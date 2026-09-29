@@ -195,13 +195,26 @@ The region currently consists of three equal `MAILBOX_FRAME_SIZE` frames:
 | Task 1 (2) | Pipeline lease slot 1 | Unused |
 
 `task_frame_count` is an endpoint contract, not a count inferred from the
-allocation size. Parent registration uses each direct chip child's own
-published depth, while whole-run admission uses the minimum depth across the
-chip set. The current Python facade selects two frames only for a direct A2/A3
-onboard chip child whose published pipeline depth is at least two. SUB,
-nested-Worker, A5, simulation, and depth-one local endpoints use one task frame
-and do not advertise successor staging. Remote endpoints have capacity one and
-advance their framed transport incrementally.
+allocation size. Each direct chip child decides its own count after `init` and
+publishes it with its granted depth; parent registration uses that published
+number, while whole-run admission uses the minimum depth across the chip set.
+The count crosses rather than being derived on both sides because only an
+initialized `ChipWorker` can answer the capability it depends on, and the parent
+must publish to exactly the frames its child polls.
+
+The Python facade's rule has two branches. A direct A2/A3 onboard chip child
+whose published pipeline depth is at least two takes two frames — that endpoint
+stages a successor behind an active run at any launch depth. Every other route
+takes a second frame only where the child resolved that it may order one native
+submission behind another, which is its runtime's published joined-launch
+capability met with the requested launch depth and the granted set count: A5
+`host_build_graph` at `launch_depth >= 2` is the one such route today. SUB,
+nested-Worker, simulation (whose backend answers that capability with a flat
+no), A5 `tensormap_and_ringbuffer`, and every depth-one local endpoint use one
+task frame and do not advertise successor staging. A launched successor occupies
+a frame of its own, so a Worker's configured launch depth is bounded by the
+frames its endpoints negotiated as well as by the granted slot depth. Remote
+endpoints have capacity one and advance their framed transport incrementally.
 
 ### 3.1 Single-frame progress path
 

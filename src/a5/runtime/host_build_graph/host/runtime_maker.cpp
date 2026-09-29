@@ -147,6 +147,15 @@ extern "C" int concurrent_native_prepare_supported_impl(void) {
     return 1;
 }
 
+extern "C" int joined_native_launch_supported_impl(void) {
+    // Every per-run device region this runtime names is selected by the run's
+    // own lease — the graph heap and the runtime image are both HOST_PER_RUN
+    // above — so a second launched run reads and writes nothing the first is
+    // still executing against. What orders the two on the device is a queued
+    // event wait, not this answer.
+    return 1;
+}
+
 // RuntimeEnv (call_config.h) is the cross-runtime ABI for per-ring config and
 // carries RUNTIME_ENV_RING_COUNT slots, shared with tensormap_and_ringbuffer.
 // host_build_graph keeps one task table and reads slot 0, so it only needs the ABI
@@ -2169,7 +2178,13 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
     }
     const BindPhaseMark h2d_phase = bind_phase_begin();
     if (api->copy_to_device(publication.device_target, publication.source, publication.bytes) != 0) {
-        LOG_ERROR("host-orch: H2D of the runtime image failed");
+        // A failed copy is not a copy that did nothing: how much of the
+        // destination it modified is unknown, so the bytes there are neither
+        // this run's image nor whatever preceded it.
+        LOG_ERROR(
+            "host-orch: H2D of the runtime image failed; [%p, +%" PRIu64 ") is left in an unknown state",
+            publication.device_target, publication.bytes
+        );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     {
@@ -2180,13 +2195,16 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         const uint64_t copied_bytes = publication.bytes - image_bytes;
         // The widest attribute string a segment formats: eight uint64 fields plus
         // their labels. With the counters ahead of it in the recorded string, this
-        // is the tail a truncation eats first.
+        // is the tail a truncation eats first. `dest` leads instead, because the
+        // range a run published into is what tells two runs' images apart, and it
+        // is the one field a truncated tail must not lose.
         char attrs[kBindAttrsCapacity];
         snprintf(
             attrs, sizeof(attrs),
-            "nt=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " sm=%" PRIu64 " args=%" PRIu64 "/%" PRIu64 "/%" PRIu64,
-            static_cast<uint64_t>(runtime->dev.host_total_tasks), publication.bytes, copied_bytes, image_bytes,
-            publication.fanin_elems, publication.tensor_elems, publication.scalar_elems
+            "dest=%p nt=%" PRIu64 " bytes=%" PRIu64 " copied=%" PRIu64 " sm=%" PRIu64 " args=%" PRIu64 "/%" PRIu64
+            "/%" PRIu64,
+            publication.device_target, static_cast<uint64_t>(runtime->dev.host_total_tasks), publication.bytes,
+            copied_bytes, image_bytes, publication.fanin_elems, publication.tensor_elems, publication.scalar_elems
         );
         record_bind_phase(HostPhaseKind::BindArenaH2d, h2d_phase, attrs, publication.bytes);
     }
@@ -2284,6 +2302,16 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     if (skip_tensor_copy_back) {
         LOG_WARN("Skipping tensor copy-back because execution failed");
     } else {
+        // Every recorded lease is a slice of the retained temporary block this run's slot
+        // published when its bind cut them, so each must still lie inside the block the slot
+        // publishes now. One outside it names bytes the slot no longer owns: the block was
+        // replaced while this run held slices of it, and both the device's writes and the copy
+        // below would then be about different memory.
+        void *retained_base = nullptr;
+        size_t retained_size = 0;
+        api->get_retained_temp_buffer(&retained_base, &retained_size);
+        const uintptr_t block = reinterpret_cast<uintptr_t>(retained_base);
+
         for (int i = 0; i < tensor_lease_count; i++) {
             const TensorLease &lease = tensor_leases[i];
 
@@ -2291,6 +2319,15 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
             if (lease.dev_ptr == nullptr) {
                 LOG_WARN("ChipTensor %d has null device pointer, skipping", i);
                 continue;
+            }
+
+            const uintptr_t slice = reinterpret_cast<uintptr_t>(lease.dev_ptr);
+            if (retained_base == nullptr || slice < block || slice + lease.size > block + retained_size) {
+                LOG_WARN(
+                    "ChipTensor %d names [%p, +%zu) outside the retained temporary block this slot publishes "
+                    "([%p, +%zu)), so its bind sliced a block that has since been replaced",
+                    i, lease.dev_ptr, lease.size, retained_base, retained_size
+                );
             }
 
             // If host pointer is null, this is a device-only allocation (no copy-back)

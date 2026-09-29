@@ -49,6 +49,7 @@
 
 #include "common/host_span.h"
 #include "common/platform_config.h"
+#include "common/host_span_scope.h"
 #include "common/strace.h"
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
@@ -171,11 +172,26 @@ __attribute__((weak)) int teardown_report_supported_impl(void) { return 0; }
  * path, where one run reaches the device at a time.
  */
 __attribute__((weak)) int joined_native_launch_supported_impl(void) { return 0; }
+/**
+ * Whether a successor may be prepared into a shared arena bank beside the run
+ * executing out of it.
+ *
+ * Asked only where two live runs select the same bank, so the question is
+ * always "may this bind rewrite regions another run is still reading". Only the
+ * runtime can answer it, from its own per-run state — and a runtime that has
+ * not answered has not established anything, so the default is **no**. The
+ * caller reads that as `PREPARED_INCOMPATIBLE` and prepares the successor after
+ * its predecessor's fence, which is the behaviour that route had before a
+ * second run could be prepared at all.
+ *
+ * A runtime whose arena regions are per-run never reaches this: its successor
+ * gets its own bank from the slot lease and shares nothing to rule on.
+ */
 __attribute__((weak)) int prepared_run_config_compatible_impl(
     const HostApi * /*api*/, const uint64_t * /*ring_task_window*/, const uint64_t * /*ring_heap*/,
     const uint64_t * /*ring_dep_pool*/
 ) {
-    return 1;
+    return 0;
 }
 
 /* ===========================================================================
@@ -1099,6 +1115,107 @@ static void note_workspace_fact(OnboardNativeRunContext *state, WorkspaceManager
     state->runner->note_workspace_run_fact(state->descriptor.pipeline_slot, state->descriptor.run_epoch, fact);
 }
 
+/**
+ * Whether the loaded runtime declares its pooled arena regions per run.
+ *
+ * The declaration is what makes a per-slot bank meaningful: a `HOST_PER_RUN`
+ * arena at a depth above one has one copy per run and every slot selects its
+ * own, while a shared one has a single copy every slot selects. So this is the
+ * statement a selected bank must agree with, read from the contract the loaded
+ * runtime publishes rather than from any copy of it.
+ */
+static const PipelineResource *declared_arena_resource(const PipelineContract *contract) {
+    if (contract == nullptr) return nullptr;
+    const PipelineResource *arena = find_pipeline_resource(*contract, PTO_PIPELINE_GM_HEAP);
+    if (arena == nullptr) arena = find_pipeline_resource(*contract, PTO_PIPELINE_RUNTIME_IMAGE);
+    return arena;
+}
+
+static bool declares_per_run_arena() {
+    const PipelineContract *contract = get_pipeline_contract();
+    const PipelineResource *arena = declared_arena_resource(contract);
+    if (arena == nullptr) return false;
+    return pipeline_resource_copy_count(*contract, *arena) > 1;
+}
+
+/**
+ * The arena bank this run's pipeline slot selects, derived from the contract the
+ * loaded runtime publishes.
+ *
+ * The bank decides which copy of the pooled regions a bind writes and a run
+ * executes out of, and those regions belong to this runtime — so the selection
+ * is resolved here, from the declaration that governs them, rather than taken
+ * from the descriptor a caller filled in. The two agree in every configuration
+ * the contract describes: a per-run arena gives each slot its own bank whatever
+ * depth a worker was granted, and a shared one gives every slot bank 0. They
+ * can only disagree where the value did not survive the caller's own selection
+ * or its transfer across this boundary, and a run prepared into the wrong bank
+ * rewrites regions another run is executing from — which produces a wrong
+ * result rather than a failure, so it must not be reachable through a
+ * descriptor field.
+ */
+static uint32_t resolved_arena_bank_for_slot(uint32_t pipeline_slot) {
+    const PipelineContract *contract = get_pipeline_contract();
+    const PipelineResource *arena = declared_arena_resource(contract);
+    if (arena == nullptr) return 0;
+    return pipeline_resource_slot(*contract, *arena, PipelineSlotLease{pipeline_slot, 0, 0});
+}
+
+/**
+ * What storage each live run's arena bank resolves to, at the one gate where a
+ * successor prepares beside an executing predecessor.
+ *
+ * Two runs reach each other's pooled regions only if the bank their slot lease
+ * selects resolves to the same storage, so this records what that selection
+ * actually produced: the depth and arena classes the loaded runtime *declares*,
+ * each live run's slot and the bank *selected* for it, and the committed heap
+ * and runtime-image bases those banks name. Declared and selected are separate
+ * fields because the selection reads the contract a worker latched, which is
+ * what makes a differently-loaded contract distinguishable from a bank that was
+ * recorded wrongly. A base reads 0 while its bank is uncommitted, which is not
+ * an address — two zeros are two absences and establish no alias.
+ *
+ * The reservation table and the claim order are copied under the one mutex that
+ * guards them and formatted afterwards; the arena lookups take no such lock and
+ * allocate nothing. Nothing here changes what is admitted.
+ */
+static void emit_overlap_storage_marks(OnboardNativeRunContext *state, bool shares_arena_bank) {
+    if (!simpler::host_trace::enabled() || state == nullptr || state->runner == nullptr) return;
+    DeviceRunnerBase *runner = state->runner;
+    DeviceRunnerBase::NativeRunReservationRow rows[PTO_PIPELINE_MAX_DEPTH];
+    const size_t live = runner->snapshot_native_run_reservations(rows, PTO_PIPELINE_MAX_DEPTH);
+
+    const PipelineContract *contract = get_pipeline_contract();
+    const PipelineResource *heap =
+        contract == nullptr ? nullptr : find_pipeline_resource(*contract, PTO_PIPELINE_GM_HEAP);
+    const PipelineResource *image =
+        contract == nullptr ? nullptr : find_pipeline_resource(*contract, PTO_PIPELINE_RUNTIME_IMAGE);
+
+    char attrs[512];
+    int at = std::snprintf(
+        attrs, sizeof(attrs), "shares=%d decl_depth=%u heap_class=%d image_class=%d live=%zu",
+        shares_arena_bank ? 1 : 0, contract == nullptr ? 0u : contract->pipeline_depth,
+        heap == nullptr ? -1 : static_cast<int>(heap->resource_class),
+        image == nullptr ? -1 : static_cast<int>(image->resource_class), live
+    );
+    for (size_t i = 0; i < live && at > 0 && static_cast<size_t>(at) < sizeof(attrs); ++i) {
+        const void *heap_base = runner->acquire_pooled_gm_heap(rows[i].arena_bank);
+        const void *image_base = runner->acquire_pooled_runtime_arena(rows[i].arena_bank);
+        const int written = std::snprintf(
+            attrs + at, sizeof(attrs) - static_cast<size_t>(at),
+            " r%zu=%s/slot%u/bank%u/epoch%llu/heap0x%llx/img0x%llx", i,
+            rows[i].owner == static_cast<const void *>(state) ? "self" : "peer", rows[i].pipeline_slot,
+            rows[i].arena_bank, static_cast<unsigned long long>(rows[i].run_epoch),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(heap_base)),
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(image_base))
+        );
+        if (written <= 0) break;
+        at += written;
+    }
+    STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
+    STRACE_HOST_SPAN_AT_A("chip.run.bind.overlap", STRACE_NOW_NS(), 0, 1, attrs);
+}
+
 static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_rc) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
@@ -1202,7 +1319,20 @@ int simpler_prepare_run(
     const uint64_t trace_inv = STRACE_ALLOC_INV();
     const long long trace_start_ns = STRACE_NOW_NS();
     try {
-        state = new (runtime) OnboardNativeRunContext(runner, *config, trace_hid, *descriptor, &g_host_api_ops);
+        // The bank is resolved from this runtime's own declaration before the
+        // context is built, so every consumer of it — the reservation, the
+        // HostApi the bind receives, `setup_static_arena` — reads one value with
+        // one provenance. A descriptor that disagreed is reported and not used.
+        NativeRunDescriptor resolved = *descriptor;
+        resolved.arena_bank = resolved_arena_bank_for_slot(resolved.pipeline_slot);
+        if (resolved.arena_bank != descriptor->arena_bank) {
+            LOG_ERROR(
+                "simpler_prepare_run: slot %u was given arena bank %u, but this runtime's declaration selects bank "
+                "%u for it; using the declared selection",
+                resolved.pipeline_slot, descriptor->arena_bank, resolved.arena_bank
+            );
+        }
+        state = new (runtime) OnboardNativeRunContext(runner, *config, trace_hid, resolved, &g_host_api_ops);
         std::snprintf(
             state->trace_attrs, sizeof(state->trace_attrs),
             "run_id=%llu dispatch_id=%llu slot_id=%u generation=%llu run_epoch=%llu",
@@ -1254,12 +1384,29 @@ int simpler_prepare_run(
             // resources are per-run gets its own bank from the slot lease, and
             // `setup_static_arena` only ever touches the bank it is handed — so
             // its successor cannot grow or release the predecessor's regions and
-            // has nothing for a probe to rule on. Asking anyway would leave
-            // those runtimes admitted on the strength of the weak default
-            // answer, which is the same value a runtime that shares a bank and
-            // forgot to implement a probe would get.
+            // has nothing for a probe to rule on. A runtime that shares a bank
+            // and never implemented the probe has established nothing, and the
+            // default answer says so.
             const bool shares_arena_bank =
                 runner->arena_bank_shared_with_other_run(state, state->descriptor.arena_bank);
+            emit_overlap_storage_marks(state, shares_arena_bank);
+            // A run whose arena is declared per-run must not be holding a bank
+            // another live run holds. The declaration and the selection are made
+            // by different sides — the runtime declares the resource class, the
+            // caller derives the bank from the slot lease — so the two can
+            // disagree, and this is the only place that can see both. A
+            // disagreement is not a layout a successor may prepare into: its
+            // bind rewrites the regions the executing run reads, which produces
+            // a wrong result rather than a failure. Refused as incompatible, so
+            // the successor prepares after its predecessor's fence.
+            if (shares_arena_bank && declares_per_run_arena()) {
+                LOG_ERROR(
+                    "simpler_prepare_run: slot %u selected arena bank %u, which a live run already holds, while this "
+                    "runtime declares its arena per run; preparing at depth one after that run's fence (%s)",
+                    state->descriptor.pipeline_slot, state->descriptor.arena_bank, state->trace_attrs
+                );
+                return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE);
+            }
             int compatibility_rc = shares_arena_bank ? 0 : 1;
             if (shares_arena_bank) {
                 STRACE("chip.run.bind.compatibility");

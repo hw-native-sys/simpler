@@ -540,10 +540,29 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
 
-            run_poll_slot_.store(prepared->pipeline_slot, std::memory_order_relaxed);
-            run_poll_state_.store(RunPollState::Enqueuing, std::memory_order_release);
+            run_progress_.claim(prepared->identity);
+            (void)run_progress_.publish(prepared->identity, RunProgressState::Enqueuing);
+
+            // Ahead of this run's first execution-visible submission, on the stream that
+            // submission enters: a successor is ordered behind its predecessor's whole
+            // operator by one queued wait on the AICore stream, and the proof event
+            // recorded behind that wait is what lets the predecessor retire without
+            // waiting for this run's kernels. The AICPU half needs no token of its own —
+            // that stream's FIFO already places this run's payload behind the
+            // predecessor's whole-operator boundary record.
+            if (prepared->join.predecessor_owner != nullptr) {
+                const int join_rc = queue_cross_run_wait(*prepared, stream_aicore_, sink);
+                if (join_rc != 0) return join_rc;
+            }
+
+            // After any cross-run wait and before the kernel: the instant this stream was
+            // released to begin this run's AICore work. A record is not a wait and no stream
+            // waits on it, so a successor's marker cannot stand in for the production wait
+            // above. A failed record does not fail the run; it makes the position unavailable.
+            (void)mark_run_boundary(RunBoundaryMarks::Position::AicoreStart, prepared->identity, stream_aicore_);
+
             LOG_INFO("=== launch_aicore_kernel ===");
-            run_poll_state_.store(RunPollState::Submitted, std::memory_order_release);
+            (void)run_progress_.publish(prepared->identity, RunProgressState::Submitted);
             int launch_rc = launch_aicore_kernel(stream_aicore_, prepared->kernel_args.args);
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
@@ -573,7 +592,35 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 return launch_rc;
             }
             sink.mark_submitted();
-            return record_run_boundary(*prepared, RunCompletionFence::StreamRole::Aicpu, stream_aicpu_);
+            // The AICPU kernel spins in the handshake until the AICore workers publish,
+            // but it returns on its own schedule: the AICore kernel may still be in its
+            // tail. Queueing this run's own AICore boundary ahead of the AICPU boundary
+            // record is what makes that record cover both kernels, and it is the only
+            // thing a successor can safely be ordered behind.
+            //
+            // Failing to reserve the reference costs the run nothing but its
+            // joinability — no boundary is published, so no successor is ever ordered
+            // behind a boundary that covers only one kernel. Failing to *queue* the wait
+            // is different: the stream may hold it, so the run is graded Partial rather
+            // than continued.
+            void *core_done = nullptr;
+            bool whole_operator = false;
+            if (prepared->joinable_boundary && open_own_boundary_wait(*prepared, &core_done) == 0) {
+                const int wait_rc = queue_own_boundary_wait(*prepared, stream_aicpu_, core_done);
+                if (wait_rc != 0) return wait_rc;
+                whole_operator = true;
+                // Behind that wait and ahead of the boundary record: the instant this run's own
+                // AICore kernel had returned, which is what makes the time a *whole-operator*
+                // end rather than an AICPU-kernel end. Recorded only on this path, because only
+                // here does the stream position carry that meaning.
+                (void)mark_run_boundary(
+                    RunBoundaryMarks::Position::WholeOperatorEnd, prepared->identity, stream_aicpu_
+                );
+            }
+            const int boundary_rc =
+                record_run_boundary(*prepared, RunCompletionFence::StreamRole::Aicpu, stream_aicpu_);
+            if (boundary_rc == 0 && whole_operator) note_whole_operator_boundary(*prepared);
+            return boundary_rc;
         }
     );
 
@@ -599,26 +646,20 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
 
 int DeviceRunner::poll_execution(const ActiveExecution &active) {
     if (active.prepared == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
-    const uint32_t pipeline_slot = active.prepared->pipeline_slot;
-    const RunPollState state = run_poll_state_.load(std::memory_order_acquire);
-    if (run_poll_slot_.load(std::memory_order_relaxed) != pipeline_slot) {
-        return SIMPLER_NATIVE_RUN_POLL_ERROR;
-    }
-    if (state == RunPollState::DeviceComplete || state == RunPollState::Drained) {
+    const NativeRunIdentity &identity = active.prepared->identity;
+    const RunProgressState state = run_progress_.state_of(identity);
+    if (state == RunProgressState::DeviceComplete || state == RunProgressState::Drained) {
         return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
     }
-    if (state != RunPollState::Submitted) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    if (state != RunProgressState::Submitted) return SIMPLER_NATIVE_RUN_POLL_ERROR;
 
-    // The state machine above still gates the query — it owns the slot check
-    // and the sticky terminal result. What it no longer decides is completion:
+    // The state machine above still gates the query — it owns this set's sticky
+    // terminal result for this run. What it no longer decides is completion:
     // that is this run's own boundaries, with the streams left as the evidence
     // the no-boundary fallback inside poll_run_fence needs.
     const int rc = poll_run_fence(*active.prepared, stream_aicpu_, stream_aicore_);
     if (rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
-        RunPollState expected = RunPollState::Submitted;
-        (void)run_poll_state_.compare_exchange_strong(
-            expected, RunPollState::DeviceComplete, std::memory_order_acq_rel, std::memory_order_acquire
-        );
+        (void)run_progress_.publish(identity, RunProgressState::DeviceComplete);
     }
     return rc;
 }
@@ -627,10 +668,10 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     if (active.prepared == nullptr) return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     PreparedExecution &prepared = *active.prepared;
     const uint32_t pipeline_slot = prepared.pipeline_slot;
-    if (!prepared.resources_owned || run_poll_slot_.load(std::memory_order_relaxed) != pipeline_slot) {
+    if (!prepared.resources_owned || run_progress_.state_of(prepared.identity) == RunProgressState::Idle) {
         LOG_ERROR(
-            "drain_execution slot mismatch: requested=%u active=%u owns=%d", pipeline_slot,
-            run_poll_slot_.load(std::memory_order_relaxed), static_cast<int>(prepared.resources_owned)
+            "drain_execution: slot %u does not describe run epoch %llu (owns=%d)", pipeline_slot,
+            static_cast<unsigned long long>(prepared.identity.run_epoch), static_cast<int>(prepared.resources_owned)
         );
         return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     }
@@ -664,6 +705,35 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     }
 
     read_device_wall_ns(prepared.pipeline_slot);
+
+    // Both this run's boundaries completed, so every wait queued on one of them
+    // is discharged here — before anything this run owns is released, and while
+    // a fallible call can still report. Nothing waits on a successor's kernels:
+    // a cross-run wait is proved by the event recorded immediately behind it.
+    // A reference that cannot be proved consumed is a device fact, so it fails
+    // the run rather than being logged past: the events it names belong to this
+    // run's slot, and releasing them under a stream that may still hold the wait
+    // is what this ordering exists to prevent.
+    const int discharge_rc =
+        discharge_boundary_waits(prepared, /*boundaries_complete=*/true, stream_aicpu_, stream_aicore_);
+    if (discharge_rc != 0) {
+        // No poison here: on the one branch where a wait may still name an event of
+        // this run the discharge has already stopped admission and kept the
+        // reference, and a code reported with the references retired is a failure to
+        // surface rather than a reason to take the card down.
+        const int teardown_rc = teardown_shared_collectors_after_run(
+            prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, false
+        );
+        if (teardown_rc != 0) {
+            LOG_ERROR(
+                "Diagnostics teardown reported %d on the discharge-error path; run error %d is kept", teardown_rc,
+                discharge_rc
+            );
+        }
+        emit_device_dep_gen_graph(prepared.dfx);
+        return DrainOutcome::device_error(discharge_rc);
+    }
+
     if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
     }
@@ -675,8 +745,10 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         teardown_shared_collectors_after_run(prepared.dfx, prepared.pipeline_slot, prepared.identity.run_epoch, true);
     emit_device_dep_gen_graph(prepared.dfx);
 
-    // Reads device memory, so it must precede KernelArgs/runtime cleanup.
-    print_handshake_results(prepared.kernel_args);
+    // Reads device memory, so it must precede KernelArgs/runtime cleanup. Sized
+    // by this run's own core count: the runner-wide one describes whichever run
+    // launched last, which at depth two is not necessarily this one.
+    print_handshake_results(prepared.kernel_args, prepared.num_aicore);
     return DrainOutcome::device_complete(teardown_rc);
 }
 
@@ -712,9 +784,26 @@ void DeviceRunner::emit_device_dep_gen_graph(const DfxRunConfig &dfx) {
 void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched) noexcept {
     if (!prepared.resources_owned) return;
 
+    // Before anything is released, and before the poison is read: a queued
+    // stream wait naming one of this run's boundaries must not outlive the
+    // events it names. On the paths that reached the drain's fallible discharge
+    // this finds nothing to do; on the paths that did not, no completion proof
+    // is available, so the ladder falls through to the bounded synchronize and,
+    // failing that, stops admission and keeps the reference retained instead of
+    // releasing an event the device may still name.
+    //
+    // The order matters: this call can be what poisons the runner, so reading
+    // `device_unusable_` before it would decide the release path from a snapshot
+    // taken while the device was still believed healthy.
+    if (!device_unusable_.load(std::memory_order_acquire)) {
+        discharge_boundary_waits_noexcept(prepared, /*boundaries_complete=*/false, stream_aicpu_, stream_aicore_);
+    }
+    clear_whole_operator_boundary(prepared);
+
     // A poisoned card cannot retire per-resource frees, and issuing them can
-    // block in the driver. Drop host-side ownership instead; finalize()'s force
-    // reset invalidates the whole device generation.
+    // block in the driver. Drop host-side ownership instead: the blocks stay
+    // quarantined, and finalize()'s force reset is what may retire them later —
+    // only where its post-reset probe confirms the reset took.
     const bool abandon = device_unusable_.load(std::memory_order_acquire);
 
     // Collectors stop before device/runtime arguments and register buffers.
@@ -731,15 +820,64 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched)
     }
     prepared.kernel_args.args.regs = 0;
     // The fence's arming, not its events: the slot keeps those for its next
-    // run. A fatal teardown has already invalidated the whole device
-    // generation, so finalize's abandon owns that case instead.
+    // run. A poisoned runner retires nothing here, because poison alone does not
+    // establish that the device stopped naming these events; the arming stays as
+    // it is and finalize's abandon owns that case.
     if (!abandon) retire_run_fence(prepared);
     prepared.resources_owned = false;
-    if (launched) run_poll_state_.store(RunPollState::Drained, std::memory_order_release);
+    if (launched) (void)run_progress_.publish(prepared.identity, RunProgressState::Drained);
 }
 
 void DeviceRunner::abandon_prepared_execution(PreparedExecution &prepared) noexcept {
     cleanup_execution(prepared, /*launched=*/false);
+}
+
+int DeviceRunner::queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done) {
+    const aclError wait_rc = aclrtStreamWaitEvent(static_cast<aclrtStream>(aicpu_stream), core_done);
+    // The API documents no guarantee that a failure means the wait was not
+    // queued, so the reference is committed either way: a revoked reservation
+    // would let this run's own boundary events be destroyed while its stream may
+    // still name one.
+    const int commit_rc = commit_boundary_wait(QueuedStreamWaits::Shape::Own, prepared);
+    if (wait_rc != ACL_SUCCESS) {
+        LOG_ERROR("aclrtStreamWaitEvent (own AICore boundary) failed: %d", static_cast<int>(wait_rc));
+        ACL_LOG_ERROR_DETAIL(wait_rc);
+        return static_cast<int>(wait_rc);
+    }
+    return commit_rc;
+}
+
+int DeviceRunner::queue_cross_run_wait(
+    PreparedExecution &prepared, rtStream_t waiter_stream, LaunchProgressSink &sink
+) {
+    void *predecessor_boundary = nullptr;
+    const int rc = open_cross_run_wait(prepared, &predecessor_boundary);
+    // Nothing has been submitted yet, so a refusal here leaves the run
+    // rollback-able and the caller's launch reports it as never started. It is
+    // not a licence to retry: the lane reaches an ordinary launch only through
+    // the explicit decline the runtime and the claim already express.
+    if (rc != 0) return rc;
+
+    const aclError wait_rc = aclrtStreamWaitEvent(static_cast<aclrtStream>(waiter_stream), predecessor_boundary);
+    // The wait is an execution-visible submission, and on a non-zero return the
+    // API does not say it was refused. Both facts point the same way: the
+    // reference is committed and the launch is graded as having reached the
+    // device, so a rollback cannot free an event the device may still name.
+    sink.mark_submitted();
+    const int commit_rc = commit_boundary_wait(QueuedStreamWaits::Shape::CrossRun, prepared);
+    if (wait_rc != ACL_SUCCESS) {
+        LOG_ERROR("aclrtStreamWaitEvent (predecessor whole-operator boundary) failed: %d", static_cast<int>(wait_rc));
+        ACL_LOG_ERROR_DETAIL(wait_rc);
+        return static_cast<int>(wait_rc);
+    }
+    if (commit_rc != 0) return commit_rc;
+    // Recorded immediately behind the wait, so it completes when the wait is
+    // consumed — not when this run finishes. That is what lets the predecessor
+    // retire its boundary without waiting for this run's kernels. Its own
+    // failure leaves the wait queued and committed, so the entry falls back to
+    // the quiescence proof at discharge rather than failing the run.
+    (void)record_cross_run_proof(prepared, waiter_stream);
+    return 0;
 }
 
 void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
@@ -1390,19 +1528,14 @@ void RunRetentionProbePeer::run_streams(DeviceRunnerBase &runner, rtStream_t *ai
 
 int RunRetentionProbePeer::retire_predecessor_ownership(DeviceRunnerBase &, PreparedExecution &) {
     // Nothing to retire: the streams are the runner's for its whole lifetime,
-    // so a successor's launch waits on no ownership a predecessor holds. What
-    // it does take over is the poll slot, which `adopt_drain_ownership` below
-    // restores for teardown.
+    // so a successor's launch waits on no ownership a predecessor holds, and
+    // each run's poll state belongs to the resource set it holds.
     return 0;
 }
 
-void RunRetentionProbePeer::adopt_drain_ownership(DeviceRunnerBase &runner, const PreparedExecution &prepared) {
-    auto &self = static_cast<DeviceRunner &>(runner);
-    // Poll and drain accept exactly one run — whichever launched last — and no
-    // path restores the previous one, so the predecessor is undrainable through
-    // the ordinary entry once the successor has launched. This runs only after
-    // the successor has fully drained, so it hands the seat back rather than
-    // claiming two runs hold it at once.
-    self.run_poll_slot_.store(prepared.pipeline_slot, std::memory_order_relaxed);
-    self.run_poll_state_.store(DeviceRunner::RunPollState::DeviceComplete, std::memory_order_release);
+void RunRetentionProbePeer::adopt_drain_ownership(DeviceRunnerBase &, const PreparedExecution &) {
+    // Nothing to hand back: poll and drain read the state of the set the run
+    // being asked about holds, matched on that run's own epoch, so a
+    // successor's launch leaves its predecessor drainable through the ordinary
+    // entry.
 }

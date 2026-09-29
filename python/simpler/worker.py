@@ -497,13 +497,23 @@ def _assert_mailbox_wire_constants() -> None:
 _assert_mailbox_wire_constants()
 
 
-def _local_task_frame_count(platform: str, _runtime: str, pipeline_depth: int) -> int:
+def _local_task_frame_count(platform: str, _runtime: str, pipeline_depth: int, joins_native_launches: bool) -> int:
     """How many task frames this endpoint uses: one per run its child may hold.
 
     Bounded by the frames the mailbox is laid out for, which is the same
     compile-time ceiling the granted depth is clamped to.
+
+    A second frame is what a successor occupies while the run ahead of it is
+    still live, and the two routes that have one reach it differently. a2a3's
+    endpoint stages a successor behind an active run whatever the launch depth,
+    so its count follows the resource sets the child granted. Every other route
+    negotiates a second frame only where that child can actually order one
+    submission behind another: ``joins_native_launches`` is the child's own
+    resolved answer, its runtime's published capability met with the launch
+    depth requested and the sets granted, so a route that cannot join keeps the
+    single-frame path rather than staging a frame whose run could never launch.
     """
-    if platform == "a2a3" and pipeline_depth >= 2:
+    if pipeline_depth >= 2 and (platform == "a2a3" or joins_native_launches):
         return min(int(pipeline_depth), _TASK_FRAME_COUNT)
     return 1
 
@@ -3891,10 +3901,16 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     # child to reach _INIT_READY before dispatching the first task, so the
     # per-rank host-side stream sync budget only covers actual op execution
     # rather than absorbing peer-rank init skew.
-    # Before the first task, the lease word is startup metadata: slot_id carries
-    # the backend's supported admission depth. Dispatches later overwrite the
-    # same fixed wire region with the run-owned slot/generation lease.
-    _PIPELINE_LEASE_FMT.pack_into(buf, _OFF_PIPELINE_LEASE, int(cw.pipeline_depth), 0, 0)
+    #
+    # The frame count is decided here, by the side that knows: only an
+    # initialized ChipWorker can answer whether its runtime joins native
+    # launches, and the parent must publish to exactly the frames this loop
+    # polls. So both numbers cross as this child's own answer rather than being
+    # derived twice — see `_read_chip_startup_grants` for the word they cross in.
+    task_frame_count = _local_task_frame_count(
+        platform, runtime, int(cw.pipeline_depth), bool(cw.supports_joined_native_launch)
+    )
+    _PIPELINE_LEASE_FMT.pack_into(buf, _OFF_PIPELINE_LEASE, int(cw.pipeline_depth), task_frame_count, 0)
     _mailbox_store_i32(state_addr, _INIT_READY)
     sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
     sys.stderr.flush()
@@ -3913,7 +3929,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             chip_platform=platform,
             chip_runtime=runtime,
             prepared=prepared,
-            task_frame_count=_local_task_frame_count(platform, runtime, int(cw.pipeline_depth)),
+            task_frame_count=task_frame_count,
             chip_rank=chip_rank,
             provider_region_store=provider_region_store,
         )
@@ -5284,6 +5300,11 @@ class Worker:
         self._orch: Orchestrator | None = None
         self._chip_shms: list[SharedMemory] = []
         self._chip_pids: list[int] = []
+        # Task frames negotiated with each chip child, in the same order. Empty
+        # until that child publishes what it granted, because only an
+        # initialized ChipWorker knows whether its runtime joins native
+        # launches; this side publishes to exactly these frames.
+        self._chip_task_frame_counts: list[int] = []
         # Teardown observations copied out of each reaped chip child's mailbox,
         # keyed by that child's pid. Absent means the child never reaped, which
         # is a different answer from an uncommitted record.
@@ -8691,7 +8712,6 @@ class Worker:
         # refused while nothing has been committed, rather than inside a child that has already
         # begun building pools.
         chip_pipeline_depth_request = self._requested_chip_pipeline_depth()
-        chip_depths: list[int] = []
         global_nodes = self._resolved_global_nodes() if self.level >= 4 else {}
 
         # Freeze the startup registry snapshot. init() already holds the epoch in
@@ -8838,13 +8858,9 @@ class Worker:
             # documented in issue #897.  A chip that fails or dies during init
             # raises here rather than spinning forever.
             self._await_children_ready(self._chip_shms, self._chip_pids, "chip", deadline)
-            for shm in self._chip_shms:
-                buf = shm.buf
-                assert buf is not None
-                # INIT_READY repurposes the lease slot_id as the child's depth
-                # advertisement; task dispatch restores normal lease semantics.
-                chip_depths.append(_PIPELINE_LEASE_FMT.unpack_from(buf, _OFF_PIPELINE_LEASE)[0])
+            chip_depths, chip_frame_counts = self._read_chip_startup_grants()
             direct_chip_pipeline_depth = self._granted_chip_pipeline_depth(chip_depths)
+            self._chip_task_frame_counts = self._granted_chip_task_frame_counts(chip_frame_counts, chip_depths)
 
         # Fork next-level Worker children (L4+ with Worker children).
         # Each child process eagerly inits the inner Worker, which forks its own
@@ -8941,21 +8957,24 @@ class Worker:
         # is this Worker's logical admission bound, with 0 deriving it from the first;
         # `_launch_depth` bounds how many of those runs may have device work launched at once, and
         # cannot exceed the slot capability because a launched run holds its slot until it ends.
+        # Nor the frames its endpoints negotiated: a launched successor occupies a task frame of
+        # its own for as long as it is live, so a single-frame endpoint carries one launched run
+        # whatever depth was requested. A route with no local chip child negotiates no frames and
+        # is bounded by the slot capability alone.
         dw.configure_pipeline_depth(
             direct_chip_pipeline_depth,
             self._pending_run_depth,
-            min(self._launch_depth, direct_chip_pipeline_depth),
+            min([self._launch_depth, direct_chip_pipeline_depth, *self._chip_task_frame_counts]),
         )
 
         # Register chip workers as NEXT_LEVEL (L3). The child pid lets the C++
         # endpoint fail a dispatch whose child died instead of spinning on a
-        # mailbox that can no longer be completed.
+        # mailbox that can no longer be completed. The frame count is the one its
+        # child published and polls, so the parent never writes to a frame the
+        # child is not reading.
         if device_ids:
             _require_matching_pids(self._chip_shms, self._chip_pids, "chip")
-            for shm, pid, chip_depth in zip(self._chip_shms, self._chip_pids, chip_depths):
-                task_frame_count = _local_task_frame_count(
-                    str(self._config["platform"]), str(self._config["runtime"]), chip_depth
-                )
+            for shm, pid, task_frame_count in zip(self._chip_shms, self._chip_pids, self._chip_task_frame_counts):
                 dw.add_next_level_worker(_mailbox_addr(shm), pid, task_frame_count)
 
         # Register Worker children as NEXT_LEVEL (L4+)
@@ -12354,6 +12373,47 @@ class Worker:
                 f"per-child grants={per_child})"
             )
         return granted
+
+    def _read_chip_startup_grants(self) -> tuple[list[int], list[int]]:
+        """What each chip child published at INIT_READY: the sets it granted and the frames it polls.
+
+        INIT_READY repurposes the base frame's lease word as startup metadata — slot_id carries the
+        child's depth advertisement and the field a task-frame lease keeps reserved carries the task
+        frame count it negotiated. Task frames are separate regions, so a dispatch lease keeps its
+        own meaning and its reserved-must-be-zero check.
+        """
+        depths: list[int] = []
+        frame_counts: list[int] = []
+        for shm in self._chip_shms:
+            buf = shm.buf
+            assert buf is not None
+            granted_depth, granted_frames, _spare = _PIPELINE_LEASE_FMT.unpack_from(buf, _OFF_PIPELINE_LEASE)
+            depths.append(granted_depth)
+            frame_counts.append(granted_frames)
+        return depths, frame_counts
+
+    def _granted_chip_task_frame_counts(self, per_child: list[int], depths: list[int]) -> list[int]:
+        """Each chip child's negotiated task-frame count, or a startup failure.
+
+        The child decides it: only an initialized ChipWorker can answer whether its runtime joins
+        native launches, and this side publishes to exactly the frames that child polls. So this
+        validates rather than re-derives — a count above the mailbox layout, above the sets that
+        child granted, or below one would have the parent and the child disagree about which
+        frames exist, and a frame the child never polls is a dispatch that never completes.
+        """
+        if len(per_child) != len(depths):
+            raise RuntimeError(f"chip workers published {len(per_child)} frame counts for {len(depths)} depths")
+        invalid = [
+            (count, depth)
+            for count, depth in zip(per_child, depths)
+            if count < 1 or count > _TASK_FRAME_COUNT or count > depth
+        ]
+        if invalid:
+            raise RuntimeError(
+                f"chip worker published invalid task frame counts (count, granted depth): {invalid}; "
+                f"the mailbox is laid out for {_TASK_FRAME_COUNT}"
+            )
+        return list(per_child)
 
     def _pipeline_depth_scope_refusal(self) -> str | None:
         """Why this Worker cannot be granted more than the default capacity, or None when it can.

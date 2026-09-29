@@ -23,6 +23,7 @@
 
 #include <runtime/rt.h>
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -32,6 +33,8 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+
+#include "host/run_progress_slots.h"
 #include <unordered_set>
 #include <vector>
 
@@ -102,6 +105,18 @@ public:
     int poll_execution(const ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
+
+    /**
+     * Whether a run may be ordered behind another on this runner right now.
+     *
+     * There is no stream ownership to wait for: every run submits on the two
+     * persistent bootstrap streams, which this runner holds for its lifetime.
+     * What does disqualify the runner is poison — a context that may not accept
+     * a new submission must not have ordering edges built into it either, and
+     * the boundary events such an edge would name are exactly the resources a
+     * poisoned runner has quarantined rather than proved retired.
+     */
+    bool ready_to_join_launch() const override { return !device_unusable_.load(std::memory_order_acquire); }
 
     // `set_chip_swimlane_enabled`, `set_dump_args_enabled`,
     // `set_pmu_enabled`, `set_scope_stats_enabled`, `set_output_prefix`,
@@ -175,7 +190,7 @@ public:
 
 private:
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
-    // worker_count_, executor + dispatcher bytes, aicore_bin_handle_,
+    // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
     // sizes, persistent AICPU/AICore streams, device_wall_*,
     // binaries_loaded_) is inherited from `DeviceRunnerBase`.
@@ -217,21 +232,33 @@ private:
     // Admission and recovery execute on different host threads.
     std::atomic<bool> device_unusable_{false};
 
-    enum class RunPollState : uint8_t {
-        Idle,
-        Enqueuing,
-        Submitted,
-        DeviceComplete,
-        Drained,
-    };
-    std::atomic<RunPollState> run_poll_state_{RunPollState::Idle};
-    std::atomic<uint32_t> run_poll_slot_{PTO_PIPELINE_MAX_DEPTH};
+    // Where each run-resource set is in its run, and which run that is. Per set
+    // rather than per runner: with two runs launched a predecessor reaching
+    // `Drained` says nothing about a successor still executing. See
+    // `host/run_progress_slots.h` for the single-owner precondition the epoch
+    // check relies on.
+    RunProgressSlots run_progress_;
+
+    // Queue this run's own AICore boundary into the AICPU stream, ahead of the
+    // AICPU boundary record that then covers the whole operator. The reservation
+    // is taken by the caller, so a refusal costs only joinability; this is the
+    // step that touches the stream, and its failure grades the run Partial.
+    int queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done);
+
+    // Order this run behind the whole-operator boundary of the predecessor its
+    // join names, on the AICore stream it submits first, and record the event
+    // that proves the wait consumed. Its AICPU side needs no edge: that stream
+    // already holds the predecessor's kernel and boundary record ahead of this
+    // run's payload, and it is one FIFO.
+    int queue_cross_run_wait(PreparedExecution &prepared, rtStream_t waiter_stream, LaunchProgressSink &sink);
 
     // Release execution-owned per-run resources. Idempotent so prepare rollback
-    // and drain share one path. `launched` publishes the sticky terminal poll
-    // state, which only a run that reached the streams may claim. Collectors are
-    // not released here: their device resources belong to the worker's lifetime
-    // and are released in finalize().
+    // and drain share one path. `launched` publishes this set's terminal state,
+    // which only a run that reached the streams may claim. Discharges the queued
+    // waits naming this run's boundaries first, and reads the poison only after
+    // that, because the discharge is what may raise it. Collectors are not
+    // released here: their device resources belong to the worker's lifetime and
+    // are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
     // On an AICore launch/sync error, best-effort drain the device so a later

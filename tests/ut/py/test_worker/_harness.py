@@ -300,6 +300,9 @@ class FakeChipWorker:
 
     pipeline_depth = 1
     launch_depth = 1
+    # A fake device orders nothing behind anything, so the chip child negotiates
+    # the single-frame path however its launch depth was configured.
+    supports_joined_native_launch = False
     committed_device_memory = 0
 
     # Part of the surface the production chip loop drives, so a stand-in that

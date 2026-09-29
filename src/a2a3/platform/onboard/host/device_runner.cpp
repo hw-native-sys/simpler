@@ -484,8 +484,10 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     rc = retire_run_aicore_stream(&prepared, RunStreamPair::CompletionStatus::Complete);
     if (rc != 0) return DrainOutcome::device_error(rc);
 
-    // Reads device memory, so it must precede KernelArgs/runtime cleanup.
-    print_handshake_results(prepared.kernel_args);
+    // Reads device memory, so it must precede KernelArgs/runtime cleanup. Sized
+    // by this run's own core count rather than the runner's, which describes
+    // whichever run launched last.
+    print_handshake_results(prepared.kernel_args, prepared.num_aicore);
     // Every device step above completed and published its own proof, so the
     // device half is settled here. The diagnostics half still fails the run for
     // the caller, and says nothing about the device.

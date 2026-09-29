@@ -1437,19 +1437,19 @@ int DeviceRunnerBase::query_max_block_dim(rtStream_t stream, uint32_t *out_cube,
     return PLATFORM_MAX_BLOCKDIM;
 }
 
-void DeviceRunnerBase::print_handshake_results(const KernelArgsHelper &kernel_args) {
+void DeviceRunnerBase::print_handshake_results(const KernelArgsHelper &kernel_args, int worker_count) {
     // Every consumer of this copy is a DEBUG record below, so the threshold
     // decides whether the D2H happens at all, not just whether it is printed.
     if (!HostLogger::get_instance().is_enabled(simpler::log::LogLevel::DEBUG)) {
         return;
     }
-    if (stream_aicpu_ == nullptr || worker_count_ == 0 || kernel_args.args.runtime_args == nullptr) {
+    if (stream_aicpu_ == nullptr || worker_count <= 0 || kernel_args.args.runtime_args == nullptr) {
         return;
     }
 
     // Allocate temporary buffer to read handshake data from device
-    std::vector<Handshake> workers(worker_count_);
-    size_t total_size = sizeof(Handshake) * worker_count_;
+    std::vector<Handshake> workers(worker_count);
+    size_t total_size = sizeof(Handshake) * static_cast<size_t>(worker_count);
     int rc = rtMemcpy(
         workers.data(), total_size, kernel_args.args.runtime_args->get_workers(), total_size, RT_MEMCPY_DEVICE_TO_HOST
     );
@@ -1460,8 +1460,8 @@ void DeviceRunnerBase::print_handshake_results(const KernelArgsHelper &kernel_ar
         return;
     }
 
-    LOG_DEBUG("Handshake results for %d cores:", worker_count_);
-    for (int i = 0; i < worker_count_; i++) {
+    LOG_DEBUG("Handshake results for %d cores:", worker_count);
+    for (int i = 0; i < worker_count; i++) {
         LOG_DEBUG(
             "  Core %d: aicore_done=%d aicpu_ready=%d task=0x%lx", i, workers[i].aicore_done, workers[i].aicpu_ready,
             static_cast<uint64_t>(workers[i].task)
@@ -2627,7 +2627,6 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     }
 
     block_dim_ = 0;
-    worker_count_ = 0;
     // Tied to stream_aicore_, destroyed above: a re-provisioned runner
     // re-queries rather than trusting the previous stream's limits.
     max_block_dim_ = 0;
@@ -2969,8 +2968,10 @@ int DeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &c
 }
 
 void DeviceRunnerBase::activate_launch_shape(const Runtime &runtime) {
-    worker_count_ = runtime.get_worker_count();
-    block_dim_ = worker_count_ / cores_per_blockdim_;
+    // Read by the AICore launch below it, in the same launch transaction, so it
+    // describes the run being submitted. Nothing after a launch reads it: a
+    // run's own core count travels with the run.
+    block_dim_ = runtime.get_worker_count() / cores_per_blockdim_;
 }
 
 int DeviceRunnerBase::sync_stream_pair(rtStream_t aicpu_stream, rtStream_t aicore_stream) {
@@ -3326,41 +3327,42 @@ int DeviceRunnerBase::record_cross_run_proof(const PreparedExecution &prepared, 
 int DeviceRunnerBase::discharge_boundary_waits(
     const PreparedExecution &prepared, bool boundaries_complete, rtStream_t aicpu_stream, rtStream_t aicore_stream
 ) {
-    if (!queued_waits_->holds_reference_to(prepared.identity)) return 0;
-
-    int first_rc =
-        queued_waits_->discharge(prepared.identity, boundaries_complete, timeout_config_.stream_sync_timeout_ms);
-    if (!queued_waits_->holds_reference_to(prepared.identity)) return first_rc;
-
-    // Nothing cheaper is left. A pair synchronize covers the boundary and
-    // everything queued behind it, which is exactly what an unproven queued
-    // wait needs — and it is a failure-path cost only, because a successful
-    // drain has already retired both rungs above.
-    LOG_WARN(
-        "discharge_boundary_waits: slot %u still holds a queued wait on its own boundary; falling back to the "
-        "bounded whole-stream synchronize",
-        prepared.pipeline_slot
+    // The ladder and its return-code precedence live in the helper; what this
+    // supplies is the two device-facing steps. Its non-zero return is a failure
+    // to report; on the one branch where a wait may still name an event of this
+    // run it has already asked for admission to stop and the reference to stay
+    // retained, so a caller must not poison again on the strength of the code
+    // alone.
+    const QueuedWaitDischargeOps ops{
+        [this, &prepared, aicpu_stream, aicore_stream]() {
+            // Nothing cheaper is left. A pair synchronize covers the boundary and
+            // everything queued behind it, which is what an unproven queued wait
+            // needs — and it is a failure-path cost only, because a proved discharge
+            // never reaches this rung.
+            LOG_WARN(
+                "discharge_boundary_waits: slot %u still holds a queued wait on one of its boundaries; falling back "
+                "to the bounded whole-stream synchronize",
+                prepared.pipeline_slot
+            );
+            return sync_stream_pair(aicpu_stream, aicore_stream);
+        },
+        [this, &prepared](int rc) {
+            // No proof was obtained, so a queued wait may still name an event of this
+            // run. Nothing may be released against it: the reference stays held and
+            // the runner stops admitting runs. Whether the resource ever becomes
+            // safe to release is settled elsewhere, by a later consumption proof or
+            // a confirmed teardown or reset — not here.
+            LOG_ERROR(
+                "discharge_boundary_waits: slot %u could not prove its queued waits consumed; admission stops and the "
+                "event stays retained (%d) rather than being released while the device may still name it",
+                prepared.pipeline_slot, rc
+            );
+            recover_device_or_mark_unusable(rc);
+        },
+    };
+    return discharge_queued_waits(
+        *queued_waits_, prepared.identity, boundaries_complete, timeout_config_.stream_sync_timeout_ms, ops
     );
-    const int sync_rc = sync_stream_pair(aicpu_stream, aicore_stream);
-    if (sync_rc == 0) {
-        const int quiesce_rc = queued_waits_->discharge_on_quiescence(prepared.identity);
-        if (first_rc == 0) first_rc = quiesce_rc;
-        if (!queued_waits_->holds_reference_to(prepared.identity)) return first_rc;
-    } else if (first_rc == 0) {
-        first_rc = sync_rc;
-    }
-
-    // No proof was obtained, so a queued wait may still name an event of this
-    // run. Nothing may be released against it; the device generation itself has
-    // to end, which is what invalidates the reference.
-    LOG_ERROR(
-        "discharge_boundary_waits: slot %u could not prove its queued waits consumed (synchronize returned %d); "
-        "the device is recovered or marked unusable rather than releasing an event the device may still name",
-        prepared.pipeline_slot, sync_rc
-    );
-    if (first_rc == 0) first_rc = PTO_RUNTIME_ERR_INTERNAL;
-    recover_device_or_mark_unusable(first_rc);
-    return first_rc;
 }
 
 void DeviceRunnerBase::discharge_boundary_waits_noexcept(
@@ -4063,6 +4065,24 @@ bool DeviceRunnerBase::arena_bank_shared_with_other_run(const void *owner, uint3
         if (reservation.arena_bank == arena_bank) return true;
     }
     return false;
+}
+
+size_t DeviceRunnerBase::snapshot_native_run_reservations(NativeRunReservationRow *rows, size_t capacity) const {
+    if (rows == nullptr || capacity == 0) return 0;
+    size_t written = 0;
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    for (const NativeRunReservation &reservation : native_run_reservations_) {
+        if (reservation.owner == nullptr) continue;
+        if (written == capacity) break;
+        const size_t claim = native_run_claim_index(reservation.owner);
+        const bool holds_claim = claim < active_native_run_count_;
+        rows[written] = NativeRunReservationRow{
+            reservation.owner, reservation.pipeline_slot, reservation.arena_bank,
+            holds_claim ? active_native_runs_[claim].identity.run_epoch : 0, holds_claim
+        };
+        ++written;
+    }
+    return written;
 }
 
 void DeviceRunnerBase::release_native_run_reservation(const void *owner) {

@@ -225,7 +225,7 @@ public:
 
 private:
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
-    // worker_count_, executor + dispatcher bytes, aicore_bin_handle_,
+    // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
     // sizes, persistent AICPU/AICore streams, device_wall_*,
     // binaries_loaded_) is inherited from `DeviceRunnerBase`.

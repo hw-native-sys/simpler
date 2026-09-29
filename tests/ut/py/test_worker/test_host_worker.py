@@ -218,6 +218,9 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
 
     class FakeChipWorker:
         pipeline_depth = 2
+        # a2a3 stages a successor frame on the strength of its granted sets, so this
+        # route negotiates two frames without joining native launches.
+        supports_joined_native_launch = False
 
         def init(
             self,
@@ -251,8 +254,12 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
         cw, *_args, chip_platform, chip_runtime, prepared=None, task_frame_count=1, chip_rank=None, **_kwargs
     ):
         assert chip_rank is None
-        published_depths.append(worker_mod._PIPELINE_LEASE_FMT.unpack_from(_args[0], worker_mod._OFF_PIPELINE_LEASE)[0])
+        depth, frames, _spare = worker_mod._PIPELINE_LEASE_FMT.unpack_from(_args[0], worker_mod._OFF_PIPELINE_LEASE)
+        published_depths.append(depth)
         published_frame_counts.append(task_frame_count)
+        # The parent registers the endpoint from this word, so the count the loop polls and the
+        # count published for the parent are the same number.
+        assert frames == task_frame_count
         events.append(("main_loop", cw, chip_platform, chip_runtime))
 
     monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
@@ -591,19 +598,57 @@ def test_teardown_chip_process_resources_ignores_released_and_keeps_each_step_on
 
 
 @pytest.mark.parametrize(
-    ("platform", "runtime", "depth", "expected"),
+    ("platform", "runtime", "depth", "joins", "expected"),
     [
-        ("a2a3", "host_build_graph", 2, 2),
-        ("a2a3", "host_build_graph", 1, 1),
-        ("a2a3", "tensormap_and_ringbuffer", 2, 2),
-        ("a5", "host_build_graph", 2, 1),
-        ("a5", "tensormap_and_ringbuffer", 2, 1),
-        ("a5sim", "tensormap_and_ringbuffer", 2, 1),
-        ("a2a3sim", "host_build_graph", 2, 1),
+        ("a2a3", "host_build_graph", 2, False, 2),
+        ("a2a3", "host_build_graph", 1, False, 1),
+        ("a2a3", "tensormap_and_ringbuffer", 2, False, 2),
+        # Every other route negotiates a successor frame only where the child resolved that it
+        # can order one native submission behind another. Depth alone does not: a5's two
+        # runtimes both grant two resource sets, and only one of them joins launches.
+        ("a5", "host_build_graph", 2, True, 2),
+        ("a5", "host_build_graph", 2, False, 1),
+        ("a5", "tensormap_and_ringbuffer", 2, False, 1),
+        ("a5sim", "tensormap_and_ringbuffer", 2, False, 1),
+        ("a2a3sim", "host_build_graph", 2, False, 1),
+        # A joining route still cannot use a frame the granted sets do not back.
+        ("a5", "host_build_graph", 1, True, 1),
     ],
 )
-def test_local_task_frame_count_uses_direct_a2a3_pipeline_depth(platform, runtime, depth, expected):
-    assert worker_mod._local_task_frame_count(platform, runtime, depth) == expected
+def test_local_task_frame_count_follows_a2a3_depth_or_a_resolved_join(platform, runtime, depth, joins, expected):
+    assert worker_mod._local_task_frame_count(platform, runtime, depth, joins) == expected
+
+
+@pytest.mark.parametrize(
+    ("frame_counts", "depths"),
+    [
+        # Below one: no frame at all to publish a dispatch into.
+        ([0], [2]),
+        # Above the sets that child granted, so the extra frame has no resources behind it.
+        ([3], [2]),
+        # Above the frames the mailbox is laid out for, so the extra frame is past the region.
+        ([worker_mod._TASK_FRAME_COUNT + 1], [worker_mod._TASK_FRAME_COUNT + 1]),
+        # One child's answer missing entirely.
+        ([2], [2, 2]),
+    ],
+)
+def test_a_chip_published_frame_count_the_parent_cannot_honour_fails_startup(frame_counts, depths):
+    """A frame count that does not reconcile is a startup error, not a quietly clamped one.
+
+    The parent publishes dispatches into exactly the frames its child polls, so a disagreement
+    about how many exist is a dispatch written where nothing reads it — which presents as a run
+    that never completes rather than as an error. Refusing at startup is what keeps that from
+    being the symptom.
+    """
+    worker = Worker(level=3, device_ids=[0], num_sub_workers=0, platform="a5", runtime="host_build_graph")
+    with pytest.raises(RuntimeError, match="task frame counts|frame counts for"):
+        worker._granted_chip_task_frame_counts(frame_counts, depths)
+
+
+def test_a_reconciled_chip_frame_count_is_taken_as_published():
+    """Each child's own count, in its own order: two children may negotiate differently."""
+    worker = Worker(level=3, device_ids=[0, 1], num_sub_workers=0, platform="a5", runtime="host_build_graph")
+    assert worker._granted_chip_task_frame_counts([2, 1], [2, 2]) == [2, 1]
 
 
 def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypatch):
@@ -650,9 +695,12 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypa
     def fake_await_children_ready(shms, _pids, kind: str, _deadline: float) -> None:
         if kind != "chip":
             return
-        for shm, depth in zip(shms, (2, 1)):
+        # What the child publishes at INIT_READY: the sets it granted, and the task frames it
+        # will poll. The parent takes the frame count from here rather than deriving it, so a
+        # child that negotiated one frame is registered with one.
+        for shm, depth, frames in zip(shms, (2, 1), (2, 1)):
             assert shm.buf is not None
-            worker_mod._PIPELINE_LEASE_FMT.pack_into(shm.buf, worker_mod._OFF_PIPELINE_LEASE, depth, 0, 0)
+            worker_mod._PIPELINE_LEASE_FMT.pack_into(shm.buf, worker_mod._OFF_PIPELINE_LEASE, depth, frames, 0)
 
     def fake_fork() -> int:
         startup_events.append(("fork",))
@@ -678,6 +726,9 @@ def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypa
 
     assert fake_parent.configured_depths == [1]
     assert fake_parent.configured_pending_depths == [0]
+    # One launched run: the default launch depth, and no more than the frames the narrower
+    # child negotiated could carry anyway.
+    assert fake_parent.configured_launch_depths == [1]
     assert [call[1:] for call in fake_parent.next_level_calls] == [(12001, 2), (12002, 1)]
     assert fake_parent.initialized
     assert startup_events[0] == ("log", 60, True)

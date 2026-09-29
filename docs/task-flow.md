@@ -910,8 +910,8 @@ process atomics and shm-safe containers. The only data that needs to cross
 the fork boundary is per-task: callable, config, args — and that fits in a
 fixed 64 KiB task frame with a one-time memcpy per dispatch. A two-frame-capable
 local mailbox reserves a separate 64 KiB control base plus two such task frames;
-single-frame compatibility endpoints use the base frame and leave the reserved
-task frames unused.
+a single-frame endpoint uses the base frame for startup and control and task
+frame 0 for every dispatch, leaving the remaining reserved task frames unused.
 
 ### Why TaskArgs in slot (not encoded blob in slot)
 

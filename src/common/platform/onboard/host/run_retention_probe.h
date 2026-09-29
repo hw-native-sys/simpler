@@ -111,13 +111,13 @@ public:
     /**
      * Make `prepared` the run this arch's ordinary drain will accept.
      *
-     * a5 gates poll and drain on one runner-wide slot id that the successor's
-     * launch overwrites and no path restores, so its predecessor becomes
-     * undrainable through the ordinary entry. Restoring it is fixture cleanup
-     * and nothing else: it runs only after the successor has fully drained, so
-     * it never stands in for two concurrently drainable runs — which is the
-     * misuse that would make the whole measurement invalid. a2a3 keys the same
-     * decisions on the submitting run's own pointer and needs nothing here.
+     * Both arches key poll and drain on the submitting run's own identity — a5
+     * on the run epoch its resource set records, a2a3 on the run's pointer — so
+     * a successor's launch takes nothing a predecessor needs and neither arch
+     * has anything to restore. The hook is kept because it is an arch question,
+     * not a settled property: an arch whose drain accepted only one run at a
+     * time would need it, and a fixture that stopped asking would silently
+     * depend on today's answer.
      */
     static void adopt_drain_ownership(DeviceRunnerBase &runner, const PreparedExecution &prepared);
 };

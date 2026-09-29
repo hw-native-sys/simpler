@@ -83,6 +83,7 @@
 #include "host/workspace_manager.h"
 #include "host/pmu_collector.h"
 #include "host/queued_stream_waits.h"
+#include "host/queued_wait_discharge.h"
 #include "host/run_boundary_marks.h"
 #include "host/run_evidence_retention.h"
 #include "host/run_completion_fence.h"
@@ -257,6 +258,30 @@ public:
      * prepare concurrently.
      */
     bool arena_bank_shared_with_other_run(const void *owner, uint32_t arena_bank) const;
+
+    /** One live native-run reservation, as a caller may read it outside the lock. */
+    struct NativeRunReservationRow {
+        const void *owner{nullptr};
+        uint32_t pipeline_slot{0};
+        uint32_t arena_bank{0};
+        uint64_t run_epoch{0};
+        bool holds_claim{false};
+    };
+
+    /**
+     * Copy every live reservation into `rows`, and return how many were written.
+     *
+     * A snapshot rather than a view: the reservation table and the claim order
+     * are read under the one mutex that guards them and nothing is retained, so
+     * a caller may format the result — or ask for an arena base, which takes no
+     * such lock — without holding it. `run_epoch` is 0 and `holds_claim` false
+     * for a reservation whose run has not taken the execution claim, because the
+     * identity is recorded with the claim rather than with the reservation.
+     *
+     * Writes at most `capacity` rows and allocates nothing, so the caller's
+     * storage bounds the cost.
+     */
+    size_t snapshot_native_run_reservations(NativeRunReservationRow *rows, size_t capacity) const;
 
     /**
      * Committed GM heap base of one arena bank, or 0 while that bank has never
@@ -743,8 +768,13 @@ public:
      * Print handshake results from device. Reads the per-core
      * `Handshake` array out of device memory and logs it at DEBUG. Must
      * be called after `drain_execution()` and before `finalize()`.
+     *
+     * `worker_count` is the run's own core count, not the runner's: with two
+     * runs in flight the runner-wide count describes whichever launched last,
+     * and sizing this read from it would read a run's handshake region at
+     * another run's width. Runs of different shapes are therefore fine.
      */
-    void print_handshake_results(const KernelArgsHelper &kernel_args);
+    void print_handshake_results(const KernelArgsHelper &kernel_args, int worker_count);
 
     /**
      * Take ownership of the AICPU + AICore executor binaries. Called
@@ -2090,7 +2120,7 @@ protected:
      *   - 3 arenas release + cached size reset
      *   - device_wall_dev_ptr_ free (before mem_alloc_.finalize)
      *   - mem_alloc_.finalize
-     *   - block_dim_, worker_count_, aicore_kernel_binary_ reset
+     *   - block_dim_, aicore_kernel_binary_ reset
      *
      * Device-wall free order is normalized to "before mem_alloc_.finalize"
      * (matching the prior a5 ordering). The prior a2a3 ordering freed it
@@ -2335,7 +2365,6 @@ protected:
     Runtime kernel_runtime_;
     int block_dim_{0};
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
-    int worker_count_{0};  // Stored for print_handshake_results
 
     // This device's block_dim ceiling and the raw ACL core limits behind it,
     // resolved once against the persistent AICore stream in

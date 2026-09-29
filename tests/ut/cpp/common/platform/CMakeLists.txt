@@ -561,6 +561,7 @@ simpler_ut_cases(platform_single_case
     test_run_drain_decision.cpp
     test_run_drain_result_separation.cpp
     test_run_outcome_decision.cpp
+    test_run_progress_slots.cpp
     test_run_shadow_consumer_evidence.cpp
     test_run_stream_pair.cpp
     test_teardown_recorder.cpp

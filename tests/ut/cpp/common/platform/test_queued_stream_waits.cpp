@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "host/queued_stream_waits.h"
+#include "host/queued_wait_discharge.h"
 
 namespace {
 
@@ -419,6 +420,169 @@ TEST_F(Fixture, DischargingOneBoundaryOwnerLeavesAnotherOwnersWaitAlone) {
     EXPECT_FALSE(waits_.holds_reference_to(kPredecessor));
     EXPECT_TRUE(waits_.holds_reference_to(kOtherPredecessor));
     EXPECT_NE(other.retire(kOtherPredecessor), 0);
+}
+
+// ---------------------------------------------------------------------------
+// The ladder a runner drives over this table: which rung proves consumption,
+// which return code survives, and when a reference has to stay retained. The
+// two device-facing steps are counted rather than performed, which is the only
+// way the rungs below the first are reachable at all — the poison step is
+// recorded as having been asked for, and nothing here resets a device.
+// ---------------------------------------------------------------------------
+
+/** The runner's two steps, recorded so a case can say which rungs were used. */
+class LadderSteps {
+public:
+    QueuedWaitDischargeOps ops() {
+        QueuedWaitDischargeOps ops;
+        ops.synchronize = [this]() {
+            ++synchronizes_;
+            return synchronize_rc_;
+        };
+        ops.poison = [this](int rc) {
+            ++poisons_;
+            poisoned_with_ = rc;
+        };
+        return ops;
+    }
+
+    void synchronize_fails(int rc) { synchronize_rc_ = rc; }
+    int synchronizes() const { return synchronizes_; }
+    int poisons() const { return poisons_; }
+    int poisoned_with() const { return poisoned_with_; }
+
+private:
+    int synchronize_rc_{0};
+    int synchronizes_{0};
+    int poisons_{0};
+    int poisoned_with_{0};
+};
+
+TEST_F(Fixture, AnUnjoinedRunClimbsNoRungAtAll) {
+    LadderSteps steps;
+    // Nothing named this run's boundaries, so there is nothing to prove and the
+    // ordinary path pays neither a synchronize nor a poison.
+    EXPECT_EQ(discharge_queued_waits(waits_, kPredecessor, /*boundaries_complete=*/true, kTimeoutMs, steps.ops()), 0);
+    EXPECT_EQ(steps.synchronizes(), 0);
+    EXPECT_EQ(steps.poisons(), 0);
+}
+
+TEST_F(Fixture, AProvedProofRetiresOnTheFirstRungWithoutWaitingForTheSuccessor) {
+    open_own_wait();
+    open_cross_run_wait();
+    LadderSteps steps;
+
+    // The predecessor's own boundaries, and the successor's proof — but *not*
+    // the successor's kernels, which stay queued behind that proof. That is the
+    // property the proof event exists for: the predecessor retires without
+    // waiting for the run ordered behind it.
+    complete_predecessor_boundaries();
+    device_.complete_next(device_.successor_aicore_stream(), 1);
+
+    EXPECT_EQ(discharge_queued_waits(waits_, kPredecessor, /*boundaries_complete=*/true, kTimeoutMs, steps.ops()), 0);
+    EXPECT_FALSE(waits_.holds_reference_to(kPredecessor));
+    EXPECT_EQ(steps.synchronizes(), 0);
+    EXPECT_EQ(steps.poisons(), 0);
+    // And only now may the fence be retired, which is what the reference held.
+    EXPECT_EQ(fence_.retire(kPredecessor), 0);
+}
+
+TEST_F(Fixture, AnUnprovableProofIsRetiredByTheSynchronizeAndQuiescenceRung) {
+    open_cross_run_wait(/*record_proof=*/false);
+    LadderSteps steps;
+    complete_predecessor_boundaries();
+
+    EXPECT_EQ(discharge_queued_waits(waits_, kPredecessor, /*boundaries_complete=*/true, kTimeoutMs, steps.ops()), 0);
+    // The first rung had no evidence, so the second was used and proved it.
+    EXPECT_EQ(steps.synchronizes(), 1);
+    EXPECT_EQ(steps.poisons(), 0);
+    EXPECT_FALSE(waits_.holds_reference_to(kPredecessor));
+    EXPECT_EQ(fence_.retire(kPredecessor), 0);
+}
+
+TEST_F(Fixture, AFailingSynchronizeStopsAdmissionAndKeepsTheReference) {
+    open_cross_run_wait(/*record_proof=*/false);
+    LadderSteps steps;
+    steps.synchronize_fails(507047);
+    complete_predecessor_boundaries();
+
+    // Nothing proved the wait consumed, so the reported code is the
+    // synchronize's own, admission is asked to stop, and the events stay
+    // retained rather than being released.
+    EXPECT_EQ(
+        discharge_queued_waits(waits_, kPredecessor, /*boundaries_complete=*/true, kTimeoutMs, steps.ops()), 507047
+    );
+    EXPECT_EQ(steps.poisons(), 1);
+    EXPECT_EQ(steps.poisoned_with(), 507047);
+    EXPECT_TRUE(waits_.holds_reference_to(kPredecessor));
+    // The retention this is all for: the fence keeps its events while a stream
+    // may still name one. Whether they ever become releasable is settled by a
+    // later consumption proof or a confirmed reset, neither of which is here.
+    EXPECT_NE(fence_.retire(kPredecessor), 0);
+    EXPECT_NE(fence_.release(), 0);
+}
+
+TEST_F(Fixture, TheFirstFailureIsReportedRatherThanALaterRungs) {
+    open_cross_run_wait();
+    LadderSteps steps;
+    // The first rung queries the proof and that query fails, so the run's
+    // original failure is -203; the rungs below it then fail too.
+    complete_predecessor_boundaries();
+    device_.fail_next_queries(1);
+    steps.synchronize_fails(507047);
+
+    EXPECT_EQ(
+        discharge_queued_waits(waits_, kPredecessor, /*boundaries_complete=*/true, kTimeoutMs, steps.ops()), -203
+    );
+    EXPECT_EQ(steps.synchronizes(), 1);
+    EXPECT_EQ(steps.poisons(), 1);
+    // Reported with the original code, not the consequence.
+    EXPECT_EQ(steps.poisoned_with(), -203);
+    EXPECT_TRUE(waits_.holds_reference_to(kPredecessor));
+}
+
+TEST_F(Fixture, AFirstRungFailureSurvivesASucceedingFallback) {
+    open_cross_run_wait();
+    LadderSteps steps;
+    complete_predecessor_boundaries();
+    device_.fail_next_queries(1);
+
+    // The fallback proves consumption, so nothing is quarantined — but the error
+    // the first rung reported is still the run's, because a later rung
+    // succeeding does not unmake it.
+    EXPECT_EQ(
+        discharge_queued_waits(waits_, kPredecessor, /*boundaries_complete=*/true, kTimeoutMs, steps.ops()), -203
+    );
+    EXPECT_EQ(steps.synchronizes(), 1);
+    EXPECT_EQ(steps.poisons(), 0);
+    EXPECT_FALSE(waits_.holds_reference_to(kPredecessor));
+    EXPECT_EQ(fence_.retire(kPredecessor), 0);
+}
+
+TEST_F(Fixture, AnUnprovenOwnWaitIsAlsoRetainedRatherThanReleased) {
+    open_own_wait();
+    LadderSteps steps;
+    steps.synchronize_fails(507047);
+
+    // `boundaries_complete=false` is the cleanup path: this run's completion was
+    // never established, so the table has no first-rung evidence either.
+    EXPECT_EQ(
+        discharge_queued_waits(waits_, kPredecessor, /*boundaries_complete=*/false, kTimeoutMs, steps.ops()), 507047
+    );
+    EXPECT_EQ(steps.poisons(), 1);
+    EXPECT_TRUE(waits_.holds_reference_to(kPredecessor));
+    EXPECT_NE(fence_.retire(kPredecessor), 0);
+}
+
+TEST_F(Fixture, AMissingSynchronizeStepIsAReportedFailureRatherThanASilentPass) {
+    open_cross_run_wait(/*record_proof=*/false);
+    complete_predecessor_boundaries();
+    QueuedWaitDischargeOps none;
+
+    // A caller that supplied no steps cannot have proved anything, so the
+    // absence reports rather than reads as a retired reference.
+    EXPECT_NE(discharge_queued_waits(waits_, kPredecessor, /*boundaries_complete=*/true, kTimeoutMs, none), 0);
+    EXPECT_TRUE(waits_.holds_reference_to(kPredecessor));
 }
 
 }  // namespace
