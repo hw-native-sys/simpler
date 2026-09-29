@@ -79,6 +79,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
@@ -120,10 +121,12 @@ from .buffer import (
     Buffer,
     BufferCapability,
     BufferDescriptor,
+    BufferLocation,
     CanonicalIdentity,
     ImportContext,
     ImportRegistry,
     LocalEndpointBufferIdentityAllocator,
+    _DeviceBufferSource,
     capabilities_for_adapter,
     create_host_shared_buffer,
     host_ptr_nbytes,
@@ -10992,6 +10995,10 @@ class Worker:
         # revoked BEFORE the native free (and before a domain's backend release), so an interrupted
         # op never leaves an identity resolving to memory that is already gone. Cleared on close().
         self._child_alloc = _DeviceAllocations()
+        self._device_buffer_source: _DeviceBufferSource | None = None
+        self._source_context_failed = False
+        self._source_attachments: set[CanonicalIdentity] = set()
+        self._chip_source_uses: dict[int, tuple[CanonicalIdentity, ...]] = {}
         # Which identities each CommDomain allocation minted, so its release revokes them together.
         self._domain_members: dict[int, set[CanonicalIdentity]] = {}
         # Guards every device-allocation table. Entry points take it (`_require_device_capability`,
@@ -11008,6 +11015,69 @@ class Worker:
         # long native call (malloc / free / copy) is serialized per worker instead, so
         # ops on different chips overlap while same-worker ordering is unchanged.
         self._child_prov_worker_locks: dict[int, threading.Lock] = {}
+
+    @property
+    def device_location(self) -> BufferLocation:
+        """The current direct L2 device context, valid only in this process and incarnation.
+
+        This identifies a source context; obtaining it registers no Buffer. It is not
+        a borrowed RTS context: this Program Worker still owns device teardown/reset.
+        """
+        if self.level != 2:
+            raise TypeError("device_location requires a direct L2 Worker")
+        with self._operation_lease("device_location"), self._child_prov_lock:
+            if self._source_context_failed:
+                raise ValueError("Worker no longer has a live device context for source registration")
+            if self._device_buffer_source is None:
+                owner = weakref.ref(self)
+                self._device_buffer_source = _DeviceBufferSource(
+                    self._buffer_identity_allocator,
+                    int(self._config.get("device_id", 0)),
+                    lambda: (worker := owner()) is not None
+                    and worker._lifecycle is _Lifecycle.READY
+                    and not worker._source_context_failed,
+                )
+            return BufferLocation(self._device_buffer_source)
+
+    def _attach_source_buffers_locked(self, args: Any) -> tuple[CanonicalIdentity, ...]:
+        """Reserve source uses and install consumer snapshots under the chip/provenance locks."""
+        source = self._device_buffer_source
+        if source is None:
+            self._child_prov_check_dispatch_locked(args, 0, api="submit")
+            return ()
+        for identity in tuple(self._source_attachments):
+            if not source.live(identity):
+                self._drop_device_alloc(identity)
+                self._source_attachments.remove(identity)
+        snapshots = source.acquire(args, self._source_attachments)
+        identities = tuple(buffer.identity for buffer in snapshots)
+        added = []
+        try:
+            for buffer in snapshots:
+                if buffer.identity in self._source_attachments:
+                    continue
+                for other in self._child_alloc.values():
+                    if buffer.base < other.base + other.nbytes and other.base < buffer.base + buffer.nbytes:
+                        raise ValueError("source Buffer overlaps a registered allocation; reuse its Tensor views")
+                # The marker precedes registration, including an interrupted native table update.
+                self._source_attachments.add(buffer.identity)
+                added.append(buffer.identity)
+                self._record_device_alloc(buffer)
+            self._child_prov_check_dispatch_locked(args, 0, api="submit")
+        except BaseException:
+            for identity in added:
+                self._drop_device_alloc(identity)
+                self._source_attachments.discard(identity)
+            source.release(identities)
+            raise
+        return identities
+
+    def _release_source_uses(self, run_id: int) -> None:
+        with self._registry_lock:
+            identities = self._chip_source_uses.pop(run_id, ())
+        if identities:
+            assert self._device_buffer_source is not None
+            self._device_buffer_source.release(identities)
 
     def _record_device_alloc(self, handle: Buffer, *, domain_allocation_id: int | None = None) -> None:
         """Make ``handle`` a live device allocation operands may name. Caller holds ``_child_prov_lock``.
@@ -11111,6 +11181,8 @@ class Worker:
         would let a wrong id serialize this op against another chip's queue.
         """
         with self._child_prov_lock:
+            if identity in self._source_attachments:
+                raise ValueError(f"Worker.{api}: borrowed source Buffer supports submit; use its allocator for IO/free")
             bound = self._child_alloc.get(identity)
             if bound is None:
                 raise ValueError(
@@ -11290,6 +11362,7 @@ class Worker:
         """
         with self._child_prov_lock:
             self._child_alloc.clear()
+            self._source_attachments.clear()
             self._domain_members.clear()
 
     def _check_chip_worker_id(self, worker_id: int) -> None:
@@ -11440,6 +11513,8 @@ class Worker:
 
         The operation lease is re-entrant, so an in-run ``orch.free`` that delegates here nests safely.
         """
+        if handle._source_registration is not None:
+            raise ValueError("Worker.free: borrowed storage is released by its allocator, never Worker.free")
         self._refuse_free_while_in_flight(handle)
         if self.level != 2 and not self._chip_shms:
             self._check_chip_worker_id(0)
@@ -12417,17 +12492,28 @@ class Worker:
             if self._names_device_allocation(args):
                 reservation.enter_context(self._child_prov_worker_lock(0))
                 reservation.enter_context(self._child_prov_lock)
-                self._child_prov_check_dispatch_locked(args, 0, api="submit")
+                sources = self._attach_source_buffers_locked(args)
+            else:
+                sources = ()
             with self._registry_lock:
                 self._chip_run_seq += 1
                 run_id = self._chip_run_seq
                 self._chip_run_touched_identities[run_id] = touched
+                if sources:
+                    self._chip_source_uses[run_id] = sources
+        native_entered = False
         try:
             chip_args = self._materialize_l2_args(args)
+            native_entered = True
             chip_run = self._chip_worker._impl._submit_chip_run_direct(callable_id, chip_args, cfg)
         except BaseException:
             with self._registry_lock:
                 self._chip_run_touched_identities.pop(run_id, None)
+            # A Python exception after native entry is not a device-completion proof.
+            if not native_entered:
+                self._release_source_uses(run_id)
+            else:
+                self._source_context_failed = True
             raise
         with self._registry_lock:
             self._chip_runs[run_id] = chip_run
@@ -12580,6 +12666,10 @@ class Worker:
             if was_l2_run:
                 self._chip_run_touched_identities.pop(run_id, None)
         if was_l2_run:
+            if native_error is None:
+                self._release_source_uses(run_id)
+            else:
+                self._source_context_failed = True
             return native_error
 
         # Two different failures, deliberately not merged. A task that failed is
@@ -13410,6 +13500,10 @@ class Worker:
                         except Exception:
                             if undelivered:
                                 raise
+                    # Only a successful lane close proves completion for its unawaited runs.
+                    # Uses retained after a reported error remain unproven, even after reset.
+                    for run_id in tuple(self._chip_runs):
+                        self._release_source_uses(run_id)
                     with self._registry_lock:
                         self._chip_runs.clear()
                         self._chip_run_touched_identities.clear()

@@ -8,13 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 """Direct L2 submission validates the same Buffer identities and argument grants as L3."""
 
+import os
+import signal
 import threading
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
-from simpler.buffer import AccessMode, mint_owner_instance_id, wrap_device_malloc, wrap_fork_inherited
-from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
+from simpler.buffer import AccessMode, Buffer, mint_owner_instance_id, wrap_device_malloc, wrap_fork_inherited
+from simpler.task_interface import CallConfig, DataType, TaskArgs, Tensor, TensorArgType
 from simpler.worker import Worker, _Lifecycle
 
 
@@ -181,3 +183,294 @@ def test_direct_l2_uses_the_shared_writable_overlap_rule(l2, second_offset, reje
     else:
         worker._submit_l2_locked(3, args, CallConfig())
         assert calls[0].tensor(1).data == buffer.base + second_offset
+
+
+def test_source_wrap_is_not_a_worker_registration(l2):
+    worker, calls, frees = l2
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    assert worker._child_alloc.get(backing.identity) is None
+    args = TaskArgs()
+    args.add_tensor(Tensor(backing, shapes=(4,), dtype=DataType.FLOAT32))
+    handle = worker._submit_l2_locked(3, args, CallConfig())
+    assert calls[0].tensor(0).data == backing.base
+    with pytest.raises(RuntimeError, match="in-flight"):
+        backing.close()
+    with pytest.raises(ValueError, match="borrowed"):
+        worker.free(backing)
+    worker._finalize_run_handle(handle, handle._run_id, None)
+    backing.close()
+    assert not frees
+    with pytest.raises(ValueError, match="released|not a live"):
+        worker._submit_l2_locked(3, args, CallConfig())
+    assert len(calls) == 1
+
+
+def test_source_wrap_context_and_descriptor_checks_precede_materialization(l2, monkeypatch):
+    worker, calls, _ = l2
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    original = arguments(backing)
+    changed = replace(backing, nbytes=128)
+    mapped = []
+    monkeypatch.setattr(worker, "_materialize_l2_args", lambda args: mapped.append(args))
+    with pytest.raises(ValueError, match="descriptor"):
+        worker._submit_l2_locked(3, arguments(changed), CallConfig())
+    assert not mapped and not calls
+    backing.close()
+    with pytest.raises(ValueError):
+        worker._submit_l2_locked(3, original, CallConfig())
+    assert not mapped and not calls
+
+
+def test_source_wrap_reservation_precedes_mapping_and_unwinds_on_bind_failure(l2, monkeypatch):
+    worker, calls, _ = l2
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+
+    def fail(args):
+        with pytest.raises(RuntimeError, match="in-flight"):
+            backing.close()
+        raise ValueError("cannot import")
+
+    monkeypatch.setattr(worker, "_materialize_l2_args", fail)
+    with pytest.raises(ValueError, match="cannot import"):
+        worker._submit_l2_locked(3, arguments(backing), CallConfig())
+    backing.close()
+    assert not calls
+
+
+def test_source_wrap_unknown_native_completion_retains_source(l2, monkeypatch):
+    worker, _, _ = l2
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+
+    def fail(*args):
+        raise RuntimeError("unproven native completion")
+
+    monkeypatch.setattr(worker._chip_worker._impl, "_submit_chip_run_direct", fail)
+    with pytest.raises(RuntimeError, match="unproven"):
+        worker._submit_l2_locked(3, arguments(backing), CallConfig())
+    with pytest.raises(RuntimeError, match="in-flight"):
+        backing.close()
+
+
+@pytest.mark.parametrize("address,nbytes", [(True, 64), (0, 64), (1, 0), (1.2, 64), ((1 << 64) - 8, 64)])
+def test_source_wrap_rejects_invalid_ranges(l2, address, nbytes):
+    worker, calls, _ = l2
+    with pytest.raises((ValueError, TypeError)):
+        Buffer.wrap(address=address, nbytes=nbytes, location=worker.device_location)
+    assert not calls
+
+
+def test_source_wrap_rejects_other_context_and_closed_incarnation(l2):
+    worker, calls, _ = l2
+    location = worker.device_location
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=location)
+    other = Worker(level=2)
+    other._lifecycle = _Lifecycle.READY
+    other._chip_worker = worker._chip_worker
+    try:
+        with pytest.raises(ValueError, match="not a live"):
+            other._submit_l2_locked(3, arguments(backing), CallConfig())
+        assert not calls
+        worker._lifecycle = _Lifecycle.CLOSED
+        with pytest.raises(ValueError, match="live device context"):
+            Buffer.wrap(address=0x9000, nbytes=64, location=location)
+        with pytest.raises(ValueError, match="live device context"):
+            backing.to_descriptor()
+    finally:
+        other._lifecycle = _Lifecycle.CLOSED
+        other._chip_worker = None
+        worker._lifecycle = _Lifecycle.READY
+        backing.close()
+
+
+def test_source_wrap_refuses_inherited_process_location(l2, monkeypatch):
+    import simpler.buffer as buffer_module  # noqa: PLC0415
+
+    worker, _, _ = l2
+    location = worker.device_location
+    monkeypatch.setattr(buffer_module.os, "getpid", lambda: -1)
+    with pytest.raises(ValueError, match="this process"):
+        Buffer.wrap(address=0x8000, nbytes=64, location=location)
+
+
+def test_source_wrap_overlap_and_address_reuse_keep_distinct_identities(l2):
+    worker, calls, _ = l2
+    location = worker.device_location
+    first = Buffer.wrap(address=0x8000, nbytes=64, location=location)
+    old_args = arguments(first)
+    with pytest.raises(ValueError, match="overlaps"):
+        Buffer.wrap(address=0x8010, nbytes=64, location=location)
+    handle = worker._submit_l2_locked(3, old_args, CallConfig())
+    worker._finalize_run_handle(handle, handle._run_id, None)
+    first.close()
+    second = Buffer.wrap(address=0x8000, nbytes=64, location=location)
+    assert first.identity != second.identity
+    handle = worker._submit_l2_locked(3, arguments(second), CallConfig())
+    worker._finalize_run_handle(handle, handle._run_id, None)
+    with pytest.raises(ValueError, match="not a live"):
+        worker._submit_l2_locked(3, old_args, CallConfig())
+    second.close()
+    assert len(calls) == 2
+
+
+def test_source_cannot_alias_owned_allocation_and_failed_attach_unwinds(l2):
+    worker, calls, _ = l2
+    owned = register_buffer(worker)
+    source = Buffer.wrap(address=owned.base, nbytes=owned.nbytes, location=worker.device_location)
+    with pytest.raises(ValueError, match="overlaps"):
+        worker._submit_l2_locked(3, arguments(source), CallConfig())
+    source.close()
+    assert not calls and not worker._source_attachments
+
+
+def test_source_grant_failure_precedes_reading_host_bytes(l2):
+    worker, calls, _ = l2
+    source = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location, access=AccessMode.READ)
+    args = arguments(wrap_fork_inherited(1, 64, worker._owner_instance_id, 99, access=AccessMode.READ))
+    args.add_tensor(Tensor(source, shapes=(4,), dtype=DataType.FLOAT32))
+    args.set_tag(1, TensorArgType.OUTPUT_EXISTING)
+    with pytest.raises(ValueError, match="does not grant"):
+        worker._submit_l2_locked(3, args, CallConfig())
+    source.close()
+    assert not calls
+
+
+def test_source_close_is_fenced_while_another_thread_materializes(l2, monkeypatch):
+    worker, calls, _ = l2
+    source = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    entered = threading.Event()
+    resume = threading.Event()
+    handles = []
+    errors = []
+    original = worker._materialize_l2_args
+
+    def paused(args):
+        entered.set()
+        assert resume.wait(5)
+        return original(args)
+
+    def submit():
+        try:
+            handles.append(worker._submit_l2_locked(3, arguments(source), CallConfig()))
+        except BaseException as error:
+            errors.append(error)
+
+    monkeypatch.setattr(worker, "_materialize_l2_args", paused)
+    thread = threading.Thread(target=submit, daemon=True)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(RuntimeError, match="in-flight"):
+            source.close()
+    finally:
+        resume.set()
+        thread.join(5)
+    assert not thread.is_alive() and not errors and len(calls) == 1
+    handle = handles[0]
+    worker._finalize_run_handle(handle, handle._run_id, None)
+    source.close()
+
+
+def test_source_run_error_does_not_prove_completion(l2):
+    worker, _, _ = l2
+    source = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    handle = worker._submit_l2_locked(3, arguments(source), CallConfig())
+    worker._finalize_run_handle(handle, handle._run_id, RuntimeError("device fault"))
+    with pytest.raises(RuntimeError, match="unproven"):
+        source.close()
+
+
+@pytest.mark.parametrize("failure", ["submit", "wait"])
+def test_native_error_invalidates_source_context_token(l2, monkeypatch, failure):
+    worker, _, _ = l2
+    location = worker.device_location
+    source = Buffer.wrap(address=0x8000, nbytes=64, location=location)
+    if failure == "submit":
+
+        def fail(*args):
+            raise RuntimeError("native failure")
+
+        monkeypatch.setattr(worker._chip_worker._impl, "_submit_chip_run_direct", fail)
+        with pytest.raises(RuntimeError, match="native failure"):
+            worker._submit_l2_locked(3, arguments(source), CallConfig())
+    else:
+        handle = worker._submit_l2_locked(3, arguments(source), CallConfig())
+        worker._finalize_run_handle(handle, handle._run_id, RuntimeError("native failure"))
+    with pytest.raises(ValueError, match="live device context"):
+        Buffer.wrap(address=0x9000, nbytes=64, location=location)
+
+
+def test_source_attach_interruption_rolls_back_registration_and_use(l2, monkeypatch):
+    worker, calls, _ = l2
+    source = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    record = worker._record_device_alloc
+
+    def fail(buffer):
+        record(buffer)
+        raise RuntimeError("interrupted registration")
+
+    monkeypatch.setattr(worker, "_record_device_alloc", fail)
+    with pytest.raises(RuntimeError, match="interrupted"):
+        worker._submit_l2_locked(3, arguments(source), CallConfig())
+    assert worker._child_alloc.get(source.identity) is None
+    assert not worker._source_attachments and not calls
+    source.close()
+
+
+def test_worker_close_drains_an_unawaited_source_use(l2):
+    worker, _, _ = l2
+    source = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    worker._submit_l2_locked(3, arguments(source), CallConfig())
+    worker._chip_worker._impl._close_chip_run_lane = lambda: None
+    worker._chip_worker._impl.workspace_report = lambda: ("disabled", {})
+    worker._chip_worker.finalize = lambda: None
+    worker.close()
+    source.close()
+    assert source.closed
+
+
+def test_cached_source_closed_before_reservation_cannot_submit(l2, monkeypatch):
+    worker, calls, _ = l2
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    args = arguments(backing)
+    handle = worker._submit_l2_locked(3, args, CallConfig())
+    worker._finalize_run_handle(handle, handle._run_id, None)
+    source = worker._device_buffer_source
+    original = source.live
+
+    def close_after_cache_check(identity):
+        was_live = original(identity)
+        backing.close()
+        return was_live
+
+    monkeypatch.setattr(source, "live", close_after_cache_check)
+    with pytest.raises(ValueError, match="released|not a live"):
+        worker._submit_l2_locked(3, args, CallConfig())
+    assert len(calls) == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="requires fork")
+def test_source_inherited_with_locked_mutex_rejects_before_locking(l2):
+    worker, _, _ = l2
+    location = worker.device_location
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=location)
+    with location._source._lock:
+        pid = os.fork()
+        if pid == 0:
+            signal.alarm(3)
+            operations = [
+                lambda: Buffer.wrap(address=0x9000, nbytes=64, location=location),
+                backing.to_descriptor,
+                backing.close,
+            ]
+            for operation in operations:
+                try:
+                    operation()
+                except ValueError:
+                    continue
+                except BaseException:
+                    os._exit(3)
+                os._exit(2)
+            os._exit(0)
+        _, status = os.waitpid(pid, 0)
+    assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+    backing.close()

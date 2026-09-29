@@ -8,14 +8,16 @@
 # -----------------------------------------------------------------------------------------------------------
 """A completed producer supplies the next run's native host scalar access."""
 
+import ctypes
 import struct
 from contextlib import ExitStack
 from pathlib import Path
 
 import pytest
 import torch
+from simpler.buffer import Buffer
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, DataType, TaskArgs, TensorArgType
+from simpler.task_interface import CallConfig, DataType, TaskArgs, Tensor, TensorArgType
 from simpler.worker import Worker
 
 from simpler_setup.scene_test import compile_chip_callable_spec, l3_compile_cache_key
@@ -58,7 +60,7 @@ def _args(worker, source, control, output, mode, offset=0.0):
 @pytest.mark.platforms(["a2a3", "a5", "a2a3sim", "a5sim"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(_RUNTIME)
-@pytest.mark.parametrize("storage", ["host", "child"])
+@pytest.mark.parametrize("storage", ["host", "child", "source"])
 @pytest.mark.parametrize("write_control", [False, True], ids=["get", "get-set"])
 def test_completed_producer_supplies_native_host_access(st_platform, st_device_ids, storage, write_control):
     with ExitStack() as cleanup:
@@ -75,6 +77,20 @@ def test_completed_producer_supplies_native_host_access(st_platform, st_device_i
             cleanup.callback(worker.free, device)
             worker.copy_to(device, control)
             control_arg = device.tensor((_SIZE,), DataType.FLOAT32)
+        elif storage == "source":
+            if st_platform.endswith("sim"):
+                # Not recorded by the native allocator: this arm exercises incomplete span coverage.
+                external = ctypes.create_string_buffer(control.nbytes)
+                address = ctypes.addressof(external)
+                ctypes.memmove(address, control.data_ptr(), control.nbytes)
+            else:
+                # The low-level allocator owns this allocation; the public Worker does not.
+                address = worker._chip_worker.malloc(control.nbytes)
+                cleanup.callback(worker._chip_worker.free, address)
+                worker._chip_worker.copy_to(address, control.data_ptr(), control.nbytes)
+            device = Buffer.wrap(address=address, nbytes=control.nbytes, location=worker.device_location)
+            cleanup.callback(device.close)
+            control_arg = Tensor(device, shapes=(_SIZE,), dtype=DataType.FLOAT32)
         else:
             control_arg = _host_tensor(worker, control)
 
@@ -94,6 +110,11 @@ def test_completed_producer_supplies_native_host_access(st_platform, st_device_i
             if write_control:
                 expected[0] = 2 * (produced + 3)
             torch.testing.assert_close(output, expected)
-            if device is not None:
+            if storage == "source":
+                if st_platform.endswith("sim"):
+                    ctypes.memmove(control.data_ptr(), address, control.nbytes)
+                else:
+                    worker._chip_worker.copy_from(control.data_ptr(), address, control.nbytes)
+            elif device is not None:
                 worker.copy_from(control, device)
             assert control[0].item() == produced + (3 if write_control else 0)

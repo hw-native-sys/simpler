@@ -453,3 +453,49 @@ migration work. It introduces no HOST/NONE chip execution or cross-side mapping.
 Explicit task dependencies stay an L3 orchestration concept: a direct L2
 submission is one task, so no `TaskArgs` dependency entry reaches the chip
 through this path.
+
+## Borrowed device sources at direct L2
+
+```python
+from simpler.buffer import Buffer
+from simpler.task_interface import DataType, TaskArgs, Tensor
+
+# worker is initialized and owns the device context containing ptr.
+source = Buffer.wrap(address=ptr, nbytes=capacity, location=worker.device_location)
+args = TaskArgs()
+args.add_tensor(Tensor(source, shapes=(count,), dtype=DataType.FLOAT32))
+run = worker.submit(callable_handle, args)
+run.result()
+source.close()  # revokes the registration; does not free ptr
+```
+
+`BufferLocation` identifies the source context's process and incarnation, not
+just a device ordinal. Its current provider is an initialized direct L2
+Program `Worker`. Another Worker, a forked process, or a closed context cannot
+use that location. This does not attach an externally owned RTS context and
+does not support HOST or remote wrapping. No new wire placement field or
+cross-Worker grant is introduced.
+
+Wrapping creates a source registration, without adding a consumer allocation
+or mapping. Submission checks the complete descriptor and source liveness,
+then installs a private consumer snapshot and reserves the source through run
+finalization. The existing geometry, direction/grant, transfer, exact-worker
+and import checks still apply. Live source ranges cannot overlap; overlap with
+Worker-owned allocations is rejected on attachment. Derive multiple views
+from the existing Buffer rather than wrapping its address again.
+
+`source.close()` refuses in-flight use and revokes an idle registration under
+the same source lock that reserves submissions. Cached consumer metadata
+cannot revive it. Rewrapping a released address mints a different identity.
+`Worker.free` never frees source storage. Worker copy operations currently
+accept owned buffers only; use the external allocator's IO for source storage.
+
+The caller guarantees the actual device, capacity, address stability and
+physical lifetime, including recovery from failed execution. Neither Buffer
+nor Tensor retains a Python allocation owner. A materialization failure
+releases its reservation. An exception after native entry, or a reported run
+error, conservatively retains it: this path has no completion-proof API for
+failed calls. The source context token is also invalidated after these errors.
+Such registrations remain unusable for close/reuse; discarding
+a handle or resetting the device is not reported as proof by this API. Worker
+close drains unawaited successful runs, but may also reset the device it owns.

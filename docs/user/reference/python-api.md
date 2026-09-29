@@ -134,13 +134,40 @@ args = TaskArgs()
 args.add_tensor(Tensor(device_buffer, shapes=(rows, cols), dtype=DataType.FLOAT32), TensorArgType.INPUT)
 ```
 
-`device_buffer` is a `Buffer` returned by `malloc` or `alloc_child_tensor`.
+`device_buffer` is a `Buffer` returned by `malloc`, `alloc_child_tensor`, or
+`Buffer.wrap` for a local direct-L2 device source.
 `Tensor(buffer, *, shapes, dtype, strides=None, byte_offset=0)` validates a view
 without allocation or transfer. `buffer.tensor(...)` remains a compatibility
 forwarder. Views carry descriptor values; they do not own the backing allocation.
 Add tensors **in signature order**, before any scalars. Use `INPUT` for an
 input, `OUTPUT_EXISTING` for a caller-allocated output, and `INOUT` for an
 input/output view. `DataType` carries the element types.
+
+### Borrowed device storage
+
+```python
+from simpler.buffer import Buffer
+
+source = Buffer.wrap(address=ptr, nbytes=capacity, location=worker.device_location)
+args = TaskArgs()
+args.add_tensor(Tensor(source, shapes=(count,), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+worker.submit(callable_handle, args).result()
+source.close()
+```
+
+`worker.device_location` is available after direct L2 initialization. The token
+identifies that live process/context incarnation; it cannot be replaced by a
+device ordinal or used on another Worker. `Buffer.wrap(..., access=...)` accepts
+an existing `AccessMode` grant (default `READWRITE`) and registers caller-owned
+storage without consumer attachment. Submission performs that attachment.
+
+The caller owns the allocation and guarantees its real device, capacity and
+lifetime. `source.close()` revokes an idle registration without freeing memory;
+it refuses in-flight or unproven completion. `Worker.free` and Worker copy
+operations do not manage this external allocation. Use its allocator for IO
+and physical release. HOST, remote, and borrowed RTS context attachment are
+outside this interface. See the [source lifetime contract](../../buffer-abi.md#borrowed-device-sources-at-direct-l2)
+for failure and Program Worker teardown behavior.
 
 ## `CallConfig`
 
