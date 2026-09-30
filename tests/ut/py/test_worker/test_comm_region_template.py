@@ -979,10 +979,13 @@ def test_output_stop_poisons_and_handle_invalidates_after_release():
 
 
 class _FakeLease:
-    def __init__(self, calls: list[tuple], name: str, handle: int, *, fail_close: bool = False) -> None:
+    def __init__(
+        self, calls: list[tuple], name: str, handle: int, *, fail_close: bool = False, mapped_base: int = 0
+    ) -> None:
         self._calls = calls
         self._name = name
         self.handle = handle
+        self.mapped_base = mapped_base
         self.closed = False
         self._fail_close = fail_close
 
@@ -996,19 +999,30 @@ class _FakeLease:
 
 
 class _FakeNativeWorker:
-    def __init__(self, calls: list[tuple], *, fail_release: bool = False) -> None:
+    def __init__(self, calls: list[tuple], owner_nonce: bytes, *, fail_release: bool = False) -> None:
         self._calls = calls
+        self._owner_nonce = bytes(owner_nonce)
         self._fail_release = fail_release
         self._last_resource_id = 42
 
+    def _posix_export(self, buffer_id: int, nbytes: int, token: str):
+        from simpler.buffer import AccessMode, AddressSpace, BackendKind, BufferDescriptor, CanonicalIdentity
+
+        return BufferDescriptor(
+            CanonicalIdentity(self._owner_nonce, int(buffer_id), 1),
+            AddressSpace.HOST,
+            AccessMode.READWRITE,
+            BackendKind.POSIX_SHM,
+            int(nbytes),
+            token.encode("ascii"),
+        )
+
     def control_payload(self, _worker_type, worker_id, sub_cmd, payload, _timeout):
         from simpler.comm_provider import (
-            PosixShmImport,
             ProviderReleaseResult,
             ProviderReleaseStatus,
             RegionAllocationResult,
             RegionExportDescriptor,
-            RegionPartExportDescriptor,
             RegionPartKind,
             RegionPartLocalView,
         )
@@ -1034,18 +1048,8 @@ class _FakeNativeWorker:
             result = RegionAllocationResult(
                 provider_resource_id=42,
                 export_descriptor=RegionExportDescriptor(
-                    payload=RegionPartExportDescriptor(
-                        spec.payload.planned_backing_kind,
-                        int(spec.payload.logical_bytes),
-                        int(spec.payload.logical_bytes),
-                        PosixShmImport("/pto_payload_42"),
-                    ),
-                    counter=RegionPartExportDescriptor(
-                        spec.counter.planned_backing_kind,
-                        int(spec.counter.logical_bytes),
-                        int(spec.counter.logical_bytes),
-                        PosixShmImport("/pto_counter_42"),
-                    ),
+                    payload=self._posix_export(1, int(spec.payload.logical_bytes), "pto_payload_42"),
+                    counter=self._posix_export(2, int(spec.counter.logical_bytes), "pto_counter_42"),
                 ),
             )
             payload_view = RegionPartLocalView(RegionPartKind.PAYLOAD, 0x1000, int(spec.payload.logical_bytes))
@@ -1091,13 +1095,22 @@ def region_worker(monkeypatch):
         worker._config = {**worker._config, "platform": "a2a3sim", "device_ids": list(device_ids)}
         calls: list[tuple] = []
         leases: list[_FakeLease] = []
-        worker._worker = _FakeNativeWorker(calls, fail_release=fail_release)
+        worker._ensure_local_device_endpoint_identities()
+        owner_nonce = bytes(worker._device_endpoint_identities[(1, DEVICE_AICPU)][0])
+        worker._worker = _FakeNativeWorker(calls, owner_nonce, fail_release=fail_release)
         monkeypatch.setattr(worker, "_consume_worker_host_mapped_cleanup_error", lambda _api: None)
 
-        def fake_import(_worker_id, _resource_id, export):
+        def fake_import(_worker_id, _resource_id, export, *, part=None, expected_device_id=None):
+            del part, expected_device_id
             name = "payload" if not leases else "counter"
-            lease = _FakeLease(calls, name, handle=100 + len(leases), fail_close=fail_mapping_close)
-            calls.append(("import", name, int(export.logical_bytes)))
+            lease = _FakeLease(
+                calls,
+                name,
+                handle=100 + len(leases),
+                fail_close=fail_mapping_close,
+                mapped_base=0 if name == "payload" else 64,
+            )
+            calls.append(("import", name, int(export.nbytes)))
             leases.append(lease)
             return lease
 
