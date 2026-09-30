@@ -1331,6 +1331,8 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, Kernel
 }
 
 int DeviceRunner::init_dep_gen_region(int num_threads, int device_id) {
+    // HBG records dependencies on the host while building each callable.
+    if (dep_gen_host_graph_active()) return 0;
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };

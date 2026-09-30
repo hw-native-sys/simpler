@@ -21,6 +21,7 @@
 #include "common/host_api.h"
 #include "host/kernel_launch_binder.h"
 #include "host_build_graph/kernel_argument_snapshot.h"
+#include "host_build_graph/dep_gen_host_graph.h"
 #include "host_build_graph/kernel_external_tensor.h"
 #include "host_build_graph/kernel_graph_owner.h"
 #include "host_build_graph/kernel_launch_state.h"
@@ -56,6 +57,8 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
                            cached->graph_template.size() != 0 && cached->argument_hash == argument_hash &&
                            hbg::same_kernel_argument_snapshot(*cached->argument_snapshot, args);
     if (!cache_hit) {
+        const bool collect_deps = kernel_static_config_.request().enable_dep_gen != 0;
+        arm_host_dep_gen_capture(collect_deps);
         hbg::GraphInvocationIdentity identity{
             callable_id,   args.tensor_count(),     args.scalar_count(), state.chip_buffer_hash,
             argument_hash, state.aicore_image_hash,
@@ -67,6 +70,14 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
             hbg_kernel_state_->resource_plan.capacity().layout.task_capacity, identity, candidate
         );
         if (rc != 0) return rc;
+        if (collect_deps) {
+            // Kernel replay does not run host orchestration again. Save each
+            // callable's graph at construction, before another root replaces
+            // the thread-local capture used by program-mode dep_gen.
+            const std::string deps_path = std::string(kernel_static_config_.request().output_prefix) +
+                                          "/deps_callable_" + std::to_string(callable_id) + ".json";
+            if (dep_gen_host_graph_emit(deps_path.c_str()) != 0) return PTO_RUNTIME_ERR_INTERNAL;
+        }
         std::unique_ptr<ChipStorageTaskArgs> snapshot(new (std::nothrow) ChipStorageTaskArgs(args));
         if (snapshot == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
         auto next = std::make_shared<hbg::KernelCallableLaunchState>();

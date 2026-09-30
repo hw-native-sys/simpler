@@ -18,9 +18,12 @@
 #include "aicpu/kernel_invocation_consumer.h"
 #include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/cache_maintenance.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
 #include "common/unified_log.h"
+#include "common/kernel_args.h"
+#include "common/platform_config.h"
 #include "host_build_graph/kernel_graph_restore.h"
 #include "host_build_graph/kernel_graph_slot_registry.h"
 #include "host_build_graph/kernel_graph_wire.h"
@@ -171,6 +174,16 @@ int consume_kernel_task(void *arg) {
 
     if (thread == 0) {
         while (g_entered.load(std::memory_order_acquire) != threads) {}
+        // Kernel-mode HostArgs bypasses the program-mode KernelArgs entry.
+        // Read the same persistent window flag as AICore on every replay;
+        // otherwise AICore records into a rotation table that AICPU never seeds.
+        const auto *kernel_args = reinterpret_cast<const KernelArgs *>(registration.kernel_args_address);
+        cache_invalidate_range(kernel_args, sizeof(*kernel_args));
+        set_platform_chip_swimlane_base(kernel_args->chip_swimlane_data_base);
+        set_platform_chip_swimlane_aicore_rotation_table(kernel_args->chip_swimlane_aicore_rotation_table);
+        set_chip_swimlane_enabled(
+            SIMPLER_GET_DFX_FLAG(kernel_args->enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE)
+        );
         hbg::GraphRestoreResult restored{};
         const auto status = hbg::restore_graph_packet(
             arg, packet_bytes, registration.device_id, registration.runtime_binary_id,
