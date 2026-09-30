@@ -154,7 +154,7 @@ public:
     // Shutdown AICore registers for this thread's assigned cores.
     // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
-    int32_t shutdown(int32_t thread_idx);
+    int32_t shutdown(Runtime *runtime, int32_t thread_idx);
 
     // Run all post-attach scheduler bookkeeping, once, on the boot leader:
     //  - publishes core assignments to the perf collector (SIMPLER_DFX)
@@ -196,6 +196,9 @@ private:
 
     // Per-core execution state, indexed by core_id (= worker_id)
     CoreExecState core_exec_states_[RUNTIME_MAX_WORKER];
+    // Normal and emergency teardown may race; one winner owns each register
+    // window and its return gate until the close has drained.
+    std::atomic<bool> core_retired_[RUNTIME_MAX_WORKER]{};
 
     // Cluster-ordered core trackers, one per scheduler thread
     CoreTracker core_trackers_[MAX_AICPU_THREADS];
@@ -296,6 +299,7 @@ private:
     // Emergency shutdown: broadcast exit signal to every handshake'd core and
     // deinit their AICore register blocks. Idempotent.
     void emergency_shutdown(Runtime *runtime);
+    int32_t retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
 
     __attribute__((noinline, cold)) void fail_scheduler(Runtime *runtime, int32_t thread_idx, int32_t error_code);
 

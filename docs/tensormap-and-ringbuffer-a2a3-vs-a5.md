@@ -1,25 +1,35 @@
 # `tensormap_and_ringbuffer`: A2/A3 vs. A5
 
-This document describes the substantive differences in the current code under
-`src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/`.
+This document describes the audited main-tree differences under
+`src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/` and explicitly identified
+pending reconciliation work.
 
-> **Maintenance baseline:** The source layout and classifications were verified
-> on 2026-09-13. Recompute the counts and update the affected sections whenever
-> the files or constants described here change.
+> **Maintenance baseline:** Source/history audit on 2026-10-09 at
+> `main @ 60167bcc1ea898cc0bf861b2e3aa0aa6f70ba40d`; no new hardware validation.
+> Pending retirement work is identified separately as PR #2388, rather than
+> delivered main behavior. Its historical performance snapshot is
+> `87ce4653bbea29841b188f7a6b4906d073bf9dac`; the proposal is rebased on this main.
+> Recompute the counts and contracts whenever the compared trees change.
 
 ## Comparison Boundary and Classification
 
 The direct comparison covers tracked files under
 `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/`, matched by relative path.
-There are 51 paths present on both platforms and two additional paths present
-only on A5. Every file in that boundary belongs to exactly one of these three
+There are 51 A2/A3 files and 55 A5 files: 51 shared paths and four additional
+paths present only on A5. At the main baseline, every file belongs to one of these
 categories:
 
 | Category | Count | Definition |
 | -------- | ----: | ---------- |
-| Byte-identical | 24 | The files at the same relative path have identical bytes |
-| Compile-time or non-functional differences | 9 | Text differs, but the generated runtime behavior and data semantics are equivalent |
-| Functional differences | 20 | Eighteen matching paths and two A5-only paths encode or document differences in runtime behavior, capacity, diagnostics, or supported backends |
+| Byte-identical | 23 | The files at the same relative path have identical bytes |
+| Compile-time or non-functional differences | 8 | The file's diff contains only include guards, naming, or comments; dependent platform contracts may still differ |
+| Functional differences | 24 | Twenty shared paths and four A5-only paths encode or document differences in behavior, layout, capacity, diagnostics, or supported backends |
+
+With the pending #2388 retirement changes, `runtime/shared/runtime.cpp` has matching code
+and only differing comments, so it moves to the non-functional category:
+23 byte-identical, 9 non-functional, and 23 functional files. This is source
+convergence, not an omitted retirement feature; byte-identical comments are
+not required. The lists below classify the pinned main baseline.
 
 A file is classified as functional when any part of its diff changes behavior,
 even if the same diff also contains include-order, comment, or formatting
@@ -32,7 +42,7 @@ there is one file and so nothing to compare.
 
 ## Byte-Identical Files
 
-The following 24 files are byte-identical:
+The following 23 files are byte-identical:
 
 ```text
 build_config.py
@@ -43,7 +53,7 @@ runtime/{common.h,async_kernel_api.h,dep_compute.h,orchestrator.h,
          runtime_core.cpp,runtime_core.h,shared_memory.h,tensor.h,
          tensormap.h,tensor_create_info.h}
 runtime/scheduler/{scheduler.cpp,scheduler_types.h}
-runtime/shared/{shared_memory.cpp,tensormap.cpp,runtime.cpp}
+runtime/shared/{shared_memory.cpp,tensormap.cpp}
 ```
 
 Byte identity is a textual result only. A shared file may still consume
@@ -56,33 +66,31 @@ The `host/` directory holds only `runtime_maker.cpp` and appears nowhere above:
 
 ## Compile-Time or Non-Functional Differences
 
-The following 9 matching paths differ textually without changing runtime
-behavior:
+The following 8 matching paths contain no behavioral change in their own diff:
 
 | Files | Difference |
 | ----- | ---------- |
 | `runtime/constants.h` | Path-derived include-guard macro names only |
 | `runtime/backend/sdma/sdma_completion_kernel.h`, `runtime/types.h` | `#pragma once` on A2/A3 versus a path-derived include guard on A5 |
-| `common/intrinsic.h` | A5 uses `s_block_idx` and `s_block_num` because the unprefixed names are compiler-reserved; getter semantics and layout are unchanged |
-| `runtime/dispatch_payload.h` | Comments follow the platform-specific `LocalContext` field names; payload semantics are unchanged |
+| `runtime/dispatch_payload.h` | Comments describe the platform-specific context fields; the `GlobalContext` layout difference is defined in `common/intrinsic.h` |
 | `runtime/aicore_completion_mailbox.h` | Path-derived include guards and comment wording only |
 | `runtime/completion_token.h` | Path-derived include guards and an A2/A3-only explanatory comment |
 | `runtime/runtime_types.h` | Comments state the corresponding 72- or 108-worker capacity; the mask remains two 64-bit words on both platforms |
 | `runtime/submit_types.h` | The launch accessor and backing field are named `block_num` on A2/A3 and `core_num` on A5; both represent the logical SPMD block count |
 
 The first two rows, covering three files, are the strict "compile macro only"
-subset. The `s_block_*` names are also a compile-time constraint rather than a
-different runtime data model. No standalone cleanup is planned; mechanical
-include guards can converge to `#pragma once` when those files are next
-modified.
+subset. Mechanical include guards, comment order, and function placement are
+outside the reconciliation blockers. They can converge when the affected file
+is next modified; textual equality is not a closure requirement.
 
 ## Files with Functional Differences
 
-The following 18 matching paths have at least one functional difference:
+The following 20 shared paths have at least one functional difference:
 
 ```text
 aicore/aicore_executor.cpp
 aicpu/aicpu_executor.cpp
+common/intrinsic.h
 docs/MULTI_RING.md
 docs/RUNTIME_LOGIC.md
 host/runtime_maker.cpp
@@ -98,12 +106,15 @@ runtime/scheduler/scheduler_cold_path.cpp
 runtime/scheduler/scheduler_completion.cpp
 runtime/scheduler/scheduler_context.h
 runtime/scheduler/scheduler_dispatch.cpp
+runtime/shared/runtime.cpp
 runtime/shared/runtime_init.cpp
 ```
 
-A5 also has two backend files with no A2/A3 counterpart:
+A5 also has four backend files with no A2/A3 counterpart:
 
 ```text
+runtime/backend/rdma/rdma_completion_kernel.h
+runtime/backend/rdma/rdma_completion_scheduler.h
 runtime/backend/urma/urma_completion_kernel.h
 runtime/backend/urma/urma_completion_scheduler.h
 ```
@@ -114,14 +125,19 @@ The functional differences group into the following themes:
 | ---------- | ---------- | ------------------------------ | ---------------- |
 | Compute topology | Physical hardware | Yes | Retain each platform's capacity constants and derived layouts |
 | AICPU launch plan | Product thread limits, CANN launch ABI, and firmware topology | Yes | Retain the A5 dynamic topology query; do not equate thread limits with physical topology |
-| Cache coherence | Hardware coherence model | Yes | Retain the required invalidate/flush operations on A2/A3; do not copy unnecessary maintenance operations to A5 |
+| Cache coherence | Producer/consumer visibility contract | Yes | Distinguish Host-DMA coherence from AICore-to-AICPU slab/counter visibility; retain each path's required maintenance |
+| AICore context and L2 alias | Driver/device configuration and compiler ABI | Yes | Retain A2/A3's `l2_cache_offset` field/getter; A5's compiler-reserved name substitutions do not imply layout equivalence |
 | PMU collection | Hardware PMU and platform collection protocol | Yes | Retain the different counter counts, readers, and FIN submission paths |
 | System counter and DMB | Hardware timing and register layout | Yes | Use the constants for each platform |
-| URMA completion | A5-specific implementation and product capability gate | Yes, for now | Retain the A5 path; do not claim that URMA is available in the default build |
-| Next-block prefetch | A2/A3-only performance optimization | No | Retain on A2/A3; validate on A5 before considering a port |
+| URMA/RDMA completion | Platform backend implementation and product capability gates | Yes, for now | Retain the four A5-only files and explicit opt-in workspace gates; source presence is not default capability |
+| Next-block prefetch | Platform-sensitive performance optimization | No | Retain on A2/A3; the recorded A5 experiment did not establish stable benefit and regressed short tasks |
+| Empty Tier-0 staging | Portable software optimization measured only on A5 (#2105) | No | Benchmark A2/A3 before a port or an explicit keep-as-is decision |
+| Profiling queue-tag publication | Software producer contract | No | Reconcile invalid-tag initialization or justify the differing producer/consumer path |
 | Scheduler progress publication | AICPU topology and measured publication cost | No | Retain A5's 16-task batching; keep per-advance publication on A2/A3, where the portable implementation showed no significant benefit |
 | Terminal task release | Measured end-of-run scheduler cost | No | A5 traces show per-task release blocking the tail after task submission has ended, so successful A5 runs elide deferred release after the graph seal; retain incremental release on A2/A3 because no tail release blocking was found there |
-| Fatal teardown | Software reliability strategy | No | Retain the current implementations; decide whether to converge after measuring the worst-case A5 teardown time |
+| Normal/fatal retirement | Software reliability protocol | No | Track #2387/#2388 through integration/acceptance; the A5 proposal is not yet delivered to main |
+| Joined launch and error status | Cross-run ordering/result ownership (#2491) | No | Retain A5's early-submission contract and A2/A3's serial shared-header fallback as a coupled distinction |
+| Async stall diagnostics | Software diagnostic strategy | No | Decide shared COUNTER/SDMA diagnostic scope; retain backend-specific snapshots |
 | Scheduler trace attribution | Software diagnostic strategy | No | Preserve the current traces; converge only after comparing generated timelines |
 
 ### Compute Topology and AICPU Launch Plan
@@ -162,16 +178,31 @@ completion protocol publishes a monotonic completed post ID: both platforms
 read it with acquire semantics and neither clears or retires the shared record.
 AICore results are still published by the AICore with `dcci`.
 
-This cache maintenance directly guarantees visibility. It cannot be
-mechanically removed from A2/A3, nor should it be copied to A5 as unnecessary
-overhead.
+Host-DMA coherence does not establish AICore-to-AICPU visibility. Both platforms
+retain deferred-slab invalidations after FIN. COUNTER polling also retains
+cache maintenance: A2/A3 groups invalidations in the wait-list loop, while A5
+invalidates in `counter_poll_op`. Do not remove those operations based on the
+Host-DMA distinction.
 
 | File | Current difference |
 | ---- | ------------------ |
 | `aicpu/aicpu_executor.cpp` | A2/A3 invalidates `runtime->dev`, which Host DMA writes, before teardown; A5 does not require the corresponding operation |
 | `runtime/backend/sdma/sdma_completion_scheduler.h` | A2/A3 invalidates the cache line before the acquire load of the completed post ID; A5 performs the acquire load directly; retirement is a no-op on both platforms |
-| `runtime/async_wait.h` | A2/A3 provides a cache-line invalidation helper for async COUNTER polling; A5 does not require it |
-| `runtime/scheduler/scheduler.h` | A2/A3 invalidates the cache line before async COUNTER polling; A5 polls directly |
+| `runtime/async_wait.h`, `runtime/scheduler/scheduler.h` | A2/A3 invalidates each distinct COUNTER line in the wait-list loop; A5 invalidates in `counter_poll_op` |
+| `runtime/scheduler/scheduler_completion.cpp` | Both platforms invalidate the AICore-written deferred slab before consuming its header/entries |
+
+### AICore Context and L2 Alias
+
+`common/intrinsic.h` is functional, not a naming-only difference. A2/A3's
+`GlobalContext` includes `uint64_t l2_cache_offset` and
+`get_l2_cache_offset(args)`, populated from resident device configuration during
+scheduler initialization. The value is the driver-provided nocache-alias
+offset; zero leaves an ordinary cached load. A5 has neither this field nor the
+getter, so the exposed global-context layout is different.
+
+A5's `s_block_idx`/`s_block_num` names remain a compiler constraint, while the
+logical SPMD block-index/count semantics are shared. Classify the whole file by
+its functional L2/context difference rather than by those spelling changes.
 
 ### PMU, System Counter, and DMB
 
@@ -193,32 +224,34 @@ platform's `platform/include/common/platform_config.h`.
 | `runtime/scheduler/scheduler_completion.cpp` | After FIN, A2/A3 invokes the AICPU MMIO reader for eight counters; A5 commits the ten-counter slot written by the AICore |
 | `platform/shared/aicpu/pmu_collector_aicpu.cpp` | Implements the A2/A3 direct MMIO read and the A5 staging-slot consumption paths |
 
-### Optional A5-Specific URMA Backend
+### Optional A5-Specific URMA and RDMA Backends
 
-A5 contains the source path for issuing URMA completion requests, creating
-deferred entries, forwarding FIN, and polling/retiring CQ entries. A2/A3
-currently registers only the COUNTER and SDMA completion backends.
-
-The repository does not currently define `PTO_URMA_SUPPORTED`. A5 therefore
-compiles the shared ABI, mailbox, CQ polling/retirement, and related paths, but
-the kernel path that successfully issues URMA PTO instructions is unreachable.
-The current state is "implemented but disabled by default." It neither means
-that the default A5 build supports URMA nor proves that the A2/A3 hardware does
-not support URMA.
+A5 contains URMA and RDMA request-issue and completion poll/retire backend
+pairs; A2/A3 registers COUNTER and SDMA only. The A5 host CMake options
+`SIMPLER_ENABLE_PTO_URMA_WORKSPACE` and `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE`
+default to `OFF`. Enabling them defines `PTO_URMA_SUPPORTED` or
+`PTO_RDMA_SUPPORTED` (plus `PTO_RDMA_BACKEND_HNS_1825_SUPPORTED`) for the host
+workspace path. The runtime builder propagates these options; the AICore
+kernel compiler separately propagates the RDMA capability definitions. A
+successful request also requires the corresponding workspace and toolchain.
+Source presence proves neither default availability nor hardware absence on
+A2/A3.
 
 Both platforms already share `CompletionToken::backend_cookie`,
 `ASYNC_ENGINE_URMA`, the 32-byte `DeferredCompletionEntry`, end-to-end cookie
 propagation from the AICore slab into the 64-byte mailbox message, and the
 generic completion-backend dispatch. The actual platform divergence is that
-A2/A3 lacks the URMA completion type, request-issue implementation, registered
-backend operations, and CQ polling/retirement path.
+A2/A3 lacks the URMA/RDMA completion types, request-issue implementation,
+registered backend operations, and CQ polling/retirement paths.
 
 | Path stage | File | Current difference |
 | ---------- | ---- | ------------------ |
 | Request issue | `runtime/backend/urma/urma_completion_kernel.h` | Present only on A5; it invokes `TGET_ASYNC`/`TPUT_ASYNC` only when `PTO_URMA_SUPPORTED` is defined |
-| Deferred entry | `runtime/aicore_completion_mailbox_types.h`, `runtime/async_kernel_api.h` | Both platforms use the same 32-byte entry and propagate `backend_cookie`; A5 additionally defines the URMA completion type |
+| Request issue | `runtime/backend/rdma/rdma_completion_kernel.h` | Present only on A5; native request issue requires `PTO_RDMA_SUPPORTED` |
+| Deferred entry | `runtime/aicore_completion_mailbox_types.h`, `runtime/async_kernel_api.h` | Both platforms use the same 32-byte entry and propagate `backend_cookie`; A5 additionally defines URMA and RDMA completion types |
 | FIN forwarding | `runtime/scheduler/scheduler_completion.cpp`, `runtime/aicore_completion_mailbox.h` | Both platforms carry `backend_cookie` into the same 64-byte mailbox message; A5 can populate it with URMA workspace metadata |
 | CQ polling/retirement | `runtime/backend/urma/urma_completion_scheduler.h`, `runtime/async_wait.h` | A5 registers URMA operations, polls CQE owner/status, advances the CQ/WQ tail, and updates the doorbell; the scheduler header itself is not guarded by the capability macro |
+| CQ polling/retirement | `runtime/backend/rdma/rdma_completion_scheduler.h`, `runtime/async_wait.h` | A5 registers RDMA-specific completion operations and snapshots; A2/A3 has no corresponding backend |
 
 ### A2/A3 Next-Block Prefetch
 
@@ -227,9 +260,9 @@ The A2/A3 completion path calls `prefetch_block_dst()` in
 declared in `runtime/scheduler/scheduler_context.h`. This prefetch reduces the
 A2/A3 sync-start drain burst without changing the scheduling protocol.
 
-Prefetch effectiveness depends strongly on platform characteristics such as
-cache capacity. The repository does not contain an A5 measurement that
-establishes a benefit, so the optimization should not be ported mechanically.
+Prefetch effectiveness depends on platform characteristics such as cache
+capacity. The recorded A5 experiment failed to establish stable benefit and
+showed short-task regressions, so the current decision is no A5 port.
 This is a platform-sensitive performance strategy, not a different scheduler
 architecture.
 
@@ -288,7 +321,7 @@ progress.
 
 | File | A5-only difference introduced by PR #1575 |
 | ---- | ----------------------------------------- |
-| `runtime/pto_ring_buffer.{h,cpp}` | A5 reclaim consumers request and await exact watermark publication after 10 ms without progress and before structural classification |
+| `runtime/ring_buffer.{h,cpp}` | A5 reclaim consumers request and await exact watermark publication after 10 ms without progress and before structural classification |
 | `runtime/orchestrator.cpp` | A5 TensorMap pressure requests publication from every ring after the same 10 ms no-progress interval |
 | `runtime/scheduler/{scheduler.h,scheduler_dispatch.cpp}` | A5 batches non-blocking publication at K=16 and services pressure requests in productive and idle loops; A2/A3 continues to publish every local advance |
 | `runtime/shared/runtime_init.cpp` | A5 initializes, resets, and wires the publication shadow and pressure handshake |
@@ -385,31 +418,71 @@ implementation there. This is an evidence-based software decision rather than
 an A5 hardware requirement; revisit it if a future A2/A3 timeline exposes the
 same tail release blocking.
 
-### Fatal Teardown
+### Normal and Fatal AICore Retirement
 
-The A2/A3 scheduler uses a dedicated fatal latch to elect an owner, broadcasts
-EXIT to all AICores that completed the handshake, and then joins them in
-parallel against a single deadline. A5 uses `completed_` to elect the owner and
-deinitializes each core sequentially.
+On the main baseline, A2/A3 uses a dedicated fatal latch, per-core retirement
+claims, grouped EXIT broadcast, a shared-deadline ACK sweep, register
+close/readback/drain, and a GM return gate. A5 still elects emergency shutdown
+using `completed_` and deinitializes cores serially on normal and fatal paths.
 
-The A2/A3 implementation mitigates failure scenarios involving 48 SDMA remote
-streams, but the hardware, PTO-ISA, and platform ABI do not mandate this
-algorithm. The current A5 sequential deinitialization does not omit the
-acknowledgement wait and is therefore not a known correctness defect. The risk
-is that each unresponsive core may consume a one-second timeout, so the
-aggregate teardown time can reach or exceed the AICPU operation-execution
-timeout.
+PR [#2388](https://github.com/hw-native-sys/simpler/pull/2388), tracked by
+[#2387](https://github.com/hw-native-sys/simpler/issues/2387), proposes the A5
+normal/fatal protocol: exactly-once per-core claims, EXIT broadcast and a
+shared deadline, IDLE close/readback/drain before releasing the per-core GM
+gate, and fatal publication before completion. It also applies the return-gate
+ordering to A5 `host_build_graph`. A5 does not define A2/A3's FAST_PATH register;
+the port closes and reads back the A5 dispatch register instead. The proposal
+must remain distinct from main until integration and acceptance are complete.
 
-The current implementations are retained. The total teardown time for N
-unresponsive cores should first be measured on A5. If a port is needed, the A5
-handshake, EXIT MMIO, shared deadline, and core deinitialization semantics must
-then be validated. See
-[Issue #1710](https://github.com/hw-native-sys/simpler/issues/1710) for tracking.
+The proposal also retains retirement requests received before core readiness.
+The corresponding A2/A3 READY/REQUESTED follow-up is
+[#2492](https://github.com/hw-native-sys/simpler/issues/2492) / PR
+[#2506](https://github.com/hw-native-sys/simpler/pull/2506), not an A2/A3 change
+inside #2388. Broader fatal-timeout work remains under
+[#1710](https://github.com/hw-native-sys/simpler/issues/1710). The older #2286
+no-net-gain result is superseded as a tracking disposition by #2387, not evidence
+that the current proposal has no cost or requires no acceptance.
 
-| File | Current difference |
-| ---- | ------------------ |
-| `runtime/scheduler/scheduler_cold_path.cpp` | A2/A3 uses a fatal latch, broadcasts EXIT, and uses a shared deadline; A5 uses a `completed_` owner and deinitializes each core sequentially |
-| `runtime/scheduler/scheduler_context.h` | A2/A3 declares fatal-owner election and broadcast/join helpers; A5 retains its existing emergency-shutdown interface |
+| File | Main baseline and pending proposal |
+| ---- | ---------------------------------- |
+| `runtime/scheduler/{scheduler_cold_path.cpp,scheduler_context.h}` | A2/A3 has dedicated fatal/retirement ownership; #2388 proposes A5 per-core ownership, READY/REQUESTED publication, and group retirement |
+| `runtime/shared/runtime.cpp`, `runtime/runtime.h` | Main A2/A3 separates the host-initialized prefix from its AICPU-initialized gate tail; #2388 adds the same descriptor lifetime distinction to A5 |
+| `aicore/aicore_executor.cpp` | Main A2/A3 waits at the GM gate after ACK; #2388 adds the corresponding A5 return wait |
+
+### Joined Native Launch and Error Status
+
+Main includes [#2491](https://github.com/hw-native-sys/simpler/pull/2491): A5
+TMR can accept a successor's native submission before its predecessor completes,
+while device execution remains serial. Its AICPU-stream ordering waits for the
+predecessor's AICore end before the whole-operator boundary can admit the next
+arena reset. Compatible live preparation requires a prebuilt-arena cache hit;
+rebuilding/uploading that shared arena beside a live predecessor is refused.
+
+A5 reports failures only from that run's retained published result. A missing
+or short record preserves the existing execution error; it cannot fall back to
+the shared header, which the successor may already have reset. A2/A3 TMR still
+uses serial launch and deliberately retains its shared-header fallback while
+the failed run owns the execution claim. A port requires coupled ordering,
+per-slot result-region publication, and status handling; toggling the capability
+or deleting the fallback alone is invalid. These are newer main contracts;
+PR #2388's historical performance snapshot `87ce4653b` predates #2491;
+its rebased source includes the main launch/status contract. Historical
+performance measurements do not validate that newer cross-run contract.
+
+### Remaining Software and Diagnostic Reconciliation
+
+The [2026-10-08 #1582 audit](https://github.com/hw-native-sys/simpler/issues/1582#issuecomment-6051030154)
+keeps these separate from #2388 retirement acceptance:
+
+| Item | Source difference | Required disposition |
+| ---- | ----------------- | -------------------- |
+| Empty Tier-0 (#2105) | A5 publishes `sync_task_seen` and skips empty sync-start staging; A2/A3 always probes Tier-0 | Benchmark A2/A3 before porting or recording keep-as-is |
+| Profiling queue-tag producer | A5's profiled `ChipReadyQueue::push` initializes `task_id_snapshot` to the invalid sentinel; A2/A3's overload does not | Align and add focused coverage, or establish why the tag is irrelevant for that path; no observed misdispatch is claimed |
+| Async stall diagnostics | A5 `AsyncWaitList::log_diagnostics` dumps mailbox/wait entries and backend snapshots; A2/A3 lacks the generic dump | Decide shared COUNTER/SDMA coverage without blindly porting RDMA-specific details |
+
+The original July/August migration list is not a current missing-feature
+checklist. Its landed items stay completed; these remaining decisions and
+retirement acceptance keep #1582 open.
 
 ### Scheduler Trace Attribution
 

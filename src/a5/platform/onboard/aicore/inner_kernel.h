@@ -21,6 +21,7 @@
 #define PLATFORM_A5_AICORE_INNER_KERNEL_H_
 
 #include <cstdint>
+#include "aicore_teardown.h"
 
 #include "common/platform_config.h"
 
@@ -48,6 +49,14 @@
 // OUT_OF_ORDER_FULL_BARRIER - no-op on real hardware (dcci handles full cache coherency)
 #define OUT_OF_ORDER_FULL_BARRIER() ((void)0)
 
+// EXITED acknowledges quiescence; only the AICPU's post-close gate permits return.
+__aicore__ inline void wait_for_post_close_release(__gm__ uint32_t *release) {
+    while (static_cast<uint32_t>(ld_dev(release, 0)) != AICORE_POST_CLOSE_RELEASE) {
+        SPIN_WAIT_HINT();
+    }
+    dsb(DSB_DDR);
+}
+
 /**
  * Read an AICore register via SPR access
  *
@@ -69,6 +78,14 @@ __aicore__ inline uint64_t read_reg(RegId reg) {
         // pmu_collector_aicore.h. This single-arg SPR form only covers
         // DATA_MAIN_BASE / CTRL / COND.
         return 0;
+    }
+}
+
+// Resident startup can fail before AICPU has reset this run's return gate.
+// Only its DMB EXIT, published after that reset, permits the EXITED ACK.
+__aicore__ inline void wait_for_aicpu_exit_signal() {
+    while (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
+        SPIN_WAIT_HINT();
     }
 }
 

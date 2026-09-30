@@ -126,9 +126,9 @@ uint32_t Runtime::callable_table_len() const { return dev.callable_table_len_; }
 // trb's device image is just the `dev` descriptor (the rest of Runtime is
 // host-only). A steady-state run re-publishes it up to the handshake region:
 // the AICore writes its report there and the AICPU the task pointer it answers
-// with, so no host value is consumed. A5 has no post-close gate array, so the
-// initialized prefix and the device extent coincide; all three entry points
-// exist so the shared host paths need no per-runtime branch.
+// with, so no host value is consumed. The first publication also initializes
+// the handshake region. Return gates form the AICPU-initialized tail and are
+// included in the device extent, outside the host-initialized prefix.
 //
 // The length stops inside the entry args, after the tensor slots this run
 // filled, which is why it is the one length that depends on the run rather than
@@ -196,7 +196,9 @@ LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &rt) {
 
 // The first publication onto an allocation adds the handshake region, so it
 // starts from the ctor-zeroed host copy rather than from whatever rtMalloc
-// left. This runtime has no host-uninitialized tail, so that reaches the end.
-size_t runtime_device_initialized_prefix_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }
+// left. Return gates are initialized by the AICPU before window-open.
+size_t runtime_device_initialized_prefix_size(const Runtime &) {
+    return offsetof(DeviceRuntimeLaunchDesc, teardown_gates);
+}
 
 size_t runtime_device_extent_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }

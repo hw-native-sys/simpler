@@ -208,14 +208,24 @@ a5 TRB's `deinit` takes `Runtime * /*runtime*/` unnamed and performs none
 | ---- | ------------------------------------ |
 | a2a3 TRB | `dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT)` (`:276`), then a **read** — bypass-load of `dev.teardown_gates[block_idx].post_close_release` (`:280`) |
 | a2a3 HBG | same shape: `dcci` (`:301`), then teardown-gate read (`:305`) |
-| a5 TRB | `dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT)` (`:255`); no teardown gate exists on this variant |
+| a5 TRB | at baseline `dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT)` (`:255`), with no gate member on this variant; see the post-baseline note below |
 | a5 HBG legacy | final `dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT)` before return, commented "Flush all dirty cache lines to HBM before kernel exit" (`aicore_legacy_executor.cpp`, end of function) |
 | a5 HBG resident | **no final handshake `dcci`**; the function ends at `write_reg(RegId::COND, AICORE_EXITED_VALUE)` (`aicore_executor.cpp:695`) |
 
+> **Post-baseline change (#2388).** Everything here is stated at commit
+> `31da0560e`, before the a2a3 retirement port. a5 TRB has since gained a
+> `teardown_gates` member and now matches the a2a3 exit shape: `dcci(...,
+> CACHELINE_OUT)` (`aicore_executor.cpp:268`) then a bypass load of
+> `dev.teardown_gates[block_idx].post_close_release` (`:269`). Statements below
+> that say a5 TRB "has no gate member" describe the baseline, not current code.
+> The final #2388 revision also gates a5 HBG legacy and resident returns;
+> resident startup/exit watchdog paths wait for the AICPU's actual EXIT before
+> ACK so a reused descriptor's stale RELEASE cannot bypass the close.
+
 The a2a3 paths' last descriptor access is a *read* placed after their own
-write-back, which is a different exit shape from a5 TRB's write-back-and-return
-and from a5 HBG resident's no-final-flush. The resident path's exit must not be
-described using the legacy path's flush.
+write-back. At this audit's baseline a5 TRB instead wrote back and returned, but
+post-baseline (#2388) it takes the a2a3 shape; a5 HBG resident still has no final
+flush. The resident path's exit must not be described using the legacy path's flush.
 
 **What the primitive is** (`src/common/platform/onboard/aicpu/cache_ops.cpp:20`):
 
@@ -231,11 +241,12 @@ described using the legacy path's flush.
   exercises any of this.
 
 The AICPU **does store** into descriptor lines — `workers[i].task`
-(`scheduler_cold_path.cpp`) and, on a2a3, `teardown_gates`. Whether any given line
-is *dirty* at the `dc civac` call depends on the mapping's write policy and on
-prior maintenance, neither of which is established here; so the clean half of that
-call has a *possible* role in publishing AICPU-authored bytes, not a demonstrated
-one. Either way, the call is not reducible to "invalidate for the next DMA".
+(`scheduler_cold_path.cpp`) and, on a2a3 and post-baseline a5 TRB,
+`teardown_gates`. Whether any given line is *dirty* at the `dc civac` call depends
+on the mapping's write policy and on prior maintenance, neither of which is
+established here; so the clean half of that call has a *possible* role in
+publishing AICPU-authored bytes, not a demonstrated one. Either way, the call is
+not reducible to "invalidate for the next DMA".
 
 > **Withdrawn from the first version:** "the `dc civac` is performing a write-back
 > of AICPU-authored bytes." Observed stores do not establish a dirty write-back
@@ -558,8 +569,12 @@ these:
   cannot succeed at all, so the question there is recovery, not publication.
 - **A core released but still spinning when the AICPU tears down** is the interleaving
   above.
-- **a5** has no gate member on TRB and does not use the gates on HBG, so this whole row
-  is a2a3-only.
+- **a5** at this audit's baseline had no gate member on TRB and does not use the
+  gates on HBG, so this whole row is a2a3-only. Post-baseline (#2388) a5 TRB
+  carries per-core `teardown_gates`, and the final revision also uses them in
+  a5 HBG. The same failure and partial-exit questions apply; the ordering and
+  publication arguments above were written for a2a3 and are not restated here
+  as validated on a5.
 
 **Limit of what is established about the failure path.** `retire_cores` logs each
 unreleased core and returns `-1` (`scheduler_cold_path.cpp:695-703` TRB); this entry
@@ -603,7 +618,12 @@ in exactly this direction. It does **not** add up to "the clean has no consumer"
   while the clean still spans `sizeof(runtime->dev)`, so the clean covers a device-only
   region. **This is a post-`31da0560e` change**: at the older baseline
   `runtime_device_copy_size` returned `sizeof(DeviceRuntimeLaunchDesc)` and the two
-  extents agreed. a5 TRB has no gate member, so its upload is the whole descriptor.
+  extents agreed. At baseline a5 TRB had no gate member, so its upload was the whole
+  descriptor. **Post-baseline (#2388)** a5 TRB gains `teardown_gates`, so its
+  `runtime_device_initialized_prefix_size` stops at
+  `offsetof(..., teardown_gates)` while `runtime_device_extent_size` stays
+  `sizeof(DeviceRuntimeLaunchDesc)` and the same two-extent split applies;
+  `runtime_device_copy_size` is unchanged.
 
 ### Evidence of no reader, versus unresolved reader
 

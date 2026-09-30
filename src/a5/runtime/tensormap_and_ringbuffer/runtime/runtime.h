@@ -43,6 +43,7 @@
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "dispatch_payload.h"
+#include "aicore_teardown.h"
 #include "task_args.h"
 #include "common/launch_entry_args.h"             // EntryArgsSource, LaunchEntryArgsPlan
 #include "tensormap_and_ringbuffer/entry_args.h"  // EntryArgsStorage
@@ -159,8 +160,9 @@ inline bool aicore_report_accepted(const volatile Handshake *handshake, uint64_t
  * Three lengths, in order. `runtime_device_copy_size` is what a steady-state run
  * re-publishes and stops before `workers`; `runtime_device_initialized_prefix_size`
  * adds `workers`, and is what the first publication onto an allocation sends so
- * the handshake region starts defined. This runtime has no gate tail, so that
- * second length equals `runtime_device_extent_size`.
+ * the handshake region starts defined. The return gates after `workers` are
+ * AICPU-initialized, so `runtime_device_extent_size` carries them and is the
+ * larger of the last two.
  *
  * Adding a field here grows the device image; adding a field to Runtime's
  * host-only tail does not. Keep it standard-layout (static_assert below) so the
@@ -253,9 +255,10 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // the AICPU the task pointer it answers with — and no host value is
     // consumed. A steady-state run re-uploads none of it; the first publication
     // onto a given allocation carries it once, which is what gives a fresh
-    // block a defined starting value. This runtime has no gate tail, so the
-    // initialized prefix ends with this array, at the end of the descriptor.
+    // block a defined starting value. The initialized prefix ends here; the
+    // AICPU initializes the isolated return gates before opening any window.
     Handshake workers[RUNTIME_MAX_WORKER];
+    AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
 };
 
 // =============================================================================
@@ -298,6 +301,7 @@ public:
     int get_aicpu_thread_num() const { return dev.aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { dev.aicpu_thread_num = n; }
     Handshake *get_workers() { return dev.workers; }
+    AicoreTeardownControl *get_teardown_gates() { return dev.teardown_gates; }
     const Handshake *get_workers() const { return dev.workers; }
     int32_t get_aicpu_allowed_cpu_count() const { return dev.aicpu_allowed_cpu_count; }
     void set_aicpu_allowed_cpu_count(int32_t n) { dev.aicpu_allowed_cpu_count = n; }
@@ -491,9 +495,17 @@ static_assert(
 );
 static_assert(
     offsetof(DeviceRuntimeLaunchDesc, workers) + sizeof(DeviceRuntimeLaunchDesc::workers) ==
+        offsetof(DeviceRuntimeLaunchDesc, teardown_gates),
+    "teardown_gates must immediately follow the initialized handshake prefix"
+);
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) % 64 == 0,
+    "return gates must not share cache lines with handshake writes"
+);
+static_assert(
+    offsetof(DeviceRuntimeLaunchDesc, teardown_gates) + sizeof(DeviceRuntimeLaunchDesc::teardown_gates) ==
         sizeof(DeviceRuntimeLaunchDesc),
-    "workers must end the descriptor on this runtime: it has no gate tail, so the initialized prefix is "
-    "the whole extent and a field appended behind it would never be published"
+    "teardown_gates must end the descriptor"
 );
 
 // Bytes a steady-state run uploads: the descriptor before the handshake region.
@@ -502,13 +514,12 @@ static_assert(
 size_t runtime_device_copy_size(const Runtime &rt);
 
 // Bytes the first publication onto a device allocation uploads: through the end
-// of the handshake region. A5 trb has no post-close gate array, so this equals
-// the device extent below.
+// of the handshake region, excluding the AICPU-initialized return gates.
 size_t runtime_device_initialized_prefix_size(const Runtime &rt);
 
 // Bytes of device memory a Runtime image occupies, and the size every allocation
 // backing a device `Runtime` must use. Never smaller than
-// `runtime_device_initialized_prefix_size`; equal to it on this runtime.
+// `runtime_device_initialized_prefix_size`.
 size_t runtime_device_extent_size(const Runtime &rt);
 
 // This run's entry-argument routing facts, captured from `rt` while it is still
