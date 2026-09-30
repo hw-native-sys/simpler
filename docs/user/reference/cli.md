@@ -6,7 +6,7 @@ How you select what runs, turn diagnostics on, and read the artifacts back.
 
 ```bash
 pytest examples tests/st --platform a2a3sim            # simulation, no device
-pytest examples tests/st -m "not sdma" --platform a2a3 --exclude-level 4 --device 4-7  # hardware (SDMA/network1 quarantined; network1 runs in the two-machine job)
+pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device 4-7  # hardware (SDMA/network1 quarantined; network1 runs in the two-machine job)
 python examples/my_example/test_my_example.py -p a2a3sim   # standalone, no pytest
 ```
 

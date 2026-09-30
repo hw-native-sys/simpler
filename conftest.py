@@ -515,7 +515,10 @@ def pytest_configure(config):
     )
     config.addinivalue_line(
         "markers",
-        "sdma_fault: the a2a3 SDMA fault-injection test; run in an isolated task-submit job.",
+        "sdma_fault: a fault-injection case that provisions SDMA and then faults an "
+        "AICore, so its own teardown is what #1425 charges. The a2a3 CI selects it "
+        "into a one-device task of its own, and both other selections exclude it by "
+        "name -- so it reaches that task whether or not it also carries `sdma`.",
     )
     config.addinivalue_line(
         "markers",

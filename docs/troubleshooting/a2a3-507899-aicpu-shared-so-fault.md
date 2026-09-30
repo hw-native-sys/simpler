@@ -63,7 +63,7 @@ exception you must surface the CANN device slog, which is otherwise hidden:
 
    ```bash
    ASCEND_SLOG_PRINT_TO_STDOUT=1 ASCEND_GLOBAL_LOG_LEVEL=1 \
-   python -m pytest examples tests/st -m "not sdma" --platform a2a3 --exclude-level 4 --device <range> -v \
+   python -m pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device <range> -v \
      --pto-session-timeout 600
    ```
 

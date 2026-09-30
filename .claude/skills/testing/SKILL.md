@@ -15,8 +15,8 @@ description: Testing guide and pre-commit testing strategy for simpler. Use when
 
 **Important**: Always read `.github/workflows/ci.yml` first for the current
 `--pto-session-timeout` values. Quarantines are marker-based, so mirror the
-a2a3 sweep with `-m "not sdma" --exclude-level 4` rather than copying a path
-list. PTO-ISA reproducibility comes from the repo-root `pto_isa.pin`.
+a2a3 sweep with `-m "not sdma and not sdma_fault" --exclude-level 4` rather than
+copying a path list. PTO-ISA reproducibility comes from the repo-root `pto_isa.pin`.
 
 **CI does not run one flat sweep on a2a3.** Marked tests are quarantined out of
 the general onboard sweep and run in a step of their own, after it, because
@@ -75,7 +75,7 @@ pytest examples tests/st --platform a2a3sim \
 
 # All hardware scene tests — mirror ci.yml: deselect the quarantined marker, or
 # those tests fail here and nowhere else
-pytest examples tests/st -m "not sdma" --exclude-level 4 --platform a2a3 --device <range> \
+pytest examples tests/st -m "not sdma and not sdma_fault" --exclude-level 4 --platform a2a3 --device <range> \
     --pto-session-timeout <timeout>
 
 # The quarantined tests, the way CI runs them — same corpus, selected by the
@@ -84,7 +84,7 @@ pytest examples tests/st -m "not sdma" --exclude-level 4 --platform a2a3 --devic
 pytest examples tests/st -m "sdma and not sdma_fault" \
     --platform a2a3 --device <2 devs> --pto-session-timeout <timeout>
 # Run the a2a3 fault-injection case in its own task/device.
-pytest tests/st -m sdma_fault \
+pytest examples tests/st -m sdma_fault \
     --platform a2a3 --device <1 dev> --pto-session-timeout <timeout>
 
 # A5 runs the corpus below level 4, including SDMA tests, on both host architectures.

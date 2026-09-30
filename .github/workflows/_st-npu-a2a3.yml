@@ -104,11 +104,16 @@ jobs:
               --platform a2a3 --compile-only --compile-workers 8
           done
 
+      # Three selections over one corpus, disjoint and exhaustive: a test with
+      # neither marker lands here, `sdma` alone in the demo task, and
+      # `sdma_fault` in the isolated one whether or not it also carries `sdma`.
+      # Each names `examples tests/st`, so a case cannot fall between them by
+      # living under a path one of them does not walk.
       - name: Run pytest scene tests (a2a3)
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-            --run ".venv/bin/python -m pytest examples tests/st -m 'not sdma' --platform a2a3 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
+            --run ".venv/bin/python -m pytest examples tests/st -m 'not sdma and not sdma_fault' --platform a2a3 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
 
       - name: SDMA pytest (a2a3)
         if: inputs.manual_mode != 'only'
@@ -123,7 +128,7 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num 1 \
-            --run ".venv/bin/python -m pytest tests/st -m sdma_fault --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+            --run ".venv/bin/python -m pytest examples tests/st -m sdma_fault --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
 
       - name: DFX smokes (a2a3)
         if: inputs.include_dfx_smokes

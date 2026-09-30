@@ -19,8 +19,10 @@ Detection / isolation procedures referenced below live in
 5. **Select a device range** (§C, range ≤4) — or, when wrapping in
    `task-submit`, let it pick via `--device auto --device-num <range size>`.
 6. **Read the marker selector out of the same job** you took the timeout from.
-   `st-onboard-a2a3` is two pytest passes: the sweep deselects `-m "not sdma"`
-   and a later step runs `-m sdma`. `st-onboard-a5` uses `--exclude-level 4` and
+   `st-onboard-a2a3` is three pytest passes: the sweep deselects
+   `-m "not sdma and not sdma_fault"`, a later step runs
+   `-m "sdma and not sdma_fault"`, and a one-device step runs `-m sdma_fault`.
+   `st-onboard-a5` uses `--exclude-level 4` and
    does not exclude `sdma`. Both quarantined tests are
    `tensormap_and_ringbuffer`, so the second pass is only needed when
    `$ARGUMENTS` names that runtime.
@@ -37,7 +39,7 @@ Detection / isolation procedures referenced below live in
    is:
 
    ```bash
-   pytest examples tests/st -m "not sdma" --exclude-level 4 --platform <platform> --runtime $ARGUMENTS \
+   pytest examples tests/st -m "not sdma and not sdma_fault" --exclude-level 4 --platform <platform> --runtime $ARGUMENTS \
      --device <range-or-$TASK_DEVICE> \
      --pto-session-timeout <timeout> -v
    ```

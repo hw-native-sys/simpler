@@ -17,8 +17,10 @@ Detection / isolation procedures referenced below live in
 4. **Select a device range** (§C, range ≤4) — or, when wrapping in
    `task-submit`, let it pick via `--device auto --device-num <range size>`.
 5. **Read the marker selector out of the same job** you took the timeout from.
-   `st-onboard-a2a3` is two pytest passes, not one: the sweep deselects
-   `-m "not sdma"` and a later step runs `-m sdma`. `st-onboard-a5` uses
+   `st-onboard-a2a3` is three pytest passes, not one: the sweep deselects
+   `-m "not sdma and not sdma_fault"`, a later step runs
+   `-m "sdma and not sdma_fault"`, and a one-device step runs `-m sdma_fault`.
+   `st-onboard-a5` uses
    `--exclude-level 4` and does not exclude `sdma`. Take the expression from
    `ci.yml` rather than assuming, so this skill cannot drift from the job it
    reproduces.
@@ -34,7 +36,7 @@ Detection / isolation procedures referenced below live in
    is:
 
    ```bash
-   pytest examples tests/st -m "not sdma" --exclude-level 4 --platform <platform> \
+   pytest examples tests/st -m "not sdma and not sdma_fault" --exclude-level 4 --platform <platform> \
      --device <range-or-$TASK_DEVICE> --pto-session-timeout <timeout> -v
    ```
 
