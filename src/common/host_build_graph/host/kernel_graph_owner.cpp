@@ -182,6 +182,7 @@ int DeviceRunnerBase::prepare_hbg_kernel_callable_registration(
     registration.scalar_count = callable.scalar_count;
     registration.device_id = device_id_;
     registration.runtime_binary_id = kernel_runtime_binary_id_;
+    registration.kernel_args_address = reinterpret_cast<uint64_t>(persistent_args_.device_k_args());
     if (!hbg::valid_hbg_callable_registration(registration)) return PTO_RUNTIME_ERR_INTERNAL;
     context.callable_registrations.emplace(callable_id, registration);
     rc = commit_device_register(callable_id);

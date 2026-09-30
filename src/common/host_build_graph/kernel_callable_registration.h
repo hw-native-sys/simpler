@@ -18,7 +18,7 @@
 
 namespace hbg {
 
-inline constexpr uint32_t HBG_CALLABLE_REGISTRATION_VERSION = 1;
+inline constexpr uint32_t HBG_CALLABLE_REGISTRATION_VERSION = 2;
 
 // Prepare-owned metadata. The device callable image remains owned by the
 // context callable cache; this record only lends it to one context generation.
@@ -37,18 +37,20 @@ struct HbgCallableRegistration {
     int32_t scalar_count{0};
     int32_t device_id{-1};
     uint64_t runtime_binary_id{0};
+    uint64_t kernel_args_address{0};  // Context-owned, including the mutable DFX window flag.
 };
 
 static_assert(std::is_standard_layout_v<HbgCallableRegistration>);
 static_assert(std::is_trivially_copyable_v<HbgCallableRegistration>);
-static_assert(sizeof(HbgCallableRegistration) == 88);
+static_assert(sizeof(HbgCallableRegistration) == 96);
 
 inline bool valid_hbg_callable_registration(const HbgCallableRegistration &r) noexcept {
     return r.version == HBG_CALLABLE_REGISTRATION_VERSION && r.bytes == sizeof(r) && r.context_generation != 0 &&
            r.runtime_address != 0 && r.register_table_address != 0 &&
            r.register_table_address % alignof(uint64_t) == 0 && r.callable_address != 0 &&
            r.callable_bytes >= sizeof(ChipCallable) && r.callable_hash != 0 && r.function_hash != 0 &&
-           r.device_id >= 0 && r.runtime_binary_id != 0 &&
+           r.device_id >= 0 && r.runtime_binary_id != 0 && r.kernel_args_address != 0 &&
+           r.kernel_args_address % alignof(uint64_t) == 0 &&
            simpler::kernel::valid_prepared_invocation({r.callable_id, r.tensor_count, r.scalar_count});
 }
 

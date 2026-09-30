@@ -136,6 +136,17 @@ prepare/freeze and slot registration. Callable prepare uploads context-owned
 images and stores immutable registration metadata without enqueuing a registration
 kernel or synchronizing a stream/event/device. It may run inside capture, including
 after an earlier launch has joined the internal streams to that capture.
+The version-2 callable registration also lends the context-owned persistent
+`KernelArgs` address to AICPU. Before scheduler initialization, the leader reads
+its current swimlane flag and buffer addresses, including on captured replay.
+This keeps AICPU rotation-table initialization in step with AICore when a DFX
+window opens or closes; the kernel HostArgs entry bypasses the program entry
+that normally publishes these fields.
+With `enable_dep_gen`, graph construction writes `deps_callable_<id>.json` in
+the configured output directory. Each file describes the latest build of that
+callable; cached replay does not rerun host orchestration. A trace containing
+multiple callables must resolve task IDs against the matching file for each
+launch, rather than treating IDs from different roots as one dependency graph.
 Each launch enqueues an idempotent callable registration immediately before graph
 execution on the same AICPU stream. Both operations are captured and replayed in
 order. An eager launch or another captured graph carries its own registration,

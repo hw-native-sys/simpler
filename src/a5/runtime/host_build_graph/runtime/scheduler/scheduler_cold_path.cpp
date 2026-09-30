@@ -812,6 +812,8 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
     // and therefore before any register window is opened.
     if (is_chip_swimlane_enabled()) {
         chip_swimlane_aicpu_init(runtime->worker_count);
+        // Task IDs restart at each HBG launch, including graph replay.
+        chip_swimlane_aicpu_record_run_boundary();
         chip_swimlane_level_ = get_chip_swimlane_level();
         if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
             // Sched-phase pool count must match the dump_args_init thread count
