@@ -452,10 +452,23 @@ public:
     int device_memset(void *dev_ptr, int value, std::size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, std::size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, std::size_t size);
-    int acquire_graph_definition_block(
-        uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **staging_out
-    );
+    int acquire_graph_staging(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **staging_out);
     void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, std::size_t *size);
+    /**
+     * Take this run's packed Definition section into the slot's launch package.
+     *
+     * The bytes are copied into the package the AICPU launch carries, and the
+     * run's `KernelArgs` is stamped with the section's offset, length and
+     * carrier. Nothing device-side is allocated, uploaded or freed: RTS copies
+     * the package as part of the launch it already makes.
+     *
+     * @return 0 on success; PTO_RUNTIME_ERR_INVALID_ARGUMENT for a length the
+     *         package cannot represent, PTO_RUNTIME_ERR_INTERNAL when the
+     *         package could not be grown or no run is prepared on this slot
+     */
+    int publish_graph_section(
+        uint32_t pipeline_slot, const void *bytes, std::size_t length, uint32_t *source_out, uint64_t *base_out
+    );
     /**
      * Hand one pipeline slot its retained scheduler-state storage, both sides.
      *
@@ -2233,7 +2246,7 @@ protected:
         load_aicpu_op_.ForgetWithoutUnload();
     }
 
-    void release_graph_definition_blocks();
+    void release_graph_definition_staging();
 
     /**
      * Release every slot's retained scheduler-state storage.
@@ -2262,15 +2275,6 @@ protected:
     /** Drop every retained host SM mirror, returning its pages to the allocator. */
     void release_sm_mirrors();
     void release_run_image_stagings();
-
-    /**
-     * Drop the retained graph-definition blocks without freeing the device side.
-     *
-     * The fatal counterpart of release_graph_definition_blocks(): a force reset
-     * has already invalidated every device allocation, so only the host-side
-     * bookkeeping and staging are dropped.
-     */
-    void abandon_graph_definition_blocks();
 
     /**
      * Clear host-side ownership after a fatal device failure without issuing
@@ -2499,21 +2503,17 @@ protected:
     // the grow/slice logic lives in utils/retained_temp_bump.h.
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<std::size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
-    // Graph Definition storage, one retained block per pipeline slot — see
-    // HostApi acquire_graph_definition_block. `staging` is the host block the
-    // run's Definition objects are packed into and stays allocated across runs,
-    // so a bind neither acquires nor returns host memory for them; the device
-    // side is the raw allocation plus the aligned address handed out. One block
-    // per slot rather than one per Definition: every Definition of a run is
-    // packed end to end and shipped by a single H2D, and every submission
-    // references the device-resident copy of its own Definition.
-    struct RetainedGraphBlock {
-        void *allocation{nullptr};
-        void *aligned_addr{nullptr};
-        std::size_t capacity{0};
-        std::vector<std::byte> staging;
+    // One pipeline slot's Graph Definition staging: host bytes the recorders
+    // build their objects into and the bind packs into the run's AICPU launch
+    // package. Grow-only and content-preserving, because a bind knows the run's
+    // total only after every recording has already written its own object into
+    // the prefix. No device member: the packed bytes reach the device inside the
+    // launch arguments RTS copies, so this slot owns no device Definition block
+    // to grow, publish or release.
+    struct RetainedGraphStaging {
+        std::vector<std::byte> bytes;
     };
-    std::array<RetainedGraphBlock, PTO_PIPELINE_MAX_DEPTH> graph_definition_blocks_{};
+    std::array<RetainedGraphStaging, PTO_PIPELINE_MAX_DEPTH> graph_definition_staging_{};
     // Scheduler-state storage, one retained pair per pipeline slot — see
     // HostApi acquire_scheduler_state_storage and utils/retained_scheduler_storage.h,
     // which holds the grow, alignment and failure rules. One pair per slot

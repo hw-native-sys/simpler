@@ -41,6 +41,7 @@
 #include "arg_direction.h"
 #include "callable.h"
 #include "common/host_api.h"
+#include "common/launch_entry_args.h"
 #include "host_build_graph/graph_host_state.h"
 #include "host_build_graph/host_tensor_access.h"
 #include "host/raii_scope_guard.h"
@@ -198,8 +199,12 @@ struct FakeHostApi {
     std::vector<uint8_t> gm_heap;
     std::vector<uint8_t> runtime_arena;
     std::vector<uint8_t> sm_mirror;
-    std::vector<uint8_t> definition_device;
     std::vector<uint8_t> definition_staging;
+    // The section the bind handed to the carrier, and how many times it did.
+    std::vector<uint8_t> published_section;
+    size_t section_publications{0};
+    // Stands in for a carrier that cannot take this length.
+    bool refuse_section{false};
     size_t definition_bytes{0};
     // One pipeline slot's retained scheduler-state pair, as the runner holds
     // it: grow-only, so a bind that fits the retained capacity gets the same
@@ -395,11 +400,13 @@ int fake_acquire_run_image_staging(void *, uint32_t, size_t bytes, size_t alignm
     *out = reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
     return 0;
 }
-int fake_acquire_graph_definition_block(void *, uint32_t, size_t bytes, size_t alignment, void **dev, void **stage) {
+int fake_acquire_graph_staging(void *, uint32_t, size_t bytes, size_t alignment, void **stage) {
     auto align = [alignment](std::vector<uint8_t> &v) {
         auto raw = reinterpret_cast<uintptr_t>(v.data());
         return reinterpret_cast<void *>((raw + alignment - 1) & ~static_cast<uintptr_t>(alignment - 1));
     };
+    // Grow-only and content-preserving, as the platform's staging is: the
+    // recorders' objects are already in this block's prefix.
     if (bytes > g_fake->definition_bytes) {
         std::vector<uint8_t> staging(bytes + alignment, 0);
         void *new_base = align(staging);
@@ -410,11 +417,23 @@ int fake_acquire_graph_definition_block(void *, uint32_t, size_t bytes, size_t a
         }
         g_fake->definition_offset = static_cast<uint8_t *>(new_base) - staging.data();
         g_fake->definition_staging = std::move(staging);
-        g_fake->definition_device.assign(bytes + alignment, 0);
         g_fake->definition_bytes = bytes;
     }
-    *dev = align(g_fake->definition_device);
     *stage = g_fake->definition_staging.data() + g_fake->definition_offset;
+    return 0;
+}
+// The carrier stands in for the launch package: the section is copied into
+// storage the fake owns, and the reported source says so. Nothing device-side is
+// allocated or uploaded, which is the property these cases check.
+int fake_publish_graph_section(
+    void *, uint32_t, const void *bytes, size_t length, uint32_t *source_out, uint64_t *base_out
+) {
+    if (bytes == nullptr || length == 0) return -1;
+    if (g_fake->refuse_section) return -1;
+    g_fake->published_section.assign(static_cast<const uint8_t *>(bytes), static_cast<const uint8_t *>(bytes) + length);
+    ++g_fake->section_publications;
+    if (source_out != nullptr) *source_out = static_cast<uint32_t>(GraphSectionSource::LaunchEnvelope);
+    if (base_out != nullptr) *base_out = 0;
     return 0;
 }
 int fake_acquire_scheduler_state_storage(
@@ -551,7 +570,8 @@ const HostApiOps &fake_ops() {
         r.host_phase_pool_finish = [](void *, uint32_t, uint64_t, uint64_t) {
             ++g_fake->phase_finish_calls;
         };
-        r.acquire_graph_definition_block = fake_acquire_graph_definition_block;
+        r.acquire_graph_staging = fake_acquire_graph_staging;
+        r.publish_graph_section = fake_publish_graph_section;
         r.get_graph_definition_staging = fake_get_graph_definition_staging;
         r.acquire_scheduler_state_storage = fake_acquire_scheduler_state_storage;
         r.declare_caller_device_writes = fake_declare_caller_device_writes;
@@ -987,23 +1007,28 @@ TEST_F(HbgBindLedgerTest, AllMetadataSourcesSurviveBindAndPublishInOrder) {
     EXPECT_EQ(fake_.copy_count, 0);
     EXPECT_EQ(fake_.orchestration_count, 1);
     const auto &pending = runtime.pending_publication();
-    ASSERT_EQ(pending.prerequisites.size(), 1u);
-    EXPECT_EQ(pending.prerequisites[0].phase, HostPhaseKind::BindGraphUpload);
-    auto *definition_target = pending.prerequisites[0].device_target;
+    // The Definition bytes are no longer a publication prerequisite: the bind
+    // hands them to the launch carrier, so the only metadata left to copy is the
+    // run image itself.
+    ASSERT_EQ(pending.prerequisites.size(), 0u);
+    EXPECT_EQ(fake_.section_publications, 1u);
+    const auto definition_bytes = fake_.published_section.size();
+    EXPECT_GT(definition_bytes, 0u);
+    EXPECT_EQ(runtime.get_graph_section_bytes(), definition_bytes);
+    EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::LaunchEnvelope);
+    EXPECT_EQ(runtime.get_graph_section_base(), 0u) << "the launch carrier publishes no shared address";
     auto *image_target = pending.device_target;
-    const auto definition_bytes = pending.prerequisites[0].bytes;
     const auto image_bytes = pending.bytes;
     ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
-    ASSERT_EQ(fake_.copies.size(), 2u);
-    EXPECT_EQ(fake_.copies[0].dst, definition_target);
-    EXPECT_EQ(fake_.copies[1].dst, image_target);
-    EXPECT_EQ(fake_.copies[0].bytes, definition_bytes);
-    EXPECT_EQ(fake_.copies[1].bytes, image_bytes);
+    ASSERT_EQ(fake_.copies.size(), 1u);
+    EXPECT_EQ(fake_.copies[0].dst, image_target);
+    EXPECT_EQ(fake_.copies[0].bytes, image_bytes);
     uint64_t recorded_bytes = 0;
-    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindGraphUpload, &recorded_bytes), 1u);
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindGraphPack, &recorded_bytes), 1u);
     EXPECT_EQ(recorded_bytes, definition_bytes);
     EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
-    EXPECT_EQ(fake_.copies.size(), 2u);
+    EXPECT_EQ(fake_.copies.size(), 1u) << "a second publication of the same run copies nothing";
+    EXPECT_EQ(fake_.section_publications, 1u) << "and hands the carrier nothing a second time";
     EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
 }
 
@@ -1032,16 +1057,20 @@ TEST_F(HbgBindLedgerTest, SchedulerModeChangesPublishOnlyThisRunsSources) {
         const bool definitions = entry == recording_orch_entry;
         fake_.copy_count = 0;
         fake_.copies.clear();
+        fake_.section_publications = 0;
         eps_ = {entry, capture_orch_bind};
         ChipStorageTaskArgs args;
         ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
         EXPECT_EQ(fake_.copy_count, 0);
         const auto &pending = runtime.pending_publication();
-        ASSERT_EQ(pending.prerequisites.size(), static_cast<size_t>(resident) + static_cast<size_t>(definitions));
+        // Only the resident scheduler state is a prerequisite now; a Definition
+        // travels in the launch package instead of a publication copy.
+        ASSERT_EQ(pending.prerequisites.size(), static_cast<size_t>(resident));
+        EXPECT_EQ(fake_.section_publications, definitions ? 1u : 0u);
         std::vector<void *> destinations;
         std::vector<std::vector<uint8_t>> snapshots;
         for (const auto &region : pending.prerequisites) {
-            EXPECT_EQ(region.phase, definitions ? HostPhaseKind::BindGraphUpload : HostPhaseKind::Count);
+            EXPECT_EQ(region.phase, HostPhaseKind::Count);
             destinations.push_back(region.device_target);
             const auto *source = static_cast<const uint8_t *>(region.source);
             snapshots.emplace_back(source, source + region.bytes);
@@ -1115,12 +1144,15 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
     const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
     for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, mixed_orch_entry}) {
         SCOPED_TRACE(entry == recording_orch_entry ? "graph" : entry == mixed_orch_entry ? "mixed" : "ordinary");
-        const size_t regions = 1 + static_cast<size_t>(entry == recording_orch_entry) +
-                               static_cast<size_t>(a5 && entry != recording_orch_entry);
+        // The run image, plus a resident scheduler state where one is selected.
+        // A Graph run adds nothing here: its Definition section goes to the
+        // launch carrier rather than through a publication copy.
+        const size_t regions = 1 + static_cast<size_t>(a5 && entry != recording_orch_entry);
         for (size_t failure = 1; failure <= regions; ++failure) {
             SCOPED_TRACE(failure);
             fake_.copy_count = 0;
             fake_.copies.clear();
+            fake_.section_publications = 0;
             eps_ = {entry, capture_orch_bind};
             ChipStorageTaskArgs args;
             ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
@@ -1147,11 +1179,9 @@ TEST_F(HbgBindLedgerTest, SchedulerPublicationFailureAllowsFreshModeSelection) {
             eps_ = {definitions ? recording_orch_entry : ordinary_orch_entry, capture_orch_bind};
             ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
             const auto &replacement = runtime.pending_publication();
-            ASSERT_EQ(
-                replacement.prerequisites.size(), static_cast<size_t>(resident) + static_cast<size_t>(definitions)
-            );
+            ASSERT_EQ(replacement.prerequisites.size(), static_cast<size_t>(resident));
             for (const auto &region : replacement.prerequisites) {
-                EXPECT_EQ(region.phase, definitions ? HostPhaseKind::BindGraphUpload : HostPhaseKind::Count);
+                EXPECT_EQ(region.phase, HostPhaseKind::Count);
             }
             if (a5) {
                 const uint32_t mode = runtime.dev.scheduler_bootstrap.runtime_mode;
@@ -1710,8 +1740,11 @@ TEST_F(HbgResidentSchedulerStorageTest, ALegacyRunNamesNoRetainedStorage) {
     // metadata it published is a Graph Definition block rather than scheduler
     // state, and its mode is neither unset nor the resident one.
     const auto &pending = runtime.pending_publication();
-    ASSERT_EQ(pending.prerequisites.size(), 1u);
-    EXPECT_EQ(pending.prerequisites[0].phase, HostPhaseKind::BindGraphUpload);
+    // A graph run publishes no metadata prerequisite at all: its Definition
+    // section rides the launch, and this run allocated no scheduler state.
+    ASSERT_EQ(pending.prerequisites.size(), 0u);
+    EXPECT_EQ(fake_.section_publications, 1u);
+    EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::LaunchEnvelope);
     const uint32_t legacy_mode = runtime.dev.scheduler_bootstrap.runtime_mode;
     EXPECT_NE(legacy_mode, 0u);
     EXPECT_NE(legacy_mode, resident_mode) << "a graph-execution run selects the legacy scheduler";
@@ -2017,6 +2050,54 @@ TEST_F(HbgHostAccessContractTest, AHostArgumentIsNeverRefusedByADeclaration) {
     ASSERT_EQ(bind(runtime, args, sig, 1), 0);
     EXPECT_EQ(access_.error, 0);
     EXPECT_EQ(writes_.query_calls, 0);
+}
+
+// A carrier that cannot take this run's section fails the bind, and the run's
+// descriptor is left naming no section at all rather than a length nothing
+// delivered.
+TEST_F(HbgBindLedgerTest, ARefusedCarrierFailsTheBindAndNamesNoSection) {
+    Runtime runtime;
+    init_runtime(runtime);
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    fake_.refuse_section = true;
+    EXPECT_NE(bind(runtime, args, nullptr, 0), 0);
+    EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::None);
+    EXPECT_EQ(runtime.get_graph_section_bytes(), 0u);
+    EXPECT_EQ(runtime.pending_publication().prerequisites.size(), 0u);
+}
+
+// A run with no Graph task names no section, so a reader cannot be handed a
+// predecessor's bytes on a reused slot.
+TEST_F(HbgBindLedgerTest, AnOrdinaryRunAfterAGraphRunNamesNoSection) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    // The ordinary run below selects a5's AICore scheduler, which resolves every
+    // task's callable at bind, so this run needs the tables a registration would
+    // have installed.
+    auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+    reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
+    const uint64_t object_table[] = {reinterpret_cast<uint64_t>(callable.data())};
+    const uint64_t entry_table[] = {0x1000};
+    runtime.set_callable_tables(
+        object_table, reinterpret_cast<uint64_t>(object_table), reinterpret_cast<uint64_t>(entry_table), 1
+    );
+    ChipStorageTaskArgs args;
+
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    ASSERT_EQ(runtime.get_graph_section_source(), GraphSectionSource::LaunchEnvelope);
+    const uint32_t graph_bytes = runtime.get_graph_section_bytes();
+    ASSERT_GT(graph_bytes, 0u);
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+
+    fake_.section_publications = 0;
+    eps_ = {ordinary_orch_entry, capture_orch_bind};
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    EXPECT_EQ(fake_.section_publications, 0u);
+    EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::None);
+    EXPECT_EQ(runtime.get_graph_section_bytes(), 0u);
 }
 
 TEST_F(HbgBindLedgerTest, RejectsUnsupportedTransferBeforeReadingEarlierArguments) {

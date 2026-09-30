@@ -1207,8 +1207,13 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
     definition.scalar_arg_count = total_scalars;
     definition.predicate_count = predicate_count;
     size_t execution_storage_bytes = 0;
+    // The execution keeps its own copy of the fanin CSR, so its rows and indices
+    // are part of the storage the outer task's heap tail has to hold. Sized here,
+    // where the counts are decided, and checked against this value on both ends
+    // of the bind.
     if (!graph_execution_storage_bytes(
-            definition.task_count, definition.tensor_arg_count, definition.scalar_arg_count, &execution_storage_bytes
+            definition.task_count, definition.tensor_arg_count, definition.scalar_arg_count, definition.edge_count,
+            &execution_storage_bytes
         ) ||
         execution_storage_bytes > UINT32_MAX) {
         return std::nullopt;

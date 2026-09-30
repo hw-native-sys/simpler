@@ -34,6 +34,7 @@
 
 #include <atomic>
 
+#include "graph_image_view.h"
 #include "common/memory_barrier.h"
 #include "utils/device_arena.h"
 #include "aicpu/platform_regs.h"  // get_reg_ptr / RegId for the early-dispatch doorbell
@@ -1382,15 +1383,18 @@ struct SchedulerState {
         return graph_route_ready_roots(execution);
     }
 
+    // `image` is the calling thread's own view of this run's Definition section;
+    // it is passed down rather than held here, because a view names the launch
+    // arguments of one thread and this context is shared by all of them.
     GraphMaterializeResult prepare_graph_task(
-        ChipTaskSlotState &outer_slot, int32_t max_tasks = GRAPH_MATERIALIZE_SLICE_TASKS,
+        ChipTaskSlotState &outer_slot, const GraphImageView &image, int32_t max_tasks = GRAPH_MATERIALIZE_SLICE_TASKS,
         int32_t *tasks_materialized = nullptr
     ) {
         GraphExecution *execution = graph_execution_from_outer_slot(outer_slot);
         if (execution == nullptr) return GraphMaterializeResult::INVALID;
         const int32_t before = execution->materialized_tasks;
         const GraphMaterializeResult result =
-            graph_execution_materialize_slice(outer_slot, *execution, max_tasks, tasks_materialized);
+            graph_execution_materialize_slice(outer_slot, *execution, image, max_tasks, tasks_materialized);
         if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::PREPARED) {
             graph_incremental_publish(*execution, before, execution->materialized_tasks);
         }
@@ -1455,7 +1459,7 @@ struct SchedulerState {
         // Membership is established by the branch above: graph_context names this task's
         // execution, and the shell case has already returned.
         GraphExecution *execution = static_cast<GraphExecution *>(slot_state.graph_context);
-        if (execution->definition == nullptr || execution->tasks == nullptr) {
+        if (execution->definition_offset == 0 || execution->tasks == nullptr) {
             outcome.error_code = SIMPLER_ERROR_INVALID_ARGS;
             return outcome;
         }

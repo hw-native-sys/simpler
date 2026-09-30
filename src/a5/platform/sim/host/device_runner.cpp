@@ -853,7 +853,7 @@ int DeviceRunner::finalize() {
     release_callable_state();
 
     unload_executor_binaries();
-    release_graph_definition_blocks();
+    release_graph_definition_staging();
     // Host allocations here, so a failure has no device meaning; this
     // finalize reports none of its releases, as its siblings above do not.
     (void)release_scheduler_state_storage();

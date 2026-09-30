@@ -172,7 +172,33 @@ struct SlotPersistentArgs {
     // saying so.
     std::array<std::byte, LAUNCH_ROUTE_PREFIX_CACHE_BYTES> published_prefix{};
     uint32_t published_prefix_bytes{0};
+
+    // Length of the Graph Definition section this slot's current bind staged
+    // into `launch_package`, or 0 when it staged none. Consumed by the
+    // publication that stamps it onto the run's `KernelArgs`, which is what
+    // keeps a value staged for one run from reaching the next: the bytes stay
+    // in the grow-only package, but nothing names them until a bind stages
+    // again.
+    uint32_t graph_section_bytes{0};
 };
+
+/**
+ * Take one run's packed Graph Definition section into its slot's launch package.
+ *
+ * Host copy only: the section becomes the tail of the AICPU launch arguments,
+ * which RTS copies with the launch, so no device block is allocated, uploaded or
+ * freed for it. The length is recorded on the slot and consumed by
+ * `KernelArgsHelper::publish_runtime_args`, which stamps the offset, length and
+ * carrier onto that run's `KernelArgs`.
+ *
+ * Called from the bind, which is why it takes the slot rather than the per-run
+ * helper: the package is the slot's, and the bind runs before the run's
+ * publication.
+ *
+ * @return 0 on success; PTO_RUNTIME_ERR_INVALID_ARGUMENT for a null section or
+ *         a package length that is not representable at the launch boundary
+ */
+int stage_graph_section(SlotPersistentArgs &slot, const void *bytes, size_t length);
 
 /**
  * Helper class for managing `KernelArgs` with device memory.
@@ -204,6 +230,7 @@ struct KernelArgsHelper {
         initializing_slot_(std::exchange(other.initializing_slot_, nullptr)),
         slot_(std::exchange(other.slot_, nullptr)),
         plan_(other.plan_),
+        graph_section_bytes_(std::exchange(other.graph_section_bytes_, 0)),
         launch_payload_(nullptr),
         launch_payload_bytes_(std::exchange(other.launch_payload_bytes_, 0)) {
         // The payload points either into the slot's staging or at this object's
@@ -343,6 +370,11 @@ private:
     // This run's entry-argument routing facts, read while the source was still
     // this run's. The launch side works from this and the snapshot alone.
     LaunchEntryArgsPlan plan_{};
+    // The Definition-section length this run's descriptor names, captured with
+    // the snapshot. The publication stamps the section only when the slot's
+    // staged length agrees with it, so a length a failed prepare left staged
+    // cannot be adopted by the next run on this slot.
+    uint32_t graph_section_bytes_{0};
 
     void *launch_payload_{nullptr};
     size_t launch_payload_bytes_{0};

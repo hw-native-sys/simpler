@@ -427,7 +427,7 @@ Commit is therefore a barrier at exactly one point, orchestration completion. It
 waits for **every** recording to leave `RECORDING`, then walks deferred shells in
 original submission order, reserves each shell's real heap block using its
 Definition's `required_heap`, patches the task descriptor and the shell's
-Definition address, and lets the image be prepared. That wait is on recording
+Definition offset, and lets the image be prepared. That wait is on recording
 *state*, not on the recorder pool: a job returns from `graph_end` before its own
 captures are destroyed, so the host orchestration entry's scope guard joins the
 jobs belonging to this bind's `RuntimeContext` separately, on both normal return
@@ -526,38 +526,60 @@ kind. Graph scheduling never dispatches the outer payload as a kernel payload;
 device materialization reads the boundary from it directly.
 
 Sub-tasks consume no task-table slots. Their descriptor, payload, slot
-state, argument pools, and completion states live in the tail of the outer `GRAPH` task's
-own heap block, past `required_heap`:
-`[GraphExecution][ChipTaskStorage...][tensor pool][scalar pool][task_states]`. The state
-array is last because a byte needs no alignment, so appending it moves no other region. One
-`TaskAllocator::alloc` covers both the packed outputs and this execution storage,
-so they are reclaimed together without a separate device allocation or release path.
+state, argument pools, fanin rows and completion states live in the tail of the outer
+`GRAPH` task's own heap block, past `required_heap`:
+`[GraphExecution][ChipTaskStorage...][tensor pool][scalar pool][fanin rows][fanin indices][task_states]`.
+The state array is last because a byte needs no alignment, so appending it moves no other
+region. One `TaskAllocator::alloc` covers both the packed outputs and this execution
+storage, so they are reclaimed together without a separate device allocation or release
+path.
 
 A sub-task's payload holds no argument array of its own — it names each region by
-a delta, like any other payload. Its pools are the last two regions of the execution
-storage, sized by the Definition's `tensor_arg_count` / `scalar_arg_count` and indexed by
-the task's own `tensor_offset` / `scalar_offset`, so its arguments occupy the same
-span in the pool as in the Definition's arg table. There is no fanin region:
-sub-task dependencies come from the Definition's fanin CSR, so such a task's `fanin_count`
-stays 0 and its fanin delta unbound.
+a delta, like any other payload. Its pools are the tensor and scalar regions of the
+execution storage, sized by the Definition's `tensor_arg_count` / `scalar_arg_count` and
+indexed by the task's own `tensor_offset` / `scalar_offset`, so its arguments occupy the
+same span in the pool as in the Definition's arg table. The payload still carries no
+fanin region: sub-task dependencies come from the fanin CSR, so such a task's
+`fanin_count` stays 0 and its fanin delta unbound. That CSR is the execution's own
+by-value copy of the Definition's, taken at localize — the two regions after the scalar
+pool, rows of `task_count + 1` then `edge_count` indices — because the image it is read
+from is the localizing thread's launch arguments and no peer may address those.
 
 The Host computes the execution-storage size before allocating the outer task's
-heap. It points the outer slot's existing `graph_context` at the shared device
-Definition and compacts the outer payload's tensor/scalar regions with every
-other task's argument pools. The copied arena zone and compact shared-memory
-image travel in one H2D. During the parallel initial classify, the Scheduler
-constructs `GraphExecution` in the outer heap tail, binds it to that Definition
-and the outer payload, and replaces `graph_context` with the execution pointer.
-Sub-task storage remains untouched until bounded materialization begins.
+heap. It records the Definition's position in the run's section as the outer
+task's `graph_definition_offset` and compacts the outer payload's tensor/scalar
+regions with every other task's argument pools. The copied arena zone and
+compact shared-memory image travel in one H2D. During the parallel initial
+classify, the Scheduler constructs `GraphExecution` in the outer heap tail,
+binds it to the Definition that offset names and to the outer payload, and puts
+the execution pointer in the outer slot's `graph_context`, which was null until
+then. Sub-task storage remains untouched until bounded materialization begins.
 
 ## Scheduler flow
 
 Host orchestration builds the complete task image before device execution. At
 the end of orchestration, the Host copies one bind image containing the
 compacted shared-memory task window and argument pools, then launches the
-Scheduler. Slot task and payload references remain self-relative;
-`graph_context` is the absolute address of the retained Definition object until
-initial classification localizes the execution in the outer heap.
+Scheduler. Slot task and payload references remain self-relative.
+
+The run's Definition objects are not uploaded separately and the runtime holds no
+device block for them: the bind packs every object of the run into one Definition
+**section** and appends it to the AICPU launch arguments, which RTS copies as
+part of the launch. A Graph task therefore names its Definition by
+`TaskDescriptor::graph_definition_offset`, an offset inside that section, and
+`graph_context` stays null until initial classification localizes the execution
+in the outer heap.
+
+Each reading AICPU thread decodes the section through its **own** view of its
+launch arguments, by fixed-size copies into aligned locals: a launch package
+belongs to the thread that entered with it, and the completion gate is a
+last-one-out latch rather than a barrier, so no address in one thread's package
+may be shared with a peer. The one part of the image read on every dependency
+scan — the fanin CSR — is copied by value into the execution's own storage tail
+at localize, which is also why `GraphDefinition::execution_storage_bytes`
+includes the CSR's rows and indices. In simulation there is no launch package:
+the runner publishes a run-owned host snapshot instead, and the source word on
+the run's descriptor says which carrier delivered the section.
 
 All AICPU threads classify disjoint slices of the completed task window behind
 one startup barrier. A Graph task enters preparation and external-fanin

@@ -36,7 +36,9 @@ int SchedulerContext::prepare_block_for_dispatch(
 // tests — only the link needs them. Weak, so a target that does link a real
 // implementation keeps it. The retirement entry differs per architecture and is
 // stubbed per target instead.
-GraphExecution *__attribute__((weak)) graph_execution_localize(ChipTaskSlotState &) { return nullptr; }
+GraphExecution *__attribute__((weak)) graph_execution_localize(ChipTaskSlotState &, const GraphImageView &) {
+    return nullptr;
+}
 
 void __attribute__((weak)) platform_init_aicore_regs(uint64_t) {}
 

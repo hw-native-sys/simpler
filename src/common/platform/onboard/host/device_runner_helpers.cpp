@@ -183,6 +183,10 @@ int KernelArgsHelper::prepare_runtime_args(
         if (slot.launch_package.size() < package_bytes) slot.launch_package.resize(package_bytes);
     }
     args.runtime_args = slot.runtime_args;
+    // Captured with the snapshot: the length this run's descriptor names for its
+    // Definition section, which the publication compares against what the bind
+    // staged on the slot.
+    graph_section_bytes_ = runtime_graph_section_bytes(host_runtime);
     runtime_args_state_ = RuntimeArgsState::Prepared;
     return 0;
 }
@@ -217,6 +221,22 @@ bool KernelArgsHelper::build_launch_package() {
     return true;
 }
 
+int stage_graph_section(SlotPersistentArgs &slot, const void *bytes, size_t length) {
+    if (bytes == nullptr || length == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    // `argsSize` is a uint32 at the launch boundary, so the whole package —
+    // header included — has to be representable there. Checked before the
+    // addition that would wrap, and no smaller limit is imposed: a graph is not
+    // refused for being large, only for being unrepresentable.
+    if (length > UINT32_MAX - LAUNCH_ENVELOPE_HEADER_BYTES) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    const size_t package_bytes = LAUNCH_ENVELOPE_HEADER_BYTES + length;
+    // Grow-only, like the entry route's use of the same buffer: a slot that has
+    // served a wider run keeps the capacity.
+    if (slot.launch_package.size() < package_bytes) slot.launch_package.resize(package_bytes);
+    std::memcpy(slot.launch_package.data() + LAUNCH_ENVELOPE_HEADER_BYTES, bytes, length);
+    slot.graph_section_bytes = static_cast<uint32_t>(length);
+    return 0;
+}
+
 void *KernelArgsHelper::launch_payload() {
     if (launch_payload_ == nullptr) return nullptr;
     if (launch_payload_ != static_cast<void *>(&args)) {
@@ -240,6 +260,37 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
     const bool launch_route = launch_route_permitted && plan_.supported && initializing_slot_ == nullptr;
     const EntryArgsSource source = launch_route ? EntryArgsSource::LaunchEnvelope : EntryArgsSource::Descriptor;
 
+    // The Graph Definition section, decided before anything is written, so a
+    // refusal here leaves no half-formed payload behind. Its length is consumed
+    // from the slot whatever this publication then does, because a length
+    // staged for this run must not be read by the next one on the slot — not
+    // even if this run fails below. It rides the same package as the entry
+    // region and starts at the same offset; the two are alternatives, because
+    // the runtime that carries values carries no graph and the one that carries
+    // a graph carries no values.
+    const uint32_t staged_graph_bytes = slot_->graph_section_bytes;
+    slot_->graph_section_bytes = 0;
+    // Both sources have to agree. A run whose descriptor names no section gets
+    // none, even if a failed prepare left one staged on this slot; a mismatch is
+    // this run's own bind disagreeing with itself and fails the publication.
+    const uint32_t graph_bytes = staged_graph_bytes == graph_section_bytes_ ? staged_graph_bytes : 0;
+    if (staged_graph_bytes != graph_section_bytes_ && graph_section_bytes_ != 0) {
+        LOG_ERROR(
+            "runtime metadata publication: staged Graph section is %u bytes but the descriptor names %u",
+            staged_graph_bytes, graph_section_bytes_
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (graph_bytes != 0 && launch_route) {
+        LOG_ERROR("runtime metadata publication: a run carries both entry values and a Graph section");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    const size_t graph_package_bytes = LAUNCH_ENVELOPE_HEADER_BYTES + graph_bytes;
+    if (graph_bytes != 0 && slot_->launch_package.size() < graph_package_bytes) {
+        LOG_ERROR("runtime metadata publication: the staged Graph section is no longer in the slot's package");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+
     // Patch the route into the snapshot before it is published, so the byte the
     // device reads and the length this copy sends cannot disagree. The three
     // words sit ahead of the entry storage, inside every publication length.
@@ -262,6 +313,22 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
         args.entry_args_source = static_cast<uint32_t>(EntryArgsSource::Descriptor);
         launch_payload_ = &args;
         launch_payload_bytes_ = sizeof(KernelArgs);
+    }
+
+    args.graph_section_offset = 0;
+    args.graph_section_bytes = 0;
+    args.graph_section_source = static_cast<uint32_t>(GraphSectionSource::None);
+    if (graph_bytes != 0) {
+        args.graph_section_offset = static_cast<uint32_t>(LAUNCH_ENVELOPE_HEADER_BYTES);
+        args.graph_section_bytes = graph_bytes;
+        args.graph_section_source = static_cast<uint32_t>(GraphSectionSource::LaunchEnvelope);
+        // Padding between the header and the section: the device reads none of
+        // it, and zeroing keeps a predecessor's bytes out of this package.
+        std::memset(
+            slot_->launch_package.data() + sizeof(KernelArgs), 0, LAUNCH_ENVELOPE_HEADER_BYTES - sizeof(KernelArgs)
+        );
+        launch_payload_ = slot_->launch_package.data();
+        launch_payload_bytes_ = graph_package_bytes;
     }
 
     const size_t publish_bytes = launch_route ? plan_.descriptor_bytes_when_launched : runtime_image_.size();

@@ -529,16 +529,19 @@ bool bind_graph_definitions(
         uploads->spilled++;
     }
 
-    void *block = nullptr;
+    // Named before anything is packed, so a run with no Graph task leaves the
+    // device expecting nothing rather than inheriting a predecessor's section.
+    runtime->publish_graph_section(GraphSectionSource::None, 0, 0);
+
     std::byte *staging = nullptr;
     if (block_bytes != 0) {
+        const BindPhaseMark pack_phase = bind_phase_begin();
         void *staging_addr = nullptr;
         // Growing the staging preserves what the recorders wrote into it, and the
         // offsets above name positions rather than addresses, so a block that moves
         // here costs nothing. Nothing is recording by now, which is what makes the
         // move safe at all.
-        if (api->acquire_graph_definition_block(block_bytes, GRAPH_DEFINITION_OBJECT_ALIGN, &block, &staging_addr) !=
-            0) {
+        if (api->acquire_graph_staging(block_bytes, GRAPH_DEFINITION_OBJECT_ALIGN, &staging_addr) != 0) {
             LOG_ERROR(
                 "host-orch: failed to retain %zu bytes for %zu Graph Definition object(s)", block_bytes, packed.size()
             );
@@ -564,12 +567,31 @@ bool bind_graph_definitions(
         }
         uploads->count = packed.size();
         uploads->bytes = block_bytes;
+        // Into the run's AICPU launch package, which RTS copies with the launch:
+        // no device block is allocated, uploaded or freed for these bytes, and a
+        // length the package cannot represent is refused here, before any
+        // submission.
+        uint32_t section_source = static_cast<uint32_t>(GraphSectionSource::None);
+        uint64_t section_base = 0;
+        if (api->publish_graph_section(staging, block_bytes, &section_source, &section_base) != 0) {
+            LOG_ERROR("host-orch: failed to carry %zu Definition byte(s) to the device", block_bytes);
+            return false;
+        }
+        // Which carrier delivered it is the platform's answer, not this bind's:
+        // onboard it is the launch package RTS copies, in simulation a run-owned
+        // host snapshot.
+        runtime->publish_graph_section(
+            static_cast<GraphSectionSource>(section_source), section_base, static_cast<uint32_t>(block_bytes)
+        );
         char attrs[kBindAttrsCapacity];
         snprintf(
             attrs, sizeof(attrs), "defs=%zu bytes=%zu submissions=%zu spilled=%zu", uploads->count, block_bytes, count,
             uploads->spilled
         );
-        runtime->add_pending_metadata(block, staging, block_bytes, HostPhaseKind::BindGraphUpload, attrs);
+        // Packing, not an upload: the phase measures assembling the section and
+        // taking it into the launch package, and the transfer it used to name is
+        // now part of the launch RTS makes.
+        record_bind_phase(HostPhaseKind::BindGraphPack, pack_phase, attrs, block_bytes);
     }
 
     for (size_t index = 0; index < count; ++index) {
@@ -579,7 +601,7 @@ bool bind_graph_definitions(
             return false;
         }
         auto object_it = packed.find(upload->full_key);
-        if (object_it == packed.end() || block == nullptr || staging == nullptr) {
+        if (object_it == packed.end() || staging == nullptr) {
             LOG_ERROR("host-orch: Graph task has no matching prepared Definition object");
             return false;
         }
@@ -595,7 +617,8 @@ bool bind_graph_definitions(
         if (definition->task_count <= 0 || definition->task_count > SUB_TASK_MAX_NUM ||
             definition->full_key != upload->full_key ||
             !graph_execution_storage_layout(
-                definition->task_count, definition->tensor_arg_count, definition->scalar_arg_count, &storage_layout
+                definition->task_count, definition->tensor_arg_count, definition->scalar_arg_count,
+                definition->edge_count, &storage_layout
             ) ||
             storage_layout.total_bytes != definition->execution_storage_bytes ||
             upload->outer_slot->to_payload().tensor_count != definition->boundary_tensor_count ||
@@ -639,9 +662,13 @@ bool bind_graph_definitions(
             packed_definition.populations_ready = true;
         }
         ready_queue_populations->add(packed_definition.ready_queue_populations);
-        upload->outer_slot->graph_context = reinterpret_cast<GraphDefinition *>(
-            reinterpret_cast<uintptr_t>(block) + object_it->second.object_offset + sizeof(GraphDefinitionHeader)
-        );
+        // The Definition is named by its position in this run's section, not by an
+        // address: the bytes reach the device as the tail of each AICPU thread's
+        // own launch arguments, so no address in them is shared. graph_context
+        // stays null until the device installs this task's execution.
+        upload->outer_slot->to_descriptor().graph_definition_offset =
+            static_cast<uint32_t>(object_it->second.object_offset + sizeof(GraphDefinitionHeader));
+        upload->outer_slot->graph_context = nullptr;
     }
     return true;
 }

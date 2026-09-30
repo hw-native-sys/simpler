@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from simpler_setup.tools.hbg.bind_phases import cold_binds, parse_binds
 
-SEGMENTS = ("args", "host_orch", "graph_upload", "arena_h2d")
+SEGMENTS = ("args", "host_orch", "graph_pack", "arena_h2d")
 
 
 def _span(pid: int, inv: int, phase: str, ts: int, dur_ns: int) -> str:

@@ -851,7 +851,7 @@ int DeviceRunner::finalize() {
     release_callable_state();
 
     unload_executor_binaries();
-    release_graph_definition_blocks();
+    release_graph_definition_staging();
     release_sm_mirrors();
     release_run_image_stagings();
 

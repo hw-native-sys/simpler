@@ -147,7 +147,7 @@ chip.run                                      (= host_wall)
 │  ├─ chip.run.bind.args        (ntensor=N: per-tensor retained-buffer slice + H2D)
 │  ├─ chip.run.bind.prebuilt    (TMR: prebuilt runtime-arena cache hit or build + upload)
 │  └─ .{arena_build,static_arena,gm_heap,shared_mem,runtime_init,host_orch,
-│       graph_upload,arena_h2d,host_view_close}
+│       graph_pack,arena_h2d,host_view_close}
 │           HBG host prepare-path segments, with SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1
 ├─ chip.run.stage_inputs        (this run's input bytes into the buffers its bind named)
 ├─ chip.run.prepare_execution   (runner prepare: register tables, topology probe, Runtime H2D)

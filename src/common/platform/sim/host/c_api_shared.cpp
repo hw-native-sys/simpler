@@ -242,13 +242,24 @@ static int acquire_scheduler_state_storage(
     }
 }
 
-static int acquire_graph_definition_block(
-    void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
+static int
+acquire_graph_staging(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **staging_out) {
+    if (runner_ctx == nullptr) return -1;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(runner_ctx)
+            ->acquire_graph_staging(pipeline_slot, bytes, alignment, staging_out);
+    } catch (...) {
+        return -1;
+    }
+}
+
+static int publish_graph_section(
+    void *runner_ctx, uint32_t pipeline_slot, const void *bytes, size_t length, uint32_t *source_out, uint64_t *base_out
 ) {
     if (runner_ctx == nullptr) return -1;
     try {
         return static_cast<SimDeviceRunnerBase *>(runner_ctx)
-            ->acquire_graph_definition_block(pipeline_slot, bytes, alignment, device_out, staging_out);
+            ->publish_graph_section(pipeline_slot, bytes, length, source_out, base_out);
     } catch (...) {
         return -1;
     }
@@ -458,7 +469,8 @@ static const HostApiOps g_host_api_ops = {
     .get_retained_temp_buffer = get_retained_temp_buffer,
     .set_retained_temp_buffer = set_retained_temp_buffer,
     .acquire_retained_temp = acquire_retained_temp,
-    .acquire_graph_definition_block = acquire_graph_definition_block,
+    .acquire_graph_staging = acquire_graph_staging,
+    .publish_graph_section = publish_graph_section,
     .get_graph_definition_staging = get_graph_definition_staging,
     .acquire_scheduler_state_storage = acquire_scheduler_state_storage,
     .acquire_sm_mirror = acquire_sm_mirror,

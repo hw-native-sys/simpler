@@ -720,9 +720,7 @@ inline bool host_phase_kind_submits_task(HostPhaseKind kind) {
  * beside the device lanes they show the handover, where the rest of the bind
  * stage is host-only setup with no device counterpart.
  */
-inline bool host_phase_kind_is_device_upload(HostPhaseKind kind) {
-    return kind == HostPhaseKind::BindGraphUpload || kind == HostPhaseKind::BindArenaH2d;
-}
+inline bool host_phase_kind_is_device_upload(HostPhaseKind kind) { return kind == HostPhaseKind::BindArenaH2d; }
 
 /**
  * Whether a kind's `detail` is a quantity, i.e. whether summing it across a bind
@@ -753,8 +751,8 @@ inline const char *host_phase_kind_name(HostPhaseKind kind) {
         return "runtime_init";
     case HostPhaseKind::BindHostOrch:
         return "host_orch";
-    case HostPhaseKind::BindGraphUpload:
-        return "graph_upload";
+    case HostPhaseKind::BindGraphPack:
+        return "graph_pack";
     case HostPhaseKind::BindArenaH2d:
         return "arena_h2d";
     case HostPhaseKind::BindHostViewClose:

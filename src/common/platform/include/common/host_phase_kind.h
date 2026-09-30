@@ -49,7 +49,7 @@ enum class HostPhaseKind : uint32_t {
     BindSharedMem,
     BindRuntimeInit,
     BindHostOrch,
-    BindGraphUpload,
+    BindGraphPack,
     BindArenaH2d,
     BindHostViewClose,
     // Recorded by the host orchestrator (host_build_graph/host/orchestrator.cpp).

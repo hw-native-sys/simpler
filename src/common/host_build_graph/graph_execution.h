@@ -323,9 +323,20 @@ struct GraphExecution {
     // the Definition's tensor_offset / scalar_offset.
     simpler::hbg::Tensor *task_tensor_pool{nullptr};
     uint64_t *task_scalar_pool{nullptr};
-    const GraphDefinition *definition{nullptr};
-    const int32_t *fanin_offsets{nullptr};
-    const uint16_t *fanin_indices{nullptr};
+    // Where this execution's Definition image starts inside the launch section,
+    // not a pointer into it. The section belongs to whichever thread's launch
+    // arguments carried it, and that thread may return while a peer is still
+    // reading, so every reader resolves this offset against its own view.
+    uint32_t definition_offset{0};
+    // The fanin CSR, copied by value into this execution's own storage tail.
+    // The dependency rows are read on every fanin scan, producer lookup, wait
+    // registration and completion, so they are the one part of the image the
+    // execution keeps: a borrowed pointer here would name a package this
+    // execution outlives, and decoding per edge would put a bounded copy in
+    // those loops.
+    int32_t *fanin_offsets{nullptr};
+    uint16_t *fanin_indices{nullptr};
+    int32_t edge_count{0};
     // Base of the graph heap this execution was given. A body tensor's recorded offset is
     // relative to the recording's own output region, which is an affine image of this heap,
     // so the two added together are the real address.
@@ -386,62 +397,84 @@ static_assert(
 
 // The outer GRAPH task's heap tail occupies
 // [GraphExecution][ChipTaskStorage x task_count][simpler::hbg::Tensor x tensor_arg_count]
-// [uint64_t x scalar_arg_count].
+// [uint64_t x scalar_arg_count][int32_t x (task_count + 1)][uint16_t x edge_count]
+// [std::atomic<ChipTaskState> x task_count].
 //
-// The last two regions are the sub-task payloads' argument pools, indexed by the
-// Definition's own tensor_offset / scalar_offset — which is why the Definition's
+// The tensor and scalar regions are the sub-task payloads' argument pools, indexed by
+// the Definition's own tensor_offset / scalar_offset — which is why the Definition's
 // arg-table counts size them rather than a per-task sum: sub-task i's arguments
-// occupy [offset, offset + count) in both the table and the pool. There is no fanin
-// region: a sub-task's dependencies live in the Definition's fanin CSR, so its
-// fanin_count stays 0 and its fanin delta unbound.
+// occupy [offset, offset + count) in both the table and the pool.
+//
+// The two regions after them are this execution's own copy of the Definition's fanin
+// CSR, rows then indices, filled by value at localize because the image they come from
+// is the localizing thread's launch arguments and no peer may address it. A sub-task
+// payload still carries no fanin region of its own: its dependencies are those rows, so
+// its fanin_count stays 0 and its fanin delta unbound.
 struct GraphExecutionStorageLayout {
     size_t tasks_offset;
     size_t tensors_offset;
     size_t scalars_offset;
+    size_t fanin_offsets_offset;
+    size_t fanin_indices_offset;
     size_t states_offset;
     size_t total_bytes;
 };
 
 inline bool graph_execution_storage_layout(
-    int32_t task_count, int32_t tensor_arg_count, int32_t scalar_arg_count, GraphExecutionStorageLayout *out
+    int32_t task_count, int32_t tensor_arg_count, int32_t scalar_arg_count, int32_t edge_count,
+    GraphExecutionStorageLayout *out
 ) {
     if (out == nullptr || task_count <= 0 || task_count > SUB_TASK_MAX_NUM || tensor_arg_count < 0 ||
-        scalar_arg_count < 0) {
+        scalar_arg_count < 0 || edge_count < 0) {
         return false;
     }
     constexpr size_t ALIGNMENT = alignof(ChipTaskStorage);
     out->tasks_offset = (sizeof(GraphExecution) + ALIGNMENT - 1) & ~(ALIGNMENT - 1);
     out->tensors_offset = out->tasks_offset + static_cast<size_t>(task_count) * sizeof(ChipTaskStorage);
     out->scalars_offset = out->tensors_offset + static_cast<size_t>(tensor_arg_count) * sizeof(simpler::hbg::Tensor);
+    // The fanin CSR follows the scalar pool, whose element is 8-byte aligned, so
+    // the row array's 4 and the index array's 2 are already satisfied and no
+    // padding is spent. Row count is task_count + 1, the same length the image
+    // carries.
+    out->fanin_offsets_offset = out->scalars_offset + static_cast<size_t>(scalar_arg_count) * sizeof(uint64_t);
+    out->fanin_indices_offset = out->fanin_offsets_offset + (static_cast<size_t>(task_count) + 1) * sizeof(int32_t);
     // The state array is last because it is the one region with no alignment of
     // its own: a byte needs none, so appending it disturbs no other section's
     // offset. Every other region is entered through a typed pointer whose
     // alignment the base already guarantees.
-    out->states_offset = out->scalars_offset + static_cast<size_t>(scalar_arg_count) * sizeof(uint64_t);
+    out->states_offset = out->fanin_indices_offset + static_cast<size_t>(edge_count) * sizeof(uint16_t);
     out->total_bytes = out->states_offset + static_cast<size_t>(task_count) * sizeof(std::atomic<ChipTaskState>);
     return true;
 }
 
 inline bool graph_execution_storage_bytes(
-    int32_t task_count, int32_t tensor_arg_count, int32_t scalar_arg_count, size_t *storage_bytes
+    int32_t task_count, int32_t tensor_arg_count, int32_t scalar_arg_count, int32_t edge_count, size_t *storage_bytes
 ) {
     GraphExecutionStorageLayout layout{};
     if (storage_bytes == nullptr ||
-        !graph_execution_storage_layout(task_count, tensor_arg_count, scalar_arg_count, &layout)) {
+        !graph_execution_storage_layout(task_count, tensor_arg_count, scalar_arg_count, edge_count, &layout)) {
         return false;
     }
     *storage_bytes = layout.total_bytes;
     return true;
 }
 
-GraphExecution *graph_execution_localize(ChipTaskSlotState &outer_slot);
+// Both take the calling thread's own view of the Definition section: the bytes
+// live in that thread's launch arguments (or, in simulation, in the run-owned
+// host snapshot), and no view is ever stored where another thread could read it
+// after its owner returned. `graph_image_view.h` holds the view and its decoders.
+struct GraphImageView;
+
+GraphExecution *graph_execution_localize(ChipTaskSlotState &outer_slot, const GraphImageView &image);
 GraphMaterializeResult graph_execution_materialize_slice(
-    ChipTaskSlotState &outer_slot, GraphExecution &execution, int32_t max_tasks, int32_t *tasks_materialized = nullptr
+    ChipTaskSlotState &outer_slot, GraphExecution &execution, const GraphImageView &image, int32_t max_tasks,
+    int32_t *tasks_materialized = nullptr
 );
 
-// An outer GRAPH slot's graph_context holds the shared Definition's device address
-// until graph_execution_localize replaces it with the execution, so this cast is only
-// valid after that call. What makes it safe is the boot sequence, not this slot: every
+// An outer GRAPH slot's graph_context is null until graph_execution_localize puts the
+// execution there — the task names its Definition by descriptor offset, not by a
+// context pointer — so this cast is only valid after that call. What makes it safe is
+// the boot sequence, not this slot: every
 // AICPU thread localizes a disjoint slice of the task window in classify_partition and
 // all of them barrier before runtime_init_ready_ is published, so no dispatch — and
 // therefore no caller of this function — observes an unlocalized GRAPH slot. A slot

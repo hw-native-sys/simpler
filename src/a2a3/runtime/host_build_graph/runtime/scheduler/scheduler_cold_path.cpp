@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include "graph_image_view.h"
 #include "scheduler_context.h"
 
 #include <cinttypes>
@@ -1143,7 +1144,7 @@ void SchedulerContext::on_graph_attached(RuntimeContext *rt, [[maybe_unused]] in
 // exactly once. Graph tasks additionally enter the bounded preparation queue;
 // their external fanin follows the same ready/wake classification as any other
 // outer task.
-void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) {
+void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads, const GraphImageView &image) {
     if (completed_.load(std::memory_order_acquire) || sched_->task_view.tasks == nullptr) {
         return;
     }
@@ -1159,7 +1160,7 @@ void SchedulerContext::classify_partition(int32_t thread_idx, int32_t nthreads) 
         }
         ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(id);
         if (slot.task_kind == TaskKind::GRAPH) {
-            if (graph_execution_localize(slot) == nullptr) slot.graph_context = nullptr;
+            if (graph_execution_localize(slot, image) == nullptr) slot.graph_context = nullptr;
             if (!sched_->push_graph_prepare(&slot, slot.to_descriptor().task_id, thread_idx)) return;
         }
         int32_t state = sched_->classify_fanin_state(&slot);

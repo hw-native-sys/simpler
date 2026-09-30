@@ -676,56 +676,52 @@ void DeviceRunnerBase::set_retained_temp_buffer(uint32_t pipeline_slot, void *ad
     retained_temp_sizes_[pipeline_slot] = size;
 }
 
-int DeviceRunnerBase::acquire_graph_definition_block(
-    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
+int DeviceRunnerBase::acquire_graph_staging(
+    uint32_t pipeline_slot, size_t bytes, size_t alignment, void **staging_out
 ) {
-    if (device_out == nullptr || staging_out == nullptr) return -1;
-    *device_out = nullptr;
+    if (staging_out == nullptr) return -1;
     *staging_out = nullptr;
-    if (pipeline_slot >= graph_definition_blocks_.size() || bytes == 0 || alignment == 0 ||
-        (alignment & (alignment - 1)) != 0 || bytes > SIZE_MAX - (alignment - 1)) {
+    if (pipeline_slot >= graph_definition_staging_.size() || bytes == 0 || alignment == 0 ||
+        (alignment & (alignment - 1)) != 0) {
         return -1;
     }
-    RetainedGraphBlock &block = graph_definition_blocks_[pipeline_slot];
-    if (block.aligned_addr == nullptr || block.capacity < bytes ||
-        reinterpret_cast<uintptr_t>(block.aligned_addr) % alignment != 0) {
-        const size_t allocation_bytes = bytes + alignment - 1;
-        void *allocation = mem_alloc_.alloc(allocation_bytes);
-        if (allocation == nullptr) return -1;
-        const uintptr_t raw = reinterpret_cast<uintptr_t>(allocation);
-        if (raw > UINTPTR_MAX - (alignment - 1)) {
-            mem_alloc_.free(allocation);
-            return -1;
-        }
-        void *aligned_addr = reinterpret_cast<void *>((raw + alignment - 1) & ~(alignment - 1));
-        if (device_memset(aligned_addr, 0, bytes) != 0) {
-            mem_alloc_.free(allocation);
-            return -1;
-        }
-        if (block.allocation != nullptr && mem_alloc_.free(block.allocation) != 0) {
-            mem_alloc_.free(allocation);
-            return -1;
-        }
-        block.allocation = allocation;
-        block.aligned_addr = aligned_addr;
-        block.capacity = bytes;
-    }
-    // Grow-only and never shrunk, so a steady-state bind assembles its objects
-    // in host memory it neither acquires nor returns.
-    if (block.staging.size() < bytes) block.staging.resize(bytes);
-    *device_out = block.aligned_addr;
-    *staging_out = block.staging.data();
+    // A byte vector's storage is aligned for every type with fundamental
+    // alignment, which is what a Definition section asks for
+    // (GRAPH_DEFINITION_OBJECT_ALIGN); a request past that has no home here.
+    if (alignment > alignof(std::max_align_t)) return -1;
+    std::vector<std::byte> &staging = graph_definition_staging_[pipeline_slot].bytes;
+    // Grow-only and content-preserving: the recorders have already built their
+    // objects into this block's prefix at the offsets they claimed, and this
+    // call is where the bind extends it to cover the ones it has to copy in.
+    // resize() is what keeps that prefix; a fresh allocation would lose it.
+    if (staging.size() < bytes) staging.resize(bytes);
+    *staging_out = staging.data();
+    return 0;
+}
+
+int DeviceRunnerBase::publish_graph_section(
+    uint32_t pipeline_slot, const void *bytes, size_t length, uint32_t *source_out, uint64_t *base_out
+) {
+    if (source_out != nullptr) *source_out = static_cast<uint32_t>(GraphSectionSource::None);
+    if (base_out != nullptr) *base_out = 0;
+    if (bytes == nullptr || length == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (pipeline_slot >= slot_persistent_args_.size()) return PTO_RUNTIME_ERR_INTERNAL;
+    const int rc = stage_graph_section(slot_persistent_args_[pipeline_slot], bytes, length);
+    if (rc != 0) return rc;
+    // No base: the section is the tail of each launched AICPU thread's own copy
+    // of the package, so there is no one address to publish.
+    if (source_out != nullptr) *source_out = static_cast<uint32_t>(GraphSectionSource::LaunchEnvelope);
     return 0;
 }
 
 void DeviceRunnerBase::get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size) {
     if (addr != nullptr) *addr = nullptr;
     if (size != nullptr) *size = 0;
-    if (pipeline_slot >= graph_definition_blocks_.size()) return;
-    RetainedGraphBlock &block = graph_definition_blocks_[pipeline_slot];
-    if (block.staging.empty()) return;
-    if (addr != nullptr) *addr = block.staging.data();
-    if (size != nullptr) *size = block.staging.size();
+    if (pipeline_slot >= graph_definition_staging_.size()) return;
+    std::vector<std::byte> &staging = graph_definition_staging_[pipeline_slot].bytes;
+    if (staging.empty()) return;
+    if (addr != nullptr) *addr = staging.data();
+    if (size != nullptr) *size = staging.size();
 }
 
 int DeviceRunnerBase::acquire_scheduler_state_storage(
@@ -877,16 +873,10 @@ void DeviceRunnerBase::release_sm_mirrors() {
     }
 }
 
-void DeviceRunnerBase::release_graph_definition_blocks() {
-    for (RetainedGraphBlock &block : graph_definition_blocks_) {
-        if (block.allocation != nullptr) mem_alloc_.free(block.allocation);
-        block = RetainedGraphBlock{};
-    }
-}
-
-void DeviceRunnerBase::abandon_graph_definition_blocks() {
-    for (RetainedGraphBlock &block : graph_definition_blocks_) {
-        block = RetainedGraphBlock{};
+void DeviceRunnerBase::release_graph_definition_staging() {
+    for (RetainedGraphStaging &staging : graph_definition_staging_) {
+        staging.bytes.clear();
+        staging.bytes.shrink_to_fit();
     }
 }
 
@@ -2486,7 +2476,6 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     prebuilt_runtime_arena_cache_.invalidate();
 
     if (abandon_device_resources) {
-        abandon_graph_definition_blocks();
         abandon_scheduler_state_storage();
         retained_temp_addrs_.fill(nullptr);
         retained_temp_sizes_.fill(0);
@@ -2494,14 +2483,14 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         // and the call would be a further device operation.
         (void)child_memory_host_views_.take_all();
     } else {
-        release_graph_definition_blocks();
         capture(release_scheduler_state_storage());
         clear_temporary_buffer();
     }
-    // Pure host memory, so both are returned on either path — a force reset
+    // Pure host memory, so all three are returned on either path — a force reset
     // invalidated device allocations, not these pages.
     release_sm_mirrors();
     release_run_image_stagings();
+    release_graph_definition_staging();
 
     // Free each slot's device-phase/task-timing buffer (allocated lazily in
     // run()) while mem_alloc_ and the device context are still live.

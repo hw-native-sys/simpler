@@ -51,13 +51,24 @@
 
 #include "common/launch_entry_args.h"
 
-/** One thread's view of the launch package's entry region. */
+/**
+ * One thread's view of its launch package: the entry region, and the Graph
+ * Definition section when this run carries one.
+ *
+ * The two regions are named the same way and for the same reason — a base kept
+ * apart from an offset the runtime checks before it forms an address — and both
+ * belong to this thread alone. `host_build_graph` uses the graph fields and no
+ * entry region; `tensormap_and_ringbuffer` the reverse.
+ */
 struct PlatformEntryArgs {
     const void *args_base{nullptr};
     uint32_t offset{0};
     uint32_t tensor_count{0};
     uint32_t scalar_count{0};
     uint32_t source{static_cast<uint32_t>(EntryArgsSource::Descriptor)};
+    uint32_t graph_offset{0};
+    uint32_t graph_bytes{0};
+    uint32_t graph_source{static_cast<uint32_t>(GraphSectionSource::None)};
 };
 
 /**

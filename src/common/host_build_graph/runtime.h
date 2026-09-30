@@ -302,6 +302,28 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // memory header holds no task counter for the boot thread to read.
     int32_t host_total_tasks;
 
+    // Where this run's Graph Definition section is, and which kind of carrier
+    // delivered it. The bytes themselves never travel here: on device they are
+    // the tail of each AICPU thread's own launch argument package, which RTS
+    // copies, and in simulation they are the run-owned host snapshot the runner
+    // keeps until the run's last consumer ends.
+    //
+    //   graph_section_source  GraphSectionSource; None when this run submitted
+    //                         no Graph task at all
+    //   graph_section_base    the snapshot's address, for the simulated carrier
+    //                         only; zero for a launch package, whose base is
+    //                         per-thread and never shared
+    //   graph_section_bytes   the section's length, checked against the reading
+    //                         thread's own view before any offset inside it is
+    //                         used
+    //
+    // One 64-byte block including its pad, because the descriptor's size has to
+    // stay a multiple of a cache line for `cache_invalidate_range(sizeof(dev))`.
+    uint64_t graph_section_base;
+    uint32_t graph_section_bytes;
+    uint32_t graph_section_source;
+    uint32_t graph_section_reserved[12];
+
     // Size of the shipped shared-memory image, argument pools included. Set by the
     // host before the image is copied; the AICPU cannot recompute it because the pool
     // extents are the bind's cursors, which only the host saw. It bounds the region at
@@ -572,6 +594,26 @@ public:
         return sizeof(dev.aicpu_allowed_cpus) / sizeof(dev.aicpu_allowed_cpus[0]);
     }
 
+    /**
+     * Name this run's Graph Definition section.
+     *
+     * Called once per bind, before publication, and with `base` zero for the
+     * launch carrier: that section's address is each reading thread's own and is
+     * never published anywhere a peer could read it. A run with no Graph task
+     * publishes `None` and zero bytes, which is what makes a stale reading
+     * refusable rather than plausible.
+     */
+    void publish_graph_section(GraphSectionSource source, uint64_t base, uint32_t bytes) {
+        dev.graph_section_source = static_cast<uint32_t>(source);
+        dev.graph_section_base = base;
+        dev.graph_section_bytes = bytes;
+    }
+    GraphSectionSource get_graph_section_source() const {
+        return static_cast<GraphSectionSource>(dev.graph_section_source);
+    }
+    uint64_t get_graph_section_base() const { return dev.graph_section_base; }
+    uint32_t get_graph_section_bytes() const { return dev.graph_section_bytes; }
+
     // =========================================================================
     // Performance Profiling
     // =========================================================================
@@ -729,3 +771,9 @@ size_t runtime_device_extent_size(const Runtime &rt);
 // descriptor, which its host path publishes at prepare time. Present so the
 // shared host launch path needs no runtime-specific branch of its own.
 LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &rt);
+
+// How many bytes of Graph Definition section this run's descriptor names, or 0
+// when it names none. Read by the shared host launch path to check the length a
+// bind staged against the one the run publishes, so the two cannot disagree; a
+// runtime with no Graph concept answers 0.
+uint32_t runtime_graph_section_bytes(const Runtime &rt);

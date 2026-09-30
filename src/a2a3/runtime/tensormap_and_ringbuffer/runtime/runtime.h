@@ -535,6 +535,11 @@ size_t runtime_device_extent_size(const Runtime &rt);
 // this run's. Defined per-runtime, and `supported` is false on a runtime with no
 // launch route, which is what keeps the shared host launch path runtime-agnostic.
 LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &rt);
+
+// Always 0: a Graph is a host_build_graph concept, so no run of this runtime
+// carries a Definition section. Present so the shared host launch path needs no
+// runtime-specific branch.
+uint32_t runtime_graph_section_bytes(const Runtime &rt);
 /**
  * Whether a launch header may be adopted, decided before any payload address is
  * formed from it.

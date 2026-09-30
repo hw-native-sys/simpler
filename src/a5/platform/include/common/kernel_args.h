@@ -137,6 +137,17 @@ struct KernelArgs {
     uint32_t entry_tensor_count{0};
     uint32_t entry_scalar_count{0};
     uint32_t entry_args_source{static_cast<uint32_t>(EntryArgsSource::Descriptor)};
+    // Where this run's Graph Definition section sits inside this launch
+    // package, how long it is, and which carrier delivered it. The section is
+    // the whole of the run's packed Definition bytes; a Graph task names its
+    // own object by an offset inside it. `argsSize` is what tells RTS how far to
+    // copy, so the section is part of the package rather than a pointer into
+    // storage the runtime would have to own. Zero and `GraphSectionSource::None`
+    // for every run that submits no Graph task, and for every runtime other
+    // than host_build_graph.
+    uint32_t graph_section_offset{0};
+    uint32_t graph_section_bytes{0};
+    uint32_t graph_section_source{static_cast<uint32_t>(GraphSectionSource::None)};
 
     // Opaque always-false guard read by the AICore SIMT meta anchor (AIV
     // KERNEL_ENTRY). The host never sets it non-zero; its only purpose is to be
@@ -154,15 +165,22 @@ static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 // measured a5 layout so that appending, reordering, or widening a field is a
 // build failure rather than a silently different launch payload: `sizeof` is
 // what `launch_aicpu_payload` hands to `rtsLaunchCpuKernel` as `argsSize`, and
-// what `PersistentKernelArgs::prepare_once` allocates and copies H2D. The values
-// differ from a2a3's: this struct has no `ffts_base_addr` and carries two
-// trailing uint32_t rather than one.
+// what `PersistentKernelArgs::prepare_once` allocates and copies H2D. The field
+// offsets differ from a2a3's: this struct has no `ffts_base_addr`, so its
+// thirteen 8-byte fields end at 104 rather than 112, and its 32-bit tail holds
+// nine uint32_t rather than eight. The two sizes coincide at 144 only because
+// the extra tail field is absorbed by the padding a2a3 does not need.
 static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 24, "KernelArgs::chip_swimlane_data_base offset drift");
 static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
     "KernelArgs::chip_swimlane_run_terminal_bank offset drift"
 );
-static_assert(sizeof(KernelArgs) == 128, "KernelArgs launch-payload size drift");
+// Where the 32-bit tail's Graph triple begins. `sizeof` alone cannot see a
+// reorder inside that tail, because every member of it is the same width, and
+// here it cannot see an appended one either: 140 bytes of members round up to
+// the same 144 as 144 would.
+static_assert(offsetof(KernelArgs, graph_section_offset) == 124, "KernelArgs::graph_section_offset offset drift");
+static_assert(sizeof(KernelArgs) == 144, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.

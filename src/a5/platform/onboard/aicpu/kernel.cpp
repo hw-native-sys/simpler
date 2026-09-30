@@ -152,10 +152,12 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // arguments are borrowed. Base and offset stay separate: the runtime forms
     // the payload address only after checking both against its descriptor.
     set_platform_entry_args(
-        platform_aicpu_affinity_thread_idx(), PlatformEntryArgs{
-                                                  arg, k_args->entry_args_offset, k_args->entry_tensor_count,
-                                                  k_args->entry_scalar_count, k_args->entry_args_source
-                                              }
+        platform_aicpu_affinity_thread_idx(),
+        PlatformEntryArgs{
+            arg, k_args->entry_args_offset, k_args->entry_tensor_count, k_args->entry_scalar_count,
+            k_args->entry_args_source, k_args->graph_section_offset, k_args->graph_section_bytes,
+            k_args->graph_section_source
+        }
     );
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);
 

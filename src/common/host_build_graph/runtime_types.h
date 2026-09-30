@@ -274,9 +274,17 @@ struct alignas(64) TaskDescriptor {
     void *packed_buffer_base;  // Start of packed buffer in GM Heap
     void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
 
+    // Where this task's Graph Definition image starts inside the run's launch
+    // Definition section, for a GRAPH task; 0 for every other kind. An offset
+    // rather than an address because the section is the AICPU launch argument
+    // package each reading thread receives its own copy of, so no address in it
+    // is shared. Carved out of the pad below, so the descriptor's size and
+    // `packed_buffer_base` offset are unchanged.
+    uint32_t graph_definition_offset;
+
     // Pads the descriptor to the cache line ChipTaskStorage places the slot state
     // on, which is what makes that container's slot offset equal to this size.
-    uint8_t reserved[24];
+    uint8_t reserved[20];
 
     // This task's other two records, defined below once ChipTaskStorage is complete.
     ChipTaskSlotState &to_slot();
@@ -612,18 +620,22 @@ struct alignas(64) ChipTaskSlotState {
     // Graph membership, and which of the two Graph structs this points at is
     // decided by task_kind rather than by anything stored here:
     //
-    //   nullptr                        an ordinary task, in no Graph
-    //   != nullptr, task_kind == GRAPH the outer Graph task, pointing at the
-    //                                  shared GraphDefinition until localize
-    //                                  swaps in its GraphExecution
+    //   nullptr                        an ordinary task, in no Graph — and the
+    //                                  outer Graph task too until localize
+    //                                  installs its execution, because the
+    //                                  Definition itself is named by the
+    //                                  descriptor's graph_definition_offset
+    //                                  rather than by any address
+    //   != nullptr, task_kind == GRAPH the outer Graph task, pointing at its
+    //                                  GraphExecution
     //   != nullptr, task_kind != GRAPH a sub-task, pointing at the
     //                                  GraphExecution it belongs to
     //
     // So every reader must test task_kind before casting, and complete_task
     // routes on exactly that pair: a null context or a GRAPH kind takes the
     // ordinary global fanout, anything else is counted against its Graph. A
-    // localize that fails puts this back to nullptr (scheduler_cold_path.cpp),
-    // so the outer task cannot be mistaken for a sub-task.
+    // localize that fails leaves this nullptr (scheduler_cold_path.cpp), so the
+    // outer task cannot be mistaken for a sub-task.
     void *graph_context{nullptr};
 
     // Graph-only scheduling metadata, paired with graph_context above. Readiness

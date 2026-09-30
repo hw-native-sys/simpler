@@ -82,15 +82,29 @@ struct HostApiOps {
     // caller owns the layout inside both and the offsets it hands to the device
     // are its own. Grow-only retention: a request that fits the retained
     // capacity reuses it, a larger one replaces it, both are released at Worker
-    // finalization. `alignment` must be a power of two, and the device block is
-    // aligned to it and zeroed when (re)allocated, so a region no upload has
-    // covered reads as zero rather than as a stale object. Lets every
-    // submission of one run reference a device-resident Definition instead of
-    // carrying a full copy. Execution storage needs no counterpart here — it is
-    // the tail of the outer Graph task's own heap allocation. Returns 0 on
-    // success.
-    int (*acquire_graph_definition_block)(
-        void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
+    // finalization. `alignment` must be a power of two and the returned base
+    // carries it, so a recorder may build its objects straight into the block at
+    // the offsets it claims. Host memory only: a Definition's bytes reach the
+    // device inside the run's AICPU launch package, so nothing here allocates,
+    // uploads or frees device storage. Growth preserves the bytes already in
+    // the block, because the recorders' objects are already in its prefix by
+    // the time a bind knows the run's total. Execution storage needs no
+    // counterpart here — it is the tail of the outer Graph task's own heap
+    // allocation. Returns 0 on success.
+    int (*acquire_graph_staging)(
+        void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **staging_out
+    );
+    // Take this run's packed Definition section into whatever carrier this
+    // platform delivers it by, and report which one that is. Onboard it is the
+    // AICPU launch package RTS copies with the launch, and `base_out` is 0
+    // because that section's address is each reading thread's own; in simulation
+    // it is a run-owned host snapshot whose address `base_out` returns. No
+    // device allocation, upload or free is involved on either, and no runtime
+    // keeps a device copy of a Definition. Returns 0 on success; a length the
+    // carrier cannot represent is refused here, before any submission.
+    int (*publish_graph_section)(
+        void *runner_ctx, uint32_t pipeline_slot, const void *bytes, size_t length, uint32_t *source_out,
+        uint64_t *base_out
     );
     // The retained host staging block as it stands, without allocating or growing:
     // {nullptr, 0} until a run has acquired one. A bind reads it before
@@ -291,11 +305,15 @@ public:
     int acquire_retained_temp(size_t bytes, void **addr_out, size_t *size_out) const {
         return ops_->acquire_retained_temp(runner_ctx_, pipeline_slot_, bytes, addr_out, size_out);
     }
-    int acquire_graph_definition_block(size_t bytes, size_t alignment, void **device_out, void **staging_out) const {
-        if (ops_->acquire_graph_definition_block == nullptr) return -1;
-        return ops_->acquire_graph_definition_block(
-            runner_ctx_, pipeline_slot_, bytes, alignment, device_out, staging_out
-        );
+    int acquire_graph_staging(size_t bytes, size_t alignment, void **staging_out) const {
+        if (ops_->acquire_graph_staging == nullptr) return -1;
+        return ops_->acquire_graph_staging(runner_ctx_, pipeline_slot_, bytes, alignment, staging_out);
+    }
+    int publish_graph_section(const void *bytes, size_t length, uint32_t *source_out, uint64_t *base_out) const {
+        if (source_out != nullptr) *source_out = 0;
+        if (base_out != nullptr) *base_out = 0;
+        if (ops_->publish_graph_section == nullptr) return -1;
+        return ops_->publish_graph_section(runner_ctx_, pipeline_slot_, bytes, length, source_out, base_out);
     }
     void get_graph_definition_staging(void **addr, size_t *size) const {
         if (ops_->get_graph_definition_staging == nullptr) {

@@ -11,9 +11,13 @@
 
 Reads the log a `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE=1 --rounds N` run leaves
 behind and reports each bind segment's minimum, median and maximum across the
-warm binds, plus the subtotal historically labelled "control plane". This sum
-does not include uninstrumented Definition preparation or A5 scheduler work;
-matching segment names across commits does not establish matching coverage.
+warm binds, plus the subtotal historically labelled "control plane". `graph_pack`
+covers Definition packing; Graph task binding, compact execution-image
+preparation and A5 scheduler work still have no segment, so this sum is not the
+whole interval. Matching segment names across commits does not establish
+matching coverage: this segment was `graph_upload` before, with a scope that
+changed twice, and a log carrying that name is reported as unknown and left out
+of the total.
 
 The spread is the point: a change smaller than the range beside it cannot be
 demonstrated. `strace_timing --tree` gives the median alone, and its default
@@ -48,10 +52,11 @@ TORCH_AUTOLOAD_LINE = re.compile(
 )
 
 # Instrumented subtotal, not the full interval before device execution.
-# Definition preparation and A5 scheduler work have no segment in this sum.
+# Graph task binding, compact execution-image preparation and A5 scheduler work
+# have no segment in this sum; Definition packing is inside `graph_pack`.
 # `args` is a per-byte staging cost. `host_view_close` remains excluded for
 # comparison with historical mapped-view logs; current binds close no mappings.
-CONTROL_PLANE = ("host_orch", "graph_upload", "arena_h2d")
+CONTROL_PLANE = ("host_orch", "graph_pack", "arena_h2d")
 
 # Historical display order; spans carry timestamps for the actual execution order.
 PHASE_ORDER = (
@@ -59,7 +64,7 @@ PHASE_ORDER = (
     "arena_build",
     "runtime_init",
     "host_orch",
-    "graph_upload",
+    "graph_pack",
     "static_arena",
     "shared_mem",
     "gm_heap",

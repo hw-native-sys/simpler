@@ -97,9 +97,10 @@ struct KernelArgs {
     uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
     // Remaining 64-bit fields. Grouped before the 32-bit tail so the struct
     // needs no interior alignment padding — every uint64_t lands on its natural
-    // 8-byte boundary and the lone trailing uint32_t carries only harmless tail
-    // padding. Order among these is free (device reads by field name, not
-    // offset); only runtime_args/regs are offset-locked.
+    // 8-byte boundary, and the tail's eight uint32_t fill the last two 8-byte
+    // slots exactly, so the struct carries no padding byte at all. Order among
+    // these is free (device reads by field name, not offset); only
+    // runtime_args/regs are offset-locked.
     uint64_t ffts_base_addr{0};  // FFTS base address for AICore
     uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
     // chip swimlane shared memory base address; use explicit flags to detect enablement
@@ -162,6 +163,17 @@ struct KernelArgs {
     uint32_t entry_tensor_count{0};
     uint32_t entry_scalar_count{0};
     uint32_t entry_args_source{static_cast<uint32_t>(EntryArgsSource::Descriptor)};
+    // Where this run's Graph Definition section sits inside this launch
+    // package, how long it is, and which carrier delivered it. The section is
+    // the whole of the run's packed Definition bytes; a Graph task names its
+    // own object by an offset inside it. `argsSize` is what tells RTS how far to
+    // copy, so the section is part of the package rather than a pointer into
+    // storage the runtime would have to own. Zero and `GraphSectionSource::None`
+    // for every run that submits no Graph task, and for every runtime other
+    // than host_build_graph.
+    uint32_t graph_section_offset{0};
+    uint32_t graph_section_bytes{0};
+    uint32_t graph_section_source{static_cast<uint32_t>(GraphSectionSource::None)};
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
@@ -178,7 +190,12 @@ static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 40,
     "KernelArgs::chip_swimlane_run_terminal_bank offset drift"
 );
-static_assert(sizeof(KernelArgs) == 136, "KernelArgs launch-payload size drift");
+// Where the 32-bit tail's Graph triple begins. `sizeof` alone cannot see a
+// reorder inside that tail, because every member of it is the same width: the
+// fourteen 8-byte fields end at 112 and the eight uint32_t that follow fill 144
+// exactly, in whatever order they are written.
+static_assert(offsetof(KernelArgs, graph_section_offset) == 132, "KernelArgs::graph_section_offset offset drift");
+static_assert(sizeof(KernelArgs) == 144, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.

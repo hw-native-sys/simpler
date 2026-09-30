@@ -937,7 +937,7 @@ _BIND_PHASE_NAMES = frozenset(
         "shared_mem",
         "runtime_init",
         "host_orch",
-        "graph_upload",
+        "graph_pack",
         "arena_h2d",
         "host_view_close",
     }

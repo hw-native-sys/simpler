@@ -35,6 +35,25 @@ enum class EntryArgsSource : uint32_t {
 };
 
 /**
+ * Which carrier delivered this run's Graph Definition section.
+ *
+ * The section is the whole of the run's Definition bytes — every framed object,
+ * as the bind packed them — and a task names its own object by an offset inside
+ * it. `LaunchEnvelope` is the onboard carrier: the section is appended to the
+ * AICPU launch arguments and RTS copies it, so each launched thread receives its
+ * own copy and no address in it may be shared. `HostSnapshot` is simulation's,
+ * where there is no launch package: the runner publishes a host snapshot it owns
+ * until the run's last consumer ends. The two are alternatives, not fallbacks
+ * for one another — a reader accepts exactly the one its platform uses, so a
+ * simulated run cannot decode a stale onboard view or the reverse.
+ */
+enum class GraphSectionSource : uint32_t {
+    None = 0,            // this run submitted no Graph task
+    LaunchEnvelope = 1,  // appended to the AICPU launch arguments, copied by RTS
+    HostSnapshot = 2,    // a run-owned host snapshot, simulation only
+};
+
+/**
  * Byte offset of the entry payload inside an AICPU launch package.
  *
  * One value for every architecture, so the payload's own offset is not a

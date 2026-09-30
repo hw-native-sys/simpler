@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "device/graph_image_source.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/device_run_result_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
@@ -340,7 +341,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         SPIN_WAIT_HINT();
     }
     if (!sched_ctx_.is_completed() && rt != nullptr) {
-        sched_ctx_.classify_partition(thread_idx, aicpu_thread_num_);
+        // This thread's own view of the Definition section, built here and passed
+        // down: a launch package belongs to the thread that entered with it.
+        sched_ctx_.classify_partition(thread_idx, aicpu_thread_num_, graph_image_view_for_reader(*runtime));
     }
     classify_arrived_.fetch_add(1, std::memory_order_acq_rel);
     if (thread_idx == aicpu_thread_num_ - 1) {

@@ -136,7 +136,6 @@ TEST_F(GraphActivationTest, IncrementalPublishRoutesCompletedDepsAndWakeChainsPe
 // PREPARED, and reject it only for SUBMITTED (not yet bound) or COMPLETED
 // (already retired).
 TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
-    GraphDefinition definition{};
     auto complete_in_state = [&](GraphExecutionState state) {
         auto task = std::make_unique<ChipTaskStorage[]>(1);
         auto states = std::make_unique<std::atomic<ChipTaskState>[]>(1);
@@ -145,7 +144,10 @@ TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
         task[0].slot.total_required_subtasks = 1;
 
         GraphExecution exec{};
-        exec.definition = &definition;
+        // Any nonzero offset stands for "bound to a Definition": this path reads
+        // the value only to separate a localized execution from a zeroed one, and
+        // decodes nothing from the section.
+        exec.definition_offset = static_cast<uint32_t>(GRAPH_DEFINITION_OBJECT_ALIGN);
         exec.tasks = exec.task_storage = task.get();
         exec.task_states = states.get();
         exec.task_count = 1;
@@ -169,13 +171,18 @@ TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
 
 // The outer Graph task completes as a task of the run, not into its execution's
 // counters. It is the one slot where a non-null graph_context does NOT mean "in a
-// Graph body": before localize swaps in the GraphExecution the shell's context is
-// the shared GraphDefinition, so the `task_kind == GRAPH` half of complete_task's
-// predicate is the only thing keeping the two apart. Drop it and this slot's
-// Definition gets read as an execution -- a silent static_cast onto another
-// struct's layout, no fault and no error code.
+// Graph body": localize puts the body's own GraphExecution there, so the
+// `task_kind == GRAPH` half of complete_task's predicate is the only thing keeping
+// the shell's completion out of the counters that same execution keeps for its
+// sub-tasks. Drop it and the shell retires as a member of the body it owns.
 TEST_F(GraphActivationTest, CompleteTaskTakesTheOrdinaryPathForTheOuterGraphTask) {
-    GraphDefinition definition{};
+    // Bound and running, so nothing about the execution's own state can be what
+    // routes this completion: with the kind check dropped, the shell would reach
+    // the body's task-index bound and fail there instead of retiring as a task of
+    // the run.
+    GraphExecution execution{};
+    execution.definition_offset = static_cast<uint32_t>(GRAPH_DEFINITION_OBJECT_ALIGN);
+    graph_execution_set_state(execution, GraphExecutionState::ACTIVE);
     // A whole storage entry, not a bare slot state: a slot reaches its descriptor by
     // ChipTaskStorage's layout, so one on its own would resolve outside itself.
     ChipTaskStorage outer{};
@@ -183,7 +190,7 @@ TEST_F(GraphActivationTest, CompleteTaskTakesTheOrdinaryPathForTheOuterGraphTask
 
     ChipTaskSlotState &slot = outer.slot;
     slot.task_kind = TaskKind::GRAPH;
-    slot.graph_context = &definition;
+    slot.graph_context = &execution;
 
 #if SIMPLER_SCHED_PROFILING
     const SchedulerState::TaskCompletionOutcome outcome = sched.complete_task(slot, 0);

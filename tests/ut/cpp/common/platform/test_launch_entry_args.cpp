@@ -350,6 +350,34 @@ TEST_F(LaunchEntryArgs, OnlyASuccessfulNoCaptureAnswerOpensTheLaunchRoute) {
     EXPECT_FALSE(launch_route_permitted_by_capture(-7, ACL_MODEL_RI_CAPTURE_STATUS_NONE));
 }
 
+// A Graph section is staged on the slot and named by the descriptor, and the
+// publication takes both or neither. The scenario is a run whose prepare failed
+// after staging: the length stays on the slot, and the next run on it names no
+// section, so the two disagree and the staged bytes must not reach that run's
+// header. Nothing in the section's own decoding can catch this — by then the
+// header already names a predecessor's bytes.
+TEST_F(LaunchEntryArgs, AStagedSectionNoDescriptorNamesIsNotPublished) {
+    std::array<unsigned char, 96> section{};
+    section.fill(0x7c);
+    ASSERT_EQ(stage_graph_section(slot, section.data(), section.size()), 0);
+    ASSERT_EQ(slot.graph_section_bytes, section.size());
+    ASSERT_EQ(runtime_graph_section_bytes(runtime), 0U) << "this run submits no Graph task";
+
+    ASSERT_EQ(run_once(false), 0);
+
+    EXPECT_EQ(helper.args.graph_section_bytes, 0U);
+    EXPECT_EQ(helper.args.graph_section_offset, 0U);
+    EXPECT_EQ(helper.args.graph_section_source, static_cast<uint32_t>(GraphSectionSource::None));
+    EXPECT_EQ(slot.graph_section_bytes, 0U) << "the staged length is consumed, not left for the run after this one";
+    EXPECT_EQ(helper.launch_payload_bytes(), sizeof(KernelArgs)) << "the package the section sits in is not submitted";
+
+    // And the run after it, which stages nothing, is unchanged by any of that.
+    helper.release_run_view();
+    ASSERT_EQ(run_once(false), 0);
+    EXPECT_EQ(helper.args.graph_section_bytes, 0U);
+    EXPECT_EQ(helper.args.graph_section_source, static_cast<uint32_t>(GraphSectionSource::None));
+}
+
 #ifdef SIMPLER_UT_TRB_RUNTIME
 // Everything below is about values only this runtime's descriptor carries.
 #include "tensormap_and_ringbuffer/entry_args.h"
@@ -820,5 +848,36 @@ TEST_F(LaunchEntryArgs, AnAbsentLaunchRouteIsNotAnInvalidCount) {
     EXPECT_FALSE(plan.supported);
     EXPECT_TRUE(plan.counts_valid);
     EXPECT_EQ(prepare(), 0) << "nothing here fails a prepare";
+}
+
+// This runtime's other half of the same seam: the Graph section takes the
+// package the entry region would have taken, and takes it only when the slot's
+// staging and the run's descriptor name one length between them.
+TEST_F(LaunchEntryArgs, AGraphSectionTravelsOnlyWhenBothSidesNameTheSameLength) {
+    std::array<unsigned char, 128> section{};
+    section.fill(0x3b);
+    runtime.publish_graph_section(GraphSectionSource::LaunchEnvelope, 0, static_cast<uint32_t>(section.size()));
+    ASSERT_EQ(stage_graph_section(slot, section.data(), section.size()), 0);
+
+    ASSERT_EQ(run_once(false), 0);
+    EXPECT_EQ(helper.args.graph_section_bytes, section.size());
+    EXPECT_EQ(helper.args.graph_section_offset, static_cast<uint32_t>(LAUNCH_ENVELOPE_HEADER_BYTES));
+    EXPECT_EQ(helper.args.graph_section_source, static_cast<uint32_t>(GraphSectionSource::LaunchEnvelope));
+    const auto *package = static_cast<const unsigned char *>(helper.launch_payload());
+    ASSERT_NE(package, nullptr);
+    EXPECT_EQ(helper.launch_payload_bytes(), LAUNCH_ENVELOPE_HEADER_BYTES + section.size());
+    EXPECT_EQ(std::memcmp(package + LAUNCH_ENVELOPE_HEADER_BYTES, section.data(), section.size()), 0)
+        << "the bytes RTS would copy are the ones the bind staged";
+    helper.release_run_view();
+
+    // Half the length under the same descriptor: this run's own bind
+    // disagreeing with itself, which fails the publication rather than naming a
+    // length nothing staged.
+    ASSERT_EQ(stage_graph_section(slot, section.data(), section.size() / 2), 0);
+    ASSERT_EQ(prepare(), 0);
+    EXPECT_NE(publish(false), 0);
+    EXPECT_FALSE(helper.runtime_args_published());
+    EXPECT_EQ(helper.launch_payload(), nullptr) << "a refused publication submits nothing";
+    helper.release_run_view();
 }
 #endif

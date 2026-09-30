@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+#include "device/graph_image_source.h"
 #include "scheduler_context.h"
 
 #include <algorithm>
@@ -1470,8 +1471,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES ? get_sys_cnt_aicpu() : 0;
 #endif
                 int32_t tasks_materialized = 0;
-                GraphMaterializeResult result =
-                    sched_->prepare_graph_task(*prepare_slot, GRAPH_MATERIALIZE_SLICE_TASKS, &tasks_materialized);
+                GraphMaterializeResult result = sched_->prepare_graph_task(
+                    *prepare_slot, graph_image_view_for_reader(*runtime), GRAPH_MATERIALIZE_SLICE_TASKS,
+                    &tasks_materialized
+                );
                 if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::BUSY) {
                     if (!sched_->push_graph_prepare(prepare_slot, prepare_task_id, thread_idx)) {
                         fail_scheduler(runtime, thread_idx, SIMPLER_ERROR_READY_QUEUE_OVERFLOW);

@@ -164,6 +164,8 @@ LaunchEntryArgsVerdict classify_launch_entry_args(
     return LaunchEntryArgsVerdict::Adopt;
 }
 
+uint32_t runtime_graph_section_bytes(const Runtime &) { return 0; }
+
 LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &rt) {
     const simpler::tmr::EntryArgsStorage &entry = rt.get_orch_args();
     const int32_t tensors = entry.tensor_count();

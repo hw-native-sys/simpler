@@ -26,6 +26,7 @@
 
 #include "graph_cache.h"
 #include "graph_execution.h"
+#include "graph_image_view.h"
 #include "runtime_status/error_names.h"
 #include "scheduler/scheduler.h"
 #include "host_build_graph/task_id.h"
@@ -189,7 +190,8 @@ std::vector<std::byte> make_test_definition(
     }
     size_t execution_storage_bytes = 0;
     graph_execution_storage_bytes(
-        definition.task_count, definition.tensor_arg_count, definition.scalar_arg_count, &execution_storage_bytes
+        definition.task_count, definition.tensor_arg_count, definition.scalar_arg_count, definition.edge_count,
+        &execution_storage_bytes
     );
     definition.execution_storage_bytes = static_cast<uint32_t>(execution_storage_bytes);
     definition.total_bytes = static_cast<uint32_t>(image.size());
@@ -214,11 +216,26 @@ public:
         std::memcpy(
             static_cast<uint8_t *>(data_) + sizeof(GraphDefinitionHeader), definition.data(), definition.size()
         );
+        object_bytes_ = object_bytes;
     }
 
     ~TestDefinitionObject() { ::operator delete(data_, std::align_val_t(alignof(GraphDefinitionHeader))); }
 
     uint64_t address() const { return reinterpret_cast<uint64_t>(data_); }
+    // The object as a one-object Definition section, which is what a reader
+    // decodes: the image starts one header in, and that offset is what a task
+    // carries.
+    GraphImageView view() const {
+        GraphImageView v{};
+        v.section = static_cast<const std::byte *>(data_);
+        v.bytes = static_cast<uint32_t>(object_bytes_);
+        return v;
+    }
+    static uint32_t image_offset() { return static_cast<uint32_t>(sizeof(GraphDefinitionHeader)); }
+    // The object's bytes, writable, so a case can poison the source while it is
+    // still alive rather than inferring anything from a freed allocation.
+    std::byte *mutable_section() { return static_cast<std::byte *>(data_); }
+    size_t section_bytes() const { return object_bytes_; }
     const GraphDefinition *definition() const {
         return reinterpret_cast<const GraphDefinition *>(
             static_cast<const uint8_t *>(data_) + sizeof(GraphDefinitionHeader)
@@ -230,6 +247,7 @@ public:
 
 private:
     void *data_{nullptr};
+    size_t object_bytes_{0};
 };
 
 class AlignedStorage {
@@ -307,11 +325,18 @@ public:
         if (definition->boundary_scalar_count != 0) {
             boundary_scalars_[definition->boundary_scalar_count - 1] = boundary_scalar;
         }
-        storage_entry_.slot.graph_context = const_cast<GraphDefinition *>(definition);
-        return graph_execution_localize(storage_entry_.slot);
+        storage_entry_.slot.graph_context = nullptr;
+        storage_entry_.slot.to_descriptor().graph_definition_offset = TestDefinitionObject::image_offset();
+        image_ = definition_object.view();
+        return graph_execution_localize(storage_entry_.slot, image_);
     }
 
+    // The view the last initialize_execution built, so a case materializes
+    // through the same section its localize read.
+    const GraphImageView &image() const { return image_; }
+
 private:
+    GraphImageView image_{};
     size_t heap_bytes_{0};
     std::unique_ptr<AlignedStorage> storage_;
     // One storage entry, as production has it: a slot state reaches its descriptor
@@ -527,17 +552,23 @@ TEST(GraphExecutionStorage, ComputesAlignedExactSize) {
     constexpr int32_t TASK_COUNT = 7;
     constexpr uint32_t TENSOR_ARGS = 11;
     constexpr uint32_t SCALAR_ARGS = 5;
+    constexpr int32_t EDGE_COUNT = 9;
     GraphExecutionStorageLayout layout{};
 
-    ASSERT_TRUE(graph_execution_storage_layout(TASK_COUNT, TENSOR_ARGS, SCALAR_ARGS, &layout));
+    ASSERT_TRUE(graph_execution_storage_layout(TASK_COUNT, TENSOR_ARGS, SCALAR_ARGS, EDGE_COUNT, &layout));
     EXPECT_EQ(layout.tasks_offset % alignof(ChipTaskStorage), 0U);
     EXPECT_GE(layout.tasks_offset, sizeof(GraphExecution));
     EXPECT_EQ(layout.tensors_offset, layout.tasks_offset + TASK_COUNT * sizeof(ChipTaskStorage));
     EXPECT_EQ(layout.tensors_offset % alignof(simpler::hbg::Tensor), 0U);
     EXPECT_EQ(layout.scalars_offset, layout.tensors_offset + TENSOR_ARGS * sizeof(simpler::hbg::Tensor));
-    // The state array is last and byte-aligned, so it starts exactly where the
-    // scalar pool ends and closes the image.
-    EXPECT_EQ(layout.states_offset, layout.scalars_offset + SCALAR_ARGS * sizeof(uint64_t));
+    // The execution's own fanin CSR follows the scalar pool, whose element
+    // alignment already covers both arrays, then the byte-aligned state array
+    // closes the image.
+    EXPECT_EQ(layout.fanin_offsets_offset, layout.scalars_offset + SCALAR_ARGS * sizeof(uint64_t));
+    EXPECT_EQ(layout.fanin_offsets_offset % alignof(int32_t), 0U);
+    EXPECT_EQ(layout.fanin_indices_offset, layout.fanin_offsets_offset + (TASK_COUNT + 1) * sizeof(int32_t));
+    EXPECT_EQ(layout.fanin_indices_offset % alignof(uint16_t), 0U);
+    EXPECT_EQ(layout.states_offset, layout.fanin_indices_offset + EDGE_COUNT * sizeof(uint16_t));
     EXPECT_EQ(layout.total_bytes, layout.states_offset + TASK_COUNT * sizeof(std::atomic<ChipTaskState>));
 }
 
@@ -561,19 +592,21 @@ TEST(GraphExecutionStorage, NarrowerArgTablesReserveLess) {
     constexpr int32_t TASK_COUNT = 4;
     size_t wide = 0;
     size_t narrow = 0;
-    ASSERT_TRUE(graph_execution_storage_bytes(TASK_COUNT, 32, 16, &wide));
-    ASSERT_TRUE(graph_execution_storage_bytes(TASK_COUNT, 4, 2, &narrow));
+    ASSERT_TRUE(graph_execution_storage_bytes(TASK_COUNT, 32, 16, 3, &wide));
+    ASSERT_TRUE(graph_execution_storage_bytes(TASK_COUNT, 4, 2, 3, &narrow));
     EXPECT_LT(narrow, wide);
 }
 
 TEST(GraphExecutionStorage, RejectsInvalidSubTaskCount) {
     size_t storage_bytes = 0;
 
-    EXPECT_FALSE(graph_execution_storage_bytes(0, 1, 1, &storage_bytes));
-    EXPECT_FALSE(graph_execution_storage_bytes(-1, 1, 1, &storage_bytes));
-    EXPECT_FALSE(graph_execution_storage_bytes(SUB_TASK_MAX_NUM + 1, 1, 1, &storage_bytes));
-    // A Definition with no arguments at all still needs its sub-task array.
-    EXPECT_TRUE(graph_execution_storage_bytes(1, 0, 0, &storage_bytes));
+    EXPECT_FALSE(graph_execution_storage_bytes(0, 1, 1, 0, &storage_bytes));
+    EXPECT_FALSE(graph_execution_storage_bytes(-1, 1, 1, 0, &storage_bytes));
+    EXPECT_FALSE(graph_execution_storage_bytes(SUB_TASK_MAX_NUM + 1, 1, 1, 0, &storage_bytes));
+    EXPECT_FALSE(graph_execution_storage_bytes(1, 1, 1, -1, &storage_bytes));
+    // A Definition with no arguments and no edges at all still needs its
+    // sub-task array.
+    EXPECT_TRUE(graph_execution_storage_bytes(1, 0, 0, 0, &storage_bytes));
     EXPECT_GE(storage_bytes, sizeof(GraphExecution) + sizeof(ChipTaskStorage));
 }
 
@@ -610,7 +643,9 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     // The execution and sub-task storage both occupy the outer heap tail after
     // required_heap.
     EXPECT_EQ(static_cast<void *>(execution), heap.execution());
-    EXPECT_EQ(graph_execution_materialize_slice(outer_slot, *execution, 2), GraphMaterializeResult::PREPARED);
+    EXPECT_EQ(
+        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::PREPARED
+    );
     // A shell released early stages its body's roots, and materialization is what
     // decides which roots it may stage. Task 0 is this body's root and is an
     // ordinary dispatchable task, so it qualifies; task 1 has a producer, so its
@@ -647,7 +682,9 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     // Same heap block: the rebuild lands on the bytes the previous execution left behind.
     EXPECT_EQ(static_cast<void *>(execution), heap.execution());
 
-    EXPECT_EQ(graph_execution_materialize_slice(outer_slot, *execution, 2), GraphMaterializeResult::PREPARED);
+    EXPECT_EQ(
+        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::PREPARED
+    );
     EXPECT_EQ(storage.task.kernel_id[0], 42);
     EXPECT_EQ(storage.slot.active_mask.raw(), 1);
     EXPECT_EQ(storage.payload.scalar_data()[0], 99U);
@@ -702,7 +739,9 @@ TEST(GraphExecutionReplay, RootStagingVerdictWithholdsCandidate) {
         outer.slot.graph_context = execution;
         outer.slot.ed_flags = test_case.shell_ed_flags;
 
-        ASSERT_EQ(graph_execution_materialize_slice(outer.slot, *execution, 2), GraphMaterializeResult::PREPARED);
+        ASSERT_EQ(
+            graph_execution_materialize_slice(outer.slot, *execution, heap.image(), 2), GraphMaterializeResult::PREPARED
+        );
         EXPECT_EQ(execution->task_at(0).slot.ed_flags & ED_FLAG_CANDIDATE, 0);
     }
 }
@@ -778,7 +817,9 @@ TEST(GraphExecutionReplay, MaterializesBoundaryScalarPoolWiderThanTaskPayload) {
     outer_slot.task_kind = TaskKind::GRAPH;
     outer_slot.graph_context = execution;
 
-    EXPECT_EQ(graph_execution_materialize_slice(outer_slot, *execution, 2), GraphMaterializeResult::PREPARED);
+    EXPECT_EQ(
+        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::PREPARED
+    );
     EXPECT_EQ(execution->task_storage[0].payload.scalar_data()[0], 21U);
 }
 
@@ -1017,11 +1058,12 @@ TEST(GraphExecutionErrors, InvalidSubTaskCompletionIsReported) {
 
 TEST(GraphExecutionProgress, SubTaskResolutionIsNotAHostCompletion) {
     SchedulerState scheduler{};
-    GraphDefinition definition{};
     ChipTaskStorage task{};
     std::atomic<ChipTaskState> states[1]{};
     GraphExecution execution{};
-    execution.definition = &definition;
+    // Any non-zero offset: the completion path only asks whether this execution
+    // names a Definition, not what is at that offset.
+    execution.definition_offset = sizeof(GraphDefinitionHeader);
     execution.tasks = &task;
     execution.task_storage = &task;
     execution.task_states = states;
@@ -1069,7 +1111,9 @@ TEST(GraphExecutionMaterialize, DirtyStorageYieldsValidExecution) {
     outer_slot.graph_context = execution;
 
     EXPECT_EQ(static_cast<void *>(execution), heap.execution());
-    EXPECT_EQ(graph_execution_materialize_slice(outer_slot, *execution, 2), GraphMaterializeResult::PREPARED);
+    EXPECT_EQ(
+        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::PREPARED
+    );
 
     // Every observable scheduling field must be a materialize-written value,
     // not the 0xAA fill: state machine, counters and atomics all start from
@@ -1098,4 +1142,212 @@ TEST(GraphExecutionMaterialize, DirtyStorageYieldsValidExecution) {
     for (size_t i = 0; i < heap.boundary_tail_bytes(1); ++i) {
         ASSERT_EQ(tail[i], std::byte{0}) << "byte " << i << " past the packed boundary";
     }
+}
+
+// ============================================================================
+// The Definition section as a launch payload: decoded by value, bounded twice,
+// and never named by an address one thread could hold after it returns.
+// ============================================================================
+
+namespace {
+
+// One Definition object placed at a deliberate offset inside a larger section,
+// so a case can misalign the base, truncate the extent, or point a task at the
+// wrong place without rebuilding the image.
+class SectionBuffer {
+public:
+    SectionBuffer(const std::vector<std::byte> &definition, size_t lead_bytes, size_t misalign = 0) {
+        const size_t object_bytes = sizeof(GraphDefinitionHeader) + definition.size();
+        bytes_.assign(misalign + lead_bytes + object_bytes, std::byte{0});
+        image_offset_ = lead_bytes + sizeof(GraphDefinitionHeader);
+        std::byte *object = bytes_.data() + misalign + lead_bytes;
+        GraphDefinitionHeader header{};
+        const auto *def = reinterpret_cast<const GraphDefinition *>(definition.data());
+        header.magic = GRAPH_DEFINITION_OBJECT_MAGIC;
+        header.definition_bytes = static_cast<uint32_t>(definition.size());
+        header.full_key = def->full_key;
+        std::memcpy(object, &header, sizeof(header));
+        std::memcpy(object + sizeof(GraphDefinitionHeader), definition.data(), definition.size());
+        section_ = bytes_.data() + misalign;
+        section_bytes_ = lead_bytes + object_bytes;
+    }
+
+    GraphImageView view() const {
+        GraphImageView v{};
+        v.section = section_;
+        v.bytes = static_cast<uint32_t>(section_bytes_);
+        return v;
+    }
+    // The same section, cut short so the object no longer fits inside it.
+    GraphImageView truncated_view() const {
+        GraphImageView v = view();
+        v.bytes = static_cast<uint32_t>(image_offset_ + 8);
+        return v;
+    }
+    uint32_t image_offset() const { return static_cast<uint32_t>(image_offset_); }
+    std::byte *mutable_section() { return section_; }
+
+private:
+    std::vector<std::byte> bytes_;
+    std::byte *section_{nullptr};
+    size_t section_bytes_{0};
+    size_t image_offset_{0};
+};
+
+}  // namespace
+
+// A package base RTS hands over carries no alignment promise, so the reader
+// copies every value into an aligned local. The same section decodes the same
+// way at an odd address as at an even one.
+TEST(GraphImageSection, DecodesAtAnUnalignedBase) {
+    std::array<uint8_t, 64> boundary{};
+    const std::vector<std::byte> definition = make_test_definition(0x5151, reinterpret_cast<uint64_t>(boundary.data()));
+
+    SectionBuffer aligned(definition, /*lead_bytes=*/0);
+    SectionBuffer misaligned(definition, /*lead_bytes=*/0, /*misalign=*/1);
+    ASSERT_NE(reinterpret_cast<uintptr_t>(misaligned.view().section) % alignof(GraphDefinitionHeader), 0U)
+        << "this case is only meaningful against a base no type's alignment covers";
+
+    GraphDefinitionValue from_aligned{};
+    GraphDefinitionValue from_misaligned{};
+    ASSERT_TRUE(graph_definition_decode_framed(aligned.view(), aligned.image_offset(), &from_aligned));
+    ASSERT_TRUE(graph_definition_decode_framed(misaligned.view(), misaligned.image_offset(), &from_misaligned));
+    EXPECT_EQ(from_misaligned.definition.full_key, from_aligned.definition.full_key);
+    EXPECT_EQ(from_misaligned.definition.total_bytes, from_aligned.definition.total_bytes);
+    EXPECT_EQ(from_misaligned.definition.task_count, from_aligned.definition.task_count);
+    EXPECT_EQ(from_misaligned.definition.edge_count, from_aligned.definition.edge_count);
+
+    // And an element read out of that misaligned image agrees too.
+    SubTaskDefinition task{};
+    ASSERT_TRUE(
+        graph_definition_load_element<SubTaskDefinition>(
+            misaligned.view(), from_misaligned, from_misaligned.definition.off_sub_tasks,
+            from_misaligned.definition.task_count, 0, &task
+        )
+    );
+    EXPECT_EQ(task.tensor_count, 1);
+}
+
+// Every read is bounded against the framed object *and* the section, because a
+// corrupt offset can land inside another object that is itself well framed.
+TEST(GraphImageSection, RefusesReadsOutsideTheObjectOrTheSection) {
+    std::array<uint8_t, 64> boundary{};
+    const std::vector<std::byte> definition = make_test_definition(0x5252, reinterpret_cast<uint64_t>(boundary.data()));
+    SectionBuffer section(definition, /*lead_bytes=*/sizeof(GraphDefinitionHeader) * 2);
+    GraphDefinitionValue object{};
+    ASSERT_TRUE(graph_definition_decode_framed(section.view(), section.image_offset(), &object));
+
+    // An offset of zero is "absent", and one past the image is corrupt.
+    uint32_t absolute = 0;
+    EXPECT_FALSE(object.absolute(section.view(), 0, 4, &absolute));
+    EXPECT_FALSE(object.absolute(section.view(), object.definition.total_bytes, 4, &absolute));
+    EXPECT_FALSE(object.absolute(section.view(), object.definition.total_bytes - 2, 4, &absolute));
+    EXPECT_TRUE(object.absolute(section.view(), object.definition.off_sub_tasks, 4, &absolute));
+
+    // An element index outside the array, and a count the image cannot hold.
+    SubTaskDefinition task{};
+    EXPECT_FALSE(
+        graph_definition_load_element<SubTaskDefinition>(
+            section.view(), object, object.definition.off_sub_tasks, object.definition.task_count,
+            object.definition.task_count, &task
+        )
+    );
+    EXPECT_FALSE(
+        graph_definition_load_element<SubTaskDefinition>(
+            section.view(), object, object.definition.off_sub_tasks, INT32_MAX, 0, &task
+        )
+    );
+
+    // A section that no longer contains the object it frames is refused before
+    // any offset inside it is used.
+    GraphDefinitionValue truncated{};
+    EXPECT_FALSE(graph_definition_decode_framed(section.truncated_view(), section.image_offset(), &truncated));
+
+    // Framing the object around another Graph, and claiming a size the image
+    // does not have, are both rejected by value.
+    auto *header = reinterpret_cast<GraphDefinitionHeader *>(
+        section.mutable_section() + section.image_offset() - sizeof(GraphDefinitionHeader)
+    );
+    const uint64_t good_key = header->full_key;
+    header->full_key = good_key ^ 0xFFULL;
+    GraphDefinitionValue reframed{};
+    EXPECT_FALSE(graph_definition_decode_framed(section.view(), section.image_offset(), &reframed));
+    header->full_key = good_key;
+    header->magic = 0;
+    EXPECT_FALSE(graph_definition_decode_framed(section.view(), section.image_offset(), &reframed));
+}
+
+// The localizing thread's package may be gone before a peer traverses the
+// graph, so nothing the execution keeps may point into it. The fanin rows and
+// indices are its own, and a later slice decodes through the *peer's* view.
+TEST(GraphImageSection, ExecutionSurvivesTheLocalizersPackage) {
+    constexpr uint64_t GRAPH_KEY_VALUE = 0x5353;
+    std::array<uint8_t, 64> boundary{};
+    const std::vector<std::byte> definition =
+        make_test_definition(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(boundary.data()));
+    const auto *source_definition = reinterpret_cast<const GraphDefinition *>(definition.data());
+
+    OuterHeap heap(definition, 0xAA);
+    TestDefinitionObject localizer_package(definition);
+    GraphExecution *execution =
+        heap.initialize_execution(localizer_package, reinterpret_cast<uint64_t>(boundary.data()), 11);
+    ASSERT_NE(execution, nullptr);
+    ASSERT_EQ(execution->edge_count, source_definition->edge_count);
+
+    // Where the rows and indices actually live. Inside the outer task's heap
+    // block, and outside the package they were read from: the two ranges are
+    // disjoint, so no later read of these arrays can reach the localizer's
+    // arguments whatever happens to them.
+    const auto *rows = reinterpret_cast<const std::byte *>(execution->fanin_offsets);
+    const size_t rows_bytes = (static_cast<size_t>(execution->task_count) + 1) * sizeof(int32_t);
+    const auto *package = localizer_package.mutable_section();
+    const std::byte *package_end = package + localizer_package.section_bytes();
+    ASSERT_NE(rows, nullptr);
+    EXPECT_GE(rows, reinterpret_cast<const std::byte *>(heap.base()));
+    EXPECT_LE(rows + rows_bytes, reinterpret_cast<const std::byte *>(heap.end()));
+    EXPECT_TRUE(rows + rows_bytes <= package || rows >= package_end) << "the rows overlap the localizer's package";
+    if (execution->edge_count != 0) {
+        const auto *indices = reinterpret_cast<const std::byte *>(execution->fanin_indices);
+        const size_t indices_bytes = static_cast<size_t>(execution->edge_count) * sizeof(uint16_t);
+        ASSERT_NE(indices, nullptr);
+        EXPECT_GE(indices, reinterpret_cast<const std::byte *>(heap.base()));
+        EXPECT_LE(indices + indices_bytes, reinterpret_cast<const std::byte *>(heap.end()));
+        EXPECT_TRUE(indices + indices_bytes <= package || indices >= package_end)
+            << "the indices overlap the localizer's package";
+    }
+
+    std::vector<int32_t> rows_seen(execution->fanin_offsets, execution->fanin_offsets + execution->task_count + 1);
+    std::vector<uint16_t> indices_seen(
+        execution->fanin_indices, execution->fanin_indices + std::max(execution->edge_count, 0)
+    );
+
+    // Poison the source while it is still a live, addressable object: a
+    // borrowed pointer reads this, and defined behaviour says so — unlike a
+    // freed allocation, where reading it at all is what is undefined.
+    std::memset(localizer_package.mutable_section(), 0x7E, localizer_package.section_bytes());
+
+    for (int32_t i = 0; i <= execution->task_count; ++i) {
+        EXPECT_EQ(execution->fanin_offsets[i], rows_seen[static_cast<size_t>(i)])
+            << "row " << i << " is read from the localizer's package rather than the execution's storage";
+    }
+    for (int32_t i = 0; i < execution->edge_count; ++i) {
+        EXPECT_EQ(execution->fanin_indices[i], indices_seen[static_cast<size_t>(i)])
+            << "index " << i << " is read from the localizer's package rather than the execution's storage";
+    }
+
+    // A peer thread now materializes the body through its own copy of the same
+    // section, which is the only address it may read the image from — and the
+    // localizer's copy is poison by now, so a view taken from it could not.
+    const TestDefinitionObject peer_package(definition);
+    ChipTaskStorage outer{};
+    outer.task.task_id = TaskId::make_global(11);
+    outer.task.packed_buffer_base = heap.base();
+    outer.task.packed_buffer_end = heap.end();
+    outer.slot.task_kind = TaskKind::GRAPH;
+    outer.slot.graph_context = execution;
+    EXPECT_EQ(
+        graph_execution_materialize_slice(outer.slot, *execution, peer_package.view(), execution->task_count),
+        GraphMaterializeResult::PREPARED
+    );
+    EXPECT_EQ(execution->materialized_tasks, execution->task_count);
 }

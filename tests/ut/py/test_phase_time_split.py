@@ -58,10 +58,10 @@ def test_parse_ignores_records_that_are_not_bind_segments(tmp_path):
         "some other TIMING line\n"
         + "[STRACE] v=1 pid=7 tid=7 inv=1 hid=abc depth=1 name=chip.run.bind ts=1 dur=9\n"
         + "[STRACE] v=1 pid=7 tid=7 inv=1 hid=abc depth=3 name=chip.run.bind.host_orch.graph_submit ts=2 dur=3\n"
-        + _span("graph_upload", 1000, 1000, 0)
+        + _span("graph_pack", 1000, 1000, 0)
     )
 
-    assert [row["phase"] for row in phase_time_split.parse([log])] == ["graph_upload"]
+    assert [row["phase"] for row in phase_time_split.parse([log])] == ["graph_pack"]
 
 
 def test_a_truncated_cold_bind_does_not_promote_its_successor(tmp_path, monkeypatch, capsys):

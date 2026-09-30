@@ -10,6 +10,7 @@
  */
 #pragma once
 
+#include "graph_image_view.h"
 #include "assert_compat.h"
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -169,7 +170,7 @@ public:
     // on_graph_attached and before runtime_init_ready_ (the caller barriers
     // all threads between the two). Concurrency-safe: push_ready_routed and
     // register_wake are the same lock-free primitives used during the run.
-    void classify_partition(int32_t thread_idx, int32_t nthreads);
+    void classify_partition(int32_t thread_idx, int32_t nthreads, const GraphImageView &image);
 
     // Bind the RuntimeContext scheduler pointer.
     void bind_runtime(RuntimeContext *rt);

@@ -290,8 +290,21 @@ public:
     int device_memset(void *dev_ptr, int value, size_t bytes);
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size);
-    int acquire_graph_definition_block(
-        uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **staging_out
+    int acquire_graph_staging(uint32_t pipeline_slot, size_t bytes, size_t alignment, void **staging_out);
+    /**
+     * Take this run's packed Definition section into its run-owned snapshot.
+     *
+     * Simulation has no launch package and no RTS to copy one: the device side
+     * is called in-process with the `Runtime`, so the section is delivered as a
+     * host snapshot this runner owns. It is copied out of the bind's staging
+     * rather than aliasing it, so a later bind growing that staging cannot move
+     * the bytes a run is still reading, and it stays pinned until this slot's
+     * next publication or the runner's release.
+     *
+     * Reports `GraphSectionSource::HostSnapshot` and the snapshot's address.
+     */
+    int publish_graph_section(
+        uint32_t pipeline_slot, const void *bytes, size_t length, uint32_t *source_out, uint64_t *base_out
     );
     void get_graph_definition_staging(uint32_t pipeline_slot, void **addr, size_t *size);
     /**
@@ -565,7 +578,7 @@ protected:
     // Bulk-free the shared callable / chip-callable / orch-SO state. Subclass
     // finalize() calls this before mem_alloc_.finalize(). Idempotent.
     void release_callable_state();
-    void release_graph_definition_blocks();
+    void release_graph_definition_staging();
 
     /**
      * Release every slot's retained scheduler-state storage.
@@ -611,21 +624,17 @@ protected:
     CallerDeviceBuffers caller_device_buffers_;
     std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
     std::array<size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
-    // Graph Definition storage, one retained block per pipeline slot — see
-    // HostApi acquire_graph_definition_block. `staging` is the host block the
-    // run's Definition objects are packed into and stays allocated across runs,
-    // so a bind neither acquires nor returns host memory for them; the device
-    // side is the raw allocation plus the aligned address handed out. One block
-    // per slot rather than one per Definition: every Definition of a run is
-    // packed end to end and shipped by a single H2D, and every submission
-    // references the device-resident copy of its own Definition.
-    struct RetainedGraphBlock {
-        void *allocation{nullptr};
-        void *aligned_addr{nullptr};
-        size_t capacity{0};
-        std::vector<std::byte> staging;
+    // One pipeline slot's Graph Definition bytes: `staging` is what the
+    // recorders build their objects into, grow-only and content-preserving, and
+    // `snapshot` is the copy a published run reads. Two buffers rather than one
+    // because the device side reads the snapshot in this same process: a later
+    // bind growing the staging must not move bytes a run still names. No device
+    // member — simulation allocates no device Definition block either.
+    struct RetainedGraphStaging {
+        std::vector<std::byte> bytes;
+        std::vector<std::byte> snapshot;
     };
-    std::array<RetainedGraphBlock, PTO_PIPELINE_MAX_DEPTH> graph_definition_blocks_{};
+    std::array<RetainedGraphStaging, PTO_PIPELINE_MAX_DEPTH> graph_definition_staging_{};
     // Scheduler-state storage, one retained pair per pipeline slot — see
     // HostApi acquire_scheduler_state_storage and
     // utils/retained_scheduler_storage.h, which holds the grow, alignment and
