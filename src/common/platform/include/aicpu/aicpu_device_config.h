@@ -51,6 +51,20 @@ void set_scheduler_timeout_ms(int timeout_ms);
 int get_scheduler_timeout_ms();
 
 /**
+ * Set the estimated-remaining ceiling (us) for a MIX pending pre-load: a target
+ * cluster whose running kernels are estimated to need more than this is not
+ * pre-loaded into, and the block stays in the shared ready queue for whichever
+ * thread frees a cluster first. Latched once per device by simpler_aicpu_init
+ * (from InitArgs.mix_preload_max_remaining_us); read by the scheduler dispatch
+ * loop each run. 0 disables the gate, leaving every pending target eligible —
+ * the behaviour before the gate existed.
+ */
+void set_mix_preload_max_remaining_us(int max_remaining_us);
+
+/** Get the MIX pre-load estimated-remaining ceiling in us (0 = gate disabled). */
+int get_mix_preload_max_remaining_us();
+
+/**
  * Set the device address of the per-device async-DMA workspace for one engine
  * kind (see DmaWorkspaceKind). Published by simpler_aicpu_init (from
  * InitArgs.dma_workspace_addr[]) into a resident-SO array; the scheduler

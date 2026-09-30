@@ -162,6 +162,9 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         load_optional_sym("set_orch_device_id", reinterpret_cast<void **>(&set_orch_device_id_func_));
         load_optional_sym("set_scheduler_timeout_ms", reinterpret_cast<void **>(&set_scheduler_timeout_ms_func_));
+        load_optional_sym(
+            "set_mix_preload_max_remaining_us", reinterpret_cast<void **>(&set_mix_preload_max_remaining_us_func_)
+        );
         if (set_scheduler_timeout_ms_func_ != nullptr) {
             // Per-device one-shot latch (mirrors the onboard InitArgs path):
             // honor SIMPLER_SCHEDULER_TIMEOUT_MS once at SO load, not per run. 0 ->
@@ -173,6 +176,12 @@ int DeviceRunner::ensure_binaries_loaded() {
             set_scheduler_timeout_ms_func_(
                 (sched_status.scheduler_env_set && sched_status.scheduler_valid) ? sched_cfg.scheduler_timeout_ms : 0
             );
+        }
+        if (set_mix_preload_max_remaining_us_func_ != nullptr) {
+            // Same one-shot latch as the timeout above: SIMPLER_MIX_PRELOAD_MAX_REMAINING_US
+            // when set, the host-side default otherwise (0 disables the gate).
+            RuntimeTimeoutConfig preload_cfg = resolve_runtime_timeout_config(RuntimeTimeoutConfig{1, 1, 0});
+            set_mix_preload_max_remaining_us_func_(preload_cfg.mix_preload_max_remaining_us);
         }
         if (!load_sym("set_platform_dump_base", reinterpret_cast<void **>(&set_platform_dump_base_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
