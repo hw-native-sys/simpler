@@ -195,7 +195,10 @@ GraphSlotStatus admit_graph_packet_for_restore(
     );
     if (admission == simpler::kernel::InvocationStatus::StaleCallable) return GraphSlotStatus::CallableMismatch;
     if (admission != simpler::kernel::InvocationStatus::Ok) return GraphSlotStatus::InvalidPacket;
-    if (validate_graph_packet(packet, bytes, GraphPacketAddress::DeviceCopy) != GraphPacketStatus::Ok)
+    // Host validated the immutable template before handing it to CANN.
+    // Rechecking its bytewise checksum on every replay scales with image size;
+    // retain framing, trusted registry binding and downstream image validation.
+    if (validate_graph_packet_framing(packet, bytes, GraphPacketAddress::DeviceCopy) != GraphPacketStatus::Ok)
         return GraphSlotStatus::InvalidPacket;
     GraphPacketHeader header{};
     std::memcpy(

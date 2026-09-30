@@ -247,15 +247,19 @@ The existing runtime image types retain their ABI. Their internal runtime
 pointers are null and rebuilt after restore; task heap/Definition references
 are bound to stable device destinations. Caller tensor contents are not copied.
 
-`validate_graph_packet` uses bounded `memcpy` reads, accepts an unaligned source,
+`validate_graph_packet_framing` uses bounded `memcpy` reads, accepts an unaligned source,
 and checks framing before accessing the region table or payload: the HBG format
 version and reserved fields, common invocation mode/counts, exact lengths,
 overflow, alignment, disjoint destination
-ranges, canonical region order and image lengths bounded by capacity. A checksum
-covers the
+ranges, canonical region order and image lengths bounded by capacity.
+`validate_graph_packet` adds a checksum covering the
 common header, HBG binding/identity, descriptors, padding and payload, excluding
-only the checksum and the single patched address. It detects accidental
-corruption; it cannot replace H3's independent device registry trust check or
+only the checksum and the single patched address. Host construction and submission
+retain this full integrity check. AICPU replay validates framing without rehashing
+the immutable CANN-owned copy on each execution. Consequently replay does not
+promise detection of arbitrary payload bit flips; it relies on Host validation
+and CANN copy/lifetime guarantees. Neither framing nor a checksum replaces
+H3's independent device registry trust check or
 the leader image validation and restore described in
 [execution-slot registration and restoration](host-build-graph-kernel-slot.md).
 

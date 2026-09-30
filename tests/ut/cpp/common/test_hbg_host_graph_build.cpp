@@ -2683,19 +2683,31 @@ TEST_F(HbgGraphRestoreTest, RepeatedRestoreRebuildsQueuesPointersAndEveryCapacit
     }
 }
 
-TEST_F(HbgGraphRestoreTest, SourceCorruptionOnFirstMiddleAndLastLineCannotWriteDestinations) {
+TEST_F(HbgGraphRestoreTest, FullValidatorDetectsSourceCorruptionOnFirstMiddleAndLastLine) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     const auto source = packet.storage;
-    const auto before = working_bytes();
     const size_t begin = packet.data_offset;
     for (size_t offset : {begin, begin + (packet.bytes - begin) / 2, packet.bytes - 1}) {
         packet.storage = source;
         reinterpret_cast<std::byte *>(packet.storage.data())[offset] ^= std::byte{0x80};
-        restored.generation = 999;
-        EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Rejected);
-        EXPECT_EQ(restored.generation, 999u);
-        EXPECT_EQ(working_bytes(), before);
+        EXPECT_EQ(
+            hbg::validate_graph_packet(packet.storage.data(), packet.bytes, hbg::GraphPacketAddress::DeviceCopy),
+            hbg::GraphPacketStatus::InvalidChecksum
+        );
     }
+}
+
+TEST_F(HbgGraphRestoreTest, ReplayUsesFramingAndImageValidationWithoutRehashingPayload) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    auto &header = packet_header();
+    header.checksum ^= 1;
+    EXPECT_EQ(
+        hbg::validate_graph_packet(packet.storage.data(), packet.bytes, hbg::GraphPacketAddress::DeviceCopy),
+        hbg::GraphPacketStatus::InvalidChecksum
+    );
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    EXPECT_EQ(restored.runtime->sm_handle->header->tasks.total_tasks, header.total_tasks);
+    ASSERT_NO_FATAL_FAILURE(retire());
 }
 
 TEST_F(HbgGraphRestoreTest, ForgedRuntimeLayoutAndRelativePoolsRejectBeforeCopy) {
@@ -2980,7 +2992,7 @@ TEST_F(HbgGraphRestoreTest, RejectionAfterRetirementCannotExposePreviousSuccess)
     ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
     ASSERT_NO_FATAL_FAILURE(retire());
     const auto before = working_bytes();
-    reinterpret_cast<std::byte *>(packet.storage.data())[packet.bytes - 1] ^= std::byte{0x80};
+    packet_header().reserved = 1;
     EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Rejected);
     EXPECT_EQ(working_bytes(), before);
     hbg::GraphRestoreResult peer;
