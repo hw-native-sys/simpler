@@ -107,9 +107,9 @@ inline uint64_t graph_packet_checksum(const void *packet, size_t size) noexcept 
 
 // Allocation-free framing validation. No device destination is read or written.
 // Registry identity checks and semantic validation of restored images precede
-// execution separately; a checksum-valid packet alone never authorizes restore.
+// execution separately. This does not scan the payload for accidental corruption.
 inline GraphPacketStatus
-validate_graph_packet(const void *packet, size_t size, GraphPacketAddress address_mode) noexcept {
+validate_graph_packet_framing(const void *packet, size_t size, GraphPacketAddress address_mode) noexcept {
     constexpr size_t prefix = sizeof(SimplerKernelInvocationHeader);
     if (packet == nullptr || size < prefix + sizeof(GraphPacketHeader) || size > UINT32_MAX)
         return GraphPacketStatus::InvalidEnvelope;
@@ -180,6 +180,17 @@ validate_graph_packet(const void *packet, size_t size, GraphPacketAddress addres
         previous_kind = kind;
     }
     if (cursor != header.payload_bytes) return GraphPacketStatus::InvalidRegion;
+    return GraphPacketStatus::Ok;
+}
+
+// Full integrity validation belongs to Host template construction/submission.
+// The CANN-owned immutable replay copy uses framing and image validation only.
+inline GraphPacketStatus
+validate_graph_packet(const void *packet, size_t size, GraphPacketAddress address_mode) noexcept {
+    const auto status = validate_graph_packet_framing(packet, size, address_mode);
+    if (status != GraphPacketStatus::Ok) return status;
+    GraphPacketHeader header{};
+    std::memcpy(&header, static_cast<const uint8_t *>(packet) + sizeof(SimplerKernelInvocationHeader), sizeof(header));
     if (header.checksum != graph_packet_checksum(packet, size)) return GraphPacketStatus::InvalidChecksum;
     return GraphPacketStatus::Ok;
 }

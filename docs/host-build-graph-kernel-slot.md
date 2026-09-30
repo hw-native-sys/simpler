@@ -143,8 +143,8 @@ trusted_callable, out)`:
    any working or registry region.
 3. Invalidates the complete bounded task-owned source before the first packet
    read, then validates the common invocation header against the trusted callable view, then
-   runs the full HBG framing, placeholder-address, region and checksum validation
-   in DeviceCopy mode.
+   runs HBG framing, placeholder-address and region validation in DeviceCopy mode
+   without rescanning the payload checksum already checked by the Host.
 4. Compares packet device, slot generation, runtime binary identity and every
    destination base/capacity pair with the sealed record.
 5. Publishes a read-only `GraphRestoreView` containing the trusted slot, validated
@@ -154,6 +154,9 @@ Failure leaves the output, registry, working memory and generation unchanged.
 An optional synchronous source-visibility operation supports backend testing;
 its failure also rejects admission. Size and overlap checks precede that operation.
 A packet with a recomputed checksum still cannot authorize a changed binding.
+The replay gate assumes an immutable CANN-owned copy of a Host-validated
+template. It does not detect arbitrary payload corruption by checksum; semantic
+image validation and registry/bounds checks still precede destination writes.
 Admission neither copies images nor releases AICore/scheduler work.
 `restore_graph_packet` performs the subsequent image validation and restoration;
 launch integration handles cancellation on failure.
@@ -255,8 +258,9 @@ lease excludes retirement until all readers and AICore work have completed;
 the restore state machine independently refuses reuse before that retirement.
 
 Unit coverage includes repeated live-image restoration, internal intermediate
-tensors, unused-capacity preservation, corrupted first/middle/
-last source cache lines, forged runtime/relative-pool fields, every memory-operation
+tensors, unused-capacity preservation, full-validator detection of corrupted
+first/middle/last source cache lines, replay without a repeated checksum scan,
+forged runtime/relative-pool fields, every memory-operation
 failure (including the pre-publication flush), explicit controlled retry, stale
 retirement/publication rejection, terminal poisoning, peer readers and an empty
 image following a Graph image. These tests exercise the real restore implementation
