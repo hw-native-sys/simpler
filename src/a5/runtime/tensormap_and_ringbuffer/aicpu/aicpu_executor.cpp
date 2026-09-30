@@ -1026,8 +1026,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     }
 
     // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
-    // platform_deinit_aicore_regs is idempotent; orchestrator threads have
-    // core_trackers_[thread_idx].core_num() == 0 so they skip the loop harmlessly.
+    // The retirement claim makes repeated requests harmless; orchestrator
+    // threads own no group. Initializers service requests that precede READY.
     int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
     // Both outcomes reach the terminal record before this thread's arrival, and
     // with the state that produced each: folding shutdown_rc into run_rc first

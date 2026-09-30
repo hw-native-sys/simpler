@@ -403,8 +403,7 @@ int32_t LegacyAicpuExecutor::run(Runtime *runtime) {
     }
 
     // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
-    // platform_deinit_aicore_regs is idempotent.
-    int32_t shutdown_rc = sched_ctx_.shutdown(thread_idx);
+    int32_t shutdown_rc = sched_ctx_.shutdown(runtime, thread_idx);
     // Both outcomes reach the terminal record before this thread's arrival, and
     // with the state that produced each: folding shutdown_rc into run_rc first
     // would publish a teardown failure as an execution one.
@@ -471,8 +470,7 @@ void LegacyAicpuExecutor::deinit(Runtime *runtime) {
     //    The length is the device descriptor, not sizeof(Runtime): the host-only
     //    tail past it is never on the device at all. It deliberately spans more
     //    than the uploaded prefix, keeping maintenance over the whole allocated
-    //    descriptor — including the gate array, which A5 declares but no A5 code
-    //    reads or writes.
+    //    descriptor — including the device-owned gate array.
     cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     // Reset all SchedulerContext-owned state in one place.

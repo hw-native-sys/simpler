@@ -17,9 +17,9 @@
 
 constexpr uint32_t AICORE_POST_CLOSE_RELEASE = 1;
 
-// A2/A3: AICPU resets this word before window-open and publishes it only after
+// AICPU resets this word before window-open and publishes it only after
 // window-close. AICore bypass-loads it after EXITED; no cached stores or dcci
-// may touch this line while the protocol is active. A5 leaves it unused.
+// may touch this line while the protocol is active.
 struct alignas(64) AicoreTeardownControl {
     uint32_t post_close_release;
 };
