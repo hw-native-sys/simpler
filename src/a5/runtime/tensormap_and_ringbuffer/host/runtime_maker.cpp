@@ -111,6 +111,30 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
 
 extern "C" int concurrent_native_prepare_supported_impl(void) { return 1; }
 
+/**
+ * One run's native submission may be ordered behind another's on this platform.
+ *
+ * The three pooled regions above are one instance each, so a successor's AICPU
+ * op must not begin before its predecessor's has returned: that op resets the
+ * arena, orchestrates and dispatches until every task completes, retires the
+ * cores, and destroys the runtime context, all across its own span.
+ *
+ * a5 submits every run on two persistent bootstrap streams, and a run's own
+ * AICore boundary is queued on the AICPU stream ahead of its whole-operator
+ * boundary record. A successor's AICPU payload therefore enters that stream's
+ * FIFO behind the predecessor's record, which is itself behind a wait on the
+ * predecessor's AICore kernel end — so the serial reuse the single instance
+ * needs is the order the platform already constructs. Only the host-side
+ * submission overlaps; the device still runs one whole operator at a time.
+ *
+ * The bind cannot rewrite those regions beside a live run either:
+ * `prepared_run_config_compatible_impl` below answers yes only on a
+ * prebuilt-arena-cache hit, where the bind writes no device byte, and the only
+ * code that builds or uploads the arena image runs on a miss, which the
+ * platform refuses while a predecessor holds the bank.
+ */
+extern "C" int joined_native_launch_supported_impl(void) { return 1; }
+
 // Helper: return current time in milliseconds
 static int64_t _now_ms() {
     struct timeval tv;
@@ -216,36 +240,15 @@ static bool resolve_ring_config(
     return true;
 }
 
-static int32_t read_runtime_status(const Runtime *runtime, const HostApi *api, SharedMemoryHeader *host_header) {
-    if (runtime == nullptr || host_header == nullptr) {
-        return 0;
-    }
-
-    void *device_sm = runtime->get_gm_sm_ptr();
-    if (device_sm == nullptr) {
-        return 0;
-    }
-
-    int hdr_rc = api->copy_from_device(host_header, device_sm, sizeof(SharedMemoryHeader));
-    if (hdr_rc != 0) {
-        LOG_WARN("Failed to copy the shared-memory header from device");
-        return 0;
-    }
-
-    int32_t orch_error_code = host_header->orch_error_code.load(std::memory_order_relaxed);
-    int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
-    return runtime_status_from_error_codes(orch_error_code, sched_error_code);
-}
-
 /**
  * This run's own error tail, published by its device side into storage the run
  * owns, or 0 when the run published none.
  *
- * Preferred over the shared header because it cannot have been overwritten: the
- * device copied it before its kernel returned, hence before the fence that
- * releases a successor to reset the header. `host_header` receives the tail at
- * its own offset, leaving the rest zeroed, so every field the log lines below
- * read resolves the same way as on the header path.
+ * The only channel a reported status may come from. It cannot have been
+ * overwritten: the device copied it before its kernel returned, hence before
+ * the fence that releases a successor to reset the shared header. `host_header`
+ * receives the tail at its own offset, leaving the rest zeroed, so every field
+ * the log lines below read resolves as it always did.
  */
 static int32_t read_published_run_status(const HostApi *api, SharedMemoryHeader *host_header) {
     if (api == nullptr || host_header == nullptr) return 0;
@@ -1011,25 +1014,26 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     SharedMemoryHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
 
-    // Both status channels are device state, readable only for a run that
-    // reached a stream. A run that failed before launch has published nothing
-    // and its shared memory belongs to whoever ran there last.
+    // This run's own published record, and only that. It is device state, so it
+    // is readable only for a run that reached a stream: a run that failed before
+    // launch published nothing and its shared memory belongs to whoever ran
+    // there last.
+    //
+    // The shared memory header is not read. It is one instance across runs, so a
+    // launched successor resets and refills it as soon as this run's boundary
+    // releases it — and that boundary is the same fence that lets this host call
+    // proceed, so there is no window here in which the header is still this
+    // run's. Every platform serving this runtime hands each pipeline slot its
+    // own result region instead, and the device side publishes into it before
+    // its kernel returns, hence before that fence. A run that published none
+    // keeps the execution error its caller already holds.
     if (execution_rc != 0 && launched != 0) {
         runtime_status = read_published_run_status(api, &host_header);
         if (runtime_status == 0) {
-            // No snapshot from this run, so fall back to the shared header. That
-            // read is only sound under the current single-launched contract:
-            // this run still holds its execution claim, no successor has been
-            // launched, and nothing has reset or rebuilt the shared memory since
-            // this run wrote it. Once P4 admits a launched successor the branch
-            // has to be reworked — an unproven read could then report the
-            // successor's header as this run's error. A run that published
-            // nothing keeps its execution error either way; only the diagnostic
-            // detail is missing.
-            runtime_status = read_runtime_status(runtime, api, &host_header);
-            if (runtime_status != 0) {
-                LOG_WARN("no error snapshot from this run; the failure detail below is read from the shared header");
-            }
+            LOG_WARN(
+                "this run published no terminal record; its execution status stands and the device-side detail is "
+                "in the device log"
+            );
         }
     }
     if (runtime_status != 0) {

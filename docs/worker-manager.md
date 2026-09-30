@@ -207,14 +207,20 @@ whose published pipeline depth is at least two takes two frames — that endpoin
 stages a successor behind an active run at any launch depth. Every other route
 takes a second frame only where the child resolved that it may order one native
 submission behind another, which is its runtime's published joined-launch
-capability met with the requested launch depth and the granted set count: A5
-`host_build_graph` at `launch_depth >= 2` is the one such route today. SUB,
-nested-Worker, simulation (whose backend answers that capability with a flat
-no), A5 `tensormap_and_ringbuffer`, and every depth-one local endpoint use one
-task frame and do not advertise successor staging. A launched successor occupies
-a frame of its own, so a Worker's configured launch depth is bounded by the
-frames its endpoints negotiated as well as by the granted slot depth. Remote
+capability met with the requested launch depth and the granted set count: both
+A5 runtimes, `host_build_graph` and `tensormap_and_ringbuffer`, publish that
+capability at `launch_depth >= 2`. SUB, nested-Worker, simulation (whose backend
+answers that capability with a flat no), and every depth-one local endpoint use
+one task frame and do not advertise successor staging. A launched successor
+occupies a frame of its own, so a Worker's configured launch depth is bounded by
+the frames its endpoints negotiated as well as by the granted slot depth. Remote
 endpoints have capacity one and advance their framed transport incrementally.
+
+The capability is answered per device context, so a level-3 Worker configured at
+`launch_depth >= 2` passes that request to every one of its local device
+children and each endpoint negotiates its own count. A nested Worker inherits
+nothing: its budgets come from its own configuration. Remote and mpirun
+manifests carry no launch depth, so those subtrees keep the default.
 
 ### 3.1 Single-frame progress path
 

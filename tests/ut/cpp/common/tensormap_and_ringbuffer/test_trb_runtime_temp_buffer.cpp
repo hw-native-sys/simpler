@@ -85,6 +85,11 @@ struct FakeHostApi {
     std::vector<uint8_t> compatibility_key;
     uint64_t observed_hash = 0;
     std::vector<uint8_t> observed_key;
+    // The run-owned terminal snapshot this run published, or empty for a run
+    // that published none. Host storage: the platform's real region is device
+    // memory the device wrote before its kernel returned, and the host reads it
+    // through a cached copy, so no D2H happens on this path.
+    std::vector<uint8_t> run_result;
 
     ~FakeHostApi() { release_all(); }
 
@@ -213,6 +218,19 @@ void fake_mark_prebuilt_runtime_arena_cached(
 ) {}
 uint64_t fake_upload_chip_callable_buffer(void * /*runner_ctx*/, const void * /* callable */) { return 0; }
 
+// The run-owned snapshot, as the platform serves it: a host-readable copy of
+// what the device published into this slot before its kernel returned. A run
+// that published none reads as absent, which is what an empty buffer models.
+const void *
+fake_get_run_result(void * /*runner_ctx*/, uint32_t /*pipeline_slot*/, uint64_t /*run_epoch*/, size_t *bytes_out) {
+    if (g_fake->run_result.empty()) {
+        if (bytes_out != nullptr) *bytes_out = 0;
+        return nullptr;
+    }
+    if (bytes_out != nullptr) *bytes_out = g_fake->run_result.size();
+    return g_fake->run_result.data();
+}
+
 // The grow the platform now owns, as the sequence the bump used to run itself.
 int fake_acquire_retained_temp(
     void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out
@@ -251,8 +269,28 @@ HostApi make_host_api() {
         .lookup_prebuilt_runtime_arena_cache = fake_lookup_prebuilt_runtime_arena_cache,
         .mark_prebuilt_runtime_arena_cached = fake_mark_prebuilt_runtime_arena_cached,
         .upload_chip_callable_buffer = fake_upload_chip_callable_buffer,
+        .get_run_result = fake_get_run_result,
     };
     return HostApi(nullptr, 0, 0, 0, &ops);
+}
+
+// Whether the runtime under test reads *only* the run-owned record on the
+// failure path. a5 declares joined-launch support, so a successor may already
+// have reset the shared memory header by the time this host call runs and the
+// header is therefore never read; a2a3 launches one run at a time, still owns
+// the header for the whole call, and still falls back to it. Both contracts are
+// asserted exactly below — neither arch's behaviour is relaxed to accommodate
+// the other. `SIMPLER_PLATFORM_NAME` is the per-arch define every runtime case
+// already carries.
+constexpr bool kReadsOnlyTheRunOwnedRecord = SIMPLER_PLATFORM_NAME[1] == '5';
+
+// One run's terminal error tail, in the layout `get_run_result` serves: the
+// bytes of a `SharedMemoryHeader` from its first error field to its end.
+std::vector<uint8_t> published_error_tail(int32_t orch_error_code) {
+    SharedMemoryHeader header{};
+    header.orch_error_code.store(orch_error_code, std::memory_order_relaxed);
+    const auto *bytes = reinterpret_cast<const uint8_t *>(&header) + SHARED_MEMORY_ERROR_TAIL_OFFSET;
+    return std::vector<uint8_t>(bytes, bytes + SHARED_MEMORY_ERROR_TAIL_BYTES);
 }
 
 ChipTensor make_tensor(std::vector<uint8_t> &storage, bool child_memory = false) {
@@ -337,7 +375,7 @@ TEST_F(TrbRuntimeTempBufferTest, SuccessfulValidateCopiesOnlyOutputTensor) {
     }));
 }
 
-TEST_F(TrbRuntimeTempBufferTest, FailedExecutionCopiesRuntimeStatus) {
+TEST_F(TrbRuntimeTempBufferTest, FailedExecutionReadsThisRunsPublishedSnapshot) {
     fake_.reset();
     Runtime runtime = make_runtime();
     std::vector<uint8_t> output(64, 0);
@@ -346,15 +384,22 @@ TEST_F(TrbRuntimeTempBufferTest, FailedExecutionCopiesRuntimeStatus) {
     ArgDirection signature[1] = {ArgDirection::OUT};
 
     ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
+    // The run-owned channel, the only one a status may come from: the device
+    // folds this run's error tail into the region its own slot holds and
+    // publishes before its kernel returns, so the host reads it without a
+    // device transfer and without naming anything a later run could have reset.
+    fake_.run_result = published_error_tail(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
+    // A different code in the shared header, so reading the wrong channel is a
+    // wrong *value* here rather than an indistinguishable pass.
     auto *header = static_cast<SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
     ASSERT_NE(header, nullptr);
-    header->orch_error_code.store(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
+    header->orch_error_code.store(SIMPLER_ERROR_SCOPE_DEADLOCK, std::memory_order_relaxed);
 
     EXPECT_EQ(finish_run(runtime, -1), -SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
-    EXPECT_EQ(fake_.copy_from_count, 1);
+    EXPECT_EQ(fake_.copy_from_count, 0);
 }
 
-TEST_F(TrbRuntimeTempBufferTest, FailedExecutionWithoutDeviceStatusSkipsTensorCopyBack) {
+TEST_F(TrbRuntimeTempBufferTest, FailedExecutionWithoutASnapshotKeepsItsExecutionError) {
     fake_.reset();
     Runtime runtime = make_runtime();
     std::vector<uint8_t> output(64, 0);
@@ -365,14 +410,57 @@ TEST_F(TrbRuntimeTempBufferTest, FailedExecutionWithoutDeviceStatusSkipsTensorCo
     ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
     ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
     std::memset(runtime.tensor_leases_[0].dev_ptr, 0x2a, output.size());
+    // Published by whichever run occupies the arena next, which is exactly what
+    // this run must not report as its own.
+    auto *header = static_cast<SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
+    ASSERT_NE(header, nullptr);
+    header->orch_error_code.store(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
 
-    // A stream/bind failure may happen before the device publishes a
-    // status. The one D2H is the diagnostic header; tensor data stays untouched.
-    EXPECT_EQ(finish_run(runtime, -1), 0);
-    EXPECT_EQ(fake_.copy_from_count, 1);
+    // The header's code is not read at all on the runtime that admits a
+    // launched successor: the header is one instance across runs, so the
+    // successor resets and refills it as soon as this run's boundary releases
+    // it, and that boundary is the same fence that lets this call proceed. The
+    // run keeps the execution error its caller already holds.
+    if (kReadsOnlyTheRunOwnedRecord) {
+        EXPECT_EQ(finish_run(runtime, -1), 0);
+        EXPECT_EQ(fake_.copy_from_count, 0);
+    } else {
+        EXPECT_EQ(finish_run(runtime, -1), -SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
+        EXPECT_EQ(fake_.copy_from_count, 1);
+    }
+    // The failure skips the tensor copy-back either way, so the caller's buffer
+    // keeps its own content rather than whatever the device slice held.
     EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](uint8_t value) {
         return value == 0;
     }));
+}
+
+TEST_F(TrbRuntimeTempBufferTest, FailedExecutionTreatsAShortTerminalRecordAsNone) {
+    fake_.reset();
+    Runtime runtime = make_runtime();
+    std::vector<uint8_t> output(64, 0);
+    ChipStorageTaskArgs args;
+    args.add_tensor(make_tensor(output));
+    ArgDirection signature[1] = {ArgDirection::OUT};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, signature, 1), 0);
+    // A record whose length is not this runtime's error tail describes nothing
+    // this runtime can read, so it reads as absent rather than being decoded at
+    // whatever offsets happen to fit. Absent and unreadable are deliberately the
+    // same outcome: neither yields a status of its own.
+    fake_.run_result = published_error_tail(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
+    fake_.run_result.pop_back();
+    auto *header = static_cast<SharedMemoryHeader *>(runtime.get_gm_sm_ptr());
+    ASSERT_NE(header, nullptr);
+    header->orch_error_code.store(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
+
+    if (kReadsOnlyTheRunOwnedRecord) {
+        EXPECT_EQ(finish_run(runtime, -1), 0);
+        EXPECT_EQ(fake_.copy_from_count, 0);
+    } else {
+        EXPECT_EQ(finish_run(runtime, -1), -SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
+        EXPECT_EQ(fake_.copy_from_count, 1);
+    }
 }
 
 // The retained buffer is malloc'd once for the run and sliced, not per tensor.

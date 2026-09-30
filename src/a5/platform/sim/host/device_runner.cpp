@@ -568,11 +568,16 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 }
                 reset_device_phase_buffer(&run->phase_buf, over_launch);
                 set_platform_phase_base_func_(reinterpret_cast<uint64_t>(&run->phase_buf));
-                // Sim allocates no result region, so there is no base to publish —
-                // but the epoch still has to reach the AICPU SO, because the
-                // collectors stamp it onto every buffer they acquire. Without
-                // it sim records carry no run identity at all.
-                set_platform_run_result_func_(/*region_base=*/0, prepared->identity.run_epoch);
+                // This slot's run-result region and this run's epoch. The two
+                // travel together: the epoch is what the collectors stamp onto
+                // every buffer they acquire, and it is also what decides whose
+                // record a reader of the region gets. The simulated device side
+                // writes the region directly, so a run's own status and
+                // diagnostic scene are readable without naming shared state a
+                // later run resets.
+                set_platform_run_result_func_(
+                    run_result_region_base(prepared->pipeline_slot), prepared->identity.run_epoch
+                );
                 sim_t0 = std::chrono::steady_clock::now();
                 run_completion_.reset(static_cast<size_t>(over_launch) + static_cast<size_t>(num_aicore));
             } catch (...) {

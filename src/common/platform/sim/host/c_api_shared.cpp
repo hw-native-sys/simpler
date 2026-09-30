@@ -297,6 +297,20 @@ static uint64_t upload_chip_callable_buffer_wrapper(void *runner_ctx, const void
     }
 }
 
+static const void *
+get_run_result_wrapper(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) {
+    if (runner_ctx == nullptr) {
+        if (bytes_out != nullptr) *bytes_out = 0;
+        return nullptr;
+    }
+    try {
+        return static_cast<SimDeviceRunnerBase *>(runner_ctx)->device_run_result(pipeline_slot, run_epoch, bytes_out);
+    } catch (...) {
+        if (bytes_out != nullptr) *bytes_out = 0;
+        return nullptr;
+    }
+}
+
 static uint32_t get_chip_swimlane_level(void *runner_ctx) {
     if (runner_ctx == nullptr) return 0;
     return static_cast<SimDeviceRunnerBase *>(runner_ctx)->chip_swimlane_level();
@@ -475,9 +489,11 @@ static const HostApiOps g_host_api_ops = {
     .host_phase_pool_finish = host_phase_pool_finish,
     .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
     // The simulated AICPU runs in this process and shares the runtime's
-    // address space, so a run's result never has to leave a device: nothing
-    // allocates a result region and nothing publishes into one.
-    .get_run_result = nullptr,
+    // address space, so the region is host memory its device side writes
+    // directly rather than an allocation a transfer has to cross. The channel
+    // is still the run-owned one: a run publishes its own record before its
+    // kernel returns, and the epoch decides whose record a reader gets.
+    .get_run_result = get_run_result_wrapper,
     .declare_caller_device_writes = declare_caller_device_writes,
     .caller_device_span_written_by_other_run = caller_device_span_written_by_other_run,
 };

@@ -483,6 +483,21 @@ int SimDeviceRunnerBase::device_memset(void *dev_ptr, int value, size_t bytes) {
     return 0;
 }
 
+uint64_t SimDeviceRunnerBase::run_result_region_base(uint32_t pipeline_slot) {
+    if (pipeline_slot >= device_run_results_.size()) return 0;
+    return reinterpret_cast<uint64_t>(&device_run_results_[pipeline_slot]);
+}
+
+const uint8_t *
+SimDeviceRunnerBase::device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const {
+    if (bytes_out != nullptr) *bytes_out = 0;
+    if (pipeline_slot >= device_run_results_.size()) return nullptr;
+    const DeviceRunResultRegion &region = device_run_results_[pipeline_slot];
+    if (!device_run_result_published(region, run_epoch)) return nullptr;
+    if (bytes_out != nullptr) *bytes_out = region.payload_bytes;
+    return region.payload;
+}
+
 void SimDeviceRunnerBase::get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size) {
     if (pipeline_slot >= retained_temp_addrs_.size()) {
         if (addr != nullptr) *addr = nullptr;

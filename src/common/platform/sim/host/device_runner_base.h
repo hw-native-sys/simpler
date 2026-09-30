@@ -51,6 +51,7 @@
 #include "utils/retained_scheduler_storage.h"
 #include "common/kernel_args.h"
 #include "common/device_phase.h"
+#include "common/device_run_result.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/dma_workspace.h"
 #include "common/platform_config.h"
@@ -288,6 +289,28 @@ public:
     size_t caller_buffer_retained_count() const { return caller_device_buffers_.retained_count(); }
 
     int device_memset(void *dev_ptr, int value, size_t bytes);
+
+    /**
+     * This slot's run-result region, as the address a run's device side
+     * publishes into.
+     *
+     * Handed to the AICPU SO with the run's epoch: the two are only meaningful
+     * together, since the host decides what belongs to a run by comparing
+     * epochs. Zero for a slot outside the array, which the caller publishes as
+     * "no region" exactly as it did before one existed.
+     */
+    uint64_t run_result_region_base(uint32_t pipeline_slot);
+
+    /**
+     * That run's published diagnostic payload, or null when it published none.
+     *
+     * Null covers every undecided case the channel defines — never published,
+     * published under another run's epoch, or self-inconsistent — and they are
+     * deliberately not distinguished here: a caller that receives no payload
+     * has no diagnostic scene to read either way.
+     */
+    const uint8_t *device_run_result(uint32_t pipeline_slot, uint64_t run_epoch, size_t *bytes_out) const;
+
     void get_retained_temp_buffer(uint32_t pipeline_slot, void **addr, size_t *size);
     void set_retained_temp_buffer(uint32_t pipeline_slot, void *addr, size_t size);
     int acquire_graph_definition_block(
@@ -800,6 +823,22 @@ protected:
     // onboard base's, which is what lets the shared host-phase code index by
     // slot without a per-platform branch.
     std::array<HostPhaseRunState, PTO_PIPELINE_MAX_DEPTH> host_phase_runs_{};
+    /**
+     * One run's device-side terminal result, per pipeline slot.
+     *
+     * The same obligation the onboard base carries (see
+     * common/device_run_result.h): a runtime folds what the host needs into
+     * this region and publishes it before its kernel returns, so a run's own
+     * status is readable without naming shared state a later run resets. Here
+     * the simulated device writes host memory directly, so the region is the
+     * storage itself rather than a cached copy of a device allocation, and no
+     * transfer stands between the publisher and the reader.
+     *
+     * Value-initialized once and never cleared per run: `published` carries the
+     * publishing run's epoch, so a slot still holding an earlier run's record
+     * fails the epoch comparison rather than being mistaken for this run's.
+     */
+    std::array<DeviceRunResultRegion, PTO_PIPELINE_MAX_DEPTH> device_run_results_{};
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;

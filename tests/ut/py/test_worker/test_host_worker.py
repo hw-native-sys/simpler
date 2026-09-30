@@ -294,6 +294,78 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
     assert published_frame_counts == [2]
 
 
+@pytest.mark.parametrize(
+    ("launch_depth", "configured", "expected_frames"),
+    [
+        # The native entry is reached only above depth one, so the default route configures
+        # nothing on the ChipWorker and publishes the single-frame serial contract.
+        (1, [], 1),
+        # At depth two the child configures its own ChipWorker before init — the only place the
+        # request and the runtime's resolved capability meet — and publishes the second frame.
+        (2, [2], 2),
+    ],
+)
+def test_chip_child_configures_its_launch_depth_through_the_native_entry(
+    monkeypatch, launch_depth, configured, expected_frames
+):
+    """a5 TMR's frame count follows the capability the child resolved, through the native entry.
+
+    ``ChipWorker.configure_launch_depth`` is the only configuration route below the public
+    Worker — it is bound for direct callers as well — so this covers both: the public route's
+    child arrives here, and a caller driving a ``ChipWorker`` itself reaches the same entry with
+    the same effect on the negotiated frame count.
+    """
+    configured_depths: list[int] = []
+    published_frame_counts: list[int] = []
+
+    class FakeChipWorker:
+        pipeline_depth = 2
+        supports_joined_native_launch = launch_depth > 1
+
+        def configure_launch_depth(self, depth: int) -> None:
+            configured_depths.append(int(depth))
+
+        def init(self, device_id, bins, **_kwargs):
+            del device_id, bins
+
+        def finalize(self) -> None:
+            pass
+
+    def fake_run_chip_main_loop(cw, *_args, task_frame_count=1, **_kwargs):
+        del cw
+        depth, frames, _spare = worker_mod._PIPELINE_LEASE_FMT.unpack_from(_args[0], worker_mod._OFF_PIPELINE_LEASE)
+        del depth
+        published_frame_counts.append(task_frame_count)
+        assert frames == task_frame_count
+
+    monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
+    monkeypatch.setattr(worker_mod, "_run_chip_main_loop", fake_run_chip_main_loop)
+
+    shm = SharedMemory(create=True, size=MAILBOX_SIZE)
+    try:
+        assert shm.buf is not None
+        worker_mod._chip_process_loop(
+            shm.buf,
+            "bins",
+            0,
+            {},
+            {},
+            {},
+            worker_mod.mint_owner_instance_id(),
+            worker_mod.mint_owner_instance_id(),
+            worker_mod.mint_owner_instance_id(),
+            platform="a5",
+            runtime="tensormap_and_ringbuffer",
+            launch_depth=launch_depth,
+        )
+    finally:
+        shm.close()
+        shm.unlink()
+
+    assert configured_depths == configured
+    assert published_frame_counts == [expected_frames]
+
+
 def _dummy_l2_domain(domain_id: int):
     return worker_mod._L2GlobalDomain(
         domain_id=domain_id,
@@ -603,19 +675,47 @@ def test_teardown_chip_process_resources_ignores_released_and_keeps_each_step_on
         ("a2a3", "host_build_graph", 1, False, 1),
         ("a2a3", "tensormap_and_ringbuffer", 2, False, 2),
         # Every other route negotiates a successor frame only where the child resolved that it
-        # can order one native submission behind another. Depth alone does not: a5's two
-        # runtimes both grant two resource sets, and only one of them joins launches.
+        # can order one native submission behind another. Depth alone does not, and the runtime
+        # name does not either: both a5 runtimes grant two resource sets and both now join, so
+        # the same runtime appears here under each answer.
         ("a5", "host_build_graph", 2, True, 2),
         ("a5", "host_build_graph", 2, False, 1),
+        ("a5", "tensormap_and_ringbuffer", 2, True, 2),
         ("a5", "tensormap_and_ringbuffer", 2, False, 1),
         ("a5sim", "tensormap_and_ringbuffer", 2, False, 1),
         ("a2a3sim", "host_build_graph", 2, False, 1),
         # A joining route still cannot use a frame the granted sets do not back.
         ("a5", "host_build_graph", 1, True, 1),
+        ("a5", "tensormap_and_ringbuffer", 1, True, 1),
     ],
 )
 def test_local_task_frame_count_follows_a2a3_depth_or_a_resolved_join(platform, runtime, depth, joins, expected):
     assert worker_mod._local_task_frame_count(platform, runtime, depth, joins) == expected
+
+
+@pytest.mark.parametrize("level", [1, 2])
+def test_launch_depth_is_refused_below_the_admission_fifo(level):
+    """The runs being ordered are a chip child's, and a Worker below the FIFO owns neither.
+
+    The public L2 Worker therefore cannot reach the capability through configuration at all: the
+    key is refused with an error rather than accepted and ignored, which is what keeps the native
+    ``ChipWorker.configure_launch_depth`` entry the only other way in.
+    """
+    with pytest.raises(ValueError, match="requires a level >= 3 Worker"):
+        worker_mod._validated_launch_depth({"launch_depth": 2}, level)
+
+
+def test_launch_depth_comes_from_each_workers_own_config():
+    """Nothing is inherited: a nested Worker's depth is read from its own config or defaults to one.
+
+    ``_init_level3`` passes the *forking* Worker's resolved depth to that Worker's own chip
+    children, and a next-level child is a separate ``Worker`` whose budgets come from its own
+    config — so an inner Worker left unconfigured keeps the serial path even under a parent that
+    asked for two.
+    """
+    assert worker_mod._validated_launch_depth({"launch_depth": 2}, 3) == 2
+    assert worker_mod._validated_launch_depth({}, 3) == 1
+    assert worker_mod._validated_launch_depth({"pipeline_depth": 2}, 4) == 1
 
 
 @pytest.mark.parametrize(
