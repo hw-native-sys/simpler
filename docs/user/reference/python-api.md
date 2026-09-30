@@ -122,6 +122,15 @@ every level. The L2 leaf resolves those views into the internal
 `ChipStorageTaskArgs` / `ChipTensor` representation; callers do not pass that
 internal representation to `Worker.run()`.
 
+The lower-level `ChipWorker.run(handle, args)` accepts the same `TaskArgs` for
+scalars and contiguous HOST/H2D tensors. DEVICE Buffer arguments use
+`Worker(level=2).submit`, which supplies live-source validation. Keep host backing
+storage alive until the synchronous call returns; after a native-call error,
+keep it alive until `finalize()` succeeds. ChipWorker retains imported mappings
+and refuses further public runs until that teardown. `ChipStorageTaskArgs`
+remains accepted only as a resolved-address compatibility path. See
+[invocation binding](../../buffer-abi.md#direct-l2-invocation-binding).
+
 For L3+ graph construction, `TaskArgs.add_dep(*handles)` adds `WAIT | RETAIN`
 edges: each consumer waits for its producers and keeps their task-owned
 resources alive until it completes. `TaskArgs.add_dep_wait(*handles)` adds

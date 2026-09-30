@@ -16,8 +16,8 @@ the task argument users build — from ``simpler.buffer``. Torch-aware helpers
 this module has no torch dependency.
 
 ``ChipTensor`` is the chip-only POD the runtime ABI expects, paired with
-``ChipStorageTaskArgs`` on the direct ``ChipWorker`` path; it carries a
-materialized address and never crosses a process boundary.
+``ChipStorageTaskArgs`` internally and at the legacy ``ChipWorker`` boundary;
+it carries a materialized address and never crosses a process boundary.
 
 Usage:
     from simpler.task_interface import DataType, TaskArgs, Tensor, TensorArgType
@@ -115,7 +115,8 @@ from _task_interface import (
     scalar_to_uint64 as _native_scalar_to_uint64,
 )
 
-from .buffer import Buffer, Tensor, TensorTransfer
+from .buffer import AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
+from .comm_endpoints import DEVICE_AICPU
 
 
 def _assert_bindings_match_source_tree() -> None:
@@ -1459,6 +1460,8 @@ class ChipWorker:
         self._identity_registry: dict[bytes, Any] = {}
         self._live_handles: dict[int, bytes] = {}
         self._next_handle_id = 0
+        self._run_lock = threading.Lock()
+        self._argument_imports: ImportRegistry | None = None
 
     def init(
         self,
@@ -1622,25 +1625,27 @@ class ChipWorker:
 
         Terminal operation — the object cannot be reused after this.
         """
-        with self._lifecycle_lock:
-            owner = self._init_owner_thread
-            if owner is not None and owner is not threading.current_thread():
-                raise RuntimeError("ChipWorker.finalize() must run on the thread that called ChipWorker.init()")
-            if self._init_in_progress:
-                raise RuntimeError("ChipWorker.finalize() cannot run while ChipWorker.init() is in progress")
-        try:
-            self._impl.finalize()
-        except BaseException:
-            # The registries name what the native side still holds. A teardown
-            # that did not complete leaves those resources alive, so dropping
-            # the registries would hide them from a retry and from the caller.
+        with self._run_lock:
+            with self._lifecycle_lock:
+                owner = self._init_owner_thread
+                if owner is not None and owner is not threading.current_thread():
+                    raise RuntimeError("ChipWorker.finalize() must run on the thread that called ChipWorker.init()")
+                if self._init_in_progress:
+                    raise RuntimeError("ChipWorker.finalize() cannot run while ChipWorker.init() is in progress")
+            try:
+                self._impl.finalize()
+            except BaseException:
+                # The registries name what the native side still holds. A teardown
+                # that did not complete leaves those resources alive, so dropping
+                # the registries would hide them from a retry and from the caller.
+                _flush_host_log_or_warn("ChipWorker.finalize()")
+                raise
+            self._close_argument_imports()
             _flush_host_log_or_warn("ChipWorker.finalize()")
-            raise
-        _flush_host_log_or_warn("ChipWorker.finalize()")
-        with self._registry_lock:
-            self._callable_registry.clear()
-            self._identity_registry.clear()
-            self._live_handles.clear()
+            with self._registry_lock:
+                self._callable_registry.clear()
+                self._identity_registry.clear()
+                self._live_handles.clear()
 
     def _allocate_slot_locked(self) -> int:
         for slot_id in range(MAX_REGISTERED_CALLABLE_IDS):
@@ -1754,7 +1759,7 @@ class ChipWorker:
     def run(
         self,
         handle: CallableHandle,
-        args: ChipStorageTaskArgs,
+        args: TaskArgs | ChipStorageTaskArgs,
         config: CallConfig | None = None,
         **kwargs: Any,
     ):
@@ -1762,7 +1767,10 @@ class ChipWorker:
 
         Args:
             handle: ``CallableHandle`` returned by ``register_callable``.
-            args: ChipStorageTaskArgs for this invocation.
+            args: TaskArgs with scalar values and contiguous HOST/H2D tensors.
+                DEVICE descriptors require Worker(level=2).submit, which validates
+                their live source registration. ChipStorageTaskArgs is accepted
+                for compatibility with callers supplying resolved addresses.
             config: Optional CallConfig. If None, a default is created.
             **kwargs: Overrides applied to config (e.g.
                 ``aicpu_thread_num=2``). A run always takes the whole device;
@@ -1771,9 +1779,51 @@ class ChipWorker:
 
         Returns ``None``. Per-stage run timing is emitted as ``[STRACE]`` log
         markers by the platform — see ``docs/dfx/host-trace.md``.
+
+        Keep tensor backing storage alive through return. TaskArgs imports are
+        released after native success; a native-call error retains them and
+        refuses further public runs until finalize() succeeds. This retains
+        mappings, not ownership of the caller's allocation.
         """
-        state = self._resolve_handle(handle)
-        self._run_slot(state.slot_id, args, config, **kwargs)
+        with self._run_lock:
+            state = self._resolve_handle(handle)
+            if self._argument_imports is not None:
+                raise RuntimeError("ChipWorker.run: retained argument mappings require successful finalize()")
+            config = self._run_config(config, kwargs)
+            if isinstance(args, TaskArgs):
+                args = _ti_module._snapshot_local_task_args(args)
+                for i in range(args.tensor_count()):
+                    if args.tensor(i).buffer.address_space == AddressSpace.DEVICE:
+                        raise ValueError(
+                            f"ChipWorker.run: argument {i} is DEVICE; use Worker(level=2).submit "
+                            "for source registration and lifetime validation"
+                        )
+                    if args.transfer(i) != TensorTransfer.H2D:
+                        raise ValueError(f"ChipWorker.run: argument {i} requires H2D transfer")
+                    tensor = args.tensor(i)
+                    expected = 1
+                    shapes, strides = tensor.shapes, tensor.strides
+                    for dim in range(len(shapes) - 1, -1, -1):
+                        if strides[dim] != expected:
+                            raise ValueError(f"ChipWorker.run: argument {i} requires contiguous H2D storage")
+                        expected *= shapes[dim]
+                registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU))
+                self._argument_imports = registry
+                try:
+                    args = _ti_module.materialize_task_args(args, registry.materialize_args(args))
+                except BaseException:
+                    self._close_argument_imports()
+                    raise
+            # A native exception leaves completion unproven. Imports remain live
+            # until successful device teardown; no finally block may unmap them.
+            self._impl.run(int(state.slot_id), args, config)
+            self._close_argument_imports()
+
+    def _close_argument_imports(self) -> None:
+        registry = self._argument_imports
+        if registry is not None:
+            registry.close()
+            self._argument_imports = None
 
     def unregister_callable(self, handle) -> None:
         """Drop one live callable handle and release its private resources when final."""
@@ -1793,15 +1843,19 @@ class ChipWorker:
     def _register_callable_at_slot(self, callable_id, callable):
         self._impl.register_callable(int(callable_id), callable)
 
-    def _run_slot(self, callable_id, args, config=None, **kwargs):
+    @staticmethod
+    def _run_config(config, overrides):
         if config is None:
             config = CallConfig()
-        for k, v in kwargs.items():
+        for k, v in overrides.items():
             setattr(config, k, v)
         if config.output_prefix:
             _bind_host_log_session_directory()
+        return config
+
+    def _run_slot(self, callable_id, args, config=None, **kwargs):
         # Returns None; per-stage timing is emitted as `[STRACE]` log markers.
-        self._impl.run(int(callable_id), args, config)
+        self._impl.run(int(callable_id), args, self._run_config(config, kwargs))
 
     def _run_slot_with_pipeline_lease(self, callable_id, args, slot_id, generation, config=None, **kwargs):
         if config is None:

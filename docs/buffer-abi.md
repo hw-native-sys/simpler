@@ -447,9 +447,23 @@ and then closes the backing, so a submission accepted between the sample and the
 close can still map an identity that release is about to unlink. Bringing host
 backing release inside the fence is part of the P2 lifecycle work above.
 
-This boundary covers the public Worker TaskArgs path. The low-level ChipWorker
-POD compatibility entry and external borrowed-pointer construction remain separate
-migration work. It introduces no HOST/NONE chip execution or cross-side mapping.
+This registration boundary covers `Worker` TaskArgs submission, including
+[borrowed device sources](#borrowed-device-sources-at-direct-l2).
+`ChipWorker.run(handle, args)` also accepts `TaskArgs`, using the same snapshot,
+import registry and POD conversion for scalar and contiguous HOST/H2D arguments. It rejects
+DEVICE descriptors before any import: device provenance and source retention
+belong to `Worker(level=2).submit`. The resolved `ChipStorageTaskArgs` entry
+remains a compatibility path with caller-managed addresses.
+
+A synchronous ChipWorker call owns its imported host mappings through native
+return, including output copies. A binding failure releases those mappings. A
+native-call exception leaves completion unproven, so the imports remain alive,
+further public `run` calls are refused, and only successful `finalize` releases
+them. Failed teardown preserves them for retry. Public `run` and `finalize` are
+serialized. Descriptors do not retain the caller's allocation: callers must keep
+host storage valid through successful return or successful teardown after an
+error; no Buffer ownership transfers to ChipWorker. This path adds no HOST/NONE
+chip execution or cross-side mapping.
 Explicit task dependencies stay an L3 orchestration concept: a direct L2
 submission is one task, so no `TaskArgs` dependency entry reaches the chip
 through this path.

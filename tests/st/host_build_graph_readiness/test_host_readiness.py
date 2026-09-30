@@ -15,11 +15,12 @@ from pathlib import Path
 
 import pytest
 import torch
-from simpler.buffer import Buffer
+from simpler.buffer import Buffer, create_host_shared_buffer, mint_owner_instance_id
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, DataType, TaskArgs, Tensor, TensorArgType
+from simpler.task_interface import CallConfig, ChipWorker, DataType, TaskArgs, Tensor, TensorArgType
 from simpler.worker import Worker
 
+from simpler_setup.runtime_builder import RuntimeBuilder
 from simpler_setup.scene_test import compile_chip_callable_spec, l3_compile_cache_key
 
 _HERE = Path(__file__).resolve().parent
@@ -118,3 +119,45 @@ def test_completed_producer_supplies_native_host_access(st_platform, st_device_i
             elif device is not None:
                 worker.copy_from(control, device)
             assert control[0].item() == produced + (3 if write_control else 0)
+
+
+@pytest.mark.platforms(["a2a3", "a5", "a2a3sim", "a5sim"])
+@pytest.mark.device_count(1)
+@pytest.mark.runtime(_RUNTIME)
+def test_chipworker_consumes_host_taskargs(st_platform, st_device_ids):
+    with ExitStack() as cleanup:
+        owner = mint_owner_instance_id()
+        buffers = [create_host_shared_buffer((_SIZE + 2) * 4, owner, i + 1) for i in range(3)]
+        for buffer in buffers:
+            cleanup.callback(buffer.close)
+        values = [torch.full((_SIZE + 2,), -999.0) for _ in buffers]
+        for buffer, value, initial in zip(buffers, values, (2.0, -91.0, 0.0), strict=True):
+            value[1:-1] = initial
+            ctypes.memmove(buffer.base, value.data_ptr(), buffer.nbytes)
+        views = [Tensor(buffer, shapes=(_SIZE,), dtype=DataType.FLOAT32, byte_offset=4) for buffer in buffers]
+        worker = ChipWorker()
+        worker.init(int(st_device_ids[0]), RuntimeBuilder(st_platform).get_binaries(_RUNTIME))
+        cleanup.callback(worker.finalize)
+        handle = worker.register_callable(_build_callable(st_platform))
+
+        def arguments(mode, offset=0.0):
+            args = TaskArgs()
+            for view, tag in zip(
+                views, (TensorArgType.INPUT, TensorArgType.INOUT, TensorArgType.OUTPUT_EXISTING), strict=True
+            ):
+                args.add_tensor(view, tag)
+            args.add_scalar(mode)
+            args.add_scalar(struct.unpack("<I", struct.pack("<f", offset))[0])
+            return args
+
+        for offset in (5.0, 11.0, -4.0):
+            worker.run(handle, arguments(0, offset))
+            worker.run(handle, arguments(2))
+            for buffer, value in zip(buffers, values, strict=True):
+                ctypes.memmove(value.data_ptr(), buffer.base, buffer.nbytes)
+                assert value[0].item() == value[-1].item() == -999.0
+            produced = 2.0 + offset
+            expected = torch.full((_SIZE,), 2 * produced + 3)
+            expected[0] = 2 * (produced + 3)
+            torch.testing.assert_close(values[2][1:-1], expected)
+            assert values[1][1].item() == produced + 3
