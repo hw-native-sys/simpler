@@ -917,3 +917,51 @@ TEST_F(TrbRuntimeTempBufferTest, RejectsUnsupportedTransferBeforeReadingEarlierA
         EXPECT_EQ(fake_.device_malloc_count, 0);
     }
 }
+
+TEST_F(TrbRuntimeTempBufferTest, RejectsUnsupportedHostLayoutBeforeReadingEarlierArguments) {
+    Runtime runtime = make_runtime();
+    const uint32_t shape[] = {2, 2};
+    const uint32_t strides[] = {3, 1};
+    // A preflight that reaches the earlier input's bytes faults immediately.
+    const ChipTensor first = make_tensor_external(reinterpret_cast<void *>(1), shape, 2, DataType::UINT8);
+    for (bool offset_view : {false, true}) {
+        SCOPED_TRACE(offset_view ? "offset" : "strided");
+        ChipTensor unsupported = make_tensor_strided(reinterpret_cast<void *>(1), shape, strides, 2, DataType::UINT8);
+        if (offset_view) {
+            unsupported = first;
+            unsupported.start_offset = 1;
+            unsupported.buffer.size = 5;
+        }
+        for (auto direction : {ArgDirection::IN, ArgDirection::OUT, ArgDirection::INOUT}) {
+            SCOPED_TRACE(static_cast<int>(direction));
+            ChipStorageTaskArgs args;
+            args.add_tensor(first);
+            args.add_tensor(unsupported);
+            const ArgDirection sig[] = {ArgDirection::IN, direction};
+            EXPECT_EQ(bind_runtime(runtime, api_, args, sig, 2), PTO_RUNTIME_ERR_UNSUPPORTED);
+            EXPECT_EQ(fake_.copy_to_count, 0);
+            EXPECT_EQ(fake_.device_malloc_count, 0);
+            EXPECT_EQ(fake_.setup_static_arena_count, 0);
+        }
+    }
+}
+
+TEST_F(TrbRuntimeTempBufferTest, AcceptsStridedDeviceViewWithOffsetWithoutTensorCopies) {
+    Runtime runtime = make_runtime();
+    std::vector<uint8_t> storage(6, 0x37);
+    const uint32_t shape[] = {2, 2};
+    const uint32_t strides[] = {3, 1};
+    ChipTensor tensor = make_tensor_strided(
+        storage.data(), shape, strides, 2, DataType::UINT8, AddressSpace::DEVICE, TensorTransfer::NONE
+    );
+    tensor.start_offset = 1;
+    tensor.buffer.size = storage.size();
+    ChipStorageTaskArgs args;
+    args.add_tensor(tensor);
+    const ArgDirection sig[] = {ArgDirection::INOUT};
+
+    ASSERT_EQ(bind_runtime(runtime, api_, args, sig, 1), 0);
+    EXPECT_TRUE(runtime.tensor_leases_.empty());
+    EXPECT_EQ(finish_run(runtime, 0), 0);
+    EXPECT_EQ(storage, std::vector<uint8_t>(6, 0x37));
+}

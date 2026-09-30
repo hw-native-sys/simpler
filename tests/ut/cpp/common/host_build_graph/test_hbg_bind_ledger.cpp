@@ -219,6 +219,7 @@ struct FakeHostApi {
     std::array<SchedulerStateSlot, PTO_PIPELINE_MAX_DEPTH> scheduler_slots{};
     int scheduler_acquires{0};
     size_t definition_offset{0};
+    int device_malloc_count{0};
     int copy_count{0};
     int fail_copy_on{0};
     int orchestration_count{0};
@@ -340,6 +341,7 @@ void host_get_set_orch_entry(const ChipTaskArgs &args) {
 }
 
 void *fake_device_malloc(void *, size_t size) {
+    ++g_fake->device_malloc_count;
     // Plain malloc, like the sim backend: the bump is what aligns its base.
     void *p = std::malloc(std::max<size_t>(size, 1));
     if (p != nullptr) g_fake->live.insert(p);
@@ -2042,4 +2044,58 @@ TEST_F(HbgBindLedgerTest, RejectsUnsupportedTransferBeforeReadingEarlierArgument
         EXPECT_EQ(fake_.copy_count, 0);
         EXPECT_TRUE(fake_.live.empty());
     }
+}
+
+TEST_F(HbgBindLedgerTest, RejectsUnsupportedHostLayoutBeforeReadingEarlierArguments) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    const uint32_t shape[] = {2, 2};
+    const uint32_t strides[] = {3, 1};
+    // A preflight that reaches the earlier input's bytes faults immediately.
+    const ChipTensor first = make_tensor_external(reinterpret_cast<void *>(1), shape, 2, DataType::UINT8);
+    for (bool offset_view : {false, true}) {
+        SCOPED_TRACE(offset_view ? "offset" : "strided");
+        ChipTensor unsupported = make_tensor_strided(reinterpret_cast<void *>(1), shape, strides, 2, DataType::UINT8);
+        if (offset_view) {
+            unsupported = first;
+            unsupported.start_offset = 1;
+            unsupported.buffer.size = 5;
+        }
+        for (auto direction : {ArgDirection::IN, ArgDirection::OUT, ArgDirection::INOUT}) {
+            SCOPED_TRACE(static_cast<int>(direction));
+            ChipStorageTaskArgs args;
+            args.add_tensor(first);
+            args.add_tensor(unsupported);
+            const ArgDirection sig[] = {ArgDirection::IN, direction};
+            EXPECT_EQ(bind(runtime, args, sig, 2), PTO_RUNTIME_ERR_UNSUPPORTED);
+            EXPECT_EQ(fake_.copy_count, 0);
+            EXPECT_EQ(fake_.device_malloc_count, 0);
+            EXPECT_TRUE(fake_.gm_heap.empty());
+            EXPECT_TRUE(fake_.runtime_arena.empty());
+            EXPECT_TRUE(fake_.sm_mirror.empty());
+            EXPECT_EQ(fake_.scheduler_acquires, 0);
+        }
+    }
+}
+
+TEST_F(HbgBindLedgerTest, AcceptsStridedDeviceViewWithOffsetWithoutTensorCopies) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto runtime_cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> storage(6, 0x37);
+    const uint32_t shape[] = {2, 2};
+    const uint32_t strides[] = {3, 1};
+    ChipTensor tensor = make_tensor_strided(
+        storage.data(), shape, strides, 2, DataType::UINT8, AddressSpace::DEVICE, TensorTransfer::NONE
+    );
+    tensor.start_offset = 1;
+    tensor.buffer.size = storage.size();
+    ChipStorageTaskArgs args;
+    args.add_tensor(tensor);
+    const ArgDirection sig[] = {ArgDirection::INOUT};
+
+    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    EXPECT_TRUE(runtime.tensor_leases().empty());
+    EXPECT_EQ(storage, std::vector<uint8_t>(6, 0x37));
 }

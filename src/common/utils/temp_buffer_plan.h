@@ -28,7 +28,8 @@
  * runtimes and both architectures, precisely because that failure is silent.
  *
  * Precondition: validate_program_tensor_transfers returned 0 for this call. Thus HOST
- * means H2D and DEVICE means NONE in both this sizing pass and the bind allocation loop.
+ * means contiguous H2D with zero start_offset, and DEVICE means NONE, in both this
+ * sizing pass and the bind allocation loop.
  *
  * The predicate: a device-memory tensor is passed through untouched and an
  * empty one addresses nothing, so neither takes a slice. Everything else takes

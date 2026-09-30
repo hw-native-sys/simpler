@@ -17,17 +17,27 @@
 
 // Whole-call preflight runs before sizing, allocating, or copying any input. HOST/NONE is
 // a valid request for a host leaf, but chip binders have no host-only binding yet.
+// HOST transfers allocate nbytes() and copy from buffer.addr without rebasing
+// the descriptor; the supported layout is contiguous with zero start_offset.
 inline int validate_program_tensor_transfers(const ChipStorageTaskArgs *args) {
     for (int i = 0; i < args->tensor_count(); ++i) {
         const auto &t = args->tensor(i);
         const char *reason = tensor_transfer_error(t.address_space, t.transfer);
-        const bool unsupported = t.address_space == AddressSpace::HOST && t.transfer == TensorTransfer::NONE;
-        if (reason == nullptr && !unsupported) continue;
+        int status = PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        if (reason == nullptr && t.address_space == AddressSpace::HOST) {
+            status = PTO_RUNTIME_ERR_UNSUPPORTED;
+            if (t.transfer == TensorTransfer::NONE) {
+                reason = "HOST/NONE is not supported by the chip binder";
+            } else if (!t.is_contiguous() || t.start_offset != 0) {
+                reason = "HOST/H2D requires contiguous strides and zero start_offset";
+            }
+        }
+        if (reason == nullptr) continue;
         LOG_ERROR(
             "bind: tensor %d address_space=%u transfer=%u: %s", i, static_cast<unsigned>(t.address_space),
-            static_cast<unsigned>(t.transfer), reason ? reason : "HOST/NONE is not supported by the chip binder"
+            static_cast<unsigned>(t.transfer), reason
         );
-        return reason ? PTO_RUNTIME_ERR_INVALID_ARGUMENT : PTO_RUNTIME_ERR_UNSUPPORTED;
+        return status;
     }
     return 0;
 }

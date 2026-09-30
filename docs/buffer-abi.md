@@ -130,7 +130,14 @@ Mailbox slots preserve each request in byte 141, formerly reserved view padding;
 standalone Tensor values do not carry it. Re-export and L2 materialization preserve
 the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE;
 HOST/NONE returns UNSUPPORTED, and invalid pairs return INVALID_ARGUMENT, before
-any tensor content copy or device allocation. Host-only leaves can use HOST/NONE.
+any tensor content copy or device allocation. HOST/H2D also requires canonical
+row-major strides and zero `ChipTensor.start_offset`, including for OUT arguments:
+the binders allocate and copy `numel * element_size` bytes from `buffer.addr`,
+without packing strided views or rebasing an element offset. Unsupported HOST
+layouts return UNSUPPORTED in the same whole-call preflight. Public `Tensor.byte_offset`
+is folded into the imported address during L2 materialization and remains supported
+for contiguous views. DEVICE/NONE views retain their strides and offsets without
+transport. Host-only leaves can use HOST/NONE.
 This does not change HBG's existing host-access implementation. Remote protocol v4
 represents only legacy location defaults: its encoder rejects other per-call
 requests before emitting a payload instead of silently dropping them.
