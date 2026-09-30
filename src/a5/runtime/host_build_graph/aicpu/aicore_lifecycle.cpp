@@ -68,6 +68,10 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
     std::memset(physical_core_ids_, 0, sizeof(physical_core_ids_));
     std::memset(thread_handshake_timing_, 0, sizeof(thread_handshake_timing_));
     core_count_ = runtime->dev.worker_count;
+    // The descriptor's gate tail is device-owned and is not copied from the host.
+    // Clear prior-run releases before any partition can open a register window.
+    std::memset(runtime->get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * core_count_);
+    wmb();
     aicpu_thread_num_ = aicpu_thread_num;
     regs_base_ = regs_base;
     lifecycle_traces_ = nullptr;
@@ -355,7 +359,7 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
     return 0;
 }
 
-int32_t AicoreLifecycle::release_partition(int32_t thread_idx, bool start_execution) {
+int32_t AicoreLifecycle::release_partition(Runtime *runtime, int32_t thread_idx, bool start_execution) {
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
     int32_t rc = 0;
@@ -363,13 +367,19 @@ int32_t AicoreLifecycle::release_partition(int32_t thread_idx, bool start_execut
     if (start_execution && trace != nullptr && lifecycle_timing_enabled())
         trace->register_release_start_cycles = get_sys_cnt_aicpu();
     wmb();
-    for (int32_t i = lo; i < hi; ++i) {
-        if (cores_[i].reg_addr == 0) continue;
-        if (start_execution) {
-            platform_init_aicore_regs(cores_[i].reg_addr);
-        } else {
-            if (platform_deinit_aicore_regs(cores_[i].reg_addr) != 0) rc = -1;
+    if (start_execution) {
+        for (int32_t i = lo; i < hi; ++i) {
+            if (cores_[i].reg_addr != 0) platform_init_aicore_regs(cores_[i].reg_addr);
         }
+    } else {
+        AicoreExitTarget targets[kMaxWorkers];
+        size_t count = 0;
+        for (int32_t i = lo; i < hi; ++i) {
+            if (cores_[i].reg_addr == 0) continue;
+            targets[count] = {cores_[i].reg_addr, &runtime->get_teardown_gates()[i]};
+            ++count;
+        }
+        if (count != 0 && platform_retire_aicore_group(targets, count, platform_aicore_exit_deadline()) != 0) rc = -1;
     }
     if (start_execution && trace != nullptr && lifecycle_timing_enabled())
         trace->register_release_end_cycles = get_sys_cnt_aicpu();
@@ -383,38 +393,45 @@ void AicoreLifecycle::signal_shutdown_partition(int32_t thread_idx) {
     if (trace != nullptr && lifecycle_timing_enabled()) trace->exit_signal_start_cycles = get_sys_cnt_aicpu();
     for (int32_t i = lo; i < hi; ++i) {
         if (cores_[i].reg_addr == 0) continue;
-        write_reg(cores_[i].reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+        platform_signal_aicore_exit(cores_[i].reg_addr);
     }
+    wmb();
     if (trace != nullptr && lifecycle_timing_enabled()) trace->exit_signal_end_cycles = get_sys_cnt_aicpu();
 }
 
 int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *runtime) {
-    (void)runtime;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(thread_idx) * core_count_) / aicpu_thread_num_);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(thread_idx + 1) * core_count_) / aicpu_thread_num_);
-    int32_t rc = 0;
-    AicpuThreadLifecycleTrace *trace = thread_lifecycle_trace(thread_idx);
-    if (trace != nullptr && lifecycle_timing_enabled()) trace->exit_wait_start_cycles = get_sys_cnt_aicpu();
+    AicoreExitTarget targets[kMaxWorkers];
+    int32_t core_ids[kMaxWorkers];
+    size_t count = 0;
     for (int32_t i = lo; i < hi; ++i) {
         if (cores_[i].reg_addr == 0) continue;
-        if (platform_deinit_aicore_regs(cores_[i].reg_addr) != 0) {
-            rc = -1;
+        targets[count] = {cores_[i].reg_addr, &runtime->get_teardown_gates()[i]};
+        core_ids[count] = i;
+        ++count;
+    }
+    AicpuThreadLifecycleTrace *trace = thread_lifecycle_trace(thread_idx);
+    if (trace != nullptr && lifecycle_timing_enabled()) trace->exit_wait_start_cycles = get_sys_cnt_aicpu();
+    bool released[kMaxWorkers];
+    const int32_t rc =
+        count == 0 ? 0 : platform_retire_aicore_group(targets, count, platform_aicore_exit_deadline(), released);
+    if (rc != 0) {
+        for (size_t i = 0; i < count; ++i) {
+            if (!released[i]) LOG_ERROR("AICore retirement: core %d not released", core_ids[i]);
         }
     }
-    rmb();
     if (trace != nullptr && lifecycle_timing_enabled()) {
         trace->exit_wait_end_cycles = get_sys_cnt_aicpu();
         cache_flush_range(trace, sizeof(*trace));
     }
 
-    int32_t core_ids[kMaxWorkers]{};
-    int32_t count = 0;
-
+    int32_t partition_core_ids[kMaxWorkers];
+    int32_t partition_count = 0;
     for (int32_t i = lo; i < hi; ++i)
-        core_ids[count++] = i;
-
-    if (is_chip_swimlane_enabled()) chip_swimlane_aicpu_flush(thread_idx, core_ids, count);
-    if (is_pmu_enabled()) pmu_aicpu_finalize(core_ids, count);
+        partition_core_ids[partition_count++] = i;
+    if (is_chip_swimlane_enabled()) chip_swimlane_aicpu_flush(thread_idx, partition_core_ids, partition_count);
+    if (is_pmu_enabled()) pmu_aicpu_finalize(partition_core_ids, partition_count);
     return rc;
 }
 

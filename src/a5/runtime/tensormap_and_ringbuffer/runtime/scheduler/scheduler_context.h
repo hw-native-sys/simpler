@@ -49,6 +49,8 @@ struct RuntimeContext;
  *   - scheduler_dispatch.cpp    (task dispatch loop and helpers)
  */
 class SchedulerContext {
+    friend class SchedulerRetirementTestPeer;
+
 public:
     // =========================================================================
     // Lifecycle
@@ -106,6 +108,12 @@ public:
     // Also runs PMU finalize (SIMPLER_DFX) before deinit when enabled.
     // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
     int32_t shutdown(int32_t thread_idx);
+
+    // Claim each core independently; requests for unpublished cores stay pending.
+    int32_t retire_cores(const int32_t *core_ids, int32_t core_num);
+
+    // Request every core before retiring the ready winners in one platform batch.
+    int32_t retire_all_cores();
 
     // Run all post-orchestration scheduler bookkeeping:
     //  - publishes core assignments to the perf collector (SIMPLER_DFX)
@@ -192,6 +200,18 @@ private:
     // be submitted; schedulers poll it.
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
+    // Published before completed_, so a thread that observes completion also
+    // observes this and cannot enter the healthy shutdown path for a fatal run.
+    std::atomic<bool> fatal_shutdown_started_{false};
+    // Both participants modify each core's atomic byte: the operation that sees
+    // the other bit alone owns retirement. READY publishes initialization;
+    // REQUESTED can arrive before initialization without consuming an empty set.
+    static constexpr uint8_t RETIREMENT_READY = 1;
+    static constexpr uint8_t RETIREMENT_REQUESTED = 2;
+    uint8_t retirement_state_[PLATFORM_MAX_CORES]{};
+    AicoreTeardownControl *teardown_gates_{nullptr};
+    bool retirement_blocked_layout_{false};
+    bool retirement_unassigned_{false};
     // The active callable's registration-owned object-address table and the
     // number of entries it holds, both bound from the descriptor in the cold
     // path. The table is in the callable's registration block, not in the
@@ -244,6 +264,15 @@ private:
     // Emergency shutdown: broadcast exit signal to every handshake'd core and
     // deinit their AICore register blocks. Idempotent.
     void emergency_shutdown(Runtime *runtime);
+
+    // Elect exactly one thread to drive the emergency retirement. Returns true
+    // to the elected caller only; publishes the fatal flag before the
+    // completion latch.
+    bool begin_emergency_shutdown();
+    void signal_emergency_shutdown(Runtime *runtime);
+    void publish_retirement_group(int32_t owner_thread);
+    int32_t retirement_group_ids(int32_t owner_thread, int32_t *ids);
+    int32_t retire_claimed_cores(const int32_t *core_ids, int32_t core_num);
 
     // =========================================================================
     // Dispatch (scheduler_dispatch.cpp)

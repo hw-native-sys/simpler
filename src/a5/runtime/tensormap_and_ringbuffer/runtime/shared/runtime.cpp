@@ -194,7 +194,9 @@ LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &rt) {
 
 // The first publication onto an allocation adds the handshake region, so it
 // starts from the ctor-zeroed host copy rather than from whatever rtMalloc
-// left. This runtime has no host-uninitialized tail, so that reaches the end.
-size_t runtime_device_initialized_prefix_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }
+// left. Return gates are initialized by the AICPU before window-open.
+size_t runtime_device_initialized_prefix_size(const Runtime &) {
+    return offsetof(DeviceRuntimeLaunchDesc, teardown_gates);
+}
 
 size_t runtime_device_extent_size(const Runtime &) { return sizeof(DeviceRuntimeLaunchDesc); }

@@ -125,8 +125,8 @@ struct Handshake {
 // The AICore owns this line's writeback: it flushes the whole line with
 // dcci(..., CACHELINE_OUT) on its report and again on exit. A word the AICPU
 // must publish independently cannot live here — a stale line writeback would
-// overwrite it. The A2/A3 post-close return gates live in
-// Runtime::teardown_gates, one isolated line each; A5 leaves them unused.
+// overwrite it. The post-close return gates live in
+// Runtime::teardown_gates, one isolated line each on both platforms.
 static_assert(sizeof(Handshake) == 64);
 static_assert(std::is_standard_layout_v<Handshake> && std::is_trivially_copyable_v<Handshake>);
 // The payload offsets are the device-side wire contract: AICore writes them and
@@ -330,16 +330,14 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // what gives a fresh block a defined starting value.
     Handshake workers[RUNTIME_MAX_WORKER];
 
-    // A2/A3 post-close return gates, one isolated cache line per worker. The
+    // Post-close return gates, one isolated cache line per worker. The
     // AICPU stores here only after that worker's register window is closed;
     // the AICore bypass-loads its own entry and returns once it reads RELEASE.
     // Separate from workers[] because the AICore flushes its whole Handshake
-    // line, which would overwrite a gate sharing it. Unused reserved storage on
-    // A5 — a declared member that occupies layout, read and written by no A5
-    // code, and A5 runs no gate initialization.
+    // line, which would overwrite a gate sharing it.
     //
     // Last, and outside both the uploaded prefix and the initialized prefix: on
-    // A2/A3 the AICPU zeroes every active entry in `pre_handshake_init` and
+    // both platforms the AICPU zeroes every active entry in `pre_handshake_init` and
     // executes `wmb()` before it publishes `hs_setup_done_`, and no register
     // window opens before that publication, so the meaningful initial value is
     // produced on the device ahead of every read of it. No host-supplied gate

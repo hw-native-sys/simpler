@@ -13,8 +13,9 @@
 
 #include "aicpu/platform_regs.h"
 
-// a5 retires one core at a time through its own register entry, where a2a3 retires a
-// group against a deadline — so the emergency-shutdown half the cold path carries
-// needs a different stub per architecture. The stall-dump tests never reach it; only
-// the link does.
-int32_t __attribute__((weak)) platform_deinit_aicore_regs(uint64_t) { return 0; }
+// The stall-dump tests never reach retirement; this stub only satisfies the link.
+uint64_t __attribute__((weak)) platform_aicore_exit_deadline() { return 0; }
+
+int32_t __attribute__((weak)) platform_retire_aicore_group(const AicoreExitTarget *, size_t, uint64_t, bool *) {
+    return 0;
+}

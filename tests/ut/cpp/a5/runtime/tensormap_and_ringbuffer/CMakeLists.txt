@@ -17,6 +17,21 @@ macro(a5_tmr_case)
     tmr_case(${ARGV} ARCHS a5)
 endmacro()
 
+# Exercise the production cold path with an observable platform retirement sink.
+a5_tmr_case(test_scheduler_retirement.cpp
+    SOURCES
+        ${A5_RUNTIME_DIR}/scheduler/scheduler_cold_path.cpp
+        ${A5_RUNTIME_DIR}/shared/runtime.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/aicpu_device_config.cpp
+    DEFINES SIMPLER_DFX=0
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    TIMEOUT 20)
+if(APPLE)
+    target_link_options(test_a5_tmr_scheduler_retirement PRIVATE -Wl,-dead_strip)
+else()
+    target_link_options(test_a5_tmr_scheduler_retirement PRIVATE -Wl,--gc-sections)
+endif()
+
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it

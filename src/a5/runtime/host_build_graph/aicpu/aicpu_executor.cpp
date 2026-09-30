@@ -321,7 +321,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 
     // The DMB register is the only execution gate. On failure the same
     // partitioned path sends EXIT and waits for every ACK.
-    if (aicore_lifecycle_.release_partition(tidx, !init_failed_.load(std::memory_order_acquire)) != 0) {
+    if (aicore_lifecycle_.release_partition(runtime, tidx, !init_failed_.load(std::memory_order_acquire)) != 0) {
         init_failed_.store(true, std::memory_order_release);
     }
 
@@ -578,8 +578,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     //    The length is the device descriptor, not sizeof(Runtime): the host-only
     //    tail past it is never on the device at all. It deliberately spans more
     //    than the uploaded prefix, keeping maintenance over the whole allocated
-    //    descriptor — including the gate array, which A5 declares but no A5 code
-    //    reads or writes.
+    //    descriptor — including the device-owned gate array.
     cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     aicore_lifecycle_.deinit();

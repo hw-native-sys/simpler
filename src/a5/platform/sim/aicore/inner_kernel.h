@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include "aicore_teardown.h"
 #include <dlfcn.h>
 
 #include "aicpu/device_time.h"
@@ -113,6 +114,12 @@ typedef int mem_dsb_t;
 // Equivalent to dmb ish (aarch64) / mfence (x86).
 #define OUT_OF_ORDER_FULL_BARRIER() __sync_synchronize()
 
+inline void wait_for_post_close_release(uint32_t *release) {
+    while (__atomic_load_n(release, __ATOMIC_ACQUIRE) != AICORE_POST_CLOSE_RELEASE) {
+        SPIN_WAIT_HINT();
+    }
+}
+
 // =============================================================================
 // MMIO Load/Store Intrinsics (sim stubs)
 // =============================================================================
@@ -175,6 +182,14 @@ inline uint64_t read_reg(RegId reg) {
     // fence beside a non-atomic load does neither, so __atomic_load_n subsumes
     // the old OUT_OF_ORDER_LOAD_BARRIER().
     return static_cast<uint64_t>(__atomic_load_n(ptr, __ATOMIC_ACQUIRE));
+}
+
+// Resident startup can fail before AICPU has reset this run's return gate.
+// Only its DMB EXIT, published after that reset, permits the EXITED ACK.
+inline void wait_for_aicpu_exit_signal() {
+    while (static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
+        SPIN_WAIT_HINT();
+    }
 }
 
 /**

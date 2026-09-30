@@ -31,6 +31,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include "aicore_teardown.h"
 #include "aicpu/cache_maintenance.h"
 #include "common/platform_config.h"
 
@@ -120,22 +121,51 @@ void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value);
  * Initialize AICore registers after core discovery
  *
  * This function performs platform-agnostic register initialization that works
- * for both a5 and a5sim, including enabling fast path control and clearing
- * dispatch registers.
+ * for both a5 and a5sim. Writing the dispatch register to idle is what opens
+ * the core's window: there is no separate window-enable control on a5.
  *
  * @param reg_addr  Register base address of the AICore
  */
 void platform_init_aicore_regs(uint64_t reg_addr);
 
-/**
- * Deinitialize AICore registers before termination
- *
- * This function sends exit signal and closes fast path control.
- *
- * @param reg_addr  Register base address of the AICore
- * @return 0 if the core acknowledged exit, non-zero on timeout
- */
-int32_t platform_deinit_aicore_regs(uint64_t reg_addr);
+// Signal one core to exit, without waiting for its acknowledgement. The store is
+// posted -- the window is Device-nGnRE, see docs/hardware/mmio-performance.md --
+// so a caller signalling several cores owes one wmb() before it starts polling.
+void platform_signal_aicore_exit(uint64_t reg_addr);
+
+// One absolute timeout deadline shared by a group of exiting cores.
+uint64_t platform_aicore_exit_deadline();
+
+// Quiesce a core whose COND the caller has already observed as EXITED: dispatch
+// back to idle, with that posted store read back so it is complete. The readback
+// targets DATA_MAIN_BASE, the register just written: nR orders accesses within
+// one peripheral, and DATA_MAIN_BASE (0xD0) and COND (0x5108) do not share a
+// 4 KB granule, so a COND load would not order against this store. Issues no
+// fence of its own -- a caller closing several windows owes one rmb() after the
+// last call and before it publishes anything those closes must precede.
+void platform_close_aicore_window(uint64_t reg_addr);
+
+struct AicoreExitTarget {
+    uint64_t reg_addr;
+    AicoreTeardownControl *teardown;
+};
+
+// Retires one exclusively-claimed set of cores: signal every member, collect
+// every ACK against one shared deadline, close every acknowledged window, then
+// release those workers.
+// Callers claim their targets first, so concurrent callers never name the same
+// core and the set need not be the whole chip. An unacknowledged core is neither
+// closed nor released and stays the host recovery path's responsibility.
+//
+// `released`, when non-null, receives one flag per target and lets the caller
+// name the cores it failed to retire; this layer takes no logging dependency.
+// Every path that returns fills those entries first, rejection included, so the
+// caller may read them without initializing the buffer; a `count` above
+// PLATFORM_MAX_CORES is rejected and only that many are filled.
+// Returns 0 when every target was released, -1 on timeout or invalid targets.
+int32_t platform_retire_aicore_group(
+    const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released = nullptr
+);
 
 /**
  * Variant-specific AICore deinit wait timeout, in ticks of get_sys_cnt_aicpu.

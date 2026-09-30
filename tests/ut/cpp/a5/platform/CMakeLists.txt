@@ -44,4 +44,26 @@ add_custom_command(TARGET test_a5_aicpu_topology_fallback POST_BUILD
         "$<TARGET_FILE_DIR:test_a5_aicpu_topology_fallback>/aicpu_cpu_topo_fallback.json"
 )
 
+a5_platform_case(test_aicore_retirement.cpp
+    SOURCES
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp
+        ${SIMPLER_SRC}/a5/platform/sim/aicpu/inner_platform_regs.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+        ${HOST_LOG_TEST_SOURCES}
+    INCLUDES ${SIMPLER_SRC}/common/platform/sim/aicpu)
+set_tests_properties(test_a5_aicore_retirement PROPERTIES TIMEOUT 20)
+
+# The AICore half of the return gate: it compiles the real a5sim
+# aicore/inner_kernel.h (so the sim include directory is on the path) and the
+# same production platform_regs.cpp retire path as the case above, which is what
+# publishes the gate the worker waits on.
+a5_platform_case(test_return_gate_wait.cpp
+    SOURCES
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp
+        ${SIMPLER_SRC}/a5/platform/sim/aicpu/inner_platform_regs.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+        ${HOST_LOG_TEST_SOURCES}
+    INCLUDES ${SIMPLER_SRC}/common/platform/sim/aicpu ${SIMPLER_SRC}/a5/platform/sim)
+set_tests_properties(test_a5_return_gate_wait PROPERTIES TIMEOUT 20)
+
 simpler_ut_glob_cases(a5_platform_case)

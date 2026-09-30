@@ -19,6 +19,7 @@
 
 class Runtime;
 struct AicpuThreadLifecycleTrace;
+class AicoreLifecycleTestPeer;
 
 class AicoreLifecycle {
 public:
@@ -29,12 +30,13 @@ public:
     void begin_bootstrap_wait(int32_t thread_idx);
     void end_bootstrap_wait(int32_t thread_idx);
     int32_t wait_bootstrap_complete(Runtime *runtime);
-    int32_t release_partition(int32_t thread_idx, bool start_execution);
+    int32_t release_partition(Runtime *runtime, int32_t thread_idx, bool start_execution);
     void signal_shutdown_partition(int32_t thread_idx);
     int32_t finish_shutdown_partition(int32_t thread_idx, Runtime *runtime);
     void deinit();
 
 private:
+    friend class AicoreLifecycleTestPeer;
     static constexpr int32_t kMaxWorkers = 108;
 
     struct CoreState {
