@@ -88,10 +88,13 @@ platform_single_case(test_memory_allocator.cpp
 # needs nothing compiled in but the CANN platform stand-in.
 platform_cases(
     test_profiler_device_engine.cpp
-    test_worker_chip_message_queue.cpp
     test_worker_chip_orch_endpoint.cpp
     test_region_instance_view.cpp
     PER_ARCH)
+
+# SPSQ region template is header-only under src/common/platform and opens no
+# arch or runtime headers, so one build covers it.
+platform_single_case(test_region_template.cpp)
 
 platform_case(test_scope_stats_collector.cpp PER_ARCH
     SOURCES

@@ -657,24 +657,21 @@ class Orchestrator:
         with self._control_admission("create_worker_chip_region"):
             return self._worker._create_worker_chip_region(int(worker_id), int(payload_bytes), int(counter_bytes))
 
-    def create_worker_chip_queue(self, *, worker_id: int, depth: int, input_arena_bytes: int, output_arena_bytes: int):
-        """Create an L3-L2 message queue backed by one L3-L2 communication region."""
+    def create_worker_chip_queue(
+        self, *, worker_id: object, depth: object, input_arena_bytes: object, output_arena_bytes: object
+    ):
+        """Create an L3-L2 message queue on one NEXT_LEVEL chip worker."""
         if self._worker is None:
             raise RuntimeError("create_worker_chip_queue requires an Orchestrator bound to a Worker")
         from .worker_chip_message_queue import create_worker_chip_queue  # noqa: PLC0415
 
-        # Reserved across the whole build, not just the region creation it
-        # nests: the descriptor writes that follow are device effects too. The
-        # reservation is re-entrant, so the inner create_worker_chip_region joins this
-        # one rather than deadlocking on it.
-        with self._control_admission("create_worker_chip_queue"):
-            return create_worker_chip_queue(
-                self,
-                worker_id=int(worker_id),
-                depth=int(depth),
-                input_arena_bytes=int(input_arena_bytes),
-                output_arena_bytes=int(output_arena_bytes),
-            )
+        return create_worker_chip_queue(
+            self,
+            worker_id=worker_id,
+            depth=depth,
+            input_arena_bytes=input_arena_bytes,
+            output_arena_bytes=output_arena_bytes,
+        )
 
     # ------------------------------------------------------------------
     # Nested scope (Strict-1 per-scope rings)
