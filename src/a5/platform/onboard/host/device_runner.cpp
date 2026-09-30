@@ -774,7 +774,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
                 discharge_rc
             );
         }
-        emit_device_dep_gen_graph(prepared.dfx);
+        emit_device_dep_gen_graph(prepared.dfx, prepared.identity.run_epoch, false);
         return DrainOutcome::device_error(discharge_rc);
     }
 
