@@ -67,6 +67,11 @@
 // returns simpler_aicpu_register_callable; host_build_graph returns none.
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
 
+// The host-orchestrating runtime's graph hand-off, and a weak fallback for a
+// runtime that captures on the device: its `dep_gen_host_graph_active()` is
+// false, so the runner never asks it for a graph.
+extern "C" int dep_gen_host_graph_take(simpler::dfx::host_graph::HostGraphExport *out);
+
 namespace {
 
 HostRuntimeTimeoutConfig resolve_onboard_timeout_config() {
@@ -3846,6 +3851,7 @@ int DeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
     std::string dump_error;
     std::string scope_stats_error;
     std::string dep_gen_error;
+    std::string host_graph_error;
     bool ok = true;
     if (chip_swimlane_collector_.retains_runs() &&
         !chip_swimlane_collector_.flush_retained_runs(remaining_ms(), &swimlane_error)) {
@@ -3872,10 +3878,16 @@ int DeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
     if (!dep_gen_flush_retained(remaining_ms(), &dep_gen_error)) {
         ok = false;
     }
+    // The host-built graph's own owner. Ungated for the same reason as the arms
+    // above: a failure recorded before retention was reconfigured off must still
+    // be reported, and an exporter holding nothing has nothing to wait for.
+    if (!host_graph_exporter_.flush_retained_runs(remaining_ms(), &host_graph_error)) {
+        ok = false;
+    }
     if (ok) return 0;
     if (error != nullptr) {
         *error = swimlane_error;
-        for (const std::string &part : {dump_error, pmu_error, scope_stats_error, dep_gen_error}) {
+        for (const std::string &part : {dump_error, pmu_error, scope_stats_error, dep_gen_error, host_graph_error}) {
             if (part.empty()) continue;
             if (!error->empty()) *error += "; ";
             *error += part;
@@ -3890,6 +3902,15 @@ void DeviceRunnerBase::finish_retained_runs() {
     pmu_collector_.finish_retained_runs();
     scope_stats_collector_.finish_retained_runs();
     dep_gen_finish_retained();
+    host_graph_exporter_.finish_retained_runs();
+}
+
+bool DeviceRunnerBase::seal_host_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept {
+    if (!dfx.dep_gen_enabled || !host_graph_exporter_.retains_runs()) return true;
+    // The hand-off is passed in rather than called: this base names no runtime
+    // symbol, and the weak `take` a device-capturing runtime links reports that
+    // there is nothing here to publish.
+    return host_graph_exporter_.seal(run_epoch, dfx.output_prefix, &dep_gen_host_graph_take);
 }
 
 void DeviceRunnerBase::write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot) {

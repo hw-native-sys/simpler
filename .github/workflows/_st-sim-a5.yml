@@ -110,6 +110,13 @@ jobs:
             --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --enable-dep-gen
 
+      - name: dep_gen smoke (a5 host_build_graph)
+        if: inputs.include_dfx_smokes
+        run: |
+          .venv/bin/python -m pytest tests/st/a5/host_build_graph/dfx/dep_gen/ \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --enable-dep-gen
+
       - name: chip_swimlane smoke (a5)
         if: inputs.include_dfx_smokes
         run: |

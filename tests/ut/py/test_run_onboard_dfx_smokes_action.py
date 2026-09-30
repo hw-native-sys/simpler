@@ -129,7 +129,11 @@ def test_a5_dfx_smokes_adapt_to_device_count_without_overlap(tmp_path: Path, dev
     assert result.returncode == 0, result.stdout + result.stderr
     assert not (state_dir / "overlap").exists()
     invocations = (state_dir / "invocations").read_text().splitlines()
-    expected_jobs = 5
+    # What a5 starts, in the action's own order: dep_gen (tensormap_and_ringbuffer),
+    # chip_swimlane, chip_swimlane (host_build_graph), PMU, args_dump (full),
+    # dep_gen (host_build_graph). The count is what the per-device distribution
+    # below is computed from, so a job added to the action moves this number.
+    expected_jobs = 6
     assert len(invocations) == expected_jobs
     for device in range(7, 7 + device_count):
         expected_count = expected_jobs // device_count + (device - 7 < expected_jobs % device_count)

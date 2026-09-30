@@ -9,14 +9,16 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Two definitions that only have to resolve, never to run.
+ * Definitions that only have to resolve, never to run.
  *
- * Both are weak: a target that links the real translation unit gets the real
+ * All are weak: a target that links the real translation unit gets the real
  * behaviour, and one that does not still links. Grouped because they share
  * that property, not because they are related.
  */
 
 #include <cstdint>
+
+#include "host/host_graph_runs.h"
 
 // A recorder worker stands its recording storage up as it starts
 // (host/graph_recorder_pool.h). The real one is in orchestrator.cpp, which the
@@ -36,4 +38,16 @@ extern "C" __attribute__((weak)) int bind_callable_to_runtime_impl(
     const uint64_t * /* ring_heap */, const uint64_t * /* ring_dep_pool */
 ) {
     return -1;
+}
+
+// The host-orchestrating runtime's graph hand-off, which
+// device_runner_base.cpp names unconditionally. The real one is in
+// host_build_graph's dep_gen_host_graph.cpp, and each arch's device_runner.cpp
+// carries this same weak fallback for a runtime that captures on the device;
+// runner-only tests link neither. NotCaptured is what a runtime with no host
+// graph reports, so a caller that reached it is answered rather than misled.
+extern "C" __attribute__((weak)) int dep_gen_host_graph_take(
+    simpler::dfx::host_graph::HostGraphExport * /* out */
+) {
+    return static_cast<int>(simpler::dfx::host_graph::TakeOutcome::NotCaptured);
 }

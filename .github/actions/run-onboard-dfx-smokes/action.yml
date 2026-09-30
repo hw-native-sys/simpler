@@ -156,11 +156,13 @@ runs:
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py" \
           --dump-args full
 
-        if [[ "$platform" == "a2a3" ]]; then
-          start_job "dep_gen (host_build_graph)" \
-            tests/st/a2a3/host_build_graph/dfx/dep_gen/test_dep_gen.py \
-            --enable-dep-gen
-        fi
+        # The directory, not a named file: every case here needs --enable-dep-gen
+        # to assert anything, so one this job does not select reports a pass
+        # having checked no graph. Both arches have a host-built dep_gen suite,
+        # so neither is branched on.
+        start_job "dep_gen (host_build_graph)" \
+          "tests/st/$platform/host_build_graph/dfx/dep_gen/" \
+          --enable-dep-gen
 
         for index in "${!job_labels[@]}"; do
           wait_job "$index"

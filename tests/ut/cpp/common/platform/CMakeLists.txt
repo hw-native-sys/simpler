@@ -111,6 +111,13 @@ platform_case(test_scope_stats_retained_runs.cpp PER_ARCH
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp
     TIER aicpu)
 
+# Who owns a host-built dependency graph between its thread and its file. Not
+# per-arch or per-runtime: the exporter names no runtime symbol — the hand-off
+# arrives as a function pointer — and holds nothing a device writes.
+platform_single_case(test_host_graph_exporter.cpp
+    SOURCES
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/host_graph_exporter.cpp)
+
 # AICPU-side dep_gen writer. Both axes: the record it writes carries the
 # runtime's TaskId, so the case resolves its bare "task_id.h" to the runtime it
 # was built for.
@@ -305,6 +312,7 @@ set(SIM_CALLABLE_POOL_SOURCES
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/chip_swimlane_collector.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/scope_stats_collector.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/scope_stats_retained_runs.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/host_graph_exporter.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/host_phase_records.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/platform_compile_info.cpp
     ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp

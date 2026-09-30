@@ -77,9 +77,26 @@ extern "C" int dep_gen_host_graph_emit(const char *deps_json_path);
  *
  * A no-op for runtimes that capture on the device: their `dep_gen_host_graph_active`
  * is the weak `false`, and their graph is emitted from the collector at drain.
+ *
+ * With cross-run retention on, the graph is handed to the runner's exporter
+ * here instead of being serialized here: the hand-off still happens on this
+ * thread, which is the whole reason this call site exists, but the file is
+ * written off the submit path. The synchronous branch below is unchanged.
  */
-static void emit_host_dep_gen_graph(const CallConfig &config, const char *trace_attrs) {
+static void emit_host_dep_gen_graph(
+    SimDeviceRunnerBase *runner, const CallConfig &config, uint64_t run_epoch, const char *trace_attrs
+) {
     if (config.enable_dep_gen == 0 || !dep_gen_host_graph_active()) return;
+    if (runner->host_graph_retains_runs()) {
+        // The graph moves out of this thread's capture into storage the
+        // exporter owns, and the file is published off this path. A failure is
+        // the exporter's sticky error, which `flush_diagnostics` and `close`
+        // report; this run's result is unchanged either way.
+        if (!runner->seal_host_dep_gen_graph(DfxRunConfig::from(config), run_epoch)) {
+            LOG_ERROR("dep_gen host graph was not handed to the background writer (%s)", trace_attrs);
+        }
+        return;
+    }
     const std::string deps_path = make_deps_json_path(config.output_prefix);
     const int emit_rc = dep_gen_host_graph_emit(deps_path.c_str());
     if (emit_rc != 0) {
@@ -994,7 +1011,7 @@ int simpler_prepare_run(
             LOG_ERROR("simpler_prepare_run: publishing this run's image failed: %d (%s)", rc, state->trace_attrs);
             return cleanup_failed_prepare(state, rc);
         }
-        emit_host_dep_gen_graph(state->config, state->trace_attrs);
+        emit_host_dep_gen_graph(runner, state->config, state->descriptor.run_epoch, state->trace_attrs);
         // This run's own input bytes, into the buffers its bind just named.
         {
             STRACE("chip.run.stage_inputs");

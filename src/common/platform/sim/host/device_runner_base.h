@@ -65,6 +65,7 @@
 #include "host/host_phase_records.h"
 #include "host/host_phase_run_state.h"
 #include "host/args_dump_collector.h"
+#include "host/host_graph_exporter.h"
 #include "host/pmu_collector.h"
 #include "host/scope_stats_collector.h"
 #include "runtime.h"
@@ -212,6 +213,20 @@ public:
     virtual void withdraw_dep_gen_run(uint64_t /*run_epoch*/) noexcept {}
     virtual bool dep_gen_flush_retained(int /*timeout_ms*/, std::string * /*error*/) { return true; }
     virtual void dep_gen_finish_retained() {}
+
+    /**
+     * Hand this thread's finished host-built dependency graph to the exporter.
+     *
+     * Called from `prepare`, on the thread that ran the orchestration, at the
+     * point that thread used to serialize and write the file. With retention
+     * off, or for a runtime that captures its graph on the device, this is inert
+     * and the caller writes synchronously as before.
+     *
+     * Reports whether a graph that should have been published was. A failure is
+     * sticky until a flush reports it and never changes the run's result.
+     */
+    bool seal_host_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
+    bool host_graph_retains_runs() const { return host_graph_exporter_.retains_runs(); }
 
     /** Reserve the runner's single active native execution through finalize. */
     bool try_acquire_native_run(const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit);
@@ -527,6 +542,9 @@ public:
         pmu_collector_.configure_retained_runs(enabled);
         scope_stats_collector_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
         configure_dep_gen_retention(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
+        // A host-orchestrating runtime's graph is finished inside `prepare` and
+        // never reaches a device collector, so it has an owner of its own.
+        host_graph_exporter_.configure_retained_runs(enabled, simpler::dfx::runs::kDefaultBudgetBytes);
     }
     bool retains_runs() const {
         return chip_swimlane_collector_.retains_runs() || dump_collector_.retains_runs() ||
@@ -851,6 +869,9 @@ protected:
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;
+    // The host-built graph's owner. Not a device collector: nothing it holds
+    // is written by the device, and no run boundary reads it.
+    simpler::dfx::host_graph::HostGraphExporter host_graph_exporter_;
 
     /**
      * The core and AICPU-thread counts a resident collector's pools were built

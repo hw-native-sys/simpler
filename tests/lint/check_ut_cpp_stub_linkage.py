@@ -29,7 +29,7 @@ weak definition — the archive copy is then simply not pulled there.
 
 This check is what makes the next one loud. For every symbol the archive
 defines strongly, no test binary may have resolved it to a weak definition. A
-symbol the archive itself defines weakly — assert_impl and the two link
+symbol the archive itself defines weakly — assert_impl and the link
 placeholders, which are meant to be overridable — is not the archive's to win,
 and is not checked.
 

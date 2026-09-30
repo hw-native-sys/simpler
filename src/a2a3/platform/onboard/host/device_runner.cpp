@@ -51,6 +51,7 @@
 #include "chip_callable_layout.h"
 #include "utils/elf_build_id.h"
 #include "host/dfx_run_config.h"
+#include "host/host_graph_runs.h"
 #include "host/host_regs.h"  // Register address retrieval
 #include "host/raii_scope_guard.h"
 #include "utils/fatal_shutdown_latch.h"
@@ -80,6 +81,13 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_replay_emit_d
 
 extern "C" __attribute__((weak, visibility("hidden"))) bool dep_gen_host_graph_active() { return false; }
 extern "C" __attribute__((weak, visibility("hidden"))) void dep_gen_host_graph_set_enabled(bool /*enable*/) {}
+extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_host_graph_take(
+    simpler::dfx::host_graph::HostGraphExport * /*out*/
+) {
+    // `NotCaptured`: this runtime builds no host graph, so there is nothing
+    // on any thread to hand over.
+    return static_cast<int>(simpler::dfx::host_graph::TakeOutcome::NotCaptured);
+}
 extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_host_graph_emit(const char * /*deps_json_path*/) {
     LOG_DEBUG("dep_gen host graph not implemented for this runtime — deps.json skipped");
     return -1;

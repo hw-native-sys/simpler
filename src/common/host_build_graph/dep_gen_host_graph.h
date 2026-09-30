@@ -31,20 +31,21 @@
  *   end_task()              — closes the task, after its last dependency step
  *
  * Control surface, called from the device runner (same host_runtime.so):
- *   set_enabled() / active() / emit()
+ *   set_enabled() / active() / take() / emit()
  *
  * Every runtime build links this .cpp. A unit test that takes the orchestrator
  * without it resolves to the no-ops in tests/ut/cpp/support/hbg_orch_stubs.cpp.
  *
  * The graph lives in thread-local state, so capture is lock-free and two
- * prepared contexts on different threads cannot overwrite one another. Emit reads
- * the calling thread's state, and the caller keeps that read on the capturing
- * thread by emitting at the end of the orchestration's own bind — see
- * `emit_host_dep_gen_graph` in each platform's c_api_shared.cpp. Emitting later
- * would not be safe: the run lane serializes with a mutex, which guarantees
- * mutual exclusion but not thread affinity, so a drain can land on another
- * thread, and a successor's bind resets the state. Emit returns -3 if a caller
- * ever reads a thread that did not capture.
+ * prepared contexts on different threads cannot overwrite one another. Both
+ * `take` and `emit` read the calling thread's state, and the caller keeps that
+ * read on the capturing thread by handing the graph over at the end of the
+ * orchestration's own bind — see `emit_host_dep_gen_graph` in each platform's
+ * c_api_shared.cpp. Doing it later would not be safe: the run lane serializes
+ * with a mutex, which guarantees mutual exclusion but not thread affinity, so a
+ * drain can land on another thread, and a successor's bind resets the state.
+ * A caller that reads a thread which did not capture is told so rather than
+ * given an empty graph.
  *
  * Per-task producer dedup mirrors append_fanin_or_fail, which keys on the producer's
  * local id; this keys on producer task id. The two agree only because
@@ -61,6 +62,7 @@
 
 #include <cstdint>
 
+#include "host/host_graph_runs.h"  // HostGraphExport, TakeOutcome
 #include "host_build_graph/tensormap.h"
 #include "host_build_graph/types.h"  // TensorRef
 #include "tensor.h"
@@ -126,8 +128,27 @@ void dep_gen_host_graph_set_enabled(bool enable);
 bool dep_gen_host_graph_active();
 
 /**
- * Write the captured graph to `deps_json_path`. Returns 0 on success, non-zero
- * if capture was off/empty or the file could not be written.
+ * Move this thread's captured graph into `out`, and report what was found.
+ *
+ * Returns a `simpler::dfx::host_graph::TakeOutcome` as an int. On `Complete`
+ * the caller owns every byte the graph occupies and the thread-local holds
+ * nothing of it, so a background writer can read `out` while the next
+ * orchestration captures into fresh storage. `NotCaptured` and `Incomplete`
+ * leave `out`'s payload empty and mean no graph may be published.
+ *
+ * An empty `Complete` graph is a real answer — an orchestration that submitted
+ * no tasks — and is distinct from `NotCaptured`, which `captured` alone could
+ * not express.
+ */
+int dep_gen_host_graph_take(simpler::dfx::host_graph::HostGraphExport *out);
+
+/**
+ * Write the captured graph to `deps_json_path`, truncating what is there.
+ *
+ * The synchronous path's entry point, unchanged in signature and in the bytes
+ * it produces. Returns 0 on success, non-zero if capture was off, ran on
+ * another thread, held an open task, produced no task, or the file could not be
+ * written — including a failure that only surfaces at flush or close.
  */
 int dep_gen_host_graph_emit(const char *deps_json_path);
 }

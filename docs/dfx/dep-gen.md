@@ -169,8 +169,11 @@ With `Worker(collect_across_runs=True)` on a level-3 worker, a
 own boundary — the receive drain and the terminal read — and hands the replay,
 the serialization and the file write to one background writer, so the host
 finishing run N can overlap run N+1's device execution. Device operators stay
-serial and diagnostic exclusivity is unchanged. Off by default; `host_build_graph`
-builds its graph on the host and is not affected.
+serial and diagnostic exclusivity is unchanged. Off by default.
+
+`host_build_graph` is covered too, by §3.2 — its graph is finished on the host
+inside `submit`, so what moves off the submit path there is the serialization and
+the write, not a device boundary.
 
 **`run()` returning no longer means `deps.json` exists.**
 `Worker.flush_diagnostics()` is the barrier that says the files up to that point
@@ -188,6 +191,66 @@ Publication is atomic: the graph is written to `deps.json.tmp` opened
 name. A destination already holding a `deps.json` therefore fails the run with
 that file untouched, and a partly written graph is never visible under the real
 name.
+
+### 3.2 Background output for the host-built graph
+
+`host_build_graph` builds the whole graph on the host, during `submit`, and the
+default path serializes and writes `deps.json` right there — before the run is
+even launched. With `collect_across_runs=True` on a level-3 worker the finished
+graph is instead **moved** out of the capturing thread's storage into an export
+the runner owns, and a background writer publishes it. The hand-off still happens
+on the thread that built the graph: capture lives in thread-local state, so that
+is the only thread that can hand it over (`test_dep_gen_thread_affinity.py`
+exists because an emit moved to drain produced no file at all).
+
+What authorizes publication is therefore **a completed host orchestration**, not
+a successful run: the device contributes nothing to this graph, and there is no
+device record to reconcile or terminal state to read. So a `deps.json` can exist
+for a run that later fails on the device, that was never launched because a
+later step of `prepare` failed, or whose device completion is unknown. That is
+what the default path already does, and it is deliberately **not** the
+`tensormap_and_ringbuffer` rule above, whose quarantine exists because its
+records live on the device.
+
+Three states are told apart, where the default path has one error code for all
+of them:
+
+| At hand-off | Result |
+| ----------- | ------ |
+| the orchestration ran on this thread and closed every task | published — an orchestration that submitted **no** tasks publishes a well-formed empty graph |
+| capture was never armed, or the orchestration ran on another thread | no file, and the flush reports it |
+| a task was opened and never closed | no file, and the flush reports it |
+
+**Retention bounds what is kept, not what may run.** At most two unpublished
+graphs, against the same 256 MiB per-exporter budget, charged from the actual
+capacity of the five vectors an export holds plus a 1 MiB serialization
+reservation and a fixed destination per slot. When both slots are taken, or a
+graph is larger than the budget can accept, **the calling thread publishes it
+immediately** rather than failing the run — that submit waits for the write, as
+it did before this existed, and nothing is dropped. A legitimately large graph
+can exceed the budget and take that route.
+
+The budget covers what is retained after the hand-off and nothing else: the
+capture's own peak during `submit`, an inline write's file buffering, thread
+stacks, allocator metadata and the file on disk are all outside it.
+
+Both routes publish the same way — an exclusive `deps.json.tmp`, the stream
+flushed and closed with its state checked afterwards, then `link`, which never
+replaces a name. So an occupied destination fails that run's diagnostic with the
+existing file untouched, and a partly written graph is never visible under the
+real name. A temporary left behind by something else makes the publication refuse
+rather than be deleted. The output directory plus the file name must fit 4096
+bytes; a longer one is refused by name.
+
+`flush_diagnostics()` waits for every publication already under way and reports
+sticky failures; `close()` closes admission, drains, and joins the writer. A
+flush does not wait for a `submit` racing it that has not yet declared a write —
+such a call finishes after the flush's linearization point, like any later
+submit. No bounded-`close()` promise on a slow disk.
+
+First step is local level 3 on a2a3/a5 (onboard and sim). Level 2 — which is
+what `tests/st/{a2a3,a5}/host_build_graph/dfx/dep_gen/test_dep_gen.py` uses —
+keeps the synchronous path, and so does every run with the option off.
 
 ### One whole graph, or no file
 
@@ -242,7 +305,10 @@ The default path is unchanged in filename, location, schema and the bytes a
 clean run produces, and it still writes at the original boundary. What changed
 is that the refusals listed above now withhold the file there too, reported on
 that path's existing log channel — no sticky error is added, the run's return
-code does not change, and no 256 MiB limit applies.
+code does not change, and no 256 MiB limit applies. The host-built graph's
+default path is unchanged in the same way, including its overwrite behaviour;
+what it gained is the write-error check the stream only reports at flush and
+close, which was previously read one step too early.
 
 ## 4. Output: `deps.json`
 
