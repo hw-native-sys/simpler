@@ -11614,11 +11614,14 @@ class Worker:
         to here exist now*. Raises ``RuntimeError`` when a promised file is
         missing, when a child reports a failure, or when the wait ran out.
 
-        What counts as success is the collector's own rule, and the three that
+        What counts as success is the collector's own rule, and the six that
         retain runs answer differently:
 
         - the **chip swimlane** artifact carries its own verdict, so a
           published partial counts as success — the file says it is partial.
+          A fatal collector fails this call even when no epoch carries a
+          verdict yet: a writer that dies before sealing anything leaves no
+          row and no file.
         - **PMU** writes a CSV, which has nowhere to record that. So a PMU run
           whose records or transport cut could not be proved complete fails
           this call even though its rows were published, and a PMU failure is
@@ -11636,6 +11639,24 @@ class Worker:
           are sticky for the device runner's life too, and deleting the
           evidence files does not clear them. A run's payload file may exist
           and still be growing; the manifest is what publication produces.
+        - **scope stats** publishes ``scope_stats/scope_stats.jsonl`` per run,
+          and is stricter than the swimlane: a lost record, a device fatal or a
+          count it cannot know each fail this call even though the file exists.
+          A run held in quarantine fails it immediately rather than waiting, as
+          no deadline can produce the collector-thread join that run needs.
+        - **dep_gen** on a device-orchestrating runtime publishes one
+          ``deps.json`` per run from the records the device produced. One whole
+          graph or no file: an unflushed device buffer, a dropped record or a
+          count it cannot reconcile withholds the file and fails this call,
+          because ``deps.json`` has nowhere to say it is partial.
+        - the **host-built graph** on ``host_build_graph`` publishes that same
+          ``deps.json``, from structure the host builds during ``submit``. What
+          authorizes it is a completed host orchestration, not a completed run,
+          so the file describes what was going to execute and can exist for a
+          run that never launched or that later failed on the device. A graph
+          of no tasks is published rather than withheld. A capture that did not
+          reach the sealing thread, or a task left open, writes no file and
+          fails this call.
 
         Callable only with no run outstanding, and never from inside a graph
         callback: it seals whole runs, which is not something a run may do to
@@ -11646,9 +11667,11 @@ class Worker:
 
         ``timeout`` bounds the waits it is passed to and is re-checked before
         each child; it does **not** bound the untimed acquisitions — the two
-        leases and the C++ mailbox mutex — so the call can exceed it. Both
-        retaining collectors are serviced inside one child's share of it, and
-        both are attempted even if the first fails.
+        leases and the C++ mailbox mutex — so the call can exceed it. Inside a
+        child every retaining collector is served from that child's single
+        remaining budget rather than from a fresh copy of it, so the bound does
+        not multiply by the number of collectors. Each is attempted even after
+        an earlier one fails, and the error names every collector that failed.
         """
         if self.level != 3:
             raise RuntimeError("Worker.flush_diagnostics: only a level-3 worker with local chip children supports it")

@@ -1549,20 +1549,34 @@ class ChipWorker:
                 earlier run's records intact. Profile at the level you want from
                 the first collected run.
 
-                Completion has two halves: a run returning means its own
-                per-run files are written, `flush_diagnostics()` returning means
-                the background record files are published. Wait for every run,
-                then flush, then convert.
+                `run()` returning does not mean that run's diagnostic files are
+                complete: the sealing and the write it moved off the boundary
+                may still be in flight. `flush_diagnostics()` returning is the
+                statement that every artifact its enabled collectors promised up
+                to that point is published, and it raises rather than returns
+                over one of those that is missing. So wait for every run, then
+                flush, then read what each collector promises — the swimlane,
+                the args dump, scope stats, `deps.json`, PMU's CSV.
+
+                What a collector promises is its own rule rather than a file per
+                run: a PMU run proved to have produced no records writes no
+                `pmu.csv` and is still a success, so an absent file is not by
+                itself a failure. `Worker.flush_diagnostics` carries each
+                collector's rule. `deps.json` on `host_build_graph` is a further
+                step removed from the run, because the graph is built during
+                `submit`: the file describes what was going to execute, and can
+                be published for a run that never launched or that later failed
+                on the device.
 
                 With args dump enabled this also moves that run's argument
                 *content*: its payload file and its manifest are finished in
-                the background, so `run()` returning no longer means either is
-                complete and the payload file may still be growing. Each run
-                owns an exclusive `args.e<epoch>.bin`, the manifest names it
-                through the `bin_file` field readers already use, and nothing
-                is deleted — a reused output prefix accumulates files. A run
-                that dies without an observed device fence is **not** recovered
-                on this path, which the default path does do; see
+                the background, so the payload file may still be growing when a
+                reader opens it, and the manifest is what publication produces.
+                Each run owns an exclusive `args.e<epoch>.bin`, the manifest
+                names it through the `bin_file` field readers already use, and
+                nothing is deleted — a reused output prefix accumulates files. A
+                run that dies without an observed device fence is **not**
+                recovered on this path, which the default path does do; see
                 docs/dfx/args-dump.md.
             dfx_session: The name this option shipped under, accepted as an
                 alias. Giving both spellings different values is an error.
