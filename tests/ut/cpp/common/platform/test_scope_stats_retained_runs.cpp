@@ -420,13 +420,23 @@ TEST(ScopeStatsRetainedRuns, UnprovenCompletionPublishesNothingAndDiscardsAfterT
 
 /**
  * Three consecutive runs each publish their own artifact, holding only their
- * own records, and `flush_diagnostics` is what makes them all present.
+ * own records. Publication of the first two returns the slots needed for the
+ * third admission; closing a run alone does not release its slot.
  */
 TEST(ScopeStatsRetainedRuns, ConsecutiveRunsEachPublishTheirOwnRecords) {
     RetainedFixture fx("three-artifacts");
+    fx.collector.pause_writer_for_test(true);
     const char *names[] = {"run-a", "run-b", "run-c"};
     const char *sites[] = {"first.cpp", "second.cpp", "third.cpp"};
     for (int i = 0; i < 3; i++) {
+        SCOPED_TRACE(names[i]);
+        if (i == 2) {
+            ASSERT_EQ(fx.collector.retained_run_stats_for_test().published, 0u);
+            fx.collector.pause_writer_for_test(false);
+            std::string error;
+            ASSERT_TRUE(fx.flush(&error)) << error;
+            ASSERT_EQ(fx.collector.retained_run_stats_for_test().published, 2u);
+        }
         const uint64_t epoch = 4500 + static_cast<uint64_t>(i);
         ASSERT_TRUE(fx.begin(epoch, fx.root.prefix(names[i])));
         fx.produce(epoch, /*pairs=*/i + 1, /*flush_at_end=*/true, sites[i]);
