@@ -109,11 +109,40 @@ holding the recording invocation's number, and later cache hits replay that
 number. Forwarding never converts, which is what keeps a correct pass-through
 silent.
 
+Because freezing is what a value read does, **a value read requires parameter
+`i` to be static.** A dynamic parameter names a value the caller may change, so
+a number taken out of one would be the recording invocation's, replayed for
+every invocation after it. There is no fallback from that either — the ordinary
+path runs the same body and reaches the same read — so `args.scalar<T>(i)`
+asserts on a dynamic parameter rather than warning, and the assertion's stack
+trace names the read. The check is a run-time one because a parameter's
+declaration is a run-time value and `i` is usually a loop variable.
+
+A body therefore has two shapes available per parameter, and which one it needs
+is a statement about the value:
+
+| The body | Boundary side | Body side |
+| -------- | ------------- | --------- |
+| only passes the parameter on | `add_scalar(v)` — dynamic | `auto x = args.scalar(i);` then `add_scalar(x)` |
+| computes with the number | `add_static_scalar(v)` — static | `T x = args.scalar<T>(i);` |
+
+Holding a handle in a named local is safe, and is the whole of the first shape:
+a handle carries its own origin, so a slot it is forwarded into still names
+parameter `i` however many locals it passed through. That also means `auto` is
+the audit — `InheritableScalar` converts to nothing, so a use that is *not* a
+pure forward fails to compile.
+
+The second shape costs reuse whenever the value moves, and the cost is not paid
+once — see **Supported dynamic and static data** below. Prefer the first shape
+unless the body genuinely needs the number.
+
 Because the diagnostic is the absence of a conversion rather than a
 deprecation, it has no blind spot. A value read inside third-party template
 code — `EXPECT_EQ(args.scalar(i), v)` is the case that motivated this — fails
 there too, where a `[[deprecated]]` attribute would have been suppressed for
-being instantiated inside a system header.
+being instantiated inside a system header. To inspect a slot's raw bits without
+reading it as a parameter — which a test may legitimately want on a dynamic one
+— use `pack_scalars()`, which hands out the slots rather than the parameters.
 
 When a value read is what you meant, say so with `args.scalar<T>(i)`. It
 applies `to_u64`'s actual inverse, which `static_cast` is not — a float slot
@@ -121,21 +150,29 @@ holds a bit pattern, so `static_cast<float>` of `1.0f`'s pattern yields
 `1065353216.0`. An enum has no other spelling at all:
 `static_cast<DataType>(args.scalar(i))` does not compile, because the handle
 converts to nothing and `static_cast` has no conversion to apply.
-`InheritableScalar::to<T>()` is the same read on a handle already in hand —
-reach for it when the parameter arrived as a function argument and the `Arg` it
-came from is no longer reachable.
 
-Freezing on purpose has a second spelling, and the two do different things.
-`args.scalar<T>(i)` hands the body a `T` to compute with, and whatever the
-body does with it afterwards is ordinary host code.
-`task_args.add_static_scalar(args.scalar(i))` instead forwards the parameter
-into a slot and drops its origin: the slot carries the same bit pattern a
-forward would have, but is recorded as static Definition data rather than
-following the parameter. Reach for the first when the body needs the number, the
-second when a destination — typically a nested Graph's boundary — should hold
-the value the enclosing parameter had at record time.
+`args.scalar<T>(i)` is also the *only* spelling that reads a parameter as a
+value. A handle offers no value read at all, so once a parameter has been
+passed on as one, forwarding is all that is left to do with it. That is not a
+restriction on what you can express — the `Arg` is where a read can be checked
+against the slot's declaration, and a handle carries no way to tell a dynamic
+parameter from a static one, because `scalar(i)` hands out a self-pointing
+origin either way.
 
-A derived value freezes the same way, and needs the same explicit read:
+Freezing on purpose goes through that same read. `add_static_scalar` rejects an
+`InheritableScalar` at compile time: a handle names a parameter, so declaring
+the handle static would freeze whatever value that parameter holds right now
+without the body ever saying it read one. Say
+`task_args.add_static_scalar(args.scalar<uint64_t>(i))` instead — the read takes
+the value, `add_static_scalar` declares the destination slot static, and the
+slot is recorded as Definition data holding the value the enclosing parameter
+had at record time. Reach for a bare `args.scalar<T>(i)` when the body needs the
+number to compute with, and for this pair when a destination — typically a
+nested Graph's boundary — should hold that value. `T` is `uint64_t` here because
+a boundary slot is 8 bytes and the destination's body is what interprets them.
+
+A derived value freezes the same way, and needs the same explicit read — and so
+the same static declaration on the parameter it derives from:
 `args.scalar(i) + 1` does not compile, `args.scalar<uint64_t>(i) + 1` does and
 is frozen. Compute it before constructing the boundary and pass it as its own
 parameter, perform the transformation in a kernel, or use a construction
@@ -161,9 +198,13 @@ why it cannot be diagnosed instead:
 ## Supported dynamic and static data
 
 - Boundary ChipTensor addresses may change for every invocation.
-- Boundary scalar values may change for every invocation. Their count is fixed
-  by the recorded boundary contract. Unused boundary scalars are allowed and do
-  not create internal scalar patches.
+- A **dynamic** boundary scalar's value may change for every invocation. A
+  **static** one may not: its value is part of the condition the Definition is
+  reused under, so a changed value takes the ordinary path rather than replaying
+  the old number. The warning names the parameter index and both values. Their
+  count is fixed by the recorded boundary contract, and so is each parameter's
+  declaration. Unused boundary scalars are allowed and do not create internal
+  scalar patches.
 - A Graph boundary contains at least one ChipTensor.
 - Construction parameters are part of Graph identity and may control the
   function's task count, kernel selection, or other structural choices.
@@ -228,6 +269,23 @@ normally for that invocation. It never reuses heap offsets recorded for a
 different shape. Debug builds also assert at these unsupported boundaries so
 development catches a violated fixed-shape contract immediately; the ordinary
 path remains the defensive release-build behavior.
+
+**A mismatch is not retried, and for a published key it is permanent.** The
+Definition cache holds one record per Graph key and nothing evicts or replaces
+it, and the cache-hit path returns as soon as the match fails rather than
+falling through to recording. So every later invocation carrying the value that
+did not match repeats the same sequence: find the Definition, fail the match,
+warn, and run the body itself. The run stays correct — the ordinary path
+computes from the caller's own arguments — but the key has lost Definition reuse
+for the rest of the run.
+
+This is what bounds `add_static_scalar` on a boundary. Declaring a parameter
+static is safe whatever its value does, and that is the point of the
+declaration; it is only *free* while the value is genuinely fixed for the run.
+A parameter that varies per invocation and is merely frozen by habit will match
+on the recording invocation and miss on every one after it, which costs more
+than the body it was meant to skip. Forward such a parameter instead — a
+forwarded slot is refreshed on replay, so the Definition keeps being reused.
 
 ## Qwen decoder-layer example
 

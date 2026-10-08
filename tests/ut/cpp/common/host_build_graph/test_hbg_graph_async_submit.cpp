@@ -21,6 +21,7 @@
 #include <mutex>
 #include <set>
 #include <thread>
+#include <vector>
 
 #include "host_build_graph/graph_recorder_pool.h"
 #include "orchestration_api.h"
@@ -169,7 +170,12 @@ bool fake_graph_prepare(RuntimeContext *rt, void *recording_handle, const GraphT
         fake.recorded_tensor_storage = &tensor;
     }
     if (args.scalar_count() > 0) {
-        fake.recorded_scalar = args.scalar<uint64_t>(0);
+        // pack_scalars, not scalar<uint64_t>(0): this records what the boundary holds, and a
+        // boundary parameter is usually dynamic — reading one as a value is the freeze that
+        // Arg::scalar<T> refuses.
+        std::vector<uint64_t> packed(static_cast<size_t>(args.scalar_count()));
+        args.pack_scalars(packed.data());
+        fake.recorded_scalar = packed[0];
     }
     if (fake.gate_four_prepares) {
         fake.cv.notify_all();

@@ -324,7 +324,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             ctx.reset();
             ctx.add_input(query, key_cache, value_cache, block_table);
             ctx.add_output(out);
-            ctx.add_scalar(
+            // Static because process_qtile_scope reads every one of them back as a value.
+            // No slot here follows a parameter -- this Arg is never submitted, so an lvalue
+            // in the list is a plain host local rather than something a later invocation
+            // refreshes, which is what add_scalar would otherwise infer from it.
+            ctx.add_static_scalar(
                 b_idx, q_idx, q_head_num, q_tile, head_dim, block_size, block_num, scale_value, bn_this_batch, cur_seq,
                 static_cast<uint64_t>(data_type)
             );

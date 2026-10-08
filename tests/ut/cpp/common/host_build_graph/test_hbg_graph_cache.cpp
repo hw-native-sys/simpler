@@ -29,6 +29,7 @@
 #include "graph_image_view.h"
 #include "runtime_status/error_names.h"
 #include "scheduler/scheduler.h"
+#include "task_interface/assert_compat.h"
 #include "host_build_graph/task_id.h"
 
 namespace {
@@ -387,6 +388,17 @@ static_assert(
 // The slot array is handed out as void*, so index it the way recording does.
 const void *slot_addr(const void *base, int32_t i) { return static_cast<const uint64_t *>(base) + i; }
 
+// The raw bits in slot i. A test that inspects a *dynamic* parameter cannot use
+// scalar<T>(i): that spelling reads a parameter as a value, which is exactly what a dynamic
+// parameter refuses — the number would be frozen. pack_scalars hands out the slots
+// themselves, which is what an inspection wants.
+template <typename ArgT>
+uint64_t slot_value(const ArgT &args, int32_t i) {
+    std::vector<uint64_t> packed(static_cast<size_t>(args.scalar_count()));
+    args.pack_scalars(packed.data());
+    return packed[static_cast<size_t>(i)];
+}
+
 // A boundary parameter must name no origin of its own. That is what makes the boundary's
 // slot array the basis recording resolves against: scalar(i) then folds to
 // &scalars_[i], and subtracting the base yields i. Were a boundary parameter to name an
@@ -435,7 +447,7 @@ TEST(GraphScalarProvenance, ForwardedScalarRetainsBoundarySource) {
 
     EXPECT_TRUE(task_args.scalar_dynamic(0));
     EXPECT_EQ(task_args.scalar_origin(0), slot_addr(boundary_args.scalar_slot_base(), 1));
-    EXPECT_EQ(task_args.scalar<uint64_t>(0), uint64_t{18});
+    EXPECT_EQ(slot_value(task_args, 0), uint64_t{18});
 }
 
 TEST(GraphScalarProvenance, ForwardedScalarNamesOriginThroughAnIntermediary) {
@@ -452,14 +464,15 @@ TEST(GraphScalarProvenance, ForwardedScalarNamesOriginThroughAnIntermediary) {
     EXPECT_EQ(task_args.scalar_origin(0), slot_addr(boundary_args.scalar_slot_base(), 1));
 }
 
-TEST(GraphScalarProvenance, FreezingAParameterDropsItsOrigin) {
+TEST(GraphScalarProvenance, FreezingAParameterNeedsAnExplicitRead) {
     GraphTaskArgs boundary_args;
     boundary_args.add_scalar(uint32_t{17}, uint32_t{18});
     CoreTaskArgs task_args;
 
-    // add_static_scalar resolves the handle to its value: this is how an enclosing Graph's
-    // parameter is deliberately frozen rather than followed.
-    task_args.add_static_scalar(boundary_args.scalar(1));
+    // A handle cannot be declared static -- it names a parameter. Reading the slot as a
+    // value takes the number, and this is how an enclosing Graph's parameter is
+    // deliberately frozen rather than followed.
+    task_args.add_static_scalar(boundary_args.scalar<uint64_t>(1));
 
     EXPECT_FALSE(task_args.scalar_dynamic(0));
     EXPECT_EQ(task_args.scalar_origin(0), nullptr);
@@ -515,7 +528,7 @@ TEST(GraphScalarProvenance, AValueOutlivesItsOrigin) {
     // The origin now dangles, and that is by design: the value was copied at add_scalar
     // time, and the address is only ever compared, never read through.
     EXPECT_TRUE(task_args.scalar_dynamic(0));
-    EXPECT_EQ(task_args.scalar<uint64_t>(0), uint64_t{42});
+    EXPECT_EQ(slot_value(task_args, 0), uint64_t{42});
 }
 
 TEST(GraphScalarProvenance, TaskSlotsInheritFromEachOther) {
@@ -532,7 +545,7 @@ TEST(GraphScalarProvenance, TaskSlotsInheritFromEachOther) {
     // a[0] itself. A chain is therefore one hop and recording resolves it without a walk.
     EXPECT_TRUE(b.scalar_dynamic(0));
     EXPECT_EQ(b.scalar_origin(0), slot_addr(boundary_args.scalar_slot_base(), 1));
-    EXPECT_EQ(b.scalar<uint64_t>(0), uint64_t{18});
+    EXPECT_EQ(slot_value(b, 0), uint64_t{18});
 }
 
 TEST(GraphScalarProvenance, InheritingAValueSlotNamesThatSlot) {
@@ -545,7 +558,119 @@ TEST(GraphScalarProvenance, InheritingAValueSlotNamesThatSlot) {
     // a[0] names no origin, so it is itself the origin.
     EXPECT_TRUE(b.scalar_dynamic(0));
     EXPECT_EQ(b.scalar_origin(0), a.scalar_slot_base());
-    EXPECT_EQ(b.scalar<uint64_t>(0), uint64_t{7});
+    EXPECT_EQ(slot_value(b, 0), uint64_t{7});
+}
+
+// The read the defect went through. A body receives the boundary's parameter list, and a
+// number taken out of a dynamic parameter becomes ordinary host data: whatever the body
+// computes from it is fixed in the Definition, and every later invocation replays that
+// number instead of the one it passed. There is no fallback -- the ordinary path runs the
+// same body and reaches the same read -- so the read is refused rather than warned about.
+//
+// What a dynamic parameter is actually refreshed with on replay is
+// GraphExecutionReplay.ResubmissionRebuildsFromDefinition below: a second invocation's
+// task reads that invocation's own value, not the recorded one.
+TEST(GraphScalarProvenance, AValueReadOfADynamicParameterIsRefused) {
+    uint64_t caller_held = 4;
+    GraphTaskArgs caller_args;
+    caller_args.add_scalar(caller_held);
+    caller_args.add_static_scalar(uint64_t{9});
+
+    // The parameter list the body reads, not the caller's arguments: a dynamic parameter
+    // names itself only after this, and that is the object the recorded body resolves
+    // against.
+    GraphTaskArgs params;
+    params.gen_scalar_params_from_args(caller_args);
+
+    EXPECT_THROW(params.scalar<uint64_t>(0), AssertionError);
+    // Its static sibling in the same list reads, so what the refusal turns on is the
+    // declaration rather than the read.
+    EXPECT_EQ(params.scalar<uint64_t>(1), uint64_t{9});
+    // Forwarding is what the parameter is for, and it is what stays available.
+    EXPECT_TRUE(params.scalar_dynamic(0));
+    EXPECT_EQ(params.scalar(0).origin(), params.scalar_slot_base());
+}
+
+namespace {
+
+// The recorded side as the runtime builds it: the boundary's own parameter list, then the
+// capture over it. Going through both is the point -- a capture that disagreed with the
+// comparison would still pass a test that hand-built the recorded array.
+struct RecordedBoundaryScalars {
+    explicit RecordedBoundaryScalars(const GraphTaskArgs &args) {
+        params.gen_scalar_params_from_args(args);
+        graph_boundary_capture_scalars(match.data(), params);
+    }
+
+    GraphTaskArgs params;
+    std::array<GraphBoundaryScalarMatch, GRAPH_MAX_SCALAR_ARGS> match{};
+};
+
+}  // namespace
+
+// A dynamic parameter is refreshed out of this invocation's own payload, so a Definition
+// recorded against one stays valid however its value moved. This is what a whole-list
+// comparison got wrong: every boundary scalar of graph_execution's layers is dynamic and
+// changes per layer, so comparing them refused a Definition that was still correct.
+//
+// This is the admission half only. That the refreshed value is the one the task actually
+// receives is GraphExecutionReplay.ResubmissionRebuildsFromDefinition below.
+TEST(GraphBoundaryScalarCondition, EveryDynamicSlotMatchesWhateverItsValue) {
+    uint64_t left = 7;
+    uint64_t right = 11;
+    GraphTaskArgs recorded_args;
+    recorded_args.add_scalar(left, right);
+    const RecordedBoundaryScalars recorded(recorded_args);
+
+    uint64_t moved_left = 70;
+    uint64_t moved_right = 110;
+    GraphTaskArgs args;
+    args.add_scalar(moved_left, moved_right);
+
+    EXPECT_EQ(graph_boundary_scalar_mismatch(recorded.match.data(), args), -1);
+}
+
+TEST(GraphBoundaryScalarCondition, AStaticSlotHoldingItsValueMatches) {
+    GraphTaskArgs recorded_args;
+    recorded_args.add_static_scalar(uint64_t{4});
+    const RecordedBoundaryScalars recorded(recorded_args);
+
+    GraphTaskArgs args;
+    args.add_static_scalar(uint64_t{4});
+
+    EXPECT_EQ(graph_boundary_scalar_mismatch(recorded.match.data(), args), -1);
+}
+
+// Nothing refreshes a static slot on replay, so whatever the body read out of it is fixed in
+// the image. A different value is therefore a different Definition, and the index is what
+// tells the author which of a dozen parameters to look at.
+TEST(GraphBoundaryScalarCondition, AStaticSlotThatMovedNamesItsIndex) {
+    uint64_t dynamic_first = 1;
+    GraphTaskArgs recorded_args;
+    recorded_args.add_scalar(dynamic_first);
+    recorded_args.add_static_scalar(uint64_t{4});
+    const RecordedBoundaryScalars recorded(recorded_args);
+
+    uint64_t dynamic_moved = 99;
+    GraphTaskArgs args;
+    args.add_scalar(dynamic_moved);
+    args.add_static_scalar(uint64_t{8});
+
+    EXPECT_EQ(graph_boundary_scalar_mismatch(recorded.match.data(), args), 1);
+}
+
+// Same value, declared the other way. The declaration decides whether replay refreshes the
+// slot, so a Definition recorded under one of them says nothing about the other.
+TEST(GraphBoundaryScalarCondition, ADeclarationThatDiffersNamesItsIndex) {
+    uint64_t held = 4;
+    GraphTaskArgs recorded_args;
+    recorded_args.add_scalar(held);
+    const RecordedBoundaryScalars recorded(recorded_args);
+
+    GraphTaskArgs args;
+    args.add_static_scalar(held);
+
+    EXPECT_EQ(graph_boundary_scalar_mismatch(recorded.match.data(), args), 0);
 }
 
 TEST(GraphExecutionStorage, ComputesAlignedExactSize) {

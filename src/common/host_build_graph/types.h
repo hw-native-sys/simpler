@@ -208,23 +208,15 @@ public:
 
     constexpr const void *origin() const { return origin_; }
 
-    // Read this handle as a value, with to_u64's actual inverse applied. Arg::scalar<T>(i)
-    // is the spelling when the Arg is in hand; this one is for a handle that has already
-    // been passed on -- a function parameter, say -- where the Arg it came from is no
-    // longer reachable. Both freeze the parameter: whatever the body computes from the
-    // number is ordinary host code, and the destination slot no longer follows the source.
-    //
-    // static_cast is not that inverse: a float slot holds a bit pattern, so
-    // static_cast<float> of 1.0f's pattern yields 1065353216.0. An enum has no other
-    // spelling at all -- the handle converts to nothing, so static_cast<DataType> of one
-    // has no conversion to apply.
-    template <typename ScalarT>
-    ScalarT to() const {
-        static_assert(sizeof(ScalarT) <= sizeof(uint64_t), "to<T>: type must fit in the slot");
-        return from_u64<ScalarT>(bits_);
-    }
-
 private:
+    // A handle offers no value read at all. It cannot tell a dynamic parameter from a
+    // static one -- Arg::scalar(i) hands out a self-pointing origin either way -- so a read
+    // taken from one could not be checked against the slot's declaration, where
+    // Arg::scalar<T>(i) has the Arg and can. Forwarding is all a handle is for, and
+    // add_scalar_one copies these bytes across as they are.
+    template <size_t MaxT, size_t MaxS>
+    friend class Arg;
+
     uint64_t bits_;
     const void *origin_;
 };
@@ -511,24 +503,34 @@ public:
      * reads it back through scalar_dynamic() and records the slot as static Definition
      * data instead of following a parameter.
      *
-     * On a Graph's own parameter list it is inert for now. gen_scalar_params_from_args
-     * carries it across, but graph_full_key is callable_hash and graph_key, so no lookup
-     * compares a scalar value; callers accordingly declare every parameter dynamic. This
-     * is what they will say otherwise with, once a scalar value is part of the condition
-     * a Definition is reused under -- which must not precede their migration (#2170),
-     * since a parameter a body freezes while declared dynamic would then match on a
-     * Definition holding a stale number.
+     * On a Graph's own parameter list it decides two things, and
+     * gen_scalar_params_from_args carries it onto the boundary to decide them. Nothing
+     * refreshes a static slot on replay, so a body may read it as a value where
+     * Arg::scalar<T> refuses a dynamic one; and the value a static slot held at record
+     * time joins the condition the Definition is reused under, since whatever the body
+     * computed from it is fixed in the image.
      *
-     * An InheritableScalar passed here is resolved to its value rather than followed --
-     * this is how an enclosing Graph's parameter is deliberately frozen into an inner
-     * boundary.
+     * Declare a parameter static when its value is fixed for the run. A static value that
+     * moves costs the key its Definition for the rest of the run -- the match fails,
+     * nothing replaces the published record, and every later invocation runs the body
+     * itself -- so a parameter that varies is forwarded rather than frozen.
+     *
+     * An InheritableScalar is rejected. A handle names a parameter, so declaring the
+     * handle static would freeze whatever value that parameter holds right now without
+     * the body ever saying it read one. Freezing an enclosing Graph's parameter into an
+     * inner boundary is spelled add_static_scalar(args.scalar<uint64_t>(i)): the read
+     * takes the value, and this declares the destination slot static.
      */
     template <typename... Args>
     void add_static_scalar(Args &&...args) {
         static_assert(sizeof...(Args) >= 1, "add_static_scalar: at least one argument required");
         static_assert(
-            ((is_supported_scalar_arg_v<Args> || is_inheritable_scalar_v<Args>) && ...),
-            "add_static_scalar: all types must be arithmetic, enum, or a Graph boundary scalar"
+            ((!is_inheritable_scalar_v<Args>) && ...),
+            "add_static_scalar: a Graph boundary scalar handle names a parameter and cannot be "
+            "declared static; read its value first with args.scalar<uint64_t>(i)"
+        );
+        static_assert(
+            (is_supported_scalar_arg_v<Args> && ...), "add_static_scalar: all types must be arithmetic or enum"
         );
         if (scalar_count_ + sizeof...(Args) > MaxS) {
             set_error(scalar_cap_msg());
@@ -559,17 +561,31 @@ public:
     // destination records is always one hop: "C inherits B, B inherits A" records C -> A.
     //
     // scalar<T>(i) for any other T reads the slot directly as T, with to_u64's actual
-    // inverse applied -- the same read InheritableScalar::to<T>() performs on a handle
-    // already in hand. static_cast on the pattern is not that inverse: a float slot holds a
+    // inverse applied. It is the only spelling that reads a parameter as a value: a handle
+    // offers no value read, because it cannot tell a dynamic parameter from a static
+    // one. static_cast on the pattern is not that inverse: a float slot holds a
     // bit pattern, so static_cast<float> of 1.0f's pattern yields 1065353216.0. An enum has
     // no other spelling at all -- the handle converts to nothing, so
     // static_cast<DataType>(scalar(i)) has no conversion to apply.
+    //
+    // A value read requires parameter i to be static. A dynamic one names a value the
+    // caller may change, and a number taken out of it becomes ordinary host data: whatever
+    // the body computes from it is fixed in the Definition, and every later invocation
+    // replays that number instead of the one it passed. The check is a run-time one because
+    // the declaration is a run-time value and i is usually a loop variable; the assertion's
+    // stack trace names the read.
     template <typename ScalarT = InheritableScalar>
     ScalarT scalar(int32_t i) const {
         if constexpr (is_inheritable_scalar_v<ScalarT>) {
             return {scalars_[i], scalar_inherited_[i] != nullptr ? scalar_inherited_[i] : &scalars_[i]};
         } else {
             static_assert(sizeof(ScalarT) <= sizeof(uint64_t), "scalar<T>: type must fit in the slot");
+            always_assert(
+                scalar_inherited_[i] == nullptr &&
+                "scalar<T>(i): this parameter is declared dynamic, so reading it as a value would "
+                "freeze what it holds now into the Definition. Forward it with scalar(i), or declare "
+                "it static with add_static_scalar where the boundary is built."
+            );
             return from_u64<ScalarT>(scalars_[i]);
         }
     }
@@ -640,12 +656,15 @@ private:
     template <bool Dynamic, typename T>
     void add_scalar_one(T &&value) {
         if constexpr (is_inheritable_scalar_v<T>) {
+            static_assert(
+                Dynamic, "an InheritableScalar is always a dynamic parameter: add_static_scalar rejects the handle, "
+                         "so freezing one goes through an explicit scalar<T>() read instead"
+            );
             // The value travels with the handle, so following the parameter costs no
-            // dereference of the origin -- and lets the origin dangle harmlessly. The
-            // forwarded slot holds the same 8 bytes whatever the source type was, so the
-            // read that pulls them out names uint64_t.
-            scalars_[scalar_count_] = value.template to<uint64_t>();
-            scalar_inherited_[scalar_count_] = Dynamic ? value.origin() : nullptr;
+            // dereference of the origin -- and lets the origin dangle harmlessly. A slot is
+            // 8 bytes whatever the source type was, so the bits copy across as they are.
+            scalars_[scalar_count_] = value.bits_;
+            scalar_inherited_[scalar_count_] = value.origin();
 #if SIMPLER_DFX
             // No host address to identify this slot by: it names a boundary parameter,
             // not a caller variable, so dump() cannot match it by pointer. The dtype is
@@ -935,8 +954,12 @@ struct ChipTaskArgs : Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS> {
             debug_assert(!t.manual_dep && t.version == 0);
             add_input(t);
         }
+        // An orchestration entry's scalars are the run's own values, not a Graph
+        // boundary's parameters, so no slot here follows anything. Declared rather than
+        // inferred from src.scalar(i)'s value category: that accessor has a by-value
+        // const overload and a by-reference non-const one.
         for (int32_t i = 0; i < src.scalar_count(); ++i) {
-            add_scalar(src.scalar(i));
+            add_static_scalar(src.scalar(i));
         }
     }
 };

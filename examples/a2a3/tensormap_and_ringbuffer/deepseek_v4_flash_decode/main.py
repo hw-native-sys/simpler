@@ -736,8 +736,8 @@ def _build_config(
     config.runtime_env.ring_task_window = runtime_env.get("ring_task_window", 0)
     config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
     config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
-    # An args-dump level, not a flag: 0=off, 1=partial, 2=full, 3=hybrid (what
-    # simpler_setup.tools.core_swimlane replays from).
+    # An args-dump level, not a flag: 0=off, 1=partial, 2=hybrid (what
+    # simpler_setup.tools.core_swimlane replays from), 3=full.
     config.enable_dump_args = dump_args
     config.enable_pmu = enable_pmu
     config.enable_dep_gen = enable_dep_gen
@@ -909,7 +909,7 @@ def parse_args(argv=None) -> argparse.Namespace:
         type=int,
         default=0,
         help="Dump per-task args at runtime. Level: 0=off, 1=partial (default when given "
-        "without a value), 2=full, 3=hybrid (what simpler_setup.tools.core_swimlane replays)",
+        "without a value), 2=hybrid (what simpler_setup.tools.core_swimlane replays), 3=full",
     )
     parser.add_argument(
         "--enable-pmu",

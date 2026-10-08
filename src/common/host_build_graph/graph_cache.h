@@ -14,6 +14,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <array>
 #include <type_traits>
 
 #include "host_build_graph/task_id.h"
@@ -84,6 +85,58 @@ inline bool rt_graph_args_cacheable(const GraphTaskArgs &args) {
         return false;
     }
     return true;
+}
+
+// One recorded boundary scalar, reduced to what a later invocation is checked against.
+//
+// `dynamic` is the caller's declaration, which gen_scalar_params_from_args carries onto the
+// boundary. `value` is what the slot held when the Definition was recorded.
+struct GraphBoundaryScalarMatch {
+    uint64_t value;
+    bool dynamic;
+};
+
+// Capture a boundary's scalars in the form graph_boundary_scalar_mismatch compares against.
+// `out` has room for params.scalar_count() entries.
+//
+// `params` is the boundary rather than the caller's arguments: gen_scalar_params_from_args
+// has already resolved every value and carried every declaration across, so this is the list
+// a later same-key submission is checked against.
+//
+// pack_scalars rather than a per-slot read, because a dynamic parameter hands out its
+// parameter rather than a value, and a comparison wants the raw slot either way.
+inline void graph_boundary_capture_scalars(GraphBoundaryScalarMatch *out, const GraphTaskArgs &params) {
+    std::array<uint64_t, GRAPH_MAX_SCALAR_ARGS> values{};
+    params.pack_scalars(values.data());
+    for (int32_t i = 0; i < params.scalar_count(); ++i) {
+        out[i] = {values[i], params.scalar_dynamic(i)};
+    }
+}
+
+// The first boundary scalar of `args` that does not present what the recording was captured
+// with, or -1 when every one of them agrees. A slot agrees when its declaration matches and,
+// where that declaration is static, its value does too.
+//
+// Only a static slot's value is compared, and that is the whole point of the check rather
+// than a weakening of it. A Definition's scalar source refs index this boundary and the
+// outer task's payload carries this invocation's values, so every dynamic slot comes back
+// refreshed on replay and what it held at record time binds nothing -- comparing it would
+// refuse a Definition that is still valid. A static slot is refreshed by nothing: whatever
+// the body read out of it is fixed in the image, so its value is part of the condition the
+// Definition is reused under.
+//
+// `recorded` is walked over args.scalar_count(), which both call sites pin equal to the
+// recorded count before reaching here.
+//
+// Nothing is logged: each call site words its own warning from the index, which keeps this a
+// predicate rather than a diagnostic.
+inline int32_t graph_boundary_scalar_mismatch(const GraphBoundaryScalarMatch *recorded, const GraphTaskArgs &args) {
+    for (int32_t i = 0; i < args.scalar_count(); ++i) {
+        const bool dynamic = args.scalar_dynamic(i);
+        if (dynamic != recorded[i].dynamic) return i;
+        if (!dynamic && args.scalar<uint64_t>(i) != recorded[i].value) return i;
+    }
+    return -1;
 }
 
 inline uint64_t rt_graph_make_key(uint64_t graph_id) { return graph_id; }

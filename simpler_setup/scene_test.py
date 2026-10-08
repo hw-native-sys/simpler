@@ -2517,9 +2517,9 @@ class SceneTestCase:
             default=0,
             help="Dump per-task args at runtime. Level: 0=off, 1=partial (only "
             "args selected via Arg::dump(...), default when given without a value), "
-            "2=full (all args), 3=hybrid (all tasks' JSON metadata; args marked "
-            "via Arg::dump(...) also write payload; used by "
-            "simpler_setup.tools.core_swimlane for Core swimlane simulator replay).",
+            "2=hybrid (all tasks' JSON metadata; args marked via Arg::dump(...) also "
+            "write payload; used by simpler_setup.tools.core_swimlane for Core "
+            "swimlane simulator replay), 3=full (every task, every arg).",
         )
         parser.add_argument(
             "--enable-dep-gen",

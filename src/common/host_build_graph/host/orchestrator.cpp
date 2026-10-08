@@ -431,6 +431,10 @@ struct GraphBoundary {
     // The match path walks the whole of this on every same-key submission, so it carries
     // the compared fields directly and is sized to the boundary, not to the cap.
     std::vector<GraphBoundaryParamMatch> param_match;
+    // The scalar half of the same question, one entry per parameter. Held apart from
+    // `params` because a published Definition outlives this boundary and needs its own
+    // copy, and both are then checked by one predicate.
+    std::vector<GraphBoundaryScalarMatch> scalar_match;
     // Bytes the parameters occupy in the recording's space. A sub-task's outputs are
     // bumped from GRAPH_RECORD_BASE + this, so the two regions of one simulated heap do
     // not overlap.
@@ -730,6 +734,10 @@ struct GraphDefinitionRecord {
     // path walks the whole of this on every same-key submission, so its size is a
     // per-submission cost: a boundary of N parameters is N contiguous cache lines.
     std::vector<GraphBoundaryParamMatch> boundary_match;
+    // The scalar half, one entry per parameter and compared by the same predicate the
+    // in-flight path uses. Also host-only: a scalar a replay refreshes is read out of the
+    // outer task's payload, so nothing here is in the image either.
+    std::vector<GraphBoundaryScalarMatch> boundary_scalar_match;
 };
 
 struct GraphHostState {
@@ -2107,6 +2115,34 @@ bool graph_boundary_arrangement_matches(const GraphBoundaryParamMatch *recorded,
     return true;
 }
 
+// The one-line diagnosis of a scalar mismatch. Shared by both match paths: they differ in
+// where they hold the recorded boundary, not in what a mismatch there means.
+//
+// The index is what makes this actionable -- a boundary of a dozen scalars gives the author
+// nowhere to look without it.
+void graph_boundary_warn_scalar_mismatch(
+    const GraphBoundaryScalarMatch &recorded, const GraphTaskArgs &args, int32_t index
+) {
+    if (args.scalar_dynamic(index) != recorded.dynamic) {
+        LOG_WARN(
+            "[GraphExecution] boundary scalar %d declaration differs from recording; using ordinary path: "
+            "recorded=%s actual=%s",
+            index, recorded.dynamic ? "dynamic" : "static", args.scalar_dynamic(index) ? "dynamic" : "static"
+        );
+        return;
+    }
+    // Reaching here means the declarations agree and the values did not, which
+    // graph_boundary_scalar_mismatch only reports for a slot it found static. That is what
+    // makes the scalar<uint64_t> read below legal: Arg::scalar<T> refuses a dynamic
+    // parameter, so widening this branch to cover a declaration mismatch would trip it.
+    LOG_WARN(
+        "[GraphExecution] boundary scalar %d is declared static and its value moved; using ordinary path: "
+        "recorded=%llu actual=%llu",
+        index, static_cast<unsigned long long>(recorded.value),
+        static_cast<unsigned long long>(args.scalar<uint64_t>(index))
+    );
+}
+
 bool graph_boundary_matches(
     const GraphDefinition &definition, const GraphDefinitionRecord &record, const GraphTaskArgs &args
 ) {
@@ -2117,6 +2153,23 @@ bool graph_boundary_matches(
             args.tensor_count(), definition.boundary_tensor_count, args.scalar_count(),
             definition.boundary_scalar_count, args.explicit_dep_count()
         );
+        return false;
+    }
+    // Before the tensors, because it is the cheaper half and the likelier reject: a static
+    // scalar whose value moved is a declared fallback, where a tensor whose geometry moved is
+    // a contract this runtime does not support. That asymmetry is also why no debug_assert
+    // sits beside this one.
+    //
+    // The count checked above is the image's copy while the array walked here is the host
+    // record's, so state the invariant locally: both are filled from the same
+    // bound_boundary().params.scalar_count() when the Definition is published, which is two
+    // hops away from either reader. The tensor half below indexes the same way.
+    debug_assert(
+        record.boundary_scalar_match.size() == static_cast<size_t>(definition.boundary_scalar_count) &&
+        "a published record's scalar match array is sized by the boundary the image counted"
+    );
+    if (const int32_t i = graph_boundary_scalar_mismatch(record.boundary_scalar_match.data(), args); i >= 0) {
+        graph_boundary_warn_scalar_mismatch(record.boundary_scalar_match[i], args, i);
         return false;
     }
     for (int32_t i = 0; i < args.tensor_count(); ++i) {
@@ -2167,6 +2220,14 @@ bool graph_boundary_matches(
 bool graph_boundary_matches(const GraphBoundary &boundary, const GraphTaskArgs &args) {
     if (args.scalar_count() != boundary.params.scalar_count() || args.explicit_dep_count() != 0 ||
         args.tensor_count() != boundary.params.tensor_count()) {
+        return false;
+    }
+    // The one diagnosed mismatch on this path. The structural ones stay silent because a
+    // same-key submission whose shape differs is an ordinary outcome of the key folding only
+    // construction parameters, while a static scalar whose value moved is the author's
+    // declaration failing to hold -- the same reason the published path words it.
+    if (const int32_t i = graph_boundary_scalar_mismatch(boundary.scalar_match.data(), args); i >= 0) {
+        graph_boundary_warn_scalar_mismatch(boundary.scalar_match[i], args, i);
         return false;
     }
     for (int32_t i = 0; i < args.tensor_count(); ++i) {
@@ -2853,6 +2914,8 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
     // Values resolved, declarations carried over. A dynamic parameter names itself, so
     // `params` stays the basis recording resolves against.
     boundary.params.gen_scalar_params_from_args(args);
+    boundary.scalar_match.resize(static_cast<size_t>(boundary.params.scalar_count()));
+    graph_boundary_capture_scalars(boundary.scalar_match.data(), boundary.params);
     boundary.params.launch_spec = args.launch_spec;
     boundary.params.set_allow_early_resolve(args.allow_early_resolve());
     if (args.task_timing_slot() != TASK_TIMING_SLOT_NONE) {
@@ -3005,6 +3068,7 @@ bool OrchestratorState::graph_end() {
         // The counts are not copied: they are in the image, where the device checks this
         // invocation's argument counts against them.
         record.boundary_match = recording->bound_boundary().param_match;
+        record.boundary_scalar_match = recording->bound_boundary().scalar_match;
         ORCH_PHASE_END(HostPhaseKind::OrchBuildDefinition, recording->task_count);
     }
     const GraphDefinition *header = built ? graph_record_definition(*state, record) : nullptr;

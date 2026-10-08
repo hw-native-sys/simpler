@@ -46,8 +46,8 @@ class TestCallConfig:
         assert config.enable_chip_swimlane == 2
         config.enable_chip_swimlane = False
         assert config.enable_chip_swimlane == 0
-        # enable_dump_args is likewise a level (0=off, 1=partial, 2=full,
-        # 3=hybrid): `True` maps to level 1 (partial), explicit ints
+        # enable_dump_args is likewise a level (0=off, 1=partial, 2=hybrid,
+        # 3=full): `True` maps to level 1 (partial), explicit ints
         # select the level.
         config.enable_dump_args = True
         assert config.enable_dump_args == 1
