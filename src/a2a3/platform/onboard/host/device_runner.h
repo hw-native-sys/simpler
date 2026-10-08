@@ -153,16 +153,6 @@ public:
     void dep_gen_finish_retained() override;
 
     /**
-     * Cleanup all resources
-     *
-     * Frees all device memory, destroys streams, and resets state.
-     * Use this for final cleanup when no more tests will run.
-     *
-     * @return 0 on success, error code on failure
-     */
-    int finalize() override;
-
-    /**
      * a2a3 fills the AIC_CTRL per-core register table and the FFTS base
      * address. The register table is allocated on `mem_alloc_`; the FFTS
      * address is a query result and owns nothing.
@@ -230,6 +220,8 @@ public:
     size_t run_stream_set_create_count() const override { return run_streams_.created_count(); }
 
 private:
+    int finalize_impl() override;
+
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
     // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached

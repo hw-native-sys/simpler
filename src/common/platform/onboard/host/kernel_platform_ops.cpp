@@ -36,6 +36,18 @@ int get_current_device(void *, int *device_id) noexcept {
     return 0;
 }
 
+int get_current_context(void *, void **current) noexcept {
+    aclrtContext context = nullptr;
+    const aclError rc = aclrtGetCurrentContext(&context);
+    if (rc != ACL_SUCCESS) {
+        LOG_ERROR("kernel context: aclrtGetCurrentContext failed: %d", static_cast<int>(rc));
+        ACL_LOG_ERROR_DETAIL(rc);
+        return static_cast<int>(rc);
+    }
+    *current = context;
+    return 0;
+}
+
 int create_hidden_stream(void *, void **stream) noexcept {
     rtStream_t created = nullptr;
     const rtError_t rc = rtStreamCreate(&created, 0);
@@ -85,6 +97,7 @@ int destroy_event(void *, void *event) noexcept {
 KernelContextOps make_onboard_kernel_context_ops() {
     KernelContextOps ops{};
     ops.get_current_device = &get_current_device;
+    ops.get_current_context = &get_current_context;
     ops.create_hidden_stream = &create_hidden_stream;
     ops.destroy_hidden_stream = &destroy_hidden_stream;
     ops.create_event = &create_event;

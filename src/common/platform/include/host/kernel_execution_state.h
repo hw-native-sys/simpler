@@ -33,6 +33,7 @@
 struct KernelContextOps {
     void *context{nullptr};
     int (*get_current_device)(void *context, int *device_id) noexcept {nullptr};
+    int (*get_current_context)(void *context, void **current) noexcept {nullptr};
     int (*create_hidden_stream)(void *context, void **stream) noexcept {nullptr};
     int (*destroy_hidden_stream)(void *context, void *stream) noexcept {nullptr};
     /**
@@ -46,8 +47,8 @@ struct KernelContextOps {
     int (*destroy_event)(void *context, void *event) noexcept {nullptr};
 
     bool valid() const {
-        return get_current_device != nullptr && create_hidden_stream != nullptr && destroy_hidden_stream != nullptr &&
-               create_event != nullptr && destroy_event != nullptr;
+        return get_current_device != nullptr && get_current_context != nullptr && create_hidden_stream != nullptr &&
+               destroy_hidden_stream != nullptr && create_event != nullptr && destroy_event != nullptr;
     }
 };
 
@@ -142,6 +143,13 @@ public:
     KernelExecutionState &operator=(const KernelExecutionState &) = delete;
 
     int initialize(int requested_device_id, const KernelContextOps &ops);
+    /**
+     * Check the caller's current device and RTS context without rebinding.
+     * Before adoption there is nothing to validate. The borrowed identity
+     * survives close: other runner owners may still need a cleanup retry
+     * after this object's streams and events have been released.
+     */
+    int validate_current_context() const;
     int mark_ready_enqueued();
     void poison(int runtime_error);
     int close();
@@ -156,12 +164,14 @@ public:
     void *event(KernelEventKind kind) const;
 
 private:
+    int validate_current_context_locked() const;
     int cleanup_owned_resources_locked();
     bool has_live_resources_locked() const;
 
     mutable std::mutex mutex_;
     KernelContextPhase phase_{KernelContextPhase::New};
     int device_id_{-1};
+    void *borrowed_context_{nullptr};
     int last_runtime_error_{0};
     int unexpected_teardown_error_{0};
     KernelContextOps ops_{};

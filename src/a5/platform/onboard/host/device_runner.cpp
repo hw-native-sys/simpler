@@ -1155,11 +1155,7 @@ int DeviceRunner::force_reset_device() {
 // `bind_callable_to_runtime`, and `upload_chip_callable_buffer` live on
 // `DeviceRunnerBase`.
 
-int DeviceRunner::finalize() {
-    if (device_id_ == -1) {
-        return 0;
-    }
-
+int DeviceRunner::finalize_impl() {
     // Fatal cleanup must not walk poisoned streams, mappings, or allocations.
     // Stop collector threads locally, drain and force-reset the card, then
     // forget the old generation's handles.

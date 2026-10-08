@@ -26,6 +26,8 @@ namespace {
 struct FakeContextOps {
     int current_device{3};
     int get_device_rc{0};
+    void *current_context{reinterpret_cast<void *>(0x1000)};
+    int get_context_rc{0};
     int create_stream_rc_after{-1};  // fail the Nth create_hidden_stream (0-based); -1 = never
     int create_event_rc_after{-1};
     int destroy_failures_remaining{0};
@@ -41,6 +43,12 @@ struct FakeContextOps {
         auto *ops = self(context);
         if (ops->get_device_rc != 0) return ops->get_device_rc;
         *device_id = ops->current_device;
+        return 0;
+    }
+    static int get_current_context(void *context, void **current) noexcept {
+        auto *ops = self(context);
+        if (ops->get_context_rc != 0) return ops->get_context_rc;
+        *current = ops->current_context;
         return 0;
     }
     static int create_hidden_stream(void *context, void **stream) noexcept {
@@ -77,13 +85,92 @@ struct FakeContextOps {
     }
 
     KernelContextOps table() {
-        return KernelContextOps{this,          &get_current_device, &create_hidden_stream, &destroy_hidden_stream,
-                                &create_event, &destroy_event};
+        return KernelContextOps{
+            this,          &get_current_device, &get_current_context, &create_hidden_stream, &destroy_hidden_stream,
+            &create_event, &destroy_event
+        };
     }
 };
 
 constexpr size_t kStreamCount = static_cast<size_t>(KernelStreamKind::Count);
 constexpr size_t kEventCount = static_cast<size_t>(KernelEventKind::Count);
+
+TEST(KernelExecutionState, NoBorrowedIdentityNeedsNoCallerContext) {
+    KernelExecutionState state;
+    EXPECT_EQ(state.validate_current_context(), 0);
+    EXPECT_EQ(state.close(), 0);
+    EXPECT_EQ(state.validate_current_context(), 0);
+}
+
+TEST(KernelExecutionState, SameDeviceDifferentContextRefusesCloseWithoutReleasingOwners) {
+    FakeContextOps fake;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    void *owner = fake.current_context;
+    fake.current_context = reinterpret_cast<void *>(0x2000);
+    EXPECT_EQ(state.close(), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Collecting);
+    EXPECT_EQ(fake.events_destroyed, 0);
+    EXPECT_EQ(fake.streams_destroyed, 0);
+    fake.current_context = owner;
+    EXPECT_EQ(state.close(), 0);
+    EXPECT_FALSE(state.has_live_resources());
+}
+
+TEST(KernelExecutionState, MissingContextOrQueryFailureCreatesNoResources) {
+    FakeContextOps fake;
+    KernelExecutionState state;
+    fake.current_context = nullptr;
+    EXPECT_EQ(state.initialize(3, fake.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    fake.get_context_rc = -45;
+    EXPECT_EQ(state.initialize(3, fake.table()), -45);
+    EXPECT_EQ(fake.streams_created, 0);
+    EXPECT_EQ(fake.events_created, 0);
+    EXPECT_EQ(state.phase(), KernelContextPhase::New);
+    fake.get_context_rc = 0;
+    fake.current_context = reinterpret_cast<void *>(0x1000);
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    EXPECT_EQ(state.close(), 0);
+}
+
+TEST(KernelExecutionState, ContextValidationPreservesStateOnDeviceAndQueryErrors) {
+    FakeContextOps fake;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    EXPECT_EQ(state.validate_current_context(), 0);
+    fake.current_device = 4;
+    EXPECT_EQ(state.validate_current_context(), PTO_RUNTIME_ERR_INVALID_STATE);
+    fake.current_device = 3;
+    fake.get_context_rc = -45;
+    EXPECT_EQ(state.validate_current_context(), -45);
+    EXPECT_EQ(state.close(), -45);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Collecting);
+    EXPECT_EQ(fake.streams_destroyed, 0);
+    EXPECT_EQ(fake.events_destroyed, 0);
+    fake.get_context_rc = 0;
+    EXPECT_EQ(state.close(), 0);
+}
+
+TEST(KernelExecutionState, BorrowedIdentitySurvivesPartialAndCompletedClose) {
+    FakeContextOps fake;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    fake.destroy_failures_remaining = 1;
+    EXPECT_EQ(state.close(), -43);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closing);
+    EXPECT_TRUE(state.has_live_resources());
+    const int destroyed = fake.events_destroyed;
+    fake.current_context = reinterpret_cast<void *>(0x2000);
+    EXPECT_EQ(state.close(), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(fake.events_destroyed, destroyed);
+    fake.current_context = reinterpret_cast<void *>(0x1000);
+    EXPECT_EQ(state.close(), 0);
+    EXPECT_FALSE(state.has_live_resources());
+    fake.current_context = reinterpret_cast<void *>(0x2000);
+    EXPECT_EQ(state.validate_current_context(), PTO_RUNTIME_ERR_INVALID_STATE);
+    fake.current_context = reinterpret_cast<void *>(0x1000);
+    EXPECT_EQ(state.validate_current_context(), 0);
+}
 
 class KernelContextCreationFailure : public ::testing::TestWithParam<int> {};
 
@@ -102,6 +189,9 @@ TEST_P(KernelContextCreationFailure, EveryCreationPointRollsBackAndCanRetry) {
     EXPECT_EQ(fake.streams_created, fake.streams_destroyed);
     EXPECT_EQ(fake.events_created, fake.events_destroyed);
     EXPECT_EQ(fake.streams_created + fake.events_created, point);
+    fake.get_context_rc = -45;
+    EXPECT_EQ(state.validate_current_context(), 0);
+    fake.get_context_rc = 0;
     fake.create_stream_rc_after = -1;
     fake.create_event_rc_after = -1;
     ASSERT_EQ(state.initialize(3, fake.table()), 0);
@@ -129,6 +219,9 @@ TEST(KernelContextOpsVocabulary, IncompleteTableIsInvalid) {
     KernelContextOps ops = fake.table();
     EXPECT_TRUE(ops.valid());
     ops.create_event = nullptr;
+    EXPECT_FALSE(ops.valid());
+    ops = fake.table();
+    ops.get_current_context = nullptr;
     EXPECT_FALSE(ops.valid());
 }
 

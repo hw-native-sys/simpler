@@ -184,6 +184,11 @@ struct FakeLifecycleOps {
                 *device = kDeviceId;
                 return 0;
             },
+            [](void *context, void **current) noexcept {
+                static_cast<FakeLifecycleOps *>(context)->calls().push_back("get_context");
+                *current = context;
+                return 0;
+            },
             [](void *context, void **stream) noexcept {
                 return create(context, stream, "stream");
             },
@@ -222,7 +227,7 @@ class KernelResourceLifecycle : public ::testing::TestWithParam<int> {};
 
 TEST_P(KernelResourceLifecycle, HasExactResourceCallOrder) {
     FakeLifecycleOps fake;
-    std::vector<std::string> expected{"get_device", "create_stream", "create_stream"};
+    std::vector<std::string> expected{"get_device", "get_context", "create_stream", "create_stream"};
     expected.insert(expected.end(), static_cast<size_t>(KernelEventKind::Count), "create_event");
     {
         KernelExecutionState state;
@@ -251,6 +256,7 @@ TEST_P(KernelResourceLifecycle, HasExactResourceCallOrder) {
         expected.insert(expected.end(), {"free", "free", "free"});
         EXPECT_EQ(fake.calls(), expected);
         ASSERT_EQ(state.close(), 0);
+        expected.insert(expected.end(), {"get_device", "get_context"});
         for (uintptr_t id = 2 + static_cast<size_t>(KernelEventKind::Count); id > 2; --id)
             expected.push_back("destroy_event:" + std::to_string(id));
         expected.insert(expected.end(), {"destroy_stream:2", "destroy_stream:1"});

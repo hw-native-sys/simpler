@@ -346,8 +346,13 @@ public:
     bool retains_failed_callable_release() const { return execution_mode_latch_.is_kernel(); }
 
     // Program attaches its owned device; kernel verifies the caller's current
-    // device without changing it. Also used for abandoning an unlaunched run.
+    // device and RTS context without changing them. Also used for abandoning
+    // an unlaunched run.
     int enter_run_thread();
+    // A borrowed environment must be current before resource mutation. An
+    // owned environment has no caller binding to validate; enter_run_thread
+    // performs its thread attachment before device work.
+    int validate_current_context() const;
     int init_kernel_context(int device_id);
     int prepare_kernel_callable(int32_t callable_id);
 
@@ -799,7 +804,7 @@ public:
      * One-shot device initialization. Performs, in order:
      *   1. attach_current_thread on device_id_
      *   2. rtStreamCreate for AICPU + AICore streams (persistent, freed
-     *      by the subclass `finalize()`).
+     *      by the subclass `finalize_impl()`).
      *   3. Bootstrap the dispatcher + register the inner AICPU SO via
      *      `ensure_binaries_loaded()`.
      *   4. Provision the requested async-DMA workspaces via
@@ -1456,13 +1461,10 @@ public:
     virtual DrainOutcome drain_execution(ActiveExecution &active) = 0;
 
     /**
-     * Cleanup all resources. Each arch's `finalize()` wraps
-     * `finalize_common()` with arch-specific device-reset behaviour:
-     * a2a3 has the ACL-ready branch + dep_gen collector teardown;
-     * a5 does straight `rtDeviceReset`. See the subclass docs for the
-     * per-arch contract.
+     * Validate the execution environment before architecture-specific cleanup.
+     * The public entry is non-virtual; subclasses implement finalize_impl().
      */
-    virtual int finalize() = 0;
+    int finalize();
 
     virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
 
@@ -1664,6 +1666,8 @@ protected:
     // public virtual dtor above lets the shared c_api delete through a
     // base pointer safely.
     DeviceRunnerBase();
+
+    virtual int finalize_impl() = 0;
 
     /**
      * `DeviceArena` callback trampolines bridging from C-style
@@ -2201,8 +2205,8 @@ protected:
     CollectorShape collector_shape_{};
 
     /**
-     * Shared body of `finalize()`. Each arch subclass's `finalize()`
-     * handles: (a) the early-return + thread attach prologue, (b) any
+     * Shared cleanup body called by each arch subclass's `finalize_impl()`.
+     * The subclass handles: (a) thread attachment, (b) any
      * arch-specific collector teardown (e.g. a2a3's `dep_gen_collector_`),
      * and (c) the arch-specific device reset (a2a3's ACL/rt branch vs
      * a5's `rtDeviceReset`). Everything else lives here:
@@ -2720,7 +2724,7 @@ protected:
     // and only pulls the tail when the header marks it used.
     //
     // One buffer per pipeline slot, allocated lazily on that slot's first
-    // capture-enabled run and freed in subclass `finalize()`. Per slot rather
+    // capture-enabled run and freed in subclass `finalize_impl()`. Per slot rather
     // than per run so the hot path does no device malloc/free, and rather than
     // one shared buffer because the device writes it for the whole of a run
     // while the host reads it only at that run's drain — a successor armed into
@@ -2758,7 +2762,7 @@ protected:
     // because epochs distinguish runs, but the first use of an allocation does.
     std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_run_result_initialized_{};
 
-    // True after AICPU SO loaded; reset by the subclass's `finalize()`.
+    // True after AICPU SO loaded; reset by the subclass's `finalize_impl()`.
     bool binaries_loaded_{false};
     // Per-device guard for the initial simpler_aicpu_init launch.
     bool aicpu_init_launched_{false};

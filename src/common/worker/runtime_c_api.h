@@ -1116,6 +1116,13 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * config and resolves that invocation's shape, binding and diagnostics.
  * `context_generation` is a nonzero host-process-unique identity minted by the
  * caller for sequential contexts; generation zero is invalid.
+ * The native RTS context current at init is borrowed as well as the device.
+ * Callable prepare/unregister, per-run prepare/finalize and context close
+ * require that same context current on the calling thread. A mismatch is
+ * rejected before mutation; restoring it permits retry. Simpler never calls
+ * SetCurrentContext on the caller's behalf. The caller keeps this context
+ * alive through successful close; handle comparison cannot detect a destroyed
+ * context whose address has been recycled.
  *
  * Structural argument errors and invalid TMR sizing configurations return
  * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Invalid generated resource contracts or

@@ -21,10 +21,15 @@ int KernelExecutionState::initialize(int requested_device_id, const KernelContex
     int rc = ops.get_current_device(ops.context, &current_device);
     if (rc != 0) return rc;
     if (current_device != requested_device_id) return PTO_RUNTIME_ERR_INVALID_STATE;
+    void *current_context = nullptr;
+    rc = ops.get_current_context(ops.context, &current_context);
+    if (rc != 0) return rc;
+    if (current_context == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
 
     phase_ = KernelContextPhase::Initializing;
     ops_ = ops;
     device_id_ = requested_device_id;
+    borrowed_context_ = current_context;
 
     for (auto &stream : hidden_streams_) {
         rc = ops_.create_hidden_stream(ops_.context, &stream);
@@ -44,6 +49,7 @@ int KernelExecutionState::initialize(int requested_device_id, const KernelContex
         } else {
             phase_ = KernelContextPhase::New;
             device_id_ = -1;
+            borrowed_context_ = nullptr;
             ops_ = {};
         }
         return rc;
@@ -51,6 +57,23 @@ int KernelExecutionState::initialize(int requested_device_id, const KernelContex
 
     phase_ = KernelContextPhase::Collecting;
     return 0;
+}
+
+int KernelExecutionState::validate_current_context() const {
+    std::scoped_lock lock(mutex_);
+    return validate_current_context_locked();
+}
+
+int KernelExecutionState::validate_current_context_locked() const {
+    if (borrowed_context_ == nullptr) return 0;
+    int current_device = -1;
+    int rc = ops_.get_current_device(ops_.context, &current_device);
+    if (rc != 0) return rc;
+    if (current_device != device_id_) return PTO_RUNTIME_ERR_INVALID_STATE;
+    void *current_context = nullptr;
+    rc = ops_.get_current_context(ops_.context, &current_context);
+    if (rc != 0) return rc;
+    return current_context == borrowed_context_ ? 0 : PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
 int KernelExecutionState::mark_ready_enqueued() {
@@ -85,6 +108,8 @@ int KernelExecutionState::close() {
     case KernelContextPhase::Closing:
         break;
     }
+    const int context_rc = validate_current_context_locked();
+    if (context_rc != 0) return context_rc;
     phase_ = KernelContextPhase::Closing;
     const int rc = cleanup_owned_resources_locked();
     if (rc != 0) {

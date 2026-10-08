@@ -138,16 +138,6 @@ public:
     void dep_gen_finish_retained() override;
 
     /**
-     * Cleanup all resources
-     *
-     * Frees all device memory, destroys streams, and resets state.
-     * Use this for final cleanup when no more tests will run.
-     *
-     * @return 0 on success, error code on failure
-     */
-    int finalize() override;
-
-    /**
      * a5 fills the per-core register table only: it has no ffts_base_addr
      * field. The table is allocated on `mem_alloc_`.
      */
@@ -195,6 +185,8 @@ public:
     int destroy_comm_stream(void *stream);
 
 private:
+    int finalize_impl() override;
+
     // Most lifecycle state (device_id_, block_dim_, cores_per_blockdim_,
     // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached

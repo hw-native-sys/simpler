@@ -1141,14 +1141,23 @@ int DeviceRunnerBase::adopt_borrowed_device(int device_id) {
 
 int DeviceRunnerBase::enter_run_thread() {
     if (!execution_mode_latch().is_kernel()) return attach_current_thread(device_id_);
-    int32_t current = -1;
-    const int rc = aclrtGetDevice(&current);
-    if (rc != 0) return rc;
-    if (device_id_ < 0 || current != device_id_) {
-        LOG_ERROR("kernel call requires caller device %d current; got %d", device_id_, current);
-        return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (device_id_ < 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+    return validate_current_context();
+}
+
+int DeviceRunnerBase::validate_current_context() const {
+    const int rc = kernel_exec_state_.validate_current_context();
+    if (rc != 0) {
+        LOG_ERROR("borrowed RTS context must be current on device %d: %d", device_id_, rc);
     }
-    return 0;
+    return rc;
+}
+
+int DeviceRunnerBase::finalize() {
+    if (device_id_ == -1) return 0;
+    const int rc = validate_current_context();
+    if (rc != 0) return rc;
+    return finalize_impl();
 }
 
 void DeviceRunnerBase::configure_aicore_op_timeout() {
@@ -1931,6 +1940,8 @@ int DeviceRunnerBase::record_host_orch_callable(
 }
 
 int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
+    const int context_rc = validate_current_context();
+    if (context_rc != 0) return context_rc;
     auto it = callables_.find(callable_id);
     if (it == callables_.end()) {
         return 0;

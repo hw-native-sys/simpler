@@ -20,6 +20,7 @@ import ctypes
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -888,6 +889,61 @@ class NativeRunDescriptor(ctypes.Structure):
     ]
 
 
+class _CallerContexts:
+    """Two real contexts on one device, both owned by the test caller."""
+
+    def __init__(self, lib, device):
+        self.lib, self.device = lib, device
+        lib.aclrtGetCurrentContext.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
+        lib.aclrtCreateContext.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int]
+        lib.aclrtSetCurrentContext.argtypes = [ctypes.c_void_p]
+        lib.aclrtDestroyContext.argtypes = [ctypes.c_void_p]
+        lib.simpler_unregister_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32]
+        self.owner, self.alternate = ctypes.c_void_p(), ctypes.c_void_p()
+        assert lib.aclrtGetCurrentContext(ctypes.byref(self.owner)) == 0
+        assert lib.aclrtCreateContext(ctypes.byref(self.alternate), device) == 0
+        assert self.alternate.value != self.owner.value
+        assert lib.aclrtSetCurrentContext(self.owner) == 0
+
+    @contextmanager
+    def other(self):
+        assert self.lib.aclrtSetCurrentContext(self.alternate) == 0
+        try:
+            current_device = ctypes.c_int(-1)
+            assert self.lib.aclrtGetDevice(ctypes.byref(current_device)) == 0
+            assert current_device.value == self.device
+            yield
+        finally:
+            current = ctypes.c_void_p()
+            query_rc = self.lib.aclrtGetCurrentContext(ctypes.byref(current))
+            assert self.lib.aclrtSetCurrentContext(self.owner) == 0
+            assert query_rc == 0
+            assert current.value == self.alternate.value  # simpler must not switch it back
+
+    def close(self):
+        assert self.lib.aclrtDestroyContext(self.alternate) == 0
+        assert self.lib.aclrtSetCurrentContext(self.owner) == 0
+
+
+def _native_run_storage(lib):
+    for name in ("get_runtime_size", "get_runtime_alignment"):
+        getattr(lib, name).restype = ctypes.c_size_t
+    size, alignment = lib.get_runtime_size(), lib.get_runtime_alignment()
+    storage = ctypes.create_string_buffer(size + alignment)
+    run = (ctypes.addressof(storage) + alignment - 1) & -alignment
+    lib.simpler_prepare_run.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int32,
+        ctypes.c_void_p,
+        ctypes.POINTER(CallConfig),
+        ctypes.POINTER(NativeRunDescriptor),
+    ]
+    for name in ("simpler_finalize_run", "simpler_launch_run"):
+        getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    return storage, run
+
+
 def _run_borrowed_prepare(arch, runtime, device):
     from simpler.task_interface import (  # noqa: PLC0415
         AddressSpace,
@@ -906,6 +962,7 @@ def _run_borrowed_prepare(arch, runtime, device):
     faults.acl_call_count.argtypes = [ctypes.c_int]
     lib.rtSetDevice.argtypes = [ctypes.c_int]
     assert lib.rtSetDevice(device) == 0
+    contexts = _CallerContexts(lib, device)
     faults.arm_acl_guard()
     config = CallConfig()
     # No kernel is launched; two threads are the smallest legal explicit shape
@@ -936,21 +993,7 @@ def _run_borrowed_prepare(arch, runtime, device):
             arch, runtime, signature=[ArgDirection.INOUT], function="kernel_call_orchestration"
         )
         assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == 0
-        for name in ("get_runtime_size", "get_runtime_alignment"):
-            getattr(lib, name).restype = ctypes.c_size_t
-        size, alignment = lib.get_runtime_size(), lib.get_runtime_alignment()
-        storage = ctypes.create_string_buffer(size + alignment)
-        run = (ctypes.addressof(storage) + alignment - 1) & -alignment
-        lib.simpler_prepare_run.argtypes = [
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_int32,
-            ctypes.c_void_p,
-            ctypes.POINTER(CallConfig),
-            ctypes.POINTER(NativeRunDescriptor),
-        ]
-        for name in ("simpler_finalize_run", "simpler_launch_run"):
-            getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        _storage, run = _native_run_storage(lib)
         descriptor = NativeRunDescriptor(generation=1, run_epoch=1)
 
         def prepare(args):
@@ -976,6 +1019,17 @@ def _run_borrowed_prepare(arch, runtime, device):
         # A DEVICE address is opaque to host preparation. No execution follows,
         # so this unmapped address must never be dereferenced by either side.
         device_args = arguments(0x1000, AddressSpace.DEVICE, TensorTransfer.NONE)
+        with contexts.other():
+            copies = faults.copy_call_count()
+            committed = lib.committed_device_memory_ctx(ctx)
+            rc = prepare(device_args)
+            prepared = rc == 0
+            assert rc == PTO_RUNTIME_ERR_INVALID_STATE, rc
+            assert lib.simpler_kernel_mode_prepare_callable(ctx, 1, image, len(image)) == PTO_RUNTIME_ERR_INVALID_STATE
+            assert lib.simpler_unregister_callable(ctx, 0) == PTO_RUNTIME_ERR_INVALID_STATE
+            assert faults.copy_call_count() == copies
+            assert lib.committed_device_memory_ctx(ctx) == committed
+            assert ctypes.string_at(run, 8) == bytes(8)
         faults.force_current_device(-1)
         assert prepare(device_args) == PTO_RUNTIME_ERR_INVALID_STATE
         assert ctypes.string_at(run, 8) == bytes(8)
@@ -991,6 +1045,10 @@ def _run_borrowed_prepare(arch, runtime, device):
             prepared = True
             assert lib.finalize_device(ctx) != 0
             assert lib.simpler_launch_run(ctx, run) == PTO_RUNTIME_ERR_INVALID_STATE
+            with contexts.other():
+                committed = lib.committed_device_memory_ctx(ctx)
+                assert lib.simpler_finalize_run(ctx, run) == PTO_RUNTIME_ERR_INVALID_STATE
+                assert lib.committed_device_memory_ctx(ctx) == committed
             faults.force_current_device(-1)
             assert lib.simpler_finalize_run(ctx, run) == PTO_RUNTIME_ERR_INVALID_STATE
             faults.force_current_device(-2)
@@ -1012,6 +1070,10 @@ def _run_borrowed_prepare(arch, runtime, device):
             else:
                 assert rc != 0
                 assert host_value.value == 11
+        with contexts.other():
+            committed = lib.committed_device_memory_ctx(ctx)
+            assert lib.finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE
+            assert lib.committed_device_memory_ctx(ctx) == committed
         assert lib.simpler_kernel_mode_supported(ctx) == 0
     finally:
         faults.force_current_device(-2)
@@ -1020,6 +1082,7 @@ def _run_borrowed_prepare(arch, runtime, device):
         assert lib.finalize_device(ctx) == 0
         assert lib.committed_device_memory_ctx(ctx) == 0
         lib.destroy_device_context(ctx)
+        contexts.close()
         assert [faults.acl_call_count(i) for i in range(8)] == [0] * 8
 
 

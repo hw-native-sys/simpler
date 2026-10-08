@@ -710,6 +710,12 @@ TeardownProofSlot proof_slot(DeviceRunnerBase *runner) {
 int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    try {
+        const int rc = runner->validate_current_context();
+        if (rc != 0) return rc;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     ContextTeardownSteps steps;
     steps.ctx = runner;
     steps.runs_outstanding = [](void *c) {
@@ -1391,6 +1397,8 @@ int simpler_prepare_run(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    const int context_rc = runner->validate_current_context();
+    if (context_rc != 0) return context_rc;
     if (runner->execution_mode_latch().is_kernel()) {
         if (!runner->kernel_execution_state().accepts_dispatch()) return PTO_RUNTIME_ERR_INVALID_STATE;
         const int args_rc = validate_kernel_run_args(args);
@@ -1398,10 +1406,6 @@ int simpler_prepare_run(
             LOG_ERROR("simpler_prepare_run: kernel arguments require HOST/NONE or DEVICE/NONE");
             return args_rc;
         }
-        // Refuse on the wrong caller thread before acquiring a run or any
-        // resources whose rollback would itself need that device current.
-        const int device_rc = runner->enter_run_thread();
-        if (device_rc != 0) return device_rc;
     }
 
     if (!runner->has_callable(callable_id)) {
@@ -1963,11 +1967,9 @@ int simpler_probe_run_retention(
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    if (state->runner->execution_mode_latch().is_kernel()) {
-        const int device_rc = state->runner->enter_run_thread();
-        // Keep the prepared run owned so the caller can retry on its device.
-        if (device_rc != 0) return device_rc;
-    }
+    // A refused environment leaves the run owned for a retry on its context.
+    const int context_rc = state->runner->validate_current_context();
+    if (context_rc != 0) return context_rc;
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;

@@ -1289,11 +1289,7 @@ int DeviceRunner::unregister_device_memory_from_host(void *dev_ptr) {
     return rc;
 }
 
-int DeviceRunner::finalize() {
-    if (device_id_ == -1) {
-        return 0;
-    }
-
+int DeviceRunner::finalize_impl() {
     // Fatal path: the ordinary stream completion/error boundary has already
     // reaped the submitted run. Stop host collector threads locally, drain and
     // force-reset the card, then forget old handles without per-resource
