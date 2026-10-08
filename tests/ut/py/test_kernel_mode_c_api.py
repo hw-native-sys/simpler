@@ -34,11 +34,8 @@ PTO_RUNTIME_ERR_INVALID_ARGUMENT = -1004
 _ARCHES = ("a2a3", "a5")
 _RUNTIMES = ("host_build_graph", "tensormap_and_ringbuffer")
 _SIM_CASES = [pytest.param(arch, runtime, id=f"{arch}-sim-{runtime}") for arch in _ARCHES for runtime in _RUNTIMES]
-# Only a runtime that can size kernel-mode resources establishes a context, so
-# every test below that needs a live one runs on tensormap_and_ringbuffer.
-# host_build_graph's refusal is its own test, and it is the interesting case
-# there: nothing after the contract builder is runtime-aware, so the refusal is
-# the whole of what keeps it out.
+# These lifecycle fault cases include TMR-specific callable device uploads.
+# Per-invocation preparation below independently exercises both runtimes.
 _KERNEL_CAPABLE_RUNTIMES = ("tensormap_and_ringbuffer",)
 _ONBOARD_CASES = [
     pytest.param(
@@ -393,7 +390,7 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
         assert {name: faults.acl_call_count(i) for i, name in enumerate(names)} == dict.fromkeys(names, 0)
 
 
-def _prepared_callable_image(arch, runtime) -> bytes:
+def _prepared_callable_image(arch, runtime, *, signature=(), function="kernel_prepare_orchestration") -> bytes:
     """A real orchestration callable image — both registration paths validate
     and hash the whole image, and the AICPU prewarm loads its SO."""
     import tempfile  # noqa: PLC0415
@@ -406,7 +403,7 @@ def _prepared_callable_image(arch, runtime) -> bytes:
         binary = KernelCompiler(arch).compile_orchestration(
             runtime, str(Path(__file__).with_name("kernel_prepare_orchestration.cpp")), build_dir=build_dir
         )
-    chip = ChipCallable.build(signature=[], func_name="kernel_prepare_orchestration", binary=binary, children=[])
+    chip = ChipCallable.build(signature=list(signature), func_name=function, binary=binary, children=[])
     return ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
 
 
@@ -468,49 +465,6 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
             == PTO_RUNTIME_ERR_UNSUPPORTED
         )
         # The refused init took no claim, so the context is still free.
-        image = _minimal_callable_image()
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == PTO_RUNTIME_ERR_INVALID_STATE
-    finally:
-        lib.destroy_device_context(ctx)
-
-
-_HBG_ONBOARD_CASES = [
-    pytest.param(
-        arch,
-        id=f"{arch}-onboard-host_build_graph",
-        marks=[pytest.mark.requires_hardware, pytest.mark.platforms([arch])],
-    )
-    for arch in _ARCHES
-]
-
-
-@pytest.mark.parametrize("arch", _HBG_ONBOARD_CASES)
-def test_onboard_runtime_without_kernel_sizing_refuses_init(arch: str):
-    """A runtime whose contract builder reports unsupported must not establish
-    a kernel context.
-
-    host_build_graph's `build_kernel_pipeline_contract_impl` is an unsupported
-    stub, and everything after it — the latch, the streams and events, the
-    runtime-image upload — is runtime-agnostic. So the builder's refusal is the
-    only thing standing between an unsupported runtime and a permanently
-    latched context with device work already issued. The sim variants cover
-    their own entry, which refuses unconditionally; this covers the onboard
-    one, where the refusal has to come from the builder.
-    """
-    lib = _load(arch, "onboard", "host_build_graph")
-    config = CallConfig()
-    payload = b"\x00"
-    ctx = lib.create_device_context()
-    assert ctx
-    try:
-        assert (
-            lib.simpler_kernel_mode_init(
-                ctx, 0, payload, len(payload), payload, len(payload), payload, len(payload), ctypes.byref(config), 1
-            )
-            == PTO_RUNTIME_ERR_UNSUPPORTED
-        )
-        # Refused before the latch, so the context took no mode and its
-        # kernel-mode entries stay unavailable.
         image = _minimal_callable_image()
         assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == PTO_RUNTIME_ERR_INVALID_STATE
     finally:
@@ -640,16 +594,9 @@ def _run_program_callable_release(arch, runtime, device):
         # which is not the release path above.
         assert lib.finalize_device(ctx) != 0
         assert faults.free_failure_hits() == 1
-        # init -> finalize -> init on one context is supported, so the second
-        # generation must not resolve a hash the first one minted — the device
-        # it was allocated on has been reset. A fresh init commits its own
-        # arenas and handshake buffer, so the baseline is taken after it rather
-        # than assumed empty.
-        assert lib.simpler_init(*init_args) == 0
-        reinit_baseline = lib.committed_device_memory_ctx(ctx)
-        assert lib.simpler_register_callable(ctx, 0, image) == 0
-        assert lib.committed_device_memory_ctx(ctx) > reinit_baseline
-        assert lib.finalize_device(ctx) == 0
+        # A failed teardown leaves an Unproven context. Clearing the callable
+        # bookkeeping does not authorize reinitializing that handle.
+        assert lib.simpler_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
     finally:
         lib.destroy_device_context(ctx)
 
@@ -721,11 +668,9 @@ def _run_loader_unload_retry(arch, runtime, device, scenario):
 def _run_program_loader_unload(arch, runtime, device):
     """A program close that resets its device ends the generation a retained
     binary handle belongs to, so the retention must not outlive the reset: the
-    failure is reported, the handle is retired, and `init -> finalize -> init`
-    on the same context keeps working."""
+    failure is reported and the handle is retired. The Unproven context
+    refuses reinitialization; destruction must not unload the stale handle."""
     lib = _load(arch, "onboard", runtime)
-    lib.simpler_register_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p]
-    lib.simpler_register_callable.restype = ctypes.c_int
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
     config = CallConfig()
     faults = ctypes.CDLL(None)
@@ -734,7 +679,6 @@ def _run_program_loader_unload(arch, runtime, device):
     assert faults.bind_test_log(lib._handle) == 0
     faults.arm_unload_failures.argtypes = [ctypes.c_int]
     faults.unload_call_count.restype = ctypes.c_int
-    image = _prepared_callable_image(arch, runtime)
     ctx = lib.create_device_context()
     assert ctx
     init_args = (
@@ -760,15 +704,10 @@ def _run_program_loader_unload(arch, runtime, device):
         # handle rather than leaving it retryable.
         assert lib.finalize_device(ctx) != 0
         assert faults.unload_call_count() == 1
-        # Second lifecycle on the same context. `Init` refuses to load over a
-        # live handle, so this only works if the reset retired the stale one.
-        assert lib.simpler_init(*init_args) == 0
-        assert lib.simpler_register_callable(ctx, 0, image) == 0
-        assert lib.finalize_device(ctx) == 0
-        # Two unloads total: the first lifecycle's failure and this lifecycle's
-        # own success. A retry of the first would have made it three, against a
-        # handle from a generation that no longer exists.
-        assert faults.unload_call_count() == 2
+        # The failed teardown leaves this handle Unproven, even though reset
+        # retired the loader. It cannot start another lifecycle.
+        assert lib.simpler_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
+        assert faults.unload_call_count() == 1
         after_close = faults.unload_call_count()
         lib.destroy_device_context(ctx)
         destroyed = True
@@ -792,8 +731,6 @@ def _run_program_loader_double_failure(arch, runtime, device, use_acl):
     lib = _load(arch, "onboard", runtime)
     lib.ensure_acl_ready_ctx.argtypes = [ctypes.c_void_p, ctypes.c_int]
     lib.ensure_acl_ready_ctx.restype = ctypes.c_int
-    lib.simpler_register_callable.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p]
-    lib.simpler_register_callable.restype = ctypes.c_int
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
     config = CallConfig()
     faults = ctypes.CDLL(None)
@@ -804,7 +741,6 @@ def _run_program_loader_double_failure(arch, runtime, device, use_acl):
     faults.unload_call_count.restype = ctypes.c_int
     faults.arm_reset_failures.argtypes = [ctypes.c_int]
     faults.reset_call_count.restype = ctypes.c_int
-    image = _prepared_callable_image(arch, runtime)
     ctx = lib.create_device_context()
     assert ctx
     init_args = (
@@ -838,23 +774,14 @@ def _run_program_loader_double_failure(arch, runtime, device, use_acl):
         # failure; the next is idempotent over a context that owns nothing.
         assert lib.finalize_device(ctx) == 0
         assert faults.unload_call_count() == 1
-        # Reuse of the same context is the property the disposition was chosen
-        # for, so it is asserted rather than inferred: keeping the context
-        # poisoned instead of abandoning would break it. `Init` refuses to load
-        # over a live handle, so this is where the pre-fix behaviour stops —
-        # `a binary is still loaded; Finalize must retire it first`.
-        assert lib.simpler_init(*init_args) == 0
-        assert lib.simpler_register_callable(ctx, 0, image) == 0
-        assert lib.finalize_device(ctx) == 0
-        # Two: the double failure's own attempt, and this lifecycle's success.
-        # Three would mean the abandoned handle was resurrected into it.
-        assert faults.unload_call_count() == 2
+        # A repeat no-op finalize does not turn an unproven reset into proof.
+        assert lib.simpler_init(*init_args) == PTO_RUNTIME_ERR_INVALID_STATE
+        assert faults.unload_call_count() == 1
         lib.destroy_device_context(ctx)
         destroyed = True
-        # `~LoadAicpuOp` has nothing left to unload. Before this fix the handle
-        # abandoned above stayed live and the destructor unloaded it again,
-        # against a device whose reset never completed, reported to nobody.
-        assert faults.unload_call_count() == 2
+        # Destruction must not retry the abandoned loader against a device
+        # whose reset was never confirmed.
+        assert faults.unload_call_count() == 1
     finally:
         if not destroyed:
             lib.destroy_device_context(ctx)
@@ -884,8 +811,8 @@ def test_loader_unload_failure_keeps_a_retryable_owner(arch, runtime, scenario, 
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
 def test_program_loader_unload_failure_does_not_outlive_its_device(arch, runtime, kernel_close_faults, request):
     """The same retention on a program context must not survive that context's
-    device reset: the failure is reported, the stale handle is retired, and a
-    second lifecycle on the same context comes up and closes cleanly."""
+    device reset: the failure is reported, the stale handle is retired, and
+    the unproven context refuses reinitialization."""
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     env = dict(os.environ)
     env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
@@ -897,8 +824,8 @@ def test_program_loader_unload_failure_does_not_outlive_its_device(arch, runtime
         text=True,
         timeout=180,
     )
-    # The discriminators are the unload count and the second init's success,
-    # both asserted inside the subprocess; the retirement itself logs at WARN,
+    # The discriminators are the unload count and refusal to reinitialize an
+    # unproven context; the retirement itself logs at WARN,
     # which the test log threshold does not admit.
     assert result.returncode == 0, result.stdout + result.stderr
 
@@ -906,8 +833,8 @@ def test_program_loader_unload_failure_does_not_outlive_its_device(arch, runtime
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
 def test_program_callable_release_failure_leaves_no_stale_record(arch, runtime, kernel_close_faults, request):
     """A program-mode callable release whose device free fails must stay
-    recoverable: the block leaks, but the content hash is registerable again,
-    in this lifetime and in the next one on the same context.
+    recoverable within that lifetime: the block leaks, but the content hash
+    is registerable again. A subsequent failed finalize forbids handle reuse.
 
     On tensormap_and_ringbuffer because that is where a callable image is
     uploaded to the device at all — host_build_graph registers a host dlopen
@@ -947,8 +874,182 @@ def test_program_loader_double_failure_leaves_nothing_to_unload(arch, runtime, r
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+class NativeRunDescriptor(ctypes.Structure):
+    _fields_ = [
+        ("pipeline_slot", ctypes.c_uint32),
+        ("arena_bank", ctypes.c_uint32),
+        ("run_id", ctypes.c_uint64),
+        ("generation", ctypes.c_uint64),
+        ("dispatch_id", ctypes.c_uint64),
+        ("run_epoch", ctypes.c_uint64),
+        ("accepted_state", ctypes.POINTER(ctypes.c_int32)),
+        ("accepted_value", ctypes.c_int32),
+        ("joinable_boundary", ctypes.c_uint32),
+    ]
+
+
+def _run_borrowed_prepare(arch, runtime, device):
+    from simpler.task_interface import (  # noqa: PLC0415
+        AddressSpace,
+        ArgDirection,
+        ChipStorageTaskArgs,
+        ChipTensor,
+        DataType,
+        TensorTransfer,
+    )
+
+    lib = _load(arch, "onboard", runtime)
+    faults = ctypes.CDLL(None)
+    faults.bind_test_log.argtypes = [ctypes.c_void_p]
+    assert faults.bind_test_log(lib._handle) == 0
+    faults.force_current_device.argtypes = [ctypes.c_int]
+    faults.acl_call_count.argtypes = [ctypes.c_int]
+    lib.rtSetDevice.argtypes = [ctypes.c_int]
+    assert lib.rtSetDevice(device) == 0
+    faults.arm_acl_guard()
+    config = CallConfig()
+    # No kernel is launched; two threads are the smallest legal explicit shape
+    # for preparing either runtime without a ChipWorker's topology resolver.
+    config.aicpu_thread_num = 2
+    aicpu, aicore, dispatcher = _binaries(arch, runtime)
+    ctx = lib.create_device_context()
+    assert ctx
+    run = None
+    prepared = False
+    try:
+        assert (
+            lib.simpler_kernel_mode_init(
+                ctx,
+                device,
+                aicpu,
+                len(aicpu),
+                aicore,
+                len(aicore),
+                dispatcher,
+                len(dispatcher),
+                ctypes.byref(config),
+                1,
+            )
+            == 0
+        )
+        image = _prepared_callable_image(
+            arch, runtime, signature=[ArgDirection.INOUT], function="kernel_call_orchestration"
+        )
+        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == 0
+        for name in ("get_runtime_size", "get_runtime_alignment"):
+            getattr(lib, name).restype = ctypes.c_size_t
+        size, alignment = lib.get_runtime_size(), lib.get_runtime_alignment()
+        storage = ctypes.create_string_buffer(size + alignment)
+        run = (ctypes.addressof(storage) + alignment - 1) & -alignment
+        lib.simpler_prepare_run.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_int32,
+            ctypes.c_void_p,
+            ctypes.POINTER(CallConfig),
+            ctypes.POINTER(NativeRunDescriptor),
+        ]
+        for name in ("simpler_finalize_run", "simpler_launch_run"):
+            getattr(lib, name).argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        descriptor = NativeRunDescriptor(generation=1, run_epoch=1)
+
+        def prepare(args):
+            return lib.simpler_prepare_run(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor))
+
+        def arguments(addr, space, transfer):
+            args = ChipStorageTaskArgs()
+            args.add_tensor(ChipTensor.make(addr, (1,), DataType.INT32, address_space=space), transfer=transfer)
+            args.add_scalar(7)
+            args.add_scalar(int(space == AddressSpace.HOST))
+            return args
+
+        # A forbidden host input is unreadable. Refusal must precede both its
+        # consumption and any metadata publication or device allocation.
+        invalid = arguments(1, AddressSpace.HOST, TensorTransfer.H2D)
+        committed = lib.committed_device_memory_ctx(ctx)
+        copies = faults.copy_call_count()
+        assert prepare(invalid) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        assert lib.committed_device_memory_ctx(ctx) == committed
+        assert faults.copy_call_count() == copies
+        assert ctypes.string_at(run, 8) == bytes(8)
+
+        # A DEVICE address is opaque to host preparation. No execution follows,
+        # so this unmapped address must never be dereferenced by either side.
+        device_args = arguments(0x1000, AddressSpace.DEVICE, TensorTransfer.NONE)
+        faults.force_current_device(-1)
+        assert prepare(device_args) == PTO_RUNTIME_ERR_INVALID_STATE
+        assert ctypes.string_at(run, 8) == bytes(8)
+        faults.force_current_device(-2)
+        # A failed metadata copy unwinds the reservation; the same run storage
+        # and slot must immediately accept another preparation.
+        faults.arm_copy_failure()
+        assert prepare(device_args) != 0
+        assert ctypes.string_at(run, 8) == bytes(8)
+        for epoch in (1, 2):
+            descriptor.run_epoch = epoch
+            assert prepare(device_args) == 0
+            prepared = True
+            assert lib.finalize_device(ctx) != 0
+            assert lib.simpler_launch_run(ctx, run) == PTO_RUNTIME_ERR_INVALID_STATE
+            faults.force_current_device(-1)
+            assert lib.simpler_finalize_run(ctx, run) == PTO_RUNTIME_ERR_INVALID_STATE
+            faults.force_current_device(-2)
+            assert lib.simpler_finalize_run(ctx, run) == 0
+            prepared = False
+            assert ctypes.string_at(run, 8) == bytes(8)
+
+        host_value = ctypes.c_int32(11)
+        host_args = arguments(ctypes.addressof(host_value), AddressSpace.HOST, TensorTransfer.NONE)
+        for expected in (18, 25):
+            descriptor.run_epoch += 1
+            rc = prepare(host_args)
+            if runtime == "host_build_graph":
+                assert rc == 0
+                prepared = True
+                assert host_value.value == expected  # fresh host orchestration on every call
+                assert lib.simpler_finalize_run(ctx, run) == 0
+                prepared = False
+            else:
+                assert rc != 0
+                assert host_value.value == 11
+        assert lib.simpler_kernel_mode_supported(ctx) == 0
+    finally:
+        faults.force_current_device(-2)
+        if prepared:
+            assert lib.simpler_finalize_run(ctx, run) == 0
+        assert lib.finalize_device(ctx) == 0
+        assert lib.committed_device_memory_ctx(ctx) == 0
+        lib.destroy_device_context(ctx)
+        assert [faults.acl_call_count(i) for i in range(8)] == [0] * 8
+
+
+@pytest.mark.parametrize(
+    ("arch", "runtime"),
+    [
+        pytest.param(arch, runtime, marks=[pytest.mark.requires_hardware, pytest.mark.platforms([arch])])
+        for arch in _ARCHES
+        for runtime in _RUNTIMES
+    ],
+)
+def test_borrowed_context_uses_per_call_prepare_and_finalize(arch, runtime, kernel_close_faults, request):
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, "borrowed_prepare"],
+        check=False,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 if __name__ == "__main__":
-    if sys.argv[4] == "program_callable_release":
+    if sys.argv[4] == "borrowed_prepare":
+        _run_borrowed_prepare(sys.argv[1], sys.argv[2], int(sys.argv[3]))
+    elif sys.argv[4] == "program_callable_release":
         _run_program_callable_release(sys.argv[1], sys.argv[2], int(sys.argv[3]))
     elif sys.argv[4] == "program_loader_unload":
         _run_program_loader_unload(sys.argv[1], sys.argv[2], int(sys.argv[3]))

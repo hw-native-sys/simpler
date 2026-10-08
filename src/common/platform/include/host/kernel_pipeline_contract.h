@@ -23,6 +23,8 @@
 // admits it and drops it: no resolved contract is retained, and no resource it
 // describes is established.
 //
+// HBG declares per-run banks with deferred sizes: host orchestration determines
+// their bytes at bind time. This declaration does not promise capture support.
 // TMR rejects invalid config with INVALID_ARGUMENT and a null output or invalid
 // generated contract with INTERNAL. Unsupported implementations return UNSUPPORTED.
 extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, PipelineContract *out);

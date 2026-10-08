@@ -24,7 +24,14 @@ bool pending = false;
 int failures_to_skip = 0;
 SimplerHostLogState test_log_state{};
 bool guard_acl = false;
-std::array<int, 6> forbidden_calls{};
+std::array<int, 8> forbidden_calls{};
+int forced_current_device = -2;
+int (*real_get_device)(int *) = nullptr;
+int (*real_set_device)(int) = nullptr;
+int (*real_set_op_timeout)(uint64_t, uint64_t *) = nullptr;
+int (*real_memcpy)(void *, uint64_t, const void *, uint64_t, int) = nullptr;
+bool fail_next_copy = false;
+int copies = 0;
 bool fake_device_drain = false;
 int device_drain_calls = 0;
 // Targeting an allocation by identity rather than by a call index: a
@@ -98,6 +105,32 @@ extern "C" int aclrtSetDevice(int device) {
     if (guard_acl) return forbidden(1);
     return reinterpret_cast<int (*)(int)>(dlsym(RTLD_NEXT, "aclrtSetDevice"))(device);
 }
+extern "C" int rtSetDevice(int device) {
+    if (guard_acl) return forbidden(6);
+    return real_set_device != nullptr ? real_set_device(device) : -4323;
+}
+extern "C" int aclrtSetOpExecuteTimeOutV2(uint64_t timeout, uint64_t *actual) {
+    if (guard_acl) return forbidden(7);
+    return real_set_op_timeout != nullptr ? real_set_op_timeout(timeout, actual) : -4323;
+}
+extern "C" void force_current_device(int device) { forced_current_device = device; }
+extern "C" int aclrtGetDevice(int *device) {
+    if (forced_current_device != -2) {
+        *device = forced_current_device;
+        return 0;
+    }
+    return real_get_device != nullptr ? real_get_device(device) : -4323;
+}
+extern "C" void arm_copy_failure() { fail_next_copy = true; }
+extern "C" int copy_call_count() { return copies; }
+extern "C" int rtMemcpy(void *dst, uint64_t dst_bytes, const void *src, uint64_t src_bytes, int kind) {
+    ++copies;
+    if (fail_next_copy) {
+        fail_next_copy = false;
+        return -4321;
+    }
+    return real_memcpy != nullptr ? real_memcpy(dst, dst_bytes, src, src_bytes, kind) : -4323;
+}
 extern "C" void arm_reset_failures(int count) {
     reset_failures_left = count;
     reset_calls = 0;
@@ -141,11 +174,18 @@ extern "C" int aclrtSynchronizeDeviceWithTimeout(int32_t timeout) {
 
 // The ctypes loader has no ChipWorker to bind a process-owned logger sink.
 extern "C" int bind_test_log(void *runtime) {
+    // ACL is a dependency of the RTLD_LOCAL component and need not be in the
+    // preload shim's RTLD_NEXT lookup scope.
+    real_get_device = reinterpret_cast<int (*)(int *)>(dlsym(runtime, "aclrtGetDevice"));
+    real_set_device = reinterpret_cast<int (*)(int)>(dlsym(runtime, "rtSetDevice"));
+    real_set_op_timeout = reinterpret_cast<int (*)(uint64_t, uint64_t *)>(dlsym(runtime, "aclrtSetOpExecuteTimeOutV2"));
+    real_memcpy = reinterpret_cast<int (*)(void *, uint64_t, const void *, uint64_t, int)>(dlsym(runtime, "rtMemcpy"));
+    if (!real_get_device || !real_set_device || !real_set_op_timeout || !real_memcpy) return -1;
     test_log_state.threshold = 40;
     test_log_state.sink_owner_pid = getpid();
     test_log_state.sink_process_pid = getpid();
     test_log_state.sink_context = &test_log_state;
-    test_log_state.sink_enqueue = [](void *, SimplerHostLogState *, const char *record, uint32_t size, int32_t) {
+    test_log_state.sink_enqueue = [](void *, SimplerHostLogState *, const char *record, uint32_t size) {
         return std::fwrite(record, 1, size, stderr) == size ? 1 : 0;
     };
     auto bind = reinterpret_cast<SimplerHostLogBindStateFn>(dlsym(runtime, "simpler_host_log_bind_state"));

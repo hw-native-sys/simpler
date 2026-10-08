@@ -345,6 +345,9 @@ public:
      */
     bool retains_failed_callable_release() const { return execution_mode_latch_.is_kernel(); }
 
+    // Program attaches its owned device; kernel verifies the caller's current
+    // device without changing it. Also used for abandoning an unlaunched run.
+    int enter_run_thread();
     int init_kernel_context(int device_id);
     int prepare_kernel_callable(int32_t callable_id);
 

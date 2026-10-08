@@ -27,6 +27,33 @@ int dummy_stream_storage = 0;
 void *const kStream = &dummy_stream_storage;
 alignas(ChipCallable) const unsigned char kCallableImage[sizeof(ChipCallable)] = {};
 
+TEST(KernelEntryValidation, RunRejectsTransfersBeforeReadingAnyTensorBytes) {
+    ChipStorageTaskArgs args{};
+    const uint32_t shape[] = {1};
+    args.add_tensor(make_tensor_external(
+        reinterpret_cast<void *>(1), shape, 1, DataType::INT32, AddressSpace::DEVICE, TensorTransfer::NONE
+    ));
+    EXPECT_EQ(validate_kernel_run_args(&args), 0);
+    args.tensor(0).address_space = AddressSpace::HOST;
+    EXPECT_EQ(validate_kernel_run_args(&args), 0);
+    for (auto space : {AddressSpace::HOST, AddressSpace::DEVICE}) {
+        args.tensor(0).address_space = space;
+        for (auto request : {TensorTransfer::H2D, TensorTransfer::D2H, static_cast<TensorTransfer>(255)}) {
+            args.tensor(0).transfer = request;
+            EXPECT_EQ(validate_kernel_run_args(&args), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+        }
+    }
+    args.tensor(0).transfer = TensorTransfer::NONE;
+    args.tensor(0).address_space = static_cast<AddressSpace>(255);
+    EXPECT_EQ(validate_kernel_run_args(&args), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(validate_kernel_run_args(nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    args.tensor_count_ = CHIP_MAX_TENSOR_ARGS + 1;
+    EXPECT_EQ(validate_kernel_run_args(&args), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    args.tensor_count_ = 0;
+    args.scalar_count_ = CHIP_MAX_SCALAR_ARGS + 1;
+    EXPECT_EQ(validate_kernel_run_args(&args), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+}
+
 TEST(KernelEntryValidation, BinarySpanRequiresPointerAndSizeTogether) {
     EXPECT_TRUE(kernel_binary_span_is_consistent(nullptr, 0));
     EXPECT_TRUE(kernel_binary_span_is_consistent(kBinary, sizeof(kBinary)));

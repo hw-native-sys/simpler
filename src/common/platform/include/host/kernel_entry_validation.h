@@ -17,6 +17,7 @@
 #include "callable.h"
 #include "callable_protocol.h"
 #include "runtime_c_api.h"
+#include "task_args.h"
 
 /**
  * Structural argument validation shared by every host-runtime component's
@@ -113,6 +114,26 @@ inline int validate_kernel_callable_image(const void *callable_image, size_t cal
         used = offset + child_header + child_binary;
     }
     return used == storage_size ? 0 : PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+}
+
+// Kernel callers own tensor placement. HOST/NONE remains available to a
+// host-orchestrating runtime; the runtime's bind validates that capability and
+// the callable signature. This check precedes allocation and orchestration.
+inline int validate_kernel_run_args(const void *args) {
+    if (args == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    const auto &call = *static_cast<const ChipStorageTaskArgs *>(args);
+    if (call.tensor_count() < 0 || call.tensor_count() > CHIP_MAX_TENSOR_ARGS || call.scalar_count() < 0 ||
+        call.scalar_count() > CHIP_MAX_SCALAR_ARGS) {
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    }
+    for (int i = 0; i < call.tensor_count(); ++i) {
+        const auto &tensor = call.tensor(i);
+        if (tensor.transfer != TensorTransfer::NONE ||
+            (tensor.address_space != AddressSpace::HOST && tensor.address_space != AddressSpace::DEVICE)) {
+            return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        }
+    }
+    return 0;
 }
 
 inline int

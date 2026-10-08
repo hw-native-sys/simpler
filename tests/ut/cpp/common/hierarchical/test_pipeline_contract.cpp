@@ -256,8 +256,23 @@ TEST(PipelineContract, KernelByteRulesAreModeSpecific) {
     for (uint32_t i = 0; i < c.resource_count; ++i) {
         auto invalid = c;
         invalid.resources[i].bytes_per_copy = i < 4 ? 0 : 1;
-        EXPECT_FALSE(is_valid_pipeline_contract(&invalid, SIMPLER_MODE_KERNEL)) << i;
+        EXPECT_FALSE(is_valid_tmr_kernel_pipeline_contract(&invalid)) << i;
+        EXPECT_EQ(is_valid_pipeline_contract(&invalid, SIMPLER_MODE_KERNEL), i == 3) << i;
     }
+}
+
+TEST(PipelineContract, KernelPerRunImagesMayBeSizedAtBind) {
+    PipelineContract c{PTO_PIPELINE_CONTRACT_ABI_VERSION, 4, PTO_PIPELINE_MAX_DEPTH, {}};
+    c.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0};
+    c.resources[1] = {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0};
+    c.resources[2] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
+    c.resources[3] = {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
+    EXPECT_TRUE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
+    EXPECT_TRUE(has_serviceable_arena_topology(c));
+    EXPECT_TRUE(has_serviceable_stream_topology(c));
+    EXPECT_EQ(pipeline_resource_copy_count(c, c.resources[0]), PTO_PIPELINE_MAX_DEPTH);
+    c.resources[0].resource_class = PTO_PIPELINE_DEVICE_SCRATCH;
+    EXPECT_FALSE(is_valid_pipeline_contract(&c, SIMPLER_MODE_KERNEL));
 }
 
 TEST(PipelineContract, KernelRequiresExactlyItsSupportedResourceShape) {

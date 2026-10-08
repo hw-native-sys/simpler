@@ -167,8 +167,9 @@ typedef enum PipelineResourceKind {
 typedef struct PipelineResource {
     uint32_t kind;
     uint32_t resource_class;
-    /* Program: must be 0. Kernel: every resource that occupies storage states
-       nonzero required usable bytes per copy, and an EXEC_HANDLE states 0.
+    /* Program: must be 0. Kernel: DEVICE_SCRATCH states nonzero required
+       usable bytes per copy; HOST_PER_RUN may state 0 when host orchestration
+       determines its size at bind time. EXEC_HANDLE states 0.
        The number is a per-copy requirement for the resource named by `kind`:
        it is neither committed HBM nor a capacity budget, and the declared
        resources are not a complete manifest of what a context commits. */
@@ -830,6 +831,14 @@ int simpler_run(
  * the top of this header. `descriptor` is required and copied before this
  * function returns. A non-null acceptance sink in the descriptor must remain
  * valid until launch returns or the prepared run is finalized without launch.
+ *
+ * Onboard kernel contexts use this same per-invocation preparation and
+ * finalize path. The caller must keep its borrowed device current. Arguments
+ * must be DEVICE/NONE or HOST/NONE; host tensor consumption is supported only
+ * by a host-orchestrating runtime. No implicit tensor transfer is performed.
+ * This preparation can allocate and synchronously publish metadata and must
+ * run outside capture. Kernel execution is not supported yet: launch remains
+ * rejected, including through simpler_launch_run().
  */
 int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
@@ -1041,12 +1050,13 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * kernel. A call that conflicts with the context's execution mode returns
  * PTO_RUNTIME_ERR_INVALID_STATE.
  *
- * Kernel-mode capacity is a mode invariant, not a gated state: `config` is
- * context-static, so each pooled arena region is committed at most once and
- * never grown or released afterwards. The platform arena reports a growth or
- * release request under kernel mode as a capacity invariant break
- * (PTO_RUNTIME_ERR_INTERNAL), and capacity intent travels in
- * CallConfig.runtime_env like everywhere else.
+ * Each call supplies its own config. TMR init validates config-derived scratch
+ * sizes; HBG declares per-run banks whose sizes are determined at bind time.
+ * Neither declaration commits those arenas. The kernel arena guard fixes each
+ * region's capacity at its first commit: a later growth or release request
+ * returns PTO_RUNTIME_ERR_INTERNAL. A caller needing larger regions must
+ * finalize its runs and close the context before creating another context.
+ * This resource guard alone does not establish capture support.
  *
  * Every host_runtime.so exports all four entries below, so a consumer resolves
  * them unconditionally like the rest of the uniform ABI; supported answers the
@@ -1075,9 +1085,9 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  *
  * Launches, not resources: it stays zero while simpler_kernel_mode_launch is a
  * rejecting stub, including on a runtime whose simpler_kernel_mode_init already
- * establishes a kernel context. Whether a runtime has kernel-mode resource
- * sizing at all is answered by that init, which refuses with
- * PTO_RUNTIME_ERR_UNSUPPORTED and establishes nothing when it does not.
+ * establishes a kernel context. Both onboard runtimes support initialization
+ * and per-invocation preparation; simulated components refuse kernel init
+ * with PTO_RUNTIME_ERR_UNSUPPORTED and establish nothing.
  *
  * This is the capability question a caller asks before choosing between the
  * kernel-mode entries and the program-mode prepared-run family. It is callable
@@ -1101,22 +1111,18 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * only context-owned persistent handles used by asynchronous preparation and
  * launch. Cold-path bring-up may synchronize a context-owned stream — the AICPU
  * init handshake does — but never a caller stream and never the device; the
- * launch path synchronizes nothing at all. `config` is read here for capacity
- * and resident-resource sizing only; it also carries per-call execution and
- * diagnostic settings, and treating the whole struct as context-static is a
- * property of this compatibility entry rather than of the configuration
- * itself. Separating the two — and resolving the per-call half per preparation
- * — belongs to the preparation entry that does not exist yet.
+ * launch path synchronizes nothing at all. `config` is read here for the
+ * runtime's admission check only. Each simpler_prepare_run() copies its own
+ * config and resolves that invocation's shape, binding and diagnostics.
  * `context_generation` is a nonzero host-process-unique identity minted by the
  * caller for sequential contexts; generation zero is invalid.
  *
  * Structural argument errors and invalid TMR sizing configurations return
  * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Invalid generated resource contracts or
  * C++ exceptions during admission return PTO_RUNTIME_ERR_INTERNAL.
- * A runtime that cannot size kernel-mode resources — today host_build_graph,
- * and every simulated variant — returns PTO_RUNTIME_ERR_UNSUPPORTED and
- * establishes nothing: that refusal is the capability gate on this path, so it
- * ends the call before the mode latch is taken.
+ * Simulated variants return PTO_RUNTIME_ERR_UNSUPPORTED and establish nothing.
+ * Both onboard runtimes admit initialization; HBG determines per-run image
+ * sizes at bind time rather than claiming a config-only size here.
  *
  * Success establishes this context's cold-path resources and latches kernel
  * mode. It does not mean kernel-mode launches are available:

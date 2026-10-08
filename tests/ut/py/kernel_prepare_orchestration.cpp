@@ -11,3 +11,13 @@
 
 // Registration resolves this symbol but never invokes the orchestration.
 extern "C" void kernel_prepare_orchestration() {}
+
+#include "orchestration_api.h"
+
+extern "C" void kernel_call_orchestration(const ChipTaskArgs &args) {
+    if (args.scalar<int32_t>(1) != 0) {
+        const uint32_t index[] = {0};
+        const auto value = get_tensor_data<int32_t>(args.tensor(0).ref(), 1, index);
+        set_tensor_data<int32_t>(args.tensor(0).ref(), 1, index, value + args.scalar<int32_t>(0));
+    }
+}

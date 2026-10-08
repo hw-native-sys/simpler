@@ -51,12 +51,14 @@ inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_
             resource.resource_class > PTO_PIPELINE_EXEC_HANDLE) {
             return false;
         }
-        // A program declaration carries no sizes. A kernel declaration sizes
-        // every resource that occupies storage, and only an execution handle
-        // is exempt, so within kernel mode the rule keys on the resource class
-        // and adding a kind cannot change which side a resource falls on.
-        const bool sized = mode == SIMPLER_MODE_KERNEL && resource.resource_class != PTO_PIPELINE_EXEC_HANDLE;
-        if (sized ? resource.bytes_per_copy == 0 : resource.bytes_per_copy != 0) return false;
+        // Per-run images may be sized by host orchestration at bind time.
+        // Shared scratch has a config-derived size before kernel init; handles
+        // never carry bytes. Program declarations remain topology-only.
+        if (mode == SIMPLER_MODE_PROGRAM || resource.resource_class == PTO_PIPELINE_EXEC_HANDLE) {
+            if (resource.bytes_per_copy != 0) return false;
+        } else if (resource.resource_class == PTO_PIPELINE_DEVICE_SCRATCH && resource.bytes_per_copy == 0) {
+            return false;
+        }
     }
     return true;
 }
@@ -153,7 +155,8 @@ inline bool is_valid_tmr_kernel_pipeline_contract(const PipelineContract *contra
     };
     for (const auto &required : REQUIRED_STORAGE) {
         const auto *resource = find_pipeline_resource(*contract, required.kind);
-        if (resource == nullptr || resource->resource_class != required.resource_class) return false;
+        if (resource == nullptr || resource->resource_class != required.resource_class || resource->bytes_per_copy == 0)
+            return false;
     }
     return true;
 }

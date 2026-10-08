@@ -116,10 +116,6 @@ static_assert(
     "AICore Scheduler profiling levels must match the chip-swimlane contract"
 );
 
-extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *, PipelineContract *) {
-    return PTO_RUNTIME_ERR_UNSUPPORTED;
-}
-
 extern "C" const PipelineContract *get_pipeline_contract(void) {
     // Host orchestration materializes this run's own graph into the image it
     // uploads, so every device-resident region carries per-run content.
@@ -139,6 +135,15 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
         },
     };
     return &contract;
+}
+
+extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, PipelineContract *out) {
+    if (out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (config == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    // The graph and its heap are sized by each bind's host orchestration.
+    // Init declares their bank topology, without claiming a fixed capacity.
+    *out = *get_pipeline_contract();
+    return 0;
 }
 
 extern "C" int concurrent_native_prepare_supported_impl(void) {

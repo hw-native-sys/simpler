@@ -1391,6 +1391,19 @@ int simpler_prepare_run(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    if (runner->execution_mode_latch().is_kernel()) {
+        if (!runner->kernel_execution_state().accepts_dispatch()) return PTO_RUNTIME_ERR_INVALID_STATE;
+        const int args_rc = validate_kernel_run_args(args);
+        if (args_rc != 0) {
+            LOG_ERROR("simpler_prepare_run: kernel arguments require HOST/NONE or DEVICE/NONE");
+            return args_rc;
+        }
+        // Refuse on the wrong caller thread before acquiring a run or any
+        // resources whose rollback would itself need that device current.
+        const int device_rc = runner->enter_run_thread();
+        if (device_rc != 0) return device_rc;
+    }
+
     if (!runner->has_callable(callable_id)) {
         LOG_ERROR("simpler_prepare_run: callable_id=%d not registered", callable_id);
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1458,7 +1471,7 @@ int simpler_prepare_run(
         if (config->enable_chip_swimlane >= 3) state->clock_log_offset = host_clock_alignment_log_offset();
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
-        int rc = runner->attach_current_thread(runner->device_id());
+        int rc = runner->enter_run_thread();
         if (rc != 0) return cleanup_failed_prepare(state, rc);
         // This thread is now proven attached, which is what a device release
         // needs. Obsolete generations left by earlier runs — including a
@@ -1722,6 +1735,9 @@ static void emit_joined_launch_span(const DeviceRunnerBase::JoinedLaunchRecord &
  * predecessor retires first launches ordinarily.
  */
 static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJoin *join) {
+    // The program launch transaction does not join the caller's stream.
+    if (state->runner->execution_mode_latch().is_kernel()) return PTO_RUNTIME_ERR_INVALID_STATE;
+
     if (!state->runner->accepts_new_run() || !state->runner_reserved) return PTO_RUNTIME_ERR_INTERNAL;
     if (state->prepared_execution == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     state->prepared_execution->join = join != nullptr ? *join : NativeRunJoin{};
@@ -1947,6 +1963,11 @@ int simpler_probe_run_retention(
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (state->runner->execution_mode_latch().is_kernel()) {
+        const int device_rc = state->runner->enter_run_thread();
+        // Keep the prepared run owned so the caller can retry on its device.
+        if (device_rc != 0) return device_rc;
+    }
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
@@ -1974,12 +1995,11 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     note_workspace_fact(
         state, launched ? WorkspaceManager::RunFact::Launched : WorkspaceManager::RunFact::NoDeviceSubmission
     );
-    // Both drain_execution() and copy_back_run_outputs_impl() touch the device,
-    // so the attach covers each of them. rtSetDevice is idempotent on an
-    // already-attached thread.
+    // Drain and copy-back need the correct current device. Program owns that
+    // binding; a borrowed context only verifies the caller's binding.
     int attach_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
-        attach_rc = state->runner->attach_current_thread(state->runner->device_id());
+        attach_rc = state->runner->enter_run_thread();
     } catch (...) {
         attach_rc = PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -2367,22 +2387,9 @@ int simpler_kernel_mode_init(
     );
     if (rc != 0) return rc;
 
-    // Requirement validation precedes the latch, and must stay there: the latch
-    // never changes — not on finalize, not on error — so a config the builder
-    // rejects after it has been taken would leave a context permanently bound
-    // to kernel mode with no resources. Validating first returns the same code
-    // on an untouched, still-reusable context. The builder is pure: it resolves
-    // sizing and reserves layout without allocating, copying, or touching the
-    // device.
-    //
-    // A builder reporting UNSUPPORTED is its runtime refusing, not a rejection
-    // of the caller's config — and that refusal is the only capability gate on
-    // this path. Nothing after it re-examines the question: the topology checks
-    // below are what establish that a runtime's declared resources are
-    // serviceable, and `init_kernel_context` and `prepare_kernel_callable` are
-    // runtime-agnostic. Proceeding would latch the context to kernel mode,
-    // create its streams and events, and upload a runtime image on a runtime
-    // that declared it cannot size one. So the refusal ends the call here.
+    // Validate the runtime's resource topology before the irreversible latch.
+    // TMR resolves scratch sizes from config; HBG's per-run graph sizes are
+    // determined later by host orchestration, on the common bind path.
     try {
         PipelineContract contract{};
         const int contract_rc = build_kernel_pipeline_contract_impl(config, &contract);
@@ -2455,9 +2462,8 @@ int simpler_kernel_mode_prepare_callable(
     }
 
     try {
-        // The caller owns the thread's current device; this records identity
-        // without binding the thread or changing device configuration.
-        rc = runner->adopt_borrowed_device(runner->device_id());
+        // Registration uploads on the caller's device without rebinding it.
+        rc = runner->enter_run_thread();
         if (rc != 0) return rc;
 
         // prepare_kernel_callable's AICPU registration self-skips a callable

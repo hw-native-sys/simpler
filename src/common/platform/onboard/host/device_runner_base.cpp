@@ -1085,11 +1085,9 @@ int DeviceRunnerBase::bind_current_thread(int device_id) {
 }
 
 int DeviceRunnerBase::attach_current_thread(int device_id) {
-    // rtSetDevice and the op-execute watchdog below are acts of device
-    // ownership, so this entry belongs to a program context. A kernel context
-    // reaches its device through adopt_borrowed_device instead; the one caller
-    // here that runs under both identities is DeviceRunner::finalize(), which
-    // skips this call on a kernel latch.
+    // Device binding and the op-execute watchdog belong to an owned program
+    // context. enter_run_thread verifies the caller's device for a borrowed
+    // context instead; finalize also skips this binding on a kernel latch.
     if (execution_mode_latch().is_kernel()) {
         LOG_ERROR("attach_current_thread: refused — a kernel-mode context does not own the caller's device");
         return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -1141,6 +1139,18 @@ int DeviceRunnerBase::adopt_borrowed_device(int device_id) {
     return 0;
 }
 
+int DeviceRunnerBase::enter_run_thread() {
+    if (!execution_mode_latch().is_kernel()) return attach_current_thread(device_id_);
+    int32_t current = -1;
+    const int rc = aclrtGetDevice(&current);
+    if (rc != 0) return rc;
+    if (device_id_ < 0 || current != device_id_) {
+        LOG_ERROR("kernel call requires caller device %d current; got %d", device_id_, current);
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    return 0;
+}
+
 void DeviceRunnerBase::configure_aicore_op_timeout() {
     uint64_t actual_timeout = 0;
     int rc = aclrtSetOpExecuteTimeOutV2(timeout_config_.op_execute_timeout_us, &actual_timeout);
@@ -1158,6 +1168,15 @@ void DeviceRunnerBase::configure_aicore_op_timeout() {
 }
 
 int DeviceRunnerBase::ensure_device_initialized() {
+    if (execution_mode_latch().is_kernel()) {
+        if (!kernel_exec_state_.accepts_dispatch() || !binaries_loaded_ || !aicpu_init_launched_) {
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        }
+        // Kernel init already completed the cold control-stream work. Run
+        // preparation neither creates program streams nor binds a device.
+        return enter_run_thread();
+    }
+
     // Attach the current thread to the device (device_id_ was set in
     // attach_current_thread() during simpler_init) and create the persistent
     // AICPU/AICore streams. Streams live for the DeviceRunner's lifetime and
