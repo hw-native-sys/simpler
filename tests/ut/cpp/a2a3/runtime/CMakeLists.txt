@@ -14,6 +14,26 @@ macro(a2a3_runtime_case src)
     tmr_case(${src} ARCHS a2a3 ${ARGN})
 endmacro()
 
+# The scheduler owns retirement; this sink records calls at the platform boundary.
+if(APPLE)
+    set(_retirement_gc_link_option -Wl,-dead_strip)
+else()
+    set(_retirement_gc_link_option -Wl,--gc-sections)
+endif()
+a2a3_runtime_case(test_scheduler_retirement.cpp NO_OBJS
+    SOURCES
+        ${SIMPLER_SRC}/a2a3/runtime/@runtime_full@/runtime/scheduler/scheduler_cold_path.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/aicpu_device_config.cpp
+    LINK a2a3_ut_support
+    DEFINES SIMPLER_DFX=0
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_retirement_gc_link_option}
+    TIMEOUT 20)
+target_sources(test_a2a3_tmr_scheduler_retirement PRIVATE
+    ${A2A3_RUNTIME_DIR}/shared/runtime.cpp)
+target_sources(test_a2a3_hbg_scheduler_retirement PRIVATE
+    ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
+
 # NO_OBJS: this case compiles platform/shared/aicpu/platform_regs.cpp, and the
 # runtime object libraries carry support/platform_regs_stub.cpp, which defines the
 # same get_reg_ptr. It takes the include contract from those libraries' arch and

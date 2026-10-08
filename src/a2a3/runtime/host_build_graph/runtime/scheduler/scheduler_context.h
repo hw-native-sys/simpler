@@ -238,10 +238,13 @@ private:
     std::atomic<int32_t> completed_tasks_{0};
     int32_t total_tasks_{0};
     std::atomic<bool> completed_{false};
-    // Per-core retirement claim. The winner owns that core's register window
-    // and return gate for the rest of the run; every other path leaves both
-    // alone. Indexed by core id, reset in pre_handshake_init.
-    std::atomic<bool> core_retired_[PLATFORM_MAX_CORES];
+    // READY publishes completed initialization, or an opened window on startup
+    // failure. REQUESTED retains an exit request before that publication. Only
+    // the operation adding the second bit owns the core's window and return gate.
+    // Indexed by core id and reset before handshake in each generation.
+    static constexpr uint8_t RETIREMENT_READY = 1;
+    static constexpr uint8_t RETIREMENT_REQUESTED = 2;
+    uint8_t retirement_state_[PLATFORM_MAX_CORES]{};
     // The active callable's registration-owned object-address table and the
     // number of entries it holds, both bound from the descriptor in the cold
     // path. The table is in the callable's registration block, not in the
@@ -300,9 +303,12 @@ private:
     // Emergency shutdown: broadcast exit signal to every handshake'd core and
     // deinit their AICore register blocks. Idempotent.
     void emergency_shutdown(Runtime *runtime);
-    // Claim and retire the named cores. Cores already claimed elsewhere are
-    // skipped, so callers may name overlapping sets.
+    // Request the named cores; an unpublished core is retired by its publisher.
+    // The second-bit winner alone reads execution state and manages the window.
     int32_t retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    void publish_retirement_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
+    void publish_all_retirement_cores(Runtime *runtime);
+    int32_t retire_claimed_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num);
     int32_t retire_all_cores(Runtime *runtime);
 
     __attribute__((noinline, cold)) void fail_scheduler(Runtime *runtime, int32_t thread_idx, int32_t error_code);

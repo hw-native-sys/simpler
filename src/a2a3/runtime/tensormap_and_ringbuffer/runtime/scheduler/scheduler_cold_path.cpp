@@ -670,20 +670,70 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
 }
 
 int32_t SchedulerContext::retire_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num) {
+    int32_t claimed_ids[PLATFORM_MAX_CORES];
+    int32_t count = 0;
+    for (int32_t i = 0; i < core_num; ++i) {
+        const int32_t core_id = core_ids[i];
+        if (core_id < 0 || core_id >= cores_total_num_) continue;
+        // An early request remains pending. Only the operation adding the
+        // second bit owns retirement; acquire observes the publisher's state.
+        if (__atomic_fetch_or(&retirement_state_[core_id], RETIREMENT_REQUESTED, __ATOMIC_ACQ_REL) ==
+            RETIREMENT_READY) {
+            claimed_ids[count++] = core_id;
+        }
+    }
+    return retire_claimed_cores(runtime, claimed_ids, count);
+}
+
+void SchedulerContext::publish_retirement_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num) {
+    int32_t claimed_ids[PLATFORM_MAX_CORES];
+    int32_t count = 0;
+    for (int32_t i = 0; i < core_num; ++i) {
+        const int32_t core_id = core_ids[i];
+        // The initializer owns these metadata stores; requesters do not read
+        // them until READY. Unmapped cores stay unpublished for host recovery.
+        if (core_id < 0 || core_id >= cores_total_num_) continue;
+        if (core_exec_states_[core_id].reg_addr == 0) continue;
+        if (__atomic_fetch_or(&retirement_state_[core_id], RETIREMENT_READY, __ATOMIC_ACQ_REL) ==
+            RETIREMENT_REQUESTED) {
+            claimed_ids[count++] = core_id;
+        }
+    }
+    (void)retire_claimed_cores(runtime, claimed_ids, count);
+}
+
+void SchedulerContext::publish_all_retirement_cores(Runtime *runtime) {
+    // The serial initializer has joined every handshake before reading metadata.
+    int32_t ids[PLATFORM_MAX_CORES];
+    for (int32_t i = 0; i < cores_total_num_; ++i)
+        ids[i] = i;
+    publish_retirement_cores(runtime, ids, cores_total_num_);
+}
+
+void SchedulerContext::publish_retirement_group(Runtime *runtime, int32_t owner_thread) {
+    // The blocked handshake partition is stable even if tracker assignment fails.
+    int32_t ids[PLATFORM_MAX_CORES];
+    int32_t count = 0;
+    const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
+    for (int32_t ci = owner_thread; ci < aic_n; ci += active_sched_threads_) {
+        ids[count++] = ci;
+        ids[count++] = aic_n + 2 * ci;
+        ids[count++] = aic_n + 2 * ci + 1;
+    }
+    publish_retirement_cores(runtime, ids, count);
+}
+
+int32_t SchedulerContext::retire_claimed_cores(Runtime *runtime, const int32_t *core_ids, int32_t core_num) {
     AicoreExitTarget targets[PLATFORM_MAX_CORES];
     int32_t claimed_ids[PLATFORM_MAX_CORES];
     size_t count = 0;
     for (int32_t i = 0; i < core_num; ++i) {
         const int32_t core_id = core_ids[i];
         if (core_id < 0 || core_id >= cores_total_num_) continue;
-        if (core_exec_states_[core_id].reg_addr == 0) continue;
-        // Claiming decides ownership of this core's register window and return
-        // gate. The loser must not touch either again: writing to a window
-        // whose worker was already released is the very ordering violation the
-        // return gate exists to prevent.
-        if (core_retired_[core_id].exchange(true, std::memory_order_acq_rel)) continue;
+        const uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
+        if (reg_addr == 0) continue;
         claimed_ids[count] = core_id;
-        targets[count] = {core_exec_states_[core_id].reg_addr, &runtime->get_teardown_gates()[core_id]};
+        targets[count] = {reg_addr, &runtime->get_teardown_gates()[core_id]};
         ++count;
     }
     if (count == 0) return 0;
@@ -807,8 +857,16 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
                 remaining--;
                 continue;
             }
+            const uint64_t reg_addr = regs[physical_core_id];
+            if (reg_addr == 0) {
+                LOG_ERROR("Core %d reported physical_core_id=%u with no register window", i, physical_core_id);
+                handshake_failed_.store(true, std::memory_order_release);
+                core_serviced[i] = true;
+                remaining--;
+                continue;
+            }
             __builtin_prefetch(&core_exec_states_[i], 1, 3);
-            ready[n_ready++] = {i, physical_core_id, regs[physical_core_id], hank->core_type};
+            ready[n_ready++] = {i, physical_core_id, reg_addr, hank->core_type};
             core_serviced[i] = true;
             remaining--;
         }
@@ -915,8 +973,16 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
                 remaining--;
                 continue;
             }
+            const uint64_t reg_addr = regs[physical_core_id];
+            if (reg_addr == 0) {
+                LOG_ERROR("Core %d reported physical_core_id=%u with no register window", i, physical_core_id);
+                handshake_failed_.store(true, std::memory_order_release);
+                core_serviced[i] = true;
+                remaining--;
+                continue;
+            }
             __builtin_prefetch(&core_exec_states_[i], 1, 3);
-            ready[n_ready++] = {i, physical_core_id, regs[physical_core_id], hank->core_type};
+            ready[n_ready++] = {i, physical_core_id, reg_addr, hank->core_type};
             core_serviced[i] = true;
             remaining--;
         }
@@ -966,7 +1032,7 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
 // directly, so a thread populates its own CoreTracker + per-core payload state
 // right after handshaking its own clusters, with no all-thread barrier.
 // =============================================================================
-void SchedulerContext::assign_own_clusters(int32_t tidx) {
+void SchedulerContext::assign_own_clusters(Runtime *runtime, int32_t tidx) {
     const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
     const int32_t active = active_sched_threads_;
 
@@ -985,6 +1051,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
             CoreTracker::MAX_CLUSTERS
         );
         handshake_failed_.store(true, std::memory_order_release);
+        publish_retirement_group(runtime, tidx);
         return;
     }
     tracker.init(own_n);
@@ -1030,6 +1097,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
             }
         }
     }
+    publish_retirement_group(runtime, tidx);
 }
 
 // Abort the run on a handshake failure discovered without the all-thread barrier
@@ -1126,10 +1194,10 @@ bool SchedulerContext::begin_emergency_shutdown() {
 void SchedulerContext::signal_emergency_shutdown(Runtime *runtime) {
     // Sweeps every core rather than one thread's slice: a fatal run must not
     // depend on the owning threads reaching their own shutdown. Per-core
-    // claiming keeps whatever they already retired untouched. Cores whose
-    // register windows never opened remain the host recovery path's
-    // responsibility.
-    LOG_WARN("Emergency shutdown: retiring all initialized AICores");
+    // claiming keeps whatever they already retired untouched. A core still
+    // handshaking retains REQUESTED and its publisher services it after READY.
+    // Cores that never publish remain the host recovery path's responsibility.
+    LOG_WARN("Emergency shutdown: requesting retirement of all AICores");
     (void)retire_all_cores(runtime);
 }
 
@@ -1149,9 +1217,7 @@ int32_t SchedulerContext::pre_handshake_init(
 
     // Zero all per-core execution state before handshake
     memset(core_exec_states_, 0, sizeof(core_exec_states_));
-    for (int32_t i = 0; i < PLATFORM_MAX_CORES; ++i) {
-        core_retired_[i].store(false, std::memory_order_relaxed);
-    }
+    memset(retirement_state_, 0, sizeof(retirement_state_));
 
     // Wire thread/transition configuration that handshake/assign need to read.
     aicpu_thread_num_ = aicpu_thread_num;
@@ -1253,6 +1319,7 @@ int32_t SchedulerContext::pre_handshake_init(
 
 int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     if (handshake_failed_.load(std::memory_order_acquire)) {
+        publish_all_retirement_cores(runtime);
         emergency_shutdown(runtime);
         return -1;
     }
@@ -1280,6 +1347,8 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     LOG_INFO("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
 
     if (!assign_cores_to_threads()) {
+        publish_all_retirement_cores(runtime);
+        emergency_shutdown(runtime);
         return -1;
     }
 
@@ -1363,6 +1432,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     func_id_to_addr_ = reinterpret_cast<uint64_t *>(runtime->dev.callable_table_addr_);
     func_id_to_addr_count_ = runtime->dev.callable_table_len_;
 
+    publish_all_retirement_cores(runtime);
     return 0;
 }
 

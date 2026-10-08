@@ -354,7 +354,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     // in this branch, so handshake ownership matches assign_own_clusters'.
     if (decouple_orch) {
         sched_ctx_.handshake_owned_clusters(runtime, tidx, hs_nthreads);
-        sched_ctx_.assign_own_clusters(tidx);
+        sched_ctx_.assign_own_clusters(runtime, tidx);
 #if SIMPLER_DFX
         // Profiling subsystems (pmu/dump/dep) need every core's physical_core_id,
         // so gate their one-time leader init behind a barrier — DFX builds only.
