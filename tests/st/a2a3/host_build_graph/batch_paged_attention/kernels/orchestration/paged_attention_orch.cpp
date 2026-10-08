@@ -54,11 +54,12 @@ extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return OrchestrationConfig{
-        .expected_arg_count = 7,
+        .expected_arg_count = 8,
     };
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
+    const auto &host_context_lens = orch_args.tensor(6).ref();
     // Read dimensions from tensor metadata
     uint64_t batch = orch_args.tensor(0).ref().shapes[0];
     uint64_t num_heads = orch_args.tensor(0).ref().shapes[1];
@@ -94,7 +95,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     uint64_t max_bn = 0;
     for (uint64_t b = 0; b < batch; b++) {
         uint32_t cl_idx[1] = {static_cast<uint32_t>(b)};
-        uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
+        uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(host_context_lens, 1, cl_idx));
         uint64_t bn_b = (cur_seq + block_size - 1) / block_size;
         if (bn_b > max_bn) max_bn = bn_b;
     }

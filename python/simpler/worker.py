@@ -295,6 +295,7 @@ from .task_interface import (
     _flush_host_log_or_warn,
     _initialize_host_log,
     _start_host_log_writer,
+    _validate_host_control_access,
     _Worker,
 )
 from .teardown_report import (
@@ -3268,6 +3269,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # bases — an exact resolution, not the parent-VA numeric-range rewrite it replaced.
             args_ptr = task_addr + _OFF_TASK_ARGS_BLOB
             args = read_args_from_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
+            _validate_host_control_access(registry.get(cid), args)
             resolved = import_registry.materialize_args(args)
             chip_args = materialize_task_args(args, resolved)
             # The acceptance flag lives in the mailbox, not in the materialized args, so
@@ -3594,6 +3596,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # the call.
             args_ptr = frame.frame_addr + _OFF_TASK_ARGS_BLOB
             args = read_args_from_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
+            _validate_host_control_access(registry.get(frame.cid), args)
             resolved = import_registry.materialize_args(args)
             chip_args = materialize_task_args(args, resolved)
             if frame.config.output_prefix:
@@ -12562,6 +12565,7 @@ class Worker:
         """
         assert self._chip_worker is not None
         args = _snapshot_local_task_args(TaskArgs() if args is None else args)
+        _validate_host_control_access(self._callable_registry.get(callable_id), args)
         touched = self._identities_in_args(args)
         # Device identity validation and accepted-use publication share free's chip lock.
         # After publication, the touched set refuses free through run finalization, including
@@ -12884,6 +12888,7 @@ class Worker:
 
     def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
         """Materialize an L2 leaf's tensor args and run the kernel to completion."""
+        _validate_host_control_access(self._callable_registry.get(callable_id), TaskArgs() if args is None else args)
         chip_args = self._materialize_l2_args(args)
         assert self._chip_worker is not None
         self._chip_worker._impl.run_materialized(callable_id, chip_args, cfg)

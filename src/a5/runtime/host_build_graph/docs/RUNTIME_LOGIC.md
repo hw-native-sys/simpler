@@ -75,7 +75,7 @@ never reaches shared memory; the bind maps it onto the status the caller sees.
 
 Step 1 gives each caller tensor a slice of the runner's retained temporary buffer
 rather than a per-run `device_malloc` / `device_free` pair: bind packs the run's
-non-child tensors to a 1024-aligned required size, grows the buffer only when a
+HOST/H2D tensors to a 1024-aligned required size, grows the buffer only when a
 run needs more than is currently retained, and bump-slices each tensor from it,
 so a steady-state workload performs no temporary device allocation at all. The
 slices are recorded as `BufferNoop` leases — validate copies the written ones
@@ -87,9 +87,14 @@ run can re-slice a buffer whose slices are still live. The mechanism
 `tensormap_and_ringbuffer`; that runtime's `RUNTIME_LOGIC.md` §2.4 carries the
 grow/slice details.
 
-The H2D copy-in of a tensor precedes its registration with the run's host
-accessor, so a reused slice can never expose the previous run's bytes to
-orchestration.
+HOST/NONE arguments bypass the temporary buffer. They remain HOST views for
+host orchestration's `get_tensor_data` (IN/INOUT) and `set_tensor_data`
+(OUT/INOUT). HOST/H2D arguments become DEVICE views after binding and cannot be
+accessed through those host entries. DEVICE task and Graph boundary arguments
+must be DEVICE. When both sides need the same control data, the caller passes
+separate HOST/NONE and HOST/H2D (or DEVICE/NONE) arguments; host writes do not
+mirror into the device argument. Device-produced host controls require an
+explicit completed copy before submitting the dependent call.
 
 An empty caller tensor addresses nothing, so it takes no slice and reaches
 orchestration with a null address. **This is a change in what hbg accepts.**

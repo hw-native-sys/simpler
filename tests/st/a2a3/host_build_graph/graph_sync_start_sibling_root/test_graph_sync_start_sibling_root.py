@@ -24,6 +24,7 @@ gated-stageable root in its body and so never exercises that interaction.
 
 import torch
 from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import TensorTransfer
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
@@ -109,7 +110,7 @@ class TestGraphSyncStartSiblingRootHbg(SceneTestCase):
                 "sibling_output",
                 torch.full((SIBLING_BLOCKS * FLOATS_PER_CACHE_LINE,), UNWRITTEN, dtype=torch.float32),
             ),
-            TensorArg("layout", torch.zeros(1, dtype=torch.int32)),
+            TensorArg("layout", torch.zeros(1, dtype=torch.int32), transfer=TensorTransfer.NONE),
         )
 
     def compute_golden(self, args, params):

@@ -22,9 +22,6 @@ a2a3_hbg_case(test_hbg_tensormap.cpp
 a2a3_hbg_case(test_dep_gen_host_graph.cpp
     SOURCES ${SIMPLER_SRC}/common/host_build_graph/host/dep_gen_host_graph.cpp)
 
-a2a3_hbg_case(test_hbg_tensor_access.cpp
-    SOURCES ${SIMPLER_SRC}/common/host_build_graph/host/host_tensor_access.cpp)
-
 # The func_id -> CoreCallable dispatch table holds exactly the active callable's
 # mappings. An entry that outlives the ChipCallable buffer it points into is
 # dereferenced by the scheduler and called by the AICore, so this links the

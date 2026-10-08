@@ -40,7 +40,7 @@ extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return OrchestrationConfig{
-        .expected_arg_count = 4,
+        .expected_arg_count = 5,
     };
 }
 
@@ -50,16 +50,17 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::hbg::Tensor &ext_B = orch_args.tensor(1).ref();
     const simpler::hbg::Tensor &ext_C = orch_args.tensor(2).ref();
     const simpler::hbg::Tensor &ext_config = orch_args.tensor(3).ref();
+    const auto &host_config = orch_args.tensor(4).ref();
 
     // Read config from tensor data: [tile_size, grid_k, num_groups, incore_loop]
     uint32_t config_idx[1] = {0};
-    int tile_size = static_cast<int>(get_tensor_data<int64_t>(ext_config, 1, config_idx));
+    int tile_size = static_cast<int>(get_tensor_data<int64_t>(host_config, 1, config_idx));
     config_idx[0]++;
-    int grid_k = static_cast<int>(get_tensor_data<int64_t>(ext_config, 1, config_idx));
+    int grid_k = static_cast<int>(get_tensor_data<int64_t>(host_config, 1, config_idx));
     config_idx[0]++;
-    int num_groups = static_cast<int>(get_tensor_data<int64_t>(ext_config, 1, config_idx));
+    int num_groups = static_cast<int>(get_tensor_data<int64_t>(host_config, 1, config_idx));
     config_idx[0]++;
-    int incore_loop = static_cast<int>(get_tensor_data<int64_t>(ext_config, 1, config_idx));
+    int incore_loop = static_cast<int>(get_tensor_data<int64_t>(host_config, 1, config_idx));
     uint64_t tile_elems = static_cast<uint64_t>(tile_size) * tile_size;
 
     int grid_m = 1;

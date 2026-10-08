@@ -28,11 +28,10 @@
  * runtimes and both architectures, precisely because that failure is silent.
  *
  * Precondition: validate_program_tensor_transfers returned 0 for this call. Thus HOST
- * means contiguous H2D with zero start_offset, and DEVICE means NONE, in both this
- * sizing pass and the bind allocation loop.
+ * transfers are contiguous H2D with zero start_offset. HOST/NONE and DEVICE/NONE
+ * have no device staging slice in this sizing pass or the bind allocation loop.
  *
- * The predicate: a device-memory tensor is passed through untouched and an
- * empty one addresses nothing, so neither takes a slice. Everything else takes
+ * The predicate: only a nonempty HOST/H2D tensor takes
  * one, rounded up to the bump's slice alignment — including a pure `OUT`
  * tensor, which needs the device buffer but no H2D copy-in, so this is not the
  * same set as the tensors `bind.args` reports as `h2d=`.
@@ -45,7 +44,7 @@ inline size_t packed_temp_bytes(const ChipStorageTaskArgs *orch_args) {
     size_t required = 0;
     for (int i = 0; i < orch_args->tensor_count(); i++) {
         ChipTensor t = orch_args->tensor(i);
-        if (t.is_device_memory() || t.nbytes() == 0) {
+        if (t.transfer != TensorTransfer::H2D || t.nbytes() == 0) {
             continue;
         }
         required += RetainedTempBump::align_up(static_cast<size_t>(t.nbytes()));

@@ -25,7 +25,7 @@ extern "C" {
 
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &args) {
     (void)args;
-    return OrchestrationConfig{.expected_arg_count = 4};
+    return OrchestrationConfig{.expected_arg_count = 5};
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
@@ -34,7 +34,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::hbg::Tensor &out = args.tensor(2).ref();
     const uint64_t spin_iters = args.scalar<uint64_t>(0);
     const uint32_t control_index[] = {0};
-    const float host_control = get_tensor_data<float>(b, 1, control_index);
+    const float host_control = get_tensor_data<float>(args.tensor(3).ref(), 1, control_index);
     uint32_t shape[1] = {a.shapes[0]};
     TensorCreateInfo temporary(shape, 1, DataType::FLOAT32);
 

@@ -11,6 +11,7 @@
 
 import torch
 from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import TensorTransfer
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
@@ -28,7 +29,7 @@ class TestBenchmarkBgemmHostBuildGraph(SceneTestCase):
             # from GM, adds the matmul result, and stores it back across grid_k
             # iterations. Its host-provided zeros must be copied in H2D, so C is
             # INOUT (read-before-write), not a pure OUT.
-            "signature": [D.IN, D.IN, D.INOUT, D.IN],
+            "signature": [D.IN, D.IN, D.INOUT, D.IN, D.IN],
         },
         "incores": [
             {
@@ -71,6 +72,7 @@ class TestBenchmarkBgemmHostBuildGraph(SceneTestCase):
             TensorArg("B", B.flatten()),
             TensorArg("C", C.flatten()),
             TensorArg("config", config),
+            TensorArg("host_config", config, transfer=TensorTransfer.NONE),
         )
 
     def compute_golden(self, args, params):

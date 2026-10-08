@@ -1468,12 +1468,8 @@ int32_t run_host_orchestration(
     orchestrator.total_cluster_count = block_dim * PLATFORM_AIC_CORES_PER_BLOCKDIM;
     orchestrator.total_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
     rt->mode = MODE_EXECUTE;
-    // get_tensor_data/set_tensor_data resolve buffer.addr through the host
-    // views registered at copy-in time (host_build_graph/host_tensor_access.h),
-    // so the host orchestrator can read control tensors (e.g. paged_attention's
-    // context_lens/block_table) whether or not the platform maps device memory
-    // into the host address space.
-
+    // Host get/set operates only on explicit HOST/NONE arguments. Uploaded
+    // arguments and runtime outputs are DEVICE tensors and cannot be read here.
     const auto *entry_points = reinterpret_cast<const HostOrchEntryPoints *>(host_orch_func_ptr);
     if (entry_points->bind == nullptr) {
         LOG_ERROR("host-orch: orch .so framework_bind_runtime was not resolved");
@@ -1911,7 +1907,7 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_ERROR("orch_args pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    const int transfer_status = validate_program_tensor_transfers(orch_args);
+    const int transfer_status = validate_program_tensor_transfers(orch_args, true, signature, sig_count);
     if (transfer_status != 0) return transfer_status;
     // host_build_graph host-orch: register_callable_impl resolved the
     // orchestration entry on the host and passed it here as host_orch_func_ptr;
@@ -1951,10 +1947,17 @@ extern "C" int bind_callable_to_runtime_impl(
     // Build device args: copy from input, replace host tensor pointers with device pointers
     ChipStorageTaskArgs device_args;
 
-    // This run's host-view window. The accessor owns every mapping it
-    // registers and releases them on every exit path, so no host view outlives
-    // the point at which a task could make it stale.
-    HostTensorAccessor tensor_access(api);
+    // Explicit HOST/NONE views are validated before any tensor copy and remain
+    // bound until all host recording threads have finished.
+    HostTensorAccessor tensor_access;
+    for (int i = 0; i < tensor_count; ++i) {
+        const ChipTensor &t = orch_args->tensor(i);
+        if (t.address_space == AddressSpace::HOST && t.transfer == TensorTransfer::NONE &&
+            !tensor_access.add(t, signature[i])) {
+            LOG_ERROR("host-orch: invalid or overlapping HOST argument %d", i);
+            return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        }
+    }
 
     // A lease recorded by an earlier bind names an offset this bind is about to
     // re-slice, so carrying one over would copy this run's bytes back to that
@@ -1999,13 +2002,11 @@ extern "C" int bind_callable_to_runtime_impl(
         if (t.is_device_memory()) {
             always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "caller tensor reaches into the virtual heap window");
             LOG_DEBUG("  ChipTensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.buffer.addr);
-            // The bytes stay where the caller put them, so orchestration has no
-            // copy-in buffer to read them from. Claim the span now and let the
-            // platform resolve a means only if an access actually lands in it.
-            if (!tensor_access.add_child_memory(t.buffer.addr, t.buffer.size)) {
-                LOG_ERROR("host-orch: could not claim child-memory tensor %d (0x%" PRIx64 ")", i, t.buffer.addr);
-                return PTO_RUNTIME_ERR_INTERNAL;
-            }
+            device_args.add_tensor(t);
+            continue;
+        }
+
+        if (t.transfer == TensorTransfer::NONE) {
             device_args.add_tensor(t);
             continue;
         }
@@ -2015,6 +2016,8 @@ extern "C" int bind_callable_to_runtime_impl(
         // An empty tensor addresses nothing, so it takes no slice and carries a
         // null address rather than one aliasing the next tensor's.
         if (size == 0) {
+            t.address_space = AddressSpace::DEVICE;
+            t.transfer = TensorTransfer::NONE;
             t.buffer.addr = 0;
             device_args.add_tensor(t);
             continue;
@@ -2059,18 +2062,8 @@ extern "C" int bind_callable_to_runtime_impl(
         );
         LOG_DEBUG("  ChipTensor %d: %zu bytes at %p", i, size, dev_ptr);
 
-        // host_build_graph runs the orchestrator on the host, which may read
-        // host-memory control tensors (e.g. paged_attention's context_lens and
-        // block_table) via get_tensor_data to shape the graph. A pure output
-        // has no valid readable bytes before execution, and a5 cannot map it;
-        // exposing its caller buffer would therefore make reads unsafe. Leave
-        // it unregistered so both get_tensor_data and set_tensor_data fail
-        // closed during orchestration.
-        if (!is_pure_output && !tensor_access.add(reinterpret_cast<uint64_t>(dev_ptr), size, host_ptr)) {
-            LOG_ERROR("host-orch: no host view for tensor %d (dev_ptr %p, %zu bytes)", i, dev_ptr, size);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-
+        t.address_space = AddressSpace::DEVICE;
+        t.transfer = TensorTransfer::NONE;
         t.buffer.addr = reinterpret_cast<uint64_t>(dev_ptr);
         always_assert(t.buffer.addr < HEAP_VIRTUAL_BASE && "an argument slice reaches into the virtual heap window");
         device_args.add_tensor(t);
@@ -2157,21 +2150,9 @@ extern "C" int bind_callable_to_runtime_impl(
         int32_t total_tasks = run_host_orchestration(
             runtime, api, tensor_access, rt, host_arena, layout, sm_size, task_capacity, host_orch_func_ptr, orch_l2
         );
-        // The orchestrator is the only host-view reader; from here the device
-        // owns these buffers, so drop the window on both exits.
-        const size_t view_count = tensor_access.mapping_count();
-        const uint64_t view_bytes = tensor_access.mapped_bytes();
-        const uint64_t device_copies = tensor_access.device_copy_count();
         const BindPhaseMark view_close_phase = bind_phase_begin();
         tensor_access.close();
-        {
-            char attrs[kBindAttrsCapacity];
-            snprintf(
-                attrs, sizeof(attrs), "count=%zu bytes=%" PRIu64 " devcopy=%" PRIu64, view_count, view_bytes,
-                device_copies
-            );
-            record_bind_phase(HostPhaseKind::BindHostViewClose, view_close_phase, attrs);
-        }
+        record_bind_phase(HostPhaseKind::BindHostViewClose, view_close_phase, "");
         if (total_tasks < 0) {
             LOG_ERROR("host-orch: orchestration run failed");
             return total_tasks;

@@ -68,11 +68,12 @@ extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return OrchestrationConfig{
-        .expected_arg_count = 7,
+        .expected_arg_count = 8,
     };
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
+    const auto &host_context_lens = orch_args.tensor(6).ref();
 #ifdef ENABLE_PROFILING
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;
@@ -155,7 +156,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
         uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
-        uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
+        uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(host_context_lens, 1, cl_idx));
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
 
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {

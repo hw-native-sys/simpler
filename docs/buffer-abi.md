@@ -128,17 +128,38 @@ changes `view`. Omitted transfer in `TaskArgs.add_tensor` or the transitional L2
 
 Mailbox slots preserve each request in byte 141, formerly reserved view padding;
 standalone Tensor values do not carry it. Re-export and L2 materialization preserve
-the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE;
-HOST/NONE returns UNSUPPORTED, and invalid pairs return INVALID_ARGUMENT, before
-any tensor content copy or device allocation. HOST/H2D also requires canonical
+the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE.
+HBG also accepts HOST/NONE with a declared IN/OUT/INOUT direction; TMR device
+orchestration returns UNSUPPORTED for it. Invalid location/transfer pairs return
+INVALID_ARGUMENT before tensor content copying or device allocation. HOST/H2D also requires canonical
 row-major strides and zero `ChipTensor.start_offset`, including for OUT arguments:
 the binders allocate and copy `numel * element_size` bytes from `buffer.addr`,
 without packing strided views or rebasing an element offset. Unsupported HOST
-layouts return UNSUPPORTED in the same whole-call preflight. Public `Tensor.byte_offset`
+layouts return UNSUPPORTED in the same whole-call preflight. Overlapping HOST/H2D
+views are also rejected when either callable parameter may write: independent
+device copies cannot preserve writable aliasing. Read-only copies may overlap;
+use explicit device storage to preserve device-side writable aliases. Public `Tensor.byte_offset`
 is folded into the imported address during L2 materialization and remains supported
 for contiguous views. DEVICE/NONE views retain their strides and offsets without
 transport. Host-only leaves can use HOST/NONE.
-This does not change HBG's existing host-access implementation. Remote protocol v4
+HBG registers HOST/NONE view bounds before copying any tensor. `get_tensor_data`
+reads only HOST/NONE IN/INOUT, and `set_tensor_data` writes only HOST/NONE
+OUT/INOUT. Before importing a public HOST/NONE argument, each chip entry also
+checks that its Buffer grant covers the callable direction; a weaker TaskArgs
+tag cannot authorize additional host writes. Strided HOST/NONE views are accepted without packing. Overlapping
+HOST/NONE views with a writer are rejected. Empty views bind but have no readable
+or writable elements. Bind does not create a device allocation for these views.
+
+After H2D binding, the orchestration argument is DEVICE/NONE. Device tasks,
+Graph boundaries and dispatch predicates reject HOST arguments. HBG host access
+rejects DEVICE arguments regardless of producer readiness: it performs no hidden
+D2H/H2D, no device mapping, and no mid-call wait for a producer. If both sides need
+a control tensor, pass two entries as above. H2D copying precedes host orchestration,
+so a host-only write changes only the host backing; it does not update the separate
+device argument. To read a prior device result on the host, wait and explicitly
+copy it before submitting the next call. The caller retains host backing through
+completion; argument registration does not transfer its ownership.
+ Remote protocol v4
 represents only legacy location defaults: its encoder rejects other per-call
 requests before emitting a payload instead of silently dropping them.
 Tensor/ChipTensor sizes remain 144/72 bytes; the internal ChipTensor carrier uses
@@ -457,7 +478,7 @@ backing release inside the fence is part of the P2 lifecycle work above.
 This registration boundary covers `Worker` TaskArgs submission, including
 [borrowed device sources](#borrowed-device-sources-at-direct-l2).
 `ChipWorker.run(handle, args)` also accepts `TaskArgs`, using the same snapshot,
-import registry and POD conversion for scalar and contiguous HOST/H2D arguments. It rejects
+import registry and POD conversion for scalars, contiguous HOST/H2D arguments and explicit HOST/NONE views. It rejects
 DEVICE descriptors before any import: device provenance and source retention
 belong to `Worker(level=2).submit`. The resolved `ChipStorageTaskArgs` entry
 remains a compatibility path with caller-managed addresses.
@@ -469,8 +490,7 @@ further public `run` calls are refused, and only successful `finalize` releases
 them. Failed teardown preserves them for retry. Public `run` and `finalize` are
 serialized. Descriptors do not retain the caller's allocation: callers must keep
 host storage valid through successful return or successful teardown after an
-error; no Buffer ownership transfers to ChipWorker. This path adds no HOST/NONE
-chip execution or cross-side mapping.
+error; no Buffer ownership transfers to ChipWorker. HOST/NONE is consumed by HBG host orchestration; it provides no cross-side mapping.
 Explicit task dependencies stay an L3 orchestration concept: a direct L2
 submission is one task, so no `TaskArgs` dependency entry reaches the chip
 through this path.

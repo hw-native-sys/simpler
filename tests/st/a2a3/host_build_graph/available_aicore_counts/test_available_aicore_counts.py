@@ -33,6 +33,7 @@ silently disabled.
 
 import torch
 from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import TensorTransfer
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
@@ -94,7 +95,7 @@ class TestAvailableAicoreCounts(SceneTestCase):
     def generate_args(self, params):
         return TaskArgsBuilder(
             TensorArg("blocks", torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)),
-            TensorArg("shape", torch.zeros(2, dtype=torch.int32)),
+            TensorArg("shape", torch.zeros(2, dtype=torch.int32), transfer=TensorTransfer.NONE),
         )
 
     def compute_golden(self, args, params):

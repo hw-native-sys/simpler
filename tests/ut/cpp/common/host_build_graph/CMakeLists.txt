@@ -158,9 +158,8 @@ hbg_case(test_native_run_acceptance.cpp
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp
     INCLUDES ${SIMPLER_SRC}/common/worker)
 
-# The host accessor's refusals, over a fake HostApi table: a caller device buffer a live run still
-# holds is deferred, an address no region covers stays an invalid argument.
-hbg_case(test_host_tensor_access_deferral.cpp
+# Explicit host views never acquire device mappings or invoke device copies.
+hbg_case(test_hbg_tensor_access.cpp
     SOURCES ${HBG_HOST_DIR}/host_tensor_access.cpp)
 
 # Everything else here is a case of this runtime with nothing beyond the

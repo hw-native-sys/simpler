@@ -17,7 +17,7 @@ import pytest
 import torch
 from simpler.buffer import Buffer, create_host_shared_buffer, mint_owner_instance_id
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import CallConfig, ChipWorker, DataType, TaskArgs, Tensor, TensorArgType
+from simpler.task_interface import CallConfig, ChipWorker, DataType, TaskArgs, Tensor, TensorArgType, TensorTransfer
 from simpler.worker import Worker
 
 from simpler_setup.runtime_builder import RuntimeBuilder
@@ -35,7 +35,7 @@ def _build_callable(platform):
         "orchestration": {
             "source": str(_HERE / "kernels/orchestration/host_readiness.cpp"),
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN, D.INOUT, D.OUT],
+            "signature": [D.IN, D.INOUT, D.OUT, D.INOUT],
         },
         "incores": [{"func_id": 0, "source": str(kernel), "core_type": "aiv", "signature": [D.IN, D.OUT]}],
     }
@@ -48,11 +48,12 @@ def _host_tensor(worker, tensor):
     return worker.make_tensor_arg(tensor, shapes=(_SIZE,), dtype=DataType.FLOAT32)
 
 
-def _args(worker, source, control, output, mode, offset=0.0):
+def _args(worker, source, control, output, host_control, mode, offset=0.0):
     args = TaskArgs()
     args.add_tensor(_host_tensor(worker, source), TensorArgType.INPUT)
     args.add_tensor(control, TensorArgType.INOUT)
     args.add_tensor(_host_tensor(worker, output), TensorArgType.OUTPUT_EXISTING)
+    args.add_tensor(_host_tensor(worker, host_control), TensorArgType.INOUT, transfer=TensorTransfer.NONE)
     args.add_scalar(mode)
     args.add_scalar(struct.unpack("<I", struct.pack("<f", offset))[0])
     return args
@@ -72,6 +73,7 @@ def test_completed_producer_supplies_native_host_access(st_platform, st_device_i
         source = torch.full((_SIZE,), 2.0)
         control = torch.full((_SIZE,), -91.0)
         output = torch.zeros(_SIZE)
+        host_control = torch.zeros(_SIZE)
         device = None
         if storage == "child":
             device = worker.malloc(control.nbytes)
@@ -98,18 +100,28 @@ def test_completed_producer_supplies_native_host_access(st_platform, st_device_i
         for offset in (5.0, 11.0, -4.0):
             output.zero_()
             produced = 2.0 + offset
-            producer = worker.submit(handle, _args(worker, source, control_arg, output, 0, offset), CallConfig())
+            producer = worker.submit(
+                handle, _args(worker, source, control_arg, output, host_control, 0, offset), CallConfig()
+            )
             producer.wait(30.0)
             if storage == "host":
                 torch.testing.assert_close(control, torch.full_like(control, produced))
 
-            # Child memory stays on device until the consumer has read it during bind.
+            # Explicit copy follows producer completion, before any host consumer.
+            if storage == "source":
+                if st_platform.endswith("sim"):
+                    ctypes.memmove(control.data_ptr(), address, control.nbytes)
+                else:
+                    worker._chip_worker.copy_from(control.data_ptr(), address, control.nbytes)
+            elif device is not None:
+                worker.copy_from(control, device)
+            host_control.copy_(control)
             mode = 2 if write_control else 1
-            consumer = worker.submit(handle, _args(worker, source, control_arg, output, mode), CallConfig())
+            consumer = worker.submit(
+                handle, _args(worker, source, control_arg, output, host_control, mode), CallConfig()
+            )
             consumer.result(30.0)
             expected = torch.full_like(output, 2 * produced + 3 if write_control else 2 + produced)
-            if write_control:
-                expected[0] = 2 * (produced + 3)
             torch.testing.assert_close(output, expected)
             if storage == "source":
                 if st_platform.endswith("sim"):
@@ -118,7 +130,8 @@ def test_completed_producer_supplies_native_host_access(st_platform, st_device_i
                     worker._chip_worker.copy_from(control.data_ptr(), address, control.nbytes)
             elif device is not None:
                 worker.copy_from(control, device)
-            assert control[0].item() == produced + (3 if write_control else 0)
+            assert control[0].item() == produced
+            assert host_control[0].item() == produced + (3 if write_control else 0)
 
 
 @pytest.mark.platforms(["a2a3", "a5", "a2a3sim", "a5sim"])
@@ -127,11 +140,11 @@ def test_completed_producer_supplies_native_host_access(st_platform, st_device_i
 def test_chipworker_consumes_host_taskargs(st_platform, st_device_ids):
     with ExitStack() as cleanup:
         owner = mint_owner_instance_id()
-        buffers = [create_host_shared_buffer((_SIZE + 2) * 4, owner, i + 1) for i in range(3)]
+        buffers = [create_host_shared_buffer((_SIZE + 2) * 4, owner, i + 1) for i in range(4)]
         for buffer in buffers:
             cleanup.callback(buffer.close)
         values = [torch.full((_SIZE + 2,), -999.0) for _ in buffers]
-        for buffer, value, initial in zip(buffers, values, (2.0, -91.0, 0.0), strict=True):
+        for buffer, value, initial in zip(buffers, values, (2.0, -91.0, 0.0, 0.0), strict=True):
             value[1:-1] = initial
             ctypes.memmove(buffer.base, value.data_ptr(), buffer.nbytes)
         views = [Tensor(buffer, shapes=(_SIZE,), dtype=DataType.FLOAT32, byte_offset=4) for buffer in buffers]
@@ -143,21 +156,23 @@ def test_chipworker_consumes_host_taskargs(st_platform, st_device_ids):
         def arguments(mode, offset=0.0):
             args = TaskArgs()
             for view, tag in zip(
-                views, (TensorArgType.INPUT, TensorArgType.INOUT, TensorArgType.OUTPUT_EXISTING), strict=True
+                views[:3], (TensorArgType.INPUT, TensorArgType.INOUT, TensorArgType.OUTPUT_EXISTING), strict=True
             ):
                 args.add_tensor(view, tag)
+            args.add_tensor(views[3], TensorArgType.INOUT, transfer=TensorTransfer.NONE)
             args.add_scalar(mode)
             args.add_scalar(struct.unpack("<I", struct.pack("<f", offset))[0])
             return args
 
         for offset in (5.0, 11.0, -4.0):
             worker.run(handle, arguments(0, offset))
+            ctypes.memmove(buffers[3].base, buffers[1].base, buffers[1].nbytes)
             worker.run(handle, arguments(2))
             for buffer, value in zip(buffers, values, strict=True):
                 ctypes.memmove(value.data_ptr(), buffer.base, buffer.nbytes)
                 assert value[0].item() == value[-1].item() == -999.0
             produced = 2.0 + offset
             expected = torch.full((_SIZE,), 2 * produced + 3)
-            expected[0] = 2 * (produced + 3)
             torch.testing.assert_close(values[2][1:-1], expected)
-            assert values[1][1].item() == produced + 3
+            assert values[1][1].item() == produced
+            assert values[3][1].item() == produced + 3

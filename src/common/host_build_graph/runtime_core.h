@@ -146,11 +146,9 @@ struct RuntimeContext {
     // identity prevents two orchestration DSOs from sharing the same key.
     uint64_t active_callable_hash;
 
-    // Host views of the tensors this run staged, owned by the run that
-    // registered them. Null on the AICPU path, which loads device addresses
-    // directly; get_tensor_data / set_tensor_data then fail closed rather than
-    // dereferencing one. Lives past the first two fields, so the orchestration
-    // .so's partial RuntimeContext definition neither sees nor needs it.
+    // Explicit HOST/NONE views registered for this orchestration call. Null on the AICPU path, which loads device
+    // addresses directly; get_tensor_data / set_tensor_data then fail closed rather than dereferencing one. Lives past
+    // the first two fields, so the orchestration .so's partial RuntimeContext definition neither sees nor needs it.
     HostTensorAccessor *tensor_access;
 
     // Prebuilt-arena fast path metadata. Carries every offset

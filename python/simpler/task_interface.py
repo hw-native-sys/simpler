@@ -115,8 +115,26 @@ from _task_interface import (
     scalar_to_uint64 as _native_scalar_to_uint64,
 )
 
-from .buffer import AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
+from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
 from .comm_endpoints import DEVICE_AICPU
+
+
+def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -> None:
+    """Check callable-side host access before descriptors become address-only PODs."""
+    for i in range(args.tensor_count()):
+        buffer = args.tensor(i).buffer
+        if buffer.address_space != AddressSpace.HOST or args.transfer(i) != TensorTransfer.NONE:
+            continue
+        direction = target.sig(i) if target is not None and i < target.sig_count else None
+        needed = {
+            ArgDirection.IN: AccessMode.READ,
+            ArgDirection.OUT: AccessMode.WRITE,
+            ArgDirection.INOUT: AccessMode.READWRITE,
+        }.get(direction)
+        # Wire TaskArgs do not carry dependency tags. The callable signature governs
+        # actual host reads/writes, so a weaker caller tag cannot widen the grant.
+        if needed is None or buffer.access not in (needed, AccessMode.READWRITE):
+            raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
 
 
 def _assert_bindings_match_source_tree() -> None:
@@ -1781,7 +1799,8 @@ class ChipWorker:
 
         Args:
             handle: ``CallableHandle`` returned by ``register_callable``.
-            args: TaskArgs with scalar values and contiguous HOST/H2D tensors.
+            args: TaskArgs with scalar values, HOST/NONE controls (HBG), and
+                contiguous HOST/H2D tensors.
                 DEVICE descriptors require Worker(level=2).submit, which validates
                 their live source registration. ChipStorageTaskArgs is accepted
                 for compatibility with callers supplying resolved addresses.
@@ -1806,14 +1825,17 @@ class ChipWorker:
             config = self._run_config(config, kwargs)
             if isinstance(args, TaskArgs):
                 args = _ti_module._snapshot_local_task_args(args)
+                _validate_host_control_access(state.target, args)
                 for i in range(args.tensor_count()):
                     if args.tensor(i).buffer.address_space == AddressSpace.DEVICE:
                         raise ValueError(
                             f"ChipWorker.run: argument {i} is DEVICE; use Worker(level=2).submit "
                             "for source registration and lifetime validation"
                         )
+                    if args.transfer(i) == TensorTransfer.NONE:
+                        continue
                     if args.transfer(i) != TensorTransfer.H2D:
-                        raise ValueError(f"ChipWorker.run: argument {i} requires H2D transfer")
+                        raise ValueError(f"ChipWorker.run: argument {i} requires NONE or H2D transfer")
                     tensor = args.tensor(i)
                     expected = 1
                     shapes, strides = tensor.shapes, tensor.strides

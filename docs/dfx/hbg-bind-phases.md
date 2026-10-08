@@ -31,7 +31,7 @@ the `chip.run.bind` span:
 | `host_orch` | orchestration and recording: every task submitted and every sub-task recorded; excludes the later Definition packing and Graph task binding in `bind_graph_definitions` |
 | `graph_pack` | assembling this run's Definition section in `bind_graph_definitions` — staging growth, header writes, spill copies — and handing it to the AICPU launch package, which RTS copies with the launch. **No H2D of its own**: the Definition bytes travel as launch arguments, so there is no device Definition block to upload. Excludes Graph task binding. Absent when there is no Definition |
 | `arena_h2d` | one H2D of the arena's copied zone and the shared-memory image |
-| `host_view_close` | closing per-run tensor-access regions and any optional device mappings; the bind path installs none of its own (`count=0 bytes=0`). `devcopy=N` counts orchestration accesses to child memory that were served by a PCIe round trip because no host mapping was available — a mapping, where one is available, is held by the runtime for the allocation's lifetime and is not closed here |
+| `host_view_close` | dropping the explicit HOST/NONE access registrations after host orchestration and recorder completion; no mapping or device-copy fallback is performed. Historical `count`, `bytes`, and `devcopy` attributes are no longer emitted |
 
 The parser's **control plane** label is the instrumented subtotal
 `host_orch + graph_pack + arena_h2d`, not the complete cost between "the

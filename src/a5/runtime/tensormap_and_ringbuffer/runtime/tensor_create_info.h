@@ -86,7 +86,7 @@ init_tensor_from_create_info(simpler::tmr::Tensor &t, const TensorCreateInfo &ci
     t.dtype = ci.dtype;
     t.manual_dep = ci.manual_dep;
     t.is_contiguous = true;
-    t.address_space = AddressSpace::HOST;
+    t.address_space = AddressSpace::DEVICE;
     for (uint32_t i = 0; i < ci.ndims; ++i) {
         t.shapes[i] = ci.shapes[i];
     }

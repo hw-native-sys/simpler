@@ -19,13 +19,14 @@ enum class Mode : uint64_t { Produce, Read, ReadWrite };
 
 extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
-    return OrchestrationConfig{.expected_arg_count = 5};
+    return OrchestrationConfig{.expected_arg_count = 6};
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
     const auto &source = args.tensor(0).ref();
     const auto &control = args.tensor(1).ref();
     const auto &output = args.tensor(2).ref();
+    const auto &host_control = args.tensor(3).ref();
     const auto mode = static_cast<Mode>(args.scalar<uint64_t>(0));
     union {
         uint64_t bits;
@@ -35,14 +36,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         scalar.bits = args.scalar<uint64_t>(1);
     } else {
         const uint32_t index[] = {0};
-        scalar.value = get_tensor_data<float>(control, 1, index);
+        scalar.value = get_tensor_data<float>(host_control, 1, index);
         if (mode == Mode::ReadWrite) {
             scalar.value += 3.0F;
-            set_tensor_data<float>(control, 1, index, scalar.value);
+            set_tensor_data<float>(host_control, 1, index, scalar.value);
         }
     }
     CoreTaskArgs task;
-    // ReadWrite consumes both the host-written element and the host-read scalar.
+    // Device control remains unchanged by the separate host control write.
     task.add_input(mode == Mode::ReadWrite ? control : source);
     task.add_output(mode == Mode::Produce ? control : output);
     task.add_scalar(scalar.bits);

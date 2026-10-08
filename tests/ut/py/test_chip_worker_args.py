@@ -22,6 +22,7 @@ from simpler.buffer import (
     wrap_device_malloc,
 )
 from simpler.task_interface import (
+    ArgDirection,
     ChipCallable,
     ChipStorageTaskArgs,
     ChipWorker,
@@ -63,7 +64,7 @@ def chip():
             if args.tensor_count():
                 tensor = args.tensor(0)
                 assert tensor.address_space == AddressSpace.HOST
-                assert args.transfer(0) == TensorTransfer.H2D
+                assert args.transfer(0) in (TensorTransfer.H2D, TensorTransfer.NONE)
                 ctypes.c_float.from_address(tensor.data).value += 5.0
 
         def finalize(self):
@@ -73,7 +74,9 @@ def chip():
 
     worker = ChipWorker()
     worker._impl = Native()
-    handle = worker.register_callable(ChipCallable.build(signature=[], func_name="test", binary=b"x", children=[]))
+    handle = worker.register_callable(
+        ChipCallable.build(signature=[ArgDirection.INOUT], func_name="test", binary=b"x", children=[])
+    )
     yield worker, handle
     worker._impl.fail_finalize = False
     worker.finalize()
@@ -109,7 +112,7 @@ def test_host_view_uses_common_materializer_and_closes_import(chip, backing, mon
     assert imports[0].shm._mmap is None
 
 
-@pytest.mark.parametrize("reason", ["device", "grant", "host_none", "strided"])
+@pytest.mark.parametrize("reason", ["device", "grant", "strided"])
 def test_whole_call_rejection_precedes_any_import(chip, backing, monkeypatch, reason):
     worker, handle = chip
     args = args_for(backing, scalar=False)
@@ -120,9 +123,6 @@ def test_whole_call_rejection_precedes_any_import(chip, backing, monkeypatch, re
         backing.access = AccessMode.READ
         args.add_tensor(Tensor(backing, shapes=(1,), dtype=DataType.FLOAT32))
         args.set_tag(1, TensorArgType.OUTPUT_EXISTING)
-    elif reason == "host_none":
-        args = TaskArgs()
-        args.add_tensor(Tensor(backing, shapes=(1,), dtype=DataType.FLOAT32), transfer=TensorTransfer.NONE)
     else:
         args = TaskArgs()
         args.add_tensor(Tensor(backing, shapes=(1,), dtype=DataType.FLOAT32))
@@ -265,3 +265,33 @@ def test_invalid_config_does_not_retain_imports(chip, backing):
     assert worker._impl.runs == []
     worker.run(handle, args_for(backing))
     assert len(worker._impl.runs) == 1
+
+
+def test_host_none_request_survives_public_binding(chip, backing):
+    worker, handle = chip
+    args = TaskArgs()
+    args.add_tensor(Tensor(backing, shapes=(2,), dtype=DataType.FLOAT32), transfer=TensorTransfer.NONE)
+    worker.run(handle, args)
+    assert worker._impl.runs[0].transfer(0) == TensorTransfer.NONE
+
+
+@pytest.mark.parametrize("direction", [ArgDirection.OUT, ArgDirection.INOUT])
+def test_host_control_grant_checked_against_callable_before_import(chip, backing, monkeypatch, direction):
+    worker, _ = chip
+    handle = worker.register_callable(
+        ChipCallable.build(signature=[direction], func_name="write", binary=b"y", children=[])
+    )
+    backing.access = AccessMode.READ
+    args = TaskArgs()
+    args.add_tensor(
+        Tensor(backing, shapes=(2,), dtype=DataType.FLOAT32), TensorArgType.INPUT, transfer=TensorTransfer.NONE
+    )
+
+    def forbidden(*_):
+        raise AssertionError("readonly host control reached import")
+
+    monkeypatch.setattr(ImportRegistry, "materialize_args", forbidden)
+    with pytest.raises(ValueError, match="HOST/NONE.*grant"):
+        worker.run(handle, args)
+    assert worker._impl.runs == []
+    assert worker._argument_imports is None

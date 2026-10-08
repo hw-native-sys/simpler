@@ -33,7 +33,7 @@ extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return OrchestrationConfig{
-        .expected_arg_count = 105,
+        .expected_arg_count = 106,
     };
 }
 
@@ -6437,7 +6437,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     int32_t nt_inline677__rv_v2 = nt_inline677;
     for (int64_t owner_rank_inline652 = 0; owner_rank_inline652 < 2; owner_rank_inline652 += 1) {
         uint32_t indices_t[1] = {static_cast<uint32_t>(owner_rank_inline652)};
-        int32_t t = get_tensor_data<int32_t>(ext_num_tokens_per_owner, 1, indices_t);
+        int32_t t = get_tensor_data<int32_t>(orch_args.tensor(92).ref(), 1, indices_t);
         int32_t nt_inline677__ssa_v3 = std::max<int32_t>(nt_inline677__rv_v2, t);
         nt_inline677__rv_v2 = nt_inline677__ssa_v3;
     }

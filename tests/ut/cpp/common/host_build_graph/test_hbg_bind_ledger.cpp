@@ -176,8 +176,7 @@ void access_entry(const ChipTaskArgs &args) {
                 task_args.add_output(written);
                 const TaskOutputTensors result = rt->orchestrator->submit_task(kernels, task_args);
                 ASSERT_TRUE(result.task_id().is_valid());
-                // The input alias has no owner id; rejection must come from the
-                // TensorMap overlap rather than the runtime-allocation branch.
+                // Both the original device view and its aliases stay device-only.
                 ASSERT_FALSE(tensor.owner_task_id.is_valid());
                 tensor = tensor.slice(0, g_access->producer == InputProducer::Disjoint ? 1 : 0, 2);
             }
@@ -502,12 +501,6 @@ struct CallerDeviceWriteState {
     int declare_rc{0};
     std::vector<std::pair<uint64_t, uint64_t>> declared_by_other_run;
     int query_calls{0};
-    // A reporter that wins the fatal field while an access is being refused — see the query fake.
-    int32_t fatal_from_query{0};
-    // Whether that winning reporter is itself another refused access, which publishes the
-    // dependency wait as the run's cause before this access's own report can.
-    bool cause_from_query{false};
-
     bool other_run_writes(uint64_t addr, uint64_t bytes) const {
         for (const auto &[base, size] : declared_by_other_run) {
             if (addr >= base && addr - base <= size && bytes <= size - (addr - base)) return true;
@@ -533,21 +526,6 @@ int fake_caller_device_span_written_by_other_run(void *, uint64_t, uint64_t addr
     if (g_writes == nullptr) return 0;
     ++g_writes->query_calls;
     const bool refused = g_writes->other_run_writes(addr, bytes);
-    // Stands in for the reporter that wins the fatal field while this access is being refused. The
-    // real one is a recording worker on another thread, between the refusal's mark and its own
-    // report; latching it here reaches the same state at the boundary that decides whose failure
-    // the run has — the mark is about to be set and the refusal's report can then only lose the
-    // exchange — and reaches it deterministically.
-    if (refused && g_writes->fatal_from_query != 0 && g_access != nullptr && g_access->runtime != nullptr) {
-        g_access->runtime->orchestrator->report_fatal(
-            g_writes->fatal_from_query, "competing_reporter", "an independent orchestration failure"
-        );
-        // The winner is another refused access rather than an unrelated failure: it owns the
-        // publication, so the run's cause is the wait it established.
-        if (g_writes->cause_from_query) {
-            host_tensor_note_dependency_wait_cause(g_access->runtime->tensor_access);
-        }
-    }
     return refused ? 1 : 0;
 }
 
@@ -1211,17 +1189,18 @@ TEST_F(HbgBindLedgerTest, HostGetSetCompletesBeforeMetadataPublication) {
     init_runtime(runtime);
     std::vector<uint8_t> input(64, 0x37);
     ChipStorageTaskArgs args;
-    args.add_tensor(host_tensor(input));
+    auto control = host_tensor(input);
+    control.transfer = TensorTransfer::NONE;
+    args.add_tensor(control);
     ArgDirection sig[] = {ArgDirection::INOUT};
     ASSERT_EQ(bind(runtime, args, sig, 1), 0);
-    EXPECT_EQ(fake_.copy_count, 2);
+    EXPECT_EQ(fake_.copy_count, 0);
     EXPECT_EQ(input[0], 0x52);
-    ASSERT_EQ(runtime.tensor_leases().size(), 1u);
-    EXPECT_EQ(std::memcmp(runtime.tensor_leases()[0].dev_ptr, input.data(), input.size()), 0);
+    EXPECT_TRUE(runtime.tensor_leases().empty());
     for (const auto &copy : fake_.copies)
         EXPECT_NE(copy.dst, runtime.pending_publication().device_target);
     EXPECT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
-    EXPECT_EQ(fake_.copy_count, 2);
+    EXPECT_EQ(fake_.copy_count, 0);
     EXPECT_TRUE(runtime.tensor_leases().empty());
 }
 
@@ -1385,21 +1364,22 @@ TEST_F(HbgBindLedgerTest, BindDrainsItsRecordersWithoutJoiningAnotherRuntime) {
     }
 }
 
-TEST_F(HbgHostAccessContractTest, HostInputIsReadableDuringBindAndInoutWritesReachBothCopies) {
+TEST_F(HbgHostAccessContractTest, ExplicitHostInoutReadsAndWritesOnlyCallerBytes) {
     Runtime runtime;
     init_runtime(runtime);
     auto runtime_cleanup = cleanup_runtime(runtime);
     std::vector<uint8_t> input(4, 0x17);
     ChipStorageTaskArgs args;
-    args.add_tensor(host_tensor(input));
+    auto control = host_tensor(input);
+    control.transfer = TensorTransfer::NONE;
+    args.add_tensor(control);
     ArgDirection sig[] = {ArgDirection::INOUT};
 
     ASSERT_EQ(bind(runtime, args, sig, 1), 0);
     ASSERT_EQ(access_.reads.size(), 1u);
     EXPECT_EQ(access_.reads[0], 0x17u);
     EXPECT_EQ(access_.error, 0);
-    ASSERT_EQ(runtime.tensor_leases().size(), 1u);
-    EXPECT_EQ(*static_cast<uint8_t *>(runtime.tensor_leases()[0].dev_ptr), 0x17);
+    EXPECT_TRUE(runtime.tensor_leases().empty());
     // An unpublished record belongs to the run that prepared it, so this run ends
     // before the one below binds.
     ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
@@ -1407,11 +1387,10 @@ TEST_F(HbgHostAccessContractTest, HostInputIsReadableDuringBindAndInoutWritesRea
     access_.write = true;
     ASSERT_EQ(bind(runtime, args, sig, 1), 0);
     EXPECT_EQ(input[0], 0x5a);
-    ASSERT_EQ(runtime.tensor_leases().size(), 1u);
-    EXPECT_EQ(*static_cast<uint8_t *>(runtime.tensor_leases()[0].dev_ptr), 0x5a);
+    EXPECT_TRUE(runtime.tensor_leases().empty());
 }
 
-TEST_F(HbgHostAccessContractTest, ChildMemoryInputUsesItsCurrentDeviceBytesDuringBind) {
+TEST_F(HbgHostAccessContractTest, DeviceInputRefusesHostReadAndWrite) {
     Runtime runtime;
     init_runtime(runtime);
     auto runtime_cleanup = cleanup_runtime(runtime);
@@ -1423,14 +1402,14 @@ TEST_F(HbgHostAccessContractTest, ChildMemoryInputUsesItsCurrentDeviceBytesDurin
     args.add_tensor(child);
     ArgDirection sig[] = {ArgDirection::INOUT};
 
-    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
+    EXPECT_EQ(bind(runtime, args, sig, 1), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
     ASSERT_EQ(access_.reads.size(), 1u);
-    EXPECT_EQ(access_.reads[0], 0x29u);
+    EXPECT_EQ(access_.reads[0], 0u);
     EXPECT_TRUE(runtime.tensor_leases().empty()) << "child memory must not acquire host staging";
     ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
     access_.write = true;
-    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
-    EXPECT_EQ(device_bytes[0], 0x5a);
+    EXPECT_EQ(bind(runtime, args, sig, 1), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
+    EXPECT_EQ(device_bytes[0], 0x29);
 }
 
 TEST_F(HbgHostAccessContractTest, PureHostOutputRejectsGetAndSet) {
@@ -1459,6 +1438,7 @@ TEST_F(HbgHostAccessContractTest, SuccessorReadsPredecessorOutputAfterExplicitCo
     ChipStorageTaskArgs args;
     args.add_tensor(host_tensor(output));
     ArgDirection sig[] = {ArgDirection::INOUT};
+    eps_ = {empty_orch_entry, empty_orch_bind};
     ASSERT_EQ(bind(predecessor, args, sig, 1), 0);
     ASSERT_EQ(predecessor.tensor_leases().size(), 1u);
 
@@ -1472,8 +1452,13 @@ TEST_F(HbgHostAccessContractTest, SuccessorReadsPredecessorOutputAfterExplicitCo
     Runtime successor;
     init_runtime(successor);
     auto successor_cleanup = cleanup_runtime(successor);
-    ASSERT_EQ(bind(successor, args, sig, 1), 0);
-    ASSERT_EQ(access_.reads.size(), 2u);
+    eps_ = {access_entry, access_bind};
+    ChipStorageTaskArgs host_args;
+    auto control = host_tensor(output);
+    control.transfer = TensorTransfer::NONE;
+    host_args.add_tensor(control);
+    ASSERT_EQ(bind(successor, host_args, sig, 1), 0);
+    ASSERT_EQ(access_.reads.size(), 1u);
     EXPECT_EQ(access_.reads.back(), 0x42u);
 }
 
@@ -1487,6 +1472,7 @@ TEST_F(HbgHostAccessContractTest, IndependentAndSharedReadOnlyInputsCanPrepareBe
     first_args.add_tensor(host_tensor(output));
     first_args.add_tensor(host_tensor(shared_input));
     ArgDirection first_sig[] = {ArgDirection::INOUT, ArgDirection::IN};
+    eps_ = {empty_orch_entry, empty_orch_bind};
     ASSERT_EQ(bind(predecessor, first_args, first_sig, 2), 0);
     ASSERT_EQ(predecessor.tensor_leases().size(), 2u);
     *static_cast<uint8_t *>(predecessor.tensor_leases()[0].dev_ptr) = 0x42;
@@ -1500,11 +1486,15 @@ TEST_F(HbgHostAccessContractTest, IndependentAndSharedReadOnlyInputsCanPrepareBe
     auto successor_cleanup = cleanup_runtime(successor);
     std::vector<uint8_t> independent(4, 0x38);
     ChipStorageTaskArgs second_args;
-    second_args.add_tensor(host_tensor(shared_input));
-    second_args.add_tensor(host_tensor(independent));
+    auto shared = host_tensor(shared_input);
+    auto other = host_tensor(independent);
+    shared.transfer = other.transfer = TensorTransfer::NONE;
+    second_args.add_tensor(shared);
+    second_args.add_tensor(other);
+    eps_ = {access_entry, access_bind};
     ArgDirection second_sig[] = {ArgDirection::IN, ArgDirection::IN};
     EXPECT_EQ(bind(successor, second_args, second_sig, 2), 0);
-    EXPECT_EQ(access_.reads, (std::vector<uint64_t>{0x11, 0x27, 0x27, 0x38}));
+    EXPECT_EQ(access_.reads, (std::vector<uint64_t>{0x27, 0x38}));
     EXPECT_EQ(output[0], 0x11);
     EXPECT_EQ(finish_run(successor, 0), 0);
 
@@ -1537,7 +1527,7 @@ TEST_F(HbgHostAccessContractTest, GetAndSetRejectCurrentGraphOutputsAndOverlappi
     }
 }
 
-TEST_F(HbgHostAccessContractTest, DisjointWriterDoesNotPreventReadyInputAccess) {
+TEST_F(HbgHostAccessContractTest, DisjointDeviceWriterDoesNotGrantHostAccess) {
     for (bool write : {false, true}) {
         access_.producer = InputProducer::Disjoint;
         access_.write = write;
@@ -1559,11 +1549,11 @@ TEST_F(HbgHostAccessContractTest, DisjointWriterDoesNotPreventReadyInputAccess) 
         args.add_tensor(host_tensor(input));
         ArgDirection sig[] = {ArgDirection::INOUT};
 
-        ASSERT_EQ(bind(runtime, args, sig, 1), 0);
-        EXPECT_EQ(access_.error, 0);
+        EXPECT_EQ(bind(runtime, args, sig, 1), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
+        EXPECT_EQ(access_.error, SIMPLER_ERROR_INVALID_ARGS);
         EXPECT_EQ(input[0], 0x17);
-        EXPECT_EQ(input[1], write ? 0x5a : 0x17);
-        if (!write) EXPECT_EQ(access_.reads.back(), 0x17u);
+        EXPECT_EQ(input[1], 0x17);
+        if (!write) EXPECT_EQ(access_.reads.back(), 0u);
     }
 }
 
@@ -1761,43 +1751,37 @@ TEST_F(HbgResidentSchedulerStorageTest, ALegacyRunNamesNoRetainedStorage) {
     EXPECT_EQ(fake_.live.count(retained), 1u);
 }
 
-// ---------------------------------------------------------------------------
-// Caller device buffers and the host graph build, through the real bind.
-//
-// These drive `bind_callable_to_runtime_impl` with an orchestration that calls
-// the production `get_tensor_data`, so the path under test is the whole of it:
-// the accessor's refusal, `report_fatal`, the orchestrator's latch, the bind's
-// status and its cleanup. What they pin is that the refusal follows a *declared
-// producer* and nothing else — sharing an allocation is not a reason to refuse.
-// ---------------------------------------------------------------------------
-
-// The R2 regression guard. Two runs may take the same immutable device input and both read its
-// bytes while building their graphs; that is legal today on every runtime that prepares a
-// successor concurrently, which is all of them. Nothing about holding an allocation may make it
-// unreadable — only a declared producer may.
-TEST_F(HbgHostAccessContractTest, ASharedDeviceInputWithNoDeclaredProducerStaysReadable) {
-    Runtime runtime;
-    init_runtime(runtime);
-    auto runtime_cleanup = cleanup_runtime(runtime);
-    std::vector<uint8_t> shared(64, 0x3c);
-    ChipStorageTaskArgs args;
-    args.add_tensor(child_memory_tensor(shared));
-    ArgDirection sig[1] = {ArgDirection::IN};
-
-    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
-    EXPECT_EQ(access_.error, 0);
-    ASSERT_FALSE(access_.reads.empty());
-    EXPECT_EQ(access_.reads.back(), 0x3cu);
-    // An input declares no write, so a maker that declares publishes an empty producer set — and
-    // it publishes it even so, since a previous run's set on this slot must not stand in for it.
-    EXPECT_EQ(writes_.declare_calls, kMakerDeclaresCallerWrites ? 1 : 0);
-    EXPECT_TRUE(writes_.declared_by_this_run.empty());
+// Caller-write declarations remain a queue/lifetime contract. They do not grant
+// host orchestration permission to dereference a DEVICE tensor.
+TEST_F(HbgHostAccessContractTest, DeviceHostAccessIsRejectedRegardlessOfProducerReadiness) {
+    for (bool pending_producer : {false, true}) {
+        SCOPED_TRACE(pending_producer);
+        access_ = HostAccessProbe{};
+        writes_ = CallerDeviceWriteState{};
+        Runtime runtime;
+        init_runtime(runtime);
+        auto cleanup = cleanup_runtime(runtime);
+        // Deliberately not host-readable: even an undeclared producer must not
+        // cause a host load, map, or D2H fallback.
+        const uint32_t shape[] = {64};
+        ChipTensor tensor;
+        tensor.init_external(reinterpret_cast<void *>(1), 64, shape, 1, DataType::UINT8, AddressSpace::DEVICE);
+        if (pending_producer) writes_.declared_by_other_run.emplace_back(1, 64);
+        ChipStorageTaskArgs args;
+        args.add_tensor(tensor);
+        ArgDirection sig[] = {ArgDirection::IN};
+        EXPECT_EQ(bind(runtime, args, sig, 1), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
+        EXPECT_EQ(access_.error, SIMPLER_ERROR_INVALID_ARGS);
+        EXPECT_EQ(writes_.query_calls, 0);
+        EXPECT_EQ(fake_.copy_count, 0);
+    }
 }
 
 // A run that produces a caller device buffer says so, from the direction its signature carries.
 // That declaration is what another run's build reads, so it has to be in place before this bind
 // runs its orchestration.
 TEST_F(HbgHostAccessContractTest, AnOutputDeviceTensorIsDeclaredAsProducedBeforeOrchestration) {
+    eps_ = {empty_orch_entry, empty_orch_bind};
     Runtime runtime;
     init_runtime(runtime);
     auto runtime_cleanup = cleanup_runtime(runtime);
@@ -1817,12 +1801,13 @@ TEST_F(HbgHostAccessContractTest, AnOutputDeviceTensorIsDeclaredAsProducedBefore
         EXPECT_EQ(writes_.declare_calls, 0);
         EXPECT_TRUE(writes_.declared_by_this_run.empty());
     }
-    // Its own declaration does not make its own argument unreadable to it.
+    // Declaring a device write requires no host tensor access.
     EXPECT_EQ(access_.error, 0);
 }
 
 // An INOUT device tensor is produced too, so it is declared. Read-before-write is still a write.
 TEST_F(HbgHostAccessContractTest, AnInoutDeviceTensorIsDeclaredAsProduced) {
+    eps_ = {empty_orch_entry, empty_orch_bind};
     Runtime runtime;
     init_runtime(runtime);
     auto runtime_cleanup = cleanup_runtime(runtime);
@@ -1838,6 +1823,7 @@ TEST_F(HbgHostAccessContractTest, AnInoutDeviceTensorIsDeclaredAsProduced) {
 // A statement the platform could not record is never reported as made: the bind fails, ahead of
 // the orchestration that would otherwise build a graph writing bytes no other run knows about.
 TEST_F(HbgHostAccessContractTest, ADeclarationThatCannotBeRecordedFailsTheBind) {
+    eps_ = {empty_orch_entry, empty_orch_bind};
     Runtime runtime;
     init_runtime(runtime);
     auto runtime_cleanup = cleanup_runtime(runtime);
@@ -1861,151 +1847,20 @@ TEST_F(HbgHostAccessContractTest, ADeclarationThatCannotBeRecordedFailsTheBind) 
     EXPECT_EQ(access_.error, 0);
 }
 
-// The wait, end to end on the production path: another run has declared it produces this buffer,
-// this run's graph build reads it, and the bind reports the one status the lane answers by leaving
-// the run queued until that producer has retired. The value the read returned is never used,
-// because the graph it would have gone into is discarded with the bind.
-TEST_F(HbgHostAccessContractTest, ReadingADeclaredProducersDeviceOutputDefersTheBind) {
-    Runtime runtime;
-    init_runtime(runtime);
-    // The fixture's own release, which still has to succeed: that is what keeps a deferred bind
-    // from stranding this run's bindings, and what lets its status reach the lane as a deferral.
-    auto runtime_cleanup = cleanup_runtime(runtime);
-    std::vector<uint8_t> produced(64, 0x7f);
-    writes_.declared_by_other_run.emplace_back(reinterpret_cast<uint64_t>(produced.data()), produced.size());
-    ChipStorageTaskArgs args;
-    args.add_tensor(child_memory_tensor(produced));
-    ArgDirection sig[1] = {ArgDirection::IN};
-
-    const int32_t bind_status = bind(runtime, args, sig, 1);
-    EXPECT_GT(writes_.query_calls, 0);
-    if (kMakerDeclaresCallerWrites) {
-        EXPECT_EQ(bind_status, PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE);
-    } else {
-        // The refusal itself is the shared accessor's, so it fires here too — but this maker
-        // neither declares a producer nor reads the deferral mark, so the run ends with the fatal
-        // the refused access latched, exactly as it did before any of this. The same constant
-        // selects both facts because they are one maker's: the maker that states what a run
-        // produces is the maker that acts on another run's statement.
-        EXPECT_EQ(bind_status, runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
-    }
-    EXPECT_EQ(access_.error, SIMPLER_ERROR_INVALID_ARGS);
-    // The read was refused rather than served, so the orchestration observed nothing.
-    ASSERT_EQ(access_.reads.size(), 1u);
-    EXPECT_EQ(access_.reads.back(), 0u);
-}
-
-// An orchestration that failed for a reason of its own keeps that reason. The callback reports a
-// fatal first and only then reads a declared producer's device output — an order a real one can
-// take, and the one that must not be turned into a retry: nothing guarantees a stateful callback
-// raises the same failure on a second attempt, so the run's own error has to reach the caller.
-//
-// Run twice, the second time with an independent failure that carries the *same* code the refusal
-// would latch, because a status comparison alone cannot tell those two apart. What does is that
-// the accessor is never reached at all: the read short-circuits on the latched fatal, so nothing
-// asks whether the span has a producer and nothing marks this attempt as a dependency wait.
-TEST_F(HbgHostAccessContractTest, AnEarlierIndependentFatalIsNotReplacedByADeferredRead) {
-    for (const int32_t independent : {SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED, SIMPLER_ERROR_INVALID_ARGS}) {
-        SCOPED_TRACE(independent);
-        access_ = HostAccessProbe{};
-        writes_ = CallerDeviceWriteState{};
+TEST_F(HbgHostAccessContractTest, AnEarlierFatalSurvivesARefusedHostRead) {
+    for (int32_t code : {SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED, SIMPLER_ERROR_INVALID_ARGS}) {
         Runtime runtime;
         init_runtime(runtime);
-        auto runtime_cleanup = cleanup_runtime(runtime);
-        std::vector<uint8_t> produced(64, 0x7f);
-        writes_.declared_by_other_run.emplace_back(reinterpret_cast<uint64_t>(produced.data()), produced.size());
-        access_.pre_fatal = independent;
+        auto cleanup = cleanup_runtime(runtime);
+        access_.pre_fatal = code;
+        std::vector<uint8_t> device(64, 0x7f);
         ChipStorageTaskArgs args;
-        args.add_tensor(child_memory_tensor(produced));
-        ArgDirection sig[1] = {ArgDirection::IN};
-
-        EXPECT_EQ(bind(runtime, args, sig, 1), runtime_status_from_error_code(independent));
-        EXPECT_EQ(access_.error, independent);
+        args.add_tensor(child_memory_tensor(device));
+        ArgDirection sig[] = {ArgDirection::IN};
+        EXPECT_EQ(bind(runtime, args, sig, 1), runtime_status_from_error_code(code));
+        EXPECT_EQ(access_.error, code);
         EXPECT_EQ(writes_.query_calls, 0);
-        ASSERT_EQ(access_.reads.size(), 1u);
-        EXPECT_EQ(access_.reads.back(), 0u);
     }
-}
-
-// The same rule one step later, where an entry check cannot reach: the access *is* refused, and
-// another reporter owns the run's failure by the time the refusal reports its own. Ownership is
-// taken from that report's exchange, so the refusal does not claim a run it did not stop — the
-// mark it left is withdrawn and the independent error is what the bind returns.
-//
-// Run twice, the second arm with a competitor carrying the very code the refusal reports. Nothing
-// in the log can tell those two apart (both read `FATAL(code=5)`), which is exactly why the
-// decision cannot be a code comparison; `query_calls == 1` separates this from the sequential case
-// above, where the access is never reached at all.
-TEST_F(HbgHostAccessContractTest, ARefusalThatDidNotLatchTheFatalDoesNotClaimTheRun) {
-    for (const int32_t competing : {SIMPLER_ERROR_HEAP_RING_DEADLOCK, SIMPLER_ERROR_INVALID_ARGS}) {
-        SCOPED_TRACE(competing);
-        access_ = HostAccessProbe{};
-        writes_ = CallerDeviceWriteState{};
-        Runtime runtime;
-        init_runtime(runtime);
-        auto runtime_cleanup = cleanup_runtime(runtime);
-        std::vector<uint8_t> produced(64, 0x7f);
-        writes_.declared_by_other_run.emplace_back(reinterpret_cast<uint64_t>(produced.data()), produced.size());
-        writes_.fatal_from_query = competing;
-        ChipStorageTaskArgs args;
-        args.add_tensor(child_memory_tensor(produced));
-        ArgDirection sig[1] = {ArgDirection::IN};
-
-        EXPECT_EQ(bind(runtime, args, sig, 1), runtime_status_from_error_code(competing));
-        EXPECT_EQ(access_.error, competing);
-        EXPECT_EQ(writes_.query_calls, 1);
-        ASSERT_EQ(access_.reads.size(), 1u);
-        EXPECT_EQ(access_.reads.back(), 0u);
-    }
-}
-
-// Two refused accesses, and only one of them can own the publication. The loser must not undo the
-// winner's: both were refused for the same dependency, so the run is waiting on a predecessor
-// either way, and turning that into a hard failure because of which thread got there first would
-// fail a valid program on host scheduling alone.
-//
-// The winner here is the query fake standing in for the other refused access — it both latches the
-// fatal and publishes the wait, which is what that access's own entry would do. This access then
-// loses the exchange, and the run still waits.
-TEST_F(HbgHostAccessContractTest, ARefusalThatLosesToAnotherRefusalStillLeavesTheRunWaiting) {
-    Runtime runtime;
-    init_runtime(runtime);
-    auto runtime_cleanup = cleanup_runtime(runtime);
-    std::vector<uint8_t> produced(64, 0x7f);
-    writes_.declared_by_other_run.emplace_back(reinterpret_cast<uint64_t>(produced.data()), produced.size());
-    // The same code a refused access reports, because that is what the other access reports.
-    writes_.fatal_from_query = SIMPLER_ERROR_INVALID_ARGS;
-    writes_.cause_from_query = true;
-    ChipStorageTaskArgs args;
-    args.add_tensor(child_memory_tensor(produced));
-    ArgDirection sig[1] = {ArgDirection::IN};
-
-    const int32_t bind_status = bind(runtime, args, sig, 1);
-    EXPECT_EQ(writes_.query_calls, 1);
-    EXPECT_EQ(access_.error, SIMPLER_ERROR_INVALID_ARGS);
-    if (kMakerDeclaresCallerWrites) {
-        EXPECT_EQ(bind_status, PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE);
-    } else {
-        // This maker reads no cause, so its run ends with the fatal either refusal latched.
-        EXPECT_EQ(bind_status, runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
-    }
-}
-
-// The same shape with the producer gone. A declaration only lives as long as its run, so once
-// nothing declares the buffer the identical bind succeeds and reads the bytes.
-TEST_F(HbgHostAccessContractTest, TheSameBindSucceedsOnceNoRunDeclaresTheBuffer) {
-    Runtime runtime;
-    init_runtime(runtime);
-    auto runtime_cleanup = cleanup_runtime(runtime);
-    std::vector<uint8_t> produced(64, 0x7f);
-    ChipStorageTaskArgs args;
-    args.add_tensor(child_memory_tensor(produced));
-    ArgDirection sig[1] = {ArgDirection::IN};
-
-    ASSERT_EQ(bind(runtime, args, sig, 1), 0);
-    EXPECT_EQ(access_.error, 0);
-    ASSERT_FALSE(access_.reads.empty());
-    EXPECT_EQ(access_.reads.back(), 0x7fu);
 }
 
 // A device argument the callable's signature does not cover is refused. Direction is the only
@@ -2014,6 +1869,7 @@ TEST_F(HbgHostAccessContractTest, TheSameBindSucceedsOnceNoRunDeclaresTheBuffer)
 // is available: declaring it would refuse a legal shared read, and leaving it undeclared would let
 // a concurrently preparing run read bytes nobody has produced.
 TEST_F(HbgHostAccessContractTest, ADeviceTensorTheSignatureDoesNotCoverIsRefused) {
+    eps_ = {empty_orch_entry, empty_orch_bind};
     Runtime runtime;
     init_runtime(runtime);
     auto runtime_cleanup = cleanup_runtime(runtime);
@@ -2038,7 +1894,7 @@ TEST_F(HbgHostAccessContractTest, ADeviceTensorTheSignatureDoesNotCoverIsRefused
 }
 
 // A host-memory argument is unaffected by any declaration: its region is the caller buffer this
-// bind copied in, and the readability query is never even asked about it.
+// bind receives explicitly, and the device-readability query is never asked.
 TEST_F(HbgHostAccessContractTest, AHostArgumentIsNeverRefusedByADeclaration) {
     Runtime runtime;
     init_runtime(runtime);
@@ -2046,7 +1902,9 @@ TEST_F(HbgHostAccessContractTest, AHostArgumentIsNeverRefusedByADeclaration) {
     std::vector<uint8_t> payload(64, 0x41);
     writes_.declared_by_other_run.emplace_back(reinterpret_cast<uint64_t>(payload.data()), payload.size());
     ChipStorageTaskArgs args;
-    args.add_tensor(host_tensor(payload));
+    auto tensor = host_tensor(payload);
+    tensor.transfer = TensorTransfer::NONE;
+    args.add_tensor(tensor);
     ArgDirection sig[1] = {ArgDirection::IN};
 
     ASSERT_EQ(bind(runtime, args, sig, 1), 0);
@@ -2108,8 +1966,7 @@ TEST_F(HbgBindLedgerTest, RejectsUnsupportedTransferBeforeReadingEarlierArgument
     const uint32_t shape[] = {16};
     // Any copy of the first input is a fault, not a weak copy-count assertion.
     const ChipTensor first = make_tensor_external(reinterpret_cast<void *>(1), shape, 1, DataType::UINT8);
-    for (auto transfer :
-         {TensorTransfer::NONE, TensorTransfer::H2D, TensorTransfer::D2H, static_cast<TensorTransfer>(255)}) {
+    for (auto transfer : {TensorTransfer::H2D, TensorTransfer::D2H, static_cast<TensorTransfer>(255)}) {
         SCOPED_TRACE(static_cast<int>(transfer));
         ChipTensor invalid = first;
         invalid.transfer = transfer;
@@ -2118,10 +1975,7 @@ TEST_F(HbgBindLedgerTest, RejectsUnsupportedTransferBeforeReadingEarlierArgument
         args.add_tensor(first);
         args.add_tensor(invalid);
         const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::IN};
-        EXPECT_EQ(
-            bind(runtime, args, sig, 2),
-            transfer == TensorTransfer::NONE ? PTO_RUNTIME_ERR_UNSUPPORTED : PTO_RUNTIME_ERR_INVALID_ARGUMENT
-        );
+        EXPECT_EQ(bind(runtime, args, sig, 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
         EXPECT_EQ(fake_.copy_count, 0);
         EXPECT_TRUE(fake_.live.empty());
     }
@@ -2179,4 +2033,162 @@ TEST_F(HbgBindLedgerTest, AcceptsStridedDeviceViewWithOffsetWithoutTensorCopies)
     ASSERT_EQ(bind(runtime, args, sig, 1), 0);
     EXPECT_TRUE(runtime.tensor_leases().empty());
     EXPECT_EQ(storage, std::vector<uint8_t>(6, 0x37));
+}
+
+TEST_F(HbgHostAccessContractTest, ExplicitHostInputIsReadableWithoutTensorStaging) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> payload(16, 0x37);
+    ChipTensor tensor = host_tensor(payload);
+    tensor.transfer = TensorTransfer::NONE;
+    ChipStorageTaskArgs args;
+    args.add_tensor(tensor);
+    const ArgDirection signature[] = {ArgDirection::IN};
+    ASSERT_EQ(bind(runtime, args, signature, 1), 0);
+    EXPECT_EQ(access_.reads, std::vector<uint64_t>{0x37});
+    EXPECT_TRUE(runtime.tensor_leases().empty());
+    EXPECT_EQ(fake_.retained_size, 0u);
+}
+
+TEST_F(HbgHostAccessContractTest, UploadedInputHasNoImplicitHostView) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> payload(16, 0x37);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(payload));
+    const ArgDirection signature[] = {ArgDirection::IN};
+    EXPECT_EQ(bind(runtime, args, signature, 1), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
+    EXPECT_EQ(access_.error, SIMPLER_ERROR_INVALID_ARGS);
+}
+
+TEST_F(HbgBindLedgerTest, HostArgumentsCannotReachDeviceTasksOrGraphBoundaries) {
+    eps_ = {
+        +[](const ChipTaskArgs &args) {
+            auto &orch = *g_orch_runtime->orchestrator;
+            const auto &host = args.tensor(0).ref();
+            const int mode = static_cast<int>(args.scalar<uint64_t>(0));
+            if (mode == 3) {
+                GraphTaskArgs boundary;
+                boundary.add_input(host);
+                EXPECT_FALSE(orch.graph_begin(0x543, boundary, 0x546).recording);
+            } else {
+                CoreTaskArgs task;
+                if (mode == 4) {
+                    CoreTaskPredicate predicate;
+                    predicate.operand.tensor = &host;
+                    predicate.operand.ndims = 1;
+                    predicate.op = PredicateOp::GT;
+                    task.set_predicate(predicate);
+                } else {
+                    task.add_input(host);
+                }
+                MixedKernels kernels{};
+                kernels.aiv0_kernel_id = 0;
+                const auto result = (mode == 0 || mode == 4) ? orch.submit_task(kernels, task) :
+                                    mode == 1                ? orch.submit_dummy_task(task) :
+                                                               orch.alloc_tensors(task);
+                EXPECT_FALSE(result.task_id().is_valid());
+            }
+        },
+        capture_orch_bind
+    };
+    for (int mode = 0; mode < 5; ++mode) {
+        SCOPED_TRACE(mode);
+        Runtime runtime;
+        init_runtime(runtime);
+        auto cleanup = cleanup_runtime(runtime);
+        std::vector<uint8_t> input(4, 0x37);
+        auto host = host_tensor(input);
+        host.transfer = TensorTransfer::NONE;
+        ChipStorageTaskArgs args;
+        args.add_tensor(host);
+        args.add_scalar(mode);
+        ArgDirection sig[] = {ArgDirection::IN};
+        EXPECT_EQ(bind(runtime, args, sig, 1), runtime_status_from_error_code(SIMPLER_ERROR_INVALID_ARGS));
+        EXPECT_EQ(fake_.copy_count, 0);
+        EXPECT_TRUE(runtime.tensor_leases().empty());
+    }
+}
+
+TEST_F(HbgBindLedgerTest, HostAndDeviceBindingsOfOneSourceRemainIndependent) {
+    eps_ = {
+        +[](const ChipTaskArgs &args) {
+            auto *rt = g_orch_runtime;
+            const uint32_t index[] = {0};
+            EXPECT_EQ(args.tensor(0).ref().address_space, AddressSpace::HOST);
+            EXPECT_EQ(args.tensor(1).ref().address_space, AddressSpace::DEVICE);
+            EXPECT_EQ(get_tensor_data(rt, args.tensor(0).ref(), 1, index), 0x37u);
+            set_tensor_data(rt, args.tensor(0).ref(), 1, index, 0x52);
+        },
+        capture_orch_bind
+    };
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> input(4, 0x37);
+    auto host = host_tensor(input);
+    host.transfer = TensorTransfer::NONE;
+    ChipStorageTaskArgs args;
+    args.add_tensor(host);
+    args.add_tensor(host_tensor(input));
+    ArgDirection sig[] = {ArgDirection::INOUT, ArgDirection::IN};
+    ASSERT_EQ(bind(runtime, args, sig, 2), 0);
+    ASSERT_EQ(runtime.tensor_leases().size(), 1u);
+    EXPECT_EQ(input[0], 0x52);
+    EXPECT_EQ(*static_cast<uint8_t *>(runtime.tensor_leases()[0].dev_ptr), 0x37);
+    EXPECT_EQ(fake_.copy_count, 1);
+}
+
+TEST_F(HbgBindLedgerTest, InvalidHostControlFailsBeforeAnyEarlierInputCopy) {
+    for (bool missing_direction : {false, true}) {
+        Runtime runtime;
+        init_runtime(runtime);
+        auto cleanup = cleanup_runtime(runtime);
+        const uint32_t shape[] = {4};
+        auto first = make_tensor_external(reinterpret_cast<void *>(1), shape, 1, DataType::UINT8);
+        auto host = first;
+        host.transfer = TensorTransfer::NONE;
+        if (!missing_direction) host.buffer.size = 3;
+        ChipStorageTaskArgs args;
+        args.add_tensor(first);
+        args.add_tensor(host);
+        const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::IN};
+        EXPECT_EQ(bind(runtime, args, sig, missing_direction ? 1 : 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+        EXPECT_EQ(fake_.copy_count, 0);
+        EXPECT_TRUE(fake_.live.empty());
+    }
+}
+
+TEST_F(HbgBindLedgerTest, RejectsOverlappingWritableH2dCopiesBeforeAllocation) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> storage(64, 0x31);
+    auto first = host_tensor(storage);
+    auto overlap = first;
+    overlap.buffer.addr += 8;
+    overlap.buffer.size -= 8;
+    overlap.shapes[0] = 16;
+    ChipStorageTaskArgs args;
+    args.add_tensor(first);
+    args.add_tensor(overlap);
+    const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::INOUT};
+    EXPECT_EQ(bind(runtime, args, sig, 2), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(fake_.copy_count, 0);
+    EXPECT_EQ(fake_.device_malloc_count, 0);
+}
+
+TEST_F(HbgBindLedgerTest, AcceptsOverlappingReadOnlyH2dCopies) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    std::vector<uint8_t> storage(64, 0x31);
+    auto tensor = host_tensor(storage);
+    ChipStorageTaskArgs args;
+    args.add_tensor(tensor);
+    args.add_tensor(tensor);
+    const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::IN};
+    EXPECT_EQ(bind(runtime, args, sig, 2), 0);
 }

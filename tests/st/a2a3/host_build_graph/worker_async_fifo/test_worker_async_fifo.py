@@ -28,7 +28,7 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import DataType, TaskArgs, TensorArgType
+from simpler.task_interface import DataType, TaskArgs, TensorArgType, TensorTransfer
 from simpler.worker import (
     _FRAME_STAGED,
     _OFF_ACCEPTED,
@@ -76,6 +76,10 @@ def _chip_args(handles, orch_signature, *scalars):
     args = TaskArgs()
     for handle, direction in zip(handles, orch_signature):
         args.add_tensor(handle.tensor((_SIZE,), DataType.FLOAT32), _DIR_TAGS[direction])
+    if len(orch_signature) == 4:
+        args.add_tensor(
+            handles[1].tensor((_SIZE,), DataType.FLOAT32), TensorArgType.INPUT, transfer=TensorTransfer.NONE
+        )
     for value in scalars:
         args.add_scalar(value)
     return args
@@ -179,7 +183,7 @@ class TestWorkerAsyncWholeRunFifo(SceneTestCase):
                 "orchestration": {
                     "source": _PIPELINED_VECTOR_ORCH,
                     "function_name": "aicpu_orchestration_entry",
-                    "signature": [D.IN, D.IN, D.OUT],
+                    "signature": [D.IN, D.IN, D.OUT, D.IN],
                 },
                 "incores": [
                     {
@@ -534,6 +538,7 @@ class TestWorkerAsyncWholeRunFifoTmr(TestWorkerAsyncWholeRunFifo):
     # Its own copies under the tensormap_and_ringbuffer tree: a source names one
     # runtime's Tensor, so it cannot be compiled under both.
     CALLABLE = _rebase_callable(TestWorkerAsyncWholeRunFifo.CALLABLE, _TMR_KERNELS)
+    CALLABLE["callables"][0]["orchestration"]["signature"] = [D.IN, D.IN, D.OUT]
 
     def test_incompatible_runtime_env_falls_back_to_depth_one(self, st_platform, st_worker):
         if st_platform != "a2a3":

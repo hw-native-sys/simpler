@@ -212,6 +212,12 @@ MAYBE_UNINITIALIZED_END
 
 uint64_t
 get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+    if (tensor.address_space != AddressSpace::DEVICE) {
+        rt->orchestrator.report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "device orchestration cannot access HOST tensors"
+        );
+        return 0;
+    }
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "get_tensor_data: buffer not allocated (addr=0). "
@@ -235,6 +241,12 @@ get_tensor_data(RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t
 void set_tensor_data(
     RuntimeContext *rt, const simpler::tmr::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 ) {
+    if (tensor.address_space != AddressSpace::DEVICE) {
+        rt->orchestrator.report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "device orchestration cannot access HOST tensors"
+        );
+        return;
+    }
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "set_tensor_data: buffer not allocated (addr=0). "

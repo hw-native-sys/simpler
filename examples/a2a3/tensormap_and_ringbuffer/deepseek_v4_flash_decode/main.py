@@ -43,10 +43,10 @@ either way, so the pytest wrapper beside this file passes ``skip_golden=True``:
 this case has no host-computable expected output, exactly as its former
 ``CASES[*]["skip_golden"]`` said.
 
-``num_tokens_per_owner`` is the one parameter that stays host-backed:
-``host_build_graph`` runs the orchestrator on the host and reads it with
-``get_tensor_data`` to size a task's block count, and a child-memory tensor is
-passed through without a host view. It is 8 bytes and always carries T.
+``num_tokens_per_owner`` has host backing and is uploaded for device consumers.
+``host_build_graph`` additionally passes a HOST/NONE view as a separate argument
+for ``get_tensor_data`` to size the task's block count. Both carry T; host
+orchestration never reads the uploaded DEVICE view.
 
 Run (2 dies; the pytest wrapper next to this file is the same thing under
 ``--manual only``):
@@ -72,6 +72,7 @@ from simpler.task_interface import (
     DataType,
     TaskArgs,
     TensorArgType,
+    TensorTransfer,
 )
 from simpler.worker import Worker
 
@@ -628,7 +629,7 @@ def _chip_spec(runtime: str, orchestration_source: str | Path | None) -> dict:
         "orchestration": {
             "source": str(source),
             "function_name": "aicpu_orchestration_entry",
-            "signature": _sig(_ORCH_SIG),
+            "signature": _sig(_ORCH_SIG + ("i" if runtime == "host_build_graph" else "")),
         },
         "incores": [
             {
@@ -748,7 +749,7 @@ def _build_config(
     return config
 
 
-def _submit(orch, chip_handle, params, whole, config, n_ranks: int, keepalive: list) -> None:
+def _submit(orch, chip_handle, params, whole, config, n_ranks: int, keepalive: list, runtime: str) -> None:
     """One decode step per rank, over a comm domain spanning both ranks.
 
     ``keepalive`` outlives the round: a submitted ``TaskArgs``' raw pointers are
@@ -781,6 +782,13 @@ def _submit(orch, chip_handle, params, whole, config, n_ranks: int, keepalive: l
                 else:
                     spec = PARAM_SPEC_BY_NAME[step[1]]
                     args.add_tensor(whole[spec.name].tensor(spec.shape, getattr(DataType, spec.dtype)), arg_type)
+            if runtime == "host_build_graph":
+                spec = PARAM_SPEC_BY_NAME["num_tokens_per_owner"]
+                args.add_tensor(
+                    whole[spec.name].tensor(spec.shape, getattr(DataType, spec.dtype)),
+                    TensorArgType.INPUT,
+                    transfer=TensorTransfer.NONE,
+                )
             args.add_scalar(rank)
             for _ in range(_N_CTX_SCALARS):
                 args.add_scalar(dom.device_ctx)
@@ -869,7 +877,7 @@ def run(  # noqa: PLR0913 -- one knob per CLI flag
             keepalive: list = []
 
             def task_orch(orch, _args, _cfg, _keep=keepalive):
-                _submit(orch, chip_handle, params, whole, config, N_RANKS, _keep)
+                _submit(orch, chip_handle, params, whole, config, N_RANKS, _keep, runtime)
 
             worker.run(task_orch)
     finally:

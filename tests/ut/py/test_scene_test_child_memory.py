@@ -226,3 +226,19 @@ def test_l3_rejects_child_memory_before_allocation():
     with pytest.raises(ValueError, match="require L2"):
         Case()._run_and_validate_l3(worker, {}, {}, {})
     assert not worker.created
+
+
+def test_explicit_host_transfer_survives_clone_and_l2_binding():
+    from simpler.task_interface import ArgDirection as D
+    from simpler.task_interface import TensorTransfer
+
+    args = TaskArgsBuilder()
+    args.add_tensor("control", torch.ones(4), transfer=TensorTransfer.NONE)
+    clone = args.clone()
+    assert clone.specs[0].transfer == TensorTransfer.NONE
+    assert clone.control.data_ptr() != args.control.data_ptr()
+    worker = FakeWorker()
+    with scene._child_memory_args(worker, clone, [D.IN]) as child_args:
+        bound, _ = scene._build_l2_ref_args(clone, [D.IN], worker, child_args)
+        assert bound.transfer(0) == TensorTransfer.NONE
+        assert worker.created == []

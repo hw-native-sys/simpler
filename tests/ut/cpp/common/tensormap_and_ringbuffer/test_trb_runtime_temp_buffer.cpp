@@ -1053,3 +1053,33 @@ TEST_F(TrbRuntimeTempBufferTest, AcceptsStridedDeviceViewWithOffsetWithoutTensor
     EXPECT_EQ(finish_run(runtime, 0), 0);
     EXPECT_EQ(storage, std::vector<uint8_t>(6, 0x37));
 }
+
+TEST_F(TrbRuntimeTempBufferTest, RejectsOverlappingWritableH2dCopiesBeforeAllocation) {
+    Runtime runtime = make_runtime();
+
+    std::vector<uint8_t> storage(64, 0x31);
+    auto first = make_tensor(storage);
+    auto overlap = first;
+    overlap.buffer.addr += 8;
+    overlap.buffer.size -= 8;
+    overlap.shapes[0] = 16;
+    ChipStorageTaskArgs args;
+    args.add_tensor(first);
+    args.add_tensor(overlap);
+    const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::INOUT};
+    EXPECT_EQ(bind_runtime(runtime, api_, args, sig, 2), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(fake_.copy_to_count, 0);
+    EXPECT_EQ(fake_.device_malloc_count, 0);
+}
+
+TEST_F(TrbRuntimeTempBufferTest, AcceptsOverlappingReadOnlyH2dCopies) {
+    Runtime runtime = make_runtime();
+
+    std::vector<uint8_t> storage(64, 0x31);
+    auto tensor = make_tensor(storage);
+    ChipStorageTaskArgs args;
+    args.add_tensor(tensor);
+    args.add_tensor(tensor);
+    const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::IN};
+    EXPECT_EQ(bind_runtime(runtime, api_, args, sig, 2), 0);
+}

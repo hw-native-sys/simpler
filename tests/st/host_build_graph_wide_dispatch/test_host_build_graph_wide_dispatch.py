@@ -22,6 +22,7 @@ drain, and the AIV cohort agree on block-to-core mapping when a single scheduler
 
 import torch
 from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import TensorTransfer
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
@@ -99,7 +100,7 @@ class TestHostBuildGraphWideDispatch(SceneTestCase):
     def generate_args(self, params):
         return TaskArgsBuilder(
             TensorArg("output", torch.zeros(MAX_TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)),
-            TensorArg("layout", torch.zeros(2, dtype=torch.int32)),
+            TensorArg("layout", torch.zeros(2, dtype=torch.int32), transfer=TensorTransfer.NONE),
         )
 
     def compute_golden(self, args, params):

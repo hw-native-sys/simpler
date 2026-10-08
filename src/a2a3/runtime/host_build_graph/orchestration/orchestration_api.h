@@ -343,11 +343,10 @@ inline uint64_t rt_orch_phase_now_ns() {
  *   uint64_t raw = get_tensor_data(tensor, 1, idx);       // old usage unchanged
  *   float val = get_tensor_data<float>(tensor, 1, idx);   // typed read
  *
- * This API reads the registered host view used to stage an external tensor.
- * It is valid while host orchestration is building the graph, before device
- * scheduling starts. A tensor produced by a submitted task cannot become
- * readable during graph construction, and a runtime-created output has no
- * registered host view; either use is reported as an invalid argument.
+ * Reads an explicit HOST/NONE argument declared IN or INOUT. Its backing must
+ * be ready before submit and stay alive through completion. DEVICE arguments,
+ * including uploaded HOST/H2D inputs and runtime outputs, are rejected. This
+ * entry never maps device memory or waits/copies a device-produced value.
  */
 template <typename T = uint64_t>
 static inline T get_tensor_data(const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
@@ -366,11 +365,10 @@ static inline T get_tensor_data(const simpler::hbg::Tensor &tensor, uint32_t ndi
  *   set_tensor_data(tensor, 1, idx, raw_u64);     // old usage unchanged
  *   set_tensor_data(tensor, 1, idx, 42.0f);       // typed write (T = float)
  *
- * This API updates the registered host view used to stage an external tensor.
- * The updated value becomes part of the graph's initial device data. It is not
- * a synchronization barrier for submitted readers or writers. A tensor with a
- * submitted producer, or a runtime-created output with no registered host view,
- * is rejected as an invalid argument.
+ * Writes an explicit HOST/NONE argument declared OUT or INOUT. Only the host
+ * backing changes; a separate HOST/H2D argument keeps its already-copied value.
+ * DEVICE arguments and runtime outputs are rejected. This is not a device
+ * transfer or a synchronization barrier.
  */
 template <typename T = uint64_t>
 static inline void

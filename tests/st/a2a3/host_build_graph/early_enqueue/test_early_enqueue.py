@@ -102,7 +102,7 @@ from pathlib import Path
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import DataType, TaskArgs, TensorArgType
+from simpler.task_interface import DataType, TaskArgs, Tensor, TensorArgType, TensorTransfer
 from simpler.worker import (
     _OFF_ACCEPTED,
     _OFF_STATE,
@@ -172,7 +172,7 @@ _CALLABLES = {
             "orchestration": {
                 "source": f"{_KERNELS}/orchestration/pipelined_vector_orch.cpp",
                 "function_name": "aicpu_orchestration_entry",
-                "signature": [D.IN, D.IN, D.OUT],
+                "signature": [D.IN, D.IN, D.OUT, D.IN],
             },
             "incores": [
                 {
@@ -198,6 +198,12 @@ def _chip_args(handles, orch_signature, *scalars):
     args = TaskArgs()
     for handle, direction in zip(handles, orch_signature):
         args.add_tensor(handle.tensor((_SIZE,), DataType.FLOAT32), _DIR_TAGS[direction])
+    # Host orchestration reads the control separately from its H2D device operand.
+    args.add_tensor(
+        Tensor(handles[1], shapes=(_SIZE,), dtype=DataType.FLOAT32),
+        TensorArgType.INPUT,
+        transfer=TensorTransfer.NONE,
+    )
     for value in scalars:
         args.add_scalar(value)
     return args

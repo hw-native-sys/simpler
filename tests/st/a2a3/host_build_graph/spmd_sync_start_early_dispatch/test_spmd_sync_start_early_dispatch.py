@@ -25,6 +25,7 @@ Kernels are shared with the tensormap_and_ringbuffer twin of this scene.
 
 import torch
 from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import TensorTransfer
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
@@ -92,7 +93,7 @@ class TestSpmdSyncStartEarlyDispatchHbg(SceneTestCase):
     def generate_args(self, params):
         return TaskArgsBuilder(
             TensorArg("output", torch.zeros(TOTAL_CL * FLOATS_PER_CACHE_LINE, dtype=torch.float32)),
-            TensorArg("layout", torch.zeros(1, dtype=torch.int32)),
+            TensorArg("layout", torch.zeros(1, dtype=torch.int32), transfer=TensorTransfer.NONE),
         )
 
     def compute_golden(self, args, params):

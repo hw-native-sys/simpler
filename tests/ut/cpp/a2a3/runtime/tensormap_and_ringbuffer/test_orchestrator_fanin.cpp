@@ -1033,3 +1033,16 @@ TEST(OrchestratorLayoutScopeTasksCap, FollowsRuntimeWindowSum) {
     EXPECT_EQ(cap_for(windows), big * CHIP_MAX_RING_DEPTH);
     EXPECT_GT(cap_for(windows), CHIP_SCOPE_TASKS_CAP);
 }
+
+TEST_F(OrchestratorFaninTest, HostTensorCannotReachDeviceSubmission) {
+    const uint32_t shape[] = {4};
+    auto host = simpler::tmr::make_tensor_external(
+        reinterpret_cast<void *>(1), shape, 1, DataType::UINT32, false, 0, AddressSpace::HOST
+    );
+    CoreTaskArgs args;
+    args.add_input(host);
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    EXPECT_FALSE(orch.submit_task(kernels, args).task_id().is_valid());
+    EXPECT_TRUE(orch.fatal);
+}

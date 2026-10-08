@@ -72,11 +72,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     args.launch_spec.set_require_sync_start(true);
     rt_submit_task(mk, args);
 
-    // shape carries no producer task, so set_tensor_data writes it straight
-    // through. Giving it one would fail the call: host_build_graph's orchestrator
-    // runs to completion on the host before the device executes anything, so a
-    // tensor with a producer holds no value it could write into, and the accessor
-    // rejects it with INVALID_ARGS.
+    // shape is an explicit HOST/NONE output for the caller's launch report.
     uint32_t idx[1] = {0};
     set_tensor_data<int32_t>(shape, 1, idx, cluster_count);
     idx[0] = 1;

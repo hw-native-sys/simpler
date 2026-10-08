@@ -349,6 +349,7 @@ class TensorArg(NamedTuple):
     name: str
     value: Any  # torch.Tensor
     child_memory: bool = False
+    transfer: Any = None  # TensorTransfer; None retains the location default
 
 
 class Scalar(NamedTuple):
@@ -391,9 +392,9 @@ class TaskArgsBuilder:
             elif isinstance(spec, Scalar):
                 self._add_scalar(spec)
 
-    def add_tensor(self, name: str, value: Any, *, child_memory=False) -> None:
+    def add_tensor(self, name: str, value: Any, *, child_memory=False, transfer=None) -> None:
         """Add a tensor. Must be called before any add_scalar."""
-        self._add_tensor(TensorArg(name, value, child_memory))
+        self._add_tensor(TensorArg(name, value, child_memory, transfer))
 
     def add_scalar(self, name: str, value: Any) -> None:
         """Add a scalar. After this, add_tensor is not allowed."""
@@ -811,7 +812,7 @@ def _build_l2_ref_args(test_args: TaskArgsBuilder, orch_signature: list, worker,
                 tensor_arg = child_args.tensors[spec.name]
             else:
                 tensor_arg = make_tensor_arg(worker, spec.value)
-            args.add_tensor(tensor_arg, dir2tag.get(direction, TensorArgType.INPUT))
+            args.add_tensor(tensor_arg, dir2tag.get(direction, TensorArgType.INPUT), transfer=spec.transfer)
             if direction in (ArgDirection.OUT, ArgDirection.INOUT):
                 output_names.append(spec.name)
             tensor_idx += 1
@@ -854,7 +855,7 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
                     f"Update CALLABLE['orchestration']['signature'] to match generate_args()."
                 )
             direction = orch_signature[tensor_idx]
-            chip_args.add_tensor(make_chip_tensor_arg(spec.value))
+            chip_args.add_tensor(make_chip_tensor_arg(spec.value), transfer=spec.transfer)
             if direction in (ArgDirection.OUT, ArgDirection.INOUT):
                 output_names.append(spec.name)
             tensor_idx += 1
@@ -953,7 +954,7 @@ def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list, worker
                 )
             direction = orch_signature[tensor_idx]
             tag = _DIR_TO_TAG.get(direction, TensorArgType.INPUT)
-            chip_args.add_tensor(_l3_ref(test_args, spec.name, worker), tag)
+            chip_args.add_tensor(_l3_ref(test_args, spec.name, worker), tag, transfer=spec.transfer)
             if direction in (ArgDirection.OUT, ArgDirection.INOUT):
                 output_names.append(spec.name)
             tensor_idx += 1

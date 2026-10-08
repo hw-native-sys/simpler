@@ -542,6 +542,8 @@ static bool copy_in_device_args(
             continue;
         }
 
+        t.address_space = AddressSpace::DEVICE;
+        t.transfer = TensorTransfer::NONE;
         void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.buffer.addr));
         size_t size = static_cast<size_t>(t.nbytes());
         if (size == 0) {
@@ -817,7 +819,7 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_ERROR("orch_args pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    const int transfer_status = validate_program_tensor_transfers(orch_args);
+    const int transfer_status = validate_program_tensor_transfers(orch_args, false, signature, sig_count);
     if (transfer_status != 0) return transfer_status;
     // trb runs orchestration on the device — there is no host-side orch
     // function pointer to invoke. The c_api signature accepts one for

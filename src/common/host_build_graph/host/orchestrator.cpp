@@ -59,6 +59,22 @@
 #include "host_build_graph/types.h"
 #include "tensor.h"
 
+template <typename Args>
+static bool require_device_arguments(OrchestratorState *orch, const Args &args) {
+    if (orch->is_fatal()) return false;
+    if (args.has_error()) return true;
+    for (int i = 0; i < args.tensor_count(); ++i) {
+        if (args.tag(i) != TensorArgType::OUTPUT && args.tensor(i).ref().address_space != AddressSpace::DEVICE) {
+            orch->report_fatal(
+                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
+                "device task argument %d is HOST; pass a separate HOST/H2D or DEVICE/NONE argument", i
+            );
+            return false;
+        }
+    }
+    return true;
+}
+
 // Raises the two edge kinds compute_task_fanin can discover, for the capture
 // instantiation. Shared by the ordinary submit path and the outer GRAPH task so
 // both describe an edge the same way.
@@ -1808,8 +1824,9 @@ resolve_dispatch_predicate(OrchestratorState *orch, const CoreTaskPredicate &pre
     }
 
     const simpler::hbg::Tensor *operand = predicate.operand.tensor;
-    if (operand == nullptr || operand->buffer.addr == 0 || predicate.operand.ndims == 0 ||
-        predicate.operand.ndims > operand->ndims || predicate.operand.ndims > MAX_TENSOR_DIMS) {
+    if (operand == nullptr || operand->address_space != AddressSpace::DEVICE || operand->buffer.addr == 0 ||
+        predicate.operand.ndims == 0 || predicate.operand.ndims > operand->ndims ||
+        predicate.operand.ndims > MAX_TENSOR_DIMS) {
         orch->report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "dispatch predicate has an invalid operand tensor"
         );
@@ -2582,8 +2599,9 @@ TaskOutputTensors graph_record_submit_sub_task(
         // Scheduler fatal rather than a named unsupported construct.
         const uint64_t flat_offset =
             operand == nullptr ? 0 : operand->compute_flat_offset(pred.operand.indices, pred.operand.ndims);
-        if (operand == nullptr || operand->ndims > MAX_TENSOR_DIMS || pred.operand.ndims > operand->ndims ||
-            flat_offset < operand->start_offset || flat_offset - operand->start_offset >= operand->extent_elem_cache ||
+        if (operand == nullptr || operand->address_space != AddressSpace::DEVICE || operand->ndims > MAX_TENSOR_DIMS ||
+            pred.operand.ndims > operand->ndims || flat_offset < operand->start_offset ||
+            flat_offset - operand->start_offset >= operand->extent_elem_cache ||
             !graph_classify_tensor(recording, task_index, *operand) ||
             (operand->owner_task_id.space() == TaskId::Space::SUB_TASK &&
              operand->owner_task_id.local_id() == task_index)) {
@@ -2724,6 +2742,7 @@ TaskOutputTensors graph_record_submit_sub_task(
 }  // namespace
 
 GraphScopeResult OrchestratorState::graph_begin(uint64_t graph_key, const GraphTaskArgs &args, uint64_t callable_hash) {
+    if (!require_device_arguments(this, args)) return {};
     ORCH_PHASE_START_SPANNING();
     const GraphScopeResult result = graph_begin_inner(graph_key, args, callable_hash);
     ORCH_PHASE_END_SPANNING(HostPhaseKind::OrchGraphBegin, graph_key);
@@ -3086,6 +3105,7 @@ void OrchestratorState::graph_commit_inner() {
 }
 
 TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
+    if (!require_device_arguments(this, args)) return {};
     auto *orch = this;
 
     // Orchestration API should short-circuit after fatal, but keep this entry
@@ -3155,6 +3175,11 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
     }
 
     if (args.predicate().op != PredicateOp::NONE) {
+        const auto *operand = args.predicate().operand.tensor;
+        if (operand != nullptr && operand->address_space != AddressSpace::DEVICE) {
+            report_fatal(SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "dispatch predicate requires a DEVICE tensor");
+            return {};
+        }
         task_attrs.set_predicate();
     }
 
@@ -3177,6 +3202,7 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
 // bucket; dispatch loop short-circuits to completion. Accepts the same Arg
 // shape as submit_task; scalars are permitted but never consumed.
 TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args) {
+    if (!require_device_arguments(this, args)) return {};
     auto *orch = this;
 
     if (orch->is_fatal()) {
@@ -3212,6 +3238,7 @@ TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args)
 }
 
 TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
+    if (!require_device_arguments(this, args)) return {};
     auto *orch = this;
     // Orchestration API should short-circuit after fatal, but keep this entry
     // robust as a no-op in case a caller reaches it directly.

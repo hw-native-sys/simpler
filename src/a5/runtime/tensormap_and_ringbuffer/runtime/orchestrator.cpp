@@ -1290,9 +1290,20 @@ static TaskOutputTensors submit_task_common(
     return result;
 }
 
-TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
-    auto *orch = this;
+static bool require_device_arguments(OrchestratorState *orch, const CoreTaskArgs &args) {
+    if (orch->fatal || args.has_error) return !orch->fatal;
+    for (int i = 0; i < args.tensor_count(); ++i) {
+        if (args.tag(i) != TensorArgType::OUTPUT && args.tensor(i).ref().address_space != AddressSpace::DEVICE) {
+            orch->report_fatal(SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "device task argument %d is HOST", i);
+            return false;
+        }
+    }
+    return true;
+}
 
+TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
+    if (!require_device_arguments(this, args)) return {};
+    auto *orch = this;
     // Orchestration API should short-circuit after fatal, but keep this entry
     // robust as a no-op in case a caller reaches it directly.
     if (orch->fatal) {
@@ -1311,6 +1322,13 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
         orch_mark_fatal(orch, SIMPLER_ERROR_INVALID_ARGS);
         return TaskOutputTensors{};
     }
+    const auto &predicate = args.predicate();
+    if (predicate.op != PredicateOp::NONE && predicate.operand.tensor != nullptr &&
+        predicate.operand.tensor->address_space != AddressSpace::DEVICE) {
+        orch->report_fatal(SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "dispatch predicate requires a DEVICE tensor");
+        return {};
+    }
+
     always_assert(orch->scheduler != nullptr);
     // === Validate submit inputs ===
     ActiveMask active_mask = mixed_kernels.to_active_mask();
@@ -1371,6 +1389,7 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
 // bucket; dispatch loop short-circuits to completion. Accepts the same Arg
 // shape as submit_task; scalars are permitted but never consumed.
 TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args) {
+    if (!require_device_arguments(this, args)) return {};
     auto *orch = this;
 
     if (orch->fatal) {
@@ -1401,6 +1420,7 @@ TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args)
 }
 
 TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
+    if (!require_device_arguments(this, args)) return {};
     auto *orch = this;
     // Orchestration API should short-circuit after fatal, but keep this entry
     // robust as a no-op in case a caller reaches it directly.

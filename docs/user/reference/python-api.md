@@ -243,3 +243,23 @@ Analysis CLIs live under `simpler_setup.tools`; see
 - [How-to: write and run a kernel](../how-to/write-and-run-a-kernel.md)
 - [Task Flow](../../task-flow.md) — how these handles travel through the runtime
 - [Communication Domains](../../comm-domain.md) — `allocate_domain` semantics
+
+### Host controls in HBG orchestration
+
+`Tensor` describes a view; transfer is chosen separately for each `TaskArgs` entry:
+
+```python
+from simpler.task_interface import TensorTransfer
+
+args.add_tensor(control, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
+args.add_tensor(control, TensorArgType.INPUT, transfer=TensorTransfer.H2D)
+```
+
+With HOST backing, the first entry stays on the host for HBG `get_tensor_data`.
+The second becomes a DEVICE operand after Program copies it. Pass each entry to
+the matching consumer; host access to DEVICE and device access to HOST are errors.
+Host `set_tensor_data` requires an OUT/INOUT declaration and changes only the HOST
+binding. It does not upload that write to the separate device binding. The caller
+keeps the backing alive through completion and explicitly waits/copies any prior
+device result before submitting a host consumer. TMR device orchestration rejects
+HOST/NONE. Neither path creates a cross-side mapped view.
