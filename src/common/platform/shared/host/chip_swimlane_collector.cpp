@@ -902,8 +902,35 @@ bool ChipSwimlaneCollector::producer_index_in_range(ProfBufferType type, uint32_
 // The stamped identity and raw count, read through the buffer type that
 // matches the kind. `count` sits after records[] in TypedBuffer, so a fixed
 // cast would read the wrong offset for three of the four kinds.
+bool ChipSwimlaneCollector::handoff_identity_agrees(
+    const ReadyBufferInfo &info, uint64_t buffer_epoch, uint32_t buffer_count, uint32_t buffer_seq,
+    const char **reason_out
+) {
+    // No identity reached this host for this hand-off -- an unsupported
+    // producer, or one that published none. There is nothing to compare, so
+    // this is not a disagreement: the buffer is still routed by its own stamp,
+    // exactly as it was before descriptors carried identity. What is lost is
+    // the cross-check, and the caller records that separately rather than
+    // discarding records it can still place.
+    if (info.run_epoch == 0) return true;
+    if (info.run_epoch != buffer_epoch) {
+        *reason_out = "entry and buffer name different runs";
+        return false;
+    }
+    if (info.buffer_seq != buffer_seq) {
+        *reason_out = "entry and buffer carry different sequence numbers";
+        return false;
+    }
+    if (info.record_count != buffer_count) {
+        *reason_out = "entry and buffer carry different record counts";
+        return false;
+    }
+    return true;
+}
+
 bool ChipSwimlaneCollector::read_buffer_identity(
-    const ReadyBufferInfo &info, uint64_t *epoch_out, uint32_t *count_out, uint32_t *capacity_out
+    const ReadyBufferInfo &info, uint64_t *epoch_out, uint32_t *count_out, uint32_t *capacity_out,
+    uint32_t *local_seq_out
 ) const {
     if (info.host_buffer_ptr == nullptr) return false;
     rmb();
@@ -913,6 +940,7 @@ bool ChipSwimlaneCollector::read_buffer_identity(
         *epoch_out = b->run_epoch;
         *count_out = b->count;
         *capacity_out = PLATFORM_PROF_BUFFER_SIZE;
+        if (local_seq_out != nullptr) *local_seq_out = b->local_seq;
         return true;
     }
     case ProfBufferType::AICORE_TASK: {
@@ -920,6 +948,7 @@ bool ChipSwimlaneCollector::read_buffer_identity(
         *epoch_out = b->run_epoch;
         *count_out = b->count;
         *capacity_out = PLATFORM_AICORE_BUFFER_SIZE;
+        if (local_seq_out != nullptr) *local_seq_out = b->local_seq;
         return true;
     }
     case ProfBufferType::AICPU_SCHED_PHASE: {
@@ -927,6 +956,7 @@ bool ChipSwimlaneCollector::read_buffer_identity(
         *epoch_out = b->run_epoch;
         *count_out = b->count;
         *capacity_out = PLATFORM_PHASE_RECORDS_PER_THREAD;
+        if (local_seq_out != nullptr) *local_seq_out = b->local_seq;
         return true;
     }
     case ProfBufferType::AICPU_ORCH_PHASE: {
@@ -934,6 +964,7 @@ bool ChipSwimlaneCollector::read_buffer_identity(
         *epoch_out = b->run_epoch;
         *count_out = b->count;
         *capacity_out = PLATFORM_PHASE_RECORDS_PER_THREAD;
+        if (local_seq_out != nullptr) *local_seq_out = b->local_seq;
         return true;
     }
     }
@@ -996,6 +1027,98 @@ void ChipSwimlaneCollector::note_buffer_observed(
     r.received_records += raw_count;
 }
 
+/**
+ * Charge one retired hand-off to the run that produced it.
+ *
+ * Three populations, kept apart because they answer different questions:
+ *
+ *  - a descriptor that validated and named an open run: the loss is that run's,
+ *    with the record count the producer published.
+ *  - a descriptor that validated but named no open run -- epoch zero, an epoch
+ *    this collector never admitted, or one whose run has already sealed. The
+ *    identity cannot be acted on, so it is reported and charged to nobody.
+ *  - a descriptor that did not validate at all: nothing in it is trustworthy.
+ *
+ * Only the first is attribution. The other two make the collector's output
+ * incomplete rather than making some run's loss figure larger, which is the
+ * distinction a scalar consumed at a run boundary cannot express.
+ */
+/**
+ * Charge one retired hand-off to the run that produced it.
+ *
+ * The identity check, the authority check and both additions happen under the
+ * bucket's `loss_mu`, which `run_begin`, the close and `release_run_slot` also
+ * hold while they install, seal or retire the same fields. That is what makes
+ * the charge atomic with respect to reuse, sealing and release; nothing here
+ * repairs a charge afterwards, because no charge can land on the wrong run in
+ * the first place.
+ *
+ * Nothing fallible runs under the lock: the reporting below happens after it is
+ * released.
+ */
+void ChipSwimlaneCollector::on_handoff_retired(const profiling_common::RetiredHandoff<ChipSwimlaneModule> &retired) {
+    if (!retired.identified) {
+        unattributable_handoffs_.fetch_add(1, std::memory_order_relaxed);
+        run_errors_.record_fatal(
+            "a ready entry failed to validate, so the records it named are lost with no run to charge them to"
+        );
+        return;
+    }
+
+    const uint64_t epoch = retired.info.run_epoch;
+    bool charged = false;
+    bool sealed_owner = false;
+    if (auto hook = pre_charge_hook()) (*hook)();
+    if (epoch != 0 && retained_ready_.load(std::memory_order_acquire)) {
+        for (auto &bucket : retained_runs_) {
+            std::lock_guard<std::mutex> lk(bucket.loss_mu);
+            // Generation and authority are read as one pair: a slot that has
+            // been released holds no run, so its stale identity may not be
+            // matched even by the epoch that once owned it.
+            if (bucket.loss_state == LossState::Free || bucket.loss_epoch != epoch) continue;
+            if (bucket.loss_state == LossState::Sealed) {
+                sealed_owner = true;
+                break;
+            }
+            saturating_add(bucket.transport_retired, 1);
+            saturating_add(bucket.transport_retired_records, retired.info.record_count);
+            charged = true;
+            break;
+        }
+    }
+    if (charged) {
+        LOG_ERROR(
+            "ChipSwimlane: run %llu lost a handed-over buffer of %u record(s) in transport",
+            static_cast<unsigned long long>(epoch), retired.info.record_count
+        );
+        return;
+    }
+
+    unattributable_handoffs_.fetch_add(1, std::memory_order_relaxed);
+    if (epoch == 0) {
+        run_errors_.record_fatal(
+            "a retired ready entry carried no run identity, so its records belong to no known run"
+        );
+        return;
+    }
+    LOG_ERROR(
+        "ChipSwimlane: run %llu lost a handed-over buffer of %u record(s) that this collector can no longer charge",
+        static_cast<unsigned long long>(epoch), retired.info.record_count
+    );
+    const char *why;
+    if (sealed_owner) {
+        why = "a retired ready entry named a run already sealed; its published artifact understates its loss";
+    } else if (run_is_tombstoned(epoch)) {
+        // Covers both ways a run finishes: a sealed run whose slot has since
+        // been released, and one withdrawn before it ever launched.
+        why = "a retired ready entry named a run this collector has already finished; its records are outside that "
+              "run's accounting";
+    } else {
+        why = "a retired ready entry named a run this collector does not hold; its records are unattributed";
+    }
+    run_errors_.record_fatal(why);
+}
+
 void ChipSwimlaneCollector::on_buffer_collected(const ReadyBufferInfo &info, int collector_shard) {
     size_t slot = 0;
     uint64_t expected_epoch = armed_run_epoch_;
@@ -1010,8 +1133,45 @@ void ChipSwimlaneCollector::on_buffer_collected(const ReadyBufferInfo &info, int
         uint32_t raw_count = 0;
         uint32_t capacity = 0;
         const size_t shard = normalize_collector_shard(collector_shard);
-        if (shard >= shard_views_.size() || !read_buffer_identity(info, &buffer_epoch, &raw_count, &capacity)) {
+        uint32_t buffer_seq = 0;
+        if (shard >= shard_views_.size() ||
+            !read_buffer_identity(info, &buffer_epoch, &raw_count, &capacity, &buffer_seq)) {
             no_run_slot_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        // The descriptor and the payload each carry this hand-off's identity,
+        // written by the same producer while it still owned the buffer. They
+        // must agree. A disagreement means the hand-off or the buffer's reuse
+        // went wrong somewhere between them, and silently preferring either
+        // side would publish one run's records under the other's name — so the
+        // records are declined and the collector's completeness is marked
+        // instead. The descriptor's epoch is only compared, never substituted:
+        // routing stays on the payload, which is the side the record vectors
+        // are appended from.
+        if (info.run_epoch == 0) {
+            // Placed by the payload alone, so a payload that lies cannot be
+            // contradicted. Recorded as a property of the transport and
+            // published on every artifact this collector writes -- not as a
+            // flush failure: the records did arrive, and a producer that
+            // declares no supported schema is a deployment fact rather than a
+            // run's error. The log fires once; the artifact field is permanent.
+            if (!unverified_handoff_reported_.exchange(true, std::memory_order_relaxed)) {
+                LOG_ERROR(
+                    "ChipSwimlane: no hand-off identity on this transport; records are placed by payload alone and "
+                    "cannot be cross-checked"
+                );
+            }
+        }
+        const char *disagreement = nullptr;
+        if (!handoff_identity_agrees(info, buffer_epoch, raw_count, buffer_seq, &disagreement)) {
+            unattributable_handoffs_.fetch_add(1, std::memory_order_relaxed);
+            run_errors_.record_fatal("a ready entry and its buffer disagreed about the hand-off; it is not delivered");
+            LOG_ERROR(
+                "ChipSwimlane: handoff identity mismatch (%s): entry run=%llu seq=%u count=%u, buffer run=%llu seq=%u "
+                "count=%u",
+                disagreement, static_cast<unsigned long long>(info.run_epoch), info.buffer_seq, info.record_count,
+                static_cast<unsigned long long>(buffer_epoch), buffer_seq, raw_count
+            );
             return;
         }
         const int resolved = shard_views_[shard].slot_for(buffer_epoch, &retain);
@@ -2203,6 +2363,15 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
         outfile << "      \"not_received_buffers\": " << data.collection.not_received_buffers << ",\n";
         outfile << "      \"unpublished_loss\": " << data.collection.unpublished_loss << ",\n";
         outfile << "      \"transport_retired\": " << data.collection.transport_retired << ",\n";
+        // Both stay numeric, including when they are zero: a reader that sees
+        // `transport_retired: 0` and `unattributable_handoffs: 0` is being told
+        // this run lost nothing in transport and nothing unattributable
+        // happened while it was open — which is a stronger statement than a
+        // field that could not decide, and is why neither becomes null.
+        outfile << "      \"transport_retired_records\": " << data.collection.transport_retired_records << ",\n";
+        outfile << "      \"unattributable_handoffs\": " << data.collection.unattributable_handoffs << ",\n";
+        outfile << "      \"handoff_identity_verified\": "
+                << (data.collection.handoff_identity_verified ? "true" : "false") << ",\n";
         outfile << "      \"cut_failed_queues\": " << data.collection.cut_failed_queues << ",\n";
         outfile << "      \"verdict\": \"" << simpler::dfx::runs::verdict_name(data.collection.verdict) << "\"\n";
         outfile << "    },\n";
@@ -3100,7 +3269,20 @@ bool ChipSwimlaneCollector::run_begin(uint64_t run_epoch, const std::string &out
         }
 
         EpochBucket &bucket = retained_runs_[slot];
-        bucket.epoch.store(run_epoch, std::memory_order_relaxed);
+        {
+            // The identity this bucket's loss is charged against moves to the
+            // new run in the same critical section that zeroes its counters and
+            // reopens them, so a drain shard holding `loss_mu` either charges
+            // the predecessor before the reset or fails the identity check
+            // after it. There is no state in which it can add to the
+            // successor's figures.
+            std::lock_guard<std::mutex> loss_lk(bucket.loss_mu);
+            bucket.loss_epoch = run_epoch;
+            bucket.loss_state = LossState::Open;
+            bucket.transport_retired = 0;
+            bucket.transport_retired_records = 0;
+        }
+        bucket.epoch.store(run_epoch, std::memory_order_release);
         bucket.retain.store(true, std::memory_order_relaxed);
         bucket.target_installed = false;
         bucket.cut_slot = -1;
@@ -3110,7 +3292,6 @@ bool ChipSwimlaneCollector::run_begin(uint64_t run_epoch, const std::string &out
         bucket.pending.level = level;
         bucket.pending.armed_run_epoch = run_epoch;
         bucket.terminal_ok = false;
-        bucket.transport_retired = 0;
         bucket.charged_bytes.store(0, std::memory_order_relaxed);
         bucket.verdict = simpler::dfx::runs::CollectionVerdict{};
         bucket.state.store(static_cast<int>(EpochState::Admitting), std::memory_order_release);
@@ -3161,8 +3342,11 @@ void ChipSwimlaneCollector::run_close(uint64_t run_epoch, uint32_t bank_index, b
     // cursors and pool metadata there for as long as they run, and a bulk — or
     // even a narrow — write from this thread would put a second writer on words
     // that have exactly one.
-    bucket.transport_retired = drain_dropped_buffers();
-    report_drain_drops();
+    // No scalar is taken here. The collector-wide counter has no identity and
+    // the drain thread may retire a predecessor's hand-off long after that run
+    // closed, so reading it at a run boundary charges whichever run happens to
+    // be closing. This epoch's own figure was accumulated by
+    // `on_handoff_retired`, from the identity each descriptor published.
     bool reads_ok = true;
     uint64_t total_device = 0;
     uint64_t dropped_device = 0;
@@ -3369,6 +3553,19 @@ void ChipSwimlaneCollector::refresh_retained_run_view(int collector_shard) {
 
 void ChipSwimlaneCollector::release_run_slot(size_t slot) {
     EpochBucket &bucket = retained_runs_[slot];
+    {
+        // Accounting authority is retired before anything else, and under the
+        // same lock a charge takes: every path back to `Free` passes here, so
+        // from this point a descriptor naming this run names a run the
+        // collector does not hold, whether it was sealed and published or
+        // withdrawn before it ever launched. Taken in its own scope so the
+        // leaf lock is never held while `retained_mu_` is acquired below.
+        std::lock_guard<std::mutex> loss_lk(bucket.loss_mu);
+        bucket.loss_state = LossState::Free;
+        bucket.loss_epoch = 0;
+        bucket.transport_retired = 0;
+        bucket.transport_retired_records = 0;
+    }
     // Free the storage first, then give its bytes back: a credit ahead of the
     // release would let an admission see headroom that does not exist yet.
     bucket.pending = RunExport{};
@@ -3487,7 +3684,17 @@ bool ChipSwimlaneCollector::seal_and_publish_run(size_t slot, simpler::dfx::runs
     data.collection.session_id = artifact_dir_index_;
     data.collection.processing_complete =
         verdict == simpler::dfx::runs::Verdict::Published || verdict == simpler::dfx::runs::Verdict::PartialSafe;
-    data.collection.transport_retired = bucket.transport_retired;
+    {
+        // Snapshot and seal in one critical section: a charge that already holds
+        // `loss_mu` is included in these figures, and one that arrives after is
+        // refused rather than changing a run whose artifact is being written.
+        std::lock_guard<std::mutex> loss_lk(bucket.loss_mu);
+        data.collection.transport_retired = bucket.transport_retired;
+        data.collection.transport_retired_records = bucket.transport_retired_records;
+        bucket.loss_state = LossState::Sealed;
+    }
+    data.collection.unattributable_handoffs = unattributable_handoffs_.load(std::memory_order_relaxed);
+    data.collection.handoff_identity_verified = !unverified_handoff_reported_.load(std::memory_order_relaxed);
     data.collection.metadata_complete = bucket.verdict.metadata_complete;
     // Decided when this epoch was serviced, against that cut's own request. A
     // second reading here could find a count the retirement below has already
@@ -3500,8 +3707,8 @@ bool ChipSwimlaneCollector::seal_and_publish_run(size_t slot, simpler::dfx::runs
             0;
     if (verdict == simpler::dfx::runs::Verdict::Published &&
         (data.collection.transport_retired != 0 || data.collection.not_received_buffers != 0 ||
-         data.collection.unpublished_loss != 0 || !data.collection.metadata_complete ||
-         !bucket.retain.load(std::memory_order_acquire))) {
+         data.collection.unattributable_handoffs != 0 || data.collection.unpublished_loss != 0 ||
+         !data.collection.metadata_complete || !bucket.retain.load(std::memory_order_acquire))) {
         verdict = simpler::dfx::runs::Verdict::PartialSafe;
     }
     data.collection.verdict = verdict;

@@ -558,14 +558,48 @@ enum class ChipSwimlaneBufferKind : uint32_t {
  * When a buffer on a core/thread is full, the producer (AICPU for AICPU
  * task / sched-phase / orch-phase, AICPU on behalf of AICore for AicoreTask)
  * pushes this entry. Host memory manager retrieves entries from the queue.
+ *
+ * The entry carries the hand-off's own identity, not only where the bytes are:
+ * `run_epoch` says which run produced them and `record_count` how many records
+ * the producer committed. Both are captured while the producer still owns the
+ * buffer and are written before the tail advance publishes the entry, so a
+ * payload the host later cannot read is still attributable. Reading them back
+ * out of the buffer is not an alternative — that is exactly the read which
+ * fails in the cases this exists for.
+ *
+ * `run_epoch == 0` means "this producer published no identity", the same
+ * no-identity sentinel the terminal bank uses.
+ *
+ * It is NOT a compatibility mechanism. A producer whose build predates these
+ * fields leaves these bytes as whatever the storage last held, which may be
+ * any value including one that matches an open run. What separates the two is
+ * `ChipSwimlaneDataHeader::handoff_schema`: the host reads these fields only
+ * from a producer that declared this schema, and treats every other hand-off
+ * as carrying no identity. A `static_assert` cannot stand in for that -- two
+ * builds with different field meanings have the same 32-byte entry.
  */
 struct ReadyQueueEntry {
     uint32_t core_index;          // Core index (0 ~ num_cores-1), or thread_idx for phase entries
     ChipSwimlaneBufferKind kind;  // Buffer kind discriminator (uint32_t underlying)
     uint64_t buffer_ptr;          // Device pointer to the full buffer
     uint32_t buffer_seq;          // Sequence number for ordering
-    uint32_t pad;                 // Alignment padding
+    uint32_t record_count;        // Records the producer committed in this buffer
+    uint64_t run_epoch;           // Run that produced them; 0 = no identity published
 } __attribute__((aligned(32)));
+
+// ABI lock. The entry is written by the AICPU .so and read by the host .so, so
+// layout drift between them is undetectable at runtime. `record_count` takes
+// the slot the explicit padding held and `run_epoch` the tail padding the
+// 32-byte alignment already reserved, so the queue arrays keep their size:
+// the device region does not grow for either field.
+static_assert(sizeof(ReadyQueueEntry) == 32, "ReadyQueueEntry must stay 32 bytes");
+static_assert(alignof(ReadyQueueEntry) == 32, "ReadyQueueEntry must stay 32-byte aligned");
+static_assert(offsetof(ReadyQueueEntry, buffer_ptr) == 8, "ReadyQueueEntry::buffer_ptr offset drift");
+static_assert(offsetof(ReadyQueueEntry, buffer_seq) == 16, "ReadyQueueEntry::buffer_seq offset drift");
+static_assert(offsetof(ReadyQueueEntry, record_count) == 20, "ReadyQueueEntry::record_count offset drift");
+static_assert(offsetof(ReadyQueueEntry, run_epoch) == 24, "ReadyQueueEntry::run_epoch offset drift");
+static_assert(__is_trivially_copyable(ReadyQueueEntry), "ReadyQueueEntry must be memcpy-able");
+static_assert(__is_standard_layout(ReadyQueueEntry), "ReadyQueueEntry must be standard-layout");
 
 // =============================================================================
 // ChipSwimlaneDataHeader - Fixed Header
@@ -612,7 +646,35 @@ struct ChipSwimlaneDataHeader {
     uint32_t num_orch_phase_threads;            // Number of orch-phase pools the AICPU initialized
     uint32_t num_phase_cores;                   // Number of valid entries in core_to_thread (0 = unset)
     int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
+
+    /**
+     * Which hand-off schema the producer in this region writes.
+     *
+     * Host zeroes the region at allocation and the AICPU stamps this at init,
+     * so the host can tell a producer that publishes `ReadyQueueEntry`'s
+     * identity fields from one whose build predates them and leaves those bytes
+     * as whatever the storage last held. Without it the host would have to read
+     * an unknown value as a run id; a `static_assert` cannot help, because two
+     * builds of different schemas have the same 32-byte entry.
+     *
+     * The host refuses to trust `run_epoch` / `record_count` unless this equals
+     * `kChipSwimlaneHandoffSchema`, so a mixed pair degrades to "no identity
+     * published" and says so, instead of attributing records by accident.
+     *
+     * Stamped, with a write barrier, before the producer publishes its first
+     * ready entry. That order is load-bearing on the host: it reads this field
+     * only after it has observed an entry, so an answer of "not this schema"
+     * can only mean a producer that does not declare it, never one that had not
+     * yet initialized.
+     */
+    uint32_t handoff_schema;
 } __attribute__((aligned(64)));
+
+/**
+ * Bumped whenever the meaning of a ready-entry field changes, not its size.
+ * 1 — `record_count` and `run_epoch` are published by the producer.
+ */
+constexpr uint32_t kChipSwimlaneHandoffSchema = 1;
 
 // ABI lock for the merged header. The phase metadata fields and the
 // core_to_thread[] array are read by both host and AICPU .so's; silent

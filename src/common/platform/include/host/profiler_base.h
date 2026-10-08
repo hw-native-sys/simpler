@@ -382,6 +382,82 @@ enum class EntryOutcome {
     kDelivered,  // in the host hand-off ring, on its way to the collector
     kRetry,      // neither acknowledged nor delivered
     kDropped,    // acknowledged and counted as lost; never reached a collector
+    /**
+     * The acknowledgement could not be decided, so this queue's consumer
+     * position is no longer known.
+     *
+     * Distinct from `kDropped` because the *queue* is now untrustworthy, not
+     * just this entry: the device may or may not consider the entry consumed,
+     * so neither serving it again nor skipping it is sound, and the per-queue
+     * consumed count must not advance -- a cut that completed on it would
+     * declare a boundary finished over an entry nobody has settled. The caller
+     * stops serving the queue and marks its cut unknown.
+     */
+    kOwnershipUnknown,
+};
+
+// What a consumer-index advance established. `kUnknown` is not a failure to
+// write — it is a failure to find out, which is why it may not be treated as
+// either outcome: re-delivering a consumed entry and dropping an unconsumed one
+// are both losses of exactly the kind this transport exists to prevent.
+enum class AckOutcome {
+    kConsumed,     // the device's head has advanced past this entry
+    kNotConsumed,  // the device's head is unchanged; the entry can be retried
+    kUnknown,      // neither could be established
+};
+
+/**
+ * What one attempt to read the producer's schema declaration established.
+ *
+ * `kFailed` is not `kUndeclared`. A transfer that did not happen says nothing
+ * about what the producer declared, and treating the two alike is what turns a
+ * momentary link failure into "this producer publishes no identity".
+ */
+enum class HandoffSchemaRead : int {
+    kFailed = -1,
+    kUndeclared = 0,
+    kDeclared = 1,
+};
+
+/**
+ * What this host knows about the producer's identity declaration.
+ *
+ * `kUnsettled` is the absence of a verdict, not a verdict: either no sample has
+ * been taken yet, or every sample so far failed. An entry may not be consumed
+ * in this state. Consuming one would have to guess, and the only available
+ * guess — "undeclared" — erases identity a current producer did supply, which
+ * turns a payload failure with a known owner into an unattributed one.
+ *
+ * The producer stamps its declaration before it publishes any entry, so a
+ * sample taken after an entry has been observed sees the stamp. That ordering
+ * is what makes `kUndeclared` mean a legacy producer rather than a host that
+ * looked too early.
+ */
+enum class HandoffTrust : uint8_t {
+    kUnsettled,
+    kDeclared,    // the producer declared the supported schema
+    kUndeclared,  // a post-publication read found no supported declaration
+    kUnreadable,  // the bounded read attempts were all refused by the link
+};
+
+/**
+ * What a `kDropped` hand-off was, for the owner that counts the loss.
+ *
+ * `identified` separates the two reasons a buffer is retired, which need
+ * different answers and must never be merged into one anonymous tally:
+ *
+ *  - the descriptor validated and the payload could not be read. The producer
+ *    published who it was and how many records it committed, so this loss
+ *    belongs to a known run and a known count.
+ *  - the descriptor itself did not validate. Nothing in it can be trusted —
+ *    including any run id it appears to carry — so this is a protocol failure
+ *    with no owner, and guessing one from whichever run is executing would be
+ *    the attribution error this whole mechanism exists to remove.
+ */
+template <typename Module>
+struct RetiredHandoff {
+    bool identified{false};
+    typename Module::ReadyBufferInfo info{};
 };
 
 // Unified mgmt-loop algorithms parameterized on Module's data-access traits.
@@ -394,6 +470,21 @@ struct ProfilerAlgorithms {
     using ReadyEntry = typename Module::ReadyEntry;
     using ReadyBufferInfo = typename Module::ReadyBufferInfo;
     using FreeQueue = typename Module::FreeQueue;
+
+    // Optional Module hook: a module whose entry carries identity is told
+    // whether this host may believe it, instead of reading a shared header
+    // field that one drain shard may be writing. A module without the overload
+    // takes the `long` form and is unchanged.
+    template <typename M = Module>
+    static auto resolve(void *shm, DataHeader *header, int q, const ReadyEntry &entry, bool identity_trusted, int)
+        -> decltype(M::resolve_entry(shm, header, q, entry, identity_trusted)) {
+        return M::resolve_entry(shm, header, q, entry, identity_trusted);
+    }
+    template <typename M = Module>
+    static auto resolve(void *shm, DataHeader *header, int q, const ReadyEntry &entry, bool, long)
+        -> decltype(M::resolve_entry(shm, header, q, entry)) {
+        return M::resolve_entry(shm, header, q, entry);
+    }
 
     // Read the entry at the head of the per-thread ready queue without
     // acknowledging it. Returns false if the queue is empty (or the device wrote
@@ -462,15 +553,81 @@ struct ProfilerAlgorithms {
     // entry stays unacknowledged and the next peek sees it again.
     template <typename Mgr>
     static bool ack_aicpu_entry(Mgr &mgr, DataHeader *header, int q) {
+        return ack_aicpu_entry_checked(mgr, header, q) == AckOutcome::kConsumed;
+    }
+
+    /**
+     * Advance this queue's consumer index, and on a failed write find out
+     * whether it actually landed.
+     *
+     * A failing `write_range_to_device` does not prove the device never saw the
+     * new head: the transfer can fail after the bytes are in place. Restoring
+     * the host shadow and retrying on that assumption would re-deliver an entry
+     * the device already considers consumed. So the device's own head is read
+     * back and compared against the only two values a single consumer can have
+     * produced:
+     *
+     *   old_head      — the write did not land; retrying this entry is correct
+     *   expected_head — the write did land; this entry is consumed, and the
+     *                   host shadow is brought forward to match
+     *   anything else — this queue is not in a state a single consumer can
+     *                   explain. Neither answer is safe, so the queue is left
+     *                   where it is and the caller is told it is unknown.
+     *
+     * The two-way reading holds only because each queue has exactly one
+     * consumer — its own drain shard — and nothing resets the index underneath
+     * it. A read-back that itself fails is `kUnknown` for the same reason: it
+     * decides nothing.
+     *
+     * On a platform whose host and device share the region there is no transfer
+     * to fail, so this path is unreachable there and the check costs nothing.
+     */
+    template <typename Mgr>
+    static AckOutcome ack_aicpu_entry_checked(Mgr &mgr, DataHeader *header, int q) {
         const uint32_t old_head = header->queue_heads[q];
-        header->queue_heads[q] = (old_head + 1) % Module::kReadyQueueSize;
+        const uint32_t expected_head = (old_head + 1) % Module::kReadyQueueSize;
+        header->queue_heads[q] = expected_head;
         wmb();
-        if (mgr.write_range_to_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0) {
-            header->queue_heads[q] = old_head;
-            LOG_ERROR("%s: failed to advance ready_queue head for thread %d", Module::kSubsystemName, q);
-            return false;
+        if (mgr.write_range_to_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) == 0) {
+            return AckOutcome::kConsumed;
         }
-        return true;
+        LOG_ERROR("%s: failed to advance ready_queue head for thread %d", Module::kSubsystemName, q);
+
+        if (mgr.read_range_from_device(&header->queue_heads[q], sizeof(header->queue_heads[q])) != 0) {
+            // Cannot be decided either way. Leave the shadow where the failed
+            // write left it rather than asserting a value, and say so.
+            LOG_ERROR(
+                "%s: could not read back ready_queue head for thread %d; whether the entry was consumed is unknown",
+                Module::kSubsystemName, q
+            );
+            // Shadow deliberately left advanced. An undecidable acknowledgement
+            // has two possible repairs and only one of them is safe: serving
+            // the entry again would deliver and free a buffer the device may
+            // already have released, while skipping it costs one hand-off that
+            // the caller counts and reports. Losing a counted buffer beats
+            // delivering an uncounted one twice.
+            return AckOutcome::kUnknown;
+        }
+        rmb();
+        const uint32_t device_head = header->queue_heads[q];
+        if (device_head == old_head) {
+            header->queue_heads[q] = old_head;
+            return AckOutcome::kNotConsumed;
+        }
+        if (device_head == expected_head) {
+            LOG_WARN(
+                "%s: ready_queue head for thread %d had already advanced; the entry is consumed despite the write "
+                "failure",
+                Module::kSubsystemName, q
+            );
+            return AckOutcome::kConsumed;
+        }
+        LOG_ERROR(
+            "%s: ready_queue head for thread %d is %u, neither %u nor %u; this queue has no single-consumer reading",
+            Module::kSubsystemName, q, device_head, old_head, expected_head
+        );
+        header->queue_heads[q] = expected_head;
+        return AckOutcome::kUnknown;
     }
 
     // Refill the originating pool's free_queue from this drain shard's local
@@ -492,13 +649,18 @@ struct ProfilerAlgorithms {
     template <typename Mgr>
     static EntryOutcome process_entry(
         Mgr &mgr, DataHeader *header, int q, const ReadyEntry &entry, EntrySite<Module> *short_site_out,
-        bool retries_exhausted
+        bool retries_exhausted, RetiredHandoff<Module> *retired_out = nullptr, bool identity_trusted = false
     ) {
-        auto site_opt = Module::resolve_entry(mgr.shared_mem_host(), header, q, entry);
+        auto site_opt = resolve(mgr.shared_mem_host(), header, q, entry, identity_trusted, 0);
         if (!site_opt.has_value()) {
             // resolve_entry already logged which index failed to validate, and no
             // retry can make it validate.
-            if (!ack_aicpu_entry(mgr, header, q)) return EntryOutcome::kRetry;
+            const AckOutcome bad_entry_ack = ack_aicpu_entry_checked(mgr, header, q);
+            if (bad_entry_ack == AckOutcome::kNotConsumed) return EntryOutcome::kRetry;
+            if (bad_entry_ack == AckOutcome::kUnknown) {
+                if (retired_out != nullptr) *retired_out = RetiredHandoff<Module>{};
+                return EntryOutcome::kOwnershipUnknown;
+            }
             // The buffer pointer travelled in the same entry, so it is trustworthy
             // only as far as the manager can vouch for it, and never trustworthy
             // enough to publish into a device-visible free_queue for AICPU to
@@ -516,6 +678,9 @@ struct ProfilerAlgorithms {
                 "%s: retired an unresolvable ready entry on thread %d; its records are lost and its buffer %p is %s",
                 Module::kSubsystemName, q, dev_ptr, parked ? "parked until teardown" : "withheld from the pool"
             );
+            // Left unidentified on purpose: the fields that would name a run
+            // are in the descriptor that just failed to validate.
+            if (retired_out != nullptr) *retired_out = RetiredHandoff<Module>{};
             return EntryOutcome::kDropped;
         }
         auto &site = *site_opt;
@@ -525,7 +690,9 @@ struct ProfilerAlgorithms {
             // resolve_host_ptr already logged. Mappings are established when a
             // buffer is allocated, i.e. before the device can ever publish it,
             // so an unmappable buffer will not become mappable on a retry.
-            return retire_undeliverable_entry(mgr, header, q, site, "its device buffer is not mapped on this host");
+            return retire_undeliverable_entry(
+                mgr, header, q, site, "its device buffer is not mapped on this host", retired_out
+            );
         }
         // a5: pull buffer contents from device into the host shadow before
         // the collector reads `count` and `records[]`.
@@ -534,14 +701,33 @@ struct ProfilerAlgorithms {
                 "%s: failed to copy ready buffer from device (kind=%d, thread=%d)", Module::kSubsystemName, site.kind, q
             );
             if (!retries_exhausted) return EntryOutcome::kRetry;
-            return retire_undeliverable_entry(mgr, header, q, site, "its device buffer could not be copied to host");
+            return retire_undeliverable_entry(
+                mgr, header, q, site, "its device buffer could not be copied to host", retired_out
+            );
         }
 
         // The payload is in the host shadow, so the device's slot can go back.
         // Doing this before the copy would put a failure between the
         // acknowledgement and the delivery, which is exactly how a record gets
         // lost without anything counting it.
-        if (!ack_aicpu_entry(mgr, header, q)) return EntryOutcome::kRetry;
+        // Only a decided, unconsumed acknowledgement may be retried: retrying an
+        // undecided one would hand this buffer to the collector twice.
+        const AckOutcome ack = ack_aicpu_entry_checked(mgr, header, q);
+        if (ack == AckOutcome::kNotConsumed) return EntryOutcome::kRetry;
+        if (ack == AckOutcome::kUnknown) {
+            LOG_ERROR(
+                "%s: thread %d could not settle a ready buffer's acknowledgement; the queue is stopped and its cut is "
+                "unknown",
+                Module::kSubsystemName, q
+            );
+            // Identity is known, but the buffer's ownership is not: the device
+            // may still hold it. It is neither delivered nor returned to a
+            // device-visible free queue -- the manager's host-only retired pool
+            // keeps it until teardown.
+            (void)mgr.retire_unqueued_buffer(site.kind, site.info.dev_buffer_ptr, q);
+            if (retired_out != nullptr) *retired_out = RetiredHandoff<Module>{true, site.info};
+            return EntryOutcome::kOwnershipUnknown;
+        }
 
         // Drain-driven free_queue top-up. The drain shard that serves ready queue
         // q is the sole runtime writer of every free_queue that q's entries
@@ -682,9 +868,28 @@ private:
     // no room the manager's retired pool holds the buffer until teardown frees
     // it, exactly as a failed top-up does.
     template <typename Mgr>
-    static EntryOutcome
-    retire_undeliverable_entry(Mgr &mgr, DataHeader *header, int q, const EntrySite<Module> &site, const char *reason) {
-        if (!ack_aicpu_entry(mgr, header, q)) return EntryOutcome::kRetry;
+    static EntryOutcome retire_undeliverable_entry(
+        Mgr &mgr, DataHeader *header, int q, const EntrySite<Module> &site, const char *reason,
+        RetiredHandoff<Module> *retired_out = nullptr
+    ) {
+        const AckOutcome ack = ack_aicpu_entry_checked(mgr, header, q);
+        if (ack == AckOutcome::kNotConsumed) return EntryOutcome::kRetry;
+        // The descriptor validated, so this loss has an owner and a count even
+        // though its bytes never arrived.
+        if (retired_out != nullptr) *retired_out = RetiredHandoff<Module>{true, site.info};
+        if (ack == AckOutcome::kUnknown) {
+            // Settled once, here, and then the queue stops. Retrying instead
+            // would re-record this loss if the write did not land, and lose it
+            // entirely if it did -- the device would simply not show the entry
+            // again. The buffer's ownership is unproven either way, so it is
+            // withheld from the free queue rather than published into it.
+            LOG_ERROR(
+                "%s: thread %d could not settle an undeliverable entry's acknowledgement; the queue is stopped",
+                Module::kSubsystemName, q
+            );
+            (void)mgr.retire_unqueued_buffer(site.kind, site.info.dev_buffer_ptr, q);
+            return EntryOutcome::kOwnershipUnknown;
+        }
         LOG_ERROR(
             "%s: retired ready buffer %p (kind=%d, thread=%d) because %s; its records are lost and are part of this "
             "run's reconcile gap",
@@ -857,6 +1062,9 @@ public:
         std::function<int(void *, const void *, size_t)> copy_from_device, void *shm_dev, void *shm_host,
         size_t shm_size, int device_id
     ) {
+        // A new region carries a new producer's declaration, so nothing read
+        // from the previous one may be believed about this one.
+        reset_handoff_identity_trust();
         alloc_cb_ = alloc_cb;
         register_cb_ = register_cb;
         free_cb_ = free_cb;
@@ -1114,6 +1322,137 @@ protected:
             "host-side; the per-buffer ERROR lines above name each buffer and why it was retired.",
             Derived::kSubsystemName, static_cast<unsigned long>(dropped)
         );
+    }
+
+    /**
+     * Count one retired hand-off, and tell the collector whose it was.
+     *
+     * The cumulative scalar is kept because the single-run reconcile path still
+     * consumes it; it is a tally, not an attribution, and nothing reads it as
+     * one. The hook beside it is what carries the identity the descriptor
+     * published, so a collector that retains runs can charge the loss to the
+     * run that produced it instead of to whichever run happens to close next.
+     *
+     * Called on the drain thread, before `note_buffer_retired` advances the
+     * per-queue consumed count: a cut must not be able to complete over a loss
+     * that is not yet on the books.
+     */
+    /**
+     * Stop serving a queue whose consumer position could not be settled, and
+     * make every cut over it report unknown instead of reached.
+     *
+     * `consumed_total_[q]` is deliberately NOT advanced: a cut's target is a
+     * consumed count, so advancing it here would let the boundary complete over
+     * an entry nobody settled. Marking the queue's cut state failed is the
+     * existing way to say "this queue's stage one is unknown and is never
+     * satisfied by default", which both reports the gap and keeps quiesce from
+     * waiting on a queue that can no longer progress.
+     */
+    void quarantine_queue(int q) {
+        if (q < 0 || static_cast<size_t>(q) >= kMaxCutQueues) return;
+        if (queue_ownership_unknown_[static_cast<size_t>(q)]) return;
+        queue_ownership_unknown_[static_cast<size_t>(q)] = true;
+        LOG_ERROR(
+            "%s: ready queue %d is stopped; its consumer position is unknown and every cut over it reports unknown",
+            Derived::kSubsystemName, q
+        );
+        // Only slots this owner may write: a Published slot it has not yet
+        // captured. A Free or Reserved slot belongs to the arming side until it
+        // publishes, and writing one would race the initialize-then-publish
+        // protocol. Cuts armed later need no write here -- the capture in
+        // `run_drain_boundary` consults the flag directly.
+        for (size_t slot = 0; slot < kMaxCutSlots; slot++) {
+            CutSlot &s = cut_slots_[slot];
+            if (s.state.load(std::memory_order_acquire) != static_cast<int>(CutState::Published)) continue;
+            s.qstate[static_cast<size_t>(q)].store(2, std::memory_order_release);
+        }
+    }
+
+    /**
+     * Settle whether this transport's identity fields may be believed.
+     *
+     * Called by whichever shard is holding an entry it is about to consume, and
+     * only then. That is the ordering the answer depends on: the producer
+     * stamps its declaration before publishing anything, so a device read
+     * issued after an entry has been observed cannot miss a stamp that entry
+     * came after. A sample taken before the producer initialized would answer
+     * "undeclared" about a producer that declares, which is why no sweep
+     * samples ahead of its first entry.
+     *
+     * Any shard may settle it; the mutex serializes the device read and the
+     * single word of shared shadow it lands in, so that word still has one
+     * writer at a time and no reader of it runs concurrently. The verdict is
+     * published with release and read with acquire, so a shard that skips the
+     * read because a sibling already settled it sees everything that read
+     * established.
+     *
+     * A refused read leaves the answer `kUnsettled` -- the caller must leave
+     * its entry on the queue -- for a bounded number of attempts, after which
+     * the link is declared unable to answer and entries are consumed without
+     * identity rather than never consumed at all.
+     */
+    HandoffTrust settle_handoff_trust(DataHeader *header) {
+        HandoffTrust settled = handoff_trust_.load(std::memory_order_acquire);
+        if (settled != HandoffTrust::kUnsettled) return settled;
+        std::lock_guard<std::mutex> lk(handoff_schema_mu_);
+        // A sibling may have settled it while this shard waited for the lock.
+        settled = handoff_trust_.load(std::memory_order_relaxed);
+        if (settled != HandoffTrust::kUnsettled) return settled;
+        switch (schema_refresh(header, 0)) {
+        case HandoffSchemaRead::kDeclared:
+            settled = HandoffTrust::kDeclared;
+            break;
+        case HandoffSchemaRead::kUndeclared:
+            settled = HandoffTrust::kUndeclared;
+            break;
+        case HandoffSchemaRead::kFailed:
+            if (++handoff_schema_attempts_ < kMaxSchemaReadAttempts) return HandoffTrust::kUnsettled;
+            LOG_ERROR(
+                "%s: the producer's identity declaration could not be read in %u attempts; hand-offs from here on "
+                "carry no identity",
+                Module::kSubsystemName, kMaxSchemaReadAttempts
+            );
+            settled = HandoffTrust::kUnreadable;
+            break;
+        }
+        handoff_trust_.store(settled, std::memory_order_release);
+        return settled;
+    }
+
+    /** The settled verdict, or `kUnsettled` while no entry has forced one. */
+    HandoffTrust handoff_trust() const { return handoff_trust_.load(std::memory_order_acquire); }
+
+    template <typename M = Module, typename Mgr = Manager>
+    auto schema_refresh(DataHeader *header, int) -> decltype(M::refresh_handoff_schema(std::declval<Mgr &>(), header)) {
+        return M::refresh_handoff_schema(manager_, header);
+    }
+    template <typename M = Module>
+    HandoffSchemaRead schema_refresh(DataHeader *, long) {
+        return HandoffSchemaRead::kDeclared;  // nothing to confirm
+    }
+
+    void note_handoff_retired(const RetiredHandoff<Module> &retired) {
+        drain_dropped_buffers_.fetch_add(1, std::memory_order_relaxed);
+        forward_retired(retired, 0);
+    }
+
+    // Optional Derived hook. A collector that does not define it gets the
+    // `long` overload and no behaviour change, so the profilers that do not
+    // retain runs are untouched — the same overload-rank trick the device
+    // engine uses for its optional module hooks.
+    template <typename D = Derived>
+    auto forward_retired(const RetiredHandoff<Module> &retired, int)
+        -> decltype(std::declval<D &>().on_handoff_retired(retired), void()) {
+        static_cast<Derived *>(this)->on_handoff_retired(retired);
+    }
+    template <typename D = Derived>
+    void forward_retired(const RetiredHandoff<Module> &, long) {}
+
+    /** Forget a previous region's declaration. Called with the new context. */
+    void reset_handoff_identity_trust() {
+        std::lock_guard<std::mutex> lk(handoff_schema_mu_);
+        handoff_schema_attempts_ = 0;
+        handoff_trust_.store(HandoffTrust::kUnsettled, std::memory_order_release);
     }
 
     void bind_manager_memory_context() {
@@ -1603,6 +1942,11 @@ private:
         }
     }
 
+    /**
+     * One drain shard: sweep its queues while the collector runs, then make a
+     * final pass over them. Both passes gate every entry on the same settled
+     * identity verdict.
+     */
     void mgmt_drain_loop(int queue_start, int queue_stride) {
         DataHeader *header = Module::header_from_shm(manager_.shared_mem_host());
         using Alg = ProfilerAlgorithms<Module>;
@@ -1639,16 +1983,31 @@ private:
                 // one whose last outcome was a retry, so a busy sibling can never
                 // hide a pending request.
                 run_drain_boundary(header, queue_start, queue_stride);
+                if (queue_ownership_unknown_[static_cast<size_t>(q)]) continue;
                 ReadyEntry entry;
                 int served = 0;
                 const int quantum = drain_quantum_.load(std::memory_order_relaxed);
                 while (Alg::try_peek_aicpu_entry(manager_, header, q, entry, true)) {
+                    // Settled with an entry already in hand, never ahead of
+                    // one: that is what makes a "no declaration" answer a fact
+                    // about the producer rather than about when this shard
+                    // happened to look.
+                    const HandoffTrust trust = settle_handoff_trust(header);
+                    if (trust == HandoffTrust::kUnsettled) {
+                        // The entry stays at the head and keeps the queue live.
+                        // Only a bounded number of refused reads can land here.
+                        found_any = true;
+                        break;
+                    }
                     // A null free_queue is the "nothing to retry" sentinel;
                     // process_entry only writes this on a short top-up.
                     EntrySite<Module> short_site{};
                     auto &since = stalled_since[static_cast<size_t>(q)];
                     const bool exhausted = entry_retries_exhausted(since);
-                    const EntryOutcome outcome = Alg::process_entry(manager_, header, q, entry, &short_site, exhausted);
+                    RetiredHandoff<Module> retired;
+                    const EntryOutcome outcome = Alg::process_entry(
+                        manager_, header, q, entry, &short_site, exhausted, &retired, trust == HandoffTrust::kDeclared
+                    );
                     if (outcome == EntryOutcome::kRetry) {
                         if (since == std::chrono::steady_clock::time_point{}) {
                             since = std::chrono::steady_clock::now();
@@ -1666,11 +2025,23 @@ private:
                         // to the next queue rather than spinning on it.
                         break;
                     }
+                    if (outcome == EntryOutcome::kOwnershipUnknown) {
+                        // Settled exactly once, then the queue stops. The
+                        // consumed count stays where it is on purpose.
+                        note_handoff_retired(retired);
+                        quarantine_queue(q);
+                        retired_or_delivered = true;
+                        break;
+                    }
                     found_any = true;
                     retired_or_delivered = true;
                     since = std::chrono::steady_clock::time_point{};
                     if (outcome == EntryOutcome::kDropped) {
-                        drain_dropped_buffers_.fetch_add(1, std::memory_order_relaxed);
+                        // Before `note_buffer_retired`, which advances the
+                        // per-queue consumed count a cut completes on: a loss
+                        // has to be on the books before the boundary it falls
+                        // inside can be declared finished.
+                        note_handoff_retired(retired);
                         note_buffer_retired(q);
                     } else {
                         note_buffer_delivered(q, queue_start);
@@ -1714,11 +2085,27 @@ private:
         }
 
         for (int q = queue_start; q < queue_count_; q += queue_stride) {
+            if (static_cast<size_t>(q) < kMaxCutQueues && queue_ownership_unknown_[static_cast<size_t>(q)]) {
+                // Already stopped, and the final drain cannot re-establish where
+                // the device's consumer index is any more than the sweep could.
+                continue;
+            }
             ReadyEntry entry;
             auto since = std::chrono::steady_clock::time_point{};
             while (Alg::try_peek_aicpu_entry(manager_, header, q, entry, true)) {
+                // Same gate as the sweep, and for the same reason: the last
+                // entry of a run is as entitled to its identity as the first,
+                // and this pass may be the first time any shard sees one.
+                const HandoffTrust trust = settle_handoff_trust(header);
+                if (trust == HandoffTrust::kUnsettled) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(100));
+                    continue;
+                }
                 const bool exhausted = entry_retries_exhausted(since);
-                const EntryOutcome outcome = Alg::process_entry(manager_, header, q, entry, nullptr, exhausted);
+                RetiredHandoff<Module> retired;
+                const EntryOutcome outcome = Alg::process_entry(
+                    manager_, header, q, entry, nullptr, exhausted, &retired, trust == HandoffTrust::kDeclared
+                );
                 if (outcome == EntryOutcome::kRetry) {
                     // Past the budget the acknowledgement write is what is
                     // failing; leave the queue alone rather than retrying a dead
@@ -1734,8 +2121,13 @@ private:
                     continue;
                 }
                 since = std::chrono::steady_clock::time_point{};
+                if (outcome == EntryOutcome::kOwnershipUnknown) {
+                    note_handoff_retired(retired);
+                    quarantine_queue(q);
+                    break;
+                }
                 if (outcome == EntryOutcome::kDropped) {
-                    drain_dropped_buffers_.fetch_add(1, std::memory_order_relaxed);
+                    note_handoff_retired(retired);
                 }
             }
         }
@@ -1793,6 +2185,16 @@ private:
             if (s.state.load(std::memory_order_acquire) != static_cast<int>(CutState::Published)) continue;
             for (int q = queue_start; q < queue_count_ && static_cast<size_t>(q) < kMaxCutQueues; q += queue_stride) {
                 if (s.qstate[static_cast<size_t>(q)].load(std::memory_order_relaxed) != 0) continue;
+                if (queue_ownership_unknown_[static_cast<size_t>(q)]) {
+                    // Applied while this cut is captured, not after it is
+                    // published. `cut_arm` resets qstate to zero, so a cut armed
+                    // after the queue stopped would otherwise capture a target
+                    // its consumed count already meets -- head==tail on a queue
+                    // nobody drains -- reach stage one, and be read as a cut
+                    // with no failed queues.
+                    s.qstate[static_cast<size_t>(q)].store(2, std::memory_order_release);
+                    continue;
+                }
                 uint32_t tail = 0;
                 uint32_t head = 0;
                 if (!capture_run_queue(header, q, &head, &tail)) {
@@ -2094,6 +2496,34 @@ private:
     std::array<CutSlot, kMaxCutSlots> cut_slots_{};
     std::atomic<uint64_t> cut_request_{0};
     std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> cut_ack_{};
+    /**
+     * Queues whose consumer position is no longer known.
+     *
+     * Set when an acknowledgement could not be decided. From then on the queue
+     * is not peeked -- the device may or may not consider its head entry
+     * consumed, so both serving it again and skipping it can lose or duplicate
+     * a record -- and every cut that spans it is marked unknown rather than
+     * satisfied, which is what keeps a run from sealing as if the boundary had
+     * been reached.
+     *
+     * One entry per ready queue and each queue has exactly one drain owner, so
+     * this needs no synchronisation beyond that ownership. It is never cleared:
+     * nothing in this teardown-bound path can re-establish where the device's
+     * consumer index is.
+     */
+    std::array<bool, kMaxCutQueues> queue_ownership_unknown_{};
+    /**
+     * This region's settled identity verdict, and the exclusion that produced
+     * it. The mutex serializes the device read and the one shared-shadow word
+     * it lands in; `handoff_schema_attempts_` is the bound on how long a link
+     * that refuses the read may keep entries waiting, and is guarded by it.
+     * Both are reset with the region they describe, because a new region
+     * carries a new producer's declaration.
+     */
+    static constexpr unsigned kMaxSchemaReadAttempts = 8;
+    std::mutex handoff_schema_mu_;
+    unsigned handoff_schema_attempts_{0};
+    std::atomic<HandoffTrust> handoff_trust_{HandoffTrust::kUnsettled};
     std::array<std::atomic<uint64_t>, kMaxCutQueues> consumed_total_{};
     std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> pushed_total_{};
     std::array<std::atomic<uint64_t>, Manager::kMaxCollectorShards> ring_processed_{};

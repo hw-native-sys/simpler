@@ -500,6 +500,7 @@ platform_cases(
     test_chip_swimlane_run_terminal_consistency.cpp
     test_chip_swimlane_aicore_accounting.cpp
     test_chip_swimlane_handoff_accounting.cpp
+    test_chip_swimlane_handoff_identity.cpp
     test_chip_swimlane_retained_runs.cpp
     PER_ARCH PER_RUNTIME TIER aicpu
     SOURCES ${CHIP_SWIMLANE_CASE_SOURCES})

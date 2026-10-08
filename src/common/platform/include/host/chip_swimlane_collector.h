@@ -34,7 +34,9 @@
 #include <functional>
 #include <mutex>
 #include <new>
+#include <memory>
 #include <optional>
+#include <utility>
 #include <string>
 #include <thread>
 #include <vector>
@@ -90,6 +92,17 @@ struct ReadyBufferInfo {
     void *dev_buffer_ptr;   // Device address of the full buffer
     void *host_buffer_ptr;  // Host-mapped address (sim: same as dev)
     uint32_t buffer_seq;    // Sequence number for ordering
+    /**
+     * Identity the producer published with the hand-off, not read back from the
+     * payload. It survives a payload this host cannot read, which is the whole
+     * reason it travels in the descriptor.
+     *
+     * Zero means no identity reached this host: either the producer published
+     * none, or it did not declare the hand-off schema and its bytes were
+     * refused. Both are statements about the hand-off, never a run id.
+     */
+    uint32_t record_count;  // Records the producer says this buffer carries
+    uint64_t run_epoch;     // Run that produced them; 0 = no identity published
 };
 
 struct ChipSwimlaneModule {
@@ -187,6 +200,29 @@ struct ChipSwimlaneModule {
 
     static DataHeader *header_from_shm(void *shm) { return get_chip_swimlane_header(shm); }
 
+    /**
+     * Pull the producer's schema declaration into the host view.
+     *
+     * Required, not an optimisation: on a platform whose host shadow is a
+     * separate allocation the host zeroes it and nothing else on the drain path
+     * refreshes this field, so without this read a current producer reads as an
+     * undeclared one and every hand-off loses its identity.
+     *
+     * Reports the read, not a policy: a transfer that failed answers `kFailed`
+     * and leaves the field as it was, because a read that did not happen is
+     * evidence about the link and none at all about what the producer declared.
+     * The caller is what decides when to ask and what an answer licenses.
+     */
+    template <typename Mgr>
+    static profiling_common::HandoffSchemaRead refresh_handoff_schema(Mgr &mgr, DataHeader *header) {
+        if (mgr.read_range_from_device(&header->handoff_schema, sizeof(header->handoff_schema)) != 0) {
+            return profiling_common::HandoffSchemaRead::kFailed;
+        }
+        rmb();
+        return header->handoff_schema == kChipSwimlaneHandoffSchema ? profiling_common::HandoffSchemaRead::kDeclared :
+                                                                      profiling_common::HandoffSchemaRead::kUndeclared;
+    }
+
     template <typename Mgr>
     static void refresh_replenish_metadata(Mgr &mgr, DataHeader *header) {
         mgr.read_range_from_device(&header->num_sched_phase_threads, sizeof(header->num_sched_phase_threads));
@@ -199,8 +235,22 @@ struct ChipSwimlaneModule {
      * or orch-phase state, or per-core AICore state. Returns nullopt for
      * out-of-range kind or core_index.
      */
+    /** Records the buffer behind each kind can hold. */
+    static uint32_t payload_record_capacity(ChipSwimlaneBufferKind kind) {
+        switch (kind) {
+        case ChipSwimlaneBufferKind::AicpuTask:
+            return static_cast<uint32_t>(PLATFORM_PROF_BUFFER_SIZE);
+        case ChipSwimlaneBufferKind::AicoreTask:
+            return static_cast<uint32_t>(PLATFORM_AICORE_BUFFER_SIZE);
+        case ChipSwimlaneBufferKind::AicpuSchedPhase:
+        case ChipSwimlaneBufferKind::AicpuOrchPhase:
+            return static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD);
+        }
+        return 0;
+    }
+
     static std::optional<profiling_common::EntrySite<ChipSwimlaneModule>>
-    resolve_entry(void *shm, DataHeader *header, int /*q*/, const ReadyEntry &entry) {
+    resolve_entry(void *shm, DataHeader *header, int /*q*/, const ReadyEntry &entry, bool identity_trusted) {
         const int num_cores = static_cast<int>(header->num_cores);
         const ChipSwimlaneBufferKind kind = entry.kind;
 
@@ -237,6 +287,29 @@ struct ChipSwimlaneModule {
         site.info.dev_buffer_ptr = reinterpret_cast<void *>(entry.buffer_ptr);
         site.info.host_buffer_ptr = nullptr;  // filled by ProfilerAlgorithms
         site.info.buffer_seq = entry.buffer_seq;
+        // Read only once this host has seen the producer declare the schema.
+        // The decision is passed in rather than re-read here: the declaration
+        // field has one writer, and a reader on another drain shard must not
+        // race it. A build that predates the identity fields leaves those bytes
+        // as whatever the storage last held, so an undeclared producer yields
+        // "no identity published" rather than a wrong one.
+        site.info.record_count = identity_trusted ? entry.record_count : 0;
+        site.info.run_epoch = identity_trusted ? entry.run_epoch : 0;
+
+        // A count larger than the buffer this entry selects cannot have come
+        // from a correct producer, and believing it would invent records for a
+        // run that never wrote them -- on the very path where the payload is
+        // unreadable and nothing else can contradict it. The whole entry is
+        // rejected rather than the count clamped: a field this wrong is
+        // evidence about the descriptor, not about the count alone.
+        const uint32_t capacity = payload_record_capacity(kind);
+        if (identity_trusted && entry.record_count > capacity) {
+            LOG_ERROR(
+                "ChipSwimlaneModule: entry claims %u records for a kind=%u buffer that holds at most %u",
+                entry.record_count, static_cast<uint32_t>(kind), capacity
+            );
+            return std::nullopt;
+        }
 
         switch (kind) {
         case ChipSwimlaneBufferKind::AicpuTask: {
@@ -461,6 +534,19 @@ public:
      * phase-record vector.
      */
     void on_buffer_collected(const ReadyBufferInfo &info, int collector_shard);
+
+    /**
+     * One hand-off the drain path retired without delivering it.
+     *
+     * Called on a drain shard, before that queue's consumed count advances, so
+     * a cut cannot complete over a loss that is not yet recorded. Charges the
+     * run whose identity the producer published with the descriptor; a
+     * hand-off whose descriptor did not validate, whose epoch is absent, or
+     * whose epoch names no open run is counted as unattributable and charged to
+     * nobody — attributing it to whichever run is executing is the error this
+     * whole mechanism exists to remove.
+     */
+    void on_handoff_retired(const profiling_common::RetiredHandoff<ChipSwimlaneModule> &retired);
 
     /**
      * Per-shard AICore records as collected, each with the run it came from.
@@ -896,6 +982,38 @@ public:
     /** This run's handoff report, as `report_run_terminal_snapshot` produced it. */
     HandoffReport handoff_report_for_test() const { return handoff_report_; }
 
+    /** This epoch's charged transport loss: {buffers, records}. */
+    std::pair<uint64_t, uint64_t> transport_loss_for_test(uint64_t run_epoch) const {
+        for (const auto &bucket : retained_runs_) {
+            std::lock_guard<std::mutex> lk(bucket.loss_mu);
+            if (bucket.loss_state == LossState::Free || bucket.loss_epoch != run_epoch) continue;
+            return {bucket.transport_retired, bucket.transport_retired_records};
+        }
+        return {0, 0};
+    }
+
+    /**
+     * Run just before a charge takes a bucket's accounting lock.
+     *
+     * Lets a test park a charge in the window a reset, a seal or a release
+     * races, which is the only window the exclusion has to survive: once the
+     * lock is taken, validation and both writes are one critical section.
+     * Holding no lock here is what lets the racing thread make progress.
+     *
+     * The callable is held behind a shared pointer and the charging thread
+     * takes its own reference before invoking it, so replacing or clearing the
+     * hook while it is executing cannot destroy the callable under its caller.
+     */
+    void set_pre_charge_hook_for_test(std::function<void()> hook) {
+        auto next = hook ? std::make_shared<std::function<void()>>(std::move(hook)) : nullptr;
+        std::lock_guard<std::mutex> lk(pre_charge_hook_mu_);
+        pre_charge_hook_ = std::move(next);
+    }
+
+    uint64_t unattributable_handoffs_for_test() const {
+        return unattributable_handoffs_.load(std::memory_order_relaxed);
+    }
+
     /**
      * One completed run's diagnostic data, owned by that run.
      *
@@ -1212,6 +1330,25 @@ private:
     // What the drain path retired before it could be presented, captured in
     // reconcile because `report_drain_drops()` consumes the counter.
     uint64_t transport_retired_buffers_{0};
+    /**
+     * Retired hand-offs this collector could not attribute to any run.
+     *
+     * Collector-lifetime and never reset by a run boundary: the loss outlives
+     * the run that was open when it happened, and no later observation can
+     * decide whose it was. Published on every run sealed while it is non-zero,
+     * as a completeness statement about that run rather than a count of its
+     * own losses.
+     */
+    std::atomic<uint64_t> unattributable_handoffs_{0};
+    /** Reported once: this transport delivers hand-offs with no identity. */
+    std::atomic<bool> unverified_handoff_reported_{false};
+    mutable std::mutex pre_charge_hook_mu_;
+    std::shared_ptr<std::function<void()>> pre_charge_hook_;
+    /** The hook as of now, kept alive for as long as the caller holds it. */
+    std::shared_ptr<std::function<void()>> pre_charge_hook() const {
+        std::lock_guard<std::mutex> lk(pre_charge_hook_mu_);
+        return pre_charge_hook_;
+    }
     HandoffReport handoff_report_{};
 
     // What `report_run_terminal_snapshot` read and concluded for this run, kept
@@ -1232,6 +1369,17 @@ private:
         Sealed,       // records moved out; the writer owns them until the file is published
         Quarantined,  // a close that could not be proved safe: nothing is moved, nothing is freed
     };
+
+    /**
+     * Whether a bucket's loss counters may still be charged, and by whom.
+     *
+     * `Free` is a refusal, not an absence of information: the slot holds no
+     * run, so a descriptor naming one has named a run this collector does not
+     * hold and its records are unattributed. A bucket reaches `Free` through
+     * every release path -- a sealed run's publication and a withdrawn run's
+     * rollback alike -- so neither leaves counters a later charge can reach.
+     */
+    enum class LossState : uint8_t { Free, Open, Sealed };
 
     /**
      * One open epoch. Slots are the capacity bound: a bucket occupies one in
@@ -1258,7 +1406,37 @@ private:
         AicoreAccounting aicore{};
         RunTerminalSnapshot terminal{};
         bool terminal_ok{false};
+        /**
+         * Guards this bucket's loss accounting as one unit: the identity it is
+         * being charged against, what that identity may still accept, and the
+         * two counters.
+         *
+         * A drain shard validates the identity and performs both additions
+         * while holding it; `run_begin` resets the counters and installs the
+         * new identity while holding it; the close takes its snapshot and marks
+         * the bucket sealed while holding it; `release_run_slot` retires the
+         * identity while holding it. Those four are the only writers, so a
+         * charge can never straddle a reset, a seal or a release -- which an
+         * atomic label and a later re-check cannot prevent, because the
+         * re-check only observes corruption it has already caused.
+         *
+         * Leaf lock. Taken under `retained_mu_` by the run-table writers and on
+         * its own by a drain shard; never held across device I/O, a
+         * reference-release wait, or an error callback.
+         */
+        mutable std::mutex loss_mu;
+        /** Identity these counters belong to. Guarded by `loss_mu`. */
+        uint64_t loss_epoch{0};
+        /**
+         * What that identity may still accept. Guarded by `loss_mu` and moved
+         * in the same critical section as `loss_epoch`, so a charge decides
+         * generation and authority from one consistent pair rather than from a
+         * state word it read outside the lock.
+         */
+        LossState loss_state{LossState::Free};
         uint64_t transport_retired{0};
+        // Records inside those buffers, from the descriptors that named them.
+        uint64_t transport_retired_records{0};
         // Host bytes this epoch holds, charged before each retained allocation
         // by whichever collector shard made it and credited when the storage is
         // actually released.
@@ -1659,8 +1837,28 @@ private:
     size_t normalize_collector_shard(int collector_shard) const;
     bool producer_index_in_range(ProfBufferType type, uint32_t index) const;
     bool read_buffer_identity(
-        const ReadyBufferInfo &info, uint64_t *epoch_out, uint32_t *count_out, uint32_t *capacity_out
+        const ReadyBufferInfo &info, uint64_t *epoch_out, uint32_t *count_out, uint32_t *capacity_out,
+        uint32_t *local_seq_out = nullptr
     ) const;
+
+    /**
+     * Whether the hand-off's two statements of identity agree.
+     *
+     * The descriptor and the payload are written by the same producer while it
+     * still owns the buffer, so epoch, sequence and record count must match. A
+     * disagreement is evidence that the hand-off or the buffer's reuse went
+     * wrong between them; preferring either side would publish one run's
+     * records under another's name. `reason_out` names the field that differed.
+     */
+    /** Add without wrapping past the maximum. Caller holds `loss_mu`. */
+    static void saturating_add(uint64_t &counter, uint64_t amount) {
+        counter = amount > UINT64_MAX - counter ? UINT64_MAX : counter + amount;
+    }
+
+    static bool handoff_identity_agrees(
+        const ReadyBufferInfo &info, uint64_t buffer_epoch, uint32_t buffer_count, uint32_t buffer_seq,
+        const char **reason_out
+    );
     void note_buffer_observed(const ReadyBufferInfo &info, int collector_shard, size_t slot, uint64_t expected_epoch);
 
     /**

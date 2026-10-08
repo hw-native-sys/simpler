@@ -216,11 +216,19 @@ struct ChipSwimlaneDeviceModule {
     static uint32_t count(Buffer *buffer) { return buffer->count; }
     static void set_count(Buffer *buffer, uint32_t count) { buffer->count = count; }
 
-    static void write_ready_entry(Context ctx, uint32_t tail, uint64_t buffer_ptr, uint32_t buffer_seq) {
+    // The hand-off's identity travels with it. `record_count` is the caller's
+    // snapshot, taken while this producer still owned the buffer; `run_epoch`
+    // is this run's, read from the device's own run identity rather than from
+    // the buffer, because the buffer is exactly what a failing host read cannot
+    // reach. Both land before the engine's `wmb()` and the tail advance.
+    static void
+    write_ready_entry(Context ctx, uint32_t tail, uint64_t buffer_ptr, uint32_t buffer_seq, uint32_t record_count) {
         ctx.header->queues[ctx.thread_idx][tail].core_index = ctx.core_index;
         ctx.header->queues[ctx.thread_idx][tail].kind = ctx.kind;
         ctx.header->queues[ctx.thread_idx][tail].buffer_ptr = buffer_ptr;
         ctx.header->queues[ctx.thread_idx][tail].buffer_seq = buffer_seq;
+        ctx.header->queues[ctx.thread_idx][tail].record_count = record_count;
+        ctx.header->queues[ctx.thread_idx][tail].run_epoch = get_platform_run_result_epoch();
     }
 
     static void account_dropped(Context, State *state, uint32_t count) {
@@ -325,15 +333,19 @@ static bool wait_for_free_queue_entry(ChipSwimlaneFreeQueue *free_queue, uint32_
  * @param core_index Core index for task entries, or pool ordinal for phase entries
  * @param buffer_ptr Device pointer to the full buffer
  * @param buffer_seq Sequence number for ordering
+ * @param record_count Records this buffer carries, read before publication
  * @param kind Buffer kind discriminator (see ChipSwimlaneBufferKind)
  * @return 0 on success, -1 if queue full
+ *
+ * No default for `record_count`: a hand-off whose count the host cannot later
+ * read is the case the field exists for, so every caller states it.
  */
 static int enqueue_ready_buffer(
     ChipSwimlaneDataHeader *header, int thread_idx, uint32_t core_index, uint64_t buffer_ptr, uint32_t buffer_seq,
-    ChipSwimlaneBufferKind kind
+    uint32_t record_count, ChipSwimlaneBufferKind kind
 ) {
     auto ctx = ChipSwimlaneTaskDeviceModule::Context{header, thread_idx, core_index, kind, nullptr};
-    return ChipSwimlaneTaskEngine::enqueue_ready(ctx, buffer_ptr, buffer_seq);
+    return ChipSwimlaneTaskEngine::enqueue_ready(ctx, buffer_ptr, buffer_seq, record_count);
 }
 
 static ChipSwimlaneAicpuTaskBuffer *
@@ -366,6 +378,13 @@ void chip_swimlane_aicpu_init(int worker_count) {
     }
 
     s_chip_swimlane_header = get_chip_swimlane_header(chip_swimlane_base);
+
+    // Declare which hand-off schema this producer writes, before any entry is
+    // published under it. The host zeroes this region at allocation, so a
+    // producer whose build predates the identity fields leaves it zero and the
+    // host refuses to read those bytes as a run id.
+    s_chip_swimlane_header->handoff_schema = kChipSwimlaneHandoffSchema;
+    wmb();
 
     // Read the granular perf_level from the shared-memory header (host wrote
     // it in ChipSwimlaneCollector::initialize). The kernel-entry setter only seeded
@@ -568,7 +587,8 @@ static void publish_aicore_pending_buffer(int core_id, int thread_idx) {
     old_buf->count = pe.record_count;
     wmb();
     int rc = enqueue_ready_buffer(
-        s_chip_swimlane_header, thread_idx, core_id, pe.buf_ptr, pe.buf_seq, ChipSwimlaneBufferKind::AicoreTask
+        s_chip_swimlane_header, thread_idx, core_id, pe.buf_ptr, pe.buf_seq, pe.record_count,
+        ChipSwimlaneBufferKind::AicoreTask
     );
     if (rc != 0) {
         LOG_ERROR(
@@ -833,7 +853,8 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
                 // function's next statement runs.
                 const uint32_t saved_count = buf->count;
                 int rc = enqueue_ready_buffer(
-                    s_chip_swimlane_header, thread_idx, core_id, buf_ptr, seq, ChipSwimlaneBufferKind::AicpuTask
+                    s_chip_swimlane_header, thread_idx, core_id, buf_ptr, seq, saved_count,
+                    ChipSwimlaneBufferKind::AicpuTask
                 );
                 if (rc == 0) {
                     LOG_INFO("Thread %d: Core %d flushed buffer with %u records", thread_idx, core_id, saved_count);
@@ -895,7 +916,7 @@ void chip_swimlane_aicpu_flush(int thread_idx, const int *cur_thread_cores, int 
 
         uint32_t ac_seq = ac_state->head.current_buf_seq;
         int rc = enqueue_ready_buffer(
-            s_chip_swimlane_header, thread_idx, core_id, ac_buf_ptr, ac_seq, ChipSwimlaneBufferKind::AicoreTask
+            s_chip_swimlane_header, thread_idx, core_id, ac_buf_ptr, ac_seq, ac_mark, ChipSwimlaneBufferKind::AicoreTask
         );
         if (rc == 0) {
             LOG_INFO(
@@ -1244,7 +1265,7 @@ static void flush_phase_pool(
     // Read before publication: a successful commit hands the buffer to the
     // host, which may recycle it before the next statement here runs.
     const uint32_t saved_count = *count_ptr;
-    int rc = enqueue_ready_buffer(s_chip_swimlane_header, thread_idx, pool_idx, buf_ptr, seq, kind);
+    int rc = enqueue_ready_buffer(s_chip_swimlane_header, thread_idx, pool_idx, buf_ptr, seq, saved_count, kind);
     if (rc == 0) {
         LOG_INFO("Thread %d: flushed %s phase buffer with %u records", thread_idx, kind_label, saved_count);
         chip_swimlane_add_saturating(state->head.published_record_count, saved_count);

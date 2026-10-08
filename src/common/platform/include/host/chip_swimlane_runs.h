@@ -105,6 +105,39 @@ struct CollectionVerdict {
     uint64_t not_received_buffers{0};
     uint64_t unpublished_loss{0};
     uint64_t transport_retired{0};
+    /**
+     * Records inside `transport_retired`'s buffers, as the producers counted
+     * them before publishing.
+     *
+     * Known separately from the buffer count because a buffer whose descriptor
+     * validated carries its own record count, while one whose descriptor did
+     * not carries nothing: attributing buffers is not the same as knowing how
+     * many records they held.
+     */
+    uint64_t transport_retired_records{0};
+    /**
+     * Hand-offs this collector retired whose descriptor did not validate, so
+     * no run can own them.
+     *
+     * Collector-wide rather than per run, and published on every unsealed run's
+     * artifact, because the loss could belong to any of them. A non-zero value
+     * means this run's record set is not provably complete — it is *not* a
+     * count of this run's own losses, and it must never be added to
+     * `transport_retired`.
+     */
+    uint64_t unattributable_handoffs{0};
+    /**
+     * Whether each hand-off's identity could be cross-checked against its
+     * payload.
+     *
+     * False when the producer published no identity -- a build that predates
+     * the ready-entry identity fields, which the host refuses to read. The
+     * records still arrived and are still placed by their own stamp; what is
+     * absent is the independent check that they were placed correctly. A
+     * reader treating `transport_retired == 0` as proof of a complete capture
+     * must consult this first.
+     */
+    bool handoff_identity_verified{true};
     uint64_t cut_failed_queues{0};
     Verdict verdict{Verdict::Published};
 };
