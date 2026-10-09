@@ -204,10 +204,6 @@ struct OrchProfilingData {
     uint64_t insert_ns;
     uint64_t fanin_ns;
     int64_t submit_count;
-    // Wait time tracking for blocking phases
-    uint64_t fanin_wait_ns;  // Legacy (wiring): fanout_lock wait; polling has no such lock
-    // Atomic operation counts per phase
-    uint64_t args_atomic_count;
 };
 
 OrchProfilingData orchestrator_get_profiling();

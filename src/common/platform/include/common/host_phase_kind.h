@@ -17,8 +17,8 @@
  * translation units need only the kinds:
  *
  *   - the host trace and record store, which format and file the records;
- *   - host_build_graph/host/orchestrator.cpp, which raises the kinds but needs
- *     none of the record machinery;
+ *   - the host_build_graph orchestrator's submit translation units, which raise the
+ *     kinds but need none of the record machinery;
  *   - orchestration_api.h, compiled into the orchestration .so, where the
  *     platform's host headers are absent.
  *
@@ -52,7 +52,8 @@ enum class HostPhaseKind : uint32_t {
     BindGraphPack,
     BindArenaH2d,
     BindHostViewClose,
-    // Recorded by the host orchestrator (host_build_graph/host/orchestrator.cpp).
+    // Recorded by the host orchestrator: the ordinary path in
+    // host_build_graph/host/orchestrator.cpp, the Graph path in host/graph_submit.cpp.
     OrchSubmitTask,       // submit_task_common: one ordinary task
     OrchAllocTensors,     // prepare_task: one alloc_tensors slot
     OrchRecordSubTask,    // graph_record_submit_sub_task: one recorded sub-task

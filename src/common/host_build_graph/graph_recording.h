@@ -298,6 +298,28 @@ GraphRecording &recorder_recording();
 
 bool graph_recording_stand_up(GraphRecording &recording);
 
+/**
+ * Stand the calling thread's recording storage up — hazard map, sub-task slots, the
+ * flat per-task arrays and the task tensor pool — without recording anything.
+ *
+ * graph_recording_stand_up() against this thread's own recorder_recording(), with the
+ * failure counted rather than only returned.
+ *
+ * A recorder worker calls this once as it starts, so the allocations land at callable
+ * registration rather than inside the first bind that worker serves, and a failure is
+ * reported where the caller can still act on it. It is an optimization, not the only
+ * stand-up point: a worker the pool creates after prewarm, and a thread whose storage was
+ * dropped for overshooting the sub-task cap, still stand up lazily on their next recording.
+ *
+ * @return false when an allocation failed; the failure is also counted for
+ *         graph_recorder_storage_failures(), which is how the host notices across the
+ *         .so boundary that carries no return value.
+ */
+bool graph_recorder_stand_up_storage();
+
+/** Stand-up failures since the process started. Monotonic. */
+size_t graph_recorder_storage_failures();
+
 bool graph_classify_tensor(const GraphRecording &recording, int32_t task_index, const simpler::hbg::Tensor &tensor);
 
 std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &recording);

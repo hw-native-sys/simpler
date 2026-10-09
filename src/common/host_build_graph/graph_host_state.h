@@ -181,24 +181,10 @@ using GraphHostStatePtr = std::unique_ptr<GraphHostState, GraphHostStateDeleter>
 
 GraphHostStatePtr make_graph_host_state(const GraphDefinitionArena &arena);
 
-/**
- * Stand the calling thread's recording storage up — hazard map, sub-task slots, the
- * flat per-task arrays and the task tensor pool — without recording anything.
- *
- * A recorder worker calls this once as it starts, so the allocations land at callable
- * registration rather than inside the first bind that worker serves, and a failure is
- * reported where the caller can still act on it. It is an optimization, not the only
- * stand-up point: a worker the pool creates after prewarm, and a thread whose storage was
- * dropped for overshooting the sub-task cap, still stand up lazily on their next recording.
- *
- * @return false when an allocation failed; the failure is also counted for
- *         graph_recorder_storage_failures(), which is how the host notices across the
- *         .so boundary that carries no return value.
- */
-bool graph_recorder_stand_up_storage();
+// Where a published record's image is: in the arena at its object offset, or in
+// the buffer it spilled to.
+const GraphDefinition *graph_record_definition(const GraphHostState &state, const GraphDefinitionRecord &record);
 
-/** Stand-up failures since the process started. Monotonic. */
-size_t graph_recorder_storage_failures();
 size_t graph_host_upload_count(const GraphHostState &state);
 // Arena bytes this run has claimed: the prefix its objects occupy, and so the
 // length of the region an upload must ship for the objects built in place.
