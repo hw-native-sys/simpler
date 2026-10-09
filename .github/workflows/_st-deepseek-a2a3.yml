@@ -39,11 +39,13 @@ jobs:
       # would let this partial compilation win the immutable-cache save race
       # and starve the main sweep's cache.
       - name: Restore scene-test kernel cache (a2a3)
-        uses: actions/cache@v5
+        id: deepseek-kernel-cache
+        uses: actions/cache/restore@v5
         with:
           path: build/cache/kernels
-          key: scene-kernels-a2a3-ds-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-${{ inputs.ref || github.sha }}
+          key: scene-kernels-a2a3-ds-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-${{ inputs.ref || github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
+            scene-kernels-a2a3-ds-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-${{ inputs.ref || github.sha }}-
             scene-kernels-a2a3-ds-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-
 
       - name: Set up environment
@@ -71,6 +73,14 @@ jobs:
             .venv/bin/python "examples/a2a3/$runtime/deepseek_v4_flash_decode/main.py" \
               --platform a2a3 --compile-only --compile-workers 8
           done
+
+      # Persist the expensive compile before device work. The run identity
+      # prevents retries from contending for one immutable cache key.
+      - name: Save scene-test kernel cache (a2a3)
+        uses: actions/cache/save@v5
+        with:
+          path: build/cache/kernels
+          key: ${{ steps.deepseek-kernel-cache.outputs.cache-primary-key }}
 
       # The DS cases are the only manual tests under these two directories, so
       # --manual only selects exactly the two smoke tests. They stay manual:

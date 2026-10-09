@@ -375,6 +375,10 @@ unbuildable kernel costing the whole batch its results.
 `actions/checkout` cleans ignored files before each job, so the onboard jobs
 restore and save `build/cache/kernels/` through `actions/cache`. Cache keys are
 partitioned by target architecture, runner OS/architecture, and PTO-ISA pin.
+The dedicated DeepSeek job gives each run attempt an immutable key and saves it
+immediately after the compile step, so a later device-test failure cannot discard
+the completed compile. Restore prefixes still reuse the newest compatible entry
+from an earlier attempt or commit.
 The callable key covers the contents of its orchestration, incore, and
 transitively included sources, the compiler identities and effective fixed
 flags, a digest of the modules that decide artifact bytes
