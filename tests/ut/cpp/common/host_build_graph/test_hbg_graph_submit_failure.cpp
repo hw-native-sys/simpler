@@ -532,7 +532,7 @@ TEST_F(HbgGraphSubmitFailureTest, ASlidingBoundaryOriginKeepsReusingItsDefinitio
     uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
     simpler::hbg::Tensor base = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
     // Same buffer, same shape, same stride, same contiguity -- only the origin differs, so
-    // every field graph_boundary_param_matches compares is equal across the two. Named
+    // every field graph_boundary_tensor_matches compares is equal across the two. Named
     // locals because GraphTaskArgs stores a pointer to what it is given.
     simpler::hbg::Tensor recorded_slice = base.slice(0, 0, 8);
     simpler::hbg::Tensor slid_slice = base.slice(0, 4, 12);

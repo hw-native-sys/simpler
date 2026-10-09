@@ -92,6 +92,7 @@ hbg_case(test_hbg_bind_ledger.cpp
     SOURCES
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/host/runtime_maker.cpp
         ${HBG_HOST_DIR}/orchestrator.cpp
+        ${HBG_HOST_DIR}/graph_recording.cpp
         ${HBG_SHARED_RUNTIME_SOURCES}
         ${HBG_HOST_DIR}/runtime_core.cpp
         ${HBG_HOST_DIR}/dep_gen_host_graph.cpp

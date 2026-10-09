@@ -70,7 +70,8 @@ Graph function and hashed by value into the cache key. They are separate from
 execution scalars in `GraphTaskArgs`: changing a construction parameter selects a
 different Definition rather than patching an existing one.
 
-An explicit identity is available for call sites that need a stable name:
+An explicit identity is available for call sites that want to choose what counts
+as the same Graph, rather than letting the Graph function's address decide:
 
 ```cpp
 rt_submit_graph(
@@ -81,10 +82,22 @@ rt_submit_graph(
 );
 ```
 
-An explicit `GRAPH_KEY` must be unique for every distinct Graph function in an
-orchestration callable. The explicit-key overload deliberately excludes the
-Graph function pointer from the cache identity so the key remains stable; using
-the same key for different functions can select the wrong recorded topology.
+The explicit-key overload drops the Graph function pointer from the cache
+identity, so two distinct Graph functions given one key share a single recorded
+Definition. That is both what the overload is for and its one hazard, and the
+hazard is silent: an explicit `GRAPH_KEY` must be unique for every distinct Graph
+function in an orchestration callable, or one of them replays the other's
+recorded topology.
+
+What the explicit form does not give is a key that outlives the process. A Graph
+is looked up by `graph_full_key(callable_hash, graph_key)`, and `callable_hash`
+is the orchestration entry's own address, so no key is stable across runs — and
+none needs to be, since a Definition cache lives inside one orchestration run and
+is never persisted.
+
+A caller that emits one C++ function per Graph wants
+`rt_submit_graph(function, args)` instead: the function's address is already the
+right identity.
 
 There are no public `GraphArgs`, `GraphBindings`, `Patch`, or `ScalarRef`
 types. The boundary is represented by `GraphTaskArgs`, which a Graph function
