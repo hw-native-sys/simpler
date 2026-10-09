@@ -54,6 +54,11 @@ std::array<bool, 2> g_joinable_boundary_requested{};
 int g_joined_rc{0};
 bool g_joined_throws{false};
 bool g_supports_joined{true};
+// The backend's diagnostic answer, and what it was asked about. Recorded so a
+// case can tell "the lane never asked" apart from "the backend said no".
+bool g_supports_joined_diagnostic{true};
+int g_diagnostic_queries{0};
+std::vector<std::pair<uint32_t, uint32_t>> g_diagnostic_pairs;
 std::vector<std::string> g_events;
 
 uint32_t slot_of(void *runtime) { return g_slots.at(runtime); }
@@ -102,6 +107,11 @@ int finalize_run(void *, void *runtime) {
 
 int supports_successor(void *) { return 1; }
 int supports_joined(void *) { return g_supports_joined ? 1 : 0; }
+int supports_joined_diagnostic(void *, void *successor, void *predecessor) {
+    g_diagnostic_queries++;
+    g_diagnostic_pairs.emplace_back(slot_of(successor), slot_of(predecessor));
+    return g_supports_joined_diagnostic ? 1 : 0;
+}
 
 void prime_worker(ChipWorker &worker, unsigned launch_depth = 2) {
     g_slots.clear();
@@ -111,6 +121,9 @@ void prime_worker(ChipWorker &worker, unsigned launch_depth = 2) {
     g_joined_rc = 0;
     g_joined_throws = false;
     g_supports_joined = true;
+    g_supports_joined_diagnostic = true;
+    g_diagnostic_queries = 0;
+    g_diagnostic_pairs.clear();
     g_finalize_rc = 0;
     g_events.clear();
     worker.launch_depth_ = launch_depth;
@@ -129,6 +142,7 @@ void prime_worker(ChipWorker &worker, unsigned launch_depth = 2) {
     worker.finalize_run_fn_ = finalize_run;
     worker.supports_concurrent_native_prepare_fn_ = supports_successor;
     worker.supports_joined_native_launch_fn_ = supports_joined;
+    worker.supports_joined_diagnostic_launch_fn_ = supports_joined_diagnostic;
 }
 
 /** One host-space tensor, which is what keeps a run inside the joined scope. */
@@ -286,7 +300,7 @@ TEST(ChipRunLaneJoinedLaunchTest, ADeviceSpaceTensorOnEitherRunFallsBackToTheSer
     worker.finalize();
 }
 
-TEST(ChipRunLaneJoinedLaunchTest, DiagnosticsStayExclusiveToOneLaunchedRun) {
+TEST(ChipRunLaneJoinedLaunchTest, DiagnosticsOtherThanSwimlaneStayExclusive) {
     ChipWorker worker;
     prime_worker(worker);
     ChipRunLane lane(worker);
@@ -295,18 +309,197 @@ TEST(ChipRunLaneJoinedLaunchTest, DiagnosticsStayExclusiveToOneLaunchedRun) {
     diagnostic.output_prefix[0] = 'x';
 
     // Preparation is not special-cased — the successor still prepares natively
-    // — but the collector pools are armed for one run at launch, so a second
-    // launched run would publish one run's records as the other's.
+    // — but every collector other than the swimlane is armed for one run at
+    // launch, so a second launched run would publish one run's records as the
+    // other's.
     ChipRun first = submit(lane, 101, 0, true, host_args());
     ChipRun second = submit(lane, 102, 1, false, host_args(), diagnostic);
     EXPECT_EQ(second.preparation_disposition(), ChipRunPreparationDisposition::NATIVE_PREPARED);
     second.activate();
     EXPECT_FALSE(second.launched());
     EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "prepare1"}));
+    EXPECT_EQ(g_diagnostic_queries, 0) << "a channel the lane can rule out never reaches the backend";
 
     g_complete[0] = true;
     EXPECT_TRUE(first.done());
     EXPECT_TRUE(second.launched());
+    lane.close();
+    worker.finalize();
+}
+
+/** Swimlane-only at one level, which is the one diagnostic shape that joins. */
+CallConfig swimlane_config(int32_t level) {
+    CallConfig config;
+    config.enable_chip_swimlane = level;
+    config.output_prefix[0] = 'x';
+    return config;
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, TwoSwimlaneRunsAtOneLevelJoinWhenTheBackendAgrees) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    const CallConfig level_two = swimlane_config(2);
+
+    ChipRun first = submit(lane, 201, 0, true, host_args(), level_two);
+    ChipRun second = submit(lane, 202, 1, false, host_args(), level_two);
+    second.activate();
+
+    EXPECT_TRUE(second.launched()) << "the successor's submission reaches the device while the front executes";
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "prepare1", "joined1behind0"}));
+    ASSERT_EQ(g_diagnostic_pairs.size(), 1u);
+    EXPECT_EQ(g_diagnostic_pairs[0].first, 1u) << "the successor is the run being asked about";
+    EXPECT_EQ(g_diagnostic_pairs[0].second, 0u) << "and the predecessor is the one it would follow";
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    g_complete[1] = true;
+    EXPECT_TRUE(second.done());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, ALevelTransitionDeclinesWithoutAskingTheBackend) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+
+    // One shared level word reaches the device, and the producer latches it
+    // when it initializes. A queued predecessor may not have latched yet, so a
+    // 1-and-2 pair must never both arm.
+    ChipRun first = submit(lane, 203, 0, true, host_args(), swimlane_config(1));
+    ChipRun second = submit(lane, 204, 1, false, host_args(), swimlane_config(2));
+    second.activate();
+
+    EXPECT_FALSE(second.launched());
+    EXPECT_EQ(g_diagnostic_queries, 0) << "the lane settles a level transition itself";
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(second.launched()) << "it launches ordinarily once it reaches the front";
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, ASwimlaneRunBesideAnotherChannelDeclines) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    CallConfig mixed = swimlane_config(1);
+    mixed.enable_dep_gen = 1;
+
+    ChipRun first = submit(lane, 205, 0, true, host_args(), swimlane_config(1));
+    ChipRun second = submit(lane, 206, 1, false, host_args(), mixed);
+    second.activate();
+
+    EXPECT_FALSE(second.launched());
+    EXPECT_EQ(g_diagnostic_queries, 0);
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(second.launched());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, ABackendDeclineIsRetriedRatherThanRemembered) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    const CallConfig level_one = swimlane_config(1);
+    // What a full bucket table looks like from the lane: a decline that is
+    // about right now, not about this pair.
+    g_supports_joined_diagnostic = false;
+
+    ChipRun first = submit(lane, 207, 0, true, host_args(), level_one);
+    ChipRun second = submit(lane, 208, 1, false, host_args(), level_one);
+    second.activate();
+    EXPECT_FALSE(second.launched());
+    const int asked_once = g_diagnostic_queries;
+    EXPECT_GT(asked_once, 0) << "the lane did ask";
+
+    // Capacity comes back. The next progress round must ask again rather than
+    // treat the earlier decline as settled -- that sticky flag belongs to a
+    // backend refusal of an actual attempt, whose reasons cannot change while
+    // the run ahead executes.
+    g_supports_joined_diagnostic = true;
+    second.activate();
+    EXPECT_TRUE(second.launched());
+    EXPECT_GT(g_diagnostic_queries, asked_once);
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    g_complete[1] = true;
+    EXPECT_TRUE(second.done());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, ARuntimeWithoutTheDiagnosticSymbolKeepsTheOldRefusal) {
+    ChipWorker worker;
+    prime_worker(worker);
+    // An older `libhost_runtime.so` exports no such symbol.
+    worker.supports_joined_diagnostic_launch_fn_ = nullptr;
+    ChipRunLane lane(worker);
+    const CallConfig level_one = swimlane_config(1);
+
+    ChipRun first = submit(lane, 209, 0, true, host_args(), level_one);
+    ChipRun second = submit(lane, 210, 1, false, host_args(), level_one);
+    second.activate();
+
+    EXPECT_FALSE(second.launched());
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(second.launched());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, DepthThreeKeepsOrdinaryJoinsAndRefusesTheDiagnosticOne) {
+    ChipWorker worker;
+    prime_worker(worker, /*launch_depth=*/3);
+    worker.pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 3, {}};
+    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
+    g_slots.emplace(worker.runtime_bufs_[2].data(), 2u);
+    ChipRunLane lane(worker);
+    const CallConfig level_one = swimlane_config(1);
+
+    // The approved opening is one successor behind one predecessor. At depth
+    // three the real gate must refuse, and it must refuse inside the worker
+    // rather than by the backend answering no -- a backend that said yes would
+    // still be outside the contract.
+    ChipRun first = submit(lane, 301, 0, true, host_args(), level_one);
+    ChipRun second = submit(lane, 302, 1, false, host_args(), level_one);
+    second.activate();
+    EXPECT_FALSE(second.launched());
+    EXPECT_EQ(g_diagnostic_queries, 0) << "the depth refusal precedes the backend question";
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    EXPECT_TRUE(second.launched()) << "it launches ordinarily once it reaches the front";
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, DepthThreeStillJoinsNonDiagnosticRuns) {
+    ChipWorker worker;
+    prime_worker(worker, /*launch_depth=*/3);
+    worker.pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 3, {}};
+    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
+    g_slots.emplace(worker.runtime_bufs_[2].data(), 2u);
+    ChipRunLane lane(worker);
+
+    // The diagnostic restriction must not narrow the ordinary path it sits
+    // beside.
+    ChipRun first = submit(lane, 303, 0, true, host_args());
+    ChipRun second = submit(lane, 304, 1, false, host_args());
+    second.activate();
+    EXPECT_TRUE(second.launched());
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    g_complete[1] = true;
+    EXPECT_TRUE(second.done());
     lane.close();
     worker.finalize();
 }

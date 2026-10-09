@@ -190,7 +190,7 @@ struct RetainedRunsFixture {
     /** Open a run: arm its bank, admit the epoch, bring the device side up. */
     void begin(uint64_t epoch) {
         ASSERT_NE(shm(), nullptr);
-        EXPECT_TRUE(collector.run_begin(epoch, dir.str(), level));
+        EXPECT_TRUE(collector.run_begin(epoch, dir.str(), level, nullptr, 0, false));
         set_platform_run_result(/*region_base=*/0, epoch);
         set_chip_swimlane_enabled(true);
         set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm()));
@@ -431,7 +431,7 @@ TEST(ChipSwimlaneRetainedRunsTest, ARefusedAdmissionKeepsThePredecessorsRecords)
     // the successor and records its own fatal — a refusal reached through
     // production code rather than an injected failure.
     fx.collector.stop();
-    EXPECT_FALSE(fx.collector.run_begin(kSecond, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+    EXPECT_FALSE(fx.collector.run_begin(kSecond, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     EXPECT_TRUE(fx.collector.retained_run_stats_for_test().fatal);
 
     EXPECT_EQ(fx.collector.collected_aicore_records_for_test()[0].size(), 3u)
@@ -474,7 +474,7 @@ TEST(ChipSwimlaneRetainedRunsTest, UnlaunchedRunsGiveTheirSlotsBackAndKeepAPrede
 
     // Admitted, then withdrawn without a launch — the shape a transaction that
     // ends at `NotStarted` leaves behind.
-    ASSERT_TRUE(fx.collector.run_begin(kFirstRolled, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(kFirstRolled, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     ASSERT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 2u);
     ASSERT_TRUE(fx.collector.abandon_run(kFirstRolled)) << "the withdrawal could not prove the references released";
     ASSERT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 1u)
@@ -482,7 +482,7 @@ TEST(ChipSwimlaneRetainedRunsTest, UnlaunchedRunsGiveTheirSlotsBackAndKeepAPrede
 
     // The same free slot again: only a rollback that really released it can
     // admit this one without waiting for capacity.
-    ASSERT_TRUE(fx.collector.run_begin(kSecondRolled, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(kSecondRolled, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     ASSERT_TRUE(fx.collector.abandon_run(kSecondRolled));
     EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 1u);
 
@@ -805,8 +805,8 @@ TEST(ChipSwimlaneRetainedRunsTest, TwoCollectorsOverOneRootReserveDistinctDirect
     // run table, and `initialize()` creates no shard to acknowledge it.
     first.start(retained_thread_factory);
     second.start(retained_thread_factory);
-    EXPECT_TRUE(first.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING));
-    EXPECT_TRUE(second.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING));
+    EXPECT_TRUE(first.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    EXPECT_TRUE(second.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
 
     int dirs = 0;
     for (const auto &entry : fs::directory_iterator(root.path())) {
@@ -824,7 +824,7 @@ TEST(ChipSwimlaneRetainedRunsTest, AnUnworkableBudgetIsRefusedAtOpen) {
     ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
     // Below the minimum working set by construction.
     collector.configure_retained_runs(/*retain_across_runs=*/true, /*budget_bytes=*/1024);
-    EXPECT_FALSE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING));
+    EXPECT_FALSE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     // A refusal costs the collector nothing: the single-run path it would have
     // taken with retention off still works on it.
     collector.begin_run(root.str(), ChipSwimlaneLevel::TASK_TIMING);
@@ -862,13 +862,13 @@ TEST(ChipSwimlaneRetainedRunsTest, AFailedPreparationLeavesNothingReadyAndRetrie
 
     // The budget is taken before the directory, so a budget this small refuses
     // before anything is reserved.
-    EXPECT_FALSE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING));
+    EXPECT_FALSE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     EXPECT_EQ(artifact_dirs(), 0) << "a failed preparation left a directory that reads as this collector's";
 
     // The same collector, a budget that works: the retry prepares and reserves
     // exactly one directory.
     collector.configure_retained_runs(/*retain_across_runs=*/true, simpler::dfx::runs::kDefaultBudgetBytes);
-    ASSERT_TRUE(collector.run_begin(2, root.str(), ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(collector.run_begin(2, root.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     EXPECT_EQ(artifact_dirs(), 1) << "the retry did not reserve its own directory";
 
     collector.run_close(2, /*bank_index=*/0, /*device_execution_complete=*/true);
@@ -955,7 +955,7 @@ TEST(ChipSwimlaneRetainedRunsTest, UnprovedReleaseKeepsOccupancyAndRefusesRetent
     // run waits for every collector shard to acknowledge the run table.
     collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
     collector.start(retained_thread_factory);
-    ASSERT_TRUE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     collector.finish_retained_runs();
     EXPECT_EQ(collector.manager().paired_initial(kKind), seeded) << "preparing retention moved the seed";
 
@@ -974,7 +974,7 @@ TEST(ChipSwimlaneRetainedRunsTest, UnprovedReleaseKeepsOccupancyAndRefusesRetent
     // it needs no reader shard, and starting one would prove nothing about it.
     ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
     collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
-    EXPECT_FALSE(collector.run_begin(2, root.str(), ChipSwimlaneLevel::TASK_TIMING))
+    EXPECT_FALSE(collector.run_begin(2, root.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false))
         << "a run was retained while an unproved release was outstanding";
     // The single-run path stays usable, as it does for every other refusal.
     collector.begin_run(root.str(), ChipSwimlaneLevel::TASK_TIMING);
@@ -1005,7 +1005,7 @@ TEST(ChipSwimlaneRetainedRunsTest, UnregisteredInitCleanupFailureAlsoRefusesRete
     // unproved occupancy belongs to the pool, not to the failed attempt.
     ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, retained_alloc, nullptr, retained_free), 0);
     collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
-    EXPECT_FALSE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING))
+    EXPECT_FALSE(collector.run_begin(1, root.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false))
         << "a run was retained after an unregistered buffer's cleanup failed";
     collector.begin_run(root.str(), ChipSwimlaneLevel::TASK_TIMING);
     collector.finalize(nullptr, retained_free);
@@ -1140,7 +1140,7 @@ TEST(ChipSwimlaneRetainedRunsTest, FatalWithNoEpochVerdictStillFailsFlush) {
 
     // No collector shard is polling, so the epoch table can never be
     // acknowledged and admission ends in the collector's fatal.
-    EXPECT_FALSE(rs.collector.run_begin(9001, rs.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+    EXPECT_FALSE(rs.collector.run_begin(9001, rs.dir.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     ASSERT_TRUE(rs.collector.retained_run_stats_for_test().fatal);
     EXPECT_EQ(rs.collector.retained_run_stats_for_test().published, 0u);
 
@@ -1171,7 +1171,7 @@ TEST(ChipSwimlaneRetainedRunsTest, CloseDefersQuarantinedStorageUntilReadersAreJ
     // Admission publishes the fatal, because the epoch table can never be
     // acknowledged. The slot is claimed either way, which is what gives the
     // writer something to seal below.
-    EXPECT_FALSE(rs.collector.run_begin(kEpoch, rs.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+    EXPECT_FALSE(rs.collector.run_begin(kEpoch, rs.dir.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     ASSERT_TRUE(rs.collector.retained_run_stats_for_test().fatal);
     ASSERT_EQ(rs.collector.retained_run_stats_for_test().open_slots, 1u);
 
@@ -1222,7 +1222,7 @@ TEST(ChipSwimlaneRetainedRunsTest, ControlHandshakeWakesAnIdleCollectorWithoutIt
     for (int i = 0; i < kCycles; i++) {
         const uint64_t epoch = kBase + static_cast<uint64_t>(i);
         const auto started = std::chrono::steady_clock::now();
-        ASSERT_TRUE(fx.collector.run_begin(epoch, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING));
+        ASSERT_TRUE(fx.collector.run_begin(epoch, fx.dir.str(), ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
         admitting += std::chrono::steady_clock::now() - started;
 
         set_platform_run_result(/*region_base=*/0, epoch);

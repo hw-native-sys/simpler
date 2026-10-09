@@ -718,22 +718,25 @@ protected:
     void *shm_ = nullptr;
 };
 
-// The tail count survives a window spanning two runs — which is the whole point
-// of tracking it instead of deriving it.
+// The tail count is this run's own — which is the whole point of tracking it
+// instead of deriving it.
 //
-// The old form was `total_record_count - current_buf_seq * BUFFER_SIZE`. Both
-// operands were reset together every run: the host cleared `total` in
-// `publish_run_config`, and `init` reset `seq` to 0. Take the per-run clear away —
-// which is exactly what continuous collection does — and the two no longer agree:
-// `total` carries the earlier run's dispatches while `seq` restarts at 0, so the
-// derivation reports the whole window as live in the current buffer.
+// The old form was `total_record_count - current_buf_seq * BUFFER_SIZE`. It
+// needed both operands to be reset together every run, and they were reset by
+// two different writers: the host cleared `total` in `publish_run_config`, and
+// the producer's `init` reset `seq` to 0. Two writers for one invariant is what
+// made the derivation fragile — skip the host half and `total` carries the
+// earlier run's dispatches while `seq` restarts at 0, so the derivation reports
+// the whole window as live in the current buffer.
 //
-// Here run 1 dispatches 3 and publishes them; run 2 starts without the host's
-// clear and dispatches 2. The derivation would have marked run 2's tail 5 — more
-// records than were ever written into that buffer — and charged the difference to
-// whichever side of the accounting read it next. The tracked counter says 2.
+// Both operands now move together, in the producer's own `init`, before that
+// run's threads are released. So the hazard is closed at its source as well as
+// by the tracked counter, and this case checks both halves: run 1 dispatches 3
+// and publishes them, run 2 then initializes and dispatches 2. The derivation
+// would have marked run 2's tail 5 — more records than were ever written into
+// that buffer. The tracked counter says 2, and `total` says 2 as well, because
+// the init that restarted `seq` cleared it in the same pass.
 TEST_F(ChipSwimlaneAccountingTest, TheTailCountSurvivesAWindowSpanningTwoRuns) {
-    // Run 1, with the host's per-run clear, as today.
     collector_.begin_run("run-one", ChipSwimlaneLevel::TASK_TIMING);
     device_run(/*epoch=*/1, /*dispatches=*/3);
     ASSERT_EQ(published_marks().size(), 1u);
@@ -745,17 +748,19 @@ TEST_F(ChipSwimlaneAccountingTest, TheTailCountSurvivesAWindowSpanningTwoRuns) {
     EXPECT_EQ(ac_state->head.live_record_count, 0u);
     EXPECT_EQ(ac_state->head.dropped_record_count, 0u);
 
-    // Run 2 without begin_run(): `total_record_count` keeps the first run's 3
-    // while `init` resets `current_buf_seq` to 0. This is the state the old
-    // derivation could not survive.
+    // Run 2 without `begin_run()`: the host arms nothing, so if the counters
+    // were still the host's to clear they would carry run 1's 3 across while
+    // `init` restarted `seq` at 0. That is the state the old derivation could
+    // not survive, and the state this run must not be in.
     device_run(/*epoch=*/2, /*dispatches=*/2);
     ASSERT_EQ(published_marks().size(), 2u);
     EXPECT_EQ(
         published_marks()[1], 2u
     ) << "the tail was marked from a cross-run derivation rather than this run's own count";
 
-    EXPECT_EQ(ac_state->head.total_record_count, 5u) << "the window's attempt tally should span both runs";
-    EXPECT_EQ(ac_state->head.published_record_count, 5u);
+    EXPECT_EQ(ac_state->head.total_record_count, 2u)
+        << "the producer's init must clear the attempt tally with the sequence it restarts";
+    EXPECT_EQ(ac_state->head.published_record_count, 2u);
     EXPECT_EQ(ac_state->head.live_record_count, 0u);
     EXPECT_EQ(ac_state->head.dropped_record_count, 0u);
     EXPECT_TRUE(accounting_balances(ac_state)) << "published + live + dropped != total";

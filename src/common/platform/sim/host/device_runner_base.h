@@ -479,6 +479,14 @@ public:
     bool host_clock_alignment_log_required(uint32_t pipeline_slot) const {
         return pipeline_slot < host_phase_runs_.size() && host_phase_runs_[pipeline_slot].needs_clock_alignment();
     }
+    /**
+     * This slot's own host-orchestration state, for a run that must not read
+     * the collector's single resident copy.
+     */
+    bool host_orchestrated_for_slot(uint32_t pipeline_slot) const noexcept {
+        if (pipeline_slot >= host_phase_runs_.size()) return false;
+        return host_phase_runs_[pipeline_slot].host_orchestrated;
+    }
     /** Hand this pass's records to the swimlane reader, just before its export. */
     void publish_host_phase_records_to_swimlane(uint32_t pipeline_slot);
     /**
@@ -500,7 +508,9 @@ public:
      * Returns non-zero when a collector that retains runs would not admit this
      * one; see the onboard base for why that fails the run.
      */
-    int start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch);
+    int start_shared_collectors_for_run(
+        const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata
+    );
 
     /**
      * Give back what the call above admitted for a run that submitted nothing.

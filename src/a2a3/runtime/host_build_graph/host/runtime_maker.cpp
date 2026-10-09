@@ -159,6 +159,20 @@ extern "C" int joined_native_launch_supported_impl(void) {
     return 1;
 }
 
+extern "C" int joined_diagnostic_launch_supported_impl(void) {
+    // The swimlane collector can hold two runs open on this runtime: buffers
+    // carry the run that produced them, each run's loss is charged to its own
+    // bucket, and the per-queue cut proves one run's hand-offs are all drained
+    // without waiting for the queue to be empty. The producer also clears its
+    // own record counters at init, so no host write lands on a predecessor
+    // that is still recording.
+    //
+    // Declared separately from the ordering capability above because three
+    // runtimes answer that one: making it imply this would make ordinary
+    // non-diagnostic early enqueue elsewhere wait on swimlane bucket capacity.
+    return 1;
+}
+
 // RuntimeEnv (call_config.h) is the cross-runtime ABI for per-ring config and
 // carries RUNTIME_ENV_RING_COUNT slots, shared with tensormap_and_ringbuffer.
 // host_build_graph keeps one task table and reads slot 0, so it only needs the ABI

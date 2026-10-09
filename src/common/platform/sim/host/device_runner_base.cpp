@@ -982,7 +982,9 @@ void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeli
     );
 }
 
-int SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) {
+int SimDeviceRunnerBase::start_shared_collectors_for_run(
+    const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata
+) {
     // Opening a resident collector's window drops the previous run's records and
     // republishes the device level, so it belongs with the start, at launch.
     auto thread_factory = [this](std::function<void()> fn) {
@@ -996,7 +998,10 @@ int SimDeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx
         // their acknowledgement of the run table.
         if (chip_swimlane_collector_.retains_runs()) {
             chip_swimlane_collector_.start(thread_factory);
-            if (!chip_swimlane_collector_.run_begin(run_epoch, dfx.output_prefix, dfx.chip_swimlane_level)) {
+            if (!chip_swimlane_collector_.run_begin(
+                    run_epoch, dfx.output_prefix, dfx.chip_swimlane_level, run_metadata.core_types,
+                    run_metadata.core_type_count, run_metadata.host_orchestrated
+                )) {
                 LOG_ERROR(
                     "ChipSwimlane: run %llu was not admitted for retained collection",
                     static_cast<unsigned long long>(run_epoch)
@@ -1153,7 +1158,13 @@ int SimDeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
     std::string dep_gen_error;
     std::string host_graph_error;
     bool ok = true;
-    if (chip_swimlane_collector_.retains_runs() &&
+    // Gated on whether this collector has ever retained, not on whether it
+    // retains now — the same boundary the onboard runner uses, and the same
+    // reason PMU's arm below is ungated. A failure recorded under retention has
+    // to survive the rebuild or reconfiguration that turned retention off, and
+    // a collector that never retained has nothing here its own runs did not
+    // already report.
+    if (chip_swimlane_collector_.ever_retained() &&
         !chip_swimlane_collector_.flush_retained_runs(remaining_ms(), &swimlane_error)) {
         ok = false;
     }

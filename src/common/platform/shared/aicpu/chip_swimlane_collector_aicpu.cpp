@@ -379,6 +379,46 @@ void chip_swimlane_aicpu_init(int worker_count) {
 
     s_chip_swimlane_header = get_chip_swimlane_header(chip_swimlane_base);
 
+    // Every pool head's record accounting starts this run at zero, before any
+    // buffer is acquired and before the handshake that lets producers run.
+    //
+    // The host cannot do this once a successor may arm while its predecessor is
+    // still producing: that write would land mid-flight and zero counters the
+    // predecessor is still advancing. Here it is ordered by the device itself --
+    // this runs on the leader, before `hs_setup_done_`, so it happens-before
+    // every producer thread of this run, and after the previous run's producers
+    // are gone with their op.
+    //
+    // All five fields together: `published + live + dropped == total` is a
+    // per-run identity, so clearing part of it would leave this run comparing a
+    // fresh total against carried-over published records. The whole platform
+    // grid, not this run's shape: a run that uses fewer cores or a lower level
+    // than the one before it must not inherit the heads that run dirtied, and
+    // the phase pools have no device initializer at all below `SCHED_PHASES`.
+    // Independent of acquisition success for the same reason -- a head whose
+    // free queue is empty still carries the previous run's counts.
+    //
+    // `current_buf_ptr`, `current_buf_seq` and the free queues are deliberately
+    // untouched: they carry retained-buffer ownership, and AICPU is the free
+    // queue's consumer and never its producer, so clearing them would strand a
+    // buffer the previous run could not hand over.
+    auto reset_head_counters = [](ChipSwimlaneActiveHead &head) {
+        head.total_record_count = 0;
+        head.dropped_record_count = 0;
+        head.live_record_count = 0;
+        head.published_record_count = 0;
+        head.published_buffer_count = 0;
+    };
+    for (int i = 0; i < PLATFORM_MAX_CORES; i++) {
+        reset_head_counters(get_perf_buffer_state(chip_swimlane_base, i)->head);
+        reset_head_counters(get_aicore_buffer_state(chip_swimlane_base, i)->head);
+    }
+    for (int t = 0; t < PLATFORM_MAX_AICPU_THREADS; t++) {
+        reset_head_counters(get_sched_phase_buffer_state(chip_swimlane_base, t)->head);
+        reset_head_counters(get_orch_phase_buffer_state(chip_swimlane_base, t)->head);
+    }
+    wmb();
+
     // Declare which hand-off schema this producer writes, before any entry is
     // published under it. The host zeroes this region at allocation, so a
     // producer whose build predates the identity fields leaves it zero and the

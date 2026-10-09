@@ -93,6 +93,7 @@ requested depth, so there it needs ``--case early_enqueue`` to select this class
 
 import contextlib
 import ctypes
+import json
 import shutil
 import tempfile
 import threading
@@ -710,10 +711,143 @@ def _wait_for_one_launched_frame(worker, timeout):
     raise AssertionError("no run reached its device launch fence")
 
 
+# Record rows are positional, and both streams end with the epoch their producer stamped:
+#   aicore_tasks    [core, task_token, reg_task_id, start, end, receive_to_start, run_epoch]
+#   scheduler_tasks [core, reg_task_id, dispatch_time, finish_time, run_epoch]
+# `reg_task_id` is a per-core dispatch sequence, not a run-unique name: two runs, and two
+# cores within one run, may legitimately carry the same value. Ownership is read from the
+# trailing `run_epoch` only.
+_STREAM_WIDTHS = {"aicore_tasks": 7, "scheduler_tasks": 5}
+
+
+def _record_rows(artifact, stream, where):
+    """One artifact's rows for a stream, each checked against the stream's width.
+
+    ``aicore_tasks`` is a bare array and is emitted at every level; ``scheduler_tasks`` is an
+    object with a ``records`` key and appears only from ``SCHEDULE_TIMING`` up. A malformed row
+    fails here rather than being dropped: skipping it would turn a corrupt publication into a
+    silent pass, which is the opposite of what this reads for.
+    """
+    width = _STREAM_WIDTHS[stream]
+    section = artifact.get(stream)
+    rows = section.get("records") if isinstance(section, dict) else section
+    assert isinstance(rows, list), f"{where} published no usable {stream} array: {type(section).__name__}"
+    for row in rows:
+        assert isinstance(row, list) and len(row) == width, (
+            f"{where} published a {stream} row of width {len(row) if isinstance(row, list) else '?'}, "
+            f"expected {width}: {row}"
+        )
+    return rows
+
+
+def _assert_per_run_artifacts(artifacts, found_paths, *, expected_level):
+    """Each collecting run published its own complete artifact, and only its own.
+
+    Separate from the overlap assertions because it checks a different thing: not that the runs
+    overlapped, but that overlapping did not let one run's collection reach the other's file.
+    Ownership is read from the per-record ``run_epoch``, the one field whose value names a run:
+    the file's own rows say which run they belong to rather than the filename saying it for them.
+    """
+    assert len(artifacts) >= 2, (
+        f"expected one swimlane artifact per collecting run, found {len(artifacts)}; the prefix held {found_paths}"
+    )
+
+    epochs = [a["metadata"]["collection"]["run_epoch"] for a in artifacts]
+    assert len(set(epochs)) == len(epochs), f"two artifacts claimed the same run epoch: {epochs}"
+    assert all(e != 0 for e in epochs), f"an artifact published the no-identity epoch: {epochs}"
+
+    for artifact in artifacts:
+        collection = artifact["metadata"]["collection"]
+        epoch = collection["run_epoch"]
+        where = f"run {epoch}"
+
+        # The level the run asked for is the level its file says it collected at. A run that
+        # silently took its neighbour's level is the shared-level-word hazard the admission
+        # predicate exists to prevent, and it would otherwise be invisible.
+        assert artifact["chip_swimlane_level"] == expected_level, (
+            f"{where} collected at level {artifact['chip_swimlane_level']}, not the {expected_level} it asked for"
+        )
+
+        # Completeness, loss and cross-check, each as its own statement. `verdict` alone is not
+        # enough: a published partial carries a verdict that says so, and these name which part.
+        assert collection["verdict"] == "published", f"{where} did not publish cleanly: {collection}"
+        assert collection["metadata_complete"] is True, f"{where} published short metadata: {collection}"
+        assert collection["processing_complete"] is True, f"{where} did not finish processing: {collection}"
+        assert collection["handoff_identity_verified"] is True, (
+            f"{where} could not cross-check its hand-off identity: {collection}"
+        )
+        for field in (
+            "transport_retired",
+            "transport_retired_records",
+            "unattributable_handoffs",
+            "not_received_buffers",
+            "unpublished_loss",
+            "cut_failed_queues",
+        ):
+            assert collection[field] == 0, f"{where} reported {field}={collection[field]}: {collection}"
+
+        # Core types are per run and were captured at this run's own admission. The launch rule
+        # that produced them is `set_core_type_rule(num_aicore, block_dim)`: a contiguous AIC
+        # prefix of one core per block, then AIV for the rest. Length alone proves nothing --
+        # the writer pads a short or missing table out to `num_cores` with AIV -- so the AIC
+        # prefix is what distinguishes a real admission-time copy from that padding, and it is
+        # asserted by content and position rather than by count.
+        core_types = artifact["metadata"]["core_types"]
+        num_cores = artifact["metadata"]["num_cores"]
+        assert len(core_types) == num_cores, f"{where} published {len(core_types)} core types for {num_cores} cores"
+        aic_count = sum(1 for ct in core_types if ct == "aic")
+        assert core_types == ["aic"] * aic_count + ["aiv"] * (num_cores - aic_count), (
+            f"{where} published core types that are not an AIC prefix followed by AIV: {core_types}"
+        )
+        assert 0 < aic_count < num_cores, (
+            f"{where} published {aic_count} AIC cores of {num_cores}; an all-AIV table is what the "
+            f"writer emits when the run's own copy never reached the bucket: {core_types}"
+        )
+
+        # Record ownership, on the records themselves. Two runs collecting at once share every
+        # pool and every ready queue, so a buffer routed by the wrong epoch is the failure this
+        # checks. `aicore_tasks` is present at every level; `scheduler_tasks` only from level 2,
+        # so the streams checked follow the level rather than being assumed, and each one has to
+        # carry rows on its own -- a stream that published nothing is unchecked, not clean.
+        streams = ["aicore_tasks"] + (["scheduler_tasks"] if expected_level >= 2 else [])
+        for stream in streams:
+            rows = _record_rows(artifact, stream, where)
+            assert rows, f"{where} published no {stream} records, so that stream's ownership is unchecked"
+            for row in rows:
+                assert row[-1] == epoch, f"{where} published a {stream} record stamped for run {row[-1]}: {row}"
+
+
+def _swimlane_artifacts(output_prefix):
+    """Every published swimlane run file under one output prefix, parsed.
+
+    Retention writes one file per run, under a directory the collector reserves for itself, so
+    the shape is discovered rather than assumed: a reader that hard-coded the layout would pass
+    on a collector that wrote nothing.
+    """
+    found = []
+    for path in sorted(Path(output_prefix).rglob("*.json")):
+        try:
+            with path.open() as handle:
+                parsed = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        # The writer emits the `collection` block only for a retained run, so
+        # the key's presence is the signal; there is no `present` field in the
+        # file, that guard lives on the C++ side.
+        if isinstance(parsed.get("metadata", {}).get("collection"), dict):
+            found.append(parsed)
+    return found
+
+
 class _EarlyEnqueueBase(SceneTestCase):
     """The two-run sequence, shared by the opt-in class and its depth-one control."""
 
     CALLABLE = _CALLABLES
+    # Swimlane level every run of the class submits at. Zero leaves the
+    # sequence non-diagnostic, which is what the original classes need; a
+    # subclass that sets it puts both runs at one level, which is the only
+    # shape the joined diagnostic path admits.
+    _SWIMLANE_LEVEL = 0
 
     def test_run(self):
         """Not the standard single-case golden path.
@@ -744,7 +878,11 @@ class _EarlyEnqueueBase(SceneTestCase):
         # instead of leaving it on the inherited stderr, which is what gives the joined-launch
         # spans a destination this process can read by child pid. No diagnostic flag is set, so
         # nothing else is written there.
-        config = self._build_config(self.CASES[0]["config"], output_prefix=output_prefix)
+        config = self._build_config(
+            self.CASES[0]["config"],
+            enable_chip_swimlane=type(self)._SWIMLANE_LEVEL,
+            output_prefix=output_prefix,
+        )
 
         def graph(orch, _args, _cfg):
             chip_args = _chip_args(arg_buffers, vector_signature, spin_iters)
@@ -1016,6 +1154,133 @@ class TestEarlyEnqueueDepthTwo(_EarlyEnqueueBase):
         assert not wall_overlapping, (
             f"a joined pair's AICPU device walls overlap: {sorted(wall_overlapping)}; walls={trace.wall_of_invocation}"
         )
+
+
+@scene_test(level=3, runtime="host_build_graph", collect_across_runs=True)
+class TestEarlyEnqueueDepthTwoSwimlane(_EarlyEnqueueBase):
+    """The same overlap, with swimlane collection on at one level on both runs.
+
+    This is the case the diagnostic opening exists for. Before it, a run with any diagnostic flag
+    set waited for its predecessor to be terminal no matter what, so the admission observed here
+    was unreachable with collection enabled.
+
+    What it adds to the non-diagnostic class is not a second ordering proof — that mechanism is
+    the same one, and it is checked the same way — but that the overlap still holds while two
+    runs are collecting, and that each of them then publishes its own artifact. Both runs carry
+    the same level because the device latches one shared level word when its producer
+    initialises; a transition is declined rather than reconciled, so a mixed pair never reaches
+    this path at all.
+
+    Retention is on, so each run's records outlive its own boundary and are written by the
+    collector's background writer. That is why the artifacts are read after the flush rather than
+    at either run's completion.
+    """
+
+    _SWIMLANE_LEVEL = 2
+
+    CASES = [
+        {
+            "name": "early_enqueue_swimlane",
+            "platforms": ["a2a3"],
+            "config": {"device_count": 1, "num_sub_workers": 0, "launch_depth": 2},
+            "params": {},
+        },
+    ]
+
+    def _run_and_validate_l3(self, worker, compiled_callables, sub_handles, case, **kwargs):
+        del kwargs
+        type(self)._st_chip_handles = compiled_callables
+        type(self)._st_sub_handles = sub_handles
+        assert str(worker._config["platform"]) in case["platforms"]  # noqa: SLF001 -- scene-test validation
+        assert worker._launch_depth == 2, (  # noqa: SLF001 -- scene-test validation
+            "this class needs a Worker at launch_depth=2; run it under pytest, or standalone "
+            "with --case early_enqueue_swimlane so no depth-one class shares the Worker"
+        )
+        self.test_two_collecting_runs_overlap_and_each_publishes_its_own("a2a3", worker)
+
+    def test_two_collecting_runs_overlap_and_each_publishes_its_own(self, st_platform, st_worker):
+        """Admission, device order and per-run artifacts, with collection enabled throughout."""
+        if st_platform != "a2a3":
+            pytest.skip("early enqueue is gated to a2a3 onboard host_build_graph")
+        trace = _RunTrace(st_worker)
+        case_runs = _CaseRuns(_frames(st_worker))
+        with tempfile.TemporaryDirectory(prefix="simpler-early-enqueue-swimlane-") as output_prefix:
+            assert self._run_two_and_observe(st_worker, output_prefix, case_runs), (
+                "two different runs collecting at level 2 were never observed launched at once"
+            )
+
+            records: list[dict] = []
+            _await_records(
+                trace,
+                records,
+                _EVIDENCE_BUDGET_S,
+                lambda seen: bool(_non_overlapping_whole_operator_pairs(trace, seen, case_runs)),
+            )
+
+            # Retention hands each run's records to a background writer, so the files exist only
+            # once a flush has published everything closed up to here. A failing flush is also
+            # how a loss this collector could not charge would surface, which is why it is
+            # asserted rather than ignored.
+            st_worker.flush_diagnostics()
+            artifacts = _swimlane_artifacts(output_prefix)
+            # Listed inside the prefix's lifetime so a miss reports what was
+            # actually written rather than an empty directory that no longer
+            # exists by the time the assertion runs.
+            found_paths = sorted(
+                str(p.relative_to(output_prefix)) for p in Path(output_prefix).rglob("*") if p.is_file()
+            )
+
+        assert records, (
+            f"no joined-launch record reached this process from children {trace.pids}, so nothing carried the ordering"
+        )
+        established = _established_pairs(records, case_runs)
+        assert established, (
+            "no pair was established with collection enabled: the successor's submission never "
+            f"completed while its predecessor's boundary was unfired. records={records}"
+        )
+        ordered, overlapping, within_tick, unmeasured = _whole_operator_order(trace, records, case_runs)
+        assert not overlapping, (
+            f"the device overlapped whole operators for {overlapping}, which the ordering must prevent"
+        )
+        assert ordered or within_tick, (
+            f"no established pair could be placed on the device clock: unmeasured={unmeasured}"
+        )
+
+        _assert_per_run_artifacts(artifacts, found_paths, expected_level=type(self)._SWIMLANE_LEVEL)
+
+
+@scene_test(level=3, runtime="host_build_graph", collect_across_runs=True)
+class TestEarlyEnqueueDepthTwoSwimlaneLevelOne(TestEarlyEnqueueDepthTwoSwimlane):
+    """The same case at ``TASK_TIMING``, the other level the admission accepts.
+
+    Both levels are admitted and the predicate requires the two runs to agree, so each needs its
+    own evidence: a level is one shared word the device latches when its producer initialises,
+    and the pools a level arms differ. At level 1 there is no scheduler-task stream, so record
+    ownership is checked on the AICore rows alone -- which the shared assertions follow from the
+    class's level rather than assuming.
+    """
+
+    _SWIMLANE_LEVEL = 1
+
+    CASES = [
+        {
+            "name": "early_enqueue_swimlane_level_one",
+            "platforms": ["a2a3"],
+            "config": {"device_count": 1, "num_sub_workers": 0, "launch_depth": 2},
+            "params": {},
+        },
+    ]
+
+    def _run_and_validate_l3(self, worker, compiled_callables, sub_handles, case, **kwargs):
+        del kwargs
+        type(self)._st_chip_handles = compiled_callables
+        type(self)._st_sub_handles = sub_handles
+        assert str(worker._config["platform"]) in case["platforms"]  # noqa: SLF001 -- scene-test validation
+        assert worker._launch_depth == 2, (  # noqa: SLF001 -- scene-test validation
+            "this class needs a Worker at launch_depth=2; run it under pytest, or standalone "
+            "with --case early_enqueue_swimlane_level_one so no depth-one class shares the Worker"
+        )
+        self.test_two_collecting_runs_overlap_and_each_publishes_its_own("a2a3", worker)
 
 
 @scene_test(level=3, runtime="host_build_graph")

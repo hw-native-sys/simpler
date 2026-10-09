@@ -1693,8 +1693,14 @@ protected:
      * later question about the cut is asked against that value, because an ack
      * for a *different* request says nothing about this capture.
      *
-     * The caller must be holding the run's execution claim: the capture reads
-     * `queue_tails[q]`, which is stable only while no producer is running.
+     * The caller must arm at or after the owning run's device completion. A
+     * successor may already be producing into the same queues by the time the
+     * capture happens, and that is sound rather than merely tolerated: a ready
+     * queue is FIFO, so every entry this run will publish was queued before any
+     * of the successor's. Successor traffic in `queue_tails[q]` can only enlarge
+     * the target, never let this run's cut complete with one of its own entries
+     * still outstanding. What the capture may not precede is this run's own
+     * completion, which is what makes its tail final.
      */
     int cut_arm(uint64_t *request_out) {
         if (request_out == nullptr) return -1;

@@ -364,11 +364,13 @@ struct ChipRunLaneState {
      * A live communication resource disqualifies every run on the worker, for
      * the same reason — the child releases those before its reset.
      *
-     * Diagnostics stay exclusive. Preparation no longer needs them to be, but
-     * a launch does: the collector pools are runner-resident and armed for one
-     * run at launch and torn down for it at drain, so a second launched run
-     * would arm them over a live capture and publish one run's records as the
-     * other's.
+     * Diagnostics are exclusive except for one shape. A collector whose pools
+     * are armed for one run at launch and torn down for it at drain cannot
+     * serve two, so any diagnostic on either run refuses by default. The
+     * swimlane collector is the one that can hold two runs open — buffers carry
+     * the run that produced them and each run's loss is charged to its own
+     * bucket — and `permits_joined_diagnostic_launch` is the narrow opening for
+     * exactly that case.
      */
     bool permits_joined_launch(const ChipRunState &predecessor, const ChipRunState &successor) const {
         if (!worker->supports_joined_native_launch()) return false;
@@ -376,9 +378,38 @@ struct ChipRunLaneState {
         if (successor.phase != ChipRunState::Phase::PREPARED) return false;
         if (!successor.activated || successor.depth_one_fallback || successor.error != nullptr) return false;
         if (successor.joined_launch_declined) return false;
-        if (predecessor.config.diagnostics_any() || successor.config.diagnostics_any()) return false;
         if (!joinable_shape(predecessor) || !joinable_shape(successor)) return false;
-        return !worker->holds_live_comm_resources();
+        if (worker->holds_live_comm_resources()) return false;
+        if (predecessor.config.diagnostics_any() || successor.config.diagnostics_any()) {
+            return permits_joined_diagnostic_launch(predecessor, successor);
+        }
+        return true;
+    }
+
+    /**
+     * Whether two diagnostic runs may be ordered on the device together.
+     *
+     * Only one shape qualifies: swimlane collection alone, at the same level on
+     * both runs, on a backend whose collector can hold two runs open. Everything
+     * else about that — whether the level is one the collector supports, whether
+     * retention is on and ready, whether a bucket is free — is the backend's to
+     * answer, because it is the backend that owns the collector. What is decided
+     * here is only what the lane can see for itself.
+     *
+     * Re-asked every round and never remembered. A decline here is a statement
+     * about right now — capacity comes back, and a run declined this round can
+     * join the next — which is exactly what `joined_launch_declined` must not be
+     * set for: that flag means the backend refused an attempt, and those reasons
+     * cannot change while the run ahead executes.
+     */
+    bool permits_joined_diagnostic_launch(const ChipRunState &predecessor, const ChipRunState &successor) const {
+        if (predecessor.config.enable_chip_swimlane == 0) return false;
+        if (predecessor.config.enable_chip_swimlane != successor.config.enable_chip_swimlane) return false;
+        if (predecessor.config.enable_dump_args != 0 || successor.config.enable_dump_args != 0) return false;
+        if (predecessor.config.enable_pmu != 0 || successor.config.enable_pmu != 0) return false;
+        if (predecessor.config.enable_dep_gen != 0 || successor.config.enable_dep_gen != 0) return false;
+        if (predecessor.config.enable_scope_stats != 0 || successor.config.enable_scope_stats != 0) return false;
+        return worker->supports_joined_diagnostic_launch(successor.native_run, predecessor.native_run);
     }
 
     /**

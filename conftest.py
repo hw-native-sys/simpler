@@ -17,6 +17,7 @@ subprocess per runtime so each gets a clean CANN context. See docs/testing.md.
 from __future__ import annotations
 
 import faulthandler
+import hashlib
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ import sys
 import tempfile
 import time
 import typing
+from pathlib import Path
 
 # Make simpler's TIMING and NUL levels acceptable to pytest's `--log-level` validator.
 # pytest does `int(getattr(logging, level.upper(), level))`, so the value must
@@ -1027,6 +1029,91 @@ def _emit_group(header: str, body: str) -> None:
     print("::endgroup::", flush=True)
 
 
+# Every native host-log record is formatted `[mono_ns=<n>][T0x<tid>][LEVEL] ` by
+# `format_record` in src/common/log/host_log.cpp, so this matches those records and
+# nothing a scene child's pytest report contains. The level is captured because it
+# decides whether a record may be dropped at all.
+_HOST_LOG_RECORD = re.compile(r"^\[mono_ns=\d+\]\[T0x[0-9a-f]+\]\[([A-Z?]+)\]")
+# The one level this bounds. `TIMING` carries the `[STRACE]` spans that produced
+# the observed flood; DEBUG, INFO, WARN and ERROR are never dropped, because a
+# fault report is the thing a reader came for and the spool file is not reachable
+# from a normal CI artifact.
+_HOST_LOG_DROPPABLE_LEVEL = "TIMING"
+_HOST_LOG_CONSOLE_RECORDS = 400
+
+
+def _spool_child_output(label: str, body: str) -> str | None:
+    """Write one child's captured output verbatim, and return the path, or None.
+
+    The returned path is the console view's licence to drop anything: `None`
+    means the stream exists nowhere else, and the caller must then render it
+    whole. The name carries a digest of the full nodeid as well as its
+    readable head, so two long nodeids that share a prefix cannot land on one
+    file and the printed path is the file that was written.
+    """
+    if not body:
+        return None
+    try:
+        directory = Path(tempfile.gettempdir()) / f"simpler-scene-output-{os.getpid()}"
+        directory.mkdir(parents=True, exist_ok=True)
+        readable = re.sub(r"[^A-Za-z0-9._-]+", "-", label).strip("-")[:100]
+        digest = hashlib.sha256(label.encode("utf-8", "replace")).hexdigest()[:16]
+        target = directory / f"{readable}-{digest}.log"
+        target.write_text(body)
+        return str(target)
+    except OSError as error:
+        print(f"[OUTPUT SPOOL ERROR] {label}: {error}", flush=True)
+        return None
+
+
+def _bounded_child_output(body: str, spooled: str | None) -> str:
+    """``body`` with its native TIMING records bounded, when they are kept elsewhere.
+
+    A scene child whose native host log is not bound to a file writes every
+    record to its stderr, and its pytest report then carries the whole stream
+    under ``Captured stderr``. One case has produced a quarter of a gigabyte
+    that way, which the runner has to upload before the job can finish.
+
+    Three things are never dropped, and each is its own reason:
+
+    - **Anything that is not a native record.** Collection output, tracebacks,
+      assertion diffs, captured-section headers and the short test summary pass
+      through in place and in order; they are what a reader came for.
+    - **Any record above TIMING.** A single ERROR followed by a burst of spans
+      would otherwise vanish, and the spool file below is in the runner's
+      temporary directory, which no artifact on this workflow collects — so a
+      remote reviewer could not retrieve what the console dropped.
+    - **Everything, when ``spooled`` is None.** The file is what makes dropping
+      a rendering choice rather than a loss; without it there is no second copy
+      and the console is the only record there is.
+    """
+    if spooled is None:
+        return body
+    lines = body.splitlines()
+    droppable = [
+        index
+        for index, line in enumerate(lines)
+        if (match := _HOST_LOG_RECORD.match(line)) and match.group(1) == _HOST_LOG_DROPPABLE_LEVEL
+    ]
+    if len(droppable) <= _HOST_LOG_CONSOLE_RECORDS:
+        return body
+    dropped = set(droppable[: len(droppable) - _HOST_LOG_CONSOLE_RECORDS])
+    where = f"; the whole stream is at {spooled}"
+    rendered: list[str] = []
+    run = 0
+    for index, line in enumerate(lines):
+        if index in dropped:
+            run += 1
+            continue
+        if run:
+            rendered.append(f"[{run} earlier host-log TIMING record(s) omitted from this view{where}]")
+            run = 0
+        rendered.append(line)
+    if run:
+        rendered.append(f"[{run} earlier host-log TIMING record(s) omitted from this view{where}]")
+    return "\n".join(rendered) + ("\n" if body.endswith("\n") else "")
+
+
 def _github_actions_escape(value: object) -> str:
     """Escape a value for the GitHub Actions workflow-command payload."""
     return str(value).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
@@ -1116,7 +1203,8 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
             tag = "PASS" if res.returncode == 0 else f"FAIL rc={res.returncode}"
             nodeid = res.nodeid or "<unknown>"
             header = f"{res.label} nodeid={nodeid} [{tag} {res.duration_s:.1f}s, devices={res.device_ids}]"
-            _emit_group(header, res.output)
+            spooled = _spool_child_output(nodeid, res.output)
+            _emit_group(header, _bounded_child_output(res.output, spooled))
             if res.returncode != 0:
                 # Out-of-group summary so a reviewer scanning the collapsed
                 # log still sees the failure without having to expand.

@@ -16,7 +16,28 @@
 #include "call_config.h"
 #include "common/args_dump.h"
 #include "common/chip_swimlane_profiling.h"
+#include "common/core_type.h"
 #include "host/pmu_collector.h"
+
+/**
+ * The diagnostics metadata one run owns, handed to a retaining collector at
+ * admission rather than read at close.
+ *
+ * The collector holds exactly one resident copy of each of these, written by
+ * whichever run launched last. While launches are exclusive that is also this
+ * run's, but a successor that submits while its predecessor still executes
+ * replaces them before the predecessor closes -- so the predecessor's artifact
+ * would carry its successor's core types. Passing them in is what makes each
+ * value belong to the run whose bucket keeps it.
+ *
+ * `core_types` points at the caller's storage and is read only during the
+ * admission call; the bucket takes its own copy.
+ */
+struct RunLocalDfxMetadata {
+    const CoreType *core_types{nullptr};
+    int core_type_count{0};
+    bool host_orchestrated{false};
+};
 
 /**
  * One run's diagnostics configuration, resolved from its own CallConfig.

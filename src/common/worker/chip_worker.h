@@ -358,6 +358,16 @@ public:
      */
     bool supports_joined_native_launch() const;
     /**
+     * Whether `run` may be ordered behind `predecessor` while both collect
+     * swimlane diagnostics.
+     *
+     * Read-only: nothing is armed, reserved or submitted, so a false answer
+     * costs the caller only the round it asked in, and a true answer is not a
+     * reservation. The backend rechecks everything it would need when the
+     * launch actually arms.
+     */
+    bool supports_joined_diagnostic_launch(const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor);
+    /**
      * Whether this worker holds a live communication session or global domain.
      *
      * A joined successor must not depend on either: both are released by the
@@ -440,6 +450,7 @@ private:
     using SimplerProbeRunRetentionFn = decltype(&simpler_probe_run_retention);
     using GetTeardownReportFn = decltype(&get_teardown_report);
     using SupportsConcurrentNativePrepareFn = int (*)(void *);
+    using SupportsJoinedDiagnosticLaunchFn = int (*)(void *, void *, void *);
     using GetArenaBankGmHeapBaseFn = uint64_t (*)(void *, uint32_t);
     using GetRetainedTempAddrFn = uint64_t (*)(void *, uint32_t);
     using GetPipelineContractFn = const PipelineContract *(*)();
@@ -537,6 +548,7 @@ private:
     SimplerFlushDiagnosticsFn flush_diagnostics_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_concurrent_native_prepare_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_joined_native_launch_fn_ = nullptr;
+    SupportsJoinedDiagnosticLaunchFn supports_joined_diagnostic_launch_fn_ = nullptr;
     GetArenaBankGmHeapBaseFn get_arena_bank_gm_heap_base_fn_ = nullptr;
     GetRetainedTempAddrFn get_retained_temp_addr_fn_ = nullptr;
     SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;

@@ -19,15 +19,9 @@
 #include "call_config.h"
 #include "common/host_api.h"
 #include "native_run_execution.h"
+#include "native_run_phase.h"
 #include "runtime_c_api.h"
 #include "runtime.h"
-
-/** Internal phase of the caller-owned opaque native-run storage. */
-enum class NativeRunPhase : uint8_t {
-    Prepared,
-    Running,
-    Complete,
-};
 
 /**
  * The single placement-owned carrier for one progressable native lifecycle.

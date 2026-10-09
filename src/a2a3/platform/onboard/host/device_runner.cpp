@@ -759,7 +759,23 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 if (int fence_rc = arm_run_fence(prepared); fence_rc != 0) return fence_rc;
                 (void)arm_device_wall_buffer(prepared.pipeline_slot, prepared.kernel_args);
                 if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
-                if (int collect_rc = start_shared_collectors_for_run(prepared.dfx, prepared.identity.run_epoch);
+                // This run's own core types, resolved from its own prepared
+                // runtime and handed to admission. The resident copy the
+                // collector keeps is set below and belongs to whichever run
+                // launched last, which under an early-enqueued successor is not
+                // the run whose bucket is being opened here.
+                std::vector<CoreType> core_types;
+                if (prepared.dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
+                    core_types.resize(static_cast<size_t>(num_aicore));
+                    for (int i = 0; i < num_aicore; i++)
+                        core_types[static_cast<size_t>(i)] = runtime.core_type_rule(i);
+                }
+                const RunLocalDfxMetadata run_metadata{
+                    core_types.empty() ? nullptr : core_types.data(), static_cast<int>(core_types.size()),
+                    host_orchestrated_for_slot(prepared.pipeline_slot)
+                };
+                if (int collect_rc =
+                        start_shared_collectors_for_run(prepared.dfx, prepared.identity.run_epoch, run_metadata);
                     collect_rc != 0) {
                     return collect_rc;
                 }
@@ -770,10 +786,9 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                     withdraw_unlaunched_collectors_for_run(prepared.dfx, prepared.identity.run_epoch);
                     return dep_rc;
                 }
-                if (prepared.dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
-                    std::vector<CoreType> core_types(num_aicore);
-                    for (int i = 0; i < num_aicore; i++)
-                        core_types[i] = runtime.core_type_rule(i);
+                // The resident copy, which the serial non-retained path reads at
+                // its own close.
+                if (!core_types.empty()) {
                     chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
                 }
 

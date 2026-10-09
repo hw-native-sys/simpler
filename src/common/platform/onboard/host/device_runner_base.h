@@ -1419,6 +1419,31 @@ public:
         LaunchProgress progress{LaunchProgress::NotStarted};
     };
 
+    /**
+     * Whether `succ` may be ordered behind `pred` while both collect swimlane
+     * diagnostics.
+     *
+     * Read-only in the strongest sense this class can offer: it arms nothing,
+     * latches no shape, starts no thread, reserves no bucket and issues no
+     * device call. It is asked before `arm_collectors_for_run`, which is the
+     * first thing that could rebuild a collector, so a stale shape here is a
+     * decline rather than a rebuild under a predecessor that is still
+     * producing.
+     *
+     * A true answer is not a reservation. The bucket it saw free is claimed
+     * later by `run_begin`, which rechecks capacity and fatality under the
+     * collector's own mutex; between the two only the lane can claim, and the
+     * lane is the single thread asking.
+     *
+     * Both arguments are the configuration owners for their runs: the
+     * successor's own prepared execution, and the predecessor's active
+     * execution's prepared state. Neither this runner's resident DFX members
+     * nor either run's original `CallConfig` substitutes, because a resident
+     * member describes whichever run armed last and a `CallConfig` has not been
+     * through the per-run degradation a channel may have applied.
+     */
+    bool can_join_diagnostic_run(const PreparedExecution &succ, const PreparedExecution &pred) const;
+
     struct LaunchOutcome {
         int rc{-1};
         LaunchProgress progress{LaunchProgress::NotStarted};
@@ -1631,6 +1656,15 @@ public:
      * that now runs from the same launch arming.
      */
     void publish_host_phase_run_to_collector(uint32_t pipeline_slot) noexcept;
+    /**
+     * This slot's own host-orchestration state, for a run that must not read
+     * the collector's single resident copy.
+     */
+    bool host_orchestrated_for_slot(uint32_t pipeline_slot) const noexcept {
+        if (pipeline_slot >= host_phase_runs_.size()) return false;
+        return host_phase_runs_[pipeline_slot].host_orchestrated;
+    }
+
     /**
      * Write this pass's per-event host phase records under `output_prefix`.
      *
@@ -2091,7 +2125,9 @@ protected:
      * caller propagates the rc and the run is rolled back rather than collected
      * by the destructive single-run path.
      */
-    int start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch);
+    int start_shared_collectors_for_run(
+        const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata
+    );
 
     /**
      * Give back what `start_shared_collectors_for_run` admitted for a run that

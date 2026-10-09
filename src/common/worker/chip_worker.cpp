@@ -303,6 +303,10 @@ void ChipWorker::init(
             load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_concurrent_native_prepare_ctx");
         supports_joined_native_launch_fn_ =
             load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_joined_native_launch_ctx");
+        // Optional: a runtime built before the diagnostic join exports no
+        // such symbol, and a null pointer is the refusal.
+        supports_joined_diagnostic_launch_fn_ =
+            reinterpret_cast<SupportsJoinedDiagnosticLaunchFn>(dlsym(handle, "supports_joined_diagnostic_launch_ctx"));
         get_arena_bank_gm_heap_base_fn_ =
             load_symbol<GetArenaBankGmHeapBaseFn>(handle, "get_arena_bank_gm_heap_base_ctx");
         get_retained_temp_addr_fn_ = load_symbol<GetRetainedTempAddrFn>(handle, "get_retained_temp_addr_ctx");
@@ -529,6 +533,7 @@ void ChipWorker::init(
         get_workspace_report_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
         supports_joined_native_launch_fn_ = nullptr;
+        supports_joined_diagnostic_launch_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
         get_retained_temp_addr_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
@@ -604,6 +609,7 @@ void ChipWorker::init(
         get_workspace_report_fn_ = nullptr;
         supports_concurrent_native_prepare_fn_ = nullptr;
         supports_joined_native_launch_fn_ = nullptr;
+        supports_joined_diagnostic_launch_fn_ = nullptr;
         get_arena_bank_gm_heap_base_fn_ = nullptr;
         get_retained_temp_addr_fn_ = nullptr;
         unregister_callable_fn_ = nullptr;
@@ -776,6 +782,7 @@ void ChipWorker::finalize() {
     get_workspace_report_fn_ = nullptr;
     supports_concurrent_native_prepare_fn_ = nullptr;
     supports_joined_native_launch_fn_ = nullptr;
+    supports_joined_diagnostic_launch_fn_ = nullptr;
     get_arena_bank_gm_heap_base_fn_ = nullptr;
     get_retained_temp_addr_fn_ = nullptr;
     unregister_callable_fn_ = nullptr;
@@ -916,6 +923,45 @@ bool ChipWorker::supports_concurrent_native_prepare() const {
 bool ChipWorker::supports_joined_native_launch() const {
     return initialized_ && launch_depth_ > 1 && pipeline_contract_.pipeline_depth > 1 &&
            supports_joined_native_launch_fn_(device_ctx_) > 0;
+}
+
+bool ChipWorker::supports_joined_diagnostic_launch(
+    const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor
+) {
+    if (!initialized_) return false;
+    // Exactly two, not "more than one". The approved opening is a successor
+    // submitting while one predecessor executes; at depth three a second
+    // successor would join behind a run that is itself already joined, and
+    // nothing here has established what two open diagnostic runs behind a third
+    // would do to the two retained buckets. Ordinary non-diagnostic joins keep
+    // the backend's own depth, which this does not touch.
+    if (launch_depth_ != 2) return false;
+    if (pipeline_contract_.pipeline_depth <= 1) return false;
+    // An older `libhost_runtime.so` exports no such symbol. Absent means the
+    // refusal this call is asking to lift, so the caller keeps today's
+    // behaviour.
+    if (supports_joined_diagnostic_launch_fn_ == nullptr) return false;
+    // Held across the token validation *and* the backend call, unlike the
+    // launch path's check: this call reads the backend's prepared and active
+    // execution state through both handles, and the slot bookkeeping that says
+    // those handles still name the runs the caller means is this mutex's. A
+    // check made under the lock and a read made after it would be two
+    // statements about two different instants.
+    //
+    // The call is read-only and takes no device action, so holding the mutex
+    // through it adds no wait that was not already this thread's.
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    if (run.slot_id >= runtime_bufs_.size() || predecessor.slot_id >= runtime_bufs_.size()) return false;
+    if (run.slot_id == predecessor.slot_id) return false;
+    const NativeRunSlotState &state = native_run_states_[run.slot_id];
+    if (state.run_epoch != run.run_epoch || state.lease_generation != run.generation) return false;
+    if (state.phase != NativeRunPhase::PREPARED) return false;
+    const NativeRunSlotState &ahead = native_run_states_[predecessor.slot_id];
+    if (ahead.run_epoch != predecessor.run_epoch || ahead.lease_generation != predecessor.generation) return false;
+    if (ahead.phase != NativeRunPhase::LAUNCHED) return false;
+    return supports_joined_diagnostic_launch_fn_(
+               device_ctx_, runtime_bufs_[run.slot_id].data(), runtime_bufs_[predecessor.slot_id].data()
+           ) > 0;
 }
 
 bool ChipWorker::holds_live_comm_resources() const {

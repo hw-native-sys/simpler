@@ -1015,6 +1015,63 @@ public:
     }
 
     /**
+     * Substitute how the run writer's thread is obtained.
+     *
+     * `start_run_writer()` has exactly one construction point, and this is it.
+     * A factory that throws there is the only way to reach the preparation's
+     * rollback: no caller can make a thread fail to spawn, and the rollback is
+     * what keeps a collector whose writer never started from claiming to
+     * retain. Unset in production, where the writer is the same plain
+     * `std::thread` it has always been.
+     *
+     * Read on the lane that prepares retention, so it must be set before the
+     * first admission and not moved while one is in flight.
+     */
+    void set_writer_thread_factory_for_test(std::function<std::thread(std::function<void()>)> factory) {
+        writer_thread_factory_ = std::move(factory);
+    }
+
+    /** One open epoch's run-local metadata, as its admission captured it. */
+    struct PendingRunMetadata {
+        bool found{false};
+        std::vector<CoreType> core_types;
+        bool host_orchestrated{false};
+    };
+    /**
+     * Inspection only, and only for an epoch this caller has admitted and not
+     * yet closed.
+     *
+     * `run_close` hands the bucket to the writer, which may publish it and
+     * return the slot to `Free` at any moment after that; `retained_mu_` makes
+     * one bucket's read internally consistent but does not extend its life. So
+     * an epoch is readable here strictly between its `run_begin` and its
+     * `run_close` -- after the close, a run's own artifact is what says what it
+     * recorded.
+     */
+    PendingRunMetadata pending_metadata_for_test(uint64_t run_epoch) const {
+        PendingRunMetadata out;
+        std::lock_guard<std::mutex> lk(retained_mu_);
+        for (const auto &bucket : retained_runs_) {
+            if (bucket.state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) continue;
+            if (bucket.epoch.load(std::memory_order_acquire) != run_epoch) continue;
+            out.found = true;
+            out.core_types = bucket.pending.core_types;
+            out.host_orchestrated = bucket.pending.host_orchestrated;
+            break;
+        }
+        return out;
+    }
+
+    /**
+     * The host bytes retention reserves before it admits anything.
+     *
+     * Fixed once the collector is sized, so it is meaningful only between
+     * `initialize()` and the first admission -- which is where a caller choosing
+     * a budget needs it.
+     */
+    size_t retained_fixed_overhead_for_test() const { return retained_fixed_overhead(); }
+
+    /**
      * One completed run's diagnostic data, owned by that run.
      *
      * A plain owned value: every field is held by value, the record streams are
@@ -1338,8 +1395,31 @@ private:
      * decide whose it was. Published on every run sealed while it is non-zero,
      * as a completeness statement about that run rather than a count of its
      * own losses.
+     *
+     * Cleared exactly once, at the first successful retention setup, so losses
+     * counted before this collector ever retained a run cannot downgrade the
+     * artifacts of runs it retains afterwards. See `ever_retained_`.
      */
     std::atomic<uint64_t> unattributable_handoffs_{0};
+    /**
+     * Whether retention setup has ever completed successfully on this
+     * collector -- not whether an artifact was written, and not whether
+     * retention is configured on right now.
+     *
+     * It is the error-reporting policy boundary. While false, a hand-off this
+     * collector cannot charge is counted and logged and nothing is made sticky:
+     * a run that never retained answers for its own loss through its own
+     * artifact, and a later flush has nothing to add. Once true it stays true
+     * through disable, finalize, rebuild and every subsequent default-mode run,
+     * because a sticky failure recorded under retention has to remain
+     * observable after the configuration that produced it is gone.
+     *
+     * Published with release under `retained_mu_` at the tail of
+     * `ensure_retained_runs_ready`, after the writer has started -- readiness
+     * alone is not enough, because the writer spawn can still throw and take
+     * the whole preparation back down.
+     */
+    std::atomic<bool> ever_retained_{false};
     /** Reported once: this transport delivers hand-offs with no identity. */
     std::atomic<bool> unverified_handoff_reported_{false};
     mutable std::mutex pre_charge_hook_mu_;
@@ -1406,6 +1486,17 @@ private:
         AicoreAccounting aicore{};
         RunTerminalSnapshot terminal{};
         bool terminal_ok{false};
+        /**
+         * Whether this run's admission-time metadata was fully kept.
+         *
+         * False when the budget refused the core-type copy at `run_begin`. It
+         * has to be remembered rather than re-derived at close: the close-time
+         * charge is a different allocation, and a sibling bucket publishing in
+         * between can credit enough for it to succeed. Without this the
+         * artifact would claim complete metadata for a run whose core types
+         * were dropped.
+         */
+        bool admission_metadata_complete{true};
         /**
          * Guards this bucket's loss accounting as one unit: the identity it is
          * being charged against, what that identity may still accept, and the
@@ -1519,6 +1610,26 @@ public:
     bool retains_runs() const { return retain_across_runs_; }
 
     /**
+     * Whether this collector has ever completed retention setup.
+     *
+     * The reporting-policy boundary, not a configuration read: it never goes
+     * back to false, so a caller that consults a sticky failure gate must use
+     * this rather than `retains_runs()`, which a rebuild can turn off while the
+     * failure it hid is still unreported.
+     */
+    bool ever_retained() const { return ever_retained_.load(std::memory_order_acquire); }
+
+    /**
+     * Whether this collector is ready to admit a retained run right now.
+     *
+     * Readiness, fatality and free capacity are three separate facts and a
+     * caller that wants to know whether a run may be admitted needs all of
+     * them. `can_admit_retained_run()` answers the conjunction under the one
+     * mutex that makes it consistent.
+     */
+    bool can_admit_retained_run() const;
+
+    /**
      * Open one run's window on a collector that retains runs.
      *
      * The first such run also reserves the artifact directory and the host
@@ -1532,8 +1643,18 @@ public:
      * refusal as "take the single-run path" would run `begin_run()`, whose
      * reset drops the records a predecessor is still publishing. So a refusal
      * fails the run.
+     *
+     * `core_types` and `host_orchestrated` are this run's own, taken at
+     * admission rather than at close. The resident copies a close would read
+     * are written by whichever run launched last, so under an early-enqueued
+     * successor a predecessor's close would publish its successor's core types;
+     * the bucket owns them from here instead. `core_types` may be empty when
+     * the caller has none, in which case the bucket keeps none.
      */
-    bool run_begin(uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level);
+    bool run_begin(
+        uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level, const CoreType *core_types,
+        int core_type_count, bool host_orchestrated
+    );
 
     /**
      * Install this run's target and hand it to the writer.
@@ -1798,6 +1919,9 @@ private:
     mutable std::mutex retained_mu_;
     std::condition_variable retained_cv_;
     std::thread writer_thread_;
+    // Null in production: `start_run_writer()` then constructs the writer
+    // directly, as it always has. See `set_writer_thread_factory_for_test`.
+    std::function<std::thread(std::function<void()>)> writer_thread_factory_;
     // The writer's own loop condition, not a record of whether one exists:
     // `writer_thread_.joinable()` is that record, and the two are set and
     // cleared together so a failed spawn leaves neither.
@@ -1944,4 +2068,27 @@ private:
      * since `slot_for` is consulted first and answers for it.
      */
     void record_run_tombstone(uint64_t run_epoch);
+
+    /**
+     * Count one hand-off this collector cannot charge to a run, and say whether
+     * the caller owes a sticky error for it.
+     *
+     * The single policy decision point. Every write to
+     * `unattributable_handoffs_` goes through here, so the boundary between
+     * "this collector has never retained a run" and "it has" is one place and
+     * one lock rather than a condition repeated at each loss site.
+     *
+     * The decision is taken under `retained_mu_`, which is also what the first
+     * successful retention setup holds while it clears the counter and
+     * publishes the latch. A loss being counted therefore lands wholly before
+     * that clear or wholly after the transition; it can neither be erased
+     * halfway nor survive into the new policy uncounted.
+     *
+     * Returns false before the boundary: the loss is counted and the caller
+     * logs it, and nothing is recorded that a later flush would report. Returns
+     * true after it, and the caller records the sticky error itself -- outside
+     * this lock, because `ErrorSummary` has its own and a bucket's `loss_mu` is
+     * a leaf beneath neither.
+     */
+    bool charge_unattributable_handoff();
 };

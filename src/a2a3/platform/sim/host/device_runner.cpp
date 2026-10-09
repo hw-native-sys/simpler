@@ -559,7 +559,22 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 set_scope_stats_enabled_func_(prepared->dfx.scope_stats_enabled);
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
-                if (int collect_rc = start_shared_collectors_for_run(prepared->dfx, prepared->identity.run_epoch);
+                // This run's own core types, resolved from its own prepared
+                // runtime and handed to admission. The resident copy the
+                // collector keeps was set during arming and belongs to
+                // whichever run launched last, so the bucket takes its own.
+                std::vector<CoreType> core_types;
+                if (prepared->dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
+                    core_types.resize(static_cast<size_t>(num_aicore));
+                    for (int i = 0; i < num_aicore; i++)
+                        core_types[static_cast<size_t>(i)] = runtime.core_type_rule(i);
+                }
+                const RunLocalDfxMetadata run_metadata{
+                    core_types.empty() ? nullptr : core_types.data(), static_cast<int>(core_types.size()),
+                    host_orchestrated_for_slot(prepared->pipeline_slot)
+                };
+                if (int collect_rc =
+                        start_shared_collectors_for_run(prepared->dfx, prepared->identity.run_epoch, run_metadata);
                     collect_rc != 0) {
                     return collect_rc;
                 }

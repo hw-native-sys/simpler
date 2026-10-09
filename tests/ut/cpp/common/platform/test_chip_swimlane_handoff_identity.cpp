@@ -23,10 +23,12 @@
  */
 
 #include <gtest/gtest.h>
+#include <unistd.h>
 
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <atomic>
 #include <chrono>
@@ -41,6 +43,8 @@
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_collector.h"
 #include "host/profiler_base.h"
+
+namespace fs = std::filesystem;
 
 namespace {
 
@@ -338,7 +342,13 @@ TEST(SwimlaneSchemaTransportTest, AnOverCapacityCountRejectsTheEntry) {
  * stage one, and read back as a cut with no failed queues.
  */
 struct CutHeader {
-    ReadyQueueEntry queues[PLATFORM_MAX_AICPU_THREADS][2]{};
+    // Four slots, which is what makes a legal multi-entry state expressible:
+    // the device producer refuses a push when `(tail + 1) % size == head`
+    // (`profiler_device_engine.h`), so a ring of N ever holds N-1 entries and a
+    // ring of 2 holds exactly one. A case that needs a predecessor's entry and
+    // a successor's beside it cannot be written at size 2 without constructing
+    // a state no producer can reach.
+    ReadyQueueEntry queues[PLATFORM_MAX_AICPU_THREADS][4]{};
     uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS]{};
     uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS]{};
     uint32_t handoff_schema{0};
@@ -356,7 +366,7 @@ struct CutModule {
     using ReadyBufferInfo = ::ReadyBufferInfo;
     using FreeQueue = CutFreeQueue;
     static constexpr int kBufferKinds = 1;
-    static constexpr uint32_t kReadyQueueSize = 2;
+    static constexpr uint32_t kReadyQueueSize = 4;
     static constexpr uint32_t kSlotCount = 1;
     static constexpr int kMaxCollectorThreads = 1;
     static constexpr const char *kSubsystemName = "CutTest";
@@ -380,6 +390,8 @@ public:
 
     using Base::cut_arm;
     using Base::cut_failed_queues;
+    using Base::cut_stage1_done;
+    using Base::note_buffer_retired;
     using Base::quarantine_queue;
     using Base::run_drain_boundary;
     using Base::set_aicpu_thread_num;
@@ -430,6 +442,94 @@ TEST(SwimlaneCutQuarantineTest, AQueueStillServedIsCapturedNormally) {
     EXPECT_EQ(failed, 0);
 }
 
+TEST(SwimlaneCutProgressTest, SuccessorTrafficCannotSatisfyThePredecessorsCut) {
+    // Two runs collecting at once share every ready queue, so a predecessor's
+    // cut is captured on queues its successor keeps pushing into. Two things
+    // have to hold and are separate: the target is `consumed + outstanding`
+    // taken once at capture and does not grow with later pushes, and one
+    // queue reaching its target does not answer for another queue's.
+    CutProbe probe;
+    CutHeader header{};
+    probe.set_aicpu_thread_num(2);
+    probe.set_run_counters(true);
+
+    // Each queue holds what the predecessor left outstanding. Both states are
+    // reachable: a ring of four admits up to three entries.
+    header.queue_heads[0] = 0;
+    header.queue_tails[0] = 2;  // two of the predecessor's, undrained
+    header.queue_heads[1] = 0;
+    header.queue_tails[1] = 1;  // one of the predecessor's, undrained
+
+    uint64_t request = 0;
+    const int slot = probe.cut_arm(&request);
+    ASSERT_GE(slot, 0);
+
+    probe.run_drain_boundary(&header, /*queue_start=*/0, /*queue_stride=*/1);
+    EXPECT_FALSE(probe.cut_stage1_done(slot)) << "nothing captured has been consumed yet";
+
+    // The successor pushes a third entry onto queue 0, legally. The capture
+    // already happened, so this must not move queue 0's target.
+    header.queue_tails[0] = 3;
+    probe.run_drain_boundary(&header, /*queue_start=*/0, /*queue_stride=*/1);
+    EXPECT_FALSE(probe.cut_stage1_done(slot)) << "a successor's push satisfied a cut on its own";
+
+    // Queue 0 drains exactly the two the predecessor owed. If the target had
+    // grown with the successor's push it would now stand at three and this
+    // queue would still be short -- which the final assertion would catch.
+    probe.note_buffer_retired(0);
+    probe.note_buffer_retired(0);
+    probe.run_drain_boundary(&header, /*queue_start=*/0, /*queue_stride=*/1);
+    EXPECT_FALSE(probe.cut_stage1_done(slot))
+        << "queue 0's progress answered for queue 1's predecessor, which has not retired";
+
+    // Only queue 1's own entry leaving completes the cut.
+    probe.note_buffer_retired(1);
+    probe.run_drain_boundary(&header, /*queue_start=*/0, /*queue_stride=*/1);
+    EXPECT_TRUE(probe.cut_stage1_done(slot))
+        << "every queue reached the target it was captured with and the cut did not notice";
+
+    int failed = 0;
+    EXPECT_TRUE(probe.cut_failed_queues(slot, request, &failed));
+    EXPECT_EQ(failed, 0) << "no queue was stopped, so none may be reported failed";
+}
+
+TEST(SwimlaneCutProgressTest, AnUndecidableQueueIsReportedWithoutHoldingTheOthers) {
+    // An acknowledgement nobody can decide stops one queue for good. The cut
+    // must still complete on the queues that are still served -- a cut no
+    // queue can finish never returns its slot -- and the stopped queue must be
+    // reported rather than counted as reached.
+    //
+    // Scope: this is the cut's own state machine. It is not evidence about the
+    // ACK retirement that decides a queue is undecidable in the first place,
+    // nor about a retained bucket being handed back; `quarantine_queue` is
+    // called here directly.
+    CutProbe probe;
+    CutHeader header{};
+    probe.set_aicpu_thread_num(2);
+    probe.set_run_counters(true);
+    header.queue_heads[0] = 0;
+    header.queue_tails[0] = 1;  // still served, one outstanding
+    header.queue_heads[1] = 1;
+    header.queue_tails[1] = 1;  // reads drained, but nobody is draining it
+
+    probe.quarantine_queue(1);
+
+    uint64_t request = 0;
+    const int slot = probe.cut_arm(&request);
+    ASSERT_GE(slot, 0);
+
+    probe.run_drain_boundary(&header, /*queue_start=*/0, /*queue_stride=*/1);
+    EXPECT_FALSE(probe.cut_stage1_done(slot)) << "queue 0 still owes the entry it was captured with";
+
+    probe.note_buffer_retired(0);
+    probe.run_drain_boundary(&header, /*queue_start=*/0, /*queue_stride=*/1);
+    EXPECT_TRUE(probe.cut_stage1_done(slot)) << "a stopped queue held a cut the served queues had reached";
+
+    int failed = 0;
+    EXPECT_TRUE(probe.cut_failed_queues(slot, request, &failed));
+    EXPECT_EQ(failed, 1) << "the stopped queue completed the cut instead of being reported";
+}
+
 // ---------------------------------------------------------------------------
 // R2: a late charge never lands on the run that reused the bucket
 // ---------------------------------------------------------------------------
@@ -452,10 +552,20 @@ profiling_common::RetiredHandoff<ChipSwimlaneModule> handoff(uint64_t epoch, uin
 /** A retaining collector, brought up the way the runner brings one up. */
 struct LossFixture {
     ChipSwimlaneCollector collector;
+    fs::path root;
     std::string dir;
 
     explicit LossFixture(const char *name) :
-        dir(std::string("/tmp/simpler-ut-") + name) {
+        // Named with this process's pid, and removed by this fixture alone.
+        // The case name on its own is one absolute path shared by every
+        // process on the host: this file builds PER_ARCH PER_RUNTIME, the host
+        // lane runs `ctest -j4`, and `/tmp` is shared between users. A root
+        // another process owns cannot be reserved into, and one this fixture
+        // never removed grows a `swimlane-K` subdirectory per run forever.
+        root(fs::temp_directory_path() / ("simpler-ut-" + std::string(name) + "-" + std::to_string(::getpid()))),
+        dir(root.string()) {
+        std::error_code ec;
+        fs::remove_all(root, ec);
         collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
         EXPECT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, loss_alloc, nullptr, loss_free), 0);
         collector.start(loss_thread);
@@ -464,12 +574,15 @@ struct LossFixture {
         collector.finish_retained_runs();
         collector.stop();
         collector.finalize(nullptr, loss_free);
+        // After the joins above, so nothing is still publishing into it.
+        std::error_code ec;
+        fs::remove_all(root, ec);
     }
 };
 
 TEST(SwimlaneLossGenerationTest, AnOpenRunIsChargedItsOwnLoss) {
     LossFixture fx("loss-open");
-    ASSERT_TRUE(fx.collector.run_begin(11, fx.dir, ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(11, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
 
     fx.collector.on_handoff_retired(handoff(11, 5));
 
@@ -481,11 +594,11 @@ TEST(SwimlaneLossGenerationTest, AnOpenRunIsChargedItsOwnLoss) {
 
 TEST(SwimlaneLossGenerationTest, APredecessorsLateChargeNeverReachesTheSuccessor) {
     LossFixture fx("loss-reuse");
-    ASSERT_TRUE(fx.collector.run_begin(21, fx.dir, ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(21, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     // Withdraw run 21 without launching it, which is the production way a slot
     // goes back; then reuse it for 22.
     ASSERT_TRUE(fx.collector.abandon_run(21));
-    ASSERT_TRUE(fx.collector.run_begin(22, fx.dir, ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(22, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
 
     fx.collector.on_handoff_retired(handoff(22, 3));  // the successor's own loss
     fx.collector.on_handoff_retired(handoff(21, 9));  // the predecessor's, arriving late
@@ -498,7 +611,7 @@ TEST(SwimlaneLossGenerationTest, APredecessorsLateChargeNeverReachesTheSuccessor
 
 TEST(SwimlaneLossGenerationTest, AnUnknownEpochIsChargedToNobody) {
     LossFixture fx("loss-unknown");
-    ASSERT_TRUE(fx.collector.run_begin(31, fx.dir, ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(31, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
 
     fx.collector.on_handoff_retired(handoff(999, 4));
 
@@ -555,7 +668,7 @@ struct ParkedCharge {
 
 TEST(SwimlaneLossExclusionTest, AChargeInFlightWhenTheBucketIsReusedNeverReachesTheSuccessor) {
     LossFixture fx("loss-reuse-race");
-    ASSERT_TRUE(fx.collector.run_begin(41, fx.dir, ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(41, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
 
     // The charge is held in the window the review names: past its decision to
     // charge 41, before it can take the bucket's accounting lock.
@@ -565,7 +678,7 @@ TEST(SwimlaneLossExclusionTest, AChargeInFlightWhenTheBucketIsReusedNeverReaches
 
     // 41 goes away and 42 takes its slot while that charge is in flight.
     ASSERT_TRUE(fx.collector.abandon_run(41));
-    ASSERT_TRUE(fx.collector.run_begin(42, fx.dir, ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(42, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     held.release();
 
     const auto successor = fx.collector.transport_loss_for_test(42);
@@ -576,14 +689,14 @@ TEST(SwimlaneLossExclusionTest, AChargeInFlightWhenTheBucketIsReusedNeverReaches
 
 TEST(SwimlaneLossExclusionTest, AParkedChargeDoesNotDisturbTheSuccessorsOwn) {
     LossFixture fx("loss-reuse-mixed");
-    ASSERT_TRUE(fx.collector.run_begin(61, fx.dir, ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(61, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
 
     ParkedCharge held;
     held.arm(fx.collector);
     held.start(fx.collector, 61, 4);
 
     ASSERT_TRUE(fx.collector.abandon_run(61));
-    ASSERT_TRUE(fx.collector.run_begin(62, fx.dir, ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(62, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     // Runs through the same hook the parked thread is still inside.
     fx.collector.on_handoff_retired(handoff(62, 3));
     held.release();
@@ -596,7 +709,7 @@ TEST(SwimlaneLossExclusionTest, AParkedChargeDoesNotDisturbTheSuccessorsOwn) {
 
 TEST(SwimlaneLossExclusionTest, AChargeInFlightWhenTheSlotIsReleasedIsRefused) {
     LossFixture fx("loss-release-race");
-    ASSERT_TRUE(fx.collector.run_begin(71, fx.dir, ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(71, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     fx.collector.on_handoff_retired(handoff(71, 2));
 
     ParkedCharge held;
@@ -622,7 +735,7 @@ TEST(SwimlaneLossExclusionTest, AChargeInFlightWhenTheSlotIsReleasedIsRefused) {
 
 TEST(SwimlaneLossAuthorityTest, AWithdrawnRunIsNotChargeableBeforeItsSuccessorExists) {
     LossFixture fx("loss-withdrawn");
-    ASSERT_TRUE(fx.collector.run_begin(81, fx.dir, ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(81, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     ASSERT_TRUE(fx.collector.abandon_run(81));
 
     // No successor has claimed the slot yet, which is what used to let the
@@ -635,7 +748,7 @@ TEST(SwimlaneLossAuthorityTest, AWithdrawnRunIsNotChargeableBeforeItsSuccessorEx
         << "a descriptor naming a run this collector no longer holds is unattributed, not charged";
 
     // And the successor that later takes the slot starts from zero.
-    ASSERT_TRUE(fx.collector.run_begin(82, fx.dir, ChipSwimlaneLevel::TASK_TIMING));
+    ASSERT_TRUE(fx.collector.run_begin(82, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     EXPECT_EQ(fx.collector.transport_loss_for_test(82).first, 0u);
 }
 

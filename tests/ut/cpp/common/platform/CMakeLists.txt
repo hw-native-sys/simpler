@@ -504,9 +504,16 @@ platform_cases(
     test_chip_swimlane_aicore_accounting.cpp
     test_chip_swimlane_handoff_accounting.cpp
     test_chip_swimlane_handoff_identity.cpp
+    test_chip_swimlane_joined_diagnostics.cpp
     test_chip_swimlane_retained_runs.cpp
     PER_ARCH PER_RUNTIME TIER aicpu
     SOURCES ${CHIP_SWIMLANE_CASE_SOURCES})
+
+# Both axes, and neither is about what the case covers: the decision under test
+# is header-only and arch-independent, but it names `ChipSwimlaneLevel` and
+# `NativeRunPhase`, whose headers reach the runtime's own `task_id.h`. No
+# collector sources — the header has no definitions to link.
+platform_case(test_joined_diagnostic_eligibility.cpp PER_ARCH PER_RUNTIME)
 
 # The exported run file, off the same two sides. Not PER_ARCH, and the reason
 # is the case rather than what it covers: its golden is a captured artifact

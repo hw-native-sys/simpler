@@ -56,6 +56,7 @@
 #include "host/acl_error_log.h"
 #include "host_log.h"
 #include "host/host_clock_alignment_log.h"
+#include "host/joined_diagnostic_eligibility.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
 #include "platform_comm/comm.h"
@@ -190,6 +191,17 @@ __attribute__((weak)) int teardown_report_supported_impl(void) { return 0; }
  * path, where one run reaches the device at a time.
  */
 __attribute__((weak)) int joined_native_launch_supported_impl(void) { return 0; }
+/**
+ * Whether this runtime's diagnostics collector can hold two runs open while
+ * one of them is ordered behind the other.
+ *
+ * Deliberately separate from `joined_native_launch_supported_impl`, which three
+ * runtimes define strongly: overloading that one would make ordinary
+ * non-diagnostic early enqueue on those runtimes start depending on swimlane
+ * bucket capacity. A runtime that does not override this keeps today's
+ * behaviour, where any diagnostic on either side refuses a join.
+ */
+__attribute__((weak)) int joined_diagnostic_launch_supported_impl(void) { return 0; }
 /**
  * Whether a successor may be prepared into a shared arena bank beside the run
  * executing out of it.
@@ -1652,6 +1664,66 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
 int supports_joined_native_launch_ctx(DeviceContextHandle ctx) {
     if (ctx == nullptr || joined_native_launch_supported_impl() == 0) return 0;
     return static_cast<DeviceRunnerBase *>(ctx)->ready_to_join_launch() ? 1 : 0;
+}
+
+/**
+ * Bind one named handle to the execution state that actually owns its
+ * configuration, refusing anything that is not this context's live run.
+ *
+ * `native_run_context` already proves the storage carries this context's magic
+ * and names this runner. What it cannot prove is that the handle is the run the
+ * caller means: storage is reused across runs on the same slot, so a stale
+ * token can still look structurally valid. The identity comparison below closes
+ * that — the descriptor is immutable for the life of the context, and the
+ * prepared execution carries the identity it was created with, so a prepared
+ * state left over from an earlier run on this slot cannot match.
+ *
+ * Identity does not pin the storage; the caller's lane ownership, slot lease
+ * and held locks do. This is a validation, not a lifetime guarantee, exactly as
+ * for the other handle-taking entry points.
+ */
+static const DeviceRunnerBase::PreparedExecution *owned_prepared_execution(
+    DeviceContextHandle ctx, RuntimeHandle handle, NativeRunPhase required_phase, const char *operation
+) {
+    OnboardNativeRunContext *state = native_run_context(ctx, handle, operation);
+    if (state == nullptr) return nullptr;
+    // A running context's configuration owner is its active execution; its
+    // `prepared_execution` was moved out when the launch took it, so reading
+    // that would read a hollow object. A prepared one has no active execution
+    // yet and owns its own.
+    const DeviceRunnerBase::PreparedExecution *prepared =
+        (required_phase == NativeRunPhase::Running) ?
+            (state->active_execution == nullptr ? nullptr : state->active_execution->prepared.get()) :
+            state->prepared_execution.get();
+
+    simpler::dfx::NativeRunHandleFacts facts;
+    facts.phase = state->phase.load(std::memory_order_acquire);
+    facts.runner_claimed = state->runner_claimed;
+    facts.runner_reserved = state->runner_reserved;
+    facts.has_execution = prepared != nullptr;
+    if (prepared != nullptr) {
+        facts.runtime_matches = prepared->runtime == &state->runtime;
+        facts.identity_matches = prepared->identity == state->identity();
+        facts.slot_matches = prepared->pipeline_slot == state->descriptor.pipeline_slot;
+    }
+    if (!simpler::dfx::prepared_handle_is_owned(facts, required_phase)) return nullptr;
+    return prepared;
+}
+
+int supports_joined_diagnostic_launch_ctx(DeviceContextHandle ctx, RuntimeHandle successor, RuntimeHandle predecessor) {
+    if (ctx == nullptr || successor == nullptr || predecessor == nullptr) return 0;
+    if (successor == predecessor) return 0;
+    if (joined_diagnostic_launch_supported_impl() == 0) return 0;
+    static constexpr const char *kOperation = "supports_joined_diagnostic_launch";
+    const DeviceRunnerBase::PreparedExecution *succ =
+        owned_prepared_execution(ctx, successor, NativeRunPhase::Prepared, kOperation);
+    if (succ == nullptr) return 0;
+    const DeviceRunnerBase::PreparedExecution *pred =
+        owned_prepared_execution(ctx, predecessor, NativeRunPhase::Running, kOperation);
+    if (pred == nullptr) return 0;
+    // Two runs in one pipeline slot are refused by the pair decision below,
+    // which is the one place that term is stated.
+    return static_cast<DeviceRunnerBase *>(ctx)->can_join_diagnostic_run(*succ, *pred) ? 1 : 0;
 }
 
 int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor) {

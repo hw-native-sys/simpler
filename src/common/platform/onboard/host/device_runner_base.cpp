@@ -49,6 +49,7 @@
 #include "host/arena_replacement_transaction.h"
 #include "kernel_platform_ops.h"
 #include "host/host_phase_records_artifact.h"
+#include "host/joined_diagnostic_eligibility.h"
 #include "host/raii_scope_guard.h"
 #include "host/run_boundary.h"
 #include "host_log.h"
@@ -3696,7 +3697,43 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(
     return 0;
 }
 
-int DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) {
+bool DeviceRunnerBase::can_join_diagnostic_run(const PreparedExecution &succ, const PreparedExecution &pred) const {
+    // Configuration first, as one verdict: execution mode, agreeing admitted
+    // levels, no other diagnostic channel, and two distinct pipeline slots.
+    // Deciding it there keeps the resource reads below off a pair its levels
+    // have already disqualified -- `can_admit_retained_run()` takes the
+    // collector's lock, and this runs once per launch attempt.
+    auto facts = [](const PreparedExecution &run) {
+        return simpler::dfx::JoinedDiagnosticRun{
+            run.dfx.chip_swimlane_level,
+            run.dfx.dump_args_enabled() || run.dfx.pmu_enabled || run.dfx.dep_gen_enabled ||
+                run.dfx.scope_stats_enabled,
+            run.pipeline_slot
+        };
+    };
+    if (simpler::dfx::classify_joined_diagnostic_pair(execution_mode_latch_.is_kernel(), facts(succ), facts(pred)) !=
+        simpler::dfx::JoinedDiagnosticVerdict::kConfigurationAgrees) {
+        return false;
+    }
+
+    // The shape this successor would arm with. A mismatch means arming would
+    // rebuild the collectors, which releases pools a predecessor is still
+    // producing into — so it is a decline here rather than a rebuild there.
+    if (succ.runtime == nullptr) return false;
+    if (collector_shape_is_stale(succ.num_aicore, succ.runtime->get_aicpu_thread_num(), succ.launch_aicpu_num)) {
+        return false;
+    }
+
+    // Retention configured, ready, not fatal, and a bucket actually free —
+    // read as one answer, because a free bucket on a collector that is not
+    // ready proves nothing and a fatal collector refuses admission whatever
+    // its capacity.
+    return chip_swimlane_collector_.can_admit_retained_run();
+}
+
+int DeviceRunnerBase::start_shared_collectors_for_run(
+    const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata
+) {
     // Open each enabled collector's window and start its mgmt + poll threads
     // now, just before kernels launch. Both halves belong here: begin_run()
     // drops the previous run's records and republishes the device level, which
@@ -3720,7 +3757,10 @@ int DeviceRunnerBase::start_shared_collectors_for_run(const DfxRunConfig &dfx, u
             // they are already running, so this is what puts the first run on
             // the same path as the rest.
             chip_swimlane_collector_.start(thread_factory);
-            if (!chip_swimlane_collector_.run_begin(run_epoch, dfx.output_prefix, dfx.chip_swimlane_level)) {
+            if (!chip_swimlane_collector_.run_begin(
+                    run_epoch, dfx.output_prefix, dfx.chip_swimlane_level, run_metadata.core_types,
+                    run_metadata.core_type_count, run_metadata.host_orchestrated
+                )) {
                 LOG_ERROR(
                     "ChipSwimlane: run %llu was not admitted for retained collection",
                     static_cast<unsigned long long>(run_epoch)
@@ -3872,7 +3912,12 @@ int DeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
     std::string dep_gen_error;
     std::string host_graph_error;
     bool ok = true;
-    if (chip_swimlane_collector_.retains_runs() &&
+    // Gated on whether this collector has ever retained, not on whether it
+    // retains now: the same reason PMU's arm below is ungated. A failure
+    // recorded under retention has to survive the rebuild or reconfiguration
+    // that turned retention off, and a collector that never retained has
+    // nothing here that its own runs did not already report.
+    if (chip_swimlane_collector_.ever_retained() &&
         !chip_swimlane_collector_.flush_retained_runs(remaining_ms(), &swimlane_error)) {
         ok = false;
     }

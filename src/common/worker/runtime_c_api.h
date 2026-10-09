@@ -37,6 +37,7 @@
  *   - pipeline:     get_pipeline_contract,
  *                   supports_concurrent_native_prepare_ctx,
  *                   supports_joined_native_launch_ctx,
+ *                   supports_joined_diagnostic_launch_ctx,
  *                   get_arena_bank_gm_heap_base_ctx,
  *                   get_retained_temp_addr_ctx
  *   - ACL/stream:   ensure_acl_ready_ctx, create_comm_stream_ctx,
@@ -869,6 +870,29 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  * zero launches ordinarily.
  */
 int supports_joined_native_launch_ctx(DeviceContextHandle ctx);
+
+/**
+ * Return nonzero when `successor` may be ordered behind `predecessor` while
+ * both collect swimlane diagnostics.
+ *
+ * Separate from `supports_joined_native_launch_ctx` on purpose. That answer is
+ * about the context's ability to order two runs at all and is shared by every
+ * runtime that can; this one additionally requires the one runtime whose
+ * diagnostics collector can hold two runs open, the same effective swimlane
+ * level on both sides, no other diagnostic channel, a collector that is
+ * retaining and ready and not fatal, and a free retained bucket. Folding the
+ * two would make ordinary non-diagnostic early enqueue depend on swimlane
+ * capacity.
+ *
+ * Read-only and allocation-free: it arms nothing, reserves nothing and takes no
+ * device action. A nonzero answer is therefore not a reservation — admission
+ * rechecks capacity and fatality under its own lock — and a zero answer is an
+ * ordinary decline the caller absorbs by launching at the front later.
+ *
+ * Both handles must name live prepared storage owned by this context, as for
+ * the other native-run entry points.
+ */
+int supports_joined_diagnostic_launch_ctx(DeviceContextHandle ctx, RuntimeHandle successor, RuntimeHandle predecessor);
 
 /**
  * Launch a prepared run ordered behind `predecessor`, which must be a run

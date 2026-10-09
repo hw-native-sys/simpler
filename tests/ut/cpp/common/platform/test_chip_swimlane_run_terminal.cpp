@@ -70,9 +70,13 @@ void arm_run(
 // The point of the whole mechanism: the successor's counter reset does not take
 // the previous run's totals with it.
 //
-// The reset is the production one — `begin_run` calls `publish_run_config` — and
-// the assertions bracket it, so a regression that re-clears the bank, or one that
-// stops clearing the live counters, both show up here.
+// The reset is the production one, and it is the *producer's*: a run's record
+// counters are cleared by `chip_swimlane_aicpu_init` on the device, before that
+// run's producer threads are released. The host's `begin_run` no longer clears
+// them, because a host write at that point would land while a predecessor is
+// still recording. The assertions bracket the device reset, so a regression
+// that re-clears the bank, or one that stops clearing the live counters, both
+// show up here.
 TEST(ChipSwimlaneRunTerminalTest, SnapshotSurvivesTheSuccessorsCounterReset) {
     ChipSwimlaneCollector collector;
     ASSERT_EQ(init_collector(collector, /*num_aicore=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING), 0);
@@ -99,10 +103,18 @@ TEST(ChipSwimlaneRunTerminalTest, SnapshotSurvivesTheSuccessorsCounterReset) {
     EXPECT_EQ(before.aicpu_task.total, 3u);
     EXPECT_EQ(before.aicpu_task.dropped, 0u);
 
-    // The successor's window opens, which is what clears the live counters.
+    // The successor's window opens, and then its producer initializes — which is
+    // what clears the live counters. The host half is kept in the sequence so
+    // this still brackets the production order, but the clear is asserted after
+    // the device half, where it now happens.
     collector.begin_run("successor", ChipSwimlaneLevel::SCHEDULE_TIMING);
+    ASSERT_EQ(get_perf_buffer_state(shm, 0)->head.total_record_count, 3u)
+        << "the host's arming cleared a predecessor's counters — that write is the race this moved to the device";
+
+    set_platform_run_result(/*region_base=*/0, kEpoch + 1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1);
     ASSERT_EQ(get_perf_buffer_state(shm, 0)->head.total_record_count, 0u)
-        << "publish_run_config no longer clears the live counters — this test's premise is gone";
+        << "the producer's init no longer clears the live counters — this test's premise is gone";
 
     ChipSwimlaneCollector::RunTerminalSnapshot after = collector.read_run_terminal_snapshot(/*bank_index=*/0, kEpoch);
     ASSERT_TRUE(after.valid) << "the successor's reset destroyed the retained snapshot";
