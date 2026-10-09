@@ -37,14 +37,18 @@ jobs:
       # compiles with --manual exclude and never builds these kernels, while
       # this job compiles only the two DS directories. Sharing the main key
       # would let this partial compilation win the immutable-cache save race
-      # and starve the main sweep's cache.
+      # and starve the main sweep's cache. An exact full-sweep key is still a
+      # safe read-only fallback: Daily creates it on the default branch, which
+      # lets otherwise unrelated PRs reuse the same unchanged DS kernels.
       - name: Restore scene-test kernel cache (a2a3)
-        uses: actions/cache@v5
+        id: deepseek-kernel-cache
+        uses: actions/cache/restore@v5
         with:
           path: build/cache/kernels
-          key: scene-kernels-a2a3-ds-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-${{ inputs.ref || github.sha }}
+          key: scene-kernels-a2a3-ds-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-cases-v1-${{ hashFiles('examples/a2a3/host_build_graph/deepseek_v4_flash_decode/**', 'examples/a2a3/tensormap_and_ringbuffer/deepseek_v4_flash_decode/**') }}
           restore-keys: |
             scene-kernels-a2a3-ds-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-
+            scene-kernels-a2a3-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pto_isa.pin') }}-cases-v1-${{ hashFiles('examples/**', 'tests/st/**') }}
 
       - name: Set up environment
         uses: ./.github/actions/setup-venv
@@ -71,6 +75,19 @@ jobs:
             .venv/bin/python "examples/a2a3/$runtime/deepseek_v4_flash_decode/main.py" \
               --platform a2a3 --compile-only --compile-workers 8
           done
+
+      # Persist a new private DS revision before device work. Do not copy a
+      # restored full-sweep archive into the DS key family: every PR can read
+      # that same default-branch cache directly.
+      - name: Save scene-test kernel cache (a2a3)
+        if: >-
+          steps.deepseek-kernel-cache.outputs.cache-hit != 'true' &&
+          (steps.deepseek-kernel-cache.outputs.cache-matched-key == '' ||
+           startsWith(steps.deepseek-kernel-cache.outputs.cache-matched-key, 'scene-kernels-a2a3-ds-'))
+        uses: actions/cache/save@v5
+        with:
+          path: build/cache/kernels
+          key: ${{ steps.deepseek-kernel-cache.outputs.cache-primary-key }}
 
       # The DS cases are the only manual tests under these two directories, so
       # --manual only selects exactly the two smoke tests. They stay manual:

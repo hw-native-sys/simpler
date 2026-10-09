@@ -375,6 +375,14 @@ unbuildable kernel costing the whole batch its results.
 `actions/checkout` cleans ignored files before each job, so the onboard jobs
 restore and save `build/cache/kernels/` through `actions/cache`. Cache keys are
 partitioned by target architecture, runner OS/architecture, and PTO-ISA pin.
+They fingerprint the scene-test case trees, so unchanged cases keep an exact
+key instead of creating one cache per CI run. A changed case restores the newest
+compatible snapshot and saves its new revision immediately after compilation,
+before a later device-test failure can discard the completed compile.
+The DeepSeek-only job first restores its small private cache. On a miss it can
+read the exact full a2a3 cache produced by Daily on the default branch, allowing
+unrelated PRs with unchanged cases to share the compiled kernels. That full
+archive is not copied back into each PR's DeepSeek cache family.
 The callable key covers the contents of its orchestration, incore, and
 transitively included sources, the compiler identities and effective fixed
 flags, a digest of the modules that decide artifact bytes
