@@ -142,9 +142,6 @@ struct RuntimeContext {
     // rt_orchestration_done. The device-side executor folds this into its
     // completed_tasks_ progress counter so shutdown/profiling totals stay closed.
     int64_t inline_completed_tasks;
-    // Graph definitions are process-local host cache entries. The callable
-    // identity prevents two orchestration DSOs from sharing the same key.
-    uint64_t active_callable_hash;
 
     // Explicit HOST/NONE views registered for this orchestration call. Null on the AICPU path, which loads device
     // addresses directly; get_tensor_data / set_tensor_data then fail closed rather than dereferencing one. Lives past

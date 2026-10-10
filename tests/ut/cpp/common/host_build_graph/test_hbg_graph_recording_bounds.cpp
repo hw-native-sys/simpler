@@ -101,7 +101,7 @@ TEST_F(HbgGraphRecordingBoundsTest, RecordedTaskIsKeyedByItsIndexNotByTheRunsNum
 
     GraphTaskArgs boundary_args;
     boundary_args.add_input(boundary);
-    const GraphScopeResult graph = orch.graph_begin(0x6B0D5A1E, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x6B0D5A1E, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_NE(graph.recording_handle, nullptr);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
@@ -149,7 +149,7 @@ TEST_F(HbgGraphRecordingBoundsTest, PreGraphProducerOfABoundaryTensorContributes
 
     GraphTaskArgs boundary_args;
     boundary_args.add_input(boundary);
-    const GraphScopeResult graph = orch.graph_begin(0x6B0D5A1F, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x6B0D5A1F, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
     const simpler::hbg::Tensor &param = graph.params->tensor(0).ref();
@@ -187,7 +187,7 @@ TEST_F(HbgGraphRecordingBoundsTest, TwoViewsOfOneBufferShareAWindowAndKeepTheEdg
     GraphTaskArgs boundary_args;
     boundary_args.add_inout(written);
     boundary_args.add_input(read);
-    const GraphScopeResult graph = orch.graph_begin(0x6B0D5A20, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x6B0D5A20, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
 

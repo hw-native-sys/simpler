@@ -106,7 +106,7 @@ protected:
     simpler::hbg::Tensor begin_body(uint64_t key, GraphTaskArgs &boundary_args, const simpler::hbg::Tensor &boundary) {
         orch.begin_scope();
         boundary_args.add_input(boundary);
-        const GraphScopeResult graph = orch.graph_begin(key, boundary_args, 0);
+        const GraphScopeResult graph = orch.graph_begin(key, boundary_args);
         EXPECT_TRUE(graph.recording);
         EXPECT_NE(graph.recording_handle, nullptr);
         EXPECT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
@@ -174,7 +174,7 @@ protected:
     // Replays a recorded body by its key. The cache hit is what submits the
     // outer shell, which is where the shell's own verdict is decided.
     TaskId submit_shell(uint64_t key, GraphTaskArgs &boundary_args) {
-        const GraphScopeResult replay = orch.graph_begin(key, boundary_args, 0);
+        const GraphScopeResult replay = orch.graph_begin(key, boundary_args);
         EXPECT_FALSE(replay.recording) << "the body is already recorded, so this must be a cache hit";
         EXPECT_TRUE(replay.task_id.is_valid());
         return replay.task_id;

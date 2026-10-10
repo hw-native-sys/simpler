@@ -251,7 +251,6 @@ RuntimeContext *runtime_init_data_from_layout(
     // rt->ops is filled by the AICPU at boot.
     rt->mode = mode;
     rt->total_cycles = 0;
-    rt->active_callable_hash = 0;
 
     // Two components are deliberately not initialized here.
     //

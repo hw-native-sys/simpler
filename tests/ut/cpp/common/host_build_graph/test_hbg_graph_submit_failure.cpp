@@ -102,10 +102,10 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphInvocationsReserveHeapOnlyAtCommi
     boundary_args.add_input(boundary);
 
     orch.begin_scope();
-    const GraphScopeResult first = orch.graph_begin(0x1715, boundary_args, 0x1736);
+    const GraphScopeResult first = orch.graph_begin(0x1715, boundary_args);
     ASSERT_TRUE(first.recording);
     ASSERT_TRUE(first.task_id.is_valid());
-    const GraphScopeResult second = orch.graph_begin(0x1715, boundary_args, 0x1736);
+    const GraphScopeResult second = orch.graph_begin(0x1715, boundary_args);
     EXPECT_FALSE(second.recording);
     EXPECT_FALSE(second.execute_block);
     ASSERT_TRUE(second.task_id.is_valid());
@@ -133,8 +133,8 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphInvocationsReserveHeapOnlyAtCommi
     const std::optional<GraphHostUpload> second_upload = graph_host_upload(*graph_state, 1);
     ASSERT_TRUE(first_upload.has_value());
     ASSERT_TRUE(second_upload.has_value());
-    EXPECT_NE(first_upload->full_key, 0u);
-    EXPECT_EQ(second_upload->full_key, first_upload->full_key) << "both shells replay one Graph";
+    EXPECT_EQ(first_upload->graph_key, 0x1715u);
+    EXPECT_EQ(second_upload->graph_key, first_upload->graph_key) << "both shells replay one Graph";
     // Distinct bases alone would still pass if finalization handed out a wrong
     // extent, so pin the length the Definition asks for and the disjointness two
     // shells of one Graph must have.
@@ -144,7 +144,7 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphInvocationsReserveHeapOnlyAtCommi
     const auto *second_end = static_cast<const char *>(second_upload->outer_slot->to_descriptor().packed_buffer_end);
     const GraphHostDefinitionList definitions = graph_host_definitions(*graph_state);
     ASSERT_EQ(definitions.entries.size(), 1u);
-    ASSERT_EQ(definitions.entries[0].full_key, first_upload->full_key);
+    ASSERT_EQ(definitions.entries[0].graph_key, first_upload->graph_key);
     const GraphDefinition *definition = definition_image(definitions.entries[0]);
     const uint64_t expected_extent =
         CHIP_ALIGN_UP(definition->required_heap + definition->execution_storage_bytes, CHIP_ALIGN_SIZE);
@@ -178,7 +178,7 @@ TEST_F(HbgGraphSubmitFailureTest, WorkerRecordsWhileMainThreadSubmitsSameHashShe
     boundary_args.add_input(boundary);
 
     orch.begin_scope();
-    const GraphScopeResult first = orch.graph_begin(0x171a, boundary_args, 0x1736);
+    const GraphScopeResult first = orch.graph_begin(0x171a, boundary_args);
     ASSERT_TRUE(first.recording);
     ASSERT_TRUE(first.task_id.is_valid());
 
@@ -227,8 +227,8 @@ TEST_F(HbgGraphSubmitFailureTest, WorkerRecordsWhileMainThreadSubmitsSameHashShe
 
     // The worker is now inside the recording. These two go through the in-flight
     // branch, which reads the boundary signature under recording_mutex.
-    const GraphScopeResult second = orch.graph_begin(0x171a, boundary_args, 0x1736);
-    const GraphScopeResult third = orch.graph_begin(0x171a, boundary_args, 0x1736);
+    const GraphScopeResult second = orch.graph_begin(0x171a, boundary_args);
+    const GraphScopeResult third = orch.graph_begin(0x171a, boundary_args);
     {
         std::lock_guard<std::mutex> lock(gate_mutex);
         main_done_submitting = true;
@@ -262,7 +262,7 @@ TEST_F(HbgGraphSubmitFailureTest, WorkerRecordsWhileMainThreadSubmitsSameHashShe
     for (size_t i = 0; i < 3; ++i) {
         const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, i);
         ASSERT_TRUE(upload.has_value());
-        EXPECT_EQ(upload->full_key, definition->full_key) << "shell " << i;
+        EXPECT_EQ(upload->graph_key, definition->graph_key) << "shell " << i;
         const auto *base = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_base);
         const auto *end = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_end);
         EXPECT_EQ(static_cast<uint64_t>(end - base), expected_extent) << "shell " << i;
@@ -290,7 +290,7 @@ TEST_F(HbgGraphSubmitFailureTest, AbortedRecordingLatchesFatalAtCommit) {
     boundary_args.add_input(boundary);
 
     orch.begin_scope();
-    const GraphScopeResult graph = orch.graph_begin(0x1717, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x1717, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(graph.task_id.is_valid());
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
@@ -331,8 +331,8 @@ TEST_F(HbgGraphSubmitFailureTest, AFatalDuringRecordingRetiresTheEntryAndFreesTh
     orch.begin_scope();
     // Two keys, so the worker has a second recording to prove its thread_locals came
     // back. Both open before any fatal is latched.
-    const GraphScopeResult first = orch.graph_begin(0x1720, boundary_args, 0x1736);
-    const GraphScopeResult second = orch.graph_begin(0x1721, boundary_args, 0x1736);
+    const GraphScopeResult first = orch.graph_begin(0x1720, boundary_args);
+    const GraphScopeResult second = orch.graph_begin(0x1721, boundary_args);
     ASSERT_TRUE(first.recording);
     ASSERT_TRUE(second.recording);
 
@@ -398,7 +398,7 @@ TEST_F(HbgGraphSubmitFailureTest, AutoScopeNestedInManualScopeRefusesTheRecordin
     boundary_args.add_input(boundary);
 
     orch.begin_scope();
-    const GraphScopeResult graph = orch.graph_begin(0x171d, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x171d, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
 
@@ -431,7 +431,7 @@ TEST_F(HbgGraphSubmitFailureTest, RuntimeAllocationInsideTheBodyRecordsAKernelle
     boundary_args.add_input(boundary);
 
     orch.begin_scope();
-    const GraphScopeResult graph = orch.graph_begin(0x1718, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x1718, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
 
@@ -472,7 +472,7 @@ TEST_F(HbgGraphSubmitFailureTest, ABoundaryPresentingOneAddressAtTwoSizesTakesTh
     GraphTaskArgs boundary_args;
     boundary_args.add_input(wide);
     boundary_args.add_inout(narrow);
-    const GraphScopeResult graph = orch.graph_begin(0x1723, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x1723, boundary_args);
 
     EXPECT_FALSE(graph.recording) << "an unrepresentable boundary opens no recording";
     EXPECT_TRUE(graph.execute_block) << "the caller runs the body itself instead";
@@ -500,7 +500,7 @@ TEST_F(HbgGraphSubmitFailureTest, ATensorThatSkippedTheBoundaryIsRefused) {
     orch.begin_scope();
     GraphTaskArgs boundary_args;
     boundary_args.add_input(boundary);
-    const GraphScopeResult graph = orch.graph_begin(0x1722, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x1722, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
 
@@ -542,7 +542,7 @@ TEST_F(HbgGraphSubmitFailureTest, ASlidingBoundaryOriginKeepsReusingItsDefinitio
     orch.begin_scope();
     GraphTaskArgs boundary_args;
     boundary_args.add_input(recorded_slice);
-    const GraphScopeResult graph = orch.graph_begin(0x1724, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x1724, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
 
@@ -553,7 +553,7 @@ TEST_F(HbgGraphSubmitFailureTest, ASlidingBoundaryOriginKeepsReusingItsDefinitio
 
     GraphTaskArgs slid_args;
     slid_args.add_input(slid_slice);
-    const GraphScopeResult replay = orch.graph_begin(0x1724, slid_args, 0x1736);
+    const GraphScopeResult replay = orch.graph_begin(0x1724, slid_args);
 
     EXPECT_FALSE(replay.execute_block) << "a slid origin is inside the boundary contract";
     ASSERT_TRUE(replay.task_id.is_valid());
@@ -595,7 +595,7 @@ TEST_F(HbgGraphSubmitFailureTest, PartitionMembersSlidingAgainstEachOtherDoNotRe
     GraphTaskArgs boundary_args;
     boundary_args.add_inout(recorded_first);
     boundary_args.add_input(recorded_second);
-    const GraphScopeResult graph = orch.graph_begin(0x1725, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x1725, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
 
@@ -613,7 +613,7 @@ TEST_F(HbgGraphSubmitFailureTest, PartitionMembersSlidingAgainstEachOtherDoNotRe
     GraphTaskArgs uniform_args;
     uniform_args.add_inout(uniform_first);
     uniform_args.add_input(uniform_second);
-    const GraphScopeResult uniform = orch.graph_begin(0x1725, uniform_args, 0x1736);
+    const GraphScopeResult uniform = orch.graph_begin(0x1725, uniform_args);
     EXPECT_FALSE(uniform.execute_block) << "a uniform slide of the whole partition is reusable";
     EXPECT_TRUE(uniform.task_id.is_valid());
 
@@ -623,7 +623,7 @@ TEST_F(HbgGraphSubmitFailureTest, PartitionMembersSlidingAgainstEachOtherDoNotRe
     GraphTaskArgs differential_args;
     differential_args.add_inout(differential_first);
     differential_args.add_input(differential_second);
-    EXPECT_THROW(orch.graph_begin(0x1725, differential_args, 0x1736), AssertionError)
+    EXPECT_THROW(orch.graph_begin(0x1725, differential_args), AssertionError)
         << "a differential slide changes the overlap geometry the Definition baked in";
     EXPECT_EQ(graph_host_upload_count(*graph_state), uploads_after_recording + 1)
         << "only the uniform slide got a shell; the refused one submitted nothing";
@@ -638,7 +638,7 @@ TEST_F(HbgGraphSubmitFailureTest, FaninFailureLatchesFatalWithoutPartialUpload) 
     orch.begin_scope();
     GraphTaskArgs boundary_args;
     boundary_args.add_input(boundary);
-    const GraphScopeResult graph = orch.graph_begin(0x1715, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x1715, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
 
@@ -662,7 +662,7 @@ TEST_F(HbgGraphSubmitFailureTest, FaninFailureLatchesFatalWithoutPartialUpload) 
         ASSERT_TRUE(orch.submit_dummy_task(producer_args).task_id().is_valid());
     }
 
-    const GraphScopeResult replay = orch.graph_begin(0x1715, boundary_args, 0x1736);
+    const GraphScopeResult replay = orch.graph_begin(0x1715, boundary_args);
 
     EXPECT_TRUE(replay.execute_block);
     EXPECT_FALSE(replay.recording);
@@ -680,7 +680,7 @@ TEST_F(HbgGraphSubmitFailureTest, CachedGraphUsesFinalTaskWindowSlot) {
     orch.begin_scope();
     GraphTaskArgs boundary_args;
     boundary_args.add_input(boundary);
-    const GraphScopeResult graph = orch.graph_begin(0x1716, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x1716, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
 
@@ -695,7 +695,7 @@ TEST_F(HbgGraphSubmitFailureTest, CachedGraphUsesFinalTaskWindowSlot) {
         ASSERT_FALSE(allocator.alloc(0).failed());
     }
 
-    const GraphScopeResult replay = orch.graph_begin(0x1716, boundary_args, 0x1736);
+    const GraphScopeResult replay = orch.graph_begin(0x1716, boundary_args);
 
     EXPECT_FALSE(replay.execute_block);
     ASSERT_TRUE(replay.task_id.is_valid());
@@ -729,7 +729,7 @@ protected:
         boundary_args.add_input(boundary);
 
         orch.begin_scope();
-        const GraphScopeResult graph = orch.graph_begin(graph_key, boundary_args, 0x1736);
+        const GraphScopeResult graph = orch.graph_begin(graph_key, boundary_args);
         EXPECT_TRUE(graph.recording);
         EXPECT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
         const simpler::hbg::Tensor &param = graph.params->tensor(0).ref();
@@ -793,7 +793,7 @@ TEST_F(HbgGraphPredicateRejectionTest, PredicateOnAKernellessSubTaskIsNotRecorde
     boundary_args.add_input(boundary);
 
     orch.begin_scope();
-    const GraphScopeResult graph = orch.graph_begin(0x2003, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x2003, boundary_args);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
     const simpler::hbg::Tensor &param = graph.params->tensor(0).ref();
@@ -828,11 +828,11 @@ TEST_F(HbgGraphSubmitFailureTest, ASecondKeyRecordsAlongsideTheFirst) {
     args_b.add_input(boundary_b);
 
     orch.begin_scope();
-    const GraphScopeResult first = orch.graph_begin(0x1901, args_a, 0x1736);
+    const GraphScopeResult first = orch.graph_begin(0x1901, args_a);
     ASSERT_TRUE(first.recording);
     ASSERT_NE(first.recording_handle, nullptr);
 
-    const GraphScopeResult second = orch.graph_begin(0x1902, args_b, 0x1736);
+    const GraphScopeResult second = orch.graph_begin(0x1902, args_b);
     EXPECT_TRUE(second.recording) << "a distinct key must not be demoted by a busy recorder";
     EXPECT_FALSE(second.execute_block);
     ASSERT_NE(second.recording_handle, nullptr);
@@ -861,10 +861,10 @@ TEST_F(HbgGraphSubmitFailureTest, ASecondKeyRecordsAlongsideTheFirst) {
     orch.graph_commit();
     EXPECT_FALSE(orch.is_fatal());
 
-    const GraphScopeResult replay_a = orch.graph_begin(0x1901, args_a, 0x1736);
+    const GraphScopeResult replay_a = orch.graph_begin(0x1901, args_a);
     EXPECT_FALSE(replay_a.execute_block) << "the first key's Definition must be cached";
     EXPECT_FALSE(replay_a.recording);
-    const GraphScopeResult replay_b = orch.graph_begin(0x1902, args_b, 0x1736);
+    const GraphScopeResult replay_b = orch.graph_begin(0x1902, args_b);
     EXPECT_FALSE(replay_b.execute_block) << "the second key's Definition must be cached";
     EXPECT_FALSE(replay_b.recording);
 }
@@ -875,7 +875,8 @@ TEST_F(HbgGraphSubmitFailureTest, ASecondKeyRecordsAlongsideTheFirst) {
 // finish these four recordings in reverse and require commit to preserve the
 // original shell order.
 TEST_F(HbgGraphSubmitFailureTest, ConcurrentDefinitionsFinalizeInSubmissionOrder) {
-    constexpr size_t kGraphCount = 4;
+    constexpr std::array<uint64_t, 4> graph_keys{0, UINT64_MAX, 0x1912, 0x1913};
+    constexpr size_t kGraphCount = graph_keys.size();
     std::array<uint32_t, 16> storage{};
     uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
     simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
@@ -886,7 +887,7 @@ TEST_F(HbgGraphSubmitFailureTest, ConcurrentDefinitionsFinalizeInSubmissionOrder
     orch.begin_scope();
     std::array<GraphScopeResult, kGraphCount> graphs;
     for (size_t i = 0; i < kGraphCount; ++i) {
-        graphs[i] = orch.graph_begin(0x1910 + i, args, 0x1736);
+        graphs[i] = orch.graph_begin(graph_keys[i], args);
         ASSERT_TRUE(graphs[i].recording) << "Graph " << i;
         ASSERT_TRUE(graphs[i].task_id.is_valid()) << "Graph " << i;
     }
@@ -908,7 +909,7 @@ TEST_F(HbgGraphSubmitFailureTest, ConcurrentDefinitionsFinalizeInSubmissionOrder
     for (size_t i = 0; i < kGraphCount; ++i) {
         const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, i);
         ASSERT_TRUE(upload.has_value()) << "Graph " << i;
-        EXPECT_NE(upload->full_key, 0u) << "Graph " << i;
+        EXPECT_EQ(upload->graph_key, graph_keys[i]) << "Graph " << i;
         const auto *base = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_base);
         const auto *end = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_end);
         ASSERT_NE(base, nullptr) << "Graph " << i;
@@ -936,7 +937,7 @@ TEST_F(HbgGraphSubmitFailureTest, ACachedGraphReplaysWhileAnotherKeyRecords) {
     TensorCreateInfo recorded_output(shape, 1, DataType::UINT32);
 
     orch.begin_scope();
-    const GraphScopeResult first = orch.graph_begin(0x1903, args_a, 0x1736);
+    const GraphScopeResult first = orch.graph_begin(0x1903, args_a);
     ASSERT_TRUE(first.recording);
     ASSERT_TRUE(orch.graph_prepare(first.recording_handle, args_a));
     CoreTaskArgs task_a;
@@ -948,10 +949,10 @@ TEST_F(HbgGraphSubmitFailureTest, ACachedGraphReplaysWhileAnotherKeyRecords) {
     ASSERT_FALSE(orch.is_fatal());
 
     // Key B is now recording and stays that way for the rest of the test.
-    const GraphScopeResult second = orch.graph_begin(0x1904, args_b, 0x1736);
+    const GraphScopeResult second = orch.graph_begin(0x1904, args_b);
     ASSERT_TRUE(second.recording);
 
-    const GraphScopeResult replay = orch.graph_begin(0x1903, args_a, 0x1736);
+    const GraphScopeResult replay = orch.graph_begin(0x1903, args_a);
     EXPECT_FALSE(replay.execute_block) << "a cache hit must not wait for an unrelated recording";
     EXPECT_FALSE(replay.recording);
     ASSERT_TRUE(replay.task_id.is_valid());
@@ -983,7 +984,7 @@ TEST_F(HbgGraphSubmitFailureTest, AnOrdinaryAllocationInterleavesWithADeferredSh
     TensorCreateInfo recorded_output(shape, 1, DataType::UINT32);
 
     orch.begin_scope();
-    const GraphScopeResult graph = orch.graph_begin(0x1905, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x1905, boundary_args);
     ASSERT_TRUE(graph.recording);
     EXPECT_EQ(orch.task_allocator.heap_top(), 0u) << "the shell defers its heap";
 
@@ -1033,10 +1034,10 @@ TEST_F(HbgGraphSubmitFailureTest, AnOrdinaryAllocationInterleavesWithADeferredSh
 // dropped, because replay takes the buffer from the invocation's own argument. So
 // the same body over a heap-resident boundary must record that tensor exactly as
 // one over a caller-owned boundary of the same shape. That is what is compared
-// here; comparing whole images would also fold in full_key, which differs between
+// here; comparing whole images would also fold in graph_key, which differs between
 // two recordings under different graph_keys whatever their boundaries are.
 struct BoundaryRecording {
-    uint64_t full_key;
+    uint64_t graph_key;
     simpler::hbg::TensorData recorded;
 };
 
@@ -1054,7 +1055,7 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
         GraphTaskArgs boundary_args;
         boundary_args.add_input(boundary);
 
-        const GraphScopeResult graph = orch.graph_begin(graph_key, boundary_args, 0x1736);
+        const GraphScopeResult graph = orch.graph_begin(graph_key, boundary_args);
         EXPECT_TRUE(graph.recording);
         EXPECT_TRUE(graph.task_id.is_valid());
         EXPECT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
@@ -1069,7 +1070,7 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
         EXPECT_FALSE(orch.is_fatal());
 
         // Each call uses its own graph_key, so it publishes exactly one Definition
-        // and appends exactly one upload. That upload names this call's full_key
+        // and appends exactly one upload. That upload names this call's graph_key
         // (graph_key combined with the callable hash), which is how the Definition
         // is selected: graph_host_definitions walks an unordered_map, so the order
         // of `entries` says nothing about which call published which.
@@ -1091,13 +1092,13 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
         }
         const GraphHostDefinition *published = nullptr;
         for (const GraphHostDefinition &entry : definitions.entries) {
-            if (entry.full_key == upload->full_key) {
+            if (entry.graph_key == upload->graph_key) {
                 published = &entry;
                 break;
             }
         }
         if (published == nullptr) {
-            ADD_FAILURE() << "graph_key " << graph_key << " published no Definition under its own full_key";
+            ADD_FAILURE() << "graph_key " << graph_key << " published no Definition under its own graph_key";
             return std::nullopt;
         }
         const GraphDefinition *def = definition_image(*published);
@@ -1116,7 +1117,7 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
             ADD_FAILURE() << "graph_key " << graph_key << " did not record its first tensor arg as a parameter";
             return std::nullopt;
         }
-        return BoundaryRecording{def->full_key, tensors[0]};
+        return BoundaryRecording{def->graph_key, tensors[0]};
     };
 
     orch.begin_scope();
@@ -1127,7 +1128,7 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
 
     // Two distinct Definitions, so the comparison below is between two recordings
     // rather than one Definition against itself.
-    EXPECT_NE(heap_recording->full_key, caller_recording->full_key);
+    EXPECT_NE(heap_recording->graph_key, caller_recording->graph_key);
     // Field-wise rather than byte-wise: a Tensor writes only the shape and stride slots its
     // ndims covers, so the trailing ones hold whatever the view before it left there.
     const simpler::hbg::TensorData &from_heap = heap_recording->recorded;

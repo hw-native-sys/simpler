@@ -148,7 +148,7 @@ inline constexpr size_t GRAPH_DEFINITION_OBJECT_ALIGN = alignof(std::max_align_t
 // of the object alignment.
 struct alignas(GRAPH_DEFINITION_OBJECT_ALIGN) GraphDefinitionHeader {
     uint64_t magic;
-    uint64_t full_key;
+    uint64_t graph_key;
     uint32_t definition_bytes;
 };
 
@@ -157,7 +157,7 @@ static_assert(std::is_standard_layout_v<GraphDefinitionHeader>);
 static_assert(sizeof(GraphDefinitionHeader) % GRAPH_DEFINITION_OBJECT_ALIGN == 0);
 
 struct GraphDefinition {
-    uint64_t full_key;
+    uint64_t graph_key;
     uint64_t required_heap;
     // The header splits by range, not by name. Everything that counts *things* is
     // signed: each is capped by SUB_TASK_MAX_NUM times a per-task constant, so the

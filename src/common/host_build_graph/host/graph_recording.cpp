@@ -207,12 +207,6 @@ bool graph_boundary_relocate_params(GraphBoundary &boundary) {
     return true;
 }
 
-uint64_t graph_full_key(uint64_t callable_hash, uint64_t graph_key) {
-    uint64_t h = 1469598103934665603ULL;
-    h = graph_hash_bytes(h, &callable_hash, sizeof(callable_hash));
-    return graph_hash_bytes(h, &graph_key, sizeof(graph_key));
-}
-
 // The recorder thread's own storage for the body it is recording, and the reason none
 // of this is allocated per recording.
 //
@@ -366,7 +360,7 @@ std::optional<GraphDefinition> graph_layout_definition(const GraphRecording &rec
     if (predicate_count > UINT16_MAX) return std::nullopt;
 
     GraphDefinition definition{};
-    definition.full_key = recording.full_key;
+    definition.graph_key = recording.graph_key;
     definition.task_count = recording.task_count;
     definition.edge_count = total_fanins;
     definition.root_count = root_count;

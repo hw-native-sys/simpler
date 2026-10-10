@@ -539,12 +539,12 @@ bool bind_graph_definitions(
     for (const GraphHostDefinition &entry : definitions.entries) {
         if (entry.bytes < sizeof(GraphDefinition)) continue;
         if (entry.spill == nullptr) {
-            packed.emplace(entry.full_key, PackedDefinition{entry.object_offset, entry.bytes, nullptr, {}, false});
+            packed.emplace(entry.graph_key, PackedDefinition{entry.object_offset, entry.bytes, nullptr, {}, false});
             continue;
         }
         const size_t object_offset = block_bytes;
         block_bytes += align_up(sizeof(GraphDefinitionHeader) + entry.bytes);
-        packed.emplace(entry.full_key, PackedDefinition{object_offset, entry.bytes, entry.spill, {}, false});
+        packed.emplace(entry.graph_key, PackedDefinition{object_offset, entry.bytes, entry.spill, {}, false});
         uploads->spilled++;
     }
 
@@ -577,7 +577,7 @@ bool bind_graph_definitions(
             const auto *definition = reinterpret_cast<const GraphDefinition *>(image);
             GraphDefinitionHeader framing{};
             framing.magic = GRAPH_DEFINITION_OBJECT_MAGIC;
-            framing.full_key = definition->full_key;
+            framing.graph_key = definition->graph_key;
             framing.definition_bytes = definition->total_bytes;
             std::memcpy(base, &framing, sizeof(framing));
             const size_t object_bytes = sizeof(GraphDefinitionHeader) + object.image_bytes;
@@ -619,7 +619,7 @@ bool bind_graph_definitions(
             LOG_ERROR("host-orch: invalid pending Graph task");
             return false;
         }
-        auto object_it = packed.find(upload->full_key);
+        auto object_it = packed.find(upload->graph_key);
         if (object_it == packed.end() || staging == nullptr) {
             LOG_ERROR("host-orch: Graph task has no matching prepared Definition object");
             return false;
@@ -634,7 +634,7 @@ bool bind_graph_definitions(
         }
         GraphExecutionStorageLayout storage_layout{};
         if (definition->task_count <= 0 || definition->task_count > SUB_TASK_MAX_NUM ||
-            definition->full_key != upload->full_key ||
+            definition->graph_key != upload->graph_key ||
             !graph_execution_storage_layout(
                 definition->task_count, definition->tensor_arg_count, definition->scalar_arg_count,
                 definition->edge_count, &storage_layout
@@ -799,7 +799,6 @@ int32_t run_host_orchestration(
         LOG_ERROR("host-orch: orch .so framework_bind_runtime was not resolved");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    rt->active_callable_hash = reinterpret_cast<uint64_t>(entry_points->entry);
     rt->tensor_access = &tensor_access;
     // Binds the orchestration .so's own framework_current_runtime, which its
     // inline rt_submit_* read. The host library links a same-named copy from

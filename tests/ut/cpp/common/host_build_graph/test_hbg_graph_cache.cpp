@@ -166,7 +166,7 @@ std::vector<std::byte> make_test_definition(
     };
 
     GraphDefinition definition{};
-    definition.full_key = graph_key;
+    definition.graph_key = graph_key;
     definition.required_heap = 128;
     definition.task_count = 2;
     definition.edge_count = 1;
@@ -213,7 +213,7 @@ public:
         header->magic = GRAPH_DEFINITION_OBJECT_MAGIC;
         header->definition_bytes =
             retained_definition_bytes == 0 ? static_cast<uint32_t>(definition.size()) : retained_definition_bytes;
-        header->full_key = def->full_key;
+        header->graph_key = def->graph_key;
         std::memcpy(
             static_cast<uint8_t *>(data_) + sizeof(GraphDefinitionHeader), definition.data(), definition.size()
         );
@@ -244,7 +244,7 @@ public:
     }
     // Frames the object around a Graph other than the one its image holds, which is
     // the shape a mis-packed shared block produces.
-    void reframe_full_key(uint64_t full_key) { static_cast<GraphDefinitionHeader *>(data_)->full_key = full_key; }
+    void reframe_graph_key(uint64_t graph_key) { static_cast<GraphDefinitionHeader *>(data_)->graph_key = graph_key; }
 
 private:
     void *data_{nullptr};
@@ -903,7 +903,7 @@ TEST(GraphDefinitionObject, RejectsHeaderFramingAnotherGraph) {
     ASSERT_NE(heap.initialize_execution(definition_object, reinterpret_cast<uint64_t>(boundary.data()), 17), nullptr)
         << "the object localizes while its header and image agree";
 
-    definition_object.reframe_full_key(GRAPH_KEY_VALUE + 1);
+    definition_object.reframe_graph_key(GRAPH_KEY_VALUE + 1);
     EXPECT_EQ(heap.initialize_execution(definition_object, reinterpret_cast<uint64_t>(boundary.data()), 17), nullptr);
 }
 
@@ -1208,7 +1208,7 @@ public:
         const auto *def = reinterpret_cast<const GraphDefinition *>(definition.data());
         header.magic = GRAPH_DEFINITION_OBJECT_MAGIC;
         header.definition_bytes = static_cast<uint32_t>(definition.size());
-        header.full_key = def->full_key;
+        header.graph_key = def->graph_key;
         std::memcpy(object, &header, sizeof(header));
         std::memcpy(object + sizeof(GraphDefinitionHeader), definition.data(), definition.size());
         section_ = bytes_.data() + misalign;
@@ -1255,7 +1255,7 @@ TEST(GraphImageSection, DecodesAtAnUnalignedBase) {
     GraphDefinitionValue from_misaligned{};
     ASSERT_TRUE(graph_definition_decode_framed(aligned.view(), aligned.image_offset(), &from_aligned));
     ASSERT_TRUE(graph_definition_decode_framed(misaligned.view(), misaligned.image_offset(), &from_misaligned));
-    EXPECT_EQ(from_misaligned.definition.full_key, from_aligned.definition.full_key);
+    EXPECT_EQ(from_misaligned.definition.graph_key, from_aligned.definition.graph_key);
     EXPECT_EQ(from_misaligned.definition.total_bytes, from_aligned.definition.total_bytes);
     EXPECT_EQ(from_misaligned.definition.task_count, from_aligned.definition.task_count);
     EXPECT_EQ(from_misaligned.definition.edge_count, from_aligned.definition.edge_count);
@@ -1311,11 +1311,11 @@ TEST(GraphImageSection, RefusesReadsOutsideTheObjectOrTheSection) {
     auto *header = reinterpret_cast<GraphDefinitionHeader *>(
         section.mutable_section() + section.image_offset() - sizeof(GraphDefinitionHeader)
     );
-    const uint64_t good_key = header->full_key;
-    header->full_key = good_key ^ 0xFFULL;
+    const uint64_t good_key = header->graph_key;
+    header->graph_key = good_key ^ 0xFFULL;
     GraphDefinitionValue reframed{};
     EXPECT_FALSE(graph_definition_decode_framed(section.view(), section.image_offset(), &reframed));
-    header->full_key = good_key;
+    header->graph_key = good_key;
     header->magic = 0;
     EXPECT_FALSE(graph_definition_decode_framed(section.view(), section.image_offset(), &reframed));
 }

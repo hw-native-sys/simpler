@@ -137,7 +137,7 @@ TEST_F(HbgSlotClaimTest, GraphOuterTaskClaimsAPoisonedSlot) {
     // recording, which the ordinary CoreTaskArgs cannot hold.
     GraphTaskArgs boundary_args;
     boundary_args.add_input(boundary);
-    const GraphScopeResult graph = orch.graph_begin(0x51ADC1A1, boundary_args, 0x1736);
+    const GraphScopeResult graph = orch.graph_begin(0x51ADC1A1, boundary_args);
     ASSERT_TRUE(graph.recording);
     // graph_begin publishes the outer shell and creates the recording, handing back the
     // handle graph_prepare binds to the thread that will submit the body. The recorder is
@@ -168,7 +168,7 @@ TEST_F(HbgSlotClaimTest, CachedGraphReplayClaimsAPoisonedSlot) {
     // recording, which the ordinary CoreTaskArgs cannot hold.
     GraphTaskArgs boundary_args;
     boundary_args.add_input(boundary);
-    const GraphScopeResult recorded = orch.graph_begin(0x51ADC1A2, boundary_args, 0x1736);
+    const GraphScopeResult recorded = orch.graph_begin(0x51ADC1A2, boundary_args);
     ASSERT_TRUE(recorded.recording);
     ASSERT_TRUE(orch.graph_prepare(recorded.recording_handle, boundary_args));
     CoreTaskArgs task_args;
@@ -177,7 +177,7 @@ TEST_F(HbgSlotClaimTest, CachedGraphReplayClaimsAPoisonedSlot) {
     ASSERT_TRUE(orch.graph_end());
 
     poison_slot(1);
-    const GraphScopeResult replay = orch.graph_begin(0x51ADC1A2, boundary_args, 0x1736);
+    const GraphScopeResult replay = orch.graph_begin(0x51ADC1A2, boundary_args);
     ASSERT_TRUE(replay.task_id.is_valid());
     ASSERT_EQ(replay.task_id.local_id(), 1);
 

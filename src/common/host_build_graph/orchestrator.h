@@ -171,14 +171,14 @@ struct OrchestratorState {
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);
     TaskOutputTensors alloc_tensors(const CoreTaskArgs &args);
-    GraphScopeResult graph_begin(uint64_t graph_key, const GraphTaskArgs &args, uint64_t callable_hash);
+    GraphScopeResult graph_begin(uint64_t graph_key, const GraphTaskArgs &args);
     bool graph_prepare(void *recording_handle, const GraphTaskArgs &args);
     void graph_abort(void *recording_handle);
     bool graph_end();
     void graph_commit();
     // Bodies of the two above. Both have several early returns, so the phase
     // record that measures them wraps the call instead of every exit.
-    GraphScopeResult graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &args, uint64_t callable_hash);
+    GraphScopeResult graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &args);
     void graph_commit_inner();
     void mark_done();
 };

@@ -50,7 +50,7 @@ using GraphSubmitResult = GraphScopeResult;
 constexpr uint64_t graph_hash_byte(uint64_t h, uint8_t b) { return (h ^ static_cast<uint64_t>(b)) * 1099511628211ULL; }
 
 // FNV-1a, mixing eight bytes per multiply instead of one. The only thing hashed
-// with it is a Graph's `full_key` — a callable hash, a graph id, a config-value
+// with it is a Graph's `graph_key` — a graph id, a config-value
 // count and the config values themselves, a few bytes per call.
 //
 // Streaming: callers chain several calls (see rt_graph_make_key below) and the word
@@ -80,12 +80,8 @@ constexpr uint64_t graph_const_hash_impl(const char *s, uint64_t h) {
 // Compile-time FNV-1a of a name, for the rt_submit_graph overload that takes an
 // explicit identity instead of deriving one from the Graph function's address.
 //
-// What the explicit form gives is a caller-chosen identity, not a stable one. The
-// cache looks a Graph up by graph_full_key(callable_hash, graph_key), and
-// callable_hash is the orchestration entry's own address, so no key outlives a
-// process -- and none needs to: a Definition cache lives inside one orchestration
-// run and is never persisted. What the caller gains is deciding what counts as the
-// same Graph: the overload drops the function pointer from the identity, so two
+// The Definition cache belongs to one orchestration run and uses graph_key directly.
+// The explicit form drops the Graph function pointer from that identity, so two
 // distinct Graph functions given one key share a single recorded Definition.
 //
 // That is the same sentence as its hazard, and the hazard is silent. Two functions

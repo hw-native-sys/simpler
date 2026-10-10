@@ -89,11 +89,10 @@ hazard is silent: an explicit `GRAPH_KEY` must be unique for every distinct Grap
 function in an orchestration callable, or one of them replays the other's
 recorded topology.
 
-What the explicit form does not give is a key that outlives the process. A Graph
-is looked up by `graph_full_key(callable_hash, graph_key)`, and `callable_hash`
-is the orchestration entry's own address, so no key is stable across runs — and
-none needs to be, since a Definition cache lives inside one orchestration run and
-is never persisted.
+The Definition cache belongs to one orchestration run and is never persisted.
+It uses `graph_key` directly for recording, reuse, upload matching, and Definition
+framing validation. Separate runs have independent caches, so orchestration
+callable identity is not part of the key.
 
 A caller that emits one C++ function per Graph wants
 `rt_submit_graph(function, args)` instead: the function's address is already the

@@ -100,7 +100,7 @@ protected:
     void record_graph(uint64_t graph_key, int task_count, const simpler::hbg::Tensor &boundary, const uint32_t *shape) {
         GraphTaskArgs boundary_args;
         boundary_args.add_input(boundary);
-        const GraphScopeResult scope = orch.graph_begin(graph_key, boundary_args, 0x1736);
+        const GraphScopeResult scope = orch.graph_begin(graph_key, boundary_args);
         ASSERT_TRUE(scope.recording);
         ASSERT_TRUE(scope.task_id.is_valid());
         ASSERT_TRUE(orch.graph_prepare(scope.recording_handle, boundary_args));
@@ -150,7 +150,7 @@ TEST_F(HbgGraphDefinitionArenaTest, ObjectsAreBuiltInTheArenaAtAlignedDisjointOf
         claimed_total += claimed;
         EXPECT_LE(entry.object_offset + claimed, used) << "the claimed prefix must cover every object in it";
         const GraphDefinition *image = definition_image(entry);
-        EXPECT_EQ(image->full_key, entry.full_key);
+        EXPECT_EQ(image->graph_key, entry.graph_key);
         EXPECT_EQ(image->total_bytes, entry.bytes);
         EXPECT_GT(image->task_count, 0u) << "the object holds a filled image, not just claimed bytes";
         EXPECT_EQ(reinterpret_cast<uintptr_t>(image) % GRAPH_DEFINITION_OBJECT_ALIGN, 0u)
@@ -175,7 +175,7 @@ TEST_F(HbgGraphDefinitionArenaTest, ObjectsAreBuiltInTheArenaAtAlignedDisjointOf
         ASSERT_TRUE(upload.has_value());
         size_t matches = 0;
         for (const GraphHostDefinition &entry : definitions.entries) {
-            if (entry.full_key != upload->full_key) continue;
+            if (entry.graph_key != upload->graph_key) continue;
             EXPECT_EQ(definition_image(entry)->total_bytes, entry.bytes) << "shell " << i;
             matches++;
         }
@@ -204,13 +204,13 @@ TEST_F(HbgGraphDefinitionArenaTest, AnArenaWithNoRoomSpillsAndStillPublishesTheI
     EXPECT_EQ(graph_host_arena_used(*graph_state), 0u) << "nothing was claimed, so the upload ships no prefix";
 
     const GraphDefinition *image = definition_image(entry);
-    EXPECT_EQ(image->full_key, entry.full_key);
+    EXPECT_EQ(image->graph_key, entry.graph_key);
     EXPECT_EQ(image->total_bytes, entry.bytes);
     EXPECT_GT(image->task_count, 0u) << "the spill holds a filled image, not just sized bytes";
 
     const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, 0);
     ASSERT_TRUE(upload.has_value());
-    EXPECT_EQ(upload->full_key, image->full_key);
+    EXPECT_EQ(upload->graph_key, image->graph_key);
 }
 
 TEST_F(HbgGraphDefinitionArenaTest, AnArenaTooSmallForAnObjectSpillsIt) {

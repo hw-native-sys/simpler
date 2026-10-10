@@ -48,7 +48,7 @@ inline constexpr size_t GRAPH_NO_OBJECT_OFFSET = static_cast<size_t>(-1);
 
 struct GraphHostUpload {
     ChipTaskSlotState *outer_slot;
-    uint64_t full_key;
+    uint64_t graph_key;
 };
 
 // The run's distinct Definition images (already deduplicated by the host-side
@@ -58,7 +58,7 @@ struct GraphHostUpload {
 // and upload. It is GRAPH_NO_OBJECT_OFFSET exactly when `spill` is set, which is
 // then the image the upload must copy into an object of its own choosing.
 struct GraphHostDefinition {
-    uint64_t full_key;
+    uint64_t graph_key;
     size_t object_offset;
     const std::byte *spill;
     size_t bytes;
@@ -70,7 +70,7 @@ struct GraphHostDefinitionList {
 
 struct GraphPendingUpload {
     ChipTaskSlotState *outer_slot{nullptr};
-    uint64_t full_key{0};
+    uint64_t graph_key{0};
     bool deferred_heap{false};
 };
 
@@ -85,7 +85,7 @@ enum class GraphRecordingStatus : uint8_t { RECORDING = 0, READY = 1, FAILED = 2
 // storage belongs to the recorder thread that will fill it (recorder_recording()), so
 // nothing here is sized by the graph.
 struct GraphInflightRecording {
-    uint64_t full_key{0};
+    uint64_t graph_key{0};
     GraphBoundary boundary;
     // Atomic because graph_prepare reads it on the recording thread without
     // taking recording_mutex, by design: acquiring the mutex there lets a

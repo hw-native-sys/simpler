@@ -301,7 +301,7 @@ void recording_orch_entry(const ChipTaskArgs &) {
     GraphTaskArgs boundary;
     auto input = simpler::hbg::make_tensor_external(data, shape, 1);
     boundary.add_input(input);
-    auto graph = orch.graph_begin(0x521, boundary, 0x523);
+    auto graph = orch.graph_begin(0x521, boundary);
     ASSERT_TRUE(graph.recording);
     ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary));
     CoreTaskArgs task;
@@ -2073,7 +2073,7 @@ TEST_F(HbgBindLedgerTest, HostArgumentsCannotReachDeviceTasksOrGraphBoundaries) 
             if (mode == 3) {
                 GraphTaskArgs boundary;
                 boundary.add_input(host);
-                EXPECT_FALSE(orch.graph_begin(0x543, boundary, 0x546).recording);
+                EXPECT_FALSE(orch.graph_begin(0x543, boundary).recording);
             } else {
                 CoreTaskArgs task;
                 if (mode == 4) {

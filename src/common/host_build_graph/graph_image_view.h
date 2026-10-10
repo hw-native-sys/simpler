@@ -120,7 +120,7 @@ graph_definition_decode_framed(const GraphImageView &view, uint32_t image_offset
     GraphDefinition definition{};
     if (!view.load(image_offset, &definition)) return false;
     if (definition.total_bytes != header.definition_bytes) return false;
-    if (definition.full_key != header.full_key) return false;
+    if (definition.graph_key != header.graph_key) return false;
     // The whole image has to be inside the section before any of its offsets is
     // used, so a truncated package is rejected here rather than per section.
     if (image_offset > view.bytes || definition.total_bytes > view.bytes - image_offset) return false;

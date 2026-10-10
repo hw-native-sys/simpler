@@ -48,7 +48,7 @@ std::optional<GraphHostUpload> graph_host_upload(GraphHostState &state, size_t i
     if (index >= state.pending_uploads.size()) return std::nullopt;
     GraphPendingUpload &upload = state.pending_uploads[index];
     if (upload.outer_slot == nullptr) return std::nullopt;
-    return GraphHostUpload{upload.outer_slot, upload.full_key};
+    return GraphHostUpload{upload.outer_slot, upload.graph_key};
 }
 
 size_t graph_host_arena_used(const GraphHostState &state) { return state.arena_cursor.load(std::memory_order_acquire); }

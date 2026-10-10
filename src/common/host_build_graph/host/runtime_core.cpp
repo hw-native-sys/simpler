@@ -49,7 +49,7 @@ static TaskOutputTensors submit_dummy_task_impl(RuntimeContext *rt, const CoreTa
 
 static GraphScopeResult graph_begin_impl(RuntimeContext *rt, uint64_t graph_key, const GraphTaskArgs &args) {
     if (rt == nullptr) return GraphScopeResult{};
-    return rt->orchestrator->graph_begin(graph_key, args, rt->active_callable_hash);
+    return rt->orchestrator->graph_begin(graph_key, args);
 }
 
 static bool graph_prepare_impl(RuntimeContext *rt, void *recording_handle, const GraphTaskArgs &args) {

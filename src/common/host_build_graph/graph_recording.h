@@ -151,7 +151,7 @@ struct GraphBoundary {
 // Storage for one recorded body, owned by the recorder thread and reset per
 // recording rather than allocated per recording — see recorder_recording().
 struct GraphRecording {
-    uint64_t full_key{0};
+    uint64_t graph_key{0};
     uint64_t next_virtual_offset{0};
     // The in-flight entry's boundary copy, bound at graph_prepare and valid until
     // graph_end/graph_abort. Not owned here: the submitting thread reads it for
@@ -291,8 +291,6 @@ void graph_classify_scalars(GraphRecording &recording, const ArgT &args, int32_t
 }
 
 bool graph_boundary_relocate_params(GraphBoundary &boundary);
-
-uint64_t graph_full_key(uint64_t callable_hash, uint64_t graph_key);
 
 GraphRecording &recorder_recording();
 
