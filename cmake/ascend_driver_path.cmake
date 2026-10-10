@@ -13,18 +13,15 @@
 # lib64/driver, not lib64 — a tool that only searches under ASCEND_HOME_PATH
 # fails to link with `cannot find -lascend_hal`.
 #
-# Every tool here that links ascend_hal includes this file, rather than each
-# carrying its own guess. Three different spellings had accumulated: this
-# resolution, a hardcoded /usr/local/Ascend/driver, and nothing at all — and the
-# tool with nothing at all did not build.
+# Shared by runtime header discovery and standalone tools.
 #
 # Resolution order:
 #   1. cmake -DASCEND_DRIVER_PATH=/opt/ascend/driver
 #   2. sibling of ASCEND_HOME_PATH, if it exists
 #   3. the standard install at /usr/local/Ascend/driver
 #
-# Sets ASCEND_DRIVER_PATH, and fails the configure naming what is missing rather
-# than leaving it to a link error that names only the library.
+# Sets ASCEND_DRIVER_PATH. Direct-link consumers additionally call
+# simpler_require_ascend_driver_library() to validate the HAL library.
 
 if(NOT DEFINED ASCEND_HOME_PATH)
     message(FATAL_ERROR "ascend_driver_path.cmake requires ASCEND_HOME_PATH to be set first")
@@ -40,11 +37,13 @@ if(NOT DEFINED ASCEND_DRIVER_PATH)
     endif()
 endif()
 
-if(NOT EXISTS "${ASCEND_DRIVER_PATH}/lib64/driver/libascend_hal.so")
-    message(FATAL_ERROR
-        "libascend_hal.so not found under ${ASCEND_DRIVER_PATH}/lib64/driver/. "
-        "Set ASCEND_DRIVER_PATH explicitly (cmake -DASCEND_DRIVER_PATH=...).")
-endif()
+function(simpler_require_ascend_driver_library)
+    if(NOT EXISTS "${ASCEND_DRIVER_PATH}/lib64/driver/libascend_hal.so")
+        message(FATAL_ERROR
+            "libascend_hal.so not found under ${ASCEND_DRIVER_PATH}/lib64/driver/. "
+            "Set ASCEND_DRIVER_PATH explicitly (cmake -DASCEND_DRIVER_PATH=...).")
+    endif()
+endfunction()
 
 message(STATUS "ASCEND_HOME_PATH   = ${ASCEND_HOME_PATH}")
 message(STATUS "ASCEND_DRIVER_PATH = ${ASCEND_DRIVER_PATH}")

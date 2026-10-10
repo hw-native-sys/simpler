@@ -18,7 +18,7 @@
 // Toolkit HAL and standalone DSMI headers define DLLEXPORT differently.
 #pragma push_macro("DLLEXPORT")
 #undef DLLEXPORT
-#include <dsmi_common_interface.h>
+#include "@_dsmi_include_dir@/dsmi_common_interface.h"
 #pragma pop_macro("DLLEXPORT")
 
 // Generated from compile checks, including enum members that #ifdef cannot detect.

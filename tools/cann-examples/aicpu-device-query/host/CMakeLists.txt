@@ -18,7 +18,8 @@ if(NOT DEFINED ENV{ASCEND_HOME_PATH})
 endif()
 set(ASCEND_HOME_PATH $ENV{ASCEND_HOME_PATH})
 
-include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ascend_driver_path.cmake")
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../../../cmake/ascend_driver_path.cmake")
+simpler_require_ascend_driver_library()
 
 add_executable(query_device_hal query_device_hal.cpp)
 

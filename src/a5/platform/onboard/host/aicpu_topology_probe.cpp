@@ -94,15 +94,14 @@ bool probe_aicpu_topology(
 
     const char *soc_name = query_soc_name();
     CpuTopology driver_topo{};
-    const bool available = query_cpu_topo(device_id, driver_topo);
+    const bool available =
+        query_cpu_topo(device_id, driver_topo) && driver_topo.total_nums <= detail::kCpuOccupancyBits;
     detail::CpuTopologyData topo{};
     if (available) {
         topo.total_nums = driver_topo.total_nums;
-        if (topo.total_nums <= detail::kCpuOccupancyBits) {
-            for (uint32_t i = 0; i < topo.total_nums; ++i) {
-                const auto &cpu = driver_topo.single_cpu_topo_info[i];
-                topo.cpus[i] = {cpu.cpu_mask, cpu.cpu_id, cpu.is_share, cpu.phy_cpu_id, cpu.hyperthread_id};
-            }
+        for (uint32_t i = 0; i < topo.total_nums; ++i) {
+            const auto &cpu = driver_topo.single_cpu_topo_info[i];
+            topo.cpus[i] = {cpu.cpu_mask, cpu.cpu_id, cpu.is_share, cpu.phy_cpu_id, cpu.hyperthread_id};
         }
     }
     return detail::build_aicpu_topology(device_occupancy, soc_name, available, topo, out_topology);

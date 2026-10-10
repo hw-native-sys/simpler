@@ -33,9 +33,10 @@
 //   query version      CANN toolkit version (from compiler/version.info)
 
 #include <acl/acl.h>
+#include <driver/ascend_hal_base.h>
 #include <runtime/rt.h>
 
-#include "aicpu_topology_driver.h"
+#include "aicpu_topology_driver.h"  // Selected DSMI declarations and topology ABI.
 
 #include <cstdint>
 #include <cstdio>

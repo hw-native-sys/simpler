@@ -11,16 +11,8 @@
 # in the separately installed driver package. Prefer that package when readable.
 set(_SIMPLER_TOPOLOGY_DRIVER_CMAKE_DIR "${CMAKE_CURRENT_LIST_DIR}")
 function(simpler_configure_aicpu_topology_driver target)
-    if(DEFINED ASCEND_DRIVER_PATH)
-        set(_driver_roots "${ASCEND_DRIVER_PATH}")
-    else()
-        get_filename_component(_ascend_parent "${ASCEND_HOME_PATH}" DIRECTORY)
-        set(_driver_roots "${_ascend_parent}/driver" "/usr/local/Ascend/driver")
-    endif()
-    set(_dsmi_candidates "")
-    foreach(_root IN LISTS _driver_roots)
-        list(APPEND _dsmi_candidates "${_root}/include")
-    endforeach()
+    include("${_SIMPLER_TOPOLOGY_DRIVER_CMAKE_DIR}/ascend_driver_path.cmake")
+    set(_dsmi_candidates "${ASCEND_DRIVER_PATH}/include")
     list(APPEND _dsmi_candidates
         "${ASCEND_HOME_PATH}/include/driver"
         "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver"
@@ -39,9 +31,9 @@ function(simpler_configure_aicpu_topology_driver target)
     message(STATUS "AICPU topology DSMI header: ${_dsmi_include_dir}/dsmi_common_interface.h")
 
     include(CheckCXXSourceCompiles)
-    set(CMAKE_REQUIRED_INCLUDES "${_dsmi_include_dir}" "${ASCEND_HOME_PATH}/include")
+    set(CMAKE_REQUIRED_INCLUDES "${ASCEND_HOME_PATH}/include")
     set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
-    set(_headers "#include <driver/ascend_hal_base.h>\n#pragma push_macro(\"DLLEXPORT\")\n#undef DLLEXPORT\n#include <dsmi_common_interface.h>\n#pragma pop_macro(\"DLLEXPORT\")\n")
+    set(_headers "#include <driver/ascend_hal_base.h>\n#pragma push_macro(\"DLLEXPORT\")\n#undef DLLEXPORT\n#include \"${_dsmi_include_dir}/dsmi_common_interface.h\"\n#pragma pop_macro(\"DLLEXPORT\")\n")
     # Recheck on configure: changing the installed packages must not reuse cached capabilities.
     foreach(_check IN ITEMS SIMPLER_DRIVER_HEADERS_COMPILE SIMPLER_HAS_HAL_CPU_TOPO
             SIMPLER_HAS_DSMI_CPU_TOPO_SUBCOMMAND SIMPLER_HAS_DSMI_CPU_TOPO_CAPACITY
@@ -58,7 +50,22 @@ function(simpler_configure_aicpu_topology_driver target)
         SIMPLER_HAS_DSMI_CPU_TOPO_SUBCOMMAND)
     check_cxx_source_compiles("${_headers}unsigned value = DSMI_MAX_CPU_TOPO_NUM;"
         SIMPLER_HAS_DSMI_CPU_TOPO_CAPACITY)
-    check_cxx_source_compiles("${_headers}struct dsmi_cpu_topology_info topo;\nstruct dsmi_single_cpu_topology_info cpu;"
+    set(SIMPLER_CPU_TOPO_DSMI_CAPACITY 64)
+    if(SIMPLER_HAS_DSMI_CPU_TOPO_CAPACITY)
+        set(SIMPLER_CPU_TOPO_DSMI_CAPACITY DSMI_MAX_CPU_TOPO_NUM)
+    endif()
+    check_cxx_source_compiles("${_headers}
+#include <cstdint>
+#include <type_traits>
+struct CpuData { uint64_t mask; uint8_t id, shared, physical, thread; };
+int main() {
+    static_assert(std::extent_v<decltype(dsmi_cpu_topology_info::single_cpu_topo_info)> == ${SIMPLER_CPU_TOPO_DSMI_CAPACITY});
+    dsmi_cpu_topology_info topo{};
+    uint32_t count{topo.total_nums};
+    const dsmi_single_cpu_topology_info &cpu = topo.single_cpu_topo_info[0];
+    CpuData data{cpu.cpu_mask, cpu.cpu_id, cpu.is_share, cpu.phy_cpu_id, cpu.hyperthread_id};
+    return count + data.id;
+}"
         SIMPLER_HAS_DSMI_CPU_TOPOLOGY)
 
     set(SIMPLER_CPU_TOPO_HAL_SELECTOR "59")
@@ -69,15 +76,11 @@ function(simpler_configure_aicpu_topology_driver target)
     if(SIMPLER_HAS_DSMI_CPU_TOPO_SUBCOMMAND)
         set(SIMPLER_CPU_TOPO_DSMI_SUBCOMMAND "DSMI_SOC_INFO_SUB_CMD_CPU_TOPO")
     endif()
-    set(SIMPLER_CPU_TOPO_DSMI_CAPACITY "64")
-    if(SIMPLER_HAS_DSMI_CPU_TOPO_CAPACITY)
-        set(SIMPLER_CPU_TOPO_DSMI_CAPACITY "DSMI_MAX_CPU_TOPO_NUM")
-    endif()
     configure_file(
         "${_SIMPLER_TOPOLOGY_DRIVER_CMAKE_DIR}/aicpu_topology_driver.h.in"
         "${CMAKE_CURRENT_BINARY_DIR}/generated/aicpu_topology_driver.h"
         @ONLY
     )
     target_include_directories(${target} BEFORE PRIVATE
-        "${CMAKE_CURRENT_BINARY_DIR}/generated" "${_dsmi_include_dir}")
+        "${CMAKE_CURRENT_BINARY_DIR}/generated")
 endfunction()

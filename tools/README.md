@@ -92,9 +92,10 @@ that are a2a3's. Making them per-arch would remove the skips. So a full sweep is
 7 built + 7 run on a2a3, and 7 built + 4 run + 3 skipped on a5.
 
 Tools that link `libascend_hal.so` resolve the driver package through
-`cann-examples/cmake/ascend_driver_path.cmake` (overridable with
-`-DASCEND_DRIVER_PATH=`), which fails the configure naming the missing library
-instead of leaving a bare `cannot find -lascend_hal`.
+[`cmake/ascend_driver_path.cmake`](../cmake/ascend_driver_path.cmake) (overridable with
+`-DASCEND_DRIVER_PATH=`), also used by runtime topology header discovery.
+Direct-link tools call `simpler_require_ascend_driver_library()` to fail configure
+with the missing library path instead of leaving a bare `cannot find -lascend_hal`.
 
 ### cann-examples/query
 
