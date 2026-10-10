@@ -195,3 +195,29 @@ fails; secondary errors remain in its exception context.
 This reference qualification covers serial correctness on A3 HBG. It does not
 establish full vLLM serving, dynamic request admission, A5/TMR coverage,
 capture/replay, implicit host/device synchronization or a performance improvement.
+
+## Independent requests
+
+`clone_worker_submit.py` runs two logically independent requests with the same
+Qwen fixture on one A3 HBG Worker at `launch_depth=2`. Immutable weights and RoPE
+are shared; each live request owns its own KV, block table, metadata, sampled
+token, logits, hidden output and run handle. Decode metadata is host staged at
+bind time so a successor can prepare without a direct-control copy behind the
+predecessor. Within either request, the next decode step uses that request's
+actual sampled output after completion.
+
+```bash
+python clone_worker_submit.py \
+  --fixture /path/to/reference-kv \
+  --kv-reference /path/to/reference-decode-kv \
+  --artifact /path/to/verified-hbg-artifact \
+  --model /path/to/Qwen3-14B \
+  --device DEVICE_ID --steps 127 --output /path/to/new-result-directory
+```
+
+The runner checks free device memory before allocating the second request and
+records a capacity failure when both requests cannot remain resident. A pass
+requires exact sampled tokens, logits/KV numerical gates, request-private
+storage isolation, and an attributable joined-launch trace for every decode pair
+showing the second enqueue before the first operator ends while device execution
+remains serial.

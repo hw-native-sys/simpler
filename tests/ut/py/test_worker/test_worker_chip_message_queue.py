@@ -1167,7 +1167,8 @@ def test_payload_admission_rejects_invalid_objects_without_shared_access():
         read_only = orch.alloc([16], DataType.UINT8)
         read_only.access = AccessMode.READ
         stale = orch.alloc([16], DataType.UINT8)
-        stale.base = int(stale.base) + 4096
+        # An address beyond all registered bases cannot alias another allocation.
+        stale.base = max(worker._worker_chip_orch_comm_host_buffers) + int(stale.nbytes)
         fake_client.requests.clear()
         fake_client.payload_writes.clear()
         before = _shared_snapshot(fake_client)
