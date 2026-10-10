@@ -2398,6 +2398,28 @@ int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled) {
     return simpler_set_retain_runs_ctx(ctx, enabled);
 }
 
+int simpler_set_retained_epoch_limit_ctx(DeviceContextHandle ctx, int32_t limit) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    if (limit < 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    // Every refusal is decided before the collector is asked to change
+    // anything. This runtime's own answer to the joined-diagnostic question is
+    // what makes the capacity meaningful: a module with no such backend has
+    // nothing to hold three runs for, so it keeps the shipped two rather than
+    // reserving storage no run will reach.
+    if (joined_diagnostic_launch_supported_impl() == 0) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    // The device side of a retained run is its terminal bank, indexed by the
+    // pipeline slot, so this module's bank count is the ceiling that matters
+    // here rather than whatever the host binding was built against.
+    if (limit > PLATFORM_RUN_TERMINAL_BANKS) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->set_retained_epoch_limit(static_cast<size_t>(limit)) ?
+                   0 :
+                   PTO_RUNTIME_ERR_UNSUPPORTED;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
 int simpler_flush_diagnostics_ctx(DeviceContextHandle ctx, int32_t timeout_ms, char *error, size_t error_capacity) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     try {

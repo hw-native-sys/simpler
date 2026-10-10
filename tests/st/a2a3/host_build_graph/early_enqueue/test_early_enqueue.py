@@ -159,6 +159,12 @@ _REFILL_RUNS = 16
 # run itself, which has already been waited for. Exhausting it is an absence, and the caller's
 # own assertion reports it as one.
 _EVIDENCE_BUDGET_S = 10.0
+# How long a collecting case gives the background publication barrier. Bounded rather than untimed
+# because this call is also made while unwinding, where an unbounded wait would replace the error
+# being unwound with a hang. Exhausting it bounds the wait only: the writer behind it is still
+# running, so the case reports a failure and keeps its output directory rather than removing one
+# the collector may still be writing into.
+_FLUSH_BUDGET_S = 120.0
 
 _DIR_TAGS = {
     D.IN: TensorArgType.INPUT,
@@ -1222,13 +1228,7 @@ class TestEarlyEnqueueDepthTwoSwimlane(_EarlyEnqueueBase):
             # how a loss this collector could not charge would surface, which is why it is
             # asserted rather than ignored.
             st_worker.flush_diagnostics()
-            artifacts = _swimlane_artifacts(output_prefix)
-            # Listed inside the prefix's lifetime so a miss reports what was
-            # actually written rather than an empty directory that no longer
-            # exists by the time the assertion runs.
-            found_paths = sorted(
-                str(p.relative_to(output_prefix)) for p in Path(output_prefix).rglob("*") if p.is_file()
-            )
+            artifacts, found_paths = _published_artifacts(output_prefix)
 
         assert records, (
             f"no joined-launch record reached this process from children {trace.pids}, so nothing carried the ordering"
@@ -1603,9 +1603,11 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
         if st_platform != "a2a3":
             pytest.skip("three-run capacity is gated to a2a3 onboard host_build_graph")
         self._require_three_sets(st_worker)
+        level = type(self)._SWIMLANE_LEVEL
         trace = _RunTrace(st_worker)
         case_runs = _CaseRuns(_frames(st_worker, _THREE_FRAMES))
-        with tempfile.TemporaryDirectory(prefix="simpler-three-run-") as output_prefix:
+        with _OutputPrefix("simpler-three-run-", "three-run window") as prefix:
+            output_prefix = prefix.path
             # Held by this scope, not by the helper: a submission that fails after making one or
             # two of the runs still leaves them drainable here, with their arguments alive.
             handles: list = []
@@ -1617,10 +1619,12 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
             finally:
                 # Before anything of this case's leaves scope, whatever the submission or the
                 # observation did: a run still in flight owns its arguments and its output buffer,
-                # and the temporary output directory is this case's too.
-                drain_failures = _drain_handles(handles, "three-run window")
+                # and the output directory is this case's too -- which a collecting subclass's
+                # background writer is still holding until the barrier below returns. Whether it
+                # did is what decides if the directory may be removed at all.
+                settle_failures, prefix.quiesced = _settle_runs(st_worker, handles, level, "three-run window")
             # Reached only with no primary error, so these have nothing to hide behind.
-            assert not drain_failures, f"a run of this case did not finish: {drain_failures}"
+            assert not settle_failures, f"this case did not come to a clean stop: {settle_failures}"
             for out, expected in expectations:
                 torch.testing.assert_close(out, expected)
 
@@ -1663,6 +1667,18 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
                 f"the ordered chain does not span all three runs: chained={sorted(chain)}"
             )
 
+            # A collecting subclass reaches here having run this exact sequence with every run at
+            # its level, so the assertions above are that subclass's own evidence rather than
+            # something it inherits without executing. What only a collecting run can add is what
+            # follows: three overlapping collections each published their own file.
+            if level:
+                artifacts, found_paths = _published_artifacts(output_prefix)
+                assert len(artifacts) >= _THREE_FRAMES, (
+                    f"expected one swimlane artifact per collecting run, found {len(artifacts)}; "
+                    f"the prefix held {found_paths}"
+                )
+                _assert_per_run_artifacts(artifacts, found_paths, expected_level=level)
+
     def test_sixteen_runs_keep_refilling_the_sets_they_retire(self, st_platform, st_worker):
         """Sixteen consecutive submissions that keep all three sets occupied as they turn over.
 
@@ -1677,6 +1693,11 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
         ordered     no resource set was ever seen carrying a *lower* dispatch id than one it had
                     already carried, so a set passes from one run to a later-submitted one.
         distinct    every one of the sixteen runs produced its own output.
+        collected   for a collecting subclass, every one of the sixteen also published its own
+                    file. Three retained runs is the whole backlog this capability grants, so
+                    sixteen of them over three sets is collection being sustained across reused
+                    resources: each admission past the third waited for a publication to return
+                    the capacity it took, and no run took another's identity on the way through.
 
         No count here bounds concurrency from above: the mailbox this reads has three frames, so
         a fourth simultaneous run would not be visible in it at all.
@@ -1689,6 +1710,7 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
         if st_platform != "a2a3":
             pytest.skip("three-run capacity is gated to a2a3 onboard host_build_graph")
         self._require_three_sets(st_worker)
+        level = type(self)._SWIMLANE_LEVEL
         case_runs = _CaseRuns(_frames(st_worker, _THREE_FRAMES))
         frames = _frames(st_worker, _THREE_FRAMES)
         # Every distinct set of three runs seen launched together, in the order first seen; the
@@ -1722,7 +1744,8 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
         handles: list = []
         buffers: list = []
         try:
-            with tempfile.TemporaryDirectory(prefix="simpler-three-run-refill-") as output_prefix:
+            with _OutputPrefix("simpler-three-run-refill-", "sixteen-run refill") as prefix:
+                output_prefix = prefix.path
                 expectations = []
                 try:
                     for index in range(_REFILL_RUNS):
@@ -1741,14 +1764,22 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
                             )
                         )
                 finally:
-                    # Every submitted run is drained before this case's buffers or its output
-                    # directory leave scope, whether the loop finished or a submission failed
-                    # part way.
-                    drain_failures = _drain_handles(handles, "sixteen-run refill")
+                    # Every submitted run is drained, and every collecting run published, before
+                    # this case's buffers or its output directory leave scope -- whether the loop
+                    # finished or a submission failed part way. What that proved decides whether
+                    # the directory may be removed.
+                    settle_failures, prefix.quiesced = _settle_runs(st_worker, handles, level, "sixteen-run refill")
                 # Reached only with no primary error, so these have nothing to hide behind.
-                assert not drain_failures, f"a run of this case did not finish: {drain_failures}"
+                assert not settle_failures, f"this case did not come to a clean stop: {settle_failures}"
                 for out, expected in expectations:
                     torch.testing.assert_close(out, expected)
+                if level:
+                    artifacts, found_paths = _published_artifacts(output_prefix)
+                    assert len(artifacts) >= _REFILL_RUNS, (
+                        f"expected one swimlane artifact per collecting run, found {len(artifacts)} for "
+                        f"{_REFILL_RUNS} runs; the prefix held {found_paths}"
+                    )
+                    _assert_per_run_artifacts(artifacts, found_paths, expected_level=level)
         finally:
             stop.set()
             sampler.join(timeout=5.0)
@@ -1771,6 +1802,77 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
         )
 
 
+@scene_test(level=3, runtime="host_build_graph", collect_across_runs=True)
+class TestThreeRunCapacitySwimlane(TestThreeRunCapacity):
+    """The three-run shape with swimlane collection on, at ``SCHEDULE_TIMING``.
+
+    The capability this covers: enabling collection used to decide which launches the lane
+    permits. At three resource sets a collecting run was refused the join outright and waited to
+    reach the front, so the collected pipeline was shallower than the one the same Worker runs
+    without collection. Three collecting runs must now reach the device together, the device must
+    still run them one whole operator at a time, and each must publish its own file.
+
+    It adds no case of its own, and that is the point: setting ``_SWIMLANE_LEVEL`` puts every run
+    the inherited cases submit at this level, so those cases *execute here* against collecting
+    runs rather than being cited from the class above. Both of them then end on this class's own
+    extra evidence, which only a collecting run can produce — one published artifact per run, each
+    carrying its own identity:
+
+    - ``test_three_runs_are_launched_and_accepted_at_once`` — three collecting runs accepted at
+      one instant, the device order they then took, and three separate files.
+    - ``test_sixteen_runs_keep_refilling_the_sets_they_retire`` — the same three sets turning over
+      sixteen collecting runs, and sixteen separate files. Three retained runs is the whole
+      backlog granted, so this is where publication has to keep returning capacity.
+
+    pytest collects both inherited methods on this class and on its level-1 subclass, so the CI
+    job runs each of them once per level. The standalone path has one entry per case and runs the
+    first of them; ``--case`` picks the case, not the method.
+    """
+
+    _SWIMLANE_LEVEL = 2
+
+    CASES = [
+        {
+            "name": "three_run_capacity_swimlane",
+            "platforms": ["a2a3"],
+            "config": {
+                "device_count": 1,
+                "num_sub_workers": 0,
+                "launch_depth": 3,
+                "pipeline_depth": 3,
+            },
+            "params": {},
+        },
+    ]
+
+
+@scene_test(level=3, runtime="host_build_graph", collect_across_runs=True)
+class TestThreeRunCapacitySwimlaneLevelOne(TestThreeRunCapacitySwimlane):
+    """The same three-run shape at ``TASK_TIMING``.
+
+    The level is one shared word the device latches when its producer initialises, and the pools a
+    level arms differ, so the two admitted levels each need their own evidence at three runs just
+    as they did at two. At level 1 there is no scheduler-task stream and the shared assertions
+    follow the class's level rather than assuming it.
+    """
+
+    _SWIMLANE_LEVEL = 1
+
+    CASES = [
+        {
+            "name": "three_run_capacity_swimlane_level_one",
+            "platforms": ["a2a3"],
+            "config": {
+                "device_count": 1,
+                "num_sub_workers": 0,
+                "launch_depth": 3,
+                "pipeline_depth": 3,
+            },
+            "params": {},
+        },
+    ]
+
+
 def _drain_handles(handles, what):
     """Wait for every submitted run before the caller's resources leave scope.
 
@@ -1787,6 +1889,74 @@ def _drain_handles(handles, what):
             failures.append(str(error))
             print(f"[{what} cleanup] a run did not finish: {error}")
     return failures
+
+
+def _settle_runs(worker, handles, level, what):
+    """Bring this case's runs, and its collection, to a stop before its output prefix may go.
+
+    Returns ``(failures, quiesced)``. ``quiesced`` is true only when nothing can still be writing
+    into the prefix: every run was waited for, and for a collecting class the publication barrier
+    returned. Two things leave it false.
+
+    A run that did not finish may still be writing, and it also leaves
+    ``flush_diagnostics``'s no-outstanding-run precondition unmet, so the barrier is not attempted
+    after a failed drain.
+
+    A barrier that raises -- including on its own budget -- bounds the wait, not the writer: with
+    retention on, each run's records outlive its own boundary and are written afterwards by the
+    collector's background writer, which this call cannot cancel or join. So an exhausted budget
+    says publication was not proved to have stopped, not that it has.
+
+    No failure is raised from here, so an unwinding caller keeps its own finding; the failures are
+    returned instead, and a caller that reaches its normal end with a non-empty list has nothing
+    to hide behind and must report them.
+    """
+    failures = [f"a run did not finish: {error}" for error in _drain_handles(handles, what)]
+    if failures or not level:
+        return failures, not failures
+    try:
+        worker.flush_diagnostics(_FLUSH_BUDGET_S)
+    except Exception as error:  # noqa: BLE001 -- must not replace the caller's failure
+        print(f"[{what} cleanup] the collecting runs did not all publish: {error}")
+        return [f"a collecting run did not publish: {error}"], False
+    return [], True
+
+
+class _OutputPrefix:
+    """A case's output directory, removed only once nothing can still be writing into it.
+
+    ``tempfile.TemporaryDirectory`` removes on every exit, including the one taken while a
+    collector's writer still owns queued output -- and a run's publication barrier bounds the wait
+    it makes, not that writer. Removing the directory then takes a destination the collector is
+    still using. So the caller sets ``quiesced`` from what it proved (see `_settle_runs`), and a
+    directory that was not proved idle is kept and named rather than removed.
+    """
+
+    def __init__(self, prefix, what):
+        self.path = tempfile.mkdtemp(prefix=prefix)
+        self.what = what
+        self.quiesced = False
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        if self.quiesced:
+            shutil.rmtree(self.path, ignore_errors=True)
+        else:
+            print(f"[{self.what} cleanup] kept {self.path}: its writers were not proved stopped")
+        return False
+
+
+def _published_artifacts(output_prefix):
+    """This prefix's published swimlane runs, with the file list that explains an empty read.
+
+    Both are taken inside the prefix's lifetime so a miss reports what was actually written
+    rather than a directory that no longer exists by the time the assertion runs.
+    """
+    artifacts = _swimlane_artifacts(output_prefix)
+    found_paths = sorted(str(p.relative_to(output_prefix)) for p in Path(output_prefix).rglob("*") if p.is_file())
+    return artifacts, found_paths
 
 
 def _release_chain_buffers(worker, handles, intermediates):

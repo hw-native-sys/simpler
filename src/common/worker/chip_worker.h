@@ -26,6 +26,7 @@
 #include "../platform_comm/comm.h"
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
+#include "host/chip_swimlane_runs.h"
 #include "pipeline_slot_pool.h"
 #include "runtime_c_api.h"
 #include "types.h"
@@ -527,8 +528,17 @@ private:
     SimplerTeardownReport teardown_report_{};
     bool teardown_report_captured_ = false;
     using SimplerSetRetainRunsFn = decltype(&simpler_set_retain_runs_ctx);
+    using SimplerSetRetainedEpochLimitFn = decltype(&simpler_set_retained_epoch_limit_ctx);
     using SimplerFlushDiagnosticsFn = decltype(&simpler_flush_diagnostics_ctx);
     SimplerSetRetainRunsFn set_retain_runs_fn_ = nullptr;
+    // Optional: a module built before the capacity grant exports no such
+    // symbol, and a null pointer leaves `retained_epoch_limit_granted_` at the
+    // shipped figure.
+    SimplerSetRetainedEpochLimitFn set_retained_epoch_limit_fn_ = nullptr;
+    // What the backend actually granted, recorded only on a success return.
+    // The joined-diagnostic gate reads it, so a refused request can never let
+    // the lane order more runs than the collector can hold.
+    size_t retained_epoch_limit_granted_ = simpler::dfx::runs::kMaxOpenEpochs;
     using SimplerSetWorkspaceBudgetFn = decltype(&simpler_set_workspace_budget_ctx);
     using SimplerEnableWorkspaceManagementFn = decltype(&simpler_enable_workspace_management_ctx);
     using SimplerGetWorkspaceReportFn = decltype(&simpler_get_workspace_report_ctx);

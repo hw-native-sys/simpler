@@ -152,6 +152,20 @@ struct ProfilerModuleMaxCollectorThreads<Module, std::void_t<decltype(Module::kM
     static constexpr int value = Module::kMaxCollectorThreads;
 };
 
+// How many transport cuts a module may have armed at once. Two unless the
+// module says otherwise, because a cut is held from one run's close until its
+// writer reaches a terminal verdict, so the count has to match however many
+// runs that module keeps open.
+template <typename Module, typename = void>
+struct ProfilerModuleMaxCutSlots {
+    static constexpr size_t value = 2;
+};
+
+template <typename Module>
+struct ProfilerModuleMaxCutSlots<Module, std::void_t<decltype(Module::kMaxCutSlots)>> {
+    static constexpr size_t value = Module::kMaxCutSlots;
+};
+
 template <typename Module, typename = void>
 struct ProfilerModuleHostQueueCapacity {
     static constexpr size_t value = 1024;

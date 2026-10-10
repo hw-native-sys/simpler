@@ -307,6 +307,10 @@ void ChipWorker::init(
         // such symbol, and a null pointer is the refusal.
         supports_joined_diagnostic_launch_fn_ =
             reinterpret_cast<SupportsJoinedDiagnosticLaunchFn>(dlsym(handle, "supports_joined_diagnostic_launch_ctx"));
+        // Optional for the same reason: a runtime built before the retained
+        // capacity grant exports nothing, and a null pointer is the refusal.
+        set_retained_epoch_limit_fn_ =
+            reinterpret_cast<SimplerSetRetainedEpochLimitFn>(dlsym(handle, "simpler_set_retained_epoch_limit_ctx"));
         get_arena_bank_gm_heap_base_fn_ =
             load_symbol<GetArenaBankGmHeapBaseFn>(handle, "get_arena_bank_gm_heap_base_ctx");
         get_retained_temp_addr_fn_ = load_symbol<GetRetainedTempAddrFn>(handle, "get_retained_temp_addr_ctx");
@@ -451,6 +455,22 @@ void ChipWorker::init(
             }
             if (set_retain_runs_fn_(device_ctx_, 1) != 0) {
                 throw std::runtime_error("ChipWorker::init: retaining runs across boundaries could not be enabled");
+            }
+            // How many runs this Worker could ever have open at once: its own
+            // launch budget and the resource sets this context was actually
+            // granted, never the request and never a host-build constant --
+            // the runtime is loaded, so only it knows its device bound.
+            //
+            // A depth below two asks for nothing: that is L2's shape, whose
+            // launch budget is one, and it keeps the shipped capacity without
+            // being asked about separately. Only a success return records the
+            // grant; absence or refusal leaves this Worker exactly as a module
+            // without the entry leaves it.
+            const uint32_t depth =
+                launch_depth_ < resolved_contract.pipeline_depth ? launch_depth_ : resolved_contract.pipeline_depth;
+            if (depth > simpler::dfx::runs::kMaxOpenEpochs && set_retained_epoch_limit_fn_ != nullptr &&
+                set_retained_epoch_limit_fn_(device_ctx_, static_cast<int32_t>(depth)) == 0) {
+                retained_epoch_limit_granted_ = depth;
             }
         }
         // Two routes, resolved from this call's own arguments rather than from
@@ -929,13 +949,14 @@ bool ChipWorker::supports_joined_diagnostic_launch(
     const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor
 ) {
     if (!initialized_) return false;
-    // Exactly two, not "more than one". The approved opening is a successor
-    // submitting while one predecessor executes; at depth three a second
-    // successor would join behind a run that is itself already joined, and
-    // nothing here has established what two open diagnostic runs behind a third
-    // would do to the two retained buckets. Ordinary non-diagnostic joins keep
-    // the backend's own depth, which this does not touch.
-    if (launch_depth_ != 2) return false;
+    // As deep as this collector was actually granted, and no deeper. The
+    // backend answers how many runs it can hold open at once; ordering a
+    // further one behind them would leave the last with no bucket to be
+    // admitted into, and admission has no refusal for that — it waits. A
+    // module that exports no capacity entry, or refused the request, leaves
+    // this at the shipped two. Ordinary non-diagnostic joins keep the
+    // backend's own depth, which this does not touch.
+    if (launch_depth_ < 2 || launch_depth_ > retained_epoch_limit_granted_) return false;
     if (pipeline_contract_.pipeline_depth <= 1) return false;
     // An older `libhost_runtime.so` exports no such symbol. Absent means the
     // refusal this call is asking to lift, so the caller keeps today's

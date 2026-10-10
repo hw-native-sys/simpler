@@ -1315,6 +1315,16 @@ int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled) {
     return simpler_set_retain_runs_ctx(ctx, enabled);
 }
 
+int simpler_set_retained_epoch_limit_ctx(DeviceContextHandle ctx, int32_t limit) {
+    // Exported so the symbol resolves uniformly across runtime modules, and
+    // refusing so a simulated backend keeps the shipped capacity: nothing here
+    // orders a diagnostic successor behind a predecessor, so a third retained
+    // run would reserve storage no run reaches.
+    (void)ctx;
+    (void)limit;
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 int simpler_flush_diagnostics_ctx(DeviceContextHandle ctx, int32_t timeout_ms, char *error, size_t error_capacity) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     try {
