@@ -59,6 +59,10 @@ endmacro()
 platform_single_case(test_kernel_execution_state.cpp
     SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_execution_state.cpp)
 
+platform_single_case(test_callable_diagnostics.cpp
+    SOURCES ${HOST_LOG_TEST_SOURCES}
+    INCLUDES ${SIMPLER_LOG_DIR})
+
 # Sim kernel threads publish one sticky completion state. A gated unit test
 # proves submission and completion are separate without relying on kernel
 # duration or host scheduling.

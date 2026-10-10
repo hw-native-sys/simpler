@@ -45,6 +45,61 @@ settle it before reading any kernel arithmetic:
 [#1036](https://github.com/hw-native-sys/simpler/issues/1036) has the worked
 example of making this distinction.
 
+## Match the PC to the uploaded callable
+
+Onboard runtimes emit `Callable image`, `Callable code`, and `Callable registration`
+records at the default **TIMING** threshold. Keep the complete per-process host
+log, including registration, alongside the device log. An explicit WARN/ERROR
+threshold suppresses the publication records.
+
+Each `Callable code` record names `device`, `runner`, `chip_hash`, `chip_dev`,
+`func_id`, `code_begin`, `code_end_exclusive`, `code_bytes`, and `code_fnv1a64`.
+The addresses and fingerprint describe the patched **host source of a successful
+H2D**, not a device readback. The fingerprint is FNV-1a over that child's code
+bytes; it is neither a hash of the whole ELF nor proof that device memory stayed
+unchanged afterwards.
+
+For a failed run boundary, `Run device failure` is emitted before recovery. It
+links `run_epoch`, `generation`, `dispatch_id`, `pipeline_slot`, and `cid` to
+`chip_hash`, `chip_dev`, and the device `runtime_args` address. This identifies
+the run whose completion failed; an error propagated from a predecessor does
+not prove this run caused the fault. Match the device log's PID/device and time
+as well. The record reads host bookkeeping only and issues no D2H on a faulted
+card.
+
+Find the publication for that PID/device/runner and image, then compare the PC
+with each **half-open** range: `code_begin <= PC < code_end_exclusive`. A PC equal
+to `code_end_exclusive` is outside that range; it must not silently be assigned
+to the preceding function. The hardware report's PC semantics still need to be
+checked before concluding that execution fell through. `Callable image freed`
+and `Callable images abandoned` delimit allocation reuse; abandonment records
+host ownership being dropped, not successful per-image device frees.
+
+These records do not contain tensor data, the device's observed dispatch
+arguments, or complete code binaries. Preserve the matching compiled artifacts
+before rebuilding or clearing caches. A matching address in a later passing
+run is not evidence of the upload address in an earlier failing run.
+
+## Match HBG's pending and running dispatches
+
+HBG's scheduler-timeout shutdown snapshot also emits `DISPATCH` at WARN for
+occupied running and pending tokens. Each record includes the logical `core`,
+`physical_core`, slot, token, token-selected payload bank, payload and argument
+addresses, `function_bin_addr`, `src_payload`, and register base. Idle tokens
+produce no record; periodic stall reports do not dump payloads.
+
+Join the logical core to the existing `CLUSTER` and `TASK` records, then compare
+its physical identity to the CANN report using that report's core-numbering
+convention. Compare `function_bin_addr` with the same run's host `Callable code`
+entry. A pending dispatch is distinct from the running dispatch; do not assign
+its function to the fault merely because it was published most recently.
+
+These are AICPU-side publication observations, not proof of the bytes the
+AICore fetched. Other scheduler threads may still be retiring work, so the
+records are not an atomic snapshot. The dump neither dereferences tensor
+addresses nor reads the gated argument contents written by the AICore. A run
+killed before the scheduler's shutdown snapshot may have no such records.
+
 ## F2: rule the kernel's own addressing in or out statically
 
 Before instrumenting, check whether the kernel *can* compute an out-of-range UB

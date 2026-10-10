@@ -1411,6 +1411,9 @@ public:
         NativeRunJoin join{};
     };
 
+    // Reads host-owned run/registration state before device recovery or cleanup.
+    void log_run_failure(const PreparedExecution &prepared, int rc) const;
+
     struct ActiveExecution {
         explicit ActiveExecution(std::unique_ptr<PreparedExecution> prepared_in, LaunchProgress progress_in) :
             prepared(std::move(prepared_in)),

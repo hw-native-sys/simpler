@@ -340,6 +340,34 @@ void SchedulerContext::log_stall_diagnostics(
             report, "[STALL thread=%d idle_iterations=%d] CLUSTER cluster_id=%d aic=%s aiv0=%s aiv1=%s", thread_idx,
             idle_iterations, cluster_id, aic_buf, aiv0_buf, aiv1_buf
         );
+        if (report == StallDumpReport::Shutdown) {
+            const int32_t core_ids[] = {aic_id, aiv0_id, aiv1_id};
+            for (int32_t core_id : core_ids) {
+                const CoreExecState &core = core_exec_states_[core_id];
+#if SIMPLER_DFX
+                const uint32_t physical_core_id = physical_core_ids_[core_id];
+#else
+                const uint32_t physical_core_id = core.physical_core_id;
+#endif
+                const int32_t tokens[] = {core.running_reg_task_id, core.pending_reg_task_id};
+                // These are AICPU publication records, not AICore readbacks or an
+                // atomic snapshot of other scheduler threads. Gated args belong
+                // to the AICore; their contents and src_payload are not dereferenced.
+                for (int slot = 0; slot < 2; ++slot) {
+                    if (tokens[slot] == AICPU_TASK_INVALID) continue;
+                    const uint32_t bank = static_cast<uint32_t>(tokens[slot]) & 1u;
+                    const DispatchPayload &payload = payload_per_core_[core_id][bank];
+                    LOG_WARN(
+                        "[STALL thread=%d] DISPATCH core=%d physical_core=%u slot=%s token=%d bank=%u "
+                        "payload=0x%" PRIx64 " args=0x%" PRIx64 " function_bin_addr=0x%" PRIx64
+                        " src_payload=0x%" PRIx64 " reg_addr=0x%" PRIx64,
+                        thread_idx, core_id, physical_core_id, slot == 0 ? "running" : "pending", tokens[slot], bank,
+                        reinterpret_cast<uint64_t>(&payload), reinterpret_cast<uint64_t>(payload.args),
+                        payload.function_bin_addr, payload.src_payload, core.reg_addr
+                    );
+                }
+            }
+        }
     }
 }
 

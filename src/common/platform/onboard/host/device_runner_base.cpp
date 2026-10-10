@@ -47,6 +47,7 @@
 #include "common/unified_log.h"
 #include "host/acl_error_log.h"
 #include "host/arena_replacement_transaction.h"
+#include "host/callable_diagnostics.h"
 #include "kernel_platform_ops.h"
 #include "host/host_phase_records_artifact.h"
 #include "host/joined_diagnostic_eligibility.h"
@@ -1477,6 +1478,21 @@ int DeviceRunnerBase::query_max_block_dim(rtStream_t stream, uint32_t *out_cube,
     return PLATFORM_MAX_BLOCKDIM;
 }
 
+void DeviceRunnerBase::log_run_failure(const PreparedExecution &prepared, int rc) const {
+    const int32_t cid = prepared.runtime != nullptr ? prepared.runtime->get_active_callable_id() : -1;
+    const auto callable = callables_.find(cid);
+    const uint64_t chip_hash = callable != callables_.end() ? callable->second.chip_buffer_hash : 0;
+    const auto image = chip_callable_buffers_.find(chip_hash);
+    const uint64_t chip_dev = image != chip_callable_buffers_.end() ? image->second.chip_dev : 0;
+    LOG_ERROR(
+        "Run device failure: device=%d runner=%p rc=%d run_epoch=%lu generation=%lu dispatch_id=%lu "
+        "pipeline_slot=%u cid=%d chip_hash=0x%lx chip_dev=0x%lx runtime_args=%p",
+        device_id_, static_cast<const void *>(this), rc, prepared.identity.run_epoch, prepared.identity.generation,
+        prepared.identity.dispatch_id, prepared.pipeline_slot, cid, chip_hash, chip_dev,
+        static_cast<void *>(prepared.kernel_args.args.runtime_args)
+    );
+}
+
 void DeviceRunnerBase::print_handshake_results(const KernelArgsHelper &kernel_args, int worker_count) {
     // Every consumer of this copy is a DEBUG record below, so the threshold
     // decides whether the D2H happens at all, not just whether it is printed.
@@ -1684,6 +1700,10 @@ uint64_t DeviceRunnerBase::upload_chip_callable_buffer(const ChipCallable *calla
         "Uploaded chip callable: chip_dev=0x%lx, size=%zu, child_count=%d, table_len=%u, hash=0x%lx", chip_dev,
         alloc_size, callable->child_count(), table_len, layout.content_hash
     );
+    log_callable_image(
+        device_id_, this, layout.content_hash, chip_dev, alloc_size,
+        *reinterpret_cast<const ChipCallable *>(scratch.data())
+    );
     return chip_dev;
 }
 
@@ -1719,9 +1739,9 @@ int DeviceRunnerBase::release_chip_callable_buffer(uint64_t hash) {
                 it->second.chip_dev, free_rc
             );
         } else {
-            LOG_DEBUG(
-                "Freed chip callable buffer: chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev,
-                it->second.total_size, hash
+            LOG_TIMING(
+                "Callable image freed: device=%d runner=%p chip_hash=0x%lx chip_dev=0x%lx upload_bytes=%zu", device_id_,
+                static_cast<void *>(this), hash, it->second.chip_dev, it->second.total_size
             );
         }
         chip_callable_buffers_.erase(it);
@@ -1898,9 +1918,10 @@ int DeviceRunnerBase::record_device_orch_callable(
     state.config_name = (config_name != nullptr) ? config_name : "";
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
-    LOG_INFO(
-        "record_device_orch_callable: cid=%d orch_hash=0x%lx chip_hash=0x%lx %zu bytes", callable_id, hash,
-        chip_buffer_hash, orch_so_size
+    LOG_TIMING(
+        "Callable registration: device=%d runner=%p cid=%d chip_hash=0x%lx aicore_image_hash=0x%lx "
+        "orch_hash=0x%lx orch_bytes=%zu",
+        device_id_, static_cast<void *>(this), callable_id, chip_buffer_hash, aicore_image_hash, hash, orch_so_size
     );
     return 0;
 }
@@ -1936,7 +1957,11 @@ int DeviceRunnerBase::record_host_orch_callable(
     state.signature = std::move(signature);
     callables_.emplace(callable_id, std::move(state));
     ++host_dlopen_total_;
-    LOG_INFO("record_host_orch_callable: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
+    LOG_TIMING(
+        "Callable registration: device=%d runner=%p cid=%d chip_hash=0x%lx aicore_image_hash=0x%lx "
+        "host_dlopen_count=%zu",
+        device_id_, static_cast<void *>(this), callable_id, chip_buffer_hash, aicore_image_hash, host_dlopen_total_
+    );
     return 0;
 }
 
@@ -2470,13 +2495,17 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
                 it = chip_callable_buffers_.erase(it);
                 continue;
             }
-            LOG_DEBUG(
-                "Freed chip callable buffer: chip_dev=0x%lx, size=%zu, hash=0x%lx", it->second.chip_dev,
-                it->second.total_size, it->first
+            LOG_TIMING(
+                "Callable image freed: device=%d runner=%p chip_hash=0x%lx chip_dev=0x%lx upload_bytes=%zu", device_id_,
+                static_cast<void *>(this), it->first, it->second.chip_dev, it->second.total_size
             );
             it = chip_callable_buffers_.erase(it);
         }
     } else {
+        LOG_TIMING(
+            "Callable images abandoned: device=%d runner=%p count=%zu", device_id_, static_cast<void *>(this),
+            chip_callable_buffers_.size()
+        );
         chip_callable_buffers_.clear();
     }
 
