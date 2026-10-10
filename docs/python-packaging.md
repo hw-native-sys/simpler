@@ -30,6 +30,7 @@ simpler_setup/            ← test framework + build/runtime assembly (simpler_s
     __init__.py
     paged_attention.py    attention reference (used by multiple paged_attention tests)
   _assets/                (wheel-only, populated by CMake install)
+    simpler.pin            Git revision and clean flag, when built from a Git checkout
     src/                  source tree mirror
     cmake/                the includes a runtime configure needs, via SIMPLER_CMAKE_DIR
     build/lib/            pre-built per-arch/platform/runtime .so/.o
@@ -83,6 +84,18 @@ NPU hardware (`a2a3`/`a5` with CANN toolkit).
 - **Source tree / editable install**: `_assets/` doesn't exist → `PROJECT_ROOT = repo root`. Live `src/`, `cmake/` and `build/lib/` are used.
 
 Anything that needs to find `src/`, `cmake/`, `build/lib/`, or `build/cache/` MUST go through `simpler_setup.environment.PROJECT_ROOT` — never `Path(__file__).parent.parent...`.
+
+### Build provenance
+
+When a wheel is built from the root of a Git checkout, CMake writes
+`simpler_setup/_assets/simpler.pin` during installation. It contains a 40-character
+`revision=<sha>` and `clean=true|false`. Tracked changes and untracked files mark
+the checkout dirty, as do ignored files in package/build input directories.
+Generated build directories, Python bytecode, and compilation databases do not
+count; bytecode and compilation databases are excluded from the wheel. A build
+from a source archive or without an available Git revision has no pin. The pin
+describes the source checkout at packaging time; it does not prove binary byte identity or
+detect changes to installed files after packaging.
 
 ## Import rules
 
