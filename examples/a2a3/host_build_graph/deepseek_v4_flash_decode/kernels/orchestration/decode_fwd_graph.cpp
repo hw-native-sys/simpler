@@ -1231,17 +1231,47 @@ void csa_attn_block(const GraphTaskArgs &args) {
     }
 }
 
-// Which routing arm the recorded body takes. A construction parameter rather than a
-// boundary scalar: the branch is resolved once at record time and fixed in the Definition,
-// so the two arms are two Graphs rather than one Graph with a per-invocation choice.
+// The distributed-MoE context every expert block reads: the peer buffers' handles plus this
+// rank's identity and token count. Fixed for the run -- the handles name buffers the host
+// registered before orchestration, and the counts are settled before the first Graph is
+// submitted -- so they are construction parameters rather than boundary scalars. A boundary
+// scalar is refreshed per invocation and never read as a value inside a recorded body.
+struct CommConfig : simpler::hbg::ConfigBase {
+    int32_t nt{0};
+    int32_t my_rank{0};
+    uint64_t arrived_ctx{0};
+    uint64_t combine_arrived_ctx{0};
+    uint64_t data_arrived_ctx{0};
+    uint64_t recv_meta_ctx{0};
+    uint64_t recv_x_ctx{0};
+    uint64_t recv_aux_ctx{0};
+    uint64_t recv_route_ctx{0};
+    uint64_t routed_y_buf_ctx{0};
+
+    uint64_t hash() const {
+        return simpler::hbg::config_hash(
+            nt, my_rank, arrived_ctx, combine_arrived_ctx, data_arrived_ctx, recv_meta_ctx, recv_x_ctx, recv_aux_ctx,
+            recv_route_ctx, routed_y_buf_ctx
+        );
+    }
+    bool operator==(const CommConfig &o) const {
+        return nt == o.nt && my_rank == o.my_rank && arrived_ctx == o.arrived_ctx &&
+               combine_arrived_ctx == o.combine_arrived_ctx && data_arrived_ctx == o.data_arrived_ctx &&
+               recv_meta_ctx == o.recv_meta_ctx && recv_x_ctx == o.recv_x_ctx && recv_aux_ctx == o.recv_aux_ctx &&
+               recv_route_ctx == o.recv_route_ctx && routed_y_buf_ctx == o.routed_y_buf_ctx;
+    }
+};
+
+// The CSA expert block reads the same context plus one more parameter: which routing arm the
+// recorded body takes. The branch is resolved once at record time and fixed in the
+// Definition, so the two arms are two Graphs rather than one Graph with a per-invocation
+// choice.
 struct CsaMoeConfig : simpler::hbg::ConfigBase {
-    explicit CsaMoeConfig(bool r) :
-        route_by_hash(r) {}
+    CommConfig comm;
+    bool route_by_hash{false};
 
-    bool route_by_hash;
-
-    uint64_t hash() const { return simpler::hbg::config_hash(route_by_hash); }
-    bool operator==(const CsaMoeConfig &other) const { return route_by_hash == other.route_by_hash; }
+    uint64_t hash() const { return simpler::hbg::config_hash_field(comm.hash(), route_by_hash); }
+    bool operator==(const CsaMoeConfig &o) const { return comm == o.comm && route_by_hash == o.route_by_hash; }
 };
 
 void csa_moe_block(const GraphTaskArgs &args, const CsaMoeConfig &config) {
@@ -1282,16 +1312,16 @@ void csa_moe_block(const GraphTaskArgs &args, const CsaMoeConfig &config) {
     // this way.
     auto csa_layer_inline714 = args.scalar(0);
     auto csa_moe_epoch_inline715 = args.scalar(1);
-    uint64_t arrived_ctx = args.scalar<uint64_t>(2);
-    uint64_t combine_arrived_ctx = args.scalar<uint64_t>(3);
-    uint64_t data_arrived_ctx = args.scalar<uint64_t>(4);
-    int32_t my_rank = args.scalar<int32_t>(5);
-    int32_t nt_inline677__rv_v2 = args.scalar<int32_t>(6);
-    uint64_t recv_meta_ctx = args.scalar<uint64_t>(7);
-    uint64_t recv_x_ctx = args.scalar<uint64_t>(8);
-    uint64_t recv_aux_ctx = args.scalar<uint64_t>(9);
-    uint64_t recv_route_ctx = args.scalar<uint64_t>(10);
-    uint64_t routed_y_buf_ctx = args.scalar<uint64_t>(11);
+    uint64_t arrived_ctx = config.comm.arrived_ctx;
+    uint64_t combine_arrived_ctx = config.comm.combine_arrived_ctx;
+    uint64_t data_arrived_ctx = config.comm.data_arrived_ctx;
+    int32_t my_rank = config.comm.my_rank;
+    int32_t nt_inline677__rv_v2 = config.comm.nt;
+    uint64_t recv_meta_ctx = config.comm.recv_meta_ctx;
+    uint64_t recv_x_ctx = config.comm.recv_x_ctx;
+    uint64_t recv_aux_ctx = config.comm.recv_aux_ctx;
+    uint64_t recv_route_ctx = config.comm.recv_route_ctx;
+    uint64_t routed_y_buf_ctx = config.comm.routed_y_buf_ctx;
     SIMPLER_SCOPE() {
         uint32_t x_mixed_inline11049_ci_shapes[2] = {8, 4096};
         TensorCreateInfo x_mixed_inline11049_ci(x_mixed_inline11049_ci_shapes, 2, DataType::BFLOAT16);
@@ -2968,7 +2998,7 @@ void hca_attn_block(const GraphTaskArgs &args) {
     }
 }
 
-void hca_moe_block(const GraphTaskArgs &args) {
+void hca_moe_block(const GraphTaskArgs &args, const CommConfig &config) {
     const simpler::hbg::Tensor &hc_ffn_fn_hca_inline519 = args.tensor(0).ref();
     const simpler::hbg::Tensor &hc_ffn_scale_hca_inline517 = args.tensor(1).ref();
     const simpler::hbg::Tensor &hc_ffn_base_hca_inline541 = args.tensor(2).ref();
@@ -3003,16 +3033,16 @@ void hca_moe_block(const GraphTaskArgs &args) {
     // wrong number. The peeled hash_moe_l*_block bodies below already bind them
     // this way.
     auto hca_moe_epoch_inline716 = args.scalar(0);
-    uint64_t arrived_ctx = args.scalar<uint64_t>(1);
-    uint64_t combine_arrived_ctx = args.scalar<uint64_t>(2);
-    uint64_t data_arrived_ctx = args.scalar<uint64_t>(3);
-    int32_t my_rank = args.scalar<int32_t>(4);
-    int32_t nt_inline677__rv_v2 = args.scalar<int32_t>(5);
-    uint64_t recv_meta_ctx = args.scalar<uint64_t>(6);
-    uint64_t recv_x_ctx = args.scalar<uint64_t>(7);
-    uint64_t recv_aux_ctx = args.scalar<uint64_t>(8);
-    uint64_t recv_route_ctx = args.scalar<uint64_t>(9);
-    uint64_t routed_y_buf_ctx = args.scalar<uint64_t>(10);
+    uint64_t arrived_ctx = config.arrived_ctx;
+    uint64_t combine_arrived_ctx = config.combine_arrived_ctx;
+    uint64_t data_arrived_ctx = config.data_arrived_ctx;
+    int32_t my_rank = config.my_rank;
+    int32_t nt_inline677__rv_v2 = config.nt;
+    uint64_t recv_meta_ctx = config.recv_meta_ctx;
+    uint64_t recv_x_ctx = config.recv_x_ctx;
+    uint64_t recv_aux_ctx = config.recv_aux_ctx;
+    uint64_t recv_route_ctx = config.recv_route_ctx;
+    uint64_t routed_y_buf_ctx = config.routed_y_buf_ctx;
     SIMPLER_SCOPE() {
         uint32_t x_mixed_inline11928_ci_shapes[2] = {8, 4096};
         TensorCreateInfo x_mixed_inline11928_ci(x_mixed_inline11928_ci_shapes, 2, DataType::BFLOAT16);
@@ -4490,7 +4520,7 @@ void swa_attn_block(const GraphTaskArgs &args) {
     }
 }
 
-void hash_moe_l0_block(const GraphTaskArgs &args) {
+void hash_moe_l0_block(const GraphTaskArgs &args, const CommConfig &config) {
     const simpler::hbg::Tensor &x_attn0_inline706 = args.tensor(0).ref();
     const simpler::hbg::Tensor &hc_ffn_base_l0_inline629 = args.tensor(1).ref();
     const simpler::hbg::Tensor &hc_ffn_fn_l0_inline621 = args.tensor(2).ref();
@@ -4521,16 +4551,16 @@ void hash_moe_l0_block(const GraphTaskArgs &args) {
     const simpler::hbg::Tensor &ext_routed_y_buf = args.tensor(27).ref();
     const simpler::hbg::Tensor &ext_combine_arrived = args.tensor(28).ref();
     const simpler::hbg::Tensor &hidden_inline709 = args.tensor(29).ref();
-    int32_t nt_inline677__rv_v2 = args.scalar<int32_t>(0);
-    int32_t my_rank = args.scalar<int32_t>(1);
-    uint64_t recv_meta_ctx = args.scalar<uint64_t>(2);
-    uint64_t arrived_ctx = args.scalar<uint64_t>(3);
-    uint64_t recv_x_ctx = args.scalar<uint64_t>(4);
-    uint64_t recv_aux_ctx = args.scalar<uint64_t>(5);
-    uint64_t recv_route_ctx = args.scalar<uint64_t>(6);
-    uint64_t data_arrived_ctx = args.scalar<uint64_t>(7);
-    uint64_t routed_y_buf_ctx = args.scalar<uint64_t>(8);
-    uint64_t combine_arrived_ctx = args.scalar<uint64_t>(9);
+    int32_t nt_inline677__rv_v2 = config.nt;
+    int32_t my_rank = config.my_rank;
+    uint64_t recv_meta_ctx = config.recv_meta_ctx;
+    uint64_t arrived_ctx = config.arrived_ctx;
+    uint64_t recv_x_ctx = config.recv_x_ctx;
+    uint64_t recv_aux_ctx = config.recv_aux_ctx;
+    uint64_t recv_route_ctx = config.recv_route_ctx;
+    uint64_t data_arrived_ctx = config.data_arrived_ctx;
+    uint64_t routed_y_buf_ctx = config.routed_y_buf_ctx;
+    uint64_t combine_arrived_ctx = config.combine_arrived_ctx;
     SIMPLER_SCOPE() {
         uint32_t x_mixed_inline9242_ci_shapes[2] = {8, 4096};
         TensorCreateInfo x_mixed_inline9242_ci(x_mixed_inline9242_ci_shapes, 2, DataType::BFLOAT16);
@@ -5319,7 +5349,7 @@ void hash_moe_l0_block(const GraphTaskArgs &args) {
     }
 }
 
-void hash_moe_l1_block(const GraphTaskArgs &args) {
+void hash_moe_l1_block(const GraphTaskArgs &args, const CommConfig &config) {
     const simpler::hbg::Tensor &x_attn1_inline694 = args.tensor(0).ref();
     const simpler::hbg::Tensor &hc_ffn_base_l1_inline720 = args.tensor(1).ref();
     const simpler::hbg::Tensor &hc_ffn_fn_l1_inline718 = args.tensor(2).ref();
@@ -5350,16 +5380,16 @@ void hash_moe_l1_block(const GraphTaskArgs &args) {
     const simpler::hbg::Tensor &ext_routed_y_buf = args.tensor(27).ref();
     const simpler::hbg::Tensor &ext_combine_arrived = args.tensor(28).ref();
     const simpler::hbg::Tensor &hidden_inline709 = args.tensor(29).ref();
-    int32_t nt_inline677__rv_v2 = args.scalar<int32_t>(0);
-    int32_t my_rank = args.scalar<int32_t>(1);
-    uint64_t recv_meta_ctx = args.scalar<uint64_t>(2);
-    uint64_t arrived_ctx = args.scalar<uint64_t>(3);
-    uint64_t recv_x_ctx = args.scalar<uint64_t>(4);
-    uint64_t recv_aux_ctx = args.scalar<uint64_t>(5);
-    uint64_t recv_route_ctx = args.scalar<uint64_t>(6);
-    uint64_t data_arrived_ctx = args.scalar<uint64_t>(7);
-    uint64_t routed_y_buf_ctx = args.scalar<uint64_t>(8);
-    uint64_t combine_arrived_ctx = args.scalar<uint64_t>(9);
+    int32_t nt_inline677__rv_v2 = config.nt;
+    int32_t my_rank = config.my_rank;
+    uint64_t recv_meta_ctx = config.recv_meta_ctx;
+    uint64_t arrived_ctx = config.arrived_ctx;
+    uint64_t recv_x_ctx = config.recv_x_ctx;
+    uint64_t recv_aux_ctx = config.recv_aux_ctx;
+    uint64_t recv_route_ctx = config.recv_route_ctx;
+    uint64_t data_arrived_ctx = config.data_arrived_ctx;
+    uint64_t routed_y_buf_ctx = config.routed_y_buf_ctx;
+    uint64_t combine_arrived_ctx = config.combine_arrived_ctx;
     SIMPLER_SCOPE() {
         uint32_t x_mixed_inline10004_ci_shapes[2] = {8, 4096};
         TensorCreateInfo x_mixed_inline10004_ci(x_mixed_inline10004_ci_shapes, 2, DataType::BFLOAT16);
@@ -7249,10 +7279,22 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // between invocations loses Definition reuse for these keys permanently, since a
     // published Definition is never replaced. Forwarding is not available for it -- the
     // body computes with the number.
-    hash_moe_l0_block_args_l0.add_static_scalar(nt_inline677__rv_v2, my_rank, recv_meta_ctx, arrived_ctx);
-    hash_moe_l0_block_args_l0.add_static_scalar(recv_x_ctx, recv_aux_ctx, recv_route_ctx, data_arrived_ctx);
-    hash_moe_l0_block_args_l0.add_static_scalar(routed_y_buf_ctx, combine_arrived_ctx);
-    rt_submit_graph(&hash_moe_l0_block, hash_moe_l0_block_args_l0);
+    // The distributed-MoE context, settled once for the run and read by every expert block.
+    // nt is the last of these to be fixed -- the loop above accumulates it -- so this sits
+    // between that loop and the first Graph submission.
+    CommConfig comm_config;
+    comm_config.nt = nt_inline677__rv_v2;
+    comm_config.my_rank = my_rank;
+    comm_config.arrived_ctx = arrived_ctx;
+    comm_config.combine_arrived_ctx = combine_arrived_ctx;
+    comm_config.data_arrived_ctx = data_arrived_ctx;
+    comm_config.recv_meta_ctx = recv_meta_ctx;
+    comm_config.recv_x_ctx = recv_x_ctx;
+    comm_config.recv_aux_ctx = recv_aux_ctx;
+    comm_config.recv_route_ctx = recv_route_ctx;
+    comm_config.routed_y_buf_ctx = routed_y_buf_ctx;
+
+    rt_submit_graph(&hash_moe_l0_block, hash_moe_l0_block_args_l0, comm_config);
     GraphTaskArgs swa_attn_block_args_l1;
     swa_attn_block_args_l1.add_input(hidden_inline709);
     swa_attn_block_args_l1.add_input(hc_attn_base_l1_inline675);
@@ -7309,10 +7351,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     hash_moe_l1_block_args_l1.add_inout(ext_routed_y_buf);
     hash_moe_l1_block_args_l1.add_input(ext_combine_arrived);
     hash_moe_l1_block_args_l1.add_inout(hidden_inline709);
-    hash_moe_l1_block_args_l1.add_static_scalar(nt_inline677__rv_v2, my_rank, recv_meta_ctx, arrived_ctx);
-    hash_moe_l1_block_args_l1.add_static_scalar(recv_x_ctx, recv_aux_ctx, recv_route_ctx, data_arrived_ctx);
-    hash_moe_l1_block_args_l1.add_static_scalar(routed_y_buf_ctx, combine_arrived_ctx);
-    rt_submit_graph(&hash_moe_l1_block, hash_moe_l1_block_args_l1);
+    rt_submit_graph(&hash_moe_l1_block, hash_moe_l1_block_args_l1, comm_config);
     auto submit_csa_attn_block = [&](int32_t csa_layer_inline714, int64_t loop_i_inline712,
                                      const simpler::hbg::Tensor &x_attn_csa_inline721,
                                      const simpler::hbg::Tensor &hidden_inline709) {
@@ -8051,12 +8090,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         csa_moe_block_args.add_inout(x_attn_csa_inline721);
         csa_moe_block_args.add_inout(hidden_mid_inline726);
         csa_moe_block_args.add_scalar(csa_layer_inline714, csa_moe_epoch_inline715);
-        csa_moe_block_args.add_static_scalar(arrived_ctx, combine_arrived_ctx);
-        csa_moe_block_args.add_static_scalar(data_arrived_ctx, my_rank, nt_inline677__rv_v2, recv_meta_ctx);
-        csa_moe_block_args.add_static_scalar(recv_x_ctx, recv_aux_ctx, recv_route_ctx, routed_y_buf_ctx);
-        rt_submit_graph(
-            &csa_moe_block, csa_moe_block_args, CsaMoeConfig{static_cast<int64_t>(csa_layer_inline714) < 3}
-        );
+        CsaMoeConfig csa_config;
+        csa_config.comm = comm_config;
+        csa_config.route_by_hash = static_cast<int64_t>(csa_layer_inline714) < 3;
+        rt_submit_graph(&csa_moe_block, csa_moe_block_args, csa_config);
     };
     auto submit_hca_attn_block = [&](int32_t hca_layer_inline704, int64_t loop_i_inline712,
                                      const simpler::hbg::Tensor &x_attn_hca_inline723,
@@ -8615,10 +8652,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         hca_moe_block_args.add_inout(hidden_inline709);
         hca_moe_block_args.add_inout(x_attn_hca_inline723);
         hca_moe_block_args.add_scalar(hca_moe_epoch_inline716);
-        hca_moe_block_args.add_static_scalar(arrived_ctx, combine_arrived_ctx, data_arrived_ctx);
-        hca_moe_block_args.add_static_scalar(my_rank, nt_inline677__rv_v2, recv_meta_ctx, recv_x_ctx);
-        hca_moe_block_args.add_static_scalar(recv_aux_ctx, recv_route_ctx, routed_y_buf_ctx);
-        rt_submit_graph(&hca_moe_block, hca_moe_block_args);
+        rt_submit_graph(&hca_moe_block, hca_moe_block_args, comm_config);
     };
     for (int64_t loop_i_inline712 = 0; loop_i_inline712 < 20; loop_i_inline712 += 1) {
         int32_t csa_layer_inline714 = static_cast<int32_t>(((loop_i_inline712 * 2) + 2));

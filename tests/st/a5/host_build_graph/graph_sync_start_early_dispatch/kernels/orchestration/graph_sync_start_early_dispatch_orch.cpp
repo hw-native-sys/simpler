@@ -67,9 +67,19 @@ static constexpr int64_t PRODUCER_SPIN_ITERS = 10000000;
 
 namespace {
 
-void sync_start_body(const GraphTaskArgs &args) {
+// This run's cluster count, which the body turns into a launch block_num. Fixed for the
+// run -- rt_available_cluster_count() reports the geometry the bind latched -- so it is a
+// construction parameter rather than a boundary scalar.
+struct SyncStartConfig : simpler::hbg::ConfigBase {
+    int64_t cohort_blocks{0};
+
+    uint64_t hash() const { return simpler::hbg::config_hash(cohort_blocks); }
+    bool operator==(const SyncStartConfig &o) const { return cohort_blocks == o.cohort_blocks; }
+};
+
+void sync_start_body(const GraphTaskArgs &args, const SyncStartConfig &config) {
     const simpler::hbg::Tensor &out = args.tensor(0).ref();
-    const int64_t cohort_blocks = args.scalar<int64_t>(0);
+    const int64_t cohort_blocks = config.cohort_blocks;
 
     // Root A — the task this scene exists for. Empty body fanin row, so the
     // shell's early release is the only thing that can stage it.
@@ -124,8 +134,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     GraphTaskArgs layer_args;
     layer_args.add_inout(out);  // seed wrote this -> the shell depends on the seed
-    layer_args.add_scalar(static_cast<int64_t>(cohort_blocks));
-    rt_submit_graph(&sync_start_body, layer_args);
+    SyncStartConfig config;
+    config.cohort_blocks = static_cast<int64_t>(cohort_blocks);
+    rt_submit_graph(&sync_start_body, layer_args, config);
 
     uint32_t idx[1] = {0};
     set_tensor_data<int32_t>(layout, 1, idx, cohort_blocks);
