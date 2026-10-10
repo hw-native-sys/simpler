@@ -203,6 +203,7 @@ private:
     // Published before completed_, so a thread that observes completion also
     // observes this and cannot enter the healthy shutdown path for a fatal run.
     std::atomic<bool> fatal_shutdown_started_{false};
+    StallWarningEpisode stall_warning_episode_;
     // Both participants modify each core's atomic byte: the operation that sees
     // the other bit alone owns retirement. READY publishes initialization;
     // REQUESTED can arrive before initialization without consuming an empty set.
@@ -459,8 +460,13 @@ private:
     __attribute__((noinline, cold)) LoopAction
     handle_orchestrator_exit(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t &task_count);
 
-    __attribute__((noinline, cold)) LoopAction
-    check_idle_fatal_error(int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime);
+    // idle_iterations / last_progress_count feed the post-mortem this emits
+    // when it is the one to latch the run's end; the pre-dispatch caller has
+    // no idle counters of its own and passes zeroes.
+    __attribute__((noinline, cold)) LoopAction check_idle_fatal_error(
+        int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t idle_iterations = 0,
+        int32_t last_progress_count = 0
+    );
 
     __attribute__((noinline, cold)) void log_stall_diagnostics(
         int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count,
@@ -468,7 +474,8 @@ private:
     );
 
     __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
-        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
+        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count,
+        const char *reason, StallDumpReport report = StallDumpReport::Shutdown
     );
 
     // Reverse lookup: given a global core_id, find which scheduler thread's

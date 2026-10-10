@@ -193,6 +193,7 @@ private:
     std::atomic<bool> orchestrator_done_{false};
     std::atomic<bool> completed_{false};
     std::atomic<bool> fatal_shutdown_started_{false};
+    StallWarningEpisode stall_warning_episode_;
     // READY publishes completed initialization, or an opened window on startup
     // failure. REQUESTED retains an exit request before that publication. Only
     // the operation adding the second bit owns the core's window and return gate.
@@ -519,7 +520,8 @@ private:
     );
 
     __attribute__((noinline, cold)) void log_shutdown_stall_snapshot(
-        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count
+        int32_t trigger_thread_idx, int32_t trigger_idle_iterations, int32_t trigger_last_progress_count,
+        const char *reason, StallDumpReport report = StallDumpReport::Shutdown
     );
 
     // Reverse lookup: given a global core_id, find which scheduler thread's

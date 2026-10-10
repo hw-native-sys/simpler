@@ -306,6 +306,9 @@ struct AsyncWaitList {
         int thread_idx
 #endif
     );
+
+    // Report a bounded snapshot of completions that can still block a task.
+    void log_diagnostics(AICoreCompletionMailbox *aicore_mailbox, const char *reason, bool warn_details = true);
 };
 
 #endif  // PTO_ASYNC_WAIT_H
