@@ -20,11 +20,20 @@
  * third: diagnostics stay exclusive to one launched run.
  */
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "call_config.h"
@@ -58,6 +67,11 @@ std::unordered_map<void *, uint32_t> g_slots;
 std::array<bool, kCapacity> g_complete{};
 std::vector<std::string> g_events;
 bool g_supports_joined{true};
+/** The slot whose `finalize_run` reports a device error, or `kNoFailingSlot` for none. */
+constexpr uint32_t kNoFailingSlot = ~0u;
+uint32_t g_finalize_fails_slot{kNoFailingSlot};
+/** Every caller-reference release a run made, as `(borrow id, kept)`. */
+std::vector<std::pair<uint64_t, bool>> g_releases;
 
 uint32_t slot_of(void *runtime) { return g_slots.at(runtime); }
 
@@ -92,9 +106,13 @@ int wait_run(void *, void *runtime) {
 }
 
 int finalize_run(void *, void *runtime) {
-    g_events.push_back("finalize" + std::to_string(slot_of(runtime)));
-    return 0;
+    const uint32_t slot = slot_of(runtime);
+    g_events.push_back("finalize" + std::to_string(slot));
+    return slot == g_finalize_fails_slot ? PTO_RUNTIME_ERR_INTERNAL : 0;
 }
+
+/** Records what each run asked its caller references to do when it ended. */
+void release_caller_buffers(void *, uint64_t borrow_id, int keep) { g_releases.push_back({borrow_id, keep != 0}); }
 
 int supports_successor(void *) { return 1; }
 int supports_joined(void *) { return g_supports_joined ? 1 : 0; }
@@ -105,6 +123,8 @@ void prime_worker(ChipWorker &worker, uint32_t depth, unsigned launch_depth) {
     g_complete = {};
     g_events.clear();
     g_supports_joined = true;
+    g_finalize_fails_slot = kNoFailingSlot;
+    g_releases.clear();
     worker.launch_depth_ = launch_depth;
     worker.initialized_ = true;
     worker.pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, depth, {}};
@@ -122,6 +142,7 @@ void prime_worker(ChipWorker &worker, uint32_t depth, unsigned launch_depth) {
     worker.finalize_run_fn_ = finalize_run;
     worker.supports_concurrent_native_prepare_fn_ = supports_successor;
     worker.supports_joined_native_launch_fn_ = supports_joined;
+    worker.device_release_caller_buffers_ctx_fn_ = release_caller_buffers;
 }
 
 /** One host-space tensor, which is what keeps a run inside the joined scope. */
@@ -197,6 +218,55 @@ TEST(ThreeRunCapacityLaneTest, TheRunPastTheGrantedCapacityIsRefusedRatherThanQu
     EXPECT_TRUE(second.done());
     EXPECT_TRUE(third.done());
     lane.close();
+    worker.finalize();
+}
+
+TEST(ThreeRunCapacityLaneTest, AMiddleRunsFailureKeepsItsOwnReferencesAndLeavesThePredecessorAlone) {
+    // Failure attribution at three, where there is a run on each side of the failing one. The
+    // device error is injected at the native boundary rather than produced on hardware: the
+    // question here is which run owns the outcome and what its references do, and that is lane
+    // state. What a real device failure then publishes to a *Worker* is a separate contract, and
+    // the predecessor-outcome half of it is external PR #2532's — this case does not reach it.
+    ChipWorker worker;
+    prime_worker(worker, /*depth=*/3, /*launch_depth=*/3);
+    g_finalize_fails_slot = 1;
+    ChipRunLane lane(worker);
+
+    ChipRun first = submit_at(lane, 1, 0, CallConfig{}, /*activate=*/true);
+    ChipRun second = submit_at(lane, 2, 1, CallConfig{}, /*activate=*/false);
+    second.activate();
+    ChipRun third = submit_at(lane, 3, 2, CallConfig{}, /*activate=*/false);
+    third.activate();
+
+    g_complete = {true, true, true};
+    // The predecessor completes on its own terms: its slot's finalize reported success, so its
+    // references are discharged rather than kept.
+    EXPECT_TRUE(first.done());
+    ASSERT_EQ(g_releases.size(), 1u);
+    EXPECT_FALSE(g_releases.front().second);
+
+    // The failing run carries its own error, and nothing the predecessor did is restated. Bounded:
+    // `wait_until` reports a deadline it did not meet as `false`, so a run that stopped reaching an
+    // outcome fails this assertion instead of parking the suite.
+    const ChipRun::Deadline deadline = ChipRun::Clock::now() + std::chrono::seconds(5);
+    EXPECT_THROW(second.wait_until(deadline), std::runtime_error);
+    ASSERT_EQ(g_releases.size(), 2u);
+    // Kept, not released: an unproven finalize cannot establish that the device stopped reading
+    // those bytes, so the caller's release stays refused from here on.
+    EXPECT_TRUE(g_releases.back().second);
+    EXPECT_NE(g_releases.back().first, g_releases.front().first);
+
+    // The run behind it had already crossed its own launch fence, so it owns device work only its
+    // own drain can retire: it reaches its own outcome and discharges its own references. What the
+    // failure took is the lane's ability to admit or serve anything further.
+    EXPECT_TRUE(second.lane_poisoned());
+    EXPECT_TRUE(third.wait_until(ChipRun::Clock::now() + std::chrono::seconds(5)));
+    ASSERT_EQ(g_releases.size(), 3u);
+    EXPECT_FALSE(g_releases.back().second);
+
+    // Closing a poisoned lane reports the failure rather than swallowing it, so this is the
+    // expected outcome of the close rather than an escaped error.
+    EXPECT_THROW(lane.close(), std::runtime_error);
     worker.finalize();
 }
 
@@ -470,7 +540,210 @@ struct CapacityHarness {
     }
 
     void accept(const Run &run) { orch.mark_task_accepted(run.task.task_slot); }
+
+    /**
+     * Drive a run's only task to completion so the run retires and gives its FIFO entry back.
+     *
+     * Reports rather than asserts: its callers run in a child process, where a gtest failure
+     * reaches nobody and only the exit status is carried back.
+     */
+    bool complete(const Run &run) {
+        allocator.slot_state(run.task.task_slot)->state.store(TaskState::COMPLETED, std::memory_order_release);
+        return orch.on_consumed(run.task.task_slot);
+    }
 };
+
+/** Poll `ready` until it holds, or report the deadline as the failure it is. */
+bool settled_within(const std::function<bool()> &ready, double seconds = 5.0) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::duration<double>(seconds);
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (ready()) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
+}
+
+/** What an admission scenario concluded, carried back through a child's exit status. */
+enum class AdmissionOutcome : int {
+    OK = 0,
+    HEAD_NOT_ACTIVE = 11,
+    SUBMISSION_RAISED = 12,
+    NEVER_PARKED = 13,
+    ADMITTED_WHILE_HELD = 14,
+    NOT_RELEASED_BY_RETIREMENT = 15,
+    WAITER_LEFT_BEHIND = 16,
+    ADMITTED_AN_EXISTING_ID = 17,
+    RETIREMENT_REFUSED = 18,
+    SCENARIO_THREW = 19,
+};
+
+int outcome_code(AdmissionOutcome outcome) { return static_cast<int>(outcome); }
+
+const char *admission_outcome_text(int code) {
+    switch (code) {
+    case 0:
+        return "the scenario held";
+    case 11:
+        return "the head run never became active, so nothing held the first set";
+    case 12:
+        return "the parked submission failed instead of waiting";
+    case 13:
+        return "no submission was ever counted in admission, so the bound was never met";
+    case 14:
+        return "a further run was admitted while the granted sets were all held";
+    case 15:
+        return "retiring one run did not release the parked submission";
+    case 16:
+        return "a waiter was left in admission after the submission returned";
+    case 17:
+        return "admission handed back the id of a run that already held a set";
+    case 18:
+        return "a run would not retire, so the release this case tests never had its cause";
+    case 19:
+        return "the scenario raised before it could conclude";
+    case -1:
+        return "the child could not be started or collected";
+    case -2:
+        return "the child did not exit: either its alarm ended a submission that never returned, or it aborted";
+    default:
+        return "an unrecognized outcome";
+    }
+}
+
+/**
+ * Run one admission scenario in a child process, and report what it concluded.
+ *
+ * The parked caller is why this is isolated. `begin_run` waits on a condition variable with no
+ * deadline of its own, so if the retirement that must release it stops doing so, the thread waits
+ * forever and no join in the scenario can return. Here that leaves the *child* parked, `alarm`
+ * ends it, and this process reports a bounded failure — without detaching a thread, without any
+ * reference outliving its owner, and without a production knob that exists only for a test.
+ */
+int isolated_admission_outcome(const std::function<int()> &scenario, unsigned alarm_seconds = 30) {
+    const pid_t child = fork();
+    if (child < 0) return -1;
+    if (child == 0) {
+        alarm(alarm_seconds);
+        int code = outcome_code(AdmissionOutcome::SCENARIO_THREW);
+        try {
+            code = scenario();
+        } catch (...) {
+            // Deliberate: an escaping exception here would abort the child, and the status that
+            // produced would be indistinguishable from the alarm this case exists to detect.
+        }
+        _exit(code);
+    }
+    int status = 0;
+    pid_t collected = 0;
+    do {
+        collected = waitpid(child, &status, 0);
+    } while (collected < 0 && errno == EINTR);
+    if (collected != child) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -2;
+}
+
+/**
+ * A fourth caller meets the capacity bound, and one retirement is what releases it.
+ *
+ * Nothing is concluded before the submitted thread has been released and joined, so the scenario
+ * always has a thread to join and never leaves one behind.
+ */
+int parks_until_one_of_three_retires() {
+    CapacityHarness h(/*depth=*/3, /*launch_depth=*/3);
+    const auto first = h.build_closed_run(1);
+    const auto second = h.build_closed_run(2);
+    const auto third = h.build_closed_run(3);
+    h.accept(first);
+    if (h.orch.active_run_id() != first.id) return outcome_code(AdmissionOutcome::HEAD_NOT_ACTIVE);
+
+    std::atomic<RunId> fourth{INVALID_RUN_ID};
+    std::atomic<bool> raised{false};
+    std::thread submitter([&] {
+        try {
+            fourth.store(h.orch.begin_run(), std::memory_order_release);
+        } catch (...) {
+            raised.store(true, std::memory_order_release);
+        }
+    });
+
+    // A caller is counted only once the FIFO bound has stopped it, so being counted is having met
+    // backpressure. Having started a thread would be evidence of nothing.
+    const bool parked = settled_within([&] {
+        return h.orch.begin_run_waiter_count_for_test() == 1;
+    });
+    const RunId while_three_held = fourth.load(std::memory_order_acquire);
+
+    // The retirement is the release, and it is the only thing that happens between that reading
+    // and the one below.
+    const bool retired = h.complete(first);
+    submitter.join();
+
+    if (raised.load(std::memory_order_acquire)) return outcome_code(AdmissionOutcome::SUBMISSION_RAISED);
+    if (!parked) return outcome_code(AdmissionOutcome::NEVER_PARKED);
+    if (while_three_held != INVALID_RUN_ID) return outcome_code(AdmissionOutcome::ADMITTED_WHILE_HELD);
+    if (!retired) return outcome_code(AdmissionOutcome::RETIREMENT_REFUSED);
+    if (h.orch.begin_run_waiter_count_for_test() != 0) return outcome_code(AdmissionOutcome::WAITER_LEFT_BEHIND);
+    const RunId admitted = fourth.load(std::memory_order_acquire);
+    if (admitted == INVALID_RUN_ID) return outcome_code(AdmissionOutcome::NOT_RELEASED_BY_RETIREMENT);
+    if (admitted == first.id || admitted == second.id || admitted == third.id) {
+        return outcome_code(AdmissionOutcome::ADMITTED_AN_EXISTING_ID);
+    }
+    return outcome_code(AdmissionOutcome::OK);
+}
+
+/** The same boundary one set lower, where the run this admits third is the one that waits. */
+int parks_until_one_of_two_retires() {
+    CapacityHarness h(/*depth=*/2, /*launch_depth=*/2);
+    const auto first = h.build_closed_run(1);
+    const auto second = h.build_closed_run(2);
+    h.accept(first);
+    if (h.orch.active_run_id() != first.id) return outcome_code(AdmissionOutcome::HEAD_NOT_ACTIVE);
+
+    std::atomic<RunId> third{INVALID_RUN_ID};
+    std::atomic<bool> raised{false};
+    std::thread submitter([&] {
+        try {
+            third.store(h.orch.begin_run(), std::memory_order_release);
+        } catch (...) {
+            raised.store(true, std::memory_order_release);
+        }
+    });
+
+    const bool parked = settled_within([&] {
+        return h.orch.begin_run_waiter_count_for_test() == 1;
+    });
+    const RunId while_two_held = third.load(std::memory_order_acquire);
+
+    const bool retired = h.complete(first);
+    submitter.join();
+
+    if (raised.load(std::memory_order_acquire)) return outcome_code(AdmissionOutcome::SUBMISSION_RAISED);
+    if (!parked) return outcome_code(AdmissionOutcome::NEVER_PARKED);
+    if (while_two_held != INVALID_RUN_ID) return outcome_code(AdmissionOutcome::ADMITTED_WHILE_HELD);
+    if (!retired) return outcome_code(AdmissionOutcome::RETIREMENT_REFUSED);
+    const RunId admitted = third.load(std::memory_order_acquire);
+    if (admitted == INVALID_RUN_ID) return outcome_code(AdmissionOutcome::NOT_RELEASED_BY_RETIREMENT);
+    if (admitted == first.id || admitted == second.id) {
+        return outcome_code(AdmissionOutcome::ADMITTED_AN_EXISTING_ID);
+    }
+    return outcome_code(AdmissionOutcome::OK);
+}
+
+// The causal half of the capacity claim, which no observation of running hardware can give: a
+// fourth caller reaching admission while three runs hold the three granted sets is parked there,
+// and the retirement of one of those runs is what releases it. Everything is driven synchronously,
+// so the ordering is established rather than inferred from timing — the only wait is on the
+// orchestrator's own count of parked callers, and exhausting it is a failure.
+TEST(ThreeRunCapacityOrchestratorTest, AFourthRunParksInAdmissionUntilOneOfTheThreeRetires) {
+    const int outcome = isolated_admission_outcome(parks_until_one_of_three_retires);
+    EXPECT_EQ(outcome, 0) << admission_outcome_text(outcome);
+}
+
+// The park follows the granted capacity rather than a constant.
+TEST(ThreeRunCapacityOrchestratorTest, AGrantOfTwoParksTheThirdRunInAdmission) {
+    const int outcome = isolated_admission_outcome(parks_until_one_of_two_retires);
+    EXPECT_EQ(outcome, 0) << admission_outcome_text(outcome);
+}
 
 TEST(ThreeRunCapacityOrchestratorTest, BothSuccessorsArePreparableAtCapacityThree) {
     CapacityHarness h(/*depth=*/3, /*launch_depth=*/3);

@@ -533,6 +533,13 @@ _PENDING_RUN_DEPTH_MAX = 2**32 - 1
 # raising a runtime's published maximum must not move this.
 _DEFAULT_PIPELINE_DEPTH_REQUEST = 2
 
+# Onboard platforms whose `host_build_graph` publishes a third run-resource set. A request above
+# the default is carried only to one of these; anywhere else the child is asked for the default.
+# Membership here decides what is *asked for*, never what is granted: the child answers with what
+# its module declared, and `_granted_chip_pipeline_depth` fails startup when an explicit request
+# got less than it asked for.
+_THREE_SET_PLATFORMS = frozenset({"a2a3", "a5"})
+
 
 def _validated_pending_run_depth(config: dict, level: int) -> int:
     """This Worker's `pending_run_depth`, validated before any startup side effect.
@@ -12524,10 +12531,17 @@ class Worker:
         """Why this Worker cannot be granted more than the default capacity, or None when it can.
 
         The supported shape is the one the contract names: a level-3 root driving exactly one
-        local chip endpoint on onboard a2a3 host_build_graph, with nothing else in the tree. Every
-        other provenance keeps the default, because no third set is negotiated or validated for it
-        in this step: a deeper level, sub-workers sharing this admission, a second endpoint, a
-        simulated platform, another runtime.
+        local chip endpoint on an onboard host_build_graph platform that declares three sets —
+        a2a3 and a5 — with nothing else in the tree. Every other provenance keeps the default,
+        because no third set is negotiated or validated for it in this step: a deeper level,
+        sub-workers sharing this admission, a second endpoint, a simulated platform, another
+        runtime.
+
+        This gate decides only whether the larger request is *carried* to the child. Whether the
+        child could serve it is a separate answer, and an explicit request is never silently
+        reduced: `_granted_chip_pipeline_depth` compares the grant against the explicit request
+        and fails startup when the child granted fewer. So a listed platform whose module declared
+        two makes `init()` raise, not serve two quietly.
 
         Being a *root* is a property of this Worker's own startup, not of its level. A level-3
         Worker is a legal child of a level-4 parent, and a remote or MPI session initializes the
@@ -12545,8 +12559,8 @@ class Worker:
         if int(self.level) != 3:
             return f"level {int(self.level)} is not the level-3 root this capacity is negotiated for"
         platform = str(self._config.get("platform", ""))
-        if platform != "a2a3":
-            return f"platform {platform!r} is not onboard a2a3"
+        if platform not in _THREE_SET_PLATFORMS:
+            return f"platform {platform!r} is not one of the onboard platforms that declare three sets"
         runtime = str(self._config.get("runtime", ""))
         if runtime != "host_build_graph":
             return f"runtime {runtime!r} is not host_build_graph"
@@ -12575,7 +12589,8 @@ class Worker:
             raise RuntimeError(
                 f"Worker pipeline_depth={requested} is not supported by this configuration: {refusal}. "
                 f"Three run-resource sets are negotiated for a level-3 Worker that is the root of its own "
-                f"startup, on onboard a2a3 host_build_graph, with one local chip endpoint and no other children."
+                f"startup, on onboard {'/'.join(sorted(_THREE_SET_PLATFORMS))} host_build_graph, with one local "
+                f"chip endpoint and no other children."
             )
         return _DEFAULT_PIPELINE_DEPTH_REQUEST
 

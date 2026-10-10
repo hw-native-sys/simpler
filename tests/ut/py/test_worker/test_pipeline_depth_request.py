@@ -80,12 +80,17 @@ def _scoped_worker(**overrides):
 
 
 @pytest.mark.skipif(PTO_PIPELINE_MAX_DEPTH < 3, reason="a third set needs a ceiling above two")
-def test_the_supported_configuration_carries_the_larger_request():
-    assert _scoped_worker()._requested_chip_pipeline_depth() == PTO_PIPELINE_MAX_DEPTH
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_the_supported_configuration_carries_the_larger_request(platform):
+    # Both onboard host_build_graph platforms declare three sets, so both carry the request to
+    # their child. What the child then grants is a separate answer, checked below.
+    assert _scoped_worker(platform=platform)._requested_chip_pipeline_depth() == PTO_PIPELINE_MAX_DEPTH
 
 
 @pytest.mark.skipif(PTO_PIPELINE_MAX_DEPTH < 3, reason="a third set needs a ceiling above two")
 def test_an_unsupported_grant_fails_startup_with_both_numbers():
+    # In scope and explicitly requested, so a child that granted only two is a shortfall the
+    # caller is told about rather than silently served.
     worker = _scoped_worker(platform="a5")
     with pytest.raises(RuntimeError, match="was requested, but this configuration grants 2"):
         worker._granted_chip_pipeline_depth([2])
@@ -138,10 +143,10 @@ def test_a_level_two_worker_grants_the_standing_default_however_high_the_runtime
         {"num_sub_workers": 1},
         {"device_ids": [0, 1]},
         {"platform": "a2a3sim"},
-        {"platform": "a5"},
+        {"platform": "a5sim"},
         {"runtime": "tensormap_and_ringbuffer"},
     ],
-    ids=["level4", "sub_workers", "two_endpoints", "sim", "a5", "tmr"],
+    ids=["level4", "sub_workers", "two_endpoints", "a2a3sim", "a5sim", "tmr"],
 )
 def test_an_explicit_request_outside_the_supported_shape_is_refused_before_anything_commits(overrides):
     # Refused, not reduced: the caller asked for three runs in flight and this configuration does

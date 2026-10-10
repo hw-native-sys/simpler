@@ -116,6 +116,15 @@ static_assert(
     "AICore Scheduler profiling levels must match the chip-swimlane contract"
 );
 
+/**
+ * Run-resource sets a kernel-mode context of this runtime declares.
+ *
+ * A separate number from the program declaration below: `simpler_kernel_mode_init`
+ * validates this contract and discards it, so the two are independent
+ * declarations rather than one capability read twice.
+ */
+static constexpr uint32_t kKernelPipelineDepth = 2;
+
 extern "C" const PipelineContract *get_pipeline_contract(void) {
     // Host orchestration materializes this run's own graph into the image it
     // uploads, so every device-resident region carries per-run content.
@@ -123,10 +132,14 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
     // PTO_PIPELINE_GM_SM is absent because hbg has no separate shared-memory
     // region: the image is the tail of the runtime-image region, so it shares that
     // region's classification. The arena-topology check skips an absent kind.
+    // `pipeline_depth` is the maximum this runtime supports, not a configured
+    // count: every device-resident region it names carries per-run content and
+    // is selected by the caller's lease, so three runs can hold three of them.
+    // What a context actually grants is the smaller of this and the request.
     static const PipelineContract contract = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
         4,
-        2,
+        PTO_PIPELINE_MAX_DEPTH,
         {
             {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0},
             {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0},
@@ -142,7 +155,12 @@ extern "C" int build_kernel_pipeline_contract_impl(const CallConfig *config, Pip
     if (config == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     // The graph and its heap are sized by each bind's host orchestration.
     // Init declares their bank topology, without claiming a fixed capacity.
+    //
+    // The bank topology is the program declaration's; the depth is not. A
+    // kernel context's capacity is `kKernelPipelineDepth` whatever the program
+    // path supports, so the two move independently.
     *out = *get_pipeline_contract();
+    out->pipeline_depth = kKernelPipelineDepth;
     return 0;
 }
 
