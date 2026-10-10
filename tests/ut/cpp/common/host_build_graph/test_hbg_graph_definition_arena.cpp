@@ -97,10 +97,15 @@ protected:
     // Record one Graph of `task_count` chained tasks under `graph_key`. The chain
     // makes the image's size a function of the count, so two keys recorded with
     // different counts cannot come out byte-identical and share one Definition.
-    void record_graph(uint64_t graph_key, int task_count, const simpler::hbg::Tensor &boundary, const uint32_t *shape) {
+    // `config` is this recording's exact construction-parameter blob; the default
+    // names none, which is what every no-config submission looks like.
+    void record_graph(
+        uint64_t graph_key, int task_count, const simpler::hbg::Tensor &boundary, const uint32_t *shape,
+        GraphConfigView config = {nullptr, 0}
+    ) {
         GraphTaskArgs boundary_args;
         boundary_args.add_input(boundary);
-        const GraphScopeResult scope = orch.graph_begin(graph_key, boundary_args, 0x1736);
+        const GraphScopeResult scope = orch.graph_begin(graph_key, graph_key, config, boundary_args, 0x1736);
         ASSERT_TRUE(scope.recording);
         ASSERT_TRUE(scope.task_id.is_valid());
         ASSERT_TRUE(orch.graph_prepare(scope.recording_handle, boundary_args));
@@ -150,7 +155,7 @@ TEST_F(HbgGraphDefinitionArenaTest, ObjectsAreBuiltInTheArenaAtAlignedDisjointOf
         claimed_total += claimed;
         EXPECT_LE(entry.object_offset + claimed, used) << "the claimed prefix must cover every object in it";
         const GraphDefinition *image = definition_image(entry);
-        EXPECT_EQ(image->full_key, entry.full_key);
+        EXPECT_EQ(image->full_key, entry.key.digest);
         EXPECT_EQ(image->total_bytes, entry.bytes);
         EXPECT_GT(image->task_count, 0u) << "the object holds a filled image, not just claimed bytes";
         EXPECT_EQ(reinterpret_cast<uintptr_t>(image) % GRAPH_DEFINITION_OBJECT_ALIGN, 0u)
@@ -175,7 +180,7 @@ TEST_F(HbgGraphDefinitionArenaTest, ObjectsAreBuiltInTheArenaAtAlignedDisjointOf
         ASSERT_TRUE(upload.has_value());
         size_t matches = 0;
         for (const GraphHostDefinition &entry : definitions.entries) {
-            if (entry.full_key != upload->full_key) continue;
+            if (!(entry.key == *upload->key)) continue;
             EXPECT_EQ(definition_image(entry)->total_bytes, entry.bytes) << "shell " << i;
             matches++;
         }
@@ -204,13 +209,13 @@ TEST_F(HbgGraphDefinitionArenaTest, AnArenaWithNoRoomSpillsAndStillPublishesTheI
     EXPECT_EQ(graph_host_arena_used(*graph_state), 0u) << "nothing was claimed, so the upload ships no prefix";
 
     const GraphDefinition *image = definition_image(entry);
-    EXPECT_EQ(image->full_key, entry.full_key);
+    EXPECT_EQ(image->full_key, entry.key.digest);
     EXPECT_EQ(image->total_bytes, entry.bytes);
     EXPECT_GT(image->task_count, 0u) << "the spill holds a filled image, not just sized bytes";
 
     const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, 0);
     ASSERT_TRUE(upload.has_value());
-    EXPECT_EQ(upload->full_key, image->full_key);
+    EXPECT_EQ(upload->key->digest, image->full_key);
 }
 
 TEST_F(HbgGraphDefinitionArenaTest, AnArenaTooSmallForAnObjectSpillsIt) {
@@ -234,4 +239,38 @@ TEST_F(HbgGraphDefinitionArenaTest, AnArenaTooSmallForAnObjectSpillsIt) {
     EXPECT_EQ(graph_host_arena_used(*graph_state), 0u)
         << "a failed claim must leave the cursor where it was, so a later object still fits";
     EXPECT_EQ(definition_image(definitions.entries[0])->total_bytes, definitions.entries[0].bytes);
+}
+
+// Colliding construction-parameter digests must stay distinct Definitions: the digest
+// only indexes the lookup, the exact blob decides identity. The pair below is the
+// constructed collision from test_hbg_graph_cache.cpp — its two config tuples hash
+// equal — reduced to what this level needs: one shared digest, two different blobs.
+TEST_F(HbgGraphDefinitionArenaTest, CollidingConfigDigestsStayDistinctDefinitions) {
+    bind_arena(256 * 1024);
+
+    std::array<uint32_t, 16> storage{};
+    uint32_t shape[] = {static_cast<uint32_t>(storage.size())};
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage.data(), shape, 1);
+
+    std::array<std::byte, graph_config_blob_bytes<uint64_t, uint64_t>()> blob_a{};
+    std::array<std::byte, graph_config_blob_bytes<uint64_t, uint64_t>()> blob_b{};
+    const uint32_t len_a = graph_config_blob_encode(blob_a.data(), uint64_t{0}, uint64_t{0});
+    const uint32_t len_b = graph_config_blob_encode(blob_b.data(), uint64_t{1}, uint64_t{0x389d0700073bb18b});
+    ASSERT_NE(len_a, 0u);
+
+    // Both recordings share one digest — the collision pair's property, and what a
+    // digest-keyed cache would fold into a single entry.
+    constexpr uint64_t SHARED_KEY = 0x1719;
+
+    orch.begin_scope();
+    record_graph(SHARED_KEY, 2, boundary, shape, GraphConfigView{blob_a.data(), len_a});
+    record_graph(SHARED_KEY, 2, boundary, shape, GraphConfigView{blob_b.data(), len_b});
+    orch.graph_commit();
+    ASSERT_FALSE(orch.is_fatal());
+
+    const GraphHostDefinitionList definitions = graph_host_definitions(*graph_state);
+    ASSERT_EQ(definitions.entries.size(), 2u) << "the blobs differ, so the identities do";
+    EXPECT_EQ(definitions.entries[0].key.digest, definitions.entries[1].key.digest)
+        << "the constructed collision shares one digest — exact keying is what separates the entries";
+    EXPECT_FALSE(definitions.entries[0].key == definitions.entries[1].key);
 }

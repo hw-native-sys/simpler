@@ -171,6 +171,14 @@ struct OrchestratorState {
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);
     TaskOutputTensors alloc_tensors(const CoreTaskArgs &args);
+    // The exact-identity form: `graph_id` and `config` (a borrowed view, valid only
+    // for this call) join `callable_hash` in the cache key; `graph_key` is the digest.
+    GraphScopeResult graph_begin(
+        uint64_t graph_id, uint64_t graph_key, GraphConfigView config, const GraphTaskArgs &args, uint64_t callable_hash
+    );
+    // The digest-only form: for a caller with no exact parameters to give, the graph
+    // id doubles as the digest input and the config is empty. This is the shape the
+    // pre-exact-keying ops slot (graph_begin) reaches.
     GraphScopeResult graph_begin(uint64_t graph_key, const GraphTaskArgs &args, uint64_t callable_hash);
     bool graph_prepare(void *recording_handle, const GraphTaskArgs &args);
     void graph_abort(void *recording_handle);
@@ -178,7 +186,9 @@ struct OrchestratorState {
     void graph_commit();
     // Bodies of the two above. Both have several early returns, so the phase
     // record that measures them wraps the call instead of every exit.
-    GraphScopeResult graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &args, uint64_t callable_hash);
+    GraphScopeResult graph_begin_inner(
+        uint64_t graph_id, uint64_t graph_key, GraphConfigView config, const GraphTaskArgs &args, uint64_t callable_hash
+    );
     void graph_commit_inner();
     void mark_done();
 };

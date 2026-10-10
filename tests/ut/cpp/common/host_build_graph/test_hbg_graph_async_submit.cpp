@@ -11,9 +11,12 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
 #include <functional>
 #include <future>
 #include <memory>
@@ -92,6 +95,16 @@ struct FakeRuntime {
     TensorArgType recorded_tag{};
     const void *recorded_args_object{nullptr};
     const void *recorded_tensor_storage{nullptr};
+
+    // What graph_begin_with_config received: the exact-key payload the .so sent, which
+    // the runtime's cache keys a Graph by.
+    bool saw_begin_with_config{false};
+    uint64_t begin_with_config_graph_id{0};
+    uint64_t begin_with_config_graph_key{0};
+    uint32_t begin_with_config_len{0};
+    // Fixed inline storage keeps FakeRuntime standard-layout for the offsetof guards
+    // below; a test's blob is a couple of small values.
+    std::array<std::byte, 32> begin_with_config_config{};
 
     // Stands in for the in-flight entry's own copy of the formal parameters: the real
     // graph_begin builds one per entry and hands it out through GraphScopeResult, and the
@@ -238,6 +251,25 @@ bool fake_graph_record_start(RuntimeContext *rt, const GraphTaskArgs &args, void
 
 void fake_graph_record_wait(RuntimeContext *rt) { test_pool().wait(rt); }
 
+GraphScopeResult fake_graph_begin_with_config(
+    RuntimeContext *rt, uint64_t graph_id, uint64_t graph_key, GraphConfigView config, const GraphTaskArgs &args
+) {
+    FakeRuntime &fake = *as_fake(rt);
+    {
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        fake.saw_begin_with_config = true;
+        fake.begin_with_config_graph_id = graph_id;
+        fake.begin_with_config_graph_key = graph_key;
+        fake.begin_with_config_len = config.len;
+        if (config.len > fake.begin_with_config_config.size()) {
+            ADD_FAILURE() << "the capture is smaller than the config blob under test";
+        } else if (config.len != 0) {
+            std::memcpy(fake.begin_with_config_config.data(), config.bytes, config.len);
+        }
+    }
+    return fake_graph_begin(rt, graph_key, args);
+}
+
 const RuntimeOps kFakeOps = {
     .scope_begin = fake_scope_begin,
     .scope_end = fake_scope_end,
@@ -249,6 +281,7 @@ const RuntimeOps kFakeOps = {
     .graph_commit = fake_graph_commit,
     .graph_record_start = fake_graph_record_start,
     .graph_record_wait = fake_graph_record_wait,
+    .graph_begin_with_config = fake_graph_begin_with_config,
 };
 
 }  // namespace
@@ -609,4 +642,74 @@ TEST(HbgGraphAsyncSubmit, AFatalInsideARecordedBodyReachesGraphEndAndAbortsNothi
     EXPECT_TRUE(fake.end_saw_fatal) << "graph_end has to observe the fatal — it is the retire point";
     EXPECT_EQ(fake.abort_calls.load(std::memory_order_acquire), 0)
         << "graph_end retires its own entry, so a caller-side abort would be a second one racing graph_commit's free";
+}
+
+namespace {
+
+void graph_body_with_config(const GraphTaskArgs &, uint32_t, float) {}
+void graph_body_plain(const GraphTaskArgs &) {}
+
+}  // namespace
+
+// The config overload must hand the runtime the exact tagged blob and the digest the
+// same values produce: that pair is what the cache keys a Graph by.
+TEST(HbgGraphAsyncSubmit, ConfigOverloadDeliversTheExactBlobAndDigest) {
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    std::array<FakeBoundary, 1> boundaries{};
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
+    framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
+
+    uint32_t storage[4]{};
+    uint32_t shape[] = {4};
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
+    GraphTaskArgs args;
+    args.add_input(boundary);
+
+    constexpr uint64_t CONFIG_GRAPH_ID = 0x1731;
+    {
+        ScopeGuard scope;
+        rt_submit_graph(CONFIG_GRAPH_ID, graph_body_with_config, args, uint32_t{7}, 2.5F);
+    }
+
+    // The encoding, pinned by hand: count, then (category, width, raw bytes) per value —
+    // unsigned integral is 3, float is 4, and 2.5F is 0x40200000.
+    const std::array<std::byte, 16> pinned{
+        std::byte{0x02}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},  //
+        std::byte{0x03}, std::byte{0x04}, std::byte{0x07}, std::byte{0x00}, std::byte{0x00}, std::byte{0x00},
+        std::byte{0x04}, std::byte{0x04}, std::byte{0x00}, std::byte{0x00}, std::byte{0x20}, std::byte{0x40},
+    };
+    std::array<std::byte, graph_config_blob_bytes<uint32_t, float>()> encoded{};
+    ASSERT_EQ(graph_config_blob_encode(encoded.data(), uint32_t{7}, 2.5F), static_cast<uint32_t>(pinned.size()));
+    EXPECT_TRUE(std::equal(encoded.begin(), encoded.end(), pinned.begin()));
+
+    {
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        ASSERT_TRUE(fake.saw_begin_with_config);
+        EXPECT_EQ(fake.begin_with_config_graph_id, CONFIG_GRAPH_ID);
+        EXPECT_EQ(fake.begin_with_config_graph_key, rt_graph_make_key(CONFIG_GRAPH_ID, uint32_t{7}, 2.5F));
+        ASSERT_EQ(fake.begin_with_config_len, static_cast<uint32_t>(pinned.size()));
+        EXPECT_TRUE(
+            std::equal(
+                fake.begin_with_config_config.begin(), fake.begin_with_config_config.begin() + pinned.size(),
+                pinned.begin()
+            )
+        ) << "the runtime must receive exactly the pinned bytes";
+    }
+
+    // The no-config overload sends the identity as its own digest and an empty blob.
+    constexpr uint64_t PLAIN_GRAPH_ID = 0x1732;
+    {
+        ScopeGuard scope;
+        rt_submit_graph(PLAIN_GRAPH_ID, graph_body_plain, args);
+    }
+    {
+        std::lock_guard<std::mutex> lock(fake.mutex);
+        EXPECT_EQ(fake.begin_with_config_graph_id, PLAIN_GRAPH_ID);
+        EXPECT_EQ(fake.begin_with_config_graph_key, PLAIN_GRAPH_ID);
+        EXPECT_EQ(fake.begin_with_config_len, 0u);
+    }
+    rt_graph_commit();
+    framework_bind_runtime(nullptr);
 }
