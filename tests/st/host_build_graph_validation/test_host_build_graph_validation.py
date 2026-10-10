@@ -11,7 +11,6 @@
 
 import functools
 import os
-import time
 
 import pytest
 import torch
@@ -23,7 +22,6 @@ from simpler.task_interface import (
     DataType,
     TaskArgs,
     TensorArgType,
-    _flush_host_log,
     _host_log_dropped_records,
 )
 from simpler.worker import Worker
@@ -46,33 +44,6 @@ CASES = {
     "write_task_produced_tensor": 6,
     "read_alloc_tensors_output": 7,
 }
-
-
-def _wait_for_host_log(capfd, markers: tuple[str, ...], dropped_before: int, timeout_s: float = 5.0) -> str:
-    """Poll for required records; a single scheduler-dependent flush is not the verdict."""
-    chunks: list[str] = []
-    deadline = time.monotonic() + timeout_s
-    last_flush = False
-    while True:
-        last_flush = _flush_host_log(100)
-        captured = capfd.readouterr()
-        chunks.extend((captured.err, captured.out))
-        log = "".join(chunks)
-        if all(marker in log for marker in markers):
-            dropped_after = _host_log_dropped_records()
-            assert dropped_after == dropped_before, (
-                f"host-log drop counter changed while waiting for {markers}: "
-                f"before={dropped_before}, after={dropped_after}"
-            )
-            return log
-        if time.monotonic() >= deadline:
-            dropped_after = _host_log_dropped_records()
-            missing = [marker for marker in markers if marker not in log]
-            raise AssertionError(
-                f"host-log records did not arrive within {timeout_s:.1f}s: missing={missing}, "
-                f"last_flush={last_flush}, dropped_delta={dropped_after - dropped_before}, tail={log[-2000:]!r}"
-            )
-        time.sleep(0.01)
 
 
 @functools.cache
@@ -112,7 +83,7 @@ def _build_callable(platform: str) -> ChipCallable:
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.parametrize("case_name", list(CASES))
-def test_invalid_input_reports_code_five(st_platform, st_device_ids, case_name, capfd):
+def test_invalid_input_reports_code_five(st_platform, st_device_ids, case_name, capfd, drain_host_log):
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     buffer = None
     dropped_before = _host_log_dropped_records()
@@ -133,7 +104,14 @@ def test_invalid_input_reports_code_five(st_platform, st_device_ids, case_name, 
         with pytest.raises(RuntimeError, match=r"(run_runtime|run) failed with code -5\b"):
             worker.run(handle, args, config)
 
-        _wait_for_host_log(capfd, ("orch_error_code=5", "INVALID_ARGS"), dropped_before)
+        log = drain_host_log(capfd)
+        assert "orch_error_code=5" in log, log
+        assert "INVALID_ARGS" in log, log
+        dropped_after = _host_log_dropped_records()
+        assert dropped_after == dropped_before, (
+            f"host-log drop counter changed during invalid-input rejection: "
+            f"before={dropped_before}, after={dropped_after}"
+        )
     finally:
         if buffer is not None:
             worker.free(buffer)
