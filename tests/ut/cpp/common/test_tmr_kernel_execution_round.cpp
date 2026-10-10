@@ -96,7 +96,7 @@ struct ExecutorModel {
 
     KernelExecutionRequest request() {
         KernelExecutionRequest request;
-        request.handshake = {&control, reports.data(), static_cast<int32_t>(reports.size()), 0};
+        request.handshake = {&control, reports.data(), static_cast<int32_t>(reports.size())};
         request.allowed_cpus = allowed.data();
         request.execution_threads = kExecutionThreads;
         request.launched_threads = kLaunchedThreads;

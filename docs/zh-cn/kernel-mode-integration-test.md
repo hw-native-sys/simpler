@@ -141,7 +141,7 @@ binder，在三条 stream 上排布如下操作：
 caller stream              AICPU 私有 stream              AICore 私有 stream
 record(Start)
                            wait(Start)
-                           清零握手区与 gate
+                           （TMR 不下发清零 task）
                            record(AicoreStart)
                                                           wait(AicoreStart)
                                                           rtKernelLaunchWithHandleV2

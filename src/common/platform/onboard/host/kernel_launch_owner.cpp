@@ -57,19 +57,8 @@ int DeviceRunnerBase::launch_kernel_callable(
         void *caller;
         const uint8_t *packet;
         size_t bytes;
-        simpler::tmr::TmrKernelClearPlan clear;
     };
-    const auto &d = kernel_descriptor_;
-    simpler::tmr::TmrKernelClearPlan clear;
-    if (!simpler::tmr::build_tmr_kernel_clear_plan(
-            {d.context_generation,
-             {d.control_address, d.control_bytes},
-             {d.reports_address, d.reports_bytes},
-             d.worker_count},
-            &clear
-        ))
-        return PTO_RUNTIME_ERR_INTERNAL;
-    Submission submission{this, caller_stream, packet.packet().data, packet.packet().size, clear};
+    Submission submission{this, caller_stream, packet.packet().data, packet.packet().size};
     kl::KernelLaunchGateOps gate;
     gate.context = &submission;
     gate.acquire = [](void *context, const kl::KernelInvocationBinding &, void *,
@@ -110,13 +99,8 @@ int DeviceRunnerBase::launch_kernel_callable(
     ops.record_event = [](void *, void *event, void *stream) noexcept {
         return aclrtRecordEvent(event, stream);
     };
-    ops.memset_handshake = [](void *context, void *stream) noexcept {
-        const auto &s = *static_cast<Submission *>(context);
-        for (const auto &region : s.clear.regions) {
-            const int result =
-                aclrtMemsetAsync(reinterpret_cast<void *>(region.address), region.bytes, 0, region.bytes, stream);
-            if (result != 0) return result;
-        }
+    // TMR uses a device-maintained report epoch; HBG keeps its own clear step.
+    ops.memset_handshake = [](void *, void *) noexcept {
         return 0;
     };
     ops.launch_aicore = [](void *context, void *stream) noexcept {

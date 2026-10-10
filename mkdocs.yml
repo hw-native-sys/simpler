@@ -135,6 +135,7 @@ nav:
       - Kernel Mode Integration Test (zh-cn): zh-cn/kernel-mode-integration-test.md
       - Kernel Integration Validation: kernel-integration-validation.md
       - Kernel Callable Residency (zh-cn): zh-cn/kernel-callable-residency.md
+      - TMR Kernel Report Epoch (zh-cn): zh-cn/tmr-kernel-report-epoch.md
       - HBG Kernel Resource Declarations: host-build-graph-kernel-contract.md
       - HBG Execution-Slot Admission: host-build-graph-kernel-slot.md
       - Dynamic Linking: dynamic-linking.md

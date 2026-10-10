@@ -22,6 +22,7 @@
 
 namespace {
 bool armed = false;
+bool core_armed = false;
 struct Gate {
     std::mutex mutex;
     std::condition_variable changed;
@@ -92,6 +93,7 @@ aclError install_gate(aclrtStream stream) {
 }  // namespace
 
 extern "C" void capture_gate_arm() { armed = true; }
+extern "C" void capture_gate_arm_core() { core_armed = true; }
 extern "C" int capture_gate_blocked() {
     std::lock_guard<std::mutex> lock(gate.mutex);
     return gate.entered && !gate.released && !gate.timed_out;
@@ -118,5 +120,11 @@ extern "C" int capture_gate_finish() {
 extern "C" aclError capture_gate_install_if_armed(aclrtStream stream) {
     if (!armed) return 0;
     armed = false;
+    return install_gate(stream);
+}
+
+extern "C" aclError capture_gate_install_core_if_armed(aclrtStream stream) {
+    if (!core_armed) return 0;
+    core_armed = false;
     return install_gate(stream);
 }
