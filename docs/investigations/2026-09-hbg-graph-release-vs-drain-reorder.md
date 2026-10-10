@@ -11,7 +11,7 @@ Issue [#2256](https://github.com/hw-native-sys/simpler/issues/2256): a
 `require_sync_start` body root deadlocks against an ordinary sibling root staged
 by the same shell release. The sibling holds gated cores until its own doorbell
 rings; the cohort cannot fit, enters the global drain, and the drain waits for
-cores that only `activate_graph_task -> graph_route_ready_roots ->
+cores that only `signal_graph_external_ready -> graph_route_ready_roots ->
 push_ready_routed` can release — a call that sat behind the drain check's
 `continue` in `resolve_and_dispatch`.
 
@@ -72,7 +72,7 @@ mechanisms.
 ## Why not (now)
 
 The shipped fix removes the asymmetry instead of accommodating it:
-`push_ready_routed`'s `TaskKind::GRAPH` branch calls `activate_graph_task`
+`push_ready_routed`'s `TaskKind::GRAPH` branch calls `signal_graph_external_ready`
 inline. Both halves of a Graph's early dispatch then use the machinery a
 top-level task uses, the scheduler loop stops being a release path at all, the
 drain's critical path gains nothing, and the invariant above holds structurally

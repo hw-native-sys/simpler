@@ -21,6 +21,8 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <atomic>
 #include <cstring>
 #include <memory>
 #include <vector>
@@ -84,7 +86,7 @@ TEST_F(GraphActivationTest, WakeRoutesConsumerWhenProducerCompletedBeforeRegiste
     std::vector<int32_t> fanin_offsets{0, 0, 1};  // task 0 is a root; task 1 <- {0}
     std::vector<uint16_t> fanin_indices{0};
     GraphExecution exec{};
-    exec.tasks = exec.task_storage = tasks.get();
+    exec.task_storage = tasks.get();
     exec.task_states = states.get();
     exec.fanin_offsets = fanin_offsets.data();
     exec.fanin_indices = fanin_indices.data();
@@ -111,7 +113,7 @@ TEST_F(GraphActivationTest, IncrementalPublishRoutesCompletedDepsAndWakeChainsPe
     std::vector<int32_t> fanin_offsets{0, 0, 0, 1, 2};  // task 2 <- {0}, task 3 <- {1}
     std::vector<uint16_t> fanin_indices{0, 1};
     GraphExecution exec{};
-    exec.tasks = exec.task_storage = tasks.get();
+    exec.task_storage = tasks.get();
     exec.task_states = states.get();
     exec.fanin_offsets = fanin_offsets.data();
     exec.fanin_indices = fanin_indices.data();
@@ -131,12 +133,9 @@ TEST_F(GraphActivationTest, IncrementalPublishRoutesCompletedDepsAndWakeChainsPe
     EXPECT_EQ(out[0], &tasks[3].slot);
 }
 
-// Incremental activation dispatches a sub-task before the graph reaches ACTIVE, so
-// complete_task must accept such a completion while the graph is MATERIALIZING or
-// PREPARED, and reject it only for SUBMITTED (not yet bound) or COMPLETED
-// (already retired).
-TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
-    auto complete_in_state = [&](GraphExecutionState state) {
+// Published sub-tasks may complete while the rest of the body is still SUBMITTED.
+TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeMaterialized) {
+    auto complete_in_state = [&](GraphExecutionPhase state) {
         auto task = std::make_unique<ChipTaskStorage[]>(1);
         auto states = std::make_unique<std::atomic<ChipTaskState>[]>(1);
         memset(task.get(), 0, sizeof(ChipTaskStorage));
@@ -148,12 +147,12 @@ TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
         // the value only to separate a localized execution from a zeroed one, and
         // decodes nothing from the section.
         exec.definition_offset = static_cast<uint32_t>(GRAPH_DEFINITION_OBJECT_ALIGN);
-        exec.tasks = exec.task_storage = task.get();
+        exec.task_storage = task.get();
         exec.task_states = states.get();
         exec.task_count = 1;
         exec.remaining_tasks.store(1);
         exec.outer_slot = nullptr;
-        graph_execution_set_state(exec, state);
+        graph_execution_set_phase(exec, state);
         task[0].slot.graph_context = &exec;
 #if SIMPLER_SCHED_PROFILING
         return sched.complete_task(task[0].slot, 0).error_code;
@@ -162,11 +161,9 @@ TEST_F(GraphActivationTest, CompleteTaskAcceptsCompletionBeforeActive) {
 #endif
     };
 
-    EXPECT_EQ(complete_in_state(GraphExecutionState::MATERIALIZING), SIMPLER_ERROR_NONE);
-    EXPECT_EQ(complete_in_state(GraphExecutionState::PREPARED), SIMPLER_ERROR_NONE);
-    EXPECT_EQ(complete_in_state(GraphExecutionState::ACTIVE), SIMPLER_ERROR_NONE);
-    EXPECT_EQ(complete_in_state(GraphExecutionState::SUBMITTED), SIMPLER_ERROR_INVALID_ARGS);
-    EXPECT_EQ(complete_in_state(GraphExecutionState::COMPLETED), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(complete_in_state(GraphExecutionPhase::SUBMITTED), SIMPLER_ERROR_NONE);
+    EXPECT_EQ(complete_in_state(GraphExecutionPhase::MATERIALIZED), SIMPLER_ERROR_NONE);
+    EXPECT_EQ(complete_in_state(GraphExecutionPhase::COMPLETED), SIMPLER_ERROR_INVALID_ARGS);
 }
 
 // The outer Graph task completes as a task of the run, not into its execution's
@@ -182,7 +179,7 @@ TEST_F(GraphActivationTest, CompleteTaskTakesTheOrdinaryPathForTheOuterGraphTask
     // the run.
     GraphExecution execution{};
     execution.definition_offset = static_cast<uint32_t>(GRAPH_DEFINITION_OBJECT_ALIGN);
-    graph_execution_set_state(execution, GraphExecutionState::ACTIVE);
+    graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED);
     // A whole storage entry, not a bare slot state: a slot reaches its descriptor by
     // ChipTaskStorage's layout, so one on its own would resolve outside itself.
     ChipTaskStorage outer{};
@@ -201,4 +198,82 @@ TEST_F(GraphActivationTest, CompleteTaskTakesTheOrdinaryPathForTheOuterGraphTask
     EXPECT_EQ(outcome.error_code, SIMPLER_ERROR_NONE);
     EXPECT_EQ(outcome.stream_tasks_completed, 1) << "the outer Graph task is one completed task of the run";
     EXPECT_TRUE(sm_handle->header->tasks.is_completed(slot.to_descriptor().task_id.local_id()));
+}
+
+class GraphRootRoutingTest : public GraphActivationTest {
+protected:
+    static constexpr int TASK_COUNT = 6;
+    std::array<ChipTaskStorage, TASK_COUNT> tasks{};
+    std::array<std::atomic<ChipTaskState>, TASK_COUNT> states{};
+    std::array<int32_t, TASK_COUNT + 1> fanin_offsets{};
+    ChipTaskSlotState shell{};
+    GraphExecution execution{};
+
+    void SetUp() override {
+        GraphActivationTest::SetUp();
+        shell.task_kind = TaskKind::GRAPH;
+        shell.graph_context = &execution;
+        execution.outer_slot = &shell;
+        execution.task_storage = tasks.data();
+        execution.task_states = states.data();
+        execution.task_count = TASK_COUNT;
+        execution.fanin_offsets = fanin_offsets.data();
+        for (int i = 0; i < TASK_COUNT; ++i) {
+            init_sub_task(tasks[i], states.data(), i, CHIP_TASK_PENDING);
+        }
+    }
+
+    void expect_routed_range(int first, int last) {
+        std::array<int, TASK_COUNT> seen{};
+        ChipTaskSlotState *out[TASK_COUNT + 1]{};
+        const int count = sched.get_ready_tasks_batch(sched.ready_queues, ResourceShape::AIC, out, TASK_COUNT + 1);
+        EXPECT_EQ(count, last - first);
+        for (int i = 0; i < count; ++i) {
+            const int id = out[i]->sub_task_local_id;
+            ASSERT_GE(id, first);
+            ASSERT_LT(id, last);
+            EXPECT_EQ(out[i], &tasks[id].slot);
+            seen[id]++;
+        }
+        for (int i = first; i < last; ++i)
+            EXPECT_EQ(seen[i], 1);
+    }
+};
+
+TEST_F(GraphRootRoutingTest, ExternalReadyFirstRoutesEachPublishedSlice) {
+    EXPECT_EQ(sched.signal_graph_external_ready(shell), 0);
+    sched.graph_incremental_publish(execution, 0, 2);
+    EXPECT_EQ(graph_execution_phase(execution), GraphExecutionPhase::SUBMITTED);
+    EXPECT_EQ(execution.route_cursor.load(), 2);
+    expect_routed_range(0, 2);
+
+    graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED);
+    sched.graph_incremental_publish(execution, 2, TASK_COUNT);
+    expect_routed_range(2, TASK_COUNT);
+    EXPECT_EQ(sched.signal_graph_external_ready(shell), 0);
+    expect_routed_range(0, 0);
+}
+
+TEST_F(GraphRootRoutingTest, PublishedRootsReleaseBeforeFullMaterialization) {
+    sched.graph_incremental_publish(execution, 0, 2);
+    expect_routed_range(0, 0);
+    EXPECT_EQ(sched.signal_graph_external_ready(shell), 2);
+    EXPECT_EQ(graph_execution_phase(execution), GraphExecutionPhase::SUBMITTED);
+    expect_routed_range(0, 2);
+
+    sched.graph_incremental_publish(execution, 2, TASK_COUNT);
+    expect_routed_range(2, TASK_COUNT);
+}
+
+TEST_F(GraphRootRoutingTest, MaterializedFirstWaitsForExternalReady) {
+    graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED);
+    sched.graph_incremental_publish(execution, 0, TASK_COUNT);
+    EXPECT_EQ(execution.route_cursor.load(), 0);
+    expect_routed_range(0, 0);
+
+    EXPECT_EQ(sched.signal_graph_external_ready(shell), TASK_COUNT);
+    EXPECT_EQ(graph_execution_phase(execution), GraphExecutionPhase::MATERIALIZED);
+    expect_routed_range(0, TASK_COUNT);
+    EXPECT_EQ(sched.signal_graph_external_ready(shell), 0);
+    expect_routed_range(0, 0);
 }

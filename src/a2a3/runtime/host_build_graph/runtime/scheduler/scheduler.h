@@ -522,9 +522,8 @@ struct SchedulerState {
     // An outer Graph is control work, never an AICore task, and it occupies no
     // ready queue of its own: a shell's readiness is acted on inline by
     // push_ready_routed's GRAPH branch, on the completion path. External
-    // dependency readiness and bounded materialization progress independently and
-    // meet at the submission's single atomic activation gate; this queue carries
-    // the materialization half alone.
+    // dependency readiness and bounded materialization progress independently;
+    // this queue carries materialization alone.
     ChipReadyQueue graph_prepare_queue;
 
     alignas(64) AsyncWaitList async_wait_list;
@@ -590,7 +589,7 @@ struct SchedulerState {
         // pending, and a cohort in that drain waits on cores that only these
         // doorbells free.
         if (slot_state->task_kind == TaskKind::GRAPH) {
-            (void)activate_graph_task(*slot_state);
+            (void)signal_graph_external_ready(*slot_state);
             return;
         }
         ResourceShape shape = slot_state->active_mask.to_shape();
@@ -844,7 +843,7 @@ struct SchedulerState {
     // AICore task — mask, blocks and all — so the shell stages those instead.
     // Each is gated exactly like any pre-staged task and rings when the ordinary
     // route reaches it: the shell's own producers complete, push_ready_routed
-    // takes the GRAPH branch, and activate_graph_task opens the external gate
+    // takes the GRAPH branch, and signal_graph_external_ready opens the external gate
     // graph_route_ready_roots reads — all on the completion path, in the same
     // call an ordinary candidate's release takes. So the data dependency the
     // shell stands for is still honoured. The shell's own completion is a later
@@ -1311,7 +1310,7 @@ struct SchedulerState {
     // Push every materialized-and-published root that has not been routed yet,
     // once the outer Graph task's external dependencies are ready.
     // route_cursor makes this idempotent, so it composes across the per-slice
-    // calls during materialization and the final call at the activation meet;
+    // publication calls and the external-readiness notification;
     // each root reaches the ready queue exactly once. Non-roots are never pushed
     // here — they reach the ready queue through their producers' wake list.
     int32_t graph_route_ready_roots(GraphExecution &execution) {
@@ -1365,13 +1364,6 @@ struct SchedulerState {
         graph_route_ready_roots(execution);
     }
 
-    int32_t activate_prepared_graph(GraphExecution &execution) {
-        if (!graph_execution_transition(execution, GraphExecutionState::PREPARED, GraphExecutionState::ACTIVE)) {
-            return 0;
-        }
-        return graph_route_ready_roots(execution);
-    }
-
     // `image` is the calling thread's own view of this run's Definition section;
     // it is passed down rather than held here, because a view names the launch
     // arguments of one thread and this context is shared by all of them.
@@ -1384,11 +1376,8 @@ struct SchedulerState {
         const int32_t before = execution->materialized_tasks;
         const GraphMaterializeResult result =
             graph_execution_materialize_slice(outer_slot, *execution, image, max_tasks, tasks_materialized);
-        if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::PREPARED) {
+        if (result == GraphMaterializeResult::PENDING || result == GraphMaterializeResult::MATERIALIZED) {
             graph_incremental_publish(*execution, before, execution->materialized_tasks);
-        }
-        if (result == GraphMaterializeResult::PREPARED && graph_execution_external_ready(*execution)) {
-            activate_prepared_graph(*execution);
         }
         return result;
     }
@@ -1397,22 +1386,16 @@ struct SchedulerState {
     // the shell's producers resolve, which is the same completion-path event that
     // releases an ordinary early-dispatch consumer.
     //
-    // Routing reads external_ready alone (graph_route_ready_roots), so it must not
-    // be gated on the PREPARED -> ACTIVE flip: a shell can resolve while its body is
-    // still MATERIALIZING, and complete_in_graph_task already admits an in-graph
-    // completion in that state. The flip is bookkeeping owned by whichever side finds
-    // the graph PREPARED first — this call, or prepare_graph_task's trailing
-    // activate_prepared_graph — and a graph that stays PREPARED routes and retires
-    // exactly the same.
+    // A published root can run while the graph is SUBMITTED. Lifecycle phase
+    // does not gate routing: only external readiness and the published range do.
     //
     // Every staged root is covered: staging claims roots below published_tasks at
     // claim time, published_tasks only grows, and route_cursor starts at 0, so the
     // range this routes is a superset of what was staged.
-    int32_t activate_graph_task(ChipTaskSlotState &outer_slot) {
+    int32_t signal_graph_external_ready(ChipTaskSlotState &outer_slot) {
         GraphExecution *execution = graph_execution_from_outer_slot(outer_slot);
         if (execution == nullptr) return 0;
         graph_execution_signal_external_ready(*execution);
-        (void)graph_execution_transition(*execution, GraphExecutionState::PREPARED, GraphExecutionState::ACTIVE);
         return graph_route_ready_roots(*execution);
     }
 
@@ -1448,16 +1431,13 @@ struct SchedulerState {
         // Membership is established by the branch above: graph_context names this task's
         // execution, and the shell case has already returned.
         GraphExecution *execution = static_cast<GraphExecution *>(slot_state.graph_context);
-        if (execution->definition_offset == 0 || execution->tasks == nullptr) {
+        if (execution->definition_offset == 0 || execution->task_storage == nullptr) {
             outcome.error_code = SIMPLER_ERROR_INVALID_ARGS;
             return outcome;
         }
-        // Incremental activation routes a sub-task before the graph reaches
-        // ACTIVE, so one can legitimately complete while the graph is still
-        // MATERIALIZING or PREPARED. Only SUBMITTED (execution not yet bound) and
-        // COMPLETED (execution already retired) are invalid states for such a completion.
-        const GraphExecutionState graph_state = graph_execution_state(*execution);
-        if (graph_state < GraphExecutionState::MATERIALIZING || graph_state > GraphExecutionState::ACTIVE) {
+        // A published sub-task can complete before the whole body is materialized.
+        const GraphExecutionPhase phase = graph_execution_phase(*execution);
+        if (phase != GraphExecutionPhase::SUBMITTED && phase != GraphExecutionPhase::MATERIALIZED) {
             outcome.error_code = SIMPLER_ERROR_INVALID_ARGS;
             return outcome;
         }

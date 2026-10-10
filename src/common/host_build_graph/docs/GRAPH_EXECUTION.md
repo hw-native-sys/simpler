@@ -681,10 +681,28 @@ placed behind that check could not free the cores such a drain waits on, which
 is the deadlock recorded as #2256. The completion path runs on the resolution
 thread, which never takes part in a drain.
 
-Preparation and external readiness set two bits in one atomic gate. Routing the
-saved root sub-tasks reads the external bit alone and is made exactly-once by
-`route_cursor`, so whichever side observes both bits routes the roots, and a
-Graph that never leaves `PREPARED` routes and retires the same.
+Each execution has three lifecycle phases, independent of external readiness:
+
+| Phase | Contract |
+| ----- | -------- |
+| `SUBMITTED` | The body is not fully materialized. It may be queued or partially materialized, and published sub-tasks may already run and complete. |
+| `MATERIALIZED` | Every sub-task is materialized. External dependencies may still be pending, and tasks may be queued or running. |
+| `COMPLETED` | Every sub-task has completed; the shell releases its external consumers. |
+
+The phase and monotonic `external_ready` flag share one atomic control byte.
+Root routing requires external readiness and a root index below
+`published_tasks`; it does not wait for the `MATERIALIZED` phase.
+`route_cursor` assigns each published index to exactly one routing caller.
+Non-roots become ready through their internal producers' completion paths.
+
+Both events try routing: the completion path signals external readiness, and
+each materialization slice publishes its new range.
+
+`materialize_busy` serializes materialization slices. The task-storage base is
+initialized during localization and remains immutable; `published_tasks`
+bounds root access to constructed and registered entries. Progress counters
+distinguish queued, partially materialized, and partially completed work
+without additional lifecycle phases.
 
 Internal dependency readiness borrows the completion-state polling idea, but
 dependency wiring remains an Orchestrator responsibility:
@@ -720,7 +738,7 @@ different party:
   decide it. A qualified shell that its producers release early does not stage
   itself — it has nothing of its own to place — but stages the body's roots,
   each an ordinary AICore task. They ring on the ordinary route, when the
-  shell's producers complete and `push_ready_routed` calls `activate_graph_task`
+  shell's producers complete and `push_ready_routed` calls `signal_graph_external_ready`
   inline to open the external gate. A Graph as a *producer* is the direction not
   supported: a shell publishes no placement of its own for a consumer to bet on.
 - **A root's own verdict.** Materialization, not recording, decides it, and the
@@ -757,7 +775,7 @@ both mean the same thing they do at top level:
   shell's early release rather than on any publish of its own.
 - *the producer released*, i.e. `early_dispatch_state == DISPATCHED`. At top
   level that is the producer completing. For a body root it is the shell's
-  producers completing, which lets `activate_graph_task` open the external gate
+  producers completing, which lets `signal_graph_external_ready` open the external gate
   and `graph_route_ready_roots` route the root — both inline on the completion
   path, in the same `push_ready_routed` call that handles a top-level release.
 

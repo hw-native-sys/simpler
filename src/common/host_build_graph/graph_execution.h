@@ -265,29 +265,26 @@ inline const T *graph_definition_ptr(const GraphDefinition &definition, uint32_t
     return graph_definition_array<T>(definition, offset, 1);
 }
 
-enum class GraphExecutionState : uint8_t {
+enum class GraphExecutionPhase : uint8_t {
     SUBMITTED = 0,
-    MATERIALIZING = 1,
-    PREPARED = 2,
-    ACTIVE = 3,
-    COMPLETED = 4,
+    MATERIALIZED = 1,
+    COMPLETED = 2,
 };
 
 enum class GraphMaterializeResult : uint8_t {
     INVALID = 0,
     BUSY = 1,
     PENDING = 2,
-    PREPARED = 3,
+    MATERIALIZED = 3,
 };
 
-inline constexpr uint8_t GRAPH_EXECUTION_STATE_MASK = 0x7;
+inline constexpr uint8_t GRAPH_EXECUTION_PHASE_MASK = 0x7;
 inline constexpr uint8_t GRAPH_EXECUTION_EXTERNAL_READY = 0x8;
 
 struct GraphExecution {
-    // The low bits hold GraphExecutionState. EXTERNAL_READY shares this byte so
-    // dependency readiness can arrive before materialization without a separate
-    // per-submission gate object.
-    std::atomic<uint8_t> state{static_cast<uint8_t>(GraphExecutionState::SUBMITTED)};
+    // SUBMITTED includes both queued and partially materialized executions.
+    // The phase and monotonic external-readiness flag share an atomic control byte.
+    std::atomic<uint8_t> control{static_cast<uint8_t>(GraphExecutionPhase::SUBMITTED)};
     std::atomic<uint8_t> materialize_busy{0};
     std::atomic<int32_t> remaining_tasks{0};
     std::atomic<int32_t> retired_tasks{0};
@@ -303,7 +300,7 @@ struct GraphExecution {
     int32_t constructed_tasks{0};
     int32_t consumed_tensor_args{0};
     ChipTaskSlotState *outer_slot{nullptr};
-    ChipTaskStorage *tasks{nullptr};
+    // Immutable after localization; published_tasks bounds access to constructed entries.
     ChipTaskStorage *task_storage{nullptr};
     // Polling-progress state, one ChipTaskState byte per sub-task, in the
     // storage tail. Carries the same PENDING -> PUBLISHED -> COMPLETED meaning
@@ -483,47 +480,31 @@ inline GraphExecution *graph_execution_from_outer_slot(ChipTaskSlotState &slot) 
     return slot.task_kind == TaskKind::GRAPH ? static_cast<GraphExecution *>(slot.graph_context) : nullptr;
 }
 
-inline GraphExecutionState
-graph_execution_state(const GraphExecution &execution, std::memory_order order = std::memory_order_acquire) {
-    return static_cast<GraphExecutionState>(execution.state.load(order) & GRAPH_EXECUTION_STATE_MASK);
+inline GraphExecutionPhase
+graph_execution_phase(const GraphExecution &execution, std::memory_order order = std::memory_order_acquire) {
+    return static_cast<GraphExecutionPhase>(execution.control.load(order) & GRAPH_EXECUTION_PHASE_MASK);
 }
 
 inline bool
 graph_execution_external_ready(const GraphExecution &execution, std::memory_order order = std::memory_order_acquire) {
-    return (execution.state.load(order) & GRAPH_EXECUTION_EXTERNAL_READY) != 0;
+    return (execution.control.load(order) & GRAPH_EXECUTION_EXTERNAL_READY) != 0;
 }
 
-inline void graph_execution_set_state(
-    GraphExecution &execution, GraphExecutionState next, std::memory_order order = std::memory_order_release
+inline void graph_execution_set_phase(
+    GraphExecution &execution, GraphExecutionPhase next, std::memory_order order = std::memory_order_release
 ) {
-    uint8_t observed = execution.state.load(std::memory_order_relaxed);
-    // Masked, so a state added past GRAPH_EXECUTION_STATE_MASK cannot reach the
+    uint8_t observed = execution.control.load(std::memory_order_relaxed);
+    // Masked, so a phase added past GRAPH_EXECUTION_PHASE_MASK cannot reach the
     // readiness bit sharing this byte.
-    const uint8_t next_state = static_cast<uint8_t>(static_cast<uint8_t>(next) & GRAPH_EXECUTION_STATE_MASK);
-    while (!execution.state.compare_exchange_weak(
-        observed, static_cast<uint8_t>((observed & ~GRAPH_EXECUTION_STATE_MASK) | next_state), order,
+    const uint8_t next_phase = static_cast<uint8_t>(static_cast<uint8_t>(next) & GRAPH_EXECUTION_PHASE_MASK);
+    while (!execution.control.compare_exchange_weak(
+        observed, static_cast<uint8_t>((observed & ~GRAPH_EXECUTION_PHASE_MASK) | next_phase), order,
         std::memory_order_relaxed
     )) {}
 }
 
-inline bool graph_execution_transition(
-    GraphExecution &execution, GraphExecutionState expected_state, GraphExecutionState next_state
-) {
-    uint8_t observed = execution.state.load(std::memory_order_acquire);
-    const uint8_t desired_state = static_cast<uint8_t>(static_cast<uint8_t>(next_state) & GRAPH_EXECUTION_STATE_MASK);
-    while ((observed & GRAPH_EXECUTION_STATE_MASK) == static_cast<uint8_t>(expected_state)) {
-        const uint8_t desired = static_cast<uint8_t>((observed & ~GRAPH_EXECUTION_STATE_MASK) | desired_state);
-        if (execution.state.compare_exchange_weak(
-                observed, desired, std::memory_order_acq_rel, std::memory_order_acquire
-            )) {
-            return true;
-        }
-    }
-    return false;
-}
-
 inline bool graph_execution_signal_external_ready(GraphExecution &execution) {
-    return (execution.state.fetch_or(GRAPH_EXECUTION_EXTERNAL_READY, std::memory_order_acq_rel) &
+    return (execution.control.fetch_or(GRAPH_EXECUTION_EXTERNAL_READY, std::memory_order_acq_rel) &
             GRAPH_EXECUTION_EXTERNAL_READY) == 0;
 }
 
@@ -532,7 +513,7 @@ inline bool graph_execution_complete_sub_task(GraphExecution &execution) {
 }
 
 inline void graph_execution_mark_completed(GraphExecution &execution) {
-    graph_execution_set_state(execution, GraphExecutionState::COMPLETED);
+    graph_execution_set_phase(execution, GraphExecutionPhase::COMPLETED);
 }
 
 inline void graph_execution_retire_sub_task(GraphExecution &execution) {

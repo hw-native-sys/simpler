@@ -20,7 +20,7 @@
  *
  * The sibling holds gated cores until its own doorbell rings, so the cohort
  * cannot fit and takes the global drain. The drain can only succeed once those
- * cores come free, and they come free only once `activate_graph_task` routes the
+ * cores come free, and they come free only once `signal_graph_external_ready` routes the
  * body's roots — which is why that ring belongs on the completion path, in
  * `push_ready_routed`, where a pending drain cannot hold it off. Reached from a
  * scheduler-loop queue instead, the drain and the ring waited on each other and

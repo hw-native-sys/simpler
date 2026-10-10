@@ -13,7 +13,7 @@
 release, so a `require_sync_start` root that needs the whole device can find its
 cores held by a sibling waiting for its own doorbell. The cohort then takes the
 global drain, and the drain can only be satisfied once those cores come free —
-which happens only once `activate_graph_task` routes the body's roots. That call
+which happens only once `signal_graph_external_ready` routes the body's roots. That call
 belongs on the completion path, in `push_ready_routed`, where a pending drain
 cannot hold it off; reached from a scheduler-loop queue instead, the drain and
 the ring waited on each other and the run hung (#2256).

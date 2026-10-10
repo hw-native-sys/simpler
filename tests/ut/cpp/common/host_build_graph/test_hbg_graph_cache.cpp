@@ -687,7 +687,7 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     // required_heap.
     EXPECT_EQ(static_cast<void *>(execution), heap.execution());
     EXPECT_EQ(
-        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::PREPARED
+        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::MATERIALIZED
     );
     // A shell released early stages its body's roots, and materialization is what
     // decides which roots it may stage. Task 0 is this body's root and is an
@@ -726,7 +726,7 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     EXPECT_EQ(static_cast<void *>(execution), heap.execution());
 
     EXPECT_EQ(
-        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::PREPARED
+        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::MATERIALIZED
     );
     EXPECT_EQ(storage.task.kernel_id[0], 42);
     EXPECT_EQ(storage.slot.active_mask.raw(), 1);
@@ -740,6 +740,93 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     EXPECT_EQ(storage.slot.completed_subtasks.load(std::memory_order_relaxed), 0);
     EXPECT_EQ(storage.payload.published_block_count.load(std::memory_order_relaxed), 0);
     EXPECT_EQ(storage.payload.dump_metadata.dump_arg_mask, uint64_t{1} << 0);
+}
+
+TEST(GraphExecutionReplay, PublishedTaskCompletesBeforeRemainingTasksMaterialize) {
+    std::array<uint8_t, 64> boundary{};
+    const std::vector<std::byte> definition = make_test_definition(0x1234, reinterpret_cast<uint64_t>(boundary.data()));
+    const TestDefinitionObject definition_object(definition);
+    OuterHeap heap(definition, 0xAA);
+    GraphExecution *execution =
+        heap.initialize_execution(definition_object, reinterpret_cast<uint64_t>(boundary.data()), 17);
+    ASSERT_NE(execution, nullptr);
+    ChipTaskStorage *const tasks = execution->task_storage;
+    ASSERT_NE(tasks, nullptr);
+    EXPECT_EQ(execution->constructed_tasks, 0);
+    EXPECT_EQ(graph_execution_phase(*execution), GraphExecutionPhase::SUBMITTED);
+
+    ChipTaskStorage outer{};
+    outer.task.task_id = TaskId::make_global(7);
+    outer.task.packed_buffer_base = heap.base();
+    outer.task.packed_buffer_end = heap.end();
+    outer.slot.task_kind = TaskKind::GRAPH;
+    outer.slot.graph_context = execution;
+    execution->outer_slot = &outer.slot;
+
+    SharedMemoryHeader header{};
+    std::array<std::atomic<ChipTaskState>, 8> stream_states{};
+    header.tasks.task_states = stream_states.data();
+    SchedulerState scheduler{};
+    scheduler.sm_header = &header;
+    scheduler.task_view.tasks = &header.tasks;
+    ChipReadyQueueSlot queue_slots[2]{};
+    queue_slots[0].sequence.store(0);
+    queue_slots[1].sequence.store(1);
+    ChipReadyQueue &queue = scheduler.ready_queues[static_cast<int32_t>(ResourceShape::AIC)];
+    queue.slots = queue_slots;
+    queue.capacity = 2;
+    queue.mask = 1;
+    EXPECT_EQ(scheduler.signal_graph_external_ready(outer.slot), 0);
+
+    execution->materialize_busy.store(1);
+    EXPECT_EQ(graph_execution_materialize_slice(outer.slot, *execution, heap.image(), 1), GraphMaterializeResult::BUSY);
+    EXPECT_EQ(execution->materialized_tasks, 0);
+    execution->materialize_busy.store(0);
+
+    ASSERT_EQ(scheduler.prepare_graph_task(outer.slot, heap.image(), 1), GraphMaterializeResult::PENDING);
+    EXPECT_EQ(graph_execution_phase(*execution), GraphExecutionPhase::SUBMITTED);
+    EXPECT_EQ(execution->materialized_tasks, 1);
+    EXPECT_EQ(execution->constructed_tasks, 1);
+    EXPECT_EQ(execution->published_tasks.load(), 1);
+    ChipTaskSlotState *ready[2]{};
+    ASSERT_EQ(queue.pop_batch(ready, 2), 1);
+    ASSERT_EQ(ready[0], &tasks[0].slot);
+    const auto first = scheduler.complete_task(*ready[0]);
+    EXPECT_EQ(first.error_code, SIMPLER_ERROR_NONE);
+    EXPECT_EQ(first.stream_tasks_completed, 0);
+    EXPECT_EQ(graph_execution_phase(*execution), GraphExecutionPhase::SUBMITTED);
+    EXPECT_EQ(execution->remaining_tasks.load(), 1);
+    EXPECT_EQ(execution->retired_tasks.load(), 1);
+    EXPECT_TRUE(execution->is_completed(0));
+    EXPECT_FALSE(header.tasks.is_completed(7));
+
+    ASSERT_EQ(scheduler.prepare_graph_task(outer.slot, heap.image(), 1), GraphMaterializeResult::MATERIALIZED);
+    EXPECT_EQ(graph_execution_phase(*execution), GraphExecutionPhase::MATERIALIZED);
+    EXPECT_TRUE(graph_execution_external_ready(*execution));
+    EXPECT_EQ(execution->task_storage, tasks);
+    EXPECT_EQ(execution->materialized_tasks, 2);
+    EXPECT_EQ(execution->constructed_tasks, 2);
+    EXPECT_TRUE(execution->is_completed(0));
+    EXPECT_EQ(tasks[1].payload.scalar_data()[0], 18U);
+
+    EXPECT_EQ(
+        graph_execution_materialize_slice(outer.slot, *execution, heap.image(), 1), GraphMaterializeResult::MATERIALIZED
+    );
+    EXPECT_EQ(execution->constructed_tasks, 2);
+    EXPECT_TRUE(execution->is_completed(0));
+
+    ASSERT_EQ(queue.pop_batch(ready, 2), 1);
+    ASSERT_EQ(ready[0], &tasks[1].slot);
+    const auto last = scheduler.complete_task(*ready[0]);
+    EXPECT_EQ(last.error_code, SIMPLER_ERROR_NONE);
+    EXPECT_EQ(last.stream_tasks_completed, 1);
+    EXPECT_EQ(graph_execution_phase(*execution), GraphExecutionPhase::COMPLETED);
+    EXPECT_EQ(execution->remaining_tasks.load(), 0);
+    EXPECT_EQ(execution->retired_tasks.load(), 2);
+    EXPECT_TRUE(execution->is_completed(1));
+    EXPECT_TRUE(header.tasks.is_completed(7));
+    EXPECT_EQ(queue.pop_batch(ready, 2), 0);
+    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_NONE);
 }
 
 // Each term that withholds ED_FLAG_CANDIDATE from a body root, one per case.
@@ -783,7 +870,8 @@ TEST(GraphExecutionReplay, RootStagingVerdictWithholdsCandidate) {
         outer.slot.ed_flags = test_case.shell_ed_flags;
 
         ASSERT_EQ(
-            graph_execution_materialize_slice(outer.slot, *execution, heap.image(), 2), GraphMaterializeResult::PREPARED
+            graph_execution_materialize_slice(outer.slot, *execution, heap.image(), 2),
+            GraphMaterializeResult::MATERIALIZED
         );
         EXPECT_EQ(execution->task_at(0).slot.ed_flags & ED_FLAG_CANDIDATE, 0);
     }
@@ -861,7 +949,7 @@ TEST(GraphExecutionReplay, MaterializesBoundaryScalarPoolWiderThanTaskPayload) {
     outer_slot.graph_context = execution;
 
     EXPECT_EQ(
-        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::PREPARED
+        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::MATERIALIZED
     );
     EXPECT_EQ(execution->task_storage[0].payload.scalar_data()[0], 21U);
 }
@@ -957,67 +1045,36 @@ TEST(GraphDefinitionObject, RejectsNegativeSubTaskArgOffset) {
     EXPECT_EQ(heap.initialize_execution(definition_object, reinterpret_cast<uint64_t>(boundary.data()), 17), nullptr);
 }
 
-TEST(GraphExecutionActivationState, ExternalReadySurvivesConcurrentLifecycleTransition) {
+TEST(GraphExecutionPhase, ExternalReadySurvivesConcurrentPhaseChanges) {
     constexpr int ITERATIONS = 1000;
     for (int iteration = 0; iteration < ITERATIONS; ++iteration) {
         GraphExecution execution{};
         std::thread materialize([&] {
-            EXPECT_TRUE(graph_execution_transition(
-                execution, GraphExecutionState::SUBMITTED, GraphExecutionState::MATERIALIZING
-            ));
+            graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED);
+            graph_execution_mark_completed(execution);
         });
         std::thread ready([&] {
             EXPECT_TRUE(graph_execution_signal_external_ready(execution));
         });
         materialize.join();
         ready.join();
-        EXPECT_EQ(graph_execution_state(execution), GraphExecutionState::MATERIALIZING);
+        EXPECT_EQ(graph_execution_phase(execution), GraphExecutionPhase::COMPLETED);
         EXPECT_TRUE(graph_execution_external_ready(execution));
     }
 }
 
-TEST(GraphExecutionActivationState, RetriesDoNotClearReadiness) {
+TEST(GraphExecutionPhase, ReadinessIsIndependentOfPhase) {
     GraphExecution execution{};
 
+    EXPECT_EQ(graph_execution_phase(execution), GraphExecutionPhase::SUBMITTED);
     EXPECT_TRUE(graph_execution_signal_external_ready(execution));
     EXPECT_FALSE(graph_execution_signal_external_ready(execution));
-    graph_execution_set_state(execution, GraphExecutionState::PREPARED);
+    EXPECT_EQ(graph_execution_phase(execution), GraphExecutionPhase::SUBMITTED);
+    graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED);
     EXPECT_TRUE(graph_execution_external_ready(execution));
-    EXPECT_TRUE(graph_execution_transition(execution, GraphExecutionState::PREPARED, GraphExecutionState::ACTIVE));
-    EXPECT_FALSE(graph_execution_transition(execution, GraphExecutionState::PREPARED, GraphExecutionState::ACTIVE));
-}
-
-TEST(GraphExecutionActivationState, ExternalReadyBeforePrepareActivatesAtMeet) {
-    SchedulerState scheduler{};
-    GraphExecution execution{};
-    ChipTaskSlotState outer_slot{};
-    outer_slot.task_kind = TaskKind::GRAPH;
-    outer_slot.graph_context = &execution;
-    execution.outer_slot = &outer_slot;
-
-    EXPECT_EQ(scheduler.activate_graph_task(outer_slot), 0);
-    EXPECT_EQ(graph_execution_state(execution), GraphExecutionState::SUBMITTED);
+    graph_execution_mark_completed(execution);
     EXPECT_TRUE(graph_execution_external_ready(execution));
-
-    graph_execution_set_state(execution, GraphExecutionState::PREPARED);
-    EXPECT_EQ(scheduler.activate_prepared_graph(execution), 0);
-    EXPECT_EQ(graph_execution_state(execution), GraphExecutionState::ACTIVE);
-    EXPECT_EQ(scheduler.activate_prepared_graph(execution), 0);
-}
-
-TEST(GraphExecutionActivationState, PrepareBeforeExternalReadyActivatesAtMeet) {
-    SchedulerState scheduler{};
-    GraphExecution execution{};
-    ChipTaskSlotState outer_slot{};
-    outer_slot.task_kind = TaskKind::GRAPH;
-    outer_slot.graph_context = &execution;
-    execution.outer_slot = &outer_slot;
-    graph_execution_set_state(execution, GraphExecutionState::PREPARED);
-
-    EXPECT_EQ(scheduler.activate_graph_task(outer_slot), 0);
-    EXPECT_EQ(graph_execution_state(execution), GraphExecutionState::ACTIVE);
-    EXPECT_TRUE(graph_execution_external_ready(execution));
-    EXPECT_EQ(scheduler.activate_graph_task(outer_slot), 0);
+    EXPECT_EQ(graph_execution_phase(execution), GraphExecutionPhase::COMPLETED);
 }
 
 TEST(GraphExecutionErrors, ReadyQueueOverflowHasTriageText) {
@@ -1031,7 +1088,7 @@ TEST(GraphExecutionErrors, ReadyQueueOverflowHasTriageText) {
 // GRAPH branch stopped acting inline — a shell places no block, so its empty
 // active_mask shapes as DUMMY — and it holds two entries while three shells
 // arrive: a routing that queued them would overflow it and latch a named error.
-TEST(GraphExecutionActivationState, ShellReadinessOpensTheGateInsteadOfQueueing) {
+TEST(GraphExecutionPhase, ShellReadinessOpensTheGateInsteadOfQueueing) {
     SharedMemoryHeader header{};
     SchedulerState scheduler{};
     scheduler.sm_header = &header;
@@ -1107,12 +1164,11 @@ TEST(GraphExecutionProgress, SubTaskResolutionIsNotAHostCompletion) {
     // Any non-zero offset: the completion path only asks whether this execution
     // names a Definition, not what is at that offset.
     execution.definition_offset = sizeof(GraphDefinitionHeader);
-    execution.tasks = &task;
     execution.task_storage = &task;
     execution.task_states = states;
     execution.task_count = 1;
     execution.remaining_tasks.store(1, std::memory_order_relaxed);
-    graph_execution_set_state(execution, GraphExecutionState::ACTIVE, std::memory_order_relaxed);
+    graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED, std::memory_order_relaxed);
     task.slot.graph_context = &execution;
     task.slot.sub_task_local_id = 0;
 
@@ -1155,7 +1211,7 @@ TEST(GraphExecutionMaterialize, DirtyStorageYieldsValidExecution) {
 
     EXPECT_EQ(static_cast<void *>(execution), heap.execution());
     EXPECT_EQ(
-        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::PREPARED
+        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::MATERIALIZED
     );
 
     // Every observable scheduling field must be a materialize-written value,
@@ -1390,7 +1446,7 @@ TEST(GraphImageSection, ExecutionSurvivesTheLocalizersPackage) {
     outer.slot.graph_context = execution;
     EXPECT_EQ(
         graph_execution_materialize_slice(outer.slot, *execution, peer_package.view(), execution->task_count),
-        GraphMaterializeResult::PREPARED
+        GraphMaterializeResult::MATERIALIZED
     );
     EXPECT_EQ(execution->materialized_tasks, execution->task_count);
 }

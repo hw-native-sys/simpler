@@ -375,8 +375,8 @@ GraphMaterializeResult graph_execution_materialize_slice(
         return GraphMaterializeResult::INVALID;
     }
 
-    GraphExecutionState state = graph_execution_state(execution);
-    if (state >= GraphExecutionState::PREPARED) return GraphMaterializeResult::PREPARED;
+    const GraphExecutionPhase phase = graph_execution_phase(execution);
+    if (phase >= GraphExecutionPhase::MATERIALIZED) return GraphMaterializeResult::MATERIALIZED;
 
     uint8_t expected_busy = 0;
     if (!execution.materialize_busy.compare_exchange_strong(
@@ -385,23 +385,9 @@ GraphMaterializeResult graph_execution_materialize_slice(
         return GraphMaterializeResult::BUSY;
     }
 
-    state = graph_execution_state(execution);
-    if (state == GraphExecutionState::SUBMITTED) {
-        if (!graph_execution_transition(
-                execution, GraphExecutionState::SUBMITTED, GraphExecutionState::MATERIALIZING
-            )) {
-            execution.materialize_busy.store(0, std::memory_order_release);
-            return GraphMaterializeResult::BUSY;
-        }
-        // Incremental activation reads producer slots through execution.tasks
-        // while the graph is still materializing, so publish the storage base
-        // once, before the first range. Topological task order guarantees every
-        // producer index a materialized task references is already constructed,
-        // and materialize_busy serializes this with any concurrent slice.
-        execution.tasks = execution.task_storage;
-    } else if (state != GraphExecutionState::MATERIALIZING) {
+    if (graph_execution_phase(execution) != GraphExecutionPhase::SUBMITTED) {
         execution.materialize_busy.store(0, std::memory_order_release);
-        return GraphMaterializeResult::INVALID;
+        return GraphMaterializeResult::MATERIALIZED;
     }
 
     // Every section below is read one element at a time out of `image`, each read
@@ -597,7 +583,7 @@ GraphMaterializeResult graph_execution_materialize_slice(
         return GraphMaterializeResult::INVALID;
     }
 
-    graph_execution_set_state(execution, GraphExecutionState::PREPARED);
+    graph_execution_set_phase(execution, GraphExecutionPhase::MATERIALIZED);
     execution.materialize_busy.store(0, std::memory_order_release);
-    return GraphMaterializeResult::PREPARED;
+    return GraphMaterializeResult::MATERIALIZED;
 }

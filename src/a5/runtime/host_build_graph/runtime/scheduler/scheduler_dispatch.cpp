@@ -1446,7 +1446,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Bounded definition materialization. It consumes no AICore, and it is
         // not a release path: a shell's roots are rung on the completion path
-        // (push_ready_routed -> activate_graph_task), and a root published after
+        // (push_ready_routed -> signal_graph_external_ready), and a root published after
         // the shell's one-shot staging claim is never pre-staged, so nothing
         // reachable from here can free a core another task waits on. That is
         // what lets it sit behind the Phase 2 drain check — a drain holding it
@@ -1484,7 +1484,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     fail_scheduler(runtime, thread_idx, SIMPLER_ERROR_INVALID_ARGS);
                     break;
                 }
-                if (tasks_materialized > 0 || result == GraphMaterializeResult::PREPARED) {
+                if (tasks_materialized > 0 || result == GraphMaterializeResult::MATERIALIZED) {
                     made_progress = true;
                 }
 #if SIMPLER_DFX
