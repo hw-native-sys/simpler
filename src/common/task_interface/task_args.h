@@ -129,7 +129,6 @@ struct TaskArgsTpl : TensorTagMixin<TensorTag, MaxT> {
             return from_u64<ScalarT>(scalars_[i]);
         }
     }
-    S &scalar(int32_t i) { return scalars_[i]; }
 
     const S *scalars() const { return scalars_; }
 
@@ -188,7 +187,6 @@ struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
             return from_u64<ScalarT>(scalars_[static_cast<size_t>(i)]);
         }
     }
-    S &scalar(int32_t i) { return scalars_[static_cast<size_t>(i)]; }
 
     const T *tensor_data() const { return tensors_.data(); }
     const S *scalar_data() const { return scalars_.data(); }
