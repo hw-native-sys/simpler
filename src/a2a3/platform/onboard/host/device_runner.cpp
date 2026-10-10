@@ -941,6 +941,7 @@ int DeviceRunner::reap_run(const PreparedExecution &prepared, int *diagnostics_r
         prepared, static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())
     );
     if (rc != 0) {
+        log_run_failure(prepared, rc);
         // The fence wait surfaces the AICore op-timeout (STARS-reaped op ->
         // 507000/507018/507046 at the boundary or, on the no-fence fallback, at
         // stream sync). The op-timeout leaves the device context poisoned for

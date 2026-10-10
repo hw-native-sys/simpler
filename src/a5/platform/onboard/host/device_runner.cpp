@@ -748,6 +748,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
 
     int rc = wait_run_fence(prepared, stream_aicpu_, stream_aicore_);
     if (rc != 0) {
+        log_run_failure(prepared, rc);
         // The fence wait surfaces the AICore op-timeout (STARS-reaped op ->
         // 507000/507018/507046 at the boundary or, on the no-fence fallback, at
         // stream sync). The op-timeout leaves the context poisoned, so recovery
