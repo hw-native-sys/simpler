@@ -28,8 +28,7 @@ Allocating a comm domain crosses a second, independent device-id layer that chip
 init never reaches, so it gets its own case: ``aclrtMemAccessDesc::location.id``
 is consumed in the driver-visible space on a2a3 with CANN 9.0 even though
 ``aclrtMemSetAccess`` is an ACL entry point, and a logical id there fails with
-507899. A5 with CANN 9.3 instead validates this field in the ACL-logical space;
-the A5 case stays deselected until issue #2519 resolves that compatibility gap.
+507899. The A5 ACL runtime instead validates this field in the ACL-logical space.
 Its sibling ``aclrtPhysicalMemProp::location.id`` is logical, so the two must
 not be treated alike on the measured a2a3 stack — see
 ``common/acl_hal_device.h``.
@@ -111,8 +110,7 @@ def test_chip_init_under_visible_devices(st_platform, st_device_ids):
     )
 
 
-# A5/CANN 9.3 requires ACL-logical access IDs; issue #2519 tracks the compatibility fix.
-@pytest.mark.platforms(["a2a3"])
+@pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(2)
 @pytest.mark.runtime(RUNTIME)
 def test_comm_domain_under_visible_devices(st_platform, st_device_ids):

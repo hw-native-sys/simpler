@@ -38,6 +38,8 @@ namespace pto {
  *     translate, even though `aclrtMemSetAccess` is an ACL entry point. Its
  *     sibling `aclrtPhysicalMemProp::location.id` MUST NOT: it is read in the
  *     logical space, and must in fact name the *bound* logical device.
+ *     The A5 ACL runtime validates both fields in the ACL-logical space, so neither
+ *     field may be translated there.
  *
  *     Measured under `ASCEND_RT_VISIBLE_DEVICES=2,3` bound to logical 0 (card 2).
  *     The grant matters: the translated id of the bound device (2) has to fall
