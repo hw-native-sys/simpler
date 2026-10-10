@@ -610,3 +610,59 @@ TEST(HbgGraphAsyncSubmit, AFatalInsideARecordedBodyReachesGraphEndAndAbortsNothi
     EXPECT_EQ(fake.abort_calls.load(std::memory_order_acquire), 0)
         << "graph_end retires its own entry, so a caller-side abort would be a second one racing graph_commit's free";
 }
+
+namespace {
+
+struct SubmitConfig : simpler::hbg::ConfigBase {
+    explicit SubmitConfig(int v) :
+        variant(v) {}
+
+    int variant;
+
+    uint64_t hash() const { return simpler::hbg::config_hash(variant); }
+    bool operator==(const SubmitConfig &other) const { return variant == other.variant; }
+};
+
+void config_graph_body(const GraphTaskArgs & /*args*/, const SubmitConfig & /*config*/) {}
+
+}  // namespace
+
+// Submitting with a Config retains it, and framework_finish_orch releases it. Those two
+// together are what keeps the registry covering the same window as the host's Definition
+// cache, which lives and dies inside one bind.
+TEST(HbgGraphAsyncSubmit, SubmittingWithAConfigRetainsItUntilTheBindFinishes) {
+    std::array<FakeBoundary, 4> boundaries;
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
+    fake.record_every_begin = true;
+    // This case is about the registry, not the handshake: let fake_graph_prepare return
+    // without waiting for a later submission that never comes.
+    fake.later_submit_entered = true;
+    framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
+    simpler::hbg::config_registry().clear();
+
+    uint32_t storage[8]{};
+    uint32_t shape[] = {8};
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
+    GraphTaskArgs args;
+    args.add_input(boundary);
+
+    {
+        ScopeGuard scope;
+        rt_submit_graph(&config_graph_body, args, SubmitConfig{1});
+        EXPECT_EQ(simpler::hbg::config_registry().size(), 1u) << "a submitted Config must be retained for the bind";
+
+        // A second Graph with a different Config is a different key, so it takes its own
+        // entry rather than being compared against the first.
+        rt_submit_graph(&config_graph_body, args, SubmitConfig{2});
+        EXPECT_EQ(simpler::hbg::config_registry().size(), 2u);
+    }
+    rt_graph_commit();
+
+    framework_finish_orch();
+    EXPECT_TRUE(simpler::hbg::config_registry().empty()) << "the bind's teardown must release every retained Config";
+
+    framework_bind_runtime(nullptr);
+}

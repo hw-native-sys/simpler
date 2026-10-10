@@ -69,12 +69,15 @@ namespace {
 constexpr size_t kAlign = 1024;
 
 // Mirrors the file-local HostOrchEntryPoints in runtime_maker.cpp: bind reads
-// exactly these two function pointers out of host_orch_func_ptr.
+// exactly these function pointers out of host_orch_func_ptr. A field added there
+// and not here is read past the end of this object, so the two must move together.
 using TestOrchEntryFunc = void (*)(const ChipTaskArgs &);
 using TestOrchBindFunc = void (*)(RuntimeContext *);
+using TestOrchFinishFunc = void (*)();
 struct TestHostOrchEntryPoints {
     TestOrchEntryFunc entry{nullptr};
     TestOrchBindFunc bind{nullptr};
+    TestOrchFinishFunc finish{nullptr};
 };
 
 // An orchestration that submits nothing: this suite is about the ledger, and a

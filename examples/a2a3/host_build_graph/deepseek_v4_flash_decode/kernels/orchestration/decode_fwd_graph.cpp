@@ -1231,7 +1231,20 @@ void csa_attn_block(const GraphTaskArgs &args) {
     }
 }
 
-void csa_moe_block(const GraphTaskArgs &args, bool route_by_hash) {
+// Which routing arm the recorded body takes. A construction parameter rather than a
+// boundary scalar: the branch is resolved once at record time and fixed in the Definition,
+// so the two arms are two Graphs rather than one Graph with a per-invocation choice.
+struct CsaMoeConfig : simpler::hbg::ConfigBase {
+    explicit CsaMoeConfig(bool r) :
+        route_by_hash(r) {}
+
+    bool route_by_hash;
+
+    uint64_t hash() const { return simpler::hbg::config_hash(route_by_hash); }
+    bool operator==(const CsaMoeConfig &other) const { return route_by_hash == other.route_by_hash; }
+};
+
+void csa_moe_block(const GraphTaskArgs &args, const CsaMoeConfig &config) {
     const simpler::hbg::Tensor &hc_ffn_fn_csa_inline547 = args.tensor(0).ref();
     const simpler::hbg::Tensor &hc_ffn_scale_csa_inline543 = args.tensor(1).ref();
     const simpler::hbg::Tensor &hc_ffn_base_csa_inline542 = args.tensor(2).ref();
@@ -1550,7 +1563,7 @@ void csa_moe_block(const GraphTaskArgs &args, bool route_by_hash) {
         // value, which rt_submit_graph folds into the key: two Definitions, each
         // layer replaying its own. (Eight in total for the pass, which is what the
         // recorder pool prewarms.)
-        if (route_by_hash) {
+        if (config.route_by_hash) {
             // Spmd route_hash_spmd_1: route_hash_1
             CoreTaskArgs params_t177;
             params_t177.add_input(ext_input_ids);
@@ -8041,7 +8054,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         csa_moe_block_args.add_static_scalar(arrived_ctx, combine_arrived_ctx);
         csa_moe_block_args.add_static_scalar(data_arrived_ctx, my_rank, nt_inline677__rv_v2, recv_meta_ctx);
         csa_moe_block_args.add_static_scalar(recv_x_ctx, recv_aux_ctx, recv_route_ctx, routed_y_buf_ctx);
-        rt_submit_graph(&csa_moe_block, csa_moe_block_args, static_cast<int64_t>(csa_layer_inline714) < 3);
+        rt_submit_graph(
+            &csa_moe_block, csa_moe_block_args, CsaMoeConfig{static_cast<int64_t>(csa_layer_inline714) < 3}
+        );
     };
     auto submit_hca_attn_block = [&](int32_t hca_layer_inline704, int64_t loop_i_inline712,
                                      const simpler::hbg::Tensor &x_attn_hca_inline723,

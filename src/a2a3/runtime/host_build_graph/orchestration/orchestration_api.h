@@ -33,14 +33,16 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
-#include <tuple>
+#include <memory>
 #include <type_traits>
+#include <unordered_map>
 
 // Type headers needed by orchestration
 #include "assert_compat.h"                    // debug_assert
 #include "host_build_graph/common.h"          // framework_bind_runtime / framework_current_runtime
 #include "common/host_phase_kind.h"           // HostPhaseKind, for the phase records below
 #include "host_build_graph/graph_cache.h"     // Graph Execution key and result helpers
+#include "host_build_graph/graph_config.h"    // simpler::hbg::ConfigBase, DefaultConfig, Config traits
 #include "host_build_graph/runtime_ops.h"     // RuntimeOps, RuntimeContext forward declaration
 #include "host_build_graph/runtime_status.h"  // SIMPLER_ERROR_*
 #include "host_build_graph/submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots
@@ -527,44 +529,76 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
     return result;
 }
 
-static inline GraphSubmitResult rt_submit_graph(uint64_t graph_id, GraphFunction function, const GraphTaskArgs &args) {
+template <typename ConfigT>
+static inline GraphSubmitResult
+rt_submit_graph(uint64_t graph_id, GraphFunction function, const GraphTaskArgs &args, const ConfigT &config) {
+    simpler::hbg::assert_config<ConfigT>();
     debug_assert(function != nullptr && "Graph function must not be null");
     if (function == nullptr) return GraphSubmitResult{};
-    return rt_submit_graph_impl(rt_graph_make_key(graph_id), args, [function](const GraphTaskArgs &record_args) {
+    const uint64_t graph_key = rt_graph_make_key(graph_id, config.hash());
+    simpler::hbg::retain_config(graph_key, config);
+    return rt_submit_graph_impl(graph_key, args, [function](const GraphTaskArgs &record_args) {
         function(record_args);
     });
 }
 
-static inline GraphSubmitResult rt_submit_graph(GraphFunction function, const GraphTaskArgs &args) {
-    return rt_submit_graph(rt_graph_function_id(function), function, args);
+// Submitting without a Config and submitting a DefaultConfig are the same submission. They
+// share this one path rather than computing a key each, so the two spellings cannot drift
+// into two keys for one Graph.
+static inline GraphSubmitResult rt_submit_graph(uint64_t graph_id, GraphFunction function, const GraphTaskArgs &args) {
+    return rt_submit_graph(graph_id, function, args, simpler::hbg::DefaultConfig{});
 }
 
-template <typename... Config>
-using GraphFunctionWithConfig = void (*)(const GraphTaskArgs &, Config...);
+static inline GraphSubmitResult rt_submit_graph(GraphFunction function, const GraphTaskArgs &args) {
+    return rt_submit_graph(rt_graph_function_id(function), function, args, simpler::hbg::DefaultConfig{});
+}
 
-template <typename... Config>
+template <typename ConfigT>
+static inline GraphSubmitResult
+rt_submit_graph(GraphFunction function, const GraphTaskArgs &args, const ConfigT &config) {
+    return rt_submit_graph(rt_graph_function_id(function), function, args, config);
+}
+
+// A Graph whose body reads construction parameters. The body takes the Config by its own
+// type, so a call that pairs a body with the wrong Config fails to deduce ConfigT rather
+// than compiling into a wrong read.
+template <typename ConfigT>
+using GraphFunctionWithConfig = void (*)(const GraphTaskArgs &, const ConfigT &);
+
+template <typename ConfigT>
 static inline GraphSubmitResult rt_submit_graph(
-    uint64_t graph_id, GraphFunctionWithConfig<Config...> function, const GraphTaskArgs &args, Config... config
+    uint64_t graph_id, GraphFunctionWithConfig<ConfigT> function, const GraphTaskArgs &args, const ConfigT &config
 ) {
+    simpler::hbg::assert_config<ConfigT>();
     debug_assert(function != nullptr && "Graph function must not be null");
     if (function == nullptr) return GraphSubmitResult{};
-    auto configs = std::make_tuple(config...);
-    return rt_submit_graph_impl(
-        rt_graph_make_key(graph_id, config...), args, [function, configs](const GraphTaskArgs &record_args) {
-            std::apply(
-                [&](auto... values) {
-                    function(record_args, values...);
-                },
-                configs
-            );
-        }
-    );
+    const uint64_t graph_key = rt_graph_make_key(graph_id, config.hash());
+    simpler::hbg::retain_config(graph_key, config);
+    // The lambda captures its own copy: the recording job runs on a recorder thread that
+    // outlives this call, so it may hold nothing of the caller's frame -- `config` included.
+    return rt_submit_graph_impl(graph_key, args, [function, config](const GraphTaskArgs &record_args) {
+        function(record_args, config);
+    });
 }
 
-template <typename... Config>
+template <typename ConfigT>
 static inline GraphSubmitResult
-rt_submit_graph(GraphFunctionWithConfig<Config...> function, const GraphTaskArgs &args, Config... config) {
-    return rt_submit_graph(rt_graph_function_id(function), function, args, config...);
+rt_submit_graph(GraphFunctionWithConfig<ConfigT> function, const GraphTaskArgs &args, const ConfigT &config) {
+    return rt_submit_graph(rt_graph_function_id(function), function, args, config);
+}
+
+// Release what this .so holds for the bind that just ended. The host calls it once per bind,
+// after the orchestration entry returns, so anything retained here covers the same window as
+// the host's Definition cache -- which is a local of run_host_orchestration and dies with it.
+//
+// Currently that is the Graph Config registry. A registry outliving the cache would report a
+// collision between two Configs that, the cache having been emptied in between, could never
+// have been confused for one another.
+//
+// `used` because this is an inline definition nothing inside the .so calls: the host reaches
+// it by dlsym, so the symbol has to be emitted anyway.
+extern "C" __attribute__((visibility("default"), used)) inline void framework_finish_orch() {
+    simpler::hbg::config_registry().clear();
 }
 
 #define _SIMPLER_CONCATENATE_IMPL(x, y) x##y

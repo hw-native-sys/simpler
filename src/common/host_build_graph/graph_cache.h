@@ -105,29 +105,12 @@ inline bool rt_graph_args_cacheable(const GraphTaskArgs &args) {
     return true;
 }
 
-inline uint64_t rt_graph_make_key(uint64_t graph_id) { return graph_id; }
-
-template <typename T>
-inline uint64_t graph_hash_config_value(uint64_t hash, T value) {
-    using Value = std::remove_cv_t<std::remove_reference_t<T>>;
-    static_assert(
-        std::is_integral_v<Value> || std::is_same_v<Value, float> || std::is_same_v<Value, double>,
-        "Graph construction parameters must be integral, float, or double values"
-    );
-    constexpr uint8_t category = std::is_same_v<Value, bool> ? 1 :
-                                 std::is_integral_v<Value>   ? (std::is_signed_v<Value> ? 2 : 3) :
-                                                               4;
-    constexpr uint8_t width = sizeof(Value);
-    hash = graph_hash_byte(hash, category);
-    hash = graph_hash_byte(hash, width);
-    return graph_hash_bytes(hash, &value, sizeof(value));
-}
-
-template <typename... Config>
-inline uint64_t rt_graph_make_key(uint64_t graph_id, Config... config) {
+// A Graph's key: its identity mixed with the hash of its construction parameters.
+//
+// One path, whatever the Graph was submitted with. A Graph that takes no construction
+// parameters passes a DefaultConfig, whose hash is zero, so there is no second key
+// arithmetic to keep in step with this one.
+inline uint64_t rt_graph_make_key(uint64_t graph_id, uint64_t config_hash) {
     uint64_t hash = graph_hash_bytes(1469598103934665603ULL, &graph_id, sizeof(graph_id));
-    const uint32_t count = sizeof...(Config);
-    hash = graph_hash_bytes(hash, &count, sizeof(count));
-    ((hash = graph_hash_config_value(hash, config)), ...);
-    return hash;
+    return graph_hash_bytes(hash, &config_hash, sizeof(config_hash));
 }

@@ -25,6 +25,7 @@
 #include "host_build_graph/runtime_status.h"
 
 #include "graph_cache.h"
+#include "graph_config.h"
 #include "graph_execution.h"
 #include "graph_image_view.h"
 #include "runtime_status/error_names.h"
@@ -367,11 +368,153 @@ TEST(GraphCache, AcceptsBoundaryScalars) {
     EXPECT_TRUE(rt_graph_args_cacheable(args));
 }
 
+// A Config whose single field reaches its hash, so two values of it are two keys.
+struct VariantConfig : simpler::hbg::ConfigBase {
+    explicit VariantConfig(int v) :
+        variant(v) {}
+
+    int variant;
+
+    uint64_t hash() const { return simpler::hbg::config_hash(variant); }
+    bool operator==(const VariantConfig &other) const { return variant == other.variant; }
+};
+
 TEST(GraphCache, ConfigValuesSelectDifferentDefinitions) {
     constexpr uint64_t GRAPH_ID = 0x1234;
 
-    EXPECT_NE(rt_graph_make_key(GRAPH_ID, 0), rt_graph_make_key(GRAPH_ID, 1));
-    EXPECT_EQ(rt_graph_make_key(GRAPH_ID, 0), rt_graph_make_key(GRAPH_ID, 0));
+    EXPECT_NE(
+        rt_graph_make_key(GRAPH_ID, VariantConfig{0}.hash()), rt_graph_make_key(GRAPH_ID, VariantConfig{1}.hash())
+    );
+    EXPECT_EQ(
+        rt_graph_make_key(GRAPH_ID, VariantConfig{0}.hash()), rt_graph_make_key(GRAPH_ID, VariantConfig{0}.hash())
+    );
+}
+
+// Submitting no Config and submitting a DefaultConfig are the same submission, so they must
+// land on one key rather than on two that happen to agree today.
+TEST(GraphCache, NoConfigAndADefaultConfigShareOneKey) {
+    constexpr uint64_t GRAPH_ID = 0x1234;
+
+    EXPECT_EQ(
+        rt_graph_make_key(GRAPH_ID, simpler::hbg::DefaultConfig{}.hash()),
+        rt_graph_make_key(GRAPH_ID, simpler::hbg::DefaultConfig{}.hash())
+    );
+    // A Config that carries values is a different Graph even at the same id.
+    EXPECT_NE(
+        rt_graph_make_key(GRAPH_ID, simpler::hbg::DefaultConfig{}.hash()),
+        rt_graph_make_key(GRAPH_ID, VariantConfig{0}.hash())
+    );
+}
+
+// The comparison a key collision is settled by. It runs where the Config's own type is
+// known, so it is an ordinary operator== rather than a virtual call.
+TEST(GraphCache, ConfigComparesByValue) {
+    EXPECT_TRUE(VariantConfig{0} == VariantConfig{0});
+    EXPECT_FALSE(VariantConfig{0} == VariantConfig{1});
+    EXPECT_TRUE(simpler::hbg::DefaultConfig{} == simpler::hbg::DefaultConfig{});
+}
+
+// What the retained Config is recovered through: a base pointer, so one table holds every
+// Config type, and a cast that fails on any other type -- which is how a collision between
+// two different Config types is caught rather than compared field by field.
+TEST(GraphCache, RetainedConfigRecoversItsOwnTypeAndRefusesAnother) {
+    const std::unique_ptr<simpler::hbg::ConfigBase> retained = std::make_unique<VariantConfig>(7);
+
+    const auto *same_type = dynamic_cast<const VariantConfig *>(retained.get());
+    ASSERT_NE(same_type, nullptr);
+    EXPECT_TRUE(*same_type == VariantConfig{7});
+    EXPECT_FALSE(*same_type == VariantConfig{8});
+
+    EXPECT_EQ(dynamic_cast<const simpler::hbg::DefaultConfig *>(retained.get()), nullptr);
+}
+
+// The three requirements the submit path enforces, checked here so a Config that fails one
+// is a compile error at a named line rather than wherever it is first submitted.
+static_assert(std::is_base_of_v<simpler::hbg::ConfigBase, VariantConfig>);
+static_assert(simpler::hbg::has_config_hash_v<VariantConfig>);
+static_assert(simpler::hbg::has_config_equality_v<VariantConfig>);
+static_assert(simpler::hbg::has_config_hash_v<simpler::hbg::DefaultConfig>);
+static_assert(simpler::hbg::has_config_equality_v<simpler::hbg::DefaultConfig>);
+
+// ConfigBase itself provides neither, which is what makes the traits above a real check
+// rather than something every derived type satisfies for free.
+static_assert(!simpler::hbg::has_config_hash_v<simpler::hbg::ConfigBase>);
+static_assert(!simpler::hbg::has_config_equality_v<simpler::hbg::ConfigBase>);
+
+// A second Config type, so a collision between two *different* types can be exercised.
+// Its field is a different type from VariantConfig's on purpose: the two must still be
+// told apart by what they are, not by what they hold.
+struct ThresholdConfig : simpler::hbg::ConfigBase {
+    explicit ThresholdConfig(bool e) :
+        enabled(e) {}
+
+    bool enabled;
+
+    uint64_t hash() const { return simpler::hbg::config_hash(enabled); }
+    bool operator==(const ThresholdConfig &other) const { return enabled == other.enabled; }
+};
+
+// The registry is a process-wide table, so each case starts and leaves it empty rather
+// than inheriting whatever an earlier one retained.
+class GraphConfigRegistryTest : public ::testing::Test {
+protected:
+    void SetUp() override { simpler::hbg::config_registry().clear(); }
+    void TearDown() override { simpler::hbg::config_registry().clear(); }
+};
+
+// The ordinary case: one Graph submitted repeatedly within a bind.
+TEST_F(GraphConfigRegistryTest, ResubmittingOneKeyWithItsOwnConfigAgrees) {
+    constexpr uint64_t KEY = 0x9001;
+
+    simpler::hbg::retain_config(KEY, VariantConfig{3});
+    EXPECT_NO_THROW(simpler::hbg::retain_config(KEY, VariantConfig{3}));
+    EXPECT_NO_THROW(simpler::hbg::retain_config(KEY, VariantConfig{3}));
+}
+
+// The hole this registry exists to close. Two Configs reaching one key means the key no
+// longer names the Graph its Definition was recorded from, so the next hit would replay the
+// wrong body -- the failure mode that was silent before.
+TEST_F(GraphConfigRegistryTest, TwoConfigValuesOnOneKeyFailLoudly) {
+    constexpr uint64_t KEY = 0x9002;
+
+    simpler::hbg::retain_config(KEY, VariantConfig{3});
+    EXPECT_THROW(simpler::hbg::retain_config(KEY, VariantConfig{4}), AssertionError);
+}
+
+// Same hole, across types rather than values. One table for every Config type is what makes
+// this case visible at all: per-type tables would put these two in separate maps.
+TEST_F(GraphConfigRegistryTest, TwoConfigTypesOnOneKeyFailLoudly) {
+    constexpr uint64_t KEY = 0x9003;
+
+    simpler::hbg::retain_config(KEY, VariantConfig{3});
+    EXPECT_THROW(simpler::hbg::retain_config(KEY, ThresholdConfig{true}), AssertionError);
+}
+
+// Distinct keys are independent, so an unrelated Graph is never dragged into a comparison.
+TEST_F(GraphConfigRegistryTest, DistinctKeysRetainIndependently) {
+    simpler::hbg::retain_config(0x9004, VariantConfig{3});
+    simpler::hbg::retain_config(0x9005, VariantConfig{4});
+    simpler::hbg::retain_config(0x9006, ThresholdConfig{false});
+
+    EXPECT_NO_THROW(simpler::hbg::retain_config(0x9004, VariantConfig{3}));
+    EXPECT_NO_THROW(simpler::hbg::retain_config(0x9005, VariantConfig{4}));
+    EXPECT_NO_THROW(simpler::hbg::retain_config(0x9006, ThresholdConfig{false}));
+    EXPECT_EQ(simpler::hbg::config_registry().size(), 3u);
+}
+
+// What framework_finish_orch does at the end of every bind. Clearing is what pairs this
+// table with the host's Definition cache: once that cache is gone, a key carries nothing,
+// so the same key may legitimately come back under a different Config.
+TEST_F(GraphConfigRegistryTest, ClearingReleasesEveryKey) {
+    constexpr uint64_t KEY = 0x9007;
+
+    simpler::hbg::retain_config(KEY, VariantConfig{3});
+    ASSERT_THROW(simpler::hbg::retain_config(KEY, VariantConfig{4}), AssertionError);
+
+    simpler::hbg::config_registry().clear();
+
+    EXPECT_TRUE(simpler::hbg::config_registry().empty());
+    EXPECT_NO_THROW(simpler::hbg::retain_config(KEY, VariantConfig{4}));
 }
 
 // Arg's storage stays unreachable only while the base is private. Under a public base an

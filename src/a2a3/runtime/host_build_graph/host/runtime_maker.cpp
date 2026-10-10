@@ -481,6 +481,7 @@ bool create_orch_so_tempfile(const uint8_t *data, size_t size, std::string *out_
 // The orchestration .so exports these (submit_task form).
 typedef void (*OrchestrationEntryFunc)(const ChipTaskArgs &);
 typedef void (*OrchestrationBindFunc)(RuntimeContext *);
+typedef void (*OrchestrationFinishFunc)();
 
 // Resolved orchestration .so entry points. register_callable_impl allocates one
 // of these (the entry, plus the .so's own framework_bind_runtime, which sets
@@ -490,6 +491,9 @@ typedef void (*OrchestrationBindFunc)(RuntimeContext *);
 struct HostOrchEntryPoints {
     OrchestrationEntryFunc entry{nullptr};
     OrchestrationBindFunc bind{nullptr};
+    // Lets the .so release what it holds for a bind, once that bind's entry has returned.
+    // Optional: a .so built before this entry point existed holds nothing per bind.
+    OrchestrationFinishFunc finish{nullptr};
 };
 
 // host_build_graph host-orch: the orchestrator builds the task graph in a host
@@ -807,6 +811,13 @@ int32_t run_host_orchestration(
     // orchestration_api.h, so nothing reads that one — rt_scope_* and
     // rt_orchestration_done take the runtime as an argument.
     entry_points->bind(rt);
+
+    // What the .so holds for this bind is released when this function leaves, by whichever
+    // path: the state it covers -- the Graph Config registry today -- is paired with
+    // graph_state below, which is a local of this function and dies the same way.
+    RAIIScopeGuard orch_finish([entry_points]() {
+        if (entry_points->finish != nullptr) entry_points->finish();
+    });
 
     const BindPhaseMark orch_phase = bind_phase_begin();
     {
@@ -1179,6 +1190,11 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
         auto *eps = new HostOrchEntryPoints{};
         eps->entry = reinterpret_cast<OrchestrationEntryFunc>(entry);
         eps->bind = reinterpret_cast<OrchestrationBindFunc>(bind_sym);
+        // Optional, and looked up without failing the registration: a .so built before this
+        // entry point existed holds nothing per bind. dlerror() is drained here so the next
+        // caller does not read this miss as its own failure.
+        eps->finish = reinterpret_cast<OrchestrationFinishFunc>(dlsym(handle, "framework_finish_orch"));
+        (void)dlerror();
         out->host_dlopen_handle = handle;
         out->host_orch_func_ptr = eps;
         LOG_INFO("host-orch: loaded orchestration entry '%s' on host", orch_func_name);

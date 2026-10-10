@@ -73,8 +73,20 @@ CoreTaskPredicate gate_predicate(const simpler::hbg::Tensor &gate, uint32_t inde
     return pred;
 }
 
-void layer(const GraphTaskArgs &args, int variant) {
-    (void)variant;
+// A construction parameter this body does not read. It still decides which Definition the
+// submission reaches -- the key carries its hash -- so it exercises the submit overload that
+// pairs a Config with a body that takes none.
+struct LayerConfig : simpler::hbg::ConfigBase {
+    explicit LayerConfig(int v) :
+        variant(v) {}
+
+    int variant;
+
+    uint64_t hash() const { return simpler::hbg::config_hash(variant); }
+    bool operator==(const LayerConfig &other) const { return variant == other.variant; }
+};
+
+void layer(const GraphTaskArgs &args) {
     const simpler::hbg::Tensor &x = args.tensor(0).ref();
     const simpler::hbg::Tensor &y = args.tensor(1).ref();
     const simpler::hbg::Tensor &boundary_gate = args.tensor(2).ref();
@@ -157,7 +169,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         layer_args.add_inout(orch_args.tensor(GRAPH_INVOCATIONS + i).ref());
         layer_args.add_input(orch_args.tensor(2 * GRAPH_INVOCATIONS + i).ref());
         layer_args.add_scalar(orch_args.scalar(i));
-        rt_submit_graph(&layer, layer_args, 0);
+        rt_submit_graph(&layer, layer_args, LayerConfig{0});
     }
 }
 
