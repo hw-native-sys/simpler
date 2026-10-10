@@ -66,7 +66,11 @@ add_custom_target(build_package_sim
 
 if(SKBUILD_MODE)
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/src/
-            DESTINATION simpler_setup/_assets/src)
+            DESTINATION simpler_setup/_assets/src
+            PATTERN "__pycache__" EXCLUDE
+            PATTERN "*.pyc" EXCLUDE
+            PATTERN "*.pyo" EXCLUDE
+            PATTERN "compile_commands.json" EXCLUDE)
     # The platform CMakeLists include these through SIMPLER_CMAKE_DIR, which
     # runtime_compiler.py resolves to PROJECT_ROOT/cmake — the installed
     # simpler_setup/_assets/cmake in a wheel. All four are reachable from a
@@ -86,4 +90,9 @@ if(SKBUILD_MODE)
         install(FILES ${CMAKE_SOURCE_DIR}/pto_isa.pin
                 DESTINATION simpler_setup/_assets)
     endif()
+    configure_file(
+        "${CMAKE_SOURCE_DIR}/cmake/install_simpler_pin.cmake.in"
+        "${CMAKE_CURRENT_BINARY_DIR}/install_simpler_pin.cmake"
+        @ONLY)
+    install(SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/install_simpler_pin.cmake")
 endif()
