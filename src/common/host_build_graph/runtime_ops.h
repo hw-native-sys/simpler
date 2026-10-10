@@ -96,4 +96,13 @@ struct RuntimeOps {
     // caller record the body inline instead.
     bool (*graph_record_start)(RuntimeContext *rt, const GraphTaskArgs &args, void *job);
     void (*graph_record_wait)(RuntimeContext *rt);
+
+    // Graph begin with this call's exact construction parameters: `graph_id` is the
+    // submit overload's exact identity, `graph_key` its digest, and `config` the
+    // tagged blob, valid only for the duration of this call. Appended after the
+    // table's original fields so a runtime built before this slot keeps answering
+    // through graph_begin above; callers treat a null here the same way.
+    GraphScopeResult (*graph_begin_with_config)(
+        RuntimeContext *rt, uint64_t graph_id, uint64_t graph_key, GraphConfigView config, const GraphTaskArgs &args
+    );
 };

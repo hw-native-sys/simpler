@@ -46,9 +46,35 @@ struct GraphDefinitionArena {
 // correct — never merely slower — when it outgrows the retained capacity.
 inline constexpr size_t GRAPH_NO_OBJECT_OFFSET = static_cast<size_t>(-1);
 
+// The cache's identity for one Graph: the exact values a submission is keyed by,
+// compared as such. `digest` is derived from the other fields — the same FNV stream
+// that names the Definition on the wire and in DFX phases — and is what indexes the
+// map; equality never rests on it, which is the point: a digest collision between two
+// distinct identities yields two entries in one bucket, not one entry for two graphs.
+struct GraphCacheKey {
+    uint64_t callable{0};
+    uint64_t graph_id{0};
+    uint64_t digest{0};
+    // The tagged construction-parameter bytes (the graph_config_blob form), empty
+    // when the Graph takes none. Owned here; the submitting side builds a borrowed
+    // view per call and nothing else may hold it.
+    std::vector<std::byte> config;
+
+    bool operator==(const GraphCacheKey &other) const {
+        return callable == other.callable && graph_id == other.graph_id && digest == other.digest &&
+               config == other.config;
+    }
+};
+
+struct GraphCacheKeyHash {
+    size_t operator()(const GraphCacheKey &key) const { return key.digest; }
+};
+
 struct GraphHostUpload {
     ChipTaskSlotState *outer_slot;
-    uint64_t full_key;
+    // Borrowed from the key's owner — a Definitions-map node or an in-flight entry —
+    // both of which outlive the upload handoff at bind time.
+    const GraphCacheKey *key;
 };
 
 // The run's distinct Definition images (already deduplicated by the host-side
@@ -58,7 +84,7 @@ struct GraphHostUpload {
 // and upload. It is GRAPH_NO_OBJECT_OFFSET exactly when `spill` is set, which is
 // then the image the upload must copy into an object of its own choosing.
 struct GraphHostDefinition {
-    uint64_t full_key;
+    GraphCacheKey key;
     size_t object_offset;
     const std::byte *spill;
     size_t bytes;
@@ -70,7 +96,9 @@ struct GraphHostDefinitionList {
 
 struct GraphPendingUpload {
     ChipTaskSlotState *outer_slot{nullptr};
-    uint64_t full_key{0};
+    // Borrowed: a Definitions-map node's key, or an in-flight/retired entry's — all
+    // outlive the pending list through the bind-time upload that reads them.
+    const GraphCacheKey *key{nullptr};
     bool deferred_heap{false};
 };
 
@@ -85,7 +113,7 @@ enum class GraphRecordingStatus : uint8_t { RECORDING = 0, READY = 1, FAILED = 2
 // storage belongs to the recorder thread that will fill it (recorder_recording()), so
 // nothing here is sized by the graph.
 struct GraphInflightRecording {
-    uint64_t full_key{0};
+    GraphCacheKey key;
     GraphBoundary boundary;
     // Atomic because graph_prepare reads it on the recording thread without
     // taking recording_mutex, by design: acquiring the mutex there lets a
@@ -121,10 +149,13 @@ struct GraphHostState {
     explicit GraphHostState(const GraphDefinitionArena &arena) :
         arena(arena) {}
 
-    std::unordered_map<uint64_t, GraphDefinitionRecord> definitions;
+    std::unordered_map<GraphCacheKey, GraphDefinitionRecord, GraphCacheKeyHash> definitions;
     // Recordings in flight, at most one per Graph key. Several record at once,
     // each on its own thread; graph_commit drains and finalizes all of them.
-    std::unordered_map<uint64_t, std::unique_ptr<GraphInflightRecording>> inflight;
+    std::unordered_map<GraphCacheKey, std::unique_ptr<GraphInflightRecording>, GraphCacheKeyHash> inflight;
+    // Entries whose recording ended, kept past graph_commit because pending uploads
+    // borrow their keys and the bind-time upload reads them after the drain.
+    std::vector<std::unique_ptr<GraphInflightRecording>> retired;
     std::vector<GraphPendingUpload> pending_uploads;
     std::mutex recording_mutex;
     std::condition_variable recording_cv;

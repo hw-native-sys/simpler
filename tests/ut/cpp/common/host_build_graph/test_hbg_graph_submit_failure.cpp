@@ -133,8 +133,8 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphInvocationsReserveHeapOnlyAtCommi
     const std::optional<GraphHostUpload> second_upload = graph_host_upload(*graph_state, 1);
     ASSERT_TRUE(first_upload.has_value());
     ASSERT_TRUE(second_upload.has_value());
-    EXPECT_NE(first_upload->full_key, 0u);
-    EXPECT_EQ(second_upload->full_key, first_upload->full_key) << "both shells replay one Graph";
+    EXPECT_NE(first_upload->key->digest, 0u);
+    EXPECT_EQ(*second_upload->key, *first_upload->key) << "both shells replay one Graph";
     // Distinct bases alone would still pass if finalization handed out a wrong
     // extent, so pin the length the Definition asks for and the disjointness two
     // shells of one Graph must have.
@@ -144,7 +144,7 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphInvocationsReserveHeapOnlyAtCommi
     const auto *second_end = static_cast<const char *>(second_upload->outer_slot->to_descriptor().packed_buffer_end);
     const GraphHostDefinitionList definitions = graph_host_definitions(*graph_state);
     ASSERT_EQ(definitions.entries.size(), 1u);
-    ASSERT_EQ(definitions.entries[0].full_key, first_upload->full_key);
+    ASSERT_EQ(definitions.entries[0].key, *first_upload->key);
     const GraphDefinition *definition = definition_image(definitions.entries[0]);
     const uint64_t expected_extent =
         CHIP_ALIGN_UP(definition->required_heap + definition->execution_storage_bytes, CHIP_ALIGN_SIZE);
@@ -262,7 +262,7 @@ TEST_F(HbgGraphSubmitFailureTest, WorkerRecordsWhileMainThreadSubmitsSameHashShe
     for (size_t i = 0; i < 3; ++i) {
         const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, i);
         ASSERT_TRUE(upload.has_value());
-        EXPECT_EQ(upload->full_key, definition->full_key) << "shell " << i;
+        EXPECT_EQ(upload->key->digest, definition->full_key) << "shell " << i;
         const auto *base = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_base);
         const auto *end = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_end);
         EXPECT_EQ(static_cast<uint64_t>(end - base), expected_extent) << "shell " << i;
@@ -908,7 +908,7 @@ TEST_F(HbgGraphSubmitFailureTest, ConcurrentDefinitionsFinalizeInSubmissionOrder
     for (size_t i = 0; i < kGraphCount; ++i) {
         const std::optional<GraphHostUpload> upload = graph_host_upload(*graph_state, i);
         ASSERT_TRUE(upload.has_value()) << "Graph " << i;
-        EXPECT_NE(upload->full_key, 0u) << "Graph " << i;
+        EXPECT_NE(upload->key->digest, 0u) << "Graph " << i;
         const auto *base = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_base);
         const auto *end = static_cast<const char *>(upload->outer_slot->to_descriptor().packed_buffer_end);
         ASSERT_NE(base, nullptr) << "Graph " << i;
@@ -1091,7 +1091,7 @@ TEST_F(HbgGraphSubmitFailureTest, RecordsAGraphWhoseBoundaryLivesInTheHeapWindow
         }
         const GraphHostDefinition *published = nullptr;
         for (const GraphHostDefinition &entry : definitions.entries) {
-            if (entry.full_key == upload->full_key) {
+            if (entry.key == *upload->key) {
                 published = &entry;
                 break;
             }

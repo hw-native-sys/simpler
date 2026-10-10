@@ -30,6 +30,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <array>
 #include <cstring>
 #include <ctime>
 #include <functional>
@@ -196,11 +197,19 @@ static inline TaskOutputTensors rt_submit_dummy_task(const CoreTaskArgs &args) {
     return rt->ops->submit_dummy_task(rt, args);
 }
 
-static inline GraphScopeResult rt_graph_begin(uint64_t graph_key, const GraphTaskArgs &args) {
+// Open (or hit) the Definition for one Graph submission: `graph_id` is the exact
+// identity the submit overload derived, `graph_key` its digest, and `config` the
+// tagged blob of this call's construction parameters, valid only for this call. A
+// runtime built before graph_begin_with_config existed leaves that slot null: only
+// the digest reaches it, which is the pre-exact-keying behavior.
+static inline GraphScopeResult
+rt_graph_begin(uint64_t graph_id, uint64_t graph_key, GraphConfigView config, const GraphTaskArgs &args) {
     RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt) || rt->ops->graph_begin == nullptr) {
-        return GraphScopeResult{};
+    if (rt->ops->is_fatal(rt)) return GraphScopeResult{};
+    if (rt->ops->graph_begin_with_config != nullptr) {
+        return rt->ops->graph_begin_with_config(rt, graph_id, graph_key, config, args);
     }
+    if (rt->ops->graph_begin == nullptr) return GraphScopeResult{};
     return rt->ops->graph_begin(rt, graph_key, args);
 }
 
@@ -428,7 +437,9 @@ static inline uint64_t rt_graph_function_id(Function function) {
 // including the boundary `args` — is a use-after-free; the recorded body receives
 // its own boundary copy as a parameter for exactly that reason.
 template <typename Invoke>
-static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const GraphTaskArgs &args, Invoke invoke) {
+static inline GraphSubmitResult rt_submit_graph_impl(
+    uint64_t graph_id, uint64_t graph_key, GraphConfigView config, const GraphTaskArgs &args, Invoke invoke
+) {
     debug_assert(!args.has_error() && "Graph boundary GraphTaskArgs construction failed");
     debug_assert(args.tensor_count() <= GRAPH_MAX_TENSOR_ARGS && "Graph boundary exceeds the tensor limit");
     debug_assert(
@@ -461,7 +472,7 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
     }
     const uint64_t _admitted_ns = rt_orch_phase_now_ns();
     rt_record_orch_phase(HostPhaseKind::OrchSubmitAdmit, _entry_ns, _admitted_ns, graph_key);
-    GraphScopeResult result = rt_graph_begin(graph_key, args);
+    GraphScopeResult result = rt_graph_begin(graph_id, graph_key, config, args);
     const uint64_t _begun_ns = rt_orch_phase_now_ns();
     if (result.recording) {
         void *handle = result.recording_handle;
@@ -527,12 +538,22 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
     return result;
 }
 
+// The digest-only form: graph_id collapsed into the digest and no construction
+// parameters. Tests drive the impl through it directly.
+template <typename Invoke>
+static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const GraphTaskArgs &args, Invoke invoke) {
+    return rt_submit_graph_impl(graph_key, graph_key, GraphConfigView{nullptr, 0}, args, invoke);
+}
+
 static inline GraphSubmitResult rt_submit_graph(uint64_t graph_id, GraphFunction function, const GraphTaskArgs &args) {
     debug_assert(function != nullptr && "Graph function must not be null");
     if (function == nullptr) return GraphSubmitResult{};
-    return rt_submit_graph_impl(rt_graph_make_key(graph_id), args, [function](const GraphTaskArgs &record_args) {
-        function(record_args);
-    });
+    return rt_submit_graph_impl(
+        graph_id, rt_graph_make_key(graph_id), GraphConfigView{nullptr, 0}, args,
+        [function](const GraphTaskArgs &record_args) {
+            function(record_args);
+        }
+    );
 }
 
 static inline GraphSubmitResult rt_submit_graph(GraphFunction function, const GraphTaskArgs &args) {
@@ -549,8 +570,14 @@ static inline GraphSubmitResult rt_submit_graph(
     debug_assert(function != nullptr && "Graph function must not be null");
     if (function == nullptr) return GraphSubmitResult{};
     auto configs = std::make_tuple(config...);
+    // Two views of the same tagged bytes: the digest indexes the lookup, the blob is
+    // what two submissions' parameters are compared by. `blob` outlives the call
+    // below — the only thing that reads the view.
+    std::array<std::byte, graph_config_blob_bytes<Config...>()> blob{};
+    const uint32_t blob_bytes = graph_config_blob_encode(blob.data(), config...);
     return rt_submit_graph_impl(
-        rt_graph_make_key(graph_id, config...), args, [function, configs](const GraphTaskArgs &record_args) {
+        graph_id, rt_graph_make_key(graph_id, config...), GraphConfigView{blob.data(), blob_bytes}, args,
+        [function, configs](const GraphTaskArgs &record_args) {
             std::apply(
                 [&](auto... values) {
                     function(record_args, values...);

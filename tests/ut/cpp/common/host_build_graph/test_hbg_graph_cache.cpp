@@ -374,6 +374,43 @@ TEST(GraphCache, ConfigValuesSelectDifferentDefinitions) {
     EXPECT_EQ(rt_graph_make_key(GRAPH_ID, 0), rt_graph_make_key(GRAPH_ID, 0));
 }
 
+// Every config value enters the hash as one whole 64-bit word XORed into the
+// state (graph_hash_bytes), so the second of two same-type values can absorb any
+// state difference the first one leaves behind: with s(v) the state just before
+// the second value's word, v2' = v2 ^ s(v1) ^ s(v1') makes the two tuples hash
+// equal. Distinct config tuples therefore do not get distinct digests — which is
+// why the cache key is the exact identity and the digest only indexes it; this
+// pair is the collision the exact keying has to keep apart, and
+// HbgGraphDefinitionArenaTest.CollidingConfigDigestsStayDistinctDefinitions pins
+// that it does.
+TEST(GraphCache, DistinctConfigTuplesShareADigest) {
+    constexpr uint64_t GRAPH_ID = 0x1234;
+    constexpr uint64_t V1 = 0;
+    constexpr uint64_t V1_PRIME = 1;
+    constexpr uint64_t V2 = 0;
+
+    // State just before the second value's word for the tuple (v1, _): prefix,
+    // the first value's category/width tags and word, then the second value's tags.
+    const auto state_before_second_value = [](uint64_t graph_id, uint64_t v1) {
+        uint64_t hash = graph_hash_bytes(1469598103934665603ULL, &graph_id, sizeof(graph_id));
+        const uint32_t count = 2;
+        hash = graph_hash_bytes(hash, &count, sizeof(count));
+        hash = graph_hash_byte(hash, 3);  // category: unsigned integral
+        hash = graph_hash_byte(hash, 8);  // width: sizeof(uint64_t)
+        hash = graph_hash_bytes(hash, &v1, sizeof(v1));
+        hash = graph_hash_byte(hash, 3);
+        hash = graph_hash_byte(hash, 8);
+        return hash;
+    };
+
+    const uint64_t v2_prime =
+        V2 ^ state_before_second_value(GRAPH_ID, V1) ^ state_before_second_value(GRAPH_ID, V1_PRIME);
+
+    EXPECT_NE(V1, V1_PRIME);
+    EXPECT_NE(V2, v2_prime);
+    EXPECT_EQ(rt_graph_make_key(GRAPH_ID, V1, V2), rt_graph_make_key(GRAPH_ID, V1_PRIME, v2_prime));
+}
+
 // Arg's storage stays unreachable only while the base is private. Under a public base an
 // implicit derived-to-base conversion reaches the same subobject, whose members are
 // public there however Arg hides their names -- so tags_, tensors_ and scalars_ would be

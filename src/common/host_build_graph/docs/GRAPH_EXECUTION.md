@@ -28,6 +28,8 @@ by asynchronous recording is terminal for that orchestration; it cannot be
 replayed as ordinary tasks without rolling back already assigned task IDs and
 TensorMap producers.
 
+![Graph Execution overview: one recording, N replays, the frozen Definition, and where the three edge sources come from](graph-execution-overview.svg)
+
 ## API
 
 A Graph boundary uses `GraphTaskArgs`; a sub-task's arguments use
@@ -66,9 +68,12 @@ void submit_layer(const GraphTaskArgs &args) {
 
 The function pointer is the default Graph identity. Trailing integral,
 `float`, `double`, and `bool` construction parameters are forwarded to the
-Graph function and hashed by value into the cache key. They are separate from
-execution scalars in `GraphTaskArgs`: changing a construction parameter selects a
-different Definition rather than patching an existing one.
+Graph function and are part of the cache identity: their tagged bytes are
+compared exactly to decide whether an invocation matches a cached Definition,
+and a digest of the same values names that Definition on the wire and in DFX
+records. They are separate from execution scalars in `GraphTaskArgs`: changing a
+construction parameter selects a different Definition rather than patching an
+existing one.
 
 An explicit identity is available for call sites that want to choose what counts
 as the same Graph, rather than letting the Graph function's address decide:
@@ -372,9 +377,13 @@ and is not part of the Graph key.
 Recording uses host-only C++ state:
 
 - `std::vector` for sub-tasks, tensors, scalars, fanins, and pending uploads;
-- `std::unordered_map` for the per-run Definition cache;
-- `std::unordered_map` for the recordings in flight, keyed by Graph identity and
-  holding each entry by `std::unique_ptr`, guarded by a mutex and completion
+- `std::unordered_map` for the per-run Definition cache, keyed by the exact Graph
+  identity — the callable entry, the graph id, and the tagged construction-parameter
+  bytes. A digest of that identity indexes the bucket and names the Definition on the
+  wire and in DFX records; equality never rests on it, so two identities whose digests
+  collide stay two entries;
+- `std::unordered_map` for the recordings in flight, keyed by the same exact identity
+  and holding each entry by `std::unique_ptr`, guarded by a mutex and completion
   condition while the recording threads publish their Definitions.
 
 The cache stores at most 16 Definitions and allocates each entry to its actual
@@ -575,6 +584,60 @@ before an offset participates in pointer arithmetic.
 
 There is no cache schema version. The cache is per run and starts empty, so a
 persistent-format version would currently have no effect.
+
+### How a submission knows it is inside a recording
+
+A Graph body is ordinary orchestration code: it calls `rt_submit_task`,
+`rt_submit_dummy_task`, `alloc_tensors` and the scope macros exactly as the
+top-level orchestration does. Nothing in those signatures distinguishes the two
+callers, and one body must serve both identities — it is recorded on a miss and
+run inline when the boundary does not match or the Definition cache is full.
+A recording thread and the submitting thread are also live at the same time,
+inside the same `OrchestratorState`, which proceeds against the recorders rather
+than joining them. The routing therefore cannot be a call parameter, and cannot
+be shared state: a flag has two states where the system has one recording
+context per recorder plus the submitter, so two concurrent recordings would
+clear each other's bit and the submitter's own ordinary submissions would be
+taken for recorded ones.
+
+It is three `thread_local` pointers, bound by `graph_prepare` and cleared by
+`graph_end` and `graph_abort`:
+
+```cpp
+thread_local GraphInflightRecording *g_active_graph_entry;
+thread_local GraphRecording          *g_active_graph_recording;
+thread_local GraphHostState          *g_active_graph_owner;
+```
+
+Together they name one fact — *this thread is recording this body for this
+orchestrator* — and call sites project it differently. The projection is
+load-bearing in both directions:
+
+- `active_graph_recording(orch)` requires the owner to match. The submission
+  entries ask it to decide **what this call means**: a recorded sub-task, or an
+  ordinary task that takes a window slot. Dropping the owner test would let one
+  orchestrator's body record into another's in-flight Definition.
+- `graph_prepare` reads `g_active_graph_recording` raw, because its question is
+  whether this thread's recording storage is free at all: binding resets that
+  storage in place. The owner-qualified form would answer "not mine" for a
+  storage that is nonetheless occupied, and the bind would destroy the in-flight
+  recording instead of refusing.
+
+The scope macros consult the same fact, for a different reason: a scope inside a
+recorded body must not touch the real scope stack, but its manual/auto mode still
+decides whether the recorder infers edges, so the depth is tracked on the
+recording.
+
+Because the storage is one per thread and `graph_prepare` refuses to bind while
+it is occupied, a thread records one body at a time. A `rt_submit_graph` reached
+from inside a body therefore cannot open a second recording: `graph_begin` marks
+the enclosing recording unsupported and returns without a recording handle,
+which leaves `execute_block` set and runs the nested body inline as ordinary
+tasks. The enclosing Graph is then terminal rather than degraded — by the time
+an unsupported recording is found, the outer shell has already entered the task
+and dependency sequence, so there is no ordinary-path fallback left to take, and
+commit reports it as `SIMPLER_ERROR_INVALID_ARGS` (the intro's rule, applied to
+the one construct the body itself can reach).
 
 ## Cache hit and memory
 

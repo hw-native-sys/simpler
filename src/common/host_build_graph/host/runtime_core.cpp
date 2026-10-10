@@ -52,6 +52,13 @@ static GraphScopeResult graph_begin_impl(RuntimeContext *rt, uint64_t graph_key,
     return rt->orchestrator->graph_begin(graph_key, args, rt->active_callable_hash);
 }
 
+static GraphScopeResult graph_begin_with_config_impl(
+    RuntimeContext *rt, uint64_t graph_id, uint64_t graph_key, GraphConfigView config, const GraphTaskArgs &args
+) {
+    if (rt == nullptr) return GraphScopeResult{};
+    return rt->orchestrator->graph_begin(graph_id, graph_key, config, args, rt->active_callable_hash);
+}
+
 static bool graph_prepare_impl(RuntimeContext *rt, void *recording_handle, const GraphTaskArgs &args) {
     return rt != nullptr && rt->orchestrator->graph_prepare(recording_handle, args);
 }
@@ -214,6 +221,7 @@ static const RuntimeOps s_runtime_ops = {
 #endif
     .graph_record_start = graph_record_start_impl,
     .graph_record_wait = graph_record_wait_impl,
+    .graph_begin_with_config = graph_begin_with_config_impl,
 };
 
 // =============================================================================

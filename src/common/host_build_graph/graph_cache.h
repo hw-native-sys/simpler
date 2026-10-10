@@ -53,6 +53,13 @@ constexpr uint64_t graph_hash_byte(uint64_t h, uint8_t b) { return (h ^ static_c
 // with it is a Graph's `full_key` — a callable hash, a graph id, a config-value
 // count and the config values themselves, a few bytes per call.
 //
+// The digest is bookkeeping, not identity: the cache compares the exact identity
+// (callable, graph id, and the tagged config bytes of the graph_config_blob form
+// below) and uses this value only to index the lookup, to name the Definition on
+// the wire, and as a DFX payload. Equal identities must still hash equal — the
+// cache key's hash and its equality would otherwise disagree — which is why the
+// tag helpers below are shared by both the digest stream and the blob encoding.
+//
 // Streaming: callers chain several calls (see rt_graph_make_key below) and the word
 // split makes the result depend on where they split, so two different chainings of
 // the same bytes disagree. That is harmless here because a key is only ever produced
@@ -105,21 +112,69 @@ inline bool rt_graph_args_cacheable(const GraphTaskArgs &args) {
     return true;
 }
 
-inline uint64_t rt_graph_make_key(uint64_t graph_id) { return graph_id; }
-
+// The tag pair a construction parameter carries into both the digest stream and the
+// exact-config blob. It keeps structurally different values apart — signed vs
+// unsigned, `int32 5` vs `int64 5`, bool vs int — and is shared by the two encodings
+// so that byte-equal blobs are guaranteed to hash equal.
 template <typename T>
-inline uint64_t graph_hash_config_value(uint64_t hash, T value) {
+constexpr uint8_t graph_config_category() {
     using Value = std::remove_cv_t<std::remove_reference_t<T>>;
     static_assert(
         std::is_integral_v<Value> || std::is_same_v<Value, float> || std::is_same_v<Value, double>,
         "Graph construction parameters must be integral, float, or double values"
     );
-    constexpr uint8_t category = std::is_same_v<Value, bool> ? 1 :
-                                 std::is_integral_v<Value>   ? (std::is_signed_v<Value> ? 2 : 3) :
-                                                               4;
-    constexpr uint8_t width = sizeof(Value);
-    hash = graph_hash_byte(hash, category);
-    hash = graph_hash_byte(hash, width);
+    return std::is_same_v<Value, bool> ? 1 : std::is_integral_v<Value> ? (std::is_signed_v<Value> ? 2 : 3) : 4;
+}
+
+template <typename T>
+constexpr uint8_t graph_config_width() {
+    using Value = std::remove_cv_t<std::remove_reference_t<T>>;
+    return sizeof(Value);
+}
+
+// A borrowed view of one submission's construction parameters in the exact byte form
+// two submissions are compared by: nothing may store the pointer — it names a stack
+// blob valid only for the duration of the begin call that reads it.
+struct GraphConfigView {
+    const std::byte *bytes;
+    uint32_t len;
+};
+static_assert(std::is_trivially_copyable_v<GraphConfigView> && std::is_standard_layout_v<GraphConfigView>);
+
+template <typename T>
+inline std::byte *graph_config_blob_append(std::byte *out, T value) {
+    using Value = std::remove_cv_t<std::remove_reference_t<T>>;
+    *out++ = static_cast<std::byte>(graph_config_category<Value>());
+    *out++ = static_cast<std::byte>(graph_config_width<Value>());
+    __builtin_memcpy(out, &value, sizeof(Value));
+    return out + sizeof(Value);
+}
+
+// Size of the blob for one parameter pack: count, then each value as
+// (category, width, raw bytes) — the same sequence and tagging rt_graph_make_key
+// streams into the digest.
+template <typename... Config>
+constexpr size_t graph_config_blob_bytes() {
+    return sizeof(uint32_t) + (size_t{0} + ... + (size_t{2} + sizeof(Config)));
+}
+
+// Returns the number of bytes written, which equals graph_config_blob_bytes<Config...>().
+template <typename... Config>
+inline uint32_t graph_config_blob_encode(std::byte *out, Config... config) {
+    const uint32_t count = sizeof...(Config);
+    __builtin_memcpy(out, &count, sizeof(count));
+    std::byte *cursor = out + sizeof(count);
+    ((cursor = graph_config_blob_append(cursor, config)), ...);
+    return static_cast<uint32_t>(cursor - out);
+}
+
+inline uint64_t rt_graph_make_key(uint64_t graph_id) { return graph_id; }
+
+template <typename T>
+inline uint64_t graph_hash_config_value(uint64_t hash, T value) {
+    using Value = std::remove_cv_t<std::remove_reference_t<T>>;
+    hash = graph_hash_byte(hash, graph_config_category<Value>());
+    hash = graph_hash_byte(hash, graph_config_width<Value>());
     return graph_hash_bytes(hash, &value, sizeof(value));
 }
 
