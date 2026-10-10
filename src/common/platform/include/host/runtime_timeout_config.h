@@ -24,6 +24,11 @@ constexpr const char *SIMPLER_OP_EXECUTE_TIMEOUT_US_ENV = "SIMPLER_OP_EXECUTE_TI
 constexpr const char *SIMPLER_STREAM_SYNC_TIMEOUT_MS_ENV = "SIMPLER_STREAM_SYNC_TIMEOUT_MS";
 constexpr const char *SIMPLER_SCHEDULER_TIMEOUT_MS_ENV = "SIMPLER_SCHEDULER_TIMEOUT_MS";
 
+// MIX pending pre-load ceiling (us). 0 disables the gate: every pending target
+// is eligible, which is the pre-gate behaviour; unset keeps the default below.
+constexpr const char *SIMPLER_MIX_PRELOAD_MAX_REMAINING_US_ENV = "SIMPLER_MIX_PRELOAD_MAX_REMAINING_US";
+constexpr int32_t RUNTIME_MIX_PRELOAD_MAX_REMAINING_US_DEFAULT = 50;
+
 // Covers the host stream-sync window before the AICPU scheduler no-progress
 // timer is armed: cold kernel registration, orchestration SO dlopen, runtime
 // init, and AICore handshake. The host cannot know the later orchestration
@@ -35,6 +40,7 @@ struct RuntimeTimeoutConfig {
     uint64_t op_execute_timeout_us;
     int32_t stream_sync_timeout_ms;
     int32_t scheduler_timeout_ms;
+    int32_t mix_preload_max_remaining_us{RUNTIME_MIX_PRELOAD_MAX_REMAINING_US_DEFAULT};
 };
 
 struct HostRuntimeTimeoutConfig {
@@ -44,9 +50,14 @@ struct HostRuntimeTimeoutConfig {
     // override" — the device falls back to its compile-time default
     // (SCHEDULER_TIMEOUT_CYCLES). Latched once per device into InitArgs.
     int32_t scheduler_timeout_ms{0};
+    // MIX pending pre-load estimated-remaining ceiling (us); 0 disables the
+    // gate. Latched once per device into InitArgs.
+    int32_t mix_preload_max_remaining_us{RUNTIME_MIX_PRELOAD_MAX_REMAINING_US_DEFAULT};
 };
 
 struct RuntimeTimeoutParseStatus {
+    bool mix_preload_env_set{false};
+    bool mix_preload_valid{false};
     bool op_execute_env_set{false};
     bool op_execute_valid{true};
     bool stream_sync_env_set{false};
@@ -170,6 +181,15 @@ resolve_runtime_timeout_config(const RuntimeTimeoutConfig &defaults, RuntimeTime
             &cfg.scheduler_timeout_ms
         );
         if (status != nullptr) status->scheduler_valid = ok;
+    }
+    const char *preload_env = std::getenv(SIMPLER_MIX_PRELOAD_MAX_REMAINING_US_ENV);
+    if (preload_env != nullptr) {
+        if (status != nullptr) status->mix_preload_env_set = true;
+        bool ok = apply_runtime_timeout_override(
+            SIMPLER_MIX_PRELOAD_MAX_REMAINING_US_ENV, preload_env, 0,
+            static_cast<uint64_t>(std::numeric_limits<int32_t>::max()), &cfg.mix_preload_max_remaining_us
+        );
+        if (status != nullptr) status->mix_preload_valid = ok;
     }
     return cfg;
 }

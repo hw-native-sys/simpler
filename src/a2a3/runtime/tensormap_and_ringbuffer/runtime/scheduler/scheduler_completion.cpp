@@ -428,6 +428,21 @@ void SchedulerContext::check_running_cores_for_completion(
             cur_thread_completed++;
         }
         if (t.running_done) {
+            // Duration sample for the MIX pre-load gate, taken before
+            // complete_slot_task (which may clear running_slot_state) and only for
+            // running slots: a pending-side completion was never observed to
+            // start, so its elapsed time is the predecessor's, not its own. The
+            // sample spans dispatch -> FIN observation, folding the poll latency
+            // in for every kernel alike; see SchedulerState::record_est_cycles.
+            if (uint64_t started = running_start_cycle_[core_id]; started != 0) {
+                uint64_t now = get_sys_cnt_aicpu();
+                if (now > started) {
+                    sched_->record_est_cycles(
+                        core.running_slot_state->task->kernel_id[static_cast<int32_t>(core.running_subslot)],
+                        now - started
+                    );
+                }
+            }
             if (core.running_slot_state->task_attrs.is_timed()) {
                 aicpu_task_timing_finish(core.running_slot_state->task_attrs.timing_slot(), thread_idx);
             }
@@ -452,6 +467,9 @@ void SchedulerContext::check_running_cores_for_completion(
                 ChipTaskSlotState *promoted = core.pending_slot_state;
                 bool sync_start_promote = pending_gated && promoted->task_attrs.requires_sync_start();
                 promote_pending_to_running(core);  // Case 2 or Case 3 (with pending)
+                // Remaining-time bookkeeping: the promoted block starts now (this
+                // core just freed), not when its pending slot was written.
+                running_start_cycle_[core_id] = get_sys_cnt_aicpu();
                 if (sync_start_promote) {
                     promoted->payload->running_slot_count.fetch_add(1, std::memory_order_seq_cst);
                     if (sched_->try_launch_sync_start_cohort(*promoted)) {
