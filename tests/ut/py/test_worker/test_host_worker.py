@@ -1481,6 +1481,36 @@ def test_two_frame_swimlane_log_flush_before_completion(monkeypatch, chip_swimla
         harness.close()
 
 
+def test_two_frame_success_survives_successor_poison_during_recursive_progress(monkeypatch):
+    harness = _TwoFrameLoopHarness()
+    lane = harness.cw._impl
+    progress = lane._progress
+
+    def recursive_progress(target):
+        # Native progress of a successor may also retire its FIFO predecessor.
+        if not target.terminal and target.submission.slot_id == 1 and len(lane._runs) == 2:
+            lane.completed[0].set()
+            assert progress(lane._runs[0])
+            lane.completed[1].set()
+        return progress(target)
+
+    monkeypatch.setattr(lane, "_progress", recursive_progress)
+    lane.finalize_errors[(1, 11)] = RuntimeError("successor finalize failed")
+    try:
+        harness.publish(0, 1)
+        harness.publish(1, 2)
+        harness.start()
+        harness.thread.join(5.0)
+        assert not harness.thread.is_alive()
+        assert _mailbox_load_i32(harness.state_addr(0)) == worker_mod._TASK_DONE
+        assert _mailbox_load_i32(harness.state_addr(1)) == worker_mod._TASK_FAILED
+        offset = harness._frame_offset(1) + MAILBOX_OFF_ERROR_MSG
+        message = bytes(harness.buf[offset : offset + worker_mod.MAILBOX_ERROR_MSG_SIZE])
+        assert b"successor finalize failed" in message
+    finally:
+        harness.close()
+
+
 def test_two_frame_publishes_launch_before_polling_immediate_completion():
     harness = _TwoFrameLoopHarness()
     try:

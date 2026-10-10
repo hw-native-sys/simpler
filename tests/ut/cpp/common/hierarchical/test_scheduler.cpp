@@ -1681,6 +1681,102 @@ TEST(WorkerManagerTest, ThirdDispatchCannotMutateTwoOccupiedFrames) {
     allocator.shutdown();
 }
 
+class MailboxChildExitTest : public ::testing::TestWithParam<std::pair<int, bool>> {};
+
+TEST_P(MailboxChildExitTest, PreservesOnlyMatchingTerminalResults) {
+    const auto [exit_code, stale_identity] = GetParam();
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    std::array<TaskSlot, 3> slots{};
+    for (size_t index = 0; index < slots.size(); ++index) {
+        slots[index] = make_progress_slot(allocator, 41 + index, index, 3);
+        ASSERT_NE(slots[index], INVALID_SLOT);
+    }
+
+    void *mailbox = mmap(nullptr, MAILBOX_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    ASSERT_NE(mailbox, MAP_FAILED);
+    std::memset(mailbox, 0, MAILBOX_SIZE);
+    int start_pipe[2];
+    ASSERT_EQ(pipe(start_pipe), 0);
+    const pid_t child = fork();
+    ASSERT_GE(child, 0);
+    if (child == 0) {
+        close(start_pipe[1]);
+        char start = 0;
+        ssize_t received;
+        do {
+            received = read(start_pipe[0], &start, sizeof(start));
+        } while (received < 0 && errno == EINTR);
+        if (received != sizeof(start)) _exit(99);
+        char *success = static_cast<char *>(mailbox) + MAILBOX_FIRST_TASK_FRAME * MAILBOX_FRAME_SIZE;
+        char *failure = success + MAILBOX_FRAME_SIZE;
+        if (stale_identity) {
+            const uint64_t stale_generation = 99;
+            std::memcpy(success + MAILBOX_OFF_FRAME_GENERATION, &stale_generation, sizeof(stale_generation));
+        }
+        set_test_frame_accepted(success);
+        set_test_frame_state(success, MailboxState::TASK_DONE);
+        const int32_t error_code = 17;
+        std::memcpy(failure + MAILBOX_OFF_ERROR, &error_code, sizeof(error_code));
+        const char message[] = "successor's own failure";
+        std::memcpy(failure + MAILBOX_OFF_ERROR_MSG, message, sizeof(message));
+        set_test_frame_accepted(failure);
+        set_test_frame_state(failure, MailboxState::TASK_FAILED);
+        _exit(exit_code);
+    }
+
+    ScopedChildProcess child_guard(child);
+    close(start_pipe[0]);
+    {
+        LocalMailboxEndpoint endpoint(0, mailbox, child, /*task_frame_count=*/3);
+        for (size_t index = 0; index < slots.size(); ++index) {
+            endpoint.submit_progress(&allocator, WorkerDispatch{slots[index], 0, 51 + index, false});
+        }
+        const char start = 1;
+        ASSERT_EQ(write(start_pipe[1], &start, sizeof(start)), sizeof(start));
+        close(start_pipe[1]);
+
+        // WNOWAIT leaves the exit status for the endpoint's own waitpid.
+        siginfo_t status{};
+        int waited;
+        do {
+            waited = waitid(P_PID, child, &status, WEXITED | WNOWAIT);
+        } while (waited < 0 && errno == EINTR);
+        ASSERT_EQ(waited, 0);
+        ASSERT_EQ(status.si_status, exit_code);
+        // No progress poll occurs before the 10 ms child-liveness deadline.
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+        for (size_t index = 0; index < slots.size(); ++index) {
+            WorkerEndpointProgress progress;
+            ASSERT_TRUE(endpoint.poll_progress(progress));
+            ASSERT_EQ(progress.kind, WorkerProgressKind::COMPLETED);
+            EXPECT_EQ(progress.completion.task_slot, slots[index]);
+            const auto expected = index == 0 && !stale_identity ? EndpointOutcome::SUCCESS :
+                                  index == 1                    ? EndpointOutcome::TASK_FAILURE :
+                                                                  EndpointOutcome::ENDPOINT_FAILURE;
+            EXPECT_EQ(progress.completion.outcome, expected);
+            if (index == 1) {
+                EXPECT_NE(progress.completion.error_message.find("code=17"), std::string::npos);
+                EXPECT_NE(progress.completion.error_message.find("successor's own failure"), std::string::npos);
+            }
+        }
+        WorkerEndpointProgress extra;
+        EXPECT_FALSE(endpoint.poll_progress(extra));
+        EXPECT_FALSE(endpoint.activate_progress(41));
+        EXPECT_THROW(endpoint.submit_progress(&allocator, WorkerDispatch{slots[0], 0, 54, false}), std::runtime_error);
+    }
+    EXPECT_EQ(munmap(mailbox, MAILBOX_SIZE), 0);
+    allocator.shutdown();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    ExitStatusAndIdentity, MailboxChildExitTest,
+    ::testing::Values(
+        std::make_pair(0, false), std::make_pair(7, false), std::make_pair(0, true), std::make_pair(7, true)
+    )
+);
+
 TEST(WorkerManagerTest, StaleFrameIdentityWithholdsCompletionUntilChildQuiesces) {
     alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
     Ring allocator;

@@ -545,6 +545,8 @@ private:
     std::mutex progress_mu_;
     uint32_t task_frame_count_{1};
     bool endpoint_poisoned_{false};
+    // Only child-exit poison permits consumption of independently published task results.
+    bool preserve_terminal_results_on_exit_{false};
     std::string endpoint_poison_reason_;
     size_t poll_cursor_{0};
     std::chrono::steady_clock::time_point next_liveness_check_{};
@@ -591,6 +593,7 @@ private:
     void poison_progress(const std::string &reason);
     bool poisoned_progress_quiesced();
     WorkerCompletion poisoned_completion(const FrameRecord &record) const;
+    WorkerCompletion terminal_completion(const FrameRecord &record, const char *frame, MailboxState state) const;
 
     // Returns a description of the child's death, or an empty string while it
     // is still running. Never throws: callers decide whether a dead child is

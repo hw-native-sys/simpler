@@ -959,6 +959,19 @@ WorkerCompletion LocalMailboxEndpoint::poisoned_completion(const FrameRecord &re
     };
 }
 
+WorkerCompletion
+LocalMailboxEndpoint::terminal_completion(const FrameRecord &record, const char *frame, MailboxState state) const {
+    int32_t error_code = 0;
+    std::memcpy(&error_code, frame + MAILBOX_OFF_ERROR, sizeof(error_code));
+    WorkerCompletion completion{record.dispatch.task_slot, record.dispatch.group_index, EndpointOutcome::SUCCESS, {}};
+    if (state == MailboxState::TASK_FAILED || error_code != 0) {
+        completion.outcome = EndpointOutcome::TASK_FAILURE;
+        completion.error_message = "LocalMailboxEndpoint child failed (worker_id=" + std::to_string(caps_.worker_id) +
+                                   ", code=" + std::to_string(error_code) + "): " + read_error_msg(frame);
+    }
+    return completion;
+}
+
 bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
     std::lock_guard<std::mutex> lk(progress_mu_);
     progress.preparation_disposition = MailboxPreparationDisposition::NONE;
@@ -974,7 +987,10 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
     if (!endpoint_poisoned_ && now >= next_liveness_check_) {
         next_liveness_check_ = now + kChildLivenessPollPeriod;
         std::string death = check_child_death();
-        if (!death.empty()) poison_progress(death);
+        if (!death.empty()) {
+            poison_progress(death);
+            preserve_terminal_results_on_exit_ = true;
+        }
     }
 
     if (endpoint_poisoned_) {
@@ -986,6 +1002,17 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
             progress.kind = WorkerProgressKind::COMPLETED;
             progress.dispatch = record.dispatch;
             progress.completion = poisoned_completion(record);
+            if (preserve_terminal_results_on_exit_) {
+                // The child can publish between an earlier frame read and waitpid observing exit.
+                // This acquire read follows confirmed exit; identity still belongs to this dispatch.
+                char *frame = task_frame(index);
+                const MailboxState state = read_mailbox_state(frame);
+                if ((state == MailboxState::TASK_DONE || state == MailboxState::TASK_FAILED) &&
+                    frame_identity_matches(record, frame)) {
+                    progress.completion = terminal_completion(record, frame, state);
+                    write_mailbox_state(MailboxState::IDLE, frame);
+                }
+            }
             record = FrameRecord{};
             poll_cursor_ = (index + 1) % task_frame_count_;
             return true;
@@ -1060,20 +1087,9 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
                 poison_progress("stale frame identity at terminal completion");
                 break;
             }
-            int32_t error_code = 0;
-            std::memcpy(&error_code, frame + MAILBOX_OFF_ERROR, sizeof(error_code));
             progress.kind = WorkerProgressKind::COMPLETED;
             progress.dispatch = record.dispatch;
-            progress.completion.task_slot = record.dispatch.task_slot;
-            progress.completion.group_index = record.dispatch.group_index;
-            if (state == MailboxState::TASK_FAILED || error_code != 0) {
-                progress.completion.outcome = EndpointOutcome::TASK_FAILURE;
-                progress.completion.error_message =
-                    "LocalMailboxEndpoint child failed (worker_id=" + std::to_string(caps_.worker_id) +
-                    ", code=" + std::to_string(error_code) + "): " + read_error_msg(frame);
-            } else {
-                progress.completion.outcome = EndpointOutcome::SUCCESS;
-            }
+            progress.completion = terminal_completion(record, frame, state);
             write_mailbox_state(MailboxState::IDLE, frame);
             record = FrameRecord{};
             poll_cursor_ = (index + 1) % task_frame_count_;

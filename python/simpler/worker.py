@@ -3645,6 +3645,29 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             if _publish_native_promotion(frame.frame_addr, frame.frame_buf, frame.identity, disposition):
                 frame.published_disposition = disposition
 
+        def publish_completed_frame(staged: _StagedFrame) -> tuple[int, str]:
+            code = 0
+            msg = ""
+            try:
+                staged.chip_run._raise_if_failed()
+            except Exception as e:  # noqa: BLE001
+                code = 1
+                msg = _format_exc(f"chip_process dev={device_id}: chip run", e)
+            if code == 0 and on_task_done_success is not None:
+                try:
+                    code, msg = on_task_done_success()
+                except Exception as e:  # noqa: BLE001
+                    code = 1
+                    msg = _format_exc(f"chip_process dev={device_id}: task completion hook", e)
+            code, msg = finish_task_logging(staged.config, code, msg)
+            _write_error(staged.frame_buf, code, msg)
+            _mailbox_store_i32(
+                staged.frame_addr + _OFF_STATE,
+                _TASK_DONE if code == 0 else _TASK_FAILED,
+            )
+            staged_frames.pop(staged.index, None)
+            return code, msg
+
         parent_pid = os.getppid()
         liveness_countdown = _PARENT_LIVENESS_POLL_INTERVAL
         shutdown_message = f"chip_process dev={device_id}: task loop shut down"
@@ -3731,26 +3754,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                             if not run_complete:
                                 continue
 
-                            code = 0
-                            msg = ""
-                            try:
-                                staged.chip_run._raise_if_failed()
-                            except Exception as e:  # noqa: BLE001
-                                code = 1
-                                msg = _format_exc(f"chip_process dev={device_id}: chip run", e)
-                            if code == 0 and on_task_done_success is not None:
-                                try:
-                                    code, msg = on_task_done_success()
-                                except Exception as e:  # noqa: BLE001
-                                    code = 1
-                                    msg = _format_exc(f"chip_process dev={device_id}: task completion hook", e)
-                            code, msg = finish_task_logging(staged.config, code, msg)
-                            _write_error(staged.frame_buf, code, msg)
-                            _mailbox_store_i32(
-                                staged.frame_addr + _OFF_STATE,
-                                _TASK_DONE if code == 0 else _TASK_FAILED,
-                            )
-                            staged_frames.pop(staged.index, None)
+                            code, msg = publish_completed_frame(staged)
                             if code != 0 and staged.chip_run.lane_poisoned:
                                 shutdown_message = msg
                                 stop_progress = True
@@ -3773,7 +3777,17 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 cw._impl._close_chip_run_lane()
             except Exception as e:  # noqa: BLE001
                 shutdown_message += "; " + _format_exc("chip run lane close", e)
-            for staged in staged_frames.values():
+            for staged in list(staged_frames.values()):
+                # Progressing one run can retire another before its mailbox is visited.
+                # Launched runs retain their own outcome after the lane is drained;
+                # unlaunched runs may only have been abandoned by close.
+                try:
+                    if staged.chip_run.launched and staged.chip_run.done():
+                        publish_completed_frame(staged)
+                        continue
+                except Exception as e:  # noqa: BLE001
+                    fail_frame(staged, _format_exc(f"chip_process dev={device_id}: chip run completion", e))
+                    continue
                 fail_frame(staged, shutdown_message)
             for index, frame_buf in enumerate(frame_bufs):
                 frame_state_addr = frame_addrs[index] + _OFF_STATE
