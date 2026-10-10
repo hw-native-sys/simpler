@@ -290,17 +290,21 @@ TEST(SwimlaneDeviceResetTest, RetainedBufferOwnershipSurvivesTheReset) {
 // ---------------------------------------------------------------------------
 
 /** A retaining collector brought up the way the runner brings one up. */
+/** A retaining collector brought up the way the runner brings one up. */
 struct AdmissionFixture {
     ChipSwimlaneCollector collector;
     fs::path root;
     std::string dir;
 
-    explicit AdmissionFixture(const char *name) :
+    explicit AdmissionFixture(const char *name, size_t epoch_limit = 0) :
         root(private_artifact_root(name)),
         dir(root.string()) {
         std::error_code ec;
         fs::remove_all(root, ec);
         collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+        // Before `initialize`, which is the only moment a capacity change is
+        // admissible — the same order the runner uses.
+        if (epoch_limit != 0) EXPECT_TRUE(collector.set_retained_epoch_limit(epoch_limit));
         EXPECT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, joined_alloc, nullptr, joined_free), 0);
         collector.start(joined_thread);
     }
@@ -807,6 +811,183 @@ TEST(SwimlanePairCapacityTest, APublishedRunGivesItsSlotBackToTheNextPair) {
     fx.collector.run_close(53, /*bank_index=*/0, /*device_execution_complete=*/false);
     EXPECT_FALSE(published_artifact(fx.collector, fx.root, 53).empty())
         << "each run of the sustained sequence publishes its own file";
+}
+
+// ---------------------------------------------------------------------------
+// A granted capacity, and every way of not getting one
+// ---------------------------------------------------------------------------
+
+TEST(SwimlaneGrantedCapacityTest, AnUngrantedCollectorKeepsTheSharedDefault) {
+    AdmissionFixture fx("granted-default");
+    EXPECT_EQ(fx.collector.active_epoch_limit(), simpler::dfx::runs::kMaxOpenEpochs)
+        << "a collector nobody granted anything to must hold what it always held";
+}
+
+TEST(SwimlaneGrantedCapacityTest, ALimitOutsideTheModulesRangeIsRefused) {
+    ChipSwimlaneCollector collector;
+    collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+
+    // Below the shared default would shrink what every other caller relies on;
+    // above the module ceiling has no storage behind it.
+    EXPECT_FALSE(collector.set_retained_epoch_limit(simpler::dfx::runs::kMaxOpenEpochs - 1));
+    EXPECT_FALSE(collector.set_retained_epoch_limit(ChipSwimlaneModule::kMaxOpenEpochs + 1));
+    EXPECT_FALSE(collector.set_retained_epoch_limit(0));
+    EXPECT_EQ(collector.active_epoch_limit(), simpler::dfx::runs::kMaxOpenEpochs)
+        << "a refused limit must leave the previous one in force";
+}
+
+TEST(SwimlaneGrantedCapacityTest, AGrantIsRefusedOnceTheCollectorIsInitialized) {
+    // The exported entry is reachable through the C API, so "the caller calls
+    // it early" is not a protection: the refusal has to be the collector's.
+    ChipSwimlaneCollector collector;
+    collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, joined_alloc, nullptr, joined_free), 0);
+
+    EXPECT_FALSE(collector.set_retained_epoch_limit(ChipSwimlaneModule::kMaxOpenEpochs))
+        << "the storage this would resize is already sized";
+    EXPECT_EQ(collector.active_epoch_limit(), simpler::dfx::runs::kMaxOpenEpochs);
+
+    collector.finalize(nullptr, joined_free);
+}
+
+TEST(SwimlaneGrantedCapacityTest, AGrantIsRefusedOnceTheReaderThreadsAreRunning) {
+    ChipSwimlaneCollector collector;
+    collector.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+    ASSERT_EQ(collector.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, joined_alloc, nullptr, joined_free), 0);
+    collector.start(joined_thread);
+
+    EXPECT_FALSE(collector.set_retained_epoch_limit(ChipSwimlaneModule::kMaxOpenEpochs))
+        << "a shard scanning the run table may not have it resized underneath";
+    EXPECT_EQ(collector.active_epoch_limit(), simpler::dfx::runs::kMaxOpenEpochs);
+
+    collector.stop();
+    collector.finalize(nullptr, joined_free);
+}
+
+TEST(SwimlaneGrantedCapacityTest, AGrantIsRefusedWhileARunIsHeld) {
+    AdmissionFixture fx("granted-while-held");
+    ASSERT_TRUE(fx.collector.run_begin(61, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+
+    EXPECT_FALSE(fx.collector.set_retained_epoch_limit(ChipSwimlaneModule::kMaxOpenEpochs))
+        << "a held run owns records, an identity and possibly a cut";
+    EXPECT_EQ(fx.collector.active_epoch_limit(), simpler::dfx::runs::kMaxOpenEpochs)
+        << "and the refusal changed nothing";
+
+    fx.collector.run_close(61, /*bank_index=*/0, /*device_execution_complete=*/false);
+}
+
+TEST(SwimlaneGrantedCapacityTest, AGrantedCollectorReservesForWhatItMayHold) {
+    // The reservation follows the granted count, not the module ceiling: a
+    // collector left at the default must not pay for storage it will never
+    // size. Compared between two collectors of the same shape, because the
+    // figure is only meaningful before the first admission.
+    ChipSwimlaneCollector two;
+    two.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+    ASSERT_EQ(two.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, joined_alloc, nullptr, joined_free), 0);
+    const size_t fixed_two = two.retained_fixed_overhead_for_test();
+    two.finalize(nullptr, joined_free);
+
+    ChipSwimlaneCollector three;
+    three.configure_retained_runs(true, simpler::dfx::runs::kDefaultBudgetBytes);
+    ASSERT_TRUE(three.set_retained_epoch_limit(ChipSwimlaneModule::kMaxOpenEpochs));
+    ASSERT_EQ(three.initialize(1, 1, 0, ChipSwimlaneLevel::TASK_TIMING, joined_alloc, nullptr, joined_free), 0);
+    const size_t fixed_three = three.retained_fixed_overhead_for_test();
+    three.finalize(nullptr, joined_free);
+
+    EXPECT_GT(fixed_three, fixed_two) << "the granted collector reserves for its extra run";
+}
+
+TEST(SwimlaneGrantedCapacityTest, ThreeRunsAreHeldAndEachPublishesItsOwnFile) {
+    AdmissionFixture fx("granted-three", ChipSwimlaneModule::kMaxOpenEpochs);
+    ASSERT_EQ(fx.collector.active_epoch_limit(), 3u);
+
+    ASSERT_TRUE(fx.collector.run_begin(71, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    ASSERT_TRUE(fx.collector.can_admit_retained_run());
+    ASSERT_TRUE(fx.collector.run_begin(72, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    ASSERT_TRUE(fx.collector.can_admit_retained_run()) << "a third bucket is what the grant bought";
+    ASSERT_TRUE(fx.collector.run_begin(73, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+
+    EXPECT_FALSE(fx.collector.can_admit_retained_run()) << "and the fourth is still declined";
+
+    // Each identity closes and seals on its own; three cuts are armed at once,
+    // one per closed run, and each must retire with its own artifact.
+    fx.collector.run_close(71, /*bank_index=*/0, /*device_execution_complete=*/false);
+    fx.collector.run_close(72, /*bank_index=*/1, /*device_execution_complete=*/false);
+    fx.collector.run_close(73, /*bank_index=*/2, /*device_execution_complete=*/false);
+
+    for (const uint64_t epoch : {71u, 72u, 73u}) {
+        const std::string artifact = published_artifact(fx.collector, fx.root, epoch);
+        EXPECT_FALSE(artifact.empty()) << "run " << epoch << " published no file of its own";
+        EXPECT_NE(artifact.find("\"run_epoch\": " + std::to_string(epoch)), std::string::npos)
+            << "run " << epoch << " published somebody else's identity: " << artifact;
+    }
+}
+
+TEST(SwimlaneGrantedCapacityTest, OnePublicationReclaimsOneCapacityAtAThreeDeepFront) {
+    AdmissionFixture fx("granted-reclaim", ChipSwimlaneModule::kMaxOpenEpochs);
+    ASSERT_TRUE(fx.collector.run_begin(81, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    ASSERT_TRUE(fx.collector.run_begin(82, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    ASSERT_TRUE(fx.collector.run_begin(83, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    ASSERT_FALSE(fx.collector.can_admit_retained_run());
+
+    // One terminal verdict returns one capacity. The other two stay held, so a
+    // sustained sequence refills one run at a time rather than waiting for the
+    // whole table to drain.
+    fx.collector.run_close(81, /*bank_index=*/0, /*device_execution_complete=*/false);
+    EXPECT_FALSE(published_artifact(fx.collector, fx.root, 81).empty());
+    ASSERT_TRUE(fx.collector.can_admit_retained_run());
+
+    ASSERT_TRUE(fx.collector.run_begin(84, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    EXPECT_FALSE(fx.collector.can_admit_retained_run()) << "the reclaimed capacity was exactly one";
+
+    fx.collector.run_close(82, /*bank_index=*/1, /*device_execution_complete=*/false);
+    fx.collector.run_close(83, /*bank_index=*/2, /*device_execution_complete=*/false);
+    fx.collector.run_close(84, /*bank_index=*/0, /*device_execution_complete=*/false);
+}
+
+TEST(SwimlaneGrantedCapacityTest, OneRunsPublicationFailureDoesNotDisturbTheOtherTwo) {
+    // Failure isolation at three: the middle run cannot write its file, and the
+    // runs either side of it still publish their own identities. Reached
+    // through the production path -- publication is a `link` that cannot
+    // replace, so a squatter on the name is what makes the write fail.
+    AdmissionFixture fx("granted-isolation", ChipSwimlaneModule::kMaxOpenEpochs);
+    ASSERT_TRUE(fx.collector.run_begin(101, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+
+    // The artifact directory is reserved by the first admission, so it exists
+    // only from here.
+    fs::path taken;
+    std::error_code ec;
+    for (const auto &entry : fs::directory_iterator(fx.root, ec)) {
+        if (entry.is_directory()) taken = entry.path() / "records_e102.json";
+    }
+    ASSERT_FALSE(taken.empty());
+    {
+        std::ofstream squatter(taken);
+        squatter << "occupied";
+    }
+
+    ASSERT_TRUE(fx.collector.run_begin(102, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    ASSERT_TRUE(fx.collector.run_begin(103, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+
+    fx.collector.run_close(101, /*bank_index=*/0, /*device_execution_complete=*/false);
+    fx.collector.run_close(102, /*bank_index=*/1, /*device_execution_complete=*/false);
+    fx.collector.run_close(103, /*bank_index=*/2, /*device_execution_complete=*/false);
+
+    std::string error;
+    // The failing run is reported, and a write failure is not a quarantine: the
+    // other two reach their own terminal verdicts and their slots come back.
+    EXPECT_FALSE(fx.collector.flush_retained_runs(8000, &error));
+    EXPECT_NE(error.find("write_failed"), std::string::npos) << error;
+    EXPECT_NE(error.find("102"), std::string::npos) << error;
+
+    for (const uint64_t epoch : {101u, 103u}) {
+        const fs::path file = taken.parent_path() / ("records_e" + std::to_string(epoch) + ".json");
+        ASSERT_TRUE(fs::exists(file, ec)) << "run " << epoch << " lost its artifact to its neighbour's failure";
+        std::ifstream in(file);
+        const std::string artifact((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        EXPECT_NE(artifact.find("\"run_epoch\": " + std::to_string(epoch)), std::string::npos) << artifact;
+    }
+    EXPECT_TRUE(fx.collector.can_admit_retained_run()) << "a write failure still gives its capacity back";
 }
 
 }  // namespace

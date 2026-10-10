@@ -1079,7 +1079,8 @@ void ChipSwimlaneCollector::on_handoff_retired(const profiling_common::RetiredHa
     bool sealed_owner = false;
     if (auto hook = pre_charge_hook()) (*hook)();
     if (epoch != 0 && retained_ready_.load(std::memory_order_acquire)) {
-        for (auto &bucket : retained_runs_) {
+        for (size_t i = 0; i < active_epoch_limit_; i++) {
+            EpochBucket &bucket = retained_runs_[i];
             std::lock_guard<std::mutex> lk(bucket.loss_mu);
             // Generation and authority are read as one pair: a slot that has
             // been released holds no run, so its stale identity may not be
@@ -2819,13 +2820,19 @@ size_t ChipSwimlaneCollector::retained_fixed_overhead() const {
     // holds its current view and, across one refresh, the new one), the
     // permanent error summary, each slot's bounded run metadata, and the
     // writer's scratch.
-    const size_t skeleton =
-        simpler::dfx::runs::kMaxOpenEpochs * shards * 2 * instances * sizeof(std::vector<CollectedRecord<int>>);
-    const size_t counters = simpler::dfx::runs::kMaxOpenEpochs * shards * sizeof(CollectorShardCounters);
+    //
+    // Four of these scale with how many runs this collector may hold, so a
+    // collector left at the default reserves what it always did. `views` does
+    // not: `ShardEpochView` carries its entry array inline, sized to the module
+    // ceiling, so its figure rises by one entry per shard view whatever the
+    // active limit is. The remaining three are constants.
+    const size_t epochs = active_epoch_limit_;
+    const size_t skeleton = epochs * shards * 2 * instances * sizeof(std::vector<CollectedRecord<int>>);
+    const size_t counters = epochs * shards * sizeof(CollectorShardCounters);
     const size_t views = (2 * shards + 1) * sizeof(ShardEpochView);
-    const size_t buckets = simpler::dfx::runs::kMaxOpenEpochs * sizeof(EpochBucket);
+    const size_t buckets = epochs * sizeof(EpochBucket);
     const size_t tombstones = simpler::dfx::runs::kMaxTombstones * sizeof(uint64_t);
-    const size_t epoch_metadata = simpler::dfx::runs::kMaxOpenEpochs * retained_run_fixed_bytes();
+    const size_t epoch_metadata = epochs * retained_run_fixed_bytes();
     return skeleton + counters + views + buckets + tombstones + epoch_metadata + sizeof(run_errors_) +
            simpler::dfx::runs::kWriterScratchBytes;
 }
@@ -2862,6 +2869,42 @@ bool ChipSwimlaneCollector::reserve_artifact_directory(const std::string &output
 void ChipSwimlaneCollector::configure_retained_runs(bool retain_across_runs, size_t budget_bytes) {
     retain_across_runs_ = retain_across_runs;
     retained_budget_bytes_ = budget_bytes;
+}
+
+bool ChipSwimlaneCollector::set_retained_epoch_limit(size_t limit) {
+    // Every condition is tested before the single write below, so a refusal
+    // leaves this collector byte-for-byte as it was. The caller reaches here
+    // through an exported C entry and is not trusted to call it at the right
+    // moment: the checks are what establish the moment, not a convention.
+    if (limit < simpler::dfx::runs::kMaxOpenEpochs || limit > ChipSwimlaneModule::kMaxOpenEpochs) {
+        LOG_ERROR(
+            "ChipSwimlane: retained epoch limit %zu is outside [%zu, %zu]", limit, simpler::dfx::runs::kMaxOpenEpochs,
+            ChipSwimlaneModule::kMaxOpenEpochs
+        );
+        return false;
+    }
+    // Sized storage, live readers, a live writer and prepared retention each
+    // mean somebody is already reading the table this would resize.
+    if (is_initialized() || collector_threads_started() || writer_thread_.joinable() ||
+        retained_ready_.load(std::memory_order_acquire)) {
+        LOG_ERROR("ChipSwimlane: retained epoch limit cannot change once the collector is in use");
+        return false;
+    }
+    {
+        // Nothing may be held even if the three tests above were somehow
+        // passed by a collector torn down out of order: a slot that is not
+        // Free owns records, an identity and possibly a cut.
+        std::lock_guard<std::mutex> lk(retained_mu_);
+        for (const auto &bucket : retained_runs_) {
+            if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free)) {
+                LOG_ERROR("ChipSwimlane: retained epoch limit cannot change while a run is held");
+                return false;
+            }
+        }
+        active_epoch_limit_ = limit;
+    }
+    LOG_INFO("ChipSwimlane: retaining up to %zu runs at once", limit);
+    return true;
 }
 
 bool ChipSwimlaneCollector::ensure_retained_runs_ready(const std::string &output_root) {
@@ -2929,7 +2972,7 @@ bool ChipSwimlaneCollector::ensure_retained_runs_ready(const std::string &output
     close_watermark_.store(0, std::memory_order_release);
     for (auto &t : tombstones_)
         t.store(0, std::memory_order_relaxed);
-    for (size_t slot = 0; slot < retained_runs_.size(); slot++) {
+    for (size_t slot = 0; slot < active_epoch_limit_; slot++) {
         retained_runs_[slot].state.store(static_cast<int>(EpochState::Free), std::memory_order_relaxed);
         retained_runs_[slot].epoch.store(0, std::memory_order_relaxed);
         retained_runs_[slot].charged_bytes.store(0, std::memory_order_relaxed);
@@ -3036,6 +3079,10 @@ void ChipSwimlaneCollector::finish_retained_runs() {
     (void)flush_retained_runs(simpler::dfx::runs::kCutAckBudgetMs * 8, &ignored);
 }
 
+// Teardown scans the whole array rather than the active limit: nothing can
+// ever occupy a slot past the limit, so the extra iterations find Free and cost
+// nothing — and a collector torn down after an out-of-order reconfiguration
+// still reports and releases everything it holds.
 void ChipSwimlaneCollector::release_retained_run_resources() {
     if (!retained_ready_.exchange(false, std::memory_order_acq_rel)) return;
     // Reached from `finalize()`, after `stop()` joined the writer and every
@@ -3067,6 +3114,7 @@ void ChipSwimlaneCollector::release_retained_run_resources() {
     LOG_INFO("ChipSwimlane: retained runs released: %s", run_errors_.report().c_str());
 }
 
+// Whole array, for the reason given above `release_retained_run_resources`.
 void ChipSwimlaneCollector::release_deferred_run_storage() {
     if (!release_deferred_.exchange(false, std::memory_order_acq_rel)) return;
     for (size_t slot = 0; slot < retained_runs_.size(); slot++) {
@@ -3231,7 +3279,7 @@ bool ChipSwimlaneCollector::read_shm_field(const volatile void *host_field, void
 }
 
 int ChipSwimlaneCollector::find_run_slot(uint64_t run_epoch) const {
-    for (size_t slot = 0; slot < retained_runs_.size(); slot++) {
+    for (size_t slot = 0; slot < active_epoch_limit_; slot++) {
         if (retained_runs_[slot].state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) {
             continue;
         }
@@ -3297,7 +3345,7 @@ bool ChipSwimlaneCollector::run_begin(
                 return false;
             }
             bool found = false;
-            for (size_t i = 0; i < retained_runs_.size(); i++) {
+            for (size_t i = 0; i < active_epoch_limit_; i++) {
                 if (retained_runs_[i].state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) {
                     slot = i;
                     found = true;
@@ -3620,7 +3668,7 @@ void ChipSwimlaneCollector::refresh_retained_run_view(int collector_shard) {
     ShardEpochView view;
     {
         std::lock_guard<std::mutex> lk(retained_mu_);
-        for (size_t slot = 0; slot < retained_runs_.size(); slot++) {
+        for (size_t slot = 0; slot < active_epoch_limit_; slot++) {
             const int state = retained_runs_[slot].state.load(std::memory_order_acquire);
             if (state != static_cast<int>(EpochState::Admitting)) continue;
             view.entries[view.count].epoch = retained_runs_[slot].epoch.load(std::memory_order_acquire);
@@ -3864,7 +3912,7 @@ void ChipSwimlaneCollector::finish_retained_run(size_t slot, simpler::dfx::runs:
 }
 
 void ChipSwimlaneCollector::service_retained_runs() {
-    for (size_t slot = 0; slot < retained_runs_.size(); slot++) {
+    for (size_t slot = 0; slot < active_epoch_limit_; slot++) {
         EpochBucket &bucket = retained_runs_[slot];
         if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Admitting)) continue;
         bool ready = false;
@@ -3906,7 +3954,8 @@ std::optional<std::chrono::steady_clock::time_point> ChipSwimlaneCollector::next
     // publishing, a shard reaching its watermark, a fatal, a close — bumps
     // `progress_` and wakes this thread on the spot.
     std::optional<std::chrono::steady_clock::time_point> earliest;
-    for (const auto &bucket : retained_runs_) {
+    for (size_t slot = 0; slot < active_epoch_limit_; slot++) {
+        const EpochBucket &bucket = retained_runs_[slot];
         if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Admitting)) continue;
         if (!bucket.target_installed) continue;
         const auto expiry = bucket.closed_at + std::chrono::milliseconds(simpler::dfx::runs::kCutAckBudgetMs * 4);
@@ -3959,7 +4008,7 @@ bool ChipSwimlaneCollector::flush_retained_runs(int timeout_ms, std::string *err
             bool pending = false;
             {
                 std::unique_lock<std::mutex> lk(retained_mu_);
-                for (size_t slot = 0; slot < retained_runs_.size(); slot++) {
+                for (size_t slot = 0; slot < active_epoch_limit_; slot++) {
                     const int state = retained_runs_[slot].state.load(std::memory_order_acquire);
                     if (state == static_cast<int>(EpochState::Free)) continue;
                     if (state == static_cast<int>(EpochState::Quarantined)) continue;  // terminal, reported below
@@ -4012,8 +4061,10 @@ bool ChipSwimlaneCollector::can_admit_retained_run() const {
     std::lock_guard<std::mutex> lk(retained_mu_);
     if (!retained_ready_.load(std::memory_order_acquire)) return false;
     if (fatal_.load(std::memory_order_acquire)) return false;
-    for (const auto &bucket : retained_runs_) {
-        if (bucket.state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) return true;
+    for (size_t slot = 0; slot < active_epoch_limit_; slot++) {
+        if (retained_runs_[slot].state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) {
+            return true;
+        }
     }
     return false;
 }
@@ -4030,8 +4081,10 @@ ChipSwimlaneCollector::RetainedRunStats ChipSwimlaneCollector::retained_run_stat
     stats.host_charged = host_budget_.charged();
     stats.budget_refusals = host_budget_.refusals();
     stats.release_deferred = release_deferred_.load(std::memory_order_acquire);
-    for (const auto &bucket : retained_runs_) {
-        if (bucket.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free)) stats.open_slots++;
+    for (size_t slot = 0; slot < active_epoch_limit_; slot++) {
+        if (retained_runs_[slot].state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free)) {
+            stats.open_slots++;
+        }
     }
     // One locked read, so the per-verdict rows and the aggregate cannot
     // disagree. `published` is every epoch that left a readable artifact:

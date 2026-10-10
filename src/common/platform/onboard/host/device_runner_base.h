@@ -390,6 +390,17 @@ public:
     }
 
     /**
+     * Raise only the swimlane collector's retained-run capacity.
+     *
+     * The other five keep `dfx::runs::kMaxOpenEpochs`: their limits and their
+     * fixed-budget formulas are approved at that figure, and nothing here has
+     * examined what a third unpublished run would mean for any of them. The
+     * collector itself decides whether the change is admissible and leaves
+     * itself untouched when it is not.
+     */
+    bool set_retained_epoch_limit(size_t limit) { return chip_swimlane_collector_.set_retained_epoch_limit(limit); }
+
+    /**
      * Publish every run closed up to now, then report.
      *
      * Returns 0 when each promised file exists; a published partial counts as

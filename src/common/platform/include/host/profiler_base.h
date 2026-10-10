@@ -1187,6 +1187,15 @@ public:
     }
 
     /**
+     * Whether `start()` has spawned this collector's threads.
+     *
+     * The same test `start()` itself uses for idempotence, exposed so a derived
+     * collector can refuse a configuration change that would resize storage its
+     * running threads already read.
+     */
+    bool collector_threads_started() const { return !collector_threads_.empty(); }
+
+    /**
      * Drain to a quiescent point without retiring the threads. On return the
      * device-side ring and the host ready queue shard(s) are empty and
      * Derived::on_buffer_collected has been called for every entry that was in
@@ -1655,7 +1664,10 @@ protected:
     // written unless a run has been retained, so the five other profilers
     // pay one relaxed load per sweep and nothing else.
 
-    static constexpr size_t kMaxCutSlots = 2;
+    // A module that retains more than the shared default declares its own
+    // ceiling; every other module keeps two and is not recompiled into a
+    // different shape by this.
+    static constexpr size_t kMaxCutSlots = profiling_common::ProfilerModuleMaxCutSlots<Module>::value;
     static constexpr size_t kMaxCutQueues = static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS);
 
     /**

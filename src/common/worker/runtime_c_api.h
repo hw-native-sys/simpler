@@ -586,6 +586,22 @@ int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info);
 int simpler_set_retain_runs_ctx(DeviceContextHandle ctx, int32_t enabled);
 
 /**
+ * Raise how many retained runs this context's swimlane collector may hold open
+ * at once, and report whether it was granted.
+ *
+ * Optional, and resolved by `dlsym` like the gate above: a module built before
+ * this exports no such symbol, and the caller then keeps the shipped capacity.
+ * A module that exports it still refuses whatever it cannot serve — a limit
+ * outside its range, a runtime with no joined-diagnostic backend, or a
+ * collector already in use — and a refusal changes nothing, so the caller may
+ * carry on at the shipped capacity rather than treating it as an error.
+ *
+ * Returns 0 when the limit is in force. Only a 0 return licenses the caller to
+ * record the larger grant.
+ */
+int simpler_set_retained_epoch_limit_ctx(DeviceContextHandle ctx, int32_t limit);
+
+/**
  * The name the gate above shipped under, forwarding to it.
  *
  * Both are exported by every runtime module built from this tree, and each is

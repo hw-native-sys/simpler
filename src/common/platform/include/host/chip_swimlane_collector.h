@@ -137,6 +137,31 @@ struct ChipSwimlaneModule {
     static constexpr int kMaxCollectorThreads = PLATFORM_MAX_AICPU_THREADS;
 
     /**
+     * How many retained runs this collector's storage is *built* for, and how
+     * many transport cuts may be armed beside them.
+     *
+     * Swimlane's own ceiling, deliberately not `dfx::runs::kMaxOpenEpochs`:
+     * that constant is shared with five other collector families, and every one
+     * of them sizes an array and a fixed-budget term from it. Raising it there
+     * would change their approved limits; raising it here changes only this
+     * collector.
+     *
+     * The ceiling is what the arrays are sized to. How many of those slots a
+     * given collector may actually use is `active_epoch_limit()`, which a
+     * backend grants once before this collector is initialized and which
+     * defaults to `dfx::runs::kMaxOpenEpochs` — so a collector nobody grants
+     * anything to behaves exactly as it does today.
+     *
+     * Cuts match epochs because a cut is armed at `run_close` and released only
+     * once the writer reaches a terminal verdict: with N runs admitted, N may
+     * be closed and unpublished at once. Fewer cuts than epochs would not
+     * refuse — `cut_arm` returning -1 downgrades that run to `CutUnknown` —
+     * so the two counts are kept equal rather than tuned.
+     */
+    static constexpr size_t kMaxOpenEpochs = 3;
+    static constexpr size_t kMaxCutSlots = kMaxOpenEpochs;
+
+    /**
      * Startup-only batch allocation size for proactive_replenish. Sched and
      * orch phase pools are sized independently
      * (PLATFORM_PROF_{SCHED,ORCH}_BUFFERS_PER_THREAD).
@@ -1301,7 +1326,7 @@ private:
         RecordsByCollector<CollectedRecord<ChipSwimlaneAicpuOrchPhaseRecord>> orch_phase;
         std::vector<CollectorShardCounters> counters;
     };
-    std::array<EpochStore, simpler::dfx::runs::kMaxOpenEpochs> epoch_stores_{};
+    std::array<EpochStore, ChipSwimlaneModule::kMaxOpenEpochs> epoch_stores_{};
 
     EpochStore &store(size_t slot) { return epoch_stores_[slot < epoch_stores_.size() ? slot : 0]; }
     const EpochStore &store(size_t slot) const { return epoch_stores_[slot < epoch_stores_.size() ? slot : 0]; }
@@ -1548,7 +1573,7 @@ private:
             int slot{-1};
             bool retain{true};
         };
-        std::array<Entry, simpler::dfx::runs::kMaxOpenEpochs> entries{};
+        std::array<Entry, ChipSwimlaneModule::kMaxOpenEpochs> entries{};
         size_t count{0};
 
         int slot_for(uint64_t epoch, bool *retain_out) const {
@@ -1605,6 +1630,27 @@ public:
      * sealing and the file write off it.
      */
     void configure_retained_runs(bool retain_across_runs, size_t budget_bytes);
+
+    /**
+     * Raise how many runs this collector may hold open at once.
+     *
+     * Returns false and changes **nothing** unless every condition holds: the
+     * limit is between the shared default and this module's ceiling, the
+     * collector has not been initialized, no reader or writer thread has been
+     * started, retention has not been prepared, and no slot holds a run. Those
+     * are checked before the single write, so a refusal leaves the previous
+     * grant, the budget and the arrays exactly as they were — a caller that
+     * reaches this through the C API cannot resize a collector that is already
+     * serving runs, and does not have to be trusted to call it early.
+     *
+     * Granting more does not open a wider launch: it answers what this
+     * collector can hold, and the backend decides separately whether a run may
+     * be ordered behind another.
+     */
+    bool set_retained_epoch_limit(size_t limit);
+
+    /** How many runs this collector may hold open at once. */
+    size_t active_epoch_limit() const { return active_epoch_limit_; }
 
     /** Whether this collector is configured to hold a run past its boundary. */
     bool retains_runs() const { return retain_across_runs_; }
@@ -1913,7 +1959,21 @@ private:
     std::string fatal_reason_;
     std::string artifact_dir_;
     uint64_t artifact_dir_index_{0};
-    std::array<EpochBucket, simpler::dfx::runs::kMaxOpenEpochs> retained_runs_{};
+    std::array<EpochBucket, ChipSwimlaneModule::kMaxOpenEpochs> retained_runs_{};
+    /**
+     * How many of `retained_runs_` this collector may use.
+     *
+     * The arrays above are built to the module ceiling; this is the bound every
+     * admission, capacity answer, budget term and preparation loop reads. It
+     * stays at the shared default until a backend grants more through
+     * `set_retained_epoch_limit`, so an ungranted collector allocates, reserves
+     * and admits exactly what it does today — including never sizing the slots
+     * past it, which is what keeps the ceiling off the heap.
+     *
+     * Written once, before this collector is initialized and before any reader
+     * or writer thread exists; read without a lock everywhere after that.
+     */
+    size_t active_epoch_limit_{simpler::dfx::runs::kMaxOpenEpochs};
     std::array<ShardEpochView, profiling_common::BufferPoolManager<ChipSwimlaneModule>::kMaxCollectorShards>
         shard_views_{};
     mutable std::mutex retained_mu_;
