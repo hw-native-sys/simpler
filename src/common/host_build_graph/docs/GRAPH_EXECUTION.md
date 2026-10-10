@@ -681,10 +681,18 @@ placed behind that check could not free the cores such a drain waits on, which
 is the deadlock recorded as #2256. The completion path runs on the resolution
 thread, which never takes part in a drain.
 
-Preparation and external readiness set two bits in one atomic gate. Routing the
-saved root sub-tasks reads the external bit alone and is made exactly-once by
-`route_cursor`, so whichever side observes both bits routes the roots, and a
-Graph that never leaves `PREPARED` routes and retires the same.
+Lifecycle and external readiness share an atomic byte. Routing reads the
+external bit alone and uses `route_cursor` to claim each root exactly once;
+a Graph that never leaves `PREPARED` routes and retires the same.
+
+Every materialization slice stores its new `published_tasks` boundary and then
+performs an acquire-release `fetch_or(0)` on the state byte. External readiness
+sets its bit with an acquire-release RMW on that same byte before routing.
+Whichever RMW is later acquires the earlier publication: either the publisher
+sees readiness and routes, or the readiness caller sees the published range
+and routes. Two acquire loads of separate atomics do not provide this
+handshake; both callers could miss the other's update. The RMW is per published
+slice, not per sub-task, and does not change lifecycle transitions.
 
 Internal dependency readiness borrows the completion-state polling idea, but
 dependency wiring remains an Orchestrator responsibility:

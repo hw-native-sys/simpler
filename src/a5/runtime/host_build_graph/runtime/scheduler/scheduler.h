@@ -1372,8 +1372,7 @@ struct SchedulerState {
                 }
             }
         }
-        execution.published_tasks.store(last, std::memory_order_release);
-        graph_route_ready_roots(execution);
+        if (graph_execution_publish_tasks(execution, last)) graph_route_ready_roots(execution);
     }
 
     int32_t activate_prepared_graph(GraphExecution &execution) {
