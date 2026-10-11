@@ -156,7 +156,7 @@ struct TaskAllocResult {
 struct OutputLayout {
     uint64_t offsets[MAX_TENSOR_ARGS] = {};
     uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
-    int32_t total_output_size = 0;
+    uint64_t total_output_size = 0;
 };
 
 // =============================================================================

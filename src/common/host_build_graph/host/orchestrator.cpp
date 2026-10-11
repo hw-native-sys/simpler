@@ -303,7 +303,7 @@ OutputLayout calculate_output_layout(const CoreTaskArgs &args) {
 }  // namespace simpler::hbg
 
 static bool prepare_task(
-    OrchestratorState *orch, const CoreTaskArgs &args, int32_t total_output_size, ActiveMask active_mask,
+    OrchestratorState *orch, const CoreTaskArgs &args, uint64_t total_output_size, ActiveMask active_mask,
     TaskAttrs task_attrs, PreparedTask *out
 ) {
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");

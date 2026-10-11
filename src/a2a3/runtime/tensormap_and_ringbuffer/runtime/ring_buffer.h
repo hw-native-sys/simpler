@@ -122,7 +122,7 @@ public:
      * @param oldest_open_task Oldest task owned by any open scope on this ring
      * @return Allocation result; check failed() for errors
      */
-    TaskAllocResult alloc(int32_t output_size, ChipTaskSlotState *oldest_open_task = nullptr) {
+    TaskAllocResult alloc(uint64_t output_size, ChipTaskSlotState *oldest_open_task = nullptr) {
         uint64_t aligned_size =
             output_size > 0 ? CHIP_ALIGN_UP(static_cast<uint64_t>(output_size), CHIP_ALIGN_SIZE) : 0;
 
@@ -416,7 +416,7 @@ private:
      * head is pinned by an open scope on this ring; false means the wall-clock
      * backstop fired.
      */
-    void report_deadlock(int32_t requested_output_size, bool heap_blocked, bool scope_gated) {
+    void report_deadlock(uint64_t requested_output_size, bool heap_blocked, bool scope_gated) {
         int32_t last_alive = last_alive_ptr_->load(std::memory_order_acquire);
         int32_t active_tasks = local_task_id_ - last_alive;
         uint64_t htail = heap_tail_;
@@ -447,7 +447,7 @@ private:
             static_cast<unsigned>(ring_id_), heap_top_, htail, heap_size_, heap_used_bytes(), heap_available()
         );
         if (heap_blocked) {
-            LOG_ERROR("  Requested:  %d bytes", requested_output_size);
+            LOG_ERROR("  Requested:  %" PRIu64 " bytes", requested_output_size);
         }
         // Head-task state dump: what the reclaim watermark is actually waiting on.
         if (slot_states_ != nullptr) {

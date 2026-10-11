@@ -91,7 +91,7 @@ public:
      * @param output_size  Total packed output size in bytes (0 = no heap needed)
      * @return Allocation result; check failed() for errors
      */
-    TaskAllocResult alloc(int32_t output_size) {
+    TaskAllocResult alloc(uint64_t output_size) {
         uint64_t aligned_size =
             output_size > 0 ? CHIP_ALIGN_UP(static_cast<uint64_t>(output_size), CHIP_ALIGN_SIZE) : 0;
 

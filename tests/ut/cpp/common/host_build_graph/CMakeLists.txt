@@ -71,6 +71,9 @@ hbg_cases(
     # Calls the real ready_queue_init_data_from_layout. The sizing TU it needs
     # comes with the orchestrator library, which globs host/.
     test_hbg_ready_queue_seed.cpp
+    # Calls the real calculate_output_layout, which comes with the orchestrator
+    # library (globs host/).
+    test_hbg_output_layout.cpp
     ORCH)
 
 hbg_case(test_hbg_graph_cache.cpp

@@ -699,7 +699,7 @@ static bool check_scope_can_accept_task(OrchestratorState *orch, TaskAllocator &
 }
 
 static bool prepare_task(
-    OrchestratorState *orch, const CoreTaskArgs &args, int32_t total_output_size, ActiveMask active_mask,
+    OrchestratorState *orch, const CoreTaskArgs &args, uint64_t total_output_size, ActiveMask active_mask,
     TaskAttrs task_attrs, PreparedTask *out
 ) {
     uint8_t ring_id = orch->current_ring_id();
