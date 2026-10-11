@@ -527,6 +527,15 @@ inline bool graph_execution_signal_external_ready(GraphExecution &execution) {
             GRAPH_EXECUTION_EXTERNAL_READY) == 0;
 }
 
+// Order every published range against external readiness on the same atomic.
+// Whichever RMW comes second acquires the other's release: the publisher sees
+// readiness, or the readiness caller sees the published range. Acquire loads
+// of separate atomics alone allow both callers to miss the other's update.
+inline bool graph_execution_publish_tasks(GraphExecution &execution, int32_t last) {
+    execution.published_tasks.store(last, std::memory_order_release);
+    return (execution.state.fetch_or(0, std::memory_order_acq_rel) & GRAPH_EXECUTION_EXTERNAL_READY) != 0;
+}
+
 inline bool graph_execution_complete_sub_task(GraphExecution &execution) {
     return execution.remaining_tasks.fetch_sub(1, std::memory_order_acq_rel) == 1;
 }
