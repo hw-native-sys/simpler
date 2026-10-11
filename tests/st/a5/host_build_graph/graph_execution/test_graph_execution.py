@@ -9,6 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Graph Execution replays dynamic tensor and scalar bindings across config-keyed definitions."""
 
+import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -77,6 +78,11 @@ class TestGraphExecutionHostBuildGraphA5(SceneTestCase):
         args.output_1[:] = (base + 1.0) * (base + 2.0)
         args.output_3[:] = (base + 100.0) * (base + 4.0)
         args.output_5[:] = (base + 5.0) * (base + 6.0)
+
+    def test_repeated_aicore_so_load(self, st_platform, st_worker):
+        if st_platform != "a5sim":
+            pytest.skip("AICore shared objects are reloaded only by the simulator")
+        self._run_and_validate_l2(st_worker, self.build_callable(st_platform), self.CASES[1], rounds=180)
 
 
 if __name__ == "__main__":

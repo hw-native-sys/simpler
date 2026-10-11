@@ -16,6 +16,7 @@
  * the executor.
  */
 
+#include <cstddef>
 #include <cstdint>
 #include <pthread.h>
 
@@ -39,14 +40,34 @@ static pthread_key_t g_chip_swimlane_aicore_head_slot_key;
 static pthread_key_t g_chip_swimlane_aicore_head_key;
 static pthread_key_t g_aicore_report_epoch_key;
 static pthread_once_t g_tls_once = PTHREAD_ONCE_INIT;
+static pthread_key_t *const g_tls_keys[] = {
+    &g_reg_base_key,
+    &g_core_id_key,
+    &g_aicore_profiling_flag_key,
+    &g_chip_swimlane_aicore_head_slot_key,
+    &g_chip_swimlane_aicore_head_key,
+    &g_aicore_report_epoch_key,
+};
+static size_t g_tls_keys_created = 0;
+static int g_tls_create_error = 0;
 
 static void create_tls_keys() {
-    pthread_key_create(&g_reg_base_key, nullptr);
-    pthread_key_create(&g_core_id_key, nullptr);
-    pthread_key_create(&g_aicore_profiling_flag_key, nullptr);
-    pthread_key_create(&g_chip_swimlane_aicore_head_slot_key, nullptr);
-    pthread_key_create(&g_chip_swimlane_aicore_head_key, nullptr);
-    pthread_key_create(&g_aicore_report_epoch_key, nullptr);
+    for (pthread_key_t *key : g_tls_keys) {
+        g_tls_create_error = pthread_key_create(key, nullptr);
+        if (g_tls_create_error != 0) return;
+        ++g_tls_keys_created;
+    }
+}
+
+static void destroy_tls_keys() __attribute__((destructor));
+static void destroy_tls_keys() {
+    for (size_t i = 0; i < g_tls_keys_created; ++i)
+        pthread_key_delete(*g_tls_keys[i]);
+}
+
+extern "C" int initialize_aicore_tls_keys() {
+    int error = pthread_once(&g_tls_once, create_tls_keys);
+    return error != 0 ? error : g_tls_create_error;
 }
 
 volatile uint8_t *sim_get_reg_base() { return static_cast<volatile uint8_t *>(pthread_getspecific(g_reg_base_key)); }
@@ -114,7 +135,7 @@ extern "C" void aicore_execute_wrapper(
     __gm__ Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs,
     uint32_t enable_profiling_flag, uint64_t chip_swimlane_aicore_rotation_table, uint64_t report_epoch
 ) {
-    pthread_once(&g_tls_once, create_tls_keys);
+    if (initialize_aicore_tls_keys() != 0) return;
 
     // Set up simulated register base for this thread.
     // regs points to an array of uint64_t base addresses (one per core).
