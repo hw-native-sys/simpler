@@ -88,7 +88,7 @@ So on hardware the exception code is the *least* informative thing on screen. Th
 The description and remedy come from the log. What it cannot tell you is which
 layer to go looking in, which is what these columns are for.
 
-### Orchestration errors (1-11)
+### Orchestration errors (1-12)
 
 | Code | Name | Whose bug, usually |
 | ---- | ---- | ------------------ |
@@ -103,6 +103,7 @@ layer to go looking in, which is what these columns are for.
 | 9 | EXPLICIT_ORCH_FATAL | orchestration (deliberate) |
 | 10 | SCOPE_TASKS_OVERFLOW | runtime-internal |
 | 11 | TENSORMAP_OVERFLOW | runtime-internal / extreme scale |
+| 12 | SUBMIT_CAPACITY_EXCEEDED | orchestration / config (HBG only) |
 
 ### Scheduler errors (100+)
 
@@ -180,7 +181,7 @@ always *fallout* — scroll up for the first failure on that device. For classif
 
 | You have | Go to |
 | -------- | ----- |
-| a capacity code — 1, 2, 3, 4, 11 | [Capacity](device-error-codes/capacity.md) |
+| a capacity code — 1, 2, 3, 4, 11, 12 | [Capacity](device-error-codes/capacity.md) |
 | a stall — 100, or code 8 | [Stalls](device-error-codes/stall.md) |
 | a `VEC`/`CUBE` instruction error or UB out of bounds in the device log | [AICore faults](device-error-codes/aicore-fault.md) |
 | 10, 11, 103, S4, S5 or unknown | [Codes with no end-to-end test](device-error-codes/untested.md) — and it is a runtime bug |

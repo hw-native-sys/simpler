@@ -204,16 +204,16 @@ struct GraphDefinition {
     //                   parameter; replay adds the             absolute in its own buffer
     //                   argument's origin
     //
-    // Geometry, dtype and flags travel absolute, because graph_boundary_matches pins those
-    // equal before a Definition may be reused.
+    // Geometry, dtype and flags travel absolute, because graph_require_boundary_match pins
+    // those equal before a Definition may be reused.
     //
     // So start_offset here does not mean what it means on the boundary tensors this is
     // matched against: there it is the caller's own origin, here an offset from it. A
     // parameter's offset is relative to its own parameter rather than to its alias
     // partition's, so a tensor is rebuilt against the argument it came from; two tensors
     // over one buffer keep their recorded distance only while the arguments keep theirs,
-    // which is what graph_boundary_matches checks and what the recorded WAR/WAW edges were
-    // inferred from.
+    // which is what graph_require_boundary_match checks and what the recorded WAR/WAW edges
+    // were inferred from.
     uint32_t off_tensors;
     uint32_t off_scalars;
     uint32_t off_scalar_inheritance;

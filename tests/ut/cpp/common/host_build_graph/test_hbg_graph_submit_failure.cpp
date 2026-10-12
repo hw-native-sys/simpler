@@ -107,7 +107,7 @@ TEST_F(HbgGraphSubmitFailureTest, InFlightGraphInvocationsReserveHeapOnlyAtCommi
     ASSERT_TRUE(first.task_id.is_valid());
     const GraphScopeResult second = orch.graph_begin(0x1715, boundary_args, 0x1736);
     EXPECT_FALSE(second.recording);
-    EXPECT_FALSE(second.execute_block);
+    EXPECT_FALSE(second.has_error);
     ASSERT_TRUE(second.task_id.is_valid());
     EXPECT_EQ(second.task_id.local_id(), first.task_id.local_id() + 1);
     EXPECT_EQ(orch.task_allocator.heap_top(), 0u);
@@ -240,8 +240,8 @@ TEST_F(HbgGraphSubmitFailureTest, WorkerRecordsWhileMainThreadSubmitsSameHashShe
     ASSERT_TRUE(task_ok);
     ASSERT_TRUE(end_ok);
     EXPECT_FALSE(second.recording);
-    EXPECT_FALSE(second.execute_block);
-    EXPECT_FALSE(third.execute_block);
+    EXPECT_FALSE(second.has_error);
+    EXPECT_FALSE(third.has_error);
     ASSERT_TRUE(second.task_id.is_valid());
     ASSERT_TRUE(third.task_id.is_valid());
     EXPECT_EQ(second.task_id.local_id(), first.task_id.local_id() + 1);
@@ -449,15 +449,15 @@ TEST_F(HbgGraphSubmitFailureTest, RuntimeAllocationInsideTheBodyRecordsAKernelle
 
 // A parameter's recording-space window is reserved once per buffer address and sized from
 // the first parameter to claim it, so the parameters at one address have to agree on how
-// wide that is. Two that present one address at two sizes do not, and the boundary is
-// refused -- the invocation takes the ordinary path, which is always correct.
+// wide that is. Two that present one address at two sizes do not, and such a boundary is a
+// contract violation: it fails the run rather than recording against either size.
 //
 // This is one of the two properties the alias partition checks; the other is that no
 // buffer is empty. That *different* addresses name non-overlapping memory is not checked
 // but assumed: every buffer a boundary can name comes from the one allocator, which hands
 // out disjoint blocks, and proving it per invocation would cost an ordering of the
 // addresses where grouping alone needs only a hash.
-TEST_F(HbgGraphSubmitFailureTest, ABoundaryPresentingOneAddressAtTwoSizesTakesTheOrdinaryPath) {
+TEST_F(HbgGraphSubmitFailureTest, ABoundaryPresentingOneAddressAtTwoSizesFailsTheRun) {
     std::array<uint32_t, 32> storage{};
     uint32_t wide_shape[] = {32};
     uint32_t narrow_shape[] = {16};
@@ -475,10 +475,11 @@ TEST_F(HbgGraphSubmitFailureTest, ABoundaryPresentingOneAddressAtTwoSizesTakesTh
     const GraphScopeResult graph = orch.graph_begin(0x1723, boundary_args, 0x1736);
 
     EXPECT_FALSE(graph.recording) << "an unrepresentable boundary opens no recording";
-    EXPECT_TRUE(graph.execute_block) << "the caller runs the body itself instead";
+    EXPECT_TRUE(graph.has_error);
     EXPECT_EQ(graph_host_upload_count(*graph_state), 0u) << "and no shell was submitted for it";
     orch.graph_commit();
-    EXPECT_FALSE(orch.is_fatal()) << "declining to record is not a failure";
+    EXPECT_TRUE(orch.is_fatal()) << "a boundary this runtime cannot represent fails the run";
+    EXPECT_EQ(orch.fatal_code.load(std::memory_order_acquire), SIMPLER_ERROR_INVALID_ARGS);
 }
 
 // A body may only use what came through its boundary, or what one of its own tasks
@@ -555,7 +556,7 @@ TEST_F(HbgGraphSubmitFailureTest, ASlidingBoundaryOriginKeepsReusingItsDefinitio
     slid_args.add_input(slid_slice);
     const GraphScopeResult replay = orch.graph_begin(0x1724, slid_args, 0x1736);
 
-    EXPECT_FALSE(replay.execute_block) << "a slid origin is inside the boundary contract";
+    EXPECT_FALSE(replay.has_error) << "a slid origin is inside the boundary contract";
     ASSERT_TRUE(replay.task_id.is_valid());
     EXPECT_FALSE(orch.is_fatal());
 
@@ -614,20 +615,22 @@ TEST_F(HbgGraphSubmitFailureTest, PartitionMembersSlidingAgainstEachOtherDoNotRe
     uniform_args.add_inout(uniform_first);
     uniform_args.add_input(uniform_second);
     const GraphScopeResult uniform = orch.graph_begin(0x1725, uniform_args, 0x1736);
-    EXPECT_FALSE(uniform.execute_block) << "a uniform slide of the whole partition is reusable";
+    EXPECT_FALSE(uniform.has_error) << "a uniform slide of the whole partition is reusable";
     EXPECT_TRUE(uniform.task_id.is_valid());
 
     // Only the second member moved, so the distance is 8 where the Definition's edges were
-    // inferred from 4. The arrangement check refuses it, and this build's assertions turn
-    // that refusal into a throw.
+    // inferred from 4. The arrangement check refuses it, and a refused boundary is a
+    // contract violation rather than a reason to replay the body.
     GraphTaskArgs differential_args;
     differential_args.add_inout(differential_first);
     differential_args.add_input(differential_second);
-    EXPECT_THROW(orch.graph_begin(0x1725, differential_args, 0x1736), AssertionError)
-        << "a differential slide changes the overlap geometry the Definition baked in";
+    const GraphScopeResult differential = orch.graph_begin(0x1725, differential_args, 0x1736);
+    EXPECT_TRUE(differential.has_error) << "a differential slide changes the overlap geometry the Definition baked in";
+    EXPECT_FALSE(differential.recording);
     EXPECT_EQ(graph_host_upload_count(*graph_state), uploads_after_recording + 1)
         << "only the uniform slide got a shell; the refused one submitted nothing";
-    EXPECT_FALSE(orch.is_fatal()) << "declining to reuse is not a failure";
+    EXPECT_TRUE(orch.is_fatal()) << "a boundary that broke its contract fails the run";
+    EXPECT_EQ(orch.fatal_code.load(std::memory_order_acquire), SIMPLER_ERROR_INVALID_ARGS);
 }
 
 TEST_F(HbgGraphSubmitFailureTest, FaninFailureLatchesFatalWithoutPartialUpload) {
@@ -664,7 +667,7 @@ TEST_F(HbgGraphSubmitFailureTest, FaninFailureLatchesFatalWithoutPartialUpload) 
 
     const GraphScopeResult replay = orch.graph_begin(0x1715, boundary_args, 0x1736);
 
-    EXPECT_TRUE(replay.execute_block);
+    EXPECT_TRUE(replay.has_error);
     EXPECT_FALSE(replay.recording);
     EXPECT_FALSE(replay.task_id.is_valid());
     EXPECT_TRUE(orch.is_fatal());
@@ -697,7 +700,7 @@ TEST_F(HbgGraphSubmitFailureTest, CachedGraphUsesFinalTaskWindowSlot) {
 
     const GraphScopeResult replay = orch.graph_begin(0x1716, boundary_args, 0x1736);
 
-    EXPECT_FALSE(replay.execute_block);
+    EXPECT_FALSE(replay.has_error);
     ASSERT_TRUE(replay.task_id.is_valid());
     EXPECT_EQ(replay.task_id.local_id(), allocator.capacity() - 1);
     EXPECT_EQ(allocator.active_count(), allocator.capacity());
@@ -834,7 +837,7 @@ TEST_F(HbgGraphSubmitFailureTest, ASecondKeyRecordsAlongsideTheFirst) {
 
     const GraphScopeResult second = orch.graph_begin(0x1902, args_b, 0x1736);
     EXPECT_TRUE(second.recording) << "a distinct key must not be demoted by a busy recorder";
-    EXPECT_FALSE(second.execute_block);
+    EXPECT_FALSE(second.has_error);
     ASSERT_NE(second.recording_handle, nullptr);
     EXPECT_NE(second.recording_handle, first.recording_handle);
 
@@ -862,10 +865,10 @@ TEST_F(HbgGraphSubmitFailureTest, ASecondKeyRecordsAlongsideTheFirst) {
     EXPECT_FALSE(orch.is_fatal());
 
     const GraphScopeResult replay_a = orch.graph_begin(0x1901, args_a, 0x1736);
-    EXPECT_FALSE(replay_a.execute_block) << "the first key's Definition must be cached";
+    EXPECT_FALSE(replay_a.has_error) << "the first key's Definition must be cached";
     EXPECT_FALSE(replay_a.recording);
     const GraphScopeResult replay_b = orch.graph_begin(0x1902, args_b, 0x1736);
-    EXPECT_FALSE(replay_b.execute_block) << "the second key's Definition must be cached";
+    EXPECT_FALSE(replay_b.has_error) << "the second key's Definition must be cached";
     EXPECT_FALSE(replay_b.recording);
 }
 
@@ -952,7 +955,7 @@ TEST_F(HbgGraphSubmitFailureTest, ACachedGraphReplaysWhileAnotherKeyRecords) {
     ASSERT_TRUE(second.recording);
 
     const GraphScopeResult replay = orch.graph_begin(0x1903, args_a, 0x1736);
-    EXPECT_FALSE(replay.execute_block) << "a cache hit must not wait for an unrelated recording";
+    EXPECT_FALSE(replay.has_error) << "a cache hit must not wait for an unrelated recording";
     EXPECT_FALSE(replay.recording);
     ASSERT_TRUE(replay.task_id.is_valid());
     // A replay off the cache carries its own heap, unlike the zero-heap shells

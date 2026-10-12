@@ -115,7 +115,7 @@ GraphScopeResult fake_graph_begin(RuntimeContext *rt, uint64_t, const GraphTaskA
     std::lock_guard<std::mutex> lock(fake.mutex);
     fake.begin_calls++;
     GraphScopeResult result;
-    result.execute_block = false;
+    result.has_error = false;
     result.recording = fake.record_every_begin || fake.begin_calls == 1;
     if (result.recording) {
         // Each recording resolves against its own list, so a body queued by an earlier

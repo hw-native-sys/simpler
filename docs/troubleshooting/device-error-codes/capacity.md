@@ -1,11 +1,11 @@
-# Chasing down a capacity code (1, 2, 3, 4, 11)
+# Chasing down a capacity code (1, 2, 3, 4, 11, 12)
 
 ← [Device Error Codes](../device-error-codes.md)
 
 SCOPE_DEADLOCK, HEAP_RING_DEADLOCK, FLOW_CONTROL_DEADLOCK,
-FANIN_CAPACITY_EXCEEDED and TENSORMAP_OVERFLOW all mean that a runtime resource could
-not admit more graph state. The adjacent device-log line identifies the actual
-resource and determines how strong that diagnosis is:
+FANIN_CAPACITY_EXCEEDED, TENSORMAP_OVERFLOW and SUBMIT_CAPACITY_EXCEEDED all mean that a
+runtime resource could not admit more graph state. The adjacent device-log line identifies
+the actual resource and determines how strong that diagnosis is:
 
 - `Provable head-of-line deadlock` is a structural proof: in TRB the reclaim head
   is the oldest task owned by an open scope on that ring, and the blocked
@@ -45,6 +45,7 @@ that trips the code.
 | HBG | task count | 3 | raise `runtime_env.ring_task_window` (any positive count), or shrink the graph |
 | HBG | inline fanin | 4 | reduce distinct producers to `CHIP_MAX_FANIN` (currently 128) or less; HBG has no dependency spill pool |
 | HBG | TensorMap entries | 11 | increase `CHIP_TENSORMAP_POOL_SIZE`, or reduce registered outputs |
+| HBG | submit-time capacity | 12 | see the four sources below |
 | TRB | open-scope task window | 1 or 3 | raise `runtime_env.ring_task_window` (a power of two, >= 4), split the scope, or diagnose stalled reclaim |
 | TRB | heap | 2 | raise `runtime_env.ring_heap`, shrink allocations, or diagnose stalled reclaim |
 | TRB | dependency pool | 4 | raise `runtime_env.ring_dep_pool`, cut fanin, or diagnose stalled reclaim |
@@ -53,6 +54,22 @@ HBG's graph heap is absent from the table because it has no knob and cannot latc
 code 2: orchestration allocates it out of a virtual window, and the device region
 is committed afterwards at the measured size. A graph too large for the device
 fails at that commit, on the host, naming the byte count it asked for.
+
+## SUBMIT_CAPACITY_EXCEEDED (12) sources
+
+Code 12 is latched on the host while a submission is being admitted, so it has no
+device-log line at all. The `LOG_ERROR` immediately above it names which of four
+capacities ran out:
+
+- **Task slots or heap bytes.** The allocator has no free slot, or the heap cannot
+  cover what this submission owns. Raise `runtime_env.ring_task_window`, or shrink the
+  sub-task outputs.
+- **The compact argument pools.** A boundary draws more tensor or scalar pool entries
+  than the single task slot it occupies is worth. Reduce its parameter count.
+- **The owned heap request.** The bytes one Definition owns exceed `INT32_MAX`. Split
+  the body.
+- **The Definition cache.** The per-worker `GRAPH_MAX_DEFINITIONS` limit was reached.
+  Submit fewer distinct Definitions, or raise the constant.
 
 The runtime's own `error hint:` line already names the knob for the code it
 latched; this table is for when you have `scope_stats` output and want to read the

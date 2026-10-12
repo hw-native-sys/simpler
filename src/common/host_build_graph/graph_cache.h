@@ -20,7 +20,10 @@
 #include "host_build_graph/types.h"
 
 struct GraphScopeResult {
-    bool execute_block{true};
+    // The submission failed: no shell was published and no recording opened. Every path
+    // that sets it latches a fatal first, so a caller needs no handling of its own --
+    // every later orchestration call short-circuits to a no-op.
+    bool has_error{false};
     bool recording{false};
     TaskId task_id{TaskId::invalid()};
     // The recording this call opened, non-null exactly when `recording` is set.

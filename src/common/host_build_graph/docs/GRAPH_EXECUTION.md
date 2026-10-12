@@ -211,8 +211,8 @@ why it cannot be diagnosed instead:
   answerable from one address alone. None of them may be empty. And two
   parameters at one address must name one size — a parameter's recording-space
   window is reserved once per address and sized from the first parameter to
-  claim it, so its group has to agree on how wide that is. Either refusal sends
-  the invocation down the ordinary path.
+  claim it, so its group has to agree on how wide that is. Either refusal fails
+  the run.
 - Everything else about the body's shape is the author's declaration, not a
   checked property. A Graph key asserts that two invocations record the same
   topology: the same task count, the same kernel selection, the same edge set,
@@ -241,20 +241,17 @@ why it cannot be diagnosed instead:
   task's own output; the predicate itself creates no dependency, exactly as on
   the ordinary path, so the caller still declares one on the operand's producer.
 
-Structural or alias mismatch logs a warning and executes the Graph function
-normally for that invocation. It never reuses heap offsets recorded for a
-different shape. Debug builds also assert at these unsupported boundaries so
-development catches a violated fixed-shape contract immediately; the ordinary
-path remains the defensive release-build behavior.
+Structural or alias mismatch latches `SIMPLER_ERROR_INVALID_ARGS` and names, in
+one log line, which parameter moved and in which field. The invocation publishes
+no shell and opens no recording, and no heap offset recorded for one shape is
+ever reused for another.
 
-**A mismatch is not retried, and for a published key it is permanent.** The
+**A mismatch fails the run; it is not a retry and not a fallback.** The
 Definition cache holds one record per Graph key and nothing evicts or replaces
-it, and the cache-hit path returns as soon as the match fails rather than
-falling through to recording. So every later invocation carrying the value that
-did not match repeats the same sequence: find the Definition, fail the match,
-warn, and run the body itself. The run stays correct — the ordinary path
-computes from the caller's own arguments — but the key has lost Definition reuse
-for the rest of the run.
+it, so a boundary that disagrees with its Definition disagrees with it for good.
+Reporting that is the point: the alternative is an invocation that computes the
+right answer while silently losing Definition reuse for the rest of the run,
+which is a performance cliff with no symptom.
 
 This is what bounds a `Config`. A value that genuinely is fixed for the run
 costs nothing there: it is folded into the key once, and every invocation
@@ -431,7 +428,7 @@ key, which the keyed in-flight map enforces.
 published Definition is immutable, so replaying it depends on no recording; the
 lookup order is what keeps an already-built Graph from waiting on an unrelated
 Definition. An identity that is neither published nor in flight opens its own
-recording rather than falling back to the ordinary path.
+recording rather than waiting on an unrelated one.
 
 The queue handoff hands `graph_prepare` the in-flight entry's own address,
 carried through `GraphScopeResult::recording_handle`. Prepare therefore neither
@@ -788,24 +785,37 @@ error instead of leaving an already-submitted outer Graph unable to complete.
 
 ## Current unsupported cases
 
-Conditions detected before an outer shell is accepted use the ordinary path:
+Each condition below is detected before an outer shell is accepted. All of them
+latch a fatal and name themselves in one log line; none falls back to submitting
+the body as ordinary tasks. A Graph that cannot be opened is a failure, not a
+slower path:
 
-- an empty Graph boundary;
+- an empty Graph boundary, or one carrying more than `GRAPH_MAX_TENSOR_ARGS`
+  (128) Tensors or `GRAPH_MAX_SCALAR_ARGS` (64) scalars;
+- an explicit dependency declared on the boundary itself;
+- nested Graph submission;
 - variable ChipTensor shape, stride, dtype, size, direction, or contiguity;
 - a boundary whose alias partition changed, or whose members moved relative to
   each other within a partition;
 - a boundary naming an empty buffer, or naming one address at two buffer sizes;
 - runtime-allocated boundary outputs;
-- more than `GRAPH_MAX_TENSOR_ARGS` (128) boundary Tensors;
-- more than 16 Definitions;
-- insufficient task-window or known cache-hit heap capacity.
+- more than `GRAPH_MAX_DEFINITIONS` (16) Definitions;
+- insufficient task-window or known cache-hit heap capacity;
+- a boundary drawing more than the argument pools hold, or a Definition owning
+  more than `INT32_MAX` heap bytes;
+- a submission against a key whose recording failed.
+
+The first eight latch `SIMPLER_ERROR_INVALID_ARGS`, the next three
+`SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED`, and the last
+`SIMPLER_ERROR_EXPLICIT_ORCH_FATAL` — the recording thread latched its own
+failure where it happened, and this line connects it to the submission it takes
+down.
 
 The following constructs are discovered only while a thread records the
 first Definition. Because its outer shell is already in the task/dependency
 sequence, they assert in debug builds and fail the orchestration in release
 builds:
 
-- nested Graph recording;
 - an explicit dependency naming a task outside the Graph;
 - a ChipTensor that reached the body without coming through the boundary,
   including a dispatch predicate's operand tensor;

@@ -228,9 +228,10 @@ bool bind_graph_topology(GraphExecution &execution, const GraphImageView &image,
 //   a body tensor  buffer address is an offset into the graph heap, whose base this
 //                  execution was given; `start_offset` is already its own view origin
 //
-// Everything else travels absolute, because graph_boundary_matches pins it equal before a
-// Definition may be reused. owner_task_id and version are not touched either -- nothing on
-// the device reads them off a task's arguments, the scheduler hands the kernel a Tensor
+// Everything else travels absolute, because graph_require_boundary_match pins it equal
+// before a Definition may be reused. owner_task_id and version are not touched either --
+// nothing on the device reads them off a task's arguments, the scheduler hands the kernel a
+// Tensor
 // pointer and the body's dependencies come from the Definition's CSR.
 //
 // Adding the parameter's *own* origin, rather than a partition-wide shift, is what makes

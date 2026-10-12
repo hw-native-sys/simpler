@@ -456,14 +456,23 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
     if (_between != 0 && _between < kBindBoundaryNs) {
         rt_record_orch_phase(HostPhaseKind::OrchGeneratedArgs, _phase.prev_exit_ns, _entry_ns, _phase.count);
     }
+    // A boundary that cannot open a Graph is a contract violation, not a reason to run
+    // the body quietly: the caller declared a Graph and gets told why it is not one.
     if (!rt_graph_args_cacheable(args)) {
-        invoke(args);
-        _phase.prev_exit_ns = rt_orch_phase_now_ns();
-        return GraphSubmitResult{};
+        rt_report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, "[GraphExecution] boundary cannot open a Graph: tensors=%d scalars=%d error=%d",
+            args.tensor_count(), args.scalar_count(), static_cast<int>(args.has_error())
+        );
+        GraphSubmitResult rejected;
+        rejected.has_error = true;
+        return rejected;
     }
     const uint64_t _admitted_ns = rt_orch_phase_now_ns();
     rt_record_orch_phase(HostPhaseKind::OrchSubmitAdmit, _entry_ns, _admitted_ns, graph_key);
     GraphScopeResult result = rt_graph_begin(graph_key, args);
+    // A failed submission has latched a fatal, so there is no body to run and no phase
+    // worth recording: the orchestration it belongs to will not produce a timeline.
+    if (result.has_error) return result;
     const uint64_t _begun_ns = rt_orch_phase_now_ns();
     if (result.recording) {
         void *handle = result.recording_handle;
@@ -510,9 +519,6 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
                 throw;
             }
         }
-    } else if (result.execute_block) {
-        // Un-cacheable at begin, or the Definition cache is full: ordinary path.
-        if (!current_runtime()->ops->is_fatal(current_runtime())) invoke(args);
     }
     // A cache hit or an in-flight hit skips the body. Every in-flight Graph task
     // is finalized at orchestration completion.
@@ -534,7 +540,11 @@ static inline GraphSubmitResult
 rt_submit_graph(uint64_t graph_id, GraphFunction function, const GraphTaskArgs &args, const ConfigT &config) {
     simpler::hbg::assert_config<ConfigT>();
     debug_assert(function != nullptr && "Graph function must not be null");
-    if (function == nullptr) return GraphSubmitResult{};
+    if (function == nullptr) {
+        GraphSubmitResult rejected;
+        rejected.has_error = true;
+        return rejected;
+    }
     const uint64_t graph_key = rt_graph_make_key(graph_id, config.hash());
     simpler::hbg::retain_config(graph_key, config);
     return rt_submit_graph_impl(graph_key, args, [function](const GraphTaskArgs &record_args) {
@@ -571,7 +581,11 @@ static inline GraphSubmitResult rt_submit_graph(
 ) {
     simpler::hbg::assert_config<ConfigT>();
     debug_assert(function != nullptr && "Graph function must not be null");
-    if (function == nullptr) return GraphSubmitResult{};
+    if (function == nullptr) {
+        GraphSubmitResult rejected;
+        rejected.has_error = true;
+        return rejected;
+    }
     const uint64_t graph_key = rt_graph_make_key(graph_id, config.hash());
     simpler::hbg::retain_config(graph_key, config);
     // The lambda captures its own copy: the recording job runs on a recorder thread that
