@@ -34,14 +34,25 @@ bool is_blank(const char *s) { return s == nullptr || s[0] == '\0'; }
 
 // Every runtime error code, including the ones no ST can provoke. 6 is retired and no longer
 // defined by any runtime's header.
+//
+// A code only one runtime raises still belongs here: a number is reserved across runtimes so
+// that every runtime's table can name it, which is what lets this list be unconditional.
 constexpr int32_t kAllRuntimeCodes[] = {
-    SIMPLER_ERROR_SCOPE_DEADLOCK,        SIMPLER_ERROR_HEAP_RING_DEADLOCK,
-    SIMPLER_ERROR_FLOW_CONTROL_DEADLOCK, SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED,
-    SIMPLER_ERROR_INVALID_ARGS,          SIMPLER_ERROR_REQUIRE_SYNC_START_INVALID,
-    SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT,   SIMPLER_ERROR_EXPLICIT_ORCH_FATAL,
-    SIMPLER_ERROR_SCOPE_TASKS_OVERFLOW,  SIMPLER_ERROR_TENSORMAP_OVERFLOW,
-    SIMPLER_ERROR_SCHEDULER_TIMEOUT,     SIMPLER_ERROR_ASYNC_COMPLETION_INVALID,
-    SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW,   SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED,
+    SIMPLER_ERROR_SCOPE_DEADLOCK,
+    SIMPLER_ERROR_HEAP_RING_DEADLOCK,
+    SIMPLER_ERROR_FLOW_CONTROL_DEADLOCK,
+    SIMPLER_ERROR_FANIN_CAPACITY_EXCEEDED,
+    SIMPLER_ERROR_INVALID_ARGS,
+    SIMPLER_ERROR_REQUIRE_SYNC_START_INVALID,
+    SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT,
+    SIMPLER_ERROR_EXPLICIT_ORCH_FATAL,
+    SIMPLER_ERROR_SCOPE_TASKS_OVERFLOW,
+    SIMPLER_ERROR_TENSORMAP_OVERFLOW,
+    SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED,
+    SIMPLER_ERROR_SCHEDULER_TIMEOUT,
+    SIMPLER_ERROR_ASYNC_COMPLETION_INVALID,
+    SIMPLER_ERROR_ASYNC_WAIT_OVERFLOW,
+    SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED,
 };
 
 TEST(RuntimeErrorNames, EveryCodeHasNameDescAndHint) {
@@ -69,7 +80,7 @@ TEST(RuntimeErrorNames, NoErrorIsNotAnError) {
 // An unrecognised code must be reported as such. Annotating it with a neighbouring code's
 // text would be worse than printing the bare number.
 TEST(RuntimeErrorNames, UnknownCodeFallsBack) {
-    for (int32_t code : {6, 12, 42, 99, 105, 9999, -1}) {
+    for (int32_t code : {6, 42, 99, 105, 9999, -1}) {
         EXPECT_STREQ(error_name(code), "unknown") << "code " << code;
         EXPECT_TRUE(is_blank(error_desc(code))) << "code " << code;
         EXPECT_TRUE(is_blank(error_hint(code))) << "code " << code;

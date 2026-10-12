@@ -18,7 +18,6 @@
 #include <unordered_map>
 
 #include "host_build_graph/graph_cache.h"
-#include "task_interface/assert_compat.h"
 
 namespace simpler::hbg {
 
@@ -158,28 +157,29 @@ inline std::unordered_map<uint64_t, std::unique_ptr<ConfigBase>> &config_registr
     return registry;
 }
 
-// Retain this key's Config, or check it against the one already retained.
+// Retain this key's Config, or check it against the one already retained. False means two
+// Configs disagree on one key.
 //
 // Two Configs disagreeing on one key means the key no longer identifies the Graph it was
-// built from, so the Definition cache would hand back the wrong body. That is a defect in a
-// hash function -- rt_graph_make_key's or a Config's own -- rather than a legitimate runtime
-// outcome, so it fails loudly instead of degrading to the ordinary path, which would hide it.
+// built from, so the Definition cache would hand back the wrong body. The caller reports it:
+// a Config's hash() is written by whoever declared the Config, so a collision is something a
+// caller can produce, and this runtime's rule for those is a fatal naming the reason rather
+// than an abort. The report lives at the submission because that is where the runtime handle
+// the fatal goes through is in scope.
 //
 // dynamic_cast rather than a type tag: the retained object, this comparison, and every
 // Config type reachable here all live in the one orchestration .so, so there is no cross-.so
 // RTTI identity to worry about.
 template <typename ConfigT>
-inline void retain_config(uint64_t graph_key, const ConfigT &config) {
+[[nodiscard]] inline bool retain_config(uint64_t graph_key, const ConfigT &config) {
     auto &registry = config_registry();
     auto it = registry.find(graph_key);
     if (it == registry.end()) {
         registry.emplace(graph_key, std::make_unique<ConfigT>(config));
-        return;
+        return true;
     }
     const auto *retained = dynamic_cast<const ConfigT *>(it->second.get());
-    always_assert(
-        retained != nullptr && *retained == config && "a Graph key collision: two different Configs hashed to one key"
-    );
+    return retained != nullptr && *retained == config;
 }
 
 }  // namespace simpler::hbg

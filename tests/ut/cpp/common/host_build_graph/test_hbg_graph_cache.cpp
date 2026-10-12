@@ -466,19 +466,21 @@ protected:
 TEST_F(GraphConfigRegistryTest, ResubmittingOneKeyWithItsOwnConfigAgrees) {
     constexpr uint64_t KEY = 0x9001;
 
-    simpler::hbg::retain_config(KEY, VariantConfig{3});
-    EXPECT_NO_THROW(simpler::hbg::retain_config(KEY, VariantConfig{3}));
-    EXPECT_NO_THROW(simpler::hbg::retain_config(KEY, VariantConfig{3}));
+    EXPECT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
+    EXPECT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
+    EXPECT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
 }
 
 // The hole this registry exists to close. Two Configs reaching one key means the key no
 // longer names the Graph its Definition was recorded from, so the next hit would replay the
-// wrong body -- the failure mode that was silent before.
+// wrong body -- the failure mode that was silent before. Reported rather than asserted: a
+// Config's hash() is the caller's own code, so a collision is caller-triggerable, and the
+// submission turns this false into a fatal naming the key.
 TEST_F(GraphConfigRegistryTest, TwoConfigValuesOnOneKeyFailLoudly) {
     constexpr uint64_t KEY = 0x9002;
 
-    simpler::hbg::retain_config(KEY, VariantConfig{3});
-    EXPECT_THROW(simpler::hbg::retain_config(KEY, VariantConfig{4}), AssertionError);
+    ASSERT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
+    EXPECT_FALSE(simpler::hbg::retain_config(KEY, VariantConfig{4}));
 }
 
 // Same hole, across types rather than values. One table for every Config type is what makes
@@ -486,19 +488,31 @@ TEST_F(GraphConfigRegistryTest, TwoConfigValuesOnOneKeyFailLoudly) {
 TEST_F(GraphConfigRegistryTest, TwoConfigTypesOnOneKeyFailLoudly) {
     constexpr uint64_t KEY = 0x9003;
 
-    simpler::hbg::retain_config(KEY, VariantConfig{3});
-    EXPECT_THROW(simpler::hbg::retain_config(KEY, ThresholdConfig{true}), AssertionError);
+    ASSERT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
+    EXPECT_FALSE(simpler::hbg::retain_config(KEY, ThresholdConfig{true}));
+}
+
+// A refused submission leaves the retained Config alone: the first one still owns the key,
+// so a later submission carrying it is still admitted.
+TEST_F(GraphConfigRegistryTest, ARefusedConfigDoesNotDisplaceTheRetainedOne) {
+    constexpr uint64_t KEY = 0x9008;
+
+    ASSERT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
+    ASSERT_FALSE(simpler::hbg::retain_config(KEY, VariantConfig{4}));
+
+    EXPECT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
+    EXPECT_EQ(simpler::hbg::config_registry().size(), 1u);
 }
 
 // Distinct keys are independent, so an unrelated Graph is never dragged into a comparison.
 TEST_F(GraphConfigRegistryTest, DistinctKeysRetainIndependently) {
-    simpler::hbg::retain_config(0x9004, VariantConfig{3});
-    simpler::hbg::retain_config(0x9005, VariantConfig{4});
-    simpler::hbg::retain_config(0x9006, ThresholdConfig{false});
+    ASSERT_TRUE(simpler::hbg::retain_config(0x9004, VariantConfig{3}));
+    ASSERT_TRUE(simpler::hbg::retain_config(0x9005, VariantConfig{4}));
+    ASSERT_TRUE(simpler::hbg::retain_config(0x9006, ThresholdConfig{false}));
 
-    EXPECT_NO_THROW(simpler::hbg::retain_config(0x9004, VariantConfig{3}));
-    EXPECT_NO_THROW(simpler::hbg::retain_config(0x9005, VariantConfig{4}));
-    EXPECT_NO_THROW(simpler::hbg::retain_config(0x9006, ThresholdConfig{false}));
+    EXPECT_TRUE(simpler::hbg::retain_config(0x9004, VariantConfig{3}));
+    EXPECT_TRUE(simpler::hbg::retain_config(0x9005, VariantConfig{4}));
+    EXPECT_TRUE(simpler::hbg::retain_config(0x9006, ThresholdConfig{false}));
     EXPECT_EQ(simpler::hbg::config_registry().size(), 3u);
 }
 
@@ -508,13 +522,13 @@ TEST_F(GraphConfigRegistryTest, DistinctKeysRetainIndependently) {
 TEST_F(GraphConfigRegistryTest, ClearingReleasesEveryKey) {
     constexpr uint64_t KEY = 0x9007;
 
-    simpler::hbg::retain_config(KEY, VariantConfig{3});
-    ASSERT_THROW(simpler::hbg::retain_config(KEY, VariantConfig{4}), AssertionError);
+    ASSERT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
+    ASSERT_FALSE(simpler::hbg::retain_config(KEY, VariantConfig{4}));
 
     simpler::hbg::config_registry().clear();
 
     EXPECT_TRUE(simpler::hbg::config_registry().empty());
-    EXPECT_NO_THROW(simpler::hbg::retain_config(KEY, VariantConfig{4}));
+    EXPECT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{4}));
 }
 
 // Arg's storage stays unreachable only while the base is private. Under a public base an
@@ -526,6 +540,28 @@ static_assert(
         const CoreTaskArgs *,
         const TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType> *>,
     "Arg must not be convertible to its storage base"
+);
+
+// The same rule one level up, and here it guards a correctness invariant rather than an
+// encapsulation one. Every mutator on Arg is non-virtual, so under a public base
+// `Arg &a = core_args; a.reset();` would run Arg's body alone and leave scalar_inherited_
+// holding origins for slots that no longer exist. A slot still naming an origin while
+// holding a value of its own is recorded as following a boundary parameter, so the
+// Definition would take that slot's value from the wrong place.
+static_assert(
+    !std::is_convertible_v<const CoreTaskArgs *, const Arg<MAX_TENSOR_ARGS, MAX_SCALAR_ARGS> *>,
+    "InheritableArg must not be convertible to Arg: a base reference would bypass the origin array"
+);
+static_assert(
+    !std::is_convertible_v<const GraphTaskArgs *, const Arg<GRAPH_MAX_TENSOR_ARGS, GRAPH_MAX_SCALAR_ARGS> *>,
+    "a Graph boundary must not be convertible to Arg either"
+);
+
+// ChipTaskArgs is the deliberate exception: its every slot holds a value of its own, so it
+// has no origin array for a base reference to bypass, and it derives from Arg publicly.
+static_assert(
+    std::is_convertible_v<const ChipTaskArgs *, const Arg<CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS> *>,
+    "ChipTaskArgs is an ordinary Arg"
 );
 
 // The slot array is handed out as void*, so index it the way recording does.

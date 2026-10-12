@@ -18,11 +18,13 @@
 #include <array>
 #include <atomic>
 #include <cstddef>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -176,6 +178,33 @@ bool graph_require_boundary_match(
         return false;
     }
     return true;
+}
+
+// Every Graph key this bind has claimed, published and in-flight alike, as one log field.
+//
+// Sorted, because what the reader is looking for is a run of keys that differ only in their
+// low bits: a Config whose fields are genuinely fixed for the run folds into one key per
+// Graph, so near-identical keys mean a field that varies per submission is being carried as
+// a construction parameter. Unsorted, that pattern is invisible in a hash table's order.
+std::string graph_claimed_keys(const GraphHostState &state) {
+    std::vector<std::pair<uint64_t, const char *>> claimed;
+    claimed.reserve(state.definitions.size() + state.inflight.size());
+    for (const auto &entry : state.definitions)
+        claimed.emplace_back(entry.first, "published");
+    for (const auto &entry : state.inflight)
+        claimed.emplace_back(entry.first, "in-flight");
+    // By key alone: a key that is published and in flight at once would otherwise order its
+    // two entries by comparing unrelated string literals' addresses.
+    std::sort(claimed.begin(), claimed.end(), [](const auto &left, const auto &right) {
+        return left.first < right.first;
+    });
+    std::string out;
+    for (const auto &[key, kind] : claimed) {
+        char one[48];
+        snprintf(one, sizeof(one), "%s0x%llx(%s)", out.empty() ? "" : " ", static_cast<unsigned long long>(key), kind);
+        out += one;
+    }
+    return out;
 }
 
 void graph_reset_outer_payload(TaskPayload &payload) {
@@ -850,10 +879,16 @@ OrchestratorState::graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &ar
     }
 
     if (state->claimed_definitions() >= GRAPH_MAX_DEFINITIONS) {
+        // The claimed keys travel with the count: the limit alone says a budget ran out, and
+        // the list says whether it ran out on distinct Graphs or on one Graph whose Config
+        // is not holding still.
+        const std::string claimed = graph_claimed_keys(*state);
         orch->report_fatal(
             SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED, __FUNCTION__,
-            "[GraphExecution] Definition cache is full (%zu published, %zu in flight, limit %d)",
-            state->definitions.size(), state->inflight.size(), GRAPH_MAX_DEFINITIONS
+            "[GraphExecution] Definition cache is full (%zu published, %zu in flight, limit %d); "
+            "rejected key 0x%llx; claimed: %s",
+            state->definitions.size(), state->inflight.size(), GRAPH_MAX_DEFINITIONS,
+            static_cast<unsigned long long>(full_key), claimed.c_str()
         );
         result.has_error = true;
         return result;

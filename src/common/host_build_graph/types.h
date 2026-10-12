@@ -297,7 +297,10 @@ public:
     // Minimal-permission: an Arg is built in place and consumed by reference;
     // it is never copied/moved (it is a large object, and its TensorRef slots
     // are non-copyable by design).
-    Arg() = default;
+    //
+    // Construction is protected: Arg is the shared implementation of the task-args layer,
+    // never a type a caller names. What a caller builds is one of the aliases below --
+    // CoreTaskArgs, GraphTaskArgs, ChipTaskArgs -- each of which decides what its slots mean.
     Arg(const Arg &) = delete;
     Arg(Arg &&) = delete;
     Arg &operator=(const Arg &) = delete;
@@ -322,18 +325,6 @@ public:
         task_timing_slot_ = slot;
     }
     int32_t task_timing_slot() const { return task_timing_slot_; }
-
-    void clear() {
-        Base::clear();
-#if SIMPLER_DFX
-        dump_arg_selection_.clear();
-#endif
-        explicit_deps_ = nullptr;
-        explicit_dep_count_ = 0;
-        allow_early_resolve_ = false;
-        task_timing_slot_ = TASK_TIMING_SLOT_NONE;
-        predicate_ = CoreTaskPredicate{};
-    }
 
     void reset() {
         clear();
@@ -527,6 +518,27 @@ public:
 #endif
 
 protected:
+    Arg() = default;
+
+    // Empty every field an Arg carries, keeping the error state. Protected rather than
+    // public: a derived Arg may add state that clearing has to reach -- InheritableArg's
+    // origin array does -- and this one is not virtual, so a call through an `Arg &` would
+    // run this body alone and leave that state behind. A slot still naming an origin while
+    // holding a value of its own is recorded as following a boundary parameter, so the
+    // Definition takes its value from the wrong place. `reset()` is the public spelling,
+    // and each derived Arg overrides it to cover its own fields.
+    void clear() {
+        Base::clear();
+#if SIMPLER_DFX
+        dump_arg_selection_.clear();
+#endif
+        explicit_deps_ = nullptr;
+        explicit_dep_count_ = 0;
+        allow_early_resolve_ = false;
+        task_timing_slot_ = TASK_TIMING_SLOT_NONE;
+        predicate_ = CoreTaskPredicate{};
+    }
+
     // Capacity-overflow message — spells the actual limit (MaxS, whatever the
     // instantiation is) into the text via std::to_string. Built once into a
     // function-local static so set_error() can hold the const char* safely.
@@ -724,16 +736,52 @@ private:
  * follow -- so ChipTaskArgs stays on plain Arg and keeps a value read that is always legal.
  */
 template <size_t MaxT, size_t MaxS>
-class InheritableArg : public Arg<MaxT, MaxS> {
+class InheritableArg : private Arg<MaxT, MaxS> {
     using Base = Arg<MaxT, MaxS>;
 
 public:
-    void clear() {
-        Base::clear();
-        // All-null is a correct empty state: every slot reads as its own value, so nothing
-        // below scalar_count_ can be mistaken for one that follows a source.
-        scalar_inherited_.fill(nullptr);
-    }
+    // Arg's own API, re-exported one name at a time, for the reason Arg itself inherits
+    // privately: a public base is reachable by an implicit derived-to-base conversion, and
+    // every mutator here is non-virtual, so `Arg &a = args; a.reset();` would run Arg's body
+    // alone and leave `scalar_inherited_` holding origins for slots that no longer exist. A
+    // slot still naming an origin while holding a value of its own is recorded as following
+    // a boundary parameter, so the Definition takes its value from the wrong place.
+    //
+    // Four names are deliberately absent and defined below instead -- clear, reset,
+    // add_scalar, add_scalars -- because each has to cover the origin array too. Arg::scalar
+    // is absent for a different reason: a slot here may follow a parameter, so the only
+    // read this class offers is the handle.
+    using Base::add_inout;
+    using Base::add_input;
+    using Base::add_no_dep;
+    using Base::add_output;
+    using Base::allow_early_resolve;
+    using Base::error_msg;
+    using Base::explicit_dep;
+    using Base::explicit_dep_count;
+    using Base::explicit_deps_data;
+    using Base::has_error;
+    using Base::pack_scalars;
+    using Base::predicate;
+    using Base::scalar_count;
+    using Base::scalar_dtypes;
+    using Base::scalar_slot_base;
+    using Base::set_allow_early_resolve;
+    using Base::set_dependencies;
+    using Base::set_error;
+    using Base::set_predicate;
+    using Base::set_task_timing_slot;
+    using Base::tag;
+    using Base::tag_data;
+    using Base::task_timing_slot;
+    using Base::tensor;
+    using Base::tensor_count;
+    using Base::tensor_data;
+#if SIMPLER_DFX
+    using Base::dump;
+#endif
+    using Base::dump_arg_index_ambiguous_mask;
+    using Base::dump_arg_mask;
 
     void reset() {
         Base::reset();
@@ -820,12 +868,19 @@ public:
     const void *scalar_origin(int32_t i) const { return scalar_inherited_[i]; }
 
 protected:
-    // Where this parameter's value came from, or null when it is static.
-    //
-    // These addresses are compared and subtracted, never dereferenced -- one may point at
-    // a caller local that has already gone out of scope. That is safe precisely because
-    // the value was copied at add_scalar time.
-    std::array<const void *, MaxS> scalar_inherited_{};
+    // The base's protected functions. Private inheritance would otherwise end the chain
+    // here: Arg's protected members are private in this class, so a class derived from this
+    // one could not reach them at all.
+    using Base::scalar_cap_msg;
+
+    // Covers the origin array the base cannot see. Protected for the same reason the base's
+    // is, and overriding it is what keeps a derived Arg's own clear() correct.
+    void clear() {
+        Base::clear();
+        // All-null is a correct empty state: every slot reads as its own value, so nothing
+        // below scalar_count_ can be mistaken for one that follows a source.
+        scalar_inherited_.fill(nullptr);
+    }
 
 private:
     // Add one slot. What it ends up being is decided by T alone: a handle names a parameter
@@ -853,6 +908,34 @@ private:
             scalar_inherited_[slot] = nullptr;
         }
     }
+
+    // ---- Data members ----------------------------------------------------------------
+    //
+    // Below this line the access specifiers run a second time, for storage rather than for
+    // functions. The base's `launch_spec` is assigned through rather than called, which is
+    // what puts it here and not among the re-exports above.
+
+public:
+    using Base::launch_spec;
+
+protected:
+    // Slot storage, carried through for the same reason as the protected functions above: a
+    // derived Arg writes it directly, GraphTaskArgs::gen_scalar_params_from_args filling a
+    // whole parameter list at once.
+    using Base::scalar_count_;
+    using Base::scalars_;
+    using Base::tags_;
+    using Base::tensor_count_;
+    using Base::tensors_;
+
+    // One more column of those same slots, and this class's own rather than the base's --
+    // which is why it is a declaration where the five above are using-declarations.
+    //
+    // Where each parameter's value came from, or null when the slot holds a value of its
+    // own. These addresses are compared and subtracted, never dereferenced -- one may point
+    // at a caller local that has already gone out of scope. That is safe precisely because
+    // the value was copied at add_scalar time.
+    std::array<const void *, MaxS> scalar_inherited_{};
 };
 
 // =============================================================================

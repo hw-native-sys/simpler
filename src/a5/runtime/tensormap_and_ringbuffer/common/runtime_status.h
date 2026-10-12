@@ -36,8 +36,9 @@
 #define SIMPLER_ERROR_REQUIRE_SYNC_START_INVALID 7
 #define SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT 8
 #define SIMPLER_ERROR_EXPLICIT_ORCH_FATAL 9
-#define SIMPLER_ERROR_SCOPE_TASKS_OVERFLOW 10  // scope_tasks buffer saturated (all rings full)
-#define SIMPLER_ERROR_TENSORMAP_OVERFLOW 11    // tensormap entry pool wedged (last_task_alive not advancing)
+#define SIMPLER_ERROR_SCOPE_TASKS_OVERFLOW 10      // scope_tasks buffer saturated (all rings full)
+#define SIMPLER_ERROR_TENSORMAP_OVERFLOW 11        // tensormap entry pool wedged (last_task_alive not advancing)
+#define SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED 12  // Not raised here; the number stays reserved across runtimes
 
 // Scheduler errors (100+): detected in scheduler threads
 #define SIMPLER_ERROR_SCHEDULER_TIMEOUT 100

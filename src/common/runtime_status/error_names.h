@@ -58,10 +58,8 @@ static inline const char *error_name(int32_t code) {
         return "SCOPE_TASKS_OVERFLOW";
     case SIMPLER_ERROR_TENSORMAP_OVERFLOW:
         return "TENSORMAP_OVERFLOW";
-#ifdef SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED
     case SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED:
         return "SUBMIT_CAPACITY_EXCEEDED";
-#endif
     case SIMPLER_ERROR_SCHEDULER_TIMEOUT:
         return "SCHEDULER_TIMEOUT";
     case SIMPLER_ERROR_ASYNC_COMPLETION_INVALID:
@@ -112,11 +110,9 @@ static inline const char *error_desc(int32_t code) {
                "first and latch SCOPE_DEADLOCK or FLOW_CONTROL_DEADLOCK)";
     case SIMPLER_ERROR_TENSORMAP_OVERFLOW:
         return "the tensormap could not reserve the entries required to register another task's outputs";
-#ifdef SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED
     case SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED:
         return "a submission needed more of a fixed capacity than the run has: task slots, heap "
                "bytes, the compact argument pools, or the Definition cache";
-#endif
     case SIMPLER_ERROR_SCHEDULER_TIMEOUT:
         return "the scheduler saw no forward progress within its timeout; the sub_class= line below "
                "carries the device-classified reason and locators";
@@ -176,12 +172,13 @@ static inline const char *error_hint(int32_t code) {
     case SIMPLER_ERROR_TENSORMAP_OVERFLOW:
         return "follow the preceding resource diagnostic: in HBG increase CHIP_TENSORMAP_POOL_SIZE "
                "or shrink the graph; in a reclaiming runtime also inspect entry-reclaim progress";
-#ifdef SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED
     case SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED:
-        return "read the preceding line for which capacity ran out: raise runtime_env.ring_task_window "
-               "for task slots, GRAPH_MAX_DEFINITIONS for the Definition cache, or shrink the submitted "
-               "boundary or its sub-task outputs";
-#endif
+        return "read the preceding line for which capacity ran out. Task slots are a run-time knob: "
+               "raise runtime_env.ring_task_window. The Definition cache is not -- GRAPH_MAX_DEFINITIONS "
+               "is a compile-time constant (currently 16), so raising it means rebuilding the runtime; "
+               "the preceding line lists the keys already held, and near-identical keys mean a Config "
+               "field is varying when it should be fixed. Otherwise shrink the submitted boundary or its "
+               "sub-task outputs";
     case SIMPLER_ERROR_SCHEDULER_TIMEOUT:
         return "read the sub_class= line below first, then follow the S1-S5 table in the doc; raise "
                "SIMPLER_SCHEDULER_TIMEOUT_MS to tell a true deadlock apart from a merely slow kernel";

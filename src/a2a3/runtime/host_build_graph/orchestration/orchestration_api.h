@@ -546,7 +546,18 @@ rt_submit_graph(uint64_t graph_id, GraphFunction function, const GraphTaskArgs &
         return rejected;
     }
     const uint64_t graph_key = rt_graph_make_key(graph_id, config.hash());
-    simpler::hbg::retain_config(graph_key, config);
+    if (!simpler::hbg::retain_config(graph_key, config)) {
+        rt_report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS,
+            "[GraphExecution] Graph key collision: key 0x%llx was already submitted with a different Config. "
+            "Two Configs hashing alike means the key no longer names one Graph -- check that hash() mixes "
+            "every field operator== compares",
+            static_cast<unsigned long long>(graph_key)
+        );
+        GraphSubmitResult rejected;
+        rejected.has_error = true;
+        return rejected;
+    }
     return rt_submit_graph_impl(graph_key, args, [function](const GraphTaskArgs &record_args) {
         function(record_args);
     });
@@ -587,7 +598,18 @@ static inline GraphSubmitResult rt_submit_graph(
         return rejected;
     }
     const uint64_t graph_key = rt_graph_make_key(graph_id, config.hash());
-    simpler::hbg::retain_config(graph_key, config);
+    if (!simpler::hbg::retain_config(graph_key, config)) {
+        rt_report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS,
+            "[GraphExecution] Graph key collision: key 0x%llx was already submitted with a different Config. "
+            "Two Configs hashing alike means the key no longer names one Graph -- check that hash() mixes "
+            "every field operator== compares",
+            static_cast<unsigned long long>(graph_key)
+        );
+        GraphSubmitResult rejected;
+        rejected.has_error = true;
+        return rejected;
+    }
     // The lambda captures its own copy: the recording job runs on a recorder thread that
     // outlives this call, so it may hold nothing of the caller's frame -- `config` included.
     return rt_submit_graph_impl(graph_key, args, [function, config](const GraphTaskArgs &record_args) {

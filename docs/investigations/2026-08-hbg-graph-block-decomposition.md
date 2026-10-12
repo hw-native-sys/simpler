@@ -97,6 +97,11 @@ no retry, even though the `rt_graph_commit()` on that same branch then waited fo
 the recorder to go idle. So k distinct Definitions submitted back to back got
 roughly every other one recorded.
 
+> Historical. The `execute_block` field and the ordinary-path fallback it selected
+> are both gone: a Graph that cannot be opened now latches a fatal naming the
+> reason, and `GraphScopeResult` carries `has_error` instead. The silent
+> degradation described here is the behaviour that change removed.
+
 That is exactly what block decomposition produces: where the pair form submits
 one key per iteration and never contends, the four-block form submits four
 distinct keys back to back. Measured on `main` at 6f56ce64 + this PR, median of
