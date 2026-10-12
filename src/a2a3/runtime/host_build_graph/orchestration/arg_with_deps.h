@@ -53,8 +53,6 @@ public:
     using CoreTaskArgs::add_output;
     using CoreTaskArgs::add_scalar;
     using CoreTaskArgs::add_scalars;
-    using CoreTaskArgs::add_static_scalar;
-    using CoreTaskArgs::add_static_scalars;
     using CoreTaskArgs::allow_early_resolve;      // speculative early-dispatch hint (getter)
     using CoreTaskArgs::set_allow_early_resolve;  // speculative early-dispatch hint (setter)
     using CoreTaskArgs::set_task_timing_slot;     // selective task-timing slot (setter)

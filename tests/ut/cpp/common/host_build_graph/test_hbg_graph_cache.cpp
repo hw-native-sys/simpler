@@ -547,12 +547,12 @@ uint64_t slot_value(const ArgT &args, int32_t i) {
 // &scalars_[i], and subtracting the base yields i. Were a boundary parameter to name an
 // origin -- a caller local, or a scratch buffer used while deep-copying -- scalar(i)
 // would hand out that address instead, it would fall outside the slot array, and
-// graph_classify_scalars would record the parameter as static. Every dynamic parameter
-// would silently stop being refreshed on replay.
-TEST(GraphScalarProvenance, AStaticParameterIsItsOwnOrigin) {
+// graph_classify_scalars would record the parameter as the body's own value. Every
+// parameter would silently stop being refreshed on replay.
+TEST(GraphScalarProvenance, ABoundaryParameterIsItsOwnOrigin) {
     GraphTaskArgs boundary_args;
     uint64_t scratch = 18;
-    boundary_args.add_static_scalar(scratch);
+    boundary_args.add_scalar(scratch);
     CoreTaskArgs task_args;
 
     task_args.add_scalar(boundary_args.scalar(0));
@@ -562,23 +562,21 @@ TEST(GraphScalarProvenance, AStaticParameterIsItsOwnOrigin) {
     EXPECT_NE(task_args.scalar_origin(0), &scratch);
 }
 
-TEST(GraphScalarProvenance, AnLvalueDeclaresADynamicParameter) {
-    GraphTaskArgs args;
+// What a slot follows is decided by what was passed, not by how it was spelled. An lvalue
+// and a literal both give the slot a value of its own; only a handle makes it follow a
+// parameter.
+TEST(GraphScalarProvenance, ValueCategoryDoesNotDeclareAnything) {
+    CoreTaskArgs args;
     uint32_t token_pos = 17;
 
-    // An lvalue is a parameter the caller holds and may change between invocations; a
-    // literal cannot be changed by anyone. Width does not enter into it -- the value is
-    // converted here, where its type is still known.
     args.add_scalar(token_pos);
     args.add_scalar(uint32_t{18});
-    args.add_static_scalar(token_pos);
 
-    EXPECT_TRUE(args.scalar_dynamic(0));
-    EXPECT_EQ(args.scalar_origin(0), &token_pos);
+    EXPECT_FALSE(args.scalar_dynamic(0)) << "an lvalue is still just a value";
+    EXPECT_EQ(args.scalar_origin(0), nullptr);
+    EXPECT_NE(args.scalar_origin(0), &token_pos);
     EXPECT_FALSE(args.scalar_dynamic(1));
     EXPECT_EQ(args.scalar_origin(1), nullptr);
-    EXPECT_FALSE(args.scalar_dynamic(2)) << "add_static_scalar overrides value category";
-    EXPECT_EQ(args.scalar<uint32_t>(2), 17u);
 }
 
 TEST(GraphScalarProvenance, ForwardedScalarRetainsBoundarySource) {
@@ -607,29 +605,14 @@ TEST(GraphScalarProvenance, ForwardedScalarNamesOriginThroughAnIntermediary) {
     EXPECT_EQ(task_args.scalar_origin(0), slot_addr(boundary_args.scalar_slot_base(), 1));
 }
 
-TEST(GraphScalarProvenance, FreezingAParameterNeedsAnExplicitRead) {
-    GraphTaskArgs boundary_args;
-    boundary_args.add_scalar(uint32_t{17}, uint32_t{18});
-    CoreTaskArgs task_args;
-
-    // A handle cannot be declared static -- it names a parameter. Reading the slot as a
-    // value takes the number, and this is how an enclosing Graph's parameter is
-    // deliberately frozen rather than followed.
-    task_args.add_static_scalar(boundary_args.scalar<uint64_t>(1));
-
-    EXPECT_FALSE(task_args.scalar_dynamic(0));
-    EXPECT_EQ(task_args.scalar_origin(0), nullptr);
-    EXPECT_EQ(task_args.scalar<uint64_t>(0), uint64_t{18});
-}
-
 TEST(GraphScalarProvenance, ValueScalarHoldsItsOwnValue) {
     CoreTaskArgs task_args;
     task_args.add_scalar(uint32_t{17}, 2.5F);
 
     EXPECT_FALSE(task_args.scalar_dynamic(0));
     EXPECT_FALSE(task_args.scalar_dynamic(1));
-    EXPECT_EQ(task_args.scalar<uint64_t>(0), uint64_t{17});
-    EXPECT_EQ(task_args.scalar<float>(1), 2.5F);
+    EXPECT_EQ(slot_value(task_args, 0), uint64_t{17});
+    EXPECT_EQ(from_u64<float>(slot_value(task_args, 1)), 2.5F);
 }
 
 TEST(GraphScalarProvenance, ZeroInitialisedSlotsReadAsStaticZero) {
@@ -661,6 +644,9 @@ TEST(GraphScalarProvenance, PackCopiesEveryValue) {
     EXPECT_EQ(packed[2], uint64_t{9});
 }
 
+// A value is copied at add_scalar time, so the variable it came from need not outlive the
+// Arg. Nothing records that variable's address either: only a handle gives a slot an origin,
+// and a handle's origin is a boundary slot rather than a caller local.
 TEST(GraphScalarProvenance, AValueOutlivesItsOrigin) {
     CoreTaskArgs task_args;
     {
@@ -668,9 +654,8 @@ TEST(GraphScalarProvenance, AValueOutlivesItsOrigin) {
         task_args.add_scalar(transient);
     }
 
-    // The origin now dangles, and that is by design: the value was copied at add_scalar
-    // time, and the address is only ever compared, never read through.
-    EXPECT_TRUE(task_args.scalar_dynamic(0));
+    EXPECT_FALSE(task_args.scalar_dynamic(0));
+    EXPECT_EQ(task_args.scalar_origin(0), nullptr);
     EXPECT_EQ(slot_value(task_args, 0), uint64_t{42});
 }
 
@@ -704,34 +689,33 @@ TEST(GraphScalarProvenance, InheritingAValueSlotNamesThatSlot) {
     EXPECT_EQ(slot_value(b, 0), uint64_t{7});
 }
 
-// The read the defect went through. A body receives the boundary's parameter list, and a
-// number taken out of a dynamic parameter becomes ordinary host data: whatever the body
-// computes from it is fixed in the Definition, and every later invocation replays that
-// number instead of the one it passed. There is no fallback -- the ordinary path runs the
-// same body and reaches the same read -- so the read is refused rather than warned about.
+// What the boundary is after gen_scalar_params_from_args: every parameter names itself,
+// whatever the caller's own slot held. That is what keeps this list the basis recording
+// resolves against -- a task slot following parameter i reports this array's i-th slot, and
+// subtracting the base yields i.
 //
-// What a dynamic parameter is actually refreshed with on replay is
-// GraphExecutionReplay.ResubmissionRebuildsFromDefinition below: a second invocation's
-// task reads that invocation's own value, not the recorded one.
-TEST(GraphScalarProvenance, AValueReadOfADynamicParameterIsRefused) {
+// Unconditional because a boundary parameter is refreshed per invocation, with no second
+// kind to tell apart: a Graph's fixed values live in its Config. What a parameter is
+// actually refreshed with on replay is GraphExecutionReplay.ResubmissionRebuildsFromDefinition
+// below -- a second invocation's task reads that invocation's own value, not the recorded one.
+TEST(GraphScalarProvenance, EveryBoundaryParameterNamesItself) {
     uint64_t caller_held = 4;
     GraphTaskArgs caller_args;
     caller_args.add_scalar(caller_held);
-    caller_args.add_static_scalar(uint64_t{9});
+    caller_args.add_scalar(uint64_t{9});
 
-    // The parameter list the body reads, not the caller's arguments: a dynamic parameter
-    // names itself only after this, and that is the object the recorded body resolves
-    // against.
     GraphTaskArgs params;
     params.gen_scalar_params_from_args(caller_args);
 
-    EXPECT_THROW(params.scalar<uint64_t>(0), AssertionError);
-    // Its static sibling in the same list reads, so what the refusal turns on is the
-    // declaration rather than the read.
-    EXPECT_EQ(params.scalar<uint64_t>(1), uint64_t{9});
-    // Forwarding is what the parameter is for, and it is what stays available.
     EXPECT_TRUE(params.scalar_dynamic(0));
+    EXPECT_TRUE(params.scalar_dynamic(1));
     EXPECT_EQ(params.scalar(0).origin(), params.scalar_slot_base());
+    EXPECT_EQ(params.scalar(1).origin(), slot_addr(params.scalar_slot_base(), 1));
+    // Neither names where the caller's value came from, which would fall outside this array.
+    EXPECT_NE(params.scalar(0).origin(), &caller_held);
+    // The values carry across unchanged.
+    EXPECT_EQ(slot_value(params, 0), uint64_t{4});
+    EXPECT_EQ(slot_value(params, 1), uint64_t{9});
 }
 
 TEST(GraphExecutionStorage, ComputesAlignedExactSize) {
