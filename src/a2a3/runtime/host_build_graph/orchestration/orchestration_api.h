@@ -539,8 +539,13 @@ template <typename ConfigT>
 static inline GraphSubmitResult
 rt_submit_graph(uint64_t graph_id, GraphFunction function, const GraphTaskArgs &args, const ConfigT &config) {
     simpler::hbg::assert_config<ConfigT>();
-    debug_assert(function != nullptr && "Graph function must not be null");
     if (function == nullptr) {
+        // Reported rather than asserted: debug_assert is a no-op in release, where a null
+        // body would otherwise drop the Graph silently and let the orchestration carry on.
+        rt_report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, "%s",
+            "[GraphExecution] a Graph was submitted with a null body, which names nothing to record"
+        );
         GraphSubmitResult rejected;
         rejected.has_error = true;
         return rejected;
@@ -591,8 +596,13 @@ static inline GraphSubmitResult rt_submit_graph(
     uint64_t graph_id, GraphFunctionWithConfig<ConfigT> function, const GraphTaskArgs &args, const ConfigT &config
 ) {
     simpler::hbg::assert_config<ConfigT>();
-    debug_assert(function != nullptr && "Graph function must not be null");
     if (function == nullptr) {
+        // Reported rather than asserted: debug_assert is a no-op in release, where a null
+        // body would otherwise drop the Graph silently and let the orchestration carry on.
+        rt_report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, "%s",
+            "[GraphExecution] a Graph was submitted with a null body, which names nothing to record"
+        );
         GraphSubmitResult rejected;
         rejected.has_error = true;
         return rejected;

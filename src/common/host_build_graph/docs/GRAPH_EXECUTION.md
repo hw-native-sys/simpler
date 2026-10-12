@@ -805,7 +805,7 @@ slower path:
   more than `INT32_MAX` heap bytes;
 - a submission against a key whose recording failed.
 
-The first eight latch `SIMPLER_ERROR_INVALID_ARGS`, the next three
+The first seven latch `SIMPLER_ERROR_INVALID_ARGS`, the next three
 `SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED`, and the last
 `SIMPLER_ERROR_EXPLICIT_ORCH_FATAL` — the recording thread latched its own
 failure where it happened, and this line connects it to the submission it takes

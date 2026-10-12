@@ -227,12 +227,20 @@ bool graph_submit_outer(
 ) {
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit Graph outside a scope");
     auto &allocator = orch->task_allocator;
-    if (allocator.active_count() >= allocator.capacity() ||
-        (!defer_heap && static_cast<uint64_t>(owned_heap) > allocator.heap_available())) {
+    // Reported apart, because they are different knobs and a deferred shell can only fail the
+    // first: its heap is reserved at commit, so owned_heap is zero here and a combined line
+    // would print `heap=0/<available>` for what is purely a task-window shortfall.
+    if (allocator.active_count() >= allocator.capacity()) {
         orch->report_fatal(
             SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED, __FUNCTION__,
-            "[GraphExecution] task-capacity/heap preflight failed: tasks=%d/%d heap=%llu/%llu",
-            allocator.active_count(), allocator.capacity(), static_cast<unsigned long long>(owned_heap),
+            "[GraphExecution] task-window preflight failed: tasks=%d/%d", allocator.active_count(), allocator.capacity()
+        );
+        return false;
+    }
+    if (!defer_heap && static_cast<uint64_t>(owned_heap) > allocator.heap_available()) {
+        orch->report_fatal(
+            SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED, __FUNCTION__,
+            "[GraphExecution] heap preflight failed: heap=%llu/%llu", static_cast<unsigned long long>(owned_heap),
             static_cast<unsigned long long>(allocator.heap_available())
         );
         return false;
