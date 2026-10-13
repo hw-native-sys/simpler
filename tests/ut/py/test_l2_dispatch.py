@@ -251,3 +251,69 @@ def test_l2_dispatch_stays_serial_under_pdb_without_an_explicit_worker_count(mon
     assert cf._dispatch_test_phases(session, []) is True
     assert "-n" not in commands[0]
     assert "--dist" not in commands[0]
+
+
+class _Marker:
+    def __init__(self, name, *args):
+        self.name = name
+        self.args = args
+
+
+class _Item:
+    """A collected item carrying only what the phase collectors read."""
+
+    def __init__(self, nodeid, *, markers=(), cls=None):
+        self.nodeid = nodeid
+        self.name = nodeid.rsplit("::", 1)[-1]
+        self.cls = cls
+        self.function = None
+        self._markers = {m.name: m for m in markers}
+
+    def iter_markers(self):
+        return iter(self._markers.values())
+
+    def get_closest_marker(self, name):
+        return self._markers.get(name)
+
+
+def test_a_standalone_resource_function_needs_no_runtime_marker():
+    cf = _load_root_conftest()
+    items = [_Item("t.py::test_two_rank", markers=[_Marker("device_count", 2)])]
+
+    jobs = cf._collect_resource_jobs(items, "a2a3")
+
+    assert [(j.kind, j.nodeid, j.runtime, j.device_count) for j in jobs] == [
+        ("standalone", "t.py::test_two_rank", None, 2)
+    ]
+
+
+def test_a_runtime_less_resource_child_is_narrowed_by_nodeid_alone():
+    # --runtime is both the child's filter and the signal that puts it in child
+    # mode; a runtime-agnostic job has no value to pass, so it must not appear.
+    cf = _load_root_conftest()
+    spec = cf._ResourceJob(
+        kind="standalone", nodeid="t.py::test_two_rank", label="test_two_rank", runtime=None, device_count=2
+    )
+    config = _Config(xdist_active=False, xdist_blocked=False)
+
+    command = cf._resource_child_command(spec, [4, 5], "a2a3", "exclude", config)
+
+    assert "--runtime" not in command
+    assert "t.py::test_two_rank" in command
+
+
+def test_an_item_no_phase_runs_is_reported_as_unclaimed():
+    # The Resource phase selects by marker and L2 by SceneTestCase runtime, so
+    # a plain function belongs to neither and would otherwise be dropped.
+    cf = _load_root_conftest()
+    resource = _Item("t.py::test_two_rank", markers=[_Marker("device_count", 2)])
+    l2 = _Item(
+        "s.py::TestScene::test_run",
+        cls=SimpleNamespace(_st_runtime="host_build_graph", _st_level=2, CASES=[]),
+    )
+    plain = _Item("u.py::test_plain")
+    jobs = cf._collect_resource_jobs([resource], "a2a3")
+
+    unclaimed = cf._collect_unclaimed_items([resource, l2, plain], jobs, ["host_build_graph"])
+
+    assert [item.nodeid for item in unclaimed] == ["u.py::test_plain"]

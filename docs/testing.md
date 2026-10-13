@@ -302,20 +302,31 @@ Layer 1  Level axis
 │   against the --device pool. Two job kinds share this phase:
 │     - L3 SceneTestCase classes (one job per class)
 │     - Standalone pytest functions marked with @pytest.mark.device_count
-│       + @pytest.mark.runtime (one job per function)
+│       (one job per function). @pytest.mark.runtime is optional: a
+│       runtime-agnostic function gets the same devices and the same
+│       isolation, and its child is narrowed by nodeid alone.
 │   CANN isolation is automatic (each job is its own process). Cross-runtime
 │   jobs can overlap when their devices don't.
 │
-└─ L2 phase (runs after Resource drains)
-    │
-    ├─ Layer 2  Runtime — serial subprocess per runtime (CANN isolation)
-    │   └─ Layer 3  Device — parallel subprocess per device (xdist for pytest,
-    │               custom fanout for standalone). Capacity bounded by --device size
-    │       └─ Layer 4  Class — one ChipWorker per (runtime, device), reused
-    │                   across every class assigned to that device
-    │           └─ Layer 5  Case — serial within a class
-    │               └─ Layer 6  Rounds — `--rounds N` loop, reuses Worker;
-    │                           L2 child memory is declared per tensor, independent of N
+├─ L2 phase (runs after Resource drains)
+│   │
+│   ├─ Layer 2  Runtime — serial subprocess per runtime (CANN isolation)
+│   │   └─ Layer 3  Device — parallel subprocess per device (xdist for pytest,
+│   │               custom fanout for standalone). Capacity bounded by --device size
+│   │       └─ Layer 4  Class — one ChipWorker per (runtime, device), reused
+│   │                   across every class assigned to that device
+│   │           └─ Layer 5  Case — serial within a class
+│   │               └─ Layer 6  Rounds — `--rounds N` loop, reuses Worker;
+│   │                           L2 child memory is declared per tensor, independent of N
+│
+└─ Leftover phase (runs last, in the dispatching process)
+    Every selected item the first two phases do not claim — a plain
+    `requires_hardware` function, say, which matches neither a device_count
+    marker nor a SceneTestCase runtime. Running them here is what keeps
+    "selected" and "run" the same set: an item no phase claims used to be
+    reported in neither the passed nor the skipped count. A test that needs
+    a process of its own declares `@pytest.mark.device_count` and becomes a
+    Resource job instead.
 ```
 
 ### Quick examples
@@ -893,7 +904,7 @@ When running `pytest --platform a2a3 --device 8-11`, the dispatcher does this:
 
 ### Resource phase — device bin-packing
 
-For every collected resource job (L3 ``SceneTestCase`` classes and standalone pytest functions marked with ``@pytest.mark.device_count`` + ``@pytest.mark.runtime``), the scheduler (`simpler_setup/parallel_scheduler.py`) maintains a free-device set starting at `[8, 9, 10, 11]`. It pops the next queued job and, if the free set can cover its `device_count`, grabs that many ids and spawns:
+For every collected resource job (L3 ``SceneTestCase`` classes and standalone pytest functions marked with ``@pytest.mark.device_count``), the scheduler (`simpler_setup/parallel_scheduler.py`) maintains a free-device set starting at `[8, 9, 10, 11]`. It pops the next queued job and, if the free set can cover its `device_count`, grabs that many ids and spawns:
 
 ```text
 # L3 class job

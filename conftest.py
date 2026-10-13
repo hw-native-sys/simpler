@@ -774,7 +774,10 @@ class _ResourceJob(typing.NamedTuple):
     kind: str  # "l3" or "standalone"
     nodeid: str
     label: str  # class name for "l3", function name for "standalone"
-    runtime: str
+    # ``None`` for a standalone function that declares no runtime: it is
+    # runtime-agnostic, so its child is narrowed by nodeid alone and carries no
+    # ``--runtime``.
+    runtime: str | None
     device_count: int
 
 
@@ -837,7 +840,9 @@ def _collect_resource_jobs(items, platform, manual_mode="exclude"):
             )
     jobs.extend(l3_by_nodeid.values())
 
-    # Standalone pytest functions with device_count + runtime markers.
+    # Standalone pytest functions with a device_count marker. ``runtime`` is
+    # optional: a test that names no runtime needs the same dedicated devices
+    # and the same subprocess isolation as one that does.
     standalone_by_nodeid: dict[str, _ResourceJob] = {}
     for item in items:
         if any(m.name == "skip" for m in item.iter_markers()):
@@ -848,8 +853,7 @@ def _collect_resource_jobs(items, platform, manual_mode="exclude"):
         if dev_marker is None:
             continue
         rt_marker = item.get_closest_marker("runtime")
-        if rt_marker is None or not rt_marker.args:
-            continue
+        runtime = rt_marker.args[0] if rt_marker is not None and rt_marker.args else None
         platforms_marker = item.get_closest_marker("platforms")
         if platforms_marker and platform and platform not in platforms_marker.args[0]:
             continue
@@ -858,12 +862,38 @@ def _collect_resource_jobs(items, platform, manual_mode="exclude"):
             kind="standalone",
             nodeid=item.nodeid,
             label=item.name,
-            runtime=rt_marker.args[0],
+            runtime=runtime,
             device_count=dev_count,
         )
     jobs.extend(standalone_by_nodeid.values())
 
     return jobs
+
+
+def _collect_unclaimed_items(items, resource_specs, l2_runtimes):
+    """Return the selected items neither the Resource nor the L2 phase runs.
+
+    The two phases select by marker and by SceneTestCase runtime, so their
+    union is not all of ``items``. The difference is what the dispatcher would
+    otherwise drop: collected and selected, reported in neither the "passed"
+    nor the "skipped" count, and therefore invisible.
+    """
+    claimed = {spec.nodeid for spec in resource_specs}
+    runtimes = set(l2_runtimes)
+    unclaimed = []
+    for item in items:
+        cls = getattr(item, "cls", None)
+        if (
+            cls is not None
+            and getattr(cls, "_st_runtime", None) in runtimes
+            and _item_scene_level(item) == SceneTestLevel.CHIP
+        ):
+            # An L2 SceneTestCase its runtime's subprocess re-collects.
+            continue
+        if item.nodeid in claimed:
+            continue
+        unclaimed.append(item)
+    return unclaimed
 
 
 def _strip_value_options(args, options):
@@ -927,11 +957,11 @@ def _resource_child_command(spec, device_ids, platform, manual_mode, cfg):
         "-m",
         "pytest",
         spec.nodeid,
-        "--runtime",
-        spec.runtime,
         "--device",
         _ps.format_device_range(device_ids),
     ]
+    if spec.runtime is not None:
+        command.extend(["--runtime", spec.runtime])
     if spec.kind == "l3":
         command.extend(["--level", "3"])
     if platform:
@@ -1307,6 +1337,25 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
             if fail_fast:
                 break
 
+    # ----- Phase 3: everything the first two phases do not claim -----
+    # Neither phase runs an item by walking ``session.items``: Resource matches
+    # a device_count marker, L2 matches a SceneTestCase runtime. An item that
+    # is neither — a plain ``requires_hardware`` function, say — belongs to no
+    # phase, and running it here is what keeps "selected" and "run" the same
+    # set. This process has only forked subprocesses up to this point, so it is
+    # the clean one; anything needing its own is a Resource job by marker.
+    leftover = _collect_unclaimed_items(session.items, resource_specs, l2_runtimes)
+    leftover_failed = False
+    if leftover and not ((resource_failed or l2_failed) and fail_fast):
+        print(f"\nLeftover phase: {len(leftover)} item(s) in this process", flush=True)
+        before = session.testsfailed
+        for index, item in enumerate(leftover):
+            nextitem = leftover[index + 1] if index + 1 < len(leftover) else None
+            item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+            if session.shouldfail or session.shouldstop:
+                break
+        leftover_failed = session.testsfailed > before
+
     if resource_failed:
         _emit_resource_failure_summary(
             resource_results,
@@ -1314,8 +1363,9 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
             heading="Resource phase failed recap",
         )
 
-    session.testsfailed = 1 if (resource_failed or l2_failed) else 0
-    if not (resource_failed or l2_failed):
+    failed = resource_failed or l2_failed or leftover_failed
+    session.testsfailed = 1 if failed else 0
+    if not failed:
         session.testscollected = sum(1 for _ in session.items)
     return True  # returning True prevents default runtestloop
 
@@ -1358,6 +1408,19 @@ def pytest_runtestloop(session):
     runtimes_all = _collect_st_runtimes(session.items)
     resource_specs = _collect_resource_jobs(session.items, platform, manual_mode)
     if not resource_specs and len(runtimes_all) <= 1 and not level_filter_explicit:
+        return
+
+    # A runtime-less standalone resource child carries no ``--runtime`` to
+    # recognise it by, so the one invocation shape it produces — that job's own
+    # nodeid and nothing else — is child mode here. Dispatching it would hand
+    # the same single job to a subprocess that lands back on this line.
+    if (
+        len(resource_specs) == 1
+        and resource_specs[0].kind == "standalone"
+        and resource_specs[0].runtime is None
+        and len(session.items) == 1
+        and not runtimes_all
+    ):
         return
 
     return _dispatch_test_phases(session, resource_specs)

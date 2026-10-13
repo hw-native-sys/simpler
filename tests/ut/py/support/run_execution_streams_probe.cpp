@@ -118,8 +118,34 @@ static void check_execution_streams() {
     assert(publication_stream == bound.aicpu);
     assert(streams_created == 0 ? bound.aicore == &stream_tokens[7] : bound.aicore == &stream_tokens[1]);
 
-    // A later change to the runner's owner fields cannot redirect this run's
-    // event records or its unfenced completion/error fallback.
+    // Replace whatever this arch submits on, by the production route that
+    // replaces it: A2/A3 destroys and recreates the retained pair's AICore
+    // stream on the next launch after a code publication marks it stale, so
+    // the handle the runner would reach for stops being this run's. The run
+    // that bound it never submitted, so nothing owns the pair.
+    const size_t created_before = streams_created;
+    runner.mark_run_streams_stale();
+    SlotPersistentArgs successor_slot;
+    auto successor = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
+    assert(successor->kernel_args.prepare_runtime_args(runtime, allocator, successor_slot) == 0);
+    auto successor_outcome = runner.launch_execution(std::move(successor), NativeRunExecutionTestPeer::mint(id));
+    assert(successor_outcome.rc == -777);
+    assert(successor_outcome.prepared != nullptr);
+    const auto successor_bound = successor_outcome.prepared->streams;
+    assert(successor_bound.ready());
+    // A5 submits every run on the runner's bootstrap pair, so there is nothing
+    // to replace and the successor binds the same handles.
+    assert(
+        streams_created > created_before ? successor_bound.aicore != bound.aicore :
+                                           successor_bound.aicore == bound.aicore
+    );
+    successor_outcome.prepared->kernel_args.release_run_view();
+    successor_outcome.prepared.reset();
+    assert(release_slot_persistent_args(successor_slot, allocator) == 0);
+
+    // Neither a replaced pair nor a later change to the runner's owner fields
+    // can redirect this run's event records or its unfenced completion/error
+    // fallback: both still name the handles bound at its own launch.
     runner.set_owner_streams(&stream_tokens[4], &stream_tokens[5]);
     event_error = 0;
     DeviceRunnerBase::PreparedExecution moved(std::move(*outcome.prepared));

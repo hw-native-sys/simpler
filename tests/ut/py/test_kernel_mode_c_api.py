@@ -322,12 +322,13 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
             accepts.argtypes = [ctypes.c_void_p]
             accepts.restype = ctypes.c_bool
             assert accepts(ctx)
-            # Inject the drain result, not a real device fault or device reset.
-            # The real recovery method sets device_unusable_ and real finalize
-            # must then take the fatal-device branch.
+            # Arm the interceptor to prove the absence: a borrowed context
+            # recovers by poisoning itself, so it drains no device it does not
+            # own. The real recovery method sets device_unusable_ and real
+            # finalize must then take the fatal-device branch.
             faults.arm_fatal_drain()
             recover(ctx, 507018)
-            assert faults.fatal_drain_count() == 1
+            assert faults.fatal_drain_count() == 0
             assert not accepts(ctx)
             assert force_reset(ctx) == PTO_RUNTIME_ERR_INVALID_STATE
             # A borrowed device gets no reset, and no reset means no confirmed
