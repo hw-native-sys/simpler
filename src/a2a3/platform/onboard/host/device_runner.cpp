@@ -490,12 +490,11 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     const PreparedExecution &prepared = *active.prepared;
     // The pair still gates the query: it owns the try-lock against a concurrent
     // retirement, the per-owner submitter check, and that run's sticky terminal
-    // result. What it no longer decides is completion — the handles it hands
-    // over are only the evidence the no-boundary fallback inside
-    // poll_run_fence needs. The owner is named because a second run may have
-    // submitted on the same pair, and its result is not this run's.
-    return run_streams_.poll(&prepared, [this, &prepared](void *aicpu, void *aicore) {
-        return poll_run_fence(prepared, static_cast<rtStream_t>(aicpu), static_cast<rtStream_t>(aicore));
+    // result. Completion uses the run's bound handles, including the no-boundary
+    // fallback inside poll_run_fence. A second run may have submitted on the
+    // same pair; the named owner's result belongs only to this run.
+    return run_streams_.poll(&prepared, [this, &prepared](void *, void *) {
+        return poll_run_fence(prepared);
     });
 }
 
@@ -523,10 +522,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // is discharged here — before anything this run owns is released, and while
     // a fallible call can still report. Nothing waits on a successor's kernels:
     // a cross-run wait is proved by the event recorded immediately behind it.
-    rc = discharge_boundary_waits(
-        prepared, /*boundaries_complete=*/true, static_cast<rtStream_t>(run_streams_.aicpu()),
-        static_cast<rtStream_t>(run_streams_.aicore())
-    );
+    rc = discharge_boundary_waits(prepared, /*boundaries_complete=*/true);
     if (rc != 0) return DrainOutcome::device_error(rc);
 
     // A proven-complete stream is reusable until a code publication marks it
@@ -550,8 +546,9 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_ai
     if (!prepared.resources_owned) return;
 
     // A poisoned card cannot retire per-resource frees or stream destroys, and
-    // issuing them can block in the driver. Drop host-side ownership instead;
-    // finalize()'s force reset invalidates the whole device generation.
+    // issuing them can block in the driver. Drop host-side ownership instead.
+    // An owned device is force-reset at finalize; a borrowed device's recovery
+    // belongs to the caller.
     const bool abandon = device_unusable_.load(std::memory_order_acquire);
 
     // Before anything is released, on the paths that did not reach the drain's
@@ -559,13 +556,9 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_ai
     // boundaries must not outlive the events it names. No proof is available
     // here — this run's completion was never established — so the ladder falls
     // through to the synchronize and, failing that, poisons. On the abandon
-    // branch the reset already invalidated every such reference, and the device
-    // must not be touched at all.
+    // branch completion is unproven and no per-resource device calls are issued.
     if (!abandon) {
-        discharge_boundary_waits_noexcept(
-            prepared, /*boundaries_complete=*/false, static_cast<rtStream_t>(run_streams_.aicpu()),
-            static_cast<rtStream_t>(run_streams_.aicore())
-        );
+        discharge_boundary_waits_noexcept(prepared, /*boundaries_complete=*/false);
     }
     clear_whole_operator_boundary(prepared);
 
@@ -735,7 +728,8 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
     if (ensure_run_streams() != 0) {
         return LaunchTransactionResult{};
     }
-    RunStreamSet streams{static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())};
+    prepared.streams = {static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())};
+    const auto &streams = prepared.streams;
     // The one descriptor H2D for this run, ahead of activate_launch_shape, DFX
     // arming and every kernel or event this run submits. It is here rather than
     // at prepare because the route its entry values take is a question about
@@ -840,7 +834,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             sink.mark_submitted();
             // Nothing else enters this stream between the kernel and its
             // boundary, so the boundary completes exactly when the kernel exits.
-            return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore, streams.aicore);
+            return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore);
         },
         [&](LaunchProgressSink &sink) -> int {
             int aicpu_launch_n =
@@ -879,7 +873,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 // here does the stream position carry that meaning.
                 (void)mark_run_boundary(RunBoundaryMarks::Position::WholeOperatorEnd, prepared.identity, streams.aicpu);
             }
-            int boundary_rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu, streams.aicpu);
+            int boundary_rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
             if (boundary_rc == 0 && whole_operator) note_whole_operator_boundary(prepared);
             return boundary_rc;
         }
@@ -931,15 +925,13 @@ int DeviceRunner::queue_cross_run_wait(
 }
 
 int DeviceRunner::reap_run(const PreparedExecution &prepared, int *diagnostics_rc) {
-    if (!run_streams_.ready()) {
-        LOG_ERROR("reap_run: the run stream pair is not ready");
+    if (!prepared.streams.ready()) {
+        LOG_ERROR("reap_run: this run has no stream binding");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     const DfxRunConfig &dfx = prepared.dfx;
     const uint32_t pipeline_slot = prepared.pipeline_slot;
-    int rc = wait_run_fence(
-        prepared, static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())
-    );
+    int rc = wait_run_fence(prepared);
     if (rc != 0) {
         // The fence wait surfaces the AICore op-timeout (STARS-reaped op ->
         // 507000/507018/507046 at the boundary or, on the no-fence fallback, at
@@ -1038,6 +1030,15 @@ void DeviceRunner::emit_device_dep_gen_graph(
 // `DeviceRunnerBase`.
 
 void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
+    // A borrowed context cannot drain or reset the caller's entire device.
+    // Poison stops this runner's admission; recovery belongs to the caller.
+    if (execution_mode_latch_.is_kernel()) {
+        kernel_exec_state_.poison(aicore_rc);
+        device_unusable_.store(true, std::memory_order_release);
+        LOG_ERROR("Execution error %d: borrowed device context marked unusable", aicore_rc);
+        return;
+    }
+
     // An AICore launch failure (207001) or an op-timeout reaped by STARS
     // (surfaced as 507000/507018/507046 at stream sync) leaves the device
     // context in a sticky-error state: the streams stay poisoned and the
@@ -1858,12 +1859,6 @@ int DeviceRunner::finalize_collectors(bool abandon_device_resources) {
 // =============================================================================
 // Group Z — #2267's late-read retention fixture (see run_retention_probe.h)
 // =============================================================================
-
-void RunRetentionProbePeer::run_streams(DeviceRunnerBase &runner, rtStream_t *aicpu, rtStream_t *aicore) {
-    auto &self = static_cast<DeviceRunner &>(runner);
-    *aicpu = static_cast<rtStream_t>(self.run_streams_.aicpu());
-    *aicore = static_cast<rtStream_t>(self.run_streams_.aicore());
-}
 
 int RunRetentionProbePeer::retire_predecessor_ownership(DeviceRunnerBase &runner, PreparedExecution &prepared) {
     auto &self = static_cast<DeviceRunner &>(runner);

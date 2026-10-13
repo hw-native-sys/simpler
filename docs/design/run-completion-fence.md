@@ -21,6 +21,21 @@ whole pipeline drained.
 
 So a run gets a boundary of its own.
 
+## Stream binding
+
+`PreparedExecution::streams` records the actual AICPU/AICore handles at launch,
+under the execution claim and before Runtime publication. Publication, kernel
+submission, boundary records, completion fallbacks and queued-wait discharge use
+that binding. The handles borrow their lifetime from the existing owner: A2/A3's
+`RunStreamPair` retains submitted run owners through retirement; A5 retains its
+bootstrap streams until runner teardown. Preparing a successor does not select
+or replace a stream.
+
+On an execution failure, an owned Program context keeps its bounded device drain
+and reset policy. A borrowed kernel context is poisoned without a device-wide
+drain or reset; the caller owns device recovery. Public kernel launch remains
+unsupported; the stream binding alone does not establish caller-stream ordering.
+
 ## The boundary
 
 Each stream records an event immediately after its own kernel:

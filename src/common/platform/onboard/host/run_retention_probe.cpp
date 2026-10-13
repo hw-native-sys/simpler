@@ -190,11 +190,9 @@ int run_retention_probe(
     // against the same sequence, is what turns the Pending reading below into
     // evidence.
     if (config.use_retained_sync != 0) {
-        rtStream_t aicpu = nullptr;
-        rtStream_t aicore = nullptr;
-        RunRetentionProbePeer::run_streams(runner, &aicpu, &aicore);
         const Clock::time_point sync_start = Clock::now();
-        report->retained_sync_rc = RunRetentionProbePeer::sync_streams(runner, aicpu, aicore);
+        report->retained_sync_rc =
+            RunRetentionProbePeer::sync_streams(runner, prepared.streams.aicpu, prepared.streams.aicore);
         report->reference_sync_ns = elapsed_ns(sync_start);
         if (report->retained_sync_rc != 0) {
             // A synchronize that failed proves nothing about waiting, so the

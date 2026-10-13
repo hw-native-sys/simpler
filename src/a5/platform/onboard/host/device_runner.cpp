@@ -518,14 +518,17 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
         return outcome;
     }
 
+    prepared->streams = {stream_aicpu_, stream_aicore_};
+    const auto &streams = prepared->streams;
+
     // The one descriptor H2D for this run, ahead of activate_launch_shape, DFX
     // arming and every kernel or event this run submits. It is here rather than
     // at prepare because the route its entry values take is a question about
-    // `stream_aicpu_` — the same handle the AICPU launch below submits on, held
+    // `streams.aicpu` — the same handle the AICPU launch below submits on, held
     // under this run's execution claim. A failure carries its own error out
     // with the run NotStarted, so nothing was submitted and the run stays
     // rollback-able.
-    if (const int publish_rc = publish_for_launch(prepared->kernel_args, stream_aicpu_); publish_rc != 0) {
+    if (const int publish_rc = publish_for_launch(prepared->kernel_args, streams.aicpu); publish_rc != 0) {
         outcome.rc = publish_rc;
         outcome.progress = LaunchProgress::NotStarted;
         outcome.prepared = std::move(prepared);
@@ -618,7 +621,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             // that stream's FIFO already places this run's payload behind the
             // predecessor's whole-operator boundary record.
             if (prepared->join.predecessor_owner != nullptr) {
-                const int join_rc = queue_cross_run_wait(*prepared, stream_aicore_, sink);
+                const int join_rc = queue_cross_run_wait(*prepared, streams.aicore, sink);
                 if (join_rc != 0) return join_rc;
             }
 
@@ -626,11 +629,11 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             // released to begin this run's AICore work. A record is not a wait and no stream
             // waits on it, so a successor's marker cannot stand in for the production wait
             // above. A failed record does not fail the run; it makes the position unavailable.
-            (void)mark_run_boundary(RunBoundaryMarks::Position::AicoreStart, prepared->identity, stream_aicore_);
+            (void)mark_run_boundary(RunBoundaryMarks::Position::AicoreStart, prepared->identity, streams.aicore);
 
             LOG_INFO("=== launch_aicore_kernel ===");
             (void)run_progress_.publish(prepared->identity, RunProgressState::Submitted);
-            int launch_rc = launch_aicore_kernel(stream_aicore_, prepared->kernel_args.args);
+            int launch_rc = launch_aicore_kernel(streams.aicore, prepared->kernel_args.args);
             if (launch_rc != 0) {
                 LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
                 recover_device_or_mark_unusable(launch_rc);
@@ -639,7 +642,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             sink.mark_submitted();
             // Nothing else enters this stream between the kernel and its
             // boundary, so the boundary completes exactly when the kernel exits.
-            return record_run_boundary(*prepared, RunCompletionFence::StreamRole::Aicore, stream_aicore_);
+            return record_run_boundary(*prepared, RunCompletionFence::StreamRole::Aicore);
         },
         [&](LaunchProgressSink &sink) -> int {
             // launch_count = popcount(OCCUPY) from the topology probe — one thread
@@ -651,7 +654,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
             STRACE_HOST_SPAN_AT("chip.run.runner_run.aicpu_launch", STRACE_NOW_NS(), 0, 2);
             int launch_rc = launch_aicpu_payload(
-                stream_aicpu_, prepared->kernel_args.launch_payload(), prepared->kernel_args.launch_payload_bytes(),
+                streams.aicpu, prepared->kernel_args.launch_payload(), prepared->kernel_args.launch_payload_bytes(),
                 host::KernelNames::RunName, aicpu_launch_n
             );
             if (launch_rc != 0) {
@@ -673,7 +676,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             void *core_done = nullptr;
             bool whole_operator = false;
             if (prepared->joinable_boundary && open_own_boundary_wait(*prepared, &core_done) == 0) {
-                const int wait_rc = queue_own_boundary_wait(*prepared, stream_aicpu_, core_done);
+                const int wait_rc = queue_own_boundary_wait(*prepared, streams.aicpu, core_done);
                 if (wait_rc != 0) return wait_rc;
                 whole_operator = true;
                 // Behind that wait and ahead of the boundary record: the instant this run's own
@@ -681,11 +684,10 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 // end rather than an AICPU-kernel end. Recorded only on this path, because only
                 // here does the stream position carry that meaning.
                 (void)mark_run_boundary(
-                    RunBoundaryMarks::Position::WholeOperatorEnd, prepared->identity, stream_aicpu_
+                    RunBoundaryMarks::Position::WholeOperatorEnd, prepared->identity, streams.aicpu
                 );
             }
-            const int boundary_rc =
-                record_run_boundary(*prepared, RunCompletionFence::StreamRole::Aicpu, stream_aicpu_);
+            const int boundary_rc = record_run_boundary(*prepared, RunCompletionFence::StreamRole::Aicpu);
             if (boundary_rc == 0 && whole_operator) note_whole_operator_boundary(*prepared);
             return boundary_rc;
         }
@@ -724,7 +726,7 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
     // terminal result for this run. What it no longer decides is completion:
     // that is this run's own boundaries, with the streams left as the evidence
     // the no-boundary fallback inside poll_run_fence needs.
-    const int rc = poll_run_fence(*active.prepared, stream_aicpu_, stream_aicore_);
+    const int rc = poll_run_fence(*active.prepared);
     if (rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
         (void)run_progress_.publish(identity, RunProgressState::DeviceComplete);
     }
@@ -746,7 +748,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         cleanup_execution(prepared, /*launched=*/true);
     });
 
-    int rc = wait_run_fence(prepared, stream_aicpu_, stream_aicore_);
+    int rc = wait_run_fence(prepared);
     if (rc != 0) {
         // The fence wait surfaces the AICore op-timeout (STARS-reaped op ->
         // 507000/507018/507046 at the boundary or, on the no-fence fallback, at
@@ -781,8 +783,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // the run rather than being logged past: the events it names belong to this
     // run's slot, and releasing them under a stream that may still hold the wait
     // is what this ordering exists to prevent.
-    const int discharge_rc =
-        discharge_boundary_waits(prepared, /*boundaries_complete=*/true, stream_aicpu_, stream_aicore_);
+    const int discharge_rc = discharge_boundary_waits(prepared, /*boundaries_complete=*/true);
     if (discharge_rc != 0) {
         // No poison here: on the one branch where a wait may still name an event of
         // this run the discharge has already stopped admission and kept the
@@ -882,14 +883,14 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool launched)
     // `device_unusable_` before it would decide the release path from a snapshot
     // taken while the device was still believed healthy.
     if (!device_unusable_.load(std::memory_order_acquire)) {
-        discharge_boundary_waits_noexcept(prepared, /*boundaries_complete=*/false, stream_aicpu_, stream_aicore_);
+        discharge_boundary_waits_noexcept(prepared, /*boundaries_complete=*/false);
     }
     clear_whole_operator_boundary(prepared);
 
     // A poisoned card cannot retire per-resource frees, and issuing them can
     // block in the driver. Drop host-side ownership instead: the blocks stay
-    // quarantined, and finalize()'s force reset is what may retire them later —
-    // only where its post-reset probe confirms the reset took.
+    // quarantined. An owned device's finalize may retire them after a confirmed
+    // force reset; a borrowed device's recovery belongs to the caller.
     const bool abandon = device_unusable_.load(std::memory_order_acquire);
 
     // Collectors stop before device/runtime arguments and register buffers.
@@ -967,6 +968,15 @@ int DeviceRunner::queue_cross_run_wait(
 }
 
 void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
+    // A borrowed context cannot drain or reset the caller's entire device.
+    // Poison stops this runner's admission; recovery belongs to the caller.
+    if (execution_mode_latch_.is_kernel()) {
+        kernel_exec_state_.poison(aicore_rc);
+        device_unusable_.store(true, std::memory_order_release);
+        LOG_ERROR("Execution error %d: borrowed device context marked unusable", aicore_rc);
+        return;
+    }
+
     // An AICore launch failure (207001) or an op-timeout reaped by STARS
     // (surfaced as 507000/507018/507046 at stream sync) leaves the device
     // context in a sticky-error state: the streams stay poisoned and the
@@ -1600,13 +1610,6 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper 
 // =============================================================================
 // #2267's late-read retention fixture (see run_retention_probe.h)
 // =============================================================================
-
-void RunRetentionProbePeer::run_streams(DeviceRunnerBase &runner, rtStream_t *aicpu, rtStream_t *aicore) {
-    // Every run submits on the persistent bootstrap pair; there is no per-run
-    // stream here to look up.
-    *aicpu = runner.stream_aicpu_;
-    *aicore = runner.stream_aicore_;
-}
 
 int RunRetentionProbePeer::retire_predecessor_ownership(DeviceRunnerBase &, PreparedExecution &) {
     // Nothing to retire: the streams are the runner's for its whole lifetime,

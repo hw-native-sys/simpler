@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Exercise onboard launch rejection against the built host runtime, with RTS stubs.
+"""Exercise onboard execution state against the built host runtime, with RTS stubs.
 
 The hardware marker selects CI jobs that build the onboard libraries and have
 CANN headers. The probe does not initialize or execute on a device.
@@ -30,9 +30,10 @@ _CASES = [
 ]
 
 
+@pytest.mark.parametrize("probe", ["runtime_publication_launch", "run_execution_streams"])
 @pytest.mark.requires_hardware
 @pytest.mark.parametrize(("arch", "runtime"), _CASES)
-def test_launch_requires_published_runtime_descriptor(arch: str, runtime: str, tmp_path: Path):
+def test_onboard_execution_contract(arch: str, runtime: str, probe: str, tmp_path: Path):
     cache = _ROOT / "build/cache" / arch / "onboard" / runtime / "host"
     library = _ROOT / "build/lib" / arch / "onboard" / runtime / "libhost_runtime.so"
     database = cache / "compile_commands.json"
@@ -53,10 +54,10 @@ def test_launch_requires_published_runtime_descriptor(arch: str, runtime: str, t
         elif arg != "-c" and arg != entry["file"]:
             command.append(arg)
     cann = Path(os.environ["ASCEND_HOME_PATH"])
-    binary = tmp_path / "publication_launch_probe"
+    binary = tmp_path / probe
     command += [
         "-UNDEBUG",
-        str(_ROOT / "tests/ut/py/support/runtime_publication_launch_probe.cpp"),
+        str(_ROOT / f"tests/ut/py/support/{probe}_probe.cpp"),
         # The probe reaches its test fixture by path from the unit-test root, the
         # same way the C++ targets do, so a fixture that moves stays reachable
         # from both without this line changing.
@@ -78,4 +79,4 @@ def test_launch_requires_published_runtime_descriptor(arch: str, runtime: str, t
     assert build.returncode == 0, build.stdout + build.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "PASS: four launch refusals" in result.stdout
+    assert "PASS:" in result.stdout

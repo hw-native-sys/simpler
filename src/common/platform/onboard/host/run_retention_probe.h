@@ -85,15 +85,6 @@ public:
     }
 
     /**
-     * The streams this runner's runs submit on.
-     *
-     * Per arch because the two do not agree on what owns them: a2a3 hands each
-     * run a `RunStreamPair`, a5 submits every run on the persistent bootstrap
-     * streams created at device bring-up.
-     */
-    static void run_streams(DeviceRunnerBase &runner, rtStream_t *aicpu, rtStream_t *aicore);
-
-    /**
      * Release whatever this arch makes a successor's launch wait for, using
      * `prepared`'s already-proven boundary completion.
      *

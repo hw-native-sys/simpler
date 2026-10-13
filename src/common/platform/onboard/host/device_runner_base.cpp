@@ -3086,9 +3086,9 @@ int DeviceRunnerBase::arm_run_fence(const PreparedExecution &prepared) {
     return rc;
 }
 
-int DeviceRunnerBase::record_run_boundary(
-    const PreparedExecution &prepared, RunCompletionFence::StreamRole role, rtStream_t stream
-) {
+int DeviceRunnerBase::record_run_boundary(const PreparedExecution &prepared, RunCompletionFence::StreamRole role) {
+    const rtStream_t stream =
+        role == RunCompletionFence::StreamRole::Aicpu ? prepared.streams.aicpu : prepared.streams.aicore;
     RunCompletionFence &fence = run_fence(prepared.pipeline_slot);
     // The one point where this stream is certainly live and certainly carrying a
     // run, so it is where its driver id is captured for the fault channel's
@@ -3126,30 +3126,30 @@ int DeviceRunnerBase::record_run_boundary(
     return rc;
 }
 
-int DeviceRunnerBase::poll_run_fence(
-    const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream
-) {
+int DeviceRunnerBase::poll_run_fence(const PreparedExecution &prepared) {
+    if (!prepared.streams.ready()) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    const auto &streams = prepared.streams;
     const RunCompletionFence::Completion completion =
         poll_and_retain_run_boundaries(run_fence(prepared.pipeline_slot), run_boundaries_observed_, prepared.identity);
     switch (completion) {
     case RunCompletionFence::Completion::Complete:
         // Boundaries prove the kernels exited; the streams carry the device's
         // verdict on them, which a completed run still has to be asked for.
-        return query_stream_pair_error(aicpu_stream, aicore_stream) == 0 ? SIMPLER_NATIVE_RUN_POLL_COMPLETE :
-                                                                           SIMPLER_NATIVE_RUN_POLL_ERROR;
+        return query_stream_pair_error(streams.aicpu, streams.aicore) == 0 ? SIMPLER_NATIVE_RUN_POLL_COMPLETE :
+                                                                             SIMPLER_NATIVE_RUN_POLL_ERROR;
     case RunCompletionFence::Completion::Pending:
         return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
     case RunCompletionFence::Completion::Unfenced:
-        return query_stream_pair_nonblocking(aicpu_stream, aicore_stream);
+        return query_stream_pair_nonblocking(streams.aicpu, streams.aicore);
     case RunCompletionFence::Completion::Error:
         break;
     }
     return SIMPLER_NATIVE_RUN_POLL_ERROR;
 }
 
-int DeviceRunnerBase::wait_run_fence(
-    const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream
-) {
+int DeviceRunnerBase::wait_run_fence(const PreparedExecution &prepared) {
+    if (!prepared.streams.ready()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const auto &streams = prepared.streams;
     const RunBoundaryWait observed = wait_and_retain_run_boundaries(
         run_fence(prepared.pipeline_slot), run_boundaries_observed_, prepared.identity,
         timeout_config_.stream_sync_timeout_ms
@@ -3160,7 +3160,7 @@ int DeviceRunnerBase::wait_run_fence(
             "whole-stream wait",
             prepared.pipeline_slot
         );
-        return sync_stream_pair(aicpu_stream, aicore_stream);
+        return sync_stream_pair(streams.aicpu, streams.aicore);
     }
 
     LOG_INFO("=== aclrtSynchronizeEventWithTimeout run completion boundaries ===");
@@ -3196,7 +3196,7 @@ int DeviceRunnerBase::wait_run_fence(
         // runs so the pair converges and the health path sees a code, but the
         // observed error is what the run returns: a later zero does not annul
         // it, and a later non-zero does not replace it.
-        const int sync_rc = sync_stream_pair(aicpu_stream, aicore_stream);
+        const int sync_rc = sync_stream_pair(streams.aicpu, streams.aicore);
         LOG_ERROR(
             "Run result transfer failed: %d (device_id=%d block_dim=%d slot=%u); the converging stream "
             "synchronize returned %d and does not replace it",
@@ -3226,7 +3226,7 @@ int DeviceRunnerBase::wait_run_fence(
     // reports it too. A zero timeout is rejected outright (107000), so there is
     // no non-blocking form of the same check. See
     // docs/design/run-completion-fence.md.
-    rc = sync_stream_pair(aicpu_stream, aicore_stream);
+    rc = sync_stream_pair(streams.aicpu, streams.aicore);
     if (rc != 0) {
         LOG_ERROR(
             "Run completed its boundaries but the device reports an error executing it: %d (device_id=%d "
@@ -3385,9 +3385,7 @@ int DeviceRunnerBase::record_cross_run_proof(const PreparedExecution &prepared, 
     return rc;
 }
 
-int DeviceRunnerBase::discharge_boundary_waits(
-    const PreparedExecution &prepared, bool boundaries_complete, rtStream_t aicpu_stream, rtStream_t aicore_stream
-) {
+int DeviceRunnerBase::discharge_boundary_waits(const PreparedExecution &prepared, bool boundaries_complete) {
     // The ladder and its return-code precedence live in the helper; what this
     // supplies is the two device-facing steps. Its non-zero return is a failure
     // to report; on the one branch where a wait may still name an event of this
@@ -3395,7 +3393,7 @@ int DeviceRunnerBase::discharge_boundary_waits(
     // retained, so a caller must not poison again on the strength of the code
     // alone.
     const QueuedWaitDischargeOps ops{
-        [this, &prepared, aicpu_stream, aicore_stream]() {
+        [this, &prepared]() -> int {
             // Nothing cheaper is left. A pair synchronize covers the boundary and
             // everything queued behind it, which is what an unproven queued wait
             // needs — and it is a failure-path cost only, because a proved discharge
@@ -3405,7 +3403,8 @@ int DeviceRunnerBase::discharge_boundary_waits(
                 "to the bounded whole-stream synchronize",
                 prepared.pipeline_slot
             );
-            return sync_stream_pair(aicpu_stream, aicore_stream);
+            if (!prepared.streams.ready()) return PTO_RUNTIME_ERR_INVALID_STATE;
+            return sync_stream_pair(prepared.streams.aicpu, prepared.streams.aicore);
         },
         [this, &prepared](int rc) {
             // No proof was obtained, so a queued wait may still name an event of this
@@ -3427,10 +3426,10 @@ int DeviceRunnerBase::discharge_boundary_waits(
 }
 
 void DeviceRunnerBase::discharge_boundary_waits_noexcept(
-    const PreparedExecution &prepared, bool boundaries_complete, rtStream_t aicpu_stream, rtStream_t aicore_stream
+    const PreparedExecution &prepared, bool boundaries_complete
 ) noexcept {
     try {
-        (void)discharge_boundary_waits(prepared, boundaries_complete, aicpu_stream, aicore_stream);
+        (void)discharge_boundary_waits(prepared, boundaries_complete);
     } catch (...) {
         LOG_ERROR("discharge_boundary_waits threw for slot %u", prepared.pipeline_slot);
         recover_device_or_mark_unusable(PTO_RUNTIME_ERR_INTERNAL);

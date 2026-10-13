@@ -47,26 +47,26 @@ extern "C" aclError aclrtCreateEventExWithFlag(aclrtEvent *, uint32_t) {
 int main() {
     DeviceRunner runner;
     Runtime runtime;
+    runtime.dev = {};
     MemoryAllocator allocator;
     SlotPersistentArgs slot;
     NativeRunIdentity id{1, 1, 1, 0};
-    // Unprepared, skipped publish, failed publish, published then released.
+    // Unprepared, prepared then released, failed publish, published then released.
     for (int arm = 0; arm != 4; ++arm) {
         auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
         if (arm) {
             assert(prepared->kernel_args.prepare_runtime_args(runtime, allocator, slot) == 0);
+            if (arm == 1) prepared->kernel_args.release_run_view();
             if (arm == 2) {
                 copy_error = -91;
-                assert(prepared->kernel_args.publish_runtime_args() == -91);
+                assert(prepared->kernel_args.publish_runtime_args(/*launch_route_permitted=*/false) == -91);
                 copy_error = 0;
             }
             if (arm == 3) {
-                assert(prepared->kernel_args.publish_runtime_args() == 0);
+                assert(prepared->kernel_args.publish_runtime_args(/*launch_route_permitted=*/false) == 0);
                 prepared->kernel_args.release_run_view();
             }
         }
-        // Skipping publish retains a non-null destination over stale bytes.
-        if (arm == 1) assert(prepared->kernel_args.args.runtime_args != nullptr);
         auto *owner = prepared.get();
         const int before = device_ops;
         auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(id));

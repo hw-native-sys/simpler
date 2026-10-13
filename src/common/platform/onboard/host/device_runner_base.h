@@ -1342,6 +1342,12 @@ public:
     virtual int provision_native_run_resources(uint32_t /*pipeline_slot*/) { return 0; }
     virtual int abandon_native_run_resources(uint32_t /*pipeline_slot*/) { return 0; }
 
+    struct RunStreams {
+        rtStream_t aicpu{nullptr};
+        rtStream_t aicore{nullptr};
+        bool ready() const { return aicpu != nullptr && aicore != nullptr; }
+    };
+
     struct PreparedExecution {
         PreparedExecution(
             const NativeRunIdentity &identity_in, Runtime &runtime_in, const CallConfig &config_in,
@@ -1363,6 +1369,7 @@ public:
             num_aicore(other.num_aicore),
             launch_aicpu_num(other.launch_aicpu_num),
             kernel_args(std::move(other.kernel_args)),
+            streams(std::exchange(other.streams, RunStreams{})),
             resources_owned(std::exchange(other.resources_owned, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
@@ -1388,6 +1395,11 @@ public:
         int num_aicore{0};
         int launch_aicpu_num{0};
         KernelArgsHelper kernel_args{};
+        // Bound before publication under the execution claim, unchanged through
+        // retirement. Handles are borrowed: A2/A3's pair retains submitted owners;
+        // A5's runner owns its streams until all runs retire. Neither preparation
+        // nor moving this state transfers ownership of the streams themselves.
+        RunStreams streams{};
         bool resources_owned{false};
         bool aicore_retirement_attempted{false};
         /**
@@ -1946,7 +1958,7 @@ protected:
      * kernel submission was accepted. Notes the submission first, so a record
      * failure cannot be mistaken for a kernel that never launched.
      */
-    int record_run_boundary(const PreparedExecution &prepared, RunCompletionFence::StreamRole role, rtStream_t stream);
+    int record_run_boundary(const PreparedExecution &prepared, RunCompletionFence::StreamRole role);
 
     /**
      * Query this run's boundaries without waiting, as one of the
@@ -1962,7 +1974,7 @@ protected:
      * report about a stream left in error. That check is not a device-exception
      * detector; see `wait_run_fence`.
      */
-    int poll_run_fence(const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream);
+    int poll_run_fence(const PreparedExecution &prepared);
 
     /**
      * Establish that this run finished and what the device made of it.
@@ -1980,7 +1992,7 @@ protected:
      * in the definition. So the branch a successful run takes touches neither
      * stream of the pair, which is what lets a successor stay queued behind it.
      */
-    int wait_run_fence(const PreparedExecution &prepared, rtStream_t aicpu_stream, rtStream_t aicore_stream);
+    int wait_run_fence(const PreparedExecution &prepared);
 
     /**
      * Give up this run's arming. Idempotent and a no-op for a run that never
@@ -2049,14 +2061,10 @@ protected:
      * naming an event that must not be destroyed, so the device is recovered or
      * marked unusable and the first error is returned.
      */
-    int discharge_boundary_waits(
-        const PreparedExecution &prepared, bool boundaries_complete, rtStream_t aicpu_stream, rtStream_t aicore_stream
-    );
+    int discharge_boundary_waits(const PreparedExecution &prepared, bool boundaries_complete);
 
     /** The same ladder from a path that cannot report, poisoning on failure. */
-    void discharge_boundary_waits_noexcept(
-        const PreparedExecution &prepared, bool boundaries_complete, rtStream_t aicpu_stream, rtStream_t aicore_stream
-    ) noexcept;
+    void discharge_boundary_waits_noexcept(const PreparedExecution &prepared, bool boundaries_complete) noexcept;
 
     /**
      * Take this runner's reference on the process's exception-notification

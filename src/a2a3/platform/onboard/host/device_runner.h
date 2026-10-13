@@ -255,11 +255,6 @@ private:
     // executor may poison the runner after a failed launch.
     std::atomic<bool> device_unusable_{false};
 
-    struct RunStreamSet {
-        rtStream_t aicpu{nullptr};
-        rtStream_t aicore{nullptr};
-    };
-
     // One pair carries every run: the execution claim is exclusive, so runs
     // reach the device one at a time and the stream orders them. Pipeline slots
     // index resources that preparation mutates, and preparing a run writes
