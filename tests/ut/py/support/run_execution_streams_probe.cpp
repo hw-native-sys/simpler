@@ -29,6 +29,8 @@ static size_t streams_created = 0;
 static int event_tokens[8];
 static size_t events_created = 0;
 static int event_error = 0;
+static rtStream_t failing_sync_stream = nullptr;
+static int device_frees = 0;
 static rtStream_t publication_stream = nullptr;
 static std::vector<rtStream_t> queried, synchronized, recorded;
 extern "C" rtError_t rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
@@ -36,6 +38,7 @@ extern "C" rtError_t rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
     return *out == nullptr ? -1 : 0;
 }
 extern "C" rtError_t rtFree(void *ptr) {
+    ++device_frees;
     std::free(ptr);
     return 0;
 }
@@ -55,7 +58,7 @@ extern "C" rtError_t rtStreamQuery(rtStream_t stream) {
 }
 extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream stream, int32_t) {
     synchronized.push_back(stream);
-    return 0;
+    return stream == failing_sync_stream ? -778 : 0;
 }
 extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream stream, aclmdlRICaptureStatus *status, aclmdlRI *model) {
     publication_stream = stream;
@@ -82,6 +85,12 @@ extern "C" aclError aclrtStreamGetId(aclrtStream, int32_t *out) {
 class ProbeRunner : public DeviceRunner {
 public:
     using DeviceRunnerBase::arm_run_fence;
+    using DeviceRunnerBase::commit_boundary_wait;
+    using DeviceRunnerBase::open_own_boundary_wait;
+    using DeviceRunnerBase::queued_boundary_wait_count;
+    using DeviceRunnerBase::run_fence;
+    using DeviceRunnerBase::slot_persistent_args;
+    MemoryAllocator &allocator() { return mem_alloc_; }
     using DeviceRunnerBase::poll_run_fence;
     using DeviceRunnerBase::record_run_boundary;
     using DeviceRunnerBase::wait_run_fence;
@@ -139,6 +148,77 @@ static void check_execution_streams() {
     runner.set_owner_streams(nullptr, nullptr);
 }
 
+// The fixture enters cleanup with the committed wait a partial launch leaves:
+// no AICPU boundary proves consumption, so discharge must synchronize the pair.
+static void check_cleanup_wait_failure(SimplerExecutionMode mode, int failing_side, bool already_poisoned) {
+    std::fprintf(
+        stderr, "cleanup: mode=%d failing_side=%d already_poisoned=%d\n", mode, failing_side, already_poisoned
+    );
+    ProbeRunner runner;
+    assert(runner.execution_mode_latch().latch(mode) == 0);
+    Runtime runtime;
+    runtime.dev = {};
+    const NativeRunIdentity id{2, 1, 1, 0};
+    DeviceRunnerBase::PreparedExecution prepared(id, runtime, CallConfig{}, 0);
+    prepared.streams = {&stream_tokens[4], &stream_tokens[5]};
+    prepared.resources_owned = true;
+    auto &slot = runner.slot_persistent_args(0);
+    assert(prepared.kernel_args.prepare_runtime_args(runtime, runner.allocator(), slot) == 0);
+    void *allocation = slot.runtime_args;
+    assert(allocation != nullptr);
+    events_created = 0;
+    assert(runner.arm_run_fence(prepared) == 0);
+    assert(runner.record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore) == 0);
+    void *boundary = nullptr;
+    assert(runner.open_own_boundary_wait(prepared, &boundary) == 0);
+    assert(boundary != nullptr);
+    assert(runner.commit_boundary_wait(QueuedStreamWaits::Shape::Own, prepared) == 0);
+    assert(runner.queued_boundary_wait_count() == 1);
+    if (already_poisoned) {
+        static_cast<DeviceRunnerBase &>(runner).recover_device_or_mark_unusable(-779);
+    }
+    const int syncs_before = device_syncs;
+    const int frees_before = device_frees;
+    synchronized.clear();
+    failing_sync_stream = failing_side == 1 ? prepared.streams.aicpu :
+                          failing_side == 2 ? prepared.streams.aicore :
+                                              nullptr;
+    runner.abandon_prepared_execution(prepared);
+    const bool poisoned = already_poisoned || failing_side != 0;
+    assert(runner.can_accept_run() == !poisoned);
+    assert(!prepared.resources_owned);
+    assert(prepared.kernel_args.args.runtime_args == nullptr);
+    assert(device_frees == frees_before);
+    assert(runner.queued_boundary_wait_count() == (poisoned ? 1u : 0u));
+    assert(runner.run_fence(0).has_device_references(id) == poisoned);
+    if (poisoned) {
+        // Quarantine clears reusable slot bookkeeping, not the live allocation
+        // or the completion fence still named by the committed stream wait.
+        assert(slot.runtime_args == nullptr && slot.runtime_bytes == 0);
+        assert(!prepared.aicore_retirement_attempted);
+    } else {
+        assert(slot.runtime_args == allocation);
+        assert(release_slot_persistent_args(slot, runner.allocator()) == 0);
+    }
+    if (already_poisoned) {
+        assert(synchronized.empty());
+    } else if (failing_side == 1) {
+        assert((synchronized == std::vector<rtStream_t>{prepared.streams.aicpu}));
+    } else {
+        assert((synchronized == std::vector<rtStream_t>{prepared.streams.aicpu, prepared.streams.aicore}));
+    }
+    assert(device_syncs - syncs_before == (!already_poisoned && poisoned && mode == SIMPLER_MODE_PROGRAM ? 1 : 0));
+    const auto sync_count = synchronized.size();
+    const int syncs_after = device_syncs;
+    runner.abandon_prepared_execution(prepared);
+    assert(synchronized.size() == sync_count && device_syncs == syncs_after);
+    assert(runner.queued_boundary_wait_count() == (poisoned ? 1u : 0u));
+    failing_sync_stream = nullptr;
+    // This fixture's allocations are host-backed RTS stubs; no device can
+    // still hold them after the cleanup assertions have finished.
+    if (poisoned) assert(runner.allocator().free(allocation) == 0);
+}
+
 int main() {
     check_execution_streams();
     {
@@ -182,7 +262,13 @@ int main() {
         assert(device_syncs == 1);
         assert(state.close() == 0);
     }
-    std::puts("PASS: per-run stream binding and device recovery respect ownership");
+    for (const auto mode : {SIMPLER_MODE_PROGRAM, SIMPLER_MODE_KERNEL}) {
+        check_cleanup_wait_failure(mode, 0, false);
+        check_cleanup_wait_failure(mode, 1, false);
+        check_cleanup_wait_failure(mode, 2, false);
+        check_cleanup_wait_failure(mode, 0, true);
+    }
+    std::puts("PASS: per-run streams and cleanup respect device ownership and wait failures");
 }
 extern "C" void unified_log_warn(const char *, const char *, ...) {}
 extern "C" void unified_log_info(const char *, const char *, ...) {}

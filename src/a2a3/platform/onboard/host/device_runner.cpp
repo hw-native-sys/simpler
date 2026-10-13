@@ -545,22 +545,22 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
 void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_aicore) noexcept {
     if (!prepared.resources_owned) return;
 
-    // A poisoned card cannot retire per-resource frees or stream destroys, and
-    // issuing them can block in the driver. Drop host-side ownership instead.
-    // An owned device is force-reset at finalize; a borrowed device's recovery
-    // belongs to the caller.
-    const bool abandon = device_unusable_.load(std::memory_order_acquire);
-
     // Before anything is released, on the paths that did not reach the drain's
     // fallible discharge: a queued stream wait naming one of this run's
     // boundaries must not outlive the events it names. No proof is available
     // here — this run's completion was never established — so the ladder falls
     // through to the synchronize and, failing that, poisons. On the abandon
     // branch completion is unproven and no per-resource device calls are issued.
-    if (!abandon) {
+    if (!device_unusable_.load(std::memory_order_acquire)) {
         discharge_boundary_waits_noexcept(prepared, /*boundaries_complete=*/false);
     }
     clear_whole_operator_boundary(prepared);
+
+    // Discharge can poison the runner. Retirement uses the resulting state:
+    // a poisoned card permits no per-resource frees or stream destroys.
+    // An owned device is force-reset at finalize; a borrowed device's recovery
+    // belongs to the caller.
+    const bool abandon = device_unusable_.load(std::memory_order_acquire);
 
     // Collectors must stop before their backing arguments are released; the
     // per-run stream retires last. Each cleanup operation is idempotent.
