@@ -207,9 +207,9 @@ whose published pipeline depth is at least two takes two frames — that endpoin
 stages a successor behind an active run at any launch depth. Every other route
 takes a second frame only where the child resolved that it may order one native
 submission behind another, which is its runtime's published joined-launch
-capability met with the requested launch depth and the granted set count: both
-A5 runtimes, `host_build_graph` and `tensormap_and_ringbuffer`, publish that
-capability at `launch_depth >= 2`. SUB, nested-Worker, simulation (whose backend
+capability met with the requested launch depth and the granted set count: every
+onboard runtime — `host_build_graph` and `tensormap_and_ringbuffer`, on both
+A2/A3 and A5 — publishes that capability at `launch_depth >= 2`. SUB, nested-Worker, simulation (whose backend
 answers that capability with a flat no), and every depth-one local endpoint use
 one task frame and do not advertise successor staging. A launched successor
 occupies a frame of its own, so a Worker's configured launch depth is bounded by

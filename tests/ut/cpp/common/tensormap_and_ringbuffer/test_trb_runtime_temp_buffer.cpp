@@ -274,16 +274,6 @@ HostApi make_host_api() {
     return HostApi(nullptr, 0, 0, 0, &ops);
 }
 
-// Whether the runtime under test reads *only* the run-owned record on the
-// failure path. a5 declares joined-launch support, so a successor may already
-// have reset the shared memory header by the time this host call runs and the
-// header is therefore never read; a2a3 launches one run at a time, still owns
-// the header for the whole call, and still falls back to it. Both contracts are
-// asserted exactly below — neither arch's behaviour is relaxed to accommodate
-// the other. `SIMPLER_PLATFORM_NAME` is the per-arch define every runtime case
-// already carries.
-constexpr bool kReadsOnlyTheRunOwnedRecord = SIMPLER_PLATFORM_NAME[1] == '5';
-
 // One run's terminal error tail, in the layout `get_run_result` serves: the
 // bytes of a `SharedMemoryHeader` from its first error field to its end.
 std::vector<uint8_t> published_error_tail(int32_t orch_error_code) {
@@ -416,18 +406,14 @@ TEST_F(TrbRuntimeTempBufferTest, FailedExecutionWithoutASnapshotKeepsItsExecutio
     ASSERT_NE(header, nullptr);
     header->orch_error_code.store(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
 
-    // The header's code is not read at all on the runtime that admits a
-    // launched successor: the header is one instance across runs, so the
-    // successor resets and refills it as soon as this run's boundary releases
-    // it, and that boundary is the same fence that lets this call proceed. The
-    // run keeps the execution error its caller already holds.
-    if (kReadsOnlyTheRunOwnedRecord) {
-        EXPECT_EQ(finish_run(runtime, -1), 0);
-        EXPECT_EQ(fake_.copy_from_count, 0);
-    } else {
-        EXPECT_EQ(finish_run(runtime, -1), -SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
-        EXPECT_EQ(fake_.copy_from_count, 1);
-    }
+    // The header's code is not read at all: the header is one instance across
+    // runs, so a launched successor resets and refills it as soon as this run's
+    // boundary releases it, and that boundary is the same fence that lets this
+    // call proceed. The run keeps the execution error its caller already holds.
+    // Both runtimes declare joined launch, so both answer this way; the planted
+    // code above is what a header read would wrongly report as this run's.
+    EXPECT_EQ(finish_run(runtime, -1), 0);
+    EXPECT_EQ(fake_.copy_from_count, 0);
     // The failure skips the tensor copy-back either way, so the caller's buffer
     // keeps its own content rather than whatever the device slice held.
     EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](uint8_t value) {
@@ -454,13 +440,10 @@ TEST_F(TrbRuntimeTempBufferTest, FailedExecutionTreatsAShortTerminalRecordAsNone
     ASSERT_NE(header, nullptr);
     header->orch_error_code.store(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_relaxed);
 
-    if (kReadsOnlyTheRunOwnedRecord) {
-        EXPECT_EQ(finish_run(runtime, -1), 0);
-        EXPECT_EQ(fake_.copy_from_count, 0);
-    } else {
-        EXPECT_EQ(finish_run(runtime, -1), -SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
-        EXPECT_EQ(fake_.copy_from_count, 1);
-    }
+    // Unreadable reads as absent on both runtimes, and absent leaves the
+    // execution error standing without the header's planted code reaching it.
+    EXPECT_EQ(finish_run(runtime, -1), 0);
+    EXPECT_EQ(fake_.copy_from_count, 0);
 }
 
 // The retained buffer is malloc'd once for the run and sliced, not per tensor.

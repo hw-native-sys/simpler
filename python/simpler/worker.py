@@ -12242,12 +12242,19 @@ class Worker:
         negotiated depth two, one active plus one prepared run are permitted and
         a third submission blocks before invoking its graph callback; where a
         backend publishes depth one, the *second* submission already blocks
-        there. A5 tensor-map-and-ring-buffer publishes depth two, while its
-        local endpoint retains one mailbox frame and serial device execution;
-        A5 host-build-graph publishes no contract and stays at depth one. A
-        caller whose first run only completes because a later callback runs
-        would deadlock on a depth-one backend. Completion and cleanup stay
-        attached to each handle.
+        there. Every onboard runtime publishes at least two sets, and both
+        ``host_build_graph`` backends publish ``PTO_PIPELINE_MAX_DEPTH`` so an
+        explicit ``pipeline_depth`` can raise a supported configuration above
+        the standing default of two.
+
+        Admission is separate from reaching the device. A prepared successor's
+        device work waits for its predecessor unless this Worker was configured
+        with ``launch_depth`` above one *and* its runtime publishes the
+        joined-launch capability, which every onboard runtime now does. The
+        device still executes one whole operator at a time either way. A caller
+        whose first run only completes because a later callback runs would
+        deadlock on a depth-one backend. Completion and cleanup stay attached to
+        each handle.
         """
         try:
             with self._operation_lease("submit"):

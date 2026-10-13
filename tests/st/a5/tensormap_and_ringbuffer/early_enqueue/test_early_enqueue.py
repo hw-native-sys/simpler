@@ -54,6 +54,14 @@ carry, for the reason their own note gives: importing a module that defines ``Sc
 classes would collect those classes here as well, and the three trees have no shared importable
 package. Consolidating them onto one arch-neutral helper needs package files in both runtime trees
 and is deliberately left to its own change rather than bundled here.
+
+Its evidence wait is for the readings the ordering assertion consumes, not for the joined-launch
+record alone: a child writes that record when a successor's native submission completes and a run's
+boundary markers when that run retires, so the two arrive separately and the drain loop is the only
+thing that advances the cursor. Every pair is also scoped to the chip child that wrote it, because a
+run key is ``(dispatch id, pipeline slot)`` and each child allocates both for itself — two endpoints
+of one Worker name the same ``(1, 0)``. A reading that never arrives is reported as missing, never
+passed.
 """
 
 import contextlib
@@ -471,26 +479,54 @@ class _RunTrace:
         return window
 
 
-def _established_pairs(records, case_runs):
+def _established_pairs(records, case_runs, pid=None):
     """The pairs whose ordering the records actually establish.
 
     A record counts only when the query answered *and* the predecessor's whole-operator boundary
     had not fired: that pair's successor completed its native submission before its predecessor
     completed. A failed query counts for neither side. Both ends must be runs this case submitted,
     and must differ.
+
+    ``pid`` scopes the records to one chip child, and a caller that is making a claim about one
+    endpoint must pass it. A run key is ``(dispatch id, pipeline slot)`` and a child allocates both
+    for itself, so two endpoints of one Worker routinely name the same ``(1, 0)`` — and the byte
+    cursor cannot separate them either, because a child that writes late writes into a window
+    another endpoint's check has already opened.
     """
     return {
         (record["predecessor"], record["successor"])
         for record in records
         if record.get("observed")
         and record.get("unfired")
+        and (pid is None or record["pid"] == pid)
         and record["successor"] != record["predecessor"]
         and record["successor"] in case_runs
         and record["predecessor"] in case_runs
     }
 
 
-def _whole_operator_order(trace, records, case_runs):
+def _comparable_boundaries(trace, pid, pair):
+    """One pair's two boundary rows as read on one child, when they can be compared at all.
+
+    Returns ``(predecessor row, successor row)`` or None. Comparability is a property of a single
+    child: the two rows must name the same device and the same tick rate, the predecessor must
+    carry its whole-operator end, and the successor its AICore start. A missing position is not a
+    slower reading of the same fact — the emitter writes 0 for one it could not take — so None here
+    covers both "not written yet" and "never available", and only the caller's deadline tells the
+    two apart.
+    """
+    ahead = trace.boundaries_of_run(pid, pair[0])
+    behind = trace.boundaries_of_run(pid, pair[1])
+    if ahead is None or behind is None:
+        return None
+    if ahead["device"] != behind["device"] or ahead["hz"] != behind["hz"]:
+        return None
+    if ahead["whole_operator_end"] is None or behind["aicore_start"] is None:
+        return None
+    return ahead, behind
+
+
+def _whole_operator_order(trace, records, case_runs, pid=None):
     """Split the established pairs by the *whole-operator* relation on the device's own clock.
 
     Returns ``(ordered, overlapping, within_tick, unmeasured)``:
@@ -507,23 +543,22 @@ def _whole_operator_order(trace, records, case_runs):
       below one tick, so the claim is held against ``ordered | within_tick``.
     * **unmeasured** — a position was unavailable, the runs report different devices, or the
       readings are on different tick rates. Never a pass.
+
+    ``pid`` scopes both the records and the boundary lookup to one child. Without it a pair's rows
+    are hunted across every child that wrote a record, which can place a pair on the other
+    endpoint's clock readings — see :func:`_established_pairs`.
     """
-    pids = {record["pid"] for record in records if not record.get("malformed")}
+    pids = [pid] if pid is not None else sorted({record["pid"] for record in records if not record.get("malformed")})
     ordered, overlapping, within_tick, unmeasured = set(), set(), set(), set()
-    for pair in _established_pairs(records, case_runs):
+    for pair in _established_pairs(records, case_runs, pid):
         decided = False
-        for pid in pids:
-            ahead = trace.boundaries_of_run(pid, pair[0])
-            behind = trace.boundaries_of_run(pid, pair[1])
-            if ahead is None or behind is None:
-                continue
-            if ahead["device"] != behind["device"] or ahead["hz"] != behind["hz"]:
-                continue
-            end = ahead["whole_operator_end"]
-            start = behind["aicore_start"]
-            if end is None or start is None:
+        for candidate in pids:
+            rows = _comparable_boundaries(trace, candidate, pair)
+            if rows is None:
                 continue
             decided = True
+            end = rows[0]["whole_operator_end"]
+            start = rows[1]["aicore_start"]
             if start > end:
                 ordered.add(pair)
             elif start == end:
@@ -535,16 +570,47 @@ def _whole_operator_order(trace, records, case_runs):
     return ordered, overlapping, within_tick, unmeasured
 
 
-def _boundary_detail(trace, pairs):
-    """Per-pair marker readings, for a failure message that names why rather than only that."""
-    detail = {}
-    for pid in trace.pids:
-        for pair in pairs:
-            detail[pair] = {
-                "predecessor": trace.boundaries_of_run(pid, pair[0]),
-                "successor": trace.boundaries_of_run(pid, pair[1]),
-            }
-    return detail
+def _boundaries_settled(trace, records, case_runs, pid=None):
+    """Whether every pair these records establish can already be placed on the device clock.
+
+    This is the predicate an evidence wait must use, because it is the question the ordering
+    assertion asks. Waiting only for a pair to be *established* returns as soon as the join span
+    lands, and a run publishes its boundary markers when it retires — a later event, written by an
+    asynchronous child writer. They are separate records, so the arrival of the first is no evidence
+    about the second, and a reader satisfied by the join alone goes on to read a successor row that
+    is simply not there yet.
+
+    False while anything is still missing, so the caller's own deadline decides when an absence has
+    been given its full window. Nothing here weakens what is asserted afterwards: the same
+    classification runs again, and a pair that never becomes comparable stays ``unmeasured``.
+    """
+    if not _established_pairs(records, case_runs, pid):
+        return False
+    return not _whole_operator_order(trace, records, case_runs, pid)[3]
+
+
+def _boundary_detail(trace, pairs, pid=None):
+    """Per-pair marker readings, per child, for a failure message that names why rather than that.
+
+    Keyed by child as well as by pair. A pair's two halves are per-child run keys, so one entry per
+    pair would report whichever child happened to be read last and silently drop the rest — which
+    is the difference between "this endpoint never published the successor's row" and "some other
+    endpoint has rows for the same key".
+    """
+    children = [pid] if pid is not None else trace.pids
+    return {
+        (child, pair): {
+            "predecessor": trace.boundaries_of_run(child, pair[0]),
+            "successor": trace.boundaries_of_run(child, pair[1]),
+        }
+        for child in children
+        for pair in pairs
+    }
+
+
+def _log_window_text(trace):
+    """Every chip child's own log window, labelled by child, for a failure message to carry."""
+    return "\n".join(f"--- child {pid} ---\n" + "\n".join(lines) for pid, lines in trace.child_log_window().items())
 
 
 def _await_records(cursor, records, budget_s, satisfied):
@@ -554,6 +620,10 @@ def _await_records(cursor, records, budget_s, satisfied):
     a read taken straight after ``wait()`` is no guarantee the child's record has been written.
     This polls instead, and returns on the budget rather than raising, so the caller's own
     assertion names which half was missing.
+
+    The predicate has to name the evidence the caller then *consumes*, not a record that merely
+    precedes it: this loop is the only thing that advances the cursor, so whatever has not been
+    read by the time it returns is not in the trace at all, however long the caller waits after.
     """
     deadline = time.monotonic() + budget_s
     while True:
@@ -618,9 +688,7 @@ def _assert_results(expectations, trace, case_runs, what):
     summary = "; ".join(
         f"run #{index}: first element {actual} against {wanted}" for index, _, actual, wanted in mismatches
     )
-    log_window = "\n".join(
-        f"--- child {pid} ---\n" + "\n".join(lines) for pid, lines in trace.child_log_window().items()
-    )
+    log_window = _log_window_text(trace)
     raise AssertionError(
         f"{what}: {len(mismatches)} of {len(expectations)} runs produced the wrong output. {summary}.\n"
         f"This case's runs (dispatch id, slot) above floor {case_runs.floor}: {runs}\n"
@@ -643,6 +711,15 @@ class _A5TmrEarlyEnqueueBase(SceneTestCase):
         keeps the skip from allocating a device for nothing.
         """
         pytest.skip("early enqueue drives its own multi-run sequences; see the cases below")
+
+    @staticmethod
+    def _endpoint_pid(worker, chip_index=0):
+        """The chip child whose records are this endpoint's.
+
+        ``_chip_pids`` and ``_chip_shms`` are appended together in device order, so one chip index
+        names the same child in the mailbox views, in the negotiated counts and in the log cursor.
+        """
+        return worker._chip_pids[chip_index]  # noqa: SLF001 -- white-box child attribution
 
     @staticmethod
     def _tensor_from_host_buffer(worker, value):
@@ -719,6 +796,7 @@ class _A5TmrEarlyEnqueueBase(SceneTestCase):
             f"{what}: endpoint {chip_index} negotiated {negotiated} task frame(s) at launch_depth=2, so no "
             f"successor can occupy one while its predecessor runs and the overlap below is unreachable"
         )
+        pid = self._endpoint_pid(worker, chip_index)
         trace = _RunTrace(worker)
         with _frame_views(worker, chip_index) as frames:
             case_runs = _CaseRuns(frames)
@@ -758,28 +836,39 @@ class _A5TmrEarlyEnqueueBase(SceneTestCase):
                 )
 
                 records: list[dict] = []
-                _await_records(
-                    trace, records, _EVIDENCE_BUDGET_S, lambda seen: bool(_established_pairs(seen, case_runs))
+                # The wait is for the readings the ordering assertion below consumes, not for the
+                # join span alone: that span is written at submission and a run's boundary markers
+                # when it retires, so a join-only predicate returns before the successor's row
+                # exists and no later read can recover it.
+                settled = _await_records(
+                    trace,
+                    records,
+                    _EVIDENCE_BUDGET_S,
+                    lambda seen: _boundaries_settled(trace, seen, case_runs, pid),
                 )
                 assert records, (
-                    f"{what}: no joined-launch record reached this process from children {trace.pids}, so "
-                    f"nothing carried the ordering of the two accepted runs"
+                    f"{what}: no joined-launch record reached this process from child {pid} (children "
+                    f"{trace.pids}), so nothing carried the ordering of the two accepted runs"
                 )
-                pairs = _established_pairs(records, case_runs)
+                pairs = _established_pairs(records, case_runs, pid)
                 assert pairs, (
-                    f"{what}: no record established a pair of this case's runs: records={records}, "
-                    f"case runs={case_runs.sorted_keys()} above floor {case_runs.floor}"
+                    f"{what}: no record from child {pid} established a pair of this case's runs: "
+                    f"records={records}, case runs={case_runs.sorted_keys()} above floor {case_runs.floor}"
                 )
 
-                ordered, overlapping, within_tick, unmeasured = _whole_operator_order(trace, records, case_runs)
+                ordered, overlapping, within_tick, unmeasured = _whole_operator_order(trace, records, case_runs, pid)
                 assert not overlapping, (
                     f"{what}: a joined successor's AICore stream was released before its predecessor's whole "
                     f"operator had finished, which is what this runtime's shared arena depends on: "
-                    f"{sorted(overlapping)}; {_boundary_detail(trace, overlapping)}"
+                    f"{sorted(overlapping)}; {_boundary_detail(trace, overlapping, pid)}"
                 )
                 assert ordered | within_tick, (
-                    f"{what}: no established pair has comparable whole-operator boundary readings: "
-                    f"unmeasured={sorted(unmeasured)}; {_boundary_detail(trace, pairs)}"
+                    f"{what}: no established pair has comparable whole-operator boundary readings on child "
+                    f"{pid} after waiting {_EVIDENCE_BUDGET_S}s for them "
+                    f"({'the wait was satisfied' if settled else 'the wait ran out'}): "
+                    f"unmeasured={sorted(unmeasured)}; {_boundary_detail(trace, pairs, pid)}; "
+                    f"this case's runs above floor {case_runs.floor}: {case_runs.sorted_keys()}; "
+                    f"records={records}\nChildren's own log window:\n{_log_window_text(trace)}"
                 )
 
 
@@ -981,6 +1070,10 @@ class TestA5TmrEarlyEnqueueTwoEndpoints(_A5TmrEarlyEnqueueBase):
         trace = _RunTrace(st_worker)
         stop = threading.Event()
 
+        # Endpoint 0 drives this case, and only its child's records are its evidence: both
+        # endpoints name their runs with their own dispatch ids, so an absence claim that accepted
+        # the other child's record could fail on a run this case never submitted.
+        pid = self._endpoint_pid(st_worker, 0)
         with _frame_views(st_worker, 0) as frames:
             case_runs = _CaseRuns(frames)
 
@@ -1036,8 +1129,8 @@ class TestA5TmrEarlyEnqueueTwoEndpoints(_A5TmrEarlyEnqueueBase):
         # Drained on the budget rather than asserted immediately: an absence has to be given the
         # same window a presence would get.
         records: list[dict] = []
-        _await_records(trace, records, _EVIDENCE_BUDGET_S, lambda seen: bool(_established_pairs(seen, case_runs)))
-        assert not _established_pairs(records, case_runs), (
+        _await_records(trace, records, _EVIDENCE_BUDGET_S, lambda seen: bool(_established_pairs(seen, case_runs, pid)))
+        assert not _established_pairs(records, case_runs, pid), (
             f"a joined launch was established while a comm domain was live: {records}"
         )
 
@@ -1105,6 +1198,7 @@ class TestA5TmrEarlyEnqueueErrorAttribution(_A5TmrEarlyEnqueueBase):
         )
         trace = _RunTrace(st_worker)
         stop = threading.Event()
+        pid = self._endpoint_pid(st_worker)
         with _frame_views(st_worker) as frames:
             case_runs = _CaseRuns(frames)
 
@@ -1176,9 +1270,9 @@ class TestA5TmrEarlyEnqueueErrorAttribution(_A5TmrEarlyEnqueueBase):
             trace,
             records,
             _EVIDENCE_BUDGET_S,
-            lambda seen: (predecessor, successor) in _established_pairs(seen, case_runs),
+            lambda seen: (predecessor, successor) in _established_pairs(seen, case_runs, pid),
         )
-        pairs = _established_pairs(records, case_runs)
+        pairs = _established_pairs(records, case_runs, pid)
         assert (predecessor, successor) in pairs, (
             f"the failing run {successor} was never recorded as having completed its native submission while "
             f"its predecessor {predecessor} still had an unfired whole-operator boundary, so it was not "
@@ -1233,6 +1327,7 @@ class TestA5TmrEarlyEnqueueDepthOneControl(_A5TmrEarlyEnqueueBase):
         )
         trace = _RunTrace(st_worker)
         stop = threading.Event()
+        pid = self._endpoint_pid(st_worker)
         with _frame_views(st_worker) as frames:
             case_runs = _CaseRuns(frames)
 
@@ -1273,7 +1368,7 @@ class TestA5TmrEarlyEnqueueDepthOneControl(_A5TmrEarlyEnqueueBase):
             f"{case_runs.floor}, so no joined-launch absence can be attributed to this case"
         )
         records: list[dict] = []
-        _await_records(trace, records, _EVIDENCE_BUDGET_S, lambda seen: bool(_established_pairs(seen, case_runs)))
-        assert not _established_pairs(records, case_runs), (
+        _await_records(trace, records, _EVIDENCE_BUDGET_S, lambda seen: bool(_established_pairs(seen, case_runs, pid)))
+        assert not _established_pairs(records, case_runs, pid), (
             f"a joined launch was established with launch_depth unset: {records}"
         )

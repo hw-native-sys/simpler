@@ -195,8 +195,8 @@ __attribute__((weak)) int joined_native_launch_supported_impl(void) { return 0; 
  * Whether this runtime's diagnostics collector can hold two runs open while
  * one of them is ordered behind the other.
  *
- * Deliberately separate from `joined_native_launch_supported_impl`, which three
- * runtimes define strongly: overloading that one would make ordinary
+ * Deliberately separate from `joined_native_launch_supported_impl`, which every
+ * onboard runtime defines strongly: overloading that one would make ordinary
  * non-diagnostic early enqueue on those runtimes start depending on swimlane
  * bucket capacity. A runtime that does not override this keeps today's
  * behaviour, where any diagnostic on either side refuses a join.

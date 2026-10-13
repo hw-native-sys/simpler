@@ -302,23 +302,33 @@ platform register helpers ([A2/A3][a3-regs], [A5][a5-regs]).
 
 ### Joined native launch and error ownership
 
-A5 TMR advertises `joined_native_launch_supported_impl()`: a compatible
-successor can be submitted while its predecessor is live, but whole-operator
-device execution stays serial. Ordering waits for the predecessor's AICore end
-before the successor may reset the shared arena. Live preparation requires a
-prebuilt-arena cache hit; rebuilding/uploading that arena is refused while a
-predecessor owns it.
+Both TMR platforms advertise `joined_native_launch_supported_impl()`: a
+compatible successor can be submitted while its predecessor is live, but
+whole-operator device execution stays serial. Ordering waits for the
+predecessor's AICore end before the successor may reset the shared arena. Live
+preparation requires a prebuilt-arena cache hit; rebuilding/uploading that arena
+is refused while a predecessor owns it.
 
-A5 therefore reads failure details only from the run's retained published
+The two construct that ordering differently, because their stream shapes differ.
+A5 aggregates, so a successor's AICPU payload enters one stream's FIFO behind
+the predecessor's whole-operator boundary record. A2/A3 keeps the AICPU and
+AICore streams distinct — the AICPU Run kernel spins in the handshake until the
+AICore workers publish, so the two must be dispatched concurrently — and splits
+the ordering across them: the successor's AICore stream takes an event wait on
+the predecessor's whole-operator boundary, while the successor's AICPU op is
+ordered by the AICPU stream's own FIFO behind the predecessor's payload, its
+own-AICore-boundary wait, its whole-operator marker and its boundary record. The
+own-AICore wait is queued *after* the AICPU payload for the handshake reason
+above, and a predecessor that published no whole-operator boundary is refused as
+a join target.
+
+Both therefore read failure details only from the run's own retained published
 result. A missing or short result leaves the execution error intact rather than
-reading a shared header that the successor may have reset. A2/A3 uses serial
-launch and retains the shared-header fallback while the failed run owns the
-execution claim. Submission capability and error ownership form one contract.
-The retained result prevents a successor's shared-memory reset from corrupting
-the predecessor's reported status. Extending this capability to A2/A3 would
-require the corresponding ordering and result-publication contract; changing
-only the capability flag or the shared-header fallback would be insufficient.
-See host runtime implementations ([A2/A3][a3-maker], [A5][a5-maker]) and
+reading a shared header that the successor may have reset. Submission capability
+and error ownership form one contract: the retained result prevents a
+successor's shared-memory reset from corrupting the predecessor's reported
+status, which is why neither platform keeps a shared-header fallback. See host
+runtime implementations ([A2/A3][a3-maker], [A5][a5-maker]) and
 [host execution ordering][runner].
 
 ## Diagnostic Differences
