@@ -121,6 +121,21 @@ std::string read_file(const fs::path &p) {
 }
 
 /**
+ * The one file a given epoch published, wherever its run reserved a directory.
+ *
+ * Found by the per-run file name rather than by a directory index: which
+ * `swimlane-<k>` a run took is a reservation detail, and a case that asserted
+ * one would be asserting the layout instead of the ownership it cares about.
+ */
+fs::path published_file_for_epoch(const fs::path &root, uint64_t epoch) {
+    const std::string wanted = "records_e" + std::to_string(epoch) + ".json";
+    for (const auto &path : published_files(root)) {
+        if (path.filename().string() == wanted) return path;
+    }
+    return {};
+}
+
+/**
  * Ordered teardown for a collector a case started for itself.
  *
  * A failed `ASSERT_*` returns from the case body, so this belongs on a
@@ -1075,8 +1090,8 @@ TEST(ChipSwimlaneRetainedRunsTest, SlotReuseAcrossRunsKeepsEachRunsRecordsInItsO
     EXPECT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
     for (int i = 0; i < kRuns; i++) {
         const uint64_t epoch = kBase + static_cast<uint64_t>(i);
-        const fs::path expected = fx.dir.path() / "swimlane-0" / ("records_e" + std::to_string(epoch) + ".json");
-        ASSERT_TRUE(fs::exists(expected)) << expected.string();
+        const fs::path expected = published_file_for_epoch(fx.dir.path(), epoch);
+        ASSERT_FALSE(expected.empty()) << "epoch " << epoch << " published no artifact of its own";
         EXPECT_EQ(rows_for_epoch(read_file(expected), epoch), static_cast<size_t>(i + 1))
             << "epoch " << epoch << " did not carry exactly its own records";
     }
@@ -1781,4 +1796,212 @@ TEST(ChipSwimlaneRetainedRunsTest, HostOrchestratedRunsPublishTheirOwnPhasesAtOr
         }
     }
     EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
+}
+
+// ---------------------------------------------------------------------------
+// Which submission an artifact belongs to, and where it is published
+// ---------------------------------------------------------------------------
+//
+// A retained artifact is only useful if a reader can tell which of a Worker's
+// submissions produced it. The identity travels by value from the run's
+// descriptor into the bucket's export, and the artifact is published into a
+// directory reserved under that run's own output prefix — so a Worker that
+// changes its prefix between submissions writes each run where that run asked.
+
+/** The submission identity a run of the staged or serial route carries. */
+NativeRunArtifactIdentity named_submission(uint64_t run_id, uint64_t dispatch_id, uint32_t rank) {
+    NativeRunArtifactIdentity who{};
+    who.run_id = run_id;
+    who.dispatch_id = dispatch_id;
+    who.generation = 1;
+    // A full-width draw, as `mint_owner_instance_id` makes: all-zero is the
+    // "nothing stated" value and must not be mistaken for an identity.
+    const uint8_t nonce[8] = {0x0f, 0x1e, 0x2d, 0x3c, 0x4b, 0x5a, 0x69, 0x78};
+    std::memcpy(who.owner_instance_id, nonce, sizeof(nonce));
+    who.pipeline_slot = 0;
+    who.chip_rank = rank;
+    who.capture_index = 0;
+    who.task_slot = 5;
+    who.group_index = 0;
+    who.group_size = 1;
+    return who;
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, AnArtifactNamesTheSubmissionThatProducedIt) {
+    RetainedRunsFixture fx("named", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kEpoch = 7701;
+    const NativeRunArtifactIdentity who = named_submission(/*run_id=*/17, /*dispatch_id=*/4, /*rank=*/2);
+
+    ASSERT_NE(fx.shm(), nullptr);
+    ASSERT_TRUE(fx.collector.run_begin(kEpoch, fx.dir.str(), fx.level, nullptr, 0, false, &who));
+    set_platform_run_result(/*region_base=*/0, kEpoch);
+    set_chip_swimlane_enabled(true);
+    set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(fx.shm()));
+    set_platform_chip_swimlane_aicore_rotation_table(0);
+    set_platform_chip_swimlane_run_terminal_bank(
+        reinterpret_cast<uint64_t>(fx.collector.arm_run_terminal_bank(/*bank_index=*/0, kEpoch))
+    );
+    chip_swimlane_aicpu_init(fx.num_aicore);
+    fx.dispatch(/*core_id=*/0, 1);
+    fx.close(kEpoch, cores, 1);
+    ASSERT_TRUE(fx.wait_for_files(1));
+
+    const std::string body = read_file(published_files(fx.dir.path()).front());
+    EXPECT_NE(body.find("\"status\": \"identified\""), std::string::npos) << body;
+    EXPECT_NE(body.find("\"owner_instance_id\": \"0f1e2d3c4b5a6978\""), std::string::npos) << body;
+    EXPECT_NE(body.find("\"run_id\": 17"), std::string::npos) << body;
+    EXPECT_NE(body.find("\"endpoint_dispatch_id\": 4"), std::string::npos) << body;
+    EXPECT_NE(body.find("\"chip_rank\": 2"), std::string::npos) << body;
+    // The acceptance sink is the caller's pointer and its sentinel, and never
+    // reaches output metadata.
+    EXPECT_EQ(body.find("accepted_state"), std::string::npos) << body;
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, ARunThatNamedNoSubmissionSaysSoRatherThanPublishingZeros) {
+    RetainedRunsFixture fx("unnamed", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kEpoch = 7801;
+
+    // The admission a low-level caller makes: no identity to state at all.
+    fx.begin(kEpoch);
+    fx.dispatch(/*core_id=*/0, 1);
+    fx.close(kEpoch, cores, 1);
+    ASSERT_TRUE(fx.wait_for_files(1));
+
+    const std::string body = read_file(published_files(fx.dir.path()).front());
+    EXPECT_NE(body.find("\"status\": \"unidentified\""), std::string::npos) << body;
+    // Null, not zero: zero is a value a reader could match, and nothing was
+    // stated to match against.
+    EXPECT_NE(body.find("\"run_id\": null"), std::string::npos) << body;
+    EXPECT_NE(body.find("\"owner_instance_id\": null"), std::string::npos) << body;
+    // The resource position is a fact about the run whatever was stated.
+    EXPECT_NE(body.find("\"pipeline_slot\": 0"), std::string::npos) << body;
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, ARunUnderANewPrefixPublishesUnderThatPrefix) {
+    RetainedRunsFixture fx("prefix-first", /*cores=*/1, /*threads=*/1);
+    ArtifactRoot second("prefix-second");
+    const int cores[] = {0};
+    constexpr uint64_t kFirst = 7901;
+    constexpr uint64_t kSecond = 7902;
+
+    fx.begin(kFirst);
+    fx.dispatch(/*core_id=*/0, 1);
+    fx.close(kFirst, cores, 1);
+    ASSERT_TRUE(fx.wait_for_files(1));
+
+    // The same collector, the same run table, a different output prefix: no
+    // rebuild happens, and the artifact must still land where this run asked.
+    ASSERT_TRUE(fx.collector.run_begin(kSecond, second.str(), fx.level, nullptr, 0, false));
+    set_platform_run_result(/*region_base=*/0, kSecond);
+    set_platform_chip_swimlane_run_terminal_bank(
+        reinterpret_cast<uint64_t>(fx.collector.arm_run_terminal_bank(/*bank_index=*/0, kSecond))
+    );
+    fx.dispatch(/*core_id=*/0, 1);
+    fx.close(kSecond, cores, 1);
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(8000);
+    while (published_files(second.path()).empty() && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_EQ(published_files(second.path()).size(), 1u) << "the second run did not publish under its own prefix";
+    EXPECT_EQ(published_files(fx.dir.path()).size(), 1u) << "the first run's prefix gained a file it never asked for";
+    EXPECT_NE(
+        published_files(second.path()).front().filename().string().find(std::to_string(kSecond)), std::string::npos
+    );
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, AWithdrawnRunGivesBackTheDirectoryItReserved) {
+    RetainedRunsFixture fx("withdraw-dir", /*cores=*/1, /*threads=*/1);
+    constexpr uint64_t kEpoch = 8001;
+
+    ASSERT_TRUE(fx.collector.run_begin(kEpoch, fx.dir.str(), fx.level, nullptr, 0, false));
+    bool reserved = false;
+    std::error_code ec;
+    for (const auto &entry : fs::directory_iterator(fx.dir.path(), ec)) {
+        if (entry.is_directory()) reserved = true;
+    }
+    ASSERT_TRUE(reserved) << "admission did not reserve a directory for this run";
+
+    // A launch that submitted nothing: the slot goes back, and so does the
+    // empty directory this run created for an artifact it never promised.
+    ASSERT_TRUE(fx.collector.abandon_run(kEpoch));
+    bool left_behind = false;
+    for (const auto &entry : fs::directory_iterator(fx.dir.path(), ec)) {
+        if (entry.is_directory()) left_behind = true;
+    }
+    EXPECT_FALSE(left_behind) << "a withdrawn run kept an empty artifact directory";
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 0u);
+}
+
+TEST(ChipSwimlaneRetainedRunsTest, RunsUnderOnePrefixEachOwnTheirOwnDirectory) {
+    RetainedRunsFixture fx("owned-dir", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kBase = 8101;
+
+    for (int i = 0; i < 3; i++) {
+        const uint64_t epoch = kBase + static_cast<uint64_t>(i);
+        fx.begin(epoch);
+        fx.dispatch(/*core_id=*/0, i + 1);
+        fx.close(epoch, cores, 1);
+    }
+    // The retirement barrier rather than the files' appearance: publication
+    // links the final name beside a `.tmp` it unlinks straight after, so a
+    // directory listing taken the moment the last file exists can still hold
+    // both. A flush returns once every run has been retired.
+    std::string error;
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error)) << error;
+
+    // One reservation per run, so no two runs ever name the same directory and
+    // a withdrawal can give one back without consulting the others.
+    size_t directories = 0;
+    std::error_code ec;
+    for (const auto &entry : fs::directory_iterator(fx.dir.path(), ec)) {
+        if (!entry.is_directory()) continue;
+        directories++;
+        size_t files = 0;
+        for (const auto &inner : fs::directory_iterator(entry.path(), ec)) {
+            if (inner.is_regular_file()) files++;
+        }
+        EXPECT_EQ(files, 1u) << entry.path().string() << " holds more than its own run's artifact";
+    }
+    EXPECT_EQ(directories, 3u);
+    EXPECT_EQ(published_files(fx.dir.path()).size(), 3u);
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 0u);
+}
+
+// The reason a reservation is per run rather than per prefix. Two runs are
+// admitted under one prefix and neither has published yet, so a shared
+// directory would be empty and `rmdir` would succeed on it — taking the
+// surviving run's destination with it. Owning one directory each is what makes
+// the withdrawal's cleanup local.
+TEST(ChipSwimlaneRetainedRunsTest, AWithdrawnRunLeavesAnotherAdmittedRunsDirectoryAlone) {
+    RetainedRunsFixture fx("withdraw-peer", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kKept = 8201;
+    constexpr uint64_t kWithdrawn = 8202;
+
+    fx.begin(kKept);
+    fx.dispatch(/*core_id=*/0, 1);
+    ASSERT_TRUE(fx.collector.run_begin(kWithdrawn, fx.dir.str(), fx.level, nullptr, 0, false));
+    std::error_code ec;
+    size_t admitted_dirs = 0;
+    for (const auto &entry : fs::directory_iterator(fx.dir.path(), ec)) {
+        if (entry.is_directory()) admitted_dirs++;
+    }
+    ASSERT_EQ(admitted_dirs, 2u) << "two admitted runs did not reserve two directories";
+
+    ASSERT_TRUE(fx.collector.abandon_run(kWithdrawn));
+    fx.close(kKept, cores, 1);
+    // The retirement barrier, not the file's appearance: `seal_and_publish_run`
+    // publishes and only then finishes the run, so the artifact is visible
+    // while the writer still owns the bucket. A flush waits for the slot to come
+    // back, and reports the write failure a removed directory would have caused
+    // instead of leaving it to a file count.
+    std::string error;
+    ASSERT_TRUE(fx.collector.flush_retained_runs(8000, &error))
+        << "the surviving run lost the directory it was going to publish into: " << error;
+    EXPECT_EQ(published_files(fx.dir.path()).size(), 1u);
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().open_slots, 0u);
 }

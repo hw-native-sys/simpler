@@ -29,6 +29,7 @@
 #include <gtest/gtest.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
@@ -39,6 +40,7 @@
 #include <future>
 #include <iterator>
 #include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -395,28 +397,69 @@ struct TightBudgetFixture {
     }
 };
 
+/** Every artifact directory reserved under one output root, right now. */
+std::set<fs::path> reserved_directories(const fs::path &root) {
+    std::set<fs::path> found;
+    std::error_code ec;
+    for (const auto &entry : fs::directory_iterator(root, ec)) {
+        if (entry.is_directory()) found.insert(entry.path());
+    }
+    return found;
+}
+
 /**
- * The text of the artifact a run published, once the writer has been waited
- * for.
+ * The directory one admission added between two listings.
  *
- * `run_close` only hands the bucket over; from there it is the writer's, and
- * the slot returns to `Free` as soon as the file exists. So a closed run's
- * verdict is read from that file -- which is stable and is what a consumer
- * sees -- rather than from a bucket that may already have been retired.
- * `flush_retained_runs` is the production wait for exactly that publication.
+ * Each admitted run reserves its own directory, so which directory belongs to
+ * which run is not a fact about the index in its name — it is the difference
+ * that run's admission made. A test that has to reach one particular run's
+ * storage asks that way rather than assuming an order.
  */
-std::string published_artifact(ChipSwimlaneCollector &collector, const fs::path &root, uint64_t epoch) {
-    std::string error;
-    const bool flushed = collector.flush_retained_runs(/*timeout_ms=*/8000, &error);
+fs::path directory_added_between(const std::set<fs::path> &before, const std::set<fs::path> &after) {
+    std::vector<fs::path> added;
+    std::set_difference(after.begin(), after.end(), before.begin(), before.end(), std::back_inserter(added));
+    if (added.size() != 1) {
+        ADD_FAILURE() << "one admission reserved " << added.size() << " directories, not one";
+        return {};
+    }
+    return added.front();
+}
+
+/** Where one epoch's artifact was published, or empty when it was not. */
+fs::path published_path(const fs::path &root, uint64_t epoch) {
     const std::string name = "records_e" + std::to_string(epoch) + ".json";
     std::error_code ec;
     for (const auto &entry : fs::directory_iterator(root, ec)) {
         if (!entry.is_directory()) continue;
         const fs::path candidate = entry.path() / name;
-        if (!fs::exists(candidate, ec)) continue;
-        std::ifstream in(candidate);
-        return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        if (fs::exists(candidate, ec)) return candidate;
     }
+    return {};
+}
+
+/** The whole text of a file, for a case that reads one it already located. */
+std::string file_text(const fs::path &path) {
+    std::ifstream in(path);
+    return std::string((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+}
+
+/**
+ * The text of the artifact a run published, once the writer has been waited
+ * for.
+ *
+ * `run_close` only hands the bucket over; from there it is the writer's, and
+ * the slot returns to `Free` after the file exists. So a closed run's
+ * verdict is read from that file -- which is stable and is what a consumer
+ * sees -- rather than from a bucket that may already have been retired.
+ * `flush_retained_runs` is the production wait for exactly that publication.
+ * Which directory holds it is the publishing run's own business: each
+ * admission reserves one, so the lookup is by name across all of them.
+ */
+std::string published_artifact(ChipSwimlaneCollector &collector, const fs::path &root, uint64_t epoch) {
+    std::string error;
+    const bool flushed = collector.flush_retained_runs(/*timeout_ms=*/8000, &error);
+    const fs::path path = published_path(root, epoch);
+    if (!path.empty()) return file_text(path);
     ADD_FAILURE() << "run " << epoch << " published no artifact under " << root << "; flush returned " << flushed
                   << " (" << error << ")";
     return {};
@@ -952,21 +995,21 @@ TEST(SwimlaneGrantedCapacityTest, OneRunsPublicationFailureDoesNotDisturbTheOthe
     // replace, so a squatter on the name is what makes the write fail.
     AdmissionFixture fx("granted-isolation", ChipSwimlaneModule::kMaxOpenEpochs);
     ASSERT_TRUE(fx.collector.run_begin(101, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    const std::set<fs::path> after_first = reserved_directories(fx.root);
 
-    // The artifact directory is reserved by the first admission, so it exists
-    // only from here.
-    fs::path taken;
-    std::error_code ec;
-    for (const auto &entry : fs::directory_iterator(fx.root, ec)) {
-        if (entry.is_directory()) taken = entry.path() / "records_e102.json";
-    }
-    ASSERT_FALSE(taken.empty());
+    // The squatter has to occupy the name the *middle* run will publish, and
+    // every run owns its own directory, so that name exists in exactly one
+    // place: the directory this admission reserves. A squatter anywhere else
+    // collides with nothing.
+    ASSERT_TRUE(fx.collector.run_begin(102, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
+    const fs::path middle = directory_added_between(after_first, reserved_directories(fx.root));
+    ASSERT_FALSE(middle.empty());
+    const fs::path taken = middle / "records_e102.json";
     {
         std::ofstream squatter(taken);
         squatter << "occupied";
     }
 
-    ASSERT_TRUE(fx.collector.run_begin(102, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     ASSERT_TRUE(fx.collector.run_begin(103, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
 
     fx.collector.run_close(101, /*bank_index=*/0, /*device_execution_complete=*/false);
@@ -979,14 +1022,18 @@ TEST(SwimlaneGrantedCapacityTest, OneRunsPublicationFailureDoesNotDisturbTheOthe
     EXPECT_FALSE(fx.collector.flush_retained_runs(8000, &error));
     EXPECT_NE(error.find("write_failed"), std::string::npos) << error;
     EXPECT_NE(error.find("102"), std::string::npos) << error;
+    EXPECT_EQ(file_text(taken), "occupied") << "the failing run replaced the name it collided with";
 
+    std::set<fs::path> neighbour_dirs;
     for (const uint64_t epoch : {101u, 103u}) {
-        const fs::path file = taken.parent_path() / ("records_e" + std::to_string(epoch) + ".json");
-        ASSERT_TRUE(fs::exists(file, ec)) << "run " << epoch << " lost its artifact to its neighbour's failure";
-        std::ifstream in(file);
-        const std::string artifact((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-        EXPECT_NE(artifact.find("\"run_epoch\": " + std::to_string(epoch)), std::string::npos) << artifact;
+        const fs::path file = published_path(fx.root, epoch);
+        ASSERT_FALSE(file.empty()) << "run " << epoch << " lost its artifact to its neighbour's failure";
+        EXPECT_NE(file.parent_path(), middle) << "run " << epoch << " published into the failing run's directory";
+        neighbour_dirs.insert(file.parent_path());
+        EXPECT_NE(file_text(file).find("\"run_epoch\": " + std::to_string(epoch)), std::string::npos)
+            << file_text(file);
     }
+    EXPECT_EQ(neighbour_dirs.size(), 2u) << "the two surviving runs published into one directory";
     EXPECT_TRUE(fx.collector.can_admit_retained_run()) << "a write failure still gives its capacity back";
 }
 

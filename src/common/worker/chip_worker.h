@@ -121,7 +121,8 @@ public:
         volatile int32_t *accepted_state, int32_t accepted_value);
     void run_with_lease(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, uint64_t run_id = 0,
+        uint64_t dispatch_id = 0, NativeRunProvenance provenance = {}
     );
 
     /**
@@ -147,7 +148,7 @@ public:
     ChipWorkerNativeRun prepare_native_run(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id = 0, uint64_t dispatch_id = 0, volatile int32_t *accepted_state = nullptr,
-        int32_t accepted_value = 0
+        int32_t accepted_value = 0, NativeRunProvenance provenance = {}
     );
     void launch_native_run(const ChipWorkerNativeRun &run);
     /**
@@ -227,7 +228,7 @@ public:
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
-        bool activated = true
+        bool activated = true, NativeRunProvenance provenance = {}
     );
     // Direct submission: no pipeline lease, so the lane admits at capacity one
     // by draining its predecessor before this run enters the FIFO. run() is the
@@ -608,12 +609,12 @@ private:
     ChipWorkerNativeRun prepare_native_run_on_slot(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
         uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-        int32_t accepted_value, bool admit_pipeline_generation
+        int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
     );
     ChipWorkerNativeRun prepare_native_run_for_lane(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-        bool pipeline_leased
+        bool pipeline_leased, NativeRunProvenance provenance
     );
     void cleanup_native_runs_noexcept() noexcept;
 

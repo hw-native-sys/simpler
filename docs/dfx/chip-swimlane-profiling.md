@@ -217,6 +217,32 @@ and pipeline diagnostics. All members submitted through one
 the current postprocessor therefore retains local-capture-index pairing for
 them and requires symmetric `dN` sets.
 
+#### Retained runs (`collect_across_runs=True`)
+
+A retained collector keeps several runs open at once, so one fixed file name
+cannot hold them. Each admitted run reserves its own directory under the prefix
+*that run* named and publishes one file in it:
+
+```text
+<output_prefix>/rank0/d0/
+├── dispatch_identity.json          # the submission that produced the run
+└── swimlane-0/
+    └── records_e<run_epoch>.json   # that run's records, and nothing else
+```
+
+`swimlane-<k>` is a reservation index taken by exclusive `mkdir`, not an
+identity: two processes sharing a prefix take different indexes, and nothing is
+derived from a pid. The run's own identity is published inside the artifact, as
+`metadata.collection.dispatch`, and that is what pairs it with the sidecar
+beside it — `owner_instance_id`, `chip_rank`, `run_id` and
+`endpoint_dispatch_id`, all four, never a filename or a directory order. A run
+whose caller stated no identity publishes `"status": "unidentified"` with null
+fields and is converted by naming its file explicitly.
+
+The two file forms are read by different rules and are never merged. A
+directory holding both offers two conversion units; name one of them with
+`--dispatch d0:fixed` or `--dispatch d0:retained`.
+
 When an L3 Worker is attached below L4, all of its outputs first enter the
 parent-assigned node namespace:
 

@@ -31,6 +31,9 @@ struct ChipRunState {
     PipelineSlotLease lease{};
     uint64_t run_id{0};
     uint64_t dispatch_id{0};
+    // Where the submission came from, for diagnostic attribution only. Stored
+    // because a queued run prepares at the front, long after its submit.
+    NativeRunProvenance provenance{};
     volatile int32_t *accepted_state{nullptr};
     int32_t accepted_value{0};
     ChipWorkerNativeRun native_run{};
@@ -175,7 +178,7 @@ struct ChipRunLaneState {
     void prepare(const std::shared_ptr<ChipRunState> &run) {
         run->native_run = worker->prepare_native_run_for_lane(
             run->callable_id, &run->args, run->config, run->lease, run->run_id, run->dispatch_id, run->accepted_state,
-            run->accepted_value, run->pipeline_leased
+            run->accepted_value, run->pipeline_leased, run->provenance
         );
         run->phase = ChipRunState::Phase::PREPARED;
         run->disposition = ChipRunPreparationDisposition::NATIVE_PREPARED;
@@ -725,7 +728,8 @@ ChipRunLane::~ChipRunLane() {
 
 ChipRun ChipRunLane::submit(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, const PipelineSlotLease &lease,
-    uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value, bool activated
+    uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value, bool activated,
+    NativeRunProvenance provenance
 ) {
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->require_usable();
@@ -758,6 +762,7 @@ ChipRun ChipRunLane::submit(
     run->lease = lease;
     run->run_id = run_id;
     run->dispatch_id = dispatch_id;
+    run->provenance = provenance;
     run->accepted_state = accepted_state;
     run->accepted_value = accepted_value;
     run->pipeline_leased = true;

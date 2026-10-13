@@ -18,6 +18,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/core_type.h"
 #include "host/pmu_collector.h"
+#include "worker/runtime_c_api.h"
 
 /**
  * The diagnostics metadata one run owns, handed to a retaining collector at
@@ -37,6 +38,13 @@ struct RunLocalDfxMetadata {
     const CoreType *core_types{nullptr};
     int core_type_count{0};
     bool host_orchestrated{false};
+    /**
+     * This run's published identity, borrowed for the admission call only.
+     *
+     * Null when the caller has none to state. Like `core_types`, the bucket
+     * takes its own copy; nothing here outlives the call.
+     */
+    const NativeRunArtifactIdentity *artifact_identity{nullptr};
 };
 
 /**

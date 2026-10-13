@@ -123,7 +123,8 @@ public:
             dfx(std::move(other.dfx)),
             pipeline_slot(other.pipeline_slot),
             num_aicore(other.num_aicore),
-            launch_aicpu_num(other.launch_aicpu_num) {}
+            launch_aicpu_num(other.launch_aicpu_num),
+            artifact_identity(other.artifact_identity) {}
         PreparedExecution &operator=(PreparedExecution &&) = delete;
 
         NativeRunIdentity identity{};
@@ -143,6 +144,15 @@ public:
         uint32_t pipeline_slot{PTO_PIPELINE_MAX_DEPTH};
         int num_aicore{0};
         int launch_aicpu_num{0};
+        /**
+         * This run's whole published identity, copied from its descriptor.
+         *
+         * `identity` above is what later phase calls address the run by and has
+         * no field for `run_id`; a diagnostic artifact needs that plus the
+         * submitting Worker's provenance to be attributed to its submission. An
+         * all-zero `owner_instance_id` means the caller stated none.
+         */
+        NativeRunArtifactIdentity artifact_identity{};
     };
 
     struct ActiveExecution {

@@ -74,6 +74,36 @@ namespace nb = nanobind;
 
 namespace {
 
+/**
+ * Build one run's provenance from the values the chip child already holds.
+ *
+ * `owner_instance_id` is the submitting Worker's nonce, carried as `bytes`
+ * because it is `os.urandom` output: it may hold NUL and is not text, so it is
+ * copied verbatim and never decoded. Anything other than exactly
+ * `OWNER_INSTANCE_ID_BYTES` of it — including the empty `bytes` a caller passes
+ * when it has no Worker identity — leaves the nonce all-zero, which is this
+ * structure's "nothing stated" value and the only state a reader refuses to
+ * match on. A short or long nonce is therefore declined rather than padded into
+ * something that looks like an identity.
+ *
+ * Reads the Python object, so every caller builds the whole POD before it
+ * releases the GIL.
+ */
+NativeRunProvenance make_run_provenance(
+    const nb::bytes &owner_instance_id, uint32_t chip_rank, uint32_t capture_index, uint32_t task_slot,
+    uint32_t group_index, uint32_t group_size
+) {
+    NativeRunProvenance provenance{};
+    if (owner_instance_id.size() != OWNER_INSTANCE_ID_BYTES) return provenance;
+    std::memcpy(provenance.owner_instance_id, owner_instance_id.c_str(), OWNER_INSTANCE_ID_BYTES);
+    provenance.chip_rank = chip_rank;
+    provenance.capture_index = capture_index;
+    provenance.task_slot = task_slot;
+    provenance.group_index = group_index;
+    provenance.group_size = group_size;
+    return provenance;
+}
+
 struct LocalAclMemLocation {
     uint32_t id{0};
     int type{0};
@@ -3662,16 +3692,26 @@ NB_MODULE(_task_interface, m) {
             "_submit_chip_run_materialized",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
                uint32_t slot_id, uint64_t generation, uint64_t run_id, uint64_t dispatch_id,
-               uint64_t accepted_state_addr, int32_t accepted_value, bool activated) {
+               uint64_t accepted_state_addr, int32_t accepted_value, bool activated, nb::bytes owner_instance_id,
+               uint32_t chip_rank, uint32_t capture_index, uint32_t task_slot, uint32_t group_index,
+               uint32_t group_size) {
+                const NativeRunProvenance provenance = make_run_provenance(
+                    owner_instance_id, chip_rank, capture_index, task_slot, group_index, group_size
+                );
+                nb::gil_scoped_release release;
                 return self.submit_chip_run(
                     callable_id, args, config, PipelineSlotLease{slot_id, 0, generation}, run_id, dispatch_id,
-                    reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, activated
+                    reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, activated, provenance
                 );
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("slot_id"), nb::arg("generation"),
             nb::arg("run_id"), nb::arg("dispatch_id"), nb::arg("accepted_state_addr"), nb::arg("accepted_value"),
-            nb::arg("activated"), nb::call_guard<nb::gil_scoped_release>(),
-            "Submit materialized task args to the chip native-run lane."
+            nb::arg("activated"), nb::arg("owner_instance_id") = nb::bytes(""), nb::arg("chip_rank") = 0,
+            nb::arg("capture_index") = 0, nb::arg("task_slot") = 0, nb::arg("group_index") = 0,
+            nb::arg("group_size") = 0,
+            "Submit materialized task args to the chip native-run lane. The provenance arguments name the "
+            "submission a diagnostic artifact belongs to; an empty owner_instance_id states none. The nonce is "
+            "copied into the POD under the GIL, which the submission itself then releases."
         )
         .def(
             "_close_chip_run_lane", &ChipWorker::close_chip_run_lane, nb::call_guard<nb::gil_scoped_release>(),
@@ -3778,7 +3818,9 @@ NB_MODULE(_task_interface, m) {
             "run_materialized",
             [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
                uint64_t accepted_state_addr, int32_t accepted_value, uint32_t pipeline_slot,
-               uint64_t pipeline_generation) {
+               uint64_t pipeline_generation, uint64_t run_id, uint64_t dispatch_id, nb::bytes owner_instance_id,
+               uint32_t chip_rank, uint32_t capture_index, uint32_t task_slot, uint32_t group_index,
+               uint32_t group_size) {
                 if (pipeline_generation == 0) {
                     self.run(
                         callable_id, &args, config, reinterpret_cast<volatile int32_t *>(accepted_state_addr),
@@ -3787,14 +3829,22 @@ NB_MODULE(_task_interface, m) {
                 } else {
                     self.run_with_lease(
                         callable_id, &args, config, PipelineSlotLease{pipeline_slot, 0, pipeline_generation},
-                        reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value
+                        reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, run_id, dispatch_id,
+                        make_run_provenance(
+                            owner_instance_id, chip_rank, capture_index, task_slot, group_index, group_size
+                        )
                     );
                 }
             },
             nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::arg("accepted_state_addr") = 0,
             nb::arg("accepted_value") = 0, nb::arg("pipeline_slot") = 0, nb::arg("pipeline_generation") = 0,
+            nb::arg("run_id") = 0, nb::arg("dispatch_id") = 0, nb::arg("owner_instance_id") = nb::bytes(""),
+            nb::arg("chip_rank") = 0, nb::arg("capture_index") = 0, nb::arg("task_slot") = 0,
+            nb::arg("group_index") = 0, nb::arg("group_size") = 0,
             "Launch a callable_id from the runtime.so-ABI POD a chip-child mailbox loop built with "
-            "materialize_task_args, so no Python code re-implements the tensor/scalar layout."
+            "materialize_task_args, so no Python code re-implements the tensor/scalar layout. The identity and "
+            "provenance arguments name the submission a diagnostic artifact belongs to; an empty "
+            "owner_instance_id states none."
         )
         .def(
             "unregister_callable",

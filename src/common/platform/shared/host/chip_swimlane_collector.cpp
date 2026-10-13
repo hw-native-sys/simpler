@@ -37,6 +37,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -2386,7 +2387,51 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
         outfile << "      \"handoff_identity_verified\": "
                 << (data.collection.handoff_identity_verified ? "true" : "false") << ",\n";
         outfile << "      \"cut_failed_queues\": " << data.collection.cut_failed_queues << ",\n";
-        outfile << "      \"verdict\": \"" << simpler::dfx::runs::verdict_name(data.collection.verdict) << "\"\n";
+        outfile << "      \"verdict\": \"" << simpler::dfx::runs::verdict_name(data.collection.verdict) << "\",\n";
+        // The submission this run's records belong to. `status` is the only
+        // field a reader may branch on: an all-zero nonce means the admitting
+        // caller stated nothing, and the identity fields are then null rather
+        // than zero, because zero is not an identity anywhere in this subsystem.
+        const NativeRunArtifactIdentity &who = data.artifact_identity;
+        bool stated = false;
+        for (unsigned char byte : who.owner_instance_id) {
+            if (byte != 0) {
+                stated = true;
+                break;
+            }
+        }
+        outfile << "      \"dispatch\": {\n";
+        outfile << "        \"status\": \"" << (stated ? "identified" : "unidentified") << "\",\n";
+        if (stated) {
+            outfile << "        \"owner_instance_id\": \"";
+            for (unsigned char byte : who.owner_instance_id) {
+                outfile << std::hex << std::setw(2) << std::setfill('0') << static_cast<unsigned>(byte);
+            }
+            outfile << std::dec << std::setfill(' ') << "\",\n";
+            outfile << "        \"chip_rank\": " << who.chip_rank << ",\n";
+            outfile << "        \"capture_index\": " << who.capture_index << ",\n";
+            outfile << "        \"run_id\": " << who.run_id << ",\n";
+            outfile << "        \"endpoint_dispatch_id\": " << who.dispatch_id << ",\n";
+            outfile << "        \"task_slot\": " << who.task_slot << ",\n";
+            outfile << "        \"group_index\": " << who.group_index << ",\n";
+            outfile << "        \"group_size\": " << who.group_size << ",\n";
+        } else {
+            outfile << "        \"owner_instance_id\": null,\n";
+            outfile << "        \"chip_rank\": null,\n";
+            outfile << "        \"capture_index\": null,\n";
+            outfile << "        \"run_id\": null,\n";
+            outfile << "        \"endpoint_dispatch_id\": null,\n";
+            outfile << "        \"task_slot\": null,\n";
+            outfile << "        \"group_index\": null,\n";
+            outfile << "        \"group_size\": null,\n";
+        }
+        // Published whatever the status: a resource position is a fact about the
+        // run even when nobody said which submission produced it. Necessary for
+        // diagnostics and deliberately not part of any matching key, because a
+        // slot and a lease generation repeat.
+        outfile << "        \"pipeline_slot\": " << who.pipeline_slot << ",\n";
+        outfile << "        \"pipeline_generation\": " << who.generation << "\n";
+        outfile << "      }\n";
         outfile << "    },\n";
     }
     outfile << "    \"clock_freq_hz\": " << PLATFORM_PROF_SYS_CNT_FREQ << ",\n";
@@ -2794,10 +2839,14 @@ std::atomic<uint64_t> g_artifact_dir_seq{0};
 
 size_t ChipSwimlaneCollector::retained_run_fixed_bytes() const {
     // Everything an admitted epoch holds whose size a platform maximum already
-    // bounds, plus an allowance for the two paths a run and its writer keep.
-    // Reserved rather than charged, so an epoch that has been admitted can
-    // never be refused the storage its own artifact needs — a refusal there
-    // could only answer by omitting metadata the file is not readable without.
+    // bounds, plus an allowance for the three paths a run, its reserved
+    // directory and its writer keep. Reserved rather than charged, so an epoch
+    // that has been admitted can never be refused the storage its own artifact
+    // needs — a refusal there could only answer by omitting metadata the file is
+    // not readable without.
+    //
+    // `sizeof(RunExport)` already covers the published identity the export
+    // carries inline; it is not added a second time here.
     //
     // The terminal snapshot's per-class index vectors are owned storage the
     // `RunExport` shell does not cover: the shell holds the vector objects, not
@@ -2809,7 +2858,7 @@ size_t ChipSwimlaneCollector::retained_run_fixed_bytes() const {
     return sizeof(RunExport) + static_cast<size_t>(PLATFORM_MAX_CORES) * sizeof(int8_t) +
            static_cast<size_t>(PLATFORM_MAX_CORES) * sizeof(CoreType) +
            static_cast<size_t>(PLATFORM_MAX_AICPU_THREADS) * sizeof(uint32_t) + terminal_indices +
-           2 * simpler::dfx::runs::kPathAllowanceBytes;
+           3 * simpler::dfx::runs::kPathAllowanceBytes;
 }
 
 size_t ChipSwimlaneCollector::retained_fixed_overhead() const {
@@ -2926,8 +2975,9 @@ bool ChipSwimlaneCollector::ensure_retained_runs_ready(const std::string &output
         return false;
     }
     // The per-epoch reservation covers a path of at most this length, and an
-    // artifact name is the reserved directory plus a bounded suffix. Refusing
-    // here is what lets every later path be reserved rather than charged.
+    // artifact name is that run's reserved directory plus a bounded suffix.
+    // Checked again per run in `run_begin`, because each run reserves under its
+    // own prefix and this one only sees the first.
     if (output_root.size() + 64 > simpler::dfx::runs::kPathAllowanceBytes) {
         LOG_ERROR(
             "ChipSwimlane: output root of %zu bytes exceeds the %zu byte path allowance", output_root.size(),
@@ -2937,11 +2987,6 @@ bool ChipSwimlaneCollector::ensure_retained_runs_ready(const std::string &output
     }
     const size_t fixed = retained_fixed_overhead();
     if (!host_budget_.open(retained_budget_bytes_, fixed)) return false;
-    std::string reserved_dir;
-    if (!reserve_artifact_directory(output_root, &reserved_dir)) {
-        host_budget_.close();
-        return false;
-    }
 
     // Twice the paired bytes `init()` seeded, per kind: one replenishment
     // generation beyond the seed is admitted and the rest refused. The seed is
@@ -2985,9 +3030,8 @@ bool ChipSwimlaneCollector::ensure_retained_runs_ready(const std::string &output
     set_run_counters(true);
     // Published last, and it is the whole readiness condition. Every step above
     // either succeeded or undid itself, so no half-prepared collector can be
-    // mistaken for a prepared one — and the directory only becomes this
-    // collector's once it is.
-    artifact_dir_ = std::move(reserved_dir);
+    // mistaken for a prepared one. No directory is taken here: each run reserves
+    // its own under its own prefix, in `run_begin`.
     retained_ready_.store(true, std::memory_order_release);
     try {
         // The writer is part of being prepared: without it a retained run is
@@ -3019,8 +3063,8 @@ bool ChipSwimlaneCollector::ensure_retained_runs_ready(const std::string &output
         }
     }
     LOG_INFO(
-        "ChipSwimlane: retaining runs in %s, budget %zu B (fixed %zu B)", artifact_dir_.c_str(), retained_budget_bytes_,
-        fixed
+        "ChipSwimlane: retaining runs under %s, budget %zu B (fixed %zu B)", output_root.c_str(),
+        retained_budget_bytes_, fixed
     );
     return true;
 }
@@ -3110,7 +3154,6 @@ void ChipSwimlaneCollector::release_retained_run_resources() {
         );
     }
     host_budget_.close();
-    artifact_dir_.clear();
     LOG_INFO("ChipSwimlane: retained runs released: %s", run_errors_.report().c_str());
 }
 
@@ -3311,7 +3354,7 @@ void ChipSwimlaneCollector::bump_control_view() {
 
 bool ChipSwimlaneCollector::run_begin(
     uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level, const CoreType *core_types,
-    int core_type_count, bool host_orchestrated
+    int core_type_count, bool host_orchestrated, const NativeRunArtifactIdentity *artifact_identity
 ) {
     // Nothing to admit a run into on a collector configured not to retain one.
     // A caller that reaches here in that state has already chosen the wrong
@@ -3322,13 +3365,35 @@ bool ChipSwimlaneCollector::run_begin(
     // run retains is reserved, not charged, so a prefix the reservation
     // cannot hold has to be turned away here rather than discovered later by a
     // charge that would have to keep what it could not pay for.
-    if (output_prefix.size() > simpler::dfx::runs::kPathAllowanceBytes) {
+    //
+    // The allowance has to cover the appended suffix too, not just the prefix:
+    // this run's artifact is `<prefix>/swimlane-<k>/records_e<epoch>.json`, so
+    // 64 bytes of headroom is what makes every later path reservable.
+    if (output_prefix.size() + 64 > simpler::dfx::runs::kPathAllowanceBytes) {
         LOG_ERROR(
             "ChipSwimlane: run %lu refused, its output prefix of %zu bytes exceeds the %zu byte allowance",
             static_cast<unsigned long>(run_epoch), output_prefix.size(), simpler::dfx::runs::kPathAllowanceBytes
         );
         return false;
     }
+    // This run's own artifact directory, reserved under its own prefix before a
+    // slot is claimed or a byte charged, and owned by this run alone: no other
+    // run publishes into it, so withdrawing this one can give it back without
+    // asking what anybody else is doing. Held locally until it is installed on
+    // the bucket, so every refusal below gives it back and nothing else owns
+    // it; from installation on it is the bucket's.
+    std::string reserved_dir;
+    if (!reserve_artifact_directory(output_prefix, &reserved_dir)) return false;
+    // Given back by `rmdir` alone, never recursively and never by unlinking a
+    // file: nothing has published into it yet, and anything that has is not
+    // this reservation's to remove.
+    auto discard_reservation = [&reserved_dir]() {
+        if (reserved_dir.empty()) return;
+        if (::rmdir(reserved_dir.c_str()) != 0) {
+            LOG_WARN("ChipSwimlane: %s is kept; it could not be removed", reserved_dir.c_str());
+        }
+        reserved_dir.clear();
+    };
     size_t slot = 0;
     {
         std::unique_lock<std::mutex> lk(retained_mu_);
@@ -3342,6 +3407,7 @@ bool ChipSwimlaneCollector::run_begin(
                 LOG_ERROR(
                     "ChipSwimlane: run %lu refused, the collector is fatal", static_cast<unsigned long>(run_epoch)
                 );
+                discard_reservation();
                 return false;
             }
             bool found = false;
@@ -3379,6 +3445,17 @@ bool ChipSwimlaneCollector::run_begin(
         bucket.pending.output_prefix = output_prefix;
         bucket.pending.level = level;
         bucket.pending.armed_run_epoch = run_epoch;
+        // The submission this run's records belong to, owned by the export the
+        // writer publishes from. A caller with none to state leaves the
+        // all-zero nonce, which is the only value a reader may not match on.
+        if (artifact_identity != nullptr) {
+            bucket.pending.artifact_identity = *artifact_identity;
+        }
+        // The directory becomes the bucket's here, under the same lock that
+        // installs the identity, so no exit after this point can leave it owned
+        // by nobody.
+        bucket.artifact_dir = std::move(reserved_dir);
+        reserved_dir.clear();
         bucket.terminal_ok = false;
         bucket.charged_bytes.store(0, std::memory_order_relaxed);
         bucket.verdict = simpler::dfx::runs::CollectionVerdict{};
@@ -3650,6 +3727,16 @@ bool ChipSwimlaneCollector::abandon_run(uint64_t run_epoch) {
     try {
         reset_epoch_store(slot, /*reset_merged_view=*/false);
     } catch (...) {}
+    // This run promised no file, and the directory it reserved is its own and
+    // still empty, so removing it releases nothing anybody holds. Attempted
+    // only on this proved-released path, never on the quarantine above, and by
+    // `rmdir` alone, so one that somehow holds a file stays. The result cannot
+    // change the withdrawal's outcome — the slot goes back either way.
+    try {
+        if (!bucket.artifact_dir.empty() && ::rmdir(bucket.artifact_dir.c_str()) != 0) {
+            LOG_WARN("ChipSwimlane: %s is kept; it could not be removed", bucket.artifact_dir.c_str());
+        }
+    } catch (...) {}
     // No verdict is recorded: a run that submitted nothing owes no file, so
     // reporting one would make a rolled-back launch read as a lost artifact and
     // fail every later flush.
@@ -3698,6 +3785,10 @@ void ChipSwimlaneCollector::release_run_slot(size_t slot) {
     // Free the storage first, then give its bytes back: a credit ahead of the
     // release would let an admission see headroom that does not exist yet.
     bucket.pending = RunExport{};
+    // The path is dropped, never the directory: a published run's artifact lives
+    // in it. Only a withdrawal that proved its references released removes one,
+    // and it does so before reaching here.
+    bucket.artifact_dir.clear();
     const size_t charged = bucket.charged_bytes.exchange(0, std::memory_order_acq_rel);
     if (charged > 0) host_budget_.credit(charged);
     // Published under `retained_mu_` so an admission waiting for capacity cannot
@@ -3853,7 +3944,10 @@ bool ChipSwimlaneCollector::seal_and_publish_run(size_t slot, simpler::dfx::runs
         return false;
     }
 
-    const std::string path = artifact_dir_ + "/records_e" + std::to_string(epoch) + ".json";
+    // This run's own reserved directory, taken at its admission from its own
+    // output prefix, so the artifact lands beside the dispatch companions that
+    // submission produced.
+    const std::string path = bucket.artifact_dir + "/records_e" + std::to_string(epoch) + ".json";
     const int rc = publish_run_file(data, path);
     if (rc != 0) {
         finish_retained_run(slot, simpler::dfx::runs::Verdict::WriteFailed, path.c_str());

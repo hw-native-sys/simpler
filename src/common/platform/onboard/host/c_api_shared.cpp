@@ -1632,6 +1632,11 @@ int simpler_prepare_run(
         // run constructs an edge the rest of this platform would never use.
         state->prepared_execution->joinable_boundary =
             state->descriptor.joinable_boundary != 0 && joined_native_launch_supported_impl() != 0;
+        // The run's own identity, by value, from the descriptor it was prepared
+        // with: `prepare_execution` receives only a `NativeRunIdentity`, which
+        // carries no `run_id`, so an artifact could not otherwise name the
+        // submission that produced it.
+        state->prepared_execution->artifact_identity = state->artifact_identity();
         state->runner_resources_owned = false;
         return 0;
     } catch (...) {

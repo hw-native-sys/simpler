@@ -29,7 +29,7 @@ from simpler_setup.scene_test import (
 )
 
 
-def _recording_converter(calls):
+def _recording_converter(calls, merged=True):
     """Stand in for the converter subprocess, reporting the success it models.
 
     The return value is the contract `_convert_rank_swimlanes` reads to decide
@@ -39,9 +39,111 @@ def _recording_converter(calls):
 
     def run(**kwargs):
         calls.append(kwargs)
-        return True
+        return merged
 
     return run
+
+
+def _write_retained_capture(capture, *, nonce="0f1e2d3c4b5a6978", run_id=17, epoch=4):
+    """One retained run's artifact and the sidecar that names it.
+
+    The artifact is not called `chip_swimlane_records.json` and does not sit in
+    the capture directory, so both the discovery and the per-Rank fallback have
+    to find it by the identity the two publish.
+    """
+    rank = int(capture.parent.name.removeprefix("rank"))
+    capture_index = int(capture.name.removeprefix("d"))
+    (capture / "swimlane-0").mkdir(parents=True)
+    artifact = capture / "swimlane-0" / f"records_e{epoch}.json"
+    artifact.write_text(
+        json.dumps(
+            {
+                "metadata": {
+                    "collection": {
+                        "run_epoch": epoch,
+                        "dispatch": {
+                            "status": "identified",
+                            "owner_instance_id": nonce,
+                            "chip_rank": rank,
+                            "run_id": run_id,
+                            "endpoint_dispatch_id": capture_index + 1,
+                        },
+                    }
+                }
+            }
+        )
+    )
+    (capture / "dispatch_identity.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "run_id": run_id,
+                "task_slot": 5,
+                "group_index": 0,
+                "group_size": 1,
+                "owner_instance_id": nonce,
+                "chip_rank": rank,
+                "local_capture_index": capture_index,
+                "endpoint_dispatch_id": capture_index + 1,
+                "pipeline_slot": 0,
+                "pipeline_generation": 1,
+                "callable_digest": "ab" * 32,
+            }
+        )
+    )
+    return artifact
+
+
+def test_l3_swimlane_postprocess_converts_the_retained_runs_of_each_dispatch(tmp_path, monkeypatch) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    artifacts = []
+    for dispatch, run_id in (("d0", 17), ("d1", 18)):
+        capture = tmp_path / "rank0" / dispatch
+        capture.mkdir(parents=True)
+        artifacts.append(_write_retained_capture(capture, run_id=run_id, epoch=4 + len(artifacts)))
+
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls))
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    assert [call["dispatch"] for call in calls] == ["d0", "d1"]
+
+
+def test_l3_swimlane_postprocess_falls_back_to_the_retained_file_itself(tmp_path, monkeypatch) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    capture = tmp_path / "rank0" / "d0"
+    capture.mkdir(parents=True)
+    artifact = _write_retained_capture(capture)
+
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls, merged=False))
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    # The merge first, then this Rank's own capture — named by what the
+    # directory actually holds, not by the fixed name it does not.
+    assert [call["input_path"] for call in calls] == [tmp_path, artifact]
+
+
+def test_l3_swimlane_postprocess_fallback_converts_only_the_selected_form(tmp_path, monkeypatch) -> None:
+    """A mixed directory is two units. Each failed merge falls back to the file
+    its own target selected; re-scanning the directory would convert the other
+    form again under the wrong target."""
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    capture = tmp_path / "rank0" / "d0"
+    capture.mkdir(parents=True)
+    retained = _write_retained_capture(capture)
+    fixed = capture / "chip_swimlane_records.json"
+    fixed.write_text("{}")
+
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls, merged=False))
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    assert [call.get("dispatch") for call in calls] == ["d0:fixed", None, "d0:retained", None]
+    assert [call["input_path"] for call in calls] == [tmp_path, fixed, tmp_path, retained]
 
 
 def test_l3_swimlane_postprocess_merges_dispatches_present_on_every_rank(tmp_path, monkeypatch) -> None:

@@ -1381,6 +1381,7 @@ public:
             launch_aicpu_num(other.launch_aicpu_num),
             kernel_args(std::move(other.kernel_args)),
             streams(std::exchange(other.streams, RunStreams{})),
+            artifact_identity(other.artifact_identity),
             resources_owned(std::exchange(other.resources_owned, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
@@ -1411,6 +1412,15 @@ public:
         // A5's runner owns its streams until all runs retire. Neither preparation
         // nor moving this state transfers ownership of the streams themselves.
         RunStreams streams{};
+        /**
+         * This run's whole published identity, copied from its descriptor.
+         *
+         * `identity` above is what later phase calls address the run by and has
+         * no field for `run_id`; a diagnostic artifact needs that plus the
+         * submitting Worker's provenance to be attributed to its submission. An
+         * all-zero `owner_instance_id` means the caller stated none.
+         */
+        NativeRunArtifactIdentity artifact_identity{};
         bool resources_owned{false};
         bool aicore_retirement_attempted{false};
         /**

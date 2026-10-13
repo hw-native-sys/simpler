@@ -300,8 +300,8 @@ SPMD tasks are present.
 | ------ | ----- | ----------- |
 | `input` | | Input JSON file (chip_swimlane_records_*.json), **or** a `dfx_outputs` directory containing `rank*/dN/` for directory mode. If omitted, the latest file in outputs/ is used |
 | `--output` | `-o` | Output JSON file (default: `merged_swimlane.json` beside a file input, `l3_swimlane.json` inside a directory input) |
-| `--dispatch` | | Directory mode only: local capture directory to merge across Ranks, e.g. `d0`. Mutually exclusive with `--dispatch-id` |
-| `--dispatch-id` | | Directory mode only: parent dispatch identity to merge, formatted `RUN_ID:TASK_SLOT`. Resolves each Rank's own `dN` through `dispatch_identity.json`. Mutually exclusive with `--dispatch` |
+| `--dispatch` | | Directory mode only: local capture directory to merge across Ranks, e.g. `d0`. A directory holding both a `chip_swimlane_records.json` and a retained `swimlane-*/` artifact offers two separate units, which are never merged — name one with `d0:fixed` or `d0:retained`. Mutually exclusive with `--dispatch-id` |
+| `--dispatch-id` | | Directory mode only: parent dispatch identity to merge, formatted `RUN_ID:TASK_SLOT`, optionally suffixed `:fixed` or `:retained`. Resolves each Rank's own `dN` through `dispatch_identity.json`. Mutually exclusive with `--dispatch` |
 | `--host-log` | | Host `[STRACE]` log holding the `chip.run.runner_run` windows (repeatable). Single-file mode prefers sibling `host_clock_alignment.*.log`, falling back to `host.*.log`; directory mode reads both at the root plus `rank*/d*/host_clock_alignment.*.log`. An explicit argument recalculates single-file alignment |
 | `--rank-pid` | | Directory mode: pin one Rank's capture to the Host invocation that ran it, `RANK=PID` or `RANK=PID:INV` (repeatable). Only needed when the captures carry no `dispatch_identity.json` and Ranks running the same shape cannot be told apart by their device windows |
 | `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping. Rejected in directory mode |

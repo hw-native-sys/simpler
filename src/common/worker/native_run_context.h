@@ -90,6 +90,32 @@ struct NativeRunContext {
             descriptor.run_epoch, descriptor.generation, descriptor.dispatch_id, descriptor.pipeline_slot
         };
     }
+
+    /**
+     * This run's whole published identity, by value.
+     *
+     * Separate from `identity()` because that one carries what later phase
+     * calls address the run by, and has no field for `run_id` — which a reader
+     * joining an artifact to the submission that produced it needs. The
+     * acceptance sink and its value are deliberately absent: they are the
+     * caller's pointer and sentinel, and belong to `publish_acceptance` alone.
+     */
+    NativeRunArtifactIdentity artifact_identity() const {
+        NativeRunArtifactIdentity snapshot{};
+        snapshot.run_id = descriptor.run_id;
+        snapshot.dispatch_id = descriptor.dispatch_id;
+        snapshot.generation = descriptor.generation;
+        std::memcpy(
+            snapshot.owner_instance_id, descriptor.provenance.owner_instance_id, sizeof(snapshot.owner_instance_id)
+        );
+        snapshot.pipeline_slot = descriptor.pipeline_slot;
+        snapshot.chip_rank = descriptor.provenance.chip_rank;
+        snapshot.capture_index = descriptor.provenance.capture_index;
+        snapshot.task_slot = descriptor.provenance.task_slot;
+        snapshot.group_index = descriptor.provenance.group_index;
+        snapshot.group_size = descriptor.provenance.group_size;
+        return snapshot;
+    }
 };
 
 /** End object lifetime, then mark the caller-owned storage reusable. */

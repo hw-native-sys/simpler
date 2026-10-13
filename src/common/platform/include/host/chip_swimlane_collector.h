@@ -1154,6 +1154,15 @@ public:
         // byte-for-byte, which is what makes the default path unchanged.
         std::string artifact_path;
         simpler::dfx::runs::CollectionVerdict collection{};
+        /**
+         * The submission this run's records belong to.
+         *
+         * Owned here, inside the bucket's export, because the writer publishes
+         * from `bucket.pending` and must not reach back into any caller's
+         * storage. An all-zero `owner_instance_id` means the admitting caller
+         * stated no identity, which is the only state a reader may not match on.
+         */
+        NativeRunArtifactIdentity artifact_identity{};
     };
 
     /**
@@ -1504,6 +1513,17 @@ private:
         // request says nothing about this capture.
         uint64_t cut_request{0};
         std::chrono::steady_clock::time_point closed_at{};
+        /**
+         * The directory this run's artifact is published into.
+         *
+         * Reserved for this run alone, from its own output prefix, at
+         * admission: a Worker that changes its prefix between submissions
+         * writes each run where that run asked, and every artifact sits beside
+         * the dispatch companions its own submission produced. One run owns it
+         * outright, so withdrawing that run can give it back without consulting
+         * any other. Empty means nothing is reserved and nothing is owed.
+         */
+        std::string artifact_dir;
         // Everything the writer needs, captured at run_close while the device
         // state is still this run's.
         RunExport pending{};
@@ -1699,7 +1719,7 @@ public:
      */
     bool run_begin(
         uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level, const CoreType *core_types,
-        int core_type_count, bool host_orchestrated
+        int core_type_count, bool host_orchestrated, const NativeRunArtifactIdentity *artifact_identity = nullptr
     );
 
     /**
@@ -1806,17 +1826,27 @@ public:
     RetainedRunStats retained_run_stats_for_test() const;
 
 private:
+    /**
+     * Take one unused `swimlane-<k>` under `output_root`, by exclusive creation.
+     *
+     * `mkdir` fails EEXIST without a window, so two processes sharing a root
+     * take different directories by construction and no index is derived from
+     * a pid, which repeats. One run owns what this reserves: `run_begin` calls
+     * it once per admission, so a withdrawal can give the directory back
+     * without asking whether another run is publishing into it.
+     */
     bool reserve_artifact_directory(const std::string &output_root, std::string *reserved_dir);
 
     /**
      * Take everything retaining a run needs, on the first run that needs it.
      *
-     * Lazy because `initialize()` is given no output prefix, and reserving a
-     * directory for a run that arms and then fails to launch would leave one
-     * behind. Readiness is the single `retained_ready_` latch and it is
-     * published last: every step before it either succeeded or undid itself,
-     * and a step that fails after the latch undoes the whole preparation, so
-     * no half-prepared collector can be mistaken for a prepared one.
+     * Lazy because `initialize()` is given no output prefix and the budget this
+     * takes is sized against one. It reserves no directory: that is per run, in
+     * `run_begin`, under the prefix that run itself named. Readiness is the
+     * single `retained_ready_` latch and it is published last: every step
+     * before it either succeeded or undid itself, and a step that fails after
+     * the latch undoes the whole preparation, so no half-prepared collector can
+     * be mistaken for a prepared one.
      */
     bool ensure_retained_runs_ready(const std::string &output_root);
 
@@ -1957,7 +1987,8 @@ private:
     std::atomic<bool> retained_ready_{false};
     std::atomic<bool> fatal_{false};
     std::string fatal_reason_;
-    std::string artifact_dir_;
+    // Labels this collector incarnation in every artifact it writes. Each run's
+    // directory is its own and lives on its bucket; this is not a path.
     uint64_t artifact_dir_index_{0};
     std::array<EpochBucket, ChipSwimlaneModule::kMaxOpenEpochs> retained_runs_{};
     /**

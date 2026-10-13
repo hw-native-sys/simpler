@@ -84,7 +84,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
-from typing import Any, NoReturn, cast
+from typing import Any, NamedTuple, NoReturn, cast
 
 import cloudpickle
 from _task_interface import (  # pyright: ignore[reportMissingImports]
@@ -2228,6 +2228,23 @@ def _config_diagnostics_any(cfg: CallConfig) -> bool:
     )
 
 
+class _DispatchProvenance(NamedTuple):
+    """Which submission one chip run serves, as the native lane receives it.
+
+    Field names match the native entry points' keyword arguments, so a caller
+    splats this rather than restating them. The default is "nothing stated": an
+    empty nonce, which the native side treats as the absent value and a reader
+    refuses to match on. Never a zeroed identity.
+    """
+
+    owner_instance_id: bytes = b""
+    chip_rank: int = 0
+    capture_index: int = 0
+    task_slot: int = 0
+    group_index: int = 0
+    group_size: int = 0
+
+
 def _write_dispatch_identity_sidecar(
     output_prefix: str,
     *,
@@ -2235,6 +2252,7 @@ def _write_dispatch_identity_sidecar(
     chip_rank: int,
     capture_index: int,
     callable_digest: bytes,
+    owner_instance_id: bytes,
 ) -> None:
     """Write parent-DAG identity beside one Rank-local diagnostic artifact."""
     protocol, run_id, pipeline_slot, generation, endpoint_dispatch_id, task_slot, group_index, group_size = (
@@ -2266,6 +2284,11 @@ def _write_dispatch_identity_sidecar(
         # without this the offline placement cannot tell one Rank's window from
         # another's when both run the same shape.
         "host_pid": os.getpid(),
+        # The submitting Worker's incarnation nonce, which a retained artifact
+        # publishes too. A pid recycles and a capture index restarts at zero, so
+        # this is what separates two incarnations writing under one prefix; it is
+        # never derived from either.
+        "owner_instance_id": owner_instance_id.hex(),
         "chip_rank": chip_rank,
         "local_capture_index": capture_index,
         "endpoint_dispatch_id": endpoint_dispatch_id,
@@ -3212,7 +3235,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         task_buf: memoryview,
         frame_identity: tuple[int, int, int, int, int, int, int, int],
         callable_digest: bytes,
-    ) -> CallConfig:
+    ) -> tuple[CallConfig, _DispatchProvenance]:
         nonlocal diagnostic_capture_index
         capture_index = diagnostic_capture_index
         cfg = _read_config_from_mailbox(
@@ -3224,16 +3247,28 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         # with no Rank identity writes at the case root, and a sidecar naming a
         # Rank it does not have would be a lie.
         if chip_rank is None or not (_config_diagnostics_any(cfg) and cfg.output_prefix):
-            return cfg
+            return cfg, _DispatchProvenance()
         _write_dispatch_identity_sidecar(
             cfg.output_prefix,
             frame_identity=frame_identity,
             chip_rank=chip_rank,
             capture_index=capture_index,
             callable_digest=callable_digest,
+            owner_instance_id=owner_instance_id,
         )
         diagnostic_capture_index += 1
-        return cfg
+        # Built here, from the same tuple the sidecar was written from, so the
+        # artifact and its sidecar cannot disagree about which submission they
+        # describe.
+        provenance = _DispatchProvenance(
+            owner_instance_id=owner_instance_id,
+            chip_rank=chip_rank,
+            capture_index=capture_index,
+            task_slot=frame_identity[5],
+            group_index=frame_identity[6],
+            group_size=frame_identity[7],
+        )
+        return cfg, provenance
 
     def finish_task_logging(cfg: CallConfig | None, code: int, msg: str) -> tuple[int, str]:
         # TASK_DONE permits the parent to read this child's completed invocation.
@@ -3255,7 +3290,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # Inside the try because it writes the diagnostic sidecar: a full or
             # read-only output_prefix must surface as this task's error, not as
             # an exception that leaves the loop before TASK_DONE is published.
-            cfg = read_task_config(task_buf, frame_identity, digest)
+            cfg, provenance = read_task_config(task_buf, frame_identity, digest)
             if cid is None:
                 raise RuntimeError(f"callable hash {_format_digest(digest)} not registered")
             # Run only consumes a prepared slot — it never lazily
@@ -3294,6 +3329,12 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 _TASK_ACCEPTED,
                 pipeline_slot,
                 pipeline_generation,
+                # This route's own identity, forwarded rather than dropped: a
+                # retained artifact names the submission that produced it, and
+                # the serial route is as public as the staged one.
+                frame_identity[1],
+                frame_identity[4],
+                **provenance._asdict(),
             )
         except Exception as e:  # noqa: BLE001
             code = 1
@@ -3531,6 +3572,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             identity: tuple[int, int, int, int, int, int, int, int]
             cid: int
             config: CallConfig
+            provenance: _DispatchProvenance
             activated: bool
             chip_run: Any = None
             launched_published: bool = False
@@ -3583,13 +3625,15 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     raise RuntimeError(
                         f"cid {cid} not prepared before task frame publication (register via _CTRL_PREPARE first)"
                     )
+                staged_config, staged_provenance = read_task_config(frame_buf, identity, digest)
                 return _StagedFrame(
                     index=index,
                     frame_buf=frame_buf,
                     frame_addr=frame_addr,
                     identity=identity,
                     cid=int(cid),
-                    config=read_task_config(frame_buf, identity, digest),
+                    config=staged_config,
+                    provenance=staged_provenance,
                     activated=initial_state in (_TASK_READY, _ACTIVATE),
                 )
             except Exception as e:  # noqa: BLE001
@@ -3622,6 +3666,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                 frame.frame_addr + _OFF_ACCEPTED,
                 _TASK_ACCEPTED,
                 False,
+                **frame.provenance._asdict(),
             )
             raw_disposition = frame.chip_run.preparation_disposition
             disposition = int(getattr(raw_disposition, "value", raw_disposition))

@@ -418,6 +418,56 @@ class TestChipWorkerStateMachine:
         with pytest.raises(RuntimeError, match="not initialized"):
             worker.unregister_callable(0)
 
+    # Every nonce the chip child can hand a submission. A caster expecting text
+    # rejects the three byte strings outright, and `None` is the absent case
+    # the binding's own default covers.
+    _NONCE_CASES = (
+        None,
+        b"",
+        # urandom output, so the nonce is neither text nor NUL-free.
+        b"\x00\xff\x80\x01\xfe\x7f\x00\x2a",
+        b"\xc3\x28\x00\x00\xed\xa0\x80\xff",
+        # Wrong length states nothing rather than being padded, and is still a
+        # legal argument.
+        b"\x01\x02\x03",
+    )
+
+    @staticmethod
+    def _submission_arguments(nonce):
+        """One uninitialized worker and the arguments a submission takes.
+
+        Slot 0 is the only slot the default `PipelineContract` admits — its
+        `pipeline_depth` is 1 — so a wider slot would be refused by the lease
+        check that runs before the lane is ever consulted, and the case would
+        prove nothing about the nonce.
+        """
+        from _task_interface import ChipStorageTaskArgs  # noqa: PLC0415
+
+        provenance = {} if nonce is None else {"owner_instance_id": nonce}
+        return _ChipWorker(), ChipStorageTaskArgs(), CallConfig(), provenance
+
+    # The two entry points are asserted in separate cases on purpose: one
+    # covering both would stop at the first failure and leave the other route
+    # unexercised, which is how a text-only caster survived on the staged side.
+    @pytest.mark.parametrize("nonce", _NONCE_CASES)
+    def test_the_serial_materialized_entry_takes_an_arbitrary_byte_nonce(self, nonce):
+        # Reaching the lane's own guard proves the argument converted; a caster
+        # expecting text fails before it with a TypeError, which is what this
+        # match distinguishes.
+        worker, args, config, provenance = self._submission_arguments(nonce)
+
+        with pytest.raises(RuntimeError, match="run lane is not initialized"):
+            worker.run_materialized(
+                0, args, config, pipeline_slot=0, pipeline_generation=2, run_id=17, dispatch_id=41, **provenance
+            )
+
+    @pytest.mark.parametrize("nonce", _NONCE_CASES)
+    def test_the_staged_materialized_entry_takes_an_arbitrary_byte_nonce(self, nonce):
+        worker, args, config, provenance = self._submission_arguments(nonce)
+
+        with pytest.raises(RuntimeError, match="run lane is not initialized"):
+            worker._submit_chip_run_materialized(0, args, config, 0, 2, 17, 41, 0, 1, False, **provenance)
+
 
 # ============================================================================
 # Python-level ChipWorker wrapper tests
@@ -755,6 +805,7 @@ class TestMailboxConfigRoundtrip:
             chip_rank=2,
             capture_index=7,
             callable_digest=b"\xab" * 32,
+            owner_instance_id=b"\x0f\x1e\x2d\x3c\x4b\x5a\x69\x78",
         )
 
         identity = json.loads((tmp_path / "dispatch_identity.json").read_text())
@@ -773,4 +824,7 @@ class TestMailboxConfigRoundtrip:
             "pipeline_slot": 1,
             "pipeline_generation": 23,
             "callable_digest": "ab" * 32,
+            # The pairing namespace a retained artifact is matched in. Hex,
+            # because the nonce is urandom output and JSON carries no bytes.
+            "owner_instance_id": "0f1e2d3c4b5a6978",
         }

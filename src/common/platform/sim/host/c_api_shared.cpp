@@ -1029,6 +1029,11 @@ int simpler_prepare_run(
             );
         }
         if (rc != 0) return cleanup_failed_prepare(state, rc);
+        // The run's own identity, by value, from the descriptor it was prepared
+        // with: `prepare_execution` receives only a `NativeRunIdentity`, which
+        // carries no `run_id`, so an artifact could not otherwise name the
+        // submission that produced it.
+        state->prepared_execution->artifact_identity = state->artifact_identity();
         return 0;
     } catch (...) {
         if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL);

@@ -571,7 +571,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 }
                 const RunLocalDfxMetadata run_metadata{
                     core_types.empty() ? nullptr : core_types.data(), static_cast<int>(core_types.size()),
-                    host_orchestrated_for_slot(prepared->pipeline_slot)
+                    host_orchestrated_for_slot(prepared->pipeline_slot), &prepared->artifact_identity
                 };
                 if (int collect_rc =
                         start_shared_collectors_for_run(prepared->dfx, prepared->identity.run_epoch, run_metadata);

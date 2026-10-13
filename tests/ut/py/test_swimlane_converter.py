@@ -199,8 +199,22 @@ def _write_l3_host_log(root, rank, *, host_shift_ns, sched_window_ns):
 
 
 def _write_l3_rank(
-    root, rank, *, host_shift_ns, task_id, clock_domain="same-boot", dispatch="d0", sched_record_ns=None
+    root,
+    rank,
+    *,
+    host_shift_ns,
+    task_id,
+    clock_domain="same-boot",
+    dispatch="d0",
+    sched_record_ns=None,
+    successor_task_id=None,
 ):
+    """One Rank's capture, its Host log and its sibling name map.
+
+    ``successor_task_id`` adds a second task behind the first, for a case that
+    needs an edge between two tasks of the same run. Omitted by default, so a
+    case that is not about dependencies keeps the single-task capture.
+    """
     rank_dir = root / f"rank{rank}" / dispatch
     rank_dir.mkdir(parents=True)
     device_base = 100 + rank * 100_000
@@ -210,7 +224,7 @@ def _write_l3_rank(
     if sched_record_ns is None:
         sched_record_ns = 50 + rank * 100
     _write_l3_host_log(root, rank, host_shift_ns=host_shift_ns, sched_window_ns=sched_record_ns + 50)
-    records = (
+    capture = (
         Capture(runtime=HBG_RUNTIME, level=4, clock_freq_hz=1_000_000_000)
         # Host orchestration records below are produced by host_build_graph alone,
         # so this capture names that runtime: a tmr document carrying them could
@@ -235,9 +249,19 @@ def _write_l3_rank(
             start_ns=host_shift_ns + 1_500,
             end_ns=host_shift_ns + 1_800,
         )
-        .build()
     )
-    (rank_dir / "chip_swimlane_records.json").write_text(json.dumps(records))
+    if successor_task_id is not None:
+        # Behind the first task and still inside the Host log's device window,
+        # so adding it changes which spans exist, not where the Rank is placed.
+        capture = capture.task(
+            task_id=successor_task_id,
+            reg_task_id=2,
+            start=device_base + 1_300,
+            end=device_base + 1_400,
+            dispatch=device_base + 1_250,
+            finish=device_base + 1_450,
+        )
+    (rank_dir / "chip_swimlane_records.json").write_text(json.dumps(capture.build()))
     (rank_dir / "name_map.json").write_text(json.dumps({"callable_id_to_name": {"0": f"kernel_r{rank}"}}))
     return rank_dir
 
@@ -291,26 +315,23 @@ def _write_hbg_l3_rank(root, rank, *, host_shift_ns, task_id, clock_domain="same
     return capture_dir
 
 
-def _write_dispatch_identity(capture_dir, *, run_id, task_slot, group_index, group_size):
+def _write_dispatch_identity(capture_dir, *, run_id, task_slot, group_index, group_size, endpoint_dispatch_id=None):
     rank = int(capture_dir.parent.name.removeprefix("rank"))
     capture_index = int(capture_dir.name.removeprefix("d"))
-    (capture_dir / "dispatch_identity.json").write_text(
-        json.dumps(
-            {
-                "schema_version": 1,
-                "run_id": run_id,
-                "task_slot": task_slot,
-                "group_index": group_index,
-                "group_size": group_size,
-                "chip_rank": rank,
-                "local_capture_index": capture_index,
-                "endpoint_dispatch_id": capture_index + 1,
-                "pipeline_slot": 0,
-                "pipeline_generation": 1,
-                "callable_digest": "ab" * 32,
-            }
-        )
-    )
+    payload = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "task_slot": task_slot,
+        "group_index": group_index,
+        "group_size": group_size,
+        "chip_rank": rank,
+        "local_capture_index": capture_index,
+        "endpoint_dispatch_id": capture_index + 1 if endpoint_dispatch_id is None else endpoint_dispatch_id,
+        "pipeline_slot": 0,
+        "pipeline_generation": 1,
+        "callable_digest": "ab" * 32,
+    }
+    (capture_dir / "dispatch_identity.json").write_text(json.dumps(payload))
 
 
 def test_l3_directory_merge_uses_common_host_origin_and_rank_namespaces(tmp_path):
@@ -2543,3 +2564,454 @@ def test_a_trace_must_name_the_runtime_its_labels_follow(tmp_path):
 
     with pytest.raises(ValueError, match="metadata.runtime is missing"):
         sc.generate_chrome_trace_json([_task_row(_tmr(2, 100), 0)], str(out), core_to_thread=[0])
+
+
+# ---------------------------------------------------------------------------
+# Retained captures: one artifact per run, paired by its own dispatch identity
+# ---------------------------------------------------------------------------
+#
+# A retained collector publishes `records_e<epoch>.json` into a directory it
+# reserved under the run's own output prefix, so a capture directory holds its
+# dispatch identity and, one level down, the artifacts of the runs that named
+# that prefix. Those are paired by the identity each artifact publishes, never by
+# a filename or an epoch order — both repeat across incarnations. A capture that
+# still holds `chip_swimlane_records.json` keeps the older rule, which is
+# directory adjacency, with or without an identity object.
+
+
+_NONCE = "0f1e2d3c4b5a6978"
+# Rank 0's Worker View in a merged trace: the single-Rank view's pid 4, moved
+# one stride up by `_namespace_rank_trace`.
+_RANK0_WORKER_PID = sc._RANK_PID_STRIDE + 4
+
+
+def _worker_slice_names(events, pid):
+    """Each task's drawn name on one Worker View lane, keyed by its task id.
+
+    Only the per-task slices carry `taskId`; the lane also holds allocation
+    bars for dependency endpoints that produced no record, which this skips
+    rather than keys on.
+    """
+    return {
+        event["args"]["taskId"]: event["name"]
+        for event in events
+        if event.get("ph") == "X"
+        and event.get("cat") == "event"
+        and event.get("pid") == pid
+        and "taskId" in event.get("args", {})
+    }
+
+
+def _retain_capture(capture_dir, *, epoch, nonce=_NONCE, rank=None, run_id=17, dispatch_id=None, status="identified"):
+    """Move a capture's fixed-name records into a retained artifact.
+
+    Returns the artifact path. The record content is whatever the fixed-name
+    writer produced, so these cases differ from the Branch-A ones only in where
+    the file sits and what identity it publishes.
+    """
+    fixed = capture_dir / "chip_swimlane_records.json"
+    raw = json.loads(fixed.read_text())
+    if rank is None:
+        rank = int(capture_dir.parent.name.removeprefix("rank"))
+    if dispatch_id is None:
+        dispatch_id = int(capture_dir.name.removeprefix("d")) + 1
+    stated = status == "identified"
+    collection = raw["metadata"].setdefault("collection", {})
+    collection["run_epoch"] = epoch
+    collection["dispatch"] = {
+        "status": status,
+        "owner_instance_id": nonce if stated else None,
+        "chip_rank": rank if stated else None,
+        "capture_index": 0 if stated else None,
+        "run_id": run_id if stated else None,
+        "endpoint_dispatch_id": dispatch_id if stated else None,
+        "task_slot": 5 if stated else None,
+        "group_index": 0 if stated else None,
+        "group_size": 1 if stated else None,
+        "pipeline_slot": 0,
+        "pipeline_generation": 1,
+    }
+    retained = capture_dir / "swimlane-0"
+    retained.mkdir(parents=True, exist_ok=True)
+    artifact = retained / f"records_e{epoch}.json"
+    artifact.write_text(json.dumps(raw))
+    fixed.unlink()
+    return artifact
+
+
+def _identity_with_nonce(capture_dir, *, nonce=_NONCE, **kwargs):
+    """Write a sidecar carrying the owner nonce the artifact publishes."""
+    _write_dispatch_identity(capture_dir, **kwargs)
+    path = capture_dir / "dispatch_identity.json"
+    identity = json.loads(path.read_text())
+    identity["owner_instance_id"] = nonce
+    path.write_text(json.dumps(identity))
+
+
+def test_a_retained_capture_is_found_by_the_identity_it_publishes(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    artifact = _retain_capture(capture, epoch=4)
+
+    assert sc._capture_records_paths(capture) == [artifact]
+    # The companions stay in the capture directory, one level above the
+    # artifact, and are reachable because the identity was verified first.
+    assert sc._companion_directory(artifact) == capture
+    assert sc._capture_directory_of(artifact) == capture
+
+
+def test_a_retained_capture_whose_identity_disagrees_is_not_paired(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    # Another incarnation's nonce: the pid, the epoch and the directory are all
+    # identical, so only the nonce separates the two.
+    artifact = _retain_capture(capture, epoch=4, nonce="aaaaaaaaaaaaaaaa")
+
+    assert sc._capture_records_paths(capture) == []
+    # Unpaired, and its companions are refused rather than guessed at.
+    assert sc._companion_directory(artifact) == artifact.parent
+
+
+def test_a_retained_capture_stating_no_identity_is_never_matched(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    _retain_capture(capture, epoch=4, status="unidentified")
+
+    assert sc._capture_records_paths(capture) == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        # Every spelling of "nothing stated" the producers can write. A key
+        # carrying one of these would match every other run that stated as
+        # little, so it must name nothing instead.
+        ("owner_instance_id", "0" * 16),
+        ("owner_instance_id", "not-hex-at-all!!"),
+        ("run_id", 0),
+        ("endpoint_dispatch_id", 0),
+        ("chip_rank", sc._ABSENT_CHIP_RANK),
+        ("chip_rank", True),
+    ),
+)
+def test_an_artifact_with_an_absent_key_component_is_not_paired(tmp_path, field, value):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    artifact = _retain_capture(capture, epoch=4)
+    raw = json.loads(artifact.read_text())
+    raw["metadata"]["collection"]["dispatch"][field] = value
+    artifact.write_text(json.dumps(raw))
+
+    assert sc._artifact_dispatch_key(artifact) is None
+    assert sc._capture_records_paths(capture) == []
+
+
+def test_a_retained_capture_with_no_sidecar_is_not_paired(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _retain_capture(capture, epoch=4)
+
+    assert sc._capture_records_paths(capture) == []
+
+
+def test_two_retained_captures_claiming_one_identity_pair_neither(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    first = _retain_capture(capture, epoch=4)
+    # A second file under the same key, which no correct producer writes: the
+    # reader reports it rather than taking whichever it globbed first.
+    (capture / "swimlane-0" / "records_e9.json").write_text(first.read_text())
+
+    assert sc._capture_records_paths(capture) == []
+
+
+def test_a_crash_temporary_is_not_read_as_a_retained_capture(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    artifact = _retain_capture(capture, epoch=4)
+    # Publication is a `link` onto the final name, so a `.tmp` is never an
+    # artifact — including one holding bytes that would otherwise parse.
+    (capture / "swimlane-0" / "records_e9.json.tmp").write_text(artifact.read_text())
+
+    assert sc._capture_records_paths(capture) == [artifact]
+
+
+def test_a_retained_capture_with_invalid_final_json_is_reported_not_paired(tmp_path, capsys):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    _retain_capture(capture, epoch=4)
+    (capture / "swimlane-0" / "records_e4.json").write_text("{ this is not json")
+
+    assert sc._capture_records_paths(capture) == []
+    assert "records_e4.json" in capsys.readouterr().err
+
+
+def test_a_fixed_name_capture_keeps_its_rule_with_no_identity_object(tmp_path):
+    """The non-retained path and every historical capture pair by adjacency."""
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+
+    assert sc._capture_records_paths(capture) == [capture / "chip_swimlane_records.json"]
+    assert sc._companion_directory(capture / "chip_swimlane_records.json") == capture
+    targets = sc.discover_l3_conversion_targets(root)
+    assert [target["dispatch"] for target in targets] == ["d0"]
+
+
+def test_a_mixed_capture_offers_both_forms_as_separate_units(tmp_path):
+    """Two shapes in one directory are two units, and are never merged."""
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    retained = _retain_capture(capture, epoch=4)
+    fixed = capture / "chip_swimlane_records.json"
+    fixed.write_text(retained.read_text())
+
+    assert sc._capture_records_paths(capture) == [fixed, retained]
+    targets = sc.discover_l3_conversion_targets(root)
+    assert [target["dispatch"] for target in targets] == ["d0:fixed", "d0:retained"]
+    assert [target["output_stem"] for target in targets] == ["l3_swimlane_d0_fixed", "l3_swimlane_d0_retained"]
+    # Each target names the exact file it selected, so a consumer whose merge
+    # failed converts that one rather than re-scanning the directory and
+    # finding the other form again.
+    assert [target["records_paths"] for target in targets] == [[fixed], [retained]]
+    assert [target["capture_dirs"] for target in targets] == [[capture], [capture]]
+    # Both selectors reach their own unit through the public directory mode.
+    for selector, expected in (("d0:fixed", fixed), ("d0:retained", retained)):
+        inputs, _ = sc._discover_l3_rank_inputs(root, selector)
+        assert inputs == [(0, expected)]
+
+
+def test_a_mixed_capture_refuses_an_unqualified_selector(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    retained = _retain_capture(capture, epoch=4)
+    (capture / "chip_swimlane_records.json").write_text(retained.read_text())
+
+    with pytest.raises(ValueError, match="d0:fixed, d0:retained"):
+        sc._discover_l3_rank_inputs(root, "d0")
+
+
+def test_a_selection_spanning_both_forms_across_ranks_is_refused(tmp_path):
+    """No single directory offers two forms here, so the per-directory check
+    cannot see this: rank0 kept its fixed file and rank1 retained its run, and
+    an unsuffixed selector would otherwise splice the two into one trace."""
+    root = tmp_path / "dfx_outputs"
+    rank0 = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    rank1 = _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8, dispatch="d0")
+    _identity_with_nonce(rank1, run_id=17, task_slot=5, group_index=0, group_size=1)
+    retained = _retain_capture(rank1, epoch=4, run_id=17)
+
+    with pytest.raises(ValueError, match="d0:fixed, d0:retained"):
+        sc._discover_l3_rank_inputs(root, "d0")
+    # Either suffix is a legal selection of one form, and each names the Rank
+    # that does not offer it rather than silently merging the other's.
+    with pytest.raises(ValueError, match="rank1 has no capture for d0"):
+        sc._discover_l3_rank_inputs(root, "d0:fixed")
+    with pytest.raises(ValueError, match="rank0 has no capture for d0"):
+        sc._discover_l3_rank_inputs(root, "d0:retained")
+    assert sc._capture_records_paths(rank0) == [rank0 / "chip_swimlane_records.json"]
+    assert sc._capture_records_paths(rank1) == [retained]
+
+
+def test_a_group_selection_spanning_both_forms_is_refused(tmp_path):
+    """The same split under one parent dispatch: group validation checks the
+    metadata and the owner, neither of which separates the two file forms."""
+    root = tmp_path / "dfx_outputs"
+    rank0 = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    rank1 = _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8, dispatch="d0")
+    _identity_with_nonce(rank0, run_id=17, task_slot=5, group_index=0, group_size=2)
+    _identity_with_nonce(rank1, run_id=17, task_slot=5, group_index=1, group_size=2)
+    _retain_capture(rank1, epoch=4, run_id=17)
+
+    with pytest.raises(ValueError, match="17:5:fixed, 17:5:retained"):
+        sc._discover_l3_rank_inputs(root, None, dispatch_identity="17:5")
+
+
+def test_retained_captures_are_discovered_across_dispatch_directories(tmp_path):
+    """One prefix per submission, so each run's artifact sits in its own dN."""
+    root = tmp_path / "dfx_outputs"
+    first = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    second = _write_l3_rank(root, 0, host_shift_ns=5_000, task_id=8, dispatch="d1")
+    _identity_with_nonce(first, run_id=17, task_slot=5, group_index=0, group_size=1)
+    _identity_with_nonce(second, run_id=18, task_slot=5, group_index=0, group_size=1)
+    _retain_capture(first, epoch=4, run_id=17)
+    _retain_capture(second, epoch=9, run_id=18)
+
+    targets = sc.discover_l3_conversion_targets(root)
+
+    assert [target["dispatch"] for target in targets] == ["d0", "d1"]
+    assert [Path(target["capture_dirs"][0]).name for target in targets] == ["d0", "d1"]
+    # Each selector resolves back to the artifact its own dN holds, which is
+    # what the SceneTest postprocessor re-invokes the CLI with.
+    for target, capture in ((targets[0], first), (targets[1], second)):
+        inputs, _ = sc._discover_l3_rank_inputs(root, target["dispatch"])
+        assert [path.parent.parent for _, path in inputs] == [capture]
+
+
+def test_a_retained_group_pairs_from_its_sidecars(tmp_path):
+    """Grouping stays sidecar-sourced: `task_slot` and `group_size` are
+    cross-checked by the artifact rather than read out of it."""
+    root = tmp_path / "dfx_outputs"
+    rank0 = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    rank1 = _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8, dispatch="d0")
+    _identity_with_nonce(rank0, run_id=17, task_slot=5, group_index=0, group_size=2)
+    _identity_with_nonce(rank1, run_id=17, task_slot=5, group_index=1, group_size=2)
+    _retain_capture(rank0, epoch=4, run_id=17)
+    _retain_capture(rank1, epoch=4, run_id=17)
+
+    inputs, pairing = sc._discover_l3_rank_inputs(root, None, dispatch_identity="17:5")
+
+    assert [rank for rank, _ in inputs] == [0, 1]
+    assert [path.parent.name for _, path in inputs] == ["swimlane-0", "swimlane-0"]
+    assert pairing["dispatch_pairing"] == "parent_dispatch_identity"
+    # The same group is found by traversal, with the capture directories the
+    # companions live in rather than the artifacts' own parents.
+    targets = sc.discover_l3_conversion_targets(root)
+    assert [target["dispatch_id"] for target in targets] == ["17:5"]
+    assert [Path(path).name for path in targets[0]["capture_dirs"]] == ["d0", "d0"]
+
+
+def test_a_retained_group_across_owner_incarnations_is_refused(tmp_path):
+    """Two Workers can agree on (run_id, task_slot); they are not one group."""
+    root = tmp_path / "dfx_outputs"
+    rank0 = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    rank1 = _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8, dispatch="d0")
+    _identity_with_nonce(rank0, run_id=17, task_slot=5, group_index=0, group_size=2)
+    _identity_with_nonce(rank1, nonce="aaaaaaaaaaaaaaaa", run_id=17, task_slot=5, group_index=1, group_size=2)
+    _retain_capture(rank0, epoch=4, run_id=17)
+    _retain_capture(rank1, epoch=4, run_id=17, nonce="aaaaaaaaaaaaaaaa")
+
+    with pytest.raises(ValueError, match="owner incarnations"):
+        sc._discover_l3_rank_inputs(root, None, dispatch_identity="17:5")
+
+
+def test_a_dispatch_key_two_directories_claim_pairs_neither(tmp_path, capsys):
+    """Only a traversal can see this: one directory cannot know what another
+    one claims, so the global check is where the ambiguity is caught."""
+    root = tmp_path / "dfx_outputs"
+    first = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, dispatch="d0")
+    second = _write_l3_rank(root, 0, host_shift_ns=5_000, task_id=8, dispatch="d1")
+    # The same whole key under two dispatch directories, which no correct
+    # producer writes: `d1` is handed `d0`'s endpoint dispatch.
+    _identity_with_nonce(first, run_id=17, task_slot=5, group_index=0, group_size=1)
+    _identity_with_nonce(second, run_id=17, task_slot=5, group_index=0, group_size=1, endpoint_dispatch_id=1)
+    _retain_capture(first, epoch=4, run_id=17, dispatch_id=1)
+    _retain_capture(second, epoch=9, run_id=17, dispatch_id=1)
+
+    targets = sc.discover_l3_conversion_targets(root)
+
+    assert targets == []
+    assert "is claimed by" in capsys.readouterr().err
+
+
+def test_a_missing_capture_names_both_rules_it_failed(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    (capture / "chip_swimlane_records.json").unlink()
+
+    with pytest.raises(ValueError, match="neither d0/chip_swimlane_records.json nor a retained capture"):
+        sc._discover_l3_rank_inputs(root, "d0")
+
+
+def test_a_retained_capture_converts_with_the_companions_of_its_own_dispatch(tmp_path):
+    """The whole public conversion, not a lookup helper: a retained artifact's
+    sidecar, dependency file and name map all live one level above it, and are
+    read only after that directory's identity is confirmed to name it."""
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7, successor_task_id=8)
+    # This run's own dependency capture, in the capture directory beside the
+    # sidecar. It carries both halves the artifact cannot: the edge between the
+    # two tasks, and the kernel each one ran — without which the decoder leaves
+    # func_id at -1 and no name map can label anything.
+    (capture / "name_map.json").write_text(
+        json.dumps({"callable_id_to_name": {"0": "kernel_r0", "1": "kernel_r0_succ"}})
+    )
+    (capture / "deps.json").write_text(
+        json.dumps(
+            {
+                "edges": [{"pred": 7, "succ": 8}],
+                "tasks": [
+                    {"task_id": 7, "kernel_ids": [-1, 0, -1], "block_num": 1},
+                    {"task_id": 8, "kernel_ids": [-1, 1, -1], "block_num": 1},
+                ],
+            }
+        )
+    )
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    artifact = _retain_capture(capture, epoch=4)
+    output = tmp_path / "l3.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+
+    output_path, rank_metadata = sc._generate_l3_trace(args, root)
+
+    assert output_path == output
+    assert [item["rank"] for item in rank_metadata] == [0]
+    assert [item["input"] for item in rank_metadata] == [str(artifact)]
+    # The sidecar in dN, which the artifact's own directory does not hold.
+    assert rank_metadata[0]["dispatch_identity"]["run_id"] == 17
+    assert rank_metadata[0]["dispatch_identity"]["endpoint_dispatch_id"] == 1
+    trace = json.loads(output.read_text())
+    assert trace["metadata"]["dispatch_pairing"] == "local_capture_index"
+
+    events = trace["traceEvents"]
+    # Rank 0's Worker View, namespaced one stride above the Host block.
+    worker_pid = _RANK0_WORKER_PID
+    drawn = _worker_slice_names(events, worker_pid)
+    # The name map and the kernel map both came from dN: without the kernel
+    # map these read `task(...)`, and without the name map `func_0(...)`.
+    assert drawn[7].startswith("kernel_r0(")
+    assert drawn[8].startswith("kernel_r0_succ(")
+    # And the edge between them, from the same directory's deps.json.
+    flows = [
+        event
+        for event in events
+        if event.get("cat") == "flow" and event.get("name") == "dependency" and event.get("pid") == worker_pid
+    ]
+    starts = [event for event in flows if event.get("ph") == "s"]
+    assert len(starts) == 1
+    finishes = [event for event in flows if event.get("ph") == "f" and event["id"] == starts[0]["id"]]
+    assert len(finishes) == 1
+    # The arrow leaves the predecessor's slice and lands on the successor's.
+    assert starts[0]["ts"] < finishes[0]["ts"]
+
+
+def test_a_retained_capture_without_a_dependency_file_cannot_name_its_task(tmp_path):
+    """The negative control for the case above: the same capture with no
+    dependency file beside it leaves the decoder at func_id -1, so the name map
+    alone cannot label the task — which is what makes the assertions above
+    evidence that both companions were read."""
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    _retain_capture(capture, epoch=4)
+    output = tmp_path / "l3.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+
+    sc._generate_l3_trace(args, root)
+
+    trace = json.loads(output.read_text())
+    drawn = _worker_slice_names(trace["traceEvents"], _RANK0_WORKER_PID)
+    assert drawn[7].startswith("task(")
+
+
+def test_an_unpaired_retained_capture_converts_from_what_it_was_given(tmp_path, capsys):
+    """Explicit single-file conversion never reaches an unverified ancestor."""
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    artifact = _retain_capture(capture, epoch=4, nonce="aaaaaaaaaaaaaaaa")
+
+    args = sc._build_parser().parse_args([str(artifact)])
+    func_names, _ = sc._load_func_names(args, artifact)
+
+    assert func_names == {}
+    assert "is not paired with a dispatch identity" in capsys.readouterr().err

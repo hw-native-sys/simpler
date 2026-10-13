@@ -1179,6 +1179,12 @@ class _FakeNativeRunImpl:
         accepted_addr,
         accepted_value,
         activated,
+        owner_instance_id=b"",
+        chip_rank=0,
+        capture_index=0,
+        task_slot=0,
+        group_index=0,
+        group_size=0,
     ):
         submission = SimpleNamespace(
             cid=cid,
@@ -1190,6 +1196,14 @@ class _FakeNativeRunImpl:
             dispatch_id=int(dispatch_id),
             accepted_addr=int(accepted_addr),
             accepted_value=int(accepted_value),
+            # The native entry takes the nonce as bytes, so the fake refuses
+            # anything else rather than accepting a spelling the binding cannot.
+            owner_instance_id=bytes(owner_instance_id),
+            chip_rank=int(chip_rank),
+            capture_index=int(capture_index),
+            task_slot=int(task_slot),
+            group_index=int(group_index),
+            group_size=int(group_size),
         )
         run = _FakeChipRun(self, submission)
         run.activated = bool(activated)

@@ -1362,7 +1362,10 @@ def _convert_rank_swimlanes(
     relative timeline. Losing the common axis should cost the common axis, not
     the whole case's swimlane.
     """
-    from simpler_setup.tools.swimlane_converter import discover_l3_conversion_targets  # noqa: PLC0415
+    from simpler_setup.tools.swimlane_converter import (  # noqa: PLC0415, PLC2701
+        _capture_records_paths,
+        discover_l3_conversion_targets,
+    )
 
     def dump_name_map(capture_dir: Path) -> Path | None:
         if not callable_spec:
@@ -1370,7 +1373,9 @@ def _convert_rank_swimlanes(
         safe_label = _sanitize_for_filename(case_label)
         return _dump_name_map(_extract_name_map(callable_spec), capture_dir / f"name_map_{safe_label}.json")
 
-    captures = [path for path in _rank_capture_dirs(output_prefix) if (path / "chip_swimlane_records.json").is_file()]
+    # Both shapes count: the fixed name the non-retained path writes, and a
+    # retained artifact the capture's own dispatch identity names.
+    captures = [path for path in _rank_capture_dirs(output_prefix) if _capture_records_paths(path)]
     if not captures:
         logger.warning(f"[{case_label}] no Rank capture is present under {output_prefix}")
         return
@@ -1398,9 +1403,12 @@ def _convert_rank_swimlanes(
             output_path=output_prefix / f"{target['output_stem']}.json" if len(targets) > 1 else None,
         )
         if not merged:
-            for capture_dir in target["capture_dirs"]:
+            # The files this target selected, never a fresh scan of its
+            # directories: a scan would offer the other form too, and could
+            # resurrect a capture discovery rejected for a duplicate identity.
+            for capture_dir, records_path in zip(target["capture_dirs"], target["records_paths"], strict=True):
                 _run_swimlane_converter(
-                    input_path=capture_dir / "chip_swimlane_records.json",
+                    input_path=records_path,
                     host_logs=host_logs,
                     func_names_path=dump_name_map(capture_dir),
                     enable_overhead=enable_overhead,
@@ -1424,11 +1432,12 @@ def _convert_case_swimlane(
 
     logger = logging.getLogger(__name__)
     if _rank_dirs(output_prefix):
-        captures = [
-            directory
-            for directory in _rank_capture_dirs(output_prefix)
-            if (directory / "chip_swimlane_records.json").is_file()
-        ]
+        # A capture counts when it holds either shape: the fixed name the
+        # non-retained path writes, or a retained artifact its own dispatch
+        # identity names. The converter applies the same two rules.
+        from simpler_setup.tools.swimlane_converter import _capture_records_paths  # noqa: PLC0415, PLC2701
+
+        captures = [directory for directory in _rank_capture_dirs(output_prefix) if _capture_records_paths(directory)]
         # Runtime-exported timing logs allow capture-local lookup when all are present.
         # Other Rank merges use the bound persistent logs.
         host_logs = (

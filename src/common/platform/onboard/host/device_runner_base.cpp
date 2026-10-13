@@ -3798,7 +3798,7 @@ int DeviceRunnerBase::start_shared_collectors_for_run(
             chip_swimlane_collector_.start(thread_factory);
             if (!chip_swimlane_collector_.run_begin(
                     run_epoch, dfx.output_prefix, dfx.chip_swimlane_level, run_metadata.core_types,
-                    run_metadata.core_type_count, run_metadata.host_orchestrated
+                    run_metadata.core_type_count, run_metadata.host_orchestrated, run_metadata.artifact_identity
                 )) {
                 LOG_ERROR(
                     "ChipSwimlane: run %llu was not admitted for retained collection",

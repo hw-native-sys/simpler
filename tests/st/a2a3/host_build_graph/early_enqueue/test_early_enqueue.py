@@ -762,6 +762,30 @@ def _assert_per_run_artifacts(artifacts, found_paths, *, expected_level):
     assert len(set(epochs)) == len(epochs), f"two artifacts claimed the same run epoch: {epochs}"
     assert all(e != 0 for e in epochs), f"an artifact published the no-identity epoch: {epochs}"
 
+    # Which submission each artifact belongs to, published by the collector from
+    # the identity its own run was prepared with. Without it a reader has the
+    # files and no way to say which `Worker.submit` produced which — and the
+    # keys have to be *distinct*, because a value repeated across runs would
+    # pair every artifact with the same dispatch.
+    dispatches = [a["metadata"]["collection"]["dispatch"] for a in artifacts]
+    for dispatch in dispatches:
+        assert dispatch["status"] == "identified", (
+            f"a collecting run published no submission identity: {dispatch}; a public Worker route always "
+            f"states one, so this is the identity plumbing failing rather than a low-level caller"
+        )
+        assert dispatch["owner_instance_id"] and set(dispatch["owner_instance_id"]) != {"0"}, (
+            f"the submitting Worker's nonce is absent or all-zero: {dispatch}"
+        )
+        for field in ("run_id", "endpoint_dispatch_id"):
+            assert isinstance(dispatch[field], int) and dispatch[field] > 0, (
+                f"{field} is not a usable identity: {dispatch}"
+            )
+    keys = [(d["owner_instance_id"], d["chip_rank"], d["run_id"], d["endpoint_dispatch_id"]) for d in dispatches]
+    assert len(set(keys)) == len(keys), f"two artifacts claimed one submission: {keys}"
+    assert len({d["owner_instance_id"] for d in dispatches}) == 1, (
+        f"one Worker's runs reported more than one incarnation nonce: {dispatches}"
+    )
+
     for artifact in artifacts:
         collection = artifact["metadata"]["collection"]
         epoch = collection["run_epoch"]

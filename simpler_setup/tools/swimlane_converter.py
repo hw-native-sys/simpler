@@ -454,10 +454,11 @@ def _prepare_capture_clock_alignment(path, host_logs=None):
 
     placement = None
     try:
+        companions = _companion_directory(path)
         logs = (
             [Path(log) for log in host_logs]
             if host_logs is not None
-            else (sorted(path.parent.glob("host_clock_alignment.*.log")) or sorted(path.parent.glob("host.*.log")))
+            else (sorted(companions.glob("host_clock_alignment.*.log")) or sorted(companions.glob("host.*.log")))
         )
         if not logs:
             raise ValueError("no Host log available")
@@ -465,7 +466,7 @@ def _prepare_capture_clock_alignment(path, host_logs=None):
         for log in logs:
             with log.open() as input_file:
                 spans.extend(parse_spans(input_file))
-        sidecar_path = path.parent / "dispatch_identity.json"
+        sidecar_path = companions / "dispatch_identity.json"
         sidecar = json.loads(sidecar_path.read_text()) if sidecar_path.is_file() else None
         windows = _matching_capture_host_windows(raw, spans, sidecar)
         if len(windows) != 1:
@@ -3557,11 +3558,14 @@ Examples:
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
     parser.add_argument(
         "--dispatch",
-        help="Local capture directory to merge for directory input, for example d0",
+        help="Local capture directory to merge for directory input, for example d0. A directory holding both a "
+        "chip_swimlane_records.json and a retained swimlane-*/ artifact offers two separate units; name one of "
+        "them with d0:fixed or d0:retained",
     )
     parser.add_argument(
         "--dispatch-id",
-        help="Parent dispatch identity to merge for directory input, formatted as RUN_ID:TASK_SLOT",
+        help="Parent dispatch identity to merge for directory input, formatted as RUN_ID:TASK_SLOT, optionally "
+        "suffixed with :fixed or :retained",
     )
     parser.add_argument(
         "--host-log",
@@ -3655,9 +3659,17 @@ def _print_verbose_data_info(data, verbose):
         print(f"  Core-to-thread mapping: {len(core_to_thread)} cores")
 
 
-def _find_sibling_name_map(input_path):
-    """Return the unique sibling ``name_map*.json``, if one exists."""
-    candidates = sorted(path for path in Path(input_path).parent.glob("name_map*.json") if path.is_file())
+def _find_sibling_name_map(input_path, companion_dir=None):
+    """Return the unique ``name_map*.json`` beside one capture, if one exists.
+
+    ``companion_dir`` is the directory this capture's companions were already
+    verified to live in. Without one it is resolved here, because a retained
+    artifact's own directory holds records files and nothing else — its name
+    map, deps and sidecar sit in the capture directory above it, and reaching
+    them unverified would hand this run another run's map.
+    """
+    directory = Path(companion_dir) if companion_dir is not None else _companion_directory(input_path)
+    candidates = sorted(path for path in Path(directory).glob("name_map*.json") if path.is_file())
     if len(candidates) == 1:
         return candidates[0]
     if len(candidates) > 1:
@@ -3711,6 +3723,194 @@ def _load_func_names(args, input_path):
 _RANK_DIR_PATTERN = re.compile(r"rank([0-9]+)")
 _DISPATCH_DIR_PATTERN = re.compile(r"d[0-9]+")
 _DISPATCH_ID_PATTERN = re.compile(r"([0-9]+):([0-9]+)")
+_CAPTURE_FORM_SUFFIX = re.compile(r"(.+):(fixed|retained)")
+# A retained run's artifact: one file per run inside a directory the collector
+# reserved under that run's own output prefix. `chip_swimlane_records.json` is
+# the one-file-per-boundary name the non-retained path still writes, and the two
+# are read by different rules — see `_capture_units`.
+_RETAINED_DIR_PATTERN = re.compile(r"swimlane-[0-9]+")
+_RETAINED_FILE_PATTERN = re.compile(r"records_e[0-9]+\.json")
+_FIXED_RECORDS_NAME = "chip_swimlane_records.json"
+# The two forms a capture directory can offer, in the order a listing shows
+# them. They are separate conversion units and are never merged.
+_CAPTURE_FORMS = ("fixed", "retained")
+_NONCE_PATTERN = re.compile(r"[0-9a-f]{16}")
+# The widest value a `uint32_t` Rank can hold. The in-tree producer states
+# absence through the all-zero nonce rather than this, so Rank 0 is a real
+# Rank; a value here can only be a corrupt or foreign artifact's.
+_ABSENT_CHIP_RANK = 2**32 - 1
+
+
+def _dispatch_key(nonce, chip_rank, run_id, endpoint_dispatch_id):
+    """The four-field key, or None when any component states nothing.
+
+    Each component is checked for the value its producer writes when it has
+    none, not only for its Python type: an all-zero nonce, a zero parent run or
+    endpoint dispatch, and the absent-Rank sentinel each mean "nothing stated",
+    and a key carrying one of them would match every other run that stated as
+    little.
+    """
+    if not isinstance(nonce, str) or not _NONCE_PATTERN.fullmatch(nonce) or set(nonce) == {"0"}:
+        return None
+    for value in (chip_rank, run_id, endpoint_dispatch_id):
+        if isinstance(value, bool) or not isinstance(value, int):
+            return None
+    if run_id <= 0 or endpoint_dispatch_id <= 0 or not 0 <= chip_rank < _ABSENT_CHIP_RANK:
+        return None
+    return (nonce, chip_rank, run_id, endpoint_dispatch_id)
+
+
+def _artifact_dispatch_key(records_path):
+    """The submission a retained artifact names, or None when it names none.
+
+    None covers four cases a caller must not confuse with a mismatch: an
+    artifact written before the field existed, one whose producer stated no
+    identity, one whose `dispatch` object is not a usable object, and one whose
+    key carries an absent component. Invalid final JSON is reported and treated
+    as naming nothing, because a crash can leave a partial file under a final
+    name.
+    """
+    try:
+        raw = json.loads(Path(records_path).read_text())
+    except (OSError, ValueError) as error:
+        print(f"Warning: ignoring unreadable capture {records_path}: {error}", file=sys.stderr)
+        return None
+    if not isinstance(raw, dict):
+        return None
+    dispatch = raw.get("metadata", {}).get("collection", {}).get("dispatch")
+    if not isinstance(dispatch, dict) or dispatch.get("status") != "identified":
+        return None
+    return _dispatch_key(
+        dispatch.get("owner_instance_id"),
+        dispatch.get("chip_rank"),
+        dispatch.get("run_id"),
+        dispatch.get("endpoint_dispatch_id"),
+    )
+
+
+def _sidecar_dispatch_key(identity):
+    """The key one capture's sidecar names, or None when it names none."""
+    if identity is None:
+        return None
+    return _dispatch_key(
+        identity.get("owner_instance_id"),
+        identity.get("chip_rank"),
+        identity.get("run_id"),
+        identity.get("endpoint_dispatch_id"),
+    )
+
+
+def _retained_artifacts(capture_dir):
+    """Every retained artifact under one capture directory, by final name only.
+
+    A temporary a crash left behind is skipped rather than read: publication is
+    a `link` onto the final name, so only that name is a complete artifact.
+    """
+    found = []
+    for directory in sorted(Path(capture_dir).glob("swimlane-*")):
+        if not directory.is_dir() or not _RETAINED_DIR_PATTERN.fullmatch(directory.name):
+            continue
+        for path in sorted(directory.glob("records_e*.json")):
+            if path.is_file() and _RETAINED_FILE_PATTERN.fullmatch(path.name):
+                found.append(path)
+    return found
+
+
+def _retained_capture_for_sidecar(capture_dir, identity):
+    """The one retained artifact in `capture_dir` that this sidecar names.
+
+    Returns None when nothing matches, and reports rather than guesses when more
+    than one does. Matching is on the whole key — nonce, Rank, parent run and
+    endpoint dispatch — never on a filename, a directory index or an epoch
+    order, because every one of those repeats across incarnations.
+    """
+    wanted = _sidecar_dispatch_key(identity)
+    if wanted is None:
+        return None
+    matches = [path for path in _retained_artifacts(capture_dir) if _artifact_dispatch_key(path) == wanted]
+    if len(matches) > 1:
+        print(
+            f"Warning: {capture_dir} holds {len(matches)} retained captures claiming one dispatch identity; "
+            "none is paired",
+            file=sys.stderr,
+        )
+        return None
+    return matches[0] if matches else None
+
+
+def _capture_units(capture_dir, identity):
+    """Every conversion unit one capture directory offers, keyed by form.
+
+    The two forms are separate units and are never merged. `fixed` is
+    `chip_swimlane_records.json`, the one-per-boundary file the non-retained
+    path and every historical capture write, paired by directory adjacency with
+    or without a sidecar. `retained` is the one artifact below `swimlane-<k>/`
+    that this directory's sidecar names, by the whole key. A directory holding
+    both offers both.
+    """
+    units = {}
+    fixed = Path(capture_dir) / _FIXED_RECORDS_NAME
+    if fixed.is_file():
+        units["fixed"] = fixed
+    retained = _retained_capture_for_sidecar(capture_dir, identity)
+    if retained is not None:
+        units["retained"] = retained
+    return units
+
+
+def _capture_records_paths(capture_dir):
+    """Every records file one capture directory offers, in form order.
+
+    A sidecar this reader cannot parse withholds the retained form and is
+    reported; the fixed name does not depend on it and still answers.
+    """
+    try:
+        identity = _load_dispatch_identity(capture_dir)
+    except ValueError as error:
+        print(f"Warning: {error}", file=sys.stderr)
+        identity = None
+    units = _capture_units(capture_dir, identity)
+    return [units[form] for form in _CAPTURE_FORMS if form in units]
+
+
+def _capture_form_of(records_path):
+    """Which of the two rules a records file is read under."""
+    return "retained" if _RETAINED_DIR_PATTERN.fullmatch(Path(records_path).parent.name) else "fixed"
+
+
+def _capture_directory_of(records_path):
+    """The `dN` directory a records file belongs to, under either rule."""
+    path = Path(records_path)
+    return path.parent.parent if _capture_form_of(path) == "retained" else path.parent
+
+
+def _companion_directory(records_path):
+    """The directory holding one capture's sidecar, Host log, deps and name map.
+
+    For a fixed-name capture that is its own directory. For a retained artifact
+    it is the capture directory one level up — but only once that directory's
+    sidecar is confirmed to name this very artifact. An unverified step would
+    hand a run the companions of whichever run reserved the directory first,
+    which is a wrong answer rather than a missing one.
+    """
+    path = Path(records_path)
+    if _capture_form_of(path) == "fixed":
+        return path.parent
+    capture_dir = path.parent.parent
+    identity = None
+    try:
+        identity = _load_dispatch_identity(capture_dir)
+    except ValueError as error:
+        print(f"Warning: ignoring dispatch identity beside {path}: {error}", file=sys.stderr)
+    if identity is not None and _retained_capture_for_sidecar(capture_dir, identity) == path:
+        return capture_dir
+    print(
+        f"Warning: {path} is not paired with a dispatch identity; its companions are not used",
+        file=sys.stderr,
+    )
+    return path.parent
+
+
 _RANK_PID_STRIDE = 100
 # Perfetto orders process groups by pid, so the pid *is* the layout: the two
 # clock domains read as two blocks only if every Host-domain pid sorts below
@@ -3828,6 +4028,22 @@ def _validate_parent_dispatch_group(discovered, expected_key):
             f"incomplete parent dispatch {expected_key[0]}:{expected_key[1]}: "
             f"expected group indexes 0..{group_size - 1}, found {sorted(group_indexes)}"
         )
+    # Every Rank of one submission is served by one parent Worker, so one
+    # incarnation nonce. Legacy grouping is unchanged — a fixed-name capture is
+    # paired by directory adjacency and never carried a nonce — but two
+    # retained incarnations that happen to agree on (run_id, task_slot) are
+    # different submissions and must not be merged into one trace.
+    nonces = {
+        identity.get("owner_instance_id")
+        for _, records_path, identity in discovered
+        if _capture_form_of(records_path) == "retained"
+    }
+    if len(nonces) > 1:
+        raise ValueError(
+            f"parent dispatch {expected_key[0]}:{expected_key[1]} draws retained captures from "
+            f"{len(nonces)} owner incarnations {sorted(str(nonce) for nonce in nonces)}; "
+            "one submission has one owner"
+        )
     return {
         "dispatch_pairing": "parent_dispatch_identity",
         "dispatch_identity": {
@@ -3839,48 +4055,175 @@ def _validate_parent_dispatch_group(discovered, expected_key):
     }
 
 
-def _discover_l3_parent_dispatch_inputs(rank_dirs, dispatch_identity):
-    match = _DISPATCH_ID_PATTERN.fullmatch(dispatch_identity)
+def _split_capture_form(selector):
+    """Split an optional ``:fixed`` / ``:retained`` suffix off a selector.
+
+    One directory can hold both forms, and they are separate conversion units
+    that are never merged, so a selector that would otherwise name two says
+    which it means. A selector without the suffix keeps its original meaning.
+    """
+    match = _CAPTURE_FORM_SUFFIX.fullmatch(selector or "")
     if match is None:
-        raise ValueError("--dispatch-id must use RUN_ID:TASK_SLOT (for example, 17:5)")
+        return selector, None
+    return match.group(1), match.group(2)
+
+
+def _select_capture_unit(units, capture_dir, form):
+    """The one unit a selector names, or None when the directory offers none."""
+    if form is not None:
+        return units.get(form)
+    if len(units) > 1:
+        offered = ", ".join(f"{capture_dir.name}:{name}" for name in sorted(units))
+        raise ValueError(
+            f"{capture_dir} holds both capture forms, which are separate conversion units and are never "
+            f"merged; name one of {offered}"
+        )
+    return next(iter(units.values()), None)
+
+
+def _require_common_capture_form(captures, selector):
+    """Refuse a selection that spans both capture forms.
+
+    Each Rank resolves its own unit, so a selector with no form suffix can land
+    on a fixed capture for one Rank and a retained one for another even though
+    no single directory offers two. The forms are read by different rules and
+    are never merged into one trace, so a selection that spans them is refused
+    rather than spliced, and the refusal names the suffix that resolves it.
+    """
+    forms = sorted({_capture_form_of(records_path) for _, records_path, _ in captures})
+    if len(forms) > 1:
+        named = ", ".join(f"{selector}:{form}" for form in forms)
+        raise ValueError(
+            f"{selector} selects both capture forms across Ranks, which are separate conversion units and are "
+            f"never merged; name one of {named}"
+        )
+
+
+def _rank_dispatch_dirs(rank_dir, *, strict):
+    """Each ``dN`` below one Rank, in capture order.
+
+    ``strict`` refuses a directory whose name is not ``dN``; whole-root
+    traversal uses it, because an unrecognised name there means the layout is
+    not the one being read. A selector-driven lookup does not, because it names
+    the directory it wants.
+    """
+    for capture_dir in sorted(
+        (path for path in Path(rank_dir).glob("d*") if path.is_dir()),
+        key=lambda path: int(path.name.removeprefix("d"))
+        if _DISPATCH_DIR_PATTERN.fullmatch(path.name)
+        else sys.maxsize,
+    ):
+        if not _DISPATCH_DIR_PATTERN.fullmatch(capture_dir.name):
+            if strict:
+                raise ValueError(f"invalid capture directory name: {capture_dir} (expected dN)")
+            continue
+        yield capture_dir
+
+
+def _ambiguous_sidecar_keys(rank_dirs):
+    """Dispatch keys more than one capture directory below this root claims.
+
+    A retained artifact is found by its whole key, so a key two directories
+    claim identifies neither of them. Reported here and withheld from retained
+    pairing everywhere below this root — which only a traversal can see, since
+    a single directory cannot know what another one claims. The fixed-name
+    captures in those directories are unaffected: their pairing has always been
+    directory adjacency.
+    """
+    claimants = defaultdict(list)
+    for _, rank_dir in rank_dirs:
+        for capture_dir in _rank_dispatch_dirs(rank_dir, strict=False):
+            try:
+                key = _sidecar_dispatch_key(_load_dispatch_identity(capture_dir))
+            except ValueError:
+                continue
+            if key is not None:
+                claimants[key].append(capture_dir)
+    ambiguous = set()
+    for key, directories in sorted(claimants.items()):
+        if len(directories) > 1:
+            named = ", ".join(str(path) for path in sorted(directories))
+            print(
+                f"Warning: dispatch identity {':'.join(str(part) for part in key)} is claimed by {named}; "
+                "no retained capture below them is paired",
+                file=sys.stderr,
+            )
+            ambiguous.add(key)
+    return ambiguous
+
+
+def _pairable_identity(identity, ambiguous):
+    """The sidecar a retained artifact may be matched against, or None.
+
+    A key two directories claim pairs nothing, so the identity is withheld from
+    retained matching while every other use of it — grouping, `host_pid`,
+    the parent key — stays exactly as it was.
+    """
+    return None if _sidecar_dispatch_key(identity) in ambiguous else identity
+
+
+def _discover_l3_parent_dispatch_inputs(rank_dirs, dispatch_identity):
+    selector, form = _split_capture_form(dispatch_identity)
+    match = _DISPATCH_ID_PATTERN.fullmatch(selector or "")
+    if match is None:
+        raise ValueError(
+            "--dispatch-id must use RUN_ID:TASK_SLOT (for example, 17:5), optionally suffixed with :fixed or :retained"
+        )
     expected_key = (int(match.group(1)), int(match.group(2)))
+    ambiguous = _ambiguous_sidecar_keys(rank_dirs)
     discovered = []
     for rank, rank_dir in rank_dirs:
-        for capture_dir in sorted(
-            (path for path in rank_dir.glob("d*") if path.is_dir()),
-            key=lambda path: int(path.name.removeprefix("d"))
-            if _DISPATCH_DIR_PATTERN.fullmatch(path.name)
-            else sys.maxsize,
-        ):
-            if not (capture_dir / "chip_swimlane_records.json").is_file():
-                continue
+        for capture_dir in _rank_dispatch_dirs(rank_dir, strict=False):
             identity = _load_dispatch_identity(capture_dir)
-            if identity is None:
+            if identity is None or (identity["run_id"], identity["task_slot"]) != expected_key:
                 continue
-            if (identity["run_id"], identity["task_slot"]) == expected_key:
-                discovered.append((rank, capture_dir / "chip_swimlane_records.json", identity))
+            units = _capture_units(capture_dir, _pairable_identity(identity, ambiguous))
+            records_path = _select_capture_unit(units, capture_dir, form)
+            if records_path is None:
+                continue
+            discovered.append((rank, records_path, identity))
+    _require_common_capture_form(discovered, f"{expected_key[0]}:{expected_key[1]}")
     pairing = _validate_parent_dispatch_group(discovered, expected_key)
     return [(rank, records_path) for rank, records_path, _ in sorted(discovered)], pairing
 
 
 def _discover_l3_local_capture_inputs(rank_dirs, dispatch):
-    if not _DISPATCH_DIR_PATTERN.fullmatch(dispatch or ""):
-        raise ValueError("--dispatch must name dN (for example, --dispatch d0)")
+    dispatch_name, form = _split_capture_form(dispatch)
+    if not _DISPATCH_DIR_PATTERN.fullmatch(dispatch_name or ""):
+        raise ValueError(
+            "--dispatch must name dN, optionally suffixed with :fixed or :retained (for example, --dispatch d0)"
+        )
 
     # One list of (rank, records_path, identity) triples rather than two parallel
     # lists: the identity belongs to the capture it was read from, and a pairing
     # that depends on two lists staying index-aligned is the failure this
     # function exists to prevent.
+    ambiguous = _ambiguous_sidecar_keys(rank_dirs)
     captures = []
     for rank, rank_dir in rank_dirs:
-        records_path = rank_dir / dispatch / "chip_swimlane_records.json"
-        if not records_path.is_file():
-            raise ValueError(f"rank{rank} is missing {dispatch}/chip_swimlane_records.json")
-        captures.append((rank, records_path, _load_dispatch_identity(records_path.parent)))
+        capture_dir = rank_dir / dispatch_name
+        identity = _load_dispatch_identity(capture_dir)
+        units = _capture_units(capture_dir, _pairable_identity(identity, ambiguous))
+        records_path = _select_capture_unit(units, capture_dir, form)
+        if records_path is None:
+            raise ValueError(
+                f"rank{rank} has no capture for {dispatch_name}: neither {dispatch_name}/{_FIXED_RECORDS_NAME} nor a "
+                f"retained capture under {dispatch_name}/swimlane-*/ that its dispatch identity names"
+            )
+        # The identity belongs to the capture directory, never to the records
+        # file's own parent: a retained artifact lives one level below it and
+        # the sidecar stays up here.
+        captures.append((rank, records_path, identity))
+
+    # Before any identity question: the individual-submission path below asks
+    # none, so a mixed-form selection would otherwise reach the merge there.
+    _require_common_capture_form(captures, dispatch_name)
 
     present_count = sum(identity is not None for _, _, identity in captures)
     if present_count not in (0, len(captures)):
-        raise ValueError(f"{dispatch} has dispatch identity metadata for only {present_count}/{len(captures)} Ranks")
+        raise ValueError(
+            f"{dispatch_name} has dispatch identity metadata for only {present_count}/{len(captures)} Ranks"
+        )
     pairing = {"dispatch_pairing": "local_capture_index"}
     if present_count:
         group_keys = {(identity["run_id"], identity["task_slot"]) for _, _, identity in captures}
@@ -3888,7 +4231,8 @@ def _discover_l3_local_capture_inputs(rank_dirs, dispatch):
         if has_group:
             if len(group_keys) != 1:
                 raise ValueError(
-                    f"{dispatch} refers to different parent dispatches across Ranks; use --dispatch-id RUN_ID:TASK_SLOT"
+                    f"{dispatch_name} refers to different parent dispatches across Ranks; "
+                    "use --dispatch-id RUN_ID:TASK_SLOT"
                 )
             pairing = _validate_parent_dispatch_group(captures, next(iter(group_keys)))
         else:
@@ -3911,44 +4255,55 @@ def discover_l3_conversion_targets(root):
     Public because the SceneTest postprocessor needs the same units this
     module's directory mode would pick, one CLI invocation per unit.
 
+    A capture directory holding both forms yields two units, never one merged
+    target, and each carries the selector that names it again plus the exact
+    files it selected.
+
     Raises ValueError only when nothing below ``root`` can be paired safely. A
     remainder that cannot be paired by dN downgrades to a stderr warning while
     the parent-identity targets are still returned.
     """
+    rank_dirs = _l3_rank_dirs(root)
+    ambiguous = _ambiguous_sidecar_keys(rank_dirs)
     captures_by_rank = {}
     parent_groups = defaultdict(list)
-    for rank, rank_dir in _l3_rank_dirs(root):
+    forms_by_dispatch = defaultdict(set)
+    for rank, rank_dir in rank_dirs:
         captures = []
-        for capture_dir in sorted(
-            (path for path in rank_dir.glob("d*") if path.is_dir()),
-            key=lambda path: int(path.name.removeprefix("d"))
-            if _DISPATCH_DIR_PATTERN.fullmatch(path.name)
-            else sys.maxsize,
-        ):
-            if not _DISPATCH_DIR_PATTERN.fullmatch(capture_dir.name):
-                raise ValueError(f"invalid capture directory name: {capture_dir} (expected dN)")
-            records_path = capture_dir / "chip_swimlane_records.json"
-            if not records_path.is_file():
-                continue
+        for capture_dir in _rank_dispatch_dirs(rank_dir, strict=True):
             identity = _load_dispatch_identity(capture_dir)
-            capture = (rank, records_path, identity)
-            captures.append(capture)
-            if identity is not None and identity["group_size"] > 1:
-                parent_groups[(identity["run_id"], identity["task_slot"])].append(capture)
+            units = _capture_units(capture_dir, _pairable_identity(identity, ambiguous))
+            for form, records_path in sorted(units.items()):
+                capture = (rank, records_path, identity)
+                captures.append((capture_dir, form, capture))
+                forms_by_dispatch[capture_dir.name].add(form)
+                if identity is not None and identity["group_size"] > 1:
+                    parent_groups[(identity["run_id"], identity["task_slot"], form)].append(capture)
         captures_by_rank[rank] = captures
+
+    group_forms = defaultdict(set)
+    for run_id, task_slot, form in parent_groups:
+        group_forms[(run_id, task_slot)].add(form)
 
     targets = []
     semantically_paired_paths = set()
-    for parent_key, captures in sorted(parent_groups.items()):
-        pairing = _validate_parent_dispatch_group(captures, parent_key)
+    for (run_id, task_slot, form), captures in sorted(parent_groups.items()):
+        pairing = _validate_parent_dispatch_group(captures, (run_id, task_slot))
         paths = [records_path for _, records_path, _ in sorted(captures)]
         semantically_paired_paths.update(paths)
+        qualified = len(group_forms[(run_id, task_slot)]) > 1
         targets.append(
             {
                 "dispatch": None,
-                "dispatch_id": f"{parent_key[0]}:{parent_key[1]}",
-                "output_stem": f"l3_swimlane_run{parent_key[0]}_task{parent_key[1]}",
-                "capture_dirs": [path.parent for path in paths],
+                "dispatch_id": f"{run_id}:{task_slot}:{form}" if qualified else f"{run_id}:{task_slot}",
+                "output_stem": f"l3_swimlane_run{run_id}_task{task_slot}" + (f"_{form}" if qualified else ""),
+                "capture_dirs": [_capture_directory_of(path) for path in paths],
+                # The exact files this target selected, in the same order as
+                # `capture_dirs`. A consumer whose merge failed converts these
+                # one by one; re-deriving them from the directories would offer
+                # the other form too and could resurrect a unit this traversal
+                # rejected.
+                "records_paths": paths,
                 "pairing": pairing,
             }
         )
@@ -3959,8 +4314,12 @@ def discover_l3_conversion_targets(root):
             (
                 rank,
                 {
-                    records_path.parent.name: records_path.parent
-                    for _, records_path, _ in captures
+                    # Keyed by the capture directory and the form, never by the
+                    # records file's own parent: a retained artifact's parent is
+                    # `swimlane-<k>`, which carries no dN and repeats across
+                    # dispatch directories.
+                    (capture_dir.name, form): (capture_dir, records_path)
+                    for capture_dir, form, (_, records_path, _) in captures
                     if records_path not in semantically_paired_paths
                 },
             )
@@ -3972,19 +4331,24 @@ def discover_l3_conversion_targets(root):
             # target is paired by (run_id, task_slot) and is unaffected by what
             # the leftover dN sets look like, so dropping those too would
             # discard exactly the pairings this identity exists to make.
-            detail = ", ".join(f"rank{rank}={sorted(captures)}" for rank, captures in fallback_sets)
+            detail = ", ".join(
+                f"rank{rank}={sorted(f'{name}:{form}' for name, form in captures)}" for rank, captures in fallback_sets
+            )
             message = f"refusing to pair asymmetric local capture indexes under {root}: {detail}"
             if not targets:
                 raise ValueError(message)
             print(f"Warning: {message}", file=sys.stderr)
             return targets
-        for dispatch in sorted(expected, key=lambda name: int(name.removeprefix("d"))):
+        for dispatch_name, form in sorted(expected, key=lambda unit: (int(unit[0].removeprefix("d")), unit[1])):
+            qualified = len(forms_by_dispatch[dispatch_name]) > 1
+            selected = [captures[(dispatch_name, form)] for _, captures in fallback_sets]
             targets.append(
                 {
-                    "dispatch": dispatch,
+                    "dispatch": f"{dispatch_name}:{form}" if qualified else dispatch_name,
                     "dispatch_id": None,
-                    "output_stem": f"l3_swimlane_{dispatch}",
-                    "capture_dirs": [captures[dispatch] for _, captures in fallback_sets],
+                    "output_stem": f"l3_swimlane_{dispatch_name}" + (f"_{form}" if qualified else ""),
+                    "capture_dirs": [capture_dir for capture_dir, _ in selected],
+                    "records_paths": [records_path for _, records_path in selected],
                     "pairing": {"dispatch_pairing": "local_capture_index"},
                 }
             )
@@ -4345,16 +4709,23 @@ def _placement_bound_events(rank, placement, global_origin_ns):
     return events
 
 
-def _load_rank_local_artifacts(records_path):
-    name_map_path = _find_sibling_name_map(records_path)
+def _load_rank_local_artifacts(records_path, companion_dir):
+    """One Rank's sidecar, name map and dependency files.
+
+    ``companion_dir`` is where this capture's companions were verified to live.
+    A retained artifact's own directory holds records files only, so resolving
+    these from the file's parent would silently drop the sidecar, the
+    dependency edges and the name map.
+    """
+    name_map_path = _find_sibling_name_map(records_path, companion_dir)
     if name_map_path is None:
         func_names, orchestrator_name = {}, None
     else:
         func_names, orchestrator_name = load_func_names_json(name_map_path)
 
-    deps_path = records_path.parent / "deps.json"
+    deps_path = Path(companion_dir) / "deps.json"
     return {
-        "dispatch_identity": _load_dispatch_identity(records_path.parent),
+        "dispatch_identity": _load_dispatch_identity(companion_dir),
         "func_names": func_names,
         "orchestrator_name": orchestrator_name,
         "deps_path": deps_path,
@@ -4407,19 +4778,25 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
 
     rank_inputs, pairing_metadata = _discover_l3_rank_inputs(root, args.dispatch, args.dispatch_id)
     raw_inputs = {}
+    companion_dirs = {}
     rank_identities = {}
     rank_host_pids = {}
     clock_domains = set()
     for rank, records_path in rank_inputs:
         with records_path.open() as f:
             raw_inputs[rank] = json.load(f)
+        # Resolved once per Rank and reused for every companion read below. For
+        # a fixed-name capture this is the file's own directory; for a retained
+        # artifact it is the capture directory one level up, and only after
+        # that directory's sidecar is confirmed to name this very artifact.
+        companion_dirs[rank] = _companion_directory(records_path)
         # The sidecar names both halves of the pairing: `host_pid` is the
         # ChipWorker child that served this capture, and the dispatch key is
         # which of that child's invocations it was. The Host log's root
         # `chip.run` span names the second, and its filename the first, so the
         # two artifacts pair exactly instead of by how well their device
         # windows happen to fit.
-        sidecar = _load_dispatch_identity(records_path.parent)
+        sidecar = _load_dispatch_identity(companion_dirs[rank])
         identity = containment.capture_identity(sidecar)
         if identity is not None:
             rank_identities[rank] = identity
@@ -4482,7 +4859,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             except (OSError, ValueError) as error:
                 print(f"Warning: could not save clock alignment: {error}", file=sys.stderr)
         data = _decode_perf_data(raw, timeline_origin_ns=global_origin_ns, placement=placement)
-        artifacts = _load_rank_local_artifacts(records_path)
+        artifacts = _load_rank_local_artifacts(records_path, companion_dirs[rank])
         dispatch_identity = artifacts["dispatch_identity"]
         trace = generate_chrome_trace_json(
             data["tasks"],

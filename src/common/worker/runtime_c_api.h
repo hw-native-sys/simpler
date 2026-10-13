@@ -194,6 +194,31 @@ typedef struct PipelineContract {
 } PipelineContract;
 
 /**
+ * Where one dispatch came from in the submitting Worker's tree.
+ *
+ * Carried beside a run's resource identity so that a diagnostic artifact can be
+ * attributed to the submission that produced it. **An all-zero
+ * `owner_instance_id` means the whole structure is unstated**, which is what a
+ * caller reaching the native lane without a Worker mailbox leaves behind: the
+ * remaining fields are then not read, and no consumer may treat their zeros as
+ * an identity. A stated nonce is a full-width random draw, so all-zero cannot
+ * collide with a real one.
+ */
+typedef struct NativeRunProvenance {
+    /** The submitting Worker's incarnation nonce; all-zero ⇔ nothing stated. */
+    uint8_t owner_instance_id[8];
+    /** Index of the chip child serving the dispatch. */
+    uint32_t chip_rank;
+    /** That child's own count of diagnostic dispatches before this one. */
+    uint32_t capture_index;
+    /** Parent task slot, and this member's place in a grouped dispatch. */
+    uint32_t task_slot;
+    uint32_t group_index;
+    uint32_t group_size;
+    uint32_t reserved;
+} NativeRunProvenance;
+
+/**
  * Ownership token for one pipeline resource slot.
  *
  * `slot_id` selects the per-run/exec-handle copies. `generation` changes every
@@ -206,6 +231,30 @@ typedef struct PipelineSlotLease {
     uint32_t reserved;
     uint64_t generation;
 } PipelineSlotLease;
+
+/**
+ * One run's whole published identity, by value.
+ *
+ * Assembled from a prepared run's descriptor and owned by every stage that
+ * keeps it, so no consumer dereferences the submitter's storage. Deliberately
+ * excludes the descriptor's acceptance sink and its value — a caller pointer
+ * and its sentinel, which must never reach output metadata — and excludes
+ * `run_epoch`, which a retaining collector already holds and publishes from its
+ * own bucket. An all-zero `owner_instance_id` carries the same meaning it has
+ * on `NativeRunProvenance`: nothing was stated, and the rest is not an identity.
+ */
+typedef struct NativeRunArtifactIdentity {
+    uint64_t run_id;
+    uint64_t dispatch_id;
+    uint64_t generation;
+    uint8_t owner_instance_id[8];
+    uint32_t pipeline_slot;
+    uint32_t chip_rank;
+    uint32_t capture_index;
+    uint32_t task_slot;
+    uint32_t group_index;
+    uint32_t group_size;
+} NativeRunArtifactIdentity;
 
 /**
  * Immutable resource and trace identity copied into one prepared run.
@@ -237,6 +286,8 @@ typedef struct NativeRunDescriptor {
      * Worker at launch depth one gets on every run.
      */
     uint32_t joinable_boundary;
+    /** Where this dispatch came from, for diagnostic attribution only. */
+    NativeRunProvenance provenance;
 } NativeRunDescriptor;
 
 /**
