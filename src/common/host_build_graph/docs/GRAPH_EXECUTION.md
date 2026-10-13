@@ -220,7 +220,11 @@ why it cannot be diagnosed instead:
   part in the reuse condition. Their count is fixed by the recorded boundary
   contract. Unused boundary scalars are allowed and do not create internal
   scalar patches.
-- A Graph boundary contains at least one ChipTensor.
+- A Graph boundary may contain no ChipTensor at all. A body that reaches its
+  buffers through handles its `Config` carries passes none, and such a boundary
+  records and publishes like any other. Every tensor such a body touches it
+  produces itself: a tensor the caller owns but did not pass as a parameter is
+  refused, whatever the boundary's count.
 - Construction parameters — the Graph's `Config` — are part of Graph identity
   and may control the function's task count, kernel selection, or other
   structural choices. Two Configs that differ record two Definitions.

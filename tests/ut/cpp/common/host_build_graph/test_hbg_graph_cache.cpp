@@ -367,10 +367,10 @@ private:
 }  // namespace
 
 // A boundary of no tensors opens a Graph like any other. A body that reaches its buffers
-// through its Config rather than through arguments passes none, and every stage below counts
-// its tensors rather than assuming one -- which
-// GraphExecutionReplay.ReplaysABodyWithNoBoundaryTensor carries through to a materialized
-// body.
+// through its Config rather than through arguments passes none. Both ends of the Graph path
+// carry the same absence of a lower bound: this admission, and the layout in
+// graph_layout_definition that decides whether the recording may be published --
+// HbgGraphRecordingBoundsTest.ABoundaryOfNoTensorsRecordsAndPublishes drives that one.
 TEST(GraphCache, AcceptsABoundaryWithNoTensor) {
     GraphTaskArgs scalars_only;
     scalars_only.add_scalar(uint32_t{17});
@@ -949,12 +949,17 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     EXPECT_EQ(storage.payload.dump_metadata.dump_arg_mask, uint64_t{1} << 0);
 }
 
-// A body that passes no tensors at all records and replays on this same path. That is the
-// shape a Config-driven Graph has -- its buffers are reached through raw handles its Config
-// carries, so nothing crosses the boundary as a tensor -- and the companion case in
-// GraphCache is what admits such a boundary. Here it is carried through to materialized
-// sub-tasks: every body tensor resolves against the graph heap, and the boundary's scalars
-// still refresh per invocation.
+// A body that passes no tensors at all replays on this same path. That is the shape a
+// Config-driven Graph has -- its buffers are reached through raw handles its Config
+// carries, so nothing crosses the boundary as a tensor.
+//
+// This case enters at replay, from a hand-built Definition: what it shows is that
+// materialization resolves every body tensor against the graph heap when no parameter can be
+// named, and that the boundary's scalars still refresh per invocation. It shows nothing about
+// whether such a boundary can be *recorded* -- the layout and publish stage is a separate end,
+// and the two disagreeing is its own defect. That end is
+// HbgGraphRecordingBoundsTest.ABoundaryOfNoTensorsRecordsAndPublishes, which drives the real
+// recorder through graph_begin, graph_prepare, a sub-task and graph_end.
 TEST(GraphExecutionReplay, ReplaysABodyWithNoBoundaryTensor) {
     constexpr uint64_t GRAPH_KEY_VALUE = 0x4321;
 

@@ -216,3 +216,49 @@ TEST_F(HbgGraphRecordingBoundsTest, TwoViewsOfOneBufferShareAWindowAndKeepTheEdg
     EXPECT_EQ(definition->task_count, 2u);
     EXPECT_EQ(definition->edge_count, 1u) << "the reader depends on the writer through the buffer they share";
 }
+
+// A boundary of no tensors records and publishes. This is the shape a Config-driven Graph has:
+// the body reaches its buffers through handles its Config carries, so nothing crosses the
+// boundary as a tensor and the boundary holds scalars alone.
+//
+// The whole path, through the real recorder rather than a hand-built image: the admission
+// `rt_graph_args_cacheable` decides, then graph_prepare, a recorded sub-task, graph_end, and the
+// published Definition. Entering at replay would prove nothing here — the two ends disagreeing
+// about a zero-tensor boundary is exactly the defect this pins, and a submission admitted at one
+// end and refused at the other records a whole body before failing at graph_end.
+TEST_F(HbgGraphRecordingBoundsTest, ABoundaryOfNoTensorsRecordsAndPublishes) {
+    GraphTaskArgs boundary_args;
+    boundary_args.add_scalar(uint64_t{17});
+    ASSERT_EQ(boundary_args.tensor_count(), 0);
+    ASSERT_TRUE(rt_graph_args_cacheable(boundary_args)) << "the submission end admits a boundary of no tensors";
+
+    orch.begin_scope();
+    const GraphScopeResult graph = orch.graph_begin(0x20E50A11, boundary_args, 0x1736);
+    ASSERT_FALSE(graph.has_error) << "a boundary of no tensors opens a Graph";
+    ASSERT_TRUE(graph.recording);
+    ASSERT_TRUE(orch.graph_prepare(graph.recording_handle, boundary_args));
+
+    // The body's own tensor, allocated inside the Graph. With no boundary tensor there is
+    // nothing for it to inherit, which is the case a Config-driven body is in: every tensor it
+    // touches it produces itself, and the buffers its Config names reach the kernel as scalars
+    // rather than as boundary parameters.
+    uint32_t shape[] = {16};
+    TensorCreateInfo recorded_output(shape, 1, DataType::UINT32);
+    CoreTaskArgs task_args;
+    task_args.add_output(recorded_output);
+    task_args.add_scalar(graph.params->scalar(0));
+    ASSERT_TRUE(orch.submit_dummy_task(task_args).task_id().is_valid());
+
+    ASSERT_TRUE(orch.graph_end()) << "the recording end must publish what the submission end admitted";
+
+    const GraphHostDefinitionList published = graph_host_definitions(*graph_state);
+    ASSERT_EQ(published.entries.size(), 1u) << "a zero-tensor boundary yields a Definition like any other";
+    const GraphHostDefinition &entry = published.entries.front();
+    ASSERT_NE(entry.object_offset, GRAPH_NO_OBJECT_OFFSET);
+    const auto *definition = reinterpret_cast<const GraphDefinition *>(
+        definition_staging.data() + entry.object_offset + sizeof(GraphDefinitionHeader)
+    );
+    EXPECT_EQ(definition->boundary_tensor_count, 0);
+    EXPECT_EQ(definition->boundary_scalar_count, 1);
+    EXPECT_EQ(definition->task_count, 1u);
+}
