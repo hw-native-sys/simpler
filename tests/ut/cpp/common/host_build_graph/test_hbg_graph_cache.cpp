@@ -506,73 +506,125 @@ protected:
     void TearDown() override { simpler::hbg::config_registry().clear(); }
 };
 
-// The ordinary case: one Graph submitted repeatedly within a bind.
-TEST_F(GraphConfigRegistryTest, ResubmittingOneKeyWithItsOwnConfigAgrees) {
-    constexpr uint64_t KEY = 0x9001;
+// Deliberately weak hashes exercise collisions without relying on chance.
+struct CollidingConfig : simpler::hbg::ConfigBase {
+    explicit CollidingConfig(int v) :
+        value(v) {}
+    int value;
+    uint64_t hash() const { return 0; }
+    bool operator==(const CollidingConfig &other) const { return value == other.value; }
+};
 
-    EXPECT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
-    EXPECT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
-    EXPECT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
-}
+struct DerivedCollidingConfig : CollidingConfig {
+    explicit DerivedCollidingConfig(int v) :
+        CollidingConfig(v) {}
+    uint64_t hash() const { return 0; }
+    bool operator==(const DerivedCollidingConfig &other) const { return value == other.value; }
+};
 
-// The hole this registry exists to close. Two Configs reaching one key means the key no
-// longer names the Graph its Definition was recorded from, so the next hit would replay the
-// wrong body -- the failure mode that was silent before. Reported rather than asserted: a
-// Config's hash() is the caller's own code, so a collision is caller-triggerable, and the
-// submission turns this false into a fatal naming the key.
-TEST_F(GraphConfigRegistryTest, TwoConfigValuesOnOneKeyFailLoudly) {
-    constexpr uint64_t KEY = 0x9002;
-
-    ASSERT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
-    EXPECT_FALSE(simpler::hbg::retain_config(KEY, VariantConfig{4}));
-}
-
-// Same hole, across types rather than values. One table for every Config type is what makes
-// this case visible at all: per-type tables would put these two in separate maps.
-TEST_F(GraphConfigRegistryTest, TwoConfigTypesOnOneKeyFailLoudly) {
-    constexpr uint64_t KEY = 0x9003;
-
-    ASSERT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
-    EXPECT_FALSE(simpler::hbg::retain_config(KEY, ThresholdConfig{true}));
-}
-
-// A refused submission leaves the retained Config alone: the first one still owns the key,
-// so a later submission carrying it is still admitted.
-TEST_F(GraphConfigRegistryTest, ARefusedConfigDoesNotDisplaceTheRetainedOne) {
-    constexpr uint64_t KEY = 0x9008;
-
-    ASSERT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
-    ASSERT_FALSE(simpler::hbg::retain_config(KEY, VariantConfig{4}));
-
-    EXPECT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
+TEST_F(GraphConfigRegistryTest, EqualConfigurationsReuseTheKey) {
+    const auto key = simpler::hbg::retain_config(0x9001, CollidingConfig{3});
+    EXPECT_EQ(key, simpler::hbg::retain_config(0x9001, CollidingConfig{3}));
     EXPECT_EQ(simpler::hbg::config_registry().size(), 1u);
 }
 
-// Distinct keys are independent, so an unrelated Graph is never dragged into a comparison.
-TEST_F(GraphConfigRegistryTest, DistinctKeysRetainIndependently) {
-    ASSERT_TRUE(simpler::hbg::retain_config(0x9004, VariantConfig{3}));
-    ASSERT_TRUE(simpler::hbg::retain_config(0x9005, VariantConfig{4}));
-    ASSERT_TRUE(simpler::hbg::retain_config(0x9006, ThresholdConfig{false}));
-
-    EXPECT_TRUE(simpler::hbg::retain_config(0x9004, VariantConfig{3}));
-    EXPECT_TRUE(simpler::hbg::retain_config(0x9005, VariantConfig{4}));
-    EXPECT_TRUE(simpler::hbg::retain_config(0x9006, ThresholdConfig{false}));
-    EXPECT_EQ(simpler::hbg::config_registry().size(), 3u);
+TEST_F(GraphConfigRegistryTest, CollidingValuesKeepIndependentKeysAcrossRehash) {
+    const auto a = simpler::hbg::retain_config(0x9002, CollidingConfig{3});
+    const auto b = simpler::hbg::retain_config(0x9002, CollidingConfig{4});
+    const auto c = simpler::hbg::retain_config(0x9002, CollidingConfig{5});
+    ASSERT_NE(a, b);
+    ASSERT_NE(a, c);
+    ASSERT_NE(b, c);
+    auto &registry = simpler::hbg::config_registry();
+    registry.rehash(registry.bucket_count() * 2);
+    EXPECT_EQ(a, simpler::hbg::retain_config(0x9002, CollidingConfig{3}));
+    EXPECT_EQ(b, simpler::hbg::retain_config(0x9002, CollidingConfig{4}));
+    EXPECT_EQ(c, simpler::hbg::retain_config(0x9002, CollidingConfig{5}));
+    EXPECT_EQ(registry.size(), 3u);
 }
 
-// What framework_finish_orch does at the end of every bind. Clearing is what pairs this
-// table with the host's Definition cache: once that cache is gone, a key carries nothing,
-// so the same key may legitimately come back under a different Config.
-TEST_F(GraphConfigRegistryTest, ClearingReleasesEveryKey) {
-    constexpr uint64_t KEY = 0x9007;
+TEST_F(GraphConfigRegistryTest, CollidingTypesKeepIndependentKeys) {
+    const auto a = simpler::hbg::retain_config(0x9003, CollidingConfig{3});
+    const auto b = simpler::hbg::retain_config(0x9003, simpler::hbg::DefaultConfig{});
+    EXPECT_NE(a, b);
+    EXPECT_EQ(a, simpler::hbg::retain_config(0x9003, CollidingConfig{3}));
+    EXPECT_EQ(b, simpler::hbg::retain_config(0x9003, simpler::hbg::DefaultConfig{}));
+}
 
-    ASSERT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{3}));
-    ASSERT_FALSE(simpler::hbg::retain_config(KEY, VariantConfig{4}));
+// A successful dynamic_cast alone does not establish exact type identity: a retained
+// derived Config also casts to its base, whose equality may ignore the derived fields.
+TEST_F(GraphConfigRegistryTest, DerivedAndBaseConfigsRemainDistinctInEitherOrder) {
+    const auto derived = simpler::hbg::retain_config(0x9004, DerivedCollidingConfig{3});
+    const auto base = simpler::hbg::retain_config(0x9004, CollidingConfig{3});
+    EXPECT_NE(derived, base);
+    simpler::hbg::clear_config_registry();
+    const auto base_first = simpler::hbg::retain_config(0x9004, CollidingConfig{3});
+    const auto derived_second = simpler::hbg::retain_config(0x9004, DerivedCollidingConfig{3});
+    EXPECT_NE(base_first, derived_second);
+}
 
-    simpler::hbg::config_registry().clear();
+TEST_F(GraphConfigRegistryTest, DifferentGraphsDoNotShareKeys) {
+    const auto a = simpler::hbg::retain_config(0x9005, CollidingConfig{3});
+    const auto b = simpler::hbg::retain_config(0x9006, CollidingConfig{3});
+    EXPECT_NE(a, b);
+    EXPECT_EQ(a, simpler::hbg::retain_config(0x9005, CollidingConfig{3}));
+    EXPECT_EQ(b, simpler::hbg::retain_config(0x9006, CollidingConfig{3}));
+}
 
+struct RawHashConfig : simpler::hbg::ConfigBase {
+    explicit RawHashConfig(uint64_t v) :
+        value(v) {}
+    uint64_t value;
+    uint64_t hash() const { return value; }
+    bool operator==(const RawHashConfig &other) const { return value == other.value; }
+};
+
+TEST_F(GraphConfigRegistryTest, CollidingGraphAndConfigDigestsRemainDistinct) {
+    const uint64_t graph_a = 0x9100;
+    const uint64_t graph_b = 0x9101;
+    const auto state_a = graph_hash_bytes(1469598103934665603ULL, &graph_a, sizeof(graph_a));
+    const auto state_b = graph_hash_bytes(1469598103934665603ULL, &graph_b, sizeof(graph_b));
+    const RawHashConfig a{0};
+    const RawHashConfig b{state_a ^ state_b};
+    ASSERT_EQ(rt_graph_make_key(graph_a, a.hash()), rt_graph_make_key(graph_b, b.hash()));
+    const auto key_a = simpler::hbg::retain_config(graph_a, a);
+    const auto key_b = simpler::hbg::retain_config(graph_b, b);
+    EXPECT_NE(key_a, key_b);
+    EXPECT_EQ(key_a, simpler::hbg::retain_config(graph_a, a));
+    EXPECT_EQ(key_b, simpler::hbg::retain_config(graph_b, b));
+}
+
+TEST_F(GraphConfigRegistryTest, RetainedConfigOwnsItsValues) {
+    CollidingConfig config{3};
+    const auto a = simpler::hbg::retain_config(0x9007, config);
+    config.value = 4;
+    EXPECT_NE(a, simpler::hbg::retain_config(0x9007, config));
+    EXPECT_EQ(a, simpler::hbg::retain_config(0x9007, CollidingConfig{3}));
+}
+
+TEST_F(GraphConfigRegistryTest, ConcurrentCollisionsReuseOneKeyPerIdentity) {
+    std::array<uint64_t, 8> keys{};
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        threads.emplace_back([&, i]() {
+            keys[i] = simpler::hbg::retain_config(0x9009, CollidingConfig{static_cast<int>(i % 2)});
+        });
+    }
+    for (auto &thread : threads)
+        thread.join();
+    EXPECT_NE(keys[0], keys[1]);
+    for (size_t i = 0; i < keys.size(); ++i)
+        EXPECT_EQ(keys[i], keys[i % 2]);
+    EXPECT_EQ(simpler::hbg::config_registry().size(), 2u);
+}
+
+TEST_F(GraphConfigRegistryTest, ClearingStartsANewBindNamespace) {
+    const auto first = simpler::hbg::retain_config(0x9008, CollidingConfig{3});
+    EXPECT_NE(first, simpler::hbg::retain_config(0x9008, CollidingConfig{4}));
+    simpler::hbg::clear_config_registry();
     EXPECT_TRUE(simpler::hbg::config_registry().empty());
-    EXPECT_TRUE(simpler::hbg::retain_config(KEY, VariantConfig{4}));
+    EXPECT_EQ(first, simpler::hbg::retain_config(0x9008, CollidingConfig{4}));
+    EXPECT_EQ(simpler::hbg::config_registry().size(), 1u);
 }
 
 // Arg's storage stays unreachable only while the base is private. Under a public base an

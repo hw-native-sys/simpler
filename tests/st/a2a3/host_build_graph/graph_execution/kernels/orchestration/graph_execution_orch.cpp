@@ -29,7 +29,8 @@ struct LayerConfig : simpler::hbg::ConfigBase {
 
     int variant;
 
-    uint64_t hash() const { return simpler::hbg::config_hash(variant); }
+    // Deliberate collision: different recorded kernels must remain distinct on replay.
+    uint64_t hash() const { return 0; }
     bool operator==(const LayerConfig &other) const { return variant == other.variant; }
 };
 

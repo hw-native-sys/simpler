@@ -198,6 +198,6 @@ jobs:
           BASE_SHA: ${{ inputs.setup_variant == 'self-cpu' && steps.base.outputs.base_sha || inputs.base_sha }}
           HEAD_SHA: ${{ inputs.setup_variant == 'self-cpu' && (inputs.ref || github.sha) || inputs.head_sha }}
         run: |
-          python -m pip install pre-commit
+          python -m pip install --retries 5 --timeout 60 "pre-commit==4.5.1"
           python -m pre_commit run --show-diff-on-failure --color=always \
             --from-ref "$BASE_SHA" --to-ref "$HEAD_SHA"

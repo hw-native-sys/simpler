@@ -93,12 +93,14 @@ either is a compile error at the submission rather than a template expansion.
 A Graph that takes no construction parameters passes nothing, which is the same
 submission as passing `simpler::hbg::DefaultConfig{}`.
 
-A Config's hash joins the cache key, so two different Configs of one Graph record
-two Definitions. The Config a key was first submitted with is retained for the
-bind and compared against every later submission on that key, which is what turns
-a hash collision into a reported fatal rather than a silently wrong replay. Build
-the hash with `simpler::hbg::config_hash`, passing every field `operator==`
-compares, in the same order.
+A Config's hash selects a registry bucket. Within that bucket, the Graph id,
+Config type, and `operator==` identify a submission. Equal identities reuse one
+internal key; unequal identities receive different keys even when their hashes
+collide. Those keys select separate Definitions in both the host cache and the
+upload path. Keys live only for the bind and are reset with the Config registry.
+Configs equal under `operator==` must return the same hash. Build it with
+`simpler::hbg::config_hash`, passing every field `operator==`
+compares, in the same order, to keep collision buckets small.
 
 A Config must be copy-constructible and self-contained: the retained copy outlives
 the submit call, and the recording job that reads it runs on another thread, so a
