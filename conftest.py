@@ -804,9 +804,11 @@ def _collect_resource_jobs(items, platform, manual_mode="exclude"):
         ``device_count`` is the max across the class's platform-matching
         cases selected by ``manual_mode``.
       - ``standalone``: one per non-class pytest function that declares its
-        resource needs via ``@pytest.mark.device_count(n)`` +
-        ``@pytest.mark.runtime("...")`` (and optional
-        ``@pytest.mark.platforms([...])``).
+        resource needs via ``@pytest.mark.device_count(n)`` (and optional
+        ``@pytest.mark.runtime("...")`` / ``@pytest.mark.platforms([...])``).
+        A function that names no runtime is runtime-agnostic: it gets the
+        same devices and the same isolation, and its child carries no
+        ``--runtime``.
 
     Both are dispatched through the same ``parallel_scheduler.run_jobs``
     bin-pack, so merging them reduces the dispatcher to a single phase in
@@ -1178,13 +1180,15 @@ def _emit_resource_failure_summary(
 
 
 def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
-    """Run Resource → L2 phases.
+    """Run Resource → L2 → leftover phases.
 
     The Resource phase dispatches every item that needs a dedicated
     device-allocating subprocess — L3 ``SceneTestCase`` classes *and*
-    standalone functions marked with ``@pytest.mark.device_count`` +
-    ``@pytest.mark.runtime``. They share the same ``run_jobs`` bin-pack
-    and fail-fast gate, so they are one phase, not two.
+    standalone functions marked with ``@pytest.mark.device_count``. They
+    share the same ``run_jobs`` bin-pack and fail-fast gate, so they are one
+    phase, not two. The L2 phase then runs one subprocess per SceneTestCase
+    runtime, and the leftover phase runs what neither claimed, in this
+    process, so that every selected item is accounted for.
 
     ``resource_specs`` is pre-collected by ``pytest_runtestloop`` (which
     already has to inspect the list to decide whether to dispatch) so
@@ -1337,6 +1341,14 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
             if fail_fast:
                 break
 
+    if resource_failed:
+        _emit_resource_failure_summary(
+            resource_results,
+            emit_annotations=False,
+            heading="Resource phase failed recap",
+        )
+    phases_failed = resource_failed or l2_failed
+
     # ----- Phase 3: everything the first two phases do not claim -----
     # Neither phase runs an item by walking ``session.items``: Resource matches
     # a device_count marker, L2 matches a SceneTestCase runtime. An item that
@@ -1344,26 +1356,29 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
     # phase, and running it here is what keeps "selected" and "run" the same
     # set. This process has only forked subprocesses up to this point, so it is
     # the clean one; anything needing its own is a Resource job by marker.
+    #
+    # It runs last so an earlier phase's recap is already on the log when a
+    # stop or a maxfail raises out of this loop and skips everything below.
     leftover = _collect_unclaimed_items(session.items, resource_specs, l2_runtimes)
     leftover_failed = False
-    if leftover and not ((resource_failed or l2_failed) and fail_fast):
+    if leftover and not (phases_failed and fail_fast):
         print(f"\nLeftover phase: {len(leftover)} item(s) in this process", flush=True)
         before = session.testsfailed
-        for index, item in enumerate(leftover):
-            nextitem = leftover[index + 1] if index + 1 < len(leftover) else None
-            item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
-            if session.shouldfail or session.shouldstop:
-                break
-        leftover_failed = session.testsfailed > before
+        try:
+            for index, item in enumerate(leftover):
+                nextitem = leftover[index + 1] if index + 1 < len(leftover) else None
+                item.config.hook.pytest_runtest_protocol(item=item, nextitem=nextitem)
+                # Both conditions raise in pytest's own loop, and the exit
+                # status is the only thing that reports a stop: it leaves the
+                # remaining items unrun with nothing failed to deduce it from.
+                if session.shouldfail:
+                    raise session.Failed(session.shouldfail)
+                if session.shouldstop:
+                    raise session.Interrupted(session.shouldstop)
+        finally:
+            leftover_failed = session.testsfailed > before
 
-    if resource_failed:
-        _emit_resource_failure_summary(
-            resource_results,
-            emit_annotations=False,
-            heading="Resource phase failed recap",
-        )
-
-    failed = resource_failed or l2_failed or leftover_failed
+    failed = phases_failed or leftover_failed
     session.testsfailed = 1 if failed else 0
     if not failed:
         session.testscollected = sum(1 for _ in session.items)
@@ -1371,12 +1386,13 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
 
 
 def pytest_runtestloop(session):
-    """Dispatch Resource + L2 phases unless caller is already in child mode.
+    """Dispatch Resource + L2 + leftover phases unless caller is in child mode.
 
-    Child mode (runtime-filtered runs, L2/L3 level-filtered runs, or
-    --collect-only) skips the dispatcher and falls through to pytest's
-    default runtestloop. Level 4 network1 selection is not child mode; it still
-    uses the Resource dispatcher.
+    Child mode (runtime-filtered runs, L2/L3 level-filtered runs, a
+    runtime-less resource job narrowed to itself, or --collect-only) skips the
+    dispatcher and falls through to pytest's default runtestloop. Level 4
+    network1 selection is not child mode; it still uses the Resource
+    dispatcher.
     """
     runtime_filter = session.config.getoption("--runtime")
     level_filter = session.config.getoption("--level")

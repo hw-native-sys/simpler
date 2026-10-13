@@ -14,6 +14,8 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 _ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -317,3 +319,95 @@ def test_an_item_no_phase_runs_is_reported_as_unclaimed():
     unclaimed = cf._collect_unclaimed_items([resource, l2, plain], jobs, ["host_build_graph"])
 
     assert [item.nodeid for item in unclaimed] == ["u.py::test_plain"]
+
+
+class _Hook:
+    """Records protocol calls and lets a test act as the item that ran."""
+
+    def __init__(self, session, on_run=None):
+        self._session = session
+        self._on_run = on_run or (lambda item: None)
+        self.ran = []
+
+    def pytest_runtest_protocol(self, item, nextitem):
+        self.ran.append((item.nodeid, nextitem.nodeid if nextitem else None))
+        self._on_run(item)
+
+
+class _Failed(Exception):
+    pass
+
+
+class _Interrupted(Exception):
+    pass
+
+
+def _leftover_session(items, on_run=None):
+    config = _Config(xdist_active=False, xdist_blocked=False)
+    session = SimpleNamespace(
+        config=config,
+        items=items,
+        testsfailed=0,
+        testscollected=0,
+        shouldfail=False,
+        shouldstop=False,
+        Failed=_Failed,
+        Interrupted=_Interrupted,
+    )
+    hook = _Hook(session, on_run)
+    for item in items:
+        item.config = SimpleNamespace(hook=hook)
+    return session, hook
+
+
+def test_the_leftover_phase_runs_each_unclaimed_item_once_in_order():
+    cf = _load_root_conftest()
+    items = [_Item("u.py::test_one"), _Item("u.py::test_two")]
+    session, hook = _leftover_session(items)
+
+    assert cf._dispatch_test_phases(session, []) is True
+
+    assert hook.ran == [("u.py::test_one", "u.py::test_two"), ("u.py::test_two", None)]
+    assert session.testsfailed == 0
+
+
+def test_a_failing_leftover_item_makes_the_dispatcher_report_failure():
+    cf = _load_root_conftest()
+    items = [_Item("u.py::test_one")]
+    session, hook = _leftover_session(items)
+    hook._on_run = lambda item: setattr(session, "testsfailed", session.testsfailed + 1)
+
+    assert cf._dispatch_test_phases(session, []) is True
+
+    assert session.testsfailed == 1
+
+
+def test_a_stopped_leftover_phase_interrupts_rather_than_reporting_success():
+    # A stop leaves the remaining items unrun with nothing failed, so only the
+    # exception pytest's own loop raises can keep the run from passing.
+    cf = _load_root_conftest()
+    items = [_Item("u.py::test_one"), _Item("u.py::test_two")]
+    session, hook = _leftover_session(items)
+    hook._on_run = lambda item: setattr(session, "shouldstop", "out of time")
+
+    with pytest.raises(_Interrupted):
+        cf._dispatch_test_phases(session, [])
+
+    assert hook.ran == [("u.py::test_one", "u.py::test_two")]
+
+
+def test_a_maxfail_stop_in_the_leftover_phase_raises_failed():
+    cf = _load_root_conftest()
+    items = [_Item("u.py::test_one"), _Item("u.py::test_two")]
+    session, hook = _leftover_session(items)
+
+    def _fail(item):
+        session.testsfailed += 1
+        session.shouldfail = "stopping after 1 failure"
+
+    hook._on_run = _fail
+
+    with pytest.raises(_Failed):
+        cf._dispatch_test_phases(session, [])
+
+    assert hook.ran == [("u.py::test_one", "u.py::test_two")]
