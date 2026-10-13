@@ -106,6 +106,7 @@ class RankGraph:
     t1: int
     kept_edges: int
     label: str
+    run_epoch: int | None = None
 
 
 def discover_rank_dirs(root: Path) -> list[Path]:
@@ -122,6 +123,15 @@ def discover_rank_dirs(root: Path) -> list[Path]:
 
 
 def build_graph(rank_dir: Path, root: Path, tol: int) -> RankGraph:
+    """Build a single-run graph, refusing ambiguous multi-run input."""
+    graphs = build_graphs(rank_dir, root, tol)
+    if len(graphs) != 1:
+        raise ValueError("capture contains multiple runs; use build_graphs to analyze each run separately")
+    return graphs[0]
+
+
+def build_graphs(rank_dir: Path, root: Path, tol: int) -> list[RankGraph]:
+    """Build one graph per run; task ids are only unique within a run."""
     rec_file = _find_records(rank_dir)
     if rec_file is None:
         raise FileNotFoundError(f"no swimlane records ({' / '.join(SWIMLANE_RECORD_NAMES)}) in {rank_dir}")
@@ -133,21 +143,38 @@ def build_graph(rank_dir: Path, root: Path, tol: int) -> RankGraph:
     name_map = _read_json(name_map_file).get("callable_id_to_name", {})
 
     freq = int(sw["metadata"]["clock_freq_hz"])
-    # aicore_tasks rows are [core_id, task_token, reg_task_id, start_tick, end_tick,
-    # receive_to_start_cycles] (see ChipSwimlaneCollector::export_swimlane_json). Kernel
-    # names come from deps.json's kernel_ids, not from these rows.
+    # aicore_tasks rows start with [core_id, task_token, reg_task_id, start_tick,
+    # end_tick]; receive_to_start_cycles and run_epoch are optional trailing fields.
+    # Kernel names come from deps.json's kernel_ids, not from these rows.
     recs = sw["aicore_tasks"]
     if not recs:
         raise RuntimeError(f"no aicore_tasks records in {rec_file} (empty/failed profiling run?)")
 
+    by_run: dict[int | None, list[list[int]]] = collections.defaultdict(list)
+    for row in recs:
+        if len(row) not in (5, 6, 7):
+            raise ValueError(f"expected 5, 6 or 7 aicore_tasks columns in {rec_file}, got {len(row)}")
+        epoch = row[6] if len(row) == 7 else None
+        if len(row) == 7 and (type(epoch) is not int or epoch < 0):
+            raise ValueError(f"invalid run_epoch in {rec_file}: {epoch!r}")
+        by_run[epoch].append(row)
+    if None in by_run and len(by_run) > 1:
+        raise ValueError(f"cannot attribute aicore_tasks mixing identified and legacy rows in {rec_file}")
+    label = str(rank_dir.relative_to(root)) if rank_dir != root else rank_dir.name
+    return [_build_run_graph(rows, deps, name_map, freq, label, epoch, tol) for epoch, rows in by_run.items()]
+
+
+def _build_run_graph(
+    recs: list[list[int]], deps, name_map, freq: int, label: str, epoch: int | None, tol: int
+) -> RankGraph:
     start: dict[str, int] = {}
     end: dict[str, int] = {}
     nblock: collections.Counter = collections.Counter()
     core_slices: dict[int, list[tuple[int, int, str]]] = collections.defaultdict(list)
-    for core, tid, _seq, st, en, _recv in recs:
+    for core, tid, _seq, st, en, *_rest in recs:
         t = str(tid)
-        start[t] = min(start.get(t, INF), st)
-        end[t] = max(end.get(t, -INF), en)
+        start[t] = min(start.get(t, st), st)
+        end[t] = max(end.get(t, en), en)
         nblock[t] += 1
         core_slices[core].append((st, en, t))
 
@@ -199,7 +226,6 @@ def build_graph(rank_dir: Path, root: Path, tol: int) -> RankGraph:
             if en > best_end:
                 best_end, best_task = en, t
 
-    label = str(rank_dir.relative_to(root)) if rank_dir != root else rank_dir.name
     return RankGraph(
         freq=freq,
         start=start,
@@ -212,7 +238,8 @@ def build_graph(rank_dir: Path, root: Path, tol: int) -> RankGraph:
         t0=min(start.values()),
         t1=max(end.values()),
         kept_edges=kept,
-        label=label,
+        label=label if epoch is None else f"{label} / run {epoch}",
+        run_epoch=epoch,
     )
 
 
@@ -286,6 +313,7 @@ class RankResult:
     stall_by_kind: dict[str, int] = field(default_factory=dict)
     ntasks: int = 0
     kept_edges: int = 0
+    run_epoch: int | None = None
 
 
 def observed_path(g: RankGraph, tol: int) -> list[tuple[str, str]]:
@@ -348,6 +376,7 @@ def analyze_rank(g: RankGraph, tol: int) -> RankResult:
         stall_by_kind=dict(stall_by_kind),
         ntasks=len(g.start),
         kept_edges=g.kept_edges,
+        run_epoch=g.run_epoch,
     )
 
 
@@ -472,7 +501,7 @@ def _trace_events(trace_data) -> list[dict]:
     return events
 
 
-def _critical_trace(trace_data, critical_task_ids: set[str]):
+def _critical_trace(trace_data, critical_task_ids: set[tuple[int | None, str]]):
     """Copy the merged trace and anonymize non-critical Worker View task bars."""
     # The trace names the runtime whose TaskId layout its ids follow, which is what
     # picks the formatter -- nothing in a task_id value says which runtime minted it.
@@ -480,18 +509,19 @@ def _critical_trace(trace_data, critical_task_ids: set[str]):
     task_display = get(runtime_name).display
     events = [event.copy() for event in _trace_events(trace_data)]
     visible_task_ids = {
-        str(event.get("args", {}).get("taskId"))
+        (event.get("args", {}).get("run_epoch"), str(event.get("args", {}).get("taskId")))
         for event in events
         if event.get("ph") == "X" and event.get("pid") == 4 and event.get("args", {}).get("taskId") is not None
     }
     missing = critical_task_ids - visible_task_ids
     if missing:
-        sample = ", ".join(sorted(missing)[:5])
+        sample = ", ".join(sorted(f"run {epoch}: task {task}" for epoch, task in missing)[:5])
         raise ValueError(f"merged Worker View is missing {len(missing)} critical task(s): {sample}")
 
     for event in events:
         task_id = event.get("args", {}).get("taskId")
-        if event.get("ph") != "X" or event.get("pid") != 4 or task_id is None or str(task_id) in critical_task_ids:
+        identity = (event.get("args", {}).get("run_epoch"), str(task_id))
+        if event.get("ph") != "X" or event.get("pid") != 4 or task_id is None or identity in critical_task_ids:
             continue
         event["name"] = f"·({task_display(task_id)})"
 
@@ -502,14 +532,17 @@ def _critical_trace(trace_data, critical_task_ids: set[str]):
     return events
 
 
-def _write_critical_path_traces(rank_dir: Path, result: RankResult) -> list[Path]:
+def _write_critical_path_traces(rank_dir: Path, results: list[RankResult]) -> list[Path]:
     merged_path = _find_merged_swimlane(rank_dir)
     if merged_path is None:
         return []
     merged_trace = _read_json(merged_path)
     paths = (
-        (STATIC_TRACE_NAME, set(result.cpm_path)),
-        (OBSERVED_TRACE_NAME, {segment.task for segment in result.segments}),
+        (STATIC_TRACE_NAME, {(result.run_epoch, task) for result in results for task in result.cpm_path}),
+        (
+            OBSERVED_TRACE_NAME,
+            {(result.run_epoch, segment.task) for result in results for segment in result.segments},
+        ),
     )
     traces: list[tuple[Path, object]] = []
     for filename, critical_task_ids in paths:
@@ -575,22 +608,26 @@ def main(argv: list[str]) -> int:
     results: list[RankResult] = []
     report_paths: list[Path] = []
     trace_paths: list[Path] = []
-    had_trace_errors = False
+    had_errors = False
     for d in rank_dirs:
-        g = build_graph(d, root, args.tol)
-        result = analyze_rank(g, args.tol)
-        results.append(result)
+        try:
+            rank_results = [analyze_rank(g, args.tol) for g in build_graphs(d, root, args.tol)]
+        except ValueError as exc:
+            print(f"error: invalid swimlane records in {d}: {exc}", file=sys.stderr)
+            had_errors = True
+            continue
+        results.extend(rank_results)
         out_path = d / args.report
-        out_path.write_text(render_report([result], args.top), encoding="utf-8")
+        out_path.write_text(render_report(rank_results, args.top), encoding="utf-8")
         report_paths.append(out_path)
         try:
-            written_traces = _write_critical_path_traces(d, result)
+            written_traces = _write_critical_path_traces(d, rank_results)
         except (OSError, ValueError) as exc:
             print(
                 f"error: invalid merged_swimlane*.json in {d}: {exc}",
                 file=sys.stderr,
             )
-            had_trace_errors = True
+            had_errors = True
             continue
         if written_traces:
             trace_paths.extend(written_traces)
@@ -600,7 +637,7 @@ def main(argv: list[str]) -> int:
                 file=sys.stderr,
             )
 
-    print(f"Analyzed {len(results)} rank(s) under {root}")
+    print(f"Analyzed {len(results)} rank/run(s) under {root}")
     print(render_summary(results))
     for out_path in report_paths:
         print(f"Report written to: {out_path}")
@@ -608,7 +645,7 @@ def main(argv: list[str]) -> int:
         print(f"Perfetto trace written to: {trace_path}")
     if args.stdout:
         print("\n" + render_report(results, args.top))
-    return 2 if had_trace_errors else 0
+    return 2 if had_errors else 0
 
 
 if __name__ == "__main__":

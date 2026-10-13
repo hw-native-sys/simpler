@@ -8,10 +8,13 @@
 # -----------------------------------------------------------------------------------------------------------
 """Contract tests for simpler_setup.tools.critical_path."""
 
+import copy
 import json
 
+import pytest
+
 from simpler_setup.tools import critical_path
-from simpler_setup.tools._runtime_dispatch import TMR_RUNTIME
+from simpler_setup.tools._runtime_dispatch import HBG_RUNTIME, TMR_RUNTIME
 
 
 def _write_rank_artifacts(rank_dir, name_map_filename):
@@ -19,8 +22,9 @@ def _write_rank_artifacts(rank_dir, name_map_filename):
     (rank_dir / "chip_swimlane_records.json").write_text(
         json.dumps(
             {
+                "chip_swimlane_level": 4,
                 "metadata": {"runtime": TMR_RUNTIME, "clock_freq_hz": 1_000_000},
-                "aicore_tasks": [[0, 1, 0, 0, 10, 0]],
+                "aicore_tasks": [[0, 1, 0, 0, 10, 0, 42]],
             }
         )
     )
@@ -40,11 +44,12 @@ def _write_visualization_artifacts(rank_dir):
     (rank_dir / "chip_swimlane_records.json").write_text(
         json.dumps(
             {
+                "chip_swimlane_level": 4,
                 "metadata": {"runtime": TMR_RUNTIME, "clock_freq_hz": 1_000_000},
                 "aicore_tasks": [
-                    [0, 1, 0, 0, 10, 0],
-                    [1, 2, 0, 0, 19, 0],
-                    [1, 3, 0, 20, 30, 0],
+                    [0, 1, 0, 0, 10, 0, 42],
+                    [1, 2, 0, 0, 19, 0, 42],
+                    [1, 3, 0, 20, 30, 0, 42],
                 ],
             }
         )
@@ -134,6 +139,9 @@ def _write_visualization_artifacts(rank_dir):
         {"cat": "flow", "id": 102, "name": "complete", "ph": "f", "pid": 2, "tid": 0, "ts": 31},
         {"args": {"taskId": 1}, "cat": "event", "name": "kernel_a(r0t1)", "ph": "X", "pid": 3, "tid": 1},
     ]
+    for event in events:
+        if "taskId" in event.get("args", {}):
+            event["args"]["run_epoch"] = 42
     (rank_dir / "merged_swimlane_20260720_120000.json").write_text(
         json.dumps(
             {
@@ -146,6 +154,34 @@ def _write_visualization_artifacts(rank_dir):
             }
         )
     )
+
+
+@pytest.mark.parametrize("row_width", [5, 6, 7])
+def test_build_graph_accepts_task_record_widths(tmp_path, row_width):
+    output_dir = tmp_path / "outputs" / "case"
+    _write_visualization_artifacts(output_dir)
+    records_path = output_dir / "chip_swimlane_records.json"
+    records = json.loads(records_path.read_text())
+    records["aicore_tasks"].append([2, 1, 7, 2, 12, 3, 42])
+    records["aicore_tasks"] = [row[:row_width] for row in records["aicore_tasks"]]
+    records_path.write_text(json.dumps(records))
+
+    graph = critical_path.build_graph(output_dir, tmp_path, tol=2)
+    result = critical_path.analyze_rank(graph, tol=2)
+
+    assert graph.start == {"1": 0, "2": 0, "3": 20}
+    assert graph.end == {"1": 12, "2": 19, "3": 30}
+    assert graph.dur == {"1": 12, "2": 19, "3": 10}
+    assert graph.nblock == {"1": 2, "2": 1, "3": 1}
+    assert graph.name == {"1": "kernel_a", "2": "kernel_b", "3": "kernel_c"}
+    assert graph.hb_pred == {"3": ["1"]}
+    assert graph.core_prev == {"3": ("2", 19)}
+    assert result.cpm_path == ["1", "3"]
+    assert result.cpm_len == 22
+    assert [segment.task for segment in result.segments] == ["2", "3"]
+    assert result.compute_total == 29
+    assert result.stall_total == 1
+    assert result.compute_total + result.stall_total == result.makespan == 30
 
 
 def test_main_accepts_name_map_variants_and_writes_report_beside_each_records(tmp_path):
@@ -202,7 +238,14 @@ def test_main_writes_static_and_observed_full_traces(tmp_path):
     for events in (static_events, observed_events):
         other_view_tasks = [event for event in events if event.get("ph") == "X" and event.get("pid") != 4]
         assert other_view_tasks == [
-            {"args": {"taskId": 1}, "cat": "event", "name": "kernel_a(r0t1)", "ph": "X", "pid": 3, "tid": 1}
+            {
+                "args": {"taskId": 1, "run_epoch": 42},
+                "cat": "event",
+                "name": "kernel_a(r0t1)",
+                "ph": "X",
+                "pid": 3,
+                "tid": 1,
+            }
         ]
     assert "dummy(r0t99)" in {event.get("name") for event in static_events}
     assert "dummy(r0t99)" in {event.get("name") for event in observed_events}
@@ -236,4 +279,148 @@ def test_main_reports_stale_merged_trace_and_continues_without_partial_cpm_outpu
     assert (good_output / "CPM_observed.json").exists()
     error = capsys.readouterr().err
     assert "error: invalid merged_swimlane*.json" in error
-    assert "missing 1 critical task(s): 2" in error
+    assert "missing 1 critical task(s): run 42: task 2" in error
+
+
+def _write_two_run_artifacts(output_dir, runtime):
+    _write_visualization_artifacts(output_dir)
+    records_path = output_dir / "chip_swimlane_records.json"
+    records = json.loads(records_path.read_text())
+    records["metadata"]["runtime"] = runtime
+    # The same task ids recur, but the second run is gated by task 1 rather
+    # than task 2. Their critical paths must be chosen independently.
+    records["aicore_tasks"].extend([[0, 1, 0, 100, 119, 0, 43], [1, 2, 0, 100, 110, 0, 43], [1, 3, 0, 120, 130, 0, 43]])
+    records_path.write_text(json.dumps(records))
+    trace_path = output_dir / "merged_swimlane_20260720_120000.json"
+    trace = json.loads(trace_path.read_text())
+    trace["metadata"]["runtime"] = runtime
+    second_run = []
+    for event in trace["traceEvents"]:
+        if event.get("ph") == "M":
+            continue
+        cloned = copy.deepcopy(event)
+        if "id" in cloned:
+            cloned["id"] += 1000
+        if "ts" in cloned:
+            cloned["ts"] += 100
+        if "taskId" in cloned.get("args", {}):
+            cloned["args"]["run_epoch"] = 43
+            if cloned.get("pid") == 4:
+                cloned["dur"] = {1: 19, 2: 10, 3: 10}[cloned["args"]["taskId"]]
+        second_run.append(cloned)
+    trace["traceEvents"].extend(second_run)
+    trace_path.write_text(json.dumps(trace))
+    return trace_path
+
+
+@pytest.mark.parametrize("runtime", [TMR_RUNTIME, HBG_RUNTIME])
+def test_repeated_task_ids_keep_per_run_paths_and_trace_highlights(tmp_path, runtime):
+    trace_path = _write_two_run_artifacts(tmp_path / "case", runtime)
+    output_dir = trace_path.parent
+    graphs = critical_path.build_graphs(output_dir, tmp_path, tol=2)
+    assert [g.run_epoch for g in graphs] == [42, 43]
+    assert [g.dur["1"] for g in graphs] == [10, 19]
+    assert all(g.nblock == {"1": 1, "2": 1, "3": 1} for g in graphs)
+    assert all(g.hb_pred == {"3": ["1"]} for g in graphs)
+    assert [g.core_prev for g in graphs] == [{"3": ("2", 19)}, {"3": ("2", 110)}]
+    results = [critical_path.analyze_rank(g, tol=2) for g in graphs]
+    assert [r.cpm_len for r in results] == [20, 29]
+    assert [[s.task for s in r.segments] for r in results] == [["2", "3"], ["1", "3"]]
+    assert all((r.compute_total, r.stall_total, r.makespan) == (29, 1, 30) for r in results)
+    with pytest.raises(ValueError, match="multiple runs"):
+        critical_path.build_graph(output_dir, tmp_path, tol=2)
+
+    assert critical_path.main([str(output_dir)]) == 0
+    report = (output_dir / "critical_path_report.md").read_text()
+    assert "case / run 42" in report and "case / run 43" in report
+    assert report.count("compute+stall = 30 ticks vs makespan 30 ticks (exact)") == 2
+    source = json.loads(trace_path.read_text())["traceEvents"]
+    expected = {
+        critical_path.STATIC_TRACE_NAME: {(42, 1), (42, 3), (43, 1), (43, 3)},
+        critical_path.OBSERVED_TRACE_NAME: {(42, 2), (42, 3), (43, 1), (43, 3)},
+    }
+    for filename, selected in expected.items():
+        events = json.loads((output_dir / filename).read_text())["traceEvents"]
+        assert len(events) == len(source)
+        highlighted = set()
+        for event, original in zip(events, source):
+            if event.get("ph") == "X" and event.get("pid") == 4 and "taskId" in event.get("args", {}):
+                if not event["name"].startswith("·("):
+                    highlighted.add((event["args"]["run_epoch"], event["args"]["taskId"]))
+                assert {k: v for k, v in event.items() if k != "name"} == {
+                    k: v for k, v in original.items() if k != "name"
+                }
+            else:
+                assert event == original
+        assert highlighted == selected
+
+
+def test_two_ten_tick_runs_do_not_turn_inter_run_idle_into_compute(tmp_path):
+    _write_rank_artifacts(tmp_path / "case", "name_map.json")
+    path = tmp_path / "case" / "chip_swimlane_records.json"
+    data = json.loads(path.read_text())
+    data["aicore_tasks"] = [[0, 1, 0, 0, 10, 0, 0], [0, 1, 0, 100, 110, 0, 8]]
+    path.write_text(json.dumps(data))
+    graphs = critical_path.build_graphs(path.parent, tmp_path, tol=2)
+    assert [g.run_epoch for g in graphs] == [0, 8]
+    for graph in graphs:
+        result = critical_path.analyze_rank(graph, tol=2)
+        assert (result.compute_total, result.stall_total, result.makespan) == (10, 0, 10)
+        assert graph.nblock == {"1": 1}
+
+
+@pytest.mark.parametrize("row_width", [5, 6])
+def test_legacy_records_and_unstamped_traces_remain_readable(tmp_path, row_width):
+    output_dir = tmp_path / "case"
+    _write_visualization_artifacts(output_dir)
+    records_path = output_dir / "chip_swimlane_records.json"
+    data = json.loads(records_path.read_text())
+    data["aicore_tasks"] = [row[:row_width] for row in data["aicore_tasks"]]
+    records_path.write_text(json.dumps(data))
+    trace_path = output_dir / "merged_swimlane_20260720_120000.json"
+    trace = json.loads(trace_path.read_text())
+    for event in trace["traceEvents"]:
+        event.get("args", {}).pop("run_epoch", None)
+    trace_path.write_text(json.dumps(trace))
+    assert critical_path.main([str(output_dir)]) == 0
+    assert (output_dir / critical_path.OBSERVED_TRACE_NAME).exists()
+
+
+@pytest.mark.parametrize("bad_epoch", [None, -1, True, "42"])
+def test_invalid_epoch_is_rejected_before_writing_a_report(tmp_path, capsys, bad_epoch):
+    output_dir = tmp_path / "case"
+    _write_rank_artifacts(output_dir, "name_map.json")
+    path = output_dir / "chip_swimlane_records.json"
+    data = json.loads(path.read_text())
+    data["aicore_tasks"][0][6] = bad_epoch
+    path.write_text(json.dumps(data))
+    assert critical_path.main([str(output_dir)]) == 2
+    assert "invalid run_epoch" in capsys.readouterr().err
+    assert not (output_dir / "critical_path_report.md").exists()
+
+
+def test_mixed_legacy_and_identified_rows_are_not_assigned_to_a_run(tmp_path, capsys):
+    output_dir = tmp_path / "case"
+    _write_visualization_artifacts(output_dir)
+    path = output_dir / "chip_swimlane_records.json"
+    data = json.loads(path.read_text())
+    data["aicore_tasks"][1] = data["aicore_tasks"][1][:6]
+    path.write_text(json.dumps(data))
+    assert critical_path.main([str(output_dir)]) == 2
+    assert "mixing identified and legacy" in capsys.readouterr().err
+    assert not (output_dir / "critical_path_report.md").exists()
+
+
+def test_same_task_id_in_another_run_cannot_hide_a_missing_trace_bar(tmp_path, capsys):
+    trace_path = _write_two_run_artifacts(tmp_path / "case", TMR_RUNTIME)
+    trace = json.loads(trace_path.read_text())
+    trace["traceEvents"] = [
+        event
+        for event in trace["traceEvents"]
+        if not (event.get("pid") == 4 and event.get("args", {}) == {"taskId": 1, "run_epoch": 43})
+    ]
+    trace_path.write_text(json.dumps(trace))
+    assert critical_path.main([str(trace_path.parent)]) == 2
+    assert "run 43: task 1" in capsys.readouterr().err
+    assert not (trace_path.parent / critical_path.STATIC_TRACE_NAME).exists()
+    assert not (trace_path.parent / critical_path.OBSERVED_TRACE_NAME).exists()

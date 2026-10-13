@@ -92,8 +92,22 @@ and its `critical_path_report.md` is written beside
 creates one local report per rank/device rather than one combined report at the
 scan root.
 
-For each rank/device, the tool builds a happens-before DAG from the dependency
-graph oriented by observed timestamps, then computes two critical paths:
+Within each rank/device, seven-column task records are grouped by `run_epoch`.
+The same task ID in two runs is two executions: each run gets its own report
+section, block counts, makespan and paths. The time between runs is not counted
+as task compute. Both Perfetto files retain the full source trace and highlight
+each run's path using `(run_epoch, task_id)`, so a missing bar cannot be supplied
+by another run's execution of the same task.
+
+Historical five-/six-column task records have no run identity and are analyzed
+as one run, with unstamped traces. Mixing identified and historical rows is
+rejected because the historical rows cannot be assigned to a run. Seven-column
+records require a nonnegative integer epoch; zero is an identity, not an absent
+field. An identified capture also requires matching epochs on Worker View bars
+in its merged trace.
+
+For each run, the tool builds a happens-before DAG from the dependency graph
+oriented by observed timestamps, then computes two critical paths:
 
 - **Static CPM** — the longest duration-weighted path, i.e. the
   dependency-limited latency floor with unlimited cores.
