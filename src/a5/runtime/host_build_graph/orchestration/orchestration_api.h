@@ -33,12 +33,10 @@
 #include <cstring>
 #include <ctime>
 #include <functional>
-#include <memory>
 #include <type_traits>
-#include <unordered_map>
 
 // Type headers needed by orchestration
-#include "assert_compat.h"                    // debug_assert
+#include "assert_compat.h"                    // always_assert
 #include "host_build_graph/common.h"          // framework_bind_runtime / framework_current_runtime
 #include "common/host_phase_kind.h"           // HostPhaseKind, for the phase records below
 #include "host_build_graph/graph_cache.h"     // Graph Execution key and result helpers
@@ -200,8 +198,19 @@ static inline TaskOutputTensors rt_submit_dummy_task(const CoreTaskArgs &args) {
 
 static inline GraphScopeResult rt_graph_begin(uint64_t graph_key, const GraphTaskArgs &args) {
     RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt) || rt->ops->graph_begin == nullptr) {
-        return GraphScopeResult{};
+    // Every runtime reaching this header implements graph_begin, so a null one means the ops
+    // table is not the one this call belongs to. Asserted rather than reported: the default
+    // result below says "nothing submitted, no error", under which the caller drops the body
+    // and leaves no record of having done so.
+    always_assert(rt->ops->graph_begin != nullptr && "an HBG runtime's ops table carries graph_begin");
+    // An already-fatal runtime fails this submission like any other: nothing is submitted
+    // and no recording opens. No report of its own -- `has_error` promises a latched fatal,
+    // and the one that short-circuited this call is it. graph_begin answers the same
+    // condition the same way, through require_device_arguments.
+    if (rt->ops->is_fatal(rt)) {
+        GraphScopeResult rejected;
+        rejected.has_error = true;
+        return rejected;
     }
     return rt->ops->graph_begin(rt, graph_key, args);
 }
@@ -431,15 +440,16 @@ static inline uint64_t rt_graph_function_id(Function function) {
 // its own boundary copy as a parameter for exactly that reason.
 template <typename Invoke>
 static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const GraphTaskArgs &args, Invoke invoke) {
-    debug_assert(!args.has_error() && "Graph boundary GraphTaskArgs construction failed");
-    debug_assert(args.tensor_count() <= GRAPH_MAX_TENSOR_ARGS && "Graph boundary exceeds the tensor limit");
-    debug_assert(
-        args.explicit_dep_count() == 0 && "Explicit dependencies crossing the Graph boundary are not supported"
-    );
+    // A boundary cannot hold a runtime-allocated output: GraphTaskArgs::add_output rejects a
+    // TensorCreateInfo at compile time, so this tag is reachable only by a bug.
+    //
+    // The caller-triggerable conditions -- a construction error, a boundary past the tensor
+    // cap, explicit dependencies -- are tested at the guard below, which refuses them the
+    // same way in both builds.
     for (int32_t i = 0; i < args.tensor_count(); ++i) {
-        debug_assert(
+        always_assert(
             args.tag(i) != TensorArgType::OUTPUT &&
-            "Runtime-allocated TensorCreateInfo is not supported at the Graph boundary"
+            "a Graph boundary cannot hold a runtime-allocated output (TensorCreateInfo)"
         );
     }
     RtSubmitPhaseState &_phase = rt_submit_phase_state();
@@ -458,10 +468,16 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
     }
     // A boundary that cannot open a Graph is a contract violation, not a reason to run
     // the body quietly: the caller declared a Graph and gets told why it is not one.
-    if (!rt_graph_args_cacheable(args)) {
+    //
+    // Explicit dependencies are tested here rather than inside rt_graph_args_cacheable
+    // because they are refused only at a Graph boundary -- an ordinary task takes them. The
+    // same pair is tested again in graph_begin_inner, which is what a caller reaching the
+    // host layer by another route meets; this one reports at the API the caller named.
+    if (!rt_graph_args_cacheable(args) || args.explicit_dep_count() != 0) {
         rt_report_fatal(
-            SIMPLER_ERROR_INVALID_ARGS, "[GraphExecution] boundary cannot open a Graph: tensors=%d scalars=%d error=%d",
-            args.tensor_count(), args.scalar_count(), static_cast<int>(args.has_error())
+            SIMPLER_ERROR_INVALID_ARGS,
+            "[GraphExecution] boundary cannot open a Graph: tensors=%d scalars=%d explicit_deps=%u error=%d",
+            args.tensor_count(), args.scalar_count(), args.explicit_dep_count(), static_cast<int>(args.has_error())
         );
         GraphSubmitResult rejected;
         rejected.has_error = true;
@@ -644,7 +660,7 @@ rt_submit_graph(GraphFunctionWithConfig<ConfigT> function, const GraphTaskArgs &
 // `used` because this is an inline definition nothing inside the .so calls: the host reaches
 // it by dlsym, so the symbol has to be emitted anyway.
 extern "C" __attribute__((visibility("default"), used)) inline void framework_finish_orch() {
-    simpler::hbg::config_registry().clear();
+    simpler::hbg::clear_config_registry();
 }
 
 #define _SIMPLER_CONCATENATE_IMPL(x, y) x##y

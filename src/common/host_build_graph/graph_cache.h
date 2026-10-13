@@ -101,8 +101,16 @@ constexpr uint64_t graph_const_hash_impl(const char *s, uint64_t h) {
 // call site in this repository uses that overload.
 constexpr uint64_t GRAPH_KEY(const char *s) { return graph_const_hash_impl(s, 1469598103934665603ULL); }
 
+// Whether a boundary can open a Graph at all: it carries no error, and it fits the fixed
+// boundary.
+//
+// A boundary of no tensors is one of them. Every stage below counts its tensors rather than
+// assuming one -- graph_boundary_relocate_params returns early at a count of zero, the alias
+// partition and arrangement walks are empty, and the device decode admits a payload whose
+// tensor_count is zero -- so a Graph whose body reaches its buffers through its Config
+// instead of its boundary records and replays on the same path as any other.
 inline bool rt_graph_args_cacheable(const GraphTaskArgs &args) {
-    if (args.has_error() || args.tensor_count() <= 0 || args.tensor_count() > GRAPH_MAX_TENSOR_ARGS) {
+    if (args.has_error() || args.tensor_count() > GRAPH_MAX_TENSOR_ARGS) {
         return false;
     }
     return true;

@@ -65,6 +65,10 @@ struct FakeRuntime {
     // A recorded body reports a fatal on the recorder thread while the bind thread
     // reads it, which is what the runtime's own fatal_code is atomic for.
     std::atomic<bool> fatal{false};
+    // The code the last report_fatal carried, so a case can tell which refusal fired
+    // rather than only that one did. Atomic for the same reason `fatal` is.
+    std::atomic<int32_t> fatal_code{0};
+    std::atomic<int> report_fatal_calls{0};
     // graph_end's view of the fatal at the moment it ran, so a test can tell "end
     // was reached after the body latched" from "end was reached at all".
     bool end_saw_fatal{false};
@@ -109,6 +113,15 @@ static_assert(offsetof(FakeRuntime, pending_scope_mode) == offsetof(RuntimeConte
 FakeRuntime *as_fake(RuntimeContext *rt) { return reinterpret_cast<FakeRuntime *>(rt); }
 
 bool fake_is_fatal(RuntimeContext *rt) { return as_fake(rt)->fatal.load(std::memory_order_acquire); }
+
+// What a refusal latches. The real runtime's report_fatal also logs; a case here only
+// needs the code, which is what tells a boundary refusal apart from any other fatal.
+void fake_report_fatal(RuntimeContext *rt, int32_t error_code, const char * /*func*/, const char * /*fmt*/, ...) {
+    FakeRuntime &fake = *as_fake(rt);
+    fake.fatal_code.store(error_code, std::memory_order_release);
+    fake.report_fatal_calls.fetch_add(1, std::memory_order_acq_rel);
+    fake.fatal.store(true, std::memory_order_release);
+}
 
 GraphScopeResult fake_graph_begin(RuntimeContext *rt, uint64_t, const GraphTaskArgs &args) {
     FakeRuntime &fake = *as_fake(rt);
@@ -242,6 +255,7 @@ const RuntimeOps kFakeOps = {
     .scope_begin = fake_scope_begin,
     .scope_end = fake_scope_end,
     .is_fatal = fake_is_fatal,
+    .report_fatal = fake_report_fatal,
     .graph_begin = fake_graph_begin,
     .graph_prepare = fake_graph_prepare,
     .graph_abort = fake_graph_abort,
@@ -663,6 +677,143 @@ TEST(HbgGraphAsyncSubmit, SubmittingWithAConfigRetainsItUntilTheBindFinishes) {
 
     framework_finish_orch();
     EXPECT_TRUE(simpler::hbg::config_registry().empty()) << "the bind's teardown must release every retained Config";
+
+    framework_bind_runtime(nullptr);
+}
+
+// The two refusals a caller can trigger at this entry, exercised through the public
+// wrapper rather than through the host layer below it.
+//
+// Going through rt_submit_graph is the whole point. The host-layer cases reach
+// graph_begin directly, so they cannot see an entry-side guard at all -- and an entry
+// that asserted instead of reporting would throw here in a debug build, which is the
+// build cpput runs, while a release build reported the fatal. A refusal has to arrive
+// the same way in both.
+TEST(HbgGraphAsyncSubmit, ABoundaryCarryingAConstructionErrorIsRefusedAtTheEntry) {
+    std::array<FakeBoundary, 2> boundaries;
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
+    fake.later_submit_entered = true;
+    framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
+    simpler::hbg::config_registry().clear();
+
+    uint32_t storage[8]{};
+    uint32_t shape[] = {8};
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
+
+    // Past the scalar cap, which records the error rather than raising the count.
+    GraphTaskArgs args;
+    args.add_input(boundary);
+    for (int32_t i = 0; i <= GRAPH_MAX_SCALAR_ARGS; ++i) {
+        args.add_scalar(uint64_t{1});
+    }
+    ASSERT_TRUE(args.has_error());
+
+    bool body_ran = false;
+    GraphSubmitResult result{};
+    {
+        ScopeGuard scope;
+        result = rt_submit_graph_impl(0x1740, args, [&](const GraphTaskArgs &) {
+            body_ran = true;
+        });
+    }
+
+    EXPECT_TRUE(result.has_error);
+    EXPECT_FALSE(body_ran) << "a refused boundary records nothing";
+    EXPECT_EQ(fake.fatal_code.load(), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(fake.begin_calls, 0) << "the entry refuses before it reaches graph_begin";
+
+    framework_bind_runtime(nullptr);
+}
+
+TEST(HbgGraphAsyncSubmit, ABoundaryCarryingExplicitDependenciesIsRefusedAtTheEntry) {
+    std::array<FakeBoundary, 2> boundaries;
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
+    fake.later_submit_entered = true;
+    framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
+    simpler::hbg::config_registry().clear();
+
+    uint32_t storage[8]{};
+    uint32_t shape[] = {8};
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
+
+    // A boundary that is otherwise valid: only the explicit dependency refuses it, so
+    // this case pins the condition rather than reaching the error path by accident.
+    const std::array<TaskId, 1> deps{TaskId::make_global(3)};
+    GraphTaskArgs args;
+    args.add_input(boundary);
+    args.set_dependencies(deps.data(), static_cast<uint32_t>(deps.size()));
+    ASSERT_FALSE(args.has_error());
+    ASSERT_EQ(args.explicit_dep_count(), 1U);
+    ASSERT_TRUE(rt_graph_args_cacheable(args)) << "the tensor half is valid; the dependency is what refuses it";
+
+    bool body_ran = false;
+    GraphSubmitResult result{};
+    {
+        ScopeGuard scope;
+        result = rt_submit_graph_impl(0x1741, args, [&](const GraphTaskArgs &) {
+            body_ran = true;
+        });
+    }
+
+    EXPECT_TRUE(result.has_error);
+    EXPECT_FALSE(body_ran) << "a refused boundary records nothing";
+    EXPECT_EQ(fake.fatal_code.load(), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(fake.begin_calls, 0) << "the entry refuses before it reaches graph_begin";
+
+    framework_bind_runtime(nullptr);
+}
+
+// A submission onto an already-fatal runtime is a failed submission, so it answers like
+// one. It reports nothing of its own: `has_error` promises a latched fatal, and the one
+// that short-circuited the call is it -- which is why this case pins that the code was not
+// overwritten and that report_fatal was never called again.
+//
+// The value matters because a caller cannot tell a submission apart from a no-op by
+// task_id alone: an invalid id arrives on both. Reporting no error here also carried the
+// call past rt_submit_graph_impl's early return into its phase bookkeeping, recording a
+// span for a submission that never happened.
+TEST(HbgGraphAsyncSubmit, ASubmissionOntoAnAlreadyFatalRuntimeFailsRatherThanNoOps) {
+    std::array<FakeBoundary, 2> boundaries;
+    FakeRuntime fake{};
+    fake.ops = &kFakeOps;
+    fake.boundaries = boundaries.data();
+    fake.boundary_capacity = static_cast<int32_t>(boundaries.size());
+    fake.later_submit_entered = true;
+    framework_bind_runtime(reinterpret_cast<RuntimeContext *>(&fake));
+    simpler::hbg::config_registry().clear();
+
+    uint32_t storage[8]{};
+    uint32_t shape[] = {8};
+    simpler::hbg::Tensor boundary = simpler::hbg::make_tensor_external(storage, shape, 1);
+    GraphTaskArgs args;
+    args.add_input(boundary);
+    ASSERT_TRUE(rt_graph_args_cacheable(args)) << "the boundary itself is valid";
+
+    // Someone else's fatal, latched before this submission runs.
+    fake.fatal_code.store(SIMPLER_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
+    fake.fatal.store(true, std::memory_order_release);
+    const int reports_before = fake.report_fatal_calls.load();
+
+    bool body_ran = false;
+    GraphSubmitResult result{};
+    {
+        ScopeGuard scope;
+        result = rt_submit_graph_impl(0x1742, args, [&](const GraphTaskArgs &) {
+            body_ran = true;
+        });
+    }
+
+    EXPECT_TRUE(result.has_error) << "an already-latched fatal still means this submission failed";
+    EXPECT_FALSE(body_ran);
+    EXPECT_EQ(fake.begin_calls, 0);
+    EXPECT_EQ(fake.report_fatal_calls.load(), reports_before) << "the latched fatal is the report; this adds none";
+    EXPECT_EQ(fake.fatal_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT) << "the first fatal's code survives";
 
     framework_bind_runtime(nullptr);
 }

@@ -230,9 +230,8 @@ uint64_t graph_full_key(uint64_t callable_hash, uint64_t graph_key) {
 // map. Only the pages stay.
 //
 // Safe as a thread_local because a thread records one body at a time: graph_prepare
-// refuses to bind while this thread already has a recording active, so a Graph nested
-// inside a recorded body takes the ordinary path rather than claiming this storage
-// twice.
+// refuses to bind while this thread already has a recording active, and a Graph nested
+// inside a recorded body is refused at graph_begin, so nothing claims this storage twice.
 GraphRecording &recorder_recording() {
     static thread_local GraphRecording storage;
     return storage;

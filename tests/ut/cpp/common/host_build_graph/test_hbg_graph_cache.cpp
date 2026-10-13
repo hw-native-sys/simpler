@@ -77,9 +77,15 @@ enum class TestRoot { ORDINARY, PREDICATED, DUMMY };
 // is what has to say so.
 enum class TestEdDefect { NONE, CANDIDATE_ON_ROOT, CANDIDATE_WITH_PREDICATE, CANDIDATE_ON_DUMMY };
 
+// Whether this body reaches its buffers through the boundary or entirely through its own
+// heap. NONE is the shape a Config-driven Graph has: nothing is passed as a tensor, so no
+// body tensor can name a parameter and the boundary carries scalars only.
+enum class TestBoundary { WITH_TENSOR, NONE };
+
 std::vector<std::byte> make_test_definition(
     uint64_t graph_key, uint64_t boundary_address, uint32_t boundary_scalar_count = 1,
-    TestRoot root_variant = TestRoot::ORDINARY, TestEdDefect ed_defect = TestEdDefect::NONE
+    TestRoot root_variant = TestRoot::ORDINARY, TestEdDefect ed_defect = TestEdDefect::NONE,
+    TestBoundary boundary_variant = TestBoundary::WITH_TENSOR
 ) {
     std::vector<std::byte> image(sizeof(GraphDefinition));
 
@@ -155,8 +161,13 @@ std::vector<std::byte> make_test_definition(
     // Tensor 0 came through the boundary: its owner names parameter 0, and its recorded
     // address is dropped because replay takes the buffer from this invocation's argument.
     // Tensor 1 is task 0's output, so its address is an offset into the graph heap.
+    //
+    // Under TestBoundary::NONE tensor 0 is heap-owned too, at an offset clear of tensor 1:
+    // with no boundary tensor there is no parameter for it to name, and graph_rebind_tensor
+    // refuses a PARAM owner whose index is past boundary_tensor_count.
     std::vector<simpler::hbg::TensorData> tensors{
-        make_test_tensor(0, TaskId::make_param(0)),
+        boundary_variant == TestBoundary::WITH_TENSOR ? make_test_tensor(0, TaskId::make_param(0)) :
+                                                        make_test_tensor(64, TaskId::make_sub_task(0, 0)),
         make_test_tensor(16, TaskId::make_sub_task(0, 0)),
     };
     tensors[1].buffer.size = 32;
@@ -172,7 +183,7 @@ std::vector<std::byte> make_test_definition(
     definition.task_count = 2;
     definition.edge_count = 1;
     definition.root_count = 1;
-    definition.boundary_tensor_count = 1;
+    definition.boundary_tensor_count = boundary_variant == TestBoundary::WITH_TENSOR ? 1 : 0;
     definition.boundary_scalar_count = boundary_scalar_count;
     definition.tensor_arg_count = 2;
     definition.scalar_arg_count = 2;
@@ -320,7 +331,11 @@ public:
             return nullptr;
         }
         std::memset(boundary_tensors_.data(), 0, TENSOR_SLOTS * sizeof(simpler::hbg::Tensor));
-        boundary_tensors_[0] = make_test_boundary(boundary_address);
+        // Only as many slots as the Definition counts. A boundary of none reserves no slot,
+        // so slot 0 is already the tail the cases below expect untouched.
+        if (definition->boundary_tensor_count > 0) {
+            boundary_tensors_[0] = make_test_boundary(boundary_address);
+        }
         storage_entry_.payload.tensor_count = definition->boundary_tensor_count;
         storage_entry_.payload.scalar_count = definition->boundary_scalar_count;
         std::fill_n(boundary_scalars_.data(), definition->boundary_scalar_count, uint64_t{0});
@@ -351,9 +366,38 @@ private:
 
 }  // namespace
 
-TEST(GraphCache, RejectsEmptyBoundary) {
-    GraphTaskArgs args;
+// A boundary of no tensors opens a Graph like any other. A body that reaches its buffers
+// through its Config rather than through arguments passes none, and every stage below counts
+// its tensors rather than assuming one -- which
+// GraphExecutionReplay.ReplaysABodyWithNoBoundaryTensor carries through to a materialized
+// body.
+TEST(GraphCache, AcceptsABoundaryWithNoTensor) {
+    GraphTaskArgs scalars_only;
+    scalars_only.add_scalar(uint32_t{17});
 
+    EXPECT_TRUE(rt_graph_args_cacheable(scalars_only));
+
+    // And one carrying nothing at all: there is no third thing a boundary holds, so an
+    // empty one is the same submission with both counts at zero.
+    GraphTaskArgs empty;
+
+    EXPECT_TRUE(rt_graph_args_cacheable(empty));
+}
+
+// The structural refusal left. A boundary past the fixed cap is refused through the error
+// the Arg recorded: GraphTaskArgs is an Arg of GRAPH_MAX_TENSOR_ARGS slots, so add_input
+// past the cap sets the error and leaves the count at the cap rather than exceeding it --
+// the count test in rt_graph_args_cacheable is the backstop behind that, not the live path.
+TEST(GraphCache, RejectsABoundaryBeyondTheTensorCap) {
+    std::array<uint8_t, 64> buffer{};
+    const simpler::hbg::Tensor tensor = make_test_boundary(reinterpret_cast<uint64_t>(buffer.data()));
+
+    GraphTaskArgs args;
+    for (int32_t i = 0; i <= GRAPH_MAX_TENSOR_ARGS; ++i) {
+        args.add_input(tensor);
+    }
+
+    ASSERT_TRUE(args.has_error());
     EXPECT_FALSE(rt_graph_args_cacheable(args));
 }
 
@@ -903,6 +947,66 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     EXPECT_EQ(storage.slot.completed_subtasks.load(std::memory_order_relaxed), 0);
     EXPECT_EQ(storage.payload.published_block_count.load(std::memory_order_relaxed), 0);
     EXPECT_EQ(storage.payload.dump_metadata.dump_arg_mask, uint64_t{1} << 0);
+}
+
+// A body that passes no tensors at all records and replays on this same path. That is the
+// shape a Config-driven Graph has -- its buffers are reached through raw handles its Config
+// carries, so nothing crosses the boundary as a tensor -- and the companion case in
+// GraphCache is what admits such a boundary. Here it is carried through to materialized
+// sub-tasks: every body tensor resolves against the graph heap, and the boundary's scalars
+// still refresh per invocation.
+TEST(GraphExecutionReplay, ReplaysABodyWithNoBoundaryTensor) {
+    constexpr uint64_t GRAPH_KEY_VALUE = 0x4321;
+
+    const std::vector<std::byte> definition = make_test_definition(
+        GRAPH_KEY_VALUE, /*boundary_address=*/0, /*boundary_scalar_count=*/1, TestRoot::ORDINARY, TestEdDefect::NONE,
+        TestBoundary::NONE
+    );
+    const TestDefinitionObject definition_object(definition);
+    ASSERT_EQ(definition_object.definition()->boundary_tensor_count, 0);
+
+    OuterHeap heap(definition, 0xAA);
+    GraphExecution *execution = heap.initialize_execution(definition_object, /*boundary_address=*/0, 17);
+    ASSERT_NE(execution, nullptr);
+    EXPECT_EQ(execution->boundary_tensor_count, 0);
+
+    ChipTaskStorage outer{};
+    TaskDescriptor &outer_task = outer.task;
+    outer_task.task_id = TaskId::make_global(7);
+    outer_task.packed_buffer_base = heap.base();
+    outer_task.packed_buffer_end = heap.end();
+    ChipTaskSlotState &outer_slot = outer.slot;
+    outer_slot.task_kind = TaskKind::GRAPH;
+    outer_slot.graph_context = execution;
+
+    ASSERT_EQ(
+        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::MATERIALIZED
+    );
+    // Both body tensors resolve against the heap, because neither can name a parameter.
+    ChipTaskStorage &root = execution->task_at(0);
+    ASSERT_EQ(root.payload.tensor_count, 1);
+    EXPECT_EQ(root.payload.tensor_data()[0].buffer.addr, reinterpret_cast<uint64_t>(heap.base() + 64));
+    EXPECT_EQ(execution->task_at(1).payload.tensor_data()[0].buffer.addr, reinterpret_cast<uint64_t>(heap.base() + 16));
+    // The boundary still carries scalars, and the one that follows a parameter takes this
+    // invocation's value.
+    ASSERT_EQ(root.payload.scalar_count, 1);
+    EXPECT_EQ(root.payload.scalar_data()[0], 17U);
+    EXPECT_EQ(execution->task_at(1).payload.scalar_data()[0], 18U);
+
+    // A second invocation refreshes that parameter, as it does for a body with a boundary
+    // tensor: nothing about the refresh depends on a tensor having crossed.
+    graph_execution_mark_completed(*execution);
+    execution->retired_tasks.store(2, std::memory_order_release);
+    outer_task.task_id = TaskId::make_global(8);
+
+    execution = heap.initialize_execution(definition_object, /*boundary_address=*/0, 99);
+    ASSERT_NE(execution, nullptr);
+    outer_slot.graph_context = execution;
+    ASSERT_EQ(
+        graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::MATERIALIZED
+    );
+    EXPECT_EQ(execution->task_at(0).payload.scalar_data()[0], 99U);
+    EXPECT_EQ(execution->task_at(0).payload.tensor_data()[0].buffer.addr, reinterpret_cast<uint64_t>(heap.base() + 64));
 }
 
 TEST(GraphExecutionReplay, PublishedTaskCompletesBeforeRemainingTasksMaterialize) {

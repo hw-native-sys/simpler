@@ -14,6 +14,7 @@
 #include <stdint.h>
 
 #include <memory>
+#include <mutex>
 #include <type_traits>
 #include <unordered_map>
 
@@ -150,11 +151,29 @@ inline void assert_config() {
 // outlived the cache would report a collision between two Configs that, the cache having
 // been emptied in between, could never have been confused for one another.
 //
-// Unsynchronized: a Graph is submitted by the orchestration entry's own thread, one at a
-// time, and a recorded body may not submit a Graph of its own. Nothing else reaches here.
+// Two threads reach this table. The orchestration entry submits a Graph on its own thread,
+// and a recorded body runs on a recorder worker that outlives the submit call which handed
+// it over -- so a Graph submitted from inside a recorded body arrives here from that worker
+// while the entry thread is still submitting. That nesting is refused, but the refusal is
+// reached through graph_begin, which is downstream of this table: the entry below is already
+// written by then. Every access therefore holds config_registry_mutex().
 inline std::unordered_map<uint64_t, std::unique_ptr<ConfigBase>> &config_registry() {
     static std::unordered_map<uint64_t, std::unique_ptr<ConfigBase>> registry;
     return registry;
+}
+
+// Guards config_registry(). Held across a whole retain -- the lookup, the insert and the
+// comparison are one decision, and two threads that each found the key absent would both
+// insert, leaving whichever lost the race recorded as the key's owner.
+inline std::mutex &config_registry_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+// Release every key, as framework_finish_orch does at the end of a bind.
+inline void clear_config_registry() {
+    const std::lock_guard<std::mutex> lock(config_registry_mutex());
+    config_registry().clear();
 }
 
 // Retain this key's Config, or check it against the one already retained. False means two
@@ -172,6 +191,7 @@ inline std::unordered_map<uint64_t, std::unique_ptr<ConfigBase>> &config_registr
 // RTTI identity to worry about.
 template <typename ConfigT>
 [[nodiscard]] inline bool retain_config(uint64_t graph_key, const ConfigT &config) {
+    const std::lock_guard<std::mutex> lock(config_registry_mutex());
     auto &registry = config_registry();
     auto it = registry.find(graph_key);
     if (it == registry.end()) {

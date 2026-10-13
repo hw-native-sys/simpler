@@ -34,7 +34,29 @@ A Graph boundary uses `GraphTaskArgs`; a sub-task's arguments use
 `CoreTaskArgs`, the existing incore argument type:
 
 ```cpp
-void graph_function(const GraphTaskArgs &args, int variant) {
+// The values this Graph is built from. They are fixed for the run, so they belong
+// to the Graph's identity rather than to its boundary: hash() joins the cache key,
+// and operator== settles a key collision between two Configs.
+//
+// The constructor is not decoration. ConfigBase has a virtual destructor, so a
+// derived Config has a virtual function and is therefore not an aggregate --
+// `LayerConfig{4, false}` does not compile without one.
+struct LayerConfig : simpler::hbg::ConfigBase {
+    LayerConfig(int64_t blocks, bool transpose) :
+        cohort_blocks(blocks), transposed(transpose) {}
+
+    int64_t cohort_blocks;
+    bool transposed;
+
+    uint64_t hash() const {
+        return simpler::hbg::config_hash(cohort_blocks, transposed);
+    }
+    bool operator==(const LayerConfig &o) const {
+        return cohort_blocks == o.cohort_blocks && transposed == o.transposed;
+    }
+};
+
+void layer(const GraphTaskArgs &args, const LayerConfig &config) {
     const ChipTensor &input = args.tensor(0).ref();
     const ChipTensor &weight = args.tensor(1).ref();
     const ChipTensor &output = args.tensor(2).ref();
@@ -49,7 +71,7 @@ void graph_function(const GraphTaskArgs &args, int variant) {
     matmul_args.add_output(intermediate);
     matmul_args.add_scalar(args.scalar(0));  // forwarded boundary parameter
     TaskOutputTensors matmul = rt_submit_aic_task(
-        variant == 0 ? FUNC_MATMUL : FUNC_MATMUL_TRANSPOSED,
+        config.transposed ? FUNC_MATMUL_TRANSPOSED : FUNC_MATMUL,
         matmul_args
     );
 
@@ -60,15 +82,32 @@ void graph_function(const GraphTaskArgs &args, int variant) {
 }
 
 void submit_layer(const GraphTaskArgs &args) {
-    rt_submit_graph(&graph_function, args, /*variant=*/0);
+    rt_submit_graph(&layer, args, LayerConfig{/*cohort_blocks=*/4, /*transposed=*/false});
 }
 ```
 
-The function pointer is the default Graph identity. Trailing integral,
-`float`, `double`, and `bool` construction parameters are forwarded to the
-Graph function and hashed by value into the cache key. They are separate from
-execution scalars in `GraphTaskArgs`: changing a construction parameter selects a
-different Definition rather than patching an existing one.
+The function pointer is the default Graph identity. A Config derives from
+`simpler::hbg::ConfigBase` and declares `uint64_t hash() const` and
+`bool operator==(const ItsOwnType &) const`; neither is virtual, and omitting
+either is a compile error at the submission rather than a template expansion.
+A Graph that takes no construction parameters passes nothing, which is the same
+submission as passing `simpler::hbg::DefaultConfig{}`.
+
+A Config's hash joins the cache key, so two different Configs of one Graph record
+two Definitions. The Config a key was first submitted with is retained for the
+bind and compared against every later submission on that key, which is what turns
+a hash collision into a reported fatal rather than a silently wrong replay. Build
+the hash with `simpler::hbg::config_hash`, passing every field `operator==`
+compares, in the same order.
+
+A Config must be copy-constructible and self-contained: the retained copy outlives
+the submit call, and the recording job that reads it runs on another thread, so a
+pointer or `string_view` into caller storage dangles.
+
+Construction parameters are separate from the execution scalars in
+`GraphTaskArgs`: changing a Config selects a different Definition rather than
+patching an existing one, while a boundary scalar is refreshed per invocation and
+patches nothing.
 
 An explicit identity is available for call sites that want to choose what counts
 as the same Graph, rather than letting the Graph function's address decide:
@@ -76,9 +115,9 @@ as the same Graph, rather than letting the Graph function's address decide:
 ```cpp
 rt_submit_graph(
     GRAPH_KEY("qwen_decoder_layer_v1"),
-    &graph_function,
+    &layer,
     args,
-    /*variant=*/0
+    LayerConfig{/*cohort_blocks=*/4, /*transposed=*/false}
 );
 ```
 
