@@ -296,28 +296,33 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("launch_depth", "configured", "expected_frames"),
+    ("launch_depth", "configured"),
     [
         # The native entry is reached only above depth one, so the default route configures
-        # nothing on the ChipWorker and publishes the single-frame serial contract.
-        (1, [], 1),
+        # nothing on the ChipWorker.
+        (1, []),
         # At depth two the child configures its own ChipWorker before init — the only place the
-        # request and the runtime's resolved capability meet — and publishes the second frame.
-        (2, [2], 2),
+        # request and the runtime's resolved capability meet.
+        (2, [2]),
     ],
 )
-def test_chip_child_configures_its_launch_depth_through_the_native_entry(
-    monkeypatch, launch_depth, configured, expected_frames
-):
-    """a5 TMR's frame count follows the capability the child resolved, through the native entry.
+def test_chip_child_configures_its_launch_depth_through_the_native_entry(monkeypatch, launch_depth, configured):
+    """The launch budget reaches the ChipWorker; the grant the child publishes does not follow it.
 
     ``ChipWorker.configure_launch_depth`` is the only configuration route below the public
     Worker — it is bound for direct callers as well — so this covers both: the public route's
     child arrives here, and a caller driving a ``ChipWorker`` itself reaches the same entry with
-    the same effect on the negotiated frame count.
+    the same effect.
+
+    The grant is the second half, and the two rows are what make it a claim rather than a
+    coincidence. Whatever launch budget the child was started with, the sets it publishes are the
+    depth its ``ChipWorker`` resolved — a run-resource count, which request frames are separate
+    from and which the launch budget does not clip. A child that still derived its grant from the
+    launch budget would satisfy the configure half above and fail the publication below.
     """
     configured_depths: list[int] = []
-    published_frame_counts: list[int] = []
+    published_depths: list[int] = []
+    published_sets: list[int] = []
 
     class FakeChipWorker:
         pipeline_depth = 2
@@ -334,10 +339,12 @@ def test_chip_child_configures_its_launch_depth_through_the_native_entry(
 
     def fake_run_chip_main_loop(cw, *_args, granted_sets=1, **_kwargs):
         del cw
-        depth, frames, _spare = worker_mod._PIPELINE_LEASE_FMT.unpack_from(_args[0], worker_mod._OFF_PIPELINE_LEASE)
-        del depth
-        published_frame_counts.append(granted_sets)
-        assert frames == granted_sets
+        depth, sets, _spare = worker_mod._PIPELINE_LEASE_FMT.unpack_from(_args[0], worker_mod._OFF_PIPELINE_LEASE)
+        published_depths.append(depth)
+        published_sets.append(granted_sets)
+        # The loop is handed the same number the lease carries, so the parent and the child
+        # cannot disagree about how many sets exist.
+        assert sets == granted_sets
 
     monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
     monkeypatch.setattr(worker_mod, "_run_chip_main_loop", fake_run_chip_main_loop)
@@ -364,7 +371,11 @@ def test_chip_child_configures_its_launch_depth_through_the_native_entry(
         shm.unlink()
 
     assert configured_depths == configured
-    assert published_frame_counts == [expected_frames]
+    assert published_depths == [FakeChipWorker.pipeline_depth]
+    assert published_sets == [FakeChipWorker.pipeline_depth], (
+        f"a child started at launch_depth={launch_depth} published {published_sets} run-resource sets rather "
+        f"than the {FakeChipWorker.pipeline_depth} its ChipWorker resolved"
+    )
 
 
 def _dummy_l2_domain(domain_id: int):
@@ -764,8 +775,8 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
             self.configured_pending_depths.append(int(pending_depth))
             self.configured_launch_depths.append(int(launch_depth))
 
-        def add_next_level_worker(self, mailbox_addr: int, pid: int, task_frame_count: int) -> None:
-            self.next_level_calls.append((int(mailbox_addr), int(pid), int(task_frame_count)))
+        def add_next_level_worker(self, mailbox_addr: int, pid: int, granted_sets: int) -> None:
+            self.next_level_calls.append((int(mailbox_addr), int(pid), int(granted_sets)))
 
         def init(self) -> None:
             self.initialized = True
@@ -794,12 +805,12 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
     def fake_await_children_ready(shms, _pids, kind: str, _deadline: float) -> None:
         if kind != "chip":
             return
-        # What the child publishes at INIT_READY: the sets it granted, and the task frames it
-        # will poll. The parent takes the frame count from here rather than deriving it, so a
-        # child that negotiated one frame is registered with one.
-        for shm, depth, frames in zip(shms, (2, 1), (2, 1)):
+        # What the child publishes at INIT_READY: its resolved depth and the run-resource sets it
+        # granted. The parent takes the grant from here rather than deriving it, so a child that
+        # resolved one set is registered with one.
+        for shm, depth, granted_sets in zip(shms, (2, 1), (2, 1)):
             assert shm.buf is not None
-            worker_mod._PIPELINE_LEASE_FMT.pack_into(shm.buf, worker_mod._OFF_PIPELINE_LEASE, depth, frames, 0)
+            worker_mod._PIPELINE_LEASE_FMT.pack_into(shm.buf, worker_mod._OFF_PIPELINE_LEASE, depth, granted_sets, 0)
 
     def fake_fork() -> int:
         startup_events.append(("fork",))
@@ -825,8 +836,8 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
 
     assert fake_parent.configured_depths == [1]
     assert fake_parent.configured_pending_depths == [0]
-    # One launched run: the default launch depth, and no more than the frames the narrower
-    # child negotiated could carry anyway.
+    # One launched run: the default launch depth, and no more than the grant the narrower child
+    # published could hold anyway.
     assert fake_parent.configured_launch_depths == [1]
     assert [call[1:] for call in fake_parent.next_level_calls] == [(12001, 2), (12002, 1)]
     assert fake_parent.initialized

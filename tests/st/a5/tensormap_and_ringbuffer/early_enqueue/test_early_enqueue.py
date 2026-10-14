@@ -188,12 +188,16 @@ def _chip_args(handles, orch_signature, *scalars):
 
 
 def _negotiated_frame_counts(worker):
-    """The task frames this Worker registered each of its chip endpoints with.
+    """The run-resource sets this Worker registered each of its chip endpoints with.
 
-    The child decides the count after init — only an initialized ``ChipWorker`` can answer whether
-    its runtime joins native launches — and publishes it; the parent registers each endpoint with
-    exactly that number. Reading the parent's record is therefore reading the route a case actually
-    runs on, not the frames the mailbox happens to be laid out for.
+    The child decides the count after init — only an initialized ``ChipWorker`` can answer what
+    depth its runtime resolved — and publishes it; the parent registers each endpoint with exactly
+    that number. Reading the parent's record is therefore reading the capacity a case actually
+    runs on, not the width the mailbox happens to be laid out for.
+
+    Not a launch budget and not a request-frame count. Those are separate numbers: request frames
+    are a fixed pool that only carries hand-offs, and ``launch_depth`` bounds how many of these
+    sets may have device work launched at once.
 
     Returned per endpoint rather than as one number, because the capability is answered per device
     context: a Worker with two devices negotiates two counts, and a case that drives both has to
@@ -1320,12 +1324,15 @@ class TestA5TmrEarlyEnqueueErrorAttribution(_A5TmrEarlyEnqueueBase):
 class TestA5TmrEarlyEnqueueDepthOneControl(_A5TmrEarlyEnqueueBase):
     """With ``launch_depth`` unset, a5 TMR keeps the serial path: no successor reaches the device.
 
-    The control reads the route it is actually on. With the opt-in unset the child negotiates one
-    task frame and its endpoint runs the single-frame loop, which publishes ``_TASK_READY`` then
-    ``_TASK_DONE`` and no ``_TASK_LAUNCHED`` at all — so the two-frames-at-one-instant observation
-    the opt-in class makes is not merely absent here, it is not a state this route publishes. The
-    same claim is therefore established from what this route does publish: the negotiated frame
-    count, and the absence of any joined-launch record for runs this case is shown to have run.
+    The control reads the route it is actually on, and that route has the *ordinary* capacity. A
+    child's grant is its resolved pipeline depth, which the default leaves at two, so this child
+    is granted the same two resource sets as the opt-in class and its endpoint runs the same
+    staged loop. What the default withholds is the authorization for a *second* run to be launched
+    while the first is still live.
+
+    So the claim is established from the two things that do distinguish the routes: the grant is
+    the ordinary one, and no joined launch is ever established for runs this case is shown to have
+    run.
     """
 
     CASES = [
@@ -1346,19 +1353,31 @@ class TestA5TmrEarlyEnqueueDepthOneControl(_A5TmrEarlyEnqueueBase):
 
     @pytest.mark.platforms(["a5"])
     def test_no_overlap_without_the_opt_in(self, st_platform, st_worker):
-        """The default is unchanged: the same two submissions produce no joined launch at all."""
+        """The default is unchanged: the same two submissions produce no joined launch at all.
+
+        What makes the default serial is the **launch** budget, not storage scarcity. The grant a
+        child publishes is its resolved pipeline depth, which the default leaves at two, so by
+        default a successor is still prepared and still holds a resource set of its own — it is
+        simply never authorized to reach the device. `ChipRunLane::launch_ready_prefix` stops at
+        `launch_depth`, so with the default of one the loop that orders a successor behind the
+        front never runs however many sets exist.
+
+        Asserting one set here would be asserting a different route than the default one, which is
+        why the capacity below is required to be the ordinary two.
+        """
         if st_platform != "a5":
             pytest.skip("a5 TMR early enqueue is gated to the a5 onboard tensormap_and_ringbuffer route")
         assert st_worker._launch_depth == 1, (  # noqa: SLF001 -- scene-test validation
             f"this control needs a Worker at the default launch_depth, got {st_worker._launch_depth}"  # noqa: SLF001
         )
-        # One frame is the whole reason a successor cannot reach the device by default: with a
-        # single frame the parent has nowhere to publish a second run while the first is live, so
-        # the second is dispatched only once the first has left.
+        # The default route with its ordinary capacity intact: the same grant the opt-in class
+        # runs on, and no authorization to launch into the second set. A control that ran with
+        # one set would pin resource scarcity instead of the launch budget this capability
+        # actually gates on.
         negotiated = _negotiated_frame_counts(st_worker)[0]
-        assert negotiated == 1, (
-            f"the default negotiated {negotiated} task frames on a5 TMR, so this control is not observing the "
-            f"serial route it exists to pin"
+        assert negotiated == _FRAME_COUNT, (
+            f"the default granted {negotiated} run-resource sets on a5 TMR rather than {_FRAME_COUNT}, so this "
+            f"control is not observing the default route it exists to pin"
         )
         trace = _RunTrace(st_worker)
         stop = threading.Event()
@@ -1396,10 +1415,10 @@ class TestA5TmrEarlyEnqueueDepthOneControl(_A5TmrEarlyEnqueueBase):
                 sampler.join(timeout=5.0)
                 observed = len(case_runs)
 
-        # Both submissions passed through that one frame, so the absence below is an absence about
+        # Both submissions were seen in the entry table, so the absence below is an absence about
         # runs this case is shown to have run rather than about nothing having been sampled.
         assert observed >= 2, (
-            f"only {observed} of this case's runs were ever seen in the negotiated frame above dispatch floor "
+            f"only {observed} of this case's runs were ever seen in the granted entries above dispatch floor "
             f"{case_runs.floor}, so no joined-launch absence can be attributed to this case"
         )
         records: list[dict] = []
