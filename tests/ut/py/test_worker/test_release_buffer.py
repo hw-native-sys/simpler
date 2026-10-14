@@ -314,6 +314,9 @@ class _FakeChipImpl:
         self.calls.append((callable_id, chip_args, cfg))
         return SimpleNamespace(wait=lambda timeout: True)
 
+    def _validate_execution_context(self):
+        pass
+
 
 def _l2_with_registered_buffer(nbytes: int = 64):
     """An L2 Worker (its own chip, no fork needed) plus one buffer already registered in

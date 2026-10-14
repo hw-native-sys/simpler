@@ -3635,6 +3635,7 @@ NB_MODULE(_task_interface, m) {
             "retains the binding for explicit finalize and prevents reinitialization."
         )
         .def("finalize", &ChipWorker::finalize)
+        .def("_validate_execution_context", &ChipWorker::validate_execution_context)
         .def(
             "flush_diagnostics", &ChipWorker::flush_diagnostics, nb::arg("timeout_ms") = 30000,
             nb::call_guard<nb::gil_scoped_release>(),

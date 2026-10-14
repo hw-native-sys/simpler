@@ -14,6 +14,7 @@ import ctypes
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from test_kernel_caller_stream import _callable
@@ -66,6 +67,7 @@ def _run(arch, runtime, device, depth, borrowed):
         ChipTensor,
         DataType,
     )
+    from simpler.worker import RunHandle, Worker  # noqa: PLC0415
 
     base = _ROOT / "build/lib" / arch / "onboard" / runtime
     lib = _load(arch, "onboard", runtime)
@@ -103,6 +105,9 @@ def _run(arch, runtime, device, depth, borrowed):
     host_buffers = []
     device_buffers = []
     runs = []
+    python_runs = []
+    handle_owner = Worker(level=2)
+    handle_owner._chip_worker = SimpleNamespace(_impl=worker)
     outputs = []
     size = 128 * 128
     nbytes = size * ctypes.sizeof(ctypes.c_float)
@@ -141,6 +146,13 @@ def _run(arch, runtime, device, depth, borrowed):
             run = worker._submit_chip_run_direct(0, args, CallConfig(), caller_stream=stream.value)
             assert run.launched
             runs.append(run)
+            # Public Worker initialization is owned-only. These handles bridge
+            # real borrowed native runs to its shared Python completion path.
+            run_id = invocation + 1
+            handle_owner._chip_runs[run_id] = run
+            python_runs.append(
+                RunHandle(handle_owner, run_id, (args,), _validate_context=worker._validate_execution_context)
+            )
             assert (
                 lib.aclrtMemcpyAsync(ctypes.addressof(current_host[2]), nbytes, current_device[2], nbytes, 2, stream)
                 == 0
@@ -152,6 +164,15 @@ def _run(arch, runtime, device, depth, borrowed):
             outputs.append((current_host[2], expected))
         if contexts is not None:
             with contexts.other():
+                handle = python_runs[-1]
+                keepalive = handle._keepalive
+                for operation in (handle.wait, handle.result):
+                    with pytest.raises(RuntimeError, match="context validation failed"):
+                        operation()
+                    assert not handle._terminal and not handle._wait_in_progress
+                    assert handle._run_id == len(runs) and handle._keepalive is keepalive
+                    assert len(handle_owner._chip_runs) == len(runs)
+                    assert not handle_owner._source_context_failed
                 with pytest.raises(RuntimeError, match="context validation failed"):
                     worker.finalize()
                 assert worker.initialized
@@ -162,8 +183,10 @@ def _run(arch, runtime, device, depth, borrowed):
             assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
         for values, expected in outputs:
             assert all(value == expected for value in values), (list(values[:8]), expected)
-        for run in runs:
-            assert run.wait(-1.0)
+        for handle in python_runs:
+            handle.wait()
+            assert handle.done
+        assert not handle_owner._chip_runs
     finally:
         _cleanup(worker, lib, contexts, device_buffers, host_buffers, streams)
 

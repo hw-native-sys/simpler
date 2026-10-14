@@ -82,8 +82,15 @@ cannot walk a legal-looking length past the end.
 | `submit(callable, args=None, config=None) -> RunHandle` | Non-blocking |
 | `live_domains() -> dict[str, CommDomainHandle]` | Currently allocated communication domains |
 
-`RunHandle` exposes `done() -> bool`, `wait(timeout=None)`, and
+`RunHandle` exposes the `done` property, `wait(timeout=None)`, and
 `result(timeout=None)`.
+
+Direct L2 handles validate the native execution context before waiting. A
+context refusal leaves the handle, its argument snapshot and its Buffer uses
+intact; restore the required context before retrying. A device execution error
+is terminal and retains unproven Buffer uses. The public Worker initialization
+still owns its device; borrowed-context initialization is an internal native
+entry, and this preflight alone does not expose a public borrowed Worker.
 
 At L2 the `callable` is a registered `ChipCallable` handle. At L3+ the top-level
 callable is a **Python orchestration function** `f(orch, args, cfg)`, where

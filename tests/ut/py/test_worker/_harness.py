@@ -276,6 +276,9 @@ class _FakeChipImpl(FakeWorkspaceAccounting):
         self.submitted.append((cid, run))
         return run
 
+    def _validate_execution_context(self) -> None:
+        pass
+
     def _close_chip_run_lane(self) -> None:
         self.lane_closed = True
         if self.lane_closed_before_finalize is None:

@@ -379,6 +379,24 @@ class TestChipWorkerKernelSymbols:
 
 
 class TestChipWorkerBorrowedInit:
+    def test_context_preflight_does_not_consume_the_binding(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(borrowed=True)
+        observer = ctypes.CDLL(str(runtime))
+        worker = _ChipWorker()
+        worker.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        try:
+            before = observer.test_closes(), observer.test_destroys()
+            observer.test_validation(-88)
+            with pytest.raises(RuntimeError, match="context validation failed with code -88"):
+                worker._validate_execution_context()
+            assert worker.initialized and worker.runtime_slot_count == 1
+            assert (observer.test_closes(), observer.test_destroys()) == before
+            observer.test_validation(0)
+            worker._validate_execution_context()
+        finally:
+            observer.test_validation(0)
+            worker.finalize()
+
     def test_borrowed_init_uses_shared_binding_and_can_close(self, kernel_symbol_runtime):
         runtime = kernel_symbol_runtime(borrowed=True)
         observer = ctypes.CDLL(str(runtime))

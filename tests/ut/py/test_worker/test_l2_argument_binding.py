@@ -25,7 +25,10 @@ def l2():
     worker = Worker(level=2)
     calls = []
     frees = []
-    impl = SimpleNamespace(_submit_chip_run_direct=lambda cid, args, cfg: calls.append(args) or object())
+    impl = SimpleNamespace(
+        _submit_chip_run_direct=lambda cid, args, cfg: calls.append(args) or object(),
+        _validate_execution_context=lambda: None,
+    )
     worker._chip_worker = SimpleNamespace(_impl=impl, free=frees.append)
     worker._lifecycle = _Lifecycle.READY
     yield worker, calls, frees
@@ -443,6 +446,73 @@ def test_worker_close_drains_an_unawaited_source_use(l2):
     worker.close()
     source.close()
     assert source.closed
+
+
+@pytest.mark.parametrize("operation", ["wait", "result"])
+def test_wrong_context_wait_preserves_the_run_and_source_use(l2, operation):
+    worker, _, _ = l2
+    current = [False]
+    waits = []
+
+    def validate():
+        if not current[0]:
+            raise RuntimeError("execution context validation failed")
+
+    def wait(timeout):
+        waits.append(timeout)
+        validate()
+        return True
+
+    impl = worker._chip_worker._impl
+    impl._validate_execution_context = validate
+    impl._submit_chip_run_direct = lambda *_args: SimpleNamespace(wait=wait, done=lambda: True)
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    handle = worker._submit_l2_locked(3, arguments(backing), CallConfig())
+    run_id = handle._run_id
+    keepalive = handle._keepalive
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="context validation failed"):
+            getattr(handle, operation)()
+        assert not handle._terminal and not handle._wait_in_progress
+        assert handle._run_id == run_id and handle._keepalive is keepalive
+        assert run_id in worker._chip_runs and run_id in worker._chip_source_uses
+        assert not worker._source_context_failed
+        with pytest.raises(RuntimeError, match="in-flight or unproven"):
+            backing.close()
+    assert not waits
+
+    current[0] = True
+    getattr(handle, operation)()
+    assert waits == [-1.0]
+    assert handle.done and handle._run_id is None and handle._keepalive is None
+    assert not worker._chip_runs and not worker._chip_source_uses
+    backing.close()
+    assert backing.closed
+
+
+def test_valid_context_device_failure_remains_terminal_and_retains_source(l2):
+    worker, _, _ = l2
+    failure = RuntimeError("device execution failed")
+    waits = []
+
+    def wait(timeout):
+        waits.append(timeout)
+        raise failure
+
+    impl = worker._chip_worker._impl
+    impl._validate_execution_context = lambda: None
+    impl._submit_chip_run_direct = lambda *_args: SimpleNamespace(wait=wait)
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    handle = worker._submit_l2_locked(3, arguments(backing), CallConfig())
+    for _ in range(2):
+        with pytest.raises(RuntimeError) as error:
+            handle.wait()
+        assert error.value is failure
+    assert waits == [-1.0]
+    assert handle.done and not worker._chip_runs
+    assert worker._source_context_failed and worker._chip_source_uses
+    with pytest.raises(RuntimeError, match="in-flight or unproven"):
+        backing.close()
 
 
 def test_cached_source_closed_before_reservation_cannot_submit(l2, monkeypatch):
