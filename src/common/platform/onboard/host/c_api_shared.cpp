@@ -1670,6 +1670,20 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return launch_prepared_run(state, nullptr);
 }
 
+int simpler_launch_run_on_stream(
+    DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle predecessor
+) {
+    OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_launch_run_on_stream");
+    if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared ||
+        state->prepared_execution == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int rc = state->runner->validate_caller_stream(caller_stream);
+    if (rc != 0) return rc;
+    state->prepared_execution->caller_stream = caller_stream;
+    return predecessor == nullptr ? launch_prepared_run(state, nullptr) :
+                                    simpler_launch_run_joined(ctx, runtime, predecessor);
+}
+
 int supports_joined_native_launch_ctx(DeviceContextHandle ctx) {
     if (ctx == nullptr || joined_native_launch_supported_impl() == 0) return 0;
     return static_cast<DeviceRunnerBase *>(ctx)->ready_to_join_launch() ? 1 : 0;
@@ -1816,8 +1830,10 @@ static void emit_joined_launch_span(const DeviceRunnerBase::JoinedLaunchRecord &
  * predecessor retires first launches ordinarily.
  */
 static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJoin *join) {
-    // The program launch transaction does not join the caller's stream.
-    if (state->runner->execution_mode_latch().is_kernel()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (state->runner->execution_mode_latch().is_kernel() &&
+        (state->prepared_execution == nullptr || state->prepared_execution->caller_stream == nullptr)) {
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
 
     if (!state->runner->accepts_new_run() || !state->runner_reserved) return PTO_RUNTIME_ERR_INTERNAL;
     if (state->prepared_execution == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
@@ -1843,7 +1859,7 @@ static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJo
     state->runner_trace_start_ns = STRACE_NOW_NS();
     int rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
-        rc = state->runner->attach_current_thread(state->runner->device_id());
+        rc = state->runner->enter_run_thread();
         if (rc == 0) {
             DeviceRunnerBase::LaunchOutcome launch =
                 state->runner->launch_execution(std::move(state->prepared_execution), std::move(state->launch_permit));
@@ -1895,7 +1911,7 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
     if (phase == NativeRunPhase::Prepared) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     if (phase == NativeRunPhase::Complete) return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
-    int attach_rc = state->runner->attach_current_thread(state->runner->device_id());
+    int attach_rc = state->runner->enter_run_thread();
     if (attach_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     if (state->active_execution == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     return state->runner->poll_execution(*state->active_execution);
@@ -1907,18 +1923,18 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
     if (phase == NativeRunPhase::Prepared) return PTO_RUNTIME_ERR_INTERNAL;
     if (phase == NativeRunPhase::Complete) return state->completion_rc;
-    // drain_execution() synchronizes and destroys streams, reads device memory
-    // and frees device allocations, all of which need this thread's CANN
-    // device context. rtSetDevice is idempotent on an already-attached thread.
+    // Drain reads device memory and retires per-run references under the
+    // owning context. Program attaches it; borrowed execution only validates
+    // the caller's current binding.
     DrainOutcome drain{};
     // Published before the call, so a drain that lost its attach or threw is
     // never mistaken for one that never ran.
     note_workspace_fact(state, WorkspaceManager::RunFact::DrainAttempted);
     try {
-        const int attach_rc = state->runner->attach_current_thread(state->runner->device_id());
+        const int attach_rc = state->runner->enter_run_thread();
         if (attach_rc != 0) {
             drain.device_rc = attach_rc;
-            LOG_ERROR("simpler_wait_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
+            LOG_ERROR("simpler_wait_run: enter_run_thread failed: %d (%s)", attach_rc, state->trace_attrs);
         } else if (state->active_execution != nullptr) {
             drain = state->runner->drain_execution(*state->active_execution);
         }
@@ -1976,7 +1992,7 @@ int simpler_probe_run_retention(
 
     int rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
-        rc = state->runner->attach_current_thread(state->runner->device_id());
+        rc = state->runner->enter_run_thread();
     } catch (...) {
         rc = PTO_RUNTIME_ERR_INTERNAL;
     }

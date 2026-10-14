@@ -1243,6 +1243,10 @@ int supports_joined_diagnostic_launch_ctx(DeviceContextHandle, RuntimeHandle, Ru
 
 int simpler_launch_run_joined(DeviceContextHandle, RuntimeHandle, RuntimeHandle) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
+int simpler_launch_run_on_stream(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 uint64_t get_arena_bank_gm_heap_base_ctx(DeviceContextHandle ctx, uint32_t bank_id) {
     if (ctx == NULL) return 0;
     return static_cast<SimDeviceRunnerBase *>(ctx)->arena_bank_gm_heap_base(bank_id);

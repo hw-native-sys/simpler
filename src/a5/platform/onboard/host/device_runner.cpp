@@ -518,9 +518,18 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
         return outcome;
     }
 
-    prepared->streams = {stream_aicpu_, stream_aicore_};
+    prepared->streams =
+        execution_mode_latch_.is_kernel() ? borrowed_run_streams() : RunStreams{stream_aicpu_, stream_aicore_};
     const auto &streams = prepared->streams;
 
+    if (prepared->caller_stream != nullptr) {
+        const int rc = validate_caller_stream(prepared->caller_stream);
+        if (rc != 0) {
+            outcome.rc = rc;
+            outcome.prepared = std::move(prepared);
+            return outcome;
+        }
+    }
     // The one descriptor H2D for this run, ahead of activate_launch_shape, DFX
     // arming and every kernel or event this run submits. It is here rather than
     // at prepare because the route its entry values take is a question about
@@ -620,6 +629,8 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             // waiting for this run's kernels. The AICPU half needs no token of its own —
             // that stream's FIFO already places this run's payload behind the
             // predecessor's whole-operator boundary record.
+            if (int caller_rc = queue_caller_entry(*prepared, sink); caller_rc != 0) return caller_rc;
+
             if (prepared->join.predecessor_owner != nullptr) {
                 const int join_rc = queue_cross_run_wait(*prepared, streams.aicore, sink);
                 if (join_rc != 0) return join_rc;
@@ -675,7 +686,11 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             // than continued.
             void *core_done = nullptr;
             bool whole_operator = false;
-            if (prepared->joinable_boundary && open_own_boundary_wait(*prepared, &core_done) == 0) {
+            // Caller exit ordering requires this join even without a successor.
+            const bool needs_join = prepared->joinable_boundary || prepared->caller_stream != nullptr;
+            const int own_rc = needs_join ? open_own_boundary_wait(*prepared, &core_done) : 0;
+            if (prepared->caller_stream != nullptr && own_rc != 0) return own_rc;
+            if (needs_join && own_rc == 0) {
                 const int wait_rc = queue_own_boundary_wait(*prepared, streams.aicpu, core_done);
                 if (wait_rc != 0) return wait_rc;
                 whole_operator = true;
@@ -689,7 +704,8 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             }
             const int boundary_rc = record_run_boundary(*prepared, RunCompletionFence::StreamRole::Aicpu);
             if (boundary_rc == 0 && whole_operator) note_whole_operator_boundary(*prepared);
-            return boundary_rc;
+            if (boundary_rc != 0) return boundary_rc;
+            return queue_caller_exit(*prepared);
         }
     );
 

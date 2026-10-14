@@ -730,6 +730,12 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
     }
     prepared.streams = {static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())};
     const auto &streams = prepared.streams;
+    if (prepared.caller_stream != nullptr) {
+        const int rc = validate_caller_stream(prepared.caller_stream);
+        if (rc != 0) {
+            return LaunchTransactionResult{rc, LaunchProgress::NotStarted, LaunchReceipt{}};
+        }
+    }
     // The one descriptor H2D for this run, ahead of activate_launch_shape, DFX
     // arming and every kernel or event this run submits. It is here rather than
     // at prepare because the route its entry values take is a question about
@@ -813,6 +819,8 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 return rc;
             }
 
+            if (int caller_rc = queue_caller_entry(prepared, sink); caller_rc != 0) return caller_rc;
+
             if (prepared.join.predecessor_owner != nullptr) {
                 int join_rc = queue_cross_run_wait(prepared, streams.aicore, sink);
                 if (join_rc != 0) return join_rc;
@@ -856,14 +864,16 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             // kernels, and it is the only thing a successor can safely be
             // ordered behind.
             //
-            // Failing to reserve the reference costs the run nothing but its
-            // joinability — no boundary is published, so no successor is ever
-            // ordered behind a boundary that covers only one kernel. Failing to
-            // *queue* the wait is different: the stream may hold it, so the run
-            // is graded Partial rather than continued.
+            // A caller-bound run requires this reference; reservation failure
+            // fails its launch. Without a caller, an optional successor boundary
+            // can degrade to non-joinable. Once the wait is attempted, failure
+            // is Partial because the stream may already hold the reference.
             void *core_done = nullptr;
             bool whole_operator = false;
-            if (prepared.joinable_boundary && open_own_boundary_wait(prepared, &core_done) == 0) {
+            const bool needs_join = prepared.joinable_boundary || prepared.caller_stream != nullptr;
+            const int own_rc = needs_join ? open_own_boundary_wait(prepared, &core_done) : 0;
+            if (prepared.caller_stream != nullptr && own_rc != 0) return own_rc;
+            if (needs_join && own_rc == 0) {
                 int wait_rc = queue_own_boundary_wait(prepared, streams.aicpu, core_done);
                 if (wait_rc != 0) return wait_rc;
                 whole_operator = true;
@@ -875,7 +885,8 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             }
             int boundary_rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
             if (boundary_rc == 0 && whole_operator) note_whole_operator_boundary(prepared);
-            return boundary_rc;
+            if (boundary_rc != 0) return boundary_rc;
+            return queue_caller_exit(prepared);
         }
     );
     return result;

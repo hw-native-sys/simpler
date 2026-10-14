@@ -28,13 +28,59 @@ under the execution claim and before Runtime publication. Publication, kernel
 submission, boundary records, completion fallbacks and queued-wait discharge use
 that binding. The handles borrow their lifetime from the existing owner: A2/A3's
 `RunStreamPair` retains submitted run owners through retirement; A5 retains its
-bootstrap streams until runner teardown. Preparing a successor does not select
+bootstrap streams for owned execution and its kernel-context streams for borrowed
+execution until runner teardown. Preparing a successor does not select
 or replace a stream.
 
 On an execution failure, an owned Program context keeps its bounded device drain
 and reset policy. A borrowed kernel context is poisoned without a device-wide
-drain or reset; the caller owns device recovery. Public kernel launch remains
-unsupported; the stream binding alone does not establish caller-stream ordering.
+drain or reset; the caller owns device recovery. The native eager entry
+`simpler_launch_run_on_stream` binds a borrowed caller stream to an already
+prepared run. Worker-level kernel launch and capture/replay remain unsupported.
+
+## Borrowed caller ordering
+
+The caller orders its own device input writes before the native launch and may
+queue output consumers immediately after that launch returns successfully.
+`simpler_launch_run_on_stream(ctx, run, caller, predecessor)` uses the existing
+prepare/launch/poll/wait/finalize transaction; `predecessor` is null for ordinary
+launch, or names the same joined-launch predecessor as `simpler_launch_run_joined`.
+The caller must serialize submissions and keep its stream, external buffers and
+native run storage alive until finalization proves completion. Launch returns an
+enqueue result; wait/finalize still report the run's device verdict.
+
+```text
+caller:  prior work -> record Start ------------------------ wait CpuDone -> record Tail -> later work
+AICPU:                wait Start -> record Fork -> kernel -> wait CoreDone -> record CpuDone
+AICore:                            wait Fork ----> kernel -> record CoreDone
+```
+
+`Fork` precedes the AICPU kernel: that kernel can wait for AICore's handshake,
+so putting the fork after it would deadlock. `CpuDone` is the existing run fence,
+recorded after both the AICPU kernel and the wait for `CoreDone`; caller ordering
+requires this whole-operator join even when cross-run early enqueue is disabled.
+
+`RunCallerOrder` owns three reusable events per occupied slot, allocated lazily
+for explicit caller launches. It holds a reference to the run's existing AICPU
+boundary until `Tail` proves the caller consumed that wait. Poll therefore also
+queries `Tail`, and drain discharges that reference before retirement. Ordinary
+program launch creates no caller events. Timing marks are independent diagnostics
+and do not substitute for these ordering edges.
+
+An attempted record or wait may be enqueued even when its API reports an error.
+The launch transaction is therefore `Partial` from the first caller-edge attempt,
+with its resources retained. If no tail was recorded, bounded synchronization of
+all three bound streams is the fallback proof. A failed proof keeps references
+quarantined; borrowed execution never resets or synchronizes the whole device.
+Failure does not establish the caller's exit dependency, so the caller must not
+consume output merely because launch returned an error.
+
+This entry is eager-only. It validates the current borrowed RTS context and
+rejects an active caller capture before launch metadata publication. Preparation
+and callable registration take place outside capture. Metadata publication is
+still synchronous, and the old `simpler_kernel_mode_launch` stub and capability
+bit remain closed pending public Worker integration. Native completion events
+and their caller references are not a captured-graph lifetime contract.
 
 ## The boundary
 

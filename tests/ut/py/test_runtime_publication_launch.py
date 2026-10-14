@@ -30,7 +30,7 @@ _CASES = [
 ]
 
 
-@pytest.mark.parametrize("probe", ["runtime_publication_launch", "run_execution_streams"])
+@pytest.mark.parametrize("probe", ["runtime_publication_launch", "run_execution_streams", "run_caller_launch"])
 @pytest.mark.requires_hardware
 @pytest.mark.parametrize(("arch", "runtime"), _CASES)
 def test_onboard_execution_contract(arch: str, runtime: str, probe: str, tmp_path: Path):

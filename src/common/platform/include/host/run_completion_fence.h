@@ -59,9 +59,10 @@
  */
 class RunCompletionFence {
 public:
-    /** Which of a run's two streams a boundary belongs to. */
-    enum class StreamRole : size_t { Aicore = 0, Aicpu = 1 };
+    /** Boundary owners and waiters. Caller only waits; it owns no boundary. */
+    enum class StreamRole : size_t { Aicore = 0, Aicpu = 1, Caller = 2 };
     static constexpr size_t kRoleCount = 2;
+    static constexpr size_t kWaiterCount = 3;
 
     enum class Completion {
         Pending,
@@ -72,11 +73,11 @@ public:
     };
 
     /**
-     * Predecessor-boundary reference held by a successor that queued a stream
+     * Boundary reference held by a successor or caller that queued a stream
      * wait on it.
      *
-     * `boundary` names the predecessor event waited on; `waiter` names the
-     * successor stream the wait was queued into, which is the stream whose own
+     * `boundary` names the recorded event waited on; `waiter` names the
+     * stream the wait was queued into, which is the stream whose own
      * completion later covers it. The two are distinct on purpose: the join
      * crosses the streams, so a proof about one stream cannot retire a wait
      * sitting in the other.
@@ -410,7 +411,9 @@ public:
     int reserve_wait_reference(
         const NativeRunIdentity &identity, StreamRole boundary_role, StreamRole waiter_role, WaitReference *out
     ) {
-        if (out == nullptr || out->valid()) return PTO_RUNTIME_ERR_INTERNAL;
+        if (out == nullptr || out->valid() || static_cast<size_t>(boundary_role) >= kRoleCount ||
+            static_cast<size_t>(waiter_role) > static_cast<size_t>(StreamRole::Caller))
+            return PTO_RUNTIME_ERR_INTERNAL;
         std::lock_guard<std::mutex> lock(mutex_);
         if (!owns(identity)) return PTO_RUNTIME_ERR_INTERNAL;
         Boundary &target = boundary(boundary_role);
@@ -552,8 +555,8 @@ private:
         // First query / wait / record failure seen on this boundary.
         int error{0};
         unsigned pending_reservations{0};
-        // Committed references, indexed by the successor stream holding the wait.
-        std::array<unsigned, kRoleCount> committed_waits{};
+        // Committed references, indexed by the stream holding the wait.
+        std::array<unsigned, kWaiterCount> committed_waits{};
 
         /** Drop the previous run's facts, keeping the event and its references. */
         void reset_run_facts() {

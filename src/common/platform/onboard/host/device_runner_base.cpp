@@ -260,6 +260,17 @@ DeviceRunnerBase::DeviceRunnerBase() {
     for (auto &fence : run_fences_) {
         fence = std::make_unique<RunCompletionFence>(make_acl_event_ops());
     }
+    for (auto &order : caller_orders_) {
+        order = std::make_unique<RunCallerOrder>(
+            make_acl_event_ops(),
+            [](void *stream, void *event) {
+                return static_cast<int>(aclrtStreamWaitEvent(stream, event));
+            },
+            [](void *stream, int timeout) {
+                return static_cast<int>(aclrtSynchronizeStreamWithTimeout(stream, timeout));
+            }
+        );
+    }
     queued_waits_ = std::make_unique<QueuedStreamWaits>(make_acl_event_ops());
     boundary_marks_ = std::make_unique<RunBoundaryMarks>(make_acl_timing_event_ops());
 }
@@ -2384,6 +2395,10 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
             capture(fence->release());
         }
     }
+    for (auto &order : caller_orders_) {
+        if (abandon_device_resources) order->abandon();
+        else capture(order->release());
+    }
     // After the fences, in both directions. An abandoned fence is what lets its
     // tokens be dropped at all; a released one refused while any was live, so
     // reaching here with an undischarged wait means the release above already
@@ -3107,10 +3122,44 @@ const char *stream_role_name(RunCompletionFence::StreamRole role) {
 
 }  // namespace
 
+DeviceRunnerBase::RunStreams DeviceRunnerBase::borrowed_run_streams() const {
+    return {
+        kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu),
+        kernel_exec_state_.hidden_stream(KernelStreamKind::Aicore)
+    };
+}
+
+int DeviceRunnerBase::validate_caller_stream(rtStream_t caller) {
+    if (caller == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    int rc = enter_run_thread();
+    if (rc != 0) return rc;
+    aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI model = nullptr;
+    rc = aclmdlRICaptureGetInfo(caller, &status, &model);
+    if (rc != 0) return rc;
+    if (status != ACL_MODEL_RI_CAPTURE_STATUS_NONE) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    return 0;
+}
+
+int DeviceRunnerBase::queue_caller_entry(const PreparedExecution &prepared, LaunchProgressSink &sink) {
+    if (prepared.caller_stream == nullptr) return 0;
+    return caller_orders_[prepared.pipeline_slot]->fork(prepared.identity, sink);
+}
+
+int DeviceRunnerBase::queue_caller_exit(const PreparedExecution &prepared) {
+    if (prepared.caller_stream == nullptr) return 0;
+    return caller_orders_[prepared.pipeline_slot]->join(prepared.identity, run_fence(prepared.pipeline_slot));
+}
+
 int DeviceRunnerBase::arm_run_fence(const PreparedExecution &prepared) {
     int rc = run_fence(prepared.pipeline_slot).arm(prepared.identity);
     if (rc != 0) {
         LOG_ERROR("arm_run_fence: slot %u could not take a completion fence: %d", prepared.pipeline_slot, rc);
+    }
+    if (rc == 0 && prepared.caller_stream != nullptr) {
+        rc = caller_orders_[prepared.pipeline_slot]->arm(
+            prepared.identity, prepared.caller_stream, prepared.streams.aicpu, prepared.streams.aicore
+        );
     }
     return rc;
 }
@@ -3156,6 +3205,11 @@ int DeviceRunnerBase::record_run_boundary(const PreparedExecution &prepared, Run
 }
 
 int DeviceRunnerBase::poll_run_fence(const PreparedExecution &prepared) {
+    if (prepared.caller_stream != nullptr) {
+        const auto completion = caller_orders_[prepared.pipeline_slot]->poll(prepared.identity);
+        if (completion == RunCompletionFence::Completion::Pending) return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+        if (completion != RunCompletionFence::Completion::Complete) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    }
     if (!prepared.streams.ready()) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     const auto &streams = prepared.streams;
     const RunCompletionFence::Completion completion =
@@ -3267,6 +3321,10 @@ int DeviceRunnerBase::wait_run_fence(const PreparedExecution &prepared) {
 }
 
 void DeviceRunnerBase::retire_run_fence(const PreparedExecution &prepared) noexcept {
+    if (caller_orders_[prepared.pipeline_slot]->retire(prepared.identity) != 0) {
+        LOG_ERROR("retire_run_fence: caller still references slot %u", prepared.pipeline_slot);
+        return;
+    }
     if (run_fence(prepared.pipeline_slot).retire(prepared.identity) != 0) {
         LOG_ERROR(
             "retire_run_fence: slot %u keeps its fence — a queued cross-run wait still names a boundary of it",
@@ -3415,6 +3473,12 @@ int DeviceRunnerBase::record_cross_run_proof(const PreparedExecution &prepared, 
 }
 
 int DeviceRunnerBase::discharge_boundary_waits(const PreparedExecution &prepared, bool boundaries_complete) {
+    const int caller_rc =
+        caller_orders_[prepared.pipeline_slot]->discharge(prepared.identity, timeout_config_.stream_sync_timeout_ms);
+    if (caller_rc != 0) {
+        recover_device_or_mark_unusable(caller_rc);
+        return caller_rc;
+    }
     // The ladder and its return-code precedence live in the helper; what this
     // supplies is the two device-facing steps. Its non-zero return is a failure
     // to report; on the one branch where a wait may still name an event of this

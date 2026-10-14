@@ -593,6 +593,7 @@ simpler_ut_cases(platform_single_case
     test_queued_stream_waits.cpp
     test_retained_scheduler_storage.cpp
     test_retained_temp_bump.cpp
+    test_run_caller_order.cpp
     test_run_completion_fence.cpp
     test_run_drain_decision.cpp
     test_run_drain_result_separation.cpp

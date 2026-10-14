@@ -88,6 +88,7 @@
 #include "host/run_boundary_marks.h"
 #include "host/run_evidence_retention.h"
 #include "host/run_completion_fence.h"
+#include "host/run_caller_order.h"
 #include "host/teardown_recorder.h"
 #include "host/run_outcome_decision.h"
 #include "host/runtime_timeout_config.h"
@@ -316,9 +317,10 @@ public:
      * Whether any kernel-context owner still holds a device resource: the
      * streams and events in `KernelExecutionState`, the argument blocks in
      * `PersistentKernelArgs`, the loaded AICPU binary in `LoadAicpuOp`, or a
-     * retained callable image in `chip_callable_buffers_`. The destruction
-     * guard reads this aggregate, so a close that succeeded for some owners and
-     * failed for another is not a close.
+     * retained callable image in `chip_callable_buffers_`. An adopted device
+     * also retains the context until shared native-run resources have closed.
+     * The destruction guard reads this aggregate: a close that succeeded for
+     * some owners and failed for another is not a close.
      *
      * False on a program context: `chip_callable_buffers_` and the loader are
      * shared with program registration, and a program context resets its
@@ -327,7 +329,10 @@ public:
      */
     bool kernel_resources_live() const {
         if (!execution_mode_latch_.is_kernel()) return false;
-        return kernel_exec_state_.has_live_resources() || persistent_args_.has_live_resources() ||
+        // Only successful resource teardown clears the adopted device. This
+        // also covers a failed release of native-run events or streams after
+        // the cold-path owners below have already closed successfully.
+        return device_id_ >= 0 || kernel_exec_state_.has_live_resources() || persistent_args_.has_live_resources() ||
                load_aicpu_op_.has_live_resources() || !chip_callable_buffers_.empty();
     }
 
@@ -349,6 +354,7 @@ public:
     // device and RTS context without changing them. Also used for abandoning
     // an unlaunched run.
     int enter_run_thread();
+    int validate_caller_stream(rtStream_t caller);
     // A borrowed environment must be current before resource mutation. An
     // owned environment has no caller binding to validate; enter_run_thread
     // performs its thread attachment before device work.
@@ -1382,6 +1388,7 @@ public:
             kernel_args(std::move(other.kernel_args)),
             streams(std::exchange(other.streams, RunStreams{})),
             artifact_identity(other.artifact_identity),
+            caller_stream(std::exchange(other.caller_stream, nullptr)),
             resources_owned(std::exchange(other.resources_owned, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
@@ -1421,6 +1428,7 @@ public:
          * all-zero `owner_instance_id` means the caller stated none.
          */
         NativeRunArtifactIdentity artifact_identity{};
+        rtStream_t caller_stream{nullptr};
         bool resources_owned{false};
         bool aicore_retirement_attempted{false};
         /**
@@ -1976,6 +1984,9 @@ protected:
      * still submitted nothing and can roll back.
      */
     int arm_run_fence(const PreparedExecution &prepared);
+    int queue_caller_entry(const PreparedExecution &prepared, LaunchProgressSink &sink);
+    int queue_caller_exit(const PreparedExecution &prepared);
+    RunStreams borrowed_run_streams() const;
 
     /**
      * Record one stream's completion boundary, immediately after that stream's
@@ -2680,6 +2691,7 @@ protected:
     // pointer because the fence is non-copyable, so the array cannot be
     // brace-initialised without naming every slot.
     std::array<std::unique_ptr<RunCompletionFence>, PTO_PIPELINE_MAX_DEPTH> run_fences_;
+    std::array<std::unique_ptr<RunCallerOrder>, PTO_PIPELINE_MAX_DEPTH> caller_orders_;
 
     // Every stream wait queued on one of those boundaries, across all slots.
     // One table rather than one per slot: a cross-run wait names two runs, and

@@ -340,6 +340,7 @@ def _run_lifecycle_retry(arch, runtime, device, scenario):
             # a cleared device identity.
             assert lib.finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE
             assert lib.finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE
+            assert faults.fatal_drain_count() == 0
             assert not accepts(ctx)
             finalized = True
         elif scenario == "destroy_unclosed":
@@ -876,6 +877,18 @@ def test_program_loader_double_failure_leaves_nothing_to_unload(arch, runtime, r
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+class NativeRunProvenance(ctypes.Structure):
+    _fields_ = [
+        ("owner_instance_id", ctypes.c_uint8 * 8),
+        ("chip_rank", ctypes.c_uint32),
+        ("capture_index", ctypes.c_uint32),
+        ("task_slot", ctypes.c_uint32),
+        ("group_index", ctypes.c_uint32),
+        ("group_size", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+    ]
+
+
 class NativeRunDescriptor(ctypes.Structure):
     _fields_ = [
         ("pipeline_slot", ctypes.c_uint32),
@@ -887,7 +900,29 @@ class NativeRunDescriptor(ctypes.Structure):
         ("accepted_state", ctypes.POINTER(ctypes.c_int32)),
         ("accepted_value", ctypes.c_int32),
         ("joinable_boundary", ctypes.c_uint32),
+        ("provenance", NativeRunProvenance),
     ]
+
+
+def test_native_run_descriptor_matches_c_header(tmp_path):
+    fields = [name for name, _ in NativeRunDescriptor._fields_]
+    source = '#include <cstdio>\n#include "runtime_c_api.h"\nint main() {\n'
+    source += 'std::printf("%zu", sizeof(NativeRunDescriptor));\n'
+    for name in fields:
+        source += f'std::printf(" %zu", offsetof(NativeRunDescriptor, {name}));\n'
+    source += "}\n"
+    binary = tmp_path / "descriptor_layout"
+    subprocess.run(
+        ["c++", "-std=c++17", "-x", "c++", "-I" + str(_PROJECT_ROOT / "src/common/worker"), "-o", str(binary), "-"],
+        input=source,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    result = subprocess.run([str(binary)], capture_output=True, text=True, check=True)
+    expected = [ctypes.sizeof(NativeRunDescriptor)]
+    expected.extend(getattr(NativeRunDescriptor, name).offset for name in fields)
+    assert [int(value) for value in result.stdout.split()] == expected
 
 
 class _CallerContexts:

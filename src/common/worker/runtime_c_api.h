@@ -27,7 +27,7 @@
  *   - prepared run: simpler_register_callable, simpler_prepare_run,
  *                   simpler_launch_run, simpler_launch_run_joined,
  *                   simpler_poll_run, simpler_wait_run,
- *                   simpler_finalize_run, simpler_run,
+ *                   simpler_finalize_run, simpler_run, simpler_launch_run_on_stream,
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
  *                   get_run_stream_set_create_count
@@ -928,6 +928,22 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /**
+ * Submit a prepared native run between the caller stream's preceding and
+ * following work. The caller retains its stream and external tensor storage
+ * through run finalization. Prepare is a host operation performed outside
+ * capture; this eager launch rejects an active/invalidated capture before
+ * publication. `predecessor`, when non-null, has the joined-launch contract.
+ *
+ * Both owned and borrowed contexts use the same native run. A borrowed context
+ * requires this explicit stream entry. Poll/wait/finalize retain the run and
+ * its event references through the caller's exit wait. A partial enqueue
+ * failure poisons the execution domain; it is not a rollback permission.
+ */
+int simpler_launch_run_on_stream(
+    DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle predecessor
+);
+
+/**
  * Return nonzero when this context can order one prepared run's native
  * submission behind another run that is already executing.
  *
@@ -1122,13 +1138,14 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * which init entry runs first. simpler_init latches program mode — the
  * exclusive-device path driven through the prepared-run family
  * above. simpler_kernel_mode_init latches kernel mode, which borrows the
- * caller's already-current device and caller-owned stream to enqueue one
- * bounded asynchronous operator per launch: no device reset, no caller-stream
- * or device synchronize on any path, zero allocation at launch, and no
- * capture/model-state queries, so a launch is capturable by ACLGraph as an
- * ordinary node. Cold-path bring-up and registration do synchronize a
- * context-owned stream — both run outside capture; the launch path
- * synchronizes nothing at all.
+ * caller's already-current device. Native eager uses simpler_prepare_run,
+ * simpler_launch_run_on_stream, and the shared poll/wait/finalize family.
+ * Its caller edges order the whole operator on the explicitly supplied stream.
+ * No borrowed path resets or synchronizes the whole device. Cold-path bring-up
+ * and registration synchronize a context-owned stream; partial enqueue cleanup
+ * may synchronize the bound caller and private streams to prove references are
+ * consumed. Capture/replay and the legacy simpler_kernel_mode_launch entry
+ * remain unsupported.
  *
  * Identity is a write-once property of the context, not a state that evolves:
  * ExecutionModeLatch on the platform runner holds it, the first init entry to
@@ -1167,8 +1184,8 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * Structural argument errors return PTO_RUNTIME_ERR_INVALID_ARGUMENT before
  * capability or lifecycle checks. These entries accept only POD structs,
  * serialized blobs, and device/stream pointers — never framework objects.
- * The caller stream is always an explicit parameter and is never stored
- * beyond the call or destroyed by simpler.
+ * The caller stream is explicit and borrowed: a native execution retains its
+ * handle through finalization, and simpler never destroys it.
  * =========================================================================== */
 
 /**
@@ -1177,11 +1194,13 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * Launches, not resources: it stays zero while simpler_kernel_mode_launch is a
  * rejecting stub, including on a runtime whose simpler_kernel_mode_init already
  * establishes a kernel context. Both onboard runtimes support initialization
- * and per-invocation preparation; simulated components refuse kernel init
+ * and the shared native eager path via simpler_launch_run_on_stream. This
+ * legacy capability bit does not advertise that native entry. Simulated
+ * components refuse kernel init
  * with PTO_RUNTIME_ERR_UNSUPPORTED and establish nothing.
  *
  * This is the capability question a caller asks before choosing between the
- * kernel-mode entries and the program-mode prepared-run family. It is callable
+ * legacy kernel-mode entries and the shared native-run family. It is callable
  * on a context that create_device_context() has returned but that no init has
  * touched; at that point the context exists but names no device —
  * create_device_context() takes no device and device_id_ is still unset — so an
@@ -1255,7 +1274,10 @@ int simpler_kernel_mode_prepare_callable(
 );
 
 /**
- * Enqueue one bounded asynchronous kernel-mode operator invocation.
+ * Reserved legacy single-call entry; currently a rejecting stub.
+ * Native eager callers use simpler_prepare_run and simpler_launch_run_on_stream.
+ *
+ * The intended single-call contract is:
  *
  * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
  * caller-owned device addresses; they are passed through without ever being
