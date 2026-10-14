@@ -46,15 +46,42 @@ Four distinct states, kept apart on purpose:
 
 | # | Obligation | Evidence | Node / assertion |
 | - | ---------- | -------- | ---------------- |
-| 1 | Default unchanged; `M = 4`; one set for a single run | native + scene | `tests/ut/py/test_worker/test_pipeline_depth_request.py` — the default request is two and `M = granted + K`; **new** `test_a_single_set_request_is_a_single_set_everywhere` pins the single-set answer on all four platforms, including the a2a3 route that otherwise follows the request; `Test*EarlyEnqueueDepthOneControl::test_no_overlap_without_the_opt_in` on all four routes asserts no two runs are ever launched together |
+| 1 | Default unchanged; `M = 4`; one set for a single run | native + scene | `tests/ut/py/test_worker/test_pipeline_depth_request.py` — the default request is two and `M = granted + K`; **new** `test_the_grant_is_the_depth_the_child_resolved` pins the grant at one for a request of one, and `test_a_grant_below_one_set_is_refused` that zero is not a state a child may publish; `Test*EarlyEnqueueDepthOneControl::test_no_overlap_without_the_opt_in` on all four routes asserts no two runs are ever launched together |
 | 2 | `pipeline_depth=8, launch_depth=4`: ≥ 4 distinct runs launched and accepted at one coherent instant | scene ×4 | `Test*WorkedCapacityExample::test_sixty_four_runs_retire_through_eight_sets` — `observer.widest == _WORKED_LAUNCH_DEPTH`, over a two-pass coherent snapshot so the four are one instant and not a window |
 | 3 | 64 sustained submissions through 8 reused sets; `M = 10`; construction stops at 8 | scene ×4 | same four cases — `len(observer.held_sets) == _WORKED_SETS`, `observer.widest_held == _WORKED_SETS`, all 64 handles drained; the entry-table width read from `mailbox_run_entry_count` in `_frame_views` |
-| 4 | TMR compatible `N > 2`: 8 queued runs hit the prebuilt-arena cache; **no bind writes a device byte**; device order serial | scene (TMR) + native, one clause outstanding | `TestA5TmrCapacityBeyondTheOldCeiling` / `TestA2a3TmrCapacityBeyondTheOldCeiling::test_five_runs_are_launched_and_accepted_at_once`, plus each suite's serial-boundary evidence reader asserting one whole operator at a time; the cache decision in `test_trb_runtime_temp_buffer.cpp::PreparedRuntimeEnvRequiresTheActiveArenaKey`. The middle clause has no assertion — below |
+| 4 | TMR compatible `N > 2`: 8 queued runs hit the prebuilt-arena cache; **no bind writes a device byte**; device order serial | scene (TMR) + native (**new**) | `TestA5TmrCapacityBeyondTheOldCeiling` / `TestA2a3TmrCapacityBeyondTheOldCeiling::test_five_runs_are_launched_and_accepted_at_once`, plus each suite's serial-boundary evidence reader asserting one whole operator at a time; the cache decision in `test_trb_runtime_temp_buffer.cpp::PreparedRuntimeEnvRequiresTheActiveArenaKey`; the cache *hit* in **new** `CompatibleRetainedBindsReuseTheArenaWithoutWritingIt`, built for both arches — see below |
 | 5 | TMR incompatible sizing drains to depth one with a free set and **does not poison** | native | `test_chip_run_lane.cpp::IncompatibleSuccessorRetriesAfterPredecessorFence` — `PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE` from the prepare stub, successor relaunched at the front; `PrepareFailureIsTerminalWithoutPoisoningTheLane` — the lane admits the next run afterwards |
 | 6 | Request above the grant fails startup; no budget required; sim still refuses one | native + source | `test_host_worker.py::test_a_chip_published_run_resource_count_the_parent_cannot_honour_fails_startup` (4 parameterisations) and `test_pipeline_depth_request.py::test_an_unsupported_grant_fails_startup_with_both_numbers`, which requires the shortfall to name both numbers; `test_device_memory_info.py::test_simulator_reports_device_memory_info_as_unsupported` for the sim refusal shape. "No budget required" is the absence of a second key: `_validated_pipeline_depth` takes one number and there is no budget parameter anywhere on the path |
 | 7 | Sustained submit without waiting: `M` never exhausted; backpressure is `pending_run_depth` | scene + native | the four worked examples (64 unwaited submissions turning over); `tests/ut/py/test_worker/test_pending_run_depth.py` for the bound itself |
 | 8 | FIFO launch order: a freed set goes to the next unprepared run | native | `test_chip_run_lane.cpp::OwnsFifoPreparationAndLaunch`, `EarlierActiveDispatchOrdersBeforeAnAlreadyStagedSuccessor`; upstream #2577's three publication-order regressions |
 | 9 | Set withheld until copyback returned **and** zero-rc binding release **and** borrow discharged | native + scene | `test_native_run_operation_lease.cpp::WholeCloseRefusesToReclaimBehindAnUnprovenRun`, `NonDestroyingSuccessIsACleanupFailure`; the borrow half on a real route in **new** `TestA5WideDeviceResultChain::test_a_device_result_feeds_four_later_runs` — the registry witness, the refusal, and the clean release after the drain |
+
+### Row 4: what "no bind writes a device byte" is about
+
+Not every bind. The first one builds the arena image and uploads it, and
+`ChildMemoryIsPassThroughAndPureOutSkipsStaging` pins that single `copy_to` by name. The clause is
+about the binds that follow: `bind_callable_to_runtime_impl` probes the prebuilt-arena cache
+first, `bind_cached_runtime_image` only wires three pointers on a hit, and
+`build_and_cache_prebuilt_arena` — the one place a static arena is set up and the one
+`copy_to_device` of the image — runs on a miss alone. That is in the runtime maker, which both
+`test_a2a3_tmr_trb_runtime_temp_buffer` and `test_a5_tmr_trb_runtime_temp_buffer` already compile
+for real.
+
+The fixture's cache hooks recorded nothing and answered a hit with placeholder addresses, so every
+bind in it took the miss path — which is why an earlier draft of this document mistook "every bind
+uploads" for the production invariant and put the skip in the runner. Both were wrong. The hooks
+now have a recording mode that stores exactly what the build published and hands the same
+pointers, offset and image back on every later lookup.
+
+`CompatibleRetainedBindsReuseTheArenaWithoutWritingIt` warms the cache with one bind, writes a
+sentinel pattern over the whole arena, then binds **eight** further runs of compatible sizing
+without releasing any of them. Each is required to hit the cache and to be wired to the recorded
+arena *by address* — base, offset and shared-memory pointer — so a bind that quietly rebuilt would
+answer with storage of its own. Afterwards: no further upload, no second static-arena setup, no
+replacement cache entry, no new allocation, the arena pointer unmoved, and the sentinel bytes
+unchanged. A ninth run with a host input then shows the distinction the clause needs — its bind
+still copies nothing, its `stage_inputs` does, and the arena is still untouched. The claim is
+about the shared arena, not about forbidding the H2D a run legitimately needs.
 
 ## Operation and finalization protocol — rows 10–25, 28
 
@@ -162,9 +189,9 @@ fails without releasing anything a second time.
 
 | # | Obligation | Evidence | Node / assertion |
 | - | ---------- | -------- | ---------------- |
-| 35 | Two endpoints: per-endpoint grants; each reaches its own overlap; outcomes aggregate | scene + native | `TestA5TmrWideTwoEndpoints::test_each_endpoint_carries_a_wide_grant` — both endpoints negotiate `_WIDE_SETS` from their own published counts, a wide prefix is admitted on each interleaved, every result is its own. The per-endpoint overlap at the old width is `Test*TmrEarlyEnqueueTwoEndpoints::test_each_endpoint_enqueues_early`. Differing grants between children: `test_host_worker.py::test_a_reconciled_chip_frame_count_is_taken_as_published` takes `[2, 1]` from two children in their own order |
+| 35 | Two endpoints: per-endpoint grants; each reaches its own overlap; outcomes aggregate | scene + native | `TestA5TmrWideTwoEndpoints::test_each_endpoint_carries_a_wide_grant` — both endpoints negotiate `_WIDE_SETS` from their own published counts, a wide prefix is admitted on each interleaved, every result is its own. The per-endpoint overlap at the old width is `Test*TmrEarlyEnqueueTwoEndpoints::test_each_endpoint_enqueues_early`. Differing grants between children: `test_host_worker.py::test_a_reconciled_chip_resource_grant_is_taken_as_published` takes `[2, 1]` from two children in their own order |
 | 36 | Two endpoints: cross-endpoint DEVICE address refused with a clear error | native | `tests/ut/py/test_worker/test_child_addr_guard.py::TestSubmitDispatchGuard::test_child_arg_to_wrong_worker_rejected` — a Worker with two chip endpoints, an allocation live on worker 0 submitted to worker 1, `ValueError` matching `"not a live allocation on target worker 1"`, and `fake.submit_next_level.assert_not_called()` so nothing reached native. The group form is `test_group_member_child_arg_wrong_worker_rejected`; the check in isolation is `TestDispatchResolution::test_unique_target_but_wrong_worker_rejected`. This is the production path: `Orchestrator.submit_next_level` reaches the same `_child_prov_check_dispatch_locked` a scene submission does |
-| 37 | Diagnostics: with swimlane on and 8 sets, a 4th diagnostic run waits for a bank and still collects; released only on report; mapped by epoch | native (partly **new**) + one outstanding item | **the wait itself**, in **new** `test_chip_run_lane_joined_launch.cpp::ADiagnosticSuccessorWithNoTerminalBankStaysPreparedUntilOneIsReleased` — run 372 behind run 371, every bank held, no joined launch reaching the backend, the successor left prepared, then the same run joining exactly once after a release. The bank table in `test_chip_swimlane_run_terminal.cpp::BanksAreHeldByEpochAndComeBackOnRelease`, `AWithdrawnRunReturnsItsBankUnused`, `AnUnprovenRunWithdrawsItsBankRatherThanReturningIt`, `FinalizeReturnsEveryBankIncludingWithdrawnOnes`, `ANonRetainingCollectorStillReturnsAProvenUnusedBank`, `ABankAcquiredForAnArmThatRefusedComesBack`. The front's separate arming path in **new** `ARunThatFoundNoBankStillCollectsAndIsServedOnTheNextRelease` and **new** `test_sim_callable_pool.cpp::TheSimRunnerHandsDiagnosticBanksOutByEpochAndRefusesBeyondTheBankCount`. Outstanding: the onboard copy of the arming helper is in no `cpput` target — below |
+| 37 | Diagnostics: with swimlane on and 8 sets, a 4th diagnostic run waits for a bank and still collects; released only on report; mapped by epoch | native (partly **new**) + one outstanding item | **the wait itself**, in **new** `test_chip_run_lane_joined_launch.cpp::ADiagnosticSuccessorWithNoTerminalBankStaysPreparedUntilOneIsReleased` — run 372 behind run 371, every bank held, no joined launch reaching the backend, the successor left prepared, then the same run joining exactly once after a release. The bank table in `test_chip_swimlane_run_terminal.cpp::BanksAreHeldByEpochAndComeBackOnRelease`, `AWithdrawnRunReturnsItsBankUnused`, `AnUnprovenRunWithdrawsItsBankRatherThanReturningIt`, `FinalizeReturnsEveryBankIncludingWithdrawnOnes`, `ANonRetainingCollectorStillReturnsAProvenUnusedBank`, `ABankAcquiredForAnArmThatRefusedComesBack`. The front's separate arming path in **new** `ARunThatFoundNoBankStillCollectsAndIsServedOnTheNextRelease` and **new** `test_sim_callable_pool.cpp::TheSimRunnerHandsDiagnosticBanksOutByEpochAndRefusesBeyondTheBankCount`. The onboard copy of the arming helper is in no `cpput` target and is a twin of the sim definition asserted here |
 | 38 | Child death holding an entry ⇒ `ENDPOINT_FAILURE`; entry reclaimed only at teardown | native | `test_scheduler.cpp::MailboxChildExitTest::PreservesOnlyMatchingTerminalResults` (4 parameterisations: exit 0/7 × stale identity), `PoisonedProgressWithholdsCompletionUntilTheChildExits` |
 | 39 | Sim parity: same admission, retirement, refusals, destruction boundary and bank mapping; no joined launch | native (**new**) | `test_sim_callable_pool.cpp::TheSimRunnerHandsDiagnosticBanksOutByEpochAndRefusesBeyondTheBankCount` for the bank surface, against the real `SimDeviceRunnerBase`; **new** `test_pipeline_depth_request.py::test_the_grant_follows_the_route_that_can_order_two_submissions` for the grant itself, which is one set on both simulated platforms because sim answers no to joined launch. Sim's own C `prepare`/`launch`/`poll`/`wait`/`finalize` are executed by the existing `st-sim-*` suites over the public route; they are not transferred from the shared lane — see below |
 
@@ -211,9 +238,10 @@ compiles into no `cpput` target — nothing under `tests/ut/cpp/` builds
 CI. It is a line-for-line twin of the sim one that is asserted here, which is why this is a
 difference in where the assertion lives rather than an unexercised branch.
 
-### Row 39: what is sim code, and why there is no sim grant to test
+### Row 39: what is sim code, and what the grant now means
 
-Two parts of this row are shared code and one is not, and the third part is the decisive one.
+Two parts of this row are shared code and one is not, and a third part changed shape under the
+run-resource refactor that landed on top of this work.
 
 **Shared.** Admission, the operation lease and the retirement bookkeeping live in
 `src/common/worker/chip_worker.cpp` and `src/common/worker/chip_run_lane.cpp`, which a sim build
@@ -225,41 +253,27 @@ lifecycle rows are *not* transferred to sim merely because the lane is shared, a
 does not claim they are. What executes sim's own entry points is the existing `st-sim-*` scene
 suites over the public route.
 
-**There is no sim configuration at a grant above one.** `_local_task_frame_count` decides the
-count the parent *registers the endpoint with*, and grants `pipeline_depth` sets only when the
-platform is literally `a2a3` or the child answers that it joins native launches;
+**Joining and granting are now separate questions, and sim answers them differently.** The grant
+used to be decided by `_local_task_frame_count`, which conflated the run-resource sets a child
+holds with the task frames a successor would occupy, and so handed a single set to any route whose
+child could not order one native submission behind another — including both simulated platforms.
+That conflation is gone: `_local_run_resource_set_count` returns the depth the child resolved, with
+no platform, runtime or joined-launch term, because request frames are a fixed independent pool
+that only carries hand-offs. A simulated child still answers *no* to joined launch —
 `src/common/platform/sim/host/c_api_shared.cpp` defines `supports_joined_native_launch_ctx` as an
-unconditional `return 0;`, so a simulated child always answers no and the endpoint is always
-registered with one set, however wide the request that reached it. That is a statement about the
-negotiated endpoint grant, not about how the child's own storage tables happen to be sized. A "sim
-scene at a wide grant" is therefore not a missing test — it is a configuration the public route
-does not offer.
-That table is now asserted directly, including both simulated platforms, in
-`test_pipeline_depth_request.py::test_the_grant_follows_the_route_that_can_order_two_submissions`,
-and the bank surface sim *does* own is covered by the runner case above.
+unconditional `return 0;` — and now still receives the grant it asked for. The two facts are
+asserted separately: the grant in
+`test_pipeline_depth_request.py::test_the_grant_is_the_depth_the_child_resolved` and
+`test_host_worker.py::test_a_chip_child_grants_the_depth_it_resolved`, the joined-launch answer by
+that definition. What a sim route therefore does *not* get is a joined launch, which is exactly
+what this row says.
+
+The bank surface sim owns is covered by the runner case above.
 
 ## Outstanding obligations
 
-One required item, and a short list of coverage that would add nothing. Each is stated with the
-reason it is where it is, not merely named.
-
-### Required behaviour nothing yet asserts
-
-**Row 4 — "no bind writes a device byte", on the prebuilt-arena cache hit.** The row's other two
-clauses are covered: the cache *decision* by
-`test_trb_runtime_temp_buffer.cpp::PreparedRuntimeEnvRequiresTheActiveArenaKey` (a matching key
-reuses the arena, a changed ring size does not), and serial device order by each TMR suite's
-evidence reader.
-
-The remaining clause is narrower than it first reads, and the narrowing is why it is still open.
-An ordinary bind *does* write a device byte — `ChildMemoryIsPassThroughAndPureOutSkipsStaging`
-pins exactly one `copy_to` for a pure-output run and names it: "the runtime arena image upload
-that every bind performs". So the clause is about the cache-hit path, where a queued run whose
-config matches the active arena skips that upload. That skip is decided in the **runner's**
-prepare, in `onboard/host/device_runner.cpp` — which `cpput` does not build, and whose sim
-counterpart is overridden by the pool fixture's own `prepare_execution`. There is no seam in the
-current `cpput` targets that reaches it, so closing this needs either a new runner-level target or
-a scene assertion on the upload count, neither of which is a test-side change alone.
+No contract row is left without an assertion. What remains is coverage that would add nothing, and
+it is listed so that its absence is a decision rather than an oversight.
 
 ### Coverage that would add nothing
 
@@ -273,8 +287,9 @@ Each has layered evidence already, and none is required by a contract row.
 - A hardware scene for the row-37 wait. The lane decision and the bank table are asserted
   natively, and the arming helper is asserted on the sim runner whose definition is a twin of the
   onboard one; a scene would observe the same three through a device.
-- A sim scene at a wide grant. The endpoint grant is one set on both simulated platforms, so there
-  is no such configuration to run.
+- An onboard-runner `cpput` target. `onboard/host/device_runner_base.cpp` is in no such target, so
+  its copy of `arm_chip_swimlane_run_terminal_bank` is reached only by the onboard scene suites.
+  It is a line-for-line twin of the sim definition that is asserted here.
 
 ### Execution state of what is here
 

@@ -2276,9 +2276,9 @@ class TestRunCapacityBeyondTheOldCeiling(_EarlyEnqueueBase):
         )
         # The grant, not the request: a backend that clamped would leave this class asserting a
         # capacity the child never gave it, which is exactly the state this case exists to refuse.
-        negotiated = worker._chip_task_frame_counts[0]  # noqa: SLF001 -- scene-test validation
+        negotiated = worker._chip_run_resource_set_counts[0]  # noqa: SLF001 -- scene-test validation
         assert negotiated == _WIDE_SETS, (
-            f"the a2a3 endpoint negotiated {negotiated} task frames for a {_WIDE_SETS}-set request, so the "
+            f"the a2a3 endpoint granted {negotiated} run-resource sets for a {_WIDE_SETS}-set request, so the "
             f"capacity was clamped somewhere and nothing below could observe it"
         )
 
@@ -2443,7 +2443,7 @@ class TestWorkedCapacityExample(_EarlyEnqueueBase):
         assert worker._launch_depth == _WORKED_LAUNCH_DEPTH, (  # noqa: SLF001 -- scene-test validation
             f"this class needs launch_depth={_WORKED_LAUNCH_DEPTH}, got {worker._launch_depth}"  # noqa: SLF001
         )
-        negotiated = worker._chip_task_frame_counts[0]  # noqa: SLF001 -- scene-test validation
+        negotiated = worker._chip_run_resource_set_counts[0]  # noqa: SLF001 -- scene-test validation
         assert negotiated == _WORKED_SETS, (
             f"the endpoint negotiated {negotiated} sets for a {_WORKED_SETS}-set request, so the capacity was "
             f"clamped somewhere and nothing below could observe it"

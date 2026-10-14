@@ -669,29 +669,24 @@ def test_teardown_chip_process_resources_ignores_released_and_keeps_each_step_on
     assert store.state is ProviderRegionStoreState.CLOSED
 
 
-@pytest.mark.parametrize(
-    ("platform", "runtime", "depth", "joins", "expected"),
-    [
-        ("a2a3", "host_build_graph", 2, False, 2),
-        ("a2a3", "host_build_graph", 1, False, 1),
-        ("a2a3", "tensormap_and_ringbuffer", 2, False, 2),
-        # Every other route negotiates a successor frame only where the child resolved that it
-        # can order one native submission behind another. Depth alone does not, and the runtime
-        # name does not either: both a5 runtimes grant two resource sets and both now join, so
-        # the same runtime appears here under each answer.
-        ("a5", "host_build_graph", 2, True, 2),
-        ("a5", "host_build_graph", 2, False, 1),
-        ("a5", "tensormap_and_ringbuffer", 2, True, 2),
-        ("a5", "tensormap_and_ringbuffer", 2, False, 1),
-        ("a5sim", "tensormap_and_ringbuffer", 2, False, 1),
-        ("a2a3sim", "host_build_graph", 2, False, 1),
-        # A joining route still cannot use a frame the granted sets do not back.
-        ("a5", "host_build_graph", 1, True, 1),
-        ("a5", "tensormap_and_ringbuffer", 1, True, 1),
-    ],
-)
-def test_local_task_frame_count_follows_a2a3_depth_or_a_resolved_join(platform, runtime, depth, joins, expected):
-    assert worker_mod._local_task_frame_count(platform, runtime, depth, joins) == expected
+@pytest.mark.parametrize("depth", [1, 2, 3, 8, 64, 1024])
+def test_a_chip_child_grants_the_depth_it_resolved(depth):
+    """The grant is the resolved depth, on every route.
+
+    It used to be conditional: a route that could not order one native submission behind another
+    was handed a single set however wide the request, because the count also stood for the task
+    frames a successor would occupy. Those are two separate numbers now — request frames are a
+    fixed pool that carries hand-offs, and this count sizes the run-state entries a run holds —
+    so joining and granting are no longer the same question, and nothing about the platform or
+    the runtime enters this answer.
+    """
+    assert worker_mod._local_run_resource_set_count(depth) == depth
+
+
+def test_a_grant_below_one_set_is_refused_rather_than_published():
+    """There is no such thing as a chip child that can hold no run at all."""
+    with pytest.raises(ValueError, match="at least one run-resource set"):
+        worker_mod._local_run_resource_set_count(0)
 
 
 @pytest.mark.parametrize("level", [1, 2])
@@ -720,7 +715,7 @@ def test_launch_depth_comes_from_each_workers_own_config():
 
 
 @pytest.mark.parametrize(
-    ("frame_counts", "depths"),
+    ("resource_counts", "depths"),
     [
         # Below one: no run-resource set at all to publish a dispatch into.
         ([0], [2]),
@@ -733,7 +728,7 @@ def test_launch_depth_comes_from_each_workers_own_config():
         ([2], [2, 2]),
     ],
 )
-def test_a_chip_published_run_resource_count_the_parent_cannot_honour_fails_startup(frame_counts, depths):
+def test_a_chip_published_run_resource_count_the_parent_cannot_honour_fails_startup(resource_counts, depths):
     """A granted-set count that does not reconcile is a startup error, not a quietly clamped one.
 
     The parent sizes its run-state entry table from this number and admits exactly the runs it
@@ -742,17 +737,17 @@ def test_a_chip_published_run_resource_count_the_parent_cannot_honour_fails_star
     Refusing at startup is what keeps that from being the symptom.
     """
     worker = Worker(level=3, device_ids=[0], num_sub_workers=0, platform="a5", runtime="host_build_graph")
-    with pytest.raises(RuntimeError, match="invalid run-resource counts|frame counts for"):
-        worker._granted_chip_task_frame_counts(frame_counts, depths)
+    with pytest.raises(RuntimeError, match="invalid run-resource counts|resource grants for"):
+        worker._granted_chip_run_resource_sets(resource_counts, depths)
 
 
-def test_a_reconciled_chip_frame_count_is_taken_as_published():
-    """Each child's own count, in its own order: two children may negotiate differently."""
+def test_a_reconciled_chip_resource_grant_is_taken_as_published():
+    """Each child's own grant, in its own order: two children may resolve different depths."""
     worker = Worker(level=3, device_ids=[0, 1], num_sub_workers=0, platform="a5", runtime="host_build_graph")
-    assert worker._granted_chip_task_frame_counts([2, 1], [2, 2]) == [2, 1]
+    assert worker._granted_chip_run_resource_sets([2, 1], [2, 2]) == [2, 1]
 
 
-def test_start_hierarchical_passes_each_chip_its_negotiated_frame_count(monkeypatch):
+def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkeypatch):
     class FakeParentWorker:
         def __init__(self) -> None:
             self.configured_depths: list[int] = []

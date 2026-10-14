@@ -24,9 +24,10 @@ import time
 import pytest
 from simpler.worker import (
     _DEFAULT_PIPELINE_DEPTH_REQUEST,
+    _UINT32_MAX,
     RemoteWorkerSpec,
     Worker,
-    _local_task_frame_count,
+    _local_run_resource_set_count,
     _validated_pipeline_depth,
 )
 
@@ -111,37 +112,35 @@ def test_several_endpoints_and_sub_workers_still_carry_the_larger_request():
     assert _scoped_worker(num_sub_workers=1)._requested_chip_pipeline_depth() == _LARGER_REQUEST
 
 
-@pytest.mark.parametrize(
-    "platform,joins,expected",
-    [
-        # a2a3 stages a successor behind an active run whatever its child answers, so the request
-        # is granted on both of its runtimes and on both answers.
-        ("a2a3", True, _LARGER_REQUEST),
-        ("a2a3", False, _LARGER_REQUEST),
-        # Every other route needs the child's own resolved answer: a route that cannot order one
-        # submission behind another keeps the single-set path rather than granting sets a run
-        # could never occupy.
-        ("a5", True, _LARGER_REQUEST),
-        ("a5", False, 1),
-        # Which is what decides both simulated platforms. `supports_joined_native_launch_ctx` is
-        # defined as an unconditional `return 0` in `src/common/platform/sim/host/c_api_shared.cpp`,
-        # so a simulated child's answer is always False and its grant is always one, however wide
-        # the request that reached it. There is therefore no simulated configuration at a grant
-        # above one — not a width a case has failed to exercise, but one the product does not
-        # offer.
-        ("a2a3sim", False, 1),
-        ("a5sim", False, 1),
-    ],
-)
-def test_the_grant_follows_the_route_that_can_order_two_submissions(platform, joins, expected):
-    assert _local_task_frame_count(platform, "host_build_graph", _LARGER_REQUEST, joins) == expected
+@pytest.mark.parametrize("depth", [1, 2, 3, _LARGER_REQUEST, 64, 1024])
+def test_the_grant_is_the_depth_the_child_resolved(depth):
+    """No platform term, no runtime term, and no joined-launch term.
+
+    The grant used to carry two meanings at once — the run-resource sets a child holds *and* the
+    task frames a successor would occupy — so a route that could not order one native submission
+    behind another was given a single set whatever it asked for. Those are separate counts now:
+    request frames are a fixed pool that only carries hand-offs, and this one sizes the run-state
+    entries a live run holds. Whether a backend joins launches is a different question with a
+    different answer, and it no longer reaches this one.
+    """
+    assert _local_run_resource_set_count(depth) == depth
 
 
-@pytest.mark.parametrize("platform", ["a2a3", "a5", "a2a3sim", "a5sim"])
-def test_a_single_set_request_is_a_single_set_everywhere(platform):
-    # The staging path is what a second set exists for, so a request of one never reaches it —
-    # including on a2a3, whose endpoint would otherwise follow the request.
-    assert _local_task_frame_count(platform, "tensormap_and_ringbuffer", 1, True) == 1
+def test_a_grant_below_one_set_is_refused():
+    # Every chip child holds at least the run it is executing, so zero is not a state to publish.
+    with pytest.raises(ValueError, match="at least one run-resource set"):
+        _local_run_resource_set_count(0)
+
+
+def test_the_request_is_bounded_by_what_the_native_side_can_carry():
+    """``Orchestrator::configure_pipeline_depth`` takes a ``uint32_t``, so the key is bounded by it.
+
+    Checked at the boundary rather than at a round number: the largest accepted value and the
+    first refused one are adjacent, so a bound that moved by one fails here.
+    """
+    assert _validated_pipeline_depth({"pipeline_depth": _UINT32_MAX}, 3) == _UINT32_MAX
+    with pytest.raises(ValueError, match="pipeline_depth must be <="):
+        _validated_pipeline_depth({"pipeline_depth": _UINT32_MAX + 1}, 3)
 
 
 def test_an_unsupported_grant_fails_startup_with_both_numbers():
