@@ -3604,19 +3604,20 @@ NB_MODULE(_task_interface, m) {
                const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
                std::optional<CallConfig> prewarm_config, bool enable_sdma, const std::string &sim_context_path,
                const std::string &sdma_warmup_path, bool collect_across_runs, uint64_t workspace_budget_bytes,
-               bool manage_workspace, uint32_t requested_pipeline_depth) {
+               bool manage_workspace, uint32_t requested_pipeline_depth,
+               std::optional<uint64_t> borrowed_context_generation) {
                 self.init(
                     host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id,
                     prewarm_config.has_value() ? &(*prewarm_config) : nullptr, enable_sdma, sim_context_path,
                     sdma_warmup_path, collect_across_runs, workspace_budget_bytes, manage_workspace,
-                    requested_pipeline_depth
+                    requested_pipeline_depth, borrowed_context_generation
                 );
             },
             nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
             nb::arg("device_id"), nb::arg("prewarm_config") = nb::none(), nb::arg("enable_sdma") = false,
             nb::arg("sim_context_path") = "", nb::arg("sdma_warmup_path") = "", nb::arg("collect_across_runs") = false,
             nb::arg("workspace_budget_bytes") = 0, nb::arg("manage_workspace") = false,
-            nb::arg("requested_pipeline_depth") = 0,
+            nb::arg("requested_pipeline_depth") = 0, nb::kw_only(), nb::arg("borrowed_context_generation") = nb::none(),
             // Release the GIL for the (potentially long) native device attach so
             // another Python thread can run during it — e.g. a concurrent close()
             // observing INITIALIZING and failing fast (a GIL held for the whole
@@ -3628,7 +3629,10 @@ NB_MODULE(_task_interface, m) {
             "given, its ring sizing is built + cached inside init (fork-constant, no "
             "cross-process control command). A no-op for runtimes without a prebuilt arena. "
             "When enable_sdma is True, provisions the async-DMA (SDMA) workspace at init so "
-            "kernels can use get_dma_workspace; init raises if the platform lacks support for the requested workspace."
+            "kernels can use get_dma_workspace; init raises if the platform lacks support for the requested workspace. "
+            "borrowed_context_generation selects the already-current caller RTS context; it must be nonzero. "
+            "The caller keeps that context current and alive through successful finalize. Failed rollback "
+            "retains the binding for explicit finalize and prevents reinitialization."
         )
         .def("finalize", &ChipWorker::finalize)
         .def(

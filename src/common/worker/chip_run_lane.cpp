@@ -99,6 +99,7 @@ struct ChipRunLaneState {
         if (closed) throw std::runtime_error("chip run lane is closed");
         if (admission_stopped) throw std::runtime_error("chip run lane has stopped admitting runs");
         if (poison != nullptr) rethrow_as_poisoned(poison);
+        worker->validate_execution_context();
     }
 
     /**
@@ -523,6 +524,7 @@ struct ChipRunLaneState {
 
     bool progress(const std::shared_ptr<ChipRunState> &target) {
         if (target->phase == ChipRunState::Phase::TERMINAL) return true;
+        worker->validate_execution_context();
         if (fifo.empty()) throw std::runtime_error("chip run lane lost a nonterminal run");
         if (fifo.front() != target) {
             (void)progress(fifo.front());
@@ -668,6 +670,7 @@ void ChipRun::activate() {
         lane_->rethrow_run_error(run_);
         return;
     }
+    lane_->worker->validate_execution_context();
     run_->activated = true;
     lane_->launch_ready_prefix();
     // Activating a queued run is what launches it, and its launch is what lets the run behind it
@@ -682,6 +685,7 @@ void ChipRun::abandon() {
     if (run_->phase == ChipRunState::Phase::LAUNCHED) {
         throw std::runtime_error("cannot abandon a launched ChipRun");
     }
+    lane_->worker->validate_execution_context();
     auto it = std::find(lane_->fifo.begin(), lane_->fifo.end(), run_);
     if (it == lane_->fifo.end()) throw std::runtime_error("chip run lane lost an unlaunched run");
     if (run_->phase == ChipRunState::Phase::PREPARED) {
@@ -894,6 +898,7 @@ ChipRun ChipRunLane::submit(
 
 void ChipRunLane::drain() {
     std::lock_guard<std::mutex> lk(state_->mu);
+    if (state_->worker != nullptr) state_->worker->validate_execution_context();
     while (!state_->fifo.empty())
         state_->drain_front();
     if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
@@ -901,6 +906,7 @@ void ChipRunLane::drain() {
 
 void ChipRunLane::close() {
     std::lock_guard<std::mutex> lk(state_->mu);
+    if (state_->worker != nullptr) state_->worker->validate_execution_context();
     if (state_->closed) {
         if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
         return;
@@ -911,9 +917,26 @@ void ChipRunLane::close() {
     if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
 }
 
+void ChipRunLane::detach_after_failed_teardown(std::exception_ptr error) noexcept {
+    std::lock_guard<std::mutex> lk(state_->mu);
+    state_->closed = true;
+    state_->poison = error;
+    for (const auto &run : state_->fifo) {
+        run->error = error;
+        run->poison_error = error;
+        run->phase = ChipRunState::Phase::TERMINAL;
+    }
+    state_->worker = nullptr;
+}
+
 void ChipRunLane::stop_admission() noexcept {
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->admission_stopped = true;
+    try {
+        if (state_->worker != nullptr) state_->worker->validate_execution_context();
+    } catch (...) {
+        return;
+    }
     state_->abandon_unlaunched();
 }
 

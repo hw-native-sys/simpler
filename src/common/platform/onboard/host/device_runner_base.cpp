@@ -1821,7 +1821,9 @@ int DeviceRunnerBase::launch_device_register(int32_t callable_id) {
         LOG_ERROR("launch_device_register: ensure_device_initialized failed: %d", rc);
         return rc;
     }
-    return register_callable_on_device(callable_id, stream_aicpu_);
+    rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+    if (control_stream == nullptr) control_stream = stream_aicpu_;
+    return register_callable_on_device(callable_id, control_stream);
 }
 
 int DeviceRunnerBase::register_callable_on_device(int32_t callable_id, rtStream_t control_stream) {

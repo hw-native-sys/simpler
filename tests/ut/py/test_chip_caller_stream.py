@@ -17,12 +17,47 @@ from pathlib import Path
 
 import pytest
 from test_kernel_caller_stream import _callable
-from test_kernel_mode_c_api import _load
+from test_kernel_mode_c_api import _CallerContexts, _load
 
 _ROOT = Path(__file__).resolve().parents[3]
 
 
-def _run(arch, runtime, device, depth):
+def _allocate_device(worker, lib, nbytes, borrowed):
+    if not borrowed:
+        return worker.malloc(nbytes)
+    allocation = ctypes.c_void_p()
+    assert lib.aclrtMalloc(ctypes.byref(allocation), nbytes, 0) == 0
+    assert allocation.value is not None
+    return allocation.value
+
+
+def _cleanup(worker, lib, contexts, device_buffers, host_buffers, streams):
+    worker._close_chip_run_lane()
+    for address in device_buffers:
+        if contexts is not None:
+            assert lib.aclrtFree(address) == 0
+        else:
+            worker.free(address)
+    for host in host_buffers:
+        assert lib.aclrtFreeHost(host) == 0
+    if contexts is not None:
+        worker.finalize()
+        # Successful borrowed close preserves caller streams and context.
+        for stream in streams:
+            assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
+        current = ctypes.c_void_p()
+        assert lib.aclrtGetCurrentContext(ctypes.byref(current)) == 0
+        assert current.value == contexts.owner.value
+    for stream in streams:
+        if stream.value:
+            assert lib.aclrtDestroyStream(stream) == 0
+    if contexts is not None:
+        contexts.close()
+    else:
+        worker.finalize()
+
+
+def _run(arch, runtime, device, depth, borrowed):
     from _task_interface import _ChipWorker  # noqa: PLC0415
     from simpler.task_interface import (  # noqa: PLC0415
         AddressSpace,
@@ -33,6 +68,12 @@ def _run(arch, runtime, device, depth):
     )
 
     base = _ROOT / "build/lib" / arch / "onboard" / runtime
+    lib = _load(arch, "onboard", runtime)
+    contexts = None
+    if borrowed:
+        lib.rtSetDevice.argtypes = [ctypes.c_int]
+        assert lib.rtSetDevice(device) == 0
+        contexts = _CallerContexts(lib, device)
     worker = _ChipWorker()
     worker.configure_launch_depth(depth)
     worker.init(
@@ -41,8 +82,10 @@ def _run(arch, runtime, device, depth):
         str(base / "aicore_kernel.o"),
         str(_ROOT / "build/lib" / arch / "dispatcher/libsimpler_aicpu_dispatcher.so"),
         device,
+        borrowed_context_generation=77 if borrowed else None,
     )
-    lib = _load(arch, "onboard", runtime)
+    lib.aclrtMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_int]
+    lib.aclrtFree.argtypes = [ctypes.c_void_p]
     lib.aclrtCreateStream.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
     lib.aclrtDestroyStream.argtypes = [ctypes.c_void_p]
     lib.aclrtSynchronizeStreamWithTimeout.argtypes = [ctypes.c_void_p, ctypes.c_int]
@@ -64,7 +107,12 @@ def _run(arch, runtime, device, depth):
     size = 128 * 128
     nbytes = size * ctypes.sizeof(ctypes.c_float)
     try:
-        worker.register_callable(0, _callable(arch, runtime))
+        callable_image = _callable(arch, runtime)
+        if contexts is not None:
+            with contexts.other():
+                with pytest.raises(RuntimeError, match="register_callable failed"):
+                    worker.register_callable(0, callable_image)
+        worker.register_callable(0, callable_image)
         for stream in streams:
             assert lib.aclrtCreateStream(ctypes.byref(stream)) == 0
         for invocation in range(4):
@@ -73,7 +121,7 @@ def _run(arch, runtime, device, depth):
             current_device = []
             current_host = []
             for _ in range(3):
-                address = worker.malloc(nbytes)
+                address = _allocate_device(worker, lib, nbytes, borrowed)
                 device_buffers.append(address)
                 current_device.append(address)
                 args.add_tensor(ChipTensor.make(address, (size,), DataType.FLOAT32, address_space=AddressSpace.DEVICE))
@@ -102,6 +150,12 @@ def _run(arch, runtime, device, depth):
             if runtime == "tensormap_and_ringbuffer":
                 expected += total
             outputs.append((current_host[2], expected))
+        if contexts is not None:
+            with contexts.other():
+                with pytest.raises(RuntimeError, match="context validation failed"):
+                    worker.finalize()
+                assert worker.initialized
+                assert runs[-1].launched
         # No RunHandle poll or wait can cause a deferred launch on this path.
         # Caller synchronization alone must see all four results.
         for stream in streams:
@@ -111,17 +165,10 @@ def _run(arch, runtime, device, depth):
         for run in runs:
             assert run.wait(-1.0)
     finally:
-        worker._close_chip_run_lane()
-        for address in device_buffers:
-            worker.free(address)
-        for host in host_buffers:
-            assert lib.aclrtFreeHost(host) == 0
-        for stream in streams:
-            if stream.value:
-                assert lib.aclrtDestroyStream(stream) == 0
-        worker.finalize()
+        _cleanup(worker, lib, contexts, device_buffers, host_buffers, streams)
 
 
+@pytest.mark.parametrize("borrowed", [False, True])
 @pytest.mark.parametrize("depth", [1, 2])
 @pytest.mark.parametrize(
     ("arch", "runtime"),
@@ -131,10 +178,10 @@ def _run(arch, runtime, device, depth):
         for runtime in ("host_build_graph", "tensormap_and_ringbuffer")
     ],
 )
-def test_direct_chip_submit_orders_caller_work(arch, runtime, depth, request):
+def test_direct_chip_submit_orders_caller_work(arch, runtime, depth, borrowed, request):
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, str(depth)],
+        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, str(depth), str(int(borrowed))],
         capture_output=True,
         text=True,
         timeout=240,
@@ -144,4 +191,4 @@ def test_direct_chip_submit_orders_caller_work(arch, runtime, depth, request):
 
 
 if __name__ == "__main__":
-    _run(sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]))
+    _run(sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), bool(int(sys.argv[5])))

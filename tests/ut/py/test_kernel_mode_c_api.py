@@ -474,6 +474,34 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
         lib.destroy_device_context(ctx)
 
 
+@pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
+def test_unclaimed_sim_close_preserves_the_callers_device(arch, runtime):
+    lib = _load(arch, "sim", runtime)
+    sim = ctypes.CDLL(str(_PROJECT_ROOT / "build/lib/libcpu_sim_context.so"))
+    for name in ("pto_cpu_sim_bind_device", "pto_cpu_sim_acquire_device", "pto_cpu_sim_release_device"):
+        getattr(sim, name).argtypes = [ctypes.c_int]
+    sim.pto_sim_get_pipe_shared_state.argtypes = [ctypes.c_uint64, ctypes.c_size_t]
+    sim.pto_sim_get_pipe_shared_state.restype = ctypes.c_void_p
+    previous = sim.pto_cpu_sim_get_bound_device()
+    device = 17
+    sim.pto_cpu_sim_acquire_device(device)
+    sim.pto_cpu_sim_bind_device(device)
+    ctx = lib.create_device_context()
+    assert ctx
+    try:
+        storage = sim.pto_sim_get_pipe_shared_state(42, 64)
+        assert storage
+        ctypes.c_uint64.from_address(storage).value = 1234
+        assert lib.finalize_device(ctx) == 0
+        # Check existence/address before reading: the rejected path must not free it.
+        assert sim.pto_sim_get_pipe_shared_state(42, 64) == storage
+        assert ctypes.c_uint64.from_address(storage).value == 1234
+    finally:
+        lib.destroy_device_context(ctx)
+        sim.pto_cpu_sim_release_device(device)
+        sim.pto_cpu_sim_bind_device(previous)
+
+
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
 def test_kernel_context_brings_up_and_closes_on_a_borrowed_device(arch: str, runtime: str, request):
     """A kernel context comes up on a device the caller owns, refuses the

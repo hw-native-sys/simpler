@@ -158,6 +158,8 @@ static void check(int fault, bool capturing) {
     prepared->caller_stream = caller;
     assert(prepared->kernel_args.prepare_runtime_args(runtime, allocator, slot) == 0);
     const int prior_copies = copies;
+    assert(simpler_validate_execution_context(nullptr) == PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    assert(simpler_validate_execution_context(&runner) == 0);
     auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(id));
     assert(syncs == 0);
     if (capturing) {

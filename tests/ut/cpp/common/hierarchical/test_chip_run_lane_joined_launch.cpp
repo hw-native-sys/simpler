@@ -305,6 +305,92 @@ TEST(ChipRunLaneJoinedLaunchTest, MissingCallerEntriesLeaveOrdinarySubmissionAva
     lane.close();
 }
 
+TEST(ChipRunLaneJoinedLaunchTest, ContextMismatchCloseKeepsTheActiveLaneRetryable) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_streams(worker);
+    int context_rc = 0;
+    worker.device_ctx_ = &context_rc;
+    worker.validate_execution_context_fn_ = [](void *ctx) {
+        return *static_cast<int *>(ctx);
+    };
+    worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+    int caller;
+    ChipRun run = worker.submit_chip_run(1, host_args(), CallConfig{}, nullptr, 0, &caller);
+    context_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_THROW(worker.close_chip_run_lane(), std::runtime_error);
+    EXPECT_THROW(run.done(), std::runtime_error);
+    EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), std::runtime_error);
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0"}));
+    EXPECT_TRUE(worker.initialized());
+    EXPECT_TRUE(run.launched());
+    context_rc = 0;
+    worker.close_chip_run_lane();
+    EXPECT_TRUE(run.done());
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "wait0", "finalize0"}));
+    worker.device_ctx_ = nullptr;
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, StopAdmissionRemainsEffectiveAcrossAContextMismatch) {
+    ChipWorker worker;
+    prime_worker(worker);
+    int context_rc = 0;
+    worker.device_ctx_ = &context_rc;
+    worker.validate_execution_context_fn_ = [](void *ctx) {
+        return *static_cast<int *>(ctx);
+    };
+    ChipRunLane lane(worker);
+    ChipRun run = lane.submit(1, host_args(), CallConfig{});
+    context_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    lane.stop_admission();
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0"}));
+    context_rc = 0;
+    EXPECT_THROW(lane.submit(1, host_args(), CallConfig{}), std::runtime_error);
+    lane.close();
+    EXPECT_TRUE(run.done());
+    worker.device_ctx_ = nullptr;
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, NativeContextMismatchDoesNotConsumeThePhaseToken) {
+    ChipWorker worker;
+    prime_worker(worker);
+    int context_rc = 0;
+    worker.device_ctx_ = &context_rc;
+    worker.validate_execution_context_fn_ = [](void *ctx) {
+        return *static_cast<int *>(ctx);
+    };
+    const auto args = host_args();
+    const auto run = worker.prepare_native_run(1, &args, CallConfig{}, PipelineSlotLease{0, 0, 1});
+    worker.launch_native_run(run);
+    context_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    EXPECT_THROW(worker.poll_native_run(run), std::runtime_error);
+    EXPECT_THROW(worker.wait_native_run(run), std::runtime_error);
+    EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0"}));
+    context_rc = 0;
+    worker.finalize_native_run(run);
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "wait0", "finalize0"}));
+    worker.device_ctx_ = nullptr;
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, FailedOwnerDestructionDetachesHandlesWithoutRetiringResources) {
+    auto worker = std::make_unique<ChipWorker>();
+    prime_worker(*worker);
+    int context_rc = 0;
+    worker->device_ctx_ = &context_rc;
+    worker->validate_execution_context_fn_ = [](void *ctx) {
+        return *static_cast<int *>(ctx);
+    };
+    worker->run_lane_ = std::make_unique<ChipRunLane>(*worker);
+    ChipRun run = worker->submit_chip_run(1, host_args(), CallConfig{});
+    context_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    worker.reset();
+    EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), std::runtime_error);
+    EXPECT_TRUE(run.lane_poisoned());
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0"}));
+}
+
 TEST(ChipRunLaneJoinedLaunchTest, TheSuccessorReachesTheDeviceWhileTheFrontStillExecutes) {
     ChipWorker worker;
     prime_worker(worker);

@@ -626,6 +626,9 @@ int finalize_device(DeviceContextHandle ctx) {
             LOG_ERROR("finalize_device: native run must be finalized first");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        // An unclaimed runner owns no simulated binding. The caller thread
+        // may still be bound to another worker's live device.
+        if (runner->device_id() < 0) return 0;
         // Publish what is still retained before any collector storage is
         // released. A no-op on a collector that retains no run.
         runner->finish_retained_runs();
@@ -1242,6 +1245,10 @@ int supports_joined_native_launch_ctx(DeviceContextHandle) { return 0; }
 int supports_joined_diagnostic_launch_ctx(DeviceContextHandle, RuntimeHandle, RuntimeHandle) { return 0; }
 
 int simpler_launch_run_joined(DeviceContextHandle, RuntimeHandle, RuntimeHandle) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
+int simpler_validate_execution_context(DeviceContextHandle ctx) {
+    return ctx != nullptr ? 0 : PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+}
 
 int simpler_validate_caller_stream(DeviceContextHandle, void *) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 

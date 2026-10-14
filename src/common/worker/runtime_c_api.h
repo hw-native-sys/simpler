@@ -28,7 +28,7 @@
  *                   simpler_launch_run, simpler_launch_run_joined,
  *                   simpler_poll_run, simpler_wait_run,
  *                   simpler_finalize_run, simpler_run, simpler_launch_run_on_stream,
- *                   simpler_validate_caller_stream,
+ *                   simpler_validate_caller_stream, simpler_validate_execution_context,
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
  *                   get_run_stream_set_create_count
@@ -843,7 +843,10 @@ int finalize_device(DeviceContextHandle ctx);
  * `simpler_run(callable_id, ...)` calls reuse this state.
  *
  * `device_id` and the executor binaries are not threaded through this entry
- * — they were captured by `simpler_init` and live on the DeviceRunner.
+ * — they were captured by context initialization and live on the DeviceRunner.
+ * Owned contexts attach their device; borrowed contexts validate the caller
+ * context and register on their context-owned control stream. Unknown device
+ * registration completion retains the callable until context close.
  * Callable-registry mutation is rejected while a native run is prepared or
  * executing on this context.
  *
@@ -934,6 +937,13 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  * the caller serializes capture changes and keeps it live through finalization.
  */
 int simpler_validate_caller_stream(DeviceContextHandle ctx, void *caller_stream);
+
+/**
+ * Validate the current borrowed RTS context before changing host run state.
+ * Owned/unclaimed contexts impose no current-context requirement. This call
+ * neither binds a device nor mutates resources; restoration permits retry.
+ */
+int simpler_validate_execution_context(DeviceContextHandle ctx);
 
 /**
  * Submit a prepared native run between the caller stream's preceding and

@@ -970,7 +970,7 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
     }
 
     try {
-        int rc = runner->attach_current_thread(runner->device_id());
+        int rc = runner->ensure_device_initialized();
         if (rc != 0) return rc;
 
         bool needs_aicpu_register = false;
@@ -979,7 +979,9 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
         if (needs_aicpu_register) {
             rc = runner->launch_device_register(callable_id);
             if (rc != 0) {
-                runner->unregister_callable(callable_id);
+                if (!runner->retains_failed_callable_release() || runner->kernel_execution_state().accepts_dispatch()) {
+                    runner->unregister_callable(callable_id);
+                }
                 return rc;
             }
         }
@@ -1668,6 +1670,15 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         return 0;
     }
     return launch_prepared_run(state, nullptr);
+}
+
+int simpler_validate_execution_context(DeviceContextHandle ctx) {
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->validate_current_context();
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
 }
 
 int simpler_validate_caller_stream(DeviceContextHandle ctx, void *caller_stream) {

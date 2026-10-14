@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <optional>
 #include <string>
 #include <type_traits>
 
@@ -20,31 +21,11 @@
 
 namespace {
 
-// `ChipWorker::init`'s parameter order is a caller-visible contract: the Python
-// binding passes positionally, so a parameter inserted rather than appended
-// silently changes what an existing call means. Pinning the whole signature makes
-// any reordering a build failure here instead of a runtime mystery; a genuinely
-// intended change updates this alias and says so.
-// Appended (never inserted) since the last revision: `sdma_warmup_path`, the
-// vector-only ELF used to warm the SDMA control path during init-time workspace
-// provisioning; `dfx_session`, the opt-in that keeps one diagnostic collection
-// session across this chip's runs instead of rebuilding it at every run
-// boundary; and `workspace_budget_bytes`, the finite budget that puts this
-// context's retained temporary buffer and three pooled arena regions under one
-// owner. Zero means no finite budget, which is separate from whether those
-// four regions have an owner at all: the onboard program init entry installs
-// one for every caller, so `manage_workspace`, the last parameter, is accepted
-// and ignored.
-// Retyped in place, not moved: the async-DMA parameter is `bool enable_sdma`
-// rather than a DmaWorkspaceKind bitmask. SDMA is the only engine a caller can
-// decline, so a set was never the question being asked; every other supported
-// engine is provisioned unconditionally.
-// Appended last: `requested_pipeline_depth`, how many native run-resource sets this context may
-// hold at once. Zero takes whatever the runtime publishes; a positive value is clamped to that
-// maximum, and the grant is latched before any per-slot storage is built.
+// The binding passes the existing parameters positionally. Borrowed context
+// generation is appended and optional; an insertion would change those callers.
 using ExpectedChipWorkerInit = void (ChipWorker::*)(
     const std::string &, const std::string &, const std::string &, const std::string &, int, const CallConfig *, bool,
-    const std::string &, const std::string &, bool, uint64_t, bool, uint32_t
+    const std::string &, const std::string &, bool, uint64_t, bool, uint32_t, std::optional<uint64_t>
 );
 static_assert(
     std::is_same_v<decltype(&ChipWorker::init), ExpectedChipWorkerInit>,

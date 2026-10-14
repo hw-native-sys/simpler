@@ -13,6 +13,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <memory>
 
 #include "../task_interface/call_config.h"
@@ -98,5 +99,7 @@ public:
     bool poisoned() const;
 
 private:
+    friend class ChipWorker;
+    void detach_after_failed_teardown(std::exception_ptr error) noexcept;
     std::shared_ptr<ChipRunLaneState> state_;
 };

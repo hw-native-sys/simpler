@@ -194,8 +194,10 @@ ChipWorker::~ChipWorker() {
         finalize();
     } catch (const std::exception &error) {
         std::fprintf(stderr, "ChipWorker::~ChipWorker: teardown failed: %s\n", error.what());
+        abandon_after_failed_teardown(std::current_exception());
     } catch (...) {
         std::fprintf(stderr, "ChipWorker::~ChipWorker: teardown failed with an unknown error\n");
+        abandon_after_failed_teardown(std::current_exception());
     }
 }
 
@@ -203,7 +205,8 @@ void ChipWorker::init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
     const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config, bool enable_sdma,
     const std::string &sim_context_path, const std::string &sdma_warmup_path, bool collect_across_runs,
-    uint64_t workspace_budget_bytes, bool manage_workspace, uint32_t requested_pipeline_depth
+    uint64_t workspace_budget_bytes, bool manage_workspace, uint32_t requested_pipeline_depth,
+    std::optional<uint64_t> borrowed_context_generation
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -213,6 +216,19 @@ void ChipWorker::init(
     }
     if (device_id < 0) {
         throw std::runtime_error("ChipWorker::init requires a non-negative device_id");
+    }
+    if (device_ctx_ != nullptr) {
+        throw std::runtime_error("ChipWorker initialization requires finalize after an incomplete rollback");
+    }
+    if (borrowed_context_generation.has_value()) {
+        if (*borrowed_context_generation == 0)
+            throw std::invalid_argument("borrowed context generation must be nonzero");
+        if (enable_sdma || !sim_context_path.empty() || !sdma_warmup_path.empty() || workspace_budget_bytes != 0 ||
+            manage_workspace) {
+            throw std::invalid_argument(
+                "borrowed initialization does not support Program workspace or simulator options"
+            );
+        }
     }
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
 
@@ -266,6 +282,8 @@ void ChipWorker::init(
         run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
         prepare_run_fn_ = load_symbol<SimplerPrepareRunFn>(handle, "simpler_prepare_run");
         launch_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_launch_run");
+        validate_execution_context_fn_ =
+            reinterpret_cast<ValidateExecutionContextFn>(dlsym(handle, "simpler_validate_execution_context"));
         // Older runtime modules have neither entry; ordinary submissions need neither.
         validate_caller_stream_fn_ =
             reinterpret_cast<ValidateCallerStreamFn>(dlsym(handle, "simpler_validate_caller_stream"));
@@ -365,6 +383,12 @@ void ChipWorker::init(
         throw;
     }
 
+    if (borrowed_context_generation.has_value() &&
+        (validate_execution_context_fn_ == nullptr || validate_caller_stream_fn_ == nullptr ||
+         launch_run_on_stream_fn_ == nullptr)) {
+        throw std::runtime_error("borrowed initialization requires native caller ordering and context validation");
+    }
+
     const PipelineContract *contract = get_pipeline_contract_fn();
     if (!is_valid_pipeline_contract(contract) || !has_serviceable_arena_topology(*contract) ||
         !has_serviceable_stream_topology(*contract)) {
@@ -412,17 +436,15 @@ void ChipWorker::init(
         throw;
     }
 
-    // One-shot platform-side init: attach the calling thread to `device_id`
-    // (rtSetDevice on onboard, sim bind+acquire on sim), transfer ownership
-    // of the executor binaries to the DeviceRunner, provision this Worker's
-    // async-DMA workspaces, and (onboard) sync CANN dlog from HostLogger.
-    // Subsequent device-ops re-attach their caller threads idempotently against
-    // the recorded device id; subsequent register_callable / run invocations
-    // reuse the cached binaries.
+    // Cold-path init attaches an owned device or adopts the caller's current
+    // RTS context. Both paths retain executor binaries on the runner; later
+    // operations attach or validate their calling thread against that binding.
+    // Only owned init provisions the optional SDMA workspaces and log level.
     //
     // read_binary_file may throw — defer the dlsym/dlclose rollback to the
     // catch block so the buffers and any partially-resolved handle are torn
     // down symmetrically.
+    bool borrowed_init_attempted = false;
     int init_rc = 0;
     try {
         std::vector<uint8_t> aicpu_bytes = read_binary_file(aicpu_path);
@@ -496,7 +518,7 @@ void ChipWorker::init(
         // Retained so existing callers keep compiling and calling.
         const bool simulated = !sim_context_path.empty();
         (void)manage_workspace;
-        if (!simulated) {
+        if (!simulated && !borrowed_context_generation.has_value()) {
             if (workspace_budget_bytes != 0) {
                 if (set_workspace_budget_fn_ == nullptr) {
                     throw std::runtime_error("ChipWorker::init: this runtime module has no workspace budget support");
@@ -514,159 +536,49 @@ void ChipWorker::init(
         } else if (workspace_budget_bytes != 0) {
             throw std::runtime_error("ChipWorker::init: a workspace budget is not supported on a simulated backend");
         }
-        init_rc = simpler_init_fn_(
-            device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(), aicore_bytes.size(),
-            dispatcher_ptr, dispatcher_bytes.size(), prewarm_config, enable_sdma ? 1 : 0, warmup_ptr,
-            warmup_bytes.size()
-        );
+        if (borrowed_context_generation.has_value()) {
+            const CallConfig default_config{};
+            borrowed_init_attempted = true;
+            init_rc = kernel_init_fn(
+                device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(),
+                aicore_bytes.size(), dispatcher_ptr, dispatcher_bytes.size(),
+                prewarm_config != nullptr ? prewarm_config : &default_config, *borrowed_context_generation
+            );
+            // UNSUPPORTED establishes no resource owner and owes no close.
+            if (init_rc == PTO_RUNTIME_ERR_UNSUPPORTED) borrowed_init_attempted = false;
+        } else {
+            init_rc = simpler_init_fn_(
+                device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(),
+                aicore_bytes.size(), dispatcher_ptr, dispatcher_bytes.size(), prewarm_config, enable_sdma ? 1 : 0,
+                warmup_ptr, warmup_bytes.size()
+            );
+        }
+        if (init_rc != 0) {
+            throw std::runtime_error(
+                std::string(borrowed_context_generation.has_value() ? "borrowed init" : "simpler_init") +
+                " failed with code " + std::to_string(init_rc)
+            );
+        }
     } catch (...) {
+        // A borrowed runner's destroy entry refuses live owners. Only a
+        // successful explicit close makes destroying and unloading it safe.
+        if (borrowed_init_attempted) {
+            const int close_rc = finalize_device_fn_(device_ctx_);
+            if (close_rc != 0) {
+                lib_handle_ = host_guard.release();
+                device_id_ = device_id;
+                throw std::runtime_error(
+                    "ChipWorker borrowed init failed with code " + std::to_string(init_rc) + "; rollback failed (" +
+                    std::to_string(close_rc) + "); keeping the context and host runtime loaded; finalize is required"
+                );
+            }
+        }
+        // Program rollback runs the runner destructor without an explicit
+        // finalize: a failed sim attach must not release a sibling's context.
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
-        // The context is gone, and its own teardown already released or
-        // quarantined every block it owned. So this generation's budget is
-        // resolved and the latch must not outlive it: a later unmanaged init
-        // would otherwise be unable to tell "no budget" from "a budget whose
-        // accounting cannot be read" and refuse every close.
-        workspace_managed_ = false;
-        workspace_limit_latched_ = false;
-        create_device_context_fn_ = nullptr;
-        destroy_device_context_fn_ = nullptr;
-        device_malloc_ctx_fn_ = nullptr;
-        device_free_ctx_fn_ = nullptr;
-        device_free_caller_buffer_ctx_fn_ = nullptr;
-        device_borrow_caller_buffers_ctx_fn_ = nullptr;
-        device_release_caller_buffers_ctx_fn_ = nullptr;
-        device_committed_memory_fn_ = nullptr;
-        device_memory_info_fn_ = nullptr;
-        copy_to_device_ctx_fn_ = nullptr;
-        copy_from_device_ctx_fn_ = nullptr;
-        get_runtime_size_fn_ = nullptr;
-        get_runtime_alignment_fn_ = nullptr;
-        simpler_init_fn_ = nullptr;
-        register_callable_fn_ = nullptr;
-        run_fn_ = nullptr;
-        prepare_run_fn_ = nullptr;
-        launch_run_fn_ = nullptr;
-        validate_caller_stream_fn_ = nullptr;
-        launch_run_on_stream_fn_ = nullptr;
-        launch_run_joined_fn_ = nullptr;
-        poll_run_fn_ = nullptr;
-        wait_run_fn_ = nullptr;
-        finalize_run_fn_ = nullptr;
-        probe_run_retention_fn_ = nullptr;
-        get_teardown_report_fn_ = nullptr;
-        set_workspace_budget_fn_ = nullptr;
-        enable_workspace_management_fn_ = nullptr;
-        get_workspace_report_fn_ = nullptr;
-        supports_concurrent_native_prepare_fn_ = nullptr;
-        supports_joined_native_launch_fn_ = nullptr;
-        supports_joined_diagnostic_launch_fn_ = nullptr;
-        get_arena_bank_gm_heap_base_fn_ = nullptr;
-        get_retained_temp_addr_fn_ = nullptr;
-        unregister_callable_fn_ = nullptr;
-        get_aicpu_dlopen_count_fn_ = nullptr;
-        get_host_dlopen_count_fn_ = nullptr;
-        get_run_stream_set_create_count_fn_ = nullptr;
-        finalize_device_fn_ = nullptr;
-        ensure_acl_ready_fn_ = nullptr;
-        create_comm_stream_fn_ = nullptr;
-        destroy_comm_stream_fn_ = nullptr;
-        comm_init_fn_ = nullptr;
-        comm_alloc_windows_fn_ = nullptr;
-        comm_get_local_window_base_fn_ = nullptr;
-        comm_get_window_size_fn_ = nullptr;
-        comm_alloc_domain_windows_fn_ = nullptr;
-        comm_release_domain_windows_fn_ = nullptr;
-        comm_global_domain_prepare_fn_ = nullptr;
-        comm_global_domain_import_fn_ = nullptr;
-        comm_global_domain_release_fn_ = nullptr;
-        comm_barrier_fn_ = nullptr;
-        comm_destroy_fn_ = nullptr;
-        kernel_supported_fn_ = nullptr;
-        kernel_init_fn_ = nullptr;
-        kernel_prepare_callable_fn_ = nullptr;
-        kernel_launch_fn_ = nullptr;
-        runtime_bufs_.clear();
+        clear_runtime_binding();
         throw;
-    }
-    if (init_rc != 0) {
-        // Symmetric teardown: drop the device context, clear all dlsym'd
-        // function pointers, dlclose, and discard cached binaries so the
-        // ChipWorker is back to its zero-initialized state.
-        //
-        // No finalize_device_fn_ call, even though simpler_init does real device
-        // work and may fail after it: destroy_device_context deletes the runner,
-        // and its destructor runs the platform's finalize() — including the
-        // fatal path that reclaims a card an SDMA warmup faulted. Calling
-        // finalize_device explicitly here would be worse than redundant on sim,
-        // where it releases whichever device *this thread* is bound to; a Worker
-        // that failed before attaching would tear down a sibling Worker's live
-        // sim context.
-        destroy_device_context_fn_(device_ctx_);
-        device_ctx_ = nullptr;
-        // Resolved with the context, as in the catch above.
-        workspace_managed_ = false;
-        workspace_limit_latched_ = false;
-        create_device_context_fn_ = nullptr;
-        destroy_device_context_fn_ = nullptr;
-        device_malloc_ctx_fn_ = nullptr;
-        device_free_ctx_fn_ = nullptr;
-        device_free_caller_buffer_ctx_fn_ = nullptr;
-        device_borrow_caller_buffers_ctx_fn_ = nullptr;
-        device_release_caller_buffers_ctx_fn_ = nullptr;
-        device_committed_memory_fn_ = nullptr;
-        device_memory_info_fn_ = nullptr;
-        copy_to_device_ctx_fn_ = nullptr;
-        copy_from_device_ctx_fn_ = nullptr;
-        get_runtime_size_fn_ = nullptr;
-        get_runtime_alignment_fn_ = nullptr;
-        simpler_init_fn_ = nullptr;
-        register_callable_fn_ = nullptr;
-        run_fn_ = nullptr;
-        prepare_run_fn_ = nullptr;
-        launch_run_fn_ = nullptr;
-        validate_caller_stream_fn_ = nullptr;
-        launch_run_on_stream_fn_ = nullptr;
-        launch_run_joined_fn_ = nullptr;
-        poll_run_fn_ = nullptr;
-        wait_run_fn_ = nullptr;
-        finalize_run_fn_ = nullptr;
-        probe_run_retention_fn_ = nullptr;
-        get_teardown_report_fn_ = nullptr;
-        set_workspace_budget_fn_ = nullptr;
-        enable_workspace_management_fn_ = nullptr;
-        get_workspace_report_fn_ = nullptr;
-        supports_concurrent_native_prepare_fn_ = nullptr;
-        supports_joined_native_launch_fn_ = nullptr;
-        supports_joined_diagnostic_launch_fn_ = nullptr;
-        get_arena_bank_gm_heap_base_fn_ = nullptr;
-        get_retained_temp_addr_fn_ = nullptr;
-        unregister_callable_fn_ = nullptr;
-        get_aicpu_dlopen_count_fn_ = nullptr;
-        get_host_dlopen_count_fn_ = nullptr;
-        get_run_stream_set_create_count_fn_ = nullptr;
-        finalize_device_fn_ = nullptr;
-        ensure_acl_ready_fn_ = nullptr;
-        create_comm_stream_fn_ = nullptr;
-        destroy_comm_stream_fn_ = nullptr;
-        comm_init_fn_ = nullptr;
-        comm_alloc_windows_fn_ = nullptr;
-        comm_get_local_window_base_fn_ = nullptr;
-        comm_get_window_size_fn_ = nullptr;
-        comm_derive_context_fn_ = nullptr;
-        comm_alloc_domain_windows_fn_ = nullptr;
-        comm_release_domain_windows_fn_ = nullptr;
-        comm_global_domain_prepare_fn_ = nullptr;
-        comm_global_domain_import_fn_ = nullptr;
-        comm_global_domain_release_fn_ = nullptr;
-        comm_barrier_fn_ = nullptr;
-        comm_destroy_fn_ = nullptr;
-        kernel_supported_fn_ = nullptr;
-        kernel_init_fn_ = nullptr;
-        kernel_prepare_callable_fn_ = nullptr;
-        kernel_launch_fn_ = nullptr;
-        runtime_bufs_.clear();
-        throw std::runtime_error("simpler_init failed with code " + std::to_string(init_rc));
     }
 
     lib_handle_ = host_guard.release();
@@ -726,6 +638,7 @@ bool ChipWorker::teardown_report(SimplerTeardownReport *out) const {
 }
 
 void ChipWorker::finalize() {
+    validate_execution_context();
     if (run_lane_ != nullptr) {
         try {
             run_lane_->close();
@@ -750,7 +663,7 @@ void ChipWorker::finalize() {
     clear_comm_sessions();
 
     int device_finalize_rc = 0;
-    if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && initialized_) {
+    if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && lib_handle_ != nullptr) {
         device_finalize_rc = finalize_device_fn_(device_ctx_);
         // Immediately after the teardown call and before both the throw below
         // and the context destruction / dlclose a success runs into: that is
@@ -776,8 +689,14 @@ void ChipWorker::finalize() {
     if (lib_handle_) {
         dlclose(lib_handle_);
     }
+    clear_runtime_binding();
+    finalized_ = true;
+}
+
+void ChipWorker::clear_runtime_binding() {
     lib_handle_ = nullptr;
     create_device_context_fn_ = nullptr;
+    simpler_init_fn_ = nullptr;
     destroy_device_context_fn_ = nullptr;
     device_malloc_ctx_fn_ = nullptr;
     device_free_ctx_fn_ = nullptr;
@@ -794,6 +713,7 @@ void ChipWorker::finalize() {
     run_fn_ = nullptr;
     prepare_run_fn_ = nullptr;
     launch_run_fn_ = nullptr;
+    validate_execution_context_fn_ = nullptr;
     validate_caller_stream_fn_ = nullptr;
     launch_run_on_stream_fn_ = nullptr;
     launch_run_joined_fn_ = nullptr;
@@ -836,6 +756,10 @@ void ChipWorker::finalize() {
     comm_global_domain_release_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
+    set_retain_runs_fn_ = nullptr;
+    set_retained_epoch_limit_fn_ = nullptr;
+    retained_epoch_limit_granted_ = simpler::dfx::runs::kMaxOpenEpochs;
+    flush_diagnostics_fn_ = nullptr;
     kernel_supported_fn_ = nullptr;
     kernel_init_fn_ = nullptr;
     kernel_prepare_callable_fn_ = nullptr;
@@ -845,7 +769,6 @@ void ChipWorker::finalize() {
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
     initialized_ = false;
     device_id_ = -1;
-    finalized_ = true;
 }
 
 void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
@@ -1024,6 +947,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
     int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
 ) {
+    validate_execution_context();
     config.validate();
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
@@ -1160,6 +1084,23 @@ void ChipWorker::close_chip_run_lane() {
     if (run_lane_ != nullptr) run_lane_->close();
 }
 
+void ChipWorker::validate_execution_context() {
+    if (device_ctx_ == nullptr || validate_execution_context_fn_ == nullptr) return;
+    const int rc = validate_execution_context_fn_(device_ctx_);
+    if (rc != 0) throw std::runtime_error("execution context validation failed with code " + std::to_string(rc));
+}
+
+void ChipWorker::abandon_after_failed_teardown(std::exception_ptr error) noexcept {
+    if (run_lane_ != nullptr) {
+        run_lane_->detach_after_failed_teardown(error);
+        // The retained lane keeps any run-side host snapshots alive as well.
+        (void)run_lane_.release();
+    }
+    for (auto &storage : runtime_bufs_)
+        storage.abandon();
+    // device_ctx_ and lib_handle_ remain live for the process lifetime.
+}
+
 void ChipWorker::validate_caller_stream(void *caller_stream) {
     if (!initialized_ || validate_caller_stream_fn_ == nullptr || launch_run_on_stream_fn_ == nullptr) {
         throw std::runtime_error("caller-stream submission requires an initialized runtime with caller ordering");
@@ -1169,6 +1110,7 @@ void ChipWorker::validate_caller_stream(void *caller_stream) {
 }
 
 void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream) {
+    validate_execution_context();
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         if (run.slot_id >= runtime_bufs_.size()) {
@@ -1202,6 +1144,7 @@ void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_
 bool ChipWorker::launch_native_run_joined(
     const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor, void *caller_stream
 ) {
+    validate_execution_context();
     if (!supports_joined_native_launch()) return false;
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -1251,6 +1194,7 @@ bool ChipWorker::launch_native_run_joined(
 }
 
 bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {
+    validate_execution_context();
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         if (run.slot_id >= runtime_bufs_.size()) {
@@ -1279,6 +1223,7 @@ bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {
 }
 
 void ChipWorker::wait_native_run(const ChipWorkerNativeRun &run) {
+    validate_execution_context();
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         if (run.slot_id >= runtime_bufs_.size()) {
@@ -1299,6 +1244,7 @@ void ChipWorker::wait_native_run(const ChipWorkerNativeRun &run) {
 }
 
 void ChipWorker::finalize_native_run(const ChipWorkerNativeRun &run) {
+    validate_execution_context();
     NativeRunPhase phase;
     int wait_rc;
     {

@@ -97,6 +97,28 @@ lifecycle. Caller ordering covers device work; Program host output copy-back
 still requires run completion/finalization. The public `Worker.submit` does not
 yet expose this argument or attach a borrowed RTS context.
 
+`ChipWorker::init` / internal `_ChipWorker.init` can select a borrowed,
+already-current RTS context with `borrowed_context_generation`. The value must
+be nonzero; omission selects owned-device initialization. Both routes load the
+same runtime and create the same native storage and lane. Borrowed initialization
+supports neither SDMA/simulator options nor Program workspace management/budget
+requests. Its config is the native admission input; each submission still
+supplies its own config. Generation is forwarded to the native init validation;
+this argument alone does not provide public Worker generation or Buffer binding.
+
+Before lane progress or native phase mutation, current-context validation rejects
+a mismatched RTS context. Restoration permits retry with the existing run handle.
+A failed borrowed initialization explicitly closes before destroying the runner;
+if close fails, it retains the context, library and storage for `finalize`, and
+refuses reinitialization. Successful rollback leaves an uninitialized worker that
+can retry. Successful `finalize` is terminal. If the worker itself is destroyed
+without completing close, it detaches surviving handles with an error and retains
+native storage, lane snapshots, context and runtime library for the process
+lifetime. It cannot prove safe reclamation at that point.
+
+Public `Worker` integration and captured-graph ownership remain separate
+requirements; internal borrowed eager submission does not deliver either.
+
 ## The boundary
 
 Each stream records an event immediately after its own kernel:

@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Tests for CallConfig and ChipWorker state machine."""
 
+import ctypes
 import json
 import os
 import shutil
@@ -199,8 +200,8 @@ def kernel_symbol_runtime(tmp_path_factory):
     """.split()
     cache = {}
 
-    def build(*, supported=0, missing=(), init_result=0, finalize_failures=0):
-        key = (supported, missing, init_result, finalize_failures)
+    def build(*, supported=0, missing=(), init_result=0, finalize_failures=0, borrowed=False):
+        key = (supported, missing, init_result, finalize_failures, borrowed)
         if key in cache:
             return cache[key]
         source = build_dir / f"runtime_{len(cache)}.cpp"
@@ -210,6 +211,11 @@ def kernel_symbol_runtime(tmp_path_factory):
             '#include "runtime_c_api.h"\n'
             "#include <cstdlib>\n"
             "static int live_contexts = 0;\n"
+            "static int destroys = 0, closes = 0, borrowed_inits = 0, validation = 0;\n"
+            'extern "C" int test_destroys() { return destroys; }\n'
+            'extern "C" int test_closes() { return closes; }\n'
+            'extern "C" int test_borrowed_inits() { return borrowed_inits; }\n'
+            'extern "C" void test_validation(int rc) { validation = rc; }\n'
             "struct ContextLeakCheck {\n"
             "    ~ContextLeakCheck() { if (live_contexts != 0) std::abort(); }\n"
             "};\n"
@@ -223,10 +229,11 @@ def kernel_symbol_runtime(tmp_path_factory):
             'extern "C" void simpler_bind_device_fault_monitor(void *) {}\n'
             "DeviceContextHandle create_device_context() { ++live_contexts; return new uint64_t{0}; }\n"
             "void destroy_device_context(DeviceContextHandle ctx) {\n"
-            "    --live_contexts; delete static_cast<uint64_t *>(ctx);\n"
+            "    ++destroys; --live_contexts; delete static_cast<uint64_t *>(ctx);\n"
             "}\n"
             f"static int finalize_failures = {finalize_failures};\n"
             "int finalize_device(DeviceContextHandle) {\n"
+            "    ++closes;\n"
             "    if (finalize_failures > 0) { --finalize_failures; return -77; }\n"
             "    return 0;\n"
             "}\n"
@@ -253,6 +260,21 @@ def kernel_symbol_runtime(tmp_path_factory):
             ),
             encoding="utf-8",
         )
+        if borrowed:
+            with source.open("a", encoding="utf-8") as output:
+                output.write(
+                    "int simpler_kernel_mode_init(DeviceContextHandle ctx, int, const uint8_t *, size_t, "
+                    "const uint8_t *, size_t, const uint8_t *, size_t, const CallConfig *cfg, uint64_t generation) {\n"
+                    "    if (cfg == nullptr || generation != 77 || *static_cast<uint64_t *>(ctx) != 0) std::abort();\n"
+                    f"    ++borrowed_inits; *static_cast<uint64_t *>(ctx) = {0 if init_result == -1001 else 2};\n"
+                    f"    return {init_result};\n"
+                    "}\n"
+                    "int simpler_validate_execution_context(DeviceContextHandle) { return validation; }\n"
+                    "int simpler_validate_caller_stream(DeviceContextHandle, void *) { return validation; }\n"
+                    "int simpler_launch_run_on_stream(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle) "
+                    "{ std::abort(); }\n"
+                )
+
         # These symbols are only resolved during init; any invocation is a test failure.
         # A separate TU keeps the sentinels independent of the C ABI parameter lists.
         sentinels.write_text(
@@ -260,7 +282,7 @@ def kernel_symbol_runtime(tmp_path_factory):
             + "".join(
                 f'extern "C" void {symbol}() {{ std::abort(); }}\n'
                 for symbol in (*unused_symbols, *_KERNEL_LIFECYCLE_SYMBOLS)
-                if symbol not in missing
+                if symbol not in missing and not (borrowed and symbol == "simpler_kernel_mode_init")
             ),
             encoding="utf-8",
         )
@@ -354,6 +376,124 @@ class TestChipWorkerKernelSymbols:
         assert worker.device_id == 0
         worker.finalize()
         assert not worker.initialized
+
+
+class TestChipWorkerBorrowedInit:
+    def test_borrowed_init_uses_shared_binding_and_can_close(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(borrowed=True)
+        observer = ctypes.CDLL(str(runtime))
+        worker = _ChipWorker()
+        worker.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        assert worker.initialized
+        assert worker.runtime_slot_count == 1
+        assert observer.test_borrowed_inits() == 1
+        worker.finalize()
+        assert not worker.initialized
+        assert observer.test_closes() == 1
+        assert observer.test_destroys() == 1
+
+    def test_wrong_context_close_does_not_consume_the_binding(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(borrowed=True)
+        observer = ctypes.CDLL(str(runtime))
+        worker = _ChipWorker()
+        worker.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        before_close, before_destroy = observer.test_closes(), observer.test_destroys()
+        observer.test_validation(-88)
+        try:
+            with pytest.raises(RuntimeError, match="context validation failed with code -88"):
+                worker.finalize()
+            assert worker.initialized
+            assert worker.runtime_slot_count == 1
+            assert observer.test_closes() == before_close
+            assert observer.test_destroys() == before_destroy
+        finally:
+            observer.test_validation(0)
+            worker.finalize()
+
+    def test_failed_borrowed_close_retains_for_retry(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(borrowed=True, finalize_failures=1)
+        observer = ctypes.CDLL(str(runtime))
+        worker = _ChipWorker()
+        worker.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        with pytest.raises(RuntimeError, match="device teardown failed"):
+            worker.finalize()
+        assert worker.initialized
+        assert worker.runtime_slot_count == 1
+        assert observer.test_destroys() == 0
+        worker.finalize()
+        assert observer.test_destroys() == 1
+
+    def test_failed_borrowed_init_closes_before_destroy_and_can_retry(self, kernel_symbol_runtime):
+        failing = kernel_symbol_runtime(borrowed=True, init_result=-66)
+        observer = ctypes.CDLL(str(failing))
+        worker = _ChipWorker()
+        with pytest.raises(RuntimeError, match="borrowed init failed with code -66"):
+            worker.init(str(failing), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        assert not worker.initialized
+        assert worker.runtime_slot_count == 0
+        assert observer.test_closes() == 1
+        assert observer.test_destroys() == 1
+        complete = kernel_symbol_runtime(borrowed=True)
+        worker.init(str(complete), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        worker.finalize()
+
+    def test_unsupported_borrowed_init_does_not_finalize_unclaimed_context(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(borrowed=True, init_result=-1001)
+        observer = ctypes.CDLL(str(runtime))
+        worker = _ChipWorker()
+        with pytest.raises(RuntimeError, match="borrowed init failed with code -1001"):
+            worker.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        assert not worker.initialized
+        assert worker.runtime_slot_count == 0
+        assert observer.test_closes() == 0
+        assert observer.test_destroys() == 1
+
+    def test_failed_rollback_requires_explicit_finalize(self, kernel_symbol_runtime):
+        failing = kernel_symbol_runtime(borrowed=True, init_result=-67, finalize_failures=1)
+        observer = ctypes.CDLL(str(failing))
+        worker = _ChipWorker()
+        with pytest.raises(RuntimeError, match="rollback failed"):
+            worker.init(str(failing), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        assert not worker.initialized
+        assert worker.runtime_slot_count == 1
+        assert observer.test_destroys() == 0
+        with pytest.raises(RuntimeError, match="incomplete rollback"):
+            worker.init(str(failing), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        worker.finalize()
+        assert worker.runtime_slot_count == 0
+        assert observer.test_destroys() == 1
+
+    @pytest.mark.parametrize(
+        "options",
+        [
+            {"borrowed_context_generation": 0},
+            {"enable_sdma": True},
+            {"sim_context_path": "not-a-simulator"},
+            {"sdma_warmup_path": "not-a-warmup"},
+            {"workspace_budget_bytes": 1024},
+            {"manage_workspace": True},
+        ],
+    )
+    def test_unsupported_policy_is_rejected_before_loading(self, options):
+        options = {"borrowed_context_generation": 77, **options}
+        worker = _ChipWorker()
+        with pytest.raises(ValueError):
+            worker.init("not-a-runtime", os.devnull, os.devnull, "", 0, **options)
+        assert not worker.initialized
+        assert worker.runtime_slot_count == 0
+
+    def test_older_runtime_is_refused_before_context_creation(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime()
+        observer = ctypes.CDLL(str(runtime))
+        worker = _ChipWorker()
+        before_destroy = observer.test_destroys()
+        with pytest.raises(RuntimeError, match="requires native caller ordering"):
+            worker.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        assert not worker.initialized
+        assert worker.runtime_slot_count == 0
+        assert observer.test_destroys() == before_destroy
+        worker.init(str(runtime), os.devnull, os.devnull, "", 0)
+        worker.finalize()
 
 
 class TestChipWorkerStateMachine:

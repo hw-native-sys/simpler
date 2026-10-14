@@ -14,8 +14,10 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -62,17 +64,19 @@ public:
     ChipWorker &operator=(const ChipWorker &) = delete;
 
     /// Bind the runtime library, cache platform binaries, and attach the
-    /// calling thread to `device_id`. Can only be called once per lifetime —
+    /// calling thread to owned `device_id`, or validate its borrowed context.
+    /// A successful init can only be called once per lifetime —
     /// the runtime and device cannot be changed after init.
     ///
     /// Every host module contains its own logger implementation and binds it to
     /// the process-owned state before use. On sim, libcpu_sim_context.so is
     /// retained in a process-wide registry because host_runtime.so resolves PTO
     /// simulator hooks from its RTLD_GLOBAL symbol scope.
-    /// `prewarm_config`, when non-null, builds + caches the prebuilt
+    /// On an owned context, `prewarm_config`, when non-null, builds + caches the prebuilt
     /// runtime-arena for its ring sizing right after the device comes up (the
     /// sizing is fork-constant, delivered by COW into init). A no-op for
-    /// runtimes without a prebuilt arena.
+    /// runtimes without a prebuilt arena. Borrowed init reads it for admission
+    /// without prewarming those arenas.
     /// `enable_sdma` opts this Worker into the async-DMA (SDMA) workspace, so
     /// kernels can use get_dma_workspace. Off by default; a Worker that does not
     /// opt in creates no SDMA streams and its kernels read a zero address for
@@ -88,13 +92,20 @@ public:
     /// the cold-start cost off the first TPREFETCH_ASYNC. Read only when
     /// `enable_sdma` is set; an empty path (or an arch that builds no such ELF)
     /// only costs that first-call latency.
+    ///
+    /// borrowed_context_generation selects the caller-owned, already-current RTS
+    /// context. It must be nonzero; absent means the existing owned-device init.
+    /// Borrowed init supports no SDMA, simulator or Program workspace-budget policy.
+    /// The caller keeps its context current through successful finalize. Failed
+    /// rollback requires explicit finalize if it could not close; that worker
+    /// cannot be reinitialized.
 
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
         const std::string &dispatcher_path, int device_id, const CallConfig *prewarm_config = nullptr,
         bool enable_sdma = false, const std::string &sim_context_path = "", const std::string &sdma_warmup_path = "",
         bool collect_across_runs = false, uint64_t workspace_budget_bytes = 0, bool manage_workspace = false,
-        uint32_t requested_pipeline_depth = 0
+        uint32_t requested_pipeline_depth = 0, std::optional<uint64_t> borrowed_context_generation = std::nullopt
     );
 
     /**
@@ -152,6 +163,7 @@ public:
     );
     void launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream = nullptr);
     void validate_caller_stream(void *caller_stream);
+    void validate_execution_context();
     /**
      * Launch `run` ordered behind `predecessor`, which must be a run this
      * ChipWorker launched and has not yet reaped.
@@ -451,6 +463,7 @@ private:
     using SimplerPrepareRunFn = decltype(&simpler_prepare_run);
     using SimplerNativeRunFn = decltype(&simpler_launch_run);
     using SimplerJoinedLaunchFn = decltype(&simpler_launch_run_joined);
+    using ValidateExecutionContextFn = decltype(&simpler_validate_execution_context);
     using ValidateCallerStreamFn = decltype(&simpler_validate_caller_stream);
     using CallerStreamLaunchFn = decltype(&simpler_launch_run_on_stream);
     // Resolved optionally rather than through `load_symbol`: only onboard
@@ -524,6 +537,7 @@ private:
     SimplerRunFn run_fn_ = nullptr;
     SimplerPrepareRunFn prepare_run_fn_ = nullptr;
     SimplerNativeRunFn launch_run_fn_ = nullptr;
+    ValidateExecutionContextFn validate_execution_context_fn_ = nullptr;
     ValidateCallerStreamFn validate_caller_stream_fn_ = nullptr;
     CallerStreamLaunchFn launch_run_on_stream_fn_ = nullptr;
     SimplerJoinedLaunchFn launch_run_joined_fn_ = nullptr;
@@ -626,6 +640,8 @@ private:
         bool pipeline_leased, NativeRunProvenance provenance
     );
     void cleanup_native_runs_noexcept() noexcept;
+    void clear_runtime_binding();
+    void abandon_after_failed_teardown(std::exception_ptr error) noexcept;
 
     /** Fill the write-once teardown copy from the still-live context; never throws. */
     void capture_teardown_report_noexcept() noexcept;
@@ -642,6 +658,8 @@ private:
         RuntimeStorage(const RuntimeStorage &) = delete;
         RuntimeStorage &operator=(const RuntimeStorage &) = delete;
 
+        // Unproven completion retains the allocation for the process lifetime.
+        void abandon() noexcept { data_ = nullptr; }
         void *data() { return data_; }
         const void *data() const { return data_; }
 
@@ -666,11 +684,9 @@ private:
     // that drives this worker's control commands and its run lane.
     bool exported_device_regions_live_ = false;
     std::unique_ptr<ChipRunLane> run_lane_;
-    // device_id_ is set once in init() and never modified afterward. All
-    // ChipWorker callers run on the thread that called init() (the same
-    // thread is the only one that subsequently calls malloc / copy_to /
-    // run / finalize), so plain `int` is sufficient — no cross-thread
-    // synchronization required.
+    // Names a successful binding or an init whose rollback still needs close.
+    // Cleared only after successful teardown. Control calls run on the owning
+    // thread, as enforced by Worker.close().
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;
