@@ -576,7 +576,7 @@ RuntimeContext *runtime_init_data_from_layout(
     void *gm_heap_dev_base, const uint64_t heap_sizes[CHIP_MAX_RING_DEPTH]
 ) {
     RuntimeContext *rt = static_cast<RuntimeContext *>(arena.region_ptr(layout.offsets.off_runtime));
-    memset(rt, 0, sizeof(*rt));
+    memset(static_cast<void *>(rt), 0, sizeof(*rt));
 
     auto *sm_wrap = static_cast<SharedMemoryHandle *>(arena.region_ptr(layout.offsets.off_sm_handle));
     memset(sm_wrap, 0, sizeof(*sm_wrap));
@@ -602,7 +602,7 @@ RuntimeContext *runtime_init_data_from_layout(
     }
 
     auto *mailbox = static_cast<AICoreCompletionMailbox *>(arena.region_ptr(layout.offsets.off_mailbox));
-    memset(mailbox, 0, sizeof(*mailbox));
+    memset(static_cast<void *>(mailbox), 0, sizeof(*mailbox));
 
     return rt;
 }
