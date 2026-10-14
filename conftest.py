@@ -16,6 +16,7 @@ subprocess per runtime so each gets a clean CANN context. See docs/testing.md.
 
 from __future__ import annotations
 
+import argparse
 import faulthandler
 import hashlib
 import json
@@ -142,6 +143,12 @@ def pytest_addoption(parser):
         help="Manual test handling: exclude (default), include, only",
     )
     parser.addoption("--runtime", action="store", default=None, help="Only run tests for this runtime")
+    parser.addoption(
+        "--resource-child",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
     parser.addoption(
         "--level",
         action="store",
@@ -959,6 +966,10 @@ def _resource_child_command(spec, device_ids, platform, manual_mode, cfg):
         "-m",
         "pytest",
         spec.nodeid,
+        # This child is one job the parent already scheduled. Without the flag
+        # a runtime-less job carries no option that distinguishes it, and the
+        # child would schedule itself again.
+        "--resource-child",
         "--device",
         _ps.format_device_range(device_ids),
     ]
@@ -1212,7 +1223,8 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
     if resource_specs:
         jobs = []
         for spec in resource_specs:
-            label = f"{spec.kind} {spec.label} (rt={spec.runtime}, dev={spec.device_count})"
+            runtime_label = spec.runtime if spec.runtime is not None else "any"
+            label = f"{spec.kind} {spec.label} (rt={runtime_label}, dev={spec.device_count})"
 
             def _build(ids, _spec=spec):
                 # Narrow the child to the specific nodeid, not the inherited
@@ -1388,14 +1400,21 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
 def pytest_runtestloop(session):
     """Dispatch Resource + L2 + leftover phases unless caller is in child mode.
 
-    Child mode (runtime-filtered runs, L2/L3 level-filtered runs, a
-    runtime-less resource job narrowed to itself, or --collect-only) skips the
-    dispatcher and falls through to pytest's default runtestloop. Level 4
-    network1 selection is not child mode; it still uses the Resource
-    dispatcher.
+    Child mode (a Resource child, runtime-filtered runs, L2/L3 level-filtered
+    runs, or --collect-only) skips the dispatcher and falls through to
+    pytest's default runtestloop. Level 4 network1 selection is not child
+    mode; it still uses the Resource dispatcher.
     """
     runtime_filter = session.config.getoption("--runtime")
     level_filter = session.config.getoption("--level")
+
+    # One job the parent already scheduled. A runtime-less job carries no other
+    # option that says so, and a parent narrowed to that same single item is
+    # otherwise indistinguishable from its own child — which would run the test
+    # in this process instead of scheduling it, enforcing no device_count and
+    # providing none of the isolation the phase exists for.
+    if session.config.getoption("--resource-child"):
+        return
 
     # Child mode: if the caller filters by runtime, or by the SceneTestCase
     # levels the dispatcher itself uses for children, it wants direct control.
@@ -1424,19 +1443,6 @@ def pytest_runtestloop(session):
     runtimes_all = _collect_st_runtimes(session.items)
     resource_specs = _collect_resource_jobs(session.items, platform, manual_mode)
     if not resource_specs and len(runtimes_all) <= 1 and not level_filter_explicit:
-        return
-
-    # A runtime-less standalone resource child carries no ``--runtime`` to
-    # recognise it by, so the one invocation shape it produces — that job's own
-    # nodeid and nothing else — is child mode here. Dispatching it would hand
-    # the same single job to a subprocess that lands back on this line.
-    if (
-        len(resource_specs) == 1
-        and resource_specs[0].kind == "standalone"
-        and resource_specs[0].runtime is None
-        and len(session.items) == 1
-        and not runtimes_all
-    ):
         return
 
     return _dispatch_test_phases(session, resource_specs)

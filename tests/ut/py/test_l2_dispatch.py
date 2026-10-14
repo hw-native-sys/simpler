@@ -411,3 +411,52 @@ def test_a_maxfail_stop_in_the_leftover_phase_raises_failed():
         cf._dispatch_test_phases(session, [])
 
     assert hook.ran == [("u.py::test_one", "u.py::test_two")]
+
+
+def test_a_resource_child_is_told_it_is_one():
+    # The parent already scheduled this job. A runtime-less job carries no
+    # other option saying so, and the child must not schedule itself again.
+    cf = _load_root_conftest()
+    spec = cf._ResourceJob(
+        kind="standalone", nodeid="t.py::test_two_rank", label="test_two_rank", runtime=None, device_count=2
+    )
+    config = _Config(xdist_active=False, xdist_blocked=False)
+
+    command = cf._resource_child_command(spec, [4, 5], "a2a3", "exclude", config)
+
+    assert "--resource-child" in command
+
+
+def test_a_resource_child_does_not_dispatch_again(monkeypatch):
+    # The item is a resource job, so without the flag this would schedule
+    # itself again — the test is vacuous against an item that no phase claims.
+    cf = _load_root_conftest()
+    jobs = []
+    monkeypatch.setattr(cf._ps, "run_jobs", lambda j, *a, **k: jobs.extend(j) or [])
+    config = _Config(xdist_active=False, xdist_blocked=False)
+    base = config.getoption
+    config.getoption = lambda name, default=None: True if name == "--resource-child" else base(name, default)
+    items = [_Item("t.py::test_two_rank", markers=[_Marker("device_count", 2)])]
+    session = SimpleNamespace(
+        config=config, items=items, testsfailed=0, testscollected=0, shouldfail=False, shouldstop=False
+    )
+
+    assert cf.pytest_runtestloop(session) is None
+    assert jobs == []
+
+
+def test_a_parent_narrowed_to_one_resource_item_still_schedules_its_job(monkeypatch):
+    # The shape a parent and its child share: one selected item, no runtime.
+    # Only the flag separates them, so without it this ran the test in-process
+    # and the scheduler enforced neither device_count nor isolation.
+    cf = _load_root_conftest()
+    jobs = []
+    monkeypatch.setattr(cf._ps, "run_jobs", lambda j, *a, **k: jobs.extend(j) or [])
+    config = _Config(xdist_active=False, xdist_blocked=False)
+    items = [_Item("t.py::test_two_rank", markers=[_Marker("device_count", 2)])]
+    session = SimpleNamespace(
+        config=config, items=items, testsfailed=0, testscollected=0, shouldfail=False, shouldstop=False
+    )
+
+    assert cf.pytest_runtestloop(session) is True
+    assert [(job.nodeid, job.device_count) for job in jobs] == [("t.py::test_two_rank", 2)]
