@@ -462,9 +462,16 @@ TEST(NativeRunOperationLeaseTest, AdmittingLaterRunsRehashesTheTableUnderASleepi
     // Enough later admissions that the table must grow: libstdc++ keeps its load factor at one,
     // so a bucket count that never moved would mean no rehash happened and this case proved
     // nothing.
+    //
+    // Each one is launched as well as prepared, because that is the lifecycle the product
+    // requires: `prepare_native_run_on_slot` admits a successor only while every run already in
+    // the table is `LAUNCHED` or `REAPED`, so a queue of merely-prepared runs is refused at the
+    // second one. Launching each is what makes these admissions real rather than a fixture that
+    // the admission check would have to be relaxed to accept.
     std::vector<ChipWorkerNativeRun> later;
     for (uint32_t slot = 1; slot < kDepth; ++slot) {
         later.push_back(prepare(worker, slot, slot + 1));
+        worker.launch_native_run(later.back());
     }
     {
         std::lock_guard<std::mutex> lk(worker.native_run_mu_);
@@ -491,6 +498,14 @@ TEST(NativeRunOperationLeaseTest, AdmittingLaterRunsRehashesTheTableUnderASleepi
         EXPECT_TRUE(it->second->pending_rc_set);
         EXPECT_EQ(it->second->pending_rc, -7) << "the waiter's own outcome was not the one it recorded";
         EXPECT_EQ(it->second->ops_in_flight, 0u);
+    }
+
+    // The launched runs behind it are finalized here rather than left to teardown, so the
+    // destructor has nothing to report and this case's own finding is the only thing in the log.
+    // Their waits are the stub's, and the outcome under test has already been read above.
+    g_wait_rc = 0;
+    for (const ChipWorkerNativeRun &launched : later) {
+        EXPECT_NO_THROW(worker.finalize_native_run(launched)) << "a later admission could not be retired";
     }
 }
 

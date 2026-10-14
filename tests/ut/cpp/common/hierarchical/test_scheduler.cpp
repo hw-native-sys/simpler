@@ -2966,7 +2966,13 @@ struct MailboxPipelineSchedulerFixture : public ::testing::Test {
         orchestrator.init(&tensor_map, &allocator, &scope, &ready_sub, &ready_next, &manager, [this] {
             scheduler.notify_ready();
         });
-        orchestrator.configure_pipeline_depth(kGrantedSets);
+        // All three budgets together, as `Worker::start` configures them. The launch depth is not
+        // decoration here: at a launch depth below two `Orchestrator::early_launch_prefix_locked`
+        // authorizes nobody, so no acceptance ever fires the orchestrator's ready notification —
+        // and a pipeline of three runs over a grant of three could never launch its second run
+        // either. A case that left it at one would be waiting for a wake the product has no
+        // reason to send.
+        orchestrator.configure_pipeline_depth(kGrantedSets, /*pending_run_depth=*/0, /*launch_depth=*/kGrantedSets);
 
         Scheduler::Config scheduler_config;
         scheduler_config.ring = &allocator;
@@ -2988,6 +2994,12 @@ struct MailboxPipelineSchedulerFixture : public ::testing::Test {
         scheduler_config.can_stage_run_on_worker_cb = [this](RunId run_id, int32_t worker_id) {
             return orchestrator.can_stage_run_on_worker(run_id, worker_id);
         };
+        // The authorization half of early launch, wired as `Worker::start` wires it. Without it a
+        // staged run on a real mailbox endpoint is never moved to ACTIVATE, so it would sit in
+        // its entry for the whole case and teardown would wait on work nothing can finish.
+        scheduler_config.early_launch_runs_cb = [this] {
+            return orchestrator.early_launch_run_ids();
+        };
         scheduler_config.on_consumed_cb = [this](TaskSlot task_slot) {
             orchestrator.on_consumed(task_slot);
         };
@@ -3000,6 +3012,10 @@ struct MailboxPipelineSchedulerFixture : public ::testing::Test {
     }
 
     void TearDown() override {
+        // Before anything is stopped: `drain()` makes the child complete whatever it holds and
+        // release every frame it withheld, so no stop below can be waiting on work only the child
+        // could finish. A case that failed part way leaves exactly that state, and this is what
+        // keeps its finding readable instead of turning it into a CTest timeout.
         child.drain();
         scheduler.request_stop();
         manager.stop_workers();
@@ -3080,9 +3096,16 @@ TEST_F(MailboxPipelineSchedulerFixture, AStagedRequestParkedByFullTransportResum
     EXPECT_TRUE(reported_failures().empty()) << "a full request pool was reported as a task failure";
 
     // One frame is released. The release only queues the hand-back: the child's own loop performs
-    // it, and then carries straight on into the run that frame carried — so from here until this
-    // test says otherwise, that run is still executing and cannot be the reason anything else is
-    // admitted.
+    // it, and then carries straight on into the run that frame carried — publishing that run's
+    // acceptance and then waiting, so from here until this test says otherwise that run is
+    // accepted but *not* terminal, and cannot be the reason anything else is admitted.
+    //
+    // The acceptance matters for more than the claim. It is also the state change that re-opens
+    // the scheduler's preparable scan: `Scheduler::dispatch_ready` runs
+    // `dispatch_preparable_next_level_singles` only when a wake or a drained completion says
+    // something moved, and the acknowledgement itself is invisible to the scheduler — it changes
+    // frame ownership inside the mailbox and nothing reports it. What production always has here
+    // is the run's own progress, which this child publishes the same way.
     const size_t reclaimed_frame = parked[0].frame_index;
     const size_t executing_entry = parked[0].entry_index;
     child.release_one_held_frame();
@@ -3097,6 +3120,10 @@ TEST_F(MailboxPipelineSchedulerFixture, AStagedRequestParkedByFullTransportResum
     // So from here, any state other than `IDLE` is a *new* publication. The load is an acquire,
     // and the parent writes the entry and the frame's header before the state word it releases
     // them with, so everything read below belongs to the publication this observed.
+    //
+    // The wait is for the scheduler's next round, which its own loop reaches without anything
+    // from here: the endpoint is busy, so the loop is spinning rather than parked, and the
+    // acceptance the child just published is the state change that re-opens the preparable scan.
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     bool republished = false;
     while (std::chrono::steady_clock::now() < deadline) {

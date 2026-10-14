@@ -23,6 +23,9 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <functional>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "aicpu/chip_swimlane_collector_aicpu.h"
@@ -65,6 +68,38 @@ void arm_run(
     );
     chip_swimlane_aicpu_init(num_aicore);
 }
+
+/**
+ * The collector's own drain, replenish and collector threads, stopped and finalized on every
+ * exit path.
+ *
+ * A case that opens more runs than `PLATFORM_PROF_SLOT_COUNT` needs this: a record buffer is
+ * popped from its core's free queue at device-side init and handed to the host at flush, and only
+ * these threads return it. A destructor rather than a tail call, because a fatal `ASSERT_*`
+ * returns from the case body — leaving the collector running would warn "destroyed without
+ * finalize()" and leak every paired buffer it allocated, which is noise on top of the real
+ * finding.
+ */
+class ScopedCollectorReceiver {
+public:
+    explicit ScopedCollectorReceiver(ChipSwimlaneCollector &collector) :
+        collector_(collector) {
+        collector_.start([](std::function<void()> body) {
+            return std::thread(std::move(body));
+        });
+    }
+
+    ScopedCollectorReceiver(const ScopedCollectorReceiver &) = delete;
+    ScopedCollectorReceiver &operator=(const ScopedCollectorReceiver &) = delete;
+
+    ~ScopedCollectorReceiver() {
+        collector_.stop();
+        collector_.finalize(nullptr, terminal_test_free);
+    }
+
+private:
+    ChipSwimlaneCollector &collector_;
+};
 
 }  // namespace
 
@@ -449,6 +484,14 @@ TEST(ChipSwimlaneRunTerminalTest, ARunThatFoundNoBankStillCollectsAndIsServedOnT
     ASSERT_NE(shm, nullptr);
     const int cores[] = {0};
 
+    // The receiver, which this case needs and the shorter ones above do not. A run's record
+    // buffer is popped from its core's free queue at `chip_swimlane_aicpu_init` and handed to the
+    // host at `flush`; only the drain and replenish threads put it back. The queue holds
+    // `PLATFORM_PROF_SLOT_COUNT` buffers, and this case opens more runs than that, so without a
+    // receiver the last init finds the queue empty and the run records nothing. Releasing a
+    // *terminal bank* does not help: banks and record buffers are separate pools.
+    ScopedCollectorReceiver receiver(collector);
+
     // Every bank there is, held by a live run of its own.
     std::vector<int> banks;
     std::vector<uint64_t> epochs;
@@ -463,6 +506,10 @@ TEST(ChipSwimlaneRunTerminalTest, ARunThatFoundNoBankStillCollectsAndIsServedOnT
         );
         ASSERT_EQ(chip_swimlane_aicpu_complete_task(/*core_id=*/0, /*thread_idx=*/0, /*task=*/1, 10, 20), 0);
         chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, /*core_num=*/1);
+        // This thread is the only producer, and it has stopped: the flush above was its last
+        // store. So the drain can be taken to a quiescent point here, which is what returns the
+        // buffer this run held to the pool the next one pops from.
+        collector.quiesce();
     }
 
     // The run beyond the bank count. It is refused a bank, and the runner's answer to that is
@@ -487,9 +534,10 @@ TEST(ChipSwimlaneRunTerminalTest, ARunThatFoundNoBankStillCollectsAndIsServedOnT
             0
         );
     }
-    chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, /*core_num=*/1);
     EXPECT_EQ(get_perf_buffer_state(shm, 0)->head.total_record_count, 4u)
         << "a run that found no terminal bank stopped collecting the records it could still take";
+    chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, /*core_num=*/1);
+    collector.quiesce();
 
     // And it published into nobody else's bank. Every holder's snapshot still reads as its own
     // one-record run rather than this four-record one.
@@ -524,8 +572,6 @@ TEST(ChipSwimlaneRunTerminalTest, ARunThatFoundNoBankStillCollectsAndIsServedOnT
     // Mapped by epoch, so the previous holder of that bank no longer reads out of it.
     EXPECT_FALSE(collector.read_run_terminal_snapshot(static_cast<uint32_t>(served), epochs[1]).valid)
         << "a reused bank still answered under the epoch that released it";
-
-    collector.finalize(nullptr, terminal_test_free);
 }
 
 // Epoch zero is a run with no identity, so it holds no bank and takes none.
