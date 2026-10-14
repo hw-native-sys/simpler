@@ -36,9 +36,7 @@ TEST(RunProgressSlotsTest, AnUnclaimedSetDescribesNoRun) {
     EXPECT_EQ(slots.state_of(kFirst), RunProgressState::Idle);
 }
 
-TEST(RunProgressSlotsTest, AnEmptyGrantBuildsAnEmptyTable) {
-    EXPECT_TRUE(RunProgressSlots::build(0).empty());
-}
+TEST(RunProgressSlotsTest, AnEmptyGrantBuildsAnEmptyTable) { EXPECT_TRUE(RunProgressSlots::build(0).empty()); }
 
 TEST(RunProgressSlotsTest, AClaimedSetCarriesItsOwnRunsStates) {
     RunProgressSlots slots;

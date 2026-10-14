@@ -75,9 +75,7 @@ public:
     const T *find(size_t slot) const noexcept { return slot < slots_.size() ? &slots_[slot] : nullptr; }
 
     /** Give every granted set the same value, without changing how many there are. */
-    void fill(const T &value) {
-        std::fill(slots_.begin(), slots_.end(), value);
-    }
+    void fill(const T &value) { std::fill(slots_.begin(), slots_.end(), value); }
 
     auto begin() noexcept { return slots_.begin(); }
     auto end() noexcept { return slots_.end(); }

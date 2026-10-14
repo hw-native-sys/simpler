@@ -109,7 +109,8 @@ public:
     RunProgressState state_of(uint32_t pipeline_slot, uint64_t run_epoch) const {
         if (run_epoch == 0) return RunProgressState::Idle;
         const Slot *slot = slots_.find(pipeline_slot);
-        if (slot == nullptr || slot->run_epoch.load(std::memory_order_acquire) != run_epoch) return RunProgressState::Idle;
+        if (slot == nullptr || slot->run_epoch.load(std::memory_order_acquire) != run_epoch)
+            return RunProgressState::Idle;
         const RunProgressState state = slot->state.load(std::memory_order_acquire);
         if (slot->run_epoch.load(std::memory_order_acquire) != run_epoch) return RunProgressState::Idle;
         return state;
