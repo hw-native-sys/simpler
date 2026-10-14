@@ -36,13 +36,13 @@ For where dispatched tasks come from, see [scheduler.md](scheduler.md).
 ```cpp
 class WorkerManager {
 public:
-    // Registration (before init). `task_frame_count` selects capacity one or
-    // the two-frame endpoint that can stage one successor.
+    // Registration (before init). `granted_sets` sizes the endpoint's run-state
+    // table; request frames have a separate fixed count.
     void add_next_level(void *mailbox, int child_pid = -1,
-                        uint32_t task_frame_count = 1);
+                        uint32_t granted_sets = 1);
     void add_next_level_at(int32_t worker_id, void *mailbox,
                            int child_pid = -1,
-                           uint32_t task_frame_count = 1);
+                           uint32_t granted_sets = 1);
     void add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint);
     void add_sub(void *mailbox, int child_pid = -1);
 
@@ -64,7 +64,7 @@ private:
         int32_t worker_id;
         void *mailbox;
         int child_pid;
-        uint32_t task_frame_count;
+        uint32_t granted_sets;
     };
     struct LocalSubEntry {
         void *mailbox;
@@ -232,27 +232,16 @@ each one against `offsetof` on the C++ struct at import: the child writes these
 words in the parent's address space, so a field it places differently is a store
 landing on another field in a live process, which no compiler can catch.
 
-`task_frame_count` is an endpoint contract, not a count inferred from the
-allocation size. Each direct chip child decides its own count after `init` and
-publishes it with its granted depth; parent registration uses that published
-number, while whole-run admission uses the minimum depth across the chip set.
-The count crosses rather than being derived on both sides because only an
-initialized `ChipWorker` can answer the capability it depends on, and the parent
-must publish to exactly the frames its child polls.
-
-The Python facade's rule has two branches. A direct A2/A3 onboard chip child
-whose published pipeline depth is at least two takes two frames — that endpoint
-stages a successor behind an active run at any launch depth. Every other route
-takes a second frame only where the child resolved that it may order one native
-submission behind another, which is its runtime's published joined-launch
-capability met with the requested launch depth and the granted set count: every
-onboard runtime — `host_build_graph` and `tensormap_and_ringbuffer`, on both
-A2/A3 and A5 — publishes that capability at `launch_depth >= 2`. SUB, nested-Worker, simulation (whose backend
-answers that capability with a flat no), and every depth-one local endpoint use
-one task frame and do not advertise successor staging. A launched successor
-occupies a frame of its own, so a Worker's configured launch depth is bounded by
-the frames its endpoints negotiated as well as by the granted slot depth. Remote
-endpoints have capacity one and advance their framed transport incrementally.
+`granted_sets` is the run-resource capacity contract, not a request-frame count.
+Each direct chip child publishes its resolved grant after `init`; the parent
+validates it against the mailbox allocation and registers that same grant. The
+mailbox has a fixed pool of `MAILBOX_REQUEST_FRAMES` payload frames, reusable as
+soon as the child copies a submission, and a separate run-state table with
+`granted_sets + MAILBOX_REQUEST_FRAMES` entries. Thus a frame hand-off can wait
+for a run-resource set without keeping a payload frame occupied for the run's
+lifetime. Whole-run admission is bounded by the minimum child grant and launch
+capability. Remote endpoints have capacity one and advance their framed
+transport incrementally.
 
 The capability is answered per device context, so a level-3 Worker configured at
 `launch_depth >= 2` passes that request to every one of its local device
@@ -260,28 +249,29 @@ children and each endpoint negotiates its own count. A nested Worker inherits
 nothing: its budgets come from its own configuration. Remote and mpirun
 manifests carry no launch depth, so those subtrees keep the default.
 
-### 3.1 Single-frame progress path
+### 3.1 Single-set progress path
 
 `LocalMailboxEndpoint::submit_progress` copies `CallConfig`,
 `PipelineSlotLease`, the 32-byte callable digest, and the length-prefixed
-`TaskArgs` blob into task frame 0 and publishes `TASK_READY`. The Scheduler
-keeps driving the owning endpoint lane and observes acceptance or completion
-through `poll_progress`; it does not wait inside one task call. A steady-clock
-liveness sample turns a child that exits before completion into
-`ENDPOINT_FAILURE`.
+`TaskArgs` blob into a free request frame and publishes `TASK_READY`. The
+Scheduler keeps driving the endpoint lane and observes acceptance or completion
+through `poll_progress`; it does not wait inside a task call. A steady-clock
+liveness sample turns a child that exits before completion into `ENDPOINT_FAILURE`.
 
-The child uses `_run_mailbox_loop`, polls the base control state and task frame
-0, resolves the digest to a private local slot, executes the task synchronously,
-writes its error tuple, and then publishes `TASK_DONE`. Capacity remains one;
-the separate frame prevents a control request from overwriting task state.
+The child uses `_run_mailbox_loop`, polls the base control state and request
+frames, resolves the digest to a private local slot, executes the task
+synchronously, writes its error tuple, and publishes `TASK_DONE`. Run admission
+remains one; the separate control frame prevents a control request from
+overwriting task state.
 
-### 3.2 Two-frame progress path
+### 3.2 Staged progress path
 
-A two-frame `LocalMailboxEndpoint` advertises `supports_frame_staging` and is
+A `LocalMailboxEndpoint` advertises `supports_frame_staging` and is
 driven through `submit_progress`, `activate_progress`, and `poll_progress`.
-The Scheduler thread is the only parent-side progress owner. The child also
-uses one `run_two_frame_loop`; it services the separate control base, stages
-both task frames, and owns the bounded active/prepared native lifecycles.
+The Scheduler thread is the only parent-side progress owner. The child uses
+`run_two_frame_loop`; it services the separate control frame, stages requests,
+and owns the bounded active/prepared native lifecycles. Request-frame capacity
+limits outstanding hand-offs; run-state capacity comes from the grant.
 
 The ordinary active dispatch and the staged successor use distinct initial
 states:
@@ -445,8 +435,8 @@ terminal events, brings its in-flight count to zero, and joins the one progress
 thread. The Scheduler is joined only after worker threads can no longer invoke
 completion callbacks, and `WorkerManager::stop()` then clears the pools.
 
-A single-frame endpoint has no staged frame to cancel; its active task
-terminalizes before its dispatcher thread joins. The Python facade owns every
+A single-set endpoint has no staged run to cancel; its active task terminalizes
+before its dispatcher thread joins. The Python facade owns every
 child PID. After native worker teardown it broadcasts `SHUTDOWN` to all child
 base frames, reaps them under one shared deadline, and closes their shared-memory
 objects. C++ endpoint code may observe or reap an early child exit for liveness

@@ -115,16 +115,16 @@ Worker::~Worker() {
     if (initialized_) close();
 }
 
-void Worker::add_worker(WorkerType type, void *mailbox, int child_pid, uint32_t task_frame_count) {
+void Worker::add_worker(WorkerType type, void *mailbox, int child_pid, uint32_t granted_sets) {
     if (initialized_) throw std::runtime_error("Worker: add_worker after init");
     if (type == WorkerType::NEXT_LEVEL) {
-        manager_.add_next_level(mailbox, child_pid, task_frame_count);
+        manager_.add_next_level(mailbox, child_pid, granted_sets);
     } else manager_.add_sub(mailbox, child_pid);
 }
 
-void Worker::add_next_level_worker(int32_t worker_id, void *mailbox, int child_pid, uint32_t task_frame_count) {
+void Worker::add_next_level_worker(int32_t worker_id, void *mailbox, int child_pid, uint32_t granted_sets) {
     if (initialized_) throw std::runtime_error("Worker: add_next_level_worker after init");
-    manager_.add_next_level_at(worker_id, mailbox, child_pid, task_frame_count);
+    manager_.add_next_level_at(worker_id, mailbox, child_pid, granted_sets);
 }
 
 void Worker::add_remote_l3_socket(

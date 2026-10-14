@@ -35,9 +35,9 @@ static_assert(kDefaultRunResourceSets >= 1, "a context must be able to hold at l
  *
  * A set is the group of per-run resources a run borrows for its whole lifetime;
  * this class owns which of them exist and who holds each one, and nothing about
- * what is in one. The count is whatever the context was granted — there is no
- * ceiling here — and a lease carries the generation that makes a released set
- * unusable to its former holder.
+ * what is in one. The count is the finite grant selected for this context, and a
+ * lease carries the generation that makes a released set unusable to its former
+ * holder.
  *
  * Three counts, which together always equal the grant's worth of sets that have
  * ever been handed out:

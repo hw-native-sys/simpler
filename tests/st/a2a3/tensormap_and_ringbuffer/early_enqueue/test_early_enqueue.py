@@ -240,7 +240,7 @@ def _negotiated_frame_counts(worker):
     context: a Worker with two devices negotiates two counts, and a case that drives both has to
     hold each of them.
     """
-    return [int(count) for count in worker._chip_task_frame_counts]  # noqa: SLF001 -- white-box negotiation
+    return [int(count) for count in worker._chip_run_resource_set_counts]  # noqa: SLF001 -- white-box negotiation
 
 
 @contextlib.contextmanager

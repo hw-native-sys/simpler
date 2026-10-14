@@ -32,10 +32,11 @@
  * whose resources carry an unspecified or out-of-range kind, an out-of-range
  * class, or a byte count incompatible with the mode and resource class.
  *
- * There is no upper bound on `pipeline_depth`: it is what a runtime says it can
- * support, and how much of that a context uses is the worker's grant. Every
- * owner of a per-run resource is sized to that grant, so a declaration above any
- * particular number costs nothing until a run holds the set.
+ * There is no fixed ABI ceiling on `pipeline_depth`: it is what a runtime says
+ * it can support. The Worker chooses the context's grant, and owners size their
+ * per-run tables and native run storage to that grant during initialization.
+ * This count bounds admitted run resources; it is not a byte budget for device
+ * workspace, which has its own allocator and optional accounting limit.
  *
  * The unspecified-kind rule is what catches a `resource_count` larger than the
  * entries a runtime actually filled in: the trailing entries are still zeroed,

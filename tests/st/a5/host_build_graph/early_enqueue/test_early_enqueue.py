@@ -193,7 +193,7 @@ def _negotiated_frame_count(worker):
     endpoint with exactly that number. Reading the parent's record is therefore reading the route
     a case actually runs on, not the frames the mailbox happens to be laid out for.
     """
-    counts = worker._chip_task_frame_counts  # noqa: SLF001 -- white-box negotiation observation
+    counts = worker._chip_run_resource_set_counts  # noqa: SLF001 -- white-box negotiation observation
     assert len(counts) == 1, f"these cases drive one chip endpoint, got {len(counts)} frame-count records"
     return int(counts[0])
 

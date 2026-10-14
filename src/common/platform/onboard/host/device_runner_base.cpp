@@ -299,16 +299,16 @@ DeviceRunnerBase::RunResourceStaging DeviceRunnerBase::build_run_resources(size_
     // The three that carry constructor arguments. Built here rather than filled
     // in after a resize, so no table is ever visible holding a null entry.
     staged.arena_banks = RunResourceSlots<std::unique_ptr<ArenaBank>>::build(granted);
-    for (std::unique_ptr<std::unique_ptr<ArenaBank>> &bank : staged.arena_banks) {
-        *bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, this);
+    for (std::unique_ptr<ArenaBank> &bank : staged.arena_banks) {
+        bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, this);
     }
     staged.run_fences = RunResourceSlots<std::unique_ptr<RunCompletionFence>>::build(granted);
-    for (std::unique_ptr<std::unique_ptr<RunCompletionFence>> &fence : staged.run_fences) {
-        *fence = std::make_unique<RunCompletionFence>(make_acl_event_ops());
+    for (std::unique_ptr<RunCompletionFence> &fence : staged.run_fences) {
+        fence = std::make_unique<RunCompletionFence>(make_acl_event_ops());
     }
     staged.caller_orders = RunResourceSlots<std::unique_ptr<RunCallerOrder>>::build(granted);
-    for (std::unique_ptr<std::unique_ptr<RunCallerOrder>> &order : staged.caller_orders) {
-        *order = std::make_unique<RunCallerOrder>(
+    for (std::unique_ptr<RunCallerOrder> &order : staged.caller_orders) {
+        order = std::make_unique<RunCallerOrder>(
             make_acl_event_ops(),
             [](void *stream, void *event) {
                 return static_cast<int>(aclrtStreamWaitEvent(stream, event));

@@ -563,32 +563,15 @@ def _assert_mailbox_wire_constants() -> None:
 _assert_mailbox_wire_constants()
 
 
-def _local_task_frame_count(platform: str, _runtime: str, pipeline_depth: int, joins_native_launches: bool) -> int:
-    """How many run-resource sets this endpoint negotiates: one per run its child may hold.
-
-    Not a frame count any more. Payload transport is a separate, fixed pool of
-    ``MAILBOX_REQUEST_FRAMES`` frames whose lifetime ends when the child has
-    copied a submission's bytes out, and what this number sizes is the run-state
-    entry table — ``M = granted + K`` — which is held for the run itself. The
-    name is kept because it is the word the two sides cross in at startup.
-
-    A second set is what a successor occupies while the run ahead of it is still
-    live, and the two routes that have one reach it differently. a2a3's endpoint
-    stages a successor behind an active run whatever the launch depth, so its
-    count follows the resource sets the child granted. Every other route
-    negotiates a second set only where that child can actually order one
-    submission behind another: ``joins_native_launches`` is the child's own
-    resolved answer, its runtime's published capability met with the launch
-    depth requested and the sets granted, so a route that cannot join keeps the
-    single-set path rather than staging a run that could never launch.
-    """
-    if pipeline_depth >= 2 and (platform == "a2a3" or joins_native_launches):
-        return int(pipeline_depth)
-    return 1
+def _local_run_resource_set_count(pipeline_depth: int) -> int:
+    """Return the resource-set grant resolved by the initialized child."""
+    if pipeline_depth < 1:
+        raise ValueError("a chip worker must grant at least one run-resource set")
+    return int(pipeline_depth)
 
 
 # `Orchestrator::configure_pipeline_depth` takes the budget as a uint32_t.
-_PENDING_RUN_DEPTH_MAX = 2**32 - 1
+_UINT32_MAX = 2**32 - 1
 
 # What a Worker requests when `pipeline_depth` is unset. Two is what every backend granted before
 # the key existed, so an unconfigured Worker keeps today's capacity and commits no third set —
@@ -612,8 +595,8 @@ def _validated_pending_run_depth(config: dict, level: int) -> int:
         raise ValueError(f"Worker pending_run_depth must be an int, got {type(value).__name__}")
     if value < 0:
         raise ValueError(f"Worker pending_run_depth must be >= 0, got {value}")
-    if value > _PENDING_RUN_DEPTH_MAX:
-        raise ValueError(f"Worker pending_run_depth must be <= {_PENDING_RUN_DEPTH_MAX}, got {value}")
+    if value > _UINT32_MAX:
+        raise ValueError(f"Worker pending_run_depth must be <= {_UINT32_MAX}, got {value}")
     return value
 
 
@@ -648,15 +631,13 @@ def _validated_launch_depth(config: dict, level: int) -> int:
 def _validated_pipeline_depth(config: dict, level: int) -> int:
     """How many native run-resource sets this Worker requests, validated before any side effect.
 
-    One set holds everything a run owns while it is in flight — its parameters, arena bank, graph
-    definition, scheduler state, host staging, result region and completion events — so this is
-    what bounds how many runs may be prepared and accepted by the device at once. The default
-    request is two, which is what every backend granted before this key existed; a larger request
-    is honoured only where the child publishes support for it, and is refused rather than silently
+    This count bounds concurrent runs and is carried across the C++ uint32 ABI. It is not a byte
+    budget for the resources each set may allocate. The default remains two; a larger request is
+    honoured only where the child publishes support for it, and is refused rather than silently
     reduced.
 
-    It is a count, not a byte budget: a set commits its storage on the first run that holds it,
-    sized by that run's own layout.
+    Mailbox tables, runner tables and native run storage are sized to the grant during startup.
+    Device workspace bytes have a separate budget and allocation path.
     """
     if "pipeline_depth" not in config:
         return _DEFAULT_PIPELINE_DEPTH_REQUEST
@@ -668,6 +649,8 @@ def _validated_pipeline_depth(config: dict, level: int) -> int:
         raise ValueError(f"Worker pipeline_depth must be an int, got {type(value).__name__}")
     if value < 1:
         raise ValueError(f"Worker pipeline_depth must be >= 1, got {value}")
+    if value > _UINT32_MAX:
+        raise ValueError(f"Worker pipeline_depth must be <= {_UINT32_MAX}, got {value}")
     return value
 
 
@@ -2262,22 +2245,18 @@ def _read_run_entry_identity(buf: memoryview) -> tuple[int, int, int, int, int, 
     )
 
 
-def _write_entry_error(buf: memoryview, code: int, msg: str = "") -> None:
-    """Write an (error code, message) pair into one run-state entry.
-
-    The message is UTF-8-encoded and truncated to ``MAILBOX_ERROR_MSG_SIZE - 1`` bytes so a NUL
-    terminator always fits — the C++ reader assumes NUL-terminated content. Both are written
-    before the terminal state, which is what lets the parent read them from the instant it
-    observes that state.
-    """
-    struct.pack_into("i", buf, _OFF_ENTRY_ERROR, code)
+def _write_error_fields(buf, code: int, msg: str, code_offset: int, message_offset: int) -> None:
+    """Write an error code and NUL-terminated, zero-padded UTF-8 message."""
+    struct.pack_into("i", buf, code_offset, code)
     encoded = msg.encode("utf-8", "replace")
     n = min(len(encoded), MAILBOX_ERROR_MSG_SIZE - 1)
-    start = _OFF_ENTRY_ERROR_TEXT
-    buf[start : start + n] = encoded[:n]
-    # Zero-pad the rest so stale content from a previous occupant of this entry
-    # never leaks into the current error report.
-    buf[start + n : start + MAILBOX_ERROR_MSG_SIZE] = b"\x00" * (MAILBOX_ERROR_MSG_SIZE - n)
+    buf[message_offset : message_offset + n] = encoded[:n]
+    buf[message_offset + n : message_offset + MAILBOX_ERROR_MSG_SIZE] = b"\x00" * (MAILBOX_ERROR_MSG_SIZE - n)
+
+
+def _write_entry_error(buf: memoryview, code: int, msg: str = "") -> None:
+    """Write an error pair into one run-state entry before its terminal state."""
+    _write_error_fields(buf, code, msg, _OFF_ENTRY_ERROR, _OFF_ENTRY_ERROR_TEXT)
 
 
 def _publish_native_promotion(entry_addr: int, entry_buf: memoryview, identity: tuple, disposition: int) -> bool:
@@ -2537,14 +2516,7 @@ def _write_error(buf, code: int, msg: str = "") -> None:
     NUL-terminated content. On success (code=0) callers may pass an empty
     message; the region is zero-padded.
     """
-    struct.pack_into("i", buf, _OFF_ERROR, code)
-    encoded = msg.encode("utf-8", "replace")
-    n = min(len(encoded), MAILBOX_ERROR_MSG_SIZE - 1)
-    start = MAILBOX_OFF_ERROR_MSG
-    buf[start : start + n] = encoded[:n]
-    # Zero-pad the remaining bytes so stale content from a previous dispatch
-    # never leaks into the current error report.
-    buf[start + n : start + MAILBOX_ERROR_MSG_SIZE] = b"\x00" * (MAILBOX_ERROR_MSG_SIZE - n)
+    _write_error_fields(buf, code, msg, _OFF_ERROR, MAILBOX_OFF_ERROR_MSG)
 
 
 def _read_error_msg(buf) -> str:
@@ -4258,15 +4230,10 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     # per-rank host-side stream sync budget only covers actual op execution
     # rather than absorbing peer-rank init skew.
     #
-    # The frame count is decided here, by the side that knows: only an
-    # initialized ChipWorker can answer whether its runtime joins native
-    # launches, and the parent must publish to exactly the frames this loop
-    # polls. So both numbers cross as this child's own answer rather than being
-    # derived twice — see `_read_chip_startup_grants` for the word they cross in.
-    task_frame_count = _local_task_frame_count(
-        platform, runtime, int(cw.pipeline_depth), bool(cw.supports_joined_native_launch)
-    )
-    _PIPELINE_LEASE_FMT.pack_into(buf, _OFF_PIPELINE_LEASE, int(cw.pipeline_depth), task_frame_count, 0)
+    # The child publishes the resolved runtime depth and the grant that sizes
+    # its run-state entries. Request frames have a fixed, independent count.
+    granted_sets = _local_run_resource_set_count(int(cw.pipeline_depth))
+    _PIPELINE_LEASE_FMT.pack_into(buf, _OFF_PIPELINE_LEASE, int(cw.pipeline_depth), granted_sets, 0)
     _mailbox_store_i32(state_addr, _INIT_READY)
     sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
     sys.stderr.flush()
@@ -4285,7 +4252,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             chip_platform=platform,
             chip_runtime=runtime,
             prepared=prepared,
-            granted_sets=task_frame_count,
+            granted_sets=granted_sets,
             chip_rank=chip_rank,
             provider_region_store=provider_region_store,
         )
@@ -5671,7 +5638,7 @@ class Worker:
         # until that child publishes what it granted, because only an
         # initialized ChipWorker knows whether its runtime joins native
         # launches; this side publishes to exactly these frames.
-        self._chip_task_frame_counts: list[int] = []
+        self._chip_run_resource_set_counts: list[int] = []
         # Teardown observations copied out of each reaped chip child's mailbox,
         # keyed by that child's pid. Absent means the child never reaped, which
         # is a different answer from an uncommitted record.
@@ -9203,9 +9170,9 @@ class Worker:
             # documented in issue #897.  A chip that fails or dies during init
             # raises here rather than spinning forever.
             self._await_children_ready(self._chip_shms, self._chip_pids, "chip", deadline)
-            chip_depths, chip_frame_counts = self._read_chip_startup_grants()
+            chip_depths, chip_grants = self._read_chip_startup_grants()
             direct_chip_pipeline_depth = self._granted_chip_pipeline_depth(chip_depths)
-            self._chip_task_frame_counts = self._granted_chip_task_frame_counts(chip_frame_counts, chip_depths)
+            self._chip_run_resource_set_counts = self._granted_chip_run_resource_sets(chip_grants, chip_depths)
 
         # Fork next-level Worker children (L4+ with Worker children).
         # Each child process eagerly inits the inner Worker, which forks its own
@@ -9302,25 +9269,22 @@ class Worker:
         # is this Worker's logical admission bound, with 0 deriving it from the first;
         # `_launch_depth` bounds how many of those runs may have device work launched at once, and
         # cannot exceed the slot capability because a launched run holds its slot until it ends.
-        # Nor the frames its endpoints negotiated: a launched successor occupies a task frame of
-        # its own for as long as it is live, so a single-frame endpoint carries one launched run
-        # whatever depth was requested. A route with no local chip child negotiates no frames and
-        # is bounded by the slot capability alone.
+        # Nor the run-resource grant at any chip endpoint. The fixed request-frame
+        # pool only carries hand-offs and does not limit live runs.
         dw.configure_pipeline_depth(
             direct_chip_pipeline_depth,
             self._pending_run_depth,
-            min([self._launch_depth, direct_chip_pipeline_depth, *self._chip_task_frame_counts]),
+            min([self._launch_depth, direct_chip_pipeline_depth, *self._chip_run_resource_set_counts]),
         )
 
         # Register chip workers as NEXT_LEVEL (L3). The child pid lets the C++
         # endpoint fail a dispatch whose child died instead of spinning on a
-        # mailbox that can no longer be completed. The frame count is the one its
-        # child published and polls, so the parent never writes to a frame the
-        # child is not reading.
+        # mailbox that can no longer be completed. The grant is the child
+        # resource-set count validated against the mailbox allocation.
         if device_ids:
             _require_matching_pids(self._chip_shms, self._chip_pids, "chip")
-            for shm, pid, task_frame_count in zip(self._chip_shms, self._chip_pids, self._chip_task_frame_counts):
-                dw.add_next_level_worker(_mailbox_addr(shm), pid, task_frame_count)
+            for shm, pid, granted_sets in zip(self._chip_shms, self._chip_pids, self._chip_run_resource_set_counts):
+                dw.add_next_level_worker(_mailbox_addr(shm), pid, granted_sets)
 
         # Register Worker children as NEXT_LEVEL (L4+)
         if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):
@@ -12862,45 +12826,36 @@ class Worker:
         return granted
 
     def _read_chip_startup_grants(self) -> tuple[list[int], list[int]]:
-        """What each chip child published at INIT_READY: the sets it granted and the frames it polls.
+        """Read each chip child's resolved depth and run-resource grant.
 
         INIT_READY repurposes the base frame's lease word as startup metadata — slot_id carries the
-        child's depth advertisement and the field a task-frame lease keeps reserved carries the task
-        frame count it negotiated. Task frames are separate regions, so a dispatch lease keeps its
-        own meaning and its reserved-must-be-zero check.
+        child's depth advertisement; the reserved field carries its resource-set grant. Request
+        frames are separate regions, so a dispatch lease keeps its own meaning.
         """
         depths: list[int] = []
-        frame_counts: list[int] = []
+        grants: list[int] = []
         for shm in self._chip_shms:
             buf = shm.buf
             assert buf is not None
-            granted_depth, granted_frames, _spare = _PIPELINE_LEASE_FMT.unpack_from(buf, _OFF_PIPELINE_LEASE)
+            granted_depth, granted_sets, _spare = _PIPELINE_LEASE_FMT.unpack_from(buf, _OFF_PIPELINE_LEASE)
             depths.append(granted_depth)
-            frame_counts.append(granted_frames)
-        return depths, frame_counts
+            grants.append(granted_sets)
+        return depths, grants
 
-    def _granted_chip_task_frame_counts(self, per_child: list[int], depths: list[int]) -> list[int]:
-        """Each chip child's negotiated task-frame count, or a startup failure.
-
-        The child decides it: only an initialized ChipWorker can answer whether its runtime joins
-        native launches, and this side publishes to exactly the frames that child polls. So this
-        validates rather than re-derives — a count above the frames this mailbox was created with,
-        above the sets that child granted, or below one would have the parent and the child
-        disagree about which frames exist, and a frame the child never polls is a dispatch that
-        never completes.
-        """
+    def _granted_chip_run_resource_sets(self, per_child: list[int], depths: list[int]) -> list[int]:
+        """Validate each child grant against its resolved depth and mailbox allocation."""
         if len(per_child) != len(depths):
-            raise RuntimeError(f"chip workers published {len(per_child)} frame counts for {len(depths)} depths")
-        created_frames = self._mailbox_granted_sets
+            raise RuntimeError(f"chip workers published {len(per_child)} resource grants for {len(depths)} depths")
+        mailbox_grant = self._mailbox_granted_sets
         invalid = [
             (count, depth)
             for count, depth in zip(per_child, depths)
-            if count < 1 or count > created_frames or count > depth
+            if count < 1 or count > mailbox_grant or count > depth
         ]
         if invalid:
             raise RuntimeError(
                 f"chip worker published invalid run-resource counts (count, granted depth): {invalid}; "
-                f"this mailbox was created for {created_frames} granted set(s)"
+                f"this mailbox was created for {mailbox_grant} granted set(s)"
             )
         return list(per_child)
 

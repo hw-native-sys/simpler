@@ -395,9 +395,8 @@ private:
     static bool all_dispatches_accepted(const std::shared_ptr<RunState> &run);
 
     /**
-     * Re-derive `early_launch_run_id_`, reporting whether this call is the one
-     * that authorized a run. The caller owes the scheduler a wake on true,
-     * issued outside `runs_mu_`.
+     * Recompute the authorized early-launch prefix and report whether it added
+     * a run. The caller owes the scheduler a wake on true, outside `runs_mu_`.
      *
      * Called at every transition that can change the answer: the last
      * acceptance arriving, submission closing, a lease refresh at retirement,
@@ -406,6 +405,10 @@ private:
      * endpoint's staging event.
      */
     bool refresh_early_launch_locked();
+    /** Callers hold `runs_mu_`; return the first currently authorized successor. */
+    RunId early_launch_first_locked() const;
+    /** Callers hold `runs_mu_`; return the authorized successor after a FIFO index. */
+    RunId early_launch_successor_locked(size_t predecessor_index) const;
     /** The FIFO prefix authorized to launch early right now; `runs_mu_` is held. */
     std::vector<RunId> early_launch_prefix_locked() const;
     void activate_fifo_head();

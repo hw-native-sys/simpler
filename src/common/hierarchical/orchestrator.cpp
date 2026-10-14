@@ -493,14 +493,9 @@ std::vector<RunId> Orchestrator::early_launch_prefix_locked() const {
     // to be ordered behind. The walk stops at the first run that fails either
     // test, so an authorization never skips a run.
     for (size_t index = 0; index + 1 < run_fifo_.size() && ids.size() + 1 < launch_depth_; ++index) {
-        auto predecessor = runs_.find(run_fifo_[index]);
-        if (predecessor == runs_.end() || !all_dispatches_accepted(predecessor->second)) break;
-        auto candidate = runs_.find(run_fifo_[index + 1]);
-        if (candidate == runs_.end()) break;
-        const std::shared_ptr<RunState> &successor = candidate->second;
-        if (successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) break;
-        if (!run_resources_.owns(successor->lease)) break;
-        ids.push_back(successor->id);
+        const RunId successor = early_launch_successor_locked(index);
+        if (successor == INVALID_RUN_ID) break;
+        ids.push_back(successor);
     }
     return ids;
 }
@@ -555,8 +550,29 @@ bool Orchestrator::refresh_early_launch_locked() {
 
 RunId Orchestrator::early_launch_run_id() const {
     std::lock_guard<std::mutex> lk(runs_mu_);
-    const std::vector<RunId> authorized = early_launch_prefix_locked();
-    return authorized.empty() ? INVALID_RUN_ID : authorized.front();
+    return early_launch_first_locked();
+}
+
+RunId Orchestrator::early_launch_first_locked() const {
+    if (launch_depth_ < 2 || !dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 ||
+        run_fifo_.front() != active_run_id_) {
+        return INVALID_RUN_ID;
+    }
+    return early_launch_successor_locked(0);
+}
+
+RunId Orchestrator::early_launch_successor_locked(size_t predecessor_index) const {
+    if (predecessor_index + 1 >= run_fifo_.size()) return INVALID_RUN_ID;
+    auto predecessor = runs_.find(run_fifo_[predecessor_index]);
+    if (predecessor == runs_.end() || !all_dispatches_accepted(predecessor->second)) return INVALID_RUN_ID;
+    auto candidate = runs_.find(run_fifo_[predecessor_index + 1]);
+    if (candidate == runs_.end()) return INVALID_RUN_ID;
+    const std::shared_ptr<RunState> &successor = candidate->second;
+    if (successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED ||
+        !run_resources_.owns(successor->lease)) {
+        return INVALID_RUN_ID;
+    }
+    return successor->id;
 }
 
 void Orchestrator::compact_if_quiescent() {

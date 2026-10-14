@@ -150,8 +150,8 @@ SimDeviceRunnerBase::RunResourceStaging SimDeviceRunnerBase::build_run_resources
     // The bank carries constructor arguments. Built here rather than filled in
     // after a resize, so the table is never visible holding a null entry.
     staged.arena_banks = RunResourceSlots<std::unique_ptr<ArenaBank>>::build(granted);
-    for (std::unique_ptr<std::unique_ptr<ArenaBank>> &bank : staged.arena_banks) {
-        *bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_);
+    for (std::unique_ptr<ArenaBank> &bank : staged.arena_banks) {
+        bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_);
     }
     return staged;
 }
