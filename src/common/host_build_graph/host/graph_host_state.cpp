@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "host_build_graph/graph_host_state.h"
+#include "host_build_graph/host/graph_host_state.h"
 
 #include <stddef.h>
 
@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "host_build_graph/graph_execution.h"
-#include "host_build_graph/graph_recording.h"
+#include "host_build_graph/host/graph_recording.h"
 
 // The GraphHostState container itself: its lifetime, and the reads the host performs on a
 // finished one -- what to upload, how much arena to ship, which Definitions it holds.

@@ -18,7 +18,7 @@
 #include <iterator>
 #include <vector>
 
-#include "host_build_graph/tensormap.h"
+#include "host_build_graph/host/tensormap.h"
 #include "host_build_graph/types.h"
 
 // What a recorded Graph boundary is compared against when a later submission presents the

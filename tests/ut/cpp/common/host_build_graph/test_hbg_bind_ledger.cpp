@@ -42,13 +42,14 @@
 #include "callable.h"
 #include "common/host_api.h"
 #include "common/launch_entry_args.h"
-#include "host_build_graph/graph_host_state.h"
-#include "host_build_graph/host_tensor_access.h"
+#include "host_build_graph/host/graph_host_state.h"
+#include "host_build_graph/host/host_tensor_access.h"
 #include "host/raii_scope_guard.h"
 #include "host_build_graph/runtime_status.h"
 #include "runtime.h"
 #include "runtime_core.h"
-#include "host_build_graph/orchestrator.h"
+#include "host_build_graph/host/orchestrator.h"
+#include "host_build_graph/host/orch_ops.h"
 #include "task_args.h"
 #include "host/host_phase_records.h"
 #include "host/platform_compile_info.h"
@@ -72,7 +73,7 @@ constexpr size_t kAlign = 1024;
 // exactly these function pointers out of host_orch_func_ptr. A field added there
 // and not here is read past the end of this object, so the two must move together.
 using TestOrchEntryFunc = void (*)(const ChipTaskArgs &);
-using TestOrchBindFunc = void (*)(RuntimeContext *);
+using TestOrchBindFunc = void (*)(OrchContext *);
 using TestOrchFinishFunc = void (*)();
 struct TestHostOrchEntryPoints {
     TestOrchEntryFunc entry{nullptr};
@@ -83,13 +84,13 @@ struct TestHostOrchEntryPoints {
 // An orchestration that submits nothing: this suite is about the ledger, and a
 // graph with no tasks exercises bind end to end all the same.
 void empty_orch_entry(const ChipTaskArgs & /*args*/) {}
-void empty_orch_bind(RuntimeContext * /*rt*/) {}
+void empty_orch_bind(OrchContext * /*ctx*/) {}
 
 // The wait callback releases a real recorder job only while its borrowed build
 // state is still alive. The test's boundary outlives bind even on the negative
 // path, so a missing wait is an assertion failure rather than a use-after-free.
 struct RecordingLifetime {
-    RuntimeOps ops{};
+    OrchOps ops{};
     GraphTaskArgs boundary;
     std::mutex mutex;
     std::condition_variable cv;
@@ -100,27 +101,30 @@ struct RecordingLifetime {
 };
 
 RecordingLifetime *g_recording = nullptr;
-RuntimeContext *g_recording_runtime = nullptr;
+OrchContext *g_recording_orch_context = nullptr;
 
-void recording_wait(RuntimeContext *rt) {
-    EXPECT_NE(rt->orchestrator, nullptr);
-    EXPECT_NE(rt->orchestrator->graph_host_state, nullptr);
-    EXPECT_NE(rt->tensor_access, nullptr);
+void recording_wait(OrchContext *ctx) {
+    EXPECT_NE(ctx->orchestrator, nullptr);
+    EXPECT_NE(ctx->orchestrator->graph_host_state, nullptr);
+    EXPECT_NE(ctx->tensor_access, nullptr);
     ++g_recording->wait_calls;
     {
         std::lock_guard<std::mutex> lock(g_recording->mutex);
         g_recording->release_job = true;
     }
     g_recording->cv.notify_all();
-    graph_record_wait_impl(rt);
+    graph_record_wait_impl(ctx);
     EXPECT_TRUE(g_recording->job_finished);
 }
 
-void recording_bind(RuntimeContext *rt) {
-    g_recording_runtime = rt;
-    g_recording->ops = *rt->ops;
+void recording_bind(OrchContext *ctx) {
+    g_recording_orch_context = ctx;
+    // The unbind a bind frame performs on its way out carries no context, matching
+    // the .so's own framework_bind_orch_context, which only stores the pointer.
+    if (ctx == nullptr) return;
+    g_recording->ops = *ctx->ops;
     g_recording->ops.graph_record_wait = recording_wait;
-    rt->ops = &g_recording->ops;
+    ctx->ops = &g_recording->ops;
 }
 
 void recording_entry(const ChipTaskArgs &) {
@@ -131,7 +135,7 @@ void recording_entry(const ChipTaskArgs &) {
         });
         g_recording->job_finished = true;
     };
-    if (!graph_record_start_impl(g_recording_runtime, g_recording->boundary, &job)) {
+    if (!graph_record_start_impl(g_recording_orch_context, g_recording->boundary, &job)) {
         throw std::runtime_error("could not start recorder");
     }
     if (g_recording->throw_from_entry) throw std::runtime_error("host orchestration failed");
@@ -140,7 +144,7 @@ void recording_entry(const ChipTaskArgs &) {
 enum class InputProducer { None, Allocated, Overlapping, Disjoint };
 
 struct HostAccessProbe {
-    RuntimeContext *runtime{nullptr};
+    OrchContext *orch_ctx{nullptr};
     InputProducer producer{InputProducer::None};
     bool write{false};
     // A failure of the orchestration's own, reported before it touches any tensor — the order a
@@ -153,12 +157,12 @@ struct HostAccessProbe {
 
 HostAccessProbe *g_access = nullptr;
 
-void access_bind(RuntimeContext *rt) { g_access->runtime = rt; }
+void access_bind(OrchContext *ctx) { g_access->orch_ctx = ctx; }
 
 void access_entry(const ChipTaskArgs &args) {
-    RuntimeContext *rt = g_access->runtime;
+    OrchContext *ctx = g_access->orch_ctx;
     if (g_access->pre_fatal != 0) {
-        rt->orchestrator->report_fatal(g_access->pre_fatal, "access_entry", "an independent orchestration failure");
+        ctx->orchestrator->report_fatal(g_access->pre_fatal, "access_entry", "an independent orchestration failure");
     }
     for (int i = 0; i < args.tensor_count(); ++i) {
         simpler::hbg::Tensor tensor = args.tensor(i).ref();
@@ -170,14 +174,14 @@ void access_entry(const ChipTaskArgs &args) {
                 const uint32_t shape[] = {1};
                 TensorCreateInfo output(shape, 1, DataType::UINT8);
                 task_args.add_output(output);
-                const TaskOutputTensors result = rt->orchestrator->submit_task(kernels, task_args);
+                const TaskOutputTensors result = ctx->orchestrator->submit_task(kernels, task_args);
                 ASSERT_EQ(result.size(), 1u);
                 tensor = result.get_ref(0);
                 ASSERT_TRUE(tensor.owner_task_id.is_valid());
             } else {
                 const simpler::hbg::Tensor written = tensor.slice(0, 0, 1);
                 task_args.add_output(written);
-                const TaskOutputTensors result = rt->orchestrator->submit_task(kernels, task_args);
+                const TaskOutputTensors result = ctx->orchestrator->submit_task(kernels, task_args);
                 ASSERT_TRUE(result.task_id().is_valid());
                 // Both the original device view and its aliases stay device-only.
                 ASSERT_FALSE(tensor.owner_task_id.is_valid());
@@ -186,11 +190,11 @@ void access_entry(const ChipTaskArgs &args) {
         }
         const uint32_t index[] = {0};
         if (g_access->write) {
-            set_tensor_data(rt, tensor, 1, index, 0x5a);
+            set_tensor_data(ctx, tensor, 1, index, 0x5a);
         } else {
-            g_access->reads.push_back(get_tensor_data(rt, tensor, 1, index));
+            g_access->reads.push_back(get_tensor_data(ctx, tensor, 1, index));
         }
-        g_access->error = rt->orchestrator->fatal_code.load(std::memory_order_acquire);
+        g_access->error = ctx->orchestrator->fatal_code.load(std::memory_order_acquire);
     }
 }
 
@@ -294,8 +298,8 @@ struct FakeHostApi {
 
 FakeHostApi *g_fake = nullptr;
 
-RuntimeContext *g_orch_runtime = nullptr;
-void capture_orch_bind(RuntimeContext *rt) { g_orch_runtime = rt; }
+OrchContext *g_orch_runtime = nullptr;
+void capture_orch_bind(OrchContext *ctx) { g_orch_runtime = ctx; }
 void recording_orch_entry(const ChipTaskArgs &) {
     ++g_fake->orchestration_count;
     auto &orch = *g_orch_runtime->orchestrator;
@@ -627,7 +631,7 @@ protected:
             }
             recording.cv.notify_all();
             graph_record_wait_impl(nullptr);
-            g_recording_runtime = nullptr;
+            g_recording_orch_context = nullptr;
             g_recording = nullptr;
         });
     }
@@ -1337,7 +1341,7 @@ TEST_F(HbgBindLedgerTest, BindDrainsItsRecordersWithoutJoiningAnotherRuntime) {
         init_runtime(runtime);
         auto runtime_cleanup = cleanup_runtime(runtime);
         ChipStorageTaskArgs args;
-        RuntimeContext other{};
+        OrchContext other{};
         GraphTaskArgs boundary;
         std::promise<void> entered, release;
         auto released = release.get_future().share();
@@ -2119,12 +2123,12 @@ TEST_F(HbgBindLedgerTest, HostArgumentsCannotReachDeviceTasksOrGraphBoundaries) 
 TEST_F(HbgBindLedgerTest, HostAndDeviceBindingsOfOneSourceRemainIndependent) {
     eps_ = {
         +[](const ChipTaskArgs &args) {
-            auto *rt = g_orch_runtime;
+            auto *ctx = g_orch_runtime;
             const uint32_t index[] = {0};
             EXPECT_EQ(args.tensor(0).ref().address_space, AddressSpace::HOST);
             EXPECT_EQ(args.tensor(1).ref().address_space, AddressSpace::DEVICE);
-            EXPECT_EQ(get_tensor_data(rt, args.tensor(0).ref(), 1, index), 0x37u);
-            set_tensor_data(rt, args.tensor(0).ref(), 1, index, 0x52);
+            EXPECT_EQ(get_tensor_data(ctx, args.tensor(0).ref(), 1, index), 0x37u);
+            set_tensor_data(ctx, args.tensor(0).ref(), 1, index, 0x52);
         },
         capture_orch_bind
     };

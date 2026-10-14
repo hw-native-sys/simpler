@@ -9,19 +9,20 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * PTO Orchestration API - Slim header for orchestration .so files
+ * Orchestration API - Slim header for orchestration .so files
  *
  * This header provides everything an orchestration source needs without
  * pulling in runtime implementation headers.  The orchestration .so has
- * zero link dependencies on runtime .cpp files; all runtime calls go
- * through the RuntimeOps function-pointer table embedded in
- * RuntimeContext.
+ * zero link dependencies on runtime .cpp files; every call into the host
+ * goes through the OrchOps function-pointer table on OrchContext.
  *
  * Orchestration sources include ONLY this header:
  *   #include "orchestration_api.h"
  *
- * Runtime sources continue to use runtime_core.h (which defines the
- * full RuntimeContext struct with all internal fields).
+ * The host sees the full OrchContext in host/orchestrator.h. The device-side
+ * RuntimeContext in runtime_core.h is a separate type that orchestration never
+ * touches: it is the state that travels to the device, and nothing host-only
+ * lives in it.
  */
 
 #pragma once
@@ -36,16 +37,16 @@
 #include <type_traits>
 
 // Type headers needed by orchestration
-#include "assert_compat.h"                    // always_assert
-#include "host_build_graph/common.h"          // framework_bind_runtime / framework_current_runtime
-#include "common/host_phase_kind.h"           // HostPhaseKind, for the phase records below
-#include "host_build_graph/graph_cache.h"     // Graph Execution key and result helpers
-#include "host_build_graph/graph_config.h"    // simpler::hbg::ConfigBase, DefaultConfig, Config traits
-#include "host_build_graph/runtime_ops.h"     // RuntimeOps, RuntimeContext forward declaration
-#include "host_build_graph/runtime_status.h"  // SIMPLER_ERROR_*
-#include "host_build_graph/submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots
-#include "types.h"                            // Arg, TaskOutputTensors, TensorArgType
-#include "tensor.h"                           // simpler::hbg::Tensor, TensorCreateInfo
+#include "assert_compat.h"                      // always_assert
+#include "host_build_graph/common.h"            // framework_bind_orch_context / framework_current_orch_context
+#include "common/host_phase_kind.h"             // HostPhaseKind, for the phase records below
+#include "host_build_graph/host/graph_cache.h"  // Graph Execution key and result helpers
+#include "host_build_graph/host/orchestration/graph_config.h"  // simpler::hbg::ConfigBase, DefaultConfig, Config traits
+#include "host_build_graph/host/orch_ops.h"                    // OrchOps, OrchContext forward declaration
+#include "host_build_graph/runtime_status.h"                   // SIMPLER_ERROR_*
+#include "host_build_graph/submit_types.h"                     // MixedKernels, INVALID_KERNEL_ID, subtask slots
+#include "types.h"                                             // Arg, TaskOutputTensors, TensorArgType
+#include "tensor.h"                                            // simpler::hbg::Tensor, TensorCreateInfo
 
 // =============================================================================
 // simpler::hbg::Tensor Factory Helpers
@@ -60,23 +61,37 @@
 // =============================================================================
 
 /**
- * Partial RuntimeContext definition for orchestration.
+ * Partial OrchContext definition for orchestration.
  *
  * Exposes the ops pointer (for runtime calls) and pending_scope_mode
- * (read directly by inline scope wrappers).  The real struct (in
- * runtime_core.h) has the same first fields, so accessing them through
- * this definition is well-defined (C struct layout guarantee).
+ * (read directly by inline scope wrappers). The full struct (in
+ * host/orchestrator.h) has the same first fields, so accessing them through
+ * this definition is well-defined (C struct layout guarantee). The full one
+ * stays out of here because it names OrchestratorState and HostTensorAccessor,
+ * which the orchestration .so has no link dependency on.
+ *
+ * This context is host-side only: the orchestration .so and the ops table it
+ * calls both run on the host, and nothing here is uploaded to the device.
  */
-struct RuntimeContext {
-    const RuntimeOps *ops;
+struct OrchContext {
+    const OrchOps *ops;
     ScopeMode pending_scope_mode;
 };
+
+// The host library compiles the full definition in host/orchestrator.h, which
+// carries three more members after these two. Both sides assert the same offsets
+// so a reorder on either one fails to compile rather than silently disagreeing
+// across the two translation units.
+static_assert(offsetof(OrchContext, ops) == 0, "OrchContext ops layout drift");
+static_assert(
+    offsetof(OrchContext, pending_scope_mode) == sizeof(const OrchOps *), "OrchContext pending_scope_mode layout drift"
+);
 
 // =============================================================================
 // Inline Convenience Wrappers (call through ops table)
 // =============================================================================
 
-static inline RuntimeContext *current_runtime() { return framework_current_runtime(); }
+static inline OrchContext *current_orch_context() { return framework_current_orch_context(); }
 
 // Where the previous submission on this thread left off, so the generated code's own
 // work between two submissions can be named rather than showing as an unattributed gap.
@@ -106,16 +121,16 @@ static inline void rt_graph_commit();
 // submitting thread for the rest of every recording in flight, which on the
 // four-Definition DeepSeek-V4 decode was a third of the orchestration window.
 static inline TaskOutputTensors alloc_tensors(const CoreTaskArgs &args) {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->is_fatal(ctx)) {
         return TaskOutputTensors{};
     }
-    return rt->ops->alloc_tensors(rt, args);
+    return ctx->ops->alloc_tensors(ctx, args);
 }
 
 static inline TaskOutputTensors alloc_tensors(const TensorCreateInfo create_infos[], uint32_t count) {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->is_fatal(ctx)) {
         return TaskOutputTensors{};
     }
     CoreTaskArgs args;
@@ -123,8 +138,8 @@ static inline TaskOutputTensors alloc_tensors(const TensorCreateInfo create_info
         args.add_output(create_infos[i]);
     }
     if (args.has_error()) {
-        rt->ops->report_fatal(
-            rt, SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
+        ctx->ops->report_fatal(
+            ctx, SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
             args.error_msg() ? args.error_msg() : "alloc_tensors failed to construct output-only Arg"
         );
         return TaskOutputTensors{};
@@ -139,15 +154,15 @@ static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
         (std::is_same_v<std::decay_t<CIs>, TensorCreateInfo> && ...),
         "alloc_tensors only accepts TensorCreateInfo arguments"
     );
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->is_fatal(ctx)) {
         return TaskOutputTensors{};
     }
     CoreTaskArgs args;
     (args.add_output(cis), ...);
     if (args.has_error()) {
-        rt->ops->report_fatal(
-            rt, SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
+        ctx->ops->report_fatal(
+            ctx, SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
             args.error_msg() ? args.error_msg() : "alloc_tensors failed to construct output-only Arg"
         );
         return TaskOutputTensors{};
@@ -156,11 +171,11 @@ static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
 }
 
 static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->is_fatal(ctx)) {
         return TaskOutputTensors{};
     }
-    return rt->ops->submit_task(rt, mixed_kernels, args);
+    return ctx->ops->submit_task(ctx, mixed_kernels, args);
 }
 
 /**
@@ -189,43 +204,43 @@ static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, const Core
  * barrier or as a placeholder producer for tests / dep-graph wiring.
  */
 static inline TaskOutputTensors rt_submit_dummy_task(const CoreTaskArgs &args) {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->is_fatal(ctx)) {
         return TaskOutputTensors{};
     }
-    return rt->ops->submit_dummy_task(rt, args);
+    return ctx->ops->submit_dummy_task(ctx, args);
 }
 
 static inline GraphScopeResult rt_graph_begin(uint64_t graph_key, const GraphTaskArgs &args) {
-    RuntimeContext *rt = current_runtime();
+    OrchContext *ctx = current_orch_context();
     // Every runtime reaching this header implements graph_begin, so a null one means the ops
     // table is not the one this call belongs to. Asserted rather than reported: the default
     // result below says "nothing submitted, no error", under which the caller drops the body
     // and leaves no record of having done so.
-    always_assert(rt->ops->graph_begin != nullptr && "an HBG runtime's ops table carries graph_begin");
+    always_assert(ctx->ops->graph_begin != nullptr && "an HBG runtime's ops table carries graph_begin");
     // An already-fatal runtime fails this submission like any other: nothing is submitted
     // and no recording opens. No report of its own -- `has_error` promises a latched fatal,
     // and the one that short-circuited this call is it. graph_begin answers the same
     // condition the same way, through require_device_arguments.
-    if (rt->ops->is_fatal(rt)) {
+    if (ctx->ops->is_fatal(ctx)) {
         GraphScopeResult rejected;
         rejected.has_error = true;
         return rejected;
     }
-    return rt->ops->graph_begin(rt, graph_key, args);
+    return ctx->ops->graph_begin(ctx, graph_key, args);
 }
 
 // Bind the calling thread to the recording `graph_key` opened. The handle comes
 // from the GraphScopeResult that opened it, so a thread can only ever record
 // into the recording it was handed.
 static inline bool rt_graph_prepare(void *recording_handle, const GraphTaskArgs &args) {
-    RuntimeContext *rt = current_runtime();
-    return rt->ops->graph_prepare != nullptr && rt->ops->graph_prepare(rt, recording_handle, args);
+    OrchContext *ctx = current_orch_context();
+    return ctx->ops->graph_prepare != nullptr && ctx->ops->graph_prepare(ctx, recording_handle, args);
 }
 
 static inline void rt_graph_abort(void *recording_handle) {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->graph_abort != nullptr) rt->ops->graph_abort(rt, recording_handle);
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->graph_abort != nullptr) ctx->ops->graph_abort(ctx, recording_handle);
 }
 
 // Finish the recording pass and publish its Definition. The calling thread
@@ -242,71 +257,71 @@ static inline void rt_graph_abort(void *recording_handle) {
 // no recording could be open to end. It reports false rather than the older `true`
 // because nothing was published.
 static inline bool rt_graph_end() {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->graph_end == nullptr) return false;
-    return rt->ops->graph_end(rt);
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->graph_end == nullptr) return false;
+    return ctx->ops->graph_end(ctx);
 }
 
 static inline void rt_graph_commit() {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->graph_record_wait != nullptr) rt->ops->graph_record_wait(rt);
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->graph_record_wait != nullptr) ctx->ops->graph_record_wait(ctx);
 
-    if (!rt->ops->is_fatal(rt) && rt->ops->graph_commit != nullptr) rt->ops->graph_commit(rt);
+    if (!ctx->ops->is_fatal(ctx) && ctx->ops->graph_commit != nullptr) ctx->ops->graph_commit(ctx);
 }
 
 static inline void rt_scope_begin(ScopeMode mode = ScopeMode::AUTO) {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->is_fatal(ctx)) {
         return;
     }
-    rt->pending_scope_mode = mode;
-    rt->ops->scope_begin(rt);
+    ctx->pending_scope_mode = mode;
+    ctx->ops->scope_begin(ctx);
 }
 
 static inline void rt_scope_end() {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->is_fatal(ctx)) {
         return;
     }
-    rt->ops->scope_end(rt);
+    ctx->ops->scope_end(ctx);
 }
 
 static inline void rt_orchestration_done() {
     rt_graph_commit();
     rt_submit_phase_state() = RtSubmitPhaseState{};
-    RuntimeContext *rt = current_runtime();
-    rt->ops->orchestration_done(rt);
+    OrchContext *ctx = current_orch_context();
+    ctx->ops->orchestration_done(ctx);
 }
 
 /** This-run MIX cluster (= AIC) count. Do not hardcode 24/36; MIX cohorts use this. */
 static inline int32_t rt_available_cluster_count() {
-    RuntimeContext *rt = current_runtime();
-    return rt->ops->available_cluster_count(rt);
+    OrchContext *ctx = current_orch_context();
+    return ctx->ops->available_cluster_count(ctx);
 }
 
 /** This-run standalone AIV core count. AIV-only cohorts size themselves on this. */
 static inline int32_t rt_available_aiv_count() {
-    RuntimeContext *rt = current_runtime();
-    return rt->ops->available_aiv_count(rt);
+    OrchContext *ctx = current_orch_context();
+    return ctx->ops->available_aiv_count(ctx);
 }
 
 static inline bool rt_is_fatal() {
-    RuntimeContext *rt = current_runtime();
-    return rt->ops->is_fatal(rt);
+    OrchContext *ctx = current_orch_context();
+    return ctx->ops->is_fatal(ctx);
 }
 
-#define rt_report_fatal(code, fmt, ...)                                          \
-    do {                                                                         \
-        RuntimeContext *_rt = current_runtime();                                 \
-        _rt->ops->report_fatal(_rt, (code), __FUNCTION__, (fmt), ##__VA_ARGS__); \
+#define rt_report_fatal(code, fmt, ...)                                            \
+    do {                                                                           \
+        OrchContext *_ctx = current_orch_context();                                \
+        _ctx->ops->report_fatal(_ctx, (code), __FUNCTION__, (fmt), ##__VA_ARGS__); \
     } while (0)
 
 // =============================================================================
 // Logging Macros for Orchestration (call through ops table)
 // =============================================================================
 
-#define LOG_ERROR(fmt, ...) current_runtime()->ops->log_error(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...) current_runtime()->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...) current_orch_context()->ops->log_error(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...) current_orch_context()->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
 
 // ============================================================================
 // Submission-gap probe — diagnostic only, nothing branches on it.
@@ -319,7 +334,7 @@ static inline bool rt_is_fatal() {
 // The three submission segments the runtime cannot see, filed under the
 // OrchSubmitAdmit / OrchRecordHandoff / OrchGeneratedArgs kinds.
 inline void rt_record_orch_phase(HostPhaseKind phase, uint64_t start_ns, uint64_t end_ns, uint64_t detail) {
-    const RuntimeOps *ops = current_runtime()->ops;
+    const OrchOps *ops = current_orch_context()->ops;
     if (ops->record_orch_phase != nullptr) {
         ops->record_orch_phase(static_cast<uint32_t>(phase), start_ns, end_ns, detail);
     }
@@ -331,15 +346,15 @@ inline void rt_record_orch_phase(HostPhaseKind phase, uint64_t start_ns, uint64_
 // reachable from this header, which resolves no runtime symbols of its own, so the
 // gate is the ops entry that rt_record_orch_phase would call.
 inline uint64_t rt_orch_phase_now_ns() {
-    if (current_runtime()->ops->record_orch_phase == nullptr) return 0;
+    if (current_orch_context()->ops->record_orch_phase == nullptr) return 0;
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000ull + static_cast<uint64_t>(ts.tv_nsec);
 }
 
-#define LOG_TIMING(fmt, ...) current_runtime()->ops->log_timing(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...) current_runtime()->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_DEBUG(fmt, ...) current_runtime()->ops->log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_TIMING(fmt, ...) current_orch_context()->ops->log_timing(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...) current_orch_context()->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...) current_orch_context()->ops->log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
 
 // =============================================================================
 // Cross-Layer Data Access
@@ -361,11 +376,11 @@ inline uint64_t rt_orch_phase_now_ns() {
  */
 template <typename T = uint64_t>
 static inline T get_tensor_data(const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->is_fatal(ctx)) {
         return from_u64<T>(0);
     }
-    return from_u64<T>(rt->ops->get_tensor_data(rt, tensor, ndims, indices));
+    return from_u64<T>(ctx->ops->get_tensor_data(ctx, tensor, ndims, indices));
 }
 
 /**
@@ -384,11 +399,11 @@ static inline T get_tensor_data(const simpler::hbg::Tensor &tensor, uint32_t ndi
 template <typename T = uint64_t>
 static inline void
 set_tensor_data(const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
-    RuntimeContext *rt = current_runtime();
-    if (rt->ops->is_fatal(rt)) {
+    OrchContext *ctx = current_orch_context();
+    if (ctx->ops->is_fatal(ctx)) {
         return;
     }
-    rt->ops->set_tensor_data(rt, tensor, ndims, indices, to_u64(value));
+    ctx->ops->set_tensor_data(ctx, tensor, ndims, indices, to_u64(value));
 }
 
 // =============================================================================
@@ -401,20 +416,20 @@ set_tensor_data(const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32
 class ScopeGuard {
 public:
     explicit ScopeGuard(ScopeMode mode = ScopeMode::AUTO) :
-        rt_(current_runtime()) {
-        if (!rt_->ops->is_fatal(rt_)) {
-            rt_->pending_scope_mode = mode;
-            rt_->ops->scope_begin(rt_);
+        ctx_(current_orch_context()) {
+        if (!ctx_->ops->is_fatal(ctx_)) {
+            ctx_->pending_scope_mode = mode;
+            ctx_->ops->scope_begin(ctx_);
         }
     }
     ~ScopeGuard() {
-        if (!rt_->ops->is_fatal(rt_)) {
-            rt_->ops->scope_end(rt_);
+        if (!ctx_->ops->is_fatal(ctx_)) {
+            ctx_->ops->scope_end(ctx_);
         }
     }
 
 private:
-    RuntimeContext *rt_;
+    OrchContext *ctx_;
 };
 
 // Define or submit a Graph Execution. On a cache miss the function executes
@@ -519,9 +534,9 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
         // its own storage before it checks capacity, so `job` is empty either way. That
         // costs nothing here, because the fallback below re-runs `invoke` -- captured by
         // value, so unaffected -- rather than the job.
-        RuntimeContext *record_rt = current_runtime();
-        const bool queued = record_rt->ops->graph_record_start != nullptr &&
-                            record_rt->ops->graph_record_start(record_rt, params, &job);
+        OrchContext *record_ctx = current_orch_context();
+        const bool queued = record_ctx->ops->graph_record_start != nullptr &&
+                            record_ctx->ops->graph_record_start(record_ctx, params, &job);
         if (!queued) {
             try {
                 if (!rt_graph_prepare(handle, params)) {

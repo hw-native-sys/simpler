@@ -14,7 +14,7 @@
  * record pool. See host_build_graph/host_phase_trace.h.
  */
 
-#include "host_build_graph/host_phase_trace.h"
+#include "host_build_graph/host/host_phase_trace.h"
 
 #include <stdio.h>
 

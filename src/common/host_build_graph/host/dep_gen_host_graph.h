@@ -63,9 +63,9 @@
 #include <cstdint>
 
 #include "host/host_graph_runs.h"  // HostGraphExport, TakeOutcome
-#include "host_build_graph/tensormap.h"
+#include "host_build_graph/host/tensormap.h"
 #include "host_build_graph/types.h"  // TensorRef
-#include "tensor.h"
+#include "host_build_graph/tensor.h"
 
 // ---------------------------------------------------------------------------
 // Capture surface (orchestrator side)

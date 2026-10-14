@@ -389,7 +389,7 @@ prepared-but-not-launched run.
 
 #### HBG build ownership
 
-A loaded host-orchestration SO keeps its current `RuntimeContext` in a
+A loaded host-orchestration SO keeps its current `OrchContext` in a
 module-local global. One build owns that binding until **all recorder jobs
 have returned**, including their captured-object cleanup. A later build must
 not rebind it early. Recording different Graph bodies within the same build

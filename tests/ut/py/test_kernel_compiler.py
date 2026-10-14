@@ -79,11 +79,20 @@ def test_host_orchestration_is_a_self_contained_log_consumer(
         assert "unified_log_host.cpp" not in source_names
         assert "-pthread" not in compiler._orchestration_link_flags(compiler._orchestration_toolchain(target_runtime))
 
-    # The Graph recorder pool belongs to the runtime, and these sources are shared with the
-    # aicore and aicpu targets, so nothing that creates host threads may be compiled into
-    # the orchestration .so -- see the note on "orchestration" in each runtime's
+    # The Graph recorder pool belongs to the runtime, not to the .so, which reaches it
+    # through the ops table. For tensormap_and_ringbuffer the orchestration sources are
+    # compiled into the aicore and aicpu targets as well, so nothing there may create a
+    # host thread at all -- see the note on "orchestration" in each runtime's
     # build_config.py. The pool used to live here behind a framework_* entry point.
     assert "graph_recorder_pool.cpp" not in source_names
+
+    if target_runtime == "host_build_graph":
+        # assert_impl is a C++ symbol, so the .so carries its own copy rather than
+        # leaving it for dlopen to resolve. build_config.py names that one file
+        # individually, because the directory holding it also holds the arena sources
+        # the .so does not need.
+        assert "assert_support.cpp" in source_names
+        assert "runtime_init.cpp" not in source_names
 
 
 def test_direct_compiler_command_uses_checkout_relative_paths(monkeypatch, tmp_path):

@@ -22,7 +22,7 @@
 // include-cleaner can see.
 #include "profiling_config.h"
 
-#include "host_build_graph/host_phase_trace.h"
+#include "host_build_graph/host/host_phase_trace.h"
 
 // The host orchestrator's own instrumentation, on two independent channels:
 //

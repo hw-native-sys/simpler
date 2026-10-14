@@ -13,8 +13,8 @@
 
 #include <stdint.h>
 
-#include "host_build_graph/graph_recording.h"
-#include "host_build_graph/orchestrator.h"
+#include "host_build_graph/host/graph_recording.h"
+#include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/runtime_types.h"
 
 // What the Graph submit path offers the ordinary one. The traffic in this direction is

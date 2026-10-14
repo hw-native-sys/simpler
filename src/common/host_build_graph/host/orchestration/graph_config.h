@@ -18,7 +18,7 @@
 #include <type_traits>
 #include <unordered_map>
 
-#include "host_build_graph/graph_cache.h"
+#include "host_build_graph/host/graph_cache.h"
 
 namespace simpler::hbg {
 

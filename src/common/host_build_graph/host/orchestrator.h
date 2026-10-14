@@ -28,16 +28,17 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <type_traits>
 
-#include "host_build_graph/task_allocator.h"
+#include "host_build_graph/host/task_allocator.h"
 #include "graph_cache.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_types.h"
 #include "host_build_graph/submit_types.h"
 #include "host_build_graph/shared_memory.h"
-#include "host_build_graph/tensormap.h"
+#include "host_build_graph/host/tensormap.h"
 #include "host_build_graph/types.h"
 
 struct GraphHostState;
@@ -190,6 +191,54 @@ struct OrchestratorState {
 static_assert(
     !std::is_move_assignable_v<OrchestratorState> && !std::is_copy_assignable_v<OrchestratorState>,
     "OrchestratorState holds a pointer into itself (task_allocator's fatal_code); assigning one would retarget it"
+);
+
+// =============================================================================
+// Orchestration Context
+// =============================================================================
+
+struct OrchOps;
+class HostTensorAccessor;
+struct RuntimeContext;
+
+/**
+ * What one orchestration call runs against.
+ *
+ * Host-side only: the orchestration .so, the ops table it calls through, and the
+ * orchestrator itself all run on the host, so none of this is uploaded to the
+ * device and none of it may be reached from device code.
+ *
+ * The orchestration .so compiles against the two-field partial definition in
+ * orchestration_api.h, which must keep agreeing with the first two members here
+ * (C struct layout guarantee). The remaining members name host-only types the .so
+ * has no link dependency on, which is why it sees only the prefix.
+ */
+struct OrchContext {
+    // Kept first, and in this order, to match the .so's partial definition.
+    const OrchOps *ops;
+    ScopeMode pending_scope_mode;
+
+    // The orchestrator this call submits into. Host-owned, with non-trivial
+    // scratch; outlives the call but not the bind that created it.
+    OrchestratorState *orchestrator;
+
+    // Explicit HOST/NONE tensor views registered for this call. Null when the
+    // caller registered none, which makes get_tensor_data / set_tensor_data fail
+    // closed rather than dereference one.
+    HostTensorAccessor *tensor_access;
+
+    // The device-side state this call feeds. Reached only where an op genuinely
+    // has to publish into the uploaded image.
+    RuntimeContext *rt;
+};
+
+// The .so compiles against the two-field partial definition in orchestration_api.h
+// and reaches both members through it, so their offsets are an ABI the compiler
+// cannot otherwise see across the two translation units. The partial definition
+// carries the same pair of assertions.
+static_assert(offsetof(OrchContext, ops) == 0, "OrchContext ops layout drift");
+static_assert(
+    offsetof(OrchContext, pending_scope_mode) == sizeof(const OrchOps *), "OrchContext pending_scope_mode layout drift"
 );
 
 // =============================================================================

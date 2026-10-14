@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "host_build_graph/graph_recording.h"
+#include "host_build_graph/host/graph_recording.h"
 
 #include <algorithm>
 #include <atomic>
@@ -18,8 +18,8 @@
 #include <vector>
 
 #include "common/unified_log.h"
-#include "host_build_graph/graph_cache.h"
-#include "host_build_graph/graph_host_state.h"
+#include "host_build_graph/host/graph_cache.h"
+#include "host_build_graph/host/graph_host_state.h"
 
 namespace {
 

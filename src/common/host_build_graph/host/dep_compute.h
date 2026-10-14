@@ -54,9 +54,9 @@
 #include <cstdint>
 
 #include "host_build_graph/task_id.h"
-#include "host_build_graph/tensormap.h"
+#include "host_build_graph/host/tensormap.h"
 #include "host_build_graph/types.h"  // TensorRef
-#include "tensor.h"
+#include "host_build_graph/tensor.h"
 
 /**
  * View struct for inputs to compute_task_fanin / register_task_outputs.

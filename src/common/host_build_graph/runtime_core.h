@@ -37,10 +37,8 @@
 #include <type_traits>
 
 #include "utils/device_arena.h"
-#include "host_build_graph/runtime_ops.h"
 #include "host_build_graph/shared_memory.h"
 #include "scheduler/scheduler.h"
-#include "host_build_graph/orchestrator.h"
 #include "aicore_completion_mailbox.h"
 
 // =============================================================================
@@ -55,6 +53,11 @@ enum RuntimeMode {
     MODE_SIMULATE = 1,   // Simulate task execution with cycle counting
     MODE_GRAPH_ONLY = 2  // Build graph only, no execution
 };
+
+// Both are host-owned and reached only through the orchestration context, which
+// no device code sees.
+struct OrchOps;
+struct OrchContext;
 
 class HostTensorAccessor;
 
@@ -115,19 +118,8 @@ struct RuntimeArenaLayout {
  * In simulated mode, runs in single process with shared address space.
  */
 struct RuntimeContext {
-    // Ops table (first field — used by orchestration .so via function pointers).
-    // Host-only, like the orchestrator below: the bind clears it before the copied
-    // zone is uploaded, so no device code may call through it.
-    const RuntimeOps *ops;
-    ScopeMode pending_scope_mode;
-
     // Components
     SharedMemoryHandle *sm_handle;
-    // Host-only, and by pointer so that this header stays trivially copyable:
-    // the orchestrator runs on the host and owns non-trivial scratch. Null on the
-    // device — bind drops it before the copied zone is uploaded, so no device code
-    // may dereference it.
-    OrchestratorState *orchestrator;
     // Device-only zone: the scheduler state holds no per-run content, so it is
     // addressed through the arena rather than carried inside this header.
     SchedulerState *scheduler;
@@ -142,11 +134,6 @@ struct RuntimeContext {
     // rt_orchestration_done. The device-side executor folds this into its
     // completed_tasks_ progress counter so shutdown/profiling totals stay closed.
     int64_t inline_completed_tasks;
-
-    // Explicit HOST/NONE views registered for this orchestration call. Null on the AICPU path, which loads device
-    // addresses directly; get_tensor_data / set_tensor_data then fail closed rather than dereferencing one. Lives past
-    // the first two fields, so the orchestration .so's partial RuntimeContext definition neither sees nor needs it.
-    HostTensorAccessor *tensor_access;
 
     // Prebuilt-arena fast path metadata. Carries every offset
     // wire_arena_pointers needs at AICPU boot so the AICPU can reconstruct
@@ -191,11 +178,11 @@ RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capa
  * the resulting buffer is rtMemcpy-ready.
  *
  * Returns the RuntimeContext* that sits at layout.off_runtime within the arena.
- * Caller must follow up with runtime_wire_arena_pointers; rt->ops and the
- * AICore-side count fields are left untouched and must be filled by the
- * AICPU at boot. Initializes the scheduler only: the orchestrator is a
- * host-owned object the host-orch path (run_host_orchestration) stands up and
- * points rt->orchestrator at, and it is never uploaded to the device.
+ * Caller must follow up with runtime_wire_arena_pointers; the AICore-side count
+ * fields are left untouched and must be filled by the AICPU at boot. Initializes
+ * the scheduler only: the orchestrator is a host-owned object that the host-orch
+ * path (run_host_orchestration) stands up on its own OrchContext, which no part
+ * of this image reaches.
  */
 RuntimeContext *runtime_init_data_from_layout(
     DeviceArena &arena, const RuntimeArenaLayout &layout, RuntimeMode mode, void *sm_dev_base, uint64_t sm_size
@@ -212,16 +199,16 @@ void runtime_wire_arena_pointers(DeviceArena &arena, const RuntimeArenaLayout &l
 
 /**
  * Install the ops table on the context the orchestration .so calls through.
- * Host-only: the bind installs it before running orchestration and clears the
- * field again before the context travels to the device.
+ * Host-only, like the context itself — declared here because the host sources
+ * that stand a bind up already include this header.
  */
-void runtime_bind_ops(RuntimeContext *rt);
+void orch_bind_ops(OrchContext *ctx);
 
 // Backing the two graph_record_* ops, defined in host/graph_recorder_pool.cpp where
 // the pool lives. The table naming them is host-only, so there is no device-side
 // fallback.
-bool graph_record_start_impl(RuntimeContext *rt, const GraphTaskArgs &args, void *job);
-void graph_record_wait_impl(RuntimeContext *rt);
+bool graph_record_start_impl(OrchContext *ctx, const GraphTaskArgs &args, void *job);
+void graph_record_wait_impl(OrchContext *ctx);
 
 /**
  * Destroy runtime. With the prebuilt-arena fast path the arena buffer is
@@ -246,10 +233,10 @@ void runtime_set_mode(RuntimeContext *rt, RuntimeMode mode);
  * submit_task requires at least one open scope. A MANUAL scope additionally makes
  * every submit inside it bypass TensorMap discovery and take its fanin from
  * CoreTaskArgs::set_dependencies() instead; an AUTO scope nested inside a MANUAL
- * one is rejected. The mode is read from RuntimeContext::pending_scope_mode, which
+ * one is rejected. The mode is read from OrchContext::pending_scope_mode, which
  * SIMPLER_SCOPE sets immediately before this call.
  */
-void rt_scope_begin(RuntimeContext *rt);
+void rt_scope_begin(OrchContext *ctx);
 
 /**
  * End current scope
@@ -259,25 +246,25 @@ void rt_scope_begin(RuntimeContext *rt);
  * here: the task table is whole-graph-resident, so no task slot and no heap byte is
  * reclaimed before the run ends.
  */
-void rt_scope_end(RuntimeContext *rt);
+void rt_scope_end(OrchContext *ctx);
 
 /**
  * Mark orchestration as complete
  *
  * Signals that no more tasks will be submitted.
  */
-void rt_orchestration_done(RuntimeContext *rt);
+void rt_orchestration_done(OrchContext *ctx);
 
 /**
  * Enter fatal state explicitly from orchestration.
  */
-void rt_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func, const char *fmt, ...);
+void rt_report_fatal(OrchContext *ctx, int32_t error_code, const char *func, const char *fmt, ...);
 
 /**
  * Cross-layer data access: read a tensor value by waiting for its producer.
  */
 uint64_t
-get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
+get_tensor_data(OrchContext *ctx, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]);
 
 /**
  * Cross-layer data access: write a value to a tensor at given indices.
@@ -285,7 +272,7 @@ get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t
  * See set_tensor_data in orchestration_api.h for full documentation.
  */
 void set_tensor_data(
-    RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+    OrchContext *ctx, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 );
 
 /**

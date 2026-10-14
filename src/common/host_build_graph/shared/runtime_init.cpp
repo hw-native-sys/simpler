@@ -234,11 +234,10 @@ RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capa
  * Populate the prebuilt runtime-arena image in place (host build path).
  *
  * Zeroes the RuntimeContext header at layout.off_runtime and initializes the
- * scheduler (ready / sync / dummy / graph queues) against the device SM.
- * rt->orchestrator is left null: the
- * orchestrator is a host-owned object the host-orch path
- * (run_host_orchestration) stands up against the host SM once that buffer
- * exists, and it is never uploaded to the device. Caller must follow up with
+ * scheduler (ready / sync / dummy / graph queues) against the device SM. The
+ * orchestrator is a host-owned object that the host-orch path
+ * (run_host_orchestration) stands up against the host SM on its own OrchContext,
+ * so no field here names it. Caller must follow up with
  * runtime_wire_arena_pointers. Returns the arena-resident RuntimeContext*, or
  * nullptr on failure.
  */
@@ -248,20 +247,15 @@ RuntimeContext *runtime_init_data_from_layout(
     RuntimeContext *rt = static_cast<RuntimeContext *>(arena.region_ptr(layout.off_runtime));
     memset(rt, 0, sizeof(*rt));
 
-    // rt->ops is filled by the AICPU at boot.
+    // The ops table and the orchestrator are not here at all: they live on the
+    // host-side OrchContext, so nothing host-only travels in this image.
     rt->mode = mode;
     rt->total_cycles = 0;
 
-    // Two components are deliberately not initialized here.
-    //
-    // The orchestrator is not in this arena at all: it is a host-owned object the
-    // host-orch path (run_host_orchestration) stands up against the host SM once
-    // that buffer is allocated, and rt->orchestrator only points at it for the
-    // duration of that pass.
-    //
-    // The scheduler and sm_handle live in the device-only zone, so their bytes
-    // never travel; the AICPU initializes them at boot. Writing them here would
-    // be writing an initialization pattern that nothing reads.
+    // The scheduler and sm_handle are deliberately left alone: they live in the
+    // device-only zone, so their bytes never travel; the AICPU initializes them at
+    // boot. Writing them here would be writing an initialization pattern that
+    // nothing reads.
     (void)sm_dev_base;
 
     return rt;

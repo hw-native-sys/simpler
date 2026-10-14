@@ -24,7 +24,7 @@
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
-#include "host_build_graph/tensormap.h"
+#include "host_build_graph/host/tensormap.h"
 
 #include <stdlib.h>
 

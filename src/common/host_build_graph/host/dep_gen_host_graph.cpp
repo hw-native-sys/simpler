@@ -29,7 +29,7 @@
  * five vectors rather than a copy. The serializer lives in that same header.
  */
 
-#include "host_build_graph/dep_gen_host_graph.h"
+#include "host_build_graph/host/dep_gen_host_graph.h"
 
 #include <cstddef>
 #include <cstdint>

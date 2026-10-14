@@ -21,7 +21,7 @@
 #include <cstring>
 #include <vector>
 
-#include "host_build_graph/ready_queue_sizing.h"
+#include "host_build_graph/host/ready_queue_sizing.h"
 #include "scheduler/scheduler.h"
 
 namespace {

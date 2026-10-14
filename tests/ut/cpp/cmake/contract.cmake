@@ -57,6 +57,13 @@ endfunction()
 # src/common/<runtime> is load-bearing and not optional: the runtime-agnostic
 # platform and worker sources reach this runtime's runtime.h / types.h / task_id.h
 # by bare name, and resolve to the other runtime's copy when it is absent.
+#
+# Both the arch-local and the shared tree carry an "orchestration" directory, and
+# which one holds the runtime's orchestration API differs by runtime:
+# tensormap_and_ringbuffer keeps its copy per arch, host_build_graph shares one
+# under host/ because its orchestration runs on the host. All of them are on the
+# path, so an orchestration source resolves the API by bare name either way, and
+# an entry that matches nothing for a given runtime simply contributes nothing.
 function(simpler_ut_includes arch runtime tier out_var)
     set(_rt "${SIMPLER_SRC}/${arch}/runtime/${runtime}")
     if(NOT IS_DIRECTORY "${_rt}")
@@ -70,7 +77,10 @@ function(simpler_ut_includes arch runtime tier out_var)
     list(APPEND _dirs "${_rt}/runtime" "${_rt}/common")
 
     simpler_ut_common_includes("${arch}" "${tier}" _common)
-    list(APPEND _dirs ${_common} "${SIMPLER_SRC}/common/${runtime}")
+    list(APPEND _dirs ${_common} "${SIMPLER_SRC}/common/${runtime}"
+         "${SIMPLER_SRC}/common/${runtime}/orchestration"
+         "${SIMPLER_SRC}/common/${runtime}/host/orchestration"
+         "${SIMPLER_SRC}/common/${runtime}/host")
 
     set(${out_var} "${_dirs}" PARENT_SCOPE)
 endfunction()

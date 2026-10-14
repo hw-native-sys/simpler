@@ -8,14 +8,13 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-#include "host_build_graph/graph_recorder_pool.h"
+#include "host_build_graph/host/graph_recorder_pool.h"
 
 #include <functional>
 #include <utility>
 
-// The ops implementations below need the full RuntimeContext, which is why the
-// header does not include this: a translation unit cannot see both it and
-// orchestration_api.h's partial definition.
+// Included for the two ops declarations below. The pool itself takes the context
+// only as an opaque owner token, so nothing here dereferences it.
 #include "host_build_graph/runtime_core.h"
 
 GraphAsyncRecordingState &graph_recorder_pool() {
@@ -36,10 +35,10 @@ bool graph_recorder_prewarm() { return graph_recorder_pool().prewarm(); }
 // `args` is the in-flight entry's own boundary, which outlives every job that reads it
 // (the bind or explicit commit drains that owner's jobs first), so the pool forwards it by
 // reference rather than copying it.
-bool graph_record_start_impl(RuntimeContext *rt, const GraphTaskArgs &args, void *job) {
+bool graph_record_start_impl(OrchContext *ctx, const GraphTaskArgs &args, void *job) {
     if (job == nullptr) return false;
     auto *record = static_cast<std::function<void(const GraphTaskArgs &)> *>(job);
-    return graph_recorder_pool().start(args, std::move(*record), rt);
+    return graph_recorder_pool().start(args, std::move(*record), ctx);
 }
 
-void graph_record_wait_impl(RuntimeContext *rt) { graph_recorder_pool().wait(rt); }
+void graph_record_wait_impl(OrchContext *ctx) { graph_recorder_pool().wait(ctx); }

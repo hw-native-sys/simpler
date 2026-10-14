@@ -17,7 +17,7 @@
  * target compiles none of this and no device code reads the ops field.
  */
 
-#include "host_build_graph/host_phase_trace.h"
+#include "host_build_graph/host/host_phase_trace.h"
 #include "host_build_graph/runtime_core.h"
 
 #include <inttypes.h>
@@ -26,8 +26,10 @@
 #include <stdlib.h>
 
 #include "common/unified_log.h"
+#include "host_build_graph/host/orchestrator.h"
+#include "host_build_graph/host/orch_ops.h"
 #include "host_build_graph/runtime_status.h"
-#include "host_build_graph/host_tensor_access.h"
+#include "host_build_graph/host/host_tensor_access.h"
 #include "host_build_graph/task_id.h"
 
 // =============================================================================
@@ -35,32 +37,32 @@
 // =============================================================================
 
 static TaskOutputTensors
-submit_task_impl(RuntimeContext *rt, const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
-    return rt->orchestrator->submit_task(mixed_kernels, args);
+submit_task_impl(OrchContext *ctx, const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
+    return ctx->orchestrator->submit_task(mixed_kernels, args);
 }
 
-static TaskOutputTensors alloc_tensors_impl(RuntimeContext *rt, const CoreTaskArgs &args) {
-    return rt->orchestrator->alloc_tensors(args);
+static TaskOutputTensors alloc_tensors_impl(OrchContext *ctx, const CoreTaskArgs &args) {
+    return ctx->orchestrator->alloc_tensors(args);
 }
 
-static TaskOutputTensors submit_dummy_task_impl(RuntimeContext *rt, const CoreTaskArgs &args) {
-    return rt->orchestrator->submit_dummy_task(args);
+static TaskOutputTensors submit_dummy_task_impl(OrchContext *ctx, const CoreTaskArgs &args) {
+    return ctx->orchestrator->submit_dummy_task(args);
 }
 
-static GraphScopeResult graph_begin_impl(RuntimeContext *rt, uint64_t graph_key, const GraphTaskArgs &args) {
-    if (rt == nullptr) return GraphScopeResult{};
-    return rt->orchestrator->graph_begin(graph_key, args);
+static GraphScopeResult graph_begin_impl(OrchContext *ctx, uint64_t graph_key, const GraphTaskArgs &args) {
+    if (ctx == nullptr) return GraphScopeResult{};
+    return ctx->orchestrator->graph_begin(graph_key, args);
 }
 
-static bool graph_prepare_impl(RuntimeContext *rt, void *recording_handle, const GraphTaskArgs &args) {
-    return rt != nullptr && rt->orchestrator->graph_prepare(recording_handle, args);
+static bool graph_prepare_impl(OrchContext *ctx, void *recording_handle, const GraphTaskArgs &args) {
+    return ctx != nullptr && ctx->orchestrator->graph_prepare(recording_handle, args);
 }
 
-static void graph_abort_impl(RuntimeContext *rt, void *recording_handle) {
-    if (rt != nullptr) rt->orchestrator->graph_abort(recording_handle);
+static void graph_abort_impl(OrchContext *ctx, void *recording_handle) {
+    if (ctx != nullptr) ctx->orchestrator->graph_abort(recording_handle);
 }
 
-static bool graph_end_impl(RuntimeContext *rt) { return rt != nullptr && rt->orchestrator->graph_end(); }
+static bool graph_end_impl(OrchContext *ctx) { return ctx != nullptr && ctx->orchestrator->graph_end(); }
 
 // The orchestration .so's phases arrive already bracketed, so this only forwards them
 // to the same pool the runtime's own records go to. Defined only at SIMPLER_DFX=1: the
@@ -72,48 +74,48 @@ static void record_orch_phase_impl(uint32_t kind, uint64_t start_ns, uint64_t en
 }
 #endif
 
-static void graph_commit_impl(RuntimeContext *rt) {
-    if (rt != nullptr) rt->orchestrator->graph_commit();
+static void graph_commit_impl(OrchContext *ctx) {
+    if (ctx != nullptr) ctx->orchestrator->graph_commit();
 }
 
-void rt_scope_begin(RuntimeContext *rt) {
-    ScopeMode mode = rt->pending_scope_mode;
-    rt->pending_scope_mode = ScopeMode::AUTO;
-    rt->orchestrator->begin_scope(mode);
+void rt_scope_begin(OrchContext *ctx) {
+    ScopeMode mode = ctx->pending_scope_mode;
+    ctx->pending_scope_mode = ScopeMode::AUTO;
+    ctx->orchestrator->begin_scope(mode);
 }
 
-void rt_scope_end(RuntimeContext *rt) { rt->orchestrator->end_scope(); }
+void rt_scope_end(OrchContext *ctx) { ctx->orchestrator->end_scope(); }
 
-void rt_orchestration_done(RuntimeContext *rt) {
+void rt_orchestration_done(OrchContext *ctx) {
     // Host orchestration calls this runtime entry directly rather than the
     // orchestration-SO wrapper. Commit here as well so an all-Graph entry has a
     // final synchronization point for its asynchronous recording and deferred
     // outer shells even when no later non-Graph task forced an earlier commit.
-    rt->orchestrator->graph_commit();
-    rt->orchestrator->mark_done();
+    ctx->orchestrator->graph_commit();
+    ctx->orchestrator->mark_done();
     // The orchestrator itself never crosses to the device, so the count of tasks
     // it completed inline is published into the header that does.
-    rt->inline_completed_tasks = rt->orchestrator->inline_completed_tasks;
+    ctx->rt->inline_completed_tasks = ctx->orchestrator->inline_completed_tasks;
 }
 
-static bool is_fatal_impl(RuntimeContext *rt) { return rt->orchestrator->is_fatal(); }
+static bool is_fatal_impl(OrchContext *ctx) { return ctx->orchestrator->is_fatal(); }
 
-void rt_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func, const char *fmt, ...) {
+void rt_report_fatal(OrchContext *ctx, int32_t error_code, const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     if (fmt == nullptr || fmt[0] == '\0') {
-        rt->orchestrator->report_fatal(error_code, func, nullptr);
+        ctx->orchestrator->report_fatal(error_code, func, nullptr);
     } else {
         char message[1024];
         vsnprintf(message, sizeof(message), fmt, args);
-        rt->orchestrator->report_fatal(error_code, func, "%s", message);
+        ctx->orchestrator->report_fatal(error_code, func, "%s", message);
     }
     va_end(args);
 }
 
-static bool require_host_tensor(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, const char *caller) {
+static bool require_host_tensor(OrchContext *ctx, const simpler::hbg::Tensor &tensor, const char *caller) {
     if (tensor.address_space == AddressSpace::HOST && !tensor.owner_task_id.is_valid()) return true;
-    rt->orchestrator->report_fatal(
+    ctx->orchestrator->report_fatal(
         SIMPLER_ERROR_INVALID_ARGS, caller,
         "host tensor access requires an explicit HOST/NONE argument; DEVICE values need an explicit copy before submit"
     );
@@ -121,19 +123,19 @@ static bool require_host_tensor(RuntimeContext *rt, const simpler::hbg::Tensor &
 }
 
 uint64_t
-get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+get_tensor_data(OrchContext *ctx, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     // A refused access cannot replace an earlier orchestration failure.
-    if (rt->orchestrator->is_fatal()) {
+    if (ctx->orchestrator->is_fatal()) {
         return 0;
     }
     if (tensor.buffer.addr == 0) {
-        rt->orchestrator->report_fatal(
+        ctx->orchestrator->report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "get_tensor_data requires a nonempty allocated HOST view"
         );
         return 0;
     }
 
-    if (!require_host_tensor(rt, tensor, __FUNCTION__)) {
+    if (!require_host_tensor(ctx, tensor, __FUNCTION__)) {
         return 0;
     }
 
@@ -141,8 +143,8 @@ get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t
     uint64_t elem_size = get_element_size(tensor.dtype);
     uint64_t elem_addr = tensor.buffer.addr + flat_offset * elem_size;
     uint64_t result = 0;
-    if (!host_tensor_read(rt->tensor_access, elem_addr, &result, elem_size)) {
-        rt->orchestrator->report_fatal(
+    if (!host_tensor_read(ctx->tensor_access, elem_addr, &result, elem_size)) {
+        ctx->orchestrator->report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
             "HOST argument read is outside the bound view or violates its declared direction"
         );
@@ -152,28 +154,28 @@ get_tensor_data(RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t
 }
 
 void set_tensor_data(
-    RuntimeContext *rt, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+    OrchContext *ctx, const simpler::hbg::Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 ) {
     // Preserve the first orchestration failure.
-    if (rt->orchestrator->is_fatal()) {
+    if (ctx->orchestrator->is_fatal()) {
         return;
     }
     if (tensor.buffer.addr == 0) {
-        rt->orchestrator->report_fatal(
+        ctx->orchestrator->report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "set_tensor_data requires a nonempty allocated HOST view"
         );
         return;
     }
 
-    if (!require_host_tensor(rt, tensor, __FUNCTION__)) {
+    if (!require_host_tensor(ctx, tensor, __FUNCTION__)) {
         return;
     }
 
     uint64_t flat_offset = tensor.compute_flat_offset(indices, ndims);
     uint64_t elem_size = get_element_size(tensor.dtype);
     uint64_t elem_addr = tensor.buffer.addr + flat_offset * elem_size;
-    if (!host_tensor_write(rt->tensor_access, elem_addr, &value, elem_size)) {
-        rt->orchestrator->report_fatal(
+    if (!host_tensor_write(ctx->tensor_access, elem_addr, &value, elem_size)) {
+        ctx->orchestrator->report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
             "HOST argument write is outside the bound view or violates its declared direction"
         );
@@ -181,10 +183,10 @@ void set_tensor_data(
     }
 }
 
-static int32_t available_cluster_count_impl(RuntimeContext *rt) { return rt->orchestrator->total_cluster_count; }
-static int32_t available_aiv_count_impl(RuntimeContext *rt) { return rt->orchestrator->total_aiv_count; }
+static int32_t available_cluster_count_impl(OrchContext *ctx) { return ctx->orchestrator->total_cluster_count; }
+static int32_t available_aiv_count_impl(OrchContext *ctx) { return ctx->orchestrator->total_aiv_count; }
 
-static const RuntimeOps s_runtime_ops = {
+static const OrchOps s_orch_ops = {
     .submit_task = submit_task_impl,
     .scope_begin = rt_scope_begin,
     .scope_end = rt_scope_end,
@@ -226,10 +228,10 @@ static const RuntimeOps s_runtime_ops = {
 // for the orchestration .so and clears the field again before the RuntimeContext
 // travels, so the device never receives a host address here.
 
-void runtime_bind_ops(RuntimeContext *rt) { rt->ops = &s_runtime_ops; }
+void orch_bind_ops(OrchContext *ctx) { ctx->ops = &s_orch_ops; }
 
-void runtime_set_mode(RuntimeContext *rt, RuntimeMode mode) {
-    if (rt) {
-        rt->mode = mode;
+void runtime_set_mode(RuntimeContext *runtime, RuntimeMode mode) {
+    if (runtime) {
+        runtime->mode = mode;
     }
 }

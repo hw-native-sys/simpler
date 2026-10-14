@@ -363,6 +363,13 @@ class KernelCompiler:
                 for f in sorted(src_dir.iterdir()):
                     if f.suffix in (".cpp", ".c") and f.is_file():
                         source_files.append(str(f))
+        # Individually named sources, for a file whose directory holds more than the
+        # .so needs. Unlike source_dirs this names one file, so nothing beside it is
+        # swept in.
+        for src_file_rel in orch_cfg.get("source_files", []):
+            src_file = (config_dir / src_file_rel).resolve()
+            if src_file.is_file():
+                source_files.append(str(src_file))
 
         return include_dirs, source_files
 

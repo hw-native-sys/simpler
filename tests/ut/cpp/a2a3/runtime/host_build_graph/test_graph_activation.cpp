@@ -29,7 +29,7 @@
 
 #include "utils/device_arena.h"
 #include "scheduler/scheduler.h"
-#include "host_build_graph/orchestrator.h"
+#include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/shared_memory.h"
 
 class GraphActivationTest : public ::testing::Test {

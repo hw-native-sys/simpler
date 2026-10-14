@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "host_build_graph/graph_submit.h"
+#include "host_build_graph/host/graph_submit.h"
 
 #include <stdint.h>
 #include <string.h>
@@ -32,22 +32,22 @@
 #include "assert_compat.h"
 #include "common/host_phase_kind.h"
 #include "common/unified_log.h"
-#include "host_build_graph/dep_compute.h"
-#include "host_build_graph/dep_gen_host_graph.h"
-#include "host_build_graph/graph_boundary_match.h"
 #include "host_build_graph/graph_execution.h"
-#include "host_build_graph/graph_host_state.h"
-#include "host_build_graph/graph_recording.h"
-#include "host_build_graph/host_phase_trace.h"
-#include "host_build_graph/orch_profiling.h"
-#include "host_build_graph/orchestrator_internal.h"
+#include "host_build_graph/host/dep_compute.h"
+#include "host_build_graph/host/dep_gen_host_graph.h"
+#include "host_build_graph/host/graph_boundary_match.h"
+#include "host_build_graph/host/graph_host_state.h"
+#include "host_build_graph/host/graph_recording.h"
+#include "host_build_graph/host/host_phase_trace.h"
+#include "host_build_graph/host/orch_profiling.h"
+#include "host_build_graph/host/orchestrator_internal.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_types.h"
 #include "host_build_graph/shared_memory.h"
 #include "host_build_graph/task_id.h"
-#include "host_build_graph/tensormap.h"
+#include "host_build_graph/host/tensormap.h"
 #include "host_build_graph/types.h"
-#include "tensor.h"
+#include "host_build_graph/tensor.h"
 
 namespace {
 

@@ -20,11 +20,11 @@
 #include <vector>
 
 #include "common/args_dump_task_metadata.h"
-#include "host_build_graph/graph_boundary_match.h"
+#include "host_build_graph/host/graph_boundary_match.h"
 #include "host_build_graph/graph_execution.h"
 #include "host_build_graph/runtime_types.h"
 #include "host_build_graph/submit_types.h"
-#include "host_build_graph/tensormap.h"
+#include "host_build_graph/host/tensormap.h"
 #include "host_build_graph/types.h"
 #include "task_interface/assert_compat.h"
 

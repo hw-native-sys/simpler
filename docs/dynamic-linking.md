@@ -90,16 +90,25 @@ All SOs loaded by DeviceRunner (AICPU, AICore, kernel, orchestration) use
 SOs need from the host SO are passed via explicit function pointer injection
 (see "Function Pointer Injection" below).
 
-### Orchestration SO: `RTLD_LAZY | RTLD_LOCAL`
+### Orchestration SO
 
-Loaded by the AICPU executor at runtime from a temp file. Uses `RTLD_LAZY`
-because not all symbols may be referenced. Communicates with the runtime
-through a function pointer table (`RuntimeOps`), not direct symbol
-linkage.
+Loaded from a temp file. Which side loads it, with which flags, and which ops
+table it calls through all differ by runtime:
 
-`RuntimeOps` is a binary ABI without size or version negotiation.
+| Runtime | Loaded by | Flags | Ops table |
+| ------- | --------- | ----- | --------- |
+| `tensormap_and_ringbuffer` | the AICPU executor | `RTLD_LAZY \| RTLD_LOCAL` — not all symbols may be referenced | `RuntimeOps`, reached through `RuntimeContext` |
+| `host_build_graph` | the host | `RTLD_NOW \| RTLD_LOCAL` | `OrchOps`, reached through `OrchContext` |
+
+`host_build_graph` orchestrates on the host, so its orchestration SO never
+reaches the AICPU at all, and the context it calls through carries only host
+state — none of it travels in the image uploaded to the device. Either way the
+SO communicates with its runtime through the function pointer table, not direct
+symbol linkage.
+
+Both tables are a binary ABI without size or version negotiation.
 Orchestration SOs and their runtime must therefore be built from the same
-simpler revision. Changing the table's field count, order, or signatures
+simpler revision. Changing a table's field count, order, or signatures
 invalidates previously built orchestration SOs; cached or prebuilt artifacts
 must be rebuilt before they are loaded by the updated runtime.
 

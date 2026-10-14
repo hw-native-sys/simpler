@@ -21,7 +21,7 @@
 #include <cstdint>
 #include <sys/mman.h>
 
-#include "host_build_graph/orchestrator_internal.h"
+#include "host_build_graph/host/orchestrator_internal.h"
 #include "host_build_graph/shared_memory.h"
 #include "scheduler/scheduler.h"
 #include "utils/device_arena.h"

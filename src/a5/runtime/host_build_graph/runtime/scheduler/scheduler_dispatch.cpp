@@ -25,7 +25,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
-#include "host_build_graph/async_poll_phase_accumulator.h"
+#include "host_build_graph/device/async_poll_phase_accumulator.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_core.h"
 #include "runtime.h"

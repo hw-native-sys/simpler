@@ -32,7 +32,7 @@ shared object, opens it with `dlopen(RTLD_LOCAL)`, and resolves:
 
 - `aicpu_orchestration_config`;
 - `aicpu_orchestration_entry`; and
-- `framework_bind_runtime`.
+- `framework_bind_orch_context`.
 
 The resolved handle and entry points belong to the registered callable and stay
 alive across prepared runs. Unregister/context teardown closes the handle and
@@ -183,12 +183,12 @@ a boundary from which region happens to be reserved first —
 orchestrator, so nothing on the device reads its state: not the `fanin_seen_epoch`
 table, not the scope arrays, not the TensorMap (~9.3 MB between them). It is
 therefore a plain host object that owns those arrays — `OrchestratorState::init`
-allocates them — and `RuntimeContext` reaches it through a pointer that `bind` drops
-before the copied zone is uploaded, so no host address crosses the boundary. A
-`static_assert` keeps `RuntimeContext` trivially copyable, which is what forbids
-putting an owning member back inside it. The one orchestrator value the device-side
-scheduler reads, the count of tasks completed inline during orchestration, is a
-scalar `rt_orchestration_done` publishes into the runtime header.
+allocates them — and the host-side `OrchContext` is what reaches it, through a
+pointer `RuntimeContext` does not carry, so no host address can cross the boundary
+in the first place. A `static_assert` keeps `RuntimeContext` trivially copyable,
+which is what forbids putting an owning member back inside it. The one orchestrator
+value the device-side scheduler reads, the count of tasks completed inline during
+orchestration, is a scalar `rt_orchestration_done` publishes into the runtime header.
 
 **Why the scheduler state is device-written.** `SchedulerState` holds no
 per-run content: `sm_header` and the task-header pointer derive from a pooled SM base,

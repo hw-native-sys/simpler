@@ -21,7 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "host_build_graph/graph_recording.h"
+#include "host_build_graph/host/graph_recording.h"
 
 struct ChipTaskSlotState;
 

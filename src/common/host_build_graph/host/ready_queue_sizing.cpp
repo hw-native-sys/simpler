@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "host_build_graph/ready_queue_sizing.h"
+#include "host_build_graph/host/ready_queue_sizing.h"
 
 #include "host_build_graph/runtime_status.h"
 

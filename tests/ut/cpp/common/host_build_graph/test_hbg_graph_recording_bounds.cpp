@@ -29,7 +29,7 @@
 #include "graph_execution.h"
 #include "graph_host_state.h"
 #include "scheduler/scheduler.h"
-#include "host_build_graph/orchestrator.h"
+#include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/shared_memory.h"
 #include "utils/device_arena.h"
 #include "host_build_graph/task_id.h"

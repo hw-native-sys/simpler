@@ -52,7 +52,7 @@
 #include "assert_compat.h"
 #include "host_build_graph/task_id.h"
 #include "profiling_config.h"
-#include "tensor.h"
+#include "host_build_graph/tensor.h"
 
 // Overlap geometry types. Relocated here from tensor.h: they are used only by
 // the runtime's overlap-detection / dependency machinery, not by the

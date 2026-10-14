@@ -13,14 +13,14 @@
 
 #include <stdint.h>
 
-#include "host_build_graph/dep_compute.h"
-#include "host_build_graph/dep_gen_host_graph.h"
-#include "host_build_graph/orchestrator.h"
+#include "host_build_graph/host/dep_compute.h"
+#include "host_build_graph/host/dep_gen_host_graph.h"
+#include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_types.h"
 #include "host_build_graph/task_id.h"
-#include "host_build_graph/tensormap.h"
-#include "tensor.h"
+#include "host_build_graph/host/tensormap.h"
+#include "host_build_graph/tensor.h"
 
 // The ordinary submit path's primitives, shared by the two translation units that submit
 // into one OrchestratorState: host/orchestrator.cpp, which defines them and runs the

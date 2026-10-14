@@ -64,16 +64,17 @@
 
 #include "assert_compat.h"
 #include "host_build_graph/runtime_status.h"
-#include "host_build_graph/dep_gen_host_graph.h"
+#include "host_build_graph/host/dep_gen_host_graph.h"
 #include "host_build_graph/graph_execution.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
-#include "host_build_graph/host_tensor_access.h"
-#include "host_build_graph/graph_host_state.h"
-#include "host_build_graph/host_phase_trace.h"
-#include "host_build_graph/orchestrator.h"
-#include "host_build_graph/ready_queue_sizing.h"
-#include "host_build_graph/graph_recorder_pool.h"
+#include "host_build_graph/host/host_tensor_access.h"
+#include "host_build_graph/host/graph_host_state.h"
+#include "host_build_graph/host/host_phase_trace.h"
+#include "host_build_graph/host/orchestrator.h"
+#include "host_build_graph/host/orch_ops.h"
+#include "host_build_graph/host/ready_queue_sizing.h"
+#include "host_build_graph/host/graph_recorder_pool.h"
 #include "host_build_graph/runtime_core.h"
 #include "host_build_graph/shared_memory.h"
 #include "host_build_graph/types.h"
@@ -819,12 +820,12 @@ bool create_orch_so_tempfile(const uint8_t *data, size_t size, std::string *out_
 
 // The orchestration .so exports these (submit_task form).
 typedef void (*OrchestrationEntryFunc)(const ChipTaskArgs &);
-typedef void (*OrchestrationBindFunc)(RuntimeContext *);
+typedef void (*OrchestrationBindFunc)(OrchContext *);
 typedef void (*OrchestrationFinishFunc)();
 
 // Resolved orchestration .so entry points. register_callable_impl allocates one
-// of these (the entry, plus the .so's own framework_bind_runtime, which sets
-// the .so-private g_current_runtime its inline rt_submit_* read) and stores its
+// of these (the entry, plus the .so's own framework_bind_orch_context, which sets
+// the .so-private context pointer its inline rt_submit_* read) and stores its
 // pointer in CallableArtifacts::host_orch_func_ptr. Owned for the callable's
 // lifetime alongside host_dlopen_handle.
 struct HostOrchEntryPoints {
@@ -1433,13 +1434,12 @@ int32_t run_host_orchestration(
     std::memset(host_sm, 0, sm_segs.storage);
 
     // Re-point the orchestrator half at the host SM (scheduler keeps device SM).
-    // Host-owned and destroyed with this frame, so rt->orchestrator is dropped on
-    // every exit — it must never outlive the object it names.
+    // Host-owned and destroyed with this frame, as is the context naming it — the
+    // device-side RuntimeContext carries neither.
     OrchestratorState orchestrator;
-    rt->orchestrator = &orchestrator;
-    RAIIScopeGuard orchestrator_binding([rt]() {
-        rt->orchestrator = nullptr;
-    });
+    OrchContext orch_ctx{};
+    orch_ctx.orchestrator = &orchestrator;
+    orch_ctx.rt = rt;
     // The graph heap is allocated out of the HEAP_VIRTUAL_BASE window: its device
     // region is committed below, once this pass has revealed how many bytes it
     // actually needs, and compact_live_image moves every address the orchestrator
@@ -1491,7 +1491,7 @@ int32_t run_host_orchestration(
         LOG_ERROR("host-orch: worker_count %d yields no clusters", runtime->get_worker_count());
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    runtime_bind_ops(rt);
+    orch_bind_ops(&orch_ctx);
     orchestrator.total_cluster_count = block_dim * PLATFORM_AIC_CORES_PER_BLOCKDIM;
     orchestrator.total_aiv_count = block_dim * PLATFORM_AIV_CORES_PER_BLOCKDIM;
     rt->mode = MODE_EXECUTE;
@@ -1499,22 +1499,26 @@ int32_t run_host_orchestration(
     // arguments and runtime outputs are DEVICE tensors and cannot be read here.
     const auto *entry_points = reinterpret_cast<const HostOrchEntryPoints *>(host_orch_func_ptr);
     if (entry_points->bind == nullptr) {
-        LOG_ERROR("host-orch: orch .so framework_bind_runtime was not resolved");
+        LOG_ERROR("host-orch: orch .so framework_bind_orch_context was not resolved");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    rt->tensor_access = &tensor_access;
-    // Binds the orchestration .so's own framework_current_runtime, which its
+    orch_ctx.tensor_access = &tensor_access;
+    // Binds the orchestration .so's own framework_current_orch_context, which its
     // inline rt_submit_* read. The host library links a same-named copy from
     // orchestration/common.cpp, but nothing outside the .so includes
     // orchestration_api.h, so nothing reads that one — rt_scope_* and
-    // rt_orchestration_done take the runtime as an argument.
-    entry_points->bind(rt);
+    // rt_orchestration_done take the context as an argument.
+    entry_points->bind(&orch_ctx);
 
     // What the .so holds for this bind is released when this function leaves, by whichever
     // path: the state it covers -- the Graph Config registry today -- is paired with
-    // graph_state below, which is a local of this function and dies the same way.
+    // graph_state below, which is a local of this function and dies the same way. The
+    // bound context is one of them: orch_ctx is a local of this frame, so the .so's
+    // global may not outlive it. Unbinding after finish() keeps the context reachable
+    // for whatever the .so still does there.
     RAIIScopeGuard orch_finish([entry_points]() {
         if (entry_points->finish != nullptr) entry_points->finish();
+        entry_points->bind(nullptr);
     });
 
     const BindPhaseMark orch_phase = bind_phase_begin();
@@ -1522,14 +1526,14 @@ int32_t run_host_orchestration(
         // Recorder jobs borrow this build's state and execute code from its SO.
         // Drain before commit can retire their entries, and before unwinding can
         // release graph_state, orchestrator, or the tensor-access views.
-        RAIIScopeGuard recorder_completion([rt]() {
-            rt->ops->graph_record_wait(rt);
+        RAIIScopeGuard recorder_completion([&orch_ctx]() {
+            orch_ctx.ops->graph_record_wait(&orch_ctx);
         });
-        rt_scope_begin(rt);
+        rt_scope_begin(&orch_ctx);
         entry_points->entry(orch_l2);
-        rt_scope_end(rt);
+        rt_scope_end(&orch_ctx);
     }
-    rt_orchestration_done(rt);
+    rt_orchestration_done(&orch_ctx);
 #if SIMPLER_ORCH_PROFILING
     // Per-sub-step cumulatives across this bind's submits. The accumulators only
     // exist in a SIMPLER_ORCH_PROFILING build (build_runtimes.py --profiling-orch 1),
@@ -1750,12 +1754,8 @@ int32_t run_host_orchestration(
     }
     char *upload_base = static_cast<char *>(staging_addr);
 
-    // The copied zone carries no host address: the orchestrator and the ops table are
-    // both host-only, and no device code may reach host memory through the image.
-    // Their work is done, so the pointers go early rather than at the guard's scope
-    // exit.
-    rt->orchestrator = nullptr;
-    rt->ops = nullptr;
+    // The copied zone carries no host address by construction: the orchestrator and
+    // the ops table live on the host-side OrchContext, which never enters this image.
     std::memcpy(upload_base, static_cast<const char *>(host_arena.base()) + layout.off_copied_begin, copied_bytes);
     const uint64_t compacted = sm_layout::compact_live_image(
         static_cast<const char *>(host_sm), task_capacity, bind_usage, heap_rebase, upload_base + copied_bytes
@@ -1871,12 +1871,12 @@ extern "C" int register_callable_impl(const ChipCallable *callable, const HostAp
             dlclose(handle);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        // The orch .so has its own framework_bind_runtime / g_current_runtime
-        // (orchestration/common.cpp is compiled into it); resolve it now so the
-        // per-run bind can set it before the .so's inline rt_submit_* run.
-        void *bind_sym = dlsym(handle, "framework_bind_runtime");
+        // The orch .so has its own framework_bind_orch_context and the context
+        // pointer it sets (orchestration/common.cpp is compiled into it); resolve it
+        // now so the per-run bind can set it before the .so's inline rt_submit_* run.
+        void *bind_sym = dlsym(handle, "framework_bind_orch_context");
         if (bind_sym == nullptr) {
-            LOG_ERROR("host-orch: orch .so does not export framework_bind_runtime: %s", dlerror());
+            LOG_ERROR("host-orch: orch .so does not export framework_bind_orch_context: %s", dlerror());
             dlclose(handle);
             return PTO_RUNTIME_ERR_INTERNAL;
         }

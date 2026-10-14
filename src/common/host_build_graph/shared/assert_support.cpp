@@ -9,7 +9,6 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "assert_compat.h"
-#include "host_build_graph/common.h"
 
 #ifdef __linux__
 #include <cxxabi.h>
@@ -21,8 +20,6 @@
 #include <vector>
 #endif
 
-struct RuntimeContext;
-
 // Unified-log error sink. Forward-declared here rather than pulled via
 // common/unified_log.h: that header lives under common/log/include, which is
 // not on the orchestration .so build's include path. The symbol resolves at
@@ -30,24 +27,6 @@ struct RuntimeContext;
 // .so (against the executor's unified_log_device), so onboard diagnostics still
 // reach the CANN device log.
 extern "C" void unified_log_error(const char *func, const char *fmt, ...);
-
-namespace {
-// Plain global (not thread_local) to avoid glibc TLSDESC stale-resolution
-// crash (BZ #32412) when the orchestration SO is dlclose'd/re-dlopen'd
-// between execution rounds.  All orchestrator threads bind the same rt
-// value, so per-thread storage is unnecessary.
-RuntimeContext *g_current_runtime = nullptr;
-}  // namespace
-
-extern "C" __attribute__((visibility("default"))) void framework_bind_runtime(RuntimeContext *rt) {
-    g_current_runtime = rt;
-}
-
-// Keep current_runtime local to this .so so orchestration helpers do not
-// accidentally bind to the AICPU binary's same-named symbol.
-extern "C" __attribute__((visibility("hidden"))) RuntimeContext *framework_current_runtime() {
-    return g_current_runtime;
-}
 
 /**
  * Use addr2line to convert an address to file:line information.
@@ -185,7 +164,7 @@ AssertionError::AssertionError(const char *condition, const char *file, int line
 [[noreturn]] void assert_impl(const char *condition, const char *file, int line) {
     // Use unified_log_error directly rather than the LOG_ERROR macro: that macro
     // lives in orchestration_api.h and expands to
-    // current_runtime()->ops->log_error, but the ops table's definition pulls in
+    // current_orch_context()->ops->log_error, but the ops table's definition pulls in
     // types.h (Arg → __aicore__-only to_u64), which the AICore build of this
     // TU cannot compile. unified_log_error reaches the same sink without that
     // dependency.
