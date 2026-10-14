@@ -68,9 +68,11 @@ public:
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
         bool activated = true, NativeRunProvenance provenance = {}
     );
+    // A non-null caller stream requires actual enqueue before a successful
+    // return. Stream work appended after that return is ordered after both kernels.
     ChipRun submit(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr
     );
 
     void drain();

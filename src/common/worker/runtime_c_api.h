@@ -28,6 +28,7 @@
  *                   simpler_launch_run, simpler_launch_run_joined,
  *                   simpler_poll_run, simpler_wait_run,
  *                   simpler_finalize_run, simpler_run, simpler_launch_run_on_stream,
+ *                   simpler_validate_caller_stream,
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
  *                   get_run_stream_set_create_count
@@ -926,6 +927,13 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
  * execution failure before the marker leaves it unchanged.
  */
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/**
+ * Check the execution environment and reject capture before per-call preparation.
+ * No run is admitted or published. A successful check does not reserve the stream;
+ * the caller serializes capture changes and keeps it live through finalization.
+ */
+int simpler_validate_caller_stream(DeviceContextHandle ctx, void *caller_stream);
 
 /**
  * Submit a prepared native run between the caller stream's preceding and

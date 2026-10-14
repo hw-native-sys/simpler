@@ -1243,6 +1243,8 @@ int supports_joined_diagnostic_launch_ctx(DeviceContextHandle, RuntimeHandle, Ru
 
 int simpler_launch_run_joined(DeviceContextHandle, RuntimeHandle, RuntimeHandle) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
+int simpler_validate_caller_stream(DeviceContextHandle, void *) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
 int simpler_launch_run_on_stream(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle) {
     return PTO_RUNTIME_ERR_UNSUPPORTED;
 }

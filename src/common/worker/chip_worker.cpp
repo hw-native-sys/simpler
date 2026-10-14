@@ -266,6 +266,11 @@ void ChipWorker::init(
         run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
         prepare_run_fn_ = load_symbol<SimplerPrepareRunFn>(handle, "simpler_prepare_run");
         launch_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_launch_run");
+        // Older runtime modules have neither entry; ordinary submissions need neither.
+        validate_caller_stream_fn_ =
+            reinterpret_cast<ValidateCallerStreamFn>(dlsym(handle, "simpler_validate_caller_stream"));
+        launch_run_on_stream_fn_ =
+            reinterpret_cast<CallerStreamLaunchFn>(dlsym(handle, "simpler_launch_run_on_stream"));
         launch_run_joined_fn_ = load_symbol<SimplerJoinedLaunchFn>(handle, "simpler_launch_run_joined");
         poll_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_poll_run");
         wait_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_wait_run");
@@ -542,6 +547,8 @@ void ChipWorker::init(
         run_fn_ = nullptr;
         prepare_run_fn_ = nullptr;
         launch_run_fn_ = nullptr;
+        validate_caller_stream_fn_ = nullptr;
+        launch_run_on_stream_fn_ = nullptr;
         launch_run_joined_fn_ = nullptr;
         poll_run_fn_ = nullptr;
         wait_run_fn_ = nullptr;
@@ -618,6 +625,8 @@ void ChipWorker::init(
         run_fn_ = nullptr;
         prepare_run_fn_ = nullptr;
         launch_run_fn_ = nullptr;
+        validate_caller_stream_fn_ = nullptr;
+        launch_run_on_stream_fn_ = nullptr;
         launch_run_joined_fn_ = nullptr;
         poll_run_fn_ = nullptr;
         wait_run_fn_ = nullptr;
@@ -785,6 +794,8 @@ void ChipWorker::finalize() {
     run_fn_ = nullptr;
     prepare_run_fn_ = nullptr;
     launch_run_fn_ = nullptr;
+    validate_caller_stream_fn_ = nullptr;
+    launch_run_on_stream_fn_ = nullptr;
     launch_run_joined_fn_ = nullptr;
     poll_run_fn_ = nullptr;
     wait_run_fn_ = nullptr;
@@ -1135,10 +1146,10 @@ ChipRun ChipWorker::submit_chip_run(
 
 ChipRun ChipWorker::submit_chip_run(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value
+    int32_t accepted_value, void *caller_stream
 ) {
     if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
-    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value);
+    return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value, caller_stream);
 }
 
 void ChipWorker::stop_chip_run_lane_admission() noexcept {
@@ -1149,7 +1160,15 @@ void ChipWorker::close_chip_run_lane() {
     if (run_lane_ != nullptr) run_lane_->close();
 }
 
-void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run) {
+void ChipWorker::validate_caller_stream(void *caller_stream) {
+    if (!initialized_ || validate_caller_stream_fn_ == nullptr || launch_run_on_stream_fn_ == nullptr) {
+        throw std::runtime_error("caller-stream submission requires an initialized runtime with caller ordering");
+    }
+    const int rc = validate_caller_stream_fn_(device_ctx_, caller_stream);
+    if (rc != 0) throw std::runtime_error("caller-stream validation failed with code " + std::to_string(rc));
+}
+
+void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream) {
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
         if (run.slot_id >= runtime_bufs_.size()) {
@@ -1161,7 +1180,10 @@ void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run) {
         }
     }
 
-    int rc = launch_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
+    if (caller_stream != nullptr) validate_caller_stream(caller_stream);
+    int rc = caller_stream != nullptr ?
+                 launch_run_on_stream_fn_(device_ctx_, runtime_bufs_[run.slot_id].data(), caller_stream, nullptr) :
+                 launch_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
     if (rc != 0) {
         int poll_rc = poll_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
         std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -1177,7 +1199,9 @@ void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run) {
     state.phase = NativeRunPhase::LAUNCHED;
 }
 
-bool ChipWorker::launch_native_run_joined(const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor) {
+bool ChipWorker::launch_native_run_joined(
+    const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor, void *caller_stream
+) {
     if (!supports_joined_native_launch()) return false;
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -1198,9 +1222,15 @@ bool ChipWorker::launch_native_run_joined(const ChipWorkerNativeRun &run, const 
         if (ahead.run_epoch != predecessor.run_epoch || ahead.phase != NativeRunPhase::LAUNCHED) return false;
     }
 
-    int rc = launch_run_joined_fn_(
-        device_ctx_, runtime_bufs_[run.slot_id].data(), runtime_bufs_[predecessor.slot_id].data()
-    );
+    if (caller_stream != nullptr) validate_caller_stream(caller_stream);
+    int rc =
+        caller_stream != nullptr ?
+            launch_run_on_stream_fn_(
+                device_ctx_, runtime_bufs_[run.slot_id].data(), caller_stream, runtime_bufs_[predecessor.slot_id].data()
+            ) :
+            launch_run_joined_fn_(
+                device_ctx_, runtime_bufs_[run.slot_id].data(), runtime_bufs_[predecessor.slot_id].data()
+            );
     // The backend refuses this way when it cannot order the two right now, and
     // it changes nothing when it does: the run is still prepared, and the caller
     // launches it ordinarily once it reaches the front.

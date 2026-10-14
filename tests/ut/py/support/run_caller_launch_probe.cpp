@@ -208,6 +208,13 @@ int main() {
     next_stream = next_event = 0;
     ProbeRunner runner;
     runner.initialize();
+    const int prior_copies = copies;
+    assert(simpler_validate_caller_stream(nullptr, caller) == PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    assert(simpler_validate_caller_stream(&runner, nullptr) == PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    assert(simpler_validate_caller_stream(&runner, caller) == PTO_RUNTIME_ERR_UNSUPPORTED);
+    capture = false;
+    assert(simpler_validate_caller_stream(&runner, caller) == 0);
+    assert(copies == prior_copies);
     runner.check_failed_event_close();
     runner.finish();
     std::puts("PASS: real launch ordering, eleven partial failures, and pre-publication capture refusal");

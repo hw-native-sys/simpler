@@ -3726,13 +3726,19 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "_submit_chip_run_direct",
-            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config) {
-                return self.submit_chip_run(callable_id, args, config);
+            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
+               uintptr_t caller_stream) {
+                return self.submit_chip_run(
+                    callable_id, args, config, nullptr, 0, reinterpret_cast<void *>(caller_stream)
+                );
             },
-            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::call_guard<nb::gil_scoped_release>(),
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::kw_only(), nb::arg("caller_stream") = 0,
+            nb::call_guard<nb::gil_scoped_release>(),
             "Submit materialized task args to the chip native-run lane without a pipeline lease and return the live "
             "run. The lane follows the runtime PipelineContract: compatible runs admit one active plus one prepared "
-            "successor; otherwise this call drains its predecessor before admitting."
+            "successor; otherwise this call drains its predecessor before admitting. With caller_stream, "
+            "success means both kernels and the caller exit wait are enqueued; launch failures throw. "
+            "The caller keeps its stream and buffers alive through retirement. Host copy-back still requires wait."
         )
         .def(
             "_prepare_native_run_materialized",
@@ -3750,8 +3756,11 @@ NB_MODULE(_task_interface, m) {
             "Prepare a native run from materialized task args after lease admission."
         )
         .def(
-            "_launch_native_run", &ChipWorker::launch_native_run, nb::arg("run"),
-            nb::call_guard<nb::gil_scoped_release>(),
+            "_launch_native_run",
+            [](ChipWorker &self, const ChipWorkerNativeRun &run) {
+                self.launch_native_run(run);
+            },
+            nb::arg("run"), nb::call_guard<nb::gil_scoped_release>(),
             "Launch a prepared native run and return after its real device launch fence."
         )
         .def(

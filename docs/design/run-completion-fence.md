@@ -82,6 +82,21 @@ still synchronous, and the old `simpler_kernel_mode_launch` stub and capability
 bit remain closed pending public Worker integration. Native completion events
 and their caller references are not a captured-graph lifetime contract.
 
+The direct `ChipWorker::submit_chip_run` / internal `_submit_chip_run_direct`
+entry accepts an optional caller stream. The lane validates it before admitting
+or preparing any new run. A successful return guarantees actual enqueue, not
+merely a prepared handle: it tries the existing joined-launch route, and drains
+a predecessor before launch if that route declines or the configured launch
+depth is one. Launch errors are thrown before returning instead of being deferred
+to the handle. Without a caller stream, the existing prepared-successor behavior
+is unchanged.
+
+The stream is recorded on that run, including a declined join's ordinary-launch
+fallback. Poll/wait/finalize and argument borrows remain the lane's existing
+lifecycle. Caller ordering covers device work; Program host output copy-back
+still requires run completion/finalization. The public `Worker.submit` does not
+yet expose this argument or attach a borrowed RTS context.
+
 ## The boundary
 
 Each stream records an event immediately after its own kernel:

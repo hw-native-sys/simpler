@@ -150,7 +150,8 @@ public:
         uint64_t run_id = 0, uint64_t dispatch_id = 0, volatile int32_t *accepted_state = nullptr,
         int32_t accepted_value = 0, NativeRunProvenance provenance = {}
     );
-    void launch_native_run(const ChipWorkerNativeRun &run);
+    void launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream = nullptr);
+    void validate_caller_stream(void *caller_stream);
     /**
      * Launch `run` ordered behind `predecessor`, which must be a run this
      * ChipWorker launched and has not yet reaped.
@@ -165,7 +166,9 @@ public:
      * to `launch_native_run` it later. Every other failure throws, exactly as
      * `launch_native_run` does.
      */
-    bool launch_native_run_joined(const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor);
+    bool launch_native_run_joined(
+        const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor, void *caller_stream = nullptr
+    );
     bool poll_native_run(const ChipWorkerNativeRun &run);
     void wait_native_run(const ChipWorkerNativeRun &run);
     void finalize_native_run(const ChipWorkerNativeRun &run);
@@ -230,12 +233,14 @@ public:
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0,
         bool activated = true, NativeRunProvenance provenance = {}
     );
-    // Direct submission: no pipeline lease, so the lane admits at capacity one
-    // by draining its predecessor before this run enters the FIFO. run() is the
-    // blocking composition of this call and ChipRun::wait_until.
+    // Direct admission uses the lane's capacity and generations. With a caller
+    // stream, success means the whole run and its exit wait have been enqueued;
+    // a non-joinable predecessor is drained before returning. The caller owns
+    // the stream through retirement. Host copy-back still requires wait/finalize.
+    // run() is the blocking composition without caller stream ordering.
     ChipRun submit_chip_run(
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
-        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0
+        volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr
     );
     void close_chip_run_lane();
     /**
@@ -446,6 +451,8 @@ private:
     using SimplerPrepareRunFn = decltype(&simpler_prepare_run);
     using SimplerNativeRunFn = decltype(&simpler_launch_run);
     using SimplerJoinedLaunchFn = decltype(&simpler_launch_run_joined);
+    using ValidateCallerStreamFn = decltype(&simpler_validate_caller_stream);
+    using CallerStreamLaunchFn = decltype(&simpler_launch_run_on_stream);
     // Resolved optionally rather than through `load_symbol`: only onboard
     // modules carry the retention fixture, so a hard requirement would oblige
     // every simulated and stand-in runtime to export a stub of it.
@@ -517,6 +524,8 @@ private:
     SimplerRunFn run_fn_ = nullptr;
     SimplerPrepareRunFn prepare_run_fn_ = nullptr;
     SimplerNativeRunFn launch_run_fn_ = nullptr;
+    ValidateCallerStreamFn validate_caller_stream_fn_ = nullptr;
+    CallerStreamLaunchFn launch_run_on_stream_fn_ = nullptr;
     SimplerJoinedLaunchFn launch_run_joined_fn_ = nullptr;
     SimplerNativeRunFn poll_run_fn_ = nullptr;
     SimplerNativeRunFn wait_run_fn_ = nullptr;

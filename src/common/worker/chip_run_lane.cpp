@@ -37,6 +37,7 @@ struct ChipRunState {
     volatile int32_t *accepted_state{nullptr};
     int32_t accepted_value{0};
     ChipWorkerNativeRun native_run{};
+    void *caller_stream{nullptr};
     Phase phase{Phase::QUEUED};
     ChipRunPreparationDisposition disposition{ChipRunPreparationDisposition::VALIDATED_ONLY};
     bool pipeline_leased{true};
@@ -312,7 +313,7 @@ struct ChipRunLaneState {
             }
         }
         try {
-            worker->launch_native_run(run->native_run);
+            worker->launch_native_run(run->native_run, run->caller_stream);
             run->phase = ChipRunState::Phase::LAUNCHED;
             run->crossed_launch_fence = true;
         } catch (...) {
@@ -448,7 +449,9 @@ struct ChipRunLaneState {
             if (!permits_joined_launch(*predecessor, *successor)) return;
             bool joined = false;
             try {
-                joined = worker->launch_native_run_joined(successor->native_run, predecessor->native_run);
+                joined = worker->launch_native_run_joined(
+                    successor->native_run, predecessor->native_run, successor->caller_stream
+                );
             } catch (...) {
                 successor->error = std::current_exception();
                 // Before `finish`, so that a finalize failure on top of this
@@ -808,10 +811,11 @@ ChipRun ChipRunLane::submit(
 
 ChipRun ChipRunLane::submit(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
-    int32_t accepted_value
+    int32_t accepted_value, void *caller_stream
 ) {
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->require_usable();
+    if (caller_stream != nullptr) state_->worker->validate_caller_stream(caller_stream);
     if (state_->generations.empty()) throw std::runtime_error("chip run lane has no runtime slots");
 
     // Direct admission follows the runtime contract but keeps the lane as its
@@ -852,6 +856,7 @@ ChipRun ChipRunLane::submit(
     run->lease = PipelineSlotLease{slot_id, 0, state_->direct_generation};
     run->accepted_state = accepted_state;
     run->accepted_value = accepted_value;
+    run->caller_stream = caller_stream;
     run->pipeline_leased = false;
     run->activated = true;
     state_->fifo.push_back(run);
@@ -871,6 +876,18 @@ ChipRun ChipRunLane::submit(
         state_->launch_ready_prefix();
     } else {
         state_->prepare_successor_if_eligible(run);
+    }
+    if (caller_stream != nullptr) {
+        // Returning a prepared-only handle would let the caller enqueue its
+        // consumer ahead of this run's exit wait. A declined join waits for
+        // the predecessor here, before the caller can append any such work.
+        state_->launch_ready_prefix();
+        while (run->phase != ChipRunState::Phase::LAUNCHED && run->phase != ChipRunState::Phase::TERMINAL) {
+            state_->drain_front();
+            state_->launch_ready_prefix();
+        }
+        state_->rethrow_run_error(run);
+        if (!run->crossed_launch_fence) throw std::runtime_error("caller-stream run did not reach launch");
     }
     return ChipRun(state_, std::move(run));
 }

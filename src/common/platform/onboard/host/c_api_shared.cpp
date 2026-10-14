@@ -1670,6 +1670,15 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     return launch_prepared_run(state, nullptr);
 }
 
+int simpler_validate_caller_stream(DeviceContextHandle ctx, void *caller_stream) {
+    if (ctx == nullptr || caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->validate_caller_stream(caller_stream);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
 int simpler_launch_run_on_stream(
     DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle predecessor
 ) {

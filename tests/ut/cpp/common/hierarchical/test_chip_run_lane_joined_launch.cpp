@@ -199,7 +199,111 @@ void prime_caller_buffers(ChipWorker &worker) {
     worker.device_release_caller_buffers_ctx_fn_ = release_caller_buffers;
 }
 
+int g_caller_validation_rc{0};
+std::vector<void *> g_caller_streams;
+
+int validate_caller_stream(void *, void *) { return g_caller_validation_rc; }
+int launch_on_stream(void *ctx, void *runtime, void *stream, void *predecessor) {
+    g_caller_streams.push_back(stream);
+    return predecessor == nullptr ? launch_run(ctx, runtime) : launch_run_joined(ctx, runtime, predecessor);
+}
+
+void prime_caller_streams(ChipWorker &worker) {
+    g_caller_validation_rc = 0;
+    g_caller_streams.clear();
+    worker.validate_caller_stream_fn_ = validate_caller_stream;
+    worker.launch_run_on_stream_fn_ = launch_on_stream;
+}
+
 using Events = std::vector<std::string>;
+
+TEST(ChipRunLaneJoinedLaunchTest, CallerSubmitQueuesItsExitBeforeReturning) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_streams(worker);
+    ChipRunLane lane(worker);
+    int caller;
+    ChipRun first = lane.submit(1, host_args(), CallConfig{});
+    ChipRun second = lane.submit(1, host_args(), CallConfig{}, nullptr, 0, &caller);
+    EXPECT_TRUE(second.launched());
+    EXPECT_FALSE(g_complete[0]);
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "prepare1", "joined1behind0"}));
+    EXPECT_EQ(g_caller_streams, (std::vector<void *>{&caller}));
+    lane.close();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, CallerSubmitWaitsForDepthOnePredecessorBeforeReturning) {
+    ChipWorker worker;
+    prime_worker(worker, 1);
+    prime_caller_streams(worker);
+    ChipRunLane lane(worker);
+    int caller;
+    ChipRun first = lane.submit(1, host_args(), CallConfig{});
+    ChipRun second = lane.submit(1, host_args(), CallConfig{}, nullptr, 0, &caller);
+    EXPECT_TRUE(second.launched());
+    EXPECT_TRUE(g_complete[0]);
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "prepare1", "wait0", "finalize0", "launch1"}));
+    EXPECT_EQ(g_caller_streams, (std::vector<void *>{&caller}));
+    lane.close();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, DeclinedCallerJoinKeepsItsStreamForOrdinaryLaunch) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_streams(worker);
+    ChipRunLane lane(worker);
+    int caller;
+    ChipRun first = lane.submit(1, host_args(), CallConfig{});
+    g_joined_rc = PTO_RUNTIME_ERR_UNSUPPORTED;
+    ChipRun second = lane.submit(1, host_args(), CallConfig{}, nullptr, 0, &caller);
+    EXPECT_TRUE(second.launched());
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "prepare1", "joined1behind0", "wait0", "finalize0", "launch1"}));
+    EXPECT_EQ(g_caller_streams, (std::vector<void *>{&caller, &caller}));
+    lane.close();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, CallerValidationRefusesBeforeAdmissionOrPredecessorDrain) {
+    ChipWorker worker;
+    prime_worker(worker, 1);
+    prime_caller_streams(worker);
+    ChipRunLane lane(worker);
+    int caller;
+    ChipRun first = lane.submit(1, host_args(), CallConfig{});
+    g_caller_validation_rc = PTO_RUNTIME_ERR_UNSUPPORTED;
+    EXPECT_THROW(lane.submit(1, host_args(), CallConfig{}, nullptr, 0, &caller), std::runtime_error);
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0"}));
+    EXPECT_TRUE(g_caller_streams.empty());
+    EXPECT_FALSE(g_complete[0]);
+    g_caller_validation_rc = 0;
+    ChipRun second = lane.submit(1, host_args(), CallConfig{}, nullptr, 0, &caller);
+    EXPECT_TRUE(second.launched());
+    lane.close();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, FailedCallerLaunchThrowsInsteadOfReturningAnUnorderedHandle) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_streams(worker);
+    ChipRunLane lane(worker);
+    int caller;
+    g_launch_rc[0] = -777;
+    EXPECT_THROW(lane.submit(1, host_args(), CallConfig{}, nullptr, 0, &caller), std::runtime_error);
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "finalize0"}));
+    EXPECT_EQ(g_caller_streams, (std::vector<void *>{&caller}));
+    lane.close();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, MissingCallerEntriesLeaveOrdinarySubmissionAvailable) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    int caller;
+    EXPECT_THROW(lane.submit(1, host_args(), CallConfig{}, nullptr, 0, &caller), std::runtime_error);
+    EXPECT_TRUE(g_events.empty());
+    ChipRun run = lane.submit(1, host_args(), CallConfig{});
+    EXPECT_TRUE(run.launched());
+    lane.close();
+}
 
 TEST(ChipRunLaneJoinedLaunchTest, TheSuccessorReachesTheDeviceWhileTheFrontStillExecutes) {
     ChipWorker worker;
