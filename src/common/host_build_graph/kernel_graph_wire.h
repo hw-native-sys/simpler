@@ -59,7 +59,7 @@ struct GraphPacketHeader {
     uint64_t payload_offset;  // From this header, past the region table and padding.
     uint64_t payload_bytes;
     uint64_t inline_payload_addr;  // Zero in the template; one CANN placeholder.
-    uint64_t checksum;             // Accidental-corruption check, not authentication.
+    uint64_t checksum;             // Host-template check; trusted device transport does not recompute it.
     uint64_t slot_generation;      // Independent of callable residency generation in K9.
     uint64_t callable_hash;
     uint64_t argument_hash;
@@ -107,7 +107,9 @@ inline uint64_t graph_packet_checksum(const void *packet, size_t size) noexcept 
 
 // Allocation-free framing validation. No device destination is read or written.
 // Registry identity checks and semantic validation of restored images precede
-// execution separately; a checksum-valid packet alone never authorizes restore.
+// execution separately. Host templates check accidental corruption once. The
+// device copy arrives through the context-owned PCIe/UB transport and skips the
+// full-packet checksum scan on every replay.
 inline GraphPacketStatus
 validate_graph_packet(const void *packet, size_t size, GraphPacketAddress address_mode) noexcept {
     constexpr size_t prefix = sizeof(SimplerKernelInvocationHeader);
@@ -180,7 +182,8 @@ validate_graph_packet(const void *packet, size_t size, GraphPacketAddress addres
         previous_kind = kind;
     }
     if (cursor != header.payload_bytes) return GraphPacketStatus::InvalidRegion;
-    if (header.checksum != graph_packet_checksum(packet, size)) return GraphPacketStatus::InvalidChecksum;
+    if (address_mode == GraphPacketAddress::HostTemplate && header.checksum != graph_packet_checksum(packet, size))
+        return GraphPacketStatus::InvalidChecksum;
     return GraphPacketStatus::Ok;
 }
 

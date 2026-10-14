@@ -2683,19 +2683,12 @@ TEST_F(HbgGraphRestoreTest, RepeatedRestoreRebuildsQueuesPointersAndEveryCapacit
     }
 }
 
-TEST_F(HbgGraphRestoreTest, SourceCorruptionOnFirstMiddleAndLastLineCannotWriteDestinations) {
+TEST_F(HbgGraphRestoreTest, DeviceAdmissionSkipsChecksumOnTrustedTransport) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
-    const auto source = packet.storage;
-    const auto before = working_bytes();
-    const size_t begin = packet.data_offset;
-    for (size_t offset : {begin, begin + (packet.bytes - begin) / 2, packet.bytes - 1}) {
-        packet.storage = source;
-        reinterpret_cast<std::byte *>(packet.storage.data())[offset] ^= std::byte{0x80};
-        restored.generation = 999;
-        EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Rejected);
-        EXPECT_EQ(restored.generation, 999u);
-        EXPECT_EQ(working_bytes(), before);
-    }
+    packet_header().checksum ^= 1;
+    hbg::GraphRestoreView view{};
+    EXPECT_EQ(admit(view), hbg::GraphSlotStatus::Ok);
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
 }
 
 TEST_F(HbgGraphRestoreTest, ForgedRuntimeLayoutAndRelativePoolsRejectBeforeCopy) {
@@ -2980,7 +2973,7 @@ TEST_F(HbgGraphRestoreTest, RejectionAfterRetirementCannotExposePreviousSuccess)
     ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
     ASSERT_NO_FATAL_FAILURE(retire());
     const auto before = working_bytes();
-    reinterpret_cast<std::byte *>(packet.storage.data())[packet.bytes - 1] ^= std::byte{0x80};
+    --packet_header().slot_generation;
     EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Rejected);
     EXPECT_EQ(working_bytes(), before);
     hbg::GraphRestoreResult peer;
