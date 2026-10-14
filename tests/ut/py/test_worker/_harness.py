@@ -227,6 +227,9 @@ class FakeWorkspaceAccounting:
     def latch_workspace_budget(self, limit_bytes: int) -> None:
         self.workspace_budget_bytes = int(limit_bytes or 0)
 
+    def _validate_execution_context(self) -> None:
+        pass
+
     def workspace_report(self) -> tuple[str, dict[str, int] | None]:
         if not self.workspace_budget_bytes:
             return ("disabled", None)
@@ -275,9 +278,6 @@ class _FakeChipImpl(FakeWorkspaceAccounting):
         run = _FakeChipRun(self.run_error)
         self.submitted.append((cid, run))
         return run
-
-    def _validate_execution_context(self) -> None:
-        pass
 
     def _close_chip_run_lane(self) -> None:
         self.lane_closed = True

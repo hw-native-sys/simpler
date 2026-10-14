@@ -113,6 +113,12 @@ The classification reaches `RunHandle.wait`/`result` without a separate Python
 preflight callback; refusal preserves waiter retry and run references. Restoration
 permits retry with the existing run handle. Other native wait errors remain
 terminal; the C ABI validation status codes are unchanged.
+Python L2 submission and callable registry changes check the same native context
+before publishing source uses, handles or ref-count changes. Close checks before
+claiming CLOSED or a teardown attempt; a rejected claim preserves the prior
+lifecycle. An accepted close failure keeps CLOSED and retryable cleanup debt.
+Native register/unregister and the legacy Python registry enforce their own
+pre-mutation boundary through the same validator.
 A failed borrowed initialization explicitly closes before destroying the runner;
 if close fails, it retains the context, library and storage for `finalize`, and
 refuses reinitialization. Successful rollback leaves an uninitialized worker that

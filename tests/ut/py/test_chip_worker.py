@@ -20,7 +20,15 @@ from types import SimpleNamespace
 import pytest
 from _task_interface import CallConfig, RuntimeEnv, _ChipWorker  # pyright: ignore[reportMissingImports]
 from simpler.buffer import Buffer
-from simpler.task_interface import DataType, ExecutionContextRefused, TaskArgs, Tensor, TensorArgType
+from simpler.task_interface import (
+    ChipCallable,
+    ChipWorker,
+    DataType,
+    ExecutionContextRefused,
+    TaskArgs,
+    Tensor,
+    TensorArgType,
+)
 from simpler.worker import Worker, _Lifecycle
 
 # ============================================================================
@@ -203,12 +211,16 @@ def kernel_symbol_runtime(tmp_path_factory):
         comm_global_domain_release comm_barrier comm_destroy
     """.split()
     cache = {}
+    next_library_id = 0
 
     def build(*, supported=0, missing=(), init_result=0, finalize_failures=0, borrowed=False):
+        nonlocal next_library_id
         key = (supported, missing, init_result, finalize_failures, borrowed)
-        if key in cache:
+        # Fault scripts retain their consumed failure budget in the loaded DSO.
+        if finalize_failures == 0 and key in cache:
             return cache[key]
-        source = build_dir / f"runtime_{len(cache)}.cpp"
+        source = build_dir / f"runtime_{next_library_id}.cpp"
+        next_library_id += 1
         sentinels = source.with_suffix(".sentinels.cpp")
         library = source.with_suffix(".so")
         source.write_text(
@@ -274,6 +286,15 @@ def kernel_symbol_runtime(tmp_path_factory):
                     f"    return {init_result};\n"
                     "}\n"
                     "int simpler_validate_execution_context(DeviceContextHandle) { return validation; }\n"
+                    "static int registrations = 0, unregistrations = 0;\n"
+                    'extern "C" int test_registrations() { return registrations; }\n'
+                    'extern "C" int test_unregistrations() { return unregistrations; }\n'
+                    "int simpler_register_callable(DeviceContextHandle, int32_t, const void *) {\n"
+                    "    ++registrations; return validation;\n"
+                    "}\n"
+                    "int simpler_unregister_callable(DeviceContextHandle, int32_t) {\n"
+                    "    ++unregistrations; return validation;\n"
+                    "}\n"
                     "int simpler_validate_caller_stream(DeviceContextHandle, void *) { return validation; }\n"
                     "int simpler_launch_run_on_stream(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle) "
                     "{ std::abort(); }\n"
@@ -286,7 +307,12 @@ def kernel_symbol_runtime(tmp_path_factory):
             + "".join(
                 f'extern "C" void {symbol}() {{ std::abort(); }}\n'
                 for symbol in (*unused_symbols, *_KERNEL_LIFECYCLE_SYMBOLS)
-                if symbol not in missing and not (borrowed and symbol == "simpler_kernel_mode_init")
+                if symbol not in missing
+                and not (
+                    borrowed
+                    and symbol
+                    in {"simpler_kernel_mode_init", "simpler_register_callable", "simpler_unregister_callable"}
+                )
             ),
             encoding="utf-8",
         )
@@ -418,6 +444,7 @@ class TestChipWorkerBorrowedInit:
 
         owner._chip_worker = SimpleNamespace(
             _impl=SimpleNamespace(
+                _validate_execution_context=native._validate_execution_context,
                 _submit_chip_run_direct=lambda *_: SimpleNamespace(wait=wait),
             )
         )
@@ -451,6 +478,197 @@ class TestChipWorkerBorrowedInit:
             owner._lifecycle = _Lifecycle.CLOSED
             observer.test_validation(0)
             native.finalize()
+
+    @pytest.mark.parametrize("operation", ["register", "register_blob", "unregister"])
+    def test_native_registration_refuses_context_before_runtime_entry(self, kernel_symbol_runtime, operation):
+        runtime = kernel_symbol_runtime(borrowed=True)
+        observer = ctypes.CDLL(str(runtime))
+        native = _ChipWorker()
+        native.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        target = ChipCallable.build(signature=[], func_name="control", binary=b"\0", children=[])
+        try:
+            if operation == "register":
+
+                def action():
+                    native.register_callable(0, target)
+
+                calls = observer.test_registrations
+            elif operation == "register_blob":
+
+                def action():
+                    native.register_callable_from_blob(0, target.buffer_ptr())
+
+                calls = observer.test_registrations
+            else:
+                native.register_callable(0, target)
+
+                def action():
+                    native.unregister_callable(0)
+
+                calls = observer.test_unregistrations
+            before = calls()
+            observer.test_validation(-88)
+            with pytest.raises(ExecutionContextRefused):
+                action()
+            assert calls() == before and native.initialized
+            observer.test_validation(0)
+            action()
+            assert calls() == before + 1
+        finally:
+            observer.test_validation(0)
+            native.finalize()
+
+    @pytest.mark.parametrize("operation", ["submit", "register", "unregister", "unregister_last", "close"])
+    def test_public_worker_refusal_precedes_state_commit(self, kernel_symbol_runtime, operation):
+        runtime = kernel_symbol_runtime(borrowed=True)
+        observer = ctypes.CDLL(str(runtime))
+        native = _ChipWorker()
+        native.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        admissions = []
+
+        class ControlledSubmission:
+            def __getattr__(self, name):
+                return getattr(native, name)
+
+            def _submit_chip_run_direct(self, *args):
+                native._validate_execution_context()
+                admissions.append(args)
+                return SimpleNamespace(wait=lambda _timeout: True, done=lambda: True)
+
+        chip = ChipWorker()
+        chip._impl = ControlledSubmission()
+        owner = Worker(level=2)
+        target = ChipCallable.build(signature=[], func_name="control", binary=b"\0", children=[])
+        handle = owner.register(target)
+        alias = None if operation == "unregister_last" else owner.register(target)
+        references = 1 if alias is None else 2
+        owner._chip_worker = chip
+        owner._lifecycle = _Lifecycle.READY
+        chip._register_callable_at_slot(owner._resolve_handle(handle).slot_id, target)
+        source = Buffer.wrap(address=0x8000, nbytes=64, location=owner.device_location)
+        args = TaskArgs()
+        args.add_tensor(Tensor(source, shapes=(4,), dtype=DataType.FLOAT32), TensorArgType.INPUT)
+        operations = {
+            "submit": lambda: owner.submit(handle, args),
+            "register": lambda: owner.register(target),
+            "unregister": lambda: owner.unregister(handle),
+            "unregister_last": lambda: owner.unregister(handle),
+            "close": owner.close,
+        }
+        before = observer.test_registrations(), observer.test_unregistrations(), observer.test_closes()
+        try:
+            observer.test_validation(-88)
+            for _ in range(2):
+                with pytest.raises(ExecutionContextRefused):
+                    operations[operation]()
+                assert owner._lifecycle is _Lifecycle.READY and owner._close_completion is None
+                assert owner._resolve_handle(handle).ref_count == references
+                if alias is not None:
+                    assert owner._resolve_handle(alias).ref_count == references
+                assert not owner._source_context_failed and not admissions
+                assert not owner._chip_runs and not owner._chip_source_uses
+                assert not owner._chip_run_touched_identities and owner._chip_run_seq == 0
+                assert owner._active_ops == 0 and not owner._lease_depth
+                assert native.initialized
+                assert before == (
+                    observer.test_registrations(),
+                    observer.test_unregistrations(),
+                    observer.test_closes(),
+                )
+            observer.test_validation(0)
+            if operation == "submit":
+                owner.submit(handle, args).wait()
+                assert len(admissions) == 1 and not owner._chip_source_uses
+            elif operation == "register":
+                registered = owner.register(target)
+                assert owner._resolve_handle(registered).ref_count == 3
+            elif operation in ("unregister", "unregister_last"):
+                owner.unregister(handle)
+                if alias is None:
+                    assert not owner._identity_registry and not owner._live_handles
+                else:
+                    assert owner._resolve_handle(alias).ref_count == 1
+            else:
+                owner.close()
+                assert owner._lifecycle is _Lifecycle.CLOSED and not native.initialized
+            source.close()
+            assert source.closed
+        finally:
+            observer.test_validation(0)
+            owner.close()
+            native.finalize()
+
+    def test_accepted_close_failure_keeps_debt_across_context_refusal(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(borrowed=True, finalize_failures=1)
+        observer = ctypes.CDLL(str(runtime))
+        chip = ChipWorker()
+        chip._impl.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        owner = Worker(level=2)
+        owner._chip_worker = chip
+        owner._lifecycle = _Lifecycle.READY
+        try:
+            with pytest.raises(RuntimeError, match="teardown"):
+                owner.close()
+            assert owner._lifecycle is _Lifecycle.CLOSED
+            assert chip.initialized and not owner._cleanup_journal.empty
+            attempt = owner._close_completion
+            assert attempt is not None and attempt.done and attempt.error is not None
+            before = observer.test_closes(), observer.test_destroys()
+            observer.test_validation(-88)
+            with pytest.raises(ExecutionContextRefused):
+                owner.close()
+            assert owner._lifecycle is _Lifecycle.CLOSED and owner._close_completion is attempt
+            assert chip.initialized and not owner._cleanup_journal.empty
+            assert (observer.test_closes(), observer.test_destroys()) == before
+            observer.test_validation(0)
+            owner.close()
+            assert not chip.initialized and owner._cleanup_journal.empty
+            assert owner._lifecycle is _Lifecycle.CLOSED
+            with pytest.raises(RuntimeError, match="requires an initialized"):
+                owner.submit(None)
+        finally:
+            observer.test_validation(0)
+            owner.close()
+            chip.finalize()
+
+    @pytest.mark.parametrize("references", [1, 2])
+    @pytest.mark.parametrize("operation", ["register", "unregister"])
+    def test_legacy_registration_refusal_keeps_live_handles(self, kernel_symbol_runtime, operation, references):
+        runtime = kernel_symbol_runtime(borrowed=True)
+        observer = ctypes.CDLL(str(runtime))
+        chip = ChipWorker()
+        chip._impl.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        target = ChipCallable.build(signature=[], func_name="control", binary=b"\0", children=[])
+        handle = chip.register_callable(target)
+        alias = chip.register_callable(target) if references == 2 else None
+        try:
+            observer.test_validation(-88)
+
+            def action():
+                if operation == "register":
+                    chip.register_callable(target)
+                else:
+                    chip.unregister_callable(handle)
+
+            for _ in range(2):
+                with pytest.raises(ExecutionContextRefused):
+                    action()
+                assert chip._resolve_handle(handle).ref_count == references
+                if alias is not None:
+                    assert chip._resolve_handle(alias).ref_count == references
+            observer.test_validation(0)
+            if operation == "register":
+                registered = chip.register_callable(target)
+                assert chip._resolve_handle(registered).ref_count == references + 1
+            else:
+                chip.unregister_callable(handle)
+                if alias is None:
+                    assert not chip._identity_registry and not chip._live_handles
+                else:
+                    assert chip._resolve_handle(alias).ref_count == 1
+        finally:
+            observer.test_validation(0)
+            chip.finalize()
 
     def test_borrowed_init_uses_shared_binding_and_can_close(self, kernel_symbol_runtime):
         runtime = kernel_symbol_runtime(borrowed=True)
@@ -713,6 +931,9 @@ class TestChipWorkerPython:
                 self.unregistered = []
                 self.aicpu_dlopen_count = 0
                 self.host_dlopen_count = 0
+
+            def _validate_execution_context(self):
+                pass
 
             def register_callable(self, slot, callable_obj):
                 self.prepared.append((slot, callable_obj))

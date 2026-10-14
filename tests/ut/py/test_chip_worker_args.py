@@ -52,6 +52,9 @@ def chip():
             self.fail_run = False
             self.fail_finalize = False
 
+        def _validate_execution_context(self):
+            pass
+
         def register_callable(self, *_):
             pass
 

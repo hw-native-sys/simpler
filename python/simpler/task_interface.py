@@ -1755,6 +1755,8 @@ class ChipWorker:
             hashid_to_digest,
         )
 
+        if self.initialized:
+            self._impl._validate_execution_context()
         descriptor = build_chip_callable_descriptor(target=callable)
         hashid = compute_callable_hashid(descriptor)
         digest = hashid_to_digest(hashid)
@@ -1865,6 +1867,8 @@ class ChipWorker:
 
     def unregister_callable(self, handle) -> None:
         """Drop one live callable handle and release its private resources when final."""
+        if self.initialized:
+            self._impl._validate_execution_context()
         with self._registry_lock:
             state = self._resolve_handle_locked(handle)
             self._live_handles.pop(handle._handle_id, None)

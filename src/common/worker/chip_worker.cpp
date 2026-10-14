@@ -778,6 +778,7 @@ void ChipWorker::register_callable(int32_t callable_id, const void *callable) {
     if (callable == nullptr) {
         throw std::runtime_error("register_callable: callable must not be null");
     }
+    validate_execution_context();
     int rc = register_callable_fn_(device_ctx_, callable_id, callable);
     if (rc != 0) {
         throw std::runtime_error("register_callable failed with code " + std::to_string(rc));
@@ -1373,6 +1374,7 @@ void ChipWorker::unregister_callable(int32_t callable_id) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
+    validate_execution_context();
     int rc = unregister_callable_fn_(device_ctx_, callable_id);
     if (rc != 0) {
         throw std::runtime_error("unregister_callable failed with code " + std::to_string(rc));

@@ -7105,6 +7105,10 @@ class Worker:
             # (a FAILED epoch that close() then reaped), not just "closed".
             raise RuntimeError(f"Worker.{api}: worker is closed") from self._startup_error
 
+    def _validate_chip_execution_context(self) -> None:
+        if self.level == 2 and self._chip_worker is not None:
+            self._chip_worker._impl._validate_execution_context()
+
     @contextlib.contextmanager
     def _operation_lease(self, api: str):
         """Admit an operation onto a READY worker and hold a lease for its whole
@@ -7462,6 +7466,7 @@ class Worker:
         broadcast to, so the lease covers only publication and the local
         pre-warm.
         """
+        self._validate_chip_execution_context()
         with self._registry_lock:
             handle, is_new = self._install_registration_locked(reg)
         if not is_new:
@@ -7959,6 +7964,9 @@ class Worker:
         ``MAX_REGISTERED_CALLABLE_IDS`` ceiling when JIT or plugin code
         churns through callables.
 
+        At L2, current-context refusal precedes handle/ref-count mutation and
+        leaves the registration valid for retry in the required context.
+
         Failure semantics (docs section 8): unregister is best-effort.
         If any chip child reports an error, the parent **warns and still
         pops the registry entry** — orch_so_table_ on the AICPU side will
@@ -7990,6 +7998,7 @@ class Worker:
         Caller holds an operation lease that pins the worker in READY for the
         registry mutation and the complete child-facing cleanup.
         """
+        self._validate_chip_execution_context()
         target = None
         digest = b""
         cid = -1
@@ -12690,6 +12699,7 @@ class Worker:
         completion fence through :meth:`RunHandle.wait`.
         """
         assert self._chip_worker is not None
+        self._validate_chip_execution_context()
         args = _snapshot_local_task_args(TaskArgs() if args is None else args)
         _validate_host_control_access(self._callable_registry.get(callable_id), args)
         touched = self._identities_in_args(args)
@@ -13243,6 +13253,7 @@ class Worker:
                         "Worker.close(): a worker with a live native tree must be closed on the thread that "
                         "init()'d it (native teardown is thread-bound)"
                     )
+                self._validate_chip_execution_context()
                 deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
                 # Claim: publish CLOSED (permanent admission fence) and install a
                 # fresh teardown attempt.

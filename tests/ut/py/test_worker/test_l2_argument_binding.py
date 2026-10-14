@@ -26,6 +26,7 @@ def l2():
     calls = []
     frees = []
     impl = SimpleNamespace(
+        _validate_execution_context=lambda: None,
         _submit_chip_run_direct=lambda cid, args, cfg: calls.append(args) or object(),
     )
     worker._chip_worker = SimpleNamespace(_impl=impl, free=frees.append)

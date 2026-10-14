@@ -95,6 +95,15 @@ the classification. The public Worker initialization still owns its device;
 borrowed-context initialization is an internal native entry, and this exception
 alone does not expose a public borrowed Worker.
 
+A READY L2 Worker checks the same native environment before submission or
+callable registry publication. Close checks before its
+CLOSED admission fence and teardown-attempt publication. An unaccepted context
+refusal preserves READY, callable handles and source uses; restore the context
+before retrying. Once close has been accepted, a teardown failure retains CLOSED
+and its cleanup debt. Re-entering close in the required context can retry that
+debt; it does not reopen the Worker. Native registration and the legacy
+ChipWorker registry also check before their state changes.
+
 At L2 the `callable` is a registered `ChipCallable` handle. At L3+ the top-level
 callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 `orch` is the `Orchestrator`:

@@ -68,7 +68,7 @@ def _run(arch, runtime, device, depth, borrowed):
         DataType,
         ExecutionContextRefused,
     )
-    from simpler.worker import RunHandle, Worker  # noqa: PLC0415
+    from simpler.worker import RunHandle, Worker, _Lifecycle  # noqa: PLC0415
 
     base = _ROOT / "build/lib" / arch / "onboard" / runtime
     lib = _load(arch, "onboard", runtime)
@@ -116,9 +116,11 @@ def _run(arch, runtime, device, depth, borrowed):
         callable_image = _callable(arch, runtime)
         if contexts is not None:
             with contexts.other():
-                with pytest.raises(RuntimeError, match="register_callable failed"):
+                with pytest.raises(ExecutionContextRefused, match="context validation failed"):
                     worker.register_callable(0, callable_image)
         worker.register_callable(0, callable_image)
+        public_callable = handle_owner.register(callable_image)
+        handle_owner._lifecycle = _Lifecycle.READY
         for stream in streams:
             assert lib.aclrtCreateStream(ctypes.byref(stream)) == 0
         for invocation in range(4):
@@ -165,15 +167,27 @@ def _run(arch, runtime, device, depth, borrowed):
             with contexts.other():
                 handle = python_runs[-1]
                 keepalive = handle._keepalive
-                for operation in (handle.wait, handle.result):
+                for operation in (lambda: handle.done, handle.wait, handle.result):
                     with pytest.raises(ExecutionContextRefused, match="context validation failed"):
                         operation()
                     assert not handle._terminal and not handle._wait_in_progress
                     assert handle._run_id == len(runs) and handle._keepalive is keepalive
                     assert len(handle_owner._chip_runs) == len(runs)
                     assert not handle_owner._source_context_failed
-                with pytest.raises(ExecutionContextRefused, match="context validation failed"):
-                    worker.finalize()
+                for operation in (
+                    lambda: handle_owner.submit(public_callable),
+                    lambda: handle_owner.register(callable_image),
+                    lambda: handle_owner.unregister(public_callable),
+                    handle_owner.close,
+                    lambda: worker.unregister_callable(0),
+                    worker.finalize,
+                ):
+                    with pytest.raises(ExecutionContextRefused, match="context validation failed"):
+                        operation()
+                    assert handle_owner._lifecycle is _Lifecycle.READY
+                    assert handle_owner._close_completion is None
+                    assert handle_owner._resolve_handle(public_callable).ref_count == 1
+                    assert not handle_owner._source_context_failed and handle_owner._chip_run_seq == 0
                 assert worker.initialized
                 assert runs[-1].launched
         # No RunHandle poll or wait can cause a deferred launch on this path.
@@ -187,6 +201,10 @@ def _run(arch, runtime, device, depth, borrowed):
             assert handle.done
         assert not handle_owner._chip_runs
     finally:
+        # Native teardown owns this bridge's resources; the public borrowed
+        # initialization and admission path is not under test here.
+        handle_owner._chip_worker = None
+        handle_owner._lifecycle = _Lifecycle.CLOSED
         _cleanup(worker, lib, contexts, device_buffers, host_buffers, streams)
 
 
