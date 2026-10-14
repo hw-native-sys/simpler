@@ -37,7 +37,7 @@
 
 #include "callable.h"
 #include "prepare_callable_common.h"
-#include "runtime_c_api.h"  // PTO_PIPELINE_MAX_DEPTH
+#include "runtime_c_api.h"
 #include "host/run_stream_pair.h"
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
@@ -268,6 +268,20 @@ private:
             return rtStreamDestroy(static_cast<rtStream_t>(stream));
         }
     };
+
+protected:
+    /** The unretired-owner table holds one entry per run this context may hold. */
+    ArchRunResourceStaging build_arch_run_resources(size_t granted) override {
+        ArchRunResourceStaging staged;
+        staged.run_streams = RunStreamPair::build(granted);
+        return staged;
+    }
+    void commit_arch_run_resources(ArchRunResourceStaging &&staged) noexcept override {
+        run_streams_.commit(std::move(staged.run_streams));
+    }
+    bool arch_run_resources_are_replaceable() const override { return run_streams_.grant_is_replaceable(); }
+
+private:
     int create_run_stream(void **out);
     int ensure_run_streams();
     // Retires the run pair on behalf of `owner`, the PreparedExecution that

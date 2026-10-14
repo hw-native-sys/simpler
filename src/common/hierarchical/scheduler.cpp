@@ -685,7 +685,11 @@ Scheduler::NextLevelGroupDispatchResult Scheduler::dispatch_next_level_group(con
             if (!result.reserved_worker_ids.insert(worker_id).second) {
                 throw std::runtime_error("Scheduler::dispatch_next_level_group: duplicate target worker");
             }
-            const bool worker_idle = worker->idle();
+            // A free lane with no request frame behind it cannot carry this
+            // member's publication, so it counts as busy here. Treating it as
+            // idle would claim the whole group and fail the member that found
+            // no transport.
+            const bool worker_idle = worker->can_dispatch();
             if (!worker_idle) {
                 all_workers_idle = false;
                 result.busy_target_worker_ids.push_back(worker_id);
@@ -788,7 +792,10 @@ bool Scheduler::dispatch_next_level_singles(
                 "Scheduler::dispatch_next_level_singles: unknown worker id " + std::to_string(worker_id)
             );
         }
-        if (!worker->idle()) continue;
+        // Lane and transport together: a task is claimed only against a worker
+        // that can publish it. The frames come back as the child acknowledges
+        // them, so a worker skipped here is asked again next round.
+        if (!worker->can_dispatch()) continue;
 
         TaskSlot slot;
         while (run_snapshot ? cfg_.ready_next_level_queues->try_pop_single(worker_id, *run_snapshot, slot) :

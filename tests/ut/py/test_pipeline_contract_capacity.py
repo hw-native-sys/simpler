@@ -27,10 +27,13 @@ import pytest
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
-#: Mirrors `PTO_PIPELINE_MAX_DEPTH` / `PTO_PIPELINE_MAX_RESOURCES` in runtime_c_api.h. The
-#: assertions below name the depth each runtime declares, so a ceiling change shows up here as a
-#: failing expectation rather than as a silently rescaled one.
-_MAX_DEPTH = 3
+#: Mirrors `PTO_PIPELINE_MAX_RESOURCES` in runtime_c_api.h. The assertions below name the depth
+#: each runtime declares, so a declaration change shows up here as a failing expectation rather
+#: than as a silently rescaled one.
+#:
+#: A program declaration carries no limit: it is what the runtime can support, and what a context
+#: uses is the grant it is given, which every per-run resource is built to.
+_UNLIMITED_DEPTH = 0xFFFFFFFF
 _MAX_RESOURCES = 8
 _CONTRACT_ABI_VERSION = 1
 
@@ -103,9 +106,9 @@ def _kernel_contract(lib: ctypes.CDLL) -> _PipelineContract:
 
 @pytest.mark.requires_hardware
 @pytest.mark.platforms(["a5"])
-def test_a5_host_build_graph_declares_three_program_sets():
-    """The program declaration that lets a Worker be granted a third run-resource set."""
-    assert _program_depth(_load("a5", "host_build_graph")) == _MAX_DEPTH
+def test_a5_host_build_graph_declares_no_program_limit():
+    """The program declaration that lets a Worker be granted as many sets as it asks for."""
+    assert _program_depth(_load("a5", "host_build_graph")) == _UNLIMITED_DEPTH
 
 
 @pytest.mark.requires_hardware
@@ -128,13 +131,17 @@ def test_a5_host_build_graph_keeps_its_kernel_capacity_at_two():
 
 @pytest.mark.requires_hardware
 @pytest.mark.platforms(["a5"])
-def test_a5_tensormap_and_ringbuffer_is_unchanged():
-    """Nothing spilled onto the other a5 runtime, whose own capacity is not in this scope."""
-    assert _program_depth(_load("a5", "tensormap_and_ringbuffer")) == 2
+def test_a5_tensormap_and_ringbuffer_declares_no_program_limit():
+    """One shared scratch serves any number of runs, because the AICPU stream FIFO is transitive.
+
+    What bounds concurrency on this runtime is the per-run task-args region, and a context gets
+    one of those per set it was granted — so this declaration carries no limit either.
+    """
+    assert _program_depth(_load("a5", "tensormap_and_ringbuffer")) == _UNLIMITED_DEPTH
 
 
 @pytest.mark.requires_hardware
 @pytest.mark.platforms(["a2a3"])
-def test_a2a3_host_build_graph_still_declares_three():
-    """The platform this capacity shipped on first keeps its declaration."""
-    assert _program_depth(_load("a2a3", "host_build_graph")) == _MAX_DEPTH
+def test_a2a3_host_build_graph_declares_no_program_limit():
+    """The platform this capacity shipped on first declares no limit either."""
+    assert _program_depth(_load("a2a3", "host_build_graph")) == _UNLIMITED_DEPTH

@@ -223,7 +223,9 @@ struct FakeHostApi {
         size_t capacity{0};
         int grows{0};
     };
-    std::array<SchedulerStateSlot, PTO_PIPELINE_MAX_DEPTH> scheduler_slots{};
+    // Wider than any grant this fixture drives; the production storage is sized
+    // to the grant and this is only the stand-in it writes through.
+    std::array<SchedulerStateSlot, 4> scheduler_slots{};
     int scheduler_acquires{0};
     size_t definition_offset{0};
     int device_malloc_count{0};
@@ -1676,7 +1678,6 @@ TEST_F(HbgResidentSchedulerStorageTest, AWiderRunGrowsItsSlotAndANarrowerOneReus
 
 // Two pipeline slots prepare at once, so their storage cannot be one block.
 TEST_F(HbgResidentSchedulerStorageTest, TwoPipelineSlotsHoldDistinctStorage) {
-    static_assert(PTO_PIPELINE_MAX_DEPTH >= 2, "this case needs two pipeline slots");
     Runtime first;
     Runtime second;
     init_runtime(first);

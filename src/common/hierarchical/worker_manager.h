@@ -96,16 +96,121 @@ bool mailbox_compare_exchange_state(char *frame, MailboxState expected, MailboxS
 // static_assert after MAILBOX_ARGS_CAPACITY). At the 256-tensor cap, wire tensors
 // occupy 36 KiB of the 64 KiB frame and leave room for scalars and protocol metadata.
 static constexpr size_t MAILBOX_FRAME_SIZE = 65536;
-static constexpr size_t MAILBOX_TASK_FRAME_COUNT = PTO_PIPELINE_MAX_DEPTH;
 static constexpr size_t MAILBOX_CONTROL_FRAME = 0;
 static constexpr size_t MAILBOX_FIRST_TASK_FRAME = 1;
-static constexpr size_t MAILBOX_SIZE = MAILBOX_FRAME_SIZE * (1 + MAILBOX_TASK_FRAME_COUNT);
-static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 6;
+static constexpr uint32_t MAILBOX_TASK_PROTOCOL_VERSION = 7;
 
-// Error message region lives at the mailbox tail. 256 B of headroom is
-// enough for `<ExceptionType>: <short message>` produced by the child-side
-// Python loops; anything longer is truncated + NUL-terminated.
+// Error message region. 256 B of headroom is enough for
+// `<ExceptionType>: <short message>` produced by the child-side Python loops;
+// anything longer is truncated + NUL-terminated.
 static constexpr size_t MAILBOX_ERROR_MSG_SIZE = 256;
+
+/**
+ * Request frames: how many payload hand-offs may be outstanding at once.
+ *
+ * A request frame carries one submission's bytes — callable digest, config,
+ * lease and the args blob — and nothing about the run's life. The child copies
+ * the blob out and says so, and the frame is immediately reusable by the next
+ * submission while the run it carried is still executing. So this bounds
+ * *concurrent hand-off*, not concurrent runs, and two is enough to keep one
+ * hand-off in flight while the next is written.
+ */
+static constexpr size_t MAILBOX_REQUEST_FRAMES = 2;
+
+/**
+ * Run-state entries beyond the granted sets.
+ *
+ * `M = granted + K`. The extra `K` is what lets a request be handed over before
+ * a set is free: the entry exists from the moment the parent publishes, and the
+ * run it names waits for a set without holding a 64 KiB frame to do it.
+ */
+constexpr size_t mailbox_run_entry_count(size_t granted_sets) { return granted_sets + MAILBOX_REQUEST_FRAMES; }
+
+/**
+ * One run's whole cross-process state, for its whole life.
+ *
+ * Separate from the request frame that delivered it, which is the point: a
+ * 64 KiB frame is held only for the hand-off, and this ~360 B entry is held for
+ * the run. POD and contiguous — it is written by a parent and read by its forked
+ * child, so it carries no pointer and no C++ type with a vtable or an allocator.
+ *
+ * Single-writer per field, with the edges stated beside each one. `state` is the
+ * only field two sides write, and they never do so at the same time: the parent
+ * owns the `FRAME_STAGED -> ACTIVATE` exchange and the child owns every other
+ * transition, with the terminal store as the child's final access to the entry.
+ */
+struct MailboxRunEntry {
+    /* Child, except the parent's identity-checked FRAME_STAGED -> ACTIVATE CAS. */
+    int32_t state;
+    /* Child, before the terminal state. */
+    int32_t error;
+    /* Device, at the kernel-launch marker. Sticky; the parent clears it on allocate. */
+    int32_t accepted;
+    /* Child, before the terminal state. */
+    int32_t preparation_disposition;
+    /* Parent, on allocate and free. Odd while in use, even while free; a stale
+       reference carrying an older value is refused rather than acted on. */
+    uint64_t entry_generation;
+    /* Child, once, after copying the args blob out of its request frame. A
+       level, not a pulse: the parent compares it with the generation of the
+       frame it published, so a missed observation is impossible. */
+    uint64_t frame_consumed_generation;
+    /* Child, on activation. */
+    uint64_t run_epoch;
+    /* Parent, before publishing; the identity the child checks its frame against. */
+    uint64_t protocol;
+    uint64_t run_id;
+    uint64_t slot_id;
+    uint64_t generation;
+    uint64_t dispatch_id;
+    uint64_t task_slot;
+    uint64_t group_index;
+    uint64_t group_size;
+    /* Child, before the terminal state. NUL-terminated, truncated to fit. */
+    char error_text[MAILBOX_ERROR_MSG_SIZE];
+};
+static_assert(
+    std::is_trivially_copyable_v<MailboxRunEntry> && std::is_standard_layout_v<MailboxRunEntry>,
+    "a run-state entry crosses a process boundary, so it must be POD and position-independent"
+);
+
+/** Stride between entries. Rounded up so every entry keeps 8-byte field alignment. */
+static constexpr size_t MAILBOX_RUN_ENTRY_STRIDE = (sizeof(MailboxRunEntry) + 63) & ~size_t{63};
+
+/** Byte offset of the entry table, which follows the control and request frames. */
+static constexpr size_t MAILBOX_RUN_ENTRY_TABLE_OFFSET = MAILBOX_FRAME_SIZE * (1 + MAILBOX_REQUEST_FRAMES);
+
+/**
+ * Bytes one endpoint's mailbox occupies for `granted_sets` in-flight runs.
+ *
+ * One control frame, `MAILBOX_REQUEST_FRAMES` request frames, and one run-state
+ * entry per run the endpoint may hold plus the hand-offs in flight. Only the
+ * entry table grows with the grant, so a deeper context costs ~360 B per run
+ * rather than 64 KiB. The Python facade that creates the shared-memory region
+ * reads this through the same binding, so both ends derive the size from one
+ * place.
+ */
+constexpr size_t mailbox_size(size_t granted_sets) {
+    return MAILBOX_RUN_ENTRY_TABLE_OFFSET + MAILBOX_RUN_ENTRY_STRIDE * mailbox_run_entry_count(granted_sets);
+}
+
+/** Run-state entry `index` inside a mapped mailbox region. */
+inline MailboxRunEntry *mailbox_run_entry(void *mailbox, size_t index) {
+    return reinterpret_cast<MailboxRunEntry *>(
+        static_cast<char *>(mailbox) + MAILBOX_RUN_ENTRY_TABLE_OFFSET + MAILBOX_RUN_ENTRY_STRIDE * index
+    );
+}
+
+/**
+ * Run-resource sets a mailbox is built for when whoever creates it does not say.
+ *
+ * Not a ceiling — nothing refuses a larger region, and the endpoint's counts
+ * come from its worker's grant. This is the convenience size for a caller with
+ * no grant to size from, which in practice is a fixture standing in for the
+ * Python facade.
+ */
+static constexpr size_t MAILBOX_DEFAULT_GRANTED_SETS = 3;
+static constexpr size_t MAILBOX_SIZE = mailbox_size(MAILBOX_DEFAULT_GRANTED_SETS);
 
 // CallConfig is written/read as a single packed POD block (see call_config.h).
 // Both ends transfer it with one memcpy — no per-field offsets to keep in sync.
@@ -138,31 +243,24 @@ static constexpr ptrdiff_t MAILBOX_OFF_ERROR_MSG =
 // Launch acceptance is sticky, not a MailboxState: a state word carrying it
 // loses the ACK whenever the child reaches TASK_DONE between two parent polls,
 // which is exactly the short-task case the fence exists to pipeline. The child
-// sets it only after a real native launch; the parent clears it before reusing
-// that task frame, so nothing else can overwrite it in between.
+// sets it only after a real native launch; the parent clears it when it
+// allocates the entry, so nothing else can overwrite it in between. It lives on
+// the run-state entry rather than the request frame because the device writes it
+// after the frame has already been handed back.
 static constexpr int32_t MAILBOX_TASK_ACCEPTED = 1;
-static constexpr ptrdiff_t MAILBOX_OFF_ACCEPTED = MAILBOX_OFF_ERROR_MSG - 8;
-// Preparation disposition occupies the four bytes of trailer padding after
-// the sticky int32 launch ACK. It is independent of the phase state word.
-static constexpr ptrdiff_t MAILBOX_OFF_PREPARATION_DISPOSITION = MAILBOX_OFF_ACCEPTED + 4;
-static constexpr ptrdiff_t MAILBOX_OFF_FRAME_PROTOCOL = MAILBOX_OFF_ACCEPTED - 40;
-static constexpr ptrdiff_t MAILBOX_OFF_FRAME_RUN_ID = MAILBOX_OFF_ACCEPTED - 32;
-static constexpr ptrdiff_t MAILBOX_OFF_FRAME_SLOT_ID = MAILBOX_OFF_ACCEPTED - 24;
-static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GENERATION = MAILBOX_OFF_ACCEPTED - 16;
-static constexpr ptrdiff_t MAILBOX_OFF_FRAME_DISPATCH_ID = MAILBOX_OFF_ACCEPTED - 8;
-// Parent-DAG identity shared by every member of one NEXT_LEVEL group. Unlike
-// dispatch_id (which is local to one WorkerThread), task_slot is comparable
-// across the group's Rank endpoints within run_id.
-static constexpr ptrdiff_t MAILBOX_OFF_FRAME_TASK_SLOT = MAILBOX_OFF_ACCEPTED - 48;
-static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GROUP_INDEX = MAILBOX_OFF_ACCEPTED - 56;
-static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GROUP_SIZE = MAILBOX_OFF_ACCEPTED - 64;
+// A request frame's own header, in the bytes the identity trailer used to hold:
+// which entry this payload belongs to, that entry's generation, and this
+// frame's own generation — which the child echoes to say the blob is copied.
+static constexpr ptrdiff_t MAILBOX_OFF_FRAME_ENTRY_INDEX = MAILBOX_OFF_ERROR_MSG - 32;
+static constexpr ptrdiff_t MAILBOX_OFF_FRAME_ENTRY_GENERATION = MAILBOX_OFF_ERROR_MSG - 24;
+static constexpr ptrdiff_t MAILBOX_OFF_FRAME_GENERATION = MAILBOX_OFF_ERROR_MSG - 16;
 // Termination is a sticky one-way word on the control frame, not a MailboxState:
 // MAILBOX_OFF_STATE has three writers (the parent's CONTROL_REQUEST, the child's
 // CONTROL_DONE, and this endpoint's return-to-IDLE), any of which overwrites a
 // SHUTDOWN store. Only a terminating parent writes this word, 0 -> 1, and
 // nothing ever clears it, so a child that observes it exits its serve loop no
 // matter what state word a concurrent control command leaves behind.
-static constexpr ptrdiff_t MAILBOX_OFF_SHUTDOWN = MAILBOX_OFF_ACCEPTED - 72;
+static constexpr ptrdiff_t MAILBOX_OFF_SHUTDOWN = MAILBOX_OFF_ERROR_MSG - 80;
 static constexpr int32_t MAILBOX_SHUTDOWN_REQUESTED = 1;
 // The chip child's teardown observation, published once on the control frame
 // after its device teardown returns. Reserved on every frame for the same
@@ -409,6 +507,26 @@ public:
     // poll_progress reports monotonic events; activate_progress is a sticky
     // FIFO-launch permission that may arrive before the child stages the frame.
     virtual void submit_progress(Ring *ring, const WorkerDispatch &dispatch);
+    /**
+     * How many more frames this endpoint can publish right now.
+     *
+     * Bounded request transport is a resource separate from run capacity, so a
+     * grant wider than the transport makes saturation an ordinary state rather
+     * than a corrupt admission. Reaching zero is backpressure: the caller must
+     * not admit a publication it cannot complete, and the next poll frees what
+     * the child has finished copying out.
+     *
+     * The count is what is free at the instant it is read, with nothing held
+     * back. What keeps two gates in one round from both acting on the same last
+     * frame is that all publication for all endpoints runs on one thread —
+     * `Scheduler::dispatch_claimed` is the only caller of either publication
+     * entry point — so a second gate in that round reads this after the first
+     * has already marked its frame published. The only other party that touches
+     * frame ownership is the child's acknowledgement, which can only free one.
+     *
+     * An endpoint whose transport is not bounded reports no limit.
+     */
+    virtual size_t available_request_transport();
     virtual bool poll_progress(WorkerEndpointProgress &progress);
     virtual bool activate_progress(RunId run_id);
     virtual void request_progress_stop() noexcept;
@@ -483,10 +601,11 @@ public:
     // caller does not own a waitable child. A valid pid enables liveness
     // checks that turn a child that dies before publishing TASK_DONE /
     // CONTROL_DONE into a reported failure instead of an endless spin-poll.
-    LocalMailboxEndpoint(int32_t worker_id, void *mailbox, int child_pid = -1, uint32_t task_frame_count = 1);
+    LocalMailboxEndpoint(int32_t worker_id, void *mailbox, int child_pid = -1, uint32_t granted_sets = 1);
 
     const WorkerEndpointCaps &caps() const override { return caps_; }
     void submit_progress(Ring *ring, const WorkerDispatch &dispatch) override;
+    size_t available_request_transport() override;
     bool poll_progress(WorkerEndpointProgress &progress) override;
     bool activate_progress(RunId run_id) override;
     void request_progress_stop() noexcept override;
@@ -543,7 +662,10 @@ private:
     std::mutex mailbox_mu_;
     std::mutex child_mu_;
     std::mutex progress_mu_;
-    uint32_t task_frame_count_{1};
+    // How many runs this endpoint may hold at once: the granted sets plus the
+    // hand-offs in flight, which is the entry count. Distinct from the request
+    // frames, of which there are always `MAILBOX_REQUEST_FRAMES`.
+    uint32_t granted_sets_{1};
     bool endpoint_poisoned_{false};
     // Only child-exit poison permits consumption of independently published task results.
     bool preserve_terminal_results_on_exit_{false};
@@ -561,23 +683,36 @@ private:
     char *mbox() const { return static_cast<char *>(mailbox_); }
     MailboxState read_mailbox_state(const char *frame = nullptr) const;
     void write_mailbox_state(MailboxState s, char *frame = nullptr);
-    // Sticky launch acceptance, cleared before this endpoint reuses a task
-    // frame. See MAILBOX_OFF_ACCEPTED.
-    bool read_task_accepted(const char *frame = nullptr) const;
-    void clear_task_accepted(char *frame = nullptr);
+    /** The control frame, or request frame `index`. */
     char *task_frame(size_t index) const;
+    /** Run-state entry `index`. The table follows the request frames. */
+    MailboxRunEntry *run_entry(size_t index) const;
     void run_control_command(const char *op_name, double timeout_s = -1.0);
 
-    struct FrameRecord {
+    /** One run's state as this endpoint reads it, in one coherent pass. */
+    struct EntrySnapshot {
+        MailboxState state{MailboxState::IDLE};
+        bool accepted{false};
+        MailboxPreparationDisposition disposition{MailboxPreparationDisposition::NONE};
+    };
+
+    /**
+     * What the parent remembers about one run-state entry.
+     *
+     * Paired with the shared `MailboxRunEntry` it names: this side is the
+     * parent's own bookkeeping — what it has already reported upward — and the
+     * shared side is what the child and the device publish.
+     */
+    struct EntryRecord {
         bool occupied{false};
         bool staged_reported{false};
         bool accepted_reported{false};
         bool activation_requested{false};
         bool activation_published{false};
-        // The disposition this frame was last reported with. A staged run may be
+        // The disposition this run was last reported with. A staged run may be
         // prepared later than it was staged — its own predecessor had not
         // launched yet when it arrived — and that promotion is published by the
-        // child into the same frame. Remembering what was reported is what lets
+        // child into the same entry. Remembering what was reported is what lets
         // the change be reported once more instead of being lost.
         MailboxPreparationDisposition reported_disposition{MailboxPreparationDisposition::NONE};
         WorkerDispatch dispatch{};
@@ -585,15 +720,52 @@ private:
         uint64_t slot_id{0};
         uint64_t generation{0};
         uint64_t group_size{0};
+        // Which request frame carried this run's payload, and that frame's
+        // generation. The parent reclaims the frame when the child echoes the
+        // generation back, which is a level rather than a pulse — so an
+        // observation missed on one poll is seen on the next.
+        size_t request_frame{kNoRequestFrame};
+        uint64_t request_frame_generation{0};
+        // This entry's own generation, odd while occupied. Every cross-side
+        // reference carries it, so a stale one is refused rather than acted on.
+        uint64_t entry_generation{0};
     };
-    std::array<FrameRecord, MAILBOX_TASK_FRAME_COUNT> frames_{};
+    static constexpr size_t kNoRequestFrame = static_cast<size_t>(-1);
+    std::vector<EntryRecord> entries_;
 
-    bool frame_identity_matches(const FrameRecord &record, const char *frame) const;
-    bool try_publish_activation(FrameRecord &record, char *frame);
+    /** Per request frame: whether the parent still owns it, and its generation. */
+    struct RequestFrameRecord {
+        bool published{false};
+        uint64_t generation{0};
+        size_t entry{kNoRequestFrame};
+    };
+    std::vector<RequestFrameRecord> request_frames_;
+    uint64_t next_frame_generation_{1};
+    uint64_t next_entry_generation_{1};
+
+    /** A free run-state entry, or `entries_.size()` when every one is occupied. */
+    size_t free_entry_locked() const;
+    /** A request frame the parent still owns, or `request_frames_.size()`. */
+    size_t free_request_frame_locked() const;
+    /**
+     * Give back every request frame whose payload the child has copied out.
+     *
+     * The decision is a level: the child stores the frame's own generation into
+     * the entry it belongs to, and this compares the two. A frame reclaimed
+     * twice is a no-op, and one whose echo is observed late is reclaimed on the
+     * next poll instead of being lost.
+     */
+    void reclaim_consumed_request_frames_locked();
+    /** Free entry `index` and publish the even generation that retires its references. */
+    void release_entry_locked(size_t index);
+
+    bool entry_identity_matches(const EntryRecord &record, const MailboxRunEntry *entry) const;
+    bool try_publish_activation(EntryRecord &record, MailboxRunEntry *entry);
     void poison_progress(const std::string &reason);
     bool poisoned_progress_quiesced();
-    WorkerCompletion poisoned_completion(const FrameRecord &record) const;
-    WorkerCompletion terminal_completion(const FrameRecord &record, const char *frame, MailboxState state) const;
+    WorkerCompletion poisoned_completion(const EntryRecord &record) const;
+    WorkerCompletion
+    terminal_completion(const EntryRecord &record, const MailboxRunEntry *entry, MailboxState state) const;
 
     // Returns a description of the child's death, or an empty string while it
     // is still running. Never throws: callers decide whether a dead child is
@@ -614,7 +786,7 @@ public:
 
     // Initialize the endpoint lane.
     //
-    // `mailbox` points to a MAILBOX_SIZE-byte MAP_SHARED region managed
+    // `mailbox` points to a `mailbox_size(granted_sets)`-byte MAP_SHARED region managed
     // by the Python facade — the real worker (a `ChipWorker` for
     // NEXT_LEVEL, a Python callable for SUB) lives in the forked child
     // and consumes the mailbox via `_chip_process_loop` / `_sub_worker_loop`.
@@ -663,6 +835,16 @@ public:
     // A staged successor must not make a second task from the active run
     // dispatchable on the same device.
     bool idle() const;
+    /**
+     * Whether an ordinary dispatch can be published right now.
+     *
+     * `idle()` alone answers only for the lane. A publication also needs a
+     * request frame, and transport is bounded independently of the grant, so
+     * this is the gate an admitter consults before claiming a task for the
+     * ordinary lane — the same obligation `can_stage` carries for the staged
+     * ones.
+     */
+    bool can_dispatch() const;
     bool can_stage() const;
     bool busy() const { return inflight_.load(std::memory_order_acquire) != 0; }
     const WorkerEndpointCaps &caps() const;
@@ -749,6 +931,13 @@ private:
         STOPPING,
         CAPACITY_EXCEEDED,
         STAGED_IDENTITY_CHANGED,
+        // Publication threw and the failure has already been delivered — by the
+        // endpoint, which may own a partially published dispatch, or by this
+        // worker's own terminal. Distinct from SUBMITTED on purpose: the two
+        // were one value, and a caller that cannot tell them apart cannot tell
+        // "the run is live" from "the run is already failed". Both mean the
+        // caller reports nothing further, and neither means the lane is free.
+        PUBLICATION_REPORTED,
     };
 
     enum class LaneKind : uint8_t {
@@ -788,7 +977,12 @@ private:
     // identity it carries rather than by position — the endpoint picks a mailbox
     // frame from the run's own pipeline lease, so which staged lane a run
     // occupies says nothing about where its frame is.
-    std::array<LaneState, PTO_PIPELINE_MAX_DEPTH> lanes_{};
+    // Sized at `start` to the endpoint's capacity, which is the count of runs
+    // its child may hold at once.
+    std::vector<LaneState> lanes_;
+    // Scratch for `progress`'s activation pass, sized beside `lanes_` so that
+    // path allocates nothing. The progress thread is its only reader and writer.
+    std::vector<RunId> activation_scratch_;
     std::unordered_set<uint64_t> accepted_dispatch_ids_;
     std::unordered_map<uint64_t, std::string> accept_errors_;
 
@@ -842,13 +1036,13 @@ public:
     using OnAcceptFn = std::function<void(WorkerDispatch)>;
     using OnStagedFn = std::function<void(WorkerDispatch)>;
 
-    // Register a worker. `mailbox` is a MAILBOX_SIZE-byte MAP_SHARED
+    // Register a worker. `mailbox` is a `mailbox_size(granted_sets)`-byte MAP_SHARED
     // region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
     // callable for SUB) lives in the forked child.
     // `child_pid` is the forked child servicing `mailbox`; pass -1 when the
     // caller owns no waitable child.
-    void add_next_level(void *mailbox, int child_pid = -1, uint32_t task_frame_count = 1);
-    void add_next_level_at(int32_t worker_id, void *mailbox, int child_pid = -1, uint32_t task_frame_count = 1);
+    void add_next_level(void *mailbox, int child_pid = -1, uint32_t granted_sets = 1);
+    void add_next_level_at(int32_t worker_id, void *mailbox, int child_pid = -1, uint32_t granted_sets = 1);
     void add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint);
     void add_sub(void *mailbox, int child_pid = -1);
 
@@ -952,7 +1146,7 @@ private:
         int32_t worker_id{-1};
         void *mailbox{nullptr};
         int child_pid{-1};
-        uint32_t task_frame_count{1};
+        uint32_t granted_sets{1};
     };
     struct LocalSubEntry {
         void *mailbox{nullptr};

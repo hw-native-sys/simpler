@@ -19,7 +19,7 @@
  *
  * Public surface:
  *   - add_worker(type, mailbox)    — register a sub-worker (before init).
- *                                    `mailbox` is a MAILBOX_SIZE-byte
+ *                                    `mailbox` is a `mailbox_size(granted_sets)`-byte
  *                                    MAP_SHARED region; the real worker
  *                                    (a `ChipWorker` for NEXT_LEVEL, a
  *                                    Python callable for SUB) lives in
@@ -72,7 +72,7 @@ public:
     Worker &operator=(const Worker &) = delete;
 
     // Register a sub-worker before calling init(). `mailbox` is a
-    // MAILBOX_SIZE-byte MAP_SHARED region; the real worker (a `ChipWorker`
+    // `mailbox_size(granted_sets)`-byte MAP_SHARED region; the real worker (a `ChipWorker`
     // for NEXT_LEVEL, a Python callable for SUB) lives in the forked
     // child and consumes the mailbox via the Python child loop.
     // `child_pid` is the forked child servicing `mailbox`, or -1 when the

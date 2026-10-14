@@ -241,7 +241,7 @@ class TestClosedAbsorption:
 class TestJournalInAbortHierarchical:
     class _FakeShm:
         def __init__(self):
-            self.buf = bytearray(worker_mod.MAILBOX_SIZE)
+            self.buf = bytearray(worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST))
             self.close_count = 0
             self.unlink_count = 0
 

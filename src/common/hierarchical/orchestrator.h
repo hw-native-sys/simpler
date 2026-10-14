@@ -45,7 +45,7 @@
 #include "../task_interface/data_type.h"
 #include "../task_interface/task_args_wire.h"
 #include "../task_interface/tensor.h"
-#include "../worker/pipeline_slot_pool.h"
+#include "../worker/run_resource_arena.h"
 #include "../worker/device_memory_info.h"
 #include "worker_manager.h"
 #include "ring.h"
@@ -317,25 +317,25 @@ private:
     std::condition_variable runs_cv_;
     std::unordered_map<RunId, std::shared_ptr<RunState>> runs_;
     std::deque<RunId> run_fifo_;
-    // The standing default, not the layout ceiling: an Orchestrator nobody
-    // configured admits what every Orchestrator admitted before the count
-    // could be requested. `configure_pipeline_depth` is what carries a granted
-    // capacity here, and the pool is sized to the ceiling so that call can
-    // raise the admission bound without rebuilding it.
-    PipelineSlotPool pipeline_slots_{PTO_PIPELINE_MAX_DEPTH};
+    // The standing default, not a layout ceiling: an Orchestrator nobody
+    // configured admits what every Orchestrator admitted before the count could
+    // be requested. `configure_pipeline_depth` carries a granted capacity here
+    // and rebuilds the arena to it, which it may do because it refuses once
+    // admission has started.
+    RunResourceArena run_resources_{kDefaultRunResourceSets};
     uint32_t admission_depth_{kDefaultRunResourceSets};
     // How many non-terminal runs `run_fifo_` may hold. Derived from
     // `admission_depth_` unless a caller configured it, so the default admits
     // exactly the runs a lease was available for before the two budgets split.
     uint32_t pending_run_limit_{kDefaultRunResourceSets};
     // How many runs may have their device work launched at once. One is the
-    // serial behaviour, and at one nothing below reads
-    // `early_launch_run_id_`, which stays invalid.
+    // serial behaviour, and at one nothing below authorizes an early launch.
     uint32_t launch_depth_{1};
-    // The staged successor currently authorized to launch early, latched so
-    // the transition into that state can be announced once rather than
-    // re-derived by every reader.
-    RunId early_launch_run_id_{INVALID_RUN_ID};
+    // Which runs were already authorized to launch early. Not the answer to
+    // "who may launch" — that is `early_launch_prefix_locked`, recomputed on
+    // demand — only the comparison that says which transition authorized
+    // someone new and therefore owes the scheduler a wake.
+    std::vector<RunId> early_launch_authorized_;
     RunId next_run_id_{1};
     RunId building_run_id_{INVALID_RUN_ID};
     RunId active_run_id_{INVALID_RUN_ID};
@@ -406,6 +406,8 @@ private:
      * endpoint's staging event.
      */
     bool refresh_early_launch_locked();
+    /** The FIFO prefix authorized to launch early right now; `runs_mu_` is held. */
+    std::vector<RunId> early_launch_prefix_locked() const;
     void activate_fifo_head();
     void retire_terminal_run(const std::shared_ptr<RunState> &run);
     void cancel_unstarted_run(const std::shared_ptr<RunState> &run, const std::string &message);

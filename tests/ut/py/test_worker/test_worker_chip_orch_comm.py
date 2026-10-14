@@ -49,7 +49,6 @@ from simpler.task_interface import DataType
 from simpler.worker import (
     _IDLE,
     _OFF_STATE,
-    MAILBOX_SIZE,
     Worker,
     _buffer_field_addr,
     _mailbox_store_i32,
@@ -358,7 +357,7 @@ class _EndpointFailingOrch:
 
 def _make_started_sim_worker() -> tuple[Worker, SharedMemory, _FakeDirectCWorker]:
     worker = Worker(level=3, device_ids=[0], platform="a2a3sim", runtime="tensormap_and_ringbuffer")
-    shm = SharedMemory(create=True, size=MAILBOX_SIZE)
+    shm = SharedMemory(create=True, size=worker_module.mailbox_size(worker_module._DEFAULT_PIPELINE_DEPTH_REQUEST))
     assert shm.buf is not None
     _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
     fake_c_worker = _FakeDirectCWorker()
@@ -373,7 +372,7 @@ def _make_started_sim_worker() -> tuple[Worker, SharedMemory, _FakeDirectCWorker
 
 def _make_started_onboard_worker(platform: str = "a2a3") -> tuple[Worker, SharedMemory, _FakeDirectCWorker]:
     worker = Worker(level=3, device_ids=[2], platform=platform, runtime="tensormap_and_ringbuffer")
-    shm = SharedMemory(create=True, size=MAILBOX_SIZE)
+    shm = SharedMemory(create=True, size=worker_module.mailbox_size(worker_module._DEFAULT_PIPELINE_DEPTH_REQUEST))
     assert shm.buf is not None
     _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
     fake_c_worker = _FakeDirectCWorker(

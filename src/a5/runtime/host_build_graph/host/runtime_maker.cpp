@@ -134,12 +134,14 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
     // region's classification. The arena-topology check skips an absent kind.
     // `pipeline_depth` is the maximum this runtime supports, not a configured
     // count: every device-resident region it names carries per-run content and
-    // is selected by the caller's lease, so three runs can hold three of them.
-    // What a context actually grants is the smaller of this and the request.
+    // is selected by the caller's lease, so as many runs can hold one as a
+    // context cares to grant. What a context actually grants is the smaller of
+    // this and the request, and every per-run resource is built to that grant —
+    // so declaring no limit here commits nothing.
     static const PipelineContract contract = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
         4,
-        PTO_PIPELINE_MAX_DEPTH,
+        UINT32_MAX,
         {
             {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_HOST_PER_RUN, 0},
             {PTO_PIPELINE_RUNTIME_IMAGE, PTO_PIPELINE_HOST_PER_RUN, 0},

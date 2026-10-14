@@ -24,6 +24,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <new>
 #include <string>
 #include <unordered_map>
@@ -32,7 +33,7 @@
 
 #include "call_config.h"
 #include "host/caller_device_buffers.h"
-#include "pipeline_slot_pool.h"
+#include "run_resource_arena.h"
 #include "runtime_c_api.h"
 #include "task_args.h"
 #include "tensor.h"
@@ -129,6 +130,10 @@ void prime_worker(ChipWorker &worker, unsigned launch_depth = 2) {
     worker.launch_depth_ = launch_depth;
     worker.initialized_ = true;
     worker.pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 2, {}};
+    // One generation per granted set, as `init` sizes it: an unsized filter has no entry for
+    // slot 0, and `is_admissible` refuses a lease outside it, so every preparation would be
+    // refused as stale before reaching the stubs below.
+    worker.pipeline_generations_.resize(2);
     worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
     worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
     for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {
@@ -624,6 +629,115 @@ TEST(ChipRunLaneJoinedLaunchTest, ABackendDeclineIsRetriedRatherThanRemembered) 
     second.activate();
     EXPECT_TRUE(second.launched());
     EXPECT_GT(g_diagnostic_queries, asked_once);
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    g_complete[1] = true;
+    EXPECT_TRUE(second.done());
+    lane.close();
+    worker.finalize();
+}
+
+namespace {
+
+// The fixed terminal-bank table, as the runner's own predicate sees it. `can_take_run_terminal_bank`
+// is the last thing `DeviceRunnerBase::can_join_diagnostic_run` asks, so for a swimlane pair this
+// *is* the backend's answer — which is why a case about it belongs here, where the lane's response
+// to that answer is observable.
+constexpr size_t kTerminalBanks = 3;
+std::map<uint64_t, int> g_bank_of;
+std::vector<uint64_t> g_bank_declined;
+std::vector<uint64_t> g_bank_permitted;
+std::array<uint64_t, 2> g_run_of_slot{};
+
+bool bank_available_for(uint64_t run_epoch) {
+    if (g_bank_of.count(run_epoch) != 0) return true;
+    return g_bank_of.size() < kTerminalBanks;
+}
+
+int supports_joined_diagnostic_banked(void *, void *successor, void *predecessor) {
+    g_diagnostic_queries++;
+    g_diagnostic_pairs.emplace_back(slot_of(successor), slot_of(predecessor));
+    const uint64_t run_epoch = g_run_of_slot[slot_of(successor)];
+    const bool permitted = bank_available_for(run_epoch);
+    (permitted ? g_bank_permitted : g_bank_declined).push_back(run_epoch);
+    return permitted ? 1 : 0;
+}
+
+size_t count_event(const std::string &event) {
+    size_t seen = 0;
+    for (const std::string &recorded : g_events) {
+        if (recorded == event) ++seen;
+    }
+    return seen;
+}
+
+}  // namespace
+
+// Contract row 37 at the layer that decides it: a diagnostic successor that could not take a
+// terminal bank is **not launched at all**. It stays prepared, its permission is re-asked on a
+// later round, and the same run joins once a bank comes back.
+//
+// This is the lane's half, and it is the half that makes the row's "waits for a bank" true.
+// `DeviceRunnerBase::can_join_diagnostic_run` ends with
+// `can_take_run_terminal_bank(succ.identity.run_epoch)`, and `launch_ready_prefix` returns on a
+// false permission *before* it calls `launch_native_run_joined` — so the successor is left
+// `PREPARED` rather than ordered onto the device without somewhere to publish. That is a wait in
+// lane state; no thread blocks. The bank table's own behaviour — held by epoch, refused when
+// full, handed on at release — is `test_chip_swimlane_run_terminal.cpp`'s, and the two are
+// layered rather than repeated.
+//
+// The invariant this asserts about dropped output is the one the product actually has: a join is
+// permitted only in a round where a bank was available for that epoch. It does not claim the
+// successor has acquired one — the acquire happens later, at the arm.
+TEST(ChipRunLaneJoinedLaunchTest, ADiagnosticSuccessorWithNoTerminalBankStaysPreparedUntilOneIsReleased) {
+    ChipWorker worker;
+    prime_worker(worker);
+    worker.supports_joined_diagnostic_launch_fn_ = supports_joined_diagnostic_banked;
+    ChipRunLane lane(worker);
+    const CallConfig level_one = swimlane_config(1);
+
+    constexpr uint64_t kFrontRun = 371;
+    constexpr uint64_t kSuccessorRun = 372;
+    g_run_of_slot = {kFrontRun, kSuccessorRun};
+    g_bank_of.clear();
+    g_bank_declined.clear();
+    g_bank_permitted.clear();
+    // Every bank held, and none of them this successor's: the state a run ordered behind the
+    // open ones meets.
+    g_bank_of = {{9001, 0}, {9002, 1}, {9003, 2}};
+    ASSERT_EQ(g_bank_of.size(), kTerminalBanks);
+
+    ChipRun first = submit(lane, kFrontRun, 0, true, host_args(), level_one);
+    ChipRun second = submit(lane, kSuccessorRun, 1, false, host_args(), level_one);
+    second.activate();
+
+    // Declined, and declined *before* the device: nothing was handed to the joined launch.
+    EXPECT_FALSE(second.launched());
+    EXPECT_EQ(count_event("joined1behind0"), 0u)
+        << "a successor with no terminal bank was ordered onto the device anyway";
+    EXPECT_EQ(count_event("launch1"), 0u) << "the successor was launched on its own ahead of the front";
+    ASSERT_EQ(g_bank_declined, (std::vector<uint64_t>{kSuccessorRun}))
+        << "the run the bank table refused was not this successor";
+    EXPECT_TRUE(g_bank_permitted.empty());
+    EXPECT_EQ(g_bank_of.count(kSuccessorRun), 0u) << "a declined successor was given a bank anyway";
+    const int asked_once = g_diagnostic_queries;
+    EXPECT_GT(asked_once, 0) << "the lane never asked, so this case is not about the bank";
+
+    // A run ahead reports and releases its bank. The decline was about this round only, so the
+    // same successor — same run, same slot — is asked again.
+    g_bank_of.erase(9002);
+    second.activate();
+
+    EXPECT_TRUE(second.launched()) << "a freed bank did not resume the successor that was waiting for one";
+    EXPECT_GT(g_diagnostic_queries, asked_once) << "the decline was remembered rather than re-asked";
+    ASSERT_EQ(g_bank_permitted, (std::vector<uint64_t>{kSuccessorRun}))
+        << "the run that joined is not the run that had been waiting";
+    EXPECT_EQ(g_bank_declined.size(), 1u) << "the successor was refused again after a bank came free";
+    ASSERT_FALSE(g_diagnostic_pairs.empty());
+    EXPECT_EQ(g_diagnostic_pairs.back().first, 1u) << "the successor asked about is not the waiting run";
+    EXPECT_EQ(g_diagnostic_pairs.back().second, 0u) << "it was not ordered behind the front";
+    EXPECT_EQ(count_event("joined1behind0"), 1u) << "the resumed successor was launched twice, or not as a join";
 
     g_complete[0] = true;
     EXPECT_TRUE(first.done());

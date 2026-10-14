@@ -60,7 +60,7 @@ the device-read prefix into host heap storage: `RuntimeLaunchImage::prepare`
 
 The destination is not per-run. It is owned by the pipeline slot —
 `SlotPersistentArgs::runtime_args`, one per slot in
-`std::array<SlotPersistentArgs, PTO_PIPELINE_MAX_DEPTH>`, allocated lazily on a
+`RunResourceSlots<SlotPersistentArgs>`, allocated lazily on a
 slot's first run (`device_runner_helpers.cpp:99-107`) and released only in
 `finalize_common_impl`. Per-slot rather than per-runner because the copy is not
 stream-ordered, so a prepared successor would otherwise overwrite the image its

@@ -14,7 +14,7 @@
 //
 // The production pieces are driven, not imitated. Boundaries come from a real
 // `RunCompletionFence` through `wait_and_retain_run_boundaries`; the record
-// read goes through `RunRecordReadLedgerT::read_with_status` against a
+// read goes through `RunRecordReadLedger::read_with_status` against a
 // scripted transport; the terminal comes from the shared
 // `device_run_result_terminal` validator; and the branch is chosen by
 // `decide_run_drain`, which is the rule `DeviceRunnerBase::wait_run_fence`
@@ -170,9 +170,8 @@ struct DrainedRun {
 };
 
 DrainedRun drain(
-    RunCompletionFence &fence, RunBoundaryLedgerT<kSlots> &boundaries, RunRecordReadLedgerT<kSlots> &reads,
-    DeviceRunResultRegion &cached, const NativeRunIdentity &run, const DeviceRunResultRegion *device_region,
-    const ScriptedTransport &transport
+    RunCompletionFence &fence, RunBoundaryLedger &boundaries, RunRecordReadLedger &reads, DeviceRunResultRegion &cached,
+    const NativeRunIdentity &run, const DeviceRunResultRegion *device_region, const ScriptedTransport &transport
 ) {
     DrainedRun out;
     out.evidence.boundaries = wait_and_retain_run_boundaries(fence, boundaries, run, kTimeoutMs).completion;
@@ -189,8 +188,8 @@ DrainedRun drain(
 TEST(RunDrainDecision, BothBoundariesAndAValidOkDecideSuccessWithoutSynchronizing) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> boundaries;
-    RunRecordReadLedgerT<kSlots> reads;
+    RunBoundaryLedger boundaries(kSlots);
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(1, 11);
     fence_the_run(fence, run);
 
@@ -209,8 +208,8 @@ TEST(RunDrainDecision, AnOkRecordWhoseBoundariesHaveNotCompletedStillSynchronize
     ScriptedEvents events;
     events.device_never_completes();
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> boundaries;
-    RunRecordReadLedgerT<kSlots> reads;
+    RunBoundaryLedger boundaries(kSlots);
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(1, 12);
     // Submitted but never recorded: the fence cannot decide it.
     ASSERT_EQ(fence.arm(run), 0);
@@ -232,8 +231,8 @@ TEST(RunDrainDecision, AnOkRecordWhoseBoundariesHaveNotCompletedStillSynchronize
 TEST(RunDrainDecision, ATransportStatusOutranksARecordThatWouldOtherwiseDecideSuccess) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> boundaries;
-    RunRecordReadLedgerT<kSlots> reads;
+    RunBoundaryLedger boundaries(kSlots);
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(2, 21);
     fence_the_run(fence, run);
 
@@ -256,7 +255,7 @@ TEST(RunDrainDecision, ATransportStatusOutranksARecordThatWouldOtherwiseDecideSu
 }
 
 TEST(RunDrainDecision, AFailedTransferLeavesNoBytesForAnyBranchToRead) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(0, 31);
     const DeviceRunResultRegion device_region = published_success(run.run_epoch);
     DeviceRunResultRegion cached = published_failure(run.run_epoch);
@@ -273,7 +272,7 @@ TEST(RunDrainDecision, AFailedTransferLeavesNoBytesForAnyBranchToRead) {
 // ===== The retained status, and the once-per-run read =====
 
 TEST(RunRecordTransferStatus, TheRawCodeIsRetainedVerbatimAndRepeatedForTheSameRun) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(3, 41);
     const DeviceRunResultRegion device_region = published_success(run.run_epoch);
     DeviceRunResultRegion cached{};
@@ -295,7 +294,7 @@ TEST(RunRecordTransferStatus, TheRawCodeIsRetainedVerbatimAndRepeatedForTheSameR
 }
 
 TEST(RunRecordTransferStatus, ASucceedingTransferRetainsNoStatus) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(3, 42);
     const DeviceRunResultRegion device_region = published_success(run.run_epoch);
     DeviceRunResultRegion cached{};
@@ -307,7 +306,7 @@ TEST(RunRecordTransferStatus, ASucceedingTransferRetainsNoStatus) {
 }
 
 TEST(RunRecordTransferStatus, ASlotWithNoRegionReportsNoStatusAndNoAttempt) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(0, 43);
     DeviceRunResultRegion cached{};
     ScriptedTransport transport(nullptr);
@@ -320,7 +319,7 @@ TEST(RunRecordTransferStatus, ASlotWithNoRegionReportsNoStatusAndNoAttempt) {
 
 // The bool-reporting entry stays for callers with no transport code to give.
 TEST(RunRecordTransferStatus, TheSuccessOnlyEntryReportsAFailureWithoutClaimingATransportCode) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(1, 44);
     const DeviceRunResultRegion device_region = published_success(run.run_epoch);
     DeviceRunResultRegion cached{};
@@ -338,7 +337,7 @@ TEST(RunRecordTransferStatus, TheSuccessOnlyEntryReportsAFailureWithoutClaimingA
 // ===== Identity =====
 
 TEST(RunRecordTransferStatus, AStatusBelongsToTheRunThatOwnsTheRead) {
-    RunRecordReadLedgerT<kSlots> reads;
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity predecessor = run_at(1, 51);
     const NativeRunIdentity successor = run_at(1, 52);
     const NativeRunIdentity other_slot = run_at(2, 51);
@@ -363,8 +362,8 @@ TEST(RunRecordTransferStatus, AStatusBelongsToTheRunThatOwnsTheRead) {
 TEST(RunDrainDecision, ARecordPublishedUnderAnEarlierEpochSynchronizes) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> boundaries;
-    RunRecordReadLedgerT<kSlots> reads;
+    RunBoundaryLedger boundaries(kSlots);
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity predecessor = run_at(1, 61);
     const NativeRunIdentity successor = run_at(1, 62);
 
@@ -386,8 +385,8 @@ TEST(RunDrainDecision, ARecordPublishedUnderAnEarlierEpochSynchronizes) {
 TEST(RunDrainDecision, AReadForgottenByAGenerationResetSynchronizes) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> boundaries;
-    RunRecordReadLedgerT<kSlots> reads;
+    RunBoundaryLedger boundaries(kSlots);
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(2, 71);
     fence_the_run(fence, run);
 
@@ -412,8 +411,8 @@ TEST(RunDrainDecision, AReadForgottenByAGenerationResetSynchronizes) {
 TEST(RunDrainDecision, APublishedFailureSynchronizesAndKeepsItsAttribution) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> boundaries;
-    RunRecordReadLedgerT<kSlots> reads;
+    RunBoundaryLedger boundaries(kSlots);
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(0, 81);
     fence_the_run(fence, run);
 
@@ -431,8 +430,8 @@ TEST(RunDrainDecision, APublishedFailureSynchronizesAndKeepsItsAttribution) {
 TEST(RunDrainDecision, ARecordNeverPublishedSynchronizes) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> boundaries;
-    RunRecordReadLedgerT<kSlots> reads;
+    RunBoundaryLedger boundaries(kSlots);
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(1, 91);
     fence_the_run(fence, run);
 
@@ -449,8 +448,8 @@ TEST(RunDrainDecision, ARecordNeverPublishedSynchronizes) {
 TEST(RunDrainDecision, ASelfInconsistentRecordSynchronizes) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
-    RunBoundaryLedgerT<kSlots> boundaries;
-    RunRecordReadLedgerT<kSlots> reads;
+    RunBoundaryLedger boundaries(kSlots);
+    RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(2, 101);
     fence_the_run(fence, run);
 

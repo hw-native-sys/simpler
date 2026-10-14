@@ -886,7 +886,12 @@ TEST(KernelPipelineBuilder, DefaultAndPackedInputsPreserveProgramContract) {
     EXPECT_EQ(packed, before);
     expect_same_contract(*get_pipeline_contract(), program_before);
     EXPECT_TRUE(is_valid_pipeline_contract(get_pipeline_contract()));
-    EXPECT_EQ(get_pipeline_contract()->pipeline_depth, 2u);
+    // The program declares no depth limit of its own: one shared scratch serves any number of runs
+    // because the AICPU stream is a FIFO and that order is transitive, so what bounds concurrency
+    // is the per-run task-args region — one per set a context was granted. The kernel contract
+    // asserted above still declares two, which is why both are checked here rather than one
+    // standing in for the other.
+    EXPECT_EQ(get_pipeline_contract()->pipeline_depth, UINT32_MAX);
 }
 
 TEST(KernelPipelineBuilder, InvalidSizesLeaveOutputUntouched) {

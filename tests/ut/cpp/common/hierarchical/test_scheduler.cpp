@@ -27,6 +27,7 @@
 #include <deque>
 #include <future>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -128,9 +129,33 @@ struct MockMailboxWorker {
     struct Record {
         uint8_t callable_hash0;
         uint64_t tensor_key;  // first tensor's identity buffer_id (unique per submit in tests)
+        // Which request frame carried this payload, which run-state entry its header named, and
+        // whether the parent asked for a preparation rather than an ordinary dispatch. Defaulted
+        // so the two-field aggregate initializer the older cases use still compiles.
+        size_t frame_index{0};
+        size_t entry_index{0};
+        bool prepare_only{false};
     };
 
+    /** A payload this child has copied out but whose hand-back it is deliberately withholding. */
+    struct HeldFrame {
+        size_t frame_index;
+        size_t entry_index;
+        uint64_t frame_generation;
+        bool prepare_only;
+    };
+
+    /** No run is staged, so acceptance has no entry to reach. */
+    static constexpr size_t kNoEntry = static_cast<size_t>(-1);
+
     alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    // What this child's parent granted it, which is what bounds the entry table it may address.
+    // `MAILBOX_SIZE` is sized for `MAILBOX_DEFAULT_GRANTED_SETS`, and every endpoint in this file
+    // is constructed over that region, so this is the width of the table that exists.
+    size_t granted_sets{MAILBOX_DEFAULT_GRANTED_SETS};
+    // The entry the run currently staged occupies, taken from the header of the frame its payload
+    // arrived on. Read by `write_task_accepted` from the test's thread.
+    std::atomic<size_t> current_entry{kNoEntry};
     std::vector<Record> dispatched;
     std::mutex dispatched_mu;
 
@@ -142,7 +167,23 @@ struct MockMailboxWorker {
     std::string next_error_msg;
     std::atomic<bool> is_running{false};
     std::atomic<bool> stop_flag{false};
+    // Whether this child writes its own acceptance word. Off by default, because the older cases
+    // publish acceptance from the test thread at a point of their own choosing.
+    std::atomic<bool> auto_accept{false};
     std::thread loop_thread;
+
+    // Frame withholding. A child owns a request frame from the instant it reads TASK_READY until
+    // its acknowledgement, and the protocol puts no bound on how long that is — so a fixture that
+    // wants the parent's transport full simply stops before the hand-back. Guarded by `hold_mu`.
+    std::mutex hold_mu;
+    std::condition_variable hold_cv;
+    size_t hold_budget{0};
+    std::vector<HeldFrame> held;
+    std::vector<HeldFrame> releasing;
+    // Request frames this child has acknowledged, counted at the acknowledgement itself.
+    std::atomic<size_t> acknowledged{0};
+    // Entries this child has staged and that are waiting for the parent's ACTIVATE.
+    std::vector<size_t> staged;
 
     void start() {
         // SharedMemory zero-fills, but std::array does not — explicitly
@@ -159,6 +200,7 @@ struct MockMailboxWorker {
         // publishes TASK_DONE before checking stop_flag, so any in-flight
         // LocalMailboxEndpoint::run completes its spin-poll cleanly.
         stop_flag.store(true, std::memory_order_release);
+        release_all_held_frames();
         {
             std::lock_guard<std::mutex> lk(run_mu);
             should_complete.store(true, std::memory_order_release);
@@ -186,21 +228,77 @@ struct MockMailboxWorker {
     }
 
     // Persistent teardown mode: every dispatch — including one arriving after
-    // this call — completes itself, so Scheduler::stop() can always join.
+    // this call — completes itself, so Scheduler::stop() can always join. Any
+    // frame still withheld is released too, since a frame this child never
+    // hands back is one the parent can never reclaim.
     void drain() {
         drain_mode.store(true, std::memory_order_release);
+        release_all_held_frames();
         std::lock_guard<std::mutex> lk(run_mu);
         should_complete.store(true, std::memory_order_release);
         run_cv.notify_one();
     }
 
-    // The child publishes acceptance into the sticky word, not the state.
+    /** Withhold the hand-back of the next `count` payloads this child copies out. */
+    void hold_next_request_frames(size_t count) {
+        std::lock_guard<std::mutex> lk(hold_mu);
+        hold_budget = count;
+    }
+
+    size_t held_frame_count() {
+        std::lock_guard<std::mutex> lk(hold_mu);
+        return held.size();
+    }
+
+    bool wait_held_frames(size_t count, int timeout_ms = 3000) {
+        std::unique_lock<std::mutex> lk(hold_mu);
+        return hold_cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [this, count] {
+            return held.size() >= count;
+        });
+    }
+
+    /**
+     * Hand back the oldest withheld frame.
+     *
+     * Only queues it: every store the protocol defines is made on this child's own loop thread,
+     * so a release from the test thread cannot reorder itself against the payload copy that
+     * preceded it.
+     */
+    void release_one_held_frame() {
+        std::lock_guard<std::mutex> lk(hold_mu);
+        if (held.empty()) return;
+        releasing.push_back(held.front());
+        held.erase(held.begin());
+    }
+
+    void release_all_held_frames() {
+        std::lock_guard<std::mutex> lk(hold_mu);
+        releasing.insert(releasing.end(), held.begin(), held.end());
+        held.clear();
+        hold_budget = 0;
+    }
+
+    /** Wait until this child has acknowledged at least `count` request frames. */
+    bool wait_acknowledged(size_t count, int timeout_ms = 3000) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (acknowledged.load(std::memory_order_acquire) >= count) return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return acknowledged.load(std::memory_order_acquire) >= count;
+    }
+
+    // The child publishes acceptance into its run's entry, not the frame that
+    // delivered the payload: the device writes this word after the frame has
+    // already been handed back. Which entry that is comes from the header of the
+    // frame the payload arrived on, which `loop` recorded when it staged the run
+    // — never a fixed index, because the parent allocates entries in submission
+    // order and a later dispatch owns a later one.
     void write_task_accepted() {
+        const size_t entry_index = current_entry.load(std::memory_order_acquire);
+        if (entry_index == kNoEntry) return;
         int32_t v = MAILBOX_TASK_ACCEPTED;
-        auto *base_ptr = reinterpret_cast<int32_t *>(mailbox.data() + MAILBOX_OFF_ACCEPTED);
-        auto *task_ptr = reinterpret_cast<int32_t *>(task_frame() + MAILBOX_OFF_ACCEPTED);
-        __atomic_store(base_ptr, &v, __ATOMIC_RELEASE);
-        __atomic_store(task_ptr, &v, __ATOMIC_RELEASE);
+        __atomic_store(&mailbox_run_entry(mailbox.data(), entry_index)->accepted, &v, __ATOMIC_RELEASE);
     }
 
     void wait_running(int timeout_ms = 500) {
@@ -213,6 +311,24 @@ struct MockMailboxWorker {
     int dispatched_count() {
         std::lock_guard<std::mutex> lk(dispatched_mu);
         return static_cast<int>(dispatched.size());
+    }
+
+    bool wait_dispatched(size_t count, int timeout_ms = 3000) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            {
+                std::lock_guard<std::mutex> lk(dispatched_mu);
+                if (dispatched.size() >= count) return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        std::lock_guard<std::mutex> lk(dispatched_mu);
+        return dispatched.size() >= count;
+    }
+
+    std::vector<Record> dispatched_records() {
+        std::lock_guard<std::mutex> lk(dispatched_mu);
+        return dispatched;
     }
 
 private:
@@ -231,74 +347,220 @@ private:
         __atomic_store_n(ptr, static_cast<int32_t>(s), __ATOMIC_RELEASE);
     }
 
-    char *task_frame() { return mailbox.data() + MAILBOX_FIRST_TASK_FRAME * MAILBOX_FRAME_SIZE; }
+    char *task_frame(size_t index) { return mailbox.data() + (MAILBOX_FIRST_TASK_FRAME + index) * MAILBOX_FRAME_SIZE; }
 
-    MailboxState read_task_state() const {
+    MailboxState read_task_state(size_t index) const {
         const auto *ptr = reinterpret_cast<const volatile int32_t *>(
-            mailbox.data() + MAILBOX_FIRST_TASK_FRAME * MAILBOX_FRAME_SIZE + MAILBOX_OFF_STATE
+            mailbox.data() + (MAILBOX_FIRST_TASK_FRAME + index) * MAILBOX_FRAME_SIZE + MAILBOX_OFF_STATE
         );
         int32_t v = __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
         return static_cast<MailboxState>(v);
     }
 
-    void write_task_state(MailboxState state) {
-        auto *ptr = reinterpret_cast<volatile int32_t *>(task_frame() + MAILBOX_OFF_STATE);
+    void write_task_state(size_t index, MailboxState state) {
+        auto *ptr = reinterpret_cast<volatile int32_t *>(task_frame(index) + MAILBOX_OFF_STATE);
         __atomic_store_n(ptr, static_cast<int32_t>(state), __ATOMIC_RELEASE);
+    }
+
+    /**
+     * Hand one request frame back, in the order the protocol requires.
+     *
+     * The frame's own state word first and the consumption ACK last: the parent treats that ACK
+     * alone as permission to refill the frame, so an `IDLE` sequenced after it would erase a
+     * payload the parent had already published. A level, not a pulse — the parent compares the
+     * echoed value against the generation it published.
+     */
+    void return_request_frame(size_t frame_index, MailboxRunEntry *entry, uint64_t frame_generation) {
+        write_task_state(frame_index, MailboxState::IDLE);
+        __atomic_store_n(&entry->frame_consumed_generation, frame_generation, __ATOMIC_RELEASE);
+        // Published after the acknowledgement it counts, so a test that observes this count has
+        // also observed the `IDLE` that preceded it — which is what lets it tell a republication
+        // apart from the publication that was already on the frame.
+        acknowledged.fetch_add(1, std::memory_order_release);
+    }
+
+    /** What this child resolved a preparation to, read by the parent with the staged state. */
+    void set_entry_disposition(MailboxRunEntry *entry, MailboxPreparationDisposition disposition) {
+        __atomic_store_n(&entry->preparation_disposition, static_cast<int32_t>(disposition), __ATOMIC_RELEASE);
+    }
+
+    /** Publish one run's terminal into its entry: rc and text first, the state last. */
+    void publish_terminal(MailboxRunEntry *entry, int32_t error_code, const std::string &error_msg) {
+        entry->error = error_code;
+        std::memset(entry->error_text, 0, MAILBOX_ERROR_MSG_SIZE);
+        if (!error_msg.empty()) {
+            const size_t n = std::min(error_msg.size(), static_cast<size_t>(MAILBOX_ERROR_MSG_SIZE - 1));
+            std::memcpy(entry->error_text, error_msg.data(), n);
+        }
+        __atomic_store_n(&entry->state, static_cast<int32_t>(MailboxState::TASK_DONE), __ATOMIC_RELEASE);
+    }
+
+    /** Take one hand-off: resolve its entry from the header, copy the payload out, give the frame back. */
+    bool serve_one_request(size_t frame_index, bool prepare_only) {
+        char *frame = task_frame(frame_index);
+        uint64_t entry_index = 0;
+        uint64_t entry_generation = 0;
+        uint64_t frame_generation = 0;
+        std::memcpy(&entry_index, frame + MAILBOX_OFF_FRAME_ENTRY_INDEX, sizeof(entry_index));
+        std::memcpy(&entry_generation, frame + MAILBOX_OFF_FRAME_ENTRY_GENERATION, sizeof(entry_generation));
+        std::memcpy(&frame_generation, frame + MAILBOX_OFF_FRAME_GENERATION, sizeof(frame_generation));
+        if (entry_index >= mailbox_run_entry_count(granted_sets)) {
+            // Nothing in this header names a live owner, so no entry is touched; the frame comes
+            // back so the loop stops re-reading it.
+            write_task_state(frame_index, MailboxState::IDLE);
+            return false;
+        }
+        MailboxRunEntry *entry = mailbox_run_entry(mailbox.data(), static_cast<size_t>(entry_index));
+        if (__atomic_load_n(&entry->entry_generation, __ATOMIC_ACQUIRE) != entry_generation) {
+            // The entry moved on; this frame is left over from a previous occupant of it and the
+            // parent has already reclaimed it from its own record.
+            write_task_state(frame_index, MailboxState::IDLE);
+            return false;
+        }
+
+        uint8_t callable_hash0 = static_cast<uint8_t>(frame[MAILBOX_OFF_TASK_CALLABLE_HASH]);
+        // The frame carries the wire blob, so decode it the way a real child does.
+        TaskArgsView view =
+            read_blob(reinterpret_cast<const uint8_t *>(frame) + MAILBOX_OFF_TASK_ARGS_BLOB, MAILBOX_ARGS_CAPACITY);
+        uint64_t tensor_key = 0;
+        if (view.tensor_count > 0) {
+            tensor_key = view.tensors(0).buffer.identity.buffer_id;
+        }
+        {
+            std::lock_guard<std::mutex> lk(dispatched_mu);
+            dispatched.push_back(
+                {callable_hash0, tensor_key, frame_index, static_cast<size_t>(entry_index), prepare_only}
+            );
+        }
+        const HeldFrame copied{frame_index, static_cast<size_t>(entry_index), frame_generation, prepare_only};
+        {
+            // The payload is out and nothing about this run has been published yet, which is the
+            // one point where a child may simply stop. A fixture that put a budget here wants the
+            // parent's transport full; every store the protocol defines still happens on this
+            // thread, when the frame is released.
+            std::lock_guard<std::mutex> lk(hold_mu);
+            if (hold_budget > 0) {
+                --hold_budget;
+                held.push_back(copied);
+                hold_cv.notify_all();
+                return true;
+            }
+        }
+        publish_consumption(copied);
+        return true;
+    }
+
+    /**
+     * Everything a child does after the payload is out: hand the frame back, then either stage the
+     * run or execute it.
+     *
+     * The hand-back comes first in both shapes, which is the whole point of transport being
+     * separate from the run — holding the frame across the execution below would stop the parent
+     * admitting anything else into this endpoint for as long as the run takes.
+     */
+    void publish_consumption(const HeldFrame &frame) {
+        MailboxRunEntry *entry = mailbox_run_entry(mailbox.data(), frame.entry_index);
+        if (frame.prepare_only) {
+            set_entry_disposition(entry, MailboxPreparationDisposition::NATIVE_PREPARED);
+            return_request_frame(frame.frame_index, entry, frame.frame_generation);
+            __atomic_store_n(&entry->state, static_cast<int32_t>(MailboxState::FRAME_STAGED), __ATOMIC_RELEASE);
+            staged.push_back(frame.entry_index);
+            return;
+        }
+        return_request_frame(frame.frame_index, entry, frame.frame_generation);
+        execute_entry(frame.entry_index, entry);
+    }
+
+    /** Run one entry to its terminal: the parked wait, then the acceptance and the terminal. */
+    void execute_entry(size_t entry_index, MailboxRunEntry *entry) {
+        current_entry.store(entry_index, std::memory_order_release);
+        is_running.store(true, std::memory_order_release);
+        if (auto_accept.load(std::memory_order_acquire)) {
+            __atomic_store_n(&entry->state, static_cast<int32_t>(MailboxState::TASK_LAUNCHED), __ATOMIC_RELEASE);
+            int32_t accepted = MAILBOX_TASK_ACCEPTED;
+            __atomic_store(&entry->accepted, &accepted, __ATOMIC_RELEASE);
+        }
+
+        {
+            std::unique_lock<std::mutex> lk(run_mu);
+            run_cv.wait(lk, [this] {
+                return should_complete.load(std::memory_order_acquire) || drain_mode.load(std::memory_order_acquire);
+            });
+            should_complete.store(false, std::memory_order_relaxed);
+        }
+        int32_t error_code = 0;
+        std::string error_msg;
+        {
+            std::lock_guard<std::mutex> lk(run_mu);
+            error_code = next_error_code;
+            error_msg = std::move(next_error_msg);
+            next_error_code = 0;
+            next_error_msg.clear();
+        }
+        is_running.store(false, std::memory_order_release);
+
+        // The run's own terminal, into its own entry, and this side's last access to it.
+        publish_terminal(entry, error_code, error_msg);
+    }
+
+    /** Hand back one frame the fixture released, and carry on from where the hold stopped. */
+    bool resume_one_released_frame() {
+        HeldFrame frame{};
+        {
+            std::lock_guard<std::mutex> lk(hold_mu);
+            if (releasing.empty()) return false;
+            frame = releasing.front();
+            releasing.erase(releasing.begin());
+        }
+        publish_consumption(frame);
+        return true;
+    }
+
+    /** Execute the first staged run the parent has promoted to ACTIVATE. */
+    bool serve_one_activation() {
+        for (size_t position = 0; position < staged.size(); ++position) {
+            const size_t entry_index = staged[position];
+            MailboxRunEntry *entry = mailbox_run_entry(mailbox.data(), entry_index);
+            if (static_cast<MailboxState>(__atomic_load_n(&entry->state, __ATOMIC_ACQUIRE)) != MailboxState::ACTIVATE) {
+                continue;
+            }
+            staged.erase(staged.begin() + static_cast<long>(position));
+            execute_entry(entry_index, entry);
+            return true;
+        }
+        return false;
+    }
+
+    bool frame_is_withheld(size_t frame_index) {
+        std::lock_guard<std::mutex> lk(hold_mu);
+        for (const HeldFrame &frame : held) {
+            if (frame.frame_index == frame_index) return true;
+        }
+        for (const HeldFrame &frame : releasing) {
+            if (frame.frame_index == frame_index) return true;
+        }
+        return false;
     }
 
     void loop() {
         while (true) {
             if (stop_flag.load(std::memory_order_acquire)) return;
+            if (resume_one_released_frame()) continue;
+            if (serve_one_activation()) continue;
             MailboxState s = read_state();
-            MailboxState task_state = read_task_state();
-            if (task_state == MailboxState::TASK_READY || s == MailboxState::TASK_READY) {
-                const bool progress_frame = task_state == MailboxState::TASK_READY;
-                char *frame = progress_frame ? task_frame() : mailbox.data();
-                uint8_t callable_hash0 = static_cast<uint8_t>(frame[MAILBOX_OFF_TASK_CALLABLE_HASH]);
-                // The frame carries the wire blob, so decode it the way a real child does.
-                TaskArgsView view = read_blob(
-                    reinterpret_cast<const uint8_t *>(frame) + MAILBOX_OFF_TASK_ARGS_BLOB, MAILBOX_ARGS_CAPACITY
-                );
-                uint64_t tensor_key = 0;
-                if (view.tensor_count > 0) {
-                    tensor_key = view.tensors(0).buffer.identity.buffer_id;
+            size_t ready_frame = MAILBOX_REQUEST_FRAMES;
+            bool ready_prepare_only = false;
+            for (size_t index = 0; index < MAILBOX_REQUEST_FRAMES; ++index) {
+                if (frame_is_withheld(index)) continue;
+                const MailboxState frame_state = read_task_state(index);
+                if (frame_state == MailboxState::TASK_READY || frame_state == MailboxState::PREPARE_READY) {
+                    ready_frame = index;
+                    ready_prepare_only = frame_state == MailboxState::PREPARE_READY;
+                    break;
                 }
-                {
-                    std::lock_guard<std::mutex> lk(dispatched_mu);
-                    dispatched.push_back({callable_hash0, tensor_key});
-                }
-                is_running.store(true, std::memory_order_release);
-
-                {
-                    std::unique_lock<std::mutex> lk(run_mu);
-                    run_cv.wait(lk, [this] {
-                        return should_complete.load(std::memory_order_acquire) ||
-                               drain_mode.load(std::memory_order_acquire);
-                    });
-                    should_complete.store(false, std::memory_order_relaxed);
-                }
-                int32_t error_code = 0;
-                std::string error_msg;
-                {
-                    std::lock_guard<std::mutex> lk(run_mu);
-                    error_code = next_error_code;
-                    error_msg = std::move(next_error_msg);
-                    next_error_code = 0;
-                    next_error_msg.clear();
-                }
-                is_running.store(false, std::memory_order_release);
-
-                std::memcpy(frame + MAILBOX_OFF_ERROR, &error_code, sizeof(int32_t));
-                std::memset(frame + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
-                if (!error_msg.empty()) {
-                    size_t n = std::min(error_msg.size(), MAILBOX_ERROR_MSG_SIZE - 1);
-                    std::memcpy(frame + MAILBOX_OFF_ERROR_MSG, error_msg.data(), n);
-                }
-                if (progress_frame) {
-                    write_task_state(MailboxState::TASK_DONE);
-                } else {
-                    write_state(MailboxState::TASK_DONE);
-                }
+            }
+            if (ready_frame < MAILBOX_REQUEST_FRAMES) {
+                (void)serve_one_request(ready_frame, ready_prepare_only);
             } else if (s == MailboxState::CONTROL_REQUEST) {
                 // Acknowledge the control request so a future test using
                 // WorkerThread::control_* doesn't hang on the spin-poll.
@@ -652,43 +914,173 @@ static char *test_task_frame(std::array<char, MAILBOX_SIZE> &mailbox, size_t ind
     return mailbox.data() + (MAILBOX_FIRST_TASK_FRAME + index) * MAILBOX_FRAME_SIZE;
 }
 
-static MailboxState test_frame_state(const char *frame) {
+static MailboxState mailbox_state_of(const char *frame) {
     const auto *state = reinterpret_cast<const int32_t *>(frame + MAILBOX_OFF_STATE);
     return static_cast<MailboxState>(__atomic_load_n(state, __ATOMIC_ACQUIRE));
 }
 
-static void set_test_frame_state(char *frame, MailboxState state) {
-    auto *wire_state = reinterpret_cast<int32_t *>(frame + MAILBOX_OFF_STATE);
-    __atomic_store_n(wire_state, static_cast<int32_t>(state), __ATOMIC_RELEASE);
+// A run's state lives in its own entry, not in the frame that delivered its
+// payload, so everything a child publishes about a run is written here. Entries
+// are allocated in submission order, which is what `index` means.
+static MailboxRunEntry *test_entry(std::array<char, MAILBOX_SIZE> &mailbox, size_t index) {
+    return mailbox_run_entry(mailbox.data(), index);
 }
 
-static void set_test_frame_accepted(char *frame) {
-    auto *accepted = reinterpret_cast<int32_t *>(frame + MAILBOX_OFF_ACCEPTED);
-    __atomic_store_n(accepted, MAILBOX_TASK_ACCEPTED, __ATOMIC_RELEASE);
+static MailboxState test_entry_state(const MailboxRunEntry *entry) {
+    return static_cast<MailboxState>(__atomic_load_n(&entry->state, __ATOMIC_ACQUIRE));
 }
 
-static uint64_t test_frame_dispatch_id(const char *frame) {
-    uint64_t dispatch_id = 0;
-    std::memcpy(&dispatch_id, frame + MAILBOX_OFF_FRAME_DISPATCH_ID, sizeof(dispatch_id));
-    return dispatch_id;
+static void set_test_entry_state(MailboxRunEntry *entry, MailboxState state) {
+    __atomic_store_n(&entry->state, static_cast<int32_t>(state), __ATOMIC_RELEASE);
 }
 
-static uint64_t test_frame_task_slot(const char *frame) {
-    uint64_t task_slot = 0;
-    std::memcpy(&task_slot, frame + MAILBOX_OFF_FRAME_TASK_SLOT, sizeof(task_slot));
-    return task_slot;
+static void set_test_entry_accepted(MailboxRunEntry *entry) {
+    __atomic_store_n(&entry->accepted, MAILBOX_TASK_ACCEPTED, __ATOMIC_RELEASE);
 }
 
-static uint64_t test_frame_group_index(const char *frame) {
-    uint64_t group_index = 0;
-    std::memcpy(&group_index, frame + MAILBOX_OFF_FRAME_GROUP_INDEX, sizeof(group_index));
-    return group_index;
+static void set_test_entry_disposition(MailboxRunEntry *entry, MailboxPreparationDisposition disposition) {
+    __atomic_store_n(&entry->preparation_disposition, static_cast<int32_t>(disposition), __ATOMIC_RELEASE);
 }
 
-static uint64_t test_frame_group_size(const char *frame) {
-    uint64_t group_size = 0;
-    std::memcpy(&group_size, frame + MAILBOX_OFF_FRAME_GROUP_SIZE, sizeof(group_size));
-    return group_size;
+static void set_test_entry_error(MailboxRunEntry *entry, int32_t code, const char *text) {
+    entry->error = code;
+    std::snprintf(entry->error_text, MAILBOX_ERROR_MSG_SIZE, "%s", text == nullptr ? "" : text);
+}
+
+/**
+ * Hand one request frame back without staging the run it carried.
+ *
+ * Where a child sits once it has copied a payload out and before it publishes anything about the
+ * run: the frame is the parent's again and the entry is still this side's. The frame's own state
+ * word goes first and the ACK last, because the parent treats that ACK alone as permission to
+ * refill the frame — an `IDLE` after it would erase whatever was published in between.
+ */
+static void test_child_return_frame(
+    std::array<char, MAILBOX_SIZE> &mailbox, size_t frame_index, MailboxRunEntry *entry, uint64_t frame_generation
+) {
+    auto *frame_state = reinterpret_cast<volatile int32_t *>(test_task_frame(mailbox, frame_index) + MAILBOX_OFF_STATE);
+    __atomic_store_n(frame_state, static_cast<int32_t>(MailboxState::IDLE), __ATOMIC_RELEASE);
+    __atomic_store_n(&entry->frame_consumed_generation, frame_generation, __ATOMIC_RELEASE);
+}
+
+/**
+ * The same hand-back for a raw mapping, which the forked-child fixtures use.
+ *
+ * Which entry this frame belongs to comes from the frame's own header, and the generation there is
+ * checked against the entry's before anything is written: that is the rule the child loop follows,
+ * and it is what makes the ACK a statement about this run rather than about whichever run holds
+ * that entry now. A header that does not match leaves the entry untouched and returns false.
+ *
+ * The payload is read before the ACK, because the hand-back is what a child does *after* copying
+ * the bytes out — acknowledging without reading is a hand-back with nothing behind it. This is a
+ * simulated consumption: it touches the digest and the blob's length prefix at the offsets the
+ * real child reads, and does not decode the args. `entry_count` bounds the table this mapping has.
+ */
+static bool test_child_consume_and_return_frame(void *mailbox, size_t frame_index, size_t entry_count) {
+    char *frame = static_cast<char *>(mailbox) + (MAILBOX_FIRST_TASK_FRAME + frame_index) * MAILBOX_FRAME_SIZE;
+    uint64_t entry_index = 0;
+    uint64_t header_generation = 0;
+    uint64_t frame_generation = 0;
+    std::memcpy(&entry_index, frame + MAILBOX_OFF_FRAME_ENTRY_INDEX, sizeof(entry_index));
+    std::memcpy(&header_generation, frame + MAILBOX_OFF_FRAME_ENTRY_GENERATION, sizeof(header_generation));
+    std::memcpy(&frame_generation, frame + MAILBOX_OFF_FRAME_GENERATION, sizeof(frame_generation));
+    if (entry_index >= entry_count) return false;
+    MailboxRunEntry *entry = mailbox_run_entry(mailbox, static_cast<size_t>(entry_index));
+    if (__atomic_load_n(&entry->entry_generation, __ATOMIC_ACQUIRE) != header_generation) return false;
+
+    // The payload, at the offsets the child reads it from. Consumed into locals and discarded:
+    // what this fixture is about is the hand-back, not the decode.
+    volatile uint8_t digest0 = static_cast<uint8_t>(frame[MAILBOX_OFF_TASK_CALLABLE_HASH]);
+    (void)digest0;
+    int32_t blob_bytes = 0;
+    std::memcpy(&blob_bytes, frame + MAILBOX_OFF_TASK_ARGS_BLOB, sizeof(blob_bytes));
+    (void)blob_bytes;
+
+    auto *frame_state = reinterpret_cast<volatile int32_t *>(frame + MAILBOX_OFF_STATE);
+    __atomic_store_n(frame_state, static_cast<int32_t>(MailboxState::IDLE), __ATOMIC_RELEASE);
+    __atomic_store_n(&entry->frame_consumed_generation, frame_generation, __ATOMIC_RELEASE);
+    return true;
+}
+
+/**
+ * The child's side of one hand-off: take the payload and say so.
+ *
+ * Echoes the frame's own generation into the entry it names, which is what lets
+ * the parent reclaim that frame while the run is still executing, and leaves the
+ * entry staged. Faithful to the real loop's order — the echo before the state —
+ * so a fixture that drives this reaches the same states a child would.
+ */
+static void test_child_consume_frame(
+    std::array<char, MAILBOX_SIZE> &mailbox, size_t frame_index, MailboxPreparationDisposition disposition
+) {
+    char *frame = test_task_frame(mailbox, frame_index);
+    uint64_t entry_index = 0;
+    uint64_t frame_generation = 0;
+    std::memcpy(&entry_index, frame + MAILBOX_OFF_FRAME_ENTRY_INDEX, sizeof(entry_index));
+    std::memcpy(&frame_generation, frame + MAILBOX_OFF_FRAME_GENERATION, sizeof(frame_generation));
+    MailboxRunEntry *entry = test_entry(mailbox, static_cast<size_t>(entry_index));
+    set_test_entry_disposition(entry, disposition);
+    test_child_return_frame(mailbox, frame_index, entry, frame_generation);
+    set_test_entry_state(entry, MailboxState::FRAME_STAGED);
+}
+
+static uint64_t test_entry_dispatch_id(const MailboxRunEntry *entry) { return entry->dispatch_id; }
+static uint64_t test_entry_task_slot(const MailboxRunEntry *entry) { return entry->task_slot; }
+static uint64_t test_entry_group_index(const MailboxRunEntry *entry) { return entry->group_index; }
+static uint64_t test_entry_group_size(const MailboxRunEntry *entry) { return entry->group_size; }
+
+/** Which entry the payload in request frame `frame_index` belongs to. */
+static size_t test_frame_entry_index(std::array<char, MAILBOX_SIZE> &mailbox, size_t frame_index) {
+    uint64_t entry_index = 0;
+    std::memcpy(
+        &entry_index, test_task_frame(mailbox, frame_index) + MAILBOX_OFF_FRAME_ENTRY_INDEX, sizeof(entry_index)
+    );
+    return static_cast<size_t>(entry_index);
+}
+
+/**
+ * Put every one of `slots` in flight at once on a granted endpoint.
+ *
+ * Transport is narrower than the grant, so this is the sequence a child and parent actually run
+ * to reach `M` live runs: each hand-off's payload is copied out and its frame acknowledged while
+ * the run it carried keeps going, which is what frees the frame for the next one. Returns the
+ * run-state entry each dispatch landed on, in submission order, or an empty vector if any
+ * hand-back was refused.
+ */
+static std::vector<size_t> test_fill_every_entry(
+    LocalMailboxEndpoint &endpoint, Ring &allocator, std::array<char, MAILBOX_SIZE> &mailbox,
+    const std::vector<TaskSlot> &slots, uint32_t granted_sets, uint64_t first_dispatch_id
+) {
+    const size_t entry_count = mailbox_run_entry_count(granted_sets);
+    std::vector<size_t> entry_of;
+    for (size_t index = 0; index < slots.size(); ++index) {
+        // A pure query that reclaims first, so this is the parent noticing the previous
+        // acknowledgement rather than a frame being handed back twice.
+        if (endpoint.available_request_transport() == 0) return {};
+        endpoint.submit_progress(
+            &allocator, WorkerDispatch{slots[index], 0, first_dispatch_id + index, /*prepare_only=*/false}
+        );
+        // Exactly one frame can be unconsumed here, because the previous one was acknowledged
+        // before this publication.
+        size_t carrier = MAILBOX_REQUEST_FRAMES;
+        for (size_t frame = 0; frame < MAILBOX_REQUEST_FRAMES; ++frame) {
+            if (mailbox_state_of(test_task_frame(mailbox, frame)) == MailboxState::TASK_READY) {
+                carrier = frame;
+                break;
+            }
+        }
+        if (carrier == MAILBOX_REQUEST_FRAMES) return {};
+        entry_of.push_back(test_frame_entry_index(mailbox, carrier));
+        if (!test_child_consume_and_return_frame(mailbox.data(), carrier, entry_count)) return {};
+    }
+    return entry_of;
+}
+
+/** A distinct message that fills the entry's inline text to its last usable byte. */
+static std::string test_saturating_error_text(char fill, const std::string &prefix) {
+    std::string text = prefix;
+    text.resize(MAILBOX_ERROR_MSG_SIZE - 1, fill);
+    return text;
 }
 
 class ScopedChildProcess {
@@ -1522,36 +1914,45 @@ TEST(WorkerManagerTest, TwoFrameLeaseSlotsDoNotDefineFifoOrAcceptance) {
     endpoint.submit_progress(&allocator, active);
     endpoint.submit_progress(&allocator, staged);
 
-    char *lower_frame = test_task_frame(mailbox, 0);
-    char *upper_frame = test_task_frame(mailbox, 1);
-    EXPECT_EQ(test_frame_state(lower_frame), MailboxState::PREPARE_READY);
-    EXPECT_EQ(test_frame_state(upper_frame), MailboxState::TASK_READY);
-    EXPECT_EQ(test_frame_dispatch_id(lower_frame), 42u);
-    EXPECT_EQ(test_frame_dispatch_id(upper_frame), 41u);
-    EXPECT_EQ(test_frame_task_slot(lower_frame), static_cast<uint64_t>(staged_slot));
-    EXPECT_EQ(test_frame_task_slot(upper_frame), static_cast<uint64_t>(active_slot));
-    EXPECT_EQ(test_frame_group_index(lower_frame), 0u);
-    EXPECT_EQ(test_frame_group_index(upper_frame), 0u);
-    EXPECT_EQ(test_frame_group_size(lower_frame), 1u);
-    EXPECT_EQ(test_frame_group_size(upper_frame), 1u);
+    // Entries are allocated in submission order and the payload frames are a
+    // separate pool, so neither index is the run's lease slot any more — which
+    // is a stronger form of what this case has always asserted.
+    MailboxRunEntry *active_entry = test_entry(mailbox, 0);
+    MailboxRunEntry *staged_entry = test_entry(mailbox, 1);
+    EXPECT_EQ(test_entry_state(active_entry), MailboxState::IDLE);
+    EXPECT_EQ(test_entry_state(staged_entry), MailboxState::IDLE);
+    EXPECT_EQ(test_frame_entry_index(mailbox, 0), 0u);
+    EXPECT_EQ(test_frame_entry_index(mailbox, 1), 1u);
+    EXPECT_EQ(mailbox_state_of(test_task_frame(mailbox, 0)), MailboxState::TASK_READY);
+    EXPECT_EQ(mailbox_state_of(test_task_frame(mailbox, 1)), MailboxState::PREPARE_READY);
+    EXPECT_EQ(test_entry_dispatch_id(active_entry), 41u);
+    EXPECT_EQ(test_entry_dispatch_id(staged_entry), 42u);
+    EXPECT_EQ(test_entry_task_slot(active_entry), static_cast<uint64_t>(active_slot));
+    EXPECT_EQ(test_entry_task_slot(staged_entry), static_cast<uint64_t>(staged_slot));
+    EXPECT_EQ(test_entry_group_index(active_entry), 0u);
+    EXPECT_EQ(test_entry_group_index(staged_entry), 0u);
+    EXPECT_EQ(test_entry_group_size(active_entry), 1u);
+    EXPECT_EQ(test_entry_group_size(staged_entry), 1u);
+    EXPECT_EQ(active_entry->slot_id, 1u);
+    EXPECT_EQ(staged_entry->slot_id, 0u);
 
     EXPECT_TRUE(endpoint.activate_progress(/*run_id=*/22));
-    EXPECT_EQ(test_frame_state(lower_frame), MailboxState::PREPARE_READY);
+    EXPECT_EQ(test_entry_state(staged_entry), MailboxState::IDLE);
     WorkerEndpointProgress progress;
     EXPECT_FALSE(endpoint.poll_progress(progress));
 
-    const int32_t native_prepared = static_cast<int32_t>(MailboxPreparationDisposition::NATIVE_PREPARED);
-    std::memcpy(lower_frame + MAILBOX_OFF_PREPARATION_DISPOSITION, &native_prepared, sizeof(native_prepared));
-    set_test_frame_state(lower_frame, MailboxState::FRAME_STAGED);
+    // The child takes the staged run's payload and says so, which both stages
+    // the entry and hands its frame back while the run is still to come.
+    test_child_consume_frame(mailbox, 1, MailboxPreparationDisposition::NATIVE_PREPARED);
     ASSERT_TRUE(endpoint.poll_progress(progress));
     EXPECT_EQ(progress.kind, WorkerProgressKind::FRAME_STAGED);
     EXPECT_EQ(progress.dispatch.dispatch_id, 42u);
     EXPECT_EQ(progress.preparation_disposition, MailboxPreparationDisposition::NATIVE_PREPARED);
-    EXPECT_EQ(test_frame_state(lower_frame), MailboxState::ACTIVATE);
+    EXPECT_EQ(test_entry_state(staged_entry), MailboxState::ACTIVATE);
 
-    set_test_frame_state(lower_frame, MailboxState::TASK_LAUNCHED);
+    set_test_entry_state(staged_entry, MailboxState::TASK_LAUNCHED);
     EXPECT_FALSE(endpoint.poll_progress(progress));
-    set_test_frame_accepted(lower_frame);
+    set_test_entry_accepted(staged_entry);
     ASSERT_TRUE(endpoint.poll_progress(progress));
     EXPECT_EQ(progress.kind, WorkerProgressKind::ACCEPTED);
     EXPECT_EQ(progress.dispatch.dispatch_id, 42u);
@@ -1577,19 +1978,19 @@ TEST(WorkerManagerTest, CapacityOneMailboxUsesTheProgressTaskFrame) {
     WorkerDispatch dispatch{task_slot, 1, /*dispatch_id=*/41, /*prepare_only=*/false};
     endpoint.submit_progress(&allocator, dispatch);
 
-    char *frame = test_task_frame(mailbox, 0);
-    EXPECT_EQ(test_frame_state(frame), MailboxState::TASK_READY);
-    EXPECT_EQ(test_frame_dispatch_id(frame), 41u);
-    EXPECT_EQ(test_frame_task_slot(frame), static_cast<uint64_t>(task_slot));
-    EXPECT_EQ(test_frame_group_index(frame), 1u);
-    EXPECT_EQ(test_frame_group_size(frame), 3u);
+    EXPECT_EQ(mailbox_state_of(test_task_frame(mailbox, 0)), MailboxState::TASK_READY);
+    MailboxRunEntry *frame = test_entry(mailbox, 0);
+    EXPECT_EQ(test_entry_dispatch_id(frame), 41u);
+    EXPECT_EQ(test_entry_task_slot(frame), static_cast<uint64_t>(task_slot));
+    EXPECT_EQ(test_entry_group_index(frame), 1u);
+    EXPECT_EQ(test_entry_group_size(frame), 3u);
 
-    set_test_frame_accepted(frame);
+    set_test_entry_accepted(frame);
     WorkerEndpointProgress progress;
     ASSERT_TRUE(endpoint.poll_progress(progress));
     EXPECT_EQ(progress.kind, WorkerProgressKind::ACCEPTED);
 
-    set_test_frame_state(frame, MailboxState::TASK_DONE);
+    set_test_entry_state(frame, MailboxState::TASK_DONE);
     ASSERT_TRUE(endpoint.poll_progress(progress));
     EXPECT_EQ(progress.kind, WorkerProgressKind::COMPLETED);
     EXPECT_EQ(progress.completion.outcome, EndpointOutcome::SUCCESS);
@@ -1597,14 +1998,18 @@ TEST(WorkerManagerTest, CapacityOneMailboxUsesTheProgressTaskFrame) {
 }
 
 TEST(WorkerManagerTest, StaleActivationObservationCannotOverwriteTerminalState) {
-    alignas(8) std::array<char, MAILBOX_FRAME_SIZE> frame{};
-    set_test_frame_state(frame.data(), MailboxState::FRAME_STAGED);
-    MailboxState stale_observation = test_frame_state(frame.data());
+    // The exchange is over the state word itself, wherever it lives; an entry's
+    // state is at the same offset as a frame's, so this drives the word
+    // directly rather than through either owner.
+    alignas(8) std::array<char, MAILBOX_RUN_ENTRY_STRIDE> word{};
+    auto *state = reinterpret_cast<int32_t *>(word.data() + MAILBOX_OFF_STATE);
+    __atomic_store_n(state, static_cast<int32_t>(MailboxState::FRAME_STAGED), __ATOMIC_RELEASE);
+    MailboxState stale_observation = static_cast<MailboxState>(__atomic_load_n(state, __ATOMIC_ACQUIRE));
     ASSERT_EQ(stale_observation, MailboxState::FRAME_STAGED);
 
-    set_test_frame_state(frame.data(), MailboxState::TASK_DONE);
-    EXPECT_FALSE(mailbox_compare_exchange_state(frame.data(), stale_observation, MailboxState::ACTIVATE));
-    EXPECT_EQ(test_frame_state(frame.data()), MailboxState::TASK_DONE);
+    __atomic_store_n(state, static_cast<int32_t>(MailboxState::TASK_DONE), __ATOMIC_RELEASE);
+    EXPECT_FALSE(mailbox_compare_exchange_state(word.data(), stale_observation, MailboxState::ACTIVATE));
+    EXPECT_EQ(static_cast<MailboxState>(__atomic_load_n(state, __ATOMIC_ACQUIRE)), MailboxState::TASK_DONE);
 }
 
 TEST(WorkerManagerTest, ThirdDispatchCannotMutateTwoOccupiedFrames) {
@@ -1639,34 +2044,43 @@ TEST(WorkerManagerTest, ThirdDispatchCannotMutateTwoOccupiedFrames) {
     worker.dispatch(WorkerDispatch{active_slot, 0});
     worker.dispatch_prepared(WorkerDispatch{staged_slot, 0});
 
-    char *frame0 = test_task_frame(mailbox, 0);
-    char *frame1 = test_task_frame(mailbox, 1);
+    // Readiness is the request frame's word and identity is the entry's: the parent writes `IDLE`
+    // to a run's entry and the ready state to the frame whose header names it, so a wait on the
+    // entry's state would never see either one.
+    char *request0 = test_task_frame(mailbox, 0);
+    char *request1 = test_task_frame(mailbox, 1);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-    while ((test_frame_state(frame0) != MailboxState::TASK_READY ||
-            test_frame_state(frame1) != MailboxState::PREPARE_READY) &&
+    while ((mailbox_state_of(request0) != MailboxState::TASK_READY ||
+            mailbox_state_of(request1) != MailboxState::PREPARE_READY) &&
            std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    EXPECT_EQ(test_frame_state(frame0), MailboxState::TASK_READY);
-    EXPECT_EQ(test_frame_state(frame1), MailboxState::PREPARE_READY);
-    const uint64_t first_dispatch_id = test_frame_dispatch_id(frame0);
-    const uint64_t second_dispatch_id = test_frame_dispatch_id(frame1);
+    EXPECT_EQ(mailbox_state_of(request0), MailboxState::TASK_READY);
+    EXPECT_EQ(mailbox_state_of(request1), MailboxState::PREPARE_READY);
+    MailboxRunEntry *frame0 = test_entry(mailbox, test_frame_entry_index(mailbox, 0));
+    MailboxRunEntry *frame1 = test_entry(mailbox, test_frame_entry_index(mailbox, 1));
+    const uint64_t first_dispatch_id = test_entry_dispatch_id(frame0);
+    const uint64_t second_dispatch_id = test_entry_dispatch_id(frame1);
 
     EXPECT_NO_THROW(worker.dispatch(WorkerDispatch{third_slot, 0}));
     EXPECT_NO_THROW(worker.dispatch_prepared(WorkerDispatch{fourth_slot, 0}));
-    EXPECT_EQ(test_frame_state(frame0), MailboxState::TASK_READY);
-    EXPECT_EQ(test_frame_state(frame1), MailboxState::PREPARE_READY);
-    EXPECT_EQ(test_frame_dispatch_id(frame0), first_dispatch_id);
-    EXPECT_EQ(test_frame_dispatch_id(frame1), second_dispatch_id);
+    // Neither frame was refilled and neither entry was re-pointed: a third dispatch that found no
+    // free transport is refused before it claims anything, so the two occupied hand-offs stand.
+    EXPECT_EQ(mailbox_state_of(request0), MailboxState::TASK_READY);
+    EXPECT_EQ(mailbox_state_of(request1), MailboxState::PREPARE_READY);
+    EXPECT_EQ(test_frame_entry_index(mailbox, 0), static_cast<size_t>(0));
+    EXPECT_EQ(test_frame_entry_index(mailbox, 1), static_cast<size_t>(1));
+    EXPECT_EQ(test_entry_dispatch_id(frame0), first_dispatch_id);
+    EXPECT_EQ(test_entry_dispatch_id(frame1), second_dispatch_id);
     {
         std::lock_guard<std::mutex> lk(completion_mu);
         EXPECT_EQ(completion_count, 2);
     }
 
-    set_test_frame_accepted(frame0);
-    set_test_frame_accepted(frame1);
-    set_test_frame_state(frame0, MailboxState::TASK_DONE);
-    set_test_frame_state(frame1, MailboxState::TASK_DONE);
+    set_test_entry_accepted(frame0);
+    set_test_entry_accepted(frame1);
+    set_test_entry_state(frame0, MailboxState::TASK_DONE);
+    set_test_entry_state(frame1, MailboxState::TASK_DONE);
     worker.progress();
     worker.progress();
     worker.progress();
@@ -1678,6 +2092,230 @@ TEST(WorkerManagerTest, ThirdDispatchCannotMutateTwoOccupiedFrames) {
         }));
     }
     worker.stop();
+    allocator.shutdown();
+}
+
+// Transport is bounded apart from the grant, so a grant wider than the frame pool
+// makes saturation an ordinary state. What it must not be is lossy: the request
+// held back by a full pool is admitted once a frame comes home, and neither the
+// payload that was in flight nor the one that follows it is overwritten.
+//
+// Driven synchronously against a real endpoint — the child side is this thread,
+// so every step is ordered by the program rather than by a device or a sleep.
+TEST(WorkerManagerTest, TransportSaturationResumesOnTheAcknowledgedFrame) {
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    std::array<TaskSlot, 3> slots{};
+    for (size_t index = 0; index < slots.size(); ++index) {
+        slots[index] = make_progress_slot(allocator, 71 + index, index, 9);
+        ASSERT_NE(slots[index], INVALID_SLOT);
+    }
+
+    // Granted three sets against two request frames: the widths differ on purpose, which is the
+    // state row 28 is about.
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*task_frame_count=*/3);
+    ASSERT_EQ(endpoint.available_request_transport(), MAILBOX_REQUEST_FRAMES);
+
+    endpoint.submit_progress(&allocator, WorkerDispatch{slots[0], 0, /*dispatch_id=*/81, /*prepare_only=*/false});
+    endpoint.submit_progress(&allocator, WorkerDispatch{slots[1], 0, /*dispatch_id=*/82, /*prepare_only=*/true});
+    // Both frames are out and the pool reports empty, so an admitter asking now is told to wait.
+    EXPECT_EQ(endpoint.available_request_transport(), 0u);
+
+    const uint64_t first_entry = test_frame_entry_index(mailbox, 0);
+    const uint64_t second_entry = test_frame_entry_index(mailbox, 1);
+    EXPECT_NE(first_entry, second_entry) << "two hand-offs landed on one entry";
+    const uint64_t first_dispatch = test_entry_dispatch_id(test_entry(mailbox, first_entry));
+    const uint64_t second_dispatch = test_entry_dispatch_id(test_entry(mailbox, second_entry));
+
+    // The child copies the first payload out and hands that frame back: IDLE, then the ACK.
+    ASSERT_TRUE(test_child_consume_and_return_frame(
+        mailbox.data(), /*frame_index=*/0, mailbox_run_entry_count(/*granted_sets=*/3)
+    ));
+    // The level the parent reads is the echo, so the frame is available again from this instant.
+    EXPECT_EQ(endpoint.available_request_transport(), 1u)
+        << "an acknowledged frame did not come back, so a saturated endpoint would never resume";
+
+    // The request that saturation held back now goes out, and lands on the reclaimed frame.
+    endpoint.submit_progress(&allocator, WorkerDispatch{slots[2], 0, /*dispatch_id=*/83, /*prepare_only=*/false});
+    EXPECT_EQ(mailbox_state_of(test_task_frame(mailbox, 0)), MailboxState::TASK_READY);
+    EXPECT_EQ(endpoint.available_request_transport(), 0u);
+
+    // Nothing was lost and nothing was overwritten. The second hand-off is untouched — its frame
+    // still carries PREPARE_READY for the same entry and dispatch — and the third has an entry of
+    // its own rather than displacing either.
+    EXPECT_EQ(mailbox_state_of(test_task_frame(mailbox, 1)), MailboxState::PREPARE_READY);
+    EXPECT_EQ(test_frame_entry_index(mailbox, 1), second_entry);
+    EXPECT_EQ(test_entry_dispatch_id(test_entry(mailbox, second_entry)), second_dispatch);
+    const uint64_t third_entry = test_frame_entry_index(mailbox, 0);
+    EXPECT_NE(third_entry, first_entry) << "the third run reused the entry the first still holds";
+    EXPECT_NE(third_entry, second_entry);
+    EXPECT_EQ(test_entry_dispatch_id(test_entry(mailbox, third_entry)), 83u);
+    // The first run's own entry still names it: its frame was reclaimed, its run was not.
+    EXPECT_EQ(test_entry_dispatch_id(test_entry(mailbox, first_entry)), first_dispatch);
+
+    // Every one of the three reaches a terminal, so none was dropped on the way.
+    for (const uint64_t entry_index : {first_entry, second_entry, third_entry}) {
+        MailboxRunEntry *entry = test_entry(mailbox, entry_index);
+        set_test_entry_accepted(entry);
+        set_test_entry_state(entry, MailboxState::TASK_DONE);
+    }
+    std::set<TaskSlot> completed;
+    for (int attempt = 0; attempt < 16 && completed.size() < slots.size(); ++attempt) {
+        WorkerEndpointProgress progress;
+        if (!endpoint.poll_progress(progress)) break;
+        if (progress.kind == WorkerProgressKind::COMPLETED) {
+            EXPECT_EQ(progress.completion.outcome, EndpointOutcome::SUCCESS);
+            completed.insert(progress.completion.task_slot);
+        }
+    }
+    EXPECT_EQ(completed, std::set<TaskSlot>(slots.begin(), slots.end()))
+        << "a run admitted across the saturation did not reach its own completion";
+    allocator.shutdown();
+}
+
+// Contract row 32: error-text pressure. Every one of the `M` runs an endpoint can hold at once
+// fails, each with its own message filled to the last byte the entry's inline text has room for,
+// and each must reach the parent whole and attributed to its own run.
+//
+// `M` is `granted + MAILBOX_REQUEST_FRAMES` and the texts are per-entry, so this is the widest
+// simultaneous text pressure the layout can produce — one text per entry, all live together,
+// none of them short enough to fit beside another.
+TEST(WorkerManagerTest, EveryConcurrentFailureKeepsItsOwnFullText) {
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    constexpr uint32_t kGrantedSets = 3;
+    const size_t entry_count = mailbox_run_entry_count(kGrantedSets);
+    std::vector<TaskSlot> slots;
+    for (size_t index = 0; index < entry_count; ++index) {
+        slots.push_back(make_progress_slot(allocator, 301 + index, index % kGrantedSets, 5));
+        ASSERT_NE(slots.back(), INVALID_SLOT);
+    }
+
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, kGrantedSets);
+    const std::vector<size_t> entry_of =
+        test_fill_every_entry(endpoint, allocator, mailbox, slots, kGrantedSets, /*first_dispatch_id=*/901);
+    ASSERT_EQ(entry_of.size(), entry_count) << "the endpoint could not hold one run per run-state entry";
+    EXPECT_EQ(std::set<size_t>(entry_of.begin(), entry_of.end()).size(), entry_count)
+        << "two runs were given the same run-state entry";
+
+    // Each run fails with a text of its own, published the way a child publishes one: rc and text
+    // before the terminal state.
+    std::map<TaskSlot, std::string> expected_text;
+    for (size_t index = 0; index < entry_of.size(); ++index) {
+        const std::string text =
+            test_saturating_error_text(static_cast<char>('a' + index), "run" + std::to_string(index) + ":");
+        expected_text[slots[index]] = text;
+        MailboxRunEntry *entry = test_entry(mailbox, entry_of[index]);
+        set_test_entry_error(entry, static_cast<int32_t>(index + 1), text.c_str());
+        set_test_entry_state(entry, MailboxState::TASK_FAILED);
+    }
+
+    std::map<TaskSlot, std::string> reported;
+    for (size_t attempt = 0; attempt < 4 * entry_count && reported.size() < entry_count; ++attempt) {
+        WorkerEndpointProgress progress;
+        if (!endpoint.poll_progress(progress)) break;
+        if (progress.kind != WorkerProgressKind::COMPLETED) continue;
+        EXPECT_EQ(progress.completion.outcome, EndpointOutcome::TASK_FAILURE);
+        EXPECT_EQ(reported.count(progress.completion.task_slot), 0u) << "one run reported twice";
+        reported[progress.completion.task_slot] = progress.completion.error_message;
+    }
+    ASSERT_EQ(reported.size(), entry_count) << "not every concurrent failure was reported";
+    for (size_t index = 0; index < slots.size(); ++index) {
+        const std::string &message = reported[slots[index]];
+        EXPECT_NE(message.find(expected_text[slots[index]]), std::string::npos)
+            << "run " << index << " did not keep its own full text; got: " << message;
+        EXPECT_NE(message.find("code=" + std::to_string(index + 1)), std::string::npos)
+            << "run " << index << " was reported under another run's code: " << message;
+    }
+
+    // Late identity: the entries are free again, so a new run takes one of them. Its completion
+    // must carry its own text rather than whatever the previous occupant left in that entry.
+    const TaskSlot reused_slot = make_progress_slot(allocator, 399, 0, 5);
+    ASSERT_NE(reused_slot, INVALID_SLOT);
+    ASSERT_GT(endpoint.available_request_transport(), 0u);
+    endpoint.submit_progress(&allocator, WorkerDispatch{reused_slot, 0, /*dispatch_id=*/999, /*prepare_only=*/false});
+    size_t carrier = MAILBOX_REQUEST_FRAMES;
+    for (size_t frame = 0; frame < MAILBOX_REQUEST_FRAMES; ++frame) {
+        if (mailbox_state_of(test_task_frame(mailbox, frame)) == MailboxState::TASK_READY) carrier = frame;
+    }
+    ASSERT_LT(carrier, MAILBOX_REQUEST_FRAMES);
+    const size_t reused_entry = test_frame_entry_index(mailbox, carrier);
+    ASSERT_TRUE(test_child_consume_and_return_frame(mailbox.data(), carrier, entry_count));
+    MailboxRunEntry *entry = test_entry(mailbox, reused_entry);
+    set_test_entry_error(entry, /*code=*/77, "the reused entry's own run");
+    set_test_entry_state(entry, MailboxState::TASK_FAILED);
+
+    WorkerEndpointProgress reused_progress;
+    ASSERT_TRUE(endpoint.poll_progress(reused_progress));
+    EXPECT_EQ(reused_progress.kind, WorkerProgressKind::COMPLETED);
+    EXPECT_EQ(reused_progress.completion.task_slot, reused_slot);
+    EXPECT_NE(reused_progress.completion.error_message.find("the reused entry's own run"), std::string::npos);
+    EXPECT_EQ(reused_progress.completion.error_message.find("run0:"), std::string::npos)
+        << "a recycled entry reported a previous occupant's text";
+    allocator.shutdown();
+}
+
+// Contract row 29, the successor half: a failure in one of `M` concurrently live runs is that
+// run's outcome and nobody else's. Every other run was published before the failure was
+// observable, so each of them is a successor that is already out at the endpoint when the
+// failure lands — the state where a shared error field, or a completion attributed by position
+// rather than identity, would collapse five outcomes into one.
+//
+// The lane-side half of this row — that the failure poisons admission while the runs already out
+// keep their own errors — is `test_chip_run_lane.cpp`'s
+// `EarlierFailedRunRetainsItsErrorAfterLaterRunPoisonsLane`; this is the endpoint's half.
+TEST(WorkerManagerTest, AFailureAmongLiveRunsIsNotItsSuccessorsOutcome) {
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    constexpr uint32_t kGrantedSets = 3;
+    const size_t entry_count = mailbox_run_entry_count(kGrantedSets);
+    std::vector<TaskSlot> slots;
+    for (size_t index = 0; index < entry_count; ++index) {
+        slots.push_back(make_progress_slot(allocator, 401 + index, index % kGrantedSets, 11));
+        ASSERT_NE(slots.back(), INVALID_SLOT);
+    }
+
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, kGrantedSets);
+    const std::vector<size_t> entry_of =
+        test_fill_every_entry(endpoint, allocator, mailbox, slots, kGrantedSets, /*first_dispatch_id=*/701);
+    ASSERT_EQ(entry_of.size(), entry_count) << "the endpoint could not hold one run per run-state entry";
+
+    // The first run fails; every run behind it was already published and succeeds.
+    constexpr size_t kFailingIndex = 0;
+    for (size_t index = 0; index < entry_of.size(); ++index) {
+        MailboxRunEntry *entry = test_entry(mailbox, entry_of[index]);
+        set_test_entry_accepted(entry);
+        if (index == kFailingIndex) {
+            set_test_entry_error(entry, /*code=*/13, "the one run that failed");
+            set_test_entry_state(entry, MailboxState::TASK_FAILED);
+        } else {
+            set_test_entry_state(entry, MailboxState::TASK_DONE);
+        }
+    }
+
+    std::map<TaskSlot, WorkerCompletion> completions;
+    for (size_t attempt = 0; attempt < 6 * entry_count && completions.size() < entry_count; ++attempt) {
+        WorkerEndpointProgress progress;
+        if (!endpoint.poll_progress(progress)) break;
+        if (progress.kind != WorkerProgressKind::COMPLETED) continue;
+        completions.emplace(progress.completion.task_slot, progress.completion);
+    }
+    ASSERT_EQ(completions.size(), entry_count) << "a live run did not reach its own completion past the failure";
+    for (size_t index = 0; index < slots.size(); ++index) {
+        const WorkerCompletion &completion = completions.at(slots[index]);
+        if (index == kFailingIndex) {
+            EXPECT_EQ(completion.outcome, EndpointOutcome::TASK_FAILURE);
+            EXPECT_NE(completion.error_message.find("the one run that failed"), std::string::npos);
+            continue;
+        }
+        EXPECT_EQ(completion.outcome, EndpointOutcome::SUCCESS)
+            << "run " << index << " took its predecessor's failure as its own outcome";
+        EXPECT_TRUE(completion.error_message.empty())
+            << "run " << index << " carried a message it never published: " << completion.error_message;
+    }
     allocator.shutdown();
 }
 
@@ -1708,20 +2346,18 @@ TEST_P(MailboxChildExitTest, PreservesOnlyMatchingTerminalResults) {
             received = read(start_pipe[0], &start, sizeof(start));
         } while (received < 0 && errno == EINTR);
         if (received != sizeof(start)) _exit(99);
-        char *success = static_cast<char *>(mailbox) + MAILBOX_FIRST_TASK_FRAME * MAILBOX_FRAME_SIZE;
-        char *failure = success + MAILBOX_FRAME_SIZE;
+        MailboxRunEntry *success = mailbox_run_entry(mailbox, 0);
+        MailboxRunEntry *failure = mailbox_run_entry(mailbox, 1);
         if (stale_identity) {
-            const uint64_t stale_generation = 99;
-            std::memcpy(success + MAILBOX_OFF_FRAME_GENERATION, &stale_generation, sizeof(stale_generation));
+            // The entry's own generation: what an identity check compares first, and what tells
+            // this run apart from any later occupant of the entry.
+            __atomic_store_n(&success->entry_generation, static_cast<uint64_t>(99), __ATOMIC_RELEASE);
         }
-        set_test_frame_accepted(success);
-        set_test_frame_state(success, MailboxState::TASK_DONE);
-        const int32_t error_code = 17;
-        std::memcpy(failure + MAILBOX_OFF_ERROR, &error_code, sizeof(error_code));
-        const char message[] = "successor's own failure";
-        std::memcpy(failure + MAILBOX_OFF_ERROR_MSG, message, sizeof(message));
-        set_test_frame_accepted(failure);
-        set_test_frame_state(failure, MailboxState::TASK_FAILED);
+        set_test_entry_accepted(success);
+        set_test_entry_state(success, MailboxState::TASK_DONE);
+        set_test_entry_error(failure, /*code=*/17, "successor's own failure");
+        set_test_entry_accepted(failure);
+        set_test_entry_state(failure, MailboxState::TASK_FAILED);
         _exit(exit_code);
     }
 
@@ -1730,6 +2366,15 @@ TEST_P(MailboxChildExitTest, PreservesOnlyMatchingTerminalResults) {
     {
         LocalMailboxEndpoint endpoint(0, mailbox, child, /*task_frame_count=*/3);
         for (size_t index = 0; index < slots.size(); ++index) {
+            // Three runs, two frames: the grant and the transport are separate widths, so a third
+            // publication needs a frame back first. This is the hand-back a child makes once it
+            // has copied the payload out — the frame returns while the run it carried stays this
+            // endpoint's, which is the whole reason the two are separate.
+            if (index == slots.size() - 1) {
+                ASSERT_TRUE(test_child_consume_and_return_frame(
+                    mailbox, /*frame_index=*/0, mailbox_run_entry_count(/*granted_sets=*/3)
+                )) << "the first hand-off's frame header did not name a live entry";
+            }
             endpoint.submit_progress(&allocator, WorkerDispatch{slots[index], 0, 51 + index, false});
         }
         const char start = 1;
@@ -1790,22 +2435,25 @@ TEST(WorkerManagerTest, StaleFrameIdentityWithholdsCompletionUntilChildQuiesces)
     endpoint.submit_progress(&allocator, WorkerDispatch{slot0, 0, /*dispatch_id=*/51, /*prepare_only=*/false});
     endpoint.submit_progress(&allocator, WorkerDispatch{slot1, 0, /*dispatch_id=*/52, /*prepare_only=*/true});
 
-    char *frame1 = test_task_frame(mailbox, 1);
-    uint64_t stale_generation = 99;
-    std::memcpy(frame1 + MAILBOX_OFF_FRAME_GENERATION, &stale_generation, sizeof(stale_generation));
-    set_test_frame_accepted(frame1);
-    set_test_frame_state(frame1, MailboxState::TASK_LAUNCHED);
+    MailboxRunEntry *frame1 = test_entry(mailbox, 1);
+    // The entry's own generation, through its member: it is the first thing an identity check
+    // compares, and it is what distinguishes this run from any later occupant of the entry.
+    // Written as a member store rather than a byte copy at a frame offset — a frame offset added
+    // to a `MailboxRunEntry *` strides whole entries, not bytes.
+    __atomic_store_n(&frame1->entry_generation, static_cast<uint64_t>(99), __ATOMIC_RELEASE);
+    set_test_entry_accepted(frame1);
+    set_test_entry_state(frame1, MailboxState::TASK_LAUNCHED);
 
     WorkerEndpointProgress first;
     WorkerEndpointProgress second;
     EXPECT_FALSE(endpoint.poll_progress(first));
-    EXPECT_EQ(test_frame_state(frame1), MailboxState::TASK_LAUNCHED);
+    EXPECT_EQ(test_entry_state(frame1), MailboxState::TASK_LAUNCHED);
 
     // Endpoint poison requests child shutdown, but parent-side completion must
     // not release the run lease until every native task has terminalized. A
     // real child publishes these states from its shutdown/finalize path.
-    set_test_frame_state(test_task_frame(mailbox, 0), MailboxState::TASK_FAILED);
-    set_test_frame_state(frame1, MailboxState::TASK_FAILED);
+    set_test_entry_state(test_entry(mailbox, 0), MailboxState::TASK_FAILED);
+    set_test_entry_state(frame1, MailboxState::TASK_FAILED);
 
     ASSERT_TRUE(endpoint.poll_progress(first));
     ASSERT_TRUE(endpoint.poll_progress(second));
@@ -1813,8 +2461,8 @@ TEST(WorkerManagerTest, StaleFrameIdentityWithholdsCompletionUntilChildQuiesces)
     EXPECT_EQ(second.kind, WorkerProgressKind::COMPLETED);
     EXPECT_EQ(first.completion.outcome, EndpointOutcome::ENDPOINT_FAILURE);
     EXPECT_EQ(second.completion.outcome, EndpointOutcome::ENDPOINT_FAILURE);
-    EXPECT_NE(first.completion.error_message.find("stale frame identity"), std::string::npos);
-    EXPECT_NE(second.completion.error_message.find("stale frame identity"), std::string::npos);
+    EXPECT_NE(first.completion.error_message.find("stale run-state entry identity"), std::string::npos);
+    EXPECT_NE(second.completion.error_message.find("stale run-state entry identity"), std::string::npos);
     EXPECT_EQ(
         std::set<TaskSlot>({first.dispatch.task_slot, second.dispatch.task_slot}), std::set<TaskSlot>({slot0, slot1})
     );
@@ -1854,10 +2502,10 @@ TEST(WorkerManagerTest, PoisonedProgressWithholdsCompletionUntilTheChildExits) {
             usleep(100);
         }
 
-        char *frame0 = static_cast<char *>(mailbox) + MAILBOX_FIRST_TASK_FRAME * MAILBOX_FRAME_SIZE;
-        char *frame1 = frame0 + MAILBOX_FRAME_SIZE;
-        set_test_frame_state(frame0, MailboxState::TASK_FAILED);
-        set_test_frame_state(frame1, MailboxState::TASK_FAILED);
+        MailboxRunEntry *frame0 = mailbox_run_entry(mailbox, 0);
+        MailboxRunEntry *frame1 = mailbox_run_entry(mailbox, 1);
+        set_test_entry_state(frame0, MailboxState::TASK_FAILED);
+        set_test_entry_state(frame1, MailboxState::TASK_FAILED);
 
         char terminal = 1;
         ssize_t written = 0;
@@ -1883,12 +2531,11 @@ TEST(WorkerManagerTest, PoisonedProgressWithholdsCompletionUntilTheChildExits) {
         endpoint.submit_progress(&allocator, WorkerDispatch{slot0, 0, /*dispatch_id=*/53, /*prepare_only=*/false});
         endpoint.submit_progress(&allocator, WorkerDispatch{slot1, 0, /*dispatch_id=*/54, /*prepare_only=*/true});
 
-        char *frame0 = static_cast<char *>(mailbox) + MAILBOX_FIRST_TASK_FRAME * MAILBOX_FRAME_SIZE;
-        char *frame1 = frame0 + MAILBOX_FRAME_SIZE;
-        uint64_t stale_generation = 100;
-        std::memcpy(frame1 + MAILBOX_OFF_FRAME_GENERATION, &stale_generation, sizeof(stale_generation));
-        set_test_frame_accepted(frame1);
-        set_test_frame_state(frame1, MailboxState::TASK_LAUNCHED);
+        MailboxRunEntry *frame0 = mailbox_run_entry(mailbox, 0);
+        MailboxRunEntry *frame1 = mailbox_run_entry(mailbox, 1);
+        __atomic_store_n(&frame1->entry_generation, static_cast<uint64_t>(100), __ATOMIC_RELEASE);
+        set_test_entry_accepted(frame1);
+        set_test_entry_state(frame1, MailboxState::TASK_LAUNCHED);
 
         WorkerEndpointProgress progress;
         EXPECT_FALSE(endpoint.poll_progress(progress));
@@ -1907,8 +2554,8 @@ TEST(WorkerManagerTest, PoisonedProgressWithholdsCompletionUntilTheChildExits) {
             } while (received < 0 && errno == EINTR);
         }
         EXPECT_EQ(received, sizeof(terminal));
-        EXPECT_EQ(test_frame_state(frame0), MailboxState::TASK_FAILED);
-        EXPECT_EQ(test_frame_state(frame1), MailboxState::TASK_FAILED);
+        EXPECT_EQ(test_entry_state(frame0), MailboxState::TASK_FAILED);
+        EXPECT_EQ(test_entry_state(frame1), MailboxState::TASK_FAILED);
         EXPECT_FALSE(endpoint.poll_progress(progress))
             << "terminal frame states are insufficient while the native child remains alive";
 
@@ -2279,6 +2926,223 @@ TEST_F(ThreeRunProgressSchedulerFixture, ColdQueuePublishesThreeRunsInFifoOrder)
         ASSERT_TRUE(orchestrator.wait_run_for(runs[index], 3.0));
         orchestrator.release_run(runs[index]);
     }
+}
+
+// The same three-run pipeline over a *real* mailbox endpoint and a real child loop, which is what
+// gives it a bounded request-frame pool to saturate. `DeterministicProgressEndpoint` has no
+// transport at all, so no fixture built on it can reach the state below.
+struct MailboxPipelineSchedulerFixture : public ::testing::Test {
+    TensorMap tensor_map;
+    Ring allocator;
+    Scope scope;
+    ReadyQueue ready_sub;
+    NextLevelReadyQueues ready_next;
+    Orchestrator orchestrator;
+    MockMailboxWorker child;
+    WorkerManager manager;
+    Scheduler scheduler;
+    CallConfig config;
+
+    static constexpr uint32_t kGrantedSets = 3;
+
+    void SetUp() override {
+        allocator.init(/*heap_bytes=*/1ULL << 20);
+        // The child publishes its own terminal states here, including the acceptance word a
+        // staged run reaches only after the parent activates it.
+        child.auto_accept.store(true, std::memory_order_release);
+        child.granted_sets = kGrantedSets;
+        child.start();
+        manager.add_next_level(child.mailbox_ptr(), /*child_pid=*/-1, kGrantedSets);
+        manager.start(
+            &allocator,
+            [this](WorkerCompletion completion) {
+                scheduler.worker_done(std::move(completion));
+            },
+            [this](WorkerDispatch dispatch) {
+                orchestrator.mark_task_accepted(dispatch.task_slot);
+            }
+        );
+        ready_next.reset(manager.next_level_worker_ids());
+        orchestrator.init(&tensor_map, &allocator, &scope, &ready_sub, &ready_next, &manager, [this] {
+            scheduler.notify_ready();
+        });
+        orchestrator.configure_pipeline_depth(kGrantedSets);
+
+        Scheduler::Config scheduler_config;
+        scheduler_config.ring = &allocator;
+        scheduler_config.ready_sub_queue = &ready_sub;
+        scheduler_config.ready_next_level_queues = &ready_next;
+        scheduler_config.manager = &manager;
+        scheduler_config.enqueue_ready_cb = [this](TaskSlot task_slot) {
+            orchestrator.enqueue_ready(task_slot);
+        };
+        scheduler_config.active_run_cb = [this] {
+            return orchestrator.dispatchable_run_id();
+        };
+        scheduler_config.preparable_run_cb = [this] {
+            return orchestrator.preparable_run_id();
+        };
+        scheduler_config.preparable_runs_cb = [this] {
+            return orchestrator.preparable_run_ids();
+        };
+        scheduler_config.can_stage_run_on_worker_cb = [this](RunId run_id, int32_t worker_id) {
+            return orchestrator.can_stage_run_on_worker(run_id, worker_id);
+        };
+        scheduler_config.on_consumed_cb = [this](TaskSlot task_slot) {
+            orchestrator.on_consumed(task_slot);
+        };
+        scheduler_config.on_task_failed_cb = [this](TaskSlot task_slot, const std::string &message) {
+            std::lock_guard<std::mutex> lk(failure_mu);
+            failures.emplace_back(task_slot, message);
+            orchestrator.report_task_error(task_slot, message);
+        };
+        scheduler.start(scheduler_config);
+    }
+
+    void TearDown() override {
+        child.drain();
+        scheduler.request_stop();
+        manager.stop_workers();
+        scheduler.stop();
+        manager.stop();
+        allocator.shutdown();
+    }
+
+    std::vector<std::pair<TaskSlot, std::string>> reported_failures() {
+        std::lock_guard<std::mutex> lk(failure_mu);
+        return failures;
+    }
+
+    WorkerThread *worker() { return manager.get_worker_by_id(WorkerType::NEXT_LEVEL, 0); }
+
+    std::mutex failure_mu;
+    std::vector<std::pair<TaskSlot, std::string>> failures;
+};
+
+// Contract row 28 / finding F6, at the layer that admits: a request the scheduler has already
+// made ready must *wait* for a frame rather than being published into a full pool or dropped.
+//
+// Transport is `MAILBOX_REQUEST_FRAMES` frames and the grant here is three sets, so the two
+// widths differ on purpose — saturation is an ordinary state rather than a fault. The child
+// withholds both hand-backs, which is a thing the protocol lets a child do at any time: the
+// acknowledgement is its last store to a frame, and nothing bounds when it makes it.
+//
+// What separates this from the endpoint-level regression below it: nothing here publishes
+// anything by hand. The scheduler owns every admission decision, and the third run is admitted
+// only because its own gate was asked again after a frame came home.
+TEST_F(MailboxPipelineSchedulerFixture, AStagedRequestParkedByFullTransportResumesOnTheAcknowledgedFrame) {
+    child.hold_next_request_frames(MAILBOX_REQUEST_FRAMES);
+
+    std::vector<RunId> runs;
+    std::vector<SubmitResult> tasks;
+    {
+        std::scoped_lock lock(scheduler.loop_mutex());
+        for (int index = 0; index < 3; ++index) {
+            runs.push_back(orchestrator.begin_run());
+            tasks.push_back(orchestrator.submit_next_level(
+                C(91 + index), single_tensor_args(0x9100 + index * 0x100, TensorArgType::OUTPUT), config, 0
+            ));
+            orchestrator.close_run_submission(runs.back());
+        }
+    }
+
+    // Both frames are out and the child is sitting on them, so the pool is empty.
+    ASSERT_TRUE(child.wait_held_frames(MAILBOX_REQUEST_FRAMES))
+        << "the child never took both request frames, so transport was never full";
+
+    // The parked state, read while the loop is still running: two payloads reached the child and
+    // the third did not, and its task is still queued rather than claimed or failed. `loop_mutex`
+    // is held so this is one instant of the scheduler's own state, not a walk across several of
+    // its iterations.
+    //
+    // The third run is a staged successor, so `can_stage` is the gate that refused it — and with
+    // `M = granted + MAILBOX_REQUEST_FRAMES` entries against two dispatches out, its inflight and
+    // staged-lane terms both have headroom, leaving transport as the term that can be false.
+    // `can_dispatch` is false too, but for the ordinary lane's own reason as well, so it is not
+    // the isolating reading; what isolates transport is that the release below changes nothing
+    // except the frame.
+    std::vector<MockMailboxWorker::Record> parked;
+    {
+        std::scoped_lock lock(scheduler.loop_mutex());
+        parked = child.dispatched_records();
+        EXPECT_EQ(parked.size(), static_cast<size_t>(MAILBOX_REQUEST_FRAMES))
+            << "more payloads reached the child than there are request frames to carry them";
+        EXPECT_EQ(allocator.slot_state(tasks[2].task_slot)->state.load(std::memory_order_acquire), TaskState::READY)
+            << "the third run's task left the ready queue while no frame could carry it";
+        EXPECT_FALSE(worker()->can_stage()) << "the endpoint offered to stage a run while the child held both frames";
+        EXPECT_FALSE(worker()->can_dispatch());
+    }
+    ASSERT_EQ(parked.size(), static_cast<size_t>(MAILBOX_REQUEST_FRAMES));
+    EXPECT_EQ(parked[0].tensor_key, 0x9100u);
+    EXPECT_FALSE(parked[0].prepare_only) << "the first run of the pipeline was staged rather than made active";
+    EXPECT_EQ(parked[1].tensor_key, 0x9200u);
+    EXPECT_TRUE(parked[1].prepare_only) << "the second run was not a staged successor";
+    EXPECT_TRUE(reported_failures().empty()) << "a full request pool was reported as a task failure";
+
+    // One frame is released. The release only queues the hand-back: the child's own loop performs
+    // it, and then carries straight on into the run that frame carried — so from here until this
+    // test says otherwise, that run is still executing and cannot be the reason anything else is
+    // admitted.
+    const size_t reclaimed_frame = parked[0].frame_index;
+    const size_t executing_entry = parked[0].entry_index;
+    child.release_one_held_frame();
+
+    // The acknowledgement itself, observed where it is made. This matters for what follows: the
+    // child's hand-back writes `IDLE` *before* the acknowledgement it counts here, so once this
+    // returns the frame reads `IDLE` unless the parent has already published something new onto
+    // it. Without this step the frame still carries the previous publication's `TASK_READY`, and
+    // a poll for "the frame is ready" would accept the payload that was already there.
+    ASSERT_TRUE(child.wait_acknowledged(1)) << "the released frame was never handed back";
+
+    // So from here, any state other than `IDLE` is a *new* publication. The load is an acquire,
+    // and the parent writes the entry and the frame's header before the state word it releases
+    // them with, so everything read below belongs to the publication this observed.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool republished = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (mailbox_state_of(test_task_frame(child.mailbox, reclaimed_frame)) != MailboxState::IDLE) {
+            republished = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(republished) << "the request a full pool held back was never published after the acknowledgement "
+                                "that freed a frame";
+    EXPECT_NE(test_entry_state(test_entry(child.mailbox, executing_entry)), MailboxState::TASK_DONE)
+        << "the run that acknowledged the frame had already finished, so its completion could be what admitted "
+           "the third rather than the acknowledgement";
+
+    // And it is the third run: the entry the republished frame names carries that task's own
+    // slot, not a reused header from either run still in flight.
+    const size_t resumed_entry = test_frame_entry_index(child.mailbox, reclaimed_frame);
+    EXPECT_NE(resumed_entry, executing_entry) << "the admitted request took the entry a live run still holds";
+    EXPECT_NE(resumed_entry, parked[1].entry_index) << "the admitted request took the entry of the withheld frame";
+    EXPECT_EQ(test_entry_task_slot(test_entry(child.mailbox, resumed_entry)), static_cast<uint64_t>(tasks[2].task_slot))
+        << "the entry the reclaimed frame names is not the task that was held back";
+    EXPECT_EQ(mailbox_state_of(test_task_frame(child.mailbox, reclaimed_frame)), MailboxState::PREPARE_READY)
+        << "the third run of the pipeline was published as an active dispatch rather than a staged successor";
+    EXPECT_TRUE(reported_failures().empty()) << "resuming a parked request reported a failure";
+    // The frame the child is still withholding is untouched: nothing was republished over it.
+    EXPECT_EQ(test_frame_entry_index(child.mailbox, parked[1].frame_index), parked[1].entry_index);
+
+    // Now the child is let go. It copies the resumed payload out, and every run reaches its own
+    // completion — which is what makes the park a delay rather than a loss.
+    child.drain();
+    ASSERT_TRUE(child.wait_dispatched(3)) << "the resumed request was published but never consumed";
+    const std::vector<MockMailboxWorker::Record> resumed = child.dispatched_records();
+    ASSERT_EQ(resumed.size(), 3u) << "a payload was delivered more than once across the saturation";
+    EXPECT_EQ(resumed[2].tensor_key, 0x9300u) << "the admitted request was not the one that had been held back";
+    EXPECT_EQ(resumed[2].callable_hash0, 93u);
+    EXPECT_EQ(resumed[2].frame_index, reclaimed_frame) << "the resumed request did not land on the acknowledged frame";
+    // Neither earlier payload was re-delivered or altered by the admission behind it.
+    EXPECT_EQ(resumed[0].tensor_key, parked[0].tensor_key);
+    EXPECT_EQ(resumed[1].tensor_key, parked[1].tensor_key);
+
+    for (size_t index = 0; index < runs.size(); ++index) {
+        ASSERT_TRUE(orchestrator.wait_run_for(runs[index], 10.0)) << "run " << index << " never retired";
+        orchestrator.release_run(runs[index]);
+    }
+    EXPECT_TRUE(reported_failures().empty()) << "a run of this pipeline failed: " << reported_failures().size();
 }
 
 TEST_F(ProgressSchedulerFixture, StagedSuccessorCannotOvertakePendingPredecessorOnSameEndpoint) {

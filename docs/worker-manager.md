@@ -16,7 +16,7 @@ SUB) in its own address space.
 The remote L3 design keeps this local fork/shm path behind
 `LocalMailboxEndpoint` and reserves the same `WorkerEndpoint` boundary for a
 framed `RemoteL3Endpoint` for cross-host NEXT_LEVEL children. A remote endpoint
-is not another child loop that polls the `MAILBOX_SIZE`-byte mailbox; it uses the
+is not another child loop that polls a shared-memory mailbox; it uses the
 contracts in
 [remote-l3-worker-design.md](remote-l3-worker-design.md).
 The current code includes that `RemoteL3Endpoint` boundary, a socket-backed
@@ -180,19 +180,57 @@ SUB workers. `group_index` selects `task_args_list[i]`. There is no
 
 ## 3. Dispatch via shm mailbox
 
-Each `LocalMailboxEndpoint` drives a `MAILBOX_SIZE`-byte `MAP_SHARED` region.
-The Python facade forks one child per mailbox **before**
-`WorkerManager::start()` (so the parent has only the Python main thread when
-fork runs, avoiding the classical "fork in a multi-threaded process" hazard)
-and the child polls the mailbox for the lifetime of the worker.
+Each `LocalMailboxEndpoint` drives a `MAP_SHARED` region of
+`mailbox_size(granted_sets)` bytes. The Python facade forks one child per mailbox
+**before** `WorkerManager::start()` (so the parent has only the Python main
+thread when fork runs, avoiding the classical "fork in a multi-threaded process"
+hazard) and the child polls the mailbox for the lifetime of the worker.
 
-The region currently consists of three equal `MAILBOX_FRAME_SIZE` frames:
+**Payload transport and execution lifetime are separate.** The region holds a
+control frame, a small fixed pool of 64 KiB *request frames*, and a table of
+small *run-state entries*:
 
-| Frame | Two-frame chip endpoint | Single-frame endpoint |
-| ----- | ----------------------- | --------------------- |
-| Base (0) | Startup and control state | Startup and control state |
-| Task 0 (1) | Pipeline lease slot 0 | The active task |
-| Task 1 (2) | Pipeline lease slot 1 | Unused |
+| Region | Count | Per item | What it bounds |
+| ------ | ----: | -------: | -------------- |
+| control frame | 1 | 64 KiB | startup and control commands |
+| request frames `F` | `MAILBOX_REQUEST_FRAMES` (2) | 64 KiB | concurrent **hand-off** |
+| run-state entries `E` | `M = granted + K` | ~360 B | concurrent **in-flight runs** |
+
+A request frame carries one submission's bytes — callable digest, config, lease,
+args blob — and nothing about the run's life. The child copies the blob out,
+echoes that frame's generation into the entry its header names, and the parent
+takes the frame back while the run it carried is still executing. A run-state
+entry carries the run itself: identity, state, run epoch, rc, inline error text,
+preparation disposition, and the acceptance word the *device* writes — which is
+why that word cannot live on the frame, since the frame is gone by then.
+
+Only the entry table grows with the grant, so a context granted 1024 sets costs
+~590 KB rather than 64 MB. The facade sizes the region from this Worker's
+`pipeline_depth` request before the fork, which is an upper bound on any grant a
+child can then publish, and the endpoint is constructed with the count that child
+negotiated. **No launch is accepted without both an entry and a granted set.**
+
+### Who writes what
+
+| Field | Sole writer | Reader |
+| ----- | ----------- | ------ |
+| `E.identity{…}`, `E.entry_generation` | parent, on allocate and free | child, identity check |
+| `F.state` (`TASK_READY`) | parent | child, acquire |
+| `E.frame_consumed_generation` | **child**, once | parent — a **level** |
+| `E.state` `FRAME_STAGED → ACTIVATE` | **parent**, identity-checked CAS | child, acquire |
+| `E.state` later, `E.run_epoch`, `E.error`, `E.error_text` | **child**; rc and text, then the state — its **final** access | parent, acquire |
+| `E.accepted` | **device**, at the kernel-launch marker | parent and child |
+
+Both reclaim decisions are levels rather than pulses, so an observation a poll
+misses the next one sees. Every cross-side reference carries
+`E.entry_generation` — odd while occupied, bumped even at release — so a frame
+left over from a previous occupant of an entry is refused rather than acted on
+under the new identity.
+
+The Python child derives every entry field offset from the binding and checks
+each one against `offsetof` on the C++ struct at import: the child writes these
+words in the parent's address space, so a field it places differently is a store
+landing on another field in a live process, which no compiler can catch.
 
 `task_frame_count` is an endpoint contract, not a count inferred from the
 allocation size. Each direct chip child decides its own count after `init` and
@@ -344,9 +382,15 @@ MAILBOX_OFF_ACCEPTED:             int32 sticky native-launch marker
 frame tail:                       fixed-size NUL-terminated error message
 ```
 
-The C++ `MAILBOX_FRAME_SIZE` and `MAILBOX_SIZE` constants are exported through
-the nanobind module. Python derives frame slicing and offsets from those
-bindings where possible. `MAILBOX_ARGS_CAPACITY` ends before the teardown
+The C++ `MAILBOX_FRAME_SIZE`, `MAILBOX_RUN_ENTRY_STRIDE` and
+`MAILBOX_RUN_ENTRY_TABLE_OFFSET` constants and the `mailbox_size(granted_sets)`
+and `mailbox_run_entry_count(granted_sets)` functions are exported through the
+nanobind module, so both ends derive the region's shape from one place.
+`mailbox_size` takes and returns `size_t` and refuses a grant with no
+representable size, rather than handing back a truncated one to allocate from.
+(`MAILBOX_SIZE` is still exported as the size a caller gets when it does not size
+the region itself, which in practice is a fixture standing in for the facade.)
+Python derives frame slicing and offsets from those bindings where possible. `MAILBOX_ARGS_CAPACITY` ends before the teardown
 record, shutdown word, protocol trailer, acceptance word, and error-message
 tail.
 

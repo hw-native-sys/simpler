@@ -253,10 +253,12 @@ consumes the resulting POD and invokes the runtime's execution lifecycle.
 
 #### Pipeline resource leases
 
-A2/A3 host runtimes and the A5 tensor-map-and-ring-buffer runtime declare
-`pipeline_depth = 2` as resource capacity. The contract determines the
-concrete copy count rather than permitting concurrent device execution by
-itself:
+Every runtime declares no `pipeline_depth` limit of its own: the declaration
+says what the runtime can support, and how much of it a context uses is the
+grant that context was given — `Worker(pipeline_depth=N)`, defaulting to two.
+Each owner of a per-run resource is built to the grant, so a declaration costs
+nothing until a run holds a set. The contract determines the concrete copy count
+rather than permitting concurrent device execution by itself:
 
 | Resource class | Copies | Selection |
 | -------------- | -----: | --------- |
@@ -264,9 +266,13 @@ itself:
 | `DEVICE_SCRATCH` | 1 | slot 0 |
 | `EXEC_HANDLE` | `pipeline_depth` | lease `slot_id`, plus any hardware-generation key |
 
-A run-owned lease is `{slot_id, generation}`. `PipelineSlotPool` mints it and
+A run-owned lease is `{slot_id, generation}`. `RunResourceArena` mints it and
 is the authority on ownership: releasing the current lease is idempotent, while
-releasing it after the slot has been re-leased is rejected.
+releasing it after the set has been re-leased is rejected. The arena holds
+exactly the granted count and reports the three counts that always partition it
+— free, live, and quarantined. A set whose run could not prove what it left
+behind is quarantined: never reused, and still counted against the grant, so a
+context cannot acquire more concurrency by failing.
 
 `ChipWorker` is downstream of that pool and cannot re-derive ownership — it
 never sees an acquire or a release. It keeps a per-slot high-water mark and
@@ -344,11 +350,12 @@ ready-queue partition is erased, and any lease the run held is returned without
 dispatching device work — a run that never reached an active or preparable role
 holds none and returns none.
 
-Each direct chip child publishes its runtime contract's `pipeline_depth` in
-the startup mailbox before `INIT_READY`. The parent configures the native
-pipeline-slot lease pool to the minimum published depth. Backends without a
-depth-two contract therefore keep depth-one serial behavior instead of
-receiving an invalid slot-1 lease.
+Each direct chip child publishes the depth it granted in the startup mailbox
+before `INIT_READY`, having already sized its own per-run resources to it. The
+parent configures the arena to the minimum published grant, and an explicit
+request the children could not meet fails startup rather than being quietly
+reduced. A backend that granted one therefore keeps depth-one serial behavior
+instead of receiving an invalid slot-1 lease.
 
 Logical admission and that lease pool are separate budgets. `begin_run` admits
 a run against the admission FIFO's own capacity and gives it no lease; the

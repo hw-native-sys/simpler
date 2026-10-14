@@ -130,7 +130,7 @@ RunId Orchestrator::begin_run() {
 }
 
 void Orchestrator::configure_pipeline_depth(uint32_t depth, uint32_t pending_depth, uint32_t launch_depth) {
-    if (depth == 0 || depth > PTO_PIPELINE_MAX_DEPTH) {
+    if (depth == 0) {
         throw std::invalid_argument("Orchestrator: pipeline depth is outside the supported range");
     }
     if (launch_depth == 0 || launch_depth > depth) {
@@ -140,6 +140,9 @@ void Orchestrator::configure_pipeline_depth(uint32_t depth, uint32_t pending_dep
     if (!runs_.empty() || building_run_id_ != INVALID_RUN_ID || active_run_id_ != INVALID_RUN_ID) {
         throw std::logic_error("Orchestrator: pipeline depth cannot change after admission starts");
     }
+    // The arena holds exactly the granted count: a set exists because a run can
+    // hold it, not because a layout reserved room for it.
+    run_resources_.regrant(depth);
     admission_depth_ = depth;
     // Below `depth` is legal: it leaves the successor role unfillable, because
     // that role needs a second FIFO entry to exist, and admission serializes.
@@ -150,8 +153,8 @@ void Orchestrator::configure_pipeline_depth(uint32_t depth, uint32_t pending_dep
 
 bool Orchestrator::acquire_lease_locked(const std::shared_ptr<RunState> &run, bool *assigned) {
     if (run->lease_released) return false;
-    if (pipeline_slots_.owns(run->lease)) return true;
-    std::optional<PipelineSlotLease> lease = pipeline_slots_.try_acquire(admission_depth_);
+    if (run_resources_.owns(run->lease)) return true;
+    std::optional<PipelineSlotLease> lease = run_resources_.try_acquire(admission_depth_);
     if (!lease.has_value()) return false;
 
     // Publishing the lease and restamping the slots already registered under it
@@ -237,7 +240,7 @@ void Orchestrator::retire_terminal_run(const std::shared_ptr<RunState> &run) {
         // active or preparable role has the invalid encoding.
         if (!run->lease_released) {
             run->lease_released = true;
-            if (run->lease.generation != 0) pipeline_slots_.release(run->lease);
+            if (run->lease.generation != 0) run_resources_.release(run->lease);
         }
         // `activate_fifo_head` below returns early while a run is active, which
         // is exactly the case where a successor handed its lease back.
@@ -407,7 +410,7 @@ bool Orchestrator::dispatchable_locked(RunId run_id) const {
     if (active_run_id_ != run_id) return false;
     auto it = runs_.find(run_id);
     return it != runs_.end() && it->second->phase.load(std::memory_order_acquire) == RunPhase::EXECUTING &&
-           pipeline_slots_.owns(it->second->lease);
+           run_resources_.owns(it->second->lease);
 }
 
 bool Orchestrator::can_dispatch_run(RunId run_id) const {
@@ -441,7 +444,7 @@ std::vector<RunId> Orchestrator::preparable_run_ids() const {
         auto it = runs_.find(run_fifo_[index]);
         if (it == runs_.end()) break;
         if (it->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) break;
-        if (!pipeline_slots_.owns(it->second->lease)) break;
+        if (!run_resources_.owns(it->second->lease)) break;
         ids.push_back(it->first);
     }
     return ids;
@@ -451,7 +454,7 @@ bool Orchestrator::can_stage_run_on_worker(RunId run_id, int32_t worker_id) cons
     std::lock_guard<std::mutex> lk(runs_mu_);
     auto candidate = runs_.find(run_id);
     if (candidate == runs_.end() || candidate->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED ||
-        !pipeline_slots_.owns(candidate->second->lease)) {
+        !run_resources_.owns(candidate->second->lease)) {
         return false;
     }
     for (RunId predecessor_id : run_fifo_) {
@@ -476,6 +479,10 @@ bool Orchestrator::can_stage_run_on_worker(RunId run_id, int32_t worker_id) cons
 
 std::vector<RunId> Orchestrator::early_launch_run_ids() const {
     std::lock_guard<std::mutex> lk(runs_mu_);
+    return early_launch_prefix_locked();
+}
+
+std::vector<RunId> Orchestrator::early_launch_prefix_locked() const {
     std::vector<RunId> ids;
     if (launch_depth_ < 2) return ids;
     if (!dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 || run_fifo_.front() != active_run_id_) {
@@ -492,7 +499,7 @@ std::vector<RunId> Orchestrator::early_launch_run_ids() const {
         if (candidate == runs_.end()) break;
         const std::shared_ptr<RunState> &successor = candidate->second;
         if (successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) break;
-        if (!pipeline_slots_.owns(successor->lease)) break;
+        if (!run_resources_.owns(successor->lease)) break;
         ids.push_back(successor->id);
     }
     return ids;
@@ -505,7 +512,7 @@ RunId Orchestrator::preparable_run_id() const {
     }
     auto it = runs_.find(run_fifo_[1]);
     if (it == runs_.end() || it->second->phase.load(std::memory_order_acquire) != RunPhase::PREPARED ||
-        !pipeline_slots_.owns(it->second->lease)) {
+        !run_resources_.owns(it->second->lease)) {
         return INVALID_RUN_ID;
     }
     return it->first;
@@ -525,31 +532,31 @@ bool Orchestrator::all_dispatches_accepted(const std::shared_ptr<RunState> &run)
 }
 
 bool Orchestrator::refresh_early_launch_locked() {
-    if (launch_depth_ < 2) {
-        early_launch_run_id_ = INVALID_RUN_ID;
-        return false;
+    // The whole authorized prefix, not one latched successor: at a launch depth
+    // above two several runs are authorized at once, and a single id could name
+    // only the first of them. The prefix is recomputed rather than remembered,
+    // so every reader gets the current answer; what is kept here is only what
+    // was already authorized, to decide which transitions owe a wake.
+    std::vector<RunId> authorized = early_launch_prefix_locked();
+    bool newly_authorized = false;
+    for (RunId run_id : authorized) {
+        if (std::find(early_launch_authorized_.begin(), early_launch_authorized_.end(), run_id) ==
+            early_launch_authorized_.end()) {
+            newly_authorized = true;
+            break;
+        }
     }
-    const RunId held = early_launch_run_id_;
-    early_launch_run_id_ = INVALID_RUN_ID;
-    if (!dispatchable_locked(active_run_id_) || run_fifo_.size() < 2 || run_fifo_.front() != active_run_id_) {
-        return false;
-    }
-    auto active = runs_.find(active_run_id_);
-    if (active == runs_.end() || !all_dispatches_accepted(active->second)) return false;
-    auto candidate = runs_.find(run_fifo_[1]);
-    if (candidate == runs_.end()) return false;
-    const std::shared_ptr<RunState> &successor = candidate->second;
-    if (successor->phase.load(std::memory_order_acquire) != RunPhase::PREPARED) return false;
-    if (!pipeline_slots_.owns(successor->lease)) return false;
-    early_launch_run_id_ = successor->id;
+    early_launch_authorized_ = std::move(authorized);
     // Only a *new* authorization owes a wake. Re-deriving the same answer on
-    // every transition would otherwise wake the scheduler for nothing.
-    return held != early_launch_run_id_;
+    // every transition would otherwise wake the scheduler for nothing, and a
+    // prefix that only shrank as its head retired authorizes nobody new.
+    return newly_authorized;
 }
 
 RunId Orchestrator::early_launch_run_id() const {
     std::lock_guard<std::mutex> lk(runs_mu_);
-    return early_launch_run_id_;
+    const std::vector<RunId> authorized = early_launch_prefix_locked();
+    return authorized.empty() ? INVALID_RUN_ID : authorized.front();
 }
 
 void Orchestrator::compact_if_quiescent() {

@@ -96,6 +96,72 @@ def test_simulator_reports_device_memory_info_as_unsupported(platform, runtime, 
         worker.close()
 
 
+def test_device_memory_info_forwards_exact_bytes(monkeypatch):
+    """Both byte counts survive the Worker path exactly, including past 2^32.
+
+    Scope, precisely: this replaces ``ChipWorker.device_memory_info`` with a structural stand-in,
+    so it covers the Worker surface, its lease and its routing, and that whatever the chip worker
+    returns reaches the caller unaltered. It does **not** reach ``aclrtGetMemInfo``, the C boundary
+    that fills the struct from it, or nanobind's conversion of that struct — the production
+    ``DeviceMemoryInfo`` is a result-only type with no constructor, so no test can mint one, and
+    nothing here would catch a defect on the native side of the call.
+
+    What it does catch is what the hardware case cannot ask for: a live card reports whatever it
+    reports, so truncation past 2^32 and a swapped field pair can only be pinned against chosen
+    values. Both edges are included because a fully free and a fully consumed device are the values
+    most likely to be special-cased, and ``free == total`` is the one case in which a swapped pair
+    would otherwise still read as correct.
+    """
+
+    class _MemoryInfoDouble:
+        """The surface `DeviceMemoryInfo` offers a caller: two counts and iteration.
+
+        A stand-in rather than the real type, which nanobind exposes with read-only fields and no
+        constructor — a production constructor added only so a test could build one would be a
+        change to the product's surface for the test's convenience.
+        """
+
+        def __init__(self, free_bytes: int, total_bytes: int) -> None:
+            self.free_bytes = free_bytes
+            self.total_bytes = total_bytes
+
+        def __iter__(self):
+            yield self.free_bytes
+            yield self.total_bytes
+
+    worker = _make_worker(level=2, platform="a2a3sim", runtime="host_build_graph", device_id=0)
+    worker.init()
+    try:
+        assert worker._chip_worker is not None  # noqa: SLF001 -- the native query is the seam
+        original_platform = worker._config["platform"]  # noqa: SLF001
+        try:
+            # Above 2^32 so a 32-bit truncation anywhere on the path shows up, plus both edges.
+            cases = [
+                (64_989_700_096, 65_452_113_920),
+                (0, 65_452_113_920),
+                (65_452_113_920, 65_452_113_920),
+            ]
+            for free_bytes, total_bytes in cases:
+                info = _MemoryInfoDouble(free_bytes, total_bytes)
+                monkeypatch.setattr(
+                    type(worker._chip_worker),  # noqa: SLF001
+                    "device_memory_info",
+                    lambda _self, _i=info: _i,
+                )
+                # The simulator refusal is decided from the platform string, so it is lifted for
+                # the call the stub answers and nothing else.
+                worker._config["platform"] = "a2a3"  # noqa: SLF001
+                reported = worker.device_memory_info()
+                assert (int(reported.free_bytes), int(reported.total_bytes)) == (free_bytes, total_bytes)
+                assert tuple(reported) == (free_bytes, total_bytes)
+        finally:
+            # Restored before the close, so teardown runs against the platform this Worker was
+            # actually built for rather than the one borrowed for the call above.
+            worker._config["platform"] = original_platform  # noqa: SLF001
+    finally:
+        worker.close()
+
+
 @pytest.mark.requires_hardware
 @pytest.mark.platforms(["a2a3", "a5"])
 @pytest.mark.device_count(1)
@@ -124,4 +190,19 @@ def test_onboard_device_memory_info_matches_acl(st_platform, st_device_ids, runt
     assert total_bytes > 0
     assert result["unpacked"] == result["info"]
     if level == 2:
-        assert result["info"] == result["acl"]
+        acl_free, acl_total = result["acl"]
+        # The capacity, exactly. This does not prove the two calls reached the same physical device
+        # or the same memory pool — two identical cards report the same total, so a wrong device of
+        # the same model would pass. What it does establish is that both readings describe a device
+        # of one size and that the pair is not swapped: a handle naming a differently sized pool, or
+        # free and total exchanged, fails here.
+        assert total_bytes == acl_total, (
+            f"the worker reports a {total_bytes} B device and ACL reports {acl_total} B, so at least one of "
+            f"them is not reporting the HBM capacity of the device under test"
+        )
+        # The free byte is a live snapshot — device-wide, shared with every other process on the
+        # card — so these are two instants and the contract offers no equality between them. Each is
+        # required to be well formed against that capacity instead. Exact forwarding of this field
+        # is pinned by `test_device_memory_info_forwards_exact_bytes`, which covers the Worker path
+        # rather than the native call.
+        assert 0 <= acl_free <= acl_total

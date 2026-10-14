@@ -11,13 +11,14 @@
 
 #pragma once
 
-#include <array>
 #include <cstddef>
 #include <mutex>
 #include <utility>
+#include <vector>
 
 #include "native_run_execution.h"
 #include "run_completion_fence.h"
+#include "run_resource_arena.h"
 #include "runtime_c_api.h"
 
 /**
@@ -354,8 +355,40 @@ private:
     }
 
     mutable std::mutex mutex_;
-    // One own wait and one cross-run wait per pipeline slot is the most the
-    // launch path can queue, and the slot count is the runner's admission bound.
-    std::array<Entry, PTO_PIPELINE_MAX_DEPTH * 2> entries_{};
+    // One own wait and one cross-run wait per run-resource set is the most the
+    // launch path can queue, and the grant is the runner's admission bound.
+    std::vector<Entry> entries_ = std::vector<Entry>(kDefaultRunResourceSets * 2);
     RunCompletionFence::DeviceEventOps ops_;
+
+public:
+    using Storage = std::vector<Entry>;
+
+    /**
+     * Build a wait table for the grant, detached.
+     *
+     * May throw; mutates nothing. Constructed in place rather than assigned: an
+     * entry carries a move-only wait reference, so it is built, never copied.
+     */
+    static Storage build(size_t granted) { return Storage(granted * 2); }
+
+    /**
+     * Whether the table may be replaced at all.
+     *
+     * Refused while any entry is live: an entry is reachable from the
+     * predecessor's drain, which is the side that must not release anything
+     * while the wait it names is still queued.
+     */
+    bool grant_is_replaceable() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const Entry &entry : entries_) {
+            if (entry.occupied || entry.reference.valid()) return false;
+        }
+        return true;
+    }
+
+    /** Adopt a built table. Never throws, so a multi-owner grant cannot half-apply. */
+    void commit(Storage &&built) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        entries_.swap(built);
+    }
 };

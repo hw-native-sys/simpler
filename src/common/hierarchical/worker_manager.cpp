@@ -218,6 +218,7 @@ void WorkerEndpoint::submit_progress(Ring *, const WorkerDispatch &) {
     throw std::runtime_error("progress submission is not supported by this WorkerEndpoint");
 }
 bool WorkerEndpoint::poll_progress(WorkerEndpointProgress &) { return false; }
+size_t WorkerEndpoint::available_request_transport() { return std::numeric_limits<size_t>::max(); }
 bool WorkerEndpoint::activate_progress(RunId) { return false; }
 void WorkerEndpoint::request_progress_stop() noexcept {}
 void WorkerEndpoint::report_progress_error(const std::string &) { request_progress_stop(); }
@@ -230,17 +231,30 @@ bool WorkerEndpoint::report_submission_error(const WorkerDispatch &, const std::
 // LocalMailboxEndpoint — mailbox helpers
 // =============================================================================
 
-LocalMailboxEndpoint::LocalMailboxEndpoint(int32_t worker_id, void *mailbox, int child_pid, uint32_t task_frame_count) :
+LocalMailboxEndpoint::LocalMailboxEndpoint(int32_t worker_id, void *mailbox, int child_pid, uint32_t granted_sets) :
     mailbox_(mailbox),
-    task_frame_count_(task_frame_count),
+    granted_sets_(granted_sets),
     child_pid_(child_pid) {
     if (mailbox == nullptr) throw std::invalid_argument("LocalMailboxEndpoint: null mailbox");
-    if (task_frame_count == 0 || task_frame_count > MAILBOX_TASK_FRAME_COUNT) {
-        throw std::invalid_argument("LocalMailboxEndpoint: invalid task frame count");
+    if (granted_sets == 0) {
+        throw std::invalid_argument("LocalMailboxEndpoint: invalid run-resource grant");
+    }
+    // `M = granted + K`. The extra entries are what let a request be handed over
+    // before a set is free: the entry exists from the moment the parent
+    // publishes, and the run it names waits for a set without holding a frame.
+    entries_.resize(mailbox_run_entry_count(granted_sets));
+    request_frames_.resize(MAILBOX_REQUEST_FRAMES);
+    // Every entry starts free and at an even generation, so a reference from a
+    // previous mapping of this region is refused rather than matched.
+    for (size_t index = 0; index < entries_.size(); ++index) {
+        MailboxRunEntry *entry = run_entry(index);
+        std::memset(entry, 0, sizeof(*entry));
     }
     caps_.worker_id = worker_id;
-    caps_.max_inflight_tasks = task_frame_count;
-    caps_.supports_frame_staging = task_frame_count > 1;
+    // What the scheduler may have in flight is the entry count, and staging
+    // needs somewhere for a successor to go while a predecessor runs.
+    caps_.max_inflight_tasks = static_cast<uint32_t>(entries_.size());
+    caps_.supports_frame_staging = granted_sets > 1;
     next_liveness_check_ = std::chrono::steady_clock::now() + kChildLivenessPollPeriod;
 }
 
@@ -310,20 +324,25 @@ bool mailbox_compare_exchange_state(char *frame, MailboxState expected, MailboxS
     );
 }
 
-bool LocalMailboxEndpoint::read_task_accepted(const char *frame) const {
-    const char *base = frame == nullptr ? mbox() : frame;
-    const int32_t *ptr = reinterpret_cast<const int32_t *>(base + MAILBOX_OFF_ACCEPTED);
+namespace {
+
+int32_t load_entry_i32(const int32_t *ptr) {
     int32_t v = 0;
     __atomic_load(ptr, &v, __ATOMIC_ACQUIRE);
-    return v == MAILBOX_TASK_ACCEPTED;
+    return v;
 }
 
-void LocalMailboxEndpoint::clear_task_accepted(char *frame) {
-    char *base = frame == nullptr ? mbox() : frame;
-    int32_t *ptr = reinterpret_cast<int32_t *>(base + MAILBOX_OFF_ACCEPTED);
-    int32_t v = 0;
-    __atomic_store(ptr, &v, __ATOMIC_RELEASE);
+uint64_t load_entry_u64(const uint64_t *ptr) {
+    uint64_t v = 0;
+    __atomic_load(ptr, &v, __ATOMIC_ACQUIRE);
+    return v;
 }
+
+void store_entry_i32(int32_t *ptr, int32_t v) { __atomic_store(ptr, &v, __ATOMIC_RELEASE); }
+
+void store_entry_u64(uint64_t *ptr, uint64_t v) { __atomic_store(ptr, &v, __ATOMIC_RELEASE); }
+
+}  // namespace
 
 void LocalMailboxEndpoint::shutdown_child() {
     // Sticky word first: a child that samples it between the two stores leaves
@@ -337,6 +356,56 @@ void LocalMailboxEndpoint::shutdown_child() {
 char *LocalMailboxEndpoint::task_frame(size_t index) const {
     return mbox() +
            static_cast<ptrdiff_t>(MAILBOX_FIRST_TASK_FRAME + index) * static_cast<ptrdiff_t>(MAILBOX_FRAME_SIZE);
+}
+
+MailboxRunEntry *LocalMailboxEndpoint::run_entry(size_t index) const {
+    return reinterpret_cast<MailboxRunEntry *>(
+        mbox() + MAILBOX_RUN_ENTRY_TABLE_OFFSET + MAILBOX_RUN_ENTRY_STRIDE * index
+    );
+}
+
+size_t LocalMailboxEndpoint::free_entry_locked() const {
+    for (size_t index = 0; index < entries_.size(); ++index) {
+        if (!entries_[index].occupied) return index;
+    }
+    return entries_.size();
+}
+
+size_t LocalMailboxEndpoint::free_request_frame_locked() const {
+    for (size_t index = 0; index < request_frames_.size(); ++index) {
+        if (!request_frames_[index].published) return index;
+    }
+    return request_frames_.size();
+}
+
+void LocalMailboxEndpoint::reclaim_consumed_request_frames_locked() {
+    for (size_t index = 0; index < request_frames_.size(); ++index) {
+        RequestFrameRecord &frame = request_frames_[index];
+        if (!frame.published) continue;
+        if (frame.entry >= entries_.size()) {
+            // The entry this frame was published for is gone, so nothing will
+            // ever echo its generation; the frame is this side's again.
+            frame.published = false;
+            continue;
+        }
+        const EntryRecord &record = entries_[frame.entry];
+        if (!record.occupied || record.request_frame != index || record.request_frame_generation != frame.generation) {
+            // Same conclusion from the record rather than the index: the
+            // occupant this frame was published for has been released, so the
+            // child refuses the frame on identity and acknowledges nothing. The
+            // frame comes back on this side's own evidence instead of waiting
+            // for a level that cannot arrive.
+            frame.published = false;
+            frame.entry = kNoRequestFrame;
+            continue;
+        }
+        const MailboxRunEntry *entry = run_entry(frame.entry);
+        // A level, not a pulse: the child stores the frame's own generation, so
+        // an echo this poll did not see is seen by the next one.
+        if (load_entry_u64(&entry->frame_consumed_generation) != frame.generation) continue;
+        frame.published = false;
+        frame.entry = kNoRequestFrame;
+    }
 }
 
 // =============================================================================
@@ -361,7 +430,10 @@ void WorkerThread::start(
     inflight_.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lane_lk(lane_mu_);
-        lanes_ = {};
+        // One active lane plus one staged lane per further run the endpoint may
+        // hold, which is exactly the capacity it just published.
+        lanes_.assign(endpoint_->caps().max_inflight_tasks, LaneState{});
+        activation_scratch_.assign(endpoint_->caps().max_inflight_tasks, INVALID_RUN_ID);
     }
 }
 
@@ -393,7 +465,10 @@ void WorkerThread::dispatch(WorkerDispatch d) {
         complete_unpublished(d, "WorkerThread::dispatch: submit failed");
         return;
     }
-    if (result == SubmitDispatchResult::SUBMITTED) return;
+    // PUBLICATION_REPORTED included: this dispatch's terminal has already been
+    // delivered, by the endpoint or by fail_submission, so reporting again here
+    // would be a second completion for one task.
+    if (result == SubmitDispatchResult::SUBMITTED || result == SubmitDispatchResult::PUBLICATION_REPORTED) return;
     release_lane_unconditional(kActiveLane);
     if (result == SubmitDispatchResult::STOPPING) {
         complete_unpublished(d, "WorkerThread::dispatch: worker is stopping");
@@ -443,7 +518,8 @@ void WorkerThread::dispatch_prepared(WorkerDispatch d) {
         complete_unpublished(d, "WorkerThread::dispatch_prepared: submit failed");
         return;
     }
-    if (result == SubmitDispatchResult::SUBMITTED) return;
+    // See the ordinary lane on PUBLICATION_REPORTED.
+    if (result == SubmitDispatchResult::SUBMITTED || result == SubmitDispatchResult::PUBLICATION_REPORTED) return;
     release_lane_unconditional(staged_index);
     if (result == SubmitDispatchResult::STOPPING) {
         complete_unpublished(d, "WorkerThread::dispatch_prepared: worker is stopping");
@@ -489,11 +565,14 @@ WorkerThread::submit_dispatch(WorkerDispatch d, size_t lane_index, RunId expecte
         trace_lease = trace_lease_attrs(ring_, d.task_slot);
     }
 #endif
+    bool published = true;
     try {
         endpoint_->submit_progress(ring_, d);
     } catch (const std::exception &e) {
+        published = false;
         fail_submission(d, std::string("submit_progress failed: ") + e.what());
     } catch (...) {
+        published = false;
         fail_submission(d, "submit_progress failed with unknown exception");
     }
     admission_lk.unlock();
@@ -508,7 +587,11 @@ WorkerThread::submit_dispatch(WorkerDispatch d, size_t lane_index, RunId expecte
         );
     }
 #endif
-    return SubmitDispatchResult::SUBMITTED;
+    // fail_submission has already delivered this dispatch's terminal and stopped
+    // the worker, so the caller must not report it again — but it is not a
+    // submission either, and saying so is what lets the caller distinguish a run
+    // that is live from one that is already failed.
+    return published ? SubmitDispatchResult::SUBMITTED : SubmitDispatchResult::PUBLICATION_REPORTED;
 }
 
 bool WorkerThread::activate_prepared(RunId run_id) {
@@ -552,10 +635,44 @@ bool WorkerThread::has_staged_run(RunId run_id) const {
 }
 
 bool WorkerThread::can_stage() const {
-    std::lock_guard<std::mutex> lane_lk(lane_mu_);
     const WorkerEndpointCaps &endpoint_caps = caps();
-    return endpoint_caps.supports_frame_staging && free_staged_lane_locked() < lanes_.size() &&
-           inflight_.load(std::memory_order_acquire) < endpoint_caps.max_inflight_tasks;
+    if (!endpoint_caps.supports_frame_staging) return false;
+    if (inflight_.load(std::memory_order_acquire) >= endpoint_caps.max_inflight_tasks) return false;
+    {
+        std::lock_guard<std::mutex> lane_lk(lane_mu_);
+        if (free_staged_lane_locked() >= lanes_.size()) return false;
+    }
+    // Transport is bounded independently of the grant, so a staging that found
+    // no frame is ordinary saturation rather than a fault, and this is where it
+    // is answered: before a task is claimed, by the admitter, which then simply
+    // asks again next round.
+    //
+    // What makes this answer still true at the publication it gates — see
+    // `can_dispatch` for the same argument — is that `Scheduler::dispatch_claimed`
+    // is the only caller of `dispatch` and `dispatch_prepared`, so every
+    // publication into every endpoint happens on the scheduler's own thread. The
+    // only other party that touches frame ownership is the child, whose
+    // acknowledgement can only free a frame. Availability therefore cannot fall
+    // between this gate and its own publication, and a second publication in the
+    // same round re-reads it after the first has marked its frame published.
+    //
+    // Queried outside lane_mu_: progress() takes the endpoint's locks and then
+    // the lane's, so holding the lane lock across this call would invert that.
+    return endpoint_->available_request_transport() > 0;
+}
+
+bool WorkerThread::can_dispatch() const {
+    // The ordinary lane's own gate, and the reason it exists: `idle()` answers
+    // only for the lane, so the publication caller that does not consult
+    // `can_stage` had no transport term at all and was the one that could reach
+    // `submit_progress` with nowhere to write. Both gates now ask the same
+    // question before anything is claimed; see `can_stage` for why the answer
+    // survives to the publication.
+    {
+        std::lock_guard<std::mutex> lane_lk(lane_mu_);
+        if (lane(LaneKind::ACTIVE).occupied) return false;
+    }
+    return endpoint_->available_request_transport() > 0;
 }
 
 bool WorkerThread::idle() const {
@@ -617,8 +734,15 @@ void WorkerThread::progress() {
     // launch early keeps its own lane — the predecessor still owns the active
     // one — so its activation has to be published from there, and so does the
     // one behind it when the depth allows a third.
-    std::array<RunId, PTO_PIPELINE_MAX_DEPTH> activate{};
-    activate.fill(INVALID_RUN_ID);
+    // Reused rather than allocated: this runs on every scheduler progress tick,
+    // once per worker, and the fixed array it replaced allocated nothing. Owned
+    // by the progress thread alone — `WorkerManager::progress` is reached only
+    // from the scheduler loop, under its loop mutex — and its last use here
+    // precedes every callout that could re-enter, so nothing observes it
+    // half-written. Sized in `start` alongside `lanes_`, whose count is fixed
+    // from then on.
+    std::vector<RunId> &activate = activation_scratch_;
+    std::fill(activate.begin(), activate.end(), INVALID_RUN_ID);
     {
         std::lock_guard<std::mutex> admission_lk(admission_mu_);
         if (!shutdown_.load(std::memory_order_acquire)) {
@@ -789,6 +913,26 @@ void WorkerThread::fail_progress_driver(const std::string &reason) noexcept {
     }
 }
 
+size_t LocalMailboxEndpoint::available_request_transport() {
+    std::lock_guard<std::mutex> mailbox_lk(mailbox_mu_);
+    std::lock_guard<std::mutex> lk(progress_mu_);
+    // A poisoned endpoint publishes nothing more, and reporting transport it
+    // will refuse would make the caller claim a task to fail it.
+    if (endpoint_poisoned_) return 0;
+    reclaim_consumed_request_frames_locked();
+    size_t free_frames = 0;
+    for (const RequestFrameRecord &frame : request_frames_) {
+        if (!frame.published) ++free_frames;
+    }
+    // An entry is as necessary as a frame: a hand-off needs both, and the entry
+    // outlives the frame, so the narrower of the two is what can be admitted.
+    size_t free_entries = 0;
+    for (const EntryRecord &record : entries_) {
+        if (!record.occupied) ++free_entries;
+    }
+    return std::min(free_frames, free_entries);
+}
+
 void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dispatch) {
     if (ring == nullptr) throw std::invalid_argument("LocalMailboxEndpoint::submit_progress: null ring");
     TaskSlotState *slot_state = ring->slot_state(dispatch.task_slot);
@@ -799,7 +943,7 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
         throw std::runtime_error("remote task sidecar is not supported by local mailbox");
     }
     if (state.run_id == INVALID_RUN_ID || state.pipeline_lease.reserved != 0 || state.pipeline_lease.generation == 0 ||
-        (task_frame_count_ > 1 && state.pipeline_lease.slot_id >= task_frame_count_)) {
+        (granted_sets_ > 1 && state.pipeline_lease.slot_id >= granted_sets_)) {
         throw std::runtime_error("task frame has an invalid pipeline lease identity");
     }
     const size_t blob_bytes = task_args_blob_size(a);
@@ -821,10 +965,6 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     }
 #endif
 
-    // The lease slot id is a native pipeline slot bounded by the runtime's
-    // PipelineContract, not a mailbox frame number. A two-frame endpoint maps
-    // the two 1:1; a single-frame endpoint always publishes to frame 0.
-    const size_t frame_index = task_frame_count_ == 1 ? 0 : state.pipeline_lease.slot_id;
     // Linearize task-frame publication against base-frame controls. The
     // control mutex is released immediately after the task state release-store;
     // controls may still execute while the native run is active, subject to
@@ -843,19 +983,67 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     if (endpoint_poisoned_) {
         throw std::runtime_error("endpoint is poisoned: " + endpoint_poison_reason_);
     }
-    FrameRecord &record = frames_[frame_index];
-    char *frame = task_frame(frame_index);
-    if (record.occupied || read_mailbox_state(frame) != MailboxState::IDLE) {
-        poison_progress("pipeline-slot task frame is not reusable");
-        throw std::runtime_error("pipeline-slot task frame is not reusable");
+    // Anything the child has finished copying out comes back first, so a
+    // submission that arrives right behind a hand-off finds a frame rather than
+    // waiting for the next poll to notice the echo.
+    reclaim_consumed_request_frames_locked();
+
+    const size_t entry_index = free_entry_locked();
+    if (entry_index >= entries_.size()) {
+        // Admission is the caller's gate and it holds no run beyond the entry
+        // count, so reaching here means the two disagree.
+        poison_progress("no run-state entry is free for an admitted run");
+        throw std::runtime_error("no run-state entry is free for an admitted run");
+    }
+    const size_t frame_index = free_request_frame_locked();
+    if (frame_index >= request_frames_.size()) {
+        // Unreachable while admission and this side agree, and that is the whole
+        // reason it is left as a throw: reaching it means a publication caller
+        // claimed work without consulting available_request_transport(), which
+        // is a defect in the admitter and not backpressure. Saturation itself —
+        // ordinary once the grant exceeds the frame count — is answered at the
+        // gate, before anything is claimed, and never arrives here.
+        //
+        // The throw is handled by fail_submission, which does poison this
+        // endpoint. That is correct for an admitter/endpoint disagreement and is
+        // exactly why ordinary saturation must not take this path: a busy poll
+        // would otherwise retire a healthy endpoint.
+        throw std::runtime_error("no request frame is free for an admitted run");
     }
 
-    int32_t zero_err = 0;
-    std::memcpy(frame + MAILBOX_OFF_ERROR, &zero_err, sizeof(zero_err));
-    std::memset(frame + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
-    clear_task_accepted(frame);
-    const int32_t no_disposition = static_cast<int32_t>(MailboxPreparationDisposition::NONE);
-    std::memcpy(frame + MAILBOX_OFF_PREPARATION_DISPOSITION, &no_disposition, sizeof(no_disposition));
+    EntryRecord &record = entries_[entry_index];
+    MailboxRunEntry *entry = run_entry(entry_index);
+    char *frame = task_frame(frame_index);
+
+    // The entry, before the frame that names it. Its generation goes odd here
+    // and even at release, so every cross-side reference to this run carries a
+    // value no reuse of the entry repeats — which is what makes a stale
+    // reference refusable instead of indistinguishable from a fresh one.
+    const uint64_t entry_generation = next_entry_generation_++ * 2 + 1;
+    const uint64_t slot_id = state.pipeline_lease.slot_id;
+    const uint64_t task_slot = static_cast<uint64_t>(dispatch.task_slot);
+    const uint64_t group_index = static_cast<uint64_t>(dispatch.group_index);
+    const uint64_t group_size = static_cast<uint64_t>(state.group_size());
+    entry->error = 0;
+    entry->preparation_disposition = static_cast<int32_t>(MailboxPreparationDisposition::NONE);
+    std::memset(entry->error_text, 0, MAILBOX_ERROR_MSG_SIZE);
+    entry->run_epoch = 0;
+    entry->protocol = MAILBOX_TASK_PROTOCOL_VERSION;
+    entry->run_id = state.run_id;
+    entry->slot_id = slot_id;
+    entry->generation = state.pipeline_lease.generation;
+    entry->dispatch_id = dispatch.dispatch_id;
+    entry->task_slot = task_slot;
+    entry->group_index = group_index;
+    entry->group_size = group_size;
+    // Both of these are read by the child to decide whether a frame is for this
+    // entry at all, so they are released before the frame's own state word.
+    store_entry_i32(&entry->accepted, 0);
+    store_entry_u64(&entry->frame_consumed_generation, 0);
+    store_entry_u64(&entry->entry_generation, entry_generation);
+    store_entry_i32(&entry->state, static_cast<int32_t>(MailboxState::IDLE));
+
+    // The frame carries the payload and the header that binds it to the entry.
     uint64_t reserved_callable = 0;
     std::memcpy(frame + MAILBOX_OFF_CALLABLE, &reserved_callable, sizeof(reserved_callable));
     std::memcpy(frame + MAILBOX_OFF_CONFIG, &state.config, sizeof(CallConfig));
@@ -870,62 +1058,58 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     uint8_t *blob = reinterpret_cast<uint8_t *>(frame + MAILBOX_OFF_TASK_ARGS_BLOB);
     write_blob(blob, a);
 
-    const uint64_t protocol = MAILBOX_TASK_PROTOCOL_VERSION;
-    const uint64_t slot_id = state.pipeline_lease.slot_id;
-    const uint64_t task_slot = static_cast<uint64_t>(dispatch.task_slot);
-    const uint64_t group_index = static_cast<uint64_t>(dispatch.group_index);
-    const uint64_t group_size = static_cast<uint64_t>(state.group_size());
-    std::memcpy(frame + MAILBOX_OFF_FRAME_PROTOCOL, &protocol, sizeof(protocol));
-    std::memcpy(frame + MAILBOX_OFF_FRAME_RUN_ID, &state.run_id, sizeof(state.run_id));
-    std::memcpy(frame + MAILBOX_OFF_FRAME_SLOT_ID, &slot_id, sizeof(slot_id));
-    std::memcpy(frame + MAILBOX_OFF_FRAME_GENERATION, &state.pipeline_lease.generation, sizeof(uint64_t));
-    std::memcpy(frame + MAILBOX_OFF_FRAME_DISPATCH_ID, &dispatch.dispatch_id, sizeof(dispatch.dispatch_id));
-    std::memcpy(frame + MAILBOX_OFF_FRAME_TASK_SLOT, &task_slot, sizeof(task_slot));
-    std::memcpy(frame + MAILBOX_OFF_FRAME_GROUP_INDEX, &group_index, sizeof(group_index));
-    std::memcpy(frame + MAILBOX_OFF_FRAME_GROUP_SIZE, &group_size, sizeof(group_size));
+    const uint64_t frame_generation = next_frame_generation_++;
+    const uint64_t entry_index_wire = static_cast<uint64_t>(entry_index);
+    std::memcpy(frame + MAILBOX_OFF_FRAME_ENTRY_INDEX, &entry_index_wire, sizeof(entry_index_wire));
+    std::memcpy(frame + MAILBOX_OFF_FRAME_ENTRY_GENERATION, &entry_generation, sizeof(entry_generation));
+    std::memcpy(frame + MAILBOX_OFF_FRAME_GENERATION, &frame_generation, sizeof(frame_generation));
 
+    record = EntryRecord{};
     record.occupied = true;
     record.dispatch = dispatch;
     record.run_id = state.run_id;
     record.slot_id = slot_id;
     record.generation = state.pipeline_lease.generation;
     record.group_size = group_size;
+    record.request_frame = frame_index;
+    record.request_frame_generation = frame_generation;
+    record.entry_generation = entry_generation;
+    request_frames_[frame_index].published = true;
+    request_frames_[frame_index].generation = frame_generation;
+    request_frames_[frame_index].entry = entry_index;
+
+    // Last: the frame's state word releases every byte written above it, on both
+    // the frame and the entry it names.
     write_mailbox_state(dispatch.prepare_only ? MailboxState::PREPARE_READY : MailboxState::TASK_READY, frame);
 }
 
-bool LocalMailboxEndpoint::frame_identity_matches(const FrameRecord &record, const char *frame) const {
-    uint64_t protocol = 0;
-    RunId run_id = INVALID_RUN_ID;
-    uint64_t slot_id = 0;
-    uint64_t generation = 0;
-    uint64_t dispatch_id = 0;
-    uint64_t task_slot = 0;
-    uint64_t group_index = 0;
-    uint64_t group_size = 0;
-    PipelineSlotLease lease{};
-    std::memcpy(&protocol, frame + MAILBOX_OFF_FRAME_PROTOCOL, sizeof(protocol));
-    std::memcpy(&run_id, frame + MAILBOX_OFF_FRAME_RUN_ID, sizeof(run_id));
-    std::memcpy(&slot_id, frame + MAILBOX_OFF_FRAME_SLOT_ID, sizeof(slot_id));
-    std::memcpy(&generation, frame + MAILBOX_OFF_FRAME_GENERATION, sizeof(generation));
-    std::memcpy(&dispatch_id, frame + MAILBOX_OFF_FRAME_DISPATCH_ID, sizeof(dispatch_id));
-    std::memcpy(&task_slot, frame + MAILBOX_OFF_FRAME_TASK_SLOT, sizeof(task_slot));
-    std::memcpy(&group_index, frame + MAILBOX_OFF_FRAME_GROUP_INDEX, sizeof(group_index));
-    std::memcpy(&group_size, frame + MAILBOX_OFF_FRAME_GROUP_SIZE, sizeof(group_size));
-    std::memcpy(&lease, frame + MAILBOX_OFF_PIPELINE_LEASE, sizeof(lease));
-    return protocol == MAILBOX_TASK_PROTOCOL_VERSION && run_id == record.run_id && slot_id == record.slot_id &&
-           generation == record.generation && dispatch_id == record.dispatch.dispatch_id &&
-           task_slot == static_cast<uint64_t>(record.dispatch.task_slot) &&
-           group_index == static_cast<uint64_t>(record.dispatch.group_index) && group_size == record.group_size &&
-           lease.slot_id == record.slot_id && lease.reserved == 0 && lease.generation == record.generation;
+bool LocalMailboxEndpoint::entry_identity_matches(const EntryRecord &record, const MailboxRunEntry *entry) const {
+    // The generation first: it is what distinguishes this run from any later
+    // occupant of the same entry, so a mismatch there makes every other field
+    // irrelevant rather than merely inconsistent.
+    if (load_entry_u64(&entry->entry_generation) != record.entry_generation) return false;
+    return entry->protocol == MAILBOX_TASK_PROTOCOL_VERSION && entry->run_id == record.run_id &&
+           entry->slot_id == record.slot_id && entry->generation == record.generation &&
+           entry->dispatch_id == record.dispatch.dispatch_id &&
+           entry->task_slot == static_cast<uint64_t>(record.dispatch.task_slot) &&
+           entry->group_index == static_cast<uint64_t>(record.dispatch.group_index) &&
+           entry->group_size == record.group_size;
 }
 
-bool LocalMailboxEndpoint::try_publish_activation(FrameRecord &record, char *frame) {
+bool LocalMailboxEndpoint::try_publish_activation(EntryRecord &record, MailboxRunEntry *entry) {
     if (!record.activation_requested || record.activation_published) return record.activation_published;
-    if (!frame_identity_matches(record, frame)) {
-        poison_progress("stale staged frame identity before activation");
+    if (!entry_identity_matches(record, entry)) {
+        poison_progress("stale staged run-state entry identity before activation");
         return false;
     }
-    if (mailbox_compare_exchange_state(frame, MailboxState::FRAME_STAGED, MailboxState::ACTIVATE)) {
+    // Parent-owned, identity-checked, and the only transition this side writes:
+    // the child owns every other one, so an exchange that fails means the child
+    // has already moved past FRAME_STAGED rather than that two writers raced.
+    int32_t expected = static_cast<int32_t>(MailboxState::FRAME_STAGED);
+    if (__atomic_compare_exchange_n(
+            &entry->state, &expected, static_cast<int32_t>(MailboxState::ACTIVATE), false, __ATOMIC_ACQ_REL,
+            __ATOMIC_ACQUIRE
+        )) {
         record.activation_published = true;
     }
     return record.activation_published;
@@ -944,30 +1128,35 @@ bool LocalMailboxEndpoint::poisoned_progress_quiesced() {
     // mistaken for a terminal parent completion.
     shutdown_child();
     if (child_pid_ > 0) return !check_child_death().empty();
-    for (size_t index = 0; index < task_frame_count_; ++index) {
-        if (!frames_[index].occupied) continue;
-        MailboxState state = read_mailbox_state(task_frame(index));
+    for (size_t index = 0; index < entries_.size(); ++index) {
+        if (!entries_[index].occupied) continue;
+        const auto state = static_cast<MailboxState>(load_entry_i32(&run_entry(index)->state));
         if (state != MailboxState::TASK_DONE && state != MailboxState::TASK_FAILED) return false;
     }
     return true;
 }
 
-WorkerCompletion LocalMailboxEndpoint::poisoned_completion(const FrameRecord &record) const {
+WorkerCompletion LocalMailboxEndpoint::poisoned_completion(const EntryRecord &record) const {
     return WorkerCompletion{
         record.dispatch.task_slot, record.dispatch.group_index, EndpointOutcome::ENDPOINT_FAILURE,
         "LocalMailboxEndpoint progress failed: " + endpoint_poison_reason_
     };
 }
 
-WorkerCompletion
-LocalMailboxEndpoint::terminal_completion(const FrameRecord &record, const char *frame, MailboxState state) const {
-    int32_t error_code = 0;
-    std::memcpy(&error_code, frame + MAILBOX_OFF_ERROR, sizeof(error_code));
+WorkerCompletion LocalMailboxEndpoint::terminal_completion(
+    const EntryRecord &record, const MailboxRunEntry *entry, MailboxState state
+) const {
+    // Both read after the acquire load of the terminal state that brought us
+    // here, which is the child's final access to this entry — so from that
+    // instant the rc and the text are this side's alone.
+    const int32_t error_code = entry->error;
     WorkerCompletion completion{record.dispatch.task_slot, record.dispatch.group_index, EndpointOutcome::SUCCESS, {}};
     if (state == MailboxState::TASK_FAILED || error_code != 0) {
+        const size_t text_len = ::strnlen(entry->error_text, MAILBOX_ERROR_MSG_SIZE);
         completion.outcome = EndpointOutcome::TASK_FAILURE;
         completion.error_message = "LocalMailboxEndpoint child failed (worker_id=" + std::to_string(caps_.worker_id) +
-                                   ", code=" + std::to_string(error_code) + "): " + read_error_msg(frame);
+                                   ", code=" + std::to_string(error_code) +
+                                   "): " + std::string(entry->error_text, text_len);
     }
     return completion;
 }
@@ -976,8 +1165,13 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
     std::lock_guard<std::mutex> lk(progress_mu_);
     progress.preparation_disposition = MailboxPreparationDisposition::NONE;
     bool any_occupied = false;
-    for (const FrameRecord &record : frames_)
+    for (const EntryRecord &record : entries_)
         any_occupied = any_occupied || record.occupied;
+    // Frames come back whether or not anything else is reportable: a hand-off
+    // whose payload the child has copied out is finished with its frame even
+    // while the run it carried is still executing, and that is the whole point
+    // of the split.
+    reclaim_consumed_request_frames_locked();
     if (!any_occupied) return false;
 
     if (!endpoint_poisoned_ && mailbox_control_timed_out_.load(std::memory_order_acquire)) {
@@ -993,73 +1187,69 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
         }
     }
 
+    const size_t entry_count = entries_.size();
     if (endpoint_poisoned_) {
         if (!poisoned_progress_quiesced()) return false;
-        for (size_t offset = 0; offset < task_frame_count_; ++offset) {
-            size_t index = (poll_cursor_ + offset) % task_frame_count_;
-            FrameRecord &record = frames_[index];
+        for (size_t offset = 0; offset < entry_count; ++offset) {
+            size_t index = (poll_cursor_ + offset) % entry_count;
+            EntryRecord &record = entries_[index];
             if (!record.occupied) continue;
             progress.kind = WorkerProgressKind::COMPLETED;
             progress.dispatch = record.dispatch;
             progress.completion = poisoned_completion(record);
             if (preserve_terminal_results_on_exit_) {
-                // The child can publish between an earlier frame read and waitpid observing exit.
+                // The child can publish between an earlier entry read and waitpid observing exit.
                 // This acquire read follows confirmed exit; identity still belongs to this dispatch.
-                char *frame = task_frame(index);
-                const MailboxState state = read_mailbox_state(frame);
+                MailboxRunEntry *entry = run_entry(index);
+                const auto state = static_cast<MailboxState>(load_entry_i32(&entry->state));
                 if ((state == MailboxState::TASK_DONE || state == MailboxState::TASK_FAILED) &&
-                    frame_identity_matches(record, frame)) {
-                    progress.completion = terminal_completion(record, frame, state);
-                    write_mailbox_state(MailboxState::IDLE, frame);
+                    entry_identity_matches(record, entry)) {
+                    progress.completion = terminal_completion(record, entry, state);
                 }
             }
-            record = FrameRecord{};
-            poll_cursor_ = (index + 1) % task_frame_count_;
+            release_entry_locked(index);
+            poll_cursor_ = (index + 1) % entry_count;
             return true;
         }
         return false;
     }
 
-    for (size_t offset = 0; offset < task_frame_count_; ++offset) {
-        size_t index = (poll_cursor_ + offset) % task_frame_count_;
-        FrameRecord &record = frames_[index];
+    for (size_t offset = 0; offset < entry_count; ++offset) {
+        size_t index = (poll_cursor_ + offset) % entry_count;
+        EntryRecord &record = entries_[index];
         if (!record.occupied) continue;
-        char *frame = task_frame(index);
-        MailboxState state = read_mailbox_state(frame);
+        MailboxRunEntry *entry = run_entry(index);
+        const auto state = static_cast<MailboxState>(load_entry_i32(&entry->state));
 
-        if (!record.accepted_reported && read_task_accepted(frame)) {
-            if (!frame_identity_matches(record, frame)) {
-                poison_progress("stale frame identity at launch acceptance");
+        if (!record.accepted_reported && load_entry_i32(&entry->accepted) == MAILBOX_TASK_ACCEPTED) {
+            if (!entry_identity_matches(record, entry)) {
+                poison_progress("stale run-state entry identity at launch acceptance");
                 break;
             }
             record.accepted_reported = true;
             progress.kind = WorkerProgressKind::ACCEPTED;
             progress.dispatch = record.dispatch;
-            poll_cursor_ = (index + 1) % task_frame_count_;
+            poll_cursor_ = (index + 1) % entry_count;
             return true;
         }
 
         if (state == MailboxState::FRAME_STAGED) {
-            if (!frame_identity_matches(record, frame)) {
-                poison_progress("stale frame identity at endpoint staging");
+            if (!entry_identity_matches(record, entry)) {
+                poison_progress("stale run-state entry identity at endpoint staging");
                 break;
             }
             if (record.activation_requested) {
-                (void)try_publish_activation(record, frame);
+                (void)try_publish_activation(record, entry);
                 if (endpoint_poisoned_) break;
             }
-            int32_t disposition_value = 0;
-            __atomic_load(
-                reinterpret_cast<const int32_t *>(frame + MAILBOX_OFF_PREPARATION_DISPOSITION), &disposition_value,
-                __ATOMIC_ACQUIRE
-            );
-            const auto disposition = static_cast<MailboxPreparationDisposition>(disposition_value);
+            const auto disposition =
+                static_cast<MailboxPreparationDisposition>(load_entry_i32(&entry->preparation_disposition));
             if (disposition != MailboxPreparationDisposition::VALIDATED_ONLY &&
                 disposition != MailboxPreparationDisposition::NATIVE_PREPARED) {
                 poison_progress("invalid preparation disposition at endpoint staging");
                 break;
             }
-            // Reported once when the frame stages, and once more if that staged run is *later*
+            // Reported once when the run stages, and once more if that staged run is *later*
             // prepared natively: a run staged behind a predecessor that had not launched yet is
             // validated-only at that instant and holds native preparation only after the
             // predecessor reaches the device. The child publishes that promotion by writing this
@@ -1076,53 +1266,70 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
                 progress.kind = WorkerProgressKind::FRAME_STAGED;
                 progress.dispatch = record.dispatch;
                 progress.preparation_disposition = disposition;
-                poll_cursor_ = (index + 1) % task_frame_count_;
+                poll_cursor_ = (index + 1) % entry_count;
                 return true;
             }
             continue;
         }
 
         if (state == MailboxState::TASK_DONE || state == MailboxState::TASK_FAILED) {
-            if (!frame_identity_matches(record, frame)) {
-                poison_progress("stale frame identity at terminal completion");
+            if (!entry_identity_matches(record, entry)) {
+                poison_progress("stale run-state entry identity at terminal completion");
                 break;
             }
             progress.kind = WorkerProgressKind::COMPLETED;
             progress.dispatch = record.dispatch;
-            progress.completion = terminal_completion(record, frame, state);
-            write_mailbox_state(MailboxState::IDLE, frame);
-            record = FrameRecord{};
-            poll_cursor_ = (index + 1) % task_frame_count_;
+            progress.completion = terminal_completion(record, entry, state);
+            release_entry_locked(index);
+            poll_cursor_ = (index + 1) % entry_count;
             return true;
         }
 
-        if (state != MailboxState::TASK_READY && state != MailboxState::PREPARE_READY &&
+        if (state != MailboxState::IDLE && state != MailboxState::TASK_READY && state != MailboxState::PREPARE_READY &&
             state != MailboxState::ACTIVATE && state != MailboxState::TASK_LAUNCHED) {
-            poison_progress("task frame entered an invalid state " + std::to_string(static_cast<int32_t>(state)));
+            poison_progress("run-state entry entered an invalid state " + std::to_string(static_cast<int32_t>(state)));
             break;
         }
     }
 
     if (!endpoint_poisoned_) return false;
     if (!poisoned_progress_quiesced()) return false;
-    for (size_t index = 0; index < task_frame_count_; ++index) {
-        FrameRecord &record = frames_[index];
+    for (size_t index = 0; index < entry_count; ++index) {
+        EntryRecord &record = entries_[index];
         if (!record.occupied) continue;
         progress.kind = WorkerProgressKind::COMPLETED;
         progress.dispatch = record.dispatch;
         progress.completion = poisoned_completion(record);
-        record = FrameRecord{};
-        poll_cursor_ = (index + 1) % task_frame_count_;
+        release_entry_locked(index);
+        poll_cursor_ = (index + 1) % entry_count;
         return true;
     }
     return false;
 }
 
+void LocalMailboxEndpoint::release_entry_locked(size_t index) {
+    EntryRecord &record = entries_[index];
+    // Even generation: the entry is free, and every reference still carrying the
+    // odd one is now refusable rather than indistinguishable from a fresh run.
+    // Published before the record is cleared, so nothing on the child side can
+    // see a free entry still advertising this run's identity.
+    MailboxRunEntry *entry = run_entry(index);
+    store_entry_u64(&entry->entry_generation, record.entry_generation + 1);
+    store_entry_i32(&entry->state, static_cast<int32_t>(MailboxState::IDLE));
+    // A frame still published for this entry will never be echoed now, so it
+    // comes back here rather than waiting for a level that cannot arrive.
+    if (record.request_frame < request_frames_.size() && request_frames_[record.request_frame].entry == index) {
+        request_frames_[record.request_frame].published = false;
+        request_frames_[record.request_frame].entry = kNoRequestFrame;
+    }
+    record = EntryRecord{};
+}
+
 bool LocalMailboxEndpoint::activate_progress(RunId run_id) {
     std::unique_lock<std::mutex> lk(progress_mu_);
     if (endpoint_poisoned_) return false;
-    for (size_t index = 0; index < task_frame_count_; ++index) {
-        FrameRecord &record = frames_[index];
+    for (size_t index = 0; index < entries_.size(); ++index) {
+        EntryRecord &record = entries_[index];
         if (!record.occupied || !record.dispatch.prepare_only || record.run_id != run_id) continue;
 #if SIMPLER_HOST_STRACE
         std::optional<simpler::host_trace::SpanScope> activate_trace;
@@ -1140,8 +1347,7 @@ bool LocalMailboxEndpoint::activate_progress(RunId run_id) {
         }
 #endif
         record.activation_requested = true;
-        char *frame = task_frame(index);
-        (void)try_publish_activation(record, frame);
+        (void)try_publish_activation(record, run_entry(index));
         lk.unlock();
         return true;
     }
@@ -1158,7 +1364,7 @@ void LocalMailboxEndpoint::report_progress_error(const std::string &reason) {
 bool LocalMailboxEndpoint::report_submission_error(const WorkerDispatch &dispatch, const std::string &reason) {
     std::lock_guard<std::mutex> lk(progress_mu_);
     bool endpoint_owned = false;
-    for (const FrameRecord &record : frames_) {
+    for (const EntryRecord &record : entries_) {
         endpoint_owned = endpoint_owned || (record.occupied && record.dispatch.dispatch_id == dispatch.dispatch_id);
     }
     poison_progress("endpoint submission failed: " + reason);
@@ -1169,13 +1375,13 @@ bool LocalMailboxEndpoint::report_submission_error(const WorkerDispatch &dispatc
 // WorkerManager
 // =============================================================================
 
-void WorkerManager::add_next_level(void *mailbox, int child_pid, uint32_t task_frame_count) {
-    add_next_level_at(static_cast<int32_t>(next_level_entries_.size()), mailbox, child_pid, task_frame_count);
+void WorkerManager::add_next_level(void *mailbox, int child_pid, uint32_t granted_sets) {
+    add_next_level_at(static_cast<int32_t>(next_level_entries_.size()), mailbox, child_pid, granted_sets);
 }
 
-void WorkerManager::add_next_level_at(int32_t worker_id, void *mailbox, int child_pid, uint32_t task_frame_count) {
+void WorkerManager::add_next_level_at(int32_t worker_id, void *mailbox, int child_pid, uint32_t granted_sets) {
     if (worker_id < 0) throw std::invalid_argument("WorkerManager::add_next_level_at: negative worker_id");
-    next_level_entries_.push_back(LocalNextLevelEntry{worker_id, mailbox, child_pid, task_frame_count});
+    next_level_entries_.push_back(LocalNextLevelEntry{worker_id, mailbox, child_pid, granted_sets});
 }
 
 void WorkerManager::add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint) {
@@ -1215,7 +1421,7 @@ void WorkerManager::start(
         for (const auto &entry : next_level_entries_) {
             auto wt = std::make_unique<WorkerThread>();
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(
-                entry.worker_id, entry.mailbox, entry.child_pid, entry.task_frame_count
+                entry.worker_id, entry.mailbox, entry.child_pid, entry.granted_sets
             );
             wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
             next_level_threads_.push_back(std::move(wt));

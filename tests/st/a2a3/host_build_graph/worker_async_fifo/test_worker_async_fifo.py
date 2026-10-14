@@ -27,14 +27,20 @@ from pathlib import Path
 
 import pytest
 import torch
+from simpler.task_interface import (
+    MAILBOX_RUN_ENTRY_STRIDE,
+    MAILBOX_RUN_ENTRY_TABLE_OFFSET,
+    DataType,
+    TaskArgs,
+    TensorArgType,
+    TensorTransfer,
+)
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import DataType, TaskArgs, TensorArgType, TensorTransfer
 from simpler.worker import (
     _FRAME_STAGED,
-    _OFF_ACCEPTED,
-    _OFF_STATE,
+    _OFF_ENTRY_ACCEPTED,
+    _OFF_ENTRY_STATE,
     _TASK_LAUNCHED,
-    MAILBOX_FRAME_SIZE,
     _mailbox_load_i32,
 )
 
@@ -132,8 +138,14 @@ def _wait_for_backend_prepared_successor(worker, timeout: float, worker_indices=
         shm_buf = worker._chip_shms[worker_index].buf  # noqa: SLF001 -- white-box backend-prepare observation
         assert shm_buf is not None
         mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
-        state_addrs = [mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE + _OFF_STATE for index in range(2)]
-        accepted_addrs = [mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE + _OFF_ACCEPTED for index in range(2)]
+        # Run-state entries, not request frames: a run's state and its acceptance word live
+        # there for the run's whole life, while the frame that delivered the payload goes back as
+        # soon as the child has copied it out.
+        entry_addrs = [
+            mailbox_addr + MAILBOX_RUN_ENTRY_TABLE_OFFSET + index * MAILBOX_RUN_ENTRY_STRIDE for index in range(2)
+        ]
+        state_addrs = [addr + _OFF_ENTRY_STATE for addr in entry_addrs]
+        accepted_addrs = [addr + _OFF_ENTRY_ACCEPTED for addr in entry_addrs]
         mailboxes.append((state_addrs, accepted_addrs))
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -161,7 +173,12 @@ def _wait_for_active_device_run(worker, timeout: float, worker_indices=(0,)) -> 
         shm_buf = worker._chip_shms[worker_index].buf  # noqa: SLF001 -- white-box device-launch observation
         assert shm_buf is not None
         mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
-        all_state_addrs.append([mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE + _OFF_STATE for index in range(2)])
+        all_state_addrs.append(
+            [
+                mailbox_addr + MAILBOX_RUN_ENTRY_TABLE_OFFSET + index * MAILBOX_RUN_ENTRY_STRIDE + _OFF_ENTRY_STATE
+                for index in range(2)
+            ]
+        )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if all(

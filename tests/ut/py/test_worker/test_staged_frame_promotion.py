@@ -24,50 +24,50 @@ import ctypes
 import struct
 
 import pytest
+from simpler.task_interface import MAILBOX_RUN_ENTRY_STRIDE as _ENTRY_SIZE
 from simpler.worker import (
     _ACTIVATE,
     _FRAME_STAGED,
     _NATIVE_PREPARED,
-    _OFF_FRAME_DISPATCH_ID,
-    _OFF_FRAME_GENERATION,
-    _OFF_FRAME_GROUP_INDEX,
-    _OFF_FRAME_GROUP_SIZE,
-    _OFF_FRAME_PROTOCOL,
-    _OFF_FRAME_RUN_ID,
-    _OFF_FRAME_SLOT_ID,
-    _OFF_FRAME_TASK_SLOT,
-    _OFF_PREPARATION_DISPOSITION,
-    _OFF_STATE,
+    _OFF_ENTRY_DISPATCH_ID,
+    _OFF_ENTRY_GROUP_INDEX,
+    _OFF_ENTRY_GROUP_SIZE,
+    _OFF_ENTRY_LEASE_GENERATION,
+    _OFF_ENTRY_PREPARATION_DISPOSITION,
+    _OFF_ENTRY_PROTOCOL,
+    _OFF_ENTRY_RUN_ID,
+    _OFF_ENTRY_SLOT_ID,
+    _OFF_ENTRY_STATE,
+    _OFF_ENTRY_TASK_SLOT,
     _TASK_PROTOCOL_VERSION,
     _VALIDATED_ONLY,
     _buffer_field_addr,
     _mailbox_load_i32,
     _mailbox_store_i32,
     _publish_native_promotion,
-    _read_task_frame_identity,
+    _read_run_entry_identity,
 )
-from simpler.worker import MAILBOX_FRAME_SIZE as _FRAME_SIZE
 
 _IDENTITY = (_TASK_PROTOCOL_VERSION, 11, 2, 3, 40, 0, 0, 1)
 _OTHER_IDENTITY = (_TASK_PROTOCOL_VERSION, 12, 2, 4, 41, 0, 0, 1)
 
 _IDENTITY_OFFSETS = (
-    _OFF_FRAME_PROTOCOL,
-    _OFF_FRAME_RUN_ID,
-    _OFF_FRAME_SLOT_ID,
-    _OFF_FRAME_GENERATION,
-    _OFF_FRAME_DISPATCH_ID,
-    _OFF_FRAME_TASK_SLOT,
-    _OFF_FRAME_GROUP_INDEX,
-    _OFF_FRAME_GROUP_SIZE,
+    _OFF_ENTRY_PROTOCOL,
+    _OFF_ENTRY_RUN_ID,
+    _OFF_ENTRY_SLOT_ID,
+    _OFF_ENTRY_LEASE_GENERATION,
+    _OFF_ENTRY_DISPATCH_ID,
+    _OFF_ENTRY_TASK_SLOT,
+    _OFF_ENTRY_GROUP_INDEX,
+    _OFF_ENTRY_GROUP_SIZE,
 )
 
 
 class _Frame:
-    """One task frame in ordinary memory, at the offsets both sides of the mailbox use."""
+    """One run-state entry in ordinary memory, at the offsets both sides of the mailbox use."""
 
     def __init__(self, identity, state, disposition):
-        self._storage = (ctypes.c_char * _FRAME_SIZE)()
+        self._storage = (ctypes.c_char * _ENTRY_SIZE)()
         self.buf = memoryview(self._storage).cast("B")
         self.addr = _buffer_field_addr(self.buf, 0)
         self.write_identity(identity)
@@ -80,19 +80,19 @@ class _Frame:
 
     @property
     def state(self):
-        return _mailbox_load_i32(self.addr + _OFF_STATE)
+        return _mailbox_load_i32(self.addr + _OFF_ENTRY_STATE)
 
     @state.setter
     def state(self, value):
-        _mailbox_store_i32(self.addr + _OFF_STATE, value)
+        _mailbox_store_i32(self.addr + _OFF_ENTRY_STATE, value)
 
     @property
     def disposition(self):
-        return _mailbox_load_i32(self.addr + _OFF_PREPARATION_DISPOSITION)
+        return _mailbox_load_i32(self.addr + _OFF_ENTRY_PREPARATION_DISPOSITION)
 
     @disposition.setter
     def disposition(self, value):
-        _mailbox_store_i32(self.addr + _OFF_PREPARATION_DISPOSITION, value)
+        _mailbox_store_i32(self.addr + _OFF_ENTRY_PREPARATION_DISPOSITION, value)
 
 
 @pytest.fixture
@@ -103,7 +103,7 @@ def staged_frame():
 def test_the_frame_models_the_wire_layout(staged_frame):
     # A positive control for every case below: if the identity were written somewhere the reader
     # does not look, the identity guard would appear to hold for the wrong reason.
-    assert _read_task_frame_identity(staged_frame.buf) == _IDENTITY
+    assert _read_run_entry_identity(staged_frame.buf) == _IDENTITY
     assert staged_frame.state == _FRAME_STAGED
     assert staged_frame.disposition == _VALIDATED_ONLY
 

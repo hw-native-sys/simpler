@@ -1298,8 +1298,9 @@ static uint32_t resolved_arena_bank_for_slot(uint32_t pipeline_slot) {
 static void emit_overlap_storage_marks(OnboardNativeRunContext *state, bool shares_arena_bank) {
     if (!simpler::host_trace::enabled() || state == nullptr || state->runner == nullptr) return;
     DeviceRunnerBase *runner = state->runner;
-    DeviceRunnerBase::NativeRunReservationRow rows[PTO_PIPELINE_MAX_DEPTH];
-    const size_t live = runner->snapshot_native_run_reservations(rows, PTO_PIPELINE_MAX_DEPTH);
+    // Sized to the grant, so the snapshot covers every set a run could hold.
+    std::vector<DeviceRunnerBase::NativeRunReservationRow> rows(runner->run_resource_grant());
+    const size_t live = runner->snapshot_native_run_reservations(rows.data(), rows.size());
 
     const PipelineContract *contract = get_pipeline_contract();
     const PipelineResource *heap =
@@ -1399,10 +1400,14 @@ int simpler_prepare_run(
 ) {
     if (ctx == nullptr || runtime == nullptr || config == nullptr || descriptor == nullptr)
         return PTO_RUNTIME_ERR_INTERNAL;
-    if (descriptor->pipeline_slot >= PTO_PIPELINE_MAX_DEPTH || descriptor->arena_bank >= PTO_PIPELINE_MAX_DEPTH) {
+    // Against the grant this context was given, not a compile-time width: a set
+    // exists because this context was granted it, so a slot past the grant names
+    // no resource here rather than one that happens to be laid out.
+    const size_t granted_sets = static_cast<DeviceRunnerBase *>(ctx)->run_resource_grant();
+    if (descriptor->pipeline_slot >= granted_sets || descriptor->arena_bank >= granted_sets) {
         LOG_ERROR(
-            "simpler_prepare_run: descriptor selects slot=%u bank=%u outside [0, %u)", descriptor->pipeline_slot,
-            descriptor->arena_bank, PTO_PIPELINE_MAX_DEPTH
+            "simpler_prepare_run: descriptor selects slot=%u bank=%u outside [0, %zu)", descriptor->pipeline_slot,
+            descriptor->arena_bank, granted_sets
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -2454,6 +2459,18 @@ int simpler_set_retained_epoch_limit_ctx(DeviceContextHandle ctx, int32_t limit)
     if (limit > PLATFORM_RUN_TERMINAL_BANKS) return PTO_RUNTIME_ERR_UNSUPPORTED;
     try {
         return static_cast<DeviceRunnerBase *>(ctx)->set_retained_epoch_limit(static_cast<size_t>(limit)) ?
+                   0 :
+                   PTO_RUNTIME_ERR_UNSUPPORTED;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_set_run_resource_grant_ctx(DeviceContextHandle ctx, uint32_t granted) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    if (granted == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->set_run_resource_grant(static_cast<size_t>(granted)) ?
                    0 :
                    PTO_RUNTIME_ERR_UNSUPPORTED;
     } catch (...) {

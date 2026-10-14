@@ -430,10 +430,13 @@ constexpr int PLATFORM_RUN_TERMINAL_SCHED_PHASE_BASE = 2 * PLATFORM_MAX_CORES;
 constexpr int PLATFORM_RUN_TERMINAL_ORCH_PHASE_BASE = 2 * PLATFORM_MAX_CORES + PLATFORM_MAX_AICPU_THREADS;
 constexpr int PLATFORM_RUN_TERMINAL_PRODUCERS = 2 * PLATFORM_MAX_CORES + 2 * PLATFORM_MAX_AICPU_THREADS;
 
-// One bank per retained run. This file is compiled by ccec for AICore, which
-// must not pull in the host worker API, so the pipeline depth is mirrored here
-// and cross-checked against PTO_PIPELINE_MAX_DEPTH in the host collector, where
-// both headers are visible.
+// How many runs may hold a terminal snapshot at once. A bank is held by the
+// epoch that acquired it and comes back when that run's snapshot is reported,
+// so this bounds concurrent *diagnostics*, not concurrent runs: a run that
+// finds no free bank keeps its diagnostic and is ordered behind the ones ahead
+// of it for that round. Device-side storage compiled by ccec for AICore, which
+// must not pull in the host worker API, so the count lives here and the host
+// collector maps epochs onto it.
 constexpr int PLATFORM_RUN_TERMINAL_BANKS = 3;
 
 inline size_t calc_run_terminal_bank_size() {

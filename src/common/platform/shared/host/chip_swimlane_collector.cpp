@@ -1553,6 +1553,66 @@ void ChipSwimlaneCollector::reconcile_aicore_counters() {
 // nothing clears it between runs, so the previous occupant's snapshot stays
 // readable until this run's producers overwrite their own entries.
 
+int ChipSwimlaneCollector::acquire_run_terminal_bank(uint64_t run_epoch) {
+    if (run_epoch == 0) return -1;
+    for (int bank = 0; bank < PLATFORM_RUN_TERMINAL_BANKS; ++bank) {
+        if (bank_epoch_[bank] == run_epoch) return bank;
+    }
+    for (int bank = 0; bank < PLATFORM_RUN_TERMINAL_BANKS; ++bank) {
+        if (bank_epoch_[bank] == 0 && !bank_quarantined_[bank]) {
+            bank_epoch_[bank] = run_epoch;
+            return bank;
+        }
+    }
+    return -1;
+}
+
+void ChipSwimlaneCollector::quarantine_run_terminal_bank(uint64_t run_epoch) {
+    if (run_epoch == 0) return;
+    for (int bank = 0; bank < PLATFORM_RUN_TERMINAL_BANKS; ++bank) {
+        if (bank_epoch_[bank] != run_epoch) continue;
+        bank_quarantined_[bank] = true;
+        bank_epoch_[bank] = 0;
+        LOG_WARN(
+            "ChipSwimlane terminal: bank %d is withdrawn — epoch %lu could not prove its device work finished, so a "
+            "producer may still be writing into it",
+            bank, static_cast<unsigned long>(run_epoch)
+        );
+    }
+}
+
+int ChipSwimlaneCollector::quarantined_run_terminal_banks() const {
+    int withdrawn = 0;
+    for (int bank = 0; bank < PLATFORM_RUN_TERMINAL_BANKS; ++bank) {
+        if (bank_quarantined_[bank]) ++withdrawn;
+    }
+    return withdrawn;
+}
+
+int ChipSwimlaneCollector::run_terminal_bank_of(uint64_t run_epoch) const {
+    if (run_epoch == 0) return -1;
+    for (int bank = 0; bank < PLATFORM_RUN_TERMINAL_BANKS; ++bank) {
+        if (bank_epoch_[bank] == run_epoch) return bank;
+    }
+    return -1;
+}
+
+bool ChipSwimlaneCollector::can_take_run_terminal_bank(uint64_t run_epoch) const {
+    if (run_epoch == 0) return false;
+    for (int bank = 0; bank < PLATFORM_RUN_TERMINAL_BANKS; ++bank) {
+        if (bank_epoch_[bank] == run_epoch) return true;
+        if (bank_epoch_[bank] == 0 && !bank_quarantined_[bank]) return true;
+    }
+    return false;
+}
+
+void ChipSwimlaneCollector::release_run_terminal_bank(uint64_t run_epoch) {
+    if (run_epoch == 0) return;
+    for (int bank = 0; bank < PLATFORM_RUN_TERMINAL_BANKS; ++bank) {
+        if (bank_epoch_[bank] == run_epoch) bank_epoch_[bank] = 0;
+    }
+}
+
 void *ChipSwimlaneCollector::arm_run_terminal_bank(uint32_t bank_index, uint64_t run_epoch) {
     // Any outcome other than a successful arm leaves this collector with no
     // expected identity. Keeping the previous run's would make the next run's
@@ -1562,7 +1622,7 @@ void *ChipSwimlaneCollector::arm_run_terminal_bank(uint32_t bank_index, uint64_t
     if (shm_host_ == nullptr || perf_shared_mem_dev_ == nullptr) return nullptr;
     if (bank_index >= static_cast<uint32_t>(PLATFORM_RUN_TERMINAL_BANKS)) {
         LOG_ERROR(
-            "ChipSwimlane terminal: pipeline slot %u exceeds the %d retained banks — no snapshot armed", bank_index,
+            "ChipSwimlane terminal: bank %u exceeds the %d retained banks — no snapshot armed", bank_index,
             PLATFORM_RUN_TERMINAL_BANKS
         );
         return nullptr;
@@ -2795,6 +2855,14 @@ int ChipSwimlaneCollector::finalize(
     aicore_foreign_identity_ = 0;
     // The region this identity was armed against is gone.
     armed_run_epoch_ = 0;
+    // And so is every bank inside it, including the ones withdrawn from service:
+    // what made a quarantined bank unsafe was a producer writing into storage
+    // that no longer exists, so a reinitialized collector starts with all of
+    // them again rather than inheriting a permanently narrowed capacity.
+    for (int bank = 0; bank < PLATFORM_RUN_TERMINAL_BANKS; ++bank) {
+        bank_epoch_[bank] = 0;
+        bank_quarantined_[bank] = false;
+    }
     // Read out of the same region, so it goes with it.
     terminal_reported_ = false;
     terminal_snapshot_ = RunTerminalSnapshot{};
@@ -3520,7 +3588,7 @@ bool ChipSwimlaneCollector::run_begin(
     return !fatal_.load(std::memory_order_acquire);
 }
 
-void ChipSwimlaneCollector::run_close(uint64_t run_epoch, uint32_t bank_index, bool device_execution_complete) {
+void ChipSwimlaneCollector::run_close(uint64_t run_epoch, bool device_execution_complete) {
     if (!retained_ready_.load(std::memory_order_acquire)) return;
     const int found = find_run_slot(run_epoch);
     if (found < 0) return;
@@ -3630,9 +3698,21 @@ void ChipSwimlaneCollector::run_close(uint64_t run_epoch, uint32_t bank_index, b
         bucket.pending.sched_phase_dropped_records[static_cast<size_t>(t)] = dropped;
     }
 
+    // The bank this run holds, by epoch. A retained run's snapshot is consumed
+    // into its own bucket rather than reported, and the bucket outlives the
+    // bank — so that copy is this path's consumer proof and the bank is handed
+    // on straight after it. Completion that could not be proved gives the
+    // opposite answer: a producer may still be writing there, so the bank is
+    // withdrawn rather than reissued.
+    const int held_bank = run_terminal_bank_of(run_epoch);
     if (device_execution_complete) {
-        bucket.terminal = read_run_terminal_snapshot(bank_index, run_epoch);
-        bucket.terminal_ok = bucket.terminal.transport_ok;
+        if (held_bank >= 0) {
+            bucket.terminal = read_run_terminal_snapshot(static_cast<uint32_t>(held_bank), run_epoch);
+            bucket.terminal_ok = bucket.terminal.transport_ok;
+            release_run_terminal_bank(run_epoch);
+        }
+    } else if (held_bank >= 0) {
+        quarantine_run_terminal_bank(run_epoch);
     }
 
     // Arm the per-queue cut. Every buffer this run will ever publish is already
@@ -3664,6 +3744,11 @@ void ChipSwimlaneCollector::run_close(uint64_t run_epoch, uint32_t bank_index, b
 }
 
 bool ChipSwimlaneCollector::abandon_run(uint64_t run_epoch) {
+    // The bank goes back whatever the retained bookkeeping then says. This run
+    // submitted nothing, so no producer can hold its bank, and the credit it
+    // took at arm would otherwise never come back: three such rollbacks and no
+    // later diagnostic run could ever be armed.
+    release_run_terminal_bank(run_epoch);
     if (!retained_ready_.load(std::memory_order_acquire)) return true;
     size_t slot = 0;
     {

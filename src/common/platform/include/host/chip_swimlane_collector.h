@@ -843,6 +843,59 @@ public:
     void *arm_run_terminal_bank(uint32_t bank_index, uint64_t run_epoch);
 
     /**
+     * Take a terminal bank for `run_epoch`, or report that none is free.
+     *
+     * The banks are a fixed device resource and a run is not: a bank is held by
+     * whichever epoch acquired it until that run's report releases it, so the
+     * mapping is by epoch and not by the set a run happens to borrow. Asking
+     * again for an epoch that already holds one answers with the same bank,
+     * which is what makes arming idempotent across a re-prepare.
+     *
+     * Returns the bank index, or -1 when every bank is held. A caller that gets
+     * -1 has not lost its diagnostic: the banks come back as runs retire, so
+     * the question is asked again next round rather than answered once.
+     */
+    int acquire_run_terminal_bank(uint64_t run_epoch);
+
+    /** Which bank `run_epoch` holds, or -1 when it holds none. */
+    int run_terminal_bank_of(uint64_t run_epoch) const;
+
+    /**
+     * Whether `run_epoch` could take a terminal bank right now.
+     *
+     * The question a scheduling round asks before ordering a further diagnostic
+     * run behind the ones already open: a run with no bank would publish no
+     * snapshot, so it waits for one instead of launching without it. Asked
+     * again every round, and the banks come back as runs retire.
+     */
+    bool can_take_run_terminal_bank(uint64_t run_epoch) const;
+
+    /**
+     * Give back the bank `run_epoch` held, so another run may take it.
+     *
+     * Only for a run whose bank is proved finished with: its snapshot has been
+     * consumed — reported, or copied into the epoch's own bucket — or it never
+     * submitted anything, so no producer can be holding the address. Those are
+     * the only two proofs; a run whose completion is merely unobserved is
+     * quarantined instead.
+     */
+    void release_run_terminal_bank(uint64_t run_epoch);
+
+    /**
+     * Withdraw the bank `run_epoch` held, without returning it.
+     *
+     * For a run that reached the device and whose completion could not be
+     * proved. The AICPU may still be writing into that bank, so handing it to
+     * another run would let two producers share it and would publish one run's
+     * accounting as another's. A quarantined bank is never reissued; it comes
+     * back only when the region itself goes, at `finalize`.
+     */
+    void quarantine_run_terminal_bank(uint64_t run_epoch);
+
+    /** How many banks are withdrawn, for a caller reporting degraded capacity. */
+    int quarantined_run_terminal_banks() const;
+
+    /**
      * Read back the snapshot armed for `run_epoch` at `bank_index`.
      *
      * Only sound after that run's completion has been established positively —
@@ -1414,6 +1467,18 @@ private:
     // verdict rather than inheriting the previous run's identity.
     uint64_t armed_run_epoch_{0};
 
+    // Which run holds each terminal bank, or 0 for a free one. The banks are a
+    // fixed device resource and a run is not, so a bank is keyed by the epoch
+    // that acquired it and comes back only when that run's snapshot has been
+    // reported. Keyed by epoch rather than by the run-resource set a run
+    // borrows: the sets are as many as the grant allows and the banks are
+    // three, so the two counts do not have to agree for either to be correct.
+    uint64_t bank_epoch_[PLATFORM_RUN_TERMINAL_BANKS]{};
+    // A bank whose holder could not prove its device work finished. Never
+    // reissued: a producer may still be writing into it, and the host cannot
+    // tell from here. Cleared only by `finalize`, where the region goes away.
+    bool bank_quarantined_[PLATFORM_RUN_TERMINAL_BANKS]{};
+
     // Per-class handoff receipt, summed from the shards at merge time.
     HandoffReceipt merged_receipt_[kProducerClasses]{};
     uint64_t merged_presented_buffers_{0};
@@ -1728,8 +1793,15 @@ public:
      * Called on the teardown thread while the run still holds its execution
      * claim, which is what makes the per-queue capture consistent: the device
      * has stopped and the successor has not launched.
+     *
+     * The terminal bank is resolved from `run_epoch` here rather than taken as
+     * an argument: a bank is held by the epoch that acquired it, so no caller
+     * can be in a position to name the right index, and one passing a run's
+     * resource-set index would read another run's accounting. This also settles
+     * the bank — released once its snapshot is in this epoch's bucket,
+     * quarantined when completion could not be proved.
      */
-    void run_close(uint64_t run_epoch, uint32_t bank_index, bool device_execution_complete);
+    void run_close(uint64_t run_epoch, bool device_execution_complete);
 
     /**
      * Withdraw a run that was admitted and never launched.

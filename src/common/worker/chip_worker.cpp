@@ -334,6 +334,10 @@ void ChipWorker::init(
         // capacity grant exports nothing, and a null pointer is the refusal.
         set_retained_epoch_limit_fn_ =
             reinterpret_cast<SimplerSetRetainedEpochLimitFn>(dlsym(handle, "simpler_set_retained_epoch_limit_ctx"));
+        // Optional on the same terms: a module built before per-run resources
+        // were sized by the grant exports nothing and keeps its own sizing.
+        set_run_resource_grant_fn_ =
+            reinterpret_cast<SimplerSetRunResourceGrantFn>(dlsym(handle, "simpler_set_run_resource_grant_ctx"));
         get_arena_bank_gm_heap_base_fn_ =
             load_symbol<GetArenaBankGmHeapBaseFn>(handle, "get_arena_bank_gm_heap_base_ctx");
         get_retained_temp_addr_fn_ = load_symbol<GetRetainedTempAddrFn>(handle, "get_retained_temp_addr_ctx");
@@ -405,6 +409,9 @@ void ChipWorker::init(
     if (wanted < resolved_contract.pipeline_depth) {
         resolved_contract.pipeline_depth = wanted;
     }
+    // The generation filter is sized by the grant for the same reason the run
+    // storage below is: a set exists because a run can hold it.
+    pipeline_generations_.resize(resolved_contract.pipeline_depth);
 
     device_ctx_ = create_device_context_fn_();
     if (device_ctx_ == nullptr) {
@@ -412,6 +419,19 @@ void ChipWorker::init(
     }
 
     try {
+        // The grant reaches the runtime before anything can name a set, so every
+        // per-run resource behind the ABI is built to the count this context
+        // actually uses. A module that exports no such entry keeps its own
+        // sizing and is held to it by the slot bound every prepare checks.
+        if (set_run_resource_grant_fn_ != nullptr) {
+            const int grant_rc = set_run_resource_grant_fn_(device_ctx_, resolved_contract.pipeline_depth);
+            if (grant_rc != 0) {
+                throw std::runtime_error(
+                    "host runtime refused a grant of " + std::to_string(resolved_contract.pipeline_depth) +
+                    " run-resource set(s) with code " + std::to_string(grant_rc)
+                );
+            }
+        }
         // One opaque native-run storage buffer per slot, always. The host
         // runtime constructs its per-run Runtime + phase state behind this
         // ABI boundary. This storage is not the RUNTIME_IMAGE resource: the
@@ -649,6 +669,27 @@ void ChipWorker::finalize() {
         run_lane_.reset();
     }
     cleanup_native_runs_noexcept();
+    // A run whose destruction could not be proved still owns whatever its carrier holds, and the
+    // carrier itself still lives in this worker's runtime storage. Everything below this point —
+    // the device teardown, the context destruction, the `dlclose` and the release of that storage
+    // — would either free those resources a second time or unload the code that owns their release
+    // routines. So the close stops here and keeps all of it, which is the same contract the device
+    // teardown's own failure already states.
+    const size_t unproven = unproven_native_run_count();
+    if (unproven != 0) {
+        // The storage leaves this object's ownership before anything else
+        // happens. Everything below would free those resources a second time or
+        // unload the code that owns their release routines, and this object's
+        // own destructor would free the carrier's bytes whatever the run table
+        // says — so the one durable retention is to detach the block, which no
+        // later destructor then returns to the allocator.
+        const size_t abandoned = abandon_unproven_native_run_storage();
+        throw std::runtime_error(
+            "ChipWorker::finalize: " + std::to_string(unproven) +
+            " native run(s) could not be proved destroyed; abandoned " + std::to_string(abandoned) +
+            " run storage block(s) and kept the context and the host runtime loaded"
+        );
+    }
     // Global domains are independent of the legacy communicator sessions.
     // Release them while the host runtime and device context are still alive.
     if (comm_global_domain_release_fn_ != nullptr) {
@@ -734,6 +775,7 @@ void ChipWorker::clear_runtime_binding() {
     supports_concurrent_native_prepare_fn_ = nullptr;
     supports_joined_native_launch_fn_ = nullptr;
     supports_joined_diagnostic_launch_fn_ = nullptr;
+    set_run_resource_grant_fn_ = nullptr;
     get_arena_bank_gm_heap_base_fn_ = nullptr;
     get_retained_temp_addr_fn_ = nullptr;
     unregister_callable_fn_ = nullptr;
@@ -898,27 +940,27 @@ bool ChipWorker::supports_joined_diagnostic_launch(
     // refusal this call is asking to lift, so the caller keeps today's
     // behaviour.
     if (supports_joined_diagnostic_launch_fn_ == nullptr) return false;
-    // Held across the token validation *and* the backend call, unlike the
-    // launch path's check: this call reads the backend's prepared and active
-    // execution state through both handles, and the slot bookkeeping that says
-    // those handles still name the runs the caller means is this mutex's. A
-    // check made under the lock and a read made after it would be two
-    // statements about two different instants.
-    //
-    // The call is read-only and takes no device action, so holding the mutex
-    // through it adds no wait that was not already this thread's.
-    std::lock_guard<std::mutex> lk(native_run_mu_);
     if (run.slot_id >= runtime_bufs_.size() || predecessor.slot_id >= runtime_bufs_.size()) return false;
     if (run.slot_id == predecessor.slot_id) return false;
-    const NativeRunSlotState &state = native_run_states_[run.slot_id];
-    if (state.run_epoch != run.run_epoch || state.lease_generation != run.generation) return false;
-    if (state.phase != NativeRunPhase::PREPARED) return false;
-    const NativeRunSlotState &ahead = native_run_states_[predecessor.slot_id];
-    if (ahead.run_epoch != predecessor.run_epoch || ahead.lease_generation != predecessor.generation) return false;
-    if (ahead.phase != NativeRunPhase::LAUNCHED) return false;
-    return supports_joined_diagnostic_launch_fn_(
-               device_ctx_, runtime_bufs_[run.slot_id].data(), runtime_bufs_[predecessor.slot_id].data()
-           ) > 0;
+    // Both carriers are dereferenced by the backend call, so both are leased — the same protection
+    // the joined launch itself takes. A phase check under the bookkeeping mutex is not enough: a
+    // finalizer reserves a run and then releases that mutex for the whole runtime destruction,
+    // leaving the phase it reserved intact, so a query admitted on the phase alone can enter while
+    // a carrier is being destroyed.
+    //
+    // Immediate, because this answers one scheduling round. A run another operation is inside is a
+    // refusal for this round and the question is asked again next round; nothing is remembered and
+    // no thread waits here.
+    void *storage = nullptr;
+    void *predecessor_storage = nullptr;
+    NativeRunOpLease held;
+    NativeRunOpLease predecessor_held;
+    const NativeRunLease lease = acquire_native_run_pair(
+        run, predecessor, NativeRunOp::ProbeSuccessor, &storage, &predecessor_storage, &held, &predecessor_held,
+        LeaseWait::Immediate
+    );
+    if (lease != NativeRunLease::Acquired) return false;
+    return supports_joined_diagnostic_launch_fn_(device_ctx_, storage, predecessor_storage) > 0;
 }
 
 bool ChipWorker::holds_live_comm_resources() const {
@@ -939,7 +981,7 @@ void ChipWorker::configure_launch_depth(unsigned depth) {
     // binds the runtime, and `supports_joined_native_launch` is where the two
     // meet. A launched run holds its pipeline slot for its whole lifetime, so
     // the slot count is the real ceiling.
-    launch_depth_ = depth > PTO_PIPELINE_MAX_DEPTH ? PTO_PIPELINE_MAX_DEPTH : depth;
+    launch_depth_ = depth;
 }
 
 ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
@@ -963,19 +1005,19 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     const bool allow_prepared_successor = supports_concurrent_native_prepare();
     {
         std::lock_guard<std::mutex> lk(native_run_mu_);
-        NativeRunSlotState &state = native_run_states_[slot_id];
-        if (state.phase != NativeRunPhase::EMPTY) {
-            throw std::runtime_error(
-                "prepare_native_run slot already owns an unfinished native run " +
-                format_native_run_identity(run_identity)
-            );
-        }
         size_t occupied = 0;
-        for (const NativeRunSlotState &candidate : native_run_states_) {
-            if (candidate.phase == NativeRunPhase::EMPTY) continue;
+        for (const auto &candidate : native_runs_) {
+            const NativeRunEntry &entry = *candidate.second;
+            if (entry.phase == NativeRunPhase::EMPTY) continue;
+            if (entry.slot_id == slot_id) {
+                throw std::runtime_error(
+                    "prepare_native_run slot already owns an unfinished native run " +
+                    format_native_run_identity(run_identity)
+                );
+            }
             ++occupied;
-            if (!allow_prepared_successor || !candidate.permits_prepared_successor ||
-                (candidate.phase != NativeRunPhase::LAUNCHED && candidate.phase != NativeRunPhase::REAPED)) {
+            if (!allow_prepared_successor || !entry.permits_prepared_successor ||
+                (entry.phase != NativeRunPhase::LAUNCHED && entry.phase != NativeRunPhase::REAPED)) {
                 throw std::runtime_error(
                     "prepare_native_run requires an active predecessor before staging a successor " +
                     format_native_run_identity(run_identity)
@@ -998,11 +1040,13 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
                 "native-run pipeline lease generation is stale " + format_native_run_identity(run_identity)
             );
         }
-        state.lease_generation = generation;
-        state.run_epoch = run_epoch;
-        state.phase = NativeRunPhase::PREPARING;
-        state.wait_rc = 0;
-        state.permits_prepared_successor = allow_prepared_successor;
+        auto entry = std::make_unique<NativeRunEntry>();
+        entry->slot_id = slot_id;
+        entry->lease_generation = generation;
+        entry->run_epoch = run_epoch;
+        entry->phase = NativeRunPhase::PREPARING;
+        entry->permits_prepared_successor = allow_prepared_successor;
+        native_runs_.emplace(run_epoch, std::move(entry));
     }
 
     int rc = -1;
@@ -1013,19 +1057,11 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         };
         rc = prepare_run_fn_(device_ctx_, runtime_bufs_[slot_id].data(), callable_id, args, &config, &descriptor);
     } catch (...) {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        NativeRunSlotState &state = native_run_states_[slot_id];
-        if (state.run_epoch == run_epoch && state.phase == NativeRunPhase::PREPARING) {
-            state = NativeRunSlotState{};
-        }
+        drop_preparing_native_run(run_epoch);
         throw;
     }
     if (rc != 0) {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        NativeRunSlotState &state = native_run_states_[slot_id];
-        if (state.run_epoch == run_epoch && state.phase == NativeRunPhase::PREPARING) {
-            state = NativeRunSlotState{};
-        }
+        drop_preparing_native_run(run_epoch);
         if (rc == PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE) {
             throw PreparedRunIncompatible(
                 "native prepare requires depth-one fallback " + format_native_run_identity(run_identity)
@@ -1037,22 +1073,24 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     }
 
     {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        NativeRunSlotState &state = native_run_states_[slot_id];
-        if (state.run_epoch != run_epoch || state.phase != NativeRunPhase::PREPARING) {
+        std::unique_lock<std::mutex> lk(native_run_mu_);
+        auto it = native_runs_.find(run_epoch);
+        if (it == native_runs_.end() || it->second->phase != NativeRunPhase::PREPARING) {
+            lk.unlock();
             (void)finalize_run_fn_(device_ctx_, runtime_bufs_[slot_id].data());
-            state = NativeRunSlotState{};
+            drop_preparing_native_run(run_epoch);
             throw std::runtime_error("native-run identity changed while prepare was in progress");
         }
         if (admit_pipeline_generation && !pipeline_generations_.admit(PipelineSlotLease{slot_id, 0, generation})) {
+            lk.unlock();
             (void)finalize_run_fn_(device_ctx_, runtime_bufs_[slot_id].data());
-            state = NativeRunSlotState{};
+            drop_preparing_native_run(run_epoch);
             throw std::runtime_error(
                 "native-run pipeline lease generation became stale while prepare was in progress " +
                 format_native_run_identity(run_identity)
             );
         }
-        state.phase = NativeRunPhase::PREPARED;
+        it->second->phase = NativeRunPhase::PREPARED;
     }
     return run_identity;
 }
@@ -1109,36 +1147,213 @@ void ChipWorker::validate_caller_stream(void *caller_stream) {
     if (rc != 0) throw std::runtime_error("caller-stream validation failed with code " + std::to_string(rc));
 }
 
-void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream) {
-    validate_execution_context();
-    {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        if (run.slot_id >= runtime_bufs_.size()) {
-            throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
-        }
-        NativeRunSlotState &state = native_run_states_[run.slot_id];
-        if (state.run_epoch != run.run_epoch || state.phase != NativeRunPhase::PREPARED) {
-            throw std::runtime_error("native-run token is stale or used in the wrong phase");
-        }
+void ChipWorker::drop_preparing_native_run(uint64_t run_epoch) noexcept {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    const auto it = native_runs_.find(run_epoch);
+    if (it != native_runs_.end() && it->second->phase == NativeRunPhase::PREPARING) {
+        native_runs_.erase(it);
     }
+    native_run_ops_done_.notify_all();
+}
 
-    if (caller_stream != nullptr) validate_caller_stream(caller_stream);
-    int rc = caller_stream != nullptr ?
-                 launch_run_on_stream_fn_(device_ctx_, runtime_bufs_[run.slot_id].data(), caller_stream, nullptr) :
-                 launch_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
-    if (rc != 0) {
-        int poll_rc = poll_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        NativeRunSlotState &state = native_run_states_[run.slot_id];
-        state.phase = poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? NativeRunPhase::REAPED : NativeRunPhase::PREPARED;
-        state.wait_rc = poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? rc : 0;
+ChipWorker::RunStorageTag ChipWorker::read_run_storage_tag(const void *storage) const noexcept {
+    // A byte read of storage this worker owns, never a use of the object the runtime placed in
+    // it: after `destroy_native_run_context` that object's lifetime has ended, and only the raw
+    // bytes remain. Zero is the tag that call leaves behind; the canonical value means it never
+    // ran; anything else is a partially torn-down or corrupted tag and is never treated as either.
+    if (storage == nullptr) return RunStorageTag::Noncanonical;
+    uint64_t tag = 0;
+    std::memcpy(&tag, storage, sizeof(tag));
+    if (tag == 0) return RunStorageTag::Destroyed;
+    if (tag == kNativeRunContextMagic) return RunStorageTag::Canonical;
+    return RunStorageTag::Noncanonical;
+}
+
+bool ChipWorker::native_run_op_admits_phase(NativeRunOp op, NativeRunPhase phase) {
+    switch (op) {
+    case NativeRunOp::Launch:
+        return phase == NativeRunPhase::PREPARED;
+    case NativeRunOp::Poll:
+    case NativeRunOp::Wait:
+        return phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED;
+    case NativeRunOp::Finalize:
+        return phase == NativeRunPhase::PREPARED || phase == NativeRunPhase::LAUNCHED ||
+               phase == NativeRunPhase::REAPED;
+    case NativeRunOp::Probe:
+        return phase == NativeRunPhase::LAUNCHED;
+    case NativeRunOp::Predecessor:
+        // Only a run still executing is something to be ordered behind. A reaped one is already
+        // over, so the ordinary launch is both correct and cheaper.
+        return phase == NativeRunPhase::LAUNCHED;
+    case NativeRunOp::ProbeSuccessor:
+        // The retention probe launches and drains this one itself, so it takes it unlaunched.
+        return phase == NativeRunPhase::PREPARED;
+    }
+    return false;
+}
+
+ChipWorker::NativeRunLease
+ChipWorker::inspect_native_run_locked(const ChipWorkerNativeRun &run, NativeRunOp op, NativeRunEntry **entry_out) {
+    const auto it = native_runs_.find(run.run_epoch);
+    if (it == native_runs_.end()) return NativeRunLease::Absent;
+    NativeRunEntry &entry = *it->second;
+    if (entry.destruction_unknown) return NativeRunLease::Stale;
+    if (entry.lease_generation != run.generation || entry.slot_id != run.slot_id) return NativeRunLease::Stale;
+    // The already-finished answer, taken before a lease and before anything can block: a completed
+    // run's poll and wait are satisfied by the recorded fact.
+    if ((op == NativeRunOp::Poll || op == NativeRunOp::Wait) && entry.phase == NativeRunPhase::REAPED) {
+        return NativeRunLease::AlreadyComplete;
+    }
+    if (!native_run_op_admits_phase(op, entry.phase)) return NativeRunLease::Stale;
+    if (entry.finalize_reserved) return NativeRunLease::Reserved;
+    if (entry.ops_in_flight != 0) return NativeRunLease::Busy;
+    if (entry_out != nullptr) *entry_out = &entry;
+    return NativeRunLease::Acquired;
+}
+
+ChipWorker::NativeRunLease ChipWorker::acquire_native_run_op(
+    const ChipWorkerNativeRun &run, NativeRunOp op, void **storage_out, NativeRunPhase *phase_out,
+    NativeRunOpLease *lease_out
+) {
+    std::unique_lock<std::mutex> lk(native_run_mu_);
+    for (;;) {
+        // Revalidated from scratch here and after every wake: the wait releases this mutex, so a
+        // finalizer may reserve the run and the operation ahead may remove it. Nothing but the
+        // epoch is carried across the release.
+        NativeRunEntry *entry = nullptr;
+        const NativeRunLease result = inspect_native_run_locked(run, op, &entry);
+        if (result == NativeRunLease::Busy && op != NativeRunOp::Poll) {
+            native_run_ops_done_.wait(lk);
+            continue;
+        }
+        if (result != NativeRunLease::Acquired) return result;
+        entry->ops_in_flight = 1;
+        if (phase_out != nullptr) *phase_out = entry->phase;
+        if (storage_out != nullptr) *storage_out = runtime_bufs_[entry->slot_id].data();
+        if (lease_out != nullptr) *lease_out = NativeRunOpLease(this, run.run_epoch);
+        return NativeRunLease::Acquired;
+    }
+}
+
+ChipWorker::NativeRunLease ChipWorker::acquire_native_run_pair(
+    const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor, NativeRunOp op, void **storage_out,
+    void **predecessor_storage_out, NativeRunOpLease *lease_out, NativeRunOpLease *predecessor_lease_out, LeaseWait wait
+) {
+    if (run.run_epoch == predecessor.run_epoch) return NativeRunLease::Stale;
+    std::unique_lock<std::mutex> lk(native_run_mu_);
+    for (;;) {
+        NativeRunEntry *entry = nullptr;
+        NativeRunEntry *ahead = nullptr;
+        // Both are decided under one hold of the mutex, so neither can change between them, and
+        // both leases are taken together or not at all.
+        const NativeRunLease own = inspect_native_run_locked(run, op, &entry);
+        const NativeRunLease other = inspect_native_run_locked(
+            predecessor, op == NativeRunOp::ProbeSuccessor ? NativeRunOp::Probe : NativeRunOp::Predecessor, &ahead
+        );
+        if (own == NativeRunLease::Busy || other == NativeRunLease::Busy) {
+            if (wait == LeaseWait::Immediate) return NativeRunLease::Busy;
+            native_run_ops_done_.wait(lk);
+            continue;
+        }
+        if (own != NativeRunLease::Acquired) return own;
+        if (other != NativeRunLease::Acquired) return other;
+        entry->ops_in_flight = 1;
+        ahead->ops_in_flight = 1;
+        *lease_out = NativeRunOpLease(this, run.run_epoch);
+        *predecessor_lease_out = NativeRunOpLease(this, predecessor.run_epoch);
+        if (storage_out != nullptr) *storage_out = runtime_bufs_[entry->slot_id].data();
+        if (predecessor_storage_out != nullptr) *predecessor_storage_out = runtime_bufs_[ahead->slot_id].data();
+        return NativeRunLease::Acquired;
+    }
+}
+
+void ChipWorker::release_native_run_op(uint64_t run_epoch) noexcept {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    const auto it = native_runs_.find(run_epoch);
+    if (it != native_runs_.end()) it->second->ops_in_flight = 0;
+    native_run_ops_done_.notify_all();
+}
+
+[[noreturn]] void
+ChipWorker::throw_native_run_lease_error(const ChipWorkerNativeRun &run, NativeRunLease lease, const char *operation) {
+    if (lease == NativeRunLease::Reserved) {
         throw std::runtime_error(
-            "launch_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
+            std::string(operation) + ": another finalization is in progress " + format_native_run_identity(run)
         );
     }
+    throw std::runtime_error(
+        std::string(operation) + ": native-run token is stale or used in the wrong phase " +
+        format_native_run_identity(run)
+    );
+}
+
+void ChipWorker::note_native_run_launched(uint64_t run_epoch) noexcept {
     std::lock_guard<std::mutex> lk(native_run_mu_);
-    NativeRunSlotState &state = native_run_states_[run.slot_id];
-    state.phase = NativeRunPhase::LAUNCHED;
+    const auto it = native_runs_.find(run_epoch);
+    if (it != native_runs_.end()) it->second->phase = NativeRunPhase::LAUNCHED;
+}
+
+void ChipWorker::note_native_run_completion(uint64_t run_epoch, int rc) noexcept {
+    // The execution fact, written whether or not a finalizer has reserved this run: completion
+    // and the error it carries are what the run established, not a phase a reservation may hold.
+    // A reservation that froze them would make a later finalize repeat a wait that already ran.
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    const auto it = native_runs_.find(run_epoch);
+    if (it == native_runs_.end()) return;
+    NativeRunEntry &entry = *it->second;
+    entry.phase = NativeRunPhase::REAPED;
+    if (rc != 0 && !entry.pending_rc_set) {
+        entry.pending_rc = rc;
+        entry.pending_rc_set = true;
+    }
+}
+
+void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream) {
+    validate_execution_context();
+    if (run.slot_id >= runtime_bufs_.size()) {
+        throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
+    }
+    // Validated before the lease: the check is about the caller's stream, not
+    // about this run, and a refusal should not have held a run's lease to reach.
+    if (caller_stream != nullptr) validate_caller_stream(caller_stream);
+    void *storage = nullptr;
+    NativeRunOpLease held;
+    const NativeRunLease lease = acquire_native_run_op(run, NativeRunOp::Launch, &storage, nullptr, &held);
+    if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "launch_native_run");
+
+    int rc = 0;
+    std::exception_ptr failure;
+    try {
+        // Both entries take the storage the lease handed out, which is what keeps
+        // the carrier alive for the duration of the call — a caller-stream launch
+        // dereferences it exactly as the ordinary one does.
+        rc = caller_stream != nullptr ? launch_run_on_stream_fn_(device_ctx_, storage, caller_stream, nullptr) :
+                                        launch_run_fn_(device_ctx_, storage);
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    if (failure == nullptr && rc != 0) {
+        // A launch that failed may still have reached the device. The probe decides which, and
+        // the answer is an execution fact: a completed one carries this launch's own error into
+        // the record a later finalize reports, and an uncompleted one leaves the run preparable.
+        int poll_rc = 0;
+        try {
+            poll_rc = poll_run_fn_(device_ctx_, storage);
+        } catch (...) {
+            poll_rc = SIMPLER_NATIVE_RUN_POLL_ERROR;
+        }
+        if (poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
+            note_native_run_completion(run.run_epoch, rc);
+        }
+        failure = std::make_exception_ptr(
+            std::runtime_error(
+                "launch_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
+            )
+        );
+    } else if (failure == nullptr) {
+        note_native_run_launched(run.run_epoch);
+    }
+    if (failure != nullptr) std::rethrow_exception(failure);
 }
 
 bool ChipWorker::launch_native_run_joined(
@@ -1146,143 +1361,337 @@ bool ChipWorker::launch_native_run_joined(
 ) {
     validate_execution_context();
     if (!supports_joined_native_launch()) return false;
-    {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        if (run.slot_id >= runtime_bufs_.size() || predecessor.slot_id >= runtime_bufs_.size()) {
-            throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
-        }
-        if (run.slot_id == predecessor.slot_id) {
-            throw std::runtime_error("a native run cannot be ordered behind its own pipeline slot");
-        }
-        const NativeRunSlotState &state = native_run_states_[run.slot_id];
-        if (state.run_epoch != run.run_epoch || state.phase != NativeRunPhase::PREPARED) {
-            throw std::runtime_error("native-run token is stale or used in the wrong phase");
-        }
-        // The predecessor has to be executing for there to be anything to order
-        // behind. REAPED is excluded on purpose: its device work is already
-        // over, so the ordinary launch is both correct and cheaper.
-        const NativeRunSlotState &ahead = native_run_states_[predecessor.slot_id];
-        if (ahead.run_epoch != predecessor.run_epoch || ahead.phase != NativeRunPhase::LAUNCHED) return false;
+    if (run.slot_id >= runtime_bufs_.size() || predecessor.slot_id >= runtime_bufs_.size()) {
+        throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
     }
+    if (run.slot_id == predecessor.slot_id) {
+        throw std::runtime_error("a native run cannot be ordered behind its own pipeline slot");
+    }
+    // Both carriers are dereferenced by the call below, so both are leased. Holding only the
+    // successor's would leave the predecessor free to be finalized and its object destroyed while
+    // the joined entry is still reading it.
+    void *storage = nullptr;
+    void *predecessor_storage = nullptr;
+    NativeRunOpLease held;
+    NativeRunOpLease predecessor_held;
+    const NativeRunLease lease = acquire_native_run_pair(
+        run, predecessor, NativeRunOp::Launch, &storage, &predecessor_storage, &held, &predecessor_held,
+        LeaseWait::Block
+    );
+    // A predecessor that is no longer there, or no longer executing, is not an error: this run
+    // launches ordinarily once it reaches the front, which is what the backend's own refusal does.
+    if (lease == NativeRunLease::Absent || lease == NativeRunLease::Stale) return false;
+    if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "launch_native_run_joined");
 
-    if (caller_stream != nullptr) validate_caller_stream(caller_stream);
-    int rc =
-        caller_stream != nullptr ?
-            launch_run_on_stream_fn_(
-                device_ctx_, runtime_bufs_[run.slot_id].data(), caller_stream, runtime_bufs_[predecessor.slot_id].data()
-            ) :
-            launch_run_joined_fn_(
-                device_ctx_, runtime_bufs_[run.slot_id].data(), runtime_bufs_[predecessor.slot_id].data()
-            );
-    // The backend refuses this way when it cannot order the two right now, and
-    // it changes nothing when it does: the run is still prepared, and the caller
-    // launches it ordinarily once it reaches the front.
-    if (rc == PTO_RUNTIME_ERR_UNSUPPORTED) return false;
-    if (rc != 0) {
-        int poll_rc = poll_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        NativeRunSlotState &state = native_run_states_[run.slot_id];
-        state.phase = poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? NativeRunPhase::REAPED : NativeRunPhase::PREPARED;
-        state.wait_rc = poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE ? rc : 0;
-        throw std::runtime_error(
-            "launch_native_run_joined failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
-        );
+    int rc = 0;
+    bool declined = false;
+    std::exception_ptr failure;
+    try {
+        // Both carriers come from the pair lease, so a concurrent finalization of
+        // either cannot destroy one under this call — which the caller-stream
+        // entry needs as much as the joined one, since it reads both.
+        rc = caller_stream != nullptr ?
+                 launch_run_on_stream_fn_(device_ctx_, storage, caller_stream, predecessor_storage) :
+                 launch_run_joined_fn_(device_ctx_, storage, predecessor_storage);
+    } catch (...) {
+        failure = std::current_exception();
     }
-    std::lock_guard<std::mutex> lk(native_run_mu_);
-    native_run_states_[run.slot_id].phase = NativeRunPhase::LAUNCHED;
-    return true;
+    // The backend refuses this way when it cannot order the two right now, and it changes nothing
+    // when it does: the run is still prepared, and the caller launches it ordinarily once it
+    // reaches the front.
+    if (failure == nullptr && rc == PTO_RUNTIME_ERR_UNSUPPORTED) {
+        declined = true;
+    } else if (failure == nullptr && rc != 0) {
+        int poll_rc = 0;
+        try {
+            poll_rc = poll_run_fn_(device_ctx_, storage);
+        } catch (...) {
+            poll_rc = SIMPLER_NATIVE_RUN_POLL_ERROR;
+        }
+        if (poll_rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
+            note_native_run_completion(run.run_epoch, rc);
+        }
+        failure = std::make_exception_ptr(
+            std::runtime_error(
+                "launch_native_run_joined failed with code " + std::to_string(rc) + " " +
+                format_native_run_identity(run)
+            )
+        );
+    } else if (failure == nullptr) {
+        note_native_run_launched(run.run_epoch);
+    }
+    if (failure != nullptr) std::rethrow_exception(failure);
+    return !declined;
 }
 
 bool ChipWorker::poll_native_run(const ChipWorkerNativeRun &run) {
     validate_execution_context();
-    {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        if (run.slot_id >= runtime_bufs_.size()) {
-            throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
-        }
-        const NativeRunSlotState &state = native_run_states_[run.slot_id];
-        if (state.run_epoch != run.run_epoch ||
-            (state.phase != NativeRunPhase::LAUNCHED && state.phase != NativeRunPhase::REAPED)) {
-            throw std::runtime_error("native-run token is stale or used in the wrong phase");
-        }
-        if (state.phase == NativeRunPhase::REAPED) return true;
+    if (run.slot_id >= runtime_bufs_.size()) {
+        throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
     }
-    int rc = poll_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
-    if (rc == SIMPLER_NATIVE_RUN_POLL_NOT_READY) {
-        return false;
+    void *storage = nullptr;
+    NativeRunOpLease held;
+    const NativeRunLease lease = acquire_native_run_op(run, NativeRunOp::Poll, &storage, nullptr, &held);
+    // Completion already established answers the question without a device call. A run another
+    // operation is inside reads as "not yet": a poll reports progress and never holds a thread.
+    if (lease == NativeRunLease::AlreadyComplete) return true;
+    if (lease == NativeRunLease::Busy) return false;
+    if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "poll_native_run");
+
+    int rc = SIMPLER_NATIVE_RUN_POLL_ERROR;
+    std::exception_ptr failure;
+    try {
+        rc = poll_run_fn_(device_ctx_, storage);
+    } catch (...) {
+        failure = std::current_exception();
     }
-    if (rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        NativeRunSlotState &state = native_run_states_[run.slot_id];
-        state.phase = NativeRunPhase::REAPED;
-        return true;
+    // Zero is "not ready" and one is "complete"; a complete poll carries no error, so nothing of
+    // its value reaches the record a finalize reports. Every other value is this poll's failure.
+    if (failure == nullptr && rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE) {
+        note_native_run_completion(run.run_epoch, 0);
+    } else if (failure == nullptr && rc != SIMPLER_NATIVE_RUN_POLL_NOT_READY) {
+        failure = std::make_exception_ptr(
+            std::runtime_error(
+                "poll_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
+            )
+        );
     }
-    throw std::runtime_error(
-        "poll_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
-    );
+    if (failure != nullptr) std::rethrow_exception(failure);
+    return rc == SIMPLER_NATIVE_RUN_POLL_COMPLETE;
 }
 
 void ChipWorker::wait_native_run(const ChipWorkerNativeRun &run) {
     validate_execution_context();
-    {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        if (run.slot_id >= runtime_bufs_.size()) {
-            throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
-        }
-        const NativeRunSlotState &state = native_run_states_[run.slot_id];
-        if (state.run_epoch != run.run_epoch ||
-            (state.phase != NativeRunPhase::LAUNCHED && state.phase != NativeRunPhase::REAPED)) {
-            throw std::runtime_error("native-run token is stale or used in the wrong phase");
-        }
-        if (state.phase == NativeRunPhase::REAPED) return;
+    if (run.slot_id >= runtime_bufs_.size()) {
+        throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
     }
-    int wait_rc = wait_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
-    std::lock_guard<std::mutex> lk(native_run_mu_);
-    NativeRunSlotState &state = native_run_states_[run.slot_id];
-    state.wait_rc = wait_rc;
-    state.phase = NativeRunPhase::REAPED;
+    void *storage = nullptr;
+    NativeRunOpLease held;
+    const NativeRunLease lease = acquire_native_run_op(run, NativeRunOp::Wait, &storage, nullptr, &held);
+    if (lease == NativeRunLease::AlreadyComplete) return;
+    if (lease != NativeRunLease::Acquired) throw_native_run_lease_error(run, lease, "wait_native_run");
+
+    int wait_rc = 0;
+    std::exception_ptr failure;
+    try {
+        wait_rc = wait_run_fn_(device_ctx_, storage);
+    } catch (...) {
+        failure = std::current_exception();
+    }
+    // A wait that returned establishes completion whatever its code says, and the code is the
+    // error a later finalize reports. A wait that threw established nothing, so the run keeps the
+    // phase it had and this call's own exception is what the caller sees.
+    if (failure == nullptr) note_native_run_completion(run.run_epoch, wait_rc);
+    if (failure != nullptr) std::rethrow_exception(failure);
 }
 
 void ChipWorker::finalize_native_run(const ChipWorkerNativeRun &run) {
     validate_execution_context();
-    NativeRunPhase phase;
-    int wait_rc;
-    {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        if (run.slot_id >= runtime_bufs_.size()) {
-            throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
-        }
-        NativeRunSlotState &state = native_run_states_[run.slot_id];
-        if (state.run_epoch != run.run_epoch ||
-            (state.phase != NativeRunPhase::PREPARED && state.phase != NativeRunPhase::LAUNCHED &&
-             state.phase != NativeRunPhase::REAPED)) {
-            throw std::runtime_error("native-run token is stale or already finalized");
-        }
-        phase = state.phase;
-        wait_rc = state.wait_rc;
-        state.phase = NativeRunPhase::FINALIZING;
+    if (run.slot_id >= runtime_bufs_.size()) {
+        throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
     }
-
-    try {
-        if (phase == NativeRunPhase::LAUNCHED) {
-            wait_rc = wait_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
-        }
-    } catch (...) {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        native_run_states_[run.slot_id].phase = phase;
-        throw;
-    }
-    int finalize_rc = finalize_run_fn_(device_ctx_, runtime_bufs_[run.slot_id].data());
-    {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        native_run_states_[run.slot_id] = NativeRunSlotState{};
-    }
-    int rc = finalize_rc != 0 ? finalize_rc : wait_rc;
-    if (rc != 0) {
+    const NativeRunFinalizeOutcome outcome = finalize_native_run_epoch(run.run_epoch, &run, FinalizeMode::Caller);
+    // The original exception outranks any reason this call could name for it: it is what actually
+    // happened, and replacing it would discard the runtime's own account of the failure.
+    if (outcome.captured != nullptr) std::rethrow_exception(outcome.captured);
+    switch (outcome.fault) {
+    case FinalizeFault::None:
+        return;
+    case FinalizeFault::Stale:
         throw std::runtime_error(
-            "finalize_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run)
+            "finalize_native_run: native-run token is stale or already finalized " + format_native_run_identity(run)
+        );
+    case FinalizeFault::Reserved:
+        throw std::runtime_error(
+            "finalize_native_run: another finalization is in progress " + format_native_run_identity(run)
+        );
+    case FinalizeFault::NonDestroying:
+        throw std::runtime_error(
+            "finalize_native_run returned success without destroying the run context " + format_native_run_identity(run)
+        );
+    case FinalizeFault::UnknownDestruction:
+        throw std::runtime_error(
+            "finalize_native_run left the run context in an unknown state " + format_native_run_identity(run)
+        );
+    case FinalizeFault::Failed:
+        throw std::runtime_error(
+            "finalize_native_run failed with code " + std::to_string(outcome.rc) + " " + format_native_run_identity(run)
         );
     }
+}
+
+void ChipWorker::clear_finalize_reservation_noexcept(uint64_t run_epoch) noexcept {
+    try {
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        const auto it = native_runs_.find(run_epoch);
+        if (it != native_runs_.end()) it->second->finalize_reserved = false;
+        native_run_ops_done_.notify_all();
+    } catch (...) {
+        // The reservation stands and the run stays unreachable to every other operation, which is
+        // the isolated state this would otherwise have to reach by a path that can also fail.
+    }
+}
+
+/**
+ * The one finalization protocol, shared by the caller's finalize and by teardown.
+ *
+ * Nothing in here allocates: every reason it can report is an enumerator and a code, every
+ * exception it can meet is either the runtime's own — captured, which `std::current_exception` does
+ * without allocating — or the bookkeeping mutex's, which is caught and leaves the reservation
+ * disposed of either way. Teardown differs in exactly two ways, both stated below: it identifies
+ * the run by epoch alone, and it never leaves a run eligible for another attempt.
+ */
+ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
+    uint64_t run_epoch, const ChipWorkerNativeRun *token, FinalizeMode mode
+) noexcept {
+    const bool teardown = mode == FinalizeMode::Teardown;
+    NativeRunFinalizeOutcome outcome;
+    void *storage = nullptr;
+    bool reserved = false;
+    try {
+        std::unique_lock<std::mutex> lk(native_run_mu_);
+        const auto found = native_runs_.find(run_epoch);
+        if (found == native_runs_.end() || found->second->destruction_unknown ||
+            (token != nullptr &&
+             (found->second->lease_generation != token->generation || found->second->slot_id != token->slot_id)) ||
+            !native_run_op_admits_phase(NativeRunOp::Finalize, found->second->phase)) {
+            if (!teardown) outcome.fault = FinalizeFault::Stale;
+            return outcome;
+        }
+        // Exactly one finalizer, decided here and independently of the run's execution phase. The
+        // phase itself is left alone: an operation finishing during the drain below still has to
+        // be able to advance it, and overwriting it is what would make this call repeat a wait
+        // that already ran and discard its error.
+        if (found->second->finalize_reserved) {
+            if (!teardown) outcome.fault = FinalizeFault::Reserved;
+            return outcome;
+        }
+        found->second->finalize_reserved = true;
+        reserved = true;
+
+        // Drain whatever operation is already inside the runtime for this run. The wait releases
+        // this mutex so that operation can reach its own tail, and the reservation above stops a
+        // new one starting. Re-looked-up after every wake, never carried.
+        for (;;) {
+            const auto current = native_runs_.find(run_epoch);
+            if (current == native_runs_.end()) return outcome;
+            if (current->second->ops_in_flight == 0) {
+                storage = runtime_bufs_[current->second->slot_id].data();
+                break;
+            }
+            native_run_ops_done_.wait(lk);
+        }
+    } catch (...) {
+        // The bookkeeping mutex or the drain wait failed. The run never reached the runtime, so it
+        // is certainly intact; the reservation this call took is given back so another finalization
+        // can still close it.
+        outcome.captured = std::current_exception();
+        if (reserved) clear_finalize_reservation_noexcept(run_epoch);
+        return outcome;
+    }
+
+    // Read after the drain, not before it: an operation that completed while this call was
+    // waiting established completion and may have recorded the error this call has to report.
+    NativeRunPhase phase = NativeRunPhase::PREPARED;
+    int persisted_rc = 0;
+    bool persisted = false;
+    try {
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        const auto it = native_runs_.find(run_epoch);
+        if (it == native_runs_.end()) return outcome;
+        phase = it->second->phase;
+        persisted_rc = it->second->pending_rc;
+        persisted = it->second->pending_rc_set;
+    } catch (...) {
+        outcome.captured = std::current_exception();
+        clear_finalize_reservation_noexcept(run_epoch);
+        return outcome;
+    }
+    // Only a run still launched has a device wait outstanding; one already reaped had its wait,
+    // and its error is the persisted one rather than anything this call would produce.
+    const bool needs_wait = phase == NativeRunPhase::LAUNCHED && wait_run_fn_ != nullptr;
+
+    bool entered_finalize = false;
+    int finalize_rc = 0;
+
+    // This call's own wait records its outcome where every other operation records one, and before
+    // the teardown below can run. A later call on a retained handle then reads completion and this
+    // error instead of waiting again and replacing it.
+    if (needs_wait) {
+        int wait_rc = 0;
+        try {
+            wait_rc = wait_run_fn_(device_ctx_, storage);
+        } catch (...) {
+            outcome.captured = std::current_exception();
+        }
+        if (outcome.captured == nullptr) {
+            note_native_run_completion(run_epoch, wait_rc);
+            if (wait_rc != 0) {
+                persisted_rc = wait_rc;
+                persisted = true;
+            }
+        }
+    }
+
+    if (outcome.captured == nullptr) {
+        entered_finalize = true;
+        try {
+            finalize_rc = finalize_run_fn_(device_ctx_, storage);
+        } catch (...) {
+            outcome.captured = std::current_exception();
+        }
+    }
+
+    // The tag is only meaningful for a call that returned. A throw out of the teardown says
+    // nothing about how far it got — it may already have released resources while the tag still
+    // reads as a live context — so that case is isolated rather than offered for a retry.
+    const RunStorageTag tag = entered_finalize ? read_run_storage_tag(storage) : RunStorageTag::Canonical;
+    const bool threw = outcome.captured != nullptr;
+    try {
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        const auto it = native_runs_.find(run_epoch);
+        if (it != native_runs_.end()) {
+            NativeRunEntry &entry = *it->second;
+            if (tag == RunStorageTag::Destroyed && !threw) {
+                native_runs_.erase(it);
+            } else if (!entered_finalize && !teardown) {
+                // The wait threw: the teardown was never reached, so the run is certainly intact
+                // and may be finalized again. Its phase is left as it stands rather than restored
+                // from the pre-wait capture — anything recorded since is an established fact.
+                entry.finalize_reserved = false;
+            } else if (tag == RunStorageTag::Canonical && !threw && finalize_rc != 0 && !teardown) {
+                // The context refusal: the run is intact and this caller may try again on a valid
+                // context. The phase keeps what the wait recorded, so that retry reads completion
+                // and the persisted error instead of waiting a second time.
+                entry.finalize_reserved = false;
+            } else {
+                // Everything else leaves teardown progress unknown, and teardown mode treats every
+                // non-destroyed outcome this way so a refused run cannot be attempted forever.
+                // Nothing further reaches this run and nothing it holds is recycled.
+                entry.destruction_unknown = true;
+                entry.finalize_reserved = false;
+                if (!threw && finalize_rc == 0 && !persisted) {
+                    outcome.fault = tag == RunStorageTag::Canonical ? FinalizeFault::NonDestroying :
+                                                                      FinalizeFault::UnknownDestruction;
+                }
+            }
+        }
+        native_run_ops_done_.notify_all();
+    } catch (...) {
+        // The outcome above is what the runtime established and is reported unchanged; only this
+        // call's own bookkeeping failed, and a reservation left behind isolates the run rather
+        // than offering it to a second teardown.
+        if (!threw) outcome.captured = std::current_exception();
+        return outcome;
+    }
+
+    if (threw || outcome.fault != FinalizeFault::None) return outcome;
+    const int rc = finalize_rc != 0 ? finalize_rc : (persisted ? persisted_rc : 0);
+    if (rc != 0) {
+        outcome.fault = FinalizeFault::Failed;
+        outcome.rc = rc;
+    }
+    return outcome;
 }
 
 RunRetentionProbeReport ChipWorker::probe_run_retention(
@@ -1295,36 +1704,36 @@ RunRetentionProbeReport ChipWorker::probe_run_retention(
         );
     }
     const bool want_successor = config.launch_successor != 0;
-    {
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        if (run.slot_id >= runtime_bufs_.size()) {
-            throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
-        }
-        const NativeRunSlotState &state = native_run_states_[run.slot_id];
-        if (state.run_epoch != run.run_epoch || state.phase != NativeRunPhase::LAUNCHED) {
-            throw std::runtime_error(
-                "probe_run_retention needs a launched, undrained predecessor " + format_native_run_identity(run)
-            );
-        }
-        if (want_successor) {
-            if (successor.slot_id >= runtime_bufs_.size() || successor.slot_id == run.slot_id) {
-                throw std::runtime_error("probe_run_retention needs the successor on a different pipeline slot");
-            }
-            const NativeRunSlotState &next = native_run_states_[successor.slot_id];
-            if (next.run_epoch != successor.run_epoch || next.phase != NativeRunPhase::PREPARED) {
-                throw std::runtime_error(
-                    "probe_run_retention needs a prepared, unlaunched successor " +
-                    format_native_run_identity(successor)
-                );
-            }
-        }
+    if (run.slot_id >= runtime_bufs_.size()) {
+        throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
+    }
+    if (want_successor && (successor.slot_id >= runtime_bufs_.size() || successor.slot_id == run.slot_id)) {
+        throw std::runtime_error("probe_run_retention needs the successor on a different pipeline slot");
+    }
+
+    // Leased like any other operation, and both runs when the fixture drives both: the call
+    // dereferences each carrier it is handed, so neither may be finalized underneath it. The lease
+    // also checks each token's generation, which this path did not.
+    void *storage = nullptr;
+    void *successor_storage = nullptr;
+    NativeRunOpLease held;
+    NativeRunOpLease successor_held;
+    const NativeRunLease lease = want_successor ?
+                                     acquire_native_run_pair(
+                                         successor, run, NativeRunOp::ProbeSuccessor, &successor_storage, &storage,
+                                         &successor_held, &held, LeaseWait::Block
+                                     ) :
+                                     acquire_native_run_op(run, NativeRunOp::Probe, &storage, nullptr, &held);
+    if (lease != NativeRunLease::Acquired) {
+        throw std::runtime_error(
+            "probe_run_retention needs a launched, undrained predecessor and a prepared successor " +
+            format_native_run_identity(run)
+        );
     }
 
     RunRetentionProbeReport report{};
-    const int rc = probe_run_retention_fn_(
-        device_ctx_, runtime_bufs_[run.slot_id].data(),
-        want_successor ? runtime_bufs_[successor.slot_id].data() : nullptr, &config, &report
-    );
+    const int rc =
+        probe_run_retention_fn_(device_ctx_, storage, want_successor ? successor_storage : nullptr, &config, &report);
     if (rc != 0) {
         throw std::runtime_error(
             "probe_run_retention refused its arguments with code " + std::to_string(rc) + " " +
@@ -1336,10 +1745,10 @@ RunRetentionProbeReport ChipWorker::probe_run_retention(
         // would have left it. The predecessor stays LAUNCHED on purpose: its
         // drain, copy-back and DFX teardown are the production path, and
         // finalize reaches all three from that phase.
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        NativeRunSlotState &next = native_run_states_[successor.slot_id];
-        next.wait_rc = report.successor_launch_rc != 0 ? report.successor_launch_rc : report.successor_drain_rc;
-        next.phase = NativeRunPhase::REAPED;
+        note_native_run_completion(
+            successor.run_epoch,
+            report.successor_launch_rc != 0 ? report.successor_launch_rc : report.successor_drain_rc
+        );
     }
     return report;
 }
@@ -1348,25 +1757,56 @@ void ChipWorker::cleanup_native_runs_noexcept() noexcept {
     if (device_ctx_ == nullptr || finalize_run_fn_ == nullptr) {
         return;
     }
-    for (size_t slot_id = 0; slot_id < runtime_bufs_.size(); ++slot_id) {
-        NativeRunPhase phase;
+    // One eligible run at a time, re-found under the lock each round: no container is built, so
+    // this path allocates nothing, and the finalization below is the same protocol a caller's
+    // finalize runs. Progress is guaranteed because teardown mode leaves every run it touches
+    // either gone or isolated, so no run can be selected twice.
+    for (;;) {
+        uint64_t run_epoch = 0;
+        bool found = false;
         {
             std::lock_guard<std::mutex> lk(native_run_mu_);
-            NativeRunSlotState &state = native_run_states_[slot_id];
-            phase = state.phase;
-            if (phase == NativeRunPhase::EMPTY) continue;
-            if (phase == NativeRunPhase::PREPARING || phase == NativeRunPhase::FINALIZING) {
-                continue;
+            for (const auto &candidate : native_runs_) {
+                const NativeRunEntry &entry = *candidate.second;
+                if (entry.destruction_unknown || entry.finalize_reserved) continue;
+                if (!native_run_op_admits_phase(NativeRunOp::Finalize, entry.phase)) continue;
+                run_epoch = candidate.first;
+                found = true;
+                break;
             }
-            state.phase = NativeRunPhase::FINALIZING;
         }
-        if (phase == NativeRunPhase::LAUNCHED && wait_run_fn_ != nullptr) {
-            (void)wait_run_fn_(device_ctx_, runtime_bufs_[slot_id].data());
-        }
-        (void)finalize_run_fn_(device_ctx_, runtime_bufs_[slot_id].data());
-        std::lock_guard<std::mutex> lk(native_run_mu_);
-        native_run_states_[slot_id] = NativeRunSlotState{};
+        if (!found) break;
+        // The outcome is dropped: there is no caller left to report it to, and it is already
+        // recorded against the run it belongs to.
+        (void)finalize_native_run_epoch(run_epoch, nullptr, FinalizeMode::Teardown);
     }
+}
+
+size_t ChipWorker::abandon_unproven_native_run_storage() noexcept {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    size_t abandoned = 0;
+    for (const auto &entry : native_runs_) {
+        const uint32_t slot = entry.second->slot_id;
+        if (slot >= runtime_bufs_.size()) continue;
+        if (runtime_bufs_[slot].data() == nullptr) continue;  // already abandoned by an earlier close
+        runtime_bufs_[slot].abandon();
+        ++abandoned;
+        std::fprintf(
+            stderr,
+            "ChipWorker: abandoning the run storage of set %u; its carrier could not be proved destroyed, so the "
+            "block is not returned to the allocator\n",
+            slot
+        );
+    }
+    return abandoned;
+}
+
+size_t ChipWorker::unproven_native_run_count() const noexcept {
+    // Every run whose destruction was proved is erased from this map by the finalization that
+    // proved it, so whatever is left after a teardown sweep is exactly what could not be closed —
+    // isolated, reserved by a finalization still running, or never past preparation.
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    return native_runs_.size();
 }
 
 void ChipWorker::unregister_callable(int32_t callable_id) {

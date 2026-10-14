@@ -24,7 +24,7 @@
 #include <vector>
 
 #include "call_config.h"
-#include "pipeline_slot_pool.h"
+#include "run_resource_arena.h"
 #include "runtime_c_api.h"
 #include "task_args.h"
 #include "types.h"
@@ -132,6 +132,10 @@ void prime_worker(ChipWorker &worker) {
     g_events.clear();
     worker.initialized_ = true;
     worker.pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 2, {}};
+    // One generation per granted set, as `init` sizes it: an unsized filter has no entry for
+    // slot 0, and `is_admissible` refuses a lease outside it, so every preparation would be
+    // refused as stale before reaching the stubs below.
+    worker.pipeline_generations_.resize(2);
     worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
     worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
     for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {

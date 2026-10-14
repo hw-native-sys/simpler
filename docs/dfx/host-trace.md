@@ -566,11 +566,11 @@ held per pipeline slot and published to the resident collector at launch, so a
 level-4 run can overlap without resetting its predecessor's records.
 
 Staging has three inputs and only that one is reachable from a submission. The
-other two — the runtime PipelineContract's `pipeline_depth` and the runtime's
-concurrent-prepare capability symbol — are compile-time properties: every onboard
-runtime declares depth 2 (`PTO_PIPELINE_MAX_DEPTH` is 2) and returns 1 from the
-capability impl, while the sim platform hardcodes 0, so overlap never happens
-under simulation. Because neither is configurable, being unable to stage a
+other two — the granted run-resource depth and the runtime's concurrent-prepare
+capability symbol — are not reachable from a submission either: every onboard
+runtime declares no depth limit and returns 1 from the capability impl, and an
+unconfigured Worker is granted the standing default of two, while the sim
+platform hardcodes 0 so overlap never happens under simulation. Because neither is configurable, being unable to stage a
 successor is a **failure** in the scene test rather than a skip — a skip would
 report green for the one state in which the property cannot hold. The platform
 gate runs first, so the sim path never reaches that assert.

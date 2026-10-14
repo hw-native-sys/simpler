@@ -28,9 +28,14 @@
  * Serviceability and runtime-specific resource sets are checked separately.
  *
  * Rejects a contract whose ABI version is not the one compiled in, that
- * declares more resources than fit, that asks for a pipeline depth outside
- * the supported range, or whose resources carry an unspecified or out-of-range kind, an
- * out-of-range class, or a byte count incompatible with the mode and resource class.
+ * declares more resources than fit, that declares no pipeline depth at all, or
+ * whose resources carry an unspecified or out-of-range kind, an out-of-range
+ * class, or a byte count incompatible with the mode and resource class.
+ *
+ * There is no upper bound on `pipeline_depth`: it is what a runtime says it can
+ * support, and how much of that a context uses is the worker's grant. Every
+ * owner of a per-run resource is sized to that grant, so a declaration above any
+ * particular number costs nothing until a run holds the set.
  *
  * The unspecified-kind rule is what catches a `resource_count` larger than the
  * entries a runtime actually filled in: the trailing entries are still zeroed,
@@ -41,8 +46,7 @@
 inline bool is_valid_pipeline_contract(const PipelineContract *contract, uint32_t mode) {
     if ((mode != SIMPLER_MODE_PROGRAM && mode != SIMPLER_MODE_KERNEL) || contract == nullptr ||
         contract->abi_version != PTO_PIPELINE_CONTRACT_ABI_VERSION ||
-        contract->resource_count > PTO_PIPELINE_MAX_RESOURCES || contract->pipeline_depth == 0 ||
-        contract->pipeline_depth > PTO_PIPELINE_MAX_DEPTH) {
+        contract->resource_count > PTO_PIPELINE_MAX_RESOURCES || contract->pipeline_depth == 0) {
         return false;
     }
     for (uint32_t i = 0; i < contract->resource_count; ++i) {

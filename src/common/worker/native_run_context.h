@@ -20,6 +20,7 @@
 #include "common/host_api.h"
 #include "native_run_execution.h"
 #include "native_run_phase.h"
+#include "native_run_storage_tag.h"
 #include "runtime_c_api.h"
 #include "runtime.h"
 
@@ -31,7 +32,7 @@
  */
 template <typename Runner>
 struct NativeRunContext {
-    static constexpr uint64_t kMagic = UINT64_C(0x534d504c52554e31);  // "SMPLRUN1"
+    static constexpr uint64_t kMagic = kNativeRunContextMagic;
 
     NativeRunContext(
         Runner *runner_in, const CallConfig &config_in, uint64_t trace_hid_in, const NativeRunDescriptor &descriptor_in,

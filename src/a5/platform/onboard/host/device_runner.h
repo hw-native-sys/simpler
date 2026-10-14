@@ -237,6 +237,18 @@ private:
     // check relies on.
     RunProgressSlots run_progress_;
 
+protected:
+    /** The progress table holds one slot per run-resource set. */
+    ArchRunResourceStaging build_arch_run_resources(size_t granted) override {
+        ArchRunResourceStaging staged;
+        staged.run_progress = RunProgressSlots::build(granted);
+        return staged;
+    }
+    void commit_arch_run_resources(ArchRunResourceStaging &&staged) noexcept override {
+        run_progress_.commit(std::move(staged.run_progress));
+    }
+
+private:
     // Queue this run's own AICore boundary into the AICPU stream, ahead of the
     // AICPU boundary record that then covers the whole operator. The reservation
     // is taken by the caller, so a refusal costs only joinability; this is the

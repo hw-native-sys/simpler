@@ -75,7 +75,7 @@ inline void log_boundary_failure(const char *what_failed, const std::exception_p
  */
 template <typename PublishHostState>
 void close_run_boundary(
-    ChipSwimlaneCollector &collector, uint64_t run_epoch, uint32_t pipeline_slot, bool device_execution_complete,
+    ChipSwimlaneCollector &collector, uint64_t run_epoch, bool device_execution_complete,
     PublishHostState &&publish_host_state
 ) {
     std::exception_ptr publication_failure;
@@ -91,7 +91,7 @@ void close_run_boundary(
         log_boundary_failure("a run's host state did not fully publish", publication_failure);
     }
     try {
-        collector.run_close(run_epoch, pipeline_slot, device_execution_complete);
+        collector.run_close(run_epoch, device_execution_complete);
     } catch (...) {
         std::exception_ptr close_failure;
         try {

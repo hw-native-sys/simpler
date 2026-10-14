@@ -685,13 +685,16 @@ TEST(WorkspaceManagerLifecycle, TheContextsOwnBackingIsNoConsumerACloseMustWaitF
     EXPECT_EQ(m.reserved_bytes(), 0u);
 }
 
-TEST(WorkspaceManagerLifecycle, EveryRunResourceSetTheLayoutCarriesMayHoldAConsumerOfOneBlock) {
-    // The ledger is sized by the layout's slot count rather than by the capacity a context
-    // happened to grant, so a run in the last set has a record of its own and is counted like the
-    // others. A close waits for all of them: the block is unused only once the last one retires,
-    // and a run whose set is above the old two-slot bound must not read as already gone.
+TEST(WorkspaceManagerLifecycle, EveryGrantedRunResourceSetMayHoldAConsumerOfOneBlock) {
+    // The ledger is sized by the grant, with no width of its own, so a run in the last set has a
+    // record and is counted like the others however large that grant is. A close waits for all of
+    // them: the block is unused only once the last one retires, and a run whose set is above the
+    // old three-slot bound must neither read as already gone nor be refused a reference.
+    constexpr uint32_t kGranted = 9;
     FakeBackend backend;
     WorkspaceManager m;
+    ASSERT_TRUE(m.grant_is_replaceable());
+    m.commit(WorkspaceManager::build(kGranted));
     ASSERT_TRUE(m.configure(backend.ops()));
     ASSERT_TRUE(m.set_limit(kBudget));
     const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
@@ -699,14 +702,14 @@ TEST(WorkspaceManagerLifecycle, EveryRunResourceSetTheLayoutCarriesMayHoldAConsu
     ASSERT_NE(block, nullptr);
     m.note_published(region, block);
 
-    const uint32_t last_slot = PTO_PIPELINE_MAX_DEPTH - 1;
+    const uint32_t last_slot = kGranted - 1;
     for (uint32_t slot = 1; slot <= last_slot; ++slot) {
         ASSERT_TRUE(m.reference(block, 31 + slot)) << "slot " << slot << " could not reference the block";
     }
     for (uint32_t slot = 0; slot <= last_slot; ++slot) {
         m.note_run_fact(slot, 31 + slot, WorkspaceManager::RunFact::Launched);
     }
-    EXPECT_EQ(m.live_drainable_consumers(), PTO_PIPELINE_MAX_DEPTH);
+    EXPECT_EQ(m.live_drainable_consumers(), kGranted);
 
     for (uint32_t slot = 0; slot < last_slot; ++slot) {
         retire(m, slot, 31 + slot);

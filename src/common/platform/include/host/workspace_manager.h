@@ -17,6 +17,7 @@
 #include <mutex>
 #include <vector>
 
+#include "run_resource_arena.h"
 #include "runtime_c_api.h"
 
 /**
@@ -194,13 +195,13 @@ public:
      * References one block can carry at once.
      *
      * A reference is dropped when its run retires or when its run's context is
-     * destroyed, and a slot admits no new run until its previous one has been
+     * destroyed, and a set admits no new run until its previous one has been
      * finalized, so the live references on one block cannot outnumber the
-     * pipeline's slots. The two spare entries exist so that reaching the bound
-     * is a refusal rather than a truncation: a reference this manager cannot
-     * record is a reference it would silently stop protecting.
+     * granted run-resource sets. The two spare entries exist so that reaching
+     * the bound is a refusal rather than a truncation: a reference this manager
+     * cannot record is a reference it would silently stop protecting.
      */
-    static constexpr size_t kMaxBlockRefs = PTO_PIPELINE_MAX_DEPTH + 2;
+    size_t max_block_refs() const { return runs_.size() + 2; }
 
     /** The identity workspace requests made outside any run belong to. */
     static constexpr uint64_t kContextEpoch = 0;
@@ -208,6 +209,45 @@ public:
     WorkspaceManager() = default;
     WorkspaceManager(const WorkspaceManager &) = delete;
     WorkspaceManager &operator=(const WorkspaceManager &) = delete;
+
+    /** What one run has reported about its own retirement, per granted set. */
+    struct RunRecord {
+        uint64_t epoch{0};
+        bool launched{false};
+        bool drain_attempted{false};
+        bool drain_proved{false};
+        bool no_submission{false};
+        bool copyback_returned{false};
+        bool bindings_released{false};
+        bool context_destroyed{false};
+    };
+
+    using Storage = std::vector<RunRecord>;
+
+    /** Build per-set fact records for the grant, detached. May throw; mutates nothing. */
+    static Storage build(size_t granted) { return Storage(granted); }
+
+    /**
+     * Whether the fact records may be replaced at all.
+     *
+     * Refused once any run has reported a fact or any block exists: a record is
+     * found by the set index its run holds, and a block's reference capacity is
+     * derived from the same count.
+     */
+    bool grant_is_replaceable() const {
+        std::scoped_lock lk(mu_);
+        if (!blocks_.empty()) return false;
+        for (const RunRecord &r : runs_) {
+            if (r.epoch != 0) return false;
+        }
+        return true;
+    }
+
+    /** Adopt built records. Never throws, so a multi-owner grant cannot half-apply. */
+    void commit(Storage &&built) noexcept {
+        std::scoped_lock lk(mu_);
+        runs_.swap(built);
+    }
 
     /**
      * Why an acquire refused. Internal to the host: the caller turns it into
@@ -303,7 +343,7 @@ public:
             if (b.quarantined || b.release_unconfirmed) continue;
             if (b.bytes < bytes) continue;
             if (b.ref_count != 0) continue;  // capacity is not permission
-            if (!add_ref(b, run_epoch)) return refuse(why, AcquireRefusal::NotServing);
+            if (!add_ref(b, run_epoch, max_block_refs())) return refuse(why, AcquireRefusal::NotServing);
             // Handed out as this region's backing, so it stops being an
             // obsolete generation now rather than at publication: between the
             // two, growth elsewhere must not reclaim the block this plan is
@@ -339,7 +379,7 @@ public:
         // storage whose free was attempted and failed would let a run write
         // where the platform may already have reclaimed.
         if (b == nullptr || b->quarantined || b->release_unconfirmed) return false;
-        return add_ref(*b, run_epoch);
+        return add_ref(*b, run_epoch, max_block_refs());
     }
 
     /**
@@ -434,7 +474,7 @@ public:
      */
     void note_run_fact(uint32_t slot, uint64_t run_epoch, RunFact fact) {
         std::scoped_lock lk(mu_);
-        if (!enabled_ || slot >= PTO_PIPELINE_MAX_DEPTH) return;
+        if (!enabled_ || slot >= runs_.size()) return;
         RunRecord &r = runs_[slot];
         if (r.epoch != run_epoch) {
             // Run epochs are minted from one process-wide counter that only
@@ -726,7 +766,7 @@ private:
         BlockState state{BlockState::ProvenUnused};
         // Run epochs currently using this block. The region already pins which
         // consumer the block belongs to, so an epoch identifies a reference.
-        uint64_t refs[kMaxBlockRefs]{};
+        std::vector<uint64_t> refs;
         uint32_t ref_count{0};
         int release_rc{0};
         bool quarantined{false};
@@ -740,17 +780,6 @@ private:
         // Accounted for by a release or by the terminal sweep already. A second
         // close finds the same record and must not charge or credit it twice.
         bool swept{false};
-    };
-
-    struct RunRecord {
-        uint64_t epoch{0};
-        bool launched{false};
-        bool drain_attempted{false};
-        bool drain_proved{false};
-        bool no_submission{false};
-        bool copyback_returned{false};
-        bool bindings_released{false};
-        bool context_destroyed{false};
     };
 
     bool must_keep_locked(void *base) const noexcept {
@@ -814,19 +843,19 @@ private:
      * a destroyed context's are quarantined, so both drop out naturally.
      */
     uint32_t count_live_locked() const {
-        uint64_t counted[PTO_PIPELINE_MAX_DEPTH * kMaxBlockRefs] = {};
-        size_t counted_n = 0;
+        std::vector<uint64_t> counted;
+        counted.reserve(runs_.size() * max_block_refs());
         uint32_t live = 0;
         for (const Block &b : blocks_) {
             if (b.released) continue;
             for (uint32_t i = 0; i < b.ref_count; ++i) {
                 const uint64_t epoch = b.refs[i];
                 bool seen = false;
-                for (size_t j = 0; j < counted_n; ++j) {
-                    if (counted[j] == epoch) seen = true;
+                for (const uint64_t already : counted) {
+                    if (already == epoch) seen = true;
                 }
                 if (seen) continue;
-                if (counted_n < sizeof(counted) / sizeof(counted[0])) counted[counted_n++] = epoch;
+                counted.push_back(epoch);
                 const RunRecord *r = record_for_locked(epoch);
                 if (r != nullptr && (r->context_destroyed || retired(*r))) continue;
                 ++live;
@@ -837,8 +866,8 @@ private:
 
     /** This epoch's fact record, or null when it has reported nothing yet. */
     const RunRecord *record_for_locked(uint64_t epoch) const {
-        for (uint32_t slot = 0; slot < PTO_PIPELINE_MAX_DEPTH; ++slot) {
-            if (runs_[slot].epoch == epoch) return &runs_[slot];
+        for (const RunRecord &r : runs_) {
+            if (r.epoch == epoch) return &r;
         }
         return nullptr;
     }
@@ -862,7 +891,7 @@ private:
         return nullptr;
     }
 
-    static bool add_ref(Block &b, uint64_t epoch) {
+    static bool add_ref(Block &b, uint64_t epoch, size_t ref_capacity) {
         // The context's own backing carries no run reference: nothing can ever
         // report this identity finished, so counting it would leave a consumer
         // no close could resolve.
@@ -870,7 +899,8 @@ private:
         for (uint32_t i = 0; i < b.ref_count; ++i) {
             if (b.refs[i] == epoch) return true;
         }
-        if (b.ref_count >= kMaxBlockRefs) return false;  // refuse, never truncate
+        if (b.ref_count >= ref_capacity) return false;  // refuse, never truncate
+        if (b.refs.size() <= b.ref_count) b.refs.resize(ref_capacity, 0);
         b.refs[b.ref_count++] = epoch;
         if (!b.quarantined && !b.release_unconfirmed) b.state = BlockState::Referenced;
         return true;
@@ -1068,23 +1098,31 @@ private:
         // Reclaiming under pressure can itself fail a release and degrade this
         // manager, so the latch is re-read after it rather than only before.
         if (degraded_) return refuse(why, AcquireRefusal::Degraded);
-        // Both ownership records exist before the device allocation: this vector
-        // may reallocate here, where nothing has been allocated on the device
-        // yet, and the backend reserves its own tracking node before its own
-        // platform call.
+        // The whole host record exists before the device allocation, and nothing
+        // after it allocates. The row's own capacity and the reference table
+        // inside it are both reserved here, where nothing has been allocated on
+        // the device yet, and the backend reserves its own tracking node before
+        // its own platform call. A host allocation *after* the acquire would
+        // leave the device block owned by no record and charged to nothing — not
+        // reclaimable, not released, and invisible to every consumer check.
         blocks_.reserve(blocks_.size() + 1);
-        void *base = backend_.acquire(backend_.ctx, bytes);
-        if (base == nullptr) return refuse(why, AcquireRefusal::BackendFailed);  // published state untouched
         Block b;
-        b.base = base;
+        b.refs.resize(max_block_refs(), 0);
         b.bytes = bytes;
         b.region = region;
         b.state = BlockState::ProvenUnused;
+        void *base = backend_.acquire(backend_.ctx, bytes);
+        if (base == nullptr) return refuse(why, AcquireRefusal::BackendFailed);  // published state untouched
+        b.base = base;
         // The predecessor stays current until this plan publishes, so a failure
         // between here and `note_published` leaves the address the region is
         // still using protected from the reclamation above.
-        add_ref(b, run_epoch);
-        blocks_.push_back(b);  // into the capacity reserved above
+        //
+        // Every step below is non-throwing: the reference table is already at
+        // capacity so `add_ref` only writes, and the row is moved into reserved
+        // capacity, which for this trivially-movable record allocates nothing.
+        add_ref(b, run_epoch, max_block_refs());
+        blocks_.push_back(std::move(b));
         reserved_bytes_ += bytes;
         if (blocks_published_ != UINT32_MAX) ++blocks_published_;
         return base;
@@ -1107,5 +1145,6 @@ private:
     Admission admission_{Admission::Open};
     Backend backend_{};
     std::vector<Block> blocks_;
-    RunRecord runs_[PTO_PIPELINE_MAX_DEPTH]{};
+    // One fact record per granted run-resource set.
+    std::vector<RunRecord> runs_ = std::vector<RunRecord>(kDefaultRunResourceSets);
 };

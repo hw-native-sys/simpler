@@ -93,10 +93,17 @@ extern "C" const PipelineContract *get_pipeline_contract(void) {
     // callable sizing and then served from the prebuilt-arena cache
     // (build_and_cache_prebuilt_arena runs only on a miss), so a run reuses the
     // instance the previous run left behind.
+    //
+    // One shared scratch serves any number of runs because the AICPU stream is a
+    // FIFO and that order is transitive: a run ordered behind the run ahead of
+    // it is ordered behind everything that run was ordered behind. So
+    // `pipeline_depth` declares no limit either — what bounds concurrency here
+    // is the per-run task-args region, and a context gets one of those per set
+    // it was granted.
     static const PipelineContract contract = {
         PTO_PIPELINE_CONTRACT_ABI_VERSION,
         6,
-        2,
+        UINT32_MAX,
         {
             {PTO_PIPELINE_TASK_ARGS, PTO_PIPELINE_HOST_PER_RUN, 0},
             {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, 0},

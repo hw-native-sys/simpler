@@ -1470,7 +1470,7 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
         // that region, and it is resolved per run because it is keyed on this
         // run's pipeline slot and identity, not on the device's.
         prepared.kernel_args.args.chip_swimlane_run_terminal_bank =
-            arm_chip_swimlane_run_terminal_bank(prepared.pipeline_slot, prepared.identity.run_epoch);
+            arm_chip_swimlane_run_terminal_bank(prepared.identity.run_epoch);
     }
 
     if (dfx.dump_args_enabled()) {

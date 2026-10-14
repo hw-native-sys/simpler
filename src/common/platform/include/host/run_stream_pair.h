@@ -11,13 +11,14 @@
 
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <cstddef>
 #include <functional>
 #include <mutex>
 #include <utility>
+#include <vector>
 
+#include "run_resource_arena.h"
 #include "runtime_c_api.h"
 
 /**
@@ -277,8 +278,10 @@ private:
     mutable std::mutex mutex_;
     void *aicpu_{nullptr};
     void *aicore_{nullptr};
-    // Runs that submitted and have not retired, in submission order.
-    std::array<OwnerSlot, PTO_PIPELINE_MAX_DEPTH> owners_{};
+    // Runs that submitted and have not retired, in submission order. As many as
+    // the grant allows: a run holds its place here for as long as it is
+    // unretired, so the capacity is the count of runs a context may hold.
+    std::vector<OwnerSlot> owners_ = std::vector<OwnerSlot>(kDefaultRunResourceSets);
     size_t owner_count_{0};
     // The most recent retirement, so a poll arriving after it still reads that
     // run's proven result instead of an error.
@@ -288,5 +291,30 @@ private:
 
     CreateFn create_;
     DestroyFn destroy_;
+
+public:
+    using Storage = std::vector<OwnerSlot>;
+
+    /** Build an unretired-owner table for the grant, detached. May throw; mutates nothing. */
+    static Storage build(size_t granted) { return Storage(granted); }
+
+    /**
+     * Whether the table may be replaced at all.
+     *
+     * Refused while any run is still unretired: an entry is identified by the
+     * run that holds it, so the table is settled before the first submission.
+     */
+    bool grant_is_replaceable() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return owner_count_ == 0;
+    }
+
+    /** Adopt a built table. Never throws, so a multi-owner grant cannot half-apply. */
+    void commit(Storage &&built) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        owners_.swap(built);
+    }
+
+private:
     std::atomic<size_t> created_count_{0};
 };

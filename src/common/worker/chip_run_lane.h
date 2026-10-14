@@ -18,7 +18,7 @@
 
 #include "../task_interface/call_config.h"
 #include "../task_interface/task_args.h"
-#include "pipeline_slot_pool.h"
+#include "run_resource_arena.h"
 
 class ChipWorker;
 struct ChipRunLaneState;

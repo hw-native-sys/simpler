@@ -16,7 +16,7 @@
  * Call bind_worker(m) from the NB_MODULE definition in task_interface.cpp.
  *
  * Python callers register sub-workers via `add_next_level_worker(mailbox_ptr)`
- * / `add_sub_worker(mailbox_ptr)`. Each mailbox addresses a MAILBOX_SIZE-byte
+ * / `add_sub_worker(mailbox_ptr)`. Each mailbox addresses a `mailbox_size(granted_sets)`-byte
  * MAP_SHARED region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
  * callable for SUB) lives in a forked Python child consuming the mailbox via
  * `_chip_process_loop` / `_sub_worker_loop`.
@@ -31,6 +31,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <cstddef>
 #include <stdexcept>
 #include <vector>
 
@@ -226,6 +227,37 @@ inline void mailbox_store_i32(uint64_t addr, int32_t v) {
     volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(addr);
 #if defined(__aarch64__)
     __asm__ volatile("stlr %w0, [%1]" : : "r"(v), "r"(ptr) : "memory");
+#elif defined(__x86_64__)
+    __asm__ volatile("" ::: "memory");
+    *ptr = v;
+#else
+    __atomic_store(ptr, &v, __ATOMIC_RELEASE);
+#endif
+}
+
+// The 64-bit pair, for the generation words the two sides exchange: an entry's
+// own generation and the request-frame generation the child echoes back. Same
+// memory order as the 32-bit pair above, for the same reason — the echo is what
+// releases the frame, and the parent's acquire-load of it must not be reordered
+// ahead of the copy it reports.
+inline uint64_t mailbox_load_u64(uint64_t addr) {
+    volatile uint64_t *ptr = reinterpret_cast<volatile uint64_t *>(addr);
+    uint64_t v;
+#if defined(__aarch64__)
+    __asm__ volatile("ldar %0, [%1]" : "=r"(v) : "r"(ptr) : "memory");
+#elif defined(__x86_64__)
+    v = *ptr;
+    __asm__ volatile("" ::: "memory");
+#else
+    __atomic_load(ptr, &v, __ATOMIC_ACQUIRE);
+#endif
+    return v;
+}
+
+inline void mailbox_store_u64(uint64_t addr, uint64_t v) {
+    volatile uint64_t *ptr = reinterpret_cast<volatile uint64_t *>(addr);
+#if defined(__aarch64__)
+    __asm__ volatile("stlr %0, [%1]" : : "r"(v), "r"(ptr) : "memory");
 #elif defined(__x86_64__)
     __asm__ volatile("" ::: "memory");
     *ptr = v;
@@ -432,7 +464,7 @@ inline void bind_worker(nb::module_ &m) {
             },
             nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1, nb::arg("task_frame_count") = 1,
             "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a "
-            "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
+            "`mailbox_size(granted_sets)`-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _chip_process_loop). `child_pid` is that "
             "forked child, used to detect an exit before mailbox completion."
         )
@@ -461,7 +493,7 @@ inline void bind_worker(nb::module_ &m) {
             },
             nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1,
             "Add a SUB sub-worker. `mailbox_ptr` is the address of a "
-            "MAILBOX_SIZE-byte MAP_SHARED region; the child process loop is "
+            "`mailbox_size(granted_sets)`-byte MAP_SHARED region; the child process loop is "
             "Python-managed (fork + _sub_worker_loop). `child_pid` is that "
             "forked child, used to detect an exit before mailbox completion."
         )
@@ -889,7 +921,70 @@ inline void bind_worker(nb::module_ &m) {
         );
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);
-    m.attr("MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
+    m.attr("MAILBOX_SIZE") = static_cast<uint64_t>(MAILBOX_SIZE);
+    m.attr("MAILBOX_REQUEST_FRAMES") = static_cast<uint64_t>(MAILBOX_REQUEST_FRAMES);
+    // Every run-state entry field's real offset, taken with offsetof rather than
+    // recomputed. The Python child reads and writes these words in the parent's
+    // address space, so a field it places differently is a silently misdirected
+    // store in a live process — not something any compiler can catch.
+    nb::dict entry_offsets;
+    entry_offsets["state"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, state));
+    entry_offsets["error"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, error));
+    entry_offsets["accepted"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, accepted));
+    entry_offsets["preparation_disposition"] =
+        static_cast<uint64_t>(offsetof(MailboxRunEntry, preparation_disposition));
+    entry_offsets["entry_generation"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, entry_generation));
+    entry_offsets["frame_consumed_generation"] =
+        static_cast<uint64_t>(offsetof(MailboxRunEntry, frame_consumed_generation));
+    entry_offsets["run_epoch"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, run_epoch));
+    entry_offsets["protocol"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, protocol));
+    entry_offsets["run_id"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, run_id));
+    entry_offsets["slot_id"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, slot_id));
+    entry_offsets["generation"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, generation));
+    entry_offsets["dispatch_id"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, dispatch_id));
+    entry_offsets["task_slot"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, task_slot));
+    entry_offsets["group_index"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, group_index));
+    entry_offsets["group_size"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, group_size));
+    entry_offsets["error_text"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, error_text));
+    m.attr("MAILBOX_RUN_ENTRY_OFFSETS") = entry_offsets;
+    nb::dict frame_offsets;
+    frame_offsets["entry_index"] = static_cast<int64_t>(MAILBOX_OFF_FRAME_ENTRY_INDEX);
+    frame_offsets["entry_generation"] = static_cast<int64_t>(MAILBOX_OFF_FRAME_ENTRY_GENERATION);
+    frame_offsets["frame_generation"] = static_cast<int64_t>(MAILBOX_OFF_FRAME_GENERATION);
+    m.attr("MAILBOX_REQUEST_FRAME_OFFSETS") = frame_offsets;
+    m.attr("MAILBOX_RUN_ENTRY_STRIDE") = static_cast<uint64_t>(MAILBOX_RUN_ENTRY_STRIDE);
+    m.attr("MAILBOX_RUN_ENTRY_TABLE_OFFSET") = static_cast<uint64_t>(MAILBOX_RUN_ENTRY_TABLE_OFFSET);
+    m.def(
+        "mailbox_run_entry_count",
+        [](uint64_t granted_sets) {
+            return static_cast<uint64_t>(mailbox_run_entry_count(granted_sets));
+        },
+        nb::arg("granted_sets"),
+        "Run-state entries one endpoint holds for this grant: one per run it may hold, plus the "
+        "hand-offs in flight."
+    );
+    m.def(
+        "mailbox_size",
+        [](uint64_t granted_sets) {
+            // size_t throughout and checked here, so a grant whose region cannot
+            // be described is refused rather than silently narrowed into the
+            // size the facade then allocates from.
+            constexpr uint64_t kMaxGrantedSets =
+                (static_cast<uint64_t>(1) << 40) / static_cast<uint64_t>(MAILBOX_RUN_ENTRY_STRIDE);
+            if (granted_sets == 0 || granted_sets > kMaxGrantedSets) {
+                throw std::invalid_argument(
+                    "mailbox_size: a grant of " + std::to_string(granted_sets) +
+                    " run-resource sets has no representable mailbox size"
+                );
+            }
+            return static_cast<uint64_t>(mailbox_size(static_cast<size_t>(granted_sets)));
+        },
+        nb::arg("granted_sets"),
+        "Bytes one endpoint's mailbox occupies for this grant: one control frame, the request "
+        "frames, and one run-state entry per run it may hold plus the hand-offs in flight. The "
+        "facade that creates the shared-memory region sizes it through this, so both ends derive "
+        "the size from the same place."
+    );
     m.attr("MAILBOX_FRAME_SIZE") = static_cast<int>(MAILBOX_FRAME_SIZE);
     m.attr("MAILBOX_OFF_ERROR_MSG") = static_cast<int>(MAILBOX_OFF_ERROR_MSG);
     m.attr("MAILBOX_ERROR_MSG_SIZE") = static_cast<int>(MAILBOX_ERROR_MSG_SIZE);
@@ -920,7 +1015,6 @@ inline void bind_worker(nb::module_ &m) {
     mailbox_dispositions["VALIDATED_ONLY"] = static_cast<int32_t>(MailboxPreparationDisposition::VALIDATED_ONLY);
     mailbox_dispositions["NATIVE_PREPARED"] = static_cast<int32_t>(MailboxPreparationDisposition::NATIVE_PREPARED);
     m.attr("MAILBOX_PREPARATION_DISPOSITION_VALUES") = mailbox_dispositions;
-    m.attr("PTO_PIPELINE_MAX_DEPTH") = static_cast<uint32_t>(PTO_PIPELINE_MAX_DEPTH);
     // The teardown record's placement and size, so the Python producer and
     // consumer cannot drift from the C++ trailer layout.
     m.attr("MAILBOX_OFF_TEARDOWN_REPORT") = static_cast<int>(MAILBOX_OFF_TEARDOWN_REPORT);
@@ -947,6 +1041,20 @@ inline void bind_worker(nb::module_ &m) {
             mailbox_store_i32(addr, value);
         },
         nb::arg("addr"), nb::arg("value"), "Release-store a 32-bit mailbox word at `addr`."
+    );
+    m.def(
+        "_mailbox_load_u64",
+        [](uint64_t addr) -> uint64_t {
+            return mailbox_load_u64(addr);
+        },
+        nb::arg("addr"), "Acquire-load a 64-bit mailbox word at `addr`."
+    );
+    m.def(
+        "_mailbox_store_u64",
+        [](uint64_t addr, uint64_t value) {
+            mailbox_store_u64(addr, value);
+        },
+        nb::arg("addr"), nb::arg("value"), "Release-store a 64-bit mailbox word at `addr`."
     );
     m.def(
         "_mailbox_wait_i32",

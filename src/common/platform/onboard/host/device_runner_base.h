@@ -87,6 +87,9 @@
 #include "host/queued_wait_discharge.h"
 #include "host/run_boundary_marks.h"
 #include "host/run_evidence_retention.h"
+#include "host/run_progress_slots.h"
+#include "host/run_resource_slots.h"
+#include "host/run_stream_pair.h"
 #include "host/run_completion_fence.h"
 #include "host/run_caller_order.h"
 #include "host/teardown_recorder.h"
@@ -405,6 +408,22 @@ public:
      * itself untouched when it is not.
      */
     bool set_retained_epoch_limit(size_t limit) { return chip_swimlane_collector_.set_retained_epoch_limit(limit); }
+
+    /**
+     * Size every per-run resource to the count of run-resource sets this
+     * context was granted.
+     *
+     * The grant is the worker's, not this module's: the module declares what it
+     * supports, and the worker decides how much of that this context uses. So
+     * it arrives here once, before any run can name a set, and every per-set
+     * resource is built to it in one step. Refused once a set is in service,
+     * and refused for a count this runner cannot reach, so a caller never gets
+     * a grant it would then index past.
+     */
+    bool set_run_resource_grant(size_t granted);
+
+    /** How many run-resource sets this runner currently holds. */
+    size_t run_resource_grant() const { return granted_run_resource_sets_; }
 
     /**
      * Publish every run closed up to now, then report.
@@ -1410,7 +1429,7 @@ public:
          * teardown and no other run's.
          */
         DfxRunConfig dfx{};
-        uint32_t pipeline_slot{PTO_PIPELINE_MAX_DEPTH};
+        uint32_t pipeline_slot{UINT32_MAX};
         int num_aicore{0};
         int launch_aicpu_num{0};
         KernelArgsHelper kernel_args{};
@@ -1937,7 +1956,7 @@ protected:
      * reports no retained snapshot, and the existing reconcile remains the
      * authoritative accounting either way.
      */
-    uint64_t arm_chip_swimlane_run_terminal_bank(uint32_t pipeline_slot, uint64_t run_epoch);
+    uint64_t arm_chip_swimlane_run_terminal_bank(uint64_t run_epoch);
 
     /**
      * Resolve this run's block_dim: every cluster the device has, i.e.
@@ -2490,7 +2509,7 @@ protected:
         bool permits_prepared_successor{false};
     };
     mutable std::mutex native_run_mu_;
-    std::array<NativeRunReservation, PTO_PIPELINE_MAX_DEPTH> native_run_reservations_{};
+    RunResourceSlots<NativeRunReservation> native_run_reservations_;
     struct NativeRunClaim {
         const void *owner{nullptr};
         NativeRunIdentity identity{};
@@ -2508,8 +2527,13 @@ protected:
     // run that is leaving, so an out-of-order release — a fast successor
     // finishing first — removes only its own entry and preserves the order of
     // the rest.
-    std::array<NativeRunClaim, PTO_PIPELINE_MAX_DEPTH> active_native_runs_{};
+    RunResourceSlots<NativeRunClaim> active_native_runs_;
     size_t active_native_run_count_{0};
+    // How many run-resource sets every per-set container above holds. Written
+    // last by `commit_run_resources`, so until a grant is published every bound
+    // check still answers for the previous one.
+    size_t granted_run_resource_sets_{0};
+
     /** Index of `owner` among the claim holders, or the array size when absent. */
     size_t native_run_claim_index(const void *owner) const;
 
@@ -2605,8 +2629,8 @@ protected:
     // (see HostApi get/set_retained_temp_buffer). Just a remembered
     // {addr, size} that the slot reuses across its runs and finalize frees;
     // the grow/slice logic lives in utils/retained_temp_bump.h.
-    std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
-    std::array<std::size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
+    RunResourceSlots<void *> retained_temp_addrs_;
+    RunResourceSlots<std::size_t> retained_temp_sizes_;
     // One pipeline slot's Graph Definition staging: host bytes the recorders
     // build their objects into and the bind packs into the run's AICPU launch
     // package. Grow-only and content-preserving, because a bind knows the run's
@@ -2617,12 +2641,12 @@ protected:
     struct RetainedGraphStaging {
         std::vector<std::byte> bytes;
     };
-    std::array<RetainedGraphStaging, PTO_PIPELINE_MAX_DEPTH> graph_definition_staging_{};
+    RunResourceSlots<RetainedGraphStaging> graph_definition_staging_;
     // Scheduler-state storage, one retained pair per pipeline slot — see
     // HostApi acquire_scheduler_state_storage and utils/retained_scheduler_storage.h,
     // which holds the grow, alignment and failure rules. One pair per slot
     // because a slot's runs are serialized while different slots' runs are not.
-    std::array<RetainedSchedulerStorage, PTO_PIPELINE_MAX_DEPTH> scheduler_state_storage_{};
+    RunResourceSlots<RetainedSchedulerStorage> scheduler_state_storage_;
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the
@@ -2642,7 +2666,7 @@ protected:
         std::unique_ptr<std::byte[]> storage;
         std::size_t capacity{0};
     };
-    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
+    RunResourceSlots<RetainedSmMirror> sm_mirrors_;
 
     // Host staging for the device execution image, one retained buffer per
     // pipeline slot — see HostApi acquire_run_image_staging. Same block shape
@@ -2652,7 +2676,7 @@ protected:
     // afterwards, so this buffer is what makes the source outlive the
     // preparation. Sized to the image a bind ships rather than to the
     // mirror's capacity.
-    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> run_image_stagings_{};
+    RunResourceSlots<RetainedSmMirror> run_image_stagings_;
 
     // One independently committed set of the three pooled device regions. A
     // run reaches its set through the arena bank its lease selects, so
@@ -2673,15 +2697,16 @@ protected:
         size_t cached_gm_sm_size{0};
         size_t cached_runtime_arena_size{0};
     };
-    // Held by pointer because DeviceArena is non-copyable and non-movable, so
-    // the array cannot be brace-initialised without naming every bank.
-    std::array<std::unique_ptr<ArenaBank>, PTO_PIPELINE_MAX_DEPTH> arena_banks_;
+    // Held by pointer because DeviceArena is non-copyable and non-movable, so a
+    // bank is constructed in place with its allocator rather than default-built
+    // with the rest of its set.
+    RunResourceSlots<std::unique_ptr<ArenaBank>> arena_banks_;
     ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
 
     // The device blocks each pipeline slot reuses across its runs. Committed on
     // a slot's first prepare and released in finalize(), so a steady-state run
     // rewrites their contents instead of reallocating them.
-    std::array<SlotPersistentArgs, PTO_PIPELINE_MAX_DEPTH> slot_persistent_args_;
+    RunResourceSlots<SlotPersistentArgs> slot_persistent_args_;
 
     // One completion fence per pipeline slot. The events are runner-owned for
     // the same reason the blocks above are: a reuse-capable event re-records
@@ -2690,8 +2715,71 @@ protected:
     // slot's next run cannot read the previous one's completion. Held by
     // pointer because the fence is non-copyable, so the array cannot be
     // brace-initialised without naming every slot.
-    std::array<std::unique_ptr<RunCompletionFence>, PTO_PIPELINE_MAX_DEPTH> run_fences_;
-    std::array<std::unique_ptr<RunCallerOrder>, PTO_PIPELINE_MAX_DEPTH> caller_orders_;
+    RunResourceSlots<std::unique_ptr<RunCompletionFence>> run_fences_;
+    RunResourceSlots<std::unique_ptr<RunCallerOrder>> caller_orders_;
+
+    /**
+     * Per-set storage an arch runner owns itself, built but not yet adopted.
+     *
+     * Opaque to the base, which only carries it from the build phase to the
+     * commit phase. A runner with no per-set storage of its own leaves it empty.
+     */
+    struct ArchRunResourceStaging {
+        RunProgressSlots::Storage run_progress;
+        RunStreamPair::Storage run_streams;
+    };
+
+    /** One built, unpublished grant: every per-set container's new storage. */
+    struct RunResourceStaging {
+        RunResourceSlots<NativeRunReservation>::Storage native_run_reservations;
+        RunResourceSlots<NativeRunClaim>::Storage active_native_runs;
+        RunResourceSlots<void *>::Storage retained_temp_addrs;
+        RunResourceSlots<std::size_t>::Storage retained_temp_sizes;
+        RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
+        RunResourceSlots<RetainedSchedulerStorage>::Storage scheduler_state_storage;
+        RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;
+        RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;
+        RunResourceSlots<std::unique_ptr<ArenaBank>>::Storage arena_banks;
+        RunResourceSlots<SlotPersistentArgs>::Storage slot_persistent_args;
+        RunResourceSlots<std::unique_ptr<RunCompletionFence>>::Storage run_fences;
+        RunResourceSlots<std::unique_ptr<RunCallerOrder>>::Storage caller_orders;
+        RunResourceSlots<NativeRunIdentity>::Storage whole_operator_boundaries;
+        RunResourceSlots<void *>::Storage device_wall_dev_ptrs;
+        RunResourceSlots<DeviceRunTiming>::Storage device_run_timing;
+        RunResourceSlots<bool>::Storage device_timing_armed;
+        RunResourceSlots<void *>::Storage device_run_result_dev_ptrs;
+        RunResourceSlots<DeviceRunResultRegion>::Storage device_run_results;
+        RunResourceSlots<bool>::Storage device_run_result_initialized;
+        RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
+        RunRecordReadLedger::Storage device_run_result_reads;
+        RunBoundaryLedger::Storage run_boundaries_observed;
+        QueuedStreamWaits::Storage queued_waits;
+        RunBoundaryMarks::Storage boundary_marks;
+        WorkspaceManager::Storage workspace_runs;
+        ArchRunResourceStaging arch;
+    };
+
+    /** Allocate every per-set resource for `granted`; publishes nothing. */
+    RunResourceStaging build_run_resources(size_t granted);
+    /** Adopt a built grant by swapping every container. Never throws. */
+    void commit_run_resources(size_t granted, RunResourceStaging &&staged) noexcept;
+
+    /**
+     * Build whatever per-set storage an arch runner owns itself.
+     *
+     * Reached from the base's build phase, so a subclass's own tables take part
+     * in the same all-or-nothing grant rather than being resized afterwards.
+     * Not reached from the constructor — a subclass is not built yet there — so
+     * each such owner also default-sizes itself to the standing default.
+     */
+    virtual ArchRunResourceStaging build_arch_run_resources(size_t granted) {
+        (void)granted;
+        return {};
+    }
+    /** Adopt the arch storage built above. Never throws. */
+    virtual void commit_arch_run_resources(ArchRunResourceStaging &&staged) noexcept { (void)staged; }
+    /** Whether an arch runner's own per-set storage may be replaced right now. */
+    virtual bool arch_run_resources_are_replaceable() const { return true; }
 
     // Every stream wait queued on one of those boundaries, across all slots.
     // One table rather than one per slot: a cross-run wait names two runs, and
@@ -2709,7 +2797,7 @@ protected:
     // because it is read by a *successor's* launch to decide whether the run it
     // was ordered behind can be joined at all.
     mutable std::mutex whole_operator_mu_;
-    std::array<NativeRunIdentity, PTO_PIPELINE_MAX_DEPTH> whole_operator_boundaries_{};
+    RunResourceSlots<NativeRunIdentity> whole_operator_boundaries_;
 
     // What this runner's finalize() observed about its own device teardown.
     // Outlives nothing: `copy_teardown_report` must be called while the runner
@@ -2809,9 +2897,9 @@ protected:
     // one shared buffer because the device writes it for the whole of a run
     // while the host reads it only at that run's drain — a successor armed into
     // the same storage would corrupt both.
-    std::array<void *, PTO_PIPELINE_MAX_DEPTH> device_wall_dev_ptrs_{};
+    RunResourceSlots<void *> device_wall_dev_ptrs_;
     // Per-slot readback results; see device_run_timing().
-    std::array<DeviceRunTiming, PTO_PIPELINE_MAX_DEPTH> device_run_timing_{};
+    RunResourceSlots<DeviceRunTiming> device_run_timing_;
     // Set when a slot's buffer is successfully reset for a launch, cleared when
     // finalize has finished with the result. It answers two questions from the
     // one fact, because both are "this slot's buffer is reset and unread":
@@ -2819,28 +2907,28 @@ protected:
     // overwrite an unconsumed result; `read_device_wall_ns` skips while it is
     // clear, so a run whose reset failed does not publish the storage's
     // previous contents as its own timing.
-    std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_timing_armed_{};
+    RunResourceSlots<bool> device_timing_armed_;
     // One result region per pipeline slot: the device address handed to that
     // slot's runs, and the host's copy of what the last such run published. Not
     // gated on diagnostics — an error result must survive with capture off.
-    std::array<void *, PTO_PIPELINE_MAX_DEPTH> device_run_result_dev_ptrs_{};
-    std::array<DeviceRunResultRegion, PTO_PIPELINE_MAX_DEPTH> device_run_results_{};
+    RunResourceSlots<void *> device_run_result_dev_ptrs_;
+    RunResourceSlots<DeviceRunResultRegion> device_run_results_;
     // Which run each cached copy was read for, and what that read left behind.
     // Together they make the read once-per-run and keep the three read states
     // apart: an empty copy read successfully is an absent record, an empty copy
     // left by a failed D2H is no observation at all, and a slot with no region
     // attempted no copy to lose.
-    RunRecordReadLedgerT<PTO_PIPELINE_MAX_DEPTH> device_run_result_reads_;
+    RunRecordReadLedger device_run_result_reads_;
     // The boundary completion each run's own drain or poll observed, retained
     // because the drain's cleanup retires the fence that could otherwise be
     // asked. See host/run_evidence_retention.h.
-    RunBoundaryLedgerT<PTO_PIPELINE_MAX_DEPTH> run_boundaries_observed_;
+    RunBoundaryLedger run_boundaries_observed_;
     // Whether a slot's region has had `published` zeroed since it was
     // allocated. `allocate_tensor` is an `rtMalloc`, so a fresh region holds
     // whatever the device left there — which cannot be assumed to differ from
     // the epoch of the run about to use it. Steady-state reuse needs no clear
     // because epochs distinguish runs, but the first use of an allocation does.
-    std::array<bool, PTO_PIPELINE_MAX_DEPTH> device_run_result_initialized_{};
+    RunResourceSlots<bool> device_run_result_initialized_;
 
     // True after AICPU SO loaded; reset by the subclass's `finalize_impl()`.
     bool binaries_loaded_{false};
@@ -2857,7 +2945,7 @@ protected:
     // independently, so it belongs to neither. One per pipeline slot, because a
     // bind is preparation and a prepared successor prepares while its
     // predecessor still owns the collectors — see host_phase_run_state.h.
-    std::array<HostPhaseRunState, PTO_PIPELINE_MAX_DEPTH> host_phase_runs_{};
+    RunResourceSlots<HostPhaseRunState> host_phase_runs_;
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;

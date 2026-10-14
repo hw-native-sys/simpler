@@ -22,31 +22,38 @@ Worker's root-or-not role is decided by its own `init()`.
 import time
 
 import pytest
-from _task_interface import PTO_PIPELINE_MAX_DEPTH
-from simpler.worker import _DEFAULT_PIPELINE_DEPTH_REQUEST, RemoteWorkerSpec, Worker, _validated_pipeline_depth
+from simpler.worker import (
+    _DEFAULT_PIPELINE_DEPTH_REQUEST,
+    RemoteWorkerSpec,
+    Worker,
+    _local_task_frame_count,
+    _validated_pipeline_depth,
+)
 
 from ._harness import fake_chip_l3
 
+# Above the default and above the three sets the old layout was built for, so a case that passes
+# here is not passing on a width that happens to exist.
+_LARGER_REQUEST = 6
+
 
 def test_the_absent_key_requests_the_default_two():
-    # Not the supported maximum: a raised ceiling must not hand an unconfigured Worker a third
-    # resource set, which would move both its footprint and its behaviour.
+    # Not whatever a runtime declares: a runtime declaring no limit must not hand an unconfigured
+    # Worker a further resource set, which would move both its footprint and its behaviour.
     assert _DEFAULT_PIPELINE_DEPTH_REQUEST == 2
     assert Worker(level=3)._pipeline_depth_request == _DEFAULT_PIPELINE_DEPTH_REQUEST
     assert _validated_pipeline_depth({}, 3) == _DEFAULT_PIPELINE_DEPTH_REQUEST
     assert Worker(level=3)._pipeline_depth_requested_explicitly is False
 
 
-@pytest.mark.parametrize("depth", [1, 2, PTO_PIPELINE_MAX_DEPTH])
-def test_a_request_within_the_ceiling_is_carried_verbatim(depth):
+@pytest.mark.parametrize("depth", [1, 2, 3, 8, 64, 1024])
+def test_any_positive_request_is_carried_verbatim(depth):
+    # No ceiling: every owner of a per-run resource is built to the grant, so a request is a
+    # number this Worker carries to its child rather than one it clamps.
     worker = Worker(level=3, pipeline_depth=depth)
     assert worker._pipeline_depth_request == depth
     assert worker._pipeline_depth_requested_explicitly is True
-
-
-def test_a_request_above_the_ceiling_is_refused_by_the_constructor():
-    with pytest.raises(ValueError, match="pipeline_depth must be <="):
-        Worker(level=3, pipeline_depth=PTO_PIPELINE_MAX_DEPTH + 1)
+    assert worker._mailbox_granted_sets == depth
 
 
 @pytest.mark.parametrize("bad", [0, -1])
@@ -73,21 +80,70 @@ def _scoped_worker(**overrides):
         "platform": "a2a3",
         "runtime": "host_build_graph",
         "device_ids": [0],
-        "pipeline_depth": PTO_PIPELINE_MAX_DEPTH,
+        "pipeline_depth": _LARGER_REQUEST,
     }
     config.update(overrides)
     return Worker(**config)
 
 
-@pytest.mark.skipif(PTO_PIPELINE_MAX_DEPTH < 3, reason="a third set needs a ceiling above two")
-@pytest.mark.parametrize("platform", ["a2a3", "a5"])
-def test_the_supported_configuration_carries_the_larger_request(platform):
-    # Both onboard host_build_graph platforms declare three sets, so both carry the request to
-    # their child. What the child then grants is a separate answer, checked below.
-    assert _scoped_worker(platform=platform)._requested_chip_pipeline_depth() == PTO_PIPELINE_MAX_DEPTH
+@pytest.mark.parametrize(
+    "platform,runtime",
+    [
+        ("a2a3", "host_build_graph"),
+        ("a5", "host_build_graph"),
+        ("a2a3", "tensormap_and_ringbuffer"),
+        ("a5", "tensormap_and_ringbuffer"),
+        ("a2a3sim", "host_build_graph"),
+        ("a5sim", "tensormap_and_ringbuffer"),
+    ],
+)
+def test_every_backend_carries_the_larger_request(platform, runtime):
+    # All four declare no limit of their own, so the request reaches the child whatever the
+    # platform and runtime. What the child then grants is a separate answer, checked below.
+    worker = _scoped_worker(platform=platform, runtime=runtime)
+    assert worker._requested_chip_pipeline_depth() == _LARGER_REQUEST
 
 
-@pytest.mark.skipif(PTO_PIPELINE_MAX_DEPTH < 3, reason="a third set needs a ceiling above two")
+def test_several_endpoints_and_sub_workers_still_carry_the_larger_request():
+    # Each endpoint owns its own grant and its own mailbox, sized to this request, so neither a
+    # second endpoint nor a sub-worker sharing this admission reduces what is asked for.
+    assert _scoped_worker(device_ids=[0, 1])._requested_chip_pipeline_depth() == _LARGER_REQUEST
+    assert _scoped_worker(num_sub_workers=1)._requested_chip_pipeline_depth() == _LARGER_REQUEST
+
+
+@pytest.mark.parametrize(
+    "platform,joins,expected",
+    [
+        # a2a3 stages a successor behind an active run whatever its child answers, so the request
+        # is granted on both of its runtimes and on both answers.
+        ("a2a3", True, _LARGER_REQUEST),
+        ("a2a3", False, _LARGER_REQUEST),
+        # Every other route needs the child's own resolved answer: a route that cannot order one
+        # submission behind another keeps the single-set path rather than granting sets a run
+        # could never occupy.
+        ("a5", True, _LARGER_REQUEST),
+        ("a5", False, 1),
+        # Which is what decides both simulated platforms. `supports_joined_native_launch_ctx` is
+        # defined as an unconditional `return 0` in `src/common/platform/sim/host/c_api_shared.cpp`,
+        # so a simulated child's answer is always False and its grant is always one, however wide
+        # the request that reached it. There is therefore no simulated configuration at a grant
+        # above one — not a width a case has failed to exercise, but one the product does not
+        # offer.
+        ("a2a3sim", False, 1),
+        ("a5sim", False, 1),
+    ],
+)
+def test_the_grant_follows_the_route_that_can_order_two_submissions(platform, joins, expected):
+    assert _local_task_frame_count(platform, "host_build_graph", _LARGER_REQUEST, joins) == expected
+
+
+@pytest.mark.parametrize("platform", ["a2a3", "a5", "a2a3sim", "a5sim"])
+def test_a_single_set_request_is_a_single_set_everywhere(platform):
+    # The staging path is what a second set exists for, so a request of one never reaches it —
+    # including on a2a3, whose endpoint would otherwise follow the request.
+    assert _local_task_frame_count(platform, "tensormap_and_ringbuffer", 1, True) == 1
+
+
 def test_an_unsupported_grant_fails_startup_with_both_numbers():
     # In scope and explicitly requested, so a child that granted only two is a shortfall the
     # caller is told about rather than silently served.
@@ -103,8 +159,10 @@ def test_a_default_request_accepts_whatever_the_children_granted():
 
 def test_an_invalid_published_depth_is_refused_whatever_was_requested():
     worker = Worker(level=3, platform="a2a3", runtime="host_build_graph", device_ids=[0])
+    # Above what this Worker asked for: a grant can never exceed a request, so a child that
+    # published one is reporting something this side cannot have mailbox frames for.
     with pytest.raises(RuntimeError, match="published invalid pipeline depths"):
-        worker._granted_chip_pipeline_depth([PTO_PIPELINE_MAX_DEPTH + 1])
+        worker._granted_chip_pipeline_depth([worker._mailbox_granted_sets + 1])
     with pytest.raises(RuntimeError, match="published invalid pipeline depths"):
         worker._granted_chip_pipeline_depth([0])
 
@@ -118,8 +176,8 @@ def test_a_level_two_worker_grants_the_standing_default_however_high_the_runtime
     """The in-process level-2 route passes no request, so it must keep the capacity it had.
 
     Real init on a simulated backend, because the grant is decided in C++ from the runtime's own
-    published contract: a2a3 host_build_graph now advertises the ceiling as what it *supports*,
-    and a route that asks for nothing must still be granted two.
+    published contract: every runtime now declares no limit of its own, and a route that asks for
+    nothing must still be granted two.
     """
     worker = Worker(level=2, platform="a2a3sim", runtime="host_build_graph", device_id=0)
     worker.init()
@@ -135,48 +193,39 @@ def test_a_level_two_worker_grants_the_standing_default_however_high_the_runtime
     )
 
 
-@pytest.mark.skipif(PTO_PIPELINE_MAX_DEPTH < 3, reason="a third set needs a ceiling above two")
 @pytest.mark.parametrize(
     "overrides",
-    [
-        {"level": 4},
-        {"num_sub_workers": 1},
-        {"device_ids": [0, 1]},
-        {"platform": "a2a3sim"},
-        {"platform": "a5sim"},
-        {"runtime": "tensormap_and_ringbuffer"},
-    ],
-    ids=["level4", "sub_workers", "two_endpoints", "a2a3sim", "a5sim", "tmr"],
+    [{"level": 4}],
+    ids=["level4"],
 )
 def test_an_explicit_request_outside_the_supported_shape_is_refused_before_anything_commits(overrides):
-    # Refused, not reduced: the caller asked for three runs in flight and this configuration does
-    # not negotiate them, so it is told rather than silently served two.
+    # Refused, not reduced: the caller asked for more runs in flight and this configuration does
+    # not own the admission that would order them, so it is told rather than silently served two.
     worker = _scoped_worker(**overrides)
-    with pytest.raises(RuntimeError, match="pipeline_depth=3 is not supported by this configuration"):
+    with pytest.raises(RuntimeError, match=f"pipeline_depth={_LARGER_REQUEST} is not supported by this configuration"):
         worker._requested_chip_pipeline_depth()
 
 
-@pytest.mark.skipif(PTO_PIPELINE_MAX_DEPTH < 3, reason="a third set needs a ceiling above two")
 def test_a_parent_holding_a_remote_endpoint_is_already_out_of_scope():
     # The parent of a remote endpoint is at level 4 or above, which the level test refuses.
-    parent = Worker(level=4, platform="a2a3", runtime="host_build_graph", device_ids=[0], pipeline_depth=3)
+    parent = Worker(
+        level=4, platform="a2a3", runtime="host_build_graph", device_ids=[0], pipeline_depth=_LARGER_REQUEST
+    )
     parent.add_remote_worker(RemoteWorkerSpec(endpoint="127.0.0.1:19077", platform="a2a3sim"))
-    with pytest.raises(RuntimeError, match="pipeline_depth=3 is not supported by this configuration"):
+    with pytest.raises(RuntimeError, match=f"pipeline_depth={_LARGER_REQUEST} is not supported by this configuration"):
         parent._requested_chip_pipeline_depth()
 
 
-@pytest.mark.skipif(PTO_PIPELINE_MAX_DEPTH < 3, reason="a third set needs a ceiling above two")
 def test_a_parent_holding_a_nested_worker_is_already_out_of_scope():
     # `add_worker` refuses to share a Worker with `device_ids`, so a parent that holds a nested
     # child has no local chip endpoint of its own — and is out of scope on the level test either
     # way.
-    parent = Worker(level=4, platform="a2a3", runtime="host_build_graph", pipeline_depth=3)
+    parent = Worker(level=4, platform="a2a3", runtime="host_build_graph", pipeline_depth=_LARGER_REQUEST)
     parent.add_worker(Worker(level=3, platform="a2a3", runtime="host_build_graph", device_ids=[1]))
-    with pytest.raises(RuntimeError, match="pipeline_depth=3 is not supported by this configuration"):
+    with pytest.raises(RuntimeError, match=f"pipeline_depth={_LARGER_REQUEST} is not supported by this configuration"):
         parent._requested_chip_pipeline_depth()
 
 
-@pytest.mark.skipif(PTO_PIPELINE_MAX_DEPTH < 3, reason="a third set needs a ceiling above two")
 def test_a_level_three_child_of_a_level_four_parent_is_refused():
     """The level test constrains the *parent* of a nested child, never the child itself.
 
@@ -192,11 +241,10 @@ def test_a_level_three_child_of_a_level_four_parent_is_refused():
     assert child._pipeline_depth_scope_refusal() == (
         "this Worker is attached to a parent Worker, so it is not the root of its tree"
     )
-    with pytest.raises(RuntimeError, match="pipeline_depth=3 is not supported by this configuration"):
+    with pytest.raises(RuntimeError, match=f"pipeline_depth={_LARGER_REQUEST} is not supported by this configuration"):
         child._requested_chip_pipeline_depth()
 
 
-@pytest.mark.skipif(PTO_PIPELINE_MAX_DEPTH < 3, reason="a third set needs a ceiling above two")
 def test_a_worker_another_startup_initializes_is_refused():
     """A remote or MPI session's inner Worker holds no parent object, only a startup deadline.
 
@@ -214,7 +262,7 @@ def test_a_worker_another_startup_initializes_is_refused():
     assert worker._pipeline_depth_scope_refusal() == (
         "this Worker is initialized by another startup, so it is not the root of its tree"
     )
-    with pytest.raises(RuntimeError, match="pipeline_depth=3 is not supported by this configuration"):
+    with pytest.raises(RuntimeError, match=f"pipeline_depth={_LARGER_REQUEST} is not supported by this configuration"):
         worker._requested_chip_pipeline_depth()
 
 

@@ -35,10 +35,12 @@
 
 #pragma once
 
-#include <array>
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <vector>
 
+#include "run_resource_arena.h"
 #include "native_run_execution.h"
 #include "runtime_c_api.h"
 
@@ -59,6 +61,12 @@ enum class RunProgressState : uint8_t {
  * where a pipeline slot is reused.
  */
 class RunProgressSlots {
+private:
+    struct Slot {
+        std::atomic<RunProgressState> state{RunProgressState::Idle};
+        std::atomic<uint64_t> run_epoch{0};
+    };
+
 public:
     /**
      * Take a set for one run, before anything of that run is submitted.
@@ -69,7 +77,7 @@ public:
      */
     void claim(const NativeRunIdentity &identity) {
         if (identity.pipeline_slot >= slots_.size()) return;
-        Slot &slot = slots_[identity.pipeline_slot];
+        Slot &slot = *slots_[identity.pipeline_slot];
         slot.state.store(RunProgressState::Idle, std::memory_order_release);
         slot.run_epoch.store(identity.run_epoch, std::memory_order_release);
     }
@@ -84,7 +92,7 @@ public:
      */
     bool publish(const NativeRunIdentity &identity, RunProgressState state) {
         if (identity.pipeline_slot >= slots_.size()) return false;
-        Slot &slot = slots_[identity.pipeline_slot];
+        Slot &slot = *slots_[identity.pipeline_slot];
         if (slot.run_epoch.load(std::memory_order_acquire) != identity.run_epoch) return false;
         slot.state.store(state, std::memory_order_release);
         return true;
@@ -101,7 +109,7 @@ public:
      */
     RunProgressState state_of(uint32_t pipeline_slot, uint64_t run_epoch) const {
         if (pipeline_slot >= slots_.size() || run_epoch == 0) return RunProgressState::Idle;
-        const Slot &slot = slots_[pipeline_slot];
+        const Slot &slot = *slots_[pipeline_slot];
         if (slot.run_epoch.load(std::memory_order_acquire) != run_epoch) return RunProgressState::Idle;
         const RunProgressState state = slot.state.load(std::memory_order_acquire);
         if (slot.run_epoch.load(std::memory_order_acquire) != run_epoch) return RunProgressState::Idle;
@@ -112,10 +120,28 @@ public:
         return state_of(identity.pipeline_slot, identity.run_epoch);
     }
 
+    using Storage = std::vector<std::unique_ptr<Slot>>;
+
+    /** Build one progress slot per granted set, detached. May throw; mutates nothing. */
+    static Storage build(size_t granted) {
+        Storage built;
+        built.reserve(granted);
+        for (size_t i = 0; i < granted; ++i) {
+            built.push_back(std::make_unique<Slot>());
+        }
+        return built;
+    }
+
+    /** Adopt built slots. Never throws, so a multi-owner grant cannot half-apply. */
+    void commit(Storage &&built) noexcept { slots_.swap(built); }
+
+    RunProgressSlots() { commit(build(kDefaultRunResourceSets)); }
+
 private:
-    struct Slot {
-        std::atomic<RunProgressState> state{RunProgressState::Idle};
-        std::atomic<uint64_t> run_epoch{0};
-    };
-    std::array<Slot, PTO_PIPELINE_MAX_DEPTH> slots_{};
+    /**
+     * One slot per granted set, held by pointer: the slots carry atomics that
+     * two runs read concurrently, so each one keeps its address for the whole
+     * life of this table rather than moving when the table is sized.
+     */
+    std::vector<std::unique_ptr<Slot>> slots_;
 };

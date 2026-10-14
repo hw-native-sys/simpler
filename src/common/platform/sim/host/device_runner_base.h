@@ -43,6 +43,7 @@
 
 #include "runtime_c_api.h"
 #include "native_run_execution.h"
+#include "run_resource_arena.h"
 
 #include "callable.h"
 #include "call_config.h"
@@ -64,6 +65,7 @@
 #include "host/dfx_run_config.h"
 #include "host/host_phase_records.h"
 #include "host/host_phase_run_state.h"
+#include "host/run_resource_slots.h"
 #include "host/args_dump_collector.h"
 #include "host/host_graph_exporter.h"
 #include "host/pmu_collector.h"
@@ -84,10 +86,22 @@ constexpr int SIM_AUTO_BLOCKDIM = 8;
 class SimDeviceRunnerBase {
 public:
     SimDeviceRunnerBase() {
-        for (auto &bank : arena_banks_) {
-            bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, &mem_alloc_);
-        }
+        commit_run_resources(kDefaultRunResourceSets, build_run_resources(kDefaultRunResourceSets));
     }
+
+    /**
+     * Size every per-run resource to the count of run-resource sets this
+     * context was granted.
+     *
+     * The grant is the worker's, not this module's: the module declares what it
+     * supports, and the worker decides how much of that this context uses. It
+     * arrives once, before any run can name a set. Refused once an arena bank
+     * is committed, because a run's lease names its set by index.
+     */
+    bool set_run_resource_grant(size_t granted);
+
+    /** How many run-resource sets this runner currently holds. */
+    size_t run_resource_grant() const { return granted_run_resource_sets_; }
 
     uint64_t arena_bank_gm_heap_base(uint32_t bank_id) const;
 
@@ -141,7 +155,7 @@ public:
          * no correctness weight here — it keeps the two runner shapes the same.
          */
         DfxRunConfig dfx{};
-        uint32_t pipeline_slot{PTO_PIPELINE_MAX_DEPTH};
+        uint32_t pipeline_slot{UINT32_MAX};
         int num_aicore{0};
         int launch_aicpu_num{0};
         /**
@@ -584,7 +598,7 @@ public:
      * the device reads as "publish no snapshot". Diagnostic-only and never a
      * prepare failure. Mirrors the onboard base.
      */
-    uint64_t arm_chip_swimlane_run_terminal_bank(uint32_t pipeline_slot, uint64_t run_epoch);
+    uint64_t arm_chip_swimlane_run_terminal_bank(uint64_t run_epoch);
     /** Write this pass's per-event host phase records, if it collected any. */
     void write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot);
     /**
@@ -683,8 +697,8 @@ protected:
     // The device allocations a caller minted through this context, and which runs still hold them
     // — see host/caller_device_buffers.h.
     CallerDeviceBuffers caller_device_buffers_;
-    std::array<void *, PTO_PIPELINE_MAX_DEPTH> retained_temp_addrs_{};
-    std::array<size_t, PTO_PIPELINE_MAX_DEPTH> retained_temp_sizes_{};
+    RunResourceSlots<void *> retained_temp_addrs_;
+    RunResourceSlots<size_t> retained_temp_sizes_;
     // One pipeline slot's Graph Definition bytes: `staging` is what the
     // recorders build their objects into, grow-only and content-preserving, and
     // `snapshot` is the copy a published run reads. Two buffers rather than one
@@ -695,12 +709,12 @@ protected:
         std::vector<std::byte> bytes;
         std::vector<std::byte> snapshot;
     };
-    std::array<RetainedGraphStaging, PTO_PIPELINE_MAX_DEPTH> graph_definition_staging_{};
+    RunResourceSlots<RetainedGraphStaging> graph_definition_staging_;
     // Scheduler-state storage, one retained pair per pipeline slot — see
     // HostApi acquire_scheduler_state_storage and
     // utils/retained_scheduler_storage.h, which holds the grow, alignment and
     // failure rules.
-    std::array<RetainedSchedulerStorage, PTO_PIPELINE_MAX_DEPTH> scheduler_state_storage_{};
+    RunResourceSlots<RetainedSchedulerStorage> scheduler_state_storage_;
     // Host mirror of the runtime shared memory, one retained buffer per pipeline
     // slot — see HostApi acquire_sm_mirror. A host-side orchestrator writes its
     // whole shared-memory image here and the bind ships the live prefix, so the
@@ -720,7 +734,7 @@ protected:
         std::unique_ptr<std::byte[]> storage;
         size_t capacity{0};
     };
-    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> sm_mirrors_{};
+    RunResourceSlots<RetainedSmMirror> sm_mirrors_;
 
     // Host staging for the device execution image, one retained buffer per
     // pipeline slot — see HostApi acquire_run_image_staging. Same block shape
@@ -730,7 +744,7 @@ protected:
     // afterwards, so this buffer is what makes the source outlive the
     // preparation. Sized to the image a bind ships rather than to the
     // mirror's capacity.
-    std::array<RetainedSmMirror, PTO_PIPELINE_MAX_DEPTH> run_image_stagings_{};
+    RunResourceSlots<RetainedSmMirror> run_image_stagings_;
 
     // Each arena bank backs the three pooled regions (GM heap / shared
     // shared memory / trb prebuilt runtime arena) for one pipeline slot. They
@@ -764,8 +778,30 @@ protected:
         size_t cached_gm_sm_size{0};
         size_t cached_runtime_arena_size{0};
     };
-    std::array<std::unique_ptr<ArenaBank>, PTO_PIPELINE_MAX_DEPTH> arena_banks_;
+    RunResourceSlots<std::unique_ptr<ArenaBank>> arena_banks_;
     ArenaBank &arena_bank(uint32_t bank_id) { return *arena_banks_[bank_id]; }
+    // How many run-resource sets every per-set container holds. Written last by
+    // `commit_run_resources`, so until a grant is published every bound check
+    // still answers for the previous one.
+    size_t granted_run_resource_sets_{0};
+
+    /** One built, unpublished grant: every per-set container's new storage. */
+    struct RunResourceStaging {
+        RunResourceSlots<void *>::Storage retained_temp_addrs;
+        RunResourceSlots<size_t>::Storage retained_temp_sizes;
+        RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
+        RunResourceSlots<RetainedSchedulerStorage>::Storage scheduler_state_storage;
+        RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;
+        RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;
+        RunResourceSlots<std::unique_ptr<ArenaBank>>::Storage arena_banks;
+        RunResourceSlots<HostPhaseRunState>::Storage host_phase_runs;
+        RunResourceSlots<DeviceRunResultRegion>::Storage device_run_results;
+    };
+
+    /** Allocate every per-set resource for `granted`; publishes nothing. */
+    RunResourceStaging build_run_resources(size_t granted);
+    /** Adopt a built grant by swapping every container. Never throws. */
+    void commit_run_resources(size_t granted, RunResourceStaging &&staged) noexcept;
     bool prebuilt_runtime_arena_cache_valid_{false};
     uint64_t prebuilt_runtime_arena_cache_hash_{0};
     std::vector<uint8_t> prebuilt_runtime_arena_cache_key_;
@@ -869,7 +905,7 @@ protected:
     // in c_api_shared.cpp). The array keeps this storage the same shape as the
     // onboard base's, which is what lets the shared host-phase code index by
     // slot without a per-platform branch.
-    std::array<HostPhaseRunState, PTO_PIPELINE_MAX_DEPTH> host_phase_runs_{};
+    RunResourceSlots<HostPhaseRunState> host_phase_runs_;
     /**
      * One run's device-side terminal result, per pipeline slot.
      *
@@ -885,7 +921,7 @@ protected:
      * publishing run's epoch, so a slot still holding an earlier run's record
      * fails the epoch comparison rather than being mistaken for this run's.
      */
-    std::array<DeviceRunResultRegion, PTO_PIPELINE_MAX_DEPTH> device_run_results_{};
+    RunResourceSlots<DeviceRunResultRegion> device_run_results_;
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;

@@ -42,21 +42,47 @@
 
 #pragma once
 
-#include <array>
+#include <algorithm>
 #include <cstdint>
+#include <vector>
 
 #include "host/run_completion_fence.h"
 #include "host/run_outcome_decision.h"
 #include "runtime_c_api.h"
 #include "worker/native_run_execution.h"
 
-/** One retained boundary observation per pipeline slot. */
-template <size_t Slots>
-class RunBoundaryLedgerT {
+/**
+ * One retained boundary observation per run-resource set.
+ *
+ * Sized to the grant a context was given rather than to any compile-time width:
+ * a set exists because a run can hold it. An observation for a set beyond the
+ * grant is dropped and reads back as `Pending`, which is the same answer an
+ * unobserved set gives.
+ */
+class RunBoundaryLedger {
+private:
+    struct Entry {
+        NativeRunIdentity identity{};
+        RunCompletionFence::Completion completion{RunCompletionFence::Completion::Pending};
+        bool observed{false};
+    };
+
 public:
+    RunBoundaryLedger() = default;
+    explicit RunBoundaryLedger(size_t granted) :
+        entries_(granted) {}
+
+    using Storage = std::vector<Entry>;
+    /** Build one entry per granted set, detached. May throw; mutates nothing. */
+    static Storage build(size_t granted) { return Storage(granted); }
+    /** Adopt a built set. Never throws, so a multi-owner grant cannot half-apply. */
+    void commit(Storage &&built) noexcept { entries_.swap(built); }
+
+    size_t size() const noexcept { return entries_.size(); }
+
     /** Retain what this run's drain or poll just observed. */
     void note(const NativeRunIdentity &identity, RunCompletionFence::Completion completion) {
-        if (identity.pipeline_slot >= Slots) return;
+        if (identity.pipeline_slot >= entries_.size()) return;
         Entry &entry = entries_[identity.pipeline_slot];
         entry.identity = identity;
         entry.completion = completion;
@@ -71,23 +97,18 @@ public:
      * — which is what Pending already means to `decide_run_execution`.
      *
      * Keying on the full `NativeRunIdentity` is what stops a successor reusing
-     * the slot from inheriting its predecessor's answer: a slot holds one
+     * the set from inheriting its predecessor's answer: a set holds one
      * observation, and only the run that made it can read it back.
      */
     RunCompletionFence::Completion observed(const NativeRunIdentity &identity) const {
-        if (identity.pipeline_slot >= Slots) return RunCompletionFence::Completion::Pending;
+        if (identity.pipeline_slot >= entries_.size()) return RunCompletionFence::Completion::Pending;
         const Entry &entry = entries_[identity.pipeline_slot];
         if (!entry.observed || entry.identity != identity) return RunCompletionFence::Completion::Pending;
         return entry.completion;
     }
 
 private:
-    struct Entry {
-        NativeRunIdentity identity{};
-        RunCompletionFence::Completion completion{RunCompletionFence::Completion::Pending};
-        bool observed{false};
-    };
-    std::array<Entry, Slots> entries_{};
+    std::vector<Entry> entries_;
 };
 
 /** What a drain's bounded wait observed, and the rc the caller still owes. */
@@ -108,9 +129,8 @@ struct RunBoundaryWait {
  * A fenced run's completion is the wait's own rc: zero is both boundaries
  * complete, and any other value is a boundary the fence could not decide.
  */
-template <size_t Slots>
-RunBoundaryWait wait_and_retain_run_boundaries(
-    RunCompletionFence &fence, RunBoundaryLedgerT<Slots> &ledger, const NativeRunIdentity &identity, int timeout_ms
+inline RunBoundaryWait wait_and_retain_run_boundaries(
+    RunCompletionFence &fence, RunBoundaryLedger &ledger, const NativeRunIdentity &identity, int timeout_ms
 ) {
     if (!fence.fenced(identity)) {
         ledger.note(identity, RunCompletionFence::Completion::Unfenced);
@@ -124,9 +144,8 @@ RunBoundaryWait wait_and_retain_run_boundaries(
 }
 
 /** Query this run's boundaries without waiting, and retain what that observed. */
-template <size_t Slots>
-RunCompletionFence::Completion poll_and_retain_run_boundaries(
-    RunCompletionFence &fence, RunBoundaryLedgerT<Slots> &ledger, const NativeRunIdentity &identity
+inline RunCompletionFence::Completion poll_and_retain_run_boundaries(
+    RunCompletionFence &fence, RunBoundaryLedger &ledger, const NativeRunIdentity &identity
 ) {
     const RunCompletionFence::Completion completion = fence.poll(identity);
     ledger.note(identity, completion);
@@ -137,9 +156,35 @@ RunCompletionFence::Completion poll_and_retain_run_boundaries(
  * One read of the result region per run, which of the three read states that
  * run's slot is in, and the status the transfer itself reported.
  */
-template <size_t Slots>
-class RunRecordReadLedgerT {
+class RunRecordReadLedger {
 public:
+    /** The three parallel tables one grant's worth of read records needs. */
+    struct Storage {
+        std::vector<uint64_t> epochs;
+        std::vector<RunRecordRead> states;
+        std::vector<int> transfer_statuses;
+    };
+
+    RunRecordReadLedger() = default;
+    explicit RunRecordReadLedger(size_t granted) { commit(build(granted)); }
+
+    /** Build one read record per granted set, detached. May throw; mutates nothing. */
+    static Storage build(size_t granted) {
+        return Storage{
+            std::vector<uint64_t>(granted, 0), std::vector<RunRecordRead>(granted, RunRecordRead::NotAttempted),
+            std::vector<int>(granted, 0)
+        };
+    }
+
+    /** Adopt a built set. Never throws, so a multi-owner grant cannot half-apply. */
+    void commit(Storage &&built) noexcept {
+        epochs_.swap(built.epochs);
+        states_.swap(built.states);
+        transfer_statuses_.swap(built.transfer_statuses);
+    }
+
+    size_t size() const noexcept { return epochs_.size(); }
+
     /**
      * Take this run's one read of `region` into `out`, retaining the
      * transfer's own status.
@@ -166,7 +211,7 @@ public:
      */
     template <typename Region, typename CopyIn>
     int read_with_status(uint32_t slot, uint64_t run_epoch, Region &out, const void *region, const CopyIn &copy_in) {
-        if (slot >= Slots) return 0;
+        if (slot >= epochs_.size()) return 0;
         if (run_epoch != 0 && epochs_[slot] == run_epoch) return transfer_statuses_[slot];
         epochs_[slot] = run_epoch;
         states_[slot] = RunRecordRead::NotAttempted;
@@ -206,7 +251,9 @@ public:
      * verdict about the bytes.
      */
     RunRecordRead state(uint32_t slot, uint64_t run_epoch) const {
-        if (slot >= Slots || run_epoch == 0 || epochs_[slot] != run_epoch) return RunRecordRead::NotAttempted;
+        if (slot >= epochs_.size() || run_epoch == 0 || epochs_[slot] != run_epoch) {
+            return RunRecordRead::NotAttempted;
+        }
         return states_[slot];
     }
 
@@ -218,19 +265,19 @@ public:
      * zero as evidence that a transfer happened.
      */
     int transfer_status(uint32_t slot, uint64_t run_epoch) const {
-        if (slot >= Slots || run_epoch == 0 || epochs_[slot] != run_epoch) return 0;
+        if (slot >= epochs_.size() || run_epoch == 0 || epochs_[slot] != run_epoch) return 0;
         return transfer_statuses_[slot];
     }
 
     /** Forget every slot's read, for a runner starting a fresh device generation. */
     void reset() {
-        epochs_.fill(0);
-        states_.fill(RunRecordRead::NotAttempted);
-        transfer_statuses_.fill(0);
+        std::fill(epochs_.begin(), epochs_.end(), 0);
+        std::fill(states_.begin(), states_.end(), RunRecordRead::NotAttempted);
+        std::fill(transfer_statuses_.begin(), transfer_statuses_.end(), 0);
     }
 
 private:
-    std::array<uint64_t, Slots> epochs_{};
-    std::array<RunRecordRead, Slots> states_{};
-    std::array<int, Slots> transfer_statuses_{};
+    std::vector<uint64_t> epochs_;
+    std::vector<RunRecordRead> states_;
+    std::vector<int> transfer_statuses_;
 };

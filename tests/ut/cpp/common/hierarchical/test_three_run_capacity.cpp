@@ -39,7 +39,7 @@
 #include "call_config.h"
 #include "orchestrator.h"
 #include "worker_manager.h"
-#include "pipeline_slot_pool.h"
+#include "run_resource_arena.h"
 #include "ring.h"
 #include "runtime_c_api.h"
 #include "scope.h"
@@ -128,6 +128,10 @@ void prime_worker(ChipWorker &worker, uint32_t depth, unsigned launch_depth) {
     worker.launch_depth_ = launch_depth;
     worker.initialized_ = true;
     worker.pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, depth, {}};
+    // One generation per granted set, as `init` sizes it: an unsized filter has no entry for
+    // slot 0, and `is_admissible` refuses a lease outside it, so every preparation would be
+    // refused as stale before reaching the stubs below.
+    worker.pipeline_generations_.resize(depth);
     for (uint32_t slot = 0; slot < depth; ++slot) {
         worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
     }
@@ -348,20 +352,37 @@ char *capacity_task_frame(std::array<char, MAILBOX_SIZE> &mailbox, size_t index)
     return mailbox.data() + (MAILBOX_FIRST_TASK_FRAME + index) * MAILBOX_FRAME_SIZE;
 }
 
-MailboxState capacity_frame_state(const char *frame) {
-    const auto *state = reinterpret_cast<const int32_t *>(frame + MAILBOX_OFF_STATE);
-    return static_cast<MailboxState>(__atomic_load_n(state, __ATOMIC_ACQUIRE));
+// A run's state lives in its own entry, allocated in submission order, rather
+// than in the request frame that delivered its payload.
+MailboxRunEntry *capacity_entry(std::array<char, MAILBOX_SIZE> &mailbox, size_t index) {
+    return mailbox_run_entry(mailbox.data(), index);
 }
 
-void set_capacity_frame_state(char *frame, MailboxState state) {
-    auto *wire_state = reinterpret_cast<int32_t *>(frame + MAILBOX_OFF_STATE);
-    __atomic_store_n(wire_state, static_cast<int32_t>(state), __ATOMIC_RELEASE);
+MailboxState capacity_entry_state(const MailboxRunEntry *entry) {
+    return static_cast<MailboxState>(__atomic_load_n(&entry->state, __ATOMIC_ACQUIRE));
 }
 
-void set_capacity_frame_disposition(char *frame, MailboxPreparationDisposition disposition) {
-    const auto value = static_cast<int32_t>(disposition);
-    auto *wire = reinterpret_cast<int32_t *>(frame + MAILBOX_OFF_PREPARATION_DISPOSITION);
-    __atomic_store_n(wire, value, __ATOMIC_RELEASE);
+void set_capacity_entry_state(MailboxRunEntry *entry, MailboxState state) {
+    __atomic_store_n(&entry->state, static_cast<int32_t>(state), __ATOMIC_RELEASE);
+}
+
+void set_capacity_entry_disposition(MailboxRunEntry *entry, MailboxPreparationDisposition disposition) {
+    __atomic_store_n(&entry->preparation_disposition, static_cast<int32_t>(disposition), __ATOMIC_RELEASE);
+}
+
+/** The child's hand-off: echo the frame's generation, then stage the entry. */
+void capacity_consume_frame(
+    std::array<char, MAILBOX_SIZE> &mailbox, size_t frame_index, MailboxPreparationDisposition disposition
+) {
+    char *frame = capacity_task_frame(mailbox, frame_index);
+    uint64_t entry_index = 0;
+    uint64_t frame_generation = 0;
+    std::memcpy(&entry_index, frame + MAILBOX_OFF_FRAME_ENTRY_INDEX, sizeof(entry_index));
+    std::memcpy(&frame_generation, frame + MAILBOX_OFF_FRAME_GENERATION, sizeof(frame_generation));
+    MailboxRunEntry *entry = capacity_entry(mailbox, static_cast<size_t>(entry_index));
+    set_capacity_entry_disposition(entry, disposition);
+    __atomic_store_n(&entry->frame_consumed_generation, frame_generation, __ATOMIC_RELEASE);
+    set_capacity_entry_state(entry, MailboxState::FRAME_STAGED);
 }
 
 TaskSlot capacity_progress_slot(Ring &ring, RunId run_id, uint32_t pipeline_slot, uint64_t generation) {
@@ -421,17 +442,17 @@ TEST(ThreeRunCapacityEndpointTest, ALaterNativePreparationIsReportedOnceMore) {
     ASSERT_NE(active_slot, INVALID_SLOT);
     ASSERT_NE(staged_slot, INVALID_SLOT);
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*task_frame_count=*/3);
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*granted_sets=*/3);
     endpoint.submit_progress(&allocator, WorkerDispatch{active_slot, 0, /*dispatch_id=*/81, /*prepare_only=*/false});
     endpoint.submit_progress(&allocator, WorkerDispatch{staged_slot, 0, /*dispatch_id=*/82, /*prepare_only=*/true});
 
-    char *staged_frame = capacity_task_frame(mailbox, 1);
-    ASSERT_EQ(capacity_frame_state(staged_frame), MailboxState::PREPARE_READY);
+    // Entry 1 is the second submission; its payload went out on request frame 1.
+    MailboxRunEntry *staged_entry = capacity_entry(mailbox, 1);
+    ASSERT_EQ(capacity_entry_state(staged_entry), MailboxState::IDLE);
 
     // Staged behind a predecessor that has not launched: the child can only say it validated the
-    // frame.
-    set_capacity_frame_disposition(staged_frame, MailboxPreparationDisposition::VALIDATED_ONLY);
-    set_capacity_frame_state(staged_frame, MailboxState::FRAME_STAGED);
+    // payload it just took.
+    capacity_consume_frame(mailbox, 1, MailboxPreparationDisposition::VALIDATED_ONLY);
     WorkerEndpointProgress progress;
     ASSERT_TRUE(endpoint.poll_progress(progress));
     EXPECT_EQ(progress.kind, WorkerProgressKind::FRAME_STAGED);
@@ -442,9 +463,10 @@ TEST(ThreeRunCapacityEndpointTest, ALaterNativePreparationIsReportedOnceMore) {
     EXPECT_FALSE(endpoint.poll_progress(progress));
 
     // The child prepares it natively once its predecessor reaches the device and republishes into
-    // the same frame, under the same identity.
-    set_capacity_frame_disposition(staged_frame, MailboxPreparationDisposition::NATIVE_PREPARED);
-    set_capacity_frame_state(staged_frame, MailboxState::FRAME_STAGED);
+    // the same entry, under the same identity. Only the disposition word moves: the state word is
+    // the parent's exchange, and the frame that carried the payload is long since back.
+    set_capacity_entry_disposition(staged_entry, MailboxPreparationDisposition::NATIVE_PREPARED);
+    set_capacity_entry_state(staged_entry, MailboxState::FRAME_STAGED);
     ASSERT_TRUE(endpoint.poll_progress(progress));
     EXPECT_EQ(progress.kind, WorkerProgressKind::FRAME_STAGED);
     EXPECT_EQ(progress.dispatch.dispatch_id, 82u);
@@ -452,7 +474,7 @@ TEST(ThreeRunCapacityEndpointTest, ALaterNativePreparationIsReportedOnceMore) {
 
     // Once, not on every poll: a promotion is a change, and the report follows the change.
     EXPECT_FALSE(endpoint.poll_progress(progress));
-    EXPECT_EQ(capacity_frame_state(staged_frame), MailboxState::FRAME_STAGED);
+    EXPECT_EQ(capacity_entry_state(staged_entry), MailboxState::FRAME_STAGED);
     allocator.shutdown();
 }
 
@@ -465,25 +487,24 @@ TEST(ThreeRunCapacityEndpointTest, APromotionDoesNotDisturbAnActivationAlreadyPu
     const TaskSlot staged_slot = capacity_progress_slot(allocator, /*run_id=*/73, /*pipeline_slot=*/0, 7);
     ASSERT_NE(staged_slot, INVALID_SLOT);
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*task_frame_count=*/3);
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*granted_sets=*/3);
     endpoint.submit_progress(&allocator, WorkerDispatch{staged_slot, 0, /*dispatch_id=*/83, /*prepare_only=*/true});
-    char *staged_frame = capacity_task_frame(mailbox, 0);
+    MailboxRunEntry *staged_entry = capacity_entry(mailbox, 0);
 
-    set_capacity_frame_disposition(staged_frame, MailboxPreparationDisposition::NATIVE_PREPARED);
-    set_capacity_frame_state(staged_frame, MailboxState::FRAME_STAGED);
+    capacity_consume_frame(mailbox, 0, MailboxPreparationDisposition::NATIVE_PREPARED);
     WorkerEndpointProgress progress;
     ASSERT_TRUE(endpoint.poll_progress(progress));
     EXPECT_EQ(progress.preparation_disposition, MailboxPreparationDisposition::NATIVE_PREPARED);
 
     // The parent authorizes it, which writes ACTIVATE into the frame.
     EXPECT_TRUE(endpoint.activate_progress(/*run_id=*/73));
-    EXPECT_EQ(capacity_frame_state(staged_frame), MailboxState::ACTIVATE);
+    EXPECT_EQ(capacity_entry_state(staged_entry), MailboxState::ACTIVATE);
 
     // A republished disposition on an activated frame changes nothing: the state is the child's to
     // move from here, and the endpoint neither reports again nor rewrites it.
-    set_capacity_frame_disposition(staged_frame, MailboxPreparationDisposition::NATIVE_PREPARED);
+    set_capacity_entry_disposition(staged_entry, MailboxPreparationDisposition::NATIVE_PREPARED);
     EXPECT_FALSE(endpoint.poll_progress(progress));
-    EXPECT_EQ(capacity_frame_state(staged_frame), MailboxState::ACTIVATE);
+    EXPECT_EQ(capacity_entry_state(staged_entry), MailboxState::ACTIVATE);
     allocator.shutdown();
 }
 

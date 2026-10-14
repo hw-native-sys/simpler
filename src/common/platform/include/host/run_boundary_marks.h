@@ -16,7 +16,9 @@
 #include <functional>
 #include <mutex>
 #include <utility>
+#include <vector>
 
+#include "run_resource_arena.h"
 #include "runtime_c_api.h"
 #include "worker/native_run_execution.h"
 
@@ -123,7 +125,7 @@ public:
      * attributed to the wrong run.
      */
     int record(Position position, const NativeRunIdentity &identity, void *stream) {
-        if (identity.pipeline_slot >= PTO_PIPELINE_MAX_DEPTH || position == Position::kCount) {
+        if (identity.pipeline_slot >= slots_.size() || position == Position::kCount) {
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         std::lock_guard<std::mutex> lock(mutex_);
@@ -159,7 +161,7 @@ public:
      */
     Mark read(Position position, const NativeRunIdentity &identity, int timeout_ms) {
         Mark mark;
-        if (identity.pipeline_slot >= PTO_PIPELINE_MAX_DEPTH || position == Position::kCount) {
+        if (identity.pipeline_slot >= slots_.size() || position == Position::kCount) {
             mark.rc = PTO_RUNTIME_ERR_INTERNAL;
             return mark;
         }
@@ -319,8 +321,40 @@ private:
         std::array<PositionState, static_cast<size_t>(Position::kCount)> positions{};
     };
 
+public:
+    using Storage = std::vector<SlotState>;
+
+    /** Build per-set marks for the grant, detached. May throw; mutates nothing. */
+    static Storage build(size_t granted) { return Storage(granted); }
+
+    /**
+     * Whether the marks may be replaced at all.
+     *
+     * Refused while any set holds a recorded mark or a created event: a mark is
+     * read back by the run that recorded it, through the set index it names, and
+     * an event belongs to this table rather than to any one run.
+     */
+    bool grant_is_replaceable() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const SlotState &slot : slots_) {
+            for (const PositionState &state : slot.positions) {
+                if (state.event != nullptr || state.records != 0) return false;
+            }
+        }
+        return true;
+    }
+
+    /** Adopt built marks. Never throws, so a multi-owner grant cannot half-apply. */
+    void commit(Storage &&built) noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        slots_.swap(built);
+    }
+
+private:
     mutable std::mutex mutex_;
-    std::array<SlotState, PTO_PIPELINE_MAX_DEPTH> slots_{};
+    // One per granted run-resource set: a run's marks live here for as long as
+    // the run holds its set.
+    std::vector<SlotState> slots_ = std::vector<SlotState>(kDefaultRunResourceSets);
     bool retained_{false};
     DeviceEventOps ops_;
 };

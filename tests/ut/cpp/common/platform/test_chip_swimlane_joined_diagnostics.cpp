@@ -483,7 +483,7 @@ TEST(SwimlaneRunLocalMetadataTest, ARefusedCoreTypeCopyIsStillIncompleteAtClose)
     // The close's own charge is a different allocation, and the budget has room
     // for it by then -- which is exactly how the completeness flag used to come
     // out true for a run whose core types were dropped.
-    fx.collector.run_close(31, /*bank_index=*/0, /*device_execution_complete=*/false);
+    fx.collector.run_close(31, /*device_execution_complete=*/false);
 
     const std::string artifact = published_artifact(fx.collector, fx.root, 31);
     EXPECT_NE(artifact.find("\"metadata_complete\": false"), std::string::npos)
@@ -494,7 +494,7 @@ TEST(SwimlaneRunLocalMetadataTest, AnAdmittedCoreTypeCopyPublishesCompleteMetada
     AdmissionFixture fx("joined-metadata-complete");
     const CoreType types[] = {CoreType::AIC};
     ASSERT_TRUE(fx.collector.run_begin(33, fx.dir, ChipSwimlaneLevel::TASK_TIMING, types, 1, false));
-    fx.collector.run_close(33, /*bank_index=*/0, /*device_execution_complete=*/false);
+    fx.collector.run_close(33, /*device_execution_complete=*/false);
 
     const std::string artifact = published_artifact(fx.collector, fx.root, 33);
     EXPECT_NE(artifact.find("\"metadata_complete\": true"), std::string::npos)
@@ -828,8 +828,8 @@ TEST(SwimlanePairCapacityTest, TwoOpenRunsFillTheTableAndRefuseAThird) {
     EXPECT_FALSE(fx.collector.can_admit_retained_run())
         << "a full table must decline the next pair before it is admitted";
 
-    fx.collector.run_close(41, /*bank_index=*/0, /*device_execution_complete=*/false);
-    fx.collector.run_close(42, /*bank_index=*/1, /*device_execution_complete=*/false);
+    fx.collector.run_close(41, /*device_execution_complete=*/false);
+    fx.collector.run_close(42, /*device_execution_complete=*/false);
 }
 
 TEST(SwimlanePairCapacityTest, APublishedRunGivesItsSlotBackToTheNextPair) {
@@ -842,7 +842,7 @@ TEST(SwimlanePairCapacityTest, APublishedRunGivesItsSlotBackToTheNextPair) {
     // the predecessor publishes while its successor is still open, and the slot
     // it gives back is what the run after that is admitted into. A table that
     // only emptied when both runs had closed would serialize every third run.
-    fx.collector.run_close(51, /*bank_index=*/0, /*device_execution_complete=*/false);
+    fx.collector.run_close(51, /*device_execution_complete=*/false);
     EXPECT_FALSE(published_artifact(fx.collector, fx.root, 51).empty());
     ASSERT_TRUE(fx.collector.can_admit_retained_run()) << "the published run's bucket is free again";
 
@@ -850,8 +850,8 @@ TEST(SwimlanePairCapacityTest, APublishedRunGivesItsSlotBackToTheNextPair) {
         << "the next successor is admitted beside the run that is still open";
     EXPECT_FALSE(fx.collector.can_admit_retained_run());
 
-    fx.collector.run_close(52, /*bank_index=*/1, /*device_execution_complete=*/false);
-    fx.collector.run_close(53, /*bank_index=*/0, /*device_execution_complete=*/false);
+    fx.collector.run_close(52, /*device_execution_complete=*/false);
+    fx.collector.run_close(53, /*device_execution_complete=*/false);
     EXPECT_FALSE(published_artifact(fx.collector, fx.root, 53).empty())
         << "each run of the sustained sequence publishes its own file";
 }
@@ -916,7 +916,7 @@ TEST(SwimlaneGrantedCapacityTest, AGrantIsRefusedWhileARunIsHeld) {
     EXPECT_EQ(fx.collector.active_epoch_limit(), simpler::dfx::runs::kMaxOpenEpochs)
         << "and the refusal changed nothing";
 
-    fx.collector.run_close(61, /*bank_index=*/0, /*device_execution_complete=*/false);
+    fx.collector.run_close(61, /*device_execution_complete=*/false);
 }
 
 TEST(SwimlaneGrantedCapacityTest, AGrantedCollectorReservesForWhatItMayHold) {
@@ -954,9 +954,9 @@ TEST(SwimlaneGrantedCapacityTest, ThreeRunsAreHeldAndEachPublishesItsOwnFile) {
 
     // Each identity closes and seals on its own; three cuts are armed at once,
     // one per closed run, and each must retire with its own artifact.
-    fx.collector.run_close(71, /*bank_index=*/0, /*device_execution_complete=*/false);
-    fx.collector.run_close(72, /*bank_index=*/1, /*device_execution_complete=*/false);
-    fx.collector.run_close(73, /*bank_index=*/2, /*device_execution_complete=*/false);
+    fx.collector.run_close(71, /*device_execution_complete=*/false);
+    fx.collector.run_close(72, /*device_execution_complete=*/false);
+    fx.collector.run_close(73, /*device_execution_complete=*/false);
 
     for (const uint64_t epoch : {71u, 72u, 73u}) {
         const std::string artifact = published_artifact(fx.collector, fx.root, epoch);
@@ -976,16 +976,16 @@ TEST(SwimlaneGrantedCapacityTest, OnePublicationReclaimsOneCapacityAtAThreeDeepF
     // One terminal verdict returns one capacity. The other two stay held, so a
     // sustained sequence refills one run at a time rather than waiting for the
     // whole table to drain.
-    fx.collector.run_close(81, /*bank_index=*/0, /*device_execution_complete=*/false);
+    fx.collector.run_close(81, /*device_execution_complete=*/false);
     EXPECT_FALSE(published_artifact(fx.collector, fx.root, 81).empty());
     ASSERT_TRUE(fx.collector.can_admit_retained_run());
 
     ASSERT_TRUE(fx.collector.run_begin(84, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
     EXPECT_FALSE(fx.collector.can_admit_retained_run()) << "the reclaimed capacity was exactly one";
 
-    fx.collector.run_close(82, /*bank_index=*/1, /*device_execution_complete=*/false);
-    fx.collector.run_close(83, /*bank_index=*/2, /*device_execution_complete=*/false);
-    fx.collector.run_close(84, /*bank_index=*/0, /*device_execution_complete=*/false);
+    fx.collector.run_close(82, /*device_execution_complete=*/false);
+    fx.collector.run_close(83, /*device_execution_complete=*/false);
+    fx.collector.run_close(84, /*device_execution_complete=*/false);
 }
 
 TEST(SwimlaneGrantedCapacityTest, OneRunsPublicationFailureDoesNotDisturbTheOtherTwo) {
@@ -1012,9 +1012,9 @@ TEST(SwimlaneGrantedCapacityTest, OneRunsPublicationFailureDoesNotDisturbTheOthe
 
     ASSERT_TRUE(fx.collector.run_begin(103, fx.dir, ChipSwimlaneLevel::TASK_TIMING, nullptr, 0, false));
 
-    fx.collector.run_close(101, /*bank_index=*/0, /*device_execution_complete=*/false);
-    fx.collector.run_close(102, /*bank_index=*/1, /*device_execution_complete=*/false);
-    fx.collector.run_close(103, /*bank_index=*/2, /*device_execution_complete=*/false);
+    fx.collector.run_close(101, /*device_execution_complete=*/false);
+    fx.collector.run_close(102, /*device_execution_complete=*/false);
+    fx.collector.run_close(103, /*device_execution_complete=*/false);
 
     std::string error;
     // The failing run is reported, and a write failure is not a quarantine: the

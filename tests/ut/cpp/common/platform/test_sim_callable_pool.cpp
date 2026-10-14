@@ -36,8 +36,10 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -80,6 +82,15 @@ extern "C" int bind_callable_to_runtime_impl(
 
 namespace {
 
+// The collector owns host storage for its terminal banks; this is the allocator pair the runner
+// would otherwise be handed by the platform.
+void *sim_bank_alloc(size_t size) { return std::calloc(1, size); }
+
+int sim_bank_free(void *ptr) {
+    std::free(ptr);
+    return 0;
+}
+
 // A concrete runner: the pure virtuals below are the execution surface, which
 // no case here drives. The accessors read the production pool the registration
 // publishes into.
@@ -104,6 +115,12 @@ public:
     // The bulk-free finalize() performs, so each case leaves no scratch or
     // handle behind.
     void release_all() { release_callable_state(); }
+
+    // The diagnostic bank surface, which is a runner method rather than a pool one: the sim
+    // runner has its own copy of it and its own collector instance, so this is where a parity
+    // claim about banks can be made against sim code rather than against shared code.
+    uint64_t arm_terminal_bank(uint64_t run_epoch) { return arm_chip_swimlane_run_terminal_bank(run_epoch); }
+    ChipSwimlaneCollector &swimlane() { return chip_swimlane_collector_; }
 
     size_t pool_size() const { return chip_callable_buffers_.size(); }
 
@@ -432,6 +449,55 @@ TEST_F(SimCallablePoolTest, ReRegisteringRebuildsTheTables) {
     EXPECT_EQ(second.object_table_dev, reinterpret_cast<uint64_t>(second.object_table));
     EXPECT_NE(second.object_table[0], 0u);
     EXPECT_NE(second.entry_table[0], 0u);
+}
+
+// Contract rows 37 and 39, where they meet: `arm_chip_swimlane_run_terminal_bank` is the
+// production function that turns "no bank is free" into the zero the device reads, and the sim
+// runner has its own copy of it and its own collector. This drives that function, not the
+// collector beneath it.
+//
+// Both of its zero-returning branches are covered: a collector with no shared region, where the
+// acquire succeeds and the *arm* refuses — the branch that must give the credit back, since
+// keeping it would retire one of the fixed banks per failed arm — and a full bank table, where
+// the acquire itself refuses.
+//
+// On what this says about parity more widely: the lane and the operation lease are shared code
+// a sim build links unchanged, but the C entry points beneath them are not — sim has its own
+// `prepare` / `launch` / `poll` / `wait` / `finalize`. So this is a parity claim about the bank
+// surface specifically, and the lifecycle rows are not transferred to sim by it.
+TEST_F(SimCallablePoolTest, TheSimRunnerHandsDiagnosticBanksOutByEpochAndRefusesBeyondTheBankCount) {
+    // No region yet, so the acquire inside the runner succeeds and the arm refuses. Zero reaches
+    // the device, and the bank it briefly took is not lost.
+    EXPECT_EQ(runner_.arm_terminal_bank(6001), 0u) << "the sim runner armed a bank with no shared region to arm it in";
+
+    ASSERT_EQ(
+        runner_.swimlane().initialize(
+            /*num_aicore=*/1, /*aicpu_thread_num=*/1, /*device_id=*/0, ChipSwimlaneLevel::SCHEDULE_TIMING,
+            sim_bank_alloc, nullptr, sim_bank_free
+        ),
+        0
+    );
+
+    std::vector<uint64_t> armed;
+    for (int index = 0; index < PLATFORM_RUN_TERMINAL_BANKS; index++) {
+        const uint64_t address = runner_.arm_terminal_bank(7000 + static_cast<uint64_t>(index));
+        EXPECT_NE(address, 0u) << "epoch " << (7000 + index)
+                               << " found no bank while the table was not yet full; a refused arm kept its credit";
+        armed.push_back(address);
+    }
+    EXPECT_EQ(std::set<uint64_t>(armed.begin(), armed.end()).size(), armed.size())
+        << "two live runs were armed into one bank";
+
+    // Beyond the count: zero, which is what the device reads as "publish no snapshot".
+    EXPECT_EQ(runner_.arm_terminal_bank(7999), 0u) << "the sim runner invented an address for a run with no bank";
+    // A holder re-arming gets its own storage back rather than a second bank.
+    EXPECT_EQ(runner_.arm_terminal_bank(7000), armed[0]);
+
+    // And the same release-then-serve order the onboard runner has.
+    runner_.swimlane().release_run_terminal_bank(7001);
+    EXPECT_EQ(runner_.arm_terminal_bank(7999), armed[1]) << "the released bank was not the one handed on";
+
+    runner_.swimlane().finalize(nullptr, sim_bank_free);
 }
 
 }  // namespace

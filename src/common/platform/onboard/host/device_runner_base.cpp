@@ -21,6 +21,8 @@
 
 #include "device_runner_base.h"
 
+#include "run_resource_arena.h"
+
 #include <runtime/rt.h>
 #include <acl/acl.h>
 #include <dlfcn.h>
@@ -254,14 +256,59 @@ RunBoundaryMarks::DeviceEventOps make_acl_timing_event_ops() {
 }  // namespace
 
 DeviceRunnerBase::DeviceRunnerBase() {
-    for (auto &bank : arena_banks_) {
-        bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, this);
+    // The sub-owners exist before the first grant is committed, because the
+    // commit hands each of them its own per-set storage.
+    queued_waits_ = std::make_unique<QueuedStreamWaits>(make_acl_event_ops());
+    boundary_marks_ = std::make_unique<RunBoundaryMarks>(make_acl_timing_event_ops());
+    commit_run_resources(kDefaultRunResourceSets, build_run_resources(kDefaultRunResourceSets));
+}
+
+/**
+ * Build every per-set resource for `granted`, publish none.
+ *
+ * Phase one of the grant. Every allocation this context's sizing needs happens
+ * here, into detached storage, so a failure anywhere leaves this runner exactly
+ * as it was — at its previous grant, with every table consistent and every
+ * pointer-held entry still constructed. The alternative, resizing members one at
+ * a time, leaves the earlier tables at the new count and the later ones at the
+ * old with nothing able to tell which, and leaves the pointer-held tables full of
+ * nulls that every reader and the whole cleanup path dereference.
+ */
+DeviceRunnerBase::RunResourceStaging DeviceRunnerBase::build_run_resources(size_t granted) {
+    RunResourceStaging staged;
+    staged.native_run_reservations = RunResourceSlots<NativeRunReservation>::build(granted);
+    staged.active_native_runs = RunResourceSlots<NativeRunClaim>::build(granted);
+    staged.retained_temp_addrs = RunResourceSlots<void *>::build(granted);
+    staged.retained_temp_sizes = RunResourceSlots<std::size_t>::build(granted);
+    staged.graph_definition_staging = RunResourceSlots<RetainedGraphStaging>::build(granted);
+    staged.scheduler_state_storage = RunResourceSlots<RetainedSchedulerStorage>::build(granted);
+    staged.sm_mirrors = RunResourceSlots<RetainedSmMirror>::build(granted);
+    staged.run_image_stagings = RunResourceSlots<RetainedSmMirror>::build(granted);
+    staged.slot_persistent_args = RunResourceSlots<SlotPersistentArgs>::build(granted);
+    staged.whole_operator_boundaries = RunResourceSlots<NativeRunIdentity>::build(granted);
+    staged.device_wall_dev_ptrs = RunResourceSlots<void *>::build(granted);
+    staged.device_run_timing = RunResourceSlots<DeviceRunTiming>::build(granted);
+    staged.device_timing_armed = RunResourceSlots<bool>::build(granted);
+    staged.device_run_result_dev_ptrs = RunResourceSlots<void *>::build(granted);
+    staged.device_run_results = RunResourceSlots<DeviceRunResultRegion>::build(granted);
+    staged.device_run_result_initialized = RunResourceSlots<bool>::build(granted);
+    staged.host_phase_runs = RunResourceSlots<HostPhaseRunState>::build(granted);
+    staged.device_run_result_reads = RunRecordReadLedger::build(granted);
+    staged.run_boundaries_observed = RunBoundaryLedger::build(granted);
+
+    // The three that carry constructor arguments. Built here rather than filled
+    // in after a resize, so no table is ever visible holding a null entry.
+    staged.arena_banks = RunResourceSlots<std::unique_ptr<ArenaBank>>::build(granted);
+    for (std::unique_ptr<std::unique_ptr<ArenaBank>> &bank : staged.arena_banks) {
+        *bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, this);
     }
-    for (auto &fence : run_fences_) {
-        fence = std::make_unique<RunCompletionFence>(make_acl_event_ops());
+    staged.run_fences = RunResourceSlots<std::unique_ptr<RunCompletionFence>>::build(granted);
+    for (std::unique_ptr<std::unique_ptr<RunCompletionFence>> &fence : staged.run_fences) {
+        *fence = std::make_unique<RunCompletionFence>(make_acl_event_ops());
     }
-    for (auto &order : caller_orders_) {
-        order = std::make_unique<RunCallerOrder>(
+    staged.caller_orders = RunResourceSlots<std::unique_ptr<RunCallerOrder>>::build(granted);
+    for (std::unique_ptr<std::unique_ptr<RunCallerOrder>> &order : staged.caller_orders) {
+        *order = std::make_unique<RunCallerOrder>(
             make_acl_event_ops(),
             [](void *stream, void *event) {
                 return static_cast<int>(aclrtStreamWaitEvent(stream, event));
@@ -271,8 +318,96 @@ DeviceRunnerBase::DeviceRunnerBase() {
             }
         );
     }
-    queued_waits_ = std::make_unique<QueuedStreamWaits>(make_acl_event_ops());
-    boundary_marks_ = std::make_unique<RunBoundaryMarks>(make_acl_timing_event_ops());
+
+    // Owners that hold their own per-set storage and size it by their own rule:
+    // the wait table takes two entries per set, and the workspace ledger derives
+    // each block's reference capacity from the same count.
+    staged.queued_waits = QueuedStreamWaits::build(granted);
+    staged.boundary_marks = RunBoundaryMarks::build(granted);
+    staged.workspace_runs = WorkspaceManager::build(granted);
+    staged.arch = build_arch_run_resources(granted);
+    return staged;
+}
+
+/**
+ * Adopt a built grant. Never throws, which is what makes it atomic.
+ *
+ * Every member below is replaced by a container swap, so the whole set of tables
+ * moves from the old count to the new one with no observable state in between.
+ */
+void DeviceRunnerBase::commit_run_resources(size_t granted, RunResourceStaging &&staged) noexcept {
+    native_run_reservations_.commit(std::move(staged.native_run_reservations));
+    active_native_runs_.commit(std::move(staged.active_native_runs));
+    retained_temp_addrs_.commit(std::move(staged.retained_temp_addrs));
+    retained_temp_sizes_.commit(std::move(staged.retained_temp_sizes));
+    graph_definition_staging_.commit(std::move(staged.graph_definition_staging));
+    scheduler_state_storage_.commit(std::move(staged.scheduler_state_storage));
+    sm_mirrors_.commit(std::move(staged.sm_mirrors));
+    run_image_stagings_.commit(std::move(staged.run_image_stagings));
+    arena_banks_.commit(std::move(staged.arena_banks));
+    slot_persistent_args_.commit(std::move(staged.slot_persistent_args));
+    run_fences_.commit(std::move(staged.run_fences));
+    caller_orders_.commit(std::move(staged.caller_orders));
+    whole_operator_boundaries_.commit(std::move(staged.whole_operator_boundaries));
+    device_wall_dev_ptrs_.commit(std::move(staged.device_wall_dev_ptrs));
+    device_run_timing_.commit(std::move(staged.device_run_timing));
+    device_timing_armed_.commit(std::move(staged.device_timing_armed));
+    device_run_result_dev_ptrs_.commit(std::move(staged.device_run_result_dev_ptrs));
+    device_run_results_.commit(std::move(staged.device_run_results));
+    device_run_result_initialized_.commit(std::move(staged.device_run_result_initialized));
+    host_phase_runs_.commit(std::move(staged.host_phase_runs));
+    device_run_result_reads_.commit(std::move(staged.device_run_result_reads));
+    run_boundaries_observed_.commit(std::move(staged.run_boundaries_observed));
+    if (queued_waits_ != nullptr) queued_waits_->commit(std::move(staged.queued_waits));
+    if (boundary_marks_ != nullptr) boundary_marks_->commit(std::move(staged.boundary_marks));
+    workspace_.commit(std::move(staged.workspace_runs));
+    commit_arch_run_resources(std::move(staged.arch));
+    // Last: until this is published, no run may name a set in the new tables,
+    // and every bound check still answers for the previous grant.
+    granted_run_resource_sets_ = granted;
+}
+
+bool DeviceRunnerBase::set_run_resource_grant(size_t granted) {
+    if (granted == 0) return false;
+    if (granted == granted_run_resource_sets_) return true;
+    // Anything already committed belongs to a set at its current index, and a
+    // run's lease names its set by that index, so the grant is settled before
+    // the first run and never while one is in flight. Each owner that can answer
+    // for itself is asked here, before anything is built.
+    {
+        std::lock_guard<std::mutex> lk(native_run_mu_);
+        for (const NativeRunClaim &claim : active_native_runs_) {
+            if (claim.identity.run_epoch != 0) return false;
+        }
+        for (const NativeRunReservation &reservation : native_run_reservations_) {
+            if (reservation.owner != nullptr) return false;
+        }
+    }
+    for (const std::unique_ptr<ArenaBank> &bank : arena_banks_) {
+        if (bank != nullptr &&
+            (bank->gm_heap.is_committed() || bank->gm_sm.is_committed() || bank->runtime_pool.is_committed())) {
+            return false;
+        }
+    }
+    if (queued_waits_ != nullptr && !queued_waits_->grant_is_replaceable()) return false;
+    if (boundary_marks_ != nullptr && !boundary_marks_->grant_is_replaceable()) return false;
+    if (!workspace_.grant_is_replaceable()) return false;
+    if (!arch_run_resources_are_replaceable()) return false;
+
+    // Build first, publish second. A failure here leaves the previous grant
+    // whole and usable, which is what makes a refused grant a startup failure
+    // rather than a corrupted runner that cleanup then walks.
+    try {
+        RunResourceStaging staged = build_run_resources(granted);
+        commit_run_resources(granted, std::move(staged));
+    } catch (...) {
+        LOG_ERROR(
+            "set_run_resource_grant: could not build %zu run-resource sets; keeping the previous grant of %zu", granted,
+            granted_run_resource_sets_
+        );
+        return false;
+    }
+    return true;
 }
 
 uint64_t DeviceRunnerBase::arena_bank_gm_heap_base(uint32_t bank_id) const {
@@ -2901,19 +3036,28 @@ int DeviceRunnerBase::ensure_device_run_result_region(
     return 0;
 }
 
-// The retained bank is indexed by the run's pipeline slot directly, not by a
-// slot-derived modulus: the slot space and the bank array are the same size, so
-// a slot outside the array is a contract break to report rather than to fold.
-static_assert(
-    PLATFORM_RUN_TERMINAL_BANKS == PTO_PIPELINE_MAX_DEPTH,
-    "swimlane terminal banks must cover exactly the pipeline's retained runs"
-);
+// The terminal bank a run publishes into is the one its epoch acquired, not the
+// one its run-resource set is numbered. The banks are a fixed device resource
+// and the sets are as many as the grant allows, so the two counts need not agree
+// for either to be correct: a run that finds no free bank keeps its diagnostic
+// and asks again next round, and the banks come back as runs retire.
 
-uint64_t DeviceRunnerBase::arm_chip_swimlane_run_terminal_bank(uint32_t pipeline_slot, uint64_t run_epoch) {
+uint64_t DeviceRunnerBase::arm_chip_swimlane_run_terminal_bank(uint64_t run_epoch) {
     // Zero means "publish no snapshot". Every path that cannot resolve a bank —
-    // swimlane off, collector not initialized, slot out of range, no run identity
-    // — returns it rather than letting the device derive an address.
-    return reinterpret_cast<uint64_t>(chip_swimlane_collector_.arm_run_terminal_bank(pipeline_slot, run_epoch));
+    // swimlane off, collector not initialized, no free bank, no run identity —
+    // returns it rather than letting the device derive an address.
+    const int bank = chip_swimlane_collector_.acquire_run_terminal_bank(run_epoch);
+    if (bank < 0) return 0;
+    void *armed = chip_swimlane_collector_.arm_run_terminal_bank(static_cast<uint32_t>(bank), run_epoch);
+    if (armed == nullptr) {
+        // The acquire above took the bank and nothing was armed into it, so no
+        // producer can reach that address and the credit is proved free. Keeping
+        // it would retire one of the three banks per failed arm, and the run
+        // publishing no snapshot is already the reported outcome.
+        chip_swimlane_collector_.release_run_terminal_bank(run_epoch);
+        return 0;
+    }
+    return reinterpret_cast<uint64_t>(armed);
 }
 
 int DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch) {
@@ -3341,7 +3485,7 @@ int DeviceRunnerBase::predecessor_boundary_unfired(const NativeRunJoin &join, bo
     if (unfired == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     *unfired = false;
     const uint32_t slot = join.predecessor_identity.pipeline_slot;
-    if (join.predecessor_owner == nullptr || slot >= PTO_PIPELINE_MAX_DEPTH) return PTO_RUNTIME_ERR_INTERNAL;
+    if (join.predecessor_owner == nullptr || slot >= granted_run_resource_sets_) return PTO_RUNTIME_ERR_INTERNAL;
     bool complete = false;
     const int rc =
         run_fences_[slot]->query_boundary(join.predecessor_identity, RunCompletionFence::StreamRole::Aicpu, &complete);
@@ -3402,7 +3546,7 @@ int DeviceRunnerBase::open_cross_run_wait(const PreparedExecution &prepared, voi
     const NativeRunJoin &join = prepared.join;
     if (join.predecessor_owner == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     const uint32_t predecessor_slot = join.predecessor_identity.pipeline_slot;
-    if (predecessor_slot >= PTO_PIPELINE_MAX_DEPTH || predecessor_slot == prepared.pipeline_slot) {
+    if (predecessor_slot >= granted_run_resource_sets_ || predecessor_slot == prepared.pipeline_slot) {
         LOG_ERROR(
             "open_cross_run_wait: slot %u was joined to slot %u, which is not another live pipeline slot",
             prepared.pipeline_slot, predecessor_slot
@@ -3441,7 +3585,7 @@ void DeviceRunnerBase::clear_whole_operator_boundary(const PreparedExecution &pr
 }
 
 bool DeviceRunnerBase::has_whole_operator_boundary(const NativeRunIdentity &identity) const {
-    if (identity.pipeline_slot >= PTO_PIPELINE_MAX_DEPTH || identity.run_epoch == 0) return false;
+    if (!whole_operator_boundaries_.holds(identity.pipeline_slot) || identity.run_epoch == 0) return false;
     std::lock_guard<std::mutex> lk(whole_operator_mu_);
     return whole_operator_boundaries_[identity.pipeline_slot] == identity;
 }
@@ -3833,7 +3977,13 @@ bool DeviceRunnerBase::can_join_diagnostic_run(const PreparedExecution &succ, co
     // read as one answer, because a free bucket on a collector that is not
     // ready proves nothing and a fatal collector refuses admission whatever
     // its capacity.
-    return chip_swimlane_collector_.can_admit_retained_run();
+    if (!chip_swimlane_collector_.can_admit_retained_run()) return false;
+    // And a terminal bank this successor could publish into. A run ordered
+    // behind the open ones with no bank left would launch without the snapshot
+    // its diagnostic exists to produce, so it waits for one: this is a decline
+    // for this round only, re-asked next round, and the banks come back as the
+    // runs ahead of it report.
+    return chip_swimlane_collector_.can_take_run_terminal_bank(succ.identity.run_epoch);
 }
 
 int DeviceRunnerBase::start_shared_collectors_for_run(
@@ -3981,7 +4131,6 @@ void DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
         withdraw_dep_gen_run(run_epoch);
     }
     if (!dfx.chip_swimlane_enabled()) return;
-    if (!chip_swimlane_collector_.retains_runs()) return;
     // Nothing may escape a rollback path: the caller owes the layer above its
     // own transaction's rc and the ownership of this run's `prepared`. The
     // withdrawal publishes its outcome — a released slot, or a quarantine with
@@ -3989,7 +4138,17 @@ void DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
     // this boundary cannot be what hides unreachable capacity; it exists so a
     // failure past that point cannot displace the launch failure either.
     try {
-        (void)chip_swimlane_collector_.abandon_run(run_epoch);
+        if (chip_swimlane_collector_.retains_runs()) {
+            (void)chip_swimlane_collector_.abandon_run(run_epoch);
+        } else {
+            // A terminal bank is taken per run whether or not this collector
+            // retains output, so its credit is owed back on the same terms.
+            // Retention decides only whether there is also a retained admission
+            // to withdraw; an ordinary-output run that stopped at NotStarted
+            // submitted nothing, so no producer can hold its bank and the
+            // release is proved rather than assumed.
+            chip_swimlane_collector_.release_run_terminal_bank(run_epoch);
+        }
     } catch (...) {}
 }
 
@@ -4187,8 +4346,13 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
         // This run's host phase records go in first: the epoch's metadata
         // snapshot inside the close is what copies them, and the collector
         // holds one copy of them for every run it serves.
+        // No bank index is passed: a bank is held by the epoch that acquired it,
+        // so the close resolves its own and settles it there — released once
+        // this run's snapshot is in its bucket, withdrawn when completion could
+        // not be proved. Handing it the resource-set index would read whichever
+        // run happens to hold that bank.
         simpler::dfx::runs::close_run_boundary(
-            chip_swimlane_collector_, run_epoch, pipeline_slot, device_execution_complete, [this, pipeline_slot] {
+            chip_swimlane_collector_, run_epoch, device_execution_complete, [this, pipeline_slot] {
                 publish_host_phase_records_to_swimlane(pipeline_slot);
             }
         );
@@ -4213,8 +4377,20 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
         // there a producer may never have reached its close — or may still be
         // running on a card the bounded drain did not prove clean. Reading then
         // would report a partial bank as if it were the run's accounting.
+        const int bank = chip_swimlane_collector_.run_terminal_bank_of(run_epoch);
         if (device_execution_complete) {
-            chip_swimlane_collector_.report_run_terminal_snapshot(pipeline_slot, run_epoch);
+            if (bank >= 0) {
+                chip_swimlane_collector_.report_run_terminal_snapshot(static_cast<uint32_t>(bank), run_epoch);
+                // Reported, so nothing reads those bytes for this run again —
+                // which is the only point at which the bank is safe to hand on.
+                chip_swimlane_collector_.release_run_terminal_bank(run_epoch);
+            }
+        } else if (bank >= 0) {
+            // The recovery path. `quiesce` above stops this host's readers, but
+            // it proves nothing about an AICPU still writing on a card the
+            // bounded drain did not settle, so the bank is withdrawn rather
+            // than handed to a run that would then share it.
+            chip_swimlane_collector_.quarantine_run_terminal_bank(run_epoch);
         }
         publish_host_phase_records_to_swimlane(pipeline_slot);
         chip_swimlane_collector_.export_swimlane_json();
@@ -4304,7 +4480,7 @@ size_t DeviceRunnerBase::native_run_claim_count() const {
 bool DeviceRunnerBase::try_reserve_native_run(
     const void *owner, uint32_t pipeline_slot, uint32_t arena_bank, bool allow_prepared_successor
 ) {
-    if (owner == nullptr || pipeline_slot >= PTO_PIPELINE_MAX_DEPTH || arena_bank >= PTO_PIPELINE_MAX_DEPTH) {
+    if (owner == nullptr || pipeline_slot >= granted_run_resource_sets_ || arena_bank >= granted_run_resource_sets_) {
         return false;
     }
     std::lock_guard<std::mutex> lk(native_run_mu_);
@@ -4339,7 +4515,7 @@ bool DeviceRunnerBase::try_reserve_native_run(
 }
 
 bool DeviceRunnerBase::arena_bank_shared_with_other_run(const void *owner, uint32_t arena_bank) const {
-    if (arena_bank >= PTO_PIPELINE_MAX_DEPTH) return false;
+    if (arena_bank >= granted_run_resource_sets_) return false;
     std::lock_guard<std::mutex> lk(native_run_mu_);
     for (const NativeRunReservation &reservation : native_run_reservations_) {
         if (reservation.owner == nullptr || reservation.owner == owner) continue;

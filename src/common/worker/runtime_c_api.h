@@ -126,13 +126,6 @@ enum {
 enum {
     PTO_PIPELINE_CONTRACT_ABI_VERSION = 1,
     PTO_PIPELINE_MAX_RESOURCES = 8,
-    /* Ceiling on pipeline_depth, and the width every per-slot array and wire
-       frame is laid out for. A context grants at most this many run resource
-       sets; what a Worker requests and what a runtime supports are both
-       clamped to it. Raising it costs static footprint — one more mailbox
-       frame per endpoint and one more entry in each per-slot array — whether
-       or not any run holds the extra set. */
-    PTO_PIPELINE_MAX_DEPTH = 3,
 };
 
 /**
@@ -259,9 +252,10 @@ typedef struct NativeRunArtifactIdentity {
 
 /**
  * Immutable resource and trace identity copied into one prepared run.
- * `pipeline_slot` and `arena_bank` must be smaller than
- * PTO_PIPELINE_MAX_DEPTH; they remain explicit because some runtimes map a
- * leased slot to a different arena bank. `run_epoch` is the process-unique
+ * `pipeline_slot` and `arena_bank` must be smaller than the run-resource grant
+ * this context was given (`simpler_set_run_resource_grant_ctx`); they remain
+ * explicit because some runtimes map a leased slot to a different arena bank.
+ * `run_epoch` is the process-unique
  * identity used by later phase calls; lease generation, run id, and dispatch
  * id remain diagnostic after admission. A non-null acceptance sink is written
  * only at the real kernel-launch marker.
@@ -652,6 +646,26 @@ int simpler_set_retain_runs_ctx(DeviceContextHandle ctx, int32_t enabled);
  * record the larger grant.
  */
 int simpler_set_retained_epoch_limit_ctx(DeviceContextHandle ctx, int32_t limit);
+
+/**
+ * Tell this context how many run-resource sets its worker granted it, so every
+ * per-run resource is built to that count.
+ *
+ * The module declares in its `PipelineContract` what it can support; a worker
+ * decides how much of that this context uses, and that decision is not derivable
+ * here. So it is published once, after the context is created and before any run
+ * names a set.
+ *
+ * Optional, and resolved by `dlsym` like the gate above: a module built before
+ * this exports no such symbol, and its own default sizing then stands. A module
+ * that exports it refuses a grant it cannot build or one that would change the
+ * meaning of a set a run already holds, and a refusal leaves the previous sizing
+ * in force.
+ *
+ * Returns 0 when the grant is in force. Only a 0 return licenses the caller to
+ * hand this context a set index above its previous sizing.
+ */
+int simpler_set_run_resource_grant_ctx(DeviceContextHandle ctx, uint32_t granted);
 
 /**
  * The name the gate above shipped under, forwarding to it.

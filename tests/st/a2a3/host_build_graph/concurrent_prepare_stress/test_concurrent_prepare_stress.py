@@ -137,8 +137,8 @@ class TestConcurrentPrepareStressHbg(SceneTestCase):
         The property folds ``initialized_``, the runtime PipelineContract's
         ``pipeline_depth > 1``, and the runtime's concurrent-prepare capability
         symbol. On a2a3 host_build_graph all three hold unconditionally — the
-        contract declares depth 2 (as does every onboard runtime, and
-        PTO_PIPELINE_MAX_DEPTH is 2) and the capability impl returns 1 outright —
+        contract declares no limit of its own and this Worker is granted the
+        standing default of two — and the capability impl returns 1 outright —
         so a false here means one of them regressed, not that this box is
         differently configured. Neither is reachable from a CallConfig, which is
         why this is an assert and not a skip: skipping would report green for the

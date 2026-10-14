@@ -1016,8 +1016,7 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
         // After the init that publishes the region base: the bank is a slice of
         // that region, and it is resolved per run because it is keyed on this
         // run's pipeline slot and identity, not on the device's.
-        kernel_args_.chip_swimlane_run_terminal_bank =
-            arm_chip_swimlane_run_terminal_bank(prepared.pipeline_slot, prepared.identity.run_epoch);
+        kernel_args_.chip_swimlane_run_terminal_bank = arm_chip_swimlane_run_terminal_bank(prepared.identity.run_epoch);
     }
 
     if (dfx.dump_args_enabled()) {

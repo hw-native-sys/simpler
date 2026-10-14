@@ -105,16 +105,24 @@ from pathlib import Path
 
 import pytest
 import torch
+from simpler.task_interface import (
+    MAILBOX_RUN_ENTRY_STRIDE,
+    MAILBOX_RUN_ENTRY_TABLE_OFFSET,
+    DataType,
+    TaskArgs,
+    TensorArgType,
+    mailbox_run_entry_count,
+)
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import DataType, TaskArgs, TensorArgType
 from simpler.worker import (
-    _OFF_ACCEPTED,
-    _OFF_STATE,
+    _OFF_ENTRY_ACCEPTED,
+    _OFF_ENTRY_GENERATION,
+    _OFF_ENTRY_STATE,
     _TASK_ACCEPTED,
     _TASK_LAUNCHED,
-    MAILBOX_FRAME_SIZE,
     _mailbox_load_i32,
-    _read_task_frame_identity,
+    _mailbox_load_u64,
+    _read_run_entry_identity,
 )
 
 from simpler_setup import SceneTestCase, scene_test
@@ -253,31 +261,53 @@ def _frame_views(worker, chip_index=0):
     # Left unnamed on purpose: a ctypes object built from a buffer holds an export for as long as
     # it lives, so binding it would reintroduce exactly the leak this function exists to close.
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
-    frame_count = _negotiated_frame_counts(worker)[chip_index]
+    # One view per run-state entry, which is where a run's whole life is
+    # published: the 64 KiB request frames carry only the payload and go back to
+    # the parent as soon as the child has copied it out.
+    entry_count = mailbox_run_entry_count(_negotiated_frame_counts(worker)[chip_index])
     views = [
-        shm_buf[(1 + index) * MAILBOX_FRAME_SIZE : (2 + index) * MAILBOX_FRAME_SIZE] for index in range(frame_count)
+        shm_buf[
+            MAILBOX_RUN_ENTRY_TABLE_OFFSET + index * MAILBOX_RUN_ENTRY_STRIDE : MAILBOX_RUN_ENTRY_TABLE_OFFSET
+            + (index + 1) * MAILBOX_RUN_ENTRY_STRIDE
+        ]
+        for index in range(entry_count)
     ]
     try:
-        yield [(mailbox_addr + (1 + index) * MAILBOX_FRAME_SIZE, view) for index, view in enumerate(views)]
+        yield [
+            (mailbox_addr + MAILBOX_RUN_ENTRY_TABLE_OFFSET + index * MAILBOX_RUN_ENTRY_STRIDE, view)
+            for index, view in enumerate(views)
+        ]
     finally:
         for view in views:
             view.release()
 
 
-def _coherent_snapshot(frames):
-    """Every frame's ``(identity, state, accepted)``, or None when they moved mid-read.
+def _coherent_snapshot(entries):
+    """Every entry's ``(identity, state, accepted)`` at one instant, or None.
 
-    The frames are separate words, so reading them one after another can mix two instants.
-    Re-reading each identity after the states settles that: a set whose identities are unchanged
-    describes named runs at one point in their lives, which is what makes a claim about the *pair*
-    attributable at all.
+    Two passes over the **states**, not only over the identities. A single pass is not an
+    instant: it can read entry A launched, and then — after A has retired and its successor E
+    has launched — read E launched too, and report both as launched when neither overlapped the
+    other. Re-reading every state and requiring each to be unchanged is what makes the returned
+    set a claim about one point in time rather than about a window.
+
+    The identities are re-read for the same reason they always were: an entry whose identity
+    moved between the passes was reused mid-read, so nothing sampled from it names a run.
     """
-    before = [_read_task_frame_identity(buf) for _, buf in frames]
-    samples = [(_mailbox_load_i32(addr + _OFF_STATE), _mailbox_load_i32(addr + _OFF_ACCEPTED)) for addr, _ in frames]
-    after = [_read_task_frame_identity(buf) for _, buf in frames]
-    if before != after:
+    before_identity = [_read_run_entry_identity(buf) for _, buf in entries]
+
+    def _states():
+        return [
+            (_mailbox_load_i32(addr + _OFF_ENTRY_STATE), _mailbox_load_i32(addr + _OFF_ENTRY_ACCEPTED))
+            for addr, _ in entries
+        ]
+
+    before_state = _states()
+    after_state = _states()
+    after_identity = [_read_run_entry_identity(buf) for _, buf in entries]
+    if before_identity != after_identity or before_state != after_state:
         return None
-    return [(identity, state, accepted) for identity, (state, accepted) in zip(after, samples)]
+    return [(identity, state, accepted) for identity, (state, accepted) in zip(after_identity, after_state)]
 
 
 def _run_key(identity):
@@ -307,12 +337,17 @@ def _launched_run_keys(snapshot):
 
 
 def _two_distinct_runs_launched(snapshot):
-    """Whether the snapshot holds two different runs, both launched and both accepted."""
-    if snapshot is None or len(snapshot) != _FRAME_COUNT:
+    """Whether the snapshot holds two different runs, both launched and both accepted.
+
+    Counted over the entries that carry a launched run, never over the whole table. The table is
+    `M = granted + K` entries so that a hand-off can be taken before a set frees, so entries
+    beyond the runs in flight are idle by construction — a predicate requiring every entry
+    launched could never be satisfied at any grant.
+    """
+    keys = _launched_run_keys(snapshot)
+    if keys is None:
         return False
-    if not all(state == _TASK_LAUNCHED and accepted == _TASK_ACCEPTED for _, state, accepted in snapshot):
-        return False
-    return len({identity for identity, _, _ in snapshot}) == _FRAME_COUNT
+    return len(keys) >= _FRAME_COUNT
 
 
 def _dispatch_floor(frames):
@@ -1661,4 +1696,559 @@ class TestA2a3TmrEarlyEnqueueOutstandingClose(_A2a3TmrEarlyEnqueueBase):
         assert outstanding >= 1, (
             "no run was left outstanding, so this case's close would have nothing to drain and the "
             "obligation it exists to check would go untested"
+        )
+
+
+#: Run-resource sets a case asks for when it is proving the capacity has no fixed number in it.
+#: Above the three every per-set owner used to be laid out for, so a pass here cannot be a pass on
+#: a width that happened to exist.
+_WIDE_SETS = 5
+#: How long the window is watched for the full width, after every submission is out. Bounded so a
+#: regression fails on the assertion rather than on the scene-test deadline.
+_WIDE_WINDOW_BUDGET_S = 60.0
+#: How long a stopped sampler is given to return. Exceeding it is a failure, not a timeout that is
+#: then ignored: the sampler takes no blocking call and checks its stop event every iteration.
+_OBSERVER_JOIN_BUDGET_S = 5.0
+#: How long the first sample is waited for, so the observer's span is established before any
+#: submission rather than assumed from `Thread.start`.
+_OBSERVER_READY_BUDGET_S = 10.0
+
+
+class _EntrySampler:
+    """Background sampling of one endpoint's run-state entries, with a proved ownership boundary.
+
+    The sampler reads integer addresses into the chip mailbox's shared memory, so it must be
+    *proved* stopped before that mapping can go. A timed `join` whose result is not checked proves
+    nothing, and raising after a timeout still unwinds into the release — so this holds its own
+    export of the shared buffer for the thread's whole life. An export is what makes
+    ``SharedMemory.close()`` raise ``BufferError`` rather than unmap, so a sampler that will not
+    stop leaves the segment mapped and its close reports the live reader, instead of this case
+    reading freed memory. The export is released only after the thread is observed dead.
+
+    `__enter__` returns once the sampler has completed a sample, so "sampling spans the body" is
+    established rather than assumed from `Thread.start`. A sampler that raises carries its
+    exception to the caller rather than losing it on a daemon thread.
+
+    Subclasses implement `observe(snapshot)`; the loop owns the cadence, and every path sleeps —
+    a tight loop on an unstable table spends the window competing with the thread publishing
+    into it.
+    """
+
+    def __init__(self, worker, entries, case_runs, chip_index=0):
+        self._entries = entries
+        self._case_runs = case_runs
+        self._stop = threading.Event()
+        self._ready = threading.Event()
+        self._error: BaseException | None = None
+        shm_buf = worker._chip_shms[chip_index].buf  # noqa: SLF001 -- white-box mailbox observation
+        assert shm_buf is not None
+        self._mapping_hold = shm_buf[0:1]
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self.samples = 0
+        self.incoherent = 0
+
+    def observe(self, snapshot) -> None:
+        """Called once per sample with a coherent snapshot, or None when the read was unstable."""
+        raise NotImplementedError
+
+    def _run(self):
+        try:
+            while not self._stop.is_set():
+                snapshot = _coherent_snapshot(self._entries)
+                self._case_runs.note(snapshot)
+                self.samples += 1
+                if snapshot is None:
+                    self.incoherent += 1
+                else:
+                    self.observe(snapshot)
+                self._ready.set()
+                time.sleep(0.001)
+        except BaseException as error:  # noqa: BLE001 -- carried to the caller by __exit__
+            self._error = error
+            self._ready.set()
+
+    def __enter__(self):
+        self._thread.start()
+        if not self._ready.wait(timeout=_OBSERVER_READY_BUDGET_S):
+            self._shutdown()
+            raise AssertionError(
+                f"the entry sampler did not complete a sample within {_OBSERVER_READY_BUDGET_S}s, so nothing "
+                f"below would have been observed"
+            )
+        if self._error is not None:
+            self._shutdown()
+            raise AssertionError(f"the entry sampler failed before sampling: {self._error!r}")
+        return self
+
+    def _shutdown(self):
+        self._stop.set()
+        self._thread.join(timeout=_OBSERVER_JOIN_BUDGET_S)
+        if self._thread.is_alive():
+            raise AssertionError(
+                f"the entry sampler did not exit within {_OBSERVER_JOIN_BUDGET_S}s of being stopped; its export "
+                f"of the chip mailbox is deliberately still held, so this endpoint's shared memory stays mapped "
+                f"and its close will report the live reader rather than this case reading freed memory"
+            )
+        self._mapping_hold.release()
+
+    def __exit__(self, exc_type, _exc, _tb):
+        self._shutdown()
+        if exc_type is None and self._error is not None:
+            raise AssertionError(f"the entry sampler failed while sampling: {self._error!r}")
+        return False
+
+
+class _WorkedCapacityObserver(_EntrySampler):
+    """The worked example's evidence: sets held, runs launched, and how each set turned over.
+
+    `widest_held` is the capacity actually in use at one instant, taken from the entry generations'
+    parity; `widest` is how many of those were launched and accepted. They are different numbers,
+    and keeping them apart is what separates the grant from the launch budget.
+
+    `frontiers` records the highest dispatch id at each new widest instant, so a width reached once
+    can be told from one reached again over later runs. `dispatches_by_slot` records the order each
+    set carried, which is what shows a set passing from one run to its successor.
+    """
+
+    def __init__(self, worker, entries, case_runs, chip_index=0):
+        super().__init__(worker, entries, case_runs, chip_index)
+        self.widest = 0
+        self.widest_held = 0
+        self.held_sets: set[int] = set()
+        self.frontiers: list[int] = []
+        self.dispatches_by_slot: dict[int, list[int]] = {}
+
+    def observe(self, snapshot) -> None:
+        held = _held_run_sets(self._entries)
+        if held is not None:
+            self.held_sets.update(held)
+            self.widest_held = max(self.widest_held, len(held))
+        keys = _launched_run_keys(snapshot)
+        if not keys:
+            return
+        if len(keys) >= self.widest and len(keys) > 1:
+            self.widest = len(keys)
+            self.frontiers.append(max(dispatch_id for dispatch_id, _ in keys))
+        for dispatch_id, slot_id in keys:
+            seen = self.dispatches_by_slot.setdefault(slot_id, [])
+            if not seen or seen[-1] != dispatch_id:
+                seen.append(dispatch_id)
+
+
+class _WideWindowObserver(_EntrySampler):
+    """Watches for the widest instant of launched, accepted runs across a submission window.
+
+    Samples to its deadline rather than stopping at the first instant that shows nothing launched:
+    runs retire at different times, so a gap between one retiring and the next launching is an
+    ordinary part of the window and says nothing about whether the width was ever reached.
+
+    `history` records the launched count at each transition. It is diagnostic context for a failure
+    — it shows whether any width was reached and how the window moved — and on its own it cannot
+    tell a product clamp from an observation that missed the instant: both can produce a history
+    whose maximum is below the target.
+    """
+
+    def __init__(self, worker, entries, case_runs, want, chip_index=0):
+        super().__init__(worker, entries, case_runs, chip_index)
+        self._want = want
+        self.together = None
+        self.widest = set()
+        self.history: list[int] = []
+        self._last = -1
+
+    def observe(self, snapshot) -> None:
+        keys = _launched_run_keys(snapshot)
+        if keys is None:
+            self.incoherent += 1
+            return
+        if len(keys) != self._last:
+            self.history.append(len(keys))
+            self._last = len(keys)
+        if len(keys) > len(self.widest):
+            self.widest = set(keys)
+        if len(keys) >= self._want and self.together is None:
+            self.together = set(keys)
+
+    def report(self) -> str:
+        return (
+            f"widest instant {sorted(self.widest)} over {self.samples} samples "
+            f"({self.incoherent} incoherent); launched-count transitions {self.history}"
+        )
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestA2a3TmrWideOutstandingClose(_A2a3TmrEarlyEnqueueBase):
+    """``close()`` drains an unwaited prefix wider than the old three-set layout.
+
+    The narrow sibling above leaves two runs outstanding, which is the width every per-set owner
+    used to be built for — a close that drains two says nothing about a close that has to drain a
+    configured grant. This leaves `_WIDE_SETS` runs submitted and unwaited and leaves the drain to
+    the Worker's own teardown.
+
+    What this can and cannot show: the outstanding count is read from the Worker's own
+    `_accepted_run_handles` before the case returns, so the close is known to have had a wide
+    prefix to drain, and a close that failed to drain it fails this case in teardown. It does not
+    observe the device side of each drain; what it establishes is that a close with more than three
+    unwaited runs registered completes and reports no failure.
+    """
+
+    CASES = [
+        {
+            "name": "a2a3_tmr_wide_outstanding_close",
+            "platforms": ["a2a3"],
+            "config": {
+                "device_count": 1,
+                "num_sub_workers": 0,
+                "launch_depth": _WIDE_SETS,
+                "pipeline_depth": _WIDE_SETS,
+            },
+            "params": {},
+        },
+    ]
+
+    def _run_and_validate_l3(self, worker, compiled_callables, sub_handles, case, **kwargs):
+        del kwargs
+        type(self)._st_chip_handles = compiled_callables
+        type(self)._st_sub_handles = sub_handles
+        assert str(worker._config["platform"]) in case["platforms"]  # noqa: SLF001 -- scene-test validation
+        self.test_close_drains_a_wide_unwaited_prefix("a2a3", worker)
+
+    @pytest.mark.platforms(["a2a3"])
+    def test_close_drains_a_wide_unwaited_prefix(self, st_platform, st_worker):
+        """Submit `_WIDE_SETS` runs, wait none, and leave the whole prefix to the Worker's close."""
+        if st_platform != "a2a3":
+            pytest.skip("a2a3 TMR early enqueue is gated to the a2a3 onboard tensormap_and_ringbuffer route")
+        assert st_worker._pipeline_depth_request == _WIDE_SETS, (  # noqa: SLF001 -- scene-test validation
+            f"this class needs pipeline_depth={_WIDE_SETS}, got {st_worker._pipeline_depth_request}"  # noqa: SLF001
+        )
+        negotiated = _negotiated_frame_counts(st_worker)[0]
+        assert negotiated == _WIDE_SETS, (
+            f"the endpoint negotiated {negotiated} sets for a {_WIDE_SETS}-set request, so the prefix this case "
+            f"leaves outstanding would not be wider than the old layout"
+        )
+        # A durable prefix, for the reason the narrow sibling gives: a run still in flight owns the
+        # directory its child is writing to, so this case must not own one that is removed under a
+        # live writer.
+        output_prefix = str(build_output_prefix("a2a3_tmr_wide_outstanding_close"))
+        for index in range(_WIDE_SETS):
+            group, _out, _expected = self._three_buffers(st_worker, float(2 * index + 2), float(2 * index + 3))
+            # Deliberately neither retained nor waited: the handles stay registered on the Worker,
+            # which is the state close has to drain.
+            self._submit_vector(st_worker, group, output_prefix, spin_iters=_DEVICE_SPIN_ITERS)
+
+        outstanding = len(st_worker._accepted_run_handles)  # noqa: SLF001 -- the state close must drain
+        # Above the old three, not merely non-empty: a close that drained a narrow prefix and left
+        # the rest behind would satisfy "at least one" and fail the obligation this case is about.
+        assert outstanding > 3, (
+            f"only {outstanding} run(s) were left outstanding, so this case's close would drain no more than "
+            f"the three every per-set owner used to be laid out for"
+        )
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestA2a3TmrCapacityBeyondTheOldCeiling(_A2a3TmrEarlyEnqueueBase):
+    """At ``pipeline_depth=5`` five runs are in flight at once on the shared-scratch runtime.
+
+    This is the backend the old declaration bounded at two, on the reasoning that one shared
+    device scratch cannot serve more runs. It can: the AICPU stream is a FIFO and that order is
+    transitive, so a run ordered behind the run ahead of it is ordered behind everything that run
+    was ordered behind. What actually bounds concurrency here is the per-run task-args region, and
+    a context gets one of those per set it was granted.
+
+    What each check can see:
+
+    granted    the endpoint negotiated five task frames, so five runs have somewhere to go.
+    accepted   five different runs were observed launched and accepted at one coherent instant.
+    distinct   every run's own output is correct, so the shared scratch served five runs in order
+               rather than letting any two of them write over each other.
+    """
+
+    CASES = [
+        {
+            "name": "a2a3_tmr_capacity_beyond_the_old_ceiling",
+            "platforms": ["a2a3"],
+            "config": {
+                "device_count": 1,
+                "num_sub_workers": 0,
+                "launch_depth": _WIDE_SETS,
+                "pipeline_depth": _WIDE_SETS,
+            },
+            "params": {},
+        },
+    ]
+
+    def _run_and_validate_l3(self, worker, compiled_callables, sub_handles, case, **kwargs):
+        del kwargs
+        type(self)._st_chip_handles = compiled_callables
+        type(self)._st_sub_handles = sub_handles
+        assert str(worker._config["platform"]) in case["platforms"]  # noqa: SLF001 -- scene-test validation
+        self._require_wide_sets(worker)
+        self.test_five_runs_are_launched_and_accepted_at_once("a2a3", worker)
+
+    @staticmethod
+    def _require_wide_sets(worker):
+        assert worker._pipeline_depth_request == _WIDE_SETS, (  # noqa: SLF001 -- scene-test validation
+            f"this class needs a Worker at pipeline_depth={_WIDE_SETS}, got {worker._pipeline_depth_request}"  # noqa: SLF001
+        )
+        # The grant, not the request: this runtime used to declare two, so a negotiation that
+        # still lands on two is the clamp this case exists to refuse.
+        negotiated = _negotiated_frame_counts(worker)[0]
+        assert negotiated == _WIDE_SETS, (
+            f"the a2a3 TMR endpoint negotiated {negotiated} task frames for a {_WIDE_SETS}-set request, "
+            f"so the capacity was clamped somewhere and nothing below could observe it"
+        )
+
+    @pytest.mark.platforms(["a2a3"])
+    def test_five_runs_are_launched_and_accepted_at_once(self, st_platform, st_worker):
+        """Five accepted submissions over five sets, each with its own correct result."""
+        if st_platform != "a2a3":
+            pytest.skip("this capacity case is gated to the a2a3 onboard tensormap_and_ringbuffer route")
+        self._require_wide_sets(st_worker)
+        trace = _RunTrace(st_worker)
+        with _frame_views(st_worker) as frames:
+            case_runs = _CaseRuns(frames)
+            with tempfile.TemporaryDirectory(prefix="simpler-a2a3-tmr-wide-capacity-") as output_prefix:
+                handles: list = []
+                buffers: list = []
+                expectations: list = []
+                # Every buffer before any submission. Allocating between submits puts five device
+                # round trips inside the window the five runs have to share, which is the host
+                # racing itself rather than the capacity being measured.
+                groups = []
+                for index in range(_WIDE_SETS):
+                    group, out, expected = self._three_buffers(st_worker, float(2 * index + 2), float(2 * index + 3))
+                    groups.append(group)
+                    buffers.extend(group)
+                    expectations.append((out, expected))
+                observer = _WideWindowObserver(st_worker, frames, case_runs, _WIDE_SETS)
+                try:
+                    # Sampling spans the whole submission window: the instant this case is about is
+                    # somewhere inside it, and a sampler that starts after it can only see what is
+                    # left. `_DEVICE_SPIN_ITERS` is the budget documented for observing an overlap;
+                    # `_REFILL_SPIN_ITERS` is explicitly the shorter one.
+                    with observer:
+                        for group in groups:
+                            handles.append(
+                                self._submit_vector(st_worker, group, output_prefix, spin_iters=_DEVICE_SPIN_ITERS)
+                            )
+                        deadline = time.monotonic() + _WIDE_WINDOW_BUDGET_S
+                        while observer.together is None and time.monotonic() < deadline:
+                            time.sleep(0.001)
+                    together = observer.together
+                finally:
+                    # Before anything of this case's leaves scope, whatever the submission or the
+                    # observation did: a run still in flight owns its arguments and its output.
+                    drain_failures = _drain_handles(handles, "a2a3 TMR wide-capacity window")
+                assert not drain_failures, f"a run of this case did not finish: {drain_failures}"
+                _assert_results(expectations, trace, case_runs, "a2a3 TMR wide-capacity window")
+
+                assert together is not None, (
+                    f"{_WIDE_SETS} different runs were never observed launched and accepted at the same time, "
+                    f"so this runtime's shared scratch never carried more than its old declaration allowed"
+                )
+                assert len(together) == _WIDE_SETS, (
+                    f"fewer than {_WIDE_SETS} runs were named together: {sorted(together)}"
+                )
+
+
+#: The contract's worked example: eight run-resource sets with four of them on the device at
+#: once, and sixty-four submissions turning over through them. Eight is above every width this
+#: layout ever had, and the launch budget is deliberately *below* the grant — the two are
+#: separate budgets and a case that conflates them proves neither.
+_WORKED_SETS = 8
+_WORKED_LAUNCH_DEPTH = 4
+_WORKED_SUBMISSIONS = 64
+
+
+def _held_run_sets(entries):
+    """Which resource sets hold a run at one coherent instant, or None.
+
+    An entry's generation is odd while it is occupied and even once released, so the odd ones are
+    the runs in flight — staged, activated and launched alike — and the sets they name are the
+    capacity actually in use. That is a different number from how many are *launched*: a run
+    holding its set while it waits behind the launch budget is precisely what the sets beyond that
+    budget buy, and it is the only observation that separates the two bounds.
+
+    Two passes, for the reason :func:`_coherent_snapshot` takes two: one pass over a table being
+    refilled can read a set after it was released and another before it was taken, and so report an
+    instant that never existed.
+    """
+
+    def _read():
+        return [
+            (_mailbox_load_u64(addr + _OFF_ENTRY_GENERATION), _read_run_entry_identity(buf)[2]) for addr, buf in entries
+        ]
+
+    before = _read()
+    after = _read()
+    if before != after:
+        return None
+    return {slot for generation, slot in after if generation % 2 == 1}
+
+
+def _observe_launch_prefix(entries, want, timeout, case_runs):
+    """Watch for `want` different runs launched and accepted at one coherent instant.
+
+    Returns the widest set of keys seen together, which the caller compares against what the
+    launch budget allows. Unlike the capacity cases this does not require the *grant*'s worth of
+    runs to be launched: `launch_depth` bounds how many reach the device, and that bound is the
+    claim.
+    """
+    deadline = time.monotonic() + timeout
+    widest: set = set()
+    while time.monotonic() < deadline:
+        snapshot = _coherent_snapshot(entries)
+        case_runs.note(snapshot)
+        keys = _launched_run_keys(snapshot)
+        if keys is not None and len(keys) > len(widest):
+            widest = set(keys)
+            if len(widest) >= want:
+                return widest
+        time.sleep(0.001)
+    return widest
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestA2a3TmrWorkedCapacityExample(_A2a3TmrEarlyEnqueueBase):
+    """The contract's worked example, end to end: eight sets, four launched, sixty-four runs.
+
+    Three claims this suite's other cases cannot make, because each needs the two budgets to be
+    *different* numbers and the run count to exceed the sets:
+
+    separated  `launch_depth=4` under `pipeline_depth=8` must hold the device to four runs while
+               more than four are admitted and prepared. A case where the two are equal cannot
+               tell a launch budget from a resource budget.
+    sustained  sixty-four submissions retire through eight reused sets, with the widest observed
+               instant reached again later over a strictly higher frontier of dispatch ids — a set
+               carrying a *later* run, not one opening window.
+    ordered    no set is ever seen carrying an earlier run after a later one, so a set passes from
+               one run to its successor rather than being shared.
+
+    What the reuse observation is: a run-state entry showing a set under a second run's identity.
+    That is a physical observation of the set being handed on, and the production path only hands
+    it on after the earlier run's lifetime closed — this case reads the handover, it does not
+    witness each step of that closure.
+    """
+
+    CASES = [
+        {
+            "name": "a2a3_tmr_worked_capacity_example",
+            "platforms": ["a2a3"],
+            "config": {
+                "device_count": 1,
+                "num_sub_workers": 0,
+                "launch_depth": _WORKED_LAUNCH_DEPTH,
+                "pipeline_depth": _WORKED_SETS,
+            },
+            "params": {},
+        },
+    ]
+
+    def _run_and_validate_l3(self, worker, compiled_callables, sub_handles, case, **kwargs):
+        del kwargs
+        type(self)._st_chip_handles = compiled_callables
+        type(self)._st_sub_handles = sub_handles
+        assert str(worker._config["platform"]) in case["platforms"]  # noqa: SLF001 -- scene-test validation
+        self._require_worked_budgets(worker)
+        self.test_sixty_four_runs_retire_through_eight_sets("a2a3", worker)
+
+    @staticmethod
+    def _require_worked_budgets(worker):
+        assert worker._pipeline_depth_request == _WORKED_SETS, (  # noqa: SLF001 -- scene-test validation
+            f"this class needs pipeline_depth={_WORKED_SETS}, got {worker._pipeline_depth_request}"  # noqa: SLF001
+        )
+        assert worker._launch_depth == _WORKED_LAUNCH_DEPTH, (  # noqa: SLF001 -- scene-test validation
+            f"this class needs launch_depth={_WORKED_LAUNCH_DEPTH}, got {worker._launch_depth}"  # noqa: SLF001
+        )
+        negotiated = _negotiated_frame_counts(worker)[0]
+        assert negotiated == _WORKED_SETS, (
+            f"the endpoint negotiated {negotiated} sets for a {_WORKED_SETS}-set request, so the capacity was "
+            f"clamped somewhere and nothing below could observe it"
+        )
+
+    @pytest.mark.platforms(["a2a3"])
+    def test_sixty_four_runs_retire_through_eight_sets(self, st_platform, st_worker):
+        """Sustained submission at the contracted budgets, with the launch bound held."""
+        if st_platform != "a2a3":
+            pytest.skip("the worked capacity example is gated to the a2a3 onboard tensormap_and_ringbuffer route")
+        self._require_worked_budgets(st_worker)
+        trace = _RunTrace(st_worker)
+        with _frame_views(st_worker) as entries:
+            case_runs = _CaseRuns(entries)
+
+            handles: list = []
+            buffers: list = []
+            expectations: list = []
+            # Sampling spans the whole body, and the scope is what proves the sampler stopped
+            # before the entry views it reads are released — on every path, including the
+            # readiness handshake failing and a submission raising. See `_EntrySampler`.
+            with _WorkedCapacityObserver(st_worker, entries, case_runs) as observer:
+                with tempfile.TemporaryDirectory(prefix="simpler-a2a3-tmr-worked-") as output_prefix:
+                    try:
+                        for index in range(_WORKED_SUBMISSIONS):
+                            group, out, expected = self._three_buffers(
+                                st_worker, float(index % 7 + 2), float(index % 5 + 3)
+                            )
+                            buffers.extend(group)
+                            expectations.append((out, expected))
+                            handles.append(
+                                self._submit_vector(st_worker, group, output_prefix, spin_iters=_REFILL_SPIN_ITERS)
+                            )
+                    finally:
+                        # Every submitted run is drained before this case's buffers or its output
+                        # directory leave scope, whether the loop finished or a submission failed
+                        # part way. More than three are outstanding at this point, which is itself
+                        # part of what this case covers.
+                        drain_failures = _drain_handles(handles, "a2a3 worked capacity example")
+                    assert not drain_failures, f"a run of this case did not finish: {drain_failures}"
+                    _assert_results(expectations, trace, case_runs, "a2a3 worked capacity example")
+
+        assert len(handles) == _WORKED_SUBMISSIONS, f"only {len(handles)} of {_WORKED_SUBMISSIONS} runs were submitted"
+        # Four on the device at once, and never a fifth: the launch budget is a separate bound
+        # from the eight sets, and a run beyond it is prepared rather than launched.
+        assert observer.widest >= 2, (
+            f"no instant held two launched runs, so nothing above the serial path was observed: "
+            f"per-set dispatch ids {observer.dispatches_by_slot}"
+        )
+        # The configured grant, observed rather than inferred: every one of the eight sets holding a
+        # run at one coherent instant. That is what separates the grant from the launch budget —
+        # four is all the launch budget can ever account for — and it is the claim an implementation
+        # advertising eight while recycling fewer cannot satisfy.
+        #
+        # Occupancy comes from the entry generation's parity, which is what the protocol itself uses
+        # to mean occupied, so a set counted here holds a run whether that run is staged, activated
+        # or launched.
+        assert observer.widest_held == _WORKED_SETS, (
+            f"at most {observer.widest_held} of {_WORKED_SETS} resource sets were ever held at one instant, so the "
+            f"grant this Worker was given is not the capacity it reached: sets seen carrying a run "
+            f"{sorted(observer.held_sets)}"
+        )
+        assert len(observer.held_sets) == _WORKED_SETS, (
+            f"only {len(observer.held_sets)} resource set(s) ever carried a run across {_WORKED_SUBMISSIONS} "
+            f"submissions: {sorted(observer.held_sets)}"
+        )
+        assert observer.widest <= _WORKED_LAUNCH_DEPTH, (
+            f"{observer.widest} runs were launched and accepted at one instant, above the launch_depth of "
+            f"{_WORKED_LAUNCH_DEPTH} this Worker was configured with"
+        )
+        # The launch budget reached, not merely respected. With the grant full and the device
+        # busy, a peak below it would mean the configured depth is not what the lane actually
+        # fills — which a bound-only assertion cannot tell from a serial pipeline.
+        assert observer.widest == _WORKED_LAUNCH_DEPTH, (
+            f"the widest instant held {observer.widest} launched runs, not the {_WORKED_LAUNCH_DEPTH} this Worker "
+            f"was "
+            f"given, so the launch budget was never reached: per-set dispatch ids {observer.dispatches_by_slot}"
+        )
+        assert len(observer.frontiers) >= 2 and max(observer.frontiers) > min(observer.frontiers), (
+            f"the widest instant was never reached again over later identities, so the sets were filled once "
+            f"rather than refilled: observer.frontiers={observer.frontiers}"
+        )
+        regressed = {slot: ids for slot, ids in observer.dispatches_by_slot.items() if ids != sorted(ids)}
+        assert not regressed, (
+            f"a resource set was seen carrying an earlier run after a later one, so the sets are not passing "
+            f"from one run to its successor: {regressed}"
+        )
+        assert len(observer.dispatches_by_slot) >= 2, (
+            f"only {len(observer.dispatches_by_slot)} resource set(s) were ever seen carrying a run: "
+            f"{observer.dispatches_by_slot}"
         )
