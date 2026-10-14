@@ -215,10 +215,18 @@ def kernel_symbol_runtime(tmp_path_factory):
     next_library_id = 0
 
     def build(
-        *, supported=0, missing=(), init_result=0, finalize_failures=0, borrowed=False, memory=False, early_failure=None
+        *,
+        supported=0,
+        missing=(),
+        init_result=0,
+        finalize_failures=0,
+        borrowed=False,
+        memory=False,
+        early_failure=None,
+        lifecycle_log=None,
     ):
         nonlocal next_library_id
-        key = (supported, missing, init_result, finalize_failures, borrowed, memory, early_failure)
+        key = (supported, missing, init_result, finalize_failures, borrowed, memory, early_failure, lifecycle_log)
         # Fault scripts retain their consumed failure budget in the loaded DSO.
         if finalize_failures == 0 and key in cache:
             return cache[key]
@@ -231,14 +239,33 @@ def kernel_symbol_runtime(tmp_path_factory):
         source.write_text(
             '#include "runtime_c_api.h"\n'
             "#include <cstdlib>\n"
+            "#include <cstdio>\n"
+            "#include <memory>\n"
+            f"static const char *lifecycle_log = {json.dumps(str(lifecycle_log)) if lifecycle_log else 'nullptr'};\n"
+            "static void record(const char *event) {\n"
+            "    if (!lifecycle_log) return;\n"
+            '    FILE *file = std::fopen(lifecycle_log, "a");\n'
+            "    if (!file) std::abort();\n"
+            '    std::fprintf(file, "%s\\n", event);\n'
+            "    std::fclose(file);\n"
+            "}\n"
             "static int live_contexts = 0;\n"
             "static int destroys = 0, closes = 0, borrowed_inits = 0, validation = 0;\n"
             'extern "C" int test_destroys() { return destroys; }\n'
             'extern "C" int test_closes() { return closes; }\n'
             'extern "C" int test_borrowed_inits() { return borrowed_inits; }\n'
             'extern "C" void test_validation(int rc) { validation = rc; }\n'
+            "static int live_scratch = 0;\n"
+            "struct Scratch {\n"
+            '    Scratch() { ++live_scratch; record("scratch-created"); }\n'
+            '    ~Scratch() { --live_scratch; record("scratch-destroyed"); }\n'
+            "};\n"
+            "struct Context { uint64_t initialized = 0; std::shared_ptr<void> scratch; };\n"
             "struct ContextLeakCheck {\n"
-            "    ~ContextLeakCheck() { if (live_contexts != 0) std::abort(); }\n"
+            "    ~ContextLeakCheck() {\n"
+            "        if (live_contexts != 0 || live_scratch != 0) std::abort();\n"
+            '        record("runtime-unloaded");\n'
+            "    }\n"
             "};\n"
             "static ContextLeakCheck context_leak_check;\n"
             "struct SimplerHostLogState;\n"
@@ -248,9 +275,10 @@ def kernel_symbol_runtime(tmp_path_factory):
             # not export the setter is a stale build, not an opt-out. This stub
             # accepts the pointer and ignores it, as it does the log state.
             'extern "C" void simpler_bind_device_fault_monitor(void *) {}\n'
-            "DeviceContextHandle create_device_context() { ++live_contexts; return new uint64_t{0}; }\n"
+            "DeviceContextHandle create_device_context() { ++live_contexts; return new Context; }\n"
             "void destroy_device_context(DeviceContextHandle ctx) {\n"
-            "    ++destroys; --live_contexts; delete static_cast<uint64_t *>(ctx);\n"
+            "    ++destroys; --live_contexts; delete static_cast<Context *>(ctx);\n"
+            '    record("context-destroyed");\n'
             "}\n"
             f"static int finalize_failures = {finalize_failures};\n"
             "int finalize_device(DeviceContextHandle) {\n"
@@ -268,12 +296,14 @@ def kernel_symbol_runtime(tmp_path_factory):
             "}\n"
             "int simpler_init(DeviceContextHandle ctx, int, const uint8_t *, size_t, const uint8_t *, size_t,\n"
             "                 const uint8_t *, size_t, const CallConfig *, int, const void *, uint64_t) {\n"
-            "    *static_cast<uint64_t *>(ctx) = 1;\n"
+            "    auto *context = static_cast<Context *>(ctx);\n"
+            "    context->initialized = 1;\n"
+            "    context->scratch = std::make_shared<Scratch>();\n"
             f"    return {init_result};\n"
             "}\n"
             + (
                 "int simpler_kernel_mode_supported(DeviceContextHandle ctx) {\n"
-                "    if (ctx == nullptr || *static_cast<uint64_t *>(ctx) != 0) std::abort();\n"
+                "    if (ctx == nullptr || static_cast<Context *>(ctx)->initialized != 0) std::abort();\n"
                 f"    return {supported};\n"
                 "}\n"
                 if "simpler_kernel_mode_supported" not in missing
@@ -289,8 +319,9 @@ def kernel_symbol_runtime(tmp_path_factory):
                 output.write(
                     "int simpler_kernel_mode_init(DeviceContextHandle ctx, int, const uint8_t *, size_t, "
                     "const uint8_t *, size_t, const uint8_t *, size_t, const CallConfig *cfg, uint64_t generation) {\n"
-                    "    if (cfg == nullptr || generation != 77 || *static_cast<uint64_t *>(ctx) != 0) std::abort();\n"
-                    f"    ++borrowed_inits; *static_cast<uint64_t *>(ctx) = {0 if init_result == -1001 else 2};\n"
+                    "    auto *context = static_cast<Context *>(ctx);\n"
+                    "    if (cfg == nullptr || generation != 77 || context->initialized != 0) std::abort();\n"
+                    f"    ++borrowed_inits; context->initialized = {0 if init_result == -1001 else 2};\n"
                     f"    return {init_result};\n"
                     "}\n"
                     "int simpler_validate_execution_context(DeviceContextHandle) { return validation; }\n"
@@ -384,6 +415,35 @@ def kernel_symbol_runtime(tmp_path_factory):
 
 
 class TestChipWorkerKernelSymbols:
+    @pytest.mark.parametrize("exit_path", ["finalize", "init_failure", "finalize_retry"])
+    def test_retained_scratch_is_destroyed_before_runtime_unload(self, kernel_symbol_runtime, tmp_path, exit_path):
+        lifecycle_log = tmp_path / "lifecycle.log"
+        runtime = kernel_symbol_runtime(
+            lifecycle_log=lifecycle_log,
+            init_result=-1000 if exit_path == "init_failure" else 0,
+            finalize_failures=1 if exit_path == "finalize_retry" else 0,
+        )
+        worker = _ChipWorker()
+        try:
+            if exit_path == "init_failure":
+                with pytest.raises(RuntimeError, match="simpler_init failed with code -1000"):
+                    worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
+            else:
+                worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
+                if exit_path == "finalize_retry":
+                    with pytest.raises(RuntimeError, match=r"device teardown failed \(-77\)"):
+                        worker.finalize()
+                    assert lifecycle_log.read_text().splitlines() == ["scratch-created"]
+                worker.finalize()
+        finally:
+            worker.finalize()
+        assert lifecycle_log.read_text().splitlines() == [
+            "scratch-created",
+            "scratch-destroyed",
+            "context-destroyed",
+            "runtime-unloaded",
+        ]
+
     def test_unsupported_runtime_still_exports_lifecycle_symbols(self, kernel_symbol_runtime):
         # A runtime that cannot run kernel mode reports so through supported()
         # and still exports the whole family, the same way the comm group ships

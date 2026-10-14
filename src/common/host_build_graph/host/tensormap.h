@@ -363,7 +363,8 @@ struct ChipTensorMap {
     // Per-task entry tracking for O(1) unlinking of covered producers. A task id
     // is its own slot index, so this is indexed by local_id directly.
     std::unique_ptr<ChipTensorMapEntry *[]> task_entry_heads;
-    int32_t max_tasks{0};  // Slots task_entry_heads is dimensioned for
+    int32_t max_tasks{0};            // Active task-id domain
+    int32_t task_entry_capacity{0};  // Retained task-head allocation, grows only
 
     // Pool occupancy, read by the tensormap-exhaustion diagnostic and by the
     // Graph recording's capacity precheck.
@@ -425,17 +426,19 @@ struct ChipTensorMap {
     // =============================================================================
 
     /**
-     * Allocate the four arrays and leave the map empty. num_buckets must be a
+     * Reuse matching arrays or allocate them, then leave the map empty.
+     * num_buckets must be a
      * power of two; `new_max_tasks` is the number of task chains to reserve, one
      * per task id the caller can place.
      *
-     * Returns false when an allocation fails, so a caller that still has an
-     * alternative path can take it rather than proceed without a hazard map.
+     * Returns false without changing the map when an allocation fails. Bucket
+     * and pool sizes are exact; task-head storage retains its largest capacity.
+     * A smaller active task domain never shrinks or reconstructs the entry pool.
      *
-     * Clearing is O(num_buckets + max_tasks), not O(pool_size): the entry
-     * pool is left uninitialized and new_entry() puts each slot into the clean
-     * unlinked state on first use, and free_entry_list is a stack meaningful only
-     * below free_num.
+     * Clearing retained storage is O(num_buckets + task_entry_capacity). A fresh
+     * entry pool also constructs every TaskId; new_entry() puts each slot into
+     * the clean unlinked state on first use, and free_entry_list is a stack
+     * meaningful only below free_num.
      */
     bool init(int32_t new_num_buckets, int32_t new_pool_size, int32_t new_max_tasks);
 
@@ -444,7 +447,7 @@ struct ChipTensorMap {
      *
      * Same post-state as init(): every bucket and task-chain head null, both pool
      * cursors at zero, the entry pool left to init-on-write. Costs
-     * O(num_buckets + max_tasks) stores against pages that are already
+     * O(num_buckets + task_entry_capacity) stores against pages that are already
      * resident, where init() pays the allocation and the first touch of each. A
      * caller that records one body after another on the same map uses this.
      *

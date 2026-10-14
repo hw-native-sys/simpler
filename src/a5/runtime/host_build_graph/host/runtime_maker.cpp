@@ -1436,12 +1436,26 @@ int32_t run_host_orchestration(
     std::memset(host_sm, 0, sm_segs.storage);
 
     // Re-point the orchestrator half at the host SM (scheduler keeps device SM).
-    // Host-owned and destroyed with this frame, as is the context naming it — the
-    // device-side RuntimeContext carries neither.
-    OrchestratorState orchestrator;
+    // Storage is retained per slot; the orchestrator and its context belong to this bind.
+    auto scratch = api->get_orchestration_scratch();
+    if (!scratch) {
+        try {
+            scratch = std::make_shared<OrchestrationScratch>();
+        } catch (const std::bad_alloc &) {
+            LOG_ERROR("host-orch: failed to allocate retained orchestration storage");
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        api->set_orchestration_scratch(scratch);
+    }
+    auto &storage = *static_cast<OrchestrationScratch *>(scratch.get());
+    OrchestratorState orchestrator{};
+    storage.swap_storage(orchestrator);
     OrchContext orch_ctx{};
     orch_ctx.orchestrator = &orchestrator;
     orch_ctx.rt = rt;
+    RAIIScopeGuard retained_storage_return([&storage, &orchestrator]() {
+        storage.swap_storage(orchestrator);
+    });
     // The graph heap is allocated out of the HEAP_VIRTUAL_BASE window: its device
     // region is committed below, once this pass has revealed how many bytes it
     // actually needs, and compact_live_image moves every address the orchestrator
@@ -1592,12 +1606,8 @@ int32_t run_host_orchestration(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    ReadyQueuePopulations ready_queue_populations{};
-    SharedMemoryTaskHeader &tasks = host_sm_handle.header->tasks;
-    for (int32_t task_id = 0; task_id < total_tasks; ++task_id) {
-        const ChipTaskSlotState &slot = tasks.get_slot_state_by_task_id(task_id);
-        ready_queue_populations.add_task(slot.active_mask, slot.task_attrs, slot.task_kind);
-    }
+    // Submission already classified each slot while its fields were hot.
+    ReadyQueuePopulations ready_queue_populations = orchestrator.ready_queue_populations;
 
     // Bind Graph tasks to retained Definition addresses. The slot holds the
     // prepared source until synchronous publication consumes it.

@@ -191,6 +191,7 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
     // guard against closing a worker that never reached a device.
     static int device_context_placeholder = 0;
     worker.device_ctx_ = &device_context_placeholder;
+    worker.destroy_device_context_fn_ = stub_destroy_device_context;
     // A real, closable handle, because the teardown guard requires a bound runtime and the close
     // `dlclose`s whatever it finds. `dlopen(nullptr, ...)` names this program, which is already
     // loaded, so this adds a reference the close gives back rather than loading anything — a

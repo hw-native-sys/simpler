@@ -115,6 +115,7 @@ public:
     // The bulk-free finalize() performs, so each case leaves no scratch or
     // handle behind.
     void release_all() { release_callable_state(); }
+    void release_retained_orchestration() { release_sm_mirrors(); }
 
     // The diagnostic bank surface, which is a runner method rather than a pool one: the sim
     // runner has its own copy of it and its own collector instance, so this is where a parity
@@ -498,6 +499,61 @@ TEST_F(SimCallablePoolTest, TheSimRunnerHandsDiagnosticBanksOutByEpochAndRefuses
     EXPECT_EQ(runner_.arm_terminal_bank(7999), armed[1]) << "the released bank was not the one handed on";
 
     runner_.swimlane().finalize(nullptr, sim_bank_free);
+}
+
+// Exercise the real runner storage and teardown helper; no device execution
+// is needed to observe host ownership. Finalization must drop every slot once.
+TEST(SimOrchestrationScratchTest, TeardownReleasesAllSlotsAndIsIdempotent) {
+    PoolRunner runner;
+    PoolRunner other;
+    constexpr uint32_t granted = 7;
+    ASSERT_TRUE(runner.set_run_resource_grant(granted));
+    ASSERT_TRUE(other.set_run_resource_grant(granted));
+    auto outside_grant = std::make_shared<int>(0);
+    std::weak_ptr<int> unretained = outside_grant;
+    runner.set_orchestration_scratch(granted, outside_grant);
+    outside_grant.reset();
+    EXPECT_TRUE(unretained.expired());
+    EXPECT_EQ(runner.get_orchestration_scratch(granted), nullptr);
+    int destroyed = 0;
+    std::vector<std::weak_ptr<void>> weak(granted);
+    for (uint32_t slot = 0; slot < granted; ++slot) {
+        std::shared_ptr<void> value(new int(slot), [&destroyed](void *p) {
+            ++destroyed;
+            delete static_cast<int *>(p);
+        });
+        weak[slot] = value;
+        runner.set_orchestration_scratch(slot, value);
+        EXPECT_EQ(other.get_orchestration_scratch(slot), nullptr);
+    }
+    EXPECT_EQ(destroyed, 0);
+    // A bind's local reference remains valid until that borrower leaves.
+    auto borrower = runner.get_orchestration_scratch(0);
+    runner.release_retained_orchestration();
+    EXPECT_EQ(destroyed, granted - 1);
+    EXPECT_FALSE(weak[0].expired());
+    for (uint32_t slot = 0; slot < granted; ++slot) {
+        EXPECT_EQ(runner.get_orchestration_scratch(slot), nullptr);
+        if (slot != 0) EXPECT_TRUE(weak[slot].expired());
+    }
+    borrower.reset();
+    EXPECT_TRUE(weak[0].expired());
+    EXPECT_EQ(destroyed, granted);
+    runner.release_retained_orchestration();
+    EXPECT_EQ(destroyed, granted);
+}
+
+TEST(SimOrchestrationScratchTest, RunnerDestructionReleasesRetainedStorage) {
+    std::weak_ptr<void> weak;
+    {
+        PoolRunner runner;
+        auto value = std::make_shared<int>(7);
+        weak = value;
+        runner.set_orchestration_scratch(0, value);
+        value.reset();
+        EXPECT_FALSE(weak.expired());
+    }
+    EXPECT_TRUE(weak.expired());
 }
 
 }  // namespace

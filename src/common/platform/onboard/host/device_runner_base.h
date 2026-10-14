@@ -540,6 +540,12 @@ public:
     int acquire_scheduler_state_storage(
         uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **device_out, void **host_out
     );
+    std::shared_ptr<void> get_orchestration_scratch(uint32_t slot) const {
+        return slot < orchestration_scratch_.size() ? orchestration_scratch_[slot] : std::shared_ptr<void>{};
+    }
+    void set_orchestration_scratch(uint32_t slot, std::shared_ptr<void> scratch) {
+        if (slot < orchestration_scratch_.size()) orchestration_scratch_[slot] = std::move(scratch);
+    }
     int acquire_sm_mirror(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
     /**
      * Retain the host buffer a run assembles its device execution image in.
@@ -2666,6 +2672,7 @@ protected:
         std::unique_ptr<std::byte[]> storage;
         std::size_t capacity{0};
     };
+    RunResourceSlots<std::shared_ptr<void>> orchestration_scratch_;
     RunResourceSlots<RetainedSmMirror> sm_mirrors_;
 
     // Host staging for the device execution image, one retained buffer per
@@ -2737,6 +2744,7 @@ protected:
         RunResourceSlots<std::size_t>::Storage retained_temp_sizes;
         RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
         RunResourceSlots<RetainedSchedulerStorage>::Storage scheduler_state_storage;
+        RunResourceSlots<std::shared_ptr<void>>::Storage orchestration_scratch;
         RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;
         RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;
         RunResourceSlots<std::unique_ptr<ArenaBank>>::Storage arena_banks;

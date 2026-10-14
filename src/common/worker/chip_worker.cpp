@@ -21,6 +21,7 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <cassert>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
@@ -747,6 +748,10 @@ void ChipWorker::finalize() {
         device_ctx_ = nullptr;
     }
     if (lib_handle_) {
+        // The destroyed context owns the retained orchestration scratch, whose
+        // shared_ptr deleter and control-block code live in this host runtime.
+        // Native runs and their borrowed references are drained before teardown.
+        assert(device_ctx_ == nullptr);
         dlclose(lib_handle_);
     }
     clear_runtime_binding();

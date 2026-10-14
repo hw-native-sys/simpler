@@ -282,6 +282,7 @@ DeviceRunnerBase::RunResourceStaging DeviceRunnerBase::build_run_resources(size_
     staged.retained_temp_sizes = RunResourceSlots<std::size_t>::build(granted);
     staged.graph_definition_staging = RunResourceSlots<RetainedGraphStaging>::build(granted);
     staged.scheduler_state_storage = RunResourceSlots<RetainedSchedulerStorage>::build(granted);
+    staged.orchestration_scratch = RunResourceSlots<std::shared_ptr<void>>::build(granted);
     staged.sm_mirrors = RunResourceSlots<RetainedSmMirror>::build(granted);
     staged.run_image_stagings = RunResourceSlots<RetainedSmMirror>::build(granted);
     staged.slot_persistent_args = RunResourceSlots<SlotPersistentArgs>::build(granted);
@@ -342,6 +343,7 @@ void DeviceRunnerBase::commit_run_resources(size_t granted, RunResourceStaging &
     retained_temp_sizes_.commit(std::move(staged.retained_temp_sizes));
     graph_definition_staging_.commit(std::move(staged.graph_definition_staging));
     scheduler_state_storage_.commit(std::move(staged.scheduler_state_storage));
+    orchestration_scratch_.commit(std::move(staged.orchestration_scratch));
     sm_mirrors_.commit(std::move(staged.sm_mirrors));
     run_image_stagings_.commit(std::move(staged.run_image_stagings));
     arena_banks_.commit(std::move(staged.arena_banks));
@@ -1020,6 +1022,8 @@ void DeviceRunnerBase::release_run_image_stagings() {
 }
 
 void DeviceRunnerBase::release_sm_mirrors() {
+    for (auto &scratch : orchestration_scratch_)
+        scratch.reset();
     for (RetainedSmMirror &mirror : sm_mirrors_) {
         mirror.storage.reset();
         mirror.capacity = 0;

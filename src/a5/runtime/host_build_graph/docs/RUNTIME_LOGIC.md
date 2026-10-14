@@ -53,6 +53,33 @@ For each run, the host:
 6. returns from bind, then synchronously publishes Definitions, any resident
    scheduler state, and finally the shared-memory image with the copied zone.
 
+The exclusive pipeline slot retains only `OrchestrationScratch`: TensorMap
+arrays and the fan-in epoch array. Each bind owns a fresh `OrchestratorState`,
+borrows those arrays, and returns them after Graph recorder teardown on every
+exit. Fatal state, counters, mirror/heap pointers and Graph bindings belong to
+that run. A bind also holds a local owning reference. `ChipWorker::finalize()`
+drains native runs, finalizes and destroys the runner, and only then closes
+`host_runtime.so`, which owns the scratch deleter and shared-pointer control-block
+code. A failed device finalization retains both the runner and module for retry.
+Callable and executor libraries closed inside runner finalization are separate
+modules. `HostApiOps` is host-only: all providers and consumers must use the same
+table definition and be built together. Null fallback covers omitted callbacks
+in that definition, not shorter tables from older binaries.
+
+TensorMap resets bucket heads, every retained task head and allocation cursors without
+reconstructing unused entries. Bucket and entry-pool storage is reused while
+its own size matches; task-head and fan-in storage grow only. Changing the
+active task capacity does not reconstruct the unchanged entry pool. A failed
+TensorMap resize preserves the prior layout and contents; a successful init
+empties the map. With default capacities the arrays retain approximately
+8.72 MiB per used slot until finalization. Pool-size changes can temporarily
+hold old and replacement arrays. No new lock or device allocation is involved.
+
+Ready-queue populations are accumulated when a task slot receives its final
+classification. Ordinary tasks, hidden allocation tasks and outer Graph tasks
+participate; Graph definition populations are still combined at bind. Output
+layout entries are initialized and read only at `OUTPUT` argument positions.
+
 `publish_run_image_impl` is the single metadata consumer. Definition and compact
 image sources are retained by the exclusive pipeline slot; A5 scheduler source
 storage moves into the same pending record. Device allocations keep their

@@ -70,7 +70,7 @@ bool require_device_arguments(OrchestratorState *orch, const Args &args) {
 
 int32_t orch_mark_fatal(OrchestratorState *orch, int32_t error_code);
 
-OutputLayout calculate_output_layout(const CoreTaskArgs &args);
+void calculate_output_layout(const CoreTaskArgs &args, OutputLayout &layout);
 
 bool ensure_tensormap_capacity(OrchestratorState *orch, int32_t needed);
 

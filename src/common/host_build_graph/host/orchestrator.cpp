@@ -137,8 +137,16 @@ bool OrchestratorState::init(void *sm_base, void *gm_heap, uint64_t heap_size, u
     // Reset in place rather than by move-assignment: fatal_code is a std::atomic,
     // which is neither copy- nor move-assignable, and a re-init has to clear every
     // field the previous pass left behind (the pool cursors below rely on it).
+    // Keep only storage; reconstruct every per-run field, including fatal state
+    // and borrowed pointers, so failed or differently shaped runs cannot leak state.
+    auto retained_map = std::move(tensor_map);
+    auto retained_seen = std::move(fanin_seen_epoch);
+    const size_t retained_capacity = fanin_seen_capacity;
     this->~OrchestratorState();
     auto *orch = new (static_cast<void *>(this)) OrchestratorState{};
+    orch->tensor_map = std::move(retained_map);
+    orch->fanin_seen_epoch = std::move(retained_seen);
+    orch->fanin_seen_capacity = retained_capacity;
 
     always_assert(max_tasks > 0);
 
@@ -156,11 +164,18 @@ bool OrchestratorState::init(void *sm_base, void *gm_heap, uint64_t heap_size, u
     orch->scalar_pool = reinterpret_cast<uint64_t *>(sm_bytes + pools.scalar_pool);
 
     // Polling: no fanin-spill pool — producer ids are inline on the payload.
+    // The epoch table's pointer and capacity are only ever assigned together
+    // from a successful allocation, so a grow that succeeds leaves the pair
+    // non-null with the memset below in range.
     const auto slots = static_cast<size_t>(max_tasks);
-    orch->fanin_seen_epoch.reset(new (std::nothrow) uint32_t[slots]);
-    if (orch->fanin_seen_epoch == nullptr) {
-        LOG_ERROR("Orchestrator scratch allocation failed (max_tasks=%" PRIu64 ")", max_tasks);
-        return false;
+    if (slots > orch->fanin_seen_capacity) {
+        std::unique_ptr<uint32_t[]> grown(new (std::nothrow) uint32_t[slots]);
+        if (!grown) {
+            LOG_ERROR("Orchestrator scratch allocation failed (max_tasks=%" PRIu64 ")", max_tasks);
+            return false;
+        }
+        orch->fanin_seen_epoch = std::move(grown);
+        orch->fanin_seen_capacity = slots;
     }
     memset(orch->fanin_seen_epoch.get(), 0, slots * sizeof(uint32_t));
 
@@ -288,8 +303,8 @@ struct PreparedTask {
 };
 
 namespace simpler::hbg {
-OutputLayout calculate_output_layout(const CoreTaskArgs &args) {
-    OutputLayout layout;
+void calculate_output_layout(const CoreTaskArgs &args, OutputLayout &layout) {
+    layout.total_output_size = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) {
             continue;
@@ -298,7 +313,6 @@ OutputLayout calculate_output_layout(const CoreTaskArgs &args) {
         layout.buffer_sizes[i] = CHIP_ALIGN_UP(args.tensor(i).create_info().buffer_size_bytes(), PACKED_OUTPUT_ALIGN);
         layout.total_output_size += layout.buffer_sizes[i];
     }
-    return layout;
 }
 }  // namespace simpler::hbg
 
@@ -375,6 +389,7 @@ static bool prepare_task(
     out->slot_state->active_mask = active_mask;
     out->slot_state->task_attrs = task_attrs;
     out->slot_state->task_kind = active_mask.is_dummy() ? TaskKind::DUMMY : TaskKind::KERNEL;
+    orch->ready_queue_populations.add_task(active_mask, task_attrs, out->slot_state->task_kind);
     // payload.fanin_count is left untouched here: submit_task_common zeroes it before
     // its fanin appends, which accumulate into it in place.
 
@@ -573,7 +588,8 @@ static TaskOutputTensors submit_task_common(
     TaskOutputTensors result;
     DispatchPredicate resolved_predicate{};
     if (!resolve_dispatch_predicate(orch, args.predicate(), &resolved_predicate)) return result;
-    OutputLayout layout = calculate_output_layout(args);
+    OutputLayout layout;
+    calculate_output_layout(args, layout);
     PreparedTask prepared;
     if (!prepare_task(orch, args, layout.total_output_size, active_mask, task_attrs, &prepared)) {
         return result;
@@ -948,7 +964,8 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
         );
     }
 
-    OutputLayout layout = calculate_output_layout(args);
+    OutputLayout layout;
+    calculate_output_layout(args, layout);
     PreparedTask prepared;
     // Kernel-less alloc task: no active subtasks, no dispatch-time attributes. The
     // early-dispatch hint is force-set below (see the flag-the-creator note).

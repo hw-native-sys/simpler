@@ -22,10 +22,39 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <new>
 #include <vector>
 
 #include "host_build_graph/host/tensormap.h"
 #include "host_build_graph/task_id.h"
+
+namespace {
+// Only nothrow array allocations in this executable participate. The counter
+// is disarmed before gtest reports an assertion or allocates its diagnostics.
+int fail_array_after = -1;
+bool fail_array_allocation() {
+    if (fail_array_after < 0) return false;
+    return fail_array_after-- == 0;
+}
+}  // namespace
+
+void *operator new[](std::size_t bytes, const std::nothrow_t &) noexcept {
+    if (fail_array_allocation()) return nullptr;
+    try {
+        return ::operator new[](bytes);
+    } catch (const std::bad_alloc &) {
+        return nullptr;
+    }
+}
+
+void *operator new[](std::size_t bytes, std::align_val_t alignment, const std::nothrow_t &) noexcept {
+    if (fail_array_allocation()) return nullptr;
+    try {
+        return ::operator new[](bytes, alignment);
+    } catch (const std::bad_alloc &) {
+        return nullptr;
+    }
+}
 
 namespace {
 
@@ -200,3 +229,100 @@ TEST_F(HbgTensorMapTest, ExhaustedPoolStaysExhausted) {
 }
 
 }  // namespace
+
+TEST(HbgTensorMapReuse, ClearsReachabilityWithoutReconstructingEntries) {
+    ChipTensorMap map;
+    ASSERT_TRUE(map.init(16, 64, 32));
+    auto *entries = map.entry_pool.get();
+    auto *entry = map.new_entry();
+    entry->producer_task_id = TaskId::make_global(7);
+    map.buckets[2] = entry;
+    map.task_entry_heads[7] = entry;
+    ASSERT_TRUE(map.init(16, 64, 32));
+    EXPECT_EQ(map.entry_pool.get(), entries);
+    EXPECT_EQ(map.current_used(), 0);
+    EXPECT_EQ(map.next_entry_idx, 0);
+    EXPECT_EQ(map.free_num, 0);
+    EXPECT_EQ(map.buckets[2], nullptr);
+    EXPECT_EQ(map.task_entry_heads[7], nullptr);
+    // Retention, not a default-construction pass over the unused entries.
+    EXPECT_EQ(entries[0].producer_task_id, TaskId::make_global(7));
+    ASSERT_TRUE(map.init(32, 128, 64));
+    EXPECT_EQ(map.pool_capacity(), 128);
+    EXPECT_EQ(map.max_tasks, 64);
+    EXPECT_EQ(map.current_used(), 0);
+}
+
+TEST(HbgTensorMapReuse, TaskCapacityChangesKeepTheEntryPool) {
+    ChipTensorMap map;
+    ASSERT_TRUE(map.init(16, 64, 32));
+    auto *entries = map.entry_pool.get();
+    auto *buckets = map.buckets.get();
+    auto *free_list = map.free_entry_list.get();
+    for (int capacity : {64, 8, 32, 64}) {
+        ASSERT_TRUE(map.init(16, 64, capacity));
+        EXPECT_EQ(map.entry_pool.get(), entries);
+        ASSERT_EQ(map.buckets.get(), buckets);
+        EXPECT_EQ(map.free_entry_list.get(), free_list);
+        EXPECT_EQ(map.max_tasks, capacity);
+        EXPECT_EQ(map.current_used(), 0);
+    }
+    auto *heads = map.task_entry_heads.get();
+    fail_array_after = 0;
+    const bool reused = map.init(16, 64, 8);
+    fail_array_after = -1;
+    ASSERT_TRUE(reused);
+    EXPECT_EQ(map.task_entry_heads.get(), heads);
+}
+
+TEST(HbgTensorMapReuse, FailedResizePreservesTheMapAndCanBeRetried) {
+    for (int failure = 0; failure < 4; ++failure) {
+        ChipTensorMap map;
+        ASSERT_TRUE(map.init(16, 64, 32));
+        auto *entries = map.entry_pool.get();
+        auto *buckets = map.buckets.get();
+        auto *heads = map.task_entry_heads.get();
+        auto *free_list = map.free_entry_list.get();
+        auto tensor = make_test_tensor(0x1000, 64);
+        map.insert(tensor, TaskId::make_global(7));
+        fail_array_after = failure;
+        const bool resized = map.init(32, 128, 64);
+        fail_array_after = -1;
+        ASSERT_FALSE(resized);
+        EXPECT_EQ(map.entry_pool.get(), entries);
+        ASSERT_EQ(map.buckets.get(), buckets);
+        EXPECT_EQ(map.task_entry_heads.get(), heads);
+        EXPECT_EQ(map.free_entry_list.get(), free_list);
+        EXPECT_EQ(map.num_buckets, 16);
+        EXPECT_EQ(map.pool_capacity(), 64);
+        EXPECT_EQ(map.max_tasks, 32);
+        TestLookupResult result;
+        run_lookup(map, tensor, result);
+        ASSERT_EQ(result.count, 1);
+        EXPECT_EQ(result.entries[0].entry->producer_task_id, TaskId::make_global(7));
+        ASSERT_TRUE(map.init(32, 128, 64));
+        EXPECT_EQ(map.current_used(), 0);
+        result = {};
+        run_lookup(map, tensor, result);
+        EXPECT_EQ(result.count, 0);
+    }
+}
+
+TEST(HbgTensorMapReuse, FailedFirstAllocationLeavesAnEmptyOwnerAndCanBeRetried) {
+    for (int failure = 0; failure < 4; ++failure) {
+        ChipTensorMap map;
+        fail_array_after = failure;
+        const bool initialized = map.init(16, 64, 32);
+        fail_array_after = -1;
+        ASSERT_FALSE(initialized);
+        EXPECT_EQ(map.buckets, nullptr);
+        EXPECT_EQ(map.entry_pool, nullptr);
+        EXPECT_EQ(map.free_entry_list, nullptr);
+        EXPECT_EQ(map.task_entry_heads, nullptr);
+        EXPECT_EQ(map.num_buckets, 0);
+        EXPECT_EQ(map.pool_capacity(), 0);
+        EXPECT_EQ(map.max_tasks, 0);
+        ASSERT_TRUE(map.init(16, 64, 32));
+        EXPECT_EQ(map.current_used(), 0);
+    }
+}

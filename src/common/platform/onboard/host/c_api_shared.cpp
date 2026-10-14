@@ -372,6 +372,15 @@ static void get_graph_definition_staging(void *runner_ctx, uint32_t pipeline_slo
     } catch (...) {}
 }
 
+static std::shared_ptr<void> get_orchestration_scratch(void *runner_ctx, uint32_t slot) {
+    return runner_ctx == nullptr ? std::shared_ptr<void>{} :
+                                   static_cast<DeviceRunnerBase *>(runner_ctx)->get_orchestration_scratch(slot);
+}
+static void set_orchestration_scratch(void *runner_ctx, uint32_t slot, std::shared_ptr<void> scratch) {
+    if (runner_ctx != nullptr)
+        static_cast<DeviceRunnerBase *>(runner_ctx)->set_orchestration_scratch(slot, std::move(scratch));
+}
+
 static int
 acquire_sm_mirror(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
     if (addr_out != nullptr) *addr_out = nullptr;
@@ -595,6 +604,8 @@ static const HostApiOps g_host_api_ops = {
     .get_run_result = get_run_result,
     .declare_caller_device_writes = declare_caller_device_writes,
     .caller_device_span_written_by_other_run = caller_device_span_written_by_other_run,
+    .get_orchestration_scratch = get_orchestration_scratch,
+    .set_orchestration_scratch = set_orchestration_scratch,
 };
 
 /* ===========================================================================

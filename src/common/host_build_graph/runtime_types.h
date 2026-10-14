@@ -237,8 +237,10 @@ enum class TaskKind : uint8_t {
 };
 
 struct OutputLayout {
-    uint64_t offsets[MAX_TENSOR_ARGS] = {};
-    uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
+    // Only OUTPUT positions are written and read. Avoid clearing two full
+    // arrays for every submission, including tasks without created outputs.
+    uint64_t offsets[MAX_TENSOR_ARGS];
+    uint64_t buffer_sizes[MAX_TENSOR_ARGS];
     uint64_t total_output_size = 0;
 };
 

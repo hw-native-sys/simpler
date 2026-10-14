@@ -12,6 +12,8 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
+#include <utility>
 
 #include "common/chip_swimlane_extension.h"
 
@@ -251,6 +253,14 @@ struct HostApiOps {
     // input has no declared producer and stays readable. Zero for a runner with no such
     // allocation, no other declaring run, or no table at all.
     int (*caller_device_span_written_by_other_run)(void *runner_ctx, uint64_t run_id, uint64_t addr, uint64_t bytes);
+    // Appending entries preserves existing offsets. All providers and consumers
+    // must be built with the same table definition; null fallback applies only
+    // to optional callbacks zero-initialized within that definition. An older,
+    // shorter binary table cannot safely expose these fields.
+    // Host-only runtime scratch, isolated by pipeline slot and released with
+    // the slot's retained mirrors. No pointer in this object travels to device.
+    std::shared_ptr<void> (*get_orchestration_scratch)(void *runner_ctx, uint32_t pipeline_slot);
+    void (*set_orchestration_scratch)(void *runner_ctx, uint32_t pipeline_slot, std::shared_ptr<void> scratch);
 };
 
 /**
@@ -332,6 +342,15 @@ public:
         return ops_->acquire_scheduler_state_storage(
             runner_ctx_, pipeline_slot_, bytes, alignment, device_out, host_out
         );
+    }
+    std::shared_ptr<void> get_orchestration_scratch() const {
+        return ops_->get_orchestration_scratch == nullptr ?
+                   std::shared_ptr<void>{} :
+                   ops_->get_orchestration_scratch(runner_ctx_, pipeline_slot_);
+    }
+    void set_orchestration_scratch(std::shared_ptr<void> scratch) const {
+        if (ops_->set_orchestration_scratch != nullptr)
+            ops_->set_orchestration_scratch(runner_ctx_, pipeline_slot_, std::move(scratch));
     }
     int acquire_sm_mirror(size_t bytes, size_t alignment, void **addr_out) const {
         if (ops_->acquire_sm_mirror == nullptr) {

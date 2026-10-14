@@ -35,7 +35,8 @@ TEST(HbgOutputLayout, TwoOneGiBOutputsKeepFullTotal) {
     CoreTaskArgs args;
     args.add_output(first, second);
 
-    OutputLayout layout = calculate_output_layout(args);
+    OutputLayout layout;
+    calculate_output_layout(args, layout);
 
     EXPECT_EQ(layout.buffer_sizes[0], 1ull << 30);
     EXPECT_EQ(layout.buffer_sizes[1], 1ull << 30);
@@ -52,7 +53,8 @@ TEST(HbgOutputLayout, TotalsPastFourGiBDoNotWrapToASmallPositiveValue) {
     CoreTaskArgs args;
     args.add_output(big, small);
 
-    OutputLayout layout = calculate_output_layout(args);
+    OutputLayout layout;
+    calculate_output_layout(args, layout);
 
     EXPECT_EQ(layout.offsets[1], 4ull << 30);
     EXPECT_EQ(static_cast<uint64_t>(layout.total_output_size), 5ull << 30);

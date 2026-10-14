@@ -131,6 +131,17 @@ TEST_F(HbgSubmitPoisonTest, EveryDeviceReadFieldIsWrittenOverPoison) {
     auto &tasks = sm_handle->header->tasks;
     const int32_t total = orch.task_allocator.active_count();
     ASSERT_GE(total, 4);
+    ReadyQueuePopulations scanned{};
+    for (int32_t i = 0; i < total; ++i) {
+        const auto &slot = tasks.get_slot_state_by_task_id(i);
+        scanned.add_task(slot.active_mask, slot.task_attrs, slot.task_kind);
+    }
+    for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+        EXPECT_EQ(orch.ready_queue_populations.ready[i], scanned.ready[i]);
+        EXPECT_EQ(orch.ready_queue_populations.ready_sync[i], scanned.ready_sync[i]);
+    }
+    EXPECT_EQ(orch.ready_queue_populations.dummy, scanned.dummy);
+    EXPECT_EQ(orch.ready_queue_populations.graph_prepare, scanned.graph_prepare);
 
     // Every claimed slot's device-read fields must carry real values, not poison.
     for (int32_t local = 0; local < total; local++) {

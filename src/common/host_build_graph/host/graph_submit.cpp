@@ -319,6 +319,7 @@ bool graph_submit_outer(
     // activates — visible only as SIMPLER_ERROR_SCHEDULER_TIMEOUT.
     slot.logical_block_num = 1;
     slot.task_kind = TaskKind::GRAPH;
+    orch->ready_queue_populations.add_task(slot.active_mask, slot.task_attrs, slot.task_kind);
 
     task.task_id = task_id;
     std::fill(std::begin(task.kernel_id), std::end(task.kernel_id), INVALID_KERNEL_ID);
@@ -505,7 +506,8 @@ TaskOutputTensors graph_record_submit_sub_task(
         recording.unsupported = true;
     }
 
-    const OutputLayout layout = calculate_output_layout(args);
+    OutputLayout layout;
+    calculate_output_layout(args, layout);
     const uint64_t aligned_output = CHIP_ALIGN_UP(static_cast<uint64_t>(layout.total_output_size), CHIP_ALIGN_SIZE);
     // Outputs are bumped past the parameter windows: both regions belong to one simulated
     // heap, so the bound counts them together. That is deliberately conservative -- the

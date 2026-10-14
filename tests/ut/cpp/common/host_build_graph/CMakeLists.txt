@@ -74,6 +74,9 @@ hbg_cases(
     # Calls the real calculate_output_layout, which comes with the orchestrator
     # library (globs host/).
     test_hbg_output_layout.cpp
+    # Repeated real binds over retained scratch: reinit, a failed discharge, and
+    # the same calculate_output_layout reachable through the orchestrator library.
+    test_hbg_scratch_retention.cpp
     ORCH)
 
 hbg_case(test_hbg_graph_cache.cpp

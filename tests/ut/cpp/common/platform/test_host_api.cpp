@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -193,4 +194,33 @@ TEST(ChipSwimlaneExtensionTest, ExposesOnlyFixedSectionNamesAndShapes) {
     EXPECT_TRUE(chip_swimlane_extension_has_expected_root(ChipSwimlaneExtensionSection::AicoreTasks, " [] "));
     EXPECT_FALSE(chip_swimlane_extension_has_expected_root(ChipSwimlaneExtensionSection::SchedulerRecords, "[]"));
     EXPECT_FALSE(chip_swimlane_extension_has_expected_root(ChipSwimlaneExtensionSection::AicoreTasks, "{}"));
+}
+
+TEST(HostApi, OrchestrationScratchIsIsolatedByRunnerAndPipelineSlot) {
+    using ScratchSlots = std::array<std::shared_ptr<void>, 2>;
+    ScratchSlots first{}, second{};
+    HostApiOps ops{};
+    ops.get_orchestration_scratch = [](void *ctx, uint32_t slot) {
+        return (*static_cast<ScratchSlots *>(ctx))[slot];
+    };
+    ops.set_orchestration_scratch = [](void *ctx, uint32_t slot, std::shared_ptr<void> scratch) {
+        (*static_cast<ScratchSlots *>(ctx))[slot] = std::move(scratch);
+    };
+    const HostApi a(&first, 0, 0, 1, &ops);
+    const HostApi b(&first, 1, 0, 2, &ops);
+    const HostApi other(&second, 0, 0, 1, &ops);
+    auto value = std::make_shared<int>(7);
+    std::weak_ptr<int> lifetime = value;
+    a.set_orchestration_scratch(value);
+    value.reset();
+    EXPECT_FALSE(lifetime.expired());
+    EXPECT_EQ(*std::static_pointer_cast<int>(a.get_orchestration_scratch()), 7);
+    EXPECT_EQ(b.get_orchestration_scratch(), nullptr);
+    EXPECT_EQ(other.get_orchestration_scratch(), nullptr);
+    a.set_orchestration_scratch({});
+    EXPECT_TRUE(lifetime.expired());
+    HostApiOps unsupported{};
+    const HostApi fallback(nullptr, 0, 0, 0, &unsupported);
+    EXPECT_EQ(fallback.get_orchestration_scratch(), nullptr);
+    fallback.set_orchestration_scratch({});
 }

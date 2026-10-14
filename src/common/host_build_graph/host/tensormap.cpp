@@ -51,15 +51,15 @@ uint64_t g_insert_count = 0;
 // =============================================================================
 
 /**
- * Allocate the four arrays and reset the map to empty. Clears the bucket heads
- * and the per-task entry heads and resets the pool cursors (next_entry_idx /
- * free_num); the entry pool is left uninitialized and initialized on write by
- * new_entry(), so this is O(num_buckets + max_tasks), not O(pool_size).
+ * Reuse matching arrays or allocate a new layout, then reset the map to empty.
+ * Matching storage only clears bucket/task heads and pool cursors, costing
+ * O(num_buckets + task_entry_capacity). A new entry array additionally
+ * default-constructs every TaskId member, so its first initialization is
+ * O(pool_size) as well.
  *
- * `new (std::nothrow) T[n]` rather than a vector: a vector would value-initialize
- * the whole entry pool, which is megabytes of zeroing the init-on-write path
- * exists to avoid, and nothrow keeps the failure reportable to a caller that
- * still has an alternative path.
+ * Default initialization avoids value-initializing the other entry fields;
+ * new_entry() and insert() write them before use. Nothrow allocation keeps
+ * failures reportable to the caller.
  */
 bool ChipTensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t new_max_tasks) {
     // num_buckets must be a power of two for the hash truncation to work. The
@@ -68,39 +68,49 @@ bool ChipTensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t
     always_assert(new_max_tasks > 0);
     always_assert(new_pool_size > 0);
 
-    buckets.reset(new (std::nothrow) ChipTensorMapEntry *[new_num_buckets]);
-    entry_pool.reset(new (std::nothrow) ChipTensorMapEntry[new_pool_size]);
-    free_entry_list.reset(new (std::nothrow) ChipTensorMapEntry *[new_pool_size]);
-    task_entry_heads.reset(new (std::nothrow) ChipTensorMapEntry *[new_max_tasks]);
-    if (buckets == nullptr || entry_pool == nullptr || free_entry_list == nullptr || task_entry_heads == nullptr) {
+    auto fail = [&]() {
         LOG_ERROR(
             "TensorMap init failed (buckets=%d, pool=%d, max_tasks=%d)", new_num_buckets, new_pool_size, new_max_tasks
         );
         return false;
+    };
+    const bool replace_buckets = num_buckets != new_num_buckets || !buckets;
+    const bool replace_pool = pool_size != new_pool_size || !entry_pool || !free_entry_list;
+    const bool grow_heads = task_entry_capacity < new_max_tasks || !task_entry_heads;
+    std::unique_ptr<ChipTensorMapEntry *[]> new_buckets;
+    std::unique_ptr<ChipTensorMapEntry[]> new_entries;
+    std::unique_ptr<ChipTensorMapEntry *[]> new_free_list;
+    std::unique_ptr<ChipTensorMapEntry *[]> new_heads;
+    if (replace_buckets) {
+        new_buckets.reset(new (std::nothrow) ChipTensorMapEntry *[new_num_buckets]);
+        if (!new_buckets) return fail();
+    }
+    if (replace_pool) {
+        new_entries.reset(new (std::nothrow) ChipTensorMapEntry[new_pool_size]);
+        if (!new_entries) return fail();
+        new_free_list.reset(new (std::nothrow) ChipTensorMapEntry *[new_pool_size]);
+        if (!new_free_list) return fail();
+    }
+    if (grow_heads) {
+        new_heads.reset(new (std::nothrow) ChipTensorMapEntry *[new_max_tasks]);
+        if (!new_heads) return fail();
     }
 
+    // Every fallible allocation precedes publication. A failure leaves both the
+    // previous layout and its reachable entries intact; a success empties it.
+    if (replace_buckets) buckets = std::move(new_buckets);
+    if (replace_pool) {
+        entry_pool = std::move(new_entries);
+        free_entry_list = std::move(new_free_list);
+    }
+    if (grow_heads) {
+        task_entry_heads = std::move(new_heads);
+        task_entry_capacity = new_max_tasks;
+    }
     num_buckets = new_num_buckets;
     pool_size = new_pool_size;
     max_tasks = new_max_tasks;
-
-    for (int32_t i = 0; i < num_buckets; i++) {
-        buckets[i] = nullptr;
-    }
-    for (int32_t i = 0; i < max_tasks; i++) {
-        task_entry_heads[i] = nullptr;
-    }
-
-    // Init-on-write: the entry pool is not pre-zeroed. new_entry() puts each
-    // bump-allocated slot into the clean "unlinked" state (bucket_index == -1,
-    // link pointers null) -- the same state free_entry() leaves a recycled slot
-    // in -- so only current_used() live entries are ever touched. buckets[] start
-    // empty and unallocated slots are never reached via a bucket chain, so
-    // nothing reads an uninitialized slot; the two debug scans (print_stats /
-    // valid_count) are bounded to next_entry_idx. free_entry_list is a stack
-    // sized by free_num, meaningful only after frees, so it needs no init.
-
-    next_entry_idx = 0;
-    free_num = 0;
+    reset();
     return true;
 }
 
@@ -110,7 +120,10 @@ void ChipTensorMap::reset() {
     for (int32_t i = 0; i < num_buckets; i++) {
         buckets[i] = nullptr;
     }
-    for (int32_t i = 0; i < max_tasks; i++) {
+    // Every retained head, not just the active domain: the head array outlives a
+    // smaller max_tasks, and a head left behind would point into the entry pool a
+    // later init replaces.
+    for (int32_t i = 0; i < task_entry_capacity; i++) {
         task_entry_heads[i] = nullptr;
     }
     // Entries are reached only through a bucket chain, and every chain is now empty, so

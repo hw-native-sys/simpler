@@ -31,8 +31,10 @@
 #include <cstddef>
 #include <memory>
 #include <type_traits>
+#include <utility>
 
 #include "host_build_graph/host/task_allocator.h"
+#include "host_build_graph/host/ready_queue_sizing.h"
 #include "graph_cache.h"
 #include "host_build_graph/runtime_status.h"
 #include "host_build_graph/runtime_types.h"
@@ -54,18 +56,20 @@ struct GraphHostState;
  *
  * host_build_graph runs the orchestrator on the host and ships the shared-memory
  * image it produces, so this whole object is host-only: it owns its scratch
- * arrays outright and no device code reads any of them. RuntimeContext therefore
- * holds it by pointer — a by-value member would put non-trivially-copyable state
- * inside the struct bind copies to the device.
+ * arrays outright and no device code reads any of them. The host-only
+ * OrchContext borrows it for one bind; neither object is part of the device image.
  */
-struct OrchestratorState {
+// init() reconstructs this complete object in place; it cannot be a base subobject.
+struct OrchestratorState final {
     // === SHARED MEMORY ACCESS ===
     SharedMemoryHeader *sm_header;
 
     // === TASK / HEAP ALLOCATION ===
     // hbg has one task table, so one allocator covers the whole graph.
     TaskAllocator task_allocator;
+    ReadyQueuePopulations ready_queue_populations{};
     std::unique_ptr<uint32_t[]> fanin_seen_epoch;
+    size_t fanin_seen_capacity{0};
     uint32_t fanin_seen_current_epoch{1};
 
     // === TENSOR MAP (Private) ===
@@ -141,7 +145,7 @@ struct OrchestratorState {
 
     // === Cold-path API (defined in orchestrator.cpp) ===
 
-    // Allocate the scratch arrays (fanin epoch table, scope arrays, tensor map)
+    // Reuse or allocate scratch arrays (fanin epoch table and tensor map)
     // and bind this orchestrator to one shared-memory mirror, GM heap and
     // scheduler. sm_base is the base of the mirror this orchestrator writes; it
     // is dereferenced, so a host-orch pass passes its host mirror rather than a
@@ -182,6 +186,21 @@ struct OrchestratorState {
     GraphScopeResult graph_begin_inner(uint64_t graph_key, const GraphTaskArgs &args);
     void graph_commit_inner();
     void mark_done();
+};
+
+// Host-only storage owned by one reserved pipeline slot. Run state (fatal code,
+// mirror pointers, graph recorders and cursors) is never retained in this holder.
+// A bind exclusively borrows the arrays and returns them after recorder teardown.
+struct OrchestrationScratch {
+    ChipTensorMap tensor_map;
+    std::unique_ptr<uint32_t[]> fanin_seen_epoch;
+    size_t fanin_seen_capacity{0};
+
+    void swap_storage(OrchestratorState &orch) noexcept {
+        std::swap(tensor_map, orch.tensor_map);
+        std::swap(fanin_seen_epoch, orch.fanin_seen_epoch);
+        std::swap(fanin_seen_capacity, orch.fanin_seen_capacity);
+    }
 };
 
 // task_allocator holds a pointer back to this object's own fatal_code, so relocating

@@ -21,7 +21,27 @@ struct ReadyQueuePopulations {
     uint64_t dummy{0};
     uint64_t graph_prepare{0};
 
-    void add_task(ActiveMask active_mask, TaskAttrs task_attrs, TaskKind task_kind, uint64_t count = 1);
+    void add_task(ActiveMask active_mask, TaskAttrs task_attrs, TaskKind task_kind, uint64_t count = 1) {
+        auto add_population = [](uint64_t *population, uint64_t count) {
+            constexpr uint64_t limit = READY_QUEUE_CAPACITY_LIMIT + 1;
+            *population =
+                (*population >= limit || count >= limit || count > limit - *population) ? limit : *population + count;
+        };
+        if (task_kind == TaskKind::GRAPH) {
+            add_population(&graph_prepare, count);
+            return;
+        }
+
+        const ResourceShape shape = active_mask.to_shape();
+        if (shape == ResourceShape::DUMMY) {
+            add_population(&dummy, count);
+            return;
+        }
+
+        if (task_attrs.has_predicate()) add_population(&dummy, count);
+        uint64_t *population = task_attrs.requires_sync_start() ? ready_sync : ready;
+        add_population(&population[static_cast<int32_t>(shape)], count);
+    }
     void add(const ReadyQueuePopulations &other);
     bool derive_capacities(ReadyQueueCapacities *capacities) const;
 };
