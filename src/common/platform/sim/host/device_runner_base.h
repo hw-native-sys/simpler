@@ -615,6 +615,13 @@ public:
      * `run_epoch` identifies the run whose retained terminal snapshot is read
      * back, which happens only when `device_execution_complete` says the caller
      * observed this run's completion.
+     *
+     * `device_producers_stopped` is the separate fact that no producer can
+     * still be writing into this run's terminal bank. A simulated device's
+     * producers are the AICPU and AICore threads of this process, so a caller
+     * that joined them knows it; pass it only from such a caller. It decides
+     * whether a *failed* run's bank is returned unread or withdrawn, and it
+     * never licenses reading a snapshot the run did not complete.
      */
     /**
      * Returns non-zero when a collector's close reported an ownership failure
@@ -623,7 +630,8 @@ public:
      * diagnosis.
      */
     int teardown_shared_collectors_after_run(
-        const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
+        const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete,
+        bool device_producers_stopped
     );
     // Diagnostic artifact root directory (CallConfig::validate() enforces non-empty
     // upstream when any diagnostic is enabled).

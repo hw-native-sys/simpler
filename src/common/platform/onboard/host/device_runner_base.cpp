@@ -4351,8 +4351,14 @@ int DeviceRunnerBase::teardown_shared_collectors_after_run(
         // this run's snapshot is in its bucket, withdrawn when completion could
         // not be proved. Handing it the resource-set index would read whichever
         // run happens to hold that bank.
+        //
+        // `false` for the producer-stop proof, on every path: a device run's
+        // producers are an AICPU and its cores, and nothing this host can do
+        // observes them stopping. Completion of the fence is the only proof
+        // available here, which is why it decides both halves.
         simpler::dfx::runs::close_run_boundary(
-            chip_swimlane_collector_, run_epoch, device_execution_complete, [this, pipeline_slot] {
+            chip_swimlane_collector_, run_epoch, device_execution_complete, /*device_producers_stopped=*/false,
+            [this, pipeline_slot] {
                 publish_host_phase_records_to_swimlane(pipeline_slot);
             }
         );

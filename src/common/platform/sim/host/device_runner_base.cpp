@@ -1384,7 +1384,8 @@ void SimDeviceRunnerBase::close_scope_stats_run_boundary(
 }
 
 int SimDeviceRunnerBase::teardown_shared_collectors_after_run(
-    const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
+    const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete,
+    bool device_producers_stopped
 ) {
     // The order is fixed by two couplings, not by preference: the host phase
     // records reach the collector before the swimlane export serializes them,
@@ -1406,9 +1407,12 @@ int SimDeviceRunnerBase::teardown_shared_collectors_after_run(
         // one copy of the sections for every run it serves.
         // No bank index is passed: a bank is held by the epoch that acquired it,
         // so the close resolves its own and settles it there. See the onboard
-        // base for the two proofs that let one be handed on.
+        // base for the two proofs that let one be handed on, and
+        // `device_producers_stopped` for the third, which only a simulated
+        // device can supply.
         simpler::dfx::runs::close_run_boundary(
-            chip_swimlane_collector_, run_epoch, device_execution_complete, [this, pipeline_slot] {
+            chip_swimlane_collector_, run_epoch, device_execution_complete, device_producers_stopped,
+            [this, pipeline_slot] {
                 publish_host_phase_records_to_swimlane(pipeline_slot);
                 publish_chip_swimlane_runtime_extensions();
             }
@@ -1429,8 +1433,12 @@ int SimDeviceRunnerBase::teardown_shared_collectors_after_run(
         chip_swimlane_collector_.quiesce();
         chip_swimlane_collector_.read_phase_header_metadata();
         chip_swimlane_collector_.reconcile_counters();
-        // Only on the completion path; see the onboard base for why an
-        // incomplete run's bank says nothing about that run.
+        // Only the completion path reads the bank; see the onboard base for why
+        // an incomplete run's snapshot says nothing about that run. Whether the
+        // bank itself comes back is a separate question, and on a simulated
+        // device it has an answer: the producers are this process's AICPU and
+        // AICore threads, and the drain joined every one of them before it got
+        // here.
         const int bank = chip_swimlane_collector_.run_terminal_bank_of(run_epoch);
         if (device_execution_complete) {
             if (bank >= 0) {
@@ -1438,10 +1446,15 @@ int SimDeviceRunnerBase::teardown_shared_collectors_after_run(
                 chip_swimlane_collector_.release_run_terminal_bank(run_epoch);
             }
         } else if (bank >= 0) {
-            // Joining this host's simulated threads is not a proof about the
-            // bank: the producers write into it from the simulated device side,
-            // and the recovery path reaches here without having settled them.
-            chip_swimlane_collector_.quarantine_run_terminal_bank(run_epoch);
+            if (device_producers_stopped) {
+                // Nothing reads what this run left there — `quiesce` above
+                // stopped the host's readers, and the entries carry their own
+                // epoch, so a survivor is counted as foreign by the next
+                // occupant rather than attributed to it.
+                chip_swimlane_collector_.discard_run_terminal_bank(run_epoch);
+            } else {
+                chip_swimlane_collector_.quarantine_run_terminal_bank(run_epoch);
+            }
         }
         publish_host_phase_records_to_swimlane(pipeline_slot);
         publish_chip_swimlane_runtime_extensions();

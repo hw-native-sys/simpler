@@ -353,6 +353,51 @@ TEST(ChipSwimlaneRunTerminalTest, AnUnprovenRunWithdrawsItsBankRatherThanReturni
     EXPECT_FALSE(collector.can_take_run_terminal_bank(8999));
 }
 
+// A failure whose producers are proved stopped is not an unproven run: nothing
+// can still be writing into that bank, so it goes back unread instead of being
+// withdrawn. The two proofs are separate facts about the same failed run —
+// whether its snapshot is valid to read, and whether its storage is safe to
+// reissue — and this pins the second against the first.
+TEST(ChipSwimlaneRunTerminalTest, AProvenStoppedFailureReturnsItsBankWhereAnUnprovenOneWithdrawsIt) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(init_collector(collector, /*num_aicore=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING), 0);
+
+    constexpr uint64_t kStopped = 8201;
+    const int stopped_bank = collector.acquire_run_terminal_bank(kStopped);
+    ASSERT_GE(stopped_bank, 0);
+    collector.discard_run_terminal_bank(kStopped);
+    EXPECT_EQ(collector.run_terminal_bank_of(kStopped), -1);
+    EXPECT_EQ(collector.quarantined_run_terminal_banks(), 0) << "a proved-stopped failure withdrew its bank";
+    EXPECT_EQ(collector.acquire_run_terminal_bank(8202), stopped_bank) << "the credit never came back to the table";
+
+    constexpr uint64_t kUnproven = 8203;
+    const int unproven_bank = collector.acquire_run_terminal_bank(kUnproven);
+    ASSERT_GE(unproven_bank, 0);
+    collector.quarantine_run_terminal_bank(kUnproven);
+    EXPECT_EQ(collector.quarantined_run_terminal_banks(), 1) << "an unproven run must still withdraw its bank";
+    collector.finalize(nullptr, terminal_test_free);
+}
+
+// Repeated failures on a simulated device: every one of them joined its
+// producers, so capacity is not consumed by failing. One more failure than there
+// are banks, because that is the count at which a withdrawal would show — three
+// quarantines retire the whole table, and the fourth run would find nothing to
+// arm and publish no snapshot for the rest of the collector's life.
+TEST(ChipSwimlaneRunTerminalTest, RepeatedProvenStoppedFailuresKeepEveryBankInService) {
+    ChipSwimlaneCollector collector;
+    ASSERT_EQ(init_collector(collector, /*num_aicore=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING), 0);
+
+    for (uint64_t epoch = 8301; epoch <= 8301 + PLATFORM_RUN_TERMINAL_BANKS; ++epoch) {
+        const int bank = collector.acquire_run_terminal_bank(epoch);
+        ASSERT_GE(bank, 0) << "epoch " << epoch << " found no bank after " << (epoch - 8301) << " failed runs";
+        ASSERT_NE(collector.arm_run_terminal_bank(static_cast<uint32_t>(bank), epoch), nullptr);
+        collector.discard_run_terminal_bank(epoch);
+    }
+    EXPECT_EQ(collector.quarantined_run_terminal_banks(), 0);
+    EXPECT_TRUE(collector.can_take_run_terminal_bank(8399));
+    collector.finalize(nullptr, terminal_test_free);
+}
+
 // The bank credit a run takes does not depend on whether this collector retains
 // output. `withdraw_unlaunched_collectors_for_run` used to return before the
 // release whenever retention was off, so a diagnostic-enabled ordinary-output run

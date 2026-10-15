@@ -729,15 +729,23 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     int runtime_rc = run_completion_.first_error();
     if (runtime_rc != 0) {
         LOG_ERROR("AICPU execution failed with rc=%d", runtime_rc);
-        // The AICPU threads are joined above, so every collector's producer has
-        // stopped and its records are as complete as the run made them. Export
-        // them: a failed run is the one whose swimlane, dumped tensors and
-        // dep_gen graph are worth reading. `false` withholds only the run
-        // terminal snapshot, which this run never reached.
+        // `active_run_->join()` above joined this run's AICPU *and* AICore
+        // threads, and those threads are the simulated device: each one calls
+        // its execute function synchronously in its own body, so none of them
+        // outlives the join and no producer can still be recording. That is why
+        // the second argument is true where the onboard runner's is false.
+        //
+        // So every collector's records are as complete as the run made them.
+        // Export them: a failed run is the one whose swimlane, dumped tensors
+        // and dep_gen graph are worth reading. The `false` withholds the run
+        // terminal snapshot, which this run never reached — its bank goes back
+        // unread rather than being withdrawn, because the producer-stop proof
+        // is what a withdrawal is for.
         // The runtime error that brought this path here stays authoritative, so
         // a diagnostics ownership failure only logs on it.
         const int error_teardown_rc = teardown_shared_collectors_after_run(
-            dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, false
+            dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch,
+            /*device_execution_complete=*/false, /*device_producers_stopped=*/true
         );
         if (error_teardown_rc != 0) {
             LOG_ERROR("Diagnostics teardown reported %d on the error path; the run error is kept", error_teardown_rc);
@@ -751,7 +759,8 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // told the run succeeded would read files whose completeness nothing
     // established.
     const int teardown_rc = teardown_shared_collectors_after_run(
-        dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, true
+        dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch,
+        /*device_execution_complete=*/true, /*device_producers_stopped=*/true
     );
     emit_device_dep_gen_graph(dfx, active.prepared->identity.run_epoch, true);
 

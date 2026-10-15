@@ -876,16 +876,37 @@ public:
      * Only for a run whose bank is proved finished with: its snapshot has been
      * consumed — reported, or copied into the epoch's own bucket — or it never
      * submitted anything, so no producer can be holding the address. Those are
-     * the only two proofs; a run whose completion is merely unobserved is
-     * quarantined instead.
+     * the proofs that the *data* is done with; `discard_run_terminal_bank` adds
+     * the one for a run whose data is worthless but whose producers are proved
+     * gone. A run whose completion is merely unobserved is quarantined instead.
      */
     void release_run_terminal_bank(uint64_t run_epoch);
 
     /**
+     * Give back the bank `run_epoch` held without reading it, on proof that
+     * every producer that could write into it has terminated.
+     *
+     * The failed-run counterpart of `release_run_terminal_bank`. What the bank
+     * holds is not this run's accounting — the run never reached its terminal
+     * publication, so the entries are whatever its producers managed before the
+     * failure, mixed with whatever the previous occupant left. None of it is
+     * read: no consumer is waiting on it, the host never copies it, and an entry
+     * that outlives this epoch is counted as foreign by the next occupant's
+     * snapshot, which compares each entry's own stamp. So the storage is free
+     * and saying so costs nothing but the bytes.
+     *
+     * The proof is the caller's and it is about producers, not about success:
+     * a simulated device's producers are host threads, and joining them
+     * establishes that none remains. A real device's do not become observable
+     * this way — there the answer is `quarantine_run_terminal_bank`.
+     */
+    void discard_run_terminal_bank(uint64_t run_epoch);
+
+    /**
      * Withdraw the bank `run_epoch` held, without returning it.
      *
-     * For a run that reached the device and whose completion could not be
-     * proved. The AICPU may still be writing into that bank, so handing it to
+     * For a run that reached the device and whose producers could not be proved
+     * stopped. The AICPU may still be writing into that bank, so handing it to
      * another run would let two producers share it and would publish one run's
      * accounting as another's. A quarantined bank is never reissued; it comes
      * back only when the region itself goes, at `finalize`.
@@ -1469,14 +1490,16 @@ private:
 
     // Which run holds each terminal bank, or 0 for a free one. The banks are a
     // fixed device resource and a run is not, so a bank is keyed by the epoch
-    // that acquired it and comes back only when that run's snapshot has been
-    // reported. Keyed by epoch rather than by the run-resource set a run
+    // that acquired it and comes back when that run's snapshot has been
+    // reported, or when its producers are proved stopped and the snapshot is
+    // discarded. Keyed by epoch rather than by the run-resource set a run
     // borrows: the sets are as many as the grant allows and the banks are
     // three, so the two counts do not have to agree for either to be correct.
     uint64_t bank_epoch_[PLATFORM_RUN_TERMINAL_BANKS]{};
-    // A bank whose holder could not prove its device work finished. Never
-    // reissued: a producer may still be writing into it, and the host cannot
-    // tell from here. Cleared only by `finalize`, where the region goes away.
+    // A bank whose holder could not prove its device work finished *and* could
+    // not prove its producers stopped. Never reissued: a producer may still be
+    // writing into it, and the host cannot tell from here. Cleared only by
+    // `finalize`, where the region goes away.
     bool bank_quarantined_[PLATFORM_RUN_TERMINAL_BANKS]{};
 
     // Per-class handoff receipt, summed from the shards at merge time.
@@ -1798,10 +1821,15 @@ public:
      * an argument: a bank is held by the epoch that acquired it, so no caller
      * can be in a position to name the right index, and one passing a run's
      * resource-set index would read another run's accounting. This also settles
-     * the bank — released once its snapshot is in this epoch's bucket,
-     * quarantined when completion could not be proved.
+     * the bank, and the two facts it settles it on are separate:
+     * `device_execution_complete` decides whether the snapshot is *valid* to
+     * read, and `device_producers_stopped` decides whether the bank is *safe*
+     * to hand on. A completed run is both. A failed run whose every producer is
+     * proved terminated — which a simulated device can establish by joining the
+     * threads that are its producers, and a real one cannot — reads nothing and
+     * still returns the bank. Only a run that is neither is quarantined.
      */
-    void run_close(uint64_t run_epoch, bool device_execution_complete);
+    void run_close(uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped = false);
 
     /**
      * Withdraw a run that was admitted and never launched.

@@ -71,11 +71,14 @@ inline void log_boundary_failure(const char *what_failed, const std::exception_p
  *   raised, because only one can be.
  *
  * Both runner bases go through here, which is what keeps the two orders the
- * same.
+ * same. `device_producers_stopped` travels with `device_execution_complete`
+ * for the same reason: the two facts the close settles the terminal bank on are
+ * the caller's to establish, and only a runner that joined its producers can
+ * supply the second.
  */
 template <typename PublishHostState>
 void close_run_boundary(
-    ChipSwimlaneCollector &collector, uint64_t run_epoch, bool device_execution_complete,
+    ChipSwimlaneCollector &collector, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped,
     PublishHostState &&publish_host_state
 ) {
     std::exception_ptr publication_failure;
@@ -91,7 +94,7 @@ void close_run_boundary(
         log_boundary_failure("a run's host state did not fully publish", publication_failure);
     }
     try {
-        collector.run_close(run_epoch, device_execution_complete);
+        collector.run_close(run_epoch, device_execution_complete, device_producers_stopped);
     } catch (...) {
         std::exception_ptr close_failure;
         try {

@@ -253,7 +253,8 @@ struct RetainedRunsFixture {
     void close_through_boundary(uint64_t epoch, const int *cores, int core_num, PublishHostState &&publish) {
         chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, core_num);
         simpler::dfx::runs::close_run_boundary(
-            collector, epoch, /*device_execution_complete=*/true, std::forward<PublishHostState>(publish)
+            collector, epoch, /*device_execution_complete=*/true, /*device_producers_stopped=*/false,
+            std::forward<PublishHostState>(publish)
         );
     }
 
@@ -668,6 +669,34 @@ TEST(ChipSwimlaneRetainedRunsTest, RunWithoutTerminalStillPublishesAndReleasesIt
     const auto stats = fx.collector.retained_run_stats_for_test();
     EXPECT_EQ(stats.open_slots, 0u);
     EXPECT_FALSE(stats.fatal);
+}
+
+// The same failed run, with the producer-stop proof its simulated device can
+// give: the snapshot is still not read — the run never reached its terminal
+// publication — but the bank goes back instead of being withdrawn, because
+// nothing can be writing into it. A retained close has to agree with the
+// non-retaining one here, since the capacity it consumes is the same table.
+TEST(ChipSwimlaneRetainedRunsTest, AFailedRunWhoseProducersStoppedReturnsItsBankUnread) {
+    RetainedRunsFixture fx("stoppedproducers", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kEpoch = 9311;
+
+    fx.begin(kEpoch);
+    fx.dispatch(/*core_id=*/0, 2);
+    chip_swimlane_aicpu_flush(0, cores, 1);
+    ASSERT_GE(fx.collector.run_terminal_bank_of(kEpoch), 0) << "this run never held a bank to settle";
+
+    fx.collector.run_close(kEpoch, /*device_execution_complete=*/false, /*device_producers_stopped=*/true);
+
+    EXPECT_EQ(fx.collector.run_terminal_bank_of(kEpoch), -1) << "a settled run still holds its bank";
+    EXPECT_EQ(fx.collector.quarantined_run_terminal_banks(), 0)
+        << "a failure with its producers proved stopped withdrew the bank anyway";
+    // Unread, not reported as this run's accounting: the artifact still carries
+    // the incomplete verdict a run that never finished must carry.
+    ASSERT_TRUE(fx.wait_for_files(1));
+    const std::string body = read_file(published_files(fx.dir.path())[0]);
+    EXPECT_NE(body.find("\"processing_complete\": false"), std::string::npos) << body.substr(0, 400);
+    EXPECT_NE(body.find("partial_cut_unknown"), std::string::npos);
 }
 
 // A publication that cannot happen must not be silently forgotten: no file, an

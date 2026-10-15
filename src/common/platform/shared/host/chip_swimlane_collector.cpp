@@ -1613,6 +1613,19 @@ void ChipSwimlaneCollector::release_run_terminal_bank(uint64_t run_epoch) {
     }
 }
 
+void ChipSwimlaneCollector::discard_run_terminal_bank(uint64_t run_epoch) {
+    if (run_epoch == 0) return;
+    for (int bank = 0; bank < PLATFORM_RUN_TERMINAL_BANKS; ++bank) {
+        if (bank_epoch_[bank] != run_epoch) continue;
+        bank_epoch_[bank] = 0;
+        LOG_INFO(
+            "ChipSwimlane terminal: bank %d returns unread — epoch %lu failed with every producer proved stopped, so "
+            "its entries are discarded rather than withdrawn",
+            bank, static_cast<unsigned long>(run_epoch)
+        );
+    }
+}
+
 void *ChipSwimlaneCollector::arm_run_terminal_bank(uint32_t bank_index, uint64_t run_epoch) {
     // Any outcome other than a successful arm leaves this collector with no
     // expected identity. Keeping the previous run's would make the next run's
@@ -3588,7 +3601,9 @@ bool ChipSwimlaneCollector::run_begin(
     return !fatal_.load(std::memory_order_acquire);
 }
 
-void ChipSwimlaneCollector::run_close(uint64_t run_epoch, bool device_execution_complete) {
+void ChipSwimlaneCollector::run_close(
+    uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
+) {
     if (!retained_ready_.load(std::memory_order_acquire)) return;
     const int found = find_run_slot(run_epoch);
     if (found < 0) return;
@@ -3701,9 +3716,11 @@ void ChipSwimlaneCollector::run_close(uint64_t run_epoch, bool device_execution_
     // The bank this run holds, by epoch. A retained run's snapshot is consumed
     // into its own bucket rather than reported, and the bucket outlives the
     // bank — so that copy is this path's consumer proof and the bank is handed
-    // on straight after it. Completion that could not be proved gives the
-    // opposite answer: a producer may still be writing there, so the bank is
-    // withdrawn rather than reissued.
+    // on straight after it. A run that did not complete reads nothing, and then
+    // the question is only whether anything can still be writing there: with
+    // every producer proved stopped the bank is free and its contents are
+    // discarded unread, and without that proof it is withdrawn, because a
+    // producer may still be writing into it.
     const int held_bank = run_terminal_bank_of(run_epoch);
     if (device_execution_complete) {
         if (held_bank >= 0) {
@@ -3712,7 +3729,11 @@ void ChipSwimlaneCollector::run_close(uint64_t run_epoch, bool device_execution_
             release_run_terminal_bank(run_epoch);
         }
     } else if (held_bank >= 0) {
-        quarantine_run_terminal_bank(run_epoch);
+        if (device_producers_stopped) {
+            discard_run_terminal_bank(run_epoch);
+        } else {
+            quarantine_run_terminal_bank(run_epoch);
+        }
     }
 
     // Arm the per-queue cut. Every buffer this run will ever publish is already
