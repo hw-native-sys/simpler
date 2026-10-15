@@ -83,31 +83,34 @@ TEST(MailboxRegistration, TheExactRegionAGrantNeedsIsAcceptedAndOnlyTheTableIsCl
     }
 }
 
-TEST(MailboxRegistration, AGrantWithNoRepresentableSizeIsRefusedWhateverExtentIsClaimed) {
-    // Above `MAILBOX_MAX_GRANTED_SETS`, so the bound a bounds check would use is
-    // itself the wrapped number — which is why this is refused on the grant and
-    // not on the extent. The extent claimed is the largest there is.
-    constexpr uint32_t kUnrepresentable = 3'000'000'000u;
-    static_assert(static_cast<uint64_t>(kUnrepresentable) > MAILBOX_MAX_GRANTED_SETS, "pick a grant past the bound");
+TEST(MailboxRegistration, AGrantAboveTheSizingCapIsRefusedWhateverExtentIsClaimed) {
+    // Above `MAILBOX_MAX_GRANTED_SETS`, which is a policy cap on how large a
+    // mailbox may be asked for — a 1 TiB entry table — and not an arithmetic
+    // limit: this grant and the ~1.15 TB table it implies are both representable
+    // here, they are simply not mappable. Refusing it on the grant rather than
+    // on the extent is the point, which is why the extent claimed is the largest
+    // there is.
+    constexpr uint32_t kAboveSizingCap = 3'000'000'000u;
+    static_assert(static_cast<uint64_t>(kAboveSizingCap) > MAILBOX_MAX_GRANTED_SETS, "pick a grant past the cap");
     std::vector<char> region = canary_region(mailbox_size(1));
     EXPECT_THROW(
         {
             LocalMailboxEndpoint endpoint(
-                0, region.data(), std::numeric_limits<size_t>::max(), /*child_pid=*/-1, kUnrepresentable
+                0, region.data(), std::numeric_limits<size_t>::max(), /*child_pid=*/-1, kAboveSizingCap
             );
         },
         std::invalid_argument
     );
     EXPECT_TRUE(all_canary(region.data(), region.data() + region.size()));
-    EXPECT_EQ(mailbox_size_for_grant(kUnrepresentable), 0u);
+    EXPECT_EQ(mailbox_size_for_grant(kAboveSizingCap), 0u);
 }
 
-TEST(MailboxRegistration, TheRepresentableBoundIsTheLastGrantWithASize) {
+TEST(MailboxRegistration, TheSizingCapIsTheLastGrantWithAMailboxSize) {
     EXPECT_EQ(mailbox_size_for_grant(0), 0u) << "a grant of nothing has no mailbox";
     EXPECT_GT(mailbox_size_for_grant(MAILBOX_MAX_GRANTED_SETS), 0u);
     EXPECT_EQ(mailbox_size_for_grant(MAILBOX_MAX_GRANTED_SETS + 1), 0u);
     EXPECT_EQ(mailbox_size_for_grant(MAILBOX_DEFAULT_GRANTED_SETS), mailbox_size(MAILBOX_DEFAULT_GRANTED_SETS))
-        << "the checked and unchecked sizes disagree inside the bound";
+        << "the capped and uncapped sizes disagree inside the admitted range";
 }
 
 TEST(MailboxRegistration, ANullMailboxIsStillRefused) {

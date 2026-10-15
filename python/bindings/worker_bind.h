@@ -975,15 +975,14 @@ inline void bind_worker(nb::module_ &m) {
     m.def(
         "mailbox_size",
         [](uint64_t granted_sets) {
-            // size_t throughout and checked here, so a grant whose region cannot
-            // be described is refused rather than silently narrowed into the
-            // size the facade then allocates from. The same bound the
-            // registration applies, read from the same place.
+            // `size_t` throughout, and bounded here by the same cap the
+            // registration applies, read from the same place — so the facade
+            // cannot size a region for a grant the registration will refuse.
             const uint64_t bytes = static_cast<uint64_t>(mailbox_size_for_grant(granted_sets));
             if (bytes == 0) {
                 throw std::invalid_argument(
-                    "mailbox_size: a grant of " + std::to_string(granted_sets) +
-                    " run-resource sets has no representable mailbox size"
+                    "mailbox_size: a grant of " + std::to_string(granted_sets) + " run-resource sets exceeds the " +
+                    std::to_string(MAILBOX_MAX_GRANTED_SETS) + " a mailbox may be sized for"
                 );
             }
             return bytes;
@@ -992,7 +991,8 @@ inline void bind_worker(nb::module_ &m) {
         "Bytes one endpoint's mailbox occupies for this grant: one control frame, the request "
         "frames, and one run-state entry per run it may hold plus the hand-offs in flight. The "
         "facade that creates the shared-memory region sizes it through this, so both ends derive "
-        "the size from the same place."
+        "the size from the same place. A grant past the admitted maximum is refused rather than "
+        "sized."
     );
     m.attr("MAILBOX_FRAME_SIZE") = static_cast<int>(MAILBOX_FRAME_SIZE);
     m.attr("MAILBOX_OFF_ERROR_MSG") = static_cast<int>(MAILBOX_OFF_ERROR_MSG);

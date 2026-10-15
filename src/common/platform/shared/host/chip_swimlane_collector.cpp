@@ -3614,9 +3614,9 @@ void ChipSwimlaneCollector::run_close(
     // completion. A successor may already have launched and be producing into
     // the same ready queues; the cut's target stays sound because those queues
     // are FIFO and every entry this run will publish was queued before any of
-    // the successor's. The terminal bank is this run's either way -- banks are
-    // indexed by pipeline slot and a slot is not reissued until its holder
-    // finalizes.
+    // the successor's. The terminal bank is this run's either way — a bank is
+    // held by the epoch that acquired it and is settled only by that epoch's
+    // own close, so a successor cannot be holding the one resolved below.
     //
     // Every read below lands in this bucket's own storage. Nothing is written
     // into the host shadow: the drain owners keep refreshing their queue

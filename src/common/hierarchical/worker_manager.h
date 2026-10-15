@@ -195,18 +195,21 @@ constexpr size_t mailbox_size(size_t granted_sets) {
 }
 
 /**
- * The largest grant whose mailbox has a size a region could have.
+ * The largest grant a mailbox may be sized for: a 1 TiB entry table.
  *
- * Past this the entry table alone exceeds a terabyte and `mailbox_size`'s
- * arithmetic is what wraps, so the number it returns would be *smaller* than the
- * table it describes — the one error a bounds check against a real mapping
- * cannot catch, because the bound itself would be the wrong one.
+ * A policy cap, not an arithmetic one. `granted_sets` is a `uint32_t` at every
+ * registration, and `MAILBOX_RUN_ENTRY_TABLE_OFFSET + MAILBOX_RUN_ENTRY_STRIDE *
+ * (grant + MAILBOX_REQUEST_FRAMES)` is representable in a 64-bit `size_t` for
+ * every value of it, so nothing above this cap would wrap — it would merely ask
+ * for a region no host can map. The cap is where that is refused by a number
+ * instead of by an allocator, and the Python binding has applied this same one
+ * since the grant became caller-chosen.
  */
 static constexpr uint64_t MAILBOX_MAX_GRANTED_SETS =
     (static_cast<uint64_t>(1) << 40) / static_cast<uint64_t>(MAILBOX_RUN_ENTRY_STRIDE);
 
 /**
- * Bytes `granted_sets` needs, or 0 when no region could hold it.
+ * Bytes `granted_sets` needs, or 0 when it is outside the admitted range.
  *
  * Zero is never a mailbox's size — even the smallest grant has the frames — so
  * it carries the refusal with no second out-parameter. Whoever maps a region and

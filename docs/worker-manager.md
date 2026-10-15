@@ -37,14 +37,17 @@ For where dispatched tasks come from, see [scheduler.md](scheduler.md).
 class WorkerManager {
 public:
     // Registration (before init). `granted_sets` sizes the endpoint's run-state
-    // table; request frames have a separate fixed count.
-    void add_next_level(void *mailbox, int child_pid = -1,
+    // table; request frames have a separate fixed count. `mailbox_bytes` is the
+    // extent the caller mapped, checked against the grant before the entry is
+    // installed.
+    void add_next_level(void *mailbox, size_t mailbox_bytes,
+                        int child_pid = -1,
                         uint32_t granted_sets = 1);
     void add_next_level_at(int32_t worker_id, void *mailbox,
-                           int child_pid = -1,
+                           size_t mailbox_bytes, int child_pid = -1,
                            uint32_t granted_sets = 1);
     void add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint);
-    void add_sub(void *mailbox, int child_pid = -1);
+    void add_sub(void *mailbox, size_t mailbox_bytes, int child_pid = -1);
 
     // Lifecycle
     void start(Ring *ring, OnCompleteFn on_complete,
@@ -180,8 +183,10 @@ SUB workers. `group_index` selects `task_args_list[i]`. There is no
 
 ## 3. Dispatch via shm mailbox
 
-Each `LocalMailboxEndpoint` drives a `MAP_SHARED` region of
-`mailbox_size(granted_sets)` bytes. The Python facade forks one child per mailbox
+Each `LocalMailboxEndpoint` drives a `MAP_SHARED` region of at least
+`mailbox_size(granted_sets)` bytes, and every registration declares the extent
+it mapped so the grant is checked against the region that exists rather than the
+one it implies. The Python facade forks one child per mailbox
 **before** `WorkerManager::start()` (so the parent has only the Python main
 thread when fork runs, avoiding the classical "fork in a multi-threaded process"
 hazard) and the child polls the mailbox for the lifetime of the worker.
@@ -376,8 +381,11 @@ The C++ `MAILBOX_FRAME_SIZE`, `MAILBOX_RUN_ENTRY_STRIDE` and
 `MAILBOX_RUN_ENTRY_TABLE_OFFSET` constants and the `mailbox_size(granted_sets)`
 and `mailbox_run_entry_count(granted_sets)` functions are exported through the
 nanobind module, so both ends derive the region's shape from one place.
-`mailbox_size` takes and returns `size_t` and refuses a grant with no
-representable size, rather than handing back a truncated one to allocate from.
+`mailbox_size` takes and returns `size_t` and refuses a grant past
+`MAILBOX_MAX_GRANTED_SETS` — a 1 TiB cap on the entry table, which is a policy
+bound rather than an arithmetic one, since every `uint32_t` grant is
+representable in a 64-bit `size_t`. Registration applies the same cap, so the
+facade cannot size a region for a grant the registration will reject.
 (`MAILBOX_SIZE` is still exported as the size a caller gets when it does not size
 the region itself, which in practice is a fixture standing in for the facade.)
 Python derives frame slicing and offsets from those bindings where possible. `MAILBOX_ARGS_CAPACITY` ends before the teardown
