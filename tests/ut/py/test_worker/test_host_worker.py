@@ -828,6 +828,9 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
     monkeypatch.setattr(worker_mod, "_start_host_log_writer", lambda: startup_events.append(("writer",)))
     monkeypatch.setattr(worker, "_await_children_ready", fake_await_children_ready)
     monkeypatch.setattr(worker_mod, "Orchestrator", lambda native, owner: (native, owner))
+    # Read before the teardown below unmaps them: this is what each registration has to declare,
+    # and it is not the size that was asked for — macOS rounds a POSIX shm mapping up to a page.
+    mapped_extents = [shm.buf.nbytes for shm in worker._chip_shms if shm.buf is not None]
     try:
         worker._start_hierarchical()
     finally:
@@ -841,12 +844,13 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
     # published could hold anyway.
     assert fake_parent.configured_launch_depths == [1]
     assert [call[2:] for call in fake_parent.next_level_calls] == [(12001, 2), (12002, 1)]
-    # Each registration carries the extent of the region this process mapped, not the extent the
-    # grant it publishes would imply: the C++ side checks the second against the first, so a child
-    # that granted two sets is still registered against the whole allocation.
-    assert [call[1] for call in fake_parent.next_level_calls] == [
-        worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST)
-    ] * 2
+    # Each registration carries the extent of the region this process actually mapped, not the one
+    # the grant it publishes would imply: the C++ side checks the second against the first, so a
+    # child that granted two sets is still registered against the whole mapping.
+    assert [call[1] for call in fake_parent.next_level_calls] == mapped_extents
+    assert all(
+        extent >= worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST) for extent in mapped_extents
+    )
     assert fake_parent.initialized
     assert startup_events[0] == ("log", 60, True)
     assert startup_events[1:] == [("fork",), ("fork",), ("writer",)]
