@@ -7106,11 +7106,12 @@ class Worker:
             raise RuntimeError(f"Worker.{api}: worker is closed") from self._startup_error
 
     def _validate_chip_execution_context(self) -> None:
+        """Reject before caller-state publication; retry with the required current context."""
         if self.level == 2 and self._chip_worker is not None:
             self._chip_worker._impl._validate_execution_context()
 
     @contextlib.contextmanager
-    def _operation_lease(self, api: str):
+    def _operation_lease(self, api: str, *, requires_execution_context: bool = True):
         """Admit an operation onto a READY worker and hold a lease for its whole
         duration, so a concurrent close() drains it before teardown.
 
@@ -7119,7 +7120,12 @@ class Worker:
         per the state/API matrix for dispatch/buffer). The lease is
         released on exit and wakes a close() that is draining. Use around any API
         that touches the live tree and can run past its admission check (run /
-        callable registration / host-buffer / remote-memory)."""
+        callable registration / host-buffer / remote-memory).
+
+        Current-context validation runs outside the lifecycle lock while the
+        lease pins the native tree. Only pure source-descriptor queries opt out;
+        refusal releases the temporary lease before the operation body starts.
+        """
         tid = threading.get_ident()
         with self._hierarchical_start_cv:
             self._consume_worker_host_mapped_cleanup_error_locked(api)
@@ -7138,6 +7144,8 @@ class Worker:
             self._active_ops += 1
             self._lease_depth[tid] = self._lease_depth.get(tid, 0) + 1
         try:
+            if requires_execution_context:
+                self._validate_chip_execution_context()
             yield
         finally:
             with self._hierarchical_start_cv:
@@ -7466,7 +7474,6 @@ class Worker:
         broadcast to, so the lease covers only publication and the local
         pre-warm.
         """
-        self._validate_chip_execution_context()
         with self._registry_lock:
             handle, is_new = self._install_registration_locked(reg)
         if not is_new:
@@ -7998,7 +8005,6 @@ class Worker:
         Caller holds an operation lease that pins the worker in READY for the
         registry mutation and the complete child-facing cleanup.
         """
-        self._validate_chip_execution_context()
         target = None
         digest = b""
         cid = -1
@@ -11167,7 +11173,7 @@ class Worker:
         """
         if self.level != 2:
             raise TypeError("device_location requires a direct L2 Worker")
-        with self._operation_lease("device_location"), self._child_prov_lock:
+        with self._operation_lease("device_location", requires_execution_context=False), self._child_prov_lock:
             if self._source_context_failed:
                 raise ValueError("Worker no longer has a live device context for source registration")
             if self._device_buffer_source is None:
@@ -12699,7 +12705,6 @@ class Worker:
         completion fence through :meth:`RunHandle.wait`.
         """
         assert self._chip_worker is not None
-        self._validate_chip_execution_context()
         args = _snapshot_local_task_args(TaskArgs() if args is None else args)
         _validate_host_control_access(self._callable_registry.get(callable_id), args)
         touched = self._identities_in_args(args)

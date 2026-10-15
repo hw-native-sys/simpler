@@ -1085,7 +1085,7 @@ void ChipWorker::close_chip_run_lane() {
     if (run_lane_ != nullptr) run_lane_->close();
 }
 
-void ChipWorker::validate_execution_context() {
+void ChipWorker::validate_execution_context() const {
     if (device_ctx_ == nullptr || validate_execution_context_fn_ == nullptr) return;
     const int rc = validate_execution_context_fn_(device_ctx_);
     if (rc != 0) throw ExecutionContextRefused("execution context validation failed with code " + std::to_string(rc));
@@ -1392,6 +1392,7 @@ void ChipWorker::flush_diagnostics(int timeout_ms) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
+    validate_execution_context();
     if (flush_diagnostics_fn_ == nullptr) return;  // this module retains no run: nothing is deferred
     char error[512] = {};
     const int rc = flush_diagnostics_fn_(device_ctx_, timeout_ms, error, sizeof(error));
@@ -1411,6 +1412,7 @@ DeviceMemoryInfo ChipWorker::device_memory_info() const {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
+    validate_execution_context();
     DeviceMemoryInfo info{};
     int rc = device_memory_info_fn_(device_ctx_, &info);
     if (rc == PTO_RUNTIME_ERR_UNSUPPORTED) {
@@ -1539,6 +1541,7 @@ uint64_t ChipWorker::malloc(size_t size) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
+    validate_execution_context();
     void *ptr = device_malloc_ctx_fn_(device_ctx_, size);
     if (ptr == nullptr) {
         throw std::runtime_error("malloc failed");
@@ -1550,6 +1553,7 @@ void ChipWorker::free(uint64_t ptr) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
+    validate_execution_context();
     // Through the guarded entry when the runtime has one: a caller allocation a run may still be
     // reading or writing is not releasable yet, and the refusal has to reach the caller rather than
     // be swallowed by the void-returning free. The check and the release are one step inside the
@@ -1595,6 +1599,7 @@ void ChipWorker::copy_to(uint64_t dst, uint64_t src, size_t size) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
+    validate_execution_context();
     int rc =
         copy_to_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(dst), reinterpret_cast<const void *>(src), size);
     if (rc != 0) {
@@ -1606,6 +1611,7 @@ void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
+    validate_execution_context();
     int rc =
         copy_from_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(dst), reinterpret_cast<const void *>(src), size);
     if (rc != 0) {

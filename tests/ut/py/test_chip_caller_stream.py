@@ -180,6 +180,12 @@ def _run(arch, runtime, device, depth, borrowed):
                     lambda: handle_owner.unregister(public_callable),
                     handle_owner.close,
                     lambda: worker.unregister_callable(0),
+                    lambda: worker.malloc(16),
+                    lambda: worker.free(device_buffers[0]),
+                    lambda: worker.copy_to(device_buffers[0], host_buffers[0].value, nbytes),
+                    lambda: worker.copy_from(host_buffers[0].value, device_buffers[0], nbytes),
+                    worker.device_memory_info,
+                    lambda: worker.flush_diagnostics(0),
                     worker.finalize,
                 ):
                     with pytest.raises(ExecutionContextRefused, match="context validation failed"):

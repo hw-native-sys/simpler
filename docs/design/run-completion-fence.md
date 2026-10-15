@@ -113,8 +113,12 @@ The classification reaches `RunHandle.wait`/`result` without a separate Python
 preflight callback; refusal preserves waiter retry and run references. Restoration
 permits retry with the existing run handle. Other native wait errors remain
 terminal; the C ABI validation status codes are unchanged.
-Python L2 submission and callable registry changes check the same native context
-before publishing source uses, handles or ref-count changes. Close checks before
+Python operation leases check the same native context outside the lifecycle lock
+before the operation body. This includes L2 submission, registry and memory/IO
+operations and automatically covers new leased APIs. The source-only
+`device_location` query explicitly opts out; its lifecycle lease still pins the
+tree. Direct native allocation/free/copies, device-memory queries and diagnostic
+flush enforce their own backend-entry boundary. Close checks before
 claiming CLOSED or a teardown attempt; a rejected claim preserves the prior
 lifecycle. An accepted close failure keeps CLOSED and retryable cleanup debt.
 Native register/unregister and the legacy Python registry enforce their own

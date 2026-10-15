@@ -170,7 +170,7 @@ public:
     );
     void launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream = nullptr);
     void validate_caller_stream(void *caller_stream);
-    void validate_execution_context();
+    void validate_execution_context() const;
     /**
      * Launch `run` ordered behind `predecessor`, which must be a run this
      * ChipWorker launched and has not yet reaped.

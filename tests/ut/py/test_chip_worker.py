@@ -213,9 +213,9 @@ def kernel_symbol_runtime(tmp_path_factory):
     cache = {}
     next_library_id = 0
 
-    def build(*, supported=0, missing=(), init_result=0, finalize_failures=0, borrowed=False):
+    def build(*, supported=0, missing=(), init_result=0, finalize_failures=0, borrowed=False, memory=False):
         nonlocal next_library_id
-        key = (supported, missing, init_result, finalize_failures, borrowed)
+        key = (supported, missing, init_result, finalize_failures, borrowed, memory)
         # Fault scripts retain their consumed failure budget in the loaded DSO.
         if finalize_failures == 0 and key in cache:
             return cache[key]
@@ -300,6 +300,41 @@ def kernel_symbol_runtime(tmp_path_factory):
                     "{ std::abort(); }\n"
                 )
 
+        memory_symbols = {
+            "device_malloc_ctx",
+            "device_free_ctx",
+            "device_free_caller_buffer_ctx",
+            "copy_to_device_ctx",
+            "copy_from_device_ctx",
+            "device_memory_info_ctx",
+        }
+        if memory:
+            with source.open("a", encoding="utf-8") as output:
+                output.write(
+                    "#include <cstring>\n"
+                    "static int memory_calls = 0, allocated = 0;\n"
+                    "static unsigned char backing[64][64];\n"
+                    'extern "C" int test_memory_calls() { return memory_calls; }\n'
+                    "void *device_malloc_ctx(DeviceContextHandle, size_t bytes) {\n"
+                    "    ++memory_calls; if (bytes > 64 || allocated == 64) std::abort();\n"
+                    "    return backing[allocated++];\n"
+                    "}\n"
+                    "void device_free_ctx(DeviceContextHandle, void *) { ++memory_calls; }\n"
+                    "int device_free_caller_buffer_ctx(DeviceContextHandle, void *) { ++memory_calls; return 0; }\n"
+                    "int copy_to_device_ctx(DeviceContextHandle, void *dst, const void *src, size_t bytes) {\n"
+                    "    ++memory_calls; std::memcpy(dst, src, bytes); return 0;\n"
+                    "}\n"
+                    "int copy_from_device_ctx(DeviceContextHandle, void *dst, const void *src, size_t bytes) {\n"
+                    "    ++memory_calls; std::memcpy(dst, src, bytes); return 0;\n"
+                    "}\n"
+                    "int device_memory_info_ctx(DeviceContextHandle, DeviceMemoryInfo *info) {\n"
+                    "    ++memory_calls; *info = {}; return 0;\n"
+                    "}\n"
+                    "int simpler_flush_diagnostics_ctx(DeviceContextHandle, int32_t, char *, size_t) {\n"
+                    "    ++memory_calls; return 0;\n"
+                    "}\n"
+                )
+
         # These symbols are only resolved during init; any invocation is a test failure.
         # A separate TU keeps the sentinels independent of the C ABI parameter lists.
         sentinels.write_text(
@@ -308,6 +343,7 @@ def kernel_symbol_runtime(tmp_path_factory):
                 f'extern "C" void {symbol}() {{ std::abort(); }}\n'
                 for symbol in (*unused_symbols, *_KERNEL_LIFECYCLE_SYMBOLS)
                 if symbol not in missing
+                and not (memory and symbol in memory_symbols)
                 and not (
                     borrowed
                     and symbol
@@ -478,6 +514,138 @@ class TestChipWorkerBorrowedInit:
             owner._lifecycle = _Lifecycle.CLOSED
             observer.test_validation(0)
             native.finalize()
+
+    @pytest.mark.parametrize("operation", ["malloc", "free", "copy_to", "copy_from", "device_memory_info", "flush"])
+    def test_native_memory_refusal_precedes_runtime_entry(self, kernel_symbol_runtime, operation):
+        runtime = kernel_symbol_runtime(borrowed=True, memory=True)
+        observer = ctypes.CDLL(str(runtime))
+        native = _ChipWorker()
+        native.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        backing = native.malloc(16)
+        host = ctypes.create_string_buffer(b"0123456789abcdef", 16)
+        operations = {
+            "malloc": lambda: native.malloc(16),
+            "free": lambda: native.free(backing),
+            "copy_to": lambda: native.copy_to(backing, ctypes.addressof(host), 16),
+            "copy_from": lambda: native.copy_from(ctypes.addressof(host), backing, 16),
+            "device_memory_info": native.device_memory_info,
+            "flush": lambda: native.flush_diagnostics(0),
+        }
+        try:
+            before = observer.test_memory_calls()
+            observer.test_validation(-88)
+            with pytest.raises(ExecutionContextRefused):
+                operations[operation]()
+            assert observer.test_memory_calls() == before
+            observer.test_validation(0)
+            operations[operation]()
+            assert observer.test_memory_calls() == before + 1
+        finally:
+            observer.test_validation(0)
+            native.finalize()
+
+    def test_operation_lease_protects_unlisted_api_and_unwinds_refusal(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime(borrowed=True)
+        observer = ctypes.CDLL(str(runtime))
+        native = _ChipWorker()
+        native.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        owner = Worker(level=2)
+        owner._chip_worker = SimpleNamespace(_impl=native)
+        owner._lifecycle = _Lifecycle.READY
+        try:
+            observer.test_validation(-88)
+            with pytest.raises(ExecutionContextRefused), owner._operation_lease("new_device_api"):
+                pytest.fail("refused operation reached its body")
+            assert owner._active_ops == 0 and not owner._lease_depth
+            assert owner._lifecycle is _Lifecycle.READY
+            # A source descriptor query owns no device-side operation.
+            location = owner.device_location
+            assert owner.device_location._source is location._source
+            observer.test_validation(0)
+            with owner._operation_lease("new_device_api"):
+                assert owner._active_ops == 1
+            assert owner._active_ops == 0 and not owner._lease_depth
+        finally:
+            owner._chip_worker = None
+            owner._lifecycle = _Lifecycle.CLOSED
+            observer.test_validation(0)
+            native.finalize()
+
+    @pytest.mark.parametrize("operation", ["malloc", "free", "copy_to", "copy_from", "create_buffer"])
+    def test_public_memory_refusal_precedes_body(self, kernel_symbol_runtime, operation):
+        runtime = kernel_symbol_runtime(borrowed=True, memory=True)
+        observer = ctypes.CDLL(str(runtime))
+        chip = ChipWorker()
+        chip._impl.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        owner = Worker(level=2)
+        owner._chip_worker = chip
+        owner._lifecycle = _Lifecycle.READY
+        backing = owner.malloc(16)
+        host = bytearray(b"0123456789abcdef")
+        operations = {
+            "malloc": lambda: owner.malloc(16),
+            "free": lambda: owner.free(backing),
+            "copy_to": lambda: owner.copy_to(backing, host),
+            "copy_from": lambda: owner.copy_from(host, backing),
+            "create_buffer": lambda: owner.create_buffer(16),
+        }
+        try:
+            before = observer.test_memory_calls()
+            registered = owner._child_alloc.get(backing.identity)
+            observer.test_validation(-88)
+            with pytest.raises(ExecutionContextRefused):
+                operations[operation]()
+            assert observer.test_memory_calls() == before
+            assert owner._child_alloc.get(backing.identity) is registered
+            assert len(owner._child_alloc) == 1 and not owner._buffers
+            assert owner._active_ops == 0 and not owner._lease_depth
+            observer.test_validation(0)
+            result = operations[operation]()
+            if operation in ("malloc", "create_buffer"):
+                assert isinstance(result, Buffer)
+                if operation == "malloc":
+                    owner.free(result)
+                else:
+                    owner.release_buffer(result)
+            if operation != "free":
+                owner.free(backing)
+            assert not owner._child_alloc
+        finally:
+            observer.test_validation(0)
+            owner.close()
+            chip.finalize()
+
+    def test_operation_preflight_releases_lifecycle_lock(self):
+        owner = Worker(level=2)
+        started = threading.Event()
+        acquired = threading.Event()
+        errors = []
+
+        def contender():
+            if not started.wait(5):
+                errors.append("validator was not entered")
+                return
+            with owner._hierarchical_start_cv:
+                acquired.set()
+
+        def validate():
+            started.set()
+            assert acquired.wait(5), "native validation holds the lifecycle lock"
+
+        owner._chip_worker = SimpleNamespace(_impl=SimpleNamespace(_validate_execution_context=validate))
+        owner._lifecycle = _Lifecycle.READY
+        thread = threading.Thread(target=contender)
+        thread.start()
+        try:
+            with owner._operation_lease("new_device_api"):
+                assert owner._active_ops == 1
+            assert not errors and owner._active_ops == 0
+        finally:
+            started.set()
+            thread.join(5)
+            owner._chip_worker = None
+            owner._lifecycle = _Lifecycle.CLOSED
+        assert not thread.is_alive()
 
     @pytest.mark.parametrize("operation", ["register", "register_blob", "unregister"])
     def test_native_registration_refuses_context_before_runtime_entry(self, kernel_symbol_runtime, operation):

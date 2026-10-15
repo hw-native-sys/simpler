@@ -95,14 +95,21 @@ the classification. The public Worker initialization still owns its device;
 borrowed-context initialization is an internal native entry, and this exception
 alone does not expose a public borrowed Worker.
 
-A READY L2 Worker checks the same native environment before submission or
-callable registry publication. Close checks before its
+READY Worker operations validate through the shared operation lease, outside the
+lifecycle lock and before their bodies run. Direct L2 operations check the native
+current-context predicate; L3+ operations retain their own child/environment
+contracts. This covers allocation, free, copies, registration and future leased
+APIs. Only `device_location`, a source-descriptor query with no device operation,
+explicitly skips current-context validation. Close checks separately before its
 CLOSED admission fence and teardown-attempt publication. An unaccepted context
 refusal preserves READY, callable handles and source uses; restore the context
 before retrying. Once close has been accepted, a teardown failure retains CLOSED
 and its cleanup debt. Re-entering close in the required context can retry that
 debt; it does not reopen the Worker. Native registration and the legacy
-ChipWorker registry also check before their state changes.
+ChipWorker registry also check before their state changes. Direct native
+allocation, free, copies, device-memory queries and diagnostic flush validate
+before calling the backend; cached host counters and descriptors do not perform
+device operations.
 
 At L2 the `callable` is a registered `ChipCallable` handle. At L3+ the top-level
 callable is a **Python orchestration function** `f(orch, args, cfg)`, where
