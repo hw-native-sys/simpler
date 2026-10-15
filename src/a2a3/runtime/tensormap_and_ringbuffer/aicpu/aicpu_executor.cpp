@@ -300,7 +300,7 @@ int32_t AicpuExecutor::init(Runtime *runtime, const ExecutionInputs &inputs) {
     if (decouple_orch) {
         sched_ctx_.handshake_owned_clusters(runtime, tidx, hs_nthreads);
         if (!sched_ctx_.handshake_failed() && !sched_ctx_.initialization_aborted())
-            sched_ctx_.assign_own_clusters(tidx);
+            sched_ctx_.assign_own_clusters(tidx, runtime);
     } else {
         sched_ctx_.handshake_partition(runtime, tidx, hs_nthreads);
     }

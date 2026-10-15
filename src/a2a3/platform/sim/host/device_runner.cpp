@@ -334,6 +334,7 @@ int DeviceRunner::prepare_execution(
     // that arming at launch and teardown at drain read the same value.
     const DfxRunConfig &dfx = execution->dfx;
     active_run_ = std::make_unique<ActiveRun>();
+    runtime.set_dma_workspace_addresses(dma_workspace_addr_);
     active_run_->runtime = &runtime;
     run_completion_.reset(1);
     auto prepare_cleanup = RAIIScopeGuard([this]() {

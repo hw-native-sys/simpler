@@ -3574,14 +3574,16 @@ NB_MODULE(_task_interface, m) {
             "kernel_init",
             [](ChipWorker &self, const std::string &host_lib_path, const std::string &aicpu_path,
                const std::string &aicore_path, const std::string &dispatcher_path, int device_id,
-               const CallConfig &config, uint64_t context_generation, const std::string &sim_context_path) {
+               const CallConfig &config, uint64_t context_generation, const std::string &sim_context_path,
+               bool enable_sdma, const std::string &sdma_warmup_path) {
                 self.kernel_init(
                     host_lib_path, aicpu_path, aicore_path, dispatcher_path, device_id, config, context_generation,
-                    sim_context_path
+                    sim_context_path, enable_sdma, sdma_warmup_path
                 );
             },
             nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"), nb::arg("dispatcher_path"),
             nb::arg("device_id"), nb::arg("config"), nb::arg("context_generation"), nb::arg("sim_context_path") = "",
+            nb::arg("enable_sdma") = false, nb::arg("sdma_warmup_path") = "",
             // Same reasoning as init: the native binding and device-context
             // construction are long enough that another Python thread must be
             // able to run during them.

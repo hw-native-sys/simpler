@@ -574,6 +574,32 @@ TEST(PersistentKernelArgs, DestructionReleasesNothing) {
 // UT-P6 / UT-P7: what actually crosses to the device.
 // ---------------------------------------------------------------------------
 
+TEST(PersistentKernelArgs, DmaWorkspaceSnapshotBelongsToItsRuntimeImage) {
+    FakeArgsOps ops;
+    Runtime first;
+    Runtime second;
+    for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind) {
+        EXPECT_EQ(first.get_dma_workspace_address(kind), 0u);
+        EXPECT_EQ(second.get_dma_workspace_address(kind), 0u);
+    }
+    uint64_t addresses[DMA_WORKSPACE_KIND_COUNT] = {0x12340000, 0};
+    first.set_dma_workspace_addresses(addresses);
+    PersistentKernelArgs args;
+    ASSERT_EQ(args.prepare_once(first, ops.table(), kDeviceId), 0);
+    addresses[DMA_WORKSPACE_SDMA] = 0x56780000;
+    second.set_dma_workspace_addresses(addresses);
+#if defined(SIMPLER_UT_TRB_RUNTIME)
+    const auto *image = reinterpret_cast<const DeviceRuntimeLaunchDesc *>(args.args().runtime_args);
+    EXPECT_EQ(image->dma_workspace_addr[DMA_WORKSPACE_SDMA], 0x12340000u);
+#else
+    const auto *image = reinterpret_cast<const Runtime *>(args.args().runtime_args);
+    EXPECT_EQ(image->get_dma_workspace_address(DMA_WORKSPACE_SDMA), 0x12340000u);
+#endif
+    EXPECT_EQ(first.get_dma_workspace_address(DMA_WORKSPACE_SDMA), 0x12340000u);
+    EXPECT_EQ(second.get_dma_workspace_address(DMA_WORKSPACE_SDMA), 0x56780000u);
+    EXPECT_EQ(args.finalize_once(), 0);
+}
+
 TEST(PersistentKernelArgs, CopiesExactlyTheRuntimeDeviceImage) {
     FakeArgsOps ops;
     Runtime runtime;

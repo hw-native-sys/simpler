@@ -1492,6 +1492,8 @@ class ChipWorker:
         config: CallConfig,
         context_generation: int | None = None,
         log_level: int | None = None,
+        *,
+        enable_sdma: bool = False,
     ):
         """Bind the runtime as a kernel-mode context on a device the caller
         already holds.
@@ -1509,6 +1511,8 @@ class ChipWorker:
             context_generation: nonzero and unique within this process. Minted
                 here when omitted.
             log_level: as for init().
+            enable_sdma: Provision and warm the SDMA workspace during init.
+                Supported on onboard a2a3 TMR and HBG; other targets reject the request.
         """
         with self._lifecycle_lock:
             if self._init_in_progress:
@@ -1522,6 +1526,7 @@ class ChipWorker:
             _initialize_host_log(log_level)
             dispatcher_path = getattr(bins, "dispatcher_path", None)
             sim_context_path = getattr(bins, "sim_context_path", None)
+            sdma_warmup_path = getattr(bins, "sdma_warmup_path", None)
             generation = (
                 int(_ChipWorker.next_kernel_context_generation())
                 if context_generation is None
@@ -1539,6 +1544,8 @@ class ChipWorker:
                 config,
                 generation,
                 "" if sim_context_path is None else str(sim_context_path),
+                bool(enable_sdma),
+                "" if sdma_warmup_path is None else str(sdma_warmup_path),
             )
         finally:
             with self._lifecycle_lock:

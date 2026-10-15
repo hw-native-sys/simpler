@@ -981,7 +981,7 @@ int DeviceRunner::finalize() {
         // On the package named above, repeated hardware A/B runs established
         // this handoff delay as a containment workaround, not a portable
         // runtime guarantee. Do not delay ordinary (non-SDMA) failures.
-        if (sdma_provisioned) {
+        if (sdma_provisioned && !execution_mode_latch().is_kernel()) {
             constexpr uint64_t kCANN900FatalHandoffMs = 10000;
             constexpr uint64_t kDeviceDownSettleMarginMs = 5000;
             const uint64_t op_timeout_ms = (timeout_config_.op_execute_timeout_us + 999) / 1000;

@@ -697,10 +697,11 @@ int DeviceRunnerBase::init_kernel_context(
     rc = ensure_binaries_loaded(control_stream);
     if (rc != 0) return rc;
 
-    // The async-DMA workspace is program mode's SDMA channel; kernel mode
-    // provisions none, so this launch publishes the all-zero addresses that
-    // mean "that engine is unavailable".
+    rc = ensure_dma_workspace_provisioned();
+    if (rc != 0) return rc;
     rc = ensure_aicpu_init_launched(control_stream);
+    if (rc != 0) return rc;
+    rc = ensure_dma_workspace_warmed();
     if (rc != 0) return rc;
     kernel_aicpu_handle_ = load_aicpu_op_.BuiltInHandle("simpler_aicpu_kernel_exec");
     rc = prepare_launch_shape(kernel_runtime_, kernel_static_config_.request());
@@ -740,6 +741,7 @@ int DeviceRunnerBase::init_kernel_context(
         rc = init_dep_gen_region(kernel_runtime_.get_aicpu_thread_num(), device_id_);
         if (rc != 0) return rc;
     }
+    kernel_runtime_.set_dma_workspace_addresses(dma_workspace_addr_);
     rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
     if (rc != 0) return rc;
     rc = kernel_static_config_.freeze();
@@ -1551,12 +1553,13 @@ int DeviceRunnerBase::launch_sdma_warmup_kernel(const void *binary, size_t size)
     // on it, so extra blocks buy nothing (measured) and tying block_dim to the
     // channel count would break on any chip with fewer AIVs than channels. The
     // kernel walks channels grid-stride to cover all of them from 8 blocks.
+    const auto stream = execution_mode_latch().is_kernel() ?
+                            static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicore)) :
+                            stream_aicore_;
     const auto started = std::chrono::steady_clock::now();
-    rc = rtKernelLaunchWithHandleV2(
-        sdma_warmup_bin_handle_, 0, kSdmaWarmupBlockDim, &rt_args, nullptr, stream_aicore_, &cfg
-    );
+    rc = rtKernelLaunchWithHandleV2(sdma_warmup_bin_handle_, 0, kSdmaWarmupBlockDim, &rt_args, nullptr, stream, &cfg);
     if (rc == 0) {
-        rc = rtStreamSynchronize(stream_aicore_);
+        rc = rtStreamSynchronize(stream);
     }
     const double elapsed_ms =
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -2381,6 +2384,7 @@ void DeviceRunnerBase::read_device_wall_ns() {
 }
 
 int DeviceRunnerBase::init_runtime_args_with_metadata(Runtime &runtime, KernelArgsHelper &kernel_args) {
+    runtime.set_dma_workspace_addresses(dma_workspace_addr_);
     int rc = kernel_args.init_runtime_args(runtime, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("init_runtime_args failed: %d", rc);

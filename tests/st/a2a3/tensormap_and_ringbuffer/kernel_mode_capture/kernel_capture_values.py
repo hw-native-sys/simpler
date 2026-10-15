@@ -52,10 +52,11 @@ class _TensorIO:
             )
 
 
-def _bind_capture_functions(lib):
+def _bind_capture_functions(lib, *, hbg=False):
     observer = ctypes.CDLL(None)
     for symbol, return_type in {
         "capture_observer_begin": None,
+        "capture_observer_begin_hbg": None,
         "capture_observer_status": ctypes.c_int,
         "capture_observer_check_resident": ctypes.c_int,
         "capture_observer_core_launches": ctypes.c_uint64,
@@ -67,7 +68,10 @@ def _bind_capture_functions(lib):
         function = getattr(observer, symbol)
         function.argtypes = []
         function.restype = return_type
-    observer.capture_observer_begin()
+    if hbg:
+        observer.capture_observer_begin_hbg()
+    else:
+        observer.capture_observer_begin()
     signatures = {
         "aclmdlRICaptureBegin": [ctypes.c_void_p, ctypes.c_int],
         "aclmdlRICaptureEnd": [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)],

@@ -30,6 +30,7 @@ Runtime::Runtime() {
     // because the CApi functions don't exist when compiled for device.
 
     // Initialize the device-copied descriptor (`dev`).
+    memset(dev.dma_workspace_addr, 0, sizeof(dev.dma_workspace_addr));
     memset(dev.workers, 0, sizeof(dev.workers));
     dev.worker_count = 0;
     dev.aicpu_thread_num = 1;

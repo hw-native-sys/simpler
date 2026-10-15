@@ -231,8 +231,9 @@ so the resulting hang shows up only under a loaded box.
 
 On a2a3, async-DMA resources are a Worker-level opt-in, not a
 communication-domain property. Construct the Worker with `enable_sdma=True` and
-the runtime provisions the SDMA workspace once at init, latches its address into
-the resident `KernelArgs`, and injects it into every run's kernel
+the runtime provisions the SDMA workspace once at init. TMR stores its addresses
+in each Runtime device descriptor and the scheduler injects that snapshot into
+every run's kernel
 `GlobalContext` (`get_dma_workspace`). A Worker without `enable_sdma` creates no
 SDMA streams and its kernels read a zero workspace address. The workspace is
 released at Worker finalize by ordinary stream/manager teardown.
@@ -269,14 +270,32 @@ streams sit in the device fault/sync domain, a fault on that Worker slows its
 teardown; keep SDMA workloads on their own Worker (and, in CI, their own task)
 so ordinary workloads are unaffected — see
 [docs/investigations/2026-07-a2a3-sdma-fault-teardown.md](investigations/2026-07-a2a3-sdma-fault-teardown.md)
-and issue #1425. `enable_sdma` is honored by **both** a2a3 onboard runtimes: the
+and issue #1425. In program mode, `enable_sdma` is honored by **both** a2a3 onboard runtimes: the
 PTO-SDMA provider is compiled into every a2a3 onboard `host_runtime.so`, so the
-gate is the platform, not the runtime. Only `tensormap_and_ringbuffer` is
-exercised with it, so host-build-graph's path from a provisioned address to a
-kernel's `get_dma_workspace` is unverified rather than closed. Simulation, a5,
-and provider-disabled builds fail Worker init fast when it is set. A5 provisions
+gate is the platform, not the runtime. Both runtimes inject the workspace into
+AICore `GlobalContext`, accessible through `get_dma_workspace`. Program-mode
+simulation provides inert scratch for no-op prefetch; a5 and provider-disabled
+onboard builds reject the Worker-level request. A5 provisions
 its communication-context SDMA workspace by default; this is separate from
 the Worker-level workspace mechanism controlled by `enable_sdma`.
+
+In **kernel mode**, SDMA is supported on a2a3 onboard TMR and HBG. The native init
+entry rejects an unsupported request before acquiring context resources. Init
+provisions the workspace and runs channel warmup on the context's hidden AICore
+stream; all cold synchronization stays outside capture. The workspace address
+is part of the persistent Runtime device image, so later AICPU initialization
+cannot replace it through the resident SO's globals. Eager launches and ACLGraph
+replays reuse the same workspace. Healthy close releases it only after the caller
+has drained work and destroyed graphs. Faulted kernel contexts retain unsafe
+resources for caller recovery and never reset the borrowed device. The existing
+one-live-kernel-context restriction per host runtime SO/device/device-runtime SO
+still applies.
+
+The native `simpler_kernel_mode_init` ABI includes `enable_sdma`,
+`sdma_warmup_binary`, and `sdma_warmup_size` after `context_generation`; pass
+`0, nullptr, 0` to disable it. Rebuild bindings, host runtime and device runtime
+together, including consumers that call this C ABI directly. PyPTO frontend
+lowering is outside this runtime change.
 
 ---
 

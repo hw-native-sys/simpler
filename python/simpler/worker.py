@@ -6640,16 +6640,13 @@ class Worker:
     def _init_execution_mode(self, level: int, config: dict[str, Any]) -> None:
         """Validate the ``execution_mode`` config key and set up the kernel-mode state.
 
-        ``"kernel"`` binds a level-2 kernel-mode context in init(); it has no L3+ form and provisions
-        no SDMA workspace, so both are refused here, before any startup resource exists.
+        ``"kernel"`` binds a level-2 context in init(); SDMA support is checked by the native runtime.
         """
         execution_mode = config.get("execution_mode", "program")
         if execution_mode not in ("program", "kernel"):
             raise ValueError(f"Worker execution_mode must be 'program' or 'kernel', got {execution_mode!r}")
         if execution_mode == "kernel" and level != 2:
             raise ValueError("execution_mode='kernel' requires level=2")
-        if execution_mode == "kernel" and config.get("enable_sdma"):
-            raise ValueError("execution_mode='kernel' does not support enable_sdma")
         self._execution_mode = execution_mode
         # `_kernel_callables` maps each id kernel_prepare_callable returned to its image; the device
         # holds addresses into those images until a native teardown succeeds, so only that teardown
@@ -8228,7 +8225,9 @@ class Worker:
             # Assigned before kernel_init so a raising kernel_init still leaves rollback's
             # _finalize_chip a ChipWorker to finalize.
             self._chip_worker = ChipWorker()
-            self._chip_worker.kernel_init(device_id, binaries, kernel_config)
+            self._chip_worker.kernel_init(
+                device_id, binaries, kernel_config, enable_sdma=bool(self._config.get("enable_sdma", False))
+            )
             self._kernel_pid = os.getpid()
             self._arm_kernel_chip_pin()
             return

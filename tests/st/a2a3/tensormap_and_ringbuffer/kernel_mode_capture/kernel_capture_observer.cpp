@@ -43,6 +43,7 @@ enum class ObserverError : int {
 // Each isolated scenario has one submitting host thread and one prepared context.
 struct Observer {
     bool armed{false};
+    bool hbg{false};
     bool resident_sampled{false};
     ObserverError error{ObserverError::None};
     uint64_t core_launches{0};
@@ -57,6 +58,7 @@ bool invocation_scope{false};
 bool forbid_sync{false};
 bool prepare_scope{false};
 uint64_t forbidden_sync_calls{0};
+uint64_t invocation_allocations{0};
 int query_override{0};
 uint64_t query_override_calls{0};
 uint64_t total_queries{0};
@@ -124,6 +126,7 @@ void observe_core(const rtArgsEx_t *args) {
     if (address == 0 || (observer.core_envelope != 0 && observer.core_envelope != address))
         note_error(ObserverError::BindingChanged);
     observer.core_envelope = address;
+    if (observer.hbg) note_binding(address);
 }
 
 void observe_cpu(const rtCpuKernelArgs_t *args) {
@@ -158,6 +161,13 @@ extern "C" void capture_observer_begin() {
     observer.armed = true;
 }
 
+extern "C" void capture_observer_begin_hbg() {
+    capture_observer_begin();
+    observer.hbg = true;
+}
+
+extern "C" uint64_t capture_observer_invocation_allocations() { return invocation_allocations; }
+
 extern "C" void capture_observer_guard_sync(int enabled) { forbid_sync = enabled != 0; }
 extern "C" void capture_observer_prepare_scope(int enabled) { prepare_scope = enabled != 0; }
 extern "C" void capture_observer_invocation_scope(int enabled) { invocation_scope = enabled != 0; }
@@ -182,6 +192,7 @@ extern "C" void capture_observer_corrupt_next_invocation() { corrupt_next_invoca
 extern "C" void capture_observer_fail_next_invocation() { fail_next_invocation = true; }
 
 extern "C" rtError_t rtMalloc(void **address, uint64_t bytes, uint32_t kind, uint16_t module) {
+    if (invocation_scope) ++invocation_allocations;
     static const auto real = reinterpret_cast<decltype(&rtMalloc)>(resolve_cann_symbol("rtMalloc"));
     const auto rc = real == nullptr ? -4330 : real(address, bytes, kind, module);
     if (rc == 0 && prepare_scope && bytes >= 1024 * 1024) large_prepare_allocations.insert(*address);
@@ -283,15 +294,18 @@ extern "C" int capture_observer_check_resident() {
     if (status != 0) return status;
     const auto copy = reinterpret_cast<decltype(&aclrtMemcpy)>(resolve_cann_symbol("aclrtMemcpy"));
     if (copy == nullptr) return -4330;
-    simpler::tmr::TmrKernelAicoreArgs envelope{};
-    int rc = copy(
-        &envelope, sizeof(envelope), reinterpret_cast<const void *>(observer.core_envelope), sizeof(envelope),
-        ACL_MEMCPY_DEVICE_TO_HOST
-    );
-    if (rc != 0) return rc;
-    if (envelope.resident_kernel_args != observer.binding) {
-        note_error(ObserverError::BindingChanged);
-        return static_cast<int>(observer.error);
+    int rc = 0;
+    if (!observer.hbg) {
+        simpler::tmr::TmrKernelAicoreArgs envelope{};
+        rc = copy(
+            &envelope, sizeof(envelope), reinterpret_cast<const void *>(observer.core_envelope), sizeof(envelope),
+            ACL_MEMCPY_DEVICE_TO_HOST
+        );
+        if (rc != 0) return rc;
+        if (envelope.resident_kernel_args != observer.binding) {
+            note_error(ObserverError::BindingChanged);
+            return static_cast<int>(observer.error);
+        }
     }
     KernelArgs resident{};
     rc = copy(
@@ -364,7 +378,7 @@ extern "C" rtError_t rtsLaunchCpuKernel(
     }
     // Context registration/revoke nodes carry only trusted context identity;
     // they are not invocations and must not be counted as dispatches.
-    if (observer.armed && invocation_scope && args != nullptr &&
+    if (observer.armed && !observer.hbg && invocation_scope && args != nullptr &&
         args->baseArgs.argsSize != sizeof(simpler::tmr::TmrContextRegistrationArgs))
         observe_cpu(args);
     static const auto real = reinterpret_cast<decltype(&rtsLaunchCpuKernel)>(resolve_cann_symbol("rtsLaunchCpuKernel"));
@@ -383,4 +397,20 @@ extern "C" rtError_t rtsLaunchCpuKernel(
         return rc;
     }
     return real == nullptr ? -4330 : real(function, blocks, stream, config, args);
+}
+
+extern "C" aclError aclrtLaunchKernelWithHostArgs(
+    aclrtFuncHandle function, uint32_t blocks, aclrtStream stream, aclrtLaunchKernelCfg *config, void *args,
+    size_t bytes, aclrtPlaceHolderInfo *placeholders, size_t placeholder_count
+) {
+    if (observer.armed && observer.hbg && invocation_scope) {
+        ++observer.cpu_launches;
+        if (args == nullptr || bytes == 0 || placeholders == nullptr || placeholder_count != 1)
+            note_error(ObserverError::InvalidCpuArgs);
+    }
+    static const auto real = reinterpret_cast<decltype(&aclrtLaunchKernelWithHostArgs)>(
+        resolve_cann_symbol("aclrtLaunchKernelWithHostArgs")
+    );
+    return real == nullptr ? -4330 :
+                             real(function, blocks, stream, config, args, bytes, placeholders, placeholder_count);
 }

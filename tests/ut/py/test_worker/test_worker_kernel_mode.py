@@ -293,10 +293,15 @@ class TestConstruction:
         with pytest.raises(ValueError, match=re.escape("execution_mode='kernel' requires level=2")):
             Worker(level=3, execution_mode="kernel", num_sub_workers=0)
 
-    def test_kernel_refuses_sdma(self, script):
-        with pytest.raises(ValueError, match="enable_sdma"):
-            _kernel_worker(enable_sdma=True)
-        assert _kernel_worker(enable_sdma=False)._execution_mode == "kernel"
+    def test_kernel_sdma_reaches_native_init(self, script):
+        config = CallConfig()
+        worker = _kernel_worker(enable_sdma=True)
+        worker.init(config=config)
+        try:
+            (chip,) = script.chips
+            assert chip.kernel_init_calls == [((_DEVICE_ID, script.binaries, config), {"enable_sdma": True})]
+        finally:
+            worker.close()
 
     def test_construction_touches_no_runtime(self, script):
         _kernel_worker()
@@ -362,7 +367,7 @@ class TestInitRouting:
             (chip,) = script.chips
             assert worker._chip_worker is chip
             # No context_generation: ChipWorker.kernel_init mints it.
-            assert chip.kernel_init_calls == [((_DEVICE_ID, script.binaries, config), {})]
+            assert chip.kernel_init_calls == [((_DEVICE_ID, script.binaries, config), {"enable_sdma": False})]
             assert chip._impl.initialized
             assert worker._callable_registry == {}
             assert worker._identity_registry == {}

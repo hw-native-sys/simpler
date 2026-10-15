@@ -21,6 +21,8 @@
  *        startup based on each core's cluster position; never changes.
  *        Only meaningful for AIV kernels in MIX tasks.
  *
+ *      - dma_workspace : per-engine addresses owned by this runtime context
+ *
  *   2. Local per-dispatch context (changes each dispatch):
  *      - block_idx : which logical block the current worker is executing
  *      - block_num : total number of blocks in this task (= block_dim)
@@ -82,6 +84,7 @@
 #include <stdint.h>
 
 #include "aicore_completion_mailbox_types.h"
+#include "common/dma_workspace.h"
 #include "host_build_graph/task_id.h"
 
 #ifndef __gm__
@@ -115,6 +118,7 @@ struct GlobalContext {
     // Used by AIV to select the correct intra-cluster hw instruction.
     // Not meaningful for AIC kernels or single-AIV tasks.
     int32_t sub_block_id;
+    uint64_t dma_workspace[DMA_WORKSPACE_KIND_COUNT];
 };
 
 struct AsyncCtx {
@@ -171,6 +175,14 @@ static __aicore__ inline int32_t get_sub_block_id(__gm__ int64_t *args) {
     __gm__ GlobalContext *ctx =
         reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
     return ctx->sub_block_id;
+}
+
+// Unprovisioned engines have address zero; invalid kinds return nullptr.
+static __aicore__ inline __gm__ uint8_t *get_dma_workspace(__gm__ int64_t *args, int kind) {
+    if (kind < 0 || kind >= DMA_WORKSPACE_KIND_COUNT) return nullptr;
+    __gm__ GlobalContext *ctx =
+        reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
+    return reinterpret_cast<__gm__ uint8_t *>(ctx->dma_workspace[kind]);
 }
 
 /**

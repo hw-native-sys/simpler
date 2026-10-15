@@ -210,6 +210,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // Per-callable_id dispatch. AICPU dispatches via
     // `orch_so_table_[active_callable_id_]`.
     int32_t active_callable_id_;
+    uint64_t dma_workspace_addr[DMA_WORKSPACE_KIND_COUNT];
 };
 
 // =============================================================================
@@ -246,6 +247,12 @@ public:
     // the shared platform layer (device_runner*.cpp, kernel.cpp) can compile
     // against either variant. trb-only code reads `runtime->dev.X` directly.
     // =========================================================================
+
+    void set_dma_workspace_addresses(const uint64_t *addresses) {
+        for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k)
+            dev.dma_workspace_addr[k] = addresses[k];
+    }
+    uint64_t get_dma_workspace_address(int kind) const { return dev.dma_workspace_addr[kind]; }
 
     int get_worker_count() const { return dev.worker_count; }
     void set_worker_count(int n) { dev.worker_count = n; }
