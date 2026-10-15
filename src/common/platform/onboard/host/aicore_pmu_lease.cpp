@@ -130,11 +130,11 @@ void fill_config(FftsProfileConfig *cfg) {
     }
 }
 
-/// Bytes the channel still held at release. Zero at cfgMode=0.
-long drain_channel(const ProfApi &api, unsigned int device) {
+/// Drained bytes, or -1 when draining failed. Stop remains required in either case.
+long drain_channel(const ProfApi &api, unsigned int device) noexcept try {
     if (api.flush == nullptr || api.read == nullptr) return 0;
     unsigned int pending = 0;
-    (void)api.flush(device, kChannelFftsProfileTask, &pending);
+    if (api.flush(device, kChannelFftsProfileTask, &pending) != 0) return -1;
     std::vector<char> buffer(1U << 16);
     long drained = 0;
     // Bounded so a channel that keeps producing cannot hold up teardown.
@@ -142,33 +142,32 @@ long drain_channel(const ProfApi &api, unsigned int device) {
     for (int i = 0; i < kMaxReads; i++) {
         const int got =
             api.read(device, kChannelFftsProfileTask, buffer.data(), static_cast<unsigned int>(buffer.size()));
-        if (got <= 0) break;
+        if (got < 0) return -1;
+        if (got == 0) break;
         drained += got;
     }
     return drained;
+} catch (...) {
+    return -1;
 }
 
 }  // namespace
 
-AicorePmuLease::~AicorePmuLease() {
+AicorePmuLease::~AicorePmuLease() noexcept try {
     std::lock_guard<std::mutex> guard(mutex_);
-    if (!owners_.empty() && state_ == State::kHeld) {
+    if (state_ == State::kHeld) {
         const ProfApi &api = prof_api();
         if (api.stop != nullptr) (void)api.stop(static_cast<unsigned int>(hal_device_id_), kChannelFftsProfileTask);
     }
     owners_.clear();
     hal_device_id_ = -1;
     state_ = State::kAbsent;
+} catch (...) {
+    LOG_WARN("AicorePmuLease: exception while stopping the channel at destruction");
 }
 
 bool AicorePmuLease::acquire(int device_id, std::uint64_t run_epoch) {
     std::lock_guard<std::mutex> guard(mutex_);
-    if (device_id < 0) {
-        state_ = State::kRefused;
-        why_ = "no device bound";
-        LOG_WARN("AicorePmuLease: %s; PMU collection runs unprotected", why_.c_str());
-        return false;
-    }
     if (!owners_.empty()) {
         if (device_id != device_id_) {
             LOG_ERROR("AicorePmuLease: held for device %d, refusing acquire for device %d", device_id_, device_id);
@@ -176,6 +175,12 @@ bool AicorePmuLease::acquire(int device_id, std::uint64_t run_epoch) {
         }
         owners_.insert(run_epoch);
         return state_ == State::kHeld;
+    }
+    if (device_id < 0) {
+        state_ = State::kRefused;
+        why_ = "no device bound";
+        LOG_WARN("AicorePmuLease: %s; PMU collection runs unprotected", why_.c_str());
+        return false;
     }
 
     const ProfApi &api = prof_api();
@@ -234,7 +239,7 @@ bool AicorePmuLease::acquire(int device_id, std::uint64_t run_epoch) {
     return false;
 }
 
-void AicorePmuLease::release(std::uint64_t run_epoch) {
+void AicorePmuLease::release(std::uint64_t run_epoch) noexcept try {
     std::lock_guard<std::mutex> guard(mutex_);
     // Only an epoch that holds a reference drops one. Every other call is a
     // path that had nothing to give back: a run refused before the acquire
@@ -244,17 +249,18 @@ void AicorePmuLease::release(std::uint64_t run_epoch) {
 
     const int device = device_id_;
     const int hal_device = hal_device_id_;
-    device_id_ = -1;
-    hal_device_id_ = -1;
     if (state_ != State::kHeld) {
+        device_id_ = -1;
+        hal_device_id_ = -1;
         state_ = State::kAbsent;
         return;
     }
-    state_ = State::kAbsent;
 
     const ProfApi &api = prof_api();
     const long drained = drain_channel(api, static_cast<unsigned int>(hal_device));
-    if (drained > 0) {
+    if (drained < 0) {
+        LOG_WARN("AicorePmuLease: drain failed for device %d (hal %d); stopping the channel", device, hal_device);
+    } else if (drained > 0) {
         LOG_WARN(
             "AicorePmuLease: drained %ld bytes from prof channel 53 on device %d (hal %d) at release; the lease "
             "is taken with cfgMode=0, which is expected to emit nothing, so this configuration no longer "
@@ -266,6 +272,12 @@ void AicorePmuLease::release(std::uint64_t run_epoch) {
         const int rc = api.stop(static_cast<unsigned int>(hal_device), kChannelFftsProfileTask);
         if (rc != 0) LOG_WARN("AicorePmuLease: prof_stop returned %d for device %d (hal %d)", rc, device, hal_device);
     }
+    device_id_ = -1;
+    hal_device_id_ = -1;
+    state_ = State::kAbsent;
+} catch (...) {
+    // A held channel retains its device identity for the destructor's stop attempt.
+    LOG_WARN("AicorePmuLease: exception during release; retaining channel identity for destruction");
 }
 
 AicorePmuLease::State AicorePmuLease::state() const {

@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <memory>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -39,6 +40,7 @@
 #include "runtime_types.h"
 #include "shared_memory.h"
 #include "runtime.h"
+#include "runtime_core.h"
 #include "task_args.h"
 #include "worker/runtime_c_api.h"
 #include "worker/pipeline_contract.h"
@@ -52,6 +54,9 @@ extern "C" int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *ap
 extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
 extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
 extern "C" int concurrent_native_prepare_supported_impl(void);
+extern "C" int prewarm_config_impl(
+    const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+);
 extern "C" int prepared_run_config_compatible_impl(
     const HostApi *api, const uint64_t *ring_task_window, const uint64_t *ring_heap, const uint64_t *ring_dep_pool
 );
@@ -103,6 +108,7 @@ struct FakeHostApi {
     void *cached_runtime_arena = nullptr;
     size_t cached_runtime_off = 0;
     const void *cached_image = nullptr;
+    std::vector<uint8_t> cached_image_storage;
     size_t cached_image_size = 0;
     int cache_store_count = 0;
     int cache_hit_count = 0;
@@ -267,7 +273,9 @@ void fake_mark_prebuilt_runtime_arena_cached(
     g_fake->cached_gm_sm = sm_base;
     g_fake->cached_runtime_arena = runtime_arena_base;
     g_fake->cached_runtime_off = runtime_off;
-    g_fake->cached_image = image_data;
+    const auto *image = static_cast<const uint8_t *>(image_data);
+    g_fake->cached_image_storage.assign(image, image + image_size);
+    g_fake->cached_image = g_fake->cached_image_storage.data();
     g_fake->cached_image_size = image_size;
 }
 uint64_t fake_upload_chip_callable_buffer(void * /*runner_ctx*/, const void * /* callable */) { return 0; }
@@ -1280,4 +1288,91 @@ TEST_F(TrbRuntimeTempBufferTest, ManagedResourceStatusesSurviveBothAdapterBridge
         EXPECT_EQ(bind_runtime(runtime, api_, host_args, signature, 1), status);
         EXPECT_EQ(fake_.copy_to_count, 0);
     }
+}
+
+TEST_F(TrbRuntimeTempBufferTest, BoundScopeCapacitiesMatchAllocatorValuesOnColdAndWarmEmptyRuns) {
+    fake_.reset();
+    fake_.cache_recording = true;
+    uint64_t windows[CHIP_MAX_RING_DEPTH] = {4, 8, 16, 32};
+    uint64_t heaps[CHIP_MAX_RING_DEPTH] = {1025, 2049, 4097, 8193};
+    uint64_t pools[CHIP_MAX_RING_DEPTH] = {5, 7, 9, 11};
+    ChipStorageTaskArgs args;
+    Runtime cold;
+    ASSERT_EQ(bind_callable_to_runtime_impl(&cold, &api_, &args, nullptr, nullptr, 0, windows, heaps, pools), 0);
+    ASSERT_TRUE(cold.scope_stats_capacity().required);
+    ASSERT_TRUE(cold.scope_stats_capacity().values);
+    const auto expected = *cold.scope_stats_capacity().values;
+    ASSERT_EQ(fake_.cache_miss_count, 1);
+    auto device_runtime = std::make_unique<RuntimeContext>();
+    ASSERT_LE(fake_.cached_runtime_off + sizeof(RuntimeContext), fake_.runtime_arena.size());
+    std::memcpy(device_runtime.get(), fake_.runtime_arena.data() + fake_.cached_runtime_off, sizeof(RuntimeContext));
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
+        EXPECT_EQ(expected.task_window[r], windows[r]);
+        EXPECT_EQ(expected.task_window[r], device_runtime->orchestrator.rings[r].task_allocator.window_size());
+        EXPECT_EQ(expected.heap[r], heaps[r]);
+        EXPECT_EQ(expected.heap[r], device_runtime->orchestrator.rings[r].task_allocator.heap_capacity());
+        EXPECT_EQ(expected.dep_pool[r], pools[r]);
+        EXPECT_EQ(expected.dep_pool[r], device_runtime->prebuilt_layout.sizing.dep_pool_capacities[r]);
+    }
+    EXPECT_GT(expected.tensormap, 0);
+    EXPECT_EQ(expected.tensormap, device_runtime->orchestrator.tensor_map.pool_capacity());
+
+    // Device execution may rewrite the arena; the cache's host image is stable.
+    std::fill(fake_.runtime_arena.begin(), fake_.runtime_arena.end(), 0xdd);
+    const int copies = fake_.copy_to_count;
+    Runtime warm;
+    ASSERT_EQ(bind_callable_to_runtime_impl(&warm, &api_, &args, nullptr, nullptr, 0, windows, heaps, pools), 0);
+    ASSERT_EQ(fake_.cache_hit_count, 1);
+    ASSERT_TRUE(warm.scope_stats_capacity().values);
+    const auto &actual = *warm.scope_stats_capacity().values;
+    EXPECT_EQ(actual.task_window, expected.task_window);
+    EXPECT_EQ(actual.heap, expected.heap);
+    EXPECT_EQ(actual.dep_pool, expected.dep_pool);
+    EXPECT_EQ(actual.tensormap, expected.tensormap);
+    EXPECT_EQ(fake_.copy_to_count, copies);
+    EXPECT_TRUE(std::all_of(fake_.runtime_arena.begin(), fake_.runtime_arena.end(), [](uint8_t v) {
+        return v == 0xdd;
+    }));
+    windows[0] = 64;
+    heaps[0] = 16385;
+    pools[0] = 13;
+    Runtime changed;
+    ASSERT_EQ(bind_callable_to_runtime_impl(&changed, &api_, &args, nullptr, nullptr, 0, windows, heaps, pools), 0);
+    ASSERT_EQ(fake_.cache_miss_count, 2);
+    ASSERT_TRUE(changed.scope_stats_capacity().values);
+    EXPECT_EQ(changed.scope_stats_capacity().values->task_window[0], 64);
+    EXPECT_EQ(changed.scope_stats_capacity().values->heap[0], 16385u);
+    EXPECT_EQ(changed.scope_stats_capacity().values->dep_pool[0], 13);
+    EXPECT_EQ(cold.scope_stats_capacity().values->task_window, expected.task_window);
+    EXPECT_EQ(cold.scope_stats_capacity().values->heap, expected.heap);
+    EXPECT_EQ(warm.scope_stats_capacity().values->dep_pool, expected.dep_pool);
+    EXPECT_EQ(finish_run(changed, 0, 0), 0);
+    EXPECT_EQ(finish_run(cold, 0, 0), 0);
+    EXPECT_EQ(finish_run(warm, 0, 0), 0);
+}
+
+TEST_F(TrbRuntimeTempBufferTest, PrewarmedBindingCapturesCapacityAndFailedRebindCannotKeepIt) {
+    fake_.reset();
+    fake_.cache_recording = true;
+    uint64_t windows[CHIP_MAX_RING_DEPTH] = {8, 16, 32, 64};
+    uint64_t heaps[CHIP_MAX_RING_DEPTH] = {2049, 4097, 8193, 16385};
+    uint64_t pools[CHIP_MAX_RING_DEPTH] = {7, 9, 11, 13};
+    ASSERT_EQ(prewarm_config_impl(&api_, windows, heaps, pools), 0);
+    ASSERT_EQ(fake_.cache_store_count, 1);
+    ChipStorageTaskArgs args;
+    Runtime runtime;
+    ASSERT_EQ(bind_callable_to_runtime_impl(&runtime, &api_, &args, nullptr, nullptr, 0, windows, heaps, pools), 0);
+    ASSERT_EQ(fake_.cache_hit_count, 1);
+    ASSERT_TRUE(runtime.scope_stats_capacity().values);
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
+        EXPECT_EQ(runtime.scope_stats_capacity().values->task_window[r], windows[r]);
+        EXPECT_EQ(runtime.scope_stats_capacity().values->heap[r], heaps[r]);
+        EXPECT_EQ(runtime.scope_stats_capacity().values->dep_pool[r], pools[r]);
+    }
+    EXPECT_GT(runtime.scope_stats_capacity().values->tensormap, 0);
+    EXPECT_EQ(finish_run(runtime, 0, 0), 0);
+    fake_.cached_image_size = 0;
+    EXPECT_NE(bind_callable_to_runtime_impl(&runtime, &api_, &args, nullptr, nullptr, 0, windows, heaps, pools), 0);
+    EXPECT_TRUE(runtime.scope_stats_capacity().required);
+    EXPECT_FALSE(runtime.scope_stats_capacity().values);
 }

@@ -24,8 +24,10 @@
 #include <cstring>
 
 #include "aicpu/device_run_result_base_aicpu.h"
+#include "aicpu/diagnostic_run_terminal_aicpu.h"
 #include "aicpu/profiler_device_engine.h"
 #include "callable_limits.h"
+#include "common/diagnostic_run_terminal.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -45,13 +47,60 @@ static uint32_t s_records_written[PLATFORM_MAX_AICPU_THREADS] = {};
 static uint32_t s_buffers_switched[PLATFORM_MAX_AICPU_THREADS] = {};
 static uint32_t s_buffers_flushed[PLATFORM_MAX_AICPU_THREADS] = {};
 
-static inline void account_dropped_records(DumpBufferState *state, uint32_t dropped_records) {
-    if (state == nullptr || dropped_records == 0) {
+// This run's accounting, per producer thread. Held here rather than in the
+// shared DumpBufferState because the two counters that do live there —
+// published_payload_count and completed_payload_count — are lifetime cursors
+// that drive arena reuse and must never be reset; a per-run figure derived by
+// differencing them would be a second meaning for the same field. Reset with
+// the counters above at each run's device init.
+static uint32_t s_records_dropped[PLATFORM_MAX_AICPU_THREADS] = {};
+// The share of the above that never reached a buffer. A record refused before
+// the write is one this producer took responsibility for and never wrote; one
+// lost after the write is already counted among the records it wrote. `total`
+// is written + refused for exactly that reason — adding every drop instead
+// would count the second kind twice and make a lossy run fail conservation.
+static uint32_t s_records_refused[PLATFORM_MAX_AICPU_THREADS] = {};
+static uint32_t s_records_published[PLATFORM_MAX_AICPU_THREADS] = {};
+static uint32_t s_buffers_published[PLATFORM_MAX_AICPU_THREADS] = {};
+static uint32_t s_payloads_published[PLATFORM_MAX_AICPU_THREADS] = {};
+static uint64_t s_payload_bytes_published[PLATFORM_MAX_AICPU_THREADS] = {};
+
+// Where this run's producer accounting is published, and which bank of it is
+// this run's. Zero means the host mapped none, which is the default path.
+/**
+ * This run's terminal bank — the address of its first producer entry — pushed
+ * at kernel entry from the launching run's KernelArgs. 0 means the host
+ * resolved none, which is every run with this collector's retention off, and
+ * is what keeps the device off an address nobody mapped.
+ */
+static uint64_t s_run_terminal_bank = 0;
+
+static inline void saturating_add_u32(uint32_t &counter, uint32_t by) {
+    counter = diagnostic_terminal_add_u32(counter, by);
+}
+
+static inline void account_dropped_records(int thread_idx, DumpBufferState *state, uint32_t dropped_records) {
+    if (dropped_records == 0) {
+        return;
+    }
+    if (thread_idx >= 0 && thread_idx < PLATFORM_MAX_AICPU_THREADS) {
+        saturating_add_u32(s_records_dropped[thread_idx], dropped_records);
+    }
+    if (state == nullptr) {
         return;
     }
     uint32_t prev = state->dropped_record_count;
     uint32_t next = prev + dropped_records;
     state->dropped_record_count = (next < prev) ? UINT32_MAX : next;
+}
+
+// A record refused before anything was written for it: counted among this
+// run's drops, and separately as one the producer never wrote.
+static inline void account_refused_record(int thread_idx, DumpBufferState *state) {
+    if (thread_idx >= 0 && thread_idx < PLATFORM_MAX_AICPU_THREADS) {
+        saturating_add_u32(s_records_refused[thread_idx], 1);
+    }
+    account_dropped_records(thread_idx, state, 1);
 }
 
 static constexpr uint64_t kDumpQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
@@ -63,6 +112,39 @@ static bool g_enable_dump_args = false;
 static DumpArgsLevel g_dump_args_level = DumpArgsLevel::OFF;
 
 extern "C" void set_platform_dump_base(uint64_t dump_data_base) { g_platform_dump_base = dump_data_base; }
+
+void set_platform_dump_args_run_terminal(uint64_t bank) { s_run_terminal_bank = bank; }
+
+void dump_args_close_run(int thread_idx) {
+    if (thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
+        return;
+    }
+    uint32_t live_at_close = 0;
+    const DumpMetaBuffer *held = s_current_dump_buf[thread_idx];
+    if (held != nullptr) {
+        live_at_close = held->count;
+    }
+
+    DiagnosticRunTerminalCounts counts{};
+    // Every record this producer took responsibility for, in the unit
+    // `published_records` and `live_at_close` are in: the ones it wrote plus
+    // the ones it refused before writing. A record written and then lost with
+    // its buffer is already among the written ones, so adding every drop here
+    // would count it twice.
+    counts.total = diagnostic_terminal_add_u32(s_records_written[thread_idx], s_records_refused[thread_idx]);
+    counts.dropped = s_records_dropped[thread_idx];
+    counts.published_records = s_records_published[thread_idx];
+    counts.published_buffers = s_buffers_published[thread_idx];
+    counts.live_at_close = live_at_close;
+    counts.published_payloads = s_payloads_published[thread_idx];
+    counts.published_payload_bytes = s_payload_bytes_published[thread_idx];
+    // No device-side fatal latch exists for this collector; a counter that
+    // reached its sentinel is reported as saturation by the figures themselves.
+
+    simpler::dfx::terminal::publish(
+        s_run_terminal_bank, PLATFORM_MAX_AICPU_THREADS, thread_idx, get_platform_run_result_epoch(), counts
+    );
+}
 
 extern "C" uint64_t get_platform_dump_base() { return g_platform_dump_base; }
 
@@ -370,6 +452,7 @@ struct DumpDeviceModule {
         DumpBufferState *state = s_dump_states[ctx.thread_idx];
         auto *buffer = reinterpret_cast<DumpMetaBuffer *>(buffer_ptr);
         uint64_t payload_count = 0;
+        uint64_t payload_bytes = 0;
         uint32_t record_count = buffer->count;
         if (record_count > PLATFORM_DUMP_RECORDS_PER_BUFFER) {
             record_count = PLATFORM_DUMP_RECORDS_PER_BUFFER;
@@ -378,16 +461,27 @@ struct DumpDeviceModule {
             const ArgsDumpRecord &record = buffer->records[i];
             if (record.kind == static_cast<uint8_t>(ArgsDumpKind::TENSOR) && record.payload_size > 0) {
                 payload_count++;
+                payload_bytes += record.payload_size;
             }
         }
         state->published_payload_count += payload_count;
+        // This run's share of the same commit. The cursor above is a lifetime
+        // one the arena's reuse depends on; these are the figures that balance
+        // against the host's receipts for this identity alone.
+        saturating_add_u32(s_records_published[ctx.thread_idx], record_count);
+        saturating_add_u32(s_buffers_published[ctx.thread_idx], 1);
+        saturating_add_u32(s_payloads_published[ctx.thread_idx], static_cast<uint32_t>(payload_count));
+        s_payload_bytes_published[ctx.thread_idx] =
+            diagnostic_terminal_add_u64(s_payload_bytes_published[ctx.thread_idx], payload_bytes);
         wmb();
         ctx.header->queues[ctx.thread_idx][tail].thread_index = static_cast<uint32_t>(ctx.thread_idx);
         ctx.header->queues[ctx.thread_idx][tail].buffer_ptr = buffer_ptr;
         ctx.header->queues[ctx.thread_idx][tail].buffer_seq = buffer_seq;
     }
 
-    static void account_dropped(Context, State *state, uint32_t count) { account_dropped_records(state, count); }
+    static void account_dropped(Context ctx, State *state, uint32_t count) {
+        account_dropped_records(ctx.thread_idx, state, count);
+    }
     static void on_pop_success(Context ctx, State *state, Buffer *buffer) {
         buffer->run_epoch = get_platform_run_result_epoch();
         buffer->local_seq = state->current_buf_seq;
@@ -669,6 +763,22 @@ void dump_args_init(int num_dump_threads) {
     memset(s_records_written, 0, sizeof(s_records_written));
     memset(s_buffers_switched, 0, sizeof(s_buffers_switched));
     memset(s_buffers_flushed, 0, sizeof(s_buffers_flushed));
+    memset(s_records_dropped, 0, sizeof(s_records_dropped));
+    memset(s_records_refused, 0, sizeof(s_records_refused));
+    memset(s_records_published, 0, sizeof(s_records_published));
+    memset(s_buffers_published, 0, sizeof(s_buffers_published));
+    memset(s_payloads_published, 0, sizeof(s_payloads_published));
+    memset(s_payload_bytes_published, 0, sizeof(s_payload_bytes_published));
+    for (int t = 0; t < num_dump_threads; t++) {
+        // Exactly the lanes this run brought up, because exactly those close.
+        // A claim on a lane the run never starts is never settled, and a
+        // participant that never settles is the run reporting its own
+        // accounting unknown — so claiming the whole dimensioned array would
+        // make every run with fewer lanes than the platform maximum unknown.
+        simpler::dfx::terminal::begin_run(
+            s_run_terminal_bank, PLATFORM_MAX_AICPU_THREADS, t, get_platform_run_result_epoch()
+        );
+    }
 }
 
 int dump_arg_record(int thread_idx, const ArgsDumpInfo &info) {
@@ -684,7 +794,7 @@ int dump_arg_record(int thread_idx, const ArgsDumpInfo &info) {
     if (buf == nullptr) {
         buf = try_pop_dump_meta_buffer(thread_idx, state, state != nullptr ? state->current_buf_seq : 0);
         if (buf == nullptr) {
-            account_dropped_records(state, 1);
+            account_refused_record(thread_idx, state);
             return -1;
         }
     }
@@ -698,7 +808,7 @@ int dump_arg_record(int thread_idx, const ArgsDumpInfo &info) {
         if (buf == nullptr) {
             buf = try_pop_dump_meta_buffer(thread_idx, state, state != nullptr ? state->current_buf_seq : 0);
             if (buf == nullptr) {
-                account_dropped_records(state, 1);
+                account_refused_record(thread_idx, state);
                 return -1;
             }
         }
@@ -725,14 +835,14 @@ int dump_arg_record(int thread_idx, const ArgsDumpInfo &info) {
     }
 
     if (!ensure_dump_arena_capacity(thread_idx, state, copy_bytes)) {
-        account_dropped_records(state, 1);
+        account_refused_record(thread_idx, state);
         return -1;
     }
     buf = s_current_dump_buf[thread_idx];
     if (buf == nullptr) {
         buf = try_pop_dump_meta_buffer(thread_idx, state, state->current_buf_seq);
         if (buf == nullptr) {
-            account_dropped_records(state, 1);
+            account_refused_record(thread_idx, state);
             return -1;
         }
     }
@@ -778,7 +888,7 @@ int dump_arg_record(int thread_idx, const ArgsDumpInfo &info) {
     buf->count = idx + 1;
     wmb();
 
-    s_records_written[thread_idx]++;
+    saturating_add_u32(s_records_written[thread_idx], 1);
 
     return 0;
 }
@@ -812,7 +922,7 @@ void dump_args_flush(int thread_idx) {
             // it, so nothing returns it to the free queue. Retaining it lets the
             // next run's init reuse it in place, which is the only return
             // available to AICPU.
-            account_dropped_records(state, buf->count);
+            account_dropped_records(thread_idx, state, buf->count);
             buf->count = 0;
             wmb();
         }

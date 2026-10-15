@@ -82,7 +82,34 @@ void scope_stats_aicpu_set_orch_thread_idx(int thread_idx);
 // Push the current (partially-filled) buffer onto the ready_queue so the host
 // gets the final records. Idempotent: a no-op when there is no current buffer.
 // Called from the orchestrator-thread exit path and from scope_stats_on_fatal.
+//
+// A successful commit hands the buffer to the host, which returns it through
+// the free queue it alone produces into. An unsuccessful one hands over
+// nothing, so the buffer stays this producer's and the records it held are
+// counted as dropped.
 void scope_stats_aicpu_flush_buffers();
+
+// --- Per-run accounting (orchestrator thread) ---
+
+// Name the bank array this collector's producer publishes its per-run
+// accounting into, and which bank belongs to the launching run. A zero base is
+// the default path: the producer then publishes nothing and the host reads its
+// live counters, as it does without retention.
+void set_platform_scope_stats_run_terminal(uint64_t bank);
+
+// Start this run's accounting: zero the producer's own counters, adopt any
+// buffer still held across the run boundary, and clear the terminal entry the
+// run will publish into.
+//
+// The counters are the producer's because a host instant is not a run boundary
+// once a successor may already be queued behind its predecessor. The buffer is
+// adopted rather than released because AICPU is the free queue's consumer and
+// never its producer, so releasing the pointer would strand it.
+void scope_stats_aicpu_begin_run();
+
+// Settle this run's accounting into its terminal entry, after every path that
+// can still change a counter. A run with no identity publishes nothing.
+void scope_stats_aicpu_close_run();
 
 // --- Capacity registration (called by runtime at init) ---
 

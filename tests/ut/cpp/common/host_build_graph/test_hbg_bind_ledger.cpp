@@ -55,6 +55,7 @@
 #include "host/host_phase_records.h"
 #include "host/platform_compile_info.h"
 #include "worker/runtime_c_api.h"
+#include "worker/native_run_context.h"
 
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
@@ -1595,10 +1596,104 @@ protected:
         return prerequisites.empty() ? nullptr : prerequisites.front().device_target;
     }
 
+    // Keep the predecessor's runner settings in place while preparing another
+    // slot through the real NativeRunContext and real scheduler layout builder.
+    void check_diagnostic_transition(int before_pmu, int after_pmu, int before_level, int after_level) {
+        struct Runner {
+            struct PreparedExecution {};
+            struct ActiveExecution {};
+            int pmu;
+            uint32_t level;
+            int queries{0};
+        } runner{before_pmu, static_cast<uint32_t>(before_level)};
+        HostApiOps ops = fake_ops();
+        ops.get_pmu_enabled = [](void *ctx) {
+            auto &r = *static_cast<Runner *>(ctx);
+            ++r.queries;
+            return r.pmu;
+        };
+        ops.get_chip_swimlane_level = [](void *ctx) {
+            auto &r = *static_cast<Runner *>(ctx);
+            ++r.queries;
+            return r.level;
+        };
+        CallConfig before{};
+        before.enable_pmu = before_pmu;
+        before.enable_chip_swimlane = before_level;
+        CallConfig after{};
+        after.enable_pmu = after_pmu;
+        after.enable_chip_swimlane = after_level;
+        NativeRunDescriptor first_id{};
+        first_id.run_epoch = 11;
+        NativeRunDescriptor second_id{};
+        second_id.pipeline_slot = 1;
+        second_id.arena_bank = 1;
+        second_id.run_epoch = 12;
+        NativeRunContext<Runner> first(&runner, before, 0, first_id, &ops);
+        NativeRunContext<Runner> second(&runner, after, 0, second_id, &ops);
+        auto cleanup = RAIIScopeGuard([&]() {
+            EXPECT_EQ(release_run_bindings_impl(&second.runtime, &second.host_api), 0);
+            EXPECT_EQ(release_run_bindings_impl(&first.runtime, &first.host_api), 0);
+        });
+        init_runtime(first.runtime);
+        init_runtime(second.runtime);
+        install_callable_tables(first.runtime);
+        second.runtime.set_callable_tables(
+            object_table_, reinterpret_cast<uint64_t>(object_table_), reinterpret_cast<uint64_t>(entry_table_), 1
+        );
+        eps_ = {ordinary_orch_entry, capture_orch_bind};
+        ChipStorageTaskArgs args;
+        const uint64_t window[4] = {8, 0, 0, 0};
+        ASSERT_EQ(
+            bind_callable_to_runtime_impl(
+                &first.runtime, &first.host_api, &args, &eps_, nullptr, 0, window, nullptr, nullptr
+            ),
+            0
+        );
+        ASSERT_GT(first.runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
+        const size_t predecessor_bytes = slot(0).capacity;
+        const auto predecessor_host = slot(0).host;
+        ASSERT_EQ(
+            bind_callable_to_runtime_impl(
+                &second.runtime, &second.host_api, &args, &eps_, nullptr, 0, window, nullptr, nullptr
+            ),
+            0
+        );
+        ASSERT_GT(second.runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
+        // Identical task shape, distinct fresh slots: only the current run's
+        // optional PMU cells or activity buffers can change the requested size.
+        if (after_pmu > before_pmu || after_level > before_level) {
+            EXPECT_GT(slot(1).capacity, predecessor_bytes);
+        } else {
+            EXPECT_LT(slot(1).capacity, predecessor_bytes);
+        }
+        EXPECT_EQ(slot(0).capacity, predecessor_bytes);
+        EXPECT_EQ(slot(0).host, predecessor_host);
+        EXPECT_EQ(runner.pmu, before_pmu);
+        EXPECT_EQ(runner.level, static_cast<uint32_t>(before_level));
+        EXPECT_EQ(runner.queries, 0);
+    }
+
     std::vector<uint8_t> callable_;
     uint64_t object_table_[1]{};
     uint64_t entry_table_[1]{};
 };
+
+TEST_F(HbgResidentSchedulerStorageTest, PreparedSuccessorEnablesPmuWithoutChangingPredecessor) {
+    check_diagnostic_transition(0, 1, 0, 0);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, PreparedSuccessorDisablesPmuWithoutChangingPredecessor) {
+    check_diagnostic_transition(1, 0, 0, 0);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, PreparedSuccessorEnablesActivityWithoutChangingPredecessor) {
+    check_diagnostic_transition(0, 0, 0, 3);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, PreparedSuccessorDisablesActivityWithoutChangingPredecessor) {
+    check_diagnostic_transition(0, 0, 3, 0);
+}
 
 // The storage belongs to the pipeline slot, not to the run that used it: a
 // second run of the same shape gets the same two blocks back, and the release

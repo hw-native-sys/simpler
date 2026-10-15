@@ -207,7 +207,7 @@ inline void populate(ChipSwimlaneCollector &collector, PhaseBuffers &buffers, co
     collector.reconcile_counters();
     collector.report_run_terminal_snapshot(/*bank_index=*/0, kEpoch);
 
-    collector.set_json_extension(ChipSwimlaneExtensionSection::AicpuLifecycleRecords, "[[11, 12]]");
+    collector.set_json_extension(kEpoch, ChipSwimlaneExtensionSection::AicpuLifecycleRecords, "[[11, 12]]", 10);
 
     std::vector<HostPhaseRecord> submits(1);
     submits[0].index = 1;

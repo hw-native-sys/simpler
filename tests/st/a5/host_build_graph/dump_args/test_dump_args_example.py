@@ -12,6 +12,14 @@
 Demonstrates the two dump-args metadata registration APIs:
   Task 0 (add):                add_task() + set_tensor_info_to_task()
   Task 1 (add_scalar_inplace): add_task_with_tensor_info()
+
+Those are orchestration APIs and they work here; the capture they register for does not. This
+runtime's route is the AICore Scheduler, where the on-core schedulers both dispatch and complete,
+so it has no per-task argument producer — `args_dump_capture_supported_impl` answers 0 and
+`simpler_prepare_run` refuses an `enable_dump_args` request. **So this case asserts the computation
+only, and `--dump-args` fails every a5 `host_build_graph` scene rather than collecting here.** The
+capture template is the a2a3 mirror, `tests/st/a2a3/host_build_graph/dump_args`; the refusal is
+asserted by `tests/st/a5/host_build_graph/test_dfx_joined_launch_attribution.py`.
 """
 
 import torch

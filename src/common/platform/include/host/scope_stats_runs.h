@@ -36,6 +36,7 @@
 
 #include "common/scope_stats.h"
 #include "host/chip_swimlane_runs.h"
+#include "host/diagnostic_run_credit.h"
 #include "host/collected_record.h"
 
 namespace simpler::dfx::scope_stats_runs {
@@ -55,14 +56,11 @@ inline constexpr size_t kRecordsPerBlock = kRecordBlockBytes / sizeof(Record);
 static_assert(kRecordsPerBlock > 0, "a record block must hold at least one record");
 
 /**
- * The device-written values one artifact needs, copied out while the run still
- * holds its execution claim.
- *
- * Copied rather than referenced because the next run rewrites every one of
- * them: the orchestrator's capacity setters republish the caps at its own init,
- * and `begin_run()` zeroes both counters. `valid` is false until a *checked*
- * device read has filled the rest, so a failed copy can never leave a stale
- * field to be published as this run's.
+ * Values owned by one artifact. Retained runs take counters from their completed
+ * terminal bank and capacities from the immutable host binding admitted into
+ * their epoch slot. The default path copies both from the shared header while
+ * the run still holds its execution claim. `valid` requires checked terminal
+ * accounting; it is not permission to read the current shared header.
  */
 struct DeviceSnapshot {
     bool valid{false};
@@ -180,6 +178,28 @@ struct RunExport {
  * accounting still balances, and the fatal travels in the artifact's own
  * `fatal` field — so it settles a partial result that is still count-known.
  */
+/**
+ * Classify a run from its own producer accounting rather than the live header.
+ *
+ * The device side of the verdict is already settled by `reconcile_run`: every
+ * participant published, the figures conserve, and what the producers committed
+ * is matched against what the host took delivery of. What this adds is the one
+ * fact that reconciliation cannot see — whether host storage held everything it
+ * was offered — so a refused record downgrades a run the device reported clean.
+ */
+inline Collection classify_reconciled(const simpler::dfx::credit::RunReconciliation &settled, uint64_t retained) {
+    Collection out;
+    out.verdict = settled.verdict;
+    out.counts_unknown = settled.counts_unknown;
+    out.received = settled.received;
+    out.retained = retained;
+    if (out.counts_unknown) return out;
+    if (retained < settled.received && out.verdict == simpler::dfx::runs::Verdict::Published) {
+        out.verdict = simpler::dfx::runs::Verdict::PartialSafe;
+    }
+    return out;
+}
+
 inline Collection classify(const DeviceSnapshot &device, uint64_t received, uint64_t retained) {
     Collection out;
     out.received = received;

@@ -558,7 +558,7 @@ TEST(ChipRunLaneJoinedLaunchTest, ADeviceSpaceTensorOnEitherRunFallsBackToTheSer
     worker.finalize();
 }
 
-TEST(ChipRunLaneJoinedLaunchTest, DiagnosticsOtherThanSwimlaneStayExclusive) {
+TEST(ChipRunLaneJoinedLaunchTest, AChannelOnOneSideOnlyIsNotAPair) {
     ChipWorker worker;
     prime_worker(worker);
     ChipRunLane lane(worker);
@@ -567,20 +567,45 @@ TEST(ChipRunLaneJoinedLaunchTest, DiagnosticsOtherThanSwimlaneStayExclusive) {
     diagnostic.output_prefix[0] = 'x';
 
     // Preparation is not special-cased — the successor still prepares natively
-    // — but every collector other than the swimlane is armed for one run at
-    // launch, so a second launched run would publish one run's records as the
-    // other's.
+    // — but an owner that is on for one run and off for the other is one
+    // shared device setting with two answers, so the pair is refused by the
+    // lane without the backend being asked.
     ChipRun first = submit(lane, 101, 0, true, host_args());
     ChipRun second = submit(lane, 102, 1, false, host_args(), diagnostic);
     EXPECT_EQ(second.preparation_disposition(), ChipRunPreparationDisposition::NATIVE_PREPARED);
     second.activate();
     EXPECT_FALSE(second.launched());
     EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "prepare1"}));
-    EXPECT_EQ(g_diagnostic_queries, 0) << "a channel the lane can rule out never reaches the backend";
+    EXPECT_EQ(g_diagnostic_queries, 0) << "a disagreement the lane can see never reaches the backend";
 
     g_complete[0] = true;
     EXPECT_TRUE(first.done());
     EXPECT_TRUE(second.launched());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, AnAgreeingChannelWithoutSwimlaneReachesTheBackend) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    // No swimlane at all: each queue-pair owner publishes its own run's
+    // accounting into a bank that run reserved, so swimlane is not a
+    // precondition for the others. Whether this pair may actually join is the
+    // backend's answer — what this proves is that the lane asks.
+    CallConfig pmu_only;
+    pmu_only.enable_pmu = true;
+    pmu_only.output_prefix[0] = 'x';
+
+    ChipRun first = submit(lane, 109, 0, true, host_args(), pmu_only);
+    ChipRun second = submit(lane, 110, 1, false, host_args(), pmu_only);
+    second.activate();
+
+    EXPECT_EQ(g_diagnostic_queries, 1) << "the lane ruled out a pair only the backend can judge";
+    EXPECT_TRUE(second.launched()) << "the backend agreed and the successor was not launched";
+
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
     lane.close();
     worker.finalize();
 }
@@ -639,13 +664,15 @@ TEST(ChipRunLaneJoinedLaunchTest, ALevelTransitionDeclinesWithoutAskingTheBacken
     worker.finalize();
 }
 
-TEST(ChipRunLaneJoinedLaunchTest, ASwimlaneRunBesideAnotherChannelDeclines) {
+TEST(ChipRunLaneJoinedLaunchTest, ASwimlaneRunBesideADisagreeingChannelDeclines) {
     ChipWorker worker;
     prime_worker(worker);
     ChipRunLane lane(worker);
     CallConfig mixed = swimlane_config(1);
     mixed.enable_dep_gen = 1;
 
+    // The two agree on the swimlane level and disagree on dep_gen. Agreement
+    // is required of every owner, not of the one that happens to be loudest.
     ChipRun first = submit(lane, 205, 0, true, host_args(), swimlane_config(1));
     ChipRun second = submit(lane, 206, 1, false, host_args(), mixed);
     second.activate();

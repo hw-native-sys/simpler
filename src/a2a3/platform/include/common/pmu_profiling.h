@@ -42,6 +42,57 @@
 constexpr int PMU_COUNTER_COUNT_A2A3 = 8;
 
 /**
+ * What this core's control register read back right after its counting window
+ * was programmed, as the one `DiagnosticRunTerminal::producer_note` this
+ * producer writes for the run that claimed its entry.
+ *
+ * It answers one question and no others: did the enable this run wrote survive
+ * to be read back on this core. It is **not** evidence about the AICore `CTRL`
+ * gate — that bit is an AICore SPR with no AICPU read path — nor that any cycle
+ * was counted, nor about which window a core's physical id resolved to. A run
+ * whose rows read zero with every core reporting `ENABLED` has only had one
+ * candidate removed.
+ *
+ * `NO_WINDOW` keeps a core the platform gave no register address — sim, or a
+ * misconfigured table — distinguishable from a core that was programmed and
+ * read back zero, which `DISABLED` reports with the observed word in the note's
+ * payload.
+ *
+ * The payload also carries the **physical core id this logical core reported**,
+ * because that id is what selected the register window and no artifact
+ * otherwise records it: a PMU row names the logical core, while the address it
+ * was measured through came from `pmu_reg_addrs[physical_core_id]`. With the
+ * base and strides the host states once per table build, those two together are
+ * the address the run actually used, which is what separates a window that was
+ * programmed and lost its enable from one that was never this core's.
+ *
+ * **Two instants, not one.** `ENABLED` / `DISABLED` are what the window held
+ * when this run programmed it, before a single task ran — an init-time fact,
+ * and the only one a run that never reached its close leaves. `HELD` / `LOST`
+ * replace it at that core's close, after every task of the run has executed,
+ * and are the task-time fact: `HELD` says the enable this run wrote was still
+ * there when the run ended, `LOST` says it was not. A note still reading
+ * `ENABLED` therefore means the close never observed this core, which is itself
+ * the finding. Neither says whether the AICore opened its own per-task gate, so
+ * neither is evidence that a counter was counting; what they separate is "the
+ * window was never armed" from "it was armed and something cleared it" from
+ * "it was armed and stayed armed, so the measurement is the suspect".
+ *
+ * Payload layout, 24 bits: physical core id in [6:0], the observed `PMU_CTRL_0`
+ * in [23:7] — the word read at whichever instant the code names.
+ */
+#define PMU_NOTE_PHYSICAL_BITS 7
+#define PMU_NOTE_PHYSICAL_MASK 0x7Fu
+enum : uint32_t {
+    PMU_NOTE_NONE = 0,       // no observation (PMU off, or no terminal bank mapped)
+    PMU_NOTE_NO_WINDOW = 1,  // this core has no PMU register window to program
+    PMU_NOTE_ENABLED = 2,    // init read-back carries the enable this run wrote
+    PMU_NOTE_DISABLED = 3,   // init read-back does not; the payload is the observed word
+    PMU_NOTE_HELD = 4,       // enabled at init and still enabled at this core's close
+    PMU_NOTE_LOST = 5,       // enabled at init, not enabled at close; payload is the close word
+};
+
+/**
  * PMU event type selector. Values match pypto's `PROF_PMU_EVENT_TYPE`.
  * Simpler exposes this through the SIMPLER_PMU_EVENT_TYPE environment variable.
  */
@@ -215,12 +266,14 @@ static_assert(sizeof(PmuFreeQueue) == 128, "PmuFreeQueue must be 128 bytes");
  *   collected_on_host + sum(dropped) == sum(total)
  */
 struct PmuBufferState {
-    PmuFreeQueue free_queue;                 // SPSC queue of free PmuBuffer addresses
-    volatile uint64_t current_buf_ptr;       // Current active PmuBuffer (0 = none)
-    volatile uint32_t current_buf_seq;       // Sequence number for ordering
-    volatile uint32_t dropped_record_count;  // Tasks whose record was dropped on device
-    volatile uint32_t total_record_count;    // Total tasks the AICPU attempted to record
-    uint32_t pad[11];                        // Pad to 192 bytes
+    PmuFreeQueue free_queue;                   // SPSC queue of free PmuBuffer addresses
+    volatile uint64_t current_buf_ptr;         // Current active PmuBuffer (0 = none)
+    volatile uint32_t current_buf_seq;         // Sequence number for ordering
+    volatile uint32_t dropped_record_count;    // Tasks whose record was dropped on device
+    volatile uint32_t total_record_count;      // Total tasks the AICPU attempted to record
+    volatile uint32_t published_record_count;  // Records inside buffers committed to the ready queue
+    volatile uint32_t published_buffer_count;  // Successful ready-queue commits
+    uint32_t pad[9];                           // Pad to 192 bytes
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(PmuBufferState) == 192, "PmuBufferState must be 192 bytes");

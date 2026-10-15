@@ -813,6 +813,12 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
         // state null) when scope_stats is disabled; the current buffer is
         // popped lazily on the first scope_end append.
         scope_stats_aicpu_set_orch_thread_idx(thread_idx);
+        // This run's own counters, zeroed on the device rather than by the
+        // host at admission: with a successor already queued a host instant
+        // can fall either side of a producer transition, and this one cannot —
+        // the predecessor's producer is gone with its operator. A no-op when
+        // no bank was resolved, which is every run on the default path.
+        scope_stats_aicpu_begin_run();
 #endif
 
 #if SIMPLER_DFX
@@ -835,6 +841,14 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
         // Push the partially-filled scope_stats buffer so the host gets the
         // final scope_end records. Idempotent / no-op when disabled.
         scope_stats_aicpu_flush_buffers();
+        // After the flushes above, which are the last records either producer
+        // can publish, so each settles counters nothing will change again. The
+        // identity goes last, so a run killed between the two leaves an entry
+        // attributed to nobody rather than to this run.
+        if (is_dep_gen_enabled()) {
+            dep_gen_aicpu_close_run();
+        }
+        scope_stats_aicpu_close_run();
 #endif
 #if SIMPLER_DFX
         uint64_t orch_cycle_end = get_sys_cnt_aicpu();

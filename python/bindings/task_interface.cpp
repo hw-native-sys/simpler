@@ -3794,7 +3794,14 @@ NB_MODULE(_task_interface, m) {
         .def(
             "_launch_native_run",
             [](ChipWorker &self, const ChipWorkerNativeRun &run) {
-                self.launch_native_run(run);
+                // A capacity decline is the one non-failure result, and this
+                // raw entry has no queue to defer into: the caller asked for
+                // this run to go now, so a refusal is reported as one.
+                if (self.launch_native_run(run) == ChipWorker::NativeLaunch::DiagnosticCreditFull) {
+                    throw std::runtime_error(
+                        "native run was not admitted: a diagnostic collector had no capacity free"
+                    );
+                }
             },
             nb::arg("run"), nb::call_guard<nb::gil_scoped_release>(),
             "Launch a prepared native run and return after its real device launch fence."
@@ -3866,6 +3873,20 @@ NB_MODULE(_task_interface, m) {
                uint64_t pipeline_generation, uint64_t run_id, uint64_t dispatch_id, nb::bytes owner_instance_id,
                uint32_t chip_rank, uint32_t capture_index, uint32_t task_slot, uint32_t group_index,
                uint32_t group_size) {
+                // Read while the GIL is still held: this is the only argument
+                // whose storage is Python's, and `make_run_provenance` copies
+                // it into a POD. Everything else is already a bound C++ object
+                // nanobind keeps alive for the call.
+                const NativeRunProvenance provenance = make_run_provenance(
+                    owner_instance_id, chip_rank, capture_index, task_slot, group_index, group_size
+                );
+                // Released for the whole submission. The run's own wait blocks
+                // on the device and, when a diagnostic owner's capacity is
+                // exhausted, on that capacity coming back — both are waits of
+                // unbounded length to this thread, and holding the interpreter
+                // across either stops every other Python thread, including the
+                // ones whose progress could end the wait.
+                nb::gil_scoped_release release;
                 if (pipeline_generation == 0) {
                     self.run(
                         callable_id, &args, config, reinterpret_cast<volatile int32_t *>(accepted_state_addr),
@@ -3875,9 +3896,7 @@ NB_MODULE(_task_interface, m) {
                     self.run_with_lease(
                         callable_id, &args, config, PipelineSlotLease{pipeline_slot, 0, pipeline_generation},
                         reinterpret_cast<volatile int32_t *>(accepted_state_addr), accepted_value, run_id, dispatch_id,
-                        make_run_provenance(
-                            owner_instance_id, chip_rank, capture_index, task_slot, group_index, group_size
-                        )
+                        provenance
                     );
                 }
             },

@@ -66,8 +66,8 @@ protected:
     }
 
     /** The finalizer, then the cleanup owner's commit — both the executor's own. */
-    DeviceRunTerminal finalize_and_publish() {
-        executor.snapshot_run_terminal(&runtime);
+    DeviceRunTerminal finalize_and_publish(bool cores_retired = true) {
+        executor.snapshot_run_terminal(&runtime, cores_retired);
         executor.publish_run_terminal();
         return device_run_result_terminal(region, kEpoch);
     }
@@ -134,11 +134,23 @@ TEST_F(ResidentFinalizer, AParticipantFailureIsNotReplacedBySettling) {
 TEST_F(ResidentFinalizer, AnUnclaimedAuditedPathPublishesNothing) {
     executor.normal_path_claims_.store(0);
 
-    executor.snapshot_run_terminal(&runtime);
+    executor.snapshot_run_terminal(&runtime, /*cores_retired=*/true);
     executor.publish_run_terminal();
 
     EXPECT_EQ(region.published, 0u) << "no record to publish";
     EXPECT_EQ(device_run_result_terminal(region, kEpoch).state, DeviceRunTerminalState::Undecided);
+}
+
+// A run whose cores did not prove they stopped did not finish the audited path,
+// whatever every participant returned. The record is still published — the host
+// reading no verdict at all is worse than reading a failure — but it cannot be
+// the success a proved run gets.
+TEST_F(ResidentFinalizer, AnUnprovedStopCannotPublishTheSuccessItsParticipantsClaimed) {
+    const DeviceRunTerminal terminal = finalize_and_publish(/*cores_retired=*/false);
+
+    EXPECT_NE(terminal.state, DeviceRunTerminalState::Succeeded)
+        << "a run that could not prove its cores stopped published a success";
+    EXPECT_EQ(header().load(), SIMPLER_ERROR_NONE) << "no write on a clean path";
 }
 
 }  // namespace

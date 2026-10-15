@@ -75,6 +75,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // profiling-buffer bases are pushed here.
     set_platform_regs(k_args->regs);
     set_platform_dump_base(k_args->dump_data_base);
+    set_platform_dump_args_run_terminal(k_args->args_dump_run_terminal_bank);
     set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS));
     set_platform_chip_swimlane_base(k_args->chip_swimlane_data_base);
     set_platform_chip_swimlane_run_terminal_bank(k_args->chip_swimlane_run_terminal_bank);
@@ -82,11 +83,14 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     set_chip_swimlane_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);
     set_platform_pmu_reg_addrs(k_args->pmu_reg_addrs);
+    set_platform_pmu_run_terminal(k_args->pmu_run_terminal_bank);
     set_pmu_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_PMU));
     set_platform_dep_gen_base(k_args->dep_gen_data_base);
+    set_platform_dep_gen_run_terminal(k_args->dep_gen_run_terminal_bank);
     set_dep_gen_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_DEP_GEN));
     set_scope_stats_enabled(SIMPLER_GET_DFX_FLAG(k_args->enable_profiling_flag, SIMPLER_DFX_FLAG_SCOPE_STATS));
     set_platform_scope_stats_base(k_args->scope_stats_data_base);
+    set_platform_scope_stats_run_terminal(k_args->scope_stats_run_terminal_bank);
 
     // Filter-style affinity gate. Host computed ALLOWED_CPUS from AICPU
     // OCCUPY and wrote it into Runtime; the device side only matches

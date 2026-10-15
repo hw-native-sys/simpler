@@ -550,7 +550,29 @@ public:
         publish_run_config();
     }
 
-    bool set_json_extension(ChipSwimlaneExtensionSection section, const std::string &json_value);
+    /**
+     * One host-side JSON section, published by the run that produced it.
+     *
+     * The epoch is the publication's identity, not a hint. Under retention a
+     * successor is admitted while its predecessor still executes, so the
+     * predecessor publishes *after* the `begin_run`-equivalent that would have
+     * cleared a resident slot — one shared slot therefore belongs to no run,
+     * and the section goes into the bucket this epoch holds. A publication
+     * naming a run this collector does not hold open is refused; so is a second
+     * publication of the same section by the same run.
+     *
+     * Non-retained mode keeps the resident slots, where one run reaches the
+     * device at a time and `begin_run` clears them per run.
+     *
+     * Charged to that run's own host budget before the copy is made — measured
+     * from the caller's bytes, so a payload the budget refuses is never
+     * materialized here — and accepted only while that run's bucket is still
+     * `Admitting`, which is the window between its `run_begin` and its
+     * `run_close`. After the close the bucket's storage belongs to the writer.
+     */
+    bool set_json_extension(
+        uint64_t run_epoch, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
+    );
 
     /**
      * Per-buffer callback invoked by ProfilerBase's poll loop. Dispatches on
@@ -1620,14 +1642,15 @@ private:
         RunTerminalSnapshot terminal{};
         bool terminal_ok{false};
         /**
-         * Whether this run's admission-time metadata was fully kept.
+         * Whether this run's caller-sized metadata was kept in full.
          *
-         * False when the budget refused the core-type copy at `run_begin`. It
+         * Cleared when the budget refused the core-type copy at `run_begin`, or
+         * refused a section this run published through `set_json_extension`. It
          * has to be remembered rather than re-derived at close: the close-time
          * charge is a different allocation, and a sibling bucket publishing in
          * between can credit enough for it to succeed. Without this the
-         * artifact would claim complete metadata for a run whose core types
-         * were dropped.
+         * artifact would claim complete metadata for a run whose core types, or
+         * whose published section, were dropped.
          */
         bool admission_metadata_complete{true};
         /**
@@ -1784,6 +1807,24 @@ public:
     bool can_admit_retained_run() const;
 
     /**
+     * Whether this collector holds no unpublished retained run.
+     *
+     * True with retention off, and true once every admitted run's writer has
+     * published. What it answers is whether a writer may still be reading
+     * this collector's pools — which outlives a run's native retirement.
+     */
+    bool retained_runs_idle() const;
+
+    /**
+     * Tell the owning context that this collector's capacity may have moved.
+     *
+     * Set once by the runner after init. Over-notifying is free — a woken
+     * admission re-attempts and parks again — while under-notifying costs a
+     * blocked run its whole deadline.
+     */
+    void set_credit_release_notifier(std::function<void()> notifier) { credit_notifier_ = std::move(notifier); }
+
+    /**
      * Open one run's window on a collector that retains runs.
      *
      * The first such run also reserves the artifact directory and the host
@@ -1807,7 +1848,8 @@ public:
      */
     bool run_begin(
         uint64_t run_epoch, const std::string &output_prefix, ChipSwimlaneLevel level, const CoreType *core_types,
-        int core_type_count, bool host_orchestrated, const NativeRunArtifactIdentity *artifact_identity = nullptr
+        int core_type_count, bool host_orchestrated, const NativeRunArtifactIdentity *artifact_identity = nullptr,
+        simpler::dfx::runs::AdmissionRefusal *why = nullptr
     );
 
     /**
@@ -2107,6 +2149,7 @@ private:
     size_t active_epoch_limit_{simpler::dfx::runs::kMaxOpenEpochs};
     std::array<ShardEpochView, profiling_common::BufferPoolManager<ChipSwimlaneModule>::kMaxCollectorShards>
         shard_views_{};
+    std::function<void()> credit_notifier_;
     mutable std::mutex retained_mu_;
     std::condition_variable retained_cv_;
     std::thread writer_thread_;

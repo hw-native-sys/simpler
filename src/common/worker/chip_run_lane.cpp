@@ -12,10 +12,13 @@
 #include "chip_run_lane.h"
 
 #include "chip_worker.h"
+#include "credit_call_gate.h"
 
 #include <unistd.h>
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <exception>
 #include <limits>
@@ -23,6 +26,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include "host/chip_swimlane_runs.h"
 
 struct ChipRunState {
     enum class Phase : uint8_t { QUEUED, PREPARED, LAUNCHED, TERMINAL };
@@ -59,6 +64,23 @@ struct ChipRunState {
     // launches ordinarily. Without it the declined attempt would be re-issued
     // on every progress round for the rest of the predecessor's execution.
     bool joined_launch_declined{false};
+    /**
+     * This run was refused admission because some enabled diagnostic owner's
+     * capacity is still held by a run ahead.
+     *
+     * `credit_blocked_generation` is what the refusal read *before* asking any
+     * owner, so a waiter parking on it cannot miss a release that landed in
+     * between. `credit_deadline_set` fixes one steady-clock deadline at the
+     * first such refusal **while this run is at the front**: a successor's
+     * decline starts nothing, polls do not renew it, and a later refusal of
+     * the same run does not move it. On expiry only this un-launched run
+     * fails; every run ahead keeps its own outcome.
+     */
+    bool credit_blocked{false};
+    const char *credit_blocked_owner{nullptr};
+    uint64_t credit_blocked_generation{0};
+    bool credit_deadline_set{false};
+    std::chrono::steady_clock::time_point credit_deadline{};
     // Every device span this run names is covered by a caller allocation of
     // this device context, and this run holds the borrow over each. Set once at
     // admission and cleared at release, so it answers "may this run join".
@@ -92,7 +114,13 @@ static uint64_t borrow_identity(const ChipRunState &run) { return static_cast<ui
 struct ChipRunLaneState {
     explicit ChipRunLaneState(ChipWorker &worker) :
         worker(&worker),
-        generations(worker.pipeline_depth(), 0) {}
+        generations(worker.pipeline_depth(), 0) {
+        // Captured once, here, while the worker is demonstrably alive. Every
+        // later call reads them from the gate: this state holds the worker as
+        // a raw pointer, and a parked waiter is exactly the thing that can
+        // outlive it.
+        credit_gate.entries = worker.credit_entries();
+    }
 
     bool in_current_process() const noexcept { return process_id == getpid(); }
 
@@ -100,14 +128,66 @@ struct ChipRunLaneState {
         if (!in_current_process()) throw ExecutionContextRefused("chip run lane belongs to another process");
     }
 
-    [[noreturn]] static void rethrow_as_poisoned(const std::exception_ptr &error) {
+    /** The right to be inside a runtime credit entry. Outlives the worker. */
+    CreditCallGate credit_gate;
+
+    /**
+     * Read the credit generation, or 0 when there is nothing to read.
+     *
+     * Safe under this lane's mutex: it holds the gate lock only for the few
+     * instructions that copy the targets, and the entry itself is
+     * non-blocking. A 0 is "no progress information", never progress.
+     */
+    uint64_t credit_generation() {
+        CreditCall call(credit_gate, Admit::Ordinary);
+        if (!call || call.entries().generation == nullptr || call.entries().ctx == nullptr) return 0;
+        return call.entries().generation(call.entries().ctx);
+    }
+
+    /**
+     * Park until the credit generation leaves `seen`, or the budget elapses.
+     *
+     * Must be called with this lane's mutex released: the threads that advance
+     * the generation are the collectors' writers, and a waiter holding the
+     * lane mutex would block every other caller on this lane — including the
+     * retirement that frees the capacity being waited for.
+     *
+     * Returns whether a wait was actually taken. False means there was
+     * nothing to park on — the gate refused the call, or this runtime exports
+     * no wait entry — which the caller must tell apart from a wait that
+     * elapsed, because retrying the first is a spin and retrying the second
+     * is progress.
+     */
+    bool wait_for_credit(uint64_t seen, int timeout_ms) {
+        CreditCall call(credit_gate, Admit::Ordinary);
+        if (!call || call.entries().wait == nullptr || call.entries().ctx == nullptr) return false;
+        (void)call.entries().wait(call.entries().ctx, seen, timeout_ms);
+        return true;
+    }
+
+    /** How the lane states its poisoned condition, for a caller reading one message. */
+    static std::string poisoned_text(const std::exception_ptr &error) {
         try {
             std::rethrow_exception(error);
         } catch (const std::exception &e) {
-            throw std::runtime_error(std::string("chip run lane is poisoned: ") + e.what());
+            return std::string("chip run lane is poisoned: ") + e.what();
         } catch (...) {
-            throw std::runtime_error("chip run lane is poisoned by an unknown native failure");
+            return "chip run lane is poisoned by an unknown native failure";
         }
+    }
+
+    static std::string cause_text(const std::exception_ptr &error) {
+        try {
+            std::rethrow_exception(error);
+        } catch (const std::exception &e) {
+            return e.what();
+        } catch (...) {
+            return "an unknown native failure";
+        }
+    }
+
+    [[noreturn]] static void rethrow_as_poisoned(const std::exception_ptr &error) {
+        throw std::runtime_error(poisoned_text(error));
     }
 
     void require_usable() const {
@@ -163,7 +243,20 @@ struct ChipRunLaneState {
 
     void rethrow_run_error(const std::shared_ptr<ChipRunState> &run) const {
         if (run->error == nullptr) return;
-        if (run->poison_error != nullptr) rethrow_as_poisoned(run->poison_error);
+        // A run whose failure *is* the poison carries the same exception in
+        // both, and reports as poisoned alone.
+        if (run->poison_error != nullptr && run->poison_error == run->error) {
+            rethrow_as_poisoned(run->poison_error);
+        }
+        // Two independent facts when the exceptions differ, and the caller is
+        // owed both: why *this* run did not run, and that the lane is poisoned
+        // by something else — a cleanup that failed after the run had already
+        // failed does not correct the first, and leaving it out would hide
+        // that no further run can be admitted. The run's own cause leads,
+        // because it is the one the caller asked about.
+        if (run->poison_error != nullptr) {
+            throw std::runtime_error(cause_text(run->error) + "; " + poisoned_text(run->poison_error));
+        }
         std::rethrow_exception(run->error);
     }
 
@@ -405,13 +498,96 @@ struct ChipRunLaneState {
             }
             run->resource_wait = false;
         }
+        // Read before the attempt, so a release landing between the two cannot
+        // be missed by a waiter that parks on it.
+        const uint64_t generation_before = credit_generation();
         try {
-            worker->launch_native_run(run->native_run, run->caller_stream);
+            if (worker->launch_native_run(run->native_run, run->caller_stream) ==
+                ChipWorker::NativeLaunch::DiagnosticCreditFull) {
+                note_credit_blocked(run, generation_before, /*at_front=*/true);
+                return;
+            }
+            run->credit_blocked = false;
             run->phase = ChipRunState::Phase::LAUNCHED;
             run->crossed_launch_fence = true;
         } catch (...) {
             fail_launch(run);
         }
+    }
+
+    /**
+     * Record that this run could not be admitted for want of diagnostic
+     * credit, and start its deadline the first time that happens at the front.
+     *
+     * The deadline is fixed once and never renewed: a later refusal of the
+     * same run, another poll, or a successor's decline all leave it where the
+     * first front refusal put it. Only a run that reaches the front gets one,
+     * because only there is nothing else it could be waiting for.
+     */
+    void note_credit_blocked(const std::shared_ptr<ChipRunState> &run, uint64_t generation, bool at_front) noexcept {
+        run->credit_blocked = true;
+        run->credit_blocked_generation = generation;
+        if (!at_front || run->credit_deadline_set) return;
+        run->credit_deadline_set = true;
+        run->credit_deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(simpler::dfx::runs::kCreditWaitBudgetMs);
+    }
+
+    /**
+     * Fail a front run whose credit never came back inside its budget.
+     *
+     * Only this run, and only while it is still un-launched: every run ahead
+     * keeps its own outcome and its own drain, and nothing device-side has
+     * been submitted for this one, so there is no device failure to invent and
+     * no reason to poison the lane. Returns true when the run was failed.
+     */
+    bool fail_if_credit_deadline_passed(const std::shared_ptr<ChipRunState> &run) noexcept {
+        if (!run->credit_blocked || !run->credit_deadline_set) return false;
+        if (run->phase == ChipRunState::Phase::LAUNCHED || run->phase == ChipRunState::Phase::TERMINAL) return false;
+        if (std::chrono::steady_clock::now() < run->credit_deadline) return false;
+        try {
+            const std::string owner = run->credit_blocked_owner != nullptr ? run->credit_blocked_owner : "a collector";
+            run->error = std::make_exception_ptr(
+                std::runtime_error(
+                    "chip run was not admitted within " + std::to_string(simpler::dfx::runs::kCreditWaitBudgetMs) +
+                    " ms: " + owner + " had no diagnostic capacity free"
+                )
+            );
+        } catch (...) {
+            run->error = std::current_exception();
+        }
+        // The carrier is retired before anything is called released. A run
+        // that reached PREPARED owns a native run on the worker — the
+        // runtime's own prepared state, its bindings and its entry in
+        // `native_runs_` — and only `finalize_native_run` destroys it.
+        // Marking the run terminal without that leaves the carrier live for
+        // the worker's whole life and makes the slot's reuse a claim rather
+        // than a fact. A QUEUED run never crossed that boundary and owns no
+        // carrier, so it has nothing to retire.
+        bool finalized = true;
+        if (run->phase == ChipRunState::Phase::PREPARED) {
+            try {
+                worker->finalize_native_run(run->native_run);
+            } catch (...) {
+                // The admission failure is this run's first cause and is kept:
+                // a cleanup that then failed is a second fact about the lane,
+                // not a replacement for why the run never launched. It
+                // poisons the lane on the existing terms, because an
+                // un-retired carrier is exactly what a later run must not
+                // prepare over.
+                finalized = false;
+                poison_with(run, std::current_exception());
+            }
+        }
+        // After the finalize, never before, for the reason `finish` gives: it
+        // is the call that releases this run's bindings, so it is the point at
+        // which the last consumer of a borrowed address is done. A finalize
+        // that failed cannot prove that, and the reference is kept.
+        release_device_spans(run, finalized);
+        run->phase = ChipRunState::Phase::TERMINAL;
+        auto it = std::find(fifo.begin(), fifo.end(), run);
+        if (it != fifo.end()) fifo.erase(it);
+        return true;
     }
 
     /** How many runs in the queue have crossed the launch boundary. */
@@ -461,13 +637,13 @@ struct ChipRunLaneState {
      * A live communication resource disqualifies every run on the worker, for
      * the same reason — the child releases those before its reset.
      *
-     * Diagnostics are exclusive except for one shape. A collector whose pools
-     * are armed for one run at launch and torn down for it at drain cannot
-     * serve two, so any diagnostic on either run refuses by default. The
-     * swimlane collector is the one that can hold two runs open — buffers carry
-     * the run that produced them and each run's loss is charged to its own
-     * bucket — and `permits_joined_diagnostic_launch` is the narrow opening for
-     * exactly that case.
+     * Every device diagnostic owner can hold two runs open: each stamps the
+     * run that produced a record onto it, and each run's accounting is
+     * published into a terminal bank its own identity reserved. What a pair
+     * must still agree on is the *settings* — one shared word per owner that
+     * the device latches once — and whether every enabled owner has capacity
+     * for one more. `permits_joined_diagnostic_launch` decides the first here,
+     * and asks the backend the second.
      */
     bool permits_joined_launch(const ChipRunState &predecessor, const ChipRunState &successor) const {
         if (!worker->supports_joined_native_launch()) return false;
@@ -486,26 +662,28 @@ struct ChipRunLaneState {
     /**
      * Whether two diagnostic runs may be ordered on the device together.
      *
-     * Only one shape qualifies: swimlane collection alone, at the same level on
-     * both runs, on a backend whose collector can hold two runs open. Everything
-     * else about that — whether the level is one the collector supports, whether
-     * retention is on and ready, whether a bucket is free — is the backend's to
-     * answer, because it is the backend that owns the collector. What is decided
-     * here is only what the lane can see for itself.
+     * The five device owners' settings must be *equal* on both runs: each
+     * owner's producers stamp their own run's identity onto what they publish,
+     * so two open runs are told apart by that, but a level or an event mode is
+     * one shared word the device latches once. Everything else about an owner
+     * — whether its retention is on, whether its collector can hold two runs
+     * open, whether a bank is free — is the backend's to answer, because it is
+     * the backend that owns the collector. What is decided here is only what
+     * the lane can see for itself.
      *
      * Re-asked every round and never remembered. A decline here is a statement
      * about right now — capacity comes back, and a run declined this round can
-     * join the next — which is exactly what `joined_launch_declined` must not be
-     * set for: that flag means the backend refused an attempt, and those reasons
-     * cannot change while the run ahead executes.
+     * join the next — which is exactly what `joined_launch_declined` must not
+     * be set for: that flag means the backend refused an attempt.
      */
     bool permits_joined_diagnostic_launch(const ChipRunState &predecessor, const ChipRunState &successor) const {
-        if (predecessor.config.enable_chip_swimlane == 0) return false;
-        if (predecessor.config.enable_chip_swimlane != successor.config.enable_chip_swimlane) return false;
-        if (predecessor.config.enable_dump_args != 0 || successor.config.enable_dump_args != 0) return false;
-        if (predecessor.config.enable_pmu != 0 || successor.config.enable_pmu != 0) return false;
-        if (predecessor.config.enable_dep_gen != 0 || successor.config.enable_dep_gen != 0) return false;
-        if (predecessor.config.enable_scope_stats != 0 || successor.config.enable_scope_stats != 0) return false;
+        const CallConfig &pred = predecessor.config;
+        const CallConfig &succ = successor.config;
+        if (pred.enable_chip_swimlane != succ.enable_chip_swimlane) return false;
+        if (pred.enable_dump_args != succ.enable_dump_args) return false;
+        if (pred.enable_pmu != succ.enable_pmu) return false;
+        if (pred.enable_dep_gen != succ.enable_dep_gen) return false;
+        if (pred.enable_scope_stats != succ.enable_scope_stats) return false;
         return worker->supports_joined_diagnostic_launch(successor.native_run, predecessor.native_run);
     }
 
@@ -518,12 +696,14 @@ struct ChipRunLaneState {
      * run, so the front is the *oldest* launched run rather than the only one.
      *
      * A backend that declines a join leaves that run prepared, to launch
-     * ordinarily once it reaches the front, and the decline is remembered: the
-     * reasons a backend gives one cannot change while the run ahead is still
-     * executing, so re-asking would issue a device call per progress round for
-     * the rest of that run's execution and get the same answer. Whether the
-     * *lane* would permit a join is still re-tested every round, because that
-     * can change.
+     * ordinarily once it reaches the front. Whether the decline is remembered
+     * depends on what could change it. For a pair with no diagnostics the
+     * reasons cannot change while the run ahead executes, so re-asking would
+     * issue a device call per progress round and get the same answer — that
+     * one is latched. For a diagnostic pair the reason may be a bank or an
+     * admission taken between the capacity pre-check and the attempt, and the
+     * next round may well find one free, so it is re-asked. Whether the *lane*
+     * would permit a join is re-tested every round either way.
      *
      * A failed join is the successor's own error. It stops the lane unless
      * finalization proves that this successor submitted no execution-visible
@@ -541,6 +721,7 @@ struct ChipRunLaneState {
             const auto successor = fifo[launched];
             if (!permits_joined_launch(*predecessor, *successor)) return;
             bool joined = false;
+            const uint64_t generation_before = credit_generation();
             try {
                 joined = worker->launch_native_run_joined(
                     successor->native_run, predecessor->native_run, successor->caller_stream
@@ -551,7 +732,23 @@ struct ChipRunLaneState {
                 return;
             }
             if (!joined) {
-                successor->joined_launch_declined = true;
+                // A non-diagnostic pair's reasons cannot change while the run
+                // ahead executes, so the decline is remembered and the backend
+                // is not asked again. A diagnostic pair's can: the pre-check
+                // above already passed its capacity terms, so a refusal here is
+                // a bank or an admission taken between the two, and the next
+                // round may well find one. Remembering it would deny this run
+                // the join for the rest of its predecessor's execution over a
+                // lost race.
+                if (!predecessor->config.diagnostics_any() && !successor->config.diagnostics_any()) {
+                    successor->joined_launch_declined = true;
+                } else {
+                    // No deadline: a successor is not at the front, and what
+                    // it waits for is also the run ahead of it retiring. It
+                    // gets its own deadline if it is still blocked when it
+                    // reaches the front.
+                    note_credit_blocked(successor, generation_before, /*at_front=*/false);
+                }
                 return;
             }
             successor->phase = ChipRunState::Phase::LAUNCHED;
@@ -624,6 +821,15 @@ struct ChipRunLaneState {
         }
 
         launch_ready_prefix();
+        // Enforced here rather than around a wait, so it applies to every
+        // caller: the local L3 child progresses with `done()` and takes no
+        // credit wait at all, and a credit-starved run on that path would
+        // otherwise never fail. It is a timestamp comparison — no blocking,
+        // no signal — and it fails only the run whose own deadline passed.
+        if (fail_if_credit_deadline_passed(target)) {
+            launch_ready_prefix();
+            return true;
+        }
         // Whatever the target is: a launch just now may have made the run behind the newly
         // launched one eligible, and that run is judged against its own predecessor rather than
         // against the front.
@@ -649,8 +855,20 @@ struct ChipRunLaneState {
         return true;
     }
 
-    void drain_front() noexcept {
-        if (fifo.empty()) return;
+    /**
+     * What one drain attempt did, for a caller that loops on it.
+     *
+     * `CreditBlocked` is the one outcome the caller must not retry under this
+     * lane's mutex: the front is activated and prepared but was refused
+     * admission, and the capacity that would release it is freed by a
+     * collector's writer, which cannot make progress a caller observes while
+     * that caller holds the lane. Looping on it is exactly the spin this
+     * reports instead of performing.
+     */
+    enum class DrainOutcome : int { Progressed, CreditBlocked };
+
+    DrainOutcome drain_front() noexcept {
+        if (fifo.empty()) return DrainOutcome::Progressed;
         const auto run = fifo.front();
         if (poison != nullptr && run->phase == ChipRunState::Phase::QUEUED) {
             run->error = poison;
@@ -659,24 +877,27 @@ struct ChipRunLaneState {
             release_device_spans(run, plan_released);
             run->phase = ChipRunState::Phase::TERMINAL;
             fifo.pop_front();
-            return;
+            return DrainOutcome::Progressed;
         }
         if (run->phase == ChipRunState::Phase::QUEUED && !run->activated) {
             const bool plan_released = release_run_plan(run);
             release_device_spans(run, plan_released);
             run->phase = ChipRunState::Phase::TERMINAL;
             fifo.pop_front();
-            return;
+            return DrainOutcome::Progressed;
         }
         launch_ready_prefix();
-        if (run->phase == ChipRunState::Phase::TERMINAL) return;
+        if (run->phase == ChipRunState::Phase::TERMINAL) return DrainOutcome::Progressed;
+        // Its own deadline may already have passed, in which case the run
+        // fails here rather than being reported as blocked forever.
+        if (fail_if_credit_deadline_passed(run)) return DrainOutcome::Progressed;
         if (run->phase == ChipRunState::Phase::PREPARED && (!run->activated || poison != nullptr)) {
             if (poison != nullptr && run->error == nullptr) {
                 run->error = poison;
                 run->poison_error = poison;
             }
             finish(run);
-            return;
+            return DrainOutcome::Progressed;
         }
         if (run->phase == ChipRunState::Phase::LAUNCHED) {
             try {
@@ -686,7 +907,97 @@ struct ChipRunLaneState {
                 poison_with(run, run->error);
             }
             finish(run);
+            return DrainOutcome::Progressed;
         }
+        // Activated, prepared, and still not launched: the launch above
+        // refused it for credit. Nothing this call can do moves it.
+        if (run->credit_blocked && run->activated && run->phase == ChipRunState::Phase::PREPARED) {
+            return DrainOutcome::CreditBlocked;
+        }
+        return DrainOutcome::Progressed;
+    }
+
+    /**
+     * Bring this run's admission deadline to now.
+     *
+     * Used when nothing further can admit it — the lane is closing and the
+     * credit gate is already detached, so no release can reach a waiter. The
+     * next drain fails the run with its own credit reason, which is the same
+     * outcome the deadline would have produced, reached without spending the
+     * budget waiting for capacity that cannot arrive.
+     */
+    void expire_credit_deadline(const std::shared_ptr<ChipRunState> &run) noexcept {
+        run->credit_deadline_set = true;
+        run->credit_deadline = std::chrono::steady_clock::now();
+    }
+
+    /**
+     * How long this run may still wait before its own deadline fails it.
+     *
+     * Zero when the deadline has passed, and the whole budget when the run has
+     * not been refused at the front yet — a successor blocked behind another
+     * run has no deadline of its own to bound the wait by.
+     */
+    /**
+     * Park until diagnostic credit moves, with this lane's mutex released.
+     *
+     * `lk` owns this lane's mutex on entry and owns it again on return. In
+     * between it is released, because the threads that free capacity are the
+     * collectors' writers and a waiter holding the lane would block the very
+     * retirement it waits for — and, on the serial route, the interpreter.
+     *
+     * Nothing is carried across the unlock but values: the run by
+     * `shared_ptr`, the generation and the budget by copy. No FIFO iterator
+     * and no native carrier survives it, and the runtime entry is reached
+     * through the gate rather than through `worker`, which this state holds
+     * as a raw pointer a parked waiter can outlive.
+     *
+     * The budget is the smaller of what this run has left before its own
+     * admission deadline and what the caller has left before its own: the
+     * first ends the run, the second ends only the wait, and conflating them
+     * would let a patient caller outlive a run's deadline or an impatient one
+     * shorten it.
+     *
+     * A runtime that exports no credit entry, or a gate that has refused this
+     * call, leaves nothing to park on. Retrying then would be a spin against
+     * a signal nobody will raise, so the run's deadline is brought forward
+     * and the next attempt fails it — which is what a backend without these
+     * entries did before them: a capacity refusal ended the run.
+     *
+     * @return true when the caller should re-attempt under the re-acquired
+     *         lock, false when it must not — the lane closed, was poisoned,
+     *         stopped admitting, lost its worker, or this run is no longer the
+     *         front it was waiting as.
+     */
+    bool
+    park_for_credit(std::unique_lock<std::mutex> &lk, const std::shared_ptr<ChipRunState> &run, int caller_budget_ms) {
+        const uint64_t seen = run->credit_blocked_generation;
+        int budget = credit_wait_budget_ms(run);
+        if (caller_budget_ms >= 0 && caller_budget_ms < budget) budget = caller_budget_ms;
+        if (budget < 0) budget = 0;
+
+        lk.unlock();
+        const bool waited = wait_for_credit(seen, budget);
+        lk.lock();
+
+        if (!waited) expire_credit_deadline(run);
+
+        // Re-read every decision input: the lane could have been closed,
+        // poisoned or drained while this thread held nothing.
+        if (closed || admission_stopped || poison != nullptr || worker == nullptr) return false;
+        if (run->phase == ChipRunState::Phase::TERMINAL) return false;
+        if (fifo.empty() || fifo.front() != run) return false;
+        return true;
+    }
+
+    int credit_wait_budget_ms(const std::shared_ptr<ChipRunState> &run) const noexcept {
+        if (!run->credit_deadline_set) return simpler::dfx::runs::kCreditWaitBudgetMs;
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                              run->credit_deadline - std::chrono::steady_clock::now()
+        )
+                              .count();
+        if (left <= 0) return 0;
+        return static_cast<int>(left);
     }
 
     // Block on the device for the launched front, for waiters with no deadline
@@ -745,8 +1056,9 @@ bool ChipRun::wait_until(Deadline deadline) {
     lane_->validate_process();
     const bool unbounded = deadline == Deadline::max();
     while (true) {
+        std::shared_ptr<ChipRunState> blocked_front;
         {
-            std::lock_guard<std::mutex> lk(lane_->mu);
+            std::unique_lock<std::mutex> lk(lane_->mu);
             if (lane_->progress(run_)) {
                 lane_->rethrow_run_error(run_);
                 return true;
@@ -755,9 +1067,43 @@ bool ChipRun::wait_until(Deadline deadline) {
             // here would spin for the whole run. Block on the device instead;
             // if nothing is blockable yet the poll loop below still applies.
             if (unbounded && lane_->block_on_front()) continue;
+            // Nothing to block on at the device, because the front was never
+            // launched: it is waiting for a collector's capacity. That is the
+            // other thing this loop would otherwise spin on, and the only
+            // place it can be waited for is outside this mutex.
+            if (!lane_->fifo.empty()) {
+                const auto &front = lane_->fifo.front();
+                if (front->credit_blocked && front->phase == ChipRunState::Phase::PREPARED) blocked_front = front;
+            }
+        }
+        if (blocked_front != nullptr) {
+            // Bounded by whichever of the two deadlines comes first. They mean
+            // different things and are never conflated: the caller's ends this
+            // wait and leaves the run live, the run's ends the run.
+            int caller_budget_ms = -1;
+            if (!unbounded) {
+                const auto left =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(deadline - Clock::now()).count();
+                caller_budget_ms = left <= 0 ? 0 : static_cast<int>(left);
+            }
+            std::unique_lock<std::mutex> lk(lane_->mu);
+            (void)lane_->park_for_credit(lk, blocked_front, caller_budget_ms);
         }
         if (Clock::now() >= deadline) return false;
     }
+}
+
+ChipRun::Deadline ChipRun::credit_deadline_for_test() const {
+    if (lane_ == nullptr || run_ == nullptr) return Deadline{};
+    std::lock_guard<std::mutex> lk(lane_->mu);
+    return run_->credit_deadline_set ? run_->credit_deadline : Deadline{};
+}
+
+void ChipRun::expire_credit_deadline_for_test() {
+    if (lane_ == nullptr || run_ == nullptr) return;
+    std::lock_guard<std::mutex> lk(lane_->mu);
+    run_->credit_deadline_set = true;
+    run_->credit_deadline = Clock::now() - std::chrono::milliseconds(1);
 }
 
 void ChipRun::activate() {
@@ -923,7 +1269,7 @@ ChipRun ChipRunLane::submit(
     int32_t accepted_value, void *caller_stream
 ) {
     state_->validate_process();
-    std::lock_guard<std::mutex> lk(state_->mu);
+    std::unique_lock<std::mutex> lk(state_->mu);
     state_->require_usable();
     if (caller_stream != nullptr) state_->worker->validate_caller_stream(caller_stream);
     if (state_->generations.empty()) throw std::runtime_error("chip run lane has no runtime slots");
@@ -937,7 +1283,17 @@ ChipRun ChipRunLane::submit(
         const bool has_successor_capacity =
             state_->fifo.size() < state_->generations.size() && state_->permits_native_successor(*state_->fifo.back());
         if (has_successor_capacity) break;
-        state_->drain_front();
+        const auto front = state_->fifo.front();
+        if (state_->drain_front() == ChipRunLaneState::DrainOutcome::CreditBlocked) {
+            // Retrying under this lock would spin: the capacity comes back on
+            // a collector's writer, which this thread is holding the lane
+            // against. Park outside it instead, bounded by that run's own
+            // admission deadline, and re-attempt once credit moves.
+            if (!state_->park_for_credit(lk, front, /*caller_budget_ms=*/-1)) {
+                state_->require_usable();
+                continue;
+            }
+        }
         state_->require_usable();
         state_->launch_ready_prefix();
     }
@@ -993,7 +1349,12 @@ ChipRun ChipRunLane::submit(
         // the predecessor here, before the caller can append any such work.
         state_->launch_ready_prefix();
         while (run->phase != ChipRunState::Phase::LAUNCHED && run->phase != ChipRunState::Phase::TERMINAL) {
-            state_->drain_front();
+            const auto front = state_->fifo.empty() ? nullptr : state_->fifo.front();
+            if (state_->drain_front() == ChipRunLaneState::DrainOutcome::CreditBlocked && front != nullptr) {
+                // Same reason as the capacity loop above: nothing this thread
+                // can do under the lane mutex releases a collector's slot.
+                (void)state_->park_for_credit(lk, front, /*caller_budget_ms=*/-1);
+            }
             state_->launch_ready_prefix();
         }
         state_->rethrow_run_error(run);
@@ -1004,23 +1365,70 @@ ChipRun ChipRunLane::submit(
 
 void ChipRunLane::drain() {
     state_->validate_process();
-    std::lock_guard<std::mutex> lk(state_->mu);
+    std::unique_lock<std::mutex> lk(state_->mu);
     if (state_->worker != nullptr) state_->worker->validate_execution_context();
-    while (!state_->fifo.empty())
-        state_->drain_front();
+    while (!state_->fifo.empty()) {
+        const auto front = state_->fifo.front();
+        if (state_->drain_front() == ChipRunLaneState::DrainOutcome::CreditBlocked) {
+            // The run's own admission deadline bounds this: when it passes,
+            // the next drain fails that run and the queue advances, so a drain
+            // terminates even if credit never comes back. A park that declines
+            // because the queue moved under it is progress and is retried;
+            // one that declines with this run still at the front is the lane
+            // going away, and there is nothing further to drain.
+            if (!state_->park_for_credit(lk, front, /*caller_budget_ms=*/-1)) {
+                if (!state_->fifo.empty() && state_->fifo.front() == front) break;
+            }
+        }
+    }
     if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
 }
 
 void ChipRunLane::close() {
     state_->validate_process();
-    std::lock_guard<std::mutex> lk(state_->mu);
-    if (state_->worker != nullptr) state_->worker->validate_execution_context();
+    // Refusal before mutation. A close on the wrong device context is not a
+    // close: it changes nothing and throws, and the worker it was called on is
+    // still open afterwards. Cancelling first would have detached that open
+    // worker's credit entries on the way to throwing, leaving a lane that can
+    // never wait for capacity again and no record of why.
+    //
+    // Taken under the lane mutex so the worker pointer cannot be cleared
+    // between the read and the call, and released again before the gate is
+    // touched — `close_credit_gate` drains callers who need that mutex.
+    {
+        std::lock_guard<std::mutex> validate(state_->mu);
+        if (state_->worker != nullptr) state_->worker->validate_execution_context();
+    }
+
+    // Now that the context is this one's: cancelling makes every parked
+    // waiter's predicate true, and the drain below needs those waiters to
+    // return in order to finish. The other order is the wait-owns-the-lease /
+    // close-needs-the-lease cycle — a waiter parked for its whole budget would
+    // hold a lease this close waits on while holding nothing it could take.
+    // `close_credit_gate` is also what proves every credit call has left
+    // before the targets are detached, so a later unload has no reader.
+    //
+    // Exactly one thread owns this; every other close joins it and returns
+    // only once detaching is a fact.
+    (void)close_credit_gate(state_->credit_gate);
+
+    std::unique_lock<std::mutex> lk(state_->mu);
     if (state_->closed) {
         if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
         return;
     }
-    while (!state_->fifo.empty())
-        state_->drain_front();
+    while (!state_->fifo.empty()) {
+        const auto front = state_->fifo.front();
+        if (state_->drain_front() == ChipRunLaneState::DrainOutcome::CreditBlocked) {
+            // The gate was detached above, so no release can reach a waiter
+            // any more and no amount of waiting will admit this run. Waiting
+            // out its budget would be a spin against a signal nobody will
+            // raise, so its deadline is brought to now and the next drain
+            // fails it with its own credit reason — the same outcome, reached
+            // without the wait.
+            state_->expire_credit_deadline(front);
+        }
+    }
     state_->closed = true;
     if (state_->poison != nullptr) std::rethrow_exception(state_->poison);
 }

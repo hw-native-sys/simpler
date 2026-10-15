@@ -219,6 +219,13 @@ def preprocess_command(entry: dict) -> list[str]:
     return argv + ["-E", "-H", "-o", "/dev/null"]
 
 
+def preprocess_key(entry: dict) -> tuple[tuple[str, ...], Path, Path]:
+    """Replay identity, including the source files_opened adds independently of argv."""
+    directory = Path(entry["directory"]).resolve()
+    source = (directory / entry["file"]).resolve()
+    return tuple(preprocess_command(entry)), directory, source
+
+
 def files_opened(entry: dict) -> set[str]:
     """Paths under src/ this translation unit compiles, its own source included.
 
@@ -330,16 +337,20 @@ def find_gaps(build_dir: Path, jobs: int) -> tuple[list[tuple[str, str, list[str
     # handle would be required to build for both arches because something it
     # links but never calls differs. What a case compiles into its own target is
     # what it chose to cover; what it links to resolve symbols is not.
+    unique_entries = {}
+    target_keys = {}
+    for name in covered:
+        target_keys[name] = []
+        for entry in by_target[name]:
+            key = preprocess_key(entry)
+            target_keys[name].append(key)
+            unique_entries.setdefault(key, entry)
+
+    # Group before submitting work: concurrent targets can own the same replay.
+    # Results live only for this invocation; every target keeps its own union.
     with ThreadPoolExecutor(max_workers=jobs) as pool:
-        per_target = dict(
-            zip(
-                covered,
-                pool.map(
-                    lambda name: set().union(*(files_opened(e) for e in by_target[name])),
-                    covered,
-                ),
-            )
-        )
+        opened_by_key = dict(zip(unique_entries, pool.map(files_opened, unique_entries.values())))
+    per_target = {name: set().union(*(opened_by_key[key] for key in target_keys[name])) for name in covered}
 
     by_case = collections.defaultdict(list)
     for name in covered:

@@ -17,6 +17,7 @@
 #include "assert_compat.h"
 #include "common/core_type.h"
 #include "common/platform_config.h"
+#include "common/pmu_profiling.h"
 #include "dispatch_payload.h"
 #include "scheduler_layout.h"
 
@@ -744,6 +745,9 @@ struct alignas(16) SchedulerTaskMetadata {
     int32_t timing_slot;
 };
 
+// One task's subtask slots, as `kernel_ids` and `active_mask` above count them.
+inline constexpr uint8_t SCHEDULER_TASK_SUBTASK_SLOTS = 3;
+
 inline __aicore__ uint32_t scheduler_task_trace_index(uint32_t trace_index_base, uint8_t active_mask, uint8_t subtask) {
     return trace_index_base + static_cast<uint32_t>(__builtin_popcount(active_mask & ((1U << subtask) - 1)));
 }
@@ -1063,7 +1067,12 @@ struct alignas(128) SchedulerWorkerContext {
     uint64_t bootstrap_target_aic_cycles;
     uint64_t bootstrap_target_aiv_cycles;
     volatile uint64_t callable_addresses_count;
-    uint64_t bootstrap_timing_reserved;
+    // This run's per-subtask PMU staging array, in the same index space as the
+    // trace cells. Taken from this group rather than from `topology_reserved`
+    // below: that tail is contract-checked zero by `scheduler_initialize_local_config`
+    // and consuming one of its words would make a context carrying this offset
+    // read as malformed.
+    volatile uint64_t pmu_cells_offset;
 
     volatile uint64_t gang_coordinator_offset;
     volatile uint64_t gang_cohorts_offset;
@@ -1172,6 +1181,28 @@ struct alignas(128) SchedulerTaskTrace {
     uint64_t descriptor_cache_observed_cycles;
     uint64_t executor_reserved[3];
 };
+
+/**
+ * One executed subtask's PMU snapshot, staged by the AICore that ran it.
+ *
+ * The AICore-scheduler route dispatches on-core, so no AICPU thread observes a
+ * task's completion while the run is live and the two-slot per-core staging
+ * ring the legacy route drains on every FIN has no consumer here. This array is
+ * the route's own staging: one cell per (task, subtask slot), written once by
+ * the core that executed it and read once by the AICPU after every core has
+ * retired. `published` carries the task id plus one and is written last, so a
+ * zero cell is a subtask this run never executed rather than one whose counters
+ * read zero.
+ */
+struct alignas(64) SchedulerTaskPmuCell {
+    uint64_t total_cycles;
+    uint32_t counters[PMU_COUNTER_COUNT_A5];
+    uint32_t worker_id;
+    volatile uint32_t published;
+    uint32_t pmu_reserved;
+};
+
+static_assert(sizeof(SchedulerTaskPmuCell) == 64, "one PMU cell per cache line");
 
 static_assert(sizeof(SchedulerTaskMetadata) == 16, "task metadata layout changed");
 static_assert(alignof(SchedulerTaskMetadata) == 16, "task metadata alignment changed");
@@ -1325,7 +1356,7 @@ inline bool scheduler_layout_reserve(uint64_t *cursor, uint64_t size, uint64_t a
 
 inline bool scheduler_plan_layout(
     uint64_t task_count, uint64_t aic_task_count, uint64_t aiv_task_count, AicoreSchedulerLayout *layout,
-    bool enable_activity_profiling = false, uint64_t trace_count = 0
+    bool enable_activity_profiling = false, uint64_t trace_count = 0, bool enable_pmu = false
 ) {
     if (layout == nullptr || aic_task_count > task_count || aiv_task_count > task_count) return false;
     AicoreSchedulerLayout next{};
@@ -1364,6 +1395,9 @@ inline bool scheduler_plan_layout(
         ) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerGangCommand, gang_commands_offset) ||
         !SCHEDULER_RESERVE_ARRAY(trace_count == 0 ? task_count : trace_count, SchedulerTaskTrace, trace_cells_offset) ||
+        (enable_pmu && !SCHEDULER_RESERVE_ARRAY(
+                           trace_count == 0 ? task_count : trace_count, SchedulerTaskPmuCell, pmu_cells_offset
+                       )) ||
         (enable_activity_profiling &&
          !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerActivityBuffer, activity_buffers_offset)) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {

@@ -625,6 +625,11 @@ TEST(ChipRunLaneTest, LaunchFailureWhoseFinalizeFailsReportsThePoisonedLane) {
         (void)failed.wait_until(ChipRunLane::Deadline::max());
         FAIL() << "expected the poisoned-lane error";
     } catch (const std::runtime_error &e) {
+        // Two independent facts, and the message carries both. Reporting only
+        // the poison would lose why this run did not run, and reporting only
+        // the launch failure would hide that the lane admits nothing further.
+        EXPECT_NE(std::string(e.what()).find("launch_native_run failed with code -6"), std::string::npos)
+            << "the run's own cause was replaced by the cleanup that failed after it";
         EXPECT_NE(std::string(e.what()).find("chip run lane is poisoned"), std::string::npos);
         EXPECT_NE(std::string(e.what()).find("finalize_native_run failed with code -7"), std::string::npos);
     }

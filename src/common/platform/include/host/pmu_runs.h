@@ -27,6 +27,7 @@
 
 #include "common/unified_log.h"
 #include "host/chip_swimlane_runs.h"
+#include "host/diagnostic_run_banks.h"
 
 /**
  * Cross-run support types for the PMU collector: the per-run verdict, the
@@ -134,6 +135,12 @@ struct RecordProofs {
     uint64_t mismatch_device{0};
     // Records a core still held after the cut settled. Any is a loss.
     uint64_t unflushed_records{0};
+    // A core's own sticky error for this run, when its producer reported one.
+    // The counts still balance, so this is a partial result rather than an
+    // unknown one — which is exactly why it cannot be left out: a run with
+    // nothing to report and a latched fatal would otherwise read as empty and
+    // successful.
+    bool fatal_latched{false};
 };
 
 /**
@@ -156,6 +163,10 @@ inline Verdict classify(const CutProofs &cut, const RecordProofs &rec, uint64_t 
         accounted != rec.total_device) {
         return Verdict::PublishedShort;
     }
+    // A core that latched a fatal is a partial run however well its counts
+    // balance, and a run with no records at all is where that matters most:
+    // without this it would reach the empty-but-successful verdict below.
+    if (rec.fatal_latched) return Verdict::PublishedShort;
     if (collected == 0) return Verdict::PublishedEmpty;
     return Verdict::Published;
 }
@@ -551,6 +562,10 @@ struct Epoch {
     // unreachable. Set by a collector shard, read once by the writer.
     std::atomic<bool> clamped{false};
 
+    // The device bank this run's cores publish into, held from admission until
+    // the close has copied their accounting out of it.
+    simpler::dfx::credit::Reservation terminal_bank;
+
     // Captured at close, under this run's execution claim.
     RecordProofs records{};
     CutProofs cut{};
@@ -619,6 +634,9 @@ struct RetainedRunStats {
  *   bool        publish_run_config(EventType)          // device header + counter reset;
  *                                                       // false = the device kept a previous value
  *   RecordProofs snapshot_run_records(bool complete) const
+ *   bool        device_publishes_run_terminal() const  // a bank is mapped for this run
+ *   Reservation reserve_run_terminal_bank(uint64_t epoch)
+ *   RecordProofs snapshot_run_records_from_terminal(bool complete, Reservation &, uint64_t epoch)
  *   uint64_t    buffer_run_epoch(const void *) const
  *   uint64_t    buffer_record_count(const void *) const
  *   uint64_t    write_buffer_rows(std::ofstream &, const Frozen &, int core, int thread,
@@ -647,7 +665,11 @@ public:
     // Admission
     // -----------------------------------------------------------------------
 
-    bool run_begin(uint64_t run_epoch, const std::string &csv_path, EventType event_type) {
+    bool run_begin(
+        uint64_t run_epoch, const std::string &csv_path, EventType event_type,
+        simpler::dfx::runs::AdmissionRefusal *why = nullptr
+    ) {
+        if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Fatal;
         // A guard, not the configuration question's answer: a caller that
         // reaches here on a collector that retains nothing has already taken
         // the wrong path.
@@ -714,6 +736,7 @@ public:
             if (!found) {
                 // Refused, not queued: the device is about to be handed this
                 // run, and a wait here would hold the launch behind a slow disk.
+                if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Capacity;
                 LOG_ERROR(
                     "PmuCollector: run %llu refused, both retained PMU runs are still unpublished",
                     static_cast<unsigned long long>(run_epoch)
@@ -747,6 +770,22 @@ public:
         // kept at the previous run's value would have it measure one event
         // group while these columns name another, and the record counts could
         // still balance, so nothing later in the pipeline could catch it.
+        // The bank this run's cores publish into. Refused like a configuration
+        // the device did not take: a run that cannot be accounted for runs
+        // without diagnostics rather than unaccounted.
+        if (owner_.device_publishes_run_terminal()) {
+            Epoch<Frozen> &admitted = epochs_[static_cast<size_t>(slot)];
+            admitted.terminal_bank = owner_.reserve_run_terminal_bank(run_epoch);
+            if (!admitted.terminal_bank.held()) {
+                if (why != nullptr) *why = simpler::dfx::runs::AdmissionRefusal::Capacity;
+                LOG_ERROR(
+                    "PmuCollector: run %llu refused, every per-run terminal bank is in use",
+                    static_cast<unsigned long long>(run_epoch)
+                );
+                withdraw_unpublished_slot(slot);
+                return false;
+            }
+        }
         if (!owner_.publish_run_config(event_type)) {
             LOG_ERROR(
                 "PmuCollector: run %llu refused, the device did not take this run's PMU configuration",
@@ -764,6 +803,117 @@ public:
     }
 
     /**
+     * Record a failure that belongs to the collector rather than to one run,
+     * and keep it until the collector is destroyed.
+     *
+     * The retained-run summary is the only place a teardown failure can still
+     * be reported from, which is why a release the collector could not prove
+     * lands here rather than in a log line nobody reads back.
+     */
+    void note_collector_failure(const char *reason) { set_fatal(reason); }
+
+    /**
+     * Tell the owning context that this collector's capacity may have moved.
+     *
+     * Set once by the runner after init. Over-notifying is free — a woken
+     * admission re-attempts and parks again — while under-notifying costs a
+     * blocked run its whole deadline, so every path that signals this
+     * collector's own waiters signals this too.
+     */
+    void set_credit_release_notifier(std::function<void()> notifier) { credit_notifier_ = std::move(notifier); }
+
+    /**
+     * Which bank `run_epoch` reserved, or -1 when it holds none.
+     *
+     * The caller turns this into the address its producers publish through.
+     * Two runs open at once hold two different banks, so the lookup is by
+     * identity rather than by whichever epoch was admitted last.
+     */
+    int run_terminal_bank_index(uint64_t run_epoch) const {
+        if (run_epoch == 0) return -1;
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const Epoch<Frozen> &epoch : epochs_) {
+            if (epoch.state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) continue;
+            if (epoch.epoch.load(std::memory_order_acquire) != run_epoch) continue;
+            if (!epoch.terminal_bank.held()) return -1;
+            return static_cast<int>(epoch.terminal_bank.index());
+        }
+        return -1;
+    }
+
+    /**
+     * Give back the bank `run_epoch` holds without reading it, on proof that
+     * every producer that could write into it has terminated.
+     *
+     * The same settlement the other owners make: a run whose completion was
+     * never observed has its per-core accounting read by nobody, and an entry
+     * that outlives this epoch is counted as foreign by the next occupant,
+     * whose reconciliation compares each entry against its own run identity.
+     * Only the device storage comes back; this run's shard files and its sticky
+     * record stay as they are.
+     *
+     * The proof is the caller's and it is about producers, not success. Without
+     * it the epoch keeps the bank, because a core may still be writing into it.
+     */
+    void discard_run_terminal_bank(uint64_t run_epoch) {
+        if (run_epoch == 0) return;
+        bool discarded = false;
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            for (Epoch<Frozen> &epoch : epochs_) {
+                if (epoch.state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) continue;
+                if (epoch.epoch.load(std::memory_order_acquire) != run_epoch) continue;
+                if (!epoch.terminal_bank.held()) break;
+                epoch.terminal_bank.release();
+                discarded = true;
+                break;
+            }
+        }
+        // Not under `mu_`: the writer may already have retired this run's slot
+        // and parked its bank, and the proof is still this run's to act on.
+        // Taken second, so a bank the slot still held is never looked for twice.
+        if (!discarded) discarded = owner_.reclaim_run_terminal_bank(run_epoch);
+        if (!discarded) return;
+        try {
+            LOG_INFO(
+                "PmuCollector terminal: run %llu returns its bank unread — it failed with every producer proved "
+                "stopped, so its entries are discarded rather than withdrawn",
+                static_cast<unsigned long long>(run_epoch)
+            );
+        } catch (...) {}
+    }
+
+    /**
+     * Whether a further run could be admitted to the retained path.
+     *
+     * Retention configured, no sticky failure, and an epoch slot actually
+     * free — read as one answer, because a free slot on a collector that is
+     * not retaining proves nothing and a failed collector refuses admission
+     * whatever its capacity.
+     */
+
+    /** Whether no admitted epoch is still unpublished. */
+    bool retained_runs_idle() const {
+        if (!retains_runs()) return true;
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const Epoch<Frozen> &epoch : epochs_) {
+            if (epoch.state.load(std::memory_order_acquire) != static_cast<int>(EpochState::Free)) return false;
+        }
+        return true;
+    }
+
+    bool can_admit_retained_run() const {
+        if (!retains_runs()) return false;
+        if (!ready_.load(std::memory_order_acquire)) return false;
+        if (fatal_.load(std::memory_order_acquire)) return false;
+        std::lock_guard<std::mutex> lk(mu_);
+        for (const Epoch<Frozen> &epoch : epochs_) {
+            if (epoch.state.load(std::memory_order_acquire) == static_cast<int>(EpochState::Free)) return true;
+        }
+        return false;
+    }
+
+    /**
      * Snapshot this run's device state while it still holds the execution
      * claim, then arm its cut and hand the epoch to the writer.
      */
@@ -773,9 +923,15 @@ public:
         if (found < 0) return;
         Epoch<Frozen> &epoch = epochs_[static_cast<size_t>(found)];
 
-        // The successor has not launched, so the per-core counters are still
-        // this run's and the ready-queue tails the cut reads are stable.
-        epoch.records = owner_.snapshot_run_records(device_execution_complete);
+        // With a bank mapped, the figures are the ones this run's own cores
+        // published, so nothing here depends on a successor not having
+        // launched. Without one, the per-core counters are still this run's
+        // only because it has not — and the ready-queue tails the cut reads are
+        // stable either way.
+        epoch.records =
+            owner_.device_publishes_run_terminal() ?
+                owner_.snapshot_run_records_from_terminal(device_execution_complete, epoch.terminal_bank, run_epoch) :
+                owner_.snapshot_run_records(device_execution_complete);
 
         // Every buffer this run will ever publish is already in a device ready
         // queue at this instant, so each queue's target is finite and a
@@ -803,6 +959,7 @@ public:
             progress_++;
         }
         cv_.notify_all();
+        if (credit_notifier_) credit_notifier_();
     }
 
     /** Give back the slot of a run that was admitted and never launched. */
@@ -849,6 +1006,13 @@ public:
         // artifact and fail every later flush.
         (void)close_shards(slot);
         remove_shard_temps(epoch.shard_paths);
+        {
+            // Nothing was launched against this bank, so no core can be writing
+            // it: this return needs no proof about the device, and without it
+            // the slot release would park a bank that is plainly free.
+            std::lock_guard<std::mutex> lk(mu_);
+            epoch.terminal_bank.release();
+        }
         release_slot(slot);
         try {
             LOG_WARN(
@@ -942,6 +1106,7 @@ public:
             progress_++;
         }
         cv_.notify_all();
+        if (credit_notifier_) credit_notifier_();
     }
 
     // -----------------------------------------------------------------------
@@ -1013,6 +1178,7 @@ public:
             progress_++;
         }
         cv_.notify_all();
+        if (credit_notifier_) credit_notifier_();
         // Void by contract: this publishes, and the caller's own flush is what
         // reports. A failure recorded here stays in the sticky summary.
         std::string ignored;
@@ -1032,6 +1198,7 @@ public:
             progress_++;
         }
         cv_.notify_all();
+        if (credit_notifier_) credit_notifier_();
         writer_.join();
     }
 
@@ -1127,6 +1294,7 @@ public:
             progress_++;
         }
         cv_.notify_all();
+        if (credit_notifier_) credit_notifier_();
     }
 
     RetainedRunStats stats() const {
@@ -1175,6 +1343,13 @@ private:
     void withdraw_unpublished_slot(size_t slot) {
         Epoch<Frozen> &epoch = epochs_[slot];
         remove_shard_temps(epoch.shard_paths);
+        {
+            // The one return that needs no proof about the device: this run was
+            // refused before it was launched, so no core was ever handed this
+            // bank and none can be writing it.
+            std::lock_guard<std::mutex> lk(mu_);
+            epoch.terminal_bank.release();
+        }
         release_slot(slot);
     }
 
@@ -1440,10 +1615,20 @@ private:
             epoch.target_installed = false;
             epoch.clamped.store(false, std::memory_order_relaxed);
             epoch.io_failed.store(false, std::memory_order_relaxed);
+            // A bank still held here belongs to a run that settled neither way:
+            // its close proved no completion, and no producer stop followed. The
+            // host writer finishing is no statement about this run's cores, so
+            // the bank is not returned — and it cannot stay on the record
+            // either, because the next admission assigns over the token and that
+            // assignment releases it just as silently. It is parked with its
+            // identity instead, out of the pool and still reclaimable by exactly
+            // this run if the proof arrives.
+            if (epoch.terminal_bank.held()) owner_.quarantine_run_terminal_bank(std::move(epoch.terminal_bank));
             epoch.state.store(static_cast<int>(EpochState::Free), std::memory_order_release);
             progress_++;
         }
         cv_.notify_all();
+        if (credit_notifier_) credit_notifier_();
     }
 
     bool ensure_shard_open(size_t slot, size_t shard) {
@@ -1503,6 +1688,7 @@ private:
         // Every waiter is woken: a refusal is what a capacity check and a flush
         // are waiting to read, so neither may block past it.
         cv_.notify_all();
+        if (credit_notifier_) credit_notifier_();
         if (first) errors_.record_fatal(reason);
     }
 
@@ -1510,6 +1696,7 @@ private:
 
     bool retain_across_runs_{false};
     std::atomic<bool> ready_{false};
+    std::function<void()> credit_notifier_;
     std::array<Epoch<Frozen>, kMaxOpenEpochs> epochs_{};
     // One output stream per (epoch slot, collector shard). Written only by the
     // collector shard that owns that index while its epoch admits, and read by

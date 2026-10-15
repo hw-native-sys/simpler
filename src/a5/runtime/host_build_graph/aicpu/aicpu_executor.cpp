@@ -18,6 +18,7 @@
 #include "aicore_lifecycle.h"
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
+#include "scheduler_ready_watchdog.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/cache_maintenance.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
@@ -78,6 +79,7 @@ struct AicpuExecutor {
     std::atomic<int32_t> normal_path_claims_{0};
     RunTerminalPublisher terminal_publisher_;
 
+    AicpuReadyWatchdog ready_watchdog_;
     std::atomic<bool> shutdown_ready_{false};
     std::atomic<int32_t> shutdown_signaled_{0};
     std::atomic<int32_t> run_status_{0};
@@ -94,7 +96,7 @@ struct AicpuExecutor {
     // Decide this run's terminal record while the state it reads is still
     // valid. Runs inside the completion gate's finalizer, on the last
     // participant out.
-    void snapshot_run_terminal(Runtime *runtime);
+    void snapshot_run_terminal(Runtime *runtime, bool cores_retired);
     // Commit the decided record. Runs on the thread that claims cleanup, after
     // teardown and before it returns from the kernel.
     void publish_run_terminal();
@@ -335,6 +337,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
             record_resident_timeout(runtime, SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT);
             init_failed_.store(true, std::memory_order_release);
         }
+        if (!init_failed_.load(std::memory_order_acquire)) ready_watchdog_.reset(get_sys_cnt_aicpu());
         init_done_.store(true, std::memory_order_release);
         if (!init_failed_.load(std::memory_order_acquire)) LOG_INFO("AicpuExecutor: Init complete");
     } else {
@@ -354,6 +357,7 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime) {
     if (last) {
         aicore_lifecycle_.deinit();
         completion_gate_.reset();
+        ready_watchdog_.reset();
         shutdown_ready_.store(false, std::memory_order_relaxed);
         shutdown_signaled_.store(0, std::memory_order_relaxed);
         run_status_.store(0, std::memory_order_relaxed);
@@ -413,7 +417,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 uint64_t completion_poll_cycles = 0;
                 uint64_t error_poll_total = 0;
                 uint32_t error_poll_count = 0;
-                uint64_t last_progress_cycles = get_sys_cnt_aicpu();
+                uint64_t last_progress_cycles = ready_watchdog_.last_progress();
                 uint64_t last_resolved_task_count = run_control->resolved_task_count;
                 bool bootstrap_was_complete = run_control->bootstrap_complete != 0;
                 const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
@@ -431,6 +435,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         last_resolved_task_count = run_control->resolved_task_count;
                         bootstrap_was_complete = bootstrap_complete;
                         last_progress_cycles = now;
+                        ready_watchdog_.record_progress(now);
                     }
                     if (trace_enabled) {
                         const uint64_t poll_end = get_sys_cnt_aicpu();
@@ -504,9 +509,18 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         run_status_.store(supervisor_rc, std::memory_order_release);
         shutdown_ready_.store(true, std::memory_order_release);
     } else {
-        if (!wait_with_scheduler_timeout([this] {
-                return shutdown_ready_.load(std::memory_order_acquire);
-            })) {
+        if (!ready_watchdog_.wait_until_ready(
+                [this] {
+                    return shutdown_ready_.load(std::memory_order_acquire);
+                },
+                [] {
+                    return get_sys_cnt_aicpu();
+                },
+                [] {
+                    SPIN_WAIT_HINT();
+                },
+                resident_scheduler_timeout_cycles()
+            )) {
             record_resident_timeout(runtime, SchedulerErrorSite::AICPU_SHUTDOWN_BARRIER_TIMEOUT);
             shutdown_wait_timed_out = true;
         }
@@ -539,13 +553,37 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // the one point where the run's final state can be read. Deciding the
         // record here and committing it after teardown is what keeps a teardown
         // fault from landing behind an already-published success.
-        snapshot_run_terminal(runtime);
-        publish_aicore_task_timing(runtime);
+        //
+        // Two separate questions below, and this arrival answers neither. Did
+        // every core stop — which is what licenses reading anything a core
+        // wrote — and did the graph complete, which is what says how much data
+        // the run owed. A partition that could not retire its cores returns
+        // that failure and still arrives here.
+        const bool cores_retired = aicore_lifecycle_.cores_retired();
+        (void)aicore_lifecycle_.settle_run_diagnostics(
+            runtime, run_status_.load(std::memory_order_acquire) == 0 && !shutdown_wait_timed_out
+        );
+        // The record is published either way — a run the host cannot read a
+        // verdict for is worse than one that reports a failure — but a run
+        // whose cores did not prove retirement did not finish the audited path,
+        // so it cannot be published as Ok.
+        snapshot_run_terminal(runtime, cores_retired);
+        if (cores_retired) {
+            publish_aicore_task_timing(runtime);
+        } else {
+            // Device-owned trace cells, written by the cores. Reading them
+            // while one of them may still be writing would publish this run's
+            // timing from a half-written cell.
+            LOG_ERROR(
+                "%s", "A5 HBG AICore Scheduler: task timing is not published for a run whose cores did not prove "
+                      "retirement"
+            );
+        }
     });
     return run_rc;
 }
 
-void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
+void AicpuExecutor::snapshot_run_terminal(Runtime *runtime, bool cores_retired) {
     // The shared header outranks a participant's own return: the supervisor
     // latches the AICore scheduler's error there, and a peer thread that only
     // waited on the shutdown barrier returns zero for the same run.
@@ -558,7 +596,12 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     // participant has finished its shutdown partition, so one settle covers
     // every core.
     const int32_t header_status = publish_aicore_scheduler_runtime_error(runtime);
-    const bool normal_path = normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
+    // The header is one cache line a core may still be writing when retirement
+    // was not proved, so what it returns cannot make such a run Ok. It can
+    // still make it worse: `run_terminal_select` reports a header or
+    // participant error whatever the audited-path answer is, which is why the
+    // read stays and only the verdict is withheld.
+    const bool normal_path = cores_retired && normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
     terminal_publisher_.take(run_terminal_select(normal_path, header_status, terminal_), nullptr, 0);
 }
 
@@ -590,6 +633,7 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // next, after teardown.
     terminal_.reset();
     normal_path_claims_.store(0, std::memory_order_release);
+    ready_watchdog_.reset();
     shutdown_ready_.store(false, std::memory_order_release);
     shutdown_signaled_.store(0, std::memory_order_release);
     run_status_.store(0, std::memory_order_release);

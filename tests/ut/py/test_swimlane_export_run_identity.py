@@ -14,10 +14,10 @@ would pass even if the exporter emitted a different shape, which is the exact
 drift this pair of layers is prone to: the identity is a trailing positional
 column on one side and an index on the other.
 
-The cpput binary is built by the "Build and run C++ unit tests" CI step, which
-runs this file immediately after ctest for that reason. In the earlier
-whole-suite pyut run the binary does not exist yet and the roundtrip skips; the
-compatibility and error cases below do not need it and always run.
+The cpput binary is built by the "Build and run C++ unit tests" CI step. The
+"Check swimlane exporter roundtrip" step runs this file after that build. In the
+earlier whole-suite pyut run the binary does not exist yet and the roundtrip
+skips; the compatibility and error cases below do not need it and always run.
 """
 
 from __future__ import annotations

@@ -63,6 +63,7 @@
 #include "host/caller_device_buffers.h"
 #include "host/memory_allocator.h"
 #include "host/chip_swimlane_collector.h"
+#include "host/diagnostic_credit_signal.h"
 #include "host/dfx_run_config.h"
 #include "host/host_phase_records.h"
 #include "host/host_phase_run_state.h"
@@ -127,6 +128,7 @@ public:
             runtime(&runtime_in),
             config(config_in),
             dfx(DfxRunConfig::from(config_in)),
+            scope_stats_capacity(runtime_in.scope_stats_capacity()),
             pipeline_slot(pipeline_slot_in) {}
         virtual ~PreparedExecution() = default;
         PreparedExecution(const PreparedExecution &) = delete;
@@ -136,6 +138,7 @@ public:
             runtime(std::exchange(other.runtime, nullptr)),
             config(other.config),
             dfx(std::move(other.dfx)),
+            scope_stats_capacity(other.scope_stats_capacity),
             pipeline_slot(other.pipeline_slot),
             num_aicore(other.num_aicore),
             launch_aicpu_num(other.launch_aicpu_num),
@@ -156,6 +159,7 @@ public:
          * no correctness weight here — it keeps the two runner shapes the same.
          */
         DfxRunConfig dfx{};
+        simpler::dfx::scope_stats_runs::CapacityMetadata scope_stats_capacity;
         uint32_t pipeline_slot{UINT32_MAX};
         int num_aicore{0};
         int launch_aicpu_num{0};
@@ -238,7 +242,22 @@ public:
      * admitted, or their export slots stay occupied by a run that never
      * reaches a boundary.
      */
-    virtual int admit_dep_gen_run(const DfxRunConfig & /*dfx*/, uint64_t /*run_epoch*/) { return 0; }
+    virtual int admit_dep_gen_run(
+        const DfxRunConfig & /*dfx*/, uint64_t /*run_epoch*/, simpler::dfx::runs::AdmissionRefusal * /*why*/ = nullptr
+    ) {
+        return 0;
+    }
+    /**
+     * Whether this run could be admitted to dep_gen's joined path right now.
+     *
+     * The dep_gen collector lives on the arch runner, so its half of the
+     * all-or-nothing admission is asked through here. False where the runtime
+     * has no device producer at all, which is also the default for a runner
+     * that owns no dep_gen collector.
+     */
+    virtual bool dep_gen_can_admit_joined_run(uint64_t /*run_epoch*/) const { return false; }
+    /** Resolve this run's dep_gen terminal bank, 0 when it holds none. */
+    virtual uint64_t dep_gen_run_terminal_bank(uint64_t /*run_epoch*/) const { return 0; }
     /** Release an admitted run whose launch submitted nothing. */
     virtual void withdraw_dep_gen_run(uint64_t /*run_epoch*/) noexcept {}
     virtual bool dep_gen_flush_retained(int /*timeout_ms*/, std::string * /*error*/) { return true; }
@@ -260,8 +279,28 @@ public:
 
     /** Reserve the runner's single active native execution through finalize. */
     bool try_acquire_native_run(const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit);
+
+    /**
+     * Re-issue the launch permit for a claim this owner already holds.
+     *
+     * Only for a launch that proved it submitted nothing and is being left
+     * retryable: `launch_execution` consumes the permit by value, and this
+     * runner keeps its execution claim from prepare through finalize, so
+     * `try_acquire_native_run` cannot mint a second one — its compare-exchange
+     * expects an unclaimed slot and this owner is the claimant.
+     *
+     * Refuses unless `owner` is the current claimant, so it cannot hand a
+     * permit to a caller that does not own the run.
+     */
+    bool reissue_launch_permit(const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit);
     void release_native_run(const void *owner);
     bool native_run_active() const;
+    /** Cleanup-only terminal storage keeps this context alive for close retry. */
+    virtual bool terminal_backing_retained() const {
+        return dump_collector_.terminal_backing_retained() || pmu_collector_.terminal_backing_retained() ||
+               scope_stats_collector_.terminal_backing_retained();
+    }
+
     bool native_run_owned_by(const void *owner) const;
     bool can_accept_run() const { return !launch_poisoned_.load(std::memory_order_acquire); }
     void poison_launch() noexcept { launch_poisoned_.store(true, std::memory_order_release); }
@@ -511,10 +550,17 @@ public:
 
     void set_chip_swimlane_enabled(int level) { chip_swimlane_level_ = static_cast<ChipSwimlaneLevel>(level); }
     uint32_t chip_swimlane_level() const { return static_cast<uint32_t>(chip_swimlane_level_); }
-    bool
-    publish_chip_swimlane_extension(ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size) {
-        return json_value != nullptr &&
-               chip_swimlane_collector_.set_json_extension(section, std::string(json_value, json_size));
+    void set_pmu_enabled(bool enabled) { pmu_enabled_ = enabled; }
+    /** The runner's applied PMU selection, used by legacy HostApi callers; see the onboard base. */
+    bool pmu_enabled() const { return pmu_enabled_; }
+    /** One run's host-side JSON section, addressed by that run's epoch; see the onboard base. */
+    bool publish_chip_swimlane_extension(
+        uint64_t run_epoch, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
+    ) {
+        // Handed on as the caller's bytes: the collector copies them once,
+        // inside the charge its per-run budget admitted, so no payload-sized
+        // temporary is materialized on a path that may refuse it.
+        return chip_swimlane_collector_.set_json_extension(run_epoch, section, json_value, json_size);
     }
     /** Hand one slot's host-phase state to the run about to bind into it. */
     void begin_host_phase_run(uint32_t pipeline_slot, const DfxRunConfig &dfx);
@@ -556,25 +602,64 @@ public:
      *
      * Returns non-zero when a collector that retains runs would not admit this
      * one; see the onboard base for why that fails the run.
+     *
+     * `admission` receives which owner declined and whether re-attempting
+     * could change the answer, plus the credit generation read before the
+     * first owner was asked. All or nothing, including under an exception;
+     * see the onboard base.
      */
+    /** The outcome of one all-or-nothing admission attempt. */
+    struct DiagnosticAdmission {
+        simpler::dfx::runs::AdmissionRefusal refusal{simpler::dfx::runs::AdmissionRefusal::None};
+        const char *owner{nullptr};
+        uint64_t credit_generation{0};
+    };
+
     int start_shared_collectors_for_run(
-        const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata
+        const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata,
+        DiagnosticAdmission *admission = nullptr
     );
+
+    /**
+     * Undo one refused admission attempt without waking its own retry.
+     *
+     * The withdrawal below, with this thread's own capacity returns suppressed
+     * and a genuine non-restoration — a quarantine, a fatal owner — published
+     * instead. Every path that declines an admission after an earlier owner
+     * took one goes through here rather than calling the withdrawal directly;
+     * the post-launch withdrawal of a run that submitted nothing deliberately
+     * does not, because that run held its admission while others observed it
+     * taken.
+     */
+    void undo_admission_attempt(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
 
     /**
      * Give back what the call above admitted for a run that submitted nothing.
      * Only for a `LaunchProgress::NotStarted` transaction; see the onboard base
      * for why a partial submission must keep its slot.
+     *
+     * Returns whether every owner's slot is back, which is what separates a
+     * restoration — the state every waiter already saw — from a quarantine,
+     * where the capacity they saw is gone for good and they must be told.
      */
-    void withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
+    bool withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept;
 
     /**
      * Close one run's PMU window: either today's drain and reconcile, or, when
      * PMU retains runs, the claim-time snapshot that hands the epoch to its
      * background writer.
+     *
+     * `device_producers_stopped` settles this run's terminal bank on the
+     * failure path and nothing else; see
+     * `simpler::dfx::runs::settle_failed_run_terminal_bank`. Only a caller that
+     * joined its producers may pass it.
      */
-    void close_pmu_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
-    void close_scope_stats_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+    void close_pmu_run_boundary(
+        const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
+    );
+    void close_scope_stats_run_boundary(
+        const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
+    );
 
     /**
      * Close one run's ArgsDump window: either today's quiesce, reconcile and
@@ -588,7 +673,9 @@ public:
      * the arena — but the caller owes an error rather than a run that quietly
      * publishes an incomplete file.
      */
-    int close_args_dump_run_boundary(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+    int close_args_dump_run_boundary(
+        const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
+    );
 
     /**
      * Whether a collector may hold a run past its boundary. Default off, and
@@ -624,6 +711,82 @@ public:
      * prepare failure. Mirrors the onboard base.
      */
     uint64_t arm_chip_swimlane_run_terminal_bank(uint64_t run_epoch);
+
+    /**
+     * This context's diagnostic credit progress, for a blocked admission.
+     *
+     * `credit_generation()` is non-blocking and safe under a caller's own
+     * lane mutex. `wait_for_credit` must not be: the threads that advance the
+     * generation are the collectors' writers, and a waiter holding a lane or
+     * collector lock could stop the very release it waits for.
+     * `cancel_credit_waits` is non-blocking and proves nothing about a waiter
+     * having left.
+     */
+    uint64_t credit_generation() const { return credit_signal_.generation(); }
+    int wait_for_credit(uint64_t seen, int32_t timeout_ms) {
+        return static_cast<int>(credit_signal_.wait_for(seen, timeout_ms));
+    }
+    void cancel_credit_waits() { credit_signal_.cancel(); }
+
+    /** Record that a diagnostic output slot or terminal bank came back. */
+    void note_diagnostic_credit_released() { credit_signal_.advance(); }
+
+    /**
+     * Whether every owner this run enabled could admit it, all or nothing.
+     *
+     * Each owner contributes three terms: that it can tell two open runs apart
+     * at all — which is the presence of a mapped terminal bank, not a count of
+     * free ones — that it has a retained admission free, and that it has a bank
+     * this run could publish into. A single owner short declines the whole
+     * pair, because a run admitted to some owners and not others would publish
+     * a partial diagnostic nothing names as partial. Mirrors the onboard base.
+     */
+    bool every_enabled_owner_can_admit(const DfxRunConfig &dfx, uint64_t run_epoch) const;
+
+    /**
+     * Fill this run's four queue-pair terminal bank addresses into its kernel
+     * arguments, from the banks its own admission reserved.
+     *
+     * Called once every owner has admitted the run and before anything is
+     * submitted. Every field is written on every run, including the ones that
+     * resolved nothing, so a successor cannot inherit a predecessor's address
+     * from reused argument storage. Mirrors the onboard base.
+     */
+    void resolve_run_terminal_banks(const DfxRunConfig &dfx, uint64_t run_epoch, KernelArgs &kernel_args) const;
+
+    /**
+     * Initialize each enabled retained owner's terminal array, once per collector.
+     *
+     * Already-open owners and owners with retention disabled are skipped. A
+     * required array that cannot be initialized returns an error before launch;
+     * live counters cannot substitute for its per-run accounting.
+     */
+    int open_run_terminal_banks_for_enabled_owners(const DfxRunConfig &dfx);
+
+    /** Wire every collector's capacity release to this context's signal. */
+    void install_credit_release_notifiers();
+
+    /**
+     * Whether any collector still holds retained data a writer has not
+     * published.
+     *
+     * Asked before a stale-shape rebuild, which frees the pools those writers
+     * are reading. The joined gate already declines a pair whose shape would
+     * rebuild, but an ordinary front run takes the same rebuild and is not
+     * covered by that gate — and a retained predecessor's writer outlives its
+     * run's native retirement by design, so "no run is executing" is not the
+     * same question as "no writer is reading".
+     */
+    bool retained_consumers_outstanding() const;
+
+    /** The dep_gen half, on the arch runner that owns that collector. */
+    virtual bool dep_gen_retained_runs_outstanding() const { return false; }
+
+    /** The dep_gen half, on the arch runner that owns that collector. */
+    virtual void install_dep_gen_credit_release_notifier(const std::function<void()> & /*notify*/) {}
+
+    /** The dep_gen half, on the arch runner that owns that collector. */
+    virtual int open_dep_gen_run_terminal_banks(const DfxRunConfig & /*dfx*/) { return 0; }
     /** Write this pass's per-event host phase records, if it collected any. */
     void write_host_phase_records_artifact(const std::string &output_prefix, uint32_t pipeline_slot);
     /**
@@ -658,6 +821,55 @@ public:
         const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete,
         bool device_producers_stopped
     );
+
+    /**
+     * Stop one run's device producers, and hold which run that was.
+     *
+     * A simulated device's producers are this process's own threads, so
+     * stopping them is joining them and `stop` is that join. The run's identity
+     * is recorded only after `stop` returns, so a stop that threw part-way
+     * leaves none.
+     *
+     * The proof is held *by identity* rather than as a flag, because runs
+     * overlap: a successor is prepared and admitted while its predecessor is
+     * still executing, so a flag would let the predecessor's stop answer for
+     * the successor — and clearing a flag at admission would let the successor
+     * erase a predecessor's proof before its boundary had read it. An epoch
+     * does neither: it answers for exactly one run and no other.
+     */
+    template <typename StopProducers>
+    void stop_run_producers(uint64_t run_epoch, StopProducers &&stop) {
+        producers_stopped_epoch_ = 0;
+        stop();
+        producers_stopped_epoch_ = run_epoch;
+    }
+
+    /** Whether *this* run's producers were stopped by the call above. */
+    bool run_producers_stopped(uint64_t run_epoch) const {
+        return run_epoch != 0 && producers_stopped_epoch_ == run_epoch;
+    }
+
+    /**
+     * Settle this run's diagnostics on the stop this runner performed.
+     *
+     * The stop is read from `stop_run_producers` rather than supplied here, so
+     * a run that was never stopped settles as one: its bank is withdrawn.
+     * `device_execution_complete` stays the caller's — stopping the producers
+     * says nothing about whether the run reached its terminal publication, and
+     * only that decides whether a snapshot is read.
+     */
+    int settle_run_after_producer_stop(
+        const DfxRunConfig &dfx, uint32_t pipeline_slot, uint64_t run_epoch, bool device_execution_complete
+    ) {
+        return teardown_shared_collectors_after_run(
+            dfx, pipeline_slot, run_epoch, device_execution_complete, run_producers_stopped(run_epoch)
+        );
+    }
+    // The run whose producers `stop_run_producers` stopped, or zero. Zero is
+    // the identity no run carries, so every run that has not reached its stop
+    // reads as unstopped.
+    uint64_t producers_stopped_epoch_ = 0;
+
     // Diagnostic artifact root directory (CallConfig::validate() enforces non-empty
     // upstream when any diagnostic is enabled).
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
@@ -938,6 +1150,26 @@ protected:
     std::string aicore_so_path_;
 
     // Performance / diagnostics collectors shared across arches.
+    /**
+     * This context's diagnostic credit progress, and what a blocked admission
+     * waits on.
+     *
+     * Advanced by every path that frees an output slot or a terminal bank, so
+     * a run declined for capacity has something to block on instead of a busy
+     * loop. Reached from the extension only through the three C entries, which
+     * carry integers and the opaque handle and nothing else.
+     */
+    simpler::dfx::credit::DiagnosticCreditSignal credit_signal_;
+
+    /**
+     * Whether the collectors' credit callbacks have been installed.
+     *
+     * One-shot. They are assigned before any collector thread starts and
+     * never reassigned, so a background writer calling one never races the
+     * assignment.
+     */
+    bool credit_notifiers_installed_{false};
+
     ChipSwimlaneCollector chip_swimlane_collector_;
     // Not a collector: the pool the runtime's prepare path writes into, read by
     // whichever per-event views the run enabled. Its two readers are gated
@@ -1021,6 +1253,7 @@ protected:
     // PreparedExecution::dfx; the runner keeps only what a device-context query
     // answers from, plus the artifact root the host-phase pool arms against.
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};  // resolved from set_chip_swimlane_enabled()
+    bool pmu_enabled_{false};                                             // resolved from set_pmu_enabled()
     std::string output_prefix_{};                                         // diagnostic artifact root directory
 };
 

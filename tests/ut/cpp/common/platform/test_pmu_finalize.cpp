@@ -13,6 +13,7 @@
 
 #include <cstdlib>
 #include <map>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -22,16 +23,26 @@
 
 namespace {
 using Register = std::pair<uint64_t, RegId>;
-struct RegisterWrite {
-    Register target;
-    uint64_t value;
-};
+enum class Access { Read, Write };
+using RegisterAccess = std::tuple<Access, Register, uint32_t>;
 uint64_t register_table = 0;
 std::map<Register, uint32_t> registers;
-std::vector<RegisterWrite> writes;
+std::vector<RegisterAccess> accesses;
 size_t read_count = 0;
 
-uint32_t saved_value(RegId reg) { return 0x4ac00000U + static_cast<uint32_t>(reg); }
+uint32_t saved_value(uint64_t base, RegId reg) {
+    return 0x4ac00000U + static_cast<uint32_t>(base >> 16) + static_cast<uint32_t>(reg);
+}
+uint32_t close_value(uint64_t base, RegId reg) { return saved_value(base, reg) ^ 0x10000000U; }
+
+uint32_t &register_value(uint64_t base, RegId reg) {
+    return registers.try_emplace({base, reg}, saved_value(base, reg)).first->second;
+}
+
+void record_write(const Register &target, uint32_t value) {
+    accesses.emplace_back(Access::Write, target, value);
+    registers[target] = value;
+}
 }  // namespace
 
 extern "C" {
@@ -40,23 +51,27 @@ uint64_t get_platform_pmu_reg_addrs() { return register_table; }
 uint64_t get_platform_regs() { return register_table; }
 }
 
-uint64_t read_reg(uint64_t, RegId reg) {
+uint64_t read_reg(uint64_t base, RegId reg) {
     ++read_count;
-    return saved_value(reg);
+    const uint32_t value = register_value(base, reg);
+    accesses.emplace_back(Access::Read, Register{base, reg}, value);
+    return value;
 }
 
-volatile uint32_t *get_reg_ptr(uint64_t base, RegId reg) { return &registers[{base, reg}]; }
+volatile uint32_t *get_reg_ptr(uint64_t base, RegId reg) { return &register_value(base, reg); }
 
 uint32_t reg_load_acquire(const volatile uint32_t *pointer) {
-    ++read_count;
-    return *pointer;
+    for (const auto &entry : registers) {
+        if (&entry.second == pointer) return static_cast<uint32_t>(read_reg(entry.first.first, entry.first.second));
+    }
+    ADD_FAILURE() << "read outside the modeled PMU register window";
+    return 0;
 }
 
 void reg_store_release(volatile uint32_t *pointer, uint32_t value) {
     for (auto &entry : registers) {
         if (&entry.second == pointer) {
-            writes.push_back({entry.first, value});
-            entry.second = value;
+            record_write(entry.first, value);
             return;
         }
     }
@@ -65,7 +80,7 @@ void reg_store_release(volatile uint32_t *pointer, uint32_t value) {
         for (int index = static_cast<int>(RegId::PMU_CTRL_0); index <= static_cast<int>(RegId::PMU_CNT7_IDX); ++index) {
             RegId reg = static_cast<RegId>(index);
             if (reinterpret_cast<uint64_t>(pointer) == base + reg_offset(reg)) {
-                writes.push_back({{base, reg}, value});
+                record_write({base, reg}, value);
                 return;
             }
         }
@@ -75,7 +90,7 @@ void reg_store_release(volatile uint32_t *pointer, uint32_t value) {
 }
 
 #if defined(SIMPLER_TEST_PMU_ARCH_A5)
-void write_reg(uint64_t base, RegId reg, uint64_t value) { writes.push_back({{base, reg}, value}); }
+void write_reg(uint64_t base, RegId reg, uint64_t value) { record_write({base, reg}, value); }
 #endif
 
 namespace {
@@ -98,6 +113,10 @@ protected:
         set_platform_pmu_base(reinterpret_cast<uint64_t>(collector_.get_pmu_shm_device_ptr()));
         set_platform_pmu_reg_addrs(reinterpret_cast<uint64_t>(bases_));
         pmu_aicpu_init(physical_, 2);
+        for (uint64_t base : bases_) {
+            for (RegId reg : controls())
+                register_value(base, reg) = close_value(base, reg);
+        }
         clear_trace();
     }
 
@@ -110,43 +129,48 @@ protected:
     }
 
     static void clear_trace() {
-        writes.clear();
+        accesses.clear();
         read_count = 0;
     }
 
-    static constexpr size_t writes_per_core() {
+    static std::vector<RegId> controls() {
 #if defined(SIMPLER_TEST_PMU_ARCH_A5)
-        return 2;
+        return {RegId::PMU_CTRL_0, RegId::PMU_CTRL_1};
 #else
-        return 1;
+        return {RegId::PMU_CTRL_0};
 #endif
+    }
+
+    void expect_finalization(const std::vector<int> &owned) {
+        std::vector<RegisterAccess> expected;
+        for (int core : owned) {
+            const uint64_t base = bases_[physical_[core]];
+            for (RegId reg : controls())
+                expected.emplace_back(Access::Read, Register{base, reg}, close_value(base, reg));
+            for (RegId reg : controls()) {
+                expected.emplace_back(Access::Write, Register{base, reg}, saved_value(base, reg));
+                EXPECT_EQ(register_value(base, reg), saved_value(base, reg));
+            }
+        }
+        EXPECT_EQ(read_count, owned.size() * controls().size());
+        EXPECT_EQ(accesses, expected);
     }
 };
 
 TEST_F(PmuFinalizeTest, RestoresOnlyOwnedCoreControlsWithoutPolling) {
     const int owned[] = {0};
     pmu_aicpu_finalize(owned, 1);
-    EXPECT_EQ(read_count, 0U);
-    ASSERT_EQ(writes.size(), writes_per_core());
-    for (const auto &write : writes) {
-        EXPECT_EQ(write.target.first, bases_[physical_[0]]);
-        EXPECT_EQ(write.value, saved_value(write.target.second));
+    expect_finalization({0});
+    for (RegId reg : controls()) {
+        const uint64_t unowned_base = bases_[physical_[1]];
+        EXPECT_EQ(register_value(unowned_base, reg), close_value(unowned_base, reg));
     }
-    EXPECT_EQ(writes[0].target.second, RegId::PMU_CTRL_0);
-#if defined(SIMPLER_TEST_PMU_ARCH_A5)
-    EXPECT_EQ(writes[1].target.second, RegId::PMU_CTRL_1);
-#endif
 }
 
 TEST_F(PmuFinalizeTest, AllCoreFinalizationHasOneFixedWriteSequencePerCore) {
     const int owned[] = {0, 1};
     pmu_aicpu_finalize(owned, 2);
-    EXPECT_EQ(read_count, 0U);
-    ASSERT_EQ(writes.size(), 2 * writes_per_core());
-    for (size_t i = 0; i < writes.size(); ++i) {
-        EXPECT_EQ(writes[i].target.first, bases_[physical_[i / writes_per_core()]]);
-        EXPECT_EQ(writes[i].value, saved_value(writes[i].target.second));
-    }
+    expect_finalization({0, 1});
 }
 
 TEST_F(PmuFinalizeTest, EmptyInvalidAndUnboundCoresDoNotTouchMmio) {
@@ -157,6 +181,6 @@ TEST_F(PmuFinalizeTest, EmptyInvalidAndUnboundCoresDoNotTouchMmio) {
     pmu_aicpu_finalize(nullptr, 0);
     pmu_aicpu_finalize(invalid_or_unbound, 3);
     EXPECT_EQ(read_count, 0U);
-    EXPECT_TRUE(writes.empty());
+    EXPECT_TRUE(accesses.empty());
 }
 }  // namespace

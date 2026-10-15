@@ -1449,6 +1449,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         dump_args_flush(thread_idx);
+        // After this lane's last flush, so the settled counts include every
+        // record it will ever publish. One producer per dump thread, and this
+        // is the thread that owns this one; a thread reaches exactly one of
+        // these exits, so no lane is settled twice.
+        dump_args_close_run(thread_idx);
     }
 #endif
 #if SIMPLER_DFX

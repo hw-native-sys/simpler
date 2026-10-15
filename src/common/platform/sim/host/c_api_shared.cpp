@@ -128,6 +128,16 @@ int publish_run_image_impl(Runtime *runtime, const HostApi *api);
 int copy_in_run_inputs_impl(const Runtime *runtime, const HostApi *api);
 int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched);
 int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
+/**
+ * Whether this runtime has a producer that reads a task's arguments at that
+ * task's own boundaries.
+ *
+ * One answer for both backends: the simulated variant runs the same AICPU and
+ * AICore sources on host threads, so a route with no task-boundary observer has
+ * none here either. @see the onboard c_api_shared.cpp declaration for why the
+ * answer is the runtime's rather than a bind's.
+ */
+__attribute__((weak)) int args_dump_capture_supported_impl(void) { return 0; }
 
 /* ===========================================================================
  * Context-bound HostApi functions passed to runtime implementations.
@@ -354,11 +364,16 @@ static uint32_t get_chip_swimlane_level(void *runner_ctx) {
     return static_cast<SimDeviceRunnerBase *>(runner_ctx)->chip_swimlane_level();
 }
 
+static int get_pmu_enabled(void *runner_ctx) {
+    if (runner_ctx == nullptr) return 0;
+    return static_cast<SimDeviceRunnerBase *>(runner_ctx)->pmu_enabled() ? 1 : 0;
+}
+
 static bool publish_chip_swimlane_extension(
-    void *runner_ctx, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
+    void *runner_ctx, uint64_t run_epoch, ChipSwimlaneExtensionSection section, const char *json_value, size_t json_size
 ) {
     return runner_ctx != nullptr && static_cast<SimDeviceRunnerBase *>(runner_ctx)
-                                        ->publish_chip_swimlane_extension(section, json_value, json_size);
+                                        ->publish_chip_swimlane_extension(run_epoch, section, json_value, json_size);
 }
 
 static void *host_phase_pool_arm(void *runner_ctx, uint32_t pipeline_slot, int producer_wants_records) {
@@ -524,6 +539,7 @@ static const HostApiOps g_host_api_ops = {
     .mark_prebuilt_runtime_arena_cached = mark_prebuilt_runtime_arena_cached_wrapper,
     .upload_chip_callable_buffer = upload_chip_callable_buffer_wrapper,
     .get_chip_swimlane_level = get_chip_swimlane_level,
+    .get_pmu_enabled = get_pmu_enabled,
     .host_phase_pool_arm = host_phase_pool_arm,
     .host_phase_pool_finish = host_phase_pool_finish,
     .publish_chip_swimlane_extension = publish_chip_swimlane_extension,
@@ -547,6 +563,10 @@ void destroy_device_context(DeviceContextHandle ctx) {
     SimDeviceRunnerBase *runner = static_cast<SimDeviceRunnerBase *>(ctx);
     if (runner != nullptr && runner->native_run_active()) {
         LOG_ERROR("destroy_device_context: refusing to destroy a context with an unfinalized native run");
+        return;
+    }
+    if (runner != nullptr && runner->terminal_backing_retained()) {
+        LOG_ERROR("destroy_device_context: terminal backing requires close retry; leaving context alive");
         return;
     }
     delete runner;
@@ -649,6 +669,7 @@ int finalize_device(DeviceContextHandle ctx) {
         // released. A no-op on a collector that retains no run.
         runner->finish_retained_runs();
         int rc = runner->finalize();
+        if (runner->terminal_backing_retained()) return rc;
         int dev = pto_cpu_sim_get_bound_device();
         if (dev >= 0) {
             pto_cpu_sim_release_device(dev);
@@ -1063,6 +1084,18 @@ int simpler_prepare_run(
         if (config->enable_chip_swimlane >= 3) state->clock_log_offset = host_clock_alignment_log_offset();
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
+        // Refuse before bind or diagnostic allocation, but only after this
+        // attempt owns a validated carrier. Successful cleanup supplies the
+        // exact-epoch release proof the worker needs to keep its lane usable.
+        if (config->enable_dump_args != 0 && args_dump_capture_supported_impl() == 0) {
+            LOG_ERROR(
+                "simpler_prepare_run: this runtime has no per-task argument capture, so the requested argument dump "
+                "(enable_dump_args=%d) is unavailable rather than empty; nothing was prepared",
+                config->enable_dump_args
+            );
+            return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_UNSUPPORTED);
+        }
+
         int rc = runner->attach_current_thread(runner->device_id());
         if (rc != 0) return cleanup_failed_prepare(state, rc);
 
@@ -1137,6 +1170,11 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
 
     state->runner_trace_start_ns = STRACE_NOW_NS();
     int rc = PTO_RUNTIME_ERR_INTERNAL;
+    // Captured where it is known: the transaction's own report of how far
+    // it got is what distinguishes a refusal that submitted nothing from
+    // one that may have reached the device, and `launch` does not outlive
+    // the block below.
+    LaunchProgress progress = LaunchProgress::NotStarted;
     try {
         rc = state->runner->attach_current_thread(state->runner->device_id());
         if (rc == 0) {
@@ -1145,6 +1183,7 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
                 state->runner->launch_execution(std::move(state->prepared_execution), std::move(state->launch_permit));
             state->launch_not_started_proven = launch.progress == LaunchProgress::NotStarted;
             rc = launch.rc;
+            progress = launch.progress;
             state->prepared_execution = std::move(launch.prepared);
             state->active_execution = std::move(launch.active);
             if (launch.progress == LaunchProgress::Complete && !state->publish_acceptance(launch.receipt))
@@ -1152,6 +1191,27 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         }
     } catch (...) {
         rc = PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // A capacity refusal is the one non-zero result that is not this run's
+    // outcome: the transaction proved it submitted nothing and handed the
+    // prepared execution back, so the carrier stays exactly as the caller
+    // prepared it and the next launch of this identity is a real launch.
+    // Latching `Complete` here, as every other non-zero result does, is what
+    // would make the approved wait-and-resume unreachable — the retry would be
+    // refused for its phase. `Partial` is excluded: a submission that may have
+    // reached the device is not retryable whatever code it carried.
+    //
+    // Unlike the onboard entry, this runner holds its execution claim from
+    // prepare through finalize, so the claim is *kept* rather than given back
+    // and only the permit — consumed by value above — is re-issued against it.
+    if (rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL && progress == LaunchProgress::NotStarted &&
+        state->active_execution == nullptr && state->prepared_execution != nullptr &&
+        state->runner->reissue_launch_permit(state, state->identity(), &state->launch_permit)) {
+        // No completion code and no runner-wall span: this run neither
+        // completed nor ran, and publishing either would put a finished run's
+        // evidence on the timeline of one that has not started.
+        state->phase.store(NativeRunPhase::Prepared, std::memory_order_release);
+        return rc;
     }
     if (rc != 0) {
         state->completion_rc = rc;
@@ -1442,6 +1502,40 @@ int simpler_set_run_resource_grant_ctx(DeviceContextHandle ctx, uint32_t granted
                    PTO_RUNTIME_ERR_UNSUPPORTED;
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+uint64_t simpler_diagnostic_credit_generation_ctx(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->credit_generation();
+    } catch (...) {
+        // A generation of 0 is "no progress information", which the caller
+        // reads as "re-ask next round" — never as progress.
+        return 0;
+    }
+}
+
+int simpler_wait_diagnostic_credit_ctx(DeviceContextHandle ctx, uint64_t seen, int32_t timeout_ms) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<SimDeviceRunnerBase *>(ctx)->wait_for_credit(seen, timeout_ms);
+    } catch (...) {
+        // Indistinguishable from cancellation on purpose: both mean "stop
+        // waiting on this context", and the caller's next attempt is what
+        // decides the run.
+        return -1;
+    }
+}
+
+void simpler_cancel_diagnostic_credit_waits_ctx(DeviceContextHandle ctx) {
+    if (ctx == NULL) return;
+    try {
+        static_cast<SimDeviceRunnerBase *>(ctx)->cancel_credit_waits();
+    } catch (...) {
+        // Nothing to report to: this is called on teardown paths whose own
+        // outcome is already decided, and the waiters it would have woken are
+        // going away regardless.
     }
 }
 

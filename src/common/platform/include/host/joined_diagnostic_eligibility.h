@@ -13,6 +13,7 @@
 #include <cstdint>
 
 #include "common/chip_swimlane_profiling.h"
+#include "host/dfx_run_config.h"
 #include "worker/native_run_phase.h"
 
 /**
@@ -37,19 +38,57 @@ enum class JoinedDiagnosticVerdict : uint8_t {
     kKernelExecution,
     kLevelDisagrees,
     kLevelNotAdmitted,
-    kOtherChannelEnabled,
+    kChannelDisagrees,
     kSamePipelineSlot,
 };
+
+/** The verdict as a reason a caller can report. */
+inline const char *joined_diagnostic_verdict_name(JoinedDiagnosticVerdict verdict) {
+    switch (verdict) {
+    case JoinedDiagnosticVerdict::kConfigurationAgrees:
+        return "the pair's configuration agrees";
+    case JoinedDiagnosticVerdict::kKernelExecution:
+        return "kernel-mode execution orders its own launches";
+    case JoinedDiagnosticVerdict::kLevelDisagrees:
+        return "the pair asked for different diagnostic settings";
+    case JoinedDiagnosticVerdict::kLevelNotAdmitted:
+        return "this diagnostic level admits no joined successor";
+    case JoinedDiagnosticVerdict::kChannelDisagrees:
+        return "the pair enabled different diagnostic channels";
+    case JoinedDiagnosticVerdict::kSamePipelineSlot:
+        return "both runs hold the same pipeline slot";
+    }
+    return "an unnamed configuration verdict";
+}
 
 /** One run's configuration, as the pair decision reads it. */
 struct JoinedDiagnosticRun {
     ChipSwimlaneLevel chip_swimlane_level{ChipSwimlaneLevel::DISABLED};
-    // True when this run also enabled args-dump, PMU, dep-gen or scope-stats.
-    // Those channels have their own per-run device state and none of them has
-    // been shown safe for two open runs, so one of them on either side is a
-    // refusal rather than a narrower question.
-    bool other_channel_enabled{false};
+    // The four queue-pair owners' settings, compared rather than refused. Each
+    // publishes its own per-run accounting into a bank this run's identity
+    // reserved, so two open runs are told apart by what their producers
+    // stamped. What is still shared is the *setting*: level and event mode are
+    // one word in each device header, latched when a producer initializes, so
+    // a pair that disagrees would silently give one run the other's setting.
+    DumpArgsLevel dump_args_level{DumpArgsLevel::OFF};
+    bool pmu_enabled{false};
+    PmuEventType pmu_event_type{};
+    bool dep_gen_enabled{false};
+    bool scope_stats_enabled{false};
     uint32_t pipeline_slot{0};
+
+    /** The five settings this run asked for, plus the slot it holds. */
+    static JoinedDiagnosticRun from(const DfxRunConfig &dfx, uint32_t pipeline_slot) {
+        JoinedDiagnosticRun out;
+        out.chip_swimlane_level = dfx.chip_swimlane_level;
+        out.dump_args_level = dfx.dump_args_level;
+        out.pmu_enabled = dfx.pmu_enabled;
+        out.pmu_event_type = dfx.pmu_event_type;
+        out.dep_gen_enabled = dfx.dep_gen_enabled;
+        out.scope_stats_enabled = dfx.scope_stats_enabled;
+        out.pipeline_slot = pipeline_slot;
+        return out;
+    }
 };
 
 /**
@@ -60,24 +99,37 @@ struct JoinedDiagnosticRun {
  * prepares and finalizes through the shared run lifecycle but launches through
  * its own, and its producers' ordering is not established.
  *
- * The levels must be *equal*, not merely each supported. The level is one
- * shared word in the device header, written by whichever run arms, and the
- * device latches it once when its producer initializes; a queued predecessor
- * may not have reached that latch when its successor arms, so a 1-and-2 pair
- * would silently give one run the other's level, with no counter, no verdict
- * and no log to say so.
+ * The levels must be *equal*, not merely each supported, and the same holds for
+ * every other owner's setting. A level is one shared word in the device header,
+ * written by whichever run arms, and the device latches it once when its
+ * producer initializes; a queued predecessor may not have reached that latch
+ * when its successor arms, so a 1-and-2 pair would silently give one run the
+ * other's level, with no counter, no verdict and no log to say so.
+ *
+ * Equality is also what makes an owner that is *off* on both sides free: it has
+ * no device state for either run to latch, so it constrains nothing.
  */
 inline JoinedDiagnosticVerdict classify_joined_diagnostic_pair(
     bool kernel_execution, const JoinedDiagnosticRun &succ, const JoinedDiagnosticRun &pred
 ) {
     if (kernel_execution) return JoinedDiagnosticVerdict::kKernelExecution;
     if (succ.chip_swimlane_level != pred.chip_swimlane_level) return JoinedDiagnosticVerdict::kLevelDisagrees;
-    if (succ.chip_swimlane_level != ChipSwimlaneLevel::TASK_TIMING &&
+    // A swimlane level either run admits but the pair has not been shown safe
+    // for. Checked after equality so the message names the narrower fact.
+    if (succ.chip_swimlane_level != ChipSwimlaneLevel::DISABLED &&
+        succ.chip_swimlane_level != ChipSwimlaneLevel::TASK_TIMING &&
         succ.chip_swimlane_level != ChipSwimlaneLevel::SCHEDULE_TIMING) {
         return JoinedDiagnosticVerdict::kLevelNotAdmitted;
     }
-    if (succ.other_channel_enabled || pred.other_channel_enabled) {
-        return JoinedDiagnosticVerdict::kOtherChannelEnabled;
+    if (succ.dump_args_level != pred.dump_args_level || succ.pmu_enabled != pred.pmu_enabled ||
+        succ.dep_gen_enabled != pred.dep_gen_enabled || succ.scope_stats_enabled != pred.scope_stats_enabled) {
+        return JoinedDiagnosticVerdict::kChannelDisagrees;
+    }
+    // Only when PMU is on for both: the event mode selects the counter group
+    // the device programs, and a run measuring one group under columns naming
+    // another cannot be told apart by any later count.
+    if (succ.pmu_enabled && succ.pmu_event_type != pred.pmu_event_type) {
+        return JoinedDiagnosticVerdict::kChannelDisagrees;
     }
     // Two runs in one pipeline slot are one run's state reused, not a pair:
     // the successor would arm over the predecessor's own slot-indexed device

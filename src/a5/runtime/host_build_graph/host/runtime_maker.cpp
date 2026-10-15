@@ -183,6 +183,45 @@ extern "C" int joined_native_launch_supported_impl(void) {
     return 1;
 }
 
+extern "C" int joined_diagnostic_launch_supported_impl(void) {
+    // Every device owner this runtime admits can hold two runs open on it —
+    // which is the four other than the argument dump, whose request this
+    // runtime refuses below. Every producer stamps the run epoch its AICPU op
+    // was launched with onto the buffer it publishes, and settles that run's
+    // own accounting into the terminal bank its pipeline slot reserves, so the
+    // host tells the two apart by identity rather than by arrival order.
+    //
+    // Both AICPU routes bring those producers up and settle them: the legacy
+    // scheduler does it across its cold path and its dispatch exits, and the
+    // AICore-scheduler route does it across `AicoreLifecycle`'s own init and
+    // shutdown partitions. A run on either route therefore publishes a
+    // terminal of its own rather than leaving its accounting unreadable.
+    return 1;
+}
+
+extern "C" int args_dump_capture_supported_impl(void) {
+    // No per-task argument capture on this runtime. Its route is the AICore
+    // Scheduler, where the on-core schedulers both dispatch tasks and reap
+    // their completions, so no AICPU thread holds a task's own boundaries and
+    // `dump_args_for_task` has no instant to run at. The two instants an AICPU
+    // thread does own are the run's, and a read there is not that task's data:
+    // a consumer's input would carry the content from before its producer ran,
+    // and a buffer several tasks write in turn would report the last write as
+    // every one of their outputs.
+    //
+    // Zero for the runtime, not for a bind. The AICPU-scheduled fallback this
+    // runtime keeps is selected inside `create_scheduler_state` from the
+    // graph's own task kinds, and from nothing a caller states, so an answer
+    // that followed the selection would make the capture available or not
+    // depending on whether a graph happened to hold a task the resident route
+    // declines.
+    //
+    // `docs/investigations/2026-10-a5-resident-per-task-args-capture.md` is the
+    // design for a task-boundary producer here; the capability is deferred to
+    // its own change.
+    return 0;
+}
+
 // RuntimeEnv (call_config.h) is the cross-runtime ABI for per-ring config and
 // carries RUNTIME_ENV_RING_COUNT slots, shared with tensormap_and_ringbuffer.
 // host_build_graph keeps one task table and reads slot 0, so it only needs the ABI
@@ -1267,7 +1306,7 @@ bool create_scheduler_state(
     if (!scheduler_plan_layout(
             static_cast<uint64_t>(total_tasks), aic_task_count, aiv_task_count, &layout,
             api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
-            executable_subtask_count
+            executable_subtask_count, api->pmu_enabled()
         ) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) {
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
@@ -1376,6 +1415,7 @@ bool create_scheduler_state(
                                                                                 SCHEDULER_PENDING_SLOT_COUNT *
                                                                                 sizeof(DispatchPayload);
         context.trace_cells_offset = layout.trace_cells_offset;
+        context.pmu_cells_offset = layout.pmu_cells_offset;
         context.task_window_last_index = task_window_size - 1;
         context.graph_task_count = static_cast<uint64_t>(total_tasks);
         context.worker_index = static_cast<uint64_t>(i);

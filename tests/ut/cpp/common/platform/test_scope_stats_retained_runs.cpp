@@ -774,3 +774,300 @@ TEST(ScopeStatsRetainedRuns, AThrowingHandoffReturnsTheSlotAndTheBudget) {
     EXPECT_FALSE(fx.flush(&tail)) << "the earlier failures stay sticky";
     EXPECT_TRUE(fs::exists(fx.root.artifact("run-c")));
 }
+
+// ---------------------------------------------------------------------------
+// Per-run terminal banks, mapped
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/**
+ * A retained collector whose producer publishes its own per-run accounting.
+ *
+ * The bank address normally reaches the producer through the launching run's
+ * kernel arguments, which this collector does not own, so the fixture pushes it
+ * and calls the producer's own run entries — exactly where the runner will. The
+ * rest is production code: the collector reserves the bank at admission, the
+ * producer publishes into it, and the boundary settles it.
+ */
+struct MappedFixture : RetainedFixture {
+    scope_runs::CapacityMetadata capacities{
+        true, scope_runs::Capacities{{8, 16, 32, 64}, {5, 7, 9, 11}, {1025, 2049, 4097, 8193}, 17}
+    };
+    explicit MappedFixture(const char *name) :
+        RetainedFixture(name) {
+        EXPECT_TRUE(collector.open_run_terminal_banks(SCOPE_STATS_TERMINAL_PRODUCERS));
+        EXPECT_TRUE(collector.device_publishes_run_terminal());
+    }
+
+    ~MappedFixture() { set_platform_scope_stats_run_terminal(0); }
+
+    /**
+     * Admit a run and push the bank its admission reserved, which is what the
+     * host does at launch: the device is handed one resolved address per run,
+     * so a successor publishes into its own bank rather than deriving one.
+     */
+    bool begin(uint64_t epoch, const fs::path &prefix) {
+        collector.start(retained_thread_factory);
+        if (!collector.run_begin(epoch, prefix.string(), nullptr, &capacities)) return false;
+        const uint64_t bank = collector.run_terminal_bank_address(epoch);
+        EXPECT_NE(bank, 0u) << "an admitted run resolved no terminal bank";
+        set_platform_scope_stats_run_terminal(bank);
+        return true;
+    }
+
+    /** One run's device side, through the producer's own entries. */
+    void produce_run(uint64_t epoch, int pairs, bool flush_at_end, const char *site) {
+        set_platform_run_result(/*region_base=*/0, epoch);
+        scope_stats_aicpu_begin_run();
+        produce(epoch, pairs, flush_at_end, site);
+        scope_stats_aicpu_close_run();
+    }
+};
+
+}  // namespace
+
+TEST(ScopeStatsRunTerminal, AMappedRunIsSettledFromItsOwnProducerAccounting) {
+    MappedFixture fx("mapped-settled");
+    ASSERT_TRUE(fx.begin(7001, fx.root.prefix("run-a")));
+    fx.produce_run(7001, /*pairs=*/3, /*flush_at_end=*/true, "mapped.cpp");
+    ASSERT_TRUE(fx.wait_for_collected(6));
+    fx.close(7001);
+
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto stats = fx.collector.retained_run_stats_for_test();
+    EXPECT_EQ(stats.published, 1u) << "a run whose producer reported was not published";
+    EXPECT_EQ(stats.counts_unknown, 0u);
+    EXPECT_EQ(stats.quarantined, 0u);
+}
+
+TEST(ScopeStatsRunTerminal, AProducerThatNeverPublishedLeavesTheRunUnknown) {
+    MappedFixture fx("mapped-missing");
+    ASSERT_TRUE(fx.begin(7201, fx.root.prefix("run-a")));
+    // Records are produced and received, but the producer's close never runs —
+    // the shape of a run killed before its operator finished. The receipts
+    // alone must not be read as a complete run.
+    set_platform_run_result(0, 7201);
+    fx.produce(7201, /*pairs=*/2, /*flush_at_end=*/true, "mapped.cpp");
+    ASSERT_TRUE(fx.wait_for_collected(4));
+    fx.close(7201);
+
+    std::string error;
+    (void)fx.flush(&error);
+    const auto stats = fx.collector.retained_run_stats_for_test();
+    EXPECT_EQ(stats.counts_unknown, 1u) << "a run with no producer accounting was reported as counted";
+    EXPECT_EQ(stats.published, 0u);
+}
+
+TEST(ScopeStatsRunTerminal, AHeldBufferIsReportedByTheRunRatherThanRecoveredByTheHost) {
+    MappedFixture fx("mapped-held-buffer");
+    ASSERT_TRUE(fx.begin(7301, fx.root.prefix("run-a")));
+    // No flush: the producer still holds the records at close and reports them
+    // as live. The host must not read that buffer — a successor adopts it.
+    fx.produce_run(7301, /*pairs=*/2, /*flush_at_end=*/false, "mapped.cpp");
+    const uint64_t held = fx.state()->current_buf_ptr;
+    ASSERT_NE(held, 0u);
+    fx.close(7301);
+    EXPECT_EQ(fx.state()->current_buf_ptr, held) << "the producer's buffer was taken by the host";
+
+    std::string error;
+    (void)fx.flush(&error);
+    const auto stats = fx.collector.retained_run_stats_for_test();
+    EXPECT_EQ(stats.counts_unknown, 0u) << "a reported live buffer is a known loss, not an unknown one";
+    EXPECT_EQ(stats.partial, 1u);
+}
+
+TEST(ScopeStatsRunTerminal, TheSuccessorsProducerOwnsTheCarriedBuffer) {
+    MappedFixture fx("mapped-carried");
+    ASSERT_TRUE(fx.begin(7401, fx.root.prefix("run-a")));
+    fx.produce_run(7401, /*pairs=*/2, /*flush_at_end=*/false, "run-a.cpp");
+    const uint64_t carried = fx.state()->current_buf_ptr;
+    ASSERT_NE(carried, 0u);
+    ASSERT_EQ(reinterpret_cast<const ScopeStatsBuffer *>(carried)->count, 4u);
+    fx.close(7401);
+
+    // The successor's own device init re-stamps and empties it, with no host
+    // admission step in between.
+    ASSERT_TRUE(fx.begin(7402, fx.root.prefix("run-b")));
+    set_platform_run_result(0, 7402);
+    scope_stats_aicpu_begin_run();
+    const auto *buf = reinterpret_cast<const ScopeStatsBuffer *>(carried);
+    EXPECT_EQ(buf->count, 0u) << "run b would append behind run a's records";
+    EXPECT_EQ(buf->run_epoch, 7402u) << "run b's records would carry run a's identity";
+    scope_stats_aicpu_close_run();
+    fx.close(7402);
+
+    std::string error;
+    (void)fx.flush(&error);
+}
+
+TEST(ScopeStatsRunTerminal, ASecondAdmissionDoesNotEraseThePredecessorsRecords) {
+    MappedFixture fx("mapped-two-open");
+    // A is admitted and receiving. B is admitted before A seals, which is the
+    // whole point of joining a successor to a running predecessor: A's records
+    // and receipts are its own and must survive B's admission.
+    ASSERT_TRUE(fx.begin(7501, fx.root.prefix("run-a")));
+    fx.produce_run(7501, /*pairs=*/3, /*flush_at_end=*/true, "run-a.cpp");
+    ASSERT_TRUE(fx.wait_for_collected(6));
+
+    ASSERT_TRUE(fx.begin(7502, fx.root.prefix("run-b")));
+    fx.produce_run(7502, /*pairs=*/1, /*flush_at_end=*/true, "run-b.cpp");
+
+    // A seals after B was admitted and after B produced, and must still publish
+    // its own six records rather than an artifact B emptied.
+    fx.close(7501);
+    fx.close(7502);
+
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto stats = fx.collector.retained_run_stats_for_test();
+    EXPECT_EQ(stats.published, 2u) << "a run lost its records to its successor's admission";
+    EXPECT_EQ(stats.counts_unknown, 0u);
+    EXPECT_TRUE(fs::exists(fx.root.artifact("run-a")));
+    EXPECT_TRUE(fs::exists(fx.root.artifact("run-b")));
+}
+
+TEST(ScopeStatsRunTerminal, EachOpenRunKeepsItsOwnReceiptCount) {
+    MappedFixture fx("mapped-receipt-isolation");
+    ASSERT_TRUE(fx.begin(7601, fx.root.prefix("run-a")));
+    fx.produce_run(7601, /*pairs=*/2, /*flush_at_end=*/true, "run-a.cpp");
+    ASSERT_TRUE(fx.wait_for_collected(4));
+
+    // B's arrivals are routed by the identity its producer stamped, so they are
+    // counted against B even while A is still open. A's verdict therefore
+    // compares its own four records against its own terminal, not against the
+    // collector's running total.
+    ASSERT_TRUE(fx.begin(7602, fx.root.prefix("run-b")));
+    fx.produce_run(7602, /*pairs=*/5, /*flush_at_end=*/true, "run-b.cpp");
+    fx.close(7601);
+
+    std::string error;
+    (void)fx.flush(&error);
+    const auto stats = fx.collector.retained_run_stats_for_test();
+    EXPECT_EQ(stats.counts_unknown, 0u) << "a run's receipts were charged with another run's records";
+    fx.close(7602);
+    (void)fx.flush(&error);
+}
+
+TEST(ScopeStatsRunTerminal, RecordsNamingNoAdmittedRunAreReportedNotAbsorbed) {
+    MappedFixture fx("mapped-foreign-records");
+    ASSERT_TRUE(fx.begin(7701, fx.root.prefix("run-a")));
+    fx.produce_run(7701, /*pairs=*/1, /*flush_at_end=*/true, "run-a.cpp");
+    ASSERT_TRUE(fx.wait_for_collected(2));
+    fx.close(7701);
+
+    // Records stamped with a run this collector never admitted: they belong to
+    // no artifact, so they are neither added to an open run nor dropped in
+    // silence. Produced after the only admitted run has closed, which is the
+    // shape a late buffer takes.
+    set_platform_run_result(0, 7799);
+    scope_stats_aicpu_begin_run();
+    fx.produce(7799, /*pairs=*/2, /*flush_at_end=*/true, "stray.cpp");
+    scope_stats_aicpu_close_run();
+    ASSERT_TRUE(fx.wait_for_collected(6)) << "the stray records never reached the collector";
+
+    std::string error;
+    EXPECT_FALSE(fx.flush(&error)) << "a record naming no admitted run was absorbed silently";
+    EXPECT_NE(error.find("no admitted run"), std::string::npos) << "the loss was counted but not reported: " << error;
+    EXPECT_GT(fx.collector.retained_run_stats_for_test().host_failures, 0u);
+}
+
+TEST(ScopeStatsRunTerminal, RetainsCapacitiesAcrossSuccessorInitAndDelayedExport) {
+    MappedFixture fx("mapped-capacities");
+    fx.collector.pause_writer_for_test(true);
+    ASSERT_TRUE(fx.begin(7801, fx.root.prefix("run-a")));
+    fx.produce_run(7801, 2, true, "a.cpp");
+    ASSERT_TRUE(fx.wait_for_collected(4));
+
+    fx.capacities.values = scope_runs::Capacities{{16, 32, 64, 128}, {13, 15, 17, 19}, {2049, 4097, 8193, 16385}, 29};
+    ASSERT_TRUE(fx.begin(7802, fx.root.prefix("run-b")));
+    fx.produce_run(7802, 1, true, "b.cpp");
+    ASSERT_TRUE(fx.wait_for_collected(6));
+    for (int r = 0; r < SCOPE_STATS_MAX_RING_DEPTH; r++)
+        scope_stats_set_ring_capacity(r, 999, 999, 999);
+    scope_stats_set_tensormap_capacity(999);
+    fx.capacities.values.reset();
+    fx.close(7801);
+    fx.close(7802);
+    fx.collector.pause_writer_for_test(false);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto a = read_file(fx.root.artifact("run-a"));
+    const auto b = read_file(fx.root.artifact("run-b"));
+    EXPECT_NE(a.find("\"task_window_max\": [8, 16, 32, 64]"), std::string::npos);
+    EXPECT_NE(a.find("\"heap_max\": [1025, 2049, 4097, 8193]"), std::string::npos);
+    EXPECT_NE(a.find("\"dep_pool_max\": [5, 7, 9, 11]"), std::string::npos);
+    EXPECT_NE(a.find("\"tensormap_max\": 17"), std::string::npos);
+    EXPECT_NE(a.find("\"total\": 4"), std::string::npos);
+    EXPECT_NE(b.find("\"task_window_max\": [16, 32, 64, 128]"), std::string::npos);
+    EXPECT_NE(b.find("\"heap_max\": [2049, 4097, 8193, 16385]"), std::string::npos);
+    EXPECT_NE(b.find("\"dep_pool_max\": [13, 15, 17, 19]"), std::string::npos);
+    EXPECT_NE(b.find("\"tensormap_max\": 29"), std::string::npos);
+    EXPECT_NE(b.find("\"total\": 2"), std::string::npos);
+}
+
+TEST(ScopeStatsRunTerminal, EmptyCompletedRunKeepsBoundCapacities) {
+    MappedFixture fx("mapped-empty-capacities");
+    ASSERT_TRUE(fx.begin(7811, fx.root.prefix("run-a")));
+    fx.produce_run(7811, 0, true, "empty.cpp");
+    fx.close(7811);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    const auto json = read_file(fx.root.artifact("run-a"));
+    EXPECT_EQ(record_lines(json), 0u);
+    EXPECT_NE(json.find("\"total\": 0"), std::string::npos);
+    EXPECT_NE(json.find("\"task_window_max\": [8, 16, 32, 64]"), std::string::npos);
+    EXPECT_NE(json.find("\"heap_max\": [1025, 2049, 4097, 8193]"), std::string::npos);
+    EXPECT_NE(json.find("\"dep_pool_max\": [5, 7, 9, 11]"), std::string::npos);
+    EXPECT_NE(json.find("\"tensormap_max\": 17"), std::string::npos);
+}
+
+TEST(ScopeStatsRunTerminal, MissingCapacityRefusesBeforeTakingCreditAndRetryKeepsItsOwnValues) {
+    MappedFixture fx("mapped-missing-capacities");
+    ASSERT_TRUE(fx.begin(7821, fx.root.prefix("withdrawn")));
+    fx.collector.abandon_run(7821);
+    EXPECT_EQ(fx.collector.run_terminal_banks_in_use(), 0u);
+    const auto saved = fx.capacities;
+    fx.capacities.values.reset();
+    runs::AdmissionRefusal why = runs::AdmissionRefusal::None;
+    EXPECT_FALSE(fx.collector.run_begin(7821, fx.root.prefix("missing").string(), &why, &fx.capacities));
+    EXPECT_EQ(why, runs::AdmissionRefusal::Fatal);
+    EXPECT_FALSE(fx.collector.run_begin(7821, fx.root.prefix("missing").string(), &why));
+    EXPECT_EQ(fx.collector.run_terminal_banks_in_use(), 0u);
+    EXPECT_FALSE(fs::exists(fx.root.artifact("withdrawn")));
+    EXPECT_FALSE(fs::exists(fx.root.artifact("missing")));
+    fx.capacities = saved;
+    fx.capacities.values->tensormap = 31;
+    ASSERT_TRUE(fx.begin(7821, fx.root.prefix("retry")));
+    fx.produce_run(7821, 0, true, "empty.cpp");
+    fx.close(7821);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_NE(read_file(fx.root.artifact("retry")).find("\"tensormap_max\": 31"), std::string::npos);
+}
+
+TEST(ScopeStatsRunTerminal, CapacitySnapshotDoesNotAuthorizeAnUnprovedCompletion) {
+    MappedFixture fx("mapped-capacities-unproved");
+    ASSERT_TRUE(fx.begin(7831, fx.root.prefix("run-a")));
+    fx.produce_run(7831, 1, true, "unproved.cpp");
+    ASSERT_TRUE(fx.wait_for_collected(2));
+    fx.close(7831, false);
+    EXPECT_FALSE(fs::exists(fx.root.artifact("run-a")));
+    EXPECT_EQ(fx.collector.retained_run_stats_for_test().quarantined, 1u);
+    EXPECT_EQ(fx.collector.run_terminal_banks_in_use(), 1u);
+    fx.collector.discard_run_terminal_bank(7831);
+    EXPECT_EQ(fx.collector.run_terminal_banks_in_use(), 0u);
+    EXPECT_FALSE(fs::exists(fx.root.artifact("run-a")));
+}
+
+TEST(ScopeStatsRunTerminal, RuntimeWithoutRingCapacitiesKeepsItsExistingMetadata) {
+    MappedFixture fx("mapped-capacities-inapplicable");
+    fx.capacities = {false, std::nullopt};
+    ASSERT_TRUE(fx.begin(7841, fx.root.prefix("run-a")));
+    fx.produce_run(7841, 0, true, "empty.cpp");
+    fx.close(7841);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_NE(read_file(fx.root.artifact("run-a")).find("\"tensormap_max\": 0"), std::string::npos);
+}

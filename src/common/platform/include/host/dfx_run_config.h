@@ -18,6 +18,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "common/core_type.h"
 #include "host/pmu_collector.h"
+#include "host/scope_stats_capacity.h"
 #include "worker/runtime_c_api.h"
 
 /**
@@ -45,6 +46,7 @@ struct RunLocalDfxMetadata {
      * takes its own copy; nothing here outlives the call.
      */
     const NativeRunArtifactIdentity *artifact_identity{nullptr};
+    const simpler::dfx::scope_stats_runs::CapacityMetadata *scope_stats_capacity{nullptr};
 };
 
 /**

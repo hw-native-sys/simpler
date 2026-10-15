@@ -57,7 +57,7 @@
 class AicorePmuLease {
 public:
     /**
-     * @brief Outcome of the most recent acquire attempt.
+     * @brief Held ownership, or the outcome of an acquisition without an owner.
      *
      * `kAbsent` covers both a driver without the symbols and a build with no
      * driver at all; neither is a fault of the caller.
@@ -65,7 +65,7 @@ public:
     enum class State { kAbsent, kHeld, kOccupied, kRefused };
 
     AicorePmuLease() = default;
-    ~AicorePmuLease();
+    ~AicorePmuLease() noexcept;
 
     AicorePmuLease(const AicorePmuLease &) = delete;
     AicorePmuLease &operator=(const AicorePmuLease &) = delete;
@@ -100,8 +100,9 @@ public:
      * Stopping drains the channel once and reports a non-zero byte count at
      * WARN: at `cfgMode = 0` there is nothing to drain, so bytes here mean
      * that invariant no longer holds.
+     * Drain failures still attempt stop; cleanup does not propagate exceptions.
      */
-    void release(std::uint64_t run_epoch);
+    void release(std::uint64_t run_epoch) noexcept;
 
     State state() const;
 

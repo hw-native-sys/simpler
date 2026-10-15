@@ -39,6 +39,14 @@ repos:
           language_version: python3
           exclude: ^3rdparty/|vendor/
 
+        - id: check-producer-stop-proof
+          name: check-producer-stop-proof
+          entry: python tests/lint/check_producer_stop_proof.py
+          language: python
+          language_version: python3
+          pass_filenames: false
+          files: ^src/(a2a3|a5)/platform/(sim|onboard)/host/device_runner\.cpp$
+
         - id: check-kernel-wire-isolation
           name: check-kernel-wire-isolation
           entry: python tests/lint/check_kernel_wire_isolation.py

@@ -56,6 +56,20 @@ static int get_aicore_reg_info(std::vector<int64_t> &regs, int64_t device_id) {
     regs.resize(MAX_INDEX);
 
     // Map each AICore individually
+    //
+    // One mapping per AICore carries all three sub-cores' register blocks, and
+    // on this architecture the same table is the PMU table — `KernelArgs`
+    // publishes `pmu_reg_addrs = regs`. So the extent a sub-core's address
+    // addresses is its stride plus the furthest register either accessor
+    // reaches, which `reg_offset` puts at the a5 PMU stop-cycle pair.
+    // `halResMap` documents `len` as an `[out]` "resource addr len", so what it
+    // counts is the driver's to define: it is compared against this layout and
+    // reported, and nothing is gated on it.
+    constexpr uint64_t kBlockSpan = REG_MMIO_PMU_STOP_CYC1_OFFSET + sizeof(uint32_t);
+    constexpr uint64_t kAddressed = REG_AIV_SECOND_OFFSET + kBlockSpan;
+    static_assert(kAddressed <= REG_AICORE_MAP_SIZE, "the requested AICore mapping cannot hold three sub-core blocks");
+    uint32_t cores_below_addressed = 0;
+    uint32_t smallest_len = 0;
     for (uint32_t core_idx = 0; core_idx < DAV_3510::PLATFORM_MAX_PHYSICAL_CORES; core_idx++) {
         map_info.res_id = core_idx;
         uint64_t map_addr = 0;
@@ -66,6 +80,8 @@ static int get_aicore_reg_info(std::vector<int64_t> &regs, int64_t device_id) {
             LOG_ERROR("halResMap failed for core %u (rc=%d)", core_idx, ret);
             return ret;
         }
+        if (core_idx == 0 || len < smallest_len) smallest_len = len;
+        if (len < kAddressed) cores_below_addressed++;
 
         // Calculate die-based indices
         // DAV_3510 has 2 dies, each with 18 AICores
@@ -82,6 +98,22 @@ static int get_aicore_reg_info(std::vector<int64_t> &regs, int64_t device_id) {
         regs[aicore_index] = map_addr;
         regs[aiv_first_index] = map_addr + REG_AIV_FIRST_OFFSET;
         regs[aiv_second_index] = map_addr + REG_AIV_SECOND_OFFSET;
+    }
+
+    // One line per table build, which is once per device.
+    if (cores_below_addressed > 0) {
+        LOG_WARN(
+            "halResMap reports as little as 0x%x bytes per AICore where this layout addresses up to 0x%llx "
+            "(sub-core stride 0x%llx, block 0x%llx) on %u of %u cores; the reported length is the driver's to "
+            "define, so every address is published as before",
+            smallest_len, (unsigned long long)kAddressed, (unsigned long long)REG_AIV_FIRST_OFFSET,
+            (unsigned long long)kBlockSpan, cores_below_addressed, DAV_3510::PLATFORM_MAX_PHYSICAL_CORES
+        );
+    } else {
+        LOG_INFO(
+            "halResMap reports at least 0x%x bytes per AICore, covering the 0x%llx this layout addresses", smallest_len,
+            (unsigned long long)kAddressed
+        );
     }
 
     return 0;

@@ -96,5 +96,35 @@ void pmu_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int co
  * @param core_num          Entries in cur_thread_cores
  */
 void pmu_aicpu_finalize(const int *cur_thread_cores, int core_num);
+/**
+ * Name the bank array this collector's producers publish their per-run
+ * accounting into, and which bank belongs to the launching run.
+ *
+ * One producer per core, so the bank holds `PLATFORM_MAX_CORES` entries. A zero
+ * base is the default path: nothing is published, and the host owns the counter
+ * reset and reads the live counters as it does without retention.
+ */
+extern "C" void set_platform_pmu_run_terminal(uint64_t bank);
+
+/**
+ * Settle one core's accounting for this run into its terminal entry, after
+ * every path that can still change one of its counters.
+ *
+ * @param core_id Logical core index
+ */
+void pmu_aicpu_close_run(int core_id);
+
+/**
+ * Settle every core this thread owns, at the thread's own exit.
+ *
+ * Core ownership is a partition, so the thread retiring a core is the only one
+ * that settles it and no core is settled twice. Runs before the registers are
+ * restored and before the cores are retired: those are what stop the producer,
+ * and this reads the counters the producer wrote.
+ *
+ * @param core_ids This thread's cores
+ * @param core_num How many of them
+ */
+void pmu_aicpu_close_run_cores(const int32_t *core_ids, int32_t core_num);
 
 #endif  // PLATFORM_AICPU_PMU_COLLECTOR_AICPU_H_

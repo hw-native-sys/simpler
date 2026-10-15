@@ -42,6 +42,7 @@
 #include "host/dfx_run_config.h"
 #include "host/host_graph_runs.h"
 #include "host/raii_scope_guard.h"
+#include "host/run_boundary.h"
 #include "host/runtime_timeout_config.h"
 #include "runtime.h"
 
@@ -220,6 +221,22 @@ int DeviceRunner::ensure_binaries_loaded() {
             return PTO_RUNTIME_ERR_INTERNAL;
         if (!load_sym("set_platform_scope_stats_base", reinterpret_cast<void **>(&set_platform_scope_stats_base_func_)))
             return PTO_RUNTIME_ERR_INTERNAL;
+        if (!load_sym(
+                "set_platform_dump_args_run_terminal",
+                reinterpret_cast<void **>(&set_platform_dump_args_run_terminal_func_)
+            ))
+            return PTO_RUNTIME_ERR_INTERNAL;
+        if (!load_sym("set_platform_pmu_run_terminal", reinterpret_cast<void **>(&set_platform_pmu_run_terminal_func_)))
+            return PTO_RUNTIME_ERR_INTERNAL;
+        if (!load_sym(
+                "set_platform_dep_gen_run_terminal", reinterpret_cast<void **>(&set_platform_dep_gen_run_terminal_func_)
+            ))
+            return PTO_RUNTIME_ERR_INTERNAL;
+        if (!load_sym(
+                "set_platform_scope_stats_run_terminal",
+                reinterpret_cast<void **>(&set_platform_scope_stats_run_terminal_func_)
+            ))
+            return PTO_RUNTIME_ERR_INTERNAL;
 
         // Publish provisioned DMA workspace addresses into the resident AICPU SO.
         using SetDmaWorkspaceAddrFunc = void (*)(int, unsigned long long);
@@ -341,7 +358,9 @@ void DeviceRunner::configure_dep_gen_retention(bool enabled, std::size_t budget_
 
 bool DeviceRunner::dep_gen_retains_runs() const { return dep_gen_collector_.retains_runs(); }
 
-int DeviceRunner::admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch) {
+int DeviceRunner::admit_dep_gen_run(
+    const DfxRunConfig &dfx, uint64_t run_epoch, simpler::dfx::runs::AdmissionRefusal *why
+) {
     if (!dfx.dep_gen_enabled || dep_gen_host_graph_active()) return 0;
     if (!dep_gen_collector_.retains_runs()) {
         // Default path: the window is opened, then the threads that serve it
@@ -359,13 +378,41 @@ int DeviceRunner::admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch)
         return create_thread(std::move(fn));
     };
     dep_gen_collector_.start(thread_factory);
-    if (!dep_gen_collector_.run_begin(run_epoch, dfx.output_prefix)) {
+    if (!dep_gen_collector_.run_begin(run_epoch, dfx.output_prefix, why)) {
         LOG_ERROR(
             "dep_gen: run %llu was not admitted for retained collection", static_cast<unsigned long long>(run_epoch)
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     return 0;
+}
+
+bool DeviceRunner::dep_gen_can_admit_joined_run(uint64_t run_epoch) const {
+    // A host-orch runtime builds the graph on the host and has no device
+    // producer, so there is nothing for a successor to publish into.
+    if (dep_gen_host_graph_active()) return false;
+    if (!dep_gen_collector_.device_publishes_run_terminal()) return false;
+    if (!dep_gen_collector_.can_admit_retained_run()) return false;
+    return dep_gen_collector_.can_take_run_terminal_bank(run_epoch);
+}
+
+bool DeviceRunner::dep_gen_retained_runs_outstanding() const { return !dep_gen_collector_.retained_runs_idle(); }
+
+void DeviceRunner::install_dep_gen_credit_release_notifier(const std::function<void()> &notify) {
+    dep_gen_collector_.set_credit_release_notifier(notify);
+}
+
+int DeviceRunner::open_dep_gen_run_terminal_banks(const DfxRunConfig &dfx) {
+    if (!dfx.dep_gen_enabled || dep_gen_host_graph_active()) return 0;
+    if (!dep_gen_collector_.retains_runs() || dep_gen_collector_.device_publishes_run_terminal()) return 0;
+    if (dep_gen_collector_.open_run_terminal_banks(DEP_GEN_TERMINAL_PRODUCERS)) return 0;
+    LOG_ERROR("DepGen: per-run terminal backing could not be initialized");
+    return PTO_RUNTIME_ERR_INTERNAL;
+}
+
+uint64_t DeviceRunner::dep_gen_run_terminal_bank(uint64_t run_epoch) const {
+    if (dep_gen_host_graph_active()) return 0;
+    return dep_gen_collector_.run_terminal_bank_address(run_epoch);
 }
 
 void DeviceRunner::withdraw_dep_gen_run(uint64_t run_epoch) noexcept {
@@ -502,7 +549,9 @@ int DeviceRunner::prepare_execution(
         set_platform_scope_stats_base_func_ == nullptr || set_platform_chip_swimlane_base_func_ == nullptr ||
         set_platform_chip_swimlane_run_terminal_bank_func_ == nullptr ||
         set_platform_chip_swimlane_aicore_rotation_table_func_ == nullptr ||
-        set_chip_swimlane_enabled_func_ == nullptr) {
+        set_chip_swimlane_enabled_func_ == nullptr || set_platform_dump_args_run_terminal_func_ == nullptr ||
+        set_platform_pmu_run_terminal_func_ == nullptr || set_platform_dep_gen_run_terminal_func_ == nullptr ||
+        set_platform_scope_stats_run_terminal_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -567,20 +616,47 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                 }
                 const RunLocalDfxMetadata run_metadata{
                     core_types.empty() ? nullptr : core_types.data(), static_cast<int>(core_types.size()),
-                    host_orchestrated_for_slot(prepared.pipeline_slot), &prepared.artifact_identity
+                    host_orchestrated_for_slot(prepared.pipeline_slot), &prepared.artifact_identity,
+                    &prepared.scope_stats_capacity
                 };
-                if (int collect_rc =
-                        start_shared_collectors_for_run(prepared.dfx, prepared.identity.run_epoch, run_metadata);
+                // One all-or-nothing admission across every enabled owner.
+                // A capacity shortage is reported as its own code and nothing
+                // is submitted, so the caller parks on the credit signal and
+                // re-attempts rather than failing a run whose slots are merely
+                // in use; any other refusal is this run's failure.
+                DiagnosticAdmission admission;
+                if (int collect_rc = start_shared_collectors_for_run(
+                        prepared.dfx, prepared.identity.run_epoch, run_metadata, &admission
+                    );
                     collect_rc != 0) {
-                    return collect_rc;
+                    return admission.refusal == simpler::dfx::runs::AdmissionRefusal::Capacity ?
+                               SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
+                               collect_rc;
                 }
-                // Admission before any submission. A refusal gives back what the
-                // collectors above already admitted, or their export slots stay held
-                // by a run that never reaches a boundary.
-                if (int dep_rc = admit_dep_gen_run(prepared.dfx, prepared.identity.run_epoch); dep_rc != 0) {
-                    withdraw_unlaunched_collectors_for_run(prepared.dfx, prepared.identity.run_epoch);
-                    return dep_rc;
+                // dep_gen admits last and rolls the others back itself, for the
+                // same reason: an export slot held by a run that never reaches
+                // a boundary is never given back. Through the same undo the
+                // all-or-nothing guard takes, so a decline here neither wakes its
+                // own retry nor hides a withdrawal that restored nothing.
+                simpler::dfx::runs::AdmissionRefusal dep_why = simpler::dfx::runs::AdmissionRefusal::None;
+                if (int dep_rc = admit_dep_gen_run(prepared.dfx, prepared.identity.run_epoch, &dep_why); dep_rc != 0) {
+                    undo_admission_attempt(prepared.dfx, prepared.identity.run_epoch);
+                    return dep_why == simpler::dfx::runs::AdmissionRefusal::Capacity ?
+                               SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
+                               dep_rc;
                 }
+                // Every owner has now admitted this run, so each one's bank is
+                // reserved and its address is resolvable. Resolved and pushed
+                // here rather than during arming because dep_gen admits last,
+                // and a run whose arming resolved an address it was later
+                // refused would hand the device a bank it does not hold. All
+                // four are pushed including the zeroes, so a successor never
+                // inherits its predecessor's address from resident state.
+                resolve_run_terminal_banks(prepared.dfx, prepared.identity.run_epoch, kernel_args_);
+                set_platform_dump_args_run_terminal_func_(kernel_args_.args_dump_run_terminal_bank);
+                set_platform_pmu_run_terminal_func_(kernel_args_.pmu_run_terminal_bank);
+                set_platform_dep_gen_run_terminal_func_(kernel_args_.dep_gen_run_terminal_bank);
+                set_platform_scope_stats_run_terminal_func_(kernel_args_.scope_stats_run_terminal_bank);
 
                 if (kernel_args_.device_wall_data_base != 0) {
                     *reinterpret_cast<uint64_t *>(kernel_args_.device_wall_data_base) = 0;
@@ -660,7 +736,14 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     auto run_cleanup = RAIIScopeGuard([this]() {
         cleanup_active_run();
     });
-    active_run_->join();
+    // The simulated device stopping. Each of these threads calls its execute
+    // function synchronously in its own body, so none outlives this join and no
+    // producer can still be recording after it — which is the whole of what the
+    // settlements below act on, and why the join is taken through the seam that
+    // holds it rather than beside one.
+    stop_run_producers(active.prepared->identity.run_epoch, [this]() {
+        active_run_->join();
+    });
     LOG_INFO("All threads completed");
 
     // Snapshot the device_wall buffer into device_wall_ns_.
@@ -722,14 +805,17 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         // is what a withdrawal is for.
         // The runtime error that brought this path here stays authoritative, so
         // a diagnostics ownership failure only logs on it.
-        const int error_teardown_rc = teardown_shared_collectors_after_run(
+        const int error_teardown_rc = settle_run_after_producer_stop(
             dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch,
-            /*device_execution_complete=*/false, /*device_producers_stopped=*/true
+            /*device_execution_complete=*/false
         );
         if (error_teardown_rc != 0) {
             LOG_ERROR("Diagnostics teardown reported %d on the error path; the run error is kept", error_teardown_rc);
         }
-        emit_device_dep_gen_graph(dfx, active.prepared->identity.run_epoch, false);
+        emit_device_dep_gen_graph(
+            dfx, active.prepared->identity.run_epoch, /*device_execution_complete=*/false,
+            /*device_producers_stopped=*/true
+        );
         return DrainOutcome::device_error(runtime_rc);
     }
 
@@ -737,11 +823,12 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
     // collected content fails the run: the claim is released here, and a caller
     // told the run succeeded would read files whose completeness nothing
     // established.
-    const int teardown_rc = teardown_shared_collectors_after_run(
-        dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch,
-        /*device_execution_complete=*/true, /*device_producers_stopped=*/true
+    const int teardown_rc = settle_run_after_producer_stop(
+        dfx, active.prepared->pipeline_slot, active.prepared->identity.run_epoch, /*device_execution_complete=*/true
     );
-    emit_device_dep_gen_graph(dfx, active.prepared->identity.run_epoch, true);
+    emit_device_dep_gen_graph(
+        dfx, active.prepared->identity.run_epoch, /*device_execution_complete=*/true, /*device_producers_stopped=*/true
+    );
 
     print_handshake_results();
 
@@ -762,7 +849,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
 }
 
 void DeviceRunner::emit_device_dep_gen_graph(
-    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
     // The host-orch shape emits at the end of bind instead, where its capture
     // window closes — see `emit_host_dep_gen_graph` in c_api_shared.cpp.
@@ -773,6 +860,9 @@ void DeviceRunner::emit_device_dep_gen_graph(
         // the writer. It is the whole of this run's emission — the default
         // body below must not also run.
         dep_gen_collector_.run_close(run_epoch, device_execution_complete);
+        simpler::dfx::runs::settle_failed_run_terminal_bank(
+            dep_gen_collector_, run_epoch, device_execution_complete, device_producers_stopped
+        );
         return;
     }
     dep_gen_collector_.quiesce();
@@ -835,6 +925,10 @@ void DeviceRunner::unload_executor_binaries() {
         set_dep_gen_enabled_func_ = nullptr;
         set_scope_stats_enabled_func_ = nullptr;
         set_platform_scope_stats_base_func_ = nullptr;
+        set_platform_dump_args_run_terminal_func_ = nullptr;
+        set_platform_pmu_run_terminal_func_ = nullptr;
+        set_platform_dep_gen_run_terminal_func_ = nullptr;
+        set_platform_scope_stats_run_terminal_func_ = nullptr;
         aicpu_so_loaded_ = false;
     }
     if (!aicpu_so_path_.empty()) {
@@ -863,6 +957,11 @@ int DeviceRunner::finalize() {
     // resources are released — including for a runner that only ever initialized
     // them and never enqueued.
     const int collector_rc = finalize_collectors();
+    // A failed terminal release still owns memory in this allocator/context.
+    // Preserve both for a later close, before any allocator sweep or reset.
+    if (terminal_backing_retained()) {
+        return collector_rc;
+    }
 
     release_callable_state();
 
@@ -924,6 +1023,7 @@ int DeviceRunner::finalize() {
 // =============================================================================
 
 int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared) {
+    if (terminal_backing_retained()) return PTO_RUNTIME_ERR_INTERNAL;
     const DfxRunConfig &dfx = prepared.dfx;
     const int num_aicore = prepared.num_aicore;
     const int launch_aicpu_num = prepared.launch_aicpu_num;
@@ -935,9 +1035,23 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     // doing this under the execution claim is what keeps the release off a live
     // predecessor's pools.
     if (collector_shape_is_stale(num_aicore, aicpu_thread_num, launch_aicpu_num)) {
+        // Holding the execution claim says no run is *executing*; it does not
+        // say no writer is *reading*. A retained predecessor's writer outlives
+        // that run's native retirement by design, and the release below frees
+        // the pools it is reading — so a rebuild waits for those writers
+        // instead, reported as a capacity block and bounded by this run's own
+        // admission deadline. The joined gate declines a stale shape outright;
+        // this is the ordinary front, which that gate never sees.
+        if (retained_consumers_outstanding()) {
+            LOG_INFO(
+                "Collector rebuild: deferring, a retained run's writer still holds the pools this shape would release"
+            );
+            return SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+        }
         // A rebuild's own release can report a diagnostics failure; it is
         // sticky in the collector's summary, so the next flush reports it.
         const int rebuild_rc = finalize_collectors();
+        if (terminal_backing_retained()) return rebuild_rc;
         if (rebuild_rc != 0) {
             LOG_ERROR("Collector rebuild: diagnostics collectors reported %d while being released", rebuild_rc);
         }
@@ -1013,6 +1127,12 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
 
     // Built here rather than during preparation because the dep_gen bit depends
     // on the same host-orch check the init above makes.
+    // Each enabled owner's bank array, mapped once and skipped afterwards.
+    // After the inits above, which is what creates the allocator and the
+    // producer counts the arrays are dimensioned by, and before the launch
+    // that first needs an address out of one.
+    if (int terminal_rc = open_run_terminal_banks_for_enabled_owners(dfx); terminal_rc != 0) return terminal_rc;
+
     uint32_t enable_profiling_flag = SIMPLER_DFX_FLAG_NONE;
     if (dfx.dump_args_enabled()) {
         SIMPLER_SET_DFX_FLAG(enable_profiling_flag, SIMPLER_DFX_FLAG_DUMP_ARGS);
@@ -1130,6 +1250,11 @@ int DeviceRunner::init_scope_stats(int num_threads) {
     return 0;
 }
 
+bool DeviceRunner::terminal_backing_retained() const {
+    return dump_collector_.terminal_backing_retained() || pmu_collector_.terminal_backing_retained() ||
+           dep_gen_collector_.terminal_backing_retained() || scope_stats_collector_.terminal_backing_retained();
+}
+
 int DeviceRunner::finalize_collectors() {
     clear_collector_shape();
     auto free_cb = [this](void *dev_ptr) -> int {
@@ -1156,5 +1281,6 @@ int DeviceRunner::finalize_collectors() {
         scope_stats_collector_.finalize(nullptr, free_cb);
         kernel_args_.scope_stats_data_base = 0;
     }
+    if (terminal_backing_retained() && rc == 0) rc = PTO_RUNTIME_ERR_INTERNAL;
     return rc;
 }

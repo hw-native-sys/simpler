@@ -31,10 +31,32 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include "common/acl_hal_device.h"
+
+namespace drain_allocation_fault {
+thread_local bool armed = false;
+thread_local bool fired = false;
+}  // namespace drain_allocation_fault
+
+void *operator new(std::size_t size) {
+    if (drain_allocation_fault::armed) {
+        drain_allocation_fault::armed = false;
+        drain_allocation_fault::fired = true;
+        throw std::bad_alloc();
+    }
+    if (void *p = std::malloc(size == 0 ? 1 : size)) return p;
+    throw std::bad_alloc();
+}
+void *operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void *p) noexcept { std::free(p); }
+void operator delete[](void *p) noexcept { std::free(p); }
+void operator delete(void *p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void *p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -44,11 +66,21 @@ struct ProfCalls {
     std::vector<unsigned int> started;
     std::vector<unsigned int> stopped;
     int start_rc = 0;
+    int flush_rc = 0;
+    int read_rc = 0;
+    bool fail_drain_allocation = false;
+    bool throw_on_read = false;
 
     void reset() {
         started.clear();
         stopped.clear();
         start_rc = 0;
+        flush_rc = 0;
+        read_rc = 0;
+        fail_drain_allocation = false;
+        throw_on_read = false;
+        drain_allocation_fault::armed = false;
+        drain_allocation_fault::fired = false;
     }
 };
 
@@ -81,7 +113,8 @@ int halProfDataFlush(unsigned int device_id, unsigned int channel_id, unsigned i
     (void)device_id;
     (void)channel_id;
     if (data_len != nullptr) *data_len = 0;
-    return 0;
+    drain_allocation_fault::armed = calls().fail_drain_allocation;
+    return calls().flush_rc;
 }
 
 int prof_channel_read(unsigned int device_id, unsigned int channel_id, char *out_buf, unsigned int buf_size) {
@@ -89,7 +122,8 @@ int prof_channel_read(unsigned int device_id, unsigned int channel_id, char *out
     (void)channel_id;
     (void)out_buf;
     (void)buf_size;
-    return 0;
+    if (calls().throw_on_read) throw std::runtime_error("injected drain read failure");
+    return calls().read_rc;
 }
 
 }  // extern "C"
@@ -242,6 +276,82 @@ TEST(AicorePmuLeaseTest, NegativeDeviceIsRefusedWithoutCallingTheDriver) {
     EXPECT_FALSE(lease.acquire(-1, 1));
     EXPECT_TRUE(calls().started.empty());
     EXPECT_TRUE(lease.state() == AicorePmuLease::State::kRefused);
+}
+
+TEST(AicorePmuLeaseTest, DrainAllocationFailureStillStopsAtBoundary) {
+    EXPECT_EXIT(
+        {
+            calls().reset();
+            AicorePmuLease lease;
+            if (!lease.acquire(kDevice, 1)) std::_Exit(2);
+            const auto device = calls().started.front();
+            calls().fail_drain_allocation = true;
+            {
+                struct LeaseRelease {
+                    AicorePmuLease &lease;
+                    ~LeaseRelease() { lease.release(1); }
+                } release{lease};
+            }
+            const bool stopped = calls().stopped.size() == 1 && calls().stopped.front() == device;
+            std::_Exit(drain_allocation_fault::fired && stopped && !lease.held() ? 0 : 3);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+
+TEST(AicorePmuLeaseTest, DrainExceptionStillStops) {
+    calls().reset();
+    {
+        AicorePmuLease lease;
+        ASSERT_TRUE(lease.acquire(kDevice, 1));
+        calls().throw_on_read = true;
+        EXPECT_NO_THROW(lease.release(1));
+        ASSERT_EQ(calls().stopped.size(), 1U);
+        EXPECT_EQ(calls().stopped.front(), calls().started.front());
+        EXPECT_FALSE(lease.held());
+        lease.release(1);
+    }
+    EXPECT_EQ(calls().stopped.size(), 1U);
+}
+
+TEST(AicorePmuLeaseTest, DrainRefusalStillStops) {
+    calls().reset();
+    AicorePmuLease lease;
+    ASSERT_TRUE(lease.acquire(kDevice, 1));
+    calls().flush_rc = -7;
+    calls().read_rc = -8;
+    EXPECT_NO_THROW(lease.release(1));
+    ASSERT_EQ(calls().stopped.size(), 1U);
+    EXPECT_EQ(calls().stopped.front(), calls().started.front());
+    EXPECT_FALSE(lease.held());
+}
+
+TEST(AicorePmuLeaseTest, InvalidDevicePreservesHeldEpochs) {
+    calls().reset();
+    AicorePmuLease lease;
+    ASSERT_TRUE(lease.acquire(kDevice, 1));
+    ASSERT_TRUE(lease.acquire(kDevice, 2));
+    EXPECT_FALSE(lease.acquire(-1, 3));
+    EXPECT_TRUE(lease.held());
+    EXPECT_TRUE(lease.why().empty());
+    lease.release(3);
+    lease.release(1);
+    EXPECT_TRUE(lease.held());
+    EXPECT_TRUE(calls().stopped.empty());
+    lease.release(2);
+    ASSERT_EQ(calls().stopped.size(), 1U);
+    EXPECT_EQ(calls().stopped.front(), calls().started.front());
+}
+
+TEST(AicorePmuLeaseTest, DestructorStopsAfterInvalidAcquire) {
+    calls().reset();
+    {
+        AicorePmuLease lease;
+        ASSERT_TRUE(lease.acquire(kDevice, 1));
+        EXPECT_FALSE(lease.acquire(-1, 2));
+    }
+    ASSERT_EQ(calls().stopped.size(), 1U);
+    EXPECT_EQ(calls().stopped.front(), calls().started.front());
 }
 
 }  // namespace

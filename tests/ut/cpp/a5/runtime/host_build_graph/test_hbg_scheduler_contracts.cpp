@@ -23,6 +23,7 @@
 #include "host_build_graph/runtime_types.h"
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
+#include "scheduler_ready_watchdog.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_ssbuf.h"
 #include "scheduler/scheduler_topology.h"
@@ -82,6 +83,211 @@ TEST(AicoreSchedulerWatchdog, UsesElapsedWallClockBudget) {
     EXPECT_FALSE(scheduler_watchdog_expired(100, 199, 100));
     EXPECT_TRUE(scheduler_watchdog_expired(100, 200, 100));
     EXPECT_TRUE(scheduler_watchdog_expired(UINT64_MAX - 10, 4, 15));
+}
+
+TEST(AicpuReadyWatchdog, RealProgressAllowsTotalExecutionBeyondBudget) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(0);
+    uint64_t now = 0;
+    int advances = 0;
+    EXPECT_TRUE(watchdog.wait_until_ready(
+        [&] {
+            return advances == 4;
+        },
+        [&] {
+            return now;
+        },
+        [&] {
+            now += 90;
+            watchdog.record_progress(now);
+            ++advances;
+        },
+        100
+    ));
+    EXPECT_EQ(now, 360u);
+    EXPECT_TRUE(scheduler_watchdog_expired(0, now, 100));
+}
+
+TEST(AicpuReadyWatchdog, UnchangedProgressExpiresAtOriginalBoundary) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(100);
+    uint64_t now = 100;
+    int polls = 0;
+    EXPECT_FALSE(watchdog.wait_until_ready(
+        [] {
+            return false;
+        },
+        [&] {
+            return now;
+        },
+        [&] {
+            now += 25;
+            ++polls;
+        },
+        100
+    ));
+    EXPECT_EQ(now, 200u);
+    EXPECT_EQ(polls, 4);
+    EXPECT_EQ(watchdog.last_progress(), 100u);
+}
+
+TEST(AicpuReadyWatchdog, SupervisorNeverStartsRemainsBounded) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(100);
+    EXPECT_FALSE(watchdog.wait_until_ready(
+        [] {
+            return false;
+        },
+        [] {
+            return 200u;
+        },
+        [] {
+            ADD_FAILURE() << "expired wait must not spin";
+        },
+        100
+    ));
+}
+
+TEST(AicpuReadyWatchdog, SupervisorLossAfterProgressRemainsBounded) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(100);
+    watchdog.record_progress(150);
+    uint64_t now = 200;
+    int unrelated_activity = 0;
+    EXPECT_FALSE(watchdog.wait_until_ready(
+        [] {
+            return false;
+        },
+        [&] {
+            return now;
+        },
+        [&] {
+            ++unrelated_activity;
+            now += 25;
+        },
+        100
+    ));
+    EXPECT_EQ(now, 250u);
+    EXPECT_EQ(unrelated_activity, 2);
+    EXPECT_EQ(watchdog.last_progress(), 150u);
+}
+
+TEST(AicpuReadyWatchdog, ReadyWinsBeforeClockAndAtExpiryRecheck) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(100);
+    EXPECT_TRUE(watchdog.wait_until_ready(
+        [] {
+            return true;
+        },
+        [] {
+            ADD_FAILURE() << "ready wait must not sample the clock";
+            return 0u;
+        },
+        [] {
+            ADD_FAILURE() << "ready wait must not spin";
+        },
+        100
+    ));
+    bool ready = false;
+    EXPECT_TRUE(watchdog.wait_until_ready(
+        [&] {
+            return ready;
+        },
+        [&] {
+            ready = true;
+            return 200u;
+        },
+        [] {
+            ADD_FAILURE() << "ready publication must win expiry";
+        },
+        100
+    ));
+}
+
+TEST(AicpuReadyWatchdog, RefreshDuringExpiryUsesNewClockSample) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(100);
+    int samples = 0;
+    bool ready = false;
+    EXPECT_TRUE(watchdog.wait_until_ready(
+        [&] {
+            return ready;
+        },
+        [&] {
+            if (++samples == 1) {
+                watchdog.record_progress(205);
+                return 200u;
+            }
+            return 206u;
+        },
+        [&] {
+            if (samples == 2) ready = true;
+        },
+        100
+    ));
+    EXPECT_EQ(samples, 2);
+}
+
+TEST(AicpuReadyWatchdog, InvocationResetDropsPriorProgress) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(100);
+    watchdog.record_progress(900);
+    watchdog.reset();
+    EXPECT_EQ(watchdog.last_progress(), 0u);
+    watchdog.reset(1000);
+    uint64_t now = 1099;
+    EXPECT_FALSE(watchdog.wait_until_ready(
+        [] {
+            return false;
+        },
+        [&] {
+            return now;
+        },
+        [&] {
+            ++now;
+        },
+        100
+    ));
+    EXPECT_EQ(now, 1100u);
+}
+
+TEST(AicpuReadyWatchdog, SignalingBarrierKeepsFixedBudget) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(100);
+    const uint64_t signaling_start = 100;
+    watchdog.record_progress(199);
+    EXPECT_TRUE(scheduler_watchdog_expired(signaling_start, 200, 100));
+    EXPECT_FALSE(scheduler_watchdog_expired(watchdog.last_progress(), 200, 100));
+}
+
+TEST(AicpuReadyWatchdog, WrapAndDisabledBudgetMatchElapsedWatchdog) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(UINT64_MAX - 10);
+    EXPECT_FALSE(watchdog.wait_until_ready(
+        [] {
+            return false;
+        },
+        [] {
+            return 4u;
+        },
+        [] {
+            ADD_FAILURE() << "wrapped deadline expired";
+        },
+        15
+    ));
+    bool ready = false;
+    EXPECT_TRUE(watchdog.wait_until_ready(
+        [&] {
+            return ready;
+        },
+        [] {
+            return UINT64_MAX;
+        },
+        [&] {
+            ready = true;
+        },
+        0
+    ));
 }
 
 using scheduler_test::SchedulerStateBuffer;
