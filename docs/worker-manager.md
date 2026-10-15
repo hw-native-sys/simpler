@@ -381,11 +381,12 @@ The C++ `MAILBOX_FRAME_SIZE`, `MAILBOX_RUN_ENTRY_STRIDE` and
 `MAILBOX_RUN_ENTRY_TABLE_OFFSET` constants and the `mailbox_size(granted_sets)`
 and `mailbox_run_entry_count(granted_sets)` functions are exported through the
 nanobind module, so both ends derive the region's shape from one place.
-`mailbox_size` takes and returns `size_t` and refuses a grant past
-`MAILBOX_MAX_GRANTED_SETS` — a 1 TiB cap on the entry table, which is a policy
-bound rather than an arithmetic one, since every `uint32_t` grant is
-representable in a 64-bit `size_t`. Registration applies the same cap, so the
-facade cannot size a region for a grant the registration will reject.
+`mailbox_size` takes and returns `size_t` and refuses a grant outside the
+admitted range `[1, MAILBOX_MAX_GRANTED_SETS]`, whose upper end is a 1 TiB cap on
+the entry table. Larger grants are rejected by this conservative sizing policy;
+their computed size is still representable in a 64-bit `size_t`. Registration
+applies the same cap, so the facade cannot size a region for a grant the
+registration will reject.
 (`MAILBOX_SIZE` is still exported as the size a caller gets when it does not size
 the region itself, which in practice is a fixture standing in for the facade.)
 Python derives frame slicing and offsets from those bindings where possible. `MAILBOX_ARGS_CAPACITY` ends before the teardown

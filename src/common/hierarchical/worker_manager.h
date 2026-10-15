@@ -197,13 +197,9 @@ constexpr size_t mailbox_size(size_t granted_sets) {
 /**
  * The largest grant a mailbox may be sized for: a 1 TiB entry table.
  *
- * A policy cap, not an arithmetic one. `granted_sets` is a `uint32_t` at every
- * registration, and `MAILBOX_RUN_ENTRY_TABLE_OFFSET + MAILBOX_RUN_ENTRY_STRIDE *
- * (grant + MAILBOX_REQUEST_FRAMES)` is representable in a 64-bit `size_t` for
- * every value of it, so nothing above this cap would wrap — it would merely ask
- * for a region no host can map. The cap is where that is refused by a number
- * instead of by an allocator, and the Python binding has applied this same one
- * since the grant became caller-chosen.
+ * Larger grants are rejected by this conservative sizing policy; their computed
+ * size is still representable in a 64-bit `size_t`. The Python binding has
+ * applied the same cap since the grant became caller-chosen.
  */
 static constexpr uint64_t MAILBOX_MAX_GRANTED_SETS =
     (static_cast<uint64_t>(1) << 40) / static_cast<uint64_t>(MAILBOX_RUN_ENTRY_STRIDE);

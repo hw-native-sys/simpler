@@ -981,8 +981,8 @@ inline void bind_worker(nb::module_ &m) {
             const uint64_t bytes = static_cast<uint64_t>(mailbox_size_for_grant(granted_sets));
             if (bytes == 0) {
                 throw std::invalid_argument(
-                    "mailbox_size: a grant of " + std::to_string(granted_sets) + " run-resource sets exceeds the " +
-                    std::to_string(MAILBOX_MAX_GRANTED_SETS) + " a mailbox may be sized for"
+                    "mailbox_size: a run-resource grant of " + std::to_string(granted_sets) +
+                    " is outside the admitted range [1, " + std::to_string(MAILBOX_MAX_GRANTED_SETS) + "]"
                 );
             }
             return bytes;
@@ -991,7 +991,7 @@ inline void bind_worker(nb::module_ &m) {
         "Bytes one endpoint's mailbox occupies for this grant: one control frame, the request "
         "frames, and one run-state entry per run it may hold plus the hand-offs in flight. The "
         "facade that creates the shared-memory region sizes it through this, so both ends derive "
-        "the size from the same place. A grant past the admitted maximum is refused rather than "
+        "the size from the same place. A grant outside the admitted range is refused rather than "
         "sized."
     );
     m.attr("MAILBOX_FRAME_SIZE") = static_cast<int>(MAILBOX_FRAME_SIZE);

@@ -248,8 +248,8 @@ void validate_mailbox_region(const char *who, const void *mailbox, size_t mailbo
     const size_t required = mailbox_size_for_grant(granted_sets);
     if (required == 0) {
         throw std::invalid_argument(
-            context + ": a grant of " + std::to_string(granted_sets) + " run-resource sets exceeds the " +
-            std::to_string(MAILBOX_MAX_GRANTED_SETS) + " a mailbox may be sized for"
+            context + ": a run-resource grant of " + std::to_string(granted_sets) +
+            " is outside the admitted range [1, " + std::to_string(MAILBOX_MAX_GRANTED_SETS) + "]"
         );
     }
     if (mailbox_bytes < required) {

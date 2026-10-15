@@ -84,12 +84,11 @@ TEST(MailboxRegistration, TheExactRegionAGrantNeedsIsAcceptedAndOnlyTheTableIsCl
 }
 
 TEST(MailboxRegistration, AGrantAboveTheSizingCapIsRefusedWhateverExtentIsClaimed) {
-    // Above `MAILBOX_MAX_GRANTED_SETS`, which is a policy cap on how large a
-    // mailbox may be asked for — a 1 TiB entry table — and not an arithmetic
-    // limit: this grant and the ~1.15 TB table it implies are both representable
-    // here, they are simply not mappable. Refusing it on the grant rather than
-    // on the extent is the point, which is why the extent claimed is the largest
-    // there is.
+    // Above `MAILBOX_MAX_GRANTED_SETS`. Larger grants are rejected by this
+    // conservative sizing policy; their computed size is still representable in
+    // a 64-bit `size_t`. Refusing this one on the grant rather than on the
+    // extent is the point, which is why the extent claimed is the largest there
+    // is.
     constexpr uint32_t kAboveSizingCap = 3'000'000'000u;
     static_assert(static_cast<uint64_t>(kAboveSizingCap) > MAILBOX_MAX_GRANTED_SETS, "pick a grant past the cap");
     std::vector<char> region = canary_region(mailbox_size(1));
