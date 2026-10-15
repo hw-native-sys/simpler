@@ -15,9 +15,10 @@
  * Compiled into the same _task_interface extension module as task_interface.cpp.
  * Call bind_worker(m) from the NB_MODULE definition in task_interface.cpp.
  *
- * Python callers register sub-workers via `add_next_level_worker(mailbox_ptr)`
- * / `add_sub_worker(mailbox_ptr)`. Each mailbox addresses a `mailbox_size(granted_sets)`-byte
- * MAP_SHARED region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
+ * Python callers register sub-workers via `add_next_level_worker(mailbox_ptr, mailbox_bytes)`
+ * / `add_sub_worker(mailbox_ptr, mailbox_bytes)`. Each registration carries the byte extent of
+ * the MAP_SHARED region it names, which is checked against the grant's
+ * `mailbox_size(granted_sets)`; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
  * callable for SUB) lives in a forked Python child consuming the mailbox via
  * `_chip_process_loop` / `_sub_worker_loop`.
  */
@@ -457,22 +458,30 @@ inline void bind_worker(nb::module_ &m) {
 
         .def(
             "add_next_level_worker",
-            [](Worker &self, uint64_t mailbox_ptr, int child_pid, uint32_t granted_sets) {
-                self.add_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr), child_pid, granted_sets);
+            [](Worker &self, uint64_t mailbox_ptr, uint64_t mailbox_bytes, int child_pid, uint32_t granted_sets) {
+                self.add_worker(
+                    WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr), static_cast<size_t>(mailbox_bytes),
+                    child_pid, granted_sets
+                );
             },
-            nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1, nb::arg("granted_sets") = 1,
-            "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a "
-            "`mailbox_size(granted_sets)`-byte MAP_SHARED region; the child process loop is "
+            nb::arg("mailbox_ptr"), nb::arg("mailbox_bytes"), nb::arg("child_pid") = -1, nb::arg("granted_sets") = 1,
+            "Add a NEXT_LEVEL sub-worker. `mailbox_ptr` is the address of a MAP_SHARED region and "
+            "`mailbox_bytes` is how much of it the caller mapped, which must cover "
+            "`mailbox_size(granted_sets)`; the child process loop is "
             "Python-managed (fork + _chip_process_loop). `child_pid` is that "
             "forked child, used to detect an exit before mailbox completion."
         )
         .def(
             "add_next_level_worker_at",
-            [](Worker &self, int32_t worker_id, uint64_t mailbox_ptr, int child_pid, uint32_t granted_sets) {
-                self.add_next_level_worker(worker_id, reinterpret_cast<void *>(mailbox_ptr), child_pid, granted_sets);
+            [](Worker &self, int32_t worker_id, uint64_t mailbox_ptr, uint64_t mailbox_bytes, int child_pid,
+               uint32_t granted_sets) {
+                self.add_next_level_worker(
+                    worker_id, reinterpret_cast<void *>(mailbox_ptr), static_cast<size_t>(mailbox_bytes), child_pid,
+                    granted_sets
+                );
             },
-            nb::arg("worker_id"), nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1, nb::arg("granted_sets") = 1,
-            "Add a NEXT_LEVEL sub-worker with an explicit worker id."
+            nb::arg("worker_id"), nb::arg("mailbox_ptr"), nb::arg("mailbox_bytes"), nb::arg("child_pid") = -1,
+            nb::arg("granted_sets") = 1, "Add a NEXT_LEVEL sub-worker with an explicit worker id."
         )
         .def(
             "configure_pipeline_depth", &Worker::configure_pipeline_depth, nb::arg("depth"),
@@ -484,12 +493,16 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "add_sub_worker",
-            [](Worker &self, uint64_t mailbox_ptr, int child_pid) {
-                self.add_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr), child_pid);
+            [](Worker &self, uint64_t mailbox_ptr, uint64_t mailbox_bytes, int child_pid) {
+                self.add_worker(
+                    WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr), static_cast<size_t>(mailbox_bytes),
+                    child_pid
+                );
             },
-            nb::arg("mailbox_ptr"), nb::arg("child_pid") = -1,
-            "Add a SUB sub-worker. `mailbox_ptr` is the address of a "
-            "`mailbox_size(granted_sets)`-byte MAP_SHARED region; the child process loop is "
+            nb::arg("mailbox_ptr"), nb::arg("mailbox_bytes"), nb::arg("child_pid") = -1,
+            "Add a SUB sub-worker. `mailbox_ptr` is the address of a MAP_SHARED region and "
+            "`mailbox_bytes` is how much of it the caller mapped, which must cover `mailbox_size(1)`; "
+            "the child process loop is "
             "Python-managed (fork + _sub_worker_loop). `child_pid` is that "
             "forked child, used to detect an exit before mailbox completion."
         )
@@ -964,16 +977,16 @@ inline void bind_worker(nb::module_ &m) {
         [](uint64_t granted_sets) {
             // size_t throughout and checked here, so a grant whose region cannot
             // be described is refused rather than silently narrowed into the
-            // size the facade then allocates from.
-            constexpr uint64_t kMaxGrantedSets =
-                (static_cast<uint64_t>(1) << 40) / static_cast<uint64_t>(MAILBOX_RUN_ENTRY_STRIDE);
-            if (granted_sets == 0 || granted_sets > kMaxGrantedSets) {
+            // size the facade then allocates from. The same bound the
+            // registration applies, read from the same place.
+            const uint64_t bytes = static_cast<uint64_t>(mailbox_size_for_grant(granted_sets));
+            if (bytes == 0) {
                 throw std::invalid_argument(
                     "mailbox_size: a grant of " + std::to_string(granted_sets) +
                     " run-resource sets has no representable mailbox size"
                 );
             }
-            return static_cast<uint64_t>(mailbox_size(static_cast<size_t>(granted_sets)));
+            return bytes;
         },
         nb::arg("granted_sets"),
         "Bytes one endpoint's mailbox occupies for this grant: one control frame, the request "

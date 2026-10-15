@@ -211,6 +211,10 @@ struct MockMailboxWorker {
 
     void *mailbox_ptr() { return mailbox.data(); }
 
+    // What a registration must declare it mapped. The array is the region, so
+    // its own size is the only honest answer.
+    size_t mailbox_bytes() const { return mailbox.size(); }
+
     void complete() {
         std::lock_guard<std::mutex> lk(run_mu);
         next_error_code = 0;
@@ -1359,7 +1363,7 @@ struct SchedulerFixture : public ::testing::Test {
         allocator.init(/*heap_bytes=*/1ULL << 20);
 
         mock_worker.start();
-        manager.add_next_level(mock_worker.mailbox_ptr());
+        manager.add_next_level(mock_worker.mailbox_ptr(), mock_worker.mailbox_bytes());
         manager.start(
             &allocator,
             [this](WorkerCompletion completion) {
@@ -1435,7 +1439,7 @@ TEST(WorkerManagerTest, StartRejectsDuplicateNextLevelWorkerId) {
     allocator.init(/*heap_bytes=*/0);
     WorkerManager manager;
 
-    manager.add_next_level(mailbox.data());
+    manager.add_next_level(mailbox.data(), mailbox.size());
     manager.add_next_level_endpoint(std::make_unique<FakeEndpoint>(0));
 
     bool threw = false;
@@ -1908,7 +1912,8 @@ TEST(WorkerManagerTest, TwoFrameLeaseSlotsDoNotDefineFifoOrAcceptance) {
     ASSERT_NE(active_slot, INVALID_SLOT);
     ASSERT_NE(staged_slot, INVALID_SLOT);
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*task_frame_count=*/2);
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), mailbox.size(), /*child_pid=*/-1,
+                                  /*granted_sets=*/2);
     WorkerDispatch active{active_slot, 0, /*dispatch_id=*/41, /*prepare_only=*/false};
     WorkerDispatch staged{staged_slot, 0, /*dispatch_id=*/42, /*prepare_only=*/true};
     endpoint.submit_progress(&allocator, active);
@@ -1972,7 +1977,8 @@ TEST(WorkerManagerTest, CapacityOneMailboxUsesTheProgressTaskFrame) {
     state->is_group_ = true;
     state->task_args_list.resize(3);
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*task_frame_count=*/1);
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), mailbox.size(), /*child_pid=*/-1,
+                                  /*granted_sets=*/1);
     EXPECT_FALSE(endpoint.caps().supports_frame_staging);
 
     WorkerDispatch dispatch{task_slot, 1, /*dispatch_id=*/41, /*prepare_only=*/false};
@@ -2038,7 +2044,7 @@ TEST(WorkerManagerTest, ThirdDispatchCannotMutateTwoOccupiedFrames) {
         },
         [](WorkerDispatch) {},
         std::make_unique<LocalMailboxEndpoint>(
-            /*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*task_frame_count=*/2
+            /*worker_id=*/0, mailbox.data(), mailbox.size(), /*child_pid=*/-1, /*granted_sets=*/2
         )
     );
     worker.dispatch(WorkerDispatch{active_slot, 0});
@@ -2114,7 +2120,8 @@ TEST(WorkerManagerTest, TransportSaturationResumesOnTheAcknowledgedFrame) {
 
     // Granted three sets against two request frames: the widths differ on purpose, which is the
     // state row 28 is about.
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*task_frame_count=*/3);
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), mailbox.size(), /*child_pid=*/-1,
+                                  /*granted_sets=*/3);
     ASSERT_EQ(endpoint.available_request_transport(), MAILBOX_REQUEST_FRAMES);
 
     endpoint.submit_progress(&allocator, WorkerDispatch{slots[0], 0, /*dispatch_id=*/81, /*prepare_only=*/false});
@@ -2193,7 +2200,7 @@ TEST(WorkerManagerTest, EveryConcurrentFailureKeepsItsOwnFullText) {
         ASSERT_NE(slots.back(), INVALID_SLOT);
     }
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, kGrantedSets);
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), mailbox.size(), /*child_pid=*/-1, kGrantedSets);
     const std::vector<size_t> entry_of =
         test_fill_every_entry(endpoint, allocator, mailbox, slots, kGrantedSets, /*first_dispatch_id=*/901);
     ASSERT_EQ(entry_of.size(), entry_count) << "the endpoint could not hold one run per run-state entry";
@@ -2278,7 +2285,7 @@ TEST(WorkerManagerTest, AFailureAmongLiveRunsIsNotItsSuccessorsOutcome) {
         ASSERT_NE(slots.back(), INVALID_SLOT);
     }
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, kGrantedSets);
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), mailbox.size(), /*child_pid=*/-1, kGrantedSets);
     const std::vector<size_t> entry_of =
         test_fill_every_entry(endpoint, allocator, mailbox, slots, kGrantedSets, /*first_dispatch_id=*/701);
     ASSERT_EQ(entry_of.size(), entry_count) << "the endpoint could not hold one run per run-state entry";
@@ -2364,7 +2371,7 @@ TEST_P(MailboxChildExitTest, PreservesOnlyMatchingTerminalResults) {
     ScopedChildProcess child_guard(child);
     close(start_pipe[0]);
     {
-        LocalMailboxEndpoint endpoint(0, mailbox, child, /*task_frame_count=*/3);
+        LocalMailboxEndpoint endpoint(0, mailbox, MAILBOX_SIZE, child, /*granted_sets=*/3);
         for (size_t index = 0; index < slots.size(); ++index) {
             // Three runs, two frames: the grant and the transport are separate widths, so a third
             // publication needs a frame back first. This is the hand-back a child makes once it
@@ -2431,7 +2438,8 @@ TEST(WorkerManagerTest, StaleFrameIdentityWithholdsCompletionUntilChildQuiesces)
     ASSERT_NE(slot0, INVALID_SLOT);
     ASSERT_NE(slot1, INVALID_SLOT);
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*task_frame_count=*/2);
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), mailbox.size(), /*child_pid=*/-1,
+                                  /*granted_sets=*/2);
     endpoint.submit_progress(&allocator, WorkerDispatch{slot0, 0, /*dispatch_id=*/51, /*prepare_only=*/false});
     endpoint.submit_progress(&allocator, WorkerDispatch{slot1, 0, /*dispatch_id=*/52, /*prepare_only=*/true});
 
@@ -2527,7 +2535,9 @@ TEST(WorkerManagerTest, PoisonedProgressWithholdsCompletionUntilTheChildExits) {
     close(release_pipe[0]);
 
     {
-        LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox, static_cast<int>(child), /*task_frame_count=*/2);
+        LocalMailboxEndpoint endpoint(
+            /*worker_id=*/0, mailbox, MAILBOX_SIZE, static_cast<int>(child), /*granted_sets=*/2
+        );
         endpoint.submit_progress(&allocator, WorkerDispatch{slot0, 0, /*dispatch_id=*/53, /*prepare_only=*/false});
         endpoint.submit_progress(&allocator, WorkerDispatch{slot1, 0, /*dispatch_id=*/54, /*prepare_only=*/true});
 
@@ -2952,7 +2962,7 @@ struct MailboxPipelineSchedulerFixture : public ::testing::Test {
         child.auto_accept.store(true, std::memory_order_release);
         child.granted_sets = kGrantedSets;
         child.start();
-        manager.add_next_level(child.mailbox_ptr(), /*child_pid=*/-1, kGrantedSets);
+        manager.add_next_level(child.mailbox_ptr(), child.mailbox_bytes(), /*child_pid=*/-1, kGrantedSets);
         manager.start(
             &allocator,
             [this](WorkerCompletion completion) {
@@ -3772,7 +3782,7 @@ TEST(WorkerManagerTest, LocalMailboxPublishesAcceptanceBeforeCompletion) {
     ASSERT_NE(slot, nullptr);
     slot->callable.digest[0] = 0x42;
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, child.mailbox_ptr());
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, child.mailbox_ptr(), child.mailbox_bytes());
     WorkerDispatch dispatch{task_slot, 0, /*dispatch_id=*/71, /*prepare_only=*/false};
     endpoint.submit_progress(&allocator, dispatch);
 
@@ -3825,7 +3835,7 @@ TEST(WorkerManagerTest, AcceptanceIsReadableAfterTaskDone) {
     ASSERT_NE(slot, nullptr);
     slot->callable.digest[0] = 0x42;
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, child.mailbox_ptr());
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, child.mailbox_ptr(), child.mailbox_bytes());
     WorkerDispatch dispatch{task_slot, 0, /*dispatch_id=*/73, /*prepare_only=*/false};
     endpoint.submit_progress(&allocator, dispatch);
 
@@ -3872,7 +3882,7 @@ TEST(WorkerManagerTest, ControlCommandFailsWhenChildExitsBeforeCompletion) {
         _exit(3);
     }
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox, static_cast<int>(child));
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox, MAILBOX_SIZE, static_cast<int>(child));
 
     std::promise<std::string> result;
     auto done = result.get_future();
@@ -4298,11 +4308,11 @@ struct GroupSchedulerFixture : public ::testing::Test {
         worker_c.start();
         sub_worker_a.start();
         sub_worker_b.start();
-        manager.add_next_level(worker_a.mailbox_ptr());
-        manager.add_next_level(worker_b.mailbox_ptr());
-        manager.add_next_level(worker_c.mailbox_ptr());
-        manager.add_sub(sub_worker_a.mailbox_ptr());
-        manager.add_sub(sub_worker_b.mailbox_ptr());
+        manager.add_next_level(worker_a.mailbox_ptr(), worker_a.mailbox_bytes());
+        manager.add_next_level(worker_b.mailbox_ptr(), worker_b.mailbox_bytes());
+        manager.add_next_level(worker_c.mailbox_ptr(), worker_c.mailbox_bytes());
+        manager.add_sub(sub_worker_a.mailbox_ptr(), sub_worker_a.mailbox_bytes());
+        manager.add_sub(sub_worker_b.mailbox_ptr(), sub_worker_b.mailbox_bytes());
         manager.start(
             &allocator,
             [this](WorkerCompletion completion) {
@@ -4652,8 +4662,8 @@ TEST(SchedulerDispatchPassTest, ActiveRunSwitchCannotBypassSuccessorGroupReserva
     allocator.init(/*heap_bytes=*/0);
     worker_a.start();
     worker_b.start();
-    manager.add_next_level(worker_a.mailbox_ptr());
-    manager.add_next_level(worker_b.mailbox_ptr());
+    manager.add_next_level(worker_a.mailbox_ptr(), worker_a.mailbox_bytes());
+    manager.add_next_level(worker_b.mailbox_ptr(), worker_b.mailbox_bytes());
     manager.start(
         &allocator,
         [&sched](WorkerCompletion completion) {
@@ -5310,8 +5320,8 @@ TEST(SchedulerWorkerTargetTest, NextLevelTargetUsesWorkerIdNotVectorIndex) {
     allocator.init(/*heap_bytes=*/1ULL << 20);
     worker_a.start();
     worker_b.start();
-    manager.add_next_level_at(7, worker_a.mailbox_ptr());
-    manager.add_next_level_at(9, worker_b.mailbox_ptr());
+    manager.add_next_level_at(7, worker_a.mailbox_ptr(), worker_a.mailbox_bytes());
+    manager.add_next_level_at(9, worker_b.mailbox_ptr(), worker_b.mailbox_bytes());
     manager.start(
         &allocator,
         [&sched](WorkerCompletion completion) {
@@ -5440,8 +5450,8 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
 
         next_level_worker.start();
         sub_worker.start();
-        manager.add_next_level(next_level_worker.mailbox_ptr());
-        manager.add_sub(sub_worker.mailbox_ptr());
+        manager.add_next_level(next_level_worker.mailbox_ptr(), next_level_worker.mailbox_bytes());
+        manager.add_sub(sub_worker.mailbox_ptr(), sub_worker.mailbox_bytes());
         manager.start(
             &allocator,
             [this](WorkerCompletion completion) {

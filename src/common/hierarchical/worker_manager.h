@@ -194,6 +194,30 @@ constexpr size_t mailbox_size(size_t granted_sets) {
     return MAILBOX_RUN_ENTRY_TABLE_OFFSET + MAILBOX_RUN_ENTRY_STRIDE * mailbox_run_entry_count(granted_sets);
 }
 
+/**
+ * The largest grant whose mailbox has a size a region could have.
+ *
+ * Past this the entry table alone exceeds a terabyte and `mailbox_size`'s
+ * arithmetic is what wraps, so the number it returns would be *smaller* than the
+ * table it describes — the one error a bounds check against a real mapping
+ * cannot catch, because the bound itself would be the wrong one.
+ */
+static constexpr uint64_t MAILBOX_MAX_GRANTED_SETS =
+    (static_cast<uint64_t>(1) << 40) / static_cast<uint64_t>(MAILBOX_RUN_ENTRY_STRIDE);
+
+/**
+ * Bytes `granted_sets` needs, or 0 when no region could hold it.
+ *
+ * Zero is never a mailbox's size — even the smallest grant has the frames — so
+ * it carries the refusal with no second out-parameter. Whoever maps a region and
+ * whoever validates one both ask this, which is what keeps the bound they
+ * enforce the same bound.
+ */
+constexpr size_t mailbox_size_for_grant(uint64_t granted_sets) {
+    if (granted_sets == 0 || granted_sets > MAILBOX_MAX_GRANTED_SETS) return 0;
+    return mailbox_size(static_cast<size_t>(granted_sets));
+}
+
 /** Run-state entry `index` inside a mapped mailbox region. */
 inline MailboxRunEntry *mailbox_run_entry(void *mailbox, size_t index) {
     return reinterpret_cast<MailboxRunEntry *>(
@@ -597,11 +621,19 @@ public:
 
 class LocalMailboxEndpoint : public WorkerEndpoint {
 public:
+    // `mailbox_bytes` is how much of the region at `mailbox` the caller actually
+    // mapped. The constructor writes the whole entry table `granted_sets`
+    // implies, so it is checked against that extent before the first write;
+    // nothing here can derive it from the grant, since the grant is the claim
+    // being checked.
+    //
     // `child_pid` is the forked child servicing this mailbox, or -1 when the
     // caller does not own a waitable child. A valid pid enables liveness
     // checks that turn a child that dies before publishing TASK_DONE /
     // CONTROL_DONE into a reported failure instead of an endless spin-poll.
-    LocalMailboxEndpoint(int32_t worker_id, void *mailbox, int child_pid = -1, uint32_t granted_sets = 1);
+    LocalMailboxEndpoint(
+        int32_t worker_id, void *mailbox, size_t mailbox_bytes, int child_pid = -1, uint32_t granted_sets = 1
+    );
 
     const WorkerEndpointCaps &caps() const override { return caps_; }
     void submit_progress(Ring *ring, const WorkerDispatch &dispatch) override;
@@ -1036,15 +1068,20 @@ public:
     using OnAcceptFn = std::function<void(WorkerDispatch)>;
     using OnStagedFn = std::function<void(WorkerDispatch)>;
 
-    // Register a worker. `mailbox` is a `mailbox_size(granted_sets)`-byte MAP_SHARED
-    // region; the real worker (a `ChipWorker` for NEXT_LEVEL, a Python
-    // callable for SUB) lives in the forked child.
+    // Register a worker. `mailbox` is a MAP_SHARED region of `mailbox_bytes`
+    // bytes, which must hold the `mailbox_size(granted_sets)` the grant implies
+    // — the registration is refused here, before any entry is installed, rather
+    // than when the endpoint first writes into the table. The real worker (a
+    // `ChipWorker` for NEXT_LEVEL, a Python callable for SUB) lives in the
+    // forked child.
     // `child_pid` is the forked child servicing `mailbox`; pass -1 when the
     // caller owns no waitable child.
-    void add_next_level(void *mailbox, int child_pid = -1, uint32_t granted_sets = 1);
-    void add_next_level_at(int32_t worker_id, void *mailbox, int child_pid = -1, uint32_t granted_sets = 1);
+    void add_next_level(void *mailbox, size_t mailbox_bytes, int child_pid = -1, uint32_t granted_sets = 1);
+    void add_next_level_at(
+        int32_t worker_id, void *mailbox, size_t mailbox_bytes, int child_pid = -1, uint32_t granted_sets = 1
+    );
     void add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint);
-    void add_sub(void *mailbox, int child_pid = -1);
+    void add_sub(void *mailbox, size_t mailbox_bytes, int child_pid = -1);
 
     // `on_complete` and `on_accept` are non-throwing contracts: the endpoint lane invokes
     // `on_complete` after endpoint ownership has ended, so no lower layer can
@@ -1145,11 +1182,16 @@ private:
     struct LocalNextLevelEntry {
         int32_t worker_id{-1};
         void *mailbox{nullptr};
+        // What the registering caller mapped at `mailbox`, carried so the
+        // endpoint built from this entry checks the region that exists rather
+        // than the one the grant implies.
+        size_t mailbox_bytes{0};
         int child_pid{-1};
         uint32_t granted_sets{1};
     };
     struct LocalSubEntry {
         void *mailbox{nullptr};
+        size_t mailbox_bytes{0};
         int child_pid{-1};
     };
     std::vector<LocalNextLevelEntry> next_level_entries_;

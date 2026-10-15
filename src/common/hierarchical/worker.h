@@ -19,8 +19,9 @@
  *
  * Public surface:
  *   - add_worker(type, mailbox)    — register a sub-worker (before init).
- *                                    `mailbox` is a `mailbox_size(granted_sets)`-byte
- *                                    MAP_SHARED region; the real worker
+ *                                    `mailbox` is a MAP_SHARED region whose
+ *                                    byte extent the caller passes with it;
+ *                                    the real worker
  *                                    (a `ChipWorker` for NEXT_LEVEL, a
  *                                    Python callable for SUB) lives in
  *                                    the forked child.
@@ -71,14 +72,20 @@ public:
     Worker(const Worker &) = delete;
     Worker &operator=(const Worker &) = delete;
 
-    // Register a sub-worker before calling init(). `mailbox` is a
-    // `mailbox_size(granted_sets)`-byte MAP_SHARED region; the real worker (a `ChipWorker`
-    // for NEXT_LEVEL, a Python callable for SUB) lives in the forked
-    // child and consumes the mailbox via the Python child loop.
+    // Register a sub-worker before calling init(). `mailbox` is a MAP_SHARED
+    // region of `mailbox_bytes` bytes, which must hold the
+    // `mailbox_size(granted_sets)` the grant implies — an undersized
+    // registration is refused here rather than when the endpoint writes its
+    // entry table. The real worker (a `ChipWorker` for NEXT_LEVEL, a Python
+    // callable for SUB) lives in the forked child and consumes the mailbox via
+    // the Python child loop.
     // `child_pid` is the forked child servicing `mailbox`, or -1 when the
     // caller owns no waitable child.
-    void add_worker(WorkerType type, void *mailbox, int child_pid = -1, uint32_t granted_sets = 1);
-    void add_next_level_worker(int32_t worker_id, void *mailbox, int child_pid = -1, uint32_t granted_sets = 1);
+    void
+    add_worker(WorkerType type, void *mailbox, size_t mailbox_bytes, int child_pid = -1, uint32_t granted_sets = 1);
+    void add_next_level_worker(
+        int32_t worker_id, void *mailbox, size_t mailbox_bytes, int child_pid = -1, uint32_t granted_sets = 1
+    );
 
     // Register a REMOTE_L3 endpoint only after its session runner completed
     // prestart and reported HELLO READY on the command lane.

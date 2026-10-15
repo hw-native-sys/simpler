@@ -231,14 +231,46 @@ bool WorkerEndpoint::report_submission_error(const WorkerDispatch &, const std::
 // LocalMailboxEndpoint — mailbox helpers
 // =============================================================================
 
-LocalMailboxEndpoint::LocalMailboxEndpoint(int32_t worker_id, void *mailbox, int child_pid, uint32_t granted_sets) :
+namespace {
+
+// Refuse a registration whose region cannot hold the table its grant implies.
+//
+// Called twice for every endpoint, on purpose: once where the registration is
+// recorded, so a malformed one installs no entry and reaches no thread, and
+// once in the constructor, which is public and reachable without going through
+// a manager at all. The second is the one that matters for the memory — it runs
+// before the first write — and the first is what keeps a rejected worker from
+// occupying a worker_id.
+void validate_mailbox_region(const char *who, const void *mailbox, size_t mailbox_bytes, uint32_t granted_sets) {
+    const std::string context(who);
+    if (mailbox == nullptr) throw std::invalid_argument(context + ": null mailbox");
+    if (granted_sets == 0) throw std::invalid_argument(context + ": invalid run-resource grant");
+    const size_t required = mailbox_size_for_grant(granted_sets);
+    if (required == 0) {
+        throw std::invalid_argument(
+            context + ": a grant of " + std::to_string(granted_sets) + " run-resource sets has no mailbox size"
+        );
+    }
+    if (mailbox_bytes < required) {
+        throw std::invalid_argument(
+            context + ": a grant of " + std::to_string(granted_sets) + " run-resource sets needs " +
+            std::to_string(required) + " mailbox bytes, and this registration mapped " + std::to_string(mailbox_bytes)
+        );
+    }
+}
+
+}  // namespace
+
+LocalMailboxEndpoint::LocalMailboxEndpoint(
+    int32_t worker_id, void *mailbox, size_t mailbox_bytes, int child_pid, uint32_t granted_sets
+) :
     mailbox_(mailbox),
     granted_sets_(granted_sets),
     child_pid_(child_pid) {
-    if (mailbox == nullptr) throw std::invalid_argument("LocalMailboxEndpoint: null mailbox");
-    if (granted_sets == 0) {
-        throw std::invalid_argument("LocalMailboxEndpoint: invalid run-resource grant");
-    }
+    // Before the resize, and before the memset below reaches the last entry:
+    // every one of those addresses comes from the grant, so the region has to be
+    // known to contain them first.
+    validate_mailbox_region("LocalMailboxEndpoint", mailbox, mailbox_bytes, granted_sets);
     // `M = granted + K`. The extra entries are what let a request be handed over
     // before a set is free: the entry exists from the moment the parent
     // publishes, and the run it names waits for a set without holding a frame.
@@ -1375,13 +1407,18 @@ bool LocalMailboxEndpoint::report_submission_error(const WorkerDispatch &dispatc
 // WorkerManager
 // =============================================================================
 
-void WorkerManager::add_next_level(void *mailbox, int child_pid, uint32_t granted_sets) {
-    add_next_level_at(static_cast<int32_t>(next_level_entries_.size()), mailbox, child_pid, granted_sets);
+void WorkerManager::add_next_level(void *mailbox, size_t mailbox_bytes, int child_pid, uint32_t granted_sets) {
+    add_next_level_at(
+        static_cast<int32_t>(next_level_entries_.size()), mailbox, mailbox_bytes, child_pid, granted_sets
+    );
 }
 
-void WorkerManager::add_next_level_at(int32_t worker_id, void *mailbox, int child_pid, uint32_t granted_sets) {
+void WorkerManager::add_next_level_at(
+    int32_t worker_id, void *mailbox, size_t mailbox_bytes, int child_pid, uint32_t granted_sets
+) {
     if (worker_id < 0) throw std::invalid_argument("WorkerManager::add_next_level_at: negative worker_id");
-    next_level_entries_.push_back(LocalNextLevelEntry{worker_id, mailbox, child_pid, granted_sets});
+    validate_mailbox_region("WorkerManager::add_next_level_at", mailbox, mailbox_bytes, granted_sets);
+    next_level_entries_.push_back(LocalNextLevelEntry{worker_id, mailbox, mailbox_bytes, child_pid, granted_sets});
 }
 
 void WorkerManager::add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endpoint) {
@@ -1389,7 +1426,12 @@ void WorkerManager::add_next_level_endpoint(std::unique_ptr<WorkerEndpoint> endp
     next_level_endpoint_entries_.push_back(std::move(endpoint));
 }
 
-void WorkerManager::add_sub(void *mailbox, int child_pid) { sub_entries_.push_back(LocalSubEntry{mailbox, child_pid}); }
+void WorkerManager::add_sub(void *mailbox, size_t mailbox_bytes, int child_pid) {
+    // A SUB endpoint takes the default grant, and its region carries the same
+    // entry table at the same offsets, so it is held to the same extent.
+    validate_mailbox_region("WorkerManager::add_sub", mailbox, mailbox_bytes, /*granted_sets=*/1);
+    sub_entries_.push_back(LocalSubEntry{mailbox, mailbox_bytes, child_pid});
+}
 
 void WorkerManager::start(
     Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept, const OnStagedFn &on_staged
@@ -1421,7 +1463,7 @@ void WorkerManager::start(
         for (const auto &entry : next_level_entries_) {
             auto wt = std::make_unique<WorkerThread>();
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(
-                entry.worker_id, entry.mailbox, entry.child_pid, entry.granted_sets
+                entry.worker_id, entry.mailbox, entry.mailbox_bytes, entry.child_pid, entry.granted_sets
             );
             wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
             next_level_threads_.push_back(std::move(wt));
@@ -1432,7 +1474,7 @@ void WorkerManager::start(
         for (size_t i = 0; i < entries.size(); ++i) {
             auto wt = std::make_unique<WorkerThread>();
             auto endpoint = std::make_unique<LocalMailboxEndpoint>(
-                static_cast<int32_t>(i), entries[i].mailbox, entries[i].child_pid
+                static_cast<int32_t>(i), entries[i].mailbox, entries[i].mailbox_bytes, entries[i].child_pid
             );
             wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
             threads.push_back(std::move(wt));

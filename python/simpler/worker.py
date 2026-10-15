@@ -2475,6 +2475,20 @@ def _mailbox_addr(shm: SharedMemory) -> int:
     return ctypes.addressof(ctypes.c_char.from_buffer(buf))
 
 
+def _mailbox_extent(shm: SharedMemory) -> int:
+    """Bytes reachable from ``_mailbox_addr(shm)``.
+
+    Read off the mapping rather than recomputed from the grant: the C++
+    registration checks the grant's entry table against this number, so a
+    size derived from the grant would make the check compare the claim with
+    itself. ``shm.buf`` is the mapping ``_mailbox_addr`` takes its address
+    from, so its length is the extent that address is good for.
+    """
+    buf = shm.buf
+    assert buf is not None
+    return buf.nbytes
+
+
 def _require_matching_pids(shms: list[SharedMemory], pids: list[int], kind: str) -> None:
     """Guard the shm/pid pairing the C++ liveness check depends on.
 
@@ -9280,11 +9294,12 @@ class Worker:
         # Register chip workers as NEXT_LEVEL (L3). The child pid lets the C++
         # endpoint fail a dispatch whose child died instead of spinning on a
         # mailbox that can no longer be completed. The grant is the child
-        # resource-set count validated against the mailbox allocation.
+        # resource-set count, and it travels with the extent of the region this
+        # process mapped for it, which is what the C++ side checks it against.
         if device_ids:
             _require_matching_pids(self._chip_shms, self._chip_pids, "chip")
             for shm, pid, granted_sets in zip(self._chip_shms, self._chip_pids, self._chip_run_resource_set_counts):
-                dw.add_next_level_worker(_mailbox_addr(shm), pid, granted_sets)
+                dw.add_next_level_worker(_mailbox_addr(shm), _mailbox_extent(shm), pid, granted_sets)
 
         # Register Worker children as NEXT_LEVEL (L4+)
         if self._next_level_shms and not hasattr(dw, "add_next_level_worker_at"):
@@ -9292,11 +9307,11 @@ class Worker:
         _require_matching_pids(self._next_level_shms, self._next_level_pids, "next_level")
         for idx, shm in enumerate(self._next_level_shms):
             worker_id = self._next_level_worker_ids[idx]
-            dw.add_next_level_worker_at(worker_id, _mailbox_addr(shm), self._next_level_pids[idx])
+            dw.add_next_level_worker_at(worker_id, _mailbox_addr(shm), _mailbox_extent(shm), self._next_level_pids[idx])
 
         _require_matching_pids(self._sub_shms, self._sub_pids, "sub")
         for shm, pid in zip(self._sub_shms, self._sub_pids):
-            dw.add_sub_worker(_mailbox_addr(shm), pid)
+            dw.add_sub_worker(_mailbox_addr(shm), _mailbox_extent(shm), pid)
 
         # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
         dw.init()

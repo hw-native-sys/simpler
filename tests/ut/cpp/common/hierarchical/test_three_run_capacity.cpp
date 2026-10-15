@@ -442,7 +442,8 @@ TEST(ThreeRunCapacityEndpointTest, ALaterNativePreparationIsReportedOnceMore) {
     ASSERT_NE(active_slot, INVALID_SLOT);
     ASSERT_NE(staged_slot, INVALID_SLOT);
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*granted_sets=*/3);
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), mailbox.size(), /*child_pid=*/-1,
+                                  /*granted_sets=*/3);
     endpoint.submit_progress(&allocator, WorkerDispatch{active_slot, 0, /*dispatch_id=*/81, /*prepare_only=*/false});
     endpoint.submit_progress(&allocator, WorkerDispatch{staged_slot, 0, /*dispatch_id=*/82, /*prepare_only=*/true});
 
@@ -487,7 +488,8 @@ TEST(ThreeRunCapacityEndpointTest, APromotionDoesNotDisturbAnActivationAlreadyPu
     const TaskSlot staged_slot = capacity_progress_slot(allocator, /*run_id=*/73, /*pipeline_slot=*/0, 7);
     ASSERT_NE(staged_slot, INVALID_SLOT);
 
-    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), /*child_pid=*/-1, /*granted_sets=*/3);
+    LocalMailboxEndpoint endpoint(/*worker_id=*/0, mailbox.data(), mailbox.size(), /*child_pid=*/-1,
+                                  /*granted_sets=*/3);
     endpoint.submit_progress(&allocator, WorkerDispatch{staged_slot, 0, /*dispatch_id=*/83, /*prepare_only=*/true});
     MailboxRunEntry *staged_entry = capacity_entry(mailbox, 0);
 

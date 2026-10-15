@@ -786,7 +786,7 @@ returns only once the whole tree is READY:
 3. Child publishes `INIT_READY` (whole L3 subtree ready), then enters
    `_child_worker_loop(mailbox, registry, inner_worker)` for dispatch
 4. **Parent**: awaits each child's `INIT_READY`, then registers each mailbox
-   with L4's Worker via `add_next_level_worker_at(worker_id, mailbox_addr)`
+   with L4's Worker via `add_next_level_worker_at(worker_id, mailbox_addr, mailbox_bytes)`
 
 ```text
 L4 parent process

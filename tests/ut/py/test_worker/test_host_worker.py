@@ -63,6 +63,7 @@ from simpler.worker import (
     Worker,
     _buffer_field_addr,
     _mailbox_addr,
+    _mailbox_extent,
     _mailbox_load_i32,
     _mailbox_load_u64,
     _mailbox_store_i32,
@@ -764,7 +765,7 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
             self.configured_depths: list[int] = []
             self.configured_pending_depths: list[int] = []
             self.configured_launch_depths: list[int] = []
-            self.next_level_calls: list[tuple[int, int, int]] = []
+            self.next_level_calls: list[tuple[int, int, int, int]] = []
             self.initialized = False
 
         def configure_pipeline_depth(self, depth: int, pending_depth: int = 0, launch_depth: int = 1) -> None:
@@ -775,8 +776,8 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
             self.configured_pending_depths.append(int(pending_depth))
             self.configured_launch_depths.append(int(launch_depth))
 
-        def add_next_level_worker(self, mailbox_addr: int, pid: int, granted_sets: int) -> None:
-            self.next_level_calls.append((int(mailbox_addr), int(pid), int(granted_sets)))
+        def add_next_level_worker(self, mailbox_addr: int, mailbox_bytes: int, pid: int, granted_sets: int) -> None:
+            self.next_level_calls.append((int(mailbox_addr), int(mailbox_bytes), int(pid), int(granted_sets)))
 
         def init(self) -> None:
             self.initialized = True
@@ -839,7 +840,13 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
     # One launched run: the default launch depth, and no more than the grant the narrower child
     # published could hold anyway.
     assert fake_parent.configured_launch_depths == [1]
-    assert [call[1:] for call in fake_parent.next_level_calls] == [(12001, 2), (12002, 1)]
+    assert [call[2:] for call in fake_parent.next_level_calls] == [(12001, 2), (12002, 1)]
+    # Each registration carries the extent of the region this process mapped, not the extent the
+    # grant it publishes would imply: the C++ side checks the second against the first, so a child
+    # that granted two sets is still registered against the whole allocation.
+    assert [call[1] for call in fake_parent.next_level_calls] == [
+        worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST)
+    ] * 2
     assert fake_parent.initialized
     assert startup_events[0] == ("log", 60, True)
     assert startup_events[1:] == [("fork",), ("fork",), ("writer",)]
@@ -861,7 +868,7 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
         def configure_pipeline_depth(self, depth: int, pending_depth: int = 0, launch_depth: int = 1) -> None:
             pass
 
-        def add_sub_worker(self, _mailbox_addr: int, pid: int) -> None:
+        def add_sub_worker(self, _mailbox_addr: int, _mailbox_bytes: int, pid: int) -> None:
             self.sub_workers.append(pid)
 
         def init(self) -> None:
@@ -3151,7 +3158,7 @@ class TestLifecycle:
         try:
             assert shm.buf is not None
             _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
-            dw.add_sub_worker(_mailbox_addr(shm))
+            dw.add_sub_worker(_mailbox_addr(shm), _mailbox_extent(shm))
             dw.init()
             results = dw.broadcast_control_all(
                 WorkerType.SUB,
@@ -3183,8 +3190,8 @@ class TestLifecycle:
             next_shm = make_mailbox()
             dw = _Worker(3)
             try:
-                dw.add_sub_worker(_mailbox_addr(sub_shm))
-                dw.add_next_level_worker(_mailbox_addr(next_shm))
+                dw.add_sub_worker(_mailbox_addr(sub_shm), _mailbox_extent(sub_shm))
+                dw.add_next_level_worker(_mailbox_addr(next_shm), _mailbox_extent(next_shm))
                 dw.init()
                 results = dw.broadcast_control_all(
                     selected_type,
