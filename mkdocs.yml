@@ -122,6 +122,7 @@ nav:
           - Overview: hardware/README.md
           - Chip architecture: hardware/chip-architecture.md
           - Cache coherency: hardware/cache-coherency.md
+          - AICore exit freshness: hardware/aicore-exit-freshness.md
           - MMIO performance: hardware/mmio-performance.md
           - CANN source references: hardware/cann-source-references.md
   - Kernels:

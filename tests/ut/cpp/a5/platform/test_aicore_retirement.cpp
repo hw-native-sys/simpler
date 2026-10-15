@@ -31,11 +31,14 @@
 #include <chrono>
 #include <cstdint>
 #include <limits>
+#include <memory>
+#include <vector>
 #include <thread>
 
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
+#include "../../support/aicore_exit_responder.h"
 
 namespace {
 
@@ -45,7 +48,6 @@ public:
     CoreRegs() { block_.fill(0); }
     uint64_t addr() { return reinterpret_cast<uint64_t>(block_.data()); }
     uint32_t dispatch() { return static_cast<uint32_t>(read_reg(addr(), RegId::DATA_MAIN_BASE)); }
-    void ack() { write_reg(addr(), RegId::COND, AICORE_EXITED_VALUE); }
     bool signalled() { return dispatch() == AICORE_EXIT_SIGNAL; }
     bool closed() { return dispatch() == AICPU_IDLE_TASK_ID; }
 
@@ -83,7 +85,7 @@ TEST(AicoreRetirement, ReturnGatesReleaseOnlyAcknowledgedCoresAfterClose) {
     std::array<AicoreTeardownControl, 2> gates{};
     AicoreExitTarget targets[] = {{cores[0].addr(), &gates[0]}, {cores[1].addr(), &gates[1]}};
     bool released[2];
-    cores[0].ack();
+    AicoreExitResponder responder_0(targets[0]);
     EXPECT_EQ(platform_retire_aicore_group(targets, 2, short_deadline(), released), -1);
     EXPECT_TRUE(cores[0].closed());
     EXPECT_EQ(gates[0].post_close_release, AICORE_POST_CLOSE_RELEASE);
@@ -97,7 +99,7 @@ TEST(AicoreRetirement, ReturnGateStaysClosedWhilePeerAckIsPending) {
     std::array<CoreRegs, 2> cores;
     std::array<AicoreTeardownControl, 2> gates{};
     AicoreExitTarget targets[] = {{cores[0].addr(), &gates[0]}, {cores[1].addr(), &gates[1]}};
-    cores[0].ack();
+    AicoreExitResponder responder_1(targets[0]);
     int rc = -1;
     std::thread caller([&] {
         rc = platform_retire_aicore_group(targets, 2, platform_aicore_exit_deadline());
@@ -109,7 +111,7 @@ TEST(AicoreRetirement, ReturnGateStaysClosedWhilePeerAckIsPending) {
         std::chrono::milliseconds(500)
     ));
     EXPECT_EQ(__atomic_load_n(&gates[0].post_close_release, __ATOMIC_ACQUIRE), 0U);
-    cores[1].ack();
+    AicoreExitResponder responder_2(targets[1]);
     caller.join();
     EXPECT_EQ(rc, 0);
     for (size_t i = 0; i < cores.size(); ++i) {
@@ -160,8 +162,9 @@ TEST(AicoreRetirement, SignalsEveryCoreBeforeWaitingOnAny) {
     ));
     for (auto &core : cores)
         EXPECT_TRUE(core.signalled());
-    for (auto &core : cores)
-        core.ack();
+    std::vector<std::unique_ptr<AicoreExitResponder>> responders;
+    for (const auto &target : targets)
+        responders.emplace_back(std::make_unique<AicoreExitResponder>(target));
     EXPECT_TRUE(wait_until(
         [&] {
             return done.load(std::memory_order_acquire);
@@ -195,7 +198,7 @@ TEST(AicoreRetirement, ClosesNoWindowUntilTheGroupHasAcknowledged) {
         },
         std::chrono::seconds(2)
     ));
-    cores[0].ack();
+    AicoreExitResponder responder_3(targets[0]);
     // The second core has not answered, so neither window may close yet.
     EXPECT_FALSE(wait_until(
         [&] {
@@ -203,7 +206,7 @@ TEST(AicoreRetirement, ClosesNoWindowUntilTheGroupHasAcknowledged) {
         },
         std::chrono::milliseconds(50)
     ));
-    cores[1].ack();
+    AicoreExitResponder responder_4(targets[1]);
     EXPECT_TRUE(wait_until(
         [&] {
             return result.load(std::memory_order_acquire) == 0;
@@ -222,9 +225,9 @@ TEST(AicoreRetirement, LeavesAnUnacknowledgedCoreUnclosed) {
     uint64_t addrs[2] = {cores[0].addr(), cores[1].addr()};
     std::array<AicoreTeardownControl, 2> teardowns{};
     auto targets = make_targets(addrs, teardowns);
-    cores[1].ack();
+    AicoreExitResponder responder_5(targets[1]);
 
-    EXPECT_EQ(platform_retire_aicore_group(targets.data(), targets.size(), get_sys_cnt_aicpu()), -1);
+    EXPECT_EQ(platform_retire_aicore_group(targets.data(), targets.size(), short_deadline()), -1);
     EXPECT_TRUE(cores[0].signalled());
     EXPECT_FALSE(cores[0].closed());
     EXPECT_TRUE(cores[1].closed());
@@ -237,10 +240,10 @@ TEST(AicoreRetirement, ReportsWhichCoresWereReleased) {
     uint64_t addrs[2] = {cores[0].addr(), cores[1].addr()};
     std::array<AicoreTeardownControl, 2> teardowns{};
     auto targets = make_targets(addrs, teardowns);
-    cores[1].ack();
+    AicoreExitResponder responder_6(targets[1]);
 
     bool released[2] = {true, false};
-    EXPECT_EQ(platform_retire_aicore_group(targets.data(), targets.size(), get_sys_cnt_aicpu(), released), -1);
+    EXPECT_EQ(platform_retire_aicore_group(targets.data(), targets.size(), short_deadline(), released), -1);
     EXPECT_FALSE(released[0]);
     EXPECT_TRUE(released[1]);
 
@@ -248,8 +251,9 @@ TEST(AicoreRetirement, ReportsWhichCoresWereReleased) {
     uint64_t answered_addrs[2] = {answered[0].addr(), answered[1].addr()};
     std::array<AicoreTeardownControl, 2> answered_teardowns{};
     auto answered_targets = make_targets(answered_addrs, answered_teardowns);
-    for (auto &core : answered)
-        core.ack();
+    std::vector<std::unique_ptr<AicoreExitResponder>> answered_responders;
+    for (const auto &target : answered_targets)
+        answered_responders.emplace_back(std::make_unique<AicoreExitResponder>(target));
     bool all_released[2] = {};
     EXPECT_EQ(
         platform_retire_aicore_group(answered_targets.data(), answered_targets.size(), short_deadline(), all_released),
@@ -306,7 +310,7 @@ TEST(AicoreRetirement, SingleCoreTargetUsesTheGroupPath) {
     CoreRegs acked;
     AicoreTeardownControl acked_teardown{};
     AicoreExitTarget acked_target{acked.addr(), &acked_teardown};
-    acked.ack();
+    AicoreExitResponder acked_responder(acked_target);
     EXPECT_EQ(platform_retire_aicore_group(&acked_target, 1, short_deadline()), 0);
     EXPECT_TRUE(acked.closed());
 
@@ -330,7 +334,7 @@ TEST(AicoreRetirement, SingleCoreTargetUsesTheGroupPath) {
     EXPECT_FALSE(core.closed());
     EXPECT_FALSE(done.load(std::memory_order_acquire));
 
-    core.ack();
+    AicoreExitResponder responder(target);
     EXPECT_TRUE(wait_until(
         [&] {
             return done.load(std::memory_order_acquire);
@@ -339,4 +343,68 @@ TEST(AicoreRetirement, SingleCoreTargetUsesTheGroupPath) {
     ));
     caller.join();
     EXPECT_TRUE(core.closed());
+}
+
+// A report can precede this run's first COND write. The retained EXITED is
+// therefore not an acknowledgement when this run's core never answers EXIT.
+TEST(ExitAckFreshnessRegression2520, PreviousExitedWithoutCurrentAckStaysUnreleased) {
+    alignas(64) std::array<uint8_t, 65536> stale_registers{};
+    AicoreTeardownControl stale_teardown{};
+    const AicoreExitTarget stale_target{reinterpret_cast<uint64_t>(stale_registers.data()), &stale_teardown};
+    platform_init_aicore_regs(stale_target.reg_addr);
+    write_reg(stale_target.reg_addr, RegId::COND, AICORE_EXITED_VALUE);
+    bool released = true;
+
+    EXPECT_EQ(platform_retire_aicore_group(&stale_target, 1, 0, &released), -1);
+    EXPECT_FALSE(released);
+    EXPECT_EQ(__atomic_load_n(&stale_teardown.post_close_release, __ATOMIC_ACQUIRE), 0U);
+    EXPECT_EQ(read_reg(stale_target.reg_addr, RegId::DATA_MAIN_BASE), AICORE_EXIT_SIGNAL);
+}
+
+TEST(ExitAckFreshnessRegression2520, RetainedAckAndCounterWrapCannotReleaseASilentCore) {
+    for (uint32_t old_ack : {7U, UINT32_MAX}) {
+        alignas(64) std::array<uint8_t, 65536> stale_registers{};
+        AicoreTeardownControl control{};
+        const AicoreExitTarget target{reinterpret_cast<uint64_t>(stale_registers.data()), &control};
+        platform_init_aicore_regs(target.reg_addr);
+        write_reg(target.reg_addr, RegId::COND, AICORE_EXITED_VALUE);
+        __atomic_store_n(&control.exit_ack, old_ack, __ATOMIC_RELEASE);
+        bool released = true;
+
+        EXPECT_EQ(platform_retire_aicore_group(&target, 1, 0, &released), -1);
+        EXPECT_FALSE(released);
+        const uint32_t request = __atomic_load_n(&control.exit_request, __ATOMIC_ACQUIRE);
+        EXPECT_NE(request, 0U);
+        EXPECT_NE(request, old_ack);
+        EXPECT_EQ(__atomic_load_n(&control.exit_ack, __ATOMIC_ACQUIRE), old_ack);
+        EXPECT_EQ(__atomic_load_n(&control.post_close_release, __ATOMIC_ACQUIRE), 0U);
+        EXPECT_EQ(read_reg(target.reg_addr, RegId::DATA_MAIN_BASE), AICORE_EXIT_SIGNAL);
+    }
+}
+
+TEST(ExitAckFreshnessRegression2520, AnAnswerToThisRequestCanRetireWithoutObservingIdle) {
+    alignas(64) std::array<uint8_t, 65536> stale_registers{};
+    AicoreTeardownControl control{};
+    const AicoreExitTarget target{reinterpret_cast<uint64_t>(stale_registers.data()), &control};
+    platform_init_aicore_regs(target.reg_addr);
+    write_reg(target.reg_addr, RegId::COND, AICORE_EXITED_VALUE);
+    __atomic_store_n(&control.exit_ack, 7U, __ATOMIC_RELEASE);
+    std::atomic<int32_t> rc{-2};
+    std::thread retiring([&] {
+        rc.store(platform_retire_aicore_group(&target, 1, platform_aicore_exit_deadline()), std::memory_order_release);
+    });
+    const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (__atomic_load_n(&control.exit_request, __ATOMIC_ACQUIRE) == 0 && std::chrono::steady_clock::now() < limit)
+        std::this_thread::yield();
+    EXPECT_NE(__atomic_load_n(&control.exit_request, __ATOMIC_ACQUIRE), 0U);
+    EXPECT_EQ(rc.load(std::memory_order_acquire), -2);
+    EXPECT_EQ(__atomic_load_n(&control.post_close_release, __ATOMIC_ACQUIRE), 0U);
+    EXPECT_EQ(read_reg(target.reg_addr, RegId::COND), AICORE_EXITED_VALUE);
+    AicoreExitResponder responder(target);
+    retiring.join();
+    EXPECT_EQ(rc.load(std::memory_order_acquire), 0);
+    EXPECT_EQ(
+        __atomic_load_n(&control.exit_ack, __ATOMIC_ACQUIRE), __atomic_load_n(&control.exit_request, __ATOMIC_ACQUIRE)
+    );
+    EXPECT_EQ(__atomic_load_n(&control.post_close_release, __ATOMIC_ACQUIRE), AICORE_POST_CLOSE_RELEASE);
 }

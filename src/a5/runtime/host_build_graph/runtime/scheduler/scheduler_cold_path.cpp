@@ -894,7 +894,10 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
         LOG_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, RUNTIME_MAX_WORKER);
         return -1;
     }
-    memset(runtime->get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * cores_total_num_);
+    for (int32_t i = 0; i < cores_total_num_; ++i) {
+        __atomic_store_n(&runtime->get_teardown_gates()[i].post_close_release, 0U, __ATOMIC_RELAXED);
+        __atomic_store_n(&runtime->get_teardown_gates()[i].exit_request, 0U, __ATOMIC_RELAXED);
+    }
     for (int32_t i = 0; i < cores_total_num_; ++i)
         core_retired_[i].store(false, std::memory_order_relaxed);
     wmb();

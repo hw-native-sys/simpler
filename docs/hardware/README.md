@@ -11,6 +11,7 @@ path.
 | -------- | -------------- |
 | [Ascend Chip Architecture](chip-architecture.md) | Host, AICPU, and AICore execution tiers; chip generations; task flow; memory hierarchy |
 | [Cache Coherency](cache-coherency.md) | GM visibility across AICore, AICPU, DMA, and SDMA paths, including required barriers and cache operations |
+| [AICore Exit Freshness](aicore-exit-freshness.md) | Frozen validation, baselines and measured cost of current-request retirement |
 
 ## Control-path investigation
 

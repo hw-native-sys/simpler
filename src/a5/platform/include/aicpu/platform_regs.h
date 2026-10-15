@@ -151,7 +151,8 @@ struct AicoreExitTarget {
 };
 
 // Retires one exclusively-claimed set of cores: signal every member, collect
-// every ACK against one shared deadline, close every acknowledged window, then
+// every matching request/ACK and EXITED against one shared deadline, close
+// every acknowledged window, then
 // release those workers.
 // Callers claim their targets first, so concurrent callers never name the same
 // core and the set need not be the whole chip. An unacknowledged core is neither
@@ -164,6 +165,11 @@ struct AicoreExitTarget {
 // PLATFORM_MAX_CORES is rejected and only that many are filled.
 // Returns 0 when every target was released, -1 on timeout or invalid targets.
 int32_t platform_retire_aicore_group(
+    const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released = nullptr
+);
+
+// Native TMR only: one request after unique claim and current report acceptance.
+int32_t platform_retire_cond_nonce_group(
     const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released = nullptr
 );
 

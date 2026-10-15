@@ -765,6 +765,10 @@ enum : uint32_t {
 
 #define AICORE_EXITED_VALUE MAKE_FIN_VALUE(AICORE_EXIT_TASK_ID)
 
+// Reserved FIN encodings excluded by the scheduler's task-ID allocator.
+constexpr uint32_t AICORE_EXIT_NONCE_0 = 0xfffffff1U;
+constexpr uint32_t AICORE_EXIT_NONCE_1 = 0xfffffff2U;
+
 // =============================================================================
 // Task State Constants
 // =============================================================================
