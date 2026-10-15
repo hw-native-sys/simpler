@@ -11456,15 +11456,23 @@ class Worker:
         with self._operation_lease("device_location", requires_execution_context=False), self._child_prov_lock:
             if self._source_context_failed:
                 raise ValueError("Worker no longer has a live device context for source registration")
+            if self._chip_worker is None:
+                raise ValueError("Worker no longer has a live device context for source registration")
+            environment = self._chip_worker._impl._execution_environment
+            if environment is None:
+                raise ValueError("Worker no longer has a live device context for source registration")
             if self._device_buffer_source is None:
                 owner = weakref.ref(self)
                 self._device_buffer_source = _DeviceBufferSource(
                     self._buffer_identity_allocator,
-                    int(self._config.get("device_id", 0)),
+                    environment[3],
                     lambda: (worker := owner()) is not None
                     and worker._lifecycle is _Lifecycle.READY
-                    and not worker._source_context_failed,
+                    and not worker._source_context_failed
+                    and worker._chip_worker is not None
+                    and worker._chip_worker._impl._execution_environment == environment,
                 )
+            self._device_buffer_source._check_context()
             return BufferLocation(self._device_buffer_source)
 
     def _attach_source_buffers_locked(self, args: Any) -> tuple[CanonicalIdentity, ...]:

@@ -18,6 +18,7 @@
 #include "pipeline_contract.h"
 
 #include <dlfcn.h>
+#include <unistd.h>
 
 #include <atomic>
 #include <cstdlib>
@@ -121,6 +122,17 @@ void load_sim_context(const std::string &path) {
     bind_host_log_state(handle, "sim context");
     registry.emplace(path, handle);
     (void)guard.release();
+}
+
+uint64_t next_environment_incarnation() {
+    static std::atomic<uint64_t> incarnation{0};
+    uint64_t current = incarnation.load(std::memory_order_relaxed);
+    while (current != std::numeric_limits<uint64_t>::max()) {
+        if (incarnation.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) {
+            return current + 1;
+        }
+    }
+    throw std::overflow_error("execution environment identity space is exhausted");
 }
 
 uint64_t next_native_run_epoch() {
@@ -413,10 +425,16 @@ void ChipWorker::init(
     // storage below is: a set exists because a run can hold it.
     pipeline_generations_.resize(resolved_contract.pipeline_depth);
 
+    const uint64_t incarnation = next_environment_incarnation();
     device_ctx_ = create_device_context_fn_();
     if (device_ctx_ == nullptr) {
         throw std::runtime_error("create_device_context returned null");
     }
+
+    execution_environment_ = ExecutionEnvironment{
+        static_cast<uint64_t>(getpid()), incarnation, borrowed_context_generation.value_or(incarnation), device_id,
+        borrowed_context_generation.has_value()
+    };
 
     try {
         // The grant reaches the runtime before anything can name a set, so every
@@ -453,6 +471,7 @@ void ChipWorker::init(
     } catch (...) {
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
+        execution_environment_.reset();
         throw;
     }
 
@@ -735,6 +754,7 @@ void ChipWorker::finalize() {
 }
 
 void ChipWorker::clear_runtime_binding() {
+    execution_environment_.reset();
     lib_handle_ = nullptr;
     create_device_context_fn_ = nullptr;
     simpler_init_fn_ = nullptr;
@@ -1124,6 +1144,10 @@ void ChipWorker::close_chip_run_lane() {
 }
 
 void ChipWorker::validate_execution_context() const {
+    // Foreign-process bindings are rejected before entry to the runtime or its mutexes.
+    if (execution_environment_ && execution_environment_->process_id != static_cast<uint64_t>(getpid())) {
+        throw ExecutionContextRefused("execution environment belongs to another process");
+    }
     if (device_ctx_ == nullptr || validate_execution_context_fn_ == nullptr) return;
     const int rc = validate_execution_context_fn_(device_ctx_);
     if (rc != 0) throw ExecutionContextRefused("execution context validation failed with code " + std::to_string(rc));

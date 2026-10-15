@@ -67,6 +67,16 @@ public:
 
 class ChipWorker {
 public:
+    // Host-only identity of one native environment binding, including retained
+    // rollback debt. It is independent of Buffer and pipeline lease generations.
+    struct ExecutionEnvironment {
+        uint64_t process_id;
+        uint64_t incarnation;
+        uint64_t context_generation;
+        int device_id;
+        bool borrowed;
+    };
+
     ChipWorker() = default;
     ~ChipWorker();
 
@@ -377,6 +387,7 @@ public:
 
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
+    std::optional<ExecutionEnvironment> execution_environment() const { return execution_environment_; }
     unsigned pipeline_depth() const { return pipeline_contract_.pipeline_depth; }
     size_t runtime_slot_count() const { return runtime_bufs_.size(); }
     bool supports_concurrent_native_prepare() const;
@@ -874,6 +885,7 @@ private:
     // Names a successful binding or an init whose rollback still needs close.
     // Cleared only after successful teardown. Control calls run on the owning
     // thread, as enforced by Worker.close().
+    std::optional<ExecutionEnvironment> execution_environment_;
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;

@@ -3638,6 +3638,17 @@ NB_MODULE(_task_interface, m) {
         )
         .def("finalize", &ChipWorker::finalize)
         .def("_validate_execution_context", &ChipWorker::validate_execution_context)
+        .def_prop_ro(
+            "_execution_environment",
+            [](const ChipWorker &self) -> nb::object {
+                const auto environment = self.execution_environment();
+                if (!environment) return nb::none();
+                return nb::make_tuple(
+                    environment->process_id, environment->incarnation, environment->context_generation,
+                    environment->device_id, environment->borrowed
+                );
+            }
+        )
         .def(
             "flush_diagnostics", &ChipWorker::flush_diagnostics, nb::arg("timeout_ms") = 30000,
             nb::call_guard<nb::gil_scoped_release>(),

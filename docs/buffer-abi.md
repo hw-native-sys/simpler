@@ -510,12 +510,21 @@ run.result()
 source.close()  # revokes the registration; does not free ptr
 ```
 
-`BufferLocation` identifies the source context's process and incarnation, not
-just a device ordinal. Its current provider is an initialized direct L2
-Program `Worker`. Another Worker, a forked process, or a closed context cannot
-use that location. This does not attach an externally owned RTS context and
-does not support HOST or remote wrapping. No new wire placement field or
-cross-Worker grant is introduced.
+`BufferLocation` identifies one native environment binding, not just a device
+ordinal or a Python Worker's READY state. The binding records the process,
+a non-repeating native incarnation, context generation, device and ownership
+policy. Source wrapping, descriptor validation and submission compare against
+the same binding. Successful native teardown invalidates it even if a facade
+still says READY; failed rollback or teardown retains it for cleanup retry.
+The binding's generation is independent of Buffer and pipeline generations.
+
+The current public provider is an initialized direct L2 Program `Worker`.
+Another Worker, a forked process, or a closed context cannot use that location.
+Reading this descriptor does not require a current RTS context. Device execution
+separately checks the runner's adopted RTS context; the logical identity is not
+an RTS reset detector or a check of the external pointer's actual allocation.
+This does not expose borrowed RTS initialization or support HOST/remote wrapping.
+No new wire placement field or cross-Worker grant is introduced.
 
 Wrapping creates a source registration, without adding a consumer allocation
 or mapping. Submission checks the complete descriptor and source liveness,

@@ -191,8 +191,11 @@ source.close()
 ```
 
 `worker.device_location` is available after direct L2 initialization. The token
-identifies that live process/context incarnation; it cannot be replaced by a
-device ordinal or used on another Worker. `Buffer.wrap(..., access=...)` accepts
+identifies that native environment binding, including its process, incarnation
+and context generation; it cannot be replaced by a device ordinal or used on
+another Worker. Source checks reject a changed or successfully retired native
+binding even if the Python facade still reports READY. Reading the location
+performs no RTS call; current-context validation remains an execution precondition. `Buffer.wrap(..., access=...)` accepts
 an existing `AccessMode` grant (default `READWRITE`) and registers caller-owned
 storage without consumer attachment. Submission performs that attachment.
 

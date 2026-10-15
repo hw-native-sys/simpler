@@ -26,6 +26,7 @@ def l2():
     calls = []
     frees = []
     impl = SimpleNamespace(
+        _execution_environment=(os.getpid(), 1, 1, 0, False),
         _validate_execution_context=lambda: None,
         _submit_chip_run_direct=lambda cid, args, cfg: calls.append(args) or object(),
     )
@@ -239,6 +240,39 @@ def test_source_wrap_context_and_descriptor_checks_precede_materialization(l2, m
     with pytest.raises(ValueError):
         worker._submit_l2_locked(3, original, CallConfig())
     assert not mapped and not calls
+
+
+@pytest.mark.parametrize("changed_field", [0, 1, 2, 3, 4, None])
+def test_source_environment_change_refuses_before_identity_or_attachment(l2, monkeypatch, changed_field):
+    worker, calls, _ = l2
+    location = worker.device_location
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=location)
+    args = arguments(backing)
+    environment = worker._chip_worker._impl._execution_environment
+    changed = list(environment)
+    if changed_field is not None:
+        changed[changed_field] += 1
+    worker._chip_worker._impl._execution_environment = None if changed_field is None else tuple(changed)
+    identities = []
+    original = worker._buffer_identity_allocator.burn_identity
+    monkeypatch.setattr(
+        worker._buffer_identity_allocator, "burn_identity", lambda: identities.append(True) or original()
+    )
+    materialize = worker._materialize_l2_args
+    mapped = []
+    monkeypatch.setattr(worker, "_materialize_l2_args", lambda args: mapped.append(args))
+    with pytest.raises(ValueError, match="live device context"):
+        Buffer.wrap(address=0x9000, nbytes=64, location=location)
+    with pytest.raises(ValueError, match="live device context"):
+        backing.to_descriptor()
+    with pytest.raises(ValueError, match="live device context"):
+        worker._submit_l2_locked(3, args, CallConfig())
+    assert not identities and not mapped and not calls
+    assert not worker._source_attachments and not worker._chip_source_uses
+    worker._chip_worker._impl._execution_environment = environment
+    monkeypatch.setattr(worker, "_materialize_l2_args", materialize)
+    worker._submit_l2_locked(3, args, CallConfig())
+    assert calls[0].tensor(0).data == backing.base
 
 
 def test_source_wrap_reservation_precedes_mapping_and_unwinds_on_bind_failure(l2, monkeypatch):

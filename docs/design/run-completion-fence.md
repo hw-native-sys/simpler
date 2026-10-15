@@ -103,8 +103,19 @@ be nonzero; omission selects owned-device initialization. Both routes load the
 same runtime and create the same native storage and lane. Borrowed initialization
 supports neither SDMA/simulator options nor Program workspace management/budget
 requests. Its config is the native admission input; each submission still
-supplies its own config. Generation is forwarded to the native init validation;
-this argument alone does not provide public Worker generation or Buffer binding.
+supplies its own config. Generation is retained in the native environment
+binding; this argument alone does not expose public Worker borrowed initialization.
+
+ChipWorker retains a host-only environment identity from native context creation
+through successful teardown: process, non-repeating incarnation, nonzero logical
+context generation, device and owned/borrowed policy. Borrowed generation is
+supplied by the caller; owned generation belongs to its native incarnation.
+Failed rollback/teardown preserves the identity and runtime binding for cleanup.
+Native context validation rejects a foreign process before entering the runtime.
+Buffer sources capture this identity and compare it on wrapping, descriptor
+validation and attachment; it is independent of run, lease and Buffer generations.
+The identity associates the source with the runner that validates the adopted
+RTS context; it neither detects an external reset nor proves pointer ownership.
 
 Before lane progress or native phase mutation, current-context validation rejects
 a mismatched RTS context with `ExecutionContextRefused`, a `std::runtime_error`

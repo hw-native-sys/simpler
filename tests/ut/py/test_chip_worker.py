@@ -12,6 +12,7 @@ import ctypes
 import json
 import os
 import shutil
+import signal
 import subprocess
 import threading
 from pathlib import Path
@@ -213,9 +214,11 @@ def kernel_symbol_runtime(tmp_path_factory):
     cache = {}
     next_library_id = 0
 
-    def build(*, supported=0, missing=(), init_result=0, finalize_failures=0, borrowed=False, memory=False):
+    def build(
+        *, supported=0, missing=(), init_result=0, finalize_failures=0, borrowed=False, memory=False, early_failure=None
+    ):
         nonlocal next_library_id
-        key = (supported, missing, init_result, finalize_failures, borrowed, memory)
+        key = (supported, missing, init_result, finalize_failures, borrowed, memory, early_failure)
         # Fault scripts retain their consumed failure budget in the loaded DSO.
         if finalize_failures == 0 and key in cache:
             return cache[key]
@@ -223,6 +226,8 @@ def kernel_symbol_runtime(tmp_path_factory):
         next_library_id += 1
         sentinels = source.with_suffix(".sentinels.cpp")
         library = source.with_suffix(".so")
+        size = "0" if early_failure == "size" else "sizeof(uint64_t)"
+        alignment = "3 * alignof(uint64_t)" if early_failure == "alignment" else "alignof(uint64_t)"
         source.write_text(
             '#include "runtime_c_api.h"\n'
             "#include <cstdlib>\n"
@@ -253,8 +258,8 @@ def kernel_symbol_runtime(tmp_path_factory):
             "    if (finalize_failures > 0) { --finalize_failures; return -77; }\n"
             "    return 0;\n"
             "}\n"
-            "size_t get_runtime_size() { return sizeof(uint64_t); }\n"
-            "size_t get_runtime_alignment() { return alignof(uint64_t); }\n"
+            f"size_t get_runtime_size() {{ return {size}; }}\n"
+            f"size_t get_runtime_alignment() {{ return {alignment}; }}\n"
             "const PipelineContract *get_pipeline_contract() {\n"
             "    static const PipelineContract contract{PTO_PIPELINE_CONTRACT_ABI_VERSION, 2, 1, {\n"
             "        {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0},\n"
@@ -276,6 +281,9 @@ def kernel_symbol_runtime(tmp_path_factory):
             ),
             encoding="utf-8",
         )
+        if early_failure == "grant":
+            with source.open("a", encoding="utf-8") as output:
+                output.write("int simpler_set_run_resource_grant_ctx(DeviceContextHandle, uint32_t) { return -89; }\n")
         if borrowed:
             with source.open("a", encoding="utf-8") as output:
                 output.write(
@@ -444,6 +452,126 @@ class TestChipWorkerKernelSymbols:
         assert not worker.initialized
 
 
+class TestChipWorkerExecutionEnvironment:
+    @pytest.mark.parametrize("borrowed", [False, True])
+    def test_environment_is_unique_and_survives_refusal(self, kernel_symbol_runtime, borrowed):
+        runtime = kernel_symbol_runtime(borrowed=borrowed)
+        observer = ctypes.CDLL(str(runtime))
+        first, second = _ChipWorker(), _ChipWorker()
+        assert first._execution_environment is None
+        options = {"borrowed_context_generation": 77} if borrowed else {}
+        try:
+            first.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+            second.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+            environment = first._execution_environment
+            pid, incarnation, generation, device_id, is_borrowed = environment
+            assert pid == os.getpid() and incarnation > 0 and generation > 0
+            assert device_id == 0 and is_borrowed is borrowed
+            if borrowed:
+                assert generation == 77
+            assert environment != second._execution_environment
+            if borrowed:
+                observer.test_validation(-88)
+                with pytest.raises(ExecutionContextRefused):
+                    first._validate_execution_context()
+                assert first._execution_environment == environment
+                observer.test_validation(0)
+            first.finalize()
+            assert first._execution_environment is None
+            assert second._execution_environment is not None
+        finally:
+            observer.test_validation(0)
+            first.finalize()
+            second.finalize()
+
+    @pytest.mark.parametrize("borrowed", [False, True])
+    @pytest.mark.parametrize(
+        ("failure", "message"),
+        [
+            ("grant", "refused a grant .* code -89"),
+            ("size", "unsupported native-run storage size/alignment"),
+            ("alignment", "unsupported native-run storage size/alignment"),
+        ],
+    )
+    def test_early_init_rollback_retires_environment_and_allows_retry(
+        self, kernel_symbol_runtime, borrowed, failure, message
+    ):
+        failing = kernel_symbol_runtime(borrowed=borrowed, early_failure=failure)
+        observer = ctypes.CDLL(str(failing))
+        worker = _ChipWorker()
+        options = {"borrowed_context_generation": 77} if borrowed else {}
+        before = observer.test_destroys(), observer.test_closes(), observer.test_borrowed_inits()
+        try:
+            with pytest.raises(RuntimeError, match=message):
+                worker.init(str(failing), os.devnull, os.devnull, "", 0, **options)
+            assert observer.test_destroys() == before[0] + 1
+            assert observer.test_closes() == before[1]
+            assert observer.test_borrowed_inits() == before[2]
+            assert not worker.initialized and worker.runtime_slot_count == 0
+            assert worker.device_id == -1
+            assert worker._execution_environment is None
+            healthy = kernel_symbol_runtime(borrowed=borrowed)
+            worker.init(str(healthy), os.devnull, os.devnull, "", 0, **options)
+            assert worker.initialized and worker.runtime_slot_count == 1
+            environment = worker._execution_environment
+            assert environment is not None and environment[0] == os.getpid()
+            assert environment[2] > 0
+            if borrowed:
+                assert environment[2] == 77
+        finally:
+            worker.finalize()
+        assert worker._execution_environment is None
+
+    @pytest.mark.parametrize("borrowed", [False, True])
+    def test_forked_native_owner_refuses_before_runtime_entry(self, kernel_symbol_runtime, borrowed):
+        runtime = kernel_symbol_runtime(borrowed=borrowed, memory=True)
+        worker = _ChipWorker()
+        options = {"borrowed_context_generation": 77} if borrowed else {}
+        worker.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+        try:
+            pid = os.fork()
+            if pid == 0:
+                signal.alarm(3)
+                try:
+                    for operation in (worker._validate_execution_context, lambda: worker.malloc(4), worker.finalize):
+                        try:
+                            operation()
+                        except ExecutionContextRefused:
+                            continue
+                        os._exit(2)
+                except BaseException:
+                    os._exit(3)
+                os._exit(0)
+            _, status = os.waitpid(pid, 0)
+            assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
+            worker._validate_execution_context()
+        finally:
+            worker.finalize()
+
+    @pytest.mark.parametrize("borrowed", [False, True])
+    def test_source_expires_after_native_finalize_while_facade_stays_ready(self, kernel_symbol_runtime, borrowed):
+        runtime = kernel_symbol_runtime(borrowed=borrowed)
+        native = _ChipWorker()
+        options = {"borrowed_context_generation": 77} if borrowed else {}
+        native.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+        owner = Worker(level=2)
+        owner._chip_worker = SimpleNamespace(_impl=native)
+        owner._lifecycle = _Lifecycle.READY
+        try:
+            location = owner.device_location
+            source = Buffer.wrap(address=0x8000, nbytes=64, location=location)
+            native.finalize()
+            assert owner._lifecycle is _Lifecycle.READY
+            with pytest.raises(ValueError, match="live device context"):
+                Buffer.wrap(address=0x9000, nbytes=64, location=location)
+            with pytest.raises(ValueError, match="live device context"):
+                source.to_descriptor()
+            source.close()
+        finally:
+            native.finalize()
+            owner._lifecycle = _Lifecycle.CLOSED
+
+
 class TestChipWorkerBorrowedInit:
     def test_context_preflight_does_not_consume_the_binding(self, kernel_symbol_runtime):
         runtime = kernel_symbol_runtime(borrowed=True)
@@ -480,6 +608,7 @@ class TestChipWorkerBorrowedInit:
 
         owner._chip_worker = SimpleNamespace(
             _impl=SimpleNamespace(
+                _execution_environment=native._execution_environment,
                 _validate_execution_context=native._validate_execution_context,
                 _submit_chip_run_direct=lambda *_: SimpleNamespace(wait=wait),
             )
@@ -844,12 +973,14 @@ class TestChipWorkerBorrowedInit:
         worker = _ChipWorker()
         worker.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
         assert worker.initialized
+        assert worker._execution_environment is not None
         assert worker.runtime_slot_count == 1
         assert observer.test_borrowed_inits() == 1
         worker.finalize()
         assert not worker.initialized
         assert observer.test_closes() == 1
         assert observer.test_destroys() == 1
+        assert worker._execution_environment is None
 
     def test_wrong_context_close_does_not_consume_the_binding(self, kernel_symbol_runtime):
         runtime = kernel_symbol_runtime(borrowed=True)
@@ -874,13 +1005,16 @@ class TestChipWorkerBorrowedInit:
         observer = ctypes.CDLL(str(runtime))
         worker = _ChipWorker()
         worker.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        environment = worker._execution_environment
         with pytest.raises(RuntimeError, match="device teardown failed"):
             worker.finalize()
         assert worker.initialized
+        assert worker._execution_environment == environment
         assert worker.runtime_slot_count == 1
         assert observer.test_destroys() == 0
         worker.finalize()
         assert observer.test_destroys() == 1
+        assert worker._execution_environment is None
 
     def test_failed_borrowed_init_closes_before_destroy_and_can_retry(self, kernel_symbol_runtime):
         failing = kernel_symbol_runtime(borrowed=True, init_result=-66)
@@ -889,6 +1023,7 @@ class TestChipWorkerBorrowedInit:
         with pytest.raises(RuntimeError, match="borrowed init failed with code -66"):
             worker.init(str(failing), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
         assert not worker.initialized
+        assert worker._execution_environment is None
         assert worker.runtime_slot_count == 0
         assert observer.test_closes() == 1
         assert observer.test_destroys() == 1
@@ -914,11 +1049,15 @@ class TestChipWorkerBorrowedInit:
         with pytest.raises(RuntimeError, match="rollback failed"):
             worker.init(str(failing), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
         assert not worker.initialized
+        environment = worker._execution_environment
+        assert environment is not None and environment[2] == 77
         assert worker.runtime_slot_count == 1
         assert observer.test_destroys() == 0
         with pytest.raises(RuntimeError, match="incomplete rollback"):
             worker.init(str(failing), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        assert worker._execution_environment == environment
         worker.finalize()
+        assert worker._execution_environment is None
         assert worker.runtime_slot_count == 0
         assert observer.test_destroys() == 1
 
