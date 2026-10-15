@@ -6340,11 +6340,8 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 encoded = shm_name.encode("utf-8")
                 mailbox[offset : offset + len(encoded)] = encoded
 
-            with (
-                patch.object(worker_mod, "_comm_base_handle", lambda _cw: 1),
-                pytest.raises(ValueError, match="overflows window_size"),
-            ):
-                worker_mod._handle_ctrl_alloc_domain(cw, mailbox)
+            with pytest.raises(ValueError, match="overflows window_size"):
+                worker_mod._handle_ctrl_alloc_domain(cw, mailbox, base_comm_handle=1)
 
             assert worker_mod._domain_reply_committed(reply), (
                 "the window was allocated and the chip did not say so before failing"
@@ -6377,11 +6374,8 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 encoded = shm_name.encode("utf-8")
                 mailbox[offset : offset + len(encoded)] = encoded
 
-            with (
-                patch.object(worker_mod, "_comm_base_handle", lambda _cw: 1),
-                pytest.raises(MemoryError, match="tuple conversion failed"),
-            ):
-                worker_mod._handle_ctrl_alloc_domain(cw, mailbox)
+            with pytest.raises(MemoryError, match="tuple conversion failed"):
+                worker_mod._handle_ctrl_alloc_domain(cw, mailbox, base_comm_handle=1)
 
             assert worker_mod._domain_reply_committed(reply)
         finally:

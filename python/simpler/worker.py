@@ -2799,7 +2799,7 @@ def _read_shm_name(buf, offset: int) -> str:
     return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
 
 
-def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
+def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview, *, base_comm_handle: int) -> None:
     """CTRL_ALLOC_DOMAIN handler — runs on the chip child.
 
     Reads the request shm (header + buffer_nbytes + rank_ids), calls
@@ -2836,7 +2836,7 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
     reply_buf = reply_shm.buf
     assert reply_buf is not None
     try:
-        handle = _comm_base_handle(cw)  # base communicator handle (cached on the ChipWorker)
+        handle = _require_base_communicator(base_comm_handle)
         device_ctx, local_window_base = cw._impl.comm_alloc_domain_windows(
             int(handle),
             int(allocation_id),
@@ -2866,12 +2866,12 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview) -> None:
         reply_shm.close()
 
 
-def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview) -> None:
+def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview) -> int:
     """CTRL_COMM_INIT handler — drives `cw.comm_init` on the chip child.
 
-    Idempotent: ``ChipWorker.comm_init`` itself caches the handle and returns
-    the existing one if already initialized, so a duplicate dispatch from the
-    parent is a no-op.
+    The native runtime caches the communicator and returns its existing
+    handle on duplicate dispatch. Only a successful return publishes a handle
+    to the serve loop.
     """
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
@@ -2890,7 +2890,7 @@ def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview) -> None:
     handle = cw.comm_init(int(rank), int(nranks), rootinfo_path)
     if handle == 0:
         raise RuntimeError("comm_init returned 0 handle for hidden base communicator")
-    cw._comm_base_handle_cached = int(handle)
+    return int(handle)
 
 
 @dataclass
@@ -3330,7 +3330,7 @@ def _teardown_chip_process_resources(
     raise aggregated
 
 
-def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview) -> None:
+def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview, *, base_comm_handle: int) -> None:
     """CTRL_RELEASE_DOMAIN handler — collective free for one allocation."""
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
@@ -3342,20 +3342,14 @@ def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview) -> None:
         req_buf.release()
         req_shm.close()
 
-    handle = _comm_base_handle(cw)
+    handle = _require_base_communicator(base_comm_handle)
     cw._impl.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
 
 
-def _comm_base_handle(cw: ChipWorker) -> int:
-    """Return the cached base-communicator handle the chip allocated during bootstrap.
-
-    The dynamic-allocate path requires an established base communicator (HCCL
-    RootInfo handshake already done).  ``bootstrap_context`` stashes the handle
-    on the ChipWorker; this helper exposes it to the CTRL_* handlers.
-    """
-    handle = getattr(cw, "_comm_base_handle_cached", 0)
+def _require_base_communicator(handle: int) -> int:
+    """Domain controls require a successful bootstrap in this chip's serve loop."""
     if not handle:
-        raise RuntimeError("CTRL_ALLOC_DOMAIN: chip has no base communicator — bootstrap_context must run first")
+        raise RuntimeError("chip has no base communicator — CTRL_COMM_INIT must succeed first")
     return int(handle)
 
 
@@ -3420,6 +3414,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         )
     )
     global_domain_store = _L2GlobalDomainStore()
+    base_comm_handle = 0
     diagnostic_capture_index = 0
 
     def read_task_config(
@@ -3546,6 +3541,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     def handle_control(  # noqa: PLR0912, PLR0915 -- one branch per control sub-command
         sub_cmd: int,
     ) -> tuple[int, str]:
+        nonlocal base_comm_handle
         code = 0
         msg = ""
         try:
@@ -3640,11 +3636,11 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         registry.pop(int(cid), None)
                         prepared.discard(int(cid))
             elif sub_cmd == _CTRL_ALLOC_DOMAIN:
-                _handle_ctrl_alloc_domain(cw, buf)
+                _handle_ctrl_alloc_domain(cw, buf, base_comm_handle=base_comm_handle)
             elif sub_cmd == _CTRL_RELEASE_DOMAIN:
-                _handle_ctrl_release_domain(cw, buf)
+                _handle_ctrl_release_domain(cw, buf, base_comm_handle=base_comm_handle)
             elif sub_cmd == _CTRL_COMM_INIT:
-                _handle_ctrl_comm_init(cw, buf)
+                base_comm_handle = _handle_ctrl_comm_init(cw, buf)
             elif sub_cmd == _CTRL_DELEGATED_REGION:
                 _handle_ctrl_delegated_region_terminal(buf, provider_transaction_table, provider_region_store)
             elif sub_cmd == _CTRL_COMMITTED_DEVICE_MEMORY:
