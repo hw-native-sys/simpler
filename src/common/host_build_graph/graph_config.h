@@ -16,6 +16,7 @@
 #include <memory>
 #include <mutex>
 #include <type_traits>
+#include <typeinfo>
 #include <unordered_map>
 
 #include "host_build_graph/graph_cache.h"
@@ -46,9 +47,8 @@ inline uint64_t config_hash_field(uint64_t hash, T value) {
 
 // A Config's hash from its fields: `return config_hash(layer, route_by_hash);`
 //
-// Every field a Config compares in operator== belongs here, and in the same order. A field
-// that reaches the comparison but not the hash makes two distinct Configs collide on one
-// key, which is detected but only as a failure.
+// Every field a Config compares in operator== belongs here, and in the same order. Unequal Configs may share a hash:
+// equality separates them in the registry. Mixing every field keeps those collision buckets small.
 //
 // The first field hashes from zero. FNV's offset basis would buy a little avalanche quality
 // and cost a constant a Config author has no use for; every field already mixes in its
@@ -67,10 +67,11 @@ inline uint64_t config_hash(const Fields &...fields) {
  * A Graph's construction parameters: the values its body reads as fixed data, as opposed to
  * the boundary scalars it forwards per invocation.
  *
- * A Config decides which Definition a submission reaches. Its hash joins the Graph key, so
- * two different Configs of one Graph record two Definitions; and the Config a key was first
- * submitted with is retained and compared against every later submission on that key, which
- * is what turns a hash collision into a detectable one rather than a silently wrong replay.
+ * A Config decides which Definition a submission reaches. Its hash selects a registry
+ * bucket; the Graph identity, Config type, and operator== select an entry within it.
+ * Configs equal under operator== must return the same hash.
+ * Each distinct identity receives a unique key for the host cache, so a hash collision
+ * records another Definition rather than replaying the wrong one or rejecting the run.
  *
  * A Config derives from ConfigBase and declares two ordinary member functions:
  *
@@ -139,67 +140,55 @@ inline void assert_config() {
     );
 }
 
-// The Config each Graph key was submitted with during the current bind.
-//
-// Held by base pointer so one table covers every Config type -- which is what lets a
-// collision between two *different* Config types be caught at all: a per-type table would
-// put them in separate maps where neither sees the other.
-//
-// Cleared at the end of each bind, through the .so's framework_finish_orch. That pairs it
-// with the host's Definition cache, which is a local of run_host_orchestration and dies with
-// it: an entry here means that key has a Definition, and both go away together. A table that
-// outlived the cache would report a collision between two Configs that, the cache having
-// been emptied in between, could never have been confused for one another.
-//
-// Two threads reach this table. The orchestration entry submits a Graph on its own thread,
-// and a recorded body runs on a recorder worker that outlives the submit call which handed
-// it over -- so a Graph submitted from inside a recorded body arrives here from that worker
-// while the entry thread is still submitting. That nesting is refused, but the refusal is
-// reached through graph_begin, which is downstream of this table: the entry below is already
-// written by then. Every access therefore holds config_registry_mutex().
-inline std::unordered_map<uint64_t, std::unique_ptr<ConfigBase>> &config_registry() {
-    static std::unordered_map<uint64_t, std::unique_ptr<ConfigBase>> registry;
+// One exact Graph identity retained for the bind. Config stays in the orchestration
+// library; only graph_key crosses the RuntimeOps boundary.
+struct RetainedGraphConfig {
+    uint64_t graph_id;
+    uint64_t graph_key;
+    std::unique_ptr<ConfigBase> config;
+};
+
+// Digest buckets may contain different Graph ids, Config types, or Config values.
+// Entries are only inserted during a bind and cleared together after recorder jobs
+// finish, matching the lifetime of the host Definition cache.
+inline std::unordered_multimap<uint64_t, RetainedGraphConfig> &config_registry() {
+    static std::unordered_multimap<uint64_t, RetainedGraphConfig> registry;
     return registry;
 }
 
-// Guards config_registry(). Held across a whole retain -- the lookup, the insert and the
-// comparison are one decision, and two threads that each found the key absent would both
-// insert, leaving whichever lost the race recorded as the key's owner.
+// Nested submissions can reach the registry from a recorder thread before graph_begin
+// rejects the nesting. Lookup, insertion, and key allocation share one critical section.
 inline std::mutex &config_registry_mutex() {
     static std::mutex mutex;
     return mutex;
 }
 
-// Release every key, as framework_finish_orch does at the end of a bind.
 inline void clear_config_registry() {
     const std::lock_guard<std::mutex> lock(config_registry_mutex());
     config_registry().clear();
 }
 
-// Retain this key's Config, or check it against the one already retained. False means two
-// Configs disagree on one key.
-//
-// Two Configs disagreeing on one key means the key no longer identifies the Graph it was
-// built from, so the Definition cache would hand back the wrong body. The caller reports it:
-// a Config's hash() is written by whoever declared the Config, so a collision is something a
-// caller can produce, and this runtime's rule for those is a fatal naming the reason rather
-// than an abort. The report lives at the submission because that is where the runtime handle
-// the fatal goes through is in scope.
-//
-// dynamic_cast rather than a type tag: the retained object, this comparison, and every
-// Config type reachable here all live in the one orchestration .so, so there is no cross-.so
-// RTTI identity to worry about.
+// Return the same key for an equal identity, or retain a copy with a fresh key.
+// Keys are insertion ordinals, independent of digest values. With no per-entry erase,
+// size() + 1 is unique until the bind ends; clearing the registry resets that namespace.
+// The host mixes this key with the callable's address. For a fixed callable its final
+// XOR and odd multiplication are bijective, so distinct ordinals stay distinct there.
+// RTTI and operator== remain local to the orchestration library that owns the Config.
 template <typename ConfigT>
-[[nodiscard]] inline bool retain_config(uint64_t graph_key, const ConfigT &config) {
+[[nodiscard]] inline uint64_t retain_config(uint64_t graph_id, const ConfigT &config) {
+    assert_config<ConfigT>();
+    const uint64_t digest = rt_graph_make_key(graph_id, config.hash());
     const std::lock_guard<std::mutex> lock(config_registry_mutex());
     auto &registry = config_registry();
-    auto it = registry.find(graph_key);
-    if (it == registry.end()) {
-        registry.emplace(graph_key, std::make_unique<ConfigT>(config));
-        return true;
+    const auto range = registry.equal_range(digest);
+    for (auto it = range.first; it != range.second; ++it) {
+        const auto &entry = it->second;
+        if (entry.graph_id != graph_id || typeid(*entry.config) != typeid(ConfigT)) continue;
+        if (dynamic_cast<const ConfigT &>(*entry.config) == config) return entry.graph_key;
     }
-    const auto *retained = dynamic_cast<const ConfigT *>(it->second.get());
-    return retained != nullptr && *retained == config;
+    const uint64_t graph_key = registry.size() + 1;
+    registry.emplace(digest, RetainedGraphConfig{graph_id, graph_key, std::make_unique<ConfigT>(config)});
+    return graph_key;
 }
 
 }  // namespace simpler::hbg

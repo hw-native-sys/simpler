@@ -566,19 +566,7 @@ rt_submit_graph(uint64_t graph_id, GraphFunction function, const GraphTaskArgs &
         rejected.has_error = true;
         return rejected;
     }
-    const uint64_t graph_key = rt_graph_make_key(graph_id, config.hash());
-    if (!simpler::hbg::retain_config(graph_key, config)) {
-        rt_report_fatal(
-            SIMPLER_ERROR_INVALID_ARGS,
-            "[GraphExecution] Graph key collision: key 0x%llx was already submitted with a different Config. "
-            "Two Configs hashing alike means the key no longer names one Graph -- check that hash() mixes "
-            "every field operator== compares",
-            static_cast<unsigned long long>(graph_key)
-        );
-        GraphSubmitResult rejected;
-        rejected.has_error = true;
-        return rejected;
-    }
+    const uint64_t graph_key = simpler::hbg::retain_config(graph_id, config);
     return rt_submit_graph_impl(graph_key, args, [function](const GraphTaskArgs &record_args) {
         function(record_args);
     });
@@ -623,19 +611,7 @@ static inline GraphSubmitResult rt_submit_graph(
         rejected.has_error = true;
         return rejected;
     }
-    const uint64_t graph_key = rt_graph_make_key(graph_id, config.hash());
-    if (!simpler::hbg::retain_config(graph_key, config)) {
-        rt_report_fatal(
-            SIMPLER_ERROR_INVALID_ARGS,
-            "[GraphExecution] Graph key collision: key 0x%llx was already submitted with a different Config. "
-            "Two Configs hashing alike means the key no longer names one Graph -- check that hash() mixes "
-            "every field operator== compares",
-            static_cast<unsigned long long>(graph_key)
-        );
-        GraphSubmitResult rejected;
-        rejected.has_error = true;
-        return rejected;
-    }
+    const uint64_t graph_key = simpler::hbg::retain_config(graph_id, config);
     // The lambda captures its own copy: the recording job runs on a recorder thread that
     // outlives this call, so it may hold nothing of the caller's frame -- `config` included.
     return rt_submit_graph_impl(graph_key, args, [function, config](const GraphTaskArgs &record_args) {
@@ -653,9 +629,8 @@ rt_submit_graph(GraphFunctionWithConfig<ConfigT> function, const GraphTaskArgs &
 // after the orchestration entry returns, so anything retained here covers the same window as
 // the host's Definition cache -- which is a local of run_host_orchestration and dies with it.
 //
-// Currently that is the Graph Config registry. A registry outliving the cache would report a
-// collision between two Configs that, the cache having been emptied in between, could never
-// have been confused for one another.
+// Currently that is the Graph Config registry. Its internal keys share the lifetime of
+// the host Definition cache; clearing both lets the next bind start a fresh key namespace.
 //
 // `used` because this is an inline definition nothing inside the .so calls: the host reaches
 // it by dlsym, so the symbol has to be emitted anyway.
