@@ -60,7 +60,7 @@ def test_chip_worker_init_keeps_the_retired_keywords_name_position_and_default()
 
 
 def test_the_level_two_route_no_longer_names_the_retired_keyword(monkeypatch):
-    """`_init_level2` reaches `ChipWorker.init` without mentioning it at all.
+    """`_init_level2` requests no retired workspace-management keyword.
 
     What a caller who *does* pass it gets is not asserted here: the value is
     ignored in `ChipWorker::init`, which this level cannot observe.
@@ -75,7 +75,7 @@ def test_the_level_two_route_no_longer_names_the_retired_keyword(monkeypatch):
         def init(self, *_a, **kwargs):
             seen.append(dict(kwargs))
 
-        def _register_callable_at_slot(self, *_a, **_k):  # pragma: no cover
+        def register_callable(self, *_a, **_k):  # pragma: no cover
             pass
 
     class _FakeBuilder:
@@ -85,7 +85,10 @@ def test_the_level_two_route_no_longer_names_the_retired_keyword(monkeypatch):
         def get_binaries(self, *_a, **_k):
             return object()
 
-    monkeypatch.setattr(worker_mod, "ChipWorker", _RecordingChip)
+    monkeypatch.setattr(worker_mod, "_ChipWorker", _RecordingChip)
+    monkeypatch.setattr(
+        worker_mod, "_initialize_chip_runtime", lambda chip, device, bins, **options: chip.init(device, bins, **options)
+    )
     monkeypatch.setattr(rb_mod, "RuntimeBuilder", _FakeBuilder)
     worker = worker_mod.Worker(2, device_id=0, **_COMMON)
     worker._init_level2()

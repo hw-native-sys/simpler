@@ -148,6 +148,10 @@ every level. The L2 leaf resolves those views into the internal
 `ChipStorageTaskArgs` / `ChipTensor` representation; callers do not pass that
 internal representation to `Worker.run()`.
 
+Direct L2 `Worker` owns its native chip binding and its own callable handles.
+The lower-level public `ChipWorker` remains a separate compatibility entry;
+its handles and Python registry are not used by `Worker` internally.
+
 The lower-level `ChipWorker.run(handle, args)` accepts the same `TaskArgs` for
 scalars and contiguous HOST/H2D tensors. DEVICE Buffer arguments use
 `Worker(level=2).submit`, which supplies live-source validation. Keep host backing

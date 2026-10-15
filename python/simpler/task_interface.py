@@ -46,6 +46,8 @@ if TYPE_CHECKING:
     # Annotation-only: `CallableHandle` is imported lazily at its use site, and
     # PEP 563 keeps these annotations as strings, so nothing is imported at
     # runtime.
+    from simpler_setup.runtime_builder import RuntimeBinaries
+
     from .callable_identity import CallableHandle
 
 import _task_interface as _ti_module  # pyright: ignore[reportMissingImports]
@@ -1465,6 +1467,46 @@ def _resolve_collect_across_runs(collect_across_runs: bool | None, dfx_session: 
     return bool(dfx_session)
 
 
+def _initialize_chip_runtime(
+    impl: _ChipWorker,
+    device_id: int,
+    bins: RuntimeBinaries,
+    *,
+    log_level: int | None = None,
+    prewarm_config: CallConfig | None = None,
+    enable_sdma: bool = False,
+    collect_across_runs: bool = False,
+    workspace_budget_bytes: int = 0,
+    manage_workspace: bool = False,
+    requested_pipeline_depth: int = 0,
+) -> None:
+    """Bind one native chip runtime from binary paths and initialize its host logger.
+
+    The caller owns lifecycle admission, callable slots and cleanup after failure.
+    """
+    _initialize_host_log(log_level)
+    dispatcher_path = getattr(bins, "dispatcher_path", None)
+    sim_context_path = getattr(bins, "sim_context_path", None)
+    sdma_warmup_path = getattr(bins, "sdma_warmup_path", None)
+    # C++ retains libcpu_sim_context.so in the sim process registry. Sim has
+    # no dispatcher; onboard bootstrap consumes its actual binary path.
+    impl.init(
+        str(bins.host_path),
+        str(bins.aicpu_path),
+        str(bins.aicore_path),
+        "" if dispatcher_path is None else str(dispatcher_path),
+        int(device_id),
+        prewarm_config,
+        bool(enable_sdma),
+        "" if sim_context_path is None else str(sim_context_path),
+        "" if sdma_warmup_path is None else str(sdma_warmup_path),
+        bool(collect_across_runs),
+        int(workspace_budget_bytes),
+        bool(manage_workspace),
+        int(requested_pipeline_depth),
+    )
+
+
 class ChipWorker:
     """Unified execution interface wrapping the host runtime C API.
 
@@ -1629,28 +1671,17 @@ class ChipWorker:
             self._init_in_progress = True
 
         try:
-            _initialize_host_log(log_level)
-
-            # C++ retains libcpu_sim_context.so in the sim process registry,
-            # loads host_runtime.so, and binds both private logger copies.
-            # dispatcher_path is empty on sim; onboard consumes the real path.
-            dispatcher_path = getattr(bins, "dispatcher_path", None)
-            sim_context_path = getattr(bins, "sim_context_path", None)
-            sdma_warmup_path = getattr(bins, "sdma_warmup_path", None)
-            self._impl.init(
-                str(bins.host_path),
-                str(bins.aicpu_path),
-                str(bins.aicore_path),
-                "" if dispatcher_path is None else str(dispatcher_path),
-                int(device_id),
-                prewarm_config,
-                bool(enable_sdma),
-                "" if sim_context_path is None else str(sim_context_path),
-                "" if sdma_warmup_path is None else str(sdma_warmup_path),
-                bool(_resolve_collect_across_runs(collect_across_runs, dfx_session)),
-                int(workspace_budget_bytes),
-                bool(manage_workspace),
-                int(requested_pipeline_depth),
+            _initialize_chip_runtime(
+                self._impl,
+                device_id,
+                bins,
+                log_level=log_level,
+                prewarm_config=prewarm_config,
+                enable_sdma=enable_sdma,
+                collect_across_runs=_resolve_collect_across_runs(collect_across_runs, dfx_session),
+                workspace_budget_bytes=workspace_budget_bytes,
+                manage_workspace=manage_workspace,
+                requested_pipeline_depth=requested_pipeline_depth,
             )
             for slot_id, callable_obj in list(self._callable_registry.items()):
                 self._impl.register_callable(int(slot_id), callable_obj)

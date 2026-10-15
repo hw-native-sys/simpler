@@ -40,7 +40,7 @@ class _FakeImpl:
 
 class _FakeChipWorker:
     def __init__(self, answer):
-        self._impl = _FakeImpl(answer)
+        self.workspace_report = _FakeImpl(answer).workspace_report
 
 
 def _available(**fields):
@@ -183,7 +183,7 @@ def _l2_with_recording_chip(monkeypatch, **extra):
         def init(self, *_a, **kwargs):
             seen.update(kwargs)
 
-        def _register_callable_at_slot(self, *_a, **_k):  # pragma: no cover
+        def register_callable(self, *_a, **_k):  # pragma: no cover
             pass
 
         def finalize(self):  # pragma: no cover
@@ -196,7 +196,10 @@ def _l2_with_recording_chip(monkeypatch, **extra):
         def get_binaries(self, *_a, **_k):
             return object()
 
-    monkeypatch.setattr(worker_mod, "ChipWorker", _RecordingChip)
+    monkeypatch.setattr(worker_mod, "_ChipWorker", _RecordingChip)
+    monkeypatch.setattr(
+        worker_mod, "_initialize_chip_runtime", lambda chip, device, bins, **options: chip.init(device, bins, **options)
+    )
     monkeypatch.setattr(rb_mod, "RuntimeBuilder", _FakeBuilder)
     worker = worker_mod.Worker(2, device_id=0, **_COMMON, **extra)
     worker._init_level2()

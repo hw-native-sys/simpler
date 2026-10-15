@@ -82,6 +82,15 @@ still synchronous, and the old `simpler_kernel_mode_launch` stub and capability
 bit remain closed pending public Worker integration. Native completion events
 and their caller references are not a captured-graph lifetime contract.
 
+A direct L2 Python `Worker` owns the native `_ChipWorker` itself. Its callable
+handles, argument imports, source uses and close journal belong to `Worker`;
+there is no intervening public Python `ChipWorker` registry or lifecycle lock.
+The public compatibility `ChipWorker` and forked chip-child path retain their
+own wrapper lifecycle. Both initialize the native runtime through the same
+internal binary-path/logging adapter and execute through the existing native
+run lane. `Worker`'s operation lease and owner-thread close checks remain the
+direct L2 lifecycle authority.
+
 The direct `ChipWorker::submit_chip_run` / internal `_submit_chip_run_direct`
 entry accepts an optional caller stream. The lane validates it before admitting
 or preparing any new run. A successful return guarantees actual enqueue, not

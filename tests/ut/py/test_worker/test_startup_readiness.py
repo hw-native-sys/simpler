@@ -37,6 +37,7 @@ import time
 from functools import partial
 from multiprocessing import Event
 from multiprocessing.shared_memory import SharedMemory
+from types import SimpleNamespace
 from typing import Protocol
 
 import pytest
@@ -912,7 +913,7 @@ class TestLevel2Lifecycle:
                 pass
 
             def get_binaries(self, *_a, **_k):
-                return object()
+                return SimpleNamespace(host_path="unused", aicpu_path="unused", aicore_path="unused")
 
         # Mock the device/runtime layer so this stays device-free (no sim
         # binaries required) — the regression is purely the lifecycle state.
@@ -986,7 +987,7 @@ class TestLevel2Lifecycle:
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w.init()
             assert w._chip_worker is not None
-            impl = w._chip_worker._impl
+            impl = w._chip_worker
             w.run(callable_handle)
             w.submit(callable_handle).wait()
             # Both forms admit through the same lane entry point, so the direct
@@ -1005,7 +1006,7 @@ class TestLevel2Lifecycle:
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w.init()
             assert w._chip_worker is not None
-            impl = w._chip_worker._impl
+            impl = w._chip_worker
             w.submit(callable_handle)  # deliberately never waited
             assert not impl.lane_closed
             w.close()
@@ -1036,7 +1037,7 @@ class TestLevel2Lifecycle:
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w.init()
             assert w._chip_worker is not None
-            impl = w._chip_worker._impl
+            impl = w._chip_worker
             # The run itself fails, so waiting on the handle raises boom — the
             # lane's poison and the caller's error are the same failure, which
             # is what makes the close below a repeat rather than news.
@@ -1053,7 +1054,7 @@ class TestLevel2Lifecycle:
         with _hard_timeout(_TEST_WALL_BUDGET_S):
             w2.init()
             assert w2._chip_worker is not None
-            impl2 = w2._chip_worker._impl
+            impl2 = w2._chip_worker
             monkeypatch.setattr(impl2, "_close_chip_run_lane", _raiser(boom))
             w2.submit(handle2)
             assert w2._chip_runs
@@ -1649,9 +1650,14 @@ class TestLevel2Lifecycle:
                 pass
 
             def get_binaries(self, *_a, **_k):
-                return object()
+                return SimpleNamespace(host_path="unused", aicpu_path="unused", aicore_path="unused")
 
-        monkeypatch.setattr(worker_mod, "ChipWorker", chip_cls)
+        monkeypatch.setattr(worker_mod, "_ChipWorker", chip_cls)
+        monkeypatch.setattr(
+            worker_mod,
+            "_initialize_chip_runtime",
+            lambda chip, device, bins, **options: chip.init(device, bins, **options),
+        )
         monkeypatch.setattr(rb_mod, "RuntimeBuilder", _FakeBuilder)
         return Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
 
@@ -1663,20 +1669,20 @@ class TestLevel2Lifecycle:
         release = threading.Event()
         build_count = {"n": 0}
 
-        class _PausingChip:
+        class _PausingChip(FakeWorkspaceAccounting):
             def __init__(self):
                 build_count["n"] += 1
                 # The owner's close() reads this chip's workspace accounting
                 # before it releases anything, so the double carries the same
                 # native handle the real one does. No budget is latched, which
                 # is the answer that lets a teardown proceed.
-                self._impl = FakeWorkspaceAccounting()
+                super().__init__()
 
             def init(self, *_a, **_k):
                 entered.set()
                 assert release.wait(10.0)
 
-            def _register_callable_at_slot(self, *_a, **_k):  # pragma: no cover
+            def register_callable(self, *_a, **_k):  # pragma: no cover
                 pass
 
             def finalize(self):
@@ -1738,19 +1744,19 @@ class TestLevel2Lifecycle:
         cancel_latched = threading.Event()
         finalized = {"n": 0}
 
-        class _PausingChip:
+        class _PausingChip(FakeWorkspaceAccounting):
             def __init__(self):
                 # close() reads this chip's workspace accounting before it
                 # releases anything, so the double carries the same native
                 # handle the real one does. No budget is latched here, which is
                 # the answer that lets a teardown proceed.
-                self._impl = FakeWorkspaceAccounting()
+                super().__init__()
 
             def init(self, *_a, **_k):
                 entered.set()
                 assert release.wait(10.0)
 
-            def _register_callable_at_slot(self, *_a, **_k):  # pragma: no cover
+            def register_callable(self, *_a, **_k):  # pragma: no cover
                 pass
 
             def finalize(self):

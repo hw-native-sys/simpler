@@ -135,8 +135,8 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         config = self._build_config(config_dict)
         chip_worker = self._chip_worker(worker)
 
-        chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
-        chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+        chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
+        chip_worker.register_callable(_SLOT_SECONDARY, callable_obj)
 
         for _ in range(2):
             test_args = self.generate_args(params)
@@ -144,7 +144,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
             golden_args = test_args.clone()
             self.compute_golden(golden_args, params)
 
-            chip_worker._run_slot(_SLOT_PRIMARY, chip_args, config=config)
+            chip_worker.run(_SLOT_PRIMARY, chip_args, config=config)
             _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
         test_args = self.generate_args(params)
@@ -152,11 +152,11 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
 
-        chip_worker._run_slot(_SLOT_SECONDARY, chip_args, config=config)
+        chip_worker.run(_SLOT_SECONDARY, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
-        chip_worker._unregister_slot(_SLOT_PRIMARY)
-        chip_worker._unregister_slot(_SLOT_SECONDARY)
+        chip_worker.unregister_callable(_SLOT_PRIMARY)
+        chip_worker.unregister_callable(_SLOT_SECONDARY)
 
     # ------------------------------------------------------------------
     # host_dlopen_count assertions (hbg path).
@@ -180,7 +180,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
         golden_args = test_args.clone()
         self.compute_golden(golden_args, params)
-        self._chip_worker(worker)._run_slot(slot, chip_args, config=config)
+        self._chip_worker(worker).run(slot, chip_args, config=config)
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
     def test_dlopen_count_same_slot_repeated_runs(self, st_platform, st_worker):
@@ -191,7 +191,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             prepared = True
             for _ in range(5):
                 self._run_one(st_worker, _SLOT_PRIMARY, config, case)
@@ -202,7 +202,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
             assert st_worker.aicpu_dlopen_count == baseline_aicpu, "hbg must not trigger any AICPU orch SO dlopens"
         finally:
             if prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
     def test_dlopen_count_two_slots_alternating(self, st_platform, st_worker):
         """prepare(primary)+prepare(secondary) + alternating runs x5 -> host_dlopen delta == 2."""
@@ -213,9 +213,9 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         secondary_prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             primary_prepared = True
-            chip_worker._register_callable_at_slot(_SLOT_SECONDARY, callable_obj)
+            chip_worker.register_callable(_SLOT_SECONDARY, callable_obj)
             secondary_prepared = True
             for _ in range(5):
                 self._run_one(st_worker, _SLOT_PRIMARY, config, case)
@@ -227,9 +227,9 @@ class TestPreparedCallableHbgA5(SceneTestCase):
             assert st_worker.aicpu_dlopen_count == baseline_aicpu
         finally:
             if secondary_prepared:
-                chip_worker._unregister_slot(_SLOT_SECONDARY)
+                chip_worker.unregister_callable(_SLOT_SECONDARY)
             if primary_prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
     def test_dlopen_count_double_prepare_raises(self, st_platform, st_worker):
         """prepare(primary) twice -> second call raises RuntimeError."""
@@ -237,13 +237,13 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             prepared = True
             with pytest.raises(RuntimeError):
-                chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+                chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
         finally:
             if prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
     def test_failed_double_prepare_closes_unpublished_host_handle(self, st_platform, st_worker):
         if not st_platform.endswith("sim"):
@@ -255,20 +255,20 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             prepared = True
             after_first_maps = _count_live_orch_so_mappings()
             assert st_worker.host_dlopen_count - baseline_count == 1
             assert after_first_maps == baseline_maps + 1
 
             with pytest.raises(RuntimeError):
-                chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+                chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
 
             assert st_worker.host_dlopen_count - baseline_count == 1
             assert _count_live_orch_so_mappings() == after_first_maps
         finally:
             if prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
         assert _count_live_orch_so_mappings() == baseline_maps
 
@@ -282,17 +282,17 @@ class TestPreparedCallableHbgA5(SceneTestCase):
         prepared = False
         chip_worker = self._chip_worker(st_worker)
         try:
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             prepared = True
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 1
-            chip_worker._unregister_slot(_SLOT_PRIMARY)
+            chip_worker.unregister_callable(_SLOT_PRIMARY)
             prepared = False
             after_unreg = st_worker.host_dlopen_count
             assert after_unreg - baseline == 1, (
                 f"unregister must NOT decrement the host dlopen counter; baseline={baseline}, after_unreg={after_unreg}"
             )
-            chip_worker._register_callable_at_slot(_SLOT_PRIMARY, callable_obj)
+            chip_worker.register_callable(_SLOT_PRIMARY, callable_obj)
             prepared = True
             self._run_one(st_worker, _SLOT_PRIMARY, config, case)
             assert st_worker.host_dlopen_count - baseline == 2, (
@@ -301,7 +301,7 @@ class TestPreparedCallableHbgA5(SceneTestCase):
             )
         finally:
             if prepared:
-                chip_worker._unregister_slot(_SLOT_PRIMARY)
+                chip_worker.unregister_callable(_SLOT_PRIMARY)
 
 
 if __name__ == "__main__":

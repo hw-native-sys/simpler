@@ -93,11 +93,8 @@ def test_l2_run_materializes_tensor_to_chip_args():
             captured["cid"] = cid
             captured["args"] = args
 
-    class _FakeChip:
-        _impl = _FakeImpl()
-
     w = Worker(level=2)
-    w._chip_worker = _FakeChip()  # type: ignore[assignment]
+    w._chip_worker = _FakeImpl()  # type: ignore[assignment]
     h = w._create_buffer_locked(16)  # 4 x f32
     try:
         shm = h.shm

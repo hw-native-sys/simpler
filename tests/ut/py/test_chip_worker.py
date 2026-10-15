@@ -452,6 +452,106 @@ class TestChipWorkerKernelSymbols:
         assert not worker.initialized
 
 
+class TestWorkerNativeChip:
+    def test_direct_worker_owns_native_chip_without_public_wrapper(self, monkeypatch, kernel_symbol_runtime):
+        import simpler.worker as worker_module  # noqa: PLC0415
+
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        runtime = kernel_symbol_runtime(borrowed=True, memory=True)
+        observer = ctypes.CDLL(str(runtime))
+        registered, unregistered, closed = (
+            observer.test_registrations(),
+            observer.test_unregistrations(),
+            observer.test_closes(),
+        )
+        bins = SimpleNamespace(host_path=runtime, aicpu_path=os.devnull, aicore_path=os.devnull)
+        monkeypatch.setattr(RuntimeBuilder, "get_binaries", lambda *_: bins)
+
+        def refuse_wrapper():
+            pytest.fail("direct L2 must not construct the public ChipWorker wrapper")
+
+        monkeypatch.setattr(worker_module, "ChipWorker", refuse_wrapper)
+        owner = Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
+        target = ChipCallable.build(signature=[], func_name="native_owner", binary=b"\0", children=[])
+        handle = owner.register(target)
+        try:
+            owner.init()
+            native = owner._chip_worker
+            assert native is not None
+            assert isinstance(native, _ChipWorker)
+            assert native._execution_environment is not None
+            assert native._execution_environment[4] is False
+            assert owner._resolve_handle(handle).ref_count == 1
+            assert observer.test_registrations() == registered + 1
+            alias = owner.register(target)
+            assert observer.test_registrations() == registered + 1
+            backing = owner.malloc(16)
+            data = bytearray(b"0123456789abcdef")
+            owner.copy_to(backing, data)
+            output = bytearray(16)
+            owner.copy_from(output, backing)
+            assert output == data
+            owner.free(backing)
+            source = Buffer.wrap(address=0x8000, nbytes=64, location=owner.device_location)
+            source.close()
+            owner.unregister(alias)
+            assert observer.test_unregistrations() == unregistered
+            owner.unregister(handle)
+            assert observer.test_unregistrations() == unregistered + 1
+        finally:
+            owner.close()
+        assert not native.initialized and native._execution_environment is None
+        assert owner._chip_worker is None and observer.test_closes() == closed + 1
+
+    @pytest.mark.parametrize("optional_paths", [False, True])
+    def test_shared_initializer_maps_binary_paths_and_runtime_options(self, monkeypatch, optional_paths):
+        import simpler.task_interface as task_module  # noqa: PLC0415
+
+        from simpler_setup.runtime_builder import RuntimeBinaries  # noqa: PLC0415
+
+        calls = []
+        fake = SimpleNamespace(init=lambda *args: calls.append(args))
+        log_levels = []
+        monkeypatch.setattr(task_module, "_initialize_host_log", log_levels.append)
+        bins = RuntimeBinaries(host_path=Path("host.so"), aicpu_path=Path("cpu.so"), aicore_path=Path("core.o"))
+        if optional_paths:
+            bins.dispatcher_path = Path("dispatcher.so")
+            bins.sim_context_path = Path("sim.so")
+            bins.sdma_warmup_path = Path("warmup.o")
+        config = CallConfig()
+        task_module._initialize_chip_runtime(
+            fake,
+            3,
+            bins,
+            log_level=30,
+            prewarm_config=config,
+            enable_sdma=True,
+            collect_across_runs=True,
+            workspace_budget_bytes=1234,
+            manage_workspace=True,
+            requested_pipeline_depth=4,
+        )
+        assert log_levels == [30]
+        assert calls == [
+            (
+                "host.so",
+                "cpu.so",
+                "core.o",
+                "dispatcher.so" if optional_paths else "",
+                3,
+                config,
+                True,
+                "sim.so" if optional_paths else "",
+                "warmup.o" if optional_paths else "",
+                True,
+                1234,
+                True,
+                4,
+            )
+        ]
+
+
 class TestChipWorkerExecutionEnvironment:
     @pytest.mark.parametrize("borrowed", [False, True])
     def test_environment_is_unique_and_survives_refusal(self, kernel_symbol_runtime, borrowed):
@@ -555,7 +655,7 @@ class TestChipWorkerExecutionEnvironment:
         options = {"borrowed_context_generation": 77} if borrowed else {}
         native.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
         owner = Worker(level=2)
-        owner._chip_worker = SimpleNamespace(_impl=native)
+        owner._chip_worker = native
         owner._lifecycle = _Lifecycle.READY
         try:
             location = owner.device_location
@@ -607,11 +707,9 @@ class TestChipWorkerBorrowedInit:
             return True
 
         owner._chip_worker = SimpleNamespace(
-            _impl=SimpleNamespace(
-                _execution_environment=native._execution_environment,
-                _validate_execution_context=native._validate_execution_context,
-                _submit_chip_run_direct=lambda *_: SimpleNamespace(wait=wait),
-            )
+            _execution_environment=native._execution_environment,
+            _validate_execution_context=native._validate_execution_context,
+            _submit_chip_run_direct=lambda *_: SimpleNamespace(wait=wait),
         )
         owner._lifecycle = _Lifecycle.READY
         try:
@@ -679,7 +777,7 @@ class TestChipWorkerBorrowedInit:
         native = _ChipWorker()
         native.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
         owner = Worker(level=2)
-        owner._chip_worker = SimpleNamespace(_impl=native)
+        owner._chip_worker = native
         owner._lifecycle = _Lifecycle.READY
         try:
             observer.test_validation(-88)
@@ -707,7 +805,7 @@ class TestChipWorkerBorrowedInit:
         chip = ChipWorker()
         chip._impl.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
         owner = Worker(level=2)
-        owner._chip_worker = chip
+        owner._chip_worker = chip._impl
         owner._lifecycle = _Lifecycle.READY
         backing = owner.malloc(16)
         host = bytearray(b"0123456789abcdef")
@@ -761,7 +859,7 @@ class TestChipWorkerBorrowedInit:
             started.set()
             assert acquired.wait(5), "native validation holds the lifecycle lock"
 
-        owner._chip_worker = SimpleNamespace(_impl=SimpleNamespace(_validate_execution_context=validate))
+        owner._chip_worker = SimpleNamespace(_validate_execution_context=validate)
         owner._lifecycle = _Lifecycle.READY
         thread = threading.Thread(target=contender)
         thread.start()
@@ -839,7 +937,7 @@ class TestChipWorkerBorrowedInit:
         handle = owner.register(target)
         alias = None if operation == "unregister_last" else owner.register(target)
         references = 1 if alias is None else 2
-        owner._chip_worker = chip
+        owner._chip_worker = chip._impl
         owner._lifecycle = _Lifecycle.READY
         chip._register_callable_at_slot(owner._resolve_handle(handle).slot_id, target)
         source = Buffer.wrap(address=0x8000, nbytes=64, location=owner.device_location)
@@ -901,7 +999,7 @@ class TestChipWorkerBorrowedInit:
         chip = ChipWorker()
         chip._impl.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
         owner = Worker(level=2)
-        owner._chip_worker = chip
+        owner._chip_worker = chip._impl
         owner._lifecycle = _Lifecycle.READY
         try:
             with pytest.raises(RuntimeError, match="teardown"):

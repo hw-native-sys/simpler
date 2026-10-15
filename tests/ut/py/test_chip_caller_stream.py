@@ -14,7 +14,6 @@ import ctypes
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 from test_kernel_caller_stream import _callable
@@ -108,7 +107,7 @@ def _run(arch, runtime, device, depth, borrowed):
     runs = []
     python_runs = []
     handle_owner = Worker(level=2)
-    handle_owner._chip_worker = SimpleNamespace(_impl=worker)
+    handle_owner._chip_worker = worker
     outputs = []
     size = 128 * 128
     nbytes = size * ctypes.sizeof(ctypes.c_float)

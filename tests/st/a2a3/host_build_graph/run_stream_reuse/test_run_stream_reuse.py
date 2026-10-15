@@ -209,11 +209,11 @@ class TestRunStreamReuseHbg(SceneTestCase):
         self.compute_golden(golden_args, params, subtract=subtract)
         chip_args, output_names = _build_chip_task_args(test_args, self.CALLABLE["orchestration"]["signature"])
         state = worker._resolve_handle(handle)
-        worker._chip_worker._run_slot_with_pipeline_lease(
+        worker._chip_worker._run_with_pipeline_lease(
             state.slot_id,
             chip_args,
-            slot_id,
-            generation,
+            slot_id=slot_id,
+            generation=generation,
             config=self._build_config(self.CASES[0].get("config", {})),
         )
         _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)

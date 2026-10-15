@@ -105,8 +105,8 @@ class TestPipelineSlotsTmr(SceneTestCase):
         else:
             chip_args, output_names = _build_chip_task_args(test_args, signature)
             state = worker._resolve_handle(handle)
-            worker._chip_worker._run_slot_with_pipeline_lease(
-                state.slot_id, chip_args, slot_id, next(self._generation_counter), config=config
+            worker._chip_worker._run_with_pipeline_lease(
+                state.slot_id, chip_args, slot_id=slot_id, generation=next(self._generation_counter), config=config
             )
         _compare_outputs(test_args, golden, output_names, self.RTOL, self.ATOL)
 

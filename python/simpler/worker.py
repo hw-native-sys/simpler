@@ -298,7 +298,9 @@ from .task_interface import (
     RemoteBufferHandle,
     TaskArgs,
     _bind_host_log_session_directory,
+    _ChipWorker,
     _flush_host_log_or_warn,
+    _initialize_chip_runtime,
     _initialize_host_log,
     _start_host_log_writer,
     _validate_host_control_access,
@@ -5632,7 +5634,7 @@ class Worker:
         self._prewarm_config: Any | None = None
 
         # Level-2 internals
-        self._chip_worker: ChipWorker | None = None
+        self._chip_worker: _ChipWorker | None = None
         # Live direct-chip runs by the run id their RunHandle carries. The lane
         # is the admission authority and holds its own FIFO; this only maps a
         # handle back to its run so waiting and finalization can find it.
@@ -7382,7 +7384,7 @@ class Worker:
     def _validate_chip_execution_context(self) -> None:
         """Reject before caller-state publication; retry with the required current context."""
         if self.level == 2 and self._chip_worker is not None:
-            self._chip_worker._impl._validate_execution_context()
+            self._chip_worker._validate_execution_context()
 
     @contextlib.contextmanager
     def _operation_lease(self, api: str, *, requires_execution_context: bool = True):
@@ -7756,7 +7758,7 @@ class Worker:
         with self._registry_lock:
             slot_id = self._identity_registry[handle.digest].slot_id
         try:
-            self._chip_worker._register_callable_at_slot(slot_id, target)
+            self._chip_worker.register_callable(slot_id, target)
         except Exception:
             with self._registry_lock:
                 self._rollback_handle_locked(handle)
@@ -8302,7 +8304,7 @@ class Worker:
                     remove_target = False
             elif self.level == 2:
                 assert self._chip_worker is not None
-                self._chip_worker._unregister_slot(cid)
+                self._chip_worker.unregister_callable(cid)
                 self._callable_registry.pop(cid, None)
                 self._identity_registry.pop(digest, None)
                 return
@@ -8417,7 +8419,7 @@ class Worker:
                     remove_target = False
             elif self.level == 2 and self._initialized:
                 assert chip_worker is not None
-                chip_worker._unregister_slot(cid)
+                chip_worker.unregister_callable(cid)
                 self._callable_registry.pop(cid, None)
                 self._identity_registry.pop(digest, None)
                 return
@@ -8832,7 +8834,7 @@ class Worker:
         cw = self._chip_worker
         if cw is None:
             return
-        status, report = cw._impl.workspace_report()
+        status, report = cw.workspace_report()
         if status == "disabled":
             return
         if status == "unavailable":
@@ -8862,13 +8864,14 @@ class Worker:
         # Buffer release (see _check_workspace_live), so it is the one route the
         # budget is supported on. Validated here, before the ChipWorker exists.
         workspace_budget = self._validated_workspace_budget(platform)
-        self._chip_worker = ChipWorker()
+        self._chip_worker = _ChipWorker()
         # The prebuilt runtime-arena is prewarmed inside cw.init for the declared
         # config's ring sizing (built right after the device comes up), so the
         # first run() with matching sizing skips the cold arena build. enable_sdma
         # opts this Worker into async-DMA (SDMA) workspace provisioning at init;
         # off by default so ordinary Workers create no SDMA streams.
-        self._chip_worker.init(
+        _initialize_chip_runtime(
+            self._chip_worker,
             device_id,
             binaries,
             prewarm_config=self._prewarm_config,
@@ -8882,7 +8885,7 @@ class Worker:
         assert self._chip_worker is not None
         for cid, target in self._callable_registry.items():
             if isinstance(target, ChipCallable):
-                self._chip_worker._register_callable_at_slot(cid, target)
+                self._chip_worker.register_callable(cid, target)
 
     def _init_hierarchical(self) -> None:
         device_ids = self._config.get("device_ids", [])
@@ -11458,7 +11461,7 @@ class Worker:
                 raise ValueError("Worker no longer has a live device context for source registration")
             if self._chip_worker is None:
                 raise ValueError("Worker no longer has a live device context for source registration")
-            environment = self._chip_worker._impl._execution_environment
+            environment = self._chip_worker._execution_environment
             if environment is None:
                 raise ValueError("Worker no longer has a live device context for source registration")
             if self._device_buffer_source is None:
@@ -11470,7 +11473,7 @@ class Worker:
                     and worker._lifecycle is _Lifecycle.READY
                     and not worker._source_context_failed
                     and worker._chip_worker is not None
-                    and worker._chip_worker._impl._execution_environment == environment,
+                    and worker._chip_worker._execution_environment == environment,
                 )
             self._device_buffer_source._check_context()
             return BufferLocation(self._device_buffer_source)
@@ -13003,7 +13006,7 @@ class Worker:
         try:
             chip_args = self._materialize_l2_args(args)
             native_entered = True
-            chip_run = self._chip_worker._impl._submit_chip_run_direct(callable_id, chip_args, cfg)
+            chip_run = self._chip_worker._submit_chip_run_direct(callable_id, chip_args, cfg)
         except BaseException:
             with self._registry_lock:
                 self._chip_run_touched_identities.pop(run_id, None)
@@ -13304,7 +13307,7 @@ class Worker:
         _validate_host_control_access(self._callable_registry.get(callable_id), TaskArgs() if args is None else args)
         chip_args = self._materialize_l2_args(args)
         assert self._chip_worker is not None
-        self._chip_worker._impl.run_materialized(callable_id, chip_args, cfg)
+        self._chip_worker.run_materialized(callable_id, chip_args, cfg)
 
     @property
     def aicpu_dlopen_count(self) -> int:
@@ -13994,14 +13997,12 @@ class Worker:
                     # every run waited, the poison is the error those waits
                     # already raised, and re-raising it here would turn a
                     # handled run failure into an unhandled close failure.
-                    impl = getattr(self._chip_worker, "_impl", None)
-                    if impl is not None:
-                        undelivered = bool(self._chip_runs)
-                        try:
-                            impl._close_chip_run_lane()
-                        except Exception:
-                            if undelivered:
-                                raise
+                    undelivered = bool(self._chip_runs)
+                    try:
+                        self._chip_worker._close_chip_run_lane()
+                    except Exception:
+                        if undelivered:
+                            raise
                     # Only a successful lane close proves completion for its unawaited runs.
                     # Uses retained after a reported error remain unproven, even after reset.
                     for run_id in tuple(self._chip_runs):

@@ -26,6 +26,7 @@ native register raise, and the failure surfaces to the caller of
 from __future__ import annotations
 
 import ctypes
+import os
 import signal
 import threading
 import time
@@ -244,12 +245,16 @@ class FakeWorkspaceAccounting:
 
 
 class _FakeChipImpl(FakeWorkspaceAccounting):
-    """The native-handle half of :class:`FakeChipWorker` (``cw._impl``)."""
+    """Native chip double, held directly by L2 and inside the chip-child wrapper."""
 
     supports_concurrent_native_prepare = False
 
-    def __init__(self, register_error: str | None = None) -> None:
+    def __init__(self, register_error: str | None = None, *, script: str = "ok") -> None:
         super().__init__()
+        self.script = script
+        self._blocks: dict[int, Any] = {}
+        self.initialized = False
+        self._execution_environment: tuple[int, int, int, int, bool] | None = None
         self._register_error = register_error
         self.submitted: list[tuple[int, Any]] = []
         self.lane_closed = False
@@ -261,6 +266,42 @@ class _FakeChipImpl(FakeWorkspaceAccounting):
         # Draining after finalize would wait on a device that is already gone.
         self.lane_closed_before_finalize: bool | None = None
         self.admission_stopped = False
+
+    def init(self, *args, **kwargs) -> None:
+        if self.script == "raises":
+            raise RuntimeError(CHIP_INIT_FAILURE)
+        if self.script == "hangs":
+            time.sleep(_HANG_S)
+        self.latch_workspace_budget(args[10])
+        self.initialized = True
+        self._execution_environment = (os.getpid(), id(self), 1, args[4], False)
+
+    def register_callable(self, _cid, _target) -> None:
+        if self._register_error is not None:
+            raise RuntimeError(self._register_error)
+
+    def unregister_callable(self, _cid) -> None:
+        pass
+
+    def malloc(self, size: int) -> int:
+        block = (ctypes.c_char * int(size))()
+        ptr = ctypes.addressof(block)
+        self._blocks[ptr] = block
+        return ptr
+
+    def free(self, ptr: int) -> None:
+        self._blocks.pop(int(ptr), None)
+
+    def copy_to(self, dst: int, src: int, size: int) -> None:
+        ctypes.memmove(dst, src, size)
+
+    def copy_from(self, dst: int, src: int, size: int) -> None:
+        ctypes.memmove(dst, src, size)
+
+    def finalize(self) -> None:
+        self.finalized = True
+        self.initialized = False
+        self._execution_environment = None
 
     def _stop_chip_run_lane_admission(self) -> None:
         """Reached only when the control loop could not establish resource ownership."""
@@ -297,8 +338,8 @@ class FakeChipWorker:
     ``malloc`` hands out are meaningful only in the process that made them —
     the same property a real device pointer has across the fork.
 
-    Build one with :func:`fake_chip_worker`; ``ChipWorker`` is constructed with
-    no arguments on both the L2 in-process and the forked chip-child paths.
+    Build one with :func:`fake_chip_worker` for the forked chip-child path.
+    The direct L2 path instead constructs :class:`_FakeChipImpl`.
     """
 
     pipeline_depth = 1
@@ -373,12 +414,13 @@ def fake_chip_worker(*, script: str = "ok", register_error: str | None = None):
 
 
 def install_fake_chip(monkeypatch, *, script: str = "ok", register_error: str | None = None) -> None:
-    """Bind the fake as ``simpler.worker.ChipWorker`` for the rest of the test.
+    """Bind native L2 and compatibility chip-child doubles for the rest of the test.
 
-    Must precede ``Worker.init()``: the chip child resolves the name at fork
-    time, and an L2 worker resolves it in-process during its own init.
+    Must precede ``Worker.init()``: the chip child resolves its wrapper at fork
+    time, and L2 resolves the native factory during its own init.
     """
     monkeypatch.setattr(worker_mod, "ChipWorker", fake_chip_worker(script=script, register_error=register_error))
+    monkeypatch.setattr(worker_mod, "_ChipWorker", lambda: _FakeChipImpl(register_error, script=script))
 
 
 @contextmanager
