@@ -67,7 +67,20 @@ Expected output ends with:
 ```text
 [global-tload-mpirun-l3] domain_rank=3 node=1 device_index=1 max_diff=0.000e+00
 global_tload_mpirun_l3 passed
+global_tload_mpirun_l3 cleanup ledger: worker 0 command=not_observed process=exited(0) cleanup=succeeded@rank0
 ```
+
+The ledger line comes after `passed` because `close()` is what produces it. It
+is this example's second assertion, and the only one on hardware that carries a
+release record end to end: rank 0 writes it beside the group manifest and L4
+reads it back after reaping `mpirun`. The check requires *an* answer on both
+counts — `unknown` fails it — but neither a `succeeded` release nor an
+`observed` command. A release that genuinely failed is a defect in whatever
+failed rather than in the ledger that reported it, and `command` reads
+`not_observed` on this route because no shutdown command is delivered to an
+mpirun group: the mailbox SHUTDOWN opcode is sent only from
+`RemoteL3Endpoint::request_progress_stop()`, which a healthy close never calls,
+so the group is reaped by SIGTERM instead.
 
 Any `max_diff` above the tolerance exits non-zero.
 

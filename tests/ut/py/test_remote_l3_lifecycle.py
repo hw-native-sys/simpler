@@ -14,11 +14,12 @@ import socket
 import struct
 import threading
 import time
-from typing import cast
+from typing import Any, Optional, cast
 
 import pytest
-from simpler import remote_l3_session, remote_l3_worker
+from simpler import remote_l3_protocol, remote_l3_session, remote_l3_worker
 from simpler.buffer import LocalEndpointBufferIdentityAllocator, create_host_shared_buffer, mint_owner_instance_id
+from simpler.session_cleanup import CleanupOutcome, ShutdownCommand, decode_runner_record
 from simpler.worker import RunHandle, Worker, _RunResources, _SharedExclusiveLock
 
 
@@ -347,7 +348,7 @@ def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch):
     monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda manifest, worker: {})
     monkeypatch.setattr(remote_l3_session, "_bind_listener", lambda _host, _port=0: sockets.pop(0))
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
-    monkeypatch.setattr(remote_l3_session, "_run_command_loop", lambda *args, **kwargs: None)
+    monkeypatch.setattr(remote_l3_session, "_run_command_loop", lambda *args, **kwargs: ShutdownCommand.NOT_OBSERVED)
 
     try:
         rc = remote_l3_session.run_session(
@@ -1055,3 +1056,110 @@ def test_session_scoped_buffer_entry_closes_its_own_backing():
 
     entry.close(unlink=True)
     assert buffer.shm is None
+
+
+def _shutdown_frame_bytes(session_id: int = 1, worker_id: int = 0) -> bytes:
+    header = remote_l3_protocol.FrameHeader(remote_l3_protocol.FrameType.SHUTDOWN, session_id, worker_id, 0)
+    return remote_l3_protocol.encode_frame(header, b"")
+
+
+def test_command_loop_reports_a_shutdown_frame_as_observed():
+    server, client = socket.socketpair()
+    with server, client:
+        client.sendall(_shutdown_frame_bytes())
+        observed = remote_l3_session._run_command_loop(server, _manifest(), cast(Any, object()))
+    assert observed is ShutdownCommand.OBSERVED
+
+
+def test_command_loop_reports_a_dropped_lane_as_not_observed():
+    # The parent destroying its transport without asking is the ordinary end of
+    # a session, but it leaves the shutdown command unacknowledged — which is a
+    # different fact, and the one the cleanup record has to carry.
+    server, client = socket.socketpair()
+    with server, client:
+        # Half-closed, not closed: the loop opens by sending HELLO, so the peer
+        # has to still be readable for the lane to reach the state under test —
+        # a session whose first read is EOF.
+        client.shutdown(socket.SHUT_WR)
+        observed = remote_l3_session._run_command_loop(server, _manifest(), cast(Any, object()))
+    assert observed is ShutdownCommand.NOT_OBSERVED
+
+
+class _StubInnerWorker:
+    """Inner Worker stand-in whose release outcome the test chooses."""
+
+    def __init__(self, *, release_error: Optional[BaseException] = None) -> None:
+        self._topology_worker_id = None
+        self.release_error = release_error
+        self.closes = 0
+
+    def init(self, *_args, **_kwargs) -> None:
+        return None
+
+    def close(self) -> None:
+        self.closes += 1
+        if self.release_error is not None:
+            raise self.release_error
+
+
+def _run_session_to_record(monkeypatch, capsys, *, release_error, observed):
+    """Drive run_session past its command lane and return (rc, decoded record)."""
+    stub = _StubInnerWorker(release_error=release_error)
+    monkeypatch.setattr(remote_l3_session, "Worker", lambda *_args, **_kwargs: stub)
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_dispatcher_registry", lambda _manifest: {})
+    monkeypatch.setattr(remote_l3_session, "_install_manifest_inner_registry", lambda _manifest, _worker: {})
+    monkeypatch.setattr(remote_l3_session, "_run_command_loop", lambda *_args: observed)
+    published: list[dict] = []
+
+    def _parent(payload):
+        published.append(payload)
+        # The runner only reaches its command lane once a parent attaches.
+        threading.Thread(
+            target=lambda: socket.create_connection(
+                (payload["command_host"], payload["command_port"]), timeout=5.0
+            ).close(),
+            daemon=True,
+        ).start()
+
+    rc = remote_l3_session.run_session(
+        _manifest(session_timeout_s=5.0, startup_remaining_s=5.0), None, ready_writer=_parent
+    )
+    assert published and published[0]["ok"] is True
+    lines = [line for line in capsys.readouterr().err.splitlines() if "cleanup-record" in line]
+    assert len(lines) == 1, f"expected exactly one cleanup record, got {lines}"
+    record = decode_runner_record(lines[0].split("cleanup-record", 1)[1].strip().encode("utf-8"))
+    return rc, record, stub
+
+
+def test_run_session_records_a_successful_release(monkeypatch, capsys):
+    rc, record, stub = _run_session_to_record(
+        monkeypatch, capsys, release_error=None, observed=ShutdownCommand.OBSERVED
+    )
+    assert rc == 0
+    assert stub.closes == 1  # the backstop in the finally does not release twice
+    assert record is not None
+    assert record.command is ShutdownCommand.OBSERVED
+    assert record.cleanup is CleanupOutcome.SUCCEEDED
+    assert record.failures == ()
+
+
+def test_run_session_reports_a_failed_release_instead_of_swallowing_it(monkeypatch, capsys):
+    # A failed release has to reach the launcher by both routes this session
+    # has: the record line and the exit status.
+    rc, record, stub = _run_session_to_record(
+        monkeypatch, capsys, release_error=RuntimeError("unlink refused"), observed=ShutdownCommand.OBSERVED
+    )
+    assert rc == 1
+    assert stub.closes == 1
+    assert record is not None
+    assert record.cleanup is CleanupOutcome.FAILED
+    assert len(record.failures) == 1
+    assert "unlink refused" in record.failures[0]
+
+
+def test_run_session_record_never_claims_an_unacknowledged_shutdown(monkeypatch, capsys):
+    # A loop that reports nothing (a stub, or a caller that discards the value)
+    # must not be read as a confirmed command.
+    _rc, record, _stub = _run_session_to_record(monkeypatch, capsys, release_error=None, observed=None)
+    assert record is not None
+    assert record.command is ShutdownCommand.NOT_OBSERVED

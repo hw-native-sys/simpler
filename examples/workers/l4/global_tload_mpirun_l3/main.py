@@ -42,6 +42,7 @@ import argparse
 import contextlib
 import struct
 
+from simpler.session_cleanup import CleanupOutcome, ShutdownCommand
 from simpler.task_interface import (
     CallConfig,
     CommBufferSpec,
@@ -71,6 +72,47 @@ def _parse_devices(value: str, *, label: str) -> tuple[int, ...]:
     return device_ids
 
 
+def _check_cleanup_ledger(worker: Worker, node_ids: tuple[int, ...]) -> None:
+    """Check that closing the group left L4 a usable release record for rank 0.
+
+    This is the one case that carries the record end to end on hardware: rank 0
+    writes it beside the group manifest and L4 reads it back after reaping
+    `mpirun`. The other ranks share no filesystem with L4 and report
+    `cleanup=UNKNOWN` by construction, so only rank 0 — `node_ids` is in rank
+    order — can be checked. Runs after `close()`, which is what populates the
+    ledger.
+
+    Two things are deliberately not required.
+
+    The release *outcome* need not be SUCCEEDED. A rank whose release fails is a
+    defect in whatever failed, not in the ledger, and the ledger reports it
+    rather than raising; demanding success here would make this example fail for
+    a reason it does not test. What it does require is an answer: UNKNOWN means
+    the record never arrived.
+
+    `command` is not required to be OBSERVED either, because no shutdown command
+    reaches this route. `MpiGroupMailboxChannel::shutdown()` runs only from
+    `RemoteL3Endpoint::request_progress_stop()`, which a healthy close never
+    calls, so the mailbox SHUTDOWN opcode is never sent and the group is reaped
+    by the SIGTERM backstop instead. The command is printed rather than asserted;
+    it reads `observed` once that delivery exists.
+    """
+    reports = worker.session_cleanup_reports()
+    rank0_worker_id = node_ids[0]
+    rank0 = reports.get(rank0_worker_id)
+    if rank0 is None:
+        raise AssertionError(
+            f"no cleanup ledger row for rank 0 (worker {rank0_worker_id}); ledger holds {sorted(reports)}"
+        )
+    if not rank0.committed:
+        raise AssertionError(f"rank 0 left no cleanup record L4 could read: {rank0.describe()}")
+    if rank0.command is ShutdownCommand.UNKNOWN:
+        raise AssertionError(f"rank 0 reported no shutdown-command outcome: {rank0.describe()}")
+    if rank0.cleanup is CleanupOutcome.UNKNOWN:
+        raise AssertionError(f"rank 0 reported no release outcome: {rank0.describe()}")
+    print(f"global_tload_mpirun_l3 cleanup ledger: {rank0.describe()}")
+
+
 def run(  # noqa: PLR0913, PLR0915 -- mirrors the CLI surface; one linear two-run flow like the mixed_l3 sibling
     *,
     local_host: str,
@@ -98,6 +140,11 @@ def run(  # noqa: PLR0913, PLR0915 -- mirrors the CLI surface; one linear two-ru
     worker: Worker | None = None
     domain_handle: GlobalCommDomainHandle | None = None
     parent_keepalive: list[TaskArgs] = []
+    node_ids: tuple[int, ...] = ()
+    # The ledger check below runs only for a workload that got as far as its
+    # golden comparison: on any earlier failure the group never reached a
+    # graceful shutdown, so its record would say nothing about this code.
+    workload_passed = False
     try:
         chip_callable = _build_tload_callable(platform, runtime)
         worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=session_timeout)
@@ -200,6 +247,7 @@ def run(  # noqa: PLR0913, PLR0915 -- mirrors the CLI surface; one linear two-ru
             raise AssertionError(f"peer TLOAD golden mismatch on domain rank(s) {failed_ranks}")
 
         print("global_tload_mpirun_l3 passed")
+        workload_passed = True
         return 0
     finally:
         parent_keepalive.clear()
@@ -207,7 +255,10 @@ def run(  # noqa: PLR0913, PLR0915 -- mirrors the CLI surface; one linear two-ru
             with contextlib.suppress(Exception):
                 domain_handle.release()
         if worker is not None:
+            # close() is what populates the ledger, so the check follows it.
             worker.close()
+            if workload_passed:
+                _check_cleanup_ledger(worker, node_ids)
 
 
 def _parse_args() -> argparse.Namespace:
