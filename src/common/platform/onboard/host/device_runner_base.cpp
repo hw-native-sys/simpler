@@ -1115,36 +1115,6 @@ int DeviceRunnerBase::setup_static_arena(
     // together until publication.
     ArenaBank &bank = this->arena_bank(arena_bank);
 
-    // Captured graphs can retain committed base addresses, so kernel mode
-    // forbids growing or releasing a region that is already committed. The
-    // check covers all three regions and completes before the transaction
-    // below, so a refusal allocates nothing and frees nothing.
-    if (execution_mode_latch().is_kernel()) {
-        const struct {
-            const DeviceArena &arena;
-            size_t cached_size;
-            size_t requested_size;
-            const char *name;
-        } regions[] = {
-            {bank.gm_heap, bank.cached_gm_heap_size, gm_heap_size, "gm_heap"},
-            {bank.gm_sm, bank.cached_gm_sm_size, gm_sm_size, "gm_sm"},
-            {bank.runtime_pool, bank.cached_runtime_arena_size, runtime_arena_size, "runtime_pool"},
-        };
-        for (const auto &region : regions) {
-            if (!kernel_arena_change_is_forbidden(
-                    region.arena.is_committed(), region.cached_size, region.requested_size
-                )) {
-                continue;
-            }
-            LOG_ERROR(
-                "setup_static_arena: kernel mode forbids %s committed region %s (cached %zu, requested %zu)",
-                region.requested_size == 0 ? "releasing" : "growing", region.name, region.cached_size,
-                region.requested_size
-            );
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-    }
-
     // The ledger keys a block by the one region that owns it, and the arena
     // allocation callback sees only a byte count, so each region names itself
     // just before its own backing is staged.

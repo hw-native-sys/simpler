@@ -206,6 +206,19 @@ Add tensors **in signature order**, before any scalars. Use `INPUT` for an
 input, `OUTPUT_EXISTING` for a caller-allocated output, and `INOUT` for an
 input/output view. `DataType` carries the element types.
 
+### Eager workspace capacity
+
+Owned and borrowed direct-L2 calls reuse internal arena capacity and grow it
+when a later invocation needs more storage. An empty first HBG call does not
+require a nonempty warmup or a new Worker before submitting a larger graph.
+A failed replacement allocation preserves the existing arena addresses and
+capacities; public submission errors retain their existing cleanup requirements.
+
+Each native run retains its bank through retirement. Concurrent HBG preparation
+uses a different bank, while shared-bank runtimes require compatible storage
+before preparing ahead of an executing run. This does not make capture/replay
+supported: captured graphs require their own address-retention contract.
+
 ### Borrowed device storage
 
 The example uses an initialized direct L2 Worker and a caller stream belonging

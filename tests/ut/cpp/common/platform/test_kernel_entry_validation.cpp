@@ -11,10 +11,7 @@
 
 #include <gtest/gtest.h>
 
-#include <cstdlib>
-
 #include "host/kernel_entry_validation.h"
-#include "utils/device_arena.h"
 
 namespace {
 
@@ -208,71 +205,6 @@ TEST(KernelEntryValidation, LaunchChecksPointersAndIdRange) {
         validate_kernel_launch_args(kCtx, MAX_REGISTERED_CALLABLE_IDS, kCallableImage, kStream),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
-}
-
-TEST(KernelArenaGuard, UncommittedRegionAcceptsAnyRequest) {
-    // Kernel mode must be able to establish capacity once, so nothing about an
-    // uncommitted region is refusable.
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(false, 0, 0));
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(false, 0, 4096));
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(false, 4096, 8192));
-}
-
-TEST(KernelArenaGuard, CommittedRegionRefusesGrowAndRelease) {
-    EXPECT_TRUE(kernel_arena_change_is_forbidden(true, 4096, 4097));
-    EXPECT_TRUE(kernel_arena_change_is_forbidden(true, 4096, 0));
-}
-
-TEST(KernelArenaGuard, CommittedRegionAllowsSameSizeAndShrink) {
-    // A shrink keeps the base and the committed size, so a captured graph's
-    // addresses survive it.
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(true, 4096, 4096));
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(true, 4096, 2048));
-    // Committed with nothing cached: asking for nothing changes nothing.
-    EXPECT_FALSE(kernel_arena_change_is_forbidden(true, 0, 0));
-}
-
-struct CountingBackend {
-    int frees = 0;
-    static void *alloc(void * /*ctx*/, size_t size) { return std::malloc(size); }
-    static void free_fn(void *ctx, void *ptr) {
-        static_cast<CountingBackend *>(ctx)->frees++;
-        std::free(ptr);
-    }
-};
-
-TEST(KernelArenaGuard, RefusalScanOverCommittedRegionsReleasesNothing) {
-    // setup_static_arena's three-region shape. The guard is evaluated over
-    // every region before any of them is touched, so reaching a refusal must
-    // leave each committed peer's base, size and committed flag intact —
-    // the arena commit sequence's rollback would free exactly these.
-    CountingBackend backend;
-    DeviceArena gm_heap(&CountingBackend::alloc, &CountingBackend::free_fn, &backend);
-    DeviceArena gm_sm(&CountingBackend::alloc, &CountingBackend::free_fn, &backend);
-    DeviceArena runtime_pool(&CountingBackend::alloc, &CountingBackend::free_fn, &backend);
-
-    const size_t cached[] = {4096, 2048, 1024};
-    DeviceArena *arenas[] = {&gm_heap, &gm_sm, &runtime_pool};
-    for (size_t i = 0; i < 3; ++i) {
-        arenas[i]->reserve(cached[i], 64);
-        ASSERT_NE(arenas[i]->commit(), nullptr);
-    }
-    const int frees_after_commit = backend.frees;
-    void *const bases[] = {gm_heap.base(), gm_sm.base(), runtime_pool.base()};
-
-    // The third region asks to grow; the first two are unchanged requests.
-    const size_t requested[] = {4096, 2048, 8192};
-    bool refused = false;
-    for (size_t i = 0; i < 3 && !refused; ++i) {
-        refused = kernel_arena_change_is_forbidden(arenas[i]->is_committed(), cached[i], requested[i]);
-    }
-
-    EXPECT_TRUE(refused);
-    EXPECT_EQ(backend.frees, frees_after_commit);
-    for (size_t i = 0; i < 3; ++i) {
-        EXPECT_TRUE(arenas[i]->is_committed());
-        EXPECT_EQ(arenas[i]->base(), bases[i]);
-    }
 }
 
 }  // namespace

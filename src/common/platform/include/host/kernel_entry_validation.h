@@ -34,21 +34,6 @@ inline bool kernel_binary_span_is_consistent(const void *binary, size_t size) {
     return (binary == nullptr) == (size == 0);
 }
 
-/* Kernel mode fixes an arena region's capacity at its first commit: a captured
-   graph retains the committed base address, so growing the region (which
-   reallocates) or releasing it invalidates an address the graph still names.
-   A shrink is permitted — it keeps both the base and the committed size.
-
-   A caller must evaluate this over every region it is about to touch before
-   mutating any of them. The arena commit sequence rolls back all regions on
-   failure, and that rollback releases the very bases this refusal exists to
-   preserve, so a refusal raised mid-sequence destroys what it is protecting. */
-inline bool kernel_arena_change_is_forbidden(bool committed, size_t cached_size, size_t requested_size) {
-    if (!committed) return false;
-    if (requested_size == 0) return cached_size != 0;
-    return requested_size > cached_size;
-}
-
 inline int validate_kernel_init_args(
     const void *ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
     size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size, const void *config,

@@ -14,11 +14,12 @@
 #include "orchestration_api.h"
 
 static void submit_state_write(const ChipTaskArgs &args, int32_t active, int32_t value) {
-    if (active == 0) return;
-    CoreTaskArgs task;
-    task.add_inout(args.tensor(0).ref());
-    task.add_scalar(static_cast<int64_t>(value));
-    rt_submit_aic_task(0, task);
+    for (int32_t i = 0; i < active; ++i) {
+        CoreTaskArgs task;
+        task.add_inout(args.tensor(0).ref());
+        task.add_scalar(static_cast<int64_t>(value));
+        rt_submit_aic_task(0, task);
+    }
 }
 
 extern "C" void state_from_scalars(const ChipTaskArgs &args) {

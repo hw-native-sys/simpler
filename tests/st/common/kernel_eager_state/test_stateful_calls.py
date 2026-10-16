@@ -105,10 +105,7 @@ def _run(platform, runtime, device, borrowed, host_controls):  # noqa: PLR0912 -
         if host_controls:
             control = owner.create_buffer(8)
             controls = (ctypes.c_int32 * 2).from_address(control.base)
-        steps = [(0, 99, 7), (1, 11, 11), (0, 123, 11), (1, 23, 23), (0, 456, 23)]
-        if borrowed and runtime == "host_build_graph":
-            # Borrowed arenas cannot grow after commit; this reserves the one-task image.
-            steps.insert(0, (1, 7, 7))
+        steps = [(0, 99, 7), (1, 11, 11), (4, 17, 17), (0, 123, 17), (8, 23, 23), (2, 29, 29), (0, 456, 29)]
         for active, value, expected in steps:
             args = TaskArgs()
             args.add_tensor(view, TensorArgType.INOUT)

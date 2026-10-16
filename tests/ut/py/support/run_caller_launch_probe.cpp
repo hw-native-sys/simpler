@@ -16,11 +16,14 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include "common/support/native_run_execution_peer.h"
 #include "device_runner.h"
 
 static int tokens[64], next_stream, next_event;
 static int fail_at, submits, syncs, copies;
+static int allocation_attempts, fail_allocation;
+static std::unordered_map<void *, size_t> live_allocations;
 static bool capture;
 static void *failed_destroy_event;
 static void *caller = &tokens[60];
@@ -33,10 +36,17 @@ static int step(const char *op, void *stream, void *event = nullptr) {
     return ++submits == fail_at ? -777 : 0;
 }
 extern "C" rtError_t rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
+    ++allocation_attempts;
+    if (allocation_attempts == fail_allocation) {
+        *out = nullptr;
+        return -777;
+    }
     *out = std::malloc(bytes);
+    if (*out != nullptr) live_allocations.emplace(*out, bytes);
     return *out ? 0 : -1;
 }
 extern "C" rtError_t rtFree(void *ptr) {
+    assert(live_allocations.erase(ptr) == 1);
     std::free(ptr);
     return 0;
 }
@@ -201,7 +211,64 @@ static void check(int fault, bool capturing) {
     runner.finish();
     assert(release_slot_persistent_args(slot, allocator) == 0);
 }
+static void check_arena_growth(SimplerExecutionMode mode) {
+    const size_t before = live_allocations.size();
+    {
+        DeviceRunner runner;
+        assert(runner.execution_mode_latch().latch(mode) == 0);
+        assert(runner.setup_static_arena(0, 4096, 2048, 1024) == 0);
+        assert(runner.setup_static_arena(1, 4096, 2048, 1024) == 0);
+        void *original[] = {
+            runner.acquire_pooled_gm_heap(0), runner.acquire_pooled_gm_sm(0), runner.acquire_pooled_runtime_arena(0)
+        };
+        void *other_bank[] = {
+            runner.acquire_pooled_gm_heap(1), runner.acquire_pooled_gm_sm(1), runner.acquire_pooled_runtime_arena(1)
+        };
+        for (void *base : original)
+            std::memset(base, 0xa5, 1024);
+        for (void *base : other_bank)
+            std::memset(base, 0x5a, 1024);
+        const size_t committed = live_allocations.size();
+        for (int failure = 1; failure <= 3; ++failure) {
+            fail_allocation = allocation_attempts + failure;
+            assert(runner.setup_static_arena(0, 8192, 4096, 2048) != 0);
+            assert(allocation_attempts == fail_allocation);
+            fail_allocation = 0;
+            assert(live_allocations.size() == committed);
+            assert(runner.acquire_pooled_gm_heap(0) == original[0]);
+            assert(runner.acquire_pooled_gm_sm(0) == original[1]);
+            assert(runner.acquire_pooled_runtime_arena(0) == original[2]);
+            for (void *base : original)
+                for (size_t i = 0; i < 1024; ++i)
+                    assert(static_cast<unsigned char *>(base)[i] == 0xa5);
+            const int attempts = allocation_attempts;
+            assert(runner.setup_static_arena(0, 4096, 2048, 1024) == 0);
+            assert(allocation_attempts == attempts);
+        }
+        assert(runner.setup_static_arena(0, 8192, 4096, 2048) == 0);
+        void *grown[] = {
+            runner.acquire_pooled_gm_heap(0), runner.acquire_pooled_gm_sm(0), runner.acquire_pooled_runtime_arena(0)
+        };
+        for (size_t i = 0; i < 3; ++i)
+            assert(grown[i] != original[i]);
+        const int attempts = allocation_attempts;
+        assert(runner.setup_static_arena(0, 4096, 2048, 1024) == 0);
+        assert(allocation_attempts == attempts);
+        assert(runner.acquire_pooled_gm_heap(0) == grown[0]);
+        assert(runner.acquire_pooled_gm_sm(0) == grown[1]);
+        assert(runner.acquire_pooled_runtime_arena(0) == grown[2]);
+        assert(runner.acquire_pooled_gm_heap(1) == other_bank[0]);
+        assert(runner.acquire_pooled_gm_sm(1) == other_bank[1]);
+        assert(runner.acquire_pooled_runtime_arena(1) == other_bank[2]);
+        for (void *base : other_bank)
+            for (size_t i = 0; i < 1024; ++i)
+                assert(static_cast<unsigned char *>(base)[i] == 0x5a);
+    }
+    assert(live_allocations.size() == before);
+}
 int main() {
+    check_arena_growth(SIMPLER_MODE_PROGRAM);
+    check_arena_growth(SIMPLER_MODE_KERNEL);
     check(0, false);
     // Positions 5 and 10 are optional timing marks; their failure is deliberately non-fatal.
     for (int fault : {1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13})

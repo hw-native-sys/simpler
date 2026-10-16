@@ -1192,11 +1192,12 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  *
  * Each call supplies its own config. TMR init validates config-derived scratch
  * sizes; HBG declares per-run banks whose sizes are determined at bind time.
- * Neither declaration commits those arenas. The kernel arena guard fixes each
- * region's capacity at its first commit: a later growth or release request
- * returns PTO_RUNTIME_ERR_INTERNAL. A caller needing larger regions must
- * finalize its runs and close the context before creating another context.
- * This resource guard alone does not establish capture support.
+ * Neither declaration commits those arenas. Native eager calls reuse an arena
+ * while its capacity suffices and transactionally replace it when more is
+ * needed. Native-run admission protects a shared bank; HBG per-run banks may
+ * prepare independently. Failed staging preserves the committed regions.
+ * Capture/replay remains unsupported; graph retention of arena addresses is
+ * not provided by this eager resource lifecycle.
  *
  * Every host_runtime.so exports all four entries below, so a consumer resolves
  * them unconditionally like the rest of the uniform ABI; supported answers the
@@ -1247,7 +1248,7 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  *
  * A successful call latches kernel mode on the context — mutually exclusive
  * with the program-mode simpler_init — and the latch controls the
- * kernel-mode guards on the platform's device/ACL lifecycle and arena paths.
+ * kernel-mode guards on the platform's device/ACL lifecycle.
  *
  * Takes no device ownership: no device reset and no ACL init/finalize. Creates
  * only context-owned persistent handles used by asynchronous preparation and
