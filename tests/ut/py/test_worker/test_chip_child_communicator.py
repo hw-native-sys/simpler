@@ -12,7 +12,6 @@ import ctypes
 import struct
 from contextlib import ExitStack
 from multiprocessing.shared_memory import SharedMemory
-from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
@@ -39,12 +38,16 @@ def shared_memory_granularity(monkeypatch, request):
 
 
 def _run_controls(monkeypatch, init_results, commands):
-    cw = MagicMock(spec_set=("comm_init", "_impl", "set_exported_device_regions_live"))
-    cw.comm_init.side_effect = init_results
-    cw._impl = SimpleNamespace(
-        comm_alloc_domain_windows=MagicMock(return_value=(0xC7, 0xB000)),
-        comm_release_domain_windows=MagicMock(),
+    cw = MagicMock(
+        spec_set=(
+            "comm_init",
+            "comm_alloc_domain_windows",
+            "comm_release_domain_windows",
+            "set_exported_device_regions_live",
+        )
     )
+    cw.comm_init.side_effect = init_results
+    cw.comm_alloc_domain_windows.return_value = (0xC7, 0xB000)
     responses = []
     owner = worker_mod.mint_owner_instance_id()
     store = ProviderRegionStore(
@@ -120,17 +123,17 @@ def test_bootstrap_handle_is_forwarded_without_mutating_runtime(monkeypatch):
     )
     assert responses == [(0, "")] * 4
     assert cw.comm_init.call_args_list == [call(0, 1, "/shared/rootinfo")] * 2
-    allocated = cw._impl.comm_alloc_domain_windows.call_args.args
+    allocated = cw.comm_alloc_domain_windows.call_args.args
     assert allocated[:5] == (0x1234, 7, [0], 0, 64)
     assert allocated[5] != 0
-    cw._impl.comm_release_domain_windows.assert_called_once_with(0x1234, 7, 1, 0)
+    cw.comm_release_domain_windows.assert_called_once_with(0x1234, 7, 1, 0)
     assert published == (1, 0xC7, 0xB000, 0)
 
     cold, refused, _ = _run_controls(monkeypatch, [], [worker_mod._CTRL_ALLOC_DOMAIN, worker_mod._CTRL_RELEASE_DOMAIN])
     assert all(code == 1 and "CTRL_COMM_INIT must succeed first" in message for code, message in refused)
     cold.comm_init.assert_not_called()
-    cold._impl.comm_alloc_domain_windows.assert_not_called()
-    cold._impl.comm_release_domain_windows.assert_not_called()
+    cold.comm_alloc_domain_windows.assert_not_called()
+    cold.comm_release_domain_windows.assert_not_called()
 
 
 @pytest.mark.parametrize("failed_init", [0, RuntimeError("init failed")])
@@ -156,9 +159,9 @@ def test_failed_bootstrap_rejects_domain_controls_until_retry(monkeypatch, faile
     assert responses[2][0] == 1
     assert ("returned 0 handle" if failed_init == 0 else "init failed") in responses[2][1]
     assert responses[5:] == [(0, "")] * 3
-    assert cw._impl.comm_alloc_domain_windows.call_count == 1
-    cw._impl.comm_release_domain_windows.assert_called_once_with(0x2345, 7, 1, 0)
-    assert cw._impl.comm_alloc_domain_windows.call_args.args[0] == 0x2345
+    assert cw.comm_alloc_domain_windows.call_count == 1
+    cw.comm_release_domain_windows.assert_called_once_with(0x2345, 7, 1, 0)
+    assert cw.comm_alloc_domain_windows.call_args.args[0] == 0x2345
 
 
 @pytest.mark.parametrize("failed_init", [0, RuntimeError("retry failed")])
@@ -177,5 +180,5 @@ def test_failed_reinitialization_preserves_the_established_handle(monkeypatch, f
     assert responses[1][0] == 1
     assert ("returned 0 handle" if failed_init == 0 else "retry failed") in responses[1][1]
     assert responses[2:] == [(0, "")] * 2
-    assert cw._impl.comm_alloc_domain_windows.call_args.args[0] == 0x3456
-    cw._impl.comm_release_domain_windows.assert_called_once_with(0x3456, 7, 1, 0)
+    assert cw.comm_alloc_domain_windows.call_args.args[0] == 0x3456
+    cw.comm_release_domain_windows.assert_called_once_with(0x3456, 7, 1, 0)

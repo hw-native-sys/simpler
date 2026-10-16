@@ -513,9 +513,76 @@ class TestChipWorkerKernelSymbols:
 
 
 class TestWorkerNativeChip:
-    def test_direct_worker_owns_native_chip_without_public_wrapper(self, monkeypatch, kernel_symbol_runtime):
+    @pytest.mark.parametrize("reject_prepare", [False, True])
+    def test_chip_child_owns_native_runtime_and_finalizes_once(
+        self, monkeypatch, kernel_symbol_runtime, reject_prepare
+    ):
         import simpler.worker as worker_module  # noqa: PLC0415
 
+        runtime = kernel_symbol_runtime(borrowed=True, memory=True)
+        observer = ctypes.CDLL(str(runtime))
+        registered, closed = observer.test_registrations(), observer.test_closes()
+        target = ChipCallable.build(signature=[], func_name="child_native", binary=b"\0", children=[])
+        bins = SimpleNamespace(host_path=runtime, aicpu_path=os.devnull, aicore_path=os.devnull)
+        captured = []
+        flushed = []
+
+        def refuse_wrapper():
+            pytest.fail("chip child must not construct the public ChipWorker wrapper")
+
+        def serve(native, *_args, prepared, **_kwargs):
+            assert isinstance(native, _ChipWorker)
+            assert native.initialized
+            assert native._execution_environment is not None
+            assert native._execution_environment[4] is False
+            assert prepared == {7}
+            backing = native.malloc(16)
+            payload = ctypes.create_string_buffer(b"0123456789abcdef")
+            result = ctypes.create_string_buffer(16)
+            native.copy_to(backing, ctypes.addressof(payload), 16)
+            native.copy_from(ctypes.addressof(result), backing, 16)
+            assert result.raw == payload.raw[:16]
+            native.free(backing)
+            captured.append(native)
+
+        monkeypatch.setattr("simpler.task_interface.ChipWorker", refuse_wrapper)
+        monkeypatch.setattr(worker_module, "_run_chip_main_loop", serve)
+        monkeypatch.setattr(worker_module, "_flush_host_log_or_warn", lambda context: flushed.append(context) or True)
+        mailbox = memoryview(bytearray(worker_module.mailbox_size(2)))
+        if reject_prepare:
+
+            def fail_preparation(*_args, **_kwargs):
+                raise RuntimeError("injected prepare failure")
+
+            monkeypatch.setattr(worker_module, "_ensure_prepared", fail_preparation)
+        worker_module._chip_process_loop(
+            mailbox,
+            bins,
+            0,
+            {7: target},
+            {},
+            {},
+            worker_module.mint_owner_instance_id(),
+            worker_module.mint_owner_instance_id(),
+            worker_module.mint_owner_instance_id(),
+            platform="a2a3sim",
+            runtime="tensormap_and_ringbuffer",
+        )
+        assert observer.test_registrations() == registered + (not reject_prepare)
+        assert observer.test_closes() == closed + 1
+        assert len(flushed) == 1
+        if reject_prepare:
+            assert captured == []
+            assert (
+                worker_module._mailbox_load_i32(worker_module._buffer_field_addr(mailbox, worker_module._OFF_STATE))
+                == worker_module._INIT_FAILED
+            )
+        else:
+            assert len(captured) == 1
+            assert not captured[0].initialized
+            assert captured[0]._execution_environment is None
+
+    def test_direct_worker_owns_native_chip_without_public_wrapper(self, monkeypatch, kernel_symbol_runtime):
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         runtime = kernel_symbol_runtime(borrowed=True, memory=True)
@@ -531,7 +598,7 @@ class TestWorkerNativeChip:
         def refuse_wrapper():
             pytest.fail("direct L2 must not construct the public ChipWorker wrapper")
 
-        monkeypatch.setattr(worker_module, "ChipWorker", refuse_wrapper)
+        monkeypatch.setattr("simpler.task_interface.ChipWorker", refuse_wrapper)
         owner = Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
         target = ChipCallable.build(signature=[], func_name="native_owner", binary=b"\0", children=[])
         handle = owner.register(target)

@@ -194,8 +194,8 @@ fires `CTRL_COMM_INIT` to every chip in parallel, which runs the base HCCL
 **cached** (`_comm_base_ready`), and the native chip runtime caches the
 communicator. Each chip child's serve loop records the handle returned by a
 successful `CTRL_COMM_INIT` and passes it explicitly to allocation/release
-controls. The control state does not live on the Python `ChipWorker` wrapper;
-failed initialization leaves the loop's previous handle unchanged. Native
+controls on its native chip binding. Failed initialization leaves the loop's
+previous handle unchanged. Native
 finalization retains ownership of communicator teardown.
 
 Consequently, when a `Worker` runs multiple times, or `allocate_domain` is

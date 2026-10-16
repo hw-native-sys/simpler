@@ -224,29 +224,8 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
         # route negotiates two frames without joining native launches.
         supports_joined_native_launch = False
 
-        def init(
-            self,
-            device_id,
-            bins,
-            *,
-            log_level,
-            prewarm_config=None,
-            enable_sdma=False,
-            collect_across_runs=False,
-            requested_pipeline_depth=0,
-        ):
-            events.append(
-                (
-                    "init",
-                    device_id,
-                    bins,
-                    log_level,
-                    prewarm_config,
-                    enable_sdma,
-                    collect_across_runs,
-                    requested_pipeline_depth,
-                )
-            )
+        def init(self, *args):
+            events.append(("init", *args))
 
         def finalize(self) -> None:
             events.append(("finalize",))
@@ -263,15 +242,16 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
         assert frames == granted_sets
         events.append(("main_loop", cw, chip_platform, chip_runtime))
 
-    monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
+    monkeypatch.setattr(worker_mod, "_ChipWorker", FakeChipWorker)
     monkeypatch.setattr(worker_mod, "_run_chip_main_loop", fake_run_chip_main_loop)
 
+    bins = SimpleNamespace(host_path="host.so", aicpu_path="aicpu.so", aicore_path="aicore.bin")
     shm = SharedMemory(create=True, size=worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST))
     try:
         assert shm.buf is not None
         worker_mod._chip_process_loop(
             shm.buf,
-            "bins",
+            bins,
             7,
             {},
             {},
@@ -288,7 +268,7 @@ def test_chip_process_loop_inits_runs_and_finalizes(monkeypatch):
 
     # A chip child asked for no particular capacity passes zero through, which is what makes the
     # grant the runtime's standing default rather than its published maximum.
-    assert events[0] == ("init", 7, "bins", 25, None, False, False, 0)
+    assert events[0] == ("init", "host.so", "aicpu.so", "aicore.bin", "", 7, None, False, "", "", False, 0, False, 0)
     assert events[1][0] == "main_loop"
     assert events[1][2:] == ("a2a3", "tensormap_and_ringbuffer")
     assert events[2] == ("finalize",)
@@ -332,8 +312,8 @@ def test_chip_child_configures_its_launch_depth_through_the_native_entry(monkeyp
         def configure_launch_depth(self, depth: int) -> None:
             configured_depths.append(int(depth))
 
-        def init(self, device_id, bins, **_kwargs):
-            del device_id, bins
+        def init(self, *_args):
+            pass
 
         def finalize(self) -> None:
             pass
@@ -347,7 +327,7 @@ def test_chip_child_configures_its_launch_depth_through_the_native_entry(monkeyp
         # cannot disagree about how many sets exist.
         assert sets == granted_sets
 
-    monkeypatch.setattr(worker_mod, "ChipWorker", FakeChipWorker)
+    monkeypatch.setattr(worker_mod, "_ChipWorker", FakeChipWorker)
     monkeypatch.setattr(worker_mod, "_run_chip_main_loop", fake_run_chip_main_loop)
 
     shm = SharedMemory(create=True, size=worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST))
@@ -355,7 +335,7 @@ def test_chip_child_configures_its_launch_depth_through_the_native_entry(monkeyp
         assert shm.buf is not None
         worker_mod._chip_process_loop(
             shm.buf,
-            "bins",
+            SimpleNamespace(host_path="host.so", aicpu_path="aicpu.so", aicore_path="aicore.bin"),
             0,
             {},
             {},
@@ -503,7 +483,7 @@ def test_sweep_l2_global_domains_attempts_every_domain_and_lists_failures_by_id(
         }
     )
     with pytest.raises(RuntimeError, match="domain cleanup failed") as exc_info:
-        worker_mod._sweep_l2_global_domains(cast(Any, SimpleNamespace(_impl=impl)), store)
+        worker_mod._sweep_l2_global_domains(cast(Any, impl), store)
     assert impl.released == [3, 5, 7]
     assert store.domains == {}
     message = str(exc_info.value)
@@ -560,7 +540,7 @@ def test_teardown_chip_process_resources_continues_and_aggregates_in_order():
     with pytest.raises(RuntimeError, match="chip process resource teardown failed") as exc_info:
         worker_mod._teardown_chip_process_resources(
             cast(Any, registry),
-            cast(Any, SimpleNamespace(_impl=impl)),
+            cast(Any, impl),
             domains,
             store,
         )
@@ -623,7 +603,7 @@ def test_teardown_chip_process_resources_lists_every_retained_resource():
     with pytest.raises(RuntimeError, match="chip process resource teardown failed") as exc_info:
         worker_mod._teardown_chip_process_resources(
             cast(Any, _RecordingImportRegistry()),
-            cast(Any, SimpleNamespace(_impl=_RecordingDomainImpl())),
+            cast(Any, _RecordingDomainImpl()),
             worker_mod._L2GlobalDomainStore(),
             store,
         )
@@ -670,7 +650,7 @@ def test_teardown_chip_process_resources_ignores_released_and_keeps_each_step_on
     )
     worker_mod._teardown_chip_process_resources(
         cast(Any, registry),
-        cast(Any, SimpleNamespace(_impl=impl)),
+        cast(Any, impl),
         domains,
         store,
     )
@@ -995,7 +975,7 @@ class _FakeNativeRunImpl:
         self._lane_poisoned = False
 
     def _stop_chip_run_lane_admission(self) -> None:
-        """The control loop reaches this through ``cw._impl`` when ownership is unknown.
+        """The control loop reaches this through the native chip entry when ownership is unknown.
 
         Stopping admission is not a recovery: whatever poisoned the lane stays poisoned, so a
         `close` that follows still reports it.
@@ -1247,12 +1227,12 @@ class _FakeNativeRunImpl:
             raise RuntimeError("fake chip run lane is poisoned")
 
 
-class _FakeTwoFrameChipWorker:
+class _FakeTwoFrameChipWorker(_FakeNativeRunImpl):
     """Collaborator double handed straight to ``_run_chip_main_loop`` in-process.
 
-    Distinct from ``_harness.FakeChipWorker``, which stands in for the class the
+    Distinct from ``_harness._FakeChipImpl``, which stands in for the class the
     forked chip child instantiates: this one is never bound as
-    ``worker.ChipWorker`` and never init'd or finalized, so it implements only
+    ``worker._ChipWorker`` and never init'd or finalized, so it implements only
     the two-frame native-run surface the loop drives.
     """
 
@@ -1260,7 +1240,7 @@ class _FakeTwoFrameChipWorker:
     launch_depth = 1
 
     def __init__(self, *, supports_concurrent_native_prepare: bool = False) -> None:
-        self._impl = _FakeNativeRunImpl(supports_concurrent_native_prepare=supports_concurrent_native_prepare)
+        super().__init__(supports_concurrent_native_prepare=supports_concurrent_native_prepare)
         self.malloc_called = threading.Event()
         self.unregister_calls: list[int] = []
         self.unregister_called = threading.Event()
@@ -1274,11 +1254,11 @@ class _FakeTwoFrameChipWorker:
         self.exported_device_regions_live = bool(live)
 
     def malloc(self, size: int) -> int:
-        self._impl.events.append(("malloc", int(size)))
+        self.events.append(("malloc", int(size)))
         self.malloc_called.set()
         return 0xCAFE
 
-    def _unregister_slot(self, cid: int) -> None:
+    def unregister_callable(self, cid: int) -> None:
         self.unregister_calls.append(int(cid))
         self.unregister_called.set()
         if self.unregister_error is not None:
@@ -1489,22 +1469,22 @@ def test_two_frame_stages_b_without_native_prepare_until_a_finalizes():
     try:
         harness.publish(0, 1)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
 
         harness.publish(1, 2)
         harness.wait_state(1, worker_mod._FRAME_STAGED)
         assert harness.preparation_disposition(1) == worker_mod._VALIDATED_ONLY
-        assert not harness.cw._impl.prepared[1].is_set()
+        assert not harness.cw.prepared[1].is_set()
         assert _mailbox_load_i32(harness.accepted_addr(1)) == 0
 
-        harness.cw._impl.completed[0].set()
-        assert harness.cw._impl.finalized[0].wait(5.0)
-        assert harness.cw._impl.launched[1].wait(5.0)
+        harness.cw.completed[0].set()
+        assert harness.cw.finalized[0].wait(5.0)
+        assert harness.cw.launched[1].wait(5.0)
         assert _mailbox_load_i32(harness.accepted_addr(1)) == worker_mod._TASK_ACCEPTED
-        harness.cw._impl.completed[1].set()
+        harness.cw.completed[1].set()
         harness.wait_state(1, worker_mod._TASK_DONE)
 
-        lifecycle = [event[:2] for event in harness.cw._impl.events if event[0] in {"prepare", "launch", "finalize"}]
+        lifecycle = [event[:2] for event in harness.cw.events if event[0] in {"prepare", "launch", "finalize"}]
         assert lifecycle == [
             ("prepare", 0),
             ("launch", 0),
@@ -1513,7 +1493,7 @@ def test_two_frame_stages_b_without_native_prepare_until_a_finalizes():
             ("launch", 1),
             ("finalize", 1),
         ]
-        launch_entries = [event for event in harness.cw._impl.events if event[0] == "launch_enter"]
+        launch_entries = [event for event in harness.cw.events if event[0] == "launch_enter"]
         assert launch_entries == [
             ("launch_enter", 0, 0, worker_mod._FRAME_STAGED),
             ("launch_enter", 1, 0, worker_mod._FRAME_STAGED),
@@ -1538,8 +1518,8 @@ def test_two_frame_swimlane_log_flush_before_completion(monkeypatch, chip_swimla
     try:
         harness.publish(0, 1, diagnostics=True, chip_swimlane=chip_swimlane)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
-        harness.cw._impl.completed[0].set()
+        assert harness.cw.launched[0].wait(5.0)
+        harness.cw.completed[0].set()
         if not chip_swimlane:
             harness.wait_state(0, worker_mod._TASK_DONE)
             assert not entered.is_set(), "PMU-only completion must not flush the Host log"
@@ -1556,7 +1536,7 @@ def test_two_frame_swimlane_log_flush_before_completion(monkeypatch, chip_swimla
 
 def test_two_frame_success_survives_successor_poison_during_recursive_progress(monkeypatch):
     harness = _TwoFrameLoopHarness()
-    lane = harness.cw._impl
+    lane = harness.cw
     progress = lane._progress
 
     def recursive_progress(target):
@@ -1589,12 +1569,12 @@ def test_two_frame_success_survives_successor_poison_during_recursive_progress(m
 def test_two_frame_publishes_launch_before_polling_immediate_completion():
     harness = _TwoFrameLoopHarness()
     try:
-        harness.cw._impl.completed[0].set()
+        harness.cw.completed[0].set()
         harness.publish(0, 1)
         harness.start()
         harness.wait_state(0, worker_mod._TASK_DONE)
 
-        assert harness.cw._impl.poll_states[0] == (0, worker_mod._TASK_LAUNCHED)
+        assert harness.cw.poll_states[0] == (0, worker_mod._TASK_LAUNCHED)
     finally:
         harness.close()
 
@@ -1607,29 +1587,29 @@ def test_two_frame_hbg_prepares_b_while_a_runs_but_accepts_only_after_launch():
     try:
         harness.publish(0, 1)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
 
         harness.publish(1, 2, state=worker_mod._PREPARE_READY)
         harness.wait_state(1, worker_mod._FRAME_STAGED)
         assert harness.preparation_disposition(1) == worker_mod._NATIVE_PREPARED
-        assert harness.cw._impl.prepared[1].is_set()
-        assert not harness.cw._impl.finalized[0].is_set()
-        assert not harness.cw._impl.launched[1].is_set()
+        assert harness.cw.prepared[1].is_set()
+        assert not harness.cw.finalized[0].is_set()
+        assert not harness.cw.launched[1].is_set()
         assert _mailbox_load_i32(harness.accepted_addr(1)) == 0
 
         _mailbox_store_i32(harness.state_addr(1), worker_mod._ACTIVATE)
-        assert harness.cw._impl.wait_for_non_head_progress(1)
-        assert not harness.cw._impl.launched[1].is_set()
+        assert harness.cw.wait_for_non_head_progress(1)
+        assert not harness.cw.launched[1].is_set()
         assert _mailbox_load_i32(harness.accepted_addr(1)) == 0
 
-        harness.cw._impl.completed[0].set()
-        assert harness.cw._impl.finalized[0].wait(5.0)
-        assert harness.cw._impl.launched[1].wait(5.0)
+        harness.cw.completed[0].set()
+        assert harness.cw.finalized[0].wait(5.0)
+        assert harness.cw.launched[1].wait(5.0)
         assert _mailbox_load_i32(harness.accepted_addr(1)) == worker_mod._TASK_ACCEPTED
-        harness.cw._impl.completed[1].set()
+        harness.cw.completed[1].set()
         harness.wait_state(1, worker_mod._TASK_DONE)
 
-        lifecycle = [event[:2] for event in harness.cw._impl.events if event[0] in {"prepare", "launch", "finalize"}]
+        lifecycle = [event[:2] for event in harness.cw.events if event[0] in {"prepare", "launch", "finalize"}]
         assert lifecycle == [
             ("prepare", 0),
             ("launch", 0),
@@ -1648,12 +1628,12 @@ def test_two_frame_hbg_publishes_failure_instead_of_staged_when_prepare_fails():
         chip_runtime="host_build_graph",
     )
     try:
-        harness.cw._impl.prepare_errors[(0, 11)] = RuntimeError("prepare failed")
+        harness.cw.prepare_errors[(0, 11)] = RuntimeError("prepare failed")
         harness.publish(0, 1)
         harness.start()
         harness.wait_state(0, worker_mod._TASK_FAILED)
-        assert not harness.cw._impl.prepared[0].is_set()
-        assert not harness.cw._impl.launched[0].is_set()
+        assert not harness.cw.prepared[0].is_set()
+        assert not harness.cw.launched[0].is_set()
         assert _mailbox_load_i32(harness.accepted_addr(0)) == 0
     finally:
         harness.close()
@@ -1669,20 +1649,20 @@ def test_two_frame_hbg_waits_for_first_token_to_launch_before_preparing_second()
         harness.publish(1, 2, state=worker_mod._PREPARE_READY)
         harness.start()
 
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
         harness.wait_state(1, worker_mod._FRAME_STAGED)
-        assert harness.cw._impl.prepared[1].is_set()
-        assert not harness.cw._impl.finalized[0].is_set()
-        assert [event[:2] for event in harness.cw._impl.events if event[0] in {"prepare", "launch"}] == [
+        assert harness.cw.prepared[1].is_set()
+        assert not harness.cw.finalized[0].is_set()
+        assert [event[:2] for event in harness.cw.events if event[0] in {"prepare", "launch"}] == [
             ("prepare", 0),
             ("launch", 0),
             ("prepare", 1),
         ]
 
         _mailbox_store_i32(harness.state_addr(1), worker_mod._ACTIVATE)
-        harness.cw._impl.completed[0].set()
-        assert harness.cw._impl.launched[1].wait(5.0)
-        harness.cw._impl.completed[1].set()
+        harness.cw.completed[0].set()
+        assert harness.cw.launched[1].wait(5.0)
+        harness.cw.completed[1].set()
         harness.wait_state(1, worker_mod._TASK_DONE)
     finally:
         harness.close()
@@ -1698,18 +1678,18 @@ def test_two_frame_hbg_prepares_and_launches_reverse_ready_frames_by_dispatch_id
         harness.publish(1, 1)
         harness.start()
 
-        assert harness.cw._impl.launched[1].wait(5.0)
-        assert not harness.cw._impl.launched[0].is_set()
-        assert [event[:2] for event in harness.cw._impl.events if event[0] in {"prepare", "launch"}] == [
+        assert harness.cw.launched[1].wait(5.0)
+        assert not harness.cw.launched[0].is_set()
+        assert [event[:2] for event in harness.cw.events if event[0] in {"prepare", "launch"}] == [
             ("prepare", 1),
             ("launch", 1),
             ("prepare", 0),
         ]
-        assert harness.cw._impl.prepare_identities == [(1, 11, 5, 1), (0, 11, 5, 2)]
+        assert harness.cw.prepare_identities == [(1, 11, 5, 1), (0, 11, 5, 2)]
 
-        harness.cw._impl.completed[1].set()
-        assert harness.cw._impl.launched[0].wait(5.0)
-        harness.cw._impl.completed[0].set()
+        harness.cw.completed[1].set()
+        assert harness.cw.launched[0].wait(5.0)
+        harness.cw.completed[0].set()
         harness.wait_state(0, worker_mod._TASK_DONE)
     finally:
         harness.close()
@@ -1725,20 +1705,20 @@ def test_two_frame_hbg_does_not_prepare_high_dispatch_successor_before_active_fr
         harness.publish(1, 1)
         harness.start()
 
-        assert harness.cw._impl.launched[1].wait(5.0)
+        assert harness.cw.launched[1].wait(5.0)
         harness.wait_state(0, worker_mod._FRAME_STAGED)
-        assert harness.cw._impl.prepared[0].is_set()
-        assert not harness.cw._impl.launched[0].is_set()
-        assert [event[:2] for event in harness.cw._impl.events if event[0] in {"prepare", "launch"}] == [
+        assert harness.cw.prepared[0].is_set()
+        assert not harness.cw.launched[0].is_set()
+        assert [event[:2] for event in harness.cw.events if event[0] in {"prepare", "launch"}] == [
             ("prepare", 1),
             ("launch", 1),
             ("prepare", 0),
         ]
 
         _mailbox_store_i32(harness.state_addr(0), worker_mod._ACTIVATE)
-        harness.cw._impl.completed[1].set()
-        assert harness.cw._impl.launched[0].wait(5.0)
-        harness.cw._impl.completed[0].set()
+        harness.cw.completed[1].set()
+        assert harness.cw.launched[0].wait(5.0)
+        harness.cw.completed[0].set()
         harness.wait_state(0, worker_mod._TASK_DONE)
     finally:
         harness.close()
@@ -1753,7 +1733,7 @@ def test_two_frame_hbg_defers_diagnostic_native_prepare_until_predecessor_finali
     try:
         harness.publish(0, 1, diagnostics=diagnostic_frame == "active")
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
 
         harness.publish(
             1,
@@ -1762,16 +1742,16 @@ def test_two_frame_hbg_defers_diagnostic_native_prepare_until_predecessor_finali
             diagnostics=diagnostic_frame == "successor",
         )
         harness.wait_state(1, worker_mod._FRAME_STAGED)
-        assert not harness.cw._impl.prepared[1].is_set()
+        assert not harness.cw.prepared[1].is_set()
 
         _mailbox_store_i32(harness.state_addr(1), worker_mod._ACTIVATE)
-        harness.cw._impl.completed[0].set()
-        assert harness.cw._impl.finalized[0].wait(5.0)
-        assert harness.cw._impl.launched[1].wait(5.0)
-        harness.cw._impl.completed[1].set()
+        harness.cw.completed[0].set()
+        assert harness.cw.finalized[0].wait(5.0)
+        assert harness.cw.launched[1].wait(5.0)
+        harness.cw.completed[1].set()
         harness.wait_state(1, worker_mod._TASK_DONE)
 
-        lifecycle = [event[:2] for event in harness.cw._impl.events if event[0] in {"prepare", "launch", "finalize"}]
+        lifecycle = [event[:2] for event in harness.cw.events if event[0] in {"prepare", "launch", "finalize"}]
         assert lifecycle == [
             ("prepare", 0),
             ("launch", 0),
@@ -1790,13 +1770,13 @@ def test_two_frame_launches_by_dispatch_id_when_frames_are_ready_in_reverse_orde
         harness.publish(0, 2)
         harness.publish(1, 1)
         harness.start()
-        assert harness.cw._impl.launched[1].wait(5.0)
-        assert not harness.cw._impl.prepared[0].is_set()
-        harness.cw._impl.completed[1].set()
-        assert harness.cw._impl.launched[0].wait(5.0)
-        harness.cw._impl.completed[0].set()
+        assert harness.cw.launched[1].wait(5.0)
+        assert not harness.cw.prepared[0].is_set()
+        harness.cw.completed[1].set()
+        assert harness.cw.launched[0].wait(5.0)
+        harness.cw.completed[0].set()
         harness.wait_state(0, worker_mod._TASK_DONE)
-        launches = [event for event in harness.cw._impl.events if event[0] == "launch"]
+        launches = [event for event in harness.cw.events if event[0] == "launch"]
         assert launches == [("launch", 1), ("launch", 0)]
     finally:
         harness.close()
@@ -1809,11 +1789,11 @@ def test_two_frame_prepare_ready_waits_for_sticky_activation():
         harness.start()
         harness.wait_state(0, worker_mod._FRAME_STAGED)
         assert harness.preparation_disposition(0) == worker_mod._VALIDATED_ONLY
-        assert not harness.cw._impl.prepared[0].is_set()
+        assert not harness.cw.prepared[0].is_set()
 
         _mailbox_store_i32(harness.state_addr(0), worker_mod._ACTIVATE)
-        assert harness.cw._impl.launched[0].wait(5.0)
-        harness.cw._impl.completed[0].set()
+        assert harness.cw.launched[0].wait(5.0)
+        harness.cw.completed[0].set()
         harness.wait_state(0, worker_mod._TASK_DONE)
     finally:
         harness.close()
@@ -1828,12 +1808,12 @@ def test_two_frame_hbg_lone_prepare_ready_stages_before_native_prepare():
         harness.publish(0, 1, state=worker_mod._PREPARE_READY)
         harness.start()
         harness.wait_state(0, worker_mod._FRAME_STAGED)
-        assert not harness.cw._impl.prepared[0].is_set()
+        assert not harness.cw.prepared[0].is_set()
 
         _mailbox_store_i32(harness.state_addr(0), worker_mod._ACTIVATE)
-        assert harness.cw._impl.launched[0].wait(5.0)
-        assert harness.cw._impl.prepared[0].is_set()
-        harness.cw._impl.completed[0].set()
+        assert harness.cw.launched[0].wait(5.0)
+        assert harness.cw.prepared[0].is_set()
+        harness.cw.completed[0].set()
         harness.wait_state(0, worker_mod._TASK_DONE)
     finally:
         harness.close()
@@ -1848,21 +1828,21 @@ def test_two_frame_hbg_prepares_already_staged_successor_after_active_claim():
         harness.publish(1, 2, state=worker_mod._PREPARE_READY)
         harness.start()
         harness.wait_state(1, worker_mod._FRAME_STAGED)
-        assert not harness.cw._impl.prepared[1].is_set()
+        assert not harness.cw.prepared[1].is_set()
 
         harness.publish(0, 1)
-        assert harness.cw._impl.launched[0].wait(5.0)
-        assert harness.cw._impl.prepared[1].wait(5.0)
-        assert [event[:2] for event in harness.cw._impl.events if event[0] in {"prepare", "launch"}] == [
+        assert harness.cw.launched[0].wait(5.0)
+        assert harness.cw.prepared[1].wait(5.0)
+        assert [event[:2] for event in harness.cw.events if event[0] in {"prepare", "launch"}] == [
             ("prepare", 0),
             ("launch", 0),
             ("prepare", 1),
         ]
 
         _mailbox_store_i32(harness.state_addr(1), worker_mod._ACTIVATE)
-        harness.cw._impl.completed[0].set()
-        assert harness.cw._impl.launched[1].wait(5.0)
-        harness.cw._impl.completed[1].set()
+        harness.cw.completed[0].set()
+        assert harness.cw.launched[1].wait(5.0)
+        harness.cw.completed[1].set()
         harness.wait_state(1, worker_mod._TASK_DONE)
     finally:
         harness.close()
@@ -1873,7 +1853,7 @@ def test_two_frame_processes_control_while_native_run_is_active():
     try:
         harness.publish(0, 1)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
 
         struct.pack_into("Q", harness.buf, worker_mod._OFF_CALLABLE, worker_mod._CTRL_MALLOC)
         struct.pack_into("Q", harness.buf, worker_mod._CTRL_OFF_ARG0, 4096)
@@ -1881,9 +1861,9 @@ def test_two_frame_processes_control_while_native_run_is_active():
         assert harness.cw.malloc_called.wait(5.0)
         assert _mailbox_load_i32(harness.mailbox_addr + _OFF_STATE) == worker_mod._CONTROL_DONE
         assert struct.unpack_from("Q", harness.buf, worker_mod._CTRL_OFF_RESULT)[0] == 0xCAFE
-        assert not harness.cw._impl.completed[0].is_set()
+        assert not harness.cw.completed[0].is_set()
 
-        harness.cw._impl.completed[0].set()
+        harness.cw.completed[0].set()
         harness.wait_state(0, worker_mod._TASK_DONE)
     finally:
         harness.close()
@@ -1894,15 +1874,15 @@ def test_two_frame_defers_unregister_until_active_native_run_finalizes():
     try:
         harness.publish(0, 1)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
 
         harness.publish_unregister()
         harness.assert_control_stays_pending()
         assert harness.cw.unregister_calls == []
         assert harness.identity_table == {harness.digest: 7}
 
-        harness.cw._impl.completed[0].set()
-        assert harness.cw._impl.finalized[0].wait(5.0)
+        harness.cw.completed[0].set()
+        assert harness.cw.finalized[0].wait(5.0)
         harness.wait_control_state(worker_mod._CONTROL_DONE)
         assert harness.cw.unregister_calls == [7]
         assert harness.identity_table == {}
@@ -1920,19 +1900,19 @@ def test_two_frame_defers_register_until_active_native_run_finalizes():
     try:
         harness.publish(0, 1)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
 
         harness.publish_register(callable_obj, payload_shm, digest)
         harness.assert_control_stays_pending()
-        assert harness.cw._impl.register_calls == []
+        assert harness.cw.register_calls == []
         assert digest not in harness.identity_table
 
-        harness.cw._impl.completed[0].set()
-        assert harness.cw._impl.finalized[0].wait(5.0)
+        harness.cw.completed[0].set()
+        assert harness.cw.finalized[0].wait(5.0)
         harness.wait_control_state(worker_mod._CONTROL_DONE)
-        assert len(harness.cw._impl.register_calls) == 1
+        assert len(harness.cw.register_calls) == 1
         cid = harness.identity_table[digest]
-        assert harness.cw._impl.register_calls[0][0] == cid
+        assert harness.cw.register_calls[0][0] == cid
         assert cid in harness.registry
         assert cid in harness.prepared
     finally:
@@ -1952,23 +1932,23 @@ def test_two_frame_defers_register_until_backend_prepared_frame_finalizes():
     try:
         harness.publish(0, 1)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
         harness.publish(1, 2, state=worker_mod._PREPARE_READY)
         harness.wait_state(1, worker_mod._FRAME_STAGED)
-        assert harness.cw._impl.prepared[1].is_set()
+        assert harness.cw.prepared[1].is_set()
 
         harness.publish_register(callable_obj, payload_shm, digest)
         harness.assert_control_stays_pending()
-        assert harness.cw._impl.register_calls == []
+        assert harness.cw.register_calls == []
 
         _mailbox_store_i32(harness.state_addr(1), worker_mod._ACTIVATE)
-        harness.cw._impl.completed[0].set()
-        assert harness.cw._impl.launched[1].wait(5.0)
+        harness.cw.completed[0].set()
+        assert harness.cw.launched[1].wait(5.0)
         harness.assert_control_stays_pending()
-        harness.cw._impl.completed[1].set()
+        harness.cw.completed[1].set()
         harness.wait_state(1, worker_mod._TASK_DONE)
         harness.wait_control_state(worker_mod._CONTROL_DONE)
-        assert len(harness.cw._impl.register_calls) == 1
+        assert len(harness.cw.register_calls) == 1
     finally:
         harness.close()
         payload_shm.close()
@@ -1987,11 +1967,11 @@ def test_two_frame_defers_final_unregister_while_matching_frame_is_staged():
         assert harness.cw.unregister_calls == []
 
         _mailbox_store_i32(harness.state_addr(0), worker_mod._ACTIVATE)
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
         harness.assert_control_stays_pending()
         assert harness.cw.unregister_calls == []
 
-        harness.cw._impl.completed[0].set()
+        harness.cw.completed[0].set()
         harness.wait_state(0, worker_mod._TASK_DONE)
         harness.wait_control_state(worker_mod._CONTROL_DONE)
         assert harness.cw.unregister_calls == [7]
@@ -2032,15 +2012,15 @@ def test_two_frame_shutdown_finalizes_active_and_fails_staged_without_launch():
     try:
         harness.publish(0, 1)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
         harness.publish(1, 2)
         harness.wait_state(1, worker_mod._FRAME_STAGED)
 
         _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._SHUTDOWN)
         harness.thread.join(5.0)
         assert not harness.thread.is_alive()
-        assert harness.cw._impl.finalized[0].is_set()
-        assert not harness.cw._impl.prepared[1].is_set()
+        assert harness.cw.finalized[0].is_set()
+        assert not harness.cw.prepared[1].is_set()
         assert _mailbox_load_i32(harness.state_addr(1)) == worker_mod._TASK_FAILED
     finally:
         harness.close()
@@ -2054,18 +2034,18 @@ def test_two_frame_shutdown_finalizes_backend_prepared_successor_once():
     try:
         harness.publish(0, 1)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
         harness.publish(1, 2, state=worker_mod._PREPARE_READY)
         harness.wait_state(1, worker_mod._FRAME_STAGED)
-        assert harness.cw._impl.prepared[1].is_set()
+        assert harness.cw.prepared[1].is_set()
 
         _mailbox_store_i32(harness.mailbox_addr + _OFF_STATE, worker_mod._SHUTDOWN)
         harness.thread.join(5.0)
         assert not harness.thread.is_alive()
         assert _mailbox_load_i32(harness.state_addr(1)) == worker_mod._TASK_FAILED
-        assert not harness.cw._impl.launched[1].is_set()
-        assert sum(event == ("finalize", 0) for event in harness.cw._impl.events) == 1
-        assert sum(event == ("finalize", 1) for event in harness.cw._impl.events) == 1
+        assert not harness.cw.launched[1].is_set()
+        assert sum(event == ("finalize", 0) for event in harness.cw.events) == 1
+        assert sum(event == ("finalize", 1) for event in harness.cw.events) == 1
     finally:
         harness.close()
 
@@ -2078,10 +2058,10 @@ def test_two_frame_stale_activation_finalizes_backend_prepared_successor_once():
     try:
         harness.publish(0, 1)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
         harness.publish(1, 2, state=worker_mod._PREPARE_READY)
         harness.wait_state(1, worker_mod._FRAME_STAGED)
-        assert harness.cw._impl.prepared[1].is_set()
+        assert harness.cw.prepared[1].is_set()
 
         # Identity is the entry's, so a stale activation is forged there: the child rechecks the
         # entry it staged under before it activates, and the frame no longer exists to it.
@@ -2089,12 +2069,12 @@ def test_two_frame_stale_activation_finalizes_backend_prepared_successor_once():
         struct.pack_into("=Q", harness.buf, entry_offset + worker_mod._OFF_ENTRY_DISPATCH_ID, 99)
         _mailbox_store_i32(harness.state_addr(1), worker_mod._ACTIVATE)
         harness.wait_state(1, worker_mod._TASK_FAILED)
-        assert not harness.cw._impl.launched[1].is_set()
-        assert sum(event == ("finalize", 1) for event in harness.cw._impl.events) == 1
+        assert not harness.cw.launched[1].is_set()
+        assert sum(event == ("finalize", 1) for event in harness.cw.events) == 1
 
-        harness.cw._impl.completed[0].set()
+        harness.cw.completed[0].set()
         harness.wait_state(0, worker_mod._TASK_DONE)
-        assert sum(event == ("finalize", 1) for event in harness.cw._impl.events) == 1
+        assert sum(event == ("finalize", 1) for event in harness.cw.events) == 1
     finally:
         harness.close()
 
@@ -2104,24 +2084,24 @@ def test_two_frame_reuses_completed_frame_for_next_staged_successor():
     try:
         harness.publish(0, 1)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
 
         harness.publish(1, 2, state=worker_mod._PREPARE_READY)
         harness.wait_state(1, worker_mod._FRAME_STAGED)
         assert _mailbox_load_i32(harness.accepted_addr(1)) == 0
 
-        harness.cw._impl.completed[0].set()
+        harness.cw.completed[0].set()
         harness.wait_state(0, worker_mod._TASK_DONE)
         _mailbox_store_i32(harness.state_addr(1), worker_mod._ACTIVATE)
         harness.wait_state(1, worker_mod._TASK_LAUNCHED)
         assert _mailbox_load_i32(harness.accepted_addr(1)) == worker_mod._TASK_ACCEPTED
 
-        harness.cw._impl.completed[0].clear()
+        harness.cw.completed[0].clear()
         harness.publish(0, 3, state=worker_mod._PREPARE_READY, generation=12)
         harness.wait_state(0, worker_mod._FRAME_STAGED)
         assert _mailbox_load_i32(harness.accepted_addr(0)) == 0
         lifecycle_before_c_activation = [
-            event[:2] for event in harness.cw._impl.events if event[0] in {"prepare", "launch", "finalize"}
+            event[:2] for event in harness.cw.events if event[0] in {"prepare", "launch", "finalize"}
         ]
         assert lifecycle_before_c_activation == [
             ("prepare", 0),
@@ -2131,15 +2111,15 @@ def test_two_frame_reuses_completed_frame_for_next_staged_successor():
             ("launch", 1),
         ]
 
-        harness.cw._impl.completed[1].set()
+        harness.cw.completed[1].set()
         harness.wait_state(1, worker_mod._TASK_DONE)
         _mailbox_store_i32(harness.state_addr(0), worker_mod._ACTIVATE)
         harness.wait_state(0, worker_mod._TASK_LAUNCHED)
         assert _mailbox_load_i32(harness.accepted_addr(0)) == worker_mod._TASK_ACCEPTED
-        harness.cw._impl.completed[0].set()
+        harness.cw.completed[0].set()
         harness.wait_state(0, worker_mod._TASK_DONE)
 
-        lifecycle = [event[:2] for event in harness.cw._impl.events if event[0] in {"prepare", "launch", "finalize"}]
+        lifecycle = [event[:2] for event in harness.cw.events if event[0] in {"prepare", "launch", "finalize"}]
         assert lifecycle == [
             ("prepare", 0),
             ("launch", 0),
@@ -2158,16 +2138,16 @@ def test_two_frame_reuses_completed_frame_for_next_staged_successor():
 def test_two_frame_launch_failure_does_not_accept_and_finalizes_once():
     harness = _TwoFrameLoopHarness()
     try:
-        harness.cw._impl.launch_errors[(0, 11)] = RuntimeError("launch failed")
+        harness.cw.launch_errors[(0, 11)] = RuntimeError("launch failed")
         harness.publish(0, 1)
         harness.start()
         harness.wait_state(0, worker_mod._TASK_FAILED)
 
         assert _mailbox_load_i32(harness.accepted_addr(0)) == 0
-        lifecycle = [event[:2] for event in harness.cw._impl.events if event[0] in {"prepare", "launch", "finalize"}]
+        lifecycle = [event[:2] for event in harness.cw.events if event[0] in {"prepare", "launch", "finalize"}]
         assert lifecycle == [("prepare", 0), ("finalize", 0)]
-        assert harness.cw._impl.finalized[0].is_set()
-        assert sum(event == ("finalize", 0) for event in harness.cw._impl.events) == 1
+        assert harness.cw.finalized[0].is_set()
+        assert sum(event == ("finalize", 0) for event in harness.cw.events) == 1
     finally:
         harness.close()
 
@@ -2175,8 +2155,8 @@ def test_two_frame_launch_failure_does_not_accept_and_finalizes_once():
 def test_two_frame_launch_cleanup_failure_terminalizes_staged_successor():
     harness = _TwoFrameLoopHarness()
     try:
-        harness.cw._impl.launch_errors[(0, 11)] = RuntimeError("launch failed")
-        harness.cw._impl.finalize_errors[(0, 11)] = RuntimeError("launch cleanup failed")
+        harness.cw.launch_errors[(0, 11)] = RuntimeError("launch failed")
+        harness.cw.finalize_errors[(0, 11)] = RuntimeError("launch cleanup failed")
         harness.publish(0, 1)
         harness.publish(1, 2)
         harness.start()
@@ -2185,8 +2165,8 @@ def test_two_frame_launch_cleanup_failure_terminalizes_staged_successor():
         harness.wait_state(1, worker_mod._TASK_FAILED)
         harness.thread.join(5.0)
         assert not harness.thread.is_alive()
-        assert not harness.cw._impl.prepared[1].is_set()
-        assert not harness.cw._impl.launched[1].is_set()
+        assert not harness.cw.prepared[1].is_set()
+        assert not harness.cw.launched[1].is_set()
         assert _mailbox_load_i32(harness.accepted_addr(1)) == 0
     finally:
         harness.close()
@@ -2198,22 +2178,22 @@ def test_two_frame_native_progress_failure_terminalizes_staged_successor(failure
     try:
         harness.publish(0, 1)
         harness.start()
-        assert harness.cw._impl.launched[0].wait(5.0)
+        assert harness.cw.launched[0].wait(5.0)
         harness.publish(1, 2)
         harness.wait_state(1, worker_mod._FRAME_STAGED)
 
         if failure_point == "poll":
-            harness.cw._impl.poll_errors[(0, 11)] = RuntimeError("poll failed")
+            harness.cw.poll_errors[(0, 11)] = RuntimeError("poll failed")
         else:
-            harness.cw._impl.finalize_errors[(0, 11)] = RuntimeError("finalize failed")
-            harness.cw._impl.completed[0].set()
+            harness.cw.finalize_errors[(0, 11)] = RuntimeError("finalize failed")
+            harness.cw.completed[0].set()
 
         harness.wait_state(0, worker_mod._TASK_FAILED)
         harness.wait_state(1, worker_mod._TASK_FAILED)
         harness.thread.join(5.0)
         assert not harness.thread.is_alive()
-        assert not harness.cw._impl.prepared[1].is_set()
-        assert not harness.cw._impl.launched[1].is_set()
+        assert not harness.cw.prepared[1].is_set()
+        assert not harness.cw.launched[1].is_set()
         assert _mailbox_load_i32(harness.accepted_addr(1)) == 0
     finally:
         harness.close()
@@ -6325,13 +6305,13 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             struct.pack_into("<Q", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, 4096)
             struct.pack_into("<I", req_buf, worker_mod._DOMAIN_REQ_HEADER.size + 8, 0)
 
-            cw = cast(Any, SimpleNamespace(_impl=SimpleNamespace()))
+            cw = cast(Any, SimpleNamespace())
 
             def committed(*args):
                 ctypes.c_uint64.from_address(args[5]).value = 1
                 return 0xC7, 0xB000
 
-            cw._impl.comm_alloc_domain_windows = committed
+            cw.comm_alloc_domain_windows = committed
             mailbox = memoryview(bytearray(worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST)))
             for offset, shm_name in (
                 (worker_mod._OFF_ARGS, request.name),
@@ -6364,8 +6344,8 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 ctypes.c_uint64.from_address(commit_address).value = 1
                 raise MemoryError("tuple conversion failed")
 
-            cw = cast(Any, SimpleNamespace(_impl=SimpleNamespace()))
-            cw._impl.comm_alloc_domain_windows = committed_then_failed
+            cw = cast(Any, SimpleNamespace())
+            cw.comm_alloc_domain_windows = committed_then_failed
             mailbox = memoryview(bytearray(worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST)))
             for offset, shm_name in (
                 (worker_mod._OFF_ARGS, request.name),
@@ -8340,9 +8320,8 @@ class TestChipMainLoopDigestRegister:
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         cw = MagicMock()
-        cw._impl = MagicMock()
-        cw._unregister_slot = MagicMock()
-        cw._impl.register_callable_from_blob = MagicMock()
+        cw.unregister_callable = MagicMock()
+        cw.register_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         digest = _chip_digest(callable_obj)
@@ -8360,9 +8339,9 @@ class TestChipMainLoopDigestRegister:
                 )
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 0
-                assert cw._unregister_slot.call_count == 0
-                cw._impl.register_callable_from_blob.assert_called_once()
-                assert cw._impl.register_callable_from_blob.call_args.args[0] == 0
+                assert cw.unregister_callable.call_count == 0
+                cw.register_callable_from_blob.assert_called_once()
+                assert cw.register_callable_from_blob.call_args.args[0] == 0
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)
@@ -8376,9 +8355,8 @@ class TestChipMainLoopDigestRegister:
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         cw = MagicMock()
-        cw._impl = MagicMock()
-        cw._unregister_slot = MagicMock()
-        cw._impl.register_callable_from_blob = MagicMock()
+        cw.unregister_callable = MagicMock()
+        cw.register_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         payload = ctypes.string_at(int(callable_obj.buffer_ptr()), int(callable_obj.buffer_size()))
@@ -8403,7 +8381,7 @@ class TestChipMainLoopDigestRegister:
                     payload_size=len(payload),
                 )
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                cw._impl.register_callable_from_blob.assert_called_once()
+                cw.register_callable_from_blob.assert_called_once()
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)
@@ -8417,9 +8395,8 @@ class TestChipMainLoopDigestRegister:
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         cw = MagicMock()
-        cw._impl = MagicMock()
-        cw._unregister_slot = MagicMock()
-        cw._impl.register_callable_from_blob = MagicMock()
+        cw.unregister_callable = MagicMock()
+        cw.register_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         wrong_digest = _chip_digest(_unique_chip_callable(8))
@@ -8441,8 +8418,8 @@ class TestChipMainLoopDigestRegister:
                 err = self._wait_for_done_and_reset(buf, state_addr)
                 assert err == 1
                 assert "HASHID_DESCRIPTOR_MISMATCH" in self._read_error_message(buf)
-                cw._impl.register_callable_from_blob.assert_not_called()
-                cw._unregister_slot.assert_not_called()
+                cw.register_callable_from_blob.assert_not_called()
+                cw.unregister_callable.assert_not_called()
                 assert registry == {}
                 assert identity_table == {}
                 assert identity_refs == {}
@@ -8459,9 +8436,8 @@ class TestChipMainLoopDigestRegister:
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         cw = MagicMock()
-        cw._impl = MagicMock()
-        cw._unregister_slot = MagicMock()
-        cw._impl.register_callable_from_blob = MagicMock()
+        cw.unregister_callable = MagicMock()
+        cw.register_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         digest = _chip_digest(callable_obj)
@@ -8487,8 +8463,8 @@ class TestChipMainLoopDigestRegister:
                     digest=digest,
                 )
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                assert cw._unregister_slot.call_count == 0
-                assert cw._impl.register_callable_from_blob.call_count == 1
+                assert cw.unregister_callable.call_count == 0
+                assert cw.register_callable_from_blob.call_count == 1
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)
@@ -8502,9 +8478,8 @@ class TestChipMainLoopDigestRegister:
         from unittest.mock import MagicMock  # noqa: PLC0415
 
         cw = MagicMock()
-        cw._impl = MagicMock()
-        cw._unregister_slot = MagicMock()
-        cw._impl.register_callable_from_blob = MagicMock()
+        cw.unregister_callable = MagicMock()
+        cw.register_callable_from_blob = MagicMock()
 
         callable_obj = _unique_chip_callable(7)
         digest = _chip_digest(callable_obj)
@@ -8533,11 +8508,11 @@ class TestChipMainLoopDigestRegister:
 
                 self._send_ctrl_unregister(buf, state_addr, digest=digest)
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                assert cw._unregister_slot.call_count == 0
+                assert cw.unregister_callable.call_count == 0
 
                 self._send_ctrl_unregister(buf, state_addr, digest=digest)
                 assert self._wait_for_done_and_reset(buf, state_addr) == 0
-                cw._unregister_slot.assert_called_once_with(0)
+                cw.unregister_callable.assert_called_once_with(0)
             finally:
                 self._shutdown(state_addr)
                 t.join(timeout=2.0)

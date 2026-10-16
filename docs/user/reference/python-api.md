@@ -148,7 +148,9 @@ every level. The L2 leaf resolves those views into the internal
 `ChipStorageTaskArgs` / `ChipTensor` representation; callers do not pass that
 internal representation to `Worker.run()`.
 
-Direct L2 `Worker` owns its native chip binding and its own callable handles.
+Direct L2 `Worker` and forked chip children each own a native chip binding.
+They share runtime initialization; the parent Worker owns public callable handles,
+and each child resolves them to its local native slots.
 The lower-level public `ChipWorker` remains a separate compatibility entry;
 its handles and Python registry are not used by `Worker` internally.
 

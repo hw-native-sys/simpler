@@ -285,7 +285,6 @@ from .task_interface import (
     CallConfig,
     ChipCallable,
     ChipDomainContext,
-    ChipWorker,
     CommBufferSpec,
     CommDomainHandle,
     DeviceMemoryInfo,
@@ -819,7 +818,7 @@ _CTRL_RELEASE_DOMAIN = 8
 # Lazy base-comm init driven from Orchestrator.allocate_domain on first use.
 # Request shm carries `<II` header (rank, nranks) + NUL-terminated
 # rootinfo_path bytes.  Chip child calls cw.comm_init(rank, nranks,
-# rootinfo_path) and caches the handle on the ChipWorker so subsequent
+# rootinfo_path). The serve loop retains the successful handle so subsequent
 # CTRL_ALLOC_DOMAIN calls can find it.
 _CTRL_COMM_INIT = 9
 _CTRL_PY_REGISTER = 10
@@ -2799,7 +2798,7 @@ def _read_shm_name(buf, offset: int) -> str:
     return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
 
 
-def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview, *, base_comm_handle: int) -> None:
+def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_handle: int) -> None:
     """CTRL_ALLOC_DOMAIN handler — runs on the chip child.
 
     Reads the request shm (header + buffer_nbytes + rank_ids), calls
@@ -2837,7 +2836,7 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview, *, base_comm_hand
     assert reply_buf is not None
     try:
         handle = _require_base_communicator(base_comm_handle)
-        device_ctx, local_window_base = cw._impl.comm_alloc_domain_windows(
+        device_ctx, local_window_base = cw.comm_alloc_domain_windows(
             int(handle),
             int(allocation_id),
             rank_ids,
@@ -2866,7 +2865,7 @@ def _handle_ctrl_alloc_domain(cw: ChipWorker, buf: memoryview, *, base_comm_hand
         reply_shm.close()
 
 
-def _handle_ctrl_comm_init(cw: ChipWorker, buf: memoryview) -> int:
+def _handle_ctrl_comm_init(cw: _ChipWorker, buf: memoryview) -> int:
     """CTRL_COMM_INIT handler — drives `cw.comm_init` on the chip child.
 
     The native runtime caches the communicator and returns its existing
@@ -3027,7 +3026,7 @@ def _validate_local_global_header(
         raise RuntimeError(f"{operation}: domain identity must be positive")
 
 
-def _handle_ctrl_global_domain_prepare(cw: ChipWorker, buf: memoryview, store: _L2GlobalDomainStore) -> None:
+def _handle_ctrl_global_domain_prepare(cw: _ChipWorker, buf: memoryview, store: _L2GlobalDomainStore) -> None:
     staged, payload, payload_size = _open_global_domain_payload(buf)
     try:
         if payload_size < max(LOCAL_PREPARE_REQUEST.size, LOCAL_PREPARE_REPLY.size + GLOBAL_DOMAIN_DESCRIPTOR_BYTES):
@@ -3053,7 +3052,7 @@ def _handle_ctrl_global_domain_prepare(cw: ChipWorker, buf: memoryview, store: _
             local_base = prior.local_window_base
             mapping_size = prior.mapping_size
         else:
-            descriptor_bytes, local_base, mapping_size = cw._impl.comm_global_domain_prepare(
+            descriptor_bytes, local_base, mapping_size = cw.comm_global_domain_prepare(
                 int(domain_id),
                 int(domain_rank),
                 int(rank_count),
@@ -3068,7 +3067,7 @@ def _handle_ctrl_global_domain_prepare(cw: ChipWorker, buf: memoryview, store: _
                 or descriptor.mapping_size != mapping_size
                 or descriptor.mapping_size < window_size
             ):
-                cw._impl.comm_global_domain_release(int(domain_id))
+                cw.comm_global_domain_release(int(domain_id))
                 raise RuntimeError("Global CommDomain backend returned an inconsistent descriptor")
             store.domains[int(domain_id)] = _L2GlobalDomain(
                 domain_id=int(domain_id),
@@ -3097,7 +3096,7 @@ def _handle_ctrl_global_domain_prepare(cw: ChipWorker, buf: memoryview, store: _
         staged.close()
 
 
-def _handle_ctrl_global_domain_import(cw: ChipWorker, buf: memoryview, store: _L2GlobalDomainStore) -> None:
+def _handle_ctrl_global_domain_import(cw: _ChipWorker, buf: memoryview, store: _L2GlobalDomainStore) -> None:
     staged, payload, payload_size = _open_global_domain_payload(buf)
     try:
         if payload_size < LOCAL_IMPORT_REQUEST.size:
@@ -3124,7 +3123,7 @@ def _handle_ctrl_global_domain_import(cw: ChipWorker, buf: memoryview, store: _L
         if entry.descriptor_table and entry.descriptor_table != descriptor_bytes:
             raise RuntimeError("Global CommDomain repeated import carries a different descriptor table")
         if entry.device_ctx == 0:
-            entry.device_ctx = int(cw._impl.comm_global_domain_import(int(domain_id), descriptor_bytes))
+            entry.device_ctx = int(cw.comm_global_domain_import(int(domain_id), descriptor_bytes))
             if entry.device_ctx == 0:
                 raise RuntimeError("Global CommDomain backend returned a zero device context")
             entry.descriptor_table = descriptor_bytes
@@ -3146,7 +3145,7 @@ def _handle_ctrl_global_domain_import(cw: ChipWorker, buf: memoryview, store: _L
         staged.close()
 
 
-def _handle_ctrl_global_domain_release(cw: ChipWorker, buf: memoryview, store: _L2GlobalDomainStore) -> None:
+def _handle_ctrl_global_domain_release(cw: _ChipWorker, buf: memoryview, store: _L2GlobalDomainStore) -> None:
     staged, payload, payload_size = _open_global_domain_payload(buf)
     try:
         if payload_size < LOCAL_RELEASE_REQUEST.size:
@@ -3157,7 +3156,7 @@ def _handle_ctrl_global_domain_release(cw: ChipWorker, buf: memoryview, store: _
         if entry is not None and entry.generation != generation:
             raise RuntimeError("Global CommDomain release generation mismatch")
         if entry is not None:
-            cw._impl.comm_global_domain_release(int(domain_id))
+            cw.comm_global_domain_release(int(domain_id))
             store.domains.pop(int(domain_id), None)
     finally:
         payload.release()
@@ -3165,7 +3164,7 @@ def _handle_ctrl_global_domain_release(cw: ChipWorker, buf: memoryview, store: _
 
 
 def _handle_ctrl_global_domain_copy(
-    cw: ChipWorker, buf: memoryview, store: _L2GlobalDomainStore, *, copy_to_device: bool
+    cw: _ChipWorker, buf: memoryview, store: _L2GlobalDomainStore, *, copy_to_device: bool
 ) -> None:
     staged, payload, payload_size = _open_global_domain_payload(buf)
     try:
@@ -3213,13 +3212,13 @@ def _handle_ctrl_global_domain_copy(
         staged.close()
 
 
-def _sweep_l2_global_domains(cw: ChipWorker, store: _L2GlobalDomainStore) -> None:
+def _sweep_l2_global_domains(cw: _ChipWorker, store: _L2GlobalDomainStore) -> None:
     failures: list[tuple[int, BaseException]] = []
     first: BaseException | None = None
     for domain_id in sorted(store.domains):
         store.domains.pop(domain_id, None)
         try:
-            cw._impl.comm_global_domain_release(int(domain_id))
+            cw.comm_global_domain_release(int(domain_id))
         except BaseException as exc:  # noqa: BLE001
             if first is None:
                 first = exc
@@ -3269,7 +3268,7 @@ def _read_teardown_report(shm: SharedMemory, child_pid: int) -> TeardownReport:
         return TeardownReport()
 
 
-def _finalize_chip_worker_and_publish(buf: memoryview, cw: ChipWorker) -> None:
+def _finalize_chip_worker_and_publish(buf: memoryview, cw: _ChipWorker) -> None:
     """Run this child's one device teardown, then publish what it observed.
 
     Both child exits that own a teardown — the startup preparation failure and
@@ -3281,10 +3280,11 @@ def _finalize_chip_worker_and_publish(buf: memoryview, cw: ChipWorker) -> None:
     try:
         cw.finalize()
     finally:
+        _flush_host_log_or_warn("chip_process finalize")
         _publish_teardown_report(buf, cw)
 
 
-def _publish_teardown_report(buf: memoryview, cw: ChipWorker) -> None:
+def _publish_teardown_report(buf: memoryview, cw: _ChipWorker) -> None:
     """Publish this child's teardown observation on the control frame, payload first.
 
     The schema word is released last, so a parent that acquire-loads it has the
@@ -3306,7 +3306,7 @@ def _publish_teardown_report(buf: memoryview, cw: ChipWorker) -> None:
 
 def _teardown_chip_process_resources(
     import_registry: ImportRegistry,
-    cw: ChipWorker,
+    cw: _ChipWorker,
     global_domain_store: _L2GlobalDomainStore,
     provider_region_store: ProviderRegionStore,
 ) -> None:
@@ -3330,7 +3330,7 @@ def _teardown_chip_process_resources(
     raise aggregated
 
 
-def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview, *, base_comm_handle: int) -> None:
+def _handle_ctrl_release_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_handle: int) -> None:
     """CTRL_RELEASE_DOMAIN handler — collective free for one allocation."""
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
@@ -3343,7 +3343,7 @@ def _handle_ctrl_release_domain(cw: ChipWorker, buf: memoryview, *, base_comm_ha
         req_shm.close()
 
     handle = _require_base_communicator(base_comm_handle)
-    cw._impl.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
+    cw.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
 
 
 def _require_base_communicator(handle: int) -> int:
@@ -3359,12 +3359,12 @@ def _ensure_prepared(cw, registry, prepared, cid: int, *, device_id: int) -> Non
     callable_obj = registry.get(cid)
     if callable_obj is None:
         raise RuntimeError(f"chip_process dev={device_id}: cid {cid} not in registry")
-    cw._register_callable_at_slot(cid, callable_obj)
+    cw.register_callable(cid, callable_obj)
     prepared.add(cid)
 
 
 def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every dependency the handlers close over crosses the fork as an explicit arg, and the control handler carries one branch per sub-command
-    cw: ChipWorker,
+    cw: _ChipWorker,
     buf: memoryview,
     mailbox_addr: int,
     state_addr: int,
@@ -3510,7 +3510,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # the fence still publishes through the address the parent polls.
             if cfg.output_prefix:
                 _bind_host_log_session_directory()
-            cw._impl.run_materialized(
+            cw.run_materialized(
                 cid,
                 chip_args,
                 cfg,
@@ -3602,14 +3602,14 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         # prepared state for the reusable private slot.
                         if int(cid) in prepared:
                             try:
-                                cw._unregister_slot(int(cid))
+                                cw.unregister_callable(int(cid))
                             except Exception:  # noqa: BLE001
                                 pass
                             prepared.discard(int(cid))
                         exported = ctypes.c_char.from_buffer(shm_buf)
                         try:
                             addr = ctypes.addressof(exported)
-                            cw._impl.register_callable_from_blob(int(cid), addr)
+                            cw.register_callable_from_blob(int(cid), addr)
                         finally:
                             del exported
                         prepared.add(int(cid))
@@ -3630,7 +3630,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         # Mutate the resolver only after native unregister
                         # succeeds. A device error must not leave the digest
                         # absent locally while its prepared slot remains live.
-                        cw._unregister_slot(int(cid))
+                        cw.unregister_callable(int(cid))
                         identity_refs.pop(digest, None)
                         identity_table.pop(digest, None)
                         registry.pop(int(cid), None)
@@ -3734,7 +3734,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                     # moving the unsafe admission into cleanup rather than preventing it. Runs
                     # already launched keep their own drains.
                     try:
-                        cw._impl._stop_chip_run_lane_admission()  # noqa: SLF001 -- no public equivalent
+                        cw._stop_chip_run_lane_admission()  # noqa: SLF001 -- no public equivalent
                     except Exception as stop_error:  # noqa: BLE001
                         msg = (msg + "; " if msg else "") + _format_exc(
                             f"chip_process dev={device_id} stop chip run lane admission", stop_error
@@ -3904,7 +3904,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             chip_args = materialize_task_args(args, resolved)
             if staged.config.output_prefix:
                 _bind_host_log_session_directory()
-            staged.chip_run = cw._impl._submit_chip_run_materialized(
+            staged.chip_run = cw._submit_chip_run_materialized(
                 staged.cid,
                 chip_args,
                 staged.config,
@@ -4095,7 +4095,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         break
         finally:
             try:
-                cw._impl._close_chip_run_lane()
+                cw._close_chip_run_lane()
             except Exception as e:  # noqa: BLE001
                 shutdown_message += "; " + _format_exc("chip run lane close", e)
             for staged in list(staged_runs.values()):
@@ -4171,12 +4171,13 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     import traceback as _tb  # noqa: PLC0415
 
     try:
-        cw = ChipWorker()
+        cw = _ChipWorker()
         # Before init: the backend's own capability is only known once init binds the runtime, and
         # `ChipWorker.launch_depth` is where the request and that capability meet.
         if launch_depth > 1:
             cw.configure_launch_depth(launch_depth)
-        cw.init(
+        _initialize_chip_runtime(
+            cw,
             device_id,
             bins,
             log_level=log_level,
@@ -4235,7 +4236,10 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
         _tb.print_exc()
         _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} provider store", e))
         _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _INIT_FAILED)
-        cw.finalize()
+        try:
+            cw.finalize()
+        finally:
+            _flush_host_log_or_warn("chip_process finalize")
         return
     # Signal init success. The parent's readiness barrier waits for every chip
     # child to reach _INIT_READY before dispatching the first task, so the
@@ -13281,7 +13285,7 @@ class Worker:
         runtime reads — only without a mailbox, since the args are already in this process.
 
         ``args`` is a ``TaskArgs`` or ``None`` (no args). The chip-only POD
-        ``ChipStorageTaskArgs`` is not accepted here — submit it through ``ChipWorker._run_slot``.
+        ``ChipStorageTaskArgs`` is not accepted here; this boundary requires address-free ``TaskArgs``.
         """
         registry = self._chip_import_registry
         if registry is None:
