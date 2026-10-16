@@ -55,7 +55,8 @@ operation can run. It uses the runner's existing package indexes by default, avo
 full mirror refresh for ordinary CI dependencies. `setup-gcc-15` is the one
 exception: after installing its pinned Toolchain PPA source, it refreshes only
 that `.sources` file, retrying a failed refresh once with a 60-second bound per
-attempt. That isolated refresh disables list cleanup, preserving the runner's
+attempt. This source-file refresh treats transient download errors as failed
+attempts so they use the retry budget. It disables list cleanup, preserving the runner's
 Ubuntu indexes for the following install. A failed refresh is a warning; the
 required package install, bounded at four minutes and retried once for this
 PPA workload, decides whether the job can continue. An install from cached
