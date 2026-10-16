@@ -418,6 +418,12 @@ void ChipWorker::init(
         get_host_dlopen_count_fn_ = module->required<GetAicpuDlopenCountFn>("get_host_dlopen_count");
         get_run_stream_set_create_count_fn_ =
             module->required<GetAicpuDlopenCountFn>("get_run_stream_set_create_count");
+        // Optional: only the a5 host_build_graph module records a scheduler
+        // selection, so a null here is a fact about the backend.
+        get_last_scheduler_runtime_mode_fn_ =
+            module->optional<GetLastSchedulerRuntimeModeFn>("get_last_scheduler_runtime_mode");
+        get_scheduler_mode_publish_count_fn_ =
+            module->optional<GetAicpuDlopenCountFn>("get_scheduler_mode_publish_count");
         finalize_device_fn_ = module->required<FinalizeDeviceFn>("finalize_device");
         if (sim_context_path.empty()) {
             execution_environment_releasable_fn_ =
@@ -891,6 +897,8 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     get_aicpu_dlopen_count_fn_ = nullptr;
     get_host_dlopen_count_fn_ = nullptr;
     get_run_stream_set_create_count_fn_ = nullptr;
+    get_last_scheduler_runtime_mode_fn_ = nullptr;
+    get_scheduler_mode_publish_count_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
     execution_environment_releasable_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
@@ -2073,6 +2081,20 @@ size_t ChipWorker::run_stream_set_create_count() const {
         return 0;
     }
     return get_run_stream_set_create_count_fn_(device_ctx_);
+}
+
+uint32_t ChipWorker::last_scheduler_runtime_mode() const {
+    if (!initialized_ || get_last_scheduler_runtime_mode_fn_ == nullptr) {
+        return 0;
+    }
+    return get_last_scheduler_runtime_mode_fn_(device_ctx_);
+}
+
+size_t ChipWorker::scheduler_mode_publish_count() const {
+    if (!initialized_ || get_scheduler_mode_publish_count_fn_ == nullptr) {
+        return 0;
+    }
+    return get_scheduler_mode_publish_count_fn_(device_ctx_);
 }
 
 void *ChipWorker::create_comm_stream_checked(const char *op_name) {

@@ -14241,6 +14241,33 @@ class Worker:
             return 0
         return self._chip_worker.run_stream_set_create_count
 
+    @property
+    def scheduler_runtime_mode(self) -> int:
+        """L2 only: which device-side scheduler the most recent bind selected.
+
+        A ``SCHEDULER_RUNTIME_MODE_*`` value: 1 = resident pending, 2 = resident
+        ready, 3 = legacy because the graph holds a graph task, 4 = legacy
+        because a task shape the resident scheduler does not support. 0 means no
+        selection was ever published.
+
+        Returns 0 on non-L2 workers, on every arch other than a5, and on the
+        tensormap_and_ringbuffer runtime -- only a5 host_build_graph chooses
+        between a resident AICore scheduler and the legacy AICPU one, so
+        elsewhere 0 means "not applicable" rather than "legacy". Pair it with
+        `scheduler_mode_publish_count` to tell a fresh selection apart from a
+        latched older one.
+        """
+        if self.level != 2 or self._chip_worker is None:
+            return 0
+        return self._chip_worker.scheduler_runtime_mode
+
+    @property
+    def scheduler_mode_publish_count(self) -> int:
+        """L2 only: how many binds have published a scheduler selection."""
+        if self.level != 2 or self._chip_worker is None:
+            return 0
+        return self._chip_worker.scheduler_mode_publish_count
+
     # ------------------------------------------------------------------
     # close
     # ------------------------------------------------------------------

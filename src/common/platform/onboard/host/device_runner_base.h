@@ -1439,6 +1439,27 @@ public:
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
     /**
+     * Which device-side scheduler the most recent bind selected, as a
+     * SCHEDULER_RUNTIME_MODE_* value, or 0 when no bind has published one.
+     *
+     * Latched rather than read back from the runtime: the launch descriptor's
+     * copy is cleared when a run releases its bindings, so by the time a caller
+     * could look it is already 0. Never cleared here — a later bind overwrites
+     * it, and `scheduler_mode_publish_count()` is what distinguishes "this bind
+     * chose again" from "nothing has changed since the last one".
+     */
+    uint32_t last_scheduler_runtime_mode() const {
+        return last_scheduler_runtime_mode_.load(std::memory_order_relaxed);
+    }
+    size_t scheduler_mode_publish_count() const {
+        return scheduler_mode_publish_total_.load(std::memory_order_relaxed);
+    }
+    void record_scheduler_runtime_mode(uint32_t mode) {
+        last_scheduler_runtime_mode_.store(mode, std::memory_order_relaxed);
+        scheduler_mode_publish_total_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /**
      * Number of run stream generations this runner has created. AICPU streams
      * belong to pipeline slots, while an AICore stream is reused only for the
      * same AICore image. Arches whose runs use the persistent pair report 0.
@@ -2895,6 +2916,9 @@ protected:
     // Same re-register semantics as `aicpu_dlopen_total_`, but for hbg
     // variants.
     size_t host_dlopen_total_{0};
+    // Written on the bind path, read by the caller's thread.
+    std::atomic<uint32_t> last_scheduler_runtime_mode_{0};
+    std::atomic<size_t> scheduler_mode_publish_total_{0};
     struct NativeRunReservation {
         const void *owner{nullptr};
         uint32_t pipeline_slot{0};

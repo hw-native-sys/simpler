@@ -34,6 +34,7 @@ own doorbell rings; the sync cohort then cannot fit and enters the global drain,
 which parks the scheduler threads that would have rung the sibling (#2256).
 """
 
+import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import TensorTransfer
@@ -60,6 +61,7 @@ TMR_TWIN = "../../tensormap_and_ringbuffer"
 GRAPH_TWIN = "../graph_execution"
 
 
+@pytest.mark.scheduler_mode("legacy")
 @scene_test(level=2, runtime="host_build_graph")
 class TestGraphSyncStartEarlyDispatchHbg(SceneTestCase):
     RTOL = 0

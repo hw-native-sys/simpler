@@ -9,12 +9,14 @@
 # -----------------------------------------------------------------------------------------------------------
 """Graph Execution replays dynamic tensor and scalar bindings across config-keyed definitions."""
 
+import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 
+@pytest.mark.scheduler_mode("legacy")
 @scene_test(level=2, runtime="host_build_graph")
 class TestGraphExecutionHostBuildGraphA5(SceneTestCase):
     RTOL = 1e-5

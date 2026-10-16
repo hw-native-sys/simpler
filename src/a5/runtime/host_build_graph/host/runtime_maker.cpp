@@ -1111,11 +1111,12 @@ void release_scheduler_state(Runtime *runtime) {
     }
 }
 
-void select_legacy_scheduler(Runtime *runtime, uint32_t mode) {
+void select_legacy_scheduler(Runtime *runtime, const HostApi *api, uint32_t mode) {
     always_assert(
         mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE
     );
     runtime->publish_scheduler_bootstrap(mode, 0);
+    if (api != nullptr) api->record_scheduler_runtime_mode(mode);
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
         runtime->dev.workers[i].aicpu_ready = 0;
         runtime->dev.workers[i].task = 0;
@@ -1142,7 +1143,7 @@ bool create_scheduler_state(
     for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
         ChipTaskSlotState &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
         if (slot.task_kind == TaskKind::GRAPH) {
-            select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
+            select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
             LOG_INFO("A5 HBG: retaining AICPU scheduling for a graph-execution run");
             return true;
         }
@@ -1293,7 +1294,7 @@ bool create_scheduler_state(
         return false;
     }
     if (legacy_shape_task_id >= 0) {
-        select_legacy_scheduler(runtime, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
+        select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
         LOG_INFO(
             "A5 HBG: retaining AICPU scheduling for task id=%" PRId64 " with SPMD or sync-start shape",
             legacy_shape_task_id
@@ -1434,6 +1435,7 @@ bool create_scheduler_state(
     runtime->publish_scheduler_bootstrap(
         SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING, aligned_address + layout.worker_contexts_offset
     );
+    api->record_scheduler_runtime_mode(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING);
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
