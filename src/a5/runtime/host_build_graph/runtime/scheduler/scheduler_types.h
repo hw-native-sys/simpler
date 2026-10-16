@@ -638,7 +638,12 @@ inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_READY_QUEUE_COUNT = 3;
 inline constexpr uint32_t SCHEDULER_MIX_QUEUE = 2;
 inline constexpr uint32_t SCHEDULER_CLUSTER_CAPACITY = SCHEDULER_WORKER_CAPACITY / 3;
-inline constexpr uint32_t SCHEDULER_CAPACITY = SCHEDULER_CLUSTER_CAPACITY;
+// How many Schedulers the state is addressed for. One per worker: a Scheduler
+// owns the slots of exactly one core, so the identity is a worker id rather than
+// a cluster index. The ready inboxes and the bootstrap-ready bitmap were already
+// sized by SCHEDULER_WORKER_CAPACITY, so widening this changes the directory's
+// shard count and the bounds checks, not any array's footprint.
+inline constexpr uint32_t SCHEDULER_CAPACITY = static_cast<uint32_t>(SCHEDULER_WORKER_CAPACITY);
 inline constexpr uint32_t SCHEDULER_ACTIVITY_CAPACITY = 1024;
 inline constexpr uint64_t SCHEDULER_PROFILING_TASK_TIMING_LEVEL = 1;
 inline constexpr uint64_t SCHEDULER_PROFILING_SCHEDULE_TIMING_LEVEL = 2;
@@ -678,7 +683,8 @@ inline constexpr int64_t SCHEDULER_TASK_REF_INVALID = -1;
 inline constexpr int64_t SCHEDULER_WAKE_LIST_OPEN = -1;
 inline constexpr int64_t SCHEDULER_WAKE_LIST_CLOSED = -2;
 inline constexpr int64_t SCHEDULER_INBOX_EMPTY = -1;
-inline constexpr uint64_t SCHEDULER_READY_PENDING_EMPTY = UINT64_MAX;
+// Both endpoints empty, which is the only state where either one may be.
+inline constexpr uint64_t SCHEDULER_READY_ENDPOINTS_EMPTY = UINT64_MAX;
 
 enum class SchedulerTaskState : int64_t {
     BLOCKED = 0,
@@ -818,8 +824,21 @@ struct alignas(128) SchedulerTaskControl {
     uint8_t scheduler_line_padding[8];
 };
 
+// A FIFO ready queue, addressed by both endpoints packed into one word.
+//
+// Sharing a word makes the endpoint pair atomic, which is what lets a consumer
+// take the last task: head and tail have to be cleared together, and across two
+// words an append landing between the two stores is overwritten and its whole
+// batch lost. The alternative that keeps two words has to carry a sentinel node
+// per queue so the queue is never structurally empty and that transition never
+// arises.
+//
+// The cost is that one word is the single contention point for both ends: a
+// producer appending and a consumer taking contend on every operation, even
+// though they touch opposite ends of a non-empty queue. Separate head and tail
+// on their own cache lines decouple that. Which one wins here is not measured.
 struct alignas(128) SchedulerReadyInbox {
-    volatile int64_t head;
+    volatile uint64_t endpoints;
     uint8_t atomic_line_padding[120];
 };
 
@@ -838,7 +857,6 @@ struct alignas(64) SchedulerReadyDirectoryShard {
 
 struct alignas(128) SchedulerReadyDirectory {
     SchedulerReadyDirectoryShard core_types[SCHEDULER_READY_QUEUE_COUNT][SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
-    volatile uint64_t bootstrap_ready_types[SCHEDULER_WORKER_CAPACITY];
 };
 
 // The Executor publishes this per-slot payload before the Completion Inbox
@@ -878,10 +896,6 @@ enum class SchedulerErrorSite : uint64_t {
     COMPLETION_REFILL_CLAIM_FAILED = 69,
     COMPLETION_REFILL_DISPATCH_FAILED = 70,
     COMPLETION_GENERATION_MISMATCH = 74,
-    DEFERRED_RESERVATION_INVALID_OWNER = 75,
-    DEFERRED_RESERVATION_INVALID_STATE = 76,
-    DEFERRED_PUBLISH_INVALID_RESERVATION = 77,
-    NORMAL_DISPATCH_INVALID_TOPOLOGY = 78,
     EXECUTOR_PREFERRED_SLOT_INVALID = 79,
     READY_INBOX_REFRESH_FAILED = 80,
     BOOTSTRAP_FAILED = 90,
@@ -1163,18 +1177,7 @@ static_assert(
     "ready directory does not cover every scheduler"
 );
 static_assert(
-    offsetof(SchedulerReadyDirectory, bootstrap_ready_types) ==
-        SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
-    "bootstrap flags must follow the ready directory shards"
-);
-static_assert(
-    offsetof(SchedulerReadyDirectory, bootstrap_ready_types) % 64 == 0,
-    "bootstrap flags must begin on a cache-line boundary"
-);
-static_assert(
-    sizeof(SchedulerReadyDirectory) == ((offsetof(SchedulerReadyDirectory, bootstrap_ready_types) +
-                                         SCHEDULER_WORKER_CAPACITY * sizeof(uint64_t) + 127) /
-                                        128 * 128),
+    sizeof(SchedulerReadyDirectory) == SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
     "ready directory layout changed"
 );
 static_assert(sizeof(SchedulerExecutorTaskTrace) == 48, "executor trace payload layout changed");
@@ -1283,7 +1286,11 @@ inline bool scheduler_plan_layout(
     uint64_t task_count, uint64_t aic_task_count, uint64_t aiv_task_count, AicoreSchedulerLayout *layout,
     bool enable_activity_profiling = false, uint64_t trace_count = 0, bool enable_pmu = false
 ) {
-    if (layout == nullptr || aic_task_count > task_count || aiv_task_count > task_count) return false;
+    // A ready inbox holds its endpoints as int32 task refs, so a graph whose
+    // refs would not fit that encoding cannot be scheduled at all.
+    if (layout == nullptr || aic_task_count > task_count || aiv_task_count > task_count ||
+        task_count > static_cast<uint64_t>(INT32_MAX))
+        return false;
     AicoreSchedulerLayout next{};
     next.task_count = task_count;
     next.aic_task_count = aic_task_count;
@@ -1319,7 +1326,7 @@ inline bool scheduler_plan_layout(
                            trace_count == 0 ? task_count : trace_count, SchedulerTaskPmuCell, pmu_cells_offset
                        )) ||
         (enable_activity_profiling &&
-         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_CLUSTER_CAPACITY, SchedulerActivityBuffer, activity_buffers_offset)) ||
+         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerActivityBuffer, activity_buffers_offset)) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
 #undef SCHEDULER_RESERVE_ARRAY
         return false;
@@ -1341,7 +1348,7 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
     for (uint64_t i = 0; i < SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)
-        ready[i].head = SCHEDULER_INBOX_EMPTY;
+        ready[i].endpoints = SCHEDULER_READY_ENDPOINTS_EMPTY;
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(base, layout.worker_contexts_offset);
     for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
         contexts[worker].physical_core_id = -1;

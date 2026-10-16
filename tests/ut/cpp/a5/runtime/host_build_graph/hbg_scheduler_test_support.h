@@ -203,6 +203,7 @@ struct FixtureStorage {
         config.scheduler_count = context->scheduler_count;
         config.self_lane = 0;
         config.scheduler_lane = UINT8_MAX;
+        config.self_core_type = scheduler_core_type_index(context->core_type);
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             config.worker_ids[lane] = context->cluster_worker_ids[lane];
             if (context->cluster_worker_ids[lane] == context->worker_index) config.self_lane = lane;

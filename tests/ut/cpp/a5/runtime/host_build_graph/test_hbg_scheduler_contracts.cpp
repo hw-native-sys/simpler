@@ -384,7 +384,7 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(storage.base(), layout.ready_inboxes_offset);
     for (uint64_t inbox = 0; inbox < SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY; ++inbox)
-        EXPECT_EQ(ready[inbox].head, SCHEDULER_INBOX_EMPTY);
+        EXPECT_EQ(ready[inbox].endpoints, SCHEDULER_READY_ENDPOINTS_EMPTY);
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(storage.base(), layout.worker_contexts_offset);
     EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved0, 0u);
     EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved1, 0u);

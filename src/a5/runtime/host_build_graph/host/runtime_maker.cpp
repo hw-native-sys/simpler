@@ -731,7 +731,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {
             const SchedulerWorkerContext &context = contexts[worker];
             if (context.is_scheduler == 0) continue;
-            if (context.scheduler_index >= SCHEDULER_CLUSTER_CAPACITY) {
+            if (context.scheduler_index >= SCHEDULER_WORKER_CAPACITY) {
                 LOG_WARN(
                     "A5 HBG: invalid Scheduler activity index for worker=%" PRIu64 ": %" PRIu64, worker,
                     context.scheduler_index

@@ -258,22 +258,19 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
     }
 
     for (int32_t cluster = 0; cluster < aic_count; ++cluster) {
-        const int32_t aiv0_worker = cluster_workers[cluster][1];
-        const int32_t aiv1_worker = cluster_workers[cluster][2];
-        // Do not bind Scheduler ownership to a runtime worker rank. Pick the
-        // lower physical AIV in each discovered hardware Cluster.
-        const uint64_t scheduler_worker = static_cast<uint64_t>(
-            cores_[aiv0_worker].physical_core_id <= cores_[aiv1_worker].physical_core_id ? aiv0_worker : aiv1_worker
-        );
         for (int32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             const int32_t worker = cluster_workers[cluster][lane];
-            const bool scheduler_lane = static_cast<uint64_t>(worker) == scheduler_worker;
             contexts[worker].cluster_count = static_cast<uint64_t>(aic_count);
             contexts[worker].cluster_index = static_cast<uint64_t>(cluster);
-            contexts[worker].scheduler_index = static_cast<uint64_t>(cluster);
-            contexts[worker].scheduler_worker_id = scheduler_worker;
-            contexts[worker].is_scheduler = scheduler_lane ? 1 : 0;
-            contexts[worker].scheduler_count = static_cast<uint64_t>(aic_count);
+            // Every core schedules itself, so a Scheduler is identified by the
+            // worker it runs on and there are as many Schedulers as workers.
+            // scheduler_worker_id names the cluster's AIC, which is the one core
+            // that coordinates a Mix task for the cluster -- not a core that
+            // schedules on another's behalf.
+            contexts[worker].scheduler_index = static_cast<uint64_t>(worker);
+            contexts[worker].scheduler_worker_id = static_cast<uint64_t>(cluster_workers[cluster][0]);
+            contexts[worker].is_scheduler = 1;
+            contexts[worker].scheduler_count = static_cast<uint64_t>(core_count_);
             for (int32_t member = 0; member < PLATFORM_CORES_PER_BLOCKDIM; ++member)
                 contexts[worker].cluster_worker_ids[member] = static_cast<uint64_t>(cluster_workers[cluster][member]);
         }
@@ -281,7 +278,7 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
     run_control->active_worker_count = static_cast<uint64_t>(core_count_);
     run_control->aic_active_worker_count = static_cast<uint64_t>(aic_count);
     run_control->aiv_active_worker_count = static_cast<uint64_t>(aiv_count);
-    run_control->scheduler_count = static_cast<uint64_t>(aic_count);
+    run_control->scheduler_count = static_cast<uint64_t>(core_count_);
     run_control->scheduler_timeout_cycles = resident_scheduler_timeout_cycles();
 
     const uint64_t topology_complete_cycles = record_lifecycle_timing ? get_sys_cnt_aicpu() : 0;
