@@ -121,7 +121,7 @@ struct SchedulerLocalConfig {
     uint64_t task_controls_offset{0};
     uint64_t ready_inboxes_offset{0};
     uint64_t ready_directory_offset{0};
-    uint64_t gang_coordinator_offset{0};
+    uint64_t graph_summary_offset{0};
     // The callable's registration-owned entry table, named by absolute address
     // because it is not part of the scheduler state these offsets index. The
     // address cannot be narrowed the way the offsets are; the length can, and
@@ -273,10 +273,10 @@ inline __aicore__ bool scheduler_initialize_local_config(
     config.worker_contexts_offset = static_cast<uint32_t>(context->worker_contexts_offset);
     config.callable_addresses_address = context->callable_addresses_address;
     config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
-    config.gang_coordinator_offset = context->gang_coordinator_offset;
-    auto *coordinator = scheduler_state_at<SchedulerGangCoordinator>(base, config.gang_coordinator_offset);
-    scheduler_observe_cache_line(coordinator);
-    local->has_mix = coordinator->mix_task_count != 0;
+    config.graph_summary_offset = context->graph_summary_offset;
+    auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, config.graph_summary_offset);
+    scheduler_observe_cache_line(summary);
+    local->has_mix = summary->mix_task_count != 0;
     const uint64_t runtime_worker_count = context->runtime_worker_count;
     const uint64_t scheduler_count = context->scheduler_count;
     const uint64_t scheduler_index = context->scheduler_index;
@@ -510,17 +510,6 @@ inline __aicore__ __gm__ SchedulerReadyInbox *scheduler_ready_inbox_at(
 inline __aicore__ __gm__ SchedulerReadyDirectory *
 scheduler_ready_directory_at(__gm__ void *scheduler_state_base, const SchedulerLocalState *context) {
     return scheduler_state_at<SchedulerReadyDirectory>(scheduler_state_base, context->config.ready_directory_offset);
-}
-
-inline __aicore__ __gm__ SchedulerGangCoordinator *
-scheduler_gang_coordinator_at(__gm__ void *scheduler_state_base, const SchedulerLocalState *context) {
-    return scheduler_state_at<SchedulerGangCoordinator>(scheduler_state_base, context->config.gang_coordinator_offset);
-}
-
-inline __aicore__ void
-scheduler_publish_gang_ready(__gm__ void *scheduler_state_base, SchedulerLocalState *context, uint8_t metadata_flags) {
-    __gm__ SchedulerGangCoordinator *coordinator = scheduler_gang_coordinator_at(scheduler_state_base, context);
-    scheduler_gm_fetch_or(coordinator->ready_priority_bits, scheduler_task_priority_bit(metadata_flags));
 }
 
 inline __aicore__ __gm__ SchedulerWorkerContext *
@@ -1048,7 +1037,7 @@ inline __aicore__ bool scheduler_plan_mix_placement(
     *placement = {};
     const auto &metadata = *scheduler_task_metadata_at(base, local, task_id);
     const LaneMask lanes = scheduler_task_lanes(metadata);
-    if (!scheduler_task_is_mix(metadata.flags) || scheduler_task_is_gang(metadata.flags)) return false;
+    if (!scheduler_task_is_mix(metadata.flags)) return false;
     for (uint8_t i = 0; i < SCHEDULER_MIX_TRACKER_COUNT; ++i) {
         if (local->mix_trackers[i].task_id < 0) {
             placement->tracker = i;
@@ -1283,7 +1272,7 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
     if (subtask_slot >= 3 || !lanes.has(static_cast<SubtaskSlot>(subtask_slot)) ||
         (target->core_type != static_cast<int32_t>(CoreType::AIC) &&
          target->core_type != static_cast<int32_t>(CoreType::AIV)) ||
-        !scheduler_task_is_executable(metadata.flags) || scheduler_task_is_gang(metadata.flags) ||
+        !scheduler_task_is_executable(metadata.flags) ||
         scheduler_metadata_core_type_index(subtask_slot) != scheduler_core_type_index(target->core_type)) {
         scheduler_record_error(
             run_control, ready_claim.task_id, SchedulerGraphResult::UNSUPPORTED_SHAPE, &graph, scheduler,
@@ -1537,74 +1526,68 @@ inline __aicore__ bool scheduler_resolve_completion(
                 );
                 return false;
             }
-            if (scheduler_task_is_gang(metadata->flags)) {
-                scheduler_publish_gang_ready(scheduler_state_base, context, metadata->flags);
-            } else {
-                const LaneMask lanes = scheduler_task_lanes(*metadata);
-                const uint8_t subtask_slot = scheduler_metadata_single_subtask_slot(lanes);
-                if (subtask_slot == UINT8_MAX && !scheduler_task_is_mix(metadata->flags)) {
-                    scheduler_record_error(
-                        run_control, waiter, SchedulerGraphResult::UNSUPPORTED_SHAPE, &graph, context,
-                        SchedulerErrorSite::COMPLETION_INVALID_SHAPE
-                    );
+            const LaneMask lanes = scheduler_task_lanes(*metadata);
+            const uint8_t subtask_slot = scheduler_metadata_single_subtask_slot(lanes);
+            if (subtask_slot == UINT8_MAX && !scheduler_task_is_mix(metadata->flags)) {
+                scheduler_record_error(
+                    run_control, waiter, SchedulerGraphResult::UNSUPPORTED_SHAPE, &graph, context,
+                    SchedulerErrorSite::COMPLETION_INVALID_SHAPE
+                );
+                return false;
+            }
+            const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, lanes);
+            if (core_type == SCHEDULER_MIX_QUEUE && direct_mix_ready != nullptr && direct_mix_ready->task_id >= 0) {
+                if (!scheduler_ready_batch_append(
+                        scheduler_state_base, context, direct_mix_ready->task_id, &batches[core_type], ready_stats,
+                        profiling_level
+                    ))
                     return false;
-                }
-                const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, lanes);
-                if (core_type == SCHEDULER_MIX_QUEUE && direct_mix_ready != nullptr && direct_mix_ready->task_id >= 0) {
-                    if (!scheduler_ready_batch_append(
-                            scheduler_state_base, context, direct_mix_ready->task_id, &batches[core_type], ready_stats,
-                            profiling_level
-                        ))
-                        return false;
-                    *direct_mix_ready = {};
-                }
-                bool direct_mix_available = false;
-                if (core_type == SCHEDULER_MIX_QUEUE && direct_mix_ready != nullptr &&
-                    batches[core_type].head == SCHEDULER_INBOX_EMPTY) {
-                    __gm__ SchedulerReadyInbox *inbox = scheduler_ready_inbox_at(
-                        scheduler_state_base, context, core_type, context->config.scheduler_index
+                *direct_mix_ready = {};
+            }
+            bool direct_mix_available = false;
+            if (core_type == SCHEDULER_MIX_QUEUE && direct_mix_ready != nullptr &&
+                batches[core_type].head == SCHEDULER_INBOX_EMPTY) {
+                __gm__ SchedulerReadyInbox *inbox =
+                    scheduler_ready_inbox_at(scheduler_state_base, context, core_type, context->config.scheduler_index);
+                direct_mix_available =
+                    scheduler_gm_query(inbox->head) == SCHEDULER_INBOX_EMPTY &&
+                    scheduler_ready_pending_head(
+                        scheduler_ready_owner_pending_load(&context->owner_pending_endpoints[core_type])
+                    ) == SCHEDULER_INBOX_EMPTY &&
+                    !scheduler_ready_directory_nonempty(
+                        scheduler_state_base, context, context->config.scheduler_count, core_type
                     );
-                    direct_mix_available =
-                        scheduler_gm_query(inbox->head) == SCHEDULER_INBOX_EMPTY &&
-                        scheduler_ready_pending_head(
-                            scheduler_ready_owner_pending_load(&context->owner_pending_endpoints[core_type])
-                        ) == SCHEDULER_INBOX_EMPTY &&
-                        !scheduler_ready_directory_nonempty(
-                            scheduler_state_base, context, context->config.scheduler_count, core_type
-                        );
-                }
-                SchedulerReadyClaim *direct_claim =
-                    direct_mix_available ? direct_mix_ready :
-                    direct_ready != nullptr && direct_ready->task_id < 0 && core_type == direct_core_type ?
-                                           direct_ready :
-                                           nullptr;
-                if (direct_claim != nullptr) {
-                    direct_claim->task_id = waiter;
-                    direct_claim->source = SchedulerReadySource::DIRECT_RESOLVE;
-                    direct_claim->publication_mode = SchedulerPublicationMode::REFILL;
-                    if (phase_timing_enabled) {
-                        __gm__ SchedulerTaskTrace *cells = scheduler_state_at<SchedulerTaskTrace>(
-                            scheduler_state_base, context->profiling->trace_cells_offset
-                        );
-                        const uint64_t transition_cycles = scheduler_cycles();
-                        for (uint8_t subtask = 0; subtask < 3; ++subtask) {
-                            if (!lanes.has(static_cast<SubtaskSlot>(subtask))) continue;
-                            auto &trace = cells[scheduler_task_trace_index(
-                                metadata->trace_index_base, lanes, static_cast<SubtaskSlot>(subtask)
-                            )];
-                            trace.ready_transition_cycles = transition_cycles;
-                            scheduler_writeback_cache_line(&trace.ready_transition_cycles);
-                        }
+            }
+            SchedulerReadyClaim *direct_claim =
+                direct_mix_available ? direct_mix_ready :
+                direct_ready != nullptr && direct_ready->task_id < 0 && core_type == direct_core_type ? direct_ready :
+                                                                                                        nullptr;
+            if (direct_claim != nullptr) {
+                direct_claim->task_id = waiter;
+                direct_claim->source = SchedulerReadySource::DIRECT_RESOLVE;
+                direct_claim->publication_mode = SchedulerPublicationMode::REFILL;
+                if (phase_timing_enabled) {
+                    __gm__ SchedulerTaskTrace *cells = scheduler_state_at<SchedulerTaskTrace>(
+                        scheduler_state_base, context->profiling->trace_cells_offset
+                    );
+                    const uint64_t transition_cycles = scheduler_cycles();
+                    for (uint8_t subtask = 0; subtask < 3; ++subtask) {
+                        if (!lanes.has(static_cast<SubtaskSlot>(subtask))) continue;
+                        auto &trace = cells[scheduler_task_trace_index(
+                            metadata->trace_index_base, lanes, static_cast<SubtaskSlot>(subtask)
+                        )];
+                        trace.ready_transition_cycles = transition_cycles;
+                        scheduler_writeback_cache_line(&trace.ready_transition_cycles);
                     }
-                } else if (!scheduler_ready_batch_append(
-                               scheduler_state_base, context, waiter, &batches[core_type], ready_stats, profiling_level
-                           )) {
-                    scheduler_record_error(
-                        run_control, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                        SchedulerErrorSite::COMPLETION_READY_APPEND_FAILED
-                    );
-                    return false;
                 }
+            } else if (!scheduler_ready_batch_append(
+                           scheduler_state_base, context, waiter, &batches[core_type], ready_stats, profiling_level
+                       )) {
+                scheduler_record_error(
+                    run_control, waiter, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                    SchedulerErrorSite::COMPLETION_READY_APPEND_FAILED
+                );
+                return false;
             }
         }
         waiter = next;

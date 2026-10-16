@@ -157,10 +157,7 @@ struct FixtureStorage {
             context.worker_contexts_offset = layout.worker_contexts_offset;
             context.callable_addresses_address = reinterpret_cast<uint64_t>(callable_addresses);
             context.callable_addresses_count = kFixtureCallableCount;
-            context.gang_coordinator_offset = layout.gang_coordinator_offset;
-            context.gang_cohorts_offset = layout.gang_cohorts_offset;
-            context.gang_participants_offset = layout.gang_participants_offset;
-            context.gang_commands_offset = layout.gang_commands_offset;
+            context.graph_summary_offset = layout.graph_summary_offset;
             context.dispatch_payload_offset =
                 layout.dispatch_payloads_offset + worker * SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
             context.graph_task_count = task_count;
@@ -200,7 +197,7 @@ struct FixtureStorage {
         config.worker_contexts_offset = context->worker_contexts_offset;
         config.callable_addresses_address = context->callable_addresses_address;
         config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
-        config.gang_coordinator_offset = context->gang_coordinator_offset;
+        config.graph_summary_offset = context->graph_summary_offset;
         config.runtime_worker_count = context->runtime_worker_count;
         config.scheduler_index = context->scheduler_index;
         config.scheduler_count = context->scheduler_count;

@@ -1444,29 +1444,26 @@ TEST(SchedulerLocalConfig, SnapshotsReadyPublicationAndReloadsOnNextRun) {
     }
 }
 
-TEST(SchedulerLocalConfig, DetectsMixIndependentlyOfGangTasks) {
+TEST(SchedulerLocalConfig, DetectsMixFromTheGraphSummary) {
     FixtureStorage storage(1, 3);
     GraphBuffer graph_buffer(1);
     const SchedulerGraphView graph = graph_buffer.graph();
     configure_cached_cluster(storage, 1);
-    auto *coordinator = scheduler_state_at<SchedulerGangCoordinator>(
-        storage.scheduler_state->base(), storage.layout.gang_coordinator_offset
-    );
-    coordinator->gang_task_count = 1;
-    coordinator->mix_task_count = 0;
-    SchedulerLocalState gang_only{};
+    auto *summary =
+        scheduler_state_at<SchedulerGraphSummary>(storage.scheduler_state->base(), storage.layout.graph_summary_offset);
+    summary->mix_task_count = 0;
+    SchedulerLocalState without_mix{};
     ASSERT_TRUE(
-        scheduler_initialize_local_config(storage.scheduler_state->base(), &storage.contexts[1], &graph, &gang_only)
+        scheduler_initialize_local_config(storage.scheduler_state->base(), &storage.contexts[1], &graph, &without_mix)
     );
-    EXPECT_FALSE(gang_only.has_mix);
+    EXPECT_FALSE(without_mix.has_mix);
 
-    coordinator->gang_task_count = 0;
-    coordinator->mix_task_count = 1;
-    SchedulerLocalState mix_only{};
+    summary->mix_task_count = 1;
+    SchedulerLocalState with_mix{};
     ASSERT_TRUE(
-        scheduler_initialize_local_config(storage.scheduler_state->base(), &storage.contexts[1], &graph, &mix_only)
+        scheduler_initialize_local_config(storage.scheduler_state->base(), &storage.contexts[1], &graph, &with_mix)
     );
-    EXPECT_TRUE(mix_only.has_mix);
+    EXPECT_TRUE(with_mix.has_mix);
 }
 
 TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInconsistentPayloadRoutes) {
