@@ -46,6 +46,15 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
 
 class SchedulerRetirementTestPeer {
 public:
+    static void publish_orchestration(SchedulerContext &context, int total, int completed, bool done) {
+        context.total_tasks_ = total;
+        context.completed_tasks_.store(completed, std::memory_order_relaxed);
+        context.orchestrator_done_.store(done, std::memory_order_release);
+    }
+    static LoopAction check_exit(SchedulerContext &context, SharedMemoryHeader &header, Runtime *runtime) {
+        int32_t count = -1;
+        return context.handle_orchestrator_exit(0, &header, runtime, count);
+    }
     static void open_cores(SchedulerContext &context) {
         for (int i = 0; i < kCores; ++i)
             context.core_exec_states_[i].reg_addr = i + 1;
@@ -251,4 +260,22 @@ TEST_F(SchedulerRetirement, ConcurrentOverlappingSetsClaimEachCoreOnce) {
     // Exactly once per core is the property: a bare total would hide a double
     // claim offset by a miss.
     expect_once();
+}
+
+TEST_F(SchedulerRetirement, EmptyGraphCompletesOnlyAfterOrchestrationPublication) {
+    auto header = std::make_unique<SharedMemoryHeader>();
+    SchedulerRetirementTestPeer::publish_orchestration(*context, 0, 0, false);
+    EXPECT_EQ(SchedulerRetirementTestPeer::check_exit(*context, *header, runtime.get()), LoopAction::NONE);
+    SchedulerRetirementTestPeer::publish_orchestration(*context, 0, 0, true);
+    EXPECT_EQ(SchedulerRetirementTestPeer::check_exit(*context, *header, runtime.get()), LoopAction::BREAK_LOOP);
+    EXPECT_EQ(SchedulerRetirementTestPeer::check_exit(*context, *header, runtime.get()), LoopAction::BREAK_LOOP);
+    EXPECT_FALSE(SchedulerRetirementTestPeer::fatal(*context));
+}
+
+TEST_F(SchedulerRetirement, NonemptyGraphStillWaitsForItsLastTask) {
+    auto header = std::make_unique<SharedMemoryHeader>();
+    SchedulerRetirementTestPeer::publish_orchestration(*context, 1, 0, true);
+    EXPECT_EQ(SchedulerRetirementTestPeer::check_exit(*context, *header, runtime.get()), LoopAction::NONE);
+    SchedulerRetirementTestPeer::publish_orchestration(*context, 1, 1, true);
+    EXPECT_EQ(SchedulerRetirementTestPeer::check_exit(*context, *header, runtime.get()), LoopAction::BREAK_LOOP);
 }

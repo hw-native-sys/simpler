@@ -51,6 +51,16 @@ uint32_t __attribute__((weak)) platform_get_physical_cores_count() { return 0; }
 // sanctioned reach into its private state.
 class SchedulerContextTestPeer {
 public:
+    static void set_completion(SchedulerContext &context, int32_t total, int32_t completed) {
+        context.total_tasks_ = total;
+        context.completed_tasks_.store(completed, std::memory_order_relaxed);
+    }
+
+    static LoopAction check_exit(SchedulerContext &context, SharedMemoryHeader &header) {
+        int32_t task_count = -1;
+        return context.check_exit_conditions(0, &header, nullptr, task_count);
+    }
+
     static void seed_dispatch(SchedulerContext &context) {
         auto &tracker = context.core_trackers_[0];
         tracker.init(1);
@@ -149,4 +159,23 @@ TEST(StallDumpLevelTest, PeriodicReportsDoNotDumpDispatchPayloads) {
     const std::string dump = capture_dump(StallDumpReport::Periodic, true);
     EXPECT_NE(dump.find("CLUSTER"), std::string::npos);
     EXPECT_EQ(dump.find("DISPATCH"), std::string::npos);
+}
+
+TEST(SchedulerCompletionTest, FinalEmptyGraphCompletes) {
+    SchedulerContext context;
+    SharedMemoryHeader header{};
+    SchedulerContextTestPeer::set_completion(context, 0, 0);
+
+    EXPECT_EQ(SchedulerContextTestPeer::check_exit(context, header), LoopAction::BREAK_LOOP);
+    EXPECT_EQ(SchedulerContextTestPeer::check_exit(context, header), LoopAction::BREAK_LOOP);
+}
+
+TEST(SchedulerCompletionTest, NonemptyGraphWaitsForItsLastTask) {
+    SchedulerContext context;
+    SharedMemoryHeader header{};
+    SchedulerContextTestPeer::set_completion(context, 1, 0);
+    EXPECT_EQ(SchedulerContextTestPeer::check_exit(context, header), LoopAction::NONE);
+
+    SchedulerContextTestPeer::set_completion(context, 1, 1);
+    EXPECT_EQ(SchedulerContextTestPeer::check_exit(context, header), LoopAction::BREAK_LOOP);
 }
