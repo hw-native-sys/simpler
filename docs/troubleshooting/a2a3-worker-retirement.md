@@ -78,20 +78,23 @@ returns early simply never arrives. Before this handoff existed, missing the
 latch cost a leaked runtime context; with workers blocked on gates, it would
 cost every core on the chip.
 
-`platform_retire_aicore_group` retires one claimed set in passes:
+Retirement uses a current-response predicate, described in the
+[freshness contract](../hardware/cache-coherency.md#exit-acknowledgement-freshness).
+Native runs use `platform_retire_cond_nonce_group` after a current nonzero-epoch
+report and exclusive claim. The claimant chooses a reserved nonce different
+from this physical core's observed COND; Core echoes it only after completing
+preceding writes. Unstamped modes use `platform_retire_aicore_group`, requiring
+EXITED plus an echo of the current GM request. Fixed EXITED alone is insufficient.
 
-1. Send EXIT to every core in the set before waiting for any ACK.
-2. Collect EXITED, using one shared deadline.
-3. Re-read the still-silent cores once. The shared deadline bounds the all-dead
-   case to a single timeout, but a core whose turn came after it expired never
-   got a wait of its own; this second read decides such a core on its own
-   evidence rather than on a peer's timeout.
-4. Reset dispatch to IDLE and close every acknowledged window. Read back the
-   MMIO window and complete that read before publishing a GM return gate.
-5. Store `AICORE_POST_CLOSE_RELEASE` to each closed core's gate. The stores are
-   relaxed: step 4's drain is what orders them after the CLOSE they belong to,
-   and the gates are independent of one another.
-6. AICore observes that word and only then returns.
+Both helpers retire one claimed set in passes:
+
+1. Publish each request before sending EXIT to every core in the set.
+2. Poll for each target's matching current response against one shared deadline.
+   A core that never responds remains unclosed and unreleased for host recovery.
+3. Reset dispatch to IDLE and close every acknowledged window. Read back the
+   MMIO windows, then drain those reads before publishing any GM return gate.
+4. Store `AICORE_POST_CLOSE_RELEASE` to each acknowledged core's gate.
+5. AICore observes that word, completes its final drain and only then returns.
 
 The AICore wait is unbounded on purpose. A bounded wait cannot help: below the
 45 s op-execute timeout it would return while the AICPU may still be writing —

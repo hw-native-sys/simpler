@@ -46,8 +46,10 @@ and what code lives on each side.
 `cache_invalidate_range` is the protocol-correct primitive for the
 **host-DMA → AICPU** case on a2a3. It was introduced in PR #204
 specifically for `Runtime` struct hand-off where the host writes via
-`rtMemcpy` and AICPU reads. **It is NOT the right primitive for
-AICore → AICPU, and it is not required for a5 DMA/HBM reads.**
+`rtMemcpy` and AICPU reads. It is not required **for cache coherency**
+when reading properly published AICore writes or a5 DMA/HBM writes.
+A control protocol can still retain the primitive's completion/ordering
+boundary, as the [exit ACK reader](#exit-acknowledgement-freshness) does.
 
 ### `dcci` is whole-cache-line: no parallel sub-line writes
 
@@ -66,8 +68,8 @@ cache line) lives in
 
 ## The "AICore → AICPU" path: AICPU does not invalidate, but DOES barrier
 
-AICore and AICPU share a coherency domain on GM. When AICore writes a
-slot, the correct handshake is:
+For the task-slot handoff below, AICore and AICPU share a coherency
+domain on GM. When AICore writes a slot, the correct handshake is:
 
 ```text
 AICore                              AICPU
@@ -150,14 +152,16 @@ earlier run's reader is still live on the line. For this one field, existing cod
 provides the **two intra-run ordering edges** below, under the lifetime preconditions
 that code already assumes — it does not establish those preconditions:
 
-- **Reset before window-open.** `memset` over the gates then `wmb()`
-  (`scheduler_cold_path.cpp:1183-1184` TRB, `:890-891` HBG). The barrier is what orders
+- **Reset before window-open.** AICPU resets the request/release words in each
+  `AicoreTeardownControl`, then executes `wmb()` in `pre_handshake_init` (TRB and
+  HBG). In GM-ACK modes AICore initializes the separate ACK line before publishing its report; native COND-nonce modes do not use that line.
+  AICPU initialization never writes that ACK line. The barrier is what orders
   the resets before `hs_setup_done_` and before any register window opens — a window is a
   plain `Device-nGnRE` store carrying no release semantics of its own. No core can read
   its gate before its window opens.
 - **RELEASE after window-close.** The quiesce pass, then the CLOSE pass and its
   readbacks, then `rmb()`, then the relaxed `post_close_release` stores
-  (`platform_regs.cpp:82`, `:142`, `:149`). The drain is what orders every store after
+  in `platform_retire_aicore_group`. The drain is what orders every store after
   the CLOSE it belongs to, so an open return gate is never paired with an open window.
 
 **Lifetime across runs is a separate, open question.** Whether a reader left behind by a
@@ -166,10 +170,77 @@ releases the same gates is **not** established — the recovery path is untraced
 neither the premise nor the two edges above settle it. See
 [the exceptional-exit limit in the descriptor visibility investigation](../investigations/2026-09-runtime-descriptor-input-visibility-chain.md#exceptional-and-partial-exits-audited-separately).
 
-The AICore reads that word with `wait_for_post_close_release`
-(`src/a2a3/platform/onboard/aicore/inner_kernel.h:52-59`), a `ld_dev` spin followed by
-`dsb(DSB_DDR)`. Nothing else is published through the gate: it is permission-to-return,
-one `uint32_t` in its own 64-byte line.
+The AICore reads the release word with `acknowledge_aicore_exit_and_wait` in
+`src/a2a3/platform/onboard/aicore/inner_kernel.h`: bypass `ld_dev` loads followed
+by a final `dsb(DSB_DDR)`. The release word is permission-to-return. It shares an
+AICPU-owned 64-byte line with `exit_request`; `exit_ack` occupies a separate
+AICore-owned line. `AicoreTeardownControl` is 128 bytes and requires matching
+host, AICPU and AICore builds.
+
+### Exit acknowledgement freshness
+
+`COND=EXITED` can survive a launch. A current report does not prove that the
+current core has observed EXIT, and failure can precede its first IDLE. Waiting
+for IDLE or using one fixed exit marker does not establish current retirement.
+
+#### Native COND nonce
+
+Native A2/A3 HBG/TMR and Native A5 TMR use a nonzero current report epoch and
+`platform_retire_cond_nonce_group`. The epoch selects the protocol and commits
+the current physical-core report; it is not the acknowledgement itself.
+
+| Order | AICPU | AICore |
+| ----- | ----- | ------ |
+| 1 | Reset request/release before READY; accept the current report; claim each target once | Publish the current physical-core report |
+| 2 | Read that target's retained COND; choose `0xfffffff1` or `0xfffffff2`, different from that observation | Continue or fail before the first IDLE |
+| 3 | Store each request, `wmb()`, then broadcast DMB EXIT | Observe EXIT; complete preceding writes with `dsb(DSB_DDR)` |
+| 4 | Accept only COND equal to that target's request, within the shared absolute deadline | Bypass-load the request, publish the nonce once, then perform no further SPR writes |
+| 5 | Close acknowledged targets, read back, drain, then publish post-close release | Bypass-poll release; final drain; return |
+
+The two nonce values are reserved FIN encodings excluded by the scheduler's
+task-ID allocator. Ordinary FIN, IDLE and fixed EXITED cannot satisfy the match.
+Selection uses the actual target's old COND, rather than a global launch parity:
+a physical core can skip intervening launches. Only this physical core writes
+its COND, and a uniquely claimed native retirement publishes one request.
+
+The Core's completion barrier precedes the request load and dependent COND
+write. There is no following GM ACK load to order on AICPU: the MMIO match is
+the confirmation. This is a separate protocol, not removal of the GM-ACK
+reader's completion operation. It still requires the previous generation to
+have completed or been recovered; concurrent descriptor reuse is invalid.
+
+#### GM request/ACK fallback
+
+A5 resident HBG, its legacy executor, and unstamped Kernel/persistent paths
+retain the GM protocol below. In particular, resident release can send EXIT
+before publishing the request, and must continue servicing late or updated
+requests. These paths are not switched by the native optimization.
+
+`COND=EXITED` alone carries no launch identity. The retirement claimant first
+invalidates the ACK line, selects a nonzero request different from the observed
+ACK (including wraparound), and orders its publication before DMB EXIT. A core
+is acknowledged only when COND is EXITED and a fresh ACK-line load equals that
+request. After quiescence, AICore bypass-loads the request and publishes its echo
+with `dcci(..., CACHELINE_OUT)` and `dsb(DSB_DDR)`. It continues observing requests
+while parked, including A5 resident shutdown's EXIT-before-request ordering.
+
+The AICPU ACK reader conservatively calls `cache_invalidate_range` before
+selecting a request and after observing EXITED while polling for its echo.
+On the ARM64 onboard path, this emits `dc civac` followed by `dsb sy` and
+`isb`; the polling call supplies a completion/ordering boundary between
+the COND read and the ACK load. This is not a non-coherent AICore → AICPU
+exception to the table above. AICPU does not write the isolated ACK line,
+so the clean does not publish a competing AICPU-authored ACK. Freshness
+comes from the request/ACK match, not cache invalidation alone.
+
+Replacing this operation requires a separate argument for equivalent
+ordering; the coherency premise alone does not justify deleting it.
+
+Both protocols prove a response to this retirement request without requiring an IDLE
+observation. A silent core retains EXIT, its open window and its closed return
+gate when the shared deadline expires; the original host recovery owns it.
+Descriptor reuse still requires the previous generation to have completed or
+been recovered. The request/ACK pair does not make concurrent reuse valid.
 
 **This licenses no deletion.** In particular the descriptor-wide
 `cache_invalidate_range` in `deinit` stays: `dc civac` also cleans, and its role toward

@@ -71,6 +71,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Dispat
 __aicore__ __attribute__((weak)) void
 legacy_aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type) {
     __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->dev.workers[block_idx]);
+    initialize_aicore_exit_ack(&runtime->dev.teardown_gates[block_idx]);
 
     // Phase 1: report physical core ID + core type and signal done in one write,
     // with no wait for the AICPU — both fields are self-known. The AICPU opens

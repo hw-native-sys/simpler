@@ -9,6 +9,11 @@ audited on 2026-10-09. The comparison describes source behavior, not measured
 performance. Paths below are relative to
 `src/{a2a3,a5}/runtime/tensormap_and_ringbuffer/` unless qualified otherwise.
 
+The file inventory and source comparisons below retain that audited baseline.
+The current retirement protocol also pairs each nonzero exit request with a
+fresh AICore ACK; see [exit ACK freshness](hardware/cache-coherency.md#exit-acknowledgement-freshness)
+for the writer ownership, compatible layout, ordering and timeout contract.
+
 ## Scope and File Inventory
 
 The two runtime trees contain 51 A2/A3 files and 55 A5 files: 51 matching
@@ -283,6 +288,15 @@ Both runtimes use a dedicated fatal latch, per-core retirement ownership,
 grouped EXIT signaling with a shared ACK deadline, register close/readback/drain,
 and an isolated GM return gate. AICore waits for that gate before returning;
 a timed-out, unacknowledged core is not released and requires host recovery.
+
+Native A2/A3 HBG/TMR and A5 TMR confirm retirement with a reserved COND nonce
+chosen to differ from the target physical core's retained value. The core
+completes preceding writes, echoes the request once, then only polls the GM
+post-close gate. A5 resident HBG and unstamped modes retain EXITED plus the
+separate GM ACK echo, including late requests. Both paths keep the same
+exclusive claim, shared deadline and close/readback/drain/release ordering.
+See [the freshness contract](hardware/cache-coherency.md#exit-acknowledgement-freshness).
+
 The AICPU initializes the gate tail before handshake. Host descriptor copies
 exclude that tail on both platforms.
 

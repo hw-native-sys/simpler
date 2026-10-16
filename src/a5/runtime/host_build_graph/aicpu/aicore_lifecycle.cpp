@@ -70,7 +70,10 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
     core_count_ = runtime->dev.worker_count;
     // The descriptor's gate tail is device-owned and is not copied from the host.
     // Clear prior-run releases before any partition can open a register window.
-    std::memset(runtime->get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * core_count_);
+    for (int32_t i = 0; i < core_count_; ++i) {
+        __atomic_store_n(&runtime->get_teardown_gates()[i].post_close_release, 0U, __ATOMIC_RELAXED);
+        __atomic_store_n(&runtime->get_teardown_gates()[i].exit_request, 0U, __ATOMIC_RELAXED);
+    }
     wmb();
     aicpu_thread_num_ = aicpu_thread_num;
     regs_base_ = regs_base;

@@ -19,3 +19,8 @@ uint64_t __attribute__((weak)) platform_aicore_exit_deadline() { return 0; }
 int32_t __attribute__((weak)) platform_retire_aicore_group(const AicoreExitTarget *, size_t, uint64_t, bool *) {
     return 0;
 }
+
+int32_t __attribute__((weak))
+platform_retire_cond_nonce_group(const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released) {
+    return platform_retire_aicore_group(targets, count, deadline, released);
+}

@@ -258,6 +258,9 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     // block a defined starting value. The initialized prefix ends here; the
     // AICPU initializes the isolated return gates before opening any window.
     Handshake workers[RUNTIME_MAX_WORKER];
+    // Each control has an AICPU-owned request/release line and an AICore-owned
+    // ACK line. AICPU initialization must never overwrite the ACK line; AICore
+    // initializes it before its report and flushes a matching ACK after EXIT.
     AicoreTeardownControl teardown_gates[RUNTIME_MAX_WORKER];
 };
 

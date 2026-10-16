@@ -679,9 +679,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     if (runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING &&
         runtime_mode != SCHEDULER_RUNTIME_MODE_RESIDENT_READY) {
         legacy_aicore_execute(runtime, block_idx, core_type);
-        wait_for_post_close_release(&runtime->dev.teardown_gates[block_idx].post_close_release);
+        acknowledge_aicore_exit_and_wait(&runtime->dev.teardown_gates[block_idx]);
         return;
     }
+    initialize_aicore_exit_ack(&runtime->dev.teardown_gates[block_idx]);
     const bool chip_swimlane_enabled = SIMPLER_GET_DFX_FLAG(profiling_flag, SIMPLER_DFX_FLAG_CHIP_SWIMLANE);
     uint64_t aicore_entry_cycles = chip_swimlane_enabled ? get_sys_cnt_aicore() : 0;
     const uint64_t report_epoch = get_aicore_report_epoch();
@@ -764,7 +765,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         // `pending_run_control`. Complete the preceding GM writes first.
         OUT_OF_ORDER_STORE_BARRIER();
         write_reg(RegId::COND, AICORE_EXITED_VALUE);
-        wait_for_post_close_release(&runtime->dev.teardown_gates[block_idx].post_close_release);
+        acknowledge_aicore_exit_and_wait(&runtime->dev.teardown_gates[block_idx]);
         return;
     }
 
@@ -790,5 +791,5 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             context, run_control, scheduler_state_base, profiling_level, aicore_entry_cycles, handshake_publish_cycles
         );
     }
-    wait_for_post_close_release(&runtime->dev.teardown_gates[block_idx].post_close_release);
+    acknowledge_aicore_exit_and_wait(&runtime->dev.teardown_gates[block_idx]);
 }

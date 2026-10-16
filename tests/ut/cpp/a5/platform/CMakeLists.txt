@@ -49,6 +49,7 @@ a5_platform_case(test_aicore_retirement.cpp
         ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp
         ${SIMPLER_SRC}/a5/platform/sim/aicpu/inner_platform_regs.cpp
         ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/cache_ops.cpp
         ${HOST_LOG_TEST_SOURCES}
     INCLUDES ${SIMPLER_SRC}/common/platform/sim/aicpu)
 set_tests_properties(test_a5_aicore_retirement PROPERTIES TIMEOUT 20)
@@ -62,6 +63,7 @@ a5_platform_case(test_return_gate_wait.cpp
         ${SIMPLER_SRC}/a5/platform/shared/aicpu/platform_regs.cpp
         ${SIMPLER_SRC}/a5/platform/sim/aicpu/inner_platform_regs.cpp
         ${SIMPLER_SRC}/common/platform/sim/aicpu/device_time.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/cache_ops.cpp
         ${HOST_LOG_TEST_SOURCES}
     INCLUDES ${SIMPLER_SRC}/common/platform/sim/aicpu ${SIMPLER_SRC}/a5/platform/sim)
 set_tests_properties(test_a5_return_gate_wait PROPERTIES TIMEOUT 20)

@@ -16,6 +16,7 @@
 #include <memory>
 #include <thread>
 
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "runtime.h"
 #include "scheduler/scheduler_context.h"
 
@@ -25,6 +26,7 @@ std::array<std::atomic<int>, kCores> retirements{};
 std::atomic<int> retirement_batches{0};
 std::atomic<int> deadlines{0};
 bool silent_core = false;
+int nonce_batches = 0;
 }  // namespace
 
 uint64_t platform_aicore_exit_deadline() { return ++deadlines; }
@@ -42,6 +44,12 @@ int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t cou
         }
     }
     return silent_core ? -1 : 0;
+}
+
+int32_t
+platform_retire_cond_nonce_group(const AicoreExitTarget *targets, size_t count, uint64_t deadline, bool *released) {
+    ++nonce_batches;
+    return platform_retire_aicore_group(targets, count, deadline, released);
 }
 
 class SchedulerRetirementTestPeer {
@@ -66,6 +74,8 @@ protected:
     std::unique_ptr<Runtime> runtime = std::make_unique<Runtime>();
 
     void SetUp() override {
+        set_platform_run_result(0, 0);
+        nonce_batches = 0;
         retirement_batches = 0;
         deadlines = 0;
         silent_core = false;
@@ -251,4 +261,39 @@ TEST_F(SchedulerRetirement, ConcurrentOverlappingSetsClaimEachCoreOnce) {
     // Exactly once per core is the property: a bare total would hide a double
     // claim offset by a miss.
     expect_once();
+}
+
+TEST_F(SchedulerRetirement, InitializationPreservesTheCoreOwnedAck) {
+    for (int i = 0; i < kCores; ++i) {
+        auto &control = runtime->dev.teardown_gates[i];
+        control.post_close_release = AICORE_POST_CLOSE_RELEASE;
+        control.exit_request = 9;
+        control.exit_ack = 17;
+    }
+    ASSERT_EQ(context->pre_handshake_init(runtime.get(), 3, 2, 0), 0);
+    for (int i = 0; i < kCores; ++i) {
+        const auto &control = runtime->dev.teardown_gates[i];
+        EXPECT_EQ(control.post_close_release, 0u);
+        EXPECT_EQ(control.exit_request, 0u);
+        EXPECT_EQ(control.exit_ack, 17u);
+    }
+}
+
+TEST_F(SchedulerRetirement, NativeRetirementUsesNonceAfterAssignment) {
+    set_platform_run_result(0, 42);
+    SchedulerRetirementTestPeer::open_cores(*context);
+    context->assign_own_clusters(0);
+    context->assign_own_clusters(1);
+    EXPECT_EQ(context->retire_all_cores(), 0);
+    expect_once();
+    EXPECT_EQ(nonce_batches, 1);
+}
+
+TEST_F(SchedulerRetirement, UnstampedRetirementUsesGmAck) {
+    SchedulerRetirementTestPeer::open_cores(*context);
+    context->assign_own_clusters(0);
+    context->assign_own_clusters(1);
+    EXPECT_EQ(context->retire_all_cores(), 0);
+    expect_once();
+    EXPECT_EQ(nonce_batches, 0);
 }

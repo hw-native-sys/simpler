@@ -737,7 +737,12 @@ int32_t SchedulerContext::retire_claimed_cores(Runtime *runtime, const int32_t *
     // platform_retire_aicore_group fills every entry on every path it returns
     // from, so this needs no initializer.
     bool released[PLATFORM_MAX_CORES];
-    const int32_t rc = platform_retire_aicore_group(targets, count, platform_aicore_exit_deadline(), released);
+    // READY commits the current report, reset gate/request, and register
+    // metadata before a unique retirement claimant can enter this helper.
+    const uint64_t deadline = platform_aicore_exit_deadline();
+    const int32_t rc = get_platform_run_result_epoch() != 0 ?
+                           platform_retire_cond_nonce_group(targets, count, deadline, released) :
+                           platform_retire_aicore_group(targets, count, deadline, released);
     if (rc != 0) {
         // Naming the cores is the only signal an unreleased worker leaves: it
         // spins on a gate it cannot log about, and the host sees just a stream
@@ -1270,7 +1275,10 @@ int32_t SchedulerContext::pre_handshake_init(
     // resets before hs_setup_done_ and before any register window opens: a
     // window is a plain Device-nGnRE store, carrying no release semantics of
     // its own.
-    memset(runtime->get_teardown_gates(), 0, sizeof(AicoreTeardownControl) * cores_total_num_);
+    for (int32_t i = 0; i < cores_total_num_; ++i) {
+        __atomic_store_n(&runtime->get_teardown_gates()[i].post_close_release, 0U, __ATOMIC_RELAXED);
+        __atomic_store_n(&runtime->get_teardown_gates()[i].exit_request, 0U, __ATOMIC_RELAXED);
+    }
     wmb();
     // The blocked 1 AIC : 2 AIV layout requires an exact multiple of 3: cluster ci
     // owns cores {ci, N/3+2ci, N/3+2ci+1}, so a non-zero remainder leaves the tail
