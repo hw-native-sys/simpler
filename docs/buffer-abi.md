@@ -337,6 +337,15 @@ result = torch.frombuffer(out_h.shm.buf, dtype=torch.float32, count=n)  # after 
 
 ## How a tensor reaches its consumer (three-way split)
 
+Chip consumers share the private `_materialize_chip_task_args` conversion in
+`simpler.task_interface`: it resolves this invocation's descriptors through the
+caller's `ImportRegistry` and builds a fresh `ChipStorageTaskArgs`. Direct L2,
+serial/staged chip-child dispatch, and the compatibility `ChipWorker` use it.
+Endpoint/callable checks and accepted backing references precede conversion;
+import-cache closure stays with each caller, including after a failed conversion.
+This conversion resolves addresses and preserves views, transfer requests and
+scalar bits. It does not copy tensor contents or authorize external allocations.
+
 A `Tensor` on the wire is materialized differently by each consumer:
 
 | Consumer | What it does |

@@ -147,6 +147,19 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
             raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
 
 
+def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> ChipStorageTaskArgs:
+    """Resolve accepted argument descriptors into this process's chip-only POD.
+
+    The caller owns submission/callable checks, backing retention and the registry's
+    lifetime. Mapping and conversion do not copy tensor contents or close imports,
+    including when a later descriptor fails to resolve.
+    """
+    if not isinstance(args, TaskArgs):
+        raise TypeError("chip argument materialization requires address-free TaskArgs")
+    resolved = registry.materialize_args(args)
+    return _ti_module.materialize_task_args(args, resolved)
+
+
 def _assert_bindings_match_source_tree() -> None:
     """Refuse a `_task_interface` built from a different revision of this tree.
 
@@ -1895,7 +1908,7 @@ class ChipWorker:
                 registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU))
                 self._argument_imports = registry
                 try:
-                    args = _ti_module.materialize_task_args(args, registry.materialize_args(args))
+                    args = _materialize_chip_task_args(args, registry)
                 except BaseException:
                     self._close_argument_imports()
                     raise

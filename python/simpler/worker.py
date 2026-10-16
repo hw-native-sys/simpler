@@ -106,7 +106,6 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _worker_host_mapped_region_import_sim,
     _worker_host_mapped_region_peek_cleanup_error,
     get_element_size,
-    materialize_task_args,
     read_args_from_blob,
 )
 from _task_interface import (
@@ -301,6 +300,7 @@ from .task_interface import (
     _flush_host_log_or_warn,
     _initialize_chip_runtime,
     _initialize_host_log,
+    _materialize_chip_task_args,
     _start_host_log_writer,
     _validate_host_control_access,
     _Worker,
@@ -3504,8 +3504,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             args_ptr = task_addr + _OFF_TASK_ARGS_BLOB
             args = read_args_from_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
             _validate_host_control_access(registry.get(cid), args)
-            resolved = import_registry.materialize_args(args)
-            chip_args = materialize_task_args(args, resolved)
+            chip_args = _materialize_chip_task_args(args, import_registry)
             # The acceptance flag lives in the mailbox, not in the materialized args, so
             # the fence still publishes through the address the parent polls.
             if cfg.output_prefix:
@@ -3900,8 +3899,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # its own storage, so this POD need not outlive the call.
             args = staged.pending_args  # type: ignore[attr-defined]
             _validate_host_control_access(registry.get(staged.cid), args)
-            resolved = import_registry.materialize_args(args)
-            chip_args = materialize_task_args(args, resolved)
+            chip_args = _materialize_chip_task_args(args, import_registry)
             if staged.config.output_prefix:
                 _bind_host_log_session_directory()
             staged.chip_run = cw._submit_chip_run_materialized(
@@ -13299,8 +13297,7 @@ class Worker:
             self._chip_import_registry = registry
         if args is None:
             args = TaskArgs()
-        resolved = registry.materialize_args(args)
-        return materialize_task_args(args, resolved)
+        return _materialize_chip_task_args(args, registry)
 
     def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
         """Materialize an L2 leaf's tensor args and run the kernel to completion."""
