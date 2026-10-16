@@ -662,7 +662,19 @@ inline constexpr bool scheduler_activity_record_count_valid(uint32_t committed) 
 inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD = 7;
 inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_SHARD_COUNT =
     (SCHEDULER_CAPACITY + SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD - 1) / SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
-inline constexpr int64_t SCHEDULER_TASK_ID_INVALID = -1;
+// A task ref names one task to the resident Scheduler. Its encoding today is a
+// GLOBAL task's index into the whole-graph-resident tables, which is why it is
+// compared against graph.task_count and used as a subscript directly.
+//
+// It is deliberately not called a task id: TaskId (src/common/host_build_graph/
+// task_id.h) is a 64-bit handle carrying a space and a parent, and a SUB_TASK --
+// a task inside a graph task's body -- has no table slot at all and is located
+// through its parent instead. TaskKind::GRAPH still sends the whole graph to the
+// legacy scheduler, so no sub-task reaches this path; supporting one means
+// widening this encoding to carry a parent. Every place that depends on the
+// encoding being an index goes through the accessors below, so that widening has
+// one set of call sites rather than a search for bare subscripts.
+inline constexpr int64_t SCHEDULER_TASK_REF_INVALID = -1;
 inline constexpr int64_t SCHEDULER_WAKE_LIST_OPEN = -1;
 inline constexpr int64_t SCHEDULER_WAKE_LIST_CLOSED = -2;
 inline constexpr int64_t SCHEDULER_INBOX_EMPTY = -1;
@@ -924,7 +936,7 @@ struct alignas(128) SchedulerRunControl {
 
     volatile uint64_t error_claimed;
     volatile uint64_t scheduler_error;
-    volatile uint64_t error_task_id;
+    volatile uint64_t error_task_ref;
     volatile uint64_t error_core_id;
     volatile uint64_t error_core_type;
     volatile uint64_t error_graph_task_count;
@@ -1070,7 +1082,7 @@ struct alignas(128) SchedulerTaskTrace {
     volatile uint64_t valid;
     uint64_t ready_source;
     uint64_t worker_id;
-    uint64_t task_id;
+    uint64_t task_ref;
     uint64_t state_probe_scheduler_worker_id;
     uint64_t state_probe_start_cycles;
     uint64_t state_probe_end_cycles;
@@ -1101,7 +1113,7 @@ struct alignas(128) SchedulerTaskTrace {
     uint64_t refill_scheduler_worker_id;
     uint64_t refill_start_cycles;
     uint64_t refill_end_cycles;
-    uint64_t refill_task_id;
+    uint64_t refill_task_ref;
     uint64_t refill_loop_iter;
     uint64_t completion_reserved[3];
 
@@ -1324,8 +1336,8 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
     for (uint64_t i = 0; i < layout.task_count; ++i) {
         controls[i].state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
         controls[i].wake_list_head = SCHEDULER_WAKE_LIST_OPEN;
-        controls[i].next_waiter = SCHEDULER_TASK_ID_INVALID;
-        controls[i].waiting_producer = static_cast<int32_t>(SCHEDULER_TASK_ID_INVALID);
+        controls[i].next_waiter = SCHEDULER_TASK_REF_INVALID;
+        controls[i].waiting_producer = static_cast<int32_t>(SCHEDULER_TASK_REF_INVALID);
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
     for (uint64_t i = 0; i < SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)

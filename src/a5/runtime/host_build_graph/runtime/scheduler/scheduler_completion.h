@@ -28,12 +28,12 @@ scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLo
 
 inline __aicore__ void scheduler_account_failed_completion(
     const SchedulerGraphView &graph, SchedulerLocalState *scheduler, __gm__ SchedulerRunControl *run_control,
-    int64_t task_id, SchedulerErrorSite error_site
+    int64_t task_ref, SchedulerErrorSite error_site
 ) {
     // Preserve a more specific error already latched by the failing helper. The
     // fallback covers argument/invariant guards that only report false.
     scheduler_record_error(
-        run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler, error_site
+        run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler, error_site
     );
     ++scheduler->pending_completed;
 }
@@ -47,7 +47,7 @@ struct SchedulerRefillCandidates {
         if (!initialize) return;
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
             for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot)
-                tasks[lane][slot] = SCHEDULER_TASK_ID_INVALID;
+                tasks[lane][slot] = SCHEDULER_TASK_REF_INVALID;
     }
 };
 
@@ -71,10 +71,10 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     if (worker_id >= scheduler->config.runtime_worker_count) return false;
     __gm__ SchedulerWorkerContext *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
     SchedulerLocalSlotState *local_slot = &scheduler->slots[cluster_lane][pending_slot];
-    const int64_t published_task_id = local_slot->task_id;
+    const int64_t published_task_ref = local_slot->task_ref;
     if (local_slot->state != SchedulerDispatchSlotState::READY || local_slot->generation != completed_generation) {
         scheduler_record_error(
-            run_control, published_task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            run_control, published_task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::COMPLETION_GENERATION_MISMATCH
         );
         return false;
@@ -84,9 +84,9 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const bool schedule_timing_enabled = scheduler_schedule_timing_enabled(profiling_level);
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
     const uint64_t completion_observe = schedule_timing_enabled ? scheduler_cycles() : 0;
-    const int64_t task_id = local_slot->task_id;
-    if (task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count) {
-        scheduler_record_error(run_control, task_id, SchedulerGraphResult::INVALID_TASK_ID, &graph, scheduler);
+    const int64_t task_ref = local_slot->task_ref;
+    if (!scheduler_task_ref_valid(graph, task_ref)) {
+        scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, scheduler);
         return false;
     }
     SchedulerMixTracker *mix_tracker = nullptr;
@@ -96,13 +96,13 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         else {
             mix_tracker = &scheduler->mix_trackers[local_slot->mix_tracker];
             const auto subtask = static_cast<SubtaskSlot>(local_slot->subtask_slot);
-            valid_subtask = valid_subtask && mix_tracker->task_id == task_id && mix_tracker->active_mask.has(subtask) &&
-                            !mix_tracker->completed_mask.has(subtask);
+            valid_subtask = valid_subtask && mix_tracker->task_ref == task_ref &&
+                            mix_tracker->active_mask.has(subtask) && !mix_tracker->completed_mask.has(subtask);
         }
     }
     if (!valid_subtask) {
         scheduler_record_error(
-            run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::COMPLETION_GENERATION_MISMATCH
         );
         return false;
@@ -128,7 +128,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         __gm__ SchedulerTaskTrace *traces =
             scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, scheduler->profiling->trace_cells_offset);
         completed_trace = &traces[scheduler_trace_index_at(
-            scheduler_state_base, scheduler, task_id, static_cast<SubtaskSlot>(local_slot->subtask_slot)
+            scheduler_state_base, scheduler, task_ref, static_cast<SubtaskSlot>(local_slot->subtask_slot)
         )];
     }
     if (chip_task_timing_enabled) {
@@ -182,9 +182,9 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     if (mix_tracker != nullptr) {
         mix_tracker->completed_mask.activate(static_cast<SubtaskSlot>(completed_subtask_slot));
         task_complete = mix_tracker->completed_mask == mix_tracker->active_mask;
-        if (task_complete) mix_tracker->task_id = SCHEDULER_TASK_ID_INVALID;
+        if (task_complete) mix_tracker->task_ref = SCHEDULER_TASK_REF_INVALID;
     }
-    local_slot->task_id = SCHEDULER_TASK_ID_INVALID;
+    local_slot->task_ref = SCHEDULER_TASK_REF_INVALID;
     local_slot->state = SchedulerDispatchSlotState::FREE;
     local_slot->subtask_slot = UINT8_MAX;
     local_slot->mix_tracker = UINT8_MAX;
@@ -192,35 +192,36 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const uint64_t completion_phase_end = phase_timing_enabled ? scheduler_cycles() : 0;
     SchedulerReadyClaim resolved_ready{};
     if (task_complete) {
-        __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_id);
+        __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
         scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
         SchedulerReadyClaim *direct_ready = replacement_ready == nullptr && worker_id != scheduler->worker_id() &&
                                                     (!scheduler->has_mix || candidates != nullptr) ?
                                                 &resolved_ready :
                                                 nullptr;
         if (!scheduler_resolve_completion(
-                graph, scheduler_state_base, scheduler, run_control, task_id, wake_stats, ready_stats, completion_stats,
-                profiling_level, false, direct_ready, scheduler_metadata_core_type_index(completed_subtask_slot),
+                graph, scheduler_state_base, scheduler, run_control, task_ref, wake_stats, ready_stats,
+                completion_stats, profiling_level, false, direct_ready,
+                scheduler_metadata_core_type_index(completed_subtask_slot),
                 scheduler->has_mix && candidates != nullptr ? &candidates->mix_ready : nullptr
             )) {
             scheduler_account_failed_completion(
-                graph, scheduler, run_control, task_id, SchedulerErrorSite::COMPLETION_RESOLVE_FAILED
+                graph, scheduler, run_control, task_ref, SchedulerErrorSite::COMPLETION_RESOLVE_FAILED
             );
             return false;
         }
     }
-    if (scheduler->has_mix && resolved_ready.task_id >= 0 && candidates != nullptr) {
-        candidates->tasks[cluster_lane][pending_slot] = resolved_ready.task_id;
+    if (scheduler->has_mix && !scheduler_task_ref_is_null(resolved_ready.task_ref) && candidates != nullptr) {
+        candidates->tasks[cluster_lane][pending_slot] = resolved_ready.task_ref;
         if (phase_timing_enabled)
             candidates->completed_trace_indices[cluster_lane][pending_slot] = scheduler_trace_index_at(
-                scheduler_state_base, scheduler, task_id, static_cast<SubtaskSlot>(completed_subtask_slot)
+                scheduler_state_base, scheduler, task_ref, static_cast<SubtaskSlot>(completed_subtask_slot)
             );
     }
     SchedulerReadyClaim ready{};
     bool ready_available = !scheduler->has_mix && replacement_ready != nullptr;
     if (ready_available) {
         ready = *replacement_ready;
-    } else if (!scheduler->has_mix && resolved_ready.task_id >= 0) {
+    } else if (!scheduler->has_mix && !scheduler_task_ref_is_null(resolved_ready.task_ref)) {
         ready = resolved_ready;
         ready_available = true;
     } else if (!scheduler->has_mix && ready_victim_cursors != nullptr && worker_id != scheduler->worker_id()) {
@@ -233,12 +234,12 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
                 &ready_victim_cursors[core_type], ready_stats, &ready
             )) {
             scheduler_account_failed_completion(
-                graph, scheduler, run_control, task_id, SchedulerErrorSite::COMPLETION_REFILL_CLAIM_FAILED
+                graph, scheduler, run_control, task_ref, SchedulerErrorSite::COMPLETION_REFILL_CLAIM_FAILED
             );
             return false;
         }
         ready.state_probe_start_cycles = state_probe_start_cycles;
-        ready_available = ready.task_id >= 0;
+        ready_available = !scheduler_task_ref_is_null(ready.task_ref);
         if (ready_available) {
             ready.state_probe_end_cycles = phase_timing_enabled ? scheduler_cycles() : 0;
             refill_start_cycles = ready.state_probe_end_cycles;
@@ -258,7 +259,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
                 graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level, ssbuf_region
             )) {
             scheduler_account_failed_completion(
-                graph, scheduler, run_control, task_id, SchedulerErrorSite::COMPLETION_REFILL_DISPATCH_FAILED
+                graph, scheduler, run_control, task_ref, SchedulerErrorSite::COMPLETION_REFILL_DISPATCH_FAILED
             );
             return false;
         }
@@ -274,7 +275,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
             completed_trace->refill_scheduler_worker_id = scheduler->worker_id();
             completed_trace->refill_start_cycles = refill_start_cycles;
             completed_trace->refill_end_cycles = refill_end_cycles;
-            completed_trace->refill_task_id = static_cast<uint64_t>(ready.task_id);
+            completed_trace->refill_task_ref = static_cast<uint64_t>(ready.task_ref);
             completed_trace->refill_loop_iter = scheduler->profiling->loop_iter;
         }
         scheduler_writeback_cache_line(completed_trace);

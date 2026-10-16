@@ -525,7 +525,7 @@ TEST(SchedulerGraph, NonPowerOfTwoWindowKeepsDirectTaskIdIndexing) {
     EXPECT_EQ(scheduler_graph_payload(graph, 1), reinterpret_cast<uint8_t *>(&storage[1].payload));
     SchedulerTaskShape shape{};
     EXPECT_EQ(scheduler_classify_task_shape(graph, 1, &shape), SchedulerGraphResult::OK);
-    EXPECT_EQ(shape.task_id, 1);
+    EXPECT_EQ(shape.task_ref, 1);
 }
 
 TEST(SchedulerGraph, ValidatesNonEmptyFanins) {

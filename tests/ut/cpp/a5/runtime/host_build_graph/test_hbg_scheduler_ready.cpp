@@ -93,7 +93,7 @@ TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
         graph.executable(0, 0);
         storage.contexts[1].core_type = static_cast<int32_t>(CoreType::AIC);
         SchedulerReadyClaim ready_claim{};
-        ready_claim.task_id = 0;
+        ready_claim.task_ref = 0;
         ready_claim.source = SchedulerReadySource::STOLEN;
         ready_claim.state_probe_start_cycles = 100;
         ready_claim.state_probe_end_cycles = 123;
@@ -106,7 +106,7 @@ TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
         auto *traces =
             scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
         EXPECT_EQ(traces[0].worker_id, level == 0 ? 0u : storage.contexts[1].worker_index);
-        EXPECT_EQ(traces[0].task_id, 0u);
+        EXPECT_EQ(traces[0].task_ref, 0u);
         EXPECT_EQ(
             traces[0].state_probe_scheduler_worker_id,
             level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? storage.contexts[1].worker_index : 0u
@@ -280,19 +280,19 @@ TEST(SchedulerReadyInbox, BatchPushAndInboxRefreshPreserveFifoAndDirectory) {
     );
     EXPECT_NE(directory->core_types[0][0].bits & 1, 0u);
     for (uint64_t index = 0; index < kTasks; ++index) {
-        int64_t task = SCHEDULER_TASK_ID_INVALID;
+        int64_t task = SCHEDULER_TASK_REF_INVALID;
         ASSERT_TRUE(scheduler_ready_pop_from_inbox(
             graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
             storage.run_control, 0, 0, &task, &stats
         ));
         EXPECT_EQ(task, static_cast<int64_t>(index));
     }
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 0, &task, &stats
     ));
-    EXPECT_EQ(task, SCHEDULER_TASK_ID_INVALID);
+    EXPECT_EQ(task, SCHEDULER_TASK_REF_INVALID);
     EXPECT_NE(directory->core_types[0][0].bits & 1, 0u);
     ASSERT_TRUE(scheduler_refresh_ready_inbox_type(
         storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0
@@ -325,7 +325,7 @@ TEST(SchedulerReadyInbox, RefreshesOnlyLocallyActiveQueueTypes) {
     ));
     EXPECT_EQ(scheduler_local_state.owner_ready_queue_mask, UINT32_C(1));
 
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 0, &task, &stats
@@ -372,19 +372,19 @@ TEST(SchedulerReadyInbox, OwnerPromotesPendingBankAfterPublishedBankDrains) {
     EXPECT_EQ(scheduler_ready_pending_tail(endpoints), 3);
 
     for (int64_t expected = 0; expected < 2; ++expected) {
-        int64_t task = SCHEDULER_TASK_ID_INVALID;
+        int64_t task = SCHEDULER_TASK_REF_INVALID;
         ASSERT_TRUE(scheduler_ready_pop_from_inbox(
             graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
             storage.run_control, 0, 0, &task, &stats
         ));
         EXPECT_EQ(task, expected);
     }
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 0, &task, &stats
     ));
-    EXPECT_EQ(task, SCHEDULER_TASK_ID_INVALID);
+    EXPECT_EQ(task, SCHEDULER_TASK_REF_INVALID);
     ASSERT_TRUE(scheduler_refresh_ready_inbox_type(
         storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0
     ));
@@ -415,7 +415,7 @@ TEST(SchedulerReadyInbox, OlderPendingBankPrecedesBatchArrivingAfterDrain) {
             &stats
         ));
     }
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 0, &task, &stats
@@ -462,7 +462,7 @@ TEST(SchedulerReadyInbox, ThiefCannotObserveOrPromoteOwnerPendingBank) {
             &stats
         ));
     }
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 1, &task, &stats
@@ -472,7 +472,7 @@ TEST(SchedulerReadyInbox, ThiefCannotObserveOrPromoteOwnerPendingBank) {
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 1, &task, &stats
     ));
-    EXPECT_EQ(task, SCHEDULER_TASK_ID_INVALID);
+    EXPECT_EQ(task, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(scheduler_ready_pending_head(owner_state.owner_pending_endpoints[0]), 1);
     ASSERT_TRUE(scheduler_refresh_ready_inbox_type(
         storage.scheduler_state->base(), storage.local_context(&storage.contexts[1], &owner_state), 0
@@ -505,7 +505,7 @@ TEST(SchedulerReadyInbox, StealsOnlyFromMarkedVictim) {
         storage.local_context(&storage.contexts[0], &storage.owner_states[0]), storage.run_control, 2, 0, &cursor,
         &stats, &claim
     ));
-    EXPECT_EQ(claim.task_id, 0);
+    EXPECT_EQ(claim.task_ref, 0);
     EXPECT_EQ(claim.inbox_index, 1u);
     EXPECT_EQ(claim.source, SchedulerReadySource::STOLEN);
     EXPECT_EQ(stats.steal_count, 1u);
@@ -583,7 +583,7 @@ TEST(SchedulerReadyInbox, SparseDirectoryWrapsWithinShard) {
         storage.local_context(&storage.contexts[7], &storage.owner_states[7]), storage.run_control, 14, 0, &cursor,
         &stats, &claim
     ));
-    EXPECT_EQ(claim.task_id, 0);
+    EXPECT_EQ(claim.task_ref, 0);
     EXPECT_EQ(claim.inbox_index, 13u);
     EXPECT_EQ(cursor, 7u);
 
@@ -592,7 +592,7 @@ TEST(SchedulerReadyInbox, SparseDirectoryWrapsWithinShard) {
         storage.local_context(&storage.contexts[7], &storage.owner_states[7]), storage.run_control, 14, 0, &cursor,
         &stats, &claim
     ));
-    EXPECT_EQ(claim.task_id, 1);
+    EXPECT_EQ(claim.task_ref, 1);
     EXPECT_EQ(claim.inbox_index, 8u);
     EXPECT_EQ(cursor, 9u);
 }
@@ -618,7 +618,7 @@ TEST(SchedulerReadyInbox, DoesNotStealAcrossDirectoryShards) {
         storage.local_context(&storage.contexts[0], &storage.owner_states[0]), storage.run_control, 14, 0, &cursor,
         &stats, &claim
     ));
-    EXPECT_EQ(claim.task_id, SCHEDULER_TASK_ID_INVALID);
+    EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
 
     cursor = 8;
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
@@ -626,7 +626,7 @@ TEST(SchedulerReadyInbox, DoesNotStealAcrossDirectoryShards) {
         storage.local_context(&storage.contexts[7], &storage.owner_states[7]), storage.run_control, 14, 0, &cursor,
         &stats, &claim
     ));
-    EXPECT_EQ(claim.task_id, 0);
+    EXPECT_EQ(claim.task_ref, 0);
     EXPECT_EQ(claim.inbox_index, 8u);
     EXPECT_EQ(claim.source, SchedulerReadySource::STOLEN);
 }
@@ -639,7 +639,7 @@ TEST(SchedulerDispatch, RejectsKernelIdBeforeCallableTableAccess) {
     storage.metadata[0].kernel_ids[0] = static_cast<uint16_t>(kFixtureCallableCount);
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -658,7 +658,7 @@ TEST(SchedulerDispatch, RejectsInvalidSingleSubtaskShapeBeforeMetadataIndex) {
     storage.metadata[0].active_mask = LaneMask::none();
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -676,7 +676,7 @@ TEST(SchedulerDispatch, RejectsCoreTypeMismatch) {
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIV);
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -695,7 +695,7 @@ TEST(SchedulerDispatch, RejectsUnknownTargetCoreType) {
     storage.metadata[0].active_mask = LaneMask::aiv0();
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -714,7 +714,7 @@ TEST(SchedulerDispatch, DispatchSequenceIsIndependentOfSlotGenerationAndRejectsZ
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -732,7 +732,7 @@ TEST(SchedulerDispatch, DispatchSequenceIsIndependentOfSlotGenerationAndRejectsZ
     storage.run_control->error_claimed = 0;
     storage.run_control->scheduler_error = 0;
     slot_claim.slot_index = 1;
-    ready_claim.task_id = 1;
+    ready_claim.task_ref = 1;
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
@@ -761,7 +761,7 @@ TEST(SchedulerDispatch, RejectsAKernelIdPastThePublishedCallableCount) {
 
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
@@ -773,7 +773,7 @@ TEST(SchedulerDispatch, RejectsAKernelIdPastThePublishedCallableCount) {
     EXPECT_EQ(payload->function_bin_addr, UINT64_C(0x1000)) << "the last id inside the count still dispatches";
 
     slot_claim.slot_index = 1;
-    ready_claim.task_id = 1;
+    ready_claim.task_ref = 1;
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
@@ -793,7 +793,7 @@ TEST(SchedulerDispatch, AcceptsLastCallableAndInlineSentinel) {
     storage.callable_addresses[kFixtureCallableCount - 1] = UINT64_C(0x2000);
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
@@ -807,7 +807,7 @@ TEST(SchedulerDispatch, AcceptsLastCallableAndInlineSentinel) {
     storage.metadata[1].kernel_ids[0] = UINT16_MAX;
     storage.metadata[1].flags |= SCHEDULER_TASK_INLINE;
     slot_claim.slot_index = 1;
-    ready_claim.task_id = 1;
+    ready_claim.task_ref = 1;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
@@ -875,7 +875,7 @@ TEST(SchedulerPredicate, MalformedPredicateStopsDispatchWithoutPublishingSlot) {
     storage.metadata[0].flags |= SCHEDULER_TASK_HAS_PREDICATE;
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -897,7 +897,7 @@ TEST(SchedulerPredicate, FailedPredicatePublishesDependencyOnlyDispatch) {
     storage.metadata[0].flags |= SCHEDULER_TASK_HAS_PREDICATE;
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -932,7 +932,7 @@ TEST(SchedulerReadyInbox, ConcurrentConsumersNeverDuplicateTask) {
     std::atomic<bool> failed{false};
     auto consume = [&](uint64_t worker) {
         while (!failed.load(std::memory_order_relaxed) && claimed.load(std::memory_order_relaxed) < kTasks) {
-            int64_t task = SCHEDULER_TASK_ID_INVALID;
+            int64_t task = SCHEDULER_TASK_REF_INVALID;
             if (!scheduler_ready_pop_from_inbox(
                     graph.graph(), storage.scheduler_state->base(),
                     storage.local_context(&storage.contexts[worker], nullptr), storage.run_control, 0, 0, &task, nullptr
@@ -1004,7 +1004,7 @@ TEST(SchedulerReadyInbox, OwnerPushRacesThiefWithoutLosingTasks) {
         for (uint64_t spin = 0; spin < kSpinLimit && !failed.load(std::memory_order_relaxed) &&
                                 claimed.load(std::memory_order_relaxed) < kTasks;
              ++spin) {
-            int64_t task = SCHEDULER_TASK_ID_INVALID;
+            int64_t task = SCHEDULER_TASK_REF_INVALID;
             if (!scheduler_ready_pop_from_inbox(
                     graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]),
                     storage.run_control, 0, 0, &task, nullptr
@@ -1074,7 +1074,7 @@ TEST(SchedulerReadyInbox, PendingPromotionRacesThiefWithoutReplayingTasks) {
         for (uint64_t spin = 0; spin < kSpinLimit && !failed.load(std::memory_order_relaxed) &&
                                 claimed.load(std::memory_order_relaxed) < kTasks;
              ++spin) {
-            int64_t task = SCHEDULER_TASK_ID_INVALID;
+            int64_t task = SCHEDULER_TASK_REF_INVALID;
             if (!scheduler_ready_pop_from_inbox(
                     graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]),
                     storage.run_control, 0, 0, &task, nullptr
@@ -1146,11 +1146,11 @@ TEST(SchedulerReadyWake, ConcurrentRegistrationAndCloseResolveEveryConsumerExact
     closer.join();
 
     while (!failed.load(std::memory_order_relaxed)) {
-        int64_t task = SCHEDULER_TASK_ID_INVALID;
+        int64_t task = SCHEDULER_TASK_REF_INVALID;
         ASSERT_TRUE(scheduler_ready_pop_from_inbox(
             graph.graph(), storage.scheduler_state->base(), reader, storage.run_control, 0, 0, &task, nullptr
         ));
-        if (task == SCHEDULER_TASK_ID_INVALID) break;
+        if (task == SCHEDULER_TASK_REF_INVALID) break;
         seen[static_cast<size_t>(task)].fetch_add(1, std::memory_order_relaxed);
     }
     EXPECT_FALSE(failed.load());
@@ -1187,7 +1187,7 @@ TEST(SchedulerReadyWake, WakeResolvePublishesConsumerToSchedulerLocalInbox) {
         &completion, 0, true, nullptr, UINT32_MAX
     ));
     EXPECT_EQ(completion.resolve_count, 1u);
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 0, &task, &ready
@@ -1232,7 +1232,7 @@ TEST(SchedulerReadyWake, WakeResolveQueuesBehindOlderPublishedWork) {
     EXPECT_EQ(completion.resolve_count, 1u);
     EXPECT_EQ(scheduler_ready_pending_head(owner_state.owner_pending_endpoints[0]), 1);
 
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 0, &task, &ready

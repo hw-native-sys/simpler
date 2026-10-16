@@ -17,22 +17,24 @@ inline __aicore__ bool scheduler_dispatch_mix_ready(
     const SchedulerReadyClaim &ready, const SchedulerMixPlacement &placement, uint64_t profiling_level,
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf
 ) {
-    if (ready.task_id < 0 || placement.count < 2 || placement.tracker >= SCHEDULER_MIX_TRACKER_COUNT) return false;
+    if (scheduler_task_ref_is_null(ready.task_ref) || placement.count < 2 ||
+        placement.tracker >= SCHEDULER_MIX_TRACKER_COUNT)
+        return false;
     const SchedulerTaskMetadata metadata =
-        scheduler_load_dispatch_metadata(base, local, ready.task_id, profiling_level);
+        scheduler_load_dispatch_metadata(base, local, ready.task_ref, profiling_level);
     SchedulerTaskPayloadArguments arguments{};
     const bool inline_task = scheduler_task_is_inline(metadata.flags);
     if (!inline_task) {
-        const SchedulerGraphResult status = scheduler_parse_task_payload_arguments(graph, ready.task_id, &arguments);
+        const SchedulerGraphResult status = scheduler_parse_task_payload_arguments(graph, ready.task_ref, &arguments);
         if (status != SchedulerGraphResult::OK) {
             scheduler_record_error(
-                run, ready.task_id, status, &graph, local, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
+                run, ready.task_ref, status, &graph, local, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
             );
             return false;
         }
     }
     auto &tracker = local->mix_trackers[placement.tracker];
-    tracker.task_id = ready.task_id;
+    tracker.task_ref = ready.task_ref;
     tracker.active_mask = scheduler_task_lanes(metadata);
     tracker.completed_mask = LaneMask::none();
     for (uint8_t i = 0; i < placement.count; ++i) {
@@ -52,8 +54,8 @@ inline __aicore__ bool scheduler_dispatch_mix_ready(
                 const auto &claim = placement.slots[j];
                 scheduler_initialize_free_slot(&local->slots[claim.cluster_lane][claim.slot_index]);
             }
-            tracker.task_id = SCHEDULER_TASK_ID_INVALID;
-            scheduler_record_error(run, ready.task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
+            tracker.task_ref = SCHEDULER_TASK_REF_INVALID;
+            scheduler_record_error(run, ready.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local);
             return false;
         }
         payloads[i] = scheduler_state_at<DispatchPayload>(
@@ -86,7 +88,7 @@ inline __aicore__ bool scheduler_fill_cluster_mix_slots(
                 &ready, &placement, allow_steal
             ))
             return false;
-        if (ready.task_id < 0) return true;
+        if (scheduler_task_ref_is_null(ready.task_ref)) return true;
         if (!scheduler_dispatch_mix_ready(graph, base, local, run, ready, placement, profiling_level, ssbuf))
             return false;
         if (progress != nullptr) *progress = true;
@@ -99,17 +101,17 @@ inline __aicore__ bool scheduler_publish_direct_mix_candidate(
     SchedulerReadyClaim *candidate, SchedulerReadyStats *stats, uint64_t profiling_level,
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf, bool *progress
 ) {
-    if (candidate == nullptr || candidate->task_id < 0) return true;
+    if (candidate == nullptr || scheduler_task_ref_is_null(candidate->task_ref)) return true;
     // The ready-queue snapshot permits a direct attempt before the next queue
     // claim. A candidate without complete placement joins the queue first.
     SchedulerMixPlacement placement{};
-    if (scheduler_plan_mix_placement(base, local, candidate->task_id, &placement)) {
+    if (scheduler_plan_mix_placement(base, local, candidate->task_ref, &placement)) {
         if (!scheduler_dispatch_mix_ready(graph, base, local, run, *candidate, placement, profiling_level, ssbuf))
             return false;
         if (progress != nullptr) *progress = true;
     } else {
         SchedulerReadyBatch batch{};
-        if (!scheduler_ready_batch_append(base, local, candidate->task_id, &batch, stats, profiling_level) ||
+        if (!scheduler_ready_batch_append(base, local, candidate->task_ref, &batch, stats, profiling_level) ||
             !scheduler_ready_batch_push(base, local, SCHEDULER_MIX_QUEUE, &batch, stats))
             return false;
     }
@@ -140,7 +142,7 @@ inline __aicore__ bool scheduler_publish_refill_candidates(
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
             const int64_t task = candidates->tasks[lane][index];
-            if (task < 0) continue;
+            if (scheduler_task_ref_is_null(task)) continue;
             const auto &metadata = *scheduler_task_metadata_at(base, local, task);
             SchedulerFreeSlotClaim claim{};
             for (uint32_t offset = 0; offset < PLATFORM_CORES_PER_BLOCKDIM && claim.slot_index == UINT32_MAX;
@@ -162,7 +164,7 @@ inline __aicore__ bool scheduler_publish_refill_candidates(
             }
             if (claim.slot_index != UINT32_MAX) {
                 SchedulerReadyClaim ready{};
-                ready.task_id = task;
+                ready.task_ref = task;
                 ready.source = SchedulerReadySource::DIRECT_RESOLVE;
                 ready.publication_mode = SchedulerPublicationMode::REFILL;
                 const uint64_t start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
@@ -174,7 +176,7 @@ inline __aicore__ bool scheduler_publish_refill_candidates(
                     completed.refill_scheduler_worker_id = local->worker_id();
                     completed.refill_start_cycles = start;
                     completed.refill_end_cycles = scheduler_cycles();
-                    completed.refill_task_id = static_cast<uint64_t>(task);
+                    completed.refill_task_ref = static_cast<uint64_t>(task);
                     completed.refill_loop_iter = local->profiling->loop_iter;
                     scheduler_publish_cache_line(&completed.refill_scheduler_worker_id);
                 }
@@ -185,7 +187,7 @@ inline __aicore__ bool scheduler_publish_refill_candidates(
                     ))
                     return false;
             }
-            candidates->tasks[lane][index] = SCHEDULER_TASK_ID_INVALID;
+            candidates->tasks[lane][index] = SCHEDULER_TASK_REF_INVALID;
         }
     }
     for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type)

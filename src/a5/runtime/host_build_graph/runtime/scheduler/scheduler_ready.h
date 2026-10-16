@@ -77,12 +77,12 @@ inline __aicore__ int64_t scheduler_ready_pending_tail(uint64_t packed) {
     return static_cast<int64_t>(static_cast<int32_t>(static_cast<uint32_t>(packed >> 32)));
 }
 
-inline __aicore__ bool scheduler_ready_pending_endpoint_fits(int64_t task_id) {
-    return task_id >= SCHEDULER_INBOX_EMPTY && task_id <= INT32_MAX;
+inline __aicore__ bool scheduler_ready_pending_endpoint_fits(int64_t task_ref) {
+    return task_ref >= SCHEDULER_INBOX_EMPTY && task_ref <= INT32_MAX;
 }
 
 struct SchedulerReadyClaim {
-    int64_t task_id{SCHEDULER_TASK_ID_INVALID};
+    int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     uint64_t inbox_index{UINT64_MAX};
     SchedulerReadySource source{SchedulerReadySource::LOCAL};
     SchedulerPublicationMode publication_mode{SchedulerPublicationMode::DISPATCH};
@@ -98,7 +98,7 @@ struct SchedulerFreeSlotClaim {
 };
 
 struct SchedulerLocalSlotState {
-    int64_t task_id{SCHEDULER_TASK_ID_INVALID};
+    int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     uint32_t generation{0};
     SchedulerDispatchSlotState state{SchedulerDispatchSlotState::EMPTY};
     uint8_t subtask_slot{UINT8_MAX};
@@ -161,7 +161,7 @@ struct SchedulerLocalProfilingState {
 
 inline constexpr uint32_t SCHEDULER_MIX_TRACKER_COUNT = PLATFORM_CORES_PER_BLOCKDIM * SCHEDULER_PENDING_SLOT_COUNT;
 struct SchedulerMixTracker {
-    int64_t task_id{SCHEDULER_TASK_ID_INVALID};
+    int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     LaneMask active_mask{};
     LaneMask completed_mask{};
 };
@@ -417,8 +417,8 @@ inline __aicore__ uint8_t scheduler_metadata_single_subtask_slot(LaneMask active
 }
 
 inline __aicore__ SchedulerPredicateResult
-scheduler_evaluate_task_predicate(const SchedulerGraphView &graph, int64_t task_id) {
-    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_id);
+scheduler_evaluate_task_predicate(const SchedulerGraphView &graph, int64_t task_ref) {
+    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_ref);
     __gm__ SchedulerDispatchPredicate *predicate =
         reinterpret_cast<__gm__ SchedulerDispatchPredicate *>(payload + SCHEDULER_GRAPH_PREDICATE_OFFSET);
     scheduler_observe_cache_line(predicate);
@@ -482,18 +482,18 @@ scheduler_completion_id(const SchedulerLocalState *context, uint64_t local_compl
 }
 
 inline __aicore__ __gm__ SchedulerTaskControl *
-scheduler_task_control_at(__gm__ void *scheduler_state_base, const SchedulerLocalState *context, int64_t task_id) {
+scheduler_task_control_at(__gm__ void *scheduler_state_base, const SchedulerLocalState *context, int64_t task_ref) {
     return scheduler_state_at<SchedulerTaskControl>(
         scheduler_state_base,
-        context->config.task_controls_offset + static_cast<uint64_t>(task_id) * sizeof(SchedulerTaskControl)
+        context->config.task_controls_offset + static_cast<uint64_t>(task_ref) * sizeof(SchedulerTaskControl)
     );
 }
 
 inline __aicore__ __gm__ SchedulerTaskMetadata *
-scheduler_task_metadata_at(__gm__ void *scheduler_state_base, const SchedulerLocalState *context, int64_t task_id) {
+scheduler_task_metadata_at(__gm__ void *scheduler_state_base, const SchedulerLocalState *context, int64_t task_ref) {
     return scheduler_state_at<SchedulerTaskMetadata>(
         scheduler_state_base,
-        context->config.task_metadata_offset + static_cast<uint64_t>(task_id) * sizeof(SchedulerTaskMetadata)
+        context->config.task_metadata_offset + static_cast<uint64_t>(task_ref) * sizeof(SchedulerTaskMetadata)
     );
 }
 
@@ -553,12 +553,12 @@ inline __aicore__ void scheduler_append_idle_activity(
 }
 
 inline __aicore__ void scheduler_record_error(
-    __gm__ SchedulerRunControl *run_control, int64_t task_id, SchedulerGraphResult status,
+    __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerGraphResult status,
     const SchedulerGraphView *graph = nullptr, __gm__ const SchedulerWorkerContext *context = nullptr,
     SchedulerErrorSite error_site = SchedulerErrorSite::UNKNOWN
 ) {
     if (scheduler_gm_compare_exchange(run_control->error_claimed, UINT64_C(0), UINT64_C(1)) != 0) return;
-    scheduler_gm_store(run_control->error_task_id, static_cast<uint64_t>(task_id));
+    scheduler_gm_store(run_control->error_task_ref, static_cast<uint64_t>(task_ref));
     if (graph != nullptr) {
         scheduler_gm_store(run_control->error_graph_task_count, graph->task_count);
         scheduler_gm_store(run_control->error_storage_address, graph->storage_address);
@@ -573,11 +573,11 @@ inline __aicore__ void scheduler_record_error(
 }
 
 inline __aicore__ void scheduler_record_error(
-    __gm__ SchedulerRunControl *run_control, int64_t task_id, SchedulerGraphResult status,
+    __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerGraphResult status,
     const SchedulerGraphView *graph, const SchedulerLocalState *local,
     SchedulerErrorSite error_site = SchedulerErrorSite::UNKNOWN
 ) {
-    scheduler_record_error(run_control, task_id, status, graph, local->config.shared_context, error_site);
+    scheduler_record_error(run_control, task_ref, status, graph, local->config.shared_context, error_site);
 }
 
 inline __aicore__ void scheduler_publish_waiter_metadata(
@@ -596,14 +596,14 @@ inline __aicore__ int64_t scheduler_observe_next_waiter(__gm__ SchedulerTaskCont
 
 inline __aicore__ SchedulerRouteResult scheduler_route_task(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
-    __gm__ SchedulerRunControl *run_control, int64_t task_id, SchedulerWakeStats *stats,
+    __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerWakeStats *stats,
     bool validate_current_state = true
 ) {
-    if (task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count) {
-        scheduler_record_error(run_control, task_id, SchedulerGraphResult::INVALID_TASK_ID, &graph, context);
+    if (!scheduler_task_ref_valid(graph, task_ref)) {
+        scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, context);
         return SchedulerRouteResult::ERROR;
     }
-    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_id);
+    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
     if (validate_current_state) {
         // A BLOCKED task belongs to at most one producer wake list. Completion
         // detaches that list before routing the task to its next fanin.
@@ -611,25 +611,25 @@ inline __aicore__ SchedulerRouteResult scheduler_route_task(
         if (state == static_cast<int64_t>(SchedulerTaskState::DONE)) return SchedulerRouteResult::COMPLETED;
         if (state != static_cast<int64_t>(SchedulerTaskState::BLOCKED)) {
             scheduler_record_error(
-                run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                 SchedulerErrorSite::ROUTE_INVALID_STATE
             );
             return SchedulerRouteResult::ERROR;
         }
     }
 
-    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_id);
+    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_ref);
     int32_t fanin_count = *reinterpret_cast<__gm__ int32_t *>(payload + SCHEDULER_GRAPH_FANIN_COUNT_OFFSET);
     int32_t next_fanin = control->next_fanin_index;
     if (fanin_count < 0 || next_fanin < 0 || next_fanin > fanin_count) {
-        scheduler_record_error(run_control, task_id, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context);
+        scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context);
         return SchedulerRouteResult::ERROR;
     }
 
     while (next_fanin < fanin_count) {
-        int32_t producer = scheduler_graph_fanin_id(graph, task_id, next_fanin);
-        if (producer < 0 || producer >= task_id) {
-            scheduler_record_error(run_control, task_id, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context);
+        int32_t producer = scheduler_graph_fanin_id(graph, task_ref, next_fanin);
+        if (!scheduler_task_ref_precedes(producer, task_ref)) {
+            scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context);
             return SchedulerRouteResult::ERROR;
         }
         if (stats != nullptr) ++stats->fanin_state_load_count;
@@ -647,7 +647,7 @@ inline __aicore__ SchedulerRouteResult scheduler_route_task(
                 break;
             }
             scheduler_publish_waiter_metadata(control, observed, next_fanin, producer);
-            int64_t actual = scheduler_gm_compare_exchange(producer_control->wake_list_head, observed, task_id);
+            int64_t actual = scheduler_gm_compare_exchange(producer_control->wake_list_head, observed, task_ref);
             if (actual == observed) {
                 if (stats != nullptr) ++stats->wake_register_count;
                 return SchedulerRouteResult::WAITING;
@@ -669,24 +669,24 @@ inline __aicore__ SchedulerRouteResult scheduler_route_task(
 // safe to publish the new head before publishing the waiter's link.
 inline __aicore__ SchedulerRouteResult scheduler_bootstrap_route_task(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
-    __gm__ SchedulerRunControl *run_control, int64_t task_id, SchedulerWakeStats *stats
+    __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerWakeStats *stats
 ) {
-    if (task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count) {
-        scheduler_record_error(run_control, task_id, SchedulerGraphResult::INVALID_TASK_ID, &graph, context);
+    if (!scheduler_task_ref_valid(graph, task_ref)) {
+        scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, context);
         return SchedulerRouteResult::ERROR;
     }
-    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_id);
+    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_ref);
     int32_t fanin_count = *reinterpret_cast<__gm__ int32_t *>(payload + SCHEDULER_GRAPH_FANIN_COUNT_OFFSET);
     if (fanin_count < 0) {
-        scheduler_record_error(run_control, task_id, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context);
+        scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context);
         return SchedulerRouteResult::ERROR;
     }
 
-    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_id);
+    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
     for (int32_t next_fanin = 0; next_fanin < fanin_count; ++next_fanin) {
-        int32_t producer = scheduler_graph_fanin_id(graph, task_id, next_fanin);
-        if (producer < 0 || producer >= task_id) {
-            scheduler_record_error(run_control, task_id, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context);
+        int32_t producer = scheduler_graph_fanin_id(graph, task_ref, next_fanin);
+        if (!scheduler_task_ref_precedes(producer, task_ref)) {
+            scheduler_record_error(run_control, task_ref, SchedulerGraphResult::INVALID_FANIN_ID, &graph, context);
             return SchedulerRouteResult::ERROR;
         }
         __gm__ SchedulerTaskMetadata *producer_metadata =
@@ -696,10 +696,10 @@ inline __aicore__ SchedulerRouteResult scheduler_bootstrap_route_task(
 
         __gm__ SchedulerTaskControl *producer_control =
             scheduler_task_control_at(scheduler_state_base, context, producer);
-        int64_t previous = scheduler_gm_exchange(producer_control->wake_list_head, task_id);
+        int64_t previous = scheduler_gm_exchange(producer_control->wake_list_head, task_ref);
         if (previous < SCHEDULER_WAKE_LIST_OPEN) {
             scheduler_record_error(
-                run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                 SchedulerErrorSite::BOOTSTRAP_WAKE_INVALID_HEAD
             );
             return SchedulerRouteResult::ERROR;
@@ -716,33 +716,32 @@ inline __aicore__ SchedulerRouteResult scheduler_bootstrap_route_task(
 }
 
 inline __aicore__ uint32_t
-scheduler_trace_index_at(__gm__ void *base, SchedulerLocalState *local, int64_t task_id, SubtaskSlot subtask) {
-    const auto *metadata = scheduler_task_metadata_at(base, local, task_id);
+scheduler_trace_index_at(__gm__ void *base, SchedulerLocalState *local, int64_t task_ref, SubtaskSlot subtask) {
+    const auto *metadata = scheduler_task_metadata_at(base, local, task_ref);
     return scheduler_task_trace_index(metadata->trace_index_base, scheduler_task_lanes(*metadata), subtask);
 }
 
 inline __aicore__ bool scheduler_bootstrap_ready_batch_append(
-    __gm__ void *scheduler_state_base, SchedulerLocalState *context, int64_t task_id, SchedulerReadyBatch *batch,
+    __gm__ void *scheduler_state_base, SchedulerLocalState *context, int64_t task_ref, SchedulerReadyBatch *batch,
     SchedulerReadyStats *stats, uint64_t profiling_level = 0
 ) {
-    if (batch == nullptr || task_id < 0 || static_cast<uint64_t>(task_id) >= context->config.graph->task_count)
-        return false;
+    if (batch == nullptr || !scheduler_task_ref_valid(*context->config.graph, task_ref)) return false;
     // next_waiter belongs to exactly one wake or Ready chain while the task is live.
-    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_id);
+    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
     control->next_waiter = SCHEDULER_INBOX_EMPTY;
     scheduler_writeback_cache_line(&control->next_waiter);
     if (batch->head == SCHEDULER_INBOX_EMPTY) {
-        batch->head = task_id;
+        batch->head = task_ref;
     } else {
         __gm__ SchedulerTaskControl *tail = scheduler_task_control_at(scheduler_state_base, context, batch->tail);
-        tail->next_waiter = task_id;
+        tail->next_waiter = task_ref;
         scheduler_writeback_cache_line(&tail->next_waiter);
     }
-    batch->tail = task_id;
+    batch->tail = task_ref;
     if (scheduler_phase_timing_enabled(profiling_level)) {
         __gm__ SchedulerTaskTrace *cells =
             scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->profiling->trace_cells_offset);
-        const auto &metadata = *scheduler_task_metadata_at(scheduler_state_base, context, task_id);
+        const auto &metadata = *scheduler_task_metadata_at(scheduler_state_base, context, task_ref);
         const LaneMask lanes = scheduler_task_lanes(metadata);
         const uint64_t now = scheduler_cycles();
         for (uint8_t subtask = 0; subtask < 3; ++subtask) {
@@ -806,28 +805,27 @@ inline __aicore__ bool scheduler_bootstrap_ready_directory_publish(
 }
 
 inline __aicore__ bool scheduler_ready_batch_append(
-    __gm__ void *scheduler_state_base, SchedulerLocalState *context, int64_t task_id, SchedulerReadyBatch *batch,
+    __gm__ void *scheduler_state_base, SchedulerLocalState *context, int64_t task_ref, SchedulerReadyBatch *batch,
     SchedulerReadyStats *stats, uint64_t profiling_level = 0
 ) {
-    if (batch == nullptr || task_id < 0 || static_cast<uint64_t>(task_id) >= context->config.graph->task_count)
-        return false;
+    if (batch == nullptr || !scheduler_task_ref_valid(*context->config.graph, task_ref)) return false;
     // next_waiter belongs to exactly one wake or Ready chain while the task is live.
-    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_id);
+    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
     control->next_waiter = SCHEDULER_INBOX_EMPTY;
     scheduler_publish_cache_line(&control->next_waiter);
     if (batch->head == SCHEDULER_INBOX_EMPTY) {
-        batch->head = task_id;
+        batch->head = task_ref;
     } else {
         __gm__ SchedulerTaskControl *tail = scheduler_task_control_at(scheduler_state_base, context, batch->tail);
         scheduler_observe_cache_line(&tail->next_waiter);
-        tail->next_waiter = task_id;
+        tail->next_waiter = task_ref;
         scheduler_publish_cache_line(&tail->next_waiter);
     }
-    batch->tail = task_id;
+    batch->tail = task_ref;
     if (scheduler_phase_timing_enabled(profiling_level)) {
         __gm__ SchedulerTaskTrace *cells =
             scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->profiling->trace_cells_offset);
-        const auto *metadata = scheduler_task_metadata_at(scheduler_state_base, context, task_id);
+        const auto *metadata = scheduler_task_metadata_at(scheduler_state_base, context, task_ref);
         const LaneMask mask = scheduler_task_lanes(*metadata);
         const uint32_t trace_base = metadata->trace_index_base;
         const uint64_t transition_cycles = scheduler_cycles();
@@ -1032,14 +1030,14 @@ struct SchedulerMixPlacement {
 };
 
 inline __aicore__ bool scheduler_plan_mix_placement(
-    __gm__ void *base, SchedulerLocalState *local, int64_t task_id, SchedulerMixPlacement *placement
+    __gm__ void *base, SchedulerLocalState *local, int64_t task_ref, SchedulerMixPlacement *placement
 ) {
     *placement = {};
-    const auto &metadata = *scheduler_task_metadata_at(base, local, task_id);
+    const auto &metadata = *scheduler_task_metadata_at(base, local, task_ref);
     const LaneMask lanes = scheduler_task_lanes(metadata);
     if (!scheduler_task_is_mix(metadata.flags)) return false;
     for (uint8_t i = 0; i < SCHEDULER_MIX_TRACKER_COUNT; ++i) {
-        if (local->mix_trackers[i].task_id < 0) {
+        if (scheduler_task_ref_is_null(local->mix_trackers[i].task_ref)) {
             placement->tracker = i;
             break;
         }
@@ -1078,18 +1076,18 @@ inline __aicore__ bool scheduler_plan_mix_placement(
 
 inline __aicore__ bool scheduler_ready_pop_from_inbox(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
-    __gm__ SchedulerRunControl *run_control, uint32_t core_type_index, uint64_t inbox_index, int64_t *task_id,
+    __gm__ SchedulerRunControl *run_control, uint32_t core_type_index, uint64_t inbox_index, int64_t *task_ref,
     SchedulerReadyStats *stats, SchedulerMixPlacement *placement = nullptr, const int64_t *first_head_snapshot = nullptr
 ) {
-    if (task_id == nullptr) return false;
-    *task_id = SCHEDULER_TASK_ID_INVALID;
+    if (task_ref == nullptr) return false;
+    *task_ref = SCHEDULER_TASK_REF_INVALID;
     __gm__ SchedulerReadyInbox *inbox =
         scheduler_ready_inbox_at(scheduler_state_base, context, core_type_index, inbox_index);
     for (uint32_t attempt = 0; attempt < 64; ++attempt) {
         int64_t head =
             attempt == 0 && first_head_snapshot != nullptr ? *first_head_snapshot : scheduler_gm_query(inbox->head);
         if (head == SCHEDULER_INBOX_EMPTY) return true;
-        if (head < 0 || static_cast<uint64_t>(head) >= graph.task_count) {
+        if (!scheduler_task_ref_valid(graph, head)) {
             scheduler_record_error(
                 run_control, head, SchedulerGraphResult::INVALID_TASK_ID, &graph, context,
                 SchedulerErrorSite::READY_POP_INVALID_HEAD
@@ -1113,7 +1111,7 @@ inline __aicore__ bool scheduler_ready_pop_from_inbox(
             continue;
         }
         if (stats != nullptr) ++stats->pop_count;
-        *task_id = head;
+        *task_ref = head;
         return true;
     }
     // Bounded contention may defer a non-empty inbox to a later scheduling iteration.
@@ -1138,7 +1136,7 @@ inline __aicore__ bool scheduler_steal_ready_from_shard(
     uint64_t start, uint64_t bits, SchedulerReadyStats *stats, SchedulerReadyClaim *claim,
     SchedulerMixPlacement *placement = nullptr
 ) {
-    int64_t task_id = SCHEDULER_TASK_ID_INVALID;
+    int64_t task_ref = SCHEDULER_TASK_REF_INVALID;
     bits &= ~(UINT64_C(1) << (context->config.scheduler_index - shard_begin));
     for (uint32_t pass = 0; pass < 2; ++pass) {
         uint64_t range_begin = pass == 0 ? start : shard_begin;
@@ -1152,12 +1150,12 @@ inline __aicore__ bool scheduler_steal_ready_from_shard(
             candidates &= candidates - 1;
             uint64_t victim = shard_begin + bit_index;
             if (!scheduler_ready_pop_from_inbox(
-                    graph, scheduler_state_base, context, run_control, core_type_index, victim, &task_id, stats,
+                    graph, scheduler_state_base, context, run_control, core_type_index, victim, &task_ref, stats,
                     placement
                 ))
                 return false;
-            if (task_id >= 0) {
-                claim->task_id = task_id;
+            if (!scheduler_task_ref_is_null(task_ref)) {
+                claim->task_ref = task_ref;
                 claim->inbox_index = victim;
                 claim->source = SchedulerReadySource::STOLEN;
                 if (stats != nullptr) ++stats->steal_count;
@@ -1184,14 +1182,14 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
         return false;
     // This Scheduler is the only publisher of its empty inbox. A thief can
     // change a nonempty head, and the pop CAS retries against that change.
-    int64_t task_id = SCHEDULER_TASK_ID_INVALID;
+    int64_t task_ref = SCHEDULER_TASK_REF_INVALID;
     if (!scheduler_ready_pop_from_inbox(
             graph, scheduler_state_base, context, run_control, core_type_index, context->config.scheduler_index,
-            &task_id, stats, placement, &owner_head_snapshot
+            &task_ref, stats, placement, &owner_head_snapshot
         ))
         return false;
-    if (task_id >= 0) {
-        claim->task_id = task_id;
+    if (!scheduler_task_ref_is_null(task_ref)) {
+        claim->task_ref = task_ref;
         claim->inbox_index = context->config.scheduler_index;
         return true;
     }
@@ -1212,7 +1210,7 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
                          start, bits, stats, claim, placement
                      ))
         return false;
-    const uint64_t cursor_base = claim->task_id >= 0 ? claim->inbox_index : start;
+    const uint64_t cursor_base = scheduler_task_ref_is_null(claim->task_ref) ? start : claim->inbox_index;
     *victim_cursor = cursor_base + 1 == shard_end ? shard_begin : cursor_base + 1;
     return true;
 }
@@ -1230,16 +1228,16 @@ inline __aicore__ bool scheduler_ready_directory_nonempty(
 }
 
 inline __aicore__ void scheduler_initialize_free_slot(SchedulerLocalSlotState *local_slot) {
-    local_slot->task_id = SCHEDULER_TASK_ID_INVALID;
+    local_slot->task_ref = SCHEDULER_TASK_REF_INVALID;
     local_slot->state = SchedulerDispatchSlotState::FREE;
     local_slot->mix_tracker = UINT8_MAX;
     local_slot->subtask_slot = UINT8_MAX;
 }
 
 inline __aicore__ SchedulerTaskMetadata scheduler_load_dispatch_metadata(
-    __gm__ void *base, SchedulerLocalState *scheduler, int64_t task_id, uint64_t profiling_level
+    __gm__ void *base, SchedulerLocalState *scheduler, int64_t task_ref, uint64_t profiling_level
 ) {
-    const auto *source = scheduler_task_metadata_at(base, scheduler, task_id);
+    const auto *source = scheduler_task_metadata_at(base, scheduler, task_ref);
     SchedulerTaskMetadata metadata{};
     metadata.kernel_ids[0] = source->kernel_ids[0];
     metadata.kernel_ids[1] = source->kernel_ids[1];
@@ -1258,8 +1256,7 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, uint8_t subtask_slot, uint64_t *prepare_start_cycles = nullptr,
     const SchedulerTaskPayloadArguments *arguments = nullptr, bool write_arguments = true
 ) {
-    if (ssbuf_region == nullptr || scheduler == nullptr || ready_claim.task_id < 0 ||
-        static_cast<uint64_t>(ready_claim.task_id) >= graph.task_count ||
+    if (ssbuf_region == nullptr || scheduler == nullptr || !scheduler_task_ref_valid(graph, ready_claim.task_ref) ||
         slot_claim.worker_id >= scheduler->config.runtime_worker_count ||
         slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT || slot_claim.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM)
         return false;
@@ -1275,7 +1272,7 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
         !scheduler_task_is_executable(metadata.flags) ||
         scheduler_metadata_core_type_index(subtask_slot) != scheduler_core_type_index(target->core_type)) {
         scheduler_record_error(
-            run_control, ready_claim.task_id, SchedulerGraphResult::UNSUPPORTED_SHAPE, &graph, scheduler,
+            run_control, ready_claim.task_ref, SchedulerGraphResult::UNSUPPORTED_SHAPE, &graph, scheduler,
             SchedulerErrorSite::DISPATCH_INVALID_SHAPE
         );
         return false;
@@ -1294,7 +1291,7 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
                             callable_addresses, scheduler->config.callable_addresses_count, kernel_id, &callable_address
                         )) {
         scheduler_record_error(
-            run_control, ready_claim.task_id, SchedulerGraphResult::INVALID_CALLABLE, &graph, scheduler,
+            run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_CALLABLE, &graph, scheduler,
             SchedulerErrorSite::DISPATCH_INVALID_CALLABLE
         );
         return false;
@@ -1304,7 +1301,7 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
         target->dispatch_payload_offset + static_cast<uint64_t>(slot_claim.slot_index) * sizeof(DispatchPayload);
 
     SchedulerTaskInfo task{
-        ready_claim.task_id,
+        ready_claim.task_ref,
         static_cast<int32_t>(kernel_id),
         static_cast<int32_t>(subtask_slot),
         subtask_slot == 0 ? CoreType::AIC : CoreType::AIV,
@@ -1320,10 +1317,10 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
             graph, task, callable_address, payload, arguments, write_arguments
         );
         if (status == SchedulerGraphResult::OK && scheduler_task_has_predicate(metadata.flags)) {
-            const SchedulerPredicateResult predicate = scheduler_evaluate_task_predicate(graph, ready_claim.task_id);
+            const SchedulerPredicateResult predicate = scheduler_evaluate_task_predicate(graph, ready_claim.task_ref);
             if (predicate == SchedulerPredicateResult::MALFORMED) {
                 scheduler_record_error(
-                    run_control, ready_claim.task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+                    run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
                     SchedulerErrorSite::DISPATCH_INVALID_PREDICATE
                 );
                 return false;
@@ -1333,7 +1330,8 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
     }
     if (status != SchedulerGraphResult::OK) {
         scheduler_record_error(
-            run_control, ready_claim.task_id, status, &graph, scheduler, SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
+            run_control, ready_claim.task_ref, status, &graph, scheduler,
+            SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
         );
         return false;
     }
@@ -1352,7 +1350,7 @@ inline __aicore__ void scheduler_stage_dispatch_slot(
         scheduler_state_base, scheduler->dispatch_payload_offset(slot_claim.cluster_lane, slot_claim.slot_index)
     );
     SchedulerLocalSlotState *local_slot = &scheduler->slots[slot_claim.cluster_lane][slot_claim.slot_index];
-    local_slot->task_id = ready_claim.task_id;
+    local_slot->task_ref = ready_claim.task_ref;
     scheduler->set_timing_slot(slot_claim.cluster_lane, slot_claim.slot_index, metadata.timing_slot);
     local_slot->generation = generation;
     local_slot->state = SchedulerDispatchSlotState::READY;
@@ -1361,7 +1359,7 @@ inline __aicore__ void scheduler_stage_dispatch_slot(
     SCHEDULER_SSBUF SchedulerSsbufDispatchControl *dispatch_control =
         &ssbuf_region->lanes[slot_claim.cluster_lane].dispatch[slot_claim.slot_index];
     if (remote) {
-        dispatch_control->task_id = ready_claim.task_id;
+        dispatch_control->task_ref = ready_claim.task_ref;
         dispatch_control->subtask_slot = subtask_slot;
     }
     scheduler_writeback_dispatch_payload(payload);
@@ -1395,7 +1393,7 @@ inline __aicore__ void scheduler_commit_dispatch_slot(
             metadata.trace_index_base, scheduler_task_lanes(metadata), static_cast<SubtaskSlot>(subtask_slot)
         )];
         trace->worker_id = slot_claim.worker_id;
-        trace->task_id = static_cast<uint64_t>(ready_claim.task_id);
+        trace->task_ref = static_cast<uint64_t>(ready_claim.task_ref);
         if (phase_timing_enabled) {
             trace->ready_source = static_cast<uint64_t>(ready_claim.source);
             trace->publication_mode = static_cast<uint64_t>(ready_claim.publication_mode);
@@ -1447,7 +1445,7 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     if (slot.state == SchedulerDispatchSlotState::FREE && slot.generation == slot_claim.generation)
         slot.state = SchedulerDispatchSlotState::FILLING;
     const SchedulerTaskMetadata metadata =
-        scheduler_load_dispatch_metadata(scheduler_state_base, scheduler, ready_claim.task_id, profiling_level);
+        scheduler_load_dispatch_metadata(scheduler_state_base, scheduler, ready_claim.task_ref, profiling_level);
     const uint8_t subtask_slot = scheduler_metadata_single_subtask_slot(scheduler_task_lanes(metadata));
     uint64_t prepare_start_cycles = 0;
     if (!scheduler_prepare_dispatch_slot(
@@ -1464,16 +1462,16 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
 
 inline __aicore__ bool scheduler_resolve_completion(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
-    __gm__ SchedulerRunControl *run_control, int64_t task_id, SchedulerWakeStats *wake_stats,
+    __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerWakeStats *wake_stats,
     SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats, uint64_t profiling_level,
     bool validate_done_state, SchedulerReadyClaim *direct_ready, uint32_t direct_core_type,
     SchedulerReadyClaim *direct_mix_ready = nullptr
 ) {
     if (context == nullptr) return false;
-    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_id);
+    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
     if (validate_done_state && scheduler_gm_query(control->state) != static_cast<int64_t>(SchedulerTaskState::DONE)) {
         scheduler_record_error(
-            run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
             SchedulerErrorSite::COMPLETION_TASK_NOT_DONE
         );
         return false;
@@ -1489,7 +1487,7 @@ inline __aicore__ bool scheduler_resolve_completion(
     int64_t waiter = scheduler_gm_exchange(control->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
     if (waiter == SCHEDULER_WAKE_LIST_CLOSED) {
         scheduler_record_error(
-            run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
             SchedulerErrorSite::COMPLETION_WAKE_ALREADY_CLOSED
         );
         return false;
@@ -1497,9 +1495,9 @@ inline __aicore__ bool scheduler_resolve_completion(
     if (wake_stats != nullptr) ++wake_stats->wake_close_count;
     SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
     while (waiter >= 0) {
-        if (static_cast<uint64_t>(waiter) >= graph.task_count) {
+        if (!scheduler_task_ref_valid(graph, waiter)) {
             scheduler_record_error(
-                run_control, task_id, SchedulerGraphResult::INVALID_TASK_ID, &graph, context,
+                run_control, task_ref, SchedulerGraphResult::INVALID_TASK_ID, &graph, context,
                 SchedulerErrorSite::COMPLETION_INVALID_WAITER
             );
             return false;
@@ -1536,9 +1534,10 @@ inline __aicore__ bool scheduler_resolve_completion(
                 return false;
             }
             const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, lanes);
-            if (core_type == SCHEDULER_MIX_QUEUE && direct_mix_ready != nullptr && direct_mix_ready->task_id >= 0) {
+            if (core_type == SCHEDULER_MIX_QUEUE && direct_mix_ready != nullptr &&
+                !scheduler_task_ref_is_null(direct_mix_ready->task_ref)) {
                 if (!scheduler_ready_batch_append(
-                        scheduler_state_base, context, direct_mix_ready->task_id, &batches[core_type], ready_stats,
+                        scheduler_state_base, context, direct_mix_ready->task_ref, &batches[core_type], ready_stats,
                         profiling_level
                     ))
                     return false;
@@ -1558,12 +1557,14 @@ inline __aicore__ bool scheduler_resolve_completion(
                         scheduler_state_base, context, context->config.scheduler_count, core_type
                     );
             }
-            SchedulerReadyClaim *direct_claim =
-                direct_mix_available ? direct_mix_ready :
-                direct_ready != nullptr && direct_ready->task_id < 0 && core_type == direct_core_type ? direct_ready :
-                                                                                                        nullptr;
+            SchedulerReadyClaim *direct_claim = direct_mix_available ? direct_mix_ready :
+                                                direct_ready != nullptr &&
+                                                        scheduler_task_ref_is_null(direct_ready->task_ref) &&
+                                                        core_type == direct_core_type ?
+                                                                       direct_ready :
+                                                                       nullptr;
             if (direct_claim != nullptr) {
-                direct_claim->task_id = waiter;
+                direct_claim->task_ref = waiter;
                 direct_claim->source = SchedulerReadySource::DIRECT_RESOLVE;
                 direct_claim->publication_mode = SchedulerPublicationMode::REFILL;
                 if (phase_timing_enabled) {
@@ -1595,7 +1596,7 @@ inline __aicore__ bool scheduler_resolve_completion(
     for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
         if (!scheduler_ready_batch_push(scheduler_state_base, context, type, &batches[type], ready_stats)) {
             scheduler_record_error(
-                run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                 SchedulerErrorSite::COMPLETION_READY_PUBLISH_FAILED
             );
             return false;

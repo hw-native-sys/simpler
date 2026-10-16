@@ -107,7 +107,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                     if (failed != nullptr) *failed = true;
                     return progress;
                 }
-                if (ready.task_id < 0) {
+                if (scheduler_task_ref_is_null(ready.task_ref)) {
                     aic_ready_available = false;
                     break;
                 }
@@ -158,7 +158,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
             if (target->core_type != static_cast<int32_t>(CoreType::AIV)) continue;
             if (aiv_worker_count >= PLATFORM_AIV_CORES_PER_BLOCKDIM) {
                 scheduler_record_error(
-                    run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+                    run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
                     SchedulerErrorSite::NORMAL_DISPATCH_INVALID_TOPOLOGY
                 );
                 if (failed != nullptr) *failed = true;
@@ -214,7 +214,7 @@ inline __aicore__ bool scheduler_fill_cluster_normal_slots(
                 if (failed != nullptr) *failed = true;
                 return progress;
             }
-            if (ready.task_id < 0) {
+            if (scheduler_task_ref_is_null(ready.task_ref)) {
                 local_slot->state = SchedulerDispatchSlotState::FREE;
                 break;
             }
@@ -250,17 +250,17 @@ inline __aicore__ bool scheduler_release_deferred_aiv_reservation(
     if (reservation.worker_id != scheduler->worker_id() || reservation.slot_index >= SCHEDULER_PENDING_SLOT_COUNT ||
         reservation.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM) {
         scheduler_record_error(
-            run_control, SCHEDULER_TASK_ID_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::DEFERRED_RESERVATION_INVALID_OWNER
         );
         return false;
     }
     SchedulerLocalSlotState *local_slot = &scheduler->slots[reservation.cluster_lane][reservation.slot_index];
-    const int64_t task_id = local_slot->task_id;
+    const int64_t task_ref = local_slot->task_ref;
     if (local_slot->state != SchedulerDispatchSlotState::FILLING || local_slot->generation != reservation.generation ||
-        task_id != SCHEDULER_TASK_ID_INVALID) {
+        task_ref != SCHEDULER_TASK_REF_INVALID) {
         scheduler_record_error(
-            run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::DEFERRED_RESERVATION_INVALID_STATE
         );
         return false;
@@ -361,18 +361,18 @@ inline __aicore__ bool scheduler_publish_deferred_aiv_local(
         entry.reserved_slot.slot_index >= SCHEDULER_PENDING_SLOT_COUNT ||
         entry.reserved_slot.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM) {
         scheduler_record_error(
-            run_control, entry.ready.task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            run_control, entry.ready.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::DEFERRED_PUBLISH_INVALID_RESERVATION
         );
         return false;
     }
     SchedulerLocalSlotState *local_slot =
         &scheduler->slots[entry.reserved_slot.cluster_lane][entry.reserved_slot.slot_index];
-    const int64_t task_id = local_slot->task_id;
+    const int64_t task_ref = local_slot->task_ref;
     if (local_slot->state != SchedulerDispatchSlotState::FILLING ||
-        local_slot->generation != entry.reserved_slot.generation || task_id != SCHEDULER_TASK_ID_INVALID) {
+        local_slot->generation != entry.reserved_slot.generation || task_ref != SCHEDULER_TASK_REF_INVALID) {
         scheduler_record_error(
-            run_control, entry.ready.task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            run_control, entry.ready.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
             SchedulerErrorSite::DEFERRED_PUBLISH_INVALID_RESERVATION
         );
         return false;
