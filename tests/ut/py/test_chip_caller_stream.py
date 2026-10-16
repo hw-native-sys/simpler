@@ -148,7 +148,7 @@ def _run(arch, runtime, device, depth, borrowed):
             run = worker._submit_chip_run_direct(0, args, CallConfig(), caller_stream=stream.value)
             assert run.launched
             runs.append(run)
-            # Public Worker initialization is owned-only. These handles bridge
+            # This test probes native admission directly. These handles bridge
             # real borrowed native runs to its shared Python completion path.
             run_id = invocation + 1
             handle_owner._chip_runs[run_id] = run

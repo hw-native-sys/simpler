@@ -22,6 +22,7 @@ import pytest
 from _task_interface import CallConfig, RuntimeEnv, _ChipWorker  # pyright: ignore[reportMissingImports]
 from simpler.buffer import Buffer
 from simpler.task_interface import (
+    ArgDirection,
     ChipCallable,
     ChipWorker,
     DataType,
@@ -334,7 +335,9 @@ def kernel_symbol_runtime(tmp_path_factory):
                     "int simpler_unregister_callable(DeviceContextHandle, int32_t) {\n"
                     "    ++unregistrations; return validation;\n"
                     "}\n"
-                    "int simpler_validate_caller_stream(DeviceContextHandle, void *) { return validation; }\n"
+                    "static int caller_validation = 0;\n"
+                    'extern "C" void test_caller_validation(int rc) { caller_validation = rc; }\n'
+                    "int simpler_validate_caller_stream(DeviceContextHandle, void *) { return caller_validation; }\n"
                     "int simpler_launch_run_on_stream(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle) "
                     "{ std::abort(); }\n"
                 )
@@ -679,6 +682,136 @@ class TestWorkerNativeChip:
         ]
 
 
+class TestPublicWorkerBorrowed:
+    @pytest.fixture
+    def owner(self, monkeypatch, kernel_symbol_runtime, request):
+        from simpler_setup import runtime_builder  # noqa: PLC0415
+
+        runtime = kernel_symbol_runtime(borrowed=True, finalize_failures=getattr(request, "param", 0))
+        observer = ctypes.CDLL(str(runtime))
+        bins = SimpleNamespace(
+            host_path=runtime,
+            aicpu_path=os.devnull,
+            aicore_path=os.devnull,
+            sdma_warmup_path=Path("/unread/sdma_warmup_kernel.o"),
+        )
+        monkeypatch.setattr(runtime_builder, "RuntimeBuilder", lambda *_: SimpleNamespace(get_binaries=lambda _: bins))
+        worker = Worker(level=2, device_id=0, platform="a2a3", runtime="tensormap_and_ringbuffer")
+        try:
+            target = ChipCallable.build(
+                signature=[ArgDirection.IN], func_name="public_borrowed", binary=b"x", children=[]
+            )
+            handle = worker.register(target)
+            worker.init(borrowed_context_generation=77)
+            yield worker, handle, observer
+        finally:
+            observer.test_validation(0)
+            observer.test_caller_validation(0)
+            worker.close()
+
+    def test_init_and_source_identity_use_the_borrowed_environment(self, owner):
+        worker, _, observer = owner
+        environment = worker._chip_worker._execution_environment
+        assert environment[2:] == (77, 0, True)
+        assert observer.test_borrowed_inits() >= 1
+        source = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+        assert source.to_descriptor().identity == source.identity
+        source.close()
+        native = worker._chip_worker
+        worker.close()
+        assert native._execution_environment is None
+        assert worker._chip_worker is None
+
+    @pytest.mark.parametrize("owner", [1], indirect=True)
+    def test_failed_close_keeps_borrowed_binding_until_retry(self, owner):
+        worker, _, observer = owner
+        native = worker._chip_worker
+        environment = native._execution_environment
+        with pytest.raises(RuntimeError, match="teardown"):
+            worker.close()
+        assert worker._lifecycle is _Lifecycle.CLOSED
+        assert native.initialized and native._execution_environment == environment
+        assert observer.test_destroys() == 0
+        worker.close()
+        assert not native.initialized and native._execution_environment is None
+        assert worker._cleanup_journal.empty
+        assert observer.test_destroys() == 1
+
+    @pytest.mark.parametrize("options", [{"enable_sdma": True}, {"workspace_budget_bytes": 4096}])
+    def test_program_resource_requests_are_rejected_before_startup(self, options):
+        worker = Worker(level=2, platform="a2a3", **options)
+        with pytest.raises(ValueError, match="SDMA or Program workspace budgets"):
+            worker.init(borrowed_context_generation=77)
+        assert worker._lifecycle is _Lifecycle.NEW and worker._chip_worker is None
+        worker.close()
+
+    @pytest.mark.parametrize("stream", [None, 0, -1, True, 0.5, 1 << 64])
+    def test_missing_or_invalid_stream_does_not_publish_a_run(self, owner, stream):
+        worker, handle, _ = owner
+        source = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+        args = TaskArgs()
+        args.add_tensor(Tensor(source, shapes=(4,), dtype=DataType.FLOAT32))
+        try:
+            with pytest.raises((TypeError, ValueError)):
+                worker.submit(handle, args, caller_stream=stream)
+            assert worker._chip_run_seq == 0
+            assert not worker._chip_run_touched_identities and not worker._chip_source_uses
+            assert not worker._source_context_failed and worker._chip_import_registry is None
+        finally:
+            source.close()
+
+    def test_caller_refusal_precedes_mapping_and_source_reservation(self, owner):
+        worker, handle, observer = owner
+        source = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+        args = TaskArgs()
+        args.add_tensor(Tensor(source, shapes=(4,), dtype=DataType.FLOAT32))
+        try:
+            observer.test_caller_validation(-1004)
+            with pytest.raises(RuntimeError, match="caller-stream validation"):
+                worker.submit(handle, args, caller_stream=0x1234)
+            assert worker._lifecycle is _Lifecycle.READY and worker._chip_run_seq == 0
+            assert not worker._chip_source_uses and not worker._source_attachments
+            assert not worker._source_context_failed and worker._chip_import_registry is None
+        finally:
+            observer.test_caller_validation(0)
+            source.close()
+
+    def test_h2d_request_is_refused_before_import(self, owner):
+        from simpler.buffer import wrap_fork_inherited  # noqa: PLC0415
+
+        worker, handle, _ = owner
+        host = wrap_fork_inherited(0x1000, 64, worker._owner_instance_id, 55)
+        args = TaskArgs()
+        args.add_tensor(Tensor(host, shapes=(4,), dtype=DataType.FLOAT32))
+        with pytest.raises(ValueError, match="does not copy HOST"):
+            worker.submit(handle, args, caller_stream=0x1234)
+        assert not worker._source_context_failed and worker._chip_import_registry is None
+        assert worker._chip_run_seq == 0
+
+    @pytest.mark.parametrize("generation", [0, -1, True, 1.5, 1 << 64])
+    def test_invalid_generation_is_rejected_before_startup(self, generation):
+        worker = Worker(level=2, platform="a2a3")
+        with pytest.raises((TypeError, ValueError)):
+            worker.init(borrowed_context_generation=generation)
+        assert worker._lifecycle is _Lifecycle.NEW and worker._chip_worker is None
+        worker.close()
+
+    @pytest.mark.parametrize("options", [{"level": 3}, {"level": 2, "platform": "a2a3sim"}])
+    def test_borrowed_context_does_not_cross_a_hierarchy_or_simulator(self, options):
+        worker = Worker(**options)
+        with pytest.raises(ValueError, match="direct L2|onboard"):
+            worker.init(borrowed_context_generation=77)
+        assert worker._lifecycle is _Lifecycle.NEW
+        worker.close()
+
+    def test_hierarchical_submit_refuses_a_process_local_stream(self):
+        worker = Worker(level=3)
+        with pytest.raises(ValueError, match="direct L2"):
+            worker.submit(lambda *_: None, caller_stream=0x1234)
+        assert worker._lifecycle is _Lifecycle.NEW
+        worker.close()
+
+
 class TestChipWorkerExecutionEnvironment:
     @pytest.mark.parametrize("borrowed", [False, True])
     def test_environment_is_unique_and_survives_refusal(self, kernel_symbol_runtime, borrowed):
@@ -836,14 +969,15 @@ class TestChipWorkerBorrowedInit:
         owner._chip_worker = SimpleNamespace(
             _execution_environment=native._execution_environment,
             _validate_execution_context=native._validate_execution_context,
-            _submit_chip_run_direct=lambda *_: SimpleNamespace(wait=wait),
+            _validate_caller_stream=native._validate_caller_stream,
+            _submit_chip_run_direct=lambda *_, **kwargs: SimpleNamespace(wait=wait),
         )
         owner._lifecycle = _Lifecycle.READY
         try:
             source = Buffer.wrap(address=0x8000, nbytes=64, location=owner.device_location)
             args = TaskArgs()
             args.add_tensor(Tensor(source, shapes=(4,), dtype=DataType.FLOAT32), TensorArgType.INPUT)
-            handle = owner._submit_l2_locked(3, args, CallConfig())
+            handle = owner._submit_l2_locked(3, args, CallConfig(), caller_stream=0x1234)
             run_id, keepalive = handle._run_id, handle._keepalive
             observer.test_validation(-88)
             for _ in range(2):
@@ -1052,7 +1186,7 @@ class TestChipWorkerBorrowedInit:
             def __getattr__(self, name):
                 return getattr(native, name)
 
-            def _submit_chip_run_direct(self, *args):
+            def _submit_chip_run_direct(self, *args, **kwargs):
                 native._validate_execution_context()
                 admissions.append(args)
                 return SimpleNamespace(wait=lambda _timeout: True, done=lambda: True)
@@ -1099,7 +1233,7 @@ class TestChipWorkerBorrowedInit:
                 )
             observer.test_validation(0)
             if operation == "submit":
-                owner.submit(handle, args).wait()
+                owner.submit(handle, args, caller_stream=0x1234).wait()
                 assert len(admissions) == 1 and not owner._chip_source_uses
             elif operation == "register":
                 registered = owner.register(target)

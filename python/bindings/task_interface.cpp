@@ -3638,6 +3638,14 @@ NB_MODULE(_task_interface, m) {
         )
         .def("finalize", &ChipWorker::finalize)
         .def("_validate_execution_context", &ChipWorker::validate_execution_context)
+        .def(
+            "_validate_caller_stream",
+            [](ChipWorker &self, uintptr_t caller_stream) {
+                self.validate_caller_stream(reinterpret_cast<void *>(caller_stream));
+            },
+            nb::arg("caller_stream"),
+            "Check caller context, stream ownership and eager capture state before submission."
+        )
         .def_prop_ro(
             "_execution_environment",
             [](const ChipWorker &self) -> nb::object {

@@ -1480,7 +1480,7 @@ def _resolve_collect_across_runs(collect_across_runs: bool | None, dfx_session: 
     return bool(dfx_session)
 
 
-def _initialize_chip_runtime(
+def _initialize_chip_runtime(  # noqa: PLR0913 -- explicit binary, workspace and environment options initialize one native owner
     impl: _ChipWorker,
     device_id: int,
     bins: RuntimeBinaries,
@@ -1492,6 +1492,7 @@ def _initialize_chip_runtime(
     workspace_budget_bytes: int = 0,
     manage_workspace: bool = False,
     requested_pipeline_depth: int = 0,
+    borrowed_context_generation: int | None = None,
 ) -> None:
     """Bind one native chip runtime from binary paths and initialize its host logger.
 
@@ -1501,6 +1502,11 @@ def _initialize_chip_runtime(
     dispatcher_path = getattr(bins, "dispatcher_path", None)
     sim_context_path = getattr(bins, "sim_context_path", None)
     sdma_warmup_path = getattr(bins, "sdma_warmup_path", None)
+    init_options = {}
+    if borrowed_context_generation is not None:
+        init_options["borrowed_context_generation"] = borrowed_context_generation
+        # Borrowed bootstrap takes no Program-owned SDMA warmup ELF.
+        sdma_warmup_path = None
     # C++ retains libcpu_sim_context.so in the sim process registry. Sim has
     # no dispatcher; onboard bootstrap consumes its actual binary path.
     impl.init(
@@ -1517,6 +1523,7 @@ def _initialize_chip_runtime(
         int(workspace_budget_bytes),
         bool(manage_workspace),
         int(requested_pipeline_depth),
+        **init_options,
     )
 
 

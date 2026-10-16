@@ -67,6 +67,7 @@ import importlib
 import json
 import logging
 import math
+import operator
 import os
 import re
 import shutil
@@ -295,6 +296,7 @@ from .task_interface import (
     RemoteBufferExport,
     RemoteBufferHandle,
     TaskArgs,
+    TensorTransfer,
     _bind_host_log_session_directory,
     _ChipWorker,
     _flush_host_log_or_warn,
@@ -5451,6 +5453,15 @@ def _config_with_valid_workspace_budget_shape(config: dict) -> dict:
     return config
 
 
+def _nonzero_uint64(value: Any, name: str) -> int:
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer, not bool")
+    result = operator.index(value)
+    if not 0 < result < 1 << 64:
+        raise ValueError(f"{name} must be a nonzero uint64")
+    return result
+
+
 class Worker:
     """Unified worker for all hierarchy levels.
 
@@ -8651,6 +8662,7 @@ class Worker:
         prewarm_config: CallConfig | None = None,
         *,
         _startup_deadline: float | None = None,
+        borrowed_context_generation: int | None = None,
     ) -> None:
         """Initialize the worker and bring its whole subtree to READY.
 
@@ -8674,11 +8686,25 @@ class Worker:
                 during hierarchy startup, before it publishes INIT_READY. A no-op
                 for runtimes without a prebuilt arena (host_build_graph). ``None``
                 (default) disables prewarm.
+            borrowed_context_generation: Direct onboard L2 only. Nonzero caller-managed
+                generation for the current RTS context. The caller keeps that context alive;
+                close releases runtime resources without resetting the caller's device.
             _startup_deadline: Internal. Absolute ``time.monotonic()`` deadline
                 inherited from a parent's startup epoch so a recursive descendant
                 consumes the parent's remaining budget instead of restarting the
                 timeout. ``None`` starts a fresh epoch.
         """
+        init_options = {}
+        if borrowed_context_generation is not None:
+            if self.level != 2:
+                raise ValueError("borrowed_context_generation requires a direct L2 Worker")
+            if self._config["platform"].endswith("sim"):
+                raise ValueError("borrowed initialization requires an onboard platform")
+            if self._config.get("enable_sdma", False) or self._config.get("workspace_budget_bytes", 0):
+                raise ValueError("borrowed initialization does not support SDMA or Program workspace budgets")
+            init_options["borrowed_context_generation"] = _nonzero_uint64(
+                borrowed_context_generation, "borrowed_context_generation"
+            )
         if prewarm_config is not None:
             prewarm_config.validate()
         # Claim the startup epoch atomically: NEW -> INITIALIZING under the
@@ -8728,7 +8754,7 @@ class Worker:
 
         try:
             if self.level == 2:
-                self._init_level2()
+                self._init_level2(**init_options)
             elif self.level >= 3:
                 self._init_hierarchical()
                 self._start_hierarchical()
@@ -8848,7 +8874,7 @@ class Worker:
                 "drained; finalize those runs and close again"
             )
 
-    def _init_level2(self) -> None:
+    def _init_level2(self, *, borrowed_context_generation: int | None = None) -> None:
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         platform = self._config["platform"]
@@ -8876,6 +8902,7 @@ class Worker:
             enable_sdma=bool(self._config.get("enable_sdma", False)),
             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
             workspace_budget_bytes=workspace_budget,
+            borrowed_context_generation=borrowed_context_generation,
         )
 
         # Pre-warm any registered ChipCallable so the first run(handle, …)
@@ -11450,7 +11477,7 @@ class Worker:
         """The current direct L2 device context, valid only in this process and incarnation.
 
         This identifies a source context; obtaining it registers no Buffer. It is not
-        a borrowed RTS context: this Program Worker still owns device teardown/reset.
+        an allocation-ownership grant; close follows this Worker's owned/borrowed policy.
         """
         if self.level != 2:
             raise TypeError("device_location requires a direct L2 Worker")
@@ -12577,7 +12604,7 @@ class Worker:
     # run — uniform entry point
     # ------------------------------------------------------------------
 
-    def submit(self, callable, args=None, config=None) -> RunHandle:
+    def submit(self, callable, args=None, config=None, *, caller_stream: int | None = None) -> RunHandle:
         """Submit one task (L2) or one DAG (L3+) and return its completion handle.
 
         Dispatch:
@@ -12590,6 +12617,10 @@ class Worker:
 
         ``args``  : TaskArgs (optional)
         ``config``: CallConfig (optional, default-constructed if None)
+        ``caller_stream``: Direct L2 RTS stream handle, required for a borrowed
+        environment. Successful submit enqueues the caller exit dependency before
+        returning. The caller keeps the stream and external allocations alive through
+        retirement. Capture is rejected before source references are reserved.
 
         Graph construction remains serialized. How many runs may be admitted is
         the depth this worker's backends negotiated, not a constant: at the
@@ -12610,16 +12641,21 @@ class Worker:
         deadlock on a depth-one backend. Completion and cleanup stay attached to
         each handle.
         """
+        submit_options = {}
+        if caller_stream is not None:
+            if self.level != 2:
+                raise ValueError("caller_stream requires a direct L2 Worker")
+            submit_options["caller_stream"] = _nonzero_uint64(caller_stream, "caller_stream")
         try:
             with self._operation_lease("submit"):
-                result = self._submit_locked(callable, args, config)
+                result = self._submit_locked(callable, args, config, **submit_options)
         except BaseException as primary:
             self._teardown_delegated_fatal_if_safe(primary)
             raise
         self._teardown_delegated_fatal_if_safe()
         return result
 
-    def run(self, callable, args=None, config=None) -> None:
+    def run(self, callable, args=None, config=None, *, caller_stream: int | None = None) -> None:
         """Execute one task or DAG synchronously as ``submit(...).wait()``.
 
         Per-stage run timing (host wall, on-NPU device wall +
@@ -12629,9 +12665,10 @@ class Worker:
         with ``simpler_setup.tools.strace_timing`` (see
         ``docs/dfx/host-trace.md``).
         """
-        self.submit(callable, args=args, config=config).wait()
+        submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
+        self.submit(callable, args=args, config=config, **submit_options).wait()
 
-    def _submit_locked(self, callable, args, config) -> RunHandle:
+    def _submit_locked(self, callable, args, config, *, caller_stream: int | None = None) -> RunHandle:
         cfg = config if config is not None else CallConfig()
 
         if self.level == 2:
@@ -12639,7 +12676,8 @@ class Worker:
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
             if getattr(cfg, "output_prefix", ""):
                 _bind_host_log_session_directory()
-            return self._submit_l2_locked(state.slot_id, args, cfg)
+            submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
+            return self._submit_l2_locked(state.slot_id, args, cfg, **submit_options)
 
         with self._submit_mu.exclusive():
             # Graph callbacks stay serialized, so a predecessor's callback has
@@ -12967,7 +13005,9 @@ class Worker:
                     return handle
         return None
 
-    def _submit_l2_locked(self, callable_id: int, args, cfg: CallConfig) -> RunHandle:
+    def _submit_l2_locked(
+        self, callable_id: int, args, cfg: CallConfig, *, caller_stream: int | None = None
+    ) -> RunHandle:
         """Admit one direct-chip run and return a handle to it while it runs.
 
         The lane is the sole admission authority. Its runtime contract permits
@@ -12976,7 +13016,17 @@ class Worker:
         completion fence through :meth:`RunHandle.wait`.
         """
         assert self._chip_worker is not None
+        if self._device_buffer_source is not None:
+            self._device_buffer_source._check_context()
+        environment = self._chip_worker._execution_environment
+        borrowed = environment is not None and environment[4]
+        if borrowed and caller_stream is None:
+            raise ValueError("borrowed submission requires caller_stream")
+        if caller_stream is not None:
+            self._chip_worker._validate_caller_stream(caller_stream)
         args = _snapshot_local_task_args(TaskArgs() if args is None else args)
+        if borrowed and any(args.transfer(i) == TensorTransfer.H2D for i in range(args.tensor_count())):
+            raise ValueError("borrowed submission does not copy HOST tensors to DEVICE")
         _validate_host_control_access(self._callable_registry.get(callable_id), args)
         touched = self._identities_in_args(args)
         # Device identity validation and accepted-use publication share free's chip lock.
@@ -13004,7 +13054,8 @@ class Worker:
         try:
             chip_args = self._materialize_l2_args(args)
             native_entered = True
-            chip_run = self._chip_worker._submit_chip_run_direct(callable_id, chip_args, cfg)
+            submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
+            chip_run = self._chip_worker._submit_chip_run_direct(callable_id, chip_args, cfg, **submit_options)
         except BaseException:
             with self._registry_lock:
                 self._chip_run_touched_identities.pop(run_id, None)

@@ -527,12 +527,15 @@ the same binding. Successful native teardown invalidates it even if a facade
 still says READY; failed rollback or teardown retains it for cleanup retry.
 The binding's generation is independent of Buffer and pipeline generations.
 
-The current public provider is an initialized direct L2 Program `Worker`.
+The public provider is an initialized direct L2 `Worker` with owned or borrowed
+RTS initialization.
 Another Worker, a forked process, or a closed context cannot use that location.
 Reading this descriptor does not require a current RTS context. Device execution
 separately checks the runner's adopted RTS context; the logical identity is not
 an RTS reset detector or a check of the external pointer's actual allocation.
-This does not expose borrowed RTS initialization or support HOST/remote wrapping.
+`Worker.init(borrowed_context_generation=...)` attaches a borrowed RTS context;
+source wrapping does not perform that attachment and does not support HOST/remote
+wrapping.
 No new wire placement field or cross-Worker grant is introduced.
 
 Wrapping creates a source registration, without adding a consumer allocation

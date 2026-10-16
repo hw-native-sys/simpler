@@ -53,8 +53,30 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | `unregister(handle_or_slot)` | Releases a registration |
 | `add_worker(worker) -> int` | Attaches a child worker; returns its id |
 | `add_remote_worker(spec: RemoteWorkerSpec) -> int` | L4; see the remote-L3 design doc |
-| `init(prewarm_config=None)` | Resolves runtime binaries, opens the device, forks children. First place setup errors appear |
-| `close()` | Releases the device and reaps children. Put it in a `finally` — a skipped `close()` leaves the device held |
+| `init(prewarm_config=None, *, borrowed_context_generation=None)` | Resolves binaries; owns or borrows the direct L2 device context, or starts children |
+| `close()` | Retires runtime resources and children; resets only an owned device. Put it in a `finally` |
+
+### Borrowed device context and caller ordering
+
+For direct onboard L2, `worker.init(borrowed_context_generation=token)` borrows
+an already-current RTS context. `token` is a nonzero uint64 supplied by the caller,
+which must keep that context alive and use a new token for a new context generation.
+It is not a reset detector or an allocation-ownership certificate. Simulator,
+SDMA and Program workspace-budget options are rejected for borrowed initialization.
+
+`worker.submit(handle, args, caller_stream=stream)` uses a nonzero integer RTS
+stream handle for this invocation; `run` accepts the same keyword. The stream is
+required for borrowed execution and may also be supplied to owned L2 execution.
+L3+/Remote do not accept these process-local context/stream values. Registration,
+TaskArgs, Buffer/Tensor and RunHandle remain the same public interfaces.
+
+Borrowed submission accepts DEVICE operands and explicit HOST/NONE controls; it
+rejects implicit tensor H2D. Keep external allocations, context and stream alive
+through retirement. Successful submit has already enqueued both kernels and the
+caller exit dependency, so work appended to that caller stream is ordered after
+the operator. Caller synchronization can establish device results; `RunHandle.wait`
+still performs runtime retirement. Capture is rejected before run/source state is
+published. Borrowed close does not reset the caller device or destroy its stream.
 
 ### Memory
 
@@ -78,8 +100,8 @@ cannot walk a legal-looking length past the end.
 
 | Method | Notes |
 | ------ | ----- |
-| `run(callable, args=None, config=None) -> None` | Blocks until the run completes |
-| `submit(callable, args=None, config=None) -> RunHandle` | Non-blocking |
+| `run(callable, args=None, config=None, *, caller_stream=None) -> None` | Blocks until the run completes |
+| `submit(callable, args=None, config=None, *, caller_stream=None) -> RunHandle` | Non-blocking |
 | `live_domains() -> dict[str, CommDomainHandle]` | Currently allocated communication domains |
 
 `RunHandle` exposes the `done` property, `wait(timeout=None)`, and
@@ -91,9 +113,9 @@ Direct L2 handles validate the execution context inside the native wait.
 completion verdict: the handle, its argument snapshot and its Buffer uses remain
 intact; restore the required context before retrying. Other native wait errors
 remain terminal and retain unproven Buffer uses; error messages do not determine
-the classification. The public Worker initialization still owns its device;
-borrowed-context initialization is an internal native entry, and this exception
-alone does not expose a public borrowed Worker.
+the classification. Borrowed-context initialization is available for direct onboard L2 through
+`Worker.init(borrowed_context_generation=...)`. The exception does not prove
+that an external allocation belongs to that context.
 
 READY Worker operations validate through the shared operation lease, outside the
 lifecycle lock and before their bodies run. Direct L2 operations check the native
@@ -186,13 +208,17 @@ input/output view. `DataType` carries the element types.
 
 ### Borrowed device storage
 
+The example uses an initialized direct L2 Worker and a caller stream belonging
+to its current RTS context. Supplying the stream works with owned initialization
+and is required with borrowed initialization.
+
 ```python
 from simpler.buffer import Buffer
 
 source = Buffer.wrap(address=ptr, nbytes=capacity, location=worker.device_location)
 args = TaskArgs()
 args.add_tensor(Tensor(source, shapes=(count,), dtype=DataType.FLOAT32), TensorArgType.INPUT)
-worker.submit(callable_handle, args).result()
+worker.submit(callable_handle, args, caller_stream=stream).result()
 source.close()
 ```
 
@@ -209,8 +235,9 @@ The caller owns the allocation and guarantees its real device, capacity and
 lifetime. `source.close()` revokes an idle registration without freeing memory;
 it refuses in-flight or unproven completion. `Worker.free` and Worker copy
 operations do not manage this external allocation. Use its allocator for IO
-and physical release. HOST, remote, and borrowed RTS context attachment are
-outside this interface. See the [source lifetime contract](../../buffer-abi.md#borrowed-device-sources-at-direct-l2)
+and physical release. HOST and remote wrapping are outside this interface.
+The provider may use owned or borrowed RTS initialization; this does not transfer
+physical ownership of the wrapped allocation. See the [source lifetime contract](../../buffer-abi.md#borrowed-device-sources-at-direct-l2)
 for failure and Program Worker teardown behavior.
 
 ## `CallConfig`

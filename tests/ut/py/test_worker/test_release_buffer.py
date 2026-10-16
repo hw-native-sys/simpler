@@ -309,6 +309,7 @@ class _FakeChipImpl:
 
     def __init__(self):
         self.calls: list[tuple[int, object, object]] = []
+        self._execution_environment = None
 
     def _submit_chip_run_direct(self, callable_id, chip_args, cfg):
         self.calls.append((callable_id, chip_args, cfg))
