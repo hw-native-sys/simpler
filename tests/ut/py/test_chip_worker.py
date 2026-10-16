@@ -548,7 +548,10 @@ class TestWorkerNativeChip:
             native.free(backing)
             captured.append(native)
 
-        monkeypatch.setattr("simpler.task_interface.ChipWorker", refuse_wrapper)
+        # `worker.py` reaches task_interface only through `from … import`, so a
+        # reintroduced wrapper construction resolves against this module's globals
+        # and nowhere else. The name is absent from them today, hence raising=False.
+        monkeypatch.setattr(worker_module, "ChipWorker", refuse_wrapper, raising=False)
         monkeypatch.setattr(worker_module, "_run_chip_main_loop", serve)
         monkeypatch.setattr(worker_module, "_flush_host_log_or_warn", lambda context: flushed.append(context) or True)
         mailbox = memoryview(bytearray(worker_module.mailbox_size(2)))
@@ -586,6 +589,8 @@ class TestWorkerNativeChip:
             assert captured[0]._execution_environment is None
 
     def test_direct_worker_owns_native_chip_without_public_wrapper(self, monkeypatch, kernel_symbol_runtime):
+        import simpler.worker as worker_module  # noqa: PLC0415
+
         from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         runtime = kernel_symbol_runtime(borrowed=True, memory=True)
@@ -601,7 +606,7 @@ class TestWorkerNativeChip:
         def refuse_wrapper():
             pytest.fail("direct L2 must not construct the public ChipWorker wrapper")
 
-        monkeypatch.setattr("simpler.task_interface.ChipWorker", refuse_wrapper)
+        monkeypatch.setattr(worker_module, "ChipWorker", refuse_wrapper, raising=False)
         owner = Worker(level=2, device_id=0, platform="a2a3sim", runtime="tensormap_and_ringbuffer")
         target = ChipCallable.build(signature=[], func_name="native_owner", binary=b"\0", children=[])
         handle = owner.register(target)

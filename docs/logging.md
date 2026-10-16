@@ -324,7 +324,7 @@ message tag.
 | ----- | ------ | ------ |
 | Python import | Register `TIMING` / `NUL`; default the `simpler` logger to TIMING | `python/simpler/_log.py` |
 | `Worker.init()` | Normalize the Python level, attach it to the host logger, quiesce an old writer before local forks, then start a new writer after the final fork | `python/simpler/worker.py` |
-| `ChipWorker.init()` | Re-seed inherited native state in a chip child, then enter C++ | `python/simpler/task_interface.py` |
+| `_initialize_chip_runtime()` | Re-seed inherited native state for every chip route — direct L2, a chip child, and the compatibility `ChipWorker` — then enter C++ | `python/simpler/task_interface.py` |
 | `_ChipWorker.init()` | Load sim context and host runtime, then bind each module's logger state | `src/common/worker/chip_worker.cpp` |
 | `simpler_init` | Onboard maps the bound threshold to CANN; attach and take executor binaries | `src/common/platform/{onboard,sim}/host/c_api_shared.cpp` |
 | Nested host load | Bind generated host orchestration/AICore logger state before entry | runtime maker / sim device runner |

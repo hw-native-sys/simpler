@@ -85,9 +85,10 @@ and their caller references are not a captured-graph lifetime contract.
 A direct L2 Python `Worker` owns the native `_ChipWorker` itself. Its callable
 handles, argument imports, source uses and close journal belong to `Worker`;
 there is no intervening public Python `ChipWorker` registry or lifecycle lock.
-The public compatibility `ChipWorker` and forked chip-child path retain their
-own wrapper lifecycle. Both initialize the native runtime through the same
-internal binary-path/logging adapter and execute through the existing native
+The public compatibility `ChipWorker` is the only route that retains its own
+wrapper lifecycle; the forked chip-child path holds the native binding directly,
+as direct L2 does. Every route initializes the native runtime through the same
+internal binary-path/logging adapter and executes through the existing native
 run lane. `Worker`'s operation lease and owner-thread close checks remain the
 direct L2 lifecycle authority.
 
