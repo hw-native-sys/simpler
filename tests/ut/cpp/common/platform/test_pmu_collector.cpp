@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <algorithm>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -126,3 +127,280 @@ TEST(PmuCollectorTest, MergesConcurrentShardWritesIntoFinalCsv) {
     collector.finalize(nullptr, test_free);
     std::filesystem::remove_all(test_dir);
 }
+
+TEST(PmuCollectorTest, FinalizeReleasesItsSharedHeaderExactlyOnce) {
+    std::vector<void *> allocations;
+    std::vector<void *> releases;
+    auto alloc = [&](size_t size) -> void * {
+        void *pointer = std::calloc(1, size);
+        allocations.push_back(pointer);
+        return pointer;
+    };
+    auto release = [&](void *pointer) -> int {
+        releases.push_back(pointer);
+        return 0;
+    };
+    {
+        PmuCollector collector;
+        collector.begin_run("/tmp/issue1710-pmu-release.csv", PmuEventType::PIPE_UTILIZATION);
+        ASSERT_EQ(collector.init(1, 1, alloc, nullptr, release, 0), 0);
+        void *header = collector.get_pmu_shm_device_ptr();
+        ASSERT_NE(header, nullptr);
+        collector.finalize(nullptr, release);
+        EXPECT_EQ(std::count(releases.begin(), releases.end(), header), 1)
+            << "the independently allocated shared header must be released";
+        collector.finalize(nullptr, release);
+        EXPECT_EQ(std::count(releases.begin(), releases.end(), header), 1);
+    }
+    for (void *pointer : allocations)
+        std::free(pointer);
+}
+
+namespace {
+std::vector<void *> i1710_registrations;
+std::vector<void *> i1710_unregistrations;
+int i1710_register(void *pointer, size_t, int, void **host) {
+    i1710_registrations.push_back(pointer);
+    *host = pointer;
+    return 0;
+}
+int i1710_unregister(void *pointer, int) {
+    i1710_unregistrations.push_back(pointer);
+    return 0;
+}
+}  // namespace
+
+TEST(PmuCollectorTest, FinalizeUnregistersTheSharedHeaderBeforeReleasingIt) {
+    i1710_registrations.clear();
+    i1710_unregistrations.clear();
+    std::vector<void *> allocations;
+    std::vector<void *> releases;
+    auto alloc = [&](size_t size) -> void * {
+        void *pointer = std::calloc(1, size);
+        allocations.push_back(pointer);
+        return pointer;
+    };
+    auto release = [&](void *pointer) -> int {
+        const int registered = std::count(i1710_registrations.begin(), i1710_registrations.end(), pointer);
+        EXPECT_EQ(std::count(i1710_unregistrations.begin(), i1710_unregistrations.end(), pointer), registered);
+        releases.push_back(pointer);
+        return 0;
+    };
+    {
+        PmuCollector collector;
+        collector.begin_run("/tmp/issue1710-pmu-map-release.csv", PmuEventType::PIPE_UTILIZATION);
+        ASSERT_EQ(collector.init(1, 1, alloc, i1710_register, release, 0), 0);
+        void *header = collector.get_pmu_shm_device_ptr();
+        ASSERT_EQ(std::count(i1710_registrations.begin(), i1710_registrations.end(), header), 1);
+        collector.finalize(i1710_unregister, release);
+        EXPECT_EQ(std::count(i1710_unregistrations.begin(), i1710_unregistrations.end(), header), 1);
+        EXPECT_EQ(std::count(releases.begin(), releases.end(), header), 1);
+        collector.finalize(i1710_unregister, release);
+        EXPECT_EQ(std::count(i1710_unregistrations.begin(), i1710_unregistrations.end(), header), 1);
+    }
+    for (void *pointer : allocations)
+        std::free(pointer);
+}
+
+TEST(PmuCollectorTest, FinalizeReleasesEveryOwnedAllocationExactlyOnce) {
+    std::vector<void *> allocations;
+    std::vector<void *> releases;
+    auto alloc = [&](size_t size) -> void * {
+        void *pointer = std::calloc(1, size);
+        allocations.push_back(pointer);
+        return pointer;
+    };
+    auto release = [&](void *pointer) -> int {
+        releases.push_back(pointer);
+        return 0;
+    };
+    {
+        PmuCollector collector;
+        collector.begin_run("/tmp/issue1710-pmu-owned-allocations.csv", PmuEventType::PIPE_UTILIZATION);
+        ASSERT_EQ(collector.init(2, 1, alloc, nullptr, release, 0), 0);
+        collector.finalize(nullptr, release);
+        for (void *pointer : allocations) {
+            EXPECT_EQ(std::count(releases.begin(), releases.end(), pointer), 1)
+                << "every allocation owned by the collector must reach its release callback";
+        }
+        const size_t release_count = releases.size();
+        collector.finalize(nullptr, release);
+        EXPECT_EQ(releases.size(), release_count);
+    }
+    for (void *pointer : allocations)
+        std::free(pointer);
+}
+
+namespace {
+
+struct PmuAllocationLedger {
+    std::vector<void *> allocations;
+    std::vector<void *> registrations;
+    std::vector<void *> unregistrations;
+    std::vector<void *> releases;
+    int allocation_attempts = 0;
+    int fail_allocation = 0;
+    int registration_attempts = 0;
+    int fail_registration = 0;
+
+    ~PmuAllocationLedger() {
+        for (void *pointer : allocations)
+            std::free(pointer);
+    }
+
+    void *allocate(size_t size) {
+        if (++allocation_attempts == fail_allocation) return nullptr;
+        void *pointer = std::calloc(1, size);
+        allocations.push_back(pointer);
+        return pointer;
+    }
+
+    int release(void *pointer) {
+        releases.push_back(pointer);
+        return 0;
+    }
+
+    void expect_released_once() const {
+        for (void *pointer : allocations) {
+            EXPECT_EQ(std::count(releases.begin(), releases.end(), pointer), 1);
+        }
+        for (void *pointer : registrations) {
+            EXPECT_EQ(std::count(unregistrations.begin(), unregistrations.end(), pointer), 1);
+        }
+    }
+};
+
+thread_local PmuAllocationLedger *pmu_test_ledger = nullptr;
+
+int register_pmu_test_memory(void *pointer, size_t, int, void **host) {
+    if (++pmu_test_ledger->registration_attempts == pmu_test_ledger->fail_registration) return 19;
+    pmu_test_ledger->registrations.push_back(pointer);
+    *host = pointer;
+    return 0;
+}
+
+int unregister_pmu_test_memory(void *pointer, int device) {
+    EXPECT_EQ(device, 7);
+    pmu_test_ledger->unregistrations.push_back(pointer);
+    return 0;
+}
+
+}  // namespace
+
+TEST(PmuCollectorTest, RepeatedInitializeFinalizeBalancesEveryAllocationAndMapping) {
+    PmuAllocationLedger ledger;
+    pmu_test_ledger = &ledger;
+    PmuCollector collector;
+    auto alloc = [&](size_t size) {
+        return ledger.allocate(size);
+    };
+    auto release = [&](void *pointer) {
+        return ledger.release(pointer);
+    };
+    for (int round = 0; round < 10; ++round) {
+        collector.begin_run("/tmp/pmu_lifecycle_test.csv", PmuEventType::PIPE_UTILIZATION);
+        const bool registered = round % 2 == 0;
+        ASSERT_EQ(collector.init(2, 1, alloc, registered ? register_pmu_test_memory : nullptr, release, 7), 0);
+        collector.finalize(unregister_pmu_test_memory, release);
+        ledger.expect_released_once();
+        const size_t released = ledger.releases.size();
+        collector.finalize(unregister_pmu_test_memory, release);
+        EXPECT_EQ(ledger.releases.size(), released);
+    }
+}
+
+TEST(PmuCollectorTest, FinalizeUsesSuppliedQuarantineCallbackInsteadOfStoredAllocator) {
+    PmuAllocationLedger ledger;
+    PmuCollector collector;
+    auto alloc = [&](size_t size) {
+        return ledger.allocate(size);
+    };
+    auto release = [&](void *pointer) {
+        return ledger.release(pointer);
+    };
+    collector.begin_run("/tmp/pmu_quarantine_test.csv", PmuEventType::PIPE_UTILIZATION);
+    ASSERT_EQ(collector.init(2, 1, alloc, nullptr, release, 7), 0);
+    std::vector<void *> quarantined;
+    auto quarantine = [&](void *pointer) {
+        quarantined.push_back(pointer);
+        return 0;
+    };
+    collector.finalize(nullptr, quarantine);
+    EXPECT_TRUE(ledger.releases.empty());
+    for (void *pointer : ledger.allocations) {
+        EXPECT_EQ(std::count(quarantined.begin(), quarantined.end(), pointer), 1);
+    }
+    const size_t count = quarantined.size();
+    collector.finalize(nullptr, quarantine);
+    EXPECT_EQ(quarantined.size(), count);
+}
+
+TEST(PmuCollectorTest, FailedInitializationCanBeFinalizedAndRetriedAtEveryAllocation) {
+    int allocation_count = 0;
+    {
+        PmuAllocationLedger ledger;
+        PmuCollector collector;
+        auto alloc = [&](size_t size) {
+            return ledger.allocate(size);
+        };
+        auto release = [&](void *pointer) {
+            return ledger.release(pointer);
+        };
+        collector.begin_run("/tmp/pmu_allocation_failure_test.csv", PmuEventType::PIPE_UTILIZATION);
+        ASSERT_EQ(collector.init(2, 1, alloc, nullptr, release, 7), 0);
+        allocation_count = ledger.allocation_attempts;
+        collector.finalize(nullptr, release);
+    }
+    for (int fail_at = 1; fail_at <= allocation_count; ++fail_at) {
+        SCOPED_TRACE(fail_at);
+        PmuAllocationLedger ledger;
+        pmu_test_ledger = &ledger;
+        ledger.fail_allocation = fail_at;
+        PmuCollector collector;
+        auto alloc = [&](size_t size) {
+            return ledger.allocate(size);
+        };
+        auto release = [&](void *pointer) {
+            return ledger.release(pointer);
+        };
+        collector.begin_run("/tmp/pmu_allocation_failure_test.csv", PmuEventType::PIPE_UTILIZATION);
+#if defined(SIMPLER_TEST_PMU_ARCH_A5)
+        PmuRegisterCallback register_callback = nullptr;
+#else
+        PmuRegisterCallback register_callback = register_pmu_test_memory;
+#endif
+        EXPECT_NE(collector.init(2, 1, alloc, register_callback, release, 7), 0);
+        collector.finalize(unregister_pmu_test_memory, release);
+        ledger.expect_released_once();
+        ledger.fail_allocation = 0;
+        ASSERT_EQ(collector.init(2, 1, alloc, register_callback, release, 7), 0);
+        collector.finalize(unregister_pmu_test_memory, release);
+        ledger.expect_released_once();
+    }
+}
+
+#if !defined(SIMPLER_TEST_PMU_ARCH_A5)
+TEST(PmuCollectorTest, FailedRegistrationCanBeFinalizedAndRetried) {
+    for (int fail_at : {1, 2, 3}) {
+        SCOPED_TRACE(fail_at);
+        PmuAllocationLedger ledger;
+        pmu_test_ledger = &ledger;
+        ledger.fail_registration = fail_at;
+        PmuCollector collector;
+        auto alloc = [&](size_t size) {
+            return ledger.allocate(size);
+        };
+        auto release = [&](void *pointer) {
+            return ledger.release(pointer);
+        };
+        collector.begin_run("/tmp/pmu_registration_failure_test.csv", PmuEventType::PIPE_UTILIZATION);
+        EXPECT_NE(collector.init(2, 1, alloc, register_pmu_test_memory, release, 7), 0);
+        collector.finalize(unregister_pmu_test_memory, release);
+        ledger.expect_released_once();
+        ledger.fail_registration = 0;
+        ASSERT_EQ(collector.init(2, 1, alloc, register_pmu_test_memory, release, 7), 0);
+        collector.finalize(unregister_pmu_test_memory, release);
+        ledger.expect_released_once();
+    }
+}
+#endif

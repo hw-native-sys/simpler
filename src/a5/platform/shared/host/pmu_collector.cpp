@@ -763,8 +763,9 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
     // allocated directly via alloc_cb (not alloc_paired_buffer), so no entry
     // exists in dev_to_host_ for them.
     for (auto *ring_dev : aicore_rings_dev_) {
-        if (ring_dev != nullptr) {
-            release_dev(ring_dev);
+        if (ring_dev != nullptr && free_cb) {
+            int rc = free_cb(ring_dev);
+            if (rc != 0) LOG_ERROR("PMU AICore ring release failed for %p: %d", ring_dev, rc);
         }
     }
     aicore_rings_dev_.clear();

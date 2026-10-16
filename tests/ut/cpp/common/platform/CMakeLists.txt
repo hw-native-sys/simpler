@@ -401,6 +401,16 @@ platform_case(test_pmu_collector.cpp PER_ARCH PER_RUNTIME
         ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
 
+simpler_pmu_arch_a5_define(pmu_collector)
+
+platform_case(test_pmu_finalize.cpp PER_ARCH PER_RUNTIME
+    SOURCES
+        ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp
+        ${SIMPLER_SRC}/@arch@/platform/shared/aicpu/pmu_collector_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
+simpler_pmu_arch_a5_define(pmu_finalize)
+
 platform_case(test_pmu_run_identity.cpp PER_ARCH PER_RUNTIME
     SOURCES
         ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp

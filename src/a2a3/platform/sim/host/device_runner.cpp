@@ -1109,6 +1109,7 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int /*device_id*/) {
 
     int rc = pmu_collector_.init(num_cores, num_threads, alloc_cb, nullptr, free_cb, -1);
     if (rc != 0) {
+        pmu_collector_.finalize(nullptr, free_cb);
         return rc;
     }
 
