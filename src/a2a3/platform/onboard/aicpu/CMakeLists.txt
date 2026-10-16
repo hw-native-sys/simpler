@@ -79,6 +79,7 @@ target_compile_options(aicpu_kernel
         -O3
         -fPIC
         $<$<BOOL:${WERROR}>:-Werror>
+        $<$<CXX_COMPILER_ID:GNU>:-Wno-error=class-memaccess>
         -Wno-error=variadic-macros
         -fno-common
         -g
