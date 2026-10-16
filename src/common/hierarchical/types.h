@@ -331,6 +331,16 @@ struct WorkerCompletion {
     int32_t group_index{0};
     EndpointOutcome outcome{EndpointOutcome::SUCCESS};
     std::string error_message;
+    /** Which endpoint reported this, for a figure that is per endpoint. */
+    int32_t worker_id{-1};
+    /**
+     * Run-resource sets that endpoint reports it can hold, or 0 for no report.
+     *
+     * A count of identities, never a byte figure, and read only from an entry
+     * whose terminal state this side has already observed — which is what makes
+     * the word this side's to read at all.
+     */
+    uint32_t admissible_run_resource_sets{0};
 };
 
 // =============================================================================

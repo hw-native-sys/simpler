@@ -463,6 +463,108 @@ public:
     }
 
     /**
+     * Whether this run still holds any block.
+     *
+     * The question a waiting plan asks about the consumer it is waiting for: a
+     * run that has dropped every reference has released whatever it held, so
+     * the wait is discharged. Answered from the references rather than from the
+     * fact records on purpose — a run that acquired workspace and has reported
+     * nothing yet still holds it, and a retired run has already dropped them.
+     */
+    bool holds_references(uint64_t run_epoch) const {
+        std::scoped_lock lk(mu_);
+        return references_run(run_epoch);
+    }
+
+    /**
+     * Run epochs whose retirement can return managed storage to this allocator.
+     *
+     * Every block here is charged against one device allocator, so a holder of
+     * any region holds bytes this request can receive — which is why the
+     * regions a plan is short of do not narrow this. A predecessor occupying
+     * another run-resource set holds that set's region keys, never the
+     * candidate's, and it is exactly the consumer a newly offered set has to
+     * wait for: a set that has never held anything has no prior holder of its
+     * own keys at all, so matching keys would leave it nothing to wait for and
+     * no reason to park.
+     *
+     * Only a *progressable* holder is reported — one this ledger has been told
+     * launched, whose context still exists and whose facts are not yet
+     * complete. A run that has merely prepared is queued behind the same
+     * grower as the caller and cannot retire while the caller waits, so it is
+     * not something to wait for; a retired run has already dropped its
+     * references; and a destroyed context's blocks are quarantined. A block is
+     * offered only when its storage can actually come back: a quarantined one
+     * never returns, an unconfirmed release already failed, and one whose host
+     * mapping could not be dropped can never be handed to another allocation.
+     *
+     * A launched run whose device stop is unproven is not distinguishable here
+     * from one still executing. That case is kept out by its lane failing the
+     * plan rather than parking it.
+     *
+     * @param requesting_epoch the asking run, which is never its own holder
+     */
+    void eligible_holders(uint64_t requesting_epoch, std::vector<uint64_t> *out) const {
+        if (out == nullptr) return;
+        std::scoped_lock lk(mu_);
+        for (const Block &b : blocks_) {
+            if (b.released || b.quarantined || b.release_unconfirmed || b.mapping_retained) continue;
+            for (uint32_t i = 0; i < b.ref_count; ++i) {
+                const uint64_t epoch = b.refs[i];
+                if (epoch == kContextEpoch || epoch == requesting_epoch) continue;
+                bool seen = false;
+                for (const uint64_t already : *out) {
+                    if (already == epoch) seen = true;
+                }
+                if (seen) continue;
+                const RunRecord *r = record_for_locked(epoch);
+                if (r == nullptr || !r->launched || r->context_destroyed || retired(*r)) continue;
+                out->push_back(epoch);
+            }
+        }
+    }
+
+    /**
+     * Whether `base` is backing a request under pressure may take back now.
+     *
+     * Its region's published generation with no consumer left: idle rather
+     * than abandoned, which is exactly why `reclaim_obsolete` keeps it. The
+     * owner still naming it has to stop first, and this is the question that
+     * owner asks before it does.
+     *
+     * Excluded for the reasons reuse excludes them: a quarantined block never
+     * returns, an unconfirmed release already failed, and one whose host
+     * mapping could not be dropped can never be handed to another allocation.
+     * Also excluded is a block no *run* has ever referenced — that is the
+     * context's own backing, which a runtime may have committed and uploaded
+     * into at prewarm and which no retirement will ever free.
+     */
+    bool idle_backing(void *base) const {
+        std::scoped_lock lk(mu_);
+        const Block *b = find_locked(base);
+        return b != nullptr && idle_backing_locked(*b);
+    }
+
+    /**
+     * Give up the published claim on idle backing so a reclaim can free it.
+     *
+     * Decided and detached under one lock, so a block another request takes as
+     * its region's backing in between is refused rather than detached out from
+     * under that request. Nothing is freed here: the block becomes an obsolete
+     * generation, and the device release happens in `reclaim_obsolete` — after
+     * the caller has cleared whatever still names the address.
+     *
+     * @return the capacity detached, or 0 when `base` is not idle backing here
+     */
+    uint64_t detach_idle_backing(void *base) {
+        std::scoped_lock lk(mu_);
+        Block *b = find_locked(base);
+        if (b == nullptr || !idle_backing_locked(*b)) return 0;
+        b->current = false;
+        return b->bytes;
+    }
+
+    /**
      * Record one fact about a run, and retire the run when its facts are
      * complete.
      *
@@ -780,6 +882,11 @@ private:
         // Accounted for by a release or by the terminal sweep already. A second
         // close finds the same record and must not charge or credit it twice.
         bool swept{false};
+        // Whether a *run* has ever held this block, as opposed to the context
+        // holding its own backing. Never cleared: a block no run has ever
+        // referenced is not a run-resource set's to give back, because no
+        // retirement will ever make it idle.
+        bool run_referenced{false};
     };
 
     bool must_keep_locked(void *base) const noexcept {
@@ -896,6 +1003,7 @@ private:
         // report this identity finished, so counting it would leave a consumer
         // no close could resolve.
         if (epoch == kContextEpoch) return true;
+        b.run_referenced = true;
         for (uint32_t i = 0; i < b.ref_count; ++i) {
             if (b.refs[i] == epoch) return true;
         }
@@ -1074,6 +1182,26 @@ private:
     /** Whether this block is an obsolete generation nothing can still be using. */
     static bool reclaimable_locked(const Block &b) {
         if (b.current || b.released || b.swept) return false;
+        if (b.quarantined || b.release_unconfirmed || b.mapping_retained) return false;
+        return b.ref_count == 0;
+    }
+
+    /**
+     * Whether this block is its region's published generation with no consumer.
+     *
+     * The complement of `reclaimable_locked` on the one field that separates
+     * them: both need the block live, provable and unreferenced, and they
+     * differ only in whether a region still publishes it.
+     *
+     * A block no run has ever referenced is excluded, because it is the
+     * context's own backing rather than a run-resource set's. A runtime that
+     * commits its pooled arena at prewarm holds exactly that — unreferenced
+     * from the moment it was published, and its device image uploaded into it
+     * — so idleness alone cannot tell a warm set apart from storage the
+     * context is using.
+     */
+    static bool idle_backing_locked(const Block &b) {
+        if (!b.current || b.released || b.swept || !b.run_referenced) return false;
         if (b.quarantined || b.release_unconfirmed || b.mapping_retained) return false;
         return b.ref_count == 0;
     }

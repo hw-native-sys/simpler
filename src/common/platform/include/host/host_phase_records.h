@@ -135,6 +135,10 @@ public:
      */
     HostPhaseRecordPool *arm(bool collect_records);
 
+    // Append a native prepare retry to its finished, unpublished logical run.
+    // Producers from the prior attempt must already have drained.
+    HostPhaseRecordPool *resume();
+
     /**
      * Close the pass.
      *

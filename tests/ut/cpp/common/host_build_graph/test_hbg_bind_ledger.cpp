@@ -43,6 +43,7 @@
 #include "common/host_api.h"
 #include "common/launch_entry_args.h"
 #include "host_build_graph/host/graph_host_state.h"
+#include "host_build_graph/host/dep_gen_host_graph.h"
 #include "host_build_graph/host/host_tensor_access.h"
 #include "host/raii_scope_guard.h"
 #include "host_build_graph/runtime_status.h"
@@ -199,6 +200,11 @@ void access_entry(const ChipTaskArgs &args) {
 }
 
 struct FakeHostApi {
+    int staging_status{0};
+    int arena_status{0};
+    bool retain_plan{false};
+    std::shared_ptr<void> prepare_plan;
+
     void *retained_addr = nullptr;
     size_t retained_size = 0;
     std::unordered_set<void *> live;
@@ -242,39 +248,21 @@ struct FakeHostApi {
     // A real record pool, so what the prepare path records is observable. Armed
     // unconditionally: whether the runner would offer one is the platform's
     // decision and not what these tests are about.
-    std::vector<HostPhaseRecordBuffer> phase_buffers;
-    HostPhaseRecordPool phase_pool{};
+    simpler::dfx::HostPhaseRecordStore phase_records;
     uint64_t phase_finish_calls = 0;
 
-    HostPhaseRecordPool *arm_phase_pool() {
-        phase_buffers.assign(PLATFORM_HOST_PHASE_BUFFERS, HostPhaseRecordBuffer{});
-        phase_pool.buffers = phase_buffers.data();
-        phase_pool.buffer_count = static_cast<uint32_t>(phase_buffers.size());
-        phase_pool.next_buffer.store(0);
-        phase_pool.generation.fetch_add(1);
-        phase_pool.dropped.store(0);
-        return &phase_pool;
-    }
+    HostPhaseRecordPool *arm_phase_pool() { return prepare_plan ? phase_records.resume() : phase_records.arm(true); }
 
     size_t phase_records_of(HostPhaseKind kind, uint64_t *payload_out = nullptr) const {
         size_t found = 0;
-        for (const HostPhaseRecordBuffer &buffer : phase_buffers) {
-            const uint32_t count = buffer.count;
-            for (uint32_t i = 0; i < count && i < PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER; ++i) {
-                if (buffer.records[i].kind != static_cast<uint32_t>(kind)) continue;
-                if (payload_out != nullptr) *payload_out = buffer.records[i].payload;
-                ++found;
-            }
+        for (const auto &record : phase_records.records()) {
+            if (record.kind != static_cast<uint32_t>(kind)) continue;
+            if (payload_out != nullptr) *payload_out = record.payload;
+            ++found;
         }
         return found;
     }
-    size_t phase_records_total() const {
-        size_t found = 0;
-        for (const HostPhaseRecordBuffer &buffer : phase_buffers) {
-            found += buffer.count;
-        }
-        return found;
-    }
+    size_t phase_records_total() const { return phase_records.records().size(); }
     struct H2D {
         void *dst;
         const void *src;
@@ -386,6 +374,7 @@ void fake_set_retained(void *, uint32_t, void *addr, size_t size) {
     g_fake->retained_size = size;
 }
 int fake_setup_static_arena(void *, uint32_t, size_t heap, size_t, size_t arena) {
+    if (g_fake->arena_status != 0) return g_fake->arena_status;
     g_fake->gm_heap.assign(std::max<size_t>(heap, kAlign) + kAlign, 0);
     g_fake->runtime_arena.assign(std::max<size_t>(arena, kAlign) + kAlign, 0);
     return 0;
@@ -484,6 +473,7 @@ void fake_get_graph_definition_staging(void *, uint32_t, void **addr, size_t *si
 int fake_acquire_retained_temp(
     void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out
 ) {
+    if (g_fake->staging_status != 0) return g_fake->staging_status;
     fake_get_retained(runner_ctx, pipeline_slot, addr_out, size_out);
     if (bytes == 0 || bytes <= *size_out) return 0;
     if (*addr_out != nullptr) fake_device_free(runner_ctx, *addr_out);
@@ -556,7 +546,8 @@ const HostApiOps &fake_ops() {
         r.host_phase_pool_arm = [](void *, uint32_t, int) -> void * {
             return g_fake->arm_phase_pool();
         };
-        r.host_phase_pool_finish = [](void *, uint32_t, uint64_t, uint64_t) {
+        r.host_phase_pool_finish = [](void *, uint32_t, uint64_t tasks, uint64_t invocation) {
+            g_fake->phase_records.finish(tasks, invocation);
             ++g_fake->phase_finish_calls;
         };
         r.acquire_graph_staging = fake_acquire_graph_staging;
@@ -565,6 +556,12 @@ const HostApiOps &fake_ops() {
         r.acquire_scheduler_state_storage = fake_acquire_scheduler_state_storage;
         r.declare_caller_device_writes = fake_declare_caller_device_writes;
         r.caller_device_span_written_by_other_run = fake_caller_device_span_written_by_other_run;
+        r.get_prepare_plan = [](void *, uint32_t) {
+            return g_fake->prepare_plan;
+        };
+        r.set_prepare_plan = [](void *, uint32_t, uint64_t, std::shared_ptr<void> plan) {
+            if (g_fake->retain_plan) g_fake->prepare_plan = std::move(plan);
+        };
         return r;
     }();
     return ops;
@@ -2200,4 +2197,164 @@ TEST_F(HbgBindLedgerTest, AcceptsOverlappingReadOnlyH2dCopies) {
     args.add_tensor(tensor);
     const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::IN};
     EXPECT_EQ(bind(runtime, args, sig, 2), 0);
+}
+
+TEST_F(HbgBindLedgerTest, ManagedStagingStatusReachesThePrepareCallerUnchanged) {
+    std::vector<uint8_t> input(16, 0x71);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(input));
+    const ArgDirection signature[] = {ArgDirection::IN};
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    for (int status : {SIMPLER_RUNTIME_ERR_RESOURCE_WAIT, SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE}) {
+        Runtime runtime;
+        init_runtime(runtime);
+        fake_.staging_status = status;
+        EXPECT_EQ(bind(runtime, args, signature, 1), status);
+        EXPECT_EQ(fake_.orchestration_count, 0u);
+        EXPECT_EQ(fake_.copy_count, 0);
+    }
+}
+
+TEST_F(HbgBindLedgerTest, AResourceWaitRetainsTheGraphAcrossRuntimeDestructionAndPublishesOnce) {
+    dep_gen_host_graph_set_enabled(true);
+    auto stop_capture = RAIIScopeGuard([] {
+        dep_gen_host_graph_set_enabled(false);
+    });
+    fake_.retain_plan = true;
+    fake_.arena_status = SIMPLER_RUNTIME_ERR_RESOURCE_WAIT;
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    std::vector<uint8_t> input(16, 0x71);
+    ChipStorageTaskArgs args;
+    args.add_tensor(host_tensor(input));
+    const ArgDirection signature[] = {ArgDirection::IN};
+    {
+        Runtime attempt;
+        init_runtime(attempt);
+        EXPECT_EQ(bind(attempt, args, signature, 1), SIMPLER_RUNTIME_ERR_RESOURCE_WAIT);
+        EXPECT_TRUE(attempt.tensor_leases().empty());
+        EXPECT_TRUE(attempt.pending_publication().prerequisites.empty());
+    }
+    ASSERT_NE(fake_.prepare_plan, nullptr);
+    EXPECT_EQ(fake_.orchestration_count, 1u);
+    const int copies_after_plan = fake_.copy_count;
+    void *const staging_after_plan = fake_.retained_addr;
+    const auto callback_records = fake_.phase_records_of(HostPhaseKind::BindHostOrch);
+    EXPECT_EQ(callback_records, 1u);
+    const auto section = fake_.published_section;
+    // Retrying an unchanged refusal preserves the same plan and source bytes.
+    {
+        Runtime attempt;
+        init_runtime(attempt);
+        EXPECT_EQ(bind(attempt, args, signature, 1), SIMPLER_RUNTIME_ERR_RESOURCE_WAIT);
+    }
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindHostOrch), callback_records);
+    fake_.arena_status = 0;
+    Runtime resumed;
+    init_runtime(resumed);
+    auto cleanup = cleanup_runtime(resumed);
+    // The resumed attempt may run on a different lane thread. Capture belongs
+    // to the saved plan, not to the original thread's diagnostic state.
+    auto retry = std::async(std::launch::async, [&] {
+        const int rc = bind(resumed, args, signature, 1);
+        if (rc != 0) return rc;
+        const int published = publish_run_image_impl(&resumed, &api_);
+        if (published != 0) return published;
+        simpler::dfx::host_graph::HostGraphExport graph;
+        EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(simpler::dfx::host_graph::TakeOutcome::Complete));
+        EXPECT_FALSE(graph.tasks.empty());
+        return 0;
+    });
+    ASSERT_EQ(retry.get(), 0);
+    EXPECT_EQ(fake_.orchestration_count, 1u);
+    EXPECT_EQ(fake_.retained_addr, staging_after_plan);
+    EXPECT_GE(fake_.copy_count, copies_after_plan);
+    EXPECT_EQ(
+        std::count_if(
+            fake_.copies.begin(), fake_.copies.end(),
+            [&](const auto &copy) {
+                return copy.src == input.data();
+            }
+        ),
+        1
+    ) << "HOST inputs are copied once";
+    EXPECT_EQ(fake_.phase_records_of(HostPhaseKind::BindHostOrch), callback_records);
+    EXPECT_EQ(fake_.published_section, section);
+    EXPECT_EQ(fake_.section_publications, 1u);
+    EXPECT_EQ(resumed.get_graph_section_bytes(), section.size());
+    EXPECT_EQ(resumed.tensor_leases().size(), 1u);
+    EXPECT_EQ(resumed.pending_publication().bytes, 0u);
+    EXPECT_NE(publish_run_image_impl(&resumed, &api_), 0);
+    fake_.prepare_plan.reset();  // the runner releases the plan after proof/publication
+}
+
+TEST_F(HbgBindLedgerTest, AResumedUnpublishedImageHasOneOwnerEvenWhenPublicationFails) {
+    dep_gen_host_graph_set_enabled(true);
+    auto stop_capture = RAIIScopeGuard([] {
+        dep_gen_host_graph_set_enabled(false);
+    });
+    fake_.retain_plan = true;
+    fake_.arena_status = SIMPLER_RUNTIME_ERR_RESOURCE_WAIT;
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    {
+        Runtime attempt;
+        init_runtime(attempt);
+        ASSERT_EQ(bind(attempt, args, nullptr, 0), SIMPLER_RUNTIME_ERR_RESOURCE_WAIT);
+    }
+    fake_.arena_status = 0;
+    Runtime resumed;
+    init_runtime(resumed);
+    ASSERT_EQ(bind(resumed, args, nullptr, 0), 0);
+    const auto source = resumed.pending_publication().source;
+    const auto bytes = resumed.pending_publication().bytes;
+    ASSERT_NE(bytes, 0u);
+    EXPECT_NE(bind(resumed, args, nullptr, 0), 0);
+    EXPECT_EQ(resumed.pending_publication().source, source);
+    EXPECT_EQ(resumed.pending_publication().bytes, bytes);
+    fake_.fail_copy_on = fake_.copy_count + 1;
+    EXPECT_NE(publish_run_image_impl(&resumed, &api_), 0);
+    simpler::dfx::host_graph::HostGraphExport graph;
+    EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(simpler::dfx::host_graph::TakeOutcome::NotCaptured));
+    EXPECT_EQ(resumed.pending_publication().bytes, 0u);
+    EXPECT_NE(publish_run_image_impl(&resumed, &api_), 0);
+    EXPECT_EQ(release_run_bindings_impl(&resumed, &api_), 0);
+    std::weak_ptr<void> owner = fake_.prepare_plan;
+    fake_.prepare_plan.reset();  // terminal cleanup after native context retirement
+    EXPECT_TRUE(owner.expired());
+    EXPECT_EQ(fake_.orchestration_count, 1u);
+    expect_only_slot_scheduler_storage_live();
+}
+
+TEST_F(HbgBindLedgerTest, AbandoningAWaitingPlanReleasesItsHostOwnerBeforeSlotReuse) {
+    fake_.retain_plan = true;
+    fake_.arena_status = SIMPLER_RUNTIME_ERR_RESOURCE_WAIT;
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    {
+        Runtime attempt;
+        init_runtime(attempt);
+        ASSERT_EQ(bind(attempt, args, nullptr, 0), SIMPLER_RUNTIME_ERR_RESOURCE_WAIT);
+    }
+    std::weak_ptr<void> owner = fake_.prepare_plan;
+    fake_.prepare_plan.reset();  // the runner's proven-unlaunched abort boundary
+    EXPECT_TRUE(owner.expired());
+    fake_.arena_status = 0;
+    Runtime next;
+    init_runtime(next);
+    auto cleanup = cleanup_runtime(next);
+    ASSERT_EQ(bind(next, args, nullptr, 0), 0);
+    EXPECT_EQ(fake_.orchestration_count, 2u);
+    ASSERT_EQ(publish_run_image_impl(&next, &api_), 0);
+    fake_.prepare_plan.reset();
+}
+
+TEST_F(HbgBindLedgerTest, ABackendWithoutPlanRetentionCannotRetryAnExecutedCallback) {
+    fake_.arena_status = SIMPLER_RUNTIME_ERR_RESOURCE_WAIT;
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    Runtime runtime;
+    init_runtime(runtime);
+    ChipStorageTaskArgs args;
+    EXPECT_EQ(bind(runtime, args, nullptr, 0), SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE);
+    EXPECT_EQ(fake_.orchestration_count, 1u);
+    EXPECT_EQ(fake_.prepare_plan, nullptr);
 }

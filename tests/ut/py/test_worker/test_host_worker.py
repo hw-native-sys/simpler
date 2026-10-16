@@ -739,19 +739,25 @@ def test_a_reconciled_chip_resource_grant_is_taken_as_published():
     assert worker._granted_chip_run_resource_sets([2, 1], [2, 2]) == [2, 1]
 
 
-def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkeypatch):
+@pytest.mark.parametrize(("automatic", "undersized"), [(False, False), (True, False), (False, True)])
+def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkeypatch, automatic, undersized):
     class FakeParentWorker:
         def __init__(self) -> None:
+            self.initial_admission_depths: list[int] = []
             self.configured_depths: list[int] = []
             self.configured_pending_depths: list[int] = []
             self.configured_launch_depths: list[int] = []
             self.next_level_calls: list[tuple[int, int, int, int]] = []
             self.initialized = False
 
-        def configure_pipeline_depth(self, depth: int, pending_depth: int = 0, launch_depth: int = 1) -> None:
+        def configure_pipeline_depth(
+            self, depth: int, pending_depth: int = 0, launch_depth: int = 1, initial_admission_depth: int = 0
+        ) -> None:
             # Three budgets: the negotiated native pipeline-slot depth, the
             # logical admission cap that defaults to deriving from it, and how
             # many of those runs may have device work launched at once.
+            assert not self.initialized
+            self.initial_admission_depths.append(initial_admission_depth)
             self.configured_depths.append(int(depth))
             self.configured_pending_depths.append(int(pending_depth))
             self.configured_launch_depths.append(int(launch_depth))
@@ -771,10 +777,16 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
         num_sub_workers=0,
         platform="a2a3",
         runtime="host_build_graph",
+        **({} if automatic else {"pipeline_depth": 2}),
     )
+    directory = worker_mod._AUTOMATIC_IDENTITY_DIRECTORY_SETS
+    depths = (directory, directory) if automatic else ((2, 1) if undersized else (2, 2))
+    grants = (directory, directory) if automatic else (2, 1)
+    # _init_hierarchical resolves this before creating mailboxes; this fixture
+    # enters _start_hierarchical directly after replacing those resources.
+    worker._mailbox_granted_sets = worker._requested_chip_pipeline_depth()
     worker._chip_shms = [
-        SharedMemory(create=True, size=worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST))
-        for _ in range(2)
+        SharedMemory(create=True, size=worker_mod.mailbox_size(directory if automatic else 2)) for _ in range(2)
     ]
     worker._l3_bins = "bins"
     fake_parent = FakeParentWorker()
@@ -789,7 +801,7 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
         # What the child publishes at INIT_READY: its resolved depth and the run-resource sets it
         # granted. The parent takes the grant from here rather than deriving it, so a child that
         # resolved one set is registered with one.
-        for shm, depth, granted_sets in zip(shms, (2, 1), (2, 1)):
+        for shm, depth, granted_sets in zip(shms, depths, grants):
             assert shm.buf is not None
             worker_mod._PIPELINE_LEASE_FMT.pack_into(shm.buf, worker_mod._OFF_PIPELINE_LEASE, depth, granted_sets, 0)
 
@@ -812,18 +824,25 @@ def test_start_hierarchical_passes_each_chip_its_published_resource_grant(monkey
     # and it is not the size that was asked for — macOS rounds a POSIX shm mapping up to a page.
     mapped_extents = [shm.buf.nbytes for shm in worker._chip_shms if shm.buf is not None]
     try:
+        if undersized:
+            with pytest.raises(RuntimeError, match="pipeline_depth"):
+                worker._start_hierarchical()
+            assert not fake_parent.initialized
+            assert not fake_parent.next_level_calls
+            return
         worker._start_hierarchical()
     finally:
         for shm in worker._chip_shms:
             shm.close()
             shm.unlink()
 
-    assert fake_parent.configured_depths == [1]
+    assert fake_parent.configured_depths == [min(depths)]
+    assert fake_parent.initial_admission_depths == [1 if automatic else 0]
     assert fake_parent.configured_pending_depths == [0]
     # One launched run: the default launch depth, and no more than the grant the narrower child
     # published could hold anyway.
-    assert fake_parent.configured_launch_depths == [1]
-    assert [call[2:] for call in fake_parent.next_level_calls] == [(12001, 2), (12002, 1)]
+    assert fake_parent.configured_launch_depths == [directory if automatic else 1]
+    assert [call[2:] for call in fake_parent.next_level_calls] == list(zip((12001, 12002), grants))
     # Each registration carries the extent of the region this process actually mapped, not the one
     # the grant it publishes would imply: the C++ side checks the second against the first, so a
     # child that granted two sets is still registered against the whole mapping.
@@ -848,9 +867,12 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
         def __init__(self) -> None:
             self.initialized = False
             self.sub_workers: list[int] = []
+            self.configured = None
 
-        def configure_pipeline_depth(self, depth: int, pending_depth: int = 0, launch_depth: int = 1) -> None:
-            pass
+        def configure_pipeline_depth(
+            self, depth: int, pending_depth: int = 0, launch_depth: int = 1, initial_admission_depth: int = 0
+        ) -> None:
+            self.configured = (depth, pending_depth, launch_depth, initial_admission_depth)
 
         def add_sub_worker(self, _mailbox_addr: int, _mailbox_bytes: int, pid: int) -> None:
             self.sub_workers.append(pid)
@@ -897,6 +919,10 @@ def test_start_hierarchical_seeds_the_logger_when_the_process_owns_no_chips(monk
             shm.close()
             shm.unlink()
 
+    assert worker._worker is not None
+    assert worker._worker.initialized
+    assert worker._worker.configured == (worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST, 0, 1, 0)
+    assert worker._worker.sub_workers == [13001]
     assert startup_events[0] == ("log", 60, True)
     assert startup_events[1:] == [("fork",), ("writer",)]
 
@@ -1341,6 +1367,9 @@ class _TwoFrameLoopHarness:
             self.mailbox_addr + self._entry_offset(index) + worker_mod._OFF_ENTRY_PREPARATION_DISPOSITION
         )
 
+    def admissible_sets(self, index: int) -> int:
+        return _mailbox_load_i32(self.mailbox_addr + self._entry_offset(index) + worker_mod._OFF_ENTRY_ADMISSIBLE_SETS)
+
     def publish(
         self,
         index: int,
@@ -1575,6 +1604,23 @@ def test_two_frame_publishes_launch_before_polling_immediate_completion():
         harness.wait_state(0, worker_mod._TASK_DONE)
 
         assert harness.cw.poll_states[0] == (0, worker_mod._TASK_LAUNCHED)
+    finally:
+        harness.close()
+
+
+def test_two_frame_publishes_no_capacity_figure_when_the_endpoint_does_not_measure_itself():
+    # Zero is the "no report" `Orchestrator::note_endpoint_capacity` reads, so an endpoint that
+    # was never asked to size itself has to leave it there. Republishing the grant it was given
+    # would fold a figure nothing measured into the admitted depth, and would make every
+    # completion read a capacity the endpoint does not maintain.
+    harness = _TwoFrameLoopHarness()
+    try:
+        harness.cw.completed[0].set()
+        harness.publish(0, 1)
+        harness.start()
+        harness.wait_state(0, worker_mod._TASK_DONE)
+
+        assert harness.admissible_sets(0) == 0
     finally:
         harness.close()
 

@@ -1184,6 +1184,11 @@ WorkerCompletion LocalMailboxEndpoint::terminal_completion(
     // instant the rc and the text are this side's alone.
     const int32_t error_code = entry->error;
     WorkerCompletion completion{record.dispatch.task_slot, record.dispatch.group_index, EndpointOutcome::SUCCESS, {}};
+    // Published by the child next to the rc, so it is in place before the
+    // terminal state that handed this entry over — the same ordering, and the
+    // same reason, as the two fields above.
+    completion.worker_id = caps_.worker_id;
+    completion.admissible_run_resource_sets = entry->admissible_run_resource_sets;
     if (state == MailboxState::TASK_FAILED || error_code != 0) {
         const size_t text_len = ::strnlen(entry->error_text, MAILBOX_ERROR_MSG_SIZE);
         completion.outcome = EndpointOutcome::TASK_FAILURE;

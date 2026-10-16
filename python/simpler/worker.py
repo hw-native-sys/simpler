@@ -410,7 +410,11 @@ _OFF_ENTRY_TASK_SLOT = 80
 _OFF_ENTRY_GROUP_INDEX = 88
 _OFF_ENTRY_GROUP_SIZE = 96
 _OFF_ENTRY_ERROR_TEXT = 104
-_ENTRY_BYTES = _OFF_ENTRY_ERROR_TEXT + MAILBOX_ERROR_MSG_SIZE
+# Appended after the text so no field above it moves: the run-resource sets the
+# child reports it can hold, published with this run's terminal state. A count
+# of identities, and zero means the child published none.
+_OFF_ENTRY_ADMISSIBLE_SETS = _OFF_ENTRY_ERROR_TEXT + MAILBOX_ERROR_MSG_SIZE
+_ENTRY_BYTES = _OFF_ENTRY_ADMISSIBLE_SETS + 4
 # Mirrors MAILBOX_OFF_SHUTDOWN / MAILBOX_SHUTDOWN_REQUESTED: termination is a
 # sticky one-way word on the control frame, not a MailboxState. _OFF_STATE has
 # three writers (parent CONTROL_REQUEST, child CONTROL_DONE, C++
@@ -543,6 +547,10 @@ def _assert_mailbox_wire_constants() -> None:
         "entry.group_index": (_OFF_ENTRY_GROUP_INDEX, MAILBOX_RUN_ENTRY_OFFSETS["group_index"]),
         "entry.group_size": (_OFF_ENTRY_GROUP_SIZE, MAILBOX_RUN_ENTRY_OFFSETS["group_size"]),
         "entry.error_text": (_OFF_ENTRY_ERROR_TEXT, MAILBOX_RUN_ENTRY_OFFSETS["error_text"]),
+        "entry.admissible_run_resource_sets": (
+            _OFF_ENTRY_ADMISSIBLE_SETS,
+            MAILBOX_RUN_ENTRY_OFFSETS["admissible_run_resource_sets"],
+        ),
         # And the request frame's header, which binds a payload to its entry.
         "frame.entry_index": (_OFF_FRAME_ENTRY_INDEX, MAILBOX_REQUEST_FRAME_OFFSETS["entry_index"]),
         "frame.entry_generation": (
@@ -580,6 +588,16 @@ _UINT32_MAX = 2**32 - 1
 # the key existed, so an unconfigured Worker keeps today's capacity and commits no third set —
 # raising a runtime's published maximum must not move this.
 _DEFAULT_PIPELINE_DEPTH_REQUEST = 2
+# Run identities a self-sizing endpoint may ever name, from a 64 KiB budget on
+# the mailbox's run-state entry table. Internal and finite: an identity costs
+# one ~384 B table entry and no device memory, so the directory can be generous
+# while the capacity actually admitted starts at one and grows only as sets are
+# proved. Reaching the directory still backpressures — it is a safety ceiling,
+# not a claim that unbounded requests are accepted.
+_AUTOMATIC_IDENTITY_DIRECTORY_SETS = max(
+    _DEFAULT_PIPELINE_DEPTH_REQUEST,
+    (64 * 1024) // MAILBOX_RUN_ENTRY_STRIDE - MAILBOX_REQUEST_FRAMES,
+)
 
 
 def _validated_pending_run_depth(config: dict, level: int) -> int:
@@ -2262,6 +2280,16 @@ def _write_entry_error(buf: memoryview, code: int, msg: str = "") -> None:
     _write_error_fields(buf, code, msg, _OFF_ENTRY_ERROR, _OFF_ENTRY_ERROR_TEXT)
 
 
+def _write_entry_admissible_sets(entry_addr: int, sets: int) -> None:
+    """Publish what this endpoint reports it can hold, before the terminal state.
+
+    Written next to the rc and the text, so it is in place before the store that
+    hands the entry to the parent — which is the parent's only reader. Zero is
+    "no report" and is what an endpoint that does not size itself leaves.
+    """
+    _mailbox_store_i32(entry_addr + _OFF_ENTRY_ADMISSIBLE_SETS, int(sets))
+
+
 def _publish_native_promotion(entry_addr: int, entry_buf: memoryview, identity: tuple, disposition: int) -> bool:
     """Publish a staged run's promotion to native preparation, writing only the disposition word.
 
@@ -3383,6 +3411,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     granted_sets: int = 1,
     chip_rank: int | None = None,
     provider_region_store: ProviderRegionStore,
+    reports_admissible_sets: bool = False,
 ) -> None:
     """Chip-process handlers for `_run_mailbox_loop`.
 
@@ -3403,7 +3432,9 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
     DEVICE_MALLOC/VMM_WINDOW backings this chip may materialize. Region Buffer
     identity uses the AICPU endpoint allocator constructed before INIT_READY.
     ``provider_region_store`` is that Store; a missing Store is an invariant
-    failure.
+    failure. ``reports_admissible_sets`` is whether this endpoint measures its
+    own run concurrency; when it does not, each terminal entry publishes zero
+    rather than the grant, which is the "no report" the parent's fold reads.
     """
     prepared = prepared if prepared is not None else set()
     if provider_region_store is None:
@@ -3966,6 +3997,16 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # that state it is the entry's sole accessor, so everything it will read has to be
             # in place before the store that hands it over. This is the child's final access.
             _write_entry_error(staged.entry_buf, code, msg)
+            # What this endpoint can hold, measured after this run released its
+            # own resources. Published here for the same reason and under the
+            # same ordering as the rc: the parent reads it only once it owns the
+            # entry. Zero when this endpoint does not size itself, which is what
+            # `Orchestrator::note_endpoint_capacity` reads as "no report" — so
+            # an endpoint that measures nothing folds into nothing rather than
+            # republishing the grant it was given.
+            _write_entry_admissible_sets(
+                staged.entry_addr, cw.admissible_run_resource_sets if reports_admissible_sets else 0
+            )
             _mailbox_store_i32(
                 staged.entry_addr + _OFF_ENTRY_STATE,
                 _TASK_DONE if code == 0 else _TASK_FAILED,
@@ -4154,6 +4195,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     launch_depth: int = 1,
     collect_across_runs: bool = False,
     pipeline_depth_request: int = 0,
+    automatic_admission: bool = False,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -4170,6 +4212,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
     """
     import traceback as _tb  # noqa: PLC0415
 
+    reports_admissible_sets = False
     try:
         cw = _ChipWorker()
         # Before init: the backend's own capability is only known once init binds the runtime, and
@@ -4189,6 +4232,15 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             # what was granted after INIT_READY and cannot change it.
             requested_pipeline_depth=pipeline_depth_request,
         )
+        if automatic_admission:
+            # After init, which is what binds the runtime and installs the
+            # workspace owner this measures against, and before any run. A
+            # backend that cannot size itself — a module without the entry —
+            # answers False, and the endpoint then admits exactly what it was
+            # granted, which is what it did before. The answer decides whether
+            # this child reports a figure at all: an endpoint that does not
+            # measure itself has nothing to publish.
+            reports_admissible_sets = bool(cw._enable_automatic_admission())  # noqa: SLF001 -- no public equivalent
     except Exception as e:
         _tb.print_exc()
         # Publish the cause into the mailbox and flag INIT_FAILED so the
@@ -4271,6 +4323,7 @@ def _chip_process_loop(  # noqa: PLR0913 -- fork-child entry: all context (bins,
             granted_sets=granted_sets,
             chip_rank=chip_rank,
             provider_region_store=provider_region_store,
+            reports_admissible_sets=reports_admissible_sets,
         )
     finally:
         # After the teardown, whether or not it raised: the C++ side captured
@@ -8947,6 +9000,15 @@ class Worker:
         #    the region a request sizes always reaches it. Only the entry table
         #    grows with the grant, so a deeper context costs a few hundred bytes
         #    per run rather than another 64 KiB frame.
+        #
+        #    Resolved here rather than at construction because the request a
+        #    self-sizing Worker carries is the identity directory, and whether
+        #    this Worker sizes itself depends on a role — root of its own
+        #    startup or not — that `init()` is what decides. One source of truth
+        #    for the two numbers: the region is sized to the count the children
+        #    are asked for, which is what keeps "a grant can never exceed the
+        #    request" true.
+        self._mailbox_granted_sets = self._requested_chip_pipeline_depth()
         mailbox_bytes = mailbox_size(self._mailbox_granted_sets)
         for i in range(n_sub):
             shm = SharedMemory(create=True, size=mailbox_bytes, name=_shm_name(self._shm_token, f"sub-{i}"))
@@ -9199,9 +9261,14 @@ class Worker:
                             prewarm_config=self._prewarm_config,
                             enable_sdma=bool(self._config.get("enable_sdma", False)),
                             chip_rank=idx,
-                            launch_depth=self._launch_depth,
+                            launch_depth=(
+                                chip_pipeline_depth_request
+                                if self._automatic_admission_requested
+                                else self._launch_depth
+                            ),
                             collect_across_runs=bool(self._config.get("collect_across_runs", False)),
                             pipeline_depth_request=chip_pipeline_depth_request,
+                            automatic_admission=self._automatic_admission_requested,
                         )
                     except BaseException as e:  # noqa: BLE001
                         import traceback as _tb  # noqa: PLC0415
@@ -9328,11 +9395,21 @@ class Worker:
         # cannot exceed the slot capability because a launched run holds its slot until it ends.
         # Nor the run-resource grant at any chip endpoint. The fixed request-frame
         # pool only carries hand-offs and does not limit live runs.
-        dw.configure_pipeline_depth(
-            direct_chip_pipeline_depth,
-            self._pending_run_depth,
-            min([self._launch_depth, direct_chip_pipeline_depth, *self._chip_run_resource_set_counts]),
-        )
+        if self._automatic_admission_requested:
+            # The startup grant sizes identities, not proven resources. Only one exploratory
+            # candidate is admissible until terminal reports establish the next capacity.
+            dw.configure_pipeline_depth(
+                direct_chip_pipeline_depth,
+                0,
+                min([direct_chip_pipeline_depth, *self._chip_run_resource_set_counts]),
+                initial_admission_depth=1,
+            )
+        else:
+            dw.configure_pipeline_depth(
+                direct_chip_pipeline_depth,
+                self._pending_run_depth,
+                min([self._launch_depth, direct_chip_pipeline_depth, *self._chip_run_resource_set_counts]),
+            )
 
         # Register chip workers as NEXT_LEVEL (L3). The child pid lets the C++
         # endpoint fail a dispatch whose child died instead of spinning on a
@@ -12622,24 +12699,34 @@ class Worker:
         returning. The caller keeps the stream and external allocations alive through
         retirement. Capture is rejected before source references are reserved.
 
-        Graph construction remains serialized. How many runs may be admitted is
-        the depth this worker's backends negotiated, not a constant: at the
-        negotiated depth two, one active plus one prepared run are permitted and
-        a third submission blocks before invoking its graph callback; where a
-        backend publishes depth one, the *second* submission already blocks
-        there. Every onboard runtime publishes at least two sets, and all four
-        publish no upper limit of their own, so an explicit ``pipeline_depth``
-        raises a supported configuration to whatever it asks for — the grant is
-        the request, and every per-run resource is built to it at startup.
+        Graph construction remains serialized. A local L3 Worker that owns its
+        startup and uses an onboard a2a3/a5 host_build_graph or
+        tensormap_and_ringbuffer backend automatically sizes admission when
+        ``pipeline_depth``, ``pending_run_depth``, ``launch_depth`` and
+        ``workspace_budget_bytes`` are all omitted. Cold admission starts at
+        one run: a second submission blocks before its Python graph callback
+        until the first whole run retires. Endpoint resource proofs then allow
+        more runs to prepare and enqueue, subject to the conservative fold
+        across participating endpoints. Reclaiming storage can reduce that
+        capacity. The startup identity directory bounds the slots that can be
+        named; it does not reserve their device memory or establish admission.
 
-        Admission is separate from reaching the device. A prepared successor's
-        device work waits for its predecessor unless this Worker was configured
-        with ``launch_depth`` above one *and* its runtime publishes the
-        joined-launch capability, which every onboard runtime now does. The
-        device still executes one whole operator at a time either way. A caller
-        whose first run only completes because a later callback runs would
-        deadlock on a depth-one backend. Completion and cleanup stay attached to
-        each handle.
+        Supplying any of those controls selects explicit behavior. The
+        negotiated ``pipeline_depth`` bounds native slots; ``pending_run_depth``
+        bounds logical admission (zero derives it from the native grant).
+        ``launch_depth`` defaults to one and bounds early device enqueue.
+        Explicit requests remain subject to backend and topology validation;
+        nested, remote, MPI and simulated workers retain their existing
+        negotiated behavior rather than using local automatic resource proof.
+
+        Admission is separate from reaching the device. Automatic mode derives
+        its launch ceiling from the backend capability and resource-set grant;
+        explicit mode needs ``launch_depth`` above one for early enqueue. Both
+        require runtime support and compatible runs for joined launch. Device
+        execution remains ordered one whole operator at a time. A run must not
+        depend on a later Python graph callback entering while admission is
+        full, including the automatic cold depth of one. Completion and cleanup
+        stay attached to each handle.
         """
         submit_options = {}
         if caller_stream is not None:
@@ -12967,6 +13054,37 @@ class Worker:
             return f"level {int(self.level)} is not the level-3 root this capacity is negotiated for"
         return None
 
+    @property
+    def _automatic_admission_requested(self) -> bool:
+        """Whether this Worker lets its endpoints size their own run concurrency.
+
+        The default for a Worker that configured none of the capacity knobs and owns its own
+        admission. Every other shape keeps exactly what it does today, and each exclusion is a
+        fact about who decides, not a preference:
+
+        * an explicit ``pipeline_depth``, ``pending_run_depth`` or ``launch_depth`` is a caller
+          who has already decided, and a derived capacity would override that decision;
+        * an explicit ``workspace_budget_bytes`` is a caller who has decided the byte policy too;
+        * a Worker that is not the root of its own startup — nested under a parent, or hosted by a
+          remote or MPI session — does not own the admission its endpoints would be reporting to;
+        * a level other than 3, or a root without local devices, has no chip endpoints to measure;
+        * a simulated platform has no workspace owner to measure against.
+
+        The simulated exclusion is decided here and not inside the endpoint, because this answer
+        sizes the mailbox entry table and seeds the FIFO bound *before* any child reports
+        anything. A simulated endpoint would be granted the whole identity directory, and then —
+        having no ledger to prove a set with — would report that grant back as what it can hold.
+        """
+        if self._pipeline_depth_scope_refusal() is not None:
+            return False
+        if self._pipeline_depth_requested_explicitly:
+            return False
+        if not self._config.get("device_ids"):
+            return False
+        if str(self._config.get("platform", "")).endswith("sim"):
+            return False
+        return not any(key in self._config for key in ("pending_run_depth", "launch_depth", "workspace_budget_bytes"))
+
     def _requested_chip_pipeline_depth(self) -> int:
         """The capacity this Worker asks each chip child for.
 
@@ -12974,7 +13092,15 @@ class Worker:
         anywhere else the child is asked for the default, so it grants exactly what it always did.
         An explicit request outside that scope is refused rather than quietly reduced — the caller
         is told at startup, before any set is committed.
+
+        With no explicit request this asks for the identity directory rather than the old fixed
+        default: the directory is what bounds how many runs can ever be *named*, and the capacity
+        actually admitted starts at one and grows only as the endpoints prove sets they can hold.
+        A named-but-unproven identity costs one table entry and no device memory, which is why the
+        two numbers are allowed to differ by this much.
         """
+        if self._automatic_admission_requested:
+            return _AUTOMATIC_IDENTITY_DIRECTORY_SETS
         requested = int(self._pipeline_depth_request)
         if requested <= _DEFAULT_PIPELINE_DEPTH_REQUEST:
             return requested

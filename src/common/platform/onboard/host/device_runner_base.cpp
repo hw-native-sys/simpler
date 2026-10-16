@@ -29,6 +29,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
@@ -55,6 +56,8 @@
 #include "host/joined_diagnostic_eligibility.h"
 #include "host/raii_scope_guard.h"
 #include "host/run_boundary.h"
+#include "host/run_resource_growth.h"
+#include "host/run_resource_trim.h"
 #include "host_log.h"
 #include "platform_comm/comm.h"
 #include "runtime_c_api.h"
@@ -283,6 +286,7 @@ DeviceRunnerBase::RunResourceStaging DeviceRunnerBase::build_run_resources(size_
     staged.graph_definition_staging = RunResourceSlots<RetainedGraphStaging>::build(granted);
     staged.scheduler_state_storage = RunResourceSlots<RetainedSchedulerStorage>::build(granted);
     staged.orchestration_scratch = RunResourceSlots<std::shared_ptr<void>>::build(granted);
+    staged.prepare_plans = RunResourceSlots<std::shared_ptr<void>>::build(granted);
     staged.sm_mirrors = RunResourceSlots<RetainedSmMirror>::build(granted);
     staged.run_image_stagings = RunResourceSlots<RetainedSmMirror>::build(granted);
     staged.slot_persistent_args = RunResourceSlots<SlotPersistentArgs>::build(granted);
@@ -344,6 +348,7 @@ void DeviceRunnerBase::commit_run_resources(size_t granted, RunResourceStaging &
     graph_definition_staging_.commit(std::move(staged.graph_definition_staging));
     scheduler_state_storage_.commit(std::move(staged.scheduler_state_storage));
     orchestration_scratch_.commit(std::move(staged.orchestration_scratch));
+    prepare_plans_.commit(std::move(staged.prepare_plans));
     sm_mirrors_.commit(std::move(staged.sm_mirrors));
     run_image_stagings_.commit(std::move(staged.run_image_stagings));
     arena_banks_.commit(std::move(staged.arena_banks));
@@ -572,13 +577,24 @@ const char *workspace_refusal_text(WorkspaceManager::AcquireRefusal why) {
 // a prepared successor built on another thread cannot be charged to this one.
 struct WorkspacePlanIdentity {
     std::uint64_t epoch{0};
+    uint32_t pipeline_slot{0};
     WorkspaceManager::RegionKey region{};
+    // What the named region is published at right now, so a block the allocator
+    // hands back because it already covers the request is distinguishable from
+    // a new generation. Only the first is the region's own ownership, which a
+    // rollback must leave in place.
+    void *region_backing{nullptr};
+    // Why the last request for this region was refused. Carried here because
+    // the allocation callback the arena transaction drives has no return path
+    // of its own for a reason.
+    WorkspaceManager::AcquireRefusal last_refusal{WorkspaceManager::AcquireRefusal::None};
 };
 thread_local WorkspacePlanIdentity g_workspace_plan;
 }  // namespace
 
 void DeviceRunnerBase::begin_workspace_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) noexcept {
     g_workspace_plan.epoch = run_epoch;
+    g_workspace_plan.pipeline_slot = pipeline_slot;
     g_workspace_plan.region = WorkspaceManager::staging_region(pipeline_slot);
 }
 
@@ -588,7 +604,228 @@ void DeviceRunnerBase::set_workspace_plan_region(const WorkspaceManager::RegionK
     g_workspace_plan.region = region;
 }
 
+void DeviceRunnerBase::set_workspace_plan_region_backing(void *backing) noexcept {
+    g_workspace_plan.region_backing = backing;
+}
+
+void *DeviceRunnerBase::arena_region_backing(uint32_t bank_id, std::size_t region_index) const {
+    if (bank_id >= arena_banks_.size() || arena_banks_[bank_id] == nullptr) return nullptr;
+    const ArenaBank &bank = *arena_banks_[bank_id];
+    switch (static_cast<WorkspaceManager::ArenaRegion>(region_index)) {
+    case WorkspaceManager::ArenaRegion::GmHeap:
+        return bank.gm_heap.raw_backing();
+    case WorkspaceManager::ArenaRegion::GmSm:
+        return bank.gm_sm.raw_backing();
+    case WorkspaceManager::ArenaRegion::RuntimePool:
+        return bank.runtime_pool.raw_backing();
+    default:
+        return nullptr;
+    }
+}
+
 WorkspaceManager::RegionKey DeviceRunnerBase::workspace_plan_region() noexcept { return g_workspace_plan.region; }
+
+void DeviceRunnerBase::record_workspace_claim(void *base, bool was_region_backing) {
+    if (base == nullptr || !auto_admission_.enabled()) return;
+    AutoAdmissionState::Claim claim;
+    claim.base = base;
+    claim.region_domain = static_cast<uint32_t>(g_workspace_plan.region.domain);
+    claim.region_index = g_workspace_plan.region.index;
+    claim.epoch = g_workspace_plan.epoch;
+    claim.was_region_backing = was_region_backing;
+    AutoAdmissionState::record_claim(claim);
+}
+
+void DeviceRunnerBase::rollback_workspace_claims() {
+    ::rollback_workspace_claims(workspace_, [](void *base) {
+        LOG_ERROR("workspace rollback: the ledger no longer holds %p, which this transaction claimed", base);
+    });
+}
+
+void DeviceRunnerBase::commit_workspace_claims() { AutoAdmissionState::commit_claims(); }
+
+/**
+ * The facts `RunResourceGrowth` decides against, from this runner's own state.
+ *
+ * Every answer below is a lookup; none of them is a policy. The reservations
+ * are snapshotted once on construction, so one trim reads one consistent view
+ * of what the endpoint holds rather than re-locking per slot.
+ */
+class DeviceRunnerBase::RunResourceEndpointView final : public RunResourceEndpoint {
+public:
+    explicit RunResourceEndpointView(DeviceRunnerBase *runner) :
+        runner_(runner),
+        granted_(runner->granted_run_resource_sets_),
+        reservations_(granted_),
+        announces_(granted_) {
+        reserved_ = runner_->snapshot_native_run_reservations(reservations_.data(), reservations_.size());
+        for (std::size_t i = 0; i < granted_; ++i) {
+            announces_[i] = ArenaRegionAnnounce{runner_, static_cast<uint32_t>(i)};
+        }
+    }
+
+    std::size_t run_resource_sets() const override { return granted_; }
+
+    bool slot_reserved(uint32_t slot) const override {
+        for (std::size_t i = 0; i < reserved_; ++i) {
+            if (reservations_[i].pipeline_slot == slot) return true;
+        }
+        return false;
+    }
+
+    bool bank_reserved(uint32_t slot) const override {
+        for (std::size_t i = 0; i < reserved_; ++i) {
+            if (reservations_[i].arena_bank == slot) return true;
+        }
+        return false;
+    }
+
+    bool plan_live(uint32_t slot) const override {
+        return runner_->auto_admission_.plan(slot).phase != AutoAdmissionState::Phase::None;
+    }
+
+    void *staging_backing(uint32_t slot) const override {
+        return slot < runner_->retained_temp_addrs_.size() ? runner_->retained_temp_addrs_[slot] : nullptr;
+    }
+
+    void release_staging_backing(uint32_t slot) override { runner_->set_retained_temp_buffer(slot, nullptr, 0); }
+
+    std::size_t arena_release_requests(uint32_t slot, ArenaRegionRequest *out, std::size_t capacity) override {
+        constexpr std::size_t kRegionCount = static_cast<std::size_t>(WorkspaceManager::ArenaRegion::kCount);
+        if (out == nullptr || capacity < kRegionCount) return 0;
+        if (slot >= granted_ || runner_->arena_banks_[slot] == nullptr) return 0;
+        ArenaBank &bank = *runner_->arena_banks_[slot];
+        auto region_gave_up = [](void *ctx, std::size_t region_index, ArenaRegionDisposition what, void *base) {
+            auto *a = static_cast<ArenaRegionAnnounce *>(ctx);
+            (void)region_index;
+            a->runner->note_arena_region_disposition(a->bank, what, base);
+        };
+        void *announce_ctx = &announces_[slot];
+        out[0] =
+            ArenaRegionRequest{&bank.gm_heap, &bank.cached_gm_heap_size, 0, "gm_heap", nullptr, nullptr, region_gave_up,
+                               announce_ctx};
+        out[1] = ArenaRegionRequest{&bank.gm_sm, &bank.cached_gm_sm_size, 0,           "gm_sm", nullptr,
+                                    nullptr,     region_gave_up,          announce_ctx};
+        out[2] = ArenaRegionRequest{
+            &bank.runtime_pool, &bank.cached_runtime_arena_size, 0, "runtime_pool", nullptr, nullptr, region_gave_up,
+            announce_ctx
+        };
+        return kRegionCount;
+    }
+
+    bool owns_prebuilt_cache(uint32_t slot) const override { return slot == 0; }
+
+    PrebuiltRuntimeArenaCache *prebuilt_cache(uint32_t /*slot*/) override {
+        return &runner_->prebuilt_runtime_arena_cache_;
+    }
+
+    void withdraw_run_resource_proof(uint32_t slot) override { runner_->clear_run_resource_proof(slot); }
+
+    int reclaim_obsolete() override { return runner_->reclaim_workspace_obsolete(); }
+
+private:
+    DeviceRunnerBase *runner_;
+    std::size_t granted_;
+    std::vector<NativeRunReservationRow> reservations_;
+    std::vector<ArenaRegionAnnounce> announces_;
+    std::size_t reserved_{0};
+};
+
+bool DeviceRunnerBase::growth_still_blocked(uint32_t pipeline_slot, AutoAdmissionState::Phase phase) {
+    RunResourceEndpointView view(this);
+    return RunResourceGrowth(workspace_, auto_admission_, view).still_blocked(pipeline_slot, phase);
+}
+
+int DeviceRunnerBase::claim_growth_permission(
+    uint32_t pipeline_slot, std::uint64_t run_epoch, AutoAdmissionState::Phase phase
+) {
+    if (!auto_admission_.enabled()) return 0;
+    RunResourceEndpointView view(this);
+    return RunResourceGrowth(workspace_, auto_admission_, view).claim_permission(pipeline_slot, run_epoch, phase);
+}
+
+int DeviceRunnerBase::report_growth_refusal(
+    uint32_t pipeline_slot, AutoAdmissionState::Phase phase, std::size_t shortfall, GrowthAttempt outcome
+) {
+    RunResourceEndpointView view(this);
+    return RunResourceGrowth(workspace_, auto_admission_, view)
+        .report_refusal(pipeline_slot, phase, shortfall, outcome);
+}
+
+std::size_t DeviceRunnerBase::trim_idle_run_resources(uint32_t requesting_slot) {
+    if (!auto_admission_.enabled() || !workspace_.enabled()) return 0;
+    RunResourceEndpointView view(this);
+    return RunResourceGrowth(workspace_, auto_admission_, view).trim_idle_sets(requesting_slot);
+}
+
+GrowthAttempt DeviceRunnerBase::grow_with_one_retry(
+    uint32_t requesting_slot, bool rollback_before_retry, GrowthAttempt (*attempt)(void *ctx), void *ctx
+) {
+    RunResourceEndpointView view(this);
+    return RunResourceGrowth(workspace_, auto_admission_, view)
+        .attempt_with_one_retry(requesting_slot, rollback_before_retry, attempt, ctx);
+}
+
+void DeviceRunnerBase::release_plan_epoch_refs(uint32_t pipeline_slot, std::uint64_t run_epoch) {
+    if (!auto_admission_.enabled()) return;
+    if (pipeline_slot >= retained_temp_addrs_.size()) return;
+    // Everything this attempt took under its own identity goes back, because
+    // the retry takes its own: a block's reference table is finite, so one
+    // reference per attempt on a block only one of them will ever use would
+    // eventually refuse a plan the resources were there for.
+    rollback_workspace_claims();
+    const AutoAdmissionState::SlotPlan plan = auto_admission_.plan(pipeline_slot);
+    if (plan.holds_input_staging && retained_temp_addrs_[pipeline_slot] != nullptr) {
+        (void)workspace_.release_ref(retained_temp_addrs_[pipeline_slot], run_epoch);
+    }
+    auto_admission_.note_epoch_refs_released(pipeline_slot);
+}
+
+void DeviceRunnerBase::note_run_resources_proven(uint32_t pipeline_slot, std::uint64_t run_epoch) {
+    if (!auto_admission_.enabled()) return;
+    const AutoAdmissionState::SlotPlan plan = auto_admission_.plan(pipeline_slot);
+    if (plan.epoch == run_epoch) auto_admission_.release_growth_token(pipeline_slot);
+    auto_admission_.note_proven(pipeline_slot);
+    // The claims are the run's own references now; nothing is given back.
+    commit_workspace_claims();
+    prepare_plans_[pipeline_slot].reset();
+    auto_admission_.end_plan(pipeline_slot);
+}
+
+int DeviceRunnerBase::abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_epoch) {
+    if (!auto_admission_.enabled()) return 0;
+    if (pipeline_slot >= retained_temp_addrs_.size()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    const AutoAdmissionState::SlotPlan plan = auto_admission_.plan(pipeline_slot);
+    // Already gone, or taken over by a later run: nothing of this epoch's is
+    // held, so the caller's unwind has nothing to do and may say so. Epoch zero
+    // names whatever plan the slot holds, which is what a caller abandoning a
+    // run whose prepare never returned an identity can say.
+    if (plan.phase == AutoAdmissionState::Phase::None) return 0;
+    if (run_epoch != 0 && plan.epoch != run_epoch) return 0;
+    const std::uint64_t epoch = plan.epoch;
+    // A plan whose run could still have reached the device is not a plan to
+    // unwind: its input staging may be read by device work, so handing the
+    // reference back would let a later growth overwrite bytes in use. The
+    // caller treats this as a failure rather than a clean abandonment.
+    if (native_run_is_live(epoch)) {
+        LOG_ERROR(
+            "abort_run_plan: slot %u still holds a live native run for epoch %llu; its resources are not "
+            "releasable here",
+            pipeline_slot, static_cast<unsigned long long>(epoch)
+        );
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    release_plan_epoch_refs(pipeline_slot, epoch);
+    prepare_plans_[pipeline_slot].reset();
+    if (plan.plan_stamped) {
+        // The slot's saved host plan is grow-only storage the next occupant
+        // reuses, so it is not freed here; what must not survive is the claim
+        // that it describes a usable run.
+        invalidate_graph_definition_staging(pipeline_slot);
+    }
+    auto_admission_.end_plan(pipeline_slot);
+    return 0;
+}
 
 int DeviceRunnerBase::reference_bank_arenas(
     uint32_t arena_bank, const ArenaRegionRequest *requests, std::size_t count
@@ -649,7 +886,16 @@ void *DeviceRunnerBase::acquire_arena_backing(std::size_t size) {
             static_cast<unsigned>(g_workspace_plan.region.domain), g_workspace_plan.region.index,
             workspace_refusal_text(why)
         );
+        g_workspace_plan.last_refusal = why;
+        return base;
     }
+    // Recorded before the transaction can abandon it. A staged block the
+    // transaction gives up keeps this plan's reference and its charge — the
+    // arena's abort frees through this same callback, which does nothing for a
+    // block the ledger owns — so without the record the only thing that could
+    // recover it is the whole run retiring, which a plan that resumes never
+    // does.
+    record_workspace_claim(base, base == g_workspace_plan.region_backing);
     return base;
 }
 
@@ -754,13 +1000,15 @@ int DeviceRunnerBase::acquire_retained_temp(
         // this run is about to write and read it, so it registers as a consumer
         // anyway — otherwise a later growth would find no reference and treat
         // those bytes as free to overwrite.
-        if (bytes != 0 && workspace_.enabled() && *addr_out != nullptr &&
-            !workspace_.reference(*addr_out, g_workspace_plan.epoch)) {
-            LOG_ERROR(
-                "acquire_retained_temp: slot %u could not register this run as a consumer of %p", pipeline_slot,
-                *addr_out
-            );
-            return PTO_RUNTIME_ERR_INTERNAL;
+        if (bytes != 0 && workspace_.enabled() && *addr_out != nullptr) {
+            if (!workspace_.reference(*addr_out, g_workspace_plan.epoch)) {
+                LOG_ERROR(
+                    "acquire_retained_temp: slot %u could not register this run as a consumer of %p", pipeline_slot,
+                    *addr_out
+                );
+                return PTO_RUNTIME_ERR_INTERNAL;
+            }
+            auto_admission_.note_input_staging_held(pipeline_slot);
         }
         return 0;
     }
@@ -783,15 +1031,45 @@ int DeviceRunnerBase::acquire_retained_temp(
     // its last consumer retires, so this request takes a block of its own
     // inside the budget. A refusal leaves the slot naming the old block.
     const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(pipeline_slot);
-    WorkspaceManager::AcquireRefusal why = WorkspaceManager::AcquireRefusal::None;
-    void *grown = workspace_.acquire(region, g_workspace_plan.epoch, bytes, &why);
+    // This run's inputs are the first device storage any prepare takes, so the
+    // growth permission is claimed here rather than at the regions below: a
+    // plan that grows its inputs and then its regions is one grower, and
+    // without this gate the earliest allocation of all would bypass it.
+    const int permission =
+        claim_growth_permission(pipeline_slot, g_workspace_plan.epoch, AutoAdmissionState::Phase::Staging);
+    if (permission != 0) return permission;
+    // The retry sequence is the growth coordinator's; what belongs here is the
+    // attempt itself and how to read its refusal. A degraded ledger publishes
+    // nothing further, so it is reported as such and neither retried nor waited
+    // on.
+    struct StagingAttempt {
+        DeviceRunnerBase *runner;
+        WorkspaceManager::RegionKey region;
+        std::size_t bytes;
+        void *grown{nullptr};
+        WorkspaceManager::AcquireRefusal why{WorkspaceManager::AcquireRefusal::None};
+    } attempt{this, region, bytes};
+    const GrowthAttempt outcome = grow_with_one_retry(
+        pipeline_slot, /*rollback_before_retry=*/false,
+        [](void *ctx) {
+            auto *a = static_cast<StagingAttempt *>(ctx);
+            a->grown = a->runner->workspace_.acquire(a->region, g_workspace_plan.epoch, a->bytes, &a->why);
+            if (a->grown != nullptr) return GrowthAttempt::Served;
+            return classify_growth_refusal(a->why);
+        },
+        &attempt
+    );
+    void *grown = attempt.grown;
     if (grown == nullptr) {
         LOG_ERROR(
             "acquire_retained_temp: workspace refused %zu bytes for slot %u: %s; the slot keeps its previous block",
-            bytes, pipeline_slot, workspace_refusal_text(why)
+            bytes, pipeline_slot, workspace_refusal_text(attempt.why)
         );
+        const int refusal = report_growth_refusal(pipeline_slot, AutoAdmissionState::Phase::Staging, bytes, outcome);
+        if (refusal != 0) return refusal;
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    auto_admission_.note_input_staging_held(pipeline_slot);
     // The previous block keeps its address and its contents: the slot stops
     // naming it, and its earlier consumers release it when they retire.
     set_retained_temp_buffer(pipeline_slot, grown, bytes);
@@ -1022,6 +1300,12 @@ void DeviceRunnerBase::release_run_image_stagings() {
 }
 
 void DeviceRunnerBase::release_sm_mirrors() {
+    for (size_t slot = 0; slot < prepare_plans_.size(); ++slot) {
+        prepare_plans_[slot].reset();
+        // Teardown destroys the saved host plan, including its growth owner.
+        // Workspace references and quarantine still require their own proofs.
+        auto_admission_.end_plan(static_cast<uint32_t>(slot));
+    }
     for (auto &scratch : orchestration_scratch_)
         scratch.reset();
     for (RetainedSmMirror &mirror : sm_mirrors_) {
@@ -1154,6 +1438,7 @@ int DeviceRunnerBase::setup_static_arena(
         a->runner->set_workspace_plan_region(
             WorkspaceManager::arena_region(a->bank, static_cast<WorkspaceManager::ArenaRegion>(region_index))
         );
+        a->runner->set_workspace_plan_region_backing(a->runner->arena_region_backing(a->bank, region_index));
     };
     // The two boundaries at which a region stops publishing a block without a
     // successor taking over. Reported to the ledger, which owns the block the
@@ -1171,15 +1456,52 @@ int DeviceRunnerBase::setup_static_arena(
          &announce, region_gave_up, &announce},
     };
     constexpr size_t kRegionCount = sizeof(requests) / sizeof(requests[0]);
+    // What this call would have to replace, decided before anything is staged.
+    // A bank every region already covers costs nothing and needs no growth
+    // permission, which is what keeps a steady workload — and every reuse of an
+    // already-proven slot — out of the grower's queue entirely.
+    bool needs_growth = false;
+    for (size_t i = 0; i < kRegionCount; ++i) {
+        if (arena_region_action(requests[i]) == ArenaRegionAction::Replace) needs_growth = true;
+    }
+    if (needs_growth && auto_admission_.enabled()) {
+        const int permission = claim_growth_permission(
+            g_workspace_plan.pipeline_slot, g_workspace_plan.epoch, AutoAdmissionState::Phase::Committing
+        );
+        if (permission != 0) return permission;
+    }
+    g_workspace_plan.last_refusal = WorkspaceManager::AcquireRefusal::None;
     // One region at a time, each named to the ledger, because the allocation
     // callbacks carry no region of their own and a capacity hit calls none at
     // all. The transaction itself is unchanged: it still stages every region
-    // and publishes only when all of them succeeded.
-    const BankArenaSetupOutcome outcome = run_bank_arena_setup(
-        requests, kRegionCount, /*owns_prebuilt_cache=*/arena_bank == 0, &prebuilt_runtime_arena_cache_,
-        DeviceArena::kDefaultBaseAlign
-    );
+    // and publishes only when all of them succeeded. The retry sequence around
+    // it is the growth coordinator's, and the attempt hands back what it staged
+    // before that sequence trims, because a block this transaction abandoned is
+    // not recoverable while the claim still holds it.
+    struct ArenaAttempt {
+        DeviceRunnerBase *runner;
+        ArenaRegionRequest *requests;
+        std::size_t count;
+        uint32_t bank;
+        BankArenaSetupOutcome outcome{};
+    } attempt{this, requests, kRegionCount, arena_bank};
+    const auto stage_bank = [](void *ctx) {
+        auto *a = static_cast<ArenaAttempt *>(ctx);
+        g_workspace_plan.last_refusal = WorkspaceManager::AcquireRefusal::None;
+        a->outcome = run_bank_arena_setup(
+            a->requests, a->count, /*owns_prebuilt_cache=*/a->bank == 0, &a->runner->prebuilt_runtime_arena_cache_,
+            DeviceArena::kDefaultBaseAlign
+        );
+        if (a->outcome.rc == 0) return GrowthAttempt::Served;
+        return classify_growth_refusal(g_workspace_plan.last_refusal);
+    };
+    GrowthAttempt growth =
+        grow_with_one_retry(g_workspace_plan.pipeline_slot, /*rollback_before_retry=*/true, stage_bank, &attempt);
+    BankArenaSetupOutcome outcome = attempt.outcome;
     if (outcome.rc == 0 && workspace_.enabled()) {
+        // Publication transferred ownership to the regions. A later reference
+        // failure must not roll those current blocks back into obsolete storage.
+        commit_workspace_claims();
         // Every region this bank now publishes is used by this plan, including
         // the ones whose existing capacity was enough and therefore allocated
         // nothing. A plan that read and wrote a region without registering as
@@ -1197,6 +1519,10 @@ int DeviceRunnerBase::setup_static_arena(
             "and capacities",
             name, requested, arena_bank
         );
+        const int refusal = report_growth_refusal(
+            g_workspace_plan.pipeline_slot, AutoAdmissionState::Phase::Committing, requested, growth
+        );
+        if (refusal != 0) return refusal;
     }
     return outcome.rc;
 }
@@ -2429,6 +2755,7 @@ void DeviceRunnerBase::apply_call_config(const CallConfig &config) {
 
 void DeviceRunnerBase::begin_host_phase_run(uint32_t pipeline_slot, const DfxRunConfig &dfx) {
     if (pipeline_slot >= host_phase_runs_.size()) return;
+    if (get_prepare_plan(pipeline_slot)) return;
     host_phase_runs_[pipeline_slot].begin(dfx);
 }
 
@@ -2445,7 +2772,8 @@ DeviceRunnerBase::host_phase_pool_arm(uint32_t pipeline_slot, bool producer_want
     // storage collects no records and says so by handing back nullptr.
     HostPhaseRecordPool *pool = nullptr;
     try {
-        pool = run.records.arm(run.wants_records(producer_wants_records));
+        pool = get_prepare_plan(pipeline_slot) ? run.records.resume() :
+                                                 run.records.arm(run.wants_records(producer_wants_records));
     } catch (...) {
         LOG_WARN("Host phase pool could not be armed; this pass collects no per-event records");
     }
@@ -4475,6 +4803,22 @@ size_t DeviceRunnerBase::native_run_claim_index(const void *owner) const {
 bool DeviceRunnerBase::native_run_active() const {
     std::lock_guard<std::mutex> lk(native_run_mu_);
     return active_native_run_count_ != 0;
+}
+
+bool DeviceRunnerBase::native_run_is_live(std::uint64_t run_epoch) const {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    for (size_t i = 0; i < active_native_run_count_; ++i) {
+        if (active_native_runs_[i].identity.run_epoch == run_epoch) return true;
+    }
+    return false;
+}
+
+void DeviceRunnerBase::invalidate_graph_definition_staging(uint32_t pipeline_slot) {
+    if (pipeline_slot >= graph_definition_staging_.size()) return;
+    // The bytes stay: the block is grow-only storage the slot's next occupant
+    // reuses, and a bind writes every object it ships. What is withdrawn is the
+    // claim that they describe a run ready to continue.
+    graph_definition_staging_[pipeline_slot].bytes.clear();
 }
 
 bool DeviceRunnerBase::native_run_owned_by(const void *owner) const {

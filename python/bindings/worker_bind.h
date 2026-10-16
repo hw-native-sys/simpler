@@ -485,7 +485,7 @@ inline void bind_worker(nb::module_ &m) {
         )
         .def(
             "configure_pipeline_depth", &Worker::configure_pipeline_depth, nb::arg("depth"),
-            nb::arg("pending_depth") = 0, nb::arg("launch_depth") = 1,
+            nb::arg("pending_depth") = 0, nb::arg("launch_depth") = 1, nb::arg("initial_admission_depth") = 0,
             "Set run admission depth from the minimum direct-chip runtime capability before init. "
             "`pending_depth` bounds non-terminal logical runs instead, and 0 derives it from `depth`. "
             "`launch_depth` bounds how many runs may have their device work launched at once; 1 keeps a "
@@ -955,6 +955,8 @@ inline void bind_worker(nb::module_ &m) {
     entry_offsets["group_index"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, group_index));
     entry_offsets["group_size"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, group_size));
     entry_offsets["error_text"] = static_cast<uint64_t>(offsetof(MailboxRunEntry, error_text));
+    entry_offsets["admissible_run_resource_sets"] =
+        static_cast<uint64_t>(offsetof(MailboxRunEntry, admissible_run_resource_sets));
     m.attr("MAILBOX_RUN_ENTRY_OFFSETS") = entry_offsets;
     nb::dict frame_offsets;
     frame_offsets["entry_index"] = static_cast<int64_t>(MAILBOX_OFF_FRAME_ENTRY_INDEX);

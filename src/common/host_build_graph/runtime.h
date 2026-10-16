@@ -550,6 +550,10 @@ public:
             {target, source, bytes, phase, std::move(attributes), std::move(storage)}
         );
     }
+    using RunImagePublication = HostOnlyState::RunImagePublication;
+    void restore_pending_publication(RunImagePublication publication) {
+        host_.pending_publication_ = std::move(publication);
+    }
     auto take_pending_publication() { return std::exchange(host_.pending_publication_, {}); }
     void clear_pending_publication() { host_.pending_publication_ = {}; }
 

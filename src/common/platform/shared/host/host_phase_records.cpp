@@ -78,6 +78,16 @@ HostPhaseRecordPool *HostPhaseRecordStore::arm(bool collect_records) {
     return &pool_;
 }
 
+HostPhaseRecordPool *HostPhaseRecordStore::resume() {
+    if (!armed_ || !finished_ || records_written_) return nullptr;
+    finished_ = false;
+    // Existing buffers, their dropped ledger and the allocation cursor stay
+    // owned by this run. A retry takes unused buffers instead of overwriting
+    // a previous producer's partially filled one.
+    pool_.generation.store(next_pass_generation(), std::memory_order_release);
+    return &pool_;
+}
+
 uint64_t HostPhaseRecordStore::stored_records() const {
     uint64_t total = 0;
     for (const auto &buffer : buffers_) {

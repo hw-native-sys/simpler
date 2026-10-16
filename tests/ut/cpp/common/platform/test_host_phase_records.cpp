@@ -296,3 +296,21 @@ TEST(HostPhaseRecords, APassIsWrittenAtMostOnceAndTheNextPassAppends) {
 }
 
 }  // namespace
+
+TEST(HostPhaseRecords, APrepareRetryAppendsAndKeepsTheDroppedLedger) {
+    HostPhaseRecordStore store;
+    auto *pool = store.arm(true);
+    ASSERT_NE(pool, nullptr);
+    record_n(pool, HostPhaseKind::OrchRecordSubTask, 3, 100);
+    pool->dropped.fetch_add(2);
+    store.finish(3, 9);
+    const auto generation = pool->generation.load();
+    ASSERT_EQ(store.resume(), pool);
+    EXPECT_NE(pool->generation.load(), generation);
+    record_n(pool, HostPhaseKind::BindArenaH2d, 1, 200);
+    store.finish(3, 10);
+    EXPECT_EQ(store.records().size(), 4u);
+    EXPECT_EQ(store.dropped_records(), 2u);
+    EXPECT_EQ(store.submitted_tasks(), 3u);
+    EXPECT_EQ(store.invocation_id(), 10u) << "the completing attempt owns the combined artifact";
+}

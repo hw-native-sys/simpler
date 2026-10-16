@@ -217,6 +217,9 @@ void Worker::init() {
     cfg.on_consumed_cb = [this](TaskSlot slot) {
         orchestrator_.on_consumed(slot);
     };
+    cfg.note_endpoint_capacity_cb = [this](int32_t worker_id, uint32_t sets) {
+        orchestrator_.note_endpoint_capacity(worker_id, sets);
+    };
     cfg.on_task_failed_cb = [this](TaskSlot slot, const std::string &message) {
         orchestrator_.report_task_error(slot, message);
     };

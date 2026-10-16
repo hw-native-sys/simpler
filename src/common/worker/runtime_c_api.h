@@ -114,6 +114,16 @@ enum {
     PTO_RUNTIME_ERR_INVALID_STATE = PTO_RUNTIME_ERR_BASE - 3,
     /* A caller supplied an invalid pointer, id, size, or other argument. */
     PTO_RUNTIME_ERR_INVALID_ARGUMENT = PTO_RUNTIME_ERR_BASE - 4,
+    /* BASE - 5 is held by the diagnostic collector's capacity refusal. */
+    /* A prepare could not take the device resources it needs now, and a
+       consumer that still holds some of them has a retirement this context will
+       reach. The plan is kept and retried once that consumer finishes, so this
+       is a wait rather than a failure and the caller must not discard the run. */
+    SIMPLER_RUNTIME_ERR_RESOURCE_WAIT = PTO_RUNTIME_ERR_BASE - 6,
+    /* A prepare could not take the device resources it needs and no consumer
+       remains whose retirement could supply them: either none ever held any, or
+       this plan has already waited for every one that did. Terminal. */
+    SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE = PTO_RUNTIME_ERR_BASE - 7,
 };
 
 /** Return values from simpler_poll_run(). */
@@ -736,6 +746,43 @@ int simpler_enable_workspace_management_ctx(DeviceContextHandle ctx);
  *         workspace.
  */
 int simpler_get_workspace_report_ctx(DeviceContextHandle ctx, SimplerWorkspaceReport *out, size_t out_bytes);
+
+/**
+ * Let this context size its own run concurrency from the resources it proves.
+ *
+ * Asked once, before anything is prepared, by a caller that was given no
+ * explicit depth and no explicit byte budget. A context that is never asked
+ * admits exactly what it was granted, as it did before.
+ *
+ * @return 0 when the context will size itself, PTO_RUNTIME_ERR_UNSUPPORTED on a
+ *         context that cannot (no managed workspace, or already prepared work)
+ */
+int simpler_enable_automatic_admission_ctx(DeviceContextHandle ctx);
+
+/**
+ * Run-resource sets this context reports it can hold.
+ *
+ * A count of identities, never a byte figure. One until a run has completed its
+ * resource commit; it then grows with what the context has proved and shrinks
+ * when those resources are reclaimed or become unprovable. Equal to the grant
+ * on a context that does not size itself.
+ */
+uint32_t simpler_admissible_run_resource_sets_ctx(DeviceContextHandle ctx);
+
+/**
+ * Give up every resource a saved plan on `pipeline_slot` still holds, and
+ * forget the plan.
+ *
+ * The one entry an abandonment uses for a run whose prepare asked to wait: such
+ * a run holds its input staging reference, the context's growth permission and
+ * whatever its in-flight transaction staged, none of which an unprepared run
+ * holds. Idempotent — a slot with no plan for this epoch reports success.
+ *
+ * @return 0 when the slot holds no plan for `run_epoch` afterwards,
+ *         PTO_RUNTIME_ERR_INVALID_STATE when the run could still have reached
+ *         the device, so its borrows must not be handed back here
+ */
+int simpler_abort_run_plan_ctx(DeviceContextHandle ctx, uint32_t pipeline_slot, uint64_t run_epoch);
 
 /**
  * Publish every diagnostic run this context has closed, then report.

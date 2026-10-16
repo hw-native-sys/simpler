@@ -373,6 +373,16 @@ extern "C" int dep_gen_host_graph_take(hg::HostGraphExport *out) {
     return static_cast<int>(task_left_open ? hg::TakeOutcome::Incomplete : hg::TakeOutcome::Complete);
 }
 
+extern "C" void dep_gen_host_graph_restore_for_export(hg::HostGraphExport *graph, int outcome) {
+    HostGraphState &s = state();
+    s.reset();
+    if (graph == nullptr || outcome == static_cast<int>(hg::TakeOutcome::NotCaptured)) return;
+    s.graph = std::move(*graph);
+    s.capture_open = true;
+    s.captured = !s.graph.tasks.empty();
+    s.in_task = outcome == static_cast<int>(hg::TakeOutcome::Incomplete);
+}
+
 extern "C" int dep_gen_host_graph_emit(const char *deps_json_path) {
     if (deps_json_path == nullptr) {
         LOG_ERROR("dep_gen host graph: null deps_json_path");

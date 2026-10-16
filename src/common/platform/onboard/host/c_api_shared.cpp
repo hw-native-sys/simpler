@@ -381,6 +381,13 @@ static void set_orchestration_scratch(void *runner_ctx, uint32_t slot, std::shar
         static_cast<DeviceRunnerBase *>(runner_ctx)->set_orchestration_scratch(slot, std::move(scratch));
 }
 
+static std::shared_ptr<void> get_prepare_plan(void *runner_ctx, uint32_t slot) {
+    return static_cast<DeviceRunnerBase *>(runner_ctx)->get_prepare_plan(slot);
+}
+static void set_prepare_plan(void *runner_ctx, uint32_t slot, uint64_t epoch, std::shared_ptr<void> plan) {
+    static_cast<DeviceRunnerBase *>(runner_ctx)->set_prepare_plan(slot, epoch, std::move(plan));
+}
+
 static int
 acquire_sm_mirror(void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **addr_out) {
     if (addr_out != nullptr) *addr_out = nullptr;
@@ -606,6 +613,8 @@ static const HostApiOps g_host_api_ops = {
     .caller_device_span_written_by_other_run = caller_device_span_written_by_other_run,
     .get_orchestration_scratch = get_orchestration_scratch,
     .set_orchestration_scratch = set_orchestration_scratch,
+    .get_prepare_plan = get_prepare_plan,
+    .set_prepare_plan = set_prepare_plan,
 };
 
 /* ===========================================================================
@@ -1344,6 +1353,61 @@ static void emit_overlap_storage_marks(OnboardNativeRunContext *state, bool shar
     STRACE_HOST_SPAN_AT_A("chip.run.bind.overlap", STRACE_NOW_NS(), 0, 1, attrs);
 }
 
+/**
+ * Stand a prepare down without ending its run, because the resources it still
+ * needs are held by a consumer this context will finish.
+ *
+ * Deliberately not `cleanup_failed_prepare`: that path reports
+ * `NoDeviceSubmission`, `CopybackReturned` and `BindingsReleased`, which
+ * together retire the epoch and drop every reference it holds — correct for a
+ * run that is over, and wrong for one that is going to continue, whose saved
+ * plan and input staging are exactly what the retry needs. So no run fact is
+ * reported here and the bindings this bind recorded are kept.
+ *
+ * What is given up is what another plan could otherwise not have: the execution
+ * claim and the native-run reservation. The growth permission stays with the
+ * waiting plan, since it is still the context's one outstanding grower.
+ */
+static int park_prepare(OnboardNativeRunContext *state, int wait_rc) {
+    const uint64_t trace_inv = state->trace_inv;
+    const uint64_t trace_hid = state->trace_hid;
+    const long long trace_start_ns = state->trace_start_ns;
+    char trace_attrs[sizeof(state->trace_attrs)];
+    std::memcpy(trace_attrs, state->trace_attrs, sizeof(trace_attrs));
+    // What this attempt took under its own identity goes back, because the
+    // attempt that continues this plan takes its own. The plan itself, the
+    // consumers it is waiting for and its growth permission all stay.
+    state->runner->release_plan_epoch_refs(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+    if (state->prepared_execution != nullptr) {
+        try {
+            state->runner->abandon_prepared_execution(*state->prepared_execution);
+        } catch (...) {
+            // The wait is still the outcome: this run has reached no device
+            // work, and the caller's retry re-derives whatever this abandons.
+        }
+    }
+    if (state->runner_resources_owned) {
+        try {
+            (void)state->runner->abandon_native_run_resources(state->descriptor.pipeline_slot);
+        } catch (...) {}
+        state->runner_resources_owned = false;
+    }
+    if (state->runner_claimed) {
+        state->runner->release_native_run(state);
+        state->runner_claimed = false;
+    }
+    if (state->runner_reserved) {
+        state->runner->release_native_run_reservation(state);
+        state->runner_reserved = false;
+    }
+    destroy_native_run_context(state);
+    emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
+    return wait_rc;
+}
+
+/** Whether this code asks the caller to keep the run and try again later. */
+static bool is_resource_wait(int rc) { return rc == SIMPLER_RUNTIME_ERR_RESOURCE_WAIT; }
+
 static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_rc) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
@@ -1389,11 +1453,24 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
     // This path frees nothing — whatever it leaves unreferenced is released at
     // the next boundary that can prove the calling thread is attached, which
     // this one cannot (it is reached from the attach failure itself).
+    //
+    // A prepare that failed ends its run, so it ends that run's plan too: the
+    // wait set it captured and the growth permission it holds belong to this
+    // submission, and leaving them would hand the slot's next occupant a set of
+    // consumers it never named and a permission it never took. The facts
+    // reported above retire this epoch and release its references, so this only
+    // has to settle the plan itself.
     note_workspace_fact(state, WorkspaceManager::RunFact::ContextDestroyed);
     if (state->runner_claimed) {
         state->runner->release_native_run(state);
         state->runner_claimed = false;
     }
+    // Abort requires proof that this epoch no longer owns a native context.
+    // Removing that context precedes settling the retained host plan, including
+    // failures between bind and publication. The reservation still prevents
+    // another run taking this slot until its plan has been settled.
+    const int abort_rc = state->runner->abort_run_plan(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+    if (resources_rc == 0) resources_rc = abort_rc;
     if (state->runner_reserved) {
         state->runner->release_native_run_reservation(state);
         state->runner_reserved = false;
@@ -1493,6 +1570,10 @@ int simpler_prepare_run(
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         state->runner_reserved = true;
+        // A retry owns the same slot but receives a fresh attempt identity.
+        // Adopt before attach/reclaim/provision/bind can fail; exact-epoch
+        // cleanup then settles the saved plan even if bind is never reached.
+        runner->adopt_run_plan_attempt(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
         // Names the run every workspace request inside this prepare belongs to:
         // the arena commits below and the retained-temp grow record their
         // references against this identity.
@@ -1612,7 +1693,13 @@ int simpler_prepare_run(
                 state->config.runtime_env.ring_heap, state->config.runtime_env.ring_dep_pool
             );
         }
-        if (rc != 0) return cleanup_failed_prepare(state, rc);
+        if (rc != 0) {
+            // The bind is where both growth points live — this run's inputs and
+            // its pooled regions — so it is the one step that can ask to be
+            // stood down rather than ended.
+            if (is_resource_wait(rc)) return park_prepare(state, rc);
+            return cleanup_failed_prepare(state, rc);
+        }
         // The bind prepared this run's device image into staging the slot owns;
         // this publishes it, before anything else touches the device arena. Two
         // calls rather than one because the write is orderable on its own: the
@@ -1656,6 +1743,13 @@ int simpler_prepare_run(
         // submission that produced it.
         state->prepared_execution->artifact_identity = state->artifact_identity();
         state->runner_resources_owned = false;
+        // This slot has now carried a run's resource demand to a complete
+        // commit, whether that demand needed new storage or was satisfied by
+        // what the slot already had — a run with every argument already on the
+        // device and every region covered proves its slot exactly as one that
+        // allocated. The grower's permission goes back here, after the last
+        // request this prepare can make.
+        runner->note_run_resources_proven(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
         return 0;
     } catch (...) {
         if (state != nullptr) return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_INTERNAL);
@@ -2436,6 +2530,40 @@ int simpler_get_workspace_report_ctx(DeviceContextHandle ctx, SimplerWorkspaceRe
     try {
         if (!static_cast<DeviceRunnerBase *>(ctx)->workspace_report(out)) return PTO_RUNTIME_ERR_UNSUPPORTED;
         return 0;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_enable_automatic_admission_ctx(DeviceContextHandle ctx) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    auto *runner = static_cast<DeviceRunnerBase *>(ctx);
+    // Nothing to size against: a context whose four workspace regions have no
+    // owner cannot tell a proven set from an unproven one, so it keeps the
+    // grant it was given rather than reporting a capacity it cannot establish.
+    if (!runner->workspace_enabled()) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (runner->native_runs_outstanding()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    try {
+        runner->enable_automatic_admission();
+        return runner->automatic_admission_enabled() ? 0 : PTO_RUNTIME_ERR_UNSUPPORTED;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+uint32_t simpler_admissible_run_resource_sets_ctx(DeviceContextHandle ctx) {
+    if (ctx == NULL) return 0;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->admissible_run_resource_sets();
+    } catch (...) {
+        return 0;
+    }
+}
+
+int simpler_abort_run_plan_ctx(DeviceContextHandle ctx, uint32_t pipeline_slot, uint64_t run_epoch) {
+    if (ctx == NULL) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        return static_cast<DeviceRunnerBase *>(ctx)->abort_run_plan(pipeline_slot, run_epoch);
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }

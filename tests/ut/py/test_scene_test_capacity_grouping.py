@@ -18,12 +18,18 @@ that path by a neighbour that did. This is the rule for that grouping; the pytes
 Worker per class and enforces the same per-class coherence in `conftest.py`.
 """
 
+import importlib.util
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from simpler_setup.scene_test import (
     _class_pipeline_depth,
     _create_standalone_worker,
+    _scene_admission_kwargs,
     _standalone_worker_groups,
+    scene_test,
 )
 
 
@@ -88,8 +94,8 @@ def test_classes_asking_for_different_capacities_do_not_share_a_worker():
     groups = _standalone_worker_groups(selected)
 
     assert groups == {
-        ("host_build_graph", 3, 3, False): [deep],
-        ("host_build_graph", 3, 0, False): [shallow, control],
+        ("host_build_graph", 3, 3, False, None): [deep],
+        ("host_build_graph", 3, 0, False, None): [shallow, control],
     }
 
 
@@ -101,7 +107,7 @@ def test_classes_asking_for_the_same_capacity_still_share_one_worker():
         second: [_case("b", pipeline_depth=3)],
     }
 
-    assert _standalone_worker_groups(selected) == {("host_build_graph", 3, 3, False): [first, second]}
+    assert _standalone_worker_groups(selected) == {("host_build_graph", 3, 3, False, None): [first, second]}
 
 
 def test_runtime_and_level_still_separate_groups():
@@ -111,9 +117,9 @@ def test_runtime_and_level_still_separate_groups():
     selected = {hbg: [_case("a")], tmr: [_case("b")], level_two: [_case("c")]}
 
     assert _standalone_worker_groups(selected) == {
-        ("host_build_graph", 3, 0, False): [hbg],
-        ("tensormap_and_ringbuffer", 3, 0, False): [tmr],
-        ("host_build_graph", 2, 0, False): [level_two],
+        ("host_build_graph", 3, 0, False, None): [hbg],
+        ("tensormap_and_ringbuffer", 3, 0, False, None): [tmr],
+        ("host_build_graph", 2, 0, False, None): [level_two],
     }
 
 
@@ -129,8 +135,8 @@ def test_classes_disagreeing_on_cross_run_retention_do_not_share_a_worker():
     selected = {retaining: [_case("across")], plain: [_case("single")]}
 
     assert _standalone_worker_groups(selected) == {
-        ("host_build_graph", 3, 0, True): [retaining],
-        ("host_build_graph", 3, 0, False): [plain],
+        ("host_build_graph", 3, 0, True, None): [retaining],
+        ("host_build_graph", 3, 0, False, None): [plain],
     }
 
 
@@ -141,7 +147,7 @@ def test_a_class_that_never_declared_retention_groups_as_not_retaining():
     bare._st_runtime = "host_build_graph"
     bare._st_level = 3
 
-    assert _standalone_worker_groups({bare: [_case("a")]}) == {("host_build_graph", 3, 0, False): [bare]}
+    assert _standalone_worker_groups({bare: [_case("a")]}) == {("host_build_graph", 3, 0, False, None): [bare]}
 
 
 # ---------------------------------------------------------------------------
@@ -168,3 +174,86 @@ def test_building_a_worker_for_a_retention_mixed_group_is_refused_the_same_way()
 
     with pytest.raises(SystemExit, match="one Worker cannot serve both cross-run retention settings"):
         _create_standalone_worker([retaining, plain], 3, None, selected)
+
+
+@pytest.mark.parametrize("control", ["pipeline_depth", "launch_depth", "pending_run_depth", "workspace_budget_bytes"])
+@pytest.mark.parametrize("value", [None, 0, 1])
+def test_automatic_metadata_rejects_even_zero_or_none_explicit_controls(control, value):
+    cls = _cls("Automatic")
+    cls.CASES = [_case("contradiction", **{control: value})]
+    with pytest.raises(ValueError, match="automatic_admission contradicts"):
+        scene_test(level=3, runtime="host_build_graph", automatic_admission=True)(cls)
+
+
+def test_automatic_metadata_requires_a_root_capable_level():
+    cls = _cls("LevelTwo", level=2)
+    cls.CASES = [_case("a")]
+    with pytest.raises(ValueError, match="requires level 3"):
+        scene_test(level=2, runtime="host_build_graph", automatic_admission=True)(cls)
+
+
+def test_automatic_and_explicit_classes_never_share_a_standalone_worker():
+    automatic = _cls("Automatic")
+    automatic._st_automatic_admission = True
+    explicit = _cls("Explicit")
+    selected = {automatic: [_case("a")], explicit: [_case("b")]}
+    assert list(_standalone_worker_groups(selected).values()) == [[automatic], [explicit]]
+    with pytest.raises(SystemExit, match="both automatic and explicit"):
+        _create_standalone_worker([automatic, explicit], 3, None, selected)
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("factory", ["pytest", "standalone"])
+def test_both_worker_factories_preserve_exact_admission_kwargs(monkeypatch, automatic, factory):
+    import simpler.worker as worker_mod  # noqa: PLC0415
+
+    cls = _cls("FactoryScene")
+    cls._st_automatic_admission = automatic
+    cls.CALLABLE = {}
+    cls.CASES = [_case("a")]
+    captured = []
+
+    class FakeWorker:
+        def __init__(self, **kwargs):
+            captured.append(kwargs)
+
+        def init(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(worker_mod, "Worker", FakeWorker)
+    if factory == "standalone":
+        _create_standalone_worker(
+            [cls], 3, SimpleNamespace(platform="a2a3", device=0, device_ids=[0]), {cls: cls.CASES}
+        )
+    else:
+        path = Path(__file__).resolve().parents[3] / "conftest.py"
+        spec = importlib.util.spec_from_file_location("_automatic_scene_conftest", path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        pool = SimpleNamespace(allocate=lambda count: [0], release=lambda ids: None)
+        fixture = module.st_worker.__wrapped__(SimpleNamespace(node=SimpleNamespace(cls=cls)), "a2a3", pool, {}, set())
+        next(fixture)
+        with pytest.raises(StopIteration):
+            next(fixture)
+    controls = {"pipeline_depth", "launch_depth", "pending_run_depth", "workspace_budget_bytes"}
+    assert len(captured) == 1
+    actual = {key: value for key, value in captured[0].items() if key in controls}
+    assert actual == ({} if automatic else {"launch_depth": 1})
+
+
+def test_shared_policy_preserves_explicit_capacity_and_depth():
+    assert _scene_admission_kwargs(_cls("Configured"), [_case("a", launch_depth=2, pipeline_depth=5)]) == {
+        "pipeline_depth": 5,
+        "launch_depth": 2,
+    }
+
+
+def test_each_automatic_class_owns_its_cold_start():
+    first, second = _cls("First"), _cls("Second")
+    first._st_automatic_admission = second._st_automatic_admission = True
+    selected = {first: [_case("one")], second: [_case("two")]}
+    assert list(_standalone_worker_groups(selected).values()) == [[first], [second]]

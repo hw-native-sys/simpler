@@ -129,9 +129,14 @@ RunId Orchestrator::begin_run() {
     return run_id;
 }
 
-void Orchestrator::configure_pipeline_depth(uint32_t depth, uint32_t pending_depth, uint32_t launch_depth) {
+void Orchestrator::configure_pipeline_depth(
+    uint32_t depth, uint32_t pending_depth, uint32_t launch_depth, uint32_t initial_admission_depth
+) {
     if (depth == 0) {
         throw std::invalid_argument("Orchestrator: pipeline depth is outside the supported range");
+    }
+    if (initial_admission_depth > depth) {
+        throw std::invalid_argument("Orchestrator: initial admission exceeds the directory");
     }
     if (launch_depth == 0 || launch_depth > depth) {
         throw std::invalid_argument("Orchestrator: launch depth must be between one and the pipeline depth");
@@ -143,16 +148,67 @@ void Orchestrator::configure_pipeline_depth(uint32_t depth, uint32_t pending_dep
     // The arena holds exactly the granted count: a set exists because a run can
     // hold it, not because a layout reserved room for it.
     run_resources_.regrant(depth);
-    admission_depth_ = depth;
+    admission_depth_ = initial_admission_depth == 0 ? depth : initial_admission_depth;
     // Below `depth` is legal: it leaves the successor role unfillable, because
     // that role needs a second FIFO entry to exist, and admission serializes.
     // That is a caller's choice, not an error.
-    pending_run_limit_ = pending_depth == 0 ? depth : pending_depth;
+    pending_run_limit_ = pending_depth == 0 ? admission_depth_ : pending_depth;
+    pending_run_limit_configured_ = pending_depth != 0;
     launch_depth_ = launch_depth;
 }
 
+void Orchestrator::note_endpoint_capacity(int32_t worker_id, uint32_t sets) {
+    if (sets == 0) return;
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    endpoint_capacity_[worker_id] = sets;
+}
+
+uint32_t Orchestrator::folded_endpoint_capacity_locked() const {
+    uint32_t folded = 0;
+    for (const auto &[worker_id, sets] : endpoint_capacity_) {
+        (void)worker_id;
+        if (folded == 0 || sets < folded) folded = sets;
+    }
+    return folded;
+}
+
+bool Orchestrator::apply_admissible_depth_locked(uint32_t sets) {
+    const uint32_t grant = run_resources_.granted();
+    if (grant == 0) return false;
+    const uint32_t clamped = sets == 0 ? 1u : (sets > grant ? grant : sets);
+    const bool widened = clamped > admission_depth_;
+    admission_depth_ = clamped;
+    if (!pending_run_limit_configured_) pending_run_limit_ = clamped;
+    return widened;
+}
+
+void Orchestrator::update_admissible_depth(uint32_t sets) {
+    bool widened = false;
+    {
+        std::lock_guard<std::mutex> lk(runs_mu_);
+        widened = apply_admissible_depth_locked(sets);
+    }
+    // A widening can make a run that is already queued leasable, and nothing
+    // else would announce that. A narrowing needs no notify: it only removes
+    // choices from the next acquisition, and the waiters it affects are already
+    // waiting on a queue that has to drain either way.
+    if (!widened) return;
+    bool leased = false;
+    {
+        std::lock_guard<std::mutex> lk(runs_mu_);
+        leased = refresh_leases_locked();
+    }
+    runs_cv_.notify_all();
+    if (leased && ready_notify_cb_) ready_notify_cb_();
+    activate_fifo_head();
+}
+
+uint32_t Orchestrator::admissible_depth() const {
+    std::lock_guard<std::mutex> lk(runs_mu_);
+    return admission_depth_;
+}
+
 bool Orchestrator::acquire_lease_locked(const std::shared_ptr<RunState> &run, bool *assigned) {
-    if (run->lease_released) return false;
     if (run_resources_.owns(run->lease)) return true;
     std::optional<PipelineSlotLease> lease = run_resources_.try_acquire(admission_depth_);
     if (!lease.has_value()) return false;
@@ -242,8 +298,11 @@ void Orchestrator::retire_terminal_run(const std::shared_ptr<RunState> &run) {
             run->lease_released = true;
             if (run->lease.generation != 0) run_resources_.release(run->lease);
         }
-        // `activate_fifo_head` below returns early while a run is active, which
-        // is exactly the case where a successor handed its lease back.
+        // Every endpoint task has reported before terminal retirement. Apply
+        // the fold under the same lock as FIFO removal, before leasing or
+        // waking a submitter; a smaller capacity must not admit on old proof.
+        const uint32_t folded_capacity = folded_endpoint_capacity_locked();
+        if (folded_capacity != 0) apply_admissible_depth_locked(folded_capacity);
         leased_a_successor = refresh_leases_locked();
         authorized_early_launch = refresh_early_launch_locked();
     }

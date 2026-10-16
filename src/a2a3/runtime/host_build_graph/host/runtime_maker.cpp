@@ -64,6 +64,7 @@
 #include "host_build_graph/host/dep_gen_host_graph.h"
 #include "host_build_graph/graph_execution.h"
 #include "host_build_graph/host/host_tensor_access.h"
+#include "host_build_graph/host/retained_prepare_plan.h"
 #include "host_build_graph/host/graph_host_state.h"
 #include "host_build_graph/host/host_phase_trace.h"
 #include "host_build_graph/host/orchestrator.h"
@@ -709,10 +710,119 @@ struct GraphHostStateBinding {
     OrchestratorState &orchestrator;
 };
 
+using HostPreparePlan = RetainedHostPreparePlan<RuntimeArenaLayout>;
+
+int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &plan) {
+    const auto &layout = plan.layout;
+    auto &host_arena = plan.host_arena;
+    void *host_sm = plan.host_sm;
+    const uint64_t task_capacity = plan.task_capacity;
+    const uint64_t heap_bytes = plan.heap_bytes;
+    const uint64_t image_bytes = plan.image_bytes;
+    const int32_t total_tasks = plan.total_tasks;
+    const auto &bind_usage = plan.bind_usage;
+    const uint64_t device_arena_bytes = layout.off_copied_end + image_bytes;
+    const BindPhaseMark static_arena_phase = bind_phase_begin();
+    runtime->dev.sm_image_bytes = image_bytes;
+    if (const int rc = api->setup_static_arena(heap_bytes, /*gm_sm_size=*/0, device_arena_bytes); rc != 0) {
+        return rc;
+    }
+    {
+        char attrs[kBindAttrsCapacity];
+        snprintf(attrs, sizeof(attrs), "heap=%" PRIu64 " arena=%" PRIu64, heap_bytes, device_arena_bytes);
+        record_bind_phase(HostPhaseKind::BindStaticArena, static_arena_phase, attrs);
+    }
+
+    const BindPhaseMark sm_phase = bind_phase_begin();
+    void *device_arena = api->acquire_pooled_runtime_arena();
+    if (device_arena == nullptr) {
+        LOG_ERROR("%s", "host-orch: failed to acquire the pooled runtime arena");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    char *arena_dev = static_cast<char *>(device_arena);
+    void *device_sm = arena_dev + layout.off_copied_end;
+    runtime->set_gm_sm_ptr(device_sm);
+    {
+        char attrs[kBindAttrsCapacity];
+        snprintf(attrs, sizeof(attrs), "bytes=%" PRIu64, image_bytes);
+        record_bind_phase(HostPhaseKind::BindSharedMem, sm_phase, attrs, image_bytes);
+    }
+
+    const BindPhaseMark heap_phase = bind_phase_begin();
+    void *gm_heap = api->acquire_pooled_gm_heap();
+    record_bind_phase(HostPhaseKind::BindGmHeap, heap_phase);
+    if (gm_heap == nullptr) {
+        LOG_ERROR("host-orch: failed to acquire the pooled GM heap");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    // The virtual heap window sits above every device address, which is what keeps
+    // a real address from being mistaken for one the rebase has to move. Device
+    // memory is the only source of addresses this pass cannot inspect one by one,
+    // so its base is checked here.
+    always_assert(
+        reinterpret_cast<uint64_t>(gm_heap) < HEAP_VIRTUAL_BASE && "device memory reaches into the virtual heap window"
+    );
+    // The alignment bind_graph_definitions checked on the virtual base — a Graph
+    // task's runtime storage must land on alignof(ChipTaskStorage) — carries to
+    // the real base only while the two are congruent: both are aligned to
+    // kDefaultBaseAlign, and that covers the storage's own requirement.
+    static_assert(
+        HEAP_VIRTUAL_BASE % DeviceArena::kDefaultBaseAlign == 0,
+        "the virtual heap base must share the committed region's alignment"
+    );
+    static_assert(
+        alignof(ChipTaskStorage) <= DeviceArena::kDefaultBaseAlign,
+        "a sub-task's storage alignment must be covered by the heap region's base alignment"
+    );
+    always_assert(reinterpret_cast<uint64_t>(gm_heap) % DeviceArena::kDefaultBaseAlign == 0);
+    const sm_layout::HeapRebase heap_rebase{reinterpret_cast<uint64_t>(gm_heap), heap_bytes};
+
+    // One host source for one copy: the copied zone and shared-memory image at
+    // exactly the offsets they occupy on the device.
+    // Over-allocated and rounded up because every segment offset is
+    // CHIP_ALIGN_SIZE-aligned and ChipTaskSlotState is alignas(64), which a byte
+    // vector's data() is not.
+    const uint64_t copied_bytes = layout.off_copied_end - layout.off_copied_begin;
+    const uint64_t upload_bytes = copied_bytes + image_bytes;
+    // Assembled in staging the runner retains rather than in a buffer that dies
+    // with this frame: publication is a separate step, so the bytes have to still
+    // be here when it reads them. Over-allocated by the alignment the layout
+    // needs, and handed over uninitialized: what this bind writes are the copied
+    // zone and the live segments `compact_live_image` emits, so the alignment gaps
+    // between segments carry whatever the block last held. No device code reads a
+    // gap — every reader indexes a segment through the layout — which is what makes
+    // clearing the whole block per bind unnecessary rather than merely expensive.
+    void *staging_addr = nullptr;
+    if (api->acquire_run_image_staging(static_cast<size_t>(upload_bytes), CHIP_ALIGN_SIZE, &staging_addr) != 0 ||
+        staging_addr == nullptr) {
+        LOG_ERROR("host-orch: staging for a %" PRIu64 "-byte runtime image is unavailable", upload_bytes);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    char *upload_base = static_cast<char *>(staging_addr);
+
+    // The copied zone carries no host address by construction: the orchestrator and
+    // the ops table live on the host-side OrchContext, which never enters this image.
+    std::memcpy(upload_base, static_cast<const char *>(host_arena.base()) + layout.off_copied_begin, copied_bytes);
+    const uint64_t compacted = sm_layout::compact_live_image(
+        static_cast<const char *>(host_sm), task_capacity, bind_usage, heap_rebase, upload_base + copied_bytes
+    );
+    always_assert(compacted == image_bytes);
+
+    // Prepared, not published: `publish_run_image_impl` performs this write, and
+    // records the BindArenaH2d segment that measures it. The pool counters travel
+    // with the record because only this bind knows them; the rest of that
+    // segment's attributes the publication rebuilds from `dev` and the length.
+    runtime->set_pending_publication(
+        arena_dev + layout.off_copied_begin, upload_base, upload_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
+        bind_usage.scalar_elems
+    );
+    return total_tasks;
+}
+
 int32_t run_host_orchestration(
     Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, RuntimeContext *rt,
     DeviceArena &host_arena, const RuntimeArenaLayout &layout, uint64_t sm_size, uint64_t task_capacity,
-    void *host_orch_func_ptr, const ChipTaskArgs &orch_l2
+    void *host_orch_func_ptr, const ChipTaskArgs &orch_l2, HostPreparePlan &plan
 ) {
     // The dep_gen graph belongs to the orchestration that is about to run.
     dep_gen_host_graph_begin_capture();
@@ -970,10 +1080,8 @@ int32_t run_host_orchestration(
     // region and short-circuits a request an existing one already covers, so a
     // repeated workload pays for neither twice and the heap is grow-only across a
     // Worker's binds.
-    const BindPhaseMark static_arena_phase = bind_phase_begin();
     // The compact shared-memory image is the only per-run tail in the device
     // arena. GraphExecution is initialized later in each outer Graph heap.
-    const uint64_t device_arena_bytes = layout.off_copied_end + image_bytes;
     // A graph whose every output is caller-owned allocates nothing, but its tasks
     // still carry the window's base as their zero-length packed buffer, so the
     // region has to exist for that address to be rebasable. Asking for 0 would
@@ -987,103 +1095,58 @@ int32_t run_host_orchestration(
         std::max<uint64_t>(orchestrator.task_allocator.heap_used_bytes(), CHIP_ALIGN_SIZE),
         DeviceArena::kDefaultBaseAlign
     );
-    if (api->setup_static_arena(heap_bytes, /*gm_sm_size=*/0, device_arena_bytes) != 0) {
-        LOG_ERROR(
-            "host-orch: failed to commit %" PRIu64 " bytes of graph heap + %" PRIu64 " bytes of device runtime arena",
-            heap_bytes, device_arena_bytes
-        );
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    {
-        char attrs[kBindAttrsCapacity];
-        snprintf(attrs, sizeof(attrs), "heap=%" PRIu64 " arena=%" PRIu64, heap_bytes, device_arena_bytes);
-        record_bind_phase(HostPhaseKind::BindStaticArena, static_arena_phase, attrs);
-    }
-
-    const BindPhaseMark sm_phase = bind_phase_begin();
-    void *device_arena = api->acquire_pooled_runtime_arena();
-    if (device_arena == nullptr) {
-        LOG_ERROR("%s", "host-orch: failed to acquire the pooled runtime arena");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    char *arena_dev = static_cast<char *>(device_arena);
-    void *device_sm = arena_dev + layout.off_copied_end;
-    runtime->set_gm_sm_ptr(device_sm);
-    {
-        char attrs[kBindAttrsCapacity];
-        snprintf(attrs, sizeof(attrs), "bytes=%" PRIu64, image_bytes);
-        record_bind_phase(HostPhaseKind::BindSharedMem, sm_phase, attrs, image_bytes);
-    }
-
-    const BindPhaseMark heap_phase = bind_phase_begin();
-    void *gm_heap = api->acquire_pooled_gm_heap();
-    record_bind_phase(HostPhaseKind::BindGmHeap, heap_phase);
-    if (gm_heap == nullptr) {
-        LOG_ERROR("host-orch: failed to acquire the pooled GM heap");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    // The virtual heap window sits above every device address, which is what keeps
-    // a real address from being mistaken for one the rebase has to move. Device
-    // memory is the only source of addresses this pass cannot inspect one by one,
-    // so its base is checked here.
-    always_assert(
-        reinterpret_cast<uint64_t>(gm_heap) < HEAP_VIRTUAL_BASE && "device memory reaches into the virtual heap window"
-    );
-    // The alignment bind_graph_definitions checked on the virtual base — a Graph
-    // task's runtime storage must land on alignof(ChipTaskStorage) — carries to
-    // the real base only while the two are congruent: both are aligned to
-    // kDefaultBaseAlign, and that covers the storage's own requirement.
-    static_assert(
-        HEAP_VIRTUAL_BASE % DeviceArena::kDefaultBaseAlign == 0,
-        "the virtual heap base must share the committed region's alignment"
-    );
-    static_assert(
-        alignof(ChipTaskStorage) <= DeviceArena::kDefaultBaseAlign,
-        "a sub-task's storage alignment must be covered by the heap region's base alignment"
-    );
-    always_assert(reinterpret_cast<uint64_t>(gm_heap) % DeviceArena::kDefaultBaseAlign == 0);
-    const sm_layout::HeapRebase heap_rebase{reinterpret_cast<uint64_t>(gm_heap), heap_bytes};
-
-    // One host source for one copy: the copied zone and shared-memory image at
-    // exactly the offsets they occupy on the device.
-    // Over-allocated and rounded up because every segment offset is
-    // CHIP_ALIGN_SIZE-aligned and ChipTaskSlotState is alignas(64), which a byte
-    // vector's data() is not.
-    const uint64_t copied_bytes = layout.off_copied_end - layout.off_copied_begin;
-    const uint64_t upload_bytes = copied_bytes + image_bytes;
-    // Assembled in staging the runner retains rather than in a buffer that dies
-    // with this frame: publication is a separate step, so the bytes have to still
-    // be here when it reads them. Over-allocated by the alignment the layout
-    // needs, and handed over uninitialized: what this bind writes are the copied
-    // zone and the live segments `compact_live_image` emits, so the alignment gaps
-    // between segments carry whatever the block last held. No device code reads a
-    // gap — every reader indexes a segment through the layout — which is what makes
-    // clearing the whole block per bind unnecessary rather than merely expensive.
-    void *staging_addr = nullptr;
-    if (api->acquire_run_image_staging(static_cast<size_t>(upload_bytes), CHIP_ALIGN_SIZE, &staging_addr) != 0 ||
-        staging_addr == nullptr) {
-        LOG_ERROR("host-orch: staging for a %" PRIu64 "-byte runtime image is unavailable", upload_bytes);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    char *upload_base = static_cast<char *>(staging_addr);
-
-    // The copied zone carries no host address by construction: the orchestrator and
-    // the ops table live on the host-side OrchContext, which never enters this image.
-    std::memcpy(upload_base, static_cast<const char *>(host_arena.base()) + layout.off_copied_begin, copied_bytes);
-    const uint64_t compacted = sm_layout::compact_live_image(
-        static_cast<const char *>(host_sm), task_capacity, bind_usage, heap_rebase, upload_base + copied_bytes
-    );
-    always_assert(compacted == image_bytes);
-
-    // Prepared, not published: `publish_run_image_impl` performs this write, and
-    // records the BindArenaH2d segment that measures it. The pool counters travel
-    // with the record because only this bind knows them; the rest of that
-    // segment's attributes the publication rebuilds from `dev` and the length.
-    runtime->set_pending_publication(
-        arena_dev + layout.off_copied_begin, upload_base, upload_bytes, bind_usage.fanin_elems, bind_usage.tensor_elems,
-        bind_usage.scalar_elems
-    );
+    plan.host_sm = host_sm;
+    plan.sm_size = sm_size;
+    plan.task_capacity = task_capacity;
+    plan.heap_bytes = heap_bytes;
+    plan.image_bytes = image_bytes;
+    plan.total_tasks = total_tasks;
+    plan.bind_usage = bind_usage;
     return total_tasks;
+}
+
+// Re-enter only the resource commit. The callback and HOST copies have already
+// completed, and their outputs stay owned by the slot while it waits.
+int resume_host_plan(Runtime *runtime, const HostApi *api, const std::shared_ptr<HostPreparePlan> &plan) {
+    if (plan->committed) return PTO_RUNTIME_ERR_INTERNAL;
+    api->set_prepare_plan(plan);
+    plan->resume(*runtime);
+    host_phase_trace_note_submitted(static_cast<uint64_t>(plan->total_tasks));
+    if (plan->staging_bytes != 0) {
+        void *staging = nullptr;
+        size_t capacity = 0;
+        api->get_retained_temp_buffer(&staging, &capacity);
+        // Device addresses are baked into the callback's graph. Its stamped
+        // slot excludes trim, so this is a current-epoch reference, never a grow.
+        if (staging != plan->staging_backing || capacity < plan->staging_bytes) return PTO_RUNTIME_ERR_INTERNAL;
+        const int rc = api->acquire_retained_temp(plan->staging_bytes, &staging, &capacity);
+        if (rc != 0) {
+            if (rc == SIMPLER_RUNTIME_ERR_RESOURCE_WAIT) {
+                if (api->get_prepare_plan() != plan) return SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE;
+                plan->park(*runtime);
+            }
+            return rc;
+        }
+        if (staging != plan->staging_backing || capacity < plan->staging_bytes) return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    const int32_t result = commit_host_plan(runtime, api, *plan);
+    if (result == SIMPLER_RUNTIME_ERR_RESOURCE_WAIT) {
+        // A backend without retained-plan support must fail rather than invoke
+        // an already completed callback again on the caller's retry.
+        if (api->get_prepare_plan() != plan) return SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE;
+        plan->park(*runtime);
+        return result;
+    }
+    if (result < 0) return result;
+    runtime->dev.host_total_tasks = result;
+    void *device_arena = api->acquire_pooled_runtime_arena();
+    if (device_arena == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    runtime->set_prebuilt_arena(device_arena, plan->layout.off_runtime);
+    plan->committed = true;
+    if (api->get_prepare_plan() != plan) {
+        dep_gen_host_graph_restore_for_export(&plan->diagnostic_graph, plan->diagnostic_outcome);
+    }
+    return 0;
 }
 
 }  // namespace
@@ -1262,6 +1325,15 @@ extern "C" int bind_callable_to_runtime_impl(
     int scalar_count = orch_args->scalar_count();
     LOG_INFO("RT2 bind: %d tensors + %d scalars, host orchestration mode", tensor_count, scalar_count);
 
+    if (auto saved = api->get_prepare_plan()) {
+        const auto plan = std::static_pointer_cast<HostPreparePlan>(saved);
+        if (plan->committed) return PTO_RUNTIME_ERR_INTERNAL;
+        host_phase_trace_begin(api);
+        const int rc = resume_host_plan(runtime, api, plan);
+        if (rc != 0) host_phase_trace_end(api);
+        return rc;
+    }
+
     // Rebinding an unpublished run must not replace its source or device owners.
     if (runtime->pending_publication().bytes != 0 || !runtime->pending_publication().prerequisites.empty()) {
         LOG_ERROR("bind_callable_to_runtime_impl: unpublished metadata still belongs to this run");
@@ -1329,9 +1401,8 @@ extern "C" int bind_callable_to_runtime_impl(
     const BindPhaseMark args_phase = bind_phase_begin();
     RetainedTempBump bump;
     const size_t required_temp_bytes = packed_temp_bytes(orch_args);
-    if (!bump.begin(api, required_temp_bytes)) {
-        LOG_ERROR("Retained temp buffer grow failed: required bytes %zu", required_temp_bytes);
-        return PTO_RUNTIME_ERR_INTERNAL;
+    if (const int rc = bump.begin_status(api, required_temp_bytes); rc != 0) {
+        return rc;
     }
     uint64_t h2d_bytes = 0;
     int h2d_tensors = 0;
@@ -1445,8 +1516,13 @@ extern "C" int bind_callable_to_runtime_impl(
     uint64_t sm_size = SharedMemoryHandle::calculate_size(task_capacity);
 
     const BindPhaseMark arena_build_phase = bind_phase_begin();
-    DeviceArena host_arena;
-    RuntimeArenaLayout layout = runtime_reserve_layout(host_arena, task_capacity);
+    auto plan = std::make_shared<HostPreparePlan>();
+    plan->staging_bytes = required_temp_bytes == 0 ? 0 : required_temp_bytes + RetainedTempBump::kAlignment - 1;
+    size_t staging_capacity = 0;
+    api->get_retained_temp_buffer(&plan->staging_backing, &staging_capacity);
+    DeviceArena &host_arena = plan->host_arena;
+    RuntimeArenaLayout &layout = plan->layout;
+    layout = runtime_reserve_layout(host_arena, task_capacity);
     if (host_arena.commit(DeviceArena::kDefaultBaseAlign) == nullptr) {
         LOG_ERROR("Failed to commit host arena for prebuilt runtime image");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1517,7 +1593,8 @@ extern "C" int bind_callable_to_runtime_impl(
         ChipTaskArgs orch_l2;
         orch_l2.create_from_entry_storage(runtime->get_orch_args());
         int32_t total_tasks = run_host_orchestration(
-            runtime, api, tensor_access, rt, host_arena, layout, sm_size, task_capacity, host_orch_func_ptr, orch_l2
+            runtime, api, tensor_access, rt, host_arena, layout, sm_size, task_capacity, host_orch_func_ptr, orch_l2,
+            *plan
         );
         const BindPhaseMark view_close_phase = bind_phase_begin();
         tensor_access.close();
@@ -1530,14 +1607,10 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_INFO("host-orch: submitted %d tasks on host", total_tasks);
     }
 
-    // Orchestration is what committed the device region, sized to cover its
-    // shared-memory tail, so this is the first point at which its base exists.
-    void *runtime_arena_dev = api->acquire_pooled_runtime_arena();
-    if (runtime_arena_dev == nullptr) {
-        LOG_ERROR("%s", "Failed to acquire the pooled runtime arena after orchestration");
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    runtime->set_prebuilt_arena(runtime_arena_dev, layout.off_runtime);
+    plan->diagnostic_outcome = dep_gen_host_graph_take(&plan->diagnostic_graph);
+    plan->park(*runtime);
+    const int commit_rc = resume_host_plan(runtime, api, plan);
+    if (commit_rc != 0) return commit_rc;
 
     LOG_INFO("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
 
@@ -1595,6 +1668,12 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
             publication.fanin_elems, publication.tensor_elems, publication.scalar_elems
         );
         record_bind_phase(HostPhaseKind::BindArenaH2d, h2d_phase, attrs, publication.bytes);
+    }
+    if (auto saved = api->get_prepare_plan()) {
+        // Keep diagnostics owned by the plan until publication succeeds. An
+        // unpublished abort or failed copy must not strand its graph in TLS.
+        const auto plan = std::static_pointer_cast<HostPreparePlan>(saved);
+        dep_gen_host_graph_restore_for_export(&plan->diagnostic_graph, plan->diagnostic_outcome);
     }
     return 0;
 }

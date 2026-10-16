@@ -3940,6 +3940,22 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro("pipeline_depth", &ChipWorker::pipeline_depth)
         .def_prop_ro("runtime_slot_count", &ChipWorker::runtime_slot_count)
+        .def(
+            "_enable_automatic_admission", &ChipWorker::enable_automatic_admission,
+            "Let this worker's device context size its own run concurrency from the resources it "
+            "proves. False when the loaded module or the context cannot, in which case the worker "
+            "keeps admitting exactly what it was granted."
+        )
+        .def_prop_ro(
+            "automatic_admission", &ChipWorker::automatic_admission,
+            "Whether this worker's context sizes its own run concurrency."
+        )
+        .def_prop_ro(
+            "admissible_run_resource_sets", &ChipWorker::admissible_run_resource_sets,
+            "Run-resource sets this context reports it can hold right now: a count of identities, "
+            "never a byte figure. One until a run has completed its resource commit; the granted "
+            "count on a context that does not size itself."
+        )
         .def_prop_ro(
             "supports_concurrent_native_prepare", &ChipWorker::supports_concurrent_native_prepare,
             "Whether non-diagnostic native preparation may overlap one active run in another slot."

@@ -65,6 +65,8 @@ constexpr size_t kAlign = 1024;
 size_t align_up(size_t value, size_t alignment) { return (value + alignment - 1) & ~(alignment - 1); }
 
 struct FakeHostApi {
+    int staging_status = 0;
+    int arena_status = 0;
     int device_malloc_count = 0;
     int device_free_count = 0;
     int copy_to_count = 0;
@@ -196,6 +198,7 @@ int fake_setup_static_arena(
     void * /*runner_ctx*/, uint32_t /*arena_bank*/, size_t gm_heap_size, size_t gm_sm_size, size_t runtime_arena_size
 ) {
     ++g_fake->setup_static_arena_count;
+    if (g_fake->arena_status != 0) return g_fake->arena_status;
     g_fake->gm_heap.assign(gm_heap_size, 0);
     g_fake->gm_sm.assign(gm_sm_size, 0);
     g_fake->runtime_arena.assign(runtime_arena_size, 0);
@@ -286,6 +289,7 @@ fake_get_run_result(void * /*runner_ctx*/, uint32_t /*pipeline_slot*/, uint64_t 
 int fake_acquire_retained_temp(
     void *runner_ctx, uint32_t pipeline_slot, size_t bytes, void **addr_out, size_t *size_out
 ) {
+    if (g_fake->staging_status != 0) return g_fake->staging_status;
     fake_get_retained_temp_buffer(runner_ctx, pipeline_slot, addr_out, size_out);
     if (bytes == 0 || bytes <= *size_out) return 0;
     if (*addr_out != nullptr) fake_device_free(runner_ctx, *addr_out);
@@ -294,7 +298,7 @@ int fake_acquire_retained_temp(
     if (grown == nullptr) {
         *addr_out = nullptr;
         *size_out = 0;
-        return -1;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
     *addr_out = grown;
     *size_out = bytes;
@@ -1259,4 +1263,21 @@ TEST_F(TrbRuntimeTempBufferTest, AcceptsOverlappingReadOnlyH2dCopies) {
     args.add_tensor(tensor);
     const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::IN};
     EXPECT_EQ(bind_runtime(runtime, api_, args, sig, 2), 0);
+}
+
+TEST_F(TrbRuntimeTempBufferTest, ManagedResourceStatusesSurviveBothAdapterBridges) {
+    for (int status : {SIMPLER_RUNTIME_ERR_RESOURCE_WAIT, SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE}) {
+        Runtime runtime = make_runtime();
+        ChipStorageTaskArgs empty_args;
+        fake_.arena_status = status;
+        EXPECT_EQ(bind_runtime(runtime, api_, empty_args, nullptr, 0), status);
+        EXPECT_EQ(fake_.copy_to_count, 0);
+        fake_.arena_status = 0;
+        fake_.staging_status = status;
+        ChipStorageTaskArgs host_args;
+        host_args.add_tensor(null_source_tensor(16));
+        const ArgDirection signature[] = {ArgDirection::IN};
+        EXPECT_EQ(bind_runtime(runtime, api_, host_args, signature, 1), status);
+        EXPECT_EQ(fake_.copy_to_count, 0);
+    }
 }

@@ -146,6 +146,12 @@ void Scheduler::stop() {
 
 void Scheduler::worker_done(WorkerCompletion completion) {
     TaskSlotState &s = *cfg_.ring->slot_state(completion.task_slot);
+    // Recorded here, where the endpoint identity is still in hand, and applied
+    // when the whole run retires. This is a capacity report, not a task
+    // outcome, so it is taken whatever the outcome below turns out to be.
+    if (completion.admissible_run_resource_sets != 0 && cfg_.note_endpoint_capacity_cb) {
+        cfg_.note_endpoint_capacity_cb(completion.worker_id, completion.admissible_run_resource_sets);
+    }
     bool failure_reported = is_failure(completion.outcome);
     if (failure_reported && cfg_.on_task_failed_cb) {
         cfg_.on_task_failed_cb(completion.task_slot, completion.error_message);

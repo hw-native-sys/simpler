@@ -110,6 +110,12 @@ public:
         std::function<RunId()> early_launch_run_cb;
         // Called when a task reaches CONSUMED (TensorMap cleanup + ring release).
         std::function<void(TaskSlot)> on_consumed_cb;
+        /**
+         * What one endpoint reports it can hold, taken where that endpoint's
+         * identity is still in hand. Optional: unset on every route whose
+         * endpoints do not size themselves.
+         */
+        std::function<void(int32_t, uint32_t)> note_endpoint_capacity_cb;
         // Called as soon as an endpoint reports failure so the error is
         // attached to the task's run even when a group has other members live.
         std::function<void(TaskSlot, const std::string &)> on_task_failed_cb;

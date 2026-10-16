@@ -328,6 +328,16 @@ void ChipWorker::init(
         }
         set_workspace_budget_fn_ =
             reinterpret_cast<SimplerSetWorkspaceBudgetFn>(dlsym(handle, "simpler_set_workspace_budget_ctx"));
+        // Automatic admission, resolved by name for the same reason as the
+        // entries above: a module built without them cannot size itself, and a
+        // caller that never asks for it never looks for them.
+        enable_automatic_admission_fn_ = reinterpret_cast<SimplerEnableAutomaticAdmissionFn>(
+            dlsym(handle, "simpler_enable_automatic_admission_ctx")
+        );
+        admissible_run_resource_sets_fn_ = reinterpret_cast<SimplerAdmissibleRunResourceSetsFn>(
+            dlsym(handle, "simpler_admissible_run_resource_sets_ctx")
+        );
+        abort_run_plan_fn_ = reinterpret_cast<SimplerAbortRunPlanFn>(dlsym(handle, "simpler_abort_run_plan_ctx"));
         enable_workspace_management_fn_ = reinterpret_cast<SimplerEnableWorkspaceManagementFn>(
             dlsym(handle, "simpler_enable_workspace_management_ctx")
         );
@@ -794,6 +804,7 @@ void ChipWorker::clear_runtime_binding() {
     // latch is resolved and must not outlive the generation that set it.
     workspace_managed_ = false;
     workspace_limit_latched_ = false;
+    automatic_admission_ = false;
     set_workspace_budget_fn_ = nullptr;
     enable_workspace_management_fn_ = nullptr;
     get_workspace_report_fn_ = nullptr;
@@ -937,6 +948,31 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_for_lane(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
         pipeline_leased, provenance
     );
+}
+
+bool ChipWorker::enable_automatic_admission() {
+    if (!initialized_ || device_ctx_ == nullptr) return false;
+    if (automatic_admission_) return true;
+    if (enable_automatic_admission_fn_ == nullptr) return false;
+    automatic_admission_ = enable_automatic_admission_fn_(device_ctx_) == 0;
+    return automatic_admission_;
+}
+
+uint32_t ChipWorker::admissible_run_resource_sets() const {
+    if (!automatic_admission_ || admissible_run_resource_sets_fn_ == nullptr || device_ctx_ == nullptr) {
+        return pipeline_contract_.pipeline_depth;
+    }
+    const uint32_t reported = admissible_run_resource_sets_fn_(device_ctx_);
+    // A context always holds the run it is executing, and it can never hold
+    // more sets than it was granted: a report outside that is not a capacity
+    // this worker can act on.
+    if (reported == 0) return 1;
+    return reported > pipeline_contract_.pipeline_depth ? pipeline_contract_.pipeline_depth : reported;
+}
+
+int ChipWorker::abort_run_plan(uint32_t pipeline_slot, uint64_t run_epoch) {
+    if (!automatic_admission_ || abort_run_plan_fn_ == nullptr || device_ctx_ == nullptr) return 0;
+    return abort_run_plan_fn_(device_ctx_, pipeline_slot, run_epoch);
 }
 
 bool ChipWorker::supports_concurrent_native_prepare() const {
@@ -1091,6 +1127,12 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         if (rc == PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE) {
             throw PreparedRunIncompatible(
                 "native prepare requires depth-one fallback " + format_native_run_identity(run_identity)
+            );
+        }
+        if (rc == SIMPLER_RUNTIME_ERR_RESOURCE_WAIT) {
+            throw PreparedRunResourceWait(
+                "native prepare is waiting for run resources a live consumer still holds " +
+                format_native_run_identity(run_identity)
             );
         }
         throw std::runtime_error(

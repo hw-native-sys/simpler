@@ -10,8 +10,11 @@
 """`Worker(pipeline_depth=...)`: the request for native run-resource sets, and where it is honoured.
 
 One set holds everything a run owns while it is in flight, so this bounds how many runs may be
-prepared and accepted by the device at once. The default request is two, which is what every
-backend granted before the key existed — raising a runtime's published maximum must not move it.
+prepared and accepted by the device at once. An explicit request is two by default, which is what
+every backend granted before the key existed — raising a runtime's published maximum must not
+move it. A route that sets nothing *and* owns its own admission asks for the identity directory
+instead, because its endpoints measure what they can hold; the capacity admitted still starts at
+one, so the two numbers are separate and both are checked below.
 
 Three things are checked here: the constructor's validation, the default, and the provenance in
 which a larger request is carried to the children at all. Most need no Worker started; the two
@@ -23,6 +26,7 @@ import time
 
 import pytest
 from simpler.worker import (
+    _AUTOMATIC_IDENTITY_DIRECTORY_SETS,
     _DEFAULT_PIPELINE_DEPTH_REQUEST,
     _UINT32_MAX,
     RemoteWorkerSpec,
@@ -279,15 +283,41 @@ def test_a_startup_with_a_deadline_is_not_its_own_root(monkeypatch):
 
 @pytest.mark.parametrize(
     "overrides",
-    [{"level": 4}, {"num_sub_workers": 1}, {"device_ids": [0, 1]}, {"platform": "a2a3sim"}],
-    ids=["level4", "sub_workers", "two_endpoints", "sim"],
+    [{"level": 4}, {"platform": "a2a3sim"}],
+    ids=["level4", "sim"],
 )
 def test_those_same_routes_ask_for_the_default_when_nothing_was_requested(overrides):
-    # The unset key never fails a route: it asks for what that route always granted.
+    # The unset key never fails a route: it asks for what that route always granted. Neither of
+    # these lets its endpoints size their own concurrency — a level-4 parent does not own the
+    # admission its endpoints would report to, and a simulated backend has no workspace owner to
+    # measure against — so both keep the standing default.
     config = {"level": 3, "platform": "a2a3", "runtime": "host_build_graph", "device_ids": [0]}
     config.update(overrides)
     worker = Worker(**config)
+    assert worker._automatic_admission_requested is False
     assert worker._requested_chip_pipeline_depth() == _DEFAULT_PIPELINE_DEPTH_REQUEST
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [{}, {"num_sub_workers": 1}, {"device_ids": [0, 1]}],
+    ids=["one_endpoint", "sub_workers", "two_endpoints"],
+)
+def test_an_unset_key_on_a_measuring_route_asks_for_the_identity_directory(overrides):
+    """Still never a failure, but no longer the old fixed default.
+
+    Each of these is a level-3 root of its own startup on an onboard platform, so its endpoints
+    measure what they can hold. What the request sizes is the identity *directory* — how many
+    runs may ever be named, which costs one ~384 B table entry each and no device memory — while
+    the capacity actually admitted starts at one and grows only as a resource commit proves a
+    set. A second endpoint and a sub-worker change neither answer: each endpoint owns its own
+    grant and its own mailbox.
+    """
+    config = {"level": 3, "platform": "a2a3", "runtime": "host_build_graph", "device_ids": [0]}
+    config.update(overrides)
+    worker = Worker(**config)
+    assert worker._automatic_admission_requested is True
+    assert worker._requested_chip_pipeline_depth() == _AUTOMATIC_IDENTITY_DIRECTORY_SETS
 
 
 def test_an_attached_child_asks_for_the_default_when_nothing_was_requested():

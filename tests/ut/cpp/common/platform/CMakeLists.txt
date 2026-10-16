@@ -59,6 +59,12 @@ endmacro()
 platform_single_case(test_kernel_execution_state.cpp
     SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_execution_state.cpp)
 
+# The growth coordinator is production: the onboard host runtime links this
+# same translation unit, so the trim, the retry policy and the holder discovery
+# under test are the ones the device runner calls rather than a copy of them.
+platform_single_case(test_run_resource_trim.cpp
+    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/run_resource_growth.cpp)
+
 platform_single_case(test_callable_diagnostics.cpp
     SOURCES ${HOST_LOG_TEST_SOURCES}
     INCLUDES ${SIMPLER_LOG_DIR})
@@ -331,6 +337,7 @@ set(SIM_CALLABLE_POOL_SOURCES
 set(SIM_CALLABLE_POOL_INCLUDES
     ${SIMPLER_COMMON_PLATFORM_DIR}/sim/host
     ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context
+    ${SIMPLER_SRC}/common/log
     ${SIMPLER_SRC}/common/worker)
 
 hbg_case(test_sim_callable_pool.cpp
@@ -571,6 +578,51 @@ platform_case(test_chip_swimlane_aicore.cpp PER_ARCH PER_RUNTIME BARE
         # shadow anything the arch directories above own.
         ${SIMPLER_SRC}/common/task_interface)
 
+# The allocation/copy/attachment transport is CPU-backed; every ownership layer
+# above it is the onboard production implementation, including native prepare.
+file(GLOB NATIVE_ADMISSION_SHARED_HOST CONFIGURE_DEPENDS
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/*.cpp)
+set(NATIVE_ADMISSION_SOURCES
+    ${CMAKE_SOURCE_DIR}/support/native_admission/transport.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_base.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/c_api_shared.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_helpers.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_persistent_args.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_phase_capture.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/run_retention_probe.cpp
+    ${SIMPLER_SRC}/@arch@/platform/onboard/host/memory_allocator.cpp
+    ${NATIVE_ADMISSION_SHARED_HOST}
+    ${SIMPLER_SRC}/@arch@/platform/shared/host/pmu_collector.cpp
+    ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp
+    ${SIMPLER_SRC}/common/platform_comm/comm_sim.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context/cpu_sim_context.cpp
+    ${SIMPLER_SRC}/common/log/host_log.cpp)
+set(NATIVE_ADMISSION_INCLUDES
+    ${CMAKE_SOURCE_DIR}/support/native_admission
+    ${CMAKE_SOURCE_DIR}/support/kernel_args
+    ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host
+    ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context
+    ${SIMPLER_SRC}/common/log
+    ${SIMPLER_SRC}/common/worker)
+hbg_case(test_native_admission.cpp
+    SOURCES ${NATIVE_ADMISSION_SOURCES}
+        ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/host/runtime_maker.cpp
+        ${_hbg_orch_host_sources}
+        ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
+        ${HBG_HOST_DIR}/host_phase_trace.cpp
+        ${HBG_SHARED_RUNTIME_SOURCES}
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+    INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
+    DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
+    LINK @arch@_ut_support ${CMAKE_DL_LIBS})
+tmr_case(test_native_admission.cpp
+    SOURCES ${NATIVE_ADMISSION_SOURCES}
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+    INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
+    DEFINES SIMPLER_UT_TRB_RUNTIME SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
+    LINK @arch@_ut_support ${CMAKE_DL_LIBS})
+
 # ---------------------------------------------------------------------------
 # Cases reaching neither the arch platform tree nor any runtime's image, so one
 # build is every build. They are named here rather than swept up by a default,
@@ -582,6 +634,7 @@ platform_case(test_chip_swimlane_aicore.cpp PER_ARCH PER_RUNTIME BARE
 simpler_ut_cases(platform_single_case
     test_acl_hal_device.cpp
     test_arena_replacement_transaction.cpp
+    test_auto_admission.cpp
     test_caller_device_buffers.cpp
     test_context_lifecycle.cpp
     test_device_fault_monitor.cpp

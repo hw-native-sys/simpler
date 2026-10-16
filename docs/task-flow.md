@@ -255,10 +255,13 @@ consumes the resulting POD and invokes the runtime's execution lifecycle.
 
 Every runtime declares no `pipeline_depth` limit of its own: the declaration
 says what the runtime can support, and how much of it a context uses is the
-grant that context was given — `Worker(pipeline_depth=N)`, defaulting to two.
-Each owner of a per-run resource is built to the grant, so a declaration costs
-nothing until a run holds a set. The contract determines the concrete copy count
-rather than permitting concurrent device execution by itself:
+grant that context was given. A caller may state that grant —
+`Worker(pipeline_depth=N)` — and an unconfigured local level-3 Worker on an
+onboard program backend instead lets its endpoints measure it (see
+[Automatic run admission](#automatic-run-admission)). Each owner of a per-run
+resource is built to the grant, so a declaration costs nothing until a run holds
+a set. The contract determines the concrete copy count rather than permitting
+concurrent device execution by itself:
 
 | Resource class | Copies | Selection |
 | -------------- | -----: | --------- |
@@ -273,6 +276,111 @@ exactly the granted count and reports the three counts that always partition it
 — free, live, and quarantined. A set whose run could not prove what it left
 behind is quarantined: never reused, and still counted against the grant, so a
 context cannot acquire more concurrency by failing.
+
+#### Automatic run admission
+
+A local level-3 `Worker` with direct device endpoints on an onboard program backend that configured no
+`pipeline_depth`, `pending_run_depth`, `launch_depth` or
+`workspace_budget_bytes`, and that is the root of its own startup, lets its
+endpoints size their own concurrency. Every other shape — an explicit
+configuration, a level-2 Worker, a nested level-3 child, a remote- or
+MPI-hosted inner Worker, a kernel or borrowed context, and any simulated
+platform or a root without local devices — keeps its existing behaviour. The simulated
+exclusion is the parent's and not the endpoint's, because this decision sizes
+the mailbox entry table and seeds the FIFO bound before any child reports
+anything.
+
+Two numbers, and keeping them apart is the point:
+
+- the **identity directory** is how many runs may ever be *named*. It comes
+  from a 64 KiB budget on the mailbox's run-state entry table, so it is
+  `64 KiB / MAILBOX_RUN_ENTRY_STRIDE − MAILBOX_REQUEST_FRAMES` identities. An
+  identity costs one table entry and no device memory. It is finite and
+  internal: reaching it backpressures like any other bound.
+- the **admitted capacity** is how many runs may be in flight. It starts at
+  **one** and is `proven_prefix + 1`, where a slot is *proven* once a run on it
+  completed its resource commit — including a run whose private byte demand was
+  legitimately zero, because every argument was already on the device and every
+  region already covered. The exploratory `+1` is offered only while no growth
+  is in flight.
+
+The parent installs admission one before accepting a submission. The static
+launch ceiling is the identity directory; the dynamic admission prefix and
+existing backend/pair compatibility checks determine which successors can
+actually enqueue beside their predecessors.
+
+A slot's proof is withdrawn when the resources that commit established are
+reclaimed, become unprovable, or when the first launch on the slot cannot take
+the per-set resources that live outside the workspace ledger. The count is a
+prefix rather than a population because the lease pool hands out the lowest
+free slot, so a proven slot above an unproven one must not be offered.
+
+Each endpoint publishes its figure with a run's terminal state; the parent
+folds the reports by `min` when the **whole** run retires, which is the one
+point at which every endpoint that executed any of its tasks has reported for
+it. An endpoint that does not size itself publishes zero, which the fold reads
+as "no report" rather than as a capacity. A decrease confines the next
+acquisition and nothing else: a lease already granted stays valid, its run
+keeps its slot, and admission waits for the queue to drain. No record, result
+or output is dropped. Retirement applies the new bound under the FIFO lock
+before assigning a successor lease or waking an admission waiter.
+
+Growing device storage is serialized by one permission per endpoint, so two
+plans never hold their old and new blocks at once — which is also what makes an
+allocation refusal attributable to one shortfall. A prepare that cannot take
+what it needs performs two steps before its one further attempt:
+
+- it **reclaims** the generations a region has replaced, and
+- it **trims** every run-resource set nothing can reach — a set cached by an
+  earlier run, with no consumer left, whose storage no reclamation would ever
+  offer, because a region's current block is kept warm on purpose. The asking
+  set is excluded by name; a set a live run reserved, one whose arena bank
+  another run reserved — which is every set on a runtime whose arena is shared
+  — and one a saved plan would resume into are excluded by what holds them;
+  quarantined, release-unconfirmed and still-mapped storage is excluded because
+  its bytes cannot come back at all. A trimmed set stops naming its storage and
+  loses its proof *before* the release, so no freed address stays published and
+  the admitted capacity falls with the resources it rested on.
+
+If a launched run on the endpoint has a finish this endpoint will reach, a
+prepare that still cannot be served is **stood down rather than failed**: its
+saved plan, its input staging and its growth permission are kept, the caller's
+orchestration callback is not invoked again, and it is retried when one of the
+consumers it named at that moment finishes — at which point that consumer's set
+is itself trimmable. The holders are the endpoint's launched runs whatever
+regions they hold, because every managed block is charged against one device
+allocator: a predecessor occupying another set holds that set's region keys and
+never the candidate's, and a set being offered for the first time has no prior
+holder of its own keys at all. A run that has merely prepared is queued behind
+the same permission and is not something to wait for. Each named identity is
+spent once, so the waits are bounded by the set captured at the first wait and
+the directory, never by a capacity that can shrink underneath the plan. With no
+such consumer, or with that set exhausted, the run fails with a typed
+resource-unavailable error. Only an allocator capacity refusal enters this
+retry policy; invalid requests, bookkeeping failures and a degraded ledger fail
+without waiting for a consumer.
+
+For host-built graphs, the slot owns the completed host plan while parked:
+its host arena, Definition publication, tensor leases and captured dependency
+graph survive destruction of each preparation attempt. A retry references the
+retained inputs and commits that plan without copying HOST inputs or invoking
+the callback again. Pending publication and leases move to exactly one Runtime;
+a successful bind cannot be rebound before publication. A backend without plan
+retention rejects a post-callback wait. Terminal failure retires the native
+context before aborting the plan, and an unproven abort retains caller borrows.
+
+Phase traces drain at each wait so no trace retains a destroyed HostApi. The
+slot's bounded record pool appends retry records and preserves its dropped
+count; the successful attempt's invocation identity labels the combined
+artifact. Dependency capture moves with the plan and is restored only after image
+publication succeeds, for the existing exporter on that thread. Diagnostic exclusivity and artifact
+formats are unchanged.
+
+There is no device-byte quota and no device-memory fraction. Only the four
+managed workspace regions take part in waiting and reclamation; per-set
+completion events, runtime storage and host buffers are separately fallible and
+fail outright, so this is not whole-device OOM recovery. No latency or
+throughput benefit is claimed.
 
 `ChipWorker` is downstream of that pool and cannot re-derive ownership — it
 never sees an acquire or a release. It keeps a per-slot high-water mark and

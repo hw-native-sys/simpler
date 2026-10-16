@@ -641,11 +641,10 @@ static void apply_orch_sched_env_flags(Runtime *runtime) {
 // shot, at the sizes derive_arena_static_sizes already resolved. Idempotent
 // across runs — the pools are owned by DeviceRunner and freed in
 // DeviceRunner::finalize().
-static bool ensure_static_arenas(const HostApi *api, const ArenaStaticSizes &sizes, StaticArenaPtrs *out) {
+static int ensure_static_arenas(const HostApi *api, const ArenaStaticSizes &sizes, StaticArenaPtrs *out) {
     int64_t t_setup_start = _now_ms();
-    if (api->setup_static_arena(sizes.total_heap, sizes.sm_size, sizes.runtime_image_size) != 0) {
-        LOG_ERROR("Failed to setup pooled static arena");
-        return false;
+    if (const int rc = api->setup_static_arena(sizes.total_heap, sizes.sm_size, sizes.runtime_image_size); rc != 0) {
+        return rc;
     }
     int64_t t_setup_end = _now_ms();
 
@@ -654,7 +653,7 @@ static bool ensure_static_arenas(const HostApi *api, const ArenaStaticSizes &siz
     int64_t t_heap_end = _now_ms();
     if (out->gm_heap == nullptr) {
         LOG_ERROR("Failed to acquire pooled GM heap");
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     int64_t t_sm_start = _now_ms();
@@ -662,19 +661,19 @@ static bool ensure_static_arenas(const HostApi *api, const ArenaStaticSizes &siz
     int64_t t_sm_end = _now_ms();
     if (out->gm_sm == nullptr) {
         LOG_ERROR("Failed to acquire pooled shared memory");
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     out->runtime_arena_dev = api->acquire_pooled_runtime_arena();
     if (out->runtime_arena_dev == nullptr) {
         LOG_ERROR("Failed to acquire pooled runtime arena");
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     LOG_INFO("TIMING: static_arena_setup = %" PRId64 "ms", t_setup_end - t_setup_start);
     LOG_INFO("TIMING: gm_heap_acquire = %" PRId64 "ms", t_heap_end - t_heap_start);
     LOG_INFO("TIMING: shared_mem_acquire = %" PRId64 "ms", t_sm_end - t_sm_start);
-    return true;
+    return 0;
 }
 
 // per-(cid,config): build the prebuilt runtime-arena image on host. Pure host
@@ -761,30 +760,30 @@ static void store_prebuilt_runtime_image(
 // the run path can wire the runtime directly instead of depending on a cache
 // round-trip. Shared by the lazy first-run miss path and the eager
 // prewarm_config_impl entry, so both build the arena identically.
-static bool build_and_cache_prebuilt_arena(
+static int build_and_cache_prebuilt_arena(
     const HostApi *api, const ArenaSizingConfig &sizing, StaticArenaPtrs *out_ptrs = nullptr,
     RuntimeArenaLayout *out_layout = nullptr
 ) {
     ArenaStaticSizes sizes;
     if (!derive_arena_static_sizes(sizing, &sizes)) {
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     StaticArenaPtrs ptrs;
-    if (!ensure_static_arenas(api, sizes, &ptrs)) {
-        return false;
+    if (const int rc = ensure_static_arenas(api, sizes, &ptrs); rc != 0) {
+        return rc;
     }
 
     DeviceArena host_arena;  // libc malloc backend; owns the image until upload
     RuntimeArenaLayout layout;
     if (!build_runtime_image(sizing, sizes, ptrs, &host_arena, &layout)) {
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     int rc_upload = api->copy_to_device(ptrs.runtime_arena_dev, host_arena.base(), layout.offsets.arena_size);
     if (rc_upload != 0) {
         LOG_ERROR("Failed to rtMemcpy prebuilt runtime arena to device (rc=%d)", rc_upload);
-        return false;
+        return PTO_RUNTIME_ERR_INTERNAL;
     }
 
     PrebuiltRuntimeArenaCacheProbe probe = make_prebuilt_runtime_arena_cache_probe(sizing);
@@ -795,7 +794,7 @@ static bool build_and_cache_prebuilt_arena(
     if (out_layout != nullptr) {
         *out_layout = layout;
     }
-    return true;
+    return 0;
 }
 
 /**
@@ -870,9 +869,8 @@ extern "C" int bind_callable_to_runtime_impl(
     // bump-slice from it.
     RetainedTempBump bump;
     const size_t required_temp_bytes = packed_temp_bytes(orch_args);
-    if (!bump.begin(api, required_temp_bytes)) {
-        LOG_ERROR("Retained temp buffer grow failed: required bytes %zu", required_temp_bytes);
-        return PTO_RUNTIME_ERR_INTERNAL;
+    if (const int rc = bump.begin_status(api, required_temp_bytes); rc != 0) {
+        return rc;
     }
 
     auto bind_cleanup = RAIIScopeGuard([&]() {
@@ -903,8 +901,8 @@ extern "C" int bind_callable_to_runtime_impl(
             // binds successfully.
             StaticArenaPtrs ptrs;
             RuntimeArenaLayout layout;
-            if (!build_and_cache_prebuilt_arena(api, sizing, &ptrs, &layout)) {
-                return PTO_RUNTIME_ERR_INTERNAL;
+            if (const int rc = build_and_cache_prebuilt_arena(api, sizing, &ptrs, &layout); rc != 0) {
+                return rc;
             }
             runtime->set_orch_args(device_args);
             runtime->set_gm_sm_ptr(ptrs.gm_sm);
@@ -946,7 +944,7 @@ extern "C" int prewarm_config_impl(
     }
 
     STRACE("chip.prewarm.build");
-    return build_and_cache_prebuilt_arena(api, sizing) ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+    return build_and_cache_prebuilt_arena(api, sizing);
 }
 
 /**

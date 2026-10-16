@@ -104,6 +104,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/chip_swimlane_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/host_phase_records.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/kernel_execution_state.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/run_resource_growth.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../shared/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/dep_gen_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/shared/host/dep_gen_retained_runs.cpp"

@@ -44,6 +44,13 @@ struct ChipRunState {
     bool activated{false};
     bool crossed_launch_fence{false};
     bool depth_one_fallback{false};
+    // Its prepare asked to wait: the device resources it needs are held by a
+    // consumer this worker will finish, and its saved plan is what the next
+    // attempt continues from. Unlike `depth_one_fallback` this is retried every
+    // round, because what clears it is another run's retirement rather than
+    // this run reaching the front. A run carrying it owns resources an
+    // unprepared run does not, so every abandonment path gives them back.
+    bool resource_wait{false};
     // The backend declined to order this run behind the run ahead of it. Kept
     // per run because the pair cannot change while both are live: the run ahead
     // stays ahead until it retires, and this one then reaches the front and
@@ -138,7 +145,8 @@ struct ChipRunLaneState {
                 // Queued: it never crossed the launch boundary, so no device
                 // work of this run's can name a borrowed address and the
                 // reference is simply given back.
-                release_device_spans(run, true);
+                const bool plan_released = release_run_plan(run);
+                release_device_spans(run, plan_released);
             }
             run->phase = ChipRunState::Phase::TERMINAL;
             it = fifo.erase(it);
@@ -231,6 +239,40 @@ struct ChipRunLaneState {
     }
 
     /**
+     * Give back what a run that never reached the device still holds.
+     *
+     * Only a waiting run holds anything here: its prepare saved a plan, kept a
+     * reference on its slot's input staging and may still hold this context's
+     * growth permission. Called before the span release on every path that
+     * abandons a queued run, and it refuses when the run could still have
+     * reached the device — which the caller turns into the run's failure rather
+     * than handing its borrows back.
+     */
+    bool release_run_plan(const std::shared_ptr<ChipRunState> &run) noexcept {
+        if (!run->resource_wait) return true;
+        run->resource_wait = false;
+        if (worker == nullptr) return true;
+        int rc = 0;
+        try {
+            // Zero epoch: a run whose prepare asked to wait never received a
+            // native-run identity, and the slot holds exactly one plan, so the
+            // slot alone names what has to be given back.
+            rc = worker->abort_run_plan(run->lease.slot_id, 0);
+        } catch (...) {
+            rc = -1;
+        }
+        if (rc != 0) {
+            const auto failure = std::make_exception_ptr(
+                std::runtime_error("chip run lane could not give back a waiting run's device resources")
+            );
+            if (run->error == nullptr) run->error = failure;
+            poison_with(run, failure);
+            return false;
+        }
+        return true;
+    }
+
+    /**
      * Discharge this run's caller references, or keep them when its last consumer is unproven.
      *
      * Both of them: the borrow over the allocations its arguments name, and the declaration of
@@ -292,7 +334,8 @@ struct ChipRunLaneState {
             } else if (run->phase == ChipRunState::Phase::QUEUED) {
                 run->error = poison;
                 run->poison_error = poison;
-                release_device_spans(run, true);
+                const bool plan_released = release_run_plan(run);
+                release_device_spans(run, plan_released);
                 run->phase = ChipRunState::Phase::TERMINAL;
                 fifo.pop_front();
             }
@@ -305,13 +348,24 @@ struct ChipRunLaneState {
         if (run->phase == ChipRunState::Phase::QUEUED) {
             try {
                 prepare(run);
+            } catch (const ChipWorker::PreparedRunResourceWait &) {
+                // Its resources are held by a consumer this worker will finish,
+                // and its saved plan is what the next attempt continues from.
+                // It keeps its slot, its lease and its borrow, and this returns
+                // without launching: the run ahead of it is what frees those
+                // resources, and the progress that retires it is the same
+                // progress that brings this run back here.
+                run->resource_wait = true;
+                return;
             } catch (...) {
                 run->error = std::current_exception();
-                release_device_spans(run, true);
+                const bool plan_released = release_run_plan(run);
+                release_device_spans(run, plan_released);
                 run->phase = ChipRunState::Phase::TERMINAL;
                 fifo.pop_front();
                 return;
             }
+            run->resource_wait = false;
         }
         try {
             worker->launch_native_run(run->native_run, run->caller_stream);
@@ -496,9 +550,16 @@ struct ChipRunLaneState {
         } catch (const ChipWorker::PreparedRunIncompatible &) {
             run->depth_one_fallback = true;
             return;
+        } catch (const ChipWorker::PreparedRunResourceWait &) {
+            // Same treatment as at the front: it keeps everything it holds and
+            // is offered again, because what it waits for is another run's
+            // retirement rather than its own position in the queue.
+            run->resource_wait = true;
+            return;
         } catch (...) {
             run->error = std::current_exception();
-            release_device_spans(run, true);
+            const bool plan_released = release_run_plan(run);
+            release_device_spans(run, plan_released);
             run->phase = ChipRunState::Phase::TERMINAL;
             auto it = std::find(fifo.begin(), fifo.end(), run);
             if (it != fifo.end()) fifo.erase(it);
@@ -564,13 +625,15 @@ struct ChipRunLaneState {
         if (poison != nullptr && run->phase == ChipRunState::Phase::QUEUED) {
             run->error = poison;
             run->poison_error = poison;
-            release_device_spans(run, true);
+            const bool plan_released = release_run_plan(run);
+            release_device_spans(run, plan_released);
             run->phase = ChipRunState::Phase::TERMINAL;
             fifo.pop_front();
             return;
         }
         if (run->phase == ChipRunState::Phase::QUEUED && !run->activated) {
-            release_device_spans(run, true);
+            const bool plan_released = release_run_plan(run);
+            release_device_spans(run, plan_released);
             run->phase = ChipRunState::Phase::TERMINAL;
             fifo.pop_front();
             return;
@@ -699,7 +762,8 @@ void ChipRun::abandon() {
         }
         lane_->release_device_spans(run_, finalized);
     } else {
-        lane_->release_device_spans(run_, true);
+        const bool plan_released = lane_->release_run_plan(run_);
+        lane_->release_device_spans(run_, plan_released);
     }
     run_->phase = ChipRunState::Phase::TERMINAL;
     lane_->fifo.erase(it);
@@ -805,7 +869,8 @@ ChipRun ChipRunLane::submit(
         // dropped as if nothing could reach those bytes. Today nothing throws after that point —
         // `launch_ready_prefix` is noexcept — and this keeps the statement true by construction
         // rather than by that coincidence.
-        state_->release_device_spans(run, !run->crossed_launch_fence);
+        const bool plan_released = state_->release_run_plan(run);
+        state_->release_device_spans(run, plan_released && !run->crossed_launch_fence);
         run->phase = ChipRunState::Phase::TERMINAL;
         auto it = std::find(state_->fifo.begin(), state_->fifo.end(), run);
         if (it != state_->fifo.end()) state_->fifo.erase(it);

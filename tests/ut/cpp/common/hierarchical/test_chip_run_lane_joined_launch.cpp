@@ -51,6 +51,7 @@ namespace {
 std::unordered_map<void *, uint32_t> g_slots;
 std::array<bool, 2> g_complete{};
 std::array<int, 2> g_launch_rc{};
+std::array<int, 2> g_prepare_rc{};
 std::array<bool, 2> g_joinable_boundary_requested{};
 int g_joined_rc{0};
 bool g_joined_throws{false};
@@ -71,7 +72,7 @@ int prepare_run(
     g_complete[descriptor->pipeline_slot] = false;
     g_joinable_boundary_requested[descriptor->pipeline_slot] = descriptor->joinable_boundary != 0;
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
-    return 0;
+    return g_prepare_rc[descriptor->pipeline_slot];
 }
 
 int launch_run(void *, void *runtime) {
@@ -118,6 +119,7 @@ void prime_worker(ChipWorker &worker, unsigned launch_depth = 2) {
     g_slots.clear();
     g_complete = {};
     g_launch_rc = {};
+    g_prepare_rc = {};
     g_joinable_boundary_requested = {};
     g_joined_rc = 0;
     g_joined_throws = false;
@@ -1049,6 +1051,37 @@ TEST(ChipRunLaneCallerBuffersTest, AnUnprovenLastConsumerKeepsTheReference) {
 
     g_finalize_rc = 0;
     EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.finalize();
+}
+
+TEST(ChipRunLaneCallerBuffersTest, ARefusedPlanAbortKeepsTheWaitingRunsBorrow) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_buffers(worker);
+    worker.automatic_admission_ = true;
+    unsigned aborts = 0;
+    // The callback ABI has no capture, so the context owns the observed count.
+    worker.device_ctx_ = &aborts;
+    worker.abort_run_plan_fn_ = [](void *ctx, uint32_t slot, uint64_t epoch) -> int {
+        ++*static_cast<unsigned *>(ctx);
+        EXPECT_EQ(slot, 1u);
+        EXPECT_EQ(epoch, 0u);
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    };
+    ChipRunLane lane(worker);
+    ChipRun first = submit(lane, 101, 0, true, device_args());
+    ASSERT_TRUE(first.launched());
+    g_prepare_rc[1] = SIMPLER_RUNTIME_ERR_RESOURCE_WAIT;
+    ChipRun waiting = submit(lane, 102, 1, true, device_args());
+    ASSERT_FALSE(waiting.launched());
+    EXPECT_THROW(waiting.abandon(), std::runtime_error);
+    EXPECT_EQ(aborts, 1u);
+    EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{2, 1}}));
+    g_complete[0] = true;
+    EXPECT_TRUE(first.done());
+    EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{2, 1}, {1, 0}}));
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    worker.device_ctx_ = nullptr;
     worker.finalize();
 }
 

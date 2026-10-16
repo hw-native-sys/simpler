@@ -391,6 +391,33 @@ public:
     unsigned pipeline_depth() const { return pipeline_contract_.pipeline_depth; }
     size_t runtime_slot_count() const { return runtime_bufs_.size(); }
     bool supports_concurrent_native_prepare() const;
+
+    /**
+     * Let this worker's device context size its own run concurrency.
+     *
+     * @return false when the loaded module or the context cannot, in which case
+     *         the worker keeps admitting exactly what it was granted
+     */
+    bool enable_automatic_admission();
+
+    /** Whether this worker's context sizes its own concurrency. */
+    bool automatic_admission() const { return automatic_admission_; }
+
+    /**
+     * Run-resource sets the context reports it can hold right now, or the
+     * granted count when it does not size itself.
+     */
+    uint32_t admissible_run_resource_sets() const;
+
+    /**
+     * Give up every resource a waiting plan on this slot still holds.
+     *
+     * Called by the lane for a run it is abandoning that asked to wait, because
+     * such a run holds things an unprepared run does not. Reports failure when
+     * the run could still have reached the device, which the caller must treat
+     * as a reason not to hand its borrows back.
+     */
+    int abort_run_plan(uint32_t pipeline_slot, uint64_t run_epoch);
     /**
      * Whether this worker may order one run's native submission behind
      * another's right now, which is both a runtime capability and a
@@ -587,9 +614,16 @@ private:
     // the lane order more runs than the collector can hold.
     size_t retained_epoch_limit_granted_ = simpler::dfx::runs::kMaxOpenEpochs;
     using SimplerSetWorkspaceBudgetFn = decltype(&simpler_set_workspace_budget_ctx);
+    using SimplerEnableAutomaticAdmissionFn = decltype(&simpler_enable_automatic_admission_ctx);
+    using SimplerAdmissibleRunResourceSetsFn = decltype(&simpler_admissible_run_resource_sets_ctx);
+    using SimplerAbortRunPlanFn = decltype(&simpler_abort_run_plan_ctx);
     using SimplerEnableWorkspaceManagementFn = decltype(&simpler_enable_workspace_management_ctx);
     using SimplerGetWorkspaceReportFn = decltype(&simpler_get_workspace_report_ctx);
     SimplerSetWorkspaceBudgetFn set_workspace_budget_fn_ = nullptr;
+    SimplerEnableAutomaticAdmissionFn enable_automatic_admission_fn_ = nullptr;
+    SimplerAdmissibleRunResourceSetsFn admissible_run_resource_sets_fn_ = nullptr;
+    SimplerAbortRunPlanFn abort_run_plan_fn_ = nullptr;
+    bool automatic_admission_ = false;
     // Resolved for the retained compatibility entry, which a direct C caller
     // may still invoke before init. `init` no longer calls it: the program
     // init entry installs the manager for every caller.
@@ -642,6 +676,20 @@ private:
 
     enum class NativeRunPhase : uint8_t { EMPTY, PREPARING, PREPARED, LAUNCHED, REAPED, FINALIZING };
     class PreparedRunIncompatible : public std::runtime_error {
+    public:
+        using std::runtime_error::runtime_error;
+    };
+    /**
+     * This run's device resources are not available yet, and a consumer that
+     * holds some of them has a finish this context will reach.
+     *
+     * Distinct from `PreparedRunIncompatible`, which is about a layout two runs
+     * cannot share and clears when the run ahead retires, and from a failure,
+     * which ends the run. The caller keeps the run queued with everything it
+     * holds; the worker's saved plan is what the next attempt continues from,
+     * so the caller's orchestration callback is not invoked again.
+     */
+    class PreparedRunResourceWait : public std::runtime_error {
     public:
         using std::runtime_error::runtime_error;
     };

@@ -107,6 +107,7 @@ hbg_case(test_hbg_bind_ledger.cpp
         ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
         ${HBG_HOST_DIR}/graph_recorder_pool.cpp
         ${HBG_HOST_DIR}/host_phase_trace.cpp
+        ${SIMPLER_SRC}/common/platform/shared/host/host_phase_records.cpp
         ${HBG_HOST_DIR}/ready_queue_sizing.cpp
         ${HBG_HOST_DIR}/host_tensor_access.cpp
         ${SIMPLER_SRC}/common/platform/shared/host/platform_compile_info.cpp

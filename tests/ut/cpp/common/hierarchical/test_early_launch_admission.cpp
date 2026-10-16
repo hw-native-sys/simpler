@@ -22,6 +22,9 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <future>
 #include <functional>
 #include <stdexcept>
 #include <utility>
@@ -46,7 +49,7 @@ struct EarlyLaunchHarness {
     NextLevelReadyQueues rq_next_level;
     ReadyQueue rq_sub;
     Orchestrator orch;
-    int wakes{0};
+    std::atomic<int> wakes{0};
 
     EarlyLaunchHarness(uint32_t depth, uint32_t launch_depth) {
         allocator.init(/*heap_bytes=*/1ULL << 20);
@@ -273,3 +276,52 @@ TEST(EarlyLaunchAdmission, LaunchDepthIsBoundedByTheAdmissionDepth) {
 }
 
 }  // namespace
+
+TEST(EarlyLaunchAdmission, AutomaticStartupWaitsForProofThenEnqueuesACompatibleSuccessor) {
+    EarlyLaunchHarness h(8, 8);
+    h.orch.configure_pipeline_depth(8, 0, 8, 1);
+    EXPECT_EQ(h.orch.admissible_depth(), 1u);
+    const auto first = h.build_closed_run(101);
+    h.accept(first);
+    auto next = std::async(std::launch::async, [&h] {
+        return h.orch.begin_run();
+    });
+    EXPECT_EQ(next.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    h.orch.note_endpoint_capacity(0, 2);
+    EXPECT_EQ(h.orch.admissible_depth(), 1u) << "a sample alone cannot widen a live run";
+    h.complete(first);
+    const auto ready = next.wait_for(std::chrono::seconds(2));
+    EXPECT_EQ(ready, std::future_status::ready);
+    if (ready != std::future_status::ready) h.orch.update_admissible_depth(8);
+    const EarlyLaunchHarness::Run second{next.get(), h.submit_one(102)};
+    h.orch.close_run_submission(second.id);
+    EXPECT_EQ(h.orch.admissible_depth(), 2u);
+    const auto third = h.build_closed_run(103);
+    h.accept(second);
+    EXPECT_EQ(h.orch.early_launch_run_id(), third.id);
+    const auto lease = h.state(third).pipeline_lease;
+    auto fourth_id = std::async(std::launch::async, [&h] {
+        return h.orch.begin_run();
+    });
+    EXPECT_EQ(fourth_id.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    h.orch.note_endpoint_capacity(0, 1);
+    h.complete(second);
+    EXPECT_EQ(h.orch.admissible_depth(), 1u);
+    EXPECT_EQ(fourth_id.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout)
+        << "retirement applies the lower capacity before waking an admission waiter";
+    EXPECT_EQ(h.state(third).pipeline_lease.slot_id, lease.slot_id);
+    EXPECT_EQ(h.state(third).pipeline_lease.generation, lease.generation);
+    h.accept(third);
+    h.complete(third);
+    const auto fourth_ready = fourth_id.wait_for(std::chrono::seconds(2));
+    EXPECT_EQ(fourth_ready, std::future_status::ready);
+    if (fourth_ready != std::future_status::ready) h.orch.update_admissible_depth(8);
+    const EarlyLaunchHarness::Run fourth{fourth_id.get(), h.submit_one(104)};
+    h.orch.close_run_submission(fourth.id);
+    h.accept(fourth);
+    h.complete(fourth);
+    h.orch.release_run(first.id);
+    h.orch.release_run(second.id);
+    h.orch.release_run(third.id);
+    h.orch.release_run(fourth.id);
+}

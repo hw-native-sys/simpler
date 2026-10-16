@@ -706,6 +706,16 @@ Tests read these to determine which devices to use. See `test_comm_lifecycle.cpp
 
 ### New Scene Test
 
+An L3 scene that qualifies default automatic admission declares
+`@scene_test(level=3, runtime=..., automatic_admission=True)`. Both pytest and
+standalone factories then omit `pipeline_depth`, `launch_depth`,
+`pending_run_depth`, and `workspace_budget_bytes`; supplying any of them in its
+case config is an error, including `None` or zero. Existing scenes retain their
+explicit launch-depth policy. Each automatic class gets a fresh standalone
+Worker so cold-start assertions cannot inherit another class's capacity.
+This is scene metadata, not a Worker configuration option. Assert the actual
+Worker mode and use endpoint capacity/identity evidence in the scene.
+
 Create a `test_*.py` file using the `@scene_test` decorator:
 
 ```python

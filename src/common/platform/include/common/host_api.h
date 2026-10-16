@@ -261,6 +261,10 @@ struct HostApiOps {
     // the slot's retained mirrors. No pointer in this object travels to device.
     std::shared_ptr<void> (*get_orchestration_scratch)(void *runner_ctx, uint32_t pipeline_slot);
     void (*set_orchestration_scratch)(void *runner_ctx, uint32_t pipeline_slot, std::shared_ptr<void> scratch);
+    // An unpublished host plan survives native prepare attempts on the same slot.
+    // Optional: only automatic onboard admission can park a managed commit.
+    std::shared_ptr<void> (*get_prepare_plan)(void *runner_ctx, uint32_t pipeline_slot);
+    void (*set_prepare_plan)(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, std::shared_ptr<void> plan);
 };
 
 /**
@@ -351,6 +355,14 @@ public:
     void set_orchestration_scratch(std::shared_ptr<void> scratch) const {
         if (ops_->set_orchestration_scratch != nullptr)
             ops_->set_orchestration_scratch(runner_ctx_, pipeline_slot_, std::move(scratch));
+    }
+    std::shared_ptr<void> get_prepare_plan() const {
+        return ops_->get_prepare_plan == nullptr ? std::shared_ptr<void>{} :
+                                                   ops_->get_prepare_plan(runner_ctx_, pipeline_slot_);
+    }
+    void set_prepare_plan(std::shared_ptr<void> plan) const {
+        if (ops_->set_prepare_plan != nullptr)
+            ops_->set_prepare_plan(runner_ctx_, pipeline_slot_, run_epoch_, std::move(plan));
     }
     int acquire_sm_mirror(size_t bytes, size_t alignment, void **addr_out) const {
         if (ops_->acquire_sm_mirror == nullptr) {

@@ -81,6 +81,8 @@
 #include "host/kernel_entry_validation.h"
 #include "host/kernel_execution_state.h"
 #include "host/memory_allocator.h"
+#include "host/auto_admission.h"
+#include "host/run_resource_growth.h"
 #include "host/workspace_manager.h"
 #include "host/pmu_collector.h"
 #include "host/queued_stream_waits.h"
@@ -546,6 +548,15 @@ public:
     void set_orchestration_scratch(uint32_t slot, std::shared_ptr<void> scratch) {
         if (slot < orchestration_scratch_.size()) orchestration_scratch_[slot] = std::move(scratch);
     }
+    std::shared_ptr<void> get_prepare_plan(uint32_t slot) const {
+        return slot < prepare_plans_.size() ? prepare_plans_[slot] : std::shared_ptr<void>{};
+    }
+    void set_prepare_plan(uint32_t slot, uint64_t epoch, std::shared_ptr<void> plan) {
+        if (!auto_admission_.enabled() || slot >= prepare_plans_.size()) return;
+        auto_admission_.begin_plan(slot, epoch, AutoAdmissionState::Phase::Planned);
+        auto_admission_.note_plan_stamped(slot);
+        prepare_plans_[slot] = std::move(plan);
+    }
     int acquire_sm_mirror(uint32_t pipeline_slot, std::size_t bytes, std::size_t alignment, void **addr_out);
     /**
      * Retain the host buffer a run assembles its device execution image in.
@@ -632,6 +643,109 @@ public:
     bool workspace_enabled() const { return workspace_.enabled(); }
 
     /**
+     * Let this context size its own concurrency from the resources it proves.
+     *
+     * Requested once, before anything is prepared, by a context whose caller
+     * configured no depth and no budget. An explicitly configured context, a
+     * borrowed one and a simulated one never ask, and every admission figure
+     * below then reports what it reported before.
+     */
+    void enable_automatic_admission() { auto_admission_.configure(granted_run_resource_sets_); }
+
+    bool automatic_admission_enabled() const { return auto_admission_.enabled(); }
+
+    /**
+     * Run-resource sets this context can report it is able to hold.
+     *
+     * The proven prefix plus one exploratory set while no growth is in flight,
+     * capped by the identity directory the caller sized. One until a run has
+     * completed its resource commit, so nothing is admitted on the strength of
+     * a slot that has demonstrated nothing.
+     */
+    uint32_t admissible_run_resource_sets() const {
+        if (!auto_admission_.enabled()) return static_cast<uint32_t>(granted_run_resource_sets_);
+        return auto_admission_.affordable_sets(static_cast<uint32_t>(granted_run_resource_sets_));
+    }
+
+    /**
+     * Give up every resource a saved plan still holds, at whatever stage it
+     * reached, and forget it.
+     *
+     * The one path every abandonment uses — a caller's, a close, a poison —
+     * because a plan that waited owns things an unprepared run does not: its
+     * input staging reference, its growth permission, and whatever its
+     * in-flight transaction had staged. Refuses rather than guessing when the
+     * run could still have reached the device, since releasing a borrow then
+     * would hand back pages device work may still name.
+     *
+     * Idempotent: a second call for a slot whose plan is gone, or for an epoch
+     * that no longer owns it, reports success and does nothing.
+     *
+     * @return 0 when the slot holds no plan for this epoch afterwards
+     */
+    // Called only after native reservation proves exclusive ownership of slot.
+    void adopt_run_plan_attempt(uint32_t pipeline_slot, std::uint64_t run_epoch) {
+        auto_admission_.adopt_plan_attempt(pipeline_slot, run_epoch);
+    }
+    int abort_run_plan(uint32_t pipeline_slot, std::uint64_t run_epoch);
+
+    /**
+     * Give back what one prepare attempt took under its own identity, keeping
+     * the slot's saved plan for the attempt that continues it.
+     *
+     * The wait path's counterpart to `abort_run_plan`: a retry takes its own
+     * claims and its own input-staging reference under its own identity, so the
+     * attempt that stood down must hand its back. The plan, the wait set it
+     * captured and the growth permission it holds all stay.
+     */
+    void release_plan_epoch_refs(uint32_t pipeline_slot, std::uint64_t run_epoch);
+
+    /** Withdraw a slot's resource proof. */
+    void clear_run_resource_proof(uint32_t pipeline_slot) { auto_admission_.clear_proven(pipeline_slot); }
+
+    /**
+     * Return the storage of every run-resource set nothing can reach, so a
+     * refused growth can ask again against what they held.
+     *
+     * The step between a refusal and its one retry. `reclaim_obsolete` alone
+     * releases only generations a region has *replaced*, and deliberately keeps
+     * a set's idle current backing so the next same-sized run reuses it — so
+     * without this a request fails beside storage it could have had: a set
+     * cached by an earlier run, with no consumer left, that no reclamation will
+     * ever offer.
+     *
+     * The decision is `RunResourceGrowth::trim_idle_sets`, which this reaches
+     * through `RunResourceEndpointView`; what this adds is the runner's own
+     * state — which slots and banks live runs hold, where each slot's staging
+     * is, and what each bank's regions are.
+     *
+     * @return sets whose storage was detached
+     */
+    std::size_t trim_idle_run_resources(uint32_t requesting_slot);
+
+    /**
+     * One growth attempt, then the trim and the reclaim, then exactly one more.
+     *
+     * `attempt` is the caller's own allocation — a staging acquire or a whole
+     * bank's staged transaction — reported as served, refused, or refused by a
+     * degraded ledger. `rollback_before_retry` is for an attempt that stages
+     * storage it must hand back before the trim can see it.
+     */
+    GrowthAttempt grow_with_one_retry(
+        uint32_t requesting_slot, bool rollback_before_retry, GrowthAttempt (*attempt)(void *ctx), void *ctx
+    );
+
+    /**
+     * Record that a run on this slot completed its resource commit.
+     *
+     * The slot becomes an admission target and the context's growth permission
+     * goes back. Called on the success path only, and the plan's own saved
+     * state ends with it: from here the run owns its resources as a prepared
+     * run, not as a plan that might still resume.
+     */
+    void note_run_resources_proven(uint32_t pipeline_slot, std::uint64_t run_epoch);
+
+    /**
      * Report one run fact at the boundary that produced it.
      *
      * Called from the run phase entries, never derived from a phase word or
@@ -662,6 +776,12 @@ public:
      * shared-memory region is published at.
      */
     static void set_workspace_plan_region(const WorkspaceManager::RegionKey &region) noexcept;
+
+    /** Publish what the named region is published at right now. */
+    static void set_workspace_plan_region_backing(void *backing) noexcept;
+
+    /** Raw backing of one region of one arena bank, or null while uncommitted. */
+    void *arena_region_backing(uint32_t bank_id, std::size_t region_index) const;
     static WorkspaceManager::RegionKey workspace_plan_region() noexcept;
 
     /** Scopes one thread's workspace plan identity to a prepare. */
@@ -1805,6 +1925,15 @@ protected:
     };
 
     /**
+     * This runner's answers to the questions a growth under pressure asks.
+     *
+     * Defined in the implementation: it holds only lookups into members this
+     * class already owns, and the policy built on them belongs to
+     * `RunResourceGrowth`, which is reachable without the device SDK.
+     */
+    class RunResourceEndpointView;
+
+    /**
      * Record that a bank region has given up the block at `base`.
      *
      * A managed block outlives the arena that was using it, so the arena's own
@@ -1830,6 +1959,25 @@ protected:
      *         recorded — refused rather than silently unprotected
      */
     int reference_bank_arenas(uint32_t arena_bank, const ArenaRegionRequest *requests, std::size_t count);
+
+    /** Record one acquisition the transaction in flight on this thread caused. */
+    void record_workspace_claim(void *base, bool was_region_backing);
+    /** Give back every reference this thread's abandoned transaction took. */
+    void rollback_workspace_claims();
+    /** Adopt this thread's claims as the regions' live references. */
+    void commit_workspace_claims();
+    /** Whether a waiting plan may not yet try again. */
+    bool growth_still_blocked(uint32_t pipeline_slot, AutoAdmissionState::Phase phase);
+    /** Take the context's growth permission, or report that a plan must wait. */
+    int claim_growth_permission(uint32_t pipeline_slot, std::uint64_t run_epoch, AutoAdmissionState::Phase phase);
+    /** Turn a refused growth into a bounded wait on named consumers, or a failure. */
+    int report_growth_refusal(
+        uint32_t pipeline_slot, AutoAdmissionState::Phase phase, std::size_t shortfall, GrowthAttempt outcome
+    );
+    /** Whether any run holding the native execution claim is this epoch. */
+    bool native_run_is_live(std::uint64_t run_epoch) const;
+    /** Withdraw a slot's saved graph plan without freeing its storage. */
+    void invalidate_graph_definition_staging(uint32_t pipeline_slot);
 
     /**
      * Configure STARS op execution timeout (once per DeviceRunner lifetime).
@@ -2625,6 +2773,11 @@ protected:
     // One budget and one ownership ledger for this context's workspace
     // regions. Off unless a caller latches a budget.
     WorkspaceManager workspace_;
+    // Which slots have proved they can carry a run, who may grow now, and what
+    // each saved plan is waiting for. Holds no byte figure: whether a request
+    // fits is the allocator's answer, reported here only as a proof or a
+    // refusal. Empty and inert unless a context asks for automatic admission.
+    AutoAdmissionState auto_admission_;
 
     // Host mappings of child-memory allocations a host-side orchestrator has
     // touched — see HostApi acquire_child_memory_host_view. Keyed by allocation
@@ -2673,6 +2826,7 @@ protected:
         std::size_t capacity{0};
     };
     RunResourceSlots<std::shared_ptr<void>> orchestration_scratch_;
+    RunResourceSlots<std::shared_ptr<void>> prepare_plans_;
     RunResourceSlots<RetainedSmMirror> sm_mirrors_;
 
     // Host staging for the device execution image, one retained buffer per
@@ -2745,6 +2899,7 @@ protected:
         RunResourceSlots<RetainedGraphStaging>::Storage graph_definition_staging;
         RunResourceSlots<RetainedSchedulerStorage>::Storage scheduler_state_storage;
         RunResourceSlots<std::shared_ptr<void>>::Storage orchestration_scratch;
+        RunResourceSlots<std::shared_ptr<void>>::Storage prepare_plans;
         RunResourceSlots<RetainedSmMirror>::Storage sm_mirrors;
         RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;
         RunResourceSlots<std::unique_ptr<ArenaBank>>::Storage arena_banks;

@@ -142,6 +142,10 @@ bool dep_gen_host_graph_active();
  */
 int dep_gen_host_graph_take(simpler::dfx::host_graph::HostGraphExport *out);
 
+// Restore an owned capture for export on the thread completing a parked plan.
+// No recording follows this hand-off; take/emit consumes it exactly once.
+void dep_gen_host_graph_restore_for_export(simpler::dfx::host_graph::HostGraphExport *graph, int outcome);
+
 /**
  * Write the captured graph to `deps_json_path`, truncating what is there.
  *

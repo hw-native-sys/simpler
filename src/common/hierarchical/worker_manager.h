@@ -168,6 +168,12 @@ struct MailboxRunEntry {
     uint64_t group_size;
     /* Child, before the terminal state. NUL-terminated, truncated to fit. */
     char error_text[MAILBOX_ERROR_MSG_SIZE];
+    /* Run-resource sets the child reports it can hold, published with this
+       run's terminal state and read by the parent only after observing it. A
+       count of identities, never a byte figure, and zero means "no report" —
+       a child that does not size itself leaves it alone. Appended last so no
+       existing field's offset moves. */
+    uint32_t admissible_run_resource_sets;
 };
 static_assert(
     std::is_trivially_copyable_v<MailboxRunEntry> && std::is_standard_layout_v<MailboxRunEntry>,

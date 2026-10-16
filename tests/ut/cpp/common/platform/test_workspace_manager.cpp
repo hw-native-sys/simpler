@@ -1040,6 +1040,109 @@ TEST(WorkspaceManagerDefault, ACurrentBackingIsNeverReclaimed) {
     EXPECT_EQ(m.acquire(region, 2, kOneMiB), warm);
 }
 
+// Idle current backing and an obsolete generation differ in exactly one fact —
+// whether a region still publishes the block — and only the second is the
+// reclaim's to take. The first is a trim's, and only after its owner has given
+// up naming it.
+TEST(WorkspaceManagerDefault, IdleBackingIsDetachableWhereAnObsoleteGenerationIsReclaimable) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
+
+    void *warm = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 1, kOneMiB, &warm));
+    EXPECT_TRUE(m.idle_backing(warm));
+    EXPECT_FALSE(m.has_reclaimable()) << "published, so no reclaim reaches it";
+
+    EXPECT_EQ(m.detach_idle_backing(warm), kOneMiB);
+    EXPECT_FALSE(m.idle_backing(warm)) << "it publishes nothing now";
+    EXPECT_TRUE(m.has_reclaimable());
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    ASSERT_EQ(backend.released.size(), 1u);
+    EXPECT_EQ(backend.released[0], warm);
+}
+
+// Capacity is not permission here either: a block a consumer still references
+// is refused rather than detached, so a request that found it idle a moment
+// earlier cannot take it from the run that took it since.
+TEST(WorkspaceManagerDefault, ReferencedBackingIsRefusedByTheDetach) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::staging_region(0);
+
+    void *block = m.acquire(region, 1, kOneMiB);
+    ASSERT_NE(block, nullptr);
+    m.note_published(region, block);
+    EXPECT_FALSE(m.idle_backing(block));
+    EXPECT_EQ(m.detach_idle_backing(block), 0u);
+    EXPECT_TRUE(m.owns(block));
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_TRUE(backend.released.empty());
+}
+
+// The holders a refused plan may wait for are the endpoint's launched runs,
+// whatever regions they hold: the blocks are charged against one allocator, so
+// a predecessor on another set holds bytes this request can receive. The
+// context's own backing is no consumer, and a run that has only prepared
+// cannot retire while the caller waits.
+TEST(WorkspaceManagerOwnership, EligibleHoldersAreTheEndpointsLaunchedRunsWhateverTheyHold) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    m.commit(WorkspaceManager::build(6));
+    const WorkspaceManager::RegionKey other_set =
+        WorkspaceManager::arena_region(3, WorkspaceManager::ArenaRegion::RuntimePool);
+    const WorkspaceManager::RegionKey context_own = WorkspaceManager::staging_region(5);
+
+    void *launched = m.acquire(other_set, 11, kOneMiB);
+    ASSERT_NE(launched, nullptr);
+    m.note_published(other_set, launched);
+    m.note_run_fact(3, 11, WorkspaceManager::RunFact::Launched);
+
+    void *prepared = m.acquire(WorkspaceManager::staging_region(2), 12, kOneMiB);
+    ASSERT_NE(prepared, nullptr);  // no fact at all: prepared and nothing more
+
+    void *context = m.acquire(context_own, WorkspaceManager::kContextEpoch, kOneMiB);
+    ASSERT_NE(context, nullptr);
+
+    std::vector<uint64_t> holders;
+    m.eligible_holders(/*requesting_epoch=*/99, &holders);
+    ASSERT_EQ(holders.size(), 1u);
+    EXPECT_EQ(holders[0], 11u);
+
+    // The launched run finishes: there is nothing left to wait for.
+    report_launched_and_drained(m, 3, 11);
+    report_host_side_done(m, 3, 11);
+    holders.clear();
+    m.eligible_holders(99, &holders);
+    EXPECT_TRUE(holders.empty());
+}
+
+// The context's own backing is unreferenced from the moment it is published —
+// a runtime that commits its pooled arena at prewarm holds exactly that, with
+// its device image already uploaded into it — so idleness alone cannot tell it
+// apart from a warm set. Only a block a run has held is a set's to give back.
+TEST(WorkspaceManagerDefault, TheContextsOwnBackingIsNeverIdleBackingToTrim) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const WorkspaceManager::RegionKey region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
+
+    void *prewarmed = m.acquire(region, WorkspaceManager::kContextEpoch, kOneMiB);
+    ASSERT_NE(prewarmed, nullptr);
+    m.note_published(region, prewarmed);
+    EXPECT_FALSE(m.idle_backing(prewarmed));
+    EXPECT_EQ(m.detach_idle_backing(prewarmed), 0u);
+
+    // A run holds it, then retires: now it is a set's storage, and idle.
+    ASSERT_TRUE(m.reference(prewarmed, 1));
+    report_launched_and_drained(m, 0, 1);
+    report_host_side_done(m, 0, 1);
+    EXPECT_TRUE(m.idle_backing(prewarmed));
+}
+
 TEST(WorkspaceManagerLedger, CompactionBoundsTheLedgerAndSurvivesAReissuedAddress) {
     FakeBackend backend;
     WorkspaceManager m;

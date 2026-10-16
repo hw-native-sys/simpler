@@ -2055,6 +2055,32 @@ class ChipWorker:
         """How many runs this worker may have launched at once, after its request was resolved."""
         return self._impl.launch_depth
 
+    def enable_automatic_admission(self) -> bool:
+        """Let this worker's device context size its own run concurrency.
+
+        Asked once, after init, by a caller that specified no depth and no byte budget. Returns
+        False when the loaded module or the context cannot — a simulated backend, a borrowed
+        context, or a module without the entry — and the worker then admits exactly what it was
+        granted, as it did before.
+        """
+        return bool(self._impl._enable_automatic_admission())  # noqa: SLF001 -- no public equivalent
+
+    @property
+    def automatic_admission(self) -> bool:
+        """Whether this worker's context sizes its own run concurrency."""
+        return bool(self._impl.automatic_admission)
+
+    @property
+    def admissible_run_resource_sets(self) -> int:
+        """Run-resource sets this context reports it can hold right now.
+
+        A count of identities, never a byte figure: it is one until a run has completed its
+        resource commit, grows with what this context has proved it can hold, and falls when those
+        resources are reclaimed or become unprovable. The granted count on a context that does not
+        size itself.
+        """
+        return int(self._impl.admissible_run_resource_sets)
+
     def configure_launch_depth(self, depth):
         """Ask, before init, for a launch depth.
 
