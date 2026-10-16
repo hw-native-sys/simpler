@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Public Worker submission preserves caller ordering and external ownership."""
+"""Dependent public Worker calls cross caller streams through events and D2D."""
 
 import ctypes
 import os
@@ -54,15 +54,26 @@ def _run(arch, runtime, device, borrowed):  # noqa: PLR0912 -- one subprocess ow
         ctypes.c_int,
         ctypes.c_void_p,
     ]
+    lib.aclrtCreateEventExWithFlag.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32]
+    lib.aclrtDestroyEvent.argtypes = [ctypes.c_void_p]
+    lib.aclrtRecordEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.aclrtStreamWaitEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     streams = [ctypes.c_void_p(), ctypes.c_void_p()]
+    handoffs = [ctypes.c_void_p(), ctypes.c_void_p()]
     device_buffers, host_buffers, sources, runs, outputs = [], [], [], [], []
     size = 128 * 128
     nbytes = size * ctypes.sizeof(ctypes.c_float)
     try:
         for stream in streams:
             assert lib.aclrtCreateStream(ctypes.byref(stream)) == 0
-        for invocation in range(4):
+        for event in handoffs:
+            assert lib.aclrtCreateEventExWithFlag(ctypes.byref(event), 1) == 0  # ACL_EVENT_SYNC
+        previous_output, previous_expected = None, 0.0
+        # Three calls keep every integer golden result exactly representable in float32.
+        for invocation in range(3):
             stream = streams[invocation % 2]
+            if invocation:
+                assert lib.aclrtStreamWaitEvent(stream, handoffs[invocation - 1]) == 0
             args = TaskArgs()
             device_views, host_views = [], []
             for index in range(3):
@@ -82,18 +93,24 @@ def _run(arch, runtime, device, borrowed):  # noqa: PLR0912 -- one subprocess ow
                     TensorArgType.INPUT if index < 2 else TensorArgType.OUTPUT_EXISTING,
                 )
             for index in range(2):
-                host_views[index][:] = [float(invocation + index + 1)] * size
+                value = -31.0 if invocation and index == 0 else float(invocation + index + 1)
+                host_views[index][:] = [value] * size
                 assert (
                     lib.aclrtMemcpyAsync(device_views[index], nbytes, host_buffers[-3 + index], nbytes, 1, stream) == 0
                 )
+            if invocation:
+                assert lib.aclrtMemcpyAsync(device_views[0], nbytes, previous_output, nbytes, 3, stream) == 0
             run = owner.submit(handle, args, caller_stream=stream.value)
             runs.append(run)
             with pytest.raises(RuntimeError, match="in-flight or unproven"):
                 sources[-1].close()
             assert lib.aclrtMemcpyAsync(host_buffers[-1], nbytes, device_views[2], nbytes, 2, stream) == 0
-            total = float(2 * invocation + 3)
+            if invocation < len(handoffs):
+                assert lib.aclrtRecordEvent(handoffs[invocation], stream) == 0
+            total = previous_expected + invocation + 2 if invocation else 3.0
             expected = (total + 1) * (total + 2) + (total if runtime == "tensormap_and_ringbuffer" else 0)
             outputs.append((host_views[2], expected))
+            previous_output, previous_expected = device_views[2], expected
         if contexts is not None:
             with contexts.other():
                 for operation in (
@@ -104,7 +121,7 @@ def _run(arch, runtime, device, borrowed):  # noqa: PLR0912 -- one subprocess ow
                 ):
                     with pytest.raises(ExecutionContextRefused):
                         operation()
-        # No RunHandle query precedes the caller's read: deferred submission fails this check.
+        # No successful RunHandle query precedes the caller's read.
         for stream in streams:
             assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
         for values, expected in outputs:
@@ -116,6 +133,13 @@ def _run(arch, runtime, device, borrowed):  # noqa: PLR0912 -- one subprocess ow
         # A failed drain stops cleanup before caller allocations can be released.
         for run in runs:
             run.wait()
+        # Caller copies and event waits outlive the kernel completion fence.
+        for stream in streams:
+            if stream.value:
+                assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
+        for event in handoffs:
+            if event.value:
+                assert lib.aclrtDestroyEvent(event) == 0
         for backing in sources:
             backing.close()
         for pointers, free in ((device_buffers, lib.aclrtFree), (host_buffers, lib.aclrtFreeHost)):
