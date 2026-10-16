@@ -55,6 +55,7 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 | `add_remote_worker(spec: RemoteWorkerSpec) -> int` | L4; see the remote-L3 design doc |
 | `init(prewarm_config=None, *, borrowed_context_generation=None)` | Resolves binaries; owns or borrows the direct L2 device context, or starts children |
 | `close()` | Retires runtime resources and children; resets only an owned device. Put it in a `finally` |
+| `session_cleanup_reports() -> dict[int, SessionCleanupReport]` | What closing each remote L3 session established, keyed by remote worker id. Keeps three events apart: whether the peer read the shutdown command, whether its process exited and with what status, and what its own release returned. `UNKNOWN` means the route cannot see that far, not that nothing happened |
 
 ### Borrowed device context and caller ordering
 

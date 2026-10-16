@@ -13,12 +13,14 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import queue
 import signal
 import struct
 import sys
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from typing import Any
 
@@ -52,6 +54,13 @@ from .remote_l3_session import (
     _install_manifest_inner_registry,
     _run_command_loop,
     _startup_deadline,
+)
+from .session_cleanup import (
+    GROUP_CLEANUP_RECORD_NAME,
+    CleanupOutcome,
+    ShutdownCommand,
+    encode_runner_record,
+    format_cleanup_failure,
 )
 from .worker import Worker
 
@@ -363,6 +372,47 @@ def _shutdown_frame(manifest: dict[str, Any]) -> bytes:
     )
 
 
+def _write_rank0_cleanup_record(
+    group_manifest_path: str | None,
+    *,
+    worker_id: int,
+    command: ShutdownCommand,
+    failures: tuple[str, ...],
+) -> None:
+    """Leave rank 0's cleanup record beside the group manifest for the launcher.
+
+    Written through a temporary name and renamed, so the launcher either finds a
+    whole record or none — it reads the file after reaping the group, with no
+    handshake to tell it the write finished.
+
+    The record covers **rank 0's own release only**. The other ranks do not
+    share this filesystem, and gathering their results here would block this
+    teardown on a rank that has already died; their releases reach the launcher
+    as the group's exit status instead.
+    """
+    if not group_manifest_path:
+        return
+    directory = os.path.dirname(os.path.abspath(group_manifest_path))
+    final_path = os.path.join(directory, GROUP_CLEANUP_RECORD_NAME)
+    staging_path = f"{final_path}.partial"
+    record = encode_runner_record(
+        worker_id=worker_id,
+        command=command,
+        cleanup=CleanupOutcome.FAILED if failures else CleanupOutcome.SUCCEEDED,
+        failures=failures,
+        rank=0,
+    )
+    try:
+        with open(staging_path, "wb") as f:
+            f.write(record)
+        os.replace(staging_path, final_path)
+    except OSError as exc:
+        # The launcher reads a missing record as "unknown", which is the honest
+        # answer; say so here rather than failing a teardown over a ledger write.
+        sys.stderr.write(f"[mpi-l3-session] WARN: could not write cleanup record: {exc}\n")
+        sys.stderr.flush()
+
+
 def _select_mailbox_replies(
     request: MailboxRequest,
     gathered: list[tuple[int, bool, bytes, MpiRankError | None]],
@@ -411,6 +461,7 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
     domain_comm: Any,
     group_manifest: dict[str, Any],
     manifest: dict[str, Any],
+    group_manifest_path: str | None = None,
 ) -> int:
     rank = int(dispatch_comm.Get_rank())
     worker_ids = tuple(int(value) for value in group_manifest["worker_ids"])
@@ -428,6 +479,9 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
     processor_thread: threading.Thread | None = None
     startup_ok = True
     startup_error = ""
+    # Whether this rank saw a shutdown command, as the cleanup record reports it.
+    # A group that dies without one never heard the parent ask.
+    shutdown_observed = False
 
     try:
         dispatch_registry = _install_manifest_dispatcher_registry(manifest)
@@ -534,6 +588,11 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
             if request is None:
                 exit_code = 1
                 break
+            # Recorded the moment the command is known, before the dispatch that
+            # carries it out: a shutdown whose dispatch then fails terminally was
+            # still received, and the record says so.
+            if request.opcode is MailboxOpcode.SHUTDOWN:
+                shutdown_observed = True
 
             local_reply = b""
             local_error: MpiRankError | None = None
@@ -581,8 +640,12 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
                         terminal=False,
                     )
                 elif request.opcode is MailboxOpcode.SHUTDOWN:
+                    # SHUTDOWN_DONE only: it releases the parent's native close,
+                    # which polls this word with the GIL held, so it must not
+                    # wait on a release that no command timeout bounds. CLOSED is
+                    # published in the teardown below, once there is a release
+                    # result for it to stand behind.
                     mailbox.complete_shutdown(sequence_id=request.sequence_id)
-                    mailbox.publish_closed()
                 else:
                     replies = _select_mailbox_replies(request, gathered, worker_ids)
                     mailbox.complete_request(sequence_id=request.sequence_id, payloads=replies)
@@ -596,11 +659,37 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
             if processor_thread.is_alive():
                 connection.feed(_shutdown_frame(manifest))
             processor_thread.join(timeout=5.0)
+        cleanup_error: BaseException | None = None
         try:
             inner_worker.close()
+        except BaseException as exc:  # noqa: BLE001 -- recorded for the launcher, then re-raised below
+            cleanup_error = exc
+            traceback.print_exc(file=sys.stderr)
+        cleanup_failures = (
+            () if cleanup_error is None else (format_cleanup_failure(f"MPI L3 rank {rank} release", cleanup_error),)
+        )
+        try:
+            if rank == 0:
+                _write_rank0_cleanup_record(
+                    group_manifest_path,
+                    worker_id=int(manifest["worker_id"]),
+                    command=ShutdownCommand.OBSERVED if shutdown_observed else ShutdownCommand.NOT_OBSERVED,
+                    failures=cleanup_failures,
+                )
         finally:
             if mailbox is not None:
-                mailbox.close()
+                # CLOSED means one thing: the shutdown command completed and the
+                # release behind it is done. So it is published only for a group
+                # that was asked to stop — a teardown reached any other way
+                # leaves the state alone — and only here, where there is a
+                # release result for it to stand behind.
+                try:
+                    if shutdown_observed:
+                        mailbox.publish_closed()
+                finally:
+                    mailbox.close()
+        if cleanup_error is not None:
+            raise cleanup_error
     return exit_code
 
 
@@ -639,6 +728,7 @@ def main(argv: list[str] | None = None) -> int:
             domain_comm=domain_comm,
             group_manifest=group_manifest,
             manifest=dict(rank_manifests[rank]),
+            group_manifest_path=ns.group_manifest,
         )
     finally:
         domain_comm.Free()

@@ -100,6 +100,12 @@ from .remote_l3_protocol import (
     read_frame,
     send_frame,
 )
+from .session_cleanup import (
+    CleanupOutcome,
+    ShutdownCommand,
+    encode_runner_record,
+    format_cleanup_failure,
+)
 from .task_interface import ChipCallable, TaskArgs, get_element_size
 from .worker import Worker, _level_capture_prefix, _NoBufferConsumerError
 
@@ -685,7 +691,19 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     manifest_inner_handles: dict[tuple[CallableKind, bytes], CallableHandle] | None = None,
     manifest_dispatch_registry: dict[bytes, Callable[..., Any]] | None = None,
     global_domain_prepare_import: Callable[[GlobalDomainCommand, Worker, int], bytes | None] | None = None,
-) -> None:
+) -> ShutdownCommand:
+    """Serve one session's command lane until it ends, and report how it ended.
+
+    The return value is the shutdown-command half of this session's cleanup
+    record: ``OBSERVED`` when a SHUTDOWN frame arrived, ``NOT_OBSERVED`` when
+    the lane reached EOF first. Those are different facts about the parent —
+    only the first proves it asked for a shutdown rather than merely dropping
+    the transport — so the caller records which one happened instead of
+    treating both as a normal end. Any other failure still propagates.
+
+    Positional parameters are fixed: callers outside this module drive the loop
+    over non-socket lanes and pass them positionally.
+    """
     session_id = int(manifest["session_id"])
     worker_id = int(manifest["worker_id"])
     dispatch_registry: dict[bytes, Callable[..., Any]] = dict(manifest_dispatch_registry or {})
@@ -729,12 +747,20 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
 
     try:
         while True:
-            frame = read_frame(conn)
+            try:
+                frame = read_frame(conn)
+            except EOFError:
+                # The lane closed without a SHUTDOWN frame. Reached whenever the
+                # parent drops the transport instead of asking, so it is the
+                # ordinary end of a session rather than a failure — but it
+                # leaves the shutdown command unacknowledged, which the caller
+                # records.
+                return ShutdownCommand.NOT_OBSERVED
             header = frame.header
             if header.session_id != session_id or header.worker_id != worker_id:
                 raise RuntimeError("remote session received mismatched session or worker frame")
             if header.frame_type == FrameType.SHUTDOWN:
-                return
+                return ShutdownCommand.OBSERVED
             if header.frame_type == FrameType.CONTROL:
                 try:
                     control = decode_control(frame.payload)
@@ -1269,6 +1295,51 @@ def run_session(
     stop_health = threading.Event()
     health_thread: threading.Thread | None = None
     ready_sent = False
+    # How the command lane ended, as the record below reports it. A session that
+    # fails before the lane opens never heard a shutdown command either, so
+    # NOT_OBSERVED is the honest starting value rather than a placeholder.
+    command_state = ShutdownCommand.NOT_OBSERVED
+    cleanup_failures: tuple[str, ...] | None = None
+
+    def _close_inner_once() -> tuple[str, ...]:
+        """Release this session's resources, recording rather than raising.
+
+        Called from the normal path and again from the finally backstop; the
+        first attempt's outcome is what the record reports. A second call would
+        be a retry of journalled teardown debt (a Worker's CLOSED is absorbing),
+        but re-reporting it would let a later retry overwrite the verdict the
+        exit status already carried.
+        """
+        nonlocal cleanup_failures
+        if cleanup_failures is None:
+            try:
+                inner_worker.close()
+                cleanup_failures = ()
+            except BaseException as exc:  # noqa: BLE001 -- a release failure is recorded, never raised past here
+                cleanup_failures = (format_cleanup_failure("remote L3 session release", exc),)
+                traceback.print_exc(file=sys.stderr)
+        return cleanup_failures
+
+    def _emit_cleanup_record(failures: tuple[str, ...]) -> None:
+        """Write this session's own half of its cleanup record to stderr.
+
+        Once the parent has dropped the command transport, stderr is the only
+        lane this runner still shares with the launcher that spawned it, so the
+        record goes there rather than nowhere. The exit status carries the same
+        verdict for a launcher that reads only that.
+        """
+        record = encode_runner_record(
+            worker_id=int(manifest["worker_id"]),
+            command=command_state,
+            cleanup=CleanupOutcome.FAILED if failures else CleanupOutcome.SUCCEEDED,
+            failures=failures,
+        )
+        try:
+            sys.stderr.write("[remote-l3-session] cleanup-record " + record.decode("utf-8"))
+            sys.stderr.flush()
+        except OSError:
+            # stderr is gone; the exit status still reports the same verdict.
+            pass
 
     def _publish_ready(payload: dict[str, Any]) -> None:
         nonlocal ready_sent
@@ -1343,7 +1414,7 @@ def run_session(
         # parent closes the command socket (read_frame sees EOF).
         conn.settimeout(None)
         with conn:
-            _run_command_loop(
+            observed = _run_command_loop(
                 conn,
                 manifest,
                 inner_worker,
@@ -1351,7 +1422,18 @@ def run_session(
                 manifest_dispatch_registry,
                 global_domain_prepare_import,
             )
-        return 0
+            # Only an explicit OBSERVED counts as one, so the record can only
+            # ever under-claim: a lane that reported anything else acknowledged
+            # nothing. The loop is also driven over non-socket lanes whose
+            # callers discard the value, and none of them may turn an
+            # unacknowledged shutdown into a confirmed one.
+            command_state = (
+                ShutdownCommand.OBSERVED if observed is ShutdownCommand.OBSERVED else ShutdownCommand.NOT_OBSERVED
+            )
+        # A session that served its lane cleanly still fails if it cannot
+        # release what it owns: the exit status is the launcher's only signal
+        # when nothing reads the record line.
+        return 1 if _close_inner_once() else 0
     except BaseException as exc:  # noqa: BLE001
         if not ready_sent:
             try:
@@ -1368,10 +1450,10 @@ def run_session(
                 pass
         if health_thread is not None:
             health_thread.join(timeout=1.0)
-        try:
-            inner_worker.close()
-        except BaseException:  # noqa: BLE001
-            pass
+        # Backstop for every path that did not reach the release above — a
+        # startup failure, or an exception out of the command lane. Exactly one
+        # record is emitted per session, after the release has been attempted.
+        _emit_cleanup_record(_close_inner_once())
 
 
 def _raise_keyboard_interrupt(_signum, _frame):

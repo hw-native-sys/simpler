@@ -424,6 +424,13 @@ by every runtime built on it, so publishing is gated on the runtime's own
 other runtime answers "no observation", which reads back as an uncommitted
 record. Remote endpoints have no local mailbox and produce no entry at all.
 
+A remote L3 session is accounted for by the separate ledger
+`Worker.session_cleanup_reports()`, built the same way and for the same reason:
+a close has three independent outcomes — the shutdown command being read, the
+process exiting, the resources being released — and one value cannot carry
+them. See [mpi-l3-mailbox.md](mpi-l3-mailbox.md) for how far each route's
+launcher can see.
+
 A chip child that outlives the close deadline is handed to the cleanup
 journal, and its record is read there instead: inside the same retry closure,
 after the reap succeeds and before the shm is closed. So a late publication is
