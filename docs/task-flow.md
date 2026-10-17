@@ -517,7 +517,7 @@ The supported entry paths establish this ownership as follows:
 | -------- | -------------- |
 | `Worker.submit` | The submission lock serializes the Python construction callback. |
 | `ChipWorker::prepare_native_run_on_slot` | A slot in `PREPARING` or `PREPARED` rejects another prepare; a successor may prepare only beside a `LAUNCHED` or `REAPED` predecessor. |
-| `simpler_prepare_run` | The runner reservation is acquired before bind and permits only one reserved successor beside the active owner. |
+| `simpler_prepare_run` | Onboard same-thread reentry within one loaded runtime module is refused before changing the nested request's state, even for another context. The runner reservation is acquired before bind and permits only one reserved successor beside the active owner. |
 | Callable registration | Each registration materializes a unique temporary SO and loads it with `RTLD_LOCAL`; separate registrations do not intentionally share a binding global. |
 | Host orchestration entry | A scope guard drains the recorder pool on normal return and exception unwinding, before Graph commit or destruction of the local build state. |
 

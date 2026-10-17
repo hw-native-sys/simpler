@@ -14,6 +14,9 @@
 #include <cstring>
 #include <filesystem>
 #include <future>
+#include <functional>
+#include <stdexcept>
+#include <utility>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -37,9 +40,11 @@ int callbacks = 0;
 bool refuse_after_callback = false;
 #ifndef SIMPLER_UT_TRB_RUNTIME
 OrchContext *current_orchestrator = nullptr;
-void entry(const ChipTaskArgs &args) {
+OrchContext *other_orchestrator = nullptr;
+std::function<void()> callback_hook;
+void record_entry(const ChipTaskArgs &args, OrchContext *&binding) {
     ++callbacks;
-    auto &orch = *current_orchestrator->orchestrator;
+    auto &orch = *binding->orchestrator;
     uint32_t shape[] = {16};
     GraphTaskArgs boundary;
     boundary.add_input(args.tensor(0).ref());
@@ -53,15 +58,19 @@ void entry(const ChipTaskArgs &args) {
     ASSERT_TRUE(orch.submit_dummy_task(task).task_id().is_valid());
     ASSERT_TRUE(orch.graph_end());
     orch.graph_commit();
-    current_orchestrator = nullptr;
+    binding = nullptr;
+    if (auto hook = std::exchange(callback_hook, {})) hook();
     if (refuse_after_callback) control().ceiling = control().bytes;
 }
+void entry(const ChipTaskArgs &args) { record_entry(args, current_orchestrator); }
 void bind(OrchContext *ctx) { current_orchestrator = ctx; }
+void other_entry(const ChipTaskArgs &args) { record_entry(args, other_orchestrator); }
+void other_bind(OrchContext *ctx) { other_orchestrator = ctx; }
 struct EntryPoints {
     void (*entry)(const ChipTaskArgs &);
     void (*bind)(OrchContext *);
     void (*finish)();
-} entry_points{entry, bind, nullptr};
+} entry_points{entry, bind, nullptr}, other_entry_points{other_entry, other_bind, nullptr};
 #endif
 
 class Runner : public DeviceRunnerBase {
@@ -82,6 +91,9 @@ public:
         callables_[1] = std::move(callable);
         chip_callable_buffers_[1] = ChipCallableBuffer{};
     }
+#ifndef SIMPLER_UT_TRB_RUNTIME
+    void use_other_entry() { callables_[1].host_orch_func_ptr = &other_entry_points; }
+#endif
     ~Runner() override { EXPECT_EQ(finalize(), 0); }
     bool can_accept_run() const override { return true; }
     bool ready_to_join_launch() const override { return true; }
@@ -125,6 +137,11 @@ public:
     }
     AutoAdmissionState::SlotPlan plan(uint32_t slot) const { return auto_admission_.plan(slot); }
     size_t charged() const { return workspace_.reserved_bytes(); }
+    bool holds_epoch(uint64_t epoch) const { return workspace_.holds_references(epoch); }
+    bool arena_referenced(uint32_t bank, size_t region) const {
+        void *backing = arena_region_backing(bank, region);
+        return backing != nullptr && workspace_.block_state(backing) == WorkspaceManager::BlockState::Referenced;
+    }
     const simpler::dfx::HostPhaseRecordStore &phases(uint32_t slot) const { return host_phase_runs_[slot].records; }
     size_t reservations() const {
         size_t n = 0;
@@ -194,6 +211,9 @@ protected:
         control() = {};
         callbacks = 0;
         refuse_after_callback = false;
+#ifndef SIMPLER_UT_TRB_RUNTIME
+        callback_hook = {};
+#endif
     }
     void TearDown() override {
         EXPECT_EQ(control().bytes, 0u);
@@ -220,6 +240,191 @@ protected:
         r.note_workspace_run_fact(slot, epoch, Fact::Launched);
     }
 };
+
+#ifndef SIMPLER_UT_TRB_RUNTIME
+TEST_F(NativeAdmissionTest, CallbackRejectsAnotherContextBeforeChangingItsRunState) {
+    Runner outer_runner;
+    Runner inner_runner;
+    inner_runner.use_other_entry();
+    Attempt outer(outer_runner, 1, 20);
+    Attempt inner(inner_runner, 2, 30);
+    volatile int32_t accepted = 73;
+    inner.descriptor.accepted_state = &accepted;
+    inner.descriptor.accepted_value = 1;
+    const std::vector<uint8_t> untouched(get_runtime_size(), 0);
+    bool entered = false;
+    callback_hook = [&] {
+        entered = true;
+        const auto allocations = control().allocations;
+        EXPECT_EQ(inner.prepare(), PTO_RUNTIME_ERR_INVALID_STATE);
+        EXPECT_EQ(simpler_prepare_run(nullptr, nullptr, 0, nullptr, nullptr, nullptr), PTO_RUNTIME_ERR_INVALID_STATE);
+        EXPECT_EQ(std::memcmp(inner.storage, untouched.data(), untouched.size()), 0);
+        EXPECT_EQ(accepted, 73);
+        EXPECT_EQ(control().allocations, allocations);
+        EXPECT_EQ(inner_runner.reservations(), 0u);
+        EXPECT_EQ(inner_runner.charged(), 0u);
+        EXPECT_EQ(inner_runner.plan(2).epoch, 0u);
+        EXPECT_EQ(inner_runner.plan(2).phase, AutoAdmissionState::Phase::None);
+        EXPECT_EQ(inner_runner.get_prepare_plan(2), nullptr);
+        EXPECT_EQ(outer_runner.reservations(), 1u);
+        EXPECT_EQ(outer_runner.plan(1).epoch, 20u);
+        EXPECT_TRUE(outer_runner.holds_epoch(20));
+    };
+    ASSERT_EQ(outer.prepare(), 0);
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(callbacks, 1);
+    EXPECT_TRUE(outer_runner.arena_referenced(1, 0));
+    EXPECT_TRUE(outer_runner.arena_referenced(1, 2));
+    EXPECT_TRUE(outer_runner.holds_epoch(20));
+    EXPECT_FALSE(outer_runner.holds_epoch(30));
+    ASSERT_EQ(simpler_finalize_run(&outer_runner, outer.storage), 0);
+    EXPECT_FALSE(outer_runner.holds_epoch(20));
+    // The same request remains usable after the outer prepare has returned.
+    ASSERT_EQ(inner.prepare(), 0);
+    EXPECT_EQ(callbacks, 2);
+    EXPECT_TRUE(inner_runner.holds_epoch(30));
+    ASSERT_EQ(simpler_finalize_run(&inner_runner, inner.storage), 0);
+    EXPECT_FALSE(inner_runner.holds_epoch(30));
+    EXPECT_EQ(accepted, 73);  // neither request launched
+}
+
+TEST_F(NativeAdmissionTest, CallbackRejectsSameContextBeforeConstructingAnotherRun) {
+    Runner runner;
+    Attempt outer(runner, 1, 20);
+    Attempt inner(runner, 2, 30);
+    const std::vector<uint8_t> untouched(get_runtime_size(), 0);
+    bool entered = false;
+    callback_hook = [&] {
+        entered = true;
+        EXPECT_EQ(
+            simpler_run(&runner, inner.storage, 1, &inner.args, &inner.config, &inner.descriptor),
+            PTO_RUNTIME_ERR_INVALID_STATE
+        );
+        EXPECT_EQ(std::memcmp(inner.storage, untouched.data(), untouched.size()), 0);
+        EXPECT_EQ(runner.reservations(), 1u);
+        EXPECT_EQ(runner.plan(2).phase, AutoAdmissionState::Phase::None);
+        EXPECT_EQ(runner.plan(1).epoch, 20u);
+    };
+    ASSERT_EQ(outer.prepare(), 0);
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(callbacks, 1);
+    EXPECT_TRUE(runner.arena_referenced(1, 2));
+}
+
+TEST_F(NativeAdmissionTest, CallbackExceptionUnwindsOuterOwnershipAndAllowsTheNextPrepare) {
+    Runner outer_runner;
+    Runner inner_runner;
+    inner_runner.use_other_entry();
+    Attempt outer(outer_runner, 1, 20);
+    Attempt inner(inner_runner, 2, 30);
+    callback_hook = [&] {
+        EXPECT_EQ(inner.prepare(), PTO_RUNTIME_ERR_INVALID_STATE);
+        throw std::runtime_error("host callback failed after nested prepare refusal");
+    };
+    EXPECT_EQ(outer.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(outer.empty());
+    EXPECT_TRUE(inner.empty());
+    EXPECT_EQ(outer_runner.reservations(), 0u);
+    EXPECT_EQ(inner_runner.reservations(), 0u);
+    EXPECT_FALSE(outer_runner.holds_epoch(20));
+    EXPECT_FALSE(outer_runner.plan(1).holds_token);
+    EXPECT_EQ(outer_runner.get_prepare_plan(1), nullptr);
+    ASSERT_EQ(inner.prepare(), 0);
+    ASSERT_EQ(simpler_finalize_run(&inner_runner, inner.storage), 0);
+    outer.descriptor.run_epoch = 21;
+    ASSERT_EQ(outer.prepare(), 0);
+    EXPECT_TRUE(outer_runner.holds_epoch(21));
+    EXPECT_FALSE(outer_runner.holds_epoch(20));
+}
+
+TEST_F(NativeAdmissionTest, ReservedPrepareExcludesAWarmConsumerBeforeTrimmingItsIdleBank) {
+    Runner runner;
+    Attempt warmup(runner, 2, 10);
+    ASSERT_EQ(warmup.prepare(), 0);
+    ASSERT_EQ(simpler_finalize_run(&runner, warmup.storage), 0);
+    void *const idle_heap = runner.arena_region_backing(2, 0);
+    void *const idle_image = runner.arena_region_backing(2, 2);
+    ASSERT_NE(idle_heap, nullptr);
+    ASSERT_NE(idle_image, nullptr);
+    Attempt outer(runner, 1, 20);
+    Attempt warm_consumer(runner, 2, 30);
+    bool entered = false;
+    callback_hook = [&] {
+        entered = true;
+        const auto allocations = control().allocations;
+        const auto charged = runner.charged();
+        auto contender = std::async(std::launch::async, [&] {
+            return warm_consumer.prepare();
+        });
+        const int rc = contender.get();
+        // A different thread passes the reentry guard; the unclaimed native
+        // reservation must still exclude even a non-growing bank consumer.
+        EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_TRUE(warm_consumer.empty());
+        EXPECT_EQ(control().allocations, allocations);
+        EXPECT_EQ(runner.charged(), charged);
+        EXPECT_EQ(runner.reservations(), 1u);
+        EXPECT_EQ(runner.arena_region_backing(2, 0), idle_heap);
+        EXPECT_EQ(runner.arena_region_backing(2, 2), idle_image);
+        if (rc == 0) EXPECT_EQ(simpler_finalize_run(&runner, warm_consumer.storage), 0);
+        control().ceiling = control().bytes;
+    };
+    ASSERT_EQ(outer.prepare(), 0);
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(runner.arena_region_backing(2, 0), nullptr);
+    EXPECT_EQ(runner.arena_region_backing(2, 2), nullptr);
+    EXPECT_EQ(runner.retained_temp_addr(2), 0u);
+    EXPECT_TRUE(runner.arena_referenced(1, 2));
+    ASSERT_EQ(simpler_finalize_run(&runner, outer.storage), 0);
+    control().ceiling = std::numeric_limits<size_t>::max();
+    const auto allocations = control().allocations;
+    ASSERT_EQ(warm_consumer.prepare(), 0);
+    EXPECT_GT(control().allocations, allocations);
+    EXPECT_TRUE(runner.arena_referenced(2, 2));
+    EXPECT_TRUE(runner.holds_epoch(30));
+}
+
+TEST_F(NativeAdmissionTest, AnotherThreadCanPrepareADifferentContextWhileTheCallbackWaits) {
+    Runner outer_runner;
+    Runner other_runner;
+    other_runner.use_other_entry();
+    Attempt outer(outer_runner, 1, 20);
+    bool entered = false;
+    callback_hook = [&] {
+        entered = true;
+        auto other = std::async(std::launch::async, [&] {
+            Attempt attempt(other_runner, 2, 30);
+            const int rc = attempt.prepare();
+            if (rc == 0) {
+                EXPECT_TRUE(other_runner.holds_epoch(30));
+                EXPECT_EQ(simpler_finalize_run(&other_runner, attempt.storage), 0);
+            }
+            return rc;
+        });
+        EXPECT_EQ(other.get(), 0);
+        EXPECT_EQ(outer_runner.plan(1).epoch, 20u);
+    };
+    ASSERT_EQ(outer.prepare(), 0);
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(callbacks, 2);
+    EXPECT_TRUE(outer_runner.arena_referenced(1, 2));
+    EXPECT_FALSE(other_runner.holds_epoch(30));
+}
+#endif
+
+TEST_F(NativeAdmissionTest, EarlyPrepareFailureDoesNotBlockTheNormalRunComposition) {
+    EXPECT_EQ(simpler_prepare_run(nullptr, nullptr, 0, nullptr, nullptr, nullptr), PTO_RUNTIME_ERR_INTERNAL);
+    Runner runner;
+    Attempt failed(runner, 0, 10);
+    failed.config.aicpu_thread_num = 1;
+    EXPECT_EQ(failed.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(failed.empty());
+    Attempt next(runner, 0, 20);
+    EXPECT_EQ(simpler_run(&runner, next.storage, 1, &next.args, &next.config, &next.descriptor), 0);
+    EXPECT_TRUE(next.empty());
+    EXPECT_EQ(runner.reservations(), 0u);
+    EXPECT_FALSE(runner.holds_epoch(20));
+}
 
 TEST_F(NativeAdmissionTest, ActualStagingAdapterTrimsIdleStorageThenRetriesOnce) {
     Runner runner;

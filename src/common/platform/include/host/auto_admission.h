@@ -193,8 +193,9 @@ public:
      * The proven prefix plus one exploratory slot, and the exploratory slot is
      * offered only while no growth is in flight — the same exclusivity the
      * token enforces, so the count cannot invite a second simultaneous
-     * replacement peak. Never zero: a context always holds the run it is
-     * executing. Never above the identity directory's own limit.
+     * replacement peak. For enabled contexts with a positive directory limit,
+     * never zero and never above that limit. Disabled or empty directories
+     * report the supplied limit unchanged.
      */
     uint32_t affordable_sets(uint32_t directory_limit) const {
         std::scoped_lock lk(mu_);

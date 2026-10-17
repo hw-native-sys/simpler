@@ -45,6 +45,7 @@
 #include <cstdio>
 #include <cstring>
 #include <new>
+#include <pthread.h>
 #include <utility>
 #include <vector>
 
@@ -1486,6 +1487,24 @@ int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
     const NativeRunDescriptor *descriptor
 ) {
+    // One prepare owns this module's thread-local workspace and diagnostic
+    // transaction until its cleanup returns, including across host callbacks.
+    struct PrepareThreadKey {
+        pthread_key_t key{};
+        int rc{pthread_key_create(&key, nullptr)};
+        ~PrepareThreadKey() {
+            if (rc == 0) pthread_key_delete(key);
+        }
+    };
+    static PrepareThreadKey thread_key;
+    if (thread_key.rc != 0) return PTO_RUNTIME_ERR_INTERNAL;
+    if (pthread_getspecific(thread_key.key) != nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (pthread_setspecific(thread_key.key, &thread_key) != 0) return PTO_RUNTIME_ERR_INTERNAL;
+    const auto prepare_scope = RAIIScopeGuard([] {
+        if (pthread_setspecific(thread_key.key, nullptr) != 0) {
+            LOG_ERROR("simpler_prepare_run: could not release this thread's prepare ownership");
+        }
+    });
     if (ctx == nullptr || runtime == nullptr || config == nullptr || descriptor == nullptr)
         return PTO_RUNTIME_ERR_INTERNAL;
     // Against the grant this context was given, not a compile-time width: a set

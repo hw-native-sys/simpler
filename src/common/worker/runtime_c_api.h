@@ -114,7 +114,7 @@ enum {
     PTO_RUNTIME_ERR_INVALID_STATE = PTO_RUNTIME_ERR_BASE - 3,
     /* A caller supplied an invalid pointer, id, size, or other argument. */
     PTO_RUNTIME_ERR_INVALID_ARGUMENT = PTO_RUNTIME_ERR_BASE - 4,
-    /* BASE - 5 is held by the diagnostic collector's capacity refusal. */
+    /* BASE - 5 is reserved for diagnostic collector capacity refusal. */
     /* A prepare could not take the device resources it needs now, and a
        consumer that still holds some of them has a retirement this context will
        reach. The plan is kept and retried once that consumer finishes, so this
@@ -972,6 +972,14 @@ int simpler_run(
  * This preparation can allocate and synchronously publish metadata and must
  * run outside capture. Kernel execution is not supported yet: launch remains
  * rejected, including through simpler_launch_run().
+ *
+ * Onboard prepare is non-reentrant on one thread within a loaded runtime
+ * module, including calls for a different context or through simpler_run().
+ * A nested call returns PTO_RUNTIME_ERR_INVALID_STATE before validating its
+ * arguments or modifying runtime storage, reservations, plans, or acceptance
+ * sinks. The outer prepare remains owned until it returns or unwinds; a later
+ * sequential call is permitted. This guard does not serialize different
+ * threads, which remain subject to the context's native reservation rules.
  */
 int simpler_prepare_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
