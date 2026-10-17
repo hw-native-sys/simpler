@@ -230,17 +230,19 @@ platform_single_case(test_device_fault_cross_dso.cpp
 # device-initialized tail at all — its header states extent equals copy size —
 # so it declares no teardown_gates and the boundary these cases pin does not
 # exist there. host_build_graph has the tail on both arches.
+set(KERNEL_ARGS_FIXTURES ${CMAKE_SOURCE_DIR}/support/kernel_args)
 set(KERNEL_ARGS_INCLUDES ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host ${SIMPLER_SRC}/common/worker)
 
 tmr_case(test_kernel_persistent_args.cpp ARCHS a2a3
     SOURCES  ${KERNEL_PERSISTENT_ARGS_SRC}
              ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
-    INCLUDES ${KERNEL_ARGS_INCLUDES}
-    DEFINES  SIMPLER_UT_TRB_RUNTIME)
+             ${CMAKE_CURRENT_SOURCE_DIR}/test_kernel_persistent_args_tmr.cpp
+    INCLUDES ${KERNEL_ARGS_INCLUDES} ${KERNEL_ARGS_FIXTURES})
 
 hbg_case(test_kernel_persistent_args.cpp
     SOURCES  ${KERNEL_PERSISTENT_ARGS_SRC} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
-    INCLUDES ${KERNEL_ARGS_INCLUDES})
+             ${CMAKE_CURRENT_SOURCE_DIR}/test_kernel_persistent_args_hbg.cpp
+    INCLUDES ${KERNEL_ARGS_INCLUDES} ${KERNEL_ARGS_FIXTURES})
 
 # Compile the actual onboard helper/allocator without an SDK. support/kernel_args
 # stands in for the CANN headers and must precede the gtest prefix, which on a
@@ -268,10 +270,11 @@ hbg_case(test_kernel_args_helper.cpp
 # publishes the prefixes it measures.
 tmr_case(test_runtime_workers_boundary.cpp
     SOURCES ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
-    DEFINES SIMPLER_UT_TRB_RUNTIME)
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_runtime_workers_boundary_tmr.cpp)
 
 hbg_case(test_runtime_workers_boundary.cpp
-    SOURCES ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
+    SOURCES ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_runtime_workers_boundary_hbg.cpp)
 
 # The publication side, and a case of this directory's own: it drives the real
 # onboard helper and allocator, and takes the CANN stand-in its siblings above
@@ -289,16 +292,17 @@ hbg_case(test_runtime_workers_publication.cpp
 # prepare captured them. Same pairing as the publication case above, and for the
 # same reason: one source, one build per runtime, each resolving "runtime.h" to
 # its own. The trb build additionally covers the descriptor's wire offsets and
-# the raw-byte decode, so it defines SIMPLER_UT_TRB_RUNTIME.
+# the raw-byte decode in its explicit runtime-specific case source.
 tmr_case(test_launch_entry_args.cpp
     SOURCES ${KERNEL_ARGS_HELPER_TEST_SOURCES}
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_launch_entry_args_tmr.cpp
             ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
-    INCLUDES_BEFORE ${CMAKE_SOURCE_DIR}/support/kernel_args ${KERNEL_ARGS_INCLUDES}
-    DEFINES SIMPLER_UT_TRB_RUNTIME)
+    INCLUDES_BEFORE ${KERNEL_ARGS_FIXTURES} ${KERNEL_ARGS_INCLUDES})
 
 hbg_case(test_launch_entry_args.cpp
     SOURCES ${KERNEL_ARGS_HELPER_TEST_SOURCES} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
-    INCLUDES_BEFORE ${CMAKE_SOURCE_DIR}/support/kernel_args ${KERNEL_ARGS_INCLUDES})
+            ${CMAKE_CURRENT_SOURCE_DIR}/test_launch_entry_args_hbg.cpp
+    INCLUDES_BEFORE ${KERNEL_ARGS_FIXTURES} ${KERNEL_ARGS_INCLUDES})
 
 # A loadable stand-in for a compiled AICore child kernel. The sim
 # registration writes each child's binary to a temp file, dlopens it and
@@ -606,6 +610,8 @@ set(NATIVE_ADMISSION_INCLUDES
     ${SIMPLER_SRC}/common/worker)
 hbg_case(test_native_admission.cpp
     SOURCES ${NATIVE_ADMISSION_SOURCES}
+        ${CMAKE_SOURCE_DIR}/support/native_admission/hbg_preparation.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/test_native_admission_hbg.cpp
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/host/runtime_maker.cpp
         ${_hbg_orch_host_sources}
         ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
@@ -617,10 +623,11 @@ hbg_case(test_native_admission.cpp
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
 tmr_case(test_native_admission.cpp
     SOURCES ${NATIVE_ADMISSION_SOURCES}
+        ${CMAKE_SOURCE_DIR}/support/native_admission/tmr_preparation.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
     INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
-    DEFINES SIMPLER_UT_TRB_RUNTIME SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
+    DEFINES SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
 
 # ---------------------------------------------------------------------------

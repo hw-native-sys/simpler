@@ -155,10 +155,3 @@ void RunRetentionProbePeer::adopt_drain_ownership(DeviceRunnerBase &, const Prep
     std::fputs("native admission CPU transport cannot adopt hardware drain ownership\n", stderr);
     std::abort();
 }
-
-#ifdef SIMPLER_UT_TRB_RUNTIME
-#include "host/host_graph_exporter.h"
-extern "C" bool dep_gen_host_graph_active() { return false; }
-extern "C" int dep_gen_host_graph_emit(const char *) { return -1; }
-extern "C" int dep_gen_host_graph_take(simpler::dfx::host_graph::HostGraphExport *) { return -1; }
-#endif

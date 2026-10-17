@@ -35,6 +35,9 @@ Runtime::Runtime() {
     dev.aicpu_allowed_cpu_count = 0;
     dev.aicpu_launch_count = 0;
     dev.host_total_tasks = 0;
+    dev.graph_section_base = 0;
+    dev.graph_section_bytes = 0;
+    dev.graph_section_source = static_cast<uint32_t>(GraphSectionSource::None);
     dev.sm_image_bytes = 0;
     dev.gm_sm_ptr_ = nullptr;
     dev.prebuilt_arena_base_ = nullptr;
