@@ -280,8 +280,9 @@ struct ChipRunLaneState {
      * identity and its lifetime — and it runs for every admitted run, not only one that borrowed,
      * since incomplete coverage can leave partial borrows as well as declarations.
      *
-     * `proven_done` is whether the run's own finalize reported success. That call drains its
-     * device work, copies its outputs back and releases its bindings, so success is what
+     * `proven_done` means successful finalize or a clean preparation rollback. Finalize
+     * drains device work, copies outputs back and releases bindings; rollback releases
+     * bindings without submitting an operator kernel. Either outcome is what
      * establishes that nothing on the device can still reach these bytes or still be writing
      * them. Failure establishes the opposite, and both facts are kept: the caller's release stays
      * refused rather than handing back pages the device may name, and the bytes this run declared
@@ -316,6 +317,24 @@ struct ChipRunLaneState {
         // whose front is supposed to be the oldest live run.
         auto it = std::find(fifo.begin(), fifo.end(), run);
         if (it != fifo.end()) fifo.erase(it);
+    }
+
+    void fail_prepare(const std::shared_ptr<ChipRunState> &run) noexcept {
+        run->error = std::current_exception();
+        bool inputs_released = false;
+        try {
+            std::rethrow_exception(run->error);
+        } catch (const RunPreparationRefused &) {
+            inputs_released = true;
+        } catch (...) {}
+        const bool plan_released = release_run_plan(run);
+        release_device_spans(run, inputs_released && plan_released);
+        // No launch does not prove host bindings were released. An unknown
+        // rollback keeps its borrows and prevents a new occupant of this slot.
+        if (!inputs_released) poison_with(run, run->error);
+        run->phase = ChipRunState::Phase::TERMINAL;
+        const auto position = std::find(fifo.begin(), fifo.end(), run);
+        if (position != fifo.end()) fifo.erase(position);
     }
 
     void fail_launch(const std::shared_ptr<ChipRunState> &run) noexcept {
@@ -358,11 +377,7 @@ struct ChipRunLaneState {
                 run->resource_wait = true;
                 return;
             } catch (...) {
-                run->error = std::current_exception();
-                const bool plan_released = release_run_plan(run);
-                release_device_spans(run, plan_released);
-                run->phase = ChipRunState::Phase::TERMINAL;
-                fifo.pop_front();
+                fail_prepare(run);
                 return;
             }
             run->resource_wait = false;
@@ -557,12 +572,7 @@ struct ChipRunLaneState {
             run->resource_wait = true;
             return;
         } catch (...) {
-            run->error = std::current_exception();
-            const bool plan_released = release_run_plan(run);
-            release_device_spans(run, plan_released);
-            run->phase = ChipRunState::Phase::TERMINAL;
-            auto it = std::find(fifo.begin(), fifo.end(), run);
-            if (it != fifo.end()) fifo.erase(it);
+            fail_prepare(run);
         }
     }
 

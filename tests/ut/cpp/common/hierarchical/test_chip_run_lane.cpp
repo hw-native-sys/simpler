@@ -41,6 +41,7 @@ namespace {
 std::unordered_map<void *, uint32_t> g_slots;
 std::array<bool, 2> g_complete{};
 std::array<int, 2> g_prepare_rc{};
+bool g_prepare_release_proven{true};
 std::array<int, 2> g_launch_rc{};
 std::array<int, 2> g_poll_rc{};
 std::array<int, 2> g_wait_rc{};
@@ -70,6 +71,9 @@ int prepare_run(
     ++g_prepare_count[descriptor->pipeline_slot];
     if (g_reject_first_prepare[descriptor->pipeline_slot] && g_prepare_count[descriptor->pipeline_slot] == 1) {
         return PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE;
+    }
+    if (g_prepare_rc[descriptor->pipeline_slot] != 0 && g_prepare_release_proven) {
+        publish_released_preparation(runtime, descriptor->run_epoch);
     }
     return g_prepare_rc[descriptor->pipeline_slot];
 }
@@ -115,6 +119,7 @@ void prime_worker(ChipWorker &worker) {
     g_slots.clear();
     g_complete = {};
     g_prepare_rc = {};
+    g_prepare_release_proven = true;
     g_launch_rc = {};
     g_poll_rc = {};
     g_wait_rc = {};
@@ -452,7 +457,7 @@ TEST(ChipRunLaneTest, PrepareFailureIsTerminalWithoutPoisoningTheLane) {
 
     ChipRun failed = submit(lane, 101, 0);
     EXPECT_TRUE(failed.done());
-    EXPECT_THROW(failed.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
+    EXPECT_THROW(failed.wait_until(ChipRunLane::Deadline::max()), RunPreparationRefused);
     EXPECT_FALSE(lane.poisoned());
 
     ChipRun successor = submit(lane, 102, 1);
@@ -633,4 +638,36 @@ TEST(ChipRunLaneTest, CloseDrainsAndRejectsNewSubmissions) {
         lane.submit(1, args, CallConfig{}, PipelineSlotLease{1, 0, 102}, 102, 102, nullptr, 0, true), std::runtime_error
     );
     worker.finalize();
+}
+
+TEST(ChipRunLaneTest, UnknownPreparationCleanupPoisonsAndKeepsTheReleaseUnproven) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_prepare_rc[0] = -5;
+    g_prepare_release_proven = false;
+    ChipRun failed = submit(lane, 101, 0);
+    EXPECT_TRUE(failed.done());
+    try {
+        failed.wait_until(ChipRunLane::Deadline::max());
+        FAIL() << "unknown cleanup must fail";
+    } catch (const RunPreparationRefused &) {
+        FAIL() << "missing release receipt must not supply an input lifetime proof";
+    } catch (const std::runtime_error &) {}
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_THROW(submit(lane, 102, 1), std::runtime_error);
+    EXPECT_THROW(lane.close(), std::runtime_error);
+    EXPECT_NO_THROW(worker.finalize());
+}
+
+TEST(ChipRunLaneTest, ReleasedPrepareReceiptIsBoundToOneEpochAndConsumedOnce) {
+    alignas(8) uint64_t storage[2]{};
+    publish_released_preparation(storage, 7);
+    EXPECT_FALSE(consume_released_preparation(storage, sizeof(storage), 8));
+    EXPECT_FALSE(consume_released_preparation(storage, sizeof(uint64_t), 7));
+    EXPECT_TRUE(consume_released_preparation(storage, sizeof(storage), 7));
+    EXPECT_FALSE(consume_released_preparation(storage, sizeof(storage), 7));
+    EXPECT_EQ(storage[0], 0u);
+    EXPECT_EQ(storage[1], 0u);
+    EXPECT_FALSE(consume_released_preparation(nullptr, sizeof(storage), 7));
 }

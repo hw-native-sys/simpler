@@ -295,6 +295,7 @@ from .task_interface import (
     RemoteAddressSpace,
     RemoteBufferExport,
     RemoteBufferHandle,
+    RunPreparationRefused,
     TaskArgs,
     TensorTransfer,
     _bind_host_log_session_directory,
@@ -13182,11 +13183,12 @@ class Worker:
             native_entered = True
             submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
             chip_run = self._chip_worker._submit_chip_run_direct(callable_id, chip_args, cfg, **submit_options)
-        except BaseException:
+        except BaseException as error:
             with self._registry_lock:
                 self._chip_run_touched_identities.pop(run_id, None)
-            # A Python exception after native entry is not a device-completion proof.
-            if not native_entered:
+            # Only this invocation's native release verdict discharges its source
+            # reservation after entry; arbitrary exceptions carry no lifetime proof.
+            if not native_entered or isinstance(error, RunPreparationRefused):
                 self._release_source_uses(run_id)
             else:
                 self._source_context_failed = True
@@ -13342,7 +13344,7 @@ class Worker:
             if was_l2_run:
                 self._chip_run_touched_identities.pop(run_id, None)
         if was_l2_run:
-            if native_error is None:
+            if native_error is None or isinstance(native_error, RunPreparationRefused):
                 self._release_source_uses(run_id)
             else:
                 self._source_context_failed = True

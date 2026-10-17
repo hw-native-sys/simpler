@@ -2052,6 +2052,7 @@ NB_MODULE(_task_interface, m) {
     m.attr("__build_commit__") = SIMPLER_BUILD_COMMIT;
 
     nb::exception<ExecutionContextRefused>(m, "ExecutionContextRefused", PyExc_RuntimeError);
+    nb::exception<RunPreparationRefused>(m, "RunPreparationRefused", PyExc_RuntimeError);
 
     // --- DataType enum ---
     nb::enum_<DataType>(m, "DataType")

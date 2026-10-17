@@ -69,6 +69,23 @@ def kernel_close_faults(tmp_path_factory):
     return output
 
 
+@pytest.fixture(scope="module")
+def prepare_release_faults(tmp_path_factory):
+    output = tmp_path_factory.mktemp("prepare-release-faults") / "faults.so"
+    subprocess.run(
+        [
+            "c++",
+            "-shared",
+            "-fPIC",
+            str(Path(__file__).with_name("support") / "prepare_release_faults.cpp"),
+            "-o",
+            str(output),
+        ],
+        check=True,
+    )
+    return output
+
+
 @pytest.mark.parametrize(("arch", "runtime"), _ONBOARD_CASES)
 @pytest.mark.parametrize(
     "scenario",
@@ -1008,7 +1025,7 @@ def _native_run_storage(lib):
     return storage, run
 
 
-def _run_borrowed_prepare(arch, runtime, device):
+def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa: PLR0915 -- one process owns the faulted context through exit
     from simpler.task_interface import (  # noqa: PLC0415
         AddressSpace,
         ArgDirection,
@@ -1020,6 +1037,11 @@ def _run_borrowed_prepare(arch, runtime, device):
 
     lib = _load(arch, "onboard", runtime)
     faults = ctypes.CDLL(None)
+    release_unproven = False
+    if release_failure:
+        faults.set_binding_release_result.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        release_function = ctypes.cast(lib.release_run_bindings_impl, ctypes.c_void_p)
+        faults.set_binding_release_result(release_function, 0)
     faults.bind_test_log.argtypes = [ctypes.c_void_p]
     assert faults.bind_test_log(lib._handle) == 0
     faults.force_current_device.argtypes = [ctypes.c_int]
@@ -1102,7 +1124,8 @@ def _run_borrowed_prepare(arch, runtime, device):
         # and slot must immediately accept another preparation.
         faults.arm_copy_failure()
         assert prepare(device_args) != 0
-        assert ctypes.string_at(run, 8) == bytes(8)
+        receipt = (ctypes.c_uint64 * 2).from_address(run)
+        assert receipt[0] != 0 and receipt[1] == descriptor.run_epoch
         for epoch in (1, 2):
             descriptor.run_epoch = epoch
             assert prepare(device_args) == 0
@@ -1139,14 +1162,26 @@ def _run_borrowed_prepare(arch, runtime, device):
             assert lib.finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE
             assert lib.committed_device_memory_ctx(ctx) == committed
         assert lib.simpler_kernel_mode_supported(ctx) == 0
+        if release_failure:
+            faults.set_binding_release_result(release_function, -4324)
+            if runtime == "host_build_graph":
+                faults.arm_copy_failure()
+            descriptor.run_epoch += 1
+            release_unproven = True
+            assert prepare(device_args if runtime == "host_build_graph" else host_args) == -4324
+            # Destruction alone is not a successful input-release verdict.
+            assert ctypes.string_at(run, 8) == bytes(8)
     finally:
         faults.force_current_device(-2)
         if prepared:
             assert lib.simpler_finalize_run(ctx, run) == 0
-        assert lib.finalize_device(ctx) == 0
-        assert lib.committed_device_memory_ctx(ctx) == 0
-        lib.destroy_device_context(ctx)
-        contexts.close()
+        if not release_unproven:
+            assert lib.finalize_device(ctx) == 0
+            assert lib.committed_device_memory_ctx(ctx) == 0
+            lib.destroy_device_context(ctx)
+            contexts.close()
+        # An injected nonzero release result supplies no retirement permission.
+        # The raw context and caller context remain owned until process exit.
         assert [faults.acl_call_count(i) for i in range(8)] == [0] * 8
 
 
@@ -1158,12 +1193,24 @@ def _run_borrowed_prepare(arch, runtime, device):
         for runtime in _RUNTIMES
     ],
 )
-def test_borrowed_context_uses_per_call_prepare_and_finalize(arch, runtime, kernel_close_faults, request):
+@pytest.mark.parametrize("release_failure", [False, True])
+def test_borrowed_context_uses_per_call_prepare_and_finalize(
+    arch, runtime, kernel_close_faults, prepare_release_faults, request, release_failure
+):
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     env = dict(os.environ)
     env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+    if release_failure:
+        env["LD_PRELOAD"] = str(prepare_release_faults) + ":" + env["LD_PRELOAD"]
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, "borrowed_prepare"],
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            arch,
+            runtime,
+            device,
+            "borrowed_prepare_failed_release" if release_failure else "borrowed_prepare",
+        ],
         check=False,
         env=env,
         capture_output=True,
@@ -1173,9 +1220,38 @@ def test_borrowed_context_uses_per_call_prepare_and_finalize(arch, runtime, kern
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    ("arch", "runtime"),
+    [
+        pytest.param(arch, runtime, marks=[pytest.mark.requires_hardware, pytest.mark.platforms([arch])])
+        for arch in _ARCHES
+        for runtime in _RUNTIMES
+    ],
+)
+def test_borrowed_prepare_refusal_retries_through_public_worker(arch, runtime, kernel_close_faults, request):
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    env = dict(os.environ)
+    env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, "public_prepare_retry"],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 if __name__ == "__main__":
-    if sys.argv[4] == "borrowed_prepare":
-        _run_borrowed_prepare(sys.argv[1], sys.argv[2], int(sys.argv[3]))
+    if sys.argv[4] == "public_prepare_retry":
+        from tests.st.common.kernel_eager_state.test_stateful_calls import _run
+
+        _run(sys.argv[1], sys.argv[2], int(sys.argv[3]), True, False, 128 << 20, refusal_retry=True)
+    elif sys.argv[4].startswith("borrowed_prepare"):
+        _run_borrowed_prepare(
+            sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "borrowed_prepare_failed_release"
+        )
     elif sys.argv[4] == "program_callable_release":
         _run_program_callable_release(sys.argv[1], sys.argv[2], int(sys.argv[3]))
     elif sys.argv[4] == "program_loader_unload":

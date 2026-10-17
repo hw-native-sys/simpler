@@ -173,7 +173,7 @@ extern "C" int aclrtSynchronizeDeviceWithTimeout(int32_t timeout) {
 }
 
 // The ctypes loader has no ChipWorker to bind a process-owned logger sink.
-extern "C" int bind_test_log(void *runtime) {
+extern "C" int bind_test_rts(void *runtime) {
     // ACL is a dependency of the RTLD_LOCAL component and need not be in the
     // preload shim's RTLD_NEXT lookup scope.
     real_get_device = reinterpret_cast<int (*)(int *)>(dlsym(runtime, "aclrtGetDevice"));
@@ -181,6 +181,11 @@ extern "C" int bind_test_log(void *runtime) {
     real_set_op_timeout = reinterpret_cast<int (*)(uint64_t, uint64_t *)>(dlsym(runtime, "aclrtSetOpExecuteTimeOutV2"));
     real_memcpy = reinterpret_cast<int (*)(void *, uint64_t, const void *, uint64_t, int)>(dlsym(runtime, "rtMemcpy"));
     if (!real_get_device || !real_set_device || !real_set_op_timeout || !real_memcpy) return -1;
+    return 0;
+}
+
+extern "C" int bind_test_log(void *runtime) {
+    if (bind_test_rts(runtime) != 0) return -1;
     test_log_state.threshold = 40;
     test_log_state.sink_owner_pid = getpid();
     test_log_state.sink_process_pid = getpid();

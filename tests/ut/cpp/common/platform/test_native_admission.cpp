@@ -191,6 +191,7 @@ struct Attempt {
         ::operator delete(storage, std::align_val_t(get_runtime_alignment()));
     }
     int prepare() { return simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor); }
+    bool consume_release() { return consume_released_preparation(storage, get_runtime_size(), descriptor.run_epoch); }
     bool empty() const {
         uint64_t magic;
         std::memcpy(&magic, storage, sizeof(magic));
@@ -322,6 +323,7 @@ TEST_F(NativeAdmissionTest, CallbackExceptionUnwindsOuterOwnershipAndAllowsTheNe
         throw std::runtime_error("host callback failed after nested prepare refusal");
     };
     EXPECT_EQ(outer.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(outer.consume_release());
     EXPECT_TRUE(outer.empty());
     EXPECT_TRUE(inner.empty());
     EXPECT_EQ(outer_runner.reservations(), 0u);
@@ -418,6 +420,7 @@ TEST_F(NativeAdmissionTest, EarlyPrepareFailureDoesNotBlockTheNormalRunCompositi
     Attempt failed(runner, 0, 10);
     failed.config.aicpu_thread_num = 1;
     EXPECT_EQ(failed.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(failed.consume_release());
     EXPECT_TRUE(failed.empty());
     Attempt next(runner, 0, 20);
     EXPECT_EQ(simpler_run(&runner, next.storage, 1, &next.args, &next.config, &next.descriptor), 0);
@@ -512,6 +515,7 @@ TEST_F(NativeAdmissionTest, MultiregionFailureKeepsEveryPublishedBackingAndRolls
         // The real C API must reclaim after attach and before launch-shape
         // validation or allocation, even when this next prepare also fails.
         EXPECT_EQ(next.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_TRUE(next.consume_release());
         EXPECT_TRUE(next.empty());
         EXPECT_EQ(control().allocations, allocations);
         EXPECT_EQ(runner.charged(), charged);
@@ -551,6 +555,7 @@ TEST_F(NativeAdmissionTest, NativePrepareParksAndDestroysTheAttemptBeforeAnEarly
     candidate.descriptor.run_epoch = 22;
     EXPECT_EQ(candidate.prepare(), -77);
     control().attach_rc = 0;
+    EXPECT_TRUE(candidate.consume_release());
     EXPECT_TRUE(candidate.empty());
     EXPECT_EQ(runner.reservations(), 0u);
     EXPECT_EQ(runner.plan(1).epoch, 0u);
@@ -649,6 +654,7 @@ TEST_F(NativeAdmissionTest, RealHbgCallbackSurvivesNativeParkAndPublicationFailu
     EXPECT_EQ(dep_gen_host_graph_take(&graph), static_cast<int>(simpler::dfx::host_graph::TakeOutcome::NotCaptured));
     EXPECT_EQ(callbacks, 1);
     EXPECT_EQ(runner.retained_temp_addr(1), staging_address);
+    EXPECT_TRUE(candidate.consume_release());
     EXPECT_TRUE(candidate.empty());
     EXPECT_EQ(runner.get_prepare_plan(1), nullptr);
     EXPECT_TRUE(saved.expired());

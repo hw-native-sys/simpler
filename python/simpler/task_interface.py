@@ -82,6 +82,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     DeviceMemoryInfo,
     ExecutionContextRefused,
     ProvenanceTable,
+    RunPreparationRefused,
     RuntimeEnv,
     TaskArgs,
     TaskHandle,
@@ -230,6 +231,7 @@ __all__ = [
     "DataType",
     "DeviceMemoryInfo",
     "ExecutionContextRefused",
+    "RunPreparationRefused",
     "get_element_size",
     "get_dtype_name",
     "MAX_TENSOR_DIMS",
@@ -1919,9 +1921,13 @@ class ChipWorker:
                 except BaseException:
                     self._close_argument_imports()
                     raise
-            # A native exception leaves completion unproven. Imports remain live
-            # until successful device teardown; no finally block may unmap them.
-            self._impl.run(int(state.slot_id), args, config)
+            # Only a clean preparation refusal releases imports on an error;
+            # other native exceptions keep them through successful teardown.
+            try:
+                self._impl.run(int(state.slot_id), args, config)
+            except RunPreparationRefused:
+                self._close_argument_imports()
+                raise
             self._close_argument_imports()
 
     def _close_argument_imports(self) -> None:

@@ -287,6 +287,27 @@ TEST(ChipRunLaneJoinedLaunchTest, CallerValidationRefusesBeforeAdmissionOrPredec
     lane.close();
 }
 
+TEST(ChipRunLaneJoinedLaunchTest, CleanPrepareRefusalDoesNotReleaseAPredecessorsBorrow) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_buffers(worker);
+    prime_caller_streams(worker);
+    ChipRunLane lane(worker);
+    int caller;
+    ChipRun first = lane.submit(1, device_args(), CallConfig{}, nullptr, 0, &caller);
+    worker.prepare_run_fn_ = [](void *, void *runtime, int32_t, const void *, const CallConfig *,
+                                const NativeRunDescriptor *descriptor) {
+        publish_released_preparation(runtime, descriptor->run_epoch);
+        return -77;
+    };
+    EXPECT_THROW(lane.submit(1, device_args(), CallConfig{}, nullptr, 0, &caller), RunPreparationRefused);
+    EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{2, 0}}));
+    EXPECT_FALSE(first.done());
+    EXPECT_FALSE(lane.poisoned());
+    lane.close();
+    EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{2, 0}, {1, 0}}));
+}
+
 TEST(ChipRunLaneJoinedLaunchTest, FailedCallerLaunchThrowsInsteadOfReturningAnUnorderedHandle) {
     ChipWorker worker;
     prime_worker(worker);
@@ -1149,3 +1170,37 @@ TEST(ChipRunLaneCallerBuffersTest, MixedExternalOutputCannotDropOwnedInputOnUnpr
 }
 
 }  // namespace
+
+TEST(ChipRunLaneJoinedLaunchTest, MissingOrStalePrepareReleaseKeepsItsBorrow) {
+    for (const bool stale : {false, true}) {
+        SCOPED_TRACE(stale);
+        ChipWorker worker;
+        prime_worker(worker);
+        prime_caller_buffers(worker);
+        prime_caller_streams(worker);
+        ChipRunLane lane(worker);
+        int caller;
+        ChipRun first = lane.submit(1, device_args(), CallConfig{}, nullptr, 0, &caller);
+        worker.prepare_run_fn_ =
+            stale ?
+                +[](void *, void *runtime, int32_t, const void *, const CallConfig *,
+                    const NativeRunDescriptor *descriptor) {
+                    publish_released_preparation(runtime, descriptor->run_epoch - 1);
+                    return -77;
+                } :
+                +[](void *, void *, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *) {
+                    return -77;
+                };
+        try {
+            lane.submit(1, device_args(), CallConfig{}, nullptr, 0, &caller);
+            FAIL() << "unproven preparation must fail";
+        } catch (const RunPreparationRefused &) {
+            FAIL() << "this attempt has no release proof";
+        } catch (const std::runtime_error &) {}
+        EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{2, 1}}));
+        EXPECT_FALSE(first.done());
+        EXPECT_TRUE(lane.poisoned());
+        EXPECT_THROW(lane.close(), std::runtime_error);
+        EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{2, 1}, {1, 0}}));
+    }
+}

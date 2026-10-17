@@ -16,7 +16,15 @@ from types import SimpleNamespace
 
 import pytest
 from simpler.buffer import AccessMode, Buffer, mint_owner_instance_id, wrap_device_malloc, wrap_fork_inherited
-from simpler.task_interface import CallConfig, DataType, ExecutionContextRefused, TaskArgs, Tensor, TensorArgType
+from simpler.task_interface import (
+    CallConfig,
+    DataType,
+    ExecutionContextRefused,
+    RunPreparationRefused,
+    TaskArgs,
+    Tensor,
+    TensorArgType,
+)
 from simpler.worker import Worker, _Lifecycle
 
 
@@ -292,15 +300,16 @@ def test_source_wrap_reservation_precedes_mapping_and_unwinds_on_bind_failure(l2
     assert not calls
 
 
-def test_source_wrap_unknown_native_completion_retains_source(l2, monkeypatch):
+@pytest.mark.parametrize("message", ["unproven native completion", "prepare_native_run failed with code -1000"])
+def test_source_wrap_unknown_native_completion_retains_source(l2, monkeypatch, message):
     worker, _, _ = l2
     backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
 
     def fail(*args):
-        raise RuntimeError("unproven native completion")
+        raise RuntimeError(message)
 
     monkeypatch.setattr(worker._chip_worker, "_submit_chip_run_direct", fail)
-    with pytest.raises(RuntimeError, match="unproven"):
+    with pytest.raises(RuntimeError, match="unproven|prepare_native_run"):
         worker._submit_l2_locked(3, arguments(backing), CallConfig())
     with pytest.raises(RuntimeError, match="in-flight"):
         backing.close()
@@ -595,3 +604,41 @@ def test_source_inherited_with_locked_mutex_rejects_before_locking(l2):
         _, status = os.waitpid(pid, 0)
     assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
     backing.close()
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+def test_clean_prepare_refusal_releases_only_its_source_reservation(l2, monkeypatch, deferred):
+    worker, _, _ = l2
+    backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    failure = RunPreparationRefused("prepare_native_run failed with code -1000")
+    active = SimpleNamespace(wait=lambda timeout: True)
+    monkeypatch.setattr(worker._chip_worker, "_submit_chip_run_direct", lambda *_: active)
+    first = worker._submit_l2_locked(3, arguments(backing), CallConfig())
+
+    def fail(*_):
+        raise failure
+
+    monkeypatch.setattr(
+        worker._chip_worker, "_submit_chip_run_direct", lambda *_: SimpleNamespace(wait=fail) if deferred else fail()
+    )
+    if deferred:
+        refused = worker._submit_l2_locked(3, arguments(backing), CallConfig())
+        for _ in range(2):
+            with pytest.raises(RunPreparationRefused) as error:
+                refused.wait()
+            assert error.value is failure
+        assert refused.done
+    else:
+        with pytest.raises(RunPreparationRefused) as error:
+            worker._submit_l2_locked(3, arguments(backing), CallConfig())
+        assert error.value is failure
+    assert not worker._source_context_failed
+    assert len(worker._chip_source_uses) == 1
+    with pytest.raises(RuntimeError, match="in-flight"):
+        backing.close()
+    first.wait()
+    assert not worker._chip_source_uses
+    monkeypatch.setattr(worker._chip_worker, "_submit_chip_run_direct", lambda *_: active)
+    worker._submit_l2_locked(3, arguments(backing), CallConfig()).wait()
+    backing.close()
+    assert backing.closed

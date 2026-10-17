@@ -50,11 +50,12 @@ def _compile(platform, runtime, host_controls):
     return compile_chip_callable_spec(spec, platform, runtime, key)
 
 
-def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=None):  # noqa: PLR0912, PLR0915 -- one subprocess owns all resources through retirement
+def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=None, refusal_retry=False):  # noqa: PLR0912, PLR0915 -- one subprocess owns all resources through retirement
     from simpler.buffer import Buffer  # noqa: PLC0415
     from simpler.task_interface import (  # noqa: PLC0415
         CallConfig,
         DataType,
+        RunPreparationRefused,
         TaskArgs,
         Tensor,
         TensorArgType,
@@ -78,7 +79,6 @@ def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=No
     state, control, runs = None, None, []
     caller_context = ctypes.c_void_p()
     last_expected = 7
-    refused = False
     nbytes = 16 * ctypes.sizeof(ctypes.c_int32)
     try:
         if onboard:
@@ -100,6 +100,10 @@ def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=No
                 ctypes.c_int,
                 ctypes.c_void_p,
             ]
+            if refusal_retry:
+                faults = ctypes.CDLL(None)
+                faults.bind_test_rts.argtypes = [ctypes.c_void_p]
+                assert faults.bind_test_rts(lib._handle) == 0
             if borrowed:
                 assert lib.rtSetDevice(device) == 0
                 assert lib.rtCtxGetCurrent(ctypes.byref(caller_context)) == 0
@@ -133,6 +137,32 @@ def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=No
         if host_controls:
             control = owner.create_buffer(8)
             controls = (ctypes.c_int32 * 2).from_address(control.base)
+        if refusal_retry:
+            rejected = TaskArgs()
+            rejected.add_tensor(view, TensorArgType.INOUT)
+            rejected.add_scalar(1)
+            rejected.add_scalar(777)
+            rejected_config = CallConfig()
+            rejected_config.runtime_env.ring_task_window = 64
+            rejected_config.runtime_env.ring_heap = (1 << 28) if runtime == "tensormap_and_ringbuffer" else 1 << 20
+            if runtime == "host_build_graph":
+                faults.arm_copy_failure()
+            with pytest.raises(RunPreparationRefused):
+                owner.submit(handle, rejected, config=rejected_config, caller_stream=stream.value)
+            # The same Worker and Buffer accept a valid invocation after rollback.
+            empty = TaskArgs()
+            empty.add_tensor(view, TensorArgType.INOUT)
+            empty.add_scalar(0)
+            empty.add_scalar(0)
+            retry = owner.submit(handle, empty, config=config, caller_stream=stream.value)
+            runs.append(retry)
+            retry.wait()
+            assert state.identity == identity
+            state.close()
+            assert state.closed
+            state = Buffer.wrap(address=allocation.value, nbytes=nbytes, location=owner.device_location)
+            view = Tensor(state, shapes=(16,), dtype=DataType.INT32)
+            identity = state.identity
         steps = [(0, 99, 7), (1, 11, 11), (4, 17, 17), (0, 123, 17), (8, 23, 23), (2, 29, 29), (0, 456, 29)]
         if workspace_budget == 1024:
             steps = [(1, 11, 11)]
@@ -153,7 +183,6 @@ def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=No
             if workspace_budget == 1024:
                 with pytest.raises(RuntimeError):
                     owner.submit(handle, args, config=config, **options)
-                refused = True
                 status, report = owner._chip_worker.workspace_report()
                 assert status == "available" and report["reserved_bytes"] <= workspace_budget
                 assert lib.aclrtMemcpyAsync(host, nbytes, allocation, nbytes, 2, stream) == 0
@@ -201,14 +230,8 @@ def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=No
                     assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
                     assert list(values) == [last_expected] + [7] * 15
             if state is not None:
-                if refused:
-                    # Native exceptions leave source uses unproven in the public
-                    # API; this subprocess retains their device backing until exit.
-                    with pytest.raises(RuntimeError, match="unproven device uses"):
-                        state.close()
-                else:
-                    state.close()
-            if allocation.value and not refused:
+                state.close()
+            if allocation.value:
                 assert lib.aclrtFree(allocation) == 0
             if host.value:
                 assert lib.aclrtFreeHost(host) == 0

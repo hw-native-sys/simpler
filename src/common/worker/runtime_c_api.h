@@ -955,8 +955,15 @@ int simpler_run(
  * must be DEVICE/NONE or HOST/NONE; host tensor consumption is supported only
  * by a host-orchestrating runtime. No implicit tensor transfer is performed.
  * This preparation can allocate and synchronously publish metadata and must
- * run outside capture. Kernel execution is not supported yet: launch remains
- * rejected, including through simpler_launch_run().
+ * run outside capture. Borrowed execution requires simpler_launch_run_on_stream;
+ * the legacy simpler_kernel_mode_launch entry remains unsupported.
+ *
+ * A clean failed preparation writes a host-only release marker and this
+ * descriptor's run_epoch into its destroyed carrier storage. This marker is
+ * consumed by ChipWorker; zero only means destruction, not input release.
+ * Missing, stale or unrecognized markers do not permit releasing inputs.
+ * Failed prepare storage can be reused directly; prepare clears an unconsumed
+ * release marker before constructing its next carrier.
  *
  * Onboard prepare is non-reentrant on one thread within a loaded runtime
  * module, including calls for a different context or through simpler_run().

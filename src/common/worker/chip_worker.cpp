@@ -185,20 +185,25 @@ ChipWorker::RuntimeStorage::RuntimeStorage(size_t size, size_t alignment) {
     }
     std::memset(storage, 0, size);
     data_ = storage;
+    size_ = size;
 }
 
 ChipWorker::RuntimeStorage::~RuntimeStorage() { std::free(data_); }
 
 ChipWorker::RuntimeStorage::RuntimeStorage(RuntimeStorage &&other) noexcept :
-    data_(other.data_) {
+    data_(other.data_),
+    size_(other.size_) {
     other.data_ = nullptr;
+    other.size_ = 0;
 }
 
 ChipWorker::RuntimeStorage &ChipWorker::RuntimeStorage::operator=(RuntimeStorage &&other) noexcept {
     if (this == &other) return *this;
     std::free(data_);
     data_ = other.data_;
+    size_ = other.size_;
     other.data_ = nullptr;
+    other.size_ = 0;
     return *this;
 }
 
@@ -1037,15 +1042,19 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
 ) {
     validate_execution_context();
-    config.validate();
+    try {
+        config.validate();
+    } catch (const std::invalid_argument &e) {
+        throw RunPreparationRefused(e.what());
+    }
     if (!initialized_) {
-        throw std::runtime_error("ChipWorker not initialized; call init() first");
+        throw RunPreparationRefused("ChipWorker not initialized; call init() first");
     }
     if (args == nullptr) {
-        throw std::runtime_error("prepare_native_run requires task args");
+        throw RunPreparationRefused("prepare_native_run requires task args");
     }
     if (slot_id >= runtime_bufs_.size()) {
-        throw std::runtime_error("prepare_native_run slot is outside the runtime PipelineContract");
+        throw RunPreparationRefused("prepare_native_run slot is outside the runtime PipelineContract");
     }
     const uint64_t run_epoch = next_native_run_epoch();
     const ChipWorkerNativeRun run_identity{slot_id, generation, run_epoch, run_id, dispatch_id};
@@ -1057,7 +1066,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             const NativeRunEntry &entry = *candidate.second;
             if (entry.phase == NativeRunPhase::EMPTY) continue;
             if (entry.slot_id == slot_id) {
-                throw std::runtime_error(
+                throw RunPreparationRefused(
                     "prepare_native_run slot already owns an unfinished native run " +
                     format_native_run_identity(run_identity)
                 );
@@ -1065,7 +1074,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
             ++occupied;
             if (!allow_prepared_successor || !entry.permits_prepared_successor ||
                 (entry.phase != NativeRunPhase::LAUNCHED && entry.phase != NativeRunPhase::REAPED)) {
-                throw std::runtime_error(
+                throw RunPreparationRefused(
                     "prepare_native_run requires an active predecessor before staging a successor " +
                     format_native_run_identity(run_identity)
                 );
@@ -1076,14 +1085,14 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         // depth is that number — not a constant — and the run past it is refused rather than
         // handed a set another run owns.
         if (occupied + 1 > pipeline_contract_.pipeline_depth) {
-            throw std::runtime_error(
+            throw RunPreparationRefused(
                 "prepare_native_run has no free run resource set at its granted depth " +
                 format_native_run_identity(run_identity)
             );
         }
         if (admit_pipeline_generation &&
             !pipeline_generations_.is_admissible(PipelineSlotLease{slot_id, 0, generation})) {
-            throw std::runtime_error(
+            throw RunPreparationRefused(
                 "native-run pipeline lease generation is stale " + format_native_run_identity(run_identity)
             );
         }
@@ -1108,6 +1117,8 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         throw;
     }
     if (rc != 0) {
+        const bool released =
+            consume_released_preparation(runtime_bufs_[slot_id].data(), runtime_bufs_[slot_id].size(), run_epoch);
         drop_preparing_native_run(run_epoch);
         if (rc == PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE) {
             throw PreparedRunIncompatible(
@@ -1120,9 +1131,10 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
                 format_native_run_identity(run_identity)
             );
         }
-        throw std::runtime_error(
-            "prepare_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run_identity)
-        );
+        const std::string message = "prepare_native_run failed with code " + std::to_string(rc) + " " +
+                                    format_native_run_identity(run_identity);
+        if (released) throw RunPreparationRefused(message);
+        throw std::runtime_error(message);
     }
 
     {

@@ -152,8 +152,17 @@ without completing close, it detaches surviving handles with an error and retain
 native storage, lane snapshots, context and runtime library for the process
 lifetime. It cannot prove safe reclamation at that point.
 
-Public `Worker` integration and captured-graph ownership remain separate
-requirements; internal borrowed eager submission does not deliver either.
+Public direct L2 `Worker` consumes this native lane for owned and borrowed
+eager calls. Captured-graph ownership remains a separate requirement.
+
+A failed preparation is a distinct terminal outcome. Only a rollback that
+released its bindings, execution preparation and saved resource plan publishes
+its host-slot release marker with the attempt's run_epoch. ChipWorker consumes
+that exact epoch and reports `RunPreparationRefused`. The lane releases that
+run's caller borrow, and Python releases that invocation's source reservation.
+Unknown or stale release state retains borrows and poisons lane admission;
+carrier destruction alone is not release evidence. Resource-wait flow control
+keeps its existing live plan and is not a terminal release verdict.
 
 ## The boundary
 

@@ -70,10 +70,10 @@ Both onboard ownership policies install the same internal workspace accounting.
 three pooled arenas, including retained generations. It excludes caller tensors,
 registered code, diagnostics, RTS argument blocks and provider memory; it is not
 a device-wide memory ceiling. An absent budget imposes no byte limit. A budget
-refusal after native submission entry follows the existing execution-error
-cleanup contract: the Worker can be closed, but source Buffer references remain
-unproven and `Buffer.close()` still refuses. Retain that backing; this path does
-not provide an immediately retryable submit or a source-release proof.
+refusal whose native preparation rolls back completely releases this invocation's
+Buffer references. The same Worker can accept a smaller valid call; the Buffer
+can close once all its other users retire. A rollback without complete release
+evidence retains its references and stops further native admission.
 
 `worker.submit(handle, args, caller_stream=stream)` uses a nonzero integer RTS
 stream handle for this invocation; `run` accepts the same keyword. The stream is
@@ -122,10 +122,19 @@ Direct L2 handles validate the execution context inside the native wait.
 `ExecutionContextRefused`, imported from `simpler.task_interface`, is a
 `RuntimeError` subclass for current-context preflight refusal. It supplies no
 completion verdict: the handle, its argument snapshot and its Buffer uses remain
-intact; restore the required context before retrying. Other native wait errors
-remain terminal and retain unproven Buffer uses; error messages do not determine
-the classification. Borrowed-context initialization is available for direct onboard L2 through
-`Worker.init(borrowed_context_generation=...)`. The exception does not prove
+intact; restore the required context before retrying.
+
+`RunPreparationRefused`, also from `simpler.task_interface`, is a terminal
+`RuntimeError` subclass stating that this invocation enqueued no operator kernel and
+released its native input bindings and preparation resources. It can surface
+from submit, or from wait when preparation was deferred. The Worker releases
+only that invocation's source references; another live run still protects a
+shared Buffer. It does not certify that the environment accepts another call,
+or undo host orchestration effects and completed synchronous copies.
+Unclassified native errors and partial launches retain unproven uses; error
+messages do not determine the classification. Borrowed-context initialization
+is available for direct onboard L2 through
+`Worker.init(borrowed_context_generation=...)`. Neither refusal type proves
 that an external allocation belongs to that context.
 
 READY Worker operations validate through the shared operation lease, outside the

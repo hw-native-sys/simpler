@@ -298,3 +298,31 @@ def test_host_control_grant_checked_against_callable_before_import(chip, backing
         worker.run(handle, args)
     assert worker._impl.runs == []
     assert worker._argument_imports is None
+
+
+def test_clean_native_prepare_refusal_releases_imports_and_allows_retry(chip, backing, monkeypatch):
+    from simpler.task_interface import RunPreparationRefused  # noqa: PLC0415
+
+    worker, handle = chip
+    failure = RunPreparationRefused("prepare_native_run failed with code -1000")
+    imports = []
+    original = ImportRegistry.materialize
+
+    def materialize(registry, descriptor):
+        result = original(registry, descriptor)
+        imports.append(result)
+        return result
+
+    def refuse(*_):
+        raise failure
+
+    monkeypatch.setattr(ImportRegistry, "materialize", materialize)
+    with monkeypatch.context() as patch:
+        patch.setattr(worker._impl, "run", refuse)
+        with pytest.raises(RunPreparationRefused) as error:
+            worker.run(handle, args_for(backing))
+        assert error.value is failure
+    assert imports[0].shm._mmap is None
+    assert worker._argument_imports is None
+    worker.run(handle, args_for(backing))
+    assert len(worker._impl.runs) == 1

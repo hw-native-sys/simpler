@@ -912,6 +912,7 @@ static void emit_native_run_runner_wall(SimNativeRunContext *state) {
 }
 
 static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc) {
+    const uint64_t run_epoch = state->descriptor.run_epoch;
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
@@ -933,7 +934,9 @@ static int cleanup_failed_prepare(SimNativeRunContext *state, int execution_rc) 
     }
     destroy_native_run_context(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns);
-    return validation_rc != 0 ? validation_rc : execution_rc;
+    if (validation_rc != 0) return validation_rc;
+    publish_released_preparation(state, run_epoch);
+    return execution_rc;
 }
 
 int simpler_prepare_run(
@@ -972,10 +975,14 @@ int simpler_prepare_run(
         LOG_ERROR("simpler_prepare_run: runtime already contains a prepared run; finalize it before reuse");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (magic != 0) {
+    if (magic != 0 && magic != kNativeRunPrepareReleasedMagic) {
         LOG_ERROR("simpler_prepare_run: runtime storage was not zero-initialized before its first use");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+
+    // Placement construction starts with an empty tag even after a failed
+    // preparation whose release result has not been consumed by a raw caller.
+    if (magic == kNativeRunPrepareReleasedMagic) std::memset(runtime, 0, kNativeRunPrepareReleaseBytes);
 
     SimNativeRunContext *state = nullptr;
     const uint64_t trace_hid = static_cast<uint64_t>(callable_id);

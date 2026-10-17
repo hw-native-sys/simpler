@@ -122,6 +122,7 @@ struct NativeRunContext {
 /** End object lifetime, then mark the caller-owned storage reusable. */
 template <typename Runner>
 void destroy_native_run_context(NativeRunContext<Runner> *context) {
+    static_assert(sizeof(NativeRunContext<Runner>) >= kNativeRunPrepareReleaseBytes);
     void *storage = context;
     context->~NativeRunContext<Runner>();
     constexpr uint64_t kEmpty = 0;

@@ -60,6 +60,14 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// This invocation enqueued no operator kernel, and its native input bindings and
+// preparation resources have all been released. It supplies no verdict about
+// any other run or about whether the execution environment accepts a retry.
+class RunPreparationRefused : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
 class UnsupportedRuntimeOperation : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -766,6 +774,7 @@ private:
         // Unproven completion retains the allocation for the process lifetime.
         void *data() { return data_; }
         const void *data() const { return data_; }
+        size_t size() const noexcept { return size_; }
 
         /**
          * Give up ownership of the block without freeing it.
@@ -777,10 +786,14 @@ private:
          * a bounded one, with the reason logged, which is what the alternative
          * of reusing those bytes cannot offer.
          */
-        void abandon() noexcept { data_ = nullptr; }
+        void abandon() noexcept {
+            data_ = nullptr;
+            size_ = 0;
+        }
 
     private:
         void *data_{nullptr};
+        size_t size_{0};
     };
 
     // Allocated once during init and never resized. Each allocation honors the

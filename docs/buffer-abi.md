@@ -493,8 +493,10 @@ belong to `Worker(level=2).submit`. The resolved `ChipStorageTaskArgs` entry
 remains a compatibility path with caller-managed addresses.
 
 A synchronous ChipWorker call owns its imported host mappings through native
-return, including output copies. A binding failure releases those mappings. A
-native-call exception leaves completion unproven, so the imports remain alive,
+return, including output copies. A binding failure releases those mappings.
+`RunPreparationRefused` releases this call's imported host mappings; later calls
+still require a usable context. Other native-call exceptions leave completion
+unproven, so the imports remain alive,
 further public `run` calls are refused, and only successful `finalize` releases
 them. Failed teardown preserves them for retry. Public `run` and `finalize` are
 serialized. Descriptors do not retain the caller's allocation: callers must keep
