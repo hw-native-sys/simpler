@@ -308,3 +308,48 @@ scheduler and pending-queue regression tests, alongside this workload test.
 The qualified scope is fixed-shape Qwen3-14B on one A3 HBG endpoint with
 diagnostics disabled, independent mutable request storage and a bounded
 sequence. Grant counts and device-memory capacity remain separate constraints.
+
+## Fixed-shape vLLM eager worker
+
+`vllm_eager.SimplerWorker` adapts vLLM 0.20.2 and vLLM-Ascend 0.20.2rc1
+on a single A3 HBG endpoint. The workload is 16 independent requests with the
+same 3338-token prompt, BF16 weights/KV, at most 128 generated tokens and greedy
+sampling. vLLM owns prefill, page assignment, sampling, EOS and token publication;
+Simpler executes each decode frame. A completed cohort may be followed by another.
+Each cohort retains its request order and existing physical pages.
+
+The runner allocates contiguous torch K/V backing and gives vLLM per-layer BSND
+views. Prefill linear modules share the input-major weights used by the existing
+decode callable. The callable requires its verified 25-argument DEVICE-output ABI.
+Borrowed L2 initialization preserves the framework's context and stream. The
+adapter synchronizes the framework stream before each submission, retires the run
+before returning logits, and preserves storage until framework consumers finish.
+Its timing therefore includes the actual host sampling and synchronization costs.
+
+The worker validates the fixed model/configuration before device setup. Decode
+checks request identities, consecutive positions, independent pages, live page
+stability and slot mapping before native submission. Failures stop subsequent
+admission. An unproven completion prevents source release and successful close.
+Diagnostics are disabled; supported execution is eager with synchronous scheduling,
+private local KV pages and complete prefill cohorts.
+
+Run the native reference and the Simpler worker in separate processes under the
+same environment, using a JSON array containing the frozen prompt token IDs:
+
+```bash
+python run_vllm_eager.py --backend native --model /path/to/Qwen3-14B \
+  --prompt-ids /path/to/prompt-ids.json --device DEVICE_ID \
+  --rounds 2 --output /path/to/native.json
+python run_vllm_eager.py --backend simpler --model /path/to/Qwen3-14B \
+  --artifact /path/to/verified-hbg-artifact \
+  --prompt-ids /path/to/prompt-ids.json --device DEVICE_ID \
+  --rounds 2 --reference /path/to/native.json --output /path/to/simpler.json
+```
+
+Use the architecture precheck and `task-submit` on shared hardware, with CANN
+initialized inside each task. `--device` selects the queue-assigned device before
+vLLM imports. Each result records generated token sequences and request wall time;
+the Simpler run also reconciles native dispatch count with actual output lengths.
+Token equality is one acceptance gate. Logits/KV numerical qualification,
+framework stream ordering, failure/close and controlled performance measurements
+must be recorded separately before declaring the framework integration accepted.
