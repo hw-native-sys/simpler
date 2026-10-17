@@ -104,17 +104,17 @@ is unchanged.
 The stream is recorded on that run, including a declined join's ordinary-launch
 fallback. Poll/wait/finalize and argument borrows remain the lane's existing
 lifecycle. Caller ordering covers device work; Program host output copy-back
-still requires run completion/finalization. The public `Worker.submit` does not
-yet expose this argument or attach a borrowed RTS context.
+still requires run completion/finalization. The public `Worker.submit` exposes
+this argument on direct L2 and supports borrowed RTS initialization.
 
 `ChipWorker::init` / internal `_ChipWorker.init` can select a borrowed,
 already-current RTS context with `borrowed_context_generation`. The value must
 be nonzero; omission selects owned-device initialization. Both routes load the
 same runtime and create the same native storage and lane. Borrowed initialization
-supports neither SDMA/simulator options nor Program workspace management/budget
-requests. Its config is the native admission input; each submission still
-supplies its own config. Generation is retained in the native environment
-binding; this argument alone does not expose public Worker borrowed initialization.
+rejects SDMA/simulator options. Both onboard ownership policies manage internal
+workspace and accept the same optional byte budget. Its config is the native
+admission input; each submission still supplies its own config. Generation is retained in the native environment
+binding; public Worker forwards it on the direct L2 onboard route.
 
 ChipWorker retains a host-only environment identity from native context creation
 through successful teardown: process, non-repeating incarnation, nonzero logical

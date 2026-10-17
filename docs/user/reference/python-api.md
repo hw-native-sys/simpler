@@ -39,6 +39,7 @@ into `**config` and validated later. The recognized keys:
 | `device_ids` | L3+ | one chip child process per entry |
 | `num_sub_workers` | L3+ | host-side Python callables to fork |
 | `enable_sdma` | a2a3 | provisions the SDMA workspace; defaults to `False` |
+| `workspace_budget_bytes` | onboard L2 | Optional positive byte limit on internal retained temporary storage and three pooled arenas; both owned and borrowed contexts manage these regions by default |
 | `heap_ring_size` | all | heap ring sizing |
 | `remote_heap_ring_size`, `remote_session_timeout_s` | L4 | remote-session sizing and timeout |
 
@@ -61,8 +62,18 @@ else raises. Remote-worker and remote-memory calls require `level >= 4`.
 For direct onboard L2, `worker.init(borrowed_context_generation=token)` borrows
 an already-current RTS context. `token` is a nonzero uint64 supplied by the caller,
 which must keep that context alive and use a new token for a new context generation.
-It is not a reset detector or an allocation-ownership certificate. Simulator,
-SDMA and Program workspace-budget options are rejected for borrowed initialization.
+It is not a reset detector or an allocation-ownership certificate. Simulator and
+SDMA options are rejected for borrowed initialization.
+
+Both onboard ownership policies install the same internal workspace accounting.
+`workspace_budget_bytes` optionally limits the retained temporary buffer and
+three pooled arenas, including retained generations. It excludes caller tensors,
+registered code, diagnostics, RTS argument blocks and provider memory; it is not
+a device-wide memory ceiling. An absent budget imposes no byte limit. A budget
+refusal after native submission entry follows the existing execution-error
+cleanup contract: the Worker can be closed, but source Buffer references remain
+unproven and `Buffer.close()` still refuses. Retain that backing; this path does
+not provide an immediately retryable submit or a source-release proof.
 
 `worker.submit(handle, args, caller_stream=stream)` uses a nonzero integer RTS
 stream handle for this invocation; `run` accepts the same keyword. The stream is

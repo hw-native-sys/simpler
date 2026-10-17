@@ -225,9 +225,20 @@ def kernel_symbol_runtime(tmp_path_factory):
         memory=False,
         early_failure=None,
         lifecycle_log=None,
+        workspace=False,
     ):
         nonlocal next_library_id
-        key = (supported, missing, init_result, finalize_failures, borrowed, memory, early_failure, lifecycle_log)
+        key = (
+            supported,
+            missing,
+            init_result,
+            finalize_failures,
+            borrowed,
+            memory,
+            early_failure,
+            lifecycle_log,
+            workspace,
+        )
         # Fault scripts retain their consumed failure budget in the loaded DSO.
         if finalize_failures == 0 and key in cache:
             return cache[key]
@@ -261,7 +272,7 @@ def kernel_symbol_runtime(tmp_path_factory):
             '    Scratch() { ++live_scratch; record("scratch-created"); }\n'
             '    ~Scratch() { --live_scratch; record("scratch-destroyed"); }\n'
             "};\n"
-            "struct Context { uint64_t initialized = 0; std::shared_ptr<void> scratch; };\n"
+            "struct Context { uint64_t initialized = 0, workspace_limit = 0; std::shared_ptr<void> scratch; };\n"
             "struct ContextLeakCheck {\n"
             "    ~ContextLeakCheck() {\n"
             "        if (live_contexts != 0 || live_scratch != 0) std::abort();\n"
@@ -312,6 +323,20 @@ def kernel_symbol_runtime(tmp_path_factory):
             ),
             encoding="utf-8",
         )
+        if workspace:
+            with source.open("a", encoding="utf-8") as output:
+                output.write(
+                    "int simpler_set_workspace_budget_ctx(DeviceContextHandle ctx, uint64_t limit) {\n"
+                    "    if (static_cast<Context *>(ctx)->initialized != 0) std::abort();\n"
+                    "    static_cast<Context *>(ctx)->workspace_limit = limit; return 0;\n"
+                    "}\n"
+                    "int simpler_get_workspace_report_ctx(DeviceContextHandle ctx, "
+                    "SimplerWorkspaceReport *out, size_t) {\n"
+                    "    const auto workspace_limit = static_cast<Context *>(ctx)->workspace_limit;\n"
+                    "    *out = {}; out->schema = WORKSPACE_REPORT_SCHEMA;\n"
+                    "    out->budget_enforced = workspace_limit != 0; out->limit_bytes = workspace_limit; return 0;\n"
+                    "}\n"
+                )
         if early_failure == "grant":
             with source.open("a", encoding="utf-8") as output:
                 output.write("int simpler_set_run_resource_grant_ctx(DeviceContextHandle, uint32_t) { return -89; }\n")
@@ -692,7 +717,13 @@ class TestPublicWorkerBorrowed:
     def owner(self, monkeypatch, kernel_symbol_runtime, request):
         from simpler_setup import runtime_builder  # noqa: PLC0415
 
-        runtime = kernel_symbol_runtime(borrowed=True, finalize_failures=getattr(request, "param", 0))
+        options = getattr(request, "param", {})
+        if isinstance(options, int):
+            options = {"finalize_failures": options}
+        budget = options.get("budget", 0)
+        runtime = kernel_symbol_runtime(
+            borrowed=True, finalize_failures=options.get("finalize_failures", 0), workspace=bool(budget)
+        )
         observer = ctypes.CDLL(str(runtime))
         bins = SimpleNamespace(
             host_path=runtime,
@@ -701,7 +732,13 @@ class TestPublicWorkerBorrowed:
             sdma_warmup_path=Path("/unread/sdma_warmup_kernel.o"),
         )
         monkeypatch.setattr(runtime_builder, "RuntimeBuilder", lambda *_: SimpleNamespace(get_binaries=lambda _: bins))
-        worker = Worker(level=2, device_id=0, platform="a2a3", runtime="tensormap_and_ringbuffer")
+        worker = Worker(
+            level=2,
+            device_id=0,
+            platform="a2a3",
+            runtime="tensormap_and_ringbuffer",
+            **({"workspace_budget_bytes": budget} if budget else {}),
+        )
         try:
             target = ChipCallable.build(
                 signature=[ArgDirection.IN], func_name="public_borrowed", binary=b"x", children=[]
@@ -742,10 +779,16 @@ class TestPublicWorkerBorrowed:
         assert worker._cleanup_journal.empty
         assert observer.test_destroys() == 1
 
-    @pytest.mark.parametrize("options", [{"enable_sdma": True}, {"workspace_budget_bytes": 4096}])
-    def test_program_resource_requests_are_rejected_before_startup(self, options):
-        worker = Worker(level=2, platform="a2a3", **options)
-        with pytest.raises(ValueError, match="SDMA or Program workspace budgets"):
+    @pytest.mark.parametrize("owner", [{"budget": 4096}], indirect=True)
+    def test_workspace_budget_reaches_borrowed_native_init(self, owner):
+        worker, _, _ = owner
+        status, report = worker._chip_worker.workspace_report()
+        assert status == "available"
+        assert report["budget_enforced"] == 1 and report["limit_bytes"] == 4096
+
+    def test_sdma_is_rejected_before_startup(self):
+        worker = Worker(level=2, platform="a2a3", enable_sdma=True)
+        with pytest.raises(ValueError, match="does not support SDMA"):
             worker.init(borrowed_context_generation=77)
         assert worker._lifecycle is _Lifecycle.NEW and worker._chip_worker is None
         worker.close()
@@ -1432,8 +1475,6 @@ class TestChipWorkerBorrowedInit:
             {"enable_sdma": True},
             {"sim_context_path": "not-a-simulator"},
             {"sdma_warmup_path": "not-a-warmup"},
-            {"workspace_budget_bytes": 1024},
-            {"manage_workspace": True},
         ],
     )
     def test_unsupported_policy_is_rejected_before_loading(self, options):
@@ -1443,6 +1484,29 @@ class TestChipWorkerBorrowedInit:
             worker.init("not-a-runtime", os.devnull, os.devnull, "", 0, **options)
         assert not worker.initialized
         assert worker.runtime_slot_count == 0
+
+    @pytest.mark.parametrize("budget", [0, 4096])
+    @pytest.mark.parametrize("manage", [False, True])
+    def test_borrowed_workspace_policy_uses_existing_report(self, kernel_symbol_runtime, budget, manage):
+        runtime = kernel_symbol_runtime(borrowed=True, workspace=True)
+        worker = _ChipWorker()
+        try:
+            worker.init(
+                str(runtime),
+                os.devnull,
+                os.devnull,
+                "",
+                0,
+                borrowed_context_generation=77,
+                workspace_budget_bytes=budget,
+                manage_workspace=manage,
+            )
+            status, report = worker.workspace_report()
+            assert status == "available"
+            assert report["budget_enforced"] == bool(budget)
+            assert report["limit_bytes"] == budget
+        finally:
+            worker.finalize()
 
     def test_older_runtime_is_refused_before_context_creation(self, kernel_symbol_runtime):
         runtime = kernel_symbol_runtime()

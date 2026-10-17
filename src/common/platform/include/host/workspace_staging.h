@@ -19,12 +19,9 @@
  * What a device context was asked to do about its workspace, before it is in a
  * position to do it.
  *
- * Management belongs only to a program context, and the execution mode is not
- * latched until `simpler_init` runs — while the two public requests
- * (`simpler_set_workspace_budget_ctx` and
- * `simpler_enable_workspace_management_ctx`) are made before it. So the
- * request is recorded here and consumed once, after the latch and before the
- * eager prewarm takes the first device memory.
+ * Both onboard init entries consume this request before internal workspace
+ * allocation. Ownership management is installed by default; a staged request
+ * optionally adds a finite limit. Staging itself allocates no device memory.
  *
  * Holds no resource: a context that records a request and never installs it is
  * exactly the context it was before.
@@ -38,7 +35,7 @@ class WorkspaceStagingRequest {
 public:
     /** What an install should do with this request. */
     enum class Install : uint32_t {
-        /** Nothing was asked for; leave the context unmanaged. */
+        /** No explicit request; install management without a byte limit. */
         Nothing = 0,
         /** Manage the four regions, enforcing no byte limit. */
         ManageOnly,

@@ -1706,6 +1706,12 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
     int rc = adopt_borrowed_device(device_id);
     if (rc != 0) return rc;
 
+    // Internal arenas belong to this runner even though the RTS context is
+    // caller-owned. The ledger and optional limit precede device allocations.
+    rc = install_staged_workspace();
+    clear_staged_workspace();
+    if (rc != 0) return rc;
+
     rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops());
     if (rc != 0) {
         LOG_ERROR("init_kernel_context: context stream/event creation failed: %d", rc);

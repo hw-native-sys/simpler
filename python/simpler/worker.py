@@ -8753,8 +8753,8 @@ class Worker:
                 raise ValueError("borrowed_context_generation requires a direct L2 Worker")
             if self._config["platform"].endswith("sim"):
                 raise ValueError("borrowed initialization requires an onboard platform")
-            if self._config.get("enable_sdma", False) or self._config.get("workspace_budget_bytes", 0):
-                raise ValueError("borrowed initialization does not support SDMA or Program workspace budgets")
+            if self._config.get("enable_sdma", False):
+                raise ValueError("borrowed initialization does not support SDMA")
             init_options["borrowed_context_generation"] = _nonzero_uint64(
                 borrowed_context_generation, "borrowed_context_generation"
             )

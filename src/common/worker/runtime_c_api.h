@@ -689,21 +689,11 @@ int simpler_set_dfx_session_ctx(DeviceContextHandle ctx, int32_t enabled);
 /**
  * Latch a finite workspace budget on this context, once, at init.
  *
- * Ownership of the four workspace regions is not what this asks for: a program
- * context gets that from `simpler_init` whether or not anyone asked. What this
- * adds is the optional finite limit on them. Recorded here and applied by
- * `simpler_init` once the execution mode is latched, so the limit is in place
- * before the eager prewarm allocates. The first accepted request stands: a
- * second call is refused rather than replacing it.
- *
- * Optional capability: a module that does not export this symbol cannot manage
- * workspace, and a caller that asked for a budget must fail rather than run
- * unmanaged. Off by default — a context that never calls this keeps every
- * allocation path it had.
- *
- * Separate from `simpler_init` for the same reason the diagnostics session gate
- * is: the init signature is resolved by name across the runtime .so boundary,
- * so extending it would break every module that does not ship in lockstep.
+ * Both onboard init entries install ownership management without a request.
+ * This adds an optional finite limit, applied before workspace allocation.
+ * The first accepted request stands: a second is refused rather than replacing
+ * it. A module without this symbol cannot honor a requested limit, and the
+ * caller must fail instead of running without that limit.
  *
  * The budget covers the per-slot retained temporary buffer and the three pooled
  * arena regions. It is not a device-wide ceiling; see SimplerWorkspaceReport.
@@ -717,14 +707,9 @@ int simpler_set_workspace_budget_ctx(DeviceContextHandle ctx, uint64_t limit_byt
 /**
  * Ask for workspace ownership management with no byte limit.
  *
- * Retained for compatibility and no longer necessary: `simpler_init` installs
- * the manager on every program context, so a caller that never calls this gets
- * the same ownership. Calling it before init still succeeds and still records a
- * request, which only reserves the once-only slot
- * `simpler_set_workspace_budget_ctx` also uses.
- *
- * A kernel context is still never managed, because the install lives in
- * `simpler_init` and kernel mode has its own entry.
+ * Compatibility entry: both owned and borrowed onboard initialization install
+ * management by default. Calling this before init reserves the once-only
+ * request slot also used by `simpler_set_workspace_budget_ctx`.
  *
  * @return 0 on success, PTO_RUNTIME_ERR_INVALID_ARGUMENT when this context has
  *         already made a request, PTO_RUNTIME_ERR_INVALID_STATE once

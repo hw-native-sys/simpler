@@ -236,11 +236,8 @@ void ChipWorker::init(
     if (borrowed_context_generation.has_value()) {
         if (*borrowed_context_generation == 0)
             throw std::invalid_argument("borrowed context generation must be nonzero");
-        if (enable_sdma || !sim_context_path.empty() || !sdma_warmup_path.empty() || workspace_budget_bytes != 0 ||
-            manage_workspace) {
-            throw std::invalid_argument(
-                "borrowed initialization does not support Program workspace or simulator options"
-            );
+        if (enable_sdma || !sim_context_path.empty() || !sdma_warmup_path.empty()) {
+            throw std::invalid_argument("borrowed initialization does not support SDMA or simulator options");
         }
     }
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
@@ -550,25 +547,13 @@ void ChipWorker::init(
                 retained_epoch_limit_granted_ = depth;
             }
         }
-        // Two routes, resolved from this call's own arguments rather than from
-        // a probe:
-        //
-        //   sim         a simulated backend manages no device workspace, so
-        //               nothing is requested and the absence of the symbols is
-        //               never examined;
-        //   program     `simpler_init` installs the manager itself, for every
-        //               caller, so this call asks for nothing on its own
-        //               account. What it still carries is the optional byte
-        //               limit, which is a caller's policy and has to be staged
-        //               before that install runs.
-        //
-        // `manage_workspace` is accepted and no longer decides anything: it
-        // kept this route's behaviour apart while one part of the tree was
-        // managed and the rest was not, and the install below covers both.
-        // Retained so existing callers keep compiling and calling.
+        // Onboard init installs workspace ownership for both owned and borrowed
+        // contexts. A finite limit is staged before either init entry runs.
+        // Simulator backends manage no device workspace. `manage_workspace` is
+        // a compatibility argument and does not select ownership policy.
         const bool simulated = !sim_context_path.empty();
         (void)manage_workspace;
-        if (!simulated && !borrowed_context_generation.has_value()) {
+        if (!simulated) {
             if (workspace_budget_bytes != 0) {
                 if (set_workspace_budget_fn_ == nullptr) {
                     throw std::runtime_error("ChipWorker::init: this runtime module has no workspace budget support");

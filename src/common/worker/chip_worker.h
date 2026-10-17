@@ -115,7 +115,8 @@ public:
     ///
     /// borrowed_context_generation selects the caller-owned, already-current RTS
     /// context. It must be nonzero; absent means the existing owned-device init.
-    /// Borrowed init supports no SDMA, simulator or Program workspace-budget policy.
+    /// Both onboard routes manage internal workspace and accept an optional byte budget.
+    /// Borrowed init supports no SDMA or simulator policy.
     /// The caller keeps its context current through successful finalize. Failed
     /// rollback requires explicit finalize if it could not close; that worker
     /// cannot be reinitialized.

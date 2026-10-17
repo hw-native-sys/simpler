@@ -809,11 +809,8 @@ int simpler_init(
     // post-consume one, and each exit records that this context is no longer
     // proved.
     //
-    // The install is what puts every route that reaches this entry — a
-    // Worker's, and a direct C caller's — under the same manager, and it runs
-    // before the eager prewarm below, which is the first thing that takes
-    // device memory. Keeping it here rather than at the staging call is what
-    // keeps a kernel context from ever being managed.
+    // Workspace ownership and its optional limit precede the eager prewarm's
+    // device allocations. Borrowed init installs the same ledger separately.
     ContextInstallSteps install_steps;
     install_steps.ctx = runner;
     install_steps.install_workspace = [](void *c) {
@@ -2496,15 +2493,9 @@ size_t committed_device_memory_ctx(DeviceContextHandle ctx) {
 
 int simpler_set_workspace_budget_ctx(DeviceContextHandle ctx, uint64_t limit_bytes) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
-    // Unchanged for every existing caller: a positive limit is still a
-    // complete request, asking for management *and* that limit. What changed
-    // is when it takes effect — it is recorded here and installed by
-    // simpler_init once the program-mode latch is taken, so the ownership
-    // ledger exists before the prewarm allocates rather than after.
-    //
-    // Zero is still refused. A caller that wants management without a limit
-    // uses simpler_enable_workspace_management_ctx instead, so the two
-    // requests stay distinguishable and no sentinel value is overloaded.
+    // Either onboard init entry consumes the request before allocating its
+    // internal workspace. Zero denotes no finite budget only on the separate
+    // management-only entry.
     if (limit_bytes == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     try {
         return static_cast<DeviceRunnerBase *>(ctx)->stage_workspace_management(limit_bytes);
