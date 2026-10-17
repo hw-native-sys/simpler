@@ -202,10 +202,30 @@ struct RetainedRunsFixture {
 
     void *shm() { return collector.get_chip_swimlane_setup_device_ptr(); }
 
+    /**
+     * Admit the epoch the way the lane does.
+     *
+     * `run_begin` does not park for capacity: it runs under the caller's lane
+     * mutex, where waiting would stop the very retirement that frees a bucket,
+     * so a full bucket table is reported as a refusal and the caller
+     * re-attempts outside both locks. This is that caller. A refusal naming
+     * anything other than capacity is final and is returned as one.
+     */
+    bool admit(uint64_t epoch) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (true) {
+            auto why = simpler::dfx::runs::AdmissionRefusal::None;
+            if (collector.run_begin(epoch, dir.str(), level, nullptr, 0, false, nullptr, &why)) return true;
+            if (why != simpler::dfx::runs::AdmissionRefusal::Capacity) return false;
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+    }
+
     /** Open a run: arm its bank, admit the epoch, bring the device side up. */
     void begin(uint64_t epoch) {
         ASSERT_NE(shm(), nullptr);
-        EXPECT_TRUE(collector.run_begin(epoch, dir.str(), level, nullptr, 0, false));
+        EXPECT_TRUE(admit(epoch)) << "epoch " << epoch << " was never admitted";
         set_platform_run_result(/*region_base=*/0, epoch);
         set_chip_swimlane_enabled(true);
         set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm()));
@@ -357,9 +377,9 @@ struct ReaderlessCollector {
 
 }  // namespace
 
-// Three runs in a row, with nobody calling flush. The writer is what
-// frees a slot, so if publication were only a caller's job the third
-// `run_begin` would block for ever against a two-slot cap.
+// Three runs in a row, with nobody calling flush. The writer is what frees a
+// bucket, so if publication were only a caller's job the third admission would
+// be refused for capacity until its deadline against a two-bucket cap.
 TEST(ChipSwimlaneRetainedRunsTest, ThreeRunsProgressWithoutAnyFlush) {
     RetainedRunsFixture fx("progress", /*cores=*/1, /*threads=*/1);
     const int cores[] = {0};
@@ -1284,8 +1304,8 @@ TEST(ChipSwimlaneRetainedRunsTest, ControlHandshakeWakesAnIdleCollectorWithoutIt
         );
         chip_swimlane_aicpu_init(fx.num_aicore);
         fx.close(epoch, cores, 1);
-        // Published before the next admission, so no `run_begin` below waits
-        // for a slot and the measurement stays about the handshake.
+        // Published before the next admission, so no `run_begin` below is
+        // refused for capacity and the measurement stays about the handshake.
         ASSERT_TRUE(fx.wait_for_files(static_cast<size_t>(i) + 1)) << "epoch " << epoch << " was not published";
     }
 
@@ -1319,7 +1339,11 @@ TEST(ChipSwimlaneRetainedRunsTest, OversizedRunMetadataIsRefusedBeforeItIsCopied
         oversized += ",";
     }
     oversized += "0]";
-    ASSERT_TRUE(fx.collector.set_json_extension(ChipSwimlaneExtensionSection::AicpuLifecycleRecords, oversized));
+    // Refused where the charge is taken: at the publication, before any copy
+    // exists. The run keeps everything else it holds.
+    EXPECT_FALSE(fx.collector.set_json_extension(
+        kEpoch, ChipSwimlaneExtensionSection::AicpuLifecycleRecords, oversized.c_str(), oversized.size()
+    ));
 
     fx.close(kEpoch, cores, 1);
     ASSERT_TRUE(fx.wait_for_files(1));
@@ -1379,6 +1403,67 @@ TEST(ChipSwimlaneRetainedRunsTest, HostPhaseRecordsReachTheEpochThatProducedThem
             EXPECT_EQ(body.find(recorded_records_field(1)), std::string::npos)
                 << "epoch 701 carried its predecessor's host phase records";
         }
+    }
+    EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
+}
+
+// Two runs open at once, each publishing a host-side section of its own.
+//
+// This is the ordering a joined launch produces and the only one in which the
+// defect appears: the successor is admitted while the predecessor is still
+// executing, so the predecessor publishes *after* the admission that would have
+// cleared a resident slot, and a shared slot then belongs to neither run. With
+// the publication addressed by its run, the first run's section goes into the
+// first run's bucket, the second's is not refused by the first's leftovers, and
+// neither artifact carries the other's section.
+TEST(ChipSwimlaneRetainedRunsTest, EachOpenRunPublishesItsOwnExtension) {
+    RetainedRunsFixture fx("extension-own-epoch", /*cores=*/1, /*threads=*/1);
+    const int cores[] = {0};
+    constexpr uint64_t kFirst = 820;
+    constexpr uint64_t kSecond = 821;
+    const std::string first_marker = "\"ZZfirstrunZZ\"";
+    const std::string second_marker = "\"ZZsecondrunZZ\"";
+    const std::string first_payload = "[" + first_marker + "]";
+    const std::string second_payload = "[" + second_marker + "]";
+    static constexpr char kOverwrite[] = "[\"ZZoverwriteZZ\"]";
+    static constexpr char kStray[] = "[\"ZZstrayZZ\"]";
+    constexpr auto kSection = ChipSwimlaneExtensionSection::AicpuLifecycleRecords;
+
+    // Both admitted before either publishes.
+    fx.begin(kFirst);
+    fx.begin(kSecond);
+
+    ASSERT_TRUE(fx.collector.set_json_extension(kFirst, kSection, first_payload.c_str(), first_payload.size()));
+    // The same run publishing the same section twice is still refused, and the
+    // first copy is what it keeps.
+    EXPECT_FALSE(fx.collector.set_json_extension(kFirst, kSection, kOverwrite, sizeof(kOverwrite) - 1));
+    // A publication naming a run this collector does not hold open lands
+    // nowhere: the only slots available are other runs'.
+    EXPECT_FALSE(fx.collector.set_json_extension(kSecond + 7, kSection, kStray, sizeof(kStray) - 1));
+    fx.close(kFirst, cores, 1);
+
+    // Accepted rather than refused: this section's slot is this run's, and the
+    // predecessor's payload is in the predecessor's bucket.
+    ASSERT_TRUE(fx.collector.set_json_extension(kSecond, kSection, second_payload.c_str(), second_payload.size()));
+    fx.close(kSecond, cores, 1);
+
+    ASSERT_TRUE(fx.wait_for_files(2));
+    size_t seen = 0;
+    for (const auto &f : published_files(fx.dir.path())) {
+        const std::string name = f.filename().string();
+        const std::string body = read_file(f);
+        if (name == "records_e820.json") {
+            seen++;
+            EXPECT_NE(body.find(first_marker), std::string::npos) << "epoch 820 lost the section it published";
+            EXPECT_EQ(body.find(second_marker), std::string::npos) << "epoch 820 carried its successor's section";
+            EXPECT_EQ(body.find("ZZoverwriteZZ"), std::string::npos) << "the refused second publication was kept";
+        } else if (name == "records_e821.json") {
+            seen++;
+            EXPECT_NE(body.find(second_marker), std::string::npos)
+                << "epoch 821 published no section of its own; its predecessor's slot refused it";
+            EXPECT_EQ(body.find(first_marker), std::string::npos) << "epoch 821 carried its predecessor's section";
+        }
+        EXPECT_EQ(body.find("ZZstrayZZ"), std::string::npos) << "a section naming no open run reached an artifact";
     }
     EXPECT_EQ(seen, 2u) << "one of the two epochs published no artifact";
 }

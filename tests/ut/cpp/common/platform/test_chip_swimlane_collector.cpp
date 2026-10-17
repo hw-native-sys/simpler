@@ -29,12 +29,15 @@
 TEST(ChipSwimlaneCollectorTest, BeginRunReleasesRuntimeExtensionSlots) {
     ChipSwimlaneCollector collector;
 
+    // Non-retained: one run reaches the device at a time, so the resident slot
+    // is the run's and `begin_run` is what releases it. The epoch is carried
+    // for the addressed path and is not what selects storage here.
     collector.begin_run("first", ChipSwimlaneLevel::TASK_TIMING);
-    ASSERT_TRUE(collector.set_json_extension(ChipSwimlaneExtensionSection::AicoreTasks, "[]"));
-    EXPECT_FALSE(collector.set_json_extension(ChipSwimlaneExtensionSection::AicoreTasks, "[]"));
+    ASSERT_TRUE(collector.set_json_extension(/*run_epoch=*/1, ChipSwimlaneExtensionSection::AicoreTasks, "[]", 2));
+    EXPECT_FALSE(collector.set_json_extension(/*run_epoch=*/1, ChipSwimlaneExtensionSection::AicoreTasks, "[]", 2));
 
     collector.begin_run("second", ChipSwimlaneLevel::TASK_TIMING);
-    EXPECT_TRUE(collector.set_json_extension(ChipSwimlaneExtensionSection::AicoreTasks, "[]"));
+    EXPECT_TRUE(collector.set_json_extension(/*run_epoch=*/2, ChipSwimlaneExtensionSection::AicoreTasks, "[]", 2));
 }
 
 namespace {

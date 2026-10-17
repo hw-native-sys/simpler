@@ -11,6 +11,7 @@
 
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
+#include "aicore/pmu_collector_aicore.h"
 // AICore dependency scheduling uses one device-side protocol.
 #include "scheduler/scheduler_mix.h"
 #include "common/platform_config.h"
@@ -56,6 +57,35 @@ struct SchedulerWorkerStats {
     uint64_t final_stats_publish_end_cycles{0};
     uint64_t exit_ack_publish_cycles{0};
 };
+
+/**
+ * Stage the PMU counters this core just froze for one executed subtask.
+ *
+ * Called between `pmu_aicore_end()` and the completion publication, so the
+ * window the counters describe is this subtask's kernel and nothing after it.
+ * The cell array is indexed exactly as the trace cells are, so a mix task's
+ * three subtasks land in three cells of their own.
+ *
+ * `published` carries the task id plus one and is written last. The AICPU
+ * reads these cells only after every core has retired, and that ordering is
+ * what lets it tell a subtask that executed and counted zero from one this run
+ * never reached.
+ */
+__aicore__ __attribute__((always_inline)) void stage_task_pmu(
+    __gm__ void *scheduler_state_base, SchedulerLocalState *local, int64_t task_id, uint8_t subtask,
+    uint64_t pmu_reg_base
+) {
+    if (local->config.pmu_cells_offset == 0 || pmu_reg_base == 0) return;
+    if (subtask >= SCHEDULER_TASK_SUBTASK_SLOTS) return;
+    __gm__ SchedulerTaskPmuCell *cells =
+        scheduler_state_at<SchedulerTaskPmuCell>(scheduler_state_base, local->config.pmu_cells_offset);
+    __gm__ SchedulerTaskPmuCell *cell = &cells[scheduler_trace_index_at(scheduler_state_base, local, task_id, subtask)];
+    pmu_aicore_read_counters(pmu_reg_base, cell->counters, &cell->total_cycles);
+    cell->worker_id = static_cast<uint32_t>(local->config.worker_ids[local->config.self_lane]);
+    OUT_OF_ORDER_STORE_BARRIER();
+    cell->published = static_cast<uint32_t>(task_id) + 1U;
+    scheduler_publish_cache_line(cell);
+}
 
 __aicore__ __attribute__((always_inline)) void execute_task(__gm__ DispatchPayload *payload) {
     if (payload == nullptr || payload->function_bin_addr == 0) return;
@@ -274,6 +304,11 @@ __aicore__ bool run_ready_dispatch_loop(
 ) {
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region = scheduler_ssbuf_region(platform_ssbuf_hardware_base_address());
     const uint32_t cluster_lane = context->config.self_lane;
+    // Non-zero only when this run enabled PMU and this core has a PMU window;
+    // it is the whole gate, so a run with PMU off issues no counter access and
+    // stages no cell.
+    const uint64_t pmu_reg_base =
+        SIMPLER_GET_DFX_FLAG(get_aicore_profiling_flag(), SIMPLER_DFX_FLAG_PMU) ? get_aicore_pmu_reg_base() : 0;
     const bool task_timing_enabled = scheduler_task_timing_enabled(profiling_level);
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
     const uint64_t scheduler_count = context->config.scheduler_count;
@@ -467,7 +502,17 @@ __aicore__ bool run_ready_dispatch_loop(
             }
             OUT_OF_ORDER_STORE_BARRIER();
             uint64_t kernel_start = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
+            if (pmu_reg_base != 0) pmu_aicore_begin();
             execute_task(payload);
+            if (pmu_reg_base != 0) {
+                pmu_aicore_end();
+                // The subtask this lane ran, not the lane: a task's subtasks
+                // are placed on whichever lanes of the cluster are free, so a
+                // mix task's three records are told apart by this and nothing
+                // else.
+                const uint8_t subtask_slot = scheduler_worker ? local_slot->subtask_slot : ssbuf_control->subtask_slot;
+                stage_task_pmu(scheduler_state_base, context, task_id, subtask_slot, pmu_reg_base);
+            }
             uint64_t kernel_end = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (commit_executor_trace) stage_task_trace_before_completion(&execution_trace, kernel_start, kernel_end);
             if (scheduler_worker) {

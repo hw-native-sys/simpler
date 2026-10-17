@@ -127,6 +127,10 @@ struct SchedulerLocalConfig {
     // address cannot be narrowed the way the offsets are; the length can, and
     // is validated below.
     uint64_t callable_addresses_address{0};
+    // This run's per-subtask PMU staging array. Here rather than in the
+    // profiling state because PMU is its own owner: a run can enable it with
+    // every swimlane level off, and that state is then absent.
+    uint64_t pmu_cells_offset{0};
     uint32_t worker_contexts_offset{0};
     uint32_t callable_addresses_count{0};
     uint32_t task_metadata_offset{0};
@@ -213,9 +217,9 @@ static_assert(SCHEDULER_PENDING_SLOT_COUNT <= 8, "local ready mask must fit one 
 static_assert(SCHEDULER_READY_QUEUE_COUNT <= 8, "owner ready mask must fit one byte");
 static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 88, "64-bit local config size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 96, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 16, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 376, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 384, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 240, "64-bit local profiling size changed"
 );
@@ -233,7 +237,12 @@ inline __aicore__ bool scheduler_initialize_local_config(
     if (context->scheduler_ssbuf_reserved0 != 0 || context->scheduler_ssbuf_reserved1 != 0 ||
         context->scheduler_ssbuf_reserved2 != 0)
         return false;
-    for (uint32_t index = 0; index < 3; ++index)
+    // Every word of the reserved tail, however many are left: a field taken out
+    // of this array is a field a producer now writes, so a bound that outlives
+    // the array reads the next member instead and rejects a context whose only
+    // fault is that the member is in use.
+    for (uint32_t index = 0; index < sizeof(context->topology_reserved) / sizeof(context->topology_reserved[0]);
+         ++index)
         if (context->topology_reserved[index] != 0) return false;
     SchedulerLocalConfig &config = local->config;
     const uint64_t payload_stride = SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
@@ -252,6 +261,7 @@ inline __aicore__ bool scheduler_initialize_local_config(
     config.task_metadata_offset = static_cast<uint32_t>(context->task_metadata_offset);
     config.ready_inboxes_offset = context->ready_inboxes_offset;
     config.ready_directory_offset = context->ready_directory_offset;
+    config.pmu_cells_offset = context->pmu_cells_offset;
     if (local->profiling != nullptr) {
         local->profiling->trace_cells_offset = context->trace_cells_offset;
         local->profiling->activity_buffers_offset = context->activity_buffers_offset;
@@ -1352,7 +1362,10 @@ inline __aicore__ void scheduler_stage_dispatch_slot(
     const bool remote = slot_claim.worker_id != scheduler->worker_id();
     SCHEDULER_SSBUF SchedulerSsbufDispatchControl *dispatch_control =
         &ssbuf_region->lanes[slot_claim.cluster_lane].dispatch[slot_claim.slot_index];
-    if (remote) dispatch_control->task_id = ready_claim.task_id;
+    if (remote) {
+        dispatch_control->task_id = ready_claim.task_id;
+        dispatch_control->subtask_slot = subtask_slot;
+    }
     scheduler_writeback_dispatch_payload(payload);
 }
 

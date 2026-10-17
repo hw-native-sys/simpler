@@ -52,6 +52,11 @@
 #define SCOPE_STATS_MAX_RING_DEPTH 4
 #define SCOPE_STATS_MAX_SCOPE_DEPTH 64
 
+// The orchestrator thread is the only writer of this collector's records, so
+// one producer publishes its per-run terminal accounting and it is producer 0.
+#define SCOPE_STATS_TERMINAL_PRODUCERS 1
+#define SCOPE_STATS_TERMINAL_PRODUCER 0
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -140,14 +145,26 @@ struct ScopeStatsFreeQueue {
 
 // Per-instance buffer state. current_buf_ptr / current_buf_seq / the counters
 // are all Device-written, Host-read (except free_queue.tail which Host writes).
+//
+// The four counters are the producer's own, reset at its run's device init and
+// settled into that run's DiagnosticRunTerminal entry at its close. A host read
+// of them names whichever run is executing, which is why no artifact is written
+// from them directly.
 struct ScopeStatsBufferState {
     ScopeStatsFreeQueue free_queue;
-    volatile uint64_t current_buf_ptr;       // Device's in-progress buffer (0 = none)
-    volatile uint32_t current_buf_seq;       // Device monotonic counter
-    volatile uint32_t dropped_record_count;  // Device: records dropped (free_queue empty / ready_queue full)
-    volatile uint32_t total_record_count;    // Device: monotonic count of every record appended (success + dropped)
-    uint32_t _pad[11];
+    volatile uint64_t current_buf_ptr;         // Device's in-progress buffer (0 = none)
+    volatile uint32_t current_buf_seq;         // Device monotonic counter
+    volatile uint32_t dropped_record_count;    // Device: records dropped (free_queue empty / ready_queue full)
+    volatile uint32_t total_record_count;      // Device: monotonic count of every record appended (success + dropped)
+    volatile uint32_t published_record_count;  // Device: records inside buffers committed to the ready queue
+    volatile uint32_t published_buffer_count;  // Device: successful ready-queue commits
+    uint32_t _pad[9];
 } __attribute__((aligned(64)));
+// The host maps this state by size, so a counter added inside the existing
+// padding must not move the cache line it shares with the free queue.
+static_assert(
+    sizeof(ScopeStatsBufferState) == sizeof(ScopeStatsFreeQueue) + 64, "ScopeStatsBufferState must stay two lines"
+);
 
 // Ready queue entry — when a ScopeStatsBuffer fills, AICPU pushes one of these
 // onto the per-thread ready queue for host pickup.
@@ -166,7 +183,8 @@ struct ScopeStatsReadyQueueEntry {
 //
 // Static capacity metadata + fatal latch live here (not in the streamed
 // records) because they are run-constants written once by the AICPU capacity
-// setters at orchestrator init and read by the host at finalize.
+// setters at orchestrator init. The serialized host path reads them at finalize;
+// retained exports use their own host binding's capacity snapshot.
 struct ScopeStatsDataHeader {
     ScopeStatsReadyQueueEntry queues[PLATFORM_MAX_AICPU_THREADS][PLATFORM_SCOPE_STATS_READYQUEUE_SIZE];
     volatile uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS];  // Host reads (consumer)

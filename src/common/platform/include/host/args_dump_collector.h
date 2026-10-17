@@ -54,6 +54,7 @@
 #include "common/unified_log.h"
 #include "data_type.h"
 #include "host/args_dump_runs.h"
+#include "host/diagnostic_run_banks.h"
 #include "host/profiler_base.h"
 #include "host/profiling_copy.h"
 
@@ -329,8 +330,122 @@ public:
      * level, or when the collector is fatal. A refusal must fail the run:
      * falling back to `begin_run` would reset counters a predecessor's writer
      * is still acknowledging against.
+     *
+     * `why` is meaningful only when this returns false, and says whether the
+     * refusal is a capacity shortage the caller should re-attempt when credit
+     * moves or a condition re-attempting cannot change. Any refusal this does
+     * not classify reports `Fatal`: an over-strict answer fails the run early,
+     * where an over-lenient one would retry until its deadline.
      */
-    bool run_begin(uint64_t run_epoch, const std::string &output_prefix, DumpArgsLevel dump_args_level);
+    bool run_begin(
+        uint64_t run_epoch, const std::string &output_prefix, DumpArgsLevel dump_args_level,
+        simpler::dfx::runs::AdmissionRefusal *why = nullptr
+    );
+
+    /**
+     * Map the device bank array this collector's producers publish their
+     * per-run accounting into, one entry per dump thread.
+     *
+     * Until this is called a run's figures come from differencing two host
+     * readings of lifetime cursors, which is correct only while runs are
+     * serialized. The address only reaches the device through the launching
+     * run's kernel arguments, so a mapped array with nobody publishing into it
+     * would report every participant missing.
+     */
+    bool open_run_terminal_banks(int expected_producers);
+
+    /** True while a run's own producer accounting is what settles its figures. */
+    bool device_publishes_run_terminal() const { return terminal_banks_.opened(); }
+    bool terminal_backing_retained() const { return terminal_banks_.backing_retained(); }
+
+    /** The address this run's producers publish into, for its kernel arguments. */
+    uint64_t run_terminal_device_address() const { return terminal_banks_.device_address(); }
+
+    /**
+     * Terminal banks held out of this collector's pool right now — one per live
+     * run that reserved one, plus any a run that ended with neither a
+     * completion nor a producer-stop proof still owes. The pool's own
+     * occupancy, which is the only figure that still answers once a run's slot
+     * has been retired.
+     */
+    size_t run_terminal_banks_in_use() const { return terminal_banks_.credits().banks_in_use(); }
+
+    /**
+     * The device address this run's producer publishes its accounting into.
+     *
+     * Resolved from the bank the run's own admission reserved, so two runs open
+     * at once get two addresses. 0 when the run holds no reservation — it was
+     * never admitted, its admission was refused, or retention is off — which is
+     * what the device reads as "publish no accounting".
+     */
+    uint64_t run_terminal_bank_address(uint64_t run_epoch) const;
+
+    /**
+     * Whether this run could take a terminal bank right now.
+     *
+     * True when the run already holds one — the question is idempotent across
+     * launch rounds — or when the array has one free. A run ordered behind the
+     * open ones with no bank left waits rather than launching without the
+     * accounting its diagnostic exists to produce; the banks come back as the
+     * runs ahead of it report.
+     */
+    bool can_take_run_terminal_bank(uint64_t run_epoch) const {
+        if (run_epoch == 0) return false;
+        if (run_terminal_bank_address(run_epoch) != 0) return true;
+        return terminal_banks_.can_reserve();
+    }
+
+    /**
+     * Give back the bank `run_epoch` holds without reading it, on proof that
+     * every producer that could write into it has terminated.
+     *
+     * The same settlement the other owners make: a run whose completion was
+     * never observed has its lane accounting read by nobody, and an entry that
+     * outlives this epoch is counted as foreign by the next occupant, whose
+     * reconciliation compares each entry against its own run identity. Only the
+     * device storage comes back — this run's payload file, its temporary
+     * manifest and any records it retained stay exactly where a failed run
+     * leaves them, as the evidence this collector never deletes.
+     *
+     * The proof is the caller's and it is about producers, not success. Without
+     * it the epoch keeps the bank, because a producer may still be writing into
+     * it.
+     */
+    void discard_run_terminal_bank(uint64_t run_epoch);
+
+    /**
+     * Whether a further run could be admitted to the retained path.
+     *
+     * Retention configured, no sticky failure, and an output slot actually
+     * free — read as one answer, because a free slot on a collector that is not
+     * retaining proves nothing and a failed collector refuses admission
+     * whatever its capacity.
+     */
+    bool can_admit_retained_run() const;
+
+    /**
+     * Whether this collector holds no unpublished retained run.
+     *
+     * True with retention off, and true once every admitted run's writer has
+     * published. What it answers is whether a writer may still be reading
+     * this collector's pools — which outlives a run's native retirement, so
+     * it is not the same question as whether a run is executing.
+     */
+    bool retained_runs_idle() const;
+
+    /**
+     * Tell the owning context that this collector's capacity may have moved.
+     *
+     * Set once by the runner after init. Over-notifying is free — a woken
+     * admission re-attempts and parks again — while under-notifying costs a
+     * blocked run its whole deadline, so every path that signals this
+     * collector's own waiters signals this too rather than reasoning about
+     * whether it had to. Invoked with no collector lock held.
+     */
+    void set_credit_release_notifier(std::function<void()> notifier) { credit_notifier_ = std::move(notifier); }
+
+    /** Producers this collector brought up: one per dump thread. */
+    int terminal_producer_count() const { return num_dump_threads_; }
 
     /**
      * Close one run's collection window while it still holds the execution
@@ -450,6 +565,7 @@ public:
     void publish_arena_acks();
 
 private:
+    friend struct ArgsDumpCollectorTestPeer;
     // Declared here so the receive path can take one by pointer; defined with
     // the rest of the retention state below.
     struct RetainedEpoch;
@@ -463,6 +579,31 @@ private:
 
     void *dump_shared_mem_dev_{nullptr};
     int num_dump_threads_{0};
+    std::function<void()> credit_notifier_;
+    simpler::dfx::credit::RunTerminalBanks terminal_banks_{};
+    // Kept from `initialize` so the bank array uses the same device allocator
+    // as this collector's buffers.
+    DumpAllocCallback device_alloc_cb_{nullptr};
+    DumpFreeCallback device_free_cb_{nullptr};
+    /**
+     * The callback the terminal bank array is released through.
+     *
+     * Separate from `device_free_cb_` because the two are not the same
+     * function at the only moment the array is released: `finalize` is handed
+     * its own free callback, and a teardown that abandons device resources
+     * hands one that frees nothing. The array is this collector's last device
+     * allocation and must follow the same policy as the pooled buffers
+     * released beside it, so `finalize` rebinds this to its own argument
+     * before releasing — using the init-time allocator there would hand memory
+     * back to an allocator the caller has deliberately stopped using.
+     */
+    DumpFreeCallback bank_free_cb_{nullptr};
+    /**
+     * The teardown's unregister callback, stashed beside the free one and for
+     * the same reason: the bank array's host mapping has to come down before
+     * its memory does, and `finalize` is the only place that callback exists.
+     */
+    DumpUnregisterCallback bank_unregister_cb_{nullptr};
 
     // Per-task output directory captured at initialize() time. The writer
     // thread builds run_dir_ = output_prefix_ / "args_dump" lazily on the
@@ -601,9 +742,15 @@ private:
 
         // Per lane at admission. The device's published and dropped counters
         // are not reset per run on this path, so a run's own figures are its
-        // close reading minus these.
+        // close reading minus these. Unused once a terminal bank is mapped: a
+        // difference between two host readings is not a run's figure when a
+        // successor may already be producing between them.
         std::vector<uint64_t> admit_published;
         std::vector<uint32_t> admit_dropped;
+
+        // The device bank this run's producers publish into, held from
+        // admission until the host has copied their accounting out of it.
+        simpler::dfx::credit::Reservation terminal_bank;
 
         // The payload cursor and the write queue's order are committed under
         // `write_mutex_` together, so the manifest's offsets and the file's
@@ -672,6 +819,7 @@ private:
 
     mutable std::mutex retained_mu_;
     std::condition_variable retained_cv_;
+    // Every access uses write_mutex_, including admission and slot release.
     uint64_t retained_progress_{0};
     std::atomic<uint64_t> retained_close_watermark_{0};
     std::atomic<bool> retained_release_deferred_{false};
@@ -701,7 +849,24 @@ private:
     void retained_seal(size_t slot);
     bool retained_publish_manifest(RetainedEpoch &epoch, simpler::dfx::args_dump::Verdict verdict);
     void retained_finish_epoch(size_t slot, simpler::dfx::args_dump::Verdict verdict, const char *detail);
+    /** Device allocation trampolines for the bank array, bound to `this`. */
+    static void *bank_alloc(void *owner, size_t bytes, void **host_out);
+    static int bank_initialize(void *owner, void *device_dst, void *host_dst, const void *initial, size_t bytes);
+    static int bank_unmap(void *owner, void *device_ptr);
+    static int bank_free(void *owner, void *device_ptr);
+    static int bank_copy(void *owner, void *host_dst, const void *device_src, const void *host_src, size_t bytes);
+
     bool retained_read_terminal_state(RetainedEpoch &epoch);
+
+    /**
+     * Fill this run's figures from the bank its producers published into.
+     *
+     * Consumes the reservation, so the bank is the next run's as soon as the
+     * accounting is in host storage. Every producer thread this collector
+     * brought up must have published; one that did not leaves the run's counts
+     * unknown rather than silently narrowing the producer set.
+     */
+    bool retained_read_terminal_from_bank(RetainedEpoch &epoch);
     void retained_decide_leftovers(RetainedEpoch &epoch);
     bool retained_publish_level(DumpArgsLevel level);
     /**

@@ -35,16 +35,39 @@ constexpr uint64_t PMU_AICORE_CTRL_ENABLE_BIT = 0x1ULL;
 
 /**
  * Begin PMU counting window: set CTRL bit0 so hardware counters start accruing.
+ *
+ * The toggle is fenced on both sides because that is how the toolchain's own
+ * equivalent does it. `metrics_prof_start` /`metrics_prof_stop` in
+ * `__clang_cce_aicore_functions.h` (CANN 9.0.0 BiSheng, guarded for
+ * `__DAV_C220_VEC__` / `__DAV_C220_CUBE__` and `__NPU_ARCH__ == 3510`, which
+ * covers both architectures here) set and clear **this same bit 0** and wrap
+ * each write in `pipe_barrier(PIPE_ALL)`. `set_ctrl` is a scalar-pipe write
+ * while the work being measured runs on the other pipes, so without those
+ * fences the enable is not ordered against the kernel body in either
+ * direction. This is contract conformance: it is not evidence about what the
+ * counters then hold, and it does not explain any particular measurement.
  */
 __aicore__ __attribute__((always_inline)) static inline void pmu_aicore_begin() {
+    pipe_barrier(PIPE_ALL);
     write_reg(RegId::CTRL, read_reg(RegId::CTRL) | PMU_AICORE_CTRL_ENABLE_BIT);
+    pipe_barrier(PIPE_ALL);
 }
 
 /**
- * End PMU counting window: clear CTRL bit0 so counters freeze until next begin.
+ * End PMU counting window: clear CTRL bit0.
+ *
+ * Whether the counter registers hold their accumulated value after this, or
+ * stop presenting it, is not stated by any contract this repo can cite. Both
+ * executors on this architecture read the counters from the AICPU, released by
+ * the per-task FIN, and publishing FIN is a notification rather than an
+ * acknowledgement that the read happened — so where this call sits relative to
+ * FIN does not decide whether a read lands inside the window, and no ordering
+ * here should be read as establishing that it does.
  */
 __aicore__ __attribute__((always_inline)) static inline void pmu_aicore_end() {
+    pipe_barrier(PIPE_ALL);
     write_reg(RegId::CTRL, read_reg(RegId::CTRL) & ~PMU_AICORE_CTRL_ENABLE_BIT);
+    pipe_barrier(PIPE_ALL);
 }
 
 #endif  // PLATFORM_AICORE_PMU_COLLECTOR_AICORE_H_

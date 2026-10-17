@@ -75,6 +75,11 @@ constexpr int DEP_GEN_TENSOR_SIZE = 128;
  */
 constexpr int DEP_GEN_MAX_EXPLICIT_DEPS = 64;
 
+// The orchestrator thread is the only writer of this collector's records, so
+// one producer publishes its per-run terminal accounting and it is producer 0.
+constexpr int DEP_GEN_TERMINAL_PRODUCERS = 1;
+constexpr int DEP_GEN_TERMINAL_PRODUCER = 0;
+
 // =============================================================================
 // DepGenRecord — one captured submit_task call
 // =============================================================================
@@ -287,7 +292,9 @@ struct DepGenBufferState {
     volatile uint32_t dropped_record_count;
     volatile uint32_t total_record_count;
     volatile uint32_t total_overflow_record_count;
-    uint32_t _pad[10];
+    volatile uint32_t published_record_count;  // records inside buffers committed to the ready queue
+    volatile uint32_t published_buffer_count;  // successful ready-queue commits
+    uint32_t _pad[8];
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(DepGenBufferState) == 192, "DepGenBufferState must be 192 bytes");

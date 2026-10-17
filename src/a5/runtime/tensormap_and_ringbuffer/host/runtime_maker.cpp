@@ -142,6 +142,28 @@ extern "C" int concurrent_native_prepare_supported_impl(void) { return 1; }
  */
 extern "C" int joined_native_launch_supported_impl(void) { return 1; }
 
+extern "C" int joined_diagnostic_launch_supported_impl(void) {
+    // The five device owners can hold two runs open on this runtime. Every
+    // producer stamps the run epoch its AICPU op was launched with onto the
+    // buffer it publishes, and settles that run's own accounting into the
+    // terminal bank its pipeline slot reserves, so the host tells the two
+    // apart by identity rather than by arrival order.
+    //
+    // The ordering above is what makes that sufficient here: a successor's
+    // AICPU op cannot begin before its predecessor's has returned, so the two
+    // runs' device producers never record at the same instant. Only their host
+    // collection overlaps.
+    return 1;
+}
+
+extern "C" int args_dump_capture_supported_impl(void) {
+    // An AICPU scheduler thread hands each task to its core and reaps its
+    // completion, so `dump_args_for_task` runs at both of a task's own
+    // boundaries (scheduler_dispatch.cpp, scheduler_completion.cpp, and the
+    // cold path's inline dispatch).
+    return 1;
+}
+
 // Helper: return current time in milliseconds
 static int64_t _now_ms() {
     struct timeval tv;
@@ -704,6 +726,18 @@ static bool build_runtime_image(
     return true;
 }
 
+static simpler::dfx::scope_stats_runs::Capacities scope_stats_capacities(const RuntimeArenaLayout &layout) {
+    static_assert(CHIP_MAX_RING_DEPTH == SCOPE_STATS_MAX_RING_DEPTH);
+    simpler::dfx::scope_stats_runs::Capacities caps;
+    for (int r = 0; r < CHIP_MAX_RING_DEPTH; r++) {
+        caps.task_window[r] = static_cast<int32_t>(layout.sizing.task_window_sizes[r]);
+        caps.heap[r] = layout.sizing.heap_sizes[r];
+        caps.dep_pool[r] = layout.sizing.dep_pool_capacities[r];
+    }
+    caps.tensormap = layout.offsets.orch.tensor_map.pool_size;
+    return caps;
+}
+
 static int bind_cached_runtime_image(
     Runtime *runtime, const HostApi *api, const PrebuiltRuntimeArenaCacheProbe &probe,
     const ChipStorageTaskArgs &device_args
@@ -722,9 +756,20 @@ static int bind_cached_runtime_image(
         return 1;
     }
 
+    // The cache retains the host image copied into this arena. Its layout is
+    // immutable even while a predecessor executes against the device image.
+    if (cached_image == nullptr || runtime_off > cached_image_size ||
+        sizeof(RuntimeContext) > cached_image_size - runtime_off) {
+        LOG_ERROR("Cached runtime arena has no complete host layout");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    RuntimeArenaLayout layout;
+    std::memcpy(
+        &layout, static_cast<const char *>(cached_image) + runtime_off + offsetof(RuntimeContext, prebuilt_layout),
+        sizeof(layout)
+    );
+    runtime->scope_stats_capacity_.values = scope_stats_capacities(layout);
     runtime->set_orch_args(device_args);
-    (void)cached_image;
-    (void)cached_image_size;
     runtime->set_gm_sm_ptr(sm_ptr);
     runtime->set_prebuilt_arena(runtime_arena_dev, runtime_off);
     return 0;
@@ -820,6 +865,7 @@ extern "C" int bind_callable_to_runtime_impl(
         LOG_ERROR("Runtime pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    runtime->scope_stats_capacity_ = {};
     if (api == nullptr) {
         LOG_ERROR("HostApi pointer is null");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -862,6 +908,7 @@ extern "C" int bind_callable_to_runtime_impl(
     }
 
     auto bind_cleanup = RAIIScopeGuard([&]() {
+        runtime->scope_stats_capacity_ = {};
         release_run_tensor_leases(runtime, api);
     });
 
@@ -895,6 +942,7 @@ extern "C" int bind_callable_to_runtime_impl(
             runtime->set_orch_args(device_args);
             runtime->set_gm_sm_ptr(ptrs.gm_sm);
             runtime->set_prebuilt_arena(ptrs.runtime_arena_dev, layout.offsets.off_runtime);
+            runtime->scope_stats_capacity_.values = scope_stats_capacities(layout);
         }
     }
     int64_t t_prebuilt_end = _now_ms();

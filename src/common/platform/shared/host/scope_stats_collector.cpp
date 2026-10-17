@@ -58,6 +58,10 @@ int ScopeStatsCollector::init(
     int num_threads, const ScopeStatsAllocCallback &alloc_cb, ScopeStatsRegisterCallback register_cb,
     const ScopeStatsFreeCallback &free_cb, int device_id
 ) {
+    if (terminal_banks_.backing_retained()) {
+        LOG_ERROR("ScopeStatsCollector: terminal backing still requires cleanup before initialization");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     if (num_threads <= 0 || num_threads > PLATFORM_MAX_AICPU_THREADS || alloc_cb == nullptr || free_cb == nullptr) {
         LOG_ERROR(
             "ScopeStatsCollector::init: invalid arguments (num_threads=%d, valid range: 1-%d)", num_threads,
@@ -76,6 +80,9 @@ int ScopeStatsCollector::init(
     // shard argument modulo the manager's shard count.
     set_aicpu_thread_num(num_threads);
 
+    device_alloc_cb_ = alloc_cb;
+    device_free_cb_ = free_cb;
+    bank_free_cb_ = free_cb;
     total_collected_ = 0;
     refused_records_ = 0;
     (void)records_.release();
@@ -161,7 +168,7 @@ int ScopeStatsCollector::init(
 // Record accumulation (in-memory)
 // ---------------------------------------------------------------------------
 
-bool ScopeStatsCollector::begin_run(uint64_t run_epoch) {
+void ScopeStatsCollector::begin_run_host_state() {
     {
         std::scoped_lock lock(records_mutex_);
         const size_t charged = records_.release();
@@ -172,6 +179,10 @@ bool ScopeStatsCollector::begin_run(uint64_t run_epoch) {
     recovered_current_buf_ = 0;
     recovered_current_total_ = 0;
     execution_complete_.store(false, std::memory_order_release);
+}
+
+bool ScopeStatsCollector::begin_run(uint64_t run_epoch) {
+    begin_run_host_state();
 
     if (shm_host_ == nullptr) return true;
 
@@ -280,9 +291,57 @@ void ScopeStatsCollector::append_buffer_records(const void *buf_host_ptr) {
     // the pool and being re-stamped by a later run.
     const uint64_t run_epoch = buf->run_epoch;
     const uint32_t local_seq = buf->local_seq;
+
+    // Which run's receipts these records belong to. With a bank mapped the
+    // answer is the identity the producer stamped, because more than one run
+    // can be open: appending to a single accumulator would put a successor's
+    // records in its predecessor's artifact and count both against whichever
+    // was admitted last. Without one there is only ever one open run, and the
+    // accumulator is left exactly as it was so its artifact's bytes do not move.
+    simpler::dfx::scope_stats_runs::RecordBlocks *store = &records_;
+    uint64_t *received = &total_collected_;
+    uint64_t *refused = &refused_records_;
+    if (terminal_banks_.opened()) {
+        RunReceipts *owner = nullptr;
+        for (RunReceipts &entry : run_receipts_) {
+            if (entry.open && entry.run_epoch == run_epoch) {
+                owner = &entry;
+                break;
+            }
+        }
+        if (owner == nullptr) {
+            // A run this collector holds no open receipts for: already sealed,
+            // or never admitted. Counted against no run — adding it to one that
+            // does not own it is the misattribution this routing exists to stop
+            // — and reported, because a count nothing reads is not a loss
+            // anybody learns about. Sticky and one-shot: the condition is a
+            // collector-level ownership failure, and the receive path must not
+            // log per record.
+            foreign_epoch_records_ += n;
+            total_collected_ += n;
+            const bool first = !foreign_epoch_reported_;
+            foreign_epoch_reported_ = true;
+            if (first) {
+                LOG_ERROR(
+                    "scope_stats: %u records arrived stamped 0x%llx, which names no admitted run; they belong to no "
+                    "artifact and this collector reports the loss",
+                    n, static_cast<unsigned long long>(run_epoch)
+                );
+                // Recorded outside this lock by the caller's own path: a sticky
+                // host failure is the collector's error channel and takes
+                // `retained_mu_`, which the receive path must not take here.
+                foreign_epoch_pending_report_ = true;
+            }
+            return;
+        }
+        store = &owner->records;
+        received = &owner->received;
+        refused = &owner->refused;
+    }
+
     for (uint32_t i = 0; i < n; i++) {
         const CollectedScopeStatsRecord record{buf->records[i], run_epoch, local_seq, 0};
-        const bool stored = records_.append(
+        const bool stored = store->append(
             record,
             [this](size_t bytes) {
                 return charge_record_block(bytes);
@@ -295,12 +354,74 @@ void ScopeStatsCollector::append_buffer_records(const void *buf_host_ptr) {
             // Counted as received and not retained: the difference is the
             // loss this run's artifact reports. The receive path is never
             // blocked and nothing is allocated on this branch.
-            refused_records_ += static_cast<uint64_t>(n - i);
-            total_collected_ += n;
+            *refused += static_cast<uint64_t>(n - i);
+            *received += n;
+            if (received != &total_collected_) total_collected_ += n;
             return;
         }
     }
-    total_collected_ += n;
+    *received += n;
+    // The collector-wide arrival count stays truthful on both paths: it is this
+    // collector's telemetry — what `total_collected()` reports and what a caller
+    // waits on — and is deliberately not what a run's verdict is built from,
+    // which is the per-run receipts above. Skipped when they are the same
+    // counter, on the unmapped path.
+    if (received != &total_collected_) total_collected_ += n;
+}
+
+bool ScopeStatsCollector::open_run_receipts(uint64_t run_epoch) {
+    std::scoped_lock lock(records_mutex_);
+    for (const RunReceipts &entry : run_receipts_) {
+        // One identity, one entry: a repeated admission of the same run would
+        // otherwise split its records across two of them.
+        if (entry.open && entry.run_epoch == run_epoch) return false;
+    }
+    for (RunReceipts &entry : run_receipts_) {
+        if (entry.open) continue;
+        const size_t charged = entry.records.release();
+        if (charged > 0) host_budget_.credit(charged);
+        entry.run_epoch = run_epoch;
+        entry.received = 0;
+        entry.refused = 0;
+        entry.open = true;
+        return true;
+    }
+    return false;
+}
+
+bool ScopeStatsCollector::take_run_receipts(uint64_t run_epoch, simpler::dfx::scope_stats_runs::RunExport *into) {
+    std::scoped_lock lock(records_mutex_);
+    for (RunReceipts &entry : run_receipts_) {
+        if (!entry.open || entry.run_epoch != run_epoch) continue;
+        into->records = std::move(entry.records);
+        into->collection.received = entry.received;
+        into->collection.retained = entry.received - entry.refused;
+        entry.records = simpler::dfx::scope_stats_runs::RecordBlocks{};
+        entry.open = false;
+        entry.run_epoch = 0;
+        return true;
+    }
+    return false;
+}
+
+void ScopeStatsCollector::drop_run_receipts(uint64_t run_epoch) {
+    size_t charged = 0;
+    {
+        std::scoped_lock lock(records_mutex_);
+        for (RunReceipts &entry : run_receipts_) {
+            if (!entry.open || entry.run_epoch != run_epoch) continue;
+            charged = entry.records.release();
+            entry.open = false;
+            entry.run_epoch = 0;
+            entry.received = 0;
+            entry.refused = 0;
+            break;
+        }
+    }
+    if (charged > 0) {
+        std::lock_guard<std::mutex> lk(retained_mu_);
+        host_budget_.credit(charged);
+    }
 }
 
 std::vector<CollectedScopeStatsRecord> ScopeStatsCollector::collected_records() const {
@@ -319,6 +440,64 @@ size_t ScopeStatsCollector::collected_for_run(uint64_t run_epoch) const {
         if (records_[i].run_epoch == run_epoch) n++;
     }
     return n;
+}
+
+// ---------------------------------------------------------------------------
+// Per-run terminal banks
+// ---------------------------------------------------------------------------
+
+void *ScopeStatsCollector::bank_alloc(void *owner, size_t bytes, void **host_out) {
+    auto *self = static_cast<ScopeStatsCollector *>(owner);
+    // Paired, because an allocation's host readability is a property of how it
+    // was mapped and not of the platform: the raw device allocator alone leaves
+    // an address this process may not dereference. Kept out of the buffer
+    // pool's mapping table, whose teardown would free it on a path that proves
+    // nothing about this collector's producers.
+    return self->alloc_unmanaged_paired_buffer(bytes, host_out);
+}
+
+int ScopeStatsCollector::bank_unmap(void *owner, void *device_ptr) {
+    auto *self = static_cast<ScopeStatsCollector *>(owner);
+    return self->unmap_unmanaged_paired_buffer(device_ptr, self->bank_unregister_cb_);
+}
+
+int ScopeStatsCollector::bank_free(void *owner, void *device_ptr) {
+    auto *self = static_cast<ScopeStatsCollector *>(owner);
+    if (self->bank_free_cb_ == nullptr || device_ptr == nullptr) return -1;
+    // The allocator's own status, reported rather than dropped: a refused free
+    // may leave the allocator still owning the pointer, and the bank array is
+    // the memory a producer writes.
+    return self->bank_free_cb_(device_ptr);
+}
+
+int ScopeStatsCollector::bank_copy(
+    void *owner, void *host_dst, const void *device_src, const void *host_src, size_t bytes
+) {
+    auto *self = static_cast<ScopeStatsCollector *>(owner);
+    // Both addresses and this collector's own copy context, so the shared rule
+    // reads the mapping this allocation actually has rather than the one its
+    // platform usually gives.
+    return simpler::dfx::credit::read_run_terminal_bank(host_dst, device_src, host_src, bytes, self->copy_from_device_);
+}
+
+int ScopeStatsCollector::bank_initialize(
+    void *owner, void *device_dst, void *host_dst, const void *initial, size_t bytes
+) {
+    auto *self = static_cast<ScopeStatsCollector *>(owner);
+    return simpler::dfx::credit::initialize_run_terminal_bank(
+        device_dst, host_dst, initial, bytes, self->copy_to_device_
+    );
+}
+
+bool ScopeStatsCollector::open_run_terminal_banks(int expected_producers) {
+    if (!retain_across_runs_) return false;
+    if (shm_host_ == nullptr || device_alloc_cb_ == nullptr || device_free_cb_ == nullptr) return false;
+    if (expected_producers != SCOPE_STATS_TERMINAL_PRODUCERS) return false;
+    return terminal_banks_.open(
+        SCOPE_STATS_TERMINAL_PRODUCERS, expected_producers, this, &ScopeStatsCollector::bank_alloc,
+        &ScopeStatsCollector::bank_unmap, &ScopeStatsCollector::bank_free, &ScopeStatsCollector::bank_copy,
+        &ScopeStatsCollector::bank_initialize
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -581,9 +760,37 @@ void ScopeStatsCollector::finalize(ScopeStatsUnregisterCallback unregister_cb, c
     {
         std::scoped_lock lock(records_mutex_);
         (void)records_.release();
+        // Every per-run entry too: a run quarantined or still open at teardown
+        // keeps its records in its own entry, and the reader threads are joined
+        // by now, so this is the first point at which they are nobody's.
+        for (RunReceipts &entry : run_receipts_) {
+            (void)entry.records.release();
+            entry = RunReceipts{};
+        }
+        foreign_epoch_records_ = 0;
     }
     recovered_current_buf_ = 0;
     recovered_current_total_ = 0;
+
+    // Released through this teardown's own callback, the one that also frees
+    // `state->current_buf_ptr` below — a buffer a producer writes into — so
+    // the array follows exactly the policy the caller chose for every other
+    // device resource here: freed on the ordinary paths, and abandoned
+    // untouched on a teardown whose callback frees nothing. The
+    // `initialize`-time allocator is deliberately not used: it would hand this
+    // memory back on a path where the caller abandoned everything else.
+    // A release the callback refuses leaves the array mapped and reported.
+    bank_free_cb_ = free_cb;
+    bank_unregister_cb_ = unregister_cb;
+    const auto bank_release = terminal_banks_.release_backing(/*device_stopped=*/true);
+    if (terminal_banks_.backing_retained()) {
+        note_host_failure(
+            bank_release == simpler::dfx::credit::RunTerminalBanks::Release::FreeFailed ?
+                "the device refused this collector's per-run terminal bank array; it stays mapped" :
+                "this collector's per-run terminal bank array could not be released and stays mapped"
+        );
+        return;
+    }
 
     auto release_dev = [&](void *p) {
         release_one_buffer(p, unregister_cb, free_cb);

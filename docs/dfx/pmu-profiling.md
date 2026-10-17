@@ -253,7 +253,33 @@ Three layers cooperate; the split is the same across architectures:
   index in `PmuDataHeader::queues[thread][...]`) and threaded through
   to the CSV row as `thread_id`.
 - **AICore** brackets the counting window around the kernel body via
-  `CTRL` SPR bit 0.
+  `CTRL` SPR bit 0, with a `pipe_barrier(PIPE_ALL)` either side of each
+  toggle. That shape is the toolchain's: `metrics_prof_start` /
+  `metrics_prof_stop` in `__clang_cce_aicore_functions.h` (CANN 9.0.0
+  BiSheng) set and clear the same bit 0 fenced the same way, and its `#if`
+  covers `__DAV_C220_VEC__`, `__DAV_C220_CUBE__` and `__NPU_ARCH__ == 3510`
+  — both architectures here. `set_ctrl` is a scalar-pipe write while the
+  measured work runs on the other pipes, so the fences are what order the
+  enable against the kernel body. Conforming to that contract is not
+  evidence about what the counters hold afterwards.
+
+  Where the close sits relative to the completion signal
+  differs by architecture, and neither order is an acknowledgement that a
+  reader finished:
+  - **a2a3** — both executors close the window and publish FIN on the core,
+    and the counters are read later by the AICPU, released by that FIN. A
+    notification is not a completed read, so the read may land after the
+    close either way.
+  - **a5** — both executors close the window and then read the counters
+    **on the executing core** (`pmu_aicore_read_counters`), staging them
+    before the completion is published. No AICPU read of a live counter is
+    involved.
+
+  Whether the counter registers hold their value after the close is not
+  stated by any contract this repo can cite — and both flows above **do**
+  depend on it, since each reads after its own close. It is an unresolved
+  hardware assumption carried by this subsystem, not an absence of
+  dependency.
 
 The per-task counter readout and the host↔device buffer transport are
 architecture-specific. Sections 5.2 and 5.3 describe each architecture
@@ -280,6 +306,106 @@ finalize for the cross-check:
 collected_on_host + dropped + mismatch == total   (a5, 3 buckets)
 collected_on_host + dropped == total              (a2a3, 2 buckets)
 ```
+
+#### Control read-back, per core and per run
+
+Each core's producer makes **two** observations of its own control window and
+writes them into **two separate fields** of the entry it claims —
+`DiagnosticRunTerminal::producer_note` at its run init and
+`::producer_note_close` at that core's own close:
+
+| Field | Code | Meaning |
+| ----- | ---- | ------- |
+| `producer_note` | `PMU_NOTE_NO_WINDOW` | the platform gave this core no register address — sim, or a misconfigured table |
+| `producer_note` | `PMU_NOTE_ENABLED` | the init read-back carried the enable this run wrote |
+| `producer_note` | `PMU_NOTE_DISABLED` | it did not; the payload is the observed word |
+| `producer_note_close` | `PMU_NOTE_HELD` | the close read carried the enable **after every task of the run had executed** |
+| `producer_note_close` | `PMU_NOTE_LOST` | it was not; the payload is the close word |
+| `producer_note_close` | zero | no close observation was published into this entry |
+
+The init read is taken immediately after the run programmed `PMU_CTRL_0` — and
+`PMU_CTRL_1` on a5 — before a single task ran. The close read is taken in
+`pmu_aicpu_finalize`, **before** the restore writes the pre-run word back, so it
+is an observation at close, not a record of the state throughout execution or
+the state the teardown leaves. One read per core per run, on a teardown path,
+with nothing written back from it and no decision taken from it. The close code is decided by the close
+word **alone**: folding the init code into it would make one count answer two
+questions, and "never enabled" and "stopped being enabled" would both read
+`lost`.
+
+**Why two fields and not one overwritten.** An init read-back proves the window
+accepted this run's enable; it proves nothing about the window during the tasks,
+which is the interval the counters are supposed to cover. The *pair* is the
+discriminator, so both have to survive:
+
+| at init | at close | narrows toward |
+| ------- | -------- | -------------- |
+| `enabled` | `held` | the enable was present at **both ends** — the per-task gate or the measurement, rather than the window's arming |
+| `enabled` | `lost` | the enable was present at the start and absent at the end — what cleared it, rather than whether it was written |
+| `not-enabled` | either | the init write, rather than the window |
+| `enabled` | absent | the close observation did not reach this entry — see below for the three states that covers |
+
+Three limits, all load-bearing:
+
+- **Two endpoint reads do not describe the interval between them.** `held` says
+  the enable was there before the first task and still there after the last one.
+  It does **not** say it was there continuously: a disable followed by a
+  re-enable inside the run satisfies exactly the same pair, and nothing here
+  distinguishes that from an uninterrupted window.
+- **An absent close note does not prove the close never ran.**
+  `note_run_close` writes only into an entry already carrying that run's epoch,
+  so a close whose entry has been re-claimed by a successor writes nothing; a
+  note can also be lost in publication. "No close code" therefore covers at
+  least a close that did not execute, a close whose epoch check refused, and a
+  close whose note did not survive — and the field alone cannot separate them.
+- **An `enabled` init read-back does not prove the write reached the intended
+  register.** It proves the address the run programmed reads back the value it
+  wrote. A window that is mapped and writable but is not this core's PMU block
+  satisfies that too. Distinct calculated virtual addresses do not prove
+  distinct physical registers; the HAL PMU window's geometry remains unverified.
+
+A single field holding only the later observation would additionally collapse
+the first two table rows into each other, which is the distinction this
+observation exists to draw. None of the rows is proof that a counter counted,
+and none is a cause: they say where to look next, **per core** — the aggregate
+counts on the collector's line are not a verdict, and a repair must not be
+chosen from them.
+
+The note's payload also carries **the physical core id that logical core
+reported**, because that id is what selected the window: a PMU row names the
+logical core, while the address it was measured through came from
+`pmu_reg_addrs[physical_core_id]`. Together with the base and strides
+`get_aicore_reg_info` states once per table build, those two give the exact
+address the run used.
+
+It is a read with no write and no decision attached. The host counts the notes
+by code when it settles the run's bank — per producer, never summed — and states
+them in **one `LOG_TIMING` line per run**, which is the default log threshold
+(`kDefaultThreshold` and `InitArgs::log_level` are both 25), so the line is in
+the child's host log without any flag. That matters: at `LOG_INFO` it would sit
+below the threshold and a run's evidence would exist only under a verbosity
+nobody enables.
+
+**What it cannot say.** The read-back comes from the address this run
+programmed, so it cannot tell a correct window from one that is mapped but is
+not this core's PMU block: such a write would land somewhere, and the read
+would return whatever that somewhere holds. What a write to a wrong register
+page actually does on this device is **not** established here — treat a wrong
+mapping as a hypothesis, not as a known silent drop. Separating the two would
+need a register in the block whose value does not come from our own writes, and
+this architecture's `RegId` set has none, so no offset outside it is accessed.
+The note also says nothing about the AICore `CTRL` bit-0 gate, which is an
+AICore SPR with no AICPU read path, and nothing about whether any cycle was
+counted — that holds for the close read as much as for the init one. A run
+reporting `PMU_NOTE_HELD` on every core and zero cycles on every row has had two
+candidates narrowed (the window was armed, and it stayed armed), not a cause
+established.
+
+**Coverage of the printed line.** The per-code counts cover every producer that
+claimed the run; the physical id and register values printed beside them are
+the **first** reporting producer's, not every core's. The notes themselves are
+per producer in the bank, so a reader who needs a specific core's note needs
+the host to print more than the first — which it does not do today.
 
 ### 5.2 a2a3 — shared-memory streaming (DAV_2201, 8 counters)
 
@@ -509,6 +635,39 @@ the runtime `Handshake` carries no profiling fields. Because the
 resolved reg base is valid from Phase 1 onward (no AICPU-side init
 dependency), `aicore_execute` caches it once after Phase 3 alongside
 the rings rather than re-reading per record.
+
+#### Two stagings, one commit
+
+The two-slot per-core `PmuAicoreRing` works because the AICPU drains it on
+every FIN: with a core running one task at a time, the `task_id % 2`
+parity keeps task N and N+1 apart. A5 `host_build_graph` with the AICore
+Scheduler has no such consumer — the on-core schedulers dispatch and
+complete, and the AICPU never sees a FIN — so that route stages instead
+into a **per-subtask cell array** sized with the trace cells and indexed
+the same way (`SchedulerTaskPmuCell`, one cache line each). The executing
+core writes its cell between `pmu_aicore_end()` and its completion
+publication, stamping it with the task id plus one; the AICPU reads every
+cell once in the run's completion gate and commits it through the same
+`pmu_aicpu_record_staged_task` path the ring drain ends in. Both stagings
+therefore share one accounting: `total` counts every commit attempted,
+`dropped` a missing buffer, `mismatch` a ring slot the core never filled.
+The cell array is reserved only when the bind's run enables PMU, so a run
+with the owner off pays nothing for it.
+
+Two things gate that read, and neither is the gate's arrival:
+
+- **Proved retirement.** A participant whose partition reported an
+  unreleased core still arrives at the completion gate, so the settlement
+  counts the cores that acknowledged exit instead. Short of the full count
+  it reads no cell and restores no register — a core that may still be
+  executing is neither a safe source nor a safe target — and the run's PMU
+  accounting is left unknown.
+- **Expected coverage.** What the run owed is every active subtask of every
+  executable task, taken from the graph rather than from the cells, so an
+  absent cell is a lost measurement rather than a subtask that did not run.
+  A run that did not complete its graph, or a completed one short of a
+  cell, leaves its producers unsettled and reports unknown instead of
+  publishing the subset that did arrive.
 
 **Lifecycle** (`device_runner.cpp`):
 

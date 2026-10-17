@@ -28,7 +28,7 @@ jobs:
   run:
     name: ut
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    timeout-minutes: 20
+    timeout-minutes: ${{ inputs.setup_variant == 'github' && contains(inputs.runs_on, 'macos') && 30 || 20 }}
     steps:
       - name: Checkout target
         uses: actions/checkout@v5
@@ -106,15 +106,33 @@ jobs:
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
           cmake --build tests/ut/cpp/build --parallel 4
           ctest --test-dir tests/ut/cpp/build -LE requires_hardware -j4 --output-on-failure --timeout 300
+
+      - name: Check C++ unit-test axis coverage
+        run: |
+          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
+            source .venv/bin/activate
+          fi
           # A case built once against one arch or one runtime passes exactly like
           # one that covers every configuration, so the gap is invisible to ctest.
           # This reads the build's compile lines instead. It needs the configured
           # build above, which is why it is here and not in pre-commit.
           python tests/lint/check_ut_cpp_axis.py --jobs 4
+
+      - name: Check C++ unit-test stub linkage
+        run: |
+          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
+            source .venv/bin/activate
+          fi
           # A stub the support archive lost to a weak fallback links fine and
           # then hangs, so ctest only catches it by timing out. This reads the
           # built binaries' symbol tables and names every target that took one.
           python tests/lint/check_ut_cpp_stub_linkage.py
+
+      - name: Check swimlane exporter roundtrip
+        run: |
+          if [ "${{ inputs.setup_variant }}" = "self-cpu" ]; then
+            source .venv/bin/activate
+          fi
           # The swimlane export→parse roundtrip needs the C++ exporter binary, so
           # it runs here rather than in the pyut sweep above (which precedes this
           # build and skips it). Asserting the parser against hand-written JSON

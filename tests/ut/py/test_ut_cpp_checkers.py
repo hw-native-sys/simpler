@@ -285,6 +285,94 @@ def test_a_failed_replay_is_an_error_not_an_empty_result(tmp_path, monkeypatch):
         axis.files_opened(tree.entries[0])
 
 
+def test_shared_replays_keep_each_targets_coverage_and_do_not_survive_a_call(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    for arch, value in (("a2a3", 2), ("a5", 5)):
+        tree.write(f"src/{arch}/platform/knob.cpp", f"int knob() {{ return {value}; }}\n")
+    for case, arches in (("partial", ("a2a3",)), ("complete", ("a2a3", "a5"))):
+        source = f"tests/ut/cpp/common/platform/test_{case}.cpp"
+        tree.write(source, "int main() { return 0; }\n")
+        for arch in arches:
+            target = f"test_{case}_{arch}"
+            tree.compile_entry(target, source)
+            tree.compile_entry(target, f"src/{arch}/platform/knob.cpp")
+
+    opened_sources = []
+    replay = axis.files_opened
+
+    def counted_replay(entry):
+        opened_sources.append(entry["file"])
+        return replay(entry)
+
+    monkeypatch.setattr(axis, "files_opened", counted_replay)
+    assert _gaps(tree, monkeypatch) == [("common/platform/test_partial.cpp", "a5")]
+    shared = tree.src / "a2a3/platform/knob.cpp"
+    assert opened_sources.count(str(shared)) == 1
+
+    # A second invocation must observe changed inputs, including a shared failure.
+    shared.write_text('#include "missing_header.h"\n')
+    with pytest.raises(SystemExit, match="Preprocessing"):
+        axis.find_gaps(tree.build, jobs=4)
+    assert opened_sources.count(str(shared)) == 2
+
+
+@pytest.mark.parametrize("difference", ["directory", "define", "include"])
+def test_distinct_replays_of_one_source_keep_both_arches(tmp_path, monkeypatch, difference):
+    tree = Tree(tmp_path)
+    for arch, value in (("a2a3", 2), ("a5", 5)):
+        tree.write(f"src/{arch}/platform/knob.h", f"#pragma once\nconstexpr int value = {value};\n")
+    source = "tests/ut/cpp/common/platform/test_knob.cpp"
+    includes = (
+        '#if SIDE == 2\n#include "a2a3/platform/knob.h"\n#else\n#include "a5/platform/knob.h"\n#endif\n'
+        if difference == "define"
+        else "#include <knob.h>\n"
+    )
+    tree.write(source, includes + "int main() { return value; }\n")
+    for arch, side in (("a2a3", 2), ("a5", 5)):
+        include_dir = "src" if difference == "define" else f"src/{arch}/platform"
+        tree.compile_entry(f"test_{arch}_knob", source, (include_dir,))
+        entry = tree.entries[-1]
+        argv = shlex.split(entry["command"])
+        if difference == "directory":
+            proxy = tree.write(f"build/{arch}/knob.h", f'#include "{tree.src / arch / "platform/knob.h"}"\n')
+            entry["directory"] = str(proxy.parent)
+            argv[1] = "-I."
+        elif difference == "define":
+            argv.insert(1, f"-DSIDE={side}")
+        entry["arguments"] = argv
+
+    assert _gaps(tree, monkeypatch) == []
+
+
+def test_shared_commands_keep_the_database_sources_in_each_target(tmp_path, monkeypatch):
+    """files_opened includes entry.file even when argv names a different source."""
+    tree = Tree(tmp_path)
+    source = "tests/ut/cpp/common/platform/test_knob.cpp"
+    tree.write(source, "int main() { return 0; }\n")
+    for arch, value in (("a2a3", 2), ("a5", 5)):
+        own = tree.write(f"src/{arch}/platform/knob.cpp", f"int knob() {{ return {value}; }}\n")
+        target = f"test_{arch}_knob"
+        tree.compile_entry(target, source)
+        tree.compile_entry(target, source)
+        tree.entries[-1]["file"] = str(own)
+        tree.entries[-1]["command"] += " -DPRODUCT=1"
+
+    assert _gaps(tree, monkeypatch) == []
+
+
+def test_an_extra_object_operand_cannot_reuse_a_successful_replay(tmp_path, monkeypatch):
+    tree = Tree(tmp_path)
+    source = "tests/ut/cpp/common/utils/test_operand.cpp"
+    tree.write(source, "int main() { return 0; }\n")
+    for target in ("test_valid", "test_missing_operand"):
+        tree.compile_entry(target, source)
+    tree.entries[-1]["command"] += " " + shlex.quote(str(tree.build / "missing.o"))
+    build = tree.install(monkeypatch)
+
+    with pytest.raises(SystemExit, match="Preprocessing"):
+        axis.find_gaps(build, jobs=4)
+
+
 # --- the database itself ----------------------------------------------------------------------
 
 

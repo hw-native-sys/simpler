@@ -539,3 +539,213 @@ TEST_F(DepGenRetainedTest, RetentionOffProducesTheSameBytesAsRetentionOn) {
 
     EXPECT_EQ(read_file(plain_path), retained_bytes) << "the retained path changed a clean run's bytes";
 }
+
+// ---------------------------------------------------------------------------
+// Per-run terminal banks, mapped
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/**
+ * A retained collector whose producer publishes its own per-run accounting.
+ *
+ * The bank address normally reaches the producer through the launching run's
+ * kernel arguments, which this collector does not own, so this pushes it and
+ * calls the producer's close — exactly where the runner will. Its init already
+ * runs per run, and is what starts this run's counters.
+ */
+class DepGenMappedTest : public DepGenRetainedTest {
+protected:
+    void configure_mapped() {
+        configure(/*retained=*/true);
+        ASSERT_TRUE(collector_.open_run_terminal_banks(DEP_GEN_TERMINAL_PRODUCERS));
+        ASSERT_TRUE(collector_.device_publishes_run_terminal());
+    }
+
+    /**
+     * Admit a run and push the bank its admission reserved, which is what the
+     * host does at launch: the device is handed one resolved address per run,
+     * so a successor publishes into its own bank rather than deriving one.
+     */
+    bool admit(uint64_t epoch, const fs::path &prefix) {
+        if (!DepGenRetainedTest::admit(epoch, prefix)) return false;
+        const uint64_t bank = collector_.run_terminal_bank_address(epoch);
+        EXPECT_NE(bank, 0u) << "an admitted run resolved no terminal bank";
+        set_platform_dep_gen_run_terminal(bank);
+        return true;
+    }
+
+    void TearDown() override {
+        set_platform_dep_gen_run_terminal(0);
+        DepGenRetainedTest::TearDown();
+    }
+
+    /** One run's device side, closed through the producer's own entry. */
+    void produce_run(uint64_t epoch, int submits, uint32_t first_task_id) {
+        produce_chain(epoch, submits, first_task_id);
+        dep_gen_aicpu_close_run();
+    }
+};
+
+}  // namespace
+
+TEST_F(DepGenMappedTest, AMappedRunIsSettledFromItsOwnProducerAccounting) {
+    OutputRoot root("mapped-settled");
+    configure_mapped();
+    ASSERT_TRUE(admit(9001, root.prefix("run-a")));
+    produce_run(9001, /*submits=*/3, 0x3100);
+    close(9001);
+
+    std::string error;
+    ASSERT_TRUE(flush(&error)) << error;
+    EXPECT_TRUE(fs::exists(root.artifact("run-a"))) << "a run whose producer reported published no graph";
+}
+
+TEST_F(DepGenMappedTest, AProducerThatNeverPublishedProducesNoGraph) {
+    OutputRoot root("mapped-missing");
+    configure_mapped();
+    ASSERT_TRUE(admit(9101, root.prefix("run-a")));
+    // The records are produced and received, but the producer's close never
+    // runs. DepGen publishes one whole graph or none, so a run whose edges
+    // cannot be shown to be all of its edges gets no file.
+    produce_chain(9101, /*submits=*/2, 0x3200);
+    close(9101);
+
+    std::string error;
+    EXPECT_FALSE(flush(&error));
+    EXPECT_FALSE(fs::exists(root.artifact("run-a"))) << "a graph was published from a partial producer set";
+}
+
+TEST_F(DepGenMappedTest, AnOverflowChainStillPublishes) {
+    OutputRoot root("mapped-overflow");
+    configure_mapped();
+    ASSERT_TRUE(admit(9201, root.prefix("run-a")));
+    set_platform_run_result(/*region_base=*/0, 9201);
+    dep_gen_aicpu_init();
+
+    // A submit whose dependency list spills into a chain: the producer charges
+    // the extra slots to its own counter, and the terminal reports buffer slots
+    // so the two sides are in the same unit.
+    constexpr int kDepCount = DEP_GEN_MAX_EXPLICIT_DEPS + 1;
+    std::vector<TaskId> deps(kDepCount);
+    for (int i = 0; i < kDepCount; ++i)
+        deps[i] = simpler::ut::test_task_id(0x3300 + static_cast<uint32_t>(i));
+    const int32_t kernel_ids[3] = {-1, -1, -1};
+    dep_gen_aicpu_record_submit(
+        simpler::ut::test_task_id(0x33FF), /*in_manual_scope=*/false, /*early_dispatch=*/false, /*tensor_count=*/0,
+        /*tensor_ptrs=*/nullptr, /*arg_types=*/nullptr, kDepCount, deps.data(), /*explicit_dep_kinds_raw=*/nullptr,
+        kCreatorEdgeDepKinds, /*block_num=*/1, kernel_ids
+    );
+    dep_gen_aicpu_flush();
+    dep_gen_aicpu_close_run();
+    close(9201);
+
+    std::string error;
+    ASSERT_TRUE(flush(&error)) << error;
+    EXPECT_TRUE(fs::exists(root.artifact("run-a"))) << "an overflow chain was reported as a unit mismatch";
+}
+
+TEST_F(DepGenMappedTest, ASecondAdmissionDoesNotEraseThePredecessorsEdges) {
+    OutputRoot root("mapped-two-open");
+    configure_mapped();
+    // A is admitted and receiving. B is admitted before A seals, which is what
+    // joining a successor to a running predecessor means: A's edges and
+    // receipts are its own and must survive B's admission. They were not —
+    // admission released the collector's single store.
+    ASSERT_TRUE(admit(9301, root.prefix("run-a")));
+    produce_run(9301, /*submits=*/3, 0x3400);
+
+    ASSERT_TRUE(admit(9302, root.prefix("run-b")));
+    produce_run(9302, /*submits=*/2, 0x3500);
+
+    close(9301);
+    close(9302);
+
+    std::string error;
+    ASSERT_TRUE(flush(&error)) << error;
+    EXPECT_TRUE(fs::exists(root.artifact("run-a"))) << "a run lost its edges to its successor's admission";
+    EXPECT_TRUE(fs::exists(root.artifact("run-b")));
+}
+
+TEST_F(DepGenMappedTest, ASuccessorsRecordsAreNotForeignWhileThePredecessorIsOpen) {
+    OutputRoot root("mapped-not-foreign");
+    configure_mapped();
+    ASSERT_TRUE(admit(9401, root.prefix("run-a")));
+    produce_run(9401, /*submits=*/1, 0x3600);
+
+    // With one admitted epoch, B's arrivals were filed as foreign and made
+    // both graphs untrustworthy. Routed by the identity its producer stamped,
+    // B's records are B's.
+    ASSERT_TRUE(admit(9402, root.prefix("run-b")));
+    produce_run(9402, /*submits=*/2, 0x3700);
+    close(9402);
+    close(9401);
+
+    std::string error;
+    ASSERT_TRUE(flush(&error)) << error;
+    EXPECT_TRUE(fs::exists(root.artifact("run-b"))) << "a successor's edges were refused as foreign";
+    EXPECT_TRUE(fs::exists(root.artifact("run-a")));
+}
+
+TEST_F(DepGenMappedTest, ARefusedGraphReturnsItsReceiptStoreAndBudget) {
+    OutputRoot root("mapped-refused-cleanup");
+    configure_mapped();
+
+    // A run whose producer never closed yields no graph. Its edges live in its
+    // own receipt entry, so the refusal has to release that entry — releasing
+    // the legacy store instead left the entry open with its blocks charged, and
+    // later admissions then ran out of receipt entries while output slots sat
+    // free.
+    ASSERT_TRUE(admit(9501, root.prefix("run-a")));
+    // Taken after the admission and before any record: the first admission is
+    // what opens the budget and reserves this collector's fixed retained
+    // overhead — the export slots, their path allowance, the permanent error
+    // record and the writer's scratch — and none of that is a run's to give
+    // back. What this case is about is the dynamic charge the refused run's
+    // edges took, so the baseline has to already contain the fixed part or the
+    // comparison asks a refusal to return storage the collector still owns.
+    const size_t baseline_charged = collector_.retained_run_stats_for_test().charged_bytes;
+    ASSERT_GT(baseline_charged, 0u) << "the first admission established no fixed retained overhead";
+    produce_chain(9501, /*submits=*/2, 0x3800);
+    close(9501);
+    std::string error;
+    EXPECT_FALSE(flush(&error));
+    ASSERT_FALSE(fs::exists(root.artifact("run-a")));
+
+    // The bytes the refused run's edges occupied are back in the budget, and
+    // only those: the fixed overhead the baseline captured stays charged. An
+    // entry left open holds its blocks, so this reads above the baseline long
+    // before any later admission notices a shortage.
+    EXPECT_EQ(collector_.retained_run_stats_for_test().charged_bytes, baseline_charged)
+        << "a refused run's record blocks stayed charged to the budget";
+
+    // And the entry itself is back. The discriminator is holding the whole
+    // table at once: a single leaked entry still leaves one free, which serves
+    // arbitrarily many admissions that close before the next one opens, so a
+    // serial sequence cannot tell the two states apart.
+    std::vector<uint64_t> held;
+    for (size_t i = 0; i < runs::kMaxOpenEpochs; i++) {
+        const uint64_t epoch = 9510 + static_cast<uint64_t>(i);
+        const std::string leaf = "run-" + std::to_string(i);
+        ASSERT_TRUE(admit(epoch, root.prefix(leaf.c_str())))
+            << "admission " << (i + 1) << " of " << runs::kMaxOpenEpochs
+            << " concurrent runs was refused, so a refused run kept its receipt entry";
+        produce_run(epoch, /*submits=*/1, 0x3900 + static_cast<uint32_t>(i) * 0x10);
+        held.push_back(epoch);
+    }
+
+    // Each of them is a whole graph of its own, so the recovered entry is one
+    // a run can actually be published from rather than merely allocated. The
+    // flush still reports failure, and that is the point: recovering the entry
+    // must not retract the sticky report that the refused run's graph was lost.
+    for (uint64_t epoch : held)
+        close(epoch);
+    std::string publish_error;
+    EXPECT_FALSE(flush(&publish_error)) << "the refused run's loss was retracted by a later successful run";
+    EXPECT_TRUE(collector_.retained_run_stats_for_test().has_error);
+    for (size_t i = 0; i < held.size(); i++) {
+        const std::string leaf = "run-" + std::to_string(i);
+        EXPECT_TRUE(fs::exists(root.artifact(leaf.c_str())))
+            << "a run admitted into the recovered entry published no graph";
+    }
+}

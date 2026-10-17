@@ -169,6 +169,23 @@ struct RecordProofs {
     uint64_t recovered_records{0};
     uint64_t unknown_lanes{0};
     uint64_t already_delivered_lanes{0};
+
+    // --- Per-run producer accounting, when a terminal bank supplies it -------
+    //
+    // Payload acknowledgement and metadata completeness are different
+    // obligations, so the payload count above does not stand in for either of
+    // these. `device_published_records` is what the producers committed, held
+    // here rather than compared at close: the receipt count is only final after
+    // the cut proves processing, so the comparison belongs to `classify` and a
+    // deficit observed mid-receive is not this run's loss.
+    uint64_t device_published_records{0};
+    // Records a producer still held when it closed. Any is a loss, and it is a
+    // known one — the producer reported it rather than leaving it to be read
+    // out of a buffer a successor now owns.
+    uint64_t unsettled_records{0};
+    // A producer's own sticky error for this run. The counts still balance, so
+    // this is a partial result rather than an unknown one.
+    bool fatal_latched{false};
 };
 
 /** The finite per-queue transport cut's outcome, in the order it is proved. */
@@ -205,6 +222,16 @@ classify(const CutProofs &cut, const RecordProofs &rec, const HostLoss &loss, ui
     if (loss.discarded_args > 0 || loss.discarded_metadata_records > 0 || rec.dropped_records > 0) {
         return Verdict::PublishedShort;
     }
+    // A producer's own fatal, and records it still held, are this run's losses
+    // even when every count balances. Reported here rather than folded into
+    // `dropped_records`, which is what the producers refused or lost in
+    // transport — a different fact with a different remedy.
+    if (rec.fatal_latched || rec.unsettled_records > 0) return Verdict::PublishedShort;
+    // Metadata the producers committed and the host never took delivery of.
+    // Compared here, where the receipt count is final: the cut has proved
+    // processing by now, so a shortfall is a loss rather than a receive still
+    // in flight.
+    if (rec.device_published_records > collected_records) return Verdict::PublishedShort;
     if (collected_records == 0) return Verdict::PublishedEmpty;
     return Verdict::Published;
 }

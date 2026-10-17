@@ -124,6 +124,19 @@ struct KernelArgs {
     // Both zero when no region was allocated.
     uint64_t run_result_data_base{0};
     uint64_t run_result_epoch{0};
+
+    // This run's per-run terminal banks for the four queue-pair diagnostic
+    // owners, each the address of that bank's first producer entry, resolved by
+    // the host from the identity that reserved it. 0 whenever the host resolved
+    // no bank — the owner is off, its retention is off, or every bank was in
+    // use — and the device treats 0 as "publish no accounting" and never
+    // derives an address of its own. One address rather than a base and an
+    // index, for the same reason the swimlane's is: the host owns the bank
+    // indexing, so a producer can only add its own producer index.
+    uint64_t args_dump_run_terminal_bank{0};
+    uint64_t pmu_run_terminal_bank{0};
+    uint64_t dep_gen_run_terminal_bank{0};
+    uint64_t scope_stats_run_terminal_bank{0};
     // 32-bit tail: no interior padding, and no field here is offset-locked.
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
     // How this run's entry arguments reached the AICPU, restated from the
@@ -167,20 +180,26 @@ static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 // what `launch_aicpu_payload` hands to `rtsLaunchCpuKernel` as `argsSize`, and
 // what `PersistentKernelArgs::prepare_once` allocates and copies H2D. The field
 // offsets differ from a2a3's: this struct has no `ffts_base_addr`, so its
-// thirteen 8-byte fields end at 104 rather than 112, and its 32-bit tail holds
-// nine uint32_t rather than eight. The two sizes coincide at 144 only because
+// seventeen 8-byte fields end at 136 rather than 144, and its 32-bit tail holds
+// nine uint32_t rather than eight. The two sizes coincide at 176 only because
 // the extra tail field is absorbed by the padding a2a3 does not need.
 static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 24, "KernelArgs::chip_swimlane_data_base offset drift");
 static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
     "KernelArgs::chip_swimlane_run_terminal_bank offset drift"
 );
+// The first of the four queue-pair terminal banks, pinned for the same reason:
+// the four are read by name, so only their offsets say whether the group was
+// reordered or one of them was dropped.
+static_assert(
+    offsetof(KernelArgs, args_dump_run_terminal_bank) == 104, "KernelArgs::args_dump_run_terminal_bank offset drift"
+);
 // Where the 32-bit tail's Graph triple begins. `sizeof` alone cannot see a
 // reorder inside that tail, because every member of it is the same width, and
-// here it cannot see an appended one either: 140 bytes of members round up to
-// the same 144 as 144 would.
-static_assert(offsetof(KernelArgs, graph_section_offset) == 124, "KernelArgs::graph_section_offset offset drift");
-static_assert(sizeof(KernelArgs) == 144, "KernelArgs launch-payload size drift");
+// here it cannot see an appended one either: 172 bytes of members round up to
+// the same 176 as 176 would.
+static_assert(offsetof(KernelArgs, graph_section_offset) == 156, "KernelArgs::graph_section_offset offset drift");
+static_assert(sizeof(KernelArgs) == 176, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.

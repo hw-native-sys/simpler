@@ -39,6 +39,21 @@ saw, without the timing distortion of inline printing.
   Real tensor-payload consumption is currently supported only on the
   `a2a3` platform family; see the platform scope below.
 
+### Which runtimes capture
+
+Capture needs a thread that observes each task's own dispatch and completion,
+so it is a property of the runtime rather than of the platform:
+
+| Platform | Runtime | Per-task capture | Request for it |
+| -------- | ------- | ---------------- | -------------- |
+| a2a3 | `host_build_graph` | yes — AICPU scheduler dispatches and reaps | served |
+| a2a3 | `tensormap_and_ringbuffer` | yes | served |
+| a5 | `tensormap_and_ringbuffer` | yes | served |
+| a5 | `host_build_graph` | **no** — on-core schedulers dispatch and reap | **refused at `simpler_prepare_run` with `PTO_RUNTIME_ERR_UNSUPPORTED`** |
+
+The last row is the same on the onboard and the simulated backend. §3.1.1 is why,
+what the refusal looks like to a caller, and which entrypoints check it.
+
 Enable in one line (`full` = every task, every arg):
 
 ```bash
@@ -92,8 +107,11 @@ python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --dump-args        # partial
 
 # pytest
 pytest tests/st/<case> --platform a5sim --dump-args full
-# a5 host_build_graph has no examples — use the scene test
-pytest tests/st/a5/host_build_graph/dump_args --platform a5sim --dump-args full
+# a5 host_build_graph has no per-task capture: every scene under it is refused
+# with -1001 while this flag is set (§3.1.1). Use the a2a3 mirror for an HBG
+# capture, or a5 tensormap_and_ringbuffer for an a5 one.
+pytest tests/st/a2a3/host_build_graph/dump_args --platform a2a3sim --dump-args full
+pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump --platform a5sim --dump-args hybrid
 pytest tests/st/<case> --platform a2a3sim --dump-args full
 pytest tests/st/a2a3/host_build_graph/vector_example --platform a2a3sim --manual include --dump-args full
 ```
@@ -119,6 +137,83 @@ dispatched**, it is latched up front — there is no dependence on task
 submission order. AICore executors read the same `SIMPLER_DFX_FLAG_DUMP_ARGS`
 bit to insert a `pipe_barrier(PIPE_ALL)` before FIN when dump is on, so
 `AFTER_COMPLETION` snapshots see the kernel's final writes.
+
+### 3.1.1 The capture instant is the task's, and where that is unavailable
+
+A record is taken at the task's own instant: `BEFORE_DISPATCH` as the
+scheduler hands the task to a core, and `AFTER_COMPLETION` as it reaps the
+FIN. That is what makes an intermediate tensor's recorded content the one
+that task actually read or wrote, which is what replay and localization
+need. Every AICPU-dispatching path captures there.
+
+**A5 `host_build_graph` has no such instant available to the AICPU, and
+therefore has no per-task argument capture at all.** Its route is the AICore
+Scheduler, where the on-core schedulers dispatch *and* complete tasks, so no
+AICPU thread observes an individual task start or finish. The only instants the
+AICPU owns are the run's — before the DMB gate opens and after every core
+has retired — and a snapshot taken there is not the task's data:
+
+- task A produces X and task B consumes it, so B's input read at the
+  pre-run boundary holds whatever X was *before A ran*;
+- two tasks write the same buffer in turn, so the post-run read gives the
+  later write as *both* their outputs.
+
+#### What a request for it does
+
+`args_dump_capture_supported_impl` is the per-runtime answer, declared beside
+the other `*_supported_impl` capability predicates in the platform's
+`c_api_shared.cpp` and defined in each runtime's `runtime_maker.cpp`. a2a3
+`host_build_graph` and both `tensormap_and_ringbuffer` runtimes answer 1; a5
+`host_build_graph` answers 0.
+
+**`simpler_prepare_run` refuses a request this answer cannot serve**, returning
+`PTO_RUNTIME_ERR_UNSUPPORTED` (-1001) before any state is read — so before the
+bind, before any device resource is provisioned, and on both the onboard and the
+simulated backend, which run the same AICPU and AICore sources. The two public
+entrypoints that carry a per-run `CallConfig` are `simpler_prepare_run` and
+`simpler_run`, and the second delegates to the first, so one check covers both;
+through the Python API that is every `Worker.submit` / `run()` whose
+`CallConfig.enable_dump_args` is non-zero. A caller sees the run fail with
+`prepare_native_run failed with code -1001`, nothing is written under its
+`output_prefix`, and the lane is not stopped — the next run is served normally.
+
+Three properties are the point of refusing there rather than later:
+
+- an empty `args_dump.json` would be indistinguishable from a capture that
+  found nothing there was to capture;
+- a run admitted and then found unable to settle this owner's accounting has
+  already executed and already held a terminal bank and a pipeline slot;
+- only this owner is a term. A request that does not name it reaches the device
+  unchanged, and a request that names it alongside the swimlane and PMU is
+  refused for *it* — those two remain available on this runtime and are asserted
+  there by `tests/st/a5/host_build_graph/test_dfx_joined_launch_attribution.py`,
+  which also asserts this refusal.
+
+The answer is the runtime's and not a bind's. a5 `host_build_graph` also keeps
+an AICPU-scheduled fallback, selected inside its bind from the graph's own task
+kinds and from nothing a caller states, so an answer that followed the selection
+would make the capture available or not depending on whether a graph happened to
+hold a task the resident route declines.
+
+**No default or bundled diagnostic set may include it there.** `--dump-args`
+defaults to `off` and no scene, example or CI lane turns it on implicitly, so a
+request is always an explicit one — but a *sweep* is a request for every scene
+it covers: `pytest tests/st/a5 --dump-args partial` now fails every a5
+`host_build_graph` scene instead of running them and collecting nothing. Select
+by path. Likewise, a suite that enables "every owner this backend has" must read
+that set per backend rather than per owner list; the joined-launch suites do
+this through their own `DEVICE_OWNERS`, and the a5 `host_build_graph` copy
+names the unsupported one in `UNSUPPORTED_OWNERS` instead of enabling it.
+
+Closing the gap needs a capture at the real task boundary, which on that route
+means either an AICore↔AICPU rendezvous per task (the AICore publishes
+"about to execute N" and waits for the host's acknowledgement, and again
+after it completes) or AICore-side payload staging. The first adds a device
+round-trip to every task's dispatch path; the second adds per-task payload
+storage. The bounded design is
+[`docs/investigations/2026-10-a5-resident-per-task-args-capture.md`](../investigations/2026-10-a5-resident-per-task-args-capture.md);
+the capability is deferred to its own change, and until then the request is
+refused rather than partly served.
 
 ### 3.2 Partial Dump — Select Specific Args
 
@@ -351,9 +446,10 @@ exist (inputs passed by the caller), the geometry travels directly on
 the Tensor object and needs no explicit per-task registration.
 
 Full template:
-[`tests/st/a5/host_build_graph/dump_args`](../../tests/st/a5/host_build_graph/dump_args/)
-(and the `a2a3` mirror at
-`tests/st/a2a3/host_build_graph/dump_args`).
+[`tests/st/a2a3/host_build_graph/dump_args`](../../tests/st/a2a3/host_build_graph/dump_args/).
+The a5 mirror at `tests/st/a5/host_build_graph/dump_args` demonstrates the same
+two registration APIs and asserts its computation, but collects nothing: that
+runtime has no capture (§3.1.1).
 
 ## 4. Capabilities
 
@@ -520,11 +616,13 @@ Each record is fixed at 128 B (two cache lines) — see
 
 ### 5.2 Where dump calls are wired in
 
-Each runtime's scheduler dispatch code calls
+Each capturing runtime's AICPU scheduler dispatch code calls
 `dump_args_for_task` at two points in the per-task state machine
 (for `tensormap_and_ringbuffer`, this is in
 `runtime/scheduler/scheduler_completion.cpp` and
-`runtime/scheduler/scheduler_dispatch.cpp`):
+`runtime/scheduler/scheduler_dispatch.cpp`). a5 `host_build_graph` has no such
+call site reachable on its route — the two points below belong to whichever
+thread owns the task, and there they are the cores' (§3.1.1):
 
 ```text
 ┌──────────────────────────────────────┐
@@ -796,6 +894,7 @@ before that flush runs, `reconcile_counters` recovers a non-empty
 | `MemoryOps` callbacks | 3 (`alloc`, `reg`, `free_`) | 5 (+ `copy_to_device`, `copy_from_device`) |
 | Arena access | direct via SVM | targeted `copy_from_device` inside `on_buffer_collected` |
 | Tensor-payload support | Supported | Supported |
+| Per-task capture by runtime | both runtimes | `tensormap_and_ringbuffer` only; `host_build_graph` has none and refuses the request (§3.1.1) |
 | `reconcile_counters` | recover leftover current buffers + dropped accounting | identical |
 | Lifecycle | `initialize` → `start` → `stop` → `reconcile_counters` → `export_dump_files` → `finalize` | identical |
 
@@ -828,10 +927,15 @@ device.
 
 ## 7. Limitations
 
-Three pressure or failure conditions exist when dump buffers run out
-of space. Successful arena backpressure preserves payload; truncation
-and record discard surface in the JSON manifest plus the
-`dump_args_flush` log line so users can detect and diagnose them.
+The runtime-level one comes first: **a5 `host_build_graph` has no per-task
+capture, and a request for it is refused at `simpler_prepare_run`** rather than
+served partly or emptily. §3.1.1 is the full account; the table in §2 is the
+per-runtime answer.
+
+Three pressure or failure conditions then exist, on the runtimes that do
+capture, when dump buffers run out of space. Successful arena backpressure
+preserves payload; truncation and record discard surface in the JSON manifest
+plus the `dump_args_flush` log line so users can detect and diagnose them.
 
 ### 7.1 Truncation (`truncated = true`)
 
@@ -922,6 +1026,7 @@ host hand-off queue).
 
 | Condition | Flag | Metadata | Payload | a2a3 | a5 |
 | --------- | ---- | -------- | ------- | ---- | -- |
+| Runtime has no per-task capture | request refused `-1001`, nothing prepared | None | None | — | a5 `host_build_graph` (§3.1.1) |
 | Tensor > arena | `truncated` | Preserved | Partial (`arena/2` bytes) | Same | Same |
 | Arena host writer falls behind | none on success | Preserved | Preserved after bounded wait for this thread's ack | Same | Same |
 | Record buffer full, no free buffer | `dropped_records` summary | Lost | Lost | After gate timeout | Same |

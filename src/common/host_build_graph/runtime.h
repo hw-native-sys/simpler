@@ -46,6 +46,7 @@
 #include "common/launch_entry_args.h"     // LaunchEntryArgsPlan
 #include "host_build_graph/entry_args.h"  // EntryArgsStorage
 #include "utils/tensor_lease.h"
+#include "host/scope_stats_capacity.h"
 
 // =============================================================================
 // Configuration Macros
@@ -561,6 +562,8 @@ public:
      * Constructor - zero-initialize all arrays
      */
     Runtime();
+
+    simpler::dfx::scope_stats_runs::CapacityMetadata scope_stats_capacity() const { return {false, std::nullopt}; }
 
     // =========================================================================
     // Accessors for the execution-parameter fields

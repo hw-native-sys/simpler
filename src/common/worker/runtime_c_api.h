@@ -126,6 +126,23 @@ enum {
     SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE = PTO_RUNTIME_ERR_BASE - 7,
 };
 
+/**
+ * A launch result that is not a failure of the run.
+ *
+ * Every diagnostic output slot or terminal bank some enabled owner needs is
+ * still held by a run ahead. Nothing was submitted and nothing was admitted:
+ * the run keeps its prepared state and may be launched again, unchanged, once
+ * `simpler_diagnostic_credit_generation_ctx` advances. A caller that treats it
+ * as a failure turns a run that is merely waiting into one that is lost.
+ *
+ * It takes a value in the host-side band so it cannot collide with a latched
+ * device code, and sits in its own enum because the band's other members are
+ * externally-contracted legacy names this one does not join.
+ */
+enum {
+    SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL = PTO_RUNTIME_ERR_BASE - 5,
+};
+
 /** Return values from simpler_poll_run(). */
 enum {
     SIMPLER_NATIVE_RUN_POLL_ERROR = PTO_RUNTIME_ERR_INTERNAL,
@@ -778,6 +795,44 @@ int simpler_abort_run_plan_ctx(DeviceContextHandle ctx, uint32_t pipeline_slot, 
  * collector's own budget.
  */
 int simpler_flush_diagnostics_ctx(DeviceContextHandle ctx, int32_t timeout_ms, char *error, size_t error_capacity);
+
+/**
+ * A snapshot of this context's diagnostic credit progress.
+ *
+ * Monotonic. Every release of a diagnostic output slot or terminal bank
+ * advances it, as does an owner becoming fatal, cancellation and teardown — so
+ * "the value changed" is the whole of what a waiter needs, and no caller has to
+ * name which owner it is waiting for.
+ *
+ * Non-blocking and safe to call while holding the caller's own lane mutex. A
+ * runtime that does not export it leaves the caller with no progress
+ * information, which the caller reads as "re-ask next round".
+ */
+uint64_t simpler_diagnostic_credit_generation_ctx(DeviceContextHandle ctx);
+
+/**
+ * Block until the credit generation differs from `seen`.
+ *
+ * Must NOT be called while holding the caller's lane mutex or any collector
+ * lock: the threads that advance the generation are the collectors' own
+ * writers, and a waiter holding either could stop the release it is waiting
+ * for.
+ *
+ * @return 1 when the generation advanced, 0 when `timeout_ms` elapsed, and a
+ *         negative value when waits were cancelled, the context is shutting
+ *         down, or the handle is not one this runtime owns.
+ */
+int simpler_wait_diagnostic_credit_ctx(DeviceContextHandle ctx, uint64_t seen, int32_t timeout_ms);
+
+/**
+ * Make every present and future credit wait on this context return.
+ *
+ * Non-blocking and idempotent: it sets the cancelled flag, broadcasts, and
+ * returns. It proves nothing about any waiter having left — that is the
+ * caller's own to establish — which is what makes it safe to call from a
+ * thread that is itself inside a guarded call.
+ */
+void simpler_cancel_diagnostic_credit_waits_ctx(DeviceContextHandle ctx);
 
 /** Copy host memory to a device pointer within the given device context. */
 int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_ptr, size_t size);

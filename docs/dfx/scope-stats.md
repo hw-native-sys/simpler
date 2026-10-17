@@ -189,6 +189,13 @@ Metadata line (line 1):
 | `dep_pool_max` | int[] | Per-ring dependency-list pool capacity (indexed by `ring`) |
 | `tensormap_max` | int | Tensormap entry capacity (scalar) |
 
+Retained TMR runs carry these capacities from their resolved runtime layout into
+their own export slot, including when binding uses a cached arena. A delayed
+export therefore keeps its run's configuration after a successor initializes.
+Missing required capacity metadata refuses admission; numeric zero is not an
+unknown-capacity sentinel. The serialized, retention-off path reads capacities
+from the shared header after completion.
+
 At the counting limit these two numbers saturate rather than wrap: the device
 counters clamp at `4294967295`, and a run that reaches it is reported with
 unknown counts instead of a small wrapped number that would look complete. The

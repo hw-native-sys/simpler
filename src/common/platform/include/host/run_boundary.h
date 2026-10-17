@@ -110,4 +110,29 @@ void close_run_boundary(
     if (publication_failure) std::rethrow_exception(publication_failure);
 }
 
+/**
+ * Settle one failed run's terminal bank, for an owner whose close does not take
+ * the producer-stop proof itself.
+ *
+ * The two facts are independent and are kept that way here. A run that did not
+ * complete has published no accounting worth reading, and its owner's close has
+ * already decided that; what is left is whether anything can still be writing
+ * into the bank. With every producer proved stopped the entries are discarded
+ * unread and the storage goes back, and without that proof the owner keeps it,
+ * because a producer that is still running would otherwise share a bank with
+ * the next run.
+ *
+ * Does nothing on the completion path: there the close consumed the snapshot
+ * and released the bank with it, and a second settlement would return a bank
+ * this run no longer holds. The swimlane makes the same decision inside its own
+ * `run_close`, which receives both facts directly.
+ */
+template <typename Collector>
+void settle_failed_run_terminal_bank(
+    Collector &collector, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
+) {
+    if (device_execution_complete || !device_producers_stopped) return;
+    collector.discard_run_terminal_bank(run_epoch);
+}
+
 }  // namespace simpler::dfx::runs

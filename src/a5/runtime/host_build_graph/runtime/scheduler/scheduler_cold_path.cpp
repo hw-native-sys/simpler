@@ -586,6 +586,10 @@ int32_t SchedulerContext::shutdown(Runtime *runtime, int32_t thread_idx) {
 
 #if SIMPLER_DFX
     if (is_pmu_enabled()) {
+        // Settle this run's per-core accounting before the registers are
+        // restored and the cores retired: those are what stop the producer,
+        // and this reads what the producer wrote.
+        pmu_aicpu_close_run_cores(cores, core_num);
         pmu_aicpu_finalize(cores, core_num);
     }
 #endif

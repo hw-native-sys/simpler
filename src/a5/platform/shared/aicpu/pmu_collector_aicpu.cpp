@@ -34,7 +34,9 @@
 
 #include "aicpu/platform_regs.h"
 #include "aicpu/device_run_result_base_aicpu.h"
+#include "aicpu/diagnostic_run_terminal_aicpu.h"
 #include "aicpu/profiler_device_engine.h"
+#include "common/diagnostic_run_terminal.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -42,10 +44,27 @@
 static uint64_t g_platform_pmu_base = 0;
 static bool g_enable_pmu = false;
 
+// Where this run's producer accounting is published, and which bank of it is
+// this run's. Zero means the host mapped none, which is the default path: the
+// host owns the counter reset and reads the live counters, as it does without
+// retention.
+/**
+ * This run's terminal bank — the address of its first producer entry — pushed
+ * at kernel entry from the launching run's KernelArgs. 0 means the host
+ * resolved none, which is every run with this collector's retention off, and
+ * is what keeps the device off an address nobody mapped.
+ */
+static uint64_t s_run_terminal_bank = 0;
+
 // Saved CTRL register state per core, indexed by logical core_id.
 // Populated by pmu_aicpu_init(), consumed by pmu_aicpu_finalize().
 static uint32_t g_pmu_saved_ctrl0[PLATFORM_MAX_CORES];
 static uint32_t g_pmu_saved_ctrl1[PLATFORM_MAX_CORES];
+// What each core's control registers read back right after this run programmed
+// them, held between the programming loop and the per-core loop that claims
+// this run's terminal entries. Written only by the thread running
+// `pmu_aicpu_init`, which is the scheduler's leader, and read only below it.
+static uint32_t g_pmu_ctrl_readback_note[PLATFORM_MAX_CORES];
 
 // Per-core cached PmuBufferState pointer and PMU header pointer.
 static PmuBufferState *s_pmu_buffer_states[PLATFORM_MAX_CORES];
@@ -61,9 +80,18 @@ static PmuAicoreRing *s_pmu_aicore_rings[PLATFORM_MAX_CORES];
 // Populated by pmu_aicpu_init(); 0 means "no PMU for this core" (sim).
 static uint64_t s_pmu_reg_addrs[PLATFORM_MAX_CORES] = {0};
 
+// PMU's per-run figures are compared against the host's receipts, so a counter
+// that wrapped would make a lossy run look balanced. Every increment clamps at
+// the sentinel the host reads as "unknown" instead.
+static inline void pmu_saturating_add(volatile uint32_t &counter, uint32_t by) {
+    counter = diagnostic_terminal_add_u32(counter, by);
+}
+
 static constexpr uint64_t kPmuQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
 
 extern "C" void set_platform_pmu_base(uint64_t pmu_data_base) { g_platform_pmu_base = pmu_data_base; }
+
+extern "C" void set_platform_pmu_run_terminal(uint64_t bank) { s_run_terminal_bank = bank; }
 
 extern "C" uint64_t get_platform_pmu_base() { return g_platform_pmu_base; }
 
@@ -145,7 +173,17 @@ struct PmuDeviceModule {
         ctx.header->queues[ctx.thread_idx][tail].buffer_seq = buffer_seq;
     }
 
-    static void account_dropped(Context, State *state, uint32_t count) { state->dropped_record_count += count; }
+    static void account_dropped(Context, State *state, uint32_t count) {
+        pmu_saturating_add(state->dropped_record_count, count);
+    }
+    // Reported once per successful commit, with the count read before the
+    // ready-queue tail advanced. What reached the host is not derivable from
+    // total and dropped: a committed buffer can still be lost afterwards, and
+    // only the gap against the host's receipt count shows it.
+    static void on_publish_committed(Context, State *state, uint32_t committed) {
+        pmu_saturating_add(state->published_record_count, committed);
+        pmu_saturating_add(state->published_buffer_count, 1);
+    }
     static void on_pop_success(Context, State *state, Buffer *buffer) {
         buffer->run_epoch = get_platform_run_result_epoch();
         buffer->local_seq = state->current_buf_seq;
@@ -242,10 +280,29 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
         uint64_t reg_addr = s_pmu_reg_addrs[i];
         if (reg_addr == 0) {
             LOG_WARN("pmu_aicpu_init: core %d has no PMU reg_addr, skipping MMIO programming", i);
+            g_pmu_ctrl_readback_note[i] =
+                diagnostic_terminal_make_note(PMU_NOTE_NO_WINDOW, physical_core_ids[i] & PMU_NOTE_PHYSICAL_MASK);
             continue;
         }
         pmu_program_events(reg_addr, *evt);
         pmu_start(reg_addr, g_pmu_saved_ctrl0[i], g_pmu_saved_ctrl1[i]);
+        // Two reads, on this cold path, of the words just written: this
+        // architecture gates counting through both control registers, so the
+        // note reports the enable only when both carry it. Nothing is written
+        // back and no decision is taken from it.
+        const uint32_t observed0 = static_cast<uint32_t>(read_reg(reg_addr, RegId::PMU_CTRL_0));
+        const uint32_t observed1 = static_cast<uint32_t>(read_reg(reg_addr, RegId::PMU_CTRL_1));
+        const bool enabled = (observed0 & REG_MMIO_PMU_CTRL_0_ENABLE_VAL) == REG_MMIO_PMU_CTRL_0_ENABLE_VAL &&
+                             (observed1 & REG_MMIO_PMU_CTRL_1_ENABLE_VAL) == REG_MMIO_PMU_CTRL_1_ENABLE_VAL;
+        // The payload carries the physical id this core reported — what chose the
+        // window, and what no artifact otherwise records — then both observed
+        // words above it, each in six bits, which is wider than either enable
+        // value.
+        const uint32_t payload = (physical_core_ids[i] & PMU_NOTE_PHYSICAL_MASK) |
+                                 ((observed0 & 0x3Fu) << PMU_NOTE_PHYSICAL_BITS) |
+                                 ((observed1 & 0x3Fu) << (PMU_NOTE_PHYSICAL_BITS + 6));
+        g_pmu_ctrl_readback_note[i] = enabled ? diagnostic_terminal_make_note(PMU_NOTE_ENABLED, payload) :
+                                                diagnostic_terminal_make_note(PMU_NOTE_DISABLED, payload);
     }
 
     // Pop initial PmuBuffer from each core's free_queue and cache the stable
@@ -254,6 +311,29 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
         PmuBufferState *state = get_pmu_buffer_state(pmu_base, i);
         s_pmu_buffer_states[i] = state;
         s_pmu_aicore_rings[i] = reinterpret_cast<PmuAicoreRing *>(state->aicore_ring_ptr);
+
+        // This core's counters start here rather than at the host's admission:
+        // a host instant is not a producer boundary once a successor may
+        // already be queued, while this init provably runs after the
+        // predecessor's producers left with their operator. The host keeps its
+        // own reset for the path that maps no terminal bank, where no successor
+        // can be admitted at all.
+        if (s_run_terminal_bank != 0) {
+            state->total_record_count = 0;
+            state->dropped_record_count = 0;
+            state->mismatch_record_count = 0;
+            state->published_record_count = 0;
+            state->published_buffer_count = 0;
+            simpler::dfx::terminal::begin_run(
+                s_run_terminal_bank, PLATFORM_MAX_CORES, i, get_platform_run_result_epoch()
+            );
+            // After the claim, into the entry that claim just stamped: the note
+            // belongs to this core's producer and to this run's epoch, and
+            // `note_run` refuses an entry carrying any other.
+            simpler::dfx::terminal::note_run(
+                s_run_terminal_bank, PLATFORM_MAX_CORES, i, get_platform_run_result_epoch(), g_pmu_ctrl_readback_note[i]
+            );
+        }
 
         // Keep the buffer this core already holds, or pop the first one.
         //
@@ -288,10 +368,11 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
     }
 }
 
-void pmu_aicpu_complete_record(
-    int core_id, int thread_idx, uint32_t reg_task_id, TaskId task_id, uint32_t func_id, CoreType core_type
+void pmu_aicpu_record_staged_task(
+    int core_id, int thread_idx, TaskId task_id, uint32_t func_id, CoreType core_type, uint64_t total_cycles,
+    const uint32_t *counters
 ) {
-    if (s_pmu_header == nullptr || core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
+    if (s_pmu_header == nullptr || core_id < 0 || core_id >= PLATFORM_MAX_CORES || counters == nullptr) {
         return;
     }
 
@@ -302,24 +383,7 @@ void pmu_aicpu_complete_record(
 
     // Account the task *before* any drop path so total reflects every task the
     // AICPU tried to record. collected + dropped + mismatch == total invariant on host.
-    state->total_record_count += 1;
-
-    // Read AICore-published PmuRecord from the stable per-core staging ring.
-    PmuAicoreRing *ring = s_pmu_aicore_rings[core_id];
-    if (ring == nullptr) {
-        state->dropped_record_count += 1;
-        wmb();
-        return;
-    }
-    PmuAicoreSlot *slot = &ring->dual_issue_slots[reg_task_id % PLATFORM_PMU_AICORE_RING_SIZE];
-
-    if (slot->reg_task_id != reg_task_id) {
-        // AICore hasn't published this slot yet — hard invariant violation,
-        // separate from capacity drops.
-        state->mismatch_record_count += 1;
-        wmb();
-        return;
-    }
+    pmu_saturating_add(state->total_record_count, 1);
 
     rmb();
     uint64_t cur_ptr = state->current_buf_ptr;
@@ -327,7 +391,7 @@ void pmu_aicpu_complete_record(
     if (cur_ptr == 0) {
         buf = try_pop_pmu_buffer(core_id, state, state->current_buf_seq);
         if (buf == nullptr) {
-            state->dropped_record_count += 1;
+            pmu_saturating_add(state->dropped_record_count, 1);
             wmb();
             return;
         }
@@ -344,7 +408,7 @@ void pmu_aicpu_complete_record(
         if (cur_ptr == 0) {
             buf = try_pop_pmu_buffer(core_id, state, state->current_buf_seq);
             if (buf == nullptr) {
-                state->dropped_record_count += 1;
+                pmu_saturating_add(state->dropped_record_count, 1);
                 wmb();
                 return;
             }
@@ -360,13 +424,52 @@ void pmu_aicpu_complete_record(
     rec->task_id = task_id;
     rec->func_id = func_id;
     rec->core_type = core_type;
-    rec->pmu_total_cycles = slot->pmu_total_cycles;
+    rec->pmu_total_cycles = total_cycles;
     for (int i = 0; i < PMU_COUNTER_COUNT_A5; i++) {
-        rec->pmu_counters[i] = slot->pmu_counters[i];
+        rec->pmu_counters[i] = counters[i];
     }
     buf->count = idx + 1;
 
     wmb();
+}
+
+void pmu_aicpu_complete_record(
+    int core_id, int thread_idx, uint32_t reg_task_id, TaskId task_id, uint32_t func_id, CoreType core_type
+) {
+    if (s_pmu_header == nullptr || core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
+        return;
+    }
+
+    PmuBufferState *state = s_pmu_buffer_states[core_id];
+    if (state == nullptr) {
+        return;
+    }
+
+    // Read AICore-published PmuRecord from the stable per-core staging ring.
+    // Both refusals below are this run's loss and are counted here, because the
+    // commit this call never reaches is where every other outcome is counted.
+    PmuAicoreRing *ring = s_pmu_aicore_rings[core_id];
+    if (ring == nullptr) {
+        pmu_saturating_add(state->total_record_count, 1);
+        pmu_saturating_add(state->dropped_record_count, 1);
+        wmb();
+        return;
+    }
+    PmuAicoreSlot *slot = &ring->dual_issue_slots[reg_task_id % PLATFORM_PMU_AICORE_RING_SIZE];
+
+    if (slot->reg_task_id != reg_task_id) {
+        // AICore hasn't published this slot yet — hard invariant violation,
+        // separate from capacity drops.
+        pmu_saturating_add(state->total_record_count, 1);
+        pmu_saturating_add(state->mismatch_record_count, 1);
+        wmb();
+        return;
+    }
+
+    rmb();
+    pmu_aicpu_record_staged_task(
+        core_id, thread_idx, task_id, func_id, core_type, slot->pmu_total_cycles, slot->pmu_counters
+    );
 }
 
 void pmu_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int core_num) {
@@ -408,9 +511,19 @@ void pmu_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int co
         }
 
         uint32_t seq = state->current_buf_seq;
+        // Read before publication: a successful enqueue advances the ready
+        // queue tail, after which the host owns this buffer and may recycle it.
+        const uint32_t committed = buf->count;
         int rc = enqueue_pmu_ready_buffer(thread_idx, static_cast<uint32_t>(core_id), buf_ptr, seq);
         if (rc == 0) {
             state->current_buf_ptr = 0;
+            // The same accounting the buffer-switch path reports, because this
+            // commit is the same event. Without it a run that ends with records
+            // in its buffer publishes them and tells its terminal it published
+            // none, so `total == published + dropped + live` fails for every
+            // such run and its accounting reads as unknown.
+            pmu_saturating_add(state->published_record_count, committed);
+            pmu_saturating_add(state->published_buffer_count, 1);
             wmb();
         } else {
             // ready_queue full at end-of-run: account the loss, but keep the
@@ -424,11 +537,42 @@ void pmu_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int co
                 "Thread %d: Core %d failed to flush PMU buffer (ready_queue full), %u records lost!", thread_idx,
                 core_id, buf->count
             );
-            state->dropped_record_count += buf->count;
+            pmu_saturating_add(state->dropped_record_count, buf->count);
             buf->count = 0;
             wmb();
         }
     }
+}
+
+void pmu_aicpu_close_run(int core_id) {
+    if (core_id < 0 || core_id >= PLATFORM_MAX_CORES) {
+        return;
+    }
+    PmuBufferState *state = s_pmu_buffer_states[core_id];
+    if (state == nullptr) {
+        return;
+    }
+
+    uint32_t live_at_close = 0;
+    const uint64_t held_ptr = state->current_buf_ptr;
+    if (held_ptr != 0) {
+        live_at_close = reinterpret_cast<const PmuBuffer *>(held_ptr)->count;
+    }
+
+    DiagnosticRunTerminalCounts counts{};
+    counts.total = state->total_record_count;
+    // A record lost to the ring/task_id invariant is lost to this run just as a
+    // dropped one is; both are reported, neither is reconstructed. The sum is
+    // formed with the same clamp its terms use: two counters below the sentinel
+    // can still add past it, and a wrapped sum would read as a balanced run.
+    counts.dropped = diagnostic_terminal_add_u32(state->dropped_record_count, state->mismatch_record_count);
+    counts.published_records = state->published_record_count;
+    counts.published_buffers = state->published_buffer_count;
+    counts.live_at_close = live_at_close;
+
+    simpler::dfx::terminal::publish(
+        s_run_terminal_bank, PLATFORM_MAX_CORES, core_id, get_platform_run_result_epoch(), counts
+    );
 }
 
 void pmu_aicpu_finalize(const int *cur_thread_cores, int core_num) {
@@ -442,8 +586,57 @@ void pmu_aicpu_finalize(const int *cur_thread_cores, int core_num) {
             continue;
         }
         uint64_t reg_addr = s_pmu_reg_addrs[core_id];
+        // The word this writes back is the one this run's own init read. Runs
+        // reach a device operator serially — a run's teardown precedes its
+        // successor's bring-up — so no successor is counting through this
+        // window yet, and a core the init skipped has no window to close.
         if (reg_addr != 0) {
+            // Read before the restore, so these are the words the run's tasks
+            // ran under rather than the words the restore leaves. Two reads,
+            // once per core per run, on a teardown path; no decision is taken
+            // from them and nothing is written back from them.
+            //
+            // This is the task-time half of the window's evidence: the init
+            // note says both enables were there before any task ran, and this
+            // says whether they were still there once every task had. Together
+            // they separate a window that was never armed from one that lost
+            // its arming during the run from one that kept it — which is as far
+            // as a register observation reaches, since neither says whether the
+            // AICore opened its own per-task gate.
+            const uint32_t observed0 = static_cast<uint32_t>(read_reg(reg_addr, RegId::PMU_CTRL_0));
+            const uint32_t observed1 = static_cast<uint32_t>(read_reg(reg_addr, RegId::PMU_CTRL_1));
+            // The physical id is read back out of the init note rather than
+            // kept in a second global: the init wrote it there, and only a core
+            // whose init ran reaches here with a window.
+            const uint32_t init_note = g_pmu_ctrl_readback_note[core_id];
+            const uint32_t payload = (diagnostic_terminal_note_payload(init_note) & PMU_NOTE_PHYSICAL_MASK) |
+                                     ((observed0 & 0x3Fu) << PMU_NOTE_PHYSICAL_BITS) |
+                                     ((observed1 & 0x3Fu) << (PMU_NOTE_PHYSICAL_BITS + 6));
+            // Decided by the close words alone. Folding the init code in would
+            // make one count answer two questions — "it was never enabled" and
+            // "it stopped being enabled" would both read `lost` — which is the
+            // distinction this observation exists to draw. The init code stays
+            // in its own field for the reader to pair with this one.
+            const bool held = (observed0 & REG_MMIO_PMU_CTRL_0_ENABLE_VAL) == REG_MMIO_PMU_CTRL_0_ENABLE_VAL &&
+                              (observed1 & REG_MMIO_PMU_CTRL_1_ENABLE_VAL) == REG_MMIO_PMU_CTRL_1_ENABLE_VAL;
+            if (s_run_terminal_bank != 0 && diagnostic_terminal_note_code(init_note) != PMU_NOTE_NO_WINDOW) {
+                // Into the entry this core's own init claimed and stamped, in
+                // the field reserved for a second observation so the init one
+                // survives; `note_run_close` refuses an entry carrying any
+                // other epoch, so a close arriving for a run whose entry a
+                // successor already took writes nothing.
+                simpler::dfx::terminal::note_run_close(
+                    s_run_terminal_bank, PLATFORM_MAX_CORES, core_id, get_platform_run_result_epoch(),
+                    diagnostic_terminal_make_note(held ? PMU_NOTE_HELD : PMU_NOTE_LOST, payload)
+                );
+            }
             pmu_stop(reg_addr, g_pmu_saved_ctrl0[core_id], g_pmu_saved_ctrl1[core_id]);
         }
     }
+}
+
+void pmu_aicpu_close_run_cores(const int32_t *core_ids, int32_t core_num) {
+    if (core_ids == nullptr || core_num <= 0) return;
+    for (int32_t i = 0; i < core_num; i++)
+        pmu_aicpu_close_run(static_cast<int>(core_ids[i]));
 }

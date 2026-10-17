@@ -39,6 +39,7 @@
 
 #include "common/core_type.h"
 #include "common/host_api.h"
+#include "host/scope_stats_capacity.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
@@ -414,6 +415,11 @@ public:
     // copy_in_run_inputs_impl and copy_back_run_outputs_impl, and released by
     // release_run_bindings_impl. Host-only (after `dev`): never uploaded.
     std::vector<TensorLease> tensor_leases_;
+
+    simpler::dfx::scope_stats_runs::CapacityMetadata scope_stats_capacity_;
+    const simpler::dfx::scope_stats_runs::CapacityMetadata &scope_stats_capacity() const {
+        return scope_stats_capacity_;
+    }
 
     // Host view of the active callable's registration-owned object-address
     // table, borrowed for as long as that callable stays registered, plus the

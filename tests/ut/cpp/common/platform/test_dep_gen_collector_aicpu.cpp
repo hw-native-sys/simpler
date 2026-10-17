@@ -28,6 +28,9 @@
 #include <cstring>
 #include <vector>
 
+#include "aicpu/device_run_result_base_aicpu.h"
+#include "common/diagnostic_run_terminal.h"
+#include "host/diagnostic_run_credit.h"
 #include "support/test_task_id.h"
 
 namespace {
@@ -198,6 +201,149 @@ TEST_F(DepGenCollectorAicpuTest, MixedKindsSurviveTwoOverflowRecords) {
     EXPECT_NE(last->flags & DEP_GEN_FLAG_LAST_OVERFLOW, 0u);
     EXPECT_EQ(last->deps[0], deps.back());
     EXPECT_EQ(last->kinds[0], kinds.back());
+}
+
+// ---------------------------------------------------------------------------
+// Per-run terminal accounting
+// ---------------------------------------------------------------------------
+
+/**
+ * One terminal bank, owned by the test the way the host collector owns it.
+ *
+ * The producer publishes into it and the host-side reconciliation reads it, so
+ * the unit a producer counts in is checked against the unit the reader
+ * subtracts in — which is the whole hazard an overflow chain introduces.
+ */
+class DepGenTerminalTest : public DepGenCollectorAicpuTest {
+protected:
+    void SetUp() override {
+        DepGenCollectorAicpuTest::SetUp();
+        bank_.assign(static_cast<size_t>(DEP_GEN_TERMINAL_PRODUCERS) * PLATFORM_DIAGNOSTIC_TERMINAL_BANKS, {});
+        for (auto &entry : bank_)
+            diagnostic_terminal_reset(&entry);
+        set_platform_dep_gen_run_terminal(reinterpret_cast<uint64_t>(bank_.data()));
+        set_platform_run_result(/*region_base=*/0, kEpoch);
+        dep_gen_aicpu_set_orch_thread_idx(0);
+    }
+
+    void TearDown() override {
+        set_platform_run_result(0, 0);
+        set_platform_dep_gen_run_terminal(0);
+        DepGenCollectorAicpuTest::TearDown();
+    }
+
+    /** Reconcile this run exactly as the collector will. */
+    simpler::dfx::credit::RunReconciliation reconcile(uint64_t received) const {
+        return simpler::dfx::credit::reconcile_run(
+            bank_.data(), DEP_GEN_TERMINAL_PRODUCERS, DEP_GEN_TERMINAL_PRODUCERS, kEpoch, received
+        );
+    }
+
+    static constexpr uint64_t kEpoch = 7701;
+    std::vector<DiagnosticRunTerminal> bank_;
+};
+
+TEST_F(DepGenTerminalTest, ASubmitThatSpillsIntoAChainConservesInSlots) {
+    constexpr int kDepCount = DEP_GEN_MAX_EXPLICIT_DEPS + 1;
+    std::vector<TaskId> deps(kDepCount);
+    for (int i = 0; i < kDepCount; ++i)
+        deps[i] = simpler::ut::test_task_id(0x200 + i);
+
+    record_submit(simpler::ut::test_task_id(0x4321), kDepCount, deps.data(), nullptr);
+    // One submit, two buffer slots: the base record plus its overflow.
+    ASSERT_EQ(buffer_->count, 2u);
+    ASSERT_EQ(state_->total_record_count, 1u);
+    ASSERT_EQ(state_->total_overflow_record_count, 1u);
+
+    dep_gen_aicpu_flush();
+    dep_gen_aicpu_close_run();
+
+    // The terminal is in slots, not submits: counting submits would report one
+    // produced against two published and condemn a healthy run.
+    EXPECT_EQ(bank_[0].run_epoch, kEpoch);
+    EXPECT_EQ(bank_[0].total, 2u);
+    EXPECT_EQ(bank_[0].published_records, 2u);
+    EXPECT_EQ(bank_[0].dropped, 0u);
+    EXPECT_EQ(bank_[0].live_at_close, 0u);
+
+    const auto out = reconcile(/*received=*/2);
+    EXPECT_EQ(out.verdict, simpler::dfx::runs::Verdict::Published);
+    EXPECT_FALSE(out.counts_unknown);
+}
+
+TEST_F(DepGenTerminalTest, AnUnflushedBufferIsReportedLiveAndStillConserves) {
+    record_one_submit(simpler::ut::test_task_id(0x11));
+    record_one_submit(simpler::ut::test_task_id(0x12));
+    ASSERT_EQ(buffer_->count, 2u);
+
+    // No flush: the records are in the producer's held buffer at close.
+    dep_gen_aicpu_close_run();
+
+    EXPECT_EQ(bank_[0].total, 2u);
+    EXPECT_EQ(bank_[0].published_records, 0u);
+    EXPECT_EQ(bank_[0].live_at_close, 2u);
+
+    const auto out = reconcile(/*received=*/0);
+    EXPECT_EQ(out.verdict, simpler::dfx::runs::Verdict::PartialSafe);
+    EXPECT_FALSE(out.counts_unknown) << "a held buffer is a known loss, not an unknown one";
+    EXPECT_EQ(out.unsettled, 2u);
+}
+
+TEST_F(DepGenTerminalTest, ARunWithoutAnIdentityPublishesNothing) {
+    set_platform_run_result(0, 0);
+    record_one_submit(simpler::ut::test_task_id(0x13));
+    dep_gen_aicpu_flush();
+    dep_gen_aicpu_close_run();
+
+    EXPECT_EQ(bank_[0].run_epoch, 0u) << "a run with no identity claimed a bank";
+}
+
+TEST_F(DepGenTerminalTest, TheRunsCountersStartAtItsOwnDeviceInit) {
+    record_one_submit(simpler::ut::test_task_id(0x14));
+    dep_gen_aicpu_flush();
+    dep_gen_aicpu_close_run();
+    ASSERT_EQ(bank_[0].total, 1u);
+
+    // The host returns the published buffer to the free queue, as its drain
+    // shard does; AICPU never produces into that queue itself.
+    state_->free_queue.buffer_ptrs[1] = reinterpret_cast<uint64_t>(buffer_);
+    state_->free_queue.tail = 2;
+
+    // The successor's device init is what zeroes them, with no host reset in
+    // between — which is the whole point of moving the reset to the producer.
+    set_platform_run_result(0, kEpoch + 1);
+    dep_gen_aicpu_init();
+    ASSERT_EQ(state_->current_buf_ptr, reinterpret_cast<uint64_t>(buffer_));
+    EXPECT_EQ(state_->total_record_count, 0u);
+    EXPECT_EQ(state_->published_record_count, 0u);
+    // The entry is the successor's from its init: the init claims it under the
+    // successor's identity, so the predecessor's snapshot is gone and the
+    // figures standing in it are nobody's yet. Both halves matter — an entry
+    // still naming the predecessor would let its counts be read as this run's,
+    // and one naming the successor with usable arithmetic would publish a run
+    // that has not closed.
+    EXPECT_EQ(bank_[0].run_epoch, kEpoch + 1) << "the successor's init did not claim the entry it publishes into";
+    EXPECT_NE(bank_[0].counts_unknown, 0u) << "a claimed entry offered arithmetic before its run closed";
+    EXPECT_EQ(bank_[0].total, 0u) << "the successor's init left its predecessor's count in the entry";
+    EXPECT_EQ(bank_[0].published_records, 0u);
+    // And an interrupted successor is still rejected: settled from here, the
+    // run reports the unknown its own claim carries rather than the
+    // predecessor's balanced figures.
+    const simpler::dfx::credit::RunReconciliation interrupted = simpler::dfx::credit::reconcile_run(
+        bank_.data(), DEP_GEN_TERMINAL_PRODUCERS, /*expected=*/1, kEpoch + 1, /*received=*/0
+    );
+    EXPECT_EQ(interrupted.verdict, simpler::dfx::runs::Verdict::CutUnknown)
+        << "a successor that never closed was settled";
+    EXPECT_TRUE(interrupted.counts_unknown);
+
+    record_one_submit(simpler::ut::test_task_id(0x15));
+    record_one_submit(simpler::ut::test_task_id(0x16));
+    dep_gen_aicpu_flush();
+    dep_gen_aicpu_close_run();
+
+    EXPECT_EQ(bank_[0].run_epoch, kEpoch + 1);
+    EXPECT_EQ(bank_[0].total, 2u) << "the successor inherited its predecessor's count";
+    EXPECT_EQ(bank_[0].published_records, 2u);
 }
 
 }  // namespace

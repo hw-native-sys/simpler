@@ -11,6 +11,8 @@
 #include "fixture.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 
+extern "C" int args_dump_capture_supported_impl(void);
+
 namespace native_admission_test {
 TEST_F(NativeAdmissionTest, CallbackRejectsAnotherContextBeforeChangingItsRunState) {
     Runner outer_runner;
@@ -277,4 +279,69 @@ TEST_F(NativeAdmissionTest, CloseOwnsTheSavedGraphAfterItsCallback) {
     EXPECT_TRUE(owner.expired());
     EXPECT_EQ(runner.charged(), 0u);
 }
+
+TEST_F(NativeAdmissionTest, UnsupportedArgsDumpReleasesExactAttemptBeforeValidRunFlushClose) {
+    if (args_dump_capture_supported_impl() != 0) GTEST_SKIP() << "This runtime supports ArgsDump";
+    Runner runner;
+    Attempt rejected(runner, 0, 10);
+    rejected.config.enable_dump_args = 1;
+    const auto allocations = control().allocations;
+    ASSERT_EQ(rejected.prepare(), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(callbacks, 0);
+    EXPECT_EQ(control().allocations, allocations);
+    EXPECT_EQ(runner.reservations(), 0u);
+    EXPECT_FALSE(runner.holds_epoch(10));
+    EXPECT_EQ(runner.plan(0).phase, AutoAdmissionState::Phase::None);
+    EXPECT_FALSE(consume_released_preparation(rejected.storage, get_runtime_size(), 11));
+    ASSERT_TRUE(rejected.consume_release());
+    EXPECT_FALSE(rejected.consume_release());
+    EXPECT_TRUE(rejected.empty());
+    Attempt next(runner, 0, 20);
+    ASSERT_EQ(simpler_run(&runner, next.storage, 1, &next.args, &next.config, &next.descriptor), 0);
+    EXPECT_EQ(callbacks, 1);
+    EXPECT_TRUE(next.empty());
+    EXPECT_FALSE(runner.holds_epoch(20));
+    char error[256]{};
+    EXPECT_EQ(simpler_flush_diagnostics_ctx(&runner, 1000, error, sizeof(error)), 0) << error;
+    EXPECT_EQ(finalize_device(&runner), 0);
+}
+
+TEST_F(NativeAdmissionTest, UnsupportedArgsDumpCannotReplaceLiveCarrierOrItsEpoch) {
+    if (args_dump_capture_supported_impl() != 0) GTEST_SKIP() << "This runtime supports ArgsDump";
+    Runner runner;
+    Attempt live(runner, 0, 10);
+    ASSERT_EQ(live.prepare(), 0);
+    std::vector<unsigned char> before(get_runtime_size());
+    std::memcpy(before.data(), live.storage, before.size());
+    live.config.enable_dump_args = 1;
+    live.descriptor.run_epoch = 20;
+    EXPECT_EQ(live.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(std::memcmp(before.data(), live.storage, before.size()), 0);
+    EXPECT_FALSE(live.consume_release());
+    EXPECT_TRUE(runner.holds_epoch(10));
+    EXPECT_FALSE(runner.holds_epoch(20));
+    EXPECT_EQ(runner.reservations(), 1u);
+    EXPECT_EQ(simpler_finalize_run(&runner, live.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, RecursiveUnsupportedArgsDumpDoesNotAcquireOrCertifyAnAttempt) {
+    if (args_dump_capture_supported_impl() != 0) GTEST_SKIP() << "This runtime supports ArgsDump";
+    Runner runner;
+    Attempt outer(runner, 0, 10);
+    Attempt inner(runner, 1, 20);
+    inner.config.enable_dump_args = 1;
+    bool entered = false;
+    callback_hook = [&] {
+        entered = true;
+        EXPECT_EQ(inner.prepare(), PTO_RUNTIME_ERR_INVALID_STATE);
+        EXPECT_TRUE(inner.empty());
+        EXPECT_FALSE(inner.consume_release());
+        EXPECT_EQ(runner.reservations(), 1u);
+        EXPECT_FALSE(runner.holds_epoch(20));
+    };
+    ASSERT_EQ(outer.prepare(), 0);
+    EXPECT_TRUE(entered);
+    EXPECT_EQ(simpler_finalize_run(&runner, outer.storage), 0);
+}
+
 }  // namespace native_admission_test

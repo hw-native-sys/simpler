@@ -42,6 +42,19 @@ public:
     void abandon();
 
     bool launched() const;
+
+    /**
+     * This run's diagnostic admission deadline, or a default-constructed
+     * time point when it has none.
+     *
+     * The deadline is fixed at the first capacity refusal of a run at the
+     * front and never renewed; reading it is the only way a case can show
+     * that a later round left it where the first one put it.
+     */
+    Deadline credit_deadline_for_test() const;
+
+    /** Bring this run's admission deadline forward, so a case need not wait. */
+    void expire_credit_deadline_for_test();
     bool lane_poisoned() const;
     ChipRunPreparationDisposition preparation_disposition() const;
 

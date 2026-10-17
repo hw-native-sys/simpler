@@ -33,6 +33,32 @@ public:
     int32_t release_partition(Runtime *runtime, int32_t thread_idx, bool start_execution);
     void signal_shutdown_partition(int32_t thread_idx);
     int32_t finish_shutdown_partition(int32_t thread_idx, Runtime *runtime);
+    /**
+     * Settle every enabled owner's run data, once, if this run proved its cores
+     * stopped.
+     *
+     * Called by the participant that closes this run's completion gate. That
+     * arrival says every participant returned from its shutdown partition, not
+     * that every partition succeeded, so the proof this reads is the count of
+     * cores that acknowledged exit — a run short of it settles nothing and
+     * reports unknown.
+     *
+     * Returns whether this run's owners were settled. False is not an error:
+     * it is the run saying its accounting is unknown, which the host reads
+     * from the unsettled producers themselves.
+     */
+    bool settle_run_diagnostics(Runtime *runtime, bool graph_completed);
+    /**
+     * Whether every core this run brought up has acknowledged exit.
+     *
+     * The one fact that licenses reading what a core wrote or writing the
+     * registers it counts with. Arrival at the run's completion gate does not
+     * establish it: a partition whose `platform_retire_aicore_group` reported
+     * an unreleased core returns that failure and still arrives.
+     */
+    bool cores_retired() const {
+        return core_count_ > 0 && retired_core_count_.load(std::memory_order_acquire) == core_count_;
+    }
     void deinit();
 
 private:
@@ -51,11 +77,16 @@ private:
     };
 
     AicpuThreadLifecycleTrace *thread_lifecycle_trace(int32_t thread_idx);
+    bool collect_run_pmu_records(Runtime *runtime, uint64_t *missing_out);
 
     CoreState cores_[kMaxWorkers]{};
     uint32_t physical_core_ids_[kMaxWorkers]{};
     ThreadHandshakeTiming thread_handshake_timing_[PLATFORM_MAX_AICPU_THREADS]{};
     std::atomic<bool> handshake_failed_{false};
+    // Cores this run proved are no longer executing: one per core that
+    // acknowledged exit, plus one per core no window was ever opened on. Read
+    // against `core_count_` before anything reads what a core wrote.
+    std::atomic<int32_t> retired_core_count_{0};
     AicpuThreadLifecycleTrace *lifecycle_traces_{nullptr};
     int32_t core_count_{0};
     int32_t aicpu_thread_num_{0};

@@ -442,6 +442,32 @@ int dump_arg_record(int thread_idx, const ArgsDumpInfo &info);
  */
 void dump_args_flush(int thread_idx);
 
+/**
+ * Name this run's terminal bank — the address of its first producer entry,
+ * resolved by the host from the identity that reserved it.
+ *
+ * One producer per AICPU thread, so the bank holds `PLATFORM_MAX_AICPU_THREADS`
+ * entries and a producer adds only its own thread index. A zero address is the
+ * default path: nothing is published and the host reads what it reads today.
+ *
+ * C linkage because the sim runner reaches it by `dlsym` into the AICPU SO,
+ * the same way it reaches the other per-run diagnostic bases.
+ */
+extern "C" void set_platform_dump_args_run_terminal(uint64_t bank);
+
+/**
+ * Settle one producer thread's accounting for this run into its terminal
+ * entry, after every path that can still change one of its counters.
+ *
+ * The payload cursors are deliberately absent from it: `published_payload_count`
+ * and `completed_payload_count` are lifetime cursors that arena reuse depends
+ * on, so this run's payload share is counted separately rather than derived by
+ * differencing them.
+ *
+ * @param thread_idx Thread index
+ */
+void dump_args_close_run(int thread_idx);
+
 #endif
 
 #endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_ARGS_DUMP_AICPU_H_

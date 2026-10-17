@@ -355,6 +355,14 @@ void ChipWorker::init(
         // such symbol, and a null pointer is the refusal.
         supports_joined_diagnostic_launch_fn_ =
             reinterpret_cast<SupportsJoinedDiagnosticLaunchFn>(dlsym(handle, "supports_joined_diagnostic_launch_ctx"));
+        // Optional on the same terms. A runtime exporting none of the three
+        // leaves a blocked admission with nothing to park on, which is the
+        // behaviour before this bridge existed: the caller re-asks next pass.
+        credit_generation_fn_ =
+            reinterpret_cast<CreditGenerationFn>(dlsym(handle, "simpler_diagnostic_credit_generation_ctx"));
+        credit_wait_fn_ = reinterpret_cast<CreditWaitFn>(dlsym(handle, "simpler_wait_diagnostic_credit_ctx"));
+        credit_cancel_fn_ =
+            reinterpret_cast<CreditCancelFn>(dlsym(handle, "simpler_cancel_diagnostic_credit_waits_ctx"));
         // Optional for the same reason: a runtime built before the retained
         // capacity grant exports nothing, and a null pointer is the refusal.
         set_retained_epoch_limit_fn_ =
@@ -801,6 +809,9 @@ void ChipWorker::clear_runtime_binding() {
     supports_concurrent_native_prepare_fn_ = nullptr;
     supports_joined_native_launch_fn_ = nullptr;
     supports_joined_diagnostic_launch_fn_ = nullptr;
+    credit_generation_fn_ = nullptr;
+    credit_wait_fn_ = nullptr;
+    credit_cancel_fn_ = nullptr;
     set_run_resource_grant_fn_ = nullptr;
     get_arena_bank_gm_heap_base_fn_ = nullptr;
     get_retained_temp_addr_fn_ = nullptr;
@@ -1377,7 +1388,7 @@ void ChipWorker::note_native_run_completion(uint64_t run_epoch, int rc) noexcept
     }
 }
 
-void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream) {
+ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream) {
     validate_execution_context();
     if (run.slot_id >= runtime_bufs_.size()) {
         throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
@@ -1401,6 +1412,12 @@ void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_
     } catch (...) {
         failure = std::current_exception();
     }
+    if (rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL && failure == nullptr) {
+        // Not a failure and not a device event: the backend admitted nothing
+        // and submitted nothing, so there is no probe to take and no launch to
+        // note. The run keeps its phase and is offered again when credit moves.
+        return NativeLaunch::DiagnosticCreditFull;
+    }
     if (failure == nullptr && rc != 0) {
         // A launch that failed may still have reached the device. The probe decides which, and
         // the answer is an execution fact: a completed one carries this launch's own error into
@@ -1423,6 +1440,7 @@ void ChipWorker::launch_native_run(const ChipWorkerNativeRun &run, void *caller_
         note_native_run_launched(run.run_epoch);
     }
     if (failure != nullptr) std::rethrow_exception(failure);
+    return NativeLaunch::Launched;
 }
 
 bool ChipWorker::launch_native_run_joined(
@@ -1468,7 +1486,12 @@ bool ChipWorker::launch_native_run_joined(
     // The backend refuses this way when it cannot order the two right now, and it changes nothing
     // when it does: the run is still prepared, and the caller launches it ordinarily once it
     // reaches the front.
-    if (failure == nullptr && rc == PTO_RUNTIME_ERR_UNSUPPORTED) {
+    if (failure == nullptr &&
+        (rc == PTO_RUNTIME_ERR_UNSUPPORTED || rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL)) {
+        // Two refusals of the same shape: the backend admitted nothing and
+        // submitted nothing, either because it cannot order the two at all or
+        // because an owner's capacity is held by a run ahead. Both leave the
+        // run prepared, and the caller re-offers it rather than failing it.
         declined = true;
     } else if (failure == nullptr && rc != 0) {
         int poll_rc = 0;

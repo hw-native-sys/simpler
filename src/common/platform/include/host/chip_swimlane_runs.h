@@ -48,6 +48,35 @@ inline constexpr int kControlAckBudgetMs = 2000;
 inline constexpr size_t kErrorMsgBytes = 256;
 
 /**
+ * How long a run at the front of its lane may stay un-admitted for want of
+ * diagnostic credit before it fails.
+ *
+ * Bounded in both directions, which neither prior behaviour was: the swimlane
+ * blocked forever waiting for a bucket, and the other owners refused at once.
+ * The figure matches the only comparable existing default — the 30 s fallback
+ * `simpler_flush_diagnostics_ctx` applies to a non-positive budget — but is a
+ * separate constant, because that one is a flush budget and not a run's.
+ *
+ * Not a user knob, not in `CallConfig`, not in `KernelArgs`: it never crosses
+ * the ABI, and only the per-wait `timeout_ms` derived from it does.
+ */
+inline constexpr int kCreditWaitBudgetMs = 30000;
+
+/**
+ * Why an owner refused to admit a run, as the admission attempt reads it.
+ *
+ * The distinction decides what the caller does next, so it is reported rather
+ * than inferred from a second capacity query: `Capacity` is about right now
+ * and is re-attempted when credit moves, while `Fatal` is about this owner and
+ * re-attempting it would only burn the run's deadline.
+ */
+enum class AdmissionRefusal : int {
+    None = 0,
+    Capacity,
+    Fatal,
+};
+
+/**
  * Why a run's artifact says what it says.
  *
  * `Published` and `PartialSafe` both produce a file; `CutUnknown` produces one

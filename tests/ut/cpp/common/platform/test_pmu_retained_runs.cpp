@@ -682,3 +682,134 @@ TEST(PmuRetainedRuns, RetentionOffKeepsTheSingleRunPath) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// Per-run terminal banks, mapped
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/**
+ * A retained collector whose cores publish their own per-run accounting.
+ *
+ * The bank address normally reaches the cores through the launching run's
+ * kernel arguments, which this collector does not own, so this pushes it and
+ * calls each core's close — exactly where the runner will. `pmu_aicpu_init`
+ * already runs per run and is what starts this run's counters.
+ */
+struct MappedPmuFixture : RetainedPmuFixture {
+    MappedPmuFixture(const char *name, int cores = 1, int threads = 1) :
+        RetainedPmuFixture(name, cores, threads) {
+        EXPECT_TRUE(collector.open_run_terminal_banks(cores));
+        EXPECT_NE(collector.run_terminal_device_address(), 0u);
+    }
+
+    ~MappedPmuFixture() { set_platform_pmu_run_terminal(0); }
+
+    /**
+     * Admit a run and push the bank its admission reserved, which is what the
+     * host does at launch: the device is handed one resolved address per run,
+     * so a successor publishes into its own bank rather than deriving one.
+     */
+    bool begin(uint64_t epoch, const fs::path &csv, PmuEventType event_type = PmuEventType::PIPE_UTILIZATION) {
+        if (!RetainedPmuFixture::begin(epoch, csv, event_type)) return false;
+        const uint64_t bank = collector.run_terminal_bank_address(epoch);
+        EXPECT_NE(bank, 0u) << "an admitted run resolved no terminal bank";
+        set_platform_pmu_run_terminal(bank);
+        return true;
+    }
+
+    /** One run's device side, closed through every core's own entry. */
+    void produce_run(uint64_t epoch, int records, int core = 0, int thread = 0) {
+        produce(epoch, records, core, thread);
+        for (int c = 0; c < num_cores; c++)
+            pmu_aicpu_close_run(c);
+    }
+};
+
+}  // namespace
+
+TEST(PmuRunTerminal, AMappedRunIsSettledFromItsOwnCoreAccounting) {
+    MappedPmuFixture fx("pmu-mapped-settled");
+    const fs::path csv = fx.root.csv("run-a");
+    ASSERT_TRUE(fx.begin(8001, csv));
+    fx.produce_run(8001, /*records=*/3);
+    fx.close(8001);
+
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    EXPECT_TRUE(fs::exists(csv)) << "a run whose cores reported produced no csv";
+}
+
+TEST(PmuRunTerminal, ACoreThatNeverPublishedLeavesTheRunUnknown) {
+    MappedPmuFixture fx("pmu-mapped-missing", /*cores=*/2);
+    const fs::path csv = fx.root.csv("run-a");
+    ASSERT_TRUE(fx.begin(8101, csv));
+    // Core 0 records and publishes; core 1 is a participant this collector
+    // brought up and never closes. The survivors must not be read as the run.
+    fx.produce(8101, /*records=*/2, /*core=*/0);
+    pmu_aicpu_close_run(0);
+    fx.close(8101);
+
+    std::string error;
+    (void)fx.flush(&error);
+    const auto stats = fx.collector.retained_run_stats_for_test();
+    EXPECT_GT(stats.errors.counts_unknown + stats.errors.published_short, 0u)
+        << "a partial core set was reported as a complete run";
+}
+
+TEST(PmuRunTerminal, TheHostDoesNotResetCountersWhenACoreOwnsThem) {
+    MappedPmuFixture fx("pmu-mapped-no-host-reset");
+    const fs::path csv = fx.root.csv("run-a");
+    // The producer's own init is the only thing that zeroes these, so a value
+    // standing before admission survives it and is cleared by the device side.
+    fx.state(0)->total_record_count = 7;
+    ASSERT_TRUE(fx.begin(8201, csv));
+    EXPECT_EQ(fx.state(0)->total_record_count, 7u) << "the host reset counters a core owns";
+
+    fx.produce_run(8201, /*records=*/1);
+    fx.close(8201);
+    std::string error;
+    (void)fx.flush(&error);
+}
+
+TEST(PmuRunTerminal, AFatalOnlyRunIsNotPublishedEmpty) {
+    // The shape the review names: a producer that recorded nothing and latched
+    // a fatal. Every count balances — total 0, published 0, dropped 0, live 0 —
+    // so the only thing distinguishing it from an ordinary empty run is the
+    // fatal, and dropping it on the way out of the terminal publishes the run
+    // as empty and successful.
+    //
+    // Exercised through `classify` directly rather than through the fixture:
+    // `fatal_latched` is a field of the shared per-run terminal, and this
+    // collector's producer has no device-side fatal latch to set it from. The
+    // adapter carries it so that a producer which gains one is not silently
+    // dropped, which is what this holds in place.
+    simpler::dfx::pmu::CutProofs cut;
+    cut.cut_known = true;
+    cut.stage2_done = true;
+
+    simpler::dfx::pmu::RecordProofs clean;
+    clean.device_execution_complete = true;
+    clean.snapshot_readable = true;
+    EXPECT_EQ(
+        simpler::dfx::pmu::classify(cut, clean, /*collected=*/0, /*io_failed=*/false),
+        simpler::dfx::pmu::Verdict::PublishedEmpty
+    );
+
+    simpler::dfx::pmu::RecordProofs fatal = clean;
+    fatal.fatal_latched = true;
+    EXPECT_EQ(
+        simpler::dfx::pmu::classify(cut, fatal, /*collected=*/0, /*io_failed=*/false),
+        simpler::dfx::pmu::Verdict::PublishedShort
+    ) << "a latched fatal was lost and the run published as empty";
+
+    // And with records, where the counts also balance on their own.
+    simpler::dfx::pmu::RecordProofs fatal_with_records = clean;
+    fatal_with_records.fatal_latched = true;
+    fatal_with_records.total_device = 4;
+    EXPECT_EQ(
+        simpler::dfx::pmu::classify(cut, fatal_with_records, /*collected=*/4, /*io_failed=*/false),
+        simpler::dfx::pmu::Verdict::PublishedShort
+    );
+}

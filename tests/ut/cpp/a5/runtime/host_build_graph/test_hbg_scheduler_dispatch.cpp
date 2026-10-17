@@ -11,6 +11,8 @@
 
 #include <gtest/gtest.h>
 
+#include <iterator>
+
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -1502,9 +1504,16 @@ TEST(SchedulerLocalConfig, RejectsTruncatedOffsetsAndInconsistentPayloadRoutes) 
         EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
         context.*field = 0;
     }
-    context.topology_reserved[2] = 1;
-    EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
-    context.topology_reserved[2] = 0;
+    // Every word of the reserved tail, by its own extent. A field taken out of
+    // this array is a field a producer writes, so a validation whose bound
+    // outlives the array would read the next member instead — and this loop is
+    // what makes that a test failure rather than a run that refuses to boot.
+    for (size_t index = 0; index < std::size(context.topology_reserved); ++index) {
+        context.topology_reserved[index] = 1;
+        EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local))
+            << "reserved tail word " << index << " is not validated";
+        context.topology_reserved[index] = 0;
+    }
     storage.contexts[0].core_type = 2;
     EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);

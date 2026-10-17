@@ -51,6 +51,10 @@ int DepGenCollector::init(
     int num_threads, const DepGenAllocCallback &alloc_cb, DepGenRegisterCallback register_cb,
     const DepGenFreeCallback &free_cb, int device_id
 ) {
+    if (terminal_banks_.backing_retained()) {
+        LOG_ERROR("DepGenCollector: terminal backing still requires cleanup before initialization");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     if (initialized_) {
         // Already holding this run's device resources. They are not per-run:
         // configuration arrives via begin_run() and the layout is fixed at
@@ -153,15 +157,74 @@ int DepGenCollector::init(
         alloc_cb, register_cb, free_cb, profiling_copy_to_device_or_null(), profiling_copy_from_device_or_null(),
         shm_dev_local, shm_host_local, shm_size, device_id
     );
+    device_alloc_cb_ = alloc_cb;
+    device_free_cb_ = free_cb;
+    bank_free_cb_ = free_cb;
     initialized_ = true;
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Per-run terminal banks
+// ---------------------------------------------------------------------------
+
+void *DepGenCollector::bank_alloc(void *owner, size_t bytes, void **host_out) {
+    auto *self = static_cast<DepGenCollector *>(owner);
+    // Paired, because an allocation's host readability is a property of how it
+    // was mapped and not of the platform: the raw device allocator alone leaves
+    // an address this process may not dereference. Kept out of the buffer
+    // pool's mapping table, whose teardown would free it on a path that proves
+    // nothing about this collector's producers.
+    return self->alloc_unmanaged_paired_buffer(bytes, host_out);
+}
+
+int DepGenCollector::bank_unmap(void *owner, void *device_ptr) {
+    auto *self = static_cast<DepGenCollector *>(owner);
+    return self->unmap_unmanaged_paired_buffer(device_ptr, self->bank_unregister_cb_);
+}
+
+int DepGenCollector::bank_free(void *owner, void *device_ptr) {
+    auto *self = static_cast<DepGenCollector *>(owner);
+    if (self->bank_free_cb_ == nullptr || device_ptr == nullptr) return -1;
+    // The allocator's own status, reported rather than dropped: a refused free
+    // may leave the allocator still owning the pointer, and the bank array is
+    // the memory a producer writes.
+    return self->bank_free_cb_(device_ptr);
+}
+
+int DepGenCollector::bank_copy(
+    void *owner, void *host_dst, const void *device_src, const void *host_src, size_t bytes
+) {
+    auto *self = static_cast<DepGenCollector *>(owner);
+    // Both addresses and this collector's own copy context, so the shared rule
+    // reads the mapping this allocation actually has rather than the one its
+    // platform usually gives.
+    return simpler::dfx::credit::read_run_terminal_bank(host_dst, device_src, host_src, bytes, self->copy_from_device_);
+}
+
+int DepGenCollector::bank_initialize(void *owner, void *device_dst, void *host_dst, const void *initial, size_t bytes) {
+    auto *self = static_cast<DepGenCollector *>(owner);
+    return simpler::dfx::credit::initialize_run_terminal_bank(
+        device_dst, host_dst, initial, bytes, self->copy_to_device_
+    );
+}
+
+bool DepGenCollector::open_run_terminal_banks(int expected_producers) {
+    if (!retain_across_runs_) return false;
+    if (shm_host_ == nullptr || device_alloc_cb_ == nullptr || device_free_cb_ == nullptr) return false;
+    if (expected_producers != DEP_GEN_TERMINAL_PRODUCERS) return false;
+    return terminal_banks_.open(
+        DEP_GEN_TERMINAL_PRODUCERS, expected_producers, this, &DepGenCollector::bank_alloc,
+        &DepGenCollector::bank_unmap, &DepGenCollector::bank_free, &DepGenCollector::bank_copy,
+        &DepGenCollector::bank_initialize
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Record accumulation (in-memory — no disk hop)
 // ---------------------------------------------------------------------------
 
-bool DepGenCollector::begin_run() {
+void DepGenCollector::begin_run_host_state() {
     {
         std::scoped_lock lock(records_mutex_);
         records_by_run_.clear();
@@ -180,6 +243,10 @@ bool DepGenCollector::begin_run() {
         charged = retained_records_.release();
     }
     if (charged > 0) credit_record_block(charged);
+}
+
+bool DepGenCollector::begin_run() {
+    begin_run_host_state();
 
     // Nothing on the device yet before the first init(); its memset covers this.
     if (shm_host_ == nullptr) return true;
@@ -244,6 +311,54 @@ void DepGenCollector::append_buffer_records(const void *buf_host_ptr) {
     // boundary, so one owner rather than a plain field two locks reach.
     if (clamped) host_clamped_ = true;
     if (n == 0) return;
+    if (retain_across_runs_ && retained_ready_ && terminal_banks_.opened()) {
+        // More than one run can be open, so the identity the producer stamped
+        // picks the receipts rather than being checked against the one admitted
+        // epoch. A stamp naming no open run is still foreign — filing it under a
+        // fresh key would make a stray buffer look like a graph — but a
+        // successor's records are no longer foreign merely because its
+        // predecessor has not sealed.
+        RunReceipts *owner = nullptr;
+        for (RunReceipts &entry : run_receipts_) {
+            if (entry.open && entry.run_epoch == run_epoch) {
+                owner = &entry;
+                break;
+            }
+        }
+        if (owner == nullptr) {
+            foreign_epoch_records_ += n;
+            LOG_ERROR(
+                "dep_gen: %u records arrived stamped 0x%llx, which names no admitted run — no graph claims them", n,
+                static_cast<unsigned long long>(run_epoch)
+            );
+            total_collected_ += n;
+            return;
+        }
+        if (clamped) owner->clamped = true;
+        for (uint32_t i = 0; i < n; i++) {
+            const bool stored = owner->records.append(
+                buf->records[i],
+                [this](size_t bytes) {
+                    return charge_record_block(bytes);
+                },
+                [this](size_t bytes) {
+                    credit_record_block(bytes);
+                }
+            );
+            if (!stored) {
+                // Counted as received and not retained. A graph missing edges
+                // is not a graph, so this run publishes nothing — but the
+                // receive path is never blocked and nothing is allocated here.
+                owner->refused += static_cast<uint64_t>(n - i);
+                owner->received += n;
+                total_collected_ += n;
+                return;
+            }
+        }
+        owner->received += n;
+        total_collected_ += n;
+        return;
+    }
     if (retain_across_runs_ && retained_ready_) {
         // Grouping by whatever epoch a buffer carries is not identity: an
         // epoch this collector never admitted names no run, and filing it
@@ -285,6 +400,41 @@ void DepGenCollector::append_buffer_records(const void *buf_host_ptr) {
     total_collected_ += n;
 }
 
+bool DepGenCollector::open_run_receipts(uint64_t run_epoch) {
+    std::scoped_lock lock(records_mutex_);
+    for (const RunReceipts &entry : run_receipts_) {
+        // One identity, one entry: a repeated admission of the same run would
+        // otherwise split its edges across two of them.
+        if (entry.open && entry.run_epoch == run_epoch) return false;
+    }
+    for (RunReceipts &entry : run_receipts_) {
+        if (entry.open) continue;
+        const size_t charged = entry.records.release();
+        if (charged > 0) credit_record_block(charged);
+        entry.run_epoch = run_epoch;
+        entry.received = 0;
+        entry.refused = 0;
+        entry.clamped = false;
+        entry.open = true;
+        return true;
+    }
+    return false;
+}
+
+void DepGenCollector::drop_run_receipts(uint64_t run_epoch) {
+    size_t charged = 0;
+    {
+        std::scoped_lock lock(records_mutex_);
+        for (RunReceipts &entry : run_receipts_) {
+            if (!entry.open || entry.run_epoch != run_epoch) continue;
+            charged = entry.records.release();
+            entry = RunReceipts{};
+            break;
+        }
+    }
+    if (charged > 0) credit_record_block(charged);
+}
+
 // ---------------------------------------------------------------------------
 // ProfilerBase callback
 // ---------------------------------------------------------------------------
@@ -298,6 +448,36 @@ void DepGenCollector::on_buffer_collected(const DepGenReadyBufferInfo &info) {
 // ---------------------------------------------------------------------------
 
 bool DepGenCollector::reconcile_counters() { return reconcile_report().clean; }
+
+simpler::dfx::dep_gen_runs::ReconcileReport
+DepGenCollector::reconcile_report_from_terminal(uint64_t run_epoch, simpler::dfx::credit::Reservation &bank) {
+    report_drain_drops();
+    bool clamped = false;
+    bool foreign = false;
+    uint64_t received = 0;
+    {
+        std::scoped_lock lock(records_mutex_);
+        // This run's own receipts, not the collector's running totals: a
+        // predecessor's or a successor's arrivals are counted in their own
+        // entries, and comparing against a shared total would charge this run
+        // for theirs. `foreign_epoch_records_` stays collector-wide, because a
+        // record naming no admitted run belongs to none of them.
+        const RunReceipts *owner = nullptr;
+        for (const RunReceipts &entry : run_receipts_) {
+            if (entry.open && entry.run_epoch == run_epoch) {
+                owner = &entry;
+                break;
+            }
+        }
+        clamped = owner != nullptr ? owner->clamped : host_clamped_;
+        const uint64_t refused = owner != nullptr ? owner->refused : refused_records_;
+        foreign = foreign_epoch_records_ > 0 || refused > 0;
+        received = owner != nullptr ? owner->received : total_collected_;
+    }
+    return simpler::dfx::dep_gen_runs::reconcile_from_terminal(
+        terminal_banks_.settle(bank, run_epoch, received), clamped, foreign
+    );
+}
 
 simpler::dfx::dep_gen_runs::ReconcileReport DepGenCollector::reconcile_report() {
     simpler::dfx::dep_gen_runs::ReconcileReport out;
@@ -439,6 +619,26 @@ void DepGenCollector::finalize(DepGenUnregisterCallback unregister_cb, const Dep
     if (!initialized_) return;
 
     stop();
+
+    // Released through this teardown's own callback, the one that also frees
+    // `state->current_buf_ptr` below — a buffer a producer writes into — so
+    // the array follows exactly the policy the caller chose for every other
+    // device resource here: freed on the ordinary paths, and abandoned
+    // untouched on a teardown whose callback frees nothing. The init-time
+    // allocator is deliberately not used: it would hand this memory back on a
+    // path where the caller abandoned everything else.
+    // A release the callback refuses leaves the array mapped and reported.
+    bank_free_cb_ = free_cb;
+    bank_unregister_cb_ = unregister_cb;
+    const auto bank_release = terminal_banks_.release_backing(/*device_stopped=*/true);
+    if (terminal_banks_.backing_retained()) {
+        note_host_failure(
+            bank_release == simpler::dfx::credit::RunTerminalBanks::Release::FreeFailed ?
+                "the device refused this collector's per-run terminal bank array; it stays mapped" :
+                "this collector's per-run terminal bank array could not be released and stays mapped"
+        );
+        return;
+    }
 
     // `stop()` is the reader join, so this is the first point at which the
     // quarantined host copies are nobody's to append to. Disposing them here

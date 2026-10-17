@@ -165,10 +165,71 @@ void ArgsDumpCollector::merge_collector_shards() {
     collector_shards_merged_ = true;
 }
 
+void *ArgsDumpCollector::bank_alloc(void *owner, size_t bytes, void **host_out) {
+    auto *self = static_cast<ArgsDumpCollector *>(owner);
+    // Paired, because an allocation's host readability is a property of how it
+    // was mapped and not of the platform: the raw device allocator alone leaves
+    // an address this process may not dereference. Kept out of the buffer
+    // pool's mapping table, whose teardown would free it on a path that proves
+    // nothing about this collector's producers.
+    return self->alloc_unmanaged_paired_buffer(bytes, host_out);
+}
+
+int ArgsDumpCollector::bank_unmap(void *owner, void *device_ptr) {
+    auto *self = static_cast<ArgsDumpCollector *>(owner);
+    return self->unmap_unmanaged_paired_buffer(device_ptr, self->bank_unregister_cb_);
+}
+
+int ArgsDumpCollector::bank_free(void *owner, void *device_ptr) {
+    auto *self = static_cast<ArgsDumpCollector *>(owner);
+    if (self->bank_free_cb_ == nullptr || device_ptr == nullptr) return -1;
+    // The allocator's own status, reported rather than dropped: a refused free
+    // may leave the allocator still owning the pointer, and the bank array is
+    // the memory a producer writes.
+    return self->bank_free_cb_(device_ptr);
+}
+
+int ArgsDumpCollector::bank_copy(
+    void *owner, void *host_dst, const void *device_src, const void *host_src, size_t bytes
+) {
+    auto *self = static_cast<ArgsDumpCollector *>(owner);
+    // Both addresses and this collector's own copy context, so the shared rule
+    // reads the mapping this allocation actually has rather than the one its
+    // platform usually gives.
+    return simpler::dfx::credit::read_run_terminal_bank(host_dst, device_src, host_src, bytes, self->copy_from_device_);
+}
+
+int ArgsDumpCollector::bank_initialize(
+    void *owner, void *device_dst, void *host_dst, const void *initial, size_t bytes
+) {
+    auto *self = static_cast<ArgsDumpCollector *>(owner);
+    return simpler::dfx::credit::initialize_run_terminal_bank(
+        device_dst, host_dst, initial, bytes, self->copy_to_device_
+    );
+}
+
+bool ArgsDumpCollector::open_run_terminal_banks(int expected_producers) {
+    if (!retain_across_runs_) return false;
+    if (shm_host_ == nullptr || device_alloc_cb_ == nullptr || device_free_cb_ == nullptr) return false;
+    // One producer per dump thread, in a bank dimensioned by the platform
+    // maximum: the stride is what the device indexes by thread, the expected
+    // count is what this collector brought up.
+    if (expected_producers != num_dump_threads_ || expected_producers <= 0) return false;
+    return terminal_banks_.open(
+        PLATFORM_MAX_AICPU_THREADS, expected_producers, this, &ArgsDumpCollector::bank_alloc,
+        &ArgsDumpCollector::bank_unmap, &ArgsDumpCollector::bank_free, &ArgsDumpCollector::bank_copy,
+        &ArgsDumpCollector::bank_initialize
+    );
+}
+
 int ArgsDumpCollector::initialize(
     int num_dump_threads, int device_id, DumpArgsLevel dump_args_level, const DumpAllocCallback &alloc_cb,
     DumpRegisterCallback register_cb, const DumpFreeCallback &free_cb
 ) {
+    if (terminal_banks_.backing_retained()) {
+        LOG_ERROR("ArgsDumpCollector: terminal backing still requires cleanup before initialization");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     if (shm_host_ != nullptr) {
         // Already holding this run's device resources. They are not per-run:
         // configuration arrives via begin_run() and the layout is fixed at
@@ -176,6 +237,9 @@ int ArgsDumpCollector::initialize(
         return 0;
     }
     dump_args_level_ = dump_args_level;
+    device_alloc_cb_ = alloc_cb;
+    device_free_cb_ = free_cb;
+    bank_free_cb_ = free_cb;
     if (num_dump_threads <= 0 || num_dump_threads > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR(
             "ArgsDumpCollector::initialize: invalid num_dump_threads=%d (valid range: 1-%d)", num_dump_threads,
@@ -1014,6 +1078,27 @@ int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Dump
 
     // Stop mgmt + collector threads if the caller didn't already (idempotent).
     stop();
+
+    // Released through this teardown's own callback, the one that also frees
+    // each thread's `current_buf_ptr` below — buffers a producer writes into —
+    // so the array follows exactly the policy the caller chose for every other
+    // device resource here: freed on the ordinary paths, and abandoned
+    // untouched on a teardown whose callback frees nothing. The init-time
+    // allocator is deliberately not used: it would hand this memory back on a
+    // path where the caller abandoned everything else. A release the callback
+    // refuses leaves the array mapped, and this entry already has a return
+    // code to report it with.
+    bank_free_cb_ = free_cb;
+    bank_unregister_cb_ = unregister_cb;
+    const auto bank_release = terminal_banks_.release_backing(/*device_stopped=*/true);
+    if (terminal_banks_.backing_retained()) {
+        if (bank_release == simpler::dfx::credit::RunTerminalBanks::Release::FreeFailed) {
+            LOG_ERROR("Args dump: the device refused the per-run terminal bank array; it stays mapped");
+        } else {
+            LOG_ERROR("Args dump: the per-run terminal bank array could not be released and stays mapped");
+        }
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
 
     if (retain_across_runs_) {
         // Only now: the shards whose references a quarantined run could not

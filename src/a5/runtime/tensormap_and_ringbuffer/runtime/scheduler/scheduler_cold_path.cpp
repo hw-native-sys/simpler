@@ -685,6 +685,10 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
     // shutdown. A fatal run ends in a host-side device reset, so counters read
     // here would not survive into the next generation.
     if (is_pmu_enabled() && !fatal_shutdown_started_.load(std::memory_order_acquire)) {
+        // Settle this run's per-core accounting before the registers are
+        // restored and the cores retired: those are what stop the producer,
+        // and this reads what the producer wrote.
+        pmu_aicpu_close_run_cores(core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num());
         pmu_aicpu_finalize(core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num());
     }
 #endif

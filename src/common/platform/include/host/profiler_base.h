@@ -1008,6 +1008,7 @@ public:
 
 private:
     friend Derived;
+    friend struct ProfilerBaseTestPeer;
     ProfilerBase() = default;
     ~ProfilerBase() = default;
 
@@ -1647,6 +1648,70 @@ protected:
         if (rc != 0) manager_.note_release_failed(dev_ptr, rc);
     }
 
+    /**
+     * Allocate a buffer the collector owns outside the manager's mapping
+     * table, together with whatever host view this platform gives it.
+     *
+     * The pairing is `alloc_paired_buffer`'s, and for the same reason: an
+     * allocation's host readability is a property of how it was mapped, never
+     * of which platform it is on. What differs is ownership. `alloc_paired_buffer`
+     * registers the mapping with the buffer pool, whose teardown then frees the
+     * pointer — and a per-run terminal bank is released only on a proof about
+     * the device that no teardown can make, so this keeps the pointer out of
+     * that table and leaves the release to its owner.
+     *
+     * `*host_out` is the address the host may dereference, and is null on a
+     * platform that mirrors by copying: there is no host view of that memory,
+     * and a reader has to go through `copy_from_device`. It is **not** a
+     * malloc'd shadow here — a caller that needs host storage brings its own.
+     */
+    void *alloc_unmanaged_paired_buffer(size_t size, void **host_out) {
+        if (host_out == nullptr) return nullptr;
+        *host_out = nullptr;
+        if (!alloc_cb_ || size == 0) return nullptr;
+
+        void *dev_ptr = alloc_cb_(size);
+        if (dev_ptr == nullptr) return nullptr;
+
+        if (register_cb_ != nullptr) {
+            void *host_ptr = nullptr;
+            const int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
+            if (rc != 0 || host_ptr == nullptr) {
+                LOG_ERROR("ProfilerBase::alloc_unmanaged_paired_buffer: register_cb_ failed: %d", rc);
+                release_unregistered_buffer(dev_ptr);
+                return nullptr;
+            }
+            *host_out = host_ptr;
+        } else if (!copy_from_device_) {
+            // Neither a registration step nor a copy shim: this platform's
+            // device memory is the host's own, so the allocation is already
+            // the host view of itself.
+            *host_out = dev_ptr;
+        }
+        return dev_ptr;
+    }
+
+    /**
+     * Take down the host mapping `alloc_unmanaged_paired_buffer` installed,
+     * before its memory is released.
+     *
+     * Separate from the free so that each outcome is recordable on its own:
+     * an unregister that succeeded and a free that then failed leave the
+     * memory held with no mapping, and a retry must not unregister a second
+     * time. Returns 0 when there is no mapping to take down, because then
+     * there is nothing this step could fail at.
+     */
+    int unmap_unmanaged_paired_buffer(void *dev_ptr, ProfUnregisterCallback unregister_cb) {
+        if (dev_ptr == nullptr) return -1;
+        if (register_cb_ == nullptr) return 0;
+        // Registration exists even when its teardown callback has not yet
+        // arrived from finalize. Keep the mapped allocation until it does.
+        if (unregister_cb == nullptr) return -1;
+        const int rc = unregister_cb(dev_ptr, device_id_);
+        if (rc != 0) LOG_ERROR("halHostUnregister failed for dev_ptr %p: %d", dev_ptr, rc);
+        return rc;
+    }
+
     // -------------------------------------------------------------------------
     // Cross-run transport cut
     // -------------------------------------------------------------------------
@@ -1883,6 +1948,100 @@ protected:
     /** A transport counter ran out of headroom; no cut can be trusted after this. */
     bool cut_counters_exhausted() const { return cut_counter_exhausted_.load(std::memory_order_acquire); }
 
+    struct TransportFailureSnapshot {
+        struct Shard {
+            uint64_t capture_ack{0};
+            uint64_t control_ack{0};
+            uint64_t pushed{0};
+            uint64_t processed{0};
+            uint64_t watermark{0};
+            uint8_t stage1{0};
+        };
+        struct Queue {
+            uint64_t consumed{0};
+            uint8_t state{0};
+        };
+        std::array<Shard, Manager::kMaxCollectorShards> shards{};
+        std::array<Queue, kMaxCutQueues> queues{};
+        uint64_t capture_request{0};
+        uint64_t control_epoch{0};
+        int shard_count{0};
+        int queue_count{0};
+        int cut_state{-1};
+        bool exhausted{false};
+    };
+
+    /**
+     * Failure evidence only: these acquire loads are a mixed-time observation,
+     * never a completion proof. Dimensions are fixed before workers start.
+     * No device read, plain cut target or worker-owned container is inspected.
+     */
+    TransportFailureSnapshot transport_failure_snapshot(int slot) const noexcept {
+        TransportFailureSnapshot out;
+        out.shard_count = std::max(0, std::min(shard_count_, Manager::kMaxCollectorShards));
+        out.queue_count = std::max(0, std::min(queue_count_, static_cast<int>(kMaxCutQueues)));
+        out.capture_request = cut_request_.load(std::memory_order_acquire);
+        out.control_epoch = control_epoch_.load(std::memory_order_acquire);
+        out.exhausted = cut_counter_exhausted_.load(std::memory_order_acquire);
+        const CutSlot *cut = slot >= 0 && static_cast<size_t>(slot) < kMaxCutSlots ? &cut_slots_[slot] : nullptr;
+        if (cut != nullptr) out.cut_state = cut->state.load(std::memory_order_acquire);
+        for (int i = 0; i < out.shard_count; i++) {
+            auto &shard = out.shards[i];
+            shard.capture_ack = cut_ack_[i].load(std::memory_order_acquire);
+            shard.control_ack = control_acked_[i].load(std::memory_order_acquire);
+            shard.pushed = pushed_total_[i].load(std::memory_order_acquire);
+            shard.processed = ring_processed_[i].load(std::memory_order_acquire);
+            if (cut != nullptr) {
+                shard.stage1 = cut->stage1[i].load(std::memory_order_acquire);
+                shard.watermark = cut->push_watermark[i].load(std::memory_order_acquire);
+            }
+        }
+        for (int q = 0; q < out.queue_count; q++) {
+            out.queues[q].consumed = consumed_total_[q].load(std::memory_order_acquire);
+            if (cut != nullptr) out.queues[q].state = cut->qstate[q].load(std::memory_order_acquire);
+        }
+        return out;
+    }
+
+    /** Bounded failure-only output; a logger failure cannot replace the original error. */
+    void log_transport_failure(
+        const char *reason, uint64_t run_epoch, int slot, uint64_t cut_request, uint64_t reference_request
+    ) const noexcept {
+        try {
+            const auto snapshot = transport_failure_snapshot(slot);
+            LOG_ERROR(
+                "%s transport failure: reason=%s run=%llu cut=%d request=%llu capture_now=%llu "
+                "reference_request=%llu control_now=%llu state=%d exhausted=%d shards=%d queues=%d "
+                "mixed_time=1 (diagnostic only)",
+                Module::kSubsystemName, reason, static_cast<unsigned long long>(run_epoch), slot,
+                static_cast<unsigned long long>(cut_request), static_cast<unsigned long long>(snapshot.capture_request),
+                static_cast<unsigned long long>(reference_request),
+                static_cast<unsigned long long>(snapshot.control_epoch), snapshot.cut_state, snapshot.exhausted ? 1 : 0,
+                snapshot.shard_count, snapshot.queue_count
+            );
+            for (int i = 0; i < snapshot.shard_count; i++) {
+                const auto &shard = snapshot.shards[i];
+                LOG_ERROR(
+                    "%s transport shard: run=%llu cut=%d shard=%d capture_ack=%llu control_ack=%llu "
+                    "stage1=%u pushed=%llu watermark=%llu processed=%llu",
+                    Module::kSubsystemName, static_cast<unsigned long long>(run_epoch), slot, i,
+                    static_cast<unsigned long long>(shard.capture_ack),
+                    static_cast<unsigned long long>(shard.control_ack), static_cast<unsigned>(shard.stage1),
+                    static_cast<unsigned long long>(shard.pushed), static_cast<unsigned long long>(shard.watermark),
+                    static_cast<unsigned long long>(shard.processed)
+                );
+            }
+            for (int q = 0; q < snapshot.queue_count; q++) {
+                LOG_ERROR(
+                    "%s transport queue: run=%llu cut=%d queue=%d state=%u consumed=%llu", Module::kSubsystemName,
+                    static_cast<unsigned long long>(run_epoch), slot, q,
+                    static_cast<unsigned>(snapshot.queues[q].state),
+                    static_cast<unsigned long long>(snapshot.queues[q].consumed)
+                );
+            }
+        } catch (...) {}
+    }
+
     /**
      * Publish a reference-release request and wait for every collector shard.
      *
@@ -1891,7 +2050,8 @@ protected:
      * the caller marked an epoch non-admitting. Returns false on timeout, and a
      * false return is never permission to free: the caller quarantines.
      */
-    bool request_run_reference_release(int timeout_ms) {
+    bool request_run_reference_release(int timeout_ms, uint64_t *request_out = nullptr) {
+        if (request_out != nullptr) *request_out = 0;
         // One requester at a time. Two overlapping requests would each wait for
         // their own epoch value while a shard, which only ever adopts the
         // newest, could skip the older one entirely — so the older waiter would
@@ -1902,6 +2062,7 @@ protected:
             return false;
         }
         const uint64_t epoch = control_epoch_.fetch_add(1, std::memory_order_acq_rel) + 1;
+        if (request_out != nullptr) *request_out = epoch;
         manager_.notify_ready_waiters();
         std::unique_lock<std::mutex> wait_lk(cut_mu_);
         return cut_cv_.wait_for(wait_lk, std::chrono::milliseconds(timeout_ms), [this, epoch] {

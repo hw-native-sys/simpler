@@ -171,9 +171,20 @@ extern "C" int joined_diagnostic_launch_supported_impl(void) {
     // own record counters at init, so no host write lands on a predecessor
     // that is still recording.
     //
-    // Declared separately from the ordering capability above because three
-    // runtimes answer that one: making it imply this would make ordinary
-    // non-diagnostic early enqueue elsewhere wait on swimlane bucket capacity.
+    // Declared separately from the ordering capability above because the two
+    // ask different things: that one is about which device regions a run owns,
+    // this one about whether a collector can hold a second run open. Making
+    // either imply the other would tie ordinary non-diagnostic early enqueue
+    // to swimlane bucket capacity.
+    return 1;
+}
+
+extern "C" int args_dump_capture_supported_impl(void) {
+    // An AICPU scheduler thread hands each task to its core and reaps its
+    // completion on this runtime — there is no on-core scheduling route here —
+    // so `dump_args_for_task` runs at both of a task's own boundaries
+    // (scheduler_dispatch.cpp, scheduler_completion.cpp, and the cold path's
+    // inline dispatch).
     return 1;
 }
 

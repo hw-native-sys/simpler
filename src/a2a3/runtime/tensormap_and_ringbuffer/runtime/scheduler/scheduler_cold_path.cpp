@@ -659,6 +659,10 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx, Runtime *runtime) {
     // not survive into the next generation. Retirement below still runs: it is
     // what releases this thread's workers, and no other path will.
     if (is_pmu_enabled() && !fatal_shutdown_started_.load(std::memory_order_acquire)) {
+        // Settle this run's per-core accounting before the registers are
+        // restored and the cores retired: those are what stop the producer,
+        // and this reads what the producer wrote.
+        pmu_aicpu_close_run_cores(cores, core_num);
         pmu_aicpu_finalize(cores, core_num);
     }
 #endif

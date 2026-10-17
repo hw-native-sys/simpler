@@ -423,6 +423,24 @@ its task ids. AICore is the
 canonical producer of `task_token`; the Scheduler producer stamps the
 dispatch / finish timestamps and the per-core join token.
 
+**A host-side section belongs to the run that published it.** `aicore_tasks`
+and `scheduler_tasks` are published by the runtime through
+`HostApi::publish_chip_swimlane_extension`, which carries the publishing run's
+own epoch, and a retaining collector stores the section in that run's bucket.
+That addressing is load-bearing under a joined launch: the successor is admitted
+while the predecessor is still executing, so the predecessor publishes *after*
+the admission that would have cleared any shared slot — one resident slot then
+belongs to neither run, and the collector would hand the predecessor's rows to
+the successor's artifact (where their `run_epoch` column, correctly, matches
+nothing the successor executed) while refusing the successor's own publication
+as a double write. A section naming a run the collector does not hold open is
+refused rather than stored anywhere, and the per-run host budget is charged at
+the publication, against that run's bucket, measured from the caller's bytes so
+a payload the budget refuses is never copied. A section is accepted only while
+that run's bucket is still `Admitting` — the window between its `run_begin` and
+its `run_close` — because after the close the bucket's storage belongs to the
+writer that may publish and release it at any moment.
+
 These artifacts carry no schema version. They are written by platform C++ in
 this repo and read by `swimlane_converter.py` from the same checkout and the
 same build, so a declared number could never disagree with the rows it

@@ -113,6 +113,15 @@ bool SimDeviceRunnerBase::try_acquire_native_run(
     return true;
 }
 
+bool SimDeviceRunnerBase::reissue_launch_permit(
+    const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit
+) {
+    if (owner == nullptr || permit == nullptr) return false;
+    if (active_native_run_.load(std::memory_order_acquire) != owner) return false;
+    *permit = LaunchPermit(identity);
+    return true;
+}
+
 void SimDeviceRunnerBase::release_native_run(const void *owner) {
     if (active_native_run_.load(std::memory_order_acquire) != owner) return;
     const void *expected = owner;
@@ -1012,6 +1021,7 @@ extern "C" __attribute__((weak)) int prewarm_config_impl(
 
 void SimDeviceRunnerBase::apply_call_config(const CallConfig &config) {
     set_chip_swimlane_enabled(config.enable_chip_swimlane);
+    set_pmu_enabled(config.enable_pmu > 0);
     set_output_prefix(config.output_prefix);
 }
 
@@ -1056,8 +1066,40 @@ void SimDeviceRunnerBase::publish_host_phase_records_to_swimlane(uint32_t pipeli
 }
 
 int SimDeviceRunnerBase::start_shared_collectors_for_run(
-    const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata
+    const DfxRunConfig &dfx, uint64_t run_epoch, const RunLocalDfxMetadata &run_metadata, DiagnosticAdmission *admission
 ) {
+    // Read before the first owner is asked. A release that lands between this
+    // read and a caller's wait has already advanced past it, so the caller
+    // cannot park on a generation that is already stale — the whole of the
+    // lost-wakeup argument.
+    simpler::dfx::runs::AdmissionRefusal why = simpler::dfx::runs::AdmissionRefusal::None;
+    if (admission != nullptr) {
+        *admission = DiagnosticAdmission{};
+        admission->credit_generation = credit_signal_.generation();
+    }
+    auto decline = [&](const char *owner) {
+        if (admission != nullptr) {
+            admission->refusal =
+                why == simpler::dfx::runs::AdmissionRefusal::None ? simpler::dfx::runs::AdmissionRefusal::Fatal : why;
+            admission->owner = owner;
+        }
+    };
+    // All or nothing: an owner that declines after earlier ones admitted gives
+    // their admissions back, and so does an exception unwinding through here.
+    // Withdrawal is by run identity and is a no-op for an owner this run never
+    // reached, so sweeping every enabled owner is exact rather than merely
+    // convenient.
+    bool admitted_all = false;
+    struct RollbackGuard {
+        SimDeviceRunnerBase *self;
+        const DfxRunConfig &dfx;
+        uint64_t run_epoch;
+        const bool *done;
+        ~RollbackGuard() {
+            if (!*done) self->undo_admission_attempt(dfx, run_epoch);
+        }
+    } rollback{this, dfx, run_epoch, &admitted_all};
+
     // Opening a resident collector's window drops the previous run's records and
     // republishes the device level, so it belongs with the start, at launch.
     auto thread_factory = [this](std::function<void()> fn) {
@@ -1073,12 +1115,13 @@ int SimDeviceRunnerBase::start_shared_collectors_for_run(
             chip_swimlane_collector_.start(thread_factory);
             if (!chip_swimlane_collector_.run_begin(
                     run_epoch, dfx.output_prefix, dfx.chip_swimlane_level, run_metadata.core_types,
-                    run_metadata.core_type_count, run_metadata.host_orchestrated, run_metadata.artifact_identity
+                    run_metadata.core_type_count, run_metadata.host_orchestrated, run_metadata.artifact_identity, &why
                 )) {
                 LOG_ERROR(
                     "ChipSwimlane: run %llu was not admitted for retained collection",
                     static_cast<unsigned long long>(run_epoch)
                 );
+                decline("chip_swimlane");
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
@@ -1093,11 +1136,12 @@ int SimDeviceRunnerBase::start_shared_collectors_for_run(
         // zero counters a predecessor's writer is still acknowledging against.
         if (dump_collector_.retains_runs()) {
             dump_collector_.start(thread_factory);
-            if (!dump_collector_.run_begin(run_epoch, dfx.output_prefix, dfx.dump_args_level)) {
+            if (!dump_collector_.run_begin(run_epoch, dfx.output_prefix, dfx.dump_args_level, &why)) {
                 LOG_ERROR(
                     "ArgsDump: run %llu was not admitted for retained collection",
                     static_cast<unsigned long long>(run_epoch)
                 );
+                decline("args_dump");
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
@@ -1115,11 +1159,12 @@ int SimDeviceRunnerBase::start_shared_collectors_for_run(
             // waits for every shard to acknowledge the new epoch table, and a
             // shard that has not been spawned cannot acknowledge anything.
             pmu_collector_.start(thread_factory);
-            if (!pmu_collector_.run_begin(run_epoch, make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type)) {
+            if (!pmu_collector_.run_begin(run_epoch, make_pmu_csv_path(dfx.output_prefix), dfx.pmu_event_type, &why)) {
                 LOG_ERROR(
                     "PmuCollector: run %llu was not admitted for retained collection",
                     static_cast<unsigned long long>(run_epoch)
                 );
+                decline("pmu");
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
@@ -1137,11 +1182,14 @@ int SimDeviceRunnerBase::start_shared_collectors_for_run(
         // whose completion could not be proved is still holding.
         if (scope_stats_collector_.retains_runs()) {
             scope_stats_collector_.start(thread_factory);
-            if (!scope_stats_collector_.run_begin(run_epoch, dfx.output_prefix)) {
+            if (!scope_stats_collector_.run_begin(
+                    run_epoch, dfx.output_prefix, &why, run_metadata.scope_stats_capacity
+                )) {
                 LOG_ERROR(
                     "ScopeStats: run %llu was not admitted for retained collection",
                     static_cast<unsigned long long>(run_epoch)
                 );
+                decline("scope_stats");
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
@@ -1153,6 +1201,11 @@ int SimDeviceRunnerBase::start_shared_collectors_for_run(
             scope_stats_collector_.start(thread_factory);
         }
     }
+    // Every enabled owner admitted. From here the run owns their slots and the
+    // guard must not take them back; the boundary that retires them is this
+    // run's own close, or `withdraw_unlaunched_collectors_for_run` if the
+    // launch turns out to have submitted nothing.
+    admitted_all = true;
     return 0;
 }
 
@@ -1179,26 +1232,64 @@ uint64_t SimDeviceRunnerBase::arm_chip_swimlane_run_terminal_bank(uint64_t run_e
     return reinterpret_cast<uint64_t>(armed);
 }
 
-void SimDeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept {
+void SimDeviceRunnerBase::undo_admission_attempt(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept {
+    bool restored = false;
+    {
+        // Giving an owner's slot back restores the state every waiter already
+        // saw before this attempt, so it is progress for nobody — and notifying
+        // there would wake this very thread onto its own bump, letting a
+        // repeated attempt manufacture its own wake every round while the
+        // blocking owner frees nothing. Thread-local, because the thread
+        // undoing an attempt is the thread that made it; a release on any other
+        // thread still advances past this attempt's snapshot.
+        simpler::dfx::credit::DiagnosticCreditSignal::SuppressSelfNotify quiet;
+        restored = withdraw_unlaunched_collectors_for_run(dfx, run_epoch);
+    }
+    // An owner that could not give its slot back restored nothing: it
+    // quarantined this run or is fatal, and the capacity every waiter last
+    // observed is gone for good. That is a real event — the opposite of the
+    // absence of one — so it is published here, outside the suppression, and a
+    // waiter learns it by re-attempting rather than by spending its whole
+    // deadline on a wake nobody will raise.
+    if (!restored) credit_signal_.advance();
+}
+
+bool SimDeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig &dfx, uint64_t run_epoch) noexcept {
     // Same rule as the onboard base: a launch that submitted nothing leaves an
     // admitted, targetless slot that neither the writer nor a flush can see,
     // and `kMaxOpenEpochs` of them exhaust the capacity the next admission
     // waits on. Nothing may escape, for the reason the onboard base gives.
+    //
+    // The result is each owner's answer to "is this slot back", conjoined: an
+    // owner that never admitted this run answers yes, and one that quarantined
+    // it or is fatal answers no. The caller needs the distinction because only
+    // the first is a restoration of what every waiter already saw.
+    bool restored = true;
     if (dfx.pmu_enabled && pmu_collector_.retains_runs()) {
-        // Nothing may escape a rollback path, for the reason given below.
+        // Nothing may escape a rollback path, for the reason given below. A
+        // throw is not a proof of release, so it settles the way a refusal does.
         try {
-            (void)pmu_collector_.abandon_run(run_epoch);
-        } catch (...) {}
+            restored = pmu_collector_.abandon_run(run_epoch) && restored;
+        } catch (...) {
+            restored = false;
+        }
     }
     if (dfx.dump_args_enabled() && dump_collector_.retains_runs()) {
         try {
-            (void)dump_collector_.abandon_run(run_epoch);
-        } catch (...) {}
+            restored = dump_collector_.abandon_run(run_epoch) && restored;
+        } catch (...) {
+            restored = false;
+        }
     }
     if (dfx.scope_stats_enabled && scope_stats_collector_.retains_runs()) {
+        // Void by contract: this owner holds its own receipts and frees the
+        // slot under its own lock, so it has no acknowledgement to fail and no
+        // quarantine to report from here.
         try {
             scope_stats_collector_.abandon_run(run_epoch);
-        } catch (...) {}
+        } catch (...) {
+            restored = false;
+        }
     }
     // DepGen's admission lives on the arch runner, so it is given back through
     // the hook. This sits with the other per-collector withdrawals and ahead of
@@ -1208,10 +1299,10 @@ void SimDeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunCon
     if (dfx.dep_gen_enabled && dep_gen_retains_runs()) {
         withdraw_dep_gen_run(run_epoch);
     }
-    if (!dfx.chip_swimlane_enabled()) return;
+    if (!dfx.chip_swimlane_enabled()) return restored;
     try {
         if (chip_swimlane_collector_.retains_runs()) {
-            (void)chip_swimlane_collector_.abandon_run(run_epoch);
+            restored = chip_swimlane_collector_.abandon_run(run_epoch) && restored;
         } else {
             // A terminal bank is taken per run whether or not this collector
             // retains output, so its credit is owed back on the same terms.
@@ -1221,7 +1312,10 @@ void SimDeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunCon
             // release is proved rather than assumed.
             chip_swimlane_collector_.release_run_terminal_bank(run_epoch);
         }
-    } catch (...) {}
+    } catch (...) {
+        restored = false;
+    }
+    return restored;
 }
 
 int SimDeviceRunnerBase::flush_diagnostics(int timeout_ms, std::string *error) {
@@ -1328,7 +1422,7 @@ void SimDeviceRunnerBase::write_host_phase_records_artifact(const std::string &o
 }
 
 void SimDeviceRunnerBase::close_pmu_run_boundary(
-    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
     if (!pmu_collector_.retains_runs()) {
         pmu_collector_.quiesce();
@@ -1346,10 +1440,13 @@ void SimDeviceRunnerBase::close_pmu_run_boundary(
     // own close.
     (void)dfx;
     pmu_collector_.run_close(run_epoch, device_execution_complete);
+    simpler::dfx::runs::settle_failed_run_terminal_bank(
+        pmu_collector_, run_epoch, device_execution_complete, device_producers_stopped
+    );
 }
 
 int SimDeviceRunnerBase::close_args_dump_run_boundary(
-    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
     if (!dump_collector_.retains_runs()) {
         dump_collector_.quiesce();
@@ -1366,11 +1463,15 @@ int SimDeviceRunnerBase::close_args_dump_run_boundary(
     // Non-zero when the close could not prove this run's published buffers were
     // processed into host-owned storage inside its execution claim. That is an
     // ownership failure, not a file annotation, so it travels out of here.
-    return dump_collector_.run_close(run_epoch, device_execution_complete);
+    const int rc = dump_collector_.run_close(run_epoch, device_execution_complete);
+    simpler::dfx::runs::settle_failed_run_terminal_bank(
+        dump_collector_, run_epoch, device_execution_complete, device_producers_stopped
+    );
+    return rc;
 }
 
 void SimDeviceRunnerBase::close_scope_stats_run_boundary(
-    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
+    const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
 ) {
     if (!scope_stats_collector_.retains_runs()) {
         scope_stats_collector_.quiesce();
@@ -1385,6 +1486,9 @@ void SimDeviceRunnerBase::close_scope_stats_run_boundary(
     // without it nothing shared is read and the run produces no artifact.
     (void)dfx;
     scope_stats_collector_.run_close(run_epoch, device_execution_complete);
+    simpler::dfx::runs::settle_failed_run_terminal_bank(
+        scope_stats_collector_, run_epoch, device_execution_complete, device_producers_stopped
+    );
 }
 
 int SimDeviceRunnerBase::teardown_shared_collectors_after_run(
@@ -1423,13 +1527,14 @@ int SimDeviceRunnerBase::teardown_shared_collectors_after_run(
         );
         write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
         if (dfx.dump_args_enabled()) {
-            args_dump_rc = close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete);
+            args_dump_rc =
+                close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
         }
         if (dfx.pmu_enabled) {
-            close_pmu_run_boundary(dfx, run_epoch, device_execution_complete);
+            close_pmu_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
         }
         if (dfx.scope_stats_enabled) {
-            close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete);
+            close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
         }
         return args_dump_rc;
     }
@@ -1468,15 +1573,16 @@ int SimDeviceRunnerBase::teardown_shared_collectors_after_run(
     write_host_phase_records_artifact(dfx.output_prefix, pipeline_slot);
 
     if (dfx.dump_args_enabled()) {
-        args_dump_rc = close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete);
+        args_dump_rc =
+            close_args_dump_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
     }
 
     if (dfx.pmu_enabled) {
-        close_pmu_run_boundary(dfx, run_epoch, device_execution_complete);
+        close_pmu_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
     }
 
     if (dfx.scope_stats_enabled) {
-        close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete);
+        close_scope_stats_run_boundary(dfx, run_epoch, device_execution_complete, device_producers_stopped);
     }
     return args_dump_rc;
 }
@@ -1688,4 +1794,116 @@ void SimDeviceRunnerBase::release_callable_state() {
     callables_.clear();
     aicpu_seen_callable_ids_.clear();
     aicpu_dlopen_total_ = 0;
+}
+
+bool SimDeviceRunnerBase::every_enabled_owner_can_admit(const DfxRunConfig &dfx, uint64_t run_epoch) const {
+    // The onboard base's reasoning, on the sim runner's own members: an owner
+    // with no mapped bank cannot tell two open runs apart whatever its
+    // capacity, and an owner with none free declines this round only.
+    if (dfx.chip_swimlane_enabled()) {
+        if (!chip_swimlane_collector_.can_admit_retained_run()) return false;
+        if (!chip_swimlane_collector_.can_take_run_terminal_bank(run_epoch)) return false;
+    }
+    if (dfx.dump_args_enabled()) {
+        if (!dump_collector_.device_publishes_run_terminal()) return false;
+        if (!dump_collector_.can_admit_retained_run()) return false;
+        if (!dump_collector_.can_take_run_terminal_bank(run_epoch)) return false;
+    }
+    if (dfx.pmu_enabled) {
+        if (!pmu_collector_.device_publishes_run_terminal()) return false;
+        if (!pmu_collector_.can_admit_retained_run()) return false;
+        if (!pmu_collector_.can_take_run_terminal_bank(run_epoch)) return false;
+    }
+    // dep_gen's device side exists only where the graph is built on the device,
+    // and the collector itself lives on the arch runner — so both the
+    // host-orch question and the capacity one are answered through the hook.
+    if (dfx.dep_gen_enabled && !dep_gen_can_admit_joined_run(run_epoch)) return false;
+    if (dfx.scope_stats_enabled) {
+        if (!scope_stats_collector_.device_publishes_run_terminal()) return false;
+        if (!scope_stats_collector_.can_admit_retained_run()) return false;
+        if (!scope_stats_collector_.can_take_run_terminal_bank(run_epoch)) return false;
+    }
+    return true;
+}
+
+void SimDeviceRunnerBase::resolve_run_terminal_banks(
+    const DfxRunConfig &dfx, uint64_t run_epoch, KernelArgs &kernel_args
+) const {
+    // Written unconditionally, including the zeroes: the fields mean "this
+    // run's bank", and argument storage is reused across runs, so a field left
+    // alone would hand a successor its predecessor's address.
+    kernel_args.args_dump_run_terminal_bank =
+        dfx.dump_args_enabled() ? dump_collector_.run_terminal_bank_address(run_epoch) : 0;
+    kernel_args.pmu_run_terminal_bank = dfx.pmu_enabled ? pmu_collector_.run_terminal_bank_address(run_epoch) : 0;
+    kernel_args.dep_gen_run_terminal_bank = dfx.dep_gen_enabled ? dep_gen_run_terminal_bank(run_epoch) : 0;
+    kernel_args.scope_stats_run_terminal_bank =
+        dfx.scope_stats_enabled ? scope_stats_collector_.run_terminal_bank_address(run_epoch) : 0;
+}
+
+void SimDeviceRunnerBase::install_credit_release_notifiers() {
+    // Exactly once per runner, and before any collector thread exists: the
+    // first call runs during the first run's arming, which precedes every
+    // `collector.start(thread_factory)`. A second assignment would write a
+    // `std::function` a background writer may be calling at that moment —
+    // releases run outside the collector locks — and assigning the same
+    // lambda is no defence, because the race is on the object and not on its
+    // value. Installed once, the callbacks are immutable for the runner's
+    // life, which is what makes them safe to call from any writer.
+    if (credit_notifiers_installed_) return;
+    credit_notifiers_installed_ = true;
+    // Every collector, not only the ones this run enabled: a collector whose
+    // owner is off raises nothing anyway, and one enabled by a later run must
+    // already be wired when its first writer publishes.
+    auto notify = [this] {
+        credit_signal_.advance();
+    };
+    chip_swimlane_collector_.set_credit_release_notifier(notify);
+    dump_collector_.set_credit_release_notifier(notify);
+    pmu_collector_.set_credit_release_notifier(notify);
+    scope_stats_collector_.set_credit_release_notifier(notify);
+    install_dep_gen_credit_release_notifier(notify);
+}
+
+int SimDeviceRunnerBase::open_run_terminal_banks_for_enabled_owners(const DfxRunConfig &dfx) {
+    install_credit_release_notifiers();
+    // Terminal storage must be initialized before admission. An enabled
+    // retained owner cannot silently fall back to shared live counters.
+    auto report = [](const char *owner, bool opened) -> int {
+        if (opened) return 0;
+        LOG_ERROR("%s: per-run terminal backing could not be initialized", owner);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    };
+    if (dfx.dump_args_enabled() && dump_collector_.retains_runs() && !dump_collector_.device_publishes_run_terminal()) {
+        if (int rc =
+                report("ArgsDump", dump_collector_.open_run_terminal_banks(dump_collector_.terminal_producer_count()));
+            rc != 0)
+            return rc;
+    }
+    if (dfx.pmu_enabled && pmu_collector_.retains_runs() && !pmu_collector_.device_publishes_run_terminal()) {
+        if (int rc = report(
+                "PmuCollector", pmu_collector_.open_run_terminal_banks(pmu_collector_.terminal_producer_count())
+            );
+            rc != 0)
+            return rc;
+    }
+    if (dfx.scope_stats_enabled && scope_stats_collector_.retains_runs() &&
+        !scope_stats_collector_.device_publishes_run_terminal()) {
+        if (int rc =
+                report("ScopeStats", scope_stats_collector_.open_run_terminal_banks(SCOPE_STATS_TERMINAL_PRODUCERS));
+            rc != 0)
+            return rc;
+    }
+    return open_dep_gen_run_terminal_banks(dfx);
+}
+
+bool SimDeviceRunnerBase::retained_consumers_outstanding() const {
+    // An unpublished slot on any owner means a writer may still read that
+    // owner's pools. Asked of every collector rather than only the ones this
+    // run enabled: a rebuild frees what a *previous* run's owner allocated,
+    // and this run's configuration says nothing about that.
+    if (!chip_swimlane_collector_.retained_runs_idle()) return true;
+    if (!dump_collector_.retained_runs_idle()) return true;
+    if (!pmu_collector_.retained_runs_idle()) return true;
+    if (!scope_stats_collector_.retained_runs_idle()) return true;
+    return dep_gen_retained_runs_outstanding();
 }

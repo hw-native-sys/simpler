@@ -100,8 +100,16 @@ bool all_equal(const std::vector<T> &values, T expected) {
     });
 }
 
-bool throwing_extension_callback(void *, ChipSwimlaneExtensionSection, const char *, size_t) {
+bool throwing_extension_callback(void *, uint64_t, ChipSwimlaneExtensionSection, const char *, size_t) {
     throw std::runtime_error("publication failed");
+}
+
+/** Records the run epoch a publication was addressed with. */
+uint64_t g_published_epoch = 0;
+
+bool recording_extension_callback(void *, uint64_t run_epoch, ChipSwimlaneExtensionSection, const char *, size_t) {
+    g_published_epoch = run_epoch;
+    return true;
 }
 
 }  // namespace
@@ -174,6 +182,20 @@ TEST(HostApiTest, PublicationExceptionsBecomeFailureResults) {
     EXPECT_FALSE(api.publish_chip_swimlane_extension(ChipSwimlaneExtensionSection::SchedulerRecords, "{}", 2));
 }
 
+// A publication is addressed by the caller's own run, not by the runner's
+// state: a retaining collector keeps one bucket per open run, and a predecessor
+// publishes after its successor has been admitted.
+TEST(HostApiTest, PublicationCarriesTheCallersOwnRunEpoch) {
+    constexpr uint64_t kEpoch = 4242;
+    HostApiOps ops{};
+    ops.publish_chip_swimlane_extension = recording_extension_callback;
+    const HostApi api(nullptr, /*pipeline_slot=*/0, /*arena_bank=*/0, kEpoch, &ops);
+
+    g_published_epoch = 0;
+    EXPECT_TRUE(api.publish_chip_swimlane_extension(ChipSwimlaneExtensionSection::AicoreTasks, "[]", 2));
+    EXPECT_EQ(g_published_epoch, kEpoch);
+}
+
 TEST(ChipSwimlaneExtensionTest, ExposesOnlyFixedSectionNamesAndShapes) {
     EXPECT_STREQ(chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::AicoreTasks), "aicore_tasks");
     EXPECT_STREQ(
@@ -223,4 +245,27 @@ TEST(HostApi, OrchestrationScratchIsIsolatedByRunnerAndPipelineSlot) {
     const HostApi fallback(nullptr, 0, 0, 0, &unsupported);
     EXPECT_EQ(fallback.get_orchestration_scratch(), nullptr);
     fallback.set_orchestration_scratch({});
+}
+
+TEST(HostApiTest, LegacyDiagnosticQueriesKeepRunnerFallbackAndAbsentDefaults) {
+    HostApiOps ops{};
+    HostApi absent(nullptr, 0, 0, 0, &ops);
+    EXPECT_TRUE(absent.pmu_enabled());
+    EXPECT_EQ(absent.chip_swimlane_level(), 0u);
+    struct Selection {
+        int pmu;
+        uint32_t level;
+    } selection{0, 0};
+    ops.get_pmu_enabled = [](void *ctx) {
+        return static_cast<Selection *>(ctx)->pmu;
+    };
+    ops.get_chip_swimlane_level = [](void *ctx) {
+        return static_cast<Selection *>(ctx)->level;
+    };
+    HostApi legacy(&selection, 0, 0, 0, &ops);
+    EXPECT_FALSE(legacy.pmu_enabled());
+    EXPECT_EQ(legacy.chip_swimlane_level(), 0u);
+    selection = {1, 3};
+    EXPECT_TRUE(legacy.pmu_enabled());
+    EXPECT_EQ(legacy.chip_swimlane_level(), 3u);
 }

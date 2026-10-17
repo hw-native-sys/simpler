@@ -49,7 +49,14 @@ public:
     void arm_host_dep_gen_capture(bool enable) override;
     void configure_dep_gen_retention(bool enabled, std::size_t budget_bytes) override;
     bool dep_gen_retains_runs() const override;
-    int admit_dep_gen_run(const DfxRunConfig &dfx, uint64_t run_epoch) override;
+    int admit_dep_gen_run(
+        const DfxRunConfig &dfx, uint64_t run_epoch, simpler::dfx::runs::AdmissionRefusal *why = nullptr
+    ) override;
+    bool dep_gen_can_admit_joined_run(uint64_t run_epoch) const override;
+    uint64_t dep_gen_run_terminal_bank(uint64_t run_epoch) const override;
+    int open_dep_gen_run_terminal_banks(const DfxRunConfig &dfx) override;
+    void install_dep_gen_credit_release_notifier(const std::function<void()> &notify) override;
+    bool dep_gen_retained_runs_outstanding() const override;
     void withdraw_dep_gen_run(uint64_t run_epoch) noexcept override;
     bool dep_gen_flush_retained(int timeout_ms, std::string *error) override;
     void dep_gen_finish_retained() override;
@@ -87,7 +94,9 @@ private:
      * whole of the completion proof: without it the retained path reads nothing
      * shared and publishes nothing.
      */
-    void emit_device_dep_gen_graph(const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete);
+    void emit_device_dep_gen_graph(
+        const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete, bool device_producers_stopped
+    );
 
     // Per-run collector teardown: releases shared memory back to mem_alloc_.
     // Idempotent. Mirrors the onboard helper.
@@ -97,6 +106,7 @@ private:
      * ArgsDump, whose last host sealing happens there.
      */
     int finalize_collectors();
+    bool terminal_backing_retained() const override;
 
     // a2a3 sim's dlsym'd function-pointer table. Loaded once via
     // ensure_binaries_loaded(), nulled on unload_executor_binaries().
@@ -123,6 +133,12 @@ private:
     void (*set_dep_gen_enabled_func_)(bool){nullptr};
     void (*set_scope_stats_enabled_func_)(bool){nullptr};
     void (*set_platform_scope_stats_base_func_)(uint64_t){nullptr};
+    // This run's terminal bank for each queue-pair owner, pushed per run the
+    // same way the swimlane's is. C linkage on all four, reached by `dlsym`.
+    void (*set_platform_dump_args_run_terminal_func_)(uint64_t){nullptr};
+    void (*set_platform_pmu_run_terminal_func_)(uint64_t){nullptr};
+    void (*set_platform_dep_gen_run_terminal_func_)(uint64_t){nullptr};
+    void (*set_platform_scope_stats_run_terminal_func_)(uint64_t){nullptr};
 
     // dep_gen collector — captures orchestrator submit_task inputs for offline replay.
     // a2a3-only; a5 has no dep_gen.

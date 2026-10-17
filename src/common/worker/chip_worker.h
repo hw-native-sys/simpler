@@ -190,7 +190,17 @@ public:
         uint64_t run_id = 0, uint64_t dispatch_id = 0, volatile int32_t *accepted_state = nullptr,
         int32_t accepted_value = 0, NativeRunProvenance provenance = {}
     );
-    void launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream = nullptr);
+    /**
+     * What a launch attempt did, for the one outcome that is not a failure.
+     *
+     * `DiagnosticCreditFull` means every output slot or terminal bank some
+     * enabled owner needs is still held by a run ahead: nothing was submitted,
+     * nothing was admitted, and the run is unchanged and launchable again once
+     * credit moves. Every other non-zero result still throws, because it is
+     * this run's failure.
+     */
+    enum class NativeLaunch : int { Launched, DiagnosticCreditFull };
+    NativeLaunch launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream = nullptr);
     void validate_caller_stream(void *caller_stream);
     void validate_execution_context() const;
     /**
@@ -443,6 +453,29 @@ public:
      * launch actually arms.
      */
     bool supports_joined_diagnostic_launch(const ChipWorkerNativeRun &run, const ChipWorkerNativeRun &predecessor);
+
+    /**
+     * The device context and the three credit entries, for a caller that must
+     * keep calling them after this worker may be gone.
+     *
+     * Handed out once, to be copied into storage that outlives the worker: a
+     * parked waiter reaches the runtime through that copy, never through
+     * `worker->`, because the lane holds the worker as a raw pointer and a
+     * waiter is exactly the thing that can outlive it.
+     */
+    using CreditGenerationFn = decltype(&simpler_diagnostic_credit_generation_ctx);
+    using CreditWaitFn = decltype(&simpler_wait_diagnostic_credit_ctx);
+    using CreditCancelFn = decltype(&simpler_cancel_diagnostic_credit_waits_ctx);
+
+    struct CreditEntries {
+        void *ctx = nullptr;
+        CreditGenerationFn generation = nullptr;
+        CreditWaitFn wait = nullptr;
+        CreditCancelFn cancel = nullptr;
+    };
+    CreditEntries credit_entries() const {
+        return CreditEntries{device_ctx_, credit_generation_fn_, credit_wait_fn_, credit_cancel_fn_};
+    }
     /**
      * Whether this worker holds a live communication session or global domain.
      *
@@ -649,6 +682,12 @@ private:
     SupportsConcurrentNativePrepareFn supports_concurrent_native_prepare_fn_ = nullptr;
     SupportsConcurrentNativePrepareFn supports_joined_native_launch_fn_ = nullptr;
     SupportsJoinedDiagnosticLaunchFn supports_joined_diagnostic_launch_fn_ = nullptr;
+    // The credit bridge. A runtime that exports none of these leaves the
+    // slots null, which degrades to "no credit wait": the caller re-asks on
+    // its own next pass, exactly as it does today.
+    CreditGenerationFn credit_generation_fn_ = nullptr;
+    CreditWaitFn credit_wait_fn_ = nullptr;
+    CreditCancelFn credit_cancel_fn_ = nullptr;
     GetArenaBankGmHeapBaseFn get_arena_bank_gm_heap_base_fn_ = nullptr;
     GetRetainedTempAddrFn get_retained_temp_addr_fn_ = nullptr;
     SimplerUnregisterCallableFn unregister_callable_fn_ = nullptr;

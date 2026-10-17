@@ -47,6 +47,22 @@ static const char *kind_to_name(AicoreRegKind kind) {
 }
 
 /**
+ * Bytes of a sub-core's register block this kind's accessors reach, which is
+ * the extent a published address addresses past its own base. `reg_offset` is
+ * the authority on where each register sits; these are the highest offsets it
+ * returns for each kind.
+ */
+static constexpr uint64_t kind_to_block_span(AicoreRegKind kind) {
+    switch (kind) {
+    case AicoreRegKind::Ctrl:
+        return REG_SPR_COND_OFFSET + sizeof(uint32_t);
+    case AicoreRegKind::Pmu:
+        return REG_MMIO_PMU_CNT7_IDX_OFFSET + sizeof(uint32_t);
+    }
+    return 0;
+}
+
+/**
  * Query valid AICore cores via HAL API
  */
 static bool get_pg_mask(uint64_t &valid, int64_t device_id) {
@@ -78,7 +94,8 @@ static bool get_pg_mask(uint64_t &valid, int64_t device_id) {
  * Retrieve AICore register base addresses via HAL API for one addr_type.
  */
 static int
-get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, const int &addr_type, int64_t device_id) {
+get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, AicoreRegKind kind, int64_t device_id) {
+    const int addr_type = kind_to_addr_type(kind);
     const int64_t phys_device_id = pto::acl_to_hal_device_id(device_id);
     uint64_t valid = 0;
     if (!get_pg_mask(valid, phys_device_id)) {
@@ -102,7 +119,7 @@ get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, const 
     }
 
     struct AddrMapInPara in_map_para;
-    struct AddrMapOutPara out_map_para;
+    struct AddrMapOutPara out_map_para{};
     in_map_para.devid = phys_device_id;
     in_map_para.addr_type = addr_type;
 
@@ -153,11 +170,27 @@ get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, const 
     }
 
     // Iterate over all cores and subcores
+    //
+    // `AddrMapOutPara::len` arrives beside the base and the HAL header documents
+    // no meaning for it on this command — `halMemCtl` declares only an opaque
+    // `out_value` — so what it counts is not established and nothing here is
+    // gated on it. The furthest block this layout addresses is measured against
+    // it and reported, because a layout reaching past the window would have the
+    // AICPU read and write another mapping's memory as if it were the core's,
+    // and that is worth seeing in a log before it is worth acting on.
+    const uint64_t block_span = kind_to_block_span(kind);
+    uint64_t furthest = 0;
+    uint32_t valid_blocks = 0;
+    uint32_t beyond_reported_len = 0;
     for (uint32_t i = 0; i < DAV_2201::PLATFORM_MAX_PHYSICAL_CORES; i++) {
         for (uint32_t j = 0; j < PLATFORM_SUB_CORES_PER_AICORE; j++) {
             uint64_t vaddr = 0UL;
             if (is_valid(i)) {
-                vaddr = out_map_para.ptr + (i * core_stride + j * sub_core_stride);
+                const uint64_t offset = i * core_stride + j * sub_core_stride;
+                vaddr = out_map_para.ptr + offset;
+                valid_blocks++;
+                if (offset + block_span > furthest) furthest = offset + block_span;
+                if (out_map_para.len != 0 && offset + block_span > out_map_para.len) beyond_reported_len++;
             }
             if (j == 0) {
                 aic.push_back(vaddr);
@@ -165,6 +198,26 @@ get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, const 
                 aiv.push_back(vaddr);
             }
         }
+    }
+
+    // One line per table build, which is once per device per kind.
+    if (beyond_reported_len > 0) {
+        LOG_WARN(
+            "%s register window ptr=0x%llx reports len=0x%llx, and this layout addresses up to 0x%llx "
+            "(core stride 0x%llx, sub-core stride 0x%llx, block 0x%llx): %u of %u valid sub-core blocks lie past "
+            "the reported length; the length's meaning is not documented for this command, so every block is "
+            "published as before",
+            kind_to_name(kind), (unsigned long long)out_map_para.ptr, (unsigned long long)out_map_para.len,
+            (unsigned long long)furthest, (unsigned long long)core_stride, (unsigned long long)sub_core_stride,
+            (unsigned long long)block_span, beyond_reported_len, valid_blocks
+        );
+    } else {
+        LOG_INFO(
+            "%s register window ptr=0x%llx len=0x%llx, %u valid sub-core blocks of 0x%llx bytes addressing up to "
+            "0x%llx",
+            kind_to_name(kind), (unsigned long long)out_map_para.ptr, (unsigned long long)out_map_para.len,
+            valid_blocks, (unsigned long long)block_span, (unsigned long long)furthest
+        );
     }
 
     return 0;
@@ -181,7 +234,7 @@ static int get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id, Aicor
     std::vector<int64_t> aic;
     std::vector<int64_t> aiv;
 
-    int rc = get_aicore_reg_info(aic, aiv, kind_to_addr_type(kind), device_id);
+    int rc = get_aicore_reg_info(aic, aiv, kind, device_id);
     if (rc != 0) {
         LOG_ERROR("get_aicore_regs(%s): halMemCtl failed: %d", kind_to_name(kind), rc);
         return rc;

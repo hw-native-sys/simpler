@@ -41,7 +41,10 @@ struct alignas(32) SchedulerSsbufDispatchControl {
     // Low 32 bits: ready generation; high 32 bits: signed timing slot.
     volatile uint64_t publication;
     int64_t task_id;
-    uint8_t reserved[16];
+    // Which of the task's subtask slots this lane runs. A remote Executor
+    // learns its slot from nowhere else, and a PMU record is per subtask.
+    uint8_t subtask_slot;
+    uint8_t reserved[15];
 };
 
 struct alignas(32) SchedulerSsbufCompletionInbox {
