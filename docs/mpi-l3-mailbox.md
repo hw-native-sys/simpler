@@ -36,6 +36,28 @@ existing command and health lanes.
    Each rank closes its inner worker, communicators are freed, `mpirun` exits,
    and L4 unlinks the mailbox and manifest directory.
 
+`SHUTDOWN_DONE` and `CLOSED` answer two different questions, and the order they
+are published in is load-bearing. Rank 0 sets `SHUTDOWN_DONE` as soon as the
+command has been carried out, because L4's native close polls that word with the
+GIL held and no command timeout bounds a release. It publishes `CLOSED` only
+after its inner worker has been released, so a reader of the group state is
+never told the group closed while the release was still to come.
+
+The release result itself is a record rank 0 writes beside the group manifest as
+`cleanup-rank0.json`, which L4 reads after reaping `mpirun` and before removing
+the directory; `Worker.session_cleanup_reports()` serves it. Rank 0 is the only
+rank that shares a filesystem with L4, and gathering the other ranks' results
+during teardown would block on a rank that has already died, so their releases
+reach L4 only as the group's exit status — which `mpirun` makes non-zero when any
+rank fails.
+
+A release that failed is reported, not raised: it goes to the ledger and to
+stderr, and `Worker.close()` still succeeds. The release ran in another process,
+so no retry on the L4 side changes its outcome, whereas the failures `close()`
+does raise — a group it could not reap, a mailbox it could not unlink, a
+manifest directory it could not remove — are debt L4 owns and a later close can
+discharge.
+
 If startup, a collective, the mailbox, or `mpirun` fails, the group becomes
 terminal. Runtime timeout also kills the complete `mpirun` process group.
 There is no TCP fallback.
