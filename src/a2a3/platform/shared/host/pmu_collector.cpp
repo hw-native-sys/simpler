@@ -103,6 +103,7 @@ int PmuCollector::init(
     num_cores_ = num_cores;
     num_threads_ = num_threads;
     buffers_registered_ = (register_cb != nullptr);
+    device_id_ = device_id;
 
     reset_collector_shards();
     execution_complete_.store(false, std::memory_order_release);
@@ -630,7 +631,7 @@ void PmuCollector::reconcile_counters() {
 // ---------------------------------------------------------------------------
 
 void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCallback &free_cb) {
-    if (!initialized_) return;
+    if (!initialized_ && shm_dev_ == nullptr) return;
 
     // Publish whatever the writer can still publish, for a caller that never
     // reached `finish_retained_runs()`. Idempotent, and it reports nothing:
@@ -690,11 +691,19 @@ void PmuCollector::finalize(PmuUnregisterCallback unregister_cb, const PmuFreeCa
     }
     manager_.clear_mappings();
 
-    // Free shared header region via the shared RAII helper.
+    // The shared header is owned independently of the pool's mapping table.
     if (shm_dev_ != nullptr) {
-        release_one_buffer(shm_dev_, shm_registered_ ? unregister_cb : nullptr, free_cb);
+        if (shm_registered_ && unregister_cb != nullptr) {
+            int rc = unregister_cb(shm_dev_, device_id_);
+            if (rc != 0) LOG_ERROR("halHostUnregister failed for PMU header %p: %d", shm_dev_, rc);
+        }
+        if (free_cb) {
+            int rc = free_cb(shm_dev_);
+            if (rc != 0) LOG_ERROR("PMU header release failed for %p: %d", shm_dev_, rc);
+        }
         shm_dev_ = nullptr;
         shm_host_ = nullptr;
+        shm_registered_ = false;
     }
 
     initialized_ = false;

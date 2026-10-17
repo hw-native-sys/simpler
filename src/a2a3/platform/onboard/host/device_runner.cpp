@@ -1756,6 +1756,11 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, Kernel
 
     int rc = pmu_collector_.init(num_cores, num_threads, alloc_cb, register_cb, free_cb, device_id);
     if (rc != 0) {
+        auto unregister_cb = [](void *dev_ptr, int id) -> int {
+            HalHostUnregisterFn fn = get_halHostUnregister();
+            return fn != nullptr ? fn(dev_ptr, id) : PTO_RUNTIME_ERR_INTERNAL;
+        };
+        pmu_collector_.finalize(unregister_cb, free_cb);
         return rc;
     }
 
