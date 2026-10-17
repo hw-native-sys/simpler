@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /** Real onboard workspace adapters and native prepare ownership over CPU transport. */
+#include <cstdlib>
 #include "fixture.h"
 
 namespace native_admission_test {
@@ -25,6 +26,67 @@ TEST_F(NativeAdmissionTest, EarlyPrepareFailureDoesNotBlockTheNormalRunCompositi
     EXPECT_TRUE(next.empty());
     EXPECT_EQ(runner.reservations(), 0u);
     EXPECT_FALSE(runner.holds_epoch(20));
+}
+
+TEST_F(NativeAdmissionTest, UnstartedLaunchCleanupPublishesOnlyItsOwnReleaseProof) {
+    Runner runner;
+    Attempt rejected(runner, 0, 10);
+    ASSERT_EQ(rejected.prepare(), 0);
+    runner.launch_refusal_rc = -4321;
+    EXPECT_EQ(simpler_launch_run(&runner, rejected.storage), -4321);
+    EXPECT_EQ(simpler_poll_run(&runner, rejected.storage), SIMPLER_NATIVE_RUN_POLL_COMPLETE);
+    EXPECT_EQ(simpler_finalize_run(&runner, rejected.storage), 0);
+    EXPECT_TRUE(rejected.consume_release());
+    EXPECT_TRUE(rejected.empty());
+    EXPECT_EQ(runner.reservations(), 0u);
+    EXPECT_FALSE(runner.holds_epoch(10));
+    runner.launch_refusal_rc = 0;
+    Attempt next(runner, 0, 20);
+    EXPECT_EQ(simpler_run(&runner, next.storage, 1, &next.args, &next.config, &next.descriptor), 0);
+    EXPECT_TRUE(next.empty());
+}
+
+TEST_F(NativeAdmissionTest, PartialLaunchNeverPublishesAnUnstartedReleaseProof) {
+    Runner runner;
+    Attempt rejected(runner, 0, 10);
+    ASSERT_EQ(rejected.prepare(), 0);
+    runner.launch_refusal_rc = -4321;
+    runner.partial_launch = true;
+    EXPECT_EQ(simpler_launch_run(&runner, rejected.storage), -4321);
+    EXPECT_EQ(simpler_wait_run(&runner, rejected.storage), -4321);
+    EXPECT_EQ(simpler_finalize_run(&runner, rejected.storage), -4321);
+    EXPECT_FALSE(rejected.consume_release());
+    EXPECT_TRUE(rejected.empty());
+}
+
+TEST_F(NativeAdmissionTest, ThrowingLaunchNeverInfersNoSubmissionFromAnAbsentActiveExecution) {
+    Runner runner;
+    Attempt rejected(runner, 0, 10);
+    ASSERT_EQ(rejected.prepare(), 0);
+    runner.launch_throws = true;
+    EXPECT_EQ(simpler_launch_run(&runner, rejected.storage), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(simpler_finalize_run(&runner, rejected.storage), 0);
+    EXPECT_FALSE(rejected.consume_release());
+    EXPECT_TRUE(rejected.empty());
+}
+
+TEST_F(NativeAdmissionTest, UnstartedLaunchWithFailedCleanupPublishesNoReleaseProof) {
+    // Failed cleanup deliberately retains workspace; subprocess exit owns its
+    // final disposal rather than fabricating device-completion evidence.
+    EXPECT_EXIT(
+        {
+            Runner runner;
+            Attempt rejected(runner, 0, 10);
+            if (rejected.prepare() != 0) std::_Exit(1);
+            runner.launch_refusal_rc = -4321;
+            if (simpler_launch_run(&runner, rejected.storage) != -4321) std::_Exit(2);
+            control().attach_rc = -77;
+            if (simpler_finalize_run(&runner, rejected.storage) != -77) std::_Exit(3);
+            if (rejected.consume_release() || !rejected.empty()) std::_Exit(4);
+            std::_Exit(0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
 }
 
 TEST_F(NativeAdmissionTest, ActualStagingAdapterTrimsIdleStorageThenRetriesOnce) {

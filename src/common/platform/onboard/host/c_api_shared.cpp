@@ -1982,6 +1982,7 @@ static void emit_joined_launch_span(const DeviceRunnerBase::JoinedLaunchRecord &
  * predecessor retires first launches ordinarily.
  */
 static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJoin *join) {
+    state->launch_not_started_proven = true;
     if (state->runner->execution_mode_latch().is_kernel() &&
         (state->prepared_execution == nullptr || state->prepared_execution->caller_stream == nullptr)) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -2013,8 +2014,10 @@ static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJo
     try {
         rc = state->runner->enter_run_thread();
         if (rc == 0) {
+            state->launch_not_started_proven = false;
             DeviceRunnerBase::LaunchOutcome launch =
                 state->runner->launch_execution(std::move(state->prepared_execution), std::move(state->launch_permit));
+            state->launch_not_started_proven = launch.progress == LaunchProgress::NotStarted;
             rc = launch.rc;
             // Where the fact becomes true, and from the transaction's own
             // report of how far it got rather than from a pointer that a later
@@ -2220,6 +2223,8 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
     const uint64_t clock_log_offset = state->clock_log_offset;
+    const uint64_t run_epoch = state->descriptor.run_epoch;
+    const bool no_submission = state->launch_not_started_proven;
     const std::string output_prefix = state->config.output_prefix;
     char trace_attrs[sizeof(state->trace_attrs)];
     std::memcpy(trace_attrs, state->trace_attrs, sizeof(trace_attrs));
@@ -2411,6 +2416,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // Last: a standalone workspace-reclamation failure is still a failure, and
     // with nothing above it to report this is where the caller learns of it.
     if (reclaim_rc != 0) return reclaim_rc;
+    if (no_submission && !launched) publish_released_preparation(state, run_epoch);
     return launched ? execution_rc : 0;
 }
 

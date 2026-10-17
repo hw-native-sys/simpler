@@ -1554,12 +1554,19 @@ void ChipWorker::wait_native_run(const ChipWorkerNativeRun &run) {
     if (failure != nullptr) std::rethrow_exception(failure);
 }
 
-void ChipWorker::finalize_native_run(const ChipWorkerNativeRun &run) {
+void ChipWorker::finalize_native_run(const ChipWorkerNativeRun &run) { finalize_native_run_impl(run, nullptr); }
+
+void ChipWorker::finalize_native_run_impl(const ChipWorkerNativeRun &run, bool *no_submission_released) {
+    if (no_submission_released != nullptr) *no_submission_released = false;
     validate_execution_context();
     if (run.slot_id >= runtime_bufs_.size()) {
         throw std::runtime_error("native-run token slot is outside the runtime PipelineContract");
     }
     const NativeRunFinalizeOutcome outcome = finalize_native_run_epoch(run.run_epoch, &run, FinalizeMode::Caller);
+    if (no_submission_released != nullptr && outcome.captured == nullptr &&
+        (outcome.fault == FinalizeFault::None || outcome.fault == FinalizeFault::Failed)) {
+        *no_submission_released = outcome.no_submission_released;
+    }
     // The original exception outranks any reason this call could name for it: it is what actually
     // happened, and replacing it would discard the runtime's own account of the failure.
     if (outcome.captured != nullptr) std::rethrow_exception(outcome.captured);
@@ -1616,6 +1623,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     const bool teardown = mode == FinalizeMode::Teardown;
     NativeRunFinalizeOutcome outcome;
     void *storage = nullptr;
+    size_t storage_bytes = 0;
     bool reserved = false;
     try {
         std::unique_lock<std::mutex> lk(native_run_mu_);
@@ -1646,6 +1654,7 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
             if (current == native_runs_.end()) return outcome;
             if (current->second->ops_in_flight == 0) {
                 storage = runtime_bufs_[current->second->slot_id].data();
+                storage_bytes = runtime_bufs_[current->second->slot_id].size();
                 break;
             }
             native_run_ops_done_.wait(lk);
@@ -1714,6 +1723,9 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
     // The tag is only meaningful for a call that returned. A throw out of the teardown says
     // nothing about how far it got — it may already have released resources while the tag still
     // reads as a live context — so that case is isolated rather than offered for a retry.
+    if (entered_finalize && outcome.captured == nullptr) {
+        outcome.no_submission_released = consume_released_preparation(storage, storage_bytes, run_epoch);
+    }
     const RunStorageTag tag = entered_finalize ? read_run_storage_tag(storage) : RunStorageTag::Canonical;
     const bool threw = outcome.captured != nullptr;
     try {

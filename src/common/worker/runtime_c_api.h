@@ -1089,6 +1089,10 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 /**
  * Wait if needed, validate/copy results, and release the opaque prepared run.
  * Also safely aborts a run that was prepared but never launched.
+ * A launch explicitly known not to have submitted execution-visible work
+ * leaves its epoch release marker after successful cleanup. A returned
+ * NotStarted transaction supplies that fact; a backend exception or an absent
+ * ActiveExecution alone does not. The original launch error remains observable.
  */
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 

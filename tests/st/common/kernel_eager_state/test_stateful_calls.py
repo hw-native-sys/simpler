@@ -50,7 +50,7 @@ def _compile(platform, runtime, host_controls):
     return compile_chip_callable_spec(spec, platform, runtime, key)
 
 
-def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=None, refusal_retry=False):  # noqa: PLR0912, PLR0915 -- one subprocess owns all resources through retirement
+def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=None, refusal_phase=None):  # noqa: PLR0912, PLR0915 -- one subprocess owns all resources through retirement
     from simpler.buffer import Buffer  # noqa: PLC0415
     from simpler.task_interface import (  # noqa: PLC0415
         CallConfig,
@@ -100,7 +100,7 @@ def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=No
                 ctypes.c_int,
                 ctypes.c_void_p,
             ]
-            if refusal_retry:
+            if refusal_phase is not None:
                 faults = ctypes.CDLL(None)
                 faults.bind_test_rts.argtypes = [ctypes.c_void_p]
                 assert faults.bind_test_rts(lib._handle) == 0
@@ -137,15 +137,19 @@ def _run(platform, runtime, device, borrowed, host_controls, workspace_budget=No
         if host_controls:
             control = owner.create_buffer(8)
             controls = (ctypes.c_int32 * 2).from_address(control.base)
-        if refusal_retry:
+        if refusal_phase is not None:
             rejected = TaskArgs()
             rejected.add_tensor(view, TensorArgType.INOUT)
             rejected.add_scalar(1)
             rejected.add_scalar(777)
             rejected_config = CallConfig()
             rejected_config.runtime_env.ring_task_window = 64
-            rejected_config.runtime_env.ring_heap = (1 << 28) if runtime == "tensormap_and_ringbuffer" else 1 << 20
-            if runtime == "host_build_graph":
+            rejected_config.runtime_env.ring_heap = (
+                (1 << 28) if runtime == "tensormap_and_ringbuffer" and refusal_phase == "prepare" else 1 << 20
+            )
+            if refusal_phase == "launch":
+                faults.arm_destroy_failure(3)
+            elif runtime == "host_build_graph":
                 faults.arm_copy_failure()
             with pytest.raises(RunPreparationRefused):
                 owner.submit(handle, rejected, config=rejected_config, caller_stream=stream.value)

@@ -295,15 +295,30 @@ struct ChipRunLaneState {
         run->device_spans_borrowed = false;
     }
 
-    void finish(const std::shared_ptr<ChipRunState> &run) noexcept {
+    void finish(const std::shared_ptr<ChipRunState> &run, std::exception_ptr joined_failure = {}) noexcept {
         bool finalized = true;
+        bool no_submission_released = false;
         try {
-            worker->finalize_native_run(run->native_run);
+            worker->finalize_native_run_impl(run->native_run, &no_submission_released);
         } catch (...) {
-            finalized = false;
+            finalized = no_submission_released;
             const std::exception_ptr finalize_error = std::current_exception();
             if (run->error == nullptr) run->error = finalize_error;
-            poison_with(run, finalize_error);
+            if (!finalized) poison_with(run, joined_failure != nullptr ? joined_failure : finalize_error);
+        }
+        if (joined_failure != nullptr && !no_submission_released) poison_with(run, joined_failure);
+        if (no_submission_released && run->error != nullptr) {
+            // A proven-unsubmitted run carries its original error through the
+            // clean refusal classification after its inputs are released.
+            try {
+                std::rethrow_exception(run->error);
+            } catch (const std::exception &error) {
+                try {
+                    throw RunPreparationRefused(error.what());
+                } catch (...) {
+                    run->error = std::current_exception();
+                }
+            } catch (...) {}
         }
         // After the finalize, never before: that call drains the device work,
         // copies this run's outputs back and releases its bindings, so it is
@@ -502,11 +517,11 @@ struct ChipRunLaneState {
      * *lane* would permit a join is still re-tested every round, because that
      * can change.
      *
-     * A join that fails rather than declining is the successor's own failure,
-     * and it stops the lane. By the launch transaction's own grading such a
-     * failure may already have reached the device, and whatever it holds sits in
-     * the stream pair the run ahead is still executing on; nothing here can tell
-     * that apart from a clean rollback.
+     * A failed join is the successor's own error. It stops the lane unless
+     * finalization proves that this successor submitted no execution-visible
+     * work and released its bindings. An ambiguous or partial failure may
+     * still hold the stream pair the predecessor is executing on. Its launch
+     * error remains primary if finalization also fails.
      */
     void launch_ready_prefix() noexcept {
         if (admission_stopped) return;
@@ -524,10 +539,7 @@ struct ChipRunLaneState {
                 );
             } catch (...) {
                 successor->error = std::current_exception();
-                // Before `finish`, so that a finalize failure on top of this
-                // cannot become the reason the lane stopped: the launch is.
-                poison_with(successor, successor->error);
-                finish(successor);
+                finish(successor, successor->error);
                 return;
             }
             if (!joined) {

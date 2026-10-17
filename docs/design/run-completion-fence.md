@@ -164,6 +164,13 @@ Unknown or stale release state retains borrows and poisons lane admission;
 carrier destruction alone is not release evidence. Resource-wait flow control
 keeps its existing live plan and is not a terminal release verdict.
 
+A launch setup failure uses the same release verdict only after an explicit
+`NotStarted` result and successful finalize. The platform clears this proof
+before calling the launch backend: a backend exception cannot infer it from a
+missing ActiveExecution. The lane preserves the original launch error while
+retiring this invocation's references and allowing a valid retry. Partial,
+ambiguous and failed-cleanup paths do not produce this verdict.
+
 ## The boundary
 
 Each stream records an event immediately after its own kernel:

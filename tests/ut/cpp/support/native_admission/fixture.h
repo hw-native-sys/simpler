@@ -71,12 +71,22 @@ public:
         *out = std::make_unique<PreparedExecution>(identity, runtime, config, slot);
         return 0;
     }
+    int launch_refusal_rc{0};
+    bool partial_launch{false};
+    bool launch_throws{false};
     LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override {
+        if (launch_throws) throw std::runtime_error("unknown launch progress");
+        if (launch_refusal_rc != 0 && !partial_launch) {
+            LaunchOutcome out;
+            out.rc = launch_refusal_rc;
+            out.prepared = std::move(prepared);
+            return out;
+        }
         auto transaction = exact_launch_transaction(
             prepared->identity, std::move(permit),
-            [](LaunchProgressSink &sink) {
+            [&](LaunchProgressSink &sink) {
                 sink.mark_submitted();
-                return 0;
+                return partial_launch ? launch_refusal_rc : 0;
             },
             [](LaunchProgressSink &sink) {
                 sink.mark_submitted();

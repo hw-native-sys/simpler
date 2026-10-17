@@ -46,6 +46,8 @@ std::array<int, 2> g_launch_rc{};
 std::array<int, 2> g_poll_rc{};
 std::array<int, 2> g_wait_rc{};
 std::array<int, 2> g_finalize_rc{};
+std::array<bool, 2> g_finalize_no_submission{};
+std::array<uint64_t, 2> g_epochs{};
 std::array<size_t, 2> g_prepare_count{};
 std::array<bool, 2> g_reject_first_prepare{};
 size_t g_poll_count{0};
@@ -67,6 +69,7 @@ int prepare_run(
 ) {
     EXPECT_EQ(slot_of(runtime), descriptor->pipeline_slot);
     g_complete[descriptor->pipeline_slot] = false;
+    g_epochs[descriptor->pipeline_slot] = descriptor->run_epoch;
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
     ++g_prepare_count[descriptor->pipeline_slot];
     if (g_reject_first_prepare[descriptor->pipeline_slot] && g_prepare_count[descriptor->pipeline_slot] == 1) {
@@ -110,6 +113,9 @@ int wait_run(void *, void *runtime) {
 int finalize_run(void *, void *runtime) {
     const uint32_t slot = slot_of(runtime);
     g_events.push_back("finalize" + std::to_string(slot));
+    if (g_finalize_no_submission[slot] && g_finalize_rc[slot] == 0) {
+        publish_released_preparation(runtime, g_epochs[slot]);
+    }
     return g_finalize_rc[slot];
 }
 
@@ -124,6 +130,8 @@ void prime_worker(ChipWorker &worker) {
     g_poll_rc = {};
     g_wait_rc = {};
     g_finalize_rc = {};
+    g_finalize_no_submission = {};
+    g_epochs = {};
     g_prepare_count = {};
     g_reject_first_prepare = {};
     g_poll_count = 0;
@@ -484,6 +492,51 @@ TEST(ChipRunLaneTest, ReclaimedLaunchFailureDoesNotPoisonTheLane) {
     g_complete[1] = true;
     EXPECT_TRUE(successor.done());
     lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, UnstartedLaunchReleasePreservesTheOriginalErrorAndAllowsRetry) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_launch_rc[0] = -6;
+    g_poll_rc[0] = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    g_finalize_no_submission[0] = true;
+
+    ChipRun failed = submit(lane, 101, 0);
+    EXPECT_TRUE(failed.done());
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        try {
+            failed.wait_until(ChipRunLane::Deadline::max());
+            FAIL() << "launch failure was discarded";
+        } catch (const RunPreparationRefused &error) {
+            EXPECT_NE(std::string(error.what()).find("launch_native_run failed with code -6"), std::string::npos);
+        }
+    }
+    EXPECT_FALSE(lane.poisoned());
+    ChipRun successor = submit(lane, 102, 1);
+    EXPECT_TRUE(successor.launched());
+    g_complete[1] = true;
+    EXPECT_TRUE(successor.done());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, MissingUnstartedReleaseProofKeepsTheFailurePoisoned) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_launch_rc[0] = -6;
+    g_poll_rc[0] = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    ChipRun failed = submit(lane, 101, 0);
+    try {
+        failed.wait_until(ChipRunLane::Deadline::max());
+        FAIL() << "expected a terminal launch error";
+    } catch (const RunPreparationRefused &) {
+        FAIL() << "missing cleanup proof permitted input release";
+    } catch (const std::runtime_error &) {}
+    EXPECT_TRUE(lane.poisoned());
+    EXPECT_THROW(lane.close(), std::runtime_error);
     worker.finalize();
 }
 

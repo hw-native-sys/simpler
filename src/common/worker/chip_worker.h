@@ -920,8 +920,11 @@ private:
     struct NativeRunFinalizeOutcome {
         FinalizeFault fault{FinalizeFault::None};
         int rc{0};
+        bool no_submission_released{false};
         std::exception_ptr captured;
     };
+    // This out-fact survives a persisted launch error, never failed cleanup.
+    void finalize_native_run_impl(const ChipWorkerNativeRun &run, bool *no_submission_released);
     /**
      * Finalize one run and report what it established.
      *

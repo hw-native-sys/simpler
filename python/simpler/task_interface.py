@@ -1921,7 +1921,7 @@ class ChipWorker:
                 except BaseException:
                     self._close_argument_imports()
                     raise
-            # Only a clean preparation refusal releases imports on an error;
+            # Only a proven pre-execution refusal releases imports on an error;
             # other native exceptions keep them through successful teardown.
             try:
                 self._impl.run(int(state.slot_id), args, config)

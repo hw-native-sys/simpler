@@ -82,6 +82,10 @@ struct NativeRunContext {
     std::unique_ptr<typename Runner::ActiveExecution> active_execution{};
     LaunchPermit launch_permit{};
     char trace_attrs[192]{};
+    // True only for a launch entry that has not attempted execution-visible
+    // submission, or whose returned transaction explicitly reports NotStarted.
+    // An exception from launch_execution supplies no such proof.
+    bool launch_not_started_proven{false};
     bool runner_resources_owned{false};
     bool runner_reserved{false};
     bool runner_claimed{false};

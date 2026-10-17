@@ -1125,7 +1125,8 @@ def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa
         faults.arm_copy_failure()
         assert prepare(device_args) != 0
         receipt = (ctypes.c_uint64 * 2).from_address(run)
-        assert receipt[0] != 0 and receipt[1] == descriptor.run_epoch
+        release_magic = receipt[0]
+        assert release_magic != 0 and receipt[1] == descriptor.run_epoch
         for epoch in (1, 2):
             descriptor.run_epoch = epoch
             assert prepare(device_args) == 0
@@ -1141,7 +1142,7 @@ def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa
             faults.force_current_device(-2)
             assert lib.simpler_finalize_run(ctx, run) == 0
             prepared = False
-            assert ctypes.string_at(run, 8) == bytes(8)
+            assert receipt[0] == release_magic and receipt[1] == descriptor.run_epoch
 
         host_value = ctypes.c_int32(11)
         host_args = arguments(ctypes.addressof(host_value), AddressSpace.HOST, TensorTransfer.NONE)
@@ -1228,12 +1229,24 @@ def test_borrowed_context_uses_per_call_prepare_and_finalize(
         for runtime in _RUNTIMES
     ],
 )
-def test_borrowed_prepare_refusal_retries_through_public_worker(arch, runtime, kernel_close_faults, request):
+@pytest.mark.parametrize("refusal_phase", ["prepare", "launch"])
+@pytest.mark.parametrize("borrowed", [False, True])
+def test_pre_execution_refusal_retries_through_public_worker(
+    arch, runtime, kernel_close_faults, request, refusal_phase, borrowed
+):
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     env = dict(os.environ)
     env["LD_PRELOAD"] = str(kernel_close_faults) + (":" + env["LD_PRELOAD"] if env.get("LD_PRELOAD") else "")
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, "public_prepare_retry"],
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            arch,
+            runtime,
+            device,
+            "public_" + refusal_phase + "_retry",
+            str(int(borrowed)),
+        ],
         env=env,
         capture_output=True,
         text=True,
@@ -1244,10 +1257,18 @@ def test_borrowed_prepare_refusal_retries_through_public_worker(arch, runtime, k
 
 
 if __name__ == "__main__":
-    if sys.argv[4] == "public_prepare_retry":
+    if sys.argv[4] in ("public_prepare_retry", "public_launch_retry"):
         from tests.st.common.kernel_eager_state.test_stateful_calls import _run
 
-        _run(sys.argv[1], sys.argv[2], int(sys.argv[3]), True, False, 128 << 20, refusal_retry=True)
+        _run(
+            sys.argv[1],
+            sys.argv[2],
+            int(sys.argv[3]),
+            bool(int(sys.argv[5])),
+            False,
+            128 << 20,
+            refusal_phase="launch" if sys.argv[4] == "public_launch_retry" else "prepare",
+        )
     elif sys.argv[4].startswith("borrowed_prepare"):
         _run_borrowed_prepare(
             sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] == "borrowed_prepare_failed_release"

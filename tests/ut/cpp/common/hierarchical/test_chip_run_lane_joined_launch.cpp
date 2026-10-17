@@ -52,6 +52,7 @@ std::unordered_map<void *, uint32_t> g_slots;
 std::array<bool, 2> g_complete{};
 std::array<int, 2> g_launch_rc{};
 std::array<int, 2> g_prepare_rc{};
+std::array<uint64_t, 2> g_prepare_epochs{};
 std::array<bool, 2> g_joinable_boundary_requested{};
 int g_joined_rc{0};
 bool g_joined_throws{false};
@@ -70,6 +71,7 @@ int prepare_run(
 ) {
     EXPECT_EQ(slot_of(runtime), descriptor->pipeline_slot);
     g_complete[descriptor->pipeline_slot] = false;
+    g_prepare_epochs[descriptor->pipeline_slot] = descriptor->run_epoch;
     g_joinable_boundary_requested[descriptor->pipeline_slot] = descriptor->joinable_boundary != 0;
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
     return g_prepare_rc[descriptor->pipeline_slot];
@@ -120,6 +122,7 @@ void prime_worker(ChipWorker &worker, unsigned launch_depth = 2) {
     g_complete = {};
     g_launch_rc = {};
     g_prepare_rc = {};
+    g_prepare_epochs = {};
     g_joinable_boundary_requested = {};
     g_joined_rc = 0;
     g_joined_throws = false;
@@ -306,6 +309,35 @@ TEST(ChipRunLaneJoinedLaunchTest, CleanPrepareRefusalDoesNotReleaseAPredecessors
     EXPECT_FALSE(lane.poisoned());
     lane.close();
     EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{2, 0}, {1, 0}}));
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, UnstartedSuccessorReleasesOnlyItsBorrowAndRetriesBesideThePredecessor) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_buffers(worker);
+    prime_caller_streams(worker);
+    ChipRunLane lane(worker);
+    int caller;
+    ChipRun first = lane.submit(1, device_args(), CallConfig{}, nullptr, 0, &caller);
+    g_joined_rc = -777;
+    worker.finalize_run_fn_ = [](void *ctx, void *runtime) {
+        const int rc = finalize_run(ctx, runtime);
+        if (rc == 0 && slot_of(runtime) == 1) publish_released_preparation(runtime, g_prepare_epochs[1]);
+        return rc;
+    };
+    EXPECT_THROW(lane.submit(1, device_args(), CallConfig{}, nullptr, 0, &caller), RunPreparationRefused);
+    EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{2, 0}}));
+    EXPECT_FALSE(first.done());
+    EXPECT_FALSE(lane.poisoned());
+
+    worker.finalize_run_fn_ = finalize_run;
+    g_joined_rc = 0;
+    ChipRun retry = lane.submit(1, device_args(), CallConfig{}, nullptr, 0, &caller);
+    EXPECT_TRUE(retry.launched());
+    EXPECT_FALSE(first.done());
+    EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{2, 0}}));
+    lane.close();
+    EXPECT_EQ(g_released, (std::vector<std::pair<uint64_t, int>>{{2, 0}, {1, 0}, {2, 0}}));
 }
 
 TEST(ChipRunLaneJoinedLaunchTest, FailedCallerLaunchThrowsInsteadOfReturningAnUnorderedHandle) {

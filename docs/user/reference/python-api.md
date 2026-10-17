@@ -127,7 +127,12 @@ intact; restore the required context before retrying.
 `RunPreparationRefused`, also from `simpler.task_interface`, is a terminal
 `RuntimeError` subclass stating that this invocation enqueued no operator kernel and
 released its native input bindings and preparation resources. It can surface
-from submit, or from wait when preparation was deferred. The Worker releases
+from submit, or from wait when preparation was deferred. It also covers launch
+setup that explicitly returned `NotStarted`, once finalize has released all
+bindings and preparation resources. The original launch error code and message
+remain observable, and a usable Worker can retry with the same Buffer. A backend
+exception or absent active-execution pointer alone supplies no such proof.
+The Worker releases
 only that invocation's source references; another live run still protects a
 shared Buffer. It does not certify that the environment accepts another call,
 or undo host orchestration effects and completed synchronous copies.

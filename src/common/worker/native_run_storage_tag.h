@@ -19,7 +19,7 @@
  * The tag a prepared run's storage carries while its carrier object is alive.
  *
  * The platform writes into worker-owned storage. Zero means the carrier has
- * been destroyed, not that all bindings were released. A failed preparation
+ * been destroyed, not that all bindings were released. A pre-execution refusal
  * whose cleanup succeeded instead leaves a release marker and its run epoch.
  * Reading either is a byte read, never a use of a destroyed carrier object.
  */

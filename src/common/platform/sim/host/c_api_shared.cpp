@@ -1071,14 +1071,17 @@ int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared)
         return PTO_RUNTIME_ERR_INTERNAL;
     if (!state->runner_claimed || !state->runner->native_run_owned_by(state)) return PTO_RUNTIME_ERR_INTERNAL;
+    state->launch_not_started_proven = true;
 
     state->runner_trace_start_ns = STRACE_NOW_NS();
     int rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
         rc = state->runner->attach_current_thread(state->runner->device_id());
         if (rc == 0) {
+            state->launch_not_started_proven = false;
             SimDeviceRunnerBase::LaunchOutcome launch =
                 state->runner->launch_execution(std::move(state->prepared_execution), std::move(state->launch_permit));
+            state->launch_not_started_proven = launch.progress == LaunchProgress::NotStarted;
             rc = launch.rc;
             state->prepared_execution = std::move(launch.prepared);
             state->active_execution = std::move(launch.active);
@@ -1153,6 +1156,8 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     const uint64_t trace_hid = state->trace_hid;
     const long long trace_start_ns = state->trace_start_ns;
     const uint64_t clock_log_offset = state->clock_log_offset;
+    const uint64_t run_epoch = state->descriptor.run_epoch;
+    const bool no_submission = state->launch_not_started_proven;
     const std::string output_prefix = state->config.output_prefix;
 
     STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
@@ -1233,6 +1238,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     if (validation_rc != 0) return validation_rc;
+    if (no_submission && !launched) publish_released_preparation(state, run_epoch);
     return launched ? execution_rc : 0;
 }
 
