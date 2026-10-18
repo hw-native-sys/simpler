@@ -2232,12 +2232,11 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
 
     int execution_rc = state->completion_rc;
-    // The launch transaction hands back an ActiveExecution only once it has
-    // reached the device (LaunchProgress::Partial or Complete); a NotStarted
-    // launch returns its PreparedExecution instead and leaves this null. So
-    // `launched` means "this run owns device work" — it is what separates a run
-    // that must be drained, whose rc is the run's result, and whose runtime
-    // holds a live GM/SM pointer, from one that never touched a stream.
+    // The launch owner covers both submitted and potentially submitted work:
+    // a backend exception is Partial and keeps its ActiveExecution. Only an
+    // explicit NotStarted result hands back PreparedExecution for rollback.
+    // Every active owner owes a drain; an error or absent receipt does not
+    // establish that the device saw no submission.
     const bool launched = state->active_execution != nullptr;
     // An ownership fact, not a code. A live ActiveExecution proves this run
     // reached the device, so reporting a launch from it is sound; the converse

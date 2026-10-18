@@ -10,7 +10,25 @@
  */
 /** Real onboard workspace adapters and native prepare ownership over CPU transport. */
 #include <cstdlib>
+#include <new>
 #include "fixture.h"
+
+namespace native_admission_test {
+thread_local bool refuse_next_host_allocation = false;
+}  // namespace native_admission_test
+
+// Only the throwing, unaligned allocation is replaced. Its ordinary delete
+// accepts malloc storage; aligned allocations retain their own allocator pair.
+void *operator new(std::size_t bytes) {
+    if (std::exchange(native_admission_test::refuse_next_host_allocation, false)) throw std::bad_alloc();
+    if (void *storage = std::malloc(bytes == 0 ? 1 : bytes)) return storage;
+    throw std::bad_alloc();
+}
+
+class NativeRunExecutionTestPeer {
+public:
+    static LaunchPermit mint(const NativeRunIdentity &identity) { return LaunchPermit(identity); }
+};
 
 namespace native_admission_test {
 TEST_F(NativeAdmissionTest, EarlyPrepareFailureDoesNotBlockTheNormalRunComposition) {
@@ -26,6 +44,65 @@ TEST_F(NativeAdmissionTest, EarlyPrepareFailureDoesNotBlockTheNormalRunCompositi
     EXPECT_TRUE(next.empty());
     EXPECT_EQ(runner.reservations(), 0u);
     EXPECT_FALSE(runner.holds_epoch(20));
+}
+
+TEST_F(NativeAdmissionTest, OwnerAllocationFailureReturnsPreparedWithoutEnteringTheBackend) {
+    Runner runner;
+    Runtime runtime;
+    const NativeRunIdentity identity{10, 10, 10, 0};
+    auto prepared = std::make_unique<Runner::PreparedExecution>(identity, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    refuse_next_host_allocation = true;
+    auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(identity));
+    const bool allocation_attempted = !std::exchange(refuse_next_host_allocation, false);
+    EXPECT_TRUE(allocation_attempted);
+    EXPECT_EQ(outcome.rc, PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(outcome.progress, LaunchProgress::NotStarted);
+    EXPECT_EQ(outcome.prepared.get(), original);
+    EXPECT_EQ(outcome.active, nullptr);
+    EXPECT_FALSE(outcome.receipt.valid());
+    EXPECT_EQ(runner.launch_calls, 0);
+    EXPECT_EQ(runner.recovery_calls, 0);
+    EXPECT_TRUE(runner.can_accept_run());
+}
+
+TEST_F(NativeAdmissionTest, FailurePolicyCannotReplaceTheResultOrLoseTheOwner) {
+    Runner runner;
+    Runtime runtime;
+    const NativeRunIdentity identity{10, 10, 10, 0};
+    auto prepared = std::make_unique<Runner::PreparedExecution>(identity, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    runner.launch_refusal_rc = -4321;
+    runner.partial_launch = true;
+    runner.recovery_throws = true;
+    auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(identity));
+    EXPECT_EQ(outcome.rc, -4321);
+    EXPECT_EQ(outcome.progress, LaunchProgress::Partial);
+    ASSERT_NE(outcome.active, nullptr);
+    EXPECT_EQ(outcome.active->prepared.get(), original);
+    EXPECT_FALSE(outcome.receipt.valid());
+    EXPECT_FALSE(runner.can_accept_run());
+    EXPECT_EQ(runner.recovery_calls, 1);
+    EXPECT_EQ(runner.recovery_rc, -4321);
+}
+
+TEST_F(NativeAdmissionTest, CompleteSubmissionHandsOffItsOwnerWithoutAnyLaterAllocation) {
+    Runner runner;
+    Runtime runtime;
+    const NativeRunIdentity identity{10, 10, 10, 0};
+    auto prepared = std::make_unique<Runner::PreparedExecution>(identity, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    runner.forbid_post_submit_allocation = true;
+    auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(identity));
+    const bool nothing_allocated = std::exchange(refuse_next_host_allocation, false);
+    EXPECT_TRUE(nothing_allocated);
+    EXPECT_EQ(outcome.rc, 0);
+    EXPECT_EQ(outcome.progress, LaunchProgress::Complete);
+    ASSERT_NE(outcome.active, nullptr);
+    EXPECT_EQ(outcome.active->prepared.get(), original);
+    EXPECT_EQ(outcome.active->progress, LaunchProgress::Complete);
+    EXPECT_EQ(outcome.prepared, nullptr);
+    EXPECT_TRUE(outcome.receipt.matches(identity));
 }
 
 TEST_F(NativeAdmissionTest, UnstartedLaunchCleanupPublishesOnlyItsOwnReleaseProof) {
@@ -59,15 +136,64 @@ TEST_F(NativeAdmissionTest, PartialLaunchNeverPublishesAnUnstartedReleaseProof) 
     EXPECT_TRUE(rejected.empty());
 }
 
-TEST_F(NativeAdmissionTest, ThrowingLaunchNeverInfersNoSubmissionFromAnAbsentActiveExecution) {
+TEST_F(NativeAdmissionTest, ThrowingBackendRetainsTheOwnerAndNeverPublishesNoSubmission) {
     Runner runner;
-    Attempt rejected(runner, 0, 10);
-    ASSERT_EQ(rejected.prepare(), 0);
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
     runner.launch_throws = true;
-    EXPECT_EQ(simpler_launch_run(&runner, rejected.storage), PTO_RUNTIME_ERR_INTERNAL);
-    EXPECT_EQ(simpler_finalize_run(&runner, rejected.storage), 0);
-    EXPECT_FALSE(rejected.consume_release());
-    EXPECT_TRUE(rejected.empty());
+    EXPECT_EQ(simpler_launch_run(&runner, candidate.storage), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(runner.recovery_calls, 1);
+    EXPECT_EQ(runner.recovery_rc, PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_FALSE(runner.can_accept_run());
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage);
+    ASSERT_NE(state->active_execution, nullptr);
+    EXPECT_EQ(state->active_execution->progress, LaunchProgress::Partial);
+    EXPECT_TRUE(runner.holds_epoch(10));
+    EXPECT_EQ(runner.drain_calls, 0);
+    Attempt blocked(runner, 1, 20);
+    const auto allocations = control().allocations;
+    EXPECT_EQ(blocked.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(blocked.empty());
+    EXPECT_EQ(control().allocations, allocations);
+
+    EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(runner.drain_calls, 1);
+    EXPECT_FALSE(candidate.consume_release());
+    EXPECT_TRUE(candidate.empty());
+}
+
+TEST_F(NativeAdmissionTest, ThrowAfterSubmissionRetainsTheCarrierAndAllBindingsUntilDrain) {
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    volatile int32_t accepted = 73;
+    candidate.descriptor.accepted_state = &accepted;
+    candidate.descriptor.accepted_value = 1;
+    ASSERT_EQ(candidate.prepare(), 0);
+    const auto bytes = control().bytes;
+    runner.launch_throws_after_submission = true;
+    EXPECT_EQ(simpler_launch_run(&runner, candidate.storage), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(runner.recovery_calls, 1);
+    EXPECT_EQ(runner.recovery_rc, PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_FALSE(runner.can_accept_run());
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage);
+    ASSERT_NE(state->active_execution, nullptr);
+    ASSERT_NE(state->active_execution->prepared, nullptr);
+    EXPECT_EQ(state->active_execution->prepared->runtime, &state->runtime);
+    EXPECT_EQ(state->active_execution->progress, LaunchProgress::Partial);
+    EXPECT_EQ(accepted, 73);
+    EXPECT_EQ(simpler_poll_run(&runner, candidate.storage), SIMPLER_NATIVE_RUN_POLL_NOT_READY);
+    EXPECT_EQ(runner.reservations(), 1u);
+    EXPECT_TRUE(runner.holds_epoch(10));
+    EXPECT_EQ(control().bytes, bytes);
+    EXPECT_EQ(runner.drain_calls, 0);
+    EXPECT_EQ(simpler_wait_run(&runner, candidate.storage), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(runner.drain_calls, 1);
+    EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_FALSE(candidate.consume_release());
+    EXPECT_TRUE(candidate.empty());
+    EXPECT_EQ(runner.reservations(), 0u);
+    EXPECT_FALSE(runner.holds_epoch(10));
+    EXPECT_EQ(runner.drain_calls, 1);
 }
 
 TEST_F(NativeAdmissionTest, UnstartedLaunchWithFailedCleanupPublishesNoReleaseProof) {

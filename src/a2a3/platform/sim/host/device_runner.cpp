@@ -517,46 +517,42 @@ int DeviceRunner::prepare_execution(
     return 0;
 }
 
-SimDeviceRunnerBase::LaunchOutcome
-DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) {
-    LaunchOutcome outcome;
-    if (prepared == nullptr) return outcome;
-    Runtime &runtime = *prepared->runtime;
-    const int num_aicore = prepared->num_aicore;
-    const int launch_aicpu_num = prepared->launch_aicpu_num;
+LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) {
+    Runtime &runtime = *prepared.runtime;
+    const int num_aicore = prepared.num_aicore;
+    const int launch_aicpu_num = prepared.launch_aicpu_num;
     constexpr int over_launch = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
     ActiveRun *run = active_run_.get();
     if (run == nullptr) {
-        outcome.prepared = std::move(prepared);
-        return outcome;
+        return LaunchTransactionResult{};
     }
 
     std::chrono::steady_clock::time_point sim_t0;
 
     LaunchTransactionResult result = exact_launch_transaction(
-        prepared->identity, std::move(permit),
+        prepared.identity, std::move(permit),
         [&](LaunchProgressSink &) -> int {
             // Arming precedes any simulated-core thread, so its failures — including
             // a thread-spawn or allocation throw — are reported as an rc and leave
             // the run safely rollback-able.
             try {
-                if (int arm_rc = arm_collectors_for_run(runtime, *prepared); arm_rc != 0) return arm_rc;
+                if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
                 set_platform_regs_func_(kernel_args_.regs);
                 if (set_orch_device_id_func_ != nullptr) set_orch_device_id_func_(device_id_);
                 set_platform_dump_base_func_(kernel_args_.dump_data_base);
-                set_dump_args_enabled_func_(prepared->dfx.dump_args_enabled());
+                set_dump_args_enabled_func_(prepared.dfx.dump_args_enabled());
                 set_platform_chip_swimlane_base_func_(kernel_args_.chip_swimlane_data_base);
                 set_platform_chip_swimlane_run_terminal_bank_func_(kernel_args_.chip_swimlane_run_terminal_bank);
                 set_platform_chip_swimlane_aicore_rotation_table_func_(
                     kernel_args_.chip_swimlane_aicore_rotation_table
                 );
-                set_chip_swimlane_enabled_func_(prepared->dfx.chip_swimlane_enabled());
+                set_chip_swimlane_enabled_func_(prepared.dfx.chip_swimlane_enabled());
                 set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
                 set_platform_pmu_reg_addrs_func_(kernel_args_.pmu_reg_addrs);
-                set_pmu_enabled_func_(prepared->dfx.pmu_enabled);
+                set_pmu_enabled_func_(prepared.dfx.pmu_enabled);
                 set_platform_dep_gen_base_func_(kernel_args_.dep_gen_data_base);
-                set_dep_gen_enabled_func_(prepared->dfx.dep_gen_enabled && !dep_gen_host_graph_active());
-                set_scope_stats_enabled_func_(prepared->dfx.scope_stats_enabled);
+                set_dep_gen_enabled_func_(prepared.dfx.dep_gen_enabled && !dep_gen_host_graph_active());
+                set_scope_stats_enabled_func_(prepared.dfx.scope_stats_enabled);
                 set_platform_scope_stats_base_func_(kernel_args_.scope_stats_data_base);
 
                 // This run's own core types, resolved from its own prepared
@@ -564,25 +560,25 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 // collector keeps was set during arming and belongs to
                 // whichever run launched last, so the bucket takes its own.
                 std::vector<CoreType> core_types;
-                if (prepared->dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
+                if (prepared.dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
                     core_types.resize(static_cast<size_t>(num_aicore));
                     for (int i = 0; i < num_aicore; i++)
                         core_types[static_cast<size_t>(i)] = runtime.core_type_rule(i);
                 }
                 const RunLocalDfxMetadata run_metadata{
                     core_types.empty() ? nullptr : core_types.data(), static_cast<int>(core_types.size()),
-                    host_orchestrated_for_slot(prepared->pipeline_slot), &prepared->artifact_identity
+                    host_orchestrated_for_slot(prepared.pipeline_slot), &prepared.artifact_identity
                 };
                 if (int collect_rc =
-                        start_shared_collectors_for_run(prepared->dfx, prepared->identity.run_epoch, run_metadata);
+                        start_shared_collectors_for_run(prepared.dfx, prepared.identity.run_epoch, run_metadata);
                     collect_rc != 0) {
                     return collect_rc;
                 }
                 // Admission before any submission. A refusal gives back what the
                 // collectors above already admitted, or their export slots stay held
                 // by a run that never reaches a boundary.
-                if (int dep_rc = admit_dep_gen_run(prepared->dfx, prepared->identity.run_epoch); dep_rc != 0) {
-                    withdraw_unlaunched_collectors_for_run(prepared->dfx, prepared->identity.run_epoch);
+                if (int dep_rc = admit_dep_gen_run(prepared.dfx, prepared.identity.run_epoch); dep_rc != 0) {
+                    withdraw_unlaunched_collectors_for_run(prepared.dfx, prepared.identity.run_epoch);
                     return dep_rc;
                 }
 
@@ -599,7 +595,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
                 // diagnostic scene are readable without naming shared state a
                 // later run resets.
                 set_platform_run_result_func_(
-                    run_result_region_base(prepared->pipeline_slot), prepared->identity.run_epoch
+                    run_result_region_base(prepared.pipeline_slot), prepared.identity.run_epoch
                 );
                 sim_t0 = std::chrono::steady_clock::now();
                 run_completion_.reset(static_cast<size_t>(over_launch) + static_cast<size_t>(num_aicore));
@@ -650,24 +646,7 @@ DeviceRunner::launch_execution(std::unique_ptr<PreparedExecution> prepared, Laun
             return 0;
         }
     );
-    if (result.poisoned()) poison_launch();
-    outcome.rc = result.rc;
-    outcome.progress = result.progress;
-    outcome.receipt = std::move(result.receipt);
-    if (result.progress == LaunchProgress::NotStarted) {
-        // Ownership first, then the withdrawal. Nothing was submitted, so the
-        // collectors' admission for this run is the runner's to give back —
-        // left in place it holds a retained slot that neither the writer nor a
-        // flush can see — but handing this rollback's `prepared` back to the
-        // caller is what lets it roll back at all, so it cannot come second to
-        // a diagnostic. The withdrawal itself reports nothing to this caller
-        // and throws nothing at it.
-        outcome.prepared = std::move(prepared);
-        withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
-    } else {
-        outcome.active = std::make_unique<ActiveExecution>(std::move(prepared), result.progress);
-    }
-    return outcome;
+    return result;
 }
 
 int DeviceRunner::poll_execution(const ActiveExecution &) { return run_completion_.poll(); }

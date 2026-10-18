@@ -258,6 +258,47 @@ RunBoundaryMarks::DeviceEventOps make_acl_timing_event_ops() {
 
 }  // namespace
 
+DeviceRunnerBase::LaunchOutcome
+DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) noexcept {
+    LaunchOutcome outcome;
+    outcome.prepared = std::move(prepared);
+    if (outcome.prepared == nullptr) return outcome;
+
+    std::unique_ptr<ActiveExecution> active;
+    try {
+        active = std::make_unique<ActiveExecution>(nullptr, LaunchProgress::NotStarted);
+    } catch (...) {
+        outcome.rc = PTO_RUNTIME_ERR_INTERNAL;
+        return outcome;
+    }
+
+    LaunchTransactionResult transaction;
+    try {
+        transaction = launch_execution_impl(*outcome.prepared, std::move(permit));
+    } catch (...) {
+        // Backend exceptions carry no proof that the device saw no submission.
+        transaction.rc = PTO_RUNTIME_ERR_INTERNAL;
+        transaction.progress = LaunchProgress::Partial;
+    }
+    outcome.rc = transaction.rc;
+    outcome.progress = transaction.progress;
+    outcome.receipt = std::move(transaction.receipt);
+    if (transaction.progress == LaunchProgress::NotStarted) {
+        withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
+    } else {
+        active->prepared = std::move(outcome.prepared);
+        active->progress = transaction.progress;
+        outcome.active = std::move(active);
+    }
+    if (outcome.poisoned()) {
+        // Ownership and the launch result survive a failure in recovery itself.
+        try {
+            recover_device_or_mark_unusable(outcome.rc);
+        } catch (...) {}
+    }
+    return outcome;
+}
+
 DeviceRunnerBase::DeviceRunnerBase() {
     // The sub-owners exist before the first grant is committed, because the
     // commit hands each of them its own per-set storage.

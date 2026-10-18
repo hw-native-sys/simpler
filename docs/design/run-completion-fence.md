@@ -171,6 +171,18 @@ missing ActiveExecution. The lane preserves the original launch error while
 retiring this invocation's references and allowing a valid retry. Partial,
 ambiguous and failed-cleanup paths do not produce this verdict.
 
+The common onboard and simulator `launch_execution` entry owns the prepared
+state and allocates its `ActiveExecution` record before invoking the backend.
+The backend receives a reference and cannot consume that owner. An explicit
+`NotStarted` result returns the prepared state for rollback; a partial result
+or escaping backend exception returns an active owner without acceptance.
+The hand-off after submission only moves existing owners and allocates no
+memory. Query, wait and finalize receive that owner; the existing drain and
+failure-isolation rules decide retirement. Partial results and backend
+exceptions close runner admission through the same policy, after the owner
+is installed. A failing recovery policy cannot discard the owner or replace
+the launch rc. An exception or missing receipt is never a no-submission proof.
+
 ## The boundary
 
 Each stream records an event immediately after its own kernel:
@@ -199,7 +211,7 @@ Three things that are *not* proofs, each of which is a way to get this wrong:
 The host must not wait for the AICore boundary before submitting the AICPU
 kernel, for the same handshake reason: the AICore kernel may be spinning for a
 kernel that has not been submitted yet. The two submissions stay back to back,
-AICore first (see the launch-order note in each arch's `launch_execution`), and
+AICore first (see the launch-order note in each arch's `launch_execution_impl`), and
 only the boundaries are waited on.
 
 ## Completion is not the verdict — a measured constraint

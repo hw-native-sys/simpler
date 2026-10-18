@@ -42,6 +42,7 @@ constexpr size_t kUnit = 1024;
 inline int callbacks = 0;
 inline bool refuse_after_callback = false;
 inline std::function<void()> callback_hook;
+extern thread_local bool refuse_next_host_allocation;
 
 class Runner : public DeviceRunnerBase {
 public:
@@ -61,7 +62,13 @@ public:
     }
     void use_other_entry() { callables_[1].host_orch_func_ptr = alternate_entry_points(); }
     ~Runner() override { EXPECT_EQ(finalize(), 0); }
-    bool can_accept_run() const override { return true; }
+    bool can_accept_run() const override { return !admission_poisoned; }
+    void recover_device_or_mark_unusable(int rc) override {
+        ++recovery_calls;
+        recovery_rc = rc;
+        admission_poisoned = true;
+        if (recovery_throws) throw std::runtime_error("recovery failed");
+    }
     bool ready_to_join_launch() const override { return true; }
     int fill_persistent_arch_fields(KernelArgs *, uint64_t) override { return 0; }
     int prepare_execution(
@@ -74,16 +81,22 @@ public:
     int launch_refusal_rc{0};
     bool partial_launch{false};
     bool launch_throws{false};
-    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) override {
+    bool launch_throws_after_submission{false};
+    bool forbid_post_submit_allocation{false};
+    bool admission_poisoned{false};
+    bool recovery_throws{false};
+    int recovery_calls{0};
+    int recovery_rc{0};
+    int launch_calls{0};
+    int drain_calls{0};
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
+        ++launch_calls;
         if (launch_throws) throw std::runtime_error("unknown launch progress");
         if (launch_refusal_rc != 0 && !partial_launch) {
-            LaunchOutcome out;
-            out.rc = launch_refusal_rc;
-            out.prepared = std::move(prepared);
-            return out;
+            return LaunchTransactionResult{launch_refusal_rc, LaunchProgress::NotStarted, LaunchReceipt{}};
         }
         auto transaction = exact_launch_transaction(
-            prepared->identity, std::move(permit),
+            prepared.identity, std::move(permit),
             [&](LaunchProgressSink &sink) {
                 sink.mark_submitted();
                 return partial_launch ? launch_refusal_rc : 0;
@@ -93,16 +106,16 @@ public:
                 return 0;
             }
         );
-        LaunchOutcome out;
-        out.rc = transaction.rc;
-        out.progress = transaction.progress;
-        out.receipt = std::move(transaction.receipt);
-        out.active = std::make_unique<ActiveExecution>(std::move(prepared), out.progress);
-        return out;
+        if (launch_throws_after_submission) throw std::bad_alloc();
+        if (forbid_post_submit_allocation) refuse_next_host_allocation = true;
+        return transaction;
     }
     void abandon_prepared_execution(PreparedExecution &) noexcept override {}
     int poll_execution(const ActiveExecution &) override { return SIMPLER_NATIVE_RUN_POLL_NOT_READY; }
-    DrainOutcome drain_execution(ActiveExecution &) override { return DrainOutcome::device_complete(0); }
+    DrainOutcome drain_execution(ActiveExecution &) override {
+        ++drain_calls;
+        return DrainOutcome::device_complete(0);
+    }
     int finalize_impl() override { return finalize_common(); }
     void arm_host_dep_gen_capture(bool enabled) override { set_dep_gen_capture(enabled); }
     AutoAdmissionState::SlotPlan plan(uint32_t slot) const { return auto_admission_.plan(slot); }
@@ -179,6 +192,7 @@ protected:
         callbacks = 0;
         refuse_after_callback = false;
         callback_hook = {};
+        refuse_next_host_allocation = false;
     }
     void TearDown() override {
         EXPECT_EQ(control().bytes, 0u);

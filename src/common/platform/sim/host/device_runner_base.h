@@ -170,7 +170,7 @@ public:
     };
 
     struct ActiveExecution {
-        explicit ActiveExecution(std::unique_ptr<PreparedExecution> prepared_in, LaunchProgress progress_in) :
+        explicit ActiveExecution(std::unique_ptr<PreparedExecution> prepared_in, LaunchProgress progress_in) noexcept :
             prepared(std::move(prepared_in)),
             progress(progress_in) {}
         ActiveExecution(const ActiveExecution &) = delete;
@@ -195,7 +195,12 @@ public:
         Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *prepared
     ) = 0;
-    virtual LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) = 0;
+    /**
+     * Allocate the active owner before entering the backend. An escaping backend
+     * exception returns Partial with that same prepared state still owned; only
+     * an explicit NotStarted result returns it for rollback.
+     */
+    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) noexcept;
     virtual void abandon_prepared_execution(PreparedExecution &prepared) noexcept = 0;
     /** Return one of the SIMPLER_NATIVE_RUN_POLL_* values without waiting. */
     virtual int poll_execution(const ActiveExecution &active) = 0;
@@ -258,7 +263,7 @@ public:
     bool native_run_active() const;
     bool native_run_owned_by(const void *owner) const;
     bool can_accept_run() const { return !launch_poisoned_.load(std::memory_order_acquire); }
-    void poison_launch() { launch_poisoned_.store(true, std::memory_order_release); }
+    void poison_launch() noexcept { launch_poisoned_.store(true, std::memory_order_release); }
 
     // --- Shared methods --------------------------------------------------
 
@@ -654,6 +659,8 @@ public:
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
 protected:
+    virtual LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) = 0;
+
     // --- Helpers usable by subclass execution / finalize -----------------
     int ensure_device_initialized();
     virtual int ensure_binaries_loaded() = 0;

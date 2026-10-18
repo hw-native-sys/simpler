@@ -91,9 +91,8 @@ int sim_bank_free(void *ptr) {
     return 0;
 }
 
-// A concrete runner: the pure virtuals below are the execution surface, which
-// no case here drives. The accessors read the production pool the registration
-// publishes into.
+// A concrete runner for registration and execution-owner contracts. The
+// accessors read the production pool published by registration.
 class PoolRunner : public SimDeviceRunnerBase {
 public:
     int prepare_execution(
@@ -102,8 +101,14 @@ public:
     ) override {
         return -1;
     }
-    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> /*prepared*/, LaunchPermit /*permit*/) override {
-        return LaunchOutcome{};
+    bool throw_on_launch{false};
+    bool partial_on_launch{false};
+    int launch_calls{0};
+    LaunchTransactionResult launch_execution_impl(PreparedExecution & /*prepared*/, LaunchPermit /*permit*/) override {
+        ++launch_calls;
+        if (throw_on_launch) throw std::bad_alloc();
+        if (partial_on_launch) return LaunchTransactionResult{-4321, LaunchProgress::Partial, LaunchReceipt{}};
+        return LaunchTransactionResult{};
     }
     void abandon_prepared_execution(PreparedExecution & /*prepared*/) noexcept override {}
     int poll_execution(const ActiveExecution & /*active*/) override { return 0; }
@@ -242,6 +247,50 @@ protected:
 // pool entry, and therefore no chip_dev any caller could reach. The successful
 // registration that follows proves the refused one left the pool usable rather
 // than merely empty.
+TEST_F(SimCallablePoolTest, AThrowingLaunchStillOwnsItsPreparedState) {
+    PoolRunner runner;
+    Runtime runtime;
+    auto prepared =
+        std::make_unique<PoolRunner::PreparedExecution>(NativeRunIdentity{10, 10, 10, 0}, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    runner.throw_on_launch = true;
+    auto outcome = runner.launch_execution(std::move(prepared), LaunchPermit{});
+    EXPECT_EQ(outcome.rc, PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(outcome.progress, LaunchProgress::Partial);
+    ASSERT_NE(outcome.active, nullptr);
+    EXPECT_EQ(outcome.active->prepared.get(), original);
+    EXPECT_EQ(outcome.active->progress, LaunchProgress::Partial);
+    EXPECT_FALSE(outcome.receipt.valid());
+    EXPECT_EQ(outcome.prepared, nullptr);
+    EXPECT_EQ(runner.launch_calls, 1);
+    EXPECT_FALSE(runner.can_accept_run());
+}
+
+TEST_F(SimCallablePoolTest, APartialLaunchStopsFurtherAdmission) {
+    PoolRunner runner;
+    Runtime runtime;
+    auto prepared =
+        std::make_unique<PoolRunner::PreparedExecution>(NativeRunIdentity{10, 10, 10, 0}, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    runner.partial_on_launch = true;
+    auto outcome = runner.launch_execution(std::move(prepared), LaunchPermit{});
+    EXPECT_EQ(outcome.rc, -4321);
+    EXPECT_EQ(outcome.progress, LaunchProgress::Partial);
+    ASSERT_NE(outcome.active, nullptr);
+    EXPECT_EQ(outcome.active->prepared.get(), original);
+    EXPECT_FALSE(runner.can_accept_run());
+}
+
+TEST_F(SimCallablePoolTest, AnEmptyLaunchNeverEntersTheBackend) {
+    PoolRunner runner;
+    auto outcome = runner.launch_execution(nullptr, LaunchPermit{});
+    EXPECT_NE(outcome.rc, 0);
+    EXPECT_EQ(outcome.progress, LaunchProgress::NotStarted);
+    EXPECT_EQ(outcome.prepared, nullptr);
+    EXPECT_EQ(outcome.active, nullptr);
+    EXPECT_EQ(runner.launch_calls, 0);
+}
+
 TEST_F(SimCallablePoolTest, AFailedRegistrationPublishesNothing) {
     const std::vector<uint8_t> unloadable = make_chip({0}, std::vector<uint8_t>(256, 0x7f), 0x11);
 
