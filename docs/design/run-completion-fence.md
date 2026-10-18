@@ -122,6 +122,13 @@ context generation, device and owned/borrowed policy. Borrowed generation is
 supplied by the caller; owned generation belongs to its native incarnation.
 Failed rollback/teardown preserves the identity and runtime binding for cleanup.
 Native context validation rejects a foreign process before entering the runtime.
+The run lane also retains its immutable creating process, independently of the
+worker pointer or environment lifetime. Inherited run handles and lane operations
+reject before taking the lane mutex, including cached status queries: a parent
+thread may have held that mutex at fork. Non-throwing stop/detach cleanup in the
+child leaves the inherited lane untouched; worker destruction retains its native
+storage and library without locking the lane or invoking device cleanup. This
+is a refusal contract, not permission to execute inherited device work.
 Buffer sources capture this identity and compare it on wrapping, descriptor
 validation and attachment; it is independent of run, lease and Buffer generations.
 The identity associates the source with the runner that validates the adopted

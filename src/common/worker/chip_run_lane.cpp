@@ -13,6 +13,8 @@
 
 #include "chip_worker.h"
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <deque>
 #include <exception>
@@ -91,6 +93,12 @@ struct ChipRunLaneState {
     explicit ChipRunLaneState(ChipWorker &worker) :
         worker(&worker),
         generations(worker.pipeline_depth(), 0) {}
+
+    bool in_current_process() const noexcept { return process_id == getpid(); }
+
+    void validate_process() const {
+        if (!in_current_process()) throw ExecutionContextRefused("chip run lane belongs to another process");
+    }
 
     [[noreturn]] static void rethrow_as_poisoned(const std::exception_ptr &error) {
         try {
@@ -705,6 +713,8 @@ struct ChipRunLaneState {
         return true;
     }
 
+    // Immutable across fork; read before mu or the mutable worker pointer.
+    const pid_t process_id{getpid()};
     ChipWorker *worker;
     mutable std::mutex mu;
     std::deque<std::shared_ptr<ChipRunState>> fifo;
@@ -725,12 +735,14 @@ ChipRun::ChipRun(std::shared_ptr<ChipRunLaneState> lane, std::shared_ptr<ChipRun
 
 bool ChipRun::done() {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
     return lane_->progress(run_);
 }
 
 bool ChipRun::wait_until(Deadline deadline) {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
     const bool unbounded = deadline == Deadline::max();
     while (true) {
         {
@@ -750,6 +762,7 @@ bool ChipRun::wait_until(Deadline deadline) {
 
 void ChipRun::activate() {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
     if (run_->phase == ChipRunState::Phase::TERMINAL) {
         lane_->rethrow_run_error(run_);
@@ -765,6 +778,7 @@ void ChipRun::activate() {
 
 void ChipRun::abandon() {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
     if (run_->phase == ChipRunState::Phase::TERMINAL) return;
     if (run_->phase == ChipRunState::Phase::LAUNCHED) {
@@ -794,18 +808,21 @@ void ChipRun::abandon() {
 
 bool ChipRun::launched() const {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
     return run_->crossed_launch_fence;
 }
 
 bool ChipRun::lane_poisoned() const {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
     return lane_->poison != nullptr;
 }
 
 ChipRunPreparationDisposition ChipRun::preparation_disposition() const {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
     std::lock_guard<std::mutex> lk(lane_->mu);
     return run_->disposition;
 }
@@ -824,6 +841,7 @@ ChipRun ChipRunLane::submit(
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value, bool activated,
     NativeRunProvenance provenance
 ) {
+    state_->validate_process();
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->require_usable();
     if (lease.reserved != 0 || lease.generation == 0 || lease.slot_id >= state_->generations.size()) {
@@ -904,6 +922,7 @@ ChipRun ChipRunLane::submit(
     int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, volatile int32_t *accepted_state,
     int32_t accepted_value, void *caller_stream
 ) {
+    state_->validate_process();
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->require_usable();
     if (caller_stream != nullptr) state_->worker->validate_caller_stream(caller_stream);
@@ -984,6 +1003,7 @@ ChipRun ChipRunLane::submit(
 }
 
 void ChipRunLane::drain() {
+    state_->validate_process();
     std::lock_guard<std::mutex> lk(state_->mu);
     if (state_->worker != nullptr) state_->worker->validate_execution_context();
     while (!state_->fifo.empty())
@@ -992,6 +1012,7 @@ void ChipRunLane::drain() {
 }
 
 void ChipRunLane::close() {
+    state_->validate_process();
     std::lock_guard<std::mutex> lk(state_->mu);
     if (state_->worker != nullptr) state_->worker->validate_execution_context();
     if (state_->closed) {
@@ -1005,6 +1026,7 @@ void ChipRunLane::close() {
 }
 
 void ChipRunLane::detach_after_failed_teardown(std::exception_ptr error) noexcept {
+    if (!state_->in_current_process()) return;
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->closed = true;
     state_->poison = error;
@@ -1017,6 +1039,7 @@ void ChipRunLane::detach_after_failed_teardown(std::exception_ptr error) noexcep
 }
 
 void ChipRunLane::stop_admission() noexcept {
+    if (!state_->in_current_process()) return;
     std::lock_guard<std::mutex> lk(state_->mu);
     state_->admission_stopped = true;
     try {
@@ -1028,6 +1051,7 @@ void ChipRunLane::stop_admission() noexcept {
 }
 
 bool ChipRunLane::poisoned() const {
+    state_->validate_process();
     std::lock_guard<std::mutex> lk(state_->mu);
     return state_->poison != nullptr;
 }

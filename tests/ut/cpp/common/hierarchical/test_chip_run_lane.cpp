@@ -9,7 +9,13 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+#include <sys/wait.h>
+#include <unistd.h>
+
 #include <algorithm>
+#include <cerrno>
+#include <csignal>
+#include <functional>
 #include <array>
 #include <chrono>
 #include <condition_variable>
@@ -723,4 +729,171 @@ TEST(ChipRunLaneTest, ReleasedPrepareReceiptIsBoundToOneEpochAndConsumedOnce) {
     EXPECT_EQ(storage[0], 0u);
     EXPECT_EQ(storage[1], 0u);
     EXPECT_FALSE(consume_released_preparation(nullptr, sizeof(storage), 7));
+}
+
+namespace {
+
+// The parent's waiter owns the lane mutex until after the child exits.
+int fork_with_lane_locked(ChipRun &run, const std::function<void()> &child_operation) {
+    {
+        std::lock_guard<std::mutex> lk(g_wait_mu);
+        g_release_wait = false;
+    }
+    std::exception_ptr wait_error;
+    std::thread waiter([&] {
+        try {
+            (void)run.wait_until(ChipRun::Deadline::max());
+        } catch (...) {
+            wait_error = std::current_exception();
+        }
+    });
+    bool entered = false;
+    {
+        std::unique_lock<std::mutex> lk(g_wait_mu);
+        entered = g_wait_cv.wait_for(lk, std::chrono::seconds(5), [] {
+            return g_wait_entered;
+        });
+    }
+    pid_t child = -1;
+    int status = -1;
+    if (entered) {
+        child = fork();
+        if (child == 0) {
+            alarm(2);
+            try {
+                child_operation();
+                _exit(0);
+            } catch (...) {
+                _exit(1);
+            }
+        }
+        if (child > 0) {
+            pid_t waited;
+            do {
+                waited = waitpid(child, &status, 0);
+            } while (waited == -1 && errno == EINTR);
+            EXPECT_EQ(waited, child);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lk(g_wait_mu);
+        g_release_wait = true;
+    }
+    g_wait_cv.notify_all();
+    waiter.join();
+    EXPECT_TRUE(entered);
+    EXPECT_GT(child, 0);
+    EXPECT_EQ(wait_error, nullptr);
+    return status;
+}
+
+void require_process_refusal(const std::function<void()> &operation) {
+    try {
+        operation();
+    } catch (const ExecutionContextRefused &) {
+        return;
+    }
+    throw std::runtime_error("inherited lane operation did not refuse its process");
+}
+
+}  // namespace
+
+TEST(ChipRunLaneTest, ForkedHandlesRefuseBeforeTakingAnInheritedMutex) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipRun completed = submit(lane, 1, 0);
+    g_complete[0] = true;
+    ASSERT_TRUE(completed.done());
+    ChipRun run = submit(lane, 2, 0);
+    const int status = fork_with_lane_locked(run, [&] {
+        const auto events = g_events;
+        for (ChipRun *handle : {&run, &completed}) {
+            require_process_refusal([&] {
+                (void)handle->done();
+            });
+            require_process_refusal([&] {
+                (void)handle->wait_until(ChipRun::Clock::now());
+            });
+            require_process_refusal([&] {
+                handle->activate();
+            });
+            require_process_refusal([&] {
+                handle->abandon();
+            });
+            require_process_refusal([&] {
+                (void)handle->launched();
+            });
+            require_process_refusal([&] {
+                (void)handle->lane_poisoned();
+            });
+            require_process_refusal([&] {
+                (void)handle->preparation_disposition();
+            });
+        }
+        if (events != g_events) throw std::runtime_error("child entered the runtime");
+    });
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+    EXPECT_TRUE(run.done());
+    ChipRun next = submit(lane, 3, 0);
+    g_complete[0] = true;
+    EXPECT_TRUE(next.done());
+}
+
+TEST(ChipRunLaneTest, ForkedLaneRefusesBeforeTakingAnInheritedMutex) {
+    ChipWorker worker;
+    prime_worker(worker);
+    auto lane = std::make_unique<ChipRunLane>(worker);
+    ChipRun run = submit(*lane, 1, 0);
+    const int status = fork_with_lane_locked(run, [&] {
+        const auto events = g_events;
+        require_process_refusal([&] {
+            (void)submit(*lane, 2, 1);
+        });
+        require_process_refusal([&] {
+            (void)lane->submit(1, ChipStorageTaskArgs{}, CallConfig{});
+        });
+        require_process_refusal([&] {
+            lane->drain();
+        });
+        require_process_refusal([&] {
+            lane->close();
+        });
+        require_process_refusal([&] {
+            (void)lane->poisoned();
+        });
+        lane->stop_admission();
+        lane.reset();
+        if (events != g_events) throw std::runtime_error("child entered the runtime");
+    });
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+    ChipRun next = submit(*lane, 2, 0);
+    g_complete[0] = true;
+    EXPECT_TRUE(next.done());
+}
+
+TEST(ChipRunLaneTest, ForkedWorkerDestructionDoesNotDetachAnInheritedLane) {
+    auto worker = std::make_unique<ChipWorker>();
+    prime_worker(*worker);
+    worker->execution_environment_ = ChipWorker::ExecutionEnvironment{static_cast<uint64_t>(getpid()), 1, 1, 0, false};
+    worker->run_lane_ = std::make_unique<ChipRunLane>(*worker);
+    ChipRun run = submit(*worker->run_lane_, 1, 0);
+    const int status = fork_with_lane_locked(run, [&] {
+        const auto events = g_events;
+        worker.reset();
+        require_process_refusal([&] {
+            (void)run.done();
+        });
+        if (events != g_events) throw std::runtime_error("child entered the runtime");
+    });
+    ASSERT_TRUE(WIFEXITED(status)) << "child status=" << status;
+    EXPECT_EQ(WEXITSTATUS(status), 0);
+    EXPECT_TRUE(run.done());
+    EXPECT_TRUE(worker->execution_environment_.has_value());
+    ChipRun next = submit(*worker->run_lane_, 2, 0);
+    g_complete[0] = true;
+    EXPECT_TRUE(next.done());
+    worker->finalize();
 }
