@@ -360,12 +360,11 @@ __aicore__ bool run_ready_dispatch_loop(
         }
         {
             uint64_t direct_refilled_slot_mask = 0;
-            SchedulerRefillCandidates refill_candidates(context->has_mix);
+            SchedulerRefillCandidates refill_candidates{};
             const bool completion_progress = scheduler_service_cluster_completions(
                 graph, scheduler_state_base, context, run_control, phase_timing_enabled ? &stats->wake : nullptr,
                 phase_timing_enabled ? &stats->ready : nullptr, phase_timing_enabled ? &stats->completion : nullptr,
-                ready_victim_cursors, profiling_level, &direct_refilled_slot_mask, ssbuf_region,
-                context->has_mix ? &refill_candidates : nullptr
+                ready_victim_cursors, profiling_level, &direct_refilled_slot_mask, ssbuf_region, &refill_candidates
             );
             scheduler_progress = completion_progress;
             if (!scheduler_fill_mix_after_completions(
@@ -373,11 +372,6 @@ __aicore__ bool run_ready_dispatch_loop(
                     &ready_victim_cursors[SCHEDULER_MIX_QUEUE], phase_timing_enabled ? &stats->ready : nullptr,
                     profiling_level, true, ssbuf_region, &scheduler_progress
                 ))
-                return false;
-            if (context->has_mix && !scheduler_publish_refill_candidates(
-                                        graph, scheduler_state_base, context, run_control, &refill_candidates,
-                                        phase_timing_enabled ? &stats->ready : nullptr, profiling_level, ssbuf_region
-                                    ))
                 return false;
             bool fill_failed = false;
             const bool dispatch_progress = scheduler_fill_own_slots(

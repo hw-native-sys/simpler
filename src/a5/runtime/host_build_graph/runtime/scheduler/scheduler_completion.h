@@ -38,17 +38,11 @@ inline __aicore__ void scheduler_account_failed_completion(
     ++scheduler->pending_completed;
 }
 
+// A Mix task resolved on the completion path, held for the coordinator to place
+// once the scan is done. An ordinary successor needs no such hand-off: the core
+// that resolved it owns the slot it came from and refills that slot directly.
 struct SchedulerRefillCandidates {
-    int64_t tasks[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_PENDING_SLOT_COUNT];
-    // Read an index only for a valid task in the same slot with phase timing enabled.
-    uint32_t completed_trace_indices[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_PENDING_SLOT_COUNT];
     SchedulerReadyClaim mix_ready{};
-    inline __aicore__ explicit SchedulerRefillCandidates(bool initialize = true) {
-        if (!initialize) return;
-        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
-            for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot)
-                tasks[lane][slot] = SCHEDULER_TASK_REF_INVALID;
-    }
 };
 
 inline __aicore__ bool scheduler_service_cluster_completion_slot(
@@ -212,10 +206,13 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     if (task_complete) {
         __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
         scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
-        SchedulerReadyClaim *direct_ready = replacement_ready == nullptr && worker_id != scheduler->worker_id() &&
-                                                    (!scheduler->has_mix || candidates != nullptr) ?
-                                                &resolved_ready :
-                                                nullptr;
+        // A core owns the slot it just freed, so the successor it resolved can
+        // go straight back into it. Only an ordinary slot qualifies: a Mix slot
+        // belongs to a peer AIV and is filled through Mix placement, which is
+        // the coordinator's alone. resolve_completion hands back a candidate
+        // only when the successor's type matches the subtask that just
+        // completed, so what lands here is always this core's own kind of work.
+        SchedulerReadyClaim *direct_ready = replacement_ready == nullptr && !mix_slot ? &resolved_ready : nullptr;
         if (!scheduler_resolve_completion(
                 graph, scheduler_state_base, scheduler, run_control, task_ref, wake_stats, ready_stats,
                 completion_stats, profiling_level, false, direct_ready,
@@ -228,18 +225,11 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
             return false;
         }
     }
-    if (scheduler->has_mix && !scheduler_task_ref_is_null(resolved_ready.task_ref) && candidates != nullptr) {
-        candidates->tasks[cluster_lane][pending_slot] = resolved_ready.task_ref;
-        if (phase_timing_enabled)
-            candidates->completed_trace_indices[cluster_lane][pending_slot] = scheduler_trace_index_at(
-                scheduler_state_base, scheduler, task_ref, static_cast<SubtaskSlot>(completed_subtask_slot)
-            );
-    }
     SchedulerReadyClaim ready{};
-    bool ready_available = !scheduler->has_mix && replacement_ready != nullptr;
+    bool ready_available = replacement_ready != nullptr;
     if (ready_available) {
         ready = *replacement_ready;
-    } else if (!scheduler->has_mix && !scheduler_task_ref_is_null(resolved_ready.task_ref)) {
+    } else if (!scheduler_task_ref_is_null(resolved_ready.task_ref)) {
         ready = resolved_ready;
         ready_available = true;
     }

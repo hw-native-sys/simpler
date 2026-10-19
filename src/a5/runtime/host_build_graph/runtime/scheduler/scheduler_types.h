@@ -687,6 +687,12 @@ inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD = 7;
 // worker id the 7 owners of a shard interleave AIC and AIV cores, so a thief
 // scanning its shard of the AIC queue finds at most a third of those bits ever
 // set; by rank all 7 are cores that can hold the work it is looking for.
+//
+// It narrows how far one publisher's work can travel, which is the other half
+// of the same property. A cluster's two AIV lanes take adjacent ranks, so both
+// land in one shard, where their worker ids had straddled a shard boundary and
+// reached two. A single-root fanout is therefore confined to one AIC shard plus
+// one AIV shard; tests/st/a5/host_build_graph/fanout_imbalance measures it.
 inline __aicore__ constexpr uint32_t scheduler_ready_queue_capacity(uint32_t core_type_index) {
     return core_type_index == 1U ? SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM :
                                    SCHEDULER_CLUSTER_CAPACITY;

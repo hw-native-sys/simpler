@@ -498,11 +498,11 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     EXPECT_EQ(traces[0].kernel_end_cycles, 200u);
     auto *waiter = scheduler_task_control_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 1);
     EXPECT_EQ(waiter->state, static_cast<int64_t>(SchedulerTaskState::BLOCKED));
-    // The completed slot is released rather than refilled: a woken successor
-    // goes to its type's ready queue, and the next fill pass claims it there.
-    EXPECT_EQ(local_slot->state, SchedulerDispatchSlotState::FREE);
-    EXPECT_EQ(local_slot->task_ref, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(ready_stats.enqueue_count, 1u);
+    // The core owns the slot it just freed, so the successor it woke goes
+    // straight back into it instead of round-tripping through the ready queue.
+    EXPECT_EQ(local_slot->state, SchedulerDispatchSlotState::READY);
+    EXPECT_EQ(local_slot->task_ref, 1);
+    EXPECT_EQ(ready_stats.enqueue_count, 0u);
     EXPECT_EQ(wake_stats.fanin_state_load_count, 0u);
 }
 
@@ -631,12 +631,12 @@ TEST(SchedulerClusterCompletion, UsesSchedulerLocalSlotStateWithoutRereadingDisp
         nullptr, storage.ssbuf_region
     ));
 
-    // The slot is released and the woken successor enqueued; the poisoned
-    // SSBUF metadata above was never consulted, which is what this covers.
-    EXPECT_EQ(local_slot->task_ref, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(local_slot->generation, completed_generation);
-    EXPECT_EQ(local_slot->state, SchedulerDispatchSlotState::FREE);
-    EXPECT_EQ(ready_stats.enqueue_count, 1u);
+    // The woken successor refills the slot directly; the poisoned SSBUF
+    // metadata above was never consulted, which is what this covers.
+    EXPECT_EQ(local_slot->task_ref, 1);
+    EXPECT_EQ(local_slot->generation, completed_generation + 1);
+    EXPECT_EQ(local_slot->state, SchedulerDispatchSlotState::READY);
+    EXPECT_EQ(ready_stats.enqueue_count, 0u);
     auto *traces =
         scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
     EXPECT_EQ(traces[0].kernel_start_cycles, 100u);
@@ -1256,28 +1256,6 @@ TEST(SchedulerMix, FailedPreparationPublishesNothingAndConsumesNoSequence) {
     }
     EXPECT_EQ(f.local->local_ready_mask, 0u);
     EXPECT_EQ(f.local->mix_trackers[0].task_ref, SCHEDULER_TASK_REF_INVALID);
-}
-
-TEST(SchedulerMix, DisplacedDirectSuccessorReturnsToReadyQueue) {
-    MixFixture f;
-    f.set_task(2, 1);
-    SchedulerRefillCandidates candidates;
-    candidates.tasks[0][0] = 2;
-    f.local->slots[0][1].state = SchedulerDispatchSlotState::FILLING;
-    f.enqueue(0);
-    ASSERT_TRUE(f.dispatch());
-    ASSERT_TRUE(scheduler_publish_refill_candidates(
-        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, &candidates, nullptr, 0,
-        f.storage.ssbuf_region
-    ));
-    EXPECT_EQ(f.local->slots[0][0].task_ref, 0);
-    SchedulerReadyClaim claim;
-    ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 1, 0, &f.cursor, nullptr,
-        &claim
-    ));
-    EXPECT_EQ(claim.task_ref, 2);
-    EXPECT_EQ(candidates.tasks[0][0], SCHEDULER_TASK_REF_INVALID);
 }
 
 TEST(SchedulerMix, DirectCandidateDoesNotOvertakeQueuedMix) {

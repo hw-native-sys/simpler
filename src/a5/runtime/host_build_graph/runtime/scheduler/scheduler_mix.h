@@ -133,31 +133,3 @@ inline __aicore__ bool scheduler_fill_mix_after_completions(
         graph, base, local, run, victim_cursor, stats, profiling_level, allow_steal, ssbuf, progress
     );
 }
-
-inline __aicore__ bool scheduler_publish_refill_candidates(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    SchedulerRefillCandidates *candidates, SchedulerReadyStats *stats, uint64_t profiling_level,
-    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf
-) {
-    SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
-    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
-            const int64_t task = candidates->tasks[lane][index];
-            if (scheduler_task_ref_is_null(task)) continue;
-            const auto &metadata = *scheduler_task_metadata_at(base, local, task);
-            // A resolved successor goes to its type's ready queue. Filling a
-            // peer's slot directly is not available here: slots[] entries for a
-            // peer lane are that peer's to fill, so this core's view of them
-            // says nothing about what is actually free there.
-            if (!scheduler_ready_batch_append(
-                    base, local, task,
-                    &batches[scheduler_task_ready_queue(metadata.flags, scheduler_task_lanes(metadata))], stats, 0
-                ))
-                return false;
-            candidates->tasks[lane][index] = SCHEDULER_TASK_REF_INVALID;
-        }
-    }
-    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type)
-        if (!scheduler_ready_batch_push(base, local, type, &batches[type], stats)) return false;
-    return true;
-}

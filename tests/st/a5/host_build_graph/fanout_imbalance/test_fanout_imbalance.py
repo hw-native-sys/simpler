@@ -66,14 +66,14 @@ REPEATS = 2048
 # itself enough to trip the device scheduler timeout
 # (SIMPLER_ERROR_SCHEDULER_TIMEOUT, surfaced as finalize code -100) — the
 # profiling would destroy the very run it was added to observe. 256 consumers
-# over ~108 cores still oversubscribes every core several times, which is all
-# the distribution claim needs.
+# oversubscribe every core several times on any supported topology, which is
+# all the distribution claim needs.
 SPREAD_COUNT = 256
 
 # Floor for the distinct-core count, set from the measurement recorded at the
-# assertion itself. Deliberately below the measured 21 so ordinary scheduling
-# jitter does not fail the run, and far enough above 3 to fail a collapse into
-# the publishing cluster.
+# assertion itself. Deliberately below the measured count so ordinary
+# scheduling jitter does not fail the run, and far enough above one cluster's
+# three cores to fail a collapse into the publishing cluster.
 SPREAD_MIN_CORES = 12
 
 # Level 3 is SCHED_PHASES: the level that carries the per-Scheduler records the
@@ -215,16 +215,22 @@ def test_fanout_spread_is_wide(st_platform, st_device_ids, tmp_path):
         active = int(metadata["num_cores"])
         assert active > 0, f"swimlane metadata reports no cores: {metadata}"
 
-        # Measured on this branch before any per-core work: a 256-wide fanout
-        # reaches 21 of 108 cores — seven clusters of three, which is exactly one
-        # directory shard (SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD = 7). The
-        # publishing Scheduler owns the inbox and only its shard-mates can steal
-        # from it, so the work cannot leave those seven clusters.
+        # A fanout cannot leave the directory shards its successors were
+        # published into. A publisher routes by core type to a peer in its own
+        # cluster, so nothing crosses a cluster except by stealing, and a thief
+        # scans only its own shard of SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD
+        # owners. The reachable set is therefore a whole number of shards, and
+        # the two measurements taken on one 96-core box say so directly: 21
+        # cores before per-core scheduling (one AIC shard plus two AIV shards),
+        # 14 after (one of each). Addressing an inbox by type rank is what
+        # merged the two AIV shards into one — a cluster's two AIV lanes take
+        # adjacent ranks, where their worker ids had straddled a shard boundary.
         #
-        # The floor is a regression guard on that measurement, not a target: it
-        # fails if the spread collapses toward a single cluster. Per-core
-        # scheduling is expected to raise the observed number well above it, and
-        # whoever sees that should raise this floor in the same change.
+        # The floor is a regression guard on those measurements, not a target:
+        # per-core scheduling changes which core schedules, not how far work can
+        # travel, so widening the spread means changing the push target or the
+        # steal range. What the floor must keep catching is a collapse into the
+        # publishing cluster, which would show up as three cores or fewer.
         assert len(cores) >= SPREAD_MIN_CORES, (
             f"fanout reached only {len(cores)} of {active} cores (floor {SPREAD_MIN_CORES}): {sorted(cores)}"
         )
