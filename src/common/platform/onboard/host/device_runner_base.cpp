@@ -3636,9 +3636,10 @@ int DeviceRunnerBase::validate_caller_stream(rtStream_t caller) {
     return 0;
 }
 
-int DeviceRunnerBase::queue_caller_entry(const PreparedExecution &prepared, LaunchProgressSink &sink) {
-    if (prepared.caller_stream == nullptr) return 0;
-    return caller_orders_[prepared.pipeline_slot]->fork(prepared.identity, sink);
+int DeviceRunnerBase::queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink) {
+    return caller_orders_[prepared.pipeline_slot]->fork(prepared.identity, sink, [&] {
+        return publish_for_launch(prepared.kernel_args, prepared.streams.aicpu, sink);
+    });
 }
 
 int DeviceRunnerBase::queue_caller_exit(const PreparedExecution &prepared) {
@@ -3651,7 +3652,7 @@ int DeviceRunnerBase::arm_run_fence(const PreparedExecution &prepared) {
     if (rc != 0) {
         LOG_ERROR("arm_run_fence: slot %u could not take a completion fence: %d", prepared.pipeline_slot, rc);
     }
-    if (rc == 0 && prepared.caller_stream != nullptr) {
+    if (rc == 0) {
         rc = caller_orders_[prepared.pipeline_slot]->arm(
             prepared.identity, prepared.caller_stream, prepared.streams.aicpu, prepared.streams.aicore
         );
@@ -3968,8 +3969,9 @@ int DeviceRunnerBase::record_cross_run_proof(const PreparedExecution &prepared, 
 }
 
 int DeviceRunnerBase::discharge_boundary_waits(const PreparedExecution &prepared, bool boundaries_complete) {
-    const int caller_rc =
-        caller_orders_[prepared.pipeline_slot]->discharge(prepared.identity, timeout_config_.stream_sync_timeout_ms);
+    const int caller_rc = caller_orders_[prepared.pipeline_slot]->discharge(
+        prepared.identity, timeout_config_.stream_sync_timeout_ms, boundaries_complete
+    );
     if (caller_rc != 0) {
         recover_device_or_mark_unusable(caller_rc);
         return caller_rc;
@@ -4280,15 +4282,8 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(
         LOG_ERROR("prepare_runtime_args failed: %d", rc);
         return rc;
     }
-    // A runtime whose entry values can travel as launch arguments publishes at
-    // launch instead, because which route they take is only answerable once the
-    // run holds the stream it will submit on. The snapshot taken above is what
-    // that publication sends, so the values are still this run's either way.
-    // Every other runtime publishes here, as it always has.
-    if (!runtime_launch_entry_args_plan(runtime).supported) {
-        rc = kernel_args.publish_runtime_args(/*launch_route_permitted=*/false);
-        if (rc != 0) return rc;
-    }
+    // Both runtimes publish on the bound AICPU stream inside the launch
+    // transaction. The slot retains the pinned source until run retirement.
     // Log config and device ordinal are no longer published per-run on
     // KernelArgs — they were latched once into the AICPU SO globals by
     // simpler_aicpu_init (ensure_aicpu_init_launched) at device init.

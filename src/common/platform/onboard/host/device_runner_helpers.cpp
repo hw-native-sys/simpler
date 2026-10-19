@@ -104,10 +104,10 @@ bool launch_entry_args_permitted(rtStream_t aicpu_stream) {
     return launch_route_permitted_by_capture(static_cast<int>(rc), static_cast<int>(status));
 }
 
-int publish_for_launch(KernelArgsHelper &kernel_args, rtStream_t aicpu_stream) {
+int publish_for_launch(KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, LaunchProgressSink &sink) {
     if (kernel_args.runtime_args_published()) return 0;
     const bool permitted = launch_entry_args_permitted(aicpu_stream);
-    const int rc = kernel_args.publish_runtime_args(permitted);
+    const int rc = kernel_args.publish_runtime_args(permitted, aicpu_stream, sink);
     if (rc != 0) {
         LOG_ERROR("publish_for_launch: this run's Runtime descriptor did not reach the device: %d", rc);
     }
@@ -161,6 +161,15 @@ int KernelArgsHelper::prepare_runtime_args(
         // here rather than inherited.
         slot.published_prefix_bytes = 0;
     }
+    if (slot.runtime_upload_source == nullptr) {
+        void *source = nullptr;
+        const int host_rc = rtMallocHost(&source, runtime_extent, 0);
+        if (host_rc != 0) return host_rc;
+        if (source == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        slot.runtime_upload_source = source;
+        slot.runtime_upload_bytes = runtime_extent;
+    }
+    if (slot.runtime_upload_bytes != runtime_extent) return PTO_RUNTIME_ERR_INVALID_STATE;
     // A block whose handshake region has never been published still holds
     // whatever the allocator returned, so the first publication onto it carries
     // that region from the ctor-zeroed host copy. Every later publication stops
@@ -249,9 +258,10 @@ void *KernelArgsHelper::launch_payload() {
     return launch_payload_;
 }
 
-int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
+int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream_t stream, LaunchProgressSink &sink) {
     if (runtime_args_state_ != RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (args.runtime_args == nullptr || slot_ == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (stream == nullptr || slot_->runtime_upload_source == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
 
     // The first publication onto a block sends the whole initialized prefix,
     // entry storage included, so its values are in the descriptor whether or
@@ -344,10 +354,10 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
     // Reentrant publish is rejected; copy failure leaves fresh prepare admissible.
     runtime_args_state_ = RuntimeArgsState::Empty;
     const int rc = runtime_image_.publish(
-        [this, prefix_cacheable](const void *source, size_t bytes) -> int {
+        [this, prefix_cacheable, stream, &sink](const void *source, size_t bytes) -> int {
             // Compared and recorded here, inside the callback, because `source`
-            // is the snapshot the publication consumes: it is alive for exactly
-            // this call and gone once it returns.
+            // is the snapshot the publication consumes. The DMA reads the slot's
+            // pinned copy, which survives this callback.
             if (prefix_cacheable && slot_->published_prefix_bytes == bytes &&
                 std::memcmp(source, slot_->published_prefix.data(), bytes) == 0) {
                 // The block holds these bytes already, and a skipped copy
@@ -361,7 +371,13 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
             // the mechanism — a warm failure leaves `workers_initialized` set,
             // so the next prepare sends this same length again.
             slot_->published_prefix_bytes = 0;
-            const int copy_rc = rtMemcpy(args.runtime_args, bytes, source, bytes, RT_MEMCPY_HOST_TO_DEVICE);
+            if (bytes > slot_->runtime_upload_bytes) return PTO_RUNTIME_ERR_INTERNAL;
+            std::memcpy(slot_->runtime_upload_source, source, bytes);
+            // A failed enqueue does not prove the stream holds no DMA reader.
+            sink.mark_submitted();
+            const int copy_rc = rtMemcpyAsync(
+                args.runtime_args, bytes, slot_->runtime_upload_source, bytes, RT_MEMCPY_HOST_TO_DEVICE, stream
+            );
             if (copy_rc != 0) return copy_rc;
             if (prefix_cacheable) {
                 // After the copy that earned it, into fixed storage: no
@@ -390,9 +406,9 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted) {
         return rc;
     }
     runtime_args_state_ = RuntimeArgsState::Published;
-    // Committed here and nowhere earlier: this copy is what put a defined value
-    // in that block's handshake region, so the fact is recorded by the call
-    // that earned it rather than by a caller that has to remember the order.
+    // An accepted initializing copy precedes the entry fork on the AICPU
+    // stream; both kernels wait behind it. Slot retirement protects the next
+    // publication from reusing this block or its source while that copy is live.
     if (initializing_slot_ != nullptr) {
         initializing_slot_->workers_initialized = true;
         initializing_slot_ = nullptr;
@@ -404,15 +420,23 @@ int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allo
     int first_error = 0;
     if (slot.runtime_args != nullptr) {
         const int rc = allocator.free(slot.runtime_args);
+        if (rc != 0) first_error = rc;
+        else slot.runtime_args = nullptr;
+    }
+    if (slot.runtime_upload_source != nullptr) {
+        const int rc = rtFreeHost(slot.runtime_upload_source);
         if (rc != 0) {
             if (first_error == 0) first_error = rc;
         } else {
-            // Whole-struct reset, so every fact recorded about the released
-            // block goes with it and a successor allocation starts uninitialized.
-            slot = SlotPersistentArgs{};
+            slot.runtime_upload_source = nullptr;
         }
     }
+    if (first_error == 0) slot = SlotPersistentArgs{};
     return first_error;
 }
 
+// No release calls: the generation has ended or completion is unproven, so a
+// queued DMA may still read the pinned source as well as name the device block.
+// Freeing that source before a reader stops is a host-memory use-after-free;
+// abandonment leaves it allocated for the rest of this process.
 void abandon_slot_persistent_args(SlotPersistentArgs &slot) { slot = SlotPersistentArgs{}; }

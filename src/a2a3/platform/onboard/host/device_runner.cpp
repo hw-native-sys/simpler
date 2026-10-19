@@ -713,16 +713,6 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             return LaunchTransactionResult{rc, LaunchProgress::NotStarted, LaunchReceipt{}};
         }
     }
-    // The one descriptor H2D for this run, ahead of activate_launch_shape, DFX
-    // arming and every kernel or event this run submits. It is here rather than
-    // at prepare because the route its entry values take is a question about
-    // `streams.aicpu` — the same handle the AICPU launch below submits on, held
-    // under this run's execution claim. A failure carries its own error out
-    // with the run NotStarted, so nothing was submitted and the run stays
-    // rollback-able.
-    if (const int publish_rc = publish_for_launch(prepared.kernel_args, streams.aicpu); publish_rc != 0) {
-        return LaunchTransactionResult{publish_rc, LaunchProgress::NotStarted, LaunchReceipt{}};
-    }
     LaunchTransactionResult result = exact_launch_transaction(
         prepared.identity, std::move(permit),
         [&](LaunchProgressSink &sink) -> int {
@@ -796,7 +786,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 return rc;
             }
 
-            if (int caller_rc = queue_caller_entry(prepared, sink); caller_rc != 0) return caller_rc;
+            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
 
             if (prepared.join.predecessor_owner != nullptr) {
                 int join_rc = queue_cross_run_wait(prepared, streams.aicore, sink);

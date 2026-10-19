@@ -30,6 +30,7 @@ struct RtsState {
     int alloc_rc = 0;
     int copy_rc = 0;
     int copies = 0;
+    LaunchProgressSink sink;
     int allocations = 0;
     int frees = 0;
     uint64_t last_copy_bytes = 0;
@@ -56,7 +57,7 @@ protected:
     int publish_once() {
         const int prepare_rc = helper.prepare_runtime_args(runtime, allocator, slot);
         if (prepare_rc != 0) return prepare_rc;
-        return helper.publish_runtime_args(/*launch_route_permitted=*/false);
+        return helper.publish_runtime_args(/*launch_route_permitted=*/false, this, rts.sink);
     }
 
     // The block's handshake region, as the device would see it.
@@ -91,7 +92,20 @@ extern "C" rtError_t rtFree(void *ptr) {
     std::free(ptr);
     return 0;
 }
-extern "C" rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
+extern "C" rtError_t rtMallocHost(void **ptr, uint64_t bytes, uint16_t) {
+    *ptr = std::malloc(bytes);
+    return *ptr == nullptr ? -1 : 0;
+}
+extern "C" rtError_t rtFreeHost(void *ptr) {
+    std::free(ptr);
+    return 0;
+}
+extern "C" rtError_t rtMemcpy(void *, uint64_t, const void *, uint64_t, rtMemcpyKind_t) {
+    ADD_FAILURE() << "runtime descriptor publication must be asynchronous";
+    return -99;
+}
+extern "C" rtError_t
+rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t) {
     ++rts.copies;
     rts.last_copy_bytes = bytes;
     EXPECT_EQ(kind, RT_MEMCPY_HOST_TO_DEVICE);
@@ -166,7 +180,9 @@ TEST_F(WorkersPublication, AnAbandonedSlotDoesNotInheritInitialization) {
 
     // The quarantine path drops ownership without freeing: the card is poisoned
     // and per-resource frees are unsafe.
+    void *abandoned_source = slot.runtime_upload_source;
     abandon_slot_persistent_args(slot);
+    std::free(abandoned_source);
     expected_leaked_allocations = 1;
     EXPECT_EQ(slot.runtime_args, nullptr);
     EXPECT_EQ(slot.runtime_bytes, 0U);

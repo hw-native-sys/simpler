@@ -30,6 +30,16 @@ int (*real_get_device)(int *) = nullptr;
 int (*real_set_device)(int) = nullptr;
 int (*real_set_op_timeout)(uint64_t, uint64_t *) = nullptr;
 int (*real_memcpy)(void *, uint64_t, const void *, uint64_t, int) = nullptr;
+int (*real_memcpy_async)(void *, uint64_t, const void *, uint64_t, int, void *) = nullptr;
+int (*real_malloc_host)(void **, uint64_t, uint16_t) = nullptr;
+int (*real_free_host)(void *) = nullptr;
+using CoreLaunch = int (*)(void *, uint64_t, uint32_t, void *, void *, void *, void *);
+CoreLaunch real_core_launch = nullptr;
+void *latest_pinned = nullptr;
+void *watched_source = nullptr;
+bool reject_descriptor_copy = false;
+bool descriptor_rejected = false;
+int descriptor_failures = 0, watched_source_frees = 0, core_launch_calls = 0, descriptor_guard_hits = 0;
 bool fail_next_copy = false;
 int copies = 0;
 bool fake_device_drain = false;
@@ -131,6 +141,48 @@ extern "C" int rtMemcpy(void *dst, uint64_t dst_bytes, const void *src, uint64_t
     }
     return real_memcpy != nullptr ? real_memcpy(dst, dst_bytes, src, src_bytes, kind) : -4323;
 }
+extern "C" int arm_descriptor_copy_failure() {
+    watched_source = latest_pinned;
+    reject_descriptor_copy = true;
+    descriptor_rejected = false;
+    descriptor_failures = watched_source_frees = descriptor_guard_hits = 0;
+    return watched_source == nullptr ? -1 : 0;
+}
+extern "C" int descriptor_copy_failures() { return descriptor_failures; }
+extern "C" int descriptor_source_frees() { return watched_source_frees; }
+extern "C" int descriptor_kernel_guard_hits() { return descriptor_guard_hits; }
+extern "C" int core_launch_call_count() { return core_launch_calls; }
+extern "C" int rtMallocHost(void **out, uint64_t size, uint16_t module_id) {
+    if (real_malloc_host == nullptr) return -4323;
+    const int rc = real_malloc_host(out, size, module_id);
+    if (rc == 0) latest_pinned = *out;
+    return rc;
+}
+extern "C" int rtFreeHost(void *ptr) {
+    if (ptr == watched_source) ++watched_source_frees;
+    return real_free_host == nullptr ? -4323 : real_free_host(ptr);
+}
+extern "C" int rtMemcpyAsync(void *dst, uint64_t cap, const void *src, uint64_t bytes, int kind, void *stream) {
+    if (reject_descriptor_copy && src == watched_source) {
+        reject_descriptor_copy = false;
+        descriptor_rejected = true;
+        ++descriptor_failures;
+        return -4321;
+    }
+    return real_memcpy_async == nullptr ? -4323 : real_memcpy_async(dst, cap, src, bytes, kind, stream);
+}
+extern "C" int rtKernelLaunchWithHandleV2(
+    void *handle, uint64_t entry, uint32_t blocks, void *args, void *sm, void *stream, void *config
+) {
+    ++core_launch_calls;
+    // A regression that ignores the rejected publication cannot execute a
+    // kernel against its uninitialized descriptor in this fault test.
+    if (reject_descriptor_copy || descriptor_rejected) {
+        ++descriptor_guard_hits;
+        return -4326;
+    }
+    return real_core_launch == nullptr ? -4323 : real_core_launch(handle, entry, blocks, args, sm, stream, config);
+}
 extern "C" void arm_reset_failures(int count) {
     reset_failures_left = count;
     reset_calls = 0;
@@ -180,7 +232,13 @@ extern "C" int bind_test_rts(void *runtime) {
     real_set_device = reinterpret_cast<int (*)(int)>(dlsym(runtime, "rtSetDevice"));
     real_set_op_timeout = reinterpret_cast<int (*)(uint64_t, uint64_t *)>(dlsym(runtime, "aclrtSetOpExecuteTimeOutV2"));
     real_memcpy = reinterpret_cast<int (*)(void *, uint64_t, const void *, uint64_t, int)>(dlsym(runtime, "rtMemcpy"));
-    if (!real_get_device || !real_set_device || !real_set_op_timeout || !real_memcpy) return -1;
+    real_memcpy_async = reinterpret_cast<decltype(real_memcpy_async)>(dlsym(runtime, "rtMemcpyAsync"));
+    real_malloc_host = reinterpret_cast<decltype(real_malloc_host)>(dlsym(runtime, "rtMallocHost"));
+    real_free_host = reinterpret_cast<decltype(real_free_host)>(dlsym(runtime, "rtFreeHost"));
+    real_core_launch = reinterpret_cast<CoreLaunch>(dlsym(runtime, "rtKernelLaunchWithHandleV2"));
+    if (!real_get_device || !real_set_device || !real_set_op_timeout || !real_memcpy || !real_memcpy_async ||
+        !real_malloc_host || !real_free_host || !real_core_launch)
+        return -1;
     return 0;
 }
 

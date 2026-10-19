@@ -21,6 +21,7 @@ constexpr unsigned char kDeviceMark = 0xa5;
 struct RtsState {
     int copy_rc = 0;
     int copies = 0;
+    LaunchProgressSink sink;
     uint64_t last_copy_bytes = 0;
     // Bytes to write before reporting `copy_rc`. Zero is the all-or-nothing
     // failure the other cases use; a positive value is the partial write a
@@ -43,7 +44,7 @@ protected:
     void TearDown() override { EXPECT_EQ(release_slot_persistent_args(slot, allocator), 0); }
 
     int prepare() { return helper.prepare_runtime_args(runtime, allocator, slot); }
-    int publish(bool permitted) { return helper.publish_runtime_args(permitted); }
+    int publish(bool permitted) { return helper.publish_runtime_args(permitted, this, rts.sink); }
 
     // One prepare+publish, with the launch route permitted or not.
     int run_once(bool permitted) {

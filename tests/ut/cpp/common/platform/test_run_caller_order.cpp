@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -84,7 +85,15 @@ protected:
 TEST_F(CallerOrderTest, CallerWaitPinsTheKernelFenceUntilItsOwnProofCompletes) {
     arm();
     LaunchProgressSink sink;
-    ASSERT_EQ(order.fork(kRun, sink), 0);
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
     EXPECT_TRUE(sink.submitted());
     EXPECT_EQ(trace, (std::vector<std::string>{"record caller", "wait cpu", "record cpu", "wait core"}));
     publish_whole_boundary();
@@ -116,7 +125,15 @@ TEST_F(CallerOrderTest, EveryForkFailureIsSubmittedAndNeedsAllThreeStreams) {
         operation = 0;
         fail_at = fault;
         LaunchProgressSink sink;
-        EXPECT_EQ(order.fork(kRun, sink), -77);
+        EXPECT_EQ(
+            order.fork(
+                kRun, sink,
+                [] {
+                    return 0;
+                }
+            ),
+            -77
+        );
         EXPECT_TRUE(sink.submitted());
         EXPECT_NE(order.retire(kRun), 0);
         sync_error = -88;
@@ -137,7 +154,15 @@ TEST_F(CallerOrderTest, FailedExitWaitOrTailRecordStillPinsTheBoundary) {
         fail_at = 0;
         arm();
         LaunchProgressSink sink;
-        ASSERT_EQ(order.fork(kRun, sink), 0);
+        ASSERT_EQ(
+            order.fork(
+                kRun, sink,
+                [] {
+                    return 0;
+                }
+            ),
+            0
+        );
         publish_whole_boundary();
         operation = 0;
         fail_at = fault;
@@ -157,7 +182,15 @@ TEST_F(CallerOrderTest, ArmingFailureAndStaleIdentityNeverQueueWork) {
     EXPECT_NE(order.arm(kRun, cpu, cpu, core), 0);
     arm();
     LaunchProgressSink sink;
-    EXPECT_NE(order.fork(kNext, sink), 0);
+    EXPECT_NE(
+        order.fork(
+            kNext, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
     EXPECT_FALSE(sink.submitted());
     EXPECT_TRUE(trace.empty());
     EXPECT_NE(order.arm(kNext, caller, cpu, core), 0);
@@ -168,7 +201,15 @@ TEST_F(CallerOrderTest, ArmingFailureAndStaleIdentityNeverQueueWork) {
 TEST_F(CallerOrderTest, AbandonAfterFenceQuarantineMakesNoDeviceCalls) {
     arm();
     LaunchProgressSink sink;
-    ASSERT_EQ(order.fork(kRun, sink), 0);
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
     publish_whole_boundary();
     ASSERT_EQ(order.join(kRun, fence), 0);
     fence.abandon();
@@ -177,3 +218,133 @@ TEST_F(CallerOrderTest, AbandonAfterFenceQuarantineMakesNoDeviceCalls) {
     EXPECT_EQ(destroyed, 0);
 }
 }  // namespace
+
+TEST_F(CallerOrderTest, PublicationPrecedesTheCoreForkAfterTheCallerDependency) {
+    arm();
+    LaunchProgressSink sink;
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [&] {
+                trace.push_back("publish cpu");
+                sink.mark_submitted();
+                return 0;
+            }
+        ),
+        0
+    );
+    EXPECT_EQ(trace, (std::vector<std::string>{"record caller", "wait cpu", "publish cpu", "record cpu", "wait core"}));
+    publish_whole_boundary();
+    ASSERT_EQ(order.join(kRun, fence), 0);
+    completed = true;
+    ASSERT_EQ(order.discharge(kRun, 100), 0);
+    EXPECT_EQ(order.retire(kRun), 0);
+}
+
+TEST_F(CallerOrderTest, PublicationWithoutACallerOrdersBothPrivateStreams) {
+    ASSERT_EQ(order.arm(kRun, nullptr, cpu, core), 0);
+    EXPECT_EQ(created, 1);
+    LaunchProgressSink sink;
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [&] {
+                trace.push_back("publish cpu");
+                sink.mark_submitted();
+                return 0;
+            }
+        ),
+        0
+    );
+    EXPECT_EQ(trace, (std::vector<std::string>{"publish cpu", "record cpu", "wait core"}));
+    EXPECT_NE(order.retire(kRun), 0);
+    ASSERT_EQ(order.discharge(kRun, 100, true), 0);
+    EXPECT_EQ(trace.size(), 3U) << "run boundaries consume the entry wait without a whole-stream sync";
+    EXPECT_EQ(order.retire(kRun), 0);
+    EXPECT_EQ(order.release(), 0);
+    EXPECT_EQ(destroyed, 1);
+}
+
+TEST_F(CallerOrderTest, AnUnchangedDescriptorWithoutACallerQueuesNoFork) {
+    ASSERT_EQ(order.arm(kRun, nullptr, cpu, core), 0);
+    LaunchProgressSink sink;
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
+    EXPECT_FALSE(sink.submitted());
+    EXPECT_TRUE(trace.empty());
+    EXPECT_EQ(order.discharge(kRun, 100), 0);
+    EXPECT_TRUE(trace.empty());
+    EXPECT_EQ(order.retire(kRun), 0);
+}
+
+TEST_F(CallerOrderTest, PublicationFailureRetainsItsPrivateStreamReaders) {
+    ASSERT_EQ(order.arm(kRun, nullptr, cpu, core), 0);
+    LaunchProgressSink sink;
+    EXPECT_EQ(
+        order.fork(
+            kRun, sink,
+            [&] {
+                sink.mark_submitted();
+                return -82;
+            }
+        ),
+        -82
+    );
+    EXPECT_TRUE(sink.submitted());
+    EXPECT_TRUE(trace.empty());
+    EXPECT_NE(order.retire(kRun), 0);
+    sync_error = -88;
+    EXPECT_EQ(order.discharge(kRun, 100), -88);
+    EXPECT_NE(order.retire(kRun), 0);
+    sync_error = 0;
+    EXPECT_EQ(order.discharge(kRun, 100), 0);
+    EXPECT_EQ(order.retire(kRun), 0);
+    EXPECT_EQ(trace, (std::vector<std::string>{"sync private", "sync private", "sync private", "sync private"}));
+}
+
+TEST_F(CallerOrderTest, AThrowAfterCopySubmissionStillRequiresDischarge) {
+    ASSERT_EQ(order.arm(kRun, nullptr, cpu, core), 0);
+    LaunchProgressSink sink;
+    EXPECT_THROW(
+        order.fork(
+            kRun, sink,
+            [&]() -> int {
+                sink.mark_submitted();
+                throw std::runtime_error("copy");
+            }
+        ),
+        std::runtime_error
+    );
+    EXPECT_NE(order.retire(kRun), 0);
+    ASSERT_EQ(order.discharge(kRun, 100), 0);
+    EXPECT_EQ(trace, (std::vector<std::string>{"sync private", "sync private"}));
+    EXPECT_EQ(order.retire(kRun), 0);
+}
+
+TEST_F(CallerOrderTest, FailedPublicationForkRecordDoesNotDiscardTheCopy) {
+    ASSERT_EQ(order.arm(kRun, nullptr, cpu, core), 0);
+    fail_at = 1;
+    LaunchProgressSink sink;
+    EXPECT_EQ(
+        order.fork(
+            kRun, sink,
+            [&] {
+                sink.mark_submitted();
+                return 0;
+            }
+        ),
+        -77
+    );
+    EXPECT_TRUE(sink.submitted());
+    EXPECT_EQ(trace, (std::vector<std::string>{"record cpu"}));
+    EXPECT_NE(order.retire(kRun), 0);
+    ASSERT_EQ(order.discharge(kRun, 100), 0);
+    EXPECT_EQ(order.retire(kRun), 0);
+}

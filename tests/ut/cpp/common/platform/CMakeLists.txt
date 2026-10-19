@@ -251,7 +251,7 @@ set(KERNEL_ARGS_HELPER_TEST_SOURCES
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_helpers.cpp
     ${SIMPLER_SRC}/@arch@/platform/onboard/host/memory_allocator.cpp)
 
-tmr_case(test_kernel_args_helper.cpp ARCHS a2a3
+tmr_case(test_kernel_args_helper.cpp
     SOURCES ${KERNEL_ARGS_HELPER_TEST_SOURCES}
             ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
     INCLUDES_BEFORE ${CMAKE_SOURCE_DIR}/support/kernel_args ${KERNEL_ARGS_INCLUDES})

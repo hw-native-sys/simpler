@@ -104,15 +104,10 @@ SINGLE_CONTEXT_TREES = frozenset({"utils", "hierarchical", "runtime_status"})
 # is a gap to close rather than an absent combination, and its reason says so. A
 # stale entry is an error, so the table only shrinks.
 WAIVERS: dict[tuple[str, str], str] = {
-    ("common/platform/test_kernel_args_helper.cpp", "a5/tensormap_and_ringbuffer"): (
-        "both cases assert the uploaded prefix of a Runtime image ends at "
-        "offsetof(DeviceRuntimeLaunchDesc, teardown_gates). a5's "
-        "tensormap_and_ringbuffer Runtime has no device-initialized tail — its "
-        "header states extent equals copy size — so it declares no "
-        "teardown_gates and the boundary has no counterpart there"
-    ),
     ("common/platform/test_kernel_persistent_args.cpp", "a5/tensormap_and_ringbuffer"): (
-        "same absent teardown_gates tail as test_kernel_args_helper"
+        "the test asserts the uploaded Runtime prefix ends at teardown_gates; "
+        "a5's tensormap_and_ringbuffer Runtime has no such device-initialized "
+        "tail, so this boundary assertion has no counterpart there"
     ),
     ("common/platform/test_chip_swimlane_run_export.cpp", "a5/host_build_graph"): (
         "the case compares against a golden captured on a2a3, carrying that "

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ctypes
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ from test_kernel_mode_c_api import (
     _CallerContexts,
     _load,
     _native_run_storage,
+    kernel_close_faults,  # noqa: F401 - shared pytest fixture
 )
 
 _ROOT = Path(__file__).resolve().parents[3]
@@ -45,12 +47,39 @@ def _callable(arch, runtime):
     return case.compile_chip_callable(arch)
 
 
-def _run(arch, runtime, device):
+def _close_case(lib, ctx, *, run, pending, streams, device_buffers, host_buffers, contexts, faults):
+    if pending:
+        lib.simpler_finalize_run(ctx, run)
+    close_rc = lib.finalize_device(ctx)
+    if faults is not None and (faults.descriptor_copy_failures() != 0 or faults.descriptor_kernel_guard_hits() != 0):
+        assert close_rc != 0
+        assert faults.descriptor_source_frees() == 0
+        for stream in streams:
+            assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
+    else:
+        assert close_rc == 0
+    lib.destroy_device_context(ctx)
+    for pointers, free in (
+        (streams, lib.aclrtDestroyStream),
+        (device_buffers, lib.aclrtFree),
+        (host_buffers, lib.aclrtFreeHost),
+    ):
+        for ptr in pointers:
+            if ptr.value:
+                assert free(ptr) == 0
+    contexts.close()
+
+
+def _run(arch, runtime, device, faults_path=None):
     from simpler.task_interface import AddressSpace, ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
     chip = _callable(arch, runtime)
     image = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
     lib = _load(arch, "onboard", runtime)
+    faults = ctypes.CDLL(faults_path) if faults_path else None
+    if faults is not None:
+        faults.bind_test_log.argtypes = [ctypes.c_void_p]
+        assert faults.bind_test_log(lib._handle) == 0
     lib.rtSetDevice.argtypes = [ctypes.c_int]
     assert lib.rtSetDevice(device) == 0
     contexts = _CallerContexts(lib, device)
@@ -121,6 +150,28 @@ def _run(arch, runtime, device):
                 == 0
             )
             pending = True
+            if faults is not None:
+                assert faults.arm_descriptor_copy_failure() == 0
+                launches = faults.core_launch_call_count()
+                rc = lib.simpler_launch_run_on_stream(ctx, run, stream, None)
+                assert rc == -4321, rc
+                assert faults.descriptor_copy_failures() == 1
+                assert faults.core_launch_call_count() == launches
+                assert faults.descriptor_source_frees() == 0
+                assert lib.simpler_finalize_run(ctx, run) != 0
+                pending = False
+                # Partial enqueue cannot publish the clean no-submission receipt.
+                assert ctypes.string_at(run, 8) == bytes(8)
+                descriptor.run_epoch += 1
+                assert (
+                    lib.simpler_prepare_run(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor))
+                    != 0
+                )
+                assert faults.descriptor_copy_failures() == 1
+                for _ in range(2):
+                    assert lib.finalize_device(ctx) != 0
+                    assert faults.descriptor_source_frees() == 0
+                return
             # No synchronization separates caller writes from launch. These
             # buffers stay alive through the caller's final read below.
             for index in range(2):
@@ -143,19 +194,17 @@ def _run(arch, runtime, device):
             pending = False
         assert storage is not None  # owns the aligned native run storage
     finally:
-        if pending:
-            lib.simpler_finalize_run(ctx, run)
-        assert lib.finalize_device(ctx) == 0
-        lib.destroy_device_context(ctx)
-        for pointers, free in (
-            (streams, lib.aclrtDestroyStream),
-            (device_buffers, lib.aclrtFree),
-            (host_buffers, lib.aclrtFreeHost),
-        ):
-            for ptr in pointers:
-                if ptr.value:
-                    assert free(ptr) == 0
-        contexts.close()
+        _close_case(
+            lib,
+            ctx,
+            run=run,
+            pending=pending,
+            streams=streams,
+            device_buffers=device_buffers,
+            host_buffers=host_buffers,
+            contexts=contexts,
+            faults=faults,
+        )
 
 
 @pytest.mark.parametrize(
@@ -178,5 +227,29 @@ def test_borrowed_launch_orders_caller_work(arch, runtime, request):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize("task_queue", ["0", "1"])
+@pytest.mark.parametrize(
+    ("arch", "runtime"),
+    [
+        pytest.param(arch, runtime, marks=[pytest.mark.requires_hardware, pytest.mark.platforms([arch])])
+        for arch in ("a2a3", "a5")
+        for runtime in ("host_build_graph", "tensormap_and_ringbuffer")
+    ],
+)
+def test_descriptor_enqueue_failure_retains_ownership(arch, runtime, task_queue, request):
+    shim = request.getfixturevalue("kernel_close_faults")
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    environment = {**os.environ, "LD_PRELOAD": str(shim), "TASK_QUEUE_ENABLE": task_queue}
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, str(shim)],
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+        env=environment,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 if __name__ == "__main__":
-    _run(sys.argv[1], sys.argv[2], int(sys.argv[3]))
+    _run(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4] if len(sys.argv) > 4 else None)

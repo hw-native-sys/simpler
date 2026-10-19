@@ -42,9 +42,22 @@ extern "C" rtError_t rtFree(void *ptr) {
     std::free(ptr);
     return 0;
 }
+extern "C" rtError_t rtMallocHost(void **out, uint64_t bytes, uint16_t) {
+    *out = std::malloc(bytes);
+    return *out ? 0 : -1;
+}
+extern "C" rtError_t rtFreeHost(void *ptr) {
+    std::free(ptr);
+    return 0;
+}
 extern "C" rtError_t rtMemcpy(void *dst, uint64_t, const void *src, uint64_t bytes, rtMemcpyKind_t) {
     std::memcpy(dst, src, bytes);
     return 0;
+}
+extern "C" rtError_t
+rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream) {
+    assert(stream != nullptr);
+    return rtMemcpy(dst, capacity, src, bytes, kind);
 }
 extern "C" rtError_t rtStreamCreate(rtStream_t *out, int32_t) {
     assert(streams_created < 8);
@@ -114,17 +127,17 @@ static void check_execution_streams() {
     assert(runner.wait_run_fence(*prepared) == PTO_RUNTIME_ERR_INVALID_STATE);
     assert(queried.empty() && synchronized.empty());
     assert(prepared->kernel_args.prepare_runtime_args(runtime, allocator, slot) == 0);
-    // The production launch publishes before arming. Arming fails before any
-    // kernel can reach RTS, and the returned owner still names that publication.
+    // Arming fails before descriptor publication or kernel submission. The
+    // returned owner retains its unpublished snapshot and bound stream pair.
     event_error = -777;
     auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(id));
     assert(outcome.rc == -777);
     assert(outcome.progress == LaunchProgress::NotStarted && !outcome.poisoned());
     assert(outcome.active == nullptr && outcome.prepared != nullptr);
-    assert(outcome.prepared->kernel_args.runtime_args_published());
+    assert(!outcome.prepared->kernel_args.runtime_args_published());
     const auto bound = outcome.prepared->streams;
     assert(bound.ready() && bound.aicpu != bound.aicore);
-    assert(publication_stream == bound.aicpu);
+    assert(publication_stream == nullptr);
     assert(streams_created == 0 ? bound.aicore == &stream_tokens[7] : bound.aicore == &stream_tokens[1]);
 
     // Replace whatever this arch submits on, by the production route that
@@ -191,6 +204,7 @@ static void check_cleanup_wait_failure(SimplerExecutionMode mode, int failing_si
     auto &slot = runner.slot_persistent_args(0);
     assert(prepared.kernel_args.prepare_runtime_args(runtime, runner.allocator(), slot) == 0);
     void *allocation = slot.runtime_args;
+    void *upload_source = slot.runtime_upload_source;
     assert(allocation != nullptr);
     events_created = 0;
     assert(runner.arm_run_fence(prepared) == 0);
@@ -242,7 +256,10 @@ static void check_cleanup_wait_failure(SimplerExecutionMode mode, int failing_si
     failing_sync_stream = nullptr;
     // This fixture's allocations are host-backed RTS stubs; no device can
     // still hold them after the cleanup assertions have finished.
-    if (poisoned) assert(runner.allocator().free(allocation) == 0);
+    if (poisoned) {
+        assert(runner.allocator().free(allocation) == 0);
+        assert(rtFreeHost(upload_source) == 0);
+    }
 }
 
 int main() {

@@ -31,10 +31,23 @@ extern "C" rtError_t rtFree(void *p) {
     std::free(p);
     return 0;
 }
+extern "C" rtError_t rtMallocHost(void **out, uint64_t bytes, uint16_t) {
+    *out = std::malloc(bytes);
+    return *out ? 0 : -1;
+}
+extern "C" rtError_t rtFreeHost(void *ptr) {
+    std::free(ptr);
+    return 0;
+}
 extern "C" rtError_t rtMemcpy(void *dst, uint64_t, const void *src, uint64_t n, rtMemcpyKind_t) {
     if (copy_error) return copy_error;
     std::memcpy(dst, src, n);
     return 0;
+}
+extern "C" rtError_t
+rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream) {
+    assert(stream != nullptr);
+    return rtMemcpy(dst, capacity, src, bytes, kind);
 }
 extern "C" rtError_t rtStreamCreate(rtStream_t *, int32_t) {
     ++device_ops;
@@ -51,6 +64,7 @@ int main() {
     MemoryAllocator allocator;
     SlotPersistentArgs slot;
     NativeRunIdentity id{1, 1, 1, 0};
+    int stream_token = 0;
     // Unprepared, prepared then released, failed publish, published then released.
     for (int arm = 0; arm != 4; ++arm) {
         auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
@@ -59,11 +73,15 @@ int main() {
             if (arm == 1) prepared->kernel_args.release_run_view();
             if (arm == 2) {
                 copy_error = -91;
-                assert(prepared->kernel_args.publish_runtime_args(/*launch_route_permitted=*/false) == -91);
+                LaunchProgressSink sink;
+                assert(prepared->kernel_args.publish_runtime_args(false, &stream_token, sink) == -91);
+                assert(sink.submitted());
                 copy_error = 0;
             }
             if (arm == 3) {
-                assert(prepared->kernel_args.publish_runtime_args(/*launch_route_permitted=*/false) == 0);
+                LaunchProgressSink sink;
+                assert(prepared->kernel_args.publish_runtime_args(false, &stream_token, sink) == 0);
+                assert(sink.submitted());
                 prepared->kernel_args.release_run_view();
             }
         }
@@ -78,6 +96,7 @@ int main() {
         assert(!outcome.poisoned());
         outcome.prepared->kernel_args.release_run_view();
     }
+    std::printf("Runtime extent: %llu bytes per slot\n", static_cast<unsigned long long>(slot.runtime_upload_bytes));
     assert(release_slot_persistent_args(slot, allocator) == 0);
     std::puts("PASS: four launch refusals; owner retained, NotStarted, zero stream/event creation");
 }

@@ -53,6 +53,17 @@ int rtFree(void *ptr) {
     std::free(ptr);
     return 0;
 }
+int rtMallocHost(void **ptr, uint64_t bytes, uint16_t) {
+    *ptr = std::malloc(bytes);
+    return *ptr == nullptr ? PTO_RUNTIME_ERR_INTERNAL : 0;
+}
+int rtFreeHost(void *ptr) {
+    std::free(ptr);
+    return 0;
+}
+int rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t) {
+    return rtMemcpy(dst, capacity, src, bytes, kind);
+}
 int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t) {
     if (const int rc = native_admission_transport::control().copy_rc) return rc;
     if (bytes > capacity || (bytes && (!dst || !src))) return -2;

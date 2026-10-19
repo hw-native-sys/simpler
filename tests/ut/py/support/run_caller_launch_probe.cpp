@@ -50,10 +50,23 @@ extern "C" rtError_t rtFree(void *ptr) {
     std::free(ptr);
     return 0;
 }
+extern "C" rtError_t rtMallocHost(void **out, uint64_t bytes, uint16_t) {
+    *out = std::malloc(bytes);
+    return *out ? 0 : -1;
+}
+extern "C" rtError_t rtFreeHost(void *ptr) {
+    std::free(ptr);
+    return 0;
+}
 extern "C" rtError_t rtMemcpy(void *dst, uint64_t, const void *src, uint64_t bytes, rtMemcpyKind_t) {
     ++copies;
     std::memcpy(dst, src, bytes);
     return 0;
+}
+extern "C" rtError_t
+rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream) {
+    const int rc = step("publish", stream);
+    return rc == 0 ? rtMemcpy(dst, capacity, src, bytes, kind) : rc;
 }
 extern "C" rtError_t rtStreamCreate(rtStream_t *out, int32_t) {
     *out = &tokens[next_stream++];
@@ -186,27 +199,27 @@ static void check(int fault, bool capturing) {
         const auto streams = outcome.active->prepared->streams;
         assert(
             (trace == std::vector<std::string>{
-                          "record", "wait", "record", "wait", "record", "core", "record", "cpu", "wait", "record",
-                          "record", "wait", "record"
+                          "record", "wait", "publish", "record", "wait", "record", "core", "record", "cpu", "wait",
+                          "record", "record", "wait", "record"
                       })
         );
         assert(
             (stream_trace == std::vector<void *>{
-                                 caller, streams.aicpu, streams.aicpu, streams.aicore, streams.aicore, streams.aicore,
-                                 streams.aicore, streams.aicpu, streams.aicpu, streams.aicpu, streams.aicpu, caller,
-                                 caller
+                                 caller, streams.aicpu, streams.aicpu, streams.aicpu, streams.aicore, streams.aicore,
+                                 streams.aicore, streams.aicore, streams.aicpu, streams.aicpu, streams.aicpu,
+                                 streams.aicpu, caller, caller
                              })
         );
     }
     if (!capturing && fault == 0) {
         // Each wait names its own record, not just the expected stream.
-        for (const auto edge : {std::pair{0, 1}, std::pair{2, 3}, std::pair{6, 8}, std::pair{10, 11}}) {
+        for (const auto edge : {std::pair{0, 1}, std::pair{3, 4}, std::pair{7, 9}, std::pair{11, 12}}) {
             assert(event_trace[edge.first] != nullptr);
             assert(event_trace[edge.first] == event_trace[edge.second]);
         }
-        assert(event_trace[0] != event_trace[2]);
-        assert(event_trace[6] != event_trace[10]);
-        assert(event_trace[12] != event_trace[10]);
+        assert(event_trace[0] != event_trace[3]);
+        assert(event_trace[7] != event_trace[11]);
+        assert(event_trace[13] != event_trace[11]);
     }
     runner.finish();
     assert(release_slot_persistent_args(slot, allocator) == 0);
@@ -270,8 +283,8 @@ int main() {
     check_arena_growth(SIMPLER_MODE_PROGRAM);
     check_arena_growth(SIMPLER_MODE_KERNEL);
     check(0, false);
-    // Positions 5 and 10 are optional timing marks; their failure is deliberately non-fatal.
-    for (int fault : {1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13})
+    // Positions 6 and 11 are optional timing marks; their failure is deliberately non-fatal.
+    for (int fault : {1, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14})
         check(fault, false);
     check(0, true);
     next_stream = next_event = 0;
@@ -286,7 +299,7 @@ int main() {
     assert(copies == prior_copies);
     runner.check_failed_event_close();
     runner.finish();
-    std::puts("PASS: real launch ordering, eleven partial failures, and pre-publication capture refusal");
+    std::puts("PASS: real launch ordering, twelve partial failures, and pre-publication capture refusal");
 }
 extern "C" void unified_log_warn(const char *, const char *, ...) {}
 extern "C" void unified_log_info(const char *, const char *, ...) {}

@@ -36,6 +36,11 @@ struct rtTaskCfgInfo_t {
 extern "C" {
 int rtMalloc(void **ptr, uint64_t bytes, uint32_t type, uint16_t module_id);
 int rtFree(void *ptr);
+int rtMallocHost(void **ptr, uint64_t bytes, uint16_t module_id);
+int rtFreeHost(void *ptr);
+int rtMemcpyAsync(
+    void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream
+);
 int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind);
 int rtSetDevice(int32_t device);
 int rtDeviceReset(int32_t device);

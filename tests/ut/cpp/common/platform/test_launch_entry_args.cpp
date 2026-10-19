@@ -46,7 +46,20 @@ extern "C" rtError_t rtFree(void *ptr) {
     std::free(ptr);
     return 0;
 }
-extern "C" rtError_t rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
+extern "C" rtError_t rtMallocHost(void **ptr, uint64_t bytes, uint16_t) {
+    *ptr = std::malloc(bytes);
+    return *ptr == nullptr ? -1 : 0;
+}
+extern "C" rtError_t rtFreeHost(void *ptr) {
+    std::free(ptr);
+    return 0;
+}
+extern "C" rtError_t rtMemcpy(void *, uint64_t, const void *, uint64_t, rtMemcpyKind_t) {
+    ADD_FAILURE() << "descriptor publication must be asynchronous";
+    return -99;
+}
+extern "C" rtError_t
+rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t) {
     ++rts.copies;
     rts.last_copy_bytes = bytes;
     EXPECT_EQ(kind, RT_MEMCPY_HOST_TO_DEVICE);
@@ -121,15 +134,15 @@ TEST_F(LaunchEntryArgs, ASnapshotIsPublishedAtMostOnce) {
     EXPECT_EQ(rts.copies, copies_after_publish);
 }
 
-// A null stream cannot be asked, so it is not asked — and routes through the
-// descriptor, which needs no query to be correct.
-TEST_F(LaunchEntryArgs, ANullStreamIsNotQueriedAndTakesTheDescriptor) {
+// Publication requires the stream that orders its asynchronous copy.
+TEST_F(LaunchEntryArgs, ANullStreamIsNotQueriedAndCannotPublish) {
     capture = {};
     ASSERT_EQ(prepare(), 0);
-    ASSERT_EQ(publish_for_launch(helper, nullptr), 0);
+    EXPECT_EQ(publish_for_launch(helper, nullptr, rts.sink), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_EQ(capture.queries, 0);
-    EXPECT_TRUE(helper.runtime_args_published());
-    EXPECT_EQ(helper.launch_payload_bytes(), sizeof(KernelArgs));
+    EXPECT_FALSE(helper.runtime_args_published());
+    EXPECT_FALSE(rts.sink.submitted());
+    EXPECT_EQ(rts.copies, 0);
 }
 
 // What a launch entry admits, as both arches ask it. An unpublished, unprepared
@@ -145,14 +158,14 @@ TEST_F(LaunchEntryArgs, LaunchAdmissionTracksThePublicationStates) {
     ASSERT_EQ(prepare(), 0);
     EXPECT_TRUE(helper.launchable()) << "prepared is admitted: publication is what the launch does first";
 
-    ASSERT_EQ(publish_for_launch(helper, stream), 0);
+    ASSERT_EQ(publish_for_launch(helper, stream, rts.sink), 0);
     EXPECT_TRUE(helper.launchable());
     EXPECT_TRUE(helper.runtime_args_published());
 
     // Already published: the step is idempotent and asks nothing again.
     const int queries_before = capture.queries;
     const int copies_before = rts.copies;
-    EXPECT_EQ(publish_for_launch(helper, stream), 0);
+    EXPECT_EQ(publish_for_launch(helper, stream, rts.sink), 0);
     EXPECT_EQ(capture.queries, queries_before);
     EXPECT_EQ(rts.copies, copies_before);
 
@@ -169,7 +182,7 @@ TEST_F(LaunchEntryArgs, AFailedProductionPublishReturnsItsOwnErrorAndNoPayload) 
     rts.copy_rc = -73;
 
     ASSERT_EQ(prepare(), 0);
-    EXPECT_EQ(publish_for_launch(helper, stream), -73) << "the rc the copy returned, unchanged";
+    EXPECT_EQ(publish_for_launch(helper, stream, rts.sink), -73) << "the rc the copy returned, unchanged";
     EXPECT_FALSE(helper.launchable()) << "an unpublished run must not reach a kernel submission";
     EXPECT_FALSE(helper.runtime_args_published());
     EXPECT_EQ(helper.launch_payload(), nullptr);

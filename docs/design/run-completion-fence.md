@@ -51,8 +51,8 @@ enqueue result; wait/finalize still report the run's device verdict.
 
 ```text
 caller:  prior work -> record Start ------------------------ wait CpuDone -> record Tail -> later work
-AICPU:                wait Start -> record Fork -> kernel -> wait CoreDone -> record CpuDone
-AICore:                            wait Fork ----> kernel -> record CoreDone
+AICPU:                wait Start -> descriptor H2D -> record Fork -> kernel -> wait CoreDone -> record CpuDone
+AICore:                                              wait Fork -> kernel -> record CoreDone
 ```
 
 `Fork` precedes the AICPU kernel: that kernel can wait for AICore's handshake,
@@ -64,23 +64,33 @@ requires this whole-operator join even when cross-run early enqueue is disabled.
 for explicit caller launches. It holds a reference to the run's existing AICPU
 boundary until `Tail` proves the caller consumed that wait. Poll therefore also
 queries `Tail`, and drain discharges that reference before retirement. Ordinary
-program launch creates no caller events. Timing marks are independent diagnostics
+program launch borrows no caller stream. An asynchronous descriptor publication
+uses the same AICPU-to-AICore fork even without a caller; a cached descriptor with
+no caller queues neither a copy nor a fork. Timing marks are independent
 and do not substitute for these ordering edges.
 
 An attempted record or wait may be enqueued even when its API reports an error.
-The launch transaction is therefore `Partial` from the first caller-edge attempt,
-with its resources retained. If no tail was recorded, bounded synchronization of
-all three bound streams is the fallback proof. A failed proof keeps references
+The launch transaction is therefore `Partial` from the first caller-edge or
+asynchronous descriptor-copy attempt, with its resources retained. If no tail
+was recorded, bounded synchronization of the bound streams is the fallback
+proof (the two private streams, and the caller stream when present). A failed proof keeps references
 quarantined; borrowed execution never resets or synchronizes the whole device.
 Failure does not establish the caller's exit dependency, so the caller must not
 consume output merely because launch returned an error.
 
 This entry is eager-only. It validates the current borrowed RTS context and
 rejects an active caller capture before launch metadata publication. Preparation
-and callable registration take place outside capture. Metadata publication is
-still synchronous, and the old `simpler_kernel_mode_launch` stub and capability
-bit remain closed pending public Worker integration. Native completion events
-and their caller references are not a captured-graph lifetime contract.
+and callable registration take place outside capture. The common eager launch
+publishes its Runtime descriptor asynchronously on the actual AICPU stream;
+its entry fork orders the AICore reader behind that copy. The slot retains a
+pinned immutable source through run retirement. A copy attempt marks Partial
+before entering RTS, so enqueue failure cannot acquire a no-submission receipt.
+The two kernel boundaries consume an ordinary publication fork; unproven partial
+work requires bounded private-stream discharge or quarantine. Bulk HBG arena
+publication and DFX writes retain their own synchronization. The compatibility
+`simpler_kernel_mode_launch` stub and capability bit remain closed; public Worker
+eager uses the shared native lane. Native completion events and their caller
+references are not a captured-graph lifetime contract.
 
 A direct L2 Python `Worker` owns the native `_ChipWorker` itself. Its callable
 handles, argument imports, source uses and close journal belong to `Worker`;

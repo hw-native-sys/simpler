@@ -304,6 +304,7 @@ TEST_F(LaunchEntryArgs, AnIdenticalWarmPrefixIsNotRepublished) {
     rts = {};
     ASSERT_EQ(run_once(true), 0);
     EXPECT_EQ(rts.copies, 0) << "the block already holds these bytes";
+    EXPECT_FALSE(rts.sink.submitted()) << "a cache hit queues no DMA reader";
     EXPECT_TRUE(helper.runtime_args_published()) << "a skip still publishes the run";
     EXPECT_GT(helper.launch_payload_bytes(), sizeof(KernelArgs)) << "the launch package is still built";
     EXPECT_EQ(slot.published_prefix_bytes, runtime_launch_entry_args_plan(runtime).descriptor_bytes_when_launched);
@@ -541,7 +542,7 @@ TEST_F(LaunchEntryArgs, EveryCaptureAnswerRoutesThroughTheProductionPublishStep)
     // and stays on the descriptor whatever the query says.
     capture = {};
     ASSERT_EQ(prepare(), 0);
-    ASSERT_EQ(publish_for_launch(helper, stream), 0);
+    ASSERT_EQ(publish_for_launch(helper, stream, rts.sink), 0);
     ASSERT_TRUE(slot.workers_initialized);
 
     for (const Answer &answer : answers) {
@@ -553,7 +554,7 @@ TEST_F(LaunchEntryArgs, EveryCaptureAnswerRoutesThroughTheProductionPublishStep)
         capture.status = answer.status;
 
         ASSERT_EQ(prepare(), 0);
-        ASSERT_EQ(publish_for_launch(helper, stream), 0);
+        ASSERT_EQ(publish_for_launch(helper, stream, rts.sink), 0);
         EXPECT_EQ(capture.queries, 1) << "the permit asks once, and never retries";
         EXPECT_EQ(capture.last_stream, stream) << "it must ask about the stream the launch will submit on";
         EXPECT_TRUE(helper.runtime_args_published());

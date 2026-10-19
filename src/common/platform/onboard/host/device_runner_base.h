@@ -2164,7 +2164,7 @@ protected:
      * still submitted nothing and can roll back.
      */
     int arm_run_fence(const PreparedExecution &prepared);
-    int queue_caller_entry(const PreparedExecution &prepared, LaunchProgressSink &sink);
+    int queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink);
     int queue_caller_exit(const PreparedExecution &prepared);
     RunStreams borrowed_run_streams() const;
 

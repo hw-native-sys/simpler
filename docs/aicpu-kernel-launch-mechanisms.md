@@ -156,39 +156,55 @@ working on a2a3 onboard across HBG and TRB, so the front was removed.
   per-task AICPU entry launches. Splitting those into separate loader objects
   would be a larger lifecycle refactor.
 
-In the program path, `KernelArgsHelper::prepare_runtime_args` reserves the
-slot-owned destination and snapshots only `DeviceRuntimeLaunchDesc`.
-`publish_runtime_args` consumes that snapshot with a synchronous H2D before
-launch. The sole production caller, `init_runtime_args_with_metadata`, calls
-them consecutively, with only a return-code check between them: there is no
-intervening Runtime mutation today. The snapshot establishes a boundary for
-later decoupled/asynchronous publication and capture work; it does not fix a
-current mutation race or make publication asynchronous.
+In the common eager path, `KernelArgsHelper::prepare_runtime_args` reserves
+the slot-owned destination and pinned host source, then snapshots the published
+prefix of `DeviceRuntimeLaunchDesc`. Both runtimes defer the descriptor copy to
+the actual launch stream. HBG's separate host-built arena publication still runs
+synchronously during preparation.
+
+The pinned allocation is requested once per prepared slot and retained until
+finalize. Its requested size is `runtime_device_extent_size`: 43,264 bytes for
+A2/A3 TMR, 47,872 for A5 TMR, 9,472 for A2/A3 HBG and 14,080 for A5 HBG in the
+current layouts. The total requested pinned capacity is the number of resident
+prepared slots times that extent; RTS page/allocation rounding can increase the
+physical reservation. Allocation failure is a prepare error, before submission.
+
+`queue_run_entry` orders the optional caller dependency onto the AICPU stream,
+then invokes `publish_for_launch`. The helper copies the snapshot into the
+slot's pinned source and enqueues `rtMemcpyAsync` on that stream. The entry fork
+records an event after the copy and makes the AICore stream wait for it before
+launching its kernel. This also protects a cold allocation's first handshake
+initialization. An unchanged TMR launch-route prefix queues neither a copy nor,
+without a caller, an entry fork.
 
 An unpublished descriptor rejects another preparation without changing its
-snapshot, destination or allocator. Explicit `release_run_view` discards it;
-a fresh preparation after publication or release withdraws the earlier
-publication status. Move transfers both the snapshot and status, leaving the
-source unable to publish or launch.
+snapshot, destination or allocator. Explicit `release_run_view` discards the
+per-run view; it does not release the slot's source or destination. Native slot
+reservation prevents another run from overwriting the pinned source before the
+current run is retired. Move transfers the snapshot and publication status,
+leaving the source helper unable to publish or launch.
 
-`runtime_args_published()` becomes true only after synchronous H2D succeeds.
-Both onboard `launch_execution` entries check it before stream creation, DFX
-arming or kernel submission. A missing or failed publication returns
-`INVALID_STATE` with `NotStarted` and the prepared owner available for cleanup;
-it does not poison the device or start an active execution. A failed copy clears
-the launch pointer while retaining the slot allocation. A repeated publish is
-rejected without a copy and preserves the existing publication verdict.
+`runtime_args_published()` means the copy was accepted into stream order, or an
+identical prefix was already resident. It does not prove DMA completion. Both
+onboard launch entries admit Prepared or Published; actual kernel submission is
+after publication and the entry fork. Missing preparation is `NotStarted`.
+An attempted asynchronous copy marks the launch transaction before the RTS call:
+a failed enqueue, fork record or wait is `Partial` and retains its execution
+owner. A failed copy leaves the descriptor unpublished and withdraws its launch
+payload. A repeated publish is rejected without another copy.
 
-Successful prepare installs a non-null `args.runtime_args`, but the destination
-still holds the previous run's bytes or uninitialized storage. The launch check
-therefore uses publication status as well as the pointer. This verdict covers
-only the Runtime descriptor: HBG image publication and late DFX arming retain
-their own checked failure paths. A future asynchronous copy must retain its
-source through completion; this synchronous status does not supply that lifetime.
+A normal run's two completion boundaries prove that its publication fork was
+consumed. A partial run without those boundaries requires the existing bounded
+stream discharge; failed proof quarantines its resources. Slot teardown releases
+the pinned source only on the normal retirement path and retains failed frees
+for retry. Fatal abandonment leaves the pinned source allocated for the rest of
+the process: freeing it while a DMA reader may still exist is a host-memory
+use-after-free. Caller streams remain caller-owned.
 
-The snapshot adds one host allocation and descriptor-size CPU copy per run;
-those costs are paid even with the adjacent calls. It does not reduce device
-transfer bytes or establish capture/replay support.
+The prepare snapshot still costs a CPU copy per run; an actual upload adds a CPU
+copy into the reused pinned source. This removes the descriptor's blocking H2D
+and does not establish a throughput gain or capture/replay support. Bulk HBG
+image publication, DFX writes, graph ownership and replay remain separate work.
 
 ## Method 3: Path B — `KERNEL_TYPE_AICPU_CUSTOM` (broken — #822)
 

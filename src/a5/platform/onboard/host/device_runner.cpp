@@ -506,8 +506,8 @@ int DeviceRunner::prepare_execution(
 LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) {
     // Prepared is admitted as well as Published: publication happens below,
     // once this run holds the stream it will submit on. What a kernel
-    // submission requires is Published, which is established before the
-    // transaction opens.
+    // submission requires is Published, which the transaction's entry fork
+    // establishes before it submits either kernel.
     if (!prepared.kernel_args.launchable()) {
         LOG_ERROR("launch_execution: this run holds no Runtime descriptor to publish");
         return LaunchTransactionResult{PTO_RUNTIME_ERR_INVALID_STATE, LaunchProgress::NotStarted, LaunchReceipt{}};
@@ -522,16 +522,6 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
         if (rc != 0) {
             return LaunchTransactionResult{rc, LaunchProgress::NotStarted, LaunchReceipt{}};
         }
-    }
-    // The one descriptor H2D for this run, ahead of activate_launch_shape, DFX
-    // arming and every kernel or event this run submits. It is here rather than
-    // at prepare because the route its entry values take is a question about
-    // `streams.aicpu` — the same handle the AICPU launch below submits on, held
-    // under this run's execution claim. A failure carries its own error out
-    // with the run NotStarted, so nothing was submitted and the run stays
-    // rollback-able.
-    if (const int publish_rc = publish_for_launch(prepared.kernel_args, streams.aicpu); publish_rc != 0) {
-        return LaunchTransactionResult{publish_rc, LaunchProgress::NotStarted, LaunchReceipt{}};
     }
 
     Runtime &runtime = *prepared.runtime;
@@ -619,7 +609,7 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             // waiting for this run's kernels. The AICPU half needs no token of its own —
             // that stream's FIFO already places this run's payload behind the
             // predecessor's whole-operator boundary record.
-            if (int caller_rc = queue_caller_entry(prepared, sink); caller_rc != 0) return caller_rc;
+            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
 
             if (prepared.join.predecessor_owner != nullptr) {
                 const int join_rc = queue_cross_run_wait(prepared, streams.aicore, sink);

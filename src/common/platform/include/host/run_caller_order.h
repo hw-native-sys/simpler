@@ -19,9 +19,11 @@
 #include "run_completion_fence.h"
 
 /**
- * One slot's caller fork and exit-wait proof. Kernel completion belongs to
- * RunCompletionFence; this owner holds its AICPU boundary until the caller
- * has consumed the wait. No caller stream is owned or destroyed here.
+ * One slot's publication/caller entry fork and caller exit-wait proof.
+ * The AICPU stream publishes before the AICore may read shared state; without
+ * a caller and without an upload no fork is queued. Kernel completion belongs
+ * to RunCompletionFence; a caller exit keeps its AICPU boundary referenced
+ * until the caller has consumed the wait. No caller stream is owned here.
  */
 class RunCallerOrder {
 public:
@@ -37,10 +39,11 @@ public:
 
     int arm(const NativeRunIdentity &id, void *caller, void *aicpu, void *aicore) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (active_ || caller == nullptr || aicpu == nullptr || aicore == nullptr || caller == aicpu ||
-            caller == aicore)
+        if (active_ || aicpu == nullptr || aicore == nullptr || caller == aicpu || caller == aicore)
             return PTO_RUNTIME_ERR_INVALID_STATE;
-        for (void *&event : events_) {
+        for (size_t i = 0; i < events_.size(); ++i) {
+            if (caller == nullptr && i != Fork) continue;
+            void *&event = events_[i];
             if (event != nullptr) continue;
             int rc = ops_.create(&event);
             if (rc != 0) return rc;
@@ -51,17 +54,32 @@ public:
         return 0;
     }
 
-    int fork(const NativeRunIdentity &id, LaunchProgressSink &sink) {
+    template <typename Publish>
+    int fork(const NativeRunIdentity &id, LaunchProgressSink &sink, Publish &&publish) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!owns(id) || submitted_) return PTO_RUNTIME_ERR_INVALID_STATE;
-        // An error return does not prove that an attempted record/wait was
-        // rejected. From this point rollback requires a completion proof.
-        submitted_ = true;
-        sink.mark_submitted();
-        int rc = ops_.record(events_[Start], streams_[Caller]);
-        if (rc != 0) return rc;
-        rc = stream_wait_(streams_[Aicpu], events_[Start]);
-        if (rc != 0) return rc;
+        // This entry is the transaction's first sink user; every submission
+        // observed here belongs to its caller edges or publication callback.
+        if (streams_[Caller] != nullptr) {
+            // A failed record/wait can still leave a queued reference.
+            submitted_ = true;
+            sink.mark_submitted();
+            int rc = ops_.record(events_[Start], streams_[Caller]);
+            if (rc != 0) return rc;
+            rc = stream_wait_(streams_[Aicpu], events_[Start]);
+            if (rc != 0) return rc;
+        }
+        int rc = 0;
+        try {
+            rc = std::forward<Publish>(publish)();
+        } catch (...) {
+            submitted_ = submitted_ || sink.submitted();
+            throw;
+        }
+        submitted_ = submitted_ || sink.submitted();
+        if (rc != 0 || !submitted_) return rc;
+        // The AICore cannot read its descriptor or report startup before the
+        // AICPU-stream publication has completed, including on a cold block.
         rc = ops_.record(events_[Fork], streams_[Aicpu]);
         if (rc != 0) return rc;
         return stream_wait_(streams_[Aicore], events_[Fork]);
@@ -94,12 +112,14 @@ public:
         return complete ? Completion::Complete : Completion::Pending;
     }
 
-    int discharge(const NativeRunIdentity &id, int timeout_ms) {
+    int discharge(const NativeRunIdentity &id, int timeout_ms, bool boundaries_complete = false) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!active_) return 0;
         if (!owns(id)) return PTO_RUNTIME_ERR_INVALID_STATE;
         if (submitted_ && !consumed_) {
-            if (tail_recorded_) {
+            if (streams_[Caller] == nullptr && boundaries_complete) {
+                consumed_ = true;
+            } else if (tail_recorded_) {
                 int rc = ops_.wait(events_[Tail], timeout_ms);
                 if (rc != 0) return rc;
             } else {
@@ -107,6 +127,7 @@ public:
                 // the borrowed caller may still name a fork or completion event.
                 int first = 0;
                 for (void *stream : streams_) {
+                    if (stream == nullptr) continue;
                     const int rc = sync_(stream, timeout_ms);
                     if (first == 0) first = rc;
                 }
