@@ -73,12 +73,16 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
             # ~64K tasks, and host-orchestration populates the whole task graph
             # before the device schedules — nothing is reclaimed mid-orchestration,
             # so the table must hold the entire graph at once. That exceeds the
-            # default. Run it explicitly with a larger
-            # runtime_env.ring_task_window if needed; the GM heap needs no sizing,
-            # since it is committed to the size orchestration measured.
+            # default. The GM heap needs no sizing, since it is committed to
+            # the size orchestration measured.
             "name": "Case1",
             "platforms": ["a2a3"],
             "manual": True,
+            "config": {
+                "runtime_env": {
+                    "ring_task_window": 131072,
+                }
+            },
             "params": {
                 "batch": 256,
                 "num_heads": 16,
@@ -94,6 +98,11 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
             "name": "Case2",
             "platforms": ["a2a3"],
             "manual": True,
+            "config": {
+                "runtime_env": {
+                    "ring_task_window": 65536,
+                }
+            },
             "params": {
                 "batch": 64,
                 "num_heads": 64,

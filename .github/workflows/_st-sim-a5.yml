@@ -37,12 +37,22 @@ on:
         required: false
         default: "10000"
         type: string
+      session_timeout_seconds:
+        description: Pytest session timeout in seconds.
+        required: false
+        default: 600
+        type: number
+      job_timeout_minutes:
+        description: Job timeout in minutes.
+        required: false
+        default: 30
+        type: number
 
 jobs:
   run:
     name: st-sim-a5sim
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    timeout-minutes: 30
+    timeout-minutes: ${{ inputs.job_timeout_minutes }}
     env:
       MANUAL_MODE: ${{ inputs.manual_mode }}
       SIMPLER_SCHEDULER_TIMEOUT_MS: ${{ inputs.scheduler_timeout_ms }}
@@ -100,28 +110,28 @@ jobs:
       - name: Run pytest scene tests
         run: |
           .venv/bin/python -m pytest examples tests/st --platform a5sim --device 0-15 -v \
-            --pto-session-timeout 600 --require-pto-isa \
+            --pto-session-timeout ${{ inputs.session_timeout_seconds }} --require-pto-isa \
             --manual "$MANUAL_MODE"
 
       - name: dep_gen smoke (a5)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/dep_gen/ \
-            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --enable-dep-gen
 
       - name: dep_gen smoke (a5 host_build_graph)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/host_build_graph/dfx/dep_gen/ \
-            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --enable-dep-gen
 
       - name: chip_swimlane smoke (a5)
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/chip_swimlane/ \
-            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --enable-chip-swimlane --enable-dep-gen
 
@@ -132,7 +142,7 @@ jobs:
             .venv/bin/python -m pytest \
               tests/st/a5/host_build_graph/dfx/chip_swimlane/test_scheduler_phases.py \
               --case TestSchedulerPhases::resolve_dummy \
-              --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+              --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
               --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
               --enable-chip-swimlane "$level"
           done
@@ -141,7 +151,7 @@ jobs:
             tests/st/a5/host_build_graph/single_core_dag/test_single_core_dag.py \
             --case TestSchedulerPhases::resolve_dummy \
             --case TestHbgSingleCoreDag::mixed_multi_root_64 \
-            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --enable-chip-swimlane 3
 
@@ -149,7 +159,7 @@ jobs:
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py \
-            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" --enable-pmu 2
 
       # `hybrid` here; see the mode-per-lane rationale in _st-sim-a2a3.yml.
@@ -163,7 +173,7 @@ jobs:
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py \
-            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --dump-args hybrid
 
@@ -171,6 +181,6 @@ jobs:
         if: inputs.include_dfx_smokes
         run: |
           .venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/dfx/scope_stats/ \
-            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout 600 \
+            --platform a5sim --device 0-15 -p no:xdist --pto-session-timeout ${{ inputs.session_timeout_seconds }} \
             --require-pto-isa --manual "${{ inputs.manual_mode == 'only' && 'only' || 'include' }}" \
             --enable-scope-stats

@@ -92,6 +92,11 @@ class TestPagedAttentionHostBuildGraphA5(SceneTestCase):
             "name": "Case2",
             "platforms": ["a5"],
             "manual": True,
+            "config": {
+                "runtime_env": {
+                    "ring_task_window": 65536,
+                }
+            },
             "params": {
                 "batch": 64,
                 "num_heads": 64,
@@ -107,6 +112,11 @@ class TestPagedAttentionHostBuildGraphA5(SceneTestCase):
             "name": "Case3",
             "platforms": ["a5"],
             "manual": True,
+            "config": {
+                "runtime_env": {
+                    "ring_task_window": 65536,
+                }
+            },
             "params": {
                 "batch": 64,
                 "num_heads": 64,
