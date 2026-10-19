@@ -46,6 +46,11 @@
  *   - comm:         comm_init, comm_alloc_windows, comm_get_local_window_base,
  *                   comm_get_window_size, comm_barrier, comm_destroy
  *
+ * Optional API — resolved opportunistically; a runtime built before these
+ * entries simply lacks the capability, and ChipWorker raises an explicit error
+ * when a caller requests it:
+ *   - registration: simpler_register_callable_v2
+ *
  * Native-run storage: caller allocates at least get_runtime_size() bytes with
  * get_runtime_alignment() alignment, zero-initializes it before first use, and
  * keeps its address stable from prepare through finalize. After finalize the
@@ -77,6 +82,7 @@ extern "C" {
 #endif
 
 typedef void *RuntimeHandle;
+/** Opaque simpler runner handle, not an ACL/RTS current-context handle. */
 typedef void *DeviceContextHandle;
 
 /**
@@ -534,6 +540,12 @@ const PipelineContract *get_pipeline_contract(void);
 /**
  * Create a new device context (heap-allocated DeviceRunner).
  * Each ChipWorker should own one context for the lifetime of its init→finalize cycle.
+ * The caller serializes init/finalize/destroy against other operations on this
+ * handle. The mode latch protects identity, not the runner's whole lifecycle.
+ * finalize_device is additionally serialized against callable registration and
+ * unregistration; initialization and destroy are not.
+ * Finalize must establish resource retirement before destroy; the handle's
+ * immutable mode alone is not evidence that its resources can be released.
  * @return Opaque handle on success, NULL on failure.
  */
 DeviceContextHandle create_device_context(void);
@@ -865,7 +877,7 @@ int finalize_device(DeviceContextHandle ctx);
 /* ===========================================================================
  * Per-callable_id preparation
  *
- * The triplet below decouples the one-shot prep work (kernel upload + orch SO
+ * These entries decouple the one-shot prep work (kernel upload + orch SO
  * H2D + caching keyed by `callable_id`) from each `simpler_run` invocation,
  * so the per-run cost shrinks to "rebuild Runtime args + launch". Callers
  * keep a stable small-int `callable_id` per ChipCallable; the platform side
@@ -876,6 +888,20 @@ int finalize_device(DeviceContextHandle ctx);
  * resident until finalize regardless. Register and unregister mutate state
  * referenced by a prepared run, so both are rejected from successful prepare
  * until its matching finalize.
+ *
+ * The table is a slot array on both host and AICPU, and the slot number is
+ * the callable_id itself. A registration occupies one slot until
+ * `unregister_callable`; a later registration may reuse it. Capacity is a
+ * slot count, not a memory budget: with all 64 slots occupied, explicit and
+ * auto-ID registration both fail until an ID is unregistered, and a consumer
+ * whose working set exceeds 64 resident callables must recycle IDs or raise
+ * the table size on both sides in a protocol change.
+ *
+ * Registration and unregistration entry points serialize against each other
+ * on one context, so an auto-ID scan and the slot it claims are atomic with
+ * respect to an explicit-ID claim of the same slot. `finalize_device` takes
+ * the same lock, so teardown cannot clear the registry under a registration.
+ * Runs, initialization and destroy still rely on the caller contract.
  * =========================================================================== */
 
 /**
@@ -896,10 +922,48 @@ int finalize_device(DeviceContextHandle ctx);
  * Callable-registry mutation is rejected while a native run is prepared or
  * executing on this context.
  *
+ * A callable_id that is already registered is rejected with
+ * PTO_RUNTIME_ERR_INVALID_ARGUMENT; unregister the ID before reusing it.
+ *
  * @return 0 on success, negative on error (NULL ctx, callable_id out of
- *         range, upload/copy failure, or AICPU prewarm failure).
+ *         range or already registered, upload/copy failure, or AICPU
+ *         prewarm failure).
  */
 int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable);
+
+/**
+ * Register on an initialized PROGRAM or KERNEL context with an unused ID.
+ * KERNEL contexts use the kernel preparation path internally. The entry does
+ * not initialize the context; an uninitialized or unlatched context returns
+ * INVALID_STATE. `callable` points to a canonical ChipCallable image of
+ * exactly `callable_size` bytes, fully validated before it is hashed or
+ * uploaded.
+ *
+ * The registry is shared with explicit-ID registration, so both draw from the
+ * same MAX_REGISTERED_CALLABLE_IDS (64) slots. Each successful call owns a
+ * distinct ID, even for equal images; upload sharing follows the runtime's
+ * existing image cache. Exhaustion returns INVALID_STATE.
+ *
+ * Registration and unregistration serialize internally on the context, so
+ * concurrent auto-ID and explicit-ID registration cannot claim the same slot.
+ * Registration is refused with PTO_RUNTIME_ERR_INTERNAL while a native run is
+ * prepared or executing on the context. finalize_device takes the same lock;
+ * runs, initialization and destroy do not, and callers still order those.
+ *
+ * Explicit-ID registration rejects an already registered ID with
+ * INVALID_ARGUMENT; auto-ID never returns an occupied slot. IDs may be reused
+ * after unregister, so callers retire all users first and discard stale IDs.
+ *
+ * @return 0 on success, PTO_RUNTIME_ERR_INVALID_ARGUMENT for a null output
+ *         pointer or malformed image, PTO_RUNTIME_ERR_INVALID_STATE for an
+ *         uninitialized/wrong-mode context or exhausted slots, and
+ *         PTO_RUNTIME_ERR_INTERNAL for an outstanding native run or an
+ *         unexpected failure. On failure *out_callable_id is -1 and cleanup
+ *         ownership stays with the runtime.
+ */
+int simpler_register_callable_v2(
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
+);
 
 /**
  * Launch a callable previously staged via `simpler_register_callable`.
@@ -1352,6 +1416,11 @@ int simpler_kernel_mode_init(
  * synchronizes a caller stream or the device. Preparation neither accepts nor
  * retains a caller stream; the current caller/capture stream is supplied
  * independently to each launch.
+ *
+ * A callable_id that is already registered is rejected with
+ * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Registration is refused with
+ * PTO_RUNTIME_ERR_INTERNAL while a native run is prepared or executing on the
+ * context; retire the run before reusing the registry.
  */
 int simpler_kernel_mode_prepare_callable(
     DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size

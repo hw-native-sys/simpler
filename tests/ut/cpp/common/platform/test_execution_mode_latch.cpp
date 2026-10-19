@@ -16,12 +16,16 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <thread>
+
 #include "host/execution_mode_latch.h"
 
 namespace {
 
 TEST(ExecutionModeLatch, StartsUnlatched) {
     ExecutionModeLatch latch;
+    EXPECT_EQ(latch.latched_mode(), std::nullopt);
     EXPECT_FALSE(latch.is_latched());
     EXPECT_FALSE(latch.is_kernel());
 }
@@ -56,6 +60,35 @@ TEST(ExecutionModeLatch, SameModeRelatchesAfterAFinalizedLifetime) {
     EXPECT_EQ(latch.latch(SIMPLER_MODE_PROGRAM), 0);
     EXPECT_EQ(latch.latched_mode(), SIMPLER_MODE_PROGRAM);
     EXPECT_EQ(latch.latch(SIMPLER_MODE_KERNEL), PTO_RUNTIME_ERR_INVALID_STATE);
+}
+
+TEST(ExecutionModeLatch, ConcurrentOppositeClaimsChooseExactlyOneIdentity) {
+    ExecutionModeLatch latch;
+    std::atomic<int> ready{0};
+    int program_rc = PTO_RUNTIME_ERR_INTERNAL;
+    int kernel_rc = PTO_RUNTIME_ERR_INTERNAL;
+    auto claim = [&](SimplerExecutionMode mode, int &result) {
+        ready.fetch_add(1);
+        while (ready.load() != 2) {}
+        result = latch.latch(mode);
+    };
+    std::thread program([&] {
+        claim(SIMPLER_MODE_PROGRAM, program_rc);
+    });
+    std::thread kernel([&] {
+        claim(SIMPLER_MODE_KERNEL, kernel_rc);
+    });
+    program.join();
+    kernel.join();
+    ASSERT_TRUE(latch.latched_mode().has_value());
+    if (program_rc == 0) {
+        EXPECT_EQ(kernel_rc, PTO_RUNTIME_ERR_INVALID_STATE);
+        EXPECT_EQ(latch.latched_mode(), SIMPLER_MODE_PROGRAM);
+    } else {
+        EXPECT_EQ(program_rc, PTO_RUNTIME_ERR_INVALID_STATE);
+        EXPECT_EQ(kernel_rc, 0);
+        EXPECT_EQ(latch.latched_mode(), SIMPLER_MODE_KERNEL);
+    }
 }
 
 }  // namespace

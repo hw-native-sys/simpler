@@ -320,6 +320,9 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
            finalize_device, simpler_kernel_mode_supported,
            simpler_kernel_mode_init, simpler_kernel_mode_prepare_callable,
            simpler_kernel_mode_launch
+    dlsym optional versioned registration entry; absence is a capability
+           verdict, not a stale build:
+           simpler_register_callable_v2
     create_device_context() → DeviceContextHandle
     allocate zeroed, aligned, stable native-run storage per pipeline slot
     simpler_init(ctx, device_id, aicpu*, aicpu_size, aicore*, aicore_size, ...)

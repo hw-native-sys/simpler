@@ -1374,6 +1374,47 @@ class TestChipWorkerBorrowedInit:
             observer.test_validation(0)
             chip.finalize()
 
+    @pytest.mark.parametrize("borrowed", [False, True])
+    def test_mode_cannot_change_during_or_after_worker_lifetime(self, kernel_symbol_runtime, borrowed):
+        runtime = kernel_symbol_runtime(borrowed=True)
+        observer = ctypes.CDLL(str(runtime))
+        worker = _ChipWorker()
+        options = {"borrowed_context_generation": 77} if borrowed else {}
+        incompatible = {} if borrowed else {"borrowed_context_generation": 77}
+        worker.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+        environment = worker._execution_environment
+        before = observer.test_borrowed_inits(), observer.test_closes(), observer.test_destroys()
+        try:
+            with pytest.raises(RuntimeError, match="already initialized"):
+                worker.init(str(runtime), os.devnull, os.devnull, "", 0, **incompatible)
+            assert worker._execution_environment == environment
+            assert (observer.test_borrowed_inits(), observer.test_closes(), observer.test_destroys()) == before
+        finally:
+            worker.finalize()
+        after = observer.test_borrowed_inits(), observer.test_closes(), observer.test_destroys()
+        for init_options in (options, incompatible):
+            with pytest.raises(RuntimeError, match="already finalized"):
+                worker.init(str(runtime), os.devnull, os.devnull, "", 0, **init_options)
+        assert worker._execution_environment is None
+        assert (observer.test_borrowed_inits(), observer.test_closes(), observer.test_destroys()) == after
+
+    @pytest.mark.parametrize("borrowed", [False, True])
+    def test_auto_register_refuses_older_runtime_without_changing_binding(self, kernel_symbol_runtime, borrowed):
+        runtime = kernel_symbol_runtime(borrowed=True)
+        worker = _ChipWorker()
+        options = {"borrowed_context_generation": 77} if borrowed else {}
+        worker.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+        environment = worker._execution_environment
+        try:
+            callable_image = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
+            with pytest.raises(RuntimeError, match="does not support versioned"):
+                worker.register_callable(callable_image)
+            worker.register_callable(0, callable_image)
+            assert worker.initialized
+            assert worker._execution_environment == environment
+        finally:
+            worker.finalize()
+
     def test_borrowed_init_uses_shared_binding_and_can_close(self, kernel_symbol_runtime):
         runtime = kernel_symbol_runtime(borrowed=True)
         observer = ctypes.CDLL(str(runtime))

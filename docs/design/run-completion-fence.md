@@ -190,6 +190,56 @@ exceptions close runner admission through the same policy, after the owner
 is installed. A failing recovery policy cannot discard the owner or replace
 the launch rc. An exception or missing receipt is never a no-submission proof.
 
+## Callable registration and execution mode identity
+
+The native registration and execution-mode contracts apply to both owned and
+borrowed runners; the caller-ordering details for borrowed submissions are in
+the preceding section.
+
+Native `ChipWorker::register_callable(image, size)` (Python
+`_ChipWorker.register_callable(callable)`) returns a runtime-assigned ID on an
+initialized PROGRAM or KERNEL worker. Both modes use the optional
+`simpler_register_callable_v2` symbol; a KERNEL context uses the kernel
+preparation path internally. Explicit-ID `register_callable(id, callable)`
+remains available and shares the registry; an ID that is already registered is
+rejected with INVALID_ARGUMENT. A runtime without the optional entry can still
+initialize and serve its existing APIs; requesting auto-ID registration raises
+an explicit unsupported-entry error. Neither overload initializes the worker.
+The public Python `ChipWorker` wrapper retains its existing CallableHandle API.
+
+Automatic and explicit registration share one ID namespace, one image-buffer
+cache and one 64-slot table (`MAX_REGISTERED_CALLABLE_IDS`, mirrored by the
+AICPU executor's `orch_so_table_`); the slot number is the ID. Equal images
+receive distinct IDs, with upload sharing governed by that cache. Capacity is a
+slot count, not a memory budget: with all 64 slots occupied, registration fails
+until an ID is unregistered. Failure leaves the output ID at -1 and preserves
+the runtime's existing cleanup ownership; exhaustion returns INVALID_STATE.
+IDs can be reused after explicit unregistration, so callers retire all users
+first and discard stale IDs. The registration and unregistration entry points
+serialize internally on the context, so an auto-ID scan and its claim cannot
+race an explicit-ID claim of the same slot; finalize takes the same lock, so
+teardown cannot clear the registry under a registration. Runs, initialization
+and destroy still rely on the caller contract. The old C symbol's signature and
+kernel-mode capability bit remain unchanged. Adapters must explicitly select
+v2; an integration-branch binary expecting a different signature under the old
+symbol cannot be loaded as if it were compatible.
+
+Execution mode is latched per native device-context handle, not per process or
+submission. This handle identifies the C++ runner; it is not the borrowed
+ACL/RTS current-context handle. `ExecutionModeLatch::latched_mode()` returns an
+optional identity snapshot: empty means unclaimed, not PROGRAM. Identity,
+initialization phase and resource retirement are separate facts. The latch mutex
+serializes identity claims only; callers serialize native init/finalize/destroy
+against operations using that handle. Concurrent claims cannot choose different
+identities, but this does not make concurrent runner initialization supported.
+A successful mode claim is never undone by finalize or a later initialization
+failure. The same handle cannot switch between PROGRAM and
+KERNEL; a finalized PROGRAM handle can initialize as PROGRAM again only when
+its cleanup proof permits it. This C ABI permission does not apply to
+`ChipWorker`, which rejects reinitialization after finalize. Borrowed submissions
+use the shared native run machinery, so sharing prepare/launch functions is not
+a mode violation.
+
 ## The boundary
 
 Each stream records an event immediately after its own kernel:

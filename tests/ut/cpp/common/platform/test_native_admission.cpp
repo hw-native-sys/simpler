@@ -11,6 +11,7 @@
 /** Real onboard workspace adapters and native prepare ownership over CPU transport. */
 #include <cstdlib>
 #include <new>
+#include "callable.h"
 #include "fixture.h"
 
 namespace native_admission_test {
@@ -31,6 +32,61 @@ public:
 };
 
 namespace native_admission_test {
+namespace {
+int fake_current_device(void *, int *device_id) noexcept {
+    *device_id = 0;
+    return 0;
+}
+int fake_current_context(void *, void **context) noexcept {
+    static int token;
+    *context = &token;
+    return 0;
+}
+int fake_create_hidden_stream(void *, void **stream) noexcept {
+    static int tokens[2];
+    static int next;
+    *stream = &tokens[next++ % 2];
+    return 0;
+}
+int fake_destroy_hidden_stream(void *, void *) noexcept { return 0; }
+int fake_create_event(void *, void **event) noexcept {
+    static int tokens[8];
+    static int next;
+    *event = &tokens[next++ % 8];
+    return 0;
+}
+int fake_destroy_event(void *, void *) noexcept { return 0; }
+}  // namespace
+
+TEST_F(NativeAdmissionTest, RegistrationRefusesWhileANativeRunIsOutstanding) {
+    Runner runner;
+    ASSERT_EQ(runner.execution_mode_latch().latch(SIMPLER_MODE_KERNEL), 0);
+    KernelContextOps ops;
+    ops.context = &runner;
+    ops.get_current_device = fake_current_device;
+    ops.get_current_context = fake_current_context;
+    ops.create_hidden_stream = fake_create_hidden_stream;
+    ops.destroy_hidden_stream = fake_destroy_hidden_stream;
+    ops.create_event = fake_create_event;
+    ops.destroy_event = fake_destroy_event;
+    ASSERT_EQ(runner.kernel_execution_state().initialize(0, ops), 0);
+    ASSERT_EQ(runner.kernel_execution_state().mark_ready_enqueued(), 0);
+    ASSERT_TRUE(runner.kernel_execution_state().accepts_dispatch());
+
+    int owner = 0;
+    ASSERT_TRUE(runner.try_reserve_native_run(&owner, 1, arena_bank(1), true));
+    ASSERT_TRUE(runner.native_runs_outstanding());
+
+    const uint8_t binary[] = {0x01};
+    const auto image = make_chip_callable(nullptr, 0, "orch", binary, sizeof(binary), nullptr, nullptr, 0, "");
+    int32_t auto_id = 99;
+    EXPECT_EQ(simpler_register_callable(&runner, 2, image.data()), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(simpler_kernel_mode_prepare_callable(&runner, 3, image.data(), image.size()), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(simpler_register_callable_v2(&runner, image.data(), image.size(), &auto_id), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(auto_id, -1);
+    runner.release_native_run_reservation(&owner);
+}
+
 TEST_F(NativeAdmissionTest, EarlyPrepareFailureDoesNotBlockTheNormalRunComposition) {
     EXPECT_EQ(simpler_prepare_run(nullptr, nullptr, 0, nullptr, nullptr, nullptr), PTO_RUNTIME_ERR_INTERNAL);
     Runner runner;

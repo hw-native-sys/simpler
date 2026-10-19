@@ -1342,6 +1342,14 @@ public:
     bool has_callable(int32_t callable_id) const;
 
     /**
+     * Serializes the registration, unregistration and finalize entry points,
+     * so an auto-ID scan and the ID it claims are one atomic step with respect
+     * to explicit-ID registration and unregistration. Runs, initialization and
+     * destroy are still caller-serialized.
+     */
+    std::mutex &callable_registration_mutex() { return callable_registration_mu_; }
+
+    /**
      * Content-derived stable identity for a registered callable: the
      * ELF Build-ID 64-bit hash of its orchestration SO (CallableState::hash,
      * computed at record_device_orch_callable time via elf_build_id_64). Returns 0 when
@@ -2636,6 +2644,11 @@ protected:
         void *host_orch_func_ptr{nullptr};
     };
     std::unordered_map<int32_t, CallableState> callables_;
+    // Held by every registration/unregistration entry point and by
+    // finalize_device. It makes an auto-ID scan and its claim atomic against
+    // an explicit-ID claim of the same slot; runs, initialization and destroy
+    // are serialized by their callers instead.
+    std::mutex callable_registration_mu_;
     // Opaque provider handle from dma_workspace_provision(), owned for the
     // Worker's life and released by finalize_common(). Null unless the Worker
     // was created with SDMA enabled.

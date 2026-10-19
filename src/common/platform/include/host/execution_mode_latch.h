@@ -12,6 +12,7 @@
 #pragma once
 
 #include <mutex>
+#include <optional>
 
 #include "execution_mode.h"
 #include "runtime_c_api.h"
@@ -40,9 +41,10 @@
  * constructing, and an init that adopts device state must roll that state
  * back itself.
  *
- * Every kernel-mode guard keys on is_kernel(), which is false until an init
- * latches KERNEL — so the guards arm exactly when a kernel context comes
- * into existence.
+ * An empty latched_mode() means unclaimed, not PROGRAM. Mode identity does
+ * not prove successful initialization or permission to release resources.
+ * The mutex protects this identity only; callers must serialize the runner's
+ * initialization and teardown against operations using that runner.
  */
 class ExecutionModeLatch {
 public:
@@ -50,30 +52,28 @@ public:
         returns PTO_RUNTIME_ERR_INVALID_STATE. */
     int latch(SimplerExecutionMode mode) {
         std::scoped_lock lock(mutex_);
-        if (latched_ && mode_ != mode) return PTO_RUNTIME_ERR_INVALID_STATE;
+        if (mode_.has_value() && *mode_ != mode) return PTO_RUNTIME_ERR_INVALID_STATE;
         mode_ = mode;
-        latched_ = true;
         return 0;
     }
 
     bool is_kernel() const {
         std::scoped_lock lock(mutex_);
-        return latched_ && mode_ == SIMPLER_MODE_KERNEL;
+        return mode_ == SIMPLER_MODE_KERNEL;
     }
 
     bool is_latched() const {
         std::scoped_lock lock(mutex_);
-        return latched_;
+        return mode_.has_value();
     }
 
-    /** The held mode; meaningful only once is_latched(). */
-    SimplerExecutionMode latched_mode() const {
+    /** One identity snapshot; empty until the first successful claim. */
+    std::optional<SimplerExecutionMode> latched_mode() const {
         std::scoped_lock lock(mutex_);
         return mode_;
     }
 
 private:
     mutable std::mutex mutex_;
-    bool latched_{false};
-    SimplerExecutionMode mode_{SIMPLER_MODE_PROGRAM};
+    std::optional<SimplerExecutionMode> mode_;
 };

@@ -186,6 +186,13 @@ def _load(arch: str, variant: str, runtime: str) -> ctypes.CDLL:
         ctypes.c_size_t,
     ]
     lib.simpler_kernel_mode_prepare_callable.restype = ctypes.c_int
+    lib.simpler_register_callable_v2.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+    lib.simpler_register_callable_v2.restype = ctypes.c_int
     lib.simpler_kernel_mode_launch.argtypes = [ctypes.c_void_p, ctypes.c_int32, ctypes.c_void_p, ctypes.c_void_p]
     lib.simpler_kernel_mode_launch.restype = ctypes.c_int
     lib.simpler_init.argtypes = [
@@ -438,7 +445,9 @@ def _check_prepare_reuse(lib, ctx, arch, runtime, *, close=True):
     assert lib.committed_device_memory_ctx(ctx) == prepared
     # Identical bytes deduplicate the callable upload. The second ID also
     # reuses the context's persistent argument blocks, so neither adds GM.
-    assert lib.simpler_kernel_mode_prepare_callable(ctx, 1, image, len(image)) == 0
+    auto_id = ctypes.c_int32(-1)
+    assert lib.simpler_register_callable_v2(ctx, image, len(image), ctypes.byref(auto_id)) == 0
+    assert auto_id.value == 1
     assert lib.committed_device_memory_ctx(ctx) == prepared
     if close:
         assert lib.finalize_device(ctx) == 0
@@ -573,6 +582,276 @@ def test_kernel_context_brings_up_and_closes_on_a_borrowed_device(arch: str, run
         # Destroying after a clean close is allowed; an unclosed kernel
         # context would be refused and leaked instead.
         lib.destroy_device_context(ctx)
+
+
+@pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
+def test_auto_registration_rejects_uninitialized_context(arch, runtime):
+    lib = _load(arch, "sim", runtime)
+    image = _minimal_callable_image()
+    ctx = lib.create_device_context()
+    assert ctx
+    try:
+        out = ctypes.c_int32(99)
+        assert lib.simpler_register_callable_v2(ctx, image, len(image), None) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        assert lib.simpler_register_callable_v2(ctx, image, 1, ctypes.byref(out)) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        assert out.value == -1
+        out.value = 99
+        assert (
+            lib.simpler_register_callable_v2(ctx, image, len(image), ctypes.byref(out)) == PTO_RUNTIME_ERR_INVALID_STATE
+        )
+        assert out.value == -1
+    finally:
+        lib.destroy_device_context(ctx)
+
+
+def _run_program_auto_register(arch, runtime):
+    from _task_interface import _ChipWorker  # noqa: PLC0415
+    from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+    base = _PROJECT_ROOT / "build" / "lib" / arch / "sim" / runtime
+    image = _prepared_callable_image(arch + "sim", runtime)
+    callable_image = ChipCallable.from_bytes(image)
+    worker = _ChipWorker()
+    with pytest.raises(RuntimeError, match="not initialized"):
+        worker.register_callable(callable_image)
+    worker.init(
+        str(base / "libhost_runtime.so"),
+        str(base / "libaicpu_kernel.so"),
+        str(base / "libaicore_kernel.so"),
+        "",
+        0,
+        sim_context_path=str(_PROJECT_ROOT / "build" / "lib" / "libcpu_sim_context.so"),
+    )
+    try:
+        worker.register_callable(0, callable_image)
+        with pytest.raises(RuntimeError, match="code -1004"):
+            worker.register_callable(0, callable_image)
+        for expected in range(1, 64):
+            assert worker.register_callable(callable_image) == expected
+        with pytest.raises(RuntimeError, match="registration failed"):
+            worker.register_callable(callable_image)
+        worker.unregister_callable(1)
+        assert worker.register_callable(callable_image) == 1
+    finally:
+        worker.finalize()
+    with pytest.raises(RuntimeError, match="not initialized"):
+        worker.register_callable(callable_image)
+
+
+def _run_program_auto_register_threads(arch, runtime):
+    import threading  # noqa: PLC0415
+
+    from _task_interface import _ChipWorker  # noqa: PLC0415
+    from simpler.task_interface import ChipCallable  # noqa: PLC0415
+
+    base = _PROJECT_ROOT / "build" / "lib" / arch / "sim" / runtime
+    image = _prepared_callable_image(arch + "sim", runtime)
+    callable_image = ChipCallable.from_bytes(image)
+    worker = _ChipWorker()
+    worker.init(
+        str(base / "libhost_runtime.so"),
+        str(base / "libaicpu_kernel.so"),
+        str(base / "libaicore_kernel.so"),
+        "",
+        0,
+        sim_context_path=str(_PROJECT_ROOT / "build" / "lib" / "libcpu_sim_context.so"),
+    )
+    try:
+        ids = []
+        failures = []
+        guard = threading.Lock()
+
+        def register():
+            try:
+                callable_id = worker.register_callable(callable_image)
+            except BaseException as exc:  # noqa: BLE001
+                with guard:
+                    failures.append(exc)
+                return
+            with guard:
+                ids.append(callable_id)
+
+        threads = [threading.Thread(target=register) for _ in range(16)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert not failures, failures
+        assert sorted(ids) == list(range(len(threads)))
+    finally:
+        worker.finalize()
+
+
+@pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
+def test_program_auto_registration_shares_legacy_ids(arch, runtime):
+    _load(arch, "sim", runtime)
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), arch, runtime, "0", "program_auto_register"],
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
+def test_program_auto_registration_is_thread_safe(arch, runtime):
+    _load(arch, "sim", runtime)
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), arch, runtime, "0", "program_auto_register_threads"],
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _run_auto_prepare(arch, runtime, device):
+    lib = _load(arch, "onboard", runtime)
+    lib.rtSetDevice.argtypes = [ctypes.c_int]
+    assert lib.rtSetDevice(device) == 0
+    contexts = _CallerContexts(lib, device)
+    ctx = lib.create_device_context()
+    assert ctx
+    aicpu, aicore, dispatcher = _binaries(arch, runtime)
+    config = CallConfig()
+    image = _prepared_callable_image(arch, runtime)
+    out = ctypes.c_int32(999)
+    entry = lib.simpler_register_callable_v2
+
+    def prepare():
+        out.value = 999
+        return entry(ctx, image, len(image), ctypes.byref(out))
+
+    try:
+        assert prepare() == PTO_RUNTIME_ERR_INVALID_STATE
+        assert out.value == -1
+        assert (
+            lib.simpler_kernel_mode_init(
+                ctx,
+                device,
+                aicpu,
+                len(aicpu),
+                aicore,
+                len(aicore),
+                dispatcher,
+                len(dispatcher),
+                ctypes.byref(config),
+                77,
+            )
+            == 0
+        )
+        assert entry(ctx, image, len(image), None) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        assert entry(ctx, image, 1, ctypes.byref(out)) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        assert out.value == -1
+        with contexts.other():
+            assert prepare() == PTO_RUNTIME_ERR_INVALID_STATE
+            assert out.value == -1
+        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == 0
+        resident = lib.committed_device_memory_ctx(ctx)
+        for expected in range(1, 64):
+            assert prepare() == 0
+            assert out.value == expected
+            if runtime == "tensormap_and_ringbuffer":
+                assert lib.committed_device_memory_ctx(ctx) == resident
+        assert prepare() == PTO_RUNTIME_ERR_INVALID_STATE
+        assert out.value == -1
+        assert lib.simpler_unregister_callable(ctx, 1) == 0
+        assert prepare() == 0
+        assert out.value == 1
+        assert lib.finalize_device(ctx) == 0
+        assert prepare() == PTO_RUNTIME_ERR_INVALID_STATE
+        assert out.value == -1
+        assert lib.committed_device_memory_ctx(ctx) == 0
+    finally:
+        assert lib.finalize_device(ctx) == 0
+        lib.destroy_device_context(ctx)
+        contexts.close()
+
+
+@pytest.mark.parametrize(
+    ("arch", "runtime"),
+    [
+        pytest.param(arch, runtime, marks=[pytest.mark.requires_hardware, pytest.mark.platforms([arch])])
+        for arch in _ARCHES
+        for runtime in _RUNTIMES
+    ],
+)
+def test_versioned_registration_allocates_ids_without_replacing_legacy_entries(arch, runtime, request):
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            arch,
+            runtime,
+            device,
+            "auto_register",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _run_mode_isolation(arch, runtime, device, mode):
+    lib = _load(arch, "onboard", runtime)
+    aicpu, aicore, dispatcher = _binaries(arch, runtime)
+    config = CallConfig()
+    if mode == "kernel":
+        lib.rtSetDevice.argtypes = [ctypes.c_int]
+        assert lib.rtSetDevice(device) == 0
+    ctx = lib.create_device_context()
+    assert ctx
+    common = (ctx, device, aicpu, len(aicpu), aicore, len(aicore), dispatcher, len(dispatcher), ctypes.byref(config))
+
+    def init_program():
+        return lib.simpler_init(*common, 0, None, 0)
+
+    def init_kernel():
+        return lib.simpler_kernel_mode_init(*common, 77)
+
+    init, incompatible = (init_kernel, init_program) if mode == "kernel" else (init_program, init_kernel)
+    try:
+        assert init() == 0
+        committed = lib.committed_device_memory_ctx(ctx)
+        assert incompatible() == PTO_RUNTIME_ERR_INVALID_STATE
+        assert lib.committed_device_memory_ctx(ctx) == committed
+        assert lib.finalize_device(ctx) == 0
+        # Finalization releases resources, but does not erase the handle's mode identity.
+        assert incompatible() == PTO_RUNTIME_ERR_INVALID_STATE
+        assert lib.committed_device_memory_ctx(ctx) == 0
+        if mode == "program":
+            assert init_program() == 0
+            assert lib.finalize_device(ctx) == 0
+    finally:
+        assert lib.finalize_device(ctx) == 0
+        lib.destroy_device_context(ctx)
+
+
+@pytest.mark.parametrize("mode", ["program", "kernel"])
+@pytest.mark.parametrize(
+    ("arch", "runtime"),
+    [
+        pytest.param(arch, runtime, marks=[pytest.mark.requires_hardware, pytest.mark.platforms([arch])])
+        for arch in _ARCHES
+        for runtime in _RUNTIMES
+    ],
+)
+def test_mode_identity_survives_incompatible_init_and_close(arch, runtime, mode, request):
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, "mode_" + mode],
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _run_program_callable_release(arch, runtime, device):
@@ -1257,7 +1536,15 @@ def test_pre_execution_refusal_retries_through_public_worker(
 
 
 if __name__ == "__main__":
-    if sys.argv[4] in ("public_prepare_retry", "public_launch_retry"):
+    if sys.argv[4] == "program_auto_register":
+        _run_program_auto_register(sys.argv[1], sys.argv[2])
+    elif sys.argv[4] == "program_auto_register_threads":
+        _run_program_auto_register_threads(sys.argv[1], sys.argv[2])
+    elif sys.argv[4] == "auto_register":
+        _run_auto_prepare(sys.argv[1], sys.argv[2], int(sys.argv[3]))
+    elif sys.argv[4].startswith("mode_"):
+        _run_mode_isolation(sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4][len("mode_") :])
+    elif sys.argv[4] in ("public_prepare_retry", "public_launch_retry"):
         from tests.st.common.kernel_eager_state.test_stateful_calls import _run
 
         _run(

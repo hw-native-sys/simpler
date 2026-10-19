@@ -920,7 +920,11 @@ int SimDeviceRunnerBase::record_device_orch_callable(
     state.func_name = (func_name != nullptr) ? func_name : "";
     state.config_name = (config_name != nullptr) ? config_name : "";
     state.signature = std::move(signature);
-    callables_.emplace(callable_id, std::move(state));
+    const bool inserted = callables_.emplace(callable_id, std::move(state)).second;
+    if (!inserted) {
+        LOG_ERROR("record_device_orch_callable: callable_id=%d was claimed concurrently", callable_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     LOG_INFO(
         "record_device_orch_callable: cid=%d orch_hash=0x%lx chip_hash=0x%lx %zu bytes", callable_id, hash,
         chip_buffer_hash, orch_so_size
@@ -956,7 +960,11 @@ int SimDeviceRunnerBase::record_host_orch_callable(
     state.host_dlopen_handle = host_dlopen_handle;
     state.host_orch_func_ptr = host_orch_func_ptr;
     state.signature = std::move(signature);
-    callables_.emplace(callable_id, std::move(state));
+    const bool inserted = callables_.emplace(callable_id, std::move(state)).second;
+    if (!inserted) {
+        LOG_ERROR("record_host_orch_callable: callable_id=%d was claimed concurrently", callable_id);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     ++host_dlopen_total_;
     LOG_INFO("record_host_orch_callable: cid=%d (host dlopen #%zu)", callable_id, host_dlopen_total_);
     return 0;

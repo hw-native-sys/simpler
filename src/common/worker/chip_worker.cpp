@@ -294,6 +294,10 @@ void ChipWorker::init(
         get_runtime_alignment_fn_ = load_symbol<GetRuntimeAlignmentFn>(handle, "get_runtime_alignment");
         simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
         register_callable_fn_ = load_symbol<SimplerRegisterCallableFn>(handle, "simpler_register_callable");
+        // Optional: a runtime built before versioned registration exports
+        // nothing, and a null pointer is the refusal.
+        register_callable_v2_fn_ =
+            reinterpret_cast<SimplerRegisterCallableV2Fn>(dlsym(handle, "simpler_register_callable_v2"));
         run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
         prepare_run_fn_ = load_symbol<SimplerPrepareRunFn>(handle, "simpler_prepare_run");
         launch_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_launch_run");
@@ -373,11 +377,12 @@ void ChipWorker::init(
         get_run_stream_set_create_count_fn_ =
             load_symbol<GetAicpuDlopenCountFn>(handle, "get_run_stream_set_create_count");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
-        // ACL lifecycle + comm_* + kernel mode are part of the uniform
-        // host_runtime.so ABI. Every platform runtime exports all of them —
-        // a runtime without a real backend (today: a5 for comm) ships
+        // ACL lifecycle + comm_* + the required kernel-mode entries are part of
+        // the uniform host_runtime.so ABI. Every platform runtime exports all of
+        // them — a runtime without a real backend (today: a5 for comm) ships
         // not-supported stubs rather than omitting the symbols, so these groups
-        // resolve unconditionally and never half-load.
+        // resolve unconditionally and never half-load. The versioned
+        // registration entries below are optional on purpose.
         //
         // simpler_kernel_mode_supported does not answer which runtime has a
         // kernel backend: it answers whether kernel-mode launches are
@@ -776,6 +781,7 @@ void ChipWorker::clear_runtime_binding() {
     get_runtime_size_fn_ = nullptr;
     get_runtime_alignment_fn_ = nullptr;
     register_callable_fn_ = nullptr;
+    register_callable_v2_fn_ = nullptr;
     run_fn_ = nullptr;
     prepare_run_fn_ = nullptr;
     launch_run_fn_ = nullptr;
@@ -837,6 +843,17 @@ void ChipWorker::clear_runtime_binding() {
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
     initialized_ = false;
     device_id_ = -1;
+}
+
+int32_t ChipWorker::register_callable(const void *callable, size_t callable_size) {
+    if (!initialized_) throw std::runtime_error("ChipWorker not initialized; call init() first");
+    validate_execution_context();
+    if (register_callable_v2_fn_ == nullptr)
+        throw std::runtime_error("runtime does not support versioned callable registration");
+    int32_t id = -1;
+    const int rc = register_callable_v2_fn_(device_ctx_, callable, callable_size, &id);
+    if (rc != 0) throw std::runtime_error("callable registration failed with code " + std::to_string(rc));
+    return id;
 }
 
 void ChipWorker::register_callable(int32_t callable_id, const void *callable) {

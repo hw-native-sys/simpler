@@ -57,6 +57,22 @@ def _cleanup(worker, lib, contexts, device_buffers, host_buffers, streams):
         worker.finalize()
 
 
+def _prepare_callable(worker, contexts, callable_image):
+    from simpler.task_interface import ExecutionContextRefused  # noqa: PLC0415
+
+    if contexts is None:
+        assert worker.register_callable(callable_image) == 0
+        return
+    with contexts.other():
+        for operation in (
+            lambda: worker.register_callable(0, callable_image),
+            lambda: worker.register_callable(callable_image),
+        ):
+            with pytest.raises(ExecutionContextRefused, match="context validation failed"):
+                operation()
+    assert worker.register_callable(callable_image) == 0
+
+
 def _run(arch, runtime, device, depth, borrowed):
     from _task_interface import _ChipWorker  # noqa: PLC0415
     from simpler.task_interface import (  # noqa: PLC0415
@@ -113,11 +129,7 @@ def _run(arch, runtime, device, depth, borrowed):
     nbytes = size * ctypes.sizeof(ctypes.c_float)
     try:
         callable_image = _callable(arch, runtime)
-        if contexts is not None:
-            with contexts.other():
-                with pytest.raises(ExecutionContextRefused, match="context validation failed"):
-                    worker.register_callable(0, callable_image)
-        worker.register_callable(0, callable_image)
+        _prepare_callable(worker, contexts, callable_image)
         public_callable = handle_owner.register(callable_image)
         handle_owner._lifecycle = _Lifecycle.READY
         for stream in streams:

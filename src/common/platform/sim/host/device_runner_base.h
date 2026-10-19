@@ -34,6 +34,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -434,6 +435,15 @@ public:
     );
     int unregister_callable(int32_t callable_id);
     bool has_callable(int32_t callable_id) const;
+
+    /**
+     * Serializes the registration, unregistration and finalize entry points,
+     * so an auto-ID scan and the ID it claims are one atomic step with respect
+     * to explicit-ID registration and unregistration. Runs, initialization and
+     * destroy are still caller-serialized.
+     */
+    std::mutex &callable_registration_mutex() { return callable_registration_mu_; }
+
     // One-step bind: install the reference to the callable's
     // registration-owned function tables and its active_callable_id, then run
     // the per-run bind_callable_to_runtime_impl with the state's
@@ -896,6 +906,11 @@ protected:
         void *host_orch_func_ptr{nullptr};
     };
     std::unordered_map<int32_t, CallableState> callables_;
+    // Held by every registration/unregistration entry point and by
+    // finalize_device. It makes an auto-ID scan and its claim atomic against
+    // an explicit-ID claim of the same slot; runs, initialization and destroy
+    // are serialized by their callers instead.
+    std::mutex callable_registration_mu_;
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     size_t aicpu_dlopen_total_{0};
     size_t host_dlopen_total_{0};

@@ -3666,6 +3666,15 @@ NB_MODULE(_task_interface, m) {
         )
         .def(
             "register_callable",
+            [](ChipWorker &self, const PyChipCallable &callable) {
+                return self.register_callable(callable.buffer_.data(), callable.buffer_.size());
+            },
+            nb::arg("callable"), nb::call_guard<nb::gil_scoped_release>(),
+            "Register on an initialized worker and return a runtime-assigned ID. "
+            "Supports owned and borrowed contexts; retire users before unregistering."
+        )
+        .def(
+            "register_callable",
             [](ChipWorker &self, int32_t callable_id, const PyChipCallable &callable) {
                 self.register_callable(callable_id, callable.buffer_.data());
             },

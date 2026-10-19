@@ -44,6 +44,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <new>
 #include <pthread.h>
 #include <utility>
@@ -743,6 +744,9 @@ TeardownProofSlot proof_slot(DeviceRunnerBase *runner) {
 int finalize_device(DeviceContextHandle ctx) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    // Teardown clears the registry, so it is ordered against registration and
+    // unregistration. Initialization still relies on the caller contract.
+    std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
     try {
         const int rc = runner->validate_current_context();
         if (rc != 0) return rc;
@@ -979,12 +983,84 @@ static int record_callable_on_runner(
     return 0;
 }
 
-int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
+static int enter_kernel_callable_preparation(DeviceRunnerBase *runner, const char *entry) {
+    if (!runner->execution_mode_latch().is_kernel()) {
+        LOG_ERROR("%s: no live kernel context on this device context", entry);
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    if (!runner->kernel_execution_state().accepts_dispatch()) {
+        LOG_ERROR("%s: the kernel context no longer accepts preparation", entry);
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    return runner->enter_run_thread();
+}
+
+// The image is validated and the caller's borrowed context is current.
+static int prepare_kernel_callable_on_runner(
+    DeviceRunnerBase *runner, int32_t callable_id, const void *callable, const char *entry
+) {
+    // prepare_kernel_callable's AICPU registration self-skips a callable
+    // whose orchestration was resolved host-side, so the flag it reports
+    // adds nothing here.
+    bool needs_aicpu_register = false;
+    int rc = record_callable_on_runner(runner, callable_id, callable, &needs_aicpu_register);
+    if (rc != 0) return rc;
+
+    rc = runner->prepare_kernel_callable(callable_id);
+    if (rc != 0) {
+        // Releasing the registration frees the device buffer holding the
+        // orchestration SO. That is only safe when preparation failed
+        // before anything on the device could read it: a registration whose
+        // wait failed or timed out leaves an AICPU task whose completion is
+        // not established, and poisons the context to say so. Keep the
+        // callable owned in that case — it is released at close, once the
+        // caller has established quiescence.
+        if (runner->kernel_execution_state().accepts_dispatch()) {
+            runner->unregister_callable(callable_id);
+        } else {
+            LOG_ERROR(
+                "%s: retaining callable_id=%d — the context was poisoned while device work on its image may still "
+                "be outstanding",
+                entry, callable_id
+            );
+        }
+        return rc;
+    }
+    return 0;
+}
+
+// The caller holds callable_registration_mutex().
+static int
+prepare_kernel_callable_locked(DeviceRunnerBase *runner, int32_t callable_id, const void *callable, const char *entry) {
+    try {
+        if (runner->native_runs_outstanding()) {
+            LOG_ERROR("%s: native run must be finalized before mutating the callable registry", entry);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        int rc = enter_kernel_callable_preparation(runner, entry);
+        if (rc != 0) return rc;
+        if (runner->has_callable(callable_id)) {
+            LOG_ERROR("%s: callable_id=%d is already registered; unregister it before reuse", entry, callable_id);
+            return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        }
+        return prepare_kernel_callable_on_runner(runner, callable_id, callable, entry);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+// The caller holds callable_registration_mutex().
+static int
+register_callable_locked(DeviceContextHandle ctx, int32_t callable_id, const void *callable, const char *entry) {
     if (ctx == NULL || callable == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
     if (runner->native_runs_outstanding()) {
-        LOG_ERROR("simpler_register_callable: native run must be finalized before mutating the callable registry");
+        LOG_ERROR("%s: native run must be finalized before mutating the callable registry", entry);
         return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    if (runner->has_callable(callable_id)) {
+        LOG_ERROR("%s: callable_id=%d is already registered; unregister it before reuse", entry, callable_id);
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     }
 
     try {
@@ -1007,6 +1083,64 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+}
+
+static int register_callable_auto_id(
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id, const char *entry
+) {
+    if (out_callable_id == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *out_callable_id = -1;
+    int rc = validate_kernel_prepare_callable_args(ctx, 0, callable, callable_size);
+    if (rc != 0) return rc;
+    rc = validate_kernel_callable_image(callable, callable_size);
+    if (rc != 0) return rc;
+    auto *runner = static_cast<DeviceRunnerBase *>(ctx);
+    const bool kernel = runner->execution_mode_latch().is_kernel();
+    try {
+        std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+        if (runner->native_runs_outstanding()) {
+            LOG_ERROR("%s: native run must be finalized before mutating the callable registry", entry);
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (!kernel && (!runner->execution_mode_latch().is_latched() || runner->device_id() < 0)) {
+            LOG_ERROR("%s: callable registration requires an initialized PROGRAM context", entry);
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+        }
+        // Check the kernel context before scanning so a full table cannot mask
+        // a non-accepting context as capacity exhaustion. enter_run_thread()
+        // is idempotent; the per-ID helper re-enters for the legacy entry.
+        if (kernel) {
+            rc = enter_kernel_callable_preparation(runner, entry);
+            if (rc != 0) return rc;
+        }
+        for (int32_t id = 0; id < MAX_REGISTERED_CALLABLE_IDS; ++id) {
+            if (runner->has_callable(id)) continue;
+            rc = kernel ? prepare_kernel_callable_locked(runner, id, callable, entry) :
+                          register_callable_locked(ctx, id, callable, entry);
+            if (rc == 0) *out_callable_id = id;
+            return rc;
+        }
+        LOG_ERROR(
+            "%s: callable ID capacity exhausted (slots=%d, device=%d, mode=%s)", entry, MAX_REGISTERED_CALLABLE_IDS,
+            runner->device_id(), kernel ? "kernel" : "program"
+        );
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int simpler_register_callable_v2(
+    DeviceContextHandle ctx, const void *callable, size_t callable_size, int32_t *out_callable_id
+) {
+    return register_callable_auto_id(ctx, callable, callable_size, out_callable_id, "simpler_register_callable_v2");
+}
+
+int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, const void *callable) {
+    if (ctx == NULL || callable == NULL) return PTO_RUNTIME_ERR_INTERNAL;
+    auto *runner = static_cast<DeviceRunnerBase *>(ctx);
+    std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+    return register_callable_locked(ctx, callable_id, callable, "simpler_register_callable");
 }
 
 // Emit device-domain trace markers for the AICPU phases. RunWall (the whole
@@ -2453,6 +2587,7 @@ int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     if (ctx == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     try {
         DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+        std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
         if (runner->native_runs_outstanding()) {
             LOG_ERROR(
                 "simpler_unregister_callable: native run must be finalized before mutating the callable registry"
@@ -2764,53 +2899,9 @@ int simpler_kernel_mode_prepare_callable(
     if (rc != 0) return rc;
     rc = validate_kernel_callable_image(callable, callable_size);
     if (rc != 0) return rc;
-
-    DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
-    if (!runner->execution_mode_latch().is_kernel()) {
-        LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    }
-    if (!runner->kernel_execution_state().accepts_dispatch()) {
-        LOG_ERROR("simpler_kernel_mode_prepare_callable: the kernel context no longer accepts preparation");
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    }
-
-    try {
-        // Registration uploads on the caller's device without rebinding it.
-        rc = runner->enter_run_thread();
-        if (rc != 0) return rc;
-
-        // prepare_kernel_callable's AICPU registration self-skips a callable
-        // whose orchestration was resolved host-side, so the flag it reports
-        // adds nothing here.
-        bool needs_aicpu_register = false;
-        rc = record_callable_on_runner(runner, callable_id, callable, &needs_aicpu_register);
-        if (rc != 0) return rc;
-
-        rc = runner->prepare_kernel_callable(callable_id);
-        if (rc != 0) {
-            // Releasing the registration frees the device buffer holding the
-            // orchestration SO. That is only safe when preparation failed
-            // before anything on the device could read it: a registration whose
-            // wait failed or timed out leaves an AICPU task whose completion is
-            // not established, and poisons the context to say so. Keep the
-            // callable owned in that case — it is released at close, once the
-            // caller has established quiescence.
-            if (runner->kernel_execution_state().accepts_dispatch()) {
-                runner->unregister_callable(callable_id);
-            } else {
-                LOG_ERROR(
-                    "simpler_kernel_mode_prepare_callable: retaining callable_id=%d — the context was poisoned while "
-                    "device work on its image may still be outstanding",
-                    callable_id
-                );
-            }
-            return rc;
-        }
-        return 0;
-    } catch (...) {
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
+    auto *runner = static_cast<DeviceRunnerBase *>(ctx);
+    std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+    return prepare_kernel_callable_locked(runner, callable_id, callable, "simpler_kernel_mode_prepare_callable");
 }
 
 int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
