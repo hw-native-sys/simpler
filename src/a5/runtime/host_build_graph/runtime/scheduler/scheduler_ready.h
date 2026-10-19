@@ -193,7 +193,6 @@ struct SchedulerLocalConfig {
     // live: one per cluster for the AIC and Mix queues, two for the AIV queue.
     uint16_t cluster_count{0};
     uint8_t self_lane{UINT8_MAX};
-    uint8_t scheduler_lane{UINT8_MAX};
     // This core's own type, which is also the only type of ready work it can
     // claim for itself. Held here so the dispatch path needs no worker-context
     // read to know which inbox is its own.
@@ -237,10 +236,6 @@ struct SchedulerLocalState {
 
     inline __aicore__ explicit SchedulerLocalState(SchedulerLocalProfilingState *profile = nullptr) :
         profiling(profile) {}
-    // Every core schedules its own slots, so this asks only whether the local
-    // config was filled in. It is kept while the call sites that still branch on
-    // it are being unwound; a core that reaches them is always a Scheduler now.
-    inline __aicore__ bool is_scheduler() const { return config.self_lane < PLATFORM_CORES_PER_BLOCKDIM; }
     // True on the one core that coordinates this cluster's Mix tasks: its AIC.
     inline __aicore__ bool is_mix_coordinator() const { return config.self_lane == 0; }
     // This core's own two dispatch slots -- the only ones it fills or executes.
@@ -312,7 +307,6 @@ struct SchedulerLocalState {
 };
 
 static_assert(SCHEDULER_WORKER_CAPACITY < UINT16_MAX, "worker IDs must fit the local config");
-static_assert(SCHEDULER_CAPACITY < UINT16_MAX, "scheduler IDs must fit the local config");
 static_assert(PLATFORM_CORES_PER_BLOCKDIM <= 8, "worker trace mask must fit one byte");
 static_assert(SCHEDULER_PENDING_SLOT_COUNT <= 8, "local ready mask must fit one byte");
 static_assert(SCHEDULER_READY_QUEUE_COUNT <= 8, "owner ready mask must fit one byte");
@@ -377,7 +371,7 @@ inline __aicore__ bool scheduler_initialize_local_config(
     const uint64_t scheduler_count = context->scheduler_count;
     const uint64_t scheduler_index = context->scheduler_index;
     if (runtime_worker_count == 0 || runtime_worker_count > SCHEDULER_WORKER_CAPACITY || scheduler_count == 0 ||
-        scheduler_count > SCHEDULER_CAPACITY || scheduler_index >= scheduler_count)
+        scheduler_count > SCHEDULER_WORKER_CAPACITY || scheduler_index >= scheduler_count)
         return false;
     config.runtime_worker_count = static_cast<uint16_t>(runtime_worker_count);
     config.scheduler_count = static_cast<uint16_t>(scheduler_count);
@@ -388,7 +382,6 @@ inline __aicore__ bool scheduler_initialize_local_config(
     if (cluster_count == 0 || cluster_count > SCHEDULER_CLUSTER_CAPACITY) return false;
     config.cluster_count = static_cast<uint16_t>(cluster_count);
     config.self_lane = UINT8_MAX;
-    config.scheduler_lane = UINT8_MAX;
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         const uint64_t worker_id = context->cluster_worker_ids[lane];
         if (worker_id >= config.runtime_worker_count) return false;
@@ -408,10 +401,8 @@ inline __aicore__ bool scheduler_initialize_local_config(
         config.cluster_type_ranks[lane] = static_cast<uint16_t>(rank);
         config.worker_ids[lane] = static_cast<uint16_t>(worker_id);
         if (worker_id == context->worker_index) config.self_lane = static_cast<uint8_t>(lane);
-        // The cluster's Mix coordinator, which is its AIC and so always lane 0.
-        if (worker_id == context->scheduler_worker_id) config.scheduler_lane = static_cast<uint8_t>(lane);
     }
-    if (config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM || config.scheduler_lane != 0) return false;
+    if (config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM) return false;
     // The loop above checked that lane 0 is the AIC and the rest are AIVs, so
     // the lane fixes the type without another worker-context read. The ready
     // queues are indexed by the same 0 = AIC / 1 = AIV order.
@@ -654,7 +645,7 @@ scheduler_worker_context_at(__gm__ void *scheduler_state_base, const SchedulerLo
 // indexed by the worker this core runs on and spans every worker.
 inline __aicore__ __gm__ SchedulerActivityBuffer *
 scheduler_activity_buffer_at(__gm__ void *scheduler_state_base, const SchedulerLocalState *context) {
-    if (context->profiling == nullptr || context->profiling->activity_buffers_offset == 0 || !context->is_scheduler() ||
+    if (context->profiling == nullptr || context->profiling->activity_buffers_offset == 0 ||
         context->config.scheduler_index >= SCHEDULER_WORKER_CAPACITY)
         return nullptr;
     return scheduler_state_at<SchedulerActivityBuffer>(
@@ -1266,7 +1257,7 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
     SchedulerMixPlacement *placement = nullptr, bool allow_steal = true
 ) {
     if (victim_cursor == nullptr || claim == nullptr || context == nullptr || scheduler_count == 0 ||
-        scheduler_count > SCHEDULER_CAPACITY || context->config.scheduler_index >= scheduler_count ||
+        scheduler_count > SCHEDULER_WORKER_CAPACITY || context->config.scheduler_index >= scheduler_count ||
         core_type_index >= SCHEDULER_READY_QUEUE_COUNT ||
         !scheduler_ready_queue_holder(core_type_index, context->config.self_core_type))
         return false;
@@ -1313,7 +1304,7 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
 inline __aicore__ bool scheduler_ready_directory_nonempty(
     __gm__ void *scheduler_state_base, SchedulerLocalState *context, uint64_t scheduler_count, uint32_t core_type_index
 ) {
-    if (scheduler_count == 0 || scheduler_count > SCHEDULER_CAPACITY ||
+    if (scheduler_count == 0 || scheduler_count > SCHEDULER_WORKER_CAPACITY ||
         core_type_index >= SCHEDULER_READY_QUEUE_COUNT ||
         !scheduler_ready_queue_holder(core_type_index, context->config.self_core_type))
         return false;

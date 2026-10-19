@@ -263,12 +263,10 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
             contexts[worker].cluster_count = static_cast<uint64_t>(aic_count);
             contexts[worker].cluster_index = static_cast<uint64_t>(cluster);
             // Every core schedules itself, so a Scheduler is identified by the
-            // worker it runs on and there are as many Schedulers as workers.
-            // scheduler_worker_id names the cluster's AIC, which is the one core
-            // that coordinates a Mix task for the cluster -- not a core that
-            // schedules on another's behalf.
+            // worker it runs on and there are as many Schedulers as workers. The
+            // core that coordinates a cluster's Mix tasks is its AIC, which the
+            // lane ordering below already fixes as lane 0.
             contexts[worker].scheduler_index = static_cast<uint64_t>(worker);
-            contexts[worker].scheduler_worker_id = static_cast<uint64_t>(cluster_workers[cluster][0]);
             contexts[worker].is_scheduler = 1;
             contexts[worker].scheduler_count = static_cast<uint64_t>(core_count_);
             for (int32_t member = 0; member < PLATFORM_CORES_PER_BLOCKDIM; ++member)

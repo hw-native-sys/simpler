@@ -215,7 +215,6 @@ struct FixtureStorage {
         config.scheduler_index = context->scheduler_index;
         config.scheduler_count = context->scheduler_count;
         config.self_lane = 0;
-        config.scheduler_lane = UINT8_MAX;
         config.self_core_type = scheduler_core_type_index(context->core_type);
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             config.worker_ids[lane] = context->cluster_worker_ids[lane];
@@ -231,7 +230,6 @@ struct FixtureStorage {
                                                   static_cast<uint16_t>(contexts[peer].type_rank) :
                                                   static_cast<uint16_t>(lane == 0 ? 0 : lane - 1);
         }
-        if (context->is_scheduler != 0) config.scheduler_lane = config.self_lane;
         return local;
     }
     std::vector<SchedulerLocalProfilingState> test_profiles;

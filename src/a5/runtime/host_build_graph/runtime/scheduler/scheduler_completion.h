@@ -49,12 +49,10 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, uint32_t cluster_lane, uint32_t pending_slot,
     uint32_t completed_generation, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
-    SchedulerCompletionStats *completion_stats, uint64_t *ready_victim_cursors, uint64_t profiling_level,
-    const SchedulerReadyClaim *replacement_ready, bool *direct_refilled,
-    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, SchedulerRefillCandidates *candidates = nullptr,
-    bool mix_slot = false
+    SchedulerCompletionStats *completion_stats, uint64_t profiling_level, const SchedulerReadyClaim *replacement_ready,
+    bool *direct_refilled, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region,
+    SchedulerRefillCandidates *candidates = nullptr, bool mix_slot = false
 ) {
-    (void)ready_victim_cursors;
     if (direct_refilled != nullptr) *direct_refilled = false;
     if (ssbuf_region == nullptr || scheduler == nullptr || cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
         pending_slot >= (mix_slot ? SCHEDULER_MIX_SLOT_COUNT : SCHEDULER_PENDING_SLOT_COUNT) ||
@@ -122,17 +120,8 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
             executor_trace.ready_observe_cycles = published_trace->ready_observe_cycles;
             executor_trace.completion_id = published_trace->completion_id;
             executor_trace.completion_inbox_index = published_trace->completion_inbox_index;
-        } else if (worker_id == scheduler->worker_id()) {
-            executor_trace = scheduler->profiling->executor_traces[pending_slot];
         } else {
-            const SCHEDULER_SSBUF volatile SchedulerExecutorTaskTrace *published_trace =
-                &ssbuf_region->lanes[cluster_lane].traces[pending_slot].payload;
-            executor_trace.kernel_start_cycles = published_trace->kernel_start_cycles;
-            executor_trace.kernel_end_cycles = published_trace->kernel_end_cycles;
-            executor_trace.ready_scan_start_cycles = published_trace->ready_scan_start_cycles;
-            executor_trace.ready_observe_cycles = published_trace->ready_observe_cycles;
-            executor_trace.completion_id = published_trace->completion_id;
-            executor_trace.completion_inbox_index = published_trace->completion_inbox_index;
+            executor_trace = scheduler->profiling->executor_traces[pending_slot];
         }
     }
     __gm__ SchedulerTaskTrace *completed_trace = nullptr;
@@ -287,11 +276,10 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
 inline __aicore__ bool scheduler_service_cluster_completions(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
-    SchedulerCompletionStats *completion_stats, uint64_t *ready_victim_cursors, uint64_t profiling_level,
-    uint64_t *direct_refilled_slot_mask, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region,
-    SchedulerRefillCandidates *candidates = nullptr
+    SchedulerCompletionStats *completion_stats, uint64_t profiling_level, uint64_t *direct_refilled_slot_mask,
+    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, SchedulerRefillCandidates *candidates = nullptr
 ) {
-    if (scheduler == nullptr || !scheduler->is_scheduler() || ssbuf_region == nullptr) return false;
+    if (scheduler == nullptr || ssbuf_region == nullptr) return false;
     if (direct_refilled_slot_mask != nullptr) *direct_refilled_slot_mask = 0;
     bool progress = false;
     // This core's own slots. A core retires only the slots it fills, so their
@@ -306,8 +294,8 @@ inline __aicore__ bool scheduler_service_cluster_completions(
         bool direct_refilled = false;
         if (!scheduler_service_cluster_completion_slot(
                 graph, scheduler_state_base, scheduler, run_control, scheduler->config.self_lane, pending_slot,
-                completed_generation, wake_stats, ready_stats, completion_stats, ready_victim_cursors, profiling_level,
-                nullptr, &direct_refilled, ssbuf_region, candidates
+                completed_generation, wake_stats, ready_stats, completion_stats, profiling_level, nullptr,
+                &direct_refilled, ssbuf_region, candidates
             )) {
             return false;
         }
@@ -335,8 +323,8 @@ inline __aicore__ bool scheduler_service_cluster_completions(
             }
             if (!scheduler_service_cluster_completion_slot(
                     graph, scheduler_state_base, scheduler, run_control, cluster_lane, mix_slot, completed_generation,
-                    wake_stats, ready_stats, completion_stats, ready_victim_cursors, profiling_level, nullptr, nullptr,
-                    ssbuf_region, candidates, true
+                    wake_stats, ready_stats, completion_stats, profiling_level, nullptr, nullptr, ssbuf_region,
+                    candidates, true
                 )) {
                 return false;
             }

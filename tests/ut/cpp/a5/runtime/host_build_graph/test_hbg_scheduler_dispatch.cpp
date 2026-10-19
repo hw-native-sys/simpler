@@ -201,7 +201,7 @@ TEST(SchedulerClusterCompletion, AccumulatesBatchOnSuccessAndBothKindsOfErrorExi
             scheduler_service_cluster_completions(
                 graph.graph(), storage.scheduler_state->base(),
                 storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, nullptr,
-                nullptr, nullptr, nullptr, 0, nullptr, storage.ssbuf_region
+                nullptr, nullptr, 0, nullptr, storage.ssbuf_region
             ),
             failure == 0
         );
@@ -246,7 +246,7 @@ TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
     ASSERT_TRUE(scheduler_service_cluster_completions(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, &wake_stats,
-        &ready_stats, &completion_stats, nullptr, 0, nullptr, storage.ssbuf_region
+        &ready_stats, &completion_stats, 0, nullptr, storage.ssbuf_region
     ));
     // The generation is consumed from local state, and the slot is released.
     EXPECT_EQ(scheduler_consumed_completion_generation(&storage.scheduler_local_state, 0, 0), slot->generation);
@@ -257,7 +257,7 @@ TEST(SchedulerClusterCompletion, SpscGenerationCompletesNormalTask) {
     EXPECT_FALSE(scheduler_service_cluster_completions(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, &wake_stats,
-        &ready_stats, &completion_stats, nullptr, 0, nullptr, storage.ssbuf_region
+        &ready_stats, &completion_stats, 0, nullptr, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.scheduler_local_state.pending_completed, 1u);
     auto *traces =
@@ -290,8 +290,8 @@ TEST(SchedulerClusterCompletion, UnprofiledSelfHandoffNeedsNoProfilingStorage) {
     EXPECT_EQ(local->timing_slot(1, selected), -1);
     local->local_completed_generations[selected] = scheduler_dispatch_generation(publication);
     ASSERT_TRUE(scheduler_service_cluster_completions(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, nullptr, nullptr, nullptr, nullptr,
-        0, nullptr, storage.ssbuf_region
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, nullptr, nullptr, nullptr, 0,
+        nullptr, storage.ssbuf_region
     ));
     EXPECT_EQ(local->profiling, nullptr);
     EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
@@ -327,8 +327,8 @@ TEST(SchedulerClusterCompletion, SelfSlotsKeepDistinctSampledTraces) {
         storage.metadata[index].timing_slot = index;
     }
     ASSERT_TRUE(scheduler_service_cluster_completions(
-        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, nullptr, nullptr, nullptr, nullptr,
-        0, nullptr, storage.ssbuf_region
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, nullptr, nullptr, nullptr, 0,
+        nullptr, storage.ssbuf_region
     ));
     auto *traces =
         scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
@@ -361,7 +361,7 @@ TEST(SchedulerClusterCompletion, RejectsStaleCompletionGenerationAtNamedSite) {
     EXPECT_FALSE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0,
-        slot->generation + 1, &wake_stats, &ready_stats, &completion_stats, nullptr, false, nullptr, nullptr,
+        slot->generation + 1, &wake_stats, &ready_stats, &completion_stats, false, nullptr, nullptr,
         storage.ssbuf_region
     ));
     EXPECT_EQ(
@@ -381,7 +381,7 @@ TEST(SchedulerClusterCompletion, AccountsCompletedTaskWhenResolveFails) {
     EXPECT_FALSE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0, slot->generation,
-        nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, storage.ssbuf_region
+        nullptr, nullptr, nullptr, 0, nullptr, nullptr, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.scheduler_local_state.pending_completed, 1u);
     EXPECT_NE(storage.run_control->scheduler_error, 0u);
@@ -405,12 +405,11 @@ TEST(SchedulerClusterCompletion, CompletionIgnoresTheReadyQueueEntirely) {
         storage.scheduler_state->base(), storage.local_context(&scheduler, &storage.scheduler_local_state), 0, 0
     )
         ->endpoints = scheduler_ready_endpoints_pack(SCHEDULER_INBOX_EMPTY, 0);
-    uint64_t ready_victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{};
 
     EXPECT_TRUE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0, slot->generation,
-        nullptr, nullptr, nullptr, ready_victim_cursors, 0, nullptr, nullptr, storage.ssbuf_region
+        nullptr, nullptr, nullptr, 0, nullptr, nullptr, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.scheduler_local_state.pending_completed, 1u);
     EXPECT_EQ(slot->state, SchedulerDispatchSlotState::FREE);
@@ -429,7 +428,7 @@ TEST(SchedulerClusterCompletion, AccountsCompletedTaskWhenRefillDispatchFails) {
     EXPECT_FALSE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0, slot->generation,
-        nullptr, nullptr, nullptr, nullptr, 0, &replacement, nullptr, storage.ssbuf_region
+        nullptr, nullptr, nullptr, 0, &replacement, nullptr, storage.ssbuf_region
     ));
     EXPECT_EQ(storage.scheduler_local_state.pending_completed, 1u);
     EXPECT_NE(storage.run_control->scheduler_error, 0u);
@@ -487,7 +486,7 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     ASSERT_TRUE(scheduler_service_cluster_completions(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, &wake_stats,
-        &ready_stats, &completion_stats, nullptr, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr, storage.ssbuf_region
+        &ready_stats, &completion_stats, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr, storage.ssbuf_region
     ));
     EXPECT_EQ(producer->completion_resolve_start_cycles, 0u);
     EXPECT_EQ(producer->completion_resolve_end_cycles, 0u);
@@ -552,13 +551,12 @@ TEST(SchedulerClusterCompletion, ReleasesCompletedSlotAndLeavesReadyTaskQueued) 
 
     SchedulerWakeStats wake_stats{};
     SchedulerCompletionStats completion_stats{};
-    uint64_t ready_victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{};
     uint64_t direct_refilled_slot_mask = 0;
     ASSERT_TRUE(scheduler_service_cluster_completions(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, &wake_stats,
-        &ready_stats, &completion_stats, ready_victim_cursors, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL,
-        &direct_refilled_slot_mask, storage.ssbuf_region
+        &ready_stats, &completion_stats, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, &direct_refilled_slot_mask,
+        storage.ssbuf_region
     ));
 
     EXPECT_EQ(local_slot->state, SchedulerDispatchSlotState::FREE);
@@ -624,11 +622,10 @@ TEST(SchedulerClusterCompletion, UsesSchedulerLocalSlotStateWithoutRereadingDisp
     scheduler_local_state.local_completed_generations[0] = completed_generation;
 
     SchedulerReadyStats ready_stats{};
-    uint64_t victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{};
     ASSERT_TRUE(scheduler_service_cluster_completions(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
-        storage.run_control, nullptr, &ready_stats, nullptr, victim_cursors, SCHEDULER_PROFILING_TASK_TIMING_LEVEL,
-        nullptr, storage.ssbuf_region
+        storage.run_control, nullptr, &ready_stats, nullptr, SCHEDULER_PROFILING_TASK_TIMING_LEVEL, nullptr,
+        storage.ssbuf_region
     ));
 
     // The woken successor refills the slot directly; the poisoned SSBUF
@@ -686,7 +683,7 @@ TEST(SchedulerClusterCompletion, CachesStableWorkerTraceAfterFirstCompletion) {
     );
     ASSERT_TRUE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
-        storage.run_control, 0, 0, scheduler_local_state.slots[0][0].generation, nullptr, nullptr, nullptr, nullptr,
+        storage.run_control, 0, 0, scheduler_local_state.slots[0][0].generation, nullptr, nullptr, nullptr,
         SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr, nullptr, storage.ssbuf_region
     ));
     ASSERT_TRUE((scheduler_local_state.profiling->worker_trace_valid_mask & 1U) != 0);
@@ -700,7 +697,7 @@ TEST(SchedulerClusterCompletion, CachesStableWorkerTraceAfterFirstCompletion) {
     );
     ASSERT_TRUE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
-        storage.run_control, 0, 1, scheduler_local_state.slots[0][1].generation, nullptr, nullptr, nullptr, nullptr,
+        storage.run_control, 0, 1, scheduler_local_state.slots[0][1].generation, nullptr, nullptr, nullptr,
         SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr, nullptr, storage.ssbuf_region
     ));
 
@@ -733,8 +730,7 @@ TEST(SchedulerClusterCompletion, RefillWithSuppliedClaimPreservesStateProbeAndRe
     ASSERT_TRUE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0, slot->generation,
-        nullptr, nullptr, nullptr, nullptr, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, &replacement, &refilled,
-        storage.ssbuf_region
+        nullptr, nullptr, nullptr, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, &replacement, &refilled, storage.ssbuf_region
     ));
 
     EXPECT_TRUE(refilled);
@@ -873,7 +869,6 @@ void configure_cached_cluster(FixtureStorage &storage) {
         context.core_type = static_cast<int32_t>(lane == 0 ? CoreType::AIC : CoreType::AIV);
         context.scheduler_count = 1;
         context.scheduler_index = 0;
-        context.scheduler_worker_id = 0;
         context.is_scheduler = 1;
         for (uint32_t peer = 0; peer < PLATFORM_CORES_PER_BLOCKDIM; ++peer)
             context.cluster_worker_ids[peer] = peer;
@@ -890,8 +885,6 @@ TEST(SchedulerLocalConfig, SnapshotsReadyPublicationAndReloadsOnNextRun) {
         auto &context = storage.contexts[self_lane];
         ASSERT_TRUE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
         EXPECT_EQ(local.config.self_lane, self_lane);
-        EXPECT_EQ(local.config.scheduler_lane, 0u);
-        EXPECT_TRUE(local.is_scheduler());
         EXPECT_EQ(local.config.worker_ids[0], 0u);
         EXPECT_EQ(scheduler_completion_id(&local, 7), 7 * 3 + self_lane);
         const uint64_t ready_offset = local.config.ready_directory_offset;
@@ -1009,18 +1002,13 @@ TEST(SchedulerLocalConfig, RejectsInvalidTopologyBeforeMailboxAccess) {
     context.cluster_worker_ids[1] = 0;
     EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
     context.cluster_worker_ids[1] = 1;
-    // The Mix coordinator is the cluster's AIC, so naming any other worker is
-    // a topology the core must refuse rather than schedule against.
-    context.scheduler_worker_id = 2;
-    EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
-    context.scheduler_worker_id = 0;
     context.is_scheduler = 0;
     EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
     context.is_scheduler = 1;
-    context.scheduler_count = SCHEDULER_CAPACITY;
-    context.scheduler_index = SCHEDULER_CAPACITY - 1;
+    context.scheduler_count = SCHEDULER_WORKER_CAPACITY;
+    context.scheduler_index = SCHEDULER_WORKER_CAPACITY - 1;
     EXPECT_TRUE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
-    context.scheduler_index = SCHEDULER_CAPACITY;
+    context.scheduler_index = SCHEDULER_WORKER_CAPACITY;
     EXPECT_FALSE(scheduler_initialize_local_config(storage.scheduler_state->base(), &context, &graph, &local));
 }
 
@@ -1033,14 +1021,14 @@ TEST(SchedulerClusterCompletion, DefersGlobalCountUntilFlushAndNeverPublishesTwi
     prepare_completed_normal_slot(storage, context);
     SchedulerLocalState *local = storage.local_context(&context, &storage.scheduler_local_state);
     ASSERT_TRUE(scheduler_service_cluster_completions(
-        graph_buffer.graph(), storage.scheduler_state->base(), local, storage.run_control, nullptr, nullptr, nullptr,
-        nullptr, 0, nullptr, storage.ssbuf_region
+        graph_buffer.graph(), storage.scheduler_state->base(), local, storage.run_control, nullptr, nullptr, nullptr, 0,
+        nullptr, storage.ssbuf_region
     ));
     EXPECT_EQ(local->pending_completed, 1u);
     EXPECT_EQ(storage.run_control->resolved_task_count, 0u);
     EXPECT_FALSE(scheduler_service_cluster_completions(
-        graph_buffer.graph(), storage.scheduler_state->base(), local, storage.run_control, nullptr, nullptr, nullptr,
-        nullptr, 0, nullptr, storage.ssbuf_region
+        graph_buffer.graph(), storage.scheduler_state->base(), local, storage.run_control, nullptr, nullptr, nullptr, 0,
+        nullptr, storage.ssbuf_region
     ));
     EXPECT_EQ(local->pending_completed, 1u);
     scheduler_flush_completions(storage.run_control, local);
@@ -1094,7 +1082,6 @@ struct MixFixture {
             context.is_scheduler = 1;
             context.scheduler_index = lane;
             context.scheduler_count = PLATFORM_CORES_PER_BLOCKDIM;
-            context.scheduler_worker_id = 0;
             for (uint32_t peer = 0; peer < PLATFORM_CORES_PER_BLOCKDIM; ++peer)
                 context.cluster_worker_ids[peer] = peer;
         }
@@ -1157,7 +1144,7 @@ struct MixFixture {
         if (lane == local->config.self_lane) local->local_ready_mask &= ~(1U << index);
         return scheduler_service_cluster_completion_slot(
             graph.graph(), storage.scheduler_state->base(), local, storage.run_control, lane, index,
-            slot(lane, index).generation, nullptr, nullptr, nullptr, nullptr, 0, nullptr, nullptr, storage.ssbuf_region,
+            slot(lane, index).generation, nullptr, nullptr, nullptr, 0, nullptr, nullptr, storage.ssbuf_region,
             candidates, lane != 0
         );
     }
@@ -1501,8 +1488,8 @@ TEST(SchedulerMix, CompletionTracesUseLogicalSubtaskRatherThanPhysicalLane) {
     for (uint32_t lane : {0, 1}) {
         ASSERT_TRUE(scheduler_service_cluster_completion_slot(
             f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, lane, 0,
-            f.slot(lane, 0).generation, nullptr, nullptr, nullptr, nullptr, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL,
-            nullptr, nullptr, f.storage.ssbuf_region, nullptr, lane != 0
+            f.slot(lane, 0).generation, nullptr, nullptr, nullptr, SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr,
+            nullptr, f.storage.ssbuf_region, nullptr, lane != 0
         ));
     }
     auto *traces =

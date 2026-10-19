@@ -1408,7 +1408,6 @@ bool create_scheduler_state(
         context.callable_addresses_address = runtime->callable_entry_table_addr();
         context.callable_addresses_count = runtime->callable_table_len();
         context.runtime_worker_count = static_cast<uint64_t>(runtime->get_worker_count());
-        context.bootstrap_done = 0;
         context.graph_summary_offset = layout.graph_summary_offset;
         context.graph_storage_address = device_sm_address + device_segments.storage;
         context.graph_reserved_address = 0;

@@ -81,7 +81,6 @@ TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
     local.profiling->activity_buffers_offset = contexts[0].activity_buffers_offset;
     local.config.scheduler_index = contexts[0].scheduler_index;
     local.config.self_lane = 0;
-    local.config.scheduler_lane = 0;
     local.profiling->loop_iter = 17;
     SchedulerActivityBuffer &buffer = buffers[SCHEDULER_WORKER_CAPACITY - 1];
     buffer.committed = SCHEDULER_ACTIVITY_CAPACITY - 1;

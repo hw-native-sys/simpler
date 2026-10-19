@@ -42,7 +42,7 @@ inline __aicore__ bool scheduler_fill_own_slots(
     uint64_t profiling_level, uint64_t skip_slot_mask, bool *failed, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region
 ) {
     if (failed != nullptr) *failed = false;
-    if (scheduler == nullptr || !scheduler->is_scheduler()) return false;
+    if (scheduler == nullptr) return false;
     const uint32_t core_type = scheduler->config.self_core_type;
     if (!scheduler_has_usable_slot(scheduler, core_type, skip_slot_mask) ||
         !scheduler_ready_directory_nonempty(

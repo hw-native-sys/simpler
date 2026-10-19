@@ -33,8 +33,7 @@ constexpr uint32_t SCHEDULER_SSBUF_INIT_GENERATION = 1;
 struct alignas(64) SchedulerSsbufHeader {
     volatile uint32_t init_generation;
     volatile uint32_t region_size;
-    volatile uint32_t scheduler_lane;
-    uint8_t reserved[52];
+    uint8_t reserved[56];
 };
 
 struct alignas(32) SchedulerSsbufDispatchControl {
@@ -160,8 +159,7 @@ inline __aicore__ void scheduler_ssbuf_store_release(SCHEDULER_SSBUF volatile ui
 #endif
 }
 
-inline __aicore__ void
-scheduler_ssbuf_initialize(SCHEDULER_SSBUF SchedulerSsbufRegion *region, uint32_t scheduler_lane) {
+inline __aicore__ void scheduler_ssbuf_initialize(SCHEDULER_SSBUF SchedulerSsbufRegion *region) {
     // SSBUF may contain user data from an earlier launch. Only generation
     // tokens gate consumers; publish the header token after every lane token
     // and all immutable metadata have been initialized. Consumers enter only
@@ -180,12 +178,10 @@ scheduler_ssbuf_initialize(SCHEDULER_SSBUF SchedulerSsbufRegion *region, uint32_
         scheduler_ssbuf_store_relaxed(&region->lanes[lane].mix_completion.publication, 0);
     }
     region->header.region_size = SCHEDULER_SSBUF_REGION_SIZE;
-    region->header.scheduler_lane = scheduler_lane;
     scheduler_ssbuf_store_release(&region->header.init_generation, SCHEDULER_SSBUF_INIT_GENERATION);
 }
 
-inline __aicore__ bool
-scheduler_ssbuf_is_initialized(const SCHEDULER_SSBUF SchedulerSsbufRegion *region, uint32_t scheduler_lane) {
+inline __aicore__ bool scheduler_ssbuf_is_initialized(const SCHEDULER_SSBUF SchedulerSsbufRegion *region) {
     return scheduler_ssbuf_load_acquire(&region->header.init_generation) == SCHEDULER_SSBUF_INIT_GENERATION &&
-           region->header.region_size == SCHEDULER_SSBUF_REGION_SIZE && region->header.scheduler_lane == scheduler_lane;
+           region->header.region_size == SCHEDULER_SSBUF_REGION_SIZE;
 }

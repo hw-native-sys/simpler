@@ -267,7 +267,6 @@ __aicore__ bool bootstrap_ready_graph(
                 scheduler_initialize_free_slot(&scheduler->mix_slots[cluster_lane][mix_slot]);
             }
         }
-        scheduler_gm_publish(target->bootstrap_done, UINT64_C(1));
         if (phase_timing_enabled) stats->bootstrap_target_cycles[type] += scheduler_cycles() - target_start;
     }
     if (phase_timing_enabled) stats->target_bootstrap_end_cycles = scheduler_cycles();
@@ -364,7 +363,7 @@ __aicore__ bool run_ready_dispatch_loop(
             const bool completion_progress = scheduler_service_cluster_completions(
                 graph, scheduler_state_base, context, run_control, phase_timing_enabled ? &stats->wake : nullptr,
                 phase_timing_enabled ? &stats->ready : nullptr, phase_timing_enabled ? &stats->completion : nullptr,
-                ready_victim_cursors, profiling_level, &direct_refilled_slot_mask, ssbuf_region, &refill_candidates
+                profiling_level, &direct_refilled_slot_mask, ssbuf_region, &refill_candidates
             );
             scheduler_progress = completion_progress;
             if (!scheduler_fill_mix_after_completions(
@@ -613,13 +612,12 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
             SchedulerErrorSite::BOOTSTRAP_FAILED
         );
     const uint32_t cluster_lane = scheduler_local_state.config.self_lane;
-    const uint32_t scheduler_lane = scheduler_local_state.config.scheduler_lane;
     uint64_t descriptor_cache_observed_cycles = 0;
     if (config_valid) {
         scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(graph.storage_address));
         descriptor_cache_observed_cycles = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
         if (context->is_scheduler != 0) {
-            scheduler_ssbuf_initialize(ssbuf_region, scheduler_lane);
+            scheduler_ssbuf_initialize(ssbuf_region);
         }
         if (context->is_scheduler != 0 &&
             !bootstrap_ready_graph(
@@ -665,8 +663,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         }
         write_reg(RegId::COND, AICORE_IDLE_VALUE);
         if (config_valid) {
-            if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || scheduler_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
-                !scheduler_ssbuf_is_initialized(ssbuf_region, scheduler_lane)) {
+            if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || !scheduler_ssbuf_is_initialized(ssbuf_region)) {
                 scheduler_record_error(
                     run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                     SchedulerErrorSite::EXECUTOR_INVALID_DISPATCH_SLOT
