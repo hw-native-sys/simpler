@@ -1636,15 +1636,17 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         LOG_ERROR("publish_run_image_impl: no prepared runtime image to publish");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    for (const auto &region : publication.prerequisites) {
-        const BindPhaseMark phase = bind_phase_begin();
-        if (api->copy_to_device(region.device_target, region.source, region.bytes) != 0) {
-            LOG_ERROR("host-orch: metadata prerequisite publication failed");
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        if (region.phase != HostPhaseKind::Count) {
-            record_bind_phase(region.phase, phase, region.attributes.c_str(), region.bytes);
-        }
+    // The slot owns snapshots before this local record is destroyed. Onboard launch
+    // publishes them on its AICPU stream before the descriptor and entry fork;
+    // the large execution image stays on the prepare path to overlap execution.
+    std::vector<HostMetadataRegion> metadata;
+    metadata.reserve(publication.prerequisites.size());
+    for (const auto &region : publication.prerequisites)
+        metadata.push_back({region.device_target, region.source, region.bytes});
+    const int metadata_rc = api->stage_launch_metadata(metadata.data(), metadata.size());
+    if (metadata_rc != 0) {
+        LOG_ERROR("host-orch: launch metadata staging failed: %d", metadata_rc);
+        return metadata_rc;
     }
     const BindPhaseMark h2d_phase = bind_phase_begin();
     if (api->copy_to_device(publication.device_target, publication.source, publication.bytes) != 0) {

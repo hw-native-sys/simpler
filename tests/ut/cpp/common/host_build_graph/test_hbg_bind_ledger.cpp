@@ -2358,3 +2358,83 @@ TEST_F(HbgBindLedgerTest, ABackendWithoutPlanRetentionCannotRetryAnExecutedCallb
     EXPECT_EQ(fake_.orchestration_count, 1u);
     EXPECT_EQ(fake_.prepare_plan, nullptr);
 }
+
+TEST_F(HbgBindLedgerTest, LaunchStagingLeavesOnlyTheLargeImageOnThePrepareCopyPath) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    auto callable = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+    reinterpret_cast<CoreCallable *>(callable.data())->set_resolved_addr(0x1000);
+    const uint64_t objects[] = {reinterpret_cast<uint64_t>(callable.data())};
+    const uint64_t entries[] = {0x1000};
+    runtime.set_callable_tables(objects, reinterpret_cast<uint64_t>(objects), reinterpret_cast<uint64_t>(entries), 1);
+    struct Captured {
+        void *target;
+        std::vector<uint8_t> bytes;
+    };
+    struct Staging {
+        std::vector<Captured> captured;
+        int calls{0};
+        int rc{0};
+    } staging;
+    HostApiOps ops = fake_ops();
+    ops.stage_launch_metadata = [](void *ctx, uint32_t slot, const HostMetadataRegion *regions, size_t count) {
+        EXPECT_EQ(slot, 0u);
+        auto &state = *static_cast<Staging *>(ctx);
+        ++state.calls;
+        if (state.rc != 0) return state.rc;
+        state.captured.clear();
+        for (size_t i = 0; i < count; ++i) {
+            const auto *source = static_cast<const uint8_t *>(regions[i].host_source);
+            state.captured.push_back({regions[i].device_target, {source, source + regions[i].bytes}});
+        }
+        return 0;
+    };
+    api_ = HostApi(&staging, 0, 0, 0, &ops);
+    const bool a5 = std::strcmp(get_platform(), "a5sim") == 0;
+    for (TestOrchEntryFunc entry : {ordinary_orch_entry, recording_orch_entry, ordinary_orch_entry}) {
+        SCOPED_TRACE(entry == ordinary_orch_entry ? "resident" : "graph");
+        eps_ = {entry, capture_orch_bind};
+        ChipStorageTaskArgs args;
+        ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+        const auto &pending = runtime.pending_publication();
+        const size_t count = pending.prerequisites.size();
+        ASSERT_EQ(count, static_cast<size_t>(a5 && entry == ordinary_orch_entry));
+        std::vector<Captured> expected;
+        for (const auto &region : pending.prerequisites) {
+            const auto *source = static_cast<const uint8_t *>(region.source);
+            expected.push_back({region.device_target, {source, source + region.bytes}});
+            std::memset(region.device_target, 0xa5, region.bytes);
+        }
+        void *image_target = pending.device_target;
+        const auto *image_source = static_cast<const uint8_t *>(pending.source);
+        const std::vector<uint8_t> image(image_source, image_source + pending.bytes);
+        const int copies = fake_.copy_count;
+        const int calls = staging.calls;
+        ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+        ASSERT_EQ(staging.calls, calls + 1) << "empty batches must clear a previous resident run";
+        ASSERT_EQ(fake_.copy_count, copies + 1);
+        EXPECT_EQ(fake_.copies.back().dst, image_target);
+        EXPECT_EQ(std::memcmp(image_target, image.data(), image.size()), 0);
+        ASSERT_EQ(staging.captured.size(), expected.size());
+        for (size_t i = 0; i < expected.size(); ++i) {
+            EXPECT_EQ(staging.captured[i].target, expected[i].target);
+            EXPECT_EQ(staging.captured[i].bytes, expected[i].bytes);
+            const auto *target = static_cast<const uint8_t *>(expected[i].target);
+            EXPECT_TRUE(std::all_of(target, target + expected[i].bytes.size(), [](uint8_t b) {
+                return b == 0xa5;
+            }));
+        }
+        ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+    }
+    // Staging refusal prevents the large image copy and consumes the pending record.
+    eps_ = {ordinary_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    staging.rc = -73;
+    const int copies = fake_.copy_count;
+    EXPECT_EQ(publish_run_image_impl(&runtime, &api_), -73);
+    EXPECT_EQ(fake_.copy_count, copies);
+    EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
+    EXPECT_EQ(fake_.copy_count, copies);
+}

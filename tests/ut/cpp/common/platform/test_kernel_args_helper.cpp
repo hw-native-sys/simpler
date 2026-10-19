@@ -15,6 +15,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <utility>
+#include <vector>
+#include <limits>
 
 #include "acl/acl.h"
 #include "device_runner_helpers.h"
@@ -29,6 +31,14 @@ struct RtsState {
     int copy_rc = 0;
     int copies = 0;
     int async_copies = 0;
+    int fail_copy_on = 0;
+    struct Copy {
+        void *target;
+        const void *source;
+        size_t bytes;
+        rtStream_t stream;
+    };
+    std::vector<Copy> queued;
     int host_alloc_rc = 0;
     int host_free_rc = 0;
     int host_allocations = 0;
@@ -98,9 +108,10 @@ static rtError_t copy_descriptor(void *dst, uint64_t capacity, const void *src, 
     // commit happens after this call returns, so the slot still shows the state
     // this copy was issued in.
     const bool initializing = rts.destination != nullptr && !rts.destination->workers_initialized;
-    EXPECT_EQ(bytes, initializing ? rts.initializing_copy_bytes : rts.steady_copy_bytes);
+    if (rts.destination != nullptr && dst == rts.destination->runtime_args)
+        EXPECT_EQ(bytes, initializing ? rts.initializing_copy_bytes : rts.steady_copy_bytes);
     EXPECT_EQ(capacity, bytes);
-    if (rts.copy_rc != 0) return rts.copy_rc;
+    if (rts.copy_rc != 0 && (rts.fail_copy_on == 0 || rts.copies == rts.fail_copy_on)) return rts.copy_rc;
     std::memcpy(dst, src, bytes);
     return 0;
 }
@@ -125,6 +136,7 @@ extern "C" rtError_t
 rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream) {
     ++rts.async_copies;
     rts.stream = stream;
+    rts.queued.push_back({dst, src, bytes, stream});
     if (rts.defer) {
         ++rts.copies;
         rts.pending_target = dst;
@@ -463,4 +475,141 @@ TEST_F(KernelArgsPublication, AbandonmentNeverFreesAPotentialDmaSource) {
     std::memcpy(rts.pending_target, rts.pending_source, rts.pending_bytes);
     std::free(source);
     EXPECT_EQ(allocator.free(destination), 0);
+}
+
+TEST_F(KernelArgsPublication, MetadataValuesArePublishedBeforeDescriptorFromSlotOwnedSources) {
+    uint64_t first = 0, second = 0;
+    {
+        uint64_t values[] = {17, 29};
+        const HostMetadataRegion regions[] = {
+            {&first, &values[0], sizeof(first)}, {&second, &values[1], sizeof(second)}
+        };
+        ASSERT_EQ(slot.staged_launch_metadata.prepare(regions, 2), 0);
+        values[0] = 900;
+    }
+    runtime.dev.worker_count = 7;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    EXPECT_EQ(rts.copies, 0);
+    EXPECT_EQ(first, 0U);
+    EXPECT_EQ(second, 0U);
+    EXPECT_EQ(slot.runtime_upload_bytes, slot.runtime_bytes + sizeof(first) + sizeof(second));
+    KernelArgsHelper moved(std::move(helper));
+    helper.release_run_view();
+    rts.defer = true;
+    ASSERT_EQ(moved.publish_runtime_args(false, &rts, rts.sink), 0);
+    moved.release_run_view();
+    ASSERT_EQ(rts.queued.size(), 3U);
+    EXPECT_EQ(first, 0U);
+    EXPECT_EQ(second, 0U);
+    EXPECT_EQ(rts.queued[0].target, &first);
+    EXPECT_EQ(rts.queued[1].target, &second);
+    EXPECT_EQ(rts.queued[2].target, slot.runtime_args);
+    auto *pinned = static_cast<std::byte *>(slot.runtime_upload_source);
+    ASSERT_EQ(rts.queued[0].source, pinned + slot.runtime_bytes);
+    ASSERT_EQ(rts.queued[1].source, pinned + slot.runtime_bytes + sizeof(first));
+    ASSERT_EQ(rts.queued[2].source, pinned);
+    ASSERT_EQ(rts.host_frees, 0);
+    for (const auto &copy : rts.queued) {
+        EXPECT_EQ(copy.stream, &rts);
+        std::memcpy(copy.target, copy.source, copy.bytes);
+    }
+    EXPECT_EQ(first, 17U);
+    EXPECT_EQ(second, 29U);
+    EXPECT_EQ(published_worker_count(), 7);
+}
+
+TEST_F(KernelArgsPublication, EveryMetadataEnqueueFailureStopsTheDescriptorAndRetainsTheSource) {
+    for (int failure = 1; failure <= 3; ++failure) {
+        SCOPED_TRACE(failure);
+        uint64_t first = 0, second = 0;
+        const uint64_t value = 37;
+        const HostMetadataRegion regions[] = {{&first, &value, sizeof(value)}, {&second, &value, sizeof(value)}};
+        ASSERT_EQ(slot.staged_launch_metadata.prepare(regions, 2), 0);
+        ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+        rts.copies = 0;
+        rts.queued.clear();
+        rts.sink = {};
+        rts.copy_rc = -81;
+        rts.fail_copy_on = failure;
+        EXPECT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), -81);
+        EXPECT_EQ(rts.copies, failure);
+        EXPECT_EQ(rts.queued.size(), static_cast<size_t>(failure));
+        EXPECT_TRUE(rts.sink.submitted());
+        EXPECT_FALSE(helper.launchable());
+        EXPECT_FALSE(helper.runtime_args_published()) << "scheduler DFX cannot read an unpublished batch";
+        EXPECT_EQ(helper.launch_payload(), nullptr);
+        EXPECT_EQ(first, failure > 1 ? value : 0U);
+        EXPECT_EQ(second, failure > 2 ? value : 0U);
+        EXPECT_EQ(published_worker_count(), static_cast<int>(0xa5a5a5a5U));
+        EXPECT_EQ(rts.host_frees, 0);
+        EXPECT_NE(slot.runtime_upload_source, nullptr);
+        EXPECT_NE(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+        EXPECT_EQ(rts.copies, failure);
+    }
+    rts.copy_rc = 0;
+    // A fresh legacy run has no metadata. It cannot replay the failed batch.
+    rts.queued.clear();
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    ASSERT_EQ(rts.queued.size(), 1U);
+    EXPECT_EQ(rts.queued.front().target, slot.runtime_args);
+}
+
+TEST_F(KernelArgsPublication, MetadataSourceGrowthFailuresAreRetryableWithoutDeviceSubmission) {
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    Runtime *destination = slot.runtime_args;
+    void *old_source = slot.runtime_upload_source;
+    uint64_t value = 73, target = 0;
+    const HostMetadataRegion region{&target, &value, sizeof(value)};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&region, 1), 0);
+    rts.queued.clear();
+    rts.sink = {};
+    rts.host_free_rc = -71;
+    EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), -71);
+    EXPECT_EQ(slot.runtime_upload_source, old_source);
+    EXPECT_FALSE(helper.launchable());
+    EXPECT_FALSE(rts.sink.submitted());
+    rts.host_free_rc = 0;
+    rts.host_alloc_rc = -72;
+    EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), -72);
+    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+    EXPECT_EQ(slot.runtime_upload_bytes, 0U);
+    EXPECT_EQ(slot.runtime_args, destination);
+    EXPECT_TRUE(rts.queued.empty());
+    rts.host_alloc_rc = 0;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    EXPECT_EQ(target, value);
+    EXPECT_EQ(slot.runtime_args, destination);
+    EXPECT_EQ(rts.queued.size(), 2U);
+}
+
+TEST_F(KernelArgsPublication, WholeMetadataBatchIsValidatedBeforeAnySourceIsRead) {
+    uint64_t target = 0;
+    const HostMetadataRegion regions[] = {
+        {&target, reinterpret_cast<void *>(1), sizeof(target)}, {nullptr, &target, sizeof(target)}
+    };
+    EXPECT_EQ(slot.staged_launch_metadata.prepare(regions, 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    const HostMetadataRegion overflowing[] = {{&target, reinterpret_cast<void *>(1), SIZE_MAX}, {&target, &target, 1}};
+    EXPECT_EQ(slot.staged_launch_metadata.prepare(overflowing, 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    const uint64_t value = 47;
+    const HostMetadataRegion valid{&target, &value, sizeof(value)};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&valid, 1), 0);
+    EXPECT_EQ(slot.staged_launch_metadata.prepare(regions, 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    EXPECT_EQ(target, value);
+}
+
+TEST_F(KernelArgsPublication, EmptyStagingClearsAnAbandonedUnpublishedBatch) {
+    uint64_t target = 0, value = 53;
+    const HostMetadataRegion region{&target, &value, sizeof(value)};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&region, 1), 0);
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(nullptr, 0), 0);
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    EXPECT_EQ(target, 0U);
+    ASSERT_EQ(rts.queued.size(), 1U);
+    EXPECT_EQ(rts.queued.front().target, slot.runtime_args);
 }

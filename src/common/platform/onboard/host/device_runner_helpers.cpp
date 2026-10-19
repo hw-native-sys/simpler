@@ -109,7 +109,7 @@ int publish_for_launch(KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, L
     const bool permitted = launch_entry_args_permitted(aicpu_stream);
     const int rc = kernel_args.publish_runtime_args(permitted, aicpu_stream, sink);
     if (rc != 0) {
-        LOG_ERROR("publish_for_launch: this run's Runtime descriptor did not reach the device: %d", rc);
+        LOG_ERROR("publish_for_launch: launch metadata publication failed: %d", rc);
     }
     return rc;
 }
@@ -161,15 +161,25 @@ int KernelArgsHelper::prepare_runtime_args(
         // here rather than inherited.
         slot.published_prefix_bytes = 0;
     }
+    const uint64_t metadata_bytes = slot.staged_launch_metadata.size();
+    if (metadata_bytes > UINT64_MAX - runtime_extent) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    const uint64_t upload_bytes = runtime_extent + metadata_bytes;
+    // Reservation excludes every previous DMA reader before this storage grows.
+    // A failed free retains ownership; a failed allocation leaves a retryable slot.
+    if (slot.runtime_upload_source != nullptr && slot.runtime_upload_bytes < upload_bytes) {
+        const int free_rc = rtFreeHost(slot.runtime_upload_source);
+        if (free_rc != 0) return free_rc;
+        slot.runtime_upload_source = nullptr;
+        slot.runtime_upload_bytes = 0;
+    }
     if (slot.runtime_upload_source == nullptr) {
         void *source = nullptr;
-        const int host_rc = rtMallocHost(&source, runtime_extent, 0);
+        const int host_rc = rtMallocHost(&source, upload_bytes, 0);
         if (host_rc != 0) return host_rc;
         if (source == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
         slot.runtime_upload_source = source;
-        slot.runtime_upload_bytes = runtime_extent;
+        slot.runtime_upload_bytes = upload_bytes;
     }
-    if (slot.runtime_upload_bytes != runtime_extent) return PTO_RUNTIME_ERR_INVALID_STATE;
     // A block whose handshake region has never been published still holds
     // whatever the allocator returned, so the first publication onto it carries
     // that region from the ctor-zeroed host copy. Every later publication stops
@@ -196,6 +206,7 @@ int KernelArgsHelper::prepare_runtime_args(
     // Definition section, which the publication compares against what the bind
     // staged on the slot.
     graph_section_bytes_ = runtime_graph_section_bytes(host_runtime);
+    launch_metadata_ = std::move(slot.staged_launch_metadata);
     runtime_args_state_ = RuntimeArgsState::Prepared;
     return 0;
 }
@@ -355,6 +366,17 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream
     runtime_args_state_ = RuntimeArgsState::Empty;
     const int rc = runtime_image_.publish(
         [this, prefix_cacheable, stream, &sink](const void *source, size_t bytes) -> int {
+            // Metadata and descriptor occupy disjoint ranges of the slot's
+            // pinned source. Neither range changes until this run retires.
+            const int metadata_rc = launch_metadata_.publish(
+                static_cast<std::byte *>(slot_->runtime_upload_source) + slot_->runtime_bytes,
+                slot_->runtime_upload_bytes - slot_->runtime_bytes,
+                [stream, &sink](void *target, const void *metadata, size_t length) {
+                    sink.mark_submitted();
+                    return rtMemcpyAsync(target, length, metadata, length, RT_MEMCPY_HOST_TO_DEVICE, stream);
+                }
+            );
+            if (metadata_rc != 0) return metadata_rc;
             // Compared and recorded here, inside the callback, because `source`
             // is the snapshot the publication consumes. The DMA reads the slot's
             // pinned copy, which survives this callback.

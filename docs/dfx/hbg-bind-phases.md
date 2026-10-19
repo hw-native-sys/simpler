@@ -69,8 +69,12 @@ publish_run_image_impl:
   arena_h2d
 ```
 
-A5 additionally prepares resident scheduler state during bind and publishes it
-before `arena_h2d`; that operation has no segment of its own.
+A5 additionally prepares resident scheduler state during bind. Onboard
+`publish_run_image_impl` snapshots that metadata before `arena_h2d`; the actual
+scheduler-state H2D queues in the later launch transaction, before the Runtime
+descriptor and entry fork. CPU transports without a staging callback retain
+synchronous publication before `arena_h2d`. Neither route has a dedicated
+scheduler segment, and the onboard enqueue cost is outside `chip.run.bind`.
 The legacy A5 path has no separate resident scheduler publication.
 
 **Execution order, emission order and parser display order differ.** Each

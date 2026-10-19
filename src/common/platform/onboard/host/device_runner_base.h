@@ -441,6 +441,7 @@ public:
 
     void free_tensor(void *dev_ptr);
     int copy_to_device(void *dev_ptr, const void *host_ptr, std::size_t bytes);
+    int stage_launch_metadata(uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count);
     int copy_from_device(void *host_ptr, const void *dev_ptr, std::size_t bytes);
 
     /**

@@ -159,20 +159,33 @@ working on a2a3 onboard across HBG and TRB, so the front was removed.
 In the common eager path, `KernelArgsHelper::prepare_runtime_args` reserves
 the slot-owned destination and pinned host source, then snapshots the published
 prefix of `DeviceRuntimeLaunchDesc`. Both runtimes defer the descriptor copy to
-the actual launch stream. HBG's separate host-built arena publication still runs
-synchronously during preparation.
+the actual launch stream. HBG's large host-built execution image still uploads
+synchronously during preparation, so that upload can overlap its predecessor's
+execution. A5 HBG's resident scheduler state is separate launch metadata: the
+bind hands owned byte snapshots through `HostApi::stage_launch_metadata`, and
+the launch queues those writes before the descriptor. Graph Definitions travel
+in the launch envelope, not through this metadata batch. Simulation transports
+without a staging callback copy the metadata synchronously during preparation.
 
-The pinned allocation is requested once per prepared slot and retained until
-finalize. Its requested size is `runtime_device_extent_size`: 43,264 bytes for
+The pinned allocation is retained per prepared slot until finalize and grows
+only while that slot has no live predecessor. Its requested capacity is the
+largest `runtime_device_extent_size + sum(metadata region bytes)` served by
+that slot. The descriptor extent alone is 43,264 bytes for
 A2/A3 TMR, 47,872 for A5 TMR, 9,472 for A2/A3 HBG and 14,080 for A5 HBG in the
-current layouts. The total requested pinned capacity is the number of resident
-prepared slots times that extent; RTS page/allocation rounding can increase the
-physical reservation. Allocation failure is a prepare error, before submission.
+current layouts. A5 HBG adds its run-specific resident scheduler layout; the
+other combinations currently stage no extra regions. Total requested pinned
+capacity is the sum of retained slot capacities; RTS page/allocation rounding
+can increase the physical reservation. These are host allocations, outside the
+device workspace budget. Growth first frees the retired source; a failed free
+retains ownership, and a failed replacement allocation can be retried without
+device submission.
 
 `queue_run_entry` orders the optional caller dependency onto the AICPU stream,
 then invokes `publish_for_launch`. The helper copies the snapshot into the
-slot's pinned source and enqueues `rtMemcpyAsync` on that stream. The entry fork
-records an event after the copy and makes the AICore stream wait for it before
+slot's pinned source and enqueues `rtMemcpyAsync` on that stream. Metadata
+regions use the source's suffix, disjoint from the descriptor prefix, and queue
+in dependency order before the descriptor. The entry fork records an event after
+all these copies and makes the AICore stream wait for it before
 launching its kernel. This also protects a cold allocation's first handshake
 initialization. An unchanged TMR launch-route prefix queues neither a copy nor,
 without a caller, an entry fork.
@@ -181,7 +194,7 @@ An unpublished descriptor rejects another preparation without changing its
 snapshot, destination or allocator. Explicit `release_run_view` discards the
 per-run view; it does not release the slot's source or destination. Native slot
 reservation prevents another run from overwriting the pinned source before the
-current run is retired. Move transfers the snapshot and publication status,
+current run is retired. Move transfers the descriptor and metadata snapshots and publication status,
 leaving the source helper unable to publish or launch.
 
 `runtime_args_published()` means the copy was accepted into stream order, or an
@@ -191,7 +204,12 @@ after publication and the entry fork. Missing preparation is `NotStarted`.
 An attempted asynchronous copy marks the launch transaction before the RTS call:
 a failed enqueue, fork record or wait is `Partial` and retains its execution
 owner. A failed copy leaves the descriptor unpublished and withdraws its launch
-payload. A repeated publish is rejected without another copy.
+payload. The first metadata enqueue failure stops later metadata and descriptor writes.
+A repeated publish is rejected without another copy. A5 scheduler DFX export
+also requires successful publication, so a metadata failure cannot label a
+previous run's scheduler records as this run's diagnostics. An empty staging batch
+clears any abandoned unpublished batch, so a legacy run cannot inherit a prior
+resident scheduler publication.
 
 A normal run's two completion boundaries prove that its publication fork was
 consumed. A partial run without those boundaries requires the existing bounded
@@ -202,7 +220,9 @@ the process: freeing it while a DMA reader may still exist is a host-memory
 use-after-free. Caller streams remain caller-owned.
 
 The prepare snapshot still costs a CPU copy per run; an actual upload adds a CPU
-copy into the reused pinned source. This removes the descriptor's blocking H2D
+copy into the reused pinned source. A5 scheduler metadata also costs an owned
+host snapshot per run. This removes the descriptor's and resident scheduler's
+blocking H2D
 and does not establish a throughput gain or capture/replay support. Bulk HBG
 image publication, DFX writes, graph ownership and replay remain separate work.
 

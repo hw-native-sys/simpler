@@ -17,6 +17,14 @@
 
 #include "common/chip_swimlane_extension.h"
 
+// Borrowed source views, valid through stage_launch_metadata; the platform
+// captures values and never takes ownership of the source containers.
+struct HostMetadataRegion {
+    void *device_target;
+    const void *host_source;
+    size_t bytes;
+};
+
 /**
  * Host API function pointers for device memory operations.
  * Allows a runtime to use pluggable device-memory backends.
@@ -265,6 +273,12 @@ struct HostApiOps {
     // Optional: only automatic onboard admission can park a managed commit.
     std::shared_ptr<void> (*get_prepare_plan)(void *runner_ctx, uint32_t pipeline_slot);
     void (*set_prepare_plan)(void *runner_ctx, uint32_t pipeline_slot, uint64_t run_epoch, std::shared_ptr<void> plan);
+    // Replaces this slot's pending launch metadata with owned byte snapshots.
+    // An empty batch clears a previous unpublished batch. No device work is
+    // submitted here; the onboard launch owns publication and source lifetime.
+    int (*stage_launch_metadata)(
+        void *runner_ctx, uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count
+    );
 };
 
 /**
@@ -275,6 +289,18 @@ struct HostApiOps {
  */
 struct HostApi {
 public:
+    int stage_launch_metadata(const HostMetadataRegion *regions, size_t count) const {
+        if (ops_->stage_launch_metadata != nullptr)
+            return ops_->stage_launch_metadata(runner_ctx_, pipeline_slot_, regions, count);
+        // CPU transports publish during prepare and have no asynchronous reader.
+        for (size_t i = 0; i < count; ++i) {
+            const auto &region = regions[i];
+            const int rc = copy_to_device(region.device_target, region.host_source, region.bytes);
+            if (rc != 0) return rc;
+        }
+        return 0;
+    }
+
     HostApi(
         void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops
     ) noexcept :

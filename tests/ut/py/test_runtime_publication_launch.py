@@ -55,6 +55,10 @@ def test_onboard_execution_contract(arch: str, runtime: str, probe: str, tmp_pat
             command.append(arg)
     cann = Path(os.environ["ASCEND_HOME_PATH"])
     binary = tmp_path / probe
+    if probe == "run_caller_launch" and arch == "a5":
+        # Compile the real backend so this executable's strong scheduler-export
+        # observer replaces its private weak leaf. The drain decision stays real.
+        command.append(entry["file"])
     command += [
         "-UNDEBUG",
         str(_ROOT / f"tests/ut/py/support/{probe}_probe.cpp"),

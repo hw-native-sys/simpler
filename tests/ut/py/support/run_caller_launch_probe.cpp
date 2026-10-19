@@ -19,12 +19,19 @@
 #include <unordered_map>
 #include "common/support/native_run_execution_peer.h"
 #include "device_runner.h"
+#include "common/host_span.h"
 
 static int tokens[64], next_stream, next_event;
 static int fail_at, submits, syncs, copies;
 static int allocation_attempts, fail_allocation;
 static std::unordered_map<void *, size_t> live_allocations;
 static bool capture;
+static int metadata_extensions, sync_error;
+extern "C" const char *get_platform();
+extern "C" bool publish_runtime_chip_swimlane_extensions(Runtime *) noexcept {
+    ++metadata_extensions;
+    return true;
+}
 static void *failed_destroy_event;
 static void *caller = &tokens[60];
 static std::vector<std::string> trace;
@@ -92,6 +99,11 @@ extern "C" aclError aclrtStreamGetId(aclrtStream, int32_t *out) {
 }
 extern "C" aclError aclrtSynchronizeStreamWithTimeout(aclrtStream, int32_t) {
     ++syncs;
+    return sync_error;
+}
+extern "C" aclError aclrtSynchronizeEventWithTimeout(aclrtEvent, int32_t) { return sync_error; }
+extern "C" aclError aclrtQueryEventStatus(aclrtEvent, aclrtEventRecordedStatus *status) {
+    *status = ACL_EVENT_RECORDED_STATUS_COMPLETE;
     return 0;
 }
 extern "C" aclError aclrtSynchronizeDeviceWithTimeout(int32_t) {
@@ -103,14 +115,17 @@ extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *s
     *model = nullptr;
     return 0;
 }
-// Only the kernel submission leaves are replaced. The production runner still
-// performs publication, arming, both callbacks, and every event/reference step.
+// Kernel submission, recovery and scheduler-export leaves are test transports.
+// The production runner performs publication, arming, launch/drain decisions,
+// both callbacks, and every event/reference step.
 int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &) { return step("core", stream); }
 int host::LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *, size_t, int, const std::string &) {
     return step("cpu", stream);
 }
 class ProbeRunner : public DeviceRunner {
 public:
+    // The model has no device faults to reset; Partial ownership is still real.
+    void recover_device_or_mark_unusable(int) override {}
     void initialize() {
         device_id_ = 0;
         assert(execution_mode_latch().latch(SIMPLER_MODE_KERNEL) == 0);
@@ -224,6 +239,66 @@ static void check(int fault, bool capturing) {
     runner.finish();
     assert(release_slot_persistent_args(slot, allocator) == 0);
 }
+static void check_metadata_publication(int fault, bool drain_fails = false) {
+    metadata_extensions = 0;
+    fail_at = fault;
+    capture = false;
+    next_stream = next_event = submits = syncs = copies = 0;
+    trace.clear();
+    stream_trace.clear();
+    event_trace.clear();
+    ProbeRunner runner;
+    runner.initialize();
+    Runtime runtime;
+    runtime.dev = {};
+    MemoryAllocator allocator;
+    SlotPersistentArgs slot;
+    uint64_t target = 0, source = 37;
+    HostMetadataRegion region{&target, &source, sizeof(source)};
+    assert(slot.staged_launch_metadata.prepare(&region, 1) == 0);
+    source = 99;
+    NativeRunIdentity id{1, 1, 1, 0};
+    auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
+    prepared->caller_stream = caller;
+    assert(prepared->kernel_args.prepare_runtime_args(runtime, allocator, slot) == 0);
+    assert(target == 0 && copies == 0);
+    auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(id));
+    assert(syncs == 0);
+    if (fault != 0) {
+        assert(outcome.rc == -777 && outcome.progress == LaunchProgress::Partial);
+        assert(submits == fault && outcome.active != nullptr && outcome.prepared == nullptr);
+        assert(trace.back() == "publish");
+        for (const auto &step : trace)
+            assert(step != "core" && step != "cpu");
+        assert(target == (fault == 3 ? 0u : 37u));
+    } else {
+        assert(outcome.rc == 0 && outcome.progress == LaunchProgress::Complete);
+        assert(target == 37);
+        assert(
+            (trace == std::vector<std::string>{
+                          "record", "wait", "publish", "publish", "record", "wait", "record", "core", "record", "cpu",
+                          "wait", "record", "record", "wait", "record"
+                      })
+        );
+        const auto streams = outcome.active->prepared->streams;
+        for (size_t i : {1u, 2u, 3u, 4u})
+            assert(stream_trace[i] == streams.aicpu);
+        assert(stream_trace[5] == streams.aicore);
+        assert(event_trace[4] == event_trace[5] && event_trace[4] != nullptr);
+    }
+    // A5's production backend is linked into this probe so its private runtime
+    // exporter can be observed without replacing the drain's readiness check.
+    if (std::strcmp(get_platform(), "a5") == 0) {
+        outcome.active->prepared->resources_owned = true;
+        outcome.active->prepared->dfx.chip_swimlane_level = ChipSwimlaneLevel::TASK_TIMING;
+        sync_error = drain_fails ? -779 : 0;
+        (void)runner.drain_execution(*outcome.active);
+        sync_error = 0;
+        assert(metadata_extensions == (fault == 0 ? 1 : 0));
+    }
+    runner.finish();
+    assert(release_slot_persistent_args(slot, allocator) == 0);
+}
 static void check_arena_growth(SimplerExecutionMode mode) {
     const size_t before = live_allocations.size();
     {
@@ -280,6 +355,15 @@ static void check_arena_growth(SimplerExecutionMode mode) {
     assert(live_allocations.size() == before);
 }
 int main() {
+    check_metadata_publication(0);
+    check_metadata_publication(3);  // Metadata enqueue failure.
+    check_metadata_publication(4);  // Descriptor enqueue after accepted metadata.
+
+    if (std::strcmp(get_platform(), "a5") == 0) {
+        check_metadata_publication(0, true);
+        check_metadata_publication(3, true);
+        check_metadata_publication(4, true);
+    }
     check_arena_growth(SIMPLER_MODE_PROGRAM);
     check_arena_growth(SIMPLER_MODE_KERNEL);
     check(0, false);
@@ -299,8 +383,10 @@ int main() {
     assert(copies == prior_copies);
     runner.check_failed_event_close();
     runner.finish();
-    std::puts("PASS: real launch ordering, twelve partial failures, and pre-publication capture refusal");
+    std::puts("PASS: real launch/drain ordering, publication failures, and pre-publication capture refusal");
 }
 extern "C" void unified_log_warn(const char *, const char *, ...) {}
 extern "C" void unified_log_info(const char *, const char *, ...) {}
 extern "C" void unified_log_error(const char *, const char *, ...) {}
+extern "C" void unified_log_debug(const char *, const char *, ...) {}
+extern "C" void unified_log_host_span(const SimplerHostSpan *) {}

@@ -580,6 +580,16 @@ static int caller_device_span_written_by_other_run(void *runner_ctx, uint64_t ru
     }
 }
 
+static int
+stage_launch_metadata(void *runner_ctx, uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count) {
+    if (runner_ctx == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        return static_cast<DeviceRunnerBase *>(runner_ctx)->stage_launch_metadata(pipeline_slot, regions, count);
+    } catch (...) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
 static const HostApiOps g_host_api_ops = {
     .device_malloc = device_malloc,
     .device_free = device_free,
@@ -616,6 +626,7 @@ static const HostApiOps g_host_api_ops = {
     .set_orchestration_scratch = set_orchestration_scratch,
     .get_prepare_plan = get_prepare_plan,
     .set_prepare_plan = set_prepare_plan,
+    .stage_launch_metadata = stage_launch_metadata,
 };
 
 /* ===========================================================================

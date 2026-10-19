@@ -135,8 +135,8 @@ size_t runtime_device_initialized_prefix_size(const Runtime &) { return Runtime:
 
 size_t runtime_device_extent_size(const Runtime &) { return Runtime::device_extent_bytes(); }
 
-// Unsupported, so this runtime's host path keeps publishing the whole descriptor
-// prefix at prepare time and never builds a launch package.
+// Tensor arguments use the descriptor route, published on the launch stream.
+// Graph Definitions have their own launch-envelope section, independent of this plan.
 LaunchEntryArgsPlan runtime_launch_entry_args_plan(const Runtime &) { return LaunchEntryArgsPlan{}; }
 
 uint32_t runtime_graph_section_bytes(const Runtime &rt) { return rt.get_graph_section_bytes(); }

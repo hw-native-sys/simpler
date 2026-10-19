@@ -734,9 +734,11 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         // remains the drain owner's responsibility and its error remains
         // authoritative over cleanup.
         recover_device_or_mark_unusable(rc);
-        // Emergency shutdown may already have flushed diagnostics. Export the
-        // manifest on the error path exactly once.
-        if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
+        // Emergency shutdown may already have flushed diagnostics. Runtime
+        // extensions require this run's published metadata: a Partial launch
+        // can still name the previous run's scheduler records.
+        if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&
+            !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
             LOG_WARN("Runtime chip-swimlane extension publication failed");
         }
         // The device error that brought this path here stays authoritative, so
@@ -780,7 +782,8 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
         return DrainOutcome::device_error(discharge_rc);
     }
 
-    if (prepared.dfx.chip_swimlane_enabled() && !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
+    if (prepared.dfx.chip_swimlane_enabled() && prepared.kernel_args.runtime_args_published() &&
+        !publish_runtime_chip_swimlane_extensions(prepared.runtime)) {
         LOG_WARN("Runtime chip-swimlane extension publication failed");
     }
     // A retained diagnostics close that could not prove it owns this run's

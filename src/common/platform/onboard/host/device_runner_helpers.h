@@ -38,6 +38,7 @@
 #include "common/launch_entry_args.h"
 #include "host/memory_allocator.h"
 #include "host/runtime_launch_image.h"
+#include "host/runtime_launch_metadata.h"
 #include "runtime_c_api.h"
 #include "native_run_execution.h"
 #include "runtime.h"
@@ -132,6 +133,9 @@ struct SlotPersistentArgs {
     void *runtime_upload_source{nullptr};
     uint64_t runtime_upload_bytes{0};
 
+    // Bind hands owned metadata values to prepare; launch consumes them once.
+    RuntimeLaunchMetadata staged_launch_metadata;
+
     Runtime *runtime_args{nullptr};  // device block holding the Runtime descriptor
     uint64_t runtime_bytes{0};       // committed length: the full device extent, not a published prefix
 
@@ -225,6 +229,7 @@ struct KernelArgsHelper {
         args(other.args),
         allocator_(std::exchange(other.allocator_, nullptr)),
         runtime_image_(std::move(other.runtime_image_)),
+        launch_metadata_(std::move(other.launch_metadata_)),
         runtime_args_state_(std::exchange(other.runtime_args_state_, RuntimeArgsState::Empty)),
         initializing_slot_(std::exchange(other.initializing_slot_, nullptr)),
         slot_(std::exchange(other.slot_, nullptr)),
@@ -279,7 +284,8 @@ struct KernelArgsHelper {
     int publish_runtime_args(bool launch_route_permitted, rtStream_t stream, LaunchProgressSink &sink);
 
     // A non-null destination alone may still contain a previous run's bytes.
-    // This verdict covers only the Runtime descriptor, not late DFX publication.
+    // This verdict covers the Runtime descriptor and staged launch metadata,
+    // not late DFX publication.
     bool runtime_args_published() const {
         return runtime_args_state_ == RuntimeArgsState::Published && args.runtime_args != nullptr;
     }
@@ -322,6 +328,7 @@ struct KernelArgsHelper {
      */
     void release_run_view() {
         runtime_image_.clear();
+        launch_metadata_.clear();
         runtime_args_state_ = RuntimeArgsState::Empty;
         args.runtime_args = nullptr;
         initializing_slot_ = nullptr;
@@ -354,6 +361,7 @@ private:
     enum class RuntimeArgsState : uint8_t { Empty, Prepared, Published };
 
     RuntimeLaunchImage runtime_image_;
+    RuntimeLaunchMetadata launch_metadata_;
     RuntimeArgsState runtime_args_state_{RuntimeArgsState::Empty};
 
     // The slot whose pending snapshot carries the handshake region, or null

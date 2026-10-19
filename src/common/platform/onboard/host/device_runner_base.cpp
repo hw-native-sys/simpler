@@ -1173,6 +1173,11 @@ int DeviceRunnerBase::acquire_graph_staging(
     return 0;
 }
 
+int DeviceRunnerBase::stage_launch_metadata(uint32_t pipeline_slot, const HostMetadataRegion *regions, size_t count) {
+    if (pipeline_slot >= slot_persistent_args_.size()) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return slot_persistent_args_[pipeline_slot].staged_launch_metadata.prepare(regions, count);
+}
+
 int DeviceRunnerBase::publish_graph_section(
     uint32_t pipeline_slot, const void *bytes, size_t length, uint32_t *source_out, uint64_t *base_out
 ) {
