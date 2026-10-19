@@ -574,7 +574,7 @@ TEST(SchedulerDispatch, DispatchSequenceIsIndependentOfSlotGenerationAndRejectsZ
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
         ready_claim, 0, storage.ssbuf_region
     ));
-    EXPECT_EQ(storage.scheduler_local_state.slots[0][0].generation, 1u);
+    EXPECT_EQ(storage.scheduler_local_state.slots[0].generation, 1u);
     uint32_t pending_slot = UINT32_MAX;
     uint64_t publication = 0;
     ASSERT_TRUE(scheduler_local_ready_pop(&storage.scheduler_local_state, &pending_slot, &publication));
@@ -737,7 +737,7 @@ TEST(SchedulerPredicate, MalformedPredicateStopsDispatchWithoutPublishingSlot) {
     ));
     EXPECT_EQ(storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_PREDICATE));
-    EXPECT_NE(storage.scheduler_local_state.slots[0][0].state, SchedulerDispatchSlotState::READY);
+    EXPECT_NE(storage.scheduler_local_state.slots[0].state, SchedulerDispatchSlotState::READY);
 }
 
 TEST(SchedulerPredicate, FailedPredicatePublishesDependencyOnlyDispatch) {

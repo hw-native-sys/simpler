@@ -204,6 +204,9 @@ struct SchedulerLocalProfilingState {
     uint64_t activity_buffers_offset{0};
     SchedulerExecutorTaskTrace executor_traces[SCHEDULER_PENDING_SLOT_COUNT]{};
     SchedulerWorkerTraceCache worker_traces[PLATFORM_CORES_PER_BLOCKDIM]{};
+    // Indexed by (lane, slot) like the slots themselves, which is what keeps a
+    // Mix slot's timing distinct from this core's own: a coordinator's own slots
+    // are lane 0 and the Mix slots it services are lanes 1 and 2.
     int32_t timing_slots[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_PENDING_SLOT_COUNT]{};
     uint32_t loop_iter{0};
     uint8_t worker_trace_valid_mask{0};
@@ -231,7 +234,7 @@ struct SchedulerLocalState {
     SchedulerLocalProfilingState *profiling{nullptr};
     uint64_t pending_completed{0};
     SchedulerMixTracker mix_trackers[SCHEDULER_MIX_TRACKER_COUNT]{};
-    uint32_t dispatch_sequences[PLATFORM_CORES_PER_BLOCKDIM]{};
+    uint32_t dispatch_sequence{0};
     bool has_mix{false};
 
     inline __aicore__ explicit SchedulerLocalState(SchedulerLocalProfilingState *profile = nullptr) :
@@ -239,10 +242,8 @@ struct SchedulerLocalState {
     // True on the one core that coordinates this cluster's Mix tasks: its AIC.
     inline __aicore__ bool is_mix_coordinator() const { return config.self_lane == 0; }
     // This core's own two dispatch slots -- the only ones it fills or executes.
-    // The slots array is still indexed by cluster lane because a Mix task's
-    // subtasks land on a peer's slots, which only the coordinator writes.
-    inline __aicore__ SchedulerLocalSlotState *own_slots() { return slots[config.self_lane]; }
-    inline __aicore__ const SchedulerLocalSlotState *own_slots() const { return slots[config.self_lane]; }
+    inline __aicore__ SchedulerLocalSlotState *own_slots() { return slots; }
+    inline __aicore__ const SchedulerLocalSlotState *own_slots() const { return slots; }
     inline __aicore__ uint64_t worker_id() const {
         return config.self_lane < PLATFORM_CORES_PER_BLOCKDIM ? config.worker_ids[config.self_lane] : UINT64_MAX;
     }
@@ -268,17 +269,18 @@ struct SchedulerLocalState {
                (static_cast<uint64_t>(config.cluster_type_ranks[lane]) * SCHEDULER_MIX_SLOT_COUNT + slot) *
                    sizeof(SchedulerExecutorTaskTrace);
     }
-    // The slot a claim names, in whichever of the two sets it belongs to.
+    // The slot a claim names, in whichever of the two sets it belongs to. An
+    // ordinary claim is always for this core's own slots, so only a Mix claim
+    // needs the lane: it names which peer AIV holds the slot.
     inline __aicore__ SchedulerLocalSlotState *slot_state(const SchedulerFreeSlotClaim &claim) {
-        return claim.mix ? &mix_slots[claim.cluster_lane][claim.slot_index] :
-                           &slots[claim.cluster_lane][claim.slot_index];
+        return claim.mix ? &mix_slots[claim.cluster_lane][claim.slot_index] : &slots[claim.slot_index];
     }
     inline __aicore__ uint64_t slot_payload_offset(const SchedulerFreeSlotClaim &claim) const {
         return claim.mix ? mix_payload_offset(claim.cluster_lane, claim.slot_index) :
                            dispatch_payload_offset(claim.cluster_lane, claim.slot_index);
     }
     inline __aicore__ uint32_t next_slot_generation(const SchedulerFreeSlotClaim &claim) {
-        return claim.mix ? ++mix_dispatch_sequences[claim.cluster_lane] : ++dispatch_sequences[claim.cluster_lane];
+        return claim.mix ? ++mix_dispatch_sequences[claim.cluster_lane] : ++dispatch_sequence;
     }
 
     inline __aicore__ int32_t timing_slot(uint32_t lane, uint32_t slot) const {
@@ -292,14 +294,15 @@ struct SchedulerLocalState {
         return timing >= 0 && timing < SCHEDULER_TASK_TIMING_SLOT_COUNT;
     }
 
-    SchedulerLocalSlotState slots[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_PENDING_SLOT_COUNT]{};
+    SchedulerLocalSlotState slots[SCHEDULER_PENDING_SLOT_COUNT]{};
     // The cluster's Mix slots, two per lane. Only the cluster's AIC writes
-    // these, which is what makes this core's view of them authoritative: unlike
-    // slots[], whose entries for a peer lane are that peer's to fill, no second
-    // core can change a Mix slot between a placement probe and its claim.
+    // these, which is what makes this core's view of them authoritative: no
+    // second core can change a Mix slot between a placement probe and its
+    // claim. Indexed by lane to match the SSBUF tokens that carry them, so
+    // lane 0 -- the coordinator itself -- holds no Mix slot.
     SchedulerLocalSlotState mix_slots[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_MIX_SLOT_COUNT]{};
     uint32_t mix_dispatch_sequences[PLATFORM_CORES_PER_BLOCKDIM]{};
-    uint64_t consumed_completion_generations[PLATFORM_CORES_PER_BLOCKDIM]{};
+    uint64_t consumed_completion_generation{0};
     uint64_t consumed_mix_completion_generations[PLATFORM_CORES_PER_BLOCKDIM]{};
     uint32_t local_completed_generations[SCHEDULER_PENDING_SLOT_COUNT]{};
     uint8_t local_ready_mask{0};
@@ -314,7 +317,7 @@ static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 128, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 16, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 528, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 440, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 240, "64-bit local profiling size changed"
 );
@@ -421,7 +424,7 @@ inline __aicore__ uint32_t scheduler_consumed_completion_generation(
     const uint32_t slot_limit = mix ? SCHEDULER_MIX_SLOT_COUNT : SCHEDULER_PENDING_SLOT_COUNT;
     if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || slot_index >= slot_limit) return 0;
     const uint64_t consumed = mix ? scheduler_local_state->consumed_mix_completion_generations[cluster_lane] :
-                                    scheduler_local_state->consumed_completion_generations[cluster_lane];
+                                    scheduler_local_state->consumed_completion_generation;
     return static_cast<uint32_t>(consumed >> (slot_index * 32));
 }
 
@@ -443,7 +446,7 @@ inline __aicore__ void scheduler_mark_completion_consumed(
     const uint32_t shift = slot_index * 32;
     const uint64_t mask = UINT64_C(0xffffffff) << shift;
     uint64_t &consumed = mix ? scheduler_local_state->consumed_mix_completion_generations[cluster_lane] :
-                               scheduler_local_state->consumed_completion_generations[cluster_lane];
+                               scheduler_local_state->consumed_completion_generation;
     consumed = (consumed & ~mask) | (static_cast<uint64_t>(completed_generation) << shift);
 }
 
@@ -460,15 +463,14 @@ scheduler_local_ready_pop(SchedulerLocalState *scheduler_local_state, uint32_t *
     uint32_t oldest = UINT32_MAX;
     for (uint32_t selected = 0; selected < SCHEDULER_PENDING_SLOT_COUNT; ++selected) {
         if ((scheduler_local_state->local_ready_mask & (1U << selected)) == 0) continue;
-        const auto &slot = scheduler_local_state->slots[scheduler_local_state->config.self_lane][selected];
-        if (oldest == UINT32_MAX ||
-            slot.generation < scheduler_local_state->slots[scheduler_local_state->config.self_lane][oldest].generation)
+        const auto &slot = scheduler_local_state->slots[selected];
+        if (oldest == UINT32_MAX || slot.generation < scheduler_local_state->slots[oldest].generation)
             oldest = selected;
     }
     if (oldest != UINT32_MAX) {
         scheduler_local_state->local_ready_mask &= ~(1U << oldest);
         *slot_index = oldest;
-        const auto &slot = scheduler_local_state->slots[scheduler_local_state->config.self_lane][oldest];
+        const auto &slot = scheduler_local_state->slots[oldest];
         // A local notification owns this slot until it is consumed here. Keep
         // an invalid state in the token so the Executor rejects it.
         *publication = (static_cast<uint64_t>(slot.generation) << 8) | static_cast<uint64_t>(slot.state);
@@ -1122,7 +1124,10 @@ inline __aicore__ bool scheduler_plan_mix_placement(
             const uint64_t worker = local->config.worker_ids[lane];
             if (worker >= local->config.runtime_worker_count) continue;
             const uint32_t slot_count = mix_slot ? SCHEDULER_MIX_SLOT_COUNT : SCHEDULER_PENDING_SLOT_COUNT;
-            const SchedulerLocalSlotState *states = mix_slot ? local->mix_slots[lane] : local->slots[lane];
+            // The AIC subtask lands on the coordinator's own slots, which is
+            // this core: lane 0 is both the only ordinary lane this loop visits
+            // and the lane the coordinator runs on.
+            const SchedulerLocalSlotState *states = mix_slot ? local->mix_slots[lane] : local->slots;
             for (uint32_t slot = 0; slot < slot_count; ++slot) {
                 if (states[slot].state != SchedulerDispatchSlotState::FREE) continue;
                 placement->slots[placement->count] = {worker, slot, states[slot].generation, lane, mix_slot};
@@ -1366,7 +1371,7 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
         return false;
     }
     const uint16_t kernel_id = metadata.kernel_ids[subtask_slot];
-    if (scheduler->dispatch_sequences[slot_claim.cluster_lane] == UINT32_MAX) return false;
+    if (scheduler->dispatch_sequence == UINT32_MAX) return false;
     auto &reserved = *scheduler->slot_state(slot_claim);
     if (reserved.state != SchedulerDispatchSlotState::FILLING || reserved.generation != slot_claim.generation ||
         scheduler->config.worker_ids[slot_claim.cluster_lane] != slot_claim.worker_id)

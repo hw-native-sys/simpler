@@ -134,12 +134,10 @@ struct FixtureStorage {
         test_graphs(workers),
         local_states(workers) {
         for (auto &local : test_contexts)
-            for (auto &lane : local.slots)
-                for (auto &slot : lane)
-                    scheduler_initialize_free_slot(&slot);
-        for (auto &lane : scheduler_local_state.slots)
-            for (auto &slot : lane)
+            for (auto &slot : local.slots)
                 scheduler_initialize_free_slot(&slot);
+        for (auto &slot : scheduler_local_state.slots)
+            scheduler_initialize_free_slot(&slot);
         EXPECT_TRUE(scheduler_plan_layout(task_count, task_count, 0, &layout, false, task_count * traces_per_task));
         scheduler_state = std::make_unique<SchedulerStateBuffer>(layout);
         run_control = scheduler_state_at<SchedulerRunControl>(scheduler_state->base(), layout.run_control_offset);

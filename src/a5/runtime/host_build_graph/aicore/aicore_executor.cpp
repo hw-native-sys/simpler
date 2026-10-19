@@ -251,14 +251,14 @@ __aicore__ bool bootstrap_ready_graph(
     scheduler->owner_ready_queue_mask = 0;
     if (phase_timing_enabled) stats->target_bootstrap_start_cycles = scheduler_cycles();
 
+    for (uint32_t slot_index = 0; slot_index < SCHEDULER_PENDING_SLOT_COUNT; ++slot_index) {
+        scheduler_initialize_free_slot(&scheduler->slots[slot_index]);
+    }
     for (uint32_t cluster_lane = 0; cluster_lane < PLATFORM_CORES_PER_BLOCKDIM; ++cluster_lane) {
         const uint64_t worker_id = scheduler->config.worker_ids[cluster_lane];
         uint64_t target_start = phase_timing_enabled ? scheduler_cycles() : 0;
         __gm__ SchedulerWorkerContext *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
         uint32_t type = scheduler_core_type_index(target->core_type);
-        for (uint32_t slot_index = 0; slot_index < SCHEDULER_PENDING_SLOT_COUNT; ++slot_index) {
-            scheduler_initialize_free_slot(&scheduler->slots[cluster_lane][slot_index]);
-        }
         // A slot state defaults to EMPTY, not FREE, so the Mix slots this core
         // coordinates have to be opened here too; left EMPTY, placement would
         // never find capacity and Mix work would silently never dispatch.
@@ -414,7 +414,7 @@ __aicore__ bool run_ready_dispatch_loop(
         }
         if (ready_slot >= 0) {
             uint32_t slot_index = static_cast<uint32_t>(ready_slot);
-            SchedulerLocalSlotState *local_slot = &context->slots[cluster_lane][slot_index];
+            SchedulerLocalSlotState *local_slot = &context->slots[slot_index];
             const int32_t timing_slot = context->timing_slot(cluster_lane, slot_index);
             __gm__ DispatchPayload *payload = scheduler_state_at<DispatchPayload>(
                 scheduler_state_base, context->dispatch_payload_offset(context->config.self_lane, slot_index)
