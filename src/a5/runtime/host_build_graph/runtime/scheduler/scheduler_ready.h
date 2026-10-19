@@ -125,7 +125,20 @@ struct SchedulerFreeSlotClaim {
     uint32_t slot_index{UINT32_MAX};
     uint32_t generation{0};
     uint32_t cluster_lane{UINT32_MAX};
+    // Whether slot_index names one of the lane's Mix slots rather than one of
+    // its own two. The two sets have separate state, payloads, generations and
+    // publication tokens, so everything that touches a slot needs to know which.
+    bool mix{false};
 };
+
+// Where a claim's dispatch is published. Mix slots have their own controls, so
+// a Mix dispatch never disturbs the publication of the lane's own work.
+inline __aicore__ SCHEDULER_SSBUF SchedulerSsbufDispatchControl *scheduler_slot_dispatch_control(
+    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, const SchedulerFreeSlotClaim &claim
+) {
+    return claim.mix ? &ssbuf_region->mix_dispatch[claim.cluster_lane][claim.slot_index] :
+                       &ssbuf_region->lanes[claim.cluster_lane].dispatch[claim.slot_index];
+}
 
 struct SchedulerLocalSlotState {
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
@@ -151,6 +164,8 @@ struct SchedulerLocalConfig {
     uint64_t task_controls_offset{0};
     uint64_t ready_inboxes_offset{0};
     uint64_t ready_directory_offset{0};
+    uint64_t mix_payloads_offset{0};
+    uint64_t mix_traces_offset{0};
     uint64_t graph_summary_offset{0};
     // The callable's registration-owned entry table, named by absolute address
     // because it is not part of the scheduler state these offsets index. The
@@ -169,6 +184,14 @@ struct SchedulerLocalConfig {
     uint16_t runtime_worker_count{0};
     uint16_t scheduler_index{UINT16_MAX};
     uint16_t scheduler_count{0};
+    // Each cluster lane's index within its own core type, which is how every
+    // ready queue that lane can hold is addressed. Read from the lane's own
+    // worker context rather than derived, so nothing here assumes an AIC's rank
+    // and its cluster index coincide.
+    uint16_t cluster_type_ranks[PLATFORM_CORES_PER_BLOCKDIM]{};
+    // Clusters in this run, which fixes how many of each queue's inboxes are
+    // live: one per cluster for the AIC and Mix queues, two for the AIV queue.
+    uint16_t cluster_count{0};
     uint8_t self_lane{UINT8_MAX};
     uint8_t scheduler_lane{UINT8_MAX};
     // This core's own type, which is also the only type of ready work it can
@@ -228,10 +251,39 @@ struct SchedulerLocalState {
     inline __aicore__ uint64_t worker_id() const {
         return config.self_lane < PLATFORM_CORES_PER_BLOCKDIM ? config.worker_ids[config.self_lane] : UINT64_MAX;
     }
+    // This core's own inbox index in every queue it can hold.
+    inline __aicore__ uint64_t self_type_rank() const {
+        return config.self_lane < PLATFORM_CORES_PER_BLOCKDIM ? config.cluster_type_ranks[config.self_lane] :
+                                                                UINT64_MAX;
+    }
     inline __aicore__ uint64_t dispatch_payload_offset(uint32_t lane, uint32_t slot) const {
         return static_cast<uint64_t>(config.dispatch_payloads_offset) +
                (static_cast<uint64_t>(config.worker_ids[lane]) * SCHEDULER_PENDING_SLOT_COUNT + slot) *
                    sizeof(DispatchPayload);
+    }
+    // A Mix slot's payload and executor trace are addressed by the holding
+    // AIV's rank, so lane 0 -- the AIC -- has none and never claims one.
+    inline __aicore__ uint64_t mix_payload_offset(uint32_t lane, uint32_t slot) const {
+        return config.mix_payloads_offset +
+               (static_cast<uint64_t>(config.cluster_type_ranks[lane]) * SCHEDULER_MIX_SLOT_COUNT + slot) *
+                   sizeof(DispatchPayload);
+    }
+    inline __aicore__ uint64_t mix_trace_offset(uint32_t lane, uint32_t slot) const {
+        return config.mix_traces_offset +
+               (static_cast<uint64_t>(config.cluster_type_ranks[lane]) * SCHEDULER_MIX_SLOT_COUNT + slot) *
+                   sizeof(SchedulerExecutorTaskTrace);
+    }
+    // The slot a claim names, in whichever of the two sets it belongs to.
+    inline __aicore__ SchedulerLocalSlotState *slot_state(const SchedulerFreeSlotClaim &claim) {
+        return claim.mix ? &mix_slots[claim.cluster_lane][claim.slot_index] :
+                           &slots[claim.cluster_lane][claim.slot_index];
+    }
+    inline __aicore__ uint64_t slot_payload_offset(const SchedulerFreeSlotClaim &claim) const {
+        return claim.mix ? mix_payload_offset(claim.cluster_lane, claim.slot_index) :
+                           dispatch_payload_offset(claim.cluster_lane, claim.slot_index);
+    }
+    inline __aicore__ uint32_t next_slot_generation(const SchedulerFreeSlotClaim &claim) {
+        return claim.mix ? ++mix_dispatch_sequences[claim.cluster_lane] : ++dispatch_sequences[claim.cluster_lane];
     }
 
     inline __aicore__ int32_t timing_slot(uint32_t lane, uint32_t slot) const {
@@ -246,7 +298,14 @@ struct SchedulerLocalState {
     }
 
     SchedulerLocalSlotState slots[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_PENDING_SLOT_COUNT]{};
+    // The cluster's Mix slots, two per lane. Only the cluster's AIC writes
+    // these, which is what makes this core's view of them authoritative: unlike
+    // slots[], whose entries for a peer lane are that peer's to fill, no second
+    // core can change a Mix slot between a placement probe and its claim.
+    SchedulerLocalSlotState mix_slots[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_MIX_SLOT_COUNT]{};
+    uint32_t mix_dispatch_sequences[PLATFORM_CORES_PER_BLOCKDIM]{};
     uint64_t consumed_completion_generations[PLATFORM_CORES_PER_BLOCKDIM]{};
+    uint64_t consumed_mix_completion_generations[PLATFORM_CORES_PER_BLOCKDIM]{};
     uint32_t local_completed_generations[SCHEDULER_PENDING_SLOT_COUNT]{};
     uint8_t local_ready_mask{0};
     uint8_t owner_ready_queue_mask{0};
@@ -259,9 +318,9 @@ static_assert(SCHEDULER_PENDING_SLOT_COUNT <= 8, "local ready mask must fit one 
 static_assert(SCHEDULER_READY_QUEUE_COUNT <= 8, "owner ready mask must fit one byte");
 static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 104, "64-bit local config size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 128, "64-bit local config size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 16, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 368, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 528, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 240, "64-bit local profiling size changed"
 );
@@ -277,15 +336,8 @@ inline __aicore__ bool scheduler_initialize_local_config(
     for (uint64_t offset = 0; offset < offsetof(SchedulerWorkerContext, bootstrap_task_count); offset += 64)
         scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(context) + offset);
     if (context->scheduler_ssbuf_reserved0 != 0 || context->scheduler_ssbuf_reserved1 != 0 ||
-        context->scheduler_ssbuf_reserved2 != 0)
+        context->scheduler_ssbuf_reserved2 != 0 || context->topology_reserved[0] != 0)
         return false;
-    // Every word of the reserved tail, however many are left: a field taken out
-    // of this array is a field a producer now writes, so a bound that outlives
-    // the array reads the next member instead and rejects a context whose only
-    // fault is that the member is in use.
-    for (uint32_t index = 0; index < sizeof(context->topology_reserved) / sizeof(context->topology_reserved[0]);
-         ++index)
-        if (context->topology_reserved[index] != 0) return false;
     SchedulerLocalConfig &config = local->config;
     const uint64_t payload_stride = SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
     if (context->worker_contexts_offset > UINT32_MAX || context->callable_addresses_count > UINT32_MAX ||
@@ -312,6 +364,12 @@ inline __aicore__ bool scheduler_initialize_local_config(
     config.callable_addresses_address = context->callable_addresses_address;
     config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
     config.graph_summary_offset = context->graph_summary_offset;
+    // The layout reserves the run control first, so no array it hands out can
+    // begin at zero: a zero here means this worker's context was never wired up
+    // and every Mix payload would be addressed from the state's own base.
+    if (context->mix_payloads_offset == 0 || context->mix_traces_offset == 0) return false;
+    config.mix_payloads_offset = context->mix_payloads_offset;
+    config.mix_traces_offset = context->mix_traces_offset;
     auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, config.graph_summary_offset);
     scheduler_observe_cache_line(summary);
     local->has_mix = summary->mix_task_count != 0;
@@ -324,6 +382,11 @@ inline __aicore__ bool scheduler_initialize_local_config(
     config.runtime_worker_count = static_cast<uint16_t>(runtime_worker_count);
     config.scheduler_count = static_cast<uint16_t>(scheduler_count);
     config.scheduler_index = static_cast<uint16_t>(scheduler_index);
+    // One AIC per cluster, so a cluster count bounds the AIC and Mix queues
+    // directly and the AIV queue by the lanes per cluster.
+    const uint64_t cluster_count = context->cluster_count;
+    if (cluster_count == 0 || cluster_count > SCHEDULER_CLUSTER_CAPACITY) return false;
+    config.cluster_count = static_cast<uint16_t>(cluster_count);
     config.self_lane = UINT8_MAX;
     config.scheduler_lane = UINT8_MAX;
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
@@ -339,6 +402,10 @@ inline __aicore__ bool scheduler_initialize_local_config(
         if (core_type != static_cast<int32_t>(lane == 0 ? CoreType::AIC : CoreType::AIV)) return false;
         if (target->dispatch_payload_offset != payload_base + worker_id * payload_stride) return false;
         if (target->worker_reserved != 0) return false;
+        const int32_t rank = target->type_rank;
+        if (rank < 0 || static_cast<uint32_t>(rank) >= scheduler_ready_queue_capacity(lane == 0 ? 0U : 1U))
+            return false;
+        config.cluster_type_ranks[lane] = static_cast<uint16_t>(rank);
         config.worker_ids[lane] = static_cast<uint16_t>(worker_id);
         if (worker_id == context->worker_index) config.self_lane = static_cast<uint8_t>(lane);
         // The cluster's Mix coordinator, which is its AIC and so always lane 0.
@@ -354,32 +421,38 @@ inline __aicore__ bool scheduler_initialize_local_config(
     return context->is_scheduler != 0;
 }
 
+// Completion generations of a lane's own slots and of its Mix slots are
+// separate sequences in separate inboxes, so which set a lane/slot pair belongs
+// to has to travel with it.
 inline __aicore__ uint32_t scheduler_consumed_completion_generation(
-    const SchedulerLocalState *scheduler_local_state, uint32_t cluster_lane, uint32_t slot_index
+    const SchedulerLocalState *scheduler_local_state, uint32_t cluster_lane, uint32_t slot_index, bool mix = false
 ) {
-    if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || slot_index >= SCHEDULER_PENDING_SLOT_COUNT) return 0;
-    return static_cast<uint32_t>(
-        scheduler_local_state->consumed_completion_generations[cluster_lane] >> (slot_index * 32)
-    );
+    const uint32_t slot_limit = mix ? SCHEDULER_MIX_SLOT_COUNT : SCHEDULER_PENDING_SLOT_COUNT;
+    if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || slot_index >= slot_limit) return 0;
+    const uint64_t consumed = mix ? scheduler_local_state->consumed_mix_completion_generations[cluster_lane] :
+                                    scheduler_local_state->consumed_completion_generations[cluster_lane];
+    return static_cast<uint32_t>(consumed >> (slot_index * 32));
 }
 
 inline __aicore__ bool scheduler_completion_generation_is_new(
     const SchedulerLocalState *scheduler_local_state, uint32_t cluster_lane, uint32_t slot_index,
-    uint32_t completed_generation
+    uint32_t completed_generation, bool mix = false
 ) {
     return completed_generation != 0 &&
            completed_generation !=
-               scheduler_consumed_completion_generation(scheduler_local_state, cluster_lane, slot_index);
+               scheduler_consumed_completion_generation(scheduler_local_state, cluster_lane, slot_index, mix);
 }
 
 inline __aicore__ void scheduler_mark_completion_consumed(
     SchedulerLocalState *scheduler_local_state, uint32_t cluster_lane, uint32_t slot_index,
-    uint32_t completed_generation
+    uint32_t completed_generation, bool mix = false
 ) {
-    if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || slot_index >= SCHEDULER_PENDING_SLOT_COUNT) return;
+    const uint32_t slot_limit = mix ? SCHEDULER_MIX_SLOT_COUNT : SCHEDULER_PENDING_SLOT_COUNT;
+    if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || slot_index >= slot_limit) return;
     const uint32_t shift = slot_index * 32;
     const uint64_t mask = UINT64_C(0xffffffff) << shift;
-    uint64_t &consumed = scheduler_local_state->consumed_completion_generations[cluster_lane];
+    uint64_t &consumed = mix ? scheduler_local_state->consumed_mix_completion_generations[cluster_lane] :
+                               scheduler_local_state->consumed_completion_generations[cluster_lane];
     consumed = (consumed & ~mask) | (static_cast<uint64_t>(completed_generation) << shift);
 }
 
@@ -544,10 +617,25 @@ inline __aicore__ __gm__ SchedulerReadyInbox *scheduler_ready_inbox_at(
     __gm__ void *scheduler_state_base, const SchedulerLocalState *context, uint32_t core_type_index,
     uint64_t inbox_index
 ) {
-    uint64_t linear = static_cast<uint64_t>(core_type_index) * SCHEDULER_WORKER_CAPACITY + inbox_index;
+    uint64_t linear = scheduler_ready_queue_base(core_type_index) + inbox_index;
     return scheduler_state_at<SchedulerReadyInbox>(
         scheduler_state_base, context->config.ready_inboxes_offset + linear * sizeof(SchedulerReadyInbox)
     );
+}
+
+// Which core types may hold a queue: the AIC and Mix queues belong to AIC cores,
+// the AIV queue to AIV cores. A core refreshes, claims from and is stolen from
+// only the queues it can hold.
+inline __aicore__ bool scheduler_ready_queue_holder(uint32_t core_type_index, uint32_t self_core_type) {
+    return (core_type_index == 1U) == (self_core_type == 1U);
+}
+
+// How many of a queue's inboxes this run actually uses. Bounds the directory's
+// valid bits, so a shard never reports an owner the topology never created.
+inline __aicore__ uint64_t
+scheduler_ready_queue_owner_count(const SchedulerLocalState *context, uint32_t core_type_index) {
+    const uint64_t clusters = context->config.cluster_count;
+    return core_type_index == 1U ? clusters * PLATFORM_AIV_CORES_PER_BLOCKDIM : clusters;
 }
 
 inline __aicore__ __gm__ SchedulerReadyDirectory *
@@ -875,15 +963,19 @@ inline __aicore__ bool scheduler_refresh_ready_inbox_type(
     uint64_t *endpoints_snapshot = nullptr
 ) {
     if (context == nullptr || core_type_index >= SCHEDULER_READY_QUEUE_COUNT ||
-        context->config.scheduler_index >= SCHEDULER_CAPACITY)
+        !scheduler_ready_queue_holder(core_type_index, context->config.self_core_type))
+        return false;
+    const uint64_t own_index = context->self_type_rank();
+    if (own_index >= scheduler_ready_queue_owner_count(context, core_type_index) ||
+        own_index >= scheduler_ready_queue_capacity(core_type_index))
         return false;
     __gm__ SchedulerReadyInbox *inbox =
-        scheduler_ready_inbox_at(scheduler_state_base, context, core_type_index, context->config.scheduler_index);
+        scheduler_ready_inbox_at(scheduler_state_base, context, core_type_index, own_index);
     __gm__ SchedulerReadyDirectory *directory = scheduler_ready_directory_at(scheduler_state_base, context);
     uint64_t packed = scheduler_gm_query(inbox->endpoints);
     if (!scheduler_ready_endpoints_consistent(packed)) return false;
     if (scheduler_ready_endpoints_empty(packed)) {
-        scheduler_ready_directory_clear(directory, core_type_index, context->config.scheduler_index);
+        scheduler_ready_directory_clear(directory, core_type_index, own_index);
         scheduler_owner_queue_deactivate(context, core_type_index);
         scheduler_cache_barrier();
         packed = scheduler_gm_query(inbox->endpoints);
@@ -891,7 +983,7 @@ inline __aicore__ bool scheduler_refresh_ready_inbox_type(
     }
     if (!scheduler_ready_endpoints_empty(packed) &&
         (context->owner_ready_queue_mask & (UINT32_C(1) << core_type_index)) == 0) {
-        scheduler_ready_directory_set(directory, core_type_index, context->config.scheduler_index);
+        scheduler_ready_directory_set(directory, core_type_index, own_index);
         scheduler_owner_queue_activate(context, core_type_index);
     }
     if (endpoints_snapshot != nullptr) *endpoints_snapshot = packed;
@@ -902,6 +994,7 @@ inline __aicore__ bool scheduler_refresh_ready_inbox(__gm__ void *scheduler_stat
     const uint32_t active_mask = context->owner_ready_queue_mask;
     for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
         if ((active_mask & (UINT32_C(1) << type)) == 0) continue;
+        if (!scheduler_ready_queue_holder(type, context->config.self_core_type)) continue;
         if (!scheduler_refresh_ready_inbox_type(scheduler_state_base, context, type)) return false;
     }
     return true;
@@ -917,16 +1010,16 @@ inline __aicore__ bool scheduler_refresh_ready_inbox(__gm__ void *scheduler_stat
 // the two AIV lanes by task ref parity, which spreads a fanout of same-type work
 // instead of piling it on one lane.
 //
-// A scheduler_index is a worker id, so the chosen worker id is also its inbox
-// index; no lookup is needed to turn one into the other.
+// The result is the target's index within its own type, which is how its queue
+// is addressed; no lookup turns it into anything else.
 inline __aicore__ uint64_t
 scheduler_ready_push_target(const SchedulerLocalState *context, uint32_t core_type_index, int64_t task_ref) {
     if (core_type_index == 1U) {
         const uint32_t lane = 1U + static_cast<uint32_t>(task_ref & 1);
-        return context->config.worker_ids[lane];
+        return context->config.cluster_type_ranks[lane];
     }
     // AIC work, and Mix work which its cluster's AIC coordinates.
-    return context->config.worker_ids[0];
+    return context->config.cluster_type_ranks[0];
 }
 
 // Append a locally built batch to the target core's ready queue.
@@ -955,7 +1048,9 @@ inline __aicore__ bool scheduler_ready_batch_push(
     if (!scheduler_ready_endpoint_fits(batch->head) || !scheduler_ready_endpoint_fits(batch->tail)) return false;
 
     const uint64_t target = scheduler_ready_push_target(context, core_type_index, batch->head);
-    if (target >= context->config.runtime_worker_count || target >= SCHEDULER_CAPACITY) return false;
+    if (target >= scheduler_ready_queue_owner_count(context, core_type_index) ||
+        target >= scheduler_ready_queue_capacity(core_type_index))
+        return false;
 
     __gm__ SchedulerReadyInbox *inbox =
         scheduler_ready_inbox_at(scheduler_state_base, context, core_type_index, target);
@@ -997,10 +1092,20 @@ struct SchedulerMixPlacement {
     uint8_t tracker{UINT8_MAX};
 };
 
+// Plan where a Mix task's subtasks go. Only the cluster's AIC plans one: the
+// AIV subtasks land on Mix slots it alone writes, so capacity it probes here
+// cannot be taken away before it claims, and its own subtask takes one of its
+// own slots. That sole ownership is what lets a probe stand as a reservation
+// and is why no back-pressure protocol is needed.
+//
+// Bootstrap established that lane 0 is the cluster's AIC and the rest are its
+// AIVs, so the lane number fixes the core type and no worker context has to be
+// read back on this path.
 inline __aicore__ bool scheduler_plan_mix_placement(
     __gm__ void *base, SchedulerLocalState *local, int64_t task_ref, SchedulerMixPlacement *placement
 ) {
     *placement = {};
+    if (!local->is_mix_coordinator()) return false;
     const auto &metadata = *scheduler_task_metadata_at(base, local, task_ref);
     const LaneMask lanes = scheduler_task_lanes(metadata);
     if (!scheduler_task_is_mix(metadata.flags)) return false;
@@ -1011,30 +1116,29 @@ inline __aicore__ bool scheduler_plan_mix_placement(
         }
     }
     if (placement->tracker == UINT8_MAX) return false;
+    const bool both_aiv = lanes.has_both_aiv();
     bool used[PLATFORM_CORES_PER_BLOCKDIM]{};
-    const bool single_aiv = !lanes.has_both_aiv();
     for (uint8_t subtask = 0; subtask < 3; ++subtask) {
         if (!lanes.has(static_cast<SubtaskSlot>(subtask))) continue;
+        const bool mix_slot = subtask != 0;
+        const uint8_t lane_begin = mix_slot ? 1 : 0;
+        const uint8_t lane_end = mix_slot ? PLATFORM_CORES_PER_BLOCKDIM : 1;
         bool found = false;
-        const uint8_t pass_count = subtask != 0 && single_aiv ? 2 : 1;
-        for (uint8_t pass = 0; pass < pass_count && !found; ++pass) {
-            for (uint8_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM && !found; ++lane) {
-                if (used[lane]) continue;
-                const uint64_t worker = local->config.worker_ids[lane];
-                if (worker >= local->config.runtime_worker_count) continue;
-                const auto *target = scheduler_worker_context_at(base, local, worker);
-                if (target->core_type != static_cast<int32_t>(subtask == 0 ? CoreType::AIC : CoreType::AIV)) continue;
-                if (subtask != 0 && !single_aiv && lane != subtask) continue;
-                if (subtask != 0 && single_aiv && ((lane == local->config.self_lane) != (pass == 1))) continue;
-                for (uint8_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-                    const auto &state = local->slots[lane][slot];
-                    if (state.state != SchedulerDispatchSlotState::FREE) continue;
-                    placement->slots[placement->count] = {worker, slot, state.generation, lane};
-                    placement->subtasks[placement->count++] = subtask;
-                    used[lane] = true;
-                    found = true;
-                    break;
-                }
+        for (uint8_t lane = lane_begin; lane < lane_end && !found; ++lane) {
+            if (used[lane]) continue;
+            // Two live AIV subtasks take a lane each; a lone one takes either.
+            if (mix_slot && both_aiv && lane != subtask) continue;
+            const uint64_t worker = local->config.worker_ids[lane];
+            if (worker >= local->config.runtime_worker_count) continue;
+            const uint32_t slot_count = mix_slot ? SCHEDULER_MIX_SLOT_COUNT : SCHEDULER_PENDING_SLOT_COUNT;
+            const SchedulerLocalSlotState *states = mix_slot ? local->mix_slots[lane] : local->slots[lane];
+            for (uint32_t slot = 0; slot < slot_count; ++slot) {
+                if (states[slot].state != SchedulerDispatchSlotState::FREE) continue;
+                placement->slots[placement->count] = {worker, slot, states[slot].generation, lane, mix_slot};
+                placement->subtasks[placement->count++] = subtask;
+                used[lane] = true;
+                found = true;
+                break;
             }
         }
         if (!found) return false;
@@ -1109,12 +1213,12 @@ inline __aicore__ bool scheduler_ready_pop_from_inbox(
 }
 
 inline __aicore__ uint64_t scheduler_load_ready_directory_shard(
-    __gm__ SchedulerReadyDirectory *directory, uint64_t scheduler_count, uint32_t core_type_index, uint64_t inbox_index
+    __gm__ SchedulerReadyDirectory *directory, uint64_t owner_count, uint32_t core_type_index, uint64_t inbox_index
 ) {
     uint64_t shard = inbox_index / SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
     uint64_t shard_begin = shard * SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
     uint64_t shard_end = shard_begin + SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
-    if (shard_end > scheduler_count) shard_end = scheduler_count;
+    if (shard_end > owner_count) shard_end = owner_count;
     uint64_t valid_bits = shard_end > shard_begin ? (UINT64_C(1) << (shard_end - shard_begin)) - 1 : 0;
     return scheduler_gm_query(directory->core_types[core_type_index][shard].bits) & valid_bits;
 }
@@ -1126,7 +1230,7 @@ inline __aicore__ bool scheduler_steal_ready_from_shard(
     SchedulerMixPlacement *placement = nullptr
 ) {
     int64_t task_ref = SCHEDULER_TASK_REF_INVALID;
-    bits &= ~(UINT64_C(1) << (context->config.scheduler_index - shard_begin));
+    bits &= ~(UINT64_C(1) << (context->self_type_rank() - shard_begin));
     for (uint32_t pass = 0; pass < 2; ++pass) {
         uint64_t range_begin = pass == 0 ? start : shard_begin;
         uint64_t range_end = pass == 0 ? shard_end : start;
@@ -1163,8 +1267,12 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
 ) {
     if (victim_cursor == nullptr || claim == nullptr || context == nullptr || scheduler_count == 0 ||
         scheduler_count > SCHEDULER_CAPACITY || context->config.scheduler_index >= scheduler_count ||
-        core_type_index >= SCHEDULER_READY_QUEUE_COUNT)
+        core_type_index >= SCHEDULER_READY_QUEUE_COUNT ||
+        !scheduler_ready_queue_holder(core_type_index, context->config.self_core_type))
         return false;
+    const uint64_t own_index = context->self_type_rank();
+    const uint64_t owner_count = scheduler_ready_queue_owner_count(context, core_type_index);
+    if (own_index >= owner_count || own_index >= scheduler_ready_queue_capacity(core_type_index)) return false;
     *claim = {};
     uint64_t owner_endpoints_snapshot = SCHEDULER_READY_ENDPOINTS_EMPTY;
     if (!scheduler_refresh_ready_inbox_type(scheduler_state_base, context, core_type_index, &owner_endpoints_snapshot))
@@ -1173,27 +1281,25 @@ inline __aicore__ bool scheduler_claim_ready_for_slot(
     // CAS retries against either change.
     int64_t task_ref = SCHEDULER_TASK_REF_INVALID;
     if (!scheduler_ready_pop_from_inbox(
-            graph, scheduler_state_base, context, run_control, core_type_index, context->config.scheduler_index,
-            &task_ref, stats, placement, &owner_endpoints_snapshot
+            graph, scheduler_state_base, context, run_control, core_type_index, own_index, &task_ref, stats, placement,
+            &owner_endpoints_snapshot
         ))
         return false;
     if (!scheduler_task_ref_is_null(task_ref)) {
         claim->task_ref = task_ref;
-        claim->inbox_index = context->config.scheduler_index;
+        claim->inbox_index = own_index;
         return true;
     }
 
     if (!allow_steal) return true;
     __gm__ SchedulerReadyDirectory *directory = scheduler_ready_directory_at(scheduler_state_base, context);
-    uint64_t shard_begin = context->config.scheduler_index / SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD *
-                           SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
+    uint64_t shard_begin =
+        own_index / SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD * SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
     uint64_t shard_end = shard_begin + SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
-    if (shard_end > scheduler_count) shard_end = scheduler_count;
+    if (shard_end > owner_count) shard_end = owner_count;
     uint64_t start = *victim_cursor;
     if (start < shard_begin || start >= shard_end) start = shard_begin;
-    uint64_t bits = scheduler_load_ready_directory_shard(
-        directory, scheduler_count, core_type_index, context->config.scheduler_index
-    );
+    uint64_t bits = scheduler_load_ready_directory_shard(directory, owner_count, core_type_index, own_index);
     if (bits != 0 && !scheduler_steal_ready_from_shard(
                          graph, scheduler_state_base, context, run_control, core_type_index, shard_begin, shard_end,
                          start, bits, stats, claim, placement
@@ -1208,12 +1314,14 @@ inline __aicore__ bool scheduler_ready_directory_nonempty(
     __gm__ void *scheduler_state_base, SchedulerLocalState *context, uint64_t scheduler_count, uint32_t core_type_index
 ) {
     if (scheduler_count == 0 || scheduler_count > SCHEDULER_CAPACITY ||
-        context->config.scheduler_index >= scheduler_count || core_type_index >= SCHEDULER_READY_QUEUE_COUNT)
+        core_type_index >= SCHEDULER_READY_QUEUE_COUNT ||
+        !scheduler_ready_queue_holder(core_type_index, context->config.self_core_type))
         return false;
+    const uint64_t own_index = context->self_type_rank();
+    const uint64_t owner_count = scheduler_ready_queue_owner_count(context, core_type_index);
+    if (own_index >= owner_count) return false;
     __gm__ SchedulerReadyDirectory *directory = scheduler_ready_directory_at(scheduler_state_base, context);
-    return scheduler_load_ready_directory_shard(
-               directory, scheduler_count, core_type_index, context->config.scheduler_index
-           ) != 0;
+    return scheduler_load_ready_directory_shard(directory, owner_count, core_type_index, own_index) != 0;
 }
 
 inline __aicore__ void scheduler_initialize_free_slot(SchedulerLocalSlotState *local_slot) {
@@ -1268,7 +1376,7 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
     }
     const uint16_t kernel_id = metadata.kernel_ids[subtask_slot];
     if (scheduler->dispatch_sequences[slot_claim.cluster_lane] == UINT32_MAX) return false;
-    auto &reserved = scheduler->slots[slot_claim.cluster_lane][slot_claim.slot_index];
+    auto &reserved = *scheduler->slot_state(slot_claim);
     if (reserved.state != SchedulerDispatchSlotState::FILLING || reserved.generation != slot_claim.generation ||
         scheduler->config.worker_ids[slot_claim.cluster_lane] != slot_claim.worker_id)
         return false;
@@ -1286,8 +1394,11 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
         return false;
     }
 
-    const uint64_t dispatch_payload_offset =
-        target->dispatch_payload_offset + static_cast<uint64_t>(slot_claim.slot_index) * sizeof(DispatchPayload);
+    // The claim decides which payload this slot owns, so a Mix slot's payload
+    // is not the target's own-slot payload. Deriving it from the claim also
+    // saves reading the offset back out of the target's worker context, which
+    // bootstrap already checked agrees with this core's own base.
+    const uint64_t dispatch_payload_offset = scheduler->slot_payload_offset(slot_claim);
 
     SchedulerTaskInfo task{
         ready_claim.task_ref,
@@ -1334,11 +1445,10 @@ inline __aicore__ void scheduler_stage_dispatch_slot(
     const SchedulerReadyClaim &ready_claim, const SchedulerTaskMetadata &metadata,
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, uint8_t subtask_slot
 ) {
-    const uint32_t generation = ++scheduler->dispatch_sequences[slot_claim.cluster_lane];
-    auto *payload = scheduler_state_at<DispatchPayload>(
-        scheduler_state_base, scheduler->dispatch_payload_offset(slot_claim.cluster_lane, slot_claim.slot_index)
-    );
-    SchedulerLocalSlotState *local_slot = &scheduler->slots[slot_claim.cluster_lane][slot_claim.slot_index];
+    const uint32_t generation = scheduler->next_slot_generation(slot_claim);
+    auto *payload =
+        scheduler_state_at<DispatchPayload>(scheduler_state_base, scheduler->slot_payload_offset(slot_claim));
+    SchedulerLocalSlotState *local_slot = scheduler->slot_state(slot_claim);
     local_slot->task_ref = ready_claim.task_ref;
     scheduler->set_timing_slot(slot_claim.cluster_lane, slot_claim.slot_index, metadata.timing_slot);
     local_slot->generation = generation;
@@ -1346,7 +1456,7 @@ inline __aicore__ void scheduler_stage_dispatch_slot(
     local_slot->subtask_slot = subtask_slot;
     const bool remote = slot_claim.worker_id != scheduler->worker_id();
     SCHEDULER_SSBUF SchedulerSsbufDispatchControl *dispatch_control =
-        &ssbuf_region->lanes[slot_claim.cluster_lane].dispatch[slot_claim.slot_index];
+        scheduler_slot_dispatch_control(ssbuf_region, slot_claim);
     if (remote) {
         dispatch_control->task_ref = ready_claim.task_ref;
         dispatch_control->subtask_slot = subtask_slot;
@@ -1363,10 +1473,10 @@ inline __aicore__ void scheduler_commit_dispatch_slot(
     const bool schedule_timing_enabled = scheduler_schedule_timing_enabled(profiling_level);
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
     const uint64_t dispatch_start_cycles = prepare_start_cycles;
-    const uint32_t generation = scheduler->slots[slot_claim.cluster_lane][slot_claim.slot_index].generation;
+    const uint32_t generation = scheduler->slot_state(slot_claim)->generation;
     const bool remote = slot_claim.worker_id != scheduler->worker_id();
     SCHEDULER_SSBUF SchedulerSsbufDispatchControl *dispatch_control =
-        &ssbuf_region->lanes[slot_claim.cluster_lane].dispatch[slot_claim.slot_index];
+        scheduler_slot_dispatch_control(ssbuf_region, slot_claim);
     const uint64_t ready_publish_cycles = schedule_timing_enabled ? scheduler_cycles() : 0;
     if (remote) {
         scheduler_ssbuf_store_relaxed(
@@ -1430,7 +1540,7 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     if (scheduler == nullptr || slot_claim.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
         slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT)
         return false;
-    auto &slot = scheduler->slots[slot_claim.cluster_lane][slot_claim.slot_index];
+    auto &slot = *scheduler->slot_state(slot_claim);
     if (slot.state == SchedulerDispatchSlotState::FREE && slot.generation == slot_claim.generation)
         slot.state = SchedulerDispatchSlotState::FILLING;
     const SchedulerTaskMetadata metadata =
@@ -1536,7 +1646,7 @@ inline __aicore__ bool scheduler_resolve_completion(
             if (core_type == SCHEDULER_MIX_QUEUE && direct_mix_ready != nullptr &&
                 batches[core_type].head == SCHEDULER_INBOX_EMPTY) {
                 __gm__ SchedulerReadyInbox *inbox =
-                    scheduler_ready_inbox_at(scheduler_state_base, context, core_type, context->config.scheduler_index);
+                    scheduler_ready_inbox_at(scheduler_state_base, context, core_type, context->self_type_rank());
                 direct_mix_available = scheduler_ready_endpoints_empty(scheduler_gm_query(inbox->endpoints)) &&
                                        !scheduler_ready_directory_nonempty(
                                            scheduler_state_base, context, context->config.scheduler_count, core_type

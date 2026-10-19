@@ -634,6 +634,17 @@ inline uint64_t sync_start_drain_ack_subtree_token(uint64_t attempt) {
 inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 128;
 inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
 inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
+// A Mix task's AIV subtasks land on slots whose only writer is the cluster's
+// AIC, held separately from each AIV's own two slots. Sole ownership is what
+// makes the AIC's capacity probe exact: it sees only its own history there, so
+// a placement it plans cannot be taken away between the probe and the claim,
+// and no back-pressure protocol is needed.
+//
+// Deliberately a second constant rather than widening SCHEDULER_PENDING_SLOT_COUNT:
+// five places pack two 32-bit generations into one 64-bit word (scheduler_ssbuf.h,
+// scheduler_ready.h, scheduler_completion.h, scheduler_dispatch.h), and a count
+// of four would overflow every one of them.
+inline constexpr uint32_t SCHEDULER_MIX_SLOT_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_READY_QUEUE_COUNT = 3;
 inline constexpr uint32_t SCHEDULER_MIX_QUEUE = 2;
@@ -665,8 +676,46 @@ inline constexpr bool scheduler_activity_record_count_valid(uint32_t committed) 
     return committed <= SCHEDULER_ACTIVITY_CAPACITY;
 }
 inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD = 7;
+
+// A ready queue is consumed only by cores of one type, so it needs one inbox per
+// such core rather than one per worker: the AIC and Mix queues are held by the
+// 36 AIC cores, the AIV queue by the 72 AIV cores. Each is addressed by the
+// core's type_rank, which the AICPU already assigns during core discovery, so
+// 3 x 108 slots collapse to 36 + 72 + 36 with no new numbering.
+//
+// Addressing by rank also makes a directory shard type-homogeneous. Addressed by
+// worker id the 7 owners of a shard interleave AIC and AIV cores, so a thief
+// scanning its shard of the AIC queue finds at most a third of those bits ever
+// set; by rank all 7 are cores that can hold the work it is looking for.
+inline __aicore__ constexpr uint32_t scheduler_ready_queue_capacity(uint32_t core_type_index) {
+    return core_type_index == 1U ? SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM :
+                                   SCHEDULER_CLUSTER_CAPACITY;
+}
+
+inline __aicore__ constexpr uint32_t scheduler_ready_queue_base(uint32_t core_type_index) {
+    return core_type_index == 0U ? 0U :
+           core_type_index == 1U ? SCHEDULER_CLUSTER_CAPACITY :
+                                   SCHEDULER_CLUSTER_CAPACITY * (1U + PLATFORM_AIV_CORES_PER_BLOCKDIM);
+}
+
+inline constexpr uint32_t SCHEDULER_READY_INBOX_CAPACITY =
+    SCHEDULER_CLUSTER_CAPACITY * (2U + PLATFORM_AIV_CORES_PER_BLOCKDIM);
+
+// Mix slots exist on AIV cores, so their payloads and executor traces are
+// addressed by the holder's AIV rank -- the same rank that addresses the AIV
+// ready queue. The traces sit in global memory rather than the cluster's SSBUF
+// because the SSBUF's remaining room goes to the dispatch and completion
+// tokens, which are on the dispatch path where the traces are not.
+inline constexpr uint32_t SCHEDULER_MIX_SLOT_CAPACITY =
+    SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM * SCHEDULER_MIX_SLOT_COUNT;
+
+// Shards are allocated per queue at the widest queue's count so the directory
+// stays a rectangular array; the unused tail of a narrower queue is never set,
+// because scheduler_ready_queue_capacity bounds what can be addressed.
 inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_SHARD_COUNT =
-    (SCHEDULER_CAPACITY + SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD - 1) / SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
+    (SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM + SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD - 1) /
+    SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
+
 // A task ref names one task to the resident Scheduler. Its encoding today is a
 // GLOBAL task's index into the whole-graph-resident tables, which is why it is
 // compared against graph.task_count and used as a subscript directly.
@@ -1039,7 +1088,14 @@ struct alignas(128) SchedulerWorkerContext {
     volatile uint64_t scheduler_worker_id;
     volatile uint64_t is_scheduler;
     volatile uint64_t cluster_worker_ids[3];
-    uint64_t topology_reserved[3];
+    // Mix slots' payloads and executor traces, both addressed by the holding
+    // AIV's rank within its type rather than by worker id. They sit in the
+    // configuration prefix because that is the span a core observes before
+    // reading any of it; a config offset outside it reads as whatever the line
+    // last held.
+    volatile uint64_t mix_payloads_offset;
+    volatile uint64_t mix_traces_offset;
+    uint64_t topology_reserved[1];
 
     alignas(128) uint64_t bootstrap_task_count;
     uint64_t ready_enqueue_count;
@@ -1173,11 +1229,24 @@ static_assert(sizeof(SchedulerReadyDirectoryShard) == 64, "ready directory shard
 static_assert(alignof(SchedulerReadyDirectoryShard) == 64, "ready directory shard alignment changed");
 static_assert(SCHEDULER_CAPACITY <= SCHEDULER_WORKER_CAPACITY, "scheduler capacity exceeds worker storage");
 static_assert(
-    SCHEDULER_READY_DIRECTORY_SHARD_COUNT * SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD >= SCHEDULER_CAPACITY,
-    "ready directory does not cover every scheduler"
+    SCHEDULER_READY_DIRECTORY_SHARD_COUNT * SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD >=
+        scheduler_ready_queue_capacity(1),
+    "ready directory does not cover the widest ready queue"
 );
 static_assert(
-    sizeof(SchedulerReadyDirectory) == SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64,
+    scheduler_ready_queue_base(SCHEDULER_READY_QUEUE_COUNT - 1) +
+            scheduler_ready_queue_capacity(SCHEDULER_READY_QUEUE_COUNT - 1) ==
+        SCHEDULER_READY_INBOX_CAPACITY,
+    "per-type inbox segments must tile the inbox array exactly"
+);
+static_assert(
+    scheduler_ready_queue_base(1) == scheduler_ready_queue_capacity(0) &&
+        scheduler_ready_queue_base(2) == scheduler_ready_queue_base(1) + scheduler_ready_queue_capacity(1),
+    "per-type inbox segments must be contiguous"
+);
+static_assert(
+    sizeof(SchedulerReadyDirectory) ==
+        (SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64 + 127) / 128 * 128,
     "ready directory layout changed"
 );
 static_assert(sizeof(SchedulerExecutorTaskTrace) == 48, "executor trace payload layout changed");
@@ -1312,12 +1381,12 @@ inline bool scheduler_plan_layout(
         ) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskMetadata, task_metadata_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
-        !SCHEDULER_RESERVE_ARRAY(
-            SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset
-        ) ||
+        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_READY_INBOX_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset) ||
         !scheduler_layout_reserve(
             &cursor, sizeof(SchedulerReadyDirectory), alignof(SchedulerReadyDirectory), &next.ready_directory_offset
         ) ||
+        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_MIX_SLOT_CAPACITY, DispatchPayload, mix_payloads_offset) ||
+        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_MIX_SLOT_CAPACITY, SchedulerExecutorTaskTrace, mix_traces_offset) ||
         !scheduler_layout_reserve(
             &cursor, sizeof(SchedulerGraphSummary), alignof(SchedulerGraphSummary), &next.graph_summary_offset
         ) ||
@@ -1347,7 +1416,7 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
         controls[i].waiting_producer = static_cast<int32_t>(SCHEDULER_TASK_REF_INVALID);
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
-    for (uint64_t i = 0; i < SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_WORKER_CAPACITY; ++i)
+    for (uint64_t i = 0; i < SCHEDULER_READY_INBOX_CAPACITY; ++i)
         ready[i].endpoints = SCHEDULER_READY_ENDPOINTS_EMPTY;
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(base, layout.worker_contexts_offset);
     for (uint64_t worker = 0; worker < SCHEDULER_WORKER_CAPACITY; ++worker) {

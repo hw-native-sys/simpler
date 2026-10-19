@@ -1397,6 +1397,8 @@ bool create_scheduler_state(
         context.ready_inboxes_offset = layout.ready_inboxes_offset;
         context.scheduler_ssbuf_reserved1 = 0;
         context.ready_directory_offset = layout.ready_directory_offset;
+        context.mix_payloads_offset = layout.mix_payloads_offset;
+        context.mix_traces_offset = layout.mix_traces_offset;
         context.worker_contexts_offset = layout.worker_contexts_offset;
         context.scheduler_ssbuf_reserved2 = 0;
         // The absolute address of the callable's registration-owned entry

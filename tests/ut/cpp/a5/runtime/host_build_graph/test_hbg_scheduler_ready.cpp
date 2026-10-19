@@ -32,6 +32,31 @@ using scheduler_test::GraphBuffer;
 using scheduler_test::kFixtureCallableCount;
 using scheduler_test::SchedulerStateBuffer;
 
+// Put one task in a queue's inbox at `owner` and mark the directory for it, the
+// state a push from that owner's cluster leaves behind. Cases about where a
+// thief may look use this so they do not also depend on push routing.
+void seed_ready_inbox(
+    FixtureStorage &storage, SchedulerLocalState *local, uint32_t core_type_index, uint64_t owner, int64_t task_ref
+) {
+    auto *control = scheduler_task_control_at(storage.scheduler_state->base(), local, task_ref);
+    control->next_waiter = SCHEDULER_INBOX_EMPTY;
+    scheduler_ready_inbox_at(storage.scheduler_state->base(), local, core_type_index, owner)->endpoints =
+        scheduler_ready_endpoints_pack(task_ref, task_ref);
+    scheduler_ready_directory_set(
+        scheduler_ready_directory_at(storage.scheduler_state->base(), local), core_type_index, owner
+    );
+}
+
+// The AIV queue of a five-cluster run: ten owners, so ranks 0-6 fall in the
+// first directory shard and 7-9 in the second. An AIV rank maps back to the
+// worker that holds it as 3 * (rank / 2) + 1 + rank % 2.
+constexpr uint32_t kAivQueue = 1;
+constexpr uint64_t kAivWorkers = 15;
+
+uint64_t aiv_rank_worker(uint64_t rank) {
+    return 3 * (rank / PLATFORM_AIV_CORES_PER_BLOCKDIM) + 1 + rank % PLATFORM_AIV_CORES_PER_BLOCKDIM;
+}
+
 TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
     AicoreSchedulerLayout disabled{};
     ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &disabled));
@@ -206,7 +231,7 @@ TEST(SchedulerBootstrap, PushesAppendedBatchToTheTypeOwnersInbox) {
     EXPECT_EQ(stats.batch_count, 1u);
 }
 
-TEST(SchedulerReadyInbox, RejectsSchedulerCapacityBoundary) {
+TEST(SchedulerReadyInbox, RejectsReadyQueueBoundary) {
     FixtureStorage storage(1, 1);
     SchedulerReadyStats stats{};
     SchedulerReadyBatch batch{};
@@ -214,20 +239,22 @@ TEST(SchedulerReadyInbox, RejectsSchedulerCapacityBoundary) {
         storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), 0, &batch, &stats
     ));
 
-    storage.contexts[0].scheduler_index = SCHEDULER_CAPACITY;
-    EXPECT_FALSE(scheduler_refresh_ready_inbox_type(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &storage.owner_states[0]), 0
-    ));
-
-    // A push is addressed by the target's worker id, so the bound it checks is
-    // the target's rather than the publisher's own identity.
-    storage.contexts[0].scheduler_index = 0;
+    // A queue is addressed by its holders' rank within their own core type, so
+    // what bounds every access is that queue's live owner count -- not a worker
+    // id and not this core's Scheduler identity.
     auto *local = storage.local_context(&storage.contexts[0], &storage.owner_states[0]);
+    EXPECT_TRUE(scheduler_refresh_ready_inbox_type(storage.scheduler_state->base(), local, 0));
+    local->config.cluster_count = 0;
+    EXPECT_FALSE(scheduler_refresh_ready_inbox_type(storage.scheduler_state->base(), local, 0));
+    EXPECT_FALSE(scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch, &stats));
+
+    local = storage.local_context(&storage.contexts[0], &storage.owner_states[0]);
     EXPECT_FALSE(
         scheduler_ready_batch_push(storage.scheduler_state->base(), local, SCHEDULER_READY_QUEUE_COUNT, &batch, &stats)
     );
-    local->config.runtime_worker_count = 0;
-    EXPECT_FALSE(scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch, &stats));
+    // An AIC holds the AIC and Mix queues; the AIV queue is not its to refresh.
+    EXPECT_FALSE(scheduler_refresh_ready_inbox_type(storage.scheduler_state->base(), local, 1));
+    EXPECT_TRUE(scheduler_refresh_ready_inbox_type(storage.scheduler_state->base(), local, SCHEDULER_MIX_QUEUE));
 }
 
 TEST(SchedulerReadyInbox, RequiresOwnerStateForPublishAndClaim) {
@@ -300,10 +327,12 @@ TEST(SchedulerReadyInbox, RefreshesOnlyLocallyActiveQueueTypes) {
     GraphBuffer graph(1);
     graph.executable(0, 0);
     SchedulerLocalState scheduler_local_state{};
-    auto *inactive_inbox =
-        scheduler_ready_inbox_at(storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), 1, 0);
+    auto *inactive_inbox = scheduler_ready_inbox_at(
+        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), SCHEDULER_MIX_QUEUE, 0
+    );
     // One endpoint naming a task while the other is empty is corruption, which
-    // a refresh of that type must reject rather than schedule against.
+    // a refresh of that type must reject rather than schedule against. Worker 0
+    // is its cluster's AIC, so the Mix queue is one it does hold.
     inactive_inbox->endpoints = scheduler_ready_endpoints_pack(SCHEDULER_INBOX_EMPTY, 0);
 
     EXPECT_TRUE(scheduler_refresh_ready_inbox(
@@ -343,31 +372,38 @@ TEST(SchedulerReadyInbox, RefreshesOnlyLocallyActiveQueueTypes) {
     ));
     EXPECT_EQ(scheduler_local_state.owner_ready_queue_mask, UINT32_C(0));
 
+    // A queue this core cannot hold is skipped rather than refreshed, so
+    // activating the AIV queue on an AIC changes nothing.
     scheduler_owner_queue_activate(&scheduler_local_state, 1);
+    EXPECT_TRUE(scheduler_refresh_ready_inbox(
+        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &scheduler_local_state)
+    ));
+    scheduler_owner_queue_deactivate(&scheduler_local_state, 1);
+
+    scheduler_owner_queue_activate(&scheduler_local_state, SCHEDULER_MIX_QUEUE);
     EXPECT_FALSE(scheduler_refresh_ready_inbox(
         storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &scheduler_local_state)
     ));
 }
 
 TEST(SchedulerReadyInbox, StealsOnlyFromMarkedVictim) {
-    FixtureStorage storage(1, 2);
+    // Two clusters, so the AIC queue has two owners and a steal has somewhere
+    // to come from: within one cluster an AIC task routes to the stealer itself.
+    FixtureStorage storage(1, 6);
     GraphBuffer graph(1);
     graph.executable(0, 0);
     SchedulerReadyBatch batch{};
     SchedulerReadyStats stats{};
-    ASSERT_TRUE(scheduler_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]), 0, &batch, &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[1], &storage.owner_states[1]), 0,
-        &batch, &stats
-    ));
+    auto *publisher = storage.local_context(&storage.contexts[3], &storage.owner_states[3]);
+    ASSERT_EQ(publisher->self_type_rank(), 1u);
+    ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), publisher, 0, &batch, &stats));
+    ASSERT_TRUE(scheduler_ready_batch_push(storage.scheduler_state->base(), publisher, 0, &batch, &stats));
 
     uint64_t cursor = 1;
     SchedulerReadyClaim claim{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&storage.contexts[0], &storage.owner_states[0]), storage.run_control, 2, 0, &cursor,
+        storage.local_context(&storage.contexts[0], &storage.owner_states[0]), storage.run_control, 6, 0, &cursor,
         &stats, &claim
     ));
     EXPECT_EQ(claim.task_ref, 0);
@@ -388,42 +424,29 @@ TEST(SchedulerReadyInbox, DirectoryShardIgnoresSchedulerTail) {
 }
 
 TEST(SchedulerReadyInbox, SparseDirectoryWrapsWithinShard) {
-    FixtureStorage storage(2, 14);
+    FixtureStorage storage(2, kAivWorkers);
     GraphBuffer graph(2);
-    graph.executable(0, 0);
-    graph.executable(1, 0);
+    graph.executable(0, 1);
+    graph.executable(1, 1);
     SchedulerReadyStats stats{};
-    SchedulerReadyBatch high_batch{};
-    SchedulerReadyBatch low_batch{};
-    ASSERT_TRUE(scheduler_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[13], nullptr), 0, &high_batch, &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[13], &storage.owner_states[13]), 0,
-        &high_batch, &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[8], nullptr), 1, &low_batch, &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[8], &storage.owner_states[8]), 0,
-        &low_batch, &stats
-    ));
+    auto *thief = storage.local_context(&storage.contexts[aiv_rank_worker(7)], &storage.owner_states[0]);
+    ASSERT_EQ(thief->self_type_rank(), 7u);
+    seed_ready_inbox(storage, thief, kAivQueue, 9, 0);
+    seed_ready_inbox(storage, thief, kAivQueue, 8, 1);
 
-    uint64_t cursor = 12;
+    uint64_t cursor = 9;
     SchedulerReadyClaim claim{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&storage.contexts[7], &storage.owner_states[7]), storage.run_control, 14, 0, &cursor,
+        graph.graph(), storage.scheduler_state->base(), thief, storage.run_control, kAivWorkers, kAivQueue, &cursor,
         &stats, &claim
     ));
     EXPECT_EQ(claim.task_ref, 0);
-    EXPECT_EQ(claim.inbox_index, 13u);
+    EXPECT_EQ(claim.inbox_index, 9u);
+    // Past the shard's last owner, so the cursor wraps to its first.
     EXPECT_EQ(cursor, 7u);
 
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&storage.contexts[7], &storage.owner_states[7]), storage.run_control, 14, 0, &cursor,
+        graph.graph(), storage.scheduler_state->base(), thief, storage.run_control, kAivWorkers, kAivQueue, &cursor,
         &stats, &claim
     ));
     EXPECT_EQ(claim.task_ref, 1);
@@ -432,33 +455,30 @@ TEST(SchedulerReadyInbox, SparseDirectoryWrapsWithinShard) {
 }
 
 TEST(SchedulerReadyInbox, DoesNotStealAcrossDirectoryShards) {
-    FixtureStorage storage(1, 14);
+    FixtureStorage storage(1, kAivWorkers);
     GraphBuffer graph(1);
-    graph.executable(0, 0);
-    SchedulerReadyBatch batch{};
+    graph.executable(0, 1);
     SchedulerReadyStats stats{};
-    ASSERT_TRUE(scheduler_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[8], nullptr), 0, &batch, &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[8], &storage.owner_states[8]), 0,
-        &batch, &stats
-    ));
+    auto *owner = storage.local_context(&storage.contexts[aiv_rank_worker(8)], &storage.owner_states[0]);
+    ASSERT_EQ(owner->self_type_rank(), 8u);
+    seed_ready_inbox(storage, owner, kAivQueue, 8, 0);
 
+    // Rank 0 is in the first shard, so the seeded owner is outside its reach.
     uint64_t cursor = 1;
     SchedulerReadyClaim claim{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&storage.contexts[0], &storage.owner_states[0]), storage.run_control, 14, 0, &cursor,
-        &stats, &claim
+        storage.local_context(&storage.contexts[aiv_rank_worker(0)], &storage.owner_states[1]), storage.run_control,
+        kAivWorkers, kAivQueue, &cursor, &stats, &claim
     ));
     EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
 
+    // Rank 7 shares the second shard with it, so the steal lands.
     cursor = 8;
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&storage.contexts[7], &storage.owner_states[7]), storage.run_control, 14, 0, &cursor,
-        &stats, &claim
+        storage.local_context(&storage.contexts[aiv_rank_worker(7)], &storage.owner_states[2]), storage.run_control,
+        kAivWorkers, kAivQueue, &cursor, &stats, &claim
     ));
     EXPECT_EQ(claim.task_ref, 0);
     EXPECT_EQ(claim.inbox_index, 8u);

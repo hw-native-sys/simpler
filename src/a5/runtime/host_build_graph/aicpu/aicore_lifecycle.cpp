@@ -342,7 +342,17 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
         if (run_control->bootstrap_complete != 0) break;
         if (++error_poll_count == 64) {
             error_poll_count = 0;
-            if (run_control->scheduler_error != 0) return -1;
+            if (run_control->scheduler_error != 0) {
+                // Error details are published before the error marker.
+                rmb();
+                LOG_ERROR(
+                    "A5 HBG AICore scheduler: bootstrap failed at task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64
+                    " type=%" PRIu64 " site=%" PRIu64,
+                    run_control->error_task_ref, run_control->scheduler_error, run_control->error_core_id,
+                    run_control->error_core_type, run_control->error_site
+                );
+                return -1;
+            }
         }
         if (scheduler_watchdog_expired(watchdog_start, get_sys_cnt_aicpu(), timeout_cycles)) {
             LOG_ERROR("%s", "A5 HBG AICore Scheduler bootstrap timeout");

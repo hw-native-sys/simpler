@@ -62,7 +62,9 @@ struct alignas(64) SchedulerSsbufLane {
     SchedulerSsbufDispatchControl dispatch[SCHEDULER_PENDING_SLOT_COUNT];
     SchedulerSsbufTaskTrace traces[SCHEDULER_PENDING_SLOT_COUNT];
     SchedulerSsbufCompletionInbox completion;
-    uint8_t reserved[32];
+    // Completions of this lane's Mix slots. Those slots have their own
+    // generations, so they need an inbox the lane's own slots do not share.
+    SchedulerSsbufCompletionInbox mix_completion;
 };
 
 struct alignas(64) SchedulerSsbufRegion {
@@ -70,8 +72,11 @@ struct alignas(64) SchedulerSsbufRegion {
     SchedulerSsbufHeader header;
     // +0x040, +0x140, +0x240: one 256-byte lane per cluster worker
     SchedulerSsbufLane lanes[PLATFORM_CORES_PER_BLOCKDIM];
-    // +0x340: reserved through the end of the 1 KiB HBG region
-    uint8_t reserved[192];
+    // +0x340: Mix dispatch, indexed by cluster lane. Same publication format as
+    // an ordinary dispatch: a Mix subtask needs everything an ordinary one does
+    // and, once an AIV prepares its own payload, its subtask index and predicate
+    // result as well -- both of which fit the control's spare bytes.
+    SchedulerSsbufDispatchControl mix_dispatch[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_MIX_SLOT_COUNT];
 };
 
 static_assert(SCHEDULER_SSBUF_REGION_OFFSET + SCHEDULER_SSBUF_REGION_SIZE == SCHEDULER_SSBUF_HARDWARE_SIZE);
@@ -89,10 +94,18 @@ static_assert(offsetof(SchedulerSsbufLane, dispatch[1]) == 0x20);
 static_assert(offsetof(SchedulerSsbufLane, traces[0]) == 0x40);
 static_assert(offsetof(SchedulerSsbufLane, traces[1]) == 0x80);
 static_assert(offsetof(SchedulerSsbufLane, completion) == 0xc0);
+static_assert(offsetof(SchedulerSsbufLane, mix_completion) == 0xe0);
 static_assert(offsetof(SchedulerSsbufRegion, lanes[0]) == 0x040);
 static_assert(offsetof(SchedulerSsbufRegion, lanes[1]) == 0x140);
 static_assert(offsetof(SchedulerSsbufRegion, lanes[2]) == 0x240);
-static_assert(offsetof(SchedulerSsbufRegion, reserved) == 0x340);
+// The Mix dispatch controls consume the region's remaining room exactly:
+// three lanes x two slots x 32 bytes fills 0x340 through the 1 KiB end.
+static_assert(offsetof(SchedulerSsbufRegion, mix_dispatch) == 0x340);
+static_assert(
+    sizeof(SchedulerSsbufDispatchControl) * PLATFORM_CORES_PER_BLOCKDIM * SCHEDULER_MIX_SLOT_COUNT ==
+    SCHEDULER_SSBUF_REGION_SIZE - 0x340
+);
+static_assert(SCHEDULER_MIX_SLOT_COUNT == 2);
 
 inline __aicore__ SCHEDULER_SSBUF SchedulerSsbufRegion *scheduler_ssbuf_region(uint64_t hardware_base) {
     return reinterpret_cast<SCHEDULER_SSBUF SchedulerSsbufRegion *>(hardware_base + SCHEDULER_SSBUF_REGION_OFFSET);
@@ -161,6 +174,10 @@ scheduler_ssbuf_initialize(SCHEDULER_SSBUF SchedulerSsbufRegion *region, uint32_
             scheduler_ssbuf_store_relaxed(&region->lanes[lane].dispatch[slot].publication, 0);
         }
         scheduler_ssbuf_store_relaxed(&region->lanes[lane].completion.publication, 0);
+        for (uint32_t slot = 0; slot < SCHEDULER_MIX_SLOT_COUNT; ++slot) {
+            scheduler_ssbuf_store_relaxed(&region->mix_dispatch[lane][slot].publication, 0);
+        }
+        scheduler_ssbuf_store_relaxed(&region->lanes[lane].mix_completion.publication, 0);
     }
     region->header.region_size = SCHEDULER_SSBUF_REGION_SIZE;
     region->header.scheduler_lane = scheduler_lane;
