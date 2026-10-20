@@ -298,6 +298,9 @@ function(simpler_ut_platform_case src)
         set(defines ${C_DEFINES})
         if(runtime)
             list(APPEND defines SIMPLER_RUNTIME_NAME="${runtime}")
+            # A token tests can branch on. The quoted name cannot be compared
+            # by the preprocessor.
+            list(APPEND defines SIMPLER_RUNTIME_${runtime}=1)
         endif()
 
         string(CONFIGURE "${C_SOURCES}" sources @ONLY)

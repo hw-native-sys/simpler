@@ -47,6 +47,7 @@ PipelineContract accepted_contract() {
 }
 
 TEST(PipelineContract, AcceptsADeclarationThisBuildCanHonor) {
+    EXPECT_EQ(PTO_PIPELINE_CONTRACT_ABI_VERSION, 2);
     const PipelineContract c = accepted_contract();
     EXPECT_TRUE(is_valid_pipeline_contract(&c));
 }

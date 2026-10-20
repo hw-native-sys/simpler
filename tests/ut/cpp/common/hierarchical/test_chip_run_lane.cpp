@@ -48,6 +48,7 @@ std::unordered_map<void *, uint32_t> g_slots;
 std::array<bool, 2> g_complete{};
 std::array<int, 2> g_prepare_rc{};
 bool g_prepare_release_proven{true};
+bool g_prepare_endpoint_identity{false};
 std::array<int, 2> g_launch_rc{};
 std::array<int, 2> g_poll_rc{};
 std::array<int, 2> g_wait_rc{};
@@ -74,6 +75,12 @@ int prepare_run(
     void *, void *runtime, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *descriptor
 ) {
     EXPECT_EQ(slot_of(runtime), descriptor->pipeline_slot);
+    if (g_prepare_endpoint_identity && descriptor->endpoint_failure != nullptr) {
+        descriptor->endpoint_failure->kind = kEndpointFailureKindRegion;
+        descriptor->endpoint_failure->reserved = 0;
+        descriptor->endpoint_failure->session_instance_id_bits = 0x42;
+        descriptor->endpoint_failure->transaction_id = 7;
+    }
     g_complete[descriptor->pipeline_slot] = false;
     g_epochs[descriptor->pipeline_slot] = descriptor->run_epoch;
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
@@ -132,6 +139,7 @@ void prime_worker(ChipWorker &worker) {
     g_complete = {};
     g_prepare_rc = {};
     g_prepare_release_proven = true;
+    g_prepare_endpoint_identity = false;
     g_launch_rc = {};
     g_poll_rc = {};
     g_wait_rc = {};
@@ -157,6 +165,7 @@ void prime_worker(ChipWorker &worker) {
     worker.pipeline_generations_.resize(2);
     worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
+    worker.endpoint_failures_.assign(worker.runtime_bufs_.size(), {});
     for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {
         g_slots.emplace(worker.runtime_bufs_[slot].data(), slot);
     }
@@ -459,6 +468,35 @@ TEST(ChipRunLaneTest, DirectRuntimeWithoutConcurrentPrepareRetainsDepthOne) {
     EXPECT_EQ(g_prepare_count[1], 0u);
     g_complete[0] = true;
     EXPECT_TRUE(second.done());
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, PrepareFailureCarriesTheEndpointIdentityAndTheNextRunDoesNot) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_prepare_rc[0] = -5;
+    g_prepare_endpoint_identity = true;
+
+    ChipRun failed = submit(lane, 201, 0);
+    try {
+        failed.wait_until(ChipRunLane::Deadline::max());
+        FAIL() << "prepare failure must surface";
+    } catch (const RunPreparationRefused &error) {
+        const std::string text = error.what();
+        EXPECT_EQ(text.find("Region endpoint error session=0x0000000000000042 transaction=7\n"), 0u);
+    }
+
+    g_prepare_endpoint_identity = false;
+    g_prepare_rc[0] = -6;
+    ChipRun next = submit(lane, 202, 0);
+    try {
+        next.wait_until(ChipRunLane::Deadline::max());
+        FAIL() << "second prepare failure must surface";
+    } catch (const RunPreparationRefused &error) {
+        EXPECT_EQ(std::string(error.what()).find("Region endpoint error"), std::string::npos);
+    }
     lane.close();
     worker.finalize();
 }

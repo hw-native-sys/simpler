@@ -316,6 +316,12 @@ static inline bool rt_is_fatal() {
         _ctx->ops->report_fatal(_ctx, (code), __FUNCTION__, (fmt), ##__VA_ARGS__); \
     } while (0)
 
+#define rt_report_endpoint_failure(kind, session_bits, transaction_id, message)                                      \
+    do {                                                                                                             \
+        OrchContext *_ctx = current_orch_context();                                                                  \
+        _ctx->ops->report_endpoint_failure(_ctx, (kind), (session_bits), (transaction_id), __FUNCTION__, (message)); \
+    } while (0)
+
 // =============================================================================
 // Logging Macros for Orchestration (call through ops table)
 // =============================================================================

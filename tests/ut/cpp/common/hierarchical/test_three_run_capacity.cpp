@@ -135,6 +135,7 @@ void prime_worker(ChipWorker &worker, uint32_t depth, unsigned launch_depth) {
     for (uint32_t slot = 0; slot < depth; ++slot) {
         worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     }
+    worker.endpoint_failures_.assign(worker.runtime_bufs_.size(), {});
     for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {
         g_slots.emplace(worker.runtime_bufs_[slot].data(), slot);
     }

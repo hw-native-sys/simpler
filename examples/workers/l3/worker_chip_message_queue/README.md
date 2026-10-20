@@ -8,19 +8,20 @@ appear — a serving loop, not a batch.
 The transport is the L3-L2 SPSC queue (`SPSQ` binding): two arenas (input and
 output) plus a 10-scalar endpoint binding the L2 orchestration receives as
 plain `TaskArgs` scalars starting at offset 0. See
-[`docs/l3-l2-message-queue.md`](../../../../docs/l3-l2-message-queue.md) for
+[`docs/CPU-NPU-message-queue.md`](../../../../docs/CPU-NPU-message-queue.md) for
 the channel's current design.
 
 ## What this exercises
 
 | Concept | How |
 | ------- | --- |
-| **Creating the channel** | `orch.create_worker_chip_queue(worker_id=0, depth=8, input_arena_bytes=..., output_arena_bytes=...)`. |
-| **Handing it to L2** | `queue.chip_task_arg_scalars()` packs the `SPSQ` binding into `TaskArgs` as exactly 10 scalars — the L2 side needs no other setup. |
+| **Creating the channel** | `orch.create_spsc_queue(initiator=host, peer=device, depth=8, input_arena_bytes=..., output_arena_bytes=...)`. The object is an `SpscQueue`. |
+| **Handing it to L2** | `queue.peer_task_arg_scalars()` packs the `SPSQ` binding into `TaskArgs` as exactly 10 scalars — the L2 side needs no other setup. |
 | **Full-duplex, decoupled** | The host enqueues two requests, drains **three** responses, then enqueues two more. Requests and responses are not paired one-to-one. |
 | **Zero-copy reads** | `queue.output.peek(timeout)` → `read_into(message, buf)` → `release(message)`. `release` is what returns arena space; skipping it stalls the producer once the queue fills. |
 | **Cooperative shutdown** | `queue.request_stop(timeout)` lets the L2 side finish work already accepted. Responses queued before the stop are still drained afterwards. |
 | **Application-level correlation** | The queue's `seq` is transport ordering only. This example carries its own 64-byte headers — `request_id` in, `(request_id, kind, aux)` out — because responses may arrive out of request order and one request may produce several. |
+| **Failure** | An empty `peek` that times out does not poison the queue. A malformed request or a drain failure is an explicit orchestration fatal and the kernel returns; this example does not retry. `queue.free()` rejects later enqueue and leaves physical reclaim until the run drains. |
 
 The mode field in each request drives the L2 kernel. Payload-header
 `request_id` values are `0, 0, 0, 7`:

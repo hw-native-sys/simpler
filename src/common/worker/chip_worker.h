@@ -33,6 +33,7 @@
 #include "host/chip_swimlane_runs.h"
 #include "native_run_storage_tag.h"
 #include "run_resource_arena.h"
+#include "common/endpoint_failure_identity.h"
 #include "runtime_c_api.h"
 #include "types.h"
 
@@ -804,6 +805,8 @@ private:
     // runtime-reported alignment and keeps a stable C ABI address through
     // prepare/finalize even if the owning vector itself is moved.
     std::vector<RuntimeStorage> runtime_bufs_;
+    // One identity slot per pipeline slot. Prepare zeroes it; the address is stable for that slot.
+    std::vector<EndpointFailureIdentity> endpoint_failures_;
     /**
      * Every live native run, keyed by the epoch that names it.
      *

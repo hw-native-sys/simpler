@@ -4945,8 +4945,8 @@ class TestRunHandle:
         first_pending, second_pending = domain("first-pending", 3), domain("second-pending", 4)
         first.remote_slot_refs.append(cast(Any, first_ref))
         second.remote_slot_refs.append(cast(Any, second_ref))
-        first.worker_chip_orch_comm_host_buffers[0x1000] = 64
-        second.worker_chip_orch_comm_host_buffers[0x2000] = 128
+        first.region_host_buffers[0x1000] = 64
+        second.region_host_buffers[0x2000] = 128
         first.live_domains[first_live.name] = first_live
         second.live_domains[second_live.name] = second_live
         first.pending_release_domains.append(first_pending)
@@ -4976,8 +4976,8 @@ class TestRunHandle:
         assert second_instance._state is worker_mod.RegionInstanceState.LIVE
         assert first_instance not in worker._region_instance_registry._instances.values()
         assert second_instance in worker._region_instance_registry._instances.values()
-        assert first.worker_chip_orch_comm_host_buffers == {}
-        assert second.worker_chip_orch_comm_host_buffers == {0x2000: 128}
+        assert first.region_host_buffers == {}
+        assert second.region_host_buffers == {0x2000: 128}
         assert released_domains == [first_pending, first_live]
         assert first_pending.freed and first_live.freed
         assert not second_pending.freed and not second_live.freed
@@ -5569,8 +5569,8 @@ class TestOrderedCleanupDegradation:
         assert resources.requires_ordered_cleanup
 
         # A remote slot reference: releasing it is an RPC to the owning worker.
-        # `create_worker_chip_queue` is not a fourth set-point — it builds its region
-        # through `create_worker_chip_region`, and inherits the flag from there.
+        # Queue creation is not a fourth set-point. It allocates a region and
+        # inherits ordered cleanup from that allocation.
         remote = worker_mod._RunResources()
         worker._building_run_resources = remote
         ref = cast(Any, object())
@@ -7745,14 +7745,24 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         worker._config = {**worker._config, "platform": "a2a3sim", "device_ids": [0]}
         worker._lifecycle = worker_mod._Lifecycle.READY
         worker._next_level_worker_ids = [0]
-        worker._validate_worker_chip_id = cast(Any, lambda _wid: None)
 
         def _interrupted(*_args):
             raise KeyboardInterrupt
 
         worker._worker = cast(Any, SimpleNamespace(control_payload=_interrupted))
-        with pytest.raises(KeyboardInterrupt):
-            worker._create_worker_chip_region(0, 4096, 64)
+        from simpler import comm_endpoints as ce
+        from simpler.orchestrator import _callback_run
+        from simpler.worker import _RunResources
+
+        worker._building_run_resources = _RunResources()
+        with _callback_run(1, worker):
+            with pytest.raises(KeyboardInterrupt):
+                worker._create_region(
+                    members=(ce.at("L3", ce.HOST_CPU), ce.at("L3/L2[0]", ce.DEVICE_AICPU)),
+                    topology=ce.SingleOwner(provider=ce.at("L3/L2[0]", ce.DEVICE_AICPU)),
+                    payload_bytes=4096,
+                    counter_bytes=64,
+                )
         assert worker._delegated_session_fatal is not None
         with pytest.raises(RuntimeError, match="no further work is admitted"):
             worker._require_no_delegated_session_fatal("submit")
@@ -7801,10 +7811,20 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             return bytes(staged)
 
         worker._worker = cast(Any, SimpleNamespace(control_payload=_failed))
+        from simpler import comm_endpoints as ce
         from simpler.comm_provider import RegionAllocationError
+        from simpler.orchestrator import _callback_run
+        from simpler.worker import _RunResources
 
-        with pytest.raises(RegionAllocationError) as excinfo:
-            worker._create_worker_chip_region(0, 4096, 64)
+        worker._building_run_resources = _RunResources()
+        with _callback_run(1, worker):
+            with pytest.raises(RegionAllocationError) as excinfo:
+                worker._create_region(
+                    members=(ce.at("L3", ce.HOST_CPU), ce.at("L3/L2[0]", ce.DEVICE_AICPU)),
+                    topology=ce.SingleOwner(provider=ce.at("L3/L2[0]", ce.DEVICE_AICPU)),
+                    payload_bytes=4096,
+                    counter_bytes=64,
+                )
         assert "BACKEND_FAILURE" in str(excinfo.value)
         assert excinfo.value.cleanup_debt_remaining is False
         assert worker._ordered_cleanup_error is None, "an ordinary failure must not shut the worker"
@@ -7819,9 +7839,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         worker = self._worker()
         assert worker._ordered_cleanup_error is None
 
-        # The shape _create_worker_chip_region's rollback reaches: the region exists
-        # on the chip and the release for it failed.
-        leaked = RuntimeError("create_worker_chip_region: rollback could not release region 4")
+        # The region exists on the chip and the release for it failed. Nothing
+        # tracked the id, so a later fence cannot reclaim it.
+        leaked = RuntimeError("region rollback could not release provider resource 4")
         with worker._hierarchical_start_cv:
             worker._ordered_cleanup_error = leaked
 

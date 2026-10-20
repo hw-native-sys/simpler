@@ -28,6 +28,7 @@
 
 #include "aicpu/dep_gen_collector_aicpu.h"
 #include "common/dep_gen.h"
+#include "common/endpoint_failure_identity.h"
 #include "common/unified_log.h"
 #include "dep_compute.h"
 #include "runtime_types.h"
@@ -214,6 +215,35 @@ void OrchestratorState::report_fatal(int32_t error_code, const char *func, const
     va_start(args, fmt);
     orch_report_fatal_v(orch, error_code, func, fmt, args);
     va_end(args);
+}
+
+void OrchestratorState::report_endpoint_failure(
+    uint32_t kind, uint64_t session_bits, uint64_t transaction_id, const char *func, const char *message
+) {
+    EndpointFailureIdentity identity{};
+    identity.kind = kind;
+    identity.reserved = 0;
+    identity.session_instance_id_bits = session_bits;
+    identity.transaction_id = transaction_id;
+    const bool shaped = endpoint_failure_identity_is_well_formed(identity) && identity.kind != 0;
+
+    fatal = true;
+    bool owned = false;
+    if (sm_header != nullptr) {
+        int32_t expected = SIMPLER_ERROR_NONE;
+        owned = sm_header->orch_error_code.compare_exchange_strong(
+            expected, SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, std::memory_order_acq_rel
+        );
+        if (owned && shaped) {
+            sm_header->endpoint_failure = identity;
+        }
+    }
+
+    if (message == nullptr || message[0] == '\0') {
+        unified_log_error(func, "FATAL(code=%d)", SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
+        return;
+    }
+    unified_log_error(func, "FATAL(code=%d): %s", SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, message);
 }
 
 static uint32_t next_fanin_seen_epoch(OrchestratorState *orch) {

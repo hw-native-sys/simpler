@@ -92,9 +92,9 @@ not just the mailbox, is what makes parent-allocated tensors visible to chip
 children. Collectives are explicitly single-host: both backends state "Scope:
 L3 single-host multi-card only" (`src/a2a3/platform/onboard/host/comm_hccl.cpp:19`).
 
-Two additional shipped L3↔L2 channels bypass the level abstraction and talk to
-AICPU directly: [l3-l2-orch-comm.md](l3-l2-orch-comm.md) and
-[l3-l2-message-queue.md](l3-l2-message-queue.md), with examples under
+Two additional shipped CPU↔NPU channels support persistent AICPU tasks:
+[CPU-NPU Region Communication](CPU-NPU-orch-comm.md) and
+[CPU-NPU Message Queue](CPU-NPU-message-queue.md), with examples under
 `examples/workers/l3/`. Parent-directed targeting of a specific child is
 [directed-next-level-scheduling.md](directed-next-level-scheduling.md).
 

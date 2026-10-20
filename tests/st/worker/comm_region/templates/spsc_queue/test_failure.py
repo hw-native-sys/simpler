@@ -74,7 +74,7 @@ def test_peer_rejects_zero_transaction(st_platform, st_device_ids):
 
         def orch(orch_handle, _args, cfg):
             queue = create_queue(orch_handle)
-            scalars = list(queue.chip_task_arg_scalars())
+            scalars = list(queue.peer_task_arg_scalars())
             scalars[2] = 0
             task_args = TaskArgs()
             for value in scalars:
@@ -84,6 +84,8 @@ def test_peer_rejects_zero_transaction(st_platform, st_device_ids):
         with pytest.raises(BaseException) as excinfo:  # noqa: PT011
             worker.run(orch, args=None, config=stream_config())
         text = _exception_text(excinfo.value)
+        assert "SPSC queue endpoint error session=" not in text
+        assert "identity=untrusted" not in text
         assert "transaction=" not in text
     except BaseException as exc:
         primary = exc
@@ -102,7 +104,7 @@ def test_peer_rejects_wrong_magic(st_platform, st_device_ids):
 
         def orch(orch_handle, _args, cfg):
             queue = create_queue(orch_handle)
-            scalars = list(queue.chip_task_arg_scalars())
+            scalars = list(queue.peer_task_arg_scalars())
             scalars[0] = 0x4C33513200010001
             task_args = TaskArgs()
             for value in scalars:
@@ -112,6 +114,8 @@ def test_peer_rejects_wrong_magic(st_platform, st_device_ids):
         with pytest.raises(BaseException) as excinfo:  # noqa: PT011
             worker.run(orch, args=None, config=stream_config())
         text = _exception_text(excinfo.value)
+        assert "SPSC queue endpoint error session=" not in text
+        assert "identity=untrusted" not in text
         assert "transaction=" not in text
     except BaseException as exc:
         primary = exc
@@ -130,17 +134,23 @@ def test_malformed_descriptor_poisons_with_identity(st_platform, st_device_ids):
 
         def orch(orch_handle, _args, cfg):
             queue = create_queue(orch_handle)
+            remembered.append(queue)
             enqueue_bytes(queue, echo_payload(b"bad-seq"))
             smashed = bytearray(8)
             struct.pack_into("<Q", smashed, 0, 99)
-            queue.region.payload_write(queue.layout.input_desc_offset, smashed, 8)
+            queue._instance.payload_write(queue.layout.input_desc_offset, smashed, 8)
             submit_queue(orch_handle, chip_handle, queue, cfg)
-            queue.output.peek(timeout=_TIMEOUT_S)
 
+        remembered: list = []
         with pytest.raises(BaseException) as excinfo:  # noqa: PT011
             worker.run(orch, args=None, config=stream_config())
         text = _exception_text(excinfo.value)
-        assert "remote abort" in text
+        queue = remembered[0]
+        session, transaction_id = queue._instance._allocation_identity
+        bits = int.from_bytes(bytes(session), "little")
+        marker = f"SPSC queue endpoint error session=0x{bits:016x} transaction={int(transaction_id)}"
+        assert marker in text
+        assert queue._instance._data_plane_error is not None
     except BaseException as exc:
         primary = exc
         raise

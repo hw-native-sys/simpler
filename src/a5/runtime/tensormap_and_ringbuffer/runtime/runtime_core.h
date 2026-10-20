@@ -101,6 +101,12 @@ struct RuntimeOps {
     // collector. Always present in the struct to keep ops-table layout stable
     // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
     void (*scope_set_site)(const char *file, int line);
+
+    // Publishes an EndpointFailureIdentity only when this call latches the run's first fatal.
+    void (*report_endpoint_failure)(
+        RuntimeContext *rt, uint32_t kind, uint64_t session_bits, uint64_t transaction_id, const char *func,
+        const char *message
+    );
 };
 
 /**

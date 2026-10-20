@@ -18,6 +18,7 @@
 #include "aicpu/region_instance_view.h"
 #include "common/region_template.h"
 #include "orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "aicpu/region_endpoint_diagnostics.h"
 
 namespace {
 
@@ -39,9 +40,7 @@ using QueueEndpoint = spsc_queue::SpscQueueEndpoint<RegionInstanceView>;
 
 uint64_t spsc_queue_now_ns() { return sys_cnt_ticks_to_ns(device_time_now_ticks(), device_time_frequency_hz()); }
 
-void report_queue_error(const QueueEndpoint &queue) {
-    rt_report_fatal(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, "%s", queue.error().message);
-}
+void report_queue_error(const QueueEndpoint &queue) { region_report_spsc_queue_error(queue.error()); }
 
 bool has_queue_error(const QueueEndpoint &queue) { return queue.error().kind != spsc_queue::SpscQueueErrorKind::NONE; }
 

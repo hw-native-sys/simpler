@@ -16,6 +16,7 @@
 #include <utility>
 
 #include "common/chip_swimlane_extension.h"
+#include "common/endpoint_failure_identity.h"
 
 // Borrowed source views, valid through stage_launch_metadata; the platform
 // captures values and never takes ownership of the source containers.
@@ -302,13 +303,15 @@ public:
     }
 
     HostApi(
-        void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops
+        void *runner_ctx, uint32_t pipeline_slot, uint32_t arena_bank, uint64_t run_epoch, const HostApiOps *ops,
+        EndpointFailureIdentity *endpoint_failure = nullptr
     ) noexcept :
         runner_ctx_(runner_ctx),
         pipeline_slot_(pipeline_slot),
         arena_bank_(arena_bank),
         run_epoch_(run_epoch),
-        ops_(ops) {}
+        ops_(ops),
+        endpoint_failure_(endpoint_failure) {}
 
     // The epoch this run was given. Runtimes that build their own swimlane
     // record streams stamp it into each row: per-task tokens restart every run,
@@ -469,6 +472,17 @@ public:
             return false;
         }
     }
+    // Copies one well-formed endpoint record into this run's sink. A later record loses.
+    void record_endpoint_failure(const EndpointFailureIdentity &failure) const noexcept {
+        if (endpoint_failure_ == nullptr || failure.kind == 0 || !endpoint_failure_identity_is_well_formed(failure)) {
+            return;
+        }
+        if (endpoint_failure_->kind != 0 && endpoint_failure_identity_is_well_formed(*endpoint_failure_)) {
+            return;
+        }
+        *endpoint_failure_ = failure;
+    }
+
     /**
      * What this run's device side published for the host to read, or nullptr
      * when it published nothing. `*bytes_out` receives the payload length.
@@ -533,4 +547,5 @@ private:
     uint32_t arena_bank_{0};
     uint64_t run_epoch_{0};
     const HostApiOps *ops_{nullptr};
+    EndpointFailureIdentity *endpoint_failure_{nullptr};
 };

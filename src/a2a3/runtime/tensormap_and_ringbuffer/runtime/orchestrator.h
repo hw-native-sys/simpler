@@ -190,6 +190,9 @@ struct OrchestratorState {
     void mark_dep_pool_position(ChipTaskSlotState &slot_state);
     void wire_fanin_task(ChipTaskSlotState &slot_state, int32_t wfanin);
     void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);
+    void report_endpoint_failure(
+        uint32_t kind, uint64_t session_bits, uint64_t transaction_id, const char *func, const char *message
+    );
     void begin_scope(ScopeMode mode = ScopeMode::AUTO);
     void end_scope();
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);

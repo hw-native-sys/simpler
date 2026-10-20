@@ -42,7 +42,8 @@ struct NativeRunContext {
         config(config_in),
         descriptor(descriptor_in),
         host_api(
-            runner_in, descriptor_in.pipeline_slot, descriptor_in.arena_bank, descriptor_in.run_epoch, host_api_ops
+            runner_in, descriptor_in.pipeline_slot, descriptor_in.arena_bank, descriptor_in.run_epoch, host_api_ops,
+            descriptor_in.endpoint_failure
         ),
         trace_hid(trace_hid_in) {
         // Publish the storage tag only after every potentially-throwing member

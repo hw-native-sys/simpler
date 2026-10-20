@@ -25,6 +25,7 @@
 #include <atomic>
 #include <cassert>
 #include <cstdlib>
+#include <cinttypes>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -456,6 +457,7 @@ void ChipWorker::init(
         for (uint32_t slot = 0; slot < resolved_contract.pipeline_depth; ++slot) {
             runtime_bufs.emplace_back(runtime_size, runtime_alignment, module);
         }
+        endpoint_failures_.assign(runtime_bufs.size(), EndpointFailureIdentity{});
         runtime_bufs_.swap(runtime_bufs);
     } catch (...) {
         destroy_device_context_fn_(device_ctx_);
@@ -807,6 +809,7 @@ void ChipWorker::clear_runtime_binding() {
     kernel_launch_fn_ = nullptr;
     runtime_bufs_.clear();
     runtime_module_.reset();
+    endpoint_failures_.clear();
     pipeline_generations_.reset();
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
     initialized_ = false;
@@ -1021,6 +1024,26 @@ void ChipWorker::configure_launch_depth(unsigned depth) {
     launch_depth_ = depth;
 }
 
+namespace {
+
+std::string with_endpoint_failure_marker(const EndpointFailureIdentity &identity, const std::string &body) {
+    if (!endpoint_failure_identity_is_well_formed(identity) || identity.kind == 0) return body;
+    const char *name =
+        identity.kind == kEndpointFailureKindRegion ? "Region endpoint error" : "SPSC queue endpoint error";
+    char line[96];
+    if (identity.transaction_id == 0) {
+        std::snprintf(line, sizeof(line), "%s identity=untrusted", name);
+    } else {
+        std::snprintf(
+            line, sizeof(line), "%s session=0x%016" PRIx64 " transaction=%" PRIu64, name,
+            identity.session_instance_id_bits, identity.transaction_id
+        );
+    }
+    return std::string(line) + "\n" + body;
+}
+
+}  // namespace
+
 ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
     uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
@@ -1038,7 +1061,7 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     if (args == nullptr) {
         throw RunPreparationRefused("prepare_native_run requires task args");
     }
-    if (slot_id >= runtime_bufs_.size()) {
+    if (slot_id >= runtime_bufs_.size() || slot_id >= endpoint_failures_.size()) {
         throw RunPreparationRefused("prepare_native_run slot is outside the runtime PipelineContract");
     }
     const uint64_t run_epoch = next_native_run_epoch();
@@ -1088,36 +1111,59 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         entry->phase = NativeRunPhase::PREPARING;
         entry->permits_prepared_successor = allow_prepared_successor;
         native_runs_.emplace(run_epoch, std::move(entry));
+        // The admitted run owns this slot. A refused prepare leaves another run's identity in place.
+        endpoint_failures_[slot_id] = {};
     }
 
     int rc = -1;
     try {
         const NativeRunDescriptor descriptor{
-            slot_id,        arena_bank_for_slot(slot_id), run_id,    generation, dispatch_id, run_epoch, accepted_state,
-            accepted_value, launch_depth_ > 1 ? 1u : 0u,  provenance
+            slot_id,
+            arena_bank_for_slot(slot_id),
+            run_id,
+            generation,
+            dispatch_id,
+            run_epoch,
+            accepted_state,
+            accepted_value,
+            launch_depth_ > 1 ? 1u : 0u,
+            provenance,
+            &endpoint_failures_[slot_id]
         };
         rc = prepare_run_fn_(device_ctx_, runtime_bufs_[slot_id].data(), callable_id, args, &config, &descriptor);
+    } catch (const std::exception &e) {
+        const EndpointFailureIdentity identity = endpoint_failures_[slot_id];
+        endpoint_failures_[slot_id] = {};
+        drop_preparing_native_run(run_epoch);
+        const std::string marked = with_endpoint_failure_marker(identity, e.what());
+        if (marked == e.what()) throw;
+        throw std::runtime_error(marked);
     } catch (...) {
+        endpoint_failures_[slot_id] = {};
         drop_preparing_native_run(run_epoch);
         throw;
     }
     if (rc != 0) {
+        const EndpointFailureIdentity identity = endpoint_failures_[slot_id];
+        endpoint_failures_[slot_id] = {};
         const bool released =
             consume_released_preparation(runtime_bufs_[slot_id].data(), runtime_bufs_[slot_id].size(), run_epoch);
         drop_preparing_native_run(run_epoch);
         if (rc == PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE) {
-            throw PreparedRunIncompatible(
-                "native prepare requires depth-one fallback " + format_native_run_identity(run_identity)
-            );
+            throw PreparedRunIncompatible(with_endpoint_failure_marker(
+                identity, "native prepare requires depth-one fallback " + format_native_run_identity(run_identity)
+            ));
         }
         if (rc == SIMPLER_RUNTIME_ERR_RESOURCE_WAIT) {
-            throw PreparedRunResourceWait(
-                "native prepare is waiting for run resources a live consumer still holds " +
-                format_native_run_identity(run_identity)
-            );
+            throw PreparedRunResourceWait(with_endpoint_failure_marker(
+                identity, "native prepare is waiting for run resources a live consumer still holds " +
+                              format_native_run_identity(run_identity)
+            ));
         }
-        const std::string message = "prepare_native_run failed with code " + std::to_string(rc) + " " +
-                                    format_native_run_identity(run_identity);
+        const std::string message = with_endpoint_failure_marker(
+            identity,
+            "prepare_native_run failed with code " + std::to_string(rc) + " " + format_native_run_identity(run_identity)
+        );
         if (released) throw RunPreparationRefused(message);
         throw std::runtime_error(message);
     }
@@ -1128,17 +1174,23 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
         if (it == native_runs_.end() || it->second->phase != NativeRunPhase::PREPARING) {
             lk.unlock();
             (void)finalize_run_fn_(device_ctx_, runtime_bufs_[slot_id].data());
+            const EndpointFailureIdentity identity = endpoint_failures_[slot_id];
+            endpoint_failures_[slot_id] = {};
             drop_preparing_native_run(run_epoch);
-            throw std::runtime_error("native-run identity changed while prepare was in progress");
+            throw std::runtime_error(
+                with_endpoint_failure_marker(identity, "native-run identity changed while prepare was in progress")
+            );
         }
         if (admit_pipeline_generation && !pipeline_generations_.admit(PipelineSlotLease{slot_id, 0, generation})) {
             lk.unlock();
             (void)finalize_run_fn_(device_ctx_, runtime_bufs_[slot_id].data());
+            const EndpointFailureIdentity identity = endpoint_failures_[slot_id];
+            endpoint_failures_[slot_id] = {};
             drop_preparing_native_run(run_epoch);
-            throw std::runtime_error(
-                "native-run pipeline lease generation became stale while prepare was in progress " +
-                format_native_run_identity(run_identity)
-            );
+            throw std::runtime_error(with_endpoint_failure_marker(
+                identity, "native-run pipeline lease generation became stale while prepare was in progress " +
+                              format_native_run_identity(run_identity)
+            ));
         }
         it->second->phase = NativeRunPhase::PREPARED;
     }
@@ -1558,6 +1610,7 @@ void ChipWorker::finalize_native_run_impl(const ChipWorkerNativeRun &run, bool *
     if (outcome.captured != nullptr) std::rethrow_exception(outcome.captured);
     switch (outcome.fault) {
     case FinalizeFault::None:
+        if (run.slot_id < endpoint_failures_.size()) endpoint_failures_[run.slot_id] = {};
         return;
     case FinalizeFault::Stale:
         throw std::runtime_error(
@@ -1575,10 +1628,17 @@ void ChipWorker::finalize_native_run_impl(const ChipWorkerNativeRun &run, bool *
         throw std::runtime_error(
             "finalize_native_run left the run context in an unknown state " + format_native_run_identity(run)
         );
-    case FinalizeFault::Failed:
-        throw std::runtime_error(
+    case FinalizeFault::Failed: {
+        EndpointFailureIdentity identity{};
+        if (run.slot_id < endpoint_failures_.size()) {
+            identity = endpoint_failures_[run.slot_id];
+            endpoint_failures_[run.slot_id] = {};
+        }
+        throw std::runtime_error(with_endpoint_failure_marker(
+            identity,
             "finalize_native_run failed with code " + std::to_string(outcome.rc) + " " + format_native_run_identity(run)
-        );
+        ));
+    }
     }
 }
 

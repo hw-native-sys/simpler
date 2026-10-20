@@ -113,6 +113,13 @@ void rt_report_fatal(OrchContext *ctx, int32_t error_code, const char *func, con
     va_end(args);
 }
 
+void rt_report_endpoint_failure(
+    OrchContext *ctx, uint32_t kind, uint64_t session_bits, uint64_t transaction_id, const char *func,
+    const char *message
+) {
+    ctx->orchestrator->report_endpoint_failure(kind, session_bits, transaction_id, func, message);
+}
+
 static bool require_host_tensor(OrchContext *ctx, const simpler::hbg::Tensor &tensor, const char *caller) {
     if (tensor.address_space == AddressSpace::HOST && !tensor.owner_task_id.is_valid()) return true;
     ctx->orchestrator->report_fatal(
@@ -216,6 +223,7 @@ static const OrchOps s_orch_ops = {
 #endif
     .graph_record_start = graph_record_start_impl,
     .graph_record_wait = graph_record_wait_impl,
+    .report_endpoint_failure = rt_report_endpoint_failure,
 };
 
 // =============================================================================

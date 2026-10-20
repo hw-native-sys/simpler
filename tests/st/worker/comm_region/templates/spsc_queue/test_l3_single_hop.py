@@ -12,7 +12,8 @@
 from __future__ import annotations
 
 import pytest
-from simpler.worker_chip_message_queue import WorkerChipQueueOpcode
+from simpler.comm_region_template import SpscQueueOpcode
+from simpler.worker import Worker
 
 from ._helpers import (
     _POST_STOP_MARKER,
@@ -20,15 +21,17 @@ from ._helpers import (
     _SMALL_ECHO,
     _TIMEOUT_S,
     SUCCESS_PLATFORMS,
+    build_chip_callable,
     close_owned_workers,
     compute_payload,
     create_queue,
     drain_message,
+    echo_once,
     echo_payload,
     enqueue_bytes,
     error_payload,
     expected_compute_payload,
-    make_l3_worker,
+    region_lifecycle,
     stream_config,
     submit_queue,
     wrap_payload,
@@ -39,12 +42,25 @@ from ._helpers import (
 @pytest.mark.device_count(1)
 @pytest.mark.runtime("tensormap_and_ringbuffer")
 def test_l3_single_hop(st_platform, st_device_ids):
-    worker, chip_handle = make_l3_worker(st_platform, int(st_device_ids[0]))
+    worker = Worker(
+        level=3,
+        device_ids=[int(st_device_ids[0])],
+        num_sub_workers=0,
+        platform=st_platform,
+        runtime="tensormap_and_ringbuffer",
+    )
+    recorder = None
+    transactions: list[int] = []
     primary = None
     try:
+        chip_handle = worker.register(build_chip_callable(st_platform))
+        lifecycle = region_lifecycle()
+        recorder = lifecycle.install_lifecycle_recorder(worker)
+        worker.init()
 
         def orch(orch_handle, _args, cfg):
             queue = create_queue(orch_handle)
+            transactions.append(int(queue._endpoint_binding.transaction_id))
             layout = queue.layout
 
             for _ in range(_QUEUE_DEPTH):
@@ -55,7 +71,7 @@ def test_l3_single_hop(st_platform, st_device_ids):
             submit_queue(orch_handle, chip_handle, queue, cfg)
             for _ in range(_QUEUE_DEPTH):
                 opcode, payload, _offset = drain_message(queue)
-                assert opcode is WorkerChipQueueOpcode.DATA
+                assert opcode is SpscQueueOpcode.DATA
                 assert payload == _SMALL_ECHO
             assert queue.output.try_peek() is None
 
@@ -64,7 +80,7 @@ def test_l3_single_hop(st_platform, st_device_ids):
             for payload in wrap_messages:
                 enqueue_bytes(queue, payload)
                 opcode, got, offset = drain_message(queue)
-                assert opcode is WorkerChipQueueOpcode.DATA
+                assert opcode is SpscQueueOpcode.DATA
                 assert got == payload
                 wrap_offsets.append(offset)
             assert wrap_offsets[1] > wrap_offsets[0]
@@ -72,7 +88,7 @@ def test_l3_single_hop(st_platform, st_device_ids):
 
             queue.input.enqueue(None, nbytes=0, timeout=_TIMEOUT_S)
             opcode, payload, offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.DATA
+            assert opcode is SpscQueueOpcode.DATA
             assert payload == b""
             assert offset == 0
 
@@ -81,27 +97,27 @@ def test_l3_single_hop(st_platform, st_device_ids):
             err2 = error_payload(b"e2")
             enqueue_bytes(queue, err1)
             opcode, payload, _offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.ERROR
+            assert opcode is SpscQueueOpcode.ERROR
             assert payload == err1
             enqueue_bytes(queue, echo)
             opcode, payload, _offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.DATA
+            assert opcode is SpscQueueOpcode.DATA
             assert payload == echo
             enqueue_bytes(queue, err2)
             opcode, payload, _offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.ERROR
+            assert opcode is SpscQueueOpcode.ERROR
             assert payload == err2
 
             compute = compute_payload(3.0)
             enqueue_bytes(queue, compute)
             opcode, payload, _offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.DATA
+            assert opcode is SpscQueueOpcode.DATA
             assert payload == expected_compute_payload(3.0)
 
             queue.request_stop(timeout=_TIMEOUT_S)
             assert queue.input.try_enqueue(_SMALL_ECHO, len(_SMALL_ECHO)) is False
             opcode, payload, _offset = drain_message(queue)
-            assert opcode is WorkerChipQueueOpcode.DATA
+            assert opcode is SpscQueueOpcode.DATA
             assert payload == _POST_STOP_MARKER
             assert queue.output.try_peek() is None
 
@@ -109,9 +125,22 @@ def test_l3_single_hop(st_platform, st_device_ids):
             with pytest.raises(RuntimeError):
                 queue.input.try_enqueue(_SMALL_ECHO, len(_SMALL_ECHO))
 
+        def orch_unfreed(orch_handle, _args, cfg):
+            queue = create_queue(orch_handle)
+            transactions.append(int(queue._endpoint_binding.transaction_id))
+            submit_queue(orch_handle, chip_handle, queue, cfg)
+            echo_once(queue, free=False)
+
         worker.run(orch, args=None, config=stream_config())
+        worker.run(orch_unfreed, args=None, config=stream_config())
+        assert transactions == [1, 2]
+        lifecycle.assert_lifecycle_rounds(recorder, 2)
     except BaseException as exc:
         primary = exc
         raise
     finally:
-        close_owned_workers(primary, worker)
+        try:
+            close_owned_workers(primary, worker)
+        finally:
+            if recorder is not None and recorder.restore is not None:
+                recorder.restore()

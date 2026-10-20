@@ -18,10 +18,11 @@ import os
 import struct
 
 import pytest
+from simpler import comm_endpoints as ce
+from simpler.comm_region_template import SpscQueueOpcode
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, TaskArgs
 from simpler.worker import Worker
-from simpler.worker_chip_message_queue import WorkerChipQueueOpcode
 
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
@@ -131,7 +132,7 @@ def _expected_outputs() -> list[bytes]:
 def _read_expected_outputs(queue, expected_outputs: list[bytes]) -> None:
     for expected in expected_outputs:
         message = queue.output.peek(timeout=_TIMEOUT_S)
-        assert message.opcode == WorkerChipQueueOpcode.DATA
+        assert message.opcode == SpscQueueOpcode.DATA
         assert message.payload_nbytes == len(expected)
         assert _read_message_payload(queue, message) == expected
         queue.output.release(message)
@@ -166,16 +167,18 @@ def run_worker_chip_message_queue_example(platform: str, device_id: int) -> None
         config.aicpu_thread_num = 2
 
         def orch(orch_handle, _args, cfg):
-            queue = orch_handle.create_worker_chip_queue(
-                worker_id=0,
+            host = ce.at("L3", ce.HOST_CPU)
+            device = ce.at("L3/L2[0]", ce.DEVICE_AICPU)
+            queue = orch_handle.create_spsc_queue(
+                initiator=host,
+                peer=device,
                 depth=_QUEUE_DEPTH,
                 input_arena_bytes=_INPUT_ARENA_BYTES,
                 output_arena_bytes=_OUTPUT_ARENA_BYTES,
             )
 
             task_args = TaskArgs()
-            # Binding occupies TaskArgs scalars [0, 10).
-            for scalar in queue.chip_task_arg_scalars():
+            for scalar in queue.peer_task_arg_scalars():
                 task_args.add_scalar(int(scalar))
             orch_handle.submit_next_level(handle, task_args, cfg, worker=0)
 

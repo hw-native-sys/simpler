@@ -1269,6 +1269,7 @@ class NativeRunDescriptor(ctypes.Structure):
         ("accepted_value", ctypes.c_int32),
         ("joinable_boundary", ctypes.c_uint32),
         ("provenance", NativeRunProvenance),
+        ("endpoint_failure", ctypes.c_void_p),
     ]
 
 

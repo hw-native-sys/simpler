@@ -139,8 +139,8 @@ nav:
       - Python Callable Serialization: python-callable-serialization.md
   - Multi-chip and comm:
       - Communication Domains: comm-domain.md
-      - L3-L2 Orchestrator Comm: l3-l2-orch-comm.md
-      - L3-L2 Message Queue: l3-l2-message-queue.md
+      - CPU-NPU Region Communication: CPU-NPU-orch-comm.md
+      - CPU-NPU Message Queue: CPU-NPU-message-queue.md
       - Directed NEXT_LEVEL Scheduling: directed-next-level-scheduling.md
       - Remote L3 Worker Design:
           - Overview: remote-l3-worker-design.md

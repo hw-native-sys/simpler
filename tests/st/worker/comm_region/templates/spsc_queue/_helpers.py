@@ -10,15 +10,17 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import struct
+import sys
 from typing import Any
 
-from simpler.comm_region_template import SpscQueueEndpointBinding, _BoundSpscQueue
+from simpler import comm_endpoints as ce
+from simpler.comm_region_template import SpscQueue, SpscQueueOpcode, _SpscQueueEndpointBinding
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, TaskArgs
 from simpler.worker import Worker, attach_exception_note
-from simpler.worker_chip_message_queue import WorkerChipQueue, WorkerChipQueueOpcode
 
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
@@ -43,6 +45,8 @@ _COMPUTE_SCALAR = 1.0
 _WRAP_NBYTES = 200 * 1024
 _POST_STOP_MARKER = struct.pack("<Q", 0x11)
 _SMALL_ECHO = struct.pack("<Q", _CMD_ECHO)
+_SENTINEL_HEAD = 0xD100000000000001
+_SENTINEL_TAIL = 0xD100000000000002
 
 SUCCESS_PLATFORMS = ["a2a3sim", "a2a3", "a5sim", "a5"]
 FAULT_PLATFORMS = ["a2a3sim", "a5sim"]
@@ -126,39 +130,113 @@ def make_l3_worker(platform: str, device_id: int) -> tuple[Worker, Any]:
         raise
 
 
-def create_queue(orch_handle) -> WorkerChipQueue:
-    queue = orch_handle.create_worker_chip_queue(
-        worker_id=0,
+def region_lifecycle():
+    name = "comm_region_recursive_single_owner_helpers"
+    module = sys.modules.get(name)
+    if module is not None:
+        return module
+    path = os.path.abspath(os.path.join(_HERE, "..", "..", "recursive_single_owner", "_helpers.py"))
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("region lifecycle helpers are missing")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def create_queue(orch_handle, *, host_path: str = "L3", peer_path: str = "L3/L2[0]") -> SpscQueue:
+    host = ce.at(host_path, ce.HOST_CPU)
+    device = ce.at(peer_path, ce.DEVICE_AICPU)
+    queue = orch_handle.create_spsc_queue(
+        initiator=host,
+        peer=device,
         depth=_QUEUE_DEPTH,
         input_arena_bytes=_INPUT_ARENA_BYTES,
         output_arena_bytes=_OUTPUT_ARENA_BYTES,
     )
-    assert isinstance(queue, WorkerChipQueue)
-    assert isinstance(queue._bound, _BoundSpscQueue)
+    assert isinstance(queue, SpscQueue)
     assert queue.layout.depth == _QUEUE_DEPTH
     assert queue.layout.input_arena_bytes == _INPUT_ARENA_BYTES
     assert queue.layout.output_arena_bytes == _OUTPUT_ARENA_BYTES
     assert queue.layout.input_arena_bytes != queue.layout.output_arena_bytes
-    scalars = queue.chip_task_arg_scalars()
+    scalars = queue.peer_task_arg_scalars()
     assert len(scalars) == 10
-    binding = SpscQueueEndpointBinding.from_scalars(scalars)
+    binding = _SpscQueueEndpointBinding.from_scalars(scalars)
     assert list(binding.to_scalars()) == scalars
     assert binding.transaction_id != 0
     return queue
 
 
-def submit_queue(orch_handle, chip_handle, queue: WorkerChipQueue, cfg) -> None:
+def queue_task_args(queue: SpscQueue, *, sentinels: bool = False) -> TaskArgs:
     task_args = TaskArgs()
-    for scalar in queue.chip_task_arg_scalars():
+    if sentinels:
+        task_args.add_scalar(_SENTINEL_HEAD)
+    for scalar in queue.peer_task_arg_scalars():
         task_args.add_scalar(int(scalar))
-    orch_handle.submit_next_level(chip_handle, task_args, cfg, worker=0)
+    if sentinels:
+        task_args.add_scalar(_SENTINEL_TAIL)
+    return task_args
 
 
-def enqueue_bytes(queue: WorkerChipQueue, payload: bytes) -> None:
+def forwarded_task_args(args) -> TaskArgs:
+    count = int(args.scalar_count())
+    start = 0
+    end = count
+    if count >= 2 and int(args.scalar(0)) == _SENTINEL_HEAD and int(args.scalar(count - 1)) == _SENTINEL_TAIL:
+        start = 1
+        end = count - 1
+    task_args = TaskArgs()
+    for index in range(start, end):
+        task_args.add_scalar(int(args.scalar(index)))
+    return task_args
+
+
+def submit_queue(orch_handle, chip_handle, queue: SpscQueue, cfg, *, worker_id: int = 0) -> None:
+    orch_handle.submit_next_level(chip_handle, queue_task_args(queue), cfg, worker=int(worker_id))
+
+
+def sentinel_task_args(middle: int) -> TaskArgs:
+    task_args = TaskArgs()
+    task_args.add_scalar(_SENTINEL_HEAD)
+    task_args.add_scalar(int(middle))
+    task_args.add_scalar(_SENTINEL_TAIL)
+    return task_args
+
+
+def assert_driver_sentinels(args, middle: int) -> None:
+    assert int(args.scalar_count()) == 3
+    assert int(args.scalar(0)) == _SENTINEL_HEAD
+    assert int(args.scalar(1)) == int(middle)
+    assert int(args.scalar(2)) == _SENTINEL_TAIL
+
+
+def echo_once(queue: SpscQueue, *, free: bool) -> None:
+    enqueue_bytes(queue, echo_payload(b"once"))
+    opcode, payload, _offset = drain_message(queue)
+    assert opcode is SpscQueueOpcode.DATA
+    assert payload == echo_payload(b"once")
+    queue.request_stop(timeout=_TIMEOUT_S)
+    opcode, payload, _offset = drain_message(queue)
+    assert opcode is SpscQueueOpcode.DATA
+    assert payload == _POST_STOP_MARKER
+    if not free:
+        return
+    queue.free()
+    try:
+        queue.input.try_enqueue(_SMALL_ECHO, len(_SMALL_ECHO))
+    except RuntimeError as exc:
+        if "released" not in str(exc):
+            raise
+    else:
+        raise AssertionError("enqueue after free succeeded")
+
+
+def enqueue_bytes(queue: SpscQueue, payload: bytes) -> None:
     queue.input.enqueue(payload, nbytes=len(payload), timeout=_TIMEOUT_S)
 
 
-def drain_message(queue: WorkerChipQueue) -> tuple[WorkerChipQueueOpcode, bytes, int]:
+def drain_message(queue: SpscQueue) -> tuple[SpscQueueOpcode, bytes, int]:
     message = queue.output.peek(timeout=_TIMEOUT_S)
     payload = _read_payload(queue, message)
     offset = int(message.payload_offset)
@@ -167,7 +245,7 @@ def drain_message(queue: WorkerChipQueue) -> tuple[WorkerChipQueueOpcode, bytes,
     return opcode, payload, offset
 
 
-def _read_payload(queue: WorkerChipQueue, message) -> bytes:
+def _read_payload(queue: SpscQueue, message) -> bytes:
     if message.payload_nbytes == 0:
         queue.output.read_into(message, None)
         return b""

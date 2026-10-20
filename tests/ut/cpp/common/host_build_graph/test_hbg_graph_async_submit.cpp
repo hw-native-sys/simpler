@@ -263,6 +263,7 @@ const OrchOps kFakeOps = {
     .graph_commit = fake_graph_commit,
     .graph_record_start = fake_graph_record_start,
     .graph_record_wait = fake_graph_record_wait,
+    .report_endpoint_failure = nullptr,
 };
 
 }  // namespace

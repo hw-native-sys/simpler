@@ -99,13 +99,13 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     _mailbox_store_i32,
     _mailbox_store_u64,
     _read_control_copy_request,
+    _region_ack_cleanup_error,
+    _region_import_onboard,
+    _region_import_sim,
+    _region_peek_cleanup_error,
     _region_vmm_granularity,
     _set_host_span_level_prefix,
     _snapshot_local_task_args,
-    _worker_host_mapped_region_ack_cleanup_error,
-    _worker_host_mapped_region_import_onboard,
-    _worker_host_mapped_region_import_sim,
-    _worker_host_mapped_region_peek_cleanup_error,
     get_element_size,
     read_args_from_blob,
 )
@@ -162,6 +162,7 @@ from .comm_endpoints import (
     DefaultRegionAccessService,
     EndpointDeployment,
     EndpointRegistry,
+    EndpointSelector,
     RegionAccessService,
     RegionLayoutSpec,
     SingleOwner,
@@ -179,7 +180,6 @@ from .comm_provider import (
     ProviderReleaseResult,
     ProviderReleaseStatus,
     RegionAllocationContext,
-    RegionAllocationSpec,
     RegionControlError,
     RegionControlErrorKind,
     RegionEnvironmentKind,
@@ -209,11 +209,13 @@ from .comm_provider_control import (
 from .comm_region import (
     MaterializationContext,
     MaterializationError,
+    MaterializationRefusal,
+    RefusalReason,
     RegionInstance,
     RegionInstanceRegistry,
     RegionInstanceState,
+    _require_region_size,
     materialize_region_instance,
-    project_region_allocation_spec,
     validate_single_owner_region_shape,
 )
 from .global_comm_domain import (
@@ -314,10 +316,6 @@ from .teardown_report import (
     decode_teardown_report,
     encode_teardown_report_payload,
 )
-from .worker_chip_orch_comm import (
-    WorkerChipOrchRegion,
-    worker_chip_orch_region_desc_from_local_views,
-)
 from .worker_level import WorkerLevel
 from .worker_level import span_prefix as _span_prefix
 
@@ -327,13 +325,12 @@ from .worker_level import span_prefix as _span_prefix
 _BOOTSTRAP_WAIT_TIMEOUT_S = 120.0
 _BOOTSTRAP_POLL_INTERVAL_S = 0.001
 _PY_CONTROL_TIMEOUT_S = 30.0
-# L2 endpoint metadata currently reaches the parent through the canonical fatal
-# text emitted by the orchestration wrapper; keep this pattern in sync with the
-# wrapper's ``L3-L2 endpoint error ... region=<id>`` format.
-_WORKER_CHIP_ENDPOINT_ERROR_REGION_RE = re.compile(r"\bL3-L2 endpoint error\b[^\n]*\bregion=(\d+)\b")
-_SPSC_QUEUE_ENDPOINT_ERROR_RE = re.compile(
-    r"SPSC queue endpoint error op=\S+ kind=\d+ session=0x([0-9A-Fa-f]{16}) transaction=(\d+) msg="
+_ENDPOINT_SHORT_MARKERS = ("Region endpoint error", "SPSC queue endpoint error")
+_ENDPOINT_SHORT_RE = re.compile(
+    r"^(Region endpoint error|SPSC queue endpoint error) session=0x([0-9a-fA-F]{16}) transaction=([0-9]+)$"
 )
+_ENDPOINT_UNTRUSTED_RE = re.compile(r"^(Region endpoint error|SPSC queue endpoint error) identity=untrusted$")
+_UINT64_MAX = (1 << 64) - 1
 
 
 def _host_spans_active() -> bool:
@@ -2554,6 +2551,52 @@ def _request_child_shutdown(buf) -> None:
     _mailbox_store_i32(_buffer_field_addr(buf, _OFF_STATE), _SHUTDOWN)
 
 
+def _parse_endpoint_failure_marker(text: str) -> tuple[str, bytes, int] | None:
+    """Return the unique short allocation marker, or None when the text has none.
+
+    A present but incomplete, repeated, or untrusted marker raises ValueError.
+    """
+    found: list[tuple[str, bytes, int]] = []
+    saw_marker = False
+    for raw_line in str(text).splitlines() or [str(text)]:
+        for marker in _ENDPOINT_SHORT_MARKERS:
+            index = raw_line.find(marker)
+            if index < 0:
+                continue
+            saw_marker = True
+            tail = raw_line[index:]
+            if _ENDPOINT_UNTRUSTED_RE.fullmatch(tail):
+                raise ValueError(f"endpoint error identity is untrusted: {tail}")
+            match = _ENDPOINT_SHORT_RE.fullmatch(tail)
+            if match is None:
+                raise ValueError(f"endpoint error marker is malformed: {tail}")
+            transaction_id = int(match.group(3))
+            if transaction_id < 1 or transaction_id > _UINT64_MAX:
+                raise ValueError(f"endpoint error transaction is illegal: {tail}")
+            session = struct.pack("<Q", int(match.group(2), 16))
+            found.append((marker, session, transaction_id))
+    if not saw_marker:
+        return None
+    if len(found) != 1:
+        raise ValueError("endpoint error marker is ambiguous")
+    return found[0]
+
+
+def _prioritize_endpoint_failure_marker(text: str) -> str:
+    """Move one valid short marker to the first line without inventing uniqueness."""
+    try:
+        parsed = _parse_endpoint_failure_marker(text)
+    except ValueError:
+        return text
+    if parsed is None:
+        return text
+    marker, session, transaction_id = parsed
+    bits = int.from_bytes(session, "little")
+    short = f"{marker} session=0x{bits:016x} transaction={transaction_id}"
+    lines = [line for line in str(text).splitlines() if line.strip() != short and short not in line]
+    return "\n".join([short, *lines]) if lines else short
+
+
 def _write_error(buf, code: int, msg: str = "") -> None:
     """Write an (error code, message) tuple into the mailbox error region.
 
@@ -2562,7 +2605,7 @@ def _write_error(buf, code: int, msg: str = "") -> None:
     NUL-terminated content. On success (code=0) callers may pass an empty
     message; the region is zero-padded.
     """
-    _write_error_fields(buf, code, msg, _OFF_ERROR, MAILBOX_OFF_ERROR_MSG)
+    _write_error_fields(buf, code, _prioritize_endpoint_failure_marker(msg), _OFF_ERROR, MAILBOX_OFF_ERROR_MSG)
 
 
 def _read_error_msg(buf) -> str:
@@ -4860,7 +4903,7 @@ class _RunResources:
     pending_release_domains: list[CommDomainHandle] = field(default_factory=list)
     live_global_domains: dict[str, GlobalCommDomainHandle] = field(default_factory=dict)
     pending_release_global_domains: list[GlobalCommDomainHandle] = field(default_factory=list)
-    worker_chip_orch_comm_host_buffers: dict[int, int] = field(default_factory=dict)
+    region_host_buffers: dict[int, int] = field(default_factory=dict)
     # Every Buffer identity a NEXT_LEVEL dispatch (submit_next_level / _group) sent as a Tensor
     # arg during this run. release_buffer() checks this set across every not-yet-settled run before
     # releasing, so a Buffer never goes away while a dispatched task still names it.
@@ -5435,6 +5478,31 @@ def attach_exception_note(error: BaseException, note: str) -> None:
     object.__setattr__(error, "__notes__", [note])
 
 
+def _require_endpoint_selector(name: str, value: object) -> EndpointSelector:
+    if not isinstance(value, EndpointSelector):
+        raise TypeError(f"{name} must be an endpoint selector")
+    return value
+
+
+def _require_region_member_selectors(members: object) -> tuple[EndpointSelector, ...]:
+    if isinstance(members, (str, bytes, bytearray)):
+        raise TypeError("members must be a sequence of endpoint selectors")
+    try:
+        items = tuple(members)  # type: ignore[arg-type]
+    except TypeError as exc:
+        raise TypeError("members must be a sequence of endpoint selectors") from exc
+    for index, item in enumerate(items):
+        if not isinstance(item, EndpointSelector):
+            raise TypeError(f"members[{index}] must be an endpoint selector")
+    return items
+
+
+def _require_explicit_single_owner(topology: object) -> SingleOwner:
+    if not isinstance(topology, SingleOwner) or not isinstance(topology.provider, EndpointSelector):
+        raise TypeError("topology must be SingleOwner with an explicit provider selector")
+    return topology
+
+
 class _DeviceAllocations:
     """Every live child device allocation, in both forms a dispatch consumes.
 
@@ -5670,13 +5738,13 @@ class Worker:
         # Sticky copy of this Worker's native return-boundary mapping cleanup
         # diagnostic. Native storage is acknowledged only after this field and
         # the admission poison above have been published.
-        self._worker_host_mapped_cleanup_error: RuntimeError | None = None
+        self._region_mapping_cleanup_error: RuntimeError | None = None
         # (snapshot awaiting acknowledgement, retained distinct detail
         # fragments). This is an ordered diagnostic set, not a resource-count
         # ledger: an identical repeated failure adds no actionable information.
         # Keep it immutable so one attribute assignment publishes both pieces
         # atomically with respect to asynchronous Python exceptions.
-        self._worker_host_mapped_cleanup_state: tuple[str | None, tuple[str, ...]] = (None, ())
+        self._region_mapping_cleanup_state: tuple[str | None, tuple[str, ...]] = (None, ())
         # submit graph construction is serialized by _submit_mu. Resource
         # creation helpers use this pointer to bind new objects to the handle
         # being built; the pointer is cleared before submit() returns.
@@ -5789,7 +5857,7 @@ class Worker:
         self._region_access_service: RegionAccessService | None = None
 
         self._region_instance_registry = RegionInstanceRegistry()
-        self._worker_chip_orch_comm_host_buffers: dict[int, int] = {}
+        self._region_host_buffers: dict[int, int] = {}
 
         self._init_device_allocation_tables()
 
@@ -7467,7 +7535,7 @@ class Worker:
         """
         tid = threading.get_ident()
         with self._hierarchical_start_cv:
-            self._consume_worker_host_mapped_cleanup_error_locked(api)
+            self._consume_region_mapping_cleanup_error_locked(api)
             if self._lifecycle is not _Lifecycle.READY:
                 raise RuntimeError(f"Worker.{api}: requires an initialized (READY) worker") from self._startup_error
             if self._ordered_cleanup_error is not None:
@@ -7672,29 +7740,6 @@ class Worker:
             return materialize_region_instance(
                 MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout_summary)
             )
-
-    def _admitted_worker_chip_region_context(
-        self, worker_id: int, payload_bytes: int, counter_bytes: int
-    ) -> MaterializationContext:
-        worker_id = int(worker_id)
-        root_path = _format_worker_path(int(self.level))
-        provider_path = _format_worker_path(2, parent_path=root_path, index=worker_id)
-        provider = at(provider_path, DEVICE_AICPU)
-        layout = RegionLayoutSpec(payload_bytes=int(payload_bytes), counter_bytes=int(counter_bytes))
-        members = (at(root_path, HOST_CPU), provider)
-        topology = SingleOwner(provider=provider)
-        registry = self._get_endpoint_registry()
-        resolved = registry.resolve_region_spec(members, topology)
-        plan = BackendResolver(registry, self._get_region_access_service()).plan(resolved, layout)
-        ctx = MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout)
-        validate_single_owner_region_shape(ctx)
-        return ctx
-
-    def _project_admitted_worker_chip_region_spec(
-        self, worker_id: int, payload_bytes: int, counter_bytes: int
-    ) -> RegionAllocationSpec:
-        ctx = self._admitted_worker_chip_region_context(int(worker_id), int(payload_bytes), int(counter_bytes))
-        return project_region_allocation_spec(ctx.plan, ctx.layout)
 
     def _register_into_snapshot_or_wait(self, reg: _CallableRegistration) -> CallableHandle | None:
         """Linearize a level>=3 register against the startup epoch.
@@ -9319,7 +9364,8 @@ class Worker:
                 parent_path=self._delegated_control_path,
                 index=int(worker_id),
             )
-            inner_worker._delegated_control_path = child_path
+            # child_path is the control-loop route. The forked Worker keeps the
+            # registry root stored at its own construction.
             pid = os.fork()
             if pid == 0:
                 buf = self._next_level_shms[idx].buf
@@ -9683,36 +9729,23 @@ class Worker:
         """
         return dict(self._live_domains)
 
-    def _validate_worker_chip_id(self, worker_id: int) -> None:
-        if self.level < 3:
-            raise RuntimeError("create_worker_chip_region requires a hierarchical Worker")
-        if self._worker is None:
-            raise RuntimeError("create_worker_chip_region requires Worker.init()")
-        device_ids = self._config.get("device_ids", [])
-        if worker_id < 0 or worker_id >= len(device_ids):
-            raise ValueError(f"create_worker_chip_region: worker_id {worker_id} outside [0, {len(device_ids)})")
-
     def _poison_spsc_queue_from_endpoint_error(
         self, exc: BaseException, resources: _RunResources | None = None
     ) -> bool:
         text = str(exc)
-        if "SPSC queue endpoint error" not in text:
-            return False
-        match = _SPSC_QUEUE_ENDPOINT_ERROR_RE.search(text)
-        if match is None:
+        try:
+            parsed = _parse_endpoint_failure_marker(text)
+        except ValueError:
+            if "SPSC queue endpoint error" not in text:
+                return False
             self._record_unreclaimable(
                 "spsc queue: endpoint error marker is malformed; no further work is admitted",
                 exc,
             )
             return True
-        session = struct.pack("<Q", int(match.group(1), 16))
-        transaction_id = int(match.group(2))
-        if transaction_id == 0:
-            self._record_unreclaimable(
-                "spsc queue: endpoint error transaction id is illegal; no further work is admitted",
-                exc,
-            )
-            return True
+        if parsed is None or parsed[0] != "SPSC queue endpoint error":
+            return False
+        _marker, session, transaction_id = parsed
         try:
             self._region_instance_registry.record_data_plane_failure_by_allocation_identity(
                 resources, session, transaction_id, exc
@@ -9729,31 +9762,39 @@ class Worker:
         )
         return True
 
-    def _poison_worker_chip_region_from_endpoint_error(
-        self, exc: BaseException, resources: _RunResources | None = None
-    ) -> bool:
-        match = _WORKER_CHIP_ENDPOINT_ERROR_REGION_RE.search(str(exc))
-        if match is None:
-            return False
-        region_id = int(match.group(1))
-        if region_id == 0:
-            return False
+    def _poison_region_from_endpoint_error(self, exc: BaseException, resources: _RunResources | None = None) -> bool:
+        text = str(exc)
         try:
-            self._region_instance_registry.record_data_plane_failure(resources, region_id, exc)
+            parsed = _parse_endpoint_failure_marker(text)
+        except ValueError:
+            if "Region endpoint error" not in text:
+                return False
+            self._record_unreclaimable(
+                "region instance: endpoint error marker is malformed; no further work is admitted",
+                exc,
+            )
+            return True
+        if parsed is None or parsed[0] != "Region endpoint error":
+            return False
+        _marker, session, transaction_id = parsed
+        try:
+            self._region_instance_registry.record_data_plane_failure_by_allocation_identity(
+                resources, session, transaction_id, exc
+            )
         except MaterializationError as routing:
             self._record_unreclaimable(
-                f"region instance: data-plane failure routing failed for resource {region_id}; "
+                "region instance: data-plane failure routing failed for allocation identity; "
                 "no further work is admitted",
                 routing,
             )
             return True
         self._record_unreclaimable(
-            f"region instance: issued local operation failed for resource {region_id}; no further work is admitted",
+            "region instance: issued local operation failed; no further work is admitted",
             exc,
         )
         return True
 
-    def _register_worker_chip_orch_comm_host_buffer(self, handle) -> None:
+    def _register_region_host_buffer(self, handle) -> None:
         if not isinstance(handle, Buffer):
             raise TypeError("L3-L2 host buffer registration expects a Buffer")
         if handle.address_space != AddressSpace.HOST:
@@ -9763,17 +9804,13 @@ class Worker:
         if base <= 0 or nbytes <= 0:
             return
         resources = self._building_run_resources
-        buffers = (
-            self._worker_chip_orch_comm_host_buffers
-            if resources is None
-            else resources.worker_chip_orch_comm_host_buffers
-        )
+        buffers = self._region_host_buffers if resources is None else resources.region_host_buffers
         buffers[base] = max(
             int(buffers.get(base, 0)),
             nbytes,
         )
 
-    def _validate_worker_chip_orch_comm_host_buffer(self, handle) -> None:
+    def _validate_region_host_buffer(self, handle) -> None:
         if not isinstance(handle, Buffer):
             raise ValueError("L3-L2 payload buffer must be a Buffer returned by orch.alloc(...)")
         if handle.address_space != AddressSpace.HOST:
@@ -9783,11 +9820,7 @@ class Worker:
         if base <= 0 or nbytes <= 0:
             raise ValueError("L3-L2 payload buffer must have a nonzero address and size")
         resources = self._building_run_resources
-        buffers = (
-            self._worker_chip_orch_comm_host_buffers
-            if resources is None
-            else resources.worker_chip_orch_comm_host_buffers
-        )
+        buffers = self._region_host_buffers if resources is None else resources.region_host_buffers
         registered_nbytes = buffers.get(base)
         if registered_nbytes is None:
             raise ValueError("L3-L2 payload buffer is not registered; use a handle returned by orch.alloc(...)")
@@ -9796,7 +9829,7 @@ class Worker:
                 f"L3-L2 payload buffer size {nbytes} exceeds registered shared storage {registered_nbytes}"
             )
 
-    def _consume_worker_host_mapped_cleanup_error_locked(self, api: str) -> RuntimeError | None:
+    def _consume_region_mapping_cleanup_error_locked(self, api: str) -> RuntimeError | None:
         """Publish and then acknowledge this Worker's native cleanup debt.
 
         Must hold ``_hierarchical_start_cv``. The native read is intentionally
@@ -9805,12 +9838,12 @@ class Worker:
         boundary. Acknowledgement may be interrupted only after admission is
         already poisoned.
         """
-        cleanup_error = _worker_host_mapped_region_peek_cleanup_error(self._owner_id)
-        pending_snapshot, details = self._worker_host_mapped_cleanup_state
+        cleanup_error = _region_peek_cleanup_error(self._owner_id)
+        pending_snapshot, details = self._region_mapping_cleanup_state
         if not cleanup_error:
             if pending_snapshot is not None:
-                self._worker_host_mapped_cleanup_state = (None, details)
-            return self._worker_host_mapped_cleanup_error
+                self._region_mapping_cleanup_state = (None, details)
+            return self._region_mapping_cleanup_error
 
         if cleanup_error != pending_snapshot:
             detail = cleanup_error
@@ -9821,26 +9854,26 @@ class Worker:
                 detail = cleanup_error[len(pending_snapshot) + 2 :]
             if detail and detail not in details:
                 details = (*details, detail)
-            self._worker_host_mapped_cleanup_state = (cleanup_error, details)
+            self._region_mapping_cleanup_state = (cleanup_error, details)
 
-        leaked = self._worker_host_mapped_cleanup_error
+        leaked = self._region_mapping_cleanup_error
         if leaked is None:
             leaked = RuntimeError(
                 f"Worker.{api}: a native L3 Host mapping owned by this Worker finalized without explicit close "
                 "and could not be reclaimed; no further work is admitted"
             )
-            self._worker_host_mapped_cleanup_error = leaked
+            self._region_mapping_cleanup_error = leaked
         leaked.__cause__ = RuntimeError("; ".join(details))
         if self._ordered_cleanup_error is None:
             self._ordered_cleanup_error = leaked
 
-        _worker_host_mapped_region_ack_cleanup_error(self._owner_id, cleanup_error)
-        self._worker_host_mapped_cleanup_state = (None, details)
-        return self._worker_host_mapped_cleanup_error
+        _region_ack_cleanup_error(self._owner_id, cleanup_error)
+        self._region_mapping_cleanup_state = (None, details)
+        return self._region_mapping_cleanup_error
 
-    def _consume_worker_host_mapped_cleanup_error(self, api: str) -> RuntimeError | None:
+    def _consume_region_mapping_cleanup_error(self, api: str) -> RuntimeError | None:
         with self._hierarchical_start_cv:
-            return self._consume_worker_host_mapped_cleanup_error_locked(api)
+            return self._consume_region_mapping_cleanup_error_locked(api)
 
     def _import_provider_part(
         self,
@@ -9852,7 +9885,7 @@ class Worker:
     ):
         expected = self._provider_import_backend_kind()
         if descriptor.backend_kind is not expected:
-            raise RuntimeError("create_worker_chip_region: unsupported import backend")
+            raise RuntimeError("region import: unsupported import backend")
         selected = None if part is None else RegionPartKind(part)
         if expected is BackendKind.POSIX_SHM:
             token = _posix_token_from_descriptor(descriptor)
@@ -9861,7 +9894,7 @@ class Worker:
                 raise RuntimeError("POSIX shm object is shorter than the descriptor logical bytes")
             if selected is RegionPartKind.COUNTER and mapping_bytes < _align_up(int(descriptor.nbytes), 64):
                 raise RuntimeError("COUNTER POSIX shm object is shorter than the 64-byte padded span")
-            return _worker_host_mapped_region_import_sim(token, int(mapping_bytes), self._owner_id)
+            return _region_import_sim(token, int(mapping_bytes), self._owner_id)
         if expected is BackendKind.VMM_SHAREABLE:
             device_id, shareable_handle, mapping_bytes = _vmm_shareable_facts(descriptor)
             namespace_id = (
@@ -9879,13 +9912,13 @@ class Worker:
                 raise RuntimeError("VMM mapping_bytes must be a positive multiple of runtime granularity")
             if selected is RegionPartKind.COUNTER and int(mapping_bytes) < _align_up(int(descriptor.nbytes), 64):
                 raise RuntimeError("COUNTER VMM mapping_bytes must cover 64-byte alignment")
-            return _worker_host_mapped_region_import_onboard(
+            return _region_import_onboard(
                 int(device_id),
                 int(shareable_handle),
                 int(mapping_bytes),
                 self._owner_id,
             )
-        raise RuntimeError("create_worker_chip_region: unsupported import backend")
+        raise RuntimeError("region import: unsupported import backend")
 
     def _provider_import_backend_kind(self) -> BackendKind:
         platform = str(self._config.get("platform", ""))
@@ -9915,59 +9948,134 @@ class Worker:
             expected_device_id=expected_device_id,
         )
 
-    def _create_worker_chip_region(self, worker_id: int, payload_bytes: int, counter_bytes: int):
-        if payload_bytes <= 0:
-            raise ValueError("create_worker_chip_region: payload_bytes must be positive")
-        if counter_bytes <= 0 or counter_bytes % 4 != 0:
-            raise ValueError("create_worker_chip_region: counter_bytes must be positive and a multiple of 4")
-        self._validate_worker_chip_id(int(worker_id))
-        resources = self._building_run_resources
+    def _create_region(
+        self,
+        *,
+        members: object,
+        topology: object,
+        payload_bytes: object,
+        counter_bytes: object,
+    ) -> RegionInstance:
+        resources = self._require_region_creation_run("_create_region")
+        frame = _callback_frame_for(self)
+        assert frame is not None
+        run_id = int(frame.run_id)
+        checked_payload = _require_region_size("payload_bytes", payload_bytes)
+        checked_counter = _require_region_size("counter_bytes", counter_bytes)
+        if checked_counter % 4 != 0:
+            raise ValueError("counter_bytes must be a multiple of 4")
+        checked_members = _require_region_member_selectors(members)
+        checked_topology = _require_explicit_single_owner(topology)
+        previous_cleanup = resources.requires_ordered_cleanup
         instance: RegionInstance | None = None
-        region = None
-        required_ordered_cleanup_before = resources.requires_ordered_cleanup if resources is not None else False
+        published = False
         try:
-            root_path = _format_worker_path(int(self.level))
-            provider_path = _format_worker_path(2, parent_path=root_path, index=int(worker_id))
-            provider = at(provider_path, DEVICE_AICPU)
-            layout = RegionLayoutSpec(payload_bytes=int(payload_bytes), counter_bytes=int(counter_bytes))
-            members = (at(root_path, HOST_CPU), provider)
-            topology = SingleOwner(provider=provider)
-            instance = self._materialize_region_instance(members, topology, layout)
-            payload_view = instance.local_view(RegionPartKind.PAYLOAD)
-            counter_view = instance.local_view(RegionPartKind.COUNTER)
-            if payload_view is None or counter_view is None:
-                raise RuntimeError("create_worker_chip_region: materialized instance is missing local views")
-            desc = worker_chip_orch_region_desc_from_local_views(
-                instance.provider_resource_id, payload_view, counter_view
-            )
-            region = WorkerChipOrchRegion(self, instance, desc)
-            if resources is not None:
-                resources.requires_ordered_cleanup = True
-            return region
-        except BaseException:
-            if resources is not None:
-                resources.requires_ordered_cleanup = required_ordered_cleanup_before
-            if instance is not None and instance._state is RegionInstanceState.LIVE and not instance._close_attempted:
-                try:
-                    self._region_instance_registry.close(instance)
-                except BaseException as close_exc:  # noqa: BLE001
-                    raise self._record_unreclaimable(
-                        f"create_worker_chip_region: rollback could not close the L3 Host mapping for region "
-                        f"{int(instance.provider_resource_id)} on worker {int(worker_id)}; "
-                        "it is leaked and no further work is admitted",
-                        close_exc,
-                    )
-            deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error(
-                "create_worker_chip_region rollback"
-            )
-            if deferred_native_cleanup_error is not None:
-                region_id = int(instance.provider_resource_id) if instance is not None else 0
-                raise self._record_unreclaimable(
-                    f"create_worker_chip_region: rollback could not close the L3 Host mapping for region "
-                    f"{region_id} on worker {int(worker_id)}; it is leaked and no further work is admitted",
-                    deferred_native_cleanup_error.__cause__ or deferred_native_cleanup_error,
-                )
+            with self._operation_lease("_create_region"), self._control_admission("_create_region"):
+                self._require_region_creation_run("_create_region")
+                registry = self._get_endpoint_registry()
+                layout = RegionLayoutSpec(payload_bytes=checked_payload, counter_bytes=checked_counter)
+                resolved = registry.resolve_region_spec(checked_members, checked_topology)
+                plan = BackendResolver(registry, self._get_region_access_service()).plan(resolved, layout)
+                if isinstance(plan, UnsupportedRegionPlan):
+                    raise MaterializationRefusal(RefusalReason.UNSUPPORTED_PLAN, plan.message)
+                ctx = MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout)
+                validate_single_owner_region_shape(ctx)
+                instance = materialize_region_instance(ctx)
+                self._finish_region_publication(instance, resources, run_id)
+                published = True
+                return instance
+        except BaseException as exc:
+            if instance is not None and not published:
+                self._rollback_unpublished_region(instance, exc)
+            if not self._run_retains_ordered_cleanup(resources):
+                resources.requires_ordered_cleanup = previous_cleanup
             raise
+
+    def _create_spsc_queue(
+        self,
+        *,
+        initiator: object,
+        peer: object,
+        depth: object,
+        input_arena_bytes: object,
+        output_arena_bytes: object,
+    ):
+        from .comm_region_template import (  # noqa: PLC0415
+            _RegionTemplateCoordinator,
+            _RegionTemplatePlacementRequest,
+            _return_spsc_queue,
+            _SpscQueueConfig,
+            _SpscQueueSlot,
+            _SpscQueueTemplate,
+            _TemplateSlotBindingRequest,
+        )
+
+        resources = self._require_region_creation_run("_create_spsc_queue")
+        checked_initiator = _require_endpoint_selector("initiator", initiator)
+        checked_peer = _require_endpoint_selector("peer", peer)
+        placement = _RegionTemplatePlacementRequest(
+            members=(checked_initiator, checked_peer),
+            topology=SingleOwner(provider=checked_peer),
+            slot_bindings=(
+                _TemplateSlotBindingRequest(_SpscQueueSlot.INITIATOR, checked_initiator),
+                _TemplateSlotBindingRequest(_SpscQueueSlot.PEER, checked_peer),
+            ),
+        )
+        previous_cleanup = resources.requires_ordered_cleanup
+        try:
+            return _RegionTemplateCoordinator(self).create(
+                template=_SpscQueueTemplate(),
+                config=_SpscQueueConfig(
+                    depth=depth,
+                    input_arena_bytes=input_arena_bytes,
+                    output_arena_bytes=output_arena_bytes,
+                ),
+                placement=placement,
+                result_projector=_return_spsc_queue,
+            )
+        except BaseException:
+            if not self._run_retains_ordered_cleanup(resources):
+                resources.requires_ordered_cleanup = previous_cleanup
+            raise
+
+    def _finish_region_publication(self, instance: RegionInstance, resources: _RunResources, run_id: int) -> None:
+        instance._cleanup_resources = resources
+        instance._owner_run_id = int(run_id)
+        if instance._state is not RegionInstanceState.LIVE:
+            raise MaterializationError("created region is not live")
+
+    def _rollback_unpublished_region(self, instance: RegionInstance, primary: BaseException) -> None:
+        try:
+            live = instance._state is RegionInstanceState.LIVE and not instance._close_attempted
+        except BaseException:
+            live = False
+        if not live:
+            return
+        try:
+            self._region_instance_registry.close(instance)
+        except BaseException as cleanup_error:
+            try:
+                attach_exception_note(
+                    primary,
+                    "region creation: materialized instance could not be reclaimed; no further work is admitted",
+                )
+            except BaseException:
+                pass
+            try:
+                self._record_unreclaimable(
+                    "region creation: materialized instance could not be reclaimed; no further work is admitted",
+                    cleanup_error,
+                )
+            except BaseException:
+                pass
+
+    def _run_retains_ordered_cleanup(self, resources: _RunResources) -> bool:
+        if self._ordered_cleanup_error is not None:
+            return True
+        return any(
+            instance._retains_cleanup_only_reachability()
+            for instance in self._region_instance_registry._iter_run(resources)
+        )
 
     def _sweep_region_instances(self) -> None:
         self._region_instance_registry.sweep()
@@ -10066,7 +10174,7 @@ class Worker:
         return result if result is not None else outcome
 
     def _close_worker_chip_orch_comm(self) -> None:
-        self._worker_chip_orch_comm_host_buffers.clear()
+        self._region_host_buffers.clear()
         self._region_instance_registry.sweep()
 
     # ------------------------------------------------------------------
@@ -12883,6 +12991,27 @@ class Worker:
                     "unreclaimed and no further work is admitted; close() it"
                 ) from self._ordered_cleanup_error
 
+    def _require_region_creation_run(self, api: str) -> _RunResources:
+        self._require_ready_for_region_planning(api)
+        frame = _callback_frame_for(self)
+        if frame is None or frame.worker is not self:
+            raise RuntimeError(f"Worker.{api}: region creation requires this Worker's orchestration callback")
+        if frame.has_submitted_task:
+            raise RuntimeError(f"Worker.{api}: region creation cannot follow a task submission in the same run")
+        resources = self._building_run_resources
+        if resources is None:
+            raise RuntimeError(f"Worker.{api}: region creation requires the owning run")
+        self._require_no_ordered_cleanup_failure(api)
+        return resources
+
+    def _require_region_access_run(self, api: str, *, resources: _RunResources, run_id: int) -> None:
+        frame = _callback_frame_for(self)
+        if frame is None or frame.worker is not self:
+            raise RuntimeError(f"Worker.{api}: region access requires this Worker's orchestration callback")
+        if int(frame.run_id) != int(run_id) or self._building_run_resources is not resources:
+            raise RuntimeError(f"Worker.{api}: region access requires the owning run")
+        self._require_no_ordered_cleanup_failure(api)
+
     def _require_region_control_context(self, api: str) -> None:
         frame = _callback_frame_for(self)
         if frame is not None:
@@ -13365,7 +13494,7 @@ class Worker:
                 if native_error is not None:
                     if self._poison_spsc_queue_from_endpoint_error(native_error, resources):
                         return
-                    self._poison_worker_chip_region_from_endpoint_error(native_error, resources)
+                    self._poison_region_from_endpoint_error(native_error, resources)
 
             def _release_native_run() -> None:
                 if orch is None:
@@ -13378,7 +13507,7 @@ class Worker:
                     ("remote_slot_refs", lambda: self._release_active_remote_slot_refs(resources)),
                     ("remote_frees", self._flush_pending_remote_frees),
                     ("region_instances", lambda: self._region_instance_registry.cleanup_run(resources)),
-                    ("worker_chip_host_buffers", resources.worker_chip_orch_comm_host_buffers.clear),
+                    ("worker_chip_host_buffers", resources.region_host_buffers.clear),
                     (
                         "pending_global_domains",
                         lambda: self._execute_pending_global_domain_releases(resources),
@@ -13692,7 +13821,7 @@ class Worker:
                     and self._cleanup_journal.empty
                     and (self._teardown_attempted or prior.error is None)
                 ):
-                    deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
+                    deferred_native_cleanup_error = self._consume_region_mapping_cleanup_error_locked("close")
                     if prior.error is not None:
                         raise prior.error
                     if deferred_native_cleanup_error is not None:
@@ -13708,7 +13837,7 @@ class Worker:
                         "init()'d it (native teardown is thread-bound)"
                     )
                 self._validate_chip_execution_context()
-                deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error_locked("close")
+                deferred_native_cleanup_error = self._consume_region_mapping_cleanup_error_locked("close")
                 # Claim: publish CLOSED (permanent admission fence) and install a
                 # fresh teardown attempt.
                 self._lifecycle = _Lifecycle.CLOSED
@@ -13797,7 +13926,7 @@ class Worker:
                 had_live = True  # conservative default if a read below is interrupted
                 detached_registry: tuple[dict, dict, dict] | None = None
                 try:
-                    deferred_native_cleanup_error = self._consume_worker_host_mapped_cleanup_error("close")
+                    deferred_native_cleanup_error = self._consume_region_mapping_cleanup_error("close")
                     if result is None and deferred_native_cleanup_error is not None:
                         result = deferred_native_cleanup_error
                     # A successful tree teardown is the reclamation boundary

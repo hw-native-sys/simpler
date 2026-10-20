@@ -98,6 +98,12 @@ typedef struct RuntimeOps {
     // collector can log it. Always present to keep ops-table layout stable
     // across SIMPLER_DFX settings; set to nullptr at SIMPLER_DFX=0.
     void (*scope_set_site)(const char *file, int line);
+
+    // Publishes an EndpointFailureIdentity only when this call latches the run's first fatal.
+    void (*report_endpoint_failure)(
+        RuntimeContext *rt, uint32_t kind, uint64_t session_bits, uint64_t transaction_id, const char *func,
+        const char *message
+    );
 } RuntimeOps;
 
 /**
@@ -253,6 +259,12 @@ static inline bool rt_is_fatal() {
     do {                                                                         \
         RuntimeContext *_rt = current_runtime();                                 \
         _rt->ops->report_fatal(_rt, (code), __FUNCTION__, (fmt), ##__VA_ARGS__); \
+    } while (0)
+
+#define rt_report_endpoint_failure(kind, session_bits, transaction_id, message)                                    \
+    do {                                                                                                           \
+        RuntimeContext *_rt = current_runtime();                                                                   \
+        _rt->ops->report_endpoint_failure(_rt, (kind), (session_bits), (transaction_id), __FUNCTION__, (message)); \
     } while (0)
 
 // =============================================================================

@@ -122,6 +122,7 @@ const RuntimeOps kFakeOps = {
     .alloc_tensors = fake_alloc_tensors,
     .submit_dummy_task = fake_submit_dummy,
     .scope_set_site = nullptr,
+    .report_endpoint_failure = nullptr,
 };
 
 class RuntimeBindingGuard {

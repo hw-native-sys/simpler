@@ -140,7 +140,7 @@ enum {
 };
 
 enum {
-    PTO_PIPELINE_CONTRACT_ABI_VERSION = 1,
+    PTO_PIPELINE_CONTRACT_ABI_VERSION = 2,
     PTO_PIPELINE_MAX_RESOURCES = 8,
 };
 
@@ -276,6 +276,8 @@ typedef struct NativeRunArtifactIdentity {
  * id remain diagnostic after admission. A non-null acceptance sink is written
  * only at the real kernel-launch marker.
  */
+struct EndpointFailureIdentity;
+
 typedef struct NativeRunDescriptor {
     uint32_t pipeline_slot;
     uint32_t arena_bank;
@@ -299,6 +301,11 @@ typedef struct NativeRunDescriptor {
     uint32_t joinable_boundary;
     /** Where this dispatch came from, for diagnostic attribution only. */
     NativeRunProvenance provenance;
+    /**
+     * Stable storage for one endpoint failure identity. Null when the caller
+     * does not receive one. The pointer stays on the host.
+     */
+    struct EndpointFailureIdentity *endpoint_failure;
 } NativeRunDescriptor;
 
 /**

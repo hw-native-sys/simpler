@@ -14,11 +14,12 @@ from __future__ import annotations
 import ctypes
 
 import pytest
+from simpler import comm_endpoints as ce
 from simpler import comm_region
 from simpler import worker as worker_module
+from simpler.comm_region import NotifyOp, WaitCmp
 from simpler.task_interface import DataType
 from simpler.worker import Worker
-from simpler.worker_chip_orch_comm import NotifyOp, WaitCmp
 
 from simpler_setup.runtime_builder import RuntimeBuilder
 
@@ -37,8 +38,8 @@ def _require_runtime(platform: str) -> None:
 
 def _install_lifecycle_spies(monkeypatch) -> list[tuple]:
     events: list[tuple] = []
-    original_import = worker_module._worker_host_mapped_region_import_onboard
-    original_close = comm_region._worker_host_mapped_region_close
+    original_import = worker_module._region_import_onboard
+    original_close = comm_region._region_close
     original_release = Worker._dispatch_delegated_release
 
     def spy_import(device_id, shareable_handle, mapping_bytes, owner_token):
@@ -60,8 +61,8 @@ def _install_lifecycle_spies(monkeypatch) -> list[tuple]:
         events.append(("release", int(result.provider_resource_id)))
         return result
 
-    monkeypatch.setattr(worker_module, "_worker_host_mapped_region_import_onboard", spy_import)
-    monkeypatch.setattr(comm_region, "_worker_host_mapped_region_close", spy_close)
+    monkeypatch.setattr(worker_module, "_region_import_onboard", spy_import)
+    monkeypatch.setattr(comm_region, "_region_close", spy_close)
     monkeypatch.setattr(Worker, "_dispatch_delegated_release", spy_release)
     return events
 
@@ -108,15 +109,18 @@ def test_onboard_provider_region_host_two_lifecycles(st_platform, st_device_ids,
             buf = (ctypes.c_uint8 * _PAYLOAD_BYTES).from_address(int(host.base))
             for i in range(_PAYLOAD_BYTES):
                 buf[i] = _HOST_MARKER
-            region = orch_handle.create_worker_chip_region(
-                worker_id=0, payload_bytes=_PAYLOAD_BYTES, counter_bytes=_COUNTER_BYTES
+            host_ep = ce.at("L3", ce.HOST_CPU)
+            device = ce.at("L3/L2[0]", ce.DEVICE_AICPU)
+            region = orch_handle.create_region(
+                members=(host_ep, device),
+                topology=ce.SingleOwner(provider=device),
+                payload_bytes=_PAYLOAD_BYTES,
+                counter_bytes=_COUNTER_BYTES,
             )
             resource_ids.append(int(region.descriptor_scalars()[1]))
-            assert int(region._instance._payload_attachment.native_lease) != int(
-                region._instance._counter_attachment.native_lease
-            )
-            assert int(region._instance._payload_local_view.logical_bytes) == _PAYLOAD_BYTES
-            assert int(region._instance._counter_local_view.logical_bytes) == _COUNTER_BYTES
+            assert int(region._payload_attachment.native_lease) != int(region._counter_attachment.native_lease)
+            assert int(region._payload_local_view.logical_bytes) == _PAYLOAD_BYTES
+            assert int(region._counter_local_view.logical_bytes) == _COUNTER_BYTES
             region.payload_write(0, host, nbytes=_PAYLOAD_BYTES)
             region.counter(0).notify(1, NotifyOp.Set)
             assert region.counter(0).test(1, WaitCmp.EQ).matched
@@ -126,7 +130,7 @@ def test_onboard_provider_region_host_two_lifecycles(st_platform, st_device_ids,
             assert bytes(buf) == bytes([_HOST_MARKER] * _PAYLOAD_BYTES)
             assert [item[0] for item in events] == ["import", "import"]
             region.free()
-            assert region._instance._state is comm_region.RegionInstanceState.LIVE
+            assert region._state is comm_region.RegionInstanceState.LIVE
             assert [item[0] for item in events] == ["import", "import"]
 
         worker.run(orch)

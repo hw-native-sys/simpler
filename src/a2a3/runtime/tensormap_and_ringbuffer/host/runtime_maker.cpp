@@ -1050,6 +1050,9 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     // than a success.
     if (execution_rc != 0 && launched != 0) {
         runtime_status = read_published_run_status(api, &host_header);
+        if (host_header.endpoint_failure.kind != 0) {
+            api->record_endpoint_failure(host_header.endpoint_failure);
+        }
         if (runtime_status == 0) {
             LOG_WARN(
                 "this run published no terminal record; its execution status stands and the device-side detail is "

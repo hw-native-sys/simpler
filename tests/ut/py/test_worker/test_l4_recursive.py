@@ -27,10 +27,12 @@ from pathlib import Path
 
 import pytest
 from _task_interface import DataType
+from simpler import comm_endpoints as ce
 from simpler.buffer import mint_owner_instance_id, wrap_device_malloc
 from simpler.callable_identity import CallableHandle
+from simpler.orchestrator import _callback_run
 from simpler.task_interface import CallConfig, TaskArgs, TaskHandle
-from simpler.worker import RunHandle, Worker, _CloseAttempt, _Lifecycle, attach_exception_note
+from simpler.worker import RunHandle, Worker, _CloseAttempt, _Lifecycle, _RunResources, attach_exception_note
 
 from tests.st.worker.comm_region.recursive_single_owner._helpers import close_owned_workers
 
@@ -808,8 +810,15 @@ class TestFatalBoundary:
         worker._config = {**worker._config, "platform": "a2a3sim", "device_ids": [0]}
         first = RuntimeError("callback-fatal")
         worker._latch_delegated_session_fatal(first)
-        with pytest.raises(RuntimeError, match="no further work is admitted") as control_exc:
-            worker._create_worker_chip_region(0, 64, 8)
+        worker._building_run_resources = _RunResources()
+        with _callback_run(1, worker):
+            with pytest.raises(RuntimeError, match="no further work is admitted") as control_exc:
+                worker._create_region(
+                    members=(ce.at("L3", ce.HOST_CPU), ce.at("L3/L2[0]", ce.DEVICE_AICPU)),
+                    topology=ce.SingleOwner(provider=ce.at("L3/L2[0]", ce.DEVICE_AICPU)),
+                    payload_bytes=64,
+                    counter_bytes=8,
+                )
         assert control_exc.value.__cause__ is first
         with pytest.raises(RuntimeError, match="no further work is admitted") as submit_exc:
             worker.submit(lambda *_args, **_kwargs: None)
@@ -1050,7 +1059,7 @@ class TestDelegatedIntegration:
         for node in tree.body:
             if isinstance(node, ast.ClassDef) and node.name == "Worker":
                 for item in node.body:
-                    if isinstance(item, ast.FunctionDef) and item.name == "_create_worker_chip_region":
+                    if isinstance(item, ast.FunctionDef) and item.name == "_create_region":
                         create = item
                     if isinstance(item, ast.FunctionDef) and item.name == "_materialize_region_instance":
                         materialize = item
@@ -1071,7 +1080,7 @@ class TestDelegatedIntegration:
 
         create_names = _names(create)
         materialize_names = _names(materialize)
-        assert "_materialize_region_instance" in create_names
+        assert "materialize_region_instance" in create_names
         assert "materialize_region_instance" in materialize_names
         assert "materialize_delegated_region_instance" not in create_names
         assert "materialize_delegated_region_instance" not in materialize_names
@@ -1086,7 +1095,7 @@ class TestDelegatedIntegration:
             "_handle_ctrl_delegated_region_terminal",
             "_dispatch_delegated_allocate",
             "_dispatch_delegated_release",
-            "_create_worker_chip_region",
+            "_create_region",
             "_materialize_region_instance",
         }
         forbidden = {"handle_ctrl_region_allocate", "handle_ctrl_region_release"}
