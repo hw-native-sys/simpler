@@ -124,6 +124,10 @@ struct KernelArgs {
     // Both zero when no region was allocated.
     uint64_t run_result_data_base{0};
     uint64_t run_result_epoch{0};
+    // AICPU die of each scheduler slot, packed per common/scheduler_die_partition.h.
+    // 0 means "no slot known", which keeps the device on round-robin cluster
+    // ownership. a5-only: the host_build_graph runtime ignores it.
+    uint64_t sched_thread_die_bits{0};
     // 32-bit tail: no interior padding, and no field here is offset-locked.
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
     // How this run's entry arguments reached the AICPU, restated from the
@@ -167,9 +171,7 @@ static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 // what `launch_aicpu_payload` hands to `rtsLaunchCpuKernel` as `argsSize`, and
 // what `PersistentKernelArgs::prepare_once` allocates and copies H2D. The field
 // offsets differ from a2a3's: this struct has no `ffts_base_addr`, so its
-// thirteen 8-byte fields end at 104 rather than 112, and its 32-bit tail holds
-// nine uint32_t rather than eight. The two sizes coincide at 144 only because
-// the extra tail field is absorbed by the padding a2a3 does not need.
+// fourteen 8-byte fields end at 112, and its 32-bit tail holds nine uint32_t.
 static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 24, "KernelArgs::chip_swimlane_data_base offset drift");
 static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
@@ -177,10 +179,10 @@ static_assert(
 );
 // Where the 32-bit tail's Graph triple begins. `sizeof` alone cannot see a
 // reorder inside that tail, because every member of it is the same width, and
-// here it cannot see an appended one either: 140 bytes of members round up to
-// the same 144 as 144 would.
-static_assert(offsetof(KernelArgs, graph_section_offset) == 124, "KernelArgs::graph_section_offset offset drift");
-static_assert(sizeof(KernelArgs) == 144, "KernelArgs launch-payload size drift");
+// here it cannot see an appended one either: 148 bytes of members round up to
+// the same 152 as 152 would.
+static_assert(offsetof(KernelArgs, graph_section_offset) == 132, "KernelArgs::graph_section_offset offset drift");
+static_assert(sizeof(KernelArgs) == 152, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.

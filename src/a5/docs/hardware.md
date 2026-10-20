@@ -203,6 +203,50 @@ siblings, and `hyperthread_id` distinguishes the two logical threads. A5 maps
 two physical CPUs to one cluster and two clusters to one die, so the runtime
 derives `cluster_id = phy_cpu_id / 2` and `die_id = phy_cpu_id / 4`.
 
+`die_id` holds only while `phy_cpu_id` is the fault-free numbering. BIOS
+renumbers the surviving CPUs once a cluster is masked off, and nothing in
+CPU_TOPO distinguishes the two, so consumers that need the die restrict
+themselves to FG.
+
+## AICore die placement
+
+`physical_core_id`, which each AICore reports at handshake, indexes the
+register window array `host_regs.cpp` builds, and that array is laid out per
+die: `SUB_CORES_PER_DIE = PLATFORM_AICORE_PER_DIE * PLATFORM_CORES_PER_BLOCKDIM`,
+so die `d` occupies `[d*54, (d+1)*54)` with its AIC in the first 18 slots and
+its AIV pairs in the remaining 36. A cluster's die is therefore
+`physical_core_id / SUB_CORES_PER_DIE`.
+
+Observed on `Ascend950DT_9581` (FG, `block_dim` 32 of 36 physical AICore):
+
+- AIC ids fall only in `[0, 17]` and `[54, 71]`, AIV only in `[18, 51]` and
+  `[72, 107]` — the gap is what makes the two-block layout observable rather
+  than inferred. A 16-AICore-per-die layout is ruled out by it: `SUB_CORES_PER_DIE`
+  would be 48 and the ids at 54 and 71 would land in AIV territory.
+- CANN hands out block indices in ascending `physical_core_id` order, so
+  `worker_id` is monotonic in it, but **which** cores are excluded varies
+  between processes. The mapping is therefore only knowable after the
+  handshake; the host cannot predict it.
+- Both dies contributed exactly 16 clusters in every sample, but nothing
+  guarantees that, so consumers derive the split rather than assume it.
+
+The cluster a `worker_id` triple names is the physical cluster: for all 32
+clusters the AIV ids matched `die_base + 18 + 2 * local` and `+ 1` against
+their AIC's id.
+
+### Cross-die MMIO cost
+
+A scheduler thread's COND poll — one MMIO read per owned core per completion
+sweep — costs **139 ns cross-die against 90 ns same-die** (mean over the four
+scheduler threads; three runs under 5% spread). The same-die figure matches the
+~95 ns per MMIO LDR recorded in `.claude/rules/ascend.md`. The penalty is not
+uniform: it ranged from 1.25x to 1.99x by thread, so AICPU cluster position
+matters too, but CPU_TOPO exposes nothing that expresses that distance.
+
+This is what
+[`scheduler_die_partition.h`](../platform/include/common/scheduler_die_partition.h)
+trades against balance when it assigns cluster ownership.
+
 For this device, `OS_SCHED=0x1` and `OCCUPY=PF_OCCUPY=0x1f8`. Therefore cpu 0
 belongs to the AICPU OS, cpu 1/2 form a Data SMT pair outside the user pool,
 and cpu 3..8 are the six Compute CPUs that may receive Scheduler or

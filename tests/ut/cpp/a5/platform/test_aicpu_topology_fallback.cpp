@@ -491,6 +491,10 @@ TEST(A5AicpuLaunchPlan, WarnsWhenCpuTopologyFallsBackToPackagedJson) {
     EXPECT_FALSE(plan.warn_stable_reachable_below_default);
     EXPECT_EQ(plan.effective_active_count, 5);
     EXPECT_EQ(plan.launch_count, 6);
+    EXPECT_EQ(pto::a5::compute_sched_thread_die_bits(topology, plan.allowed_cpus, 4), 0U);
+
+    topology.source = AicpuTopologySource::kDriver;
+    EXPECT_NE(pto::a5::compute_sched_thread_die_bits(topology, plan.allowed_cpus, 4), 0U);
 }
 
 TEST(A5AicpuLaunchPlan, EnforcesManualAndLaunchCapacityWithoutClamping) {

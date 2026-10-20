@@ -85,4 +85,10 @@ bool platform_aicpu_affinity_gate_filter(
 
 int32_t platform_aicpu_affinity_thread_idx() { return tl_filter_exec_idx; }
 
+// Never true here. The sim gate hands out exec indices from a counter and does
+// not look at allowed_cpus at all, so an index names a survivor's arrival
+// order, not a cpu — the correspondence onboard callers read into the slot does
+// not exist to be checked.
+bool platform_aicpu_affinity_exact_match() { return false; }
+
 void platform_aicpu_affinity_set_thread_idx(int32_t idx) { tl_filter_exec_idx = idx; }

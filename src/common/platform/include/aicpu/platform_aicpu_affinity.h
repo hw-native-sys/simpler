@@ -58,6 +58,18 @@ bool platform_aicpu_affinity_gate_filter(const int32_t *allowed_cpus, int32_t al
 // N-1).
 int32_t platform_aicpu_affinity_thread_idx();
 
+// True when every survivor of the most recent filter gate is running on the
+// `allowed_cpus[]` entry its exec index names.
+//
+// That correspondence is what lets the host describe a thread by its slot —
+// a5's die-affinity cluster ownership derives each scheduler thread's die from
+// `allowed_cpus[exec_idx]`. The gate's recovery path breaks it: when CANN
+// over-subscribes one allowed cpu and misses another, the unmatched threads are
+// given the leftover slots by report order so every sched/orch role is still
+// filled, and from then on an exec index no longer identifies a cpu. Callers
+// that read meaning into the slot must check this and fall back.
+bool platform_aicpu_affinity_exact_match();
+
 // Publish this thread's resolved exec index into the affinity TLS.
 //
 // Onboard, the filter gate already assigns the index, so this is a redundant

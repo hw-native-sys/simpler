@@ -74,7 +74,8 @@ def _build_consumer(
         'target_include_directories(probe PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated" '
         '"${ASCEND_HOME_PATH}/include")\n'
         f'target_include_directories(probe PRIVATE "{REPO_ROOT}/src/common/platform/include" '
-        f'"{REPO_ROOT}/src/common/log/include")\n'
+        f'"{REPO_ROOT}/src/common/log/include" '
+        f'"{REPO_ROOT}/src/a5/platform/include")\n'
         "simpler_configure_aicpu_topology_driver(consumer)\n"
         'target_include_directories(consumer PRIVATE "${ASCEND_HOME_PATH}/include")\n'
     )

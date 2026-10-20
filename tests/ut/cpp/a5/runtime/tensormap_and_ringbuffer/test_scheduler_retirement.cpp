@@ -27,6 +27,10 @@ std::atomic<int> deadlines{0};
 bool silent_core = false;
 }  // namespace
 
+bool platform_aicpu_affinity_exact_match() { return false; }
+extern "C" uint64_t get_sched_thread_die_bits() { return 0; }
+uint32_t platform_get_physical_cores_count() { return 64; }
+void platform_init_aicore_regs(uint64_t) {}
 uint64_t platform_aicore_exit_deadline() { return ++deadlines; }
 uint64_t read_reg(uint64_t, RegId) { return AICORE_EXITED_VALUE; }
 int32_t platform_retire_aicore_group(const AicoreExitTarget *targets, size_t count, uint64_t, bool *released) {
@@ -66,6 +70,20 @@ public:
         for (int i = 0; i < kCores; ++i) {
             context.core_type_compact_[i] = static_cast<uint8_t>(i < 2 ? CoreType::AIC : CoreType::AIV);
         }
+    }
+    static void set_first_thread_die_ownership(SchedulerContext &context) {
+        context.owned_clusters_[0][0] = 1;
+        context.owned_cluster_count_[0] = 1;
+        context.die_affinity_active_[0] = true;
+    }
+    static int cluster_count(const SchedulerContext &context, int owner) {
+        return context.core_trackers_[owner].get_cluster_count();
+    }
+    static int first_aic(const SchedulerContext &context, int owner) {
+        return context.core_trackers_[owner].get_aic_core_id(0);
+    }
+    static uint32_t physical_core_id(const SchedulerContext &context, int worker) {
+        return context.physical_core_ids_[worker];
     }
 };
 
@@ -178,6 +196,37 @@ TEST_F(SchedulerRetirement, AssignmentAndEmergencyCanPublishConcurrently) {
     first.join();
     second.join();
     expect_once();
+}
+
+TEST_F(SchedulerRetirement, OneThreadDieOwnershipDoesNotChangeAnotherThreadFallback) {
+    SchedulerRetirementTestPeer::set_first_thread_die_ownership(*context);
+    context->assign_own_clusters(1);
+    EXPECT_EQ(SchedulerRetirementTestPeer::cluster_count(*context, 1), 1);
+}
+
+TEST_F(SchedulerRetirement, ReinitializationClearsDieOwnership) {
+    SchedulerRetirementTestPeer::set_first_thread_die_ownership(*context);
+    context->deinit();
+    ASSERT_EQ(context->pre_handshake_init(runtime.get(), 3, 2, 0), 0);
+    context->assign_own_clusters(0);
+    EXPECT_EQ(SchedulerRetirementTestPeer::cluster_count(*context, 0), 1);
+    EXPECT_EQ(SchedulerRetirementTestPeer::first_aic(*context, 0), 0);
+}
+
+TEST_F(SchedulerRetirement, NonDfxHandshakePublishesPhysicalIdsForSerialAssignment) {
+    runtime->dev.serial_orch_sched = true;
+    std::array<uint64_t, 64> regs{};
+    for (int i = 0; i < kCores; ++i) {
+        const uint32_t pcid = static_cast<uint32_t>(i + 2);
+        regs[pcid] = static_cast<uint64_t>(i + 1);
+        runtime->dev.workers[i].physical_core_id = pcid;
+        runtime->dev.workers[i].core_type = i < 2 ? CoreType::AIC : CoreType::AIV;
+        runtime->dev.workers[i].aicore_done = pcid + 1;
+    }
+    ASSERT_EQ(context->pre_handshake_init(runtime.get(), 3, 2, reinterpret_cast<uint64_t>(regs.data())), 0);
+    context->handshake_partition(runtime.get(), 0, 1);
+    for (int i = 0; i < kCores; ++i)
+        EXPECT_EQ(SchedulerRetirementTestPeer::physical_core_id(*context, i), static_cast<uint32_t>(i + 2));
 }
 
 TEST_F(SchedulerRetirement, SerialHandshakeFailureUsesOneFallbackOwner) {
