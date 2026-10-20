@@ -71,7 +71,7 @@ void run_one_task(ChipSwimlaneCollector &collector, uint32_t slot, uint64_t epoc
     set_platform_chip_swimlane_run_terminal_bank(
         reinterpret_cast<uint64_t>(collector.arm_run_terminal_bank(slot, epoch))
     );
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING);
 
     ASSERT_EQ(chip_swimlane_aicpu_complete_task(/*core_id=*/0, 0, 1, 10, 20), 0);
     const int cores[] = {0};

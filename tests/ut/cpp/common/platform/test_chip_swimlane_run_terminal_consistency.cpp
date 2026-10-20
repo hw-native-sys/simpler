@@ -65,7 +65,7 @@ void arm_run(ChipSwimlaneCollector &collector, int num_aicore, uint32_t slot, ui
     set_platform_chip_swimlane_run_terminal_bank(
         reinterpret_cast<uint64_t>(collector.arm_run_terminal_bank(slot, epoch))
     );
-    chip_swimlane_aicpu_init(num_aicore);
+    chip_swimlane_aicpu_init(num_aicore, ChipSwimlaneLevel::SCHEDULE_TIMING);
 }
 
 // The production order at teardown: reconcile captures the live side, then the

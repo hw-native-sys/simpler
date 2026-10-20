@@ -66,7 +66,7 @@ void arm_run(
     set_platform_chip_swimlane_run_terminal_bank(
         reinterpret_cast<uint64_t>(collector.arm_run_terminal_bank(slot, epoch))
     );
-    chip_swimlane_aicpu_init(num_aicore);
+    chip_swimlane_aicpu_init(num_aicore, level);
 }
 
 /**
@@ -148,7 +148,7 @@ TEST(ChipSwimlaneRunTerminalTest, SnapshotSurvivesTheSuccessorsCounterReset) {
         << "the host's arming cleared a predecessor's counters — that write is the race this moved to the device";
 
     set_platform_run_result(/*region_base=*/0, kEpoch + 1);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING);
     ASSERT_EQ(get_perf_buffer_state(shm, 0)->head.total_record_count, 0u)
         << "the producer's init no longer clears the live counters — this test's premise is gone";
 
@@ -570,7 +570,7 @@ TEST(ChipSwimlaneRunTerminalTest, ARunThatFoundNoBankStillCollectsAndIsServedOnT
     set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
     set_platform_chip_swimlane_aicore_rotation_table(0);
     set_platform_chip_swimlane_run_terminal_bank(0);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING);
     for (uint32_t task = 1; task <= 4; task++) {
         ASSERT_EQ(
             chip_swimlane_aicpu_complete_task(
@@ -656,7 +656,7 @@ TEST(ChipSwimlaneRunTerminalTest, NoBankIsArmedWithoutARegionASlotOrAnEpoch) {
     set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
     set_platform_chip_swimlane_aicore_rotation_table(0);
     set_platform_chip_swimlane_run_terminal_bank(0);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING);
     ASSERT_EQ(chip_swimlane_aicpu_complete_task(0, 0, 1, 10, 20), 0);
     const int cores[] = {0};
     chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, /*core_num=*/1);

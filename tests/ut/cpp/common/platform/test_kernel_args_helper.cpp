@@ -14,6 +14,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <utility>
 #include <vector>
 #include <limits>
@@ -153,6 +154,14 @@ extern "C" const char *aclGetRecentErrMsg() { return nullptr; }
 extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *) {
     if (status != nullptr) *status = ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
     return ACL_SUCCESS;
+}
+
+TEST(KernelArgsDefaults, FreshRuntimeStartsWithSwimlaneDisabled) {
+    alignas(Runtime) unsigned char storage[sizeof(Runtime)];
+    std::memset(storage, kDeviceMark, sizeof(storage));
+    auto *fresh = new (storage) Runtime;
+    EXPECT_EQ(fresh->dev.chip_swimlane_level, 0U);
+    fresh->~Runtime();
 }
 
 TEST_F(KernelArgsPublication, PrepareDoesNotPublishAndOwnsAnIndependentSnapshot) {

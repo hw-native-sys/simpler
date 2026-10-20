@@ -182,6 +182,13 @@ public:
         device_run_result_dev_ptrs_[0] = nullptr;
     }
     using DeviceRunnerBase::slot_persistent_args;
+    void prepare_level(Runtime &runtime, int level) {
+        max_block_dim_ = 1;
+        CallConfig config;
+        config.aicpu_thread_num = 2;
+        config.enable_chip_swimlane = level;
+        assert(prepare_launch_shape(runtime, config) == 0);
+    }
     bool timing_armed() const { return device_timing_armed_[0]; }
     void consume_timing() { device_timing_armed_[0] = false; }
     void release_timing() {
@@ -333,6 +340,30 @@ static void check_metadata_publication(int fault, bool drain_fails = false) {
     }
     runner.finish();
     assert(release_slot_persistent_args(slot, allocator) == 0);
+}
+static void check_level_publication(bool entry_route) {
+    next_stream = next_event = submits = copies = 0;
+    fail_at = 0;
+    ProbeRunner runner;
+    runner.initialize();
+    Runtime runtime;
+    auto &slot = runner.slot_persistent_args(0);
+    for (int level : {4, 1, 0, 3, 2}) {
+        runner.prepare_level(runtime, level);
+        assert(runtime.dev.chip_swimlane_level == static_cast<uint32_t>(level));
+        KernelArgsHelper helper;
+        assert(helper.prepare_runtime_args(runtime, runner.allocator(), slot) == 0);
+        runtime.dev.chip_swimlane_level = 99;
+        LaunchProgressSink sink;
+        assert(helper.publish_runtime_args(entry_route, caller, sink) == 0);
+        assert(sink.submitted());
+        uint32_t published;
+        const auto *device = reinterpret_cast<const std::byte *>(slot.runtime_args);
+        std::memcpy(&published, device + offsetof(DeviceRuntimeLaunchDesc, chip_swimlane_level), sizeof(published));
+        assert(published == static_cast<uint32_t>(level));
+    }
+    assert(release_slot_persistent_args(slot, runner.allocator()) == 0);
+    runner.finish();
 }
 static void check_result_prepare_refusal() {
     next_stream = next_event = 0;
@@ -580,6 +611,8 @@ static void check_arena_growth(SimplerExecutionMode mode) {
     assert(live_allocations.size() == before);
 }
 int main() {
+    check_level_publication(false);
+    check_level_publication(true);
     check_result_prepare_refusal();
     for (bool has_caller : {false, true})
         for (int failure_step : {0, 1, 2, 3})

@@ -89,6 +89,14 @@ by **independent layers**:
 | Runtime emission (does it actually emit?) | env (`SIMPLER_DEVICE_STRACE_ENABLE`, log level) | on |
 | Runtime detail tier | `get_chip_swimlane_level()` | SCHEDULE_TIMING |
 
+Swimlane granularity comes from each call's `CallConfig.enable_chip_swimlane`.
+The host snapshots it into the Runtime descriptor, published on the AICPU
+launch stream before either kernel. AICPU initialization receives that value
+explicitly; the shared collector header only records the initial pool level.
+Opening a host collection window does not publish device configuration, and
+changing the detail tier does not clear retained record queues. The binary
+on/off bit still travels through the existing kernel launch arguments.
+
 `SIMPLER_HOST_STRACE` (compile) gates whether `[STRACE]` markers exist at all;
 `SIMPLER_DEVICE_STRACE_ENABLE` (runtime env) independently gates device-domain
 markers. Onboard device-phase capture also requires the `LOG_TIMING` level to

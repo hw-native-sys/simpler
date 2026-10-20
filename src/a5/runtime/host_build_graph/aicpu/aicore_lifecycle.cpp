@@ -100,7 +100,9 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
                   "on-core, so this run's argument dump is unavailable rather than collected"
         );
     }
-    if (chip_swimlane_enabled) chip_swimlane_aicpu_init(core_count_);
+    if (chip_swimlane_enabled) {
+        chip_swimlane_aicpu_init(core_count_, static_cast<ChipSwimlaneLevel>(runtime->dev.chip_swimlane_level));
+    }
     return 0;
 }
 

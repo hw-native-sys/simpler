@@ -180,7 +180,7 @@ TEST(SwimlaneDeviceResetTest, EveryHeadOnTheGridStartsAtZero) {
 
     // Two cores, which is fewer than the grid and fewer than the platform
     // maximum: the device acquisition loop visits only these.
-    chip_swimlane_aicpu_init(/*worker_count=*/2);
+    chip_swimlane_aicpu_init(/*worker_count=*/2, ChipSwimlaneLevel::SCHED_PHASES);
 
     for (int i = 0; i < PLATFORM_MAX_CORES; i++) {
         EXPECT_TRUE(DeviceResetFixture::all_zero(get_perf_buffer_state(fx.shm(), i)->head, "task head"))
@@ -209,23 +209,20 @@ TEST(SwimlaneDeviceResetTest, EveryLevelClearsTheWholeGrid) {
           ChipSwimlaneLevel::ORCH_PHASES}) {
         DeviceResetFixture fx(level);
         fx.dirty_every_head(13);
-        chip_swimlane_aicpu_init(/*worker_count=*/2);
+        chip_swimlane_aicpu_init(/*worker_count=*/2, level);
         EXPECT_TRUE(fx.whole_grid_is_zero()) << " at level " << static_cast<uint32_t>(level);
     }
 }
 
 TEST(SwimlaneDeviceResetTest, ANarrowerRunAtALowerLevelInheritsNothingFromAWiderOne) {
-    // The 4-to-2 transition on one region, and the level has to actually move:
-    // `begin_run` is the production arm path, and `publish_run_config` inside
-    // it is what writes the device's single level word. Changing only the core
-    // count would leave the device latched at the higher level and prove
-    // nothing about a run that collects less than the one before it.
+    // Each producer latches its invocation's level; host admission does not
+    // change the shared header while a predecessor still uses the pools.
     DeviceResetFixture fx(ChipSwimlaneLevel::ORCH_PHASES, /*num_aicore=*/4, /*aicpu_thread_num=*/2);
     ChipSwimlaneDataHeader *header = get_chip_swimlane_header(fx.shm());
 
     fx.collector.begin_run(/*output_prefix=*/"", ChipSwimlaneLevel::ORCH_PHASES);
     ASSERT_EQ(header->chip_swimlane_level, static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES));
-    chip_swimlane_aicpu_init(/*worker_count=*/4);
+    chip_swimlane_aicpu_init(/*worker_count=*/4, ChipSwimlaneLevel::ORCH_PHASES);
 
     // What the wide, high-level run leaves behind: dirty heads on every core
     // and both phase pools, and a buffer each core still owns.
@@ -236,16 +233,40 @@ TEST(SwimlaneDeviceResetTest, ANarrowerRunAtALowerLevelInheritsNothingFromAWider
     fx.dirty_every_head(17);
 
     fx.collector.begin_run(/*output_prefix=*/"", ChipSwimlaneLevel::SCHEDULE_TIMING);
-    ASSERT_EQ(header->chip_swimlane_level, static_cast<uint32_t>(ChipSwimlaneLevel::SCHEDULE_TIMING))
-        << "the device's level word did not follow the run that armed it";
-
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    ASSERT_EQ(header->chip_swimlane_level, static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES));
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::SCHEDULE_TIMING);
+    ASSERT_EQ(get_chip_swimlane_level(), ChipSwimlaneLevel::SCHEDULE_TIMING);
 
     EXPECT_TRUE(fx.whole_grid_is_zero()) << " after narrowing from four cores at level 4 to one at level 2";
     for (int i = 0; i < PLATFORM_MAX_CORES; i++) {
         EXPECT_EQ(get_perf_buffer_state(fx.shm(), i)->head.current_buf_ptr, owned[i])
             << "the transition stranded or replaced a buffer core " << i << " still owned";
     }
+}
+
+TEST(SwimlaneDeviceResetTest, DeviceLatchesTheInvocationLevelInsteadOfTheHeader) {
+    DeviceResetFixture fx(ChipSwimlaneLevel::ORCH_PHASES);
+    for (const auto level :
+         {ChipSwimlaneLevel::TASK_TIMING, ChipSwimlaneLevel::SCHEDULE_TIMING, ChipSwimlaneLevel::SCHED_PHASES,
+          ChipSwimlaneLevel::ORCH_PHASES}) {
+        SCOPED_TRACE(static_cast<uint32_t>(level));
+        set_chip_swimlane_enabled(true);
+        chip_swimlane_aicpu_init(1, level);
+        EXPECT_EQ(get_chip_swimlane_level(), level);
+        EXPECT_EQ(
+            get_chip_swimlane_header(fx.shm())->chip_swimlane_level,
+            static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES)
+        );
+    }
+    set_chip_swimlane_enabled(false);
+    EXPECT_EQ(get_chip_swimlane_level(), ChipSwimlaneLevel::DISABLED);
+}
+
+TEST(SwimlaneDeviceResetTest, ArmingASuccessorDoesNotPublishItsDeviceLevel) {
+    DeviceResetFixture fx(ChipSwimlaneLevel::ORCH_PHASES);
+    auto *header = get_chip_swimlane_header(fx.shm());
+    fx.collector.begin_run("successor", ChipSwimlaneLevel::TASK_TIMING);
+    EXPECT_EQ(header->chip_swimlane_level, static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES));
 }
 
 TEST(SwimlaneDeviceResetTest, AHeadWithNoFreeBufferIsStillCleared) {
@@ -262,7 +283,7 @@ TEST(SwimlaneDeviceResetTest, AHeadWithNoFreeBufferIsStillCleared) {
     aicore->head.current_buf_ptr = 0;
     aicore->free_queue.head = aicore->free_queue.tail;
 
-    chip_swimlane_aicpu_init(/*worker_count=*/2);
+    chip_swimlane_aicpu_init(/*worker_count=*/2, ChipSwimlaneLevel::SCHED_PHASES);
 
     EXPECT_TRUE(DeviceResetFixture::all_zero(task->head, "dry task head"));
     EXPECT_TRUE(DeviceResetFixture::all_zero(aicore->head, "dry aicore head"));
@@ -270,7 +291,7 @@ TEST(SwimlaneDeviceResetTest, AHeadWithNoFreeBufferIsStillCleared) {
 
 TEST(SwimlaneDeviceResetTest, RetainedBufferOwnershipSurvivesTheReset) {
     DeviceResetFixture fx;
-    chip_swimlane_aicpu_init(/*worker_count=*/2);
+    chip_swimlane_aicpu_init(/*worker_count=*/2, ChipSwimlaneLevel::SCHED_PHASES);
 
     // What a run that could not hand its buffer over leaves behind: a head
     // still naming it, which only a successful enqueue ever releases.
@@ -280,7 +301,7 @@ TEST(SwimlaneDeviceResetTest, RetainedBufferOwnershipSurvivesTheReset) {
     const uint32_t free_head = task->free_queue.head;
     DeviceResetFixture::dirty(task->head, 5);
 
-    chip_swimlane_aicpu_init(/*worker_count=*/2);
+    chip_swimlane_aicpu_init(/*worker_count=*/2, ChipSwimlaneLevel::SCHED_PHASES);
 
     EXPECT_EQ(task->head.current_buf_ptr, retained_ptr) << "the reset must not strand a retained buffer";
     EXPECT_EQ(task->free_queue.head, free_head) << "a retained buffer is reused in place, not replaced";

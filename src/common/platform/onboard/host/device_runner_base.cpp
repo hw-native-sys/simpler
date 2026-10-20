@@ -3534,6 +3534,7 @@ int DeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig &c
 
     runtime.set_worker_count(num_aicore);
     runtime.set_aicpu_thread_num(config.aicpu_thread_num);
+    runtime.dev.chip_swimlane_level = static_cast<uint32_t>(config.enable_chip_swimlane);
 
     // First `block_dim` cores are AIC; remaining ~2/3 are AIV. The rule is host
     // state: every consumer of it runs on the host and needs it before any core
@@ -4479,7 +4480,7 @@ int DeviceRunnerBase::start_shared_collectors_for_run(
 
     // Open each enabled collector's window and start its mgmt + poll threads
     // now, just before kernels launch. Both halves belong here: begin_run()
-    // drops the previous run's records and republishes the device level, which
+    // drops the previous run's host records on the non-retained path, which
     // is only safe while this run holds the execution claim, and starting
     // earlier wastes CPU on empty queues and risks tripping ProfilerBase's
     // poll-loop idle-timeout if device-side init is slow.

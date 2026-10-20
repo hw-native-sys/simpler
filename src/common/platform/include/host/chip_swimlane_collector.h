@@ -480,13 +480,9 @@ public:
      * @param device_id                Device ID (forwarded to register_cb)
      * @param chip_swimlane_level   Collection granularity (DISABLED / TASK_TIMING
      *                                 / SCHEDULE_TIMING / SCHED_PHASES / ORCH_PHASES).
-     *                                 Written into
-     *                                 `ChipSwimlaneDataHeader::chip_swimlane_level`
-     *                                 so AICPU can promote it in
-     *                                 `chip_swimlane_aicpu_init`, AND cached on the
-     *                                 collector so `export_swimlane_json()`
-     *                                 can gate phase sections and stamp the
-     *                                 JSON `version`.
+     *                                 Sets the initial pool layout and the collector's
+     *                                 export level. The device consumes its own
+     *                                 invocation's Runtime descriptor level.
      * @param alloc_cb                 Device memory allocation callback
      * @param register_cb              Memory registration callback (nullptr for
      *                                 simulation and non-SVM platforms)
@@ -518,20 +514,10 @@ public:
     );
 
     /**
-     * Start a run's collection window: bind its artifact configuration, drop the
-     * previous run's records, counters, and runtime extensions, and — once the
-     * region exists — republish the level the device reads.
-     *
-     * The collector initializes once and serves every run, so this is the only
-     * point at which a run's records, counters and device level are established;
-     * initialize() establishes none of them. Skip it and this run's artifact
-     * carries the records every earlier run collected, reconcile compares an
-     * accumulated collected count against one run's device total, and the device
-     * stays on whichever level the first run asked for.
-     *
-     * Before the first initialize() there is no region and no shard storage yet;
-     * reset_collector_shards() is then a no-op over empty extents and
-     * publish_run_config() has no header to write.
+     * Open a host collection window: clear previous export records, counters
+     * and receipts, and bind this run's output prefix and level. Device level
+     * selection belongs to the invocation descriptor; this operation writes no
+     * device configuration or producer counters.
      */
     void begin_run(const std::string &output_prefix, ChipSwimlaneLevel chip_swimlane_level) {
         output_prefix_ = output_prefix;
@@ -547,7 +533,7 @@ public:
         handoff_report_ = HandoffReport{};
         transport_retired_buffers_ = 0;
         reset_collector_shards();
-        publish_run_config();
+        validate_run_pool();
     }
 
     /**
@@ -753,9 +739,9 @@ public:
      */
     void read_phase_header_metadata();
 
-    // Push the run's level into the device-visible header. A no-op before the
-    // region exists, and a single narrow field write once it does.
-    void publish_run_config();
+    // Check that the requested level has a device orch pool, without changing
+    // shared configuration or producer-owned state.
+    void validate_run_pool();
 
     /**
      * Sum per-core / per-thread total_record_count and dropped_record_count
@@ -2248,10 +2234,9 @@ private:
      * Give the device orch-phase pool its buffers when this run's level needs
      * them and no earlier run built them.
      *
-     * The pool's existence is the one thing initialize() derives from the level,
-     * and the level is the one part of a run's configuration that begin_run()
-     * re-publishes every run. Since initialize() returns early while the region
-     * is held, a run that escalates past ORCH_PHASES would otherwise publish a
+     * The pool's existence is the one thing initialize() derives from the level.
+     * Since initialize() returns early while the region is held, an invocation
+     * that escalates to ORCH_PHASES would otherwise publish a
      * level the pool cannot serve and the device would emit nothing — no error,
      * no reconcile gap, just an empty orch section.
      *

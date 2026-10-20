@@ -77,8 +77,8 @@
 // naturally — e.g. `if (level >= SCHED_PHASES)` means "this section runs when
 // scheduler phase records are being collected (or any higher tier)".
 //
-// Transported via `ChipSwimlaneDataHeader::chip_swimlane_level` (host → AICPU,
-// shared memory) and `CallConfig::enable_chip_swimlane` (Python → C). The wire
+// Transported via the per-invocation Runtime descriptor (host → AICPU)
+// and `CallConfig::enable_chip_swimlane` (Python → C). The wire
 // representation stays integer (uint32_t / int32_t) for ABI stability; this
 // enum is the canonical in-code type used for comparisons.
 // =============================================================================
@@ -331,9 +331,7 @@ struct ChipSwimlaneActiveHead {
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(ChipSwimlaneActiveHead) == 64, "ChipSwimlaneActiveHead must be one cache line");
-// `publish_run_config` resets the cumulative counters with one narrow write
-// over this contiguous span, so a gap here would leave a counter carrying the
-// previous run's value into the next one.
+// Cumulative record accounting occupies bytes [12, 32) of the producer head.
 static_assert(offsetof(ChipSwimlaneActiveHead, total_record_count) == 12, "cumulative counter span drift");
 static_assert(offsetof(ChipSwimlaneActiveHead, published_buffer_count) == 28, "cumulative counter span drift");
 
@@ -359,9 +357,9 @@ inline void chip_swimlane_add_saturating(volatile uint32_t &counter, uint32_t n)
 /**
  * One producer's final record accounting for one run, retained past that run.
  *
- * `publish_run_config` zeroes every pool head at each `begin_run`, so a run's
- * totals do not survive its successor. A producer copies its settled counters
- * here at its last flush; the entry stays readable until its bank is reused.
+ * `chip_swimlane_aicpu_init` zeroes pool-head counters before producers start
+ * each invocation. A producer copies its settled counters here at its last
+ * flush; the entry stays readable until its bank is reused.
  *
  * `run_epoch` is the run identity the producer was executing under. Zero means
  * "no snapshot": it is the initialized state, and it is not a value a live run
@@ -633,9 +631,7 @@ struct ChipSwimlaneDataHeader {
 
     // Metadata (Host initializes, Device read-only)
     uint32_t num_cores;            // Actual number of cores launched
-    uint32_t chip_swimlane_level;  // 0=off, 1=AICore timing, 2=+Scheduler task timing,
-                                   // 3=+sched phases, 4=+orch phases. Host writes
-                                   // at init; AICPU reads in chip_swimlane_aicpu_init.
+    uint32_t chip_swimlane_level;  // Initial pool level; per-run level is in the Runtime descriptor.
 
     // Phase profiling metadata (AICPU writes in chip_swimlane_aicpu_init_phase;
     // Host reads at drain time). Both counts == 0 means phase profiling was not

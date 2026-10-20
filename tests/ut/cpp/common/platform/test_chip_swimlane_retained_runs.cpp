@@ -240,7 +240,7 @@ struct RetainedRunsFixture {
         set_platform_chip_swimlane_run_terminal_bank(
             reinterpret_cast<uint64_t>(collector.arm_run_terminal_bank(static_cast<uint32_t>(bank), epoch))
         );
-        chip_swimlane_aicpu_init(num_aicore);
+        chip_swimlane_aicpu_init(num_aicore, level);
     }
 
     /** Dispatch AICore records on `core_id`, writing each slot the host keeps. */
@@ -1099,7 +1099,7 @@ TEST(ChipSwimlaneRetainedRunsTest, RetentionOffKeepsTheLegacyArtifactExactly) {
     set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(collector.get_chip_swimlane_setup_device_ptr()));
     set_platform_chip_swimlane_aicore_rotation_table(0);
     set_platform_chip_swimlane_run_terminal_bank(reinterpret_cast<uint64_t>(collector.arm_run_terminal_bank(0, 9801)));
-    chip_swimlane_aicpu_init(1);
+    chip_swimlane_aicpu_init(1, ChipSwimlaneLevel::TASK_TIMING);
     chip_swimlane_aicpu_on_aicore_dispatch(0, 0, 1);
     auto *ac_state = get_aicore_buffer_state(collector.get_chip_swimlane_setup_device_ptr(), 0);
     auto *buf = reinterpret_cast<ChipSwimlaneAicoreTaskBuffer *>(ac_state->head.current_buf_ptr);
@@ -1306,7 +1306,7 @@ TEST(ChipSwimlaneRetainedRunsTest, ControlHandshakeWakesAnIdleCollectorWithoutIt
         set_platform_chip_swimlane_run_terminal_bank(
             reinterpret_cast<uint64_t>(fx.collector.arm_run_terminal_bank(/*bank_index=*/0, epoch))
         );
-        chip_swimlane_aicpu_init(fx.num_aicore);
+        chip_swimlane_aicpu_init(fx.num_aicore, ChipSwimlaneLevel::TASK_TIMING);
         fx.close(epoch, cores, 1);
         // Published before the next admission, so no `run_begin` below is
         // refused for capacity and the measurement stays about the handshake.
@@ -1966,7 +1966,7 @@ TEST(ChipSwimlaneRetainedRunsTest, AnArtifactNamesTheSubmissionThatProducedIt) {
     set_platform_chip_swimlane_run_terminal_bank(
         reinterpret_cast<uint64_t>(fx.collector.arm_run_terminal_bank(/*bank_index=*/0, kEpoch))
     );
-    chip_swimlane_aicpu_init(fx.num_aicore);
+    chip_swimlane_aicpu_init(fx.num_aicore, fx.level);
     fx.dispatch(/*core_id=*/0, 1);
     fx.close(kEpoch, cores, 1);
     ASSERT_TRUE(fx.wait_for_files(1));

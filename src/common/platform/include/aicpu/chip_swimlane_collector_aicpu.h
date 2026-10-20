@@ -37,8 +37,8 @@
  *     at kernel entry; queried via `is_chip_swimlane_enabled()`. Each call
  *     invalidates the preceding launch's cached level and phase writers,
  *     including when profiling is disabled and init will not run.
- *   - granular ChipSwimlaneLevel — `ChipSwimlaneDataHeader::chip_swimlane_level`
- *     (shared memory); read in `chip_swimlane_aicpu_init` and cached, then queried
+ *   - granular ChipSwimlaneLevel — this invocation's Runtime descriptor;
+ *     passed to `chip_swimlane_aicpu_init` and cached, then queried
  *     via `get_chip_swimlane_level()` for
  *     `>= SCHEDULE_TIMING / SCHED_PHASES / ORCH_PHASES` gates.
  */
@@ -65,8 +65,8 @@ extern "C" bool is_chip_swimlane_enabled();
 extern "C" void set_platform_chip_swimlane_aicore_rotation_table(uint64_t table_addr);
 extern "C" uint64_t get_platform_chip_swimlane_aicore_rotation_table();
 
-// Typed getter for the granular perf_level (promoted from the shared-memory
-// header inside chip_swimlane_aicpu_init). Gate sites should use this so the
+// Typed getter for the invocation level latched by chip_swimlane_aicpu_init.
+// Gate sites use this so the
 // comparison RHS is a named ChipSwimlaneLevel constant.
 ChipSwimlaneLevel get_chip_swimlane_level();
 
@@ -81,8 +81,9 @@ ChipSwimlaneLevel get_chip_swimlane_level();
  * address into the ChipSwimlaneActiveHead channel that AICore polls per task.
  *
  * @param worker_count  Number of AICore workers (cores) to initialize
+ * @param level         Granularity from this invocation's published descriptor
  */
-void chip_swimlane_aicpu_init(int worker_count);
+void chip_swimlane_aicpu_init(int worker_count, ChipSwimlaneLevel level);
 
 /**
  * Pre-dispatch hook for AICore buffer rotation and per-pool stats.

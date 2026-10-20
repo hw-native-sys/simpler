@@ -323,7 +323,9 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     uint64_t graph_section_base;
     uint32_t graph_section_bytes;
     uint32_t graph_section_source;
-    uint32_t graph_section_reserved[12];
+    // Per-invocation granularity travels in every descriptor publication.
+    uint32_t chip_swimlane_level;
+    uint32_t graph_section_reserved[11];
 
     // Size of the shipped shared-memory image, argument pools included. Set by the
     // host before the image is copied; the AICPU cannot recompute it because the pool

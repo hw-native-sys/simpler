@@ -102,8 +102,8 @@ static int s_orch_thread_idx = -1;
 // perf code can discover enablement + device-base without reading the generic
 // Runtime struct. Two channels (mirrors PMU):
 //   - g_enable_chip_swimlane (bool) — set at kernel entry from the bitmask bit
-//   - g_chip_swimlane_level (ChipSwimlaneLevel) — promoted in
-//     chip_swimlane_aicpu_init from the shared-memory header so
+//   - g_chip_swimlane_level (ChipSwimlaneLevel) — latched by
+//     chip_swimlane_aicpu_init from this invocation's descriptor so
 //     `>= SCHEDULE_TIMING / SCHED_PHASES / ORCH_PHASES` gates have the granular
 //     value (exposed via get_chip_swimlane_level()).
 static uint64_t g_platform_chip_swimlane_base = 0;
@@ -357,7 +357,7 @@ try_pop_records_buffer(int core_id, ChipSwimlaneAicpuTaskPool *state, uint32_t n
     );
 }
 
-void chip_swimlane_aicpu_init(int worker_count) {
+void chip_swimlane_aicpu_init(int worker_count, ChipSwimlaneLevel level) {
     // Each profiled launch starts counting AICore dispatches from 0 so the rotation boundary check
     // (count % BUFFER_SIZE == 0) lands on the right dispatches. Stale values
     // from a prior launch would skip the first rotation (count already past a
@@ -426,10 +426,9 @@ void chip_swimlane_aicpu_init(int worker_count) {
     s_chip_swimlane_header->handoff_schema = kChipSwimlaneHandoffSchema;
     wmb();
 
-    // Read the granular perf_level from the shared-memory header (host wrote
-    // it in ChipSwimlaneCollector::initialize). The kernel-entry setter only seeded
-    // the binary g_enable_chip_swimlane via the bitmask bit.
-    g_chip_swimlane_level = static_cast<ChipSwimlaneLevel>(s_chip_swimlane_header->chip_swimlane_level);
+    // The caller supplies this invocation's published descriptor value. The
+    // shared collector header is not a per-run configuration carrier.
+    g_chip_swimlane_level = level;
 
     LOG_INFO(
         "Initializing performance profiling for %d cores (free queue), chip_swimlane_level=%u", worker_count,

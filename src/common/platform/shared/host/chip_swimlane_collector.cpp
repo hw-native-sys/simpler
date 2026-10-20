@@ -198,7 +198,7 @@ int ChipSwimlaneCollector::initialize(
     if (shm_host_ != nullptr) {
         // Already holding this run's device resources. They are not per-run,
         // with one exception: the level decides whether a device orch-phase
-        // pool exists, and begin_run() re-publishes the level every run, so a
+        // pool exists, and each invocation carries its own level, so a
         // run may ask for a level the pools were not built for.
         return ensure_device_orch_pool(chip_swimlane_level);
     }
@@ -2191,20 +2191,9 @@ ChipSwimlaneCollector::build_handoff_report(const RunTerminalSnapshot &snapshot,
     return report;
 }
 
-void ChipSwimlaneCollector::publish_run_config() {
-    // Nothing to publish before the region exists; initialize() writes the level
-    // from the member begin_run() just set.
+void ChipSwimlaneCollector::validate_run_pool() {
+    // Pool validation is meaningful only after initialization.
     if (shm_host_ == nullptr) return;
-
-    ChipSwimlaneDataHeader *header = get_chip_swimlane_header(shm_host_);
-    header->chip_swimlane_level = static_cast<uint32_t>(chip_swimlane_level_);
-    wmb();
-    // One field, not the region: a bulk write-back would race the AICPU's own
-    // header fields (phase thread counts, core_to_thread) — see
-    // buffer_pool_manager.h's note on narrow write_range_to_device calls. On SVM
-    // platforms copy_to_device is null and this is a no-op, because the store
-    // above already landed in device-visible memory.
-    publish_field(&header->chip_swimlane_level, sizeof(header->chip_swimlane_level), "chip_swimlane_level");
 
     // A level the device orch pool cannot serve produces an empty orch section
     // and nothing else: the run completes, no buffer is lost, and reconcile
@@ -2214,7 +2203,7 @@ void ChipSwimlaneCollector::publish_run_config() {
     if (chip_swimlane_level_ >= ChipSwimlaneLevel::ORCH_PHASES && !host_orchestrated_ &&
         get_orch_phase_buffer_state(shm_host_, 0)->free_queue.tail == 0) {
         LOG_ERROR(
-            "ChipSwimlane: published level %d with no device orch-phase pool; the device will emit no orchestrator "
+            "ChipSwimlane: requested level %d with no device orch-phase pool; the device will emit no orchestrator "
             "phases this run",
             static_cast<int>(chip_swimlane_level_)
         );
@@ -3672,8 +3661,7 @@ bool ChipSwimlaneCollector::run_begin(
         host_phase_dropped_records_ = 0;
         host_state_incomplete_ = false;
     }
-    // Per-run device counter reset, unchanged from the legacy path.
-    publish_run_config();
+    validate_run_pool();
     // Every shard must see this epoch before the device can publish into it,
     // or its first buffers would be classified as belonging to no bucket.
     bump_control_view();

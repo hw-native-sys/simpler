@@ -61,7 +61,7 @@ void arm_run(ChipSwimlaneCollector &collector, int num_aicore, uint32_t slot, ui
     set_platform_chip_swimlane_run_terminal_bank(
         reinterpret_cast<uint64_t>(collector.arm_run_terminal_bank(slot, epoch))
     );
-    chip_swimlane_aicpu_init(num_aicore);
+    chip_swimlane_aicpu_init(num_aicore, ChipSwimlaneLevel::TASK_TIMING);
 }
 
 // Dispatch `records` AICore tasks on `core_id` and fill the active buffer's
@@ -427,7 +427,7 @@ TEST(ChipSwimlaneAicoreAccountingTest, FailedArmDoesNotLeaveThePriorIdentityCurr
     set_platform_chip_swimlane_base(reinterpret_cast<uint64_t>(shm));
     set_platform_chip_swimlane_aicore_rotation_table(0);
     set_platform_chip_swimlane_run_terminal_bank(0);
-    chip_swimlane_aicpu_init(/*worker_count=*/1);
+    chip_swimlane_aicpu_init(/*worker_count=*/1, ChipSwimlaneLevel::TASK_TIMING);
     dispatch_aicore(collector, /*core_id=*/0, /*records=*/2, /*unwritten=*/0);
     chip_swimlane_aicpu_flush(/*thread_idx=*/0, cores, /*core_num=*/1);
     const uint32_t tail_before = 0;

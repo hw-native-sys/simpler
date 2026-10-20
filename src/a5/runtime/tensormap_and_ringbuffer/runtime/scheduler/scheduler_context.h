@@ -185,7 +185,7 @@ private:
 #if SIMPLER_DFX
     SchedChipSwimlaneCounters sched_chip_swimlane_[MAX_AICPU_THREADS];
     // Cached once at init() from get_chip_swimlane_level(), AFTER
-    // chip_swimlane_aicpu_init has promoted the level from the shared-memory header.
+    // chip_swimlane_aicpu_init has latched this invocation's descriptor level.
     ChipSwimlaneLevel chip_swimlane_level_{ChipSwimlaneLevel::DISABLED};
 #endif
 

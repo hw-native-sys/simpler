@@ -239,6 +239,9 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     uint32_t entry_scalar_count_;
     uint32_t entry_args_source_;  // EntryArgsSource
 
+    // Per-invocation granularity travels in every descriptor publication.
+    uint32_t chip_swimlane_level;
+
     // Entry args, adopted on the host. Last of the uploaded fields, because it
     // is the only one whose useful length is a property of the run: a
     // steady-state publication stops after `tensor_count_` of its

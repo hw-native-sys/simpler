@@ -31,6 +31,7 @@ Runtime::Runtime() {
     // Initialize the device-copied descriptor (`dev`).
     memset(dev.workers, 0, sizeof(dev.workers));
     dev.worker_count = 0;
+    dev.chip_swimlane_level = 0;
     dev.aicpu_thread_num = 1;
     memset(dev.aicpu_allowed_cpus, 0, sizeof(dev.aicpu_allowed_cpus));
     dev.aicpu_allowed_cpu_count = 0;

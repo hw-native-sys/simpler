@@ -1637,6 +1637,9 @@ protected:
         });
         init_runtime(first.runtime);
         init_runtime(second.runtime);
+        // Production prepare_launch_shape fills these before binding.
+        first.runtime.dev.chip_swimlane_level = static_cast<uint32_t>(before.enable_chip_swimlane);
+        second.runtime.dev.chip_swimlane_level = static_cast<uint32_t>(after.enable_chip_swimlane);
         install_callable_tables(first.runtime);
         second.runtime.set_callable_tables(
             object_table_, reinterpret_cast<uint64_t>(object_table_), reinterpret_cast<uint64_t>(entry_table_), 1
@@ -1725,6 +1728,27 @@ TEST_F(HbgResidentSchedulerStorageTest, ASameSizedRunReusesItsSlotStorageAndAllo
     EXPECT_EQ(slot(0).grows, 1) << "a same-sized run allocates nothing";
     EXPECT_EQ(slot(0).device, device);
     EXPECT_EQ(published_scheduler_target(runtime), target);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, PhaseStorageUsesThisInvocationRatherThanTheRunnerLevel) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    install_callable_tables(runtime);
+    eps_ = {ordinary_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    ASSERT_EQ(api_.chip_swimlane_level(), 0U);
+    runtime.dev.chip_swimlane_level = 0;
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    ASSERT_FALSE(runtime.pending_publication().prerequisites.empty());
+    const size_t plain_bytes = runtime.pending_publication().prerequisites.front().bytes;
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+
+    runtime.dev.chip_swimlane_level = static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES);
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    ASSERT_FALSE(runtime.pending_publication().prerequisites.empty());
+    EXPECT_GT(runtime.pending_publication().prerequisites.front().bytes, plain_bytes);
+    EXPECT_EQ(api_.chip_swimlane_level(), 0U) << "the runner still describes the predecessor";
 }
 
 // A wider graph needs more state than the slot retained, so the slot replaces

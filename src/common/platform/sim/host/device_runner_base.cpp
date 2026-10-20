@@ -467,6 +467,7 @@ int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig
     runtime.set_worker_count(num_aicore);
     worker_count_ = num_aicore;
     runtime.set_aicpu_thread_num(config.aicpu_thread_num);
+    runtime.dev.chip_swimlane_level = static_cast<uint32_t>(config.enable_chip_swimlane);
 
     // First `block_dim` cores are AIC; remaining ~2/3 are AIV. The rule is host
     // state read by the sim's per-core thread start and by the DFX collector.
@@ -1144,8 +1145,8 @@ int SimDeviceRunnerBase::start_shared_collectors_for_run(
         }
     } rollback{this, dfx, run_epoch, &admitted_all};
 
-    // Opening a resident collector's window drops the previous run's records and
-    // republishes the device level, so it belongs with the start, at launch.
+    // Opening a non-retained window drops the previous run's host records,
+    // so it belongs with the collector start at launch.
     auto thread_factory = [this](std::function<void()> fn) {
         return create_thread(std::move(fn));
     };

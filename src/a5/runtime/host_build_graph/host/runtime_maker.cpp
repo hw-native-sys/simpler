@@ -521,7 +521,7 @@ void append_scheduler_record(
 }
 
 bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
-    const uint32_t level = api->chip_swimlane_level();
+    const uint32_t level = runtime->dev.chip_swimlane_level;
     if (level == 0) return true;
 
     SchedulerStateOwner owner{};
@@ -1305,7 +1305,7 @@ bool create_scheduler_state(
     AicoreSchedulerLayout layout{};
     if (!scheduler_plan_layout(
             static_cast<uint64_t>(total_tasks), aic_task_count, aiv_task_count, &layout,
-            api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
+            runtime->dev.chip_swimlane_level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
             executable_subtask_count, api->pmu_enabled()
         ) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) {
@@ -1362,7 +1362,7 @@ bool create_scheduler_state(
     run_control->aiv_task_count = aiv_task_count;
     run_control->aic_worker_demand = aic_worker_demand;
     run_control->aiv_worker_demand = aiv_worker_demand;
-    run_control->chip_swimlane_level = api->chip_swimlane_level();
+    run_control->chip_swimlane_level = runtime->dev.chip_swimlane_level;
     run_control->sampled_task_timing_enabled = sampled_task_timing_enabled ? 1 : 0;
     run_control->dispatch_payloads_offset = layout.dispatch_payloads_offset;
     run_control->task_metadata_offset = layout.task_metadata_offset;

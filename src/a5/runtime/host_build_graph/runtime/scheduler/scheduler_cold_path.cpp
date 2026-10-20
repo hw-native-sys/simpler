@@ -863,16 +863,16 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
     regs_ = regs_base;
 
 #if SIMPLER_DFX
-    // chip_swimlane_aicpu_init promotes g_chip_swimlane_level from the shared-memory
-    // header — must be called BEFORE caching the level, otherwise the cached
-    // value would still be 0 (only the binary enable bit has been seeded by
-    // kernel.cpp at this point). Reset the cached level on disabled runs so a
-    // prior enabled launch's level can't leak into the phase-record gates in
+    // chip_swimlane_aicpu_init latches this run's descriptor level — must be called BEFORE caching the level, otherwise
+    // the cached value would still be 0 (only the binary enable bit has been seeded by kernel.cpp at this point). Reset
+    // the cached level on disabled runs so a prior enabled launch's level can't leak into the phase-record gates in
     // scheduler_dispatch. This runs on the leader before it publishes
     // hs_setup_done_, so it happens-before every thread's handshake_partition
     // and therefore before any register window is opened.
     if (is_chip_swimlane_enabled()) {
-        chip_swimlane_aicpu_init(runtime->dev.worker_count);
+        chip_swimlane_aicpu_init(
+            runtime->dev.worker_count, static_cast<ChipSwimlaneLevel>(runtime->dev.chip_swimlane_level)
+        );
         chip_swimlane_level_ = get_chip_swimlane_level();
         if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
             // Sched-phase pool count must match the dump_args_init thread count

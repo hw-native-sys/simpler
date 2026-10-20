@@ -2489,12 +2489,10 @@ protected:
      * their mgmt + poll threads. Each block is gated on `dfx`, this run's own
      * configuration, not on the runner's members.
      *
-     * The collectors are resident and serve every run, so opening the window is
-     * destructive: it drops the previous run's records and counters and
-     * republishes the level the device reads. That is why it happens here, at
-     * launch, rather than during preparation — this is the first point the run
-     * holds the execution claim, so it is the first point at which no other run
-     * is executing against those collectors.
+     * Non-retained windows clear previous host records and counters at launch,
+     * under the execution claim. Retained admission keeps predecessor records
+     * in their own buckets. Swimlane device level comes from this invocation's
+     * descriptor; other collectors retain their own publication protocols.
      *
      * Each spawned thread is bound to `device_id_` via `create_thread`.
      *
