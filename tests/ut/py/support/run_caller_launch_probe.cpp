@@ -20,6 +20,7 @@
 #include "common/support/native_run_execution_peer.h"
 #include "device_runner.h"
 #include "common/host_span.h"
+#include "common/device_phase.h"
 
 static int tokens[64], next_stream, next_event;
 static int fail_at, submits, syncs, copies;
@@ -27,6 +28,10 @@ static int allocation_attempts, fail_allocation;
 static std::unordered_map<void *, size_t> live_allocations;
 static bool capture;
 static int metadata_extensions, sync_error;
+static void *timing_target;
+static const void *timing_source;
+static size_t timing_bytes;
+bool device_phase_capture_enabled() { return true; }
 extern "C" const char *get_platform();
 extern "C" bool publish_runtime_chip_swimlane_extensions(Runtime *) noexcept {
     ++metadata_extensions;
@@ -73,6 +78,11 @@ extern "C" rtError_t rtMemcpy(void *dst, uint64_t, const void *src, uint64_t byt
 extern "C" rtError_t
 rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream) {
     const int rc = step("publish", stream);
+    if (rc == 0 && dst == timing_target) {
+        timing_source = src;
+        timing_bytes = bytes;
+        return 0;
+    }
     return rc == 0 ? rtMemcpy(dst, capacity, src, bytes, kind) : rc;
 }
 extern "C" rtError_t rtStreamCreate(rtStream_t *out, int32_t) {
@@ -154,6 +164,15 @@ public:
         };
         assert(kernel_execution_state().initialize(0, ops) == 0);
     }
+    using DeviceRunnerBase::ensure_device_wall_buffer;
+    using DeviceRunnerBase::slot_persistent_args;
+    bool timing_armed() const { return device_timing_armed_[0]; }
+    void consume_timing() { device_timing_armed_[0] = false; }
+    void release_timing() {
+        free_tensor(device_wall_dev_ptrs_[0]);
+        device_wall_dev_ptrs_[0] = nullptr;
+    }
+    MemoryAllocator &allocator() { return mem_alloc_; }
     void check_failed_event_close() {
         Runtime runtime;
         runtime.dev = {};
@@ -299,6 +318,92 @@ static void check_metadata_publication(int fault, bool drain_fails = false) {
     runner.finish();
     assert(release_slot_persistent_args(slot, allocator) == 0);
 }
+static void check_timing_prepare_refusal() {
+    next_stream = next_event = 0;
+    ProbeRunner runner;
+    runner.initialize();
+    Runtime runtime;
+    const NativeRunIdentity id{1, 1, 1, 0};
+    DeviceRunnerBase::PreparedExecution prepared(id, runtime, CallConfig{}, 0);
+    fail_allocation = allocation_attempts + 1;
+    assert(runner.ensure_device_wall_buffer(0, prepared.kernel_args) == 0);
+    assert(prepared.kernel_args.args.device_wall_data_base == 0);
+    assert(runner.slot_persistent_args(0).staged_launch_metadata.size() == 0);
+    fail_allocation = 0;
+    prepared.resources_owned = true;
+    assert(runner.ensure_device_wall_buffer(0, prepared.kernel_args) == 0);
+    const size_t reset_bytes = runner.slot_persistent_args(0).staged_launch_metadata.size();
+    assert(reset_bytes != 0 && !runner.timing_armed());
+    runner.abandon_prepared_execution(prepared);
+    assert(runner.slot_persistent_args(0).staged_launch_metadata.size() == 0);
+    assert(!runner.timing_armed());
+    prepared.resources_owned = true;
+    assert(runner.ensure_device_wall_buffer(0, prepared.kernel_args) == 0);
+    assert(runner.slot_persistent_args(0).staged_launch_metadata.size() == reset_bytes);
+    runner.abandon_prepared_execution(prepared);
+    runner.release_timing();
+    runner.finish();
+}
+static void check_timing_publication(int fault) {
+    fail_at = fault;
+    capture = false;
+    next_stream = next_event = submits = syncs = copies = 0;
+    trace.clear();
+    stream_trace.clear();
+    event_trace.clear();
+    timing_source = nullptr;
+    ProbeRunner runner;
+    runner.initialize();
+    Runtime runtime;
+    runtime.dev = {};
+    const NativeRunIdentity id{1, 1, 1, 0};
+    auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
+    prepared->caller_stream = caller;
+    auto &slot = runner.slot_persistent_args(0);
+    uint64_t scheduler_target = 0, scheduler_source = 37;
+    const HostMetadataRegion region{&scheduler_target, &scheduler_source, sizeof(scheduler_source)};
+    assert(slot.staged_launch_metadata.prepare(&region, 1) == 0);
+    assert(runner.ensure_device_wall_buffer(0, prepared->kernel_args) == 0);
+    timing_target = reinterpret_cast<void *>(prepared->kernel_args.args.device_wall_data_base);
+    assert(timing_target != nullptr);
+    constexpr int threads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+    constexpr size_t bytes = device_phase_buffer_bytes(threads);
+    assert(slot.staged_launch_metadata.size() == sizeof(scheduler_source) + bytes);
+    std::memset(timing_target, 0xa5, bytes);
+    assert(copies == 0 && !runner.timing_armed());
+    assert(prepared->kernel_args.prepare_runtime_args(runtime, runner.allocator(), slot) == 0);
+    auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(id));
+    assert(syncs == 0);
+    if (fault) {
+        assert(outcome.rc == -777 && outcome.progress == LaunchProgress::Partial);
+        assert(!runner.timing_armed());
+        for (const auto &op : trace)
+            assert(op != "core" && op != "cpu");
+    } else {
+        assert(outcome.rc == 0 && outcome.progress == LaunchProgress::Complete);
+        assert(runner.timing_armed());
+        assert(scheduler_target == scheduler_source);
+        assert(trace[2] == "publish" && trace[3] == "publish" && trace[4] == "publish");
+        for (int i : {2, 3, 4})
+            assert(stream_trace[i] == outcome.active->prepared->streams.aicpu);
+        // The DMA reader outlives the per-run host snapshot, with no intervening wait.
+        outcome.active->prepared->kernel_args.release_run_view();
+        assert(timing_source != nullptr && timing_bytes == bytes);
+        assert(static_cast<unsigned char *>(timing_target)[0] == 0xa5);
+        std::memcpy(timing_target, timing_source, timing_bytes);
+        DevicePhaseBufferStorage<threads> expected{};
+        reset_device_phase_buffer(&expected, threads);
+        assert(std::memcmp(timing_target, &expected, bytes) == 0);
+        KernelArgsHelper unread;
+        assert(runner.ensure_device_wall_buffer(0, unread) == 0);
+        assert(unread.args.device_wall_data_base == 0);
+        assert(slot.staged_launch_metadata.size() == 0);
+    }
+    runner.consume_timing();
+    runner.release_timing();
+    timing_target = nullptr;
+    runner.finish();
+}
 static void check_arena_growth(SimplerExecutionMode mode) {
     const size_t before = live_allocations.size();
     {
@@ -355,6 +460,10 @@ static void check_arena_growth(SimplerExecutionMode mode) {
     assert(live_allocations.size() == before);
 }
 int main() {
+    check_timing_prepare_refusal();
+    check_timing_publication(0);
+    check_timing_publication(4);
+    check_timing_publication(5);
     check_metadata_publication(0);
     check_metadata_publication(3);  // Metadata enqueue failure.
     check_metadata_publication(4);  // Descriptor enqueue after accepted metadata.

@@ -1087,7 +1087,7 @@ public:
      * Called by finalize on every path that ends a run, emitted or not: a run
      * that never launched still owns its slot. Re-arming a slot that is still
      * armed means a successor took storage whose result nobody read, and
-     * `arm_device_wall_buffer` reports that rather than overwriting it.
+     * preparation refuses timing for that slot rather than overwriting it.
      */
     void release_device_run_timing(uint32_t pipeline_slot);
 
@@ -2098,12 +2098,11 @@ protected:
     /**
      * Prepare the device-phase/task-timing buffer for one run, in that run's
      * pipeline slot. Capture-disabled runs publish a null device base.
-     * Capture-enabled runs allocate the slot's buffer lazily, reset every
-     * record, and publish the base for AICPU stamping. Allocation or reset
-     * failure is non-fatal; the base stays null and timing reads as 0.
+     * Enabled runs allocate lazily and snapshot a full reset into pending
+     * launch metadata. Publication queues the reset before either kernel;
+     * its failure rejects launch. Allocation failure disables timing only.
      */
-    void ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
-    int arm_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
+    int ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args);
 
     /**
      * Point this run's KernelArgs at its slot's result region and stamp the run
@@ -3089,13 +3088,9 @@ protected:
     RunResourceSlots<void *> device_wall_dev_ptrs_;
     // Per-slot readback results; see device_run_timing().
     RunResourceSlots<DeviceRunTiming> device_run_timing_;
-    // Set when a slot's buffer is successfully reset for a launch, cleared when
-    // finalize has finished with the result. It answers two questions from the
-    // one fact, because both are "this slot's buffer is reset and unread":
-    // `arm_device_wall_buffer` refuses while it is set, so a successor cannot
-    // overwrite an unconsumed result; `read_device_wall_ns` skips while it is
-    // clear, so a run whose reset failed does not publish the storage's
-    // previous contents as its own timing.
+    // An accepted publication arms the slot; retirement consumes its result.
+    // Preparation cannot overwrite an armed slot. Failed publication leaves it
+    // unarmed, so readback cannot misattribute a predecessor's timing.
     RunResourceSlots<bool> device_timing_armed_;
     // One result region per pipeline slot: the device address handed to that
     // slot's runs, and the host's copy of what the last such run published. Not

@@ -59,6 +59,16 @@ public:
         return 0;
     }
 
+    int append(const HostMetadataRegion &region) {
+        if (region.device_target == nullptr || region.host_source == nullptr || region.bytes == 0 ||
+            region.bytes > std::numeric_limits<size_t>::max() - bytes_)
+            return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        const auto *source = static_cast<const std::byte *>(region.host_source);
+        regions_.push_back({region.device_target, {source, source + region.bytes}});
+        bytes_ += region.bytes;
+        return 0;
+    }
+
     size_t size() const { return bytes_; }
     void clear() {
         regions_.clear();

@@ -51,7 +51,16 @@ deep-dive — see [l2-timing.md](l2-timing.md).
 
 * Host allocates one fixed buffer with layout `DevicePhaseBufferHeader |
   AicpuPhaseRecord[] | TaskTimingRecord[]`. Both record regions are
-  **thread-major**. It resets the whole buffer each run and publishes its address
+  **thread-major**. Onboard preparation snapshots the full reset beside the run's
+  pending launch metadata. Launch copies it asynchronously from slot-owned pinned
+  memory on the AICPU stream before the descriptor and entry fork; both kernels
+  follow that reset. An enqueue failure rejects launch, retains the DMA source
+  until completion or quarantine, and suppresses timing readback. The simulator
+  resets its host mirror directly. With timing enabled, each slot retains an
+  additional reset-sized pinned source: 2,512 bytes on A2/A3 or 5,840 bytes on A5
+  (`16 + max_threads * (10 + 16) * 16`). The source shares descriptor staging;
+  no additional pinned allocation is made once that slot has sufficient capacity.
+  Both paths publish the buffer address
   into the AICPU SO via `set_platform_phase_base()` — a plain global + `extern "C"`
   setter, exactly like `set_platform_dump_base` / `set_platform_chip_swimlane_base`
   (onboard: `kernel.cpp` from `KernelArgs::device_wall_data_base`; sim: the host

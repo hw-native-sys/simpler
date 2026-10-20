@@ -3479,64 +3479,31 @@ DeviceRunTerminal DeviceRunnerBase::device_run_terminal(uint32_t pipeline_slot, 
     return device_run_result_terminal(device_run_results_[pipeline_slot], run_epoch);
 }
 
-void DeviceRunnerBase::ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args) {
-    if (!device_phase_capture_enabled() || pipeline_slot >= device_wall_dev_ptrs_.size()) {
-        // A null base makes the AICPU stamping helpers no-op.
-        kernel_args.args.device_wall_data_base = 0;
-        return;
-    }
-    // Fixed header followed by per-thread AICPU phase records (thread-major:
-    // AicpuPhaseRecord[NUM_AICPU_PHASES] per launched AICPU thread). Slot
-    // AicpuPhase::RunWall keeps the original whole-run wall; the rest subdivide
-    // the on-NPU portion. Each surviving AICPU thread writes its own records
-    // (plain stores, no atomics); read_device_wall_ns() reduces RunWall as
-    // max(end) - min(start) and surfaces the other phases as trace markers.
-    // Each pipeline slot owns its own buffer, allocated lazily and reset every
-    // run, so the device's writes for one run cannot land in storage whose
-    // result another run has not read yet.
-    constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-    using BufferImage = DevicePhaseBufferStorage<kThreads>;
-    constexpr size_t kBytes = device_phase_buffer_bytes(kThreads);
-    static_assert(sizeof(BufferImage) == kBytes, "device-phase buffer layout drift");
-    void *&slot_ptr = device_wall_dev_ptrs_[pipeline_slot];
-    if (slot_ptr == nullptr) {
-        slot_ptr = allocate_tensor(kBytes);
-    }
-    if (slot_ptr != nullptr) {
-        kernel_args.args.device_wall_data_base = reinterpret_cast<uint64_t>(slot_ptr);
-    }
-}
-
-int DeviceRunnerBase::arm_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args) {
-    if (pipeline_slot >= device_wall_dev_ptrs_.size()) return 0;
-    void *slot_ptr = device_wall_dev_ptrs_[pipeline_slot];
-    if (slot_ptr == nullptr || kernel_args.args.device_wall_data_base == 0) return 0;
+int DeviceRunnerBase::ensure_device_wall_buffer(uint32_t pipeline_slot, KernelArgsHelper &kernel_args) {
+    kernel_args.args.device_wall_data_base = 0;
+    if (!device_phase_capture_enabled() || pipeline_slot >= device_wall_dev_ptrs_.size()) return 0;
     if (device_timing_armed_[pipeline_slot]) {
-        // The slot's previous result was never consumed, so its owner's finalize
-        // did not run. Arming anyway would overwrite an unread result; report it
-        // and leave this run without capture rather than corrupt both.
         LOG_WARN(
             "device_phase slot %u still holds an unconsumed result; disabling phase capture this run", pipeline_slot
         );
-        kernel_args.args.device_wall_data_base = 0;
         return 0;
     }
     constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
     using BufferImage = DevicePhaseBufferStorage<kThreads>;
+    static_assert(sizeof(BufferImage) == device_phase_buffer_bytes(kThreads), "device-phase buffer layout drift");
+    void *&slot_ptr = device_wall_dev_ptrs_[pipeline_slot];
+    if (slot_ptr == nullptr) slot_ptr = allocate_tensor(sizeof(BufferImage));
+    if (slot_ptr == nullptr) return 0;
     static const BufferImage init = [] {
         BufferImage image{};
         reset_device_phase_buffer(&image, kThreads);
         return image;
     }();
-    if (copy_to_device(slot_ptr, &init, sizeof(init)) != 0) {
-        // Reset failed — disable capture for this run so stale slot data
-        // can't leak into the reduction. Keep the slot's allocation alive:
-        // the next run on this slot retries the reset.
-        LOG_WARN("device_phase reset H2D failed; disabling phase capture this run");
-        kernel_args.args.device_wall_data_base = 0;
-        return 0;
-    }
-    device_timing_armed_[pipeline_slot] = true;
+    // This snapshot shares the slot's pinned DMA source and completion lifetime
+    // with scheduler metadata. Neither preparation nor arming writes device memory.
+    const int rc = slot_persistent_args_[pipeline_slot].staged_launch_metadata.append({slot_ptr, &init, sizeof(init)});
+    if (rc != 0) return rc;
+    kernel_args.args.device_wall_data_base = reinterpret_cast<uint64_t>(slot_ptr);
     return 0;
 }
 
@@ -3651,7 +3618,11 @@ int DeviceRunnerBase::validate_caller_stream(rtStream_t caller) {
 
 int DeviceRunnerBase::queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink) {
     return caller_orders_[prepared.pipeline_slot]->fork(prepared.identity, sink, [&] {
-        return publish_for_launch(prepared.kernel_args, prepared.streams.aicpu, sink);
+        const int rc = publish_for_launch(prepared.kernel_args, prepared.streams.aicpu, sink);
+        if (rc == 0 && prepared.kernel_args.args.device_wall_data_base != 0) {
+            device_timing_armed_[prepared.pipeline_slot] = true;
+        }
+        return rc;
     });
 }
 
@@ -4208,11 +4179,8 @@ void DeviceRunnerBase::read_device_wall_ns(uint32_t pipeline_slot) {
     out.device_id = device_id_;
     out.sys_cnt_hz = device_sys_cnt_frequency_hz();
     if (!device_phase_capture_enabled()) return;
-    // Gate on this slot's arming, not just on the buffer existing. A failed
-    // reset leaves the allocation in place but publishes a null device base, so
-    // AICPU never stamped for this run — reading anyway would republish the
-    // previous run on this slot (or, on a slot's first run, whatever
-    // `allocate_tensor` handed back) as this run's result.
+    // An accepted publication arms this slot; failed or skipped publication
+    // leaves it unreadable. Drain precedes every read of the asynchronous reset.
     if (!device_timing_armed_[pipeline_slot]) return;
     void *slot_ptr = device_wall_dev_ptrs_[pipeline_slot];
     if (slot_ptr == nullptr) return;

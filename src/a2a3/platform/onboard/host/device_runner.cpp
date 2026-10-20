@@ -378,7 +378,8 @@ int DeviceRunner::prepare_execution(
         return rc;
     }
 
-    ensure_device_wall_buffer(pipeline_slot, execution->kernel_args);
+    rc = ensure_device_wall_buffer(pipeline_slot, execution->kernel_args);
+    if (rc != 0) return rc;
 
     // A run without somewhere to publish its result must not launch: it would
     // leave the host with no way to recover the run's own error scene, and a
@@ -579,6 +580,7 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_ai
         abandon_slot_persistent_args(slot_persistent_args(prepared.pipeline_slot));
     } else {
         prepared.kernel_args.release_run_view();
+        slot_persistent_args(prepared.pipeline_slot).staged_launch_metadata.clear();
     }
     prepared.kernel_args.args.regs = 0;
     prepared.kernel_args.args.pmu_reg_addrs = 0;
@@ -729,7 +731,6 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             try {
                 activate_launch_shape(runtime);
                 if (int fence_rc = arm_run_fence(prepared); fence_rc != 0) return fence_rc;
-                (void)arm_device_wall_buffer(prepared.pipeline_slot, prepared.kernel_args);
                 if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
                 // This run's own core types, resolved from its own prepared
                 // runtime and handed to admission. The resident copy the

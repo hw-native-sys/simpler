@@ -613,3 +613,29 @@ TEST_F(KernelArgsPublication, EmptyStagingClearsAnAbandonedUnpublishedBatch) {
     ASSERT_EQ(rts.queued.size(), 1U);
     EXPECT_EQ(rts.queued.front().target, slot.runtime_args);
 }
+
+TEST_F(KernelArgsPublication, AppendedResetPreservesEarlierMetadataAndOwnsItsSnapshot) {
+    uint64_t target = 0, reset_target = 0;
+    const uint64_t value = 67;
+    const HostMetadataRegion first{&target, &value, sizeof(value)};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&first, 1), 0);
+    {
+        uint64_t reset = 91;
+        ASSERT_EQ(slot.staged_launch_metadata.append({&reset_target, &reset, sizeof(reset)}), 0);
+        reset = 0;
+    }
+    // A rejected addition cannot consume or replace the previously staged batch.
+    EXPECT_EQ(slot.staged_launch_metadata.append({nullptr, &value, 8}), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(
+        slot.staged_launch_metadata.append({&target, reinterpret_cast<void *>(1), SIZE_MAX}),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
+    );
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    EXPECT_EQ(target, value);
+    EXPECT_EQ(reset_target, 91U);
+    ASSERT_EQ(rts.queued.size(), 3U);
+    EXPECT_EQ(rts.queued[0].target, &target);
+    EXPECT_EQ(rts.queued[1].target, &reset_target);
+    EXPECT_EQ(rts.queued[2].target, slot.runtime_args);
+}
