@@ -15,6 +15,7 @@ import pytest
 from simpler import comm_endpoints as ce
 from simpler.buffer import _RESOLVERS
 from simpler.buffer import BackendKind as BufferBackendKind
+from simpler.mpi_direct_topology import MpiDirectTopology
 from simpler.worker import RemoteWorkerSpec, Worker, _Lifecycle
 
 FROZEN_ADAPTER_KIND_U32 = {
@@ -60,6 +61,27 @@ def _l4_with_remote(*specs: RemoteWorkerSpec) -> Worker:
     worker = Worker(level=4, num_sub_workers=0)
     for spec in specs:
         worker.add_remote_worker(spec)
+    return _ready(worker)
+
+
+def _l4_with_mpi_direct(*, hosts: tuple[str, ...], device_ids_by_rank: tuple[tuple[int, ...], ...]) -> Worker:
+    worker = Worker(level=4, num_sub_workers=0)
+    topology = MpiDirectTopology.from_dict(
+        {
+            "controller_host": "192.0.2.1",
+            "executor_ranks": [
+                {
+                    "rank": worker_id + 1,
+                    "worker_id": worker_id,
+                    "host": host,
+                    "platform": "a2a3sim",
+                    "device_ids": device_ids,
+                }
+                for worker_id, (host, device_ids) in enumerate(zip(hosts, device_ids_by_rank))
+            ],
+        }
+    )
+    worker._configure_mpi_direct(topology, 1, object())  # type: ignore[arg-type]
     return _ready(worker)
 
 
@@ -540,6 +562,24 @@ def test_remote_registry_normalizes_node_identity_by_host_not_remote_status():
     assert registry.same_node(remote_a, remote_b)
     assert not registry.same_node(root, remote_a)
     assert not registry.same_node(remote_a, remote_c)
+
+
+def test_mpi_direct_registry_registers_rank_hosts_and_devices():
+    worker = _l4_with_mpi_direct(
+        hosts=("localhost", "10.0.0.7", "10.0.0.7"),
+        device_ids_by_rank=((12, 13), (14,), (15,)),
+    )
+    registry = worker._get_endpoint_registry()
+    root = _record(worker, "L4", ce.HOST_CPU)
+    local_device = _record(worker, "L4/L3[0]/L2[1]", ce.DEVICE_AICORE)
+    remote_a = _record(worker, "L4/L3[1]", ce.HOST_CPU)
+    remote_device = _record(worker, "L4/L3[1]/L2[0]", ce.DEVICE_AICORE)
+    remote_b = _record(worker, "L4/L3[2]", ce.HOST_CPU)
+
+    assert registry.same_node(root, local_device)
+    assert registry.same_node(remote_a, remote_device)
+    assert registry.same_node(remote_a, remote_b)
+    assert not registry.same_node(root, remote_a)
 
 
 def test_at_missing_path_reports_path_not_found():

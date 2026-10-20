@@ -442,7 +442,11 @@ active native run and marks every
 active or staged task frame failed before leaving; the parent drains those
 terminal events, brings its in-flight count to zero, and joins the one progress
 thread. The Scheduler is joined only after worker threads can no longer invoke
-completion callbacks, and `WorkerManager::stop()` then clears the pools.
+completion callbacks. `WorkerManager::stop()` sends lifecycle shutdown to
+every child endpoint before clearing the pools. An idle remote transport stays
+open between progress stop and that shutdown send; an endpoint with a pending
+task cancels its transport immediately. Native `Worker.close()` releases the
+GIL so Python MPI progress can return outbound credit while close waits.
 
 A single-set endpoint has no staged run to cancel; its active task terminalizes
 before its dispatcher thread joins. The Python facade owns every
@@ -478,6 +482,14 @@ remain serialized on the same ordered command lane, and an independent
 simulation health lane is monitored throughout. Python remote worker specs open
 a session through `simpler-remote-worker`; the endpoint is schedulable only
 after the session runner reports `HELLO READY`.
+
+The direct MPI path uses that same endpoint with `MpiDirectTransport`. A
+single launcher owns rank 0 (L4) and ranks 1..N (L3), without the daemon.
+`MpiDirectTransportHub` provides byte credit and frame routing, while a Python
+progress thread performs MPI calls. Its health check covers idle sessions;
+normal teardown sends `SHUTDOWN` before closing the hub. See the
+[direct MPI example](../examples/workers/l4/vector_add_mpi_direct_l3/README.md)
+for launcher ownership, failure handling, and polling costs.
 
 A control request issued while a remote task is in flight waits for that task
 to complete or for endpoint progress to stop. The command and task share one

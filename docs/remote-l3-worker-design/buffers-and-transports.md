@@ -343,6 +343,17 @@ Current status: `RemoteL3Endpoint` owns a transport-neutral
 adapter, data adapter, buffer registry, and health lane described below remain
 to be implemented behind that transport boundary.
 
+Implemented control transports include sockets, the shared-memory MPI mailbox,
+and direct MPI point-to-point frames. Direct MPI reuses the current SLR3 codec
+and remote registration/memory operations; it does not enable a new HCOMM data
+profile. A static world uses rank 0 for L4 and ranks 1..N for L3 executors.
+Four MPI tags separate requests, replies, health, and lifecycle. A shared byte
+budget includes outstanding MPI sends until completion. Cancellation wakes
+only the affected route; invalid frames, shared credit failure, and missing
+heartbeats fail the world. The launcher owns rank cleanup on controller exit.
+See the [direct MPI example](../../examples/workers/l4/vector_add_mpi_direct_l3/README.md)
+for startup, shutdown, and failure contracts.
+
 The adapter family provides this logical contract:
 
 ```text

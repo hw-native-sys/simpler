@@ -390,9 +390,14 @@ public:
     remote_l3::ControlName last_control_name{remote_l3::ControlName::PREPARE_CALLABLE};
     remote_l3::RemoteRegistryTarget last_target_registry{remote_l3::RemoteRegistryTarget::REMOTE_TASK_DISPATCHER};
     CallableKind last_callable_kind{CallableKind::PYTHON_IMPORT};
+    int shutdown_calls{0};
 
-    void submit_frame(const std::vector<uint8_t> &frame) override { last_frame = frame; }
+    void submit_frame(const std::vector<uint8_t> &frame) override {
+        if (shutdown_calls != 0) throw std::runtime_error("FakeRemoteTransport: submit after shutdown");
+        last_frame = frame;
+    }
     void submit_progress_frame(const std::vector<uint8_t> &frame) override { submit_frame(frame); }
+    void shutdown() override { ++shutdown_calls; }
 
     bool poll_progress_reply(remote_l3::FrameType frame_type, uint64_t sequence, std::vector<uint8_t> &reply) override {
         if (progress_polls_before_ready > 0) {
@@ -556,6 +561,19 @@ TEST(RemoteEndpoint, ProgressStopReleasesWaitingControl) {
     ring.shutdown();
 }
 
+TEST(RemoteEndpoint, IdleProgressStopDefersTransportShutdownUntilLifecycleFrame) {
+    auto *transport = new FakeRemoteTransport();
+    RemoteL3Endpoint endpoint(3, 99, "fake", std::unique_ptr<RemoteL3Transport>(transport));
+
+    endpoint.request_progress_stop();
+    EXPECT_EQ(transport->shutdown_calls, 0);
+
+    endpoint.shutdown_child();
+    ASSERT_FALSE(transport->last_frame.empty());
+    EXPECT_EQ(remote_l3::decode_frame(transport->last_frame).header.frame_type, remote_l3::FrameType::SHUTDOWN);
+    EXPECT_EQ(transport->shutdown_calls, 1);
+}
+
 TEST(RemoteEndpoint, RemoteTaskErrorMapsToTaskFailure) {
     Ring ring;
     ring.init(1ULL << 20);
@@ -702,6 +720,38 @@ TEST(RemoteSocketTransport, ClosedPeerWriteDoesNotRaiseSigpipe) {
     EXPECT_TRUE(saw_error) << "peer RST did not land before the write";
     EXPECT_EQ(g_sigpipe_count, 0);
     transport.shutdown();
+}
+
+TEST(RemoteEndpoint, IdleSocketProgressStopPreservesLifecycleShutdown) {
+    uint16_t port = 0;
+    int listener = make_loopback_listener(port);
+    ScopedServerThread server;
+    std::vector<uint8_t> received(remote_l3::FRAME_HEADER_BYTES);
+    size_t received_bytes = 0;
+    server.thread() = std::thread([&] {
+        int fd = accept_until_stop(listener, server.stop_flag());
+        if (fd >= 0) {
+            timeval timeout{2, 0};
+            (void)::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            while (received_bytes < received.size()) {
+                ssize_t n = ::recv(fd, received.data() + received_bytes, received.size() - received_bytes, 0);
+                if (n <= 0) break;
+                received_bytes += static_cast<size_t>(n);
+            }
+            ::close(fd);
+        }
+        ::close(listener);
+    });
+    auto transport = std::make_unique<RemoteL3SocketTransport>("127.0.0.1", port, "127.0.0.1", 1, 1.0, 1.0);
+    RemoteL3Endpoint endpoint(0, 1, "socket", std::move(transport));
+    endpoint.request_progress_stop();
+    endpoint.shutdown_child();
+    server.stop_and_join();
+    ASSERT_EQ(received_bytes, remote_l3::FRAME_HEADER_BYTES);
+    auto frame = remote_l3::decode_frame(received);
+    EXPECT_EQ(frame.header.frame_type, remote_l3::FrameType::SHUTDOWN);
+    EXPECT_EQ(frame.header.worker_id, 0);
+    EXPECT_EQ(frame.header.session_id, 1U);
 }
 
 // Every socket test below starts a server thread and then constructs a

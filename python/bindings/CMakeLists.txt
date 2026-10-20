@@ -24,6 +24,7 @@ set(HIERARCHICAL_SOURCES
     ${HIERARCHICAL_SRC}/scope.cpp
     ${HIERARCHICAL_SRC}/remote_wire.cpp
     ${HIERARCHICAL_SRC}/remote_endpoint.cpp
+    ${HIERARCHICAL_SRC}/mpi_direct_transport.cpp
     ${HIERARCHICAL_SRC}/orchestrator.cpp
     ${HIERARCHICAL_SRC}/worker_manager.cpp
     ${HIERARCHICAL_SRC}/scheduler.cpp

@@ -39,6 +39,7 @@ from simpler.callable_identity import (
 )
 from simpler.comm_endpoints import HOST_CPU
 from simpler.orchestrator import Orchestrator
+from simpler.remote_l3_limits import MAX_FRAME_BYTES
 from simpler.remote_l3_protocol import (
     CallableKind,
     ChipCallableBlobLocation,
@@ -2884,6 +2885,48 @@ def test_remote_register_commit_exception_aborts_prepared_and_marks_uncertain():
 
     assert fake.aborted == [worker_id]
     assert digest in worker._uncertain_hashids
+
+
+def test_initial_mpi_direct_register_rollback_aborts_only_uncommitted_workers():
+    class FailingCommitWorker:
+        def __init__(self):
+            self.aborted = []
+            self.unregistered = []
+
+        def remote_prepare_register(self, worker_id, *args):
+            return _FakeRemoteControlResult(worker_id)
+
+        def remote_commit_register(self, worker_id, *args):
+            return _FakeRemoteControlResult(worker_id, ok=worker_id == 0, error_message="commit failed")
+
+        def remote_abort_register(self, worker_id, *args):
+            self.aborted.append(worker_id)
+            return _FakeRemoteControlResult(worker_id)
+
+        def remote_unregister(self, worker_id, *args):
+            self.unregistered.append(worker_id)
+            return _FakeRemoteControlResult(worker_id)
+
+    worker = Worker(level=4, num_sub_workers=0)
+    hub = worker_mod._MpiDirectTransportHub(MAX_FRAME_BYTES)
+    topology = worker_mod.MpiDirectTopology.from_dict(
+        {
+            "executor_ranks": [
+                {"rank": worker_id + 1, "worker_id": worker_id, "host": "localhost", "platform": "a2a3sim"}
+                for worker_id in range(2)
+            ]
+        }
+    )
+    worker._configure_mpi_direct(topology, 1, hub)
+    worker.register(RemoteCallable(_REMOTE_NOOP_ORCH_TARGET), workers=[0, 1])
+    fake = FailingCommitWorker()
+    worker._worker = fake  # type: ignore[assignment]
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        worker._publish_initial_mpi_direct_callables()
+
+    assert fake.aborted == [1]
+    assert fake.unregistered == [0]
 
 
 def test_remote_unregister_exception_is_best_effort_and_marks_uncertain():
