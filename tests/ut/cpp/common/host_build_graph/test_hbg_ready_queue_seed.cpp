@@ -19,6 +19,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <chrono>
+#include <future>
 #include <vector>
 
 #include "host_build_graph/host/ready_queue_sizing.h"
@@ -116,6 +118,264 @@ TEST(HbgReadyQueueSeed, DrainedQueueWrapsWithoutReseeding) {
     }
 
     EXPECT_EQ(queue.max_occupancy.load(std::memory_order_relaxed), CAPACITY);
+}
+
+class HbgReadyQueueRelease : public ::testing::TestWithParam<bool> {};
+
+TEST_P(HbgReadyQueueRelease, RejectsAClaimedSlotWithoutWaitingForItsConsumer) {
+    SlotsRegion region(0xAA);
+    ChipReadyQueue queue{};
+    make_queue(&queue, region);
+    queue.seed_slots();
+    for (uint64_t i = 0; i < CAPACITY; ++i)
+        ASSERT_TRUE(queue.push(fake_slot_state(i)));
+
+    // A consumer owns slot zero after its cursor CAS and before releasing the
+    // slot sequence. The remaining consumers can drain while that one pauses.
+    queue.dequeue_pos.store(1, std::memory_order_relaxed);
+    for (uint64_t i = 1; i < CAPACITY; ++i)
+        ASSERT_EQ(queue.pop(), fake_slot_state(i));
+    ASSERT_EQ(queue.size(), 0u);
+
+    std::promise<void> started;
+    auto producer = std::async(std::launch::async, [&] {
+        started.set_value();
+        auto *item = fake_slot_state(CAPACITY);
+        return GetParam() ? queue.push_batch(&item, 1) : queue.push(item);
+    });
+    started.get_future().wait();
+    const auto result_before_release = producer.wait_for(std::chrono::seconds(1));
+    queue.slots[0].sequence.store(static_cast<int64_t>(CAPACITY), std::memory_order_release);
+    EXPECT_EQ(result_before_release, std::future_status::ready);
+    ASSERT_FALSE(producer.get());
+    ASSERT_TRUE(queue.push(fake_slot_state(CAPACITY)));
+    EXPECT_EQ(queue.pop(), fake_slot_state(CAPACITY));
+    EXPECT_EQ(queue.pop(), nullptr);
+}
+
+INSTANTIATE_TEST_SUITE_P(SingleAndBatch, HbgReadyQueueRelease, ::testing::Bool());
+
+TEST(HbgReadyQueueRelease, BatchRejectsAHeldSecondSlotAndCanRetryAfterRelease) {
+    SlotsRegion region(0xAA);
+    ChipReadyQueue queue{};
+    make_queue(&queue, region);
+    queue.seed_slots();
+    for (uint64_t i = 0; i < CAPACITY; ++i)
+        ASSERT_TRUE(queue.push(fake_slot_state(i)));
+
+    // Two consumers claim the first two slots; only the first releases its slot.
+    queue.dequeue_pos.store(2, std::memory_order_relaxed);
+    queue.slots[0].sequence.store(static_cast<int64_t>(CAPACITY), std::memory_order_release);
+    for (uint64_t i = 2; i < CAPACITY; ++i)
+        ASSERT_EQ(queue.pop(), fake_slot_state(i));
+
+    ChipTaskSlotState *items[] = {fake_slot_state(CAPACITY), fake_slot_state(CAPACITY + 1)};
+    const TaskId tags[] = {TaskId::make_global(81), TaskId::make_global(82)};
+    std::promise<void> started;
+    auto producer = std::async(std::launch::async, [&] {
+        started.set_value();
+        return queue.push_batch_tagged(items, tags, 2);
+    });
+    started.get_future().wait();
+    const auto result_before_release = producer.wait_for(std::chrono::seconds(1));
+    const uint64_t cursor_before_release = queue.enqueue_pos.load(std::memory_order_relaxed);
+    queue.slots[1].sequence.store(static_cast<int64_t>(CAPACITY + 1), std::memory_order_release);
+    EXPECT_EQ(result_before_release, std::future_status::ready);
+    EXPECT_EQ(cursor_before_release, CAPACITY);
+    ASSERT_FALSE(producer.get());
+    ASSERT_TRUE(queue.push_batch_tagged(items, tags, 2));
+    for (int i = 0; i < 2; ++i) {
+        TaskId tag;
+        EXPECT_EQ(queue.pop_tagged(&tag), items[i]);
+        EXPECT_EQ(tag, tags[i]);
+    }
+    EXPECT_EQ(queue.pop(), nullptr);
+}
+
+TEST(HbgReadyQueueRelease, FullBatchRejectsWithoutPublishingItsFreePrefix) {
+    SlotsRegion region(0xAA);
+    ChipReadyQueue queue{};
+    make_queue(&queue, region);
+    queue.seed_slots();
+    for (uint64_t i = 0; i < CAPACITY - 1; ++i)
+        ASSERT_TRUE(queue.push(fake_slot_state(i)));
+
+    ChipTaskSlotState *items[] = {fake_slot_state(CAPACITY), fake_slot_state(CAPACITY + 1)};
+    EXPECT_FALSE(queue.push_batch(items, 2));
+    EXPECT_EQ(queue.enqueue_pos.load(std::memory_order_relaxed), CAPACITY - 1);
+    for (uint64_t i = 0; i < CAPACITY - 1; ++i)
+        EXPECT_EQ(queue.pop(), fake_slot_state(i));
+    EXPECT_EQ(queue.pop(), nullptr);
+}
+
+enum class ReadyRoute { GRAPH, READY, SYNC, DUMMY };
+
+class HbgReadyQueueCaller : public ::testing::TestWithParam<ReadyRoute> {
+protected:
+    SharedMemoryHeader header{};
+    SchedulerState scheduler{};
+    SlotsRegion region{0xAA};
+    ChipTaskStorage incoming{};
+    ChipReadyQueue *queue{nullptr};
+
+    void SetUp() override {
+        scheduler.sm_header = &header;
+        incoming.task.task_id = TaskId::make_global(81);
+        incoming.slot.active_mask = ActiveMask(SUBTASK_MASK_AIC);
+        switch (GetParam()) {
+        case ReadyRoute::GRAPH:
+            queue = &scheduler.graph_prepare_queue;
+            break;
+        case ReadyRoute::READY:
+            queue = &scheduler.ready_queues[static_cast<int32_t>(ResourceShape::AIC)];
+            break;
+        case ReadyRoute::SYNC:
+            incoming.slot.task_attrs.set_sync_start();
+            queue = &scheduler.ready_sync_queues[static_cast<int32_t>(ResourceShape::AIC)];
+            break;
+        case ReadyRoute::DUMMY:
+            incoming.slot.active_mask = ActiveMask{};
+            queue = &scheduler.dummy_ready_queue;
+            break;
+        }
+        make_queue(queue, region);
+        queue->seed_slots();
+        for (uint64_t i = 0; i < CAPACITY; ++i)
+            ASSERT_TRUE(queue->push(fake_slot_state(i)));
+    }
+
+    bool submit() {
+        if (GetParam() == ReadyRoute::GRAPH)
+            return scheduler.push_graph_prepare(&incoming.slot, incoming.task.task_id, 2);
+        scheduler.push_ready_routed(&incoming.slot);
+        return header.sched_error_code.load(std::memory_order_acquire) == SIMPLER_ERROR_NONE;
+    }
+
+    void claim_without_releasing() {
+        queue->dequeue_pos.store(1, std::memory_order_relaxed);
+        for (uint64_t i = 1; i < CAPACITY; ++i)
+            ASSERT_EQ(queue->pop(), fake_slot_state(i));
+    }
+};
+
+TEST_P(HbgReadyQueueCaller, RetriesAClaimedSlotAtTheSchedulerCallSite) {
+    claim_without_releasing();
+    std::promise<void> started;
+    auto producer = std::async(std::launch::async, [&] {
+        started.set_value();
+        return submit();
+    });
+    started.get_future().wait();
+    const auto before_release = producer.wait_for(std::chrono::milliseconds(20));
+    queue->slots[0].sequence.store(static_cast<int64_t>(CAPACITY), std::memory_order_release);
+    EXPECT_EQ(before_release, std::future_status::timeout);
+    ASSERT_TRUE(producer.get());
+    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_NONE);
+    TaskId tag;
+    EXPECT_EQ(queue->pop_tagged(&tag), &incoming.slot);
+    EXPECT_EQ(tag, GetParam() == ReadyRoute::GRAPH ? incoming.task.task_id : TaskId::invalid());
+    EXPECT_EQ(queue->pop(), nullptr);
+}
+
+TEST_P(HbgReadyQueueCaller, ReportsAnUnclaimedFullQueueWithoutOverwritingTasks) {
+    EXPECT_FALSE(submit());
+    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    for (uint64_t i = 0; i < CAPACITY; ++i)
+        EXPECT_EQ(queue->pop(), fake_slot_state(i));
+    EXPECT_EQ(queue->pop(), nullptr);
+}
+
+TEST_P(HbgReadyQueueCaller, StopsRetryingWhenAnotherSchedulerHasFailed) {
+    claim_without_releasing();
+    header.sched_error_code.store(SIMPLER_ERROR_SCHEDULER_TIMEOUT, std::memory_order_release);
+    auto producer = std::async(std::launch::async, [&] {
+        return submit();
+    });
+    const auto before_release = producer.wait_for(std::chrono::seconds(1));
+    queue->slots[0].sequence.store(static_cast<int64_t>(CAPACITY), std::memory_order_release);
+    EXPECT_EQ(before_release, std::future_status::ready);
+    EXPECT_FALSE(producer.get());
+    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_SCHEDULER_TIMEOUT);
+    EXPECT_EQ(queue->pop(), nullptr);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    RequiredRoutes, HbgReadyQueueCaller,
+    ::testing::Values(ReadyRoute::GRAPH, ReadyRoute::READY, ReadyRoute::SYNC, ReadyRoute::DUMMY)
+);
+
+TEST(HbgReadyQueueCallerBatch, RetriesAHeldSecondSlotWithoutPublishingAPrefix) {
+    SlotsRegion region(0xAA);
+    ChipReadyQueue queue{};
+    make_queue(&queue, region);
+    queue.seed_slots();
+    for (uint64_t i = 0; i < CAPACITY; ++i)
+        ASSERT_TRUE(queue.push(fake_slot_state(i)));
+    queue.dequeue_pos.store(2, std::memory_order_relaxed);
+    queue.slots[0].sequence.store(static_cast<int64_t>(CAPACITY), std::memory_order_release);
+    for (uint64_t i = 2; i < CAPACITY; ++i)
+        ASSERT_EQ(queue.pop(), fake_slot_state(i));
+
+    SharedMemoryHeader header{};
+    SchedulerState scheduler{};
+    scheduler.sm_header = &header;
+    ChipTaskSlotState *items[] = {fake_slot_state(CAPACITY), fake_slot_state(CAPACITY + 1)};
+    const TaskId tags[] = {TaskId::make_global(81), TaskId::make_global(82)};
+    std::promise<void> started;
+    auto producer = std::async(std::launch::async, [&] {
+        started.set_value();
+        return scheduler.retry_required_queue_push(
+            queue, "ready_requeue", 2,
+            [&] {
+                return queue.push_batch_tagged(items, tags, 2);
+            },
+            2
+        );
+    });
+    started.get_future().wait();
+    const auto before_release = producer.wait_for(std::chrono::milliseconds(20));
+    const uint64_t cursor_before_release = queue.enqueue_pos.load();
+    queue.slots[1].sequence.store(static_cast<int64_t>(CAPACITY + 1), std::memory_order_release);
+    EXPECT_EQ(before_release, std::future_status::timeout);
+    EXPECT_EQ(cursor_before_release, CAPACITY);
+    ASSERT_TRUE(producer.get());
+    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_NONE);
+    for (int i = 0; i < 2; ++i) {
+        TaskId tag;
+        EXPECT_EQ(queue.pop_tagged(&tag), items[i]);
+        EXPECT_EQ(tag, tags[i]);
+    }
+    EXPECT_EQ(queue.pop(), nullptr);
+}
+
+TEST(HbgReadyQueueCallerBatch, RejectsAnUnclaimedSecondSlotWithoutPublishingAPrefix) {
+    SlotsRegion region(0xAA);
+    ChipReadyQueue queue{};
+    make_queue(&queue, region);
+    queue.seed_slots();
+    for (uint64_t i = 0; i < CAPACITY - 1; ++i)
+        ASSERT_TRUE(queue.push(fake_slot_state(i)));
+    SharedMemoryHeader header{};
+    SchedulerState scheduler{};
+    scheduler.sm_header = &header;
+    ChipTaskSlotState *items[] = {fake_slot_state(CAPACITY), fake_slot_state(CAPACITY + 1)};
+    auto producer = std::async(std::launch::async, [&] {
+        return scheduler.retry_required_queue_push(
+            queue, "ready_requeue", 2,
+            [&] {
+                return queue.push_batch(items, 2);
+            },
+            2
+        );
+    });
+    const auto before_pop = producer.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(queue.pop(), fake_slot_state(0));
+    EXPECT_EQ(before_pop, std::future_status::ready);
+    EXPECT_FALSE(producer.get());
+    EXPECT_EQ(header.sched_error_code.load(), SIMPLER_ERROR_READY_QUEUE_OVERFLOW);
+    for (uint64_t i = 1; i < CAPACITY - 1; ++i)
+        EXPECT_EQ(queue.pop(), fake_slot_state(i));
+    EXPECT_EQ(queue.pop(), nullptr);
 }
 
 // Seeding is unconditional on attach, so it must also recover a region left

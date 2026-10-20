@@ -33,6 +33,7 @@
 #pragma once
 
 #include <atomic>
+#include "common/unified_log.h"
 
 #include "graph_image_view.h"
 #include "common/memory_barrier.h"
@@ -133,6 +134,8 @@ struct alignas(64) ChipReadyQueue {
     // pop with a tag ever read this field, and all of them push with one, so an
     // untagged entry's tag is never compared. The sentinel says so, where a zero
     // would have been a legitimate handle.
+    // A false result can mean the target slot still belongs to a consumer
+    // that has advanced its dequeue cursor.
     bool push(ChipTaskSlotState *slot_state) { return push_tagged(slot_state, TaskId::invalid()); }
 
     bool push_tagged(ChipTaskSlotState *slot_state, TaskId task_id_snapshot) {
@@ -150,7 +153,7 @@ struct alignas(64) ChipReadyQueue {
                     break;
                 }
             } else if (diff < 0) {
-                return false;  // Queue full
+                return false;  // Target slot unavailable
             }
         }
 
@@ -164,9 +167,9 @@ struct alignas(64) ChipReadyQueue {
     // Batch push: reserve count slots with a single CAS after confirming
     // every target slot is available under the usual Vyukov sequence check.
     // Returns false without publishing anything when the queue cannot take all
-    // `count` items. A target slot holding an older generation means full and
-    // ends the call; a slot a peer has reserved but not yet published is
-    // transient and retries, so this only spins while a peer is mid-publish.
+    // `count` items. An older-generation slot returns false even if its
+    // consumer already claimed it. Callers choose retry or fallback; cursor
+    // contention retries inside the reservation attempt.
     bool push_batch(ChipTaskSlotState **items, int count) { return push_batch_tagged(items, nullptr, count); }
 
     bool push_batch_tagged(ChipTaskSlotState **items, const TaskId *task_id_snapshots, int count) {
@@ -182,7 +185,7 @@ struct alignas(64) ChipReadyQueue {
                 int64_t seq = slot->sequence.load(std::memory_order_acquire);
                 int64_t diff = seq - static_cast<int64_t>(pos + i);
                 if (diff < 0) {
-                    return false;  // Queue full
+                    return false;  // Target slot unavailable
                 }
                 if (diff > 0) {
                     ready = false;
@@ -232,7 +235,7 @@ struct alignas(64) ChipReadyQueue {
                 contended = true;
                 atomic_ops++;  // failed CAS
             } else if (diff < 0) {
-                return false;  // Queue full
+                return false;  // Target slot unavailable
             } else {
                 contended = true;  // diff > 0: slot not yet released, spin
             }
@@ -555,10 +558,52 @@ struct SchedulerState {
         }
     }
 
+    void report_ready_queue_rejection(const char *name, const ChipReadyQueue &queue) {
+        const uint64_t enqueue = queue.enqueue_pos.load(std::memory_order_relaxed);
+        const uint64_t dequeue = queue.dequeue_pos.load(std::memory_order_relaxed);
+        const int64_t sequence = queue.slots[enqueue & queue.mask].sequence.load(std::memory_order_acquire);
+        LOG_ERROR(
+            "READY_QUEUE_REJECT queue=%s capacity=%llu enqueue=%llu dequeue=%llu next_sequence=%lld", name,
+            static_cast<unsigned long long>(queue.capacity), static_cast<unsigned long long>(enqueue),
+            static_cast<unsigned long long>(dequeue), static_cast<long long>(sequence)
+        );
+    }
+
+    // Required queues cover every reachable task, but a consumer can still
+    // own the physical slot after advancing its dequeue cursor. The Scheduler
+    // retries that ownership window; optional queue callers retain fallback.
+    template <typename TryPush>
+    bool retry_required_queue_push(
+        ChipReadyQueue &queue, const char *name, int32_t thread_idx, TryPush &&try_push, uint64_t count = 1
+    ) {
+        while (!try_push()) {
+            if (sm_header->sched_error_code.load(std::memory_order_acquire) != SIMPLER_ERROR_NONE) return false;
+            const uint64_t pos = queue.enqueue_pos.load(std::memory_order_relaxed);
+            bool retry = count <= queue.capacity;
+            for (uint64_t i = 0; retry && i < count; ++i) {
+                const uint64_t target = pos + i;
+                const int64_t sequence = queue.slots[target & queue.mask].sequence.load(std::memory_order_acquire);
+                // Slots may already be free or a peer may have advanced the
+                // enqueue cursor. A held previous-lap slot waits for its reader.
+                if (sequence >= static_cast<int64_t>(target)) continue;
+                if (target >= queue.capacity && sequence == static_cast<int64_t>(target - queue.capacity + 1) &&
+                    queue.dequeue_pos.load(std::memory_order_relaxed) > target - queue.capacity) {
+                    continue;
+                }
+                retry = false;
+            }
+            if (retry) continue;
+            report_ready_queue_rejection(name, queue);
+            latch_ready_queue_overflow(thread_idx);
+            return false;
+        }
+        return true;
+    }
+
     bool push_graph_prepare(ChipTaskSlotState *slot_state, TaskId task_id, int32_t thread_idx) {
-        if (graph_prepare_queue.push_tagged(slot_state, task_id)) return true;
-        latch_ready_queue_overflow(thread_idx);
-        return false;
+        return retry_required_queue_push(graph_prepare_queue, "graph_prepare", thread_idx, [&] {
+            return graph_prepare_queue.push_tagged(slot_state, task_id);
+        });
     }
 
     void push_ready_routed(ChipTaskSlotState *slot_state) {
@@ -593,24 +638,22 @@ struct SchedulerState {
             return;
         }
         ResourceShape shape = slot_state->active_mask.to_shape();
-        bool pushed;
+        ChipReadyQueue *queue;
+        const char *name;
         if (shape == ResourceShape::DUMMY ||
             (slot_state->task_attrs.has_predicate() && !slot_state->to_payload().predicate.pass())) {
-            pushed = dummy_ready_queue.push(slot_state);
+            queue = &dummy_ready_queue;
+            name = "dummy";
         } else if (slot_state->task_attrs.requires_sync_start()) {
-            pushed = ready_sync_queues[static_cast<int32_t>(shape)].push(slot_state);
+            queue = &ready_sync_queues[static_cast<int32_t>(shape)];
+            name = "ready_sync";
         } else {
-            pushed = ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+            queue = &ready_queues[static_cast<int32_t>(shape)];
+            name = "ready";
         }
-        // Every ready / sync / dummy task routes to exactly one queue. A false
-        // push means that queue's peak concurrent occupancy exceeded its
-        // bind-time capacity — a capacity mis-sizing, not a normal condition.
-        // Silently dropping the task would stall the run, so latch a named error
-        // (surfaces as READY_QUEUE_OVERFLOW rather than an anonymous
-        // forward-progress timeout).
-        if (!pushed) {
-            latch_ready_queue_overflow();
-        }
+        retry_required_queue_push(*queue, name, -1, [&] {
+            return queue->push(slot_state);
+        });
     }
 
     // ---- Polling completion primitives ---------------------------------------

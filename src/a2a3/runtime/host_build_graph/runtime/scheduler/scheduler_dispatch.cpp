@@ -339,6 +339,13 @@ void SchedulerContext::dispatch_shape(
 #endif
     if (entered_drain) return;
 
+    auto &ready_queue = disp_queues[static_cast<int32_t>(shape)];
+    auto requeue = [&](ChipTaskSlotState *slot) {
+        return sched_->retry_required_queue_push(ready_queue, "ready_requeue", thread_idx, [&] {
+            return ready_queue.push(slot);
+        });
+    };
+
     bool is_pending = (phase == CoreTracker::DispatchPhase::PENDING);
     bool is_mix = (shape == ResourceShape::MIX);
     auto cores = is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
@@ -439,7 +446,10 @@ void SchedulerContext::dispatch_shape(
                 auto wanted = is_pending ? CoreTracker::MixPlacement::PENDING : CoreTracker::MixPlacement::RUNNING;
                 selected_mix_clusters = tracker.get_mix_cluster_offset_states(cmask, wanted) & cores;
                 if (!selected_mix_clusters.has_value()) {
-                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    if (!requeue(slot_state)) {
+                        flush_publish();
+                        return;
+                    }
                     continue;
                 }
             }
@@ -450,17 +460,26 @@ void SchedulerContext::dispatch_shape(
 
             if (slot_state->task_attrs.requires_sync_start()) {
                 if (is_pending) {
-                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    if (!requeue(slot_state)) {
+                        flush_publish();
+                        return;
+                    }
                     continue;
                 }
                 int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
                 if (available < slot_state->logical_block_num) {
                     flush_publish();
                     if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
-                        disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                        if (!requeue(slot_state)) {
+                            flush_publish();
+                            return;
+                        }
                     }
                     for (int rem = bi + 1; rem < got; rem++) {
-                        disp_queues[static_cast<int32_t>(shape)].push(batch[rem]);
+                        if (!requeue(batch[rem])) {
+                            flush_publish();
+                            return;
+                        }
                     }
                     entered_drain = true;
                     break;
@@ -472,7 +491,15 @@ void SchedulerContext::dispatch_shape(
                 // These came off this queue and no other owner holds them, so a
                 // drop would lose them: retry until the space they vacated is
                 // free again.
-                while (!disp_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi)) {}
+                if (!sched_->retry_required_queue_push(
+                        ready_queue, "ready_requeue", thread_idx,
+                        [&] {
+                            return ready_queue.push_batch(&batch[bi], got - bi);
+                        },
+                        got - bi
+                    )) {
+                    return;
+                }
                 break;
             }
 
@@ -495,7 +522,11 @@ void SchedulerContext::dispatch_shape(
             published_n++;
 
             if (start + claim < slot_state->logical_block_num) {
-                disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                if (!requeue(slot_state)) {
+                    --published_n;
+                    flush_publish();
+                    return;
+                }
             }
 
             for (int32_t b = 0; b < claim; b++) {

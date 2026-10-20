@@ -124,8 +124,15 @@ Code 104 can be reported before or after device execution starts:
   during bind and never reach the device. Split the graph or reduce the number
   of tasks routed to that queue.
 - **Device scheduler:** a queue push found no free slot after bind accepted the
-  graph. Use the reported queue and occupancy details to investigate a runtime
-  accounting error or an incompatible configuration.
+  graph. The failure-only `READY_QUEUE_REJECT` device log identifies the queue,
+  capacity, enqueue/dequeue cursors and next slot sequence. These are concurrent
+  snapshots, not an atomic queue-state dump. Use them to investigate a runtime
+  accounting error or an incompatible configuration. The queue's nonblocking
+  push can return false while a consumer owns a slot after claiming its dequeue
+  cursor. Required-queue callers in the Scheduler retry that release window and
+  stop if another Scheduler has failed. Optional early-dispatch callers retain
+  their fallback paths. An unclaimed full slot or an invalid slot sequence still
+  reports overflow in a required queue sized to cover all reachable tasks.
 
 ### SCHEDULER_TIMEOUT sub-classes
 
