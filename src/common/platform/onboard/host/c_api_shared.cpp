@@ -1295,13 +1295,20 @@ int simpler_kernel_mode_supported(DeviceContextHandle) { return runtime_supports
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
-    const CallConfig *config, uint64_t context_generation
+    const CallConfig *config, uint64_t context_generation, int enable_sdma, const void *sdma_warmup_binary,
+    uint64_t sdma_warmup_size
 ) {
     int rc = validate_kernel_init_args(
         ctx, device_id, aicpu_binary, aicpu_size, aicore_binary, aicore_size, dispatcher_binary, dispatcher_size,
         config, context_generation
     );
     if (rc != 0) return rc;
+    if ((enable_sdma != 0 && enable_sdma != 1) ||
+        !kernel_binary_span_is_consistent(sdma_warmup_binary, sdma_warmup_size))
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    // Refuse before adopting the device or acquiring context resources.
+    if (enable_sdma && (dma_workspace_supported_mask() & (uint32_t{1} << DMA_WORKSPACE_SDMA)) == 0)
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
 
     try {
         PipelineContract contract{};
@@ -1345,6 +1352,12 @@ int simpler_kernel_mode_init(
             std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
             runner->set_dispatcher_binary(std::move(dispatcher_vec));
         }
+        std::vector<uint8_t> warmup_vec;
+        if (enable_sdma && sdma_warmup_size != 0) {
+            const auto *bytes = static_cast<const uint8_t *>(sdma_warmup_binary);
+            warmup_vec.assign(bytes, bytes + sdma_warmup_size);
+        }
+        runner->set_dma_workspace_request(enable_sdma != 0, std::move(warmup_vec));
         const HostApi kernel_api(runner, 0, 0, &g_host_api_ops);
         rc = runner->init_kernel_context(device_id, *config, context_generation, &kernel_api);
     } catch (...) {

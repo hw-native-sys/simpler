@@ -17,7 +17,7 @@
  * an engine is the kernel's decision, not the runtime's: every provisioned
  * address is injected, and a kind the runtime did not provision reads back 0.
  * One slot per engine, indexed by this enum; DMA_WORKSPACE_KIND_COUNT sizes the
- * injected array end to end (InitArgs, the resident AICPU config, and
+ * injected array end to end (InitArgs, the Runtime device image, and
  * GlobalContext).
  *
  * simpler-owned and deliberately independent of pto-isa's comm::DmaEngine —
@@ -34,24 +34,19 @@
  * docs/investigations/2026-07-a2a3-sdma-fault-teardown.md. A Worker declines it
  * by leaving `enable_sdma` off, which is the default.
  *
- * Current support matrix: the a2a3 onboard PTO-SDMA provider is compiled into
- * every a2a3 onboard host_runtime, so both runtimes there provision SDMA on
- * request — the gate is the platform, not the runtime. Only
- * tensormap_and_ringbuffer is exercised with it, so host-build-graph's path from
- * a provisioned address to a kernel's get_dma_workspace is unverified rather
- * than closed. URMA is reserved for the future a5 per-domain provider.
- * Simulation, a5, and builds without the a2a3 PTO-SDMA provider reject a request
- * for SDMA during Worker initialization, when the workspace would be
- * provisioned.
+ * Current support matrix: a2a3 onboard TMR and HBG provision SDMA on request
+ * in both program and kernel modes. Each Runtime snapshots its own addresses;
+ * the scheduler publishes them through each core's GlobalContext.
+ * URMA is reserved for the future a5 per-domain provider.
+ * Program-mode simulation provisions inert scratch for no-op prefetch kernels.
+ * Kernel-mode simulation, a5, and onboard builds without the PTO-SDMA provider
+ * reject an explicit SDMA request during initialization.
  */
 
-#ifndef PLATFORM_COMMON_DMA_WORKSPACE_H_
-#define PLATFORM_COMMON_DMA_WORKSPACE_H_
+#pragma once
 
 enum DmaWorkspaceKind {
     DMA_WORKSPACE_SDMA = 0,  // PTO-ISA async-SDMA (a2a3): TPREFETCH_ASYNC / TGET_ASYNC / TPUT_ASYNC
     DMA_WORKSPACE_URMA = 1,  // Reserved for the future a5 URMA async engine
     DMA_WORKSPACE_KIND_COUNT = 2,
 };
-
-#endif  // PLATFORM_COMMON_DMA_WORKSPACE_H_

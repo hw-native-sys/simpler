@@ -35,7 +35,7 @@ into `**config` and validated later. The recognized keys:
 | --- | ---------- | ------- |
 | `platform` | all | `a2a3`, `a2a3sim`, `a5`, `a5sim` |
 | `runtime` | all | `tensormap_and_ringbuffer` or `host_build_graph` |
-| `execution_mode` | L2 | `"program"` (default) or `"kernel"`; see [Kernel mode](#kernel-mode-l2). `"kernel"` with `level != 2` or a truthy `enable_sdma` raises `ValueError`, as does an unknown value |
+| `execution_mode` | L2 | `"program"` (default) or `"kernel"`; see [Kernel mode](#kernel-mode-l2). `"kernel"` with `level != 2` raises `ValueError`, as does an unknown value |
 | `device_id` | L2 | the single chip this worker drives |
 | `device_ids` | L3+ | one chip child process per entry |
 | `num_sub_workers` | L3+ | host-side Python callables to fork |
@@ -99,6 +99,25 @@ callable is a **Python orchestration function** `f(orch, args, cfg)`, where
 | `alloc_child_tensor(worker_id, shapes, dtype) -> Buffer` | Delegates allocation to the owning Worker; target chip memory is named by the returned handle |
 
 ### Kernel mode (L2)
+
+On a2a3 onboard TMR and HBG, kernel mode accepts `enable_sdma=True` for
+`TPREFETCH_ASYNC` (the runtime primitive used by PyPTO's
+`pl.prefetch.async_prefetch`). For example:
+
+```python
+worker = Worker(level=2, platform="a2a3", runtime="tensormap_and_ringbuffer",
+                execution_mode="kernel", device_id=device_id, enable_sdma=True)
+```
+
+Use `runtime="host_build_graph"` for HBG.
+SDMA provisioning and optional channel warmup occur in `init()`, outside capture.
+Launch and replay reuse the context's workspace without allocating or synchronizing.
+The default remains `False`, which supplies a zero SDMA workspace address. Kernel
+mode rejects SDMA on simulation, a5, and builds without the provider during
+initialization. The low-level equivalent is
+`ChipWorker.kernel_init(device_id, bins, config, enable_sdma=True)`.
+Destroy captured graphs and drain caller work before closing the context; the
+workspace belongs to the context, while the device still belongs to the caller.
 
 `Worker(level=2, execution_mode="kernel")` is the entry for a framework that
 already owns the device and its streams. The Worker borrows the device that is

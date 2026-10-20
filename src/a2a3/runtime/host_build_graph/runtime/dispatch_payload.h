@@ -116,7 +116,7 @@ struct alignas(64) DispatchPayload {
      *  the idle AICore fills them from src_payload during its gate wait. */
     uint64_t args[DISPATCH_MAX_ARGS];
 
-    /** Per-core global context: sub_block_id (AIV lane identity). Cold: written once
+    /** Per-core global context: AIV lane identity and DMA workspaces. Cold: written once
      *  at init, never per dispatch, so it lives in the tail (not the CL0 control
      *  block). args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
     GlobalContext global_context;

@@ -80,6 +80,13 @@ foreach(SRC_FILE ${ALL_SOURCES})
             "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface/tmr_kernel_context.h"
             "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface/tmr_kernel_control.h"
         )
+    elseif(SRC_FILE MATCHES "/host_build_graph/aicore/aicore_executor\\.cpp$")
+        set(SOURCE_WIRE_HEADERS
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/host_build_graph/runtime.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform/include/common/dma_workspace.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../runtime/host_build_graph/common/intrinsic.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/../../../runtime/host_build_graph/runtime/dispatch_payload.h"
+        )
     endif()
     set(OBJ_AIC "${CMAKE_CURRENT_BINARY_DIR}/${SRC_NAME}_aic.o")
     set(OBJ_AIV "${CMAKE_CURRENT_BINARY_DIR}/${SRC_NAME}_aiv.o")

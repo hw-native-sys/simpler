@@ -207,12 +207,14 @@ class KernelCompiler:
         these regardless of what extra_include_dirs the caller passes, so
         kernels can include them without the call site knowing the dependency.
 
-        Also carries ``src/common/platform/include`` so kernel-facing runtime
+        Carries the architecture platform constants (including the device clock)
+        and ``src/common/platform/include`` so kernel-facing runtime
         headers (e.g. ``intrinsic.h``) can pull shared platform headers like
         ``common/dma_workspace.h`` regardless of what the call site passes.
         """
         return [
             str(Path(__file__).resolve().parent / "incore"),
+            str(self.platform_dir / "include"),
             str(self.project_root / "src" / "common" / "platform" / "include"),
         ]
 

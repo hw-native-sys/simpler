@@ -114,14 +114,23 @@ TEST(KernelPipelineEntry, RealSimVariantsValidateWithoutClaimingOrCommitting) {
             ASSERT_NE(ctx, nullptr);
             CallConfig config;
             auto invoke = [&](const CallConfig *input, uint64_t generation = 1) {
-                return init(ctx, 0, nullptr, 0, nullptr, 0, nullptr, 0, input, generation);
+                return init(ctx, 0, nullptr, 0, nullptr, 0, nullptr, 0, input, generation, 0, nullptr, 0);
             };
             EXPECT_EQ(invoke(nullptr), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
             EXPECT_EQ(invoke(&config, 0), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
             const uint8_t binary = 0;
-            EXPECT_EQ(init(ctx, 0, &binary, 0, nullptr, 0, nullptr, 0, &config, 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-            EXPECT_EQ(init(ctx, 0, nullptr, 0, &binary, 0, nullptr, 0, &config, 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
-            EXPECT_EQ(init(ctx, 0, nullptr, 0, nullptr, 0, &binary, 0, &config, 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+            EXPECT_EQ(
+                init(ctx, 0, &binary, 0, nullptr, 0, nullptr, 0, &config, 1, 0, nullptr, 0),
+                PTO_RUNTIME_ERR_INVALID_ARGUMENT
+            );
+            EXPECT_EQ(
+                init(ctx, 0, nullptr, 0, &binary, 0, nullptr, 0, &config, 1, 0, nullptr, 0),
+                PTO_RUNTIME_ERR_INVALID_ARGUMENT
+            );
+            EXPECT_EQ(
+                init(ctx, 0, nullptr, 0, nullptr, 0, &binary, 0, &config, 1, 0, nullptr, 0),
+                PTO_RUNTIME_ERR_INVALID_ARGUMENT
+            );
             config.runtime_env.ring_task_window[0] = 3;
             EXPECT_EQ(
                 invoke(&config), std::string(runtime) == "tensormap_and_ringbuffer" ? PTO_RUNTIME_ERR_INVALID_ARGUMENT :

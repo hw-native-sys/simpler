@@ -492,7 +492,7 @@ bool ChipWorker::probe_kernel_mode_supported(const std::string &host_lib_path, c
 void ChipWorker::kernel_init(
     const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
     const std::string &dispatcher_path, int device_id, const CallConfig &config, uint64_t context_generation,
-    const std::string &sim_context_path
+    const std::string &sim_context_path, bool enable_sdma, const std::string &sdma_warmup_path
 ) {
     if (finalized_) {
         throw ChipWorkerError(PTO_RUNTIME_ERR_INVALID_STATE, "ChipWorker already finalized; cannot reinitialize");
@@ -571,10 +571,13 @@ void ChipWorker::kernel_init(
             dispatcher_bytes = read_binary_file(dispatcher_path);
         }
         const uint8_t *dispatcher_ptr = dispatcher_bytes.empty() ? nullptr : dispatcher_bytes.data();
+        std::vector<uint8_t> warmup_bytes;
+        if (enable_sdma && !sdma_warmup_path.empty()) warmup_bytes = read_binary_file(sdma_warmup_path);
         kernel_context_ = true;
         init_rc = kernel_init_fn(
             device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(), aicore_bytes.size(),
-            dispatcher_ptr, dispatcher_bytes.size(), &config, context_generation
+            dispatcher_ptr, dispatcher_bytes.size(), &config, context_generation, enable_sdma ? 1 : 0,
+            warmup_bytes.empty() ? nullptr : warmup_bytes.data(), warmup_bytes.size()
         );
         if (init_rc == 0) {
             kernel_supported_fn_ = kernel_supported_fn;

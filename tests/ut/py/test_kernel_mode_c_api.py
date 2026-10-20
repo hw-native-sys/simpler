@@ -169,8 +169,18 @@ def _load(arch: str, variant: str, runtime: str) -> ctypes.CDLL:
         ctypes.c_char_p, ctypes.c_size_t,
         ctypes.c_char_p, ctypes.c_size_t,
         ctypes.POINTER(CallConfig), ctypes.c_uint64,
+        ctypes.c_int, ctypes.c_void_p, ctypes.c_uint64,
     ]  # fmt: skip
     lib.simpler_kernel_mode_init.restype = ctypes.c_int
+    native_init = lib.simpler_kernel_mode_init
+
+    def kernel_init(*args, enable_sdma=0, sdma_warmup_binary=None, sdma_warmup_size=None):
+        warmup_size = len(sdma_warmup_binary) if sdma_warmup_binary is not None else 0
+        if sdma_warmup_size is not None:
+            warmup_size = sdma_warmup_size
+        return native_init(*args, enable_sdma, sdma_warmup_binary, warmup_size)
+
+    lib.simpler_kernel_mode_init = kernel_init
     lib.simpler_kernel_mode_prepare_callable.argtypes = [
         ctypes.c_void_p,
         ctypes.c_void_p,
@@ -259,6 +269,29 @@ def test_kernel_init_rejects_malformed_arguments(arch: str, runtime: str):
             )
             == PTO_RUNTIME_ERR_INVALID_ARGUMENT
         )
+    finally:
+        lib.destroy_device_context(ctx)
+
+
+@pytest.mark.parametrize(("arch", "runtime"), _SIM_CASES)
+def test_kernel_sdma_init_validation_leaves_context_unclaimed(arch, runtime):
+    lib = _load(arch, "sim", runtime)
+    config = CallConfig()
+    payload = b"x"
+    ctx = lib.create_device_context()
+    assert ctx
+    args = (ctx, 0, payload, 1, payload, 1, payload, 1, ctypes.byref(config), 1)
+    try:
+        for options in (
+            {"enable_sdma": -1},
+            {"enable_sdma": 2},
+            {"sdma_warmup_size": 1},
+            {"sdma_warmup_binary": payload, "sdma_warmup_size": 0},
+        ):
+            assert lib.simpler_kernel_mode_init(*args, **options) == PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        assert lib.simpler_kernel_mode_init(*args, enable_sdma=1) == PTO_RUNTIME_ERR_UNSUPPORTED
+        assert lib.committed_device_memory_ctx(ctx) == 0
+        assert lib.simpler_kernel_mode_init(*args) == PTO_RUNTIME_ERR_UNSUPPORTED
     finally:
         lib.destroy_device_context(ctx)
 
@@ -674,6 +707,31 @@ def test_simulated_components_report_kernel_mode_unsupported(arch: str, runtime:
             lib.simpler_kernel_mode_prepare_callable(ctx, image, len(image), ctypes.byref(minted))
             == PTO_RUNTIME_ERR_INVALID_STATE
         )
+    finally:
+        lib.destroy_device_context(ctx)
+
+
+@pytest.mark.parametrize(
+    ("arch", "runtime"),
+    [case for case in _ONBOARD_CASES if case.values[0] != "a2a3"],
+)
+def test_kernel_sdma_unsupported_does_not_borrow_device(arch, runtime):
+    lib = _load(arch, "onboard", runtime)
+    ctx = lib.create_device_context()
+    config = CallConfig()
+    payload = b"x"
+    assert ctx
+    try:
+        # No ACL initialization or current device: rejection must precede both
+        # device adoption and parsing/loading of these placeholder binaries.
+        assert (
+            lib.simpler_kernel_mode_init(
+                ctx, 0, payload, 1, payload, 1, payload, 1, ctypes.byref(config), 1, enable_sdma=1
+            )
+            == PTO_RUNTIME_ERR_UNSUPPORTED
+        )
+        assert lib.committed_device_memory_ctx(ctx) == 0
+        assert lib.finalize_device(ctx) == 0
     finally:
         lib.destroy_device_context(ctx)
 

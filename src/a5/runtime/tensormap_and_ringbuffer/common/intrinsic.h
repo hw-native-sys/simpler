@@ -120,6 +120,8 @@ struct GlobalContext {
     // Used by AIV to select the correct intra-cluster hw instruction.
     // Not meaningful for AIC kernels or single-AIV tasks.
     int32_t sub_block_id;
+    // Dense AIV worker slot, stable across logical tasks; -1 on non-AIV workers.
+    int32_t sdma_channel_id;
     // Per-engine async-DMA workspace device addresses (0 when unavailable),
     // indexed by DmaWorkspaceKind. The scheduler copies them from the resident
     // config into every core's context during cold start.
@@ -184,6 +186,17 @@ static __aicore__ inline int32_t get_sub_block_id(__gm__ int64_t *args) {
     __gm__ GlobalContext *ctx =
         reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
     return ctx->sub_block_id;
+}
+
+/**
+ * Return the resident AIV worker's SDMA channel, or -1 on non-AIV workers.
+ * Unlike logical block IDs, this identity is unique across concurrent tasks
+ * and remains stable when a worker picks up its next dispatch.
+ */
+static __aicore__ inline int32_t get_sdma_channel_id(__gm__ int64_t *args) {
+    __gm__ GlobalContext *ctx =
+        reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
+    return ctx->sdma_channel_id;
 }
 
 /**

@@ -910,7 +910,7 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
 // directly, so a thread populates its own CoreTracker + per-core sub_block_id
 // right after handshaking its own clusters, with no all-thread barrier.
 // =============================================================================
-void SchedulerContext::assign_own_clusters(int32_t tidx) {
+void SchedulerContext::assign_own_clusters(int32_t tidx, Runtime *runtime) {
     const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
     const int32_t active = active_sched_threads_;
 
@@ -957,6 +957,11 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
             int32_t core_id = tracker.get_core_id_by_offset(c * PLATFORM_CORES_PER_BLOCKDIM + sub);
             for (int32_t buf = 0; buf < 2; buf++) {
                 DispatchPayload &dp = payload_per_core_[core_id][buf];
+                // Handshake slots put all AICs first, then distinct AIV workers.
+                // Unlike block_idx, this identity never restarts for another task.
+                const int32_t aic_count = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
+                dp.global_context.sdma_channel_id =
+                    core_id >= aic_count && core_id < cores_total_num_ ? core_id - aic_count : -1;
                 AsyncCtx &ac = dp.local_context.async_ctx;
                 volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
                 ac.completion_count = &slab->count;
@@ -966,7 +971,7 @@ void SchedulerContext::assign_own_clusters(int32_t tidx) {
                 slab->count = 0;
                 slab->error_code = SIMPLER_ERROR_NONE;
                 for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
-                    dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
+                    dp.global_context.dma_workspace[k] = runtime->get_dma_workspace_address(k);
                 }
                 dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
                 dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);
@@ -1299,6 +1304,11 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
     for (int32_t core_id = 0; core_id < RUNTIME_MAX_WORKER; core_id++) {
         for (int32_t buf = 0; buf < 2; buf++) {
             DispatchPayload &dp = payload_per_core_[core_id][buf];
+            // Handshake slots put all AICs first, then distinct AIV workers.
+            // Unlike block_idx, this identity never restarts for another task.
+            const int32_t aic_count = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
+            dp.global_context.sdma_channel_id =
+                core_id >= aic_count && core_id < cores_total_num_ ? core_id - aic_count : -1;
             AsyncCtx &ac = dp.local_context.async_ctx;
             volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
             ac.completion_count = &slab->count;
@@ -1310,7 +1320,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime, simpler::tmr::Ca
             slab->count = 0;
             slab->error_code = SIMPLER_ERROR_NONE;
             for (int k = 0; k < DMA_WORKSPACE_KIND_COUNT; ++k) {
-                dp.global_context.dma_workspace[k] = get_dma_workspace_addr(k);
+                dp.global_context.dma_workspace[k] = runtime->get_dma_workspace_address(k);
             }
             dp.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.local_context);
             dp.args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dp.global_context);

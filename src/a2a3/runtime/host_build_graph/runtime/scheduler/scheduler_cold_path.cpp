@@ -968,6 +968,13 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
     for (int32_t core_id = 0; core_id < RUNTIME_MAX_WORKER; core_id++) {
         for (int32_t buf = 0; buf < 2; buf++) {
             DispatchPayload &dp = payload_per_core_[core_id][buf];
+            // Handshake slots put all AICs first, then distinct AIV workers.
+            // Unlike block_idx, this identity never restarts for another task.
+            const int32_t aic_count = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
+            dp.global_context.sdma_channel_id =
+                core_id >= aic_count && core_id < cores_total_num_ ? core_id - aic_count : -1;
+            for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
+                dp.global_context.dma_workspace[kind] = runtime->get_dma_workspace_address(kind);
             AsyncCtx &ac = dp.local_context.async_ctx;
             volatile DeferredCompletionSlab *slab = &deferred_slab_per_core_[core_id][buf];
             ac.completion_count = &slab->count;

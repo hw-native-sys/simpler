@@ -121,10 +121,9 @@ public:
     ///
     /// Takes no ownership of the caller's device: this path never calls
     /// aclInit, aclrtSetDevice, ensure_acl_ready, or any device reset, and it
-    /// provisions no SDMA workspace. `config` is context-static — launches
-    /// never mutate it. `context_generation` must be nonzero and unique among
-    /// the kernel contexts this process constructs; next_kernel_context_generation()
-    /// mints one.
+    /// provisions SDMA only when explicitly requested on a supported TMR or HBG
+    /// target. `config` is context-static — launches never mutate it. `context_generation` must be nonzero and unique
+    /// among the kernel contexts this process constructs; next_kernel_context_generation() mints one.
     ///
     /// The per-slot native-run storage and the ChipRunLane stay absent: both
     /// back the program-mode prepare/launch/poll/wait/finalize_run surface,
@@ -134,7 +133,7 @@ public:
     void kernel_init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
         const std::string &dispatcher_path, int device_id, const CallConfig &config, uint64_t context_generation,
-        const std::string &sim_context_path = ""
+        const std::string &sim_context_path = "", bool enable_sdma = false, const std::string &sdma_warmup_path = ""
     );
 
     /// Whether the bound runtime can execute kernel-mode launches. The answer

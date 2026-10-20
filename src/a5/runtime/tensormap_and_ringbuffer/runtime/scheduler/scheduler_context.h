@@ -88,7 +88,7 @@ public:
     // Barrier-free counterpart of assign_cores_to_threads: thread tidx populates
     // its own CoreTracker + per-core sub_block_id for the clusters it owns, right
     // after handshaking them — no all-thread barrier or leader post_handshake_init.
-    void assign_own_clusters(int32_t tidx);
+    void assign_own_clusters(int32_t tidx, Runtime *runtime);
     // Latch completion + shutdown cores on a handshake failure seen without the
     // barrier (non-DFX path). Idempotent.
     void abort_and_shutdown(Runtime *runtime);

@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "common/core_type.h"
+#include "common/dma_workspace.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_aicpu_affinity.h"  // MAX_GATE_THREADS (aicpu_allowed_cpus bound)
 #include "task_args.h"
@@ -231,6 +232,8 @@ private:
     void *prebuilt_arena_base_;
     size_t prebuilt_runtime_offset_;
 
+    uint64_t dma_workspace_addr_[DMA_WORKSPACE_KIND_COUNT]{};
+
     // Orchestration metadata set by the platform host (DeviceRunner) when
     // registering a callable. host_build_graph runs the orchestrator on the
     // host, so the device side no longer reads the SO bytes / symbol names —
@@ -262,6 +265,11 @@ public:
     void set_worker_count(int n) { worker_count = n; }
     int get_aicpu_thread_num() const { return aicpu_thread_num; }
     void set_aicpu_thread_num(int n) { aicpu_thread_num = n; }
+    void set_dma_workspace_addresses(const uint64_t *addresses) {
+        for (int kind = 0; kind < DMA_WORKSPACE_KIND_COUNT; ++kind)
+            dma_workspace_addr_[kind] = addresses[kind];
+    }
+    uint64_t get_dma_workspace_address(int kind) const { return dma_workspace_addr_[kind]; }
     Handshake *get_workers() { return workers; }
     AicoreTeardownControl *get_teardown_gates() { return teardown_gates; }
     int32_t get_aicpu_allowed_cpu_count() const { return aicpu_allowed_cpu_count; }

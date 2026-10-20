@@ -305,14 +305,12 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  *      simpler_run invocations reuse this resident pair — no binary bytes
  *      cross the C ABI on per-run paths.
  *
- *   4. Provision this device's async-DMA workspaces and latch their device
- *      addresses into the resident AICPU globals, so every subsequent run
- *      carries them (the scheduler prefills each core's GlobalContext from
- *      there, and kernels read them through get_dma_workspace(args, kind); a
- *      kind this device did not provision reads back 0). The addresses are
- *      published by the same one-shot AICPU init launch that step 2's device
- *      bring-up performs, so provisioning is ordered before it rather than
- *      re-latching afterwards.
+ *   4. Provision this runner's async-DMA workspaces. TMR snapshots the device
+ *      addresses into each Runtime device descriptor; the scheduler prefills
+ *      each core's GlobalContext from that snapshot. Kernels read it through
+ *      get_dma_workspace(args, kind), and an unprovisioned kind reads back 0.
+ *      Provisioning precedes the AICPU initialization launch. TMR dispatch
+ *      does not depend on the workspace globals that launch also publishes.
  *
  *      Every engine the platform supports is provisioned except SDMA, which is
  *      provisioned only when `enable_sdma` is non-zero. SDMA is the one engine
@@ -630,6 +628,13 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * nonzero host-process-unique identity minted by the caller for sequential
  * contexts; generation zero is invalid.
  *
+ * `enable_sdma` must be 0 or 1. With 1, a2a3 onboard TMR and HBG provision a
+ * context-owned workspace and optionally warm it from the supplied ELF on
+ * its hidden AICore stream during init. Unsupported targets reject before
+ * resource acquisition. A null warmup pointer requires size zero; it skips
+ * warmup without disabling SDMA. Launch/replay reuse the persistent workspace.
+ * The caller must destroy graphs and drain work before finalize releases it.
+ *
  * Of `config`'s five diagnostics only `enable_chip_swimlane` (0-4) is accepted,
  * and it requires `output_prefix`; the other four and `capture_clock_anchors`
  * return PTO_RUNTIME_ERR_UNSUPPORTED. This call commits the swimlane's device
@@ -643,7 +648,8 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
-    const CallConfig *config, uint64_t context_generation
+    const CallConfig *config, uint64_t context_generation, int enable_sdma, const void *sdma_warmup_binary,
+    uint64_t sdma_warmup_size
 );
 
 /**

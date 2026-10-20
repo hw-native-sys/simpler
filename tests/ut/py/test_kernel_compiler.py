@@ -83,11 +83,12 @@ def test_host_orchestration_is_a_self_contained_log_consumer(
     assert "graph_recorder_pool.cpp" not in source_names
 
 
-def test_direct_compiler_command_uses_checkout_relative_paths(monkeypatch, tmp_path):
+@pytest.mark.parametrize("platform", ["a2a3sim", "a5sim"])
+def test_direct_compiler_command_uses_checkout_relative_paths(monkeypatch, tmp_path, platform):
     from simpler_setup import kernel_compiler  # noqa: PLC0415
     from simpler_setup.environment import PROJECT_ROOT  # noqa: PLC0415
 
-    compiler = kernel_compiler.KernelCompiler("a2a3sim")
+    compiler = kernel_compiler.KernelCompiler(platform)
     source = PROJECT_ROOT / "simpler_setup" / "incore" / "pipe_sync.h"
     captured = {}
     monkeypatch.setattr(compiler, "_make_temp_path", lambda **_kwargs: str(tmp_path / "kernel.so"))
@@ -101,6 +102,9 @@ def test_direct_compiler_command_uses_checkout_relative_paths(monkeypatch, tmp_p
     assert compiler._compile_incore_sim(str(source), core_type="aiv") == b"compiled"
     assert captured["cmd"][-1] == str(Path("simpler_setup") / "incore" / "pipe_sync.h")
     assert f"-I{Path('simpler_setup') / 'incore'}" in captured["cmd"]
+    architecture_headers = compiler.platform_dir / "include"
+    assert (architecture_headers / "common" / "platform_config.h").is_file()
+    assert f"-I{architecture_headers.relative_to(PROJECT_ROOT)}" in captured["cmd"]
 
 
 def test_compiler_subprocess_runs_from_checkout_root(monkeypatch):

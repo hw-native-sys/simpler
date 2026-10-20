@@ -293,7 +293,7 @@ def kernel_symbol_runtime(tmp_path_factory):
             + (
                 "int simpler_kernel_mode_init(DeviceContextHandle ctx, int, const uint8_t *, size_t,\n"
                 "                             const uint8_t *, size_t, const uint8_t *, size_t,\n"
-                "                             const CallConfig *, uint64_t) {\n"
+                "                             const CallConfig *, uint64_t, int, const void *, uint64_t) {\n"
                 "    if (ctx == nullptr) std::abort();\n"
                 f"    return {kernel_init_result};\n"
                 "}\n"

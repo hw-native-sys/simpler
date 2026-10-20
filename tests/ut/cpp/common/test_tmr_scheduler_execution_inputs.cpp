@@ -164,6 +164,27 @@ TEST_F(TmrSchedulerExecutionInputsTest, ExplicitTableSurvivesHandshakeAndOrdinar
     }
 }
 
+TEST_F(TmrSchedulerExecutionInputsTest, SdmaChannelBelongsToWorkerAcrossPayloadBuffersAndTasks) {
+    initialize({table_a.data(), table_a.size()});
+    for (int buf = 0; buf < 2; ++buf) {
+        EXPECT_EQ(context->payload_per_core_[0][buf].global_context.sdma_channel_id, -1);
+        for (int core = 1; core < 3; ++core) {
+            auto &payload = context->payload_per_core_[core][buf];
+            // Concurrent tasks may both have logical block zero.
+            ASSERT_TRUE(context->build_payload(payload, slot, SubtaskSlot::AIV0, 0, false));
+            EXPECT_EQ(get_sdma_channel_id(reinterpret_cast<int64_t *>(payload.args)), core - 1);
+            ASSERT_TRUE(context->build_payload(payload, slot, SubtaskSlot::AIV0, 17, false));
+            EXPECT_EQ(get_sdma_channel_id(reinterpret_cast<int64_t *>(payload.args)), core - 1);
+        }
+    }
+    // The barrier-free path must publish the same mapping as the serial path.
+    context->assign_own_clusters(0, resident.get());
+    for (int buf = 0; buf < 2; ++buf) {
+        EXPECT_EQ(context->payload_per_core_[1][buf].global_context.sdma_channel_id, 0);
+        EXPECT_EQ(context->payload_per_core_[2][buf].global_context.sdma_channel_id, 1);
+    }
+}
+
 TEST_F(TmrSchedulerExecutionInputsTest, ExplicitTableBuildsEarlyPayloadAcrossABA) {
     for (const auto *table : {&table_a, &table_b, &table_a}) {
         init_slot();

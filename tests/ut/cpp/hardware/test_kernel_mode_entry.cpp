@@ -116,7 +116,7 @@ struct RuntimeBinaries {
         const CallConfig config{};
         return api.init(
             ctx, device_id, aicpu.data(), aicpu.size(), aicore.data(), aicore.size(), dispatcher.data(),
-            dispatcher.size(), &config, generation
+            dispatcher.size(), &config, generation, 0, nullptr, 0
         );
     }
 };
@@ -340,15 +340,16 @@ TEST_F(KernelModeEntryTest, MalformedArgumentsAreRejectedBeforeTheStateCheck) {
 
     // Generation zero is the ABI's invalid generation.
     EXPECT_EQ(
-        api.init(ctx, device_id_, aicpu.data(), aicpu.size(), nullptr, 0, nullptr, 0, &config, 0),
+        api.init(ctx, device_id_, aicpu.data(), aicpu.size(), nullptr, 0, nullptr, 0, &config, 0, 0, nullptr, 0),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     // A binary and its size describe one object: present-together or absent-together.
     EXPECT_EQ(
-        api.init(ctx, device_id_, aicpu.data(), 0, nullptr, 0, nullptr, 0, &config, 1), PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        api.init(ctx, device_id_, aicpu.data(), 0, nullptr, 0, nullptr, 0, &config, 1, 0, nullptr, 0),
+        PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
     EXPECT_EQ(
-        api.init(ctx, -1, aicpu.data(), aicpu.size(), nullptr, 0, nullptr, 0, &config, 1),
+        api.init(ctx, -1, aicpu.data(), aicpu.size(), nullptr, 0, nullptr, 0, &config, 1, 0, nullptr, 0),
         PTO_RUNTIME_ERR_INVALID_ARGUMENT
     );
 

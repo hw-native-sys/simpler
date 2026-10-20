@@ -777,3 +777,149 @@ SPMD grouping and overhead counters are isolated per launch. See the
   safely locate the AICore cancellation target. Ordinary invalid host arguments
   are rejected before enqueue; recovery from a corrupted outer device packet
   requires a future prepared-binding registry and explicit revocation.
+
+## TMR and HBG kernel-mode async prefetch
+
+Based on `feat/kernel-mode-integration-test` at `17e342455`, the a2a3 onboard
+TMR and HBG paths accept `Worker(level=2, execution_mode="kernel", enable_sdma=True)`
+and the equivalent `ChipWorker.kernel_init(..., enable_sdma=True)`.
+This validates simpler's `TPREFETCH_ASYNC` runtime support; it does not qualify
+an end-to-end PyPTO `pl.prefetch.async_prefetch` frontend integration.
+
+Initialization provisions the SDMA provider and runs its optional warmup ELF
+on the context's hidden AICore stream, outside capture. Both runtimes copy DMA workspace
+addresses into its Runtime device descriptor for both program and kernel modes.
+The scheduler reads that descriptor instead of the resident SO's mutable DMA
+globals. Launch/replay reuse the persistent addresses. Close follows the existing
+external-quiescence and graph-destruction contract, without resetting the borrowed
+device. Kernel fatal teardown skips the program-only reset handoff delay.
+
+The default SDMA flag stays off. A5, simulation kernel mode, and provider-disabled
+builds reject explicit SDMA enablement. The native init C ABI has three appended
+SDMA arguments; downstream native callers and runtime binaries must be rebuilt
+together. HBG's a2a3 scheduler initializes both payload slots with the Runtime's
+DMA address snapshot. Its `DispatchPayload` remains 512 bytes.
+
+### Functional coverage
+
+`tests/st/a2a3/tensormap_and_ringbuffer/kernel_mode_capture/test_kernel_prefetch.py`
+is marked `sdma` and runs each case in an isolated onboard subprocess:
+
+| Case | Data and assertion |
+| ---- | ------------------ |
+| `eager` | 100 launches; 128 FP32 elements each; input changes every round and output starts at `-999`; exact output comparison |
+| `replay` | First invocation is captured without eager priming; 100 ACLGraph replays with new input values and reset output sentinels |
+| `recreate` | 100 replays, graph destruction, context close, then new contexts with SDMA disabled and enabled on the same borrowed device |
+| `disabled` | 100 launches leave the output sentinel intact because the kernel observes a zero workspace |
+| `program_isolation` | Program SDMA init, kernel init without SDMA, kernel close, then 100 successful program prefetch runs; reproduces the address-clobber sequence without violating the resident executor's program/kernel mutual exclusion |
+
+The reused prefetch kernel writes output only after observing a non-null SDMA
+workspace and successful `AsyncEvent.Wait`. Eager/capture/replay instrumentation
+checks zero internal synchronization and zero `rtMalloc` calls during invocation,
+plus stable resident argument addresses and committed allocator memory. Successful
+close is followed by a caller allocation to check borrowed-device usability.
+C++ tests check initial zero addresses, independent Runtime snapshots, and the
+bytes copied to the device image. C ABI tests cover malformed SDMA arguments and
+unsupported targets rejecting before resource acquisition.
+
+### Initial TMR validation results
+
+- Editable build of bindings and available runtime variants: passed.
+- Python unit tests: **2560 passed, 74 skipped**.
+- C++ unit targets: **179 passed, 2 failed**. Both failures are the existing
+  A2A3/A5 `aicore_pre_window_cancel` targets; all four cases in each also fail
+  with exit status 4 on the unchanged `17e342455` baseline. The existing
+  `test_a2a3_thread_scheduling` target needs the shared platform include directory
+  supplied through `CPLUS_INCLUDE_PATH` to build locally.
+- Isolated single-device SDMA sweep: **7 passed**, comprising all five new
+  prefetch cases, the program-mode prefetch demo, and the existing bounded
+  SDMA fault-teardown case. The two-device SDMA completion scene was excluded.
+- Existing TMR onboard capture regression: **4 passed** (`cold_unsynced`,
+  `fresh_inputs`, `eager_batch`, `eager_dag`), each with 100 rounds.
+- Before HBG support was added, its native SDMA rejection before device adoption passed.
+- Complete a2a3 onboard TMR L2 scenes with `-m "not sdma"`: **58 passed**.
+- Complete a2a3sim L2 scenes: **42 passed, 8 skipped**.
+- The broader a2a3sim sweep did not finish: its multi-device resource phase
+  timed out after 600 seconds in `TestAllreduceIbingRejectNonSum`. This is an
+  unresolved broad-regression result, not a passing full simulation sweep.
+- The broader all-runtime onboard L2 sweep was stopped after HBG failures.
+  HBG `benchmark_bgemm` also failed alone with AICPU synchronization status
+  507018 after approximately 45 seconds. The HBG extension validation below
+  supersedes this isolated failure after a clean AICore rebuild and records
+  the separate runtime-switching limitation found in the combined sweep.
+- Changed-file Python formatting/lint, C++ formatting, header, language,
+  platform-literal, retired-name and kernel-wire checks: passed.
+
+A5 onboard and PyPTO frontend integration are not covered. Multi-device onboard
+sweeps require more than the single available card and are not covered by these
+single-device results.
+
+Local build/test logs are retained under
+`outputs/tmr_kernel_prefetch_validation/`. The hardware test commands used
+`task-submit` device locks after the a2a3 silicon precheck. Reproduction commands
+inside that locked environment (with SDK environment and the worktree venv active):
+
+```bash
+python -m pytest tests/st/a2a3/tensormap_and_ringbuffer/kernel_mode_capture/test_kernel_prefetch.py \
+    --platform a2a3 --device "$TASK_DEVICE" -v --pto-session-timeout 600
+python -m pytest examples tests/st -m sdma --exclude-level 3 \
+    --platform a2a3 --device "$TASK_DEVICE" -v --pto-session-timeout 600
+python -m pytest examples tests/st -m "not sdma" --level 2 \
+    --runtime tensormap_and_ringbuffer --platform a2a3 --device "$TASK_DEVICE" \
+    -v --require-pto-isa --pto-session-timeout 600
+```
+
+### HBG prefetch extension
+
+The a2a3 HBG kernel path uses the same context-owned SDMA provider and warmup
+lifecycle as TMR. `Runtime` retains its own address snapshot; the scheduler
+copies it into both dispatch payload buffers. User kernels obtain it through
+`get_dma_workspace(args, DMA_WORKSPACE_SDMA)` without adding user arguments.
+
+The HBG scene in
+`tests/st/a2a3/host_build_graph/kernel_mode_capture/test_kernel_prefetch.py`
+uses two dependent prefetch/copy tasks and a runtime-owned intermediate tensor.
+Each of its five cases reuses the 128-element FP32, 100-round, changing-input
+oracles above. The native observer handles HBG's HostArgs launch API and checks
+stable resident argument addresses as well as zero invocation synchronization,
+zero `rtMalloc` calls, and no committed-memory growth.
+
+Validation of the HBG extension:
+
+- HBG prefetch: **5 passed** (eager, first-use capture/replay, recreation,
+  disabled workspace, and program/kernel address isolation).
+- Isolated single-device SDMA sweep: **12 passed**, including the five HBG
+  and five TMR prefetch cases, the program prefetch demo and bounded fault teardown.
+- Existing HBG capture/replay suite: **20 passed**, including internal tensors,
+  input changes, chained graphs and callable preparation inside capture.
+- HBG onboard L2 scenes in isolation: **41 passed, 1 skipped**.
+- TMR onboard L2 scenes in isolation: **58 passed**.
+- HBG/kernel C++ test targets: **66 passed**.
+- Python unit tests: **2560 passed, 73 skipped**.
+- a2a3sim L2 scenes: **42 passed, 8 skipped**.
+- Runtime builds and changed-file formatting/lint: passed.
+
+An initial HBG handshake timeout also affected the non-prefetch capture control.
+That control passed on a clean `17e342455` build; cleaning and rebuilding the
+current HBG AICore binary removed the timeout. The AICore custom build commands
+omitted HBG Runtime/context header dependencies. Both onboard architecture build
+files include those dependencies, and Ninja's dependency graph was checked.
+The previously failing HBG program benchmark also passed after the rebuild.
+
+The combined all-runtime onboard L2 sweep reported **94 passed, 1 skipped,
+5 failed**. Failures occurred on the first program-mode run following a runtime
+switch, with AICPU synchronization status 507018. The two standalone matrix
+retries and both complete runtime-isolated sweeps passed. This combined sweep
+used `--level 2` without `--runtime`, which bypasses the test dispatcher's
+runtime isolation. A clean `17e342455` baseline reproduced the same failure:
+two HBG scenes passed, then the first TMR scene failed with 507018. The same
+three baseline scenes passed when dispatched into separate processes. This
+matches the existing [onboard runtime isolation constraint](testing.md#runtime-isolation-constraint-onboard).
+Use one `--runtime` per L2 invocation, or let the dispatcher isolate runtimes;
+the failing combined invocation is not a supported full-regression recipe.
+Baseline logs are `baseline-mixed-same-process.log` and
+`baseline-mixed-isolated.log` in the directory below.
+
+Logs are under `outputs/hbg_kernel_prefetch_validation/`. All onboard tests used
+`task-submit` after silicon precheck. A5 onboard, multi-device SDMA and PyPTO DSL
+end-to-end execution are not qualified by these results.
