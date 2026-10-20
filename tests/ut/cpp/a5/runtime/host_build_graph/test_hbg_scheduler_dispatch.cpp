@@ -45,23 +45,6 @@ test_slot(FixtureStorage &storage, const SchedulerWorkerContext &scheduler, uint
     return &storage.scheduler_local_state.slots[pending_slot];
 }
 
-SchedulerSsbufDispatchControl *test_ssbuf_control(
-    FixtureStorage &storage, const SchedulerWorkerContext &scheduler, uint64_t worker_id, uint32_t pending_slot
-) {
-    return &storage.ssbuf_region->lanes[test_cluster_lane(scheduler, worker_id)].dispatch[pending_slot];
-}
-
-SchedulerSsbufCompletionInbox *
-test_completion_inbox(FixtureStorage &storage, const SchedulerWorkerContext &scheduler, uint64_t worker_id) {
-    return &storage.ssbuf_region->lanes[test_cluster_lane(scheduler, worker_id)].completion;
-}
-
-SchedulerExecutorTaskTrace *test_ssbuf_trace(
-    FixtureStorage &storage, const SchedulerWorkerContext &scheduler, uint64_t worker_id, uint32_t pending_slot
-) {
-    return &storage.ssbuf_region->lanes[test_cluster_lane(scheduler, worker_id)].traces[pending_slot].payload;
-}
-
 void configure_normal_aiv_cluster(FixtureStorage &storage, uint64_t task_count) {
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     SchedulerWorkerContext &scheduler = storage.contexts[1];
@@ -114,13 +97,7 @@ void occupy_normal_slot(
     local_slot.subtask_slot = 1;
     local_slot.state = SchedulerDispatchSlotState::READY;
     local_slot.generation = ++storage.scheduler_local_state.dispatch_sequence;
-    if (worker_id == scheduler.worker_index) {
-        scheduler_local_ready_publish(&storage.scheduler_local_state, pending_slot);
-    } else {
-        scheduler_ssbuf_store_relaxed(
-            &test_ssbuf_control(storage, scheduler, worker_id, pending_slot)->publication, local_slot.generation
-        );
-    }
+    scheduler_local_ready_publish(&storage.scheduler_local_state, pending_slot);
 }
 
 // A completed task in one of this core's own slots. A core fills and retires
@@ -336,7 +313,6 @@ TEST(SchedulerClusterCompletion, SelfSlotsKeepDistinctSampledTraces) {
         EXPECT_EQ(traces[index].kernel_start_cycles, 100 + index);
         EXPECT_EQ(traces[index].kernel_end_cycles, 200 + index);
         EXPECT_FALSE(local->sampled_task_timing(1, index));
-        EXPECT_EQ(storage.ssbuf_region->lanes[1].traces[index].payload.kernel_end_cycles, 0u);
     }
 }
 
@@ -614,11 +590,6 @@ TEST(SchedulerClusterCompletion, UsesSchedulerLocalSlotStateWithoutRereadingDisp
     auto *executor_trace = &scheduler_local_state.profiling->executor_traces[0];
     executor_trace->kernel_start_cycles = 100;
     executor_trace->kernel_end_cycles = 200;
-    // Poison the published dispatch metadata: the completion reads this core's
-    // own slot state and must not go back to SSBUF for any of it.
-    auto *published_control = test_ssbuf_control(storage, scheduler, 0, 0);
-    published_control->task_ref = 999;
-    published_control->publication = completed_generation + 99;
     scheduler_local_state.local_completed_generations[0] = completed_generation;
 
     SchedulerReadyStats ready_stats{};
@@ -672,14 +643,11 @@ TEST(SchedulerClusterCompletion, CachesStableWorkerTraceAfterFirstCompletion) {
             storage.run_control, SchedulerFreeSlotClaim{0, pending_slot, local_slot->generation, 0}, ready,
             SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, storage.ssbuf_region
         ));
-        auto *executor_trace = test_ssbuf_trace(storage, scheduler, 0, pending_slot);
+        auto *executor_trace = &scheduler_local_state.profiling->executor_traces[pending_slot];
         executor_trace->kernel_start_cycles = 100 + pending_slot;
         executor_trace->kernel_end_cycles = 200 + pending_slot;
     }
 
-    auto *completion_line = test_completion_inbox(storage, scheduler, 0);
-    completion_line->publication =
-        scheduler_ssbuf_update_completion(completion_line->publication, 0, scheduler_local_state.slots[0].generation);
     ASSERT_TRUE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
         storage.run_control, 0, 0, scheduler_local_state.slots[0].generation, nullptr, nullptr, nullptr,
@@ -691,8 +659,6 @@ TEST(SchedulerClusterCompletion, CachesStableWorkerTraceAfterFirstCompletion) {
     target.trace_handshake_publish_cycles = 22;
     target.trace_register_release_cycles = 23;
     target.trace_descriptor_cache_observed_cycles = 24;
-    completion_line->publication =
-        scheduler_ssbuf_update_completion(completion_line->publication, 1, scheduler_local_state.slots[1].generation);
     ASSERT_TRUE(scheduler_service_cluster_completion_slot(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
         storage.run_control, 0, 1, scheduler_local_state.slots[1].generation, nullptr, nullptr, nullptr,
@@ -811,7 +777,8 @@ TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
     EXPECT_EQ(local->own_slots()[0].state, SchedulerDispatchSlotState::READY);
     EXPECT_EQ(local->own_slots()[1].task_ref, SCHEDULER_TASK_REF_INVALID);
     EXPECT_EQ(local->own_slots()[1].state, SchedulerDispatchSlotState::FILLING);
-    EXPECT_EQ(test_ssbuf_control(storage, scheduler, 0, 1)->publication, 0u);
+    // Slot 0 dispatched and slot 1 did not, so only slot 0 is published.
+    EXPECT_EQ(local->local_ready_mask, 1u);
     EXPECT_NE(storage.run_control->scheduler_error, 0u);
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_SHAPE));
 }
@@ -1135,8 +1102,7 @@ struct MixFixture {
         return lane == 0 ? local->dispatch_sequence : local->mix_dispatch_sequences[lane];
     }
     SchedulerSsbufDispatchControl *control(uint32_t lane, uint32_t index) {
-        return lane == 0 ? &storage.ssbuf_region->lanes[lane].dispatch[index] :
-                           &storage.ssbuf_region->mix_dispatch[lane][index];
+        return &storage.ssbuf_region->mix_dispatch[lane][index];
     }
     bool complete(uint32_t lane, uint32_t index, SchedulerRefillCandidates *candidates = nullptr) {
         if (lane == local->config.self_lane) local->local_ready_mask &= ~(1U << index);
@@ -1237,7 +1203,10 @@ TEST(SchedulerMix, FailedPreparationPublishesNothingAndConsumesNoSequence) {
     for (uint32_t lane = 0; lane < 3; ++lane) {
         EXPECT_EQ(f.sequence(lane), 0u);
         EXPECT_EQ(f.slot(lane, 0).state, SchedulerDispatchSlotState::FREE);
-        EXPECT_EQ(f.control(lane, 0)->publication, 0u);
+        // Only a Mix subtask publishes through SSBUF; lane 0 is the
+        // coordinator's own slot, whose publication is the local ready mask
+        // asserted below.
+        if (lane != 0) EXPECT_EQ(f.control(lane, 0)->publication, 0u);
     }
     EXPECT_EQ(f.local->local_ready_mask, 0u);
     EXPECT_EQ(f.local->mix_trackers[0].task_ref, SCHEDULER_TASK_REF_INVALID);
@@ -1516,5 +1485,5 @@ TEST(SchedulerDispatch, SequenceExhaustionDoesNotPublishOrWrap) {
         metadata, 0, f.storage.ssbuf_region, 0
     ));
     EXPECT_EQ(f.local->dispatch_sequence, UINT32_MAX);
-    EXPECT_EQ(f.storage.ssbuf_region->lanes[0].dispatch[0].publication, 0u);
+    EXPECT_EQ(f.local->local_ready_mask, 0u);
 }

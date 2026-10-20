@@ -131,13 +131,14 @@ struct SchedulerFreeSlotClaim {
     bool mix{false};
 };
 
-// Where a claim's dispatch is published. Mix slots have their own controls, so
-// a Mix dispatch never disturbs the publication of the lane's own work.
-inline __aicore__ SCHEDULER_SSBUF SchedulerSsbufDispatchControl *scheduler_slot_dispatch_control(
+// Where a Mix dispatch is published. Only a Mix slot is published through SSBUF
+// at all: it is the one slot a core does not fill for itself, so its holder has
+// to be told. A core's own dispatch stays in local state, which is where its
+// executor reads it.
+inline __aicore__ SCHEDULER_SSBUF SchedulerSsbufDispatchControl *scheduler_mix_dispatch_control(
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, const SchedulerFreeSlotClaim &claim
 ) {
-    return claim.mix ? &ssbuf_region->mix_dispatch[claim.cluster_lane][claim.slot_index] :
-                       &ssbuf_region->lanes[claim.cluster_lane].dispatch[claim.slot_index];
+    return &ssbuf_region->mix_dispatch[claim.cluster_lane][claim.slot_index];
 }
 
 struct SchedulerLocalSlotState {
@@ -1450,10 +1451,11 @@ inline __aicore__ void scheduler_stage_dispatch_slot(
     local_slot->generation = generation;
     local_slot->state = SchedulerDispatchSlotState::READY;
     local_slot->subtask_slot = subtask_slot;
-    const bool remote = slot_claim.worker_id != scheduler->worker_id();
-    SCHEDULER_SSBUF SchedulerSsbufDispatchControl *dispatch_control =
-        scheduler_slot_dispatch_control(ssbuf_region, slot_claim);
-    if (remote) {
+    // Only a Mix slot's holder has to be told what it is running; this core
+    // reads its own slots out of the local state written just above.
+    if (slot_claim.mix) {
+        SCHEDULER_SSBUF SchedulerSsbufDispatchControl *dispatch_control =
+            scheduler_mix_dispatch_control(ssbuf_region, slot_claim);
         dispatch_control->task_ref = ready_claim.task_ref;
         dispatch_control->subtask_slot = subtask_slot;
     }
@@ -1470,13 +1472,11 @@ inline __aicore__ void scheduler_commit_dispatch_slot(
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
     const uint64_t dispatch_start_cycles = prepare_start_cycles;
     const uint32_t generation = scheduler->slot_state(slot_claim)->generation;
-    const bool remote = slot_claim.worker_id != scheduler->worker_id();
-    SCHEDULER_SSBUF SchedulerSsbufDispatchControl *dispatch_control =
-        scheduler_slot_dispatch_control(ssbuf_region, slot_claim);
     const uint64_t ready_publish_cycles = schedule_timing_enabled ? scheduler_cycles() : 0;
-    if (remote) {
+    if (slot_claim.mix) {
         scheduler_ssbuf_store_relaxed(
-            &dispatch_control->publication, scheduler_ssbuf_pack_ready(generation, metadata.timing_slot)
+            &scheduler_mix_dispatch_control(ssbuf_region, slot_claim)->publication,
+            scheduler_ssbuf_pack_ready(generation, metadata.timing_slot)
         );
     } else {
         scheduler_local_ready_publish(scheduler, slot_claim.slot_index);

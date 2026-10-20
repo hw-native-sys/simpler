@@ -413,10 +413,8 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 1024u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
     EXPECT_NE(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_waiter) / 64);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, dispatch[1]), 0x20u);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, traces[0]), 0x40u);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, traces[1]), 0x80u);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, completion), 0xc0u);
+    EXPECT_EQ(offsetof(SchedulerSsbufLane, mix_completion), 0x00u);
+    EXPECT_EQ(sizeof(SchedulerSsbufLane), 0x40u);
     EXPECT_EQ(
         offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64, offsetof(SchedulerTaskTrace, complete_loop_iter) / 64
     );
@@ -439,10 +437,10 @@ TEST(SchedulerSsbuf, InitializesDirtyMailboxWithoutTouchingUserStorage) {
     EXPECT_EQ(reinterpret_cast<uint8_t *>(region) - hardware.data(), SCHEDULER_SSBUF_REGION_OFFSET);
     EXPECT_TRUE(scheduler_ssbuf_is_initialized(region));
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-            EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].dispatch[slot].publication), 0u);
+        for (uint32_t slot = 0; slot < SCHEDULER_MIX_SLOT_COUNT; ++slot) {
+            EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->mix_dispatch[lane][slot].publication), 0u);
         }
-        EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].completion.publication), 0u);
+        EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].mix_completion.publication), 0u);
     }
     EXPECT_EQ(hardware[SCHEDULER_SSBUF_REGION_OFFSET - 1], 0xa5);
 }
