@@ -55,7 +55,7 @@ static TaskId submit_aiv_producer(const simpler::tmr::Tensor &out, int16_t core_
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.add_scalar(PRODUCER_SPIN_ITERS);
-    args.launch_spec.set_core_num(core_num);
+    args.launch_spec.set_block_num(core_num);
     args.set_allow_early_resolve(early_on);
     return rt_submit_aiv_task(FUNC_SPMD_WRITE_AIV, args).task_id();
 }
@@ -65,7 +65,7 @@ static void submit_mix_sync_consumer(const simpler::tmr::Tensor &out, int16_t co
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.add_scalar(0);  // consumer does not spin
-    args.launch_spec.set_core_num(core_num);
+    args.launch_spec.set_block_num(core_num);
     args.launch_spec.set_require_sync_start(true);
     args.add_dep(dep);
     rt_submit_task(mix_kernels(), args);

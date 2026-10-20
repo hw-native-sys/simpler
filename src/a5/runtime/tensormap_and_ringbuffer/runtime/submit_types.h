@@ -252,19 +252,19 @@ struct MixedKernels {
  *
  * Controls how many logical blocks (SPMD dimension) a single task
  * is expanded into at dispatch time.  Each block receives a unique
- * block_idx in [0, core_num) via the per-dispatch LocalContext.
+ * block_idx in [0, block_num) via the per-dispatch LocalContext.
  */
 class LaunchSpec {
 public:
     constexpr LaunchSpec() = default;
 
-    int16_t core_num() const { return core_num_; }
-    void set_core_num(int16_t n) { core_num_ = n; }
+    int16_t block_num() const { return block_num_; }
+    void set_block_num(int16_t n) { block_num_ = n; }
 
     bool require_sync_start() const { return require_sync_start_; }
     void set_require_sync_start(bool v) { require_sync_start_ = v; }
 
 private:
-    int16_t core_num_{1};
+    int16_t block_num_{1};
     bool require_sync_start_{false};
 };

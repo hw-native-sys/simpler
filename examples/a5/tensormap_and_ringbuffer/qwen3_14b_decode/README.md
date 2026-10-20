@@ -143,7 +143,7 @@ re-transcribe `CALLABLE` from `OUT/kernel_config.py` (which already records
 `func_id`, `core_type`, per-kernel `signature`, and `extra_include_dirs`).
 
 The harvest is a2a3 codegen, so re-apply the deltas from "Relationship to the
-a2a3 example" afterwards. The three mechanical ones are one pass each:
+a2a3 example" afterwards. The two mechanical ones are one pass each:
 
 ```bash
 cd examples/a5/tensormap_and_ringbuffer/qwen3_14b_decode
@@ -151,7 +151,6 @@ grep -rlZ '__DAV_C220_' kernels | xargs -0 sed -i \
     's/__DAV_C220_VEC__/__DAV_VEC__/g; s/__DAV_C220_CUBE__/__DAV_CUBE__/g'
 grep -rlZ 'pipe_barrier(PIPE_\(V\|MTE1\|FIX\));' kernels | xargs -0 sed -i \
     '/^[[:space:]]*pipe_barrier(PIPE_\(V\|MTE1\|FIX\));[[:space:]]*$/d'
-sed -i 's/\.set_block_num(/.set_core_num(/g' kernels/orchestration/decode_fwd_layers.cpp
 ```
 
 The Left-tile fractal and the `fai_body.hpp` edits (include order, soft Mix
@@ -248,7 +247,6 @@ so a refresh is still "re-harvest a2a3, then re-apply this table".
 
 | Delta | Where | Why a5 needs it |
 | ----- | ----- | --------------- |
-| `set_block_num` → `set_core_num` (×18) | orchestration | a5 tmr `LaunchSpec` names the accessor `set_core_num` (hbg still has `set_block_num`) |
 | Left(A) tile `BLayout::RowMajor` → `ColMajor` (×288) | AIC kernels | a5 cube takes L0A in the ColMajor fractal: pto-isa's own `TileLeft` alias is `BLayout::ColMajor` off a2a3, and `CheckMadValid` asserts `!TileLeft::isRowMajor`. SFractal stays `RowMajor`, and the L1 `Mat` tiles the `TEXTRACT` reads from are unchanged |
 | drop `pipe_barrier(PIPE_V)` (×135), `pipe_barrier(PIPE_MTE1)` (×32), `pipe_barrier(PIPE_FIX)` (×3) | AIV + AIC kernels | a5 `pipe_barrier` accepts only `MTE3` / `M` / `ALL`; anything else is a compile error. Nothing is lost: a5's own `pto::Event` emits no barrier for a same-pipe V event either, and every cross-pipe order here is already carried by a `set_flag` / `wait_flag` pair |
 | `__DAV_C220_{VEC,CUBE}__` → `__DAV_{VEC,CUBE}__` (3 files) | attention extern | `__DAV_C220_*` is the a2a3 (`dav-c220`) ccec predefine. a5 builds as `dav-c310`, so on a5 those guards silently compiled out the whole RoPE/QK-norm/KV-write phase **and** the vendor FAI's cube and vector bodies — the task ran to completion writing nothing. `__DAV_VEC__` / `__DAV_CUBE__` are predefined on both arches and are what every other kernel here already uses |

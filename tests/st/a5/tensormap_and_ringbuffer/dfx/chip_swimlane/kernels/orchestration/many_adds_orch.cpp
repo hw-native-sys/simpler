@@ -73,7 +73,7 @@ static void submit_long_spmd_burst(const simpler::tmr::Tensor &spmd_ws) {
         args.add_inout(spmd_ws);
         args.add_scalar(static_cast<int64_t>(i) * kSpmdBlocks);  // base_cl
         args.add_scalar(kSpmdSpinIters);
-        args.launch_spec.set_core_num(kSpmdBlocks);
+        args.launch_spec.set_block_num(kSpmdBlocks);
         (void)rt_submit_aiv_task(FUNC_SPMD_SLOW, args);
     }
 }

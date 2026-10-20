@@ -768,7 +768,7 @@ static bool prepare_task(
     // task_state left as CONSUMED by eager reset (safe for stale wait_for_tensor
     // observers); set to PENDING here when orchestrator actually reuses the slot.
     out->slot_state->task_state.store(CHIP_TASK_PENDING, std::memory_order_relaxed);
-    int16_t block_num = args.launch_spec.core_num();
+    int16_t block_num = args.launch_spec.block_num();
     out->slot_state->total_required_subtasks =
         static_cast<int16_t>(block_num * __builtin_popcount(active_mask.core_mask()));
     out->slot_state->logical_block_num = block_num;
@@ -1071,7 +1071,7 @@ static TaskOutputTensors submit_task_common(
             task_id, orch->in_manual_scope(), args.allow_early_resolve(), tc, tensor_ptrs, arg_types_u8,
             static_cast<int>(args.explicit_dep_count()), args.explicit_deps_data(),
             reinterpret_cast<const uint8_t *>(args.explicit_dep_kinds_data()),
-            static_cast<uint8_t>(DEP_WAIT | DEP_RETAIN), args.launch_spec.core_num(), kernel_ids_capture
+            static_cast<uint8_t>(DEP_WAIT | DEP_RETAIN), args.launch_spec.block_num(), kernel_ids_capture
         );
     }
 #endif
@@ -1334,7 +1334,7 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
     ActiveMask active_mask = mixed_kernels.to_active_mask();
     always_assert(static_cast<bool>(active_mask) && "MixedKernels must have at least one active slot");
 
-    int16_t block_num = args.launch_spec.core_num();
+    int16_t block_num = args.launch_spec.block_num();
     always_assert(block_num >= 1 && "block_num must be >= 1");
 
     // Normalize single-AIV tasks: if only aiv1 is set (no aic, no aiv0), move

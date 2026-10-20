@@ -53,7 +53,7 @@ static TaskId submit_producer(const simpler::tmr::Tensor &out, int16_t core_num,
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.add_scalar(PRODUCER_SPIN_ITERS);
-    args.launch_spec.set_core_num(core_num);
+    args.launch_spec.set_block_num(core_num);
     args.set_allow_early_resolve(early_on);
     return rt_submit_aic_task(FUNC_SPMD_WRITE_AIC, args).task_id();
 }
@@ -66,7 +66,7 @@ static void submit_sync_consumer(const simpler::tmr::Tensor &out, int16_t core_n
     CoreTaskArgsWithDeps<4> args;
     args.add_inout(out);
     args.add_scalar(base_cl);
-    args.launch_spec.set_core_num(core_num);
+    args.launch_spec.set_block_num(core_num);
     args.launch_spec.set_require_sync_start(true);
     args.add_dep(dep);
     rt_submit_task(kernels, args);

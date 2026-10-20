@@ -92,7 +92,7 @@ static TaskId submit_producer(const simpler::tmr::Tensor &out) {
     args.add_inout(out);
     args.add_scalar(0);
     args.add_scalar(PRODUCER_SPIN_ITERS);
-    args.launch_spec.set_core_num(PRODUCER_BLOCKS);
+    args.launch_spec.set_block_num(PRODUCER_BLOCKS);
     args.set_allow_early_resolve(true);
     return rt_submit_aic_task(FUNC_SLOW_PRODUCER_AIC, args).task_id();
 }
@@ -102,7 +102,7 @@ static TaskId submit_aiv_blocker(const simpler::tmr::Tensor &out, int32_t blocke
     args.add_inout(out);
     args.add_scalar(BLOCKER_STATUS_BASE_CL);
     args.add_scalar(blocker_count);
-    args.launch_spec.set_core_num(static_cast<int16_t>(blocker_count));
+    args.launch_spec.set_block_num(static_cast<int16_t>(blocker_count));
     args.set_allow_early_resolve(true);
     return rt_submit_aiv_task(FUNC_SPIN_BLOCKER_AIV, args).task_id();
 }
@@ -111,7 +111,7 @@ static void submit_consumer(const simpler::tmr::Tensor &out, TaskId producer, in
     CoreTaskArgsWithDeps<1> args;
     args.add_inout(out);
     args.add_scalar(PRODUCER_BLOCKS);
-    args.launch_spec.set_core_num(consumer_blocks);
+    args.launch_spec.set_block_num(consumer_blocks);
     args.launch_spec.set_require_sync_start(true);
     args.add_dep(producer);
     rt_submit_aiv_task(FUNC_SYNC_CONSUMER_AIV, args);

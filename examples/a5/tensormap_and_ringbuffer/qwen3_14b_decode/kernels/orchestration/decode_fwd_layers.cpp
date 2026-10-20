@@ -82,7 +82,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         params_t0.add_output(pa_metadata);
         params_t0.add_scalar(pa_max_blocks_i32);
         params_t0.add_scalar(pa_num_pages_i32);
-        params_t0.launch_spec.set_core_num(1);
+        params_t0.launch_spec.set_block_num(1);
         params_t0.set_allow_early_resolve(true);
         TaskOutputTensors task_0_outs = rt_submit_aiv_task(0, params_t0);
         TaskId tiling_tid_inline0 = task_0_outs.task_id();
@@ -123,7 +123,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
             params_t2.add_output(normed);
             params_t2.add_input(cur);
             params_t2.add_input(ext_input_rms_weight);
-            params_t2.launch_spec.set_core_num(5);
+            params_t2.launch_spec.set_block_num(5);
             params_t2.set_allow_early_resolve(true);
             TaskId params_t2_deps[1];
             uint32_t params_t2_deps_count = 0;
@@ -295,7 +295,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t6.add_input(normed__rv_v5);
                     params_t6.add_input(ext_wq);
                     params_t6.add_scalar(layer_hidden_base_inline151);
-                    params_t6.launch_spec.set_core_num(50);
+                    params_t6.launch_spec.set_block_num(50);
                     params_t6.set_allow_early_resolve(true);
                     TaskId params_t6_deps[2];
                     uint32_t params_t6_deps_count = 0;
@@ -358,7 +358,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t9.add_input(normed__rv_v5);
                     params_t9.add_input(ext_wk);
                     params_t9.add_scalar(layer_hidden_base_inline151);
-                    params_t9.launch_spec.set_core_num(10);
+                    params_t9.launch_spec.set_block_num(10);
                     params_t9.set_allow_early_resolve(true);
                     TaskId params_t9_deps[1];
                     uint32_t params_t9_deps_count = 0;
@@ -373,7 +373,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t10.add_input(normed__rv_v5);
                     params_t10.add_input(ext_wv);
                     params_t10.add_scalar(layer_hidden_base_inline151);
-                    params_t10.launch_spec.set_core_num(10);
+                    params_t10.launch_spec.set_block_num(10);
                     params_t10.set_allow_early_resolve(true);
                     TaskId params_t10_deps[1];
                     uint32_t params_t10_deps_count = 0;
@@ -409,7 +409,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t11.add_input(ext_seq_lens);
                     params_t11.add_scalar(layer_cache_base_inline193);
                     MixedKernels mixed_11 = {11, 12, 12};
-                    params_t11.launch_spec.set_core_num(attention_core_num_inline188);
+                    params_t11.launch_spec.set_block_num(attention_core_num_inline188);
                     params_t11.launch_spec.set_require_sync_start(true);
                     params_t11.set_allow_early_resolve(true);
                     TaskId params_t11_deps[7];
@@ -498,7 +498,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t13.add_inout(attn_proj_fp32_inline220);
                     params_t13.add_scalar(N_OUT_DIRECT_inline61);
                     params_t13.add_scalar(layer_hidden_base_inline151);
-                    params_t13.launch_spec.set_core_num(24);
+                    params_t13.launch_spec.set_block_num(24);
                     TaskId params_t13_deps[1];
                     uint32_t params_t13_deps_count = 0;
                     params_t13_deps[params_t13_deps_count++] = attn_done_tid_inline78;
@@ -1010,7 +1010,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t20.add_inout(gate_acc_all_inline203);
                     params_t20.add_scalar(gu_k0_inline131);
                     params_t20.add_scalar(layer_hidden_base_inline151);
-                    params_t20.launch_spec.set_core_num(6);
+                    params_t20.launch_spec.set_block_num(6);
                     TaskId params_t20_deps[1];
                     uint32_t params_t20_deps_count = 0;
                     if (_submit_deps_buf_inline237[0].is_valid())
@@ -1037,7 +1037,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t21.add_inout(up_acc_all_inline303);
                     params_t21.add_scalar(gu_k0_inline131);
                     params_t21.add_scalar(layer_hidden_base_inline151);
-                    params_t21.launch_spec.set_core_num(6);
+                    params_t21.launch_spec.set_block_num(6);
                     TaskId params_t21_deps[1];
                     uint32_t params_t21_deps_count = 0;
                     if (_submit_deps_buf_inline260[0].is_valid())
@@ -1111,7 +1111,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t22.add_inout(gate_acc_all_inline203);
                     params_t22.add_scalar(gu_k0_inline131__ssa_v1);
                     params_t22.add_scalar(layer_hidden_base_inline151);
-                    params_t22.launch_spec.set_core_num(6);
+                    params_t22.launch_spec.set_block_num(6);
                     TaskId params_t22_deps[1];
                     uint32_t params_t22_deps_count = 0;
                     if (_submit_deps_buf_inline237__ssa_v1[0].is_valid())
@@ -1138,7 +1138,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t23.add_inout(up_acc_all_inline303);
                     params_t23.add_scalar(gu_k0_inline131__ssa_v1);
                     params_t23.add_scalar(layer_hidden_base_inline151);
-                    params_t23.launch_spec.set_core_num(6);
+                    params_t23.launch_spec.set_block_num(6);
                     TaskId params_t23_deps[1];
                     uint32_t params_t23_deps_count = 0;
                     if (_submit_deps_buf_inline260__ssa_v1[0].is_valid())
@@ -1212,7 +1212,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t24.add_inout(gate_acc_all_inline203);
                     params_t24.add_scalar(gu_k0_inline131__ssa_v2);
                     params_t24.add_scalar(layer_hidden_base_inline151);
-                    params_t24.launch_spec.set_core_num(6);
+                    params_t24.launch_spec.set_block_num(6);
                     TaskId params_t24_deps[1];
                     uint32_t params_t24_deps_count = 0;
                     if (_submit_deps_buf_inline237__ssa_v2[0].is_valid())
@@ -1239,7 +1239,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t25.add_inout(up_acc_all_inline303);
                     params_t25.add_scalar(gu_k0_inline131__ssa_v2);
                     params_t25.add_scalar(layer_hidden_base_inline151);
-                    params_t25.launch_spec.set_core_num(6);
+                    params_t25.launch_spec.set_block_num(6);
                     TaskId params_t25_deps[1];
                     uint32_t params_t25_deps_count = 0;
                     if (_submit_deps_buf_inline260__ssa_v2[0].is_valid())
@@ -1313,7 +1313,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t26.add_inout(gate_acc_all_inline203);
                     params_t26.add_scalar(gu_k0_inline131__ssa_v3);
                     params_t26.add_scalar(layer_hidden_base_inline151);
-                    params_t26.launch_spec.set_core_num(6);
+                    params_t26.launch_spec.set_block_num(6);
                     TaskId params_t26_deps[1];
                     uint32_t params_t26_deps_count = 0;
                     if (_submit_deps_buf_inline237__ssa_v3[0].is_valid())
@@ -1340,7 +1340,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t27.add_inout(up_acc_all_inline303);
                     params_t27.add_scalar(gu_k0_inline131__ssa_v3);
                     params_t27.add_scalar(layer_hidden_base_inline151);
-                    params_t27.launch_spec.set_core_num(6);
+                    params_t27.launch_spec.set_block_num(6);
                     TaskId params_t27_deps[1];
                     uint32_t params_t27_deps_count = 0;
                     if (_submit_deps_buf_inline260__ssa_v3[0].is_valid())
@@ -1414,7 +1414,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t28.add_inout(gate_acc_all_inline203);
                     params_t28.add_scalar(gu_k0_inline131__ssa_v4);
                     params_t28.add_scalar(layer_hidden_base_inline151);
-                    params_t28.launch_spec.set_core_num(6);
+                    params_t28.launch_spec.set_block_num(6);
                     TaskId params_t28_deps[1];
                     uint32_t params_t28_deps_count = 0;
                     if (_submit_deps_buf_inline237__ssa_v4[0].is_valid())
@@ -1441,7 +1441,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_t29.add_inout(up_acc_all_inline303);
                     params_t29.add_scalar(gu_k0_inline131__ssa_v4);
                     params_t29.add_scalar(layer_hidden_base_inline151);
-                    params_t29.launch_spec.set_core_num(6);
+                    params_t29.launch_spec.set_block_num(6);
                     TaskId params_t29_deps[1];
                     uint32_t params_t29_deps_count = 0;
                     if (_submit_deps_buf_inline260__ssa_v4[0].is_valid())
@@ -1780,7 +1780,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 params_t34.add_input(ext_input_rms_weight);
                 params_t34.add_inout(next_normed);
                 params_t34.add_scalar(next_gamma_idx);
-                params_t34.launch_spec.set_core_num(5);
+                params_t34.launch_spec.set_block_num(5);
                 params_t34.set_allow_early_resolve(true);
                 TaskId params_t34_deps[85];
                 uint32_t params_t34_deps_count = 0;

@@ -78,7 +78,7 @@ separately (PR #1450 ports the `tests/st` side).
 
 `qwen3_14b_decode/` is an **a5 port in progress** (a2a3 source → a5). It
 compiles and runs on a5 after the a2a3→a5 kernel diffs
-(`set_block_num`→`set_core_num`, dropped `pipe_barrier(PIPE_V/MTE1/FIX)` that
+(dropped `pipe_barrier(PIPE_V/MTE1/FIX)` that
 a5's `pipe_barrier` rejects, AIC Left-tile `RowMajor`→`ColMajor` fractal,
 `ring_dep_pool=65536`), but the fused-attention extern still deadlocks at its
 in-kernel `SyncAll` — see the example's README "Status" and the open question

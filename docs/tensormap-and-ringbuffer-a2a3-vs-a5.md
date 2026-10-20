@@ -70,10 +70,6 @@ runtime/tensormap.h
 | `runtime/dispatch_payload.h`, `runtime/runtime_types.h` | Comments about platform context fields and worker capacity |
 | `runtime/runtime.h` | Includes/guards, comments, assertion messages, and accessor order; descriptor fields and size expressions match |
 | `runtime/shared/runtime.cpp` | Comments; device-copy prefix and extent calculations match |
-| `runtime/submit_types.h` | `LaunchSpec::block_num`/`set_block_num` on A2/A3 versus `core_num`/`set_core_num` on A5; both specify the logical SPMD block count |
-
-The `LaunchSpec` spelling difference matters to callers compiling directly
-against these headers, even though its stored value and scheduling meaning match.
 
 ### Behavioral or capability differences
 

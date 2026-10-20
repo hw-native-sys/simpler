@@ -43,7 +43,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     p.add_output(ci);          // args[3] s2 scratch
     p.add_output(ext_out);     // args[4]
     p.add_output(ext_timing);  // args[5] per-block timing (ticks)
-    p.launch_spec.set_core_num(8);
+    p.launch_spec.set_block_num(8);
     rt_submit_aiv_task(0, p);
 }
 

@@ -59,7 +59,7 @@ static void submit_mix(const simpler::tmr::Tensor &out, int16_t block_num, int64
     CoreTaskArgs args;
     args.add_inout(out);
     args.add_scalar(base_cl);
-    args.launch_spec.set_core_num(block_num);
+    args.launch_spec.set_block_num(block_num);
     args.launch_spec.set_require_sync_start(sync_start);
     rt_submit_task(mk, args);
 }

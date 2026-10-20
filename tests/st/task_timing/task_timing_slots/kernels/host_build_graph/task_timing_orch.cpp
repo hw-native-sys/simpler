@@ -32,17 +32,6 @@
 
 #include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
-// SPMD parallelism count is spelled set_block_num on a2a3 and set_core_num on
-// a5; pick whichever the launch spec exposes so this example builds on both.
-template <typename Spec>
-static inline auto set_spmd_count(Spec &s, int16_t n) -> decltype(s.set_block_num(n), void()) {
-    s.set_block_num(n);
-}
-template <typename Spec>
-static inline auto set_spmd_count(Spec &s, int16_t n) -> decltype(s.set_core_num(n), void()) {
-    s.set_core_num(n);
-}
-
 extern "C" {
 
 __attribute__((visibility("default"))) OrchestrationConfig
@@ -129,7 +118,7 @@ __attribute__((visibility("default"))) void task_timing_spmd_orchestration(const
     params.add_input(a);
     params.add_input(b);
     params.add_output(out);
-    set_spmd_count(params.launch_spec, 8);
+    params.launch_spec.set_block_num(8);
     params.set_task_timing_slot(0);
     rt_submit_aiv_task(0, params);
 }
