@@ -599,6 +599,55 @@ measurements are not comparable to PMU-off baselines.
 
 ## 7. Limitations
 
+### 7.0 The counting window has another writer, and the lease that holds it off
+
+simpler programs the AICore PMU control register by writing MMIO directly from
+the AICPU. TS writes the same register, and nothing in the driver or the
+runtime arbitrates between the two: the window mapping is per-process with no
+refcount and no owner check. An AICore-utilization query on the same chip
+(`npu-smi info -t usages`) resets `PMU_CTRL_0` to a resting value, and so does a
+background periodic source that has not been identified. Every counter reads
+zero from that point in the run.
+
+How often that happens depends on how long the window stays open, which is why
+it is invisible in a short payload and routine in a long one: the same 513-task
+payload loses every counter in roughly one run in seven at a half-second
+window, and in most runs at four seconds.
+
+While driver prof channel 53 (`CHANNEL_FFTS_PROFILE_BUFFER_TASK`) is started on
+a device, the reset does not happen. `AicorePmuLease`
+([aicore_pmu_lease.h](../../src/common/platform/onboard/host/aicore_pmu_lease.h))
+starts it for the duration of a PMU collection, reference-counted so that it
+spans every retained run rather than being dropped by the first run to close.
+
+Three properties of that mechanism decide how it has to be used:
+
+- **Starting the channel is what protects; the configuration's content does
+  not.** `cfgMode` 0 and 3 protect alike, and so does clearing the config's
+  sub-task bit. Measured 9/9 runs losing every counter with no channel held,
+  0/15 with one held, over 30780 rows.
+- **`cfgMode = 0` is nevertheless required**, because the lease is taken in the
+  process that submits the tasks. At `cfgMode = 3` the device emits 128 bytes
+  per task into a host ring that no reader drains, and that ring overwrites its
+  oldest bytes without accounting for the loss. At `cfgMode = 0` a
+  4000-kernel in-process workload produced nothing at all.
+- **The channel is exclusive across processes**, enforced below user space: a
+  second start returns `-10` while one is held. So a PMU-enabled run denies
+  channel 53 to msprof on that device for as long as it collects, and a
+  profiler already holding it denies the lease to us. The second case is
+  logged and collection proceeds unprotected; it never fails a run.
+
+**Why holding the channel protects is not established.** It may be an
+implementation detail of the device firmware, which is not open and which a
+CANN upgrade may change with no signal here. That is why
+`TestPmuCountingWindow`
+([test_pmu_counting_window.py](../../tests/st/a2a3/host_build_graph/dfx/pmu/test_pmu_counting_window.py))
+asserts per row rather than in aggregate, and asserts a floor on the spinning
+task as well: a window disabled partway through leaves a row that is non-zero
+but short, which was observed at 1.1% of the expected count with every row
+non-zero. An aggregate check, or a check for zeros alone, reads that run as a
+pass.
+
 ### 7.1 a2a3
 
 PMU collection assumes each logical AICore has at most one in-flight

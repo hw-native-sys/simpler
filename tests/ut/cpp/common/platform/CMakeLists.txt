@@ -611,6 +611,7 @@ file(GLOB NATIVE_ADMISSION_SHARED_HOST CONFIGURE_DEPENDS
 set(NATIVE_ADMISSION_SOURCES
     ${CMAKE_SOURCE_DIR}/support/native_admission/transport.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_base.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/aicore_pmu_lease.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/c_api_shared.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_helpers.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_persistent_args.cpp
@@ -651,6 +652,16 @@ tmr_case(test_native_admission.cpp
     INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
     DEFINES SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
+
+# The lease's own case. Declared apart from the bulk list below because it needs
+# the implementation compiled in, and because it resolves the driver's prof
+# entry points through `dlsym(RTLD_DEFAULT, ...)`: ENABLE_EXPORTS puts this
+# binary's own definitions of those names in the dynamic symbol table, which is
+# what lets the case drive the refusal codes with no device and no CANN.
+platform_single_case(test_aicore_pmu_lease.cpp
+    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/aicore_pmu_lease.cpp
+    INCLUDES ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host)
+set_target_properties(test_aicore_pmu_lease PROPERTIES ENABLE_EXPORTS ON)
 
 # ---------------------------------------------------------------------------
 # Cases reaching neither the arch platform tree nor any runtime's image, so one

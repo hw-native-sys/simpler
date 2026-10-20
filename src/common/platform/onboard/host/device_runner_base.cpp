@@ -4375,6 +4375,10 @@ int DeviceRunnerBase::start_shared_collectors_for_run(
         }
     }
     if (dfx.pmu_enabled) {
+        // Before the window is programmed, not after: the reset this guards
+        // against lands in the gaps between tasks, and the first of those gaps
+        // opens as soon as the first core is armed.
+        (void)pmu_lease_.acquire(device_id(), run_epoch);
         // Configuration picks the path, exactly as it does for swimlane: a run
         // a retaining collector will not admit fails here, before any kernel is
         // submitted, rather than falling into the single-run reset that would
@@ -4435,6 +4439,14 @@ void DeviceRunnerBase::withdraw_unlaunched_collectors_for_run(const DfxRunConfig
         // Nothing may escape a rollback path, for the reason given below.
         try {
             (void)pmu_collector_.abandon_run(run_epoch);
+        } catch (...) {}
+    }
+    if (dfx.pmu_enabled) {
+        // Unconditional on purpose: the lease drops a reference only for an
+        // epoch that holds one, so a run refused before the acquire ran and a
+        // run whose acquire failed both give back nothing here.
+        try {
+            pmu_lease_.release(run_epoch);
         } catch (...) {}
     }
     if (dfx.dump_args_enabled() && dump_collector_.retains_runs()) {
@@ -4612,6 +4624,16 @@ int DeviceRunnerBase::close_args_dump_run_boundary(
 void DeviceRunnerBase::close_pmu_run_boundary(
     const DfxRunConfig &dfx, uint64_t run_epoch, bool device_execution_complete
 ) {
+    // The lease covers the device-side counting window, which this boundary
+    // ends; the host-side writing that follows touches no PMU register. A
+    // successor already past its own open holds its own reference, so the
+    // channel survives this release for as long as any run still counts.
+    struct LeaseRelease {
+        AicorePmuLease *lease;
+        uint64_t epoch;
+        ~LeaseRelease() { lease->release(epoch); }
+    } lease_release{&pmu_lease_, run_epoch};
+
     if (!pmu_collector_.retains_runs()) {
         pmu_collector_.quiesce();
         pmu_collector_.reconcile_counters();

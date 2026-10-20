@@ -63,6 +63,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "utils/device_arena.h"
 #include "utils/retained_scheduler_storage.h"
+#include "aicore_pmu_lease.h"
 #include "device_phase_capture.h"
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
@@ -3132,6 +3133,10 @@ protected:
     RunResourceSlots<HostPhaseRunState> host_phase_runs_;
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
+    // Reference-counted for the whole of PMU collection, which spans every
+    // retained run: a predecessor's close must not stop a channel its
+    // successor is still counting under.
+    AicorePmuLease pmu_lease_;
     ScopeStatsCollector scope_stats_collector_;
     // The host-built graph's owner. Not a device collector: nothing it holds
     // is written by the device, and no run boundary reads it.

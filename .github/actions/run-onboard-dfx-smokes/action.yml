@@ -145,6 +145,19 @@ runs:
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/pmu/test_pmu.py" \
           --enable-pmu 2
 
+        # A second PMU job, and the only one that can see a counting window
+        # stop. The smoke above runs microsecond-scale tasks, where the loss
+        # this covers appears too rarely for a pass to mean anything; this one
+        # holds a core for ~0.9 s and asserts per row. `--manual include`
+        # because the case is manual so the ordinary sweep, which passes no
+        # --enable-pmu, does not spend its spin with every assertion skipped.
+        # a2a3 only: the suite exists there.
+        if [[ "$platform" == "a2a3" ]]; then
+          start_job "PMU counting window (host_build_graph)" \
+            "tests/st/a2a3/host_build_graph/dfx/pmu/" \
+            --manual include --enable-pmu 2
+        fi
+
         # Mode "full" here; see the mode-per-lane rationale in _st-sim-a2a3.yml.
         # This action runs for both a2a3 and a5 onboard, so full -- the only
         # mode that ignores the Arg::dump() masks and writes payload for every
