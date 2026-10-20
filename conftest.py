@@ -1850,7 +1850,11 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
 
     level = cls._st_level
     runtime = cls._st_runtime
-    from simpler_setup.scene_test import _class_wants_sdma  # noqa: PLC0415
+    from simpler_setup.scene_test import (  # noqa: PLC0415
+        _class_wants_sdma,
+        first_matching_case_config,
+        init_prewarm_config_from_request,
+    )
 
     wants_sdma = _class_wants_sdma(cls)
 
@@ -1916,7 +1920,11 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
         # mark the runtime poisoned and skip (this test and every later one for
         # the runtime) instead of surfacing a raw 507899 setup ERROR.
         try:
-            w.init()
+            w.init(
+                prewarm_config=init_prewarm_config_from_request(
+                    request, first_matching_case_config(cls, st_platform, request)
+                )
+            )
         except RuntimeError as e:
             if _requires_l2_worker_retirement_msg(str(e)):
                 _l2_poisoned.add(runtime)
@@ -1993,7 +2001,11 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
         cls._st_sub_handles = sub_handles
         cls._st_chip_handles = chip_handles
 
-        w.init()
+        w.init(
+            prewarm_config=init_prewarm_config_from_request(
+                request, first_matching_case_config(cls, st_platform, request)
+            )
+        )
         yield w
         w.close()
         device_pool.release(ids)

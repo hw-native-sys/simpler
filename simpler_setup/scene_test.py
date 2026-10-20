@@ -177,6 +177,98 @@ def standalone_pytest_options(request) -> dict:
     }
 
 
+def prewarm_config_for_diagnostics(diag: _DiagnosticOptions, config_dict=None):
+    """Build the init-time CallConfig that warms the DFX collectors a later run
+    will use. ``output_prefix`` stays empty: prewarm writes no files and
+    ``validate_prewarm()`` does not require it. Returns ``None`` when no
+    diagnostic is enabled."""
+    if not (diag.chip_swimlane or diag.dump_args or diag.pmu or diag.dep_gen or diag.scope_stats):
+        return None
+    from simpler.task_interface import CallConfig  # noqa: PLC0415
+
+    config_dict = config_dict or {}
+    config = CallConfig()
+    config.enable_chip_swimlane = diag.chip_swimlane
+    config.enable_dump_args = diag.dump_args
+    config.enable_pmu = diag.pmu
+    config.enable_dep_gen = diag.dep_gen
+    config.enable_scope_stats = diag.scope_stats
+    # The first case's shape, resolved the way _build_config does, so prewarm
+    # sizes the collector/arena for the first run rather than the defaults.
+    config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 0)
+    runtime_env = config_dict.get("runtime_env", {})
+    config.runtime_env.ring_task_window = runtime_env.get("ring_task_window", 0)
+    config.runtime_env.ring_heap = runtime_env.get("ring_heap", 0)
+    config.runtime_env.ring_dep_pool = runtime_env.get("ring_dep_pool", 0)
+    return config
+
+
+def init_prewarm_config_from_request(request, config_dict=None):
+    """Resolve this pytest session's effective diagnostics into a prewarm
+    config for ``Worker.init``. ``warn=False``: ``test_run`` already warns
+    about the multi-round zeroing."""
+    opts = standalone_pytest_options(request)
+    diag = effective_diagnostic_options(
+        opts["rounds"],
+        chip_swimlane=opts["enable_chip_swimlane"],
+        dump_args=opts["dump_args"],
+        pmu=opts["enable_pmu"],
+        dep_gen=opts["enable_dep_gen"],
+        scope_stats=opts["enable_scope_stats"],
+        swimlane_overhead=opts["enable_swimlane_overhead"],
+        warn=False,
+    )
+    return prewarm_config_for_diagnostics(diag, config_dict)
+
+
+def prewarm_config_from_args(args, config_dict=None):
+    """Build the standalone path's prewarm config from the already-effective
+    ``args`` diagnostics."""
+    return prewarm_config_for_diagnostics(
+        _DiagnosticOptions(
+            args.enable_chip_swimlane,
+            args.dump_args,
+            args.enable_pmu,
+            args.enable_dep_gen,
+            args.enable_scope_stats,
+            args.enable_swimlane_overhead,
+        ),
+        config_dict,
+    )
+
+
+def _cases_matching_filters(cls, platform: str, selectors, manual_mode: str) -> list:
+    """Cases of ``cls`` that survive the ``--platform``, ``--case``, and ``--manual`` filters."""
+    matched = []
+    for case in cls.CASES:
+        if platform not in case["platforms"]:
+            continue
+        if not _match_selectors(cls.__name__, case["name"], selectors):
+            continue
+        is_manual = is_manual_for_platform(case.get("manual"), platform)
+        if manual_mode == "exclude" and is_manual:
+            continue
+        if manual_mode == "only" and not is_manual:
+            continue
+        matched.append(case)
+    return matched
+
+
+def first_matching_case_config(cls, platform: str, request) -> dict:
+    """Config dict of the first ``cls`` case that survives the ``--platform``,
+    ``--case``, and ``--manual`` filters, or ``{}`` when none match.
+
+    The worker fixture prewarms with this case's shape so the collectors are
+    sized for the first run that will actually happen, not for an entry of
+    ``CASES`` that the filters may have removed.
+    """
+    raw_selectors = request.config.getoption("--case", default=None) or []
+    selectors = [_parse_case_selector(v) for v in raw_selectors]
+    manual_mode = request.config.getoption("--manual", default="exclude")
+    matched = _cases_matching_filters(cls, platform, selectors, manual_mode)
+    return matched[0].get("config", {}) if matched else {}
+
+
 def _pto_isa_compile_cache_token() -> str:
     """Pin SHA included in session compile-cache keys.
 
@@ -2066,7 +2158,7 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     @classmethod
-    def _create_worker(cls, platform, device_id=0):
+    def _create_worker(cls, platform, device_id=0, prewarm_config=None):
         """Create the L2 Worker for the standalone path.
 
         Mirrors the ``st_worker`` pytest fixture, which yields a ``Worker``
@@ -2083,7 +2175,7 @@ class SceneTestCase:
             runtime=cls._st_runtime,
             enable_sdma=_class_wants_sdma(cls),
         )
-        w.init()
+        w.init(prewarm_config=prewarm_config)
         return w
 
     # ------------------------------------------------------------------
@@ -2481,20 +2573,7 @@ class SceneTestCase:
         raw_selectors = request.config.getoption("--case", default=None) or []
         selectors = [_parse_case_selector(v) for v in raw_selectors]
         manual_mode = request.config.getoption("--manual", default="exclude")
-        cls_name = type(self).__name__
-        matched = []
-        for case in self.CASES:
-            if st_platform not in case["platforms"]:
-                continue
-            if not _match_selectors(cls_name, case["name"], selectors):
-                continue
-            is_manual = is_manual_for_platform(case.get("manual"), st_platform)
-            if manual_mode == "exclude" and is_manual:
-                continue
-            if manual_mode == "only" and not is_manual:
-                continue
-            matched.append(case)
-        return matched
+        return _cases_matching_filters(type(self), st_platform, selectors, manual_mode)
 
     # ------------------------------------------------------------------
     # Standalone entry point
@@ -3025,7 +3104,8 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
     """
     first_cls = group[0]
     if level == 2:
-        return first_cls._create_worker(args.platform, args.device), {}, {}
+        prewarm_config = prewarm_config_from_args(args, selected_by_cls[first_cls][0].get("config", {}))
+        return first_cls._create_worker(args.platform, args.device, prewarm_config), {}, {}
 
     from simpler.worker import Worker  # noqa: PLC0415
 
@@ -3101,5 +3181,6 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
                 cls_chip_handles[f"{name}_sig"] = entry["orchestration"].get("signature", [])
         per_class_sub_handles[cls] = cls_sub_handles
         per_class_chip_handles[cls] = cls_chip_handles
-    worker.init()
+    prewarm_config = prewarm_config_from_args(args, selected_by_cls[first_cls][0].get("config", {}))
+    worker.init(prewarm_config=prewarm_config)
     return worker, per_class_sub_handles, per_class_chip_handles

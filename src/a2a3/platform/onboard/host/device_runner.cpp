@@ -1630,9 +1630,8 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     return 0;
 }
 
-int DeviceRunner::init_chip_swimlane(
-    int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
-    ChipSwimlaneLevel chip_swimlane_level
+int DeviceRunner::ensure_chip_swimlane_initialized(
+    int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level
 ) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
@@ -1655,10 +1654,17 @@ int DeviceRunner::init_chip_swimlane(
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = chip_swimlane_collector_.initialize(
+    return chip_swimlane_collector_.initialize(
         num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, alloc_cb, register_cb, free_cb,
         unregister_collector_memory
     );
+}
+
+int DeviceRunner::init_chip_swimlane(
+    int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
+    ChipSwimlaneLevel chip_swimlane_level
+) {
+    int rc = ensure_chip_swimlane_initialized(num_aicore, aicpu_thread_num, device_id, chip_swimlane_level);
     if (rc != 0) {
         return rc;
     }
@@ -1670,11 +1676,7 @@ int DeviceRunner::init_chip_swimlane(
     return 0;
 }
 
-int DeviceRunner::init_args_dump(
-    const Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level
-) {
-    int num_dump_threads = runtime.get_aicpu_thread_num();
-
+int DeviceRunner::ensure_args_dump_initialized(int num_dump_threads, int device_id, DumpArgsLevel dump_args_level) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
@@ -1696,9 +1698,15 @@ int DeviceRunner::init_args_dump(
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = dump_collector_.initialize(
+    return dump_collector_.initialize(
         num_dump_threads, device_id, dump_args_level, alloc_cb, register_cb, free_cb, unregister_collector_memory
     );
+}
+
+int DeviceRunner::init_args_dump(
+    const Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level
+) {
+    int rc = ensure_args_dump_initialized(runtime.get_aicpu_thread_num(), device_id, dump_args_level);
     if (rc != 0) {
         return rc;
     }
@@ -1707,7 +1715,7 @@ int DeviceRunner::init_args_dump(
     return 0;
 }
 
-int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+int DeviceRunner::ensure_pmu_initialized(int num_cores, int num_threads, int device_id) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
@@ -1729,9 +1737,13 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, Kernel
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = pmu_collector_.init(
+    return pmu_collector_.init(
         num_cores, num_threads, alloc_cb, register_cb, free_cb, device_id, unregister_collector_memory
     );
+}
+
+int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+    int rc = ensure_pmu_initialized(num_cores, num_threads, device_id);
     if (rc != 0) {
         return rc;
     }
@@ -1740,7 +1752,7 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, Kernel
     return 0;
 }
 
-int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+int DeviceRunner::ensure_dep_gen_initialized(int num_threads, int device_id) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
@@ -1762,8 +1774,11 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper 
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc =
-        dep_gen_collector_.init(num_threads, alloc_cb, register_cb, free_cb, device_id, unregister_collector_memory);
+    return dep_gen_collector_.init(num_threads, alloc_cb, register_cb, free_cb, device_id, unregister_collector_memory);
+}
+
+int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+    int rc = ensure_dep_gen_initialized(num_threads, device_id);
     if (rc != 0) {
         return rc;
     }
@@ -1772,7 +1787,7 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper 
     return 0;
 }
 
-int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+int DeviceRunner::ensure_scope_stats_initialized(int num_threads, int device_id) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
@@ -1794,15 +1809,83 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
         return mem_alloc_.free(dev_ptr);
     };
 
-    int rc = scope_stats_collector_.init(
+    return scope_stats_collector_.init(
         num_threads, alloc_cb, register_cb, free_cb, device_id, unregister_collector_memory
     );
+}
+
+int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+    int rc = ensure_scope_stats_initialized(num_threads, device_id);
     if (rc != 0) {
         return rc;
     }
 
     kernel_args.args.scope_stats_data_base =
         reinterpret_cast<uint64_t>(scope_stats_collector_.get_scope_stats_shm_device_ptr());
+    return 0;
+}
+
+int DeviceRunner::prewarm_dfx(const CallConfig &config) {
+    if (!config.diagnostics_any()) return 0;
+
+    const auto started = std::chrono::steady_clock::now();
+    const int block_dim = resolve_block_dim();
+    if (block_dim < 1) return PTO_RUNTIME_ERR_INTERNAL;
+    const int num_aicore = block_dim * cores_per_blockdim_;
+
+    // Resolve the AICPU-thread count the collectors are sized for, with the
+    // same probe + resolve rule prepare_execution applies to its own run.
+    std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
+    if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
+        LOG_ERROR("A2A3 AICPU topology probe failed; cannot prewarm diagnostics collectors");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    int aicpu_thread_num = resolve_aicpu_thread_num(
+        config.aicpu_thread_num, static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM
+    );
+    if (aicpu_thread_num < 0) return PTO_RUNTIME_ERR_INTERNAL;
+
+    auto thread_factory = [this](std::function<void()> fn) {
+        return create_thread(std::move(fn));
+    };
+
+    if (config.enable_chip_swimlane != 0) {
+        int rc = ensure_chip_swimlane_initialized(
+            num_aicore, aicpu_thread_num, device_id_, static_cast<ChipSwimlaneLevel>(config.enable_chip_swimlane)
+        );
+        if (rc != 0) return rc;
+        chip_swimlane_collector_.start(thread_factory);
+    }
+    if (config.enable_dump_args != 0) {
+        int rc = ensure_args_dump_initialized(
+            aicpu_thread_num, device_id_, static_cast<DumpArgsLevel>(config.enable_dump_args)
+        );
+        if (rc != 0) return rc;
+        dump_collector_.start(thread_factory);
+    }
+    if (config.enable_pmu != 0) {
+        int rc = ensure_pmu_initialized(num_aicore, aicpu_thread_num, device_id_);
+        if (rc != 0) return rc;
+        pmu_collector_.start(thread_factory);
+    }
+    // dep_gen prewarm spawns only the drain thread; admit_dep_gen_run opens the
+    // per-run window on the first run, so the thread idles until then.
+    if (config.enable_dep_gen != 0 && !dep_gen_host_graph_active()) {
+        int rc = ensure_dep_gen_initialized(aicpu_thread_num, device_id_);
+        if (rc != 0) return rc;
+        dep_gen_collector_.start(thread_factory);
+    }
+    if (config.enable_scope_stats != 0) {
+        int rc = ensure_scope_stats_initialized(aicpu_thread_num, device_id_);
+        if (rc != 0) return rc;
+        scope_stats_collector_.start(thread_factory);
+    }
+
+    latch_collector_shape(num_aicore, aicpu_thread_num, aicpu_thread_num);
+
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    LOG_TIMING("dfx prewarm: diagnostics collectors warmed in %.2f ms", elapsed_ms);
     return 0;
 }
 

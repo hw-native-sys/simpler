@@ -388,5 +388,6 @@ int main() {
 extern "C" void unified_log_warn(const char *, const char *, ...) {}
 extern "C" void unified_log_info(const char *, const char *, ...) {}
 extern "C" void unified_log_error(const char *, const char *, ...) {}
+extern "C" void unified_log_timing(const char *, const char *, ...) {}
 extern "C" void unified_log_debug(const char *, const char *, ...) {}
 extern "C" void unified_log_host_span(const SimplerHostSpan *) {}

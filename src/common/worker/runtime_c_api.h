@@ -838,16 +838,23 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
  *      whose device launch or sync fails does fail init, because that card is
  *      then poisoned.
  *
- *   5. When `prewarm_config` is non-null, build + upload + cache the prebuilt
- *      runtime-arena for its `runtime_env` ring sizing (tensormap_and_ringbuffer;
- *      a no-op for runtimes without a prebuilt arena). The device is up by this
- *      point, so the first simpler_run with matching sizing skips the (~800ms)
- *      cold build. The sizing is fork-constant, so it rides init rather than a
- *      separate call. Only `prewarm_config->runtime_env` is read.
+ *   5. When `prewarm_config` is non-null, warm the one-time setup a first run
+ *      would otherwise pay:
  *
- * Returns 0 on success, negative on attach, provisioning, or prewarm-build
- * failure, and PTO_RUNTIME_ERR_INVALID_STATE when the context is already
- * latched to kernel mode.
+ *      - The prebuilt runtime-arena for its `runtime_env` ring sizing is built +
+ *        uploaded + cached (tensormap_and_ringbuffer; a no-op for runtimes
+ *        without a prebuilt arena). The device is up by this point, so the first
+ *        simpler_run with matching sizing skips the (~800ms) cold build. The
+ *        sizing is fork-constant, so it rides init rather than a separate call.
+ *
+ *      - The diagnostics collectors named by its DFX flags (enable_chip_swimlane,
+ *        enable_dump_args, enable_pmu, enable_dep_gen, enable_scope_stats) are
+ *        initialized and started, so the first profiled run skips their one-time
+ *        buffer allocation, SVM registration, and thread spawn.
+ *
+ * Returns 0 on success, negative on attach, provisioning, arena-prewarm, or
+ * collector-prewarm failure, and PTO_RUNTIME_ERR_INVALID_STATE when the
+ * context is already latched to kernel mode.
  */
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,

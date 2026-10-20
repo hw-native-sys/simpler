@@ -217,7 +217,7 @@ def test_both_worker_factories_preserve_exact_admission_kwargs(monkeypatch, auto
         def __init__(self, **kwargs):
             captured.append(kwargs)
 
-        def init(self):
+        def init(self, prewarm_config=None):
             pass
 
         def close(self):
@@ -226,7 +226,20 @@ def test_both_worker_factories_preserve_exact_admission_kwargs(monkeypatch, auto
     monkeypatch.setattr(worker_mod, "Worker", FakeWorker)
     if factory == "standalone":
         _create_standalone_worker(
-            [cls], 3, SimpleNamespace(platform="a2a3", device=0, device_ids=[0]), {cls: cls.CASES}
+            [cls],
+            3,
+            SimpleNamespace(
+                platform="a2a3",
+                device=0,
+                device_ids=[0],
+                enable_chip_swimlane=0,
+                dump_args=0,
+                enable_pmu=0,
+                enable_dep_gen=False,
+                enable_scope_stats=False,
+                enable_swimlane_overhead=False,
+            ),
+            {cls: cls.CASES},
         )
     else:
         path = Path(__file__).resolve().parents[3] / "conftest.py"
@@ -235,7 +248,10 @@ def test_both_worker_factories_preserve_exact_admission_kwargs(monkeypatch, auto
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         pool = SimpleNamespace(allocate=lambda count: [0], release=lambda ids: None)
-        fixture = module.st_worker.__wrapped__(SimpleNamespace(node=SimpleNamespace(cls=cls)), "a2a3", pool, {}, set())
+        request = SimpleNamespace(
+            node=SimpleNamespace(cls=cls), config=SimpleNamespace(getoption=lambda name, default=None: default)
+        )
+        fixture = module.st_worker.__wrapped__(request, "a2a3", pool, {}, set())
         next(fixture)
         with pytest.raises(StopIteration):
             next(fixture)

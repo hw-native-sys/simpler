@@ -388,6 +388,21 @@ private:
      */
     int init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args);
 
+    int ensure_chip_swimlane_initialized(
+        int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level
+    );
+    int ensure_args_dump_initialized(int num_dump_threads, int device_id, DumpArgsLevel dump_args_level);
+    int ensure_pmu_initialized(int num_cores, int num_threads, int device_id);
+    int ensure_dep_gen_initialized(int num_threads, int device_id);
+    int ensure_scope_stats_initialized(int num_threads, int device_id);
+
+    /**
+     * Initialize + start every diagnostics collector `config` enables, so the
+     * first profiled run skips the one-time buffer setup in its launch. No
+     * output is written; output_prefix stays per-run.
+     */
+    int prewarm_dfx(const CallConfig &config) override;
+
     // Emit the device-orchestration dep_gen graph, on both the success and the
     // error return of drain_execution: the device flushes its dep_gen buffers
     // during emergency_shutdown, so a failed run's graph is recoverable. Its own

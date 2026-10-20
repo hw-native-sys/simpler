@@ -930,6 +930,20 @@ int simpler_init(
             runner->mark_teardown_unresolved();
             return rc;
         }
+
+        // Warm the diagnostics collectors this process will use, so the first
+        // profiled run pays only its per-run open/begin step instead of the
+        // one-time buffer allocation + device registration inside its launch.
+        try {
+            rc = runner->prewarm_dfx(*prewarm_config);
+        } catch (...) {
+            runner->mark_teardown_unresolved();
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (rc != 0) {
+            runner->mark_teardown_unresolved();
+            return rc;
+        }
     }
     return 0;
 }

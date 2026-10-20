@@ -3469,6 +3469,7 @@ NB_MODULE(_task_interface, m) {
         )
         .def_rw("enable_pmu", &CallConfig::enable_pmu)
         .def("validate", &CallConfig::validate)
+        .def("validate_prewarm", &CallConfig::validate_prewarm)
         .def_prop_rw(
             "enable_dep_gen",
             [](const CallConfig &c) {

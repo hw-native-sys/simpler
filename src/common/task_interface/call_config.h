@@ -141,6 +141,11 @@ struct CallConfig {
         }
         runtime_env.validate();
     }
+
+    // Prewarm-time validation. The DFX flags here express collection intent,
+    // not a run whose output directory is known, so output_prefix is not
+    // required. Ring sizing is still load-bearing: the arena prewarm reads it.
+    void validate_prewarm() const { runtime_env.validate(); }
 };
 #pragma pack(pop)
 static_assert(sizeof(RuntimeEnv) == RUNTIME_ENV_UINT64_FIELD_COUNT * sizeof(uint64_t), "RuntimeEnv wire layout drift");

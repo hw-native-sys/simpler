@@ -26,6 +26,7 @@
 #include "platform_comm/comm.h"
 #include "runtime_c_api.h"
 
+#include <chrono>
 #include <dlfcn.h>
 
 #include "aicpu_loader/host/load_aicpu_op.h"
@@ -1491,9 +1492,8 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
     return 0;
 }
 
-int DeviceRunner::init_chip_swimlane(
-    int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
-    ChipSwimlaneLevel chip_swimlane_level
+int DeviceRunner::ensure_chip_swimlane_initialized(
+    int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level
 ) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
@@ -1501,9 +1501,16 @@ int DeviceRunner::init_chip_swimlane(
     auto free_cb = [this](void *dev_ptr) -> int {
         return mem_alloc_.free(dev_ptr);
     };
-    int rc = chip_swimlane_collector_.initialize(
+    return chip_swimlane_collector_.initialize(
         num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, alloc_cb, /*register_cb=*/nullptr, free_cb
     );
+}
+
+int DeviceRunner::init_chip_swimlane(
+    int num_aicore, int aicpu_thread_num, int device_id, KernelArgsHelper &kernel_args,
+    ChipSwimlaneLevel chip_swimlane_level
+) {
+    int rc = ensure_chip_swimlane_initialized(num_aicore, aicpu_thread_num, device_id, chip_swimlane_level);
     if (rc == 0) {
         kernel_args.args.chip_swimlane_data_base =
             reinterpret_cast<uint64_t>(chip_swimlane_collector_.get_chip_swimlane_setup_device_ptr());
@@ -1513,20 +1520,22 @@ int DeviceRunner::init_chip_swimlane(
     return rc;
 }
 
-int DeviceRunner::init_args_dump(
-    const Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level
-) {
-    int num_dump_threads = runtime.get_aicpu_thread_num();
-
+int DeviceRunner::ensure_args_dump_initialized(int num_dump_threads, int device_id, DumpArgsLevel dump_args_level) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
     auto free_cb = [this](void *dev_ptr) -> int {
         return mem_alloc_.free(dev_ptr);
     };
-    int rc = dump_collector_.initialize(
+    return dump_collector_.initialize(
         num_dump_threads, device_id, dump_args_level, alloc_cb, /*register_cb=*/nullptr, free_cb
     );
+}
+
+int DeviceRunner::init_args_dump(
+    const Runtime &runtime, int device_id, KernelArgsHelper &kernel_args, DumpArgsLevel dump_args_level
+) {
+    int rc = ensure_args_dump_initialized(runtime.get_aicpu_thread_num(), device_id, dump_args_level);
     if (rc != 0) {
         return rc;
     }
@@ -1535,14 +1544,18 @@ int DeviceRunner::init_args_dump(
     return 0;
 }
 
-int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+int DeviceRunner::ensure_pmu_initialized(int num_cores, int num_threads, int device_id) {
     auto alloc_cb = [this](size_t size) -> void * {
         return mem_alloc_.alloc(size);
     };
     auto free_cb = [this](void *dev_ptr) -> int {
         return mem_alloc_.free(dev_ptr);
     };
-    int rc = pmu_collector_.init(num_cores, num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, device_id);
+    return pmu_collector_.init(num_cores, num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, device_id);
+}
+
+int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+    int rc = ensure_pmu_initialized(num_cores, num_threads, device_id);
     if (rc == 0) {
         kernel_args.args.pmu_data_base = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_shm_device_ptr());
         kernel_args.args.aicore_pmu_ring_addrs =
@@ -1551,7 +1564,7 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, Kernel
     return rc;
 }
 
-int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+int DeviceRunner::ensure_scope_stats_initialized(int num_threads, int device_id) {
     // a5: register_cb=nullptr, so the collector mallocs a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device (see
     // ProfilerBase::alloc_paired_buffer). No halHostRegister on a5.
@@ -1561,7 +1574,11 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
     auto free_cb = [this](void *dev_ptr) -> int {
         return mem_alloc_.free(dev_ptr);
     };
-    int rc = scope_stats_collector_.init(num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, device_id);
+    return scope_stats_collector_.init(num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, device_id);
+}
+
+int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+    int rc = ensure_scope_stats_initialized(num_threads, device_id);
     if (rc != 0) {
         return rc;
     }
@@ -1570,7 +1587,7 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
     return 0;
 }
 
-int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+int DeviceRunner::ensure_dep_gen_initialized(int num_threads, int device_id) {
     // a5: register_cb=nullptr, so the collector mallocs a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device. No
     // halHostRegister on a5 (matches PMU / chip swimlane / dump collectors).
@@ -1580,11 +1597,80 @@ int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper 
     auto free_cb = [this](void *dev_ptr) -> int {
         return mem_alloc_.free(dev_ptr);
     };
-    int rc = dep_gen_collector_.init(num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, device_id);
+    return dep_gen_collector_.init(num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, device_id);
+}
+
+int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
+    int rc = ensure_dep_gen_initialized(num_threads, device_id);
     if (rc != 0) {
         return rc;
     }
     kernel_args.args.dep_gen_data_base = reinterpret_cast<uint64_t>(dep_gen_collector_.get_dep_gen_shm_device_ptr());
+    return 0;
+}
+
+int DeviceRunner::prewarm_dfx(const CallConfig &config) {
+    if (!config.diagnostics_any()) return 0;
+
+    const auto started = std::chrono::steady_clock::now();
+    const int block_dim = resolve_block_dim();
+    if (block_dim < 1) return PTO_RUNTIME_ERR_INTERNAL;
+    const int num_aicore = block_dim * cores_per_blockdim_;
+
+    pto::a5::AicpuTopology topology;
+    if (query_aicpu_topology(topology) != 0) {
+        LOG_ERROR("AICPU topology probe failed; cannot prewarm diagnostics collectors");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    pto::a5::AicpuLaunchPlan launch_plan;
+    std::string plan_error;
+    if (!pto::a5::build_aicpu_launch_plan(topology, config.aicpu_thread_num, launch_plan, plan_error)) {
+        LOG_ERROR("cannot build AICPU launch plan for diagnostics prewarm: %s", plan_error.c_str());
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    int aicpu_thread_num = launch_plan.effective_active_count;
+
+    auto thread_factory = [this](std::function<void()> fn) {
+        return create_thread(std::move(fn));
+    };
+
+    if (config.enable_chip_swimlane != 0) {
+        int rc = ensure_chip_swimlane_initialized(
+            num_aicore, aicpu_thread_num, device_id_, static_cast<ChipSwimlaneLevel>(config.enable_chip_swimlane)
+        );
+        if (rc != 0) return rc;
+        chip_swimlane_collector_.start(thread_factory);
+    }
+    if (config.enable_dump_args != 0) {
+        int rc = ensure_args_dump_initialized(
+            aicpu_thread_num, device_id_, static_cast<DumpArgsLevel>(config.enable_dump_args)
+        );
+        if (rc != 0) return rc;
+        dump_collector_.start(thread_factory);
+    }
+    if (config.enable_pmu != 0) {
+        int rc = ensure_pmu_initialized(num_aicore, aicpu_thread_num, device_id_);
+        if (rc != 0) return rc;
+        pmu_collector_.start(thread_factory);
+    }
+    // dep_gen prewarm spawns only the drain thread; admit_dep_gen_run opens the
+    // per-run window on the first run, so the thread idles until then.
+    if (config.enable_dep_gen != 0 && !dep_gen_host_graph_active()) {
+        int rc = ensure_dep_gen_initialized(aicpu_thread_num, device_id_);
+        if (rc != 0) return rc;
+        dep_gen_collector_.start(thread_factory);
+    }
+    if (config.enable_scope_stats != 0) {
+        int rc = ensure_scope_stats_initialized(aicpu_thread_num, device_id_);
+        if (rc != 0) return rc;
+        scope_stats_collector_.start(thread_factory);
+    }
+
+    latch_collector_shape(num_aicore, aicpu_thread_num, aicpu_thread_num);
+
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    LOG_TIMING("dfx prewarm: diagnostics collectors warmed in %.2f ms", elapsed_ms);
     return 0;
 }
 

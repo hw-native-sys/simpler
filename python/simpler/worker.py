@@ -8738,8 +8738,10 @@ class Worker:
                 same sizing skips the (~800ms) cold prebuilt runtime-arena build.
                 An L2 worker prewarms here; an L3+ worker prewarms each chip child
                 during hierarchy startup, before it publishes INIT_READY. A no-op
-                for runtimes without a prebuilt arena (host_build_graph). ``None``
-                (default) disables prewarm.
+                for runtimes without a prebuilt arena (host_build_graph). The DFX
+                flags (``enable_chip_swimlane`` etc.) also warm up the matching
+                diagnostics collectors so the first profiled run skips their
+                one-time buffer/SVM setup. ``None`` (default) disables prewarm.
             borrowed_context_generation: Direct onboard L2 only. Nonzero caller-managed
                 generation for the current RTS context. The caller keeps that context alive;
                 close releases runtime resources without resetting the caller's device.
@@ -8760,7 +8762,7 @@ class Worker:
                 borrowed_context_generation, "borrowed_context_generation"
             )
         if prewarm_config is not None:
-            prewarm_config.validate()
+            prewarm_config.validate_prewarm()
         # Claim the startup epoch atomically: NEW -> INITIALIZING under the
         # lifecycle lock so a concurrent init / register / close observes one
         # linear transition and never a half-built Worker. Every level claims the

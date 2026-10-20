@@ -2358,6 +2358,19 @@ protected:
     );
 
     /**
+     * Warm up the diagnostics collectors a later run will enable: initialize
+     * each collector the config turns on (buffer allocation + device
+     * registration) and start its threads, so the first profiled run pays only
+     * its per-run open/begin step. No output is written — output_prefix is
+     * resolved per run. The arch subclass resolves the launch shape (core and
+     * AICPU thread counts) its collectors are sized for; the base no-op covers
+     * subclasses with no onboard collectors.
+     */
+public:
+    virtual int prewarm_dfx(const CallConfig &) { return 0; }
+
+protected:
+    /**
      * Give back what `start_shared_collectors_for_run` admitted for a run that
      * ended up submitting nothing.
      *

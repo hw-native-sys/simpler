@@ -82,7 +82,7 @@ struct DfxRunConfig {
         DfxRunConfig resolved;
         resolved.chip_swimlane_level = static_cast<ChipSwimlaneLevel>(config.enable_chip_swimlane);
         resolved.dump_args_level = static_cast<DumpArgsLevel>(config.enable_dump_args);
-        resolved.pmu_enabled = config.enable_pmu > 0;
+        resolved.pmu_enabled = config.enable_pmu != 0;
         resolved.pmu_event_type = resolve_pmu_event_type(config.enable_pmu);
         resolved.dep_gen_enabled = config.enable_dep_gen != 0;
         resolved.scope_stats_enabled = config.enable_scope_stats != 0;
