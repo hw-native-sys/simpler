@@ -148,8 +148,7 @@ A2/A3's `GlobalContext` contains `l2_cache_offset`, exposed through
 `get_l2_cache_offset(args)`. Scheduler initialization copies the driver-provided
 nocache-alias offset from resident device configuration. Zero leaves an ordinary
 cached address. A5 exposes neither this field nor its getter, so the context
-layouts differ. A5 also names local fields `s_block_idx`/`s_block_num` to avoid
-compiler built-in name collisions; the logical block semantics are shared.
+layouts differ. Both use `block_idx`/`block_num` for local logical block fields.
 See `common/intrinsic.h` ([A2/A3][a3-intrinsic], [A5][a5-intrinsic]).
 
 The field is A2/A3-only because its DMA load instruction does not encode the

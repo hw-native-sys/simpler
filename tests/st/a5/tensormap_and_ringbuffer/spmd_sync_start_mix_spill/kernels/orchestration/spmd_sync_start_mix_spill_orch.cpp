@@ -13,8 +13,8 @@
  * SPMD sync_start MIX pending-spill Orchestration (a5)
  *
  * Port of a2a3 spmd_sync_start_mix_spill, sized for a5 (36 AIC + 72 AIV):
- *   P: AIV core_num=72, base_cl=0,  allow_early_resolve = scalar early_on (fills all AIV)
- *   C: MIX core_num=24, base_cl=72, require_sync_start=true, dep=[P]
+ *   P: AIV block_num=72, base_cl=0,  allow_early_resolve = scalar early_on (fills all AIV)
+ *   C: MIX block_num=24, base_cl=72, require_sync_start=true, dep=[P]
  *      → 24 AIC idle→running, 48 AIV busy→pending (per-core spill + rendezvous)
  *
  * Args layout: [output], scalar: early_on
@@ -50,22 +50,22 @@ static MixedKernels mix_kernels() {
     return mk;
 }
 
-static TaskId submit_aiv_producer(const simpler::tmr::Tensor &out, int16_t core_num, int64_t base_cl, bool early_on) {
+static TaskId submit_aiv_producer(const simpler::tmr::Tensor &out, int16_t block_num, int64_t base_cl, bool early_on) {
     CoreTaskArgs args;
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.add_scalar(PRODUCER_SPIN_ITERS);
-    args.launch_spec.set_block_num(core_num);
+    args.launch_spec.set_block_num(block_num);
     args.set_allow_early_resolve(early_on);
     return rt_submit_aiv_task(FUNC_SPMD_WRITE_AIV, args).task_id();
 }
 
-static void submit_mix_sync_consumer(const simpler::tmr::Tensor &out, int16_t core_num, int64_t base_cl, TaskId dep) {
+static void submit_mix_sync_consumer(const simpler::tmr::Tensor &out, int16_t block_num, int64_t base_cl, TaskId dep) {
     CoreTaskArgsWithDeps<4> args;
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.add_scalar(0);  // consumer does not spin
-    args.launch_spec.set_block_num(core_num);
+    args.launch_spec.set_block_num(block_num);
     args.launch_spec.set_require_sync_start(true);
     args.add_dep(dep);
     rt_submit_task(mix_kernels(), args);

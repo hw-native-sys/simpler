@@ -25,8 +25,8 @@
  *        callable is provisioned before that scheduler run begins.
  *
  *   2. Local per-dispatch context (changes each dispatch):
- *      - s_block_idx : which logical block the current worker is executing
- *      - s_block_num : total number of blocks in this task (= block_dim)
+ *      - block_idx : which logical block the current worker is executing
+ *      - block_num : total number of logical blocks in this task
  *      Written by build_payload() before each dispatch.
  *
  * Both categories are injected via two pointer slots appended at the tail
@@ -152,18 +152,13 @@ struct AsyncCtx {
 /**
  * Per-dispatch local context, stored in DispatchPayload.
  * Written by build_payload() before each dispatch. Different blocks of the
- * same task receive different s_block_idx values but the same s_block_num.
- *
- * NOTE: Fields are prefixed with s_ to avoid collisions with compiler
- * built-in symbols block_idx / block_num on the a5 AICore target, which
- * would cause a compile error if the unprefixed names were used.
+ * same task receive different block_idx values but the same block_num.
  */
 struct LocalContext {
-    int32_t s_block_idx;  // Logical block index within the task [0, s_block_num)
-    int32_t s_block_num;  // How many logical blocks this task requires.
-                          // Currently fixed to 1 (block_dim > 1 not yet implemented).
-                          // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
-                          // which controls how many physical cores the runtime launches.
+    int32_t block_idx;  // Logical block index within the task [0, block_num)
+    int32_t block_num;  // How many logical blocks this task requires.
+                        // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
+                        // which controls how many physical cores the runtime launches.
     AsyncCtx async_ctx;
 };
 
@@ -211,19 +206,17 @@ static __aicore__ inline __gm__ uint8_t *get_dma_workspace(__gm__ int64_t *args,
 static __aicore__ inline int32_t get_block_idx(__gm__ int64_t *args) {
     __gm__ LocalContext *ctx =
         reinterpret_cast<__gm__ LocalContext *>(static_cast<uint64_t>(args[SPMD_LOCAL_CONTEXT_INDEX]));
-    return ctx->s_block_idx;
+    return ctx->block_idx;
 }
 
 /**
  * Return how many logical blocks the current task requires.
  * All blocks of the same task see the same value.
- * Currently always returns 1 (block_dim>1 not yet implemented).
- *
  * Note: this is NOT the same as RUNTIME_CONFIG.block_dim in
  * kernel_config.py, which controls how many physical cores are launched.
  */
 static __aicore__ inline int32_t get_block_num(__gm__ int64_t *args) {
     __gm__ LocalContext *ctx =
         reinterpret_cast<__gm__ LocalContext *>(static_cast<uint64_t>(args[SPMD_LOCAL_CONTEXT_INDEX]));
-    return ctx->s_block_num;
+    return ctx->block_num;
 }

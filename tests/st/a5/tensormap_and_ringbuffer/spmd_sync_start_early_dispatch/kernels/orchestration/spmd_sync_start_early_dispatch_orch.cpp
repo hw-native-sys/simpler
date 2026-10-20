@@ -16,8 +16,8 @@
  * the producer is flagged allow_early_resolve (1) or not (0), so the same scene
  * can compare early vs ready-only swimlanes.
  *
- *   P: AIC core_num=50, base_cl=0, allow_early_resolve = scalar early_on
- *   C: MIX core_num=24, base_cl=50, require_sync_start=true, dep=[P]
+ *   P: AIC block_num=50, base_cl=0, allow_early_resolve = scalar early_on
+ *   C: MIX block_num=24, base_cl=50, require_sync_start=true, dep=[P]
  *
  * Args layout: [output], scalar: early_on
  */
@@ -48,17 +48,17 @@ static constexpr int64_t PRODUCER_SPIN_ITERS = 10000000;
 
 static constexpr int32_t PRODUCER_BLOCKS = 50;
 
-static TaskId submit_producer(const simpler::tmr::Tensor &out, int16_t core_num, int64_t base_cl, bool early_on) {
+static TaskId submit_producer(const simpler::tmr::Tensor &out, int16_t block_num, int64_t base_cl, bool early_on) {
     CoreTaskArgs args;
     args.add_inout(out);
     args.add_scalar(base_cl);
     args.add_scalar(PRODUCER_SPIN_ITERS);
-    args.launch_spec.set_block_num(core_num);
+    args.launch_spec.set_block_num(block_num);
     args.set_allow_early_resolve(early_on);
     return rt_submit_aic_task(FUNC_SPMD_WRITE_AIC, args).task_id();
 }
 
-static void submit_sync_consumer(const simpler::tmr::Tensor &out, int16_t core_num, int64_t base_cl, TaskId dep) {
+static void submit_sync_consumer(const simpler::tmr::Tensor &out, int16_t block_num, int64_t base_cl, TaskId dep) {
     MixedKernels kernels;
     kernels.aic_kernel_id = FUNC_SPMD_MIX_AIC;
     kernels.aiv0_kernel_id = FUNC_SPMD_MIX_AIV0;
@@ -66,7 +66,7 @@ static void submit_sync_consumer(const simpler::tmr::Tensor &out, int16_t core_n
     CoreTaskArgsWithDeps<4> args;
     args.add_inout(out);
     args.add_scalar(base_cl);
-    args.launch_spec.set_block_num(core_num);
+    args.launch_spec.set_block_num(block_num);
     args.launch_spec.set_require_sync_start(true);
     args.add_dep(dep);
     rt_submit_task(kernels, args);

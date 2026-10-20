@@ -745,7 +745,7 @@ edge (#1405).
 #### a5 platform notes
 
 - `RUNTIME_MAX_WORKER = 108` — doorbell table / `staged_core_mask` words must cover 108 cores.
-- AICore index fields are `s_block_idx` / `s_block_num` (not a2a3 `block_idx` / `block_num`).
+- AICore `LocalContext` uses `block_idx` / `block_num` for logical blocks, matching A2/A3.
 - DMB MMIO offset is **`0xD0`** (a2a3 uses `0xA0`). Ready dispatch writes the low 32 bits;
   early release rings high 32 via 64-bit STR `(token<<32)|token`. AICore gated path spins on
   `read_dmb_high32() == task_id` before ACK.
