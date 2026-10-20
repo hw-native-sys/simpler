@@ -133,7 +133,7 @@ void prime_worker(ChipWorker &worker, uint32_t depth, unsigned launch_depth) {
     // refused as stale before reaching the stubs below.
     worker.pipeline_generations_.resize(depth);
     for (uint32_t slot = 0; slot < depth; ++slot) {
-        worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
+        worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     }
     for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {
         g_slots.emplace(worker.runtime_bufs_[slot].data(), slot);

@@ -10,7 +10,7 @@ and per-thread state is managed across simulation and onboard platforms.
 ```text
 Python process (ChipWorker)
   |
-  dlopen(host_runtime.so, RTLD_GLOBAL)        ← host SO
+  dlopen(host_runtime.so, RTLD_NOW | RTLD_LOCAL)        ← host SO
     |
     +-- DeviceRunner::ensure_binaries_loaded()
     |     |
@@ -30,7 +30,7 @@ Python process (ChipWorker)
 ```text
 Python process (ChipWorker)
   |
-  dlopen(host_runtime.so, RTLD_GLOBAL)        ← host SO
+  dlopen(host_runtime.so, RTLD_NOW | RTLD_LOCAL)        ← host SO
     |
     +-- DeviceRunner (handle-based, one per ChipWorker)
     |     |
@@ -57,31 +57,33 @@ AICore remains a CANN-registered binary blob.
 
 ## RTLD Flags and Rationale
 
-### Host Runtime SO: `RTLD_NOW | RTLD_GLOBAL`
+### Host Runtime SO: `RTLD_NOW | RTLD_LOCAL`
 
-`RTLD_GLOBAL` is **required**. PTO ISA's TPUSH/TPOP instructions (AIC-AIV
-data transfer for mix-type kernels) use `dlsym(RTLD_DEFAULT, ...)` internally
-to locate shared storage hooks defined in the host SO:
+`RuntimeModule` owns one dynamic-loader reference. Its required symbol lookup
+throws on a missing export; optional lookup returns null. Existing C symbols
+and their required/optional policies are unchanged.
 
-```cpp
-// PTO ISA: pto/common/cpu_stub.hpp
-inline GetSharedStorageHookFn ResolveSharedStorageHook() {
-    static auto hook = reinterpret_cast<...>(
-        dlsym(RTLD_DEFAULT, "pto_cpu_sim_get_shared_storage"));
-    return hook;
-}
-```
+The runtime stays local so identically named entries in TMR and HBG do not
+interpose on each other. Simulation's process-wide `libcpu_sim_context.so`
+is loaded separately with `RTLD_GLOBAL`; it supplies the PTO-ISA hooks reached
+by `dlsym(RTLD_DEFAULT, ...)`, including shared storage and task identity.
+Those hooks do not require global visibility for the host runtime itself.
 
-With `RTLD_LOCAL`, this symbol is not in the global scope. The hook returns
-`nullptr`, and TPUSH/TPOP fall back to a `static` local variable per SO.
-Since AIC and AIV kernel threads run in different contexts, they get separate
-storage instances and deadlock — the producer (TPUSH) writes to one storage,
-the consumer (TPOP) waits on another.
+The context binding and each opaque native-run storage slot share the module
+owner. A storage move transfers both its bytes and its code reference; freeing
+the bytes precedes dropping that reference. Successful close destroys the
+context and releases native storage before dropping the binding's module
+reference. Failed initialization clears uncommitted bindings before its local
+module owner exits. Failed close keeps the binding for retry.
 
-**Cross-runtime isolation** (running different runtime SOs sequentially) relies
-on `-fno-gnu-unique` to ensure `dlclose` actually unloads the SO. The next
-`dlopen` with `RTLD_GLOBAL` then replaces the global symbol scope with the
-new runtime's symbols.
+If destruction cannot prove teardown, the context and abandoned storage remain
+retained and their module is kept loaded for the process lifetime. Ordinary
+C++ reference destruction cannot unload code that retained state may call.
+This is terminal retention, not proof that device work stopped. Captured-graph
+ownership is a separate consumer; this eager owner does not enable capture.
+
+`-fno-gnu-unique` permits actual unload after the final reference on supported
+ELF builds. The process-owned simulator context retains its separate lifetime.
 
 ### Inner SOs: `RTLD_LOCAL`
 
@@ -129,8 +131,8 @@ in a file-scope `g_hal_handle` and never explicitly dlclosed.
 | ------ | ---- | ------- | ------------ |
 | `pto_cpu_sim_set_execution_context` | PTO ISA `cpu_stub.hpp` | Kernel `set_execution_context()` | Sim: injected via `set_sim_context_helpers` (bypasses dlsym) |
 | `pto_cpu_sim_get_execution_context` | PTO ISA `cpu_stub.hpp` | Kernel `get_block_idx()` etc. | Sim: same injection mechanism |
-| `pto_cpu_sim_get_shared_storage` | PTO ISA `cpu_stub.hpp` | TPUSH/TPOP shared state | Requires `RTLD_GLOBAL` on host SO |
-| `pto_cpu_sim_get_task_cookie` | PTO ISA `cpu_stub.hpp` | Kernel `get_task_cookie()` | Requires `RTLD_GLOBAL` on host SO |
+| `pto_cpu_sim_get_shared_storage` | PTO ISA `cpu_stub.hpp` | TPUSH/TPOP shared state | Provided by the process-global simulator context |
+| `pto_cpu_sim_get_task_cookie` | PTO ISA `cpu_stub.hpp` | Kernel `get_task_cookie()` | Provided by the process-global simulator context |
 | `halMemAlloc` / `halMemFree` | Onboard `device_malloc.cpp` | AICPU device memory | Resolved once, cached in statics |
 | `halGetDeviceInfoByBuff` | Onboard `host_regs.cpp` | Core validity query | a2a3 only |
 | `halMemCtl` | Onboard `host_regs.cpp` | Register address mapping | a2a3 only |
@@ -143,8 +145,8 @@ and `RTLD_LOCAL`.
 
 The next two (`get_shared_storage`, `get_task_cookie`) are called from PTO ISA
 template code instantiated **inside kernel SOs** — not the AICore SO. Function
-pointer injection into the AICore SO cannot reach them. They require the host
-SO to be loaded with `RTLD_GLOBAL`.
+pointer injection into the AICore SO cannot reach them. They resolve against the process-global simulator context; the host runtime
+remains local.
 
 The HAL symbols are onboard-only. CANN's scheduler process pre-loads
 `libascend_hal.so` into the global scope before launching AICPU kernels.
@@ -259,7 +261,7 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 | SO | Caching | Lifecycle |
 | -- | ------- | --------- |
 | Sim context | Process registry keyed by path | Process lifetime: loaded once with `RTLD_GLOBAL`, never explicitly closed |
-| Host runtime | `ChipWorker::lib_handle_` | Per-init: dlopen in `init()`, dlclose in `finalize()` |
+| Host runtime | `RuntimeModule` shared by context and native storage | Final reference after successful teardown; terminal failure retains code for process lifetime |
 | AICPU | `DeviceRunner::aicpu_so_handle_` | Per-init: loaded lazily by the first `prepare_execution()`, retained across runs, closed by `finalize()` |
 | AICore | `DeviceRunner::aicore_so_handle_` | Per-run: reloaded for the run's kernel binary, closed after a successful `drain_execution()` (or by final cleanup) |
 | Kernel | `DeviceRunner::func_id_to_addr_` (map by func_id) | Per-task: uploaded in `init_runtime_impl()`, removed in `release_run_bindings_impl()` |
@@ -269,7 +271,7 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 
 | Resource | Caching | Lifecycle |
 | -------- | ------- | --------- |
-| Host runtime | `ChipWorker::lib_handle_` | Per-runtime-group: shared across tasks in same group |
+| Host runtime | `RuntimeModule` shared by context and native storage | Per runtime group, released after its final proven consumer; terminal failure retains code |
 | Dispatcher SO bytes | `DeviceRunnerBase::dispatcher_so_binary_` | Init-only: passed to `LoadAicpuOp::BootstrapDispatcher`, then cleared |
 | Runtime AICPU SO | Preinstall file `simpler_inner_<fp>_<device_id>.so` | Written once through dispatcher bootstrap, then registered via `rtsBinaryLoadFromFile` |
 | AICPU entry handles | `LoadAicpuOp` cached `rtFuncHandle`s | Per-runtime-group: reused by `rtsLaunchCpuKernel` on every task |
@@ -356,7 +358,7 @@ ChipWorker.finalize()
   finalize_device(ctx)
     unload_executor_binaries()               dlclose AICPU and any residual AICore SO
   destroy_device_context(ctx)
-  dlclose(host_runtime.so)                   -fno-gnu-unique ensures real unload
+  release native storage and module owners   final reference permits dlclose
 ```
 
 ### Onboard (subprocess per device, ChipWorker reused per runtime group)
@@ -423,5 +425,5 @@ device_worker_main(device_id)
     ChipWorker.finalize()
       finalize_device(ctx)                     rtDeviceReset()
       destroy_device_context(ctx)
-      dlclose(host_runtime.so)
+      release native storage and module owners
 ```

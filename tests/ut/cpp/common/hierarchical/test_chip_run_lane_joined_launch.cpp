@@ -139,8 +139,8 @@ void prime_worker(ChipWorker &worker, unsigned launch_depth = 2) {
     // slot 0, and `is_admissible` refuses a lease outside it, so every preparation would be
     // refused as stale before reaching the stubs below.
     worker.pipeline_generations_.resize(2);
-    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
-    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
+    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
+    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {
         g_slots.emplace(worker.runtime_bufs_[slot].data(), slot);
     }
@@ -826,7 +826,7 @@ TEST(ChipRunLaneJoinedLaunchTest, DepthThreeKeepsOrdinaryJoinsAndRefusesTheDiagn
     ChipWorker worker;
     prime_worker(worker, /*launch_depth=*/3);
     worker.pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 3, {}};
-    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
+    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     g_slots.emplace(worker.runtime_bufs_[2].data(), 2u);
     ChipRunLane lane(worker);
     const CallConfig level_one = swimlane_config(1);
@@ -852,7 +852,7 @@ TEST(ChipRunLaneJoinedLaunchTest, DepthThreeStillJoinsNonDiagnosticRuns) {
     ChipWorker worker;
     prime_worker(worker, /*launch_depth=*/3);
     worker.pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 3, {}};
-    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
+    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     g_slots.emplace(worker.runtime_bufs_[2].data(), 2u);
     ChipRunLane lane(worker);
 

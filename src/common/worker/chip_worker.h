@@ -51,6 +51,7 @@ struct ChipWorkerNativeRun {
 
 class ChipRun;
 class ChipRunLane;
+class RuntimeModule;
 struct ChipRunLaneState;
 
 // A current-context preflight refusal occurs before lane progress or native
@@ -336,7 +337,7 @@ public:
     ///
     /// The three `device_*_caller_buffer(s)_ctx` entries are mandatory C ABI,
     /// like the rest of the `device_*_ctx` family: `init` resolves them with
-    /// `load_symbol`, which throws when one is missing, so a bound runtime
+    /// `RuntimeModule::required`, which throws when one is missing, so a bound runtime
     /// always has them. (The two `HostApiOps` entries this capability adds are
     /// the optional half — those are null-guarded, and a platform publishing
     /// neither behaves as it did.) False therefore means what the paragraph
@@ -526,7 +527,7 @@ private:
     using ValidateExecutionContextFn = decltype(&simpler_validate_execution_context);
     using ValidateCallerStreamFn = decltype(&simpler_validate_caller_stream);
     using CallerStreamLaunchFn = decltype(&simpler_launch_run_on_stream);
-    // Resolved optionally rather than through `load_symbol`: only onboard
+    // Resolved optionally rather than through `RuntimeModule::required`: only onboard
     // modules carry the retention fixture, so a hard requirement would oblige
     // every simulated and stand-in runtime to export a stub of it.
     using SimplerProbeRunRetentionFn = decltype(&simpler_probe_run_retention);
@@ -578,7 +579,7 @@ private:
     uint64_t create_base_comm(int rank, int nranks, const std::string &rootinfo_path);
     void clear_comm_sessions();
 
-    void *lib_handle_ = nullptr;
+    std::shared_ptr<RuntimeModule> runtime_module_;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
     DestroyDeviceContextFn destroy_device_context_fn_ = nullptr;
     DeviceMallocCtxFn device_malloc_ctx_fn_ = nullptr;
@@ -769,7 +770,7 @@ private:
     class RuntimeStorage {
     public:
         RuntimeStorage() = default;
-        RuntimeStorage(size_t size, size_t alignment);
+        RuntimeStorage(size_t size, size_t alignment, std::shared_ptr<RuntimeModule> module);
         ~RuntimeStorage();
         RuntimeStorage(RuntimeStorage &&other) noexcept;
         RuntimeStorage &operator=(RuntimeStorage &&other) noexcept;
@@ -791,14 +792,12 @@ private:
          * a bounded one, with the reason logged, which is what the alternative
          * of reusing those bytes cannot offer.
          */
-        void abandon() noexcept {
-            data_ = nullptr;
-            size_ = 0;
-        }
+        void abandon() noexcept;
 
     private:
         void *data_{nullptr};
         size_t size_{0};
+        std::shared_ptr<RuntimeModule> module_;
     };
 
     // Allocated once during init and never resized. Each allocation honors the

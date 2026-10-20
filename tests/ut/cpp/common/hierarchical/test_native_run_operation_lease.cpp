@@ -43,8 +43,27 @@
 #undef protected
 
 #include "native_run_storage_tag.h"
+#include "runtime_module.h"
 
 namespace {
+
+TEST(NativeRunOperationLeaseTest, RunStorageRetainsItsModuleAcrossMoves) {
+    auto module = std::make_shared<RuntimeModule>(nullptr);
+    std::weak_ptr<RuntimeModule> weak = module;
+    ChipWorker::RuntimeStorage first(64, alignof(std::max_align_t), module);
+    void *address = first.data();
+    module.reset();
+    EXPECT_FALSE(weak.expired());
+    ChipWorker::RuntimeStorage second(std::move(first));
+    EXPECT_EQ(first.data(), nullptr);
+    EXPECT_EQ(second.data(), address);
+    EXPECT_FALSE(weak.expired());
+    first = std::move(second);
+    EXPECT_EQ(second.data(), nullptr);
+    EXPECT_EQ(first.data(), address);
+    first = ChipWorker::RuntimeStorage{};
+    EXPECT_TRUE(weak.expired());
+}
 
 // What each stub should do on its next call. Plain globals because one case drives one worker.
 std::mutex g_mu;
@@ -192,19 +211,16 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
     static int device_context_placeholder = 0;
     worker.device_ctx_ = &device_context_placeholder;
     worker.destroy_device_context_fn_ = stub_destroy_device_context;
-    // A real, closable handle, because the teardown guard requires a bound runtime and the close
-    // `dlclose`s whatever it finds. `dlopen(nullptr, ...)` names this program, which is already
-    // loaded, so this adds a reference the close gives back rather than loading anything — a
-    // stand-in pointer would be undefined behaviour at that `dlclose`.
-    if (worker.lib_handle_ == nullptr) worker.lib_handle_ = dlopen(nullptr, RTLD_LAZY);
-    EXPECT_NE(worker.lib_handle_, nullptr);
+    // A reference to this executable supplies the runtime owner without another DSO.
+    if (worker.runtime_module_ == nullptr) worker.runtime_module_ = std::make_shared<RuntimeModule>(nullptr);
+    EXPECT_NE(worker.runtime_module_, nullptr);
     worker.pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, depth, {}};
     // One generation per granted set, as `init` sizes it: an unsized filter has no entry for
     // slot 0, and `is_admissible` refuses a lease outside it, so every preparation would be
     // refused as stale before reaching the stubs below.
     worker.pipeline_generations_.resize(depth);
     for (uint32_t slot = 0; slot < depth; ++slot) {
-        worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
+        worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), worker.runtime_module_);
     }
     worker.prepare_run_fn_ = prepare_run;
     worker.launch_run_fn_ = launch_run;

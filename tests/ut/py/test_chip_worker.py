@@ -14,6 +14,8 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
+import textwrap
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -443,6 +445,45 @@ def kernel_symbol_runtime(tmp_path_factory):
 
 
 class TestChipWorkerKernelSymbols:
+    def test_failed_destructor_retains_runtime_code(self, kernel_symbol_runtime, tmp_path):
+        lifecycle_log = tmp_path / "retained-lifecycle.log"
+        runtime = kernel_symbol_runtime(lifecycle_log=lifecycle_log, finalize_failures=3)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent("""\
+                    import gc
+                    import os
+                    import sys
+                    from pathlib import Path
+                    from _task_interface import _ChipWorker
+
+                    worker = _ChipWorker()
+                    worker.init(sys.argv[1], os.devnull, os.devnull, "", device_id=0)
+                    try:
+                        worker.finalize()
+                    except RuntimeError as error:
+                        assert "device teardown failed (-77)" in str(error)
+                    else:
+                        raise AssertionError("teardown unexpectedly succeeded")
+                    del worker
+                    gc.collect()
+                    assert Path(sys.argv[2]).read_text().splitlines() == ["scratch-created"]
+                    os._exit(0)
+                    """),
+                str(runtime),
+                str(lifecycle_log),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "ChipWorker::~ChipWorker: teardown failed" in result.stderr
+        assert lifecycle_log.read_text().splitlines() == ["scratch-created"]
+
     @pytest.mark.parametrize("exit_path", ["finalize", "init_failure", "finalize_retry"])
     def test_retained_scratch_is_destroyed_before_runtime_unload(self, kernel_symbol_runtime, tmp_path, exit_path):
         lifecycle_log = tmp_path / "lifecycle.log"

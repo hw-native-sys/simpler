@@ -16,6 +16,8 @@
 #include "device_fault_monitor_host.h"
 #include "host_log.h"
 #include "pipeline_contract.h"
+#include "runtime_module.h"
+#include "host/raii_scope_guard.h"
 
 #include <dlfcn.h>
 #include <unistd.h>
@@ -56,22 +58,6 @@ public:
 private:
     void *handle_;
 };
-
-template <typename T>
-T load_symbol(void *handle, const char *name) {
-    dlerror();  // clear any existing error
-    void *sym = dlsym(handle, name);
-    const char *err = dlerror();
-    if (err) {
-        std::string msg = "dlsym failed for '";
-        msg += name;
-        msg += "': ";
-        msg += err;
-        msg += "; every compatible module built from this source tree exports it, so rebuild the module";
-        throw std::runtime_error(msg);
-    }
-    return reinterpret_cast<T>(sym);
-}
 
 void bind_host_log_state(void *handle, const char *module_name) {
     const char *error = nullptr;
@@ -178,7 +164,8 @@ std::vector<uint8_t> read_binary_file(const std::string &path) {
 
 }  // namespace
 
-ChipWorker::RuntimeStorage::RuntimeStorage(size_t size, size_t alignment) {
+ChipWorker::RuntimeStorage::RuntimeStorage(size_t size, size_t alignment, std::shared_ptr<RuntimeModule> module) :
+    module_(std::move(module)) {
     void *storage = nullptr;
     if (posix_memalign(&storage, alignment, size) != 0) {
         throw std::bad_alloc();
@@ -192,7 +179,8 @@ ChipWorker::RuntimeStorage::~RuntimeStorage() { std::free(data_); }
 
 ChipWorker::RuntimeStorage::RuntimeStorage(RuntimeStorage &&other) noexcept :
     data_(other.data_),
-    size_(other.size_) {
+    size_(other.size_),
+    module_(std::move(other.module_)) {
     other.data_ = nullptr;
     other.size_ = 0;
 }
@@ -202,9 +190,16 @@ ChipWorker::RuntimeStorage &ChipWorker::RuntimeStorage::operator=(RuntimeStorage
     std::free(data_);
     data_ = other.data_;
     size_ = other.size_;
+    module_ = std::move(other.module_);
     other.data_ = nullptr;
     other.size_ = 0;
     return *this;
+}
+
+void ChipWorker::RuntimeStorage::abandon() noexcept {
+    if (module_ != nullptr) module_->retain_until_process_exit();
+    data_ = nullptr;
+    size_ = 0;
 }
 
 ChipWorker::~ChipWorker() {
@@ -251,22 +246,12 @@ void ChipWorker::init(
         load_sim_context(sim_context_path);
     }
 
-    // Host runtime SO is loaded with RTLD_LOCAL so that different runtimes'
-    // identically-named symbols (simpler_init, simpler_register_callable,
-    // simpler_run, etc.) do not collide when switching runtimes within the
-    // same process.
-    // Cross-runtime isolation relies on -fno-gnu-unique (#453) allowing
-    // dlclose to actually unload the previous runtime's SO before loading
-    // the next one.
-    dlerror();
-    void *handle = dlopen(host_lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
-    if (!handle) {
-        std::string err = "dlopen failed: ";
-        const char *msg = dlerror();
-        err += msg ? msg : "unknown error";
-        throw std::runtime_error(err);
-    }
-    DlHandleGuard host_guard(handle);
+    auto module = std::make_shared<RuntimeModule>(host_lib_path.c_str());
+    void *handle = module->handle();
+    // Uncommitted symbols and storage are cleared before the local module owner exits.
+    auto rollback_binding = RAIIScopeGuard([&] {
+        if (runtime_module_ == nullptr) clear_runtime_binding();
+    });
     bind_host_log_state(handle, "host runtime");
     bind_device_fault_monitor(handle, "host runtime");
 
@@ -276,50 +261,46 @@ void ChipWorker::init(
     KernelPrepareCallableFn kernel_prepare_callable_fn = nullptr;
     KernelLaunchFn kernel_launch_fn = nullptr;
     try {
-        create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
-        destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
-        device_malloc_ctx_fn_ = load_symbol<DeviceMallocCtxFn>(handle, "device_malloc_ctx");
-        device_free_ctx_fn_ = load_symbol<DeviceFreeCtxFn>(handle, "device_free_ctx");
+        create_device_context_fn_ = module->required<CreateDeviceContextFn>("create_device_context");
+        destroy_device_context_fn_ = module->required<DestroyDeviceContextFn>("destroy_device_context");
+        device_malloc_ctx_fn_ = module->required<DeviceMallocCtxFn>("device_malloc_ctx");
+        device_free_ctx_fn_ = module->required<DeviceFreeCtxFn>("device_free_ctx");
         device_free_caller_buffer_ctx_fn_ =
-            load_symbol<DeviceFreeCallerBufferCtxFn>(handle, "device_free_caller_buffer_ctx");
+            module->required<DeviceFreeCallerBufferCtxFn>("device_free_caller_buffer_ctx");
         device_borrow_caller_buffers_ctx_fn_ =
-            load_symbol<DeviceBorrowCallerBuffersCtxFn>(handle, "device_borrow_caller_buffers_ctx");
+            module->required<DeviceBorrowCallerBuffersCtxFn>("device_borrow_caller_buffers_ctx");
         device_release_caller_buffers_ctx_fn_ =
-            load_symbol<DeviceReleaseCallerBuffersCtxFn>(handle, "device_release_caller_buffers_ctx");
-        device_committed_memory_fn_ = load_symbol<GetCommittedDeviceMemoryFn>(handle, "committed_device_memory_ctx");
-        device_memory_info_fn_ = load_symbol<GetDeviceMemoryInfoFn>(handle, "device_memory_info_ctx");
-        copy_to_device_ctx_fn_ = load_symbol<CopyToDeviceCtxFn>(handle, "copy_to_device_ctx");
-        copy_from_device_ctx_fn_ = load_symbol<CopyFromDeviceCtxFn>(handle, "copy_from_device_ctx");
-        get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
-        get_runtime_alignment_fn_ = load_symbol<GetRuntimeAlignmentFn>(handle, "get_runtime_alignment");
-        simpler_init_fn_ = load_symbol<SimplerInitFn>(handle, "simpler_init");
-        register_callable_fn_ = load_symbol<SimplerRegisterCallableFn>(handle, "simpler_register_callable");
+            module->required<DeviceReleaseCallerBuffersCtxFn>("device_release_caller_buffers_ctx");
+        device_committed_memory_fn_ = module->required<GetCommittedDeviceMemoryFn>("committed_device_memory_ctx");
+        device_memory_info_fn_ = module->required<GetDeviceMemoryInfoFn>("device_memory_info_ctx");
+        copy_to_device_ctx_fn_ = module->required<CopyToDeviceCtxFn>("copy_to_device_ctx");
+        copy_from_device_ctx_fn_ = module->required<CopyFromDeviceCtxFn>("copy_from_device_ctx");
+        get_runtime_size_fn_ = module->required<GetRuntimeSizeFn>("get_runtime_size");
+        get_runtime_alignment_fn_ = module->required<GetRuntimeAlignmentFn>("get_runtime_alignment");
+        simpler_init_fn_ = module->required<SimplerInitFn>("simpler_init");
+        register_callable_fn_ = module->required<SimplerRegisterCallableFn>("simpler_register_callable");
         // Optional: a runtime built before versioned registration exports
         // nothing, and a null pointer is the refusal.
-        register_callable_v2_fn_ =
-            reinterpret_cast<SimplerRegisterCallableV2Fn>(dlsym(handle, "simpler_register_callable_v2"));
-        run_fn_ = load_symbol<SimplerRunFn>(handle, "simpler_run");
-        prepare_run_fn_ = load_symbol<SimplerPrepareRunFn>(handle, "simpler_prepare_run");
-        launch_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_launch_run");
+        register_callable_v2_fn_ = module->optional<SimplerRegisterCallableV2Fn>("simpler_register_callable_v2");
+        run_fn_ = module->required<SimplerRunFn>("simpler_run");
+        prepare_run_fn_ = module->required<SimplerPrepareRunFn>("simpler_prepare_run");
+        launch_run_fn_ = module->required<SimplerNativeRunFn>("simpler_launch_run");
         validate_execution_context_fn_ =
-            reinterpret_cast<ValidateExecutionContextFn>(dlsym(handle, "simpler_validate_execution_context"));
+            module->optional<ValidateExecutionContextFn>("simpler_validate_execution_context");
         // Older runtime modules have neither entry; ordinary submissions need neither.
-        validate_caller_stream_fn_ =
-            reinterpret_cast<ValidateCallerStreamFn>(dlsym(handle, "simpler_validate_caller_stream"));
-        launch_run_on_stream_fn_ =
-            reinterpret_cast<CallerStreamLaunchFn>(dlsym(handle, "simpler_launch_run_on_stream"));
-        launch_run_joined_fn_ = load_symbol<SimplerJoinedLaunchFn>(handle, "simpler_launch_run_joined");
-        poll_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_poll_run");
-        wait_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_wait_run");
-        finalize_run_fn_ = load_symbol<SimplerNativeRunFn>(handle, "simpler_finalize_run");
+        validate_caller_stream_fn_ = module->optional<ValidateCallerStreamFn>("simpler_validate_caller_stream");
+        launch_run_on_stream_fn_ = module->optional<CallerStreamLaunchFn>("simpler_launch_run_on_stream");
+        launch_run_joined_fn_ = module->required<SimplerJoinedLaunchFn>("simpler_launch_run_joined");
+        poll_run_fn_ = module->required<SimplerNativeRunFn>("simpler_poll_run");
+        wait_run_fn_ = module->required<SimplerNativeRunFn>("simpler_wait_run");
+        finalize_run_fn_ = module->required<SimplerNativeRunFn>("simpler_finalize_run");
         // Absent on every simulated and stand-in module by construction, so a
         // null here is a fact about the backend rather than a stale build. The
         // caller reports it.
-        probe_run_retention_fn_ =
-            reinterpret_cast<SimplerProbeRunRetentionFn>(dlsym(handle, "simpler_probe_run_retention"));
+        probe_run_retention_fn_ = module->optional<SimplerProbeRunRetentionFn>("simpler_probe_run_retention");
         // Optional for the same reason: a module that records no teardown does
         // not export this, and a null is that fact rather than a stale build.
-        get_teardown_report_fn_ = reinterpret_cast<GetTeardownReportFn>(dlsym(handle, "get_teardown_report"));
+        get_teardown_report_fn_ = module->optional<GetTeardownReportFn>("get_teardown_report");
         // Cross-run collection entry points. Resolved by name rather than added
         // to `simpler_init`'s signature, which every runtime module must match
         // exactly; a module built without them simply cannot retain runs.
@@ -327,56 +308,48 @@ void ChipWorker::init(
         // Two names, because this one is the only symbol here that was renamed
         // after it shipped: the canonical spelling first, then the one it
         // shipped under, so a module from either build is usable.
-        set_retain_runs_fn_ = reinterpret_cast<SimplerSetRetainRunsFn>(dlsym(handle, "simpler_set_retain_runs_ctx"));
+        set_retain_runs_fn_ = module->optional<SimplerSetRetainRunsFn>("simpler_set_retain_runs_ctx");
         if (set_retain_runs_fn_ == nullptr) {
-            set_retain_runs_fn_ =
-                reinterpret_cast<SimplerSetRetainRunsFn>(dlsym(handle, "simpler_set_dfx_session_ctx"));
+            set_retain_runs_fn_ = module->optional<SimplerSetRetainRunsFn>("simpler_set_dfx_session_ctx");
         }
-        set_workspace_budget_fn_ =
-            reinterpret_cast<SimplerSetWorkspaceBudgetFn>(dlsym(handle, "simpler_set_workspace_budget_ctx"));
+        set_workspace_budget_fn_ = module->optional<SimplerSetWorkspaceBudgetFn>("simpler_set_workspace_budget_ctx");
         // Automatic admission, resolved by name for the same reason as the
         // entries above: a module built without them cannot size itself, and a
         // caller that never asks for it never looks for them.
-        enable_automatic_admission_fn_ = reinterpret_cast<SimplerEnableAutomaticAdmissionFn>(
-            dlsym(handle, "simpler_enable_automatic_admission_ctx")
-        );
-        admissible_run_resource_sets_fn_ = reinterpret_cast<SimplerAdmissibleRunResourceSetsFn>(
-            dlsym(handle, "simpler_admissible_run_resource_sets_ctx")
-        );
-        abort_run_plan_fn_ = reinterpret_cast<SimplerAbortRunPlanFn>(dlsym(handle, "simpler_abort_run_plan_ctx"));
-        enable_workspace_management_fn_ = reinterpret_cast<SimplerEnableWorkspaceManagementFn>(
-            dlsym(handle, "simpler_enable_workspace_management_ctx")
-        );
-        get_workspace_report_fn_ =
-            reinterpret_cast<SimplerGetWorkspaceReportFn>(dlsym(handle, "simpler_get_workspace_report_ctx"));
-        flush_diagnostics_fn_ =
-            reinterpret_cast<SimplerFlushDiagnosticsFn>(dlsym(handle, "simpler_flush_diagnostics_ctx"));
+        enable_automatic_admission_fn_ =
+            module->optional<SimplerEnableAutomaticAdmissionFn>("simpler_enable_automatic_admission_ctx");
+        admissible_run_resource_sets_fn_ =
+            module->optional<SimplerAdmissibleRunResourceSetsFn>("simpler_admissible_run_resource_sets_ctx");
+        abort_run_plan_fn_ = module->optional<SimplerAbortRunPlanFn>("simpler_abort_run_plan_ctx");
+        enable_workspace_management_fn_ =
+            module->optional<SimplerEnableWorkspaceManagementFn>("simpler_enable_workspace_management_ctx");
+        get_workspace_report_fn_ = module->optional<SimplerGetWorkspaceReportFn>("simpler_get_workspace_report_ctx");
+        flush_diagnostics_fn_ = module->optional<SimplerFlushDiagnosticsFn>("simpler_flush_diagnostics_ctx");
         supports_concurrent_native_prepare_fn_ =
-            load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_concurrent_native_prepare_ctx");
+            module->required<SupportsConcurrentNativePrepareFn>("supports_concurrent_native_prepare_ctx");
         supports_joined_native_launch_fn_ =
-            load_symbol<SupportsConcurrentNativePrepareFn>(handle, "supports_joined_native_launch_ctx");
+            module->required<SupportsConcurrentNativePrepareFn>("supports_joined_native_launch_ctx");
         // Optional: a runtime built before the diagnostic join exports no
         // such symbol, and a null pointer is the refusal.
         supports_joined_diagnostic_launch_fn_ =
-            reinterpret_cast<SupportsJoinedDiagnosticLaunchFn>(dlsym(handle, "supports_joined_diagnostic_launch_ctx"));
+            module->optional<SupportsJoinedDiagnosticLaunchFn>("supports_joined_diagnostic_launch_ctx");
         // Optional for the same reason: a runtime built before the retained
         // capacity grant exports nothing, and a null pointer is the refusal.
         set_retained_epoch_limit_fn_ =
-            reinterpret_cast<SimplerSetRetainedEpochLimitFn>(dlsym(handle, "simpler_set_retained_epoch_limit_ctx"));
+            module->optional<SimplerSetRetainedEpochLimitFn>("simpler_set_retained_epoch_limit_ctx");
         // Optional on the same terms: a module built before per-run resources
         // were sized by the grant exports nothing and keeps its own sizing.
         set_run_resource_grant_fn_ =
-            reinterpret_cast<SimplerSetRunResourceGrantFn>(dlsym(handle, "simpler_set_run_resource_grant_ctx"));
-        get_arena_bank_gm_heap_base_fn_ =
-            load_symbol<GetArenaBankGmHeapBaseFn>(handle, "get_arena_bank_gm_heap_base_ctx");
-        get_retained_temp_addr_fn_ = load_symbol<GetRetainedTempAddrFn>(handle, "get_retained_temp_addr_ctx");
-        get_pipeline_contract_fn = load_symbol<GetPipelineContractFn>(handle, "get_pipeline_contract");
-        unregister_callable_fn_ = load_symbol<SimplerUnregisterCallableFn>(handle, "simpler_unregister_callable");
-        get_aicpu_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_aicpu_dlopen_count");
-        get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
+            module->optional<SimplerSetRunResourceGrantFn>("simpler_set_run_resource_grant_ctx");
+        get_arena_bank_gm_heap_base_fn_ = module->required<GetArenaBankGmHeapBaseFn>("get_arena_bank_gm_heap_base_ctx");
+        get_retained_temp_addr_fn_ = module->required<GetRetainedTempAddrFn>("get_retained_temp_addr_ctx");
+        get_pipeline_contract_fn = module->required<GetPipelineContractFn>("get_pipeline_contract");
+        unregister_callable_fn_ = module->required<SimplerUnregisterCallableFn>("simpler_unregister_callable");
+        get_aicpu_dlopen_count_fn_ = module->required<GetAicpuDlopenCountFn>("get_aicpu_dlopen_count");
+        get_host_dlopen_count_fn_ = module->required<GetAicpuDlopenCountFn>("get_host_dlopen_count");
         get_run_stream_set_create_count_fn_ =
-            load_symbol<GetAicpuDlopenCountFn>(handle, "get_run_stream_set_create_count");
-        finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
+            module->required<GetAicpuDlopenCountFn>("get_run_stream_set_create_count");
+        finalize_device_fn_ = module->required<FinalizeDeviceFn>("finalize_device");
         // ACL lifecycle + comm_* + the required kernel-mode entries are part of
         // the uniform host_runtime.so ABI. Every platform runtime exports all of
         // them — a runtime without a real backend (today: a5 for comm) ships
@@ -392,27 +365,25 @@ void ChipWorker::init(
         // answered by simpler_kernel_mode_init, which refuses with
         // PTO_RUNTIME_ERR_UNSUPPORTED and establishes nothing when its runtime
         // cannot size kernel resources. Neither gates symbol resolution.
-        ensure_acl_ready_fn_ = load_symbol<EnsureAclReadyFn>(handle, "ensure_acl_ready_ctx");
-        create_comm_stream_fn_ = load_symbol<CreateCommStreamFn>(handle, "create_comm_stream_ctx");
-        destroy_comm_stream_fn_ = load_symbol<DestroyCommStreamFn>(handle, "destroy_comm_stream_ctx");
-        comm_init_fn_ = load_symbol<CommInitFn>(handle, "comm_init");
-        comm_alloc_windows_fn_ = load_symbol<CommAllocWindowsFn>(handle, "comm_alloc_windows");
-        comm_get_local_window_base_fn_ = load_symbol<CommGetLocalWindowBaseFn>(handle, "comm_get_local_window_base");
-        comm_get_window_size_fn_ = load_symbol<CommGetWindowSizeFn>(handle, "comm_get_window_size");
-        comm_derive_context_fn_ = load_symbol<CommDeriveContextFn>(handle, "comm_derive_context");
-        comm_alloc_domain_windows_fn_ = load_symbol<CommAllocDomainWindowsFn>(handle, "comm_alloc_domain_windows");
-        comm_release_domain_windows_fn_ =
-            load_symbol<CommReleaseDomainWindowsFn>(handle, "comm_release_domain_windows");
-        comm_global_domain_prepare_fn_ = load_symbol<CommGlobalDomainPrepareFn>(handle, "comm_global_domain_prepare");
-        comm_global_domain_import_fn_ = load_symbol<CommGlobalDomainImportFn>(handle, "comm_global_domain_import");
-        comm_global_domain_release_fn_ = load_symbol<CommGlobalDomainReleaseFn>(handle, "comm_global_domain_release");
-        comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
-        comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
-        kernel_supported_fn = load_symbol<KernelSupportedFn>(handle, "simpler_kernel_mode_supported");
-        kernel_init_fn = load_symbol<KernelInitFn>(handle, "simpler_kernel_mode_init");
-        kernel_prepare_callable_fn =
-            load_symbol<KernelPrepareCallableFn>(handle, "simpler_kernel_mode_prepare_callable");
-        kernel_launch_fn = load_symbol<KernelLaunchFn>(handle, "simpler_kernel_mode_launch");
+        ensure_acl_ready_fn_ = module->required<EnsureAclReadyFn>("ensure_acl_ready_ctx");
+        create_comm_stream_fn_ = module->required<CreateCommStreamFn>("create_comm_stream_ctx");
+        destroy_comm_stream_fn_ = module->required<DestroyCommStreamFn>("destroy_comm_stream_ctx");
+        comm_init_fn_ = module->required<CommInitFn>("comm_init");
+        comm_alloc_windows_fn_ = module->required<CommAllocWindowsFn>("comm_alloc_windows");
+        comm_get_local_window_base_fn_ = module->required<CommGetLocalWindowBaseFn>("comm_get_local_window_base");
+        comm_get_window_size_fn_ = module->required<CommGetWindowSizeFn>("comm_get_window_size");
+        comm_derive_context_fn_ = module->required<CommDeriveContextFn>("comm_derive_context");
+        comm_alloc_domain_windows_fn_ = module->required<CommAllocDomainWindowsFn>("comm_alloc_domain_windows");
+        comm_release_domain_windows_fn_ = module->required<CommReleaseDomainWindowsFn>("comm_release_domain_windows");
+        comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
+        comm_global_domain_import_fn_ = module->required<CommGlobalDomainImportFn>("comm_global_domain_import");
+        comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
+        comm_barrier_fn_ = module->required<CommBarrierFn>("comm_barrier");
+        comm_destroy_fn_ = module->required<CommDestroyFn>("comm_destroy");
+        kernel_supported_fn = module->required<KernelSupportedFn>("simpler_kernel_mode_supported");
+        kernel_init_fn = module->required<KernelInitFn>("simpler_kernel_mode_init");
+        kernel_prepare_callable_fn = module->required<KernelPrepareCallableFn>("simpler_kernel_mode_prepare_callable");
+        kernel_launch_fn = module->required<KernelLaunchFn>("simpler_kernel_mode_launch");
     } catch (...) {
         throw;
     }
@@ -483,7 +454,7 @@ void ChipWorker::init(
         std::vector<RuntimeStorage> runtime_bufs;
         runtime_bufs.reserve(resolved_contract.pipeline_depth);
         for (uint32_t slot = 0; slot < resolved_contract.pipeline_depth; ++slot) {
-            runtime_bufs.emplace_back(runtime_size, runtime_alignment);
+            runtime_bufs.emplace_back(runtime_size, runtime_alignment, module);
         }
         runtime_bufs_.swap(runtime_bufs);
     } catch (...) {
@@ -610,7 +581,7 @@ void ChipWorker::init(
         if (borrowed_init_attempted) {
             const int close_rc = finalize_device_fn_(device_ctx_);
             if (close_rc != 0) {
-                lib_handle_ = host_guard.release();
+                runtime_module_ = module;
                 device_id_ = device_id;
                 throw std::runtime_error(
                     "ChipWorker borrowed init failed with code " + std::to_string(init_rc) + "; rollback failed (" +
@@ -626,7 +597,7 @@ void ChipWorker::init(
         throw;
     }
 
-    lib_handle_ = host_guard.release();
+    runtime_module_ = module;
     kernel_supported_fn_ = kernel_supported_fn;
     kernel_init_fn_ = kernel_init_fn;
     kernel_prepare_callable_fn_ = kernel_prepare_callable_fn;
@@ -729,7 +700,7 @@ void ChipWorker::finalize() {
     clear_comm_sessions();
 
     int device_finalize_rc = 0;
-    if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && lib_handle_ != nullptr) {
+    if (device_ctx_ != nullptr && finalize_device_fn_ != nullptr && runtime_module_ != nullptr) {
         device_finalize_rc = finalize_device_fn_(device_ctx_);
         // Immediately after the teardown call and before both the throw below
         // and the context destruction / dlclose a success runs into: that is
@@ -752,20 +723,13 @@ void ChipWorker::finalize() {
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
     }
-    if (lib_handle_) {
-        // The destroyed context owns the retained orchestration scratch, whose
-        // shared_ptr deleter and control-block code live in this host runtime.
-        // Native runs and their borrowed references are drained before teardown.
-        assert(device_ctx_ == nullptr);
-        dlclose(lib_handle_);
-    }
+    assert(device_ctx_ == nullptr);
     clear_runtime_binding();
     finalized_ = true;
 }
 
 void ChipWorker::clear_runtime_binding() {
     execution_environment_.reset();
-    lib_handle_ = nullptr;
     create_device_context_fn_ = nullptr;
     simpler_init_fn_ = nullptr;
     destroy_device_context_fn_ = nullptr;
@@ -801,6 +765,9 @@ void ChipWorker::clear_runtime_binding() {
     workspace_managed_ = false;
     workspace_limit_latched_ = false;
     automatic_admission_ = false;
+    enable_automatic_admission_fn_ = nullptr;
+    admissible_run_resource_sets_fn_ = nullptr;
+    abort_run_plan_fn_ = nullptr;
     set_workspace_budget_fn_ = nullptr;
     enable_workspace_management_fn_ = nullptr;
     get_workspace_report_fn_ = nullptr;
@@ -839,6 +806,7 @@ void ChipWorker::clear_runtime_binding() {
     kernel_prepare_callable_fn_ = nullptr;
     kernel_launch_fn_ = nullptr;
     runtime_bufs_.clear();
+    runtime_module_.reset();
     pipeline_generations_.reset();
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
     initialized_ = false;
@@ -1222,7 +1190,8 @@ void ChipWorker::abandon_after_failed_teardown(std::exception_ptr error) noexcep
     }
     for (auto &storage : runtime_bufs_)
         storage.abandon();
-    // device_ctx_ and lib_handle_ remain live for the process lifetime.
+    if (runtime_module_ != nullptr) runtime_module_->retain_until_process_exit();
+    // The device context and its runtime code remain live for the process lifetime.
 }
 
 void ChipWorker::validate_caller_stream(void *caller_stream) {

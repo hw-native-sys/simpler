@@ -155,8 +155,8 @@ void prime_worker(ChipWorker &worker) {
     // slot 0, and `is_admissible` refuses a lease outside it, so every preparation would be
     // refused as stale before reaching the stubs below.
     worker.pipeline_generations_.resize(2);
-    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
-    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t));
+    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
+    worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {
         g_slots.emplace(worker.runtime_bufs_[slot].data(), slot);
     }
