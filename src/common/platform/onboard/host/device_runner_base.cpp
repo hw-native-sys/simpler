@@ -3377,21 +3377,15 @@ int DeviceRunnerBase::ensure_device_run_result_region(
         LOG_ERROR("run-result region: allocation failed for slot %u", pipeline_slot);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // A fresh allocation has to be zeroed once. `allocate_tensor` is an
-    // `rtMalloc`: the bytes it returns are whatever the device left there, so
-    // `published` cannot be assumed to differ from the epoch this run is about
-    // to look for. Only the first use of an allocation pays this — steady-state
-    // reuse is distinguished by epoch and needs no per-run H2D.
     if (!device_run_result_initialized_[pipeline_slot]) {
         const uint64_t unpublished = 0;
-        if (copy_to_device(slot_ptr, &unpublished, sizeof(unpublished)) != 0) {
-            // Publish no base: a region whose `published` is still unknown could
-            // read back as this run's own epoch. The allocation stays so the
-            // next prepare on this slot retries the initialization.
-            LOG_ERROR("run-result region: initial clear failed for slot %u", pipeline_slot);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        device_run_result_initialized_[pipeline_slot] = true;
+        // Fresh storage has no trustworthy publication marker. The snapshot
+        // joins this run's pinned metadata batch; the entry fork orders both
+        // kernels after its asynchronous clear.
+        const int rc = slot_persistent_args_[pipeline_slot].staged_launch_metadata.append(
+            {slot_ptr, &unpublished, sizeof(unpublished)}
+        );
+        if (rc != 0) return rc;
     }
     kernel_args.args.run_result_data_base = reinterpret_cast<uint64_t>(slot_ptr);
     kernel_args.args.run_result_epoch = run_epoch;
@@ -3424,6 +3418,9 @@ uint64_t DeviceRunnerBase::arm_chip_swimlane_run_terminal_bank(uint64_t run_epoc
 
 int DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t run_epoch) {
     if (pipeline_slot >= device_run_results_.size()) return 0;
+    // A refused or failed cold publication leaves allocator bytes untrusted,
+    // even if they happen to contain the requested epoch. No read is certified.
+    if (!device_run_result_initialized_[pipeline_slot]) return 0;
     // The region is this slot's, and the slot is not handed to another run until
     // the run holding it finalizes, so this read races nothing. What makes the
     // record this run's rather than a successor's is that its device side wrote
@@ -3619,6 +3616,9 @@ int DeviceRunnerBase::validate_caller_stream(rtStream_t caller) {
 int DeviceRunnerBase::queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink) {
     return caller_orders_[prepared.pipeline_slot]->fork(prepared.identity, sink, [&] {
         const int rc = publish_for_launch(prepared.kernel_args, prepared.streams.aicpu, sink);
+        if (rc == 0 && prepared.kernel_args.args.run_result_data_base != 0) {
+            device_run_result_initialized_[prepared.pipeline_slot] = true;
+        }
         if (rc == 0 && prepared.kernel_args.args.device_wall_data_base != 0) {
             device_timing_armed_[prepared.pipeline_slot] = true;
         }

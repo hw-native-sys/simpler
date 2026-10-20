@@ -31,6 +31,8 @@ static int metadata_extensions, sync_error;
 static void *timing_target;
 static const void *timing_source;
 static size_t timing_bytes;
+static void *result_target;
+static const void *result_source;
 bool device_phase_capture_enabled() { return true; }
 extern "C" const char *get_platform();
 extern "C" bool publish_runtime_chip_swimlane_extensions(Runtime *) noexcept {
@@ -54,7 +56,10 @@ extern "C" rtError_t rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
         return -777;
     }
     *out = std::malloc(bytes);
-    if (*out != nullptr) live_allocations.emplace(*out, bytes);
+    if (*out != nullptr) {
+        live_allocations.emplace(*out, bytes);
+        std::memset(*out, 0xa5, bytes);
+    }
     return *out ? 0 : -1;
 }
 extern "C" rtError_t rtFree(void *ptr) {
@@ -78,6 +83,11 @@ extern "C" rtError_t rtMemcpy(void *dst, uint64_t, const void *src, uint64_t byt
 extern "C" rtError_t
 rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t stream) {
     const int rc = step("publish", stream);
+    if (rc == 0 && dst == result_target) {
+        assert(bytes == sizeof(uint64_t));
+        result_source = src;
+        return 0;
+    }
     if (rc == 0 && dst == timing_target) {
         timing_source = src;
         timing_bytes = bytes;
@@ -164,7 +174,13 @@ public:
         };
         assert(kernel_execution_state().initialize(0, ops) == 0);
     }
+    using DeviceRunnerBase::ensure_device_run_result_region;
     using DeviceRunnerBase::ensure_device_wall_buffer;
+    bool result_initialized() const { return device_run_result_initialized_[0]; }
+    void release_result() {
+        free_tensor(device_run_result_dev_ptrs_[0]);
+        device_run_result_dev_ptrs_[0] = nullptr;
+    }
     using DeviceRunnerBase::slot_persistent_args;
     bool timing_armed() const { return device_timing_armed_[0]; }
     void consume_timing() { device_timing_armed_[0] = false; }
@@ -318,6 +334,110 @@ static void check_metadata_publication(int fault, bool drain_fails = false) {
     runner.finish();
     assert(release_slot_persistent_args(slot, allocator) == 0);
 }
+static void check_result_prepare_refusal() {
+    next_stream = next_event = 0;
+    ProbeRunner runner;
+    runner.initialize();
+    Runtime runtime;
+    const NativeRunIdentity id{1, 1, 1, 0};
+    DeviceRunnerBase::PreparedExecution prepared(id, runtime, CallConfig{}, 0);
+    const int before = allocation_attempts;
+    assert(runner.ensure_device_run_result_region(0, 0, prepared.kernel_args) != 0);
+    assert(allocation_attempts == before);
+    fail_allocation = allocation_attempts + 1;
+    assert(runner.ensure_device_run_result_region(0, 1, prepared.kernel_args) != 0);
+    assert(prepared.kernel_args.args.run_result_data_base == 0);
+    fail_allocation = 0;
+    for (int retry = 0; retry < 2; ++retry) {
+        prepared.resources_owned = true;
+        assert(runner.ensure_device_run_result_region(0, 1, prepared.kernel_args) == 0);
+        assert(!runner.result_initialized());
+        assert(runner.slot_persistent_args(0).staged_launch_metadata.size() == sizeof(uint64_t));
+        runner.abandon_prepared_execution(prepared);
+        assert(runner.slot_persistent_args(0).staged_launch_metadata.size() == 0);
+    }
+    runner.release_result();
+    runner.finish();
+}
+static void check_result_publication(bool has_caller, int failure_step) {
+    capture = false;
+    next_stream = next_event = submits = syncs = copies = 0;
+    trace.clear();
+    stream_trace.clear();
+    event_trace.clear();
+    fail_at = failure_step == 0 ? 0 : failure_step + (has_caller ? 2 : 0);
+    result_source = nullptr;
+    ProbeRunner runner;
+    runner.initialize();
+    Runtime runtime;
+    runtime.dev = {};
+    const NativeRunIdentity id{1, 1, 1, 0};
+    auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
+    if (has_caller) prepared->caller_stream = caller;
+    auto &slot = runner.slot_persistent_args(0);
+    assert(runner.ensure_device_run_result_region(0, id.run_epoch, prepared->kernel_args) == 0);
+    result_target = reinterpret_cast<void *>(prepared->kernel_args.args.run_result_data_base);
+    assert(result_target != nullptr);
+    assert(!runner.result_initialized() && copies == 0);
+    assert(slot.staged_launch_metadata.size() == sizeof(uint64_t));
+    // Allocator bytes can resemble a fully valid success for the requested epoch.
+    DeviceRunResultRegion forged{};
+    forged.published = id.run_epoch;
+    forged.verdict = static_cast<uint32_t>(DeviceRunVerdict::Ok);
+    assert(device_run_result_terminal(forged, id.run_epoch).state == DeviceRunTerminalState::Succeeded);
+    std::memcpy(result_target, &forged, sizeof(forged));
+    assert(runner.read_device_run_result(0, id.run_epoch) == 0);
+    assert(runner.device_run_result_read_status(0, id.run_epoch) == RunRecordRead::NotAttempted);
+    assert(runner.device_run_terminal(0, id.run_epoch).state == DeviceRunTerminalState::Undecided);
+    assert(copies == 0);
+    assert(prepared->kernel_args.prepare_runtime_args(runtime, runner.allocator(), slot) == 0);
+    auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(id));
+    assert(syncs == 0);
+    if (failure_step != 0) {
+        assert(outcome.rc == -777 && outcome.progress == LaunchProgress::Partial);
+        assert(runner.result_initialized() == (failure_step == 3));
+        for (const auto &op : trace)
+            assert(op != "core" && op != "cpu");
+        if (!runner.result_initialized()) {
+            const int before = copies;
+            assert(runner.read_device_run_result(0, id.run_epoch) == 0);
+            assert(copies == before);
+            assert(runner.device_run_result_read_status(0, id.run_epoch) == RunRecordRead::NotAttempted);
+        }
+    } else {
+        assert(outcome.rc == 0 && outcome.progress == LaunchProgress::Complete);
+        assert(runner.result_initialized());
+        const size_t publication = has_caller ? 2 : 0;
+        assert(trace[publication] == "publish" && trace[publication + 1] == "publish");
+        assert(stream_trace[publication] == outcome.active->prepared->streams.aicpu);
+        assert(stream_trace[publication + 1] == outcome.active->prepared->streams.aicpu);
+    }
+    if (outcome.active != nullptr) outcome.active->prepared->kernel_args.release_run_view();
+    // Complete the accepted DMA after the per-run snapshot has been released.
+    if (result_source != nullptr) {
+        uint64_t before;
+        std::memcpy(&before, result_target, sizeof(before));
+        assert(before == id.run_epoch);
+        std::memcpy(result_target, result_source, sizeof(uint64_t));
+        uint64_t after;
+        std::memcpy(&after, result_target, sizeof(after));
+        assert(after == 0);
+    }
+    if (failure_step == 0) {
+        assert(runner.read_device_run_result(0, id.run_epoch) == 0);
+        assert(runner.device_run_result_read_status(0, id.run_epoch) == RunRecordRead::Ok);
+        assert(runner.device_run_terminal(0, id.run_epoch).state == DeviceRunTerminalState::Undecided);
+        const int before = allocation_attempts;
+        KernelArgsHelper warm;
+        assert(runner.ensure_device_run_result_region(0, 2, warm) == 0);
+        assert(allocation_attempts == before);
+        assert(warm.args.run_result_data_base == reinterpret_cast<uint64_t>(result_target));
+        assert(slot.staged_launch_metadata.size() == 0);
+    }
+    result_target = nullptr;
+    runner.release_result();
+    runner.finish();
+}
 static void check_timing_prepare_refusal() {
     next_stream = next_event = 0;
     ProbeRunner runner;
@@ -460,6 +580,10 @@ static void check_arena_growth(SimplerExecutionMode mode) {
     assert(live_allocations.size() == before);
 }
 int main() {
+    check_result_prepare_refusal();
+    for (bool has_caller : {false, true})
+        for (int failure_step : {0, 1, 2, 3})
+            check_result_publication(has_caller, failure_step);
     check_timing_prepare_refusal();
     check_timing_publication(0);
     check_timing_publication(4);

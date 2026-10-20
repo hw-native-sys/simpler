@@ -1,8 +1,26 @@
 # Run completion fences
 
 How an onboard run's completion is established, who owns the resources that
-establish it, and what a future change that queues two runs at once may rely
-on.
+establish it, and what runs queued on the same streams may rely on.
+
+## Initial publication of the run-result region
+
+Each slot lazily allocates one result region. Preparation snapshots a zero
+`published` marker into the existing launch metadata batch, without copying to
+device. Launch publishes the batch from slot-owned pinned memory on the AICPU
+stream before the entry fork and either kernel. Only a successful publication
+marks the allocation initialized; readback occurs after drain. The pinned source
+stays live through retirement or quarantine, including failed enqueue attempts.
+
+A failed or skipped initial publication leaves the allocation untrusted. Even
+allocator bytes equal to the requested epoch cannot produce a certified read or
+terminal result; the existing drain decision uses its conservative fallback.
+A failure after any async enqueue attempt is Partial and prevents kernel launch.
+Preparation abort discards its unpublished snapshot, and a later attempt stages
+a fresh marker. Once initialized, ordinary slot reuse needs no marker copy:
+per-run epochs distinguish the device's results. This adds eight bytes to an
+uninitialized slot's pinned publication source, with no warm-run transfer or
+latency claim. Cold allocation and other initialization remain outside capture.
 
 ## The question a stream cannot answer
 
@@ -36,7 +54,9 @@ On an execution failure, an owned Program context keeps its bounded device drain
 and reset policy. A borrowed kernel context is poisoned without a device-wide
 drain or reset; the caller owns device recovery. The native eager entry
 `simpler_launch_run_on_stream` binds a borrowed caller stream to an already
-prepared run. Worker-level kernel launch and capture/replay remain unsupported.
+prepared run. Public `Worker.init(borrowed_context_generation=...)` and
+`Worker.submit(..., caller_stream=...)` use this same native path. Capture/replay
+is rejected by the eager entry.
 
 ## Borrowed caller ordering
 
@@ -51,7 +71,7 @@ enqueue result; wait/finalize still report the run's device verdict.
 
 ```text
 caller:  prior work -> record Start ------------------------ wait CpuDone -> record Tail -> later work
-AICPU:                wait Start -> descriptor H2D -> record Fork -> kernel -> wait CoreDone -> record CpuDone
+AICPU:                wait Start -> metadata/descriptor H2D -> record Fork -> kernel -> wait CoreDone -> record CpuDone
 AICore:                                              wait Fork -> kernel -> record CoreDone
 ```
 

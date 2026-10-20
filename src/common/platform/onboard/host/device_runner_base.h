@@ -2107,10 +2107,10 @@ protected:
     /**
      * Point this run's KernelArgs at its slot's result region and stamp the run
      * epoch the device must publish. Allocated lazily per slot and, unlike the
-     * timing buffer, never gated on diagnostics. Returns non-zero when the
-     * region could not be provided, which the caller must treat as a prepare
-     * failure: continuing would launch a run whose device side has nowhere to
-     * put its result, and whose region still holds a predecessor's payload.
+     * timing buffer, never gated on diagnostics. Its first publication stages
+     * an unpublished marker into the slot's launch metadata; warm reuse needs
+     * no clear. Preparation does not write the device block. Returns non-zero
+     * when allocation or staging fails; no kernel may launch without a region.
      */
     int ensure_device_run_result_region(uint32_t pipeline_slot, uint64_t run_epoch, KernelArgsHelper &kernel_args);
 
@@ -3107,11 +3107,11 @@ protected:
     // because the drain's cleanup retires the fence that could otherwise be
     // asked. See host/run_evidence_retention.h.
     RunBoundaryLedger run_boundaries_observed_;
-    // Whether a slot's region has had `published` zeroed since it was
-    // allocated. `allocate_tensor` is an `rtMalloc`, so a fresh region holds
-    // whatever the device left there — which cannot be assumed to differ from
-    // the epoch of the run about to use it. Steady-state reuse needs no clear
-    // because epochs distinguish runs, but the first use of an allocation does.
+    // A successful launch publication enqueues this allocation's first marker
+    // clear before the entry fork. Readback follows drain and refuses an
+    // uninitialized allocation; stale allocator bytes may match any run epoch.
+    // Slot retirement excludes the previous DMA reader before warm reuse, whose
+    // epoch distinguishes it without another clear.
     RunResourceSlots<bool> device_run_result_initialized_;
 
     // True after AICPU SO loaded; reset by the subclass's `finalize_impl()`.
