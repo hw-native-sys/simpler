@@ -147,14 +147,16 @@ inline __aicore__ uint64_t scheduler_gm_query_u32_pair(__gm__ volatile uint32_t 
 #endif
 }
 
+// A store publishes a word other cores take ownership from -- a task's state, a
+// chain link, an error field -- so it is an atomic exchange whose result is
+// discarded, never a device store plus a barrier. A device store leaves the word
+// exposed to a cache-line writeback: any core holding that line can restore its
+// stale copy of the word, and the cores here share lines by design.
 inline __aicore__ void
 scheduler_gm_store(__gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_RELEASE) {
 #if defined(__CCE_AICORE__)
     (void)order;
-    st_dev(
-        static_cast<uint64_t>(desired), reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ int64_t *>(&value)), 0
-    );
-    OUT_OF_ORDER_STORE_BARRIER();
+    (void)atomicExch(const_cast<__gm__ int64_t *>(&value), desired);
 #else
     __atomic_store_n(&value, desired, order);
 #endif
@@ -164,8 +166,7 @@ inline __aicore__ void
 scheduler_gm_store(__gm__ volatile uint64_t &value, uint64_t desired, int order = __ATOMIC_RELEASE) {
 #if defined(__CCE_AICORE__)
     (void)order;
-    st_dev(desired, const_cast<__gm__ uint64_t *>(&value), 0);
-    OUT_OF_ORDER_STORE_BARRIER();
+    (void)atomicExch(const_cast<__gm__ uint64_t *>(&value), desired);
 #else
     __atomic_store_n(&value, desired, order);
 #endif
@@ -175,18 +176,7 @@ inline __aicore__ void
 scheduler_gm_store(__gm__ volatile uint32_t &value, uint32_t desired, int order = __ATOMIC_RELEASE) {
 #if defined(__CCE_AICORE__)
     (void)order;
-    st_dev(desired, const_cast<__gm__ uint32_t *>(&value), 0);
-    OUT_OF_ORDER_STORE_BARRIER();
-#else
-    __atomic_store_n(&value, desired, order);
-#endif
-}
-
-inline __aicore__ void
-scheduler_gm_publish(__gm__ volatile uint64_t &value, uint64_t desired, int order = __ATOMIC_RELEASE) {
-#if defined(__CCE_AICORE__)
-    (void)order;
-    (void)atomicExch(const_cast<__gm__ uint64_t *>(&value), desired);
+    (void)atomicExch(const_cast<__gm__ uint32_t *>(&value), desired);
 #else
     __atomic_store_n(&value, desired, order);
 #endif

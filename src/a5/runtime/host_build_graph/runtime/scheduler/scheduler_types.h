@@ -855,22 +855,29 @@ inline __aicore__ bool scheduler_task_has_predicate(uint8_t flags) {
 }
 
 struct alignas(128) SchedulerTaskControl {
-    // Cross-core state publication and wake-list RMWs share the first line.
+    // Cross-core state publication, the wake-list RMWs, and the chain link share
+    // the first line. Every field here is reached only through the atomic
+    // wrappers, which is what the link needs on two counts: a Ready inbox has
+    // several producers now, so the link transfers ownership of a node and must
+    // be written as an atomic rather than observed-and-published; and nothing
+    // publishes this line as a whole, so no producer's line writeback can
+    // restore its stale copy of a link another producer just wrote.
     volatile int64_t state;
     volatile int64_t wake_list_head;
-    uint8_t atomic_line_padding[48];
+    // Links the task while it belongs to a dependency wake list, to a Ready
+    // inbox, or to the local batch staged for one. A task is in at most one of
+    // them: a resolver detaches a whole wake list before routing its waiters,
+    // and a batch is spliced into an inbox without rewriting its links.
+    volatile int64_t next_waiter;
+    uint8_t atomic_line_padding[40];
 
-    // next_waiter links the task only while it belongs to a dependency wake
-    // list or Ready inbox; its value is unspecified in all other states.
-    int64_t next_waiter;
     int32_t next_fanin_index;
     int32_t waiting_producer;
     uint64_t completion_resolve_start_cycles;
     uint64_t completion_resolve_end_cycles;
-    uint64_t reserved_ready_publish;
     uint64_t scheduler_worker_id;
     uint64_t completion_resolve_loop_iter;
-    uint8_t scheduler_line_padding[8];
+    uint8_t scheduler_line_padding[24];
 };
 
 // A FIFO ready queue, addressed by both endpoints packed into one word.
@@ -1217,7 +1224,13 @@ static_assert(std::is_trivially_copyable_v<SchedulerTaskMetadata> && std::is_sta
 static_assert(alignof(SchedulerTaskMetadata) == 16, "task metadata alignment changed");
 static_assert(sizeof(SchedulerTaskControl) == 128, "task control layout changed");
 static_assert(alignof(SchedulerTaskControl) == 128, "task control alignment changed");
-static_assert(offsetof(SchedulerTaskControl, next_waiter) == 64, "waiter metadata needs its own line");
+// Both chain links share the atomic line. A link has several producers, so it is
+// written as a single device word; keeping it off the line-published half is what
+// stops one producer's writeback from restoring its stale copy of the link.
+static_assert(offsetof(SchedulerTaskControl, next_waiter) < 64, "wake link must sit on the atomic line");
+static_assert(
+    offsetof(SchedulerTaskControl, next_fanin_index) == 64, "line-published waiter metadata needs its own line"
+);
 static_assert(sizeof(SchedulerReadyInbox) == 128, "ready inbox layout changed");
 static_assert(alignof(SchedulerReadyInbox) == 128, "ready inbox alignment changed");
 static_assert(sizeof(SchedulerGraphSummary) == 128, "graph summary layout changed");

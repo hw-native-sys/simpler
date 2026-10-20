@@ -696,7 +696,7 @@ inline __aicore__ void scheduler_record_error(
         scheduler_gm_store(run_control->error_core_type, static_cast<uint64_t>(context->core_type));
     }
     scheduler_gm_store(run_control->error_site, static_cast<uint64_t>(error_site));
-    scheduler_gm_publish(run_control->scheduler_error, static_cast<uint64_t>(status));
+    scheduler_gm_store(run_control->scheduler_error, static_cast<uint64_t>(status));
 }
 
 inline __aicore__ void scheduler_record_error(
@@ -710,15 +710,16 @@ inline __aicore__ void scheduler_record_error(
 inline __aicore__ void scheduler_publish_waiter_metadata(
     __gm__ SchedulerTaskControl *control, int64_t next_waiter, int32_t next_fanin_index, int32_t waiting_producer
 ) {
-    control->next_waiter = next_waiter;
     control->next_fanin_index = next_fanin_index;
     control->waiting_producer = waiting_producer;
-    scheduler_publish_cache_line(&control->next_waiter);
+    scheduler_publish_cache_line(&control->next_fanin_index);
+    // The link lands after the fields it is read alongside, and as a single
+    // atomic word: the waiter becomes reachable only once its link is readable.
+    scheduler_gm_store(control->next_waiter, next_waiter);
 }
 
 inline __aicore__ int64_t scheduler_observe_next_waiter(__gm__ SchedulerTaskControl *control) {
-    scheduler_observe_cache_line(&control->next_waiter);
-    return control->next_waiter;
+    return scheduler_gm_query(control->next_waiter);
 }
 
 inline __aicore__ SchedulerRouteResult scheduler_route_task(
@@ -831,10 +832,10 @@ inline __aicore__ SchedulerRouteResult scheduler_bootstrap_route_task(
             );
             return SchedulerRouteResult::ERROR;
         }
-        control->next_waiter = previous;
         control->next_fanin_index = next_fanin;
         control->waiting_producer = producer;
-        scheduler_writeback_cache_line(&control->next_waiter);
+        scheduler_writeback_cache_line(&control->next_fanin_index);
+        scheduler_gm_store(control->next_waiter, previous);
         if (stats != nullptr) ++stats->wake_register_count;
         return SchedulerRouteResult::WAITING;
     }
@@ -853,16 +854,13 @@ inline __aicore__ bool scheduler_bootstrap_ready_batch_append(
     SchedulerReadyStats *stats, uint64_t profiling_level = 0
 ) {
     if (batch == nullptr || !scheduler_task_ref_valid(*context->config.graph, task_ref)) return false;
-    // next_waiter belongs to exactly one wake or Ready chain while the task is live.
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
-    control->next_waiter = SCHEDULER_INBOX_EMPTY;
-    scheduler_writeback_cache_line(&control->next_waiter);
+    scheduler_gm_store(control->next_waiter, SCHEDULER_INBOX_EMPTY);
     if (batch->head == SCHEDULER_INBOX_EMPTY) {
         batch->head = task_ref;
     } else {
         __gm__ SchedulerTaskControl *tail = scheduler_task_control_at(scheduler_state_base, context, batch->tail);
-        tail->next_waiter = task_ref;
-        scheduler_writeback_cache_line(&tail->next_waiter);
+        scheduler_gm_store(tail->next_waiter, task_ref);
     }
     batch->tail = task_ref;
     if (scheduler_phase_timing_enabled(profiling_level)) {
@@ -889,17 +887,13 @@ inline __aicore__ bool scheduler_ready_batch_append(
     SchedulerReadyStats *stats, uint64_t profiling_level = 0
 ) {
     if (batch == nullptr || !scheduler_task_ref_valid(*context->config.graph, task_ref)) return false;
-    // next_waiter belongs to exactly one wake or Ready chain while the task is live.
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
-    control->next_waiter = SCHEDULER_INBOX_EMPTY;
-    scheduler_publish_cache_line(&control->next_waiter);
+    scheduler_gm_store(control->next_waiter, SCHEDULER_INBOX_EMPTY);
     if (batch->head == SCHEDULER_INBOX_EMPTY) {
         batch->head = task_ref;
     } else {
         __gm__ SchedulerTaskControl *tail = scheduler_task_control_at(scheduler_state_base, context, batch->tail);
-        scheduler_observe_cache_line(&tail->next_waiter);
-        tail->next_waiter = task_ref;
-        scheduler_publish_cache_line(&tail->next_waiter);
+        scheduler_gm_store(tail->next_waiter, task_ref);
     }
     batch->tail = task_ref;
     if (scheduler_phase_timing_enabled(profiling_level)) {
@@ -1062,9 +1056,7 @@ inline __aicore__ bool scheduler_ready_batch_push(
         }
         if (!was_empty) {
             __gm__ SchedulerTaskControl *old_tail = scheduler_task_control_at(scheduler_state_base, context, tail);
-            scheduler_observe_cache_line(&old_tail->next_waiter);
-            old_tail->next_waiter = batch->head;
-            scheduler_publish_cache_line(&old_tail->next_waiter);
+            scheduler_gm_store(old_tail->next_waiter, batch->head);
         }
         scheduler_cache_barrier();
         scheduler_ready_directory_set(
@@ -1574,7 +1566,7 @@ inline __aicore__ bool scheduler_resolve_completion(
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
     uint64_t resolve_start = phase_timing_enabled ? scheduler_cycles() : 0;
     if (phase_timing_enabled) {
-        scheduler_observe_cache_line(&control->next_waiter);
+        scheduler_observe_cache_line(&control->next_fanin_index);
         control->completion_resolve_start_cycles = resolve_start;
         control->scheduler_worker_id = context->worker_id();
         control->completion_resolve_loop_iter = context->profiling->loop_iter;
@@ -1695,7 +1687,7 @@ inline __aicore__ bool scheduler_resolve_completion(
     }
     if (phase_timing_enabled) {
         control->completion_resolve_end_cycles = scheduler_cycles();
-        scheduler_publish_cache_line(&control->next_waiter);
+        scheduler_publish_cache_line(&control->next_fanin_index);
     }
     if (completion_stats != nullptr) ++completion_stats->resolve_count;
     return true;

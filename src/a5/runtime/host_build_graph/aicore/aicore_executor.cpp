@@ -140,11 +140,11 @@ publish_worker_stats(__gm__ SchedulerWorkerContext *context, const SchedulerWork
     scheduler_publish_cache_line(&context->completion_enqueue_cycles);
     scheduler_publish_cache_line(&context->bootstrap_slot_fill_aic_cycles);
 
-    scheduler_gm_publish(context->bootstrap_scan_end_cycles, stats.bootstrap_scan_end_cycles);
-    scheduler_gm_publish(context->target_bootstrap_start_cycles, stats.target_bootstrap_start_cycles);
-    scheduler_gm_publish(context->target_bootstrap_end_cycles, stats.target_bootstrap_end_cycles);
-    scheduler_gm_publish(context->bootstrap_target_aic_cycles, stats.bootstrap_target_cycles[0]);
-    scheduler_gm_publish(context->bootstrap_target_aiv_cycles, stats.bootstrap_target_cycles[1]);
+    scheduler_gm_store(context->bootstrap_scan_end_cycles, stats.bootstrap_scan_end_cycles);
+    scheduler_gm_store(context->target_bootstrap_start_cycles, stats.target_bootstrap_start_cycles);
+    scheduler_gm_store(context->target_bootstrap_end_cycles, stats.target_bootstrap_end_cycles);
+    scheduler_gm_store(context->bootstrap_target_aic_cycles, stats.bootstrap_target_cycles[0]);
+    scheduler_gm_store(context->bootstrap_target_aiv_cycles, stats.bootstrap_target_cycles[1]);
 }
 
 // Keep the pre-kernel timestamps out of the indirect kernel call's live set.
@@ -225,7 +225,7 @@ __aicore__ bool bootstrap_ready_graph(
 
     uint64_t arrived = scheduler_gm_fetch_add(run_control->bootstrap_scan_arrived_count, UINT64_C(1)) + 1;
     if (arrived == scheduler_count) {
-        scheduler_gm_publish(run_control->bootstrap_scan_complete, UINT64_C(1));
+        scheduler_gm_store(run_control->bootstrap_scan_complete, UINT64_C(1));
     } else {
         uint32_t barrier_backoff = kInitialBackoffIterations;
         const uint64_t barrier_start = scheduler_cycles();
@@ -292,7 +292,7 @@ __aicore__ bool bootstrap_ready_graph(
     // This completion publication is observed by AICPU before it emits the
     // one and only DMB release. Schedulers do not wait on another barrier.
     arrived = scheduler_gm_fetch_add(run_control->bootstrap_arrived_count, UINT64_C(1)) + 1;
-    if (arrived == scheduler_count) scheduler_gm_publish(run_control->bootstrap_complete, UINT64_C(1));
+    if (arrived == scheduler_count) scheduler_gm_store(run_control->bootstrap_complete, UINT64_C(1));
     return true;
 }
 
