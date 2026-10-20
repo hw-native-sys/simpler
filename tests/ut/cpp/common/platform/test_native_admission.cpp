@@ -87,6 +87,44 @@ TEST_F(NativeAdmissionTest, RegistrationRefusesWhileANativeRunIsOutstanding) {
     runner.release_native_run_reservation(&owner);
 }
 
+TEST_F(NativeAdmissionTest, AutomaticRegistrationDoesNotRetryFailedProgramInitialization) {
+    class FreshRunner : public Runner {
+    public:
+        FreshRunner() {
+            device_id_ = -1;
+            callables_.clear();
+            chip_callable_buffers_.clear();
+        }
+    } runner;
+    const uint8_t binary[] = {0x01};
+    control().fail_stream_create = 1;
+    ASSERT_EQ(
+        simpler_init(&runner, 0, binary, sizeof(binary), binary, sizeof(binary), nullptr, 0, nullptr, 0, nullptr, 0),
+        -4242
+    );
+    ASSERT_EQ(control().stream_create_calls, 1u);
+    ASSERT_EQ(runner.device_id(), 0);
+    ASSERT_EQ(runner.execution_mode_latch().latched_mode(), SIMPLER_MODE_PROGRAM);
+    ASSERT_EQ(runner.teardown_proof(), TeardownProof::Unresolved);
+
+    const auto image = make_chip_callable(nullptr, 0, "orch", binary, sizeof(binary), nullptr, nullptr, 0, "");
+    const auto allocations = control().allocations;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        int32_t id = 99;
+        EXPECT_EQ(
+            simpler_register_callable_v2(&runner, image.data(), image.size(), &id), PTO_RUNTIME_ERR_INVALID_STATE
+        );
+        EXPECT_EQ(id, -1);
+        EXPECT_EQ(control().stream_create_calls, 1u);
+        EXPECT_EQ(control().allocations, allocations);
+        EXPECT_FALSE(runner.has_callable(0));
+    }
+    EXPECT_EQ(finalize_device(&runner), 0);
+    int32_t id = 99;
+    EXPECT_EQ(simpler_register_callable_v2(&runner, image.data(), image.size(), &id), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(id, -1);
+}
+
 TEST_F(NativeAdmissionTest, EarlyPrepareFailureDoesNotBlockTheNormalRunComposition) {
     EXPECT_EQ(simpler_prepare_run(nullptr, nullptr, 0, nullptr, nullptr, nullptr), PTO_RUNTIME_ERR_INTERNAL);
     Runner runner;

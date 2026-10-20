@@ -934,10 +934,10 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
 /**
  * Register on an initialized PROGRAM or KERNEL context with an unused ID.
  * KERNEL contexts use the kernel preparation path internally. The entry does
- * not initialize the context; an uninitialized or unlatched context returns
- * INVALID_STATE. `callable` points to a canonical ChipCallable image of
- * exactly `callable_size` bytes, fully validated before it is hashed or
- * uploaded.
+ * not initialize the context; an uninitialized, failed-init or finalized
+ * context returns INVALID_STATE. `callable` points to a canonical ChipCallable
+ * image of exactly `callable_size` bytes, fully validated before it is hashed
+ * or uploaded.
  *
  * The registry is shared with explicit-ID registration, so both draw from the
  * same MAX_REGISTERED_CALLABLE_IDS (64) slots. Each successful call owns a

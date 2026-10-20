@@ -604,6 +604,50 @@ def test_auto_registration_rejects_uninitialized_context(arch, runtime):
         lib.destroy_device_context(ctx)
 
 
+@pytest.mark.parametrize("arch", _ARCHES)
+def test_auto_registration_rejects_failed_program_init(arch):
+    runtime = "tensormap_and_ringbuffer"
+    lib = _load(arch, "sim", runtime)
+    image = _minimal_callable_image()
+    ctx = lib.create_device_context()
+    assert ctx
+    try:
+        # TMR rejects a non-power-of-two task window after device attachment.
+        config = CallConfig()
+        config.runtime_env[0] = 3
+        assert lib.simpler_init(ctx, 0, None, 0, None, 0, None, 0, ctypes.byref(config), 0, None, 0) != 0
+        committed = lib.committed_device_memory_ctx(ctx)
+        for _ in range(2):
+            out = ctypes.c_int32(99)
+            assert (
+                lib.simpler_register_callable_v2(ctx, image, len(image), ctypes.byref(out))
+                == PTO_RUNTIME_ERR_INVALID_STATE
+            )
+            assert out.value == -1
+            assert lib.committed_device_memory_ctx(ctx) == committed
+        assert lib.finalize_device(ctx) == 0
+        base = _PROJECT_ROOT / "build" / "lib" / arch / "sim" / runtime
+        aicpu = (base / "libaicpu_kernel.so").read_bytes()
+        aicore = (base / "libaicore_kernel.so").read_bytes()
+        init_args = (ctx, 0, aicpu, len(aicpu), aicore, len(aicore), None, 0, None, 0, None, 0)
+        image = _prepared_callable_image(arch + "sim", runtime)
+        for _ in range(2):
+            assert lib.simpler_init(*init_args) == 0
+            out = ctypes.c_int32(99)
+            assert lib.simpler_register_callable_v2(ctx, image, len(image), ctypes.byref(out)) == 0
+            assert out.value == 0
+            assert lib.finalize_device(ctx) == 0
+            out.value = 99
+            assert (
+                lib.simpler_register_callable_v2(ctx, image, len(image), ctypes.byref(out))
+                == PTO_RUNTIME_ERR_INVALID_STATE
+            )
+            assert out.value == -1
+    finally:
+        assert lib.finalize_device(ctx) == 0
+        lib.destroy_device_context(ctx)
+
+
 def _run_program_auto_register(arch, runtime):
     from _task_interface import _ChipWorker  # noqa: PLC0415
     from simpler.task_interface import ChipCallable  # noqa: PLC0415

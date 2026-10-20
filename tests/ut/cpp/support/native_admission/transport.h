@@ -21,6 +21,8 @@ struct Control {
     size_t fail_allocation{0};
     int attach_rc{0};
     int copy_rc{0};
+    size_t stream_create_calls{0};
+    size_t fail_stream_create{0};
 };
 Control &control();
 }  // namespace native_admission_transport

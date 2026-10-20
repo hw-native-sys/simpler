@@ -753,6 +753,7 @@ int finalize_device(DeviceContextHandle ctx) {
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    runner->set_program_initialized(false);
     ContextTeardownSteps steps;
     steps.ctx = runner;
     steps.runs_outstanding = [](void *c) {
@@ -809,6 +810,7 @@ int simpler_init(
         );
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
+    runner->set_program_initialized(false);
 
     // Admitted, so the proof is already spent: every step from here on is a
     // post-consume one, and each exit records that this context is no longer
@@ -924,6 +926,7 @@ int simpler_init(
             return rc;
         }
     }
+    runner->set_program_initialized(true);
     return 0;
 }
 
@@ -1102,7 +1105,7 @@ static int register_callable_auto_id(
             LOG_ERROR("%s: native run must be finalized before mutating the callable registry", entry);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        if (!kernel && (!runner->execution_mode_latch().is_latched() || runner->device_id() < 0)) {
+        if (!kernel && !runner->program_initialized()) {
             LOG_ERROR("%s: callable registration requires an initialized PROGRAM context", entry);
             return PTO_RUNTIME_ERR_INVALID_STATE;
         }

@@ -62,6 +62,8 @@ int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMe
 int rtSetDevice(int32_t) { return native_admission_transport::control().attach_rc; }
 int rtDeviceReset(int32_t) { return 0; }
 int rtStreamCreate(rtStream_t *out, int32_t) {
+    auto &c = native_admission_transport::control();
+    if (++c.stream_create_calls == c.fail_stream_create) return -4242;
     *out = std::malloc(1);
     return *out ? 0 : -12;
 }

@@ -641,6 +641,7 @@ int finalize_device(DeviceContextHandle ctx) {
             LOG_ERROR("finalize_device: native run must be finalized first");
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        runner->set_program_initialized(false);
         // An unclaimed runner owns no simulated binding. The caller thread
         // may still be bound to another worker's live device.
         if (runner->device_id() < 0) return 0;
@@ -689,6 +690,7 @@ int simpler_init(
         return latch_rc;
     }
 
+    runner->set_program_initialized(false);
     runner->set_dma_workspace_request(enable_sdma != 0);
 
     int rc;
@@ -741,6 +743,7 @@ int simpler_init(
         }
         if (rc != 0) return rc;
     }
+    runner->set_program_initialized(true);
     return 0;
 }
 
@@ -835,7 +838,7 @@ int simpler_register_callable_v2(
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
-        if (!runner->execution_mode_latch().is_latched() || runner->device_id() < 0) {
+        if (!runner->program_initialized()) {
             LOG_ERROR("simpler_register_callable_v2: callable registration requires an initialized PROGRAM context");
             return PTO_RUNTIME_ERR_INVALID_STATE;
         }
