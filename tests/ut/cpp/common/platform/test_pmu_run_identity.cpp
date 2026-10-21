@@ -185,7 +185,7 @@ protected:
     void run_once_without_begin_run(uint64_t epoch, int records) {
         set_platform_run_result(/*region_base=*/0, epoch);
         const uint32_t core_ids[] = {0};
-        pmu_aicpu_init(core_ids, /*num_cores=*/1);
+        pmu_aicpu_init(core_ids, /*num_cores=*/1, PmuEventType::PIPE_UTILIZATION);
         if (records > 0) fill_records(state_->current_buf_ptr, records);
         const int cores[] = {kCore};
         pmu_aicpu_flush_buffers(kThread, cores, /*core_num=*/1);
@@ -353,7 +353,7 @@ TEST_F(PmuRunIdentityTest, AFailedFlushChargesDroppedOnceAndKeepsTheBuffer) {
     collector_.begin_run(csv_.string(), PmuEventType::PIPE_UTILIZATION);
     set_platform_run_result(/*region_base=*/0, /*run_epoch=*/41);
     const uint32_t core_ids[] = {0};
-    pmu_aicpu_init(core_ids, /*num_cores=*/1);
+    pmu_aicpu_init(core_ids, /*num_cores=*/1, PmuEventType::PIPE_UTILIZATION);
 
     const uint64_t held = state_->current_buf_ptr;
     ASSERT_NE(held, 0u);
@@ -376,7 +376,7 @@ TEST_F(PmuRunIdentityTest, AFailedFlushChargesDroppedOnceAndKeepsTheBuffer) {
     // Reusable in place: the next run takes it and re-stamps it.
     collector_.begin_run(csv_.string(), PmuEventType::PIPE_UTILIZATION);
     set_platform_run_result(/*region_base=*/0, /*run_epoch=*/42);
-    pmu_aicpu_init(core_ids, /*num_cores=*/1);
+    pmu_aicpu_init(core_ids, /*num_cores=*/1, PmuEventType::PIPE_UTILIZATION);
     EXPECT_EQ(state_->current_buf_ptr, held) << "init drew a replacement instead of reusing the retained buffer";
     const auto *reused = reinterpret_cast<const PmuBuffer *>(held);
     EXPECT_EQ(reused->count, 0u);
@@ -398,7 +398,7 @@ TEST_F(PmuRunIdentityTest, APublishedBufferIsNotAlsoRetainedByTheDevice) {
     collector_.begin_run(csv_.string(), PmuEventType::PIPE_UTILIZATION);
     set_platform_run_result(/*region_base=*/0, /*run_epoch=*/52);
     const uint32_t core_ids[] = {0};
-    pmu_aicpu_init(core_ids, /*num_cores=*/1);
+    pmu_aicpu_init(core_ids, /*num_cores=*/1, PmuEventType::PIPE_UTILIZATION);
     const uint64_t acquired = state_->current_buf_ptr;
     EXPECT_NE(acquired, 0u) << "init drew nothing after the previous run released its buffer";
     EXPECT_NE(acquired, published) << "the pool handed out a buffer the host had not returned";

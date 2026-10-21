@@ -224,7 +224,7 @@ struct RetainedPmuFixture {
         std::vector<uint32_t> core_ids;
         for (int c = 0; c < num_cores; c++)
             core_ids.push_back(static_cast<uint32_t>(c));
-        pmu_aicpu_init(core_ids.data(), num_cores);
+        pmu_aicpu_init(core_ids.data(), num_cores, PmuEventType::PIPE_UTILIZATION);
         if (records > 0) fill_records(state(core)->current_buf_ptr, records, core);
         const int cores[] = {core};
         pmu_aicpu_flush_buffers(thread, cores, /*core_num=*/1);
@@ -491,7 +491,7 @@ TEST(PmuRetainedRuns, ALateBufferForASealedRunIsABoundedCollectorError) {
     ASSERT_TRUE(fx.begin(902, b));
     set_platform_run_result(/*region_base=*/0, 902);
     const uint32_t core_ids[] = {0};
-    pmu_aicpu_init(core_ids, /*num_cores=*/1);
+    pmu_aicpu_init(core_ids, /*num_cores=*/1, PmuEventType::PIPE_UTILIZATION);
     auto *buf = reinterpret_cast<PmuBuffer *>(fx.state(0)->current_buf_ptr);
     ASSERT_NE(buf, nullptr);
     buf->records[0].task_id = simpler::ut::test_task_id(0x1);
@@ -640,7 +640,7 @@ TEST(PmuRetainedRuns, RetentionOffKeepsTheSingleRunPath) {
     set_platform_pmu_reg_addrs(0);
     set_platform_run_result(/*region_base=*/0, 1201);
     const uint32_t core_ids[] = {0};
-    pmu_aicpu_init(core_ids, /*num_cores=*/1);
+    pmu_aicpu_init(core_ids, /*num_cores=*/1, PmuEventType::PIPE_UTILIZATION);
     auto *state = get_pmu_buffer_state(shm, 0);
     auto *buf = reinterpret_cast<PmuBuffer *>(state->current_buf_ptr);
     ASSERT_NE(buf, nullptr);

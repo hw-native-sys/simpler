@@ -112,7 +112,7 @@ protected:
         set_pmu_enabled(true);
         set_platform_pmu_base(reinterpret_cast<uint64_t>(collector_.get_pmu_shm_device_ptr()));
         set_platform_pmu_reg_addrs(reinterpret_cast<uint64_t>(bases_));
-        pmu_aicpu_init(physical_, 2);
+        pmu_aicpu_init(physical_, 2, PmuEventType::PIPE_UTILIZATION);
         for (uint64_t base : bases_) {
             for (RegId reg : controls())
                 register_value(base, reg) = close_value(base, reg);
@@ -175,7 +175,7 @@ TEST_F(PmuFinalizeTest, AllCoreFinalizationHasOneFixedWriteSequencePerCore) {
 
 TEST_F(PmuFinalizeTest, EmptyInvalidAndUnboundCoresDoNotTouchMmio) {
     bases_[physical_[1]] = 0;
-    pmu_aicpu_init(physical_, 2);
+    pmu_aicpu_init(physical_, 2, PmuEventType::PIPE_UTILIZATION);
     clear_trace();
     const int invalid_or_unbound[] = {-1, PLATFORM_MAX_CORES, 1};
     pmu_aicpu_finalize(nullptr, 0);

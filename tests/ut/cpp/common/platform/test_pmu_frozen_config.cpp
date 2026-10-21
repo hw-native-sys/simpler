@@ -13,8 +13,8 @@
  * Two production boundaries the retained-run cases next door do not reach.
  *
  * 1. A run's event type and column set are frozen at its admission, so a
- *    successor's admission — which rewrites the collector's own event type, CSV
- *    header and the device header — cannot reach a predecessor's rows. The
+ *    successor's admission — which rewrites the collector's own event type and
+ *    CSV header — cannot reach a predecessor's rows. The
  *    predecessor's whole publication is deliberately still pending when that
  *    happens: it has not been closed, so nothing of it has been sealed, merged
  *    or named. No sleeping is involved, so the overlap is a fact of the
@@ -169,10 +169,10 @@ std::vector<std::string> csv_column(const std::string &content, const std::strin
  * publish it. The `run_epoch` stamp is production — `pmu_aicpu_init` writes it
  * and nothing here touches it.
  */
-void produce_one_run(void *shm, uint64_t epoch, int records) {
+void produce_one_run(void *shm, uint64_t epoch, int records, PmuEventType event_type) {
     set_platform_run_result(/*region_base=*/0, epoch);
     const uint32_t core_ids[] = {0};
-    pmu_aicpu_init(core_ids, /*num_cores=*/1);
+    pmu_aicpu_init(core_ids, /*num_cores=*/1, event_type);
     PmuBufferState *state = get_pmu_buffer_state(shm, 0);
     ASSERT_NE(state->current_buf_ptr, 0u);
     auto *buf = reinterpret_cast<PmuBuffer *>(state->current_buf_ptr);
@@ -192,10 +192,9 @@ void produce_one_run(void *shm, uint64_t epoch, int records) {
  * A run's configuration is frozen at its admission.
  *
  * Run A is admitted with one event type, produces its rows and closes at its
- * own boundary — which is where production closes it, because the successor's
- * admission zeroes the per-core counters its snapshot reads. Run B is then
+ * own boundary — which is where production snapshots its producer accounting. Run B is then
  * admitted with a *different* event type, which rewrites the collector's live
- * event type, its CSV header and the device header. A's rows are still to be
+ * event type and its CSV header. A's rows are still to be
  * merged and named from its own frozen copy, and the buffers carrying them are
  * consumed by a collector thread that runs against whatever configuration is
  * live at the time.
@@ -209,7 +208,7 @@ void produce_one_run(void *shm, uint64_t epoch, int records) {
  * written by the collector shard, not by the writer — are the part that
  * overlaps by construction.
  */
-TEST(PmuFrozenConfig, APendingRunKeepsItsColumnsWhileASuccessorResetsThem) {
+TEST(PmuFrozenConfig, APendingRunKeepsItsColumnsAcrossASuccessorsAdmission) {
     OutputRoot root("frozen-columns");
     PmuCollector collector;
     collector.configure_retained_runs(true);
@@ -227,13 +226,17 @@ TEST(PmuFrozenConfig, APendingRunKeepsItsColumnsWhileASuccessorResetsThem) {
     // A, under PIPE_UTILIZATION: produced and closed while it owns the device,
     // so its counters are its own.
     ASSERT_TRUE(collector.run_begin(2101, a.string(), PmuEventType::PIPE_UTILIZATION));
-    produce_one_run(shm, 2101, /*records=*/2);
+    produce_one_run(shm, 2101, /*records=*/2, PmuEventType::PIPE_UTILIZATION);
     collector.run_close(2101, /*device_execution_complete=*/true);
 
-    // B's admission is what rewrites the collector's own event type, its header
-    // and the device header — while A's file is still to be written.
+    // B's admission rewrites the collector's own event type and its CSV header
+    // while A's file is still to be written.
+    const auto device_event = get_pmu_header(shm)->event_type;
+    const auto device_total = get_pmu_buffer_state(shm, 0)->total_record_count;
     ASSERT_TRUE(collector.run_begin(2102, b.string(), PmuEventType::MEMORY));
-    produce_one_run(shm, 2102, /*records=*/1);
+    EXPECT_EQ(get_pmu_header(shm)->event_type, device_event);
+    EXPECT_EQ(get_pmu_buffer_state(shm, 0)->total_record_count, device_total);
+    produce_one_run(shm, 2102, /*records=*/1, PmuEventType::MEMORY);
     collector.run_close(2102, /*device_execution_complete=*/true);
 
     std::string error;
@@ -303,7 +306,7 @@ TEST(PmuFrozenConfig, TheDefaultPathBeginsItsRunBeforeItsThreadsStart) {
     set_pmu_enabled(true);
     set_platform_pmu_base(reinterpret_cast<uint64_t>(shm));
     set_platform_pmu_reg_addrs(0);
-    produce_one_run(shm, 2201, /*records=*/2);
+    produce_one_run(shm, 2201, /*records=*/2, PmuEventType::MEMORY);
 
     // The boundary the runner uses on this path: drain, then reconcile, which
     // is what merges the shards into the final CSV.
@@ -346,12 +349,12 @@ TEST(PmuFrozenConfig, TheDefaultPathBeginsItsRunBeforeItsThreadsStart) {
  *   admission still succeeds.
  * - A's record is delivered through the real routing path **on this thread**,
  *   after `run_begin(B)` has already rewritten the collector's live event type,
- *   its CSV header and the device header.
+ *   its CSV header.
  *
  * A's close still precedes B's admission, so A's counters are its own. What is
  * left non-deterministic is nothing this case asserts.
  */
-TEST(PmuFrozenConfig, ARowWrittenAfterASuccessorsResetKeepsItsOwnRunsColumns) {
+TEST(PmuFrozenConfig, ALateRowKeepsItsOwnRunsColumnsAfterASuccessorsAdmission) {
     OutputRoot root("frozen-witness");
     PmuCollector collector;
     collector.configure_retained_runs(true);
@@ -378,7 +381,7 @@ TEST(PmuFrozenConfig, ARowWrittenAfterASuccessorsResetKeepsItsOwnRunsColumns) {
     wmb();
     collector.run_close(3101, /*device_execution_complete=*/true);
 
-    // B's admission rewrites every live copy of the configuration.
+    // B's admission changes the collector's host configuration.
     ASSERT_TRUE(collector.run_begin(3102, b.string(), PmuEventType::MEMORY));
 
     // The window this case is about: A is still open, so the row below is
@@ -400,7 +403,7 @@ TEST(PmuFrozenConfig, ARowWrittenAfterASuccessorsResetKeepsItsOwnRunsColumns) {
         << "the late row was not attributed to run A";
 
     // B's own record, through the real producer and the real drain.
-    produce_one_run(shm, 3102, /*records=*/1);
+    produce_one_run(shm, 3102, /*records=*/1, PmuEventType::MEMORY);
     collector.run_close(3102, /*device_execution_complete=*/true);
 
     collector.hold_retained_writer_for_test(false);
@@ -412,7 +415,7 @@ TEST(PmuFrozenConfig, ARowWrittenAfterASuccessorsResetKeepsItsOwnRunsColumns) {
     ASSERT_FALSE(content_a.empty()) << "run A published nothing";
     ASSERT_FALSE(content_b.empty()) << "run B published nothing";
     EXPECT_NE(header_line(content_a), header_line(content_b))
-        << "a successor's event type reached a row written after its reset:\n"
+        << "a successor's event type reached a row written after its admission:\n"
         << header_line(content_a);
 
     const std::vector<std::string> type_a = csv_column(content_a, "event_type");
@@ -432,6 +435,24 @@ TEST(PmuFrozenConfig, ARowWrittenAfterASuccessorsResetKeepsItsOwnRunsColumns) {
     set_platform_run_result(0, 0);
     collector.finish_retained_runs();
     collector.stop();
+    collector.finalize(nullptr, frozen_free);
+}
+
+TEST(PmuFrozenConfig, HostAdmissionPreservesDeviceConfigurationAndProducerCounters) {
+    OutputRoot root("host-admission");
+    PmuCollector collector;
+    ASSERT_EQ(collector.init(1, 1, frozen_alloc, nullptr, frozen_free, /*device_id=*/0), 0);
+    void *shm = collector.get_pmu_shm_device_ptr();
+    ASSERT_NE(shm, nullptr);
+    const auto initial_event = get_pmu_header(shm)->event_type;
+    auto *state = get_pmu_buffer_state(shm, 0);
+    state->total_record_count = 37;
+    state->dropped_record_count = 11;
+
+    collector.begin_run(root.csv("memory").string(), PmuEventType::MEMORY);
+    EXPECT_EQ(get_pmu_header(shm)->event_type, initial_event);
+    EXPECT_EQ(state->total_record_count, 37U);
+    EXPECT_EQ(state->dropped_record_count, 11U);
     collector.finalize(nullptr, frozen_free);
 }
 

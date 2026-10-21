@@ -154,9 +154,9 @@ protected:
     // The run's device-side register sequence, with no records in between:
     // what each core's window holds while the run is open, and what it holds
     // once the run's own teardown has closed it, is all this case reads.
-    void open_run(uint64_t epoch, int num_cores = kCores) {
+    void open_run(uint64_t epoch, int num_cores = kCores, PmuEventType event_type = PmuEventType::PIPE_UTILIZATION) {
         set_platform_run_result(/*region_base=*/0, epoch);
-        pmu_aicpu_init(kPhysical, num_cores);
+        pmu_aicpu_init(kPhysical, num_cores, event_type);
     }
 
     void close_run(int num_cores = kCores) {
@@ -166,11 +166,11 @@ protected:
         pmu_aicpu_finalize(cores, num_cores);
     }
 
-    const PmuEventConfig &events() const {
+    const PmuEventConfig &events(PmuEventType event_type = PmuEventType::PIPE_UTILIZATION) const {
 #if defined(SIMPLER_TEST_PMU_ARCH_A5)
-        return *pmu_resolve_event_config_a5(PmuEventType::PIPE_UTILIZATION);
+        return *pmu_resolve_event_config_a5(event_type);
 #else
-        return *pmu_resolve_event_config_a2a3(PmuEventType::PIPE_UTILIZATION);
+        return *pmu_resolve_event_config_a2a3(event_type);
 #endif
     }
 
@@ -186,6 +186,49 @@ protected:
 };
 
 int PmuCountingWindowTest::instance_ = 0;
+
+TEST_F(PmuCountingWindowTest, DeviceEntryResetsAccountingWithoutATerminalBank) {
+    for (int core = 0; core < kCores; ++core) {
+        auto *state = get_pmu_buffer_state(shm_, core);
+        state->total_record_count = 37;
+        state->dropped_record_count = 11;
+#if defined(SIMPLER_TEST_PMU_ARCH_A5)
+        state->mismatch_record_count = 13;
+#endif
+        state->published_record_count = 23;
+        state->published_buffer_count = 2;
+    }
+    open_run(99);
+    for (int core = 0; core < kCores; ++core) {
+        auto *state = get_pmu_buffer_state(shm_, core);
+        EXPECT_EQ(state->total_record_count, 0U);
+        EXPECT_EQ(state->dropped_record_count, 0U);
+#if defined(SIMPLER_TEST_PMU_ARCH_A5)
+        EXPECT_EQ(state->mismatch_record_count, 0U);
+#endif
+        EXPECT_EQ(state->published_record_count, 0U);
+        EXPECT_EQ(state->published_buffer_count, 0U);
+    }
+    close_run();
+}
+
+TEST_F(PmuCountingWindowTest, InvocationSelectionProgramsEventsDespiteAConflictingHeader) {
+    get_pmu_header(shm_)->event_type = static_cast<uint32_t>(PmuEventType::PIPE_UTILIZATION);
+    for (PmuEventType selected : {PmuEventType::MEMORY, PmuEventType::RESOURCE_CONFLICT}) {
+        collector_.begin_run(csv_.string(), selected);
+        open_run(/*epoch=*/101, kCores, selected);
+        bool differs_from_header = false;
+        for (int i = 0; i < kPmuCounterCount; ++i) {
+            differs_from_header = differs_from_header || events(selected).event_ids[i] != events().event_ids[i];
+            for (int core = 0; core < kCores; ++core) {
+                EXPECT_EQ(word(core, reg_index(RegId::PMU_CNT0_IDX, i)), events(selected).event_ids[i]);
+            }
+        }
+        EXPECT_TRUE(differs_from_header);
+        EXPECT_EQ(get_pmu_header(shm_)->event_type, static_cast<uint32_t>(PmuEventType::PIPE_UTILIZATION));
+        close_run();
+    }
+}
 
 // The window a core's counters are programmed in is the one its physical id
 // names. A resolution that used the logical index would program the other

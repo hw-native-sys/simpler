@@ -367,7 +367,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
                 init_done_.store(true, std::memory_order_release);
                 return -1;
             }
-            sched_ctx_.post_handshake_profiling_init();
+            sched_ctx_.post_handshake_profiling_init(runtime);
             init_done_.store(true, std::memory_order_release);
         } else {
             while (!init_done_.load(std::memory_order_acquire)) {

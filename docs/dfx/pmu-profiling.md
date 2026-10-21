@@ -36,6 +36,14 @@ python tests/st/<case>/test_<name>.py -p a2a3 -d 0 --enable-pmu
 
 ## 3. How to Use
 
+Each invocation publishes its PMU event group in the Runtime descriptor using
+the existing stream-ordered descriptor upload. AICPU programs the selected
+events and resets that run's record counters before its producers start, for
+both retained and single-run collection. Host admission updates export state
+without writing the shared device header or counters. Buffer ownership and
+queue cursors persist across runs; per-run terminal banks and driver leases
+retain their existing completion requirements.
+
 ### 3.1 Enable PMU
 
 Bare flag selects the default `PIPE_UTILIZATION` event group:
@@ -292,7 +300,7 @@ publishes for the run. Its target struct is `PmuDataHeader` on both
 architectures; in both cases it carries:
 
 - `num_cores` — number of AICore instances in use
-- `event_type` — `PmuEventType` value the host wrote at init time
+- `event_type` — initial pool metadata; each invocation selects its event group through its Runtime descriptor
 
 AICPU reads it on init to find per-core state. On every task FIN it
 commits a `PmuRecord` and increments `PmuBufferState::total_record_count`.

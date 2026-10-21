@@ -300,7 +300,8 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
 
     // Leader-only, after the topology, because `pmu_aicpu_init` needs every
     // core's physical id.
-    if (is_pmu_enabled()) pmu_aicpu_init(physical_core_ids_, core_count_);
+    if (is_pmu_enabled())
+        pmu_aicpu_init(physical_core_ids_, core_count_, static_cast<PmuEventType>(runtime->dev.pmu_event_type));
     cache_flush_range(contexts, static_cast<size_t>(core_count_) * sizeof(*contexts));
     cache_flush_range(run_control, sizeof(*run_control));
     cache_flush_range(lifecycle_traces, static_cast<size_t>(aicpu_thread_num_) * sizeof(*lifecycle_traces));

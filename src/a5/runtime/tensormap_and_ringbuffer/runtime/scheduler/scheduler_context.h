@@ -83,7 +83,7 @@ public:
     void abort_and_shutdown(Runtime *runtime);
     // Leader-only profiling-subsystem init (DFX builds); called behind a barrier
     // in the barrier-free path since pmu_aicpu_init needs all physical_core_ids_.
-    void post_handshake_profiling_init();
+    void post_handshake_profiling_init(Runtime *runtime);
     bool handshake_failed() const { return handshake_failed_.load(std::memory_order_acquire); }
     // Leader-only, after the handshake barrier: build worker-id lists, assign
     // cores, init profiling subsystems, read task counts, init payloads.

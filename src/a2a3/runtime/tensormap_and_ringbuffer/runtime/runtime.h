@@ -234,6 +234,7 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
 
     // Per-invocation granularity travels in every descriptor publication.
     uint32_t chip_swimlane_level;
+    uint32_t pmu_event_type;  // PmuEventType; zero while PMU is disabled.
 
     // Entry args, adopted on the host. Last of the uploaded fields, because it
     // is the only one whose useful length is a property of the run: a

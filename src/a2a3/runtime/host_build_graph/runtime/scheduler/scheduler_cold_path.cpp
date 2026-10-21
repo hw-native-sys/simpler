@@ -1033,7 +1033,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         dump_args_init(active_sched_threads_);
     }
     if (is_pmu_enabled()) {
-        pmu_aicpu_init(physical_core_ids_, cores_total_num_);
+        pmu_aicpu_init(physical_core_ids_, cores_total_num_, static_cast<PmuEventType>(runtime->dev.pmu_event_type));
     }
 #endif
 

@@ -232,7 +232,7 @@ static void pmu_switch_buffer(int core_id, int thread_idx) {
 // High-level interface
 // ---------------------------------------------------------------------------
 
-void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
+void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores, PmuEventType event_type) {
     void *pmu_base = reinterpret_cast<void *>(get_platform_pmu_base());
     if (pmu_base == nullptr) {
         LOG_ERROR("pmu_aicpu_init: pmu_data_base is NULL");
@@ -240,9 +240,6 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
     }
 
     s_pmu_header = get_pmu_header(pmu_base);
-
-    // Read event_type from SHM header (written by host at init)
-    uint32_t pmu_event_type = s_pmu_header->event_type;
 
     // Resolve per-core PMU MMIO base from physical_core_ids. 0 means "no PMU
     // for this core" (sim or misconfigured) — subsequent record/stop become no-ops.
@@ -256,7 +253,7 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
     }
 
     // Program event selectors and start PMU counters on all cores
-    const PmuEventConfig *evt = pmu_resolve_event_config_a2a3(static_cast<PmuEventType>(pmu_event_type));
+    const PmuEventConfig *evt = pmu_resolve_event_config_a2a3(event_type);
     if (evt == nullptr) {
         evt = &PMU_EVENTS_A2A3_PIPE_UTIL;
     }
@@ -290,17 +287,13 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
         PmuBufferState *state = get_pmu_buffer_state(pmu_base, i);
         s_pmu_buffer_states[i] = state;
 
-        // This core's counters start here rather than at the host's admission:
-        // a host instant is not a producer boundary once a successor may
-        // already be queued, while this init provably runs after the
-        // predecessor's producers left with their operator. The host keeps its
-        // own reset for the path that maps no terminal bank, where no successor
-        // can be admitted at all.
+        // Entry follows the previous operator's producer retirement. Buffer
+        // ownership and queue cursors persist; record accounting is per run.
+        state->total_record_count = 0;
+        state->dropped_record_count = 0;
+        state->published_record_count = 0;
+        state->published_buffer_count = 0;
         if (s_run_terminal_bank != 0) {
-            state->total_record_count = 0;
-            state->dropped_record_count = 0;
-            state->published_record_count = 0;
-            state->published_buffer_count = 0;
             simpler::dfx::terminal::begin_run(
                 s_run_terminal_bank, PLATFORM_MAX_CORES, i, get_platform_run_result_epoch()
             );

@@ -361,7 +361,7 @@ struct PmuDataHeader {
     volatile uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS];  // Host reads (consumer)
     volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // AICPU writes (producer)
     uint32_t num_cores;
-    uint32_t event_type;  // PmuEventType value, written by host at init
+    uint32_t event_type;  // Initial pool metadata; per-run selection is in the Runtime descriptor.
     uint32_t pad[2];
 } __attribute__((aligned(64)));
 

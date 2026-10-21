@@ -1541,7 +1541,10 @@ public:
             config(config_in),
             dfx(DfxRunConfig::from(config_in)),
             scope_stats_capacity(runtime_in.scope_stats_capacity()),
-            pipeline_slot(pipeline_slot_in) {}
+            pipeline_slot(pipeline_slot_in) {
+            // Device publication and host export share one resolved selection.
+            runtime_in.dev.pmu_event_type = dfx.pmu_enabled ? static_cast<uint32_t>(dfx.pmu_event_type) : 0;
+        }
         PreparedExecution(const PreparedExecution &) = delete;
         PreparedExecution &operator=(const PreparedExecution &) = delete;
         PreparedExecution(PreparedExecution &&other) noexcept :

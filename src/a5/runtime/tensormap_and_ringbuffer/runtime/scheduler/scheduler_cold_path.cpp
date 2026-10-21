@@ -1115,13 +1115,14 @@ void SchedulerContext::abort_and_shutdown(Runtime *runtime) { emergency_shutdown
 // Profiling-subsystem init (leader-only). pmu_aicpu_init needs every core's
 // physical_core_id, so the barrier-free init path calls this behind an
 // all-thread barrier compiled only into DFX builds. No-op otherwise.
-void SchedulerContext::post_handshake_profiling_init() {
+void SchedulerContext::post_handshake_profiling_init(Runtime *runtime) {
+    (void)runtime;
 #if SIMPLER_DFX
     if (is_dump_args_enabled()) {
         dump_args_init(active_sched_threads_);
     }
     if (is_pmu_enabled()) {
-        pmu_aicpu_init(physical_core_ids_, cores_total_num_);
+        pmu_aicpu_init(physical_core_ids_, cores_total_num_, static_cast<PmuEventType>(runtime->dev.pmu_event_type));
     }
 #endif
 }
@@ -1377,7 +1378,7 @@ int32_t SchedulerContext::post_handshake_init(Runtime *runtime) {
         dump_args_init(active_sched_threads_);
     }
     if (is_pmu_enabled()) {
-        pmu_aicpu_init(physical_core_ids_, cores_total_num_);
+        pmu_aicpu_init(physical_core_ids_, cores_total_num_, static_cast<PmuEventType>(runtime->dev.pmu_event_type));
     }
 #endif
 

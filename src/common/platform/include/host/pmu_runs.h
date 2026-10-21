@@ -631,8 +631,7 @@ struct RetainedRunStats {
  *   size_t      retained_shard_count() const
  *   Frozen      freeze_run_config(EventType) const
  *   std::string build_csv_header(const Frozen &) const
- *   bool        publish_run_config(EventType)          // device header + counter reset;
- *                                                       // false = the device kept a previous value
+ *   void        set_run_config(EventType)              // host-only current selection
  *   RecordProofs snapshot_run_records(bool complete) const
  *   bool        device_publishes_run_terminal() const  // a bank is mapped for this run
  *   Reservation reserve_run_terminal_bank(uint64_t epoch)
@@ -760,19 +759,8 @@ public:
             progress_++;
         }
 
-        // The device header and the per-core counter reset. The predecessor's
-        // close has already snapshotted those counters, which is what makes
-        // resetting them here safe.
-        //
-        // A field the device did not take refuses the run **before it is
-        // launched**, because this epoch's whole promise is that its frozen
-        // host configuration and the device's agree: an event type the device
-        // kept at the previous run's value would have it measure one event
-        // group while these columns name another, and the record counts could
-        // still balance, so nothing later in the pipeline could catch it.
-        // The bank this run's cores publish into. Refused like a configuration
-        // the device did not take: a run that cannot be accounted for runs
-        // without diagnostics rather than unaccounted.
+        // Each admitted epoch holds its own terminal bank while its producers
+        // execute and its host readers settle their accounting.
         if (owner_.device_publishes_run_terminal()) {
             Epoch<Frozen> &admitted = epochs_[static_cast<size_t>(slot)];
             admitted.terminal_bank = owner_.reserve_run_terminal_bank(run_epoch);
@@ -786,14 +774,7 @@ public:
                 return false;
             }
         }
-        if (!owner_.publish_run_config(event_type)) {
-            LOG_ERROR(
-                "PmuCollector: run %llu refused, the device did not take this run's PMU configuration",
-                static_cast<unsigned long long>(run_epoch)
-            );
-            withdraw_unpublished_slot(slot);
-            return false;
-        }
+        owner_.set_run_config(event_type);
         // Every shard must see this epoch before the device can publish into
         // it, or its first buffers would belong to no epoch.
         if (!owner_.request_run_reference_release(kControlAckBudgetMs)) {

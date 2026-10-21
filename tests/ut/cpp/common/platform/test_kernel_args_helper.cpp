@@ -156,11 +156,12 @@ extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *s
     return ACL_SUCCESS;
 }
 
-TEST(KernelArgsDefaults, FreshRuntimeStartsWithSwimlaneDisabled) {
+TEST(KernelArgsDefaults, FreshRuntimeStartsWithDiagnosticsDisabled) {
     alignas(Runtime) unsigned char storage[sizeof(Runtime)];
     std::memset(storage, kDeviceMark, sizeof(storage));
     auto *fresh = new (storage) Runtime;
     EXPECT_EQ(fresh->dev.chip_swimlane_level, 0U);
+    EXPECT_EQ(fresh->dev.pmu_event_type, 0U);
     fresh->~Runtime();
 }
 

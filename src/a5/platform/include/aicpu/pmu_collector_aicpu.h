@@ -31,8 +31,7 @@
  *   pmu_aicpu_finalize()          — per-thread: restore CTRL registers.
  */
 
-#ifndef PLATFORM_AICPU_PMU_COLLECTOR_AICPU_H_
-#define PLATFORM_AICPU_PMU_COLLECTOR_AICPU_H_
+#pragma once
 
 #include <cstdint>
 
@@ -68,9 +67,10 @@ extern "C" bool is_pmu_enabled();
  * touch any Handshake field.
  *
  * @param physical_core_ids   Array of hardware physical core ids (length num_cores)
+ * @param event_type         This invocation's published descriptor selection.
  * @param num_cores           Number of active AICore workers
  */
-void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores);
+void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores, PmuEventType event_type);
 
 /**
  * Commit one PmuRecord from the per-core stable AICore staging-ring slot.
@@ -158,5 +158,3 @@ void pmu_aicpu_close_run(int core_id);
  * @param core_num How many of them
  */
 void pmu_aicpu_close_run_cores(const int32_t *core_ids, int32_t core_num);
-
-#endif  // PLATFORM_AICPU_PMU_COLLECTOR_AICPU_H_

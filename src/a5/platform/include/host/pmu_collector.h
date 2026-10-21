@@ -47,8 +47,7 @@
  *   finalize()                   — Free all device memory and unregister.
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_
-#define SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_
+#pragma once
 
 #include <atomic>
 #include <array>
@@ -220,22 +219,16 @@ public:
      *
      * @param num_cores                         Number of AICore instances in use
      * @param num_threads                       Number of AICPU scheduling threads
-     * @param csv_path                          Output CSV path
-     * @param event_type                        PmuEventType selector (written
-     *                                          to PmuDataHeader::event_type
-     *                                          so AICPU can configure HW
-     *                                          counters)
      * @param alloc_cb / register_cb / free_cb  Memory operation callbacks
      *                                          (register_cb nullptr on a5)
-     * @param user_data                         Opaque pointer forwarded to callbacks
      * @param device_id                         Device ID (for register_cb)
      * @return 0 on success, non-zero on failure
      */
     // Allocates the device-side resources.
     //
     // Per-run configuration (CSV destination, event selection) is bound
-    // separately by begin_run(), which must run before this on the first run so
-    // the event type reaches the device header and the CSV header string.
+    // separately by begin_run(). The device receives each run's selection
+    // through its Runtime descriptor.
     int init(
         int num_cores, int num_threads, const PmuAllocCallback &alloc_cb, PmuRegisterCallback register_cb,
         const PmuFreeCallback &free_cb, int device_id, PmuUnregisterCallback unregister_cb = nullptr
@@ -243,12 +236,10 @@ public:
 
     // Start a run's collection window: bind its CSV destination and event
     // selection, drop the previous run's shard state, rebuild the CSV header
-    // (its columns are named by the event config), and — once the region exists
-    // — republish the event type the device reads.
+    // (its columns are named by the event config). Device state is untouched.
     //
     // The collector initializes once and serves every run, so this is the only
-    // point at which a run's shard files, CSV columns and device event type are
-    // established; init() establishes none of them.
+    // point at which a run's shard files and CSV columns are established.
     void begin_run(const std::string &csv_path, PmuEventType event_type);
 
     void start(const profiling_common::ThreadFactory &thread_factory);
@@ -417,7 +408,7 @@ public:
     /**
      * Close one run's collection window while it still holds the execution
      * claim: snapshot the device counters and live buffers the successor's
-     * admission will zero, then arm the transport cut and hand the epoch to the
+     * device entry will zero, then arm the transport cut and hand the epoch to the
      * writer. Does not drain and does not merge.
      */
     void run_close(uint64_t run_epoch, bool device_execution_complete) {
@@ -514,7 +505,7 @@ private:
     static int bank_free(void *owner, void *device_ptr);
     static int bank_copy(void *owner, void *host_dst, const void *device_src, const void *host_src, size_t bytes);
 
-    bool publish_run_config(PmuEventType event_type);
+    void set_run_config(PmuEventType event_type);
     simpler::dfx::pmu::RecordProofs snapshot_run_records(bool device_execution_complete) const;
 
     /** True while this run's own cores report their accounting. */
@@ -685,5 +676,3 @@ inline std::string make_pmu_csv_path(const std::string &output_dir) {
     }
     return output_dir + "/pmu.csv";
 }
-
-#endif  // SRC_A5_PLATFORM_INCLUDE_HOST_PMU_COLLECTOR_H_

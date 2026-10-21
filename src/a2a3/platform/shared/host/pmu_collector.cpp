@@ -292,12 +292,7 @@ void PmuCollector::begin_run(const std::string &csv_path, PmuEventType event_typ
     }
     execution_complete_.store(false, std::memory_order_release);
     rebuild_csv_header();
-    // The single-run path keeps its behaviour: a field the device would not
-    // take is logged by `publish_field` and the run proceeds, exactly as it did
-    // before retention existed. Only a retained admission treats that as a
-    // refusal, because only it promises that the frozen host configuration and
-    // the device's agree.
-    (void)publish_run_config(event_type);
+    set_run_config(event_type);
 }
 
 void *PmuCollector::bank_alloc(void *owner, size_t bytes, void **host_out) {
@@ -440,63 +435,7 @@ simpler::dfx::pmu::RecordProofs PmuCollector::snapshot_run_records_from_terminal
     return proofs;
 }
 
-bool PmuCollector::publish_run_config(PmuEventType event_type) {
-    event_type_ = event_type;
-    // Before the first init() there is no region; init() writes the event type
-    // from the member just set. Afterwards the device needs the new value by
-    // another route — one narrow field, not a bulk write-back, so it cannot race
-    // the AICPU's own header fields.
-    if (shm_host_ == nullptr) return true;
-    bool published = true;
-    PmuDataHeader *hdr = get_pmu_header(shm_host_);
-    hdr->event_type = static_cast<uint32_t>(event_type_);
-    wmb();
-    // The device reads the event type out of this header to program its
-    // counters, so a copy the device did not take leaves it measuring the
-    // previous run's event group while the host names this run's columns.
-    // `publish_field` returns false in exactly that case.
-    published = publish_field(&hdr->event_type, sizeof(hdr->event_type), "event_type") && published;
-
-    // The per-core record counters are producer-side and never reset by the
-    // device, so they carry the previous run's totals into this run's
-    // reconcile. The two are adjacent, so one write-back per core covers
-    // them and leaves the device-owned fields beside them alone.
-    // a2a3 orders these dropped-then-total and has no mismatch counter;
-    // a5's layout differs, so neither the order nor the span is shared.
-    //
-    // Only the non-retaining path reaches the reset below, which is why one
-    // run at a time owns these counters there. A retaining collector reaches
-    // here through an admission that a predecessor's close does *not* precede —
-    // early enqueue admits a successor while the run ahead is still executing
-    // and still counting — so a host reset here would land either side of a
-    // producer transition. The guard below is what keeps it off that path.
-    static_assert(
-        offsetof(PmuBufferState, total_record_count) ==
-            offsetof(PmuBufferState, dropped_record_count) + sizeof(uint32_t),
-        "the two counters must stay adjacent for this single write-back to cover both"
-    );
-    // The region holds num_cores_ states (calc_pmu_data_size), so that is
-    // the bound — a wider loop writes past its end. The runner rebuilds this
-    // collector when a run's core count changes, so a resident one is never
-    // asked to reset a state it does not own.
-    //
-    // With a bank mapped each core zeroes its own counters at this run's device
-    // init, so the host resets none of them: its write would land either side
-    // of a producer transition, which is the hazard the move to the device
-    // removes. The event type above is still the host's to publish.
-    if (terminal_banks_.opened()) return published;
-    for (int c = 0; c < num_cores_; c++) {
-        PmuBufferState *state = get_pmu_buffer_state(shm_host_, c);
-        state->dropped_record_count = 0;
-        state->total_record_count = 0;
-        wmb();
-        // A reset the device did not take carries the predecessor's totals into
-        // this run's reconcile, so its completeness comparison would be against
-        // somebody else's producer count.
-        published = publish_field(&state->dropped_record_count, 2 * sizeof(uint32_t), "record counters") && published;
-    }
-    return published;
-}
+void PmuCollector::set_run_config(PmuEventType event_type) { event_type_ = event_type; }
 
 void PmuCollector::reset_collector_shards() {
     (void)close_csv_shards();

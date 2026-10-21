@@ -25,8 +25,7 @@
  *   pmu_aicpu_finalize()        — per-thread: restore CTRL registers on shutdown
  */
 
-#ifndef PLATFORM_AICPU_PMU_COLLECTOR_AICPU_H_
-#define PLATFORM_AICPU_PMU_COLLECTOR_AICPU_H_
+#pragma once
 
 #include <cstdint>
 
@@ -58,9 +57,10 @@ extern "C" bool is_pmu_enabled();
  * @param physical_core_ids  Array of hardware physical core ids, indexed by
  *                           logical core_id. Caller owns the memory; this
  *                           function does not retain the pointer.
+ * @param event_type         This invocation's published descriptor selection.
  * @param num_cores          Number of active cores (logical core_id range is [0, num_cores))
  */
-void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores);
+void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores, PmuEventType event_type);
 
 /**
  * Read PMU counters for one completed task and append a PmuRecord to the
@@ -126,5 +126,3 @@ void pmu_aicpu_close_run(int core_id);
  * @param core_num How many of them
  */
 void pmu_aicpu_close_run_cores(const int32_t *core_ids, int32_t core_num);
-
-#endif  // PLATFORM_AICPU_PMU_COLLECTOR_AICPU_H_
