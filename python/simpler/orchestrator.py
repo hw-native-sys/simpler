@@ -232,6 +232,7 @@ def _admit_task_submission(worker: Any = None) -> None:
     """
     if worker is not None:
         worker._require_no_ordered_cleanup_failure("submit")
+        worker._require_no_mpi_session_failure("submit")
     frame = _callback_frame_for(worker)
     if frame is not None:
         frame.has_submitted_task = True
@@ -265,8 +266,11 @@ def direct_control(worker: Any, native_orch: Any, api: str):
         # may have caught the rollback failure and carried on.
         if worker is not None:
             worker._require_no_ordered_cleanup_failure(api)
+            worker._require_no_mpi_session_failure(api)
         if native_orch is not None:
             native_orch.await_run_admission(frame.run_id)
+        if worker is not None:
+            worker._require_no_mpi_session_failure(api)
         yield
         return
     if worker is None:

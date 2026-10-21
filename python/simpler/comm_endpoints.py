@@ -172,6 +172,55 @@ def _require_owner_instance_id(nonce: object) -> bytes:
     return value
 
 
+class MpiSessionState(str, Enum):
+    CONFIGURED = "CONFIGURED"
+    STARTING = "STARTING"
+    ACTIVE = "ACTIVE"
+    TERMINAL = "TERMINAL"
+    RETIRED = "RETIRED"
+    UNOBSERVED = "UNOBSERVED"
+
+
+@dataclass(frozen=True)
+class MpiSessionBinding:
+    owner_path: str
+    group_id: str
+    rank: int
+    worker_id: int
+    session_id: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.owner_path, str) or not self.owner_path:
+            raise ValueError("MPI owner_path must be a non-empty worker path")
+        root = _PATH_SEGMENT_RE.fullmatch(self.owner_path.split("/", 1)[0])
+        if root is None:
+            raise ValueError("MPI owner_path must start with a worker root")
+        parse_endpoint_path(self.owner_path, root_level=int(root.group("level")))
+        if not isinstance(self.group_id, str) or not self.group_id.strip():
+            raise ValueError("MPI group_id must be a non-empty string")
+        for name, value in (("rank", self.rank), ("worker_id", self.worker_id), ("session_id", self.session_id)):
+            if type(value) is not int:
+                raise TypeError(f"MPI {name} must be an int")
+            if value < 0:
+                raise ValueError(f"MPI {name} must be nonnegative")
+        if not 0 < self.session_id < (1 << 63):
+            raise ValueError("MPI session_id must be a nonzero 63-bit identity")
+
+
+@dataclass(frozen=True)
+class MpiSessionSnapshot:
+    binding: MpiSessionBinding
+    state: MpiSessionState
+    failure_reason: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binding, MpiSessionBinding):
+            raise TypeError("MPI snapshot requires a MpiSessionBinding")
+        object.__setattr__(self, "state", MpiSessionState(self.state))
+        if self.failure_reason is not None and not isinstance(self.failure_reason, str):
+            raise TypeError("MPI failure_reason must be a string or None")
+
+
 @dataclass(frozen=True)
 class _EndpointTopologyEntry:
     path: str
@@ -181,6 +230,8 @@ class _EndpointTopologyEntry:
     #: entries leave it absent. Allocator presence is a separate frozen startup fact.
     owner_instance_id: bytes | None = None
     has_buffer_identity_allocator: bool | None = None
+    requires_mpi_session: bool = False
+    mpi_session: MpiSessionSnapshot | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +284,8 @@ class EndpointResolveReason(str, Enum):
     INVALID_PATH = "INVALID_PATH"
     PROVIDER_NOT_SINGLE_ENDPOINT = "PROVIDER_NOT_SINGLE_ENDPOINT"
     OWNER_NOT_REGISTERED = "OWNER_NOT_REGISTERED"
+    REGISTRY_MISMATCH = "REGISTRY_MISMATCH"
+    MPI_SESSION_UNAVAILABLE = "MPI_SESSION_UNAVAILABLE"
 
 
 class EndpointResolveError(ValueError):
@@ -253,6 +306,7 @@ class EndpointRegistry:
         records: Sequence[EndpointRecord],
         owner_bindings: Mapping[bytes, EndpointId] = MappingProxyType({}),
         allocator_states: Mapping[EndpointId, bool | None] = MappingProxyType({}),
+        mpi_sessions: Mapping[EndpointId, MpiSessionSnapshot] = MappingProxyType({}),
     ) -> None:
         self.root_level = int(root_level)
         self.session_instance_id = bytes(session_instance_id)
@@ -269,6 +323,46 @@ class EndpointRegistry:
         self._buffer_identity_allocator_states = {
             int(endpoint_id): None if state is None else bool(state) for endpoint_id, state in allocator_states.items()
         }
+        self._mpi_sessions = self._validated_mpi_sessions(mpi_sessions)
+
+    def _validated_mpi_sessions(
+        self, mpi_sessions: Mapping[EndpointId, MpiSessionSnapshot]
+    ) -> Mapping[EndpointId, MpiSessionSnapshot]:
+        sessions = dict(mpi_sessions)
+        by_group: dict[tuple[str, str], tuple[MpiSessionState, str | None]] = {}
+        by_rank: dict[tuple[str, str, int], MpiSessionSnapshot] = {}
+        by_worker: dict[tuple[str, int], MpiSessionBinding] = {}
+        by_session: dict[tuple[str, int], MpiSessionBinding] = {}
+        for endpoint_id, session in sessions.items():
+            if type(endpoint_id) is not int or endpoint_id not in self._by_id:
+                raise ValueError(f"MPI binding names an unknown endpoint id: {endpoint_id!r}")
+            if not isinstance(session, MpiSessionSnapshot):
+                raise TypeError("MPI endpoint binding must be a MpiSessionSnapshot")
+            binding = session.binding
+            self._parse(binding.owner_path)
+            rank_path = _format_worker_path(3, parent_path=binding.owner_path, index=binding.worker_id)
+            record = self._by_id[endpoint_id]
+            if (
+                record.identity.session_instance_id != self.session_instance_id
+                or record.identity.registry_epoch != self.registry_epoch
+            ):
+                raise ValueError("MPI endpoint record does not belong to this registry identity")
+            if record.path != rank_path and not record.path.startswith(rank_path + "/"):
+                raise ValueError(f"MPI binding does not match endpoint path {record.path!r}")
+            group_key = (binding.owner_path, binding.group_id)
+            group_state = (session.state, session.failure_reason)
+            if by_group.setdefault(group_key, group_state) != group_state:
+                raise ValueError(f"MPI group has inconsistent state snapshots: {group_key!r}")
+            rank_key = (binding.owner_path, binding.group_id, binding.rank)
+            if by_rank.setdefault(rank_key, session) != session:
+                raise ValueError(f"MPI rank has inconsistent endpoint snapshots: {rank_key!r}")
+            worker_key = (binding.owner_path, binding.worker_id)
+            if by_worker.setdefault(worker_key, binding) != binding:
+                raise ValueError(f"MPI worker id is reused by different ranks: {worker_key!r}")
+            session_key = (binding.owner_path, binding.session_id)
+            if by_session.setdefault(session_key, binding) != binding:
+                raise ValueError(f"MPI session id is reused by different ranks: {session_key!r}")
+        return MappingProxyType(sessions)
 
     @classmethod
     def from_snapshot(
@@ -285,7 +379,14 @@ class EndpointRegistry:
         seen: set[tuple[str, EndpointDeployment]] = set()
         owner_bindings: dict[bytes, EndpointId] = {}
         allocator_states: dict[EndpointId, bool | None] = {}
+        mpi_sessions: dict[EndpointId, MpiSessionSnapshot] = {}
         for endpoint_id, entry in enumerate(entries):
+            if type(entry.requires_mpi_session) is not bool:
+                raise TypeError("requires_mpi_session must be a bool")
+            if entry.requires_mpi_session != (entry.mpi_session is not None):
+                raise ValueError(f"MPI source and session binding disagree for endpoint {entry.path!r}")
+            if entry.mpi_session is not None:
+                mpi_sessions[endpoint_id] = entry.mpi_session
             deployment = EndpointDeployment(entry.deployment)
             key = (entry.path, deployment)
             if key in seen:
@@ -332,11 +433,31 @@ class EndpointRegistry:
             records=records,
             owner_bindings=owner_bindings,
             allocator_states=allocator_states,
+            mpi_sessions=mpi_sessions,
         )
 
     @property
     def records(self) -> tuple[EndpointRecord, ...]:
         return self._records
+
+    def mpi_session_for_endpoint(
+        self, endpoint: EndpointRecord | EndpointIdentity | EndpointId
+    ) -> MpiSessionSnapshot | None:
+        record = self._record_for(endpoint)
+        return self._mpi_sessions.get(record.endpoint_id)
+
+    def require_mpi_sessions_active(self, members: Sequence[EndpointRecord | EndpointIdentity | EndpointId]) -> None:
+        """Validate this snapshot only; current availability requires an owner-side check."""
+        for member in members:
+            record = self._record_for(member)
+            session = self._mpi_sessions.get(record.endpoint_id)
+            if session is not None and session.state is not MpiSessionState.ACTIVE:
+                label = _endpoint_label(record)
+                raise EndpointResolveError(
+                    EndpointResolveReason.MPI_SESSION_UNAVAILABLE,
+                    f"MPI session for {label} is {session.state.value}",
+                    (label,),
+                )
 
     def resolve_members(self, selectors: Sequence[EndpointSelector]) -> tuple[EndpointRecord, ...]:
         resolved: list[EndpointRecord] = []
@@ -470,13 +591,20 @@ class EndpointRegistry:
 
     def _record_for(self, endpoint: EndpointRecord | EndpointIdentity | EndpointId) -> EndpointRecord:
         if isinstance(endpoint, EndpointRecord):
-            return endpoint
+            record = self._record_for(endpoint.identity)
+            if endpoint != record:
+                raise EndpointResolveError(
+                    EndpointResolveReason.REGISTRY_MISMATCH,
+                    "EndpointRecord contents do not match this registry",
+                )
+            return record
         if isinstance(endpoint, EndpointIdentity):
             record = self._by_identity.get(endpoint)
             if record is None:
-                raise ValueError(
+                raise EndpointResolveError(
+                    EndpointResolveReason.REGISTRY_MISMATCH,
                     "unknown EndpointIdentity in registry "
-                    f"session={self.session_instance_id!r} epoch={self.registry_epoch}"
+                    f"session={self.session_instance_id!r} epoch={self.registry_epoch}",
                 )
             return record
         try:
@@ -835,6 +963,7 @@ class BackendResolver:
     def plan(self, resolved: ResolvedRegionSpec, layout: RegionLayoutSpec) -> BackendPlan | UnsupportedRegionPlan:
         self._validate_layout(layout)
         members = resolved.members
+        self._registry.require_mpi_sessions_active(members)
         provider = self._choose_provider(resolved)
         if isinstance(provider, UnsupportedRegionPlan):
             return provider

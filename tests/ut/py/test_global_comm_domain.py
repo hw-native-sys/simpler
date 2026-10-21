@@ -19,7 +19,7 @@ import time
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import pytest
 from simpler.buffer import AddressSpace
@@ -1478,10 +1478,16 @@ def test_global_domain_control_ids_do_not_overlap_worker_controls():
 
 
 def test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import(monkeypatch):
+    from simpler.comm_endpoints import MpiSessionState  # noqa: PLC0415
     from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
     from simpler.task_interface import CommBufferSpec  # noqa: PLC0415
+    from test_mpi_l3_group import _FakeProcess, _ReadyMailbox  # noqa: PLC0415
 
     worker, resources, node_ids = _mpi_static_worker()
+    group = worker._mpi_l3_groups[0]
+    group.state = MpiSessionState.ACTIVE
+    group.process = cast(Any, _FakeProcess())
+    group.mailbox = _ReadyMailbox(world_size=len(group.ranks))
     calls = []
     commands = []
 
@@ -1552,6 +1558,7 @@ def test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import(mo
         assert worker._live_global_domains["mpi-static"] is handle
         assert resources.live_global_domains["mpi-static"] is handle
     finally:
+        group.process = None
         _close_failure_injection_worker(worker, resources)
 
 
@@ -1666,14 +1673,15 @@ def test_mpirun_group_cleanup_continues_after_one_process_wait_fails():
         def __init__(self, *, fail_wait):
             self.fail_wait = fail_wait
             self.waited = False
+            self.returncode = None
 
-        @staticmethod
-        def poll():
-            return 0
+        def poll(self):
+            return self.returncode
 
         def wait(self, *, timeout):
-            assert timeout == 0.1
+            assert 0.0 <= timeout <= 0.1
             self.waited = True
+            self.returncode = 0
             if self.fail_wait:
                 raise RuntimeError("injected wait failure")
             return 0
@@ -1696,7 +1704,7 @@ def test_mpirun_group_cleanup_continues_after_one_process_wait_fails():
     )
     worker._mpi_l3_groups[:] = [first, second]
     try:
-        with pytest.raises(RuntimeError, match="first cleanup wait after terminate"):
+        with pytest.raises(RuntimeError, match="first cleanup .*injected wait failure"):
             worker._close_mpirun_groups(timeout_s=0.1)
 
         assert first_process.waited

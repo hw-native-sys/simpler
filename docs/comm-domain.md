@@ -71,13 +71,90 @@ from `RemoteWorkerSpec`; a local L3 reads the same fields from its `Worker`
 configuration. All participating nodes must use the same profile.
 
 An MPI-launched group registered with `add_mpirun_worker_group` uses the same
-member contract. Rank 0 writes the group manifest before launch, every MPI rank
-must publish READY before the L4 parent exposes the returned worker ids, and
-the `MpiL3GroupSpec.hosts` order defines node ranks. Global CommDomain members
+member contract. Registration returns worker ids for configuration; it does
+not launch the group or establish readiness. Member identities are validated
+and the complete group is published together: a failed registration leaves
+existing groups and endpoint snapshots unchanged. A successful registration
+invalidates the parent's cached endpoint registry.
+
+The parent writes the group manifest before launch. Every MPI rank must
+publish READY before the parent attaches the group mailbox during `init()`.
+The `MpiL3GroupSpec.hosts` order defines node ranks. Global CommDomain members
 must include the complete returned group; their order still defines dense
 domain ranks. A full MPI group exchanges descriptors rank-side over an MPI
 collective, so the L4 import fanout is skipped; a partial group falls back to
 the L4 descriptor broker above.
+
+The parent's management state becomes ACTIVE only after mailbox readiness,
+native attachment, and a final process/channel check. An observed unexpected
+exit records the first failure and invalidates the parent's cached endpoint
+registry; a terminal group cannot become ACTIVE again. Worker startup checks
+the latched failure and requires every registered group to be ACTIVE before
+publishing READY.
+
+Retiring a group is separate from reclaiming its resources. Mailbox mappings
+remain owned until the process and monitor have exited and native close has
+released the attachment. A timeout or failed close retains the references and
+cleanup journal entry for retry; startup rollback also preserves a native
+owner whose attachment release is unconfirmed.
+
+MPI group cleanup computes one absolute deadline and passes it unchanged to
+each group and the process reaper. Normal-exit and SIGTERM waits are capped
+at five and two seconds. The remaining budget first
+reserves up to two seconds for reaping after SIGKILL, then up to one second
+for monitor join and mapping-lock acquisition, then up to two seconds for
+SIGTERM grace. A short budget therefore reduces normal-exit and SIGTERM waits
+first; an exhausted budget only permits nonblocking checks and signal delivery.
+Monitor join and mapping-lock acquisition share a one-second cutoff within the
+overall deadline. These bounds cover explicit waits, not operating-system
+scheduling, native teardown, or filesystem cleanup; unconfirmed exit or
+attachment release still retains cleanup debt for retry.
+
+If native initialization was entered but did not report completion, a return
+from native close does not prove quiescence. The Python owner retains the
+attachment and its mappings as cleanup debt rather than declaring release;
+automatic reclamation in that partial-init case requires a native completion
+receipt.
+
+The MPI session work is limited to associating existing session identities
+with the endpoint registry and defining local invalidation boundaries. Mapping
+lifetime guards and retained cleanup debt support that boundary; they do not
+add heartbeats, dynamic membership, automatic recovery, remote reclamation
+acknowledgments, or a new session registry or epoch field. The existing domain
+transaction and wire formats keep their current contracts.
+
+Each parent-owned mpirun group's host, AICPU, and AICORE endpoint projects
+the registered rank's session binding into the existing registry. A nested child's configuration
+is enumerable but its MPI state is UNOBSERVED in the parent's process; it
+cannot authorize a plan. Pure registry construction does not inspect channels.
+It captures topology and version under the lifecycle lock, builds outside
+that lock, and checks the version again before caching, with at most three
+attempts. Concurrent invalidation discards the stale candidate.
+
+Worker region planning checks the owner, registry version, selected bindings,
+and ACTIVE state before and after planning. Between these checks it observes
+only selected, directly owned MPI groups, outside the lifecycle lock, using
+nonblocking process polls and a guarded mailbox read. An observed process exit
+or unavailable channel uses the same local invalidation path. A busy mailbox
+guard refuses the current planning attempt without declaring the group dead.
+The standalone backend planner checks snapshot state; current owner validation
+is the Worker's responsibility.
+
+After a trusted MPI failure is published, operation leases reject new ordinary
+work. Submission and control recheck after serializer/FIFO waits, including
+reentrant control and task submission inside an open graph callback. If native
+begin-run already returned an id, that run is registered before rejection and
+uses the existing cancellation and fence-owned finalization path.
+
+Materialization revalidates under the existing allocation dispatch lock before
+sending a request and after an ALLOCATED reply, before importing its views.
+It also checks before publishing imported attachments. Registry mismatch and
+unavailable MPI sessions retain distinct typed refusal reasons and causes.
+Failures after allocation use the existing delegated-fatal or release paths;
+they do not imply that remote resources have already been reclaimed. Internal
+release, finalization, and close do not use the new ordinary-work admission
+guard. A failure after the last check still belongs to the in-flight boundary;
+these checks do not provide remote fencing or cancellation of a native wait.
 
 Global CommDomain capability follows the backend that the node actually
 loads: a platform ending in `sim` supports the `sim` profile, and a real

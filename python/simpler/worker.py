@@ -81,7 +81,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
@@ -162,9 +162,16 @@ from .comm_endpoints import (
     BackendResolver,
     DefaultRegionAccessService,
     EndpointDeployment,
+    EndpointRecord,
     EndpointRegistry,
+    EndpointResolveError,
+    EndpointResolveReason,
+    MpiSessionBinding,
+    MpiSessionSnapshot,
+    MpiSessionState,
     RegionAccessService,
     RegionLayoutSpec,
+    ResolvedRegionSpec,
     SingleOwner,
     UnsupportedRegionPlan,
     _EndpointTopologyEntry,
@@ -724,6 +731,10 @@ _STARTUP_POLL_INTERVAL_S = 0.001
 # to close gracefully (so it unlinks the nested mailbox shms only it knows the
 # names of) before being SIGKILLed. This bounds that graceful wait.
 _ROLLBACK_GRACEFUL_TIMEOUT_S = 10.0
+_MPI_CLOSE_EXIT_TIMEOUT_S = 5.0
+_MPI_CLOSE_TERM_TIMEOUT_S = 2.0
+_MPI_CLOSE_REAP_TIMEOUT_S = 2.0
+_MPI_CLOSE_FINALIZE_TIMEOUT_S = 1.0
 # A chip/sub child exiting after SHUTDOWN still has to release everything it
 # imported — on a large-scope run (dsv4 HBG: ~80 backings incl. a 2 GiB ring
 # heap) the per-mapping teardown alone runs ~10 s — so the close-path reap
@@ -1207,6 +1218,13 @@ class _MpiL3RankRuntime:
     spec: _MpiL3RankSpec
 
 
+class _MpiSessionFailureKind(str, enum.Enum):
+    PROCESS_EXIT = "PROCESS_EXIT"
+    CHANNEL_TERMINAL = "CHANNEL_TERMINAL"
+    STARTUP_FAILURE = "STARTUP_FAILURE"
+    MONITOR_FAILURE = "MONITOR_FAILURE"
+
+
 @dataclass
 class _MpiL3GroupRuntime:
     group_id: str
@@ -1218,6 +1236,13 @@ class _MpiL3GroupRuntime:
     mailbox: Any | None = None
     monitor_thread: threading.Thread | None = None
     closing: bool = False
+    state: MpiSessionState = MpiSessionState.CONFIGURED
+    failure_cause: BaseException | None = None
+    failure_kind: _MpiSessionFailureKind | None = None
+    notification_error: Exception | None = None
+    mailbox_lock: Any = field(default_factory=threading.Lock, repr=False, compare=False)
+    native_attached: bool = False
+    process_returncode: int | None = None
 
 
 @dataclass(frozen=True)
@@ -5557,6 +5582,8 @@ class Worker:
         self.level = level
         self._delegated_control_path = _format_worker_path(int(level))
         self._delegated_session_fatal: BaseException | None = None
+        self._mpi_session_failure: BaseException | None = None
+        self._mpi_native_init_incomplete = False
         # Rebound from the level in `init()`; the default matches the C++ table's
         # so a span emitted before init names L3 rather than nothing.
         self._host_span_prefix = _span_prefix(WorkerLevel.node)
@@ -5931,8 +5958,25 @@ class Worker:
 
             group_id = uuid.uuid4().hex
             ranks: list[_MpiL3RankRuntime] = []
+            worker_ids = set(self._next_level_worker_ids) | self._remote_like_worker_ids()
+            session_ids = {item.session_id for item in self._mpi_rank_by_worker_id.values()}
+            session_ids.update(item.session_id for item in self._remote_sessions)
+            if any(group.group_id == group_id for group in self._mpi_l3_groups):
+                raise ValueError(f"MPI group id is already registered: {group_id}")
             for rank in range(len(spec.hosts)):
                 worker_id = self._allocate_next_level_worker_id()
+                session_id = self._new_remote_session_id()
+                MpiSessionBinding(
+                    owner_path=self._delegated_control_path,
+                    group_id=group_id,
+                    rank=rank,
+                    worker_id=worker_id,
+                    session_id=session_id,
+                )
+                if worker_id in worker_ids or session_id in session_ids:
+                    raise ValueError("MPI group members require distinct worker and session identities")
+                worker_ids.add(worker_id)
+                session_ids.add(session_id)
                 rank_spec = _MpiL3RankSpec(
                     platform=spec.platform,
                     runtime=spec.runtime,
@@ -5946,14 +5990,18 @@ class Worker:
                     group_id=group_id,
                     rank=rank,
                     worker_id=worker_id,
-                    session_id=self._new_remote_session_id(),
+                    session_id=session_id,
                     spec=rank_spec,
                 )
                 ranks.append(runtime)
-                self._mpi_worker_ids.append(worker_id)
-                self._mpi_rank_by_worker_id[worker_id] = runtime
             group = _MpiL3GroupRuntime(group_id=group_id, spec=spec, ranks=tuple(ranks))
-            self._mpi_l3_groups.append(group)
+            next_groups = [*self._mpi_l3_groups, group]
+            next_worker_ids = [*self._mpi_worker_ids, *(item.worker_id for item in ranks)]
+            next_ranks = self._mpi_rank_by_worker_id | {item.worker_id: item for item in ranks}
+            self._mpi_l3_groups = next_groups
+            self._mpi_worker_ids = next_worker_ids
+            self._mpi_rank_by_worker_id = next_ranks
+            self._invalidate_endpoint_registry()
             return tuple(rank.worker_id for rank in ranks)
 
     def _remote_like_worker_ids(self) -> set[int]:
@@ -6429,70 +6477,175 @@ class Worker:
         host_args = {"--host", "-host", "-H", "--hostfile", "-hostfile", "--machinefile", "-machinefile"}
         return any(arg in host_args or arg.startswith("--host=") or arg.startswith("--hostfile=") for arg in args)
 
-    @staticmethod
-    def _close_mpirun_group(  # noqa: PLR0912 -- cleanup reports every independent process/resource failure
+    def _require_no_mpi_session_failure_locked(self, api: str) -> None:
+        """The caller holds the lifecycle condition lock."""
+        if self._mpi_session_failure is not None:
+            raise RuntimeError(
+                f"Worker.{api}: MPI session is unavailable; close this Worker"
+            ) from self._mpi_session_failure
+
+    def _require_no_mpi_session_failure(self, api: str) -> None:
+        with self._hierarchical_start_cv:
+            self._require_no_mpi_session_failure_locked(api)
+
+    def _mpi_group_event_matches_locked(
+        self,
         group: _MpiL3GroupRuntime,
+        process: subprocess.Popen[Any] | None,
+        session_ids: tuple[int, ...],
+    ) -> bool:
+        return (
+            any(current is group for current in self._mpi_l3_groups)
+            and group.process is process
+            and tuple(rank.session_id for rank in group.ranks) == session_ids
+        )
+
+    def _expire_mpi_group_session_locked(
+        self,
+        group: _MpiL3GroupRuntime,
+        expected_process: subprocess.Popen[Any] | None,
+        expected_session_ids: tuple[int, ...],
+        cause: BaseException,
         *,
-        timeout_s: float,
-    ) -> list[str]:
+        kind: _MpiSessionFailureKind,
+    ) -> bool:
+        """The caller holds the lifecycle lock; no mailbox access or remote wait occurs here."""
+        if (
+            not self._mpi_group_event_matches_locked(group, expected_process, expected_session_ids)
+            or group.closing
+            or group.state not in (MpiSessionState.STARTING, MpiSessionState.ACTIVE)
+        ):
+            return False
+        kind = _MpiSessionFailureKind(kind)
+        if not isinstance(cause, BaseException):
+            raise TypeError("MPI failure cause must be an exception")
+        group.state = MpiSessionState.TERMINAL
+        group.failure_cause = cause
+        group.failure_kind = kind
+        if self._mpi_session_failure is None:
+            summary = RuntimeError(f"MPI group {group.group_id} {kind.value} is unavailable")
+            summary.__cause__ = cause
+            self._mpi_session_failure = summary
+        self._invalidate_endpoint_registry()
+        self._hierarchical_start_cv.notify_all()
+        return True
+
+    def _expire_mpi_group_session(
+        self,
+        group: _MpiL3GroupRuntime,
+        expected_process: subprocess.Popen[Any] | None,
+        expected_session_ids: tuple[int, ...],
+        cause: BaseException,
+        *,
+        kind: _MpiSessionFailureKind,
+    ) -> bool:
+        with self._hierarchical_start_cv:
+            changed = self._expire_mpi_group_session_locked(
+                group, expected_process, expected_session_ids, cause, kind=kind
+            )
+        if not changed:
+            return False
+        try:
+            reason = str(cause)
+        except Exception:
+            reason = f"{type(cause).__name__}: failure message is unavailable"
+        notification_error = None
+        if group.mailbox_lock.acquire(blocking=False):
+            try:
+                if group.mailbox is not None:
+                    group.mailbox.mark_terminal(reason)
+            except Exception as exc:
+                notification_error = exc
+            finally:
+                group.mailbox_lock.release()
+        else:
+            notification_error = RuntimeError("MPI terminal notification skipped: mailbox mapping is in use")
+        if notification_error is not None:
+            with self._hierarchical_start_cv:
+                if group.notification_error is None:
+                    group.notification_error = notification_error
+        return changed
+
+    @staticmethod
+    def _reap_mpirun_process(proc: subprocess.Popen[Any], deadline: float) -> list[str]:
         failures: list[str] = []
-        group.closing = True
-        proc = group.process
+        started = _monotonic()
+        budget = max(0.0, deadline - started)
+        # Short budgets prioritize reaping, then monitor and mapping cleanup, then SIGTERM grace.
+        reap_reserve = min(_MPI_CLOSE_REAP_TIMEOUT_S, budget)
+        finalize_reserve = min(_MPI_CLOSE_FINALIZE_TIMEOUT_S, max(0.0, budget - reap_reserve))
+        term_reserve = min(_MPI_CLOSE_TERM_TIMEOUT_S, max(0.0, budget - reap_reserve - finalize_reserve))
+        stages = (
+            (None, _MPI_CLOSE_EXIT_TIMEOUT_S, deadline - reap_reserve - finalize_reserve - term_reserve),
+            (signal.SIGTERM, _MPI_CLOSE_TERM_TIMEOUT_S, deadline - reap_reserve - finalize_reserve),
+            (signal.SIGKILL, _MPI_CLOSE_REAP_TIMEOUT_S, deadline - finalize_reserve),
+        )
+        for sig, wait_limit, stage_deadline in stages:
+            try:
+                if proc.poll() is not None:
+                    return failures
+                if sig is not None:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.killpg(proc.pid, sig)
+                proc.wait(timeout=min(wait_limit, max(0.0, stage_deadline - _monotonic())))
+            except subprocess.TimeoutExpired:
+                continue
+            except BaseException as exc:  # noqa: BLE001 -- cleanup retains unreaped resources
+                failures.append(f"reap process: {exc}")
+        return failures
+
+    def _close_mpirun_group(self, group: _MpiL3GroupRuntime, *, deadline: float) -> list[str]:
+        failures: list[str] = []
+        self._mark_mpirun_groups_closing([group])
+        with self._hierarchical_start_cv:
+            proc, monitor = group.process, group.monitor_thread
         if proc is not None:
-            try:
-                # The remote sessions received SHUTDOWN before this runs, so a
-                # healthy group exits by itself once its ranks close their
-                # inner workers. SIGTERM is the backstop, not the first move:
-                # a rank interrupted mid native teardown dies uncleanly and
-                # mpirun reports the whole job as a bad termination.
-                if proc.poll() is None:
-                    with contextlib.suppress(subprocess.TimeoutExpired):
-                        proc.wait(timeout=timeout_s)
-                if proc.poll() is None:
-                    try:
-                        os.killpg(proc.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-                    except BaseException as exc:  # noqa: BLE001
-                        failures.append(f"terminate: {exc}")
-                try:
-                    proc.wait(timeout=timeout_s)
-                except subprocess.TimeoutExpired:
-                    try:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    except BaseException as exc:  # noqa: BLE001
-                        failures.append(f"kill: {exc}")
-                    try:
-                        proc.wait(timeout=timeout_s)
-                    except BaseException as exc:  # noqa: BLE001
-                        failures.append(f"wait after kill: {exc}")
-                except BaseException as exc:  # noqa: BLE001
-                    failures.append(f"wait after terminate: {exc}")
-            finally:
-                group.process = None
-        if group.monitor_thread is not None:
-            group.monitor_thread.join(timeout=timeout_s)
+            failures.extend(self._reap_mpirun_process(proc, deadline))
+        finalize_deadline = min(deadline, _monotonic() + _MPI_CLOSE_FINALIZE_TIMEOUT_S)
+        try:
+            if monitor is not None and monitor.is_alive():
+                monitor.join(timeout=max(0.0, finalize_deadline - _monotonic()))
+            process_live = proc is not None and proc.poll() is None
+            monitor_live = monitor is not None and monitor.is_alive()
+        except BaseException as exc:  # noqa: BLE001 -- unknown liveness forbids unmapping
+            failures.append(f"observe process or monitor: {exc}")
+            process_live = monitor_live = True
+        if process_live or monitor_live:
+            failures.append("process or monitor still alive; retaining mailbox and references")
+            return [f"MPI L3 group {group.group_id} cleanup {failure}" for failure in failures]
+        with self._hierarchical_start_cv:
+            group.process_returncode = proc.returncode if proc is not None else group.process_returncode
+            group.process = None
             group.monitor_thread = None
-        if group.mailbox is not None:
+            native_attached = group.native_attached
+        if native_attached:
+            failures.append("native Worker still owns the mailbox attachment")
+        elif not group.mailbox_lock.acquire(timeout=max(0.0, finalize_deadline - _monotonic())):
+            failures.append("mailbox mapping is still in use")
+        else:
+            close_error = None
             try:
-                group.mailbox.close(unlink=True)
-            except BaseException as exc:  # noqa: BLE001
-                failures.append(f"close mailbox: {exc}")
+                if group.mailbox is not None:
+                    group.mailbox.close(unlink=True)
+                    group.mailbox = None
+            except BaseException as exc:  # noqa: BLE001 -- failed mappings remain retryable
+                close_error = exc
             finally:
-                group.mailbox = None
+                group.mailbox_lock.release()
+            if close_error is not None:
+                failures.append(f"close mailbox: {close_error}")
+        if failures:
+            return [f"MPI L3 group {group.group_id} cleanup {failure}" for failure in failures]
         try:
             if group.ready_dir is not None:
                 shutil.rmtree(group.ready_dir)
         except FileNotFoundError:
             pass
         except BaseException as exc:  # noqa: BLE001
-            failures.append(f"remove ready directory: {exc}")
-        finally:
-            group.ready_dir = None
-            group.manifest_path = None
-        return [f"MPI L3 group {group.group_id} cleanup {failure}" for failure in failures]
+            return [f"MPI L3 group {group.group_id} cleanup remove ready directory: {exc}"]
+        group.ready_dir = None
+        group.manifest_path = None
+        return []
 
     def _close_mpirun_groups(
         self,
@@ -6501,108 +6654,67 @@ class Worker:
         suppress_errors: bool = False,
     ) -> None:
         failures: list[str] = []
+        deadline = _monotonic() + timeout_s
         for group in reversed(self._mpi_l3_groups):
-            failures.extend(self._close_mpirun_group(group, timeout_s=timeout_s))
+            failures.extend(self._close_mpirun_group(group, deadline=deadline))
         if failures:
             sys.stderr.write("\n".join(f"[worker pid={os.getpid()}] WARN: {failure}" for failure in failures) + "\n")
             sys.stderr.flush()
             if not suppress_errors:
                 raise RuntimeError(failures[0])
 
-    @staticmethod
-    def _monitor_mpirun_group(group: _MpiL3GroupRuntime, proc: subprocess.Popen[Any]) -> None:
-        returncode = proc.wait()
-        if group.closing or group.mailbox is None:
-            return
-        with contextlib.suppress(BaseException):
-            group.mailbox.mark_terminal(f"mpirun exited unexpectedly with status {returncode}")
+    def _monitor_mpirun_group(self, group: _MpiL3GroupRuntime, proc: subprocess.Popen[Any]) -> None:
+        session_ids = tuple(rank.session_id for rank in group.ranks)
+        try:
+            returncode = proc.wait()
+        except BaseException as cause:  # noqa: BLE001 -- unavailable observation is distinct from proven exit
+            self._expire_mpi_group_session(group, proc, session_ids, cause, kind=_MpiSessionFailureKind.MONITOR_FAILURE)
+        else:
+            with self._hierarchical_start_cv:
+                if self._mpi_group_event_matches_locked(group, proc, session_ids):
+                    group.process_returncode = returncode
+            self._expire_mpi_group_session(
+                group,
+                proc,
+                session_ids,
+                RuntimeError(f"mpirun exited unexpectedly with status {returncode}"),
+                kind=_MpiSessionFailureKind.PROCESS_EXIT,
+            )
 
-    @staticmethod
-    def _mark_mpirun_groups_closing(groups: list[_MpiL3GroupRuntime]) -> None:
-        for group in groups:
-            group.closing = True
+    def _mark_mpirun_groups_closing(self, groups: list[_MpiL3GroupRuntime]) -> None:
+        with self._hierarchical_start_cv:
+            for group in groups:
+                group.closing = True
+                if group.state in (MpiSessionState.CONFIGURED, MpiSessionState.STARTING, MpiSessionState.ACTIVE):
+                    group.state = MpiSessionState.RETIRED
+                    self._invalidate_endpoint_registry()
+            self._hierarchical_start_cv.notify_all()
 
     def _activate_mpirun_worker_groups(self, deadline: float) -> None:
         if not self._mpi_l3_groups:
             return
-        from .mpi_group_mailbox import MAILBOX_SIZE as MPI_MAILBOX_SIZE  # noqa: PLC0415
-        from .mpi_group_mailbox import MailboxGroupState, MpiGroupMailbox  # noqa: PLC0415
-
-        session_timeout = self._remote_session_timeout_s()
         assert self._worker is not None
         for group in self._mpi_l3_groups:
-            ready_dir = tempfile.mkdtemp(prefix="simpler-mpirun-manifest-")
-            manifest_path = os.path.join(ready_dir, "group.json")
-            group.ready_dir = ready_dir
-            group.manifest_path = manifest_path
-            mailbox = MpiGroupMailbox.create(world_size=len(group.ranks))
-            group.mailbox = mailbox
-            rank_manifests: list[dict[str, Any]] = []
-            startup_remaining_s = self._remaining_until(deadline, "MPI L3 group manifest")
-            for rank in group.ranks:
-                manifest = self._build_mpi_rank_manifest(
-                    rank=rank,
-                    startup_remaining_s=startup_remaining_s,
+            with self._hierarchical_start_cv:
+                self._require_no_mpi_session_failure_locked("init")
+                if group.state is not MpiSessionState.CONFIGURED or group.closing:
+                    raise RuntimeError("MPI group activation requires a configured, nonretired group")
+                group.state = MpiSessionState.STARTING
+                self._invalidate_endpoint_registry()
+                self._hierarchical_start_cv.notify_all()
+            try:
+                self._activate_mpirun_group(group, deadline)
+            except BaseException as cause:
+                with self._hierarchical_start_cv:
+                    proc = group.process
+                self._expire_mpi_group_session(
+                    group,
+                    proc,
+                    tuple(rank.session_id for rank in group.ranks),
+                    cause,
+                    kind=_MpiSessionFailureKind.STARTUP_FAILURE,
                 )
-                manifest.update(
-                    {
-                        "mpi_group_id": group.group_id,
-                        "mpi_rank": rank.rank,
-                        "mpi_world_size": len(group.ranks),
-                        "mpi_group_worker_ids": [item.worker_id for item in group.ranks],
-                        "mpi_global_domain_exchange": True,
-                    }
-                )
-                rank_manifests.append(manifest)
-            group_manifest = {
-                "group_id": group.group_id,
-                "world_size": len(group.ranks),
-                "worker_ids": [rank.worker_id for rank in group.ranks],
-                "mailbox": mailbox.manifest(),
-                "rank_manifests": rank_manifests,
-            }
-            with open(manifest_path, "w", encoding="utf-8") as f:
-                json.dump(group_manifest, f, sort_keys=True)
-                f.write("\n")
-
-            cmd = [group.spec.mpirun_path, "-np", str(len(group.ranks))]
-            if not self._mpirun_args_select_hosts(group.spec.mpirun_args):
-                cmd.extend(["--host", ",".join(group.spec.hosts)])
-            cmd.extend(group.spec.mpirun_args)
-            cmd.extend(
-                [
-                    group.spec.python_executable,
-                    "-m",
-                    "simpler.mpi_l3_session",
-                    "--group-manifest",
-                    manifest_path,
-                ]
-            )
-            group.process = subprocess.Popen(cmd, start_new_session=True)
-            while mailbox.group_state is MailboxGroupState.INITIALIZING:
-                if group.process.poll() is not None:
-                    raise RuntimeError(
-                        f"MPI L3 group {group.group_id} exited before READY (status {group.process.returncode})"
-                    )
-                self._remaining_until(deadline, "MPI L3 mailbox READY")
-                _sleep(_STARTUP_POLL_INTERVAL_S)
-            if mailbox.group_state is not MailboxGroupState.READY:
-                raise RuntimeError(f"MPI L3 group {group.group_id} failed before READY: {mailbox.terminal_reason()}")
-            self._worker.add_mpi_group_mailbox(
-                [rank.worker_id for rank in group.ranks],
-                [rank.session_id for rank in group.ranks],
-                mailbox.address,
-                MPI_MAILBOX_SIZE,
-                group.process.pid,
-                session_timeout,
-            )
-            group.monitor_thread = threading.Thread(
-                target=self._monitor_mpirun_group,
-                args=(group, group.process),
-                daemon=True,
-                name=f"simpler-mpirun-monitor-{group.group_id[:8]}",
-            )
-            group.monitor_thread.start()
+                raise
         if _monotonic() >= deadline:
             raise RuntimeError("MPI L3 activation: startup deadline exceeded after attach")
 
@@ -6683,6 +6795,125 @@ class Worker:
                     with contextlib.suppress(BaseException):
                         self._worker.remote_unregister(worker_id, target_registry, callable_kind, state.digest)
                 raise
+
+    def _prepare_mpirun_group_manifest(self, group: _MpiL3GroupRuntime, deadline: float) -> Any:
+        from .mpi_group_mailbox import MpiGroupMailbox  # noqa: PLC0415
+
+        ready_dir = tempfile.mkdtemp(prefix="simpler-mpirun-manifest-")
+        manifest_path = os.path.join(ready_dir, "group.json")
+        group.ready_dir, group.manifest_path = ready_dir, manifest_path
+        mailbox = MpiGroupMailbox.create(world_size=len(group.ranks))
+        with group.mailbox_lock:
+            group.mailbox = mailbox
+        rank_manifests: list[dict[str, Any]] = []
+        startup_remaining_s = self._remaining_until(deadline, "MPI L3 group manifest")
+        for rank in group.ranks:
+            manifest = self._build_mpi_rank_manifest(rank=rank, startup_remaining_s=startup_remaining_s)
+            manifest.update(
+                {
+                    "mpi_group_id": group.group_id,
+                    "mpi_rank": rank.rank,
+                    "mpi_world_size": len(group.ranks),
+                    "mpi_group_worker_ids": [item.worker_id for item in group.ranks],
+                    "mpi_global_domain_exchange": True,
+                }
+            )
+            rank_manifests.append(manifest)
+        with group.mailbox_lock:
+            mailbox_manifest = mailbox.manifest()
+        group_manifest = {
+            "group_id": group.group_id,
+            "world_size": len(group.ranks),
+            "worker_ids": [rank.worker_id for rank in group.ranks],
+            "mailbox": mailbox_manifest,
+            "rank_manifests": rank_manifests,
+        }
+        with open(manifest_path, "w", encoding="utf-8") as f:
+            json.dump(group_manifest, f, sort_keys=True)
+            f.write("\n")
+        return mailbox
+
+    def _require_mpi_group_starting_locked(self, group: _MpiL3GroupRuntime, proc: subprocess.Popen[Any]) -> None:
+        self._require_no_mpi_session_failure_locked("init")
+        if group.process is not proc or group.closing or group.state is not MpiSessionState.STARTING:
+            raise RuntimeError("MPI activation lost its current group instance")
+        if self._cancel_token:
+            raise InitCancelled("init cancelled during MPI activation")
+
+    def _wait_mpi_group_ready(
+        self, group: _MpiL3GroupRuntime, proc: subprocess.Popen[Any], mailbox: Any, deadline: float
+    ) -> None:
+        from .mpi_group_mailbox import MailboxGroupState  # noqa: PLC0415
+
+        while True:
+            self._remaining_until(deadline, "MPI L3 mailbox READY")
+            with self._hierarchical_start_cv:
+                self._require_mpi_group_starting_locked(group, proc)
+            if proc.poll() is not None:
+                raise RuntimeError(f"MPI L3 group {group.group_id} exited before READY (status {proc.returncode})")
+            with group.mailbox_lock:
+                if group.mailbox is not mailbox:
+                    raise RuntimeError("MPI startup mailbox was detached")
+                state = mailbox.group_state
+                reason = mailbox.terminal_reason()
+            if state is MailboxGroupState.READY:
+                return
+            if state is not MailboxGroupState.INITIALIZING:
+                raise RuntimeError(f"MPI L3 group {group.group_id} failed before READY: {reason}")
+            _sleep(_STARTUP_POLL_INTERVAL_S)
+
+    def _activate_mpirun_group(self, group: _MpiL3GroupRuntime, deadline: float) -> None:
+        from .mpi_group_mailbox import MAILBOX_SIZE as MPI_MAILBOX_SIZE  # noqa: PLC0415
+        from .mpi_group_mailbox import MailboxGroupState  # noqa: PLC0415
+
+        mailbox = self._prepare_mpirun_group_manifest(group, deadline)
+        assert group.manifest_path is not None
+        cmd = [group.spec.mpirun_path, "-np", str(len(group.ranks))]
+        if not self._mpirun_args_select_hosts(group.spec.mpirun_args):
+            cmd.extend(["--host", ",".join(group.spec.hosts)])
+        cmd.extend(group.spec.mpirun_args)
+        cmd.extend(
+            [group.spec.python_executable, "-m", "simpler.mpi_l3_session", "--group-manifest", group.manifest_path]
+        )
+        proc = subprocess.Popen(cmd, start_new_session=True)
+        with self._hierarchical_start_cv:
+            group.process = proc
+        monitor = threading.Thread(
+            target=self._monitor_mpirun_group,
+            args=(group, proc),
+            daemon=True,
+            name=f"simpler-mpirun-monitor-{group.group_id[:8]}",
+        )
+        with self._hierarchical_start_cv:
+            group.monitor_thread = monitor
+        monitor.start()
+        self._wait_mpi_group_ready(group, proc, mailbox, deadline)
+        with self._hierarchical_start_cv:
+            self._require_mpi_group_starting_locked(group, proc)
+            group.native_attached = True
+        with group.mailbox_lock:
+            if group.mailbox is not mailbox:
+                raise RuntimeError("MPI startup mailbox was detached before native attach")
+            mailbox_address = mailbox.address
+        assert self._worker is not None
+        self._worker.add_mpi_group_mailbox(
+            [rank.worker_id for rank in group.ranks],
+            [rank.session_id for rank in group.ranks],
+            mailbox_address,
+            MPI_MAILBOX_SIZE,
+            proc.pid,
+            self._remote_session_timeout_s(),
+        )
+        with group.mailbox_lock:
+            if group.mailbox is not mailbox or mailbox.group_state is not MailboxGroupState.READY:
+                raise RuntimeError("MPI mailbox is not READY after native attach")
+        if proc.poll() is not None:
+            raise RuntimeError(f"MPI process exited after native attach (status {proc.returncode})")
+        with self._hierarchical_start_cv:
+            self._require_mpi_group_starting_locked(group, proc)
+            group.state = MpiSessionState.ACTIVE
+            self._invalidate_endpoint_registry()
+            self._hierarchical_start_cv.notify_all()
 
     def _require_remote_worker_started(self, worker_id: int) -> None:
         """Argument + resource gate for the public remote-memory APIs. Admission
@@ -7624,6 +7855,7 @@ class Worker:
                     f"Worker.{api}: delegated-region session is fatal and no further work is admitted; "
                     "close this Worker"
                 ) from self._delegated_session_fatal
+            self._require_no_mpi_session_failure_locked(api)
             self._active_ops += 1
             self._lease_depth[tid] = self._lease_depth.get(tid, 0) + 1
         try:
@@ -7709,14 +7941,33 @@ class Worker:
             remote_node_identity = self._node_identity_from_remote_endpoint(spec.endpoint)
             entries.append(_EndpointTopologyEntry(remote_path, HOST_CPU, remote_node_identity))
             self._append_device_endpoint_topology(entries, remote_path, spec.device_ids, remote_node_identity)
+        self._append_mpi_endpoint_topology(entries, worker, path)
+
+    def _append_mpi_endpoint_topology(self, entries: list[_EndpointTopologyEntry], worker: Worker, path: str) -> None:
         mpi_groups = {group.group_id: group for group in worker._mpi_l3_groups}
         for child_index in worker._mpi_worker_ids:
             rank = worker._mpi_rank_by_worker_id[int(child_index)]
             group = mpi_groups[rank.group_id]
+            session = MpiSessionSnapshot(
+                MpiSessionBinding(path, group.group_id, rank.rank, rank.worker_id, rank.session_id),
+                group.state if worker is self else MpiSessionState.UNOBSERVED,
+                group.failure_kind.value if worker is self and group.failure_kind is not None else None,
+            )
             mpi_node_identity = _normalize_node_identity(group.spec.hosts[rank.rank])
             mpi_path = _format_worker_path(3, parent_path=path, index=int(child_index))
-            entries.append(_EndpointTopologyEntry(mpi_path, HOST_CPU, mpi_node_identity))
-            self._append_device_endpoint_topology(entries, mpi_path, rank.spec.device_ids, mpi_node_identity)
+            entries.append(
+                _EndpointTopologyEntry(
+                    mpi_path, HOST_CPU, mpi_node_identity, requires_mpi_session=True, mpi_session=session
+                )
+            )
+            self._append_device_endpoint_topology(
+                entries,
+                mpi_path,
+                rank.spec.device_ids,
+                mpi_node_identity,
+                requires_mpi_session=True,
+                mpi_session=session,
+            )
         for spec in worker._mpi_direct_worker_specs:
             mpi_node_identity = _normalize_node_identity(spec.host)
             mpi_path = _format_worker_path(3, parent_path=path, index=int(spec.worker_id))
@@ -7731,13 +7982,23 @@ class Worker:
         node_identity: str,
         *,
         local_worker: Worker | None = None,
+        requires_mpi_session: bool = False,
+        mpi_session: MpiSessionSnapshot | None = None,
     ) -> None:
         identities = None if local_worker is None else local_worker._ensure_local_device_endpoint_identities()
         for child_index, _device_id in enumerate(tuple(device_ids)):
             device_path = _format_worker_path(2, parent_path=path_to_l3, index=child_index)
             if identities is None:
-                entries.append(_EndpointTopologyEntry(device_path, DEVICE_AICORE, node_identity))
-                entries.append(_EndpointTopologyEntry(device_path, DEVICE_AICPU, node_identity))
+                for deployment in (DEVICE_AICORE, DEVICE_AICPU):
+                    entries.append(
+                        _EndpointTopologyEntry(
+                            device_path,
+                            deployment,
+                            node_identity,
+                            requires_mpi_session=requires_mpi_session,
+                            mpi_session=mpi_session,
+                        )
+                    )
                 continue
             aicore_nonce, aicore_allocator = identities[(child_index, DEVICE_AICORE)]
             aicpu_nonce, aicpu_allocator = identities[(child_index, DEVICE_AICPU)]
@@ -7776,13 +8037,132 @@ class Worker:
 
     def _get_endpoint_registry(self) -> EndpointRegistry:
         self._require_ready_for_region_planning("_get_endpoint_registry")
-        registry = self._endpoint_registry
-        if registry is None:
-            registry = EndpointRegistry.from_snapshot(
-                self._endpoint_topology_snapshot(), registry_epoch=self._endpoint_registry_epoch
+        for _attempt in range(3):
+            with self._hierarchical_start_cv:
+                registry = self._endpoint_registry
+                if (
+                    registry is not None
+                    and registry.session_instance_id == self._owner_instance_id
+                    and registry.registry_epoch == self._endpoint_registry_epoch
+                ):
+                    return registry
+                epoch = self._endpoint_registry_epoch
+                snapshot = self._endpoint_topology_snapshot()
+            registry = EndpointRegistry.from_snapshot(snapshot, registry_epoch=epoch)
+            with self._hierarchical_start_cv:
+                if snapshot.session_instance_id == self._owner_instance_id and epoch == self._endpoint_registry_epoch:
+                    if self._endpoint_registry is None:
+                        self._endpoint_registry = registry
+                    return self._endpoint_registry
+        raise EndpointResolveError(
+            EndpointResolveReason.REGISTRY_MISMATCH,
+            "endpoint registry changed repeatedly during construction; retry the operation",
+        )
+
+    def _validate_endpoint_registry_snapshot(
+        self, registry: EndpointRegistry, members: Sequence[EndpointRecord]
+    ) -> None:
+        with self._hierarchical_start_cv:
+            if (
+                registry.session_instance_id != self._owner_instance_id
+                or registry.registry_epoch != self._endpoint_registry_epoch
+            ):
+                raise EndpointResolveError(
+                    EndpointResolveReason.REGISTRY_MISMATCH,
+                    "endpoint registry no longer belongs to the current owner/version",
+                )
+            if self._mpi_session_failure is not None:
+                raise EndpointResolveError(
+                    EndpointResolveReason.MPI_SESSION_UNAVAILABLE, "MPI owner has observed a session failure"
+                ) from self._mpi_session_failure
+            registry.require_mpi_sessions_active(members)
+            root_path = _format_worker_path(int(self.level))
+            groups = {group.group_id: group for group in self._mpi_l3_groups}
+            for member in members:
+                session = registry.mpi_session_for_endpoint(member)
+                if session is None:
+                    continue
+                binding = session.binding
+                group = groups.get(binding.group_id)
+                rank = self._mpi_rank_by_worker_id.get(binding.worker_id)
+                if (
+                    binding.owner_path != root_path
+                    or group is None
+                    or rank is None
+                    or not any(current is rank for current in group.ranks)
+                    or binding
+                    != MpiSessionBinding(root_path, rank.group_id, rank.rank, rank.worker_id, rank.session_id)
+                    or group.closing
+                    or group.state is not MpiSessionState.ACTIVE
+                ):
+                    raise EndpointResolveError(
+                        EndpointResolveReason.MPI_SESSION_UNAVAILABLE,
+                        f"MPI binding for {member.path} is not a current ACTIVE session",
+                        (member.path,),
+                    )
+
+    @staticmethod
+    def _observe_mpi_group_failure(
+        group: _MpiL3GroupRuntime, process: subprocess.Popen[Any] | None
+    ) -> tuple[_MpiSessionFailureKind, BaseException] | None:
+        from .mpi_group_mailbox import MailboxGroupState  # noqa: PLC0415
+
+        try:
+            if process is None:
+                raise RuntimeError("ACTIVE MPI group has no owned process")
+            returncode = process.poll()
+        except Exception as exc:
+            return _MpiSessionFailureKind.MONITOR_FAILURE, exc
+        if returncode is not None:
+            return _MpiSessionFailureKind.PROCESS_EXIT, RuntimeError(f"MPI group exited with status {returncode}")
+        if not group.mailbox_lock.acquire(blocking=False):
+            raise EndpointResolveError(
+                EndpointResolveReason.MPI_SESSION_UNAVAILABLE,
+                "MPI mailbox is in use; current availability could not be observed; retry the operation",
             )
-            self._endpoint_registry = registry
-        return registry
+        try:
+            mailbox = group.mailbox
+            if mailbox is None:
+                raise RuntimeError("ACTIVE MPI group mailbox was detached")
+            if mailbox.group_state is not MailboxGroupState.READY:
+                raise RuntimeError(f"MPI group channel is unavailable: {mailbox.terminal_reason()}")
+            if mailbox.world_size != len(group.ranks):
+                raise RuntimeError("MPI group mailbox membership does not match the registered group")
+        except Exception as exc:
+            return _MpiSessionFailureKind.CHANNEL_TERMINAL, exc
+        finally:
+            group.mailbox_lock.release()
+        return None
+
+    def _refresh_mpi_session_observations(self, registry: EndpointRegistry, members: Sequence[EndpointRecord]) -> None:
+        root_path = _format_worker_path(int(self.level))
+        selected = {
+            session.binding.group_id
+            for member in members
+            if (session := registry.mpi_session_for_endpoint(member)) is not None
+            and session.binding.owner_path == root_path
+        }
+        with self._hierarchical_start_cv:
+            observations = tuple(
+                (group, group.process, tuple(rank.session_id for rank in group.ranks))
+                for group in self._mpi_l3_groups
+                if group.group_id in selected and group.state is MpiSessionState.ACTIVE and not group.closing
+            )
+        for group, process, session_ids in observations:
+            failure = self._observe_mpi_group_failure(group, process)
+            if failure is not None:
+                kind, cause = failure
+                self._expire_mpi_group_session(group, process, session_ids, cause, kind=kind)
+
+    def _plan_resolved_region(
+        self, registry: EndpointRegistry, resolved: ResolvedRegionSpec, layout: RegionLayoutSpec
+    ) -> BackendPlan | UnsupportedRegionPlan:
+        self._validate_endpoint_registry_snapshot(registry, resolved.members)
+        self._refresh_mpi_session_observations(registry, resolved.members)
+        self._validate_endpoint_registry_snapshot(registry, resolved.members)
+        plan = BackendResolver(registry, self._get_region_access_service()).plan(resolved, layout)
+        self._validate_endpoint_registry_snapshot(registry, resolved.members)
+        return plan
 
     def _get_region_access_service(self) -> RegionAccessService:
         service = self._region_access_service
@@ -7803,8 +8183,7 @@ class Worker:
         with self._operation_lease("_plan_region"):
             registry = self._get_endpoint_registry()
             resolved = registry.resolve_region_spec(members, topology)
-            resolver = BackendResolver(registry, self._get_region_access_service())
-            return resolver.plan(resolved, layout_summary)
+            return self._plan_resolved_region(registry, resolved, layout_summary)
 
     def _materialize_region_instance(
         self, members, topology: SingleOwner, layout_summary: RegionLayoutSpec
@@ -7816,8 +8195,7 @@ class Worker:
         ):
             registry = self._get_endpoint_registry()
             resolved = registry.resolve_region_spec(members, topology)
-            resolver = BackendResolver(registry, self._get_region_access_service())
-            plan = resolver.plan(resolved, layout_summary)
+            plan = self._plan_resolved_region(registry, resolved, layout_summary)
             return materialize_region_instance(
                 MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout_summary)
             )
@@ -7834,7 +8212,7 @@ class Worker:
         topology = SingleOwner(provider=provider)
         registry = self._get_endpoint_registry()
         resolved = registry.resolve_region_spec(members, topology)
-        plan = BackendResolver(registry, self._get_region_access_service()).plan(resolved, layout)
+        plan = self._plan_resolved_region(registry, resolved, layout)
         ctx = MaterializationContext(worker=self, registry=registry, plan=plan, layout=layout)
         validate_single_owner_region_shape(ctx)
         return ctx
@@ -8973,6 +9351,9 @@ class Worker:
             # single lifecycle state so no thread ever observes a started
             # hierarchy while the worker is not yet READY.
             with self._hierarchical_start_cv:
+                self._require_no_mpi_session_failure_locked("init")
+                if any(group.state is not MpiSessionState.ACTIVE for group in self._mpi_l3_groups):
+                    raise RuntimeError("MPI groups must be ACTIVE before the Worker publishes READY")
                 # Final root-deadline gate, in the same critical section as the
                 # commit: a thread descheduled between startup and here cannot
                 # publish READY past the single root startup deadline. Applied to
@@ -9596,7 +9977,7 @@ class Worker:
             dw.add_sub_worker(_mailbox_addr(shm), _mailbox_extent(shm), pid)
 
         # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
-        dw.init()
+        self._initialize_native_worker(dw)
 
         self._orch = Orchestrator(dw.get_orchestrator(), self)
 
@@ -9606,6 +9987,13 @@ class Worker:
         # chip child before that child published INIT_READY (see
         # _chip_process_loop), and the runtime arena was prewarmed there too — so
         # there is no post-scheduler control_prepare on the startup path.
+
+    def _initialize_native_worker(self, worker: _Worker) -> None:
+        with self._hierarchical_start_cv:
+            self._mpi_native_init_incomplete = bool(self._mpi_l3_groups)
+        worker.init()
+        with self._hierarchical_start_cv:
+            self._mpi_native_init_incomplete = False
 
     def _await_children_ready(self, shms, pids, kind: str, deadline: float) -> None:
         """Block until every forked child reports INIT_READY, or abort.
@@ -9808,20 +10196,23 @@ class Worker:
             "killed": list(killed),
         }
 
-        # Release the pre-fork _Worker so a retry / close() won't double-free
-        # the HeapRing mmap the C++ ctor grabbed.
-        self._worker = None
-        self._orch = None
+        # Attached MPI mailboxes pin their native owner and its local mappings
+        # until native close acknowledges that all attachments are released.
+        retain_native = any(group.native_attached for group in self._mpi_l3_groups)
+        if not retain_native:
+            self._worker = None
+            self._orch = None
 
         # Signal delivery is not reclamation. Use the same pid/shm pairing and
         # journal handoff as normal close; a SIGKILL survivor remains retryable.
-        try:
-            self._reclaim_child_groups(deadline)
-        except BaseException as exc:  # noqa: BLE001 -- rollback remains best-effort
-            sys.stderr.write(
-                f"[worker pid={os.getpid()}] WARN: startup child reclaim failed (continuing best-effort): {exc}\n"
-            )
-            sys.stderr.flush()
+        if not retain_native:
+            try:
+                self._reclaim_child_groups(deadline)
+            except BaseException as exc:  # noqa: BLE001 -- rollback remains best-effort
+                sys.stderr.write(
+                    f"[worker pid={os.getpid()}] WARN: startup child reclaim failed (continuing best-effort): {exc}\n"
+                )
+                sys.stderr.flush()
         self._startup_group_leader_pids.clear()
 
     def _cleanup_partial_init(self) -> None:
@@ -10768,7 +11159,6 @@ class Worker:
         """
 
         registry = self._get_endpoint_registry()
-        resolver = BackendResolver(registry, self._get_region_access_service())
         root_path = _format_worker_path(int(self.level))
         attachments: list[GlobalDomainAttachment] = []
         for receiver_node_id in sorted({int(node) for node in receiver_nodes}):
@@ -10795,7 +11185,8 @@ class Worker:
                     (provider_selector, consumer_selector),
                     SingleOwner(provider=provider_selector),
                 )
-                plan = resolver.plan(
+                plan = self._plan_resolved_region(
+                    registry,
                     resolved,
                     RegionLayoutSpec(payload_bytes=int(window_size), counter_bytes=0),
                 )
@@ -12950,6 +13341,7 @@ class Worker:
             # and the poison may have been published by the cleanup this call
             # just waited on — the check at lease time cannot have seen it.
             self._require_no_ordered_cleanup_failure("submit")
+            self._require_no_mpi_session_failure("submit")
             return self._submit_l3_locked(callable, args, cfg)
 
     def _record_unreclaimable(self, message: str, cause: BaseException | None = None) -> RuntimeError:
@@ -13105,10 +13497,12 @@ class Worker:
         """
         held = _held_control_reservations()
         if id(self) in held:
+            self._require_no_mpi_session_failure(api)
             yield
             return
         with self._submit_mu.shared():
             with self._hierarchical_start_cv:
+                self._require_no_mpi_session_failure_locked(api)
                 if self._ordered_cleanup_error is not None:
                     raise RuntimeError(
                         f"{api}: a prior run's ordered cleanup failed, so this worker's device state is "
@@ -13380,8 +13774,10 @@ class Worker:
         scope_open = False
         self._building_run_resources = resources
         try:
+            self._require_no_mpi_session_failure("submit")
             self._orch._scope_begin()
             scope_open = True
+            self._require_no_mpi_session_failure("submit")
             with _callback_run(run_id, self):
                 if _host_spans_active():
                     graph_start_ns = time.monotonic_ns()
@@ -13400,12 +13796,14 @@ class Worker:
                         )
                 else:
                     callable(self._orch, args, cfg)
+            self._require_no_mpi_session_failure("submit")
             if self._delegated_session_fatal is not None:
                 raise RuntimeError(
                     "Worker.submit: delegated-region session is fatal and no further work is admitted"
                 ) from self._delegated_session_fatal
             scope_open = False
             self._orch._scope_end()
+            self._require_no_mpi_session_failure("submit")
             self._orch._close_run_submission(run_id)
         except BaseException as e:
             try:
@@ -13703,7 +14101,14 @@ class Worker:
             self._has_native_tree()
             or bool(self._sub_pids or self._chip_pids or self._next_level_pids)
             or bool(self._sub_shms or self._chip_shms or self._next_level_shms)
-            or any(group.process is not None or group.ready_dir is not None for group in self._mpi_l3_groups)
+            or any(
+                group.process is not None
+                or group.ready_dir is not None
+                or group.mailbox is not None
+                or group.monitor_thread is not None
+                or group.native_attached
+                for group in self._mpi_l3_groups
+            )
             or bool(self._region_instance_registry._instances)
             or bool(self._live_domains)
             or bool(self._live_global_domains or self._failed_global_domain_releases)
@@ -13725,7 +14130,15 @@ class Worker:
         n_shms = len(self._sub_shms) + len(self._chip_shms) + len(self._next_level_shms)
         if n_shms:
             parts.append(f"{n_shms} child shm(s)")
-        n_mpi = sum(1 for group in self._mpi_l3_groups if group.process is not None or group.ready_dir is not None)
+        n_mpi = sum(
+            1
+            for group in self._mpi_l3_groups
+            if group.process is not None
+            or group.ready_dir is not None
+            or group.mailbox is not None
+            or group.monitor_thread is not None
+            or group.native_attached
+        )
         if n_mpi:
             parts.append(f"{n_mpi} mpirun group(s)")
         n_instances = len(self._region_instance_registry._instances)
@@ -14362,6 +14775,16 @@ class Worker:
                 if self._worker:
                     self._mark_mpirun_groups_closing(self._mpi_l3_groups)
                     self._worker.close()
+                    with self._hierarchical_start_cv:
+                        if self._mpi_native_init_incomplete and any(
+                            group.native_attached for group in self._mpi_l3_groups
+                        ):
+                            raise RuntimeError(
+                                "MPI attachment release is unproven after incomplete native init; "
+                                "retaining native owner and mappings"
+                            )
+                        for group in self._mpi_l3_groups:
+                            group.native_attached = False
                     self._worker = None
                     self._orch = None
 
@@ -14369,22 +14792,23 @@ class Worker:
             journal_err = self._cleanup_journal.drive({("native", "hierarchical Worker")})
             if journal_err is not None:
                 errors.append(journal_err)
-            # A failed native close must not strand the mpirun children: their
-            # reaping and mailbox unlink run before the error propagates.
+            # Process reaping is independent of native close. Mailbox mappings
+            # remain pinned until the native attachment is released.
             self._cleanup_journal.add_once("child", "MPI L3 groups", self._close_mpirun_groups)
             journal_err = self._cleanup_journal.drive({("child", "MPI L3 groups")})
             if journal_err is not None:
                 errors.append(journal_err)
             if errors and not startup_abort:
                 raise errors[0]
-            self._cleanup_journal.add_once(
-                "shm", "Worker-Chip orchestration mappings", self._close_worker_chip_orch_comm
-            )
-            journal_err = self._cleanup_journal.drive({("shm", "Worker-Chip orchestration mappings")})
-            if journal_err is not None:
-                errors.append(journal_err)
-                if not startup_abort:
-                    raise errors[0]
+            if not any(group.native_attached for group in self._mpi_l3_groups):
+                self._cleanup_journal.add_once(
+                    "shm", "Worker-Chip orchestration mappings", self._close_worker_chip_orch_comm
+                )
+                journal_err = self._cleanup_journal.drive({("shm", "Worker-Chip orchestration mappings")})
+                if journal_err is not None:
+                    errors.append(journal_err)
+                    if not startup_abort:
+                        raise errors[0]
             if startup_abort:
                 self._abort_hierarchical(deadline=deadline)
                 if not self._next_level_pids and not self._next_level_shms:

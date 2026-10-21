@@ -12,11 +12,13 @@ import dataclasses
 from typing import Any, cast
 
 import pytest
+import simpler.worker as worker_mod
 from simpler import comm_endpoints as ce
 from simpler.buffer import _RESOLVERS
 from simpler.buffer import BackendKind as BufferBackendKind
 from simpler.mpi_direct_topology import MpiDirectTopology
 from simpler.worker import RemoteWorkerSpec, Worker, _Lifecycle
+from test_mpi_l3_group import _FakeProcess, _mpi_worker, _ReadyMailbox
 
 FROZEN_ADAPTER_KIND_U32 = {
     None: 0,
@@ -580,6 +582,8 @@ def test_mpi_direct_registry_registers_rank_hosts_and_devices():
     assert registry.same_node(remote_a, remote_device)
     assert registry.same_node(remote_a, remote_b)
     assert not registry.same_node(root, remote_a)
+    assert all(registry.mpi_session_for_endpoint(record) is None for record in registry.records)
+    worker._validate_endpoint_registry_snapshot(registry, registry.records)
 
 
 def test_at_missing_path_reports_path_not_found():
@@ -927,3 +931,172 @@ def test_worker_region_planning_uses_lease_admission_and_close_invalidates_epoch
     assert worker._endpoint_registry_epoch == 1
     with pytest.raises(RuntimeError, match="READY"):
         worker._resolve_region_spec([ce.at("L3", ce.HOST_CPU)], ce.SingleOwner())
+
+
+@pytest.fixture
+def mpi_registry_worker():
+    worker = _mpi_worker()
+    group = worker._mpi_l3_groups[0]
+    group.state = ce.MpiSessionState.ACTIVE
+    group.process = cast(Any, _FakeProcess())
+    group.mailbox = _ReadyMailbox(world_size=len(group.ranks))
+    _ready(worker)
+    try:
+        yield worker
+    finally:
+        group.process = None
+        worker.close()
+
+
+def test_mpi_worker_registry_projects_rank_bindings_without_observing_channels(mpi_registry_worker, monkeypatch):
+    worker = mpi_registry_worker
+    group = worker._mpi_l3_groups[0]
+
+    def unexpected_poll():
+        pytest.fail("registry construction must not observe channels")
+
+    monkeypatch.setattr(group.process, "poll", unexpected_poll)
+    registry = worker._get_endpoint_registry()
+    for rank in group.ranks:
+        records = tuple(record for record in registry.records if record.path.startswith(f"L4/L3[{rank.worker_id}]"))
+        assert {record.deployment for record in records} == {ce.HOST_CPU, ce.DEVICE_AICPU, ce.DEVICE_AICORE}
+        sessions = tuple(registry.mpi_session_for_endpoint(record) for record in records)
+        assert len(records) == 3
+        assert all(session == sessions[0] for session in sessions)
+        assert sessions[0] is not None
+        assert sessions[0].binding == ce.MpiSessionBinding(
+            "L4", group.group_id, rank.rank, rank.worker_id, rank.session_id
+        )
+        assert sessions[0].state is ce.MpiSessionState.ACTIVE
+    worker._validate_endpoint_registry_snapshot(registry, registry.records)
+    assert worker._get_endpoint_registry() is registry
+    session = registry.mpi_session_for_endpoint(registry.records[1])
+    assert session is not None
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        cast(Any, session.binding).session_id = 909
+    with pytest.raises(TypeError):
+        cast(Any, registry._mpi_sessions)[1] = session
+    forged = dataclasses.replace(registry.records[1], path="L4/L3[99]")
+    with pytest.raises(ce.EndpointResolveError) as failure:
+        registry.mpi_session_for_endpoint(forged)
+    assert failure.value.reason is ce.EndpointResolveReason.REGISTRY_MISMATCH
+    snapshot = worker._endpoint_topology_snapshot()
+    entries = tuple(
+        dataclasses.replace(entry, mpi_session=None) if entry.requires_mpi_session else entry
+        for entry in snapshot.entries
+    )
+    with pytest.raises(ValueError, match="MPI"):
+        ce.EndpointRegistry.from_snapshot(
+            dataclasses.replace(snapshot, entries=entries), registry_epoch=registry.registry_epoch
+        )
+
+
+def test_mpi_failure_rebuild_cannot_authorize_terminal_members(mpi_registry_worker):
+    worker = mpi_registry_worker
+    group = worker._mpi_l3_groups[0]
+    old = worker._get_endpoint_registry()
+    worker._expire_mpi_group_session(
+        group,
+        group.process,
+        tuple(rank.session_id for rank in group.ranks),
+        RuntimeError("observed exit"),
+        kind=worker_mod._MpiSessionFailureKind.PROCESS_EXIT,
+    )
+    with pytest.raises(ce.EndpointResolveError) as stale:
+        worker._validate_endpoint_registry_snapshot(old, old.records)
+    assert stale.value.reason is ce.EndpointResolveReason.REGISTRY_MISMATCH
+    current = worker._get_endpoint_registry()
+    session = current.mpi_session_for_endpoint(current.records[1])
+    assert session is not None and session.state is ce.MpiSessionState.TERMINAL
+    resolver = ce.BackendResolver(current, ce.StaticRegionAccessService({}))
+    resolved = current.resolve_region_spec([ce.at("L4/L3[0]", ce.HOST_CPU)], ce.SingleOwner())
+    with pytest.raises(ce.EndpointResolveError) as planning_failure:
+        resolver.plan(resolved, ce.RegionLayoutSpec(payload_bytes=64, counter_bytes=0))
+    assert planning_failure.value.reason is ce.EndpointResolveReason.MPI_SESSION_UNAVAILABLE
+    with pytest.raises(ce.EndpointResolveError) as unavailable:
+        worker._validate_endpoint_registry_snapshot(current, current.records)
+    assert unavailable.value.reason is ce.EndpointResolveReason.MPI_SESSION_UNAVAILABLE
+
+
+@pytest.mark.parametrize("continuous", [False, True])
+def test_registry_build_discards_stale_result_and_has_bounded_retries(mpi_registry_worker, monkeypatch, continuous):
+    worker = mpi_registry_worker
+    build = ce.EndpointRegistry.from_snapshot
+    candidates = []
+
+    def invalidated_build(cls, snapshot, *, registry_epoch):
+        candidate = build(snapshot, registry_epoch=registry_epoch)
+        candidates.append(candidate)
+        assert worker._hierarchical_start_mu.acquire(blocking=False), "registry construction holds the lifecycle lock"
+        try:
+            if continuous or len(candidates) == 1:
+                worker._invalidate_endpoint_registry()
+        finally:
+            worker._hierarchical_start_mu.release()
+        return candidate
+
+    monkeypatch.setattr(ce.EndpointRegistry, "from_snapshot", classmethod(invalidated_build))
+    if continuous:
+        with pytest.raises(ce.EndpointResolveError) as failure:
+            worker._get_endpoint_registry()
+        assert failure.value.reason is ce.EndpointResolveReason.REGISTRY_MISMATCH
+        assert len(candidates) == 3
+        assert worker._endpoint_registry is None
+    else:
+        registry = worker._get_endpoint_registry()
+        assert len(candidates) == 2
+        assert registry is candidates[-1] and registry is not candidates[0]
+        assert registry.registry_epoch == worker._endpoint_registry_epoch
+
+
+def test_nested_mpi_configuration_is_enumerable_but_cannot_authorize_plans():
+    child = _mpi_worker()
+    other = _mpi_worker()
+    parent = Worker(level=5, num_sub_workers=0)
+    parent.add_worker(child)
+    parent.add_worker(other)
+    child._mpi_l3_groups[0].state = ce.MpiSessionState.ACTIVE
+    _ready(parent)
+    try:
+        registry = parent._get_endpoint_registry()
+        resolved = parent._resolve_region_spec([ce.under("L5", ce.DEVICE_AICORE)], ce.SingleOwner())
+        assert resolved.members
+        owners = set()
+        for member in resolved.members:
+            session = registry.mpi_session_for_endpoint(member)
+            assert session is not None and session.state is ce.MpiSessionState.UNOBSERVED
+            owners.add(session.binding.owner_path)
+        assert owners == {"L5/L4[0]", "L5/L4[1]"}
+        with pytest.raises(ce.EndpointResolveError) as failure:
+            _plan(parent, [ce.under("L5", ce.DEVICE_AICORE)])
+        assert failure.value.reason is ce.EndpointResolveReason.MPI_SESSION_UNAVAILABLE
+        assert isinstance(_plan(parent, [ce.at("L5", ce.HOST_CPU)]), ce.BackendPlan)
+    finally:
+        parent.close()
+        child.close()
+        other.close()
+
+
+@pytest.mark.parametrize("observation", ["process_exit", "channel_terminal", "planning_race"])
+def test_mpi_planning_observes_failure_and_rejects_the_old_registry(mpi_registry_worker, monkeypatch, observation):
+    worker = mpi_registry_worker
+    group = worker._mpi_l3_groups[0]
+    registry = worker._get_endpoint_registry()
+    if observation == "process_exit":
+        group.process.returncode = 0
+    elif observation == "channel_terminal":
+        group.mailbox.mark_terminal("channel failed")
+    else:
+
+        def fail_during_planning(*_args):
+            group.process.returncode = 17
+            worker._refresh_mpi_session_observations(registry, registry.records)
+            return object()
+
+        monkeypatch.setattr(ce.BackendResolver, "plan", fail_during_planning)
+    with pytest.raises(ce.EndpointResolveError) as failure:
+        _plan(worker, [ce.at("L4/L3[0]", ce.HOST_CPU)])
+    assert failure.value.reason is ce.EndpointResolveReason.REGISTRY_MISMATCH
+    assert group.state is ce.MpiSessionState.TERMINAL
+    assert worker._endpoint_registry_epoch == registry.registry_epoch + 1
+    assert worker._active_ops == 0

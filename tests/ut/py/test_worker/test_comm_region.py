@@ -1872,6 +1872,8 @@ def test_shape_validation_rejects_foreign_registry_context():
         validate_single_owner_region_shape(dataclasses.replace(owner, worker=foreign_worker))
 
     assert excinfo.value.reason is RefusalReason.REGISTRY_MISMATCH
+    assert isinstance(excinfo.value.__cause__, ce.EndpointResolveError)
+    assert excinfo.value.__cause__.reason is ce.EndpointResolveReason.REGISTRY_MISMATCH
 
 
 def test_shape_validation_does_not_translate_worker_readiness_errors():
@@ -2907,6 +2909,58 @@ def test_epoch_change_after_allocated_latches_fatal_without_import():
     assert import_calls == []
     assert releases == []
     assert ctx.worker._delegated_session_fatal is excinfo.value
+
+
+@pytest.mark.parametrize("boundary", ["before_dispatch", "allocated_reply"])
+def test_mpi_failure_at_materialization_boundary_does_not_import(monkeypatch, boundary):
+    import simpler.comm_region as region_mod
+
+    ctx = _accepted_context()
+    worker = ctx.worker
+    dispatches = []
+    import_calls = []
+    _install_delegated_dispatch(worker, dispatches, import_calls=import_calls)
+    cause = RuntimeError("observed MPI failure")
+
+    def fail():
+        with worker._hierarchical_start_cv:
+            worker._mpi_session_failure = cause
+
+    if boundary == "before_dispatch":
+        encode = region_mod.encode_request
+
+        def fail_after_encode(*args, **kwargs):
+            request = encode(*args, **kwargs)
+            fail()
+            return request
+
+        monkeypatch.setattr(region_mod, "encode_request", fail_after_encode)
+    else:
+        dispatch = worker._dispatch_delegated_allocate
+
+        def fail_after_allocate(staged):
+            reply = dispatch(staged)
+            fail()
+            return reply
+
+        monkeypatch.setattr(worker, "_dispatch_delegated_allocate", fail_after_allocate)
+    try:
+        with pytest.raises(MaterializationRefusal) as failure:
+            materialize_region_instance(ctx)
+        assert failure.value.reason is RefusalReason.MPI_SESSION_UNAVAILABLE
+        resolution_error = failure.value.__cause__
+        assert isinstance(resolution_error, ce.EndpointResolveError)
+        assert resolution_error.__cause__ is cause
+        assert len(dispatches) == (boundary == "allocated_reply")
+        assert not import_calls
+        assert not _tracked(worker)
+        if boundary == "allocated_reply":
+            assert worker._delegated_session_fatal is failure.value
+        else:
+            assert worker._delegated_session_fatal is None
+    finally:
+        worker._worker = None
+        worker.close()
 
 
 def test_typed_attachment_keeps_provider_identity(region_worker):

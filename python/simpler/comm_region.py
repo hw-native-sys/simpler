@@ -43,6 +43,7 @@ from .comm_endpoints import (
     EndpointRecord,
     EndpointRegistry,
     EndpointResolveError,
+    EndpointResolveReason,
     MemberAttachmentPlan,
     RegionLayoutSpec,
     RegionPartPlan,
@@ -325,6 +326,7 @@ class RefusalReason(str, Enum):
     UNSUPPORTED_BACKEND_KIND = "UNSUPPORTED_BACKEND_KIND"
     UNSUPPORTED_ATTACHMENT = "UNSUPPORTED_ATTACHMENT"
     REGISTRY_MISMATCH = "REGISTRY_MISMATCH"
+    MPI_SESSION_UNAVAILABLE = "MPI_SESSION_UNAVAILABLE"
 
 
 class MaterializationError(RuntimeError):
@@ -619,6 +621,7 @@ class RegionInstance:
     def payload_write(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()
         self._worker._require_region_control_context("region_instance.payload_write")
+        self._worker._require_no_mpi_session_failure("region_instance.payload_write")
         payload_part = self._payload_part
         assert payload_part is not None
         payload_part.write(offset, host_buffer, nbytes)
@@ -626,6 +629,7 @@ class RegionInstance:
     def payload_read(self, offset: int, host_buffer: Any, nbytes: int | None = None) -> None:
         self._ensure_live()
         self._worker._require_region_control_context("region_instance.payload_read")
+        self._worker._require_no_mpi_session_failure("region_instance.payload_read")
         payload_part = self._payload_part
         assert payload_part is not None
         payload_part.read(offset, host_buffer, nbytes)
@@ -633,6 +637,7 @@ class RegionInstance:
     def counter(self, offset: int):
         self._ensure_live()
         self._worker._require_region_control_context("region_instance.counter")
+        self._worker._require_no_mpi_session_failure("region_instance.counter")
         counter_part = self._counter_part
         assert counter_part is not None
         return counter_part.counter(offset)
@@ -1038,6 +1043,7 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
                 )
             request = _delegated_allocate_request(shape, ctx.plan, ctx.layout, session_instance_id, transaction_id)
             staged = encode_request(request, staged_capacity=max(ALLOCATE_REQUEST_HARD_CEILING, ALLOCATE_REPLY_BYTES))
+            _validate_registry_matches_worker(ctx, observe=True)
             raw_reply = dispatcher(memoryview(staged))
             if isinstance(raw_reply, (bytes, bytearray, memoryview)):
                 reply_payload = raw_reply
@@ -1049,7 +1055,7 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
             try:
                 if outcome.result is None or outcome.payload_view is None or outcome.counter_view is None:
                     raise MaterializationError("delegated ALLOCATED reply is missing result or local views")
-                _validate_registry_matches_worker(ctx)
+                _validate_registry_matches_worker(ctx, observe=True)
                 validate_committed_region_allocation(
                     ctx.plan,
                     spec,
@@ -1104,6 +1110,7 @@ def materialize_region_instance(ctx: MaterializationContext) -> RegionInstance: 
                     RegionPartKind.COUNTER, counter_desc, counter_lease
                 )
                 counter_lease = None
+                _validate_registry_matches_worker(ctx)
             except BaseException as primary:
                 cleanup_errors: list[BaseException] = []
                 if counter_lease is not None:
@@ -1325,14 +1332,27 @@ def _select_host_vmm_copy_access(
     return HostVmmCopyAccess.from_mapping(mapping)
 
 
-def _validate_registry_matches_worker(ctx: MaterializationContext) -> None:
-    worker_instance_id = getattr(ctx.worker, "_owner_instance_id", None)
-    worker_epoch = getattr(ctx.worker, "_endpoint_registry_epoch", None)
-    if worker_instance_id != ctx.registry.session_instance_id or worker_epoch != ctx.registry.registry_epoch:
-        raise MaterializationRefusal(
-            RefusalReason.REGISTRY_MISMATCH,
-            "Region materialization requires a registry from the current worker endpoint epoch",
+def _validate_registry_matches_worker(ctx: MaterializationContext, *, observe: bool = False) -> None:
+    try:
+        ctx.worker._validate_endpoint_registry_snapshot(ctx.registry, ())
+        members = (
+            tuple(_record_for(ctx, member) for member in ctx.plan.ordered_members)
+            if isinstance(ctx.plan, BackendPlan)
+            else ()
         )
+        ctx.worker._validate_endpoint_registry_snapshot(ctx.registry, members)
+        if observe:
+            ctx.worker._refresh_mpi_session_observations(ctx.registry, members)
+            ctx.worker._validate_endpoint_registry_snapshot(ctx.registry, members)
+    except EndpointResolveError as exc:
+        reasons = {
+            EndpointResolveReason.REGISTRY_MISMATCH: RefusalReason.REGISTRY_MISMATCH,
+            EndpointResolveReason.MPI_SESSION_UNAVAILABLE: RefusalReason.MPI_SESSION_UNAVAILABLE,
+        }
+        reason = reasons.get(exc.reason)
+        if reason is None:
+            raise
+        raise MaterializationRefusal(reason, str(exc)) from exc
 
 
 def _validate_part(part: RegionPartPlan, provider: EndpointRecord, consumer: EndpointRecord) -> None:
