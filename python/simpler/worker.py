@@ -267,6 +267,8 @@ from .global_comm_domain import (
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
+from .startup_artifacts import StartupArtifactSpec
+from .startup_preparation import NodeStartupHook, normalize_startup_artifacts, normalize_startup_hooks
 from .task_interface import (
     MAILBOX_ARGS_CAPACITY,
     MAILBOX_ERROR_MSG_SIZE,
@@ -1090,6 +1092,8 @@ class MpiL3GroupSpec:
     mpirun_path: str = "mpirun"
     mpirun_args: tuple[str, ...] = ()
     python_executable: str = field(default_factory=lambda: sys.executable)
+    startup_artifacts: tuple[StartupArtifactSpec, ...] = ()
+    startup_hooks_by_rank: tuple[NodeStartupHook | None, ...] = ()
 
     def __post_init__(self) -> None:  # noqa: PLR0912 -- one place validates the public mpirun rank contract
         hosts = tuple(str(host) for host in self.hosts)
@@ -1174,6 +1178,10 @@ class MpiL3GroupSpec:
         object.__setattr__(self, "mpirun_path", str(self.mpirun_path))
         object.__setattr__(self, "mpirun_args", tuple(str(arg) for arg in self.mpirun_args))
         object.__setattr__(self, "python_executable", str(self.python_executable))
+        object.__setattr__(self, "startup_artifacts", normalize_startup_artifacts(self.startup_artifacts))
+        object.__setattr__(
+            self, "startup_hooks_by_rank", normalize_startup_hooks(self.startup_hooks_by_rank, len(hosts))
+        )
 
 
 @dataclass(frozen=True)
@@ -1196,6 +1204,7 @@ class _MpiL3RankSpec:
     transport: str
     comm_profile: str
     global_device_ranks: tuple[int, ...]
+    startup_hook: NodeStartupHook | None = None
 
 
 @dataclass(frozen=True)
@@ -5941,6 +5950,7 @@ class Worker:
                     transport=spec.transport,
                     comm_profile=spec.comm_profile,
                     global_device_ranks=spec.global_device_ranks_by_rank[rank],
+                    startup_hook=spec.startup_hooks_by_rank[rank],
                 )
                 runtime = _MpiL3RankRuntime(
                     group_id=group_id,
@@ -6365,6 +6375,7 @@ class Worker:
             "remote_task_dispatcher": self._remote_dispatcher_entries_for_worker(rank.worker_id),
             "inner_l3_worker": self._inner_registry_entries_for_spec(spec),
             "feature_flags": ["mpi-group-mailbox-v1"],
+            "startup_hook": spec.startup_hook.to_manifest() if spec.startup_hook is not None else None,
         }
 
     def _open_remote_session(
@@ -6560,6 +6571,7 @@ class Worker:
                 "worker_ids": [rank.worker_id for rank in group.ranks],
                 "mailbox": mailbox.manifest(),
                 "rank_manifests": rank_manifests,
+                "startup_artifacts": [artifact.to_manifest() for artifact in group.spec.startup_artifacts],
             }
             with open(manifest_path, "w", encoding="utf-8") as f:
                 json.dump(group_manifest, f, sort_keys=True)

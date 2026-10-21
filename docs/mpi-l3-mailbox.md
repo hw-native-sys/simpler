@@ -26,8 +26,12 @@ existing command and health lanes.
 1. L4 creates the mailbox and writes its name, protocol version, size, and
    world size into the group manifest.
 2. L4 starts `mpirun` as a new process group and monitors that direct child.
-3. Each rank creates and initializes its own L3 `Worker`.
-4. All ranks complete a readiness `allgather`.
+3. Rank 0 reads and verifies startup archives and broadcasts their bytes.
+   Each rank installs and activates those artifacts, installs the dispatcher
+   and local CHIP registry, runs its optional preparation hook, and initializes
+   its own L3 `Worker` and command processor.
+4. All ranks exchange status after each of those four startup stages. A failed
+   stage prevents every rank from entering the following stage.
 5. Rank 0 reopens the mailbox by name and publishes `READY`. Other ranks never
    map it.
 6. L4 attaches every stable MPI worker id to the same
@@ -39,6 +43,76 @@ existing command and health lanes.
 If startup, a collective, the mailbox, or `mpirun` fails, the group becomes
 terminal. Runtime timeout also kills the complete `mpirun` process group.
 There is no TCP fallback.
+
+### Startup artifacts and node preparation
+
+`MpiL3GroupSpec.startup_artifacts` accepts a tuple of
+`simpler.startup_artifacts.StartupArtifactSpec` objects. Each descriptor names
+a parent-local `.tar.gz` archive, its SHA-256 digest, and an import namespace.
+Archives contain Python source under that namespace; for example, `entry.py`
+inside an archive bound to `job_bundle` becomes `job_bundle.entry`.
+Use `tarfile.USTAR_FORMAT` when producing archives. Only rank 0 opens the archive
+paths. Other ranks receive verified bytes and select their own cache using
+`SIMPLER_STARTUP_ARTIFACT_CACHE`, or `~/.cache/simpler/startup_artifacts` by default.
+
+`startup_hooks_by_rank` accepts one optional
+`simpler.startup_preparation.NodeStartupHook` per rank. Its default supplies no
+hook on any rank. Hooks use ordinary `module:qualname` imports, including modules
+from startup artifacts, and accept a JSON object of parameters containing only
+finite values. Configuration snapshots those parameters defensively.
+
+```python
+import hashlib
+from pathlib import Path
+
+from simpler.startup_artifacts import StartupArtifactSpec
+from simpler.startup_preparation import NodeStartupHook
+from simpler.worker import MpiL3GroupSpec
+
+archive = Path("generated/job_bundle.tar.gz")
+artifact = StartupArtifactSpec(
+    archive,
+    hashlib.sha256(archive.read_bytes()).hexdigest(),
+    "job_bundle",
+)
+spec = MpiL3GroupSpec(
+    hosts=("node-a", "node-b"),
+    platform="a2a3sim",
+    device_ids_by_rank=((0,), (0,)),
+    startup_artifacts=(artifact,),
+    startup_hooks_by_rank=(
+        NodeStartupHook("job_bundle.entry:prepare", {"role": "left"}),
+        NodeStartupHook("job_bundle.entry:prepare", {"role": "right"}),
+    ),
+)
+```
+
+Each hook receives a `NodeStartupContext` with `rank`, `artifact_roots`
+(artifact digest to local `Path`), `inner_worker`, `chip_handles` (hex digest to
+the existing local `CallableHandle`), and its `parameters`. Hooks run on the main
+dispatcher thread after local registration and before `inner_worker.init()`.
+They can bind module state that the worker's children inherit when forked.
+CHIP callables continue to travel in the existing inner registry; startup
+artifacts introduce no second CHIP payload or metadata format.
+
+A hook returns `None` or an object with `close()`. The session keeps that object
+alive until the command processor has drained and the inner worker has closed,
+then closes it, including during failed startup. Cleanup continues after an
+individual cleanup error and preserves the original startup failure.
+If the command processor remains alive after its bounded drain wait, the rank
+exits with status 124 while retaining its worker and hook state until process
+exit. Registry, hook, and initialization errors include the supplied artifact
+digests alongside the failing rank and stage.
+
+Manifest loading, artifact activation, registries, preparation, and inner
+initialization share one local absolute deadline. Payload-read and broadcast time
+consume that budget. Until rank 0 has read the JSON budget, the parent's launch
+deadline remains the backstop. A stalled hook or collective causes a watchdog to
+exit the rank with status 124 without calling MPI from the watchdog thread. The
+MPI launcher and parent own whole-job teardown after that fail-stop exit; wedged
+user code cannot receive cooperative cleanup. Ordinary stage errors use the status
+exchange and ordered cleanup instead. Mailbox `READY` requires all stages to
+succeed on every rank.
 
 ## Envelope and state
 
@@ -140,8 +214,12 @@ protocol keeps number 18 for committed-device-memory control.
 
 ## Threading
 
-Only the main dispatcher thread calls MPI. The existing command processor runs
-on a rank-local thread over an in-memory, socket-shaped queue. Global
-CommDomain operations cross back to the dispatcher through a queue and
-`threading.Event`, so they use `domain_comm` on the MPI-owning thread. This
-design does not require `MPI_THREAD_MULTIPLE`.
+The main dispatcher owns ordinary MPI command ordering. The command processor
+runs on a rank-local thread over an in-memory, socket-shaped queue. Global
+CommDomain requests cross back to the dispatcher through a queue and
+`threading.Event`. The bounded domain exchange runs its blocking `allgather` on
+a helper thread while the dispatcher waits. Successful exchanges serialize MPI
+calls; a domain-exchange timeout uses the existing MPI job-abort path. The startup
+watchdog makes no MPI calls and exits only its own rank on timeout. Startup
+preparation introduces no additional MPI thread-level requirement. Hooks and worker
+initialization remain on the main dispatcher thread.

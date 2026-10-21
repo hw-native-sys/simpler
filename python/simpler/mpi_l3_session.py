@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import queue
 import signal
 import struct
@@ -41,6 +42,7 @@ from .mpi_group_mailbox import (
     open_rank_mailbox,
 )
 from .remote_l3_protocol import (
+    CallableKind,
     FrameHeader,
     FrameType,
     decode_frame,
@@ -53,6 +55,8 @@ from .remote_l3_session import (
     _run_command_loop,
     _startup_deadline,
 )
+from .startup_artifacts import read_startup_artifacts
+from .startup_preparation import NodeStartupContext, _install_node_artifacts, _invoke_node_hook, _StartupStages
 from .worker import Worker
 
 # Upper bound on one rank-0 park on the request word. An L4 publish wakes the
@@ -284,21 +288,52 @@ class _InMemoryCommandConnection:
         return self.next_reply()
 
 
+def _manifest_startup_deadline(manifest: dict[str, Any], started: float) -> float:
+    deadline = _startup_deadline(manifest)
+    if "startup_deadline_monotonic" not in manifest:
+        deadline -= time.monotonic() - started
+    return deadline
+
+
 def _load_group_manifest_from_rank0(comm: Any, manifest_path: str) -> dict[str, Any]:
     rank = int(comm.Get_rank())
+    started = time.monotonic()
+    budget = None
     if rank == 0:
         try:
             with open(manifest_path, encoding="utf-8") as f:
-                payload = (True, json.load(f))
+                group = json.load(f)
+            manifests = group.get("rank_manifests", [])
+            if manifests:
+                deadline = min(_manifest_startup_deadline(item, started) for item in manifests)
+                budget = _StartupStages(comm, rank, deadline)
+                budget.stage = "artifact broadcast"
+            descriptions = []
+            for description in group.get("startup_artifacts", []):
+                digest = description.get("sha256", "unknown") if isinstance(description, dict) else "unknown"
+                try:
+                    descriptions.extend(read_startup_artifacts([description]))
+                except BaseException as exc:
+                    raise RuntimeError(f"artifact {digest}: {type(exc).__name__}: {exc}") from exc
+            group["startup_artifacts"] = descriptions
+            payload = (True, group)
         except BaseException as exc:  # noqa: BLE001
             payload = (False, f"{type(exc).__name__}: {exc}")
     else:
         payload = None
-    ok, value = comm.bcast(payload, root=0)
+    try:
+        ok, value = comm.bcast(payload, root=0)
+    finally:
+        if budget is not None:
+            budget.close()
     if not ok:
         raise RuntimeError(f"MPI L3 rank0 failed to read group manifest {manifest_path!r}: {value}")
     if not isinstance(value, dict):
         raise ValueError("MPI L3 group manifest broadcast returned a non-object payload")
+    manifests = value.get("rank_manifests", [])
+    if isinstance(manifests, list) and 0 <= rank < len(manifests):
+        manifest = manifests[rank]
+        manifest["startup_deadline_monotonic"] = _manifest_startup_deadline(manifest, started)
     return value
 
 
@@ -414,25 +449,38 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
 ) -> int:
     rank = int(dispatch_comm.Get_rank())
     worker_ids = tuple(int(value) for value in group_manifest["worker_ids"])
+    startup_deadline = _startup_deadline(manifest)
+    stages = _StartupStages(dispatch_comm, rank, startup_deadline)
     mailbox: MpiGroupMailbox | None = None
-    inner_worker = Worker(
-        level=3,
-        platform=str(manifest["platform"]),
-        runtime=str(manifest.get("runtime", "tensormap_and_ringbuffer")),
-        device_ids=tuple(int(value) for value in manifest.get("device_ids", ())),
-        num_sub_workers=int(manifest.get("num_sub_workers", 0)),
-        heap_ring_size=int(manifest["heap_ring_size"]) if manifest.get("heap_ring_size") is not None else None,
-    )
-    inner_worker._topology_worker_id = int(manifest["worker_id"])
+    inner_worker: Worker | None = None
     connection = _InMemoryCommandConnection()
     processor_thread: threading.Thread | None = None
-    startup_ok = True
+    hook_state = None
     startup_error = ""
 
-    try:
+    def _artifacts():
+        nonlocal inner_worker
+        inner_worker = Worker(
+            level=3,
+            platform=str(manifest["platform"]),
+            runtime=str(manifest.get("runtime", "tensormap_and_ringbuffer")),
+            device_ids=tuple(int(value) for value in manifest.get("device_ids", ())),
+            num_sub_workers=int(manifest.get("num_sub_workers", 0)),
+            heap_ring_size=int(manifest["heap_ring_size"]) if manifest.get("heap_ring_size") is not None else None,
+        )
+        inner_worker._topology_worker_id = int(manifest["worker_id"])
+        return _install_node_artifacts(group_manifest.get("startup_artifacts", []))
+
+    def _registry():
+        assert inner_worker is not None
         dispatch_registry = _install_manifest_dispatcher_registry(manifest)
         inner_handles = _install_manifest_inner_registry(manifest, inner_worker)
-        inner_worker.init(_startup_deadline=_startup_deadline(manifest))
+        return dispatch_registry, inner_handles
+
+    def _initialize() -> None:
+        nonlocal processor_thread
+        assert inner_worker is not None
+        inner_worker.init(_startup_deadline=startup_deadline)
         exchange = MpiGlobalDomainExchange(
             domain_comm,
             group_worker_ids=worker_ids,
@@ -458,20 +506,69 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
         hello = decode_frame(connection.next_reply())
         if hello.header.frame_type is not FrameType.HELLO:
             raise RuntimeError("MPI command processor did not publish HELLO")
+
+    def _cleanup() -> bool:
+        errors = []
+        if processor_thread is not None:
+            try:
+                if processor_thread.is_alive():
+                    connection.feed(_shutdown_frame(manifest))
+                processor_thread.join(timeout=5.0)
+            except BaseException as exc:  # noqa: BLE001 -- subsequent resources must still be closed.
+                errors.append(exc)
+            if processor_thread.is_alive():
+                print(
+                    f"MPI rank {rank} cleanup: command processor did not drain; "
+                    "exiting rank while retaining live worker and hook state",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                os._exit(124)
+        for closeable in (inner_worker, hook_state, mailbox):
+            if closeable is not None:
+                try:
+                    closeable.close()
+                except BaseException as exc:  # noqa: BLE001 -- cleanup must preserve the original startup failure.
+                    errors.append(exc)
+        for error in errors:
+            print(_format_remote_error(f"MPI rank {rank} cleanup", error), file=sys.stderr)
+        return not errors
+
+    try:
+        artifact_roots = stages.run("artifacts", _artifacts)
+        artifact_context = f" artifacts [{', '.join(artifact_roots)}]" if artifact_roots else ""
+        dispatch_registry, inner_handles = stages.run("registry", _registry, error_context=artifact_context)
+        hook_description = manifest.get("startup_hook")
+        hook_parameters = hook_description.get("parameters", {}) if isinstance(hook_description, dict) else {}
+        context = NodeStartupContext(
+            rank=rank,
+            artifact_roots=artifact_roots,
+            inner_worker=inner_worker,
+            chip_handles={
+                digest.hex(): handle
+                for (kind, digest), handle in inner_handles.items()
+                if kind == CallableKind.CHIP_CALLABLE
+            },
+            parameters=hook_parameters,
+        )
+
+        def _prepare() -> None:
+            nonlocal hook_state
+            hook_state = _invoke_node_hook(hook_description, context)
+
+        stages.run("hook", _prepare, error_context=artifact_context)
+        stages.run("init", _initialize, error_context=artifact_context)
     except BaseException as exc:  # noqa: BLE001
-        startup_ok = False
         startup_error = _format_remote_error(f"MPI rank {rank} startup", exc)
 
-    readiness = dispatch_comm.allgather((rank, startup_ok, startup_error))
     mailbox_ready = True
     mailbox_error = ""
     if rank == 0:
         try:
             mailbox = open_rank_mailbox(group_manifest["mailbox"], rank=rank)
             assert mailbox is not None
-            failures = [(ready_rank, error) for ready_rank, ok, error in readiness if not ok]
-            if failures:
-                mailbox_error = "; ".join(f"rank {ready_rank}: {error}" for ready_rank, error in failures)
+            if startup_error:
+                mailbox_error = startup_error
                 mailbox.mark_terminal(mailbox_error)
                 mailbox_ready = False
             else:
@@ -481,15 +578,21 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
             mailbox_error = _format_remote_error("MPI rank 0 mailbox startup", exc)
             if mailbox is not None:
                 mailbox.mark_terminal(mailbox_error)
-    mailbox_ready, mailbox_error = dispatch_comm.bcast((mailbox_ready, mailbox_error), root=0)
+    try:
+        mailbox_ready, mailbox_error = dispatch_comm.bcast((mailbox_ready, mailbox_error), root=0)
+    except BaseException:
+        try:
+            _cleanup()
+        finally:
+            stages.close()
+        raise
     if not mailbox_ready:
-        if processor_thread is not None:
-            connection.feed(_shutdown_frame(manifest))
-            processor_thread.join(timeout=1.0)
-        inner_worker.close()
-        if mailbox is not None:
-            mailbox.close()
+        try:
+            _cleanup()
+        finally:
+            stages.close()
         return 1
+    stages.close()
 
     last_sequence_id = 0
     local_command_sequence = 0
@@ -592,15 +695,8 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
             if request.opcode is MailboxOpcode.SHUTDOWN:
                 break
     finally:
-        if processor_thread is not None:
-            if processor_thread.is_alive():
-                connection.feed(_shutdown_frame(manifest))
-            processor_thread.join(timeout=5.0)
-        try:
-            inner_worker.close()
-        finally:
-            if mailbox is not None:
-                mailbox.close()
+        if not _cleanup():
+            exit_code = 1
     return exit_code
 
 
