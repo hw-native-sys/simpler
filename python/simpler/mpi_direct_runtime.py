@@ -25,6 +25,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Callable
 
+from .mpi_direct_cleanup import MpiDirectCleanupReport, _RankCleanupReporter, cleanup_failure
 from .mpi_direct_protocol import (
     MPI_DIRECT_STARTUP_TOKEN_ENV,
     MpiDirectTag,
@@ -40,6 +41,10 @@ COMMAND_REPLY_TAG = int(MpiDirectTag.COMMAND_REPLY)
 HEALTH_TAG = int(MpiDirectTag.HEALTH)
 LIFECYCLE_TAG = int(MpiDirectTag.LIFECYCLE)
 _MPI_GATE_RETRY_INTERVAL_S = 0.01
+
+
+class _MpiDirectCleanupError(RuntimeError):
+    pass
 
 
 def _launcher_rank() -> int:
@@ -229,7 +234,9 @@ class _ControllerProgress:
 
 
 class MpiDirectControllerContext:
-    def __init__(self, MPI, world, topology: MpiDirectTopology, session_id: int) -> None:
+    def __init__(
+        self, MPI, world, topology: MpiDirectTopology, session_id: int, reporter: _RankCleanupReporter | None = None
+    ) -> None:
         from _task_interface import _MpiDirectTransportHub  # noqa: PLC0415
 
         self.topology = topology
@@ -241,6 +248,7 @@ class MpiDirectControllerContext:
         self._progress = _ControllerProgress(MPI, world, self._hub, topology.session_timeout_s)
         self._workers: list[Any] = []
         self._closed = False
+        self._cleanup_reporter = reporter
         self._progress.start()
 
     def attach(self, worker) -> tuple[int, ...]:
@@ -266,26 +274,48 @@ class MpiDirectControllerContext:
         if self._closed:
             return
         self._closed = True
+        if self._cleanup_reporter is not None:
+            self._cleanup_reporter.begin(command="not_observed")
         close_errors: list[BaseException] = []
+        transport_failed = False
         for worker in reversed(self._workers):
             try:
                 worker.close()
             except BaseException as exc:  # noqa: BLE001
                 close_errors.append(exc)
         if not self._hub.all_routes_shutdown:
-            error = RuntimeError("MPI executors did not receive lifecycle shutdown")
+            transport_failed = True
+            error = RuntimeError("MPI executors were not sent lifecycle shutdown")
             close_errors.append(error)
             self._hub.fail(str(error))
         try:
             self._progress.stop(self.topology.session_timeout_s)
+        except BaseException as exc:  # noqa: BLE001
+            transport_failed = True
+            close_errors.append(exc)
         finally:
-            self._hub.close()
+            try:
+                self._hub.close()
+            except BaseException as exc:  # noqa: BLE001
+                transport_failed = True
+                close_errors.append(exc)
+            if self._cleanup_reporter is not None:
+                self._cleanup_reporter.finish([cleanup_failure("L4 close", exc) for exc in close_errors])
         if close_errors:
-            raise RuntimeError(f"failed to close {len(close_errors)} attached L4 Worker(s)") from close_errors[0]
+            error_type = RuntimeError if transport_failed else _MpiDirectCleanupError
+            raise error_type(f"L4 close encountered {len(close_errors)} failure(s)") from close_errors[0]
 
 
 class _ExecutorFrameSocket:
-    def __init__(self, MPI, world, spec: MpiDirectExecutorSpec, session_id: int, heartbeat_interval_s: float) -> None:
+    def __init__(
+        self,
+        MPI,
+        world,
+        spec: MpiDirectExecutorSpec,
+        session_id: int,
+        heartbeat_interval_s: float,
+        reporter: _RankCleanupReporter | None = None,
+    ) -> None:
         self._MPI = MPI
         self._world = world
         self._spec = spec
@@ -297,6 +327,8 @@ class _ExecutorFrameSocket:
         self._health_thread: threading.Thread | None = None
         self._health_error: BaseException | None = None
         self._health_sequence = 0
+        self._cleanup_reporter = reporter
+        self.shutdown_observed = False
 
     def _send(self, data: bytes, tag: int) -> None:
         with self._mpi_mu:
@@ -365,6 +397,10 @@ class _ExecutorFrameSocket:
                 raise RuntimeError("controller MPI tag does not match SLR3 request type")
             if decoded.header.session_id != self._session_id or decoded.header.worker_id != self._spec.worker_id:
                 raise RuntimeError("controller SLR3 frame identity mismatch")
+            if decoded.header.frame_type == FrameType.SHUTDOWN:
+                self.shutdown_observed = True
+                if self._cleanup_reporter is not None:
+                    self._cleanup_reporter.begin(command="observed")
             return frame
 
     def recv(self, size: int) -> bytes:
@@ -403,8 +439,10 @@ def _load_controller(target: str) -> Callable[[MpiDirectControllerContext], Any]
     return callback
 
 
-def _run_controller(MPI, world, topology: MpiDirectTopology, session_id: int, target: str) -> None:
-    context = MpiDirectControllerContext(MPI, world, topology, session_id)
+def _run_controller(
+    MPI, world, topology: MpiDirectTopology, session_id: int, target: str, reporter: _RankCleanupReporter | None = None
+) -> None:
+    context = MpiDirectControllerContext(MPI, world, topology, session_id, reporter)
     try:
         _load_controller(target)(context)
     except BaseException:
@@ -417,10 +455,12 @@ def _run_controller(MPI, world, topology: MpiDirectTopology, session_id: int, ta
         context.close()
 
 
-def _run_executor(MPI, world, topology: MpiDirectTopology, session_id: int, spec, worker) -> None:
+def _run_executor(
+    MPI, world, topology: MpiDirectTopology, session_id: int, spec, worker, reporter: _RankCleanupReporter | None = None
+) -> int:
     from .remote_l3_session import _run_command_loop  # noqa: PLC0415
 
-    channel = _ExecutorFrameSocket(MPI, world, spec, session_id, topology.heartbeat_interval_s)
+    channel = _ExecutorFrameSocket(MPI, world, spec, session_id, topology.heartbeat_interval_s, reporter)
     manifest = {
         **spec.to_dict(),
         "session_id": session_id,
@@ -431,13 +471,32 @@ def _run_executor(MPI, world, topology: MpiDirectTopology, session_id: int, spec
         "node_rank": spec.rank - 1,
         "node_count": len(topology.executors),
     }
+    cleanup_errors: list[BaseException] = []
+    fatal_error: BaseException | None = None
     try:
-        _run_command_loop(channel, manifest, worker, {}, {})  # type: ignore[arg-type]
-    finally:
-        try:
-            channel.close()
-        finally:
-            worker.close()
+        _run_command_loop(channel, manifest, worker, {}, {}, cleanup_errors=cleanup_errors)  # type: ignore[arg-type]
+    except BaseException as exc:  # noqa: BLE001
+        fatal_error = exc
+    failures = [cleanup_failure("command-loop buffer release", exc) for exc in cleanup_errors]
+    if fatal_error is None:
+        fatal_error = next((exc for exc in cleanup_errors if not isinstance(exc, Exception)), None)
+    try:
+        channel.close()
+    except BaseException as exc:  # noqa: BLE001
+        failures.append(cleanup_failure("MPI channel close", exc))
+        if fatal_error is None:
+            fatal_error = exc
+    try:
+        worker.close()
+    except BaseException as exc:  # noqa: BLE001
+        failures.append(cleanup_failure("L3 Worker.close", exc))
+        if fatal_error is None and not isinstance(exc, Exception):
+            fatal_error = exc
+    if reporter is not None:
+        reporter.finish(failures)
+    if fatal_error is not None:
+        raise fatal_error
+    return 1 if failures else 0
 
 
 def run_runtime(
@@ -490,14 +549,32 @@ def run_runtime(
 
     MPI = _import_mpi()
     world = None
+    report_settings = data.get("cleanup_report")
+    reporter = None
+    if report_settings is not None:
+        spec = topology.executor_for_rank(rank) if rank else None
+        reporter = _RankCleanupReporter(
+            startup_host,
+            int(report_settings["port"]),
+            startup_token,
+            MpiDirectCleanupReport(
+                str(report_settings["job_id"]),
+                session_id,
+                rank,
+                None if spec is None else spec.worker_id,
+                "L4" if rank == 0 else "L3",
+            ),
+        )
     try:
         world = _init_mpi(MPI, rank, topology.world_size)
         if rank == 0:
-            _run_controller(MPI, world, topology, session_id, controller)
+            _run_controller(MPI, world, topology, session_id, controller, reporter)
         else:
             assert worker is not None
-            _run_executor(MPI, world, topology, session_id, topology.executor_for_rank(rank), worker)
+            return _run_executor(MPI, world, topology, session_id, topology.executor_for_rank(rank), worker, reporter)
         return 0
+    except _MpiDirectCleanupError:
+        return 1
     except BaseException:
         print(
             f"[mpi-direct rank={rank} host={socket.gethostname()}] fatal error after MPI initialization",

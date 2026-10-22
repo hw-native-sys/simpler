@@ -18,6 +18,8 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -27,6 +29,7 @@ import simpler.mpi_direct_runtime as runtime_mod
 import simpler.mpi_direct_supervisor as supervisor_mod
 from simpler import mpi_direct_protocol as protocol_mod
 from simpler import remote_l3_session
+from simpler.mpi_direct_cleanup import MpiDirectCleanupLedger, MpiDirectCleanupReport
 from simpler.mpi_direct_protocol import MPI_DIRECT_STARTUP_TOKEN_ENV, MpiDirectTag
 from simpler.mpi_direct_runtime import _pre_mpi_gate
 from simpler.mpi_direct_supervisor import (
@@ -253,6 +256,7 @@ def supervisor_setup(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor_mod.socket, "socket", lambda *_args: listener)
     monkeypatch.setattr(supervisor_mod.subprocess, "Popen", Mock(return_value=process))
     monkeypatch.setattr(supervisor_mod, "_startup_gate", Mock())
+    monkeypatch.setattr(supervisor_mod, "_CleanupReceiver", lambda *_args: nullcontext(SimpleNamespace(port=4568)))
     return str(topology_path), process
 
 
@@ -575,13 +579,90 @@ def test_executor_cleanup_closes_worker_when_channel_close_fails(monkeypatch):
     channel = Mock(close=Mock(side_effect=RuntimeError("heartbeat failed")))
     worker = Mock()
     monkeypatch.setattr(runtime_mod, "_ExecutorFrameSocket", lambda *_args: channel)
-    monkeypatch.setattr(remote_l3_session, "_run_command_loop", lambda *_args: None)
+    monkeypatch.setattr(remote_l3_session, "_run_command_loop", lambda *_args, **_kwargs: None)
 
     with pytest.raises(RuntimeError, match="heartbeat failed"):
         runtime_mod._run_executor(None, None, topology, 1, topology.executors[0], worker)
 
     channel.close.assert_called_once()
     worker.close.assert_called_once()
+
+
+@pytest.mark.parametrize("loop_release_fails", [False, True])
+def test_executor_reports_release_failures_before_returning_nonzero(monkeypatch, loop_release_fails):
+    topology = MpiDirectTopology.from_dict(_topology_dict())
+    channel = Mock(shutdown_observed=True)
+    reporter = Mock()
+    worker = Mock(close=Mock(side_effect=RuntimeError("worker release failed")))
+    monkeypatch.setattr(runtime_mod, "_ExecutorFrameSocket", lambda *_args: channel)
+
+    def loop(*_args, cleanup_errors):
+        if loop_release_fails:
+            cleanup_errors.append(RuntimeError("buffer release failed"))
+
+    monkeypatch.setattr(remote_l3_session, "_run_command_loop", loop)
+    assert runtime_mod._run_executor(None, None, topology, 1, topology.executors[0], worker, reporter) == 1
+    failures = reporter.finish.call_args.args[0]
+    assert any("worker release failed" in detail for detail in failures)
+    assert any("buffer release failed" in detail for detail in failures) == loop_release_fails
+    channel.close.assert_called_once()
+
+
+def test_executor_preserves_fatal_loop_error_and_still_reports_close_result(monkeypatch):
+    topology = MpiDirectTopology.from_dict(_topology_dict())
+    channel = Mock(shutdown_observed=False)
+    reporter = Mock()
+    worker = Mock(close=Mock(side_effect=RuntimeError("release failed")))
+    monkeypatch.setattr(runtime_mod, "_ExecutorFrameSocket", lambda *_args: channel)
+    monkeypatch.setattr(remote_l3_session, "_run_command_loop", Mock(side_effect=ValueError("bad frame")))
+    with pytest.raises(ValueError, match="bad frame"):
+        runtime_mod._run_executor(None, None, topology, 1, topology.executors[0], worker, reporter)
+    assert len(reporter.finish.call_args.args[0]) == 1
+    assert "release failed" in reporter.finish.call_args.args[0][0]
+
+
+@pytest.mark.parametrize("bad_identity", [False, True])
+def test_executor_acknowledges_shutdown_only_after_frame_identity_validation(monkeypatch, bad_identity):
+    from simpler.remote_l3_protocol import FrameHeader, FrameType, encode_frame  # noqa: PLC0415
+
+    topology = MpiDirectTopology.from_dict(_topology_dict())
+    reporter = Mock()
+    channel = runtime_mod._ExecutorFrameSocket(None, None, topology.executors[0], 1, 1.0, reporter)
+    frame = encode_frame(FrameHeader(FrameType.SHUTDOWN, 2 if bad_identity else 1, 0, 0), b"")
+    status = SimpleNamespace(Get_tag=lambda: runtime_mod.LIFECYCLE_TAG)
+    monkeypatch.setattr(runtime_mod, "_receive_frame", lambda *_args: (status, frame))
+    if bad_identity:
+        with pytest.raises(RuntimeError, match="identity mismatch"):
+            channel._receive_message()
+        reporter.begin.assert_not_called()
+        assert not channel.shutdown_observed
+    else:
+        assert channel._receive_message() == frame
+        reporter.begin.assert_called_once_with(command="observed")
+        assert channel.shutdown_observed
+
+
+@pytest.mark.parametrize("transport_fails", [False, True])
+def test_controller_reports_own_close_separately_from_executor_receipt(transport_fails):
+    context = runtime_mod.MpiDirectControllerContext.__new__(runtime_mod.MpiDirectControllerContext)
+    context._closed = False
+    context.topology = MpiDirectTopology.from_dict(_topology_dict())
+    context._cleanup_reporter = Mock()
+    context._workers = [Mock(close=Mock(side_effect=RuntimeError("L4 release failed"))), Mock()]
+    context._hub = Mock(all_routes_shutdown=True)
+    context._progress = Mock()
+    if transport_fails:
+        context._progress.stop.side_effect = RuntimeError("progress failed")
+    expected = RuntimeError if transport_fails else runtime_mod._MpiDirectCleanupError
+    with pytest.raises(expected, match="L4 close encountered"):
+        context.close()
+    context._cleanup_reporter.begin.assert_called_once_with(command="not_observed")
+    assert "L4 release failed" in context._cleanup_reporter.finish.call_args.args[0][0]
+    assert len(context._cleanup_reporter.finish.call_args.args[0]) == (2 if transport_fails else 1)
+    context._hub.close.assert_called_once()
+    context._workers[1].close.assert_called_once()
+    context.close()
+    context._cleanup_reporter.finish.assert_called_once()
 
 
 def test_executor_receive_does_not_sleep_on_dispatch_path(monkeypatch):
@@ -741,8 +822,178 @@ def _interrupt_idle_mpi_job(proc, mode, controller_path, supervisor_ready):
         assert len(executors) == 2, processes
         os.kill(executors[0], signal.SIGSTOP)
     else:
-        signum = signal.SIGTERM if mode == "supervisor-term" else signal.SIGHUP
+        signum = signal.SIGTERM if mode in ("supervisor-term", "executor-close-stall") else signal.SIGHUP
         proc.send_signal(signum)
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"worker_id": 99},
+        {"rank": 1},
+        {"role": "L4"},
+        {"job_id": "old-job"},
+        {"session_id": 92},
+        {"sequence": 0},
+        {"command": "not_observed"},
+        {"cleanup": "failed", "failures": ("release failed",)},
+    ],
+)
+def test_two_host_example_checks_each_rank_cleanup_identity_and_outcome(changes):
+    from examples.workers.l4.vector_add_mpi_direct_l3.main import _check_cleanup_reports  # noqa: PLC0415
+
+    topology = MpiDirectTopology.from_dict(_topology_dict(second_host="host-b"))
+    reports = {
+        rank: replace(report, sequence=2, command="not_observed" if rank == 0 else "observed", cleanup="succeeded")
+        for rank, report in MpiDirectCleanupLedger(topology, "job", 91).snapshot().items()
+    }
+    _check_cleanup_reports(topology, reports)
+    reports[2] = replace(reports[2], **changes)
+    with pytest.raises(AssertionError, match="rank 2"):
+        _check_cleanup_reports(topology, reports)
+
+
+@pytest.mark.parametrize("missing", [False, True])
+def test_two_host_example_requires_received_reports_after_successful_launcher(monkeypatch, missing):
+    from examples.workers.l4.vector_add_mpi_direct_l3 import main as example_mod  # noqa: PLC0415
+
+    def supervise(topology_path, _controller, *, cleanup_reports, **_kwargs):
+        topology = MpiDirectTopology.load(topology_path)
+        for rank, report in MpiDirectCleanupLedger(topology, "job", 91).snapshot().items():
+            cleanup_reports[rank] = (
+                report
+                if missing and rank == 2
+                else replace(
+                    report, sequence=2, command="not_observed" if rank == 0 else "observed", cleanup="succeeded"
+                )
+            )
+        return 0
+
+    monkeypatch.setattr(example_mod, "run_supervisor", supervise)
+
+    def run():
+        return example_mod.run(
+            local_host="192.0.2.1",
+            remote_host="192.0.2.2",
+            python_executable="python",
+            local_devices="0",
+            remote_devices="0",
+        )
+
+    if missing:
+        with pytest.raises(AssertionError, match="rank 2 incomplete cleanup report"):
+            run()
+    else:
+        assert run() == 0
+
+
+def _check_rank_cleanup_output(output, mode, topology):
+    from examples.workers.l4.vector_add_mpi_direct_l3.main import _check_cleanup_reports  # noqa: PLC0415
+
+    reports = [
+        json.loads(line)["mpi_direct_cleanup"]
+        for line in output.splitlines()
+        if line.startswith('{"mpi_direct_cleanup":')
+    ]
+    assert {report["rank"] for report in reports} == {0, 1, 2}, output
+    assert all("process_exit" not in report for report in reports)
+    decoded = {
+        report["rank"]: MpiDirectCleanupReport(**{key: value for key, value in report.items() if key != "schema"})
+        for report in reports
+    }
+    if mode in ("roundtrip", "slurm-allocation"):
+        _check_cleanup_reports(MpiDirectTopology.from_dict(topology), decoded)
+    elif mode == "missing-executor-report":
+        assert decoded[2].sequence == 0, output
+        assert all(decoded[rank].cleanup == "succeeded" for rank in (0, 1)), output
+        with pytest.raises(AssertionError, match="rank 2 incomplete cleanup report"):
+            _check_cleanup_reports(MpiDirectTopology.from_dict(topology), decoded)
+    elif mode == "executor-command-error":
+        assert "controller SLR3 frame identity mismatch" in output, output
+        assert decoded[2].sequence == 2, output
+        assert decoded[2].command == "not_observed", output
+        assert decoded[2].cleanup == "succeeded", output
+        assert not decoded[2].failures, output
+    if mode in ("roundtrip", "slurm-allocation", "executor-close-error", "controller-close-error"):
+        assert all(report["sequence"] == 2 for report in reports), output
+        failed_rank = 2 if mode == "executor-close-error" else 0 if mode == "controller-close-error" else None
+        for report in reports:
+            assert report["command"] == ("not_observed" if report["rank"] == 0 else "observed"), output
+            assert report["cleanup"] == ("failed" if report["rank"] == failed_rank else "succeeded"), output
+            if report["rank"] == failed_rank:
+                assert "injected rank close failure" in " ".join(report["failures"]), output
+    elif mode == "rank0-crash":
+        assert reports[0]["cleanup"] == "unknown", output
+    elif mode == "executor-close-stall":
+        assert reports[2]["sequence"] == 1, output
+        assert reports[2]["command"] == "observed", output
+        assert reports[2]["cleanup"] == "unknown", output
+
+
+def _inject_rank_cleanup_fault(tmp_path, mode, supervisor_ready, env):
+    if mode == "missing-executor-report":
+        (tmp_path / "sitecustomize.py").write_text(
+            "import os\n"
+            "rank = os.environ.get('PMI_RANK', os.environ.get('OMPI_COMM_WORLD_RANK'))\n"
+            "if rank == '2':\n"
+            "    from simpler.mpi_direct_cleanup import _RankCleanupReporter\n"
+            "    _RankCleanupReporter._send = lambda self, report: False\n",
+            encoding="utf-8",
+        )
+    elif mode == "executor-command-error":
+        # The shared decoder also reaches the independent runtime instance launched with -m.
+        (tmp_path / "sitecustomize.py").write_text(
+            "import os\n"
+            "rank = os.environ.get('PMI_RANK', os.environ.get('OMPI_COMM_WORLD_RANK'))\n"
+            "if rank == '2':\n"
+            "    from dataclasses import replace\n"
+            "    from simpler import remote_l3_protocol as wire\n"
+            "    decode_frame = wire.decode_frame\n"
+            "    def corrupt_command(data):\n"
+            "        frame = decode_frame(data)\n"
+            "        if frame.header.frame_type in (wire.FrameType.CONTROL, wire.FrameType.TASK):\n"
+            "            frame = replace(frame, header=replace(frame.header, session_id=frame.header.session_id ^ 1))\n"
+            "        return frame\n"
+            "    wire.decode_frame = corrupt_command\n",
+            encoding="utf-8",
+        )
+    elif mode in ("executor-close-error", "controller-close-error", "executor-close-stall"):
+        inject_rank = "0" if mode == "controller-close-error" else "2"
+        inject_level = 4 if mode == "controller-close-error" else 3
+        (tmp_path / "sitecustomize.py").write_text(
+            "import os\n"
+            "rank = os.environ.get('PMI_RANK', os.environ.get('OMPI_COMM_WORLD_RANK'))\n"
+            f"if rank == {inject_rank!r}:\n"
+            "    from simpler.worker import Worker\n"
+            "    close = Worker.close\n"
+            "    def fail_close(self):\n"
+            f"        if self.level == {inject_level}:\n"
+            + (
+                f"            open({str(supervisor_ready)!r}, 'w').write(str(os.getpid()))\n"
+                "            import threading\n"
+                "            threading.Event().wait()\n"
+                if mode == "executor-close-stall"
+                else "            close(self)\n            raise RuntimeError('injected rank close failure')\n"
+            )
+            + "        close(self)\n"
+            "    Worker.close = fail_close\n",
+            encoding="utf-8",
+        )
+    elif mode in ("unused-executors", "idle-executor-stop"):
+        (tmp_path / "sitecustomize.py").write_text("", encoding="utf-8")
+    else:
+        return
+    if mode in ("executor-command-error", "unused-executors", "idle-executor-stop"):
+        # MPI Abort can discard launcher-forwarded stderr after the rank has flushed it.
+        with (tmp_path / "sitecustomize.py").open("a", encoding="utf-8") as customization:
+            customization.write(
+                "import os, sys\n"
+                "rank = os.environ.get('PMI_RANK', os.environ.get('OMPI_COMM_WORLD_RANK'))\n"
+                "if rank is not None:\n"
+                f"    sys.stderr = open({str(tmp_path)!r} + '/rank-' + rank + '.stderr', 'w', "
+                "encoding='utf-8', buffering=1)\n"
+            )
+    env["PYTHONPATH"] = str(tmp_path) + os.pathsep + env["PYTHONPATH"]
 
 
 @pytest.mark.parametrize(
@@ -755,6 +1006,11 @@ def _interrupt_idle_mpi_job(proc, mode, controller_path, supervisor_ready):
         "supervisor-term",
         "supervisor-hup",
         "idle-executor-stop",
+        "executor-close-error",
+        "controller-close-error",
+        "executor-close-stall",
+        "missing-executor-report",
+        "executor-command-error",
     ],
 )
 def test_real_mpi_cpu_world_and_launcher_cleanup(tmp_path, mode):
@@ -793,6 +1049,7 @@ def test_real_mpi_cpu_world_and_launcher_cleanup(tmp_path, mode):
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join((str(Path(__file__).parent), str(Path.cwd()), env.get("PYTHONPATH", "")))
+    _inject_rank_cleanup_fault(tmp_path, mode, supervisor_ready, env)
     if mode == "slurm-allocation":
         env["SLURM_PROCID"] = "0"
     proc = subprocess.Popen(
@@ -814,16 +1071,23 @@ def test_real_mpi_cpu_world_and_launcher_cleanup(tmp_path, mode):
         start_new_session=True,
     )
     try:
-        if mode.startswith("supervisor-") or mode == "idle-executor-stop":
+        if mode.startswith("supervisor-") or mode in ("idle-executor-stop", "executor-close-stall"):
             _interrupt_idle_mpi_job(proc, mode, controller_path, supervisor_ready)
         output, _ = proc.communicate(timeout=8 if mode == "idle-executor-stop" else 45)
+        output += "".join(
+            "\n" + rank_log.read_text(encoding="utf-8") for rank_log in sorted(tmp_path.glob("rank-*.stderr"))
+        )
         if mode == "idle-executor-stop":
             assert "timed out waiting for HEALTH frame" in output, output
-        assert (proc.returncode == 0) if mode in ("roundtrip", "slurm-allocation") else (proc.returncode != 0), output
+        successful = mode in ("roundtrip", "slurm-allocation", "missing-executor-report")
+        assert (proc.returncode == 0) if successful else (proc.returncode != 0), output
         if mode.startswith("supervisor-"):
             assert proc.returncode == 128 + (signal.SIGTERM if mode == "supervisor-term" else signal.SIGHUP), output
+        if mode == "executor-close-stall":
+            assert proc.returncode == 128 + signal.SIGTERM, output
         if mode == "rank0-crash":
             assert crash_marker.exists(), output
+        _check_rank_cleanup_output(output, mode, topology)
         if mode == "unused-executors":
             assert "lifecycle shutdown" in output, output
         processes = subprocess.check_output(["ps", "-ww", "-eo", "pid,args"], text=True)

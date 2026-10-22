@@ -8,13 +8,16 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import contextlib
+import ctypes
 import json
 import os
 import socket
 import struct
 import threading
 import time
+from types import SimpleNamespace
 from typing import cast
+from unittest.mock import Mock
 
 import pytest
 from simpler import remote_l3_session, remote_l3_worker
@@ -36,6 +39,56 @@ def _manifest(**extra):
     }
     manifest.update(extra)
     return manifest
+
+
+@pytest.mark.parametrize("command_fails", [False, True])
+@pytest.mark.parametrize("release_fails", [False, True])
+def test_command_loop_preserves_runtime_error_and_collects_buffer_release_errors(
+    monkeypatch, command_fails, release_fails
+):
+    from simpler.remote_l3_protocol import ControlName, FrameHeader, FrameType  # noqa: PLC0415
+
+    command_error = RuntimeError("controller SLR3 frame identity mismatch")
+    release_error = RuntimeError("buffer release failed")
+    buffers = [ctypes.create_string_buffer(8), ctypes.create_string_buffer(8)]
+    worker = Mock(create_buffer=Mock(side_effect=buffers))
+    requests = iter(
+        [SimpleNamespace(header=FrameHeader(FrameType.CONTROL, 1, 0, sequence), payload=b"") for sequence in (1, 2)]
+        + [command_error if command_fails else SimpleNamespace(header=FrameHeader(FrameType.SHUTDOWN, 1, 0, 0))]
+    )
+
+    def receive(_conn):
+        request = next(requests)
+        if isinstance(request, BaseException):
+            raise request
+        return request
+
+    released = []
+
+    def close(entry, **_kwargs):
+        released.append(entry.data)
+        if release_fails and entry.data is buffers[0]:
+            raise release_error
+
+    monkeypatch.setattr(remote_l3_session, "read_frame", receive)
+    monkeypatch.setattr(remote_l3_session, "send_frame", lambda *_args: None)
+    monkeypatch.setattr(
+        remote_l3_session,
+        "decode_control",
+        lambda _payload: SimpleNamespace(
+            control_name=ControlName.ALLOC_REMOTE_BUFFER, command_bytes=struct.pack("<Q", 8), control_version=1
+        ),
+    )
+    monkeypatch.setattr(remote_l3_session._RemoteBufferEntry, "close", close)
+    cleanup_errors = []
+    if command_fails:
+        with pytest.raises(RuntimeError) as raised:
+            remote_l3_session._run_command_loop(Mock(), _manifest(), worker, cleanup_errors=cleanup_errors)
+        assert raised.value is command_error
+    else:
+        remote_l3_session._run_command_loop(Mock(), _manifest(), worker, cleanup_errors=cleanup_errors)
+    assert released == buffers
+    assert cleanup_errors == ([release_error] if release_fails else [])
 
 
 def test_read_runner_ready_times_out_without_payload():

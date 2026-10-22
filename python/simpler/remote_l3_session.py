@@ -685,7 +685,14 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     manifest_inner_handles: dict[tuple[CallableKind, bytes], CallableHandle] | None = None,
     manifest_dispatch_registry: dict[bytes, Callable[..., Any]] | None = None,
     global_domain_prepare_import: Callable[[GlobalDomainCommand, Worker, int], bytes | None] | None = None,
+    *,
+    cleanup_errors: list[BaseException] | None = None,
 ) -> None:
+    """Collect release errors separately when the caller supplies a cleanup ledger.
+
+    With a collector, command exceptions propagate even when buffer release fails.
+    Without a collector, release errors propagate directly.
+    """
     session_id = int(manifest["session_id"])
     worker_id = int(manifest["worker_id"])
     dispatch_registry: dict[bytes, Callable[..., Any]] = dict(manifest_dispatch_registry or {})
@@ -1240,7 +1247,12 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
             send_frame(conn, FrameHeader(FrameType.COMPLETION, session_id, worker_id, header.sequence), payload)
     finally:
         for key, entry in list(buffers.items()):
-            entry.close(unlink=len(key) == 2)
+            try:
+                entry.close(unlink=len(key) == 2)
+            except BaseException as exc:
+                if cleanup_errors is None:
+                    raise
+                cleanup_errors.append(exc)
         buffers.clear()
         with _INNER_HANDLE_LOCK:
             _INNER_HANDLES.clear()

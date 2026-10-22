@@ -29,6 +29,9 @@ jobs:
     name: ut
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: ${{ inputs.setup_variant == 'github' && contains(inputs.runs_on, 'macos') && 30 || 20 }}
+    # Single-host CPU MPI tests must not select the runner's unsupported RDMA devices.
+    env:
+      UCX_TLS: "self,sm,tcp"
     steps:
       - name: Checkout target
         uses: actions/checkout@v5
@@ -85,6 +88,15 @@ jobs:
         uses: ./.github/actions/setup-venv
         with:
           packages: ".[test]"
+
+      - name: Install MPI for Linux unit tests
+        if: inputs.setup_variant == 'github' && runner.os == 'Linux'
+        run: |
+          # Use matching MPI wheels: Ubuntu 24.04's MPICH package cannot
+          # form a Hydra world (https://github.com/pmodels/mpich/issues/7064).
+          pip install --only-binary=:all: 'mpi4py==4.1.2' 'mpich==4.3.2'
+          python -c "import mpi4py; mpi4py.rc.initialize=False; from mpi4py import MPI; vendor=MPI.get_vendor(); print(vendor); assert 'mpich' in vendor[0].lower()"
+          mpirun -n 3 python -c "from mpi4py import MPI; comm=MPI.COMM_WORLD; print(comm.Get_rank(), comm.Get_size()); assert comm.Get_size()==3; assert comm.allreduce(1)==3"
 
       - name: Run Python unit tests
         run: |
