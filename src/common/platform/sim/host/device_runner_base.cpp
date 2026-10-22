@@ -468,6 +468,7 @@ int SimDeviceRunnerBase::prepare_launch_shape(Runtime &runtime, const CallConfig
     worker_count_ = num_aicore;
     runtime.set_aicpu_thread_num(config.aicpu_thread_num);
     runtime.dev.chip_swimlane_level = static_cast<uint32_t>(config.enable_chip_swimlane);
+    runtime.dev.dump_args_level = static_cast<uint32_t>(config.enable_dump_args);
 
     // First `block_dim` cores are AIC; remaining ~2/3 are AIV. The rule is host
     // state read by the sim's per-core thread start and by the DFX collector.

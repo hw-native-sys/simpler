@@ -162,6 +162,7 @@ TEST(KernelArgsDefaults, FreshRuntimeStartsWithDiagnosticsDisabled) {
     auto *fresh = new (storage) Runtime;
     EXPECT_EQ(fresh->dev.chip_swimlane_level, 0U);
     EXPECT_EQ(fresh->dev.pmu_event_type, 0U);
+    EXPECT_EQ(fresh->dev.dump_args_level, 0U);
     fresh->~Runtime();
 }
 

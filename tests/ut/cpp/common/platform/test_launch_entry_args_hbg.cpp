@@ -15,6 +15,11 @@
 #include "launch_entry_args_fixture.h"
 
 using namespace launch_entry_args_test;
+TEST_F(LaunchEntryArgs, DescriptorSelectionPreservesTheHandshakeBoundary) {
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, sm_image_bytes), 224U);
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, workers), 256U);
+}
+
 // The other runtime's half of the seam: no launch route, and a launch payload
 // that is still the header alone.
 TEST_F(LaunchEntryArgs, ARuntimeWithoutALaunchRouteReportsSo) {

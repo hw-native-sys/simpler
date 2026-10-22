@@ -101,16 +101,7 @@ void ArgsDumpCollector::begin_run(const std::string &output_prefix, DumpArgsLeve
         count.store(0, std::memory_order_relaxed);
     }
 
-    // Before the first initialize() there is no region; initialize() writes the
-    // level from the member just set. Afterwards the device needs the new value
-    // by another route, and it is one narrow field rather than a bulk write-back
-    // so it cannot race the AICPU's own header fields.
     if (shm_host_ != nullptr) {
-        DumpDataHeader *header = get_dump_header(shm_host_);
-        header->dump_args_level = static_cast<uint32_t>(dump_args_level_);
-        wmb();
-        publish_field(&header->dump_args_level, sizeof(header->dump_args_level), "dump_args_level");
-
         // The per-thread payload counters are what reconcile compares against,
         // and nothing on the device resets them. published/completed/dropped are
         // contiguous, so one write-back per thread covers them.
@@ -299,7 +290,6 @@ int ArgsDumpCollector::initialize(
     header->magic = ARGS_DUMP_MAGIC;
     header->num_dump_threads = static_cast<uint32_t>(num_dump_threads);
     header->records_per_buffer = PLATFORM_DUMP_RECORDS_PER_BUFFER;
-    header->dump_args_level = static_cast<uint32_t>(dump_args_level_);
 
     uint64_t arena_size = calc_dump_arena_size();
     header->arena_size_per_thread = arena_size;

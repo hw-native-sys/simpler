@@ -293,7 +293,7 @@ struct DumpDataHeader {
     uint32_t records_per_buffer;
     uint64_t arena_size_per_thread;
     uint32_t magic;
-    uint32_t dump_args_level;  // DumpArgsLevel: 0=off, 1=partial, 2=hybrid, 3=full
+    uint32_t reserved;
 } __attribute__((aligned(64)));
 
 // =============================================================================

@@ -27,6 +27,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -185,7 +186,7 @@ struct RetainedArgsDumpFixture {
     /** The device side of one run: init, record `args` tensors, flush. */
     void produce(uint64_t epoch, int args, bool flush_device = true) {
         set_platform_run_result(/*region_base=*/0, epoch);
-        dump_args_init(/*num_dump_threads=*/1);
+        dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
         for (int i = 0; i < args; i++)
             record_tensor(0x700 + i, static_cast<uint32_t>(i));
         if (flush_device) dump_args_flush(kLane);
@@ -285,6 +286,43 @@ TEST(ArgsDumpRetainedRuns, TwoRunsKeepTheirOwnPayloadFileAndManifest) {
     // Both runs' charges came back with their slots.
     EXPECT_EQ(st.open_epochs, 0u);
     EXPECT_EQ(st.open_collected_records, 0u);
+}
+
+TEST(ArgsDumpRetainedRuns, SuccessorAdmissionDoesNotChangeAPredecessorsSelection) {
+    RetainedArgsDumpFixture fx("selection-overlap");
+    fx.collector.hold_retained_writer_for_test(true);
+    ASSERT_TRUE(fx.collector.run_begin(297, fx.root.prefix("run-a").string(), DumpArgsLevel::PARTIAL));
+    ASSERT_TRUE(fx.collector.run_begin(298, fx.root.prefix("run-b").string(), DumpArgsLevel::HYBRID));
+    for (auto epoch : {297u, 298u}) {
+        const auto level = epoch == 297 ? DumpArgsLevel::PARTIAL : DumpArgsLevel::HYBRID;
+        set_platform_run_result(0, epoch);
+        dump_args_init(/*num_dump_threads=*/1, level);
+        EXPECT_EQ(is_dump_args_selective_mode(), level == DumpArgsLevel::PARTIAL);
+        fx.record_tensor(0x700, 0);
+        dump_args_flush(kLane);
+        fx.close(epoch);
+    }
+    fx.collector.hold_retained_writer_for_test(false);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
+    for (auto name : {"run-a", "run-b"}) {
+        const std::string manifest = read_file(fx.root.manifest(name));
+        ASSERT_FALSE(manifest.empty());
+        EXPECT_EQ(manifest_number(manifest, "dump_args_level"), std::string(name) == "run-a" ? 1 : 2);
+        EXPECT_EQ(manifest_number(manifest, "total_args"), 1);
+    }
+}
+
+TEST(ArgsDumpRetainedRuns, AdmissionDoesNotPublishADeviceSelection) {
+    RetainedArgsDumpFixture fx("level-host-only");
+    std::vector<unsigned char> before(sizeof(*fx.header));
+    std::memcpy(before.data(), fx.header, before.size());
+    ASSERT_TRUE(fx.collector.run_begin(299, fx.root.prefix("run-a").string(), DumpArgsLevel::PARTIAL));
+    EXPECT_EQ(std::memcmp(fx.header, before.data(), before.size()), 0);
+    fx.produce(299, /*args=*/0);
+    fx.close(299);
+    std::string error;
+    ASSERT_TRUE(fx.flush(&error)) << error;
 }
 
 /**
@@ -476,7 +514,7 @@ TEST(ArgsDumpRetainedRuns, ABudgetRefusedPayloadKeepsItsMetadataAndFailsTheFlush
 
     ASSERT_TRUE(fx.begin(801, fx.root.prefix("run-a")));
     set_platform_run_result(/*region_base=*/0, 801);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     // One tensor whose payload is twice the whole working set, so no ordering
     // of the other charges can make room for it.
     const uint64_t huge_elements = (2 * simpler::dfx::runs::kMinWorkingSetBytes) / sizeof(int32_t);
@@ -593,7 +631,7 @@ TEST(ArgsDumpRetainedRuns, FinalizeCarriesAFailureTheEarlierFlushAlreadyReported
 
     ASSERT_TRUE(collector.run_begin(1101, root.prefix("run-a").string(), DumpArgsLevel::FULL));
     set_platform_run_result(/*region_base=*/0, 1101);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     dump_args_flush(kLane);
     // No fence: the run is incomplete and the flush says so.
     collector.run_close(1101, /*device_execution_complete=*/false);
@@ -635,7 +673,7 @@ TEST(ArgsDumpRetainedRuns, RetentionOffKeepsTheSingleRunOutput) {
     collector.begin_run(root.prefix("run-a").string(), DumpArgsLevel::FULL);
     std::vector<int32_t> tensor(kTensorElements, 3);
     set_platform_run_result(/*region_base=*/0, 1201);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     ArgsDumpInfo info{};
     info.task_id = simpler::ut::test_task_id(0x1200);
     info.role = ArgsDumpRole::INPUT;

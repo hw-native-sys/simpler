@@ -325,8 +325,9 @@ struct alignas(64) DeviceRuntimeLaunchDesc {
     uint32_t graph_section_source;
     // Per-invocation granularity travels in every descriptor publication.
     uint32_t chip_swimlane_level;
-    uint32_t pmu_event_type;  // PmuEventType; zero while PMU is disabled.
-    uint32_t graph_section_reserved[10];
+    uint32_t pmu_event_type;   // PmuEventType; zero while PMU is disabled.
+    uint32_t dump_args_level;  // DumpArgsLevel; zero while argument dumping is disabled.
+    uint32_t graph_section_reserved[9];
 
     // Size of the shipped shared-memory image, argument pools included. Set by the
     // host before the image is copied; the AICPU cannot recompute it because the pool

@@ -32,6 +32,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -125,7 +126,7 @@ protected:
     // collection window spanning several runs will look like.
     void run_once_without_begin_run(uint64_t epoch, int args) {
         set_platform_run_result(/*region_base=*/0, epoch);
-        dump_args_init(/*num_dump_threads=*/1);
+        dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
         for (int i = 0; i < args; i++) {
             record_scalar(static_cast<uint32_t>(0x500 + i), static_cast<uint32_t>(i));
         }
@@ -185,6 +186,46 @@ protected:
 };
 
 int ArgsDumpRunIdentityTest::instance_ = 0;
+
+TEST_F(ArgsDumpRunIdentityTest, HostAdmissionDoesNotPublishADeviceSelection) {
+    std::vector<unsigned char> before(sizeof(*header_));
+    std::memcpy(before.data(), header_, before.size());
+    collector_.begin_run(dir_.string(), DumpArgsLevel::PARTIAL);
+    EXPECT_EQ(std::memcmp(header_, before.data(), before.size()), 0);
+}
+
+TEST_F(ArgsDumpRunIdentityTest, InvocationSelectionControlsPayloadWithoutPoolMetadata) {
+    uint32_t value = 0x12345678;
+    for (auto level :
+         {DumpArgsLevel::HYBRID, DumpArgsLevel::FULL, DumpArgsLevel::PARTIAL, DumpArgsLevel::HYBRID,
+          DumpArgsLevel::FULL}) {
+        SCOPED_TRACE(static_cast<uint32_t>(level));
+        collector_.begin_run(dir_.string(), level);
+        header_->reserved = UINT32_MAX;
+        dump_args_init(/*num_dump_threads=*/1, level);
+        EXPECT_EQ(is_dump_args_selective_mode(), level == DumpArgsLevel::PARTIAL);
+        EXPECT_EQ(should_load_dump_args_task_masks(), level != DumpArgsLevel::FULL);
+        const uint64_t before = state_->arena_write_offset;
+        ArgsDumpInfo info{};
+        info.task_id = simpler::ut::test_task_id(0x600);
+        info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
+        info.dtype = static_cast<uint8_t>(DataType::UINT32);
+        info.buffer_addr = reinterpret_cast<uint64_t>(&value);
+        info.ndims = 1;
+        info.shapes[0] = info.strides[0] = 1;
+        info.capture_payload = 0;
+        ASSERT_EQ(dump_arg_record(kThreadIdx, info), 0);
+        EXPECT_EQ(state_->arena_write_offset - before, level == DumpArgsLevel::HYBRID ? 0u : sizeof(value));
+        dump_args_flush(kThreadIdx);
+        ASSERT_EQ(collect_published(), 1);
+        ASSERT_EQ(collector_.export_dump_files(), 0);
+        host_push_free_queue(state_->free_queue, published_buffer_at(consumed_tail_ - 1));
+        const std::string manifest = read_manifest();
+        EXPECT_NE(
+            manifest.find("\"dump_args_level\": " + std::to_string(static_cast<uint32_t>(level))), std::string::npos
+        );
+    }
+}
 
 // A run's args reach the host carrying that run's epoch. The stamp is
 // production — the engine's pop hook and init's reuse path write it, and nothing
@@ -308,7 +349,7 @@ TEST_F(ArgsDumpRunIdentityTest, APublishedBufferIsNotAlsoRetainedByTheDevice) {
     // draw the one the host has not given back.
     collector_.begin_run(dir_.string(), DumpArgsLevel::FULL);
     set_platform_run_result(/*region_base=*/0, /*run_epoch=*/52);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     const uint64_t acquired = state_->current_buf_ptr;
     EXPECT_NE(acquired, 0u) << "init drew nothing after the previous run released its buffer";
     EXPECT_NE(acquired, published) << "the pool handed out a buffer the host had not returned";

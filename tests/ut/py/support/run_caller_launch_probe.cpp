@@ -15,6 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 #include <unordered_map>
@@ -183,12 +184,13 @@ public:
         device_run_result_dev_ptrs_[0] = nullptr;
     }
     using DeviceRunnerBase::slot_persistent_args;
-    void prepare_diagnostics(Runtime &runtime, int level, int pmu_event_type) {
+    void prepare_diagnostics(Runtime &runtime, int level, int pmu_event_type, int dump_level = 0) {
         max_block_dim_ = 1;
         CallConfig config;
         config.aicpu_thread_num = 2;
         config.enable_chip_swimlane = level;
         config.enable_pmu = pmu_event_type;
+        config.enable_dump_args = dump_level;
         assert(prepare_launch_shape(runtime, config) == 0);
         PreparedExecution execution(NativeRunIdentity{}, runtime, config, 0);
         assert(
@@ -356,13 +358,29 @@ static void check_level_publication(bool entry_route) {
     runner.initialize();
     Runtime runtime;
     auto &slot = runner.slot_persistent_args(0);
-    for (const auto [level, pmu] : {std::pair{4, 0}, {1, 0}, {0, 0}, {3, 0}, {2, 0}, {2, 2}, {2, 4}, {2, 0}, {2, 8}}) {
-        runner.prepare_diagnostics(runtime, level, pmu);
+    for (const auto [level, pmu, dump_level] :
+         {std::tuple{4, 0, 0},
+          {1, 0, 0},
+          {0, 0, 0},
+          {3, 0, 0},
+          {2, 0, 0},
+          {2, 2, 0},
+          {2, 4, 0},
+          {2, 0, 0},
+          {2, 8, 0},
+          {0, 0, 3},
+          {0, 0, 1},
+          {0, 0, 0},
+          {0, 0, 2},
+          {0, 0, 3}}) {
+        runner.prepare_diagnostics(runtime, level, pmu, dump_level);
+        assert(runtime.dev.dump_args_level == static_cast<uint32_t>(dump_level));
         assert(runtime.dev.chip_swimlane_level == static_cast<uint32_t>(level));
         KernelArgsHelper helper;
         assert(helper.prepare_runtime_args(runtime, runner.allocator(), slot) == 0);
         runtime.dev.chip_swimlane_level = 99;
         runtime.dev.pmu_event_type = 99;
+        runtime.dev.dump_args_level = 99;
         LaunchProgressSink sink;
         assert(helper.publish_runtime_args(entry_route, caller, sink) == 0);
         assert(sink.submitted());
@@ -372,6 +390,8 @@ static void check_level_publication(bool entry_route) {
         assert(published == static_cast<uint32_t>(level));
         std::memcpy(&published, device + offsetof(DeviceRuntimeLaunchDesc, pmu_event_type), sizeof(published));
         assert(published == static_cast<uint32_t>(pmu));
+        std::memcpy(&published, device + offsetof(DeviceRuntimeLaunchDesc, dump_args_level), sizeof(published));
+        assert(published == static_cast<uint32_t>(dump_level));
     }
     assert(setenv("SIMPLER_PMU_EVENT_TYPE", "4", 1) == 0);
     runner.prepare_diagnostics(runtime, 0, 2);

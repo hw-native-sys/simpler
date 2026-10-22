@@ -78,7 +78,7 @@ protected:
 
         header_ = get_dump_header(shm_.get());
         header_->magic = ARGS_DUMP_MAGIC;
-        header_->dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
+
         header_->num_dump_threads = 1;
 
         state_ = get_dump_buffer_state(shm_.get(), kLane);
@@ -96,7 +96,7 @@ protected:
         set_platform_dump_base(reinterpret_cast<uint64_t>(shm_.get()));
         set_platform_dump_args_run_terminal(reinterpret_cast<uint64_t>(bank_.data()));
         set_platform_run_result(/*region_base=*/0, kEpoch);
-        dump_args_init(/*num_dump_threads=*/1);
+        dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     }
 
     void TearDown() override {
@@ -220,7 +220,7 @@ TEST_F(ArgsDumpRunTerminalTest, TheSuccessorsInitStartsItsOwnAccounting) {
     set_platform_run_result(0, kEpoch + 1);
     state_->free_queue.buffer_ptrs[1] = reinterpret_cast<uint64_t>(meta_.get());
     state_->free_queue.tail = 2;
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     EXPECT_EQ(terminal().run_epoch, kEpoch + 1) << "the successor's init did not claim the entry it publishes into";
     EXPECT_NE(terminal().counts_unknown, 0u) << "a claimed entry offered arithmetic before its run closed";
     EXPECT_EQ(terminal().total, 0u) << "the successor's init left its predecessor's count in the entry";
@@ -247,7 +247,7 @@ TEST_F(ArgsDumpRunTerminalTest, ARunWithoutAnIdentityWritesNoEntryAtEitherEnd) {
     const uint32_t claimed_unknown = terminal().counts_unknown;
 
     set_platform_run_result(0, 0);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     EXPECT_EQ(terminal().run_epoch, kEpoch) << "an init with no identity claimed a bank";
 
     ASSERT_EQ(record_tensor(0x909, 0), 0);
@@ -289,7 +289,7 @@ protected:
 
         header_ = get_dump_header(shm_.get());
         header_->magic = ARGS_DUMP_MAGIC;
-        header_->dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
+
         header_->num_dump_threads = kLanes;
 
         for (int lane = 0; lane < kLanes; lane++) {
@@ -311,7 +311,7 @@ protected:
         set_platform_dump_base(reinterpret_cast<uint64_t>(shm_.get()));
         set_platform_dump_args_run_terminal(reinterpret_cast<uint64_t>(bank_.data()));
         set_platform_run_result(/*region_base=*/0, kEpoch);
-        dump_args_init(kLanes);
+        dump_args_init(kLanes, DumpArgsLevel::FULL);
     }
 
     void TearDown() override {

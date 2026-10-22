@@ -245,31 +245,6 @@ void ArgsDumpCollector::retained_stop_writer() {
     retained_writer_thread_.join();
 }
 
-bool ArgsDumpCollector::retained_publish_level(DumpArgsLevel level) {
-    if (shm_host_ == nullptr || dump_shared_mem_dev_ == nullptr) return false;
-    DumpDataHeader *header = get_dump_header(shm_host_);
-    header->dump_args_level = static_cast<uint32_t>(level);
-    wmb();
-    publish_field(&header->dump_args_level, sizeof(header->dump_args_level), "dump_args_level");
-
-    // Read back what the device will actually latch. Which read that is depends
-    // on the platform, and the difference is not cosmetic: on an SVM platform
-    // the host shadow and the device region are one allocation and the copy
-    // hooks are deliberate no-ops, so a copy into a local would observe
-    // nothing and report every run's level as refused.
-    DumpDataHeader *device_header = get_dump_header(dump_shared_mem_dev_);
-    uint32_t observed = 0;
-    if (shm_host_ == dump_shared_mem_dev_) {
-        observed = device_header->dump_args_level;
-    } else if (profiling_copy_from_device(&observed, &device_header->dump_args_level, sizeof(observed)) != 0) {
-        return false;
-    }
-    // A level the device did not take would have it select one set of arguments
-    // while this run's manifest names another, and the record counts could
-    // still balance — so nothing later in the pipeline could catch it.
-    return observed == static_cast<uint32_t>(level);
-}
-
 // ---------------------------------------------------------------------------
 // Admission
 // ---------------------------------------------------------------------------
@@ -459,14 +434,6 @@ bool ArgsDumpCollector::run_begin(
     }
     retained_bump_progress();
 
-    if (!retained_publish_level(dump_args_level)) {
-        LOG_ERROR(
-            "Args dump: run %llu refused, the device did not take this run's dump level",
-            static_cast<unsigned long long>(run_epoch)
-        );
-        retained_withdraw_unpublished_slot(slot);
-        return false;
-    }
     // Every shard must see this run before the device can publish into it, or
     // its first buffers would belong to no run.
     uint64_t reference_request = 0;

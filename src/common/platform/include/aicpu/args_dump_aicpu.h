@@ -413,8 +413,9 @@ inline void dump_args_for_task(
  * metadata buffers from each thread's free_queue.
  *
  * @param num_dump_threads Number of scheduling threads that will dump args
+ * @param level This invocation's selection from the published Runtime descriptor
  */
-void dump_args_init(int num_dump_threads);
+void dump_args_init(int num_dump_threads, DumpArgsLevel level);
 
 /**
  * Record a single dumped arg.

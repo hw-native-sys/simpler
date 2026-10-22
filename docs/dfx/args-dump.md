@@ -122,14 +122,16 @@ allocates dump storage, publishes its base address through
 `kernel_args.dump_data_base`, and sets `SIMPLER_DFX_FLAG_DUMP_ARGS`
 (every mode but `off`) in each worker handshake's `enable_profiling_flag` for
 the enable/disable decision. The **partial / full / hybrid**
-distinction is carried as a `DumpArgsLevel` in the dump shared-memory header
-(`DumpDataHeader::dump_args_level`, host-written before launch) rather
-than in the profiling-flag bitmask. The on-device AICPU reads the storage base
+distinction is carried in `Runtime::dev.dump_args_level`, published with this
+invocation's descriptor in stream order, rather than in the profiling-flag bitmask. The on-device AICPU reads the storage base
 via `set_platform_dump_base()`, the enable bit via
-`set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(...))`, and latches the mode
-from the header level before task dispatch (`PARTIAL` → selective,
+`set_dump_args_enabled(SIMPLER_GET_DFX_FLAG(...))`, and latches the descriptor selection
+before task dispatch (`PARTIAL` → selective,
 `HYBRID` → all metadata, payload copy controlled by the
-same per-task mask as `PARTIAL`). The runtime resolves the mask before each
+same per-task mask as `PARTIAL`). Host admission freezes the export selection
+without writing or reading back a shared device level; descriptor publication
+failure stops kernel submission. Ordinary payload-counter reset and retained
+queue/cursor ownership remain separate protocols. The runtime resolves the mask before each
 record reaches the platform writer, so the writer does not depend on a second
 task-id lookup. Because the
 level is decided host-side **before any task is
@@ -580,7 +582,7 @@ DumpDataHeader                                  (host init, AICPU reads)
 ├── num_dump_threads
 ├── records_per_buffer
 ├── magic = 0x44554D50 ("DUMP")
-└── dump_args_level  (DumpArgsLevel: 0=off, 1=partial, 2=hybrid, 3=full; AICPU latches before dispatch)
+└── reserved  (zero; the per-invocation level is in Runtime::dev.dump_args_level)
 
 DumpBufferState[num_dump_threads]               (per-thread)
 ├── free_queue {buffer_ptrs[SLOT_COUNT], head, tail}

@@ -162,6 +162,7 @@ TEST_F(LaunchEntryArgs, TheDescriptorsWireOffsetsAreFixed) {
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, entry_args_source_), 132U);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, chip_swimlane_level), 136U);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, pmu_event_type), 140U);
+    EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, dump_args_level), 144U);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, orch_args_storage_), 192U);
     EXPECT_EQ(offsetof(DeviceRuntimeLaunchDesc, workers), 34048U)
         << "the handshake region's address is what the first publication's length and the device both depend on";

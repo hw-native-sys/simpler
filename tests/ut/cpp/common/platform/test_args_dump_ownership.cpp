@@ -239,7 +239,7 @@ struct OwnershipFixture {
      */
     void produce(uint64_t epoch, int args, bool flush_at_end = true) {
         set_platform_run_result(/*region_base=*/0, epoch);
-        dump_args_init(/*num_dump_threads=*/1);
+        dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
         for (int i = 0; i < args; i++)
             record_tensor(0x900 + i, static_cast<uint32_t>(i));
         if (flush_at_end) dump_args_flush(kLane);
@@ -355,7 +355,7 @@ TEST(ArgsDumpOwnership, ACloseReturnsOnlyAfterEveryPublishedBufferIsReceived) {
 
     ASSERT_TRUE(fx.begin(2301, fx.root.prefix("run-a")));
     set_platform_run_result(/*region_base=*/0, 2301);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     for (int i = 0; i < kRecords; i++)
         fx.record_tensor(0xA00 + i, static_cast<uint32_t>(i % 8));
     dump_args_flush(kLane);
@@ -408,7 +408,7 @@ TEST(ArgsDumpOwnership, EachRecordHoldsItsOwnTasksDataAtItsOwnInstant) {
 
     ASSERT_TRUE(fx.begin(2501, fx.root.prefix("run-a")));
     set_platform_run_result(/*region_base=*/0, 2501);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
 
     // Task A: input is 11, and A writes 22 over the same buffer.
     fx.record_arg(0x7001, /*arg_index=*/0, ArgsDumpRole::INPUT, ArgsDumpStage::BEFORE_DISPATCH, shared.data());
@@ -701,7 +701,7 @@ TEST(ArgsDumpRunTerminal, AClaimedRunThatRecordedNothingIsAProvedEmptyManifest) 
     MappedOwnershipFixture fx("mapped-claimed-empty");
     ASSERT_TRUE(fx.begin(6801, fx.root.prefix("run-a")));
     set_platform_run_result(/*region_base=*/0, 6801);
-    dump_args_init(/*num_dump_threads=*/1);
+    dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     dump_args_close_run(kLane);
     EXPECT_EQ(fx.close(6801), 0) << "a producer that claimed the run and settled zeroes was read as unproved";
 

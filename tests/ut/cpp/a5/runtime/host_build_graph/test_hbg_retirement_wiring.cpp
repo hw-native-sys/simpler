@@ -21,6 +21,7 @@
 #include <utility>
 #include <vector>
 
+#include "common/args_dump.h"
 #include "aicore_lifecycle.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
@@ -70,7 +71,7 @@ extern "C" bool is_dump_args_enabled() { return false; }
 // producer, and the stub above keeps either from being reached.
 void dump_args_flush(int) {}
 void dump_args_close_run(int) {}
-void dump_args_init(int) {}
+void dump_args_init(int, DumpArgsLevel) {}
 
 class SchedulerContextTestPeer {
 public:

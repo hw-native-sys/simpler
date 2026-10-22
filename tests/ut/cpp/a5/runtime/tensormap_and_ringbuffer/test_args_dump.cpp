@@ -113,7 +113,7 @@ TEST_F(ArgsDumpTest, DumpRecordCorrectness) {
 
     DumpDataHeader *hdr = get_dump_header(dump_mem);
     hdr->magic = ARGS_DUMP_MAGIC;
-    hdr->dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
+
     hdr->num_dump_threads = 1;
 
     DumpBufferState *state = get_dump_buffer_state(dump_mem, 0);
@@ -124,7 +124,7 @@ TEST_F(ArgsDumpTest, DumpRecordCorrectness) {
     state->arena_write_offset = 0;
 
     set_platform_dump_base(reinterpret_cast<uint64_t>(dump_mem));
-    dump_args_init(1);
+    dump_args_init(1, DumpArgsLevel::FULL);
 
     // Record a 1-D UINT64 tensor (4 elements, contiguous).
     ArgsDumpInfo tinfo = {};
@@ -207,7 +207,7 @@ TEST_F(ArgsDumpTest, ArenaBackpressureChecksBeforePayloadOverwrite) {
 
     DumpDataHeader *header = get_dump_header(dump_mem);
     header->magic = ARGS_DUMP_MAGIC;
-    header->dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
+
     header->num_dump_threads = 1;
     DumpBufferState *state = get_dump_buffer_state(dump_mem, 0);
     state->free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(&meta_buffers[0]);
@@ -217,7 +217,7 @@ TEST_F(ArgsDumpTest, ArenaBackpressureChecksBeforePayloadOverwrite) {
     state->arena_size = kArenaSize;
 
     set_platform_dump_base(reinterpret_cast<uint64_t>(dump_mem));
-    dump_args_init(1);
+    dump_args_init(1, DumpArgsLevel::FULL);
 
     ArgsDumpInfo info{};
     info.role = ArgsDumpRole::INPUT;

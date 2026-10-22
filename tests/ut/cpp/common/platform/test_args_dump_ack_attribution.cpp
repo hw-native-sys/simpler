@@ -173,7 +173,7 @@ struct AttributionFixture {
     /** One run that records `args` tensors and never flushes them to a queue. */
     void produce_unpublished(uint64_t epoch, int args) {
         set_platform_run_result(/*region_base=*/0, epoch);
-        dump_args_init(/*num_dump_threads=*/1);
+        dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
         for (int i = 0; i < args; i++)
             record_tensor(0xB00 + i, static_cast<uint32_t>(i));
     }

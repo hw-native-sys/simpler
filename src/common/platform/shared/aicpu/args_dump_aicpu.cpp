@@ -106,7 +106,7 @@ static inline void account_refused_record(int thread_idx, DumpBufferState *state
 static constexpr uint64_t kDumpQueueBackpressureWaitCycles = PLATFORM_DFX_BACKPRESSURE_TIMEOUT_CYCLES;
 
 static bool g_enable_dump_args = false;
-// Dump level latched from the header in dump_args_init(). The selective
+// Dump level latched from this invocation in dump_args_init(). The selective
 // (PARTIAL) and metadata-first (HYBRID) modes are derived from it rather
 // than tracked as separate flags — mirrors g_chip_swimlane_level.
 static DumpArgsLevel g_dump_args_level = DumpArgsLevel::OFF;
@@ -697,7 +697,7 @@ static inline void write_dump_arg_logical_prefix(
     gather_dump_arg_dim(writer, info, elem_sz, 0, info.start_offset, &remaining_bytes);
 }
 
-void dump_args_init(int num_dump_threads) {
+void dump_args_init(int num_dump_threads, DumpArgsLevel level) {
     void *dump_base = reinterpret_cast<void *>(get_platform_dump_base());
     if (dump_base == nullptr) {
         LOG_ERROR("platform dump base is NULL, cannot initialize args dump");
@@ -710,11 +710,11 @@ void dump_args_init(int num_dump_threads) {
 
     s_dump_header = get_dump_header(dump_base);
 
-    // Latch dump level from the host-written header before any task is dumped.
+    // The descriptor selection is stable for this invocation before dispatch.
     // PARTIAL → selective (only Arg::dump()-marked args); FULL → every task;
     // HYBRID → every task's metadata; payload is copied only for
     // arguments selected through the same per-task mask as PARTIAL.
-    g_dump_args_level = static_cast<DumpArgsLevel>(s_dump_header->dump_args_level);
+    g_dump_args_level = level;
 
     LOG_INFO("Initializing args dump for %d threads", num_dump_threads);
 

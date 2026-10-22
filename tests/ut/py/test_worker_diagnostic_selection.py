@@ -51,6 +51,21 @@ def _check_pmu(folder, level):
         assert reader.fieldnames and "run_epoch" in reader.fieldnames
 
 
+def _check_args_dump(folder, level):
+    artifact = folder / "args_dump" / "args_dump.json"
+    if level in (0, 1):
+        # The vector callable has no dump-marked arguments.
+        assert not artifact.exists()
+        return
+    data = json.loads(artifact.read_text())
+    assert data["dump_args_level"] == level
+    assert data["total_args"] > 0
+    if level == 2:
+        assert data["bin_file"] is None
+    else:
+        assert (artifact.parent / data["bin_file"]).stat().st_size > 0
+
+
 def _run(arch, runtime, device, borrowed, root, diagnostic):
     from simpler.task_interface import (  # noqa: PLC0415
         CallConfig,
@@ -89,25 +104,22 @@ def _run(arch, runtime, device, borrowed, root, diagnostic):
                 Tensor(backing, shapes=(count,), dtype=DataType.FLOAT32),
                 TensorArgType.INPUT if i < 2 else TensorArgType.OUTPUT_EXISTING,
             )
-        levels = (2, 4, 0, 1, 2) if diagnostic == "pmu" else (4, 1, 0, 3, 2)
+        selections = {"pmu": (2, 4, 0, 1, 2), "swimlane": (4, 1, 0, 3, 2), "args_dump": (3, 1, 0, 2, 3)}
+        levels = selections[diagnostic]
         for invocation, level in enumerate(levels):
             folder = root / str(invocation)
             folder.mkdir()
             config = CallConfig()
-            if diagnostic == "pmu":
-                config.enable_pmu = level
-            else:
-                config.enable_chip_swimlane = level
+            field = {"pmu": "enable_pmu", "swimlane": "enable_chip_swimlane", "args_dump": "enable_dump_args"}
+            setattr(config, field[diagnostic], level)
             config.output_prefix = str(folder)
             worker.submit(handle, args, config, caller_stream=stream.value).wait()
             result = array.array("f", [0.0]) * count
             worker.copy_from(result, buffers[2])
             expected = 47.0 if runtime == "tensormap_and_ringbuffer" else 42.0
             assert all(value == expected for value in result), (level, result[:8])
-            if diagnostic == "pmu":
-                _check_pmu(folder, level)
-            else:
-                _check_swimlane(folder, level)
+            checker = {"pmu": _check_pmu, "swimlane": _check_swimlane, "args_dump": _check_args_dump}
+            checker[diagnostic](folder, level)
     finally:
         # The caller stream may still hold a wait after the kernel boundaries.
         if stream.value:
@@ -152,6 +164,29 @@ def test_worker_uses_each_invocations_selection(
             str(tmp_path),
             diagnostic,
         ],
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    ("arch", "runtime"),
+    [
+        pytest.param(arch, runtime, marks=[pytest.mark.requires_hardware, pytest.mark.platforms([arch])])
+        for arch, runtime in (
+            ("a2a3", "host_build_graph"),
+            ("a2a3", "tensormap_and_ringbuffer"),
+            ("a5", "tensormap_and_ringbuffer"),
+        )
+    ],
+)
+def test_worker_uses_each_invocations_args_dump_selection(arch, runtime, tmp_path, request):
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    result = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, "1", str(tmp_path), "args_dump"],
         capture_output=True,
         text=True,
         timeout=240,
