@@ -324,6 +324,11 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         serial_orch_sched_ = runtime->dev.serial_orch_sched;
 
         hs_arrived_.store(0, std::memory_order_relaxed);
+#if SIMPLER_DFX
+        // One leader initializes accounting before handshake/configuration can
+        // fail. The completed predecessor owns no producer writes here.
+        scope_stats_aicpu_begin_run();
+#endif
         if (sched_ctx_.pre_handshake_init(runtime, aicpu_thread_num_, sched_thread_num_, get_platform_regs()) != 0) {
             init_failed_.store(true, std::memory_order_release);
             hs_setup_done_.store(true, std::memory_order_release);
@@ -825,12 +830,6 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
         // state null) when scope_stats is disabled; the current buffer is
         // popped lazily on the first scope_end append.
         scope_stats_aicpu_set_orch_thread_idx(thread_idx);
-        // This run's own counters, zeroed on the device rather than by the
-        // host at admission: with a successor already queued a host instant
-        // can fall either side of a producer transition, and this one cannot —
-        // the predecessor's producer is gone with its operator. A no-op when
-        // no bank was resolved, which is every run on the default path.
-        scope_stats_aicpu_begin_run();
 #endif
 
 #if SIMPLER_DFX

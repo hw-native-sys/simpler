@@ -169,6 +169,10 @@ TEST(DiagnosticAdmissionTest, AnAdmittedRunKeepsTheCollectorNonIdleUntilItIsPubl
     ASSERT_TRUE(collector.run_begin(9401, root.prefix("run-a").string()));
     EXPECT_FALSE(collector.retained_runs_idle()) << "an unpublished run let a rebuild free its writer's pools";
 
+    // This host-only fixture models an initialized, empty producer. An
+    // admitted identity alone is insufficient evidence that device init ran.
+    auto *state = get_scope_stats_buffer_state(collector.get_scope_stats_shm_device_ptr(), 0);
+    state->run_epoch = 9401;
     collector.run_close(9401, /*device_execution_complete=*/true);
     std::string error;
     (void)collector.flush_retained_runs(5000, &error);

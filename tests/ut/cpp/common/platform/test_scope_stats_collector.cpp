@@ -24,6 +24,7 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <vector>
 #include <unistd.h>
 
 namespace {
@@ -256,4 +257,204 @@ TEST(ScopeStatsRunIdentityTest, TwoPartialRunsAccountWithoutACapacityTerm) {
     EXPECT_EQ(published_records + in_flight + state->dropped_record_count, state->total_record_count);
 
     collector.finalize(nullptr, test_free);
+}
+
+TEST(ScopeStatsRunIdentityTest, HostAdmissionLeavesProducerStateAndHeldBufferUntouched) {
+    ScopeStatsCollector collector;
+    ASSERT_EQ(collector.init(1, test_alloc, nullptr, test_free, 0), 0);
+    void *shm = collector.get_scope_stats_shm_device_ptr();
+    auto *state = get_scope_stats_buffer_state(shm, 0);
+    const uint64_t held = state->free_queue.buffer_ptrs[state->free_queue.head % PLATFORM_SCOPE_STATS_SLOT_COUNT];
+    ++state->free_queue.head;
+    state->current_buf_ptr = held;
+    state->current_buf_seq = 7;
+    state->total_record_count = 13;
+    state->dropped_record_count = 2;
+    state->published_record_count = 8;
+    state->published_buffer_count = 3;
+    auto *buffer = reinterpret_cast<ScopeStatsBuffer *>(held);
+    buffer->count = 3;
+    buffer->run_epoch = 11;
+    buffer->local_seq = 7;
+    std::vector<unsigned char> before(calc_scope_stats_shm_size(1));
+    std::memcpy(before.data(), shm, before.size());
+    unsigned char header_before[offsetof(ScopeStatsBuffer, records)];
+    std::memcpy(header_before, buffer, sizeof(header_before));
+
+    collector.begin_run(22);
+
+    EXPECT_EQ(std::memcmp(shm, before.data(), before.size()), 0);
+    EXPECT_EQ(std::memcmp(buffer, header_before, sizeof(header_before)), 0);
+    collector.finalize(nullptr, test_free);
+}
+
+TEST(ScopeStatsRunIdentityTest, DeviceEntryOwnsAccountingAndHeldBufferWithoutATerminalBank) {
+    ScopeStatsCollector collector;
+    ASSERT_EQ(collector.init(1, test_alloc, nullptr, test_free, 0), 0);
+    void *shm = collector.get_scope_stats_shm_device_ptr();
+    auto *state = get_scope_stats_buffer_state(shm, 0);
+    const uint64_t held = state->free_queue.buffer_ptrs[state->free_queue.head % PLATFORM_SCOPE_STATS_SLOT_COUNT];
+    ++state->free_queue.head;
+    state->current_buf_ptr = held;
+    state->current_buf_seq = 7;
+    state->total_record_count = 13;
+    state->dropped_record_count = 2;
+    state->published_record_count = 8;
+    state->published_buffer_count = 3;
+    auto *buffer = reinterpret_cast<ScopeStatsBuffer *>(held);
+    buffer->count = 3;
+    buffer->run_epoch = 11;
+    buffer->local_seq = 5;
+    const uint32_t head = state->free_queue.head;
+    const uint32_t tail = state->free_queue.tail;
+    set_platform_scope_stats_run_terminal(0);
+    set_scope_stats_enabled(true);
+    set_platform_scope_stats_base(reinterpret_cast<uint64_t>(shm));
+    set_platform_run_result(0, 22);
+
+    scope_stats_aicpu_begin_run();
+
+    EXPECT_EQ(state->total_record_count, 0u);
+    EXPECT_EQ(state->dropped_record_count, 0u);
+    EXPECT_EQ(state->published_record_count, 0u);
+    EXPECT_EQ(state->published_buffer_count, 0u);
+    EXPECT_EQ(state->current_buf_ptr, held);
+    EXPECT_EQ(state->current_buf_seq, 7u);
+    EXPECT_EQ(state->free_queue.head, head);
+    EXPECT_EQ(state->free_queue.tail, tail);
+    EXPECT_EQ(buffer->count, 0u);
+    EXPECT_EQ(buffer->run_epoch, 22u);
+    EXPECT_EQ(buffer->local_seq, 7u);
+    EXPECT_EQ(state->run_epoch, 22u);
+    set_platform_scope_stats_base(0);
+    set_platform_run_result(0, 0);
+    collector.finalize(nullptr, test_free);
+}
+
+TEST(ScopeStatsRunIdentityTest, AnUnstartedRunCannotRecoverOrExportItsPredecessorsAccounting) {
+    ScopeStatsCollector collector;
+    ASSERT_EQ(collector.init(1, test_alloc, nullptr, test_free, 0), 0);
+    void *shm = collector.get_scope_stats_shm_device_ptr();
+    set_platform_scope_stats_base(reinterpret_cast<uint64_t>(shm));
+    set_platform_scope_stats_run_terminal(0);
+    set_platform_run_result(0, 11);
+    set_scope_stats_enabled(true);
+    scope_stats_aicpu_set_orch_thread_idx(0);
+    scope_stats_aicpu_begin_run();
+    scope_stats_set_pending_site("previous.cpp", 7);
+    scope_stats_begin(0, 1, 2, 1024, 2048, 1, 2, 3);
+    auto *state = get_scope_stats_buffer_state(shm, 0);
+    ASSERT_NE(state->current_buf_ptr, 0u);
+    ASSERT_EQ(reinterpret_cast<ScopeStatsBuffer *>(state->current_buf_ptr)->count, 1u);
+    collector.begin_run(22);
+    const auto root = std::filesystem::temp_directory_path() / ("scope_stats_unstarted_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+
+    EXPECT_FALSE(collector.reconcile_counters());
+    EXPECT_EQ(collector.total_collected(), 0u);
+    EXPECT_NE(collector.write_jsonl(root.string()), 0);
+    EXPECT_FALSE(std::filesystem::exists(root / "scope_stats" / "scope_stats.jsonl"));
+
+    set_platform_scope_stats_base(0);
+    set_platform_run_result(0, 0);
+    collector.finalize(nullptr, test_free);
+    std::filesystem::remove_all(root);
+}
+
+TEST(ScopeStatsRunIdentityTest, FailedTerminalReadInvalidatesAnEarlierSuccessfulSnapshot) {
+    ScopeStatsCollector collector;
+    ASSERT_EQ(collector.init(1, test_alloc, nullptr, test_free, 0), 0);
+    void *shm = collector.get_scope_stats_shm_device_ptr();
+    collector.begin_run(11);
+    set_scope_stats_enabled(true);
+    set_platform_scope_stats_base(reinterpret_cast<uint64_t>(shm));
+    set_platform_scope_stats_run_terminal(0);
+    set_platform_run_result(0, 11);
+    scope_stats_aicpu_begin_run();
+    ASSERT_TRUE(collector.reconcile_counters());
+    const auto root =
+        std::filesystem::temp_directory_path() / ("scope_stats_failed_read_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    ASSERT_EQ(collector.write_jsonl((root / "before").string()), 0);
+
+    collector.fail_terminal_copy_for_test(true);
+    EXPECT_FALSE(collector.reconcile_counters());
+    EXPECT_NE(collector.write_jsonl((root / "after").string()), 0);
+    EXPECT_FALSE(std::filesystem::exists(root / "after"));
+
+    set_platform_scope_stats_base(0);
+    set_platform_run_result(0, 0);
+    collector.finalize(nullptr, test_free);
+    std::filesystem::remove_all(root);
+}
+
+TEST(ScopeStatsRunIdentityTest, DisabledProducerLifecycleLeavesAResidentPoolUntouched) {
+    ScopeStatsCollector collector;
+    ASSERT_EQ(collector.init(1, test_alloc, nullptr, test_free, 0), 0);
+    void *shm = collector.get_scope_stats_shm_device_ptr();
+    set_platform_scope_stats_base(reinterpret_cast<uint64_t>(shm));
+    set_platform_scope_stats_run_terminal(0);
+    set_platform_run_result(0, 11);
+    set_scope_stats_enabled(true);
+    scope_stats_aicpu_set_orch_thread_idx(0);
+    scope_stats_aicpu_begin_run();
+    scope_stats_set_pending_site("enabled.cpp", 7);
+    scope_stats_begin(0, 1, 2, 1024, 2048, 1, 2, 3);
+    auto *state = get_scope_stats_buffer_state(shm, 0);
+    ASSERT_NE(state->current_buf_ptr, 0u);
+    auto *held = reinterpret_cast<ScopeStatsBuffer *>(state->current_buf_ptr);
+    ASSERT_EQ(held->count, 1u);
+    std::vector<unsigned char> before(calc_scope_stats_shm_size(1));
+    std::memcpy(before.data(), shm, before.size());
+    unsigned char header_before[offsetof(ScopeStatsBuffer, records)];
+    std::memcpy(header_before, held, sizeof(header_before));
+
+    DiagnosticRunTerminal bank{};
+    bank.run_epoch = 11;
+    bank.total = 1;
+    bank.live_at_close = 1;
+    unsigned char bank_before[sizeof(bank)];
+    std::memcpy(bank_before, &bank, sizeof(bank));
+    set_platform_scope_stats_run_terminal(reinterpret_cast<uint64_t>(&bank));
+
+    // Sim retains its resident base across OFF invocations.
+    set_scope_stats_enabled(false);
+    set_platform_run_result(0, 22);
+    scope_stats_aicpu_begin_run();
+    scope_stats_aicpu_flush_buffers();
+    scope_stats_aicpu_close_run();
+
+    EXPECT_EQ(std::memcmp(shm, before.data(), before.size()), 0);
+    EXPECT_EQ(std::memcmp(held, header_before, sizeof(header_before)), 0);
+    EXPECT_EQ(std::memcmp(&bank, bank_before, sizeof(bank)), 0);
+    set_platform_scope_stats_run_terminal(0);
+    set_platform_scope_stats_base(0);
+    set_platform_run_result(0, 0);
+    collector.finalize(nullptr, test_free);
+}
+
+TEST(ScopeStatsRunIdentityTest, ProducerlessRuntimeExportsMetadataWithoutADeviceEntry) {
+    ScopeStatsCollector collector;
+    ASSERT_EQ(collector.init(1, test_alloc, nullptr, test_free, 0), 0);
+    const simpler::dfx::scope_stats_runs::CapacityMetadata capacities{false, std::nullopt};
+    collector.begin_run(11, &capacities);
+    auto *state = get_scope_stats_buffer_state(collector.get_scope_stats_shm_device_ptr(), 0);
+    ASSERT_EQ(state->run_epoch, 0u);
+    EXPECT_TRUE(collector.reconcile_counters());
+    const auto root =
+        std::filesystem::temp_directory_path() / ("scope_stats_producerless_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(root);
+    EXPECT_EQ(collector.write_jsonl(root.string()), 0);
+    const std::string metadata = read_file(root / "scope_stats" / "scope_stats.jsonl");
+    EXPECT_NE(metadata.find("\"total\": 0"), std::string::npos);
+    EXPECT_EQ(metadata.find('\n'), metadata.size() - 1);
+
+    // The exception belongs to this runtime contract, not to the collector's
+    // lifetime. Unknown/required producers still need an initialized epoch.
+    collector.begin_run(22);
+    EXPECT_FALSE(collector.reconcile_counters());
+    EXPECT_NE(collector.write_jsonl((root / "required").string()), 0);
+    EXPECT_FALSE(std::filesystem::exists(root / "required"));
+    collector.finalize(nullptr, test_free);
+    std::filesystem::remove_all(root);
 }

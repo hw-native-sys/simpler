@@ -100,6 +100,7 @@ bool ScopeStatsCollector::charge_record_block(size_t bytes) {
 // ---------------------------------------------------------------------------
 
 bool ScopeStatsCollector::read_terminal_checked(scope_runs::DeviceSnapshot *out) {
+    device_snapshot_valid_ = false;
     if (out == nullptr || shm_host_ == nullptr) return false;
     *out = scope_runs::DeviceSnapshot{};
     if (fail_terminal_copy_) return false;
@@ -115,6 +116,7 @@ bool ScopeStatsCollector::read_terminal_checked(scope_runs::DeviceSnapshot *out)
     }
     rmb();
     *out = snapshot_unchecked();
+    device_snapshot_valid_ = out->valid;
     return out->valid;
 }
 
@@ -250,17 +252,9 @@ bool ScopeStatsCollector::run_begin(
         note_host_failure("the background writer could not be started");
         return false;
     }
-    // With a bank mapped the producer resets its own device counters and adopts
-    // its own carried-over buffer at this run's device init, so the host must do
-    // neither: its write would land either side of a producer transition, which
-    // is the hazard the move to the device removes. The host half of the
-    // admission — this run's records, receipts and completion observation — is
-    // not the producer's and runs either way.
-    //
-    // The host half is this run's own receipts, not a reset of the collector's:
-    // a predecessor may still be open, and `begin_run_host_state` would release
-    // the records it has not sealed. Each admitted run gets its own entry and
-    // retires it at its own close.
+    // Mapped runs keep their own host receipts while a predecessor may still
+    // be open. The producer initializes counters and held buffers on-device in
+    // both collection modes; host admission only owns the collection window.
     if (terminal_banks_.opened()) {
         if (!open_run_receipts(run_epoch)) {
             {
@@ -279,21 +273,7 @@ bool ScopeStatsCollector::run_begin(
         execution_complete_.store(false, std::memory_order_release);
         return true;
     }
-    if (!begin_run(run_epoch)) {
-        // The device would attribute this run's records to the previous one, so
-        // the run is refused here — before any kernel is submitted — rather
-        // than publishing an artifact whose records are not all its own. Same
-        // rollback as the writer's: the slot is given back, not held by a run
-        // that will never close.
-        {
-            std::lock_guard<std::mutex> lk(retained_mu_);
-            slots_[admitted] = Slot{};
-        }
-        retained_cv_.notify_all();
-        if (credit_notifier_) credit_notifier_();
-        note_host_failure("the producer's carried-over buffer could not be re-stamped for the admitted run");
-        return false;
-    }
+    begin_run(run_epoch, capacities);
     return true;
 }
 

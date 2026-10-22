@@ -116,15 +116,15 @@ struct ScopeStatsBuffer {
     // device buffer has been returned to the pool and reused by a later run.
     // Zero when the producer had no run identity to stamp.
     //
-    // A buffer the producer still holds at a run's end is the one exception,
-    // and only between runs: once that run's completion is proved and before
-    // the next launch, the host re-stamps this header for the run it is
-    // admitting, because reusing the pointer means the producer never pops and
-    // so never re-stamps it itself.
+    // After the preceding producer stops, the next enabled run's AICPU init
+    // leader re-stamps a held buffer before handshake and orchestration. The
+    // predecessor's device terminal accounts for unsettled records in mapped
+    // mode; ordinary/unmapped collection settles its host boundary first.
+    // The pointer remains producer-owned.
     uint64_t run_epoch;
-    // Buffer generation within that run, from the producer's own rotation
-    // counter. Restarts per run, so it identifies a buffer only together with
-    // `run_epoch` — it is not a cross-run ordering key.
+    // Buffer generation from the producer's persistent rotation counter.
+    // Together with `run_epoch` it identifies a buffer within that run;
+    // it is not a cross-run ordering key.
     uint32_t local_seq;
     uint32_t _pad1[11];  // Pad the header to 64 B; isolates count's cache line.
 
@@ -158,13 +158,18 @@ struct ScopeStatsBufferState {
     volatile uint32_t total_record_count;      // Device: monotonic count of every record appended (success + dropped)
     volatile uint32_t published_record_count;  // Device: records inside buffers committed to the ready queue
     volatile uint32_t published_buffer_count;  // Device: successful ready-queue commits
-    uint32_t _pad[9];
+    uint32_t _reserved;
+    // Published after device run initialization; stale accounting is not this run's.
+    volatile uint64_t run_epoch;
+    uint32_t _pad[6];
 } __attribute__((aligned(64)));
 // The host maps this state by size, so a counter added inside the existing
 // padding must not move the cache line it shares with the free queue.
 static_assert(
     sizeof(ScopeStatsBufferState) == sizeof(ScopeStatsFreeQueue) + 64, "ScopeStatsBufferState must stay two lines"
 );
+
+static_assert(offsetof(ScopeStatsBufferState, run_epoch) == sizeof(ScopeStatsFreeQueue) + 32);
 
 // Ready queue entry — when a ScopeStatsBuffer fills, AICPU pushes one of these
 // onto the per-thread ready queue for host pickup.

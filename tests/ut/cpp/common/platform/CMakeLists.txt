@@ -115,6 +115,16 @@ platform_case(test_scope_stats_collector.cpp PER_ARCH
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp
     TIER aicpu)
 
+# Detached host shadows keep a failed held-buffer read distinct from a valid
+# shared accounting read, including on the otherwise SVM architecture.
+platform_case(test_scope_stats_read_failure.cpp PER_ARCH
+    SOURCES
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/scope_stats_collector.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/scope_stats_retained_runs.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/scope_stats_collector_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
+    TIER aicpu)
+
 platform_case(test_scope_stats_retained_runs.cpp PER_ARCH
     SOURCES
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/scope_stats_collector.cpp

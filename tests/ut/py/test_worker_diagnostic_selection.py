@@ -66,6 +66,24 @@ def _check_args_dump(folder, level):
         assert (artifact.parent / data["bin_file"]).stat().st_size > 0
 
 
+def _check_scope_stats(folder, enabled, *, producer_expected=True):
+    artifact = folder / "scope_stats" / "scope_stats.jsonl"
+    if not enabled:
+        assert not artifact.exists()
+        return
+    metadata, *records = [json.loads(line) for line in artifact.read_text().splitlines()]
+    assert metadata["fatal"] is False, metadata
+    assert metadata["dropped"] == 0, metadata
+    assert metadata["total"] == len(records), (metadata, records)
+    if not producer_expected:
+        assert not records, records
+        return
+    assert len(records) >= 4, records
+    epochs = {record["run_epoch"] for record in records}
+    assert len(epochs) == 1 and 0 not in epochs, epochs
+    return next(iter(epochs))
+
+
 def _run(arch, runtime, device, borrowed, root, diagnostic):
     from simpler.task_interface import (  # noqa: PLC0415
         CallConfig,
@@ -104,13 +122,24 @@ def _run(arch, runtime, device, borrowed, root, diagnostic):
                 Tensor(backing, shapes=(count,), dtype=DataType.FLOAT32),
                 TensorArgType.INPUT if i < 2 else TensorArgType.OUTPUT_EXISTING,
             )
-        selections = {"pmu": (2, 4, 0, 1, 2), "swimlane": (4, 1, 0, 3, 2), "args_dump": (3, 1, 0, 2, 3)}
+        selections = {
+            "pmu": (2, 4, 0, 1, 2),
+            "swimlane": (4, 1, 0, 3, 2),
+            "args_dump": (3, 1, 0, 2, 3),
+            "scope_stats": (True, False, True, True),
+        }
         levels = selections[diagnostic]
+        scope_epochs = set()
         for invocation, level in enumerate(levels):
             folder = root / str(invocation)
             folder.mkdir()
             config = CallConfig()
-            field = {"pmu": "enable_pmu", "swimlane": "enable_chip_swimlane", "args_dump": "enable_dump_args"}
+            field = {
+                "pmu": "enable_pmu",
+                "swimlane": "enable_chip_swimlane",
+                "args_dump": "enable_dump_args",
+                "scope_stats": "enable_scope_stats",
+            }
             setattr(config, field[diagnostic], level)
             config.output_prefix = str(folder)
             worker.submit(handle, args, config, caller_stream=stream.value).wait()
@@ -118,8 +147,18 @@ def _run(arch, runtime, device, borrowed, root, diagnostic):
             worker.copy_from(result, buffers[2])
             expected = 47.0 if runtime == "tensormap_and_ringbuffer" else 42.0
             assert all(value == expected for value in result), (level, result[:8])
-            checker = {"pmu": _check_pmu, "swimlane": _check_swimlane, "args_dump": _check_args_dump}
-            checker[diagnostic](folder, level)
+            checker = {
+                "pmu": _check_pmu,
+                "swimlane": _check_swimlane,
+                "args_dump": _check_args_dump,
+            }
+            if diagnostic == "scope_stats":
+                epoch = _check_scope_stats(folder, level, producer_expected=runtime == "tensormap_and_ringbuffer")
+                if epoch is not None:
+                    assert epoch not in scope_epochs, (invocation, epoch, scope_epochs)
+                    scope_epochs.add(epoch)
+            else:
+                checker[diagnostic](folder, level)
     finally:
         # The caller stream may still hold a wait after the kernel boundaries.
         if stream.value:
@@ -187,6 +226,37 @@ def test_worker_uses_each_invocations_args_dump_selection(arch, runtime, tmp_pat
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     result = subprocess.run(
         [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, "1", str(tmp_path), "args_dump"],
+        capture_output=True,
+        text=True,
+        timeout=240,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.requires_hardware
+@pytest.mark.parametrize(
+    ("arch", "runtime"),
+    [
+        pytest.param(arch, runtime, marks=pytest.mark.platforms([arch]))
+        for arch in ("a2a3", "a5")
+        for runtime in ("host_build_graph", "tensormap_and_ringbuffer")
+    ],
+)
+@pytest.mark.parametrize("borrowed", [False, True])
+def test_worker_collects_scope_stats_each_invocation(arch, runtime, borrowed, tmp_path, request):
+    device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            arch,
+            runtime,
+            device,
+            str(int(borrowed)),
+            str(tmp_path),
+            "scope_stats",
+        ],
         capture_output=True,
         text=True,
         timeout=240,

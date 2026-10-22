@@ -1239,11 +1239,9 @@ int SimDeviceRunnerBase::start_shared_collectors_for_run(
                 return PTO_RUNTIME_ERR_INTERNAL;
             }
         } else {
-            // The default path writes one file per boundary rather than a
-            // per-run artifact, and on failure it keeps the behaviour it has
-            // without the re-stamp: a run is never refused here. The helper has
-            // already logged which buffer and which run it concerns.
-            (void)scope_stats_collector_.begin_run(run_epoch);
+            // The host window opens before its collector threads start;
+            // producer state is initialized at this run's device entry.
+            scope_stats_collector_.begin_run(run_epoch, run_metadata.scope_stats_capacity);
             scope_stats_collector_.start(thread_factory);
         }
     }

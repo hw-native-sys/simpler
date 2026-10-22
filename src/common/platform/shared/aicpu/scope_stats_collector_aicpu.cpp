@@ -301,18 +301,9 @@ void scope_stats_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx =
 extern "C" void set_platform_scope_stats_run_terminal(uint64_t bank) { s_run_terminal_bank = bank; }
 
 extern "C" void scope_stats_aicpu_begin_run() {
-    if (s_scope_stats_state == nullptr) return;
-    // Without a mapped bank this collector is on the default path: no successor
-    // can be admitted, and the host still owns both the counter reset and the
-    // adoption of a held buffer. Doing either here as well would renumber the
-    // lifetime totals the host reconciles against.
-    if (s_run_terminal_bank == 0) return;
-
-    // The counters this run accounts into are the producer's own and are zeroed
-    // here rather than by the host at admission: a host instant can fall either
-    // side of a producer transition once a successor may already be queued, and
-    // this one cannot — the predecessor's producers are gone with their
-    // operator before this run's device init runs.
+    if (!scope_stats_enabled || s_scope_stats_state == nullptr) return;
+    // Both collection modes reset at the producer boundary, after the previous
+    // operator has stopped. Host admission never writes this accounting state.
     s_scope_stats_state->total_record_count = 0;
     s_scope_stats_state->dropped_record_count = 0;
     s_scope_stats_state->published_record_count = 0;
@@ -330,6 +321,8 @@ extern "C" void scope_stats_aicpu_begin_run() {
         held->local_seq = s_scope_stats_state->current_buf_seq;
     }
     wmb();
+    s_scope_stats_state->run_epoch = get_platform_run_result_epoch();
+    wmb();
 
     simpler::dfx::terminal::begin_run(
         s_run_terminal_bank, SCOPE_STATS_TERMINAL_PRODUCERS, SCOPE_STATS_TERMINAL_PRODUCER,
@@ -338,7 +331,7 @@ extern "C" void scope_stats_aicpu_begin_run() {
 }
 
 extern "C" void scope_stats_aicpu_close_run() {
-    if (s_scope_stats_state == nullptr) return;
+    if (!scope_stats_enabled || s_scope_stats_state == nullptr) return;
 
     uint32_t live_at_close = 0;
     const uint64_t held_ptr = s_scope_stats_state->current_buf_ptr;
@@ -361,7 +354,7 @@ extern "C" void scope_stats_aicpu_close_run() {
 }
 
 void scope_stats_aicpu_flush_buffers() {
-    if (s_scope_stats_state == nullptr) {
+    if (!scope_stats_enabled || s_scope_stats_state == nullptr) {
         return;
     }
     rmb();

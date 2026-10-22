@@ -210,7 +210,8 @@ while this run's file is still being written. **`run()` returning no longer
 means `scope_stats.jsonl` exists — `Worker.flush_diagnostics()` is the barrier
 that says the files up to that point are published.** TMR only; on
 `host_build_graph` there is no producer and the boundary behaves as it always
-has. The default (`collect_across_runs=False`) path is unchanged.
+has. The default (`collect_across_runs=False`) path continues to attempt export at its
+run boundary.
 
 Four keys are added to the metadata line in this mode only, so a reader that
 ignores them sees the same shape as before:
@@ -223,20 +224,36 @@ ignores them sees the same shape as before:
 | `host_retained_records` | uint | Of those, how many the 256 MiB per-collector budget kept |
 
 A run that ends without the producer handing its last buffer over leaves that
-buffer named in `current_buf_ptr` — holding whatever records the boundary has
-just recovered, possibly none, and still stamped with the run that acquired it.
-Because the producer only re-stamps a buffer it *pops*, reusing that pointer
-would make the next run append behind those records and inherit their identity.
-Admission therefore re-stamps the buffer's 64-byte header — `count`,
-`run_epoch`, `local_seq` — for the run being admitted, so each artifact holds
-only its own records. The pointer and the free queue are left alone: the drain
-shard is the sole runtime writer of the free queue, and clearing the pointer
-would orphan a pool buffer. A header that cannot be republished to the device
-fails the admission, so no artifact is written for a run whose records the
-device could misattribute.
+buffer named in `current_buf_ptr`, possibly containing unsettled records and
+still stamped with the run that acquired it.
+Before handshake and orchestration configuration, the next enabled run's AICPU
+leader resets the four producer counters and re-stamps the held buffer's `count`,
+`run_epoch` and `local_seq`. This device
+entry runs after the preceding producer has stopped. Ordinary/unmapped collection
+settles the predecessor's host boundary before reuse; mapped retained collection
+uses its device terminal's `live_at_close`, even when host sealing happens later.
+The rule applies both with and without a retained terminal bank; host admission clears only its host collection window and performs
+no producer-state readback or header upload. The pointer and the free queue are
+left alone: the drain shard is the sole runtime writer of the free queue, and
+clearing the pointer would orphan a pool buffer. A mapped terminal bank supplies
+per-run accounting publication; it does not select who initializes the producer.
+Disabled invocations leave the resident producer state and terminal untouched,
+even when sim retains the pool address.
+The shared accounting epoch is published after initialization, using existing
+padding without growing the shared region. Ordinary collection checks it against
+the admitted run before recovery or export. A run that never reaches device
+initialization, or whose shared-region read fails, cannot export the predecessor's
+accounting. This marker identifies initialization; it does not prove completion.
+A producerless runtime (`CapacityMetadata.required=false`, as in HBG) still
+exports its metadata-only artifact; it has no producer epoch to validate.
+Unknown/required producers retain the epoch check.
 
-A published file is not by itself a success: loss, a fatal and unknown counts
-each make `flush_diagnostics()` raise, and the error is sticky for the runner's
+Ordinary collection is best effort: a rejected snapshot is logged and no artifact
+is written; the diagnostic rejection does not replace the computation result.
+Retained collection uses its existing collection-error reporting below.
+
+In retained mode, a published file is not by itself a success: loss, a fatal and
+unknown counts each make `flush_diagnostics()` raise, and the error is sticky for the runner's
 life. A file already occupying the destination is never removed or overwritten
 — the run fails instead. And a run whose device completion could not be proved
 writes **no** file at all: nothing shared is read on that path, its host copies
@@ -260,7 +277,7 @@ Per-sample lines, oldest-first:
 | `dep_pool_end` | int | Scheduler-published dependency-list pool top at this boundary |
 | `tensormap` | int | Tensormap entries in use |
 | `run_epoch` | uint | Which run produced this record. Copied out of the buffer the record came from, so it stays correct after that buffer is returned to the pool and reused by a later run. `0` means the producer had no run identity to stamp |
-| `buf_seq` | uint | Buffer generation within that run. Restarts per run, so it identifies a buffer only together with `run_epoch` — not a cross-run ordering key |
+| `buf_seq` | uint | Generation from the producer's persistent rotation counter, so it identifies a buffer only together with `run_epoch` — not a cross-run ordering key |
 
 `start`/`end` are the ring's tail/head pointers at that boundary — see
 the metric formulas in [§1](#reading-the-report) for how a scope's peak

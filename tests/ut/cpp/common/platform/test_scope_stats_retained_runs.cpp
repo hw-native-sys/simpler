@@ -121,7 +121,10 @@ struct RetainedFixture {
 
     bool begin(uint64_t epoch, const fs::path &prefix) {
         collector.start(retained_thread_factory);
-        return collector.run_begin(epoch, prefix.string());
+        if (!collector.run_begin(epoch, prefix.string())) return false;
+        set_platform_run_result(0, epoch);
+        scope_stats_aicpu_begin_run();
+        return true;
     }
     void close(uint64_t epoch, bool complete = true) { collector.run_close(epoch, complete); }
     bool flush(std::string *error) { return collector.flush_retained_runs(5000, error); }
@@ -487,8 +490,8 @@ TEST(ScopeStatsRetainedRuns, ARecoveredBufferIsNotTheNextRunsToAppendTo) {
     ASSERT_EQ(reinterpret_cast<const ScopeStatsBuffer *>(carried)->count, 4u);
     fx.close(5101);
 
-    // Run b produces nothing at all. Admission is what re-stamps the carried
-    // buffer, so this run owns an empty one rather than the previous run's.
+    // Run b produces nothing. Its device entry re-stamps the carried buffer
+    // before any append, so this run owns an empty one.
     ASSERT_TRUE(fx.begin(5102, fx.root.prefix("run-b")));
     EXPECT_EQ(fx.state()->current_buf_ptr, carried) << "the pointer must be left in place";
     const auto *buf = reinterpret_cast<const ScopeStatsBuffer *>(carried);
@@ -551,6 +554,7 @@ TEST(ScopeStatsRetainedRuns, RetentionOffKeepsTheSingleRunOutput) {
     collector.begin_run(4601);
     collector.start(retained_thread_factory);
     set_platform_run_result(0, 4601);
+    scope_stats_aicpu_begin_run();
     scope_stats_set_pending_site("default.cpp", 300);
     scope_stats_begin(0, 1, 2, 1024, 2048, 1, 2, 3);
     scope_stats_end(0, 1, 3, 1024, 3072, 1, 3, 4);

@@ -90,6 +90,8 @@ int ScopeStatsCollector::init(
     bank_free_cb_ = free_cb;
     total_collected_ = 0;
     refused_records_ = 0;
+    expected_producer_epoch_ = 0;
+    device_snapshot_valid_ = false;
     (void)records_.release();
     recovered_current_buf_ = 0;
     recovered_current_total_ = 0;
@@ -171,7 +173,11 @@ int ScopeStatsCollector::init(
 // Record accumulation (in-memory)
 // ---------------------------------------------------------------------------
 
-void ScopeStatsCollector::begin_run_host_state() {
+void ScopeStatsCollector::begin_run(
+    uint64_t run_epoch, const simpler::dfx::scope_stats_runs::CapacityMetadata *capacities
+) {
+    expected_producer_epoch_ = capacities == nullptr || capacities->required ? run_epoch : 0;
+    device_snapshot_valid_ = false;
     {
         std::scoped_lock lock(records_mutex_);
         const size_t charged = records_.release();
@@ -182,89 +188,6 @@ void ScopeStatsCollector::begin_run_host_state() {
     recovered_current_buf_ = 0;
     recovered_current_total_ = 0;
     execution_complete_.store(false, std::memory_order_release);
-}
-
-bool ScopeStatsCollector::begin_run(uint64_t run_epoch) {
-    begin_run_host_state();
-
-    if (shm_host_ == nullptr) return true;
-
-    // The device's record counters are producer-side and never reset by it, so
-    // they carry the previous run's totals into this run's reconcile. The old
-    // finalize/init cycle cleared them implicitly by memsetting a fresh region.
-    // The two are adjacent, so one write-back covers both and leaves the
-    // device-owned fields in the same line alone.
-    ScopeStatsBufferState *state = get_scope_stats_buffer_state(shm_host_, 0);
-    state->dropped_record_count = 0;
-    state->total_record_count = 0;
-    wmb();
-    static_assert(
-        offsetof(ScopeStatsBufferState, total_record_count) ==
-            offsetof(ScopeStatsBufferState, dropped_record_count) + sizeof(uint32_t),
-        "the two counters must stay adjacent for this single write-back to cover both"
-    );
-    publish_field(&state->dropped_record_count, 2 * sizeof(uint32_t), "record counters");
-    return adopt_current_buffer(run_epoch);
-}
-
-bool ScopeStatsCollector::adopt_current_buffer(uint64_t run_epoch) {
-    ScopeStatsBufferState *state = get_scope_stats_buffer_state(shm_host_, 0);
-    // Both fields are device-written, so the shadow is refreshed rather than
-    // trusted: whether the preceding boundary happened to read the whole region
-    // is not a property this run should depend on.
-    if (manager_.read_range_from_device(&state->current_buf_ptr, sizeof(state->current_buf_ptr)) != 0 ||
-        manager_.read_range_from_device(&state->current_buf_seq, sizeof(state->current_buf_seq)) != 0) {
-        LOG_ERROR(
-            "scope_stats: run %llu could not read what the producer still holds, so it cannot own it",
-            static_cast<unsigned long long>(run_epoch)
-        );
-        return false;
-    }
-    rmb();
-    const uint64_t buf_dev = state->current_buf_ptr;
-    // Zero is the whole of the ordinary path: the producer clears the pointer
-    // when it publishes, and for a non-empty buffer its end-of-run flush clears
-    // it on both the enqueued and the dropped branch. An empty one is left
-    // named — that flush returns early on a zero count without clearing — so
-    // the pointer surviving does not by itself mean records came with it. So
-    // this costs two narrow reads per run and does nothing until a run ends
-    // with the producer still holding a buffer.
-    if (buf_dev == 0) return true;
-    void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_dev));
-    if (host_ptr == nullptr) {
-        LOG_ERROR(
-            "scope_stats: the buffer 0x%lx the producer still holds has no host mapping, so it cannot be re-stamped "
-            "for run %llu",
-            static_cast<unsigned long>(buf_dev), static_cast<unsigned long long>(run_epoch)
-        );
-        return false;
-    }
-    ScopeStatsBuffer *buf = reinterpret_cast<ScopeStatsBuffer *>(host_ptr);
-    // Already harvested: the preceding run's close recovered this buffer's
-    // records into that run's own accounting — `recover_unpublished_buffer_checked`
-    // on the retained path, `reconcile_counters` on the default one. Zeroing the
-    // count here is what stops them being counted a second time as this run's.
-    const uint32_t carried_over = buf->count;
-    buf->count = 0;
-    buf->run_epoch = run_epoch;
-    buf->local_seq = state->current_buf_seq;
-    wmb();
-    // `records` begins where the header ends, so this range is the whole header
-    // and none of the record storage.
-    if (profiling_copy_to_device(reinterpret_cast<void *>(buf_dev), host_ptr, offsetof(ScopeStatsBuffer, records)) !=
-        0) {
-        LOG_ERROR(
-            "scope_stats: re-stamping the buffer 0x%lx the producer still holds failed, so run %llu cannot own it",
-            static_cast<unsigned long>(buf_dev), static_cast<unsigned long long>(run_epoch)
-        );
-        return false;
-    }
-    LOG_WARN(
-        "scope_stats: run %llu starts with the buffer 0x%lx still held by the producer, carrying %u already-recovered "
-        "records; it is re-stamped for this run so they are not counted twice",
-        static_cast<unsigned long long>(run_epoch), static_cast<unsigned long>(buf_dev), carried_over
-    );
-    return true;
 }
 
 void ScopeStatsCollector::on_buffer_collected(const ScopeStatsReadyBufferInfo &info) {
@@ -511,23 +434,24 @@ bool ScopeStatsCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return false;
     report_drain_drops();
 
-    // Pull the latest BufferState (current_buf_ptr, total/dropped counters)
-    // before the cross-check so it sees post-stop() device state.
-    if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
-        profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
-    }
-    rmb();
+    simpler::dfx::scope_stats_runs::DeviceSnapshot device;
+    if (!read_terminal_checked(&device)) return false;
     bool clean = true;
 
     ScopeStatsBufferState *state = scope_stats_state(0);
-    uint64_t total_device = state->total_record_count;
-    uint64_t dropped_device = state->dropped_record_count;
+    uint64_t total_device = device.total_records;
+    uint64_t dropped_device = device.dropped_records;
 
     uint64_t buf_dev = state->current_buf_ptr;
     if (buf_dev != 0) {
         void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(buf_dev));
         if (host_ptr != nullptr) {
-            profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_dev), sizeof(ScopeStatsBuffer));
+            if (profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_dev), sizeof(ScopeStatsBuffer)) !=
+                0) {
+                device_snapshot_valid_ = false;
+                LOG_ERROR("scope_stats: reading the held buffer failed; no artifact is written");
+                return false;
+            }
             uint32_t count = reinterpret_cast<const ScopeStatsBuffer *>(host_ptr)->count;
             if (count != 0) {
                 if (recovered_current_buf_ != buf_dev || recovered_current_total_ != total_device) {
@@ -638,6 +562,13 @@ simpler::dfx::scope_stats_runs::DeviceSnapshot ScopeStatsCollector::snapshot_unc
     if (shm_host_ == nullptr) return out;
     const ScopeStatsDataHeader *hdr = scope_stats_header();
     const ScopeStatsBufferState *state = scope_stats_state(0);
+    if (expected_producer_epoch_ != 0 && state->run_epoch != expected_producer_epoch_) {
+        LOG_ERROR(
+            "scope_stats: producer epoch %llu does not match run %llu; no accounting is exported",
+            static_cast<unsigned long long>(state->run_epoch), static_cast<unsigned long long>(expected_producer_epoch_)
+        );
+        return out;
+    }
     out.fatal_latched = hdr->fatal_latched;
     out.dropped_records = state->dropped_record_count;
     out.total_records = state->total_record_count;
@@ -719,6 +650,7 @@ int ScopeStatsCollector::render_jsonl_to(
 
 int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     if (!initialized_ || shm_host_ == nullptr) return 0;
+    if (!device_snapshot_valid_) return PTO_RUNTIME_ERR_INVALID_STATE;
 
     std::filesystem::path dir = std::filesystem::path(output_dir) / "scope_stats";
     std::error_code ec;
