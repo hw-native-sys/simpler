@@ -75,8 +75,9 @@ size_t ArgsDumpCollector::normalize_collector_shard(int collector_shard) const {
     return static_cast<size_t>(collector_shard);
 }
 
-void ArgsDumpCollector::begin_run(const std::string &output_prefix, DumpArgsLevel dump_args_level) {
+void ArgsDumpCollector::begin_run(const std::string &output_prefix, DumpArgsLevel dump_args_level, uint64_t run_epoch) {
     output_prefix_ = output_prefix;
+    run_epoch_ = run_epoch;
     dump_args_level_ = dump_args_level;
     reset_collector_shards();
     total_dropped_record_count_.store(0, std::memory_order_relaxed);
@@ -99,33 +100,6 @@ void ArgsDumpCollector::begin_run(const std::string &output_prefix, DumpArgsLeve
     }
     for (auto &count : received_payload_counts_) {
         count.store(0, std::memory_order_relaxed);
-    }
-
-    if (shm_host_ != nullptr) {
-        // The per-thread payload counters are what reconcile compares against,
-        // and nothing on the device resets them. published/completed/dropped are
-        // contiguous, so one write-back per thread covers them.
-        //
-        // arena_write_offset is deliberately NOT reset: it is a monotonic cursor
-        // the host reads modulo arena_size, so it stays correct across runs.
-        static_assert(
-            offsetof(DumpBufferState, dropped_record_count) ==
-                offsetof(DumpBufferState, published_payload_count) + 2 * sizeof(uint64_t),
-            "the payload counters must stay contiguous for this single write-back to cover them"
-        );
-        constexpr size_t kCounterSpan = 2 * sizeof(uint64_t) + sizeof(uint32_t);
-        // The region holds num_dump_threads_ states (calc_dump_data_size), so
-        // that is the bound — a wider loop writes past its end. The runner
-        // rebuilds this collector when a run's thread count changes, so a
-        // resident one is never asked to reset a state it does not own.
-        for (int t = 0; t < num_dump_threads_; t++) {
-            DumpBufferState *state = get_dump_buffer_state(shm_host_, t);
-            state->published_payload_count = 0;
-            state->completed_payload_count = 0;
-            state->dropped_record_count = 0;
-            wmb();
-            publish_field(&state->published_payload_count, kCounterSpan, "payload counters");
-        }
     }
 }
 
@@ -726,11 +700,14 @@ void ArgsDumpCollector::reconcile_counters() {
     if (retain_across_runs_) return;
     report_drain_drops();
 
-    // Pull the latest BufferStates (current_buf_ptr, dropped_record_count)
+    // Pull the latest BufferStates (current_buf_ptr, run_dropped_record_count)
     // before the per-thread loop so leftovers reflect post-stop() device
     // state.
     if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
-        profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_);
+        if (profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_) != 0) {
+            LOG_ERROR("Args dump: cannot read device state for run %llu", static_cast<unsigned long long>(run_epoch_));
+            return;
+        }
     }
     rmb();
 
@@ -746,9 +723,19 @@ void ArgsDumpCollector::reconcile_counters() {
     // collected buffer, so a hung run still yields its dumped inputs/outputs.
     for (int t = 0; t < num_dump_threads_; t++) {
         DumpBufferState *state = get_dump_buffer_state(shm_host_, t);
+        if (state->run_epoch != run_epoch_) {
+            // The pool includes non-scheduler AICPU lanes that never initialize.
+            // A prior held buffer or loss count still needs an attributable run.
+            if (state->current_buf_ptr != 0 || state->run_dropped_record_count != 0) {
+                LOG_ERROR(
+                    "Args dump: lane %d did not initialize for run %llu", t, static_cast<unsigned long long>(run_epoch_)
+                );
+            }
+            continue;
+        }
 
-        total_dropped_record_count_.fetch_add(state->dropped_record_count, std::memory_order_relaxed);
-        dropped_total += state->dropped_record_count;
+        total_dropped_record_count_.fetch_add(state->run_dropped_record_count, std::memory_order_relaxed);
+        dropped_total += state->run_dropped_record_count;
 
         uint64_t cur_ptr = state->current_buf_ptr;
         if (cur_ptr == 0) continue;
@@ -756,8 +743,13 @@ void ArgsDumpCollector::reconcile_counters() {
         void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(cur_ptr));
         if (host_ptr == nullptr) continue;
 
-        profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(cur_ptr), sizeof(DumpMetaBuffer));
-        uint32_t count = reinterpret_cast<DumpMetaBuffer *>(host_ptr)->count;
+        if (profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(cur_ptr), sizeof(DumpMetaBuffer)) != 0) {
+            LOG_ERROR("Args dump: cannot recover lane %d for run %llu", t, static_cast<unsigned long long>(run_epoch_));
+            continue;
+        }
+        const auto *buffer = static_cast<const DumpMetaBuffer *>(host_ptr);
+        if (buffer->run_epoch != run_epoch_) continue;
+        uint32_t count = buffer->count;
         if (count == 0) continue;
 
         DumpReadyBufferInfo info;
@@ -857,22 +849,29 @@ void ArgsDumpCollector::publish_arena_acks() {
     for (int t = 0; t < num_dump_threads_; t++) {
         DumpBufferState *host_state = get_dump_buffer_state(shm_host_, t);
         DumpBufferState *device_state = get_dump_buffer_state(dump_shared_mem_dev_, t);
+        constexpr size_t kOrdinaryCounterSpan = offsetof(DumpBufferState, run_epoch) + sizeof(uint64_t) -
+                                                offsetof(DumpBufferState, published_payload_count);
+        const size_t counter_bytes =
+            retain_across_runs_ ? sizeof(host_state->published_payload_count) : kOrdinaryCounterSpan;
         if (profiling_copy_from_device(
-                &host_state->published_payload_count, &device_state->published_payload_count,
-                sizeof(host_state->published_payload_count)
+                &host_state->published_payload_count, &device_state->published_payload_count, counter_bytes
             ) != 0) {
             continue;
         }
+        if (!retain_across_runs_ && host_state->run_epoch != run_epoch_) continue;
         const uint64_t published = host_state->published_payload_count;
         // What releases this lane's arena differs by path, and the difference is
         // the whole point of the retained one.
         //
-        // Default path, unchanged: the writer bumps `written_payload_counts_[t]`
+        // Ordinary collection: the writer bumps `written_payload_counts_[t]`
         // once `args.bin` accepted the bytes, and that equality is the proof.
         // One run owns the file for its whole boundary, so tying reuse to disk
-        // costs that run nothing — and `begin_run` zeroes these counters per
-        // run, which is what keeps that path's own recovery of an un-flushed
-        // buffer from crediting a payload the device never published.
+        // costs that run nothing. Its host window starts at zero while the
+        // device's initialization baseline anchors it in the lifetime cursor.
+        // This equation assumes recovery runs after producers stop. The
+        // ordinary close boundary does not yet check its producer-stop proof;
+        // recovery of unpublished payloads against a live producer can therefore
+        // over-credit this count. Epoch/read checks do not establish quiescence.
         //
         // `written_payload_counts_[t]` is deliberately **not** part of the
         // retained equation: the writer advances it for recovered payloads too,
@@ -895,14 +894,14 @@ void ArgsDumpCollector::publish_arena_acks() {
             taken = received_payload_counts_[t].load(std::memory_order_acquire) +
                     discarded_payload_counts_[t].load(std::memory_order_acquire);
         } else {
-            taken = written_payload_counts_[t].load(std::memory_order_acquire);
+            taken = host_state->run_published_payload_base + written_payload_counts_[t].load(std::memory_order_acquire);
         }
         if (taken < published) {
             continue;
         }
         if (host_state->completed_payload_count >= published) {
             // Already acknowledged at or past this watermark. The counters are
-            // monotonic for the collector's life on the retained path, so the
+            // monotonic for the collector's life on both paths, so the
             // acknowledgement must never move backwards.
             continue;
         }

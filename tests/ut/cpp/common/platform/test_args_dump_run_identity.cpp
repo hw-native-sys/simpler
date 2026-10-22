@@ -22,10 +22,9 @@
  * only by a successful enqueue, because AICPU consumes the free queue and never
  * produces into it, so reuse by the next run's init is its only way back.
  *
- * Payloads are deliberately out of scope here: every record is a SCALAR with
- * `capture_payload = 0`, so nothing touches the arena. The arena needs no
- * identity of its own — `arena_write_offset` is monotonic across runs, so a
- * record's `payload_offset` is already unique and its run is the record's.
+ * Scalar records exercise buffer identity; payload records additionally pin
+ * the lifetime credit equation across ordinary invocations. Arena identity
+ * comes from its monotonic offset and each record's invocation epoch.
  */
 
 #include <gtest/gtest.h>
@@ -90,7 +89,7 @@ protected:
         std::filesystem::remove_all(dir_);
         ASSERT_TRUE(std::filesystem::create_directories(dir_));
 
-        collector_.begin_run(dir_.string(), DumpArgsLevel::FULL);
+        collector_.begin_run(dir_.string(), DumpArgsLevel::FULL, 0);
         ASSERT_EQ(
             collector_.initialize(
                 /*num_dump_threads=*/1, /*device_id=*/0, DumpArgsLevel::FULL, args_dump_test_alloc, nullptr,
@@ -118,7 +117,7 @@ protected:
     // One run's device-side sequence: the host opens the window, the device
     // acquires a buffer, records `args` scalars and flushes.
     void run_once(uint64_t epoch, int args) {
-        collector_.begin_run(dir_.string(), DumpArgsLevel::FULL);
+        collector_.begin_run(dir_.string(), DumpArgsLevel::FULL, epoch);
         run_once_without_begin_run(epoch, args);
     }
 
@@ -190,8 +189,137 @@ int ArgsDumpRunIdentityTest::instance_ = 0;
 TEST_F(ArgsDumpRunIdentityTest, HostAdmissionDoesNotPublishADeviceSelection) {
     std::vector<unsigned char> before(sizeof(*header_));
     std::memcpy(before.data(), header_, before.size());
-    collector_.begin_run(dir_.string(), DumpArgsLevel::PARTIAL);
+    collector_.begin_run(dir_.string(), DumpArgsLevel::PARTIAL, 0);
     EXPECT_EQ(std::memcmp(header_, before.data(), before.size()), 0);
+}
+
+TEST_F(ArgsDumpRunIdentityTest, HostAdmissionLeavesProducerAndTransportStateUntouched) {
+    state_->published_payload_count = 17;
+    state_->completed_payload_count = 13;
+    state_->dropped_record_count = 9;
+    state_->arena_write_offset = 128;
+    std::vector<unsigned char> before(sizeof(*state_));
+    std::memcpy(before.data(), state_, before.size());
+
+    collector_.begin_run(dir_.string(), DumpArgsLevel::FULL, 0);
+
+    EXPECT_EQ(std::memcmp(state_, before.data(), before.size()), 0);
+}
+
+TEST_F(ArgsDumpRunIdentityTest, OrdinaryPayloadAcknowledgementsRemainMonotonicAcrossInvocations) {
+    for (uint64_t epoch = 71; epoch != 74; ++epoch) {
+        SCOPED_TRACE(epoch);
+        collector_.begin_run(dir_.string(), DumpArgsLevel::FULL, epoch);
+        set_platform_run_result(0, epoch);
+        dump_args_init(1, DumpArgsLevel::FULL);
+        uint32_t value = static_cast<uint32_t>(epoch);
+        ArgsDumpInfo info{};
+        info.task_id = simpler::ut::test_task_id(0x700);
+        info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
+        info.dtype = static_cast<uint8_t>(DataType::UINT32);
+        info.buffer_addr = reinterpret_cast<uint64_t>(&value);
+        info.ndims = 1;
+        info.shapes[0] = info.strides[0] = 1;
+        info.capture_payload = 1;
+        ASSERT_EQ(dump_arg_record(kThreadIdx, info), 0);
+        dump_args_flush(kThreadIdx);
+        const uint64_t expected = epoch - 70;
+        ASSERT_EQ(state_->published_payload_count, expected);
+        EXPECT_EQ(state_->completed_payload_count, expected - 1);
+        collector_.publish_arena_acks();
+        EXPECT_EQ(state_->completed_payload_count, expected - 1);
+
+        ASSERT_EQ(collect_published(), 1);
+        ASSERT_EQ(collector_.export_dump_files(), 0);
+        std::ifstream payload(dir_ / "args_dump" / "args.bin", std::ios::binary);
+        uint32_t restored = 0;
+        payload.read(reinterpret_cast<char *>(&restored), sizeof(restored));
+        ASSERT_EQ(payload.gcount(), sizeof(restored));
+        EXPECT_EQ(restored, value);
+        collector_.publish_arena_acks();
+        EXPECT_EQ(state_->completed_payload_count, expected);
+        host_push_free_queue(state_->free_queue, published_buffer_at(consumed_tail_ - 1));
+    }
+}
+
+TEST_F(ArgsDumpRunIdentityTest, DeviceEntryStartsRunAccountingWithoutResettingLifetimeTransport) {
+    state_->published_payload_count = state_->completed_payload_count = 17;
+    state_->dropped_record_count = UINT32_MAX;
+    state_->run_dropped_record_count = 7;
+    state_->arena_write_offset = 128;
+    state_->free_queue.head = state_->free_queue.tail;
+    const uint32_t head = state_->free_queue.head;
+    const uint32_t tail = state_->free_queue.tail;
+    set_platform_run_result(0, 81);
+
+    dump_args_init(1, DumpArgsLevel::FULL);
+
+    EXPECT_EQ(state_->published_payload_count, 17u);
+    EXPECT_EQ(state_->completed_payload_count, 17u);
+    EXPECT_EQ(state_->dropped_record_count, UINT32_MAX);
+    EXPECT_EQ(state_->run_published_payload_base, 17u);
+    EXPECT_EQ(state_->run_dropped_record_count, 0u);
+    EXPECT_EQ(state_->arena_write_offset, 128u);
+    EXPECT_EQ(state_->free_queue.head, head);
+    EXPECT_EQ(state_->free_queue.tail, tail);
+}
+
+TEST(ArgsDumpRunIdentity, UnusedCollectorLanesDoNotReportInitializationFailure) {
+    ArgsDumpCollector collector;
+    const auto dir = std::filesystem::temp_directory_path() / ("args_dump_unused_lanes_" + std::to_string(::getpid()));
+    std::filesystem::remove_all(dir);
+    ASSERT_EQ(collector.initialize(2, 0, DumpArgsLevel::FULL, args_dump_test_alloc, nullptr, args_dump_test_free), 0);
+    void *shm = collector.get_dump_shm_device_ptr();
+    set_dump_args_enabled(true);
+    set_platform_dump_base(reinterpret_cast<uint64_t>(shm));
+    set_platform_run_result(0, 71);
+    collector.begin_run(dir.string(), DumpArgsLevel::FULL, 71);
+    dump_args_init(1, DumpArgsLevel::FULL);
+    ASSERT_NE(get_dump_buffer_state(shm, 0)->current_buf_ptr, 0u);
+    ASSERT_EQ(get_dump_buffer_state(shm, 1)->current_buf_ptr, 0u);
+
+    testing::internal::CaptureStderr();
+    collector.reconcile_counters();
+    const auto unused = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(unused.find("did not initialize"), std::string::npos);
+
+    get_dump_buffer_state(shm, 0)->run_epoch = 70;
+    testing::internal::CaptureStderr();
+    collector.reconcile_counters();
+    const auto stale = testing::internal::GetCapturedStderr();
+    EXPECT_NE(stale.find("lane 0 did not initialize for run 71"), std::string::npos);
+    EXPECT_EQ(stale.find("lane 1 did not initialize"), std::string::npos);
+
+    set_dump_args_enabled(false);
+    set_platform_dump_base(0);
+    set_platform_run_result(0, 0);
+    collector.finalize(nullptr, args_dump_test_free);
+    std::filesystem::remove_all(dir);
+}
+
+TEST_F(ArgsDumpRunIdentityTest, AnUnstartedInvocationCannotRecoverItsPredecessor) {
+    collector_.begin_run(dir_.string(), DumpArgsLevel::FULL, 91);
+    set_platform_run_result(0, 91);
+    dump_args_init(1, DumpArgsLevel::FULL);
+    record_scalar(0x900, 0);
+    ASSERT_NE(state_->current_buf_ptr, 0u);
+    ASSERT_EQ(reinterpret_cast<DumpMetaBuffer *>(state_->current_buf_ptr)->count, 1u);
+
+    collector_.begin_run(dir_.string(), DumpArgsLevel::FULL, 92);
+    collector_.reconcile_counters();
+    EXPECT_EQ(collector_.export_dump_files(), 0);
+    EXPECT_FALSE(std::filesystem::exists(dir_ / "args_dump" / "args_dump.json"));
+}
+
+TEST_F(ArgsDumpRunIdentityTest, AnUnstartedInvocationCannotAcknowledgeItsPredecessorsBaseline) {
+    state_->published_payload_count = state_->run_published_payload_base = 17;
+    state_->completed_payload_count = 13;
+    state_->run_epoch = 91;
+    collector_.begin_run(dir_.string(), DumpArgsLevel::FULL, 92);
+
+    collector_.publish_arena_acks();
+
+    EXPECT_EQ(state_->completed_payload_count, 13u);
 }
 
 TEST_F(ArgsDumpRunIdentityTest, InvocationSelectionControlsPayloadWithoutPoolMetadata) {
@@ -200,7 +328,7 @@ TEST_F(ArgsDumpRunIdentityTest, InvocationSelectionControlsPayloadWithoutPoolMet
          {DumpArgsLevel::HYBRID, DumpArgsLevel::FULL, DumpArgsLevel::PARTIAL, DumpArgsLevel::HYBRID,
           DumpArgsLevel::FULL}) {
         SCOPED_TRACE(static_cast<uint32_t>(level));
-        collector_.begin_run(dir_.string(), level);
+        collector_.begin_run(dir_.string(), level, 0);
         header_->reserved = UINT32_MAX;
         dump_args_init(/*num_dump_threads=*/1, level);
         EXPECT_EQ(is_dump_args_selective_mode(), level == DumpArgsLevel::PARTIAL);
@@ -347,7 +475,7 @@ TEST_F(ArgsDumpRunIdentityTest, APublishedBufferIsNotAlsoRetainedByTheDevice) {
 
     // Nothing is retained, so the next run draws from the pool — and it must not
     // draw the one the host has not given back.
-    collector_.begin_run(dir_.string(), DumpArgsLevel::FULL);
+    collector_.begin_run(dir_.string(), DumpArgsLevel::FULL, 52);
     set_platform_run_result(/*region_base=*/0, /*run_epoch=*/52);
     dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);
     const uint64_t acquired = state_->current_buf_ptr;

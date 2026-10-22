@@ -252,11 +252,13 @@ public:
         DumpUnregisterCallback unregister_cb = nullptr
     );
 
-    // Bind the single-run artifact configuration and reset its shard/counter
-    // window. The prefix is read when the writer starts on the first buffer.
+    // Bind the single-run artifact configuration and reset only its host
+    // shard/counter window. Device transport cursors remain monotonic.
+    // The prefix is read when the writer starts on the first buffer. Ordinary
+    // recovery and arena credits require this exact initialized device epoch.
     // Device selection is published separately in the invocation descriptor;
     // retained runs use run_begin() and preserve their monotonic counters.
-    void begin_run(const std::string &output_prefix, DumpArgsLevel dump_args_level);
+    void begin_run(const std::string &output_prefix, DumpArgsLevel dump_args_level, uint64_t run_epoch);
 
     void start(const profiling_common::ThreadFactory &thread_factory);
 
@@ -603,6 +605,7 @@ private:
     // thread builds run_dir_ = output_prefix_ / "args_dump" lazily on the
     // first on_buffer_collected.
     std::string output_prefix_;
+    uint64_t run_epoch_{0};
 
     // Per-thread arena pointers (device + host shadow)
     struct ArenaInfo {

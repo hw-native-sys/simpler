@@ -670,7 +670,7 @@ TEST(ArgsDumpRetainedRuns, RetentionOffKeepsTheSingleRunOutput) {
     set_dump_args_enabled(true);
     set_platform_dump_base(reinterpret_cast<uint64_t>(shm));
 
-    collector.begin_run(root.prefix("run-a").string(), DumpArgsLevel::FULL);
+    collector.begin_run(root.prefix("run-a").string(), DumpArgsLevel::FULL, 1201);
     std::vector<int32_t> tensor(kTensorElements, 3);
     set_platform_run_result(/*region_base=*/0, 1201);
     dump_args_init(/*num_dump_threads=*/1, DumpArgsLevel::FULL);

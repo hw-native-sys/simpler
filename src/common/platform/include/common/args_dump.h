@@ -41,6 +41,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "common/args_dump_task_metadata.h"
 #include "common/platform_config.h"
@@ -200,7 +201,10 @@ static_assert(sizeof(DumpFreeQueue) == 128, "DumpFreeQueue must be 128 bytes");
  * - arena_write_offset: Device writes (monotonic), Host reads to size the arena snapshot
  * - published_payload_count: Device counts payload records committed to the ready queue
  * - completed_payload_count: Host acknowledges payloads after writer completion
- * - dropped_record_count: Device writes (records lost before host export)
+ * - dropped_record_count: Device writes (lifetime records lost before host export)
+ * - run_published_payload_base: Device snapshots the lifetime payload cursor at init
+ * - run_dropped_record_count: Device counts losses for this invocation
+ * - run_epoch: Device publishes the initialized baseline identity before dispatch
  */
 struct DumpBufferState {
     DumpFreeQueue free_queue;                   // SPSC queue of free DumpMetaBuffer addresses
@@ -213,14 +217,25 @@ struct DumpBufferState {
     volatile uint64_t published_payload_count;  // Payload records committed to the ready queue
     volatile uint64_t completed_payload_count;  // Host-acknowledged published payload count
     volatile uint32_t dropped_record_count;     // Records dropped before host export
-    uint8_t pad1[68];                           // Pad to 256 bytes (188 + 68 = 256)
+    uint32_t pad1;
+    volatile uint64_t run_published_payload_base;  // Lifetime payload cursor at invocation init
+    volatile uint32_t run_dropped_record_count;    // Losses in this invocation
+    uint32_t pad2;
+    volatile uint64_t run_epoch;  // Initialized invocation identity
+    uint8_t pad3[40];             // Pad to 256 bytes (216 + 40)
 } __attribute__((aligned(64)));
 
+static_assert(
+    std::is_standard_layout_v<DumpBufferState> && std::is_trivially_copyable_v<DumpBufferState>,
+    "DumpBufferState must support raw host/device copies"
+);
 static_assert(sizeof(DumpBufferState) == 256, "DumpBufferState must be 256 bytes");
 static_assert(offsetof(DumpBufferState, current_buf_ptr) == 128, "DumpBufferState current_buf_ptr offset changed");
 static_assert(offsetof(DumpBufferState, arena_base) == 144, "DumpBufferState arena_base offset changed");
 static_assert(offsetof(DumpBufferState, completed_payload_count) == 176, "completed payload offset changed");
 static_assert(offsetof(DumpBufferState, dropped_record_count) == 184, "dropped record offset changed");
+static_assert(offsetof(DumpBufferState, run_published_payload_base) == 192, "run baseline offset changed");
+static_assert(offsetof(DumpBufferState, run_epoch) == 208, "run epoch offset changed");
 
 // =============================================================================
 // DumpReadyQueueEntry - Ready Queue Entry

@@ -183,6 +183,7 @@ TEST_F(ArgsDumpRunTerminalTest, ARecordRefusedBeforeTheWriteIsAlsoThisRunsTotal)
 
     EXPECT_EQ(terminal().total, 2u) << "a refused record left the total";
     EXPECT_EQ(terminal().dropped, 1u);
+    EXPECT_EQ(state_->run_dropped_record_count, 1u);
     EXPECT_EQ(terminal().published_records, 1u);
 
     const credit::RunReconciliation out = reconcile(/*received=*/1);

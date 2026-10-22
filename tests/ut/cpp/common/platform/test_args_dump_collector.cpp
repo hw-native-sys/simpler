@@ -50,7 +50,7 @@ TEST(ArgsDumpCollectorTest, MergesConcurrentShardRecordsIntoManifest) {
     constexpr int kRecordsPerShard = 32;
     constexpr int kShardCount = DumpModule::kMaxCollectorThreads;
     ArgsDumpCollector collector;
-    collector.begin_run(test_dir.string(), DumpArgsLevel::HYBRID);
+    collector.begin_run(test_dir.string(), DumpArgsLevel::HYBRID, 0);
     ASSERT_EQ(collector.initialize(kShardCount, 0, DumpArgsLevel::HYBRID, test_alloc, nullptr, test_free), 0);
 
     std::vector<DumpMetaBuffer> buffers(kShardCount);
@@ -116,7 +116,7 @@ TEST(ArgsDumpCollectorTest, ArenaAckAdvancesOnlyForThreadsWhosePayloadsLanded) {
     constexpr int kArenaCount = 2;
     constexpr uint64_t kPayloadSize = sizeof(uint64_t);
     TestArgsDumpCollector collector;
-    collector.begin_run(test_dir.string(), DumpArgsLevel::FULL);
+    collector.begin_run(test_dir.string(), DumpArgsLevel::FULL, 0);
     ASSERT_EQ(collector.initialize(kArenaCount, 0, DumpArgsLevel::FULL, test_alloc, nullptr, test_free), 0);
 
     auto *device_base = collector.get_dump_shm_device_ptr();
@@ -178,7 +178,7 @@ TEST(ArgsDumpCollectorTest, ArenaAckDoesNotOffsetPayloadsAcrossThreads) {
     ASSERT_TRUE(std::filesystem::create_directories(test_dir));
 
     TestArgsDumpCollector collector;
-    collector.begin_run(test_dir.string(), DumpArgsLevel::FULL);
+    collector.begin_run(test_dir.string(), DumpArgsLevel::FULL, 0);
     ASSERT_EQ(collector.initialize(2, 0, DumpArgsLevel::FULL, test_alloc, nullptr, test_free), 0);
 
     auto *device_base = collector.get_dump_shm_device_ptr();
@@ -247,7 +247,7 @@ TEST(ArgsDumpCollectorTest, FinalizeStopsTheWriterWhenExportIsSkipped) {
     ASSERT_TRUE(std::filesystem::create_directories(test_dir));
 
     ArgsDumpCollector collector;
-    collector.begin_run(test_dir.string(), DumpArgsLevel::FULL);
+    collector.begin_run(test_dir.string(), DumpArgsLevel::FULL, 0);
     ASSERT_EQ(collector.initialize(1, 0, DumpArgsLevel::FULL, test_alloc, nullptr, test_free), 0);
 
     // One collected buffer is all it takes to start the writer thread.

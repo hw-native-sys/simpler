@@ -130,8 +130,14 @@ before task dispatch (`PARTIAL` → selective,
 `HYBRID` → all metadata, payload copy controlled by the
 same per-task mask as `PARTIAL`). Host admission freezes the export selection
 without writing or reading back a shared device level; descriptor publication
-failure stops kernel submission. Ordinary payload-counter reset and retained
-queue/cursor ownership remain separate protocols. The runtime resolves the mask before each
+failure stops kernel submission. Host admission only resets its local collection
+window. Device entry records the payload-credit baseline used by ordinary collectors
+and clears per-invocation drop accounting; transport counters and queue/arena cursors remain
+monotonic for both ordinary and retained collection. Device entry publishes the
+initialized epoch after the baseline is ready. Ordinary arena acknowledgements
+and leftover recovery require that epoch to match the host invocation; recovery
+reads must succeed before cached bytes can be consumed. Already collected records
+remain best-effort output; retained error reporting is unchanged. The runtime resolves the mask before each
 record reaches the platform writer, so the writer does not depend on a second
 task-id lookup. Because the
 level is decided host-side **before any task is
@@ -556,10 +562,12 @@ Two honest limits of this mode:
   not an acknowledgement, and contributes nothing to it.
 
 The lane payload counters (`published_payload_count`,
-`completed_payload_count`) become monotonic for the collector's life on this
-path instead of being reset per run, so a predecessor's writer cannot have its
-acknowledgements zeroed by a successor's admission. The design assumes one
-collector's lifetime does not produce 2⁶⁴ payload records; admission checks the
+`completed_payload_count`) are monotonic for the collector's life on both paths.
+Retained collection uses lifetime host-ownership credits. Ordinary collection
+uses the device-entry `run_published_payload_base` plus this invocation's
+written payload count, so opening a new host window cannot erase or manufacture
+transport credits. The design assumes one
+collector's lifetime does not produce 2⁶⁴ payload records; retained admission checks the
 counters' headroom and refuses a run that is close to it, which lowers the risk
 of reaching that bound rather than proving no single run can.
 
@@ -592,7 +600,10 @@ DumpBufferState[num_dump_threads]               (per-thread)
 ├── arena_write_offset         (AICPU cursor in the current arena reuse cycle)
 ├── published_payload_count    (payloads committed to Host through RQ entries)
 ├── completed_payload_count    (published watermark acknowledged by Host)
-└── dropped_record_count
+├── dropped_record_count       (lifetime, retained fallback accounting)
+├── run_published_payload_base  (device-entry lifetime cursor)
+├── run_dropped_record_count    (this invocation only)
+└── run_epoch                   (initialized baseline identity)
 
 DumpMetaBuffer pool (rotated)                   (BUFFERS_PER_THREAD per thread)
 └── ArgsDumpRecord records[RECORDS_PER_BUFFER] + count   ← 128 B each
@@ -797,8 +808,9 @@ the fields host modified (advanced `queue_heads[q]`, refilled
 The per-thread arena lives outside the shm region, so
 `on_buffer_collected` separately refreshes `arena_write_offset` and
 copies the arena bytes. The arena-ack pass refreshes each thread's
-`published_payload_count` and compares it with that thread's writer completion
-count. For each thread whose counts match, Host writes that published watermark
+`published_payload_count` and the device-entry `run_published_payload_base`.
+For ordinary collection it compares the published cursor with that baseline
+plus the thread's current-window writer completion count. For each thread whose counts match, Host writes that published watermark
 back as `completed_payload_count`; AICPU requires this acknowledgement before
 reusing that thread's arena. The comparison and the write-back are both
 per-thread, so one lane's outstanding payload never holds up another's arena.
@@ -881,7 +893,7 @@ a5 normally relies on per-thread AICPU flush (`dump_args_flush`) to move
 the current buffer into the ready queue. If a hang/op-timeout reaps AICPU
 before that flush runs, `reconcile_counters` recovers a non-empty
 `current_buf_ptr` host-side before export, then accumulates each thread's
-`dropped_record_count` for the final anomaly report.
+`run_dropped_record_count` for the final anomaly report.
 
 ### 5.6 a2a3 vs a5 at a glance
 
@@ -983,6 +995,12 @@ per replenish tick — writes that watermark back as the thread's
 monotonic logical offset to the next physical arena boundary and writes the
 pending payload from the arena start.
 
+The ordinary host window counts writes from zero. Device initialization snapshots
+the lifetime published cursor into `run_published_payload_base`; adding that
+baseline converts current-window disk completions to lifetime transport credits.
+The retained path continues using lifetime receipt/discard credits. Neither host
+admission nor device entry resets published/completed cursors.
+
 Every quantity here is per-thread: each AICPU thread owns its own arena, so
 thread *t* may wrap as soon as thread *t*'s own payloads are on disk. The cursor
 is never reset and no reclaimed/published arena offset is needed. The wait is
@@ -1010,14 +1028,18 @@ the current records are accounted as dropped.
 // Reuse current buffer — account for lost records
 account_dropped_records(state, cur_buf.count)
 cur_buf.count = 0          ← reset and reuse
-dropped_record_count += N  ← tracks total lost records
+dropped_record_count += N      ← saturating lifetime loss counter
+run_dropped_record_count += N  ← saturating loss counter for this invocation
 ```
 
 The same fallback applies during `dump_args_flush()` at end of
 execution if the ready queue is full.
 
 **Effect:** `dropped_records` in the manifest summary shows how
-many argument records were lost. Dropped arguments do not appear in
+many argument records were lost in this invocation. Device initialization clears
+`run_dropped_record_count`, independently of the lifetime counter used by retained
+collection. A saturated lifetime counter therefore does not hide a later
+ordinary invocation's losses. Dropped arguments do not appear in
 the `args[]` array at all.
 
 **Tuning:** raise `PLATFORM_DUMP_BUFFERS_PER_THREAD` (more
@@ -1148,9 +1170,14 @@ and 4 s stream-sync for onboard jobs; 5 s scheduler for sim jobs.
   blocks on the wedged core), its last buffer is left un-flushed on
   the device (`current_buf_ptr != 0`). The host's `reconcile_counters`
   detects this and recovers those records directly from the device
-  buffer + arena (the device is not reset until *after* the export),
-  so whatever the AICPU managed to record — including in-flight
-  output written before the kill — still reaches the manifest.
+  buffer + arena (the device is not reset until *after* the export). Recovery
+  requires the current invocation's initialized lane and buffer epochs and
+  successful shared-state and buffer reads; failed reads do not authorize
+  cached-shadow recovery. Records already owned by the host retain best-effort
+  export. Unread producer accounting is not represented as unknown in the current
+  manifest, so `dropped_records: 0` alone does not prove no loss after a read failure.
+  Recovery assumes stopped producers; the ordinary close boundary currently does
+  not check its producer-stop proof. Epoch and read checks do not establish quiescence.
 
 This ordering is load-bearing: if the timeouts were inverted (STARS
 reaping before the AICPU's budget, as in earlier versions), the

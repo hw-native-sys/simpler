@@ -524,6 +524,13 @@ platform_case(test_args_dump_run_identity.cpp PER_ARCH PER_RUNTIME
         ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
         ${SIMPLER_SRC}/@arch@/platform/sim/host/profiling_copy.cpp)
 
+platform_case(test_args_dump_read_failure.cpp PER_ARCH PER_RUNTIME
+    SOURCES
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_collector.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/args_dump_retained_runs.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp)
+
 # Per-run terminal evidence: the ArgsDump producer's own accounting, and the
 # credit pool and bank array every collector's banks are reserved from. Both
 # axes for the same reason as the cases above — the terminal is dimensioned by

@@ -60,10 +60,14 @@ def _check_args_dump(folder, level):
     data = json.loads(artifact.read_text())
     assert data["dump_args_level"] == level
     assert data["total_args"] > 0
+    assert data["dropped_records"] == 0
+    epochs = {record["run_epoch"] for record in data["args"]}
+    assert len(epochs) == 1 and next(iter(epochs)) != 0, epochs
     if level == 2:
         assert data["bin_file"] is None
     else:
         assert (artifact.parent / data["bin_file"]).stat().st_size > 0
+    return next(iter(epochs))
 
 
 def _check_scope_stats(folder, enabled, *, producer_expected=True):
@@ -129,7 +133,7 @@ def _run(arch, runtime, device, borrowed, root, diagnostic):
             "scope_stats": (True, False, True, True),
         }
         levels = selections[diagnostic]
-        scope_epochs = set()
+        diagnostic_epochs = set()
         for invocation, level in enumerate(levels):
             folder = root / str(invocation)
             folder.mkdir()
@@ -154,11 +158,11 @@ def _run(arch, runtime, device, borrowed, root, diagnostic):
             }
             if diagnostic == "scope_stats":
                 epoch = _check_scope_stats(folder, level, producer_expected=runtime == "tensormap_and_ringbuffer")
-                if epoch is not None:
-                    assert epoch not in scope_epochs, (invocation, epoch, scope_epochs)
-                    scope_epochs.add(epoch)
             else:
-                checker[diagnostic](folder, level)
+                epoch = checker[diagnostic](folder, level)
+            if epoch is not None:
+                assert epoch not in diagnostic_epochs, (invocation, epoch, diagnostic_epochs)
+                diagnostic_epochs.add(epoch)
     finally:
         # The caller stream may still hold a wait after the kernel boundaries.
         if stream.value:
@@ -222,10 +226,20 @@ def test_worker_uses_each_invocations_selection(
         )
     ],
 )
-def test_worker_uses_each_invocations_args_dump_selection(arch, runtime, tmp_path, request):
+@pytest.mark.parametrize("borrowed", [False, True])
+def test_worker_uses_each_invocations_args_dump_selection(arch, runtime, borrowed, tmp_path, request):
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, "1", str(tmp_path), "args_dump"],
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            arch,
+            runtime,
+            device,
+            str(int(borrowed)),
+            str(tmp_path),
+            "args_dump",
+        ],
         capture_output=True,
         text=True,
         timeout=240,
