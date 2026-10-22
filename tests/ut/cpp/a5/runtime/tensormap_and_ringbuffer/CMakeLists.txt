@@ -17,6 +17,26 @@ macro(a5_tmr_case)
     tmr_case(${ARGV} ARCHS a5)
 endmacro()
 
+a5_tmr_case(test_mix_spare_lane.cpp
+    NO_OBJS
+    SOURCES
+        ${A5_RUNTIME_DIR}/ring_buffer.cpp
+        ${A5_RUNTIME_DIR}/shared/shared_memory.cpp
+        ${A5_RUNTIME_DIR}/shared/runtime_init.cpp
+        ${A5_RUNTIME_DIR}/scheduler/scheduler.cpp
+        ${A5_RUNTIME_DIR}/scheduler/scheduler_dispatch.cpp
+        ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+    DEFINES SIMPLER_DFX=0
+    LINK a5_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    TIMEOUT 30)
+if(APPLE)
+    target_link_options(test_a5_tmr_mix_spare_lane PRIVATE -Wl,-dead_strip)
+else()
+    target_link_options(test_a5_tmr_mix_spare_lane PRIVATE -Wl,--gc-sections)
+endif()
+
 # Exercise the production cold path with an observable platform retirement sink.
 a5_tmr_case(test_scheduler_retirement.cpp
     SOURCES

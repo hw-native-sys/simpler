@@ -34,6 +34,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <algorithm>
 #include <set>
 #include <thread>
@@ -401,3 +402,221 @@ INSTANTIATE_TEST_SUITE_P(
         MPMCConfig{4, 4, 1250}  // HighContentionStress
     )
 );
+
+class MixReadyQueueTest : public ReadyQueueTest {
+protected:
+    void SetUp() override {
+        ReadyQueueTest::SetUp();
+        queue.track_mix_resources = true;
+    }
+};
+
+TEST_F(MixReadyQueueTest, MaskUnionTracksCellsAndTheirOriginalGeneration) {
+    ChipTaskSlotState left, right, both, full;
+    left.active_mask = ActiveMask(3);
+    right.active_mask = ActiveMask(5);
+    both.active_mask = ActiveMask(6);
+    full.active_mask = ActiveMask(7);
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 0);
+    ASSERT_TRUE(queue.push_tagged(&left, TaskId::make(0, 1), 3));
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 3);
+    ASSERT_TRUE(queue.push(&right, 5));
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 7);
+    // A stale early entry must release its cell's mask, not a reused task's mask.
+    left.active_mask = ActiveMask(2);
+    TaskId tag;
+    EXPECT_EQ(queue.pop_tagged(&tag), &left);
+    EXPECT_EQ(tag, TaskId::make(0, 1));
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 5);
+    ASSERT_TRUE(queue.push(&both, 6));
+    ASSERT_TRUE(queue.push(&full, 7));
+    EXPECT_EQ(queue.pop(), &right);
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 7);
+    EXPECT_EQ(queue.pop(), &both);
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 7);
+    EXPECT_EQ(queue.pop(), &full);
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 0);
+}
+
+TEST_F(MixReadyQueueTest, FailedPushAndBatchRollBackReservations) {
+    ChipTaskSlotState left, right;
+    left.active_mask = ActiveMask(3);
+    right.active_mask = ActiveMask(5);
+    for (uint64_t i = 0; i < CAPACITY; ++i)
+        ASSERT_TRUE(queue.push(&left, 3));
+    EXPECT_FALSE(queue.push(&right, 5));
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 3);
+    ChipTaskSlotState *batch[] = {&right, &right};
+    uint8_t core_masks[] = {5, 5};
+    EXPECT_FALSE(queue.push_batch(batch, 2, core_masks));
+    EXPECT_FALSE(queue.push_batch(batch, CAPACITY + 1, core_masks));
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 3);
+    for (uint64_t i = 0; i < CAPACITY; ++i)
+        EXPECT_EQ(queue.pop(), &left);
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 0);
+}
+
+TEST_F(MixReadyQueueTest, InFlightReservationAndResetKeepMasksVisible) {
+    ChipTaskSlotState left;
+    left.active_mask = ActiveMask(3);
+    {
+        ChipReadyQueue::PushReservation in_flight(queue, &left, 3);
+        EXPECT_EQ(queue.size(), 0);
+        EXPECT_EQ(queue.reserved_mix_core_mask(), 3);
+    }
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 0);
+    ASSERT_TRUE(queue.push(&left, 3));
+    queue.reset_for_reuse();
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 3);
+    EXPECT_EQ(queue.pop(), &left);
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 0);
+}
+
+TEST_F(MixReadyQueueTest, BatchWrapKeepsPointerTagsAndMaskCounts) {
+    ChipTaskSlotState left, right;
+    left.active_mask = ActiveMask(3);
+    right.active_mask = ActiveMask(5);
+    ChipTaskSlotState *batch[] = {&left, &right};
+    TaskId tags[] = {TaskId::make(0, 3), TaskId::make(0, 4)};
+    uint8_t core_masks[] = {3, 5};
+    for (int round = 0; round < 50; ++round) {
+        ASSERT_TRUE(queue.push_batch_tagged(batch, tags, 2, core_masks));
+        EXPECT_EQ(queue.reserved_mix_core_mask(), 7);
+        ChipTaskSlotState *out[2];
+        TaskId out_tags[2];
+        uint8_t out_masks[2];
+        ASSERT_EQ(queue.pop_batch_tagged(out, out_tags, 2, out_masks), 2);
+        EXPECT_EQ(out[0], &left);
+        EXPECT_EQ(out[1], &right);
+        EXPECT_EQ(out_tags[0], tags[0]);
+        EXPECT_EQ(out_tags[1], tags[1]);
+        EXPECT_EQ(out_masks[0], 3);
+        EXPECT_EQ(out_masks[1], 5);
+        EXPECT_EQ(queue.reserved_mix_core_mask(), 0);
+    }
+}
+
+TEST_F(MixReadyQueueTest, BatchReservationLeavesUnusedLaneAvailableBeforeTicket) {
+    ChipTaskSlotState left;
+    left.active_mask = ActiveMask(3);
+    ChipTaskSlotState *items[] = {&left, &left};
+    uint8_t core_masks[] = {3, 3};
+    // Park the producer in preflight so the reservation is observable before
+    // any cell publication. Restore the empty sequence before it takes a ticket.
+    queue.slots[0].sequence.store(1, std::memory_order_release);
+    bool pushed = false;
+    std::thread producer([&] {
+        pushed = queue.push_batch(items, 2, core_masks);
+    });
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    uint8_t reserved = 0;
+    while ((reserved = queue.reserved_mix_core_mask()) == 0 && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    EXPECT_EQ(reserved, 3);
+    EXPECT_EQ(queue.mix_mask_counts[0].load(), 2);
+    // The queue transports the captured mask even after descriptor reuse.
+    left.active_mask = ActiveMask(2);
+    queue.slots[0].sequence.store(0, std::memory_order_release);
+    producer.join();
+    EXPECT_TRUE(pushed);
+    EXPECT_EQ(queue.pop(), &left);
+    EXPECT_EQ(queue.pop(), &left);
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 0);
+}
+
+TEST_F(MixReadyQueueTest, ConcurrentProducersAndConsumersReleaseAllMasksExactlyOnce) {
+    constexpr int total = 4096;
+    std::vector<ChipTaskSlotState> items(total);
+    std::vector<std::atomic<int>> seen(total);
+    constexpr uint8_t masks[] = {3, 5, 6, 7};
+    for (int i = 0; i < total; ++i) {
+        items[i].active_mask = ActiveMask(masks[i % 4]);
+        seen[i].store(0);
+    }
+    std::atomic<int> done{0};
+    std::atomic<int> consumed{0};
+    std::vector<std::thread> threads;
+    for (int producer = 0; producer < 4; ++producer)
+        threads.emplace_back([&, producer] {
+            int end = (producer + 1) * (total / 4);
+            for (int i = producer * (total / 4); i < end;) {
+                int count = producer & 1 ? std::min(3, end - i) : 1;
+                ChipTaskSlotState *batch[3];
+                uint8_t batch_masks[3];
+                for (int j = 0; j < count; ++j) {
+                    batch[j] = &items[i + j];
+                    batch_masks[j] = masks[(i + j) % 4];
+                }
+                while (!queue.push_batch(batch, count, batch_masks))
+                    std::this_thread::yield();
+                i += count;
+            }
+            done.fetch_add(1, std::memory_order_release);
+        });
+    for (int consumer = 0; consumer < 4; ++consumer)
+        threads.emplace_back([&] {
+            while (done.load(std::memory_order_acquire) != 4 || queue.size() != 0) {
+                ChipTaskSlotState *out[3];
+                int count = queue.pop_batch(out, 3);
+                for (int i = 0; i < count; ++i) {
+                    seen[out[i] - items.data()].fetch_add(1);
+                    consumed.fetch_add(1);
+                }
+                if (count == 0) std::this_thread::yield();
+            }
+        });
+    for (auto &thread : threads)
+        thread.join();
+    EXPECT_EQ(consumed.load(), total);
+    for (auto &count : seen)
+        EXPECT_EQ(count.load(), 1);
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 0);
+    for (auto &count : queue.mix_mask_counts)
+        EXPECT_EQ(count.load(), 0);
+}
+
+TEST_F(MixReadyQueueTest, MaskSnapshotsRoundTripWithoutDereferencingOpaqueTokens) {
+    // Only transport is exercised: these aligned tokens are never admitted as
+    // tasks. Queue operations must not read the memory they point at.
+    auto *token = reinterpret_cast<ChipTaskSlotState *>(uintptr_t{0x10000});
+    TaskId original = TaskId::make(0, 8);
+    ASSERT_TRUE(queue.push_tagged(token, original, 3));
+    TaskId tag;
+    uint8_t mask = 0;
+    EXPECT_EQ(queue.pop_tagged(&tag, &mask), token);
+    EXPECT_EQ(tag, original);
+    EXPECT_EQ(mask, 3);
+    ChipTaskSlotState *tokens[] = {token, token};
+    TaskId tags[] = {tag, TaskId::make(0, 9)};
+    uint8_t masks[] = {mask, 5};
+    ASSERT_TRUE(queue.push_batch_tagged(tokens, tags, 2, masks));
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 7);
+    ChipTaskSlotState *out[2];
+    TaskId out_tags[2];
+    uint8_t out_masks[2];
+    ASSERT_EQ(queue.pop_batch_tagged(out, out_tags, 2, out_masks), 2);
+    EXPECT_EQ(out[0], token);
+    EXPECT_EQ(out[1], token);
+    EXPECT_EQ(out_masks[0], 3);
+    EXPECT_EQ(out_masks[1], 5);
+    EXPECT_EQ(out_tags[0], tags[0]);
+    EXPECT_EQ(out_tags[1], tags[1]);
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 0);
+}
+
+#if SIMPLER_SCHED_PROFILING
+TEST_F(MixReadyQueueTest, ProfiledPushAndPopReleaseMaskReservations) {
+    ChipTaskSlotState item;
+    item.active_mask = ActiveMask(5);
+    uint64_t atomics = 0, wait = 0;
+    ASSERT_TRUE(queue.push(&item, atomics, wait, 5));
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 5);
+    EXPECT_EQ(queue.pop(atomics, wait), &item);
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 0);
+    ASSERT_TRUE(queue.push(&item, atomics, wait, 5));
+    ChipTaskSlotState *out[1];
+    EXPECT_EQ(queue.pop_batch(out, 1, atomics, wait), 1);
+    EXPECT_EQ(out[0], &item);
+    EXPECT_EQ(queue.reserved_mix_core_mask(), 0);
+}
+#endif

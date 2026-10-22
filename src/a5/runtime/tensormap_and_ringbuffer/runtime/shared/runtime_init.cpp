@@ -55,18 +55,23 @@ size_t ready_queue_reserve_layout(DeviceArena &arena, uint64_t capacity) {
     return arena.reserve(capacity * sizeof(ChipReadyQueueSlot), CHIP_ALIGN_SIZE);
 }
 
-bool ready_queue_init_data_from_layout(ChipReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity) {
+bool ready_queue_init_data_from_layout(
+    ChipReadyQueue *queue, DeviceArena &arena, size_t slots_off, uint64_t capacity, bool track_mix_resources
+) {
     // Address the slots region for data writes without storing the pointer in
     // queue->slots — that field is set by ready_queue_wire_arena_pointers.
     auto *slots_arena = static_cast<ChipReadyQueueSlot *>(arena.region_ptr(slots_off));
     queue->capacity = capacity;
     queue->mask = capacity - 1;
+    queue->track_mix_resources = track_mix_resources;
+    for (auto &count : queue->mix_mask_counts)
+        count.store(0, std::memory_order_relaxed);
     queue->enqueue_pos.store(0, std::memory_order_relaxed);
     queue->dequeue_pos.store(0, std::memory_order_relaxed);
 
     for (uint64_t i = 0; i < capacity; i++) {
         slots_arena[i].sequence.store((int64_t)i, std::memory_order_relaxed);
-        slots_arena[i].slot_state = nullptr;
+        slots_arena[i].tagged_slot_state = 0;
     }
 
     return true;
@@ -182,14 +187,16 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
 
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         if (!ready_queue_init_data_from_layout(
-                &sched->ready_queues[i], arena, layout.off_ready_queue_slots[i], layout.ready_queue_capacity
+                &sched->ready_queues[i], arena, layout.off_ready_queue_slots[i], layout.ready_queue_capacity,
+                i == static_cast<int>(ResourceShape::MIX)
             )) {
             return false;
         }
     }
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         if (!ready_queue_init_data_from_layout(
-                &sched->ready_sync_queues[i], arena, layout.off_ready_sync_queue_slots[i], layout.ready_queue_capacity
+                &sched->ready_sync_queues[i], arena, layout.off_ready_sync_queue_slots[i], layout.ready_queue_capacity,
+                i == static_cast<int>(ResourceShape::MIX)
             )) {
             return false;
         }
@@ -202,7 +209,7 @@ bool SchedulerState::init_data_from_layout(const SchedulerLayout &layout, Device
     for (int i = 0; i < NUM_RESOURCE_SHAPES; i++) {
         if (!ready_queue_init_data_from_layout(
                 &sched->early_dispatch_queues[i], arena, layout.off_early_dispatch_queue_slots[i],
-                CHIP_EARLY_DISPATCH_QUEUE_SIZE
+                CHIP_EARLY_DISPATCH_QUEUE_SIZE, i == static_cast<int>(ResourceShape::MIX)
             )) {
             return false;
         }

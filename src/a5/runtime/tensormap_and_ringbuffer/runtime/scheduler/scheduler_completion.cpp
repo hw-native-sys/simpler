@@ -474,6 +474,11 @@ bool SchedulerContext::enter_drain_mode(ChipTaskSlotState *slot_state, int32_t b
     drain_state_.drain_stage_go.store(0, std::memory_order_relaxed);
     drain_state_.drain_stage_done_mask.store(0, std::memory_order_relaxed);
     drain_state_.drain_running_staged.store(0, std::memory_order_relaxed);
+    // A single-shape AIV task's logical slot can use either physical V lane.
+    uint8_t physical_mask = slot_state->active_mask.to_shape() == ResourceShape::AIV ?
+                                SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1 :
+                                slot_state->active_mask.core_mask();
+    drain_state_.reserved_core_mask.store(physical_mask, std::memory_order_relaxed);
     // Release store: all stores above are now visible to any thread that
     // acquire-loads sync_start_pending and sees block_num > 0.
     drain_state_.sync_start_pending.store(block_num, std::memory_order_release);
