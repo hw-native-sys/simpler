@@ -218,13 +218,14 @@ def test_rdma_kernel_uses_peer_independent_session_and_explicit_peer_ops() -> No
     assert "TGET_ASYNC<pto::comm::DmaEngine::RDMA>(local_scratch, remote_tput, readback_session, peer)" in consumer
 
 
-def test_a5_scheduler_invalidates_deferred_completion_slab_before_reading_count() -> None:
+def test_a5_scheduler_orders_deferred_completion_slab_reads_after_cond() -> None:
     source = SCHEDULER_COMPLETION.read_text(encoding="utf-8")
     assert "volatile DeferredCompletionSlab *deferred_slab" in source
-    assert "cache_invalidate_range" in source
-    assert "offsetof(DeferredCompletionSlab, entries)" in source
-    assert source.index("cache_invalidate_range") < source.index("deferred_slab->error_code")
-    assert source.index("cache_invalidate_range") < source.index("deferred_slab->count")
+    poll = source[source.index("void SchedulerContext::check_running_cores_for_completion(") :]
+    assert poll.index("reg_load_acquire(core.cond_ptr)") < poll.index("rmb();")
+    assert poll.index("rmb();") < poll.index("complete_slot_task(")
+    assert "deferred_slab->error_code" in source
+    assert "deferred_slab->count = 0" in source
 
 
 def test_rdma_deferred_demo_serializes_hns1825_sq_posts() -> None:
