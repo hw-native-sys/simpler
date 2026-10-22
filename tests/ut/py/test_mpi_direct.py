@@ -18,6 +18,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -253,6 +254,7 @@ def supervisor_setup(tmp_path, monkeypatch):
     monkeypatch.setattr(supervisor_mod.socket, "socket", lambda *_args: listener)
     monkeypatch.setattr(supervisor_mod.subprocess, "Popen", Mock(return_value=process))
     monkeypatch.setattr(supervisor_mod, "_startup_gate", Mock())
+    monkeypatch.setattr(supervisor_mod, "_CleanupReceiver", lambda *_args: nullcontext(SimpleNamespace(port=4568)))
     return str(topology_path), process
 
 
@@ -584,6 +586,82 @@ def test_executor_cleanup_closes_worker_when_channel_close_fails(monkeypatch):
     worker.close.assert_called_once()
 
 
+@pytest.mark.parametrize("loop_release_fails", [False, True])
+def test_executor_reports_release_failures_before_returning_nonzero(monkeypatch, loop_release_fails):
+    topology = MpiDirectTopology.from_dict(_topology_dict())
+    channel = Mock(shutdown_observed=True)
+    reporter = Mock()
+    worker = Mock(close=Mock(side_effect=RuntimeError("worker release failed")))
+    monkeypatch.setattr(runtime_mod, "_ExecutorFrameSocket", lambda *_args: channel)
+
+    def loop(*_args):
+        if loop_release_fails:
+            raise RuntimeError("buffer release failed")
+
+    monkeypatch.setattr(remote_l3_session, "_run_command_loop", loop)
+    assert runtime_mod._run_executor(None, None, topology, 1, topology.executors[0], worker, reporter) == 1
+    failures = reporter.finish.call_args.args[0]
+    assert any("worker release failed" in detail for detail in failures)
+    assert any("buffer release failed" in detail for detail in failures) == loop_release_fails
+    channel.close.assert_called_once()
+
+
+def test_executor_preserves_fatal_loop_error_and_still_reports_close_result(monkeypatch):
+    topology = MpiDirectTopology.from_dict(_topology_dict())
+    channel = Mock(shutdown_observed=False)
+    reporter = Mock()
+    worker = Mock(close=Mock(side_effect=RuntimeError("release failed")))
+    monkeypatch.setattr(runtime_mod, "_ExecutorFrameSocket", lambda *_args: channel)
+    monkeypatch.setattr(remote_l3_session, "_run_command_loop", Mock(side_effect=ValueError("bad frame")))
+    with pytest.raises(ValueError, match="bad frame"):
+        runtime_mod._run_executor(None, None, topology, 1, topology.executors[0], worker, reporter)
+    assert len(reporter.finish.call_args.args[0]) == 2
+
+
+@pytest.mark.parametrize("bad_identity", [False, True])
+def test_executor_acknowledges_shutdown_only_after_frame_identity_validation(monkeypatch, bad_identity):
+    from simpler.remote_l3_protocol import FrameHeader, FrameType, encode_frame  # noqa: PLC0415
+
+    topology = MpiDirectTopology.from_dict(_topology_dict())
+    reporter = Mock()
+    channel = runtime_mod._ExecutorFrameSocket(None, None, topology.executors[0], 1, 1.0, reporter)
+    frame = encode_frame(FrameHeader(FrameType.SHUTDOWN, 2 if bad_identity else 1, 0, 0), b"")
+    status = SimpleNamespace(Get_tag=lambda: runtime_mod.LIFECYCLE_TAG)
+    monkeypatch.setattr(runtime_mod, "_receive_frame", lambda *_args: (status, frame))
+    if bad_identity:
+        with pytest.raises(RuntimeError, match="identity mismatch"):
+            channel._receive_message()
+        reporter.begin.assert_not_called()
+        assert not channel.shutdown_observed
+    else:
+        assert channel._receive_message() == frame
+        reporter.begin.assert_called_once_with(command="observed")
+        assert channel.shutdown_observed
+
+
+@pytest.mark.parametrize("transport_fails", [False, True])
+def test_controller_reports_own_close_separately_from_executor_receipt(transport_fails):
+    context = runtime_mod.MpiDirectControllerContext.__new__(runtime_mod.MpiDirectControllerContext)
+    context._closed = False
+    context.topology = MpiDirectTopology.from_dict(_topology_dict())
+    context._cleanup_reporter = Mock()
+    context._workers = [Mock(close=Mock(side_effect=RuntimeError("L4 release failed"))), Mock()]
+    context._hub = Mock(all_routes_shutdown=True)
+    context._progress = Mock()
+    if transport_fails:
+        context._progress.stop.side_effect = RuntimeError("progress failed")
+    expected = RuntimeError if transport_fails else runtime_mod._MpiDirectCleanupError
+    with pytest.raises(expected, match="L4 close encountered"):
+        context.close()
+    context._cleanup_reporter.begin.assert_called_once_with(command="not_observed")
+    assert "L4 release failed" in context._cleanup_reporter.finish.call_args.args[0][0]
+    assert len(context._cleanup_reporter.finish.call_args.args[0]) == (2 if transport_fails else 1)
+    context._hub.close.assert_called_once()
+    context._workers[1].close.assert_called_once()
+    context.close()
+    context._cleanup_reporter.finish.assert_called_once()
+
+
 def test_executor_receive_does_not_sleep_on_dispatch_path(monkeypatch):
     topology = MpiDirectTopology.from_dict(_topology_dict())
 
@@ -741,8 +819,58 @@ def _interrupt_idle_mpi_job(proc, mode, controller_path, supervisor_ready):
         assert len(executors) == 2, processes
         os.kill(executors[0], signal.SIGSTOP)
     else:
-        signum = signal.SIGTERM if mode == "supervisor-term" else signal.SIGHUP
+        signum = signal.SIGTERM if mode in ("supervisor-term", "executor-close-stall") else signal.SIGHUP
         proc.send_signal(signum)
+
+
+def _check_rank_cleanup_output(output, mode):
+    reports = [
+        json.loads(line)["mpi_direct_cleanup"]
+        for line in output.splitlines()
+        if line.startswith('{"mpi_direct_cleanup":')
+    ]
+    assert {report["rank"] for report in reports} == {0, 1, 2}, output
+    assert all("process_exit" not in report for report in reports)
+    if mode in ("roundtrip", "slurm-allocation", "executor-close-error", "controller-close-error"):
+        assert all(report["sequence"] == 2 for report in reports), output
+        failed_rank = 2 if mode == "executor-close-error" else 0 if mode == "controller-close-error" else None
+        for report in reports:
+            assert report["command"] == ("not_observed" if report["rank"] == 0 else "observed"), output
+            assert report["cleanup"] == ("failed" if report["rank"] == failed_rank else "succeeded"), output
+            if report["rank"] == failed_rank:
+                assert "injected rank close failure" in " ".join(report["failures"]), output
+    elif mode == "rank0-crash":
+        assert reports[0]["cleanup"] == "unknown", output
+    elif mode == "executor-close-stall":
+        assert reports[2]["sequence"] == 1, output
+        assert reports[2]["command"] == "observed", output
+        assert reports[2]["cleanup"] == "unknown", output
+
+
+def _inject_rank_close_failure(tmp_path, mode, supervisor_ready, env):
+    if mode in ("executor-close-error", "controller-close-error", "executor-close-stall"):
+        inject_rank = "0" if mode == "controller-close-error" else "2"
+        inject_level = 4 if mode == "controller-close-error" else 3
+        (tmp_path / "sitecustomize.py").write_text(
+            "import os\n"
+            "rank = os.environ.get('PMI_RANK', os.environ.get('OMPI_COMM_WORLD_RANK'))\n"
+            f"if rank == {inject_rank!r}:\n"
+            "    from simpler.worker import Worker\n"
+            "    close = Worker.close\n"
+            "    def fail_close(self):\n"
+            f"        if self.level == {inject_level}:\n"
+            + (
+                f"            open({str(supervisor_ready)!r}, 'w').write(str(os.getpid()))\n"
+                "            import threading\n"
+                "            threading.Event().wait()\n"
+                if mode == "executor-close-stall"
+                else "            close(self)\n            raise RuntimeError('injected rank close failure')\n"
+            )
+            + "        close(self)\n"
+            "    Worker.close = fail_close\n",
+            encoding="utf-8",
+        )
+        env["PYTHONPATH"] = str(tmp_path) + os.pathsep + env["PYTHONPATH"]
 
 
 @pytest.mark.parametrize(
@@ -755,6 +883,9 @@ def _interrupt_idle_mpi_job(proc, mode, controller_path, supervisor_ready):
         "supervisor-term",
         "supervisor-hup",
         "idle-executor-stop",
+        "executor-close-error",
+        "controller-close-error",
+        "executor-close-stall",
     ],
 )
 def test_real_mpi_cpu_world_and_launcher_cleanup(tmp_path, mode):
@@ -793,6 +924,7 @@ def test_real_mpi_cpu_world_and_launcher_cleanup(tmp_path, mode):
     )
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join((str(Path(__file__).parent), str(Path.cwd()), env.get("PYTHONPATH", "")))
+    _inject_rank_close_failure(tmp_path, mode, supervisor_ready, env)
     if mode == "slurm-allocation":
         env["SLURM_PROCID"] = "0"
     proc = subprocess.Popen(
@@ -814,7 +946,7 @@ def test_real_mpi_cpu_world_and_launcher_cleanup(tmp_path, mode):
         start_new_session=True,
     )
     try:
-        if mode.startswith("supervisor-") or mode == "idle-executor-stop":
+        if mode.startswith("supervisor-") or mode in ("idle-executor-stop", "executor-close-stall"):
             _interrupt_idle_mpi_job(proc, mode, controller_path, supervisor_ready)
         output, _ = proc.communicate(timeout=8 if mode == "idle-executor-stop" else 45)
         if mode == "idle-executor-stop":
@@ -822,8 +954,11 @@ def test_real_mpi_cpu_world_and_launcher_cleanup(tmp_path, mode):
         assert (proc.returncode == 0) if mode in ("roundtrip", "slurm-allocation") else (proc.returncode != 0), output
         if mode.startswith("supervisor-"):
             assert proc.returncode == 128 + (signal.SIGTERM if mode == "supervisor-term" else signal.SIGHUP), output
+        if mode == "executor-close-stall":
+            assert proc.returncode == 128 + signal.SIGTERM, output
         if mode == "rank0-crash":
             assert crash_marker.exists(), output
+        _check_rank_cleanup_output(output, mode)
         if mode == "unused-executors":
             assert "lifecycle shutdown" in output, output
         processes = subprocess.check_output(["ps", "-ww", "-eo", "pid,args"], text=True)
