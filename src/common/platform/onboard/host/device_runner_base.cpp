@@ -3256,7 +3256,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     return rc;
 }
 
-int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args) {
+int DeviceRunnerBase::ensure_aicore_binary_registered() {
     // Lazy-register the AICore binary on first call; reuse cached handle
     // thereafter. CANN has no public rtUnregisterAllKernel, so re-registering
     // every run would pin another device-side copy of the ELF and quickly
@@ -3282,6 +3282,17 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &
         }
     }
 
+    return 0;
+}
+
+int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args) {
+    return launch_aicore_kernel(stream, k_args, 0, 0);
+}
+
+int DeviceRunnerBase::launch_aicore_kernel(
+    rtStream_t stream, const KernelArgs &k_args, uint64_t capture_control, uint64_t capture_generation
+) {
+    if (int rc = ensure_aicore_binary_registered(); rc != 0) return rc;
     // `AicoreLaunchArgs` is the host-side image of the entry's parameter list
     // and is defined per-arch beside the entry's ABI, in common/kernel_args.h.
     // The driver copies `argsSize` bytes during the launch call, so a stack
@@ -3289,6 +3300,8 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &
     AicoreLaunchArgs args{};
     fill_shared_launch_args(args, k_args);
     fill_arch_launch_args(args, k_args);
+    args.capture_control = capture_control;
+    args.capture_generation = capture_generation;
     rtArgsEx_t rt_args;
     std::memset(&rt_args, 0, sizeof(rt_args));
     rt_args.args = &args;
@@ -3654,31 +3667,21 @@ int DeviceRunnerBase::arm_run_fence(const PreparedExecution &prepared) {
     return rc;
 }
 
+void DeviceRunnerBase::note_run_stream_identity(rtStream_t stream) {
+    int32_t stream_id = -1;
+    if (aclrtStreamGetId(static_cast<aclrtStream>(stream), &stream_id) == ACL_SUCCESS) {
+        run_stream_ids_.note(stream_id);
+    } else {
+        LOG_WARN("execution stream identity is unavailable; later unmatched fault notices have undecided attribution");
+        run_stream_ids_.note_unidentified_stream();
+    }
+}
+
 int DeviceRunnerBase::record_run_boundary(const PreparedExecution &prepared, RunCompletionFence::StreamRole role) {
     const rtStream_t stream =
         role == RunCompletionFence::StreamRole::Aicpu ? prepared.streams.aicpu : prepared.streams.aicore;
     RunCompletionFence &fence = run_fence(prepared.pipeline_slot);
-    // The one point where this stream is certainly live and certainly carrying a
-    // run, so it is where its driver id is captured for the fault channel's
-    // filter. A number survives both the stream's replacement and the device
-    // reset that would invalidate the handle; asking the handle later does not.
-    {
-        int32_t stream_id = -1;
-        if (aclrtStreamGetId(static_cast<aclrtStream>(stream), &stream_id) == ACL_SUCCESS) {
-            run_stream_ids_.note(stream_id);
-        } else {
-            // A stream this run submits on whose id is unknown. Skipping it
-            // silently would leave the history claiming to be whole while
-            // missing exactly the entry a later notice on this stream would
-            // carry, and that notice would then read as another runner's.
-            LOG_WARN(
-                "aclrtStreamGetId failed for the %s stream of slot %u; the fault channel's stream history is "
-                "incomplete from here, so an unmatched notice reads as undecided rather than as another runner's",
-                stream_role_name(role), prepared.pipeline_slot
-            );
-            run_stream_ids_.note_unidentified_stream();
-        }
-    }
+    note_run_stream_identity(stream);
     // The submission is a fact the instant the device queue accepted it, and it
     // has to be recorded before anything that can still fail — otherwise a
     // failing record below would leave the run looking unsubmitted.
@@ -5249,4 +5252,29 @@ bool DeviceRunnerBase::retained_consumers_outstanding() const {
     if (!pmu_collector_.retained_runs_idle()) return true;
     if (!scope_stats_collector_.retained_runs_idle()) return true;
     return dep_gen_retained_runs_outstanding();
+}
+
+int DeviceRunnerBase::pin_kernel_capture_callable(int32_t callable_id, uint64_t *hash) {
+    const auto callable = callables_.find(callable_id);
+    if (hash == nullptr || callable == callables_.end() || callable->second.host_dlopen_handle != nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const auto buffer = chip_callable_buffers_.find(callable->second.chip_buffer_hash);
+    if (buffer == chip_callable_buffers_.end() || buffer->second.release_pending || buffer->second.refcount <= 0)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    ++buffer->second.refcount;
+    *hash = callable->second.chip_buffer_hash;
+    return 0;
+}
+
+int DeviceRunnerBase::synchronize_kernel_capture_stream(rtStream_t stream) {
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = aclrtSynchronizeStreamWithTimeout(stream, timeout_config_.stream_sync_timeout_ms);
+    } catch (...) {}
+    if (rc != 0) {
+        try {
+            recover_device_or_mark_unusable(rc);
+        } catch (...) {}
+    }
+    return rc;
 }

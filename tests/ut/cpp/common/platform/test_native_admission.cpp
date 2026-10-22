@@ -11,11 +11,134 @@
 /** Real onboard workspace adapters and native prepare ownership over CPU transport. */
 #include <cstdlib>
 #include <new>
+#include <unistd.h>
 #include "callable.h"
 #include "fixture.h"
 
+extern "C" void simpler_bind_device_fault_monitor(void *);
+
 namespace native_admission_test {
 thread_local bool refuse_next_host_allocation = false;
+static simpler::tmr::KernelCaptureControl *retain_capture(Attempt &candidate, uint64_t epoch) {
+    auto &runner = candidate.runner;
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage);
+    state->capture_execution = std::make_unique<KernelCaptureOwner>();
+    auto &owner = *state->capture_execution;
+    state->retained_device_use.retain(state->identity());
+    runner.note_workspace_run_fact(
+        candidate.descriptor.pipeline_slot, candidate.descriptor.run_epoch, Fact::DeviceReferencesRetained
+    );
+    runner.set_kernel_capture_owner(state);
+    auto *control = static_cast<simpler::tmr::KernelCaptureControl *>(
+        runner.allocate_tensor(sizeof(simpler::tmr::KernelCaptureControl))
+    );
+    if (control == nullptr) return nullptr;
+    *control = {};
+    // Inject device evidence only. Release, native finalize and the workspace
+    // ledger are production code; CPU transport supplies the stream proof.
+    owner.reference = {reinterpret_cast<uint64_t>(control), 17, 23};
+    owner.registration.reference = owner.reference;
+    control->capture_generation = 17;
+    control->context_generation = 23;
+    control->decision = static_cast<uint32_t>(simpler::tmr::CaptureDecision::Admitted);
+    control->replay_epoch = control->completed_epoch = epoch;
+    return control;
+}
+
+TEST_F(NativeAdmissionTest, CaptureReleaseReportsObservedExecutionInsteadOfNoSubmission) {
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
+    ASSERT_NE(retain_capture(candidate, 3), nullptr);
+    EXPECT_EQ(simpler_kernel_capture_release(&runner, candidate.storage), 0);
+    EXPECT_TRUE(candidate.empty());
+    const auto facts = runner.facts(0, 10);
+    EXPECT_TRUE(facts.launched);
+    EXPECT_TRUE(facts.drain_proved);
+    EXPECT_FALSE(facts.no_submission);
+}
+
+TEST_F(NativeAdmissionTest, UnexecutedCaptureRetiresOnlyWithAQuiescenceProof) {
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
+    ASSERT_NE(retain_capture(candidate, 0), nullptr);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage);
+    int caller = 0;
+    state->capture_execution->caller_stream = &caller;
+    state->capture_execution->recorded = true;
+    EXPECT_NE(simpler_finalize_run(&runner, candidate.storage), 0);
+    ASSERT_TRUE(runner.can_accept_run());
+    control().stream_sync_rc = -4321;
+    runner.recovery_throws = true;
+    EXPECT_EQ(simpler_kernel_capture_release(&runner, candidate.storage), -4321);
+    EXPECT_FALSE(runner.can_accept_run());
+    EXPECT_EQ(runner.recovery_rc, -4321);
+    EXPECT_FALSE(candidate.empty());
+    auto facts = runner.facts(0, 10);
+    EXPECT_FALSE(facts.launched);
+    EXPECT_FALSE(facts.no_submission);
+    EXPECT_FALSE(facts.drain_proved);
+    EXPECT_TRUE(runner.holds_epoch(10));
+    runner.recovery_throws = false;
+    control().stream_sync_rc = 0;
+    EXPECT_EQ(simpler_kernel_capture_release(&runner, candidate.storage), 0);
+    facts = runner.facts(0, 10);
+    EXPECT_FALSE(facts.launched);
+    EXPECT_FALSE(facts.no_submission);
+    EXPECT_TRUE(facts.drain_proved);
+    EXPECT_FALSE(runner.can_accept_run());
+}
+
+TEST_F(NativeAdmissionTest, CaptureConsumesLateFaultWithoutRewritingItsRuntimeResult) {
+    DeviceFaultMonitor monitor(
+        {[] {
+             return 0;
+         },
+         [] {
+             return 0;
+         },
+         [] {
+             return static_cast<long>(getpid());
+         }}
+    );
+    struct Binding {
+        explicit Binding(DeviceFaultMonitor &m) { simpler_bind_device_fault_monitor(&m); }
+        ~Binding() { simpler_bind_device_fault_monitor(nullptr); }
+    } binding(monitor);
+    Runner runner;
+    ASSERT_EQ(runner.monitor_faults(), 0);
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
+    ASSERT_NE(retain_capture(candidate, 3), nullptr);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage);
+    int caller = 0;
+    state->capture_execution->caller_stream = &caller;
+    state->capture_execution->recorded = true;
+    runner.note_run_stream_identity(&caller);
+    monitor.report(DeviceFaultNotice{0, 1, 7, 507001, 0});
+    SimplerKernelCaptureResult result{};
+    EXPECT_EQ(simpler_kernel_capture_wait(&runner, candidate.storage, &result), 0);
+    EXPECT_EQ(result.runtime_status, 0);
+    EXPECT_EQ(result.completed_epoch, 3u);
+    EXPECT_FALSE(runner.accepts_new_run());
+    EXPECT_EQ(simpler_kernel_capture_release(&runner, candidate.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, CaptureControlReadFailureRetainsItsLeaseForRetry) {
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
+    ASSERT_NE(retain_capture(candidate, 2), nullptr);
+    control().copy_rc = -4321;
+    EXPECT_EQ(simpler_kernel_capture_release(&runner, candidate.storage), -4321);
+    EXPECT_FALSE(candidate.empty());
+    EXPECT_TRUE(runner.holds_epoch(10));
+    control().copy_rc = 0;
+    EXPECT_EQ(simpler_kernel_capture_release(&runner, candidate.storage), 0);
+    EXPECT_FALSE(runner.holds_epoch(10));
+}
+
 }  // namespace native_admission_test
 
 // Only the throwing, unaligned allocation is replaced. Its ordinary delete
@@ -38,6 +161,7 @@ int fake_current_device(void *, int *device_id) noexcept {
     return 0;
 }
 int fake_current_context(void *, void **context) noexcept {
+    if (control().attach_rc != 0) return control().attach_rc;
     static int token;
     *context = &token;
     return 0;
@@ -56,7 +180,99 @@ int fake_create_event(void *, void **event) noexcept {
     return 0;
 }
 int fake_destroy_event(void *, void *) noexcept { return 0; }
+
+int initialize_capture_context(Runner &runner) {
+    KernelContextOps ops;
+    ops.get_current_device = fake_current_device;
+    ops.get_current_context = fake_current_context;
+    ops.create_hidden_stream = fake_create_hidden_stream;
+    ops.destroy_hidden_stream = fake_destroy_hidden_stream;
+    ops.create_event = fake_create_event;
+    ops.destroy_event = fake_destroy_event;
+    const int rc = runner.kernel_execution_state().initialize(0, ops);
+    return rc != 0 ? rc : runner.kernel_execution_state().mark_ready_enqueued();
+}
 }  // namespace
+
+TEST_F(NativeAdmissionTest, CaptureReleaseLoaderExceptionRetainsRegistrationForRetry) {
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
+    ASSERT_NE(retain_capture(candidate, 0), nullptr);
+    ASSERT_EQ(initialize_capture_context(runner), 0);
+    auto &owner = *static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage)->capture_execution;
+    owner.registered = true;
+    const auto control_address = owner.reference.control_address;
+    control().capture_registration_throws = true;
+    bool escaped = false;
+    int rc = 0;
+    try {
+        rc = simpler_kernel_capture_release(&runner, candidate.storage);
+    } catch (...) {
+        escaped = true;
+    }
+    control().capture_registration_throws = false;
+    EXPECT_FALSE(escaped);
+    EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_FALSE(candidate.empty());
+    EXPECT_TRUE(owner.registered);
+    EXPECT_EQ(owner.reference.control_address, control_address);
+    EXPECT_FALSE(runner.kernel_execution_state().accepts_dispatch());
+    EXPECT_EQ(control().capture_registration_calls, 1u);
+    EXPECT_EQ(simpler_kernel_capture_release(&runner, candidate.storage), 0);
+    EXPECT_EQ(control().capture_registration_calls, 2u);
+    EXPECT_TRUE(candidate.empty());
+}
+
+TEST_F(NativeAdmissionTest, CaptureRecordExceptionsRetainHiddenStreamOwnershipAndPoisonAdmission) {
+    for (const bool allocation_throws : {true, false}) {
+        SCOPED_TRACE(allocation_throws);
+        Runner runner;
+        runner.set_executors({}, {1});
+        Attempt candidate(runner, 0, 10);
+        ASSERT_EQ(candidate.prepare(), 0);
+        ASSERT_NE(retain_capture(candidate, 0), nullptr);
+        ASSERT_EQ(initialize_capture_context(runner), 0);
+        auto &owner = *static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage)->capture_execution;
+        owner.registered = true;
+        control().capture_active = true;
+        control().capture_refuse_after_core = allocation_throws ? &refuse_next_host_allocation : nullptr;
+        control().capture_loader_throws = !allocation_throws;
+        control().capture_core_calls = control().capture_cpu_calls = 0;
+        control().capture_record_allocation_failures = 0;
+        int caller = 0;
+        int rc = 0;
+        bool escaped = false;
+        try {
+            rc = simpler_kernel_capture_record(&runner, candidate.storage, &caller);
+        } catch (...) {
+            escaped = true;
+        }
+        refuse_next_host_allocation = false;
+        control().capture_refuse_after_core = nullptr;
+        control().capture_loader_throws = false;
+        EXPECT_FALSE(escaped);
+        EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_EQ(control().capture_core_calls, 1u);
+        EXPECT_EQ(control().capture_cpu_calls, allocation_throws ? 0u : 1u);
+        EXPECT_EQ(control().capture_record_allocation_failures, allocation_throws ? 1u : 0u);
+        EXPECT_TRUE(owner.enqueue_attempted);
+        EXPECT_FALSE(owner.recorded);
+        EXPECT_FALSE(runner.kernel_execution_state().accepts_dispatch());
+        // A partial capture cannot prove the hidden submissions complete from
+        // the caller alone. A failed proof must preserve the owner for retry.
+        control().capture_active = false;
+        owner.registered = false;
+        control().stream_sync_rc = -4321;
+        EXPECT_EQ(simpler_kernel_capture_release(&runner, candidate.storage), -4321);
+        EXPECT_FALSE(candidate.empty());
+        control().stream_sync_rc = 0;
+        const auto before = control().capture_sync_calls;
+        EXPECT_EQ(simpler_kernel_capture_release(&runner, candidate.storage), 0);
+        EXPECT_EQ(control().capture_sync_calls - before, 3u);
+        control().capture_active = false;
+    }
+}
 
 TEST_F(NativeAdmissionTest, RegistrationRefusesWhileANativeRunIsOutstanding) {
     Runner runner;
@@ -84,7 +300,59 @@ TEST_F(NativeAdmissionTest, RegistrationRefusesWhileANativeRunIsOutstanding) {
     EXPECT_EQ(simpler_kernel_mode_prepare_callable(&runner, 3, image.data(), image.size()), PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_EQ(simpler_register_callable_v2(&runner, image.data(), image.size(), &auto_id), PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_EQ(auto_id, -1);
+    EXPECT_EQ(simpler_unregister_callable(&runner, 1), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(runner.has_callable(1));
     runner.release_native_run_reservation(&owner);
+}
+
+TEST_F(NativeAdmissionTest, WrongContextDoesNotConsumeCaptureFaultNotices) {
+    DeviceFaultMonitor monitor(
+        {[] {
+             return 0;
+         },
+         [] {
+             return 0;
+         },
+         [] {
+             return static_cast<long>(getpid());
+         }}
+    );
+    struct Binding {
+        explicit Binding(DeviceFaultMonitor &m) { simpler_bind_device_fault_monitor(&m); }
+        ~Binding() { simpler_bind_device_fault_monitor(nullptr); }
+    } binding(monitor);
+    Runner runner;
+    ASSERT_EQ(runner.monitor_faults(), 0);
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
+    ASSERT_NE(retain_capture(candidate, 0), nullptr);
+    KernelContextOps ops;
+    ops.get_current_device = fake_current_device;
+    ops.get_current_context = fake_current_context;
+    ops.create_hidden_stream = fake_create_hidden_stream;
+    ops.destroy_hidden_stream = fake_destroy_hidden_stream;
+    ops.create_event = fake_create_event;
+    ops.destroy_event = fake_destroy_event;
+    ASSERT_EQ(runner.kernel_execution_state().initialize(0, ops), 0);
+    ASSERT_EQ(runner.kernel_execution_state().mark_ready_enqueued(), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage);
+    state->capture_execution->registered = true;
+    int caller = 0;
+    runner.note_run_stream_identity(&caller);
+    monitor.report(DeviceFaultNotice{0, 1, 7, 507001, 0});
+    control().attach_rc = -4321;
+    EXPECT_NE(simpler_kernel_capture_record(&runner, candidate.storage, &caller), 0);
+    EXPECT_TRUE(runner.accepts_new_run());
+    EXPECT_FALSE(state->capture_execution->enqueue_attempted);
+    EXPECT_EQ(state->capture_execution->caller_stream, nullptr);
+    control().attach_rc = 0;
+    // CPU transport reports capture status NONE. This preflight refusal must
+    // leave the pending notice untouched too, after the context is restored.
+    EXPECT_NE(simpler_kernel_capture_record(&runner, candidate.storage, &caller), 0);
+    EXPECT_TRUE(runner.accepts_new_run());
+    EXPECT_EQ(runner.consume_device_fault_notices(), 1u);
+    state->capture_execution->registered = false;
+    EXPECT_EQ(simpler_kernel_capture_release(&runner, candidate.storage), 0);
 }
 
 TEST_F(NativeAdmissionTest, AutomaticRegistrationDoesNotRetryFailedProgramInitialization) {
@@ -123,6 +391,31 @@ TEST_F(NativeAdmissionTest, AutomaticRegistrationDoesNotRetryFailedProgramInitia
     int32_t id = 99;
     EXPECT_EQ(simpler_register_callable_v2(&runner, image.data(), image.size(), &id), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_EQ(id, -1);
+}
+
+TEST_F(NativeAdmissionTest, InvalidCaptureOwnerCannotMutateTheCallableRegistry) {
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
+    runner.set_kernel_capture_owner(candidate.storage);
+    const uint8_t binary[] = {0x01};
+    const auto image = make_chip_callable(nullptr, 0, "orch", binary, sizeof(binary), nullptr, nullptr, 0, "");
+    const auto allocations = control().allocations;
+    EXPECT_EQ(simpler_register_callable(&runner, 2, image.data()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(
+        simpler_kernel_mode_prepare_callable(&runner, 2, image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    int32_t auto_id = 99;
+    EXPECT_EQ(
+        simpler_register_callable_v2(&runner, image.data(), image.size(), &auto_id), PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    EXPECT_EQ(auto_id, -1);
+    EXPECT_EQ(simpler_unregister_callable(&runner, 1), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_TRUE(runner.has_callable(1));
+    EXPECT_FALSE(runner.has_callable(2));
+    EXPECT_EQ(control().allocations, allocations);
+    EXPECT_TRUE(runner.native_runs_outstanding());
+    runner.set_kernel_capture_owner(nullptr);
 }
 
 TEST_F(NativeAdmissionTest, EarlyPrepareFailureDoesNotBlockTheNormalRunComposition) {

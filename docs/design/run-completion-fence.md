@@ -668,7 +668,12 @@ instant the submission is accepted, and the transaction grades a later failure
 Simulation records no events: its submit callbacks take the sink and ignore it,
 and its grading is unchanged.
 
-## Borrowed TMR eager invocation ownership
+## Borrowed TMR eager invocation admission
+
+Borrowed eager already enters the common native-run lane. The framed TMR
+invocation adds registered callable occupancy and per-run binding checks to
+that path; it does not introduce another executor, registration API or caller
+ordering protocol.
 
 Borrowed TMR eager calls use the existing native-run lane, caller ordering and
 completion fence. Their launch package carries a 40-byte invocation header,
@@ -689,3 +694,15 @@ prefix. Program descriptor and launch-envelope routes retain their behavior;
 kernel packets require permitted launch transport and cannot silently fall back
 to unvalidated descriptor values. Active capture remains rejected by the eager
 entry. These per-run resources do not provide captured-graph lifetime.
+
+Registration and context finalization retain their common locking and admission
+rules. A prepared ordinary native run prevents all registration entries and
+unregistration from changing the registry. Refusal leaves automatic ID output
+at -1 and performs no allocation or copy. A refused context finalize does not
+retire the run or restore dispatch readiness; each of those states keeps its
+own existing check.
+
+Execution stream identities are recorded through the same runner helper used
+by capture, independently of recording a completion fence. An unavailable
+stream ID leaves fault attribution undecided under the existing health policy;
+it does not establish that later unmatched notices belong to another runner.

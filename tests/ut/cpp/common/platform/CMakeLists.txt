@@ -74,6 +74,7 @@ platform_single_case(test_callable_diagnostics.cpp
 # duration or host scheduling.
 platform_single_case(test_sim_run_completion.cpp
     INCLUDES ${SIMPLER_COMMON_PLATFORM_DIR}/sim/host)
+platform_single_case(test_kernel_capture_binder.cpp)
 
 # RegisterCallableArgs lives in the arch platform headers, and a2a3's
 # kernel_args.h is not a5's, so the POD shape this checks is checked per arch.
@@ -829,6 +830,7 @@ set(NATIVE_ADMISSION_SOURCES
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_base.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/aicore_pmu_lease.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/c_api_shared.cpp
+    ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_capture_api.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_helpers.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_persistent_args.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_phase_capture.cpp

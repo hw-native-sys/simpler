@@ -974,8 +974,9 @@ int finalize_device(DeviceContextHandle ctx);
  * Owned contexts attach their device; borrowed contexts validate the caller
  * context and register on their context-owned control stream. Unknown device
  * registration completion retains the callable until context close.
- * Callable-registry mutation is rejected while a native run is prepared or
- * executing on this context.
+ * Callable-registry mutation is rejected while an ordinary native run is
+ * prepared or executing. A capture lease instead validates its identity and
+ * quiesces its recorded caller stream before any registry mutation.
  *
  * A callable_id that is already registered is rejected with
  * PTO_RUNTIME_ERR_INVALID_ARGUMENT; unregister the ID before reusing it.
@@ -1001,8 +1002,9 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
  *
  * Registration and unregistration serialize internally on the context, so
  * concurrent auto-ID and explicit-ID registration cannot claim the same slot.
- * Registration is refused with PTO_RUNTIME_ERR_INTERNAL while a native run is
- * prepared or executing on the context. finalize_device takes the same lock;
+ * Registration is refused with PTO_RUNTIME_ERR_INTERNAL while an ordinary
+ * native run is prepared or executing. A capture lease validates its identity
+ * and quiesces the recorded caller before registration. finalize_device takes the same lock;
  * runs, initialization and destroy do not, and callers still order those.
  *
  * Explicit-ID registration rejects an already registered ID with
@@ -1243,7 +1245,9 @@ uint64_t get_retained_temp_addr_ctx(DeviceContextHandle ctx, uint32_t slot_id);
  * `launch_device_register` triggers `dlclose` + reload), or at process
  * exit. Long-running processes that register / unregister cids without ever
  * reusing them will hold the AICPU SO handle until shutdown.
- * Rejected while a native run is prepared or executing on this context.
+ * Rejected while an ordinary native run is prepared or executing. A capture
+ * lease first proves recorded caller completion and revokes the captured
+ * callable's device identity; same-ID reuse cannot revive that graph.
  *
  * @return 0 on success or if callable_id was not registered, negative on error.
  */
@@ -1346,8 +1350,8 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * No borrowed path resets or synchronizes the whole device. Cold-path bring-up
  * and registration synchronize a context-owned stream; partial enqueue cleanup
  * may synchronize the bound caller and private streams to prove references are
- * consumed. Capture/replay and the legacy simpler_kernel_mode_launch entry
- * remain unsupported.
+ * consumed. TMR capture/replay uses the explicit graph lease family below;
+ * the legacy simpler_kernel_mode_launch entry remains unsupported.
  *
  * Identity is a write-once property of the context, not a state that evolves:
  * ExecutionModeLatch on the platform runner holds it, the first init entry to
@@ -1366,8 +1370,8 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * while its capacity suffices and transactionally replace it when more is
  * needed. Native-run admission protects a shared bank; HBG per-run banks may
  * prepare independently. Failed staging preserves the committed regions.
- * Capture/replay remains unsupported; graph retention of arena addresses is
- * not provided by this eager resource lifecycle.
+ * TMR capture preparation retains these arenas under a graph lease; eager
+ * preparation alone provides no graph retention.
  *
  * Every host_runtime.so exports all four entries below, so a consumer resolves
  * them unconditionally like the rest of the uniform ABI; supported answers the
@@ -1449,8 +1453,8 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * simpler_kernel_mode_supported() answers that question and stays zero while
  * simpler_kernel_mode_launch is a rejecting stub. Nor does it retain the
  * validated contract or resolve per-preparation configuration — the contract
- * is validated and discarded, and `context_generation` is checked for being
- * nonzero and not yet given a retained lifecycle.
+ * is validated and discarded. The nonzero `context_generation` is retained
+ * for independent device registration of TMR capture leases.
  */
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
@@ -1468,14 +1472,16 @@ int simpler_kernel_mode_init(
  * callable id range. Preparation may allocate persistent state and enqueue
  * asynchronous device work on context-owned streams. Registration synchronizes
  * its internal AICPU control stream before committing the callable, but never
- * synchronizes a caller stream or the device. Preparation neither accepts nor
- * retains a caller stream; the current caller/capture stream is supplied
- * independently to each launch.
+ * synchronizes the device. With a live capture lease, a callable mutation first
+ * quiesces its recorded caller stream and revokes the captured callable before
+ * unregistering it. Preparation itself accepts no caller stream; eager launch
+ * or capture record supplies it explicitly.
  *
  * A callable_id that is already registered is rejected with
  * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Registration is refused with
- * PTO_RUNTIME_ERR_INTERNAL while a native run is prepared or executing on the
- * context; retire the run before reusing the registry.
+ * PTO_RUNTIME_ERR_INTERNAL while an ordinary native run is prepared or executing
+ * on the context; finalize that run before reusing the registry. A capture lease
+ * instead follows the completion and revocation rules above.
  */
 int simpler_kernel_mode_prepare_callable(
     DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
@@ -1496,6 +1502,63 @@ int simpler_kernel_mode_prepare_callable(
  * device execution may still be in flight and may still fail asynchronously.
  */
 int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream);
+
+/** Native capture capability of this build: TMR onboard only. */
+int simpler_kernel_capture_supported(DeviceContextHandle ctx);
+
+typedef struct SimplerKernelCaptureResult {
+    uint64_t replay_epoch;
+    uint64_t completed_epoch; /* AICPU participants only; wait also proves the native AICore join. */
+    int32_t runtime_status;   /* First failure, retained across queued later replays. */
+    uint32_t decision;
+} SimplerKernelCaptureResult;
+
+/**
+ * Prepare one graph lease outside capture, using caller-owned aligned Runtime
+ * storage from get_runtime_size/alignment. The lease retains the ordinary
+ * prepared-run arenas, code and argument snapshot; capacities and addresses
+ * stay fixed. TMR onboard, borrowed context, slot zero and diagnostics off are
+ * currently supported. An existing native run or capture lease is refused.
+ *
+ * This snapshots DEVICE Tensor descriptors and scalars at preparation. The
+ * caller retains the addressed Tensor storage through graph release. A failure
+ * after resource ownership is established may retain the lease for retryable
+ * capture_release; ordinary native finalize cannot free a retained graph lease.
+ * Serialize lifecycle and registry operations on the context, as for callable
+ * preparation. No eager work or second capture may share the leased context.
+ */
+int simpler_kernel_capture_prepare(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor
+);
+
+/**
+ * Record exactly once between the caller's native CANN capture begin/end.
+ * Queries capture status, then records the caller/AICPU/AICore event chain and
+ * native launches without allocating device/runtime resources, uploading,
+ * synchronizing or attaching a model. The launcher can allocate host storage;
+ * callback allocation failures return an integer error and retain the lease
+ * for explicit release. The caller owns end/instantiate and the native model.
+ *
+ * Every replay of that model must be enqueued on this same caller stream.
+ * Its whole-operator join serializes device admission before the next replay.
+ * Executing the model concurrently or on another stream violates the lease.
+ * Capture failure retains accepted-or-unknown submissions until explicit
+ * release can prove all participating streams quiescent.
+ */
+int simpler_kernel_capture_record(DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream);
+
+/** Wait outside capture; return the retained runtime status after the native join. */
+int simpler_kernel_capture_wait(DeviceContextHandle ctx, RuntimeHandle runtime, SimplerKernelCaptureResult *result);
+
+/**
+ * Caller attests that the native graph/model has been destroyed and can never
+ * replay again, including after a failed capture/end/instantiate. Then wait for
+ * pending work, revoke device registration and release the lease. A failed wait
+ * or free retains ownership for retry. Context close refuses a live lease.
+ * Successful release also finalizes the underlying prepared native storage.
+ */
+int simpler_kernel_capture_release(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 #ifdef __cplusplus
 }

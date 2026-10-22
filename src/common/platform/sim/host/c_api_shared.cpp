@@ -1617,4 +1617,31 @@ int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, con
     return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
+int simpler_kernel_capture_supported(DeviceContextHandle) { return 0; }
+
+int simpler_kernel_capture_prepare(
+    DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
+    const NativeRunDescriptor *descriptor
+) {
+    if (ctx == nullptr || runtime == nullptr || args == nullptr || config == nullptr || descriptor == nullptr ||
+        callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS)
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_kernel_capture_record(DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream) {
+    if (ctx == nullptr || runtime == nullptr || caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_kernel_capture_wait(DeviceContextHandle ctx, RuntimeHandle runtime, SimplerKernelCaptureResult *result) {
+    if (ctx == nullptr || runtime == nullptr || result == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_kernel_capture_release(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    if (ctx == nullptr || runtime == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 }  // extern "C"

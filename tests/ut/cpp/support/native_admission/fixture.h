@@ -121,6 +121,12 @@ public:
     AutoAdmissionState::SlotPlan plan(uint32_t slot) const { return auto_admission_.plan(slot); }
     size_t charged() const { return workspace_.reserved_bytes(); }
     bool holds_epoch(uint64_t epoch) const { return workspace_.holds_references(epoch); }
+    int monitor_faults() { return acquire_device_fault_monitor(); }
+    WorkspaceManager::RunRecord facts(uint32_t slot, uint64_t epoch) const {
+        WorkspaceManager::RunRecord out;
+        EXPECT_TRUE(workspace_.describe_run(slot, epoch, &out));
+        return out;
+    }
     bool arena_referenced(uint32_t bank, size_t region) const {
         void *backing = arena_region_backing(bank, region);
         return backing != nullptr && workspace_.block_state(backing) == WorkspaceManager::BlockState::Referenced;

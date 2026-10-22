@@ -1164,8 +1164,13 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
 // {simpler_aicpu_exec, simpler_aicpu_init}. TMARB resolves orchestration on the
 // device, so it exports simpler_aicpu_register_callable; the common AICPU loader
 // queries this so it carries no runtime-specific symbol knowledge.
+extern "C" int runtime_kernel_capture_supported_impl() { return 1; }
+
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count) {
-    static const char *const kExtra[] = {"simpler_aicpu_register_callable", "simpler_aicpu_query_topology"};
+    static const char *const kExtra[] = {
+        "simpler_aicpu_register_callable", "simpler_aicpu_query_topology", "simpler_aicpu_capture_registration",
+        "simpler_aicpu_capture_admit"
+    };
     if (count != nullptr) {
         *count = sizeof(kExtra) / sizeof(kExtra[0]);
     }

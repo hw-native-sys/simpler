@@ -327,6 +327,14 @@ public:
     bool program_initialized() const { return program_initialized_; }
     void set_program_initialized(bool initialized) { program_initialized_ = initialized; }
 
+    void *kernel_capture_owner() const { return kernel_capture_owner_; }
+    void set_kernel_capture_owner(void *owner) { kernel_capture_owner_ = owner; }
+    uint64_t kernel_context_generation() const { return kernel_context_generation_; }
+    void set_kernel_context_generation(uint64_t generation) { kernel_context_generation_ = generation; }
+    int pin_kernel_capture_callable(int32_t callable_id, uint64_t *hash);
+    int release_kernel_capture_control(void *control) { return mem_alloc_.free(control); }
+    int synchronize_kernel_capture_stream(rtStream_t stream);
+
     /** Context-lifetime streams and events, live only in kernel mode. */
     KernelExecutionState &kernel_execution_state() { return kernel_exec_state_; }
 
@@ -1260,6 +1268,7 @@ public:
      * process-wide, and this runner speaks for its own streams.
      */
     uint64_t consume_device_fault_notices() noexcept;
+    void note_run_stream_identity(rtStream_t stream);
 
     /** Evidence this device's fault channel has produced in the live generation. */
     const DeviceHealthState &device_health() const { return device_health_; }
@@ -1920,6 +1929,10 @@ public:
      * the call must follow collector arming.
      */
     int launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args);
+    int launch_aicore_kernel(
+        rtStream_t stream, const KernelArgs &k_args, uint64_t capture_control, uint64_t capture_generation
+    );
+    int ensure_aicore_binary_registered();
 
     /**
      * Walk the SDMA control path once per channel, so the first TPREFETCH_ASYNC
@@ -2934,6 +2947,8 @@ protected:
     ExecutionModeLatch execution_mode_latch_;
     bool program_initialized_{false};
     KernelExecutionState kernel_exec_state_;
+    void *kernel_capture_owner_{nullptr};
+    uint64_t kernel_context_generation_{0};
     PersistentKernelArgs persistent_args_;
     Runtime kernel_runtime_;
     int block_dim_{0};

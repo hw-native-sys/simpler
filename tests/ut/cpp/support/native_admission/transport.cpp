@@ -20,6 +20,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <new>
+#include <stdexcept>
 
 namespace native_admission_transport {
 Control &control() {
@@ -93,6 +95,10 @@ int rtUnregisterAllKernel(void *p) {
     return 0;
 }
 int rtKernelLaunchWithHandleV2(void *, uint64_t, uint32_t, rtArgsEx_t *, void *, rtStream_t, rtTaskCfgInfo_t *) {
+    if (auto &c = native_admission_transport::control(); c.capture_active) {
+        ++c.capture_core_calls;
+        return 0;
+    }
     return -1;
 }
 const char *aclGetRecentErrMsg() { return "native admission CPU transport"; }
@@ -109,7 +115,23 @@ int aclrtDestroyEvent(aclrtEvent p) {
     std::free(p);
     return 0;
 }
-int aclrtRecordEvent(aclrtEvent, aclrtStream) { return 0; }
+int aclrtRecordEvent(aclrtEvent, aclrtStream) {
+    auto &c = native_admission_transport::control();
+    if (c.capture_refuse_after_core != nullptr && c.capture_core_calls != 0) {
+        *c.capture_refuse_after_core = true;
+        // The volatile allocator target preserves the faulting call under
+        // optimization. Only bad_alloc observed at this site satisfies the witness.
+        void *(*volatile allocate)(std::size_t) = ::operator new;
+        try {
+            void *storage = allocate(1);
+            ::operator delete(storage);
+        } catch (const std::bad_alloc &) {
+            ++c.capture_record_allocation_failures;
+            throw;
+        }
+    }
+    return 0;
+}
 int aclrtResetEvent(aclrtEvent, aclrtStream) { return 0; }
 int aclrtQueryEventStatus(aclrtEvent, aclrtEventRecordedStatus *out) {
     *out = ACL_EVENT_RECORDED_STATUS_COMPLETE;
@@ -122,7 +144,10 @@ int aclrtEventGetTimestamp(aclrtEvent, uint64_t *out) {
 }
 int aclrtStreamWaitEvent(aclrtStream, aclrtEvent) { return 0; }
 int aclrtSynchronizeStream(aclrtStream) { return 0; }
-int aclrtSynchronizeStreamWithTimeout(aclrtStream, int32_t) { return 0; }
+int aclrtSynchronizeStreamWithTimeout(aclrtStream, int32_t) {
+    ++native_admission_transport::control().capture_sync_calls;
+    return native_admission_transport::control().stream_sync_rc;
+}
 int aclrtGetStreamResLimit(aclrtStream, int, uint32_t *out) {
     *out = 1;
     return 0;
@@ -137,11 +162,13 @@ int aclrtSetOpExecuteTimeOutV2(uint64_t wanted, uint64_t *actual) {
     return 0;
 }
 int aclrtStreamGetId(aclrtStream, int32_t *out) {
+    if (native_admission_transport::control().fail_stream_id) return -7;
     *out = 1;
     return 0;
 }
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *model) {
-    *status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    *status = native_admission_transport::control().capture_active ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE :
+                                                                     ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     *model = nullptr;
     return 0;
 }
@@ -153,7 +180,20 @@ int LoadAicpuOp::Finalize() { return 0; }
 void LoadAicpuOp::ForgetWithoutUnload() {}
 int LoadAicpuOp::BootstrapDispatcher(const void *, size_t, const void *, size_t, rtStream_t, int) { return -1; }
 int LoadAicpuOp::Init(const std::vector<std::string> &) { return -1; }
-int LoadAicpuOp::LaunchBuiltInOp(rtStream_t, void *, size_t, int, const std::string &) { return -1; }
+int LoadAicpuOp::LaunchBuiltInOp(rtStream_t, void *, size_t, int, const std::string &name) {
+    auto &c = native_admission_transport::control();
+    if (name == "simpler_aicpu_capture_registration") {
+        ++c.capture_registration_calls;
+        if (c.capture_registration_throws) throw std::bad_alloc();
+        return 0;
+    }
+    if (!c.capture_active) return -1;
+    if (name == "simpler_aicpu_exec") {
+        ++c.capture_cpu_calls;
+        if (c.capture_loader_throws) throw std::runtime_error("capture loader failure");
+    }
+    return 0;
+}
 }  // namespace host
 
 KernelContextOps make_onboard_kernel_context_ops() { return {}; }
