@@ -1193,6 +1193,7 @@ public:
         // queues rely on.
         const int n = shard_count_;
 
+        drain_device_queues_on_stop_.store(true, std::memory_order_relaxed);
         mgmt_running_.store(true, std::memory_order_release);
         mgmt_drain_threads_.reserve(n);
         for (int i = 0; i < n; i++) {
@@ -1242,7 +1243,6 @@ public:
      * Precondition: the device-side producers have stopped. A drain worker
      * reports its shard quiescent after one full sweep that found nothing, so a
      * producer still writing could push a record in behind that report.
-     * Callers already satisfy this — the run is drained before teardown.
      *
      * Idempotent, and a no-op before start() or after stop(). Like stop(), it
      * waits without a deadline: a wedged worker hangs the caller here exactly
@@ -1264,18 +1264,22 @@ public:
     }
 
     /**
-     * Stop the drain/replenish mgmt threads, drain whatever the drain side
-     * pushes during its final pass, and join the collector. Idempotent. Caller
-     * is guaranteed on return that mgmt's device-side ringbuffer and the
-     * host-side ready queue shard(s) are empty and Derived::on_buffer_collected
-     * has been called for every entry that was in either queue. Framework-owned
-     * buffers are NOT freed here — Derived's finalize() must do that.
+     * Stop the drain/replenish mgmt threads and join the collector. A proven
+     * producer stop permits a final device-queue drain; without that proof,
+     * only entries already handed to host collectors are finished. Idempotent. Caller
+     * is guaranteed on return that host readers have exited. With a final drain
+     * requested and device producers stopped, mgmt's device-side ringbuffer and the host-side ready
+     * queue shard(s) are empty and Derived::on_buffer_collected has been called
+     * for every entry that was in either queue. Host-thread exit does not prove
+     * producer completion. Framework-owned buffers are NOT freed here —
+     * Derived's finalize() must do that.
      *
      * Order matters: stop+join mgmt first so its final-drain pass is fully
      * landed in the host shards BEFORE we tell poll to exit. Otherwise mgmt's
      * last batch has no consumer.
      */
-    void stop() {
+    void stop(bool drain_device_queues = true) {
+        drain_device_queues_on_stop_.store(drain_device_queues, std::memory_order_relaxed);
         mgmt_running_.store(false, std::memory_order_release);
         for (auto &thread : mgmt_drain_threads_) {
             if (thread.joinable()) {
@@ -1356,9 +1360,9 @@ protected:
 
     /**
      * Name what the drain path lost, so a reconcile gap is attributable instead
-     * of anonymous. Derived::reconcile_counters() is the only caller: the read
-     * consumes the count, which is what makes each run report its own rather
-     * than the collector's cumulative total across a resident lifetime.
+     * of anonymous. Reconciliation or an unproven ordinary close consumes the
+     * host-only count before the next run starts, so a report names this run's
+     * losses rather than the collector's cumulative total.
      */
     void report_drain_drops() {
         const uint64_t dropped = drain_dropped_buffers_.exchange(0, std::memory_order_relaxed);
@@ -2200,7 +2204,7 @@ private:
         // budget.
         std::vector<std::chrono::steady_clock::time_point> stalled_since(static_cast<size_t>(queue_count_));
 
-        while (mgmt_running_.load(std::memory_order_relaxed)) {
+        while (mgmt_running_.load(std::memory_order_acquire)) {
             // An ack covers only a sweep that starts after this epoch is observed.
             const uint64_t requested = drain_quiesce_epoch_.load(std::memory_order_acquire);
             // `found_any` gates quiescence — it means a queue still holds an entry
@@ -2222,7 +2226,8 @@ private:
                 ReadyEntry entry;
                 int served = 0;
                 const int quantum = drain_quantum_.load(std::memory_order_relaxed);
-                while (Alg::try_peek_aicpu_entry(manager_, header, q, entry, true)) {
+                while (mgmt_running_.load(std::memory_order_acquire) &&
+                       Alg::try_peek_aicpu_entry(manager_, header, q, entry, true)) {
                     // Settled with an entry already in hand, never ahead of
                     // one: that is what makes a "no declaration" answer a fact
                     // about the producer rather than about when this shard
@@ -2319,6 +2324,7 @@ private:
             }
         }
 
+        if (!drain_device_queues_on_stop_.load(std::memory_order_relaxed)) return;
         for (int q = queue_start; q < queue_count_; q += queue_stride) {
             if (static_cast<size_t>(q) < kMaxCutQueues && queue_ownership_unknown_[static_cast<size_t>(q)]) {
                 // Already stopped, and the final drain cannot re-establish where
@@ -2708,6 +2714,7 @@ private:
     std::vector<std::thread> mgmt_drain_threads_;
     std::thread mgmt_replenish_thread_;
     std::atomic<bool> mgmt_running_{false};
+    std::atomic<bool> drain_device_queues_on_stop_{true};
 
     // Written by every drain shard, read once per run by reconcile_counters().
     std::atomic<uint64_t> drain_dropped_buffers_{0};

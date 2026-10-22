@@ -653,6 +653,24 @@ tmr_case(test_run_terminal_stop_settlement.cpp
     DEFINES  SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
     LINK     ${CMAKE_DL_LIBS})
 
+# Ordinary close uses the real runner boundary and the real AICPU producer.
+hbg_case(test_args_dump_ordinary_close.cpp
+    SOURCES
+        ${CAPACITY_REFUSAL_SOURCES}
+        ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+    INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
+    DEFINES  SIMPLER_RUNTIME_NAME="host_build_graph"
+    LINK     ${CMAKE_DL_LIBS})
+
+tmr_case(test_args_dump_ordinary_close.cpp
+    SOURCES
+        ${CAPACITY_REFUSAL_SOURCES}
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+    INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
+    DEFINES  SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
+    LINK     ${CMAKE_DL_LIBS})
+
 # Each owner's own three answers to the all-or-nothing admission: which
 # refusal is re-attemptable, whether withdrawing an identity it never admitted
 # is exact, and whether a writer may still be reading its pools.

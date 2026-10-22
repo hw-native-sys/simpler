@@ -339,6 +339,7 @@ dispatch):
   "inout_args": 0,
   "truncated_args": 0,
   "dropped_records": 0,
+  "dropped_records_complete": true,
   "bin_file": "args.bin",
   "args": [
     {
@@ -363,6 +364,9 @@ dispatch):
 
 Key fields:
 
+- `dropped_records_complete` — ordinary manifests distinguish a confirmed
+  device-reported loss count from an unread or incomplete one. It does not
+  certify payload/file or whole-artifact completeness; see §7.3.
 - `dump_args_level` — the capture mode, as its wire value
   (`0` off / `1` partial / `2` hybrid / `3` full).
 - `task_id` — runtime task identity. Use to correlate with swimlane / PMU
@@ -548,11 +552,12 @@ What changes for a caller:
 
 Two honest limits of this mode:
 
-- **A run that dies without an observed device fence is not recovered.** The
-  default path reads a hung run's un-flushed buffer back; the retained path
-  does not, because nothing there proves the device producers stopped, and
-  reading a buffer a successor may already have recycled is worse than an
-  incomplete dump. Leave `collect_across_runs` off for that investigation.
+- **A run that dies without an observed device fence is not recovered.**
+  Ordinary collection also requires a stop proof before reading an un-flushed
+  buffer: observed execution completion or independently joined producers.
+  The onboard boundary supplies no independent producer-stop proof after a
+  failed fence. Both modes therefore preserve host-owned best-effort output
+  without recovering a buffer that a live producer may still modify.
 - **A blocked disk is not a bounded wait.** `flush_diagnostics` is bounded by
   the timeout you pass it, not by a promise that the writer finishes. It does
   not, however, hold the *device*: the producer's arena is released once the
@@ -743,11 +748,11 @@ metadata by `(task_id, stage, arg_index, role)` before writing JSON.
 │   │   host mapping     │<┼──mapping─────<│                          │
 │   └────────────────────┘ │               │                          │
 │                          │               │ dump_args_flush()        │
-│ stop()                   │               │   log per-thread stats   │
-│   join mgmt → collectors │               └──────────────────────────┘
-│ reconcile_counters()     │
-│   recover leftovers      │
-│   + dropped accounting   │
+│ ordinary close(proof)    │               │   log per-thread stats   │
+│   proved: quiesce        │               └──────────────────────────┘
+│     reconcile counters   │
+│   unknown: stop(false)   │
+│     no held recovery     │
 │                          │
 │ export_dump_files()      │
 │   → <output_prefix>/     │
@@ -766,12 +771,13 @@ init_args_dump()
 start()                          ← spawn split mgmt threads (drain/refill
                                    + replenish), then collector shards
 launch AICPU / AICore
-rtStreamSynchronize              ← wait for kernel completion
-stop()                           ← join mgmt/replenish after final drain,
-                                   then signal collector shards and join them
-reconcile_counters()             ← recover leftover current buffers
-                                   + dropped accounting
-export_dump_files()
+observe run completion
+close_ordinary_run(completed || producers_joined)
+  proof: quiesce() → reconcile_counters() → export_dump_files()
+         collector threads remain resident
+  unknown: stop(false) → export_dump_files()
+           join host readers; skip final device drain and held recovery
+           dropped_records_complete is false
 ```
 
 [`ArgsDumpCollector`](../../src/common/platform/include/host/args_dump_collector.h)
@@ -852,12 +858,12 @@ per-thread, so one lane's outstanding payload never holds up another's arena.
 │     queue to writer thrd │               │                          │
 │   notify_copy_done       │               │                          │
 │                          │               │                          │
-│ rtStreamSynchronize      │               │                          │
-│ stop()                   │               │                          │
-│   join mgmt + collectors │               │                          │
-│ reconcile_counters()     │               │                          │
-│   recover leftovers      │               │                          │
-│   + dropped accounting   │               │                          │
+│ observe completion       │               │                          │
+│ ordinary close(proof)    │               │                          │
+│   proved: quiesce        │               │                          │
+│     reconcile counters   │               │                          │
+│   unknown: stop(false)   │               │                          │
+│     no held recovery     │               │                          │
 │ export_dump_files()      │               │                          │
 │   → <output_prefix>/     │               │                          │
 │     args_dump/...        │               │                          │
@@ -872,11 +878,10 @@ init_args_dump()
   kernel_args_.args.dump_data_base = dump_collector_.get_dump_shm_device_ptr()
 dump_collector_.start(thread_factory)   ← split mgmt + collector shards
 launch AICPU / AICore
-rtStreamSynchronize
-dump_collector_.stop()                  ← join mgmt + collectors, drain final batch
-dump_collector_.reconcile_counters()    ← recover leftover current buffers
-                                          + dropped accounting
-dump_collector_.export_dump_files()
+observe run completion
+dump_collector_.close_ordinary_run(completed || producers_joined)
+  proof: quiesce → reconcile counters → export; keep host threads resident
+  unknown: stop(false) → export host-owned records; no held recovery
 dump_collector_.finalize()
 ```
 
@@ -890,10 +895,11 @@ with `DumpModule`. The only a5-specific glue is the 5-callback
 inside `on_buffer_collected`.
 
 a5 normally relies on per-thread AICPU flush (`dump_args_flush`) to move
-the current buffer into the ready queue. If a hang/op-timeout reaps AICPU
-before that flush runs, `reconcile_counters` recovers a non-empty
-`current_buf_ptr` host-side before export, then accumulates each thread's
-`run_dropped_record_count` for the final anomaly report.
+the current buffer into the ready queue. Recovery of a non-empty
+`current_buf_ptr` requires proof that producers stopped, plus current-epoch
+and successful-read checks. A failed onboard fence supplies no independent
+stop proof: close exports host-owned records, skips held recovery and marks
+the dropped-record count incomplete.
 
 ### 5.6 a2a3 vs a5 at a glance
 
@@ -909,8 +915,8 @@ before that flush runs, `reconcile_counters` recovers a non-empty
 | Arena access | direct via SVM | targeted `copy_from_device` inside `on_buffer_collected` |
 | Tensor-payload support | Supported | Supported |
 | Per-task capture by runtime | both runtimes | `tensormap_and_ringbuffer` only; `host_build_graph` has none and refuses the request (§3.1.1) |
-| `reconcile_counters` | recover leftover current buffers + dropped accounting | identical |
-| Lifecycle | `initialize` → `start` → `stop` → `reconcile_counters` → `export_dump_files` → `finalize` | identical |
+| `reconcile_counters` | recover held buffers and snapshot loss counts only after producer-stop proof and host quiescence | identical |
+| Ordinary close | proof: `quiesce` → reconcile → export; unknown: `stop(false)` → export host-owned records | identical |
 
 ## 6. Overhead
 
@@ -1035,8 +1041,25 @@ run_dropped_record_count += N  ← saturating loss counter for this invocation
 The same fallback applies during `dump_args_flush()` at end of
 execution if the ready queue is full.
 
-**Effect:** `dropped_records` in the manifest summary shows how
-many argument records were lost in this invocation. Device initialization clears
+**Effect:** `dropped_records` in the manifest summary counts device-reported
+record losses in this invocation. Ordinary manifests also include
+`dropped_records_complete`: it is `true` only after stopped-producer reconciliation
+has read the invocation's counters and resolved every held metadata buffer without
+an uncounted transport loss. A failed shared-state or held-buffer read, an
+unattributable held buffer, a retired unreadable ready buffer, or a saturated
+counter leaves it `false`. A held-buffer read failure leaves its potential record
+loss unknown even when the device's loss counter was readable. Without completed
+reconciliation, including when producer stop is unknown, it also remains `false`.
+In those cases the numeric field is an observed lower bound; zero does not prove
+zero loss. This flag describes record-loss accounting only: it does not certify
+payload reads, file writes, or the completeness of the entire artifact.
+
+Ordinary collection retains its no-data convention: when no records were
+collected, it writes no manifest, including on an unproven close. Absence of an
+artifact is not evidence of zero device loss or complete collection. The
+completeness flag describes ordinary manifests that were actually written.
+
+Device initialization clears
 `run_dropped_record_count`, independently of the lifetime counter used by retained
 collection. A saturated lifetime counter therefore does not hide a later
 ordinary invocation's losses. Dropped arguments do not appear in
@@ -1053,7 +1076,8 @@ host hand-off queue).
 | Runtime has no per-task capture | request refused `-1001`, nothing prepared | None | None | — | a5 `host_build_graph` (§3.1.1) |
 | Tensor > arena | `truncated` | Preserved | Partial (`arena/2` bytes) | Same | Same |
 | Arena host writer falls behind | none on success | Preserved | Preserved after bounded wait for this thread's ack | Same | Same |
-| Record buffer full, no free buffer | `dropped_records` summary | Lost | Lost | After gate timeout | Same |
+| Record buffer full, no free buffer | `dropped_records`; `dropped_records_complete` states accounting confidence | Lost | Lost | After gate timeout | Same |
+| Ordinary close without producer-stop proof | `dropped_records_complete: false` when a manifest exists; no artifact does not prove zero loss | Host-owned records preserved; held records not recovered | Host-owned payload preserved; held payload not recovered | Same | Same |
 
 ### 7.5 Configuration knobs
 
@@ -1157,27 +1181,32 @@ and 4 s stream-sync for onboard jobs; 5 s scheduler for sim jobs.
   — written at the `after_completion` stage, reflecting current GM,
   so you can see how far a stuck kernel got and how much it wrote.
   Because this fires before STARS reaps the op (45 s), it
-  normally completes while the kernel is still wedged (and host-side
-  recovery below backstops the rest). Best-effort:
+  normally completes while the kernel is still wedged. Only records whose
+  publication reaches the host are available without a later stop proof. Best-effort:
   only AICore writes already drained to GM are visible (the stuck
   core issued no `pipe_barrier`, so writes still in its cache are
   not), and a read may be torn if the core is mid-write. To tell a
   running task's partial output apart from a genuine completion,
   cross-reference the `[STALL …] state=RUNNING` / `SHUTDOWN_SNAPSHOT`
   log lines — those task_ids are the in-flight ones.
-- **Host-side recovery (backstop).** If the AICPU is killed before
-  it finishes flushing (it loses the race, or `emergency_shutdown`
-  blocks on the wedged core), its last buffer is left un-flushed on
-  the device (`current_buf_ptr != 0`). The host's `reconcile_counters`
-  detects this and recovers those records directly from the device
-  buffer + arena (the device is not reset until *after* the export). Recovery
+- **Host-side recovery after proven stop.** A producer that stops before
+  flushing can leave its last buffer on the device (`current_buf_ptr != 0`).
+  Only after observed execution completion or independent producer termination
+  may `reconcile_counters` recover its records from the device buffer and arena.
+  An onboard failed fence provides neither proof, so it does not enable this backstop. Recovery
   requires the current invocation's initialized lane and buffer epochs and
   successful shared-state and buffer reads; failed reads do not authorize
   cached-shadow recovery. Records already owned by the host retain best-effort
-  export. Unread producer accounting is not represented as unknown in the current
-  manifest, so `dropped_records: 0` alone does not prove no loss after a read failure.
-  Recovery assumes stopped producers; the ordinary close boundary currently does
-  not check its producer-stop proof. Epoch and read checks do not establish quiescence.
+  export. Unread producer accounting or an unreadable held buffer leaves
+  `dropped_records_complete: false`; `dropped_records: 0` alone does not prove no loss.
+  Recovery requires either observed execution completion or independently joined
+  producers. Without either proof, ordinary close joins the host drain,
+  replenish, and collector threads before exporting host-owned records, and
+  skips the final device-queue drain and recovery of producer-held buffers.
+  Entries already handed to host collectors finish; later device publications
+  remain on the device. This host shutdown does not establish
+  device completion or authorize freeing device storage. Epoch and read checks
+  alone do not establish quiescence.
 
 This ordering is load-bearing: if the timeouts were inverted (STARS
 reaping before the AICPU's budget, as in earlier versions), the

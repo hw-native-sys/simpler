@@ -36,6 +36,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 
 #include "common/memory_barrier.h"
@@ -81,6 +82,9 @@ void ArgsDumpCollector::begin_run(const std::string &output_prefix, DumpArgsLeve
     dump_args_level_ = dump_args_level;
     reset_collector_shards();
     total_dropped_record_count_.store(0, std::memory_order_relaxed);
+    dropped_records_complete_ = false;
+    ordinary_drain_loss_ = false;
+    recovered_current_buffers_.assign(static_cast<size_t>(num_dump_threads_), {});
     total_truncated_count_.store(0, std::memory_order_relaxed);
     last_progress_ms_.store(0, std::memory_order_relaxed);
     // The lane counters are the one piece of per-run state a retained run must
@@ -225,6 +229,9 @@ int ArgsDumpCollector::initialize(
     num_dump_threads_ = num_dump_threads;
     reset_collector_shards();
     total_dropped_record_count_.store(0, std::memory_order_relaxed);
+    dropped_records_complete_ = false;
+    ordinary_drain_loss_ = false;
+    recovered_current_buffers_.assign(static_cast<size_t>(num_dump_threads_), {});
     total_truncated_count_.store(0, std::memory_order_relaxed);
     last_progress_ms_.store(0, std::memory_order_relaxed);
     for (auto &count : written_payload_counts_) {
@@ -690,19 +697,34 @@ void ArgsDumpCollector::on_buffer_collected(const DumpReadyBufferInfo &info, int
 // reconcile_counters: recover un-flushed current buffers + dropped accounting
 // ---------------------------------------------------------------------------
 
+int ArgsDumpCollector::close_ordinary_run(bool producer_stop_proved) {
+    if (producer_stop_proved) {
+        quiesce();
+        reconcile_counters();
+    } else {
+        // Host transport finishes only entries already handed to collectors;
+        // new device publications and producer-held buffers stay on the device.
+        // Thread exit supplies no authority to release device storage.
+        stop(false);
+        report_drain_drops();
+    }
+    return export_dump_files();
+}
+
 void ArgsDumpCollector::reconcile_counters() {
-    if (shm_host_ == nullptr) return;
     // The retained path decides a leftover buffer at its own close, under that
     // run's execution claim and against that run's receipt ledger. Reaching
     // this bulk read afterwards would copy the whole shared region back over
     // the free-queue cursors the drain and replenish threads own, and would
     // read a buffer whose identity nothing here can check.
     if (retain_across_runs_) return;
+    dropped_records_complete_ = false;
+    if (shm_host_ == nullptr) return;
+    ordinary_drain_loss_ = ordinary_drain_loss_ || drain_dropped_buffers() != 0;
     report_drain_drops();
 
-    // Pull the latest BufferStates (current_buf_ptr, run_dropped_record_count)
-    // before the per-thread loop so leftovers reflect post-stop() device
-    // state.
+    // Producer stop precedes this snapshot. quiesce() drains published records
+    // but leaves host transport threads resident.
     if (manager_.shared_mem_dev() != nullptr && shm_size_ > 0) {
         if (profiling_copy_from_device(shm_host_, manager_.shared_mem_dev(), shm_size_) != 0) {
             LOG_ERROR("Args dump: cannot read device state for run %llu", static_cast<unsigned long long>(run_epoch_));
@@ -711,22 +733,19 @@ void ArgsDumpCollector::reconcile_counters() {
     }
     rmb();
 
-    uint32_t dropped_total = 0;
+    uint64_t dropped_total = 0;
+    bool counts_complete = !ordinary_drain_loss_;
     int recovered_threads = 0;
-    // After stop(), a non-zero current_buf_ptr with records means the device
-    // never ran dump_args_flush for that thread. The common cause is a hang:
-    // the AICPU op is reaped by the hardware op-execution timeout (507xxx)
-    // before its graceful scheduler-timeout shutdown can flush. The host still
-    // holds the buffer and the originating arena, so recover the records here
-    // (the same path the poll thread uses for a ready buffer) instead of
-    // dropping them — export_dump_files() then writes them like any normally
-    // collected buffer, so a hung run still yields its dumped inputs/outputs.
+    // A stopped producer may leave records in its unpublished current buffer.
+    // Recovery reads require the current lane/buffer epoch and successful
+    // copies; a failed fence alone supplies none of the stop proof.
     for (int t = 0; t < num_dump_threads_; t++) {
         DumpBufferState *state = get_dump_buffer_state(shm_host_, t);
         if (state->run_epoch != run_epoch_) {
             // The pool includes non-scheduler AICPU lanes that never initialize.
             // A prior held buffer or loss count still needs an attributable run.
             if (state->current_buf_ptr != 0 || state->run_dropped_record_count != 0) {
+                counts_complete = false;
                 LOG_ERROR(
                     "Args dump: lane %d did not initialize for run %llu", t, static_cast<unsigned long long>(run_epoch_)
                 );
@@ -734,30 +753,47 @@ void ArgsDumpCollector::reconcile_counters() {
             continue;
         }
 
-        total_dropped_record_count_.fetch_add(state->run_dropped_record_count, std::memory_order_relaxed);
         dropped_total += state->run_dropped_record_count;
+        if (state->run_dropped_record_count == std::numeric_limits<uint32_t>::max()) counts_complete = false;
 
         uint64_t cur_ptr = state->current_buf_ptr;
         if (cur_ptr == 0) continue;
 
+        // A stopped producer preserves its held pointer/sequence for this run.
+        auto &recovered = recovered_current_buffers_[static_cast<size_t>(t)];
+        const uint32_t current_seq = state->current_buf_seq;
+        if (recovered.dev_buffer_ptr == cur_ptr && recovered.buffer_seq == current_seq) continue;
+
         void *host_ptr = manager_.resolve_host_ptr(reinterpret_cast<void *>(cur_ptr));
-        if (host_ptr == nullptr) continue;
+        if (host_ptr == nullptr) {
+            counts_complete = false;
+            continue;
+        }
 
         if (profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(cur_ptr), sizeof(DumpMetaBuffer)) != 0) {
+            counts_complete = false;
             LOG_ERROR("Args dump: cannot recover lane %d for run %llu", t, static_cast<unsigned long long>(run_epoch_));
             continue;
         }
         const auto *buffer = static_cast<const DumpMetaBuffer *>(host_ptr);
-        if (buffer->run_epoch != run_epoch_) continue;
+        if (buffer->run_epoch != run_epoch_) {
+            counts_complete = false;
+            continue;
+        }
         uint32_t count = buffer->count;
+        if (count > PLATFORM_DUMP_RECORDS_PER_BUFFER) {
+            counts_complete = false;
+            continue;
+        }
         if (count == 0) continue;
 
         DumpReadyBufferInfo info;
         info.thread_index = static_cast<uint32_t>(t);
         info.dev_buffer_ptr = reinterpret_cast<void *>(cur_ptr);
         info.host_buffer_ptr = host_ptr;
-        info.buffer_seq = state->current_buf_seq;
+        info.buffer_seq = current_seq;
         on_buffer_collected(info, static_cast<int>(t));
+        recovered = {cur_ptr, current_seq};
         recovered_threads++;
         LOG_WARN(
             "Dump reconcile: thread %d had an un-flushed buffer (count=%u) — device flush did not run "
@@ -766,11 +802,16 @@ void ArgsDumpCollector::reconcile_counters() {
         );
     }
 
+    const uint64_t max_count = std::numeric_limits<uint32_t>::max();
+    total_dropped_record_count_.store(
+        static_cast<uint32_t>(std::min(dropped_total, max_count)), std::memory_order_relaxed
+    );
+    dropped_records_complete_ = counts_complete && dropped_total <= max_count;
     if (dropped_total > 0) {
         LOG_WARN(
-            "Dump reconcile: %u records dropped on device side. "
+            "Dump reconcile: %llu records dropped on device side. "
             "Increase PLATFORM_DUMP_BUFFERS_PER_THREAD or PLATFORM_DUMP_READYQUEUE_SIZE.",
-            dropped_total
+            static_cast<unsigned long long>(dropped_total)
         );
     }
     if (recovered_threads > 0) {
@@ -868,10 +909,9 @@ void ArgsDumpCollector::publish_arena_acks() {
         // One run owns the file for its whole boundary, so tying reuse to disk
         // costs that run nothing. Its host window starts at zero while the
         // device's initialization baseline anchors it in the lifetime cursor.
-        // This equation assumes recovery runs after producers stop. The
-        // ordinary close boundary does not yet check its producer-stop proof;
-        // recovery of unpublished payloads against a live producer can therefore
-        // over-credit this count. Epoch/read checks do not establish quiescence.
+        // Recovery requires a producer-stop proof. An unproven close joins the
+        // host transport before export and excludes unpublished payloads from
+        // this count.
         //
         // `written_payload_counts_[t]` is deliberately **not** part of the
         // retained equation: the writer advances it for recovered payloads too,
@@ -962,6 +1002,9 @@ int ArgsDumpCollector::export_dump_files() {
         LOG_WARN("No args dump data to export");
         reset_collector_shards();
         total_dropped_record_count_.store(0, std::memory_order_relaxed);
+        dropped_records_complete_ = false;
+        ordinary_drain_loss_ = false;
+        recovered_current_buffers_.assign(static_cast<size_t>(num_dump_threads_), {});
         total_truncated_count_.store(0, std::memory_order_relaxed);
         writer_started_ = false;
         return 0;
@@ -1013,6 +1056,7 @@ int ArgsDumpCollector::export_dump_files() {
     meta.inout_args = num_inout_args;
     meta.truncated_args = total_truncated_count_.load(std::memory_order_relaxed);
     meta.dropped_records = total_dropped_record_count_.load(std::memory_order_relaxed);
+    meta.dropped_records_complete = dropped_records_complete_;
     if (dump_args_level_ != DumpArgsLevel::HYBRID || bytes_written_.load() != 0) {
         meta.bin_file = "args.bin";
     }
@@ -1048,6 +1092,9 @@ int ArgsDumpCollector::export_dump_files() {
     collector_shards_merged_ = false;
     total_metadata_collected_.store(0, std::memory_order_relaxed);
     total_dropped_record_count_.store(0, std::memory_order_relaxed);
+    dropped_records_complete_ = false;
+    ordinary_drain_loss_ = false;
+    recovered_current_buffers_.assign(static_cast<size_t>(num_dump_threads_), {});
     total_truncated_count_.store(0, std::memory_order_relaxed);
     writer_started_ = false;
     return 0;
@@ -1198,6 +1245,9 @@ int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Dump
     collector_shards_merged_ = false;
     total_metadata_collected_.store(0, std::memory_order_relaxed);
     total_dropped_record_count_.store(0, std::memory_order_relaxed);
+    dropped_records_complete_ = false;
+    ordinary_drain_loss_ = false;
+    recovered_current_buffers_.assign(static_cast<size_t>(num_dump_threads_), {});
     total_truncated_count_.store(0, std::memory_order_relaxed);
     writer_started_ = false;
     clear_memory_context();

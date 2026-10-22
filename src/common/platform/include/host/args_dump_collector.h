@@ -278,12 +278,19 @@ public:
     int export_dump_files();
 
     /**
-     * After stop():
+     * A completed execution or joined producer supplies the stop proof.
+     * Without it, host readers retire before export and producer-held buffers
+     * stay on the device. Closes only the ordinary single-run artifact window.
+     */
+    int close_ordinary_run(bool producer_stop_proved);
+
+    /**
+     * After producer stop and host transport quiescence:
      *   - Recover records from any non-empty DumpBufferState::current_buf_ptr
      *     left behind by abnormal exit before device-side flush ran.
-     *   - Accumulate device-side dropped_record_count into
+     *   - Snapshot device-side run_dropped_record_count into
      *     total_dropped_record_count_ for the final anomaly report.
-     * Must be called after stop().
+     * Joining host threads alone does not prove the device producer stopped.
      */
     void reconcile_counters();
 
@@ -626,6 +633,13 @@ private:
 
     // Stats
     std::atomic<uint32_t> total_dropped_record_count_{0};
+    bool dropped_records_complete_{false};
+    bool ordinary_drain_loss_{false};
+    struct RecoveredCurrentBuffer {
+        uint64_t dev_buffer_ptr{0};
+        uint32_t buffer_seq{0};
+    };
+    std::vector<RecoveredCurrentBuffer> recovered_current_buffers_;
     std::atomic<uint32_t> total_truncated_count_{0};
     std::array<std::atomic<uint64_t>, PLATFORM_MAX_AICPU_THREADS> written_payload_counts_{};
 

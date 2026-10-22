@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstring>
 #include <iomanip>
+#include <optional>
 #include <ostream>
 #include <sstream>
 #include <string>
@@ -134,6 +135,8 @@ struct ManifestMeta {
     uint32_t inout_args{0};
     uint64_t truncated_args{0};
     uint64_t dropped_records{0};
+    // Ordinary runs only: completeness of record-loss accounting, not payloads.
+    std::optional<bool> dropped_records_complete;
     // Empty means `null`: the level selected no payload, so no payload file
     // was produced and there is nothing for the offsets to refer to.
     std::string bin_file;
@@ -162,6 +165,9 @@ inline void write_manifest_prologue(std::ostream &json, const ManifestMeta &meta
     json << "  \"inout_args\": " << meta.inout_args << ",\n";
     json << "  \"truncated_args\": " << meta.truncated_args << ",\n";
     json << "  \"dropped_records\": " << meta.dropped_records << ",\n";
+    if (meta.dropped_records_complete.has_value()) {
+        json << "  \"dropped_records_complete\": " << (*meta.dropped_records_complete ? "true" : "false") << ",\n";
+    }
     if (meta.retained) {
         json << "  \"host_discarded_args\": " << meta.host_discarded_args << ",\n";
         json << "  \"metadata_discarded_records\": " << meta.metadata_discarded_records << ",\n";
