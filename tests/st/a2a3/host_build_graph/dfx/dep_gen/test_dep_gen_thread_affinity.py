@@ -28,13 +28,14 @@ reaches past the supported surface.
 
 import json
 import threading
+from pathlib import Path
 
 import torch
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CallConfig
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
-from simpler_setup.scene_test import _build_l2_ref_args, build_output_prefix
+from simpler_setup.scene_test import _build_l2_ref_args
 
 KERNELS_BASE = "kernels"
 
@@ -106,10 +107,9 @@ class TestDepGenHostGraphThreadAffinity(SceneTestCase):
         handle = st_worker.register(callable_obj)
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
-        def make_config(prefix):
+        def make_config():
             config = CallConfig()
             config.enable_dep_gen = True
-            config.output_prefix = str(prefix)
             return config
 
         # The resolved descriptors in chip_args carry addresses into the torch
@@ -124,21 +124,22 @@ class TestDepGenHostGraphThreadAffinity(SceneTestCase):
             keepalive.append((args, chip_args))
             return chip_args
 
-        first_prefix = build_output_prefix(f"{type(self).__name__}_{case['name']}_first")
-        second_prefix = build_output_prefix(f"{type(self).__name__}_{case['name']}_second")
-
         # This thread orchestrates the first run, so its graph lands in this
         # thread's capture state. It stays alive for the whole test: a thread that
         # exited would destroy that state for a different reason.
-        first = st_worker.submit(handle, build_args(), make_config(first_prefix))
+        first = st_worker.submit(handle, build_args(), make_config())
+        first_prefix = Path(st_worker.capture_output_prefix)
 
         # The second submit blocks at depth one and drains the first run — on this
         # thread, not the one that orchestrated it.
         drain_error: list[BaseException] = []
+        second_prefixes: list[Path] = []
 
         def submit_from_other_thread():
             try:
-                st_worker.submit(handle, build_args(), make_config(second_prefix)).wait()
+                second = st_worker.submit(handle, build_args(), make_config())
+                second_prefixes.append(Path(st_worker.capture_output_prefix))
+                second.wait()
             except BaseException as exc:  # noqa: BLE001 -- reported on the main thread
                 drain_error.append(exc)
 
@@ -149,6 +150,7 @@ class TestDepGenHostGraphThreadAffinity(SceneTestCase):
         if drain_error:
             raise drain_error[0]
         first.wait()
+        [second_prefix] = second_prefixes
 
         for label, prefix in (("first", first_prefix), ("second", second_prefix)):
             deps_path = prefix / "deps.json"

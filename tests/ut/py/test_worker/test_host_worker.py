@@ -45,6 +45,7 @@ from simpler.callable_identity import (
 from simpler.task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
+    CallConfig,
     ChipCallable,
     DataType,
     TaskArgs,
@@ -3538,7 +3539,7 @@ class TestRunHandle:
             raise graph_error
 
         with pytest.raises(ValueError) as excinfo:
-            worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
+            worker._submit_l3_locked(bad_graph, None, CallConfig())
 
         assert excinfo.value is graph_error
         assert events == ["begin", "scope_begin", "scope_end", "fail", "fail", "wait", "release"]
@@ -3557,7 +3558,7 @@ class TestRunHandle:
             raise ValueError("bad graph")
 
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
+            worker._submit_l3_locked(bad_graph, None, CallConfig())
 
         expected_name = f"{worker._host_span_prefix}.graph_build"
         assert emitted == [(expected_name, 1, 0, 0, 100, 175, "run_id=1 role=facade")]
@@ -3592,7 +3593,7 @@ class TestRunHandle:
             raise ValueError("bad graph")
 
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
+            worker._submit_l3_locked(bad_graph, None, CallConfig())
 
     def test_submit_enables_the_process_log_only_for_output_runs(self, monkeypatch):
         """An output run enables the stable process log before it builds the graph."""
@@ -3604,18 +3605,15 @@ class TestRunHandle:
             raise ValueError("bad graph")
 
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="/tmp/run-artifacts")))
+            cfg = CallConfig()
+            cfg.output_prefix = "/tmp/run-artifacts"
+            worker._submit_locked(bad_graph, None, cfg)
         assert bindings == [None]
 
-        # An empty prefix leaves the logger on stderr.
+        # An empty prefix does not request a log binding.
         bindings.clear()
         with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_locked(bad_graph, None, cast(Any, SimpleNamespace(output_prefix="")))
-        assert bindings == []
-
-        # A config without the field at all must not be what fails a submit.
-        with pytest.raises(ValueError, match="bad graph"):
-            worker._submit_locked(bad_graph, None, cast(Any, object()))
+            worker._submit_locked(bad_graph, None, CallConfig())
         assert bindings == []
 
     def test_unsettled_graph_cancellation_abandons_the_handle_before_close(self):
@@ -3626,7 +3624,7 @@ class TestRunHandle:
             raise graph_error
 
         with pytest.raises(ValueError) as excinfo:
-            worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
+            worker._submit_l3_locked(bad_graph, None, CallConfig())
 
         assert excinfo.value is graph_error
         assert events == ["begin", "scope_begin", "scope_end", "fail", "fail"]
@@ -3700,7 +3698,7 @@ class TestRunHandle:
             raise graph_error
 
         with pytest.raises(ValueError) as caught:
-            worker._submit_l3_locked(bad_graph, None, cast(Any, object()))
+            worker._submit_l3_locked(bad_graph, None, CallConfig())
 
         assert caught.value is graph_error
         assert lifecycle_cv.interrupts == 1

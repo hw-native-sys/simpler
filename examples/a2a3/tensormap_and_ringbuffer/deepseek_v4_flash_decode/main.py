@@ -86,7 +86,7 @@ from simpler_setup.goldens.deepseek_v4_flash_decode import (
 from simpler_setup.log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
 from simpler_setup.parallel_scheduler import device_range_to_list
 from simpler_setup.scene_test import (
-    build_output_prefix,
+    _outputs_dir,
     compile_chip_callable_spec,
     effective_diagnostic_options,
     finalize_diagnostic_outputs,
@@ -730,7 +730,6 @@ def _build_config(
     enable_pmu: int,
     enable_dep_gen: bool,
     enable_scope_stats: bool,
-    output_prefix: str,
 ) -> CallConfig:
     config = CallConfig()
     runtime_env = _RUNTIME_ENV[runtime]
@@ -743,9 +742,6 @@ def _build_config(
     config.enable_pmu = enable_pmu
     config.enable_dep_gen = enable_dep_gen
     config.enable_scope_stats = enable_scope_stats
-    # CallConfig::validate() requires a prefix whenever a diagnostic is enabled.
-    if output_prefix:
-        config.output_prefix = output_prefix
     return config
 
 
@@ -844,12 +840,11 @@ def run(  # noqa: PLR0913 -- one knob per CLI flag
         scope_stats=enable_scope_stats,
         swimlane_overhead=False,
     )
-    diagnostics_on = bool(diagnostics.dump_args or diagnostics.pmu or diagnostics.dep_gen or diagnostics.scope_stats)
-    output_prefix = str(build_output_prefix(f"{CASE_LABEL}_{runtime}")) if diagnostics_on else ""
 
     print(f"[dsv4] devices={device_ids} rounds={rounds} skip_golden={skip_golden}", flush=True)
     worker = Worker(
         level=3,
+        output_root=_outputs_dir(),
         device_ids=device_ids,
         num_sub_workers=0,
         platform=platform,
@@ -869,7 +864,6 @@ def run(  # noqa: PLR0913 -- one knob per CLI flag
             enable_pmu=diagnostics.pmu,
             enable_dep_gen=diagnostics.dep_gen,
             enable_scope_stats=diagnostics.scope_stats,
-            output_prefix=output_prefix,
         )
         log_torch_backend_autoload_once()
         for round_idx in range(rounds):
@@ -881,6 +875,7 @@ def run(  # noqa: PLR0913 -- one knob per CLI flag
 
             worker.run(task_orch)
     finally:
+        output_prefix = worker.capture_output_prefix or ""
         worker.close()
         if output_prefix:
             finalize_diagnostic_outputs(

@@ -777,7 +777,7 @@ class _A5TmrEarlyEnqueueBase(SceneTestCase):
         """
         handle = type(self)._st_chip_handles[callable_name]
         signature = type(self)._st_chip_handles[f"{callable_name}_sig"]
-        config = self._build_config(self.CASES[0]["config"], output_prefix=output_prefix)
+        config = self._build_config(self.CASES[0]["config"])
 
         def graph(orch, _args, _cfg):
             orch.submit_next_level(handle, _chip_args(arg_buffers, signature, spin_iters), config, worker=chip_index)
@@ -1124,8 +1124,8 @@ class TestA5TmrEarlyEnqueueTwoEndpoints(_A5TmrEarlyEnqueueBase):
             sampler = threading.Thread(target=sample, daemon=True)
             sampler.start()
             try:
-                with tempfile.TemporaryDirectory(prefix="simpler-a5-tmr-early-enqueue-comm-") as output_prefix:
-                    config = self._build_config(self.CASES[0]["config"], output_prefix=output_prefix)
+                with tempfile.TemporaryDirectory(prefix="simpler-a5-tmr-early-enqueue-comm-"):
+                    config = self._build_config(self.CASES[0]["config"])
                     buffers: list = []
                     expectations: list = []
                     groups = []

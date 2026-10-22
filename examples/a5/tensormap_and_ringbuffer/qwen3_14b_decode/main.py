@@ -64,7 +64,7 @@ from simpler_setup.log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, confi
 from simpler_setup.parallel_scheduler import device_range_to_list
 from simpler_setup.scene_test import (
     ChildMemoryTaskArgs,
-    build_output_prefix,
+    _outputs_dir,
     compile_chip_callable_spec,
     effective_diagnostic_options,
     finalize_diagnostic_outputs,
@@ -514,7 +514,6 @@ def _build_config(
     enable_pmu: int,
     enable_dep_gen: bool,
     enable_scope_stats: bool,
-    output_prefix: str,
 ) -> CallConfig:
     config = CallConfig()
     config.runtime_env.ring_task_window = runtime_env.get("ring_task_window", 0)
@@ -525,8 +524,6 @@ def _build_config(
     config.enable_pmu = enable_pmu
     config.enable_dep_gen = enable_dep_gen
     config.enable_scope_stats = enable_scope_stats
-    if output_prefix:
-        config.output_prefix = output_prefix
     return config
 
 
@@ -609,16 +606,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
         scope_stats=enable_scope_stats,
         swimlane_overhead=enable_swimlane_overhead,
     )
-    diagnostics_on = bool(
-        diagnostics.chip_swimlane
-        or diagnostics.dump_args
-        or diagnostics.pmu
-        or diagnostics.dep_gen
-        or diagnostics.scope_stats
-        or diagnostics.swimlane_overhead
-    )
     diagnostic_label = f"{CASE_LABEL}_{runtime}"
-    output_prefix = str(build_output_prefix(diagnostic_label)) if diagnostics_on else ""
     if runtime_env is None:
         runtime_env = TestQwen314BDecode.CASES[0].get("config", {}).get("runtime_env", {})
     assert runtime_env is not None
@@ -628,7 +616,7 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
         f"[qwen] device={device_id} rounds={rounds} skip_golden={skip_golden}; one fixture upload",
         flush=True,
     )
-    worker = Worker(level=2, platform=platform, runtime=runtime, device_id=device_id)
+    worker = Worker(level=2, platform=platform, runtime=runtime, device_id=device_id, output_root=_outputs_dir())
     chip_handle = worker.register(chip)
     worker.init()
     child_args = ChildMemoryTaskArgs(worker)
@@ -658,7 +646,6 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
             enable_pmu=diagnostics.pmu,
             enable_dep_gen=diagnostics.dep_gen,
             enable_scope_stats=diagnostics.scope_stats,
-            output_prefix=output_prefix,
         )
         log_torch_backend_autoload_once()
         # KV writes are intentionally not reset between rounds. Fixed inputs and
@@ -669,17 +656,19 @@ def run(  # noqa: PLR0913 -- one knob per standalone CLI option
         if golden is not None:
             _copy_and_compare(worker, child_args.buffers, golden)
     finally:
+        output_prefix = worker.capture_output_prefix or ""
         child_args.release()
         worker.close()
-        finalize_diagnostic_outputs(
-            diagnostic_label,
-            output_prefix,
-            callable_spec=spec,
-            chip_swimlane=diagnostics.chip_swimlane,
-            dep_gen=diagnostics.dep_gen,
-            scope_stats=diagnostics.scope_stats,
-            swimlane_overhead=diagnostics.swimlane_overhead,
-        )
+        if output_prefix:
+            finalize_diagnostic_outputs(
+                diagnostic_label,
+                output_prefix,
+                callable_spec=spec,
+                chip_swimlane=diagnostics.chip_swimlane,
+                dep_gen=diagnostics.dep_gen,
+                scope_stats=diagnostics.scope_stats,
+                swimlane_overhead=diagnostics.swimlane_overhead,
+            )
     print("[qwen] PASSED", flush=True)
     return 0
 

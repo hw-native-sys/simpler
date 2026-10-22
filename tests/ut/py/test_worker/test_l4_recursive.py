@@ -21,6 +21,8 @@ from __future__ import annotations
 import ast
 import os
 import struct
+import subprocess
+import sys
 import threading
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
@@ -32,6 +34,7 @@ from simpler.callable_identity import CallableHandle
 from simpler.task_interface import CallConfig, TaskArgs, TaskHandle
 from simpler.worker import RunHandle, Worker, _CloseAttempt, _Lifecycle, attach_exception_note
 
+from simpler_setup.scene_test import _outputs_dir
 from tests.st.worker.comm_region.recursive_single_owner._helpers import close_owned_workers
 
 from ._harness import (
@@ -396,7 +399,7 @@ class TestL4ToL3MultipleDispatches:
 
 
 class TestL4ChildCaptureNamespace:
-    def test_attached_l3_children_write_under_distinct_namespaces(self, tmp_path):
+    def test_attached_l3_children_write_under_distinct_namespaces(self):
         """Two attached L3 children never share one artifact directory.
 
         Every diagnostic below `output_prefix` uses a fixed filename, and each
@@ -405,6 +408,25 @@ class TestL4ChildCaptureNamespace:
         written at the prefix the child was actually handed, so both survive
         only if the two children were handed different ones.
         """
+        if os.environ.get("SIMPLER_L4_CAPTURE_TEST_CHILD") != "1":
+            env = os.environ.copy()
+            env["SIMPLER_L4_CAPTURE_TEST_CHILD"] = "1"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pytest",
+                    f"{__file__}::TestL4ChildCaptureNamespace::test_attached_l3_children_write_under_distinct_namespaces",
+                    "-q",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+                timeout=90,
+                check=False,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
+            return
 
         def l3_orch(orch, args, config):
             os.makedirs(config.output_prefix, exist_ok=True)
@@ -416,23 +438,26 @@ class TestL4ChildCaptureNamespace:
         second = Worker(level=3, num_sub_workers=1)
         second.register(lambda args: None)
 
-        w4 = Worker(level=4, num_sub_workers=0)
+        w4 = Worker(level=4, num_sub_workers=0, output_root=_outputs_dir())
         l3_handle = w4.register(l3_orch)
         first_id = w4.add_worker(first)
         second_id = w4.add_worker(second)
         w4.init()
 
-        child_config = CallConfig()
-        child_config.output_prefix = str(tmp_path)
+        run_config = CallConfig()
+        run_config.enable_dep_gen = True
 
         def l4_orch(orch, args, config):
             for worker_id in (first_id, second_id):
-                orch.submit_next_level(l3_handle, TaskArgs(), child_config, worker=worker_id)
+                orch.submit_next_level(l3_handle, TaskArgs(), config, worker=worker_id)
 
-        w4.run(l4_orch)
+        w4.run(l4_orch, config=run_config)
+        capture_prefix = w4.capture_output_prefix
+        assert capture_prefix is not None
+        capture_root = Path(capture_prefix)
         w4.close()
 
-        probes = {path.parent.name: path.read_text() for path in tmp_path.rglob("probe.txt")}
+        probes = {path.parent.name: path.read_text() for path in capture_root.rglob("probe.txt")}
         assert set(probes) == {f"node{first_id}", f"node{second_id}"}
         assert len(set(probes.values())) == 2
 

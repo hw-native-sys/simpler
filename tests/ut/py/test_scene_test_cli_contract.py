@@ -344,19 +344,21 @@ def test_chip_swimlane_extension_hook_uses_the_shared_multi_round_gate(rounds, e
     assert SceneTestCase._effective_enable_chip_swimlane(request) == expected
 
 
-def test_swimlane_overhead_allocates_a_diagnostic_output_prefix(monkeypatch) -> None:
+def test_swimlane_overhead_allocates_a_diagnostic_output_prefix() -> None:
     scene_test_module = importlib.import_module("simpler_setup.scene_test")
     output_prefix = scene_test_module.Path("diagnostic-output")
     captured = {}
+
+    class FakeWorker:
+        def _diagnostic_case_output(self, _case_label):
+            return scene_test_module.nullcontext(str(output_prefix))
 
     class FakeScene:
         def _run_and_validate(self, *_args, **kwargs):
             captured.update(kwargs)
 
-    monkeypatch.setattr(scene_test_module, "build_output_prefix", lambda _case_label: output_prefix)
-
     run_class_cases(
-        object(),
+        FakeWorker(),
         FakeScene(),
         [{"name": "overhead"}],
         callable_obj=object(),

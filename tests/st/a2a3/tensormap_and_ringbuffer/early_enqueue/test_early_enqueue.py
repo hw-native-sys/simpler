@@ -126,7 +126,6 @@ from simpler.worker import (
 )
 
 from simpler_setup import SceneTestCase, scene_test
-from simpler_setup.scene_test import build_output_prefix
 from simpler_setup.tools.strace_timing import parse_spans
 
 #: The point-in-time host span one joined launch publishes, carrying both run identities and
@@ -814,7 +813,7 @@ class _A2a3TmrEarlyEnqueueBase(SceneTestCase):
         """
         handle = type(self)._st_chip_handles[callable_name]
         signature = type(self)._st_chip_handles[f"{callable_name}_sig"]
-        config = self._build_config(self.CASES[0]["config"], output_prefix=output_prefix)
+        config = self._build_config(self.CASES[0]["config"])
 
         def graph(orch, _args, _cfg):
             orch.submit_next_level(handle, _chip_args(arg_buffers, signature, spin_iters), config, worker=chip_index)
@@ -1679,13 +1678,8 @@ class TestA2a3TmrEarlyEnqueueOutstandingClose(_A2a3TmrEarlyEnqueueBase):
         assert st_worker._launch_depth == 2, (  # noqa: SLF001 -- scene-test validation
             f"this class needs a Worker at launch_depth=2, got {st_worker._launch_depth}"  # noqa: SLF001
         )
-        # The directory has to outlive this case, because a run still in flight owns the prefix its
-        # child is writing to — so it must be one this case does not own. `build_output_prefix`
-        # creates a durable, gitignored `outputs/<label>_<timestamp>/` that nothing afterwards
-        # removes, which is what makes it safe here and is how every other case's diagnostic
-        # artifacts are retained. A `mkdtemp` would either be removed under a live writer or be an
-        # unexplained leak.
-        output_prefix = str(build_output_prefix("a2a3_tmr_outstanding_close"))
+        # Host logs are bound to the Worker's output root before these runs start.
+        output_prefix = ""
         for a_value, b_value in ((2.0, 3.0), (5.0, 7.0)):
             group, _out, _expected = self._three_buffers(st_worker, a_value, b_value)
             # Deliberately not retained and deliberately not waited: the handles stay registered on
@@ -1926,10 +1920,7 @@ class TestA2a3TmrWideOutstandingClose(_A2a3TmrEarlyEnqueueBase):
             f"the endpoint negotiated {negotiated} sets for a {_WIDE_SETS}-set request, so the prefix this case "
             f"leaves outstanding would not be wider than the old layout"
         )
-        # A durable prefix, for the reason the narrow sibling gives: a run still in flight owns the
-        # directory its child is writing to, so this case must not own one that is removed under a
-        # live writer.
-        output_prefix = str(build_output_prefix("a2a3_tmr_wide_outstanding_close"))
+        output_prefix = ""
         for index in range(_WIDE_SETS):
             group, _out, _expected = self._three_buffers(st_worker, float(2 * index + 2), float(2 * index + 3))
             # Deliberately neither retained nor waited: the handles stay registered on the Worker,

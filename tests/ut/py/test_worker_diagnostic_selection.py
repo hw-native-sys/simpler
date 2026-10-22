@@ -24,9 +24,6 @@ from test_kernel_mode_c_api import _CallerContexts, _load
 
 def _check_swimlane(folder, level):
     artifact = folder / "chip_swimlane_records.json"
-    if level == 0:
-        assert not artifact.exists()
-        return
     data = json.loads(artifact.read_text())
     assert data["chip_swimlane_level"] == level
     assert data["aicore_tasks"]
@@ -38,9 +35,6 @@ def _check_swimlane(folder, level):
 
 def _check_pmu(folder, level):
     artifact = folder / "pmu.csv"
-    if level == 0:
-        assert not artifact.exists()
-        return
     with artifact.open(newline="") as csv_file:
         reader = csv.DictReader(csv_file)
         rows = list(reader)
@@ -74,7 +68,7 @@ def _run(arch, runtime, device, borrowed, root, diagnostic):
             lib.rtSetDevice.argtypes = [ctypes.c_int]
             assert lib.rtSetDevice(device) == 0
             contexts = _CallerContexts(lib, device)
-        worker = Worker(level=2, device_id=device, platform=arch, runtime=runtime)
+        worker = Worker(level=2, device_id=device, platform=arch, runtime=runtime, output_root=root)
         handle = worker.register(_callable(arch, runtime))
         worker.init(borrowed_context_generation=77 if borrowed else None)
         assert lib.aclrtCreateStream(ctypes.byref(stream)) == 0
@@ -90,24 +84,25 @@ def _run(arch, runtime, device, borrowed, root, diagnostic):
                 TensorArgType.INPUT if i < 2 else TensorArgType.OUTPUT_EXISTING,
             )
         levels = (2, 4, 0, 1, 2) if diagnostic == "pmu" else (4, 1, 0, 3, 2)
-        for invocation, level in enumerate(levels):
-            folder = root / str(invocation)
-            folder.mkdir()
+        check_artifact = _check_pmu if diagnostic == "pmu" else _check_swimlane
+        for level in levels:
             config = CallConfig()
             if diagnostic == "pmu":
                 config.enable_pmu = level
             else:
                 config.enable_chip_swimlane = level
-            config.output_prefix = str(folder)
             worker.submit(handle, args, config, caller_stream=stream.value).wait()
+            capture = worker.capture_output_prefix
             result = array.array("f", [0.0]) * count
             worker.copy_from(result, buffers[2])
             expected = 47.0 if runtime == "tensormap_and_ringbuffer" else 42.0
             assert all(value == expected for value in result), (level, result[:8])
-            if diagnostic == "pmu":
-                _check_pmu(folder, level)
-            else:
-                _check_swimlane(folder, level)
+            if level == 0:
+                assert capture is None
+                continue
+            assert capture is not None
+            folder = Path(capture)
+            check_artifact(folder, level)
     finally:
         # The caller stream may still hold a wait after the kernel boundaries.
         if stream.value:

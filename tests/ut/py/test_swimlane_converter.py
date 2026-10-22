@@ -9,6 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import json
+import os
 import re
 from pathlib import Path
 
@@ -2659,6 +2660,25 @@ def test_a_retained_capture_is_found_by_the_identity_it_publishes(tmp_path):
     # artifact, and are reachable because the identity was verified first.
     assert sc._companion_directory(artifact) == capture
     assert sc._capture_directory_of(artifact) == capture
+
+
+def test_retained_capture_discovers_persistent_host_log_from_its_sidecar(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    capture = _write_l3_rank(root, 0, host_shift_ns=0, task_id=7)
+    _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=0, group_size=1)
+    artifact = _retain_capture(capture, epoch=4)
+    logs = tmp_path / "host_logs" / "session"
+    logs.mkdir(parents=True)
+    host_log = logs / "host.1000.log"
+    (root / host_log.name).replace(host_log)
+    sidecar_path = capture / "dispatch_identity.json"
+    identity = json.loads(sidecar_path.read_text())
+    identity["host_log_directory"] = os.path.relpath(logs, capture)
+    sidecar_path.write_text(json.dumps(identity))
+
+    rank_inputs, _ = sc._discover_l3_rank_inputs(root, "d0:retained")
+    assert rank_inputs == [(0, artifact)]
+    assert sc._discover_host_logs(root, [], rank_inputs) == [host_log]
 
 
 def test_a_retained_capture_whose_identity_disagrees_is_not_paired(tmp_path):

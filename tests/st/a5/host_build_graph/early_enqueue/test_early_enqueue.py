@@ -789,7 +789,7 @@ class _A5EarlyEnqueueBase(SceneTestCase):
         # instead of leaving it on the inherited stderr, which is what gives the joined-launch
         # spans a destination this process can read by child pid. No diagnostic flag is set, so
         # nothing else is written there.
-        config = self._build_config(self.CASES[0]["config"], output_prefix=output_prefix)
+        config = self._build_config(self.CASES[0]["config"])
 
         def graph(orch, _args, _cfg):
             chip_args = _chip_args(arg_buffers, vector_signature, spin_iters)
@@ -1630,7 +1630,7 @@ class TestA5ThreeRunCapacity(_A5EarlyEnqueueBase):
                             orch.submit_next_level(
                                 type(self)._st_chip_handles["vector"],
                                 chip_args,
-                                self._build_config(self.CASES[0]["config"], output_prefix=output_prefix),
+                                self._build_config(self.CASES[0]["config"]),
                                 worker=0,
                             )
 

@@ -33,10 +33,9 @@ TORCH_DEVICE_BACKEND_AUTOLOAD=0 SIMPLER_SKIP_DEVICE_RUN=1"          # + mode del
 CASE="examples/.../<entry>.py -p a2a3"                # exactly as the case table gives it
 TAIL="--rounds 6 --log-level timing"                                 # per mode
 
-.claude/skills/onboard-arch-precheck/check.sh a2a3 || exit 1
 echo "[stamp] $HEAD_SHA env $ENVS python $CASE $TAIL" >"$LOG"
 task-submit --device auto --device-num "$DEVICES" --timeout "$TIMEOUT" --max-time "$TIMEOUT" \
-  --run "env $ENVS python $CASE $TAIL -d \$TASK_DEVICE" >>"$LOG" 2>&1
+  --run ".claude/skills/onboard-arch-precheck/check.sh a2a3 && env $ENVS python $CASE $TAIL -d \$TASK_DEVICE" >>"$LOG" 2>&1
 grep -c 'name=chip.run.bind\.' "$LOG"   # numbers mode: must be > 0
 ```
 
@@ -62,11 +61,12 @@ omits the flag leaves it implicit in whatever that commit's default happens to
 be. Two arms of a cross-commit A/B can then run at different levels with neither
 stamp showing it.
 
-**In timeline mode that last check reports 0 on a run that worked.** A diagnostic
-flag makes `CallConfig.output_prefix` non-empty, and a non-empty prefix moves
-every host-log record — every `[STRACE]` span included — out of
-`$LOG` into `outputs/<case>_<ts>/host.<pid>.log`, one file per process. Grep those
-instead, and feed the finisher both (see the timeline command below).
+**In timeline mode that last check reports 0 on a run that worked.** The
+driver's `Worker(output_root=outputs)` binds the Host logger during initialization
+to `outputs/host_logs/<session-id>/`, one `host.<pid>.log` per process. The
+diagnostic flag makes Simpler allocate a separate capture directory and fill the
+internal `CallConfig.output_prefix`. Grep the persistent session logs for bind
+spans and pass that directory to the timeline tool (see below).
 
 ## The two cases
 
@@ -80,11 +80,11 @@ instead, and feed the finisher both (see the timeline command below).
 | `TIMEOUT` | 3600 (cold compile is minutes) | 2400 |
 | emits `torch_backend_autoload` | **no** — the parser says so above the table, and a dsv4 A/B has no in-log witness for the autoload state | yes |
 
-Neither case needs a `--level`: each driver runs its `Worker` in this process,
-so its chip children write straight to the log the `task-submit --run` command
-is redirected into. (Under the scene-test module runner they did not: it
-captured the child's stdout and the log ended up with zero segment spans
-while the run still passed.)
+Neither case needs a `--level`: each driver runs its `Worker` in this process.
+In numbers mode, the chip children write into the log redirected by
+`task-submit --run`. In timeline mode, read the persistent Host-log session.
+Under the scene-test module runner, the redirected log can have zero segment
+spans while the run still passes.
 
 ## The two modes
 
@@ -97,32 +97,31 @@ while the run still passed.)
 
 `--rounds > 1` force-disables every diagnostic (it warns per flag), so one run
 gives statistics or a timeline, never both. The diagnostic flag in timeline mode
-is there to make `CallConfig.output_prefix` non-empty, which is what gives the
-per-event artifact a directory; `--enable-chip-swimlane` raises
+reserves a capture directory for the per-event artifact; `--enable-chip-swimlane` raises
 `NotImplementedError` at level 3.
 
 ```bash
 # numbers — the segment spans are in $LOG, since no diagnostic flag is on
 python -m simpler_setup.tools.hbg.bind_phases "$LOG"
 
-# timeline — only an artifact newer than this run's own marker counts
-RECORDS=$(find outputs -name host_phase_records.jsonl -newer "$MARK")
-echo "$RECORDS"          # must name exactly one file; empty ⇒ this run wrote none,
-                         # so stop rather than reading a previous run's artifact
-D=$(dirname "$RECORDS")
-grep -c 'name=chip.run.bind\.' "$D"/host.*.log   # must be > 0; $LOG has none in this mode
-# The spans are split — the invoking process wrote its own to $LOG, each chip
-# child wrote its own under $D — so parse the concatenation, not either half.
-cat "$LOG" "$D"/host.*.log > "$D/bind_timeline.log"
-python -m simpler_setup.tools.strace_timing "$D/bind_timeline.log" \
-  --host-phase-records "$RECORDS" \
-  --swimlane "$D/host_swimlane.json"                          # load in ui.perfetto.dev
+# timeline — only this run's capture and Host-log session count
+D=$(find outputs/captures -mindepth 2 -maxdepth 2 -type d -newer "$MARK")
+H=$(find outputs/host_logs -mindepth 1 -maxdepth 1 -type d -newer "$MARK")
+echo "$D" "$H"       # each must name exactly one directory from this run
+test -d "$D" && test -d "$H" || { echo "ambiguous or missing capture/log session"; exit 1; }
+mapfile -t RECORDS < <(find "$D" -name host_phase_records.jsonl -newer "$MARK")
+test "${#RECORDS[@]}" -gt 0 || { echo "no Host phase records"; exit 1; }
+grep -h 'name=chip.run.bind\.' "$H"/host.*.log | wc -l  # must be > 0
+RECORD_ARGS=()
+for record in "${RECORDS[@]}"; do RECORD_ARGS+=(--host-phase-records "$record"); done
+python -m simpler_setup.tools.strace_timing "$H" "${RECORD_ARGS[@]}" \
+  --swimlane "$D/host_swimlane.json"             # load in ui.perfetto.dev
 ```
 
 ## Before reporting a number
 
-- `grep -c 'name=chip.run.bind\.'` was `> 0` — in `$LOG` for numbers mode, in
-  `$D/host.*.log` for timeline mode — and the table shows a `[stamp]` line.
+- The bind-span count was `> 0` — in `$LOG` for numbers mode, in
+  `$H/host.*.log` for timeline mode — and the table shows a `[stamp]` line.
 - Quote the stamp with the number. A number without the command and commit that
   produced it cannot be compared to anything.
 - Before an A/B, check the recording sites at both commits as required by

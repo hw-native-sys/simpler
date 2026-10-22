@@ -26,15 +26,27 @@ initialization-time policy described in [logging.md](../logging.md).
 
 ## Where the records go
 
-The host logger writes to stderr until an output run enables file logging.
-Worker then binds the whole process tree to one stable transient directory,
-`${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/`, and each process writes
-`host.<pid>.log` there. Every later capture in that Worker session reuses the
-same spool, so deleting an earlier `CallConfig.output_prefix` cannot break the
-writer. The root process removes the spool at normal interpreter exit. Until it
-is bound, records stay on the console. An embedding that needs a persistent
-complete trace may explicitly call `_set_host_log_directory(path)` before the
-first output run; the automatic binder preserves an existing destination.
+The host logger writes to stderr until a file destination is bound.
+`Worker(output_root=path)` binds at `init()` to
+`<path>/host_logs/<session-id>/`, with one `host.<pid>.log` per process. The
+files survive exit. The root belongs to the process: later Workers in the
+same process must use the same root. Without a root, records stay on stderr
+until a legacy internal diagnostic binds the transient
+`${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/` spool, removed at
+normal interpreter exit. Public diagnostic calls require `output_root`.
+
+Simpler creates one directory per direct diagnostic submission under
+`<path>/captures/<worker-id>/`. SceneTest reserves one `<case>_<id>/`
+directory directly under the root, so its L2 or L3 submissions for that case
+share a capture directory.
+L3 chip captures remain separate under `rankN/dN/`. The caller does not set
+`CallConfig.output_prefix`; it is an internal field carried through the
+hierarchy. `Worker.capture_output_prefix` reports the current thread's capture
+directory from its latest submission attempt that reached diagnostic
+configuration. It may remain set after a failed submission; a later
+non-diagnostic submission clears it. Each L3 chip capture's
+`dispatch_identity.json` contains a relative `host_log_directory` reference
+for offline conversion.
 
 After successful execution and validation of an HBG level-3/4 capture with Host
 recording armed and finished and an output prefix, native finalize
@@ -45,9 +57,9 @@ independent `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` switch and an output prefi
 This works for direct L2 and forked ChipWorker runs without SceneTest. The file
 contains only the current invocation's original alignment spans and is not the
 cumulative logger destination. It requires TIMING-or-finer logging. While the
-process is alive, use the session spool's `host.<pid>.log` files for ordinary
-messages or the complete Host call tree; prebind an explicit directory when that
-complete trace must survive process exit. The AICPU-launch marker is a TIMING Host-clock point sampled immediately
+process is alive, use the output root's `host_logs/<session-id>/host.<pid>.log`
+files for ordinary messages or the complete Host call tree. The AICPU-launch
+marker is a TIMING Host-clock point sampled immediately
 before the launch API call (`dur=0`, `depth=2`), not a Device-start or
 launch-completion timestamp.
 

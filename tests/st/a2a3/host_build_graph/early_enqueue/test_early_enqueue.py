@@ -951,7 +951,6 @@ class _EarlyEnqueueBase(SceneTestCase):
         config = self._build_config(
             self.CASES[0]["config"],
             enable_chip_swimlane=type(self)._SWIMLANE_LEVEL,
-            output_prefix=output_prefix,
         )
 
         def graph(orch, _args, _cfg):
@@ -1277,7 +1276,7 @@ class TestEarlyEnqueueDepthTwoSwimlane(_EarlyEnqueueBase):
         trace = _RunTrace(st_worker)
         with _frames(st_worker) as floor_entries:
             case_runs = _CaseRuns(floor_entries)
-        with tempfile.TemporaryDirectory(prefix="simpler-early-enqueue-swimlane-") as output_prefix:
+        with st_worker._diagnostic_case_output("early_enqueue_swimlane") as output_prefix:
             assert self._run_two_and_observe(st_worker, output_prefix, case_runs), (
                 "two different runs collecting at level 2 were never observed launched at once"
             )
@@ -1676,7 +1675,10 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
         trace = _RunTrace(st_worker)
         with _frames(st_worker, _THREE_FRAMES) as floor_entries:
             case_runs = _CaseRuns(floor_entries)
-        with _OutputPrefix("simpler-three-run-", "three-run window") as prefix:
+        with (
+            _OutputPrefix("simpler-three-run-", "three-run window") as prefix,
+            st_worker._diagnostic_case_output("three_run_window") as capture_prefix,
+        ):
             output_prefix = prefix.path
             # Held by this scope, not by the helper: a submission that fails after making one or
             # two of the runs still leaves them drainable here, with their arguments alive.
@@ -1742,7 +1744,7 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
             # something it inherits without executing. What only a collecting run can add is what
             # follows: three overlapping collections each published their own file.
             if level:
-                artifacts, found_paths = _published_artifacts(output_prefix)
+                artifacts, found_paths = _published_artifacts(capture_prefix)
                 assert len(artifacts) >= _THREE_FRAMES, (
                     f"expected one swimlane artifact per collecting run, found {len(artifacts)}; "
                     f"the prefix held {found_paths}"
@@ -1815,7 +1817,10 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
             handles: list = []
             buffers: list = []
             try:
-                with _OutputPrefix("simpler-three-run-refill-", "sixteen-run refill") as prefix:
+                with (
+                    _OutputPrefix("simpler-three-run-refill-", "sixteen-run refill") as prefix,
+                    st_worker._diagnostic_case_output("sixteen_run_refill") as capture_prefix,
+                ):
                     output_prefix = prefix.path
                     expectations = []
                     try:
@@ -1845,7 +1850,7 @@ class TestThreeRunCapacity(_EarlyEnqueueBase):
                     for out, expected in expectations:
                         torch.testing.assert_close(out, expected)
                     if level:
-                        artifacts, found_paths = _published_artifacts(output_prefix)
+                        artifacts, found_paths = _published_artifacts(capture_prefix)
                         assert len(artifacts) >= _REFILL_RUNS, (
                             f"expected one swimlane artifact per collecting run, found {len(artifacts)} for "
                             f"{_REFILL_RUNS} runs; the prefix held {found_paths}"

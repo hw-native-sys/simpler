@@ -20,7 +20,7 @@ import pytest
 
 
 @pytest.fixture
-def drain_host_log(tmp_path_factory):
+def drain_host_log():
     """Read new host-log output from the process's active sink.
 
     A `[STRACE]` record reaches stderr or ``host.<pid>.log`` through the process
@@ -28,9 +28,8 @@ def drain_host_log(tmp_path_factory):
     misses records after a run binds the logger to its output directory. Track
     the file cursor as well as captured output so repeated drains consume each
     record exactly once regardless of which sink is active. Bind an unbound
-    logger to a pytest session directory so the fixture has a stable file sink,
-    matching the process-session lifetime used by production output runs. It
-    also survives per-test cleanup when tmp_path_retention_policy is failed.
+    logger beneath the configured output root, matching the process-session
+    lifetime used by production output runs.
 
     The wait is bounded but it is not the verdict. Producers are quiescent by the
     time a test reads — the run has completed — so `pending_record_count`
@@ -42,16 +41,20 @@ def drain_host_log(tmp_path_factory):
     from _task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
         _host_log_directory,
         _monotonic_now_ns,
-        _set_host_log_directory,
     )
     from simpler.task_interface import (  # noqa: PLC0415
+        _bind_host_log_session_directory,
+        _configure_host_log_output_root,
         _flush_host_log,
         _host_log_dropped_records,
         _host_log_pending_records,
     )
 
+    from simpler_setup.scene_test import _outputs_dir  # noqa: PLC0415
+
     if not _host_log_directory():
-        _set_host_log_directory(str(tmp_path_factory.mktemp("host-logs")))
+        _configure_host_log_output_root(_outputs_dir())
+        _bind_host_log_session_directory()
     file_directory = _host_log_directory()
     fixture_start_ns = _monotonic_now_ns()
     file_offset = 0

@@ -14,11 +14,12 @@ Converts performance data JSON (.json) to Chrome Trace Event Format JSON
 for visualization in Perfetto (https://ui.perfetto.dev/).
 
 Usage:
-    python -m simpler_setup.tools.swimlane_converter  # latest chip_swimlane_records_*.json under ./outputs/
-    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json
-    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json -o out.json
-    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json -k kernel_config.py
-    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json -v
+    python -m simpler_setup.tools.swimlane_converter  # latest outputs/*/chip_swimlane_records.json
+    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<capture-id>/chip_swimlane_records.json
+    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<capture-id>/chip_swimlane_records.json -o out.json
+    python -m simpler_setup.tools.swimlane_converter \
+        outputs/<case>_<capture-id>/chip_swimlane_records.json -k kernel_config.py
+    python -m simpler_setup.tools.swimlane_converter outputs/<case>_<capture-id>/chip_swimlane_records.json -v
 
 SPMD (block_num>1): dependency flows use the earliest visible task slice
 per (func_id, task_id) independently in each view; see
@@ -460,6 +461,10 @@ def _prepare_capture_clock_alignment(path, host_logs=None):
             if host_logs is not None
             else (sorted(companions.glob("host_clock_alignment.*.log")) or sorted(companions.glob("host.*.log")))
         )
+        if not logs and host_logs is None:
+            directory = _referenced_host_log_directory(companions)
+            if directory is not None:
+                logs = sorted(directory.glob("host.*.log"))
         if not logs:
             raise ValueError("no Host log available")
         spans = []
@@ -3515,11 +3520,11 @@ def _build_parser():
         epilog="""
 Examples:
   %(prog)s                                            # Use latest .json in outputs/, output to outputs/
-  %(prog)s outputs/<case>_<ts>/chip_swimlane_records.json   # Output: outputs/merged_swimlane_20260210_143526.json
-  %(prog)s outputs/<case>_<ts>/chip_swimlane_records.json -o custom_output.json
-  %(prog)s outputs/<case>_<ts>/chip_swimlane_records.json \
+  %(prog)s outputs/<case>_<capture-id>/chip_swimlane_records.json
+  %(prog)s outputs/<case>_<capture-id>/chip_swimlane_records.json -o custom_output.json
+  %(prog)s outputs/<case>_<capture-id>/chip_swimlane_records.json \
       -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
-  %(prog)s outputs/<case>_<ts>/chip_swimlane_records.json -v
+  %(prog)s outputs/<case>_<capture-id>/chip_swimlane_records.json -v
   %(prog)s build_output/<case>/dfx_outputs --dispatch d0
         """,
     )
@@ -3527,8 +3532,9 @@ Examples:
         "input",
         nargs="?",
         help=(
-            "Input JSON file, or a dfx_outputs directory containing rank*/dN/. "
-            "If omitted, uses the latest chip_swimlane_records_*.json in outputs/."
+            "Input JSON file, or a dfx_outputs directory containing rank*/dN/ "
+            "(directory input also requires --dispatch or --dispatch-id). "
+            "If omitted, uses the latest outputs/*/chip_swimlane_records.json (L2 SceneTest captures)."
         ),
     )
     parser.add_argument(
@@ -3571,8 +3577,9 @@ Examples:
         "--host-log",
         action="append",
         help="Host [STRACE] log holding the chip.run.runner_run windows the captures are placed in "
-        "(repeatable). Single-file input prefers sibling host_clock_alignment.*.log over host.*.log. "
-        "Directory input reads both at the root and rank*/d*/host_clock_alignment.*.log. "
+        "(repeatable). Single-file input prefers sibling host_clock_alignment.*.log over host.*.log, "
+        "then the directory referenced by dispatch_identity.json. Directory input reads root and "
+        "rank*/d*/host_clock_alignment.*.log plus referenced session logs. "
         "A single capture with no matching logs remains unaligned; valid saved alignment needs no logs.",
     )
     parser.add_argument(
@@ -3623,7 +3630,7 @@ def _resolve_output_path(args, input_path):
         return input_path / "l3_swimlane.json"
 
     # Default: write merged_swimlane.json next to the input. The parent
-    # directory name (e.g. outputs/<case>_<ts>/) already disambiguates runs.
+    # directory name (e.g. outputs/<case>_<capture-id>/) already disambiguates runs.
     return input_path.parent / "merged_swimlane.json"
 
 
@@ -4002,6 +4009,26 @@ def _load_dispatch_identity(capture_dir):
     return identity
 
 
+def _referenced_host_log_directory(capture_dir, sidecar=None, *, missing_ok=False):
+    """Resolve the durable log directory named by a capture's identity."""
+    sidecar_path = Path(capture_dir) / "dispatch_identity.json"
+    if sidecar is None:
+        if not sidecar_path.is_file():
+            return None
+        sidecar = json.loads(sidecar_path.read_text())
+    reference = sidecar.get("host_log_directory") if isinstance(sidecar, dict) else None
+    if reference is None:
+        return None
+    if not isinstance(reference, str) or not reference:
+        raise ValueError(f"invalid host_log_directory in {sidecar_path}")
+    directory = (Path(capture_dir) / reference).resolve()
+    if not directory.is_dir():
+        if missing_ok:
+            return None
+        raise ValueError(f"Host log directory referenced by {sidecar_path} is missing: {directory}")
+    return directory
+
+
 def _validate_parent_dispatch_group(discovered, expected_key):
     if not discovered:
         raise ValueError(f"no Rank captures found for parent dispatch {expected_key[0]}:{expected_key[1]}")
@@ -4375,10 +4402,11 @@ def _rank_clock_domain(rank, records_path, raw):
     return str(clock_domain)
 
 
-def _discover_host_logs(root, explicit):
+def _discover_host_logs(root, explicit, rank_inputs=()):
     """The `[STRACE]` logs that hold the outer windows for these captures.
 
-    Persistent ``host.<pid>.log`` files live at the case/level output root;
+    Persistent ``host.<pid>.log`` files can be referenced by each capture's
+    ``dispatch_identity.json`` through ``host_log_directory``;
     ``host_clock_alignment.<pid>.log`` holds capture-local timing spans.
     See ``docs/dfx/host-trace.md``.
     """
@@ -4388,11 +4416,19 @@ def _discover_host_logs(root, explicit):
         if missing:
             raise ValueError(f"--host-log names a file that does not exist: {', '.join(missing)}")
         return paths
+    directories = set()
+    for _, records_path in rank_inputs:
+        capture_dir = _companion_directory(records_path)
+        sidecar = _load_dispatch_identity(capture_dir)
+        directory = _referenced_host_log_directory(capture_dir, sidecar, missing_ok=True)
+        if directory is not None:
+            directories.add(directory)
     paths = sorted(
         {
             *Path(root).glob("host_clock_alignment.*.log"),
             *Path(root).glob("host.*.log"),
             *Path(root).glob("rank*/d*/host_clock_alignment.*.log"),
+            *(path for directory in directories for path in directory.glob("host.*.log")),
         }
     )
     if not paths:
@@ -4813,7 +4849,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             "cross-host splice is not implemented."
         )
 
-    host_logs = _discover_host_logs(root, args.host_log)
+    host_logs = _discover_host_logs(root, args.host_log, rank_inputs)
     placements, host_pairing, host_spans = _place_rank_captures(
         host_logs, raw_inputs, rank_identities, rank_host_pids, _parse_rank_pid_pins(args.rank_pid)
     )

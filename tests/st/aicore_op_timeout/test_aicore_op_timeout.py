@@ -28,6 +28,7 @@ from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.log_config import configure_logging
 from simpler_setup.pto_isa import ensure_pto_isa_root
+from simpler_setup.scene_test import _outputs_dir
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = "tensormap_and_ringbuffer"
@@ -56,7 +57,7 @@ def _build_chip_callable(platform: str) -> ChipCallable:
     )
 
 
-def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, *, enable_sdma: bool):
+def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, *, enable_sdma: bool):
     configure_logging("error")
     monkeypatch.setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", "2000")
     monkeypatch.setenv("SIMPLER_OP_EXECUTE_TIMEOUT_US", "3000000")
@@ -65,6 +66,7 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
     chip_callable = _build_chip_callable(st_platform)
     worker = Worker(
         level=2,
+        output_root=_outputs_dir(),
         platform=st_platform,
         runtime=RUNTIME,
         device_id=int(st_device_ids[0]),
@@ -82,7 +84,6 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
         # Fatal cleanup must stop the host threads and forget those mappings
         # without unregistering/freeing buffers on the poisoned card.
         config.enable_chip_swimlane = 1
-        config.output_prefix = str(tmp_path)
 
         t0 = time.monotonic()
         # Acceptable error codes for the STARS-killed AICore op. Device status
@@ -144,8 +145,8 @@ def _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, 
 # 10 s run budget, so the assertions report first; this mark is only the
 # backstop for a genuine hang.
 @pytest.mark.timeout(180)
-def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids, monkeypatch, tmp_path):
-    _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, enable_sdma=False)
+def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids, monkeypatch):
+    _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, enable_sdma=False)
 
 
 @pytest.mark.sdma
@@ -154,6 +155,6 @@ def test_aicore_op_timeout_surfaces_as_runtime_error(st_platform, st_device_ids,
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(90)
-def test_sdma_worker_aicore_fault_teardown_is_bounded(st_platform, st_device_ids, monkeypatch, tmp_path):
+def test_sdma_worker_aicore_fault_teardown_is_bounded(st_platform, st_device_ids, monkeypatch):
     """Real SDMA provisioning must not turn one AICore fault into a five-minute close."""
-    _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, tmp_path, enable_sdma=True)
+    _exercise_aicore_timeout(st_platform, st_device_ids, monkeypatch, enable_sdma=True)

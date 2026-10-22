@@ -78,16 +78,17 @@ rounds stay uninstrumented.
 
 ### 3.2 Output
 
-The PMU artifact is a CSV file under the per-task output prefix
-(`CallConfig::output_prefix`, set by `scene_test.py::_build_output_prefix`
-to `outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/` for SceneTest runs):
+The PMU artifact is a CSV file under the capture directory. For SceneTest,
+Simpler reserves `outputs/<ClassName>_<case>_<capture-id>/` beneath
+`Worker(output_root=...)` and passes it as the internal
+`CallConfig::output_prefix`:
 
 ```text
 <output_prefix>/pmu.csv
 ```
 
 The filename is fixed (no per-file timestamp) — the directory is the
-per-task uniqueness boundary.
+capture uniqueness boundary.
 
 Common columns (in order, identical across architectures):
 

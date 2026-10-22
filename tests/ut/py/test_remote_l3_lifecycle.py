@@ -38,6 +38,18 @@ def _manifest(**extra):
     return manifest
 
 
+def test_remote_session_rejects_unshared_output_root_before_init(tmp_path):
+    ready = []
+    manifest = _manifest(
+        output_root=str(tmp_path / "output"),
+        output_root_probe=str(tmp_path / "output" / "host_logs" / "parent-session"),
+    )
+    assert remote_l3_session.run_session(manifest, None, ready_writer=ready.append) == 1
+    assert len(ready) == 1
+    assert "remote output_root is not shared" in ready[0]["error"]
+    assert not (tmp_path / "output").exists()
+
+
 def test_read_runner_ready_times_out_without_payload():
     ready_r, ready_w = os.pipe()
     try:
@@ -286,7 +298,7 @@ def test_run_session_bounds_command_accept_by_startup_deadline_not_session_timeo
     assert command_sock.timeout == 5.0
 
 
-def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch):
+def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch, tmp_path):
     # A finite timeout on the command connection would self-destruct a healthy but
     # idle session (read_frame idle-waiting for the next command would raise). The
     # accept()'d socket inherits socket.getdefaulttimeout() (a user module could
@@ -349,9 +361,17 @@ def test_run_session_forces_command_conn_blocking_for_idle(monkeypatch):
     monkeypatch.setattr(remote_l3_session, "_health_loop", lambda *args: None)
     monkeypatch.setattr(remote_l3_session, "_run_command_loop", lambda *args, **kwargs: None)
 
+    parent_session = tmp_path / "output" / "host_logs" / "parent-session"
+    parent_session.mkdir(parents=True)
     try:
         rc = remote_l3_session.run_session(
-            _manifest(startup_deadline_monotonic=1005.0, session_timeout_s=0.05), ready_w
+            _manifest(
+                startup_deadline_monotonic=1005.0,
+                session_timeout_s=0.05,
+                output_root=str(tmp_path / "output"),
+                output_root_probe=str(parent_session),
+            ),
+            ready_w,
         )
         assert rc == 0
     finally:

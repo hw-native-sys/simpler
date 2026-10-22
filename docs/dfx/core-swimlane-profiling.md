@@ -345,7 +345,7 @@ python -m simpler_setup.tools.core_swimlane --test <file> --func-id 0,1,2 --plat
 
 # Subsequent: another task from the same case, reusing the manifest.
 python -m simpler_setup.tools.core_swimlane --test <file> --func-id 3,4 --platform a2a3sim \
-    --dump-json outputs/<ClassName>_<Case>_<ts>/args_dump/args_dump.json
+    --dump-json "outputs/<ClassName>_<Case>_<capture-id>/args_dump/args_dump.json"
 ```
 
 The manifest holds every task's args for the whole case. The default level-3

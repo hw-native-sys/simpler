@@ -30,6 +30,7 @@ Two host behaviours are exercised, because they genuinely differ:
 
 import os
 import time
+from pathlib import Path
 
 import pytest
 from simpler.task_interface import (
@@ -39,6 +40,7 @@ from simpler.task_interface import (
     CoreCallable,
     _flush_host_log,
     _host_log_dropped_records,
+    _persistent_host_log_directory,
 )
 from simpler.worker import Worker
 
@@ -46,6 +48,7 @@ from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.log_config import configure_logging
 from simpler_setup.pto_isa import ensure_pto_isa_root
+from simpler_setup.scene_test import _outputs_dir
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = "tensormap_and_ringbuffer"
@@ -53,15 +56,27 @@ KERNELS = os.path.join(HERE, "kernels")
 ORCH_DIR = os.path.join(KERNELS, "orchestration")
 
 
-def _wait_for_host_log(capfd, markers: tuple[str, ...], dropped_before: int, timeout_s: float = 5.0) -> str:
+def _host_log_offsets() -> dict[Path, int]:
+    directory = _persistent_host_log_directory()
+    assert directory is not None
+    return {path: path.stat().st_size for path in Path(directory).glob("host.*.log")}
+
+
+def _wait_for_host_log(
+    offsets: dict[Path, int], markers: tuple[str, ...], dropped_before: int, timeout_s: float = 5.0
+) -> str:
     """Poll for required records and report queue loss instead of trusting one flush deadline."""
-    chunks: list[str] = []
     deadline = time.monotonic() + timeout_s
     last_flush = False
     while True:
         last_flush = _flush_host_log(100)
-        captured = capfd.readouterr()
-        chunks.extend((captured.err, captured.out))
+        directory = _persistent_host_log_directory()
+        assert directory is not None
+        chunks = []
+        for path in Path(directory).glob("host.*.log"):
+            with path.open("rb") as stream:
+                stream.seek(offsets.get(path, 0))
+                chunks.append(stream.read().decode("utf-8", errors="replace"))
         log = "".join(chunks)
         if all(marker in log for marker in markers):
             dropped_after = _host_log_dropped_records()
@@ -320,7 +335,7 @@ def _make_worker(platform: str, device_id: int, case_name: str, monkeypatch):
     for key, value in case.get("env", {}).items():
         monkeypatch.setenv(key, str(value))
     chip_callable = _build_chip_callable(platform, case)
-    worker = Worker(level=2, platform=platform, runtime=RUNTIME, device_id=device_id)
+    worker = Worker(level=2, platform=platform, runtime=RUNTIME, device_id=device_id, output_root=_outputs_dir())
     handle = worker.register(chip_callable)
     worker.init()
     config = CallConfig()
@@ -334,7 +349,7 @@ def _make_worker(platform: str, device_id: int, case_name: str, monkeypatch):
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.parametrize("case_name", _SIM_CASE_PARAMS)
-def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monkeypatch, capfd):
+def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monkeypatch):
     """sim: the runtime status (``code -N``) reaches the host directly."""
     configure_logging("error")
     case = CASES[case_name]
@@ -343,10 +358,11 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
     dropped_before = _host_log_dropped_records()
     worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), case_name, monkeypatch)
     try:
+        offsets = _host_log_offsets()
         with pytest.raises(RuntimeError, match=rf"(run_runtime|run) failed with code -{case['code']}\b"):
             worker.run(handle, None, config)
         log = _wait_for_host_log(
-            capfd,
+            offsets,
             (case["marker"], "error detail:", case["explain"], "error hint:"),
             dropped_before,
         )
@@ -360,7 +376,7 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(90)  # hang cases hold a core ~15-20 s; bound a wedge
 @pytest.mark.parametrize("case_name", list(CASES))
-def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_name, monkeypatch, capfd):
+def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_name, monkeypatch):
     """onboard: the watchdog may mask the code as 507xxx, but the device class still reaches the host log."""
     # warning, not error: the run-result fallback asserted below is a LOG_WARN.
     configure_logging("warning")
@@ -368,13 +384,14 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
     dropped_before = _host_log_dropped_records()
     worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), case_name, monkeypatch)
     try:
+        offsets = _host_log_offsets()
         # On hardware the op-execute / stream-sync watchdog can surface a generic
         # CANN 507xxx instead of the runtime's own -N; we only require that the
         # run fails. The point of the test is the device-classified host LOG.
         with pytest.raises(RuntimeError):
             worker.run(handle, None, config)
         log = _wait_for_host_log(
-            capfd,
+            offsets,
             (case["marker"], "error detail:", case["explain"], "error hint:"),
             dropped_before,
         )
@@ -400,12 +417,10 @@ _DFX_ON_FAILURE_CASE = "scope_deadlock"
 @pytest.mark.platforms(["a5sim", "a2a3sim", "a2a3"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-def test_failed_run_exports_its_diagnostics(st_platform, st_device_ids, monkeypatch, tmp_path):
+def test_failed_run_exports_its_diagnostics(st_platform, st_device_ids, monkeypatch):
     """A run that fails still exports the collectors it armed."""
     configure_logging("error")
     worker, handle, config = _make_worker(st_platform, int(st_device_ids[0]), _DFX_ON_FAILURE_CASE, monkeypatch)
-    out = tmp_path / "fatal_dfx"
-    config.output_prefix = str(out)
     # chip_swimlane is enabled but not asserted: it exports nothing when a run
     # holds no task records, so its artifact cannot witness the teardown. It is
     # on so the failure path drives its export too.
@@ -416,8 +431,11 @@ def test_failed_run_exports_its_diagnostics(st_platform, st_device_ids, monkeypa
         with pytest.raises(RuntimeError):
             worker.run(handle, None, config)
     finally:
+        capture = worker.capture_output_prefix
         worker.close()
 
+    assert capture is not None
+    out = Path(capture)
     produced = sorted(str(p.relative_to(out)) for p in out.rglob("*")) if out.is_dir() else []
     # scope_stats writes whenever its collector initialized, so it carries no
     # record-count precondition, and it is written last in the teardown: its

@@ -156,30 +156,29 @@ pytest tests/st/... --platform a5onboard --enable-chip-swimlane
 # Manual (paths land alongside chip_swimlane_records.json inside the same
 # <output_prefix> directory)
 python -m simpler_setup.tools.swimlane_converter \
-    outputs/<case>_<ts>/chip_swimlane_records.json \
-    --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
+    outputs/<case>_<capture-id>/chip_swimlane_records.json \
+    --func-names outputs/<case>_<capture-id>/name_map_TestPA_basic.json
 
 python -m simpler_setup.tools.deps_viewer \
-    outputs/<case>_<ts>/deps.json \
-    --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
+    outputs/<case>_<capture-id>/deps.json \
+    --func-names outputs/<case>_<capture-id>/name_map_TestPA_basic.json
 
 python -m simpler_setup.tools.deps_viewer \
-    outputs/<case>_<ts>/deps.json \
+    outputs/<case>_<capture-id>/deps.json \
     --format html \
-    --func-names outputs/<case>_<ts>/name_map_TestPA_basic.json
+    --func-names outputs/<case>_<capture-id>/name_map_TestPA_basic.json
 ```
 
 ## File Layout
 
-Each test case writes its diagnostic artifacts under
-`CallConfig::output_prefix` (chosen by
-`scene_test.py::_build_output_prefix` as
-`outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/`). Filenames are fixed —
-the per-case directory is the uniqueness boundary, so parallel runs
-cannot collide.
+Each SceneTest case reserves a unique directory
+`outputs/<ClassName>_<case>_<capture-id>/` under its Worker's `output_root`.
+Simpler passes that directory as the internal `CallConfig::output_prefix`.
+Filenames are fixed; the generated directory is the uniqueness boundary for
+parallel cases.
 
 ```text
-outputs/TestPA_basic_20260416_151301/
+outputs/TestPA_basic_<capture-id>/
   chip_swimlane_records.json         # perf data (runtime)
   name_map_TestPA_basic.json   # name mapping (SceneTest)
   merged_swimlane.json         # Perfetto trace (converter)

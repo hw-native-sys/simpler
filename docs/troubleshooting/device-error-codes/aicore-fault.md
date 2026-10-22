@@ -14,7 +14,7 @@ VEC instruction error: the ub address out of bounds
 ```
 
 **Redirect the device log before the run that you expect to fail.** The harness
-does not do this for you: `outputs/<case>_<ts>/` is only created when a DFX flag
+does not do this for you: `outputs/<case>_<capture-id>/` is only created when a DFX flag
 is on, so a plain onboard run leaves its device log in the shared
 `~/ascend/log/debug/device-<id>/` among every other user's. A fault you cannot
 attribute to a file is a fault you cannot diagnose, and the evidence is gone

@@ -31,6 +31,7 @@ import time
 import traceback
 from dataclasses import dataclass
 from multiprocessing import shared_memory
+from pathlib import Path
 from typing import Any, Callable
 
 from .buffer import (
@@ -1223,7 +1224,8 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 )
                 try:
                     task.config.output_prefix = _level_capture_prefix(task.config.output_prefix, inner_worker)
-                    inner_worker.run(orch_fn, task_args, task.config)
+                    with inner_worker._inherited_capture_output(task.config.output_prefix):
+                        inner_worker.run(orch_fn, task_args, task.config)
                 finally:
                     for backing in inline_backings:
                         backing.close()
@@ -1255,6 +1257,7 @@ def run_session(
 ) -> int:
     inner_worker = Worker(
         level=3,
+        output_root=manifest.get("output_root"),
         platform=str(manifest["platform"]),
         runtime=str(manifest.get("runtime", "tensormap_and_ringbuffer")),
         device_ids=tuple(int(x) for x in manifest.get("device_ids", [])),
@@ -1282,6 +1285,12 @@ def run_session(
         # Validate the runtime command timeout wire value up front (rejects a
         # malformed session_timeout_s); the command lane itself idle-waits blocking.
         _session_timeout_s(manifest)
+        probe = manifest.get("output_root_probe")
+        if probe is not None and not Path(probe).is_dir():
+            raise RuntimeError(
+                f"remote output_root is not shared: cannot see parent Host log session {probe}; "
+                "mount the same writable output_root at the same absolute path on every host"
+            )
         # Establish this runner's single absolute deadline before any startup work
         # (registry install, inner init) so every stage draws from it. It is the
         # daemon's shared-clock deadline when supplied (so spawn/import time is

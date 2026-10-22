@@ -135,12 +135,15 @@ Any ordinary human-readable record whose formatted envelope and body exceed
 record to one atomic pipe write when several forked processes share captured
 stderr; callers that need a large payload must split it into separate records.
 
-One background writer drains the queue. A non-empty
-`CallConfig.output_prefix` lazily enables file logging, but the cumulative log
-is not stored in that capture: the process tree binds once to
-`${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/`, and each process appends
-to its own `host.<pid>.log`. The root process removes this transient spool at
-normal interpreter exit. Without an output prefix the writer uses stderr. The
+One background writer drains the queue. With `Worker(output_root=path)`,
+`Worker.init()` binds the process tree to `<path>/host_logs/<session-id>/`;
+each process writes its own `host.<pid>.log` there, and the files survive exit.
+The root must be set before the first file-sink binding and is fixed for the
+process lifetime. Public diagnostic submissions require `output_root`; Simpler
+generates the per-run path internally. Without a root, the writer uses stderr
+until a legacy internal capture binds the transient
+`${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/` spool, removed at normal
+interpreter exit. The
 bound directory is the destination, not a preference: a record it cannot take
 is counted as a drop rather than relocated, so a run's log is never split
 across two places.
@@ -261,13 +264,16 @@ since a run that dropped records produces numbers derived from an incomplete log
 Python seeds the extension-owned state before C++ loads consumers:
 
 ```python
+# Worker.init validates prewarm and startup parameters before binding.
+# With output_root, bind the durable session before device setup or forking.
+_configure_host_log_output_root(output_root)
+_bind_host_log_session_directory()
 _initialize_host_log(level, defer_writer=is_hierarchical)
 # Hierarchical workers perform all local forks here.
 _start_host_log_writer()
 self._impl.init(host_path, aicpu_path, aicore_path, dispatcher_path,
                 device_id, prewarm_config, enable_sdma, sim_context_path)
-# At the first submit carrying an output prefix:
-_bind_host_log_session_directory()
+# A legacy internal capture without output_root binds a transient spool at submit.
 ```
 
 `ChipWorker::init` then performs the module-specific work:

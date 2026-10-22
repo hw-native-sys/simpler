@@ -369,7 +369,9 @@ work answers in one run what a duration comparison cannot answer in ten.
 
 The summed `host-orch phase=` lines cannot be placed on a timeline inside
 `host_orch`: they are cost shares. The per-event view comes from the runtime's
-per-producer record pool, written to `outputs/<case>_<ts>/host_phase_records.jsonl` —
+per-producer record pool, written below
+`outputs/captures/<worker-id>/run-<capture-id>/` for these standalone drivers
+(under `rankN/dN/` for L3) —
 one record per orchestrator operation, each with its own interval.
 
 Three conditions must all hold, and the first two produce an empty result
@@ -377,9 +379,10 @@ silently:
 
 1. **`SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1`**, which is what arms the pool.
    `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE` does not: it gates the summed
-   the segment spans alone, so Recipe A's environment collects no records.
-2. **A diagnostic flag must be on**, because that is what makes
-   `CallConfig.output_prefix` non-empty. `--enable-scope-stats` is the cheapest
+   segment spans alone, so Recipe A's environment collects no records.
+2. **A diagnostic flag must be on**, so Simpler allocates a capture directory
+   under `Worker(output_root=...)` and fills the internal
+   `CallConfig.output_prefix`. `--enable-scope-stats` is the cheapest
    choice when only Host phase records are needed. `--enable-chip-swimlane` is
    also supported for same-host L3 and writes each ChipWorker capture below a
    separate `rankN/dN` directory, but it collects substantially more data.
@@ -395,40 +398,35 @@ execution does not complete still yield its prepare timing — and it is why a
 swimlane for a case that hangs on device is cheaper to take with the variable set
 than to take by waiting out the stall.
 
-**The flag that satisfies condition 2 also moves the log.** A non-empty
-`CallConfig.output_prefix` enables one transient Host-log spool for the whole
-process tree under `${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/`; it does not bind the
-logger to that capture. Segment and `[STRACE]` spans leave stderr together, so
-Recipe A's `grep -c 'name=chip.run.bind\.' "$LOG"` still reports **0** for a
-Recipe B run that worked perfectly. SceneTest consumes the spool before process
-exit. A manual workflow that parses after exit must prebind a persistent directory
-before the first output run; the automatic session binder preserves it:
+**The Worker root determines where the log goes.** `Worker(output_root=path)`
+binds the process tree to `<path>/host_logs/<session-id>/` during initialization.
+Diagnostic flags allocate capture directories under the same root; they do not
+move the logger. Segment and `[STRACE]` spans from all processes appear in
+`host.<pid>.log` files there, which survive exit. Recipe A's
+`grep -c 'name=chip.run.bind\.' "$LOG"` therefore reports **0** for a Recipe B
+run that worked perfectly. Use the session directory created by that run;
+manually binding a different directory with `_set_host_log_directory` before
+Worker initialization conflicts with `output_root`.
 
-```python
-import os
-from pathlib import Path
-from _task_interface import _set_host_log_directory
-
-log_dir = Path(os.environ["SIMPLER_FULL_HOST_LOG_DIR"])
-log_dir.mkdir(parents=True, exist_ok=True)
-_set_host_log_directory(str(log_dir))
-```
-
-The skill's timeline mode uses that prebound directory and finishes with
+The timeline mode finishes with
 
 ```bash
-D=outputs/<case>_<ts>
-H="$D/full_host_logs"  # SIMPLER_FULL_HOST_LOG_DIR used by the runner above
-cat "$LOG" "$H"/host.*.log > "$D/bind_timeline.log"
-python -m simpler_setup.tools.strace_timing "$D/bind_timeline.log" \
-    --host-phase-records "$D/host_phase_records.jsonl" \
+D="outputs/captures/<worker-id>/run-<capture-id>"
+H="outputs/host_logs/<session-id>"  # select this run's session directory
+python -m simpler_setup.tools.strace_timing "$H" \
+    --host-phase-records "<path-to-host_phase_records.jsonl>" \
     --swimlane "$D/host_swimlane.json"
 ```
 
+For a two-rank run, repeat `--host-phase-records` for each
+`$D/rankN/dN/host_phase_records.jsonl`. The
+[`hbg-bind-phases` recipe](../../.claude/skills/hbg-bind-phases/SKILL.md)
+finds these paths for one run.
+
 Load the JSON in [Perfetto](https://ui.perfetto.dev) or `chrome://tracing`. Each
 rank is its own pid lane, and every record is drawn inside its
-`chip.run.bind`. The same command with the dsv4 log and its records file gives
-the two-rank version; `dropped` in the artifact's header says whether the pool
+`chip.run.bind`. Repeating `--host-phase-records` for both dsv4 ranks gives
+the two-rank version; `dropped` in each artifact's header says whether the pool
 truncated anything (it is 0 for both cases: 337 records for qwen, 1887 per rank
 for dsv4).
 
@@ -458,10 +456,10 @@ signal than any duration on a shared box.
 
 | Trap | Symptom | What to do |
 | ---- | ------- | ---------- |
-| Any diagnostic flag on (so, every Recipe B run) | `$LOG` has no `[STRACE]` markers at all, run passes | the output run moved the host log to the process-session spool; parse it before exit or prebind a persistent directory as shown above |
+| Any diagnostic flag on (so, every Recipe B run) | `$LOG` has no `[STRACE]` markers at all, run passes | read `outputs/host_logs/<session-id>/host.<pid>.log` after exit; the Worker binds this persistent session at initialization |
 | A `SceneTestCase` with `device_count > 1` run through the module runner | log has zero segment spans, test passes | give the child command `--runtime <rt> --level 3`; a standalone `main.py` case needs nothing |
 | `SIMPLER_SKIP_DEVICE_RUN=0` | run still skips the device, "PASSED" means nothing ran | `unset` the variable |
-| `--rounds 6` with `--enable-scope-stats` | no `outputs/<case>_<ts>/` artifacts, plus a `disabled: --rounds > 1` warning | one round for artifacts, many rounds for numbers |
+| `--rounds 6` with `--enable-scope-stats` | no `outputs/captures/<worker-id>/run-<capture-id>/` artifacts, plus a `disabled: --rounds > 1` warning | one round for artifacts, many rounds for numbers |
 | Only `SIMPLER_HBG_BIND_BREAKDOWN_ENABLE` set for Recipe B | segment spans present, no `host_phase_records.jsonl` | the records are a separate switch: also export `SIMPLER_HBG_HOST_PHASE_RECORDS_ENABLE=1` |
 | Comparing a log with no `[stamp]` first line | the parser says so above the table | re-run it through the recipe; conditions cannot be recovered from memory |
 | Treating the parser total as the complete control plane | work outside the three segments looks like a host-side win | check the source coverage in both arms; the subtotal now includes Definition packing but still excludes Graph task binding, compact execution-image preparation and A5 scheduler work |

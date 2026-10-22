@@ -1850,7 +1850,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
 
     level = cls._st_level
     runtime = cls._st_runtime
-    from simpler_setup.scene_test import _class_wants_sdma  # noqa: PLC0415
+    from simpler_setup.scene_test import _class_wants_sdma, _outputs_dir  # noqa: PLC0415
 
     wants_sdma = _class_wants_sdma(cls)
 
@@ -1908,7 +1908,14 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
 
         from simpler.worker import Worker  # noqa: PLC0415
 
-        w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime, enable_sdma=wants_sdma)
+        w = Worker(
+            level=2,
+            output_root=_outputs_dir(),
+            device_id=dev_id,
+            platform=st_platform,
+            runtime=runtime,
+            enable_sdma=wants_sdma,
+        )
         w._st_device_id = dev_id
         # First rebuild after a poison-and-heal lands here. On arches where the
         # device re-inits cleanly this just works; on a5 the op-timeout poison
@@ -1961,6 +1968,7 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
         # barrier. Default False leaves every existing case unchanged.
         w = Worker(
             level=3,
+            output_root=_outputs_dir(),
             device_ids=ids,
             num_sub_workers=max_subs,
             platform=st_platform,

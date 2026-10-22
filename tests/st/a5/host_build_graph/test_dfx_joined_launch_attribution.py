@@ -578,7 +578,7 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
 
     # -- configurations --------------------------------------------------
 
-    def _diagnostic_config(self, prefix: Path, *, shifted: bool):
+    def _diagnostic_config(self, *, shifted: bool):
         """Every owner this runtime has a device producer for, enabled at once.
 
         `shifted` moves exactly one setting without turning any owner off, which is what makes a
@@ -593,7 +593,6 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
             enable_pmu=_PMU_PIPE_UTILIZATION if "pmu" in owners else 0,
             enable_dep_gen="dep_gen" in owners,
             enable_scope_stats="scope_stats" in owners,
-            output_prefix=str(prefix),
         )
 
     def _checked_owners(self):
@@ -651,12 +650,13 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
                 tensors[0].fill_(value)
                 tensors[1].fill_(value + 1.0)
                 tensors[2].zero_()
-                prefix = root / f"run{index}"
                 # Only the second run's settings move, so the pair agrees or disagrees by exactly
                 # one word.
-                chip_config = self._diagnostic_config(prefix, shifted=disagree and index == 1)
+                chip_config = self._diagnostic_config(shifted=disagree and index == 1)
                 handles.append(self._submit(worker, buffers, chip_config, spin_iters))
-                views.append((tensors, prefix))
+                capture = worker.capture_output_prefix
+                assert capture is not None, "diagnostic submission has no capture directory"
+                views.append((tensors, Path(capture)))
         except BaseException:
             # Whatever was accepted still has to retire, and its views have to go before anything
             # can unlink the memory behind them. The drain's own failure must not replace the one
@@ -701,21 +701,23 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
                 tensors[0].fill_(value)
                 tensors[1].fill_(value + 1.0)
                 tensors[2].zero_()
-                prefix = root / f"run{index}"
-                prepared.append((buffers, tensors, prefix, self._diagnostic_config(prefix, shifted=False)))
+                prepared.append((buffers, tensors, self._diagnostic_config(shifted=False)))
 
-            for index, (buffers, _tensors, _prefix, config) in enumerate(prepared):
+            prefixes = []
+            for index, (buffers, _tensors, config) in enumerate(prepared):
                 if index >= 2:
                     # Retire only the older handle. Its successor remains offered to the device
                     # while this submission reuses capacity; publication proceeds independently.
                     handles[index - 2].wait()
                 handles.append(self._submit(worker, buffers, config, 0 if simulated else _SPIN_ITERS))
+                capture = worker.capture_output_prefix
+                assert capture is not None, "diagnostic submission has no capture directory"
+                prefixes.append(Path(capture))
             self._drain(handles)
-            for index, (_buffers, tensors, _prefix, _config) in enumerate(prepared):
+            for index, (_buffers, tensors, _config) in enumerate(prepared):
                 assert torch.allclose(tensors[2], _golden(tensors[0], tensors[1]), rtol=self.RTOL, atol=self.ATOL), (
                     f"{what}: run {index} did not produce its own golden result"
                 )
-            prefixes = [prefix for _buffers, _tensors, prefix, _config in prepared]
         except BaseException:
             # A later submit/wait failure must not abandon an already accepted successor or
             # replace the original failure with a subsequent cleanup error.
@@ -1129,8 +1131,6 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
 
     def _unsupported_owner_is_refused(self, worker, root: Path):
         """The refusal itself, with its failures carried by the caller above."""
-        refused = root / "refused"
-        refused.mkdir(parents=True, exist_ok=True)
         unsupported = list(type(self).UNSUPPORTED_OWNERS)
         assert unsupported, "this backend declares no unsupported owner, so there is nothing to refuse"
 
@@ -1141,9 +1141,11 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
             enable_chip_swimlane=_SWIMLANE_TASK_TIMING,
             enable_dump_args="dump_args" in unsupported,
             enable_pmu=_PMU_PIPE_UTILIZATION,
-            output_prefix=str(refused),
         )
         error = self._submit_expecting_failure(worker, config, "the unsupported-owner refusal")
+        capture = worker.capture_output_prefix
+        assert capture is not None, "refused diagnostic submission has no capture directory"
+        refused = Path(capture)
         assert _UNSUPPORTED_PREPARE_CODE in str(error), (
             f"the unsupported-owner refusal: requesting {unsupported} failed with {error!r}, which does not name "
             f"{_UNSUPPORTED_PREPARE_CODE}; a run that was admitted and then could not settle this owner's "
@@ -1159,15 +1161,15 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
             )
 
         # The lane after it. Same owners minus the unsupported one, and every artifact present.
-        served = root / "served"
-        served.mkdir(parents=True, exist_ok=True)
         supported = self._build_config(
             self.CASES[0]["config"],
             enable_chip_swimlane=_SWIMLANE_TASK_TIMING,
             enable_pmu=_PMU_PIPE_UTILIZATION,
-            output_prefix=str(served),
         )
         self._submit_expecting_success(worker, supported, "the run after the unsupported-owner refusal")
+        capture = worker.capture_output_prefix
+        assert capture is not None, "served diagnostic submission has no capture directory"
+        served = Path(capture)
         worker.flush_diagnostics()
         for owner in self._checked_owners():
             assert _find_artifacts(served, owner), (
@@ -1214,12 +1216,10 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         assert ok, f"{what}: did not produce its own result"
 
     def _assert_no_artifact_without_diagnostics(self, worker, root: Path):
-        """The control: a destination named, every owner off, and nothing written there.
+        """The control: every owner off, so no capture directory is allocated.
 
-        The prefix is set exactly as a collecting run sets it, so this says "a run with somewhere
-        to write wrote nothing" rather than "a run with nowhere to write wrote nothing" — which
-        would hold however much the collectors published. No spin: there is no window to observe
-        here, only an output tree to find empty.
+        No spin is needed here; the submission has completed and there is no
+        diagnostic writer to await before checking the absence of artifacts.
 
         The flush is what makes the emptiness a finding on this Worker. Retention is on for the
         class, so a returning `run()` no longer implies a file exists; without the barrier an
@@ -1233,8 +1233,9 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
     def _no_artifact_without_diagnostics(self, worker, root: Path):
         """The control itself, with its failures carried by the caller above."""
         root.mkdir(parents=True, exist_ok=True)
-        quiet = self._build_config(self.CASES[0]["config"], output_prefix=str(root))
+        quiet = self._build_config(self.CASES[0]["config"])
         self._submit_expecting_success(worker, quiet, "the no-diagnostics control")
+        assert worker.capture_output_prefix is None, "unarmed run allocated a capture directory"
         worker.flush_diagnostics()
         for owner in self._checked_owners():
             assert not _find_artifacts(root, owner), f"a run with no diagnostics enabled published a {owner} artifact"

@@ -40,11 +40,26 @@ into `**config` and validated later. The recognized keys:
 | `num_sub_workers` | L3+ | host-side Python callables to fork |
 | `enable_sdma` | a2a3 | provisions the SDMA workspace; defaults to `False` |
 | `workspace_budget_bytes` | onboard L2 | Optional positive byte limit on internal retained temporary storage and three pooled arenas; both owned and borrowed contexts manage these regions by default |
+| `output_root` | all | Optional process-wide directory for diagnostic captures and persistent Host logs; required before a public diagnostic submission |
 | `heap_ring_size` | all | heap ring sizing |
 | `remote_heap_ring_size`, `remote_session_timeout_s` | L4 | remote-session sizing and timeout |
 
 `level` selects the topology: `2` is one chip, `>= 3` is hierarchical. Anything
 else raises. Remote-worker and remote-memory calls require `level >= 4`.
+
+With `Worker(output_root=path)`, the first initialized Worker binds Host logs
+under `<path>/host_logs/<session-id>/`; later Workers in the same process must
+use the same root. Each direct diagnostic submission gets a unique directory
+under `<path>/captures/<worker-id>/`. SceneTest reserves one generated
+`<case>_<capture-id>/` directory directly under the root for each case and
+shares it across that case's submissions. Local child Workers inherit the root.
+The caller does not choose `CallConfig.output_prefix`.
+For remote L3 and MPI workers, the same absolute `output_root` is passed to each
+host. Use a writable shared mount at that path on every host so the capture
+tree and Host logs remain together. A path that exists only on the L4 host
+cannot serve as the output root for remote diagnostics.
+Remote startup checks that it can see the parent's Host log session before
+initializing its own Worker.
 
 ### Lifecycle
 
@@ -113,10 +128,18 @@ cannot walk a legal-looking length past the end.
 | ------ | ----- |
 | `run(callable, args=None, config=None, *, caller_stream=None) -> None` | Blocks until the run completes |
 | `submit(callable, args=None, config=None, *, caller_stream=None) -> RunHandle` | Non-blocking |
+| `capture_output_prefix -> str \| None` | Current thread's capture directory for the most recent submission attempt that reached diagnostic configuration; see below |
 | `live_domains() -> dict[str, CommDomainHandle]` | Currently allocated communication domains |
 
 `RunHandle` exposes the `done` property, `wait(timeout=None)`, and
 `result(timeout=None)`.
+
+`capture_output_prefix` is set when a diagnostic submission receives its
+directory, before the submission succeeds. A failed submission may therefore
+leave a directory and a non-`None` value. The next submission on the same
+thread that reaches configuration without diagnostics clears it to `None`.
+Preflight rejection before configuration does not update it. The property does
+not report the last successful run, and other threads have their own value.
 
 Direct L2 handles validate the execution context inside the native wait.
 `ExecutionContextRefused`, imported from `simpler.task_interface`, is a
@@ -290,11 +313,15 @@ for failure and Program Worker teardown behavior.
 | `enable_pmu` | `0` | `0` off; `>0` selects the event type |
 | `enable_dep_gen` | `0` | Emit the dependency graph |
 | `enable_scope_stats` | `0` | Writes `<output_prefix>/scope_stats/scope_stats.jsonl` |
-| `output_prefix` | `""` | **Required whenever any diagnostic is enabled** |
+| `output_prefix` | `""` | Internal per-capture destination filled by `Worker`; callers must leave it empty |
 | `runtime_env` | — | TRB uses `ring_task_window`, `ring_heap`, and `ring_dep_pool`. HBG uses `ring_task_window[0]` for graph task capacity; its graph heap is sized after orchestration |
 
-`validate()` runs at every submit/run entry point and throws if a diagnostic is
-on without `output_prefix`, or if a ring override breaks the ring's constraints.
+Set `output_root` on the Worker and enable diagnostics in `CallConfig`; Simpler
+allocates the capture directory and fills `output_prefix` on the internal copy
+before native validation. Public `Worker.submit` and `run` reject a
+caller-selected `output_prefix`. Calling `CallConfig.validate()` yourself on
+the unfilled config still rejects enabled diagnostics with an empty prefix;
+ring overrides must also satisfy their constraints.
 
 ## `simpler.trace`
 

@@ -85,6 +85,7 @@ from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field, replace
 from multiprocessing import resource_tracker
 from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
 from typing import Any, NamedTuple, NoReturn, cast
 
 import cloudpickle
@@ -302,10 +303,12 @@ from .task_interface import (
     TensorTransfer,
     _bind_host_log_session_directory,
     _ChipWorker,
+    _configure_host_log_output_root,
     _flush_host_log_or_warn,
     _initialize_chip_runtime,
     _initialize_host_log,
     _materialize_chip_task_args,
+    _persistent_host_log_directory,
     _start_host_log_writer,
     _validate_host_control_access,
     _Worker,
@@ -2395,6 +2398,20 @@ class _DispatchProvenance(NamedTuple):
     group_size: int = 0
 
 
+def _config_with_output_prefix(source: CallConfig, prefix: str) -> CallConfig:
+    """Fill an automatic destination without changing a caller-owned config."""
+    cfg = CallConfig()
+    cfg.aicpu_thread_num = source.aicpu_thread_num
+    cfg.runtime_env = source.runtime_env
+    cfg.enable_chip_swimlane = source.enable_chip_swimlane
+    cfg.enable_dump_args = source.enable_dump_args
+    cfg.enable_pmu = source.enable_pmu
+    cfg.enable_dep_gen = source.enable_dep_gen
+    cfg.enable_scope_stats = source.enable_scope_stats
+    cfg.output_prefix = prefix
+    return cfg
+
+
 def _write_dispatch_identity_sidecar(
     output_prefix: str,
     *,
@@ -2446,6 +2463,9 @@ def _write_dispatch_identity_sidecar(
         "pipeline_generation": generation,
         "callable_digest": callable_digest.hex(),
     }
+    host_log_directory = _persistent_host_log_directory()
+    if host_log_directory is not None:
+        payload["host_log_directory"] = os.path.relpath(host_log_directory, output_prefix)
     with open(temporary_path, "w") as file:
         json.dump(payload, file, indent=2)
         file.write("\n")
@@ -4510,7 +4530,8 @@ def _child_worker_loop(
             # pure forwarding to L2 carries no map cost.
             args = _reexport_args_from_mailbox(task_buf, inner_worker)
             cfg = _read_config_from_mailbox(task_buf, level_worker=inner_worker)
-            inner_worker.run(orch_fn, args, cfg)
+            with inner_worker._inherited_capture_output(cfg.output_prefix):
+                inner_worker.run(orch_fn, args, cfg)
         except Exception as e:  # noqa: BLE001
             return 1, _format_exc(f"child_worker level={inner_worker.level}", e)
         return 0, ""
@@ -5555,6 +5576,15 @@ class Worker:
         **config,
     ) -> None:
         self.level = level
+        output_root = config.pop("output_root", None)
+        if output_root is None:
+            self._output_root = None
+        else:
+            root_path = os.fspath(output_root)
+            if not root_path:
+                raise ValueError("output_root must not be empty")
+            self._output_root = str(Path(root_path).expanduser().resolve())
+        self._capture_output_prefix_by_thread = threading.local()
         self._delegated_control_path = _format_worker_path(int(level))
         self._delegated_session_fatal: BaseException | None = None
         # Rebound from the level in `init()`; the default matches the C++ table's
@@ -6313,6 +6343,8 @@ class Worker:
             "parent_worker_level": int(self.level),
             "remote_worker_level": 3,
             "worker_id": int(worker_id),
+            "output_root": self._output_root,
+            "output_root_probe": _persistent_host_log_directory(),
             "platform": spec.platform,
             "runtime": spec.runtime,
             "device_ids": list(spec.device_ids),
@@ -6349,6 +6381,8 @@ class Worker:
             "parent_worker_level": int(self.level),
             "remote_worker_level": 3,
             "worker_id": int(rank.worker_id),
+            "output_root": self._output_root,
+            "output_root_probe": _persistent_host_log_directory(),
             "platform": spec.platform,
             "runtime": spec.runtime,
             "device_ids": list(spec.device_ids),
@@ -8766,6 +8800,14 @@ class Worker:
                 raise RuntimeError("Child worker must be NEW (not started/failed/closed) before add_worker()")
             if worker._topology_parent is not None:
                 raise RuntimeError("Child worker is already attached to another parent")
+            if self._output_root is not None:
+                subtree = [worker]
+                for child in subtree:
+                    if child._output_root is not None and child._output_root != self._output_root:
+                        raise ValueError("Local child Worker output_root must match its parent")
+                    subtree.extend(child._next_level_workers)
+                for child in subtree:
+                    child._output_root = self._output_root
             worker_id = self._allocate_next_level_worker_id()
             worker._topology_parent = self
             worker._topology_worker_id = worker_id
@@ -8942,6 +8984,15 @@ class Worker:
             # check and the epoch claim (register's snapshot install also holds
             # this lock).
             self._validate_eligible_targets()
+            if self.level >= 3:
+                self._is_startup_root = _startup_deadline is None
+            if self.level == 2 and "workspace_budget_bytes" in self._config:
+                self._validated_workspace_budget(self._config["platform"])
+            elif self.level >= 3:
+                self._validate_hierarchical_startup_config()
+                self._requested_chip_pipeline_depth()
+            elif self.level < 2:
+                raise ValueError(f"Worker: level {self.level} not supported")
             self._prewarm_config = prewarm_config
             self._startup_error = None
             self._init_owner_thread = threading.current_thread()
@@ -8950,9 +9001,11 @@ class Worker:
                 self._assign_shm_namespace()
             if bytes(self._buffer_identity_allocator.owner_instance_id) != self._owner_instance_id:
                 raise RuntimeError("Worker buffer identity allocator is not bound to the HOST owner nonce")
+            if self._output_root is not None:
+                _configure_host_log_output_root(self._output_root)
+                _bind_host_log_session_directory()
             self._lifecycle = _Lifecycle.INITIALIZING
             if self.level >= 3:
-                self._is_startup_root = _startup_deadline is None
                 own_deadline = _monotonic() + self._startup_timeout_s
                 # A recursive descendant caps its own timeout at the parent's
                 # remaining budget so the whole tree fits one startup_timeout_s.
@@ -9121,11 +9174,9 @@ class Worker:
             if isinstance(target, ChipCallable):
                 self._chip_worker.register_callable(cid, target)
 
-    def _init_hierarchical(self) -> None:
-        device_ids = self._config.get("device_ids", [])
-        n_sub = self._config.get("num_sub_workers", 0)
-        heap_ring_size = self._config.get("heap_ring_size", None)
-        if self.level >= 4 and device_ids:
+    def _validate_hierarchical_startup_config(self) -> None:
+        """Check startup parameters before binding a process-wide log sink."""
+        if self.level >= 4 and self._config.get("device_ids"):
             raise RuntimeError("Worker level >= 4 must use add_worker(); device_ids are only supported on L3 Workers")
 
         # Only a worker that carries remote workers has a remote session to
@@ -9147,6 +9198,12 @@ class Worker:
                 "workspace_budget_bytes is only supported on a same-process level-2 Worker; "
                 "this Worker owns chip children, whose workspace cannot be checked before shutdown"
             )
+
+    def _init_hierarchical(self) -> None:
+        device_ids = self._config.get("device_ids", [])
+        n_sub = self._config.get("num_sub_workers", 0)
+        heap_ring_size = self._config.get("heap_ring_size", None)
+        self._validate_hierarchical_startup_config()
 
         # 1. Allocate sub-worker mailboxes: a control frame, the request frames,
         #    and one run-state entry per run this Worker could ever ask a child to
@@ -12898,6 +12955,18 @@ class Worker:
                 raise ValueError("caller_stream requires a direct L2 Worker")
             submit_options["caller_stream"] = _nonzero_uint64(caller_stream, "caller_stream")
         try:
+            reserved = getattr(self._capture_output_prefix_by_thread, "reserved", None)
+            inherited = getattr(self._capture_output_prefix_by_thread, "inherited", None)
+            if (
+                config is not None
+                and getattr(config, "output_prefix", "")
+                and config.output_prefix
+                not in {
+                    reserved,
+                    inherited,
+                }
+            ):
+                raise ValueError("output_prefix is managed by Simpler; pass output_root to Worker instead")
             with self._operation_lease("submit"):
                 result = self._submit_locked(callable, args, config, **submit_options)
         except BaseException as primary:
@@ -12919,8 +12988,73 @@ class Worker:
         submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
         self.submit(callable, args=args, config=config, **submit_options).wait()
 
+    @property
+    def capture_output_prefix(self) -> str | None:
+        """This thread's latest configured capture path, even if submission failed.
+
+        A later non-diagnostic submission clears it once configuration begins.
+        """
+        return getattr(self._capture_output_prefix_by_thread, "path", None)
+
+    @contextlib.contextmanager
+    def _inherited_capture_output(self, prefix: str):
+        """Permit one internally forwarded capture path for a child Worker."""
+        previous = getattr(self._capture_output_prefix_by_thread, "inherited", None)
+        self._capture_output_prefix_by_thread.inherited = prefix
+        try:
+            yield
+        finally:
+            self._capture_output_prefix_by_thread.inherited = previous
+
+    def _new_capture_prefix(self, label: str = "run", *, case: bool = False) -> str:
+        if self._output_root is None:
+            raise ValueError("diagnostics require Worker(output_root=...)")
+        root = _configure_host_log_output_root(self._output_root)
+        directory = root if case else root / "captures" / self._owner_id
+        directory.mkdir(parents=True, exist_ok=True)
+        safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", label).strip("._")[:80] or "run"
+        separator = "_" if case else "-"
+        return tempfile.mkdtemp(prefix=f"{safe_label}{separator}", dir=directory)
+
+    @contextlib.contextmanager
+    def _diagnostic_case_output(self, label: str):
+        """Reserve one generated directory for a SceneTest case on this thread."""
+        previous = getattr(self._capture_output_prefix_by_thread, "reserved", None)
+        prefix = self._new_capture_prefix(label, case=True)
+        self._capture_output_prefix_by_thread.reserved = prefix
+        try:
+            yield prefix
+        finally:
+            self._capture_output_prefix_by_thread.reserved = previous
+
+    def _diagnostic_config_for_submit(self, cfg: CallConfig) -> CallConfig:
+        """Select a distinct directory for each diagnostic submission."""
+        self._capture_output_prefix_by_thread.path = None
+        if _config_diagnostics_any(cfg) and not cfg.output_prefix:
+            prefix = getattr(self._capture_output_prefix_by_thread, "reserved", None) or self._new_capture_prefix()
+            cfg = _config_with_output_prefix(cfg, prefix)
+        if _config_diagnostics_any(cfg):
+            self._capture_output_prefix_by_thread.path = cfg.output_prefix
+        return cfg
+
+    def _diagnostic_config_for_next_level(self, cfg: CallConfig) -> CallConfig:
+        """Carry the current run directory into each child task."""
+        frame = _callback_frame_for(self)
+        if frame is None:
+            return cfg
+        if cfg.output_prefix and cfg.output_prefix != frame.capture_prefix:
+            raise ValueError("output_prefix is managed by Simpler; pass output_root to Worker instead")
+        if not _config_diagnostics_any(cfg):
+            return cfg
+        if not frame.capture_prefix:
+            frame.capture_prefix = (
+                getattr(self._capture_output_prefix_by_thread, "reserved", None) or self._new_capture_prefix()
+            )
+            self._capture_output_prefix_by_thread.path = frame.capture_prefix
+        return _config_with_output_prefix(cfg, frame.capture_prefix)
+
     def _submit_locked(self, callable, args, config, *, caller_stream: int | None = None) -> RunHandle:
-        cfg = config if config is not None else CallConfig()
+        cfg = self._diagnostic_config_for_submit(config if config is not None else CallConfig())
 
         if self.level == 2:
             assert self._chip_worker is not None
@@ -13382,7 +13516,7 @@ class Worker:
         try:
             self._orch._scope_begin()
             scope_open = True
-            with _callback_run(run_id, self):
+            with _callback_run(run_id, self, cfg.output_prefix):
                 if _host_spans_active():
                     graph_start_ns = time.monotonic_ns()
                     try:

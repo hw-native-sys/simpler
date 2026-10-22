@@ -286,10 +286,10 @@ I marked" contract. Use `--dump-args full` when you want everything.
 
 ### 3.3 Output
 
-The dump artifacts land under the per-task output prefix
-(`CallConfig::output_prefix`, set by
-`scene_test.py::_build_output_prefix` to
-`outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/` for SceneTest runs):
+The dump artifacts land under the capture directory. For SceneTest,
+Simpler reserves `outputs/<ClassName>_<case>_<capture-id>/` beneath
+`Worker(output_root=...)` and passes it as the internal
+`CallConfig::output_prefix`:
 
 ```text
 <output_prefix>/
@@ -299,7 +299,7 @@ The dump artifacts land under the per-task output prefix
 ```
 
 Filenames are fixed (no per-file timestamp) — the directory is the
-per-task uniqueness boundary. Once at least one record reaches the collector,
+capture uniqueness boundary. Once at least one record reaches the collector,
 `partial` and `full` create `args.bin`, which may be empty when no tensor
 payload was selected or recorded. `hybrid` with records but no selected tensor
 payload emits only `args_dump.json`; otherwise it also emits `args.bin`.
@@ -404,7 +404,7 @@ python -m simpler_setup.tools.dump_viewer --stage before --role input --export
 python -m simpler_setup.tools.dump_viewer --index 42
 
 # Pin to a specific dump directory
-python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/args_dump \
+python -m simpler_setup.tools.dump_viewer outputs/<case>_<capture-id>/args_dump \
     --task 0x0000000200000a00 --export
 ```
 
@@ -1094,7 +1094,7 @@ On a5 raise `PLATFORM_DUMP_RECORDS_PER_BUFFER`; on a2a3 raise
 Either the run did not produce one (see first question), or the
 viewer's working directory differs from the run's. Pass the
 explicit dump-dir path to the viewer:
-`python -m simpler_setup.tools.dump_viewer outputs/<case>_<ts>/args_dump`.
+`python -m simpler_setup.tools.dump_viewer outputs/<case>_<capture-id>/args_dump`.
 
 **The run hung (AICore op-timeout / scheduler timeout) — is there
 still a dump?** Yes. The host exports the manifest even though `run()` returns

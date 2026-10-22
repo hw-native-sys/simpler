@@ -207,10 +207,6 @@ def main():  # noqa: PLR0912, PLR0915 -- one Worker owns the request pool and it
     if len(args.request_steps) < 3 or min(args.request_steps) < 2 or args.pipeline_depth < 4:
         raise ValueError("require at least three multi-step requests and at least four resource sets")
     args.output.mkdir(parents=True, exist_ok=False)
-    (args.output / "host").mkdir()
-    from _task_interface import _set_host_log_directory  # noqa: PLC0415
-
-    _set_host_log_directory(str(args.output / "host"))
     worker, error = None, None
     hosts, slots, runs, completed = [], [], [], set()
     handles, attempts = {}, []
@@ -237,6 +233,7 @@ def main():  # noqa: PLR0912, PLR0915 -- one Worker owns the request pool and it
         directions["out"] = TensorArgType.INOUT
         worker = Worker(
             level=3,
+            output_root=args.output,
             platform="a2a3",
             runtime="host_build_graph",
             device_ids=[args.device],
@@ -282,7 +279,6 @@ def main():  # noqa: PLR0912, PLR0915 -- one Worker owns the request pool and it
         config = CallConfig()
         config.enable_dep_gen = False
         config.enable_chip_swimlane = 0
-        config.output_prefix = str(args.output)
         report.update(
             code_head=_source_head(Path(__file__).resolve().parents[4]),
             consumer_sha256=_sha256(Path(__file__)),

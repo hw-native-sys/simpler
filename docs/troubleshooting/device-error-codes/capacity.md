@@ -32,7 +32,7 @@ bytes, dep-pool entries, tensormap entries) per `SIMPLER_SCOPE`:
 ```python
 cfg = CallConfig()
 cfg.enable_scope_stats = True
-cfg.output_prefix = "outputs/my_run"
+worker = Worker(..., output_root="outputs")
 worker.run(callable, args, cfg)
 ```
 

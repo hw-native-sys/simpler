@@ -181,7 +181,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
 | `--manual` | | `exclude` | `exclude`/`include`/`only` for manual scene-test cases and standalone pytest tests |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
-| `--enable-chip-swimlane [PERF_LEVEL]` | | `0` | Enable chip swimlane collection. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/chip-swimlane-profiling.md](dfx/chip-swimlane-profiling.md#31-enable-chip-swimlane) for the level table. Each test case gets its own `outputs/<case>_<ts>/` directory under which `chip_swimlane_records.json` lands; parallel runs never collide. Disabled when `--rounds > 1`. |
+| `--enable-chip-swimlane [PERF_LEVEL]` | | `0` | Enable chip swimlane collection. The flag takes an integer perf_level 0–4 (bare = 4); see [docs/dfx/chip-swimlane-profiling.md](dfx/chip-swimlane-profiling.md#31-enable-chip-swimlane) for the level table. Each test case gets its own `outputs/<case>_<capture-id>/` directory; L3 chip records live under `rankN/dN/`. Parallel runs never collide. Disabled when `--rounds > 1`. |
 | `--dump-args` | | `0` | Dump tensors plus scalar args into unified runtime artifacts (bare flag = `1`; supports `0/1/2/3`) |
 | `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
 | `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
@@ -392,15 +392,26 @@ A single file can declare both L2 and L3 classes; they're grouped by `(runtime, 
 
 ### Profiling under parallelism
 
-Each test case sets its own `CallConfig.output_prefix` (chosen by `scene_test.py::_build_output_prefix` as `outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/`). The C++ runtime writes all diagnostic artifacts under that prefix with fixed filenames:
+Each SceneTest case reserves a unique directory under `Worker(output_root=outputs)`:
+`outputs/<ClassName>_<case>_<capture-id>/`. Simpler passes it as the internal
+`CallConfig.output_prefix`. The runtime writes diagnostic artifacts beneath it
+with fixed filenames:
 
-- `outputs/<case>_<ts>/chip_swimlane_records.json` — swimlane (`--enable-chip-swimlane`)
-- `outputs/<case>_<ts>/args_dump/` — args dump (`--dump-args`)
-- `outputs/<case>_<ts>/pmu.csv` — PMU counters (`--enable-pmu`)
+- `outputs/<case>_<capture-id>/chip_swimlane_records.json` — L2 swimlane (`--enable-chip-swimlane`)
+- `outputs/<case>_<capture-id>/rankN/dN/chip_swimlane_records.json` — L3 chip swimlane
+- `outputs/<case>_<capture-id>/args_dump/` — L2 args dump (`--dump-args`)
+- `outputs/<case>_<capture-id>/pmu.csv` — L2 PMU counters (`--enable-pmu`)
 
-Because each case gets its own directory, parallel runs (xdist workers, L3 case fanout, L2 device fanout) can never collide on filename — there is no per-file timestamp, no env-var scoping, and no post-run flatten step. `CallConfig::validate()` throws if any diagnostic flag is enabled but `output_prefix` is empty; `scene_test.py::run_class_cases` always fills it from the case label.
+Because each case gets its own generated directory, parallel runs (xdist workers,
+L3 case fanout, L2 device fanout) cannot collide on filename. Host logs live in
+`outputs/host_logs/<session-id>/` across all cases in the process. Callers set
+`output_root`, not `CallConfig.output_prefix`; the Worker fills the latter before
+native validation.
 
-Standalone invocations of CLIs (`python -m simpler_setup.tools.swimlane_converter`, etc.) auto-detect the latest `outputs/*/chip_swimlane_records.json` (sorted by mtime); pass `--input <path>` to override.
+`swimlane_converter` without an input auto-detects the latest L2 SceneTest
+`outputs/*/chip_swimlane_records.json` by mtime. Pass the records file for a
+direct Worker capture. For an L3 merge, pass the capture directory together
+with `--dispatch dN` or `--dispatch-id RUN_ID:TASK_SLOT`.
 
 ### Dispatcher skip conditions (normal pytest runs)
 

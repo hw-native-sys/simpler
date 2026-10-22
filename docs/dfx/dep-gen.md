@@ -155,10 +155,10 @@ isolation, see the **split workflow** described in
 — one dep_gen capture per topology, then any number of swimlane
 runs that the converter joins back to that captured graph.
 
-When `--enable-dep-gen` is on with any other diagnostic flag, an
-`output_prefix` directory must be set (the runtime throws otherwise).
-The standard SceneTest path
-(`outputs/<TestName>_<case>_<timestamp>/`) handles that automatically.
+When `--enable-dep-gen` is on with any other diagnostic flag, the runtime
+needs an `output_prefix` directory. Pass `output_root` to `Worker`; Simpler
+fills the internal prefix. SceneTest automatically reserves a unique
+`outputs/<TestName>_<case>_<capture-id>/` directory for each case.
 
 ---
 

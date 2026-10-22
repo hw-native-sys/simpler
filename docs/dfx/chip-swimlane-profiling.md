@@ -175,10 +175,8 @@ runs are not instrumented.
 ### 3.2 Output
 
 The raw artifact lands under the per-task output prefix
-(`CallConfig::output_prefix`, set by
-`scene_test.py::_build_output_prefix` to
-`outputs/<ClassName>_<case>_<YYYYMMDD_HHMMSS>/` for SceneTest
-runs):
+(`CallConfig::output_prefix`, assigned internally by `Worker` beneath
+`output_root`, with direct Worker captures under `captures/<worker-id>/`):
 
 ```text
 <output_prefix>/
@@ -189,6 +187,15 @@ runs):
 
 Filenames are fixed (no per-file timestamp) — the directory is the
 per-task uniqueness boundary.
+
+For direct `Worker` use, set `Worker(output_root=path)` before `init()` and
+enable diagnostics on the call config. Simpler assigns a distinct directory
+under `<path>/captures/<worker-id>/` for each submission; SceneTest reserves
+one per case. Host logs go to `<path>/host_logs/<session-id>/`, and L3
+`dispatch_identity.json` points to that directory. Callers do not set
+`CallConfig.output_prefix`; Simpler carries that internal path to the chips.
+For remote or MPI L3 workers, `<path>` must be a writable shared mount at the
+same absolute path on every host; the path is sent unchanged to each worker.
 
 For L3 runs, each forked ChipWorker writes below its own `rankN/dN` directory.
 The filenames above are fixed, so N children sharing one `output_prefix` would
@@ -247,19 +254,23 @@ When an L3 Worker is attached below L4, all of its outputs first enter the
 parent-assigned node namespace:
 
 ```text
+<output_root>/
+└── host_logs/<session-id>/
+    └── host.<pid>.log
+
 <output_prefix>/
-├── host.<l4-pid>.log
 ├── node0/
-│   ├── host.<l3-or-chip-pid>.log
 │   └── rank0/d0/
 │       ├── chip_swimlane_records.json
 │       ├── host_clock_alignment.<chip-pid>.log  # matched timing spans only
 │       └── dispatch_identity.json
 └── node1/
-    ├── host.<l3-or-chip-pid>.log
     └── rank0/d0/
         └── ...
 ```
+
+Host logs stay outside the capture tree; the `host_clock_alignment` files
+shown beneath each node stay with that capture.
 
 `nodeN` uses the stable worker id returned by `Worker.add_worker()`,
 `Worker.add_remote_worker()`, or `Worker.add_mpirun_worker_group()`; one
@@ -632,17 +643,17 @@ reader hoists it to the top of the output dict.
 and produces a per-function task-execution summary:
 
 ```bash
-# Auto-detects the latest outputs/*/chip_swimlane_records.json
+# Auto-detects the latest L2 SceneTest outputs/*/chip_swimlane_records.json
 python -m simpler_setup.tools.swimlane_converter
 
 # Pin to a specific case + add func_id → name mapping
 python -m simpler_setup.tools.swimlane_converter \
-    outputs/<case>_<ts>/chip_swimlane_records.json \
-    --func-names outputs/<case>_<ts>/name_map_<case>.json
+    outputs/<case>_<capture-id>/chip_swimlane_records.json \
+    --func-names outputs/<case>_<capture-id>/name_map_<case>.json
 
 # Custom output path
 python -m simpler_setup.tools.swimlane_converter \
-    outputs/<case>_<ts>/chip_swimlane_records.json -o my_trace.json
+    outputs/<case>_<capture-id>/chip_swimlane_records.json -o my_trace.json
 
 # Same-host L3: merge rankN/d0 captures onto one CLOCK_MONOTONIC timeline
 python -m simpler_setup.tools.swimlane_converter \
@@ -679,10 +690,9 @@ python -m simpler_setup.tools.swimlane_converter \
     outputs/<case>/chip_swimlane_records.json --host-log outputs/<case>/test.log
 ```
 
-The first output run binds the process tree's cumulative Host logs to a stable
-transient session spool under `${TMPDIR:-/tmp}/simpler-host-logs-<root-pid>-<uuid>/`, independent
-of every capture directory. It keeps accumulating across calls and is removed at
-normal root-process exit. After successful Device execution and validation, if Host recording is armed and
+With `Worker(output_root=path)`, initialization binds cumulative Host logs to
+`<path>/host_logs/<session-id>/`, outside every capture directory. The log files
+accumulate across calls and survive process exit. After successful Device execution and validation, if Host recording is armed and
 finished for a level-3/4 capture with an output prefix, native finalize emits the last `chip.run` span, flushes the executing process's logger,
 and atomically exports `host_clock_alignment.<pid>.log` beside
 `chip_swimlane_records.json` before publishing completion. Direct L2 runs and
@@ -704,10 +714,10 @@ logs, performs containment, saves `metadata.clock_alignment` in mixed HBG source
 captures, and generates the merged trace. Timing-log export itself does not
 calculate or save clock alignment. Device-only captures and other diagnostics
 alone do not trigger this export. Directory merging retains containment for all
-runtimes and levels. While the process is alive, complete Host call trees
-remain in the session spool's `host.<pid>.log` files and can be supplied through
+runtimes and levels. Complete Host call trees remain in the root's
+`host_logs/<session-id>/host.<pid>.log` files and can be supplied through
 explicit `--host-log` inputs. The capture-local alignment logs remain with the
-capture after the transient spool is removed.
+capture.
 
 The TIMING marker `chip.run.runner_run.aicpu_launch`, sampled immediately before
 AICPU launch, raises the placement lower bound to the later of the runner start
@@ -812,11 +822,9 @@ both sources of uncertainty.
 
 The Host block comes first and has two parts. Above the Ranks are the
 processes that dispatched to them — the L3 scheduler's `node.*` lanes, and an
-L4's `network1.*` above those. Each process binds its persistent host log to the root of
-the level namespace it owns, so a direct L3 run stores them above the Rank
-captures. Under a parent-assigned namespace only that namespace's own
-levels are beside them — the L4 above a `nodeN` writes one directory up, where
-a merge reading that `nodeN` does not look. They are Host CLOCK_MONOTONIC and
+L4's `network1.*` above those. The processes in one local Worker tree write to
+the root's `host_logs/<session-id>/` directory; each Rank capture references it
+through `dispatch_identity.json`. They are Host CLOCK_MONOTONIC and
 same-host cross-process comparable, so they are drawn directly and **carry no
 `slack_ns` at all** — containment is a device-clock term. Their logs cover the
 whole run while the merge covers one dispatch, so the invocations drawn are
@@ -866,7 +874,7 @@ either:
 
 | Input | Default output |
 | ----- | -------------- |
-| a records file | `outputs/<case>_<ts>/merged_swimlane.json` |
+| a records file | `outputs/<case>_<capture-id>/merged_swimlane.json` |
 | a `dfx_outputs` directory | `<dfx_outputs>/l3_swimlane.json` |
 
 Open <https://ui.perfetto.dev/> and drag the file in. Both forms produce the
@@ -1026,8 +1034,8 @@ python test_my_case.py --platform a2a3 --enable-dep-gen
 # captured graph.
 python test_my_case.py --platform a2a3 --enable-chip-swimlane 4
 python -m simpler_setup.tools.swimlane_converter \
-    outputs/<case_ts>/chip_swimlane_records.json \
-    --deps-json outputs/<case_dep_ts>/deps.json
+    outputs/<case_perf_id>/chip_swimlane_records.json \
+    --deps-json outputs/<case_dep_id>/deps.json
 ```
 
 Use this when:
@@ -1057,10 +1065,10 @@ python test_my_case.py --platform a2a3 --enable-chip-swimlane 1
 python test_my_case.py --platform a2a3 --enable-dep-gen
 
 # Join offline: copy the deps.json in, then re-run the converter.
-cp outputs/<case_dep_ts>/deps.json outputs/<case_perf_ts>/deps.json
+cp outputs/<case_dep_id>/deps.json outputs/<case_perf_id>/deps.json
 python -m simpler_setup.tools.swimlane_converter \
-    outputs/<case_perf_ts>/chip_swimlane_records.json \
-    --func-names outputs/<case_perf_ts>/name_map_<case>.json
+    outputs/<case_perf_id>/chip_swimlane_records.json \
+    --func-names outputs/<case_perf_id>/name_map_<case>.json
 ```
 
 The converter is a pure post-processor — re-running it against the
@@ -1650,7 +1658,7 @@ automatically after a SceneTest with `--enable-chip-swimlane`; if it
 did not, run it manually:
 
 ```bash
-python -m simpler_setup.tools.swimlane_converter outputs/<case>_<ts>/chip_swimlane_records.json
+python -m simpler_setup.tools.swimlane_converter outputs/<case>_<capture-id>/chip_swimlane_records.json
 ```
 
 **All tasks show as `task(<task-id>)` (undistinguished).** No `deps.json`

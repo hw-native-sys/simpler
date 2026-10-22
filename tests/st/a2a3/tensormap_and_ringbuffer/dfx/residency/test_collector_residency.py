@@ -52,13 +52,14 @@ onboard a2a3 lane can observe it.
 """
 
 import json
+from pathlib import Path
 
 import torch
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CallConfig
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
-from simpler_setup.scene_test import _build_l2_ref_args, build_output_prefix
+from simpler_setup.scene_test import _build_l2_ref_args
 
 KERNELS_BASE = "../../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
 
@@ -161,7 +162,6 @@ class TestCollectorResidency(SceneTestCase):
 
         artifacts = []
         for run_index, thread_count in enumerate(RUN_THREAD_COUNTS):
-            prefix = build_output_prefix(f"{type(self).__name__}_{case['name']}_run{run_index}")
             args = self.generate_args(case.get("params", {}))
             chip_args, _output_names = _build_l2_ref_args(args, orch_sig, st_worker)
 
@@ -170,9 +170,8 @@ class TestCollectorResidency(SceneTestCase):
             config.enable_dep_gen = True
             config.enable_chip_swimlane = 1
             config.aicpu_thread_num = thread_count
-            config.output_prefix = str(prefix)
             st_worker.run(handle, chip_args, config)
-            artifacts.append(prefix)
+            artifacts.append(Path(st_worker.capture_output_prefix))
 
         assert len(set(artifacts)) == len(artifacts), "the runs shared an output prefix; the test proves nothing"
 

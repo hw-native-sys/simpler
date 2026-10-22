@@ -267,11 +267,6 @@ def _await_joined_evidence(log_directory, child_pids, run_pairs, timeout=10.0, *
 def main() -> int:  # noqa: PLR0912, PLR0915 -- one Worker owns the two request lifetimes
     args = _parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
-    host_log_directory = args.output / "host"
-    host_log_directory.mkdir()
-    from _task_interface import _set_host_log_directory  # noqa: PLC0415
-
-    _set_host_log_directory(str(host_log_directory))
     report = {"status": "running", "launch_depth": 2, "steps_requested": args.steps, "requests": [[], []]}
     worker = None
     error = None
@@ -301,6 +296,7 @@ def main() -> int:  # noqa: PLR0912, PLR0915 -- one Worker owns the two request 
         }
         worker = Worker(
             level=3,
+            output_root=args.output,
             platform="a2a3",
             runtime="host_build_graph",
             device_ids=[args.device],
@@ -359,7 +355,6 @@ def main() -> int:  # noqa: PLR0912, PLR0915 -- one Worker owns the two request 
         config = CallConfig()
         config.enable_dep_gen = False
         config.enable_chip_swimlane = 0
-        config.output_prefix = str(args.output)
 
         def prepare_pair():
             for request in range(2):

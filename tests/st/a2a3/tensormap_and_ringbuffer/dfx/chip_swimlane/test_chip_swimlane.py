@@ -30,7 +30,6 @@ import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
-from simpler_setup.scene_test import build_output_prefix
 
 from ._swimlane_validate import validate_perf_artifact
 
@@ -137,14 +136,13 @@ class TestDeviceOrchestrationClockCapture(TestChipSwimlane):
     def _build_config(self, config_dict, *args, **kwargs):
         config = super()._build_config(config_dict, *args, **kwargs)
         config.enable_chip_swimlane = self._swimlane_level
-        if not config.output_prefix:
-            config.output_prefix = str(build_output_prefix(f"{type(self).__name__}_{time.monotonic_ns()}"))
-        if self._swimlane_level:
-            path = Path(config.output_prefix) / "chip_swimlane_records.json"
-            # CLI-generated prefixes can repeat for the same case within one second.
-            path.unlink(missing_ok=True)
-            self._clock_capture_paths += (path,)
         return config
+
+    def _run_and_validate_l2(self, worker, callable_obj, case, **kwargs):
+        super()._run_and_validate_l2(worker, callable_obj, case, **kwargs)
+        if self._swimlane_level:
+            path = Path(worker.capture_output_prefix) / "chip_swimlane_records.json"
+            self._clock_capture_paths += (path,)
 
 
 if __name__ == "__main__":

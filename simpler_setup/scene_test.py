@@ -31,7 +31,7 @@ import platform as host_platform
 import sys
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from enum import IntEnum
 from functools import cache
 from pathlib import Path
@@ -1242,13 +1242,11 @@ def _outputs_dir() -> Path:
 
 
 def build_output_prefix(case_label: str) -> Path:
-    """Per-case directory for diagnostic artifacts.
+    """Allocate a standalone directory for tests that manage their own files.
 
-    Each case gets its own ``outputs/<case_label>_<timestamp>/`` directory; the
-    runtime writes ``chip_swimlane_records.json``, ``args_dump/``, and ``pmu.csv``
-    under that root with fixed filenames. Two cases of the same name run in
-    the same second is not a contemplated scenario (parallel xdist runs differ
-    by class+method).
+    SceneTest captures use ``Worker._diagnostic_case_output`` instead; that
+    allocation is unique even when two cases start within the same second.
+    This helper preserves the timestamped path expected by standalone callers.
 
     The directory is created here: the dep_gen host replay (and any other
     writer) ``fopen``s ``<prefix>/<file>`` directly without an mkdir of its
@@ -1664,39 +1662,37 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     )
     for case in cases:
         case_label = f"{cls_name}_{case['name']}"
-        # Per-case directory the runtime writes into. Required (non-empty) when
-        # any diagnostic flag is on; CallConfig::validate() throws otherwise.
-        # scope_stats writes below the per-case output prefix, so it uses the
-        # same output-prefix allocation as the other diagnostics.
-        prefix = build_output_prefix(case_label) if diagnostics_on else Path("")
-        try:
-            cls_inst._run_and_validate(
-                worker,
-                callable_obj,
-                case,
-                sub_handles=sub_handles,
-                rounds=rounds,
-                skip_golden=skip_golden,
-                enable_chip_swimlane=enable_chip_swimlane,
-                enable_dump_args=enable_dump_args,
-                enable_pmu=enable_pmu,
-                enable_dep_gen=enable_dep_gen,
-                enable_scope_stats=enable_scope_stats,
-                output_prefix=str(prefix) if diagnostics_on else "",
-            )
-        except Exception as exc:
-            _name_failing_case(exc, cls_name, case["name"])
-            raise
-        finally:
-            finalize_diagnostic_outputs(
-                case_label,
-                prefix,
-                callable_spec=callable_spec,
-                chip_swimlane=enable_chip_swimlane,
-                dep_gen=enable_dep_gen,
-                scope_stats=enable_scope_stats,
-                swimlane_overhead=enable_swimlane_overhead,
-            )
+        capture = worker._diagnostic_case_output(case_label) if diagnostics_on else nullcontext("")
+        with capture as output_prefix:
+            try:
+                cls_inst._run_and_validate(
+                    worker,
+                    callable_obj,
+                    case,
+                    sub_handles=sub_handles,
+                    rounds=rounds,
+                    skip_golden=skip_golden,
+                    enable_chip_swimlane=enable_chip_swimlane,
+                    enable_dump_args=enable_dump_args,
+                    enable_pmu=enable_pmu,
+                    enable_dep_gen=enable_dep_gen,
+                    enable_scope_stats=enable_scope_stats,
+                    output_prefix=output_prefix,
+                )
+            except Exception as exc:
+                _name_failing_case(exc, cls_name, case["name"])
+                raise
+            finally:
+                if output_prefix:
+                    finalize_diagnostic_outputs(
+                        case_label,
+                        Path(output_prefix),
+                        callable_spec=callable_spec,
+                        chip_swimlane=enable_chip_swimlane,
+                        dep_gen=enable_dep_gen,
+                        scope_stats=enable_scope_stats,
+                        swimlane_overhead=enable_swimlane_overhead,
+                    )
 
 
 def _describe_mismatch(actual, expected, rtol, atol) -> str:
@@ -2078,6 +2074,7 @@ class SceneTestCase:
 
         w = Worker(
             level=2,
+            output_root=_outputs_dir(),
             device_id=device_id,
             platform=platform,
             runtime=cls._st_runtime,
@@ -2366,14 +2363,9 @@ class SceneTestCase:
 
                 with _temporary_env(self._resolve_env()):
                     # The config reaches the chips through the orchestration
-                    # closure, but its output prefix also enables this process
-                    # tree's stable Host-log spool (`Worker._submit_l3_locked`).
-                    # Without it the L3 scheduler's `node.*` spans go to stderr,
-                    # while the chip children export only capture-local clock
-                    # logs, and the merged swimlane has no scheduler lane to
-                    # draw. At L3
-                    # the submit's own config is read for nothing else, and
-                    # `task_orch` discards the copy it is handed.
+                    # closure. The L3 submit also carries the same generated
+                    # capture path so its Host spans and child artifacts can be
+                    # associated with this case.
                     worker.run(task_orch, config=config)
 
                 if not skip_golden:
@@ -3072,6 +3064,7 @@ def _create_standalone_worker(group, level, args, selected_by_cls):
         device_ids = list(range(args.device, args.device + max_devices))
     worker = Worker(
         level=3,
+        output_root=_outputs_dir(),
         device_ids=device_ids,
         num_sub_workers=max_subs,
         platform=args.platform,

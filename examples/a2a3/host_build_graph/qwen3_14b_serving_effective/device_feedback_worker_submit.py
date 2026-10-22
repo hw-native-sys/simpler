@@ -229,11 +229,7 @@ def _feedback_evidence(log_directory, child_pids, run_ids):
 def main():  # noqa: PLR0912, PLR0915 -- one Worker owns the bounded chain and its retained results
     args = _parse_args()
     args.output.mkdir(parents=True, exist_ok=False)
-    log_directory = args.output / "host"
-    log_directory.mkdir()
-    from _task_interface import _set_host_log_directory  # noqa: PLC0415
-
-    _set_host_log_directory(str(log_directory))
+    log_directory = None
     worker = None
     hosts = []
     error = None
@@ -286,6 +282,7 @@ def main():  # noqa: PLR0912, PLR0915 -- one Worker owns the bounded chain and i
         directions["out"] = TensorArgType.INOUT
         worker = Worker(
             level=3,
+            output_root=args.output,
             platform="a2a3",
             runtime="host_build_graph",
             device_ids=[args.device],
@@ -319,7 +316,6 @@ def main():  # noqa: PLR0912, PLR0915 -- one Worker owns the bounded chain and i
         config = CallConfig()
         config.enable_dep_gen = False
         config.enable_chip_swimlane = 0
-        config.output_prefix = str(args.output)
         report["feedback_buffers"] = [
             {"buffer_id": buffer.identity.buffer_id, "base": int(buffer.base)} for buffer in sampled_outputs
         ]

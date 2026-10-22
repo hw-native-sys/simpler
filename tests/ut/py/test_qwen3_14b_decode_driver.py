@@ -78,6 +78,7 @@ class _FakeWorker:
         self.runs = []
         self.copy_from_count = 0
         self.closed = False
+        self.capture_output_prefix = None
         self.__class__.instances.append(self)
 
     def register(self, chip):
@@ -100,6 +101,14 @@ class _FakeWorker:
     def run(self, handle, task_args, config) -> None:
         self.runs.append((handle, task_args, config))
         self.events.append("run")
+        if (
+            config.enable_chip_swimlane
+            or config.enable_dump_args
+            or config.enable_pmu
+            or config.enable_dep_gen
+            or config.enable_scope_stats
+        ):
+            self.capture_output_prefix = "diagnostic-output"
 
     def copy_from(self, actual, buffer) -> None:
         self.copy_from_count += 1
@@ -189,7 +198,13 @@ def test_standalone_driver_keeps_one_device_fixture_across_rounds(
 
     [worker] = _FakeWorker.instances
     names = [param.name for param in driver.param_specs(driver.N_LAYERS)]
-    assert worker.kwargs == {"level": 2, "platform": platform, "runtime": runtime, "device_id": 7}
+    assert worker.kwargs == {
+        "level": 2,
+        "platform": platform,
+        "runtime": runtime,
+        "device_id": 7,
+        "output_root": driver._outputs_dir(),
+    }
     assert len(worker.allocations) == 20 == len(names)
     assert [name for _, name in worker.uploads] == [name for name in names if name != "out"]
     assert len(worker.runs) == 3
@@ -246,7 +261,6 @@ def test_correctness_reuses_one_materialized_fixture(monkeypatch, relative_path:
         "effective_diagnostic_options",
         lambda _rounds, **kwargs: SimpleNamespace(**kwargs),
     )
-    monkeypatch.setattr(driver, "build_output_prefix", lambda _label: Path("diagnostic-output"))
     monkeypatch.setattr(
         driver,
         "finalize_diagnostic_outputs",
@@ -277,10 +291,12 @@ def test_correctness_reuses_one_materialized_fixture(monkeypatch, relative_path:
     assert len(compared) == 1 and compared[0][0] is worker and compared[0][2] is fixture
     assert [name for _, name in worker.uploads] == [name for name in names if name != "out"]
     assert worker.runs[0][2].enable_chip_swimlane == 3
-    assert worker.runs[0][2].output_prefix == "diagnostic-output"
+    assert worker.runs[0][2].output_prefix == ""
+    assert worker.kwargs["output_root"] == driver._outputs_dir()
     assert worker.events.index("autoload") > max(i for i, event in enumerate(worker.events) if event == "copy_to")
     assert worker.events.index("autoload") < worker.events.index("run")
     assert len(finalized) == 1
+    assert finalized[0][0][1] == "diagnostic-output"
     assert finalized[0][1]["chip_swimlane"] == 3
     assert finalized[0][1]["swimlane_overhead"] is True
 

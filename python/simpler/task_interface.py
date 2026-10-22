@@ -1365,22 +1365,64 @@ class GlobalCommDomainView:
 
 
 _HOST_LOG_SESSION_OWNER_PID = os.getpid()
+_HOST_LOG_SESSION_ID = uuid.uuid4().hex
 _HOST_LOG_SESSION_DIRECTORY = Path(tempfile.gettempdir()) / (
-    f"simpler-host-logs-{_HOST_LOG_SESSION_OWNER_PID}-{uuid.uuid4().hex}"
+    f"simpler-host-logs-{_HOST_LOG_SESSION_OWNER_PID}-{_HOST_LOG_SESSION_ID}"
 )
+_HOST_LOG_OUTPUT_ROOT: Path | None = None
+_HOST_LOG_SESSION_LOCK = threading.Lock()
+
+
+def _reset_host_log_session_lock_after_fork() -> None:
+    global _HOST_LOG_SESSION_LOCK
+    _HOST_LOG_SESSION_LOCK = threading.Lock()
+
+
+os.register_at_fork(after_in_child=_reset_host_log_session_lock_after_fork)
+
+
+def _configure_host_log_output_root(output_root: str | os.PathLike[str]) -> Path:
+    """Choose a durable, process-wide log session before a Worker forks children."""
+    global _HOST_LOG_SESSION_DIRECTORY, _HOST_LOG_OUTPUT_ROOT
+    root = Path(output_root).expanduser().resolve()
+    with _HOST_LOG_SESSION_LOCK:
+        if _HOST_LOG_OUTPUT_ROOT is not None:
+            if root != _HOST_LOG_OUTPUT_ROOT:
+                raise RuntimeError(f"Host logs already use output_root {_HOST_LOG_OUTPUT_ROOT}")
+            return root
+        bound = _native_host_log_directory()
+        target = root / "host_logs" / _HOST_LOG_SESSION_ID
+        if bound and Path(bound).resolve() != target:
+            raise RuntimeError(
+                f"Host log sink already bound to {bound}; set output_root before the first diagnostic run"
+            )
+        target.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _HOST_LOG_OUTPUT_ROOT = root
+        _HOST_LOG_SESSION_DIRECTORY = target
+        return root
+
+
+def _persistent_host_log_directory() -> str | None:
+    """Directory to record in capture metadata, if logs survive process exit."""
+    return str(_HOST_LOG_SESSION_DIRECTORY) if _HOST_LOG_OUTPUT_ROOT is not None else None
 
 
 def _bind_host_log_session_directory() -> str:
     """Bind the process tree to one log directory that outlives every capture."""
-    bound = _native_host_log_directory()
-    if bound:
+    with _HOST_LOG_SESSION_LOCK:
+        bound = _native_host_log_directory()
+        if bound:
+            if _HOST_LOG_OUTPUT_ROOT is not None and Path(bound).resolve() != _HOST_LOG_SESSION_DIRECTORY:
+                raise RuntimeError(f"Host log sink already bound to {bound}, expected {_HOST_LOG_SESSION_DIRECTORY}")
+            return str(bound)
+        _HOST_LOG_SESSION_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _native_set_host_log_directory(str(_HOST_LOG_SESSION_DIRECTORY))
+        bound = _native_host_log_directory()
+        if not bound:
+            raise RuntimeError(f"cannot bind simpler Host log directory {_HOST_LOG_SESSION_DIRECTORY}")
+        if _HOST_LOG_OUTPUT_ROOT is not None and Path(bound).resolve() != _HOST_LOG_SESSION_DIRECTORY:
+            raise RuntimeError(f"Host log sink already bound to {bound}, expected {_HOST_LOG_SESSION_DIRECTORY}")
         return str(bound)
-    _HOST_LOG_SESSION_DIRECTORY.mkdir(mode=0o700, parents=True, exist_ok=True)
-    _native_set_host_log_directory(str(_HOST_LOG_SESSION_DIRECTORY))
-    bound = _native_host_log_directory()
-    if not bound:
-        raise RuntimeError(f"cannot bind simpler Host log directory {_HOST_LOG_SESSION_DIRECTORY}")
-    return str(bound)
 
 
 def _cleanup_host_log_session_directory() -> None:
@@ -1389,8 +1431,9 @@ def _cleanup_host_log_session_directory() -> None:
         return
     with contextlib.suppress(BaseException):
         _native_flush_host_log(1000)
-    with contextlib.suppress(OSError):
-        shutil.rmtree(_HOST_LOG_SESSION_DIRECTORY)
+    if _HOST_LOG_OUTPUT_ROOT is None:
+        with contextlib.suppress(OSError):
+            shutil.rmtree(_HOST_LOG_SESSION_DIRECTORY)
 
 
 atexit.register(_cleanup_host_log_session_directory)

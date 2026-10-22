@@ -48,15 +48,16 @@ single round.
 ## Enabling from your own code
 
 The same switches are `CallConfig` fields, so a direct-`Worker` program sets
-them itself. Any enabled diagnostic requires `output_prefix` to be set —
-`CallConfig::validate()` rejects the config otherwise.
+them itself. Set a process-wide `output_root` when constructing the Worker;
+Simpler creates a separate directory for each diagnostic submission.
 
 ```python
 cfg = CallConfig()
 cfg.enable_chip_swimlane = 4      # 0 = off; 1..4 select detail
 cfg.enable_pmu = 1              # 0 = off; >0 selects the event type
-cfg.output_prefix = "outputs/my_run"    # required once any diagnostic is on
+worker = Worker(..., output_root="outputs")
 worker.run(handle, args, cfg)
+print(worker.capture_output_prefix)
 ```
 
 In a `@scene_test`, per-case knobs live under `"config"`, including

@@ -45,7 +45,6 @@ from simpler.worker import (
 )
 
 from simpler_setup import SceneTestCase
-from simpler_setup.scene_test import build_output_prefix
 from tests.st.a2a3.host_build_graph.early_enqueue import test_early_enqueue as evidence
 from tests.st.a2a3.host_build_graph.worker_async_fifo.test_worker_async_fifo import (
     _SUB_ENTERED,
@@ -278,7 +277,7 @@ class AutomaticAdmissionScene(SceneTestCase):
         return value + (256.5 if self._st_runtime == "host_build_graph" else 32.0)
 
     def submit(self, worker, buffers, *, endpoint=0, spin=_SPIN, hold=False, entered=None, name="vector"):
-        config = self._build_config({}, output_prefix=self.prefix)
+        config = self._build_config({})
         handle = type(self)._st_chip_handles[name]
 
         def graph(orch, _args, _config):
@@ -498,7 +497,6 @@ class AutomaticAdmissionScene(SceneTestCase):
 
     def test_run(self, st_platform, st_worker):
         self.assert_mode(st_worker, st_platform)
-        self.prefix = str(build_output_prefix("automatic_admission"))
         try:
             self.cold(st_worker)
             self.sequential(st_worker)
@@ -512,7 +510,6 @@ class AutomaticAdmissionScene(SceneTestCase):
 class AutomaticDeviceDemandScene(AutomaticAdmissionScene):
     def test_run(self, st_platform, st_worker):
         self.assert_mode(st_worker, st_platform)
-        self.prefix = str(build_output_prefix("automatic_device_demand"))
         try:
             self.device_chain(st_worker)
             self.refill(st_worker)
@@ -523,7 +520,6 @@ class AutomaticDeviceDemandScene(AutomaticAdmissionScene):
 class AutomaticOutstandingCloseScene(AutomaticAdmissionScene):
     def test_run(self, st_platform, st_worker):
         self.assert_mode(st_worker, st_platform)
-        self.prefix = str(build_output_prefix("automatic_outstanding_close"))
         handles = []
         with contextlib.ExitStack() as readers:
             outputs = []
@@ -559,9 +555,8 @@ class AutomaticTwoEndpointScene(AutomaticAdmissionScene):
     def test_run(self, st_platform, st_worker):
         self.assert_mode(st_worker, st_platform)
         assert len(st_worker._chip_shms) == 2
-        self.prefix = str(build_output_prefix("automatic_two_endpoint_fold"))
         groups = [self.group(st_worker, value) for value in (2.0, 7.0)]
-        config = self._build_config({}, output_prefix=self.prefix)
+        config = self._build_config({})
         first = None
         thread = None
         result = {}

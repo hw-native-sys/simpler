@@ -182,11 +182,12 @@ _CALLBACK_RUN = threading.local()
 
 
 class _CallbackFrame:
-    __slots__ = ("has_submitted_task", "run_id", "worker")
+    __slots__ = ("capture_prefix", "has_submitted_task", "run_id", "worker")
 
-    def __init__(self, worker: Any, run_id: int) -> None:
+    def __init__(self, worker: Any, run_id: int, capture_prefix: str = "") -> None:
         self.worker = worker
         self.run_id = int(run_id)
+        self.capture_prefix = capture_prefix
         self.has_submitted_task = False
 
 
@@ -207,10 +208,10 @@ def _callback_frame_for(worker: Any) -> _CallbackFrame | None:
 
 
 @contextlib.contextmanager
-def _callback_run(run_id: int, worker: Any = None):
+def _callback_run(run_id: int, worker: Any = None, capture_prefix: str = ""):
     """Mark this thread as executing *worker*'s *run_id* graph callback."""
     frames = _callback_frames()
-    frames.append(_CallbackFrame(worker, run_id))
+    frames.append(_CallbackFrame(worker, run_id, capture_prefix))
     try:
         yield
     finally:
@@ -318,6 +319,8 @@ class Orchestrator:
         ``TaskArgs.add_dep_wait`` during the same orchestration run.
         """
         cfg = config if config is not None else CallConfig()
+        if self._worker is not None and _callback_frame_for(self._worker) is not None:
+            cfg = self._worker._diagnostic_config_for_next_level(cfg)
         cpp_worker_id = _require_next_level_worker_id(worker, argument="worker")
         expected_namespace = (
             None
@@ -382,6 +385,8 @@ class Orchestrator:
         Returns one opaque ``TaskHandle`` for the group DAG node.
         """
         cfg = config if config is not None else CallConfig()
+        if self._worker is not None and _callback_frame_for(self._worker) is not None:
+            cfg = self._worker._diagnostic_config_for_next_level(cfg)
         worker_ids = [_require_next_level_worker_id(value, argument="workers entries") for value in workers]
         if len(worker_ids) != len(args_list):
             raise ValueError("workers length must match args_list length")
