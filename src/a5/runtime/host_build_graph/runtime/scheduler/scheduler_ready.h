@@ -718,8 +718,12 @@ inline __aicore__ void scheduler_publish_waiter_metadata(
     scheduler_gm_store(control->next_waiter, next_waiter);
 }
 
+// The chain link is published by another core's atomic, and ld_dev does not
+// observe such a write until it has drained: reading it with ld_dev returns the
+// pre-publication -1, which reads as the end of the chain and orphans every
+// waiter behind this node. The read must therefore be an atomic too.
 inline __aicore__ int64_t scheduler_observe_next_waiter(__gm__ SchedulerTaskControl *control) {
-    return scheduler_gm_query(control->next_waiter);
+    return scheduler_gm_load(control->next_waiter);
 }
 
 inline __aicore__ SchedulerRouteResult scheduler_route_task(
@@ -791,10 +795,13 @@ inline __aicore__ SchedulerRouteResult scheduler_route_task(
     return SchedulerRouteResult::READY_TO_ENQUEUE;
 }
 
-// No task can execute while the bootstrap barrier is closed. Executable
-// producers therefore have open wake lists, and non-executable producers are
-// the inline-completed tasks initialized by the host. The barrier makes it
-// safe to publish the new head before publishing the waiter's link.
+// The bootstrap barrier is closed for the whole of every core's registration
+// pass: a core announces arrival only after its last registration, and the gate
+// opens only once every core has arrived. No resolver can detach a wake list
+// here, which is what makes publishing the new head before the waiter's link
+// safe on this path and nowhere else. A producer the host completed inline
+// carries no metadata flags at all, so the executability filter below is what
+// keeps this pass off a wake list the host already closed.
 inline __aicore__ SchedulerRouteResult scheduler_bootstrap_route_task(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerWakeStats *stats

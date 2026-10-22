@@ -739,6 +739,51 @@ TEST(SchedulerNormalDispatch, FillsItsOwnFreshAicSlot) {
     EXPECT_EQ(local->own_slots()[0].state, SchedulerDispatchSlotState::READY);
 }
 
+// A publisher sets an owner's directory bit, and only that owner clears it,
+// after observing its own inbox empty. This pins what the owner does when the
+// bit is clear while its inbox holds work -- the state a clear latched from a
+// stale read of the endpoints would leave behind.
+TEST(SchedulerNormalDispatch, FindsOwnQueuedWorkWithItsDirectoryBitClear) {
+    FixtureStorage storage(1, 3);
+    GraphBuffer graph(1);
+    graph.executable(0, 0);
+    SchedulerWorkerContext &scheduler = storage.contexts[0];
+    scheduler.core_type = static_cast<int32_t>(CoreType::AIC);
+    scheduler.is_scheduler = 1;
+    scheduler.scheduler_count = 1;
+    scheduler.scheduler_index = 0;
+    for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
+        scheduler.cluster_worker_ids[lane] = lane;
+    uint64_t *callables = storage.callable_addresses;
+    callables[1] = 0x1000;
+    auto *local = storage.local_context(&scheduler, &storage.scheduler_local_state);
+    auto *control = scheduler_task_control_at(storage.scheduler_state->base(), local, 0);
+    control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
+    SchedulerReadyBatch batch{};
+    SchedulerReadyStats ready_stats{};
+    ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), local, 0, &batch, &ready_stats));
+    ASSERT_TRUE(scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch, &ready_stats));
+
+    // The work is queued and reachable; now drop only the directory bit and
+    // the local active mask, leaving the inbox exactly as it is.
+    const uint32_t core_type = local->config.self_core_type;
+    scheduler_ready_directory_clear(
+        scheduler_ready_directory_at(storage.scheduler_state->base(), local), core_type, local->self_type_rank()
+    );
+    local->owner_ready_queue_mask = 0;
+
+    uint64_t victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{};
+    bool failed = true;
+    const bool progress = scheduler_fill_own_slots(
+        graph.graph(), storage.scheduler_state->base(), local, storage.run_control, victim_cursors, &ready_stats, 0, 0,
+        &failed, storage.ssbuf_region
+    );
+    EXPECT_FALSE(failed);
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(local->own_slots()[0].task_ref, 0);
+    EXPECT_EQ(local->own_slots()[0].state, SchedulerDispatchSlotState::READY);
+}
+
 TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
     FixtureStorage storage(2, 3);
     GraphBuffer graph(2);

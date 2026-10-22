@@ -289,8 +289,11 @@ __aicore__ bool bootstrap_ready_graph(
     );
     if (fill_failed) return false;
 
-    // This completion publication is observed by AICPU before it emits the
-    // one and only DMB release. Schedulers do not wait on another barrier.
+    // Nothing published above needs ordering against this announcement. A wake
+    // list travels by atomics on both sides: a resolver detaches it with an
+    // exchange and reads its links with an atomic load. A ready batch is found
+    // by a poll that repeats, so a queue head this core cannot see yet is read
+    // again on the next pass.
     arrived = scheduler_gm_fetch_add(run_control->bootstrap_arrived_count, UINT64_C(1)) + 1;
     if (arrived == scheduler_count) scheduler_gm_store(run_control->bootstrap_complete, UINT64_C(1));
     return true;
