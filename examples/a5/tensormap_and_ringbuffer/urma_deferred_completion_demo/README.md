@@ -1,88 +1,25 @@
-# urma_deferred_completion_demo — the same protocol, over URMA
+# A5 URMA deferred completion
 
-The a5-only twin of
-[`../sdma_async_completion_demo/`](../sdma_async_completion_demo/). Both run the
-identical two-rank protocol; they differ in which transport moves the bytes and
-which completion path reports it done.
+Each of two ranks reads the peer's Device window into `out`. A separate
+consumer depends on `out` and computes `result = out + 1`. Both outputs are
+checked against nonzero golden data. Completion is polled by the TMR scheduler;
+submission does not synchronously wait on the AIV.
 
-```text
-producer:  TGET_ASYNC the peer's input from the window into local `out`,
-           register the AsyncEvent through the deferred-completion path
-consumer:  depends on that producer output, writes result = out + 1
-```
+The suite contains four pytest items:
 
-Checking both `out` and `result` is what makes it a test of two things at once:
-`out` proves completion polling saw the transfer land, and `result` proves the
-deferred-release dependency held the consumer back until it had.
+- `TestUrmaDeferredCompletionDemo`: one read and dependent consumer per rank.
+- `TestUrmaRepeatedPosts`: four slices posted to the same peer queue.
+- `TestUrmaDomainLifecycle`: multiple domains, logical release while another
+  domain is live, and three complete runs that recreate domains on the same
+  worker. Control operations precede task submission in each run.
+- `test_urma_native_teardown`: real base and child HCCL communicators, active
+  and retired domains, and explicit `comm_destroy` success before device reset.
 
-## What actually differs from the SDMA demo
+Use the explicit URMA build and strict verification commands in
+[the A5 URMA guide](../../../../docs/a5-urma.md). The PR and Daily URMA jobs
+require all four items to execute. The default SDMA build intentionally skips
+these tests; that skip is not URMA acceptance.
 
-`kernels/aiv/kernel_consumer.cpp` is **byte-identical** between the two
-directories. Only the transfer kernel and the orchestration change:
-
-| What | URMA | SDMA |
-| ---- | ---- | ---- |
-| Transfer kernel | `kernel_urma_tget_async.cpp` | `kernel_sdma_tget_async.cpp` |
-| Completion header | `backend/urma/urma_completion_kernel.h` | `backend/sdma/sdma_completion_kernel.h` |
-| Build selection | `SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON` | default |
-
-Read them side by side and the transport is the only variable — which is
-exactly what you want when deciding which one a workload should use.
-
-## SDMA is the default; URMA is the opt-in alternative
-
-This is the part to know before trying to run either.
-
-```cmake
-option(SIMPLER_ENABLE_PTO_URMA_WORKSPACE "..." OFF)
-if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
-    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OFF)
-else()
-    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
-endif()
-```
-
-— `src/a5/platform/onboard/host/CMakeLists.txt`. **One host runtime build can
-carry one overlay, not both**, because `CommContext` has a single
-`workSpace` / `workSpaceSize` pair to hand the kernel. So the two demos cannot
-pass in the same build; comparing them means rebuilding.
-
-The kernel checks for this at run time too: `workSpace == 0` means the overlay
-was not built in.
-
-## Consequently it is doubly gated, and never runs in CI
-
-| Gate | Effect |
-| ---- | ------ |
-| `CASES[*]["platforms"] = ["a5"]` | deselected on any other `--platform` |
-| `CASES[*]["config"]["device_count"] = 2` | needs two dies |
-| `@pytest.mark.skipif(not _urma_workspace_enabled())` | skipped unless `SIMPLER_ENABLE_PTO_URMA_WORKSPACE` is one of `1` / `ON` / `TRUE` / `YES` in the environment |
-| `urma_deferred_completion_orch_fn()` raises | re-checks the env var immediately before allocating the communication domain |
-
-Since the URMA CMake option defaults `OFF`, a stock build skips this test even on a5
-hardware. **A green CI run says nothing about URMA.** Treat it as a manual
-bring-up check, not as coverage.
-
-## Run
-
-```bash
-# 1. rebuild the host runtime with the overlay on
-SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON pip install --no-build-isolation -e .
-
-# 2. run it, with the same variable visible to pytest (the skipif reads the env)
-SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON \
-  pytest examples/a5/tensormap_and_ringbuffer/urma_deferred_completion_demo \
-  --platform a5 --device 0-1
-```
-
-The variable is needed twice for different reasons: `runtime_builder.py`
-forwards it to CMake so the overlay is compiled in, and the test reads it from
-the environment to decide whether to skip. Setting only one of the two gives
-you either a skipped test or a `workSpace == 0` failure.
-
-Wrap the hardware run in `task-submit` on a shared box.
-
-## See also
-
-[`../sdma_async_completion_demo/`](../sdma_async_completion_demo/) — the
-default SDMA variant of the same protocol.
+The consumer kernel is shared in behavior with
+[the SDMA demo](../sdma_async_completion_demo/). The runtime build selects one
+workspace overlay, so comparing transports requires rebuilding.

@@ -9,8 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_KERNEL_H_
-#define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_KERNEL_H_
+#pragma once
 
 #include <stdint.h>
 
@@ -24,6 +23,7 @@
 #include <pto/comm/async_common/async_event_impl.hpp>
 #if defined(PTO_URMA_SUPPORTED)
 #include <pto/comm/async/urma/urma_async_intrin.hpp>
+#include "common/urma_workspace_contract.h"
 #endif
 #endif
 
@@ -92,6 +92,8 @@ UrmaTput(const DstTensor &dst, const SrcTensor &src, __gm__ uint8_t *workspace, 
 }
 
 namespace pto2::detail {
+
+inline __aicore__ void defer_error(AsyncCtx &ctx, int32_t error_code);
 
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
 inline __aicore__ bool register_urma_async_event(
@@ -180,6 +182,32 @@ inline __aicore__ TensorT make_tensor_slice(TensorT &tensor, uint64_t elem_offse
 template <typename DstTensor, typename SrcTensor>
 inline __aicore__ bool submit_urma_request_once(AsyncCtx &ctx, UrmaRequestDescriptor<DstTensor, SrcTensor> desc) {
 #if defined(PTO_URMA_SUPPORTED)
+    if (!ctx.task_token.is_valid() || !ctx.completion_count || !ctx.completion_entries ||
+        *ctx.completion_count >= ctx.completion_capacity || !desc.workspace) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+        return false;
+    }
+    auto *info = reinterpret_cast<__gm__ pto::comm::urma::UrmaInfo *>(desc.workspace);
+    if (info->layout != pto::comm::urma::UrmaLayout::PER_PEER || info->rowsPerPeer != 1 || info->jettiesPerCore != 1 ||
+        info->jettyCount != info->rankCount || desc.remote_rank >= info->rankCount || !info->sqPtr || !info->scqPtr) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
+    auto *wq = reinterpret_cast<__gm__ pto::comm::urma::UrmaWQCtx *>(info->sqPtr) + desc.remote_rank;
+    auto *cq = reinterpret_cast<__gm__ pto::comm::urma::UrmaCqCtx *>(info->scqPtr) + desc.remote_rank;
+    if (!wq->bufAddr || !wq->dbAddr || !wq->headAddr || !wq->tailAddr || !cq->tailAddr || !cq->bufAddr || !cq->dbAddr ||
+        cq->cqeShiftSize != 6 || wq->wqeShiftSize != 6 || !wq->depth || !cq->depth || wq->depth >= (1u << 31) ||
+        cq->depth >= (1u << 31) || (wq->depth & (wq->depth - 1)) || (cq->depth & (cq->depth - 1))) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
+    // The scheduler is the only CQ consumer; PTO's full-ring synchronous drain
+    // is unreachable for accepted submissions.
+    const uint32_t head = ld_dev(reinterpret_cast<__gm__ uint32_t *>(wq->headAddr), 0);
+    if (!pto::comm::urma::detail::UrmaRingHasRoom(wq, cq, head, wq->submittedWqeCount, 1, 1)) {
+        pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        return false;
+    }
     pto::comm::AsyncSession session;
     if (!pto::comm::BuildAsyncSession<pto::comm::DmaEngine::URMA>(desc.workspace, desc.remote_rank, session)) {
         pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
@@ -219,6 +247,7 @@ inline __aicore__ bool submit_chunked_urma_request(AsyncCtx &ctx, UrmaRequestDes
         pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return false;
     }
+    if (elem_count == 0) return true;
     const uint64_t total_bytes = elem_count * sizeof(RawDType);
     const uint64_t max_bytes = kUrmaMaxTransferBytes;
     if (total_bytes <= max_bytes) {
@@ -304,31 +333,23 @@ template <typename PtoAsyncEvent, typename PtoAsyncSession>
 inline __aicore__ bool register_urma_async_event(
     AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session, __gm__ uint8_t *workspace
 ) {
-    if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
-        (void)event.Wait(session);
-        return true;
-    }
-    if (event.handle == 0) {
-        return true;
-    }
-
-    const uint32_t engine = static_cast<uint32_t>(event.engine);
-    if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::URMA) || workspace == nullptr) {
+    if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr ||
+        workspace == nullptr || session.qpIdxBase != 0 || session.qpCount != 1 ||
+        static_cast<uint32_t>(event.engine) != static_cast<uint32_t>(::pto::comm::DmaEngine::URMA) ||
+        event.urmaJettyBase != 0 || event.urmaJettyCount != 1 ||
+        static_cast<uint32_t>(event.handle) != event.urmaTargetBbPerJetty[0]) {
         defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
-        (void)event.Wait(session);
         return false;
     }
-
     CompletionToken token{
         event.handle,
-        0,
+        event.urmaTargetCqePerJetty[0],
         COMPLETION_ENGINE_URMA,
         COMPLETION_TYPE_URMA_EVENT_HANDLE,
         reinterpret_cast<uint64_t>(workspace),
     };
     if (!register_completion_condition(ctx, token)) {
         defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
-        (void)event.Wait(session);
         return false;
     }
     return true;
@@ -338,7 +359,7 @@ inline __aicore__ bool register_urma_async_event(
 
 template <typename DstTensor, typename SrcTensor>
 inline __aicore__ bool send_request_entry(AsyncCtx &ctx, UrmaRequestDescriptor<DstTensor, SrcTensor> desc) {
-    return pto2::urma_backend::submit_chunked_urma_request(ctx, desc);
+    const bool submitted = pto2::urma_backend::submit_chunked_urma_request(ctx, desc);
+    if (!submitted) pto2::detail::defer_flush(ctx);
+    return submitted;
 }
-
-#endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_BACKEND_URMA_URMA_COMPLETION_KERNEL_H_

@@ -31,6 +31,8 @@ jobs:
     runs-on: ${{ fromJSON(inputs.runs_on) }}
     timeout-minutes: 60
     env:
+      SIMPLER_ENABLE_PTO_URMA_WORKSPACE: "OFF"
+      SIMPLER_ENABLE_PTO_RDMA_WORKSPACE: "OFF"
       MANUAL_MODE: ${{ inputs.manual_mode }}
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"

@@ -29,6 +29,7 @@
 #include "host/file_marker_handshake.h"
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <climits>
@@ -55,6 +56,9 @@
 #endif
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
 #include "pto/comm/async/urma/urma_workspace_manager.hpp"
+#include "common/urma_workspace_contract.h"
+#include "host/urma_lifetime.h"
+#include "common/platform_config.h"
 #endif
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
 #ifndef __gm__
@@ -72,6 +76,18 @@ static inline HcclResult hccl_comm_init_root_info(uint32_t n, const HcclRootInfo
 static inline HcclResult hccl_barrier(HcclComm c, aclrtStream s) { return HcclBarrier(c, s); }
 static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(c); }
 
+extern "C" const char *comm_async_workspace_backend() {
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    return "URMA";
+#elif defined(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
+    return "RDMA";
+#else
+    return "SDMA";
+#endif
+}
+
+extern "C" const char *comm_pto_isa_build_commit() { return SIMPLER_PTO_ISA_BUILD_COMMIT; }
+
 // ============================================================================
 // Internal state
 // ============================================================================
@@ -79,7 +95,8 @@ static inline HcclResult hccl_comm_destroy(HcclComm c) { return HcclCommDestroy(
 // Per-domain dynamic allocation.  One of these per orch.allocate_domain call.
 // Tracks the local VMM window (mapped VA + its physical handle + the
 // granularity-aligned byte size) and every peer VMM import (mapped VA +
-// imported physical handle), all torn down in comm_release_domain_windows,
+// imported physical handle). URMA retains these until communicator teardown;
+// other backends reclaim them in comm_release_domain_windows,
 // plus the device CommContext we materialise for the subset.  Only the
 // EnablePeerAccess routes are left to aclrtResetDevice at finalize: they are
 // process-global and per device-pair, so releasing them per allocation would
@@ -91,9 +108,12 @@ struct DomainAllocation {
     aclrtDrvMemHandle own_handle = nullptr;  // physical handle backing local_buf
     // Per-peer imports: (mapped VA, imported physical handle).  allocate_domain
     // can cycle repeatedly within one comm handle before any device reset, so
-    // these are released explicitly at domain teardown rather than left to reset.
+    // these are explicitly released once the backend no longer references them.
     std::vector<std::pair<void *, aclrtDrvMemHandle>> peer_windows;
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    uint64_t allocation_id = 0;
+    HcclComm urma_comm = nullptr;
+    bool urma_ready = false;
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> urma_workspace;
 #endif
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
@@ -103,6 +123,7 @@ struct DomainAllocation {
 };
 
 struct CommHandle_ {
+    bool closing = false;
     int rank;
     int nranks;
     std::string rootinfo_path;
@@ -121,6 +142,10 @@ struct CommHandle_ {
     std::unique_ptr<pto::comm::sdma::SdmaWorkspaceManager> sdma_workspace;
 #endif
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    CommHandle_ *quarantine_next = nullptr;
+    bool urma_ready = false;
+    DomainAllocation base_windows;
+    std::vector<std::unique_ptr<DomainAllocation>> retired_domains;
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> urma_workspace;
 #endif
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
@@ -694,8 +719,15 @@ static int alloc_windows_via_ipc(CommHandle h, uint64_t win_size) {
             return -1;
         }
         h->host_ctx.windowsIn[p] = reinterpret_cast<uint64_t>(peerVa);
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+        h->base_windows.peer_windows.emplace_back(peerVa, peerHandle);
+#endif
     }
 
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    h->base_windows.local_buf = localBuf;
+    h->base_windows.own_handle = handle;
+#endif
     return 0;
 }
 
@@ -847,37 +879,39 @@ static bool rank_ids_are_dense_prefix(const uint32_t *rank_ids, size_t rank_coun
 
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
 static bool init_urma_workspace(
-    CommHandle h, uint32_t rank_id, uint32_t rank_count, void *symmetric_addr, uint64_t symmetric_size,
+    CommHandle h, HcclComm comm, uint32_t rank_id, uint32_t rank_count, void *symmetric_addr, uint64_t symmetric_size,
     std::unique_ptr<pto::comm::urma::UrmaWorkspaceManager> &workspace
 ) {
-    if (workspace) return workspace->GetWorkspaceAddr() != nullptr;
+    if (workspace) return false;
     if (h == nullptr || h->hccl_comm == nullptr || symmetric_addr == nullptr || symmetric_size == 0 ||
         rank_id >= rank_count) {
         return false;
     }
 
-    auto manager = std::make_unique<pto::comm::urma::UrmaWorkspaceManager>();
-    if (!manager->Init(h->hccl_comm, rank_id, rank_count, symmetric_addr, symmetric_size)) {
+    workspace = std::make_unique<pto::comm::urma::UrmaWorkspaceManager>();
+    if (!workspace->Init(
+            comm, rank_id, rank_count, symmetric_addr, symmetric_size, pto::comm::urma::UrmaLayout::PER_PEER
+        )) {
         LOG_WARN(
             "[comm rank %d] URMA workspace init failed (rank_id=%u rank_count=%u size=%llu)", h->rank, rank_id,
             rank_count, static_cast<unsigned long long>(symmetric_size)
         );
         return false;
     }
-    workspace = std::move(manager);
     return true;
 }
 
 static bool ensure_base_urma_workspace(CommHandle h) {
     if (h == nullptr) return false;
-    if (h->urma_workspace) return h->host_ctx.workSpace != 0 && h->host_ctx.workSpaceSize != 0;
+    if (h->urma_workspace) return h->urma_ready;
     void *local_buf = reinterpret_cast<void *>(static_cast<uintptr_t>(h->host_ctx.windowsIn[h->rank]));
     if (!init_urma_workspace(
-            h, static_cast<uint32_t>(h->rank), static_cast<uint32_t>(h->nranks), local_buf, h->host_ctx.winSize,
-            h->urma_workspace
+            h, h->hccl_comm, static_cast<uint32_t>(h->rank), static_cast<uint32_t>(h->nranks), local_buf,
+            h->host_ctx.winSize, h->urma_workspace
         )) {
         return false;
     }
+    h->urma_ready = true;
     h->host_ctx.workSpace = reinterpret_cast<uint64_t>(h->urma_workspace->GetWorkspaceAddr());
     h->host_ctx.workSpaceSize = urma_workspace_bytes(static_cast<uint32_t>(h->nranks));
     return h->host_ctx.workSpace != 0 && h->host_ctx.workSpaceSize != 0;
@@ -1583,29 +1617,30 @@ static int domain_alloc_via_ipc(
     }
 #endif
 #ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
-    if (rank_ids_are_dense_prefix(rank_ids, rank_count)) {
-        if (!init_urma_workspace(
-                h, domain_rank, static_cast<uint32_t>(rank_count), localBuf, aligned_size, out->urma_workspace
-            )) {
-            reset_domain_urma_workspace(*out);
-            release_domain_peer_windows(*out);
-            release_domain_window_raw(localBuf, handle);
-            return -1;
-        }
-        domain_workspace_addr = reinterpret_cast<uint64_t>(out->urma_workspace->GetWorkspaceAddr());
-        domain_workspace_size = urma_workspace_bytes(static_cast<uint32_t>(rank_count));
-    } else {
-        LOG_WARN("[comm rank %d] alloc_domain: URMA workspace disabled for non-dense rank mapping", h->rank);
+    std::vector<uint32_t> members(rank_ids, rank_ids + rank_count);
+    HcclCommConfig comm_config;
+    HcclCommConfigInit(&comm_config);
+    if (HcclCreateSubCommConfig == nullptr || HcclCreateSubCommConfig(
+                                                  &h->hccl_comm, static_cast<uint32_t>(rank_count), members.data(),
+                                                  allocation_id, domain_rank, &comm_config, &out->urma_comm
+                                              ) != HCCL_SUCCESS) {
+        LOG_ERROR("[comm rank %d] URMA domain subcommunicator creation failed", h->rank);
+        return -1;
     }
+    if (!init_urma_workspace(
+            h, out->urma_comm, domain_rank, static_cast<uint32_t>(rank_count), localBuf, aligned_size,
+            out->urma_workspace
+        ))
+        return -1;
+    out->urma_ready = true;
+    domain_workspace_addr = reinterpret_cast<uint64_t>(out->urma_workspace->GetWorkspaceAddr());
+    domain_workspace_size = urma_workspace_bytes(static_cast<uint32_t>(rank_count));
 #endif
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
     if (!init_rdma_workspace(
             h, domain_rank, static_cast<uint32_t>(rank_count), rdma_bootstrap, peers, localBuf, aligned_size,
             out->rdma_workspace
         )) {
-        reset_domain_urma_workspace(*out);
-        release_domain_peer_windows(*out);
-        release_domain_window_raw(localBuf, handle);
         return -1;
     }
     domain_workspace_addr = reinterpret_cast<uint64_t>(out->rdma_workspace->GetWorkspaceAddr());
@@ -1635,9 +1670,6 @@ static int domain_alloc_via_ipc(
                 "[comm rank %d] alloc_domain: ImportFromShareableHandle(peer_dr=%d) -> %d", h->rank, p,
                 static_cast<int>(aret)
             );
-            reset_domain_urma_workspace(*out);
-            release_domain_peer_windows(*out);
-            release_domain_window_raw(localBuf, handle);
             return -1;
         }
         void *peerVa = nullptr;
@@ -1648,9 +1680,6 @@ static int domain_alloc_via_ipc(
                 static_cast<int>(aret)
             );
             aclrtFreePhysical(peerHandle);
-            reset_domain_urma_workspace(*out);
-            release_domain_peer_windows(*out);
-            release_domain_window_raw(localBuf, handle);
             return -1;
         }
         aret = aclrtMapMem(peerVa, aligned_size, 0, peerHandle, 0);
@@ -1658,9 +1687,6 @@ static int domain_alloc_via_ipc(
             LOG_ERROR("[comm rank %d] alloc_domain: peer MapMem(peer_dr=%d) -> %d", h->rank, p, static_cast<int>(aret));
             aclrtReleaseMemAddress(peerVa);
             aclrtFreePhysical(peerHandle);
-            reset_domain_urma_workspace(*out);
-            release_domain_peer_windows(*out);
-            release_domain_window_raw(localBuf, handle);
             return -1;
         }
         aret = aclrtMemSetAccess(peerVa, aligned_size, &accessDesc, 1);
@@ -1671,9 +1697,6 @@ static int domain_alloc_via_ipc(
             aclrtUnmapMem(peerVa);
             aclrtReleaseMemAddress(peerVa);
             aclrtFreePhysical(peerHandle);
-            reset_domain_urma_workspace(*out);
-            release_domain_peer_windows(*out);
-            release_domain_window_raw(localBuf, handle);
             return -1;
         }
         out->peer_windows.emplace_back(peerVa, peerHandle);
@@ -1685,18 +1708,12 @@ static int domain_alloc_via_ipc(
     aret = aclrtMalloc(&newDevMem, sizeof(CommContext), ACL_MEM_MALLOC_HUGE_FIRST);
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: ctx aclrtMalloc -> %d", h->rank, static_cast<int>(aret));
-        reset_domain_urma_workspace(*out);
-        release_domain_peer_windows(*out);
-        release_domain_window_raw(localBuf, handle);
         return -1;
     }
     aret = aclrtMemcpy(newDevMem, sizeof(CommContext), &ctx, sizeof(CommContext), ACL_MEMCPY_HOST_TO_DEVICE);
     if (aret != ACL_SUCCESS) {
         LOG_ERROR("[comm rank %d] alloc_domain: ctx Memcpy H2D -> %d", h->rank, static_cast<int>(aret));
         aclrtFree(newDevMem);
-        reset_domain_urma_workspace(*out);
-        release_domain_peer_windows(*out);
-        release_domain_window_raw(localBuf, handle);
         return -1;
     }
     out->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
@@ -1706,13 +1723,16 @@ static int domain_alloc_via_ipc(
 }  // namespace
 
 extern "C" int comm_alloc_windows(CommHandle h, size_t win_size, uint64_t *device_ctx_out) try {
-    if (!h || !device_ctx_out) return -1;
+    if (!h || h->closing || !device_ctx_out) return -1;
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    if (h->nranks < 2) return -1;
+#endif
 
     // Idempotency guard: comm_alloc_windows is not re-entrant. The localBuf
-    // allocated by alloc_windows_via_ipc is owned by the handle's windowsIn[]
-    // entries and is only reclaimed at aclrtResetDevice; calling this twice
-    // would leak a full per-rank pool. device_ctx is set on first success.
-    if (h->device_ctx != nullptr) {
+    // allocated by alloc_windows_via_ipc belongs to this handle. Once allocation
+    // has begun, a second attempt must not replace retained resources, including
+    // a partially initialized URMA manager. device_ctx is set on first success.
+    if (h->device_ctx != nullptr || h->host_ctx.winSize != 0) {
         LOG_ERROR("[comm rank %d] comm_alloc_windows: already allocated on this handle", h->rank);
         return -1;
     }
@@ -1769,7 +1789,16 @@ extern "C" int comm_derive_context(
     CommHandle h, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank, size_t window_offset,
     size_t window_size, uint64_t *device_ctx_out
 ) try {
-    if (!h || !rank_ids || !device_ctx_out) return -1;
+    if (!h || h->closing || !rank_ids || !device_ctx_out) return -1;
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    if (rank_count != static_cast<size_t>(h->nranks) || !rank_ids_are_dense_prefix(rank_ids, rank_count) ||
+        domain_rank != static_cast<uint32_t>(h->rank) || window_offset != 0) {
+        LOG_ERROR(
+            "[comm rank %d] URMA derived contexts require the full dense rank set and zero window offset", h->rank
+        );
+        return -1;
+    }
+#endif
     if (h->host_ctx.rankNum == 0) {
         LOG_ERROR("[comm rank %d] comm_derive_context: base windows are not allocated", h->rank);
         return -1;
@@ -1853,7 +1882,7 @@ extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
     size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
 ) try {
-    if (!h || !rank_ids || !device_ctx_out || !local_window_base_out) return -1;
+    if (!h || h->closing || !rank_ids || !device_ctx_out || !local_window_base_out) return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         LOG_ERROR(
             "[comm rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)", h->rank,
@@ -1884,13 +1913,37 @@ extern "C" int comm_alloc_domain_windows(
         return -1;
     }
 
-    auto alloc = std::make_unique<DomainAllocation>();
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    for (const auto &retired : h->retired_domains) {
+        if (retired->allocation_id == allocation_id) {
+            LOG_ERROR("[comm rank %d] URMA allocation_id remains retained until communicator destruction", h->rank);
+            return -1;
+        }
+    }
+    if (!rank_ids_are_dense_prefix(rank_ids, rank_count) || rank_count < 2) {
+        LOG_ERROR("[comm rank %d] URMA domains require a dense rank prefix with at least two ranks", h->rank);
+        return -1;
+    }
+#endif
+    auto inserted = h->domain_allocations.emplace(allocation_id, std::make_unique<DomainAllocation>());
+    auto &alloc = inserted.first->second;
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    alloc->allocation_id = allocation_id;
+#endif
     int rc = domain_alloc_via_ipc(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, alloc.get());
-    if (rc != 0) return rc;
-
+    if (rc != 0) {
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+        h->retired_domains.push_back(std::move(alloc));
+#else
+        reset_domain_urma_workspace(*alloc);
+        release_domain_peer_windows(*alloc);
+        release_domain_local_buffer(*alloc);
+#endif
+        h->domain_allocations.erase(inserted.first);
+        return rc;
+    }
     *device_ctx_out = reinterpret_cast<uint64_t>(alloc->device_ctx);
     *local_window_base_out = reinterpret_cast<uint64_t>(alloc->local_buf);
-    h->domain_allocations.emplace(allocation_id, std::move(alloc));
     return 0;
 } catch (const std::exception &e) {
     LOG_ERROR("[comm] alloc_domain: exception: %s", e.what());
@@ -1902,7 +1955,7 @@ extern "C" int comm_alloc_domain_windows(
 
 extern "C" int
 comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) try {
-    if (!h) return -1;
+    if (!h || h->closing) return -1;
     auto it = h->domain_allocations.find(allocation_id);
     if (it == h->domain_allocations.end()) {
         LOG_ERROR(
@@ -1921,17 +1974,21 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         return -1;
     }
     int rc = 0;
-    // Best-effort subset barrier so peers don't free local memory under each
-    // other.  If a peer crashed mid-allocation, the timeout returns false and
-    // we proceed with local teardown anyway — same shape as comm_destroy.
+    // Synchronize logical release across the subset. URMA retains registrations
+    // and backing memory even on timeout; physical teardown belongs to comm_destroy.
     if (!file_barrier(
             h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count),
             domain_barrier_tag(allocation_id, "release"), h->run_token
         )) {
-        LOG_WARN("[comm rank %d] release_domain: barrier timed out; releasing local state anyway", h->rank);
+        LOG_WARN("[comm rank %d] release_domain: barrier timed out", h->rank);
         rc = -1;
     }
 
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    h->retired_domains.push_back(std::move(alloc));
+    h->domain_allocations.erase(it);
+    return rc;
+#endif
     if (alloc->device_ctx) {
         aclError aret = aclrtFree(alloc->device_ctx);
         if (aret != ACL_SUCCESS && rc == 0) rc = -1;
@@ -1972,21 +2029,106 @@ extern "C" int comm_global_domain_release(uint64_t) {
     return -1;
 }
 
-extern "C" int comm_destroy(CommHandle h) try {
-    if (!h) return -1;
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+namespace {
+// Failed teardown remains owned for the lifetime of this process. Device reset
+// or process termination, not C++ static destruction, is its reclamation boundary.
+static void quarantine_urma_handle(CommHandle h) {
+    static std::atomic<CommHandle> quarantine{nullptr};
+    h->quarantine_next = quarantine.load(std::memory_order_relaxed);
+    while (
+        !quarantine.compare_exchange_weak(h->quarantine_next, h, std::memory_order_release, std::memory_order_relaxed)
+    ) {}
+}
 
-    // Final barrier is best-effort: if a peer already crashed we still need to
-    // release the local resources we own, so timeout just logs and proceeds.
+static bool
+urma_workspace_drained(const pto::comm::urma::UrmaWorkspaceManager *workspace, bool ready, uint32_t nranks) {
+    if (!ready) return true;  // Init has not exposed this workspace to kernels.
+    return workspace &&
+           urma_lifetime::queues_drained(
+               reinterpret_cast<uint64_t>(workspace->GetWorkspaceAddr()),
+               [](void *dst, uint64_t src, size_t size) {
+                   return aclrtMemcpy(dst, size, reinterpret_cast<void *>(src), size, ACL_MEMCPY_DEVICE_TO_HOST) ==
+                          ACL_SUCCESS;
+               },
+               nranks
+           );
+}
+
+static bool close_urma_communications(CommHandle h) {
+    auto visit_domains = [h](auto operation) {
+        for (auto &entry : h->domain_allocations)
+            if (!operation(*entry.second)) return false;
+        for (auto &entry : h->retired_domains)
+            if (!operation(*entry)) return false;
+        return true;
+    };
+    return urma_lifetime::shutdown(
+        [] {
+            return aclrtSynchronizeDeviceWithTimeout(PLATFORM_STREAM_SYNC_TIMEOUT_MS) == ACL_SUCCESS;
+        },
+        [&] {
+            return urma_workspace_drained(h->urma_workspace.get(), h->urma_ready, h->nranks) &&
+                   visit_domains([](DomainAllocation &alloc) {
+                       return urma_workspace_drained(alloc.urma_workspace.get(), alloc.urma_ready, alloc.nranks);
+                   });
+        },
+        [&] {
+            if (!visit_domains([](DomainAllocation &alloc) {
+                    if (!alloc.urma_comm) return true;
+                    if (hccl_comm_destroy(alloc.urma_comm) != HCCL_SUCCESS) return false;
+                    alloc.urma_comm = nullptr;
+                    return true;
+                }))
+                return false;
+            if (h->hccl_comm && hccl_comm_destroy(h->hccl_comm) != HCCL_SUCCESS) return false;
+            h->hccl_comm = nullptr;
+            return true;
+        },
+        [&] {
+            visit_domains([](DomainAllocation &alloc) {
+                alloc.urma_workspace.reset();
+                return true;
+            });
+            h->urma_workspace.reset();
+        }
+    );
+}
+}  // namespace
+#endif
+
+extern "C" int comm_destroy(CommHandle h) try {
+    if (!h || h->closing) return -1;
+    h->closing = true;
+
+    // URMA requires this peer handshake before physical teardown. A timeout
+    // leaves ownership quarantined; the default backend keeps best-effort cleanup.
     int rc = 0;
     const auto destroy_handshake =
         file_marker_handshake::destroy_barrier(h->rootinfo_path, h->rank, h->nranks, h->run_token);
     if (!destroy_handshake.ok()) {
         LOG_WARN(
-            "[comm rank %d] comm_destroy: final barrier failed during %s for rank %d; releasing local state anyway",
-            h->rank, file_marker_handshake::stage_name(destroy_handshake.stage), destroy_handshake.rank
+            "[comm rank %d] comm_destroy: final barrier failed during %s for rank %d", h->rank,
+            file_marker_handshake::stage_name(destroy_handshake.stage), destroy_handshake.rank
         );
         rc = -1;
     }
+
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    if (!destroy_handshake.ok() || !close_urma_communications(h)) {
+        LOG_ERROR("[comm rank %d] URMA teardown lacks stop/drain/destroy proof; quarantining resources", h->rank);
+        quarantine_urma_handle(h);
+        return -1;
+    }
+    for (auto &alloc : h->retired_domains) {
+        if (alloc->device_ctx) aclrtFree(alloc->device_ctx);
+        release_domain_peer_windows(*alloc);
+        release_domain_local_buffer(*alloc);
+    }
+    h->retired_domains.clear();
+    release_domain_peer_windows(h->base_windows);
+    release_domain_local_buffer(h->base_windows);
+#endif
 
     if (h->owns_device_ctx && h->device_ctx) {
         aclrtFree(h->device_ctx);
@@ -2045,10 +2187,18 @@ extern "C" int comm_destroy(CommHandle h) try {
     return rc;
 } catch (const std::exception &e) {
     LOG_ERROR("[comm] comm_destroy: exception: %s", e.what());
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    if (h) quarantine_urma_handle(h);
+#else
     if (h) delete h;
+#endif
     return -1;
 } catch (...) {
     LOG_ERROR("[comm] comm_destroy: unknown exception");
+#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE
+    if (h) quarantine_urma_handle(h);
+#else
     if (h) delete h;
+#endif
     return -1;
 }

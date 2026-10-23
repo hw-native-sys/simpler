@@ -31,8 +31,6 @@
 #include "platform_comm/comm_context.h"
 #include "tensor.h"
 
-using namespace pto;
-
 namespace {
 
 constexpr int kElems = 128 * 128;
@@ -49,11 +47,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ CommContext *comm_ctx = reinterpret_cast<__gm__ CommContext *>(args[2]);
 
-    // A null workspace means the host runtime was not built with the URMA
-    // backend; self-skip rather than dereferencing it.
+    AsyncCtx async_ctx = get_async_ctx(args);
     if (comm_ctx == nullptr || comm_ctx->rankNum != 2 || comm_ctx->rankId >= comm_ctx->rankNum ||
         comm_ctx->workSpace == 0 || comm_ctx->windowsIn[comm_ctx->rankId] == 0) {
-        pipe_barrier(PIPE_ALL);
+        pto2::detail::defer_error(async_ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_flush(async_ctx);
         return;
     }
 
@@ -65,16 +63,29 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace), peer_rank, input_offset
     );
 
-    using FlatShape = Shape<1, 1, 1, 1, kElems>;
-    using FlatStride = pto::Stride<kElems, kElems, kElems, kElems, 1>;
-    using GlobalData = GlobalTensor<float, FlatShape, FlatStride>;
-
-    GlobalData remote_global(remote_input);
-    GlobalData local_global(local_out);
-
-    AsyncCtx async_ctx = get_async_ctx(args);
-    (void)send_request_entry(
-        async_ctx,
-        UrmaTget(local_global, remote_global, reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace), peer_rank)
-    );
+    const uint64_t chunks = static_cast<uint64_t>(args[3]);
+    if (chunks != 1 && chunks != 4) {
+        pto2::detail::defer_error(async_ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+        pto2::detail::defer_flush(async_ctx);
+        return;
+    }
+    const int64_t elems = kElems / chunks;
+    using FlatShape = pto::Shape<1, 1, 1, 1, pto::DYNAMIC>;
+    using FlatStride = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, 1>;
+    using GlobalData = pto::GlobalTensor<float, FlatShape, FlatStride>;
+    for (uint64_t chunk = 0; chunk < chunks; ++chunk) {
+        GlobalData remote_global(
+            remote_input + chunk * elems, FlatShape(1, 1, 1, 1, elems), FlatStride(elems, elems, elems, elems, 1)
+        );
+        GlobalData local_global(
+            local_out + chunk * elems, FlatShape(1, 1, 1, 1, elems), FlatStride(elems, elems, elems, elems, 1)
+        );
+        if (!send_request_entry(
+                async_ctx,
+                UrmaTget(
+                    local_global, remote_global, reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace), peer_rank
+                )
+            ))
+            break;
+    }
 }

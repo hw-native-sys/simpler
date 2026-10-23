@@ -1,0 +1,65 @@
+name: A5 URMA baseline
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        required: true
+        type: string
+
+jobs:
+  run:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    env:
+      SIMPLER_ENABLE_PTO_URMA_WORKSPACE: "ON"
+      SIMPLER_ENABLE_PTO_RDMA_WORKSPACE: "OFF"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Check A5 silicon
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          .claude/skills/onboard-arch-precheck/check.sh a5
+      - name: Build URMA runtime
+        uses: ./.github/actions/setup-venv
+        with:
+          build-packages: "scikit-build-core nanobind<3 cmake>=3.20"
+          packages: "--no-build-isolation --config-settings=build.targets=build_package_a5 .[test]"
+          install-torch: "false"
+          system-site-packages: "true"
+          source-cann: "true"
+      - name: Record versions and compile kernels
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          mkdir -p outputs/urma/ascend
+          git rev-parse HEAD > outputs/urma/versions.txt
+          cat pto_isa.pin >> outputs/urma/versions.txt
+          npu-smi info >> outputs/urma/versions.txt || task-submit --run "npu-smi info" >> outputs/urma/versions.txt
+          .venv/bin/python -m simpler_setup.tools.scene_test_compile \
+            examples/a5/tensormap_and_ringbuffer/urma_deferred_completion_demo \
+            --platform a5 --require-pto-isa --compile-workers 4 -v 2>&1 | tee outputs/urma/compile.log
+      - name: Run mandatory two-rank URMA cases
+        run: |
+          source /usr/local/Ascend/cann/set_env.sh
+          export ASCEND_PROCESS_LOG_PATH="$PWD/outputs/urma/ascend"
+          .claude/skills/onboard-arch-precheck/check.sh a5
+          task-submit --timeout 1800 --max-time 1800 --device auto --device-num 2 \
+            --run ".venv/bin/python -m simpler_setup.tools.urma_verify --device \$TASK_DEVICE --report outputs/urma/verification.json" 2>&1 | tee outputs/urma/device.log
+      - name: Save evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: urma-a5-${{ runner.arch }}-${{ github.run_id }}
+          path: |
+            outputs/urma/
+            build/cache/a5/onboard/*/host/CMakeCache.txt
+            build/cache/a5/onboard/*/host/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: error

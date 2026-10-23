@@ -65,3 +65,8 @@ jobs:
       # relabelled. A job matches every label in this list, so it cannot accept
       # either spelling.
       runs_on: '["self-hosted","Linux","ARM64","a2a3pod"]'
+
+  st-urma-a5:
+    uses: ./.github/workflows/_st-urma-a5.yml
+    with:
+      runs_on: '["self-hosted","a5"]'

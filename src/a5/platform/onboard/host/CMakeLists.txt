@@ -206,10 +206,8 @@ endif()
 # (#1351).
 set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING
     "PTO-ISA commit used for host_runtime cache key")
-if(NOT "${SIMPLER_PTO_ISA_BUILD_COMMIT}" STREQUAL "")
-    target_compile_definitions(host_runtime PRIVATE
-        SIMPLER_PTO_ISA_BUILD_COMMIT="${SIMPLER_PTO_ISA_BUILD_COMMIT}")
-endif()
+target_compile_definitions(host_runtime PRIVATE
+    SIMPLER_PTO_ISA_BUILD_COMMIT="${SIMPLER_PTO_ISA_BUILD_COMMIT}")
 
 # Include directories - always include local headers
 target_include_directories(host_runtime

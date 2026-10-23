@@ -85,7 +85,7 @@ inline void sdma_event_record_retire_op(CompletionCondition &cond) {
 }
 
 inline CompletionPollResult urma_event_handle_poll_op(const CompletionCondition &cond) {
-    return pto2::urma_backend::poll_urma_event_handle(cond.addr, cond.backend_cookie);
+    return pto2::urma_backend::poll_urma_event_handle(cond.addr, cond.backend_cookie, cond.expected_value);
 }
 
 inline void urma_event_handle_retire_op(CompletionCondition &cond) {

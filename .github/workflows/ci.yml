@@ -154,3 +154,10 @@ jobs:
     with:
       runs_on: '["self-hosted","a5"]'
       include_dfx_smokes: true
+
+  st-urma-a5:
+    needs: [detect-changes, pre-commit]
+    if: needs.detect-changes.outputs.a5_changed == 'true' && needs.detect-changes.outputs.st_affected == 'true'
+    uses: ./.github/workflows/_st-urma-a5.yml
+    with:
+      runs_on: '["self-hosted","a5"]'

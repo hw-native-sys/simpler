@@ -151,8 +151,9 @@ jobs:
           # ONE definition of "changing this cannot change what the code does".
           # Every gate below derives from this set. CI implementation workflows
           # are deliberately absent: a change to gates or job bodies must run
-          # everything.
-          NON_CODE='^(docs/|\.docs/|\.claude/|mkdocs\.yml$|\.github/workflows/docs\.yml$|\.gitignore$|\.pre-commit-config\.yaml$)|\.md$'
+          # everything. Skill Markdown is non-code; executable skill helpers
+          # such as the onboard architecture check are CI dependencies.
+          NON_CODE='^(docs/|\.docs/|mkdocs\.yml$|\.github/workflows/docs\.yml$|\.gitignore$|\.pre-commit-config\.yaml$)|\.md$'
 
           CODE=$(echo "$FILES" | grep -vE "$NON_CODE" || true)
           if [ -z "$CODE" ]; then

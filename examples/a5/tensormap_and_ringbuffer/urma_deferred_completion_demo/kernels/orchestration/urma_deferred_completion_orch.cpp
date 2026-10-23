@@ -19,7 +19,7 @@ extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig
 urma_deferred_completion_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
-    return OrchestrationConfig{.expected_arg_count = 4};
+    return OrchestrationConfig{.expected_arg_count = 5};
 }
 
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
@@ -27,8 +27,8 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 }
 
 __attribute__((visibility("default"))) void urma_deferred_completion_orchestration(const ChipTaskArgs &orch_args) {
-    if (orch_args.tensor_count() != 3 || orch_args.scalar_count() != 1) {
-        LOG_ERROR("urma_deferred_completion_demo: expected 3 tensors and 1 scalar");
+    if (orch_args.tensor_count() != 3 || orch_args.scalar_count() != 2) {
+        LOG_ERROR("urma_deferred_completion_demo: expected 3 tensors and 2 scalars");
         return;
     }
 
@@ -41,6 +41,7 @@ __attribute__((visibility("default"))) void urma_deferred_completion_orchestrati
     producer_args.add_input(input);
     producer_args.add_output(out);
     producer_args.add_scalar(reinterpret_cast<uint64_t>(comm_ctx));
+    producer_args.add_scalar(orch_args.scalar<uint64_t>(1));
     rt_submit_aiv_task(0, producer_args);
 
     CoreTaskArgs consumer_args;
