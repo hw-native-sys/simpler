@@ -44,6 +44,11 @@ inline __aicore__ bool scheduler_fill_own_slots(
     if (failed != nullptr) *failed = false;
     if (scheduler == nullptr) return false;
     const uint32_t core_type = scheduler->config.self_core_type;
+    // The queue this core claims from is the one its own core type runs. They
+    // are separate vocabularies that happen to share the AIC/AIV numbering, so
+    // the slot check below takes the core type and everything queue-side takes
+    // the task type.
+    const TaskType task_type = scheduler_self_task_type(core_type);
     if (!scheduler_has_usable_slot(scheduler, core_type, skip_slot_mask)) return false;
     // A core polls its own inbox on every pass. The directory gates only the
     // steal scan, which reads one peer endpoint per victim. Any publisher sets
@@ -52,7 +57,7 @@ inline __aicore__ bool scheduler_fill_own_slots(
     // whatever is queued when a clear and a push cross, until a later push
     // sets the bit again.
     const bool allow_steal = scheduler_ready_directory_nonempty(
-        scheduler_state_base, scheduler, scheduler->config.scheduler_count, core_type
+        scheduler_state_base, scheduler, scheduler->config.scheduler_count, task_type
     );
 
     const uint64_t worker_id = scheduler->worker_id();
@@ -67,8 +72,8 @@ inline __aicore__ bool scheduler_fill_own_slots(
 
         SchedulerReadyClaim ready{};
         if (!scheduler_claim_ready_for_slot(
-                graph, scheduler_state_base, scheduler, run_control, scheduler->config.scheduler_count, core_type,
-                &ready_victim_cursors[core_type], ready_stats, &ready, nullptr, allow_steal
+                graph, scheduler_state_base, scheduler, run_control, scheduler->config.scheduler_count, task_type,
+                &ready_victim_cursors[scheduler_task_type_index(task_type)], ready_stats, &ready, nullptr, allow_steal
             )) {
             if (failed != nullptr) *failed = true;
             return progress;

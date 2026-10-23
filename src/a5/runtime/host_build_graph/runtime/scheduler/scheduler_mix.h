@@ -84,8 +84,8 @@ inline __aicore__ bool scheduler_fill_cluster_mix_slots(
         SchedulerMixPlacement placement{};
         SchedulerReadyClaim ready{};
         if (!scheduler_claim_ready_for_slot(
-                graph, base, local, run, local->config.scheduler_count, SCHEDULER_MIX_QUEUE, victim_cursor, stats,
-                &ready, &placement, allow_steal
+                graph, base, local, run, local->config.scheduler_count, TaskType::MIX, victim_cursor, stats, &ready,
+                &placement, allow_steal
             ))
             return false;
         if (scheduler_task_ref_is_null(ready.task_ref)) return true;
@@ -112,7 +112,7 @@ inline __aicore__ bool scheduler_publish_direct_mix_candidate(
     } else {
         SchedulerReadyBatch batch{};
         if (!scheduler_ready_batch_append(base, local, candidate->task_ref, &batch, stats, profiling_level) ||
-            !scheduler_ready_batch_push(base, local, SCHEDULER_MIX_QUEUE, &batch, stats))
+            !scheduler_ready_batch_push(base, local, TaskType::MIX, &batch, stats))
             return false;
     }
     *candidate = {};

@@ -643,8 +643,42 @@ inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
 // of four would overflow every one of them.
 inline constexpr uint32_t SCHEDULER_MIX_SLOT_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
-inline constexpr uint32_t SCHEDULER_READY_QUEUE_COUNT = 3;
-inline constexpr uint32_t SCHEDULER_MIX_QUEUE = 2;
+
+// What a ready task is, which is also the queue it waits in. AIC and AIV share
+// their numbering with CoreType because a core of that type is what runs them;
+// MIX and SPMD have no core type of their own, which is why this is not the
+// core type it grew out of.
+//
+// SPMD is not a fourth shape but a fourth discipline: an SPMD task is still
+// AIC-, AIV- or Mix-shaped, and its shape is read from its metadata. What sets
+// it apart is that the whole machine claims it block by block instead of one
+// core popping it whole, so it needs a queue every core can see.
+enum class TaskType : uint32_t {
+    AIC = 0,
+    AIV = 1,
+    MIX = 2,
+    SPMD = 3,
+};
+
+inline constexpr uint32_t SCHEDULER_READY_QUEUE_COUNT = 4;
+
+// The queue a core claims for itself: it takes the work its own core type runs.
+// This mapping is the one place the two numberings meet, and naming it is what
+// keeps every other site from passing one where the other belongs.
+inline __aicore__ constexpr TaskType scheduler_self_task_type(uint32_t self_core_type) {
+    return self_core_type == 1U ? TaskType::AIV : TaskType::AIC;
+}
+
+inline __aicore__ constexpr uint32_t scheduler_task_type_index(TaskType type) { return static_cast<uint32_t>(type); }
+
+// An enum class stops a plain integer reaching a queue parameter, but not a
+// deliberate cast. The base below answers for an unnamed value by falling
+// through to SPMD's, so a value past the last task type would quietly address
+// the SPMD queue rather than be refused; every entry point that takes one from
+// outside checks this first.
+inline __aicore__ constexpr bool scheduler_task_type_valid(TaskType type) {
+    return scheduler_task_type_index(type) < SCHEDULER_READY_QUEUE_COUNT;
+}
 inline constexpr uint32_t SCHEDULER_CLUSTER_CAPACITY = SCHEDULER_WORKER_CAPACITY / 3;
 inline constexpr uint32_t SCHEDULER_ACTIVITY_CAPACITY = 1024;
 inline constexpr uint64_t SCHEDULER_PROFILING_TASK_TIMING_LEVEL = 1;
@@ -668,35 +702,47 @@ inline constexpr bool scheduler_activity_record_count_valid(uint32_t committed) 
 }
 inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD = 7;
 
-// A ready queue is consumed only by cores of one type, so it needs one inbox per
-// such core rather than one per worker: the AIC and Mix queues are held by the
-// 36 AIC cores, the AIV queue by the 72 AIV cores. Each is addressed by the
-// core's type_rank, which the AICPU already assigns during core discovery, so
-// 3 x 108 slots collapse to 36 + 72 + 36 with no new numbering.
-//
-// Addressing by rank also makes a directory shard type-homogeneous. Addressed by
-// worker id the 7 owners of a shard interleave AIC and AIV cores, so a thief
-// scanning its shard of the AIC queue finds at most a third of those bits ever
-// set; by rank all 7 are cores that can hold the work it is looking for.
+// Addressing an inbox by the holder's rank within its core type, rather than by
+// worker id, is what makes a directory shard type-homogeneous: by worker id the
+// 7 owners of a shard interleave AIC and AIV cores, so a thief scanning its
+// shard of the AIC queue finds at most a third of those bits ever set; by rank
+// all 7 are cores that can hold the work it is looking for. The AICPU already
+// assigns that rank during core discovery.
 //
 // It narrows how far one publisher's work can travel, which is the other half
 // of the same property. A cluster's two AIV lanes take adjacent ranks, so both
 // land in one shard, where their worker ids had straddled a shard boundary and
 // reached two. A single-root fanout is therefore confined to one AIC shard plus
 // one AIV shard; tests/st/a5/host_build_graph/fanout_imbalance measures it.
-inline __aicore__ constexpr uint32_t scheduler_ready_queue_capacity(uint32_t core_type_index) {
-    return core_type_index == 1U ? SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM :
-                                   SCHEDULER_CLUSTER_CAPACITY;
+
+// How many inboxes a task type's ready queue is made of -- not how many tasks
+// one holds, which is unbounded: an inbox is an intrusive FIFO whose endpoints
+// pack (head, tail) into one word and whose tasks link through next_waiter.
+//
+// A queue consumed only by cores of one type needs one inbox per such core
+// rather than one per worker, so 3 x 108 slots collapse to 36 + 72 + 36 with no
+// new numbering. The SPMD queue is the exception on both counts: one inbox for
+// the whole machine, because a block of its head may be claimed by any core,
+// and no shard of its own in the directory below.
+inline __aicore__ constexpr uint32_t scheduler_ready_inbox_capacity(TaskType type) {
+    return type == TaskType::SPMD ? 1U :
+           type == TaskType::AIV  ? SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM :
+                                    SCHEDULER_CLUSTER_CAPACITY;
 }
 
-inline __aicore__ constexpr uint32_t scheduler_ready_queue_base(uint32_t core_type_index) {
-    return core_type_index == 0U ? 0U :
-           core_type_index == 1U ? SCHEDULER_CLUSTER_CAPACITY :
-                                   SCHEDULER_CLUSTER_CAPACITY * (1U + PLATFORM_AIV_CORES_PER_BLOCKDIM);
+// Where this task type's inboxes begin in the one flat array that holds them
+// all. Every type must name its own base: falling through to another type's
+// puts two queues on the same inboxes, which loses tasks with no error of its
+// own.
+inline __aicore__ constexpr uint32_t scheduler_ready_inbox_base(TaskType type) {
+    return type == TaskType::AIC ? 0U :
+           type == TaskType::AIV ? SCHEDULER_CLUSTER_CAPACITY :
+           type == TaskType::MIX ? SCHEDULER_CLUSTER_CAPACITY * (1U + PLATFORM_AIV_CORES_PER_BLOCKDIM) :
+                                   SCHEDULER_CLUSTER_CAPACITY * (2U + PLATFORM_AIV_CORES_PER_BLOCKDIM);
 }
 
 inline constexpr uint32_t SCHEDULER_READY_INBOX_CAPACITY =
-    SCHEDULER_CLUSTER_CAPACITY * (2U + PLATFORM_AIV_CORES_PER_BLOCKDIM);
+    SCHEDULER_CLUSTER_CAPACITY * (2U + PLATFORM_AIV_CORES_PER_BLOCKDIM) + 1U;
 
 // Mix slots exist on AIV cores, so their payloads and executor traces are
 // addressed by the holder's AIV rank -- the same rank that addresses the AIV
@@ -708,10 +754,21 @@ inline constexpr uint32_t SCHEDULER_MIX_SLOT_CAPACITY =
 
 // Shards are allocated per queue at the widest queue's count so the directory
 // stays a rectangular array; the unused tail of a narrower queue is never set,
-// because scheduler_ready_queue_capacity bounds what can be addressed.
+// because scheduler_ready_inbox_capacity bounds what can be addressed.
 inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_SHARD_COUNT =
     (SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM + SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD - 1) /
     SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD;
+
+// A directory bit spares a thief one endpoint read per victim, so it exists
+// only for the queues that have victims. The SPMD queue has a single inbox and
+// nobody to steal from, and its one consumer path reads those endpoints
+// directly -- a row here would be set and cleared by every core on the machine
+// and read by none.
+inline constexpr uint32_t SCHEDULER_READY_DIRECTORY_QUEUE_COUNT = scheduler_task_type_index(TaskType::SPMD);
+
+inline __aicore__ constexpr bool scheduler_ready_queue_has_directory(TaskType type) {
+    return scheduler_task_type_index(type) < SCHEDULER_READY_DIRECTORY_QUEUE_COUNT;
+}
 
 // A task ref names one task to the resident Scheduler. Its encoding today is a
 // GLOBAL task's index into the whole-graph-resident tables, which is why it is
@@ -741,6 +798,7 @@ enum class SchedulerReadySource : uint8_t {
     LOCAL = 0,
     STOLEN = 1,
     DIRECT_RESOLVE = 2,
+    SPMD_CLAIM = 3,
 };
 
 enum class SchedulerPublicationMode : uint8_t {
@@ -810,11 +868,25 @@ struct alignas(16) SchedulerTaskMetadata {
     int32_t timing_slot;
 };
 
-inline __aicore__ uint32_t scheduler_task_trace_index(uint32_t trace_index_base, uint8_t active_mask, uint8_t subtask) {
-    return trace_index_base + static_cast<uint32_t>(__builtin_popcount(active_mask & ((1U << subtask) - 1)));
+// Where a block's trace cell sits. runtime_maker strides trace_index_base by
+// block_num * active_subtasks, so every block of an SPMD task has its own cell
+// and a run's swimlane shows which core ran each one. A task of one block
+// passes block 0 and lands exactly where it did before.
+inline __aicore__ uint32_t
+scheduler_task_trace_index(uint32_t trace_index_base, uint8_t active_mask, uint8_t subtask, uint16_t block_idx = 0) {
+    const uint32_t subtasks = static_cast<uint32_t>(__builtin_popcount(active_mask));
+    return trace_index_base + static_cast<uint32_t>(block_idx) * subtasks +
+           static_cast<uint32_t>(__builtin_popcount(active_mask & ((1U << subtask) - 1)));
 }
-inline __aicore__ uint32_t scheduler_task_ready_queue(uint8_t flags, uint8_t active_mask) {
-    return (flags & SCHEDULER_TASK_MIX) != 0 ? SCHEDULER_MIX_QUEUE : ((active_mask & 1U) != 0 ? 0U : 1U);
+
+// Which queue a ready task joins. SPMD is tested first and so wins over MIX: a
+// Mix SPMD task is claimed block by block like any other, and the claim reads
+// its shape back from the metadata. Testing MIX first would put it on a queue
+// whose consumer pops it whole, and only its block 0 would ever run.
+inline __aicore__ TaskType scheduler_task_ready_queue(uint8_t flags, uint8_t active_mask) {
+    if ((flags & SCHEDULER_TASK_SPMD) != 0) return TaskType::SPMD;
+    if ((flags & SCHEDULER_TASK_MIX) != 0) return TaskType::MIX;
+    return (active_mask & 1U) != 0 ? TaskType::AIC : TaskType::AIV;
 }
 
 inline __aicore__ bool scheduler_task_is_executable(uint8_t flags) { return (flags & SCHEDULER_TASK_EXECUTABLE) != 0; }
@@ -850,7 +922,18 @@ struct alignas(128) SchedulerTaskControl {
     // them: a resolver detaches a whole wake list before routing its waiters,
     // and a batch is spliced into an inbox without rewriting its links.
     volatile int64_t next_waiter;
-    uint8_t atomic_line_padding[40];
+    // An SPMD task's blocks are handed out from next_block and counted back in
+    // completed_blocks, both by cores in other clusters, so both are
+    // read-modify-written across the chip and belong on this line rather than
+    // the line-published half below: a writeback of that half restores the
+    // writer's stale copy of whatever a peer last wrote there. block_num is
+    // written once by the host and only read here, and rides along so a claim
+    // needs no second cache line. All three are unsigned because
+    // scheduler_gm_fetch_add has no signed overload.
+    volatile uint64_t next_block;
+    volatile uint64_t completed_blocks;
+    volatile uint64_t block_num;
+    uint8_t atomic_line_padding[16];
 
     int32_t next_fanin_index;
     int32_t waiting_producer;
@@ -884,7 +967,8 @@ struct alignas(128) SchedulerReadyInbox {
 // occupies its own cache line away from the state Schedulers mutate.
 struct alignas(128) SchedulerGraphSummary {
     uint64_t mix_task_count;
-    uint8_t cache_line_padding[120];
+    uint64_t spmd_task_count;
+    uint8_t cache_line_padding[112];
 };
 
 struct alignas(64) SchedulerReadyDirectoryShard {
@@ -893,7 +977,8 @@ struct alignas(64) SchedulerReadyDirectoryShard {
 };
 
 struct alignas(128) SchedulerReadyDirectory {
-    SchedulerReadyDirectoryShard core_types[SCHEDULER_READY_QUEUE_COUNT][SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
+    SchedulerReadyDirectoryShard task_types[SCHEDULER_READY_DIRECTORY_QUEUE_COUNT]
+                                           [SCHEDULER_READY_DIRECTORY_SHARD_COUNT];
 };
 
 // The Executor publishes this per-slot payload before the Completion Inbox
@@ -934,6 +1019,8 @@ enum class SchedulerErrorSite : uint64_t {
     COMPLETION_GENERATION_MISMATCH = 74,
     EXECUTOR_PREFERRED_SLOT_INVALID = 79,
     READY_INBOX_REFRESH_FAILED = 80,
+    SPMD_CLAIM_INVALID_BLOCK = 81,
+    SPMD_COMPLETION_OVERRUN = 82,
     BOOTSTRAP_FAILED = 90,
     CONTEXT_READY_TIMEOUT = 91,
     BOOTSTRAP_SCAN_TIMEOUT = 92,
@@ -1191,23 +1278,25 @@ static_assert(sizeof(SchedulerReadyDirectoryShard) == 64, "ready directory shard
 static_assert(alignof(SchedulerReadyDirectoryShard) == 64, "ready directory shard alignment changed");
 static_assert(
     SCHEDULER_READY_DIRECTORY_SHARD_COUNT * SCHEDULER_READY_DIRECTORY_OWNERS_PER_SHARD >=
-        scheduler_ready_queue_capacity(1),
+        scheduler_ready_inbox_capacity(TaskType::AIV),
     "ready directory does not cover the widest ready queue"
 );
 static_assert(
-    scheduler_ready_queue_base(SCHEDULER_READY_QUEUE_COUNT - 1) +
-            scheduler_ready_queue_capacity(SCHEDULER_READY_QUEUE_COUNT - 1) ==
+    scheduler_ready_inbox_base(TaskType::SPMD) + scheduler_ready_inbox_capacity(TaskType::SPMD) ==
         SCHEDULER_READY_INBOX_CAPACITY,
     "per-type inbox segments must tile the inbox array exactly"
 );
 static_assert(
-    scheduler_ready_queue_base(1) == scheduler_ready_queue_capacity(0) &&
-        scheduler_ready_queue_base(2) == scheduler_ready_queue_base(1) + scheduler_ready_queue_capacity(1),
+    scheduler_ready_inbox_base(TaskType::AIV) == scheduler_ready_inbox_capacity(TaskType::AIC) &&
+        scheduler_ready_inbox_base(TaskType::MIX) ==
+            scheduler_ready_inbox_base(TaskType::AIV) + scheduler_ready_inbox_capacity(TaskType::AIV) &&
+        scheduler_ready_inbox_base(TaskType::SPMD) ==
+            scheduler_ready_inbox_base(TaskType::MIX) + scheduler_ready_inbox_capacity(TaskType::MIX),
     "per-type inbox segments must be contiguous"
 );
 static_assert(
     sizeof(SchedulerReadyDirectory) ==
-        (SCHEDULER_READY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64 + 127) / 128 * 128,
+        (SCHEDULER_READY_DIRECTORY_QUEUE_COUNT * SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64 + 127) / 128 * 128,
     "ready directory layout changed"
 );
 static_assert(sizeof(SchedulerExecutorTaskTrace) == 48, "executor trace payload layout changed");
@@ -1372,6 +1461,12 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
         controls[i].wake_list_head = SCHEDULER_WAKE_LIST_OPEN;
         controls[i].next_waiter = SCHEDULER_TASK_REF_INVALID;
         controls[i].waiting_producer = static_cast<int32_t>(SCHEDULER_TASK_REF_INVALID);
+        // The block cursor and its counter belong to this pass; block_num is
+        // the host's, written from the graph it alone has. Splitting them this
+        // way is only visible if the memset above ever narrows, which is
+        // exactly when a field nobody owns would start reading as garbage.
+        controls[i].next_block = 0;
+        controls[i].completed_blocks = 0;
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(base, layout.ready_inboxes_offset);
     for (uint64_t i = 0; i < SCHEDULER_READY_INBOX_CAPACITY; ++i)

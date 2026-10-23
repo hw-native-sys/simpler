@@ -169,10 +169,11 @@ __aicore__ bool bootstrap_ready_graph(
                         SchedulerRouteResult::READY_TO_ENQUEUE;
         if (route == SchedulerRouteResult::ERROR) return false;
         if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
-            const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, metadata->active_mask);
+            const TaskType type = scheduler_task_ready_queue(metadata->flags, metadata->active_mask);
             if (!scheduler_bootstrap_ready_batch_append(
-                    scheduler_state_base, scheduler, static_cast<int64_t>(task_ref), &batches[core_type],
-                    phase_timing_enabled ? &stats->ready : nullptr, profiling_level
+                    scheduler_state_base, scheduler, static_cast<int64_t>(task_ref),
+                    &batches[scheduler_task_type_index(type)], phase_timing_enabled ? &stats->ready : nullptr,
+                    profiling_level
                 ))
                 return false;
         }
@@ -184,9 +185,10 @@ __aicore__ bool bootstrap_ready_graph(
     // this one. The push sets the target's directory bit itself, so there is no
     // per-publisher bitmap left to aggregate -- the barrier below still orders
     // every scan ahead of the first consume.
-    for (uint32_t type = 0; type < SCHEDULER_READY_QUEUE_COUNT; ++type) {
+    for (uint32_t index = 0; index < SCHEDULER_READY_QUEUE_COUNT; ++index) {
         if (!scheduler_ready_batch_push(
-                scheduler_state_base, scheduler, type, &batches[type], phase_timing_enabled ? &stats->ready : nullptr
+                scheduler_state_base, scheduler, static_cast<TaskType>(index), &batches[index],
+                phase_timing_enabled ? &stats->ready : nullptr
             ))
             return false;
     }
@@ -227,7 +229,7 @@ __aicore__ bool bootstrap_ready_graph(
         const uint64_t worker_id = scheduler->config.worker_ids[cluster_lane];
         uint64_t target_start = phase_timing_enabled ? scheduler_cycles() : 0;
         __gm__ SchedulerWorkerContext *target = scheduler_worker_context_at(scheduler_state_base, scheduler, worker_id);
-        uint32_t type = scheduler_core_type_index(target->core_type);
+        uint32_t core_type_index = scheduler_core_type_index(target->core_type);
         // A slot state defaults to EMPTY, not FREE, so the Mix slots this core
         // coordinates have to be opened here too; left EMPTY, placement would
         // never find capacity and Mix work would silently never dispatch.
@@ -236,19 +238,23 @@ __aicore__ bool bootstrap_ready_graph(
                 scheduler_initialize_free_slot(&scheduler->mix_slots[cluster_lane][mix_slot]);
             }
         }
-        if (phase_timing_enabled) stats->bootstrap_target_cycles[type] += scheduler_cycles() - target_start;
+        if (phase_timing_enabled) stats->bootstrap_target_cycles[core_type_index] += scheduler_cycles() - target_start;
     }
     if (phase_timing_enabled) stats->target_bootstrap_end_cycles = scheduler_cycles();
 
     // Prepare the first executable wave while the sole DMB launch gate is
-    // still closed.
+    // still closed. One cursor per ready queue, including the SPMD queue's,
+    // which stays zero: that queue has one inbox and so nobody to steal from.
     uint64_t ready_victim_cursors[SCHEDULER_READY_QUEUE_COUNT]{
         (scheduler->config.scheduler_index + 1) % scheduler_count,
         (scheduler->config.scheduler_index + 1) % scheduler_count,
+        (scheduler->config.scheduler_index + 1) % scheduler_count,
+        0,
     };
     bool fill_failed = false;
     if (!scheduler_fill_cluster_mix_slots(
-            graph, scheduler_state_base, scheduler, run_control, &ready_victim_cursors[SCHEDULER_MIX_QUEUE],
+            graph, scheduler_state_base, scheduler, run_control,
+            &ready_victim_cursors[scheduler_task_type_index(TaskType::MIX)],
             phase_timing_enabled ? &stats->ready : nullptr, profiling_level, true, ssbuf_region, nullptr
         ))
         return false;
@@ -284,6 +290,8 @@ __aicore__ bool run_ready_dispatch_loop(
     uint64_t ready_victim_cursors[SCHEDULER_READY_QUEUE_COUNT]{
         (context->config.scheduler_index + 1) % scheduler_count,
         (context->config.scheduler_index + 1) % scheduler_count,
+        (context->config.scheduler_index + 1) % scheduler_count,
+        0,
     };
     // Mix generations this core has already run, and what it has told the
     // coordinator about them. Both are per Mix slot and local to this core.
@@ -335,8 +343,9 @@ __aicore__ bool run_ready_dispatch_loop(
             scheduler_progress = completion_progress;
             if (!scheduler_fill_mix_after_completions(
                     graph, scheduler_state_base, context, run_control, &refill_candidates.mix_ready,
-                    &ready_victim_cursors[SCHEDULER_MIX_QUEUE], phase_timing_enabled ? &stats->ready : nullptr,
-                    profiling_level, true, ssbuf_region, &scheduler_progress
+                    &ready_victim_cursors[scheduler_task_type_index(TaskType::MIX)],
+                    phase_timing_enabled ? &stats->ready : nullptr, profiling_level, true, ssbuf_region,
+                    &scheduler_progress
                 ))
                 return false;
             bool fill_failed = false;

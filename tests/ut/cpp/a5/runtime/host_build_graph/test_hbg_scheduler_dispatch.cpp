@@ -81,8 +81,8 @@ void enqueue_normal_aiv_tasks(
         ));
     }
     ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&scheduler, &storage.scheduler_local_state), 1, &batch,
-        &ready_stats
+        storage.scheduler_state->base(), storage.local_context(&scheduler, &storage.scheduler_local_state),
+        TaskType::AIV, &batch, &ready_stats
     ));
 }
 
@@ -376,7 +376,8 @@ TEST(SchedulerClusterCompletion, CompletionIgnoresTheReadyQueueEntirely) {
     // task accounted regardless, and the next fill pass is what meets the
     // corruption.
     scheduler_ready_inbox_at(
-        storage.scheduler_state->base(), storage.local_context(&scheduler, &storage.scheduler_local_state), 0, 0
+        storage.scheduler_state->base(), storage.local_context(&scheduler, &storage.scheduler_local_state),
+        TaskType::AIC, 0
     )
         ->endpoints = scheduler_ready_endpoints_pack(SCHEDULER_INBOX_EMPTY, 0);
 
@@ -519,8 +520,8 @@ TEST(SchedulerClusterCompletion, ReleasesCompletedSlotAndLeavesReadyTaskQueued) 
         storage.scheduler_state->base(), storage.local_context(&scheduler), 1, &batch, &ready_stats
     ));
     ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&scheduler, &storage.scheduler_local_state), 0, &batch,
-        &ready_stats
+        storage.scheduler_state->base(), storage.local_context(&scheduler, &storage.scheduler_local_state),
+        TaskType::AIC, &batch, &ready_stats
     ));
 
     SchedulerWakeStats wake_stats{};
@@ -543,8 +544,8 @@ TEST(SchedulerClusterCompletion, ReleasesCompletedSlotAndLeavesReadyTaskQueued) 
     int64_t queued = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, 0, 0, &queued,
-        &ready_stats
+        storage.local_context(&scheduler, &storage.scheduler_local_state), storage.run_control, TaskType::AIC, 0,
+        &queued, &ready_stats
     ));
     EXPECT_EQ(queued, 1);
 }
@@ -724,7 +725,9 @@ TEST(SchedulerNormalDispatch, FillsItsOwnFreshAicSlot) {
     SchedulerReadyBatch batch{};
     SchedulerReadyStats ready_stats{};
     ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), local, 0, &batch, &ready_stats));
-    ASSERT_TRUE(scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch, &ready_stats));
+    ASSERT_TRUE(
+        scheduler_ready_batch_push(storage.scheduler_state->base(), local, TaskType::AIC, &batch, &ready_stats)
+    );
 
     uint64_t victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{};
     bool failed = true;
@@ -760,13 +763,15 @@ TEST(SchedulerNormalDispatch, FindsOwnQueuedWorkWithItsDirectoryBitClear) {
     SchedulerReadyBatch batch{};
     SchedulerReadyStats ready_stats{};
     ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), local, 0, &batch, &ready_stats));
-    ASSERT_TRUE(scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch, &ready_stats));
+    ASSERT_TRUE(
+        scheduler_ready_batch_push(storage.scheduler_state->base(), local, TaskType::AIC, &batch, &ready_stats)
+    );
 
     // The work is queued and reachable; now drop only the directory bit and
     // the local active mask, leaving the inbox exactly as it is.
-    const uint32_t core_type = local->config.self_core_type;
+    const TaskType task_type = scheduler_self_task_type(local->config.self_core_type);
     scheduler_ready_directory_clear(
-        scheduler_ready_directory_at(storage.scheduler_state->base(), local), core_type, local->self_type_rank()
+        scheduler_ready_directory_at(storage.scheduler_state->base(), local), task_type, local->self_type_rank()
     );
     local->owner_ready_queue_mask = 0;
 
@@ -807,7 +812,9 @@ TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
             scheduler_ready_batch_append(storage.scheduler_state->base(), local, task_ref, &batch, &ready_stats)
         );
     }
-    ASSERT_TRUE(scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch, &ready_stats));
+    ASSERT_TRUE(
+        scheduler_ready_batch_push(storage.scheduler_state->base(), local, TaskType::AIC, &batch, &ready_stats)
+    );
 
     uint64_t victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{};
     bool failed = false;
@@ -1261,7 +1268,7 @@ TEST(SchedulerMix, DirectCandidateDoesNotOvertakeQueuedMix) {
     SchedulerReadyClaim candidate{};
     ASSERT_TRUE(scheduler_resolve_completion(
         f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, nullptr, nullptr,
-        nullptr, 0, false, nullptr, SCHEDULER_MIX_QUEUE, &candidate
+        nullptr, 0, false, nullptr, TaskType::MIX, &candidate
     ));
     EXPECT_EQ(candidate.task_ref, SCHEDULER_TASK_REF_INVALID);
     ASSERT_TRUE(f.dispatch());
@@ -1284,7 +1291,7 @@ TEST(SchedulerMix, DirectCandidatePrecedesMixQueuedAfterResolve) {
     SchedulerReadyClaim candidate{};
     ASSERT_TRUE(scheduler_resolve_completion(
         f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, nullptr, nullptr,
-        nullptr, 0, false, nullptr, SCHEDULER_MIX_QUEUE, &candidate
+        nullptr, 0, false, nullptr, TaskType::MIX, &candidate
     ));
     ASSERT_EQ(candidate.task_ref, 1);
     f.enqueue(2);
@@ -1318,7 +1325,7 @@ TEST(SchedulerMix, DirectCandidateQueuesWhenRequiredLaneIsBusy) {
     SchedulerReadyClaim candidate{};
     ASSERT_TRUE(scheduler_resolve_completion(
         f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, nullptr, nullptr,
-        nullptr, 0, false, nullptr, SCHEDULER_MIX_QUEUE, &candidate
+        nullptr, 0, false, nullptr, TaskType::MIX, &candidate
     ));
     ASSERT_EQ(candidate.task_ref, 1);
     f.enqueue(2);
@@ -1414,8 +1421,8 @@ TEST(SchedulerMix, LastLaneAloneResolvesDependency) {
     EXPECT_EQ(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
     SchedulerReadyClaim claim;
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 1, 0, &f.cursor, nullptr,
-        &claim
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 1, TaskType::AIC, &f.cursor,
+        nullptr, &claim
     ));
     EXPECT_EQ(claim.task_ref, 1);
 }
@@ -1452,10 +1459,10 @@ TEST(SchedulerMix, NoStealPolicyStillAdmitsLocalMix) {
     f.local->config.scheduler_count = 2;
     auto *control = scheduler_task_control_at(f.storage.scheduler_state->base(), f.local, 0);
     control->next_waiter = SCHEDULER_INBOX_EMPTY;
-    scheduler_ready_inbox_at(f.storage.scheduler_state->base(), f.local, SCHEDULER_MIX_QUEUE, 1)->endpoints =
+    scheduler_ready_inbox_at(f.storage.scheduler_state->base(), f.local, TaskType::MIX, 1)->endpoints =
         scheduler_ready_endpoints_pack(0, 0);
     scheduler_ready_directory_set(
-        scheduler_ready_directory_at(f.storage.scheduler_state->base(), f.local), SCHEDULER_MIX_QUEUE, 1
+        scheduler_ready_directory_at(f.storage.scheduler_state->base(), f.local), TaskType::MIX, 1
     );
 
     ASSERT_TRUE(f.dispatch(false));

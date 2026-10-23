@@ -1112,12 +1112,18 @@ bool create_scheduler_state(
     }
     std::vector<int64_t> inline_completed_task_refs;
     std::vector<SchedulerTaskMetadata> task_metadata(static_cast<size_t>(total_tasks));
+    // Each task's block count, carried to the SchedulerTaskControl table that
+    // does not exist yet: the scheduler state is sized from totals this walk
+    // produces, so it cannot be allocated until the walk is done. A
+    // non-executable task keeps the 1 that means "one dispatch, no blocks".
+    std::vector<uint64_t> task_block_num(static_cast<size_t>(total_tasks), 1);
     uint64_t aic_task_count = 0;
     bool sampled_task_timing_enabled = false;
     uint64_t aiv_task_count = 0;
     uint64_t executable_task_count = 0;
     uint64_t executable_subtask_count = 0;
     uint64_t mix_task_count = 0;
+    uint64_t spmd_task_count = 0;
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
     int64_t legacy_shape_task_ref = -1;
@@ -1249,6 +1255,8 @@ bool create_scheduler_state(
             aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, logical_block_num * active_aiv_subtasks);
         }
         if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
+        if (scheduler_task_is_spmd(metadata.flags)) ++spmd_task_count;
+        task_block_num[static_cast<size_t>(task_ref)] = logical_block_num;
         executable_subtask_count += expected_subtasks;
         ++executable_task_count;
     }
@@ -1310,6 +1318,8 @@ bool create_scheduler_state(
     }
 
     auto *task_controls = scheduler_state_at<SchedulerTaskControl>(host_base, layout.task_controls_offset);
+    for (int64_t task_ref = 0; task_ref < total_tasks; ++task_ref)
+        task_controls[task_ref].block_num = task_block_num[static_cast<size_t>(task_ref)];
     for (int64_t task_ref : inline_completed_task_refs) {
         task_controls[task_ref].state = static_cast<int64_t>(SchedulerTaskState::DONE);
         task_controls[task_ref].wake_list_head = SCHEDULER_WAKE_LIST_CLOSED;
@@ -1338,6 +1348,7 @@ bool create_scheduler_state(
     run_control->error_core_type = UINT64_MAX;
     auto *graph_summary = scheduler_state_at<SchedulerGraphSummary>(host_base, layout.graph_summary_offset);
     graph_summary->mix_task_count = mix_task_count;
+    graph_summary->spmd_task_count = spmd_task_count;
 
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, layout.worker_contexts_offset);
     int32_t aic_rank = 0;

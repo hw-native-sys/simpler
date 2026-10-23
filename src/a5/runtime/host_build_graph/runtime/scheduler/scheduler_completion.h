@@ -128,8 +128,9 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     if (chip_task_timing_enabled || sampled_task_timing_enabled) {
         __gm__ SchedulerTaskTrace *traces =
             scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, scheduler->profiling->trace_cells_offset);
-        completed_trace =
-            &traces[scheduler_trace_index_at(scheduler_state_base, scheduler, task_ref, local_slot->subtask_slot)];
+        completed_trace = &traces[scheduler_trace_index_at(
+            scheduler_state_base, scheduler, task_ref, local_slot->subtask_slot, local_slot->block_idx
+        )];
     }
     if (chip_task_timing_enabled) {
         // Finish all trace invalidations before any cached trace write.
@@ -188,6 +189,8 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     local_slot->state = SchedulerDispatchSlotState::FREE;
     local_slot->subtask_slot = UINT8_MAX;
     local_slot->mix_tracker = UINT8_MAX;
+    local_slot->block_idx = 0;
+    local_slot->block_num = 1;
     scheduler->set_timing_slot(cluster_lane, pending_slot, -1);
     const uint64_t completion_phase_end = phase_timing_enabled ? scheduler_cycles() : 0;
     SchedulerReadyClaim resolved_ready{};
@@ -204,7 +207,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         if (!scheduler_resolve_completion(
                 graph, scheduler_state_base, scheduler, run_control, task_ref, wake_stats, ready_stats,
                 completion_stats, profiling_level, false, direct_ready,
-                scheduler_metadata_core_type_index(completed_subtask_slot),
+                scheduler_self_task_type(scheduler_metadata_core_type_index(completed_subtask_slot)),
                 scheduler->has_mix && candidates != nullptr ? &candidates->mix_ready : nullptr
             )) {
             scheduler_account_failed_completion(

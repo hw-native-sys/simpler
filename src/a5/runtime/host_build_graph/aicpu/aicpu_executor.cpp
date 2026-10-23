@@ -175,8 +175,8 @@ static void log_unfinished_tasks(Runtime *runtime) {
         }
         LOG_ERROR(
             "A5 HBG AICore scheduler: unfinished task=%" PRIu64 " state=%" PRId64 " wake_head=%" PRId64
-            " next_waiter=%" PRId64 " fanin_index=%" PRId32 " waiting_producer=%" PRId32
-            " producer_state=%" PRId64 " producer_wake_head=%" PRId64 " active_mask=0x%x flags=0x%x",
+            " next_waiter=%" PRId64 " fanin_index=%" PRId32 " waiting_producer=%" PRId32 " producer_state=%" PRId64
+            " producer_wake_head=%" PRId64 " active_mask=0x%x flags=0x%x",
             task, controls[task].state, controls[task].wake_list_head, controls[task].next_waiter,
             controls[task].next_fanin_index, controls[task].waiting_producer,
             controls[task].waiting_producer >= 0 && static_cast<uint64_t>(controls[task].waiting_producer) < count ?
@@ -198,22 +198,19 @@ static void log_unfinished_tasks(Runtime *runtime) {
         const int32_t head = static_cast<int32_t>(static_cast<uint32_t>(packed));
         const int32_t tail = static_cast<int32_t>(static_cast<uint32_t>(packed >> 32));
         if (head < 0 && tail < 0) continue;
-        LOG_ERROR(
-            "A5 HBG AICore scheduler: inbox %u not drained: head=%" PRId32 " tail=%" PRId32, index, head, tail
-        );
+        LOG_ERROR("A5 HBG AICore scheduler: inbox %u not drained: head=%" PRId32 " tail=%" PRId32, index, head, tail);
     }
     // The directory is what a thief consults before looking at an inbox, so a
     // bit set over an empty inbox wastes scans and a bit clear over a full one
     // hides the work. Either way it belongs next to the endpoints above.
-    auto *directory = scheduler_state_at<SchedulerReadyDirectory>(scheduler_state_base, context->ready_directory_offset);
+    auto *directory =
+        scheduler_state_at<SchedulerReadyDirectory>(scheduler_state_base, context->ready_directory_offset);
     cache_invalidate_range(directory, sizeof(*directory));
-    for (uint32_t type = 0; type < 3; ++type) {
+    for (uint32_t type = 0; type < SCHEDULER_READY_DIRECTORY_QUEUE_COUNT; ++type) {
         for (uint32_t shard = 0; shard < SCHEDULER_READY_DIRECTORY_SHARD_COUNT; ++shard) {
-            const uint64_t bits = directory->core_types[type][shard].bits;
+            const uint64_t bits = directory->task_types[type][shard].bits;
             if (bits == 0) continue;
-            LOG_ERROR(
-                "A5 HBG AICore scheduler: directory type %u shard %u still flags 0x%" PRIx64, type, shard, bits
-            );
+            LOG_ERROR("A5 HBG AICore scheduler: directory type %u shard %u still flags 0x%" PRIx64, type, shard, bits);
         }
     }
     // The AICores are still running when this timeout fires, so one pass cannot

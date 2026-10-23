@@ -18,12 +18,14 @@
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
+#include <type_traits>
 #include <vector>
 
 #include "host_build_graph/runtime_types.h"
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
 #include "scheduler/scheduler_graph.h"
+#include "scheduler/scheduler_ready.h"
 #include "scheduler/scheduler_ssbuf.h"
 #include "scheduler/scheduler_topology.h"
 #include "scheduler/scheduler_types.h"
@@ -120,9 +122,9 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
     EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved2, 0u);
 
     auto *directory = scheduler_state_at<SchedulerReadyDirectory>(storage.base(), layout.ready_directory_offset);
-    auto shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[0][0]);
-    auto shard1 = reinterpret_cast<uintptr_t>(&directory->core_types[0][1]);
-    auto aiv_shard0 = reinterpret_cast<uintptr_t>(&directory->core_types[1][0]);
+    auto shard0 = reinterpret_cast<uintptr_t>(&directory->task_types[0][0]);
+    auto shard1 = reinterpret_cast<uintptr_t>(&directory->task_types[0][1]);
+    auto aiv_shard0 = reinterpret_cast<uintptr_t>(&directory->task_types[1][0]);
     EXPECT_EQ(shard1 - shard0, 64u);
     EXPECT_EQ(aiv_shard0 - shard0, SCHEDULER_READY_DIRECTORY_SHARD_COUNT * 64u);
 }
@@ -378,6 +380,116 @@ TEST(SchedulerClusterTopology, UsesMixedKernelLaunchCoordinate) {
     EXPECT_EQ(coordinate.cluster_index, 2);
     EXPECT_EQ(coordinate.cluster_lane, 2);
     EXPECT_FALSE(scheduler_cluster_coordinate_from_worker(12, false, kClusters, 2, &coordinate));
+}
+
+// The SPMD queue is the fourth ready queue and holds exactly one inbox. Its
+// base is the trap this pins: before it had a branch of its own it fell into
+// the Mix queue's, which put the two queues on the same inboxes and lost no
+// task loudly enough to notice.
+TEST(SchedulerReadyQueueLayout, SpmdQueueOwnsOneInboxPastTheOthers) {
+    EXPECT_EQ(SCHEDULER_READY_QUEUE_COUNT, 4U);
+    EXPECT_EQ(scheduler_ready_inbox_capacity(TaskType::SPMD), 1U);
+    EXPECT_EQ(
+        scheduler_ready_inbox_base(TaskType::SPMD),
+        scheduler_ready_inbox_base(TaskType::MIX) + scheduler_ready_inbox_capacity(TaskType::MIX)
+    );
+    EXPECT_NE(scheduler_ready_inbox_base(TaskType::SPMD), scheduler_ready_inbox_base(TaskType::MIX));
+    EXPECT_EQ(
+        scheduler_ready_inbox_base(TaskType::SPMD) + scheduler_ready_inbox_capacity(TaskType::SPMD),
+        SCHEDULER_READY_INBOX_CAPACITY
+    );
+}
+
+// A directory bit spares a thief an endpoint read, and the SPMD queue has no
+// thief. Sizing the directory by the queue count would silently give it a row.
+TEST(SchedulerReadyQueueLayout, SpmdQueueHasNoDirectoryRow) {
+    EXPECT_FALSE(scheduler_ready_queue_has_directory(TaskType::SPMD));
+    EXPECT_TRUE(scheduler_ready_queue_has_directory(TaskType::AIC));
+    EXPECT_TRUE(scheduler_ready_queue_has_directory(TaskType::AIV));
+    EXPECT_TRUE(scheduler_ready_queue_has_directory(TaskType::MIX));
+    EXPECT_EQ(std::extent_v<decltype(SchedulerReadyDirectory::task_types)>, scheduler_task_type_index(TaskType::SPMD));
+    EXPECT_LT(std::extent_v<decltype(SchedulerReadyDirectory::task_types)>, SCHEDULER_READY_QUEUE_COUNT);
+}
+
+// A core claims the queue its own core type runs, and no core type maps to
+// SPMD. That gap is what keeps an SPMD successor off the direct-refill path,
+// which would dispatch it as a single block and strand the rest.
+TEST(SchedulerTaskClassification, SelfTaskTypeMapsOnlyTheTwoCoreTypes) {
+    EXPECT_EQ(scheduler_self_task_type(0U), TaskType::AIC);
+    EXPECT_EQ(scheduler_self_task_type(1U), TaskType::AIV);
+    EXPECT_NE(scheduler_self_task_type(0U), TaskType::SPMD);
+    EXPECT_NE(scheduler_self_task_type(1U), TaskType::SPMD);
+    EXPECT_TRUE(scheduler_task_type_valid(TaskType::SPMD));
+    EXPECT_FALSE(scheduler_task_type_valid(static_cast<TaskType>(SCHEDULER_READY_QUEUE_COUNT)));
+}
+
+// SPMD wins over MIX because a Mix SPMD task is still claimed block by block.
+// Were MIX tested first, such a task would land on a queue whose consumer pops
+// it whole and only its block 0 would ever run.
+TEST(SchedulerTaskClassification, SpmdOutranksMixWhenChoosingAQueue) {
+    const uint8_t aic_mask = 0b001;
+    const uint8_t mix_mask = 0b011;
+    EXPECT_EQ(scheduler_task_ready_queue(SCHEDULER_TASK_EXECUTABLE, aic_mask), TaskType::AIC);
+    EXPECT_EQ(scheduler_task_ready_queue(SCHEDULER_TASK_EXECUTABLE, 0b010), TaskType::AIV);
+    EXPECT_EQ(scheduler_task_ready_queue(SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX, mix_mask), TaskType::MIX);
+    EXPECT_EQ(scheduler_task_ready_queue(SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD, aic_mask), TaskType::SPMD);
+    EXPECT_EQ(
+        scheduler_task_ready_queue(SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX | SCHEDULER_TASK_SPMD, mix_mask),
+        TaskType::SPMD
+    );
+}
+
+// Every block of a task gets a trace cell of its own, and runtime_maker strides
+// trace_index_base by block_num * active_subtasks to leave room for them. A
+// task of one block must still land exactly where it did before.
+TEST(SchedulerTaskTrace, BlockIndexStridesByTheTasksSubtaskCount) {
+    const uint8_t mix_mask = 0b111;
+    EXPECT_EQ(scheduler_task_trace_index(100, mix_mask, 0), 100U);
+    EXPECT_EQ(scheduler_task_trace_index(100, mix_mask, 1), 101U);
+    EXPECT_EQ(scheduler_task_trace_index(100, mix_mask, 2), 102U);
+    EXPECT_EQ(scheduler_task_trace_index(100, mix_mask, 0, 1), 103U);
+    EXPECT_EQ(scheduler_task_trace_index(100, mix_mask, 2, 3), 111U);
+
+    const uint8_t aiv_only = 0b010;
+    EXPECT_EQ(scheduler_task_trace_index(7, aiv_only, 1), 7U);
+    EXPECT_EQ(scheduler_task_trace_index(7, aiv_only, 1, 5), 12U);
+
+    // A sparse mask strides by the live subtasks, not by three.
+    const uint8_t aic_and_aiv1 = 0b101;
+    EXPECT_EQ(scheduler_task_trace_index(0, aic_and_aiv1, 2), 1U);
+    EXPECT_EQ(scheduler_task_trace_index(0, aic_and_aiv1, 0, 1), 2U);
+}
+
+// The cursor, its counter and the block count are read-modify-written from
+// other clusters, so they share the line reached only through atomics. The
+// line-published half below restores a writer's stale copy of anything on it.
+TEST(SchedulerTaskControlLayout, BlockFieldsShareTheAtomicLine) {
+    EXPECT_LT(offsetof(SchedulerTaskControl, next_block), 64U);
+    EXPECT_LT(offsetof(SchedulerTaskControl, completed_blocks), 64U);
+    EXPECT_LT(offsetof(SchedulerTaskControl, block_num), 64U);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, next_fanin_index), 64U);
+    EXPECT_EQ(sizeof(SchedulerTaskControl), 128U);
+    // fetch_add has no signed overload, so these cannot be int64_t.
+    EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::next_block), volatile uint64_t>));
+    EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::completed_blocks), volatile uint64_t>));
+}
+
+// A task that is not SPMD is one of block 0 of 1, which is its real shape
+// rather than an absence to be encoded. Every dispatch site therefore writes
+// these without an SPMD branch, and the count is what a completion tests to
+// decide whether the task needs cross-block aggregation at all.
+TEST(SchedulerBlockIndex, ASingleBlockTaskIsBlockZeroOfOne) {
+    EXPECT_EQ(SchedulerFreeSlotClaim{}.block_idx, 0U);
+    EXPECT_EQ(SchedulerFreeSlotClaim{}.block_num, 1U);
+    EXPECT_EQ(SchedulerLocalSlotState{}.block_idx, 0U);
+    EXPECT_EQ(SchedulerLocalSlotState{}.block_num, 1U);
+    // A claim written positionally still defaults its block fields, which is
+    // what keeps every existing dispatch site unchanged.
+    const SchedulerFreeSlotClaim positional{3, 1, 7, 2, true};
+    EXPECT_EQ(positional.block_idx, 0U);
+    EXPECT_EQ(positional.block_num, 1U);
+    // Block 0 of 1 lands exactly where a task with no block concept landed.
+    EXPECT_EQ(scheduler_task_trace_index(42, 0b111, 1, 0), scheduler_task_trace_index(42, 0b111, 1));
 }
 
 }  // namespace
