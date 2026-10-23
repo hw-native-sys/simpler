@@ -89,6 +89,16 @@ the operator. Caller synchronization can establish device results; `RunHandle.wa
 still performs runtime retirement. Capture is rejected before run/source state is
 published. Borrowed close does not reset the caller device or destroy its stream.
 
+Frameworks with a separate host emission queue must place the submission in
+that queue's callback; passing a stream integer alone does not order a Python
+call against framework work still waiting for host emission. The optional
+[A3 framework eager reference](../../../examples/workers/l2/framework_eager/README.md)
+uses the same public Worker for TMR and HBG, preserves frame/storage owners and
+uses the final framework completion boundary before runtime retirement. It
+demonstrates ordering, not overlapping execution: native admission, predecessor
+retirement and capacity backpressure can still wait. It
+requires matching torch/torch_npu/CANN and does not enable capture submission.
+
 ### Memory
 
 | Method | Notes |
