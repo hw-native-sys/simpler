@@ -1,0 +1,235 @@
+{
+  "schema_version": 1,
+  "date": "2026-10-23",
+  "scope": "真实 HBG CSA 业务 TDD；非性能优化结果",
+  "simpler_commit": "f5cc679bbf3d7d2058ca453aa6bf0b6686cff989",
+  "branch": "feat/fully_distributed_within_core",
+  "torch": "2.12.0+cpu",
+  "device": {
+    "id": 0,
+    "soc": "Ascend950PR_958b",
+    "aic": 32,
+    "aiv": 64,
+    "counter_hz": 1000000000,
+    "unlocked_direct_run": true
+  },
+  "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+  "runtime_sha256": {
+    "libhost_runtime.so": "4762853d70056351c09ff6c2c3ba4f016f73ffc0e556f2eb63196a06dd2ce669",
+    "libaicpu_kernel.so": "46cfce81eacb6829110d8ac38263431ca5afdced8524eda133d817da40a12bee",
+    "aicore_kernel.o": "e39c77c96427e69b6e6eeb919fef8ca1b3594b3afc40bc89ce117fbcdd15c938"
+  },
+  "vendor_sources_unchanged": true,
+  "production_runtime_modified": false,
+  "cpu": {
+    "new_tests_passed": 460,
+    "combined_tests_passed": 1021,
+    "log": "outputs/csa-tdd-cpu-20261023-verified.log",
+    "cpp_targets_passed": 5
+  },
+  "business": {
+    "cases": [
+      "baseline",
+      "main_state_reverse",
+      "inner_state_reverse",
+      "kv_reverse",
+      "cmp_reverse",
+      "idx_reverse",
+      "all_rotate",
+      "all_scramble",
+      "all_reverse",
+      "idx_rotate",
+      "scale_write_poison",
+      "all_pages_scale_poison"
+    ],
+    "rounds_per_case": 3,
+    "invocations": 36,
+    "golden_checks": 252,
+    "epochs": [
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8,
+      9,
+      10,
+      11,
+      12,
+      13,
+      14,
+      15,
+      16,
+      17,
+      18,
+      19,
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      31,
+      32,
+      33,
+      34,
+      35,
+      36
+    ],
+    "scheduler_mode": 4,
+    "passed": true,
+    "log": "outputs/csa-business-a5-20261023-validated.log"
+  },
+  "resident": {
+    "cases": 3,
+    "golden_checks_passed": 21,
+    "expected_red": 3,
+    "reason": "七项数值通过后拒绝 mode=4 / LEGACY_UNSUPPORTED_SHAPE",
+    "log": "outputs/csa-resident-a5-20261023.log"
+  },
+  "original_baseline": {
+    "result": "outputs/csa-hbg-check-t5gdhdhv/result.json",
+    "rounds": 3,
+    "golden_checks": 21,
+    "passed": true
+  },
+  "traces": {
+    "l1": {
+      "result": "outputs/csa-hbg-l1-ouk4nqas/result.json",
+      "passed": true,
+      "expected_red": false,
+      "golden_checks": 14,
+      "audit": {
+        "logical_tasks": 79,
+        "physical_tasks": 2308,
+        "clock_freq_hz": 1000000000,
+        "level": 1,
+        "execution_epoch": 1,
+        "per_kind_executions": {
+          "aiv": 1444,
+          "aic": 864
+        },
+        "dependency_edges_checked": 133,
+        "block_identity_verified": false,
+        "runtime": "host_build_graph",
+        "scheduler_producer": null,
+        "distributed_scheduler_verified": false,
+        "require_aicore_scheduler": false,
+        "host_capture": null,
+        "clock_alignment_status": null,
+        "cross_domain_latency_available": false
+      }
+    },
+    "l4": {
+      "result": "outputs/csa-hbg-l4-y96qddiu/result.json",
+      "passed": true,
+      "expected_red": false,
+      "golden_checks": 14,
+      "audit": {
+        "logical_tasks": 79,
+        "physical_tasks": 2308,
+        "clock_freq_hz": 1000000000,
+        "level": 4,
+        "execution_epoch": 1,
+        "per_kind_executions": {
+          "aiv": 1444,
+          "aic": 864
+        },
+        "dependency_edges_checked": 133,
+        "block_identity_verified": false,
+        "runtime": "host_build_graph",
+        "scheduler_producer": "aicpu",
+        "distributed_scheduler_verified": false,
+        "require_aicore_scheduler": false,
+        "host_capture": {
+          "status": "complete",
+          "expected_records": 107,
+          "recorded_records": 107,
+          "pool_records": 117,
+          "dropped_records": 0,
+          "error": null
+        },
+        "clock_alignment_status": "bounded",
+        "cross_domain_latency_available": true
+      }
+    },
+    "l4_strict": {
+      "result": "outputs/csa-hbg-l4-9zolp_hy/result.json",
+      "passed": false,
+      "expected_red": true,
+      "golden_checks": 14,
+      "audit": {
+        "logical_tasks": 79,
+        "physical_tasks": 2308,
+        "clock_freq_hz": 1000000000,
+        "level": 4,
+        "execution_epoch": 1,
+        "per_kind_executions": {
+          "aiv": 1444,
+          "aic": 864
+        },
+        "dependency_edges_checked": 133,
+        "block_identity_verified": false,
+        "runtime": "host_build_graph",
+        "scheduler_producer": "aicpu",
+        "distributed_scheduler_verified": false,
+        "require_aicore_scheduler": false,
+        "host_capture": {
+          "status": "complete",
+          "expected_records": 107,
+          "recorded_records": 107,
+          "pool_records": 117,
+          "dropped_records": 0,
+          "error": null
+        },
+        "clock_alignment_status": "bounded",
+        "cross_domain_latency_available": true
+      }
+    }
+  },
+  "excluded_experiment": {
+    "log": "outputs/csa-batch-isolated-20261023.log",
+    "transformation": "batch_reverse",
+    "accepted_as_metamorphic_case": false,
+    "reason": "请求 0 / 请求 2 的 compressor state 物理页 2 发生别名；重排会改变读写顺序，旧 golden 不可直接按 batch 重排。单独复测 x_out/cmp_kv/idx_kv_cache 不一致，不归因于 scheduler。"
+  },
+  "limitations": [
+    "真实泳道不包含 block_idx/subtask_slot，未证明逐 block 唯一身份。",
+    "CPU 协议模型通过不代表生产 resident 已实现。",
+    "本次真实 CSA 不覆盖 sync_start；没有修改冻结 kernel 或输入/golden 文件。"
+  ],
+  "artifact_sha256": {
+    "outputs/csa-batch-isolated-20261023.log": "611e4e7ee53c051dcf5eb74833a2c72b1a7005c99ccfbda68088480fde6cbe92",
+    "outputs/csa-business-a5-20261023-validated.log": "74bd47f9a6fa2e15a634b7b196cfbbc36ae7a23c2cbf8133ed41a2ae8fd25f6f",
+    "outputs/csa-hbg-check-t5gdhdhv/check.log": "ee607974899f63cf8ebaf241f7664fde3fec45c45487af0905687df22a69448c",
+    "outputs/csa-hbg-check-t5gdhdhv/result.json": "f4664303f10286809a8ca2a65e62a92ab91c840f8c5a20240915af0bad5c775b",
+    "outputs/csa-hbg-l1-ouk4nqas/chip_swimlane_records.json": "84e0793af7d7ff3c5184d2c35e6720c68ff1e704b3f7474f8f22ee1ee843aa83",
+    "outputs/csa-hbg-l1-ouk4nqas/convert.log": "5f529900c5517be9dd4a887a3186482797a5efcb82b117a12101db274b5ae4ec",
+    "outputs/csa-hbg-l1-ouk4nqas/deps.json": "7b9eff8ea7d3d1c5817978e4c1084547285ed6ee25121c93109dba2a2807e2dc",
+    "outputs/csa-hbg-l1-ouk4nqas/deps.log": "22a10aa55c3944114a4c4556a57d56df2050433037b871b79c35252339607e48",
+    "outputs/csa-hbg-l1-ouk4nqas/result.json": "639fbc20f5e23ac08938c6dce29fec24b87f05030b700182810d9cfdfd134e3b",
+    "outputs/csa-hbg-l1-ouk4nqas/timing.log": "617bace7e7a6ebfc2d4585987aea4cf5add3e86be33536aad79918f513b99e7b",
+    "outputs/csa-hbg-l4-9zolp_hy/chip_swimlane_records.json": "28f9bba1b6386e9f5d31387d084d322989d8eca42ae95c01ed3cc4f95daf5e40",
+    "outputs/csa-hbg-l4-9zolp_hy/deps.json": "7b9eff8ea7d3d1c5817978e4c1084547285ed6ee25121c93109dba2a2807e2dc",
+    "outputs/csa-hbg-l4-9zolp_hy/deps.log": "1612793d4f2c20e39830778364aa00e43fb42e50566cb3b09d910b27e5a59765",
+    "outputs/csa-hbg-l4-9zolp_hy/host_clock_alignment.2106141.log": "7b58d3c28e7e5e67f5ffe05aa68fef69c0926f9a1b4944e942f9d61076b9f1b0",
+    "outputs/csa-hbg-l4-9zolp_hy/result.json": "f008ca0a6e83cd912866d560095adce1473a92c1e5f41d66c02b55a8387de1bf",
+    "outputs/csa-hbg-l4-9zolp_hy/timing.log": "b20813f08bedaa5c378fa1ee032ea260062870fe9dffa958a3068baffcc60a25",
+    "outputs/csa-hbg-l4-y96qddiu/chip_swimlane_records.json": "4de6d5d85878b90be3c649c28f004d19fc1b22ca0ba17c1811a71972e7c535c9",
+    "outputs/csa-hbg-l4-y96qddiu/convert.log": "7b6cadd8071dbe1a9aa637bfc8b7cb72cce14b424654f5f3fd009f95bbfe0a44",
+    "outputs/csa-hbg-l4-y96qddiu/deps.json": "7b9eff8ea7d3d1c5817978e4c1084547285ed6ee25121c93109dba2a2807e2dc",
+    "outputs/csa-hbg-l4-y96qddiu/deps.log": "7e756e3c6b1be38b96cc9a0378399950fd2216ce129087ab9f3ca5179dbe6774",
+    "outputs/csa-hbg-l4-y96qddiu/host_clock_alignment.2094557.log": "87ea3c982bcfdae9816cdfafa0c16bde5de28addd1f064dbe1b75ac788a85dc3",
+    "outputs/csa-hbg-l4-y96qddiu/result.json": "d1130deffbbf331701ffa13f3ca4055d86fb56a54bc26c37dd3b8cf98e4a0250",
+    "outputs/csa-hbg-l4-y96qddiu/timing.log": "22b3547dc7d26612c6535627c67a3bff58a092a9a37f50c36a26dea319d19eac",
+    "outputs/csa-resident-a5-20261023.log": "35c92ee21ba5d6edf147b4c82395e9d9ad9f9b925cfe9e691115b2c0a1044c30",
+    "outputs/csa-tdd-cpu-20261023-verified.log": "50469eebe645ccea61a23f2c8cf705f7f93f460654fbac600f471e8f35366eef"
+  }
+}

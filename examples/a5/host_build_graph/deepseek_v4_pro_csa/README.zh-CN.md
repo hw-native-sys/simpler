@@ -163,3 +163,73 @@ python -m pytest -q \
 - `outputs/csa-hbg-l4-5dlwq5b0/L4.json`：依赖与计时两次采集的七项输出均通过，79 个逻辑任务、2308 条物理记录、107 条 host 构图记录完整。
 - 对该实测 L4 执行严格 producer 校验，因 `aicpu` 回退按预期拒绝；没有把数值通过认作 AICore 调度通过。
 - 2026-10-14 的 HBG 历史 benchmark 由本目录分析器重算，100 轮样本及统计完全一致；本次未重新采样性能基线。
+
+## 5. 真实 CSA 的调度 TDD（2026-10-23）
+
+入口为 [test_csa_business.py](../../../../tests/fdwic/pa_hbg/csa/test_csa_business.py)，直接继承本目录的原生用例，复用全部 54 个 kernel、52 项 ABI 和七项比较器。**没有换成探针、缩减 block 数、重新生成 golden，或修改生产 runtime。** 用例参数只改变经过验证的物理存储布局；性能比较仍用原来的 `run.py bench`，不能混合不同布局的计时。
+
+业务数值与调度来源是两道独立门禁：
+
+| 验收组 | 本次结果 | 后续通过条件 |
+| ------ | -------- | ------------ |
+| `TestCSABusiness` | A5 上 12 个用例 × 3 轮全部通过，252 项输出校验 | 所有输出继续符合原比较规则 |
+| `TestCSAResident` | A5 上 3 个用例均数值通过，再因 `mode=4` 失败 | 数值通过，且每次调用新发布 resident 模式 |
+| `run.py l4 --require-aicore-scheduler` | 数值和采集完整性通过，因 `producer=aicpu` 失败 | L4 的 scheduler producer 为 `aicore` |
+
+不能给后两组加 `xfail`、跳过 golden 或接受回退来使它们变绿。`TestCSABusiness` 允许 legacy，是稳定的业务基线，不是 resident 的替代证明。所有硬件用例保持 `manual`，避免在没有固定数据的机器上误启动大负载。
+
+### 业务变体及 oracle 边界
+
+[business_cases.py](business_cases.py) 定义 12 个用例：原始基线；main state、inner state、KV、compressed KV、index cache 五组分别反转；全部物理页反转、循环移动、固定种子打乱；index 页单独循环移动；index scale 写入扰动；全页打乱与 scale 扰动组合。
+
+- 每组页重排同时更新 pool、block table 和 slot mapping；普通 KV 还更新 `window_swa_indices`，index payload/scale 始终使用同一个映射。`-1` 哨兵、页内偏移、FP8 位模式和原有别名关系不变，golden 仅做相同物理页重排。
+- 原始 `idx_kv_scale` 的输入恰好等于输出。只看它数值通过，不能证明写入发生。扰动用例将**本次应写的两个槽位**初值置为 2，仍使用原 golden，迫使 `kv_and_cache_write` 正确覆盖；其他槽位保持原样。
+- 仍严格检查六个 pool 的未映射区域，不允许数值容差掩盖越界写。未触碰 compressor state 中原本合法的 `-Inf` 也必须保留，不能对整个 pool 一概要求有限值。
+- 每轮由现有 SceneTest L2 循环恢复七个输出缓冲区的初值。另有 CPU 测试直接驱动该循环，在三次设备调用的替身入口逐项断言已恢复，避免只用“重复输出相同”推断 reset 正确。
+- **不把 batch 任意排列当作等价变换。** 快照中请求 0 的 position 8192 和请求 2 的历史 position 0 都映射到 state 物理页 2，涉及行 8、9 的跨请求读写。真机单独复测 batch 反转时，`x_out`、`cmp_kv`、`idx_kv_cache` 不一致；旧 golden 不能直接按 batch 重排复用。该探索不是 scheduler 回归证据，最终测试拒绝这种未获支持的变换，并锁定两个 pool 的别名事实。
+
+### 真实图与边界断言
+
+[graph_contract.json](graph_contract.json) 来源于本次 A5 HBG 的 `deps.json`，保留原始采集 SHA256、commit 和输入清单摘要。图包含 79 个执行任务、2 个 Dummy、133 条去重后的图内依赖边，60 个多 block 任务、2308 条执行记录（AIC 864 / AIV 1444）。Host 已完成的分配节点另列为 `host_ready_refs`，不伪造它们的设备执行。
+
+[graph_contract.py](graph_contract.py) 在 `run.py l1/l4` 中检查原始 kernel 组合、block 数、依赖和 tensor view，并检查逐任务 AIC/AIV 数量、单次正数 epoch、包括 Dummy 在内的前驱执行完成时序。保留 schema 缺失项的边界：原始泳道**不提供 `block_idx` / `subtask_slot`**，结果明确写 `block_identity_verified=false`；2308 条记录不等于证明 2308 个唯一 block 身份。精确领取身份仍需配合 [SPMD 原生探针](../../../../tests/fdwic/pa_hbg/spmd/test_spmd_contract.py)。
+
+CPU TDD 分为两层：
+
+- 不需要大数据：`test_csa_business_variants.py`、`test_csa_capture_contract.py`、`test_csa_graph_contract.py`、`test_csa_scene_contract.py` 和 `hbg_spmd_contracts/test_csa_protocol.py`。逐条删除 133 条边、逐项缩减 60 个多 block 任务、去掉 Mix 的 AIV、破坏 16 个 pack 的 tensor view 都必须失败；完整 DAG 在 1/4/32 cluster 和不同 ready 顺序下执行。专测 Mix 512 的首块/波次边界/末块拖尾、最后一条 lane 的可见性、8 路 merge、16 路 projection 汇合、Dummy 以及普通分波不能误标成 sync_start。
+- 需要固定数据但不需要卡：[test_csa_snapshot.py](../../../../tests/fdwic/pa_hbg/csa/test_csa_snapshot.py)。检查真实七项 golden、全部布局变换、各 pool 首末写入/未映射行破坏、NaN/Inf、8 个 token 的最终输出损坏和 scale 漏写。此文件缺数据会失败，不会静默跳过。
+
+本次先写失败测试，确认旧采集校验遗漏“执行总数相同但核类型错误、epoch 混杂/为零、消费者越过 Dummy 提前执行”四个反例，再修正用例侧校验器。协议模型测试变绿只说明设计断言自洽，不说明生产 Scalar 调度器已实现。
+
+本次新增 460 项 CPU／快照检查全部通过；与既有 SPMD、CLA、CSA 和 golden hook 测试合并回归，共 1021 项通过。5 个相关 C++ 测试目标、Ruff、Markdown 和 Python 3.9 语法检查通过。
+
+### 复跑及实测记录
+
+在仓库根目录使用 Torch 2.12 的 `.venv-csa`，先确认已为当前 checkout 重编 native binding。以下不新增环境开关、pytest 参数或调度配置：
+
+```bash
+source .venv-csa/bin/activate
+export TORCH_DEVICE_BACKEND_AUTOLOAD=0
+export OMP_NUM_THREADS=8 MKL_NUM_THREADS=8
+
+# 12 个真实业务用例，每个 3 轮；同一 Worker 连续复用。
+python tests/fdwic/pa_hbg/csa/test_csa_business.py \
+  -p a5 -d 0 --manual include --case TestCSABusiness:: --rounds 3
+
+# 故意保留的 resident 红灯；不是纯协议模型。
+python tests/fdwic/pa_hbg/csa/test_csa_business.py \
+  -p a5 -d 0 --manual include --case TestCSAResident::
+
+# 本次新增的 CPU 和真实快照测试。
+python -m pytest -q tests/ut/py/test_csa_*.py \
+  tests/ut/py/hbg_spmd_contracts/test_csa_protocol.py \
+  tests/fdwic/pa_hbg/csa/test_csa_snapshot.py
+
+# 原有入口保持可用；L4 严格门禁仍拒绝回退。
+python examples/a5/host_build_graph/deepseek_v4_pro_csa/run.py l4 \
+  -d 0 --require-aicore-scheduler
+```
+
+本次设备 0 为 `Ascend950PR_958b`，当前 checkout 为 `f5cc679bbf3d7d2058ca453aa6bf0b6686cff989`，Torch `2.12.0+cpu`。没有使用缺失的 `npu-smi` 或 `task-submit`，通过 CANN 查询确认 A5 后直接上卡，未获取设备锁。结果索引见 [results_20261023.json](../../../../tests/fdwic/pa_hbg/csa/results_20261023.json)，其中区分通过、预期红灯和排除的 batch 变换探索。
+
+原始日志保存在 `outputs/csa-business-a5-20261023-validated.log`（36 次调用，epoch 1–36）、`outputs/csa-resident-a5-20261023.log`、`outputs/csa-hbg-check-t5gdhdhv/`、`outputs/csa-hbg-l4-y96qddiu/`、`outputs/csa-hbg-l4-9zolp_hy/` 和 `outputs/csa-hbg-l1-ouk4nqas/`。后续改调度器时先确保业务组没有正确性回归，再将 resident 和 L4 来源门禁从红变绿；不要据此声称 sync_start 已获得硬件覆盖。

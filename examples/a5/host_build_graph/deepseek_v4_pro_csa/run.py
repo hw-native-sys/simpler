@@ -20,9 +20,10 @@ from collections import Counter
 from pathlib import Path
 
 if __package__:
-    from . import workload
+    from . import graph_contract, workload
     from .analyze_perf import summarize
 else:
+    import graph_contract
     import workload
     from analyze_perf import summarize
 
@@ -43,11 +44,13 @@ def validate_task_capture(raw_path, deps_path, level):
         raise ValueError("CSA task capture is incomplete or the workload changed")
     if len(raw["aicore_tasks"]) != len(parsed["tasks"]):
         raise ValueError("AICore rows were lost during parsing")
+    obligations = graph_contract.audit_execution(deps, parsed["tasks"])
     summary = {
         "logical_tasks": len(actual),
         "physical_tasks": len(parsed["tasks"]),
         "clock_freq_hz": raw["metadata"]["clock_freq_hz"],
         "level": level,
+        **obligations,
     }
     return raw, parsed, summary
 
@@ -186,6 +189,7 @@ def main(argv=None):
             raw_path, deps_path = result_dir / "chip_swimlane_records.json", result_dir / "deps.json"
             shutil.copyfile(graph_dir / "deps.json", deps_path)
             shutil.copyfile(timing_dir / "chip_swimlane_records.json", raw_path)
+            graph_contract.validate_graph(json.loads(deps_path.read_text()))
             for pattern in ("name_map_*.json", "host_clock_alignment.*.log", "dispatch_identity.json"):
                 for companion in timing_dir.glob(pattern):
                     shutil.copyfile(companion, result_dir / companion.name)

@@ -23,7 +23,8 @@ repos:
           entry: python tests/lint/check_english_only.py
           language: python
           language_version: python3
-          exclude: ^(3rdparty/|docs/zh-cn/|README\.zh-CN\.md)|vendor/
+          # The PA HBG design notes are maintained in Chinese; code remains checked.
+          exclude: ^(3rdparty/|docs/zh-cn/|README\.zh-CN\.md)|vendor/|^tests/fdwic/pa_hbg/(?:[^/]+|spmd/[^/]+)\.md$
 
         - id: check-test-platform-literals
           name: check-test-platform-literals
