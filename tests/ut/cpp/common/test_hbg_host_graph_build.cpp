@@ -20,6 +20,7 @@
 #include <memory>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -27,11 +28,16 @@
 #include "host_build_graph/graph_recorder_pool.h"
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/kernel_external_tensor.h"
+#include "host_build_graph/kernel_external_tensor_wire.h"
+#include "host_build_graph/kernel_callable_binding.h"
 #include "host_build_graph/kernel_argument_snapshot.h"
 #include "host_build_graph/kernel_graph_template.h"
+#include "host_build_graph/kernel_graph_dispatch.h"
+#include "host_build_graph/kernel_graph_prepared.h"
 #include "host_build_graph/kernel_graph_slot.h"
 #include "host_build_graph/kernel_graph_slot_registry.h"
 #include "host_build_graph/kernel_graph_restore.h"
+#include "host_build_graph/kernel_launch_state.h"
 #include "host_build_graph/graph_execution.h"
 #include "host_build_graph/host_tensor_access.h"
 #include "host_build_graph/host_tensor_access_abort.h"
@@ -41,9 +47,21 @@
 #include "worker/runtime_c_api.h"
 #include "host/kernel_pipeline_contract.h"
 #include "call_config.h"
+#include "utils/fnv1a_64.h"
+#include "aicpu/platform_regs.h"
+#include "aicpu/args_dump_aicpu.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
+#include "aicpu/dep_gen_collector_aicpu.h"
+#include "aicpu/device_phase_aicpu.h"
+#include "aicpu/pmu_collector_aicpu.h"
+#include "aicpu/scope_stats_collector_aicpu.h"
+#include "common/kernel_args.h"
 
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count);
 extern "C" const char *const *runtime_l1_extra_aicpu_symbols(size_t *count);
+extern "C" int simpler_aicpu_l1_hbg_prepare_execution_context(void *arg);
+int consume_kernel_task(void *arg);
+uint64_t get_test_kernel_phase_base();
 
 namespace {
 
@@ -382,9 +400,72 @@ TEST(HbgKernelExternalTensor, RejectsHostDeviceArgsAndUnsupportedStrides) {
     EXPECT_EQ(hbg::validate_kernel_external_tensors(args), hbg::KernelExternalTensorStatus::UnsupportedStrideFamily);
 }
 
+TEST(HbgKernelExternalTensor, PreservesWideTensorArithmeticBounds) {
+    GraphTensor tensor{};
+    tensor.buffer_addr = 0x44000;
+    tensor.buffer_size = UINT64_MAX;
+    tensor.extent_elem = UINT64_MAX;
+    tensor.ndims = 3;
+    tensor.dtype = static_cast<uint8_t>(DataType::UINT8);
+    tensor.address_space = static_cast<uint8_t>(AddressSpace::DEVICE);
+    tensor.shapes[0] = UINT32_MAX;
+    tensor.shapes[1] = 5;
+    tensor.shapes[2] = 3;
+    tensor.strides[0] = UINT32_MAX - 1;
+    tensor.strides[1] = UINT32_MAX - 1;
+    tensor.strides[2] = 1;
+    EXPECT_TRUE(graph_tensor_wire_valid(tensor));
+    tensor.shapes[2] = 4;
+    tensor.extent_elem = 0;
+    EXPECT_FALSE(graph_tensor_wire_valid(tensor));
+
+    tensor.shapes[1] = UINT32_MAX;
+    tensor.shapes[2] = 2;
+    tensor.strides[0] = tensor.strides[1] = 1;
+    tensor.extent_elem = uint64_t{2} * UINT32_MAX;
+    EXPECT_FALSE(graph_tensor_wire_valid(tensor));
+
+    tensor.ndims = 2;
+    tensor.shapes[0] = tensor.shapes[1] = UINT32_MAX;
+    tensor.strides[0] = UINT32_MAX;
+    tensor.strides[1] = 1;
+    tensor.extent_elem = uint64_t{UINT32_MAX} * UINT32_MAX;
+    tensor.is_contiguous = 1;
+    EXPECT_TRUE(graph_tensor_wire_valid(tensor));
+    EXPECT_TRUE(hbg::supported_kernel_graph_stride_family(tensor));
+    tensor.strides[1] = UINT32_MAX;
+    EXPECT_FALSE(hbg::supported_kernel_graph_stride_family(tensor));
+
+    tensor.ndims = 3;
+    tensor.shapes[1] = 641;
+    tensor.shapes[2] = 6700417;
+    tensor.strides[0] = tensor.strides[1] = 1;
+    tensor.extent_elem = uint64_t{UINT32_MAX} + 641 + 6700417 - 2;
+    tensor.is_contiguous = 0;
+    EXPECT_TRUE(graph_tensor_wire_valid(tensor));
+    ++tensor.shapes[2];
+    ++tensor.extent_elem;
+    EXPECT_FALSE(graph_tensor_wire_valid(tensor));
+}
+
+TEST(HbgKernelExternalTensor, RejectsFlatTensorRankBeforePacking) {
+    const uint32_t shape[] = {1};
+    const auto boundary =
+        make_tensor_external(reinterpret_cast<void *>(0x22000), shape, 1, DataType::UINT64, AddressSpace::DEVICE);
+    auto tensor = simpler::hbg::Tensor::from_boundary(boundary);
+    ASSERT_TRUE(hbg::valid_kernel_graph_tensor(tensor));
+    ASSERT_TRUE(hbg::valid_restored_kernel_graph_tensor(tensor, 0x100000000ULL, 4096));
+    for (uint32_t ndims : {uint32_t{0}, uint32_t{MAX_TENSOR_DIMS + 1}, uint32_t{256}, UINT32_MAX}) {
+        SCOPED_TRACE(ndims);
+        tensor.ndims = ndims;
+        EXPECT_FALSE(hbg::valid_kernel_graph_tensor(tensor));
+        EXPECT_FALSE(hbg::valid_restored_kernel_graph_tensor(tensor, 0x100000000ULL, 4096));
+    }
+}
+
 class HostGraphBuildTest : public ::testing::Test {
 protected:
-    static constexpr uint64_t capacity = 64;
+    uint64_t capacity{64};
     Runtime runtime;
     DeviceArena host_arena;
     RuntimeArenaLayout layout{};
@@ -1483,7 +1564,115 @@ protected:
         );
         return out;
     }
+    hbg::HbgCallableRegistration dispatch_registration() const {
+        const auto graph = header();
+        hbg::HbgCallableRegistration registration{};
+        registration.context_generation = graph.slot_generation;
+        registration.runtime_address = 0x1000;
+        registration.register_table_address = 0x2000;
+        registration.callable_address = 0x3000;
+        registration.callable_bytes = sizeof(ChipCallable);
+        registration.callable_hash = identity.callable_hash;
+        registration.function_hash = identity.function_hash;
+        registration.callable_id = identity.callable_id;
+        registration.tensor_count = identity.tensor_count;
+        registration.scalar_count = identity.scalar_count;
+        registration.device_id = graph.device_id;
+        registration.runtime_binary_id = graph.runtime_binary_id;
+        return registration;
+    }
 };
+
+TEST(HbgGraphPacket, ChecksumMatchesOfficialXxh64AcrossAlignmentsAndTails) {
+    EXPECT_EQ(hbg::graph_packet_checksum(nullptr, 0), 0u);
+    EXPECT_EQ(hbg::graph_packet_checksum(nullptr, 512), 0u);
+    std::array<uint8_t, 80> short_packet{};
+    for (size_t bytes = 0; bytes < short_packet.size(); ++bytes)
+        EXPECT_EQ(hbg::graph_packet_checksum(short_packet.data(), bytes), 0u);
+    struct Golden {
+        size_t bytes;
+        uint64_t hashes[3];
+    };
+    // Official xxHash v0.8.3 XXH64(reference[0:64] + reference[80:], seed=0).
+    // Patterns: zero, 0xff, ((i * 37 + 11) ^ (i >> 3)) & 0xff, at physical offset i.
+    const Golden golden[] = {
+        {80, {0x257b09a147b82a19ULL, 0x2e54fae2959dbb84ULL, 0xc24252c19a5eddf4ULL}},
+        {81, {0xd033cd270447f937ULL, 0x6ed2445b4b82d6cbULL, 0x153fdcd9e3754d09ULL}},
+        {82, {0x1f3015449a5a2480ULL, 0x8bc9b76d9da69a7bULL, 0x7a3ba22f5e1bf612ULL}},
+        {83, {0xf8f20e020412c80aULL, 0xc9d2770133220dd7ULL, 0x7e031e357e0a1d0bULL}},
+        {84, {0x0a679d6f6e1d084cULL, 0x6e09cc8e7bc88046ULL, 0x25c7d3c0da75a4eeULL}},
+        {85, {0x221b3e9c66ed049bULL, 0xfb2ea409d22024f8ULL, 0xf39a5fed90d7fd3aULL}},
+        {86, {0xcc19586bc6b6659eULL, 0x723f58f37bcb48f3ULL, 0x2cc56907d95cc8d5ULL}},
+        {87, {0x462b2c1d5cc67d0dULL, 0x2be8c4abdd7444e6ULL, 0x125ed752fc98afbeULL}},
+        {88, {0xd2c15e19901d658eULL, 0x54da385251eed7cfULL, 0x2f2aab41c5e200c2ULL}},
+        {89, {0xbe88019ce5de71b6ULL, 0x44116994dc3b5dbcULL, 0x26b4d4d21d182ef7ULL}},
+        {90, {0x122d7e563f7ebe53ULL, 0xa534b3306e19a362ULL, 0x8ff61a79a5224c57ULL}},
+        {91, {0xdfb1b23670a37f6bULL, 0x518a1cdd1cae6d89ULL, 0x37c06e3c0c06f387ULL}},
+        {92, {0x6d4dc250a2d71dd8ULL, 0xb545728891acd0c0ULL, 0xf8abb43834759dd9ULL}},
+        {93, {0x767323aa514a4b3eULL, 0x8bd834b970eae746ULL, 0xbaea1f7652503622ULL}},
+        {94, {0xd02a55fbcdd78515ULL, 0xaeb31e1dfe50ac04ULL, 0x459556d0ced51f50ULL}},
+        {95, {0x4b8cef055d638a36ULL, 0xb028ba6e929900edULL, 0xcb644d4939c0150dULL}},
+        {96, {0xee6d208b78ba5eaaULL, 0xa576860c8bf28ba7ULL, 0xd47796f278d87812ULL}},
+        {97, {0x31e926817a39841bULL, 0x00dd17f6611db32cULL, 0xd7fa9c58f8a9106bULL}},
+        {98, {0x9ff396b3135b456cULL, 0xb40ace2a18c04691ULL, 0xb1a54cfc3be5c6e8ULL}},
+        {99, {0x5c0413dac1b3b939ULL, 0xf632c1001a64972cULL, 0xef3d78b38bba4032ULL}},
+        {100, {0x1498e3f1d1af7e35ULL, 0xdbb87b2bd21282adULL, 0x2d7c65de5f2a5c61ULL}},
+        {101, {0x4e6fe85182d48a10ULL, 0x563054d9390a6244ULL, 0x23b34c4800e50d24ULL}},
+        {102, {0x023314074cb17f3aULL, 0xef02095399d77e5eULL, 0x2202f17dc88f2bf0ULL}},
+        {103, {0xa5fa1a57f86e2821ULL, 0xed595fa6df97559aULL, 0xd34be233ac54c626ULL}},
+        {104, {0x90544ddf7f0428ebULL, 0x60ffc85a1a4db56dULL, 0x0367d4dd913dae03ULL}},
+        {105, {0xfad4f662b43ce68cULL, 0x224930fefa4ffc9fULL, 0x203e8a1771bdbe3eULL}},
+        {106, {0xbfc627f903045881ULL, 0x2f95c9fbc9aad2f6ULL, 0x7141cae5692b7a94ULL}},
+        {107, {0x5f6042db52039ba9ULL, 0x9c3c97840ef928f9ULL, 0xfc88a4f267b279d5ULL}},
+        {108, {0x4808152f82cfb223ULL, 0xc93b4e94fd6a4bc8ULL, 0x6c2c4d4c62276930ULL}},
+        {109, {0xf3d57b3fcfda5974ULL, 0x98899143b63f1fafULL, 0xfad3ca84a98eb604ULL}},
+        {110, {0x5e2157cc7eabc1c6ULL, 0x75c6e358269872ecULL, 0x1dcfc200dc0dfd82ULL}},
+        {111, {0x59f913c719e77988ULL, 0xbef7e10175af1391ULL, 0x2ea711814a1bd15bULL}},
+        {112, {0xc088fb75504a22bfULL, 0xa4c923881794a94fULL, 0x5be3f26dd8ca09d1ULL}},
+        {113, {0x2f3a12dcabb0f60bULL, 0xbb0bd4e56a3cab3dULL, 0xbe1bde904930d035ULL}},
+        {127, {0x51c55aadcba25168ULL, 0x50378970a1e9ba43ULL, 0x21b38d4bb79ab177ULL}},
+        {128, {0x8ff8fc9514e3a9c1ULL, 0x8b2949dc1458af05ULL, 0xe6fd9cd96ea7bfcbULL}},
+        {129, {0xd0bde90e5fab3ff4ULL, 0xaadb5643789b5af6ULL, 0xde2a8315756601e4ULL}},
+        {255, {0xb5ea2ee9848886e1ULL, 0x02ebc97799cfb588ULL, 0xd30e238cdec40906ULL}},
+        {256, {0x3b2f9b86d7a3505dULL, 0x67da7d82d095af3cULL, 0x8aa91e14d42ba13aULL}},
+        {257, {0xce57013ff2e37492ULL, 0x6688fa92212896ddULL, 0x0cf01c39c032ca23ULL}},
+        {513, {0xfd9e18a73f717a2cULL, 0xd4348b57b6d89568ULL, 0x857ee35c2b8047ffULL}},
+        {1024, {0xb0ee0eb5ed26f0eeULL, 0xbbedde8b00c972e0ULL, 0x2f832a9db4d8f88fULL}},
+        {84000, {0x303e48c0241fa756ULL, 0x383e395b79a44ce5ULL, 0xe4958b533bac1688ULL}},
+    };
+    for (const auto &entry : golden) {
+        for (size_t pattern = 0; pattern < 3; ++pattern) {
+            for (size_t alignment = 0; alignment < sizeof(uint64_t); ++alignment) {
+                // The packet ends at the allocation boundary for sanitizer overread checks.
+                auto storage = std::make_unique<uint8_t[]>(alignment + entry.bytes);
+                auto *packet = storage.get() + alignment;
+                for (size_t i = 0; i < entry.bytes; ++i)
+                    packet[i] = pattern == 0 ? 0 : pattern == 1 ? 0xff : static_cast<uint8_t>((i * 37 + 11) ^ (i >> 3));
+                ASSERT_EQ(hbg::graph_packet_checksum(packet, entry.bytes), entry.hashes[pattern])
+                    << "pattern=" << pattern << " alignment=" << alignment << " bytes=" << entry.bytes;
+            }
+        }
+    }
+}
+
+TEST(HbgGraphPacket, ChecksumExcludesOnlyPatchedAddressAndChecksumBytes) {
+    constexpr size_t skip =
+        sizeof(SimplerKernelInvocationHeader) + offsetof(hbg::GraphPacketHeader, inline_payload_addr);
+    std::vector<uint8_t> packet(513, 0);
+    const uint64_t baseline = hbg::graph_packet_checksum(packet.data(), packet.size());
+    for (size_t offset = 0; offset < packet.size(); ++offset) {
+        for (unsigned bit = 0; bit < 8; ++bit) {
+            packet[offset] = static_cast<uint8_t>(1u << bit);
+            const uint64_t checksum = hbg::graph_packet_checksum(packet.data(), packet.size());
+            if (offset >= skip && offset < skip + 16) {
+                EXPECT_EQ(checksum, baseline) << "offset=" << offset << " bit=" << bit;
+            } else {
+                EXPECT_NE(checksum, baseline) << "offset=" << offset << " bit=" << bit;
+            }
+            packet[offset] = 0;
+        }
+    }
+}
 
 TEST(HbgGraphPacket, CompactLayoutFollowsWindowAndPreservesProgramSizing) {
     for (uint64_t window : {1, 2, 63, 64, 65, 128, 32768}) {
@@ -1541,6 +1730,108 @@ TEST_F(HbgGraphPacketTest, SnapshotOwnsImagesAndPreservesSourceAndDeviceMemory) 
     ASSERT_EQ(hbg::make_graph_host_args(snapshot, args), 0);
     EXPECT_EQ(bytes(), original);
     EXPECT_EQ(std::memcmp(args.storage.data(), original.data(), args.bytes), 0);
+}
+
+TEST_F(HbgGraphPacketTest, DispatchKeepsCanonicalPacketAndRelocatesBothPlaceholders) {
+    ASSERT_EQ(build(chain_entry), 2);
+    prepare();
+    ASSERT_EQ(snapshot_graph(), 0);
+    const auto original = bytes();
+    const auto registration = dispatch_registration();
+    hbg::GraphHostArgs canonical;
+    hbg::GraphHostArgs args;
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, canonical), 0);
+    ASSERT_EQ(hbg::make_graph_dispatch_args(snapshot, registration, args), 0);
+    hbg::GraphDispatchHeader dispatch{};
+    ASSERT_TRUE(hbg::read_graph_dispatch_header(args.storage.data(), sizeof(dispatch), dispatch));
+    EXPECT_EQ(std::memcmp(&dispatch.registration, &registration, sizeof(registration)), 0);
+    EXPECT_EQ(args.bytes, sizeof(dispatch) + original.size());
+    EXPECT_EQ(args.address_offset, sizeof(dispatch) + canonical.address_offset);
+    EXPECT_EQ(args.data_offset, sizeof(dispatch) + canonical.data_offset);
+    auto *inner = reinterpret_cast<std::byte *>(args.storage.data()) + sizeof(dispatch);
+    EXPECT_EQ(std::memcmp(inner, original.data(), original.size()), 0);
+    const uint64_t address = reinterpret_cast<uintptr_t>(args.storage.data()) + args.data_offset;
+    std::memcpy(reinterpret_cast<std::byte *>(args.storage.data()) + args.address_offset, &address, sizeof(address));
+    EXPECT_EQ(
+        hbg::validate_graph_packet(inner, original.size(), hbg::GraphPacketAddress::DeviceCopy),
+        hbg::GraphPacketStatus::Ok
+    );
+    EXPECT_TRUE(hbg::read_graph_dispatch_header(args.storage.data(), sizeof(dispatch), dispatch));
+    inner[original.size() - 1] ^= std::byte{1};
+    EXPECT_EQ(
+        hbg::validate_graph_packet(inner, original.size(), hbg::GraphPacketAddress::DeviceCopy),
+        hbg::GraphPacketStatus::InvalidChecksum
+    );
+    EXPECT_EQ(bytes(), original);
+    const auto previous = args.storage;
+    auto conflict = registration;
+    ++conflict.function_hash;
+    EXPECT_EQ(hbg::make_graph_dispatch_args(snapshot, conflict, args), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(args.storage, previous);
+}
+
+TEST_F(HbgGraphPacketTest, DispatchPrefixRejectsDamageAndFramingWithoutChangingOutput) {
+    ASSERT_EQ(build(chain_entry), 2);
+    prepare();
+    ASSERT_EQ(snapshot_graph(), 0);
+    hbg::GraphHostArgs args;
+    ASSERT_EQ(hbg::make_graph_dispatch_args(snapshot, dispatch_registration(), args), 0);
+    hbg::GraphDispatchHeader good{};
+    ASSERT_TRUE(hbg::read_graph_dispatch_header(args.storage.data(), sizeof(good), good));
+    hbg::GraphDispatchHeader output{};
+    std::memset(static_cast<void *>(&output), 0xa5, sizeof(output));
+    const auto unchanged = output;
+    auto rejected = [&](const void *data, size_t size) {
+        EXPECT_FALSE(hbg::read_graph_dispatch_header(data, size, output));
+        EXPECT_EQ(std::memcmp(&output, &unchanged, sizeof(output)), 0);
+    };
+    rejected(nullptr, sizeof(good));
+    for (size_t size = 0; size < sizeof(good); ++size)
+        rejected(&good, size);
+    for (size_t alignment = 0; alignment < 8; ++alignment) {
+        auto exact = std::make_unique<uint8_t[]>(sizeof(good) + alignment);
+        auto *data = exact.get() + alignment;
+        std::memcpy(data, &good, sizeof(good));
+        hbg::GraphDispatchHeader parsed{};
+        ASSERT_TRUE(hbg::read_graph_dispatch_header(data, sizeof(good), parsed));
+        EXPECT_EQ(std::memcmp(&parsed, &good, sizeof(good)), 0);
+        for (size_t byte = 0; byte < sizeof(good); ++byte) {
+            for (unsigned bit = 0; bit < 8; ++bit) {
+                data[byte] ^= uint8_t{1} << bit;
+                rejected(data, sizeof(good));
+                data[byte] ^= uint8_t{1} << bit;
+            }
+        }
+    }
+    std::vector<hbg::GraphDispatchHeader> invalid;
+    auto bad = good;
+    bad.version++;
+    invalid.push_back(bad);
+    bad = good;
+    bad.header_bytes--;
+    invalid.push_back(bad);
+    bad = good;
+    bad.packet_bytes = UINT64_MAX;
+    invalid.push_back(bad);
+    bad = good;
+    bad.packet_bytes = sizeof(SimplerKernelInvocationHeader) + sizeof(hbg::GraphPacketHeader) - 1;
+    invalid.push_back(bad);
+    bad = good;
+    bad.invocation.reserved_ = 1;
+    invalid.push_back(bad);
+    bad = good;
+    bad.invocation.host_copy_tensor_count = 1;
+    invalid.push_back(bad);
+    bad = good;
+    bad.registration.context_generation = 0;
+    invalid.push_back(bad);
+    bad = good;
+    bad.registration.tensor_count++;
+    invalid.push_back(bad);
+    for (auto &candidate : invalid) {
+        candidate.checksum = hbg::graph_dispatch_checksum(candidate);
+        rejected(&candidate, sizeof(candidate));
+    }
 }
 
 TEST_F(HbgGraphPacketTest, DefinitionSnapshotsIncludeRetainedSpilledAndRepeatedGraphs) {
@@ -1609,9 +1900,10 @@ TEST_F(HbgGraphPacketTest, SmallerGraphKeepsFrozenCapacityAndTransmitsOnlyLiveIm
         &image, static_cast<const std::byte *>(snapshot.data()) + sizeof(SimplerKernelInvocationHeader) + sizeof(h),
         sizeof(image)
     );
-    EXPECT_EQ(image.bytes, h.sm_offset + result.image_bytes);
+    EXPECT_EQ(image.destination_offset, h.runtime_offset);
+    EXPECT_EQ(image.bytes, h.sm_offset + result.image_bytes - h.runtime_offset);
     RuntimeContext pristine{};
-    std::memcpy(&pristine, payload + h.runtime_offset, sizeof(pristine));
+    std::memcpy(&pristine, payload, sizeof(pristine));
     EXPECT_EQ(pristine.ops, nullptr);
     EXPECT_EQ(pristine.orchestrator, nullptr);
     EXPECT_EQ(pristine.tensor_access, nullptr);
@@ -1624,6 +1916,22 @@ TEST_F(HbgGraphPacketTest, SmallerGraphKeepsFrozenCapacityAndTransmitsOnlyLiveIm
         hbg::validate_graph_packet(larger.data(), larger.size(), hbg::GraphPacketAddress::HostTemplate),
         hbg::GraphPacketStatus::Ok
     );
+}
+
+TEST_F(HbgGraphPacketTest, RuntimeImageExcludesDeviceInitializedPrefix) {
+    ASSERT_EQ(build(chain_entry), 2);
+    prepare();
+    ASSERT_EQ(snapshot_graph(), 0);
+    const auto h = header();
+    hbg::GraphImageRegion image{};
+    std::memcpy(
+        &image, static_cast<const std::byte *>(snapshot.data()) + sizeof(SimplerKernelInvocationHeader) + sizeof(h),
+        sizeof(image)
+    );
+    EXPECT_EQ(image.destination_offset, h.runtime_offset);
+    EXPECT_EQ(image.bytes, h.sm_offset + result.image_bytes - h.runtime_offset);
+    EXPECT_EQ(required.runtime_arena_bytes, h.sm_offset + result.image_bytes);
+    EXPECT_GE(h.destinations[1].capacity, required.runtime_arena_bytes);
 }
 
 TEST_F(HbgGraphPacketTest, HeapAndDependencyReferencesSurviveCopyingThePacket) {
@@ -1639,9 +1947,9 @@ TEST_F(HbgGraphPacketTest, HeapAndDependencyReferencesSurviveCopyingThePacket) {
     Buffer relocated;
     relocated.reserve(binding.runtime_image.capacity);
     std::memcpy(
-        relocated.data(),
+        relocated.data() + h.runtime_offset,
         static_cast<const std::byte *>(snapshot.data()) + sizeof(SimplerKernelInvocationHeader) + h.payload_offset,
-        h.sm_offset + result.image_bytes
+        h.sm_offset + result.image_bytes - h.runtime_offset
     );
     const auto to = sm_layout::segment_offsets(sm_layout::image_extents(result.bind_usage));
     const auto *tasks = reinterpret_cast<const ChipTaskStorage *>(relocated.data() + h.sm_offset + to.storage);
@@ -1740,6 +2048,9 @@ TEST_F(HbgGraphPacketTest, RejectsMalformedEnvelopeHeaderRegionsAndContents) {
         },
         [](auto &, auto &h, auto &) {
             h.version++;
+        },
+        [](auto &, auto &h, auto &) {
+            h.version = 3;
         },
         [](auto &, auto &h, auto &) {
             h.region_count = UINT32_MAX;
@@ -1841,6 +2152,48 @@ TEST_F(HbgGraphPacketTest, RejectsUnpreparedContextAndAllowsConcurrentLaunchCopi
     auto second = std::async(std::launch::async, copy);
     EXPECT_TRUE(first.get());
     EXPECT_TRUE(second.get());
+    const auto registration = dispatch_registration();
+    auto copy_dispatch = [&]() {
+        hbg::GraphHostArgs args;
+        if (hbg::make_graph_dispatch_args(snapshot, registration, args) != 0) return false;
+        hbg::GraphDispatchHeader dispatch{};
+        if (!hbg::read_graph_dispatch_header(args.storage.data(), sizeof(dispatch), dispatch)) return false;
+        const auto *inner = reinterpret_cast<const std::byte *>(args.storage.data()) + sizeof(dispatch);
+        return hbg::validate_graph_packet(inner, dispatch.packet_bytes, hbg::GraphPacketAddress::HostTemplate) ==
+               hbg::GraphPacketStatus::Ok;
+    };
+    auto dispatch_first = std::async(std::launch::async, copy_dispatch);
+    auto dispatch_second = std::async(std::launch::async, copy_dispatch);
+    EXPECT_TRUE(dispatch_first.get());
+    EXPECT_TRUE(dispatch_second.get());
+}
+
+TEST_F(HbgGraphPacketTest, DispatchSubmissionPropagatesFailureWithoutChangingTemplate) {
+    ASSERT_EQ(build(chain_entry), 2);
+    prepare();
+    ASSERT_EQ(snapshot_graph(), 0);
+    const auto original = bytes();
+    int calls = 0;
+    const hbg::GraphHostLaunchOps ops{
+        &calls, [](void *opaque, hbg::GraphHostArgs &args) -> int {
+            ++*static_cast<int *>(opaque);
+            hbg::GraphDispatchHeader dispatch{};
+            EXPECT_TRUE(hbg::read_graph_dispatch_header(args.storage.data(), sizeof(dispatch), dispatch));
+            const uint64_t address = reinterpret_cast<uintptr_t>(args.storage.data()) + args.data_offset;
+            std::memcpy(
+                reinterpret_cast<std::byte *>(args.storage.data()) + args.address_offset, &address, sizeof(address)
+            );
+            const auto *inner = reinterpret_cast<const std::byte *>(args.storage.data()) + sizeof(dispatch);
+            EXPECT_EQ(
+                hbg::validate_graph_packet(inner, dispatch.packet_bytes, hbg::GraphPacketAddress::DeviceCopy),
+                hbg::GraphPacketStatus::Ok
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    };
+    EXPECT_EQ(hbg::submit_graph_dispatch(snapshot, dispatch_registration(), ops), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(calls, 1);
+    EXPECT_EQ(bytes(), original);
 }
 
 TEST_F(HbgGraphPacketTest, LaunchBridgeCopiesEachPacketAndPropagatesSubmissionFailure) {
@@ -1923,8 +2276,9 @@ TEST_F(HbgGraphPacketTest, TensorAddressesAndScalarsSurviveRelocation) {
         Buffer aligned;
         aligned.reserve(binding.runtime_image.capacity);
         std::memcpy(
-            aligned.data(), packets[i].data() + sizeof(SimplerKernelInvocationHeader) + first_header.payload_offset,
-            first_header.sm_offset + result.image_bytes
+            aligned.data() + first_header.runtime_offset,
+            packets[i].data() + sizeof(SimplerKernelInvocationHeader) + first_header.payload_offset,
+            first_header.sm_offset + result.image_bytes - first_header.runtime_offset
         );
         const auto *sm = aligned.data() + first_header.sm_offset;
         const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents(result.bind_usage));
@@ -2005,9 +2359,9 @@ protected:
         if (registry != nullptr) hbg::detach_graph_slot_registry(registry);
         HbgGraphPacketTest::TearDown();
     }
-    void prepare_slot(bool publish = true, uint64_t scheduler_capacity = 0) {
+    void prepare_slot(bool publish = true, uint64_t scheduler_capacity = 0, uint64_t spare = 0) {
         ASSERT_GE(build(graph_entry), 0);
-        prepare(0, scheduler_capacity);
+        prepare(spare, scheduler_capacity);
         ASSERT_EQ(hbg::seal_graph_execution_slot(context, 0, 19, 109, seal), 0);
         registry = reinterpret_cast<hbg::GraphSlotRegistry *>(seal.registry.address);
         if (publish) {
@@ -2060,6 +2414,230 @@ protected:
     }
 };
 
+TEST_F(HbgGraphSlotTest, DispatchBoundsIncludeThePrefixAndRejectStaleContextAuthority) {
+    prepare_slot();
+    const auto before = working_bytes();
+    auto registration = dispatch_registration();
+    // Prefix/slot admission must not dereference this prepare-owned address.
+    registration.runtime_address = 1;
+    hbg::GraphHostArgs args;
+    ASSERT_EQ(hbg::make_graph_dispatch_args(snapshot, registration, args), 0);
+    hbg::GraphDispatchHeader dispatch{};
+    ASSERT_TRUE(hbg::read_graph_dispatch_header(args.storage.data(), sizeof(dispatch), dispatch));
+    ASSERT_TRUE(hbg::graph_dispatch_matches_slot(args.storage.data(), dispatch, seal));
+    auto conflict = dispatch;
+    ++conflict.registration.context_generation;
+    EXPECT_FALSE(hbg::graph_dispatch_matches_slot(args.storage.data(), conflict, seal));
+    conflict = dispatch;
+    ++conflict.registration.device_id;
+    EXPECT_FALSE(hbg::graph_dispatch_matches_slot(args.storage.data(), conflict, seal));
+    conflict = dispatch;
+    ++conflict.registration.runtime_binary_id;
+    EXPECT_FALSE(hbg::graph_dispatch_matches_slot(args.storage.data(), conflict, seal));
+    conflict = dispatch;
+    conflict.packet_bytes = seal.max_packet_bytes + 1;
+    EXPECT_FALSE(hbg::graph_dispatch_matches_slot(args.storage.data(), conflict, seal));
+    const uint64_t begin = reinterpret_cast<uintptr_t>(args.storage.data());
+    const hbg::GraphDestination inner{begin + sizeof(dispatch), dispatch.packet_bytes};
+    for (size_t destination = 0; destination < 5; ++destination) {
+        auto overlap = seal;
+        auto &window = destination == 4 ? overlap.registry : overlap.destinations[destination];
+        window = {begin, sizeof(dispatch)};
+        ASSERT_FALSE(hbg::graph_windows_overlap(inner, window));
+        EXPECT_FALSE(hbg::graph_dispatch_source_fits(args.storage.data(), sizeof(dispatch), overlap));
+        EXPECT_FALSE(hbg::graph_dispatch_matches_slot(args.storage.data(), dispatch, overlap));
+    }
+    EXPECT_FALSE(hbg::graph_dispatch_source_fits(nullptr, sizeof(dispatch), seal));
+    EXPECT_FALSE(hbg::graph_dispatch_source_fits(reinterpret_cast<void *>(UINTPTR_MAX - 8), sizeof(dispatch), seal));
+    EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphSlotTest, DispatchConflictRejectsBeforeReadingUnmappedRuntime) {
+    prepare_slot();
+    EXPECT_EXIT(
+        {
+            alarm(5);
+            const auto before = working_bytes();
+            auto registration = dispatch_registration();
+            if (simpler_aicpu_l1_hbg_register_callable(&registration) != 0) _exit(2);
+            registration.runtime_address = 1;
+            hbg::GraphHostArgs args;
+            if (hbg::make_graph_dispatch_args(snapshot, registration, args) != 0) _exit(3);
+            const int rc = consume_kernel_task(args.storage.data());
+            _exit(rc != 0 && working_bytes() == before ? 0 : 1);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+
+TEST_F(HbgGraphSlotTest, DispatchPublicationFailureCancelsAndReleasesAllParticipants) {
+    prepare_slot();
+    auto isolated = [&]() {
+        alarm(5);
+        const auto before = working_bytes();
+        Runtime runtime;
+        runtime.set_aicpu_thread_num(4);
+        runtime.set_aicpu_allowed_cpu_count(4);
+        runtime.set_aicpu_launch_count(4);
+        auto registration = dispatch_registration();
+        registration.runtime_address = reinterpret_cast<uintptr_t>(&runtime);
+        if (simpler_aicpu_l1_hbg_register_callable(&registration) != 0) _exit(2);
+        set_platform_regs(registration.register_table_address + 8);
+        hbg::GraphHostArgs args;
+        if (hbg::make_graph_dispatch_args(snapshot, registration, args) != 0) _exit(3);
+        const uint64_t payload = reinterpret_cast<uintptr_t>(args.storage.data()) + args.data_offset;
+        std::memcpy(
+            reinterpret_cast<std::byte *>(args.storage.data()) + args.address_offset, &payload, sizeof(payload)
+        );
+        const auto *inner = reinterpret_cast<const std::byte *>(args.storage.data()) + sizeof(hbg::GraphDispatchHeader);
+        if (hbg::validate_graph_packet(inner, snapshot.size(), hbg::GraphPacketAddress::DeviceCopy) !=
+            hbg::GraphPacketStatus::Ok)
+            _exit(4);
+        for (int round = 0; round < 2; ++round) {
+            runtime.kernel_prelaunch.state = HBG_KERNEL_PRELAUNCH_WAIT;
+            std::array<int, 4> results{};
+            std::vector<std::thread> threads;
+            for (size_t thread = 0; thread < results.size(); ++thread)
+                threads.emplace_back([&, thread] {
+                    results[thread] = consume_kernel_task(args.storage.data());
+                });
+            for (auto &thread : threads)
+                thread.join();
+            if (std::any_of(
+                    results.begin(), results.end(),
+                    [](int rc) {
+                        return rc == 0;
+                    }
+                ) ||
+                runtime.kernel_prelaunch.state != HBG_KERNEL_PRELAUNCH_CANCEL || registry->restore.attempt != 0 ||
+                working_bytes() != before)
+                _exit(1);
+        }
+        _exit(0);
+    };
+    EXPECT_EXIT(isolated(), ::testing::ExitedWithCode(0), "");
+}
+
+TEST_F(HbgGraphSlotTest, KernelDfxRefreshTracksWindowsAndReplacesProgramGlobals) {
+    prepare_slot();
+    Runtime runtime;
+    auto registration = dispatch_registration();
+    registration.runtime_address = reinterpret_cast<uintptr_t>(&runtime);
+    KernelArgs args{};
+    args.runtime_args = &runtime;
+    args.regs = registration.register_table_address;
+    args.chip_swimlane_data_base = 0x10000;
+    args.chip_swimlane_aicore_rotation_table = 0x20000;
+    args.dep_gen_data_base = 0x30000;
+    *runtime.kernel_dfx_args_slot() = reinterpret_cast<uintptr_t>(&args);
+    const uint32_t swimlane = SIMPLER_DFX_FLAG_CHIP_SWIMLANE;
+    const uint32_t dependencies = SIMPLER_DFX_FLAG_DEP_GEN;
+    for (uint32_t flags : {0u, swimlane, 0u, dependencies, swimlane | dependencies, 0u, swimlane}) {
+        SCOPED_TRACE(flags);
+        set_chip_swimlane_enabled(false);
+        set_platform_chip_swimlane_base(0x40000);
+        set_platform_chip_swimlane_aicore_rotation_table(0x50000);
+        set_dep_gen_enabled(true);
+        set_platform_dep_gen_base(0x60000);
+        set_dump_args_enabled(true);
+        set_platform_dump_base(0x61000);
+        set_scope_stats_enabled(true);
+        set_pmu_enabled(true);
+        set_platform_pmu_base(0x70000);
+        set_platform_phase_base(0x80000);
+        args.enable_profiling_flag = flags;
+        ASSERT_TRUE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+        EXPECT_EQ(is_chip_swimlane_enabled(), (flags & swimlane) != 0);
+        EXPECT_EQ(get_platform_chip_swimlane_base(), args.chip_swimlane_data_base);
+        EXPECT_EQ(get_platform_chip_swimlane_aicore_rotation_table(), args.chip_swimlane_aicore_rotation_table);
+        EXPECT_EQ(is_dep_gen_enabled(), (flags & dependencies) != 0);
+        EXPECT_EQ(get_platform_dep_gen_base(), args.dep_gen_data_base);
+        EXPECT_FALSE(is_dump_args_enabled());
+        EXPECT_FALSE(is_pmu_enabled());
+        EXPECT_FALSE(is_scope_stats_enabled());
+        EXPECT_EQ(get_platform_dump_base(), 0u);
+        EXPECT_EQ(get_platform_pmu_base(), 0u);
+        EXPECT_EQ(get_test_kernel_phase_base(), 0u);
+    }
+    auto conflict = registration;
+    ++conflict.context_generation;
+    EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, conflict));
+    conflict = registration;
+    conflict.register_table_address += 8;
+    EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, conflict));
+    *runtime.kernel_dfx_args_slot() = 1;
+    EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    *runtime.kernel_dfx_args_slot() = reinterpret_cast<uintptr_t>(&args);
+    args.enable_profiling_flag = SIMPLER_DFX_FLAG_PMU;
+    EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    EXPECT_TRUE(is_chip_swimlane_enabled());
+    EXPECT_EQ(get_platform_chip_swimlane_base(), 0x10000u);
+    alignas(1024) hbg::GraphSlotRegistry other{};
+    EXPECT_FALSE(hbg::detach_graph_slot_registry(&other));
+    EXPECT_TRUE(is_chip_swimlane_enabled());
+    ASSERT_TRUE(hbg::detach_graph_slot_registry(registry));
+    EXPECT_FALSE(is_chip_swimlane_enabled());
+    EXPECT_FALSE(is_dep_gen_enabled());
+    EXPECT_EQ(get_platform_chip_swimlane_base(), 0u);
+    EXPECT_EQ(get_platform_chip_swimlane_aicore_rotation_table(), 0u);
+    EXPECT_EQ(get_platform_dep_gen_base(), 0u);
+    EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    ASSERT_EQ(hbg::bind_graph_slot_registry(registry, 0, 109), hbg::GraphSlotStatus::Ok);
+    args.chip_swimlane_data_base = 0x90000;
+    args.enable_profiling_flag = swimlane;
+    ASSERT_TRUE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    EXPECT_EQ(get_platform_chip_swimlane_base(), 0x90000u);
+}
+
+TEST_F(HbgGraphSlotTest, KernelDfxRejectsInvalidResidentArgsBeforeBinding) {
+    prepare_slot();
+    Runtime runtime;
+    auto registration = dispatch_registration();
+    registration.runtime_address = reinterpret_cast<uintptr_t>(&runtime);
+    KernelArgs args{};
+    args.runtime_args = &runtime;
+    args.regs = registration.register_table_address;
+    *runtime.kernel_dfx_args_slot() = reinterpret_cast<uintptr_t>(&args);
+    const auto valid = args;
+    for (int invalid = 0; invalid < 8; ++invalid) {
+        SCOPED_TRACE(invalid);
+        args = valid;
+        switch (invalid) {
+        case 0:
+            args.runtime_args = nullptr;
+            break;
+        case 1:
+            args.regs += 8;
+            break;
+        case 2:
+            args.chip_swimlane_data_base = 0x10000;
+            break;
+        case 3:
+            args.chip_swimlane_aicore_rotation_table = 0x20000;
+            break;
+        case 4:
+            args.dep_gen_data_base = 1;
+            break;
+        case 5:
+            args.enable_profiling_flag = SIMPLER_DFX_FLAG_DEP_GEN;
+            break;
+        case 6:
+            args.dump_data_base = 0x30000;
+            break;
+        case 7:
+            args.device_wall_data_base = 0x40000;
+            break;
+        }
+        EXPECT_FALSE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    }
+    args = valid;
+    ASSERT_TRUE(hbg::refresh_graph_kernel_dfx(registry, &runtime, registration));
+    EXPECT_FALSE(is_chip_swimlane_enabled());
+    EXPECT_FALSE(is_dep_gen_enabled());
+    EXPECT_EQ(get_platform_chip_swimlane_base(), 0u);
+    EXPECT_EQ(get_platform_dep_gen_base(), 0u);
+}
+
 TEST_F(HbgGraphSlotTest, SealsFrozenContextBeforeReadyAndUsesDedicatedPrepareStream) {
     ASSERT_GE(build(chain_entry), 0);
     RuntimeArenaLayout compact{};
@@ -2091,7 +2669,7 @@ TEST_F(HbgGraphSlotTest, SealsFrozenContextBeforeReadyAndUsesDedicatedPrepareStr
     ASSERT_EQ(admit(view), hbg::GraphSlotStatus::Ok);
     EXPECT_EQ(view.slot.slot_generation, 19u);
     EXPECT_EQ(view.graph.runtime_binary_id, 109u);
-    EXPECT_EQ(view.slot.max_packet_bytes, packet.bytes);
+    EXPECT_EQ(view.slot.max_packet_bytes, packet.bytes + packet_header().runtime_offset);
     EXPECT_EQ(provider.allocation_calls, allocations);
     EXPECT_TRUE(platform.copies.empty());
 }
@@ -2291,11 +2869,10 @@ TEST_F(HbgGraphSlotTest, KernelRegistrationRejectsASecondLiveContextBeforeWritin
 }
 
 TEST(HbgKernelRegistrationManifestTest, ProgramAndKernelModesExposeIndependentSymbolSets) {
-    constexpr std::array<const char *, 4> kernel_symbols = {
-        "simpler_aicpu_l1_hbg_register_execution_slot",
-        "simpler_aicpu_l1_hbg_detach_execution_slot",
-        "simpler_aicpu_l1_hbg_register_callable",
-        "simpler_aicpu_kernel_exec",
+    constexpr std::array<const char *, 6> kernel_symbols = {
+        "simpler_aicpu_l1_hbg_register_execution_slot",   "simpler_aicpu_l1_hbg_prepare_image_destinations",
+        "simpler_aicpu_l1_hbg_prepare_execution_context", "simpler_aicpu_l1_hbg_detach_execution_slot",
+        "simpler_aicpu_l1_hbg_register_callable",         "simpler_aicpu_kernel_exec",
     };
     size_t program_count = 0;
     const char *const *program = runtime_extra_aicpu_symbols(&program_count);
@@ -2597,12 +3174,752 @@ protected:
         for (const auto &dst : seal.destinations)
             if (dst.capacity) std::memset(reinterpret_cast<void *>(dst.address), 0xa5, dst.capacity);
     }
-    std::vector<std::byte> mutable_bytes() const {
+    std::vector<std::byte> target_bytes() const {
         auto all = working_bytes();
         all.resize(all.size() - sizeof(hbg::GraphSlotRegistry));
         return all;
     }
+    std::vector<std::byte> restored_image_bytes() {
+        auto all = target_bytes();
+        all.erase(all.begin(), all.begin() + seal.destinations[0].capacity + packet_header().runtime_offset);
+        return all;
+    }
+    void expect_initialized_scheduler() {
+        const auto base = seal.destinations[1].address;
+        const auto &layout = restored.runtime->prebuilt_layout;
+        auto &scheduler = *restored.runtime->scheduler;
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(&scheduler), base + layout.off_scheduler);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(restored.runtime->sm_handle), base + layout.off_sm_handle);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(restored.runtime->aicore_mailbox), base + layout.off_mailbox);
+        EXPECT_EQ(scheduler.sm_header, restored.runtime->sm_handle->header);
+        const auto &handle = *restored.runtime->sm_handle;
+        const auto sm = base + packet_header().sm_offset;
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(handle.sm_base), sm);
+        EXPECT_EQ(handle.sm_size, restored.sm_bytes);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(handle.header), sm);
+        EXPECT_FALSE(handle.is_owner);
+        const auto segments = sm_layout::segment_offsets(
+            sm_layout::image_extents({sm_layout::live_slot_pitch(restored.total_tasks), 0, 0, 0})
+        );
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(handle.header->tasks.task_storage), sm + segments.storage);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(handle.header->tasks.task_states), sm + segments.task_states);
+        const auto check_queue = [&](const ChipReadyQueue &queue, uint64_t capacity) {
+            EXPECT_EQ(queue.capacity, capacity);
+            EXPECT_EQ(queue.mask, capacity - 1);
+            EXPECT_EQ(queue.enqueue_pos.load(), 0u);
+            EXPECT_EQ(queue.dequeue_pos.load(), 0u);
+            EXPECT_EQ(queue.max_occupancy.load(), 0u);
+            ASSERT_NE(queue.slots, nullptr);
+            ASSERT_GE(reinterpret_cast<uintptr_t>(queue.slots), base);
+            ASSERT_LE(reinterpret_cast<uintptr_t>(queue.slots + capacity), base + packet_header().runtime_offset);
+            for (uint64_t i = 0; i < capacity; ++i) {
+                EXPECT_EQ(queue.slots[i].sequence.load(), static_cast<int64_t>(i));
+                EXPECT_EQ(queue.slots[i].slot_state, nullptr);
+            }
+        };
+        for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+            check_queue(scheduler.ready_queues[i], layout.sched.capacities.ready[i]);
+            check_queue(scheduler.ready_sync_queues[i], layout.sched.capacities.ready_sync[i]);
+            check_queue(scheduler.early_dispatch_queues[i], CHIP_EARLY_DISPATCH_QUEUE_SIZE);
+        }
+        check_queue(scheduler.dummy_ready_queue, layout.sched.capacities.dummy);
+        check_queue(scheduler.graph_ready_queue, layout.sched.capacities.graph_ready);
+        check_queue(scheduler.graph_prepare_queue, layout.sched.capacities.graph_prepare);
+        check_queue(scheduler.early_sync_start_queue, CHIP_EARLY_DISPATCH_QUEUE_SIZE);
+        check_queue(scheduler.ed_publish_drain_queue, CHIP_EARLY_DISPATCH_QUEUE_SIZE);
+        EXPECT_EQ(scheduler.async_wait_list.count, 0);
+        EXPECT_EQ(scheduler.async_wait_list.busy.load(), 0);
+        EXPECT_EQ(scheduler.async_wait_list.mpsc_skipped_count.load(), 0u);
+    }
+    void expect_initialized_prefix() {
+        ASSERT_NO_FATAL_FAILURE(expect_initialized_scheduler());
+        const auto &mailbox = *restored.runtime->aicore_mailbox;
+        EXPECT_EQ(mailbox.head.load(), 0u);
+        EXPECT_EQ(mailbox.tail.load(), 0u);
+        for (const auto &entry : mailbox.entries)
+            EXPECT_EQ(entry.seq.load(), 0u);
+    }
 };
+
+namespace {
+struct PreparedImageReleaseProbe {
+    int calls{0};
+    int error{0};
+
+    std::shared_ptr<hbg::KernelPreparedGraphImage> make_image() {
+        auto image = std::make_shared<hbg::KernelPreparedGraphImage>();
+        image->pinned_image = this;
+        image->release_image = [](void *source) noexcept {
+            auto &probe = *static_cast<PreparedImageReleaseProbe *>(source);
+            ++probe.calls;
+            return probe.error;
+        };
+        return image;
+    }
+};
+}  // namespace
+
+TEST(HbgPreparedImageLifetime, FailedReleaseRetainsTheSourceUntilSuccessfulRetry) {
+    PreparedImageReleaseProbe probe;
+    probe.error = -71;
+    auto image = probe.make_image();
+    EXPECT_EQ(image->release(), -71);
+    EXPECT_EQ(image->pinned_image, &probe);
+    EXPECT_EQ(probe.calls, 1);
+    probe.error = 0;
+    EXPECT_EQ(image->release(), 0);
+    EXPECT_EQ(image->pinned_image, nullptr);
+    EXPECT_EQ(image->release(), 0);
+    image.reset();
+    EXPECT_EQ(probe.calls, 2);
+}
+
+TEST(HbgPreparedImageLifetime, ContextCloseRetriesTheFailedSourceWithoutReleasingSuccessfulSourcesTwice) {
+    PreparedImageReleaseProbe first, second, third;
+    second.error = -72;
+    hbg::KernelContextLaunchState context;
+    context.prepared_images = {first.make_image(), second.make_image(), third.make_image()};
+    const std::weak_ptr<hbg::KernelPreparedGraphImage> retained = context.prepared_images[1];
+    EXPECT_EQ(context.release_prepared_images(), -72);
+    ASSERT_EQ(context.prepared_images.size(), 3u);
+    EXPECT_FALSE(retained.expired());
+    EXPECT_EQ(context.prepared_images[0]->pinned_image, nullptr);
+    EXPECT_EQ(context.prepared_images[1]->pinned_image, &second);
+    EXPECT_EQ(first.calls, 1);
+    EXPECT_EQ(second.calls, 1);
+    EXPECT_EQ(third.calls, 0);
+    second.error = 0;
+    EXPECT_EQ(context.release_prepared_images(), 0);
+    EXPECT_TRUE(context.prepared_images.empty());
+    EXPECT_TRUE(retained.expired());
+    EXPECT_EQ(context.release_prepared_images(), 0);
+    EXPECT_EQ(first.calls, 1);
+    EXPECT_EQ(second.calls, 2);
+    EXPECT_EQ(third.calls, 1);
+}
+
+TEST(HbgPreparedImageLifetime, AbandonPreservesSourcesThroughContextAndCallableDestruction) {
+    PreparedImageReleaseProbe first, second;
+    std::weak_ptr<hbg::KernelPreparedGraphImage> retained_first, retained_second;
+    {
+        hbg::KernelContextLaunchState context;
+        hbg::KernelCallableLaunchState callable;
+        context.prepared_images = {first.make_image(), second.make_image()};
+        callable.prepared_image = context.prepared_images[0];
+        retained_first = callable.prepared_image;
+        retained_second = context.prepared_images[1];
+        context.abandon_prepared_images();
+        context.prepared_images.clear();
+        EXPECT_FALSE(retained_first.expired());
+        EXPECT_TRUE(retained_second.expired());
+        EXPECT_EQ(first.calls, 0);
+        EXPECT_EQ(second.calls, 0);
+    }
+    EXPECT_TRUE(retained_first.expired());
+    EXPECT_EQ(first.calls, 0);
+    EXPECT_EQ(second.calls, 0);
+}
+
+class HbgPreparedGraphTest : public HbgGraphRestoreTest {
+protected:
+    hbg::GraphPreparedDispatch prepared{};
+
+    void dirty_working_preserving_mailbox() {
+        auto &mailbox = *restored.runtime->aicore_mailbox;
+        std::array<std::byte, sizeof(mailbox)> saved;
+        std::memcpy(saved.data(), &mailbox, saved.size());
+        dirty_working();
+        std::memcpy(&mailbox, saved.data(), saved.size());
+    }
+    void prepare_dispatch() {
+        ASSERT_EQ(hbg::make_graph_prepared_dispatch(snapshot, dispatch_registration(), prepared), 0);
+        ASSERT_TRUE(hbg::graph_prepared_dispatch_matches_slot(prepared, seal));
+    }
+    void publish_image() {
+        const auto *payload = static_cast<const std::byte *>(snapshot.data()) + sizeof(SimplerKernelInvocationHeader) +
+                              prepared.graph.payload_offset;
+        for (uint32_t i = 0; i < prepared.graph.region_count; ++i) {
+            const auto &region = prepared.regions[i];
+            const auto kind = static_cast<uint32_t>(region.kind);
+            std::memcpy(
+                reinterpret_cast<void *>(seal.destinations[kind].address + region.destination_offset),
+                payload + region.source_offset, region.bytes
+            );
+        }
+    }
+    void select_template(const hbg::GraphLaunchTemplate &source) {
+        snapshot = source;
+        ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+        patch();
+        ASSERT_NO_FATAL_FAILURE(prepare_dispatch());
+    }
+    void prepare_templates(
+        void (*first)(const ChipTaskArgs &), void (*second)(const ChipTaskArgs &),
+        std::array<hbg::GraphLaunchTemplate, 2> &templates
+    ) {
+        const std::array<void (*)(const ChipTaskArgs &), 2> entries{first, second};
+        std::array<hbg::GraphResourceRequirements, 2> requirements{};
+        RuntimeArenaLayout physical{};
+        ASSERT_EQ(hbg::make_kernel_graph_layout(capacity, physical), 0);
+        for (size_t i = 0; i < entries.size(); ++i) {
+            ASSERT_GE(build(entries[i]), 0);
+            ASSERT_EQ(hbg::get_graph_resource_requirements(result, physical, requirements[i]), 0);
+        }
+        hbg::KernelResourcePlan plan;
+        ASSERT_EQ(hbg::KernelResourcePlan::create(requirements.data(), requirements.size(), plan), 0);
+        for (const auto &graph : requirements)
+            ASSERT_TRUE(plan.admits(graph));
+        ASSERT_EQ(context.initialize(0, provider.context_ops(), 19), 0);
+        ASSERT_EQ(plan.prepare(context, provider.resource_ops()), 0);
+        ASSERT_EQ(context.mark_ready_enqueued(), 0);
+        ASSERT_EQ(context.freeze_resources(), 0);
+        ASSERT_EQ(hbg::bind_kernel_resources_for_launch(context, 0, 19, requirements[0], binding), 0);
+        ASSERT_EQ(hbg::seal_graph_execution_slot(context, 0, 19, 109, seal), 0);
+        registry = reinterpret_cast<hbg::GraphSlotRegistry *>(seal.registry.address);
+        ASSERT_EQ(simpler_aicpu_l1_hbg_register_execution_slot(&seal), 0);
+        const uint64_t first_hash = identity.argument_hash;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            identity.argument_hash = first_hash + i;
+            ASSERT_GE(build(entries[i]), 0);
+            ASSERT_EQ(snapshot_graph(), 0);
+            templates[i] = snapshot;
+        }
+        identity.argument_hash = first_hash;
+        ASSERT_NO_FATAL_FAILURE(select_template(templates[0]));
+        dirty_working();
+    }
+};
+
+TEST_F(HbgPreparedGraphTest, HostValidationRejectsCorruptSourceAndSemanticImageBeforePublication) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_NO_FATAL_FAILURE(prepare_dispatch());
+    const auto before = working_bytes();
+    const auto expected = prepared;
+    for (int variant = 0; variant < 4; ++variant) {
+        SCOPED_TRACE(variant);
+        auto damaged = snapshot;
+        auto *base = const_cast<std::byte *>(static_cast<const std::byte *>(damaged.data()));
+        hbg::GraphPacketHeader graph{};
+        std::memcpy(&graph, base + sizeof(SimplerKernelInvocationHeader), sizeof(graph));
+        if (variant == 0) {
+            base[damaged.size() - 1] ^= std::byte{0x80};
+        } else {
+            const auto *source_payload = base + sizeof(SimplerKernelInvocationHeader) + graph.payload_offset;
+            hbg::GraphImageRegion region{};
+            std::memcpy(&region, base + sizeof(SimplerKernelInvocationHeader) + sizeof(graph), sizeof(region));
+            auto *runtime_source = const_cast<std::byte *>(source_payload) + region.source_offset;
+            if (variant == 1) {
+                const uint64_t foreign = 0x1234;
+                std::memcpy(runtime_source + offsetof(RuntimeContext, scheduler), &foreign, sizeof(foreign));
+            } else if (variant == 2) {
+                const uint64_t invalid_offset = UINT64_MAX;
+                std::memcpy(
+                    runtime_source + offsetof(RuntimeContext, prebuilt_layout) +
+                        offsetof(RuntimeArenaLayout, off_scheduler),
+                    &invalid_offset, sizeof(invalid_offset)
+                );
+            } else {
+                const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents({graph.total_tasks, 0, 0, 0}));
+                auto *sm = runtime_source + graph.sm_offset - graph.runtime_offset;
+                const auto invalid_kind = static_cast<TaskKind>(UINT8_MAX);
+                std::memcpy(
+                    sm + offsets.storage + offsetof(ChipTaskStorage, slot) + offsetof(ChipTaskSlotState, task_kind),
+                    &invalid_kind, sizeof(invalid_kind)
+                );
+            }
+            graph.checksum = hbg::graph_packet_checksum(damaged.data(), damaged.size());
+            std::memcpy(base + sizeof(SimplerKernelInvocationHeader), &graph, sizeof(graph));
+            ASSERT_EQ(
+                hbg::validate_graph_packet(damaged.data(), damaged.size(), hbg::GraphPacketAddress::HostTemplate),
+                hbg::GraphPacketStatus::Ok
+            );
+        }
+        EXPECT_NE(hbg::make_graph_prepared_dispatch(damaged, dispatch_registration(), prepared), 0);
+        EXPECT_EQ(std::memcmp(&prepared, &expected, sizeof(prepared)), 0);
+        EXPECT_EQ(working_bytes(), before);
+    }
+}
+
+TEST_F(HbgPreparedGraphTest, MetadataRejectsChangedIdentityBoundsAndUnusedRegions) {
+    std::array<hbg::GraphLaunchTemplate, 2> templates;
+    ASSERT_NO_FATAL_FAILURE(prepare_templates(graph_entry, empty_entry, templates));
+    using Mutate = void (*)(hbg::GraphPreparedDispatch &);
+    const Mutate mutations[] = {
+        [](auto &h) {
+            ++h.magic;
+        },
+        [](auto &h) {
+            ++h.version;
+        },
+        [](auto &h) {
+            --h.header_bytes;
+        },
+        [](auto &h) {
+            ++h.invocation.callable_id;
+        },
+        [](auto &h) {
+            ++h.invocation.tensor_count;
+        },
+        [](auto &h) {
+            ++h.invocation.scalar_count;
+        },
+        [](auto &h) {
+            h.invocation.host_copy_tensor_count = 1;
+        },
+        [](auto &h) {
+            ++h.registration.context_generation;
+        },
+        [](auto &h) {
+            ++h.registration.callable_hash;
+        },
+        [](auto &h) {
+            ++h.graph.function_hash;
+        },
+        [](auto &h) {
+            ++h.graph.runtime_binary_id;
+        },
+        [](auto &h) {
+            h.graph.total_tasks = h.graph.task_window;
+        },
+        [](auto &h) {
+            h.graph.heap_bytes = h.graph.destinations[0].capacity + 1;
+        },
+        [](auto &h) {
+            h.graph.sm_offset = h.graph.destinations[1].capacity;
+        },
+        [](auto &h) {
+            h.graph.destinations[1].address = h.graph.destinations[0].address;
+        },
+        [](auto &h) {
+            h.graph.destinations[0].capacity = UINT64_MAX;
+        },
+        [](auto &h) {
+            h.regions[0].destination_offset = h.graph.sm_offset;
+        },
+        [](auto &h) {
+            h.regions[0].bytes = h.graph.destinations[1].capacity;
+        },
+        [](auto &h) {
+            h.regions[0].source_offset = UINT64_MAX;
+        },
+        [](auto &h) {
+            h.regions[0].reserved = 1;
+        },
+    };
+    const auto before = working_bytes();
+    for (auto mutate : mutations) {
+        auto damaged = prepared;
+        mutate(damaged);
+        damaged.checksum = hbg::graph_prepared_dispatch_checksum(damaged);
+        EXPECT_FALSE(hbg::valid_graph_prepared_dispatch(damaged));
+        EXPECT_FALSE(hbg::graph_prepared_dispatch_matches_slot(damaged, seal));
+    }
+    auto damaged = prepared;
+    ++damaged.checksum;
+    EXPECT_FALSE(hbg::valid_graph_prepared_dispatch(damaged));
+    ASSERT_NO_FATAL_FAILURE(select_template(templates[1]));
+    ASSERT_EQ(prepared.graph.total_tasks, 0u);
+    ASSERT_LT(prepared.graph.region_count, 3u);
+    damaged = prepared;
+    damaged.regions[prepared.graph.region_count].bytes = 64;
+    damaged.checksum = hbg::graph_prepared_dispatch_checksum(damaged);
+    EXPECT_FALSE(hbg::valid_graph_prepared_dispatch(damaged));
+    EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgPreparedGraphTest, MetadataRequiresTheIndependentSlotAndSupportsUnalignedReads) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_NO_FATAL_FAILURE(prepare_dispatch());
+    for (int variant = 0; variant < 7; ++variant) {
+        SCOPED_TRACE(variant);
+        auto foreign = seal;
+        if (variant == 0) ++foreign.device_id;
+        else if (variant == 1) ++foreign.slot_generation;
+        else if (variant == 2) ++foreign.runtime_binary_id;
+        else if (variant == 3) foreign.destinations[1].address += 1024;
+        else if (variant == 4) --foreign.destinations[1].capacity;
+        else if (variant == 5) foreign.max_packet_bytes = sizeof(SimplerKernelInvocationHeader);
+        else foreign.destinations[2].capacity += 1024;
+        EXPECT_FALSE(hbg::graph_prepared_dispatch_matches_slot(prepared, foreign));
+    }
+    for (size_t alignment = 0; alignment < sizeof(uint64_t); ++alignment) {
+        std::vector<std::byte> storage(sizeof(prepared) + alignment);
+        std::memcpy(storage.data() + alignment, &prepared, sizeof(prepared));
+        hbg::GraphPreparedDispatch output{};
+        output.checksum = 999;
+        const auto unchanged = output;
+        EXPECT_FALSE(hbg::read_graph_prepared_dispatch(storage.data() + alignment, sizeof(prepared) - 1, output));
+        EXPECT_EQ(std::memcmp(&output, &unchanged, sizeof(output)), 0);
+        ASSERT_TRUE(hbg::read_graph_prepared_dispatch(storage.data() + alignment, sizeof(prepared), output));
+        EXPECT_EQ(std::memcmp(&output, &prepared, sizeof(output)), 0);
+    }
+    hbg::GraphPreparedDispatch output{};
+    EXPECT_FALSE(hbg::read_graph_prepared_dispatch(nullptr, sizeof(prepared), output));
+}
+
+TEST_F(HbgPreparedGraphTest, SingleParticipantMetadataFailureCollectivelyCancelsBeforeAttach) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    for (int variant = 0; variant < 3; ++variant) {
+        SCOPED_TRACE(variant);
+        for (size_t bad_copy = 0; bad_copy < 4; ++bad_copy) {
+            SCOPED_TRACE(bad_copy);
+            auto isolated = [&]() {
+                alarm(5);
+                Runtime execution_runtime;
+                execution_runtime.set_aicpu_thread_num(4);
+                execution_runtime.set_aicpu_allowed_cpu_count(4);
+                execution_runtime.set_aicpu_launch_count(4);
+                for (int32_t i = 0; i < 4; ++i)
+                    execution_runtime.get_aicpu_allowed_cpus()[i] = i;
+                auto callable = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+                    nullptr, 0, "prepared", nullptr, 0, nullptr, nullptr, 0, ""
+                );
+                auto registration = dispatch_registration();
+                registration.runtime_address = reinterpret_cast<uintptr_t>(&execution_runtime);
+                registration.callable_address = reinterpret_cast<uintptr_t>(callable.data());
+                registration.callable_bytes = callable.size();
+                KernelArgs dfx_args{};
+                dfx_args.runtime_args = &execution_runtime;
+                dfx_args.regs = registration.register_table_address;
+                *execution_runtime.kernel_dfx_args_slot() = reinterpret_cast<uintptr_t>(&dfx_args);
+                if (simpler_aicpu_l1_hbg_register_callable(&registration) != 0 ||
+                    !hbg::refresh_graph_kernel_dfx(registry, &execution_runtime, registration))
+                    _exit(2);
+                hbg::GraphPreparedContext prepared_context{seal, reinterpret_cast<uintptr_t>(&execution_runtime)};
+                if (simpler_aicpu_l1_hbg_prepare_execution_context(&prepared_context) != 0 ||
+                    hbg::make_graph_prepared_dispatch(snapshot, registration, prepared) != 0 ||
+                    !hbg::graph_prepared_dispatch_matches_slot(prepared, seal))
+                    _exit(3);
+                publish_image();
+                const auto before = target_bytes();
+                std::array<hbg::GraphPreparedDispatch, 4> copies;
+                copies.fill(prepared);
+                if (variant == 0) ++copies[bad_copy].magic;
+                else if (variant == 2) ++copies[bad_copy].graph.argument_hash;
+                copies[bad_copy].checksum = hbg::graph_prepared_dispatch_checksum(copies[bad_copy]);
+                if (variant == 2 && !hbg::graph_prepared_dispatch_matches_slot(copies[bad_copy], seal)) _exit(4);
+                execution_runtime.kernel_prelaunch.state = HBG_KERNEL_PRELAUNCH_WAIT;
+                std::array<int, 4> results{};
+                std::vector<std::thread> threads;
+                for (size_t participant = 0; participant < copies.size(); ++participant)
+                    threads.emplace_back([&, participant] {
+                        void *arg = variant == 1 && participant == bad_copy ? nullptr : &copies[participant];
+                        results[participant] = consume_kernel_task(arg);
+                    });
+                for (auto &thread : threads)
+                    thread.join();
+                if (std::any_of(
+                        results.begin(), results.end(),
+                        [](int rc) {
+                            return rc != -1;
+                        }
+                    ) ||
+                    execution_runtime.kernel_prelaunch.state != HBG_KERNEL_PRELAUNCH_CANCEL ||
+                    registry->restore.attempt != 0 || registry->restore.committed_generation != 0 ||
+                    registry->restore.phase != static_cast<uint32_t>(hbg::GraphRestorePhase::Idle) ||
+                    registry->phase != static_cast<uint32_t>(hbg::GraphSlotPhase::Poisoned) || target_bytes() != before)
+                    _exit(1);
+                _exit(0);
+            };
+            EXPECT_EXIT(isolated(), ::testing::ExitedWithCode(0), "");
+        }
+    }
+}
+
+TEST_F(HbgPreparedGraphTest, OrderedDmaResetsExecutionStateAndRetainsQuiescentMailboxStorage) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_NO_FATAL_FAILURE(prepare_dispatch());
+    std::vector<std::byte> expected;
+    for (uint64_t round = 1; round <= 4; ++round) {
+        if (round == 1) dirty_working();
+        else dirty_working_preserving_mailbox();
+        publish_image();
+        ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
+        EXPECT_EQ(restored.generation, round);
+        EXPECT_EQ(restored.total_tasks, prepared.graph.total_tasks);
+        ASSERT_NO_FATAL_FAILURE(expect_initialized_scheduler());
+        auto &mailbox = *restored.runtime->aicore_mailbox;
+        EXPECT_EQ(mailbox.head.load(), round - 1);
+        EXPECT_EQ(mailbox.tail.load(), round - 1);
+        AICoreCompletionMsgView message{};
+        EXPECT_FALSE(mailbox.try_pop(message));
+        if (round == 1) {
+            for (const auto &entry : mailbox.entries)
+                EXPECT_EQ(entry.seq.load(), 0u);
+        }
+        if (round == 1) expected = restored_image_bytes();
+        else EXPECT_EQ(restored_image_bytes(), expected);
+        auto &tasks = restored.runtime->sm_handle->header->tasks;
+        ASSERT_GT(tasks.total_tasks, 0);
+        auto &queue = restored.runtime->scheduler->graph_ready_queue;
+        ASSERT_TRUE(queue.push(&tasks.storage_at(0).slot));
+        EXPECT_EQ(queue.pop(), &tasks.storage_at(0).slot);
+        ASSERT_TRUE(mailbox.try_push_normal_done(TaskId{1}, 0x4000 + round));
+        ASSERT_NO_FATAL_FAILURE(retire());
+    }
+}
+
+TEST_F(HbgPreparedGraphTest, AlternatingTemplatesRestoreTheirOwnImagesIntoTheSameSlot) {
+    std::array<hbg::GraphLaunchTemplate, 2> templates;
+    ASSERT_NO_FATAL_FAILURE(prepare_templates(graph_entry, chain_entry, templates));
+    ASSERT_EQ(result.total_tasks, 2);
+    std::vector<std::byte> expected_first;
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE(round);
+        ASSERT_NO_FATAL_FAILURE(select_template(templates[round == 1 ? 1 : 0]));
+        if (round == 0) dirty_working();
+        else dirty_working_preserving_mailbox();
+        publish_image();
+        ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
+        EXPECT_EQ(restored.generation, static_cast<uint64_t>(round + 1));
+        EXPECT_EQ(restored.total_tasks, round == 1 ? 2u : 1u);
+        ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+        if (round == 0) expected_first = restored_image_bytes();
+        else if (round == 2) EXPECT_EQ(restored_image_bytes(), expected_first);
+        auto &task = restored.runtime->sm_handle->header->tasks.storage_at(0);
+        task.slot.completed_subtasks.store(7);
+        task.payload.published_block_count.store(5);
+        ASSERT_NO_FATAL_FAILURE(retire());
+    }
+}
+
+TEST_F(HbgPreparedGraphTest, MailboxReuseSurvivesWrapAndDiscardsOnlyPreviouslyPublishedMessages) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_NO_FATAL_FAILURE(prepare_dispatch());
+    publish_image();
+    ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
+    auto &mailbox = *restored.runtime->aicore_mailbox;
+    AICoreCompletionMsgView message{};
+    for (uint64_t i = 0; i < AICORE_COMPLETION_MAILBOX_CAPACITY + 17; ++i) {
+        ASSERT_TRUE(mailbox.try_push_normal_done(TaskId{1}, 0x4000 + i));
+        ASSERT_TRUE(mailbox.try_pop(message));
+        EXPECT_EQ(message.addr, 0x4000 + i);
+    }
+    for (uint64_t i = 0; i < 5; ++i)
+        ASSERT_TRUE(mailbox.try_push_normal_done(TaskId{1}, 0x8000 + i));
+    const uint64_t ticket = mailbox.head.load();
+    ASSERT_NO_FATAL_FAILURE(retire());
+    publish_image();
+    ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
+    EXPECT_EQ(restored.runtime->aicore_mailbox, &mailbox);
+    EXPECT_EQ(mailbox.head.load(), ticket);
+    EXPECT_EQ(mailbox.tail.load(), ticket);
+    EXPECT_FALSE(mailbox.try_pop(message));
+    mailbox.head.store(ticket + 1);
+    EXPECT_FALSE(mailbox.try_pop(message));
+    mailbox.head.store(ticket);
+    ASSERT_TRUE(mailbox.try_push_normal_done(TaskId{2}, 0x9000));
+    ASSERT_TRUE(mailbox.try_pop(message));
+    EXPECT_EQ(message.task_token.raw, 2u);
+    EXPECT_EQ(message.addr, 0x9000u);
+    ASSERT_NO_FATAL_FAILURE(retire());
+}
+
+TEST_F(HbgPreparedGraphTest, ControlledRestoreFailureRequiresFullMailboxInitialization) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_NO_FATAL_FAILURE(prepare_dispatch());
+    publish_image();
+    ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
+    ASSERT_TRUE(restored.runtime->aicore_mailbox->try_push_normal_done(TaskId{1}, 0x4000));
+    ASSERT_NO_FATAL_FAILURE(retire());
+    hbg::GraphRestoreOps failure;
+    failure.copy = [](void *, void *, const void *, size_t) {
+        return false;
+    };
+    ASSERT_EQ(restore(failure), hbg::GraphRestoreStatus::CopyFailed);
+    ASSERT_NO_FATAL_FAILURE(retire(hbg::GraphRestoreRetirement::ControlledFailure));
+    dirty_working();
+    publish_image();
+    ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
+    ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+    ASSERT_NO_FATAL_FAILURE(retire());
+}
+
+TEST_F(HbgPreparedGraphTest, AttachRejectsForeignMetadataAndBusyStateWithoutChangingImages) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    ASSERT_NO_FATAL_FAILURE(prepare_dispatch());
+    const auto before = working_bytes();
+    auto foreign = prepared;
+    ++foreign.graph.slot_generation;
+    foreign.checksum = hbg::graph_prepared_dispatch_checksum(foreign);
+    restored.generation = 999;
+    EXPECT_NE(hbg::attach_prepared_graph_image(foreign, seal, restored), hbg::GraphRestoreStatus::Ok);
+    EXPECT_EQ(restored.generation, 999u);
+    EXPECT_EQ(working_bytes(), before);
+    dirty_working();
+    publish_image();
+    ASSERT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Ok);
+    const auto active = working_bytes();
+    EXPECT_EQ(hbg::attach_prepared_graph_image(prepared, seal, restored), hbg::GraphRestoreStatus::Busy);
+    EXPECT_EQ(working_bytes(), active);
+    ASSERT_NO_FATAL_FAILURE(retire());
+}
+
+TEST_F(HbgGraphRestoreTest, RejectsChecksumVersionsBeforeChangingRestoreState) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto original = packet.storage;
+    const auto before = working_bytes();
+    for (int variant = 0; variant < 3; ++variant) {
+        SCOPED_TRACE(variant);
+        packet.storage = original;
+        auto &header = packet_header();
+        header.version = variant < 2 ? 4 : 5;
+        if (variant == 1) {
+            header.checksum = hbg::graph_packet_checksum(packet.storage.data(), packet.bytes);
+        } else {
+            constexpr size_t skip =
+                sizeof(SimplerKernelInvocationHeader) + offsetof(hbg::GraphPacketHeader, inline_payload_addr);
+            const auto *data = reinterpret_cast<const uint8_t *>(packet.storage.data());
+            header.checksum = simpler::common::utils::fnv1a_64(data, skip);
+            header.checksum =
+                simpler::common::utils::fnv1a_64_append(header.checksum, data + skip + 16, packet.bytes - skip - 16);
+        }
+        expect_rejected(hbg::GraphSlotStatus::InvalidPacket);
+        restored = {reinterpret_cast<RuntimeContext *>(uintptr_t{1}), 999, 888, 777};
+        EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Rejected);
+        EXPECT_EQ(restored.runtime, reinterpret_cast<RuntimeContext *>(uintptr_t{1}));
+        EXPECT_EQ(restored.generation, 999u);
+        EXPECT_EQ(restored.sm_bytes, 888u);
+        EXPECT_EQ(restored.total_tasks, 777u);
+        EXPECT_EQ(working_bytes(), before);
+    }
+    packet.storage = original;
+    EXPECT_EQ(packet_header().version, 5);
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    EXPECT_EQ(restored.generation, 1u);
+    retire();
+}
+
+class HbgLargeGraphRestoreTest : public HbgGraphRestoreTest {
+protected:
+    void SetUp() override {
+        capacity = 512;
+        HostGraphBuildTest::SetUp();
+    }
+    void prepare_large_slot() {
+        packet_task_count = capacity - 1;
+        ASSERT_EQ(build(packet_window_entry), capacity - 1);
+        RuntimeArenaLayout physical{};
+        ASSERT_EQ(hbg::make_kernel_graph_layout(capacity, physical), 0);
+        hbg::GraphResourceRequirements largest{};
+        ASSERT_EQ(hbg::get_graph_resource_requirements(result, physical, largest), 0);
+        ASSERT_NO_FATAL_FAILURE(prepare_slot(true, largest.scheduler_state_bytes, 2 * 1024 * 1024));
+    }
+};
+
+TEST_F(HbgLargeGraphRestoreTest, FlatQueuesFollowTaskCountWithoutMovingFrozenStorage) {
+    ASSERT_NO_FATAL_FAILURE(prepare_large_slot());
+    RuntimeArenaLayout physical{};
+    ASSERT_EQ(hbg::make_kernel_graph_layout(capacity, physical), 0);
+    for (int count : {0, 1, 63, 64, 65, 127, 128, 129, 511}) {
+        SCOPED_TRACE(count);
+        packet_task_count = count;
+        ASSERT_EQ(build(packet_window_entry), count);
+        ASSERT_EQ(snapshot_graph(), 0);
+        ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+        patch();
+        dirty_working();
+        ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+        ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+        const auto &logical = restored.runtime->prebuilt_layout;
+        uint64_t expected = 64;
+        while (expected < static_cast<uint64_t>(count))
+            expected <<= 1;
+        EXPECT_EQ(logical.task_capacity, physical.task_capacity);
+        EXPECT_EQ(logical.arena_size, physical.arena_size);
+        EXPECT_EQ(logical.off_runtime, physical.off_runtime);
+        EXPECT_EQ(logical.off_copied_begin, physical.off_copied_begin);
+        EXPECT_EQ(logical.off_copied_end, physical.off_copied_end);
+        EXPECT_EQ(logical.off_scheduler, physical.off_scheduler);
+        EXPECT_EQ(logical.off_sm_handle, physical.off_sm_handle);
+        EXPECT_EQ(logical.off_mailbox, physical.off_mailbox);
+        EXPECT_EQ(packet_header().runtime_offset, physical.off_runtime);
+        EXPECT_EQ(packet_header().sm_offset, physical.off_copied_end);
+        auto &sched = *restored.runtime->scheduler;
+        std::vector<ChipReadyQueue *> queues;
+        for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+            EXPECT_EQ(logical.sched.off_ready_queue_slots[i], physical.sched.off_ready_queue_slots[i]);
+            EXPECT_EQ(logical.sched.off_ready_sync_queue_slots[i], physical.sched.off_ready_sync_queue_slots[i]);
+            EXPECT_EQ(
+                logical.sched.off_early_dispatch_queue_slots[i], physical.sched.off_early_dispatch_queue_slots[i]
+            );
+            queues.push_back(&sched.ready_queues[i]);
+            queues.push_back(&sched.ready_sync_queues[i]);
+        }
+        EXPECT_EQ(logical.sched.off_dummy_ready_queue_slots, physical.sched.off_dummy_ready_queue_slots);
+        EXPECT_EQ(logical.sched.off_graph_ready_queue_slots, physical.sched.off_graph_ready_queue_slots);
+        EXPECT_EQ(logical.sched.off_graph_prepare_queue_slots, physical.sched.off_graph_prepare_queue_slots);
+        queues.push_back(&sched.dummy_ready_queue);
+        queues.push_back(&sched.graph_ready_queue);
+        queues.push_back(&sched.graph_prepare_queue);
+        auto &tasks = restored.runtime->sm_handle->header->tasks;
+        for (auto *queue : queues) {
+            ASSERT_EQ(queue->capacity, expected);
+            const auto *unused = reinterpret_cast<const uint8_t *>(queue->slots + expected);
+            EXPECT_TRUE(std::all_of(unused, unused + (capacity - expected) * sizeof(ChipReadyQueueSlot), [](auto b) {
+                return b == 0xa5;
+            }));
+            for (int lap = 0; lap < 3; ++lap) {
+                for (int i = 0; i < count; ++i)
+                    ASSERT_TRUE(queue->push(&tasks.storage_at(i).slot));
+                for (int i = 0; i < count; ++i) {
+                    auto *slot = queue->pop();
+                    ASSERT_EQ(slot, &tasks.storage_at(i).slot);
+                    ASSERT_TRUE(queue->push(slot));
+                }
+                for (int i = 0; i < count; ++i)
+                    EXPECT_EQ(queue->pop(), &tasks.storage_at(i).slot);
+                EXPECT_EQ(queue->pop(), nullptr);
+            }
+        }
+        ASSERT_NO_FATAL_FAILURE(retire());
+    }
+    ASSERT_EQ(build(graph_entry), 1);
+    ASSERT_EQ(snapshot_graph(), 0);
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+    patch();
+    dirty_working();
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+    EXPECT_EQ(restored.runtime->scheduler->dummy_ready_queue.capacity, capacity);
+    ASSERT_NO_FATAL_FAILURE(retire());
+    ASSERT_EQ(build(chain_entry), 2);
+    ASSERT_EQ(snapshot_graph(), 0);
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+    patch();
+    dirty_working();
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+    EXPECT_EQ(restored.runtime->scheduler->dummy_ready_queue.capacity, 64u);
+}
+
+TEST_F(HbgLargeGraphRestoreTest, ForgedFlatQueueCapacitiesRejectBeforeAnyTargetWrite) {
+    ASSERT_NO_FATAL_FAILURE(prepare_large_slot());
+    packet_task_count = 65;
+    ASSERT_EQ(build(packet_window_entry), 65);
+    ASSERT_EQ(snapshot_graph(), 0);
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+    patch();
+    const auto original = packet.storage;
+    const auto before = working_bytes();
+    for (int queue = 0; queue < 9; ++queue) {
+        for (uint64_t forged : {uint64_t{0}, uint64_t{64}, uint64_t{127}, uint64_t{256}, UINT64_MAX}) {
+            packet.storage = original;
+            auto *source = reinterpret_cast<RuntimeContext *>(
+                reinterpret_cast<std::byte *>(packet.storage.data()) + packet.data_offset
+            );
+            auto &caps = source->prebuilt_layout.sched.capacities;
+            if (queue < 3) caps.ready[queue] = forged;
+            else if (queue < 6) caps.ready_sync[queue - 3] = forged;
+            else if (queue == 6) caps.dummy = forged;
+            else if (queue == 7) caps.graph_ready = forged;
+            else caps.graph_prepare = forged;
+            patch();
+            EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
+            EXPECT_EQ(working_bytes(), before);
+        }
+    }
+}
 
 TEST_F(HbgGraphRestoreTest, OrdinaryIntermediateSurvivesBuildPacketAndRestore) {
     ASSERT_EQ(build(chain_entry), 2);
@@ -2622,18 +3939,26 @@ TEST_F(HbgGraphRestoreTest, OrdinaryIntermediateSurvivesBuildPacketAndRestore) {
     EXPECT_EQ(tasks[0].payload.tensor_data()[0].buffer.addr, tasks[1].payload.tensor_data()[0].buffer.addr);
     EXPECT_EQ(tasks[1].payload.fanin_data()[0], 0);
     const auto *heap = reinterpret_cast<const uint8_t *>(binding.heap.address);
-    EXPECT_TRUE(std::all_of(heap + result.heap_bytes, heap + binding.heap.capacity, [](auto value) {
+    EXPECT_TRUE(std::all_of(heap, heap + binding.heap.capacity, [](auto value) {
+        return value == 0xa5;
+    }));
+    hbg::GraphRestoreResult peer;
+    ASSERT_EQ(hbg::acquire_graph_restore_result(registry, restored.generation, peer), hbg::GraphRestoreStatus::Ok);
+    EXPECT_TRUE(std::all_of(heap, heap + binding.heap.capacity, [](auto value) {
         return value == 0xa5;
     }));
     ASSERT_NO_FATAL_FAILURE(retire());
-    auto *source = reinterpret_cast<ChipTaskStorage *>(
-        reinterpret_cast<std::byte *>(packet.storage.data()) + packet.data_offset + packet_header().sm_offset +
-        offsets.storage
-    );
+    auto *source_sm = reinterpret_cast<std::byte *>(packet.storage.data()) + packet.data_offset +
+                      packet_header().sm_offset - packet_header().runtime_offset;
+    Buffer aligned;
+    aligned.reserve(restored.sm_bytes);
+    std::memcpy(aligned.data(), source_sm, restored.sm_bytes);
+    auto *source = reinterpret_cast<ChipTaskStorage *>(aligned.data() + offsets.storage);
     auto &tensor = source[0].payload.tensor_data()[0];
     const auto original = tensor;
     for (uint64_t address : {binding.heap.address - 64, binding.heap.address + result.heap_bytes, HEAP_VIRTUAL_BASE}) {
         tensor.buffer.addr = address;
+        std::memcpy(source_sm, aligned.data(), restored.sm_bytes);
         patch();
         const auto before = working_bytes();
         EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
@@ -2641,10 +3966,46 @@ TEST_F(HbgGraphRestoreTest, OrdinaryIntermediateSurvivesBuildPacketAndRestore) {
     }
     tensor = original;
     tensor.buffer.size = result.heap_bytes + 1;
+    std::memcpy(source_sm, aligned.data(), restored.sm_bytes);
     patch();
     const auto before = working_bytes();
     EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
     EXPECT_EQ(working_bytes(), before);
+}
+
+TEST_F(HbgGraphRestoreTest, ForgedFlatTensorRankRejectsBeforeAnyTargetWrite) {
+    ASSERT_EQ(build(chain_entry), 2);
+    prepare(4096);
+    ASSERT_EQ(hbg::seal_graph_execution_slot(context, 0, 19, 109, seal), 0);
+    registry = reinterpret_cast<hbg::GraphSlotRegistry *>(seal.registry.address);
+    ASSERT_EQ(simpler_aicpu_l1_hbg_register_execution_slot(&seal), 0);
+    ASSERT_EQ(snapshot_graph(), 0);
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+    patch();
+    const auto original = packet.storage;
+    const auto before = working_bytes();
+    const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents(result.bind_usage));
+    Buffer aligned;
+    aligned.reserve(result.image_bytes);
+    for (uint32_t ndims : {uint32_t{0}, uint32_t{MAX_TENSOR_DIMS + 1}, uint32_t{256}, UINT32_MAX}) {
+        SCOPED_TRACE(ndims);
+        packet.storage = original;
+        auto *source = reinterpret_cast<std::byte *>(packet.storage.data()) + packet.data_offset +
+                       packet_header().sm_offset - packet_header().runtime_offset + offsets.storage;
+        auto *sm = source - offsets.storage;
+        std::memcpy(aligned.data(), sm, result.image_bytes);
+        auto *storage = reinterpret_cast<ChipTaskStorage *>(aligned.data() + offsets.storage);
+        ASSERT_GT(storage[0].payload.tensor_count, 0);
+        storage[0].payload.tensor_data()[0].ndims = ndims;
+        std::memcpy(sm, aligned.data(), result.image_bytes);
+        patch();
+        ASSERT_EQ(
+            hbg::validate_graph_packet(packet.storage.data(), packet.bytes, hbg::GraphPacketAddress::DeviceCopy),
+            hbg::GraphPacketStatus::Ok
+        );
+        EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
+        EXPECT_EQ(working_bytes(), before);
+    }
 }
 
 TEST_F(HbgGraphPacketTest, PacketDoesNotTransmitUnusedFrozenCapacity) {
@@ -2657,7 +4018,48 @@ TEST_F(HbgGraphPacketTest, PacketDoesNotTransmitUnusedFrozenCapacity) {
     );
 }
 
-TEST_F(HbgGraphRestoreTest, RepeatedRestoreRebuildsQueuesPointersAndEveryCapacityByte) {
+TEST_F(HbgGraphRestoreTest, DirtyHeapMaterializesGraphAfterEveryRestore) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    for (uint8_t fill : {0xa5, 0x5a, 0xff}) {
+        dirty_working();
+        std::memset(reinterpret_cast<void *>(binding.heap.address), fill, binding.heap.capacity);
+        ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+        auto &tasks = restored.runtime->sm_handle->header->tasks;
+        int graphs = 0;
+        for (int32_t i = 0; i < tasks.total_tasks; ++i) {
+            auto &outer = tasks.storage_at(i);
+            if (outer.slot.task_kind != TaskKind::GRAPH) continue;
+            ++graphs;
+            auto *execution = graph_execution_localize(outer.slot);
+            ASSERT_NE(execution, nullptr);
+            ASSERT_EQ(execution->task_count, 2);
+            EXPECT_EQ(execution->remaining_tasks.load(), 2);
+            EXPECT_EQ(graph_execution_materialize_slice(outer.slot, *execution, 1), GraphMaterializeResult::PENDING);
+            EXPECT_EQ(graph_execution_materialize_slice(outer.slot, *execution, 1), GraphMaterializeResult::PREPARED);
+            for (int32_t j = 0; j < execution->task_count; ++j) {
+                const auto &task = execution->task_at(j);
+                EXPECT_EQ(execution->task_states[j].load(), CHIP_TASK_PENDING);
+                EXPECT_EQ(task.slot.completed_subtasks.load(), 0);
+                EXPECT_EQ(task.payload.published_block_count.load(), 0);
+                EXPECT_EQ(task.payload.scalar_count, 0);
+                ASSERT_EQ(task.payload.tensor_count, j + 1);
+                for (int32_t k = 0; k < task.payload.tensor_count; ++k) {
+                    const auto &tensor = task.payload.tensor_data()[k];
+                    EXPECT_GE(tensor.buffer.addr, binding.heap.address);
+                    EXPECT_LE(tensor.buffer.addr + tensor.buffer.size, binding.heap.address + result.heap_bytes);
+                }
+            }
+            EXPECT_EQ(
+                execution->task_at(0).payload.tensor_data()[0].buffer.addr,
+                execution->task_at(1).payload.tensor_data()[0].buffer.addr
+            );
+        }
+        EXPECT_EQ(graphs, 1);
+        ASSERT_NO_FATAL_FAILURE(retire());
+    }
+}
+
+TEST_F(HbgGraphRestoreTest, RepeatedRestoreRebuildsQueuesPointersAndWorkingImages) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     const auto source = packet.storage;
     ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
@@ -2667,20 +4069,122 @@ TEST_F(HbgGraphRestoreTest, RepeatedRestoreRebuildsQueuesPointersAndEveryCapacit
     EXPECT_EQ(runtime->scheduler->sm_header, runtime->sm_handle->header);
     auto &queue = runtime->scheduler->graph_ready_queue;
     EXPECT_EQ(queue.slots[queue.capacity - 1].sequence.load(), queue.capacity - 1);
-    const auto expected = mutable_bytes();
+    ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+    const auto expected = restored_image_bytes();
     for (uint64_t iteration = 2; iteration <= 16; ++iteration) {
         ASSERT_NO_FATAL_FAILURE(retire());
         dirty_working();
         ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
         EXPECT_EQ(restored.runtime, runtime);
         EXPECT_EQ(restored.generation, iteration);
-        EXPECT_EQ(mutable_bytes(), expected);
+        ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+        EXPECT_EQ(restored_image_bytes(), expected);
         EXPECT_EQ(packet.storage, source);
         hbg::GraphRestoreResult peer;
         EXPECT_EQ(hbg::acquire_graph_restore_result(registry, iteration - 1, peer), hbg::GraphRestoreStatus::NotReady);
         EXPECT_EQ(hbg::acquire_graph_restore_result(registry, iteration, peer), hbg::GraphRestoreStatus::Ok);
         EXPECT_EQ(peer.runtime, runtime);
     }
+}
+
+TEST_F(HbgGraphRestoreTest, RuntimeTailFlushKeepsDevicePrefixInitialized) {
+    ASSERT_EQ(build(empty_entry), 0);
+    RuntimeArenaLayout layout{};
+    ASSERT_EQ(hbg::make_kernel_graph_layout(capacity, layout), 0);
+    hbg::GraphResourceRequirements empty{};
+    ASSERT_EQ(hbg::get_graph_resource_requirements(result, layout, empty), 0);
+    ASSERT_NO_FATAL_FAILURE(prepare_slot(true, empty.scheduler_state_bytes));
+    struct Trace {
+        std::vector<std::pair<const void *, size_t>> copies;
+        std::vector<std::pair<const void *, size_t>> flushes;
+    } trace;
+    hbg::GraphRestoreOps ops;
+    ops.context = &trace;
+    ops.copy = [](void *context, void *dst, const void *src, size_t bytes) {
+        static_cast<Trace *>(context)->copies.emplace_back(dst, bytes);
+        std::memcpy(dst, src, bytes);
+        return true;
+    };
+    ops.flush = [](void *context, const void *dst, size_t bytes) {
+        static_cast<Trace *>(context)->flushes.emplace_back(dst, bytes);
+        return true;
+    };
+    for (bool empty_graph : {false, true}) {
+        if (empty_graph) {
+            ASSERT_EQ(build(empty_entry), 0);
+            ASSERT_EQ(snapshot_graph(), 0);
+            ASSERT_EQ(hbg::make_graph_host_args(snapshot, packet), 0);
+            patch();
+        }
+        dirty_working();
+        trace.copies.clear();
+        trace.flushes.clear();
+        ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::Ok);
+        ASSERT_FALSE(trace.copies.empty());
+        ASSERT_FALSE(trace.flushes.empty());
+        const auto &h = packet_header();
+        const uint64_t live = h.sm_offset + result.image_bytes;
+        EXPECT_EQ(
+            trace.copies[0].first, reinterpret_cast<const void *>(seal.destinations[1].address + h.runtime_offset)
+        );
+        EXPECT_EQ(trace.copies[0].second, live - h.runtime_offset);
+        EXPECT_EQ(
+            trace.flushes[0].first, reinterpret_cast<const void *>(seal.destinations[1].address + h.runtime_offset)
+        );
+        EXPECT_EQ(trace.flushes[0].second, live - h.runtime_offset);
+        ASSERT_EQ(trace.flushes.size(), trace.copies.size() + 1);
+        for (size_t i = 1; i < trace.copies.size(); ++i)
+            EXPECT_EQ(trace.flushes[i], trace.copies[i]);
+        EXPECT_EQ(trace.flushes.back().first, &registry->restore);
+        EXPECT_EQ(trace.flushes.back().second, sizeof(registry->restore));
+        EXPECT_EQ(registry->restore.live_bytes[1], live);
+        ASSERT_NO_FATAL_FAILURE(expect_initialized_prefix());
+        ASSERT_NO_FATAL_FAILURE(retire());
+    }
+}
+
+TEST_F(HbgGraphRestoreTest, NoncanonicalDestinationOffsetsRejectBeforeAnyTargetWrite) {
+    ASSERT_NO_FATAL_FAILURE(prepare_slot());
+    const auto original = packet.storage;
+    const auto before = working_bytes();
+    const auto offset = packet_header().runtime_offset;
+    const auto capacity = seal.destinations[1].capacity;
+    for (uint64_t invalid :
+         {uint64_t{0}, offset - 1, offset + 1, packet_header().sm_offset, capacity - 1, UINT64_MAX}) {
+        packet.storage = original;
+        auto *region = reinterpret_cast<hbg::GraphImageRegion *>(
+            reinterpret_cast<std::byte *>(packet.storage.data()) + sizeof(SimplerKernelInvocationHeader) +
+            sizeof(hbg::GraphPacketHeader)
+        );
+        region->destination_offset = invalid;
+        patch();
+        EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Rejected);
+        EXPECT_EQ(working_bytes(), before);
+    }
+    packet.storage = original;
+    auto *regions = reinterpret_cast<hbg::GraphImageRegion *>(
+        reinterpret_cast<std::byte *>(packet.storage.data()) + sizeof(SimplerKernelInvocationHeader) +
+        sizeof(hbg::GraphPacketHeader)
+    );
+    ASSERT_GT(packet_header().region_count, 1u);
+    regions[1].destination_offset = 64;
+    patch();
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Rejected);
+    EXPECT_EQ(working_bytes(), before);
+    packet.storage = original;
+    packet_header().runtime_offset -= 64;
+    regions = reinterpret_cast<hbg::GraphImageRegion *>(
+        reinterpret_cast<std::byte *>(packet.storage.data()) + sizeof(SimplerKernelInvocationHeader) +
+        sizeof(hbg::GraphPacketHeader)
+    );
+    regions[0].destination_offset = packet_header().runtime_offset;
+    patch();
+    ASSERT_EQ(
+        hbg::validate_graph_packet(packet.storage.data(), packet.bytes, hbg::GraphPacketAddress::DeviceCopy),
+        hbg::GraphPacketStatus::Ok
+    );
+    EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
+    EXPECT_EQ(working_bytes(), before);
 }
 
 TEST_F(HbgGraphRestoreTest, SourceCorruptionOnFirstMiddleAndLastLineCannotWriteDestinations) {
@@ -2709,12 +4213,12 @@ TEST_F(HbgGraphRestoreTest, ForgedRuntimeLayoutAndRelativePoolsRejectBeforeCopy)
         EXPECT_EQ(restore(), hbg::GraphRestoreStatus::InvalidImage);
         EXPECT_EQ(working_bytes(), before);
     };
-    const size_t runtime = packet.data_offset + packet_header().runtime_offset;
+    const size_t runtime = packet.data_offset;
     corrupt(
         runtime + offsetof(RuntimeContext, prebuilt_layout) + offsetof(RuntimeArenaLayout, off_scheduler), UINT64_MAX, 8
     );
     corrupt(runtime + offsetof(RuntimeContext, ops), 0x1234, sizeof(void *));
-    const size_t sm = packet.data_offset + packet_header().sm_offset;
+    const size_t sm = packet.data_offset + packet_header().sm_offset - packet_header().runtime_offset;
     corrupt(sm + offsetof(SharedMemoryTaskHeader, total_tasks), 999, 4);
     const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents({packet_header().total_tasks, 0, 0, 0}));
     corrupt(sm + offsets.storage + offsetof(ChipTaskStorage, payload) + offsetof(TaskPayload, tensors), INT32_MAX, 4);
@@ -2724,7 +4228,7 @@ TEST_F(HbgGraphRestoreTest, HostOnlyCopyCannotBeSmuggledIntoTheDeviceGraphImage)
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     const auto before = working_bytes();
     auto *base = reinterpret_cast<std::byte *>(packet.storage.data());
-    const size_t sm = packet.data_offset + packet_header().sm_offset;
+    const size_t sm = packet.data_offset + packet_header().sm_offset - packet_header().runtime_offset;
     const auto offsets = sm_layout::segment_offsets(sm_layout::image_extents({packet_header().total_tasks, 0, 0, 0}));
     const size_t payload = sm + offsets.storage + offsetof(ChipTaskStorage, payload);
     const size_t tensor_field = payload + offsetof(TaskPayload, tensors);
@@ -2750,27 +4254,20 @@ TEST_F(HbgGraphRestoreTest, PartialMemoryFailuresNeverCommitAndFullRetrySucceeds
             std::memcpy(dst, src, size);
             return ++self.step != self.fail_at;
         }
-        static bool zero(void *ctx, void *dst, size_t size) {
-            auto &self = *static_cast<Fault *>(ctx);
-            std::memset(dst, 0, size);
-            return ++self.step != self.fail_at;
-        }
         static bool flush(void *ctx, const void *, size_t) {
             auto &self = *static_cast<Fault *>(ctx);
             return ++self.step != self.fail_at;
         }
     };
-    int regions = 0;
-    for (const auto &dst : seal.destinations)
-        regions += dst.capacity != 0;
-    const auto expected = mutable_bytes();
+    const int regions = static_cast<int>(packet_header().region_count);
+    const auto expected = restored_image_bytes();
     for (int fail_at = 1; fail_at <= 2 * regions + 1; ++fail_at) {
         const uint64_t previous = restored.generation;
         const auto output = restored;
         Fault fault{0, fail_at};
         ASSERT_NO_FATAL_FAILURE(retire());
         dirty_working();
-        EXPECT_EQ(restore({&fault, Fault::copy, Fault::zero, Fault::flush}), hbg::GraphRestoreStatus::CopyFailed);
+        EXPECT_EQ(restore({&fault, Fault::copy, Fault::flush}), hbg::GraphRestoreStatus::CopyFailed);
         EXPECT_EQ(restored.generation, output.generation);
         EXPECT_EQ(restored.runtime, output.runtime);
         EXPECT_EQ(registry->restore.committed_generation, previous);
@@ -2781,7 +4278,7 @@ TEST_F(HbgGraphRestoreTest, PartialMemoryFailuresNeverCommitAndFullRetrySucceeds
         ASSERT_NO_FATAL_FAILURE(retire(hbg::GraphRestoreRetirement::ControlledFailure));
         EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
         EXPECT_EQ(restored.generation, previous + 2);
-        EXPECT_EQ(mutable_bytes(), expected);
+        EXPECT_EQ(restored_image_bytes(), expected);
     }
 }
 
@@ -2815,6 +4312,7 @@ TEST_F(HbgGraphRestoreTest, SmallerAndEmptyGraphsInitializeOnlyLiveWorkingState)
     // A5 reserves its flat scheduler for the empty graph and uses the Graph
     // fallback for the nonempty graph. Prepare accounts for both variants.
     ASSERT_NO_FATAL_FAILURE(prepare_slot(true, empty.scheduler_state_bytes));
+    const auto original_packet = packet;
     ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
     ASSERT_NO_FATAL_FAILURE(retire());
     ASSERT_EQ(build(empty_entry), 0);
@@ -2830,13 +4328,21 @@ TEST_F(HbgGraphRestoreTest, SmallerAndEmptyGraphsInitializeOnlyLiveWorkingState)
         if (!dst.capacity) continue;
         const auto *bytes = reinterpret_cast<const uint8_t *>(dst.address);
         const uint64_t live = i == 0 ? empty.gm_heap_bytes : empty.scheduler_state_bytes;
-        EXPECT_TRUE(std::all_of(bytes, bytes + live, [](auto value) {
-            return value == 0;
+        EXPECT_TRUE(std::all_of(bytes, bytes + live, [i](auto value) {
+            return value == (i == 0 ? 0xa5 : 0);
         }));
         EXPECT_TRUE(std::all_of(bytes + live, bytes + dst.capacity, [](auto value) {
             return value == 0xa5;
         }));
     }
+    ASSERT_NO_FATAL_FAILURE(retire());
+    packet = original_packet;
+    patch();
+    dirty_working();
+    ASSERT_EQ(restore(), hbg::GraphRestoreStatus::Ok);
+    EXPECT_EQ(restored.total_tasks, packet_header().total_tasks);
+    EXPECT_GT(restored.total_tasks, 0u);
+    EXPECT_EQ(restored.runtime->sm_handle->header->tasks.total_tasks, static_cast<int32_t>(restored.total_tasks));
 }
 
 TEST_F(HbgGraphRestoreTest, BusyAndExhaustedControlCannotWriteWorkingImages) {
@@ -2924,7 +4430,7 @@ TEST_F(HbgGraphRestoreTest, ReadyExecutionCannotBeOverwrittenBeforeRetirement) {
 TEST_F(HbgGraphRestoreTest, FailedRestoreCannotRetryWithoutCleanup) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     hbg::GraphRestoreOps ops;
-    ops.zero = [](void *, void *, size_t) {
+    ops.copy = [](void *, void *, const void *, size_t) {
         return false;
     };
     ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::CopyFailed);
@@ -3008,7 +4514,7 @@ TEST_F(HbgGraphRestoreTest, PublishFailureIsQuarantinedAndFatalCleanupCannotRetr
         hbg::GraphRestoreStatus::Rejected
     );
     EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Quarantined);
-    const auto before = mutable_bytes();
+    const auto before = target_bytes();
     EXPECT_EQ(
         hbg::retire_graph_restore(registry, registry->restore.attempt, {hbg::GraphRestoreRetirement::FatalFailure}),
         hbg::GraphRestoreStatus::Poisoned
@@ -3020,7 +4526,7 @@ TEST_F(HbgGraphRestoreTest, PublishFailureIsQuarantinedAndFatalCleanupCannotRetr
         ),
         hbg::GraphRestoreStatus::Poisoned
     );
-    EXPECT_EQ(mutable_bytes(), before);
+    EXPECT_EQ(target_bytes(), before);
 }
 
 TEST_F(HbgGraphRestoreTest, FatalExecutionAfterSuccessfulRestoreRevokesPeerAccess) {
@@ -3051,7 +4557,7 @@ TEST_F(HbgGraphRestoreTest, PeerValidatesRegistryBeforeInvalidatingWorkingAddres
 TEST_F(HbgGraphRestoreTest, ControlledRestoreFailureCannotHideNativeRuntimeError) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     hbg::GraphRestoreOps ops;
-    ops.zero = [](void *, void *, size_t) {
+    ops.copy = [](void *, void *, const void *, size_t) {
         return false;
     };
     ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::CopyFailed);
@@ -3067,7 +4573,7 @@ TEST_F(HbgGraphRestoreTest, ControlledRestoreFailureCannotHideNativeRuntimeError
 TEST_F(HbgGraphRestoreTest, ControlledRestoreFailureCannotHideUnexpectedTeardownError) {
     ASSERT_NO_FATAL_FAILURE(prepare_slot());
     hbg::GraphRestoreOps ops;
-    ops.zero = [](void *, void *, size_t) {
+    ops.copy = [](void *, void *, const void *, size_t) {
         return false;
     };
     ASSERT_EQ(restore(ops), hbg::GraphRestoreStatus::CopyFailed);
@@ -3078,4 +4584,202 @@ TEST_F(HbgGraphRestoreTest, ControlledRestoreFailureCannotHideUnexpectedTeardown
         hbg::GraphRestoreStatus::Poisoned
     );
     EXPECT_EQ(restore(), hbg::GraphRestoreStatus::Poisoned);
+}
+
+namespace {
+
+class HbgCallableBindingTest : public ::testing::Test {
+protected:
+    Runtime runtime;
+    hbg::KernelCallableBinding binding;
+    std::vector<uint8_t> image_a;
+    std::vector<uint8_t> image_b;
+    hbg::HbgCallableRegistration a;
+    hbg::HbgCallableRegistration b;
+
+    static std::vector<uint8_t> image(int children, uint8_t code_byte) {
+        const int32_t ids[] = {3, 8};
+        std::vector<uint8_t> child_images[2];
+        for (int i = 0; i < children; ++i) {
+            child_images[i] = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, &code_byte, 1);
+            reinterpret_cast<CoreCallable *>(child_images[i].data())->resolved_addr_ = 0x1000 + code_byte + i;
+        }
+        return make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 1024>(
+            nullptr, 0, "orch", &code_byte, 1, ids, child_images, children, ""
+        );
+    }
+
+    static CoreCallable *child(std::vector<uint8_t> &storage, int index) {
+        auto *parent = reinterpret_cast<ChipCallable *>(storage.data());
+        return reinterpret_cast<CoreCallable *>(parent->storage_ + parent->child_offsets_[index]);
+    }
+
+    hbg::HbgCallableRegistration registration(std::vector<uint8_t> &storage, int id) {
+        hbg::HbgCallableRegistration value;
+        value.context_generation = 1;
+        value.runtime_address = reinterpret_cast<uintptr_t>(&runtime);
+        value.register_table_address = 0x1000;
+        value.callable_address = reinterpret_cast<uintptr_t>(storage.data());
+        value.callable_bytes = storage.size();
+        value.callable_hash = id + 1;
+        value.function_hash = id + 2;
+        value.callable_id = id;
+        value.device_id = 0;
+        value.runtime_binary_id = 1;
+        return value;
+    }
+
+    void SetUp() override {
+        image_a = image(2, 1);
+        image_b = image(1, 2);
+        a = registration(image_a, 0);
+        b = registration(image_b, 1);
+        ASSERT_TRUE(hbg::valid_hbg_callable_registration(a));
+        ASSERT_TRUE(hbg::valid_hbg_callable_registration(b));
+    }
+
+    void expect_a() {
+        EXPECT_EQ(runtime.get_active_callable_id(), a.callable_id);
+        EXPECT_EQ(runtime.get_function_bin_addr(3), reinterpret_cast<uintptr_t>(child(image_a, 0)));
+        EXPECT_EQ(runtime.get_function_bin_addr(8), reinterpret_cast<uintptr_t>(child(image_a, 1)));
+    }
+};
+
+TEST_F(HbgCallableBindingTest, RepeatedBindingPreservesEveryChildHeader) {
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
+    expect_a();
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Reused);
+    expect_a();
+}
+
+TEST_F(HbgCallableBindingTest, DifferentCodeWithSharedFunctionIdSupportsAba) {
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
+    ASSERT_EQ(binding.bind(&runtime, b), hbg::CallableBindingResult::Rebound);
+    EXPECT_EQ(runtime.get_function_bin_addr(3), reinterpret_cast<uintptr_t>(child(image_b, 0)));
+    EXPECT_EQ(runtime.get_function_bin_addr(8), 0u);
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
+    expect_a();
+}
+
+TEST_F(HbgCallableBindingTest, PartialFailureRevokesPriorBindingBeforeRetry) {
+    for (bool bad_offset : {false, true}) {
+        ASSERT_NE(binding.bind(&runtime, a), hbg::CallableBindingResult::Rejected);
+        auto failing_image = image(2, 3);
+        auto failing = registration(failing_image, 2);
+        if (bad_offset) {
+            reinterpret_cast<ChipCallable *>(failing_image.data())->child_offsets_[1] = UINT32_MAX;
+        } else {
+            child(failing_image, 1)->resolved_addr_ = 0;
+        }
+        ASSERT_EQ(binding.bind(&runtime, failing), hbg::CallableBindingResult::Rejected);
+        EXPECT_EQ(runtime.get_active_callable_id(), -1);
+        EXPECT_EQ(runtime.get_function_bin_addr(3), reinterpret_cast<uintptr_t>(child(failing_image, 0)));
+        ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
+        expect_a();
+    }
+}
+
+TEST_F(HbgCallableBindingTest, ActiveResetRebuildsTheSameRegistration) {
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
+    runtime.clear_function_bin_addrs();
+    runtime.set_active_callable_id(-1);
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
+    expect_a();
+}
+
+TEST_F(HbgCallableBindingTest, NewGenerationCannotReuseOldSuccessfulBinding) {
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
+    auto next = a;
+    ++next.context_generation;
+    child(image_a, 1)->resolved_addr_ = 0;
+    ASSERT_EQ(binding.bind(&runtime, next), hbg::CallableBindingResult::Rejected);
+    EXPECT_EQ(runtime.get_active_callable_id(), -1);
+    child(image_a, 1)->resolved_addr_ = 0x2000;
+    ASSERT_EQ(binding.bind(&runtime, next), hbg::CallableBindingResult::Rebound);
+    expect_a();
+}
+
+TEST_F(HbgCallableBindingTest, RuntimeIdentityMustMatchEvenWithTheSameActiveId) {
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
+    Runtime another;
+    another.set_active_callable_id(a.callable_id);
+    ASSERT_EQ(binding.bind(&another, a), hbg::CallableBindingResult::Rejected);
+    EXPECT_EQ(another.get_active_callable_id(), -1);
+    auto next = a;
+    next.runtime_address = reinterpret_cast<uintptr_t>(&another);
+    ASSERT_EQ(binding.bind(&another, next), hbg::CallableBindingResult::Rebound);
+    EXPECT_EQ(another.get_function_bin_addr(3), reinterpret_cast<uintptr_t>(child(image_a, 0)));
+    ASSERT_EQ(binding.bind(&runtime, a), hbg::CallableBindingResult::Rebound);
+    expect_a();
+}
+
+}  // namespace
+
+TEST(HbgRuntimePublication, SpansCoverChangedFieldsWithoutPublishingWorkerLines) {
+    for (bool functions_changed : {false, true}) {
+        SCOPED_TRACE(functions_changed);
+        Runtime runtime;
+        const auto *base = reinterpret_cast<const uint8_t *>(&runtime);
+        const std::vector<uint8_t> before(base, base + sizeof(runtime));
+        constexpr uintptr_t pattern = UINTPTR_MAX / 0xff * 0x5a;
+        runtime.set_gm_sm_ptr(reinterpret_cast<void *>(pattern));
+        runtime.set_prebuilt_arena(reinterpret_cast<void *>(pattern), pattern);
+        runtime.host_total_tasks = 0x35353535;
+        runtime.sm_image_bytes = pattern;
+        runtime.set_active_callable_id(0x35353535);
+        if (functions_changed)
+            for (int i = 0; i < RUNTIME_MAX_FUNC_ID; ++i)
+                runtime.replay_function_bin_addr(i, pattern);
+        const auto spans = runtime.kernel_graph_publication_spans(functions_changed);
+        EXPECT_EQ(spans[0].address, runtime.func_id_to_addr_);
+        EXPECT_EQ(spans[0].bytes, functions_changed ? sizeof(runtime.func_id_to_addr_) : 0u);
+        const auto object_begin = reinterpret_cast<uintptr_t>(&runtime);
+        const auto owned_end = reinterpret_cast<uintptr_t>(runtime.teardown_gates) + sizeof(runtime.teardown_gates);
+        size_t published_bytes = 0;
+        for (const auto &span : spans) {
+            if (span.bytes == 0) continue;
+            const auto begin = reinterpret_cast<uintptr_t>(span.address);
+            ASSERT_GE(begin, object_begin);
+            ASSERT_LE(begin + span.bytes, object_begin + sizeof(runtime));
+            // cache_ops.cpp rounds both ends to 64-byte AICPU cache lines.
+            const auto rounded_begin = begin & ~uintptr_t{63};
+            const auto rounded_end = (begin + span.bytes + 63) & ~uintptr_t{63};
+            EXPECT_GE(rounded_begin, owned_end);
+            EXPECT_GT(rounded_end, rounded_begin);
+            published_bytes += span.bytes;
+        }
+        EXPECT_LT(published_bytes, (functions_changed ? sizeof(runtime.func_id_to_addr_) : 0u) + 1024u);
+        for (size_t offset = 0; offset < sizeof(runtime); ++offset) {
+            if (before[offset] == base[offset]) continue;
+            const auto address = object_begin + offset;
+            EXPECT_TRUE(
+                std::any_of(
+                    spans.begin(), spans.end(),
+                    [&](const auto &span) {
+                        const auto begin = reinterpret_cast<uintptr_t>(span.address);
+                        return address >= begin && address - begin < span.bytes;
+                    }
+                )
+            ) << "unpublished changed byte "
+              << offset;
+        }
+    }
+}
+
+TEST(HbgRuntimePublication, HandshakeSpanStaysWithinHostResetLinesWithoutReadingConfiguration) {
+    Runtime runtime;
+    for (int32_t workers : {-1, 0, 1, RUNTIME_MAX_WORKER, INT32_MAX}) {
+        SCOPED_TRACE(workers);
+        runtime.worker_count = workers;
+        const auto span = runtime.kernel_graph_handshake_span();
+        const auto begin = reinterpret_cast<uintptr_t>(span.address);
+        const auto end = begin + span.bytes;
+        EXPECT_EQ(begin, reinterpret_cast<uintptr_t>(&runtime.kernel_prelaunch));
+        EXPECT_EQ(end, reinterpret_cast<uintptr_t>(runtime.workers + RUNTIME_MAX_WORKER));
+        EXPECT_EQ(begin % 64, 0u);
+        EXPECT_EQ(end % 64, 0u);
+        EXPECT_LE(end, reinterpret_cast<uintptr_t>(runtime.teardown_gates));
+        EXPECT_LE(end, reinterpret_cast<uintptr_t>(&runtime.worker_count));
+        EXPECT_LE(end, reinterpret_cast<uintptr_t>(runtime.func_id_to_addr_));
+    }
 }

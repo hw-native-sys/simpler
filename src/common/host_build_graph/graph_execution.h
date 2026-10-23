@@ -356,9 +356,13 @@ inline bool graph_tensor_wire_valid(const GraphTensor &tensor) {
         const uint64_t stride = tensor.strides[i];
         if (shape == 0 || stride == 0) return false;
         contiguous &= stride == expected_stride;
-        if (shape - 1 > (UINT64_MAX - extent) / stride || expected_stride > UINT64_MAX / shape) return false;
-        extent += (shape - 1) * stride;
-        expected_stride *= shape;
+        uint64_t increment, next_extent, next_stride;
+        if (__builtin_mul_overflow(shape - 1, stride, &increment) ||
+            __builtin_add_overflow(extent, increment, &next_extent) ||
+            __builtin_mul_overflow(expected_stride, shape, &next_stride))
+            return false;
+        extent = next_extent;
+        expected_stride = next_stride;
     }
     if (extent != tensor.extent_elem || contiguous != (tensor.is_contiguous != 0)) return false;
 

@@ -73,6 +73,20 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
         next->graph_template = std::move(candidate);
         next->argument_snapshot = std::move(snapshot);
         next->argument_hash = argument_hash;
+        auto prepared = std::make_shared<hbg::KernelPreparedGraphImage>();
+        rc = hbg::make_graph_prepared_dispatch(next->graph_template, registration->second, prepared->dispatch);
+        if (rc != 0) return rc;
+        const auto &graph = prepared->dispatch.graph;
+        rc = aclrtMallocHost(&prepared->pinned_image, static_cast<size_t>(graph.payload_bytes));
+        if (rc != 0) return rc;
+        prepared->release_image = [](void *image) noexcept {
+            return static_cast<int>(aclrtFreeHost(image));
+        };
+        const auto *payload = static_cast<const std::byte *>(next->graph_template.data()) +
+                              sizeof(SimplerKernelInvocationHeader) + graph.payload_offset;
+        std::memcpy(prepared->pinned_image, payload, static_cast<size_t>(graph.payload_bytes));
+        hbg_kernel_state_->prepared_images.push_back(prepared);
+        next->prepared_image = std::move(prepared);
         state.hbg_launch_state = std::move(next);
     }
 
@@ -80,8 +94,7 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
     struct Submission {
         DeviceRunnerBase *runner;
         void *caller;
-        const hbg::GraphLaunchTemplate *graph;
-        const hbg::HbgCallableRegistration *registration;
+        const hbg::KernelPreparedGraphImage *prepared;
         uint64_t clear_address;
         size_t clear_bytes;
     };
@@ -97,11 +110,7 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
     if (runtime_address == 0 || workers_end <= clear_address || kernel_runtime_.get_worker_count() <= 0)
         return PTO_RUNTIME_ERR_INVALID_STATE;
     Submission submission{
-        this,
-        caller_stream,
-        &state.hbg_launch_state->graph_template,
-        &registration->second,
-        clear_address,
+        this, caller_stream, state.hbg_launch_state->prepared_image.get(), clear_address,
         static_cast<size_t>(workers_end - clear_address)
     };
     kl::KernelLaunchGateOps gate;
@@ -154,17 +163,27 @@ int DeviceRunnerBase::launch_hbg_kernel_callable(
         auto &r = *static_cast<Submission *>(context)->runner;
         return r.launch_aicore_kernel(static_cast<rtStream_t>(stream), r.persistent_args_.device_k_args());
     };
+    ops.publish_image = [](void *context, void *stream) noexcept {
+        const auto &image = *static_cast<Submission *>(context)->prepared;
+        const auto &header = image.dispatch;
+        for (uint32_t n = 0; n < header.graph.region_count; ++n) {
+            const auto &region = header.regions[n];
+            const auto kind = static_cast<uint32_t>(region.kind);
+            const auto &destination = header.graph.destinations[kind];
+            const int rc = aclrtMemcpyAsync(
+                reinterpret_cast<void *>(destination.address + region.destination_offset),
+                static_cast<size_t>(destination.capacity - region.destination_offset),
+                static_cast<const std::byte *>(image.pinned_image) + region.source_offset,
+                static_cast<size_t>(region.bytes), ACL_MEMCPY_HOST_TO_DEVICE, static_cast<aclrtStream>(stream)
+            );
+            if (rc != 0) return rc;
+        }
+        return 0;
+    };
     ops.launch_aicpu = [](void *context, void *stream) noexcept {
         const auto &s = *static_cast<Submission *>(context);
-        // Registration and execution share the AICPU stream and capture. Each
-        // invocation is self-contained even if another graph has never replayed.
-        auto registration = *s.registration;
-        const int registered = s.runner->launch_aicpu_payload(
-            stream, &registration, sizeof(registration), "simpler_aicpu_l1_hbg_register_callable", 1
-        );
-        if (registered != 0) return registered;
-        return hbg::launch_graph_template(
-            *s.graph, s.runner->kernel_aicpu_handle_,
+        return hbg::launch_graph_prepared(
+            s.prepared->dispatch, s.runner->kernel_aicpu_handle_,
             static_cast<uint32_t>(s.runner->kernel_runtime_.get_aicpu_launch_count()), static_cast<aclrtStream>(stream)
         );
     };

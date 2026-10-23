@@ -23,8 +23,8 @@ inline bool supported_kernel_graph_stride_family(const GraphTensor &tensor) noex
     for (uint32_t i = tensor.ndims - 1; i > 0; --i) {
         const uint64_t inner = tensor.strides[i];
         const uint64_t shape = tensor.shapes[i];
-        if (shape != 0 && inner > UINT64_MAX / shape) return false;
-        if (tensor.strides[i - 1] < inner * shape) return false;
+        uint64_t span;
+        if (__builtin_mul_overflow(inner, shape, &span) || tensor.strides[i - 1] < span) return false;
     }
     return true;
 }
@@ -49,10 +49,12 @@ inline bool valid_restored_kernel_graph_tensor(const GraphTensor &tensor, uint64
 
 inline bool
 valid_restored_kernel_graph_tensor(const simpler::hbg::Tensor &tensor, uint64_t heap, uint64_t bytes) noexcept {
+    if (tensor.ndims == 0 || tensor.ndims > MAX_TENSOR_DIMS) return false;
     return valid_restored_kernel_graph_tensor(graph_tensor_pack(tensor), heap, bytes);
 }
 
 inline bool valid_kernel_graph_tensor(const simpler::hbg::Tensor &tensor) noexcept {
+    if (tensor.ndims == 0 || tensor.ndims > MAX_TENSOR_DIMS) return false;
     return valid_kernel_graph_tensor(graph_tensor_pack(tensor));
 }
 

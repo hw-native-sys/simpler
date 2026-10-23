@@ -29,6 +29,56 @@ TEST(KernelBinder, ThreeStreamSuccessAndSteadyStateHaveExactTrace) {
     EXPECT_EQ(f.fake.finishes, 11);
 }
 
+TEST(KernelBinder, PreparedImagePublicationPrecedesAicoreStartOnTheAicpuStream) {
+    Fixture f;
+    ASSERT_NO_FATAL_FAILURE(f.initialize());
+    auto ops = f.fake.ops();
+    ops.publish_image = [](void *context, void *stream) noexcept {
+        auto &fake = *static_cast<Fake *>(context);
+        EXPECT_EQ(stream, fake.handles.aicpu);
+        return fake.append(Step::PublishImage);
+    };
+    auto expected = success;
+    expected.insert(expected.begin() + 3, Step::PublishImage);
+    for (int round = 0; round < 4; ++round) {
+        f.fake.clear_trace();
+        const auto result = launch_bound_kernel(f.binding, ptr(100), f.fake.gate(), ops);
+        EXPECT_EQ(result.status, 0);
+        EXPECT_TRUE(result.tail_recorded);
+        EXPECT_EQ(f.fake.trace, expected);
+    }
+    EXPECT_EQ(f.fake.acquisitions, 4);
+    EXPECT_EQ(f.fake.finishes, 4);
+}
+
+TEST(KernelBinder, FailedImagePublicationStopsBeforeEitherKernelLaunchAndPoisonsTheOwner) {
+    Fixture f;
+    ASSERT_NO_FATAL_FAILURE(f.initialize());
+    auto ops = f.fake.ops();
+    ops.publish_image = [](void *context, void *stream) noexcept {
+        auto &fake = *static_cast<Fake *>(context);
+        EXPECT_EQ(stream, fake.handles.aicpu);
+        return fake.append(Step::PublishImage);
+    };
+    f.fake.fail_at = 4;
+    const auto result = launch_bound_kernel(f.binding, ptr(100), f.fake.gate(), ops);
+    const std::vector<Step> expected{Step::Start, Step::AicpuWait, Step::Clear, Step::PublishImage};
+    EXPECT_EQ(result.status, -1704);
+    EXPECT_EQ(result.failed_step, Step::PublishImage);
+    EXPECT_EQ(result.cleanup_status, 0);
+    EXPECT_TRUE(result.enqueue_started);
+    EXPECT_FALSE(result.tail_recorded);
+    EXPECT_EQ(f.fake.trace, expected);
+    EXPECT_EQ(f.fake.calls, 4);
+    EXPECT_TRUE(f.fake.poisoned);
+    EXPECT_EQ(f.fake.runtime_error, result.status);
+    EXPECT_EQ(f.fake.acquisitions, f.fake.finishes);
+    f.fake.clear_trace();
+    EXPECT_NE(launch_bound_kernel(f.binding, ptr(100), f.fake.gate(), ops).status, 0);
+    EXPECT_TRUE(f.fake.trace.empty());
+    EXPECT_EQ(f.fake.acquisitions, f.fake.finishes);
+}
+
 TEST(KernelBinder, StreamSwitchQueriesButNeverWaitsOldTail) {
     Fixture f;
     ASSERT_NO_FATAL_FAILURE(f.initialize());

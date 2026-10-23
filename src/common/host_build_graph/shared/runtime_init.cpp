@@ -25,6 +25,23 @@
 #include "host_build_graph/shared_memory.h"
 #include "scheduler/scheduler.h"
 
+ReadyQueueCapacities
+hbg::kernel_graph_queue_capacities(uint32_t total_tasks, uint64_t task_window, bool has_definitions) noexcept {
+    uint64_t capacity = 64;
+    const uint64_t population = has_definitions ? task_window : total_tasks;
+    while (capacity < population)
+        capacity <<= 1;
+    ReadyQueueCapacities capacities{};
+    for (int i = 0; i < NUM_RESOURCE_SHAPES; ++i) {
+        capacities.ready[i] = capacity;
+        capacities.ready_sync[i] = capacity;
+    }
+    capacities.dummy = capacity;
+    capacities.graph_ready = capacity;
+    capacities.graph_prepare = capacity;
+    return capacities;
+}
+
 // =============================================================================
 // Ready queue
 // =============================================================================

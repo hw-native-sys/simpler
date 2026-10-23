@@ -33,6 +33,8 @@ enqueue_kernel_launch_sequence(const KernelLaunchOps &ops, const KernelLaunchHan
     if (!step(KernelLaunchStep::Start, ops.record_event(ops.context, h.start, h.caller))) return result;
     if (!step(KernelLaunchStep::AicpuWait, ops.wait_event(ops.context, h.aicpu, h.start))) return result;
     if (!step(KernelLaunchStep::Clear, ops.memset_handshake(ops.context, h.aicpu))) return result;
+    if (ops.publish_image != nullptr && !step(KernelLaunchStep::PublishImage, ops.publish_image(ops.context, h.aicpu)))
+        return result;
 
     // AicoreStart is recorded on the AICPU stream before the AICPU launch. The
     // AICPU orchestrator spins on AICore's handshake report, so an AicoreStart

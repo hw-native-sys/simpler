@@ -16,6 +16,8 @@ struct RuntimeContext;
 
 namespace hbg {
 
+struct GraphPreparedDispatch;
+
 enum class GraphRestoreStatus : uint32_t {
     Ok,
     Rejected,
@@ -49,7 +51,6 @@ struct GraphRestoreResult {
 struct GraphRestoreOps {
     void *context{nullptr};
     bool (*copy)(void *, void *, const void *, size_t){nullptr};
-    bool (*zero)(void *, void *, size_t){nullptr};
     bool (*flush)(void *, const void *, size_t){nullptr};
 };
 
@@ -57,13 +58,26 @@ struct GraphRestoreOps {
 // The owner excludes prior execution/readers, serializes this entire operation
 // with close/registration, and retains immutable packet/callable storage.
 // Source admission and image checks finish before any destination is written.
+// Tensor heap contents are uninitialized; task writers and Graph materialization
+// initialize their data and execution metadata independently of image restore.
 // Ready remains occupied until retirement; Failed remains quarantined until
-// controlled cleanup or terminal poisoning. Every admitted retry restores all regions.
+// controlled cleanup or terminal poisoning. Every admitted retry restores all image regions.
 // out changes only on success. This function neither launches nor synchronizes.
 GraphRestoreStatus restore_graph_packet(
     const void *packet, size_t bytes, int device_id, uint64_t runtime_binary_id,
     const simpler::kernel::PreparedInvocationView &trusted_callable, GraphRestoreResult &out,
     const GraphRestoreOps &ops = {}
+) noexcept;
+
+// The Host validates the complete image before enqueueing DMA. Every participant
+// has invalidated its copied spans after DMA and joined before this leader call.
+// slot comes from the independently acquired live context registry. The owner
+// excludes previous execution and retains the immutable prepared image/metadata.
+// This attaches published bytes without copying or flushing their image spans.
+// A successfully retired mailbox retains its ticket sequence storage; a new
+// slot, intervening restore failure or changed Runtime address initializes it.
+GraphRestoreStatus attach_prepared_graph_image(
+    const GraphPreparedDispatch &prepared, const GraphSlotRegistration &slot, GraphRestoreResult &out
 ) noexcept;
 
 // Called after all participants have skipped dispatch on failure, shut down,

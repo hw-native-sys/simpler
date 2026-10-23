@@ -16,9 +16,12 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <future>
+#include <thread>
 #include <vector>
 
 #include "host_build_graph/ready_queue_sizing.h"
@@ -137,6 +140,80 @@ TEST(HbgReadyQueueSeed, ReseedRecoversAPartiallyUsedRegion) {
         EXPECT_TRUE(queue.push(fake_slot_state(i))) << "push " << i;
     }
     EXPECT_EQ(queue.pop(), fake_slot_state(0));
+}
+
+TEST(HbgReadyQueueSeed, ClaimedConsumerSlotIsNotAFullQueue) {
+    for (bool batch : {false, true}) {
+        SCOPED_TRACE(batch);
+        SlotsRegion region(0xAA);
+        ChipReadyQueue queue{};
+        make_queue(&queue, region);
+        queue.seed_slots();
+        for (uint64_t i = 0; i < CAPACITY; ++i)
+            ASSERT_TRUE(queue.push(fake_slot_state(i)));
+
+        EXPECT_FALSE(queue.consumer_is_releasing(CAPACITY, queue.slots[0].sequence.load()));
+        EXPECT_FALSE(queue.consumer_is_releasing(1, 0));
+        // Consumer A owns slot zero but has not published its free sequence.
+        queue.dequeue_pos.store(1, std::memory_order_relaxed);
+        EXPECT_TRUE(queue.consumer_is_releasing(CAPACITY, queue.slots[0].sequence.load()));
+        ASSERT_EQ(queue.pop(), fake_slot_state(1));
+        if (batch) ASSERT_EQ(queue.pop(), fake_slot_state(2));
+        std::promise<void> started;
+        std::promise<bool> result;
+        auto started_future = started.get_future();
+        auto result_future = result.get_future();
+        std::thread producer([&] {
+            ChipTaskSlotState *items[] = {fake_slot_state(1), fake_slot_state(2)};
+            started.set_value();
+            const uint64_t tags[] = {41, 43};
+            result.set_value(batch ? queue.push_batch_tagged(items, tags, 2) : queue.push_tagged(items[0], 41));
+        });
+        started_future.wait();
+        (void)result_future.wait_for(std::chrono::milliseconds(20));
+        queue.slots[0].sequence.store(CAPACITY, std::memory_order_release);
+        producer.join();
+        ASSERT_TRUE(result_future.get());
+        for (uint64_t i = batch ? 3 : 2; i < CAPACITY; ++i)
+            EXPECT_EQ(queue.pop(), fake_slot_state(i));
+        uint64_t tag = 0;
+        EXPECT_EQ(queue.pop_tagged(&tag), fake_slot_state(1));
+        EXPECT_EQ(tag, 41u);
+        if (batch) {
+            EXPECT_EQ(queue.pop_tagged(&tag), fake_slot_state(2));
+            EXPECT_EQ(tag, 43u);
+        }
+        EXPECT_EQ(queue.pop(), nullptr);
+    }
+}
+
+TEST(HbgReadyQueueSeed, BatchRejectsUnclaimedFullSlotAfterAClaimedHole) {
+    SlotsRegion region(0xAA);
+    ChipReadyQueue queue{};
+    make_queue(&queue, region);
+    queue.seed_slots();
+    for (uint64_t i = 0; i < CAPACITY; ++i)
+        ASSERT_TRUE(queue.push(fake_slot_state(i)));
+    queue.dequeue_pos.store(1, std::memory_order_relaxed);
+    ASSERT_EQ(queue.pop(), fake_slot_state(1));
+    std::promise<void> started;
+    std::promise<bool> result;
+    auto started_future = started.get_future();
+    auto result_future = result.get_future();
+    std::thread producer([&] {
+        ChipTaskSlotState *items[] = {fake_slot_state(0), fake_slot_state(1), fake_slot_state(2)};
+        started.set_value();
+        result.set_value(queue.push_batch(items, 3));
+    });
+    started_future.wait();
+    const auto status = result_future.wait_for(std::chrono::seconds(1));
+    queue.slots[0].sequence.store(CAPACITY, std::memory_order_release);
+    producer.join();
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_FALSE(result_future.get());
+    for (uint64_t i = 2; i < CAPACITY; ++i)
+        EXPECT_EQ(queue.pop(), fake_slot_state(i));
+    EXPECT_EQ(queue.pop(), nullptr);
 }
 
 TEST(HbgReadyQueueSizing, DerivesCapacityForEachReachablePopulation) {

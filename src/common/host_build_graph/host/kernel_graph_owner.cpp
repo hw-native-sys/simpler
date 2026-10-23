@@ -152,6 +152,34 @@ int DeviceRunnerBase::prepare_hbg_kernel_runtime(const HostApi *) {
     );
     if (rc != 0) return rc;
     context.slot_registered = true;
+    rc = launch_aicpu_payload(
+        control_stream, &context.slot_registration, sizeof(context.slot_registration),
+        "simpler_aicpu_l1_hbg_prepare_image_destinations",
+        static_cast<uint32_t>(kernel_runtime_.get_aicpu_launch_count())
+    );
+    if (rc != 0) return rc;
+    return aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
+}
+
+int DeviceRunnerBase::prepare_hbg_kernel_dfx_context() {
+    if (!persistent_args_.is_prepared() || persistent_args_.device_k_args() == nullptr ||
+        persistent_args_.args().runtime_args == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    *kernel_runtime_.kernel_dfx_args_slot() = reinterpret_cast<uint64_t>(persistent_args_.device_k_args());
+    int rc = copy_to_device(
+        persistent_args_.args().runtime_args->kernel_dfx_args_slot(), kernel_runtime_.kernel_dfx_args_slot(),
+        sizeof(uint64_t)
+    );
+    if (rc != 0) return rc;
+    hbg::GraphPreparedContext prepared{
+        hbg_kernel_state_->slot_registration,
+        reinterpret_cast<uint64_t>(persistent_args_.args().runtime_args),
+    };
+    auto *control_stream = kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu);
+    rc = launch_aicpu_payload(
+        control_stream, &prepared, sizeof(prepared), "simpler_aicpu_l1_hbg_prepare_execution_context", 1
+    );
+    if (rc != 0) return rc;
     return aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
 }
 
@@ -190,7 +218,8 @@ int DeviceRunnerBase::prepare_hbg_kernel_callable_registration(
 }
 
 int DeviceRunnerBase::finalize_hbg_kernel_registration() {
-    if (hbg_kernel_state_ == nullptr || !hbg_kernel_state_->slot_registered) return 0;
+    if (hbg_kernel_state_ == nullptr) return 0;
+    if (!hbg_kernel_state_->slot_registered) return hbg_kernel_state_->release_prepared_images();
     rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
     if (control_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
     hbg::GraphSlotDetach detach{
@@ -206,7 +235,11 @@ int DeviceRunnerBase::finalize_hbg_kernel_registration() {
     rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc != 0) return rc;
     hbg_kernel_state_->slot_registered = false;
-    return 0;
+    return hbg_kernel_state_->release_prepared_images();
+}
+
+void DeviceRunnerBase::abandon_hbg_kernel_sources() {
+    if (hbg_kernel_state_ != nullptr) hbg_kernel_state_->abandon_prepared_images();
 }
 
 #endif  // SIMPLER_HBG_KERNEL_MODE

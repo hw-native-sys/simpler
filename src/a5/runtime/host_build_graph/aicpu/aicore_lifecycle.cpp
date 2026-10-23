@@ -78,7 +78,10 @@ int32_t AicoreLifecycle::pre_handshake_init(Runtime *runtime, int32_t aicpu_thre
             "A5 HBG AICore Scheduler PMU/argument diagnostics are best-effort: artifacts may be absent or incomplete"
         );
     }
-    if (chip_swimlane_enabled) chip_swimlane_aicpu_init(core_count_);
+    if (chip_swimlane_enabled) {
+        chip_swimlane_aicpu_init(core_count_);
+        if (*runtime->kernel_dfx_args_slot() != 0) chip_swimlane_aicpu_record_run_boundary();
+    }
     return 0;
 }
 

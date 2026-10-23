@@ -22,7 +22,7 @@
 namespace hbg {
 
 inline constexpr uint32_t GRAPH_PACKET_MAGIC = 0x50474248;  // HBGP
-inline constexpr uint16_t GRAPH_PACKET_VERSION = 3;
+inline constexpr uint16_t GRAPH_PACKET_VERSION = 5;
 
 enum class GraphImageKind : uint32_t { Runtime = 1, Definitions = 2, Scheduler = 3 };
 enum class GraphPacketAddress : uint32_t { HostTemplate, DeviceCopy };
@@ -100,9 +100,76 @@ inline bool graph_span_fits(uint64_t offset, uint64_t size, uint64_t capacity) n
 inline uint64_t graph_packet_checksum(const void *packet, size_t size) noexcept {
     constexpr size_t skip = sizeof(SimplerKernelInvocationHeader) + offsetof(GraphPacketHeader, inline_payload_addr);
     if (packet == nullptr || size < skip + 16) return 0;
+    // XXH64, seed zero, over the concatenation of the two covered spans.
+    // https://github.com/Cyan4973/xxHash/blob/v0.8.3/doc/xxhash_spec.md
+    static_assert(skip == 64);
+    constexpr uint64_t p1 = 0x9e3779b185ebca87ULL;
+    constexpr uint64_t p2 = 0xc2b2ae3d27d4eb4fULL;
+    constexpr uint64_t p3 = 0x165667b19e3779f9ULL;
+    constexpr uint64_t p4 = 0x85ebca77c2b2ae63ULL;
+    constexpr uint64_t p5 = 0x27d4eb2f165667c5ULL;
+    const auto rotate = [](uint64_t value, unsigned bits) {
+        return (value << bits) | (value >> (64 - bits));
+    };
+    const auto read64 = [](const uint8_t *ptr) {
+        uint64_t value;
+        std::memcpy(&value, ptr, sizeof(value));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        value = __builtin_bswap64(value);
+#endif
+        return value;
+    };
+    const auto read32 = [](const uint8_t *ptr) {
+        uint32_t value;
+        std::memcpy(&value, ptr, sizeof(value));
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        value = __builtin_bswap32(value);
+#endif
+        return value;
+    };
+    const auto round = [&](uint64_t acc, uint64_t lane) {
+        return rotate(acc + lane * p2, 31) * p1;
+    };
+    uint64_t a = p1 + p2, b = p2, c = 0, d = uint64_t{0} - p1;
+    const auto stripes = [&](const uint8_t *&ptr, size_t &remaining) {
+        while (remaining >= 32) {
+            a = round(a, read64(ptr));
+            b = round(b, read64(ptr + 8));
+            c = round(c, read64(ptr + 16));
+            d = round(d, read64(ptr + 24));
+            ptr += 32;
+            remaining -= 32;
+        }
+    };
     const auto *bytes = static_cast<const uint8_t *>(packet);
-    auto hash = simpler::common::utils::fnv1a_64(bytes, skip);
-    return simpler::common::utils::fnv1a_64_append(hash, bytes + skip + 16, size - skip - 16);
+    size_t head_bytes = skip;
+    stripes(bytes, head_bytes);
+    const auto *tail = static_cast<const uint8_t *>(packet) + skip + 16;
+    size_t remaining = size - skip - 16;
+    stripes(tail, remaining);
+    uint64_t hash = rotate(a, 1) + rotate(b, 7) + rotate(c, 12) + rotate(d, 18);
+    hash = (hash ^ round(0, a)) * p1 + p4;
+    hash = (hash ^ round(0, b)) * p1 + p4;
+    hash = (hash ^ round(0, c)) * p1 + p4;
+    hash = (hash ^ round(0, d)) * p1 + p4;
+    hash += size - 16;
+    while (remaining >= 8) {
+        hash = rotate(hash ^ round(0, read64(tail)), 27) * p1 + p4;
+        tail += 8;
+        remaining -= 8;
+    }
+    if (remaining >= 4) {
+        hash = rotate(hash ^ (uint64_t{read32(tail)} * p1), 23) * p2 + p3;
+        tail += 4;
+        remaining -= 4;
+    }
+    while (remaining != 0) {
+        hash = rotate(hash ^ (uint64_t{*tail++} * p5), 11) * p1;
+        --remaining;
+    }
+    hash = (hash ^ (hash >> 33)) * p2;
+    hash = (hash ^ (hash >> 29)) * p3;
+    return hash ^ (hash >> 32);
 }
 
 // Allocation-free framing validation. No device destination is read or written.
@@ -169,9 +236,11 @@ validate_graph_packet(const void *packet, size_t size, GraphPacketAddress addres
         if (kind <= previous_kind || kind > 3 || (index == 0 && kind != 1)) return GraphPacketStatus::InvalidRegion;
         const uint64_t capacity = header.destinations[kind].capacity;
         const uint64_t aligned = (cursor + 63) & ~uint64_t{63};
-        if (region.reserved != 0 || region.source_offset != aligned || region.destination_offset != 0 ||
-            region.bytes == 0 || region.bytes > capacity ||
-            (kind == 1 && (region.bytes <= header.sm_offset || region.bytes % 64 != 0)) ||
+        const uint64_t destination_offset = kind == 1 ? header.runtime_offset : 0;
+        if (region.reserved != 0 || region.source_offset != aligned ||
+            region.destination_offset != destination_offset || region.bytes == 0 ||
+            !graph_span_fits(region.destination_offset, region.bytes, capacity) ||
+            (kind == 1 && (region.bytes <= header.sm_offset - header.runtime_offset || region.bytes % 64 != 0)) ||
             !graph_span_fits(region.source_offset, region.bytes, header.payload_bytes))
             return GraphPacketStatus::InvalidRegion;
         for (; cursor < aligned; ++cursor)

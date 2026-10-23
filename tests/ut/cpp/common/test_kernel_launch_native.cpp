@@ -30,6 +30,9 @@ struct NativeFake {
     std::vector<std::vector<uint8_t>> copies;
     std::vector<int> memset_values;
     std::vector<int> host_args_errors;
+    size_t expected_placeholder_count{1};
+    const void *canonical_host_args{nullptr};
+    bool mutate_host_args{false};
     void initialize() {
         fixture.initialize();
         fixture.binding.packet = reinterpret_cast<const uint8_t *>(packet.data());
@@ -100,16 +103,27 @@ extern "C" aclError aclrtLaunchKernelWithHostArgs(
     EXPECT_EQ(function, ptr(201));
     EXPECT_EQ(blocks, 6u);
     EXPECT_EQ(stream, ptr(1));
-    EXPECT_EQ(count, 1u);
+    EXPECT_EQ(count, active->expected_placeholder_count);
+    if (active->canonical_host_args != nullptr) EXPECT_NE(args, active->canonical_host_args);
     auto *first = static_cast<uint8_t *>(args);
-    uint64_t placeholder_value = 1;
-    std::memcpy(&placeholder_value, first + placeholders[0].addrOffset, sizeof(placeholder_value));
-    EXPECT_EQ(placeholder_value, 0u);
     active->copies.emplace_back(first, first + bytes);
-    auto &copy = active->copies.back();
-    const uint64_t address = reinterpret_cast<uintptr_t>(copy.data()) + placeholders[0].dataOffset;
-    std::memcpy(copy.data() + placeholders[0].addrOffset, &address, sizeof(address));
-    std::memcpy(first + placeholders[0].addrOffset, &address, sizeof(address));
+    if (count == 1 && placeholders != nullptr) {
+        uint64_t placeholder_value = 1;
+        std::memcpy(&placeholder_value, first + placeholders[0].addrOffset, sizeof(placeholder_value));
+        EXPECT_EQ(placeholder_value, 0u);
+        auto &copy = active->copies.back();
+        const uint64_t address = reinterpret_cast<uintptr_t>(copy.data()) + placeholders[0].dataOffset;
+        std::memcpy(copy.data() + placeholders[0].addrOffset, &address, sizeof(address));
+        std::memcpy(first + placeholders[0].addrOffset, &address, sizeof(address));
+    } else {
+        EXPECT_EQ(count, 0u);
+        EXPECT_EQ(placeholders, nullptr);
+        EXPECT_EQ(bytes, sizeof(hbg::GraphPreparedDispatch));
+    }
+    if (active->mutate_host_args && bytes != 0) {
+        first[0] ^= 0x80;
+        first[bytes - 1] ^= 0x40;
+    }
     if (!active->host_args_errors.empty()) {
         const int error = active->host_args_errors.front();
         active->host_args_errors.erase(active->host_args_errors.begin());
@@ -132,6 +146,54 @@ TEST(HbgKernelHostArgs, ForwardsEveryLaunchStatusWithoutSynchronizationOrRetry) 
         EXPECT_EQ(hbg::launch_graph_host_args(args, ptr(201), 6, ptr(1), nullptr), error);
         EXPECT_EQ(f.copies.size(), 1u);
     }
+}
+
+TEST(HbgKernelHostArgs, PreparedMetadataUsesNoPlaceholdersAndForwardsStatusWithoutRetry) {
+    for (const int error : {ACL_ERROR_RT_MEMORY_ALLOCATION, 12345, 0}) {
+        SCOPED_TRACE(error);
+        NativeFake f;
+        active = &f;
+        f.initialize();
+        f.expected_placeholder_count = 0;
+        f.host_args_errors = {error};
+        f.mutate_host_args = true;
+        hbg::GraphPreparedDispatch source{};
+        source.invocation.callable_id = 7;
+        source.graph.argument_hash = 101;
+        const auto unchanged = source;
+        f.canonical_host_args = &source;
+        EXPECT_EQ(hbg::launch_graph_prepared(source, ptr(201), 6, ptr(1)), error);
+        ASSERT_EQ(f.copies.size(), 1u);
+        ASSERT_EQ(f.copies[0].size(), 432u);
+        EXPECT_EQ(std::memcmp(f.copies[0].data(), &unchanged, sizeof(unchanged)), 0);
+        EXPECT_EQ(std::memcmp(&source, &unchanged, sizeof(source)), 0);
+        EXPECT_TRUE(f.host_args_errors.empty());
+        EXPECT_TRUE(f.fixture.fake.trace.empty());
+        EXPECT_TRUE(f.memset_values.empty());
+        EXPECT_EQ(f.fixture.fake.queries, 0);
+    }
+}
+
+TEST(HbgKernelHostArgs, PreparedReplaysUseIndependentWritableArgumentCopies) {
+    NativeFake f;
+    active = &f;
+    f.initialize();
+    f.expected_placeholder_count = 0;
+    f.mutate_host_args = true;
+    hbg::GraphPreparedDispatch source{};
+    source.invocation.callable_id = 9;
+    source.graph.argument_hash = 107;
+    const auto unchanged = source;
+    f.canonical_host_args = &source;
+    for (int round = 0; round < 2; ++round) {
+        ASSERT_EQ(hbg::launch_graph_prepared(source, ptr(201), 6, ptr(1)), 0);
+        EXPECT_EQ(std::memcmp(&source, &unchanged, sizeof(source)), 0);
+    }
+    ASSERT_EQ(f.copies.size(), 2u);
+    EXPECT_EQ(f.copies[0], f.copies[1]);
+    EXPECT_EQ(f.copies[0].size(), 432u);
+    EXPECT_EQ(std::memcmp(f.copies[0].data(), &unchanged, sizeof(unchanged)), 0);
+    EXPECT_EQ(f.fixture.fake.trace, (std::vector<Step>{Step::AicpuLaunch, Step::AicpuLaunch}));
 }
 
 TEST(KernelNativeBinder, RoutesThreeStreamsAndCopiesIndependentHostArgs) {

@@ -79,6 +79,7 @@ extern "C" __attribute__((weak)) uint32_t runtime_hbg_kernel_architecture_impl(v
 int __attribute__((weak)) DeviceRunnerBase::prepare_hbg_kernel_runtime(const HostApi *) {
     return PTO_RUNTIME_ERR_UNSUPPORTED;
 }
+int __attribute__((weak)) DeviceRunnerBase::prepare_hbg_kernel_dfx_context() { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 int __attribute__((weak)) DeviceRunnerBase::prepare_hbg_kernel_callable_registration(
     int32_t, size_t, const simpler::kernel::PreparedInvocationView &, void *
 ) {
@@ -753,6 +754,9 @@ int DeviceRunnerBase::init_kernel_context(
     if (rc != 0) return rc;
     if (!hbg_kernel) {
         rc = prepare_kernel_coordination();
+        if (rc != 0) return rc;
+    } else {
+        rc = prepare_hbg_kernel_dfx_context();
         if (rc != 0) return rc;
     }
     rc = persistent_args_.set_dfx_enabled(false);
@@ -1848,6 +1852,7 @@ int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
 int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_common_impl(true); }
 
 int __attribute__((weak)) DeviceRunnerBase::finalize_hbg_kernel_registration() { return 0; }
+void __attribute__((weak)) DeviceRunnerBase::abandon_hbg_kernel_sources() {}
 
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     if (!abandon_device_resources && execution_mode_latch_.is_kernel()) {
@@ -2030,6 +2035,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     // exists. Both are no-ops on a program-mode context.
     if (abandon_device_resources) {
         abandon_kernel_coordination();
+        abandon_hbg_kernel_sources();
         hbg_kernel_state_.reset();
         persistent_args_.abandon();
     } else {

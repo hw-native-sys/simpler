@@ -139,6 +139,13 @@ struct alignas(64) ChipReadyQueue {
                                  )) {}
     }
 
+    // dequeue_pos advances before the consumer releases the slot sequence.
+    // That owned generation is temporarily unavailable rather than full.
+    bool consumer_is_releasing(uint64_t pos, int64_t sequence) {
+        return pos >= capacity && sequence == static_cast<int64_t>(pos - capacity + 1) &&
+               dequeue_pos.fetch_add(0, std::memory_order_acquire) > pos - capacity;
+    }
+
     bool push(ChipTaskSlotState *slot_state) { return push_tagged(slot_state, 0); }
 
     bool push_tagged(ChipTaskSlotState *slot_state, uint64_t task_id_snapshot) {
@@ -156,7 +163,7 @@ struct alignas(64) ChipReadyQueue {
                     break;
                 }
             } else if (diff < 0) {
-                return false;  // Queue full
+                if (!consumer_is_releasing(pos, seq)) return false;
             }
         }
 
@@ -170,9 +177,8 @@ struct alignas(64) ChipReadyQueue {
     // Batch push: reserve count slots with a single CAS after confirming
     // every target slot is available under the usual Vyukov sequence check.
     // Returns false without publishing anything when the queue cannot take all
-    // `count` items. A target slot holding an older generation means full and
-    // ends the call; a slot a peer has reserved but not yet published is
-    // transient and retries, so this only spins while a peer is mid-publish.
+    // `count` items. A target slot still owned by a consumer or producer is
+    // transient and retries; an unclaimed older generation means full.
     bool push_batch(ChipTaskSlotState **items, int count) { return push_batch_tagged(items, nullptr, count); }
 
     bool push_batch_tagged(ChipTaskSlotState **items, const uint64_t *task_id_snapshots, int count) {
@@ -188,7 +194,9 @@ struct alignas(64) ChipReadyQueue {
                 int64_t seq = slot->sequence.load(std::memory_order_acquire);
                 int64_t diff = seq - static_cast<int64_t>(pos + i);
                 if (diff < 0) {
-                    return false;  // Queue full
+                    if (!consumer_is_releasing(pos + i, seq)) return false;
+                    ready = false;
+                    continue;
                 }
                 if (diff > 0) {
                     ready = false;
@@ -238,9 +246,11 @@ struct alignas(64) ChipReadyQueue {
                 contended = true;
                 atomic_ops++;  // failed CAS
             } else if (diff < 0) {
-                return false;  // Queue full
+                if (!consumer_is_releasing(pos, seq)) return false;
+                atomic_ops++;
+                contended = true;
             } else {
-                contended = true;  // diff > 0: slot not yet released, spin
+                contended = true;  // diff > 0: peer advanced this slot, retry
             }
         }
         atomic_ops++;  // final sequence.store

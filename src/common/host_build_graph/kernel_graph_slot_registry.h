@@ -13,7 +13,11 @@
 #include "host_build_graph/kernel_graph_slot_wire.h"
 #include "task_interface/kernel_invocation_validation.h"
 
+class Runtime;
+
 namespace hbg {
+
+struct HbgCallableRegistration;
 
 // AICPU control operations. Init only targets newly allocated, exclusively held
 // registry storage. It cannot reset a live context. Register never changes Ready
@@ -40,6 +44,12 @@ bind_graph_slot_registry(GraphSlotRegistry *registry, int device_id, uint64_t ru
 bool detach_graph_slot_registry(GraphSlotRegistry *registry) noexcept;
 // Borrowed only while the invocation owner holds the context execution lease.
 GraphSlotRegistry *current_graph_slot_registry() noexcept;
+
+// The invocation leader refreshes context-owned diagnostic state before
+// scheduler initialization. Detach clears the binding only after quiescence.
+bool refresh_graph_kernel_dfx(
+    const GraphSlotRegistry *registry, Runtime *runtime, const HbgCallableRegistration &registration
+) noexcept;
 
 // Serialized with control/restore/retirement by the invocation owner. Terminal:
 // no register, bind, admission or retirement may make this storage usable again.

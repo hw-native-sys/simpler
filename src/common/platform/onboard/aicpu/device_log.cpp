@@ -36,7 +36,7 @@ bool is_log_enable_debug() { return g_is_log_enable_debug; }
 
 bool is_log_enable_info() { return g_is_log_enable_info; }
 
-bool is_log_enable_timing() { return g_is_log_enable_timing; }
+bool is_log_enable_timing() { return g_is_log_enable_timing && g_is_log_enable_warn; }
 
 bool is_log_enable_warn() { return g_is_log_enable_warn; }
 

@@ -608,3 +608,5 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     LOG_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
 }
+
+int32_t aicpu_execute_restored_graph(Runtime *runtime) { return aicpu_execute(runtime); }

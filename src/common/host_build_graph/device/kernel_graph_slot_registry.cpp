@@ -12,11 +12,50 @@
 
 #include <atomic>
 
+#include "aicpu/args_dump_aicpu.h"
 #include "aicpu/cache_maintenance.h"
+#include "aicpu/chip_swimlane_collector_aicpu.h"
+#include "aicpu/dep_gen_collector_aicpu.h"
+#include "aicpu/device_phase_aicpu.h"
+#include "aicpu/pmu_collector_aicpu.h"
+#include "aicpu/scope_stats_collector_aicpu.h"
+#include "common/kernel_args.h"
+#include "host_build_graph/kernel_callable_registration.h"
+#include "runtime.h"
 
 namespace hbg {
 namespace {
 std::atomic<GraphSlotRegistry *> current_registry{nullptr};
+
+struct KernelDfxBinding {
+    const GraphSlotRegistry *registry{nullptr};
+    Runtime *runtime{nullptr};
+    uint64_t generation{0};
+    uint64_t args_address{0};
+    uint64_t regs{0};
+    uint64_t swimlane{0};
+    uint64_t rotation{0};
+    uint64_t dependencies{0};
+    uint32_t capabilities{0};
+};
+
+KernelDfxBinding kernel_dfx;
+
+void publish_kernel_dfx(uint32_t flags) noexcept {
+    set_chip_swimlane_enabled(SIMPLER_GET_DFX_FLAG(flags, SIMPLER_DFX_FLAG_CHIP_SWIMLANE));
+    set_platform_chip_swimlane_base(kernel_dfx.swimlane);
+    set_platform_chip_swimlane_aicore_rotation_table(kernel_dfx.rotation);
+    set_dep_gen_enabled(SIMPLER_GET_DFX_FLAG(flags, SIMPLER_DFX_FLAG_DEP_GEN));
+    set_platform_dep_gen_base(kernel_dfx.dependencies);
+    // Program entry points share these globals with kernel mode.
+    set_dump_args_enabled(false);
+    set_platform_dump_base(0);
+    set_pmu_enabled(false);
+    set_platform_pmu_base(0);
+    set_scope_stats_enabled(false);
+    set_platform_scope_stats_base(0);
+    set_platform_phase_base(0);
+}
 
 bool valid_registry(const GraphSlotRegistry *registry) {
     if (registry == nullptr || reinterpret_cast<uintptr_t>(registry) % 1024 != 0) return false;
@@ -154,10 +193,68 @@ bind_graph_slot_registry(GraphSlotRegistry *registry, int device_id, uint64_t ru
 
 bool detach_graph_slot_registry(GraphSlotRegistry *registry) noexcept {
     if (registry == nullptr) return false;
-    return current_registry.compare_exchange_strong(registry, nullptr, std::memory_order_acq_rel);
+    if (!current_registry.compare_exchange_strong(registry, nullptr, std::memory_order_acq_rel)) return false;
+    kernel_dfx = {};
+    publish_kernel_dfx(0);
+    return true;
 }
 
 GraphSlotRegistry *current_graph_slot_registry() noexcept { return current_registry.load(std::memory_order_acquire); }
+
+bool refresh_graph_kernel_dfx(
+    const GraphSlotRegistry *registry, Runtime *runtime, const HbgCallableRegistration &registration
+) noexcept {
+    if (registry == nullptr || registry != current_graph_slot_registry() || runtime == nullptr ||
+        registration.context_generation != registry->context_generation ||
+        registration.runtime_address != reinterpret_cast<uintptr_t>(runtime))
+        return false;
+    const uint64_t address = *runtime->kernel_dfx_args_slot();
+    if (address == 0 || address % alignof(KernelArgs) != 0 || address > UINTPTR_MAX - sizeof(KernelArgs)) return false;
+    if (kernel_dfx.registry != nullptr) {
+        if (kernel_dfx.registry != registry || kernel_dfx.runtime != runtime ||
+            kernel_dfx.generation != registration.context_generation || kernel_dfx.args_address != address ||
+            kernel_dfx.regs != registration.register_table_address)
+            return false;
+    } else {
+        const auto *resident = reinterpret_cast<const KernelArgs *>(address);
+        cache_invalidate_range(resident, sizeof(*resident));
+        KernelArgs args{};
+        std::memcpy(&args, resident, sizeof(args));
+        const bool swimlane = args.chip_swimlane_data_base != 0;
+        const bool rotation = args.chip_swimlane_aicore_rotation_table != 0;
+        const auto valid_address = [](uint64_t value) {
+            return value == 0 || (value % alignof(uint64_t) == 0 && value <= UINTPTR_MAX - sizeof(uint64_t));
+        };
+        uint32_t capabilities = swimlane ? SIMPLER_DFX_FLAG_CHIP_SWIMLANE : 0;
+        if (args.dep_gen_data_base != 0) capabilities |= SIMPLER_DFX_FLAG_DEP_GEN;
+        if (args.runtime_args != runtime || args.regs != registration.register_table_address || swimlane != rotation ||
+            (args.enable_profiling_flag & ~capabilities) != 0 || !valid_address(args.chip_swimlane_data_base) ||
+            !valid_address(args.chip_swimlane_aicore_rotation_table) || !valid_address(args.dep_gen_data_base) ||
+            args.dump_data_base != 0 || args.pmu_data_base != 0 || args.scope_stats_data_base != 0 ||
+            args.device_wall_data_base != 0)
+            return false;
+        kernel_dfx = {
+            registry,
+            runtime,
+            registration.context_generation,
+            address,
+            args.regs,
+            args.chip_swimlane_data_base,
+            args.chip_swimlane_aicore_rotation_table,
+            args.dep_gen_data_base,
+            capabilities
+        };
+    }
+    uint32_t flags = 0;
+    if (kernel_dfx.capabilities != 0) {
+        const auto *args = reinterpret_cast<const KernelArgs *>(address);
+        cache_invalidate_range(&args->enable_profiling_flag, sizeof(args->enable_profiling_flag));
+        flags = args->enable_profiling_flag;
+        if ((flags & ~kernel_dfx.capabilities) != 0) return false;
+    }
+    publish_kernel_dfx(flags);
+    return true;
+}
 
 GraphSlotStatus poison_graph_execution_slot(GraphSlotRegistry *registry) noexcept {
     if (!valid_registry(registry)) return GraphSlotStatus::InvalidRegistry;

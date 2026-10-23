@@ -31,6 +31,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include <array>
 #include <vector>
 
 #include "common/core_type.h"
@@ -244,6 +245,33 @@ private:
     char device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME];
 
 public:
+    struct GraphPublicationSpan {
+        const void *address;
+        size_t bytes;
+    };
+
+    GraphPublicationSpan kernel_graph_handshake_span() const {
+        const auto *begin = reinterpret_cast<const uint8_t *>(&kernel_prelaunch);
+        const auto *end = reinterpret_cast<const uint8_t *>(workers + RUNTIME_MAX_WORKER);
+        return {begin, static_cast<size_t>(end - begin)};
+    }
+
+    // These fields are AICPU-owned; worker reports and teardown gates occupy
+    // separate cache lines. Function bindings remain visible across replays.
+    std::array<GraphPublicationSpan, 4> kernel_graph_publication_spans(bool functions_changed) const {
+        const auto *control_begin = reinterpret_cast<const uint8_t *>(&host_total_tasks);
+        const auto *control_end = reinterpret_cast<const uint8_t *>(&gm_sm_ptr_) + sizeof(gm_sm_ptr_);
+        const auto *prebuilt_begin = reinterpret_cast<const uint8_t *>(&prebuilt_arena_base_);
+        const auto *prebuilt_end =
+            reinterpret_cast<const uint8_t *>(&prebuilt_runtime_offset_) + sizeof(prebuilt_runtime_offset_);
+        return {
+            {{func_id_to_addr_, functions_changed ? sizeof(func_id_to_addr_) : 0},
+             {control_begin, static_cast<size_t>(control_end - control_begin)},
+             {prebuilt_begin, static_cast<size_t>(prebuilt_end - prebuilt_begin)},
+             {&active_callable_id_, sizeof(active_callable_id_)}}
+        };
+    }
+
     /**
      * Constructor - zero-initialize all arrays
      */
@@ -342,6 +370,14 @@ public:
     // device code must not inspect. No fixed cap — grows with the chip-level
     // entry-tensor count.
     std::vector<TensorPair> tensor_pairs_;
+
+    // Context initialization publishes the resident KernelArgs address here.
+    // Program runtimes keep zero; invocation restoration never rewrites it.
+    uint64_t *kernel_dfx_args_slot() { return &kernel_dfx_args_; }
+    const uint64_t *kernel_dfx_args_slot() const { return &kernel_dfx_args_; }
+
+private:
+    uint64_t kernel_dfx_args_{0};
 };
 
 // Number of bytes of the Runtime image that must be copied to the device.

@@ -1418,10 +1418,9 @@ extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count) {
 // cannot change the program-mode runtime's resolved entry set.
 extern "C" const char *const *runtime_l1_extra_aicpu_symbols(size_t *count) {
     static const char *const kExtra[] = {
-        "simpler_aicpu_l1_hbg_register_execution_slot",
-        "simpler_aicpu_l1_hbg_detach_execution_slot",
-        "simpler_aicpu_l1_hbg_register_callable",
-        "simpler_aicpu_kernel_exec",
+        "simpler_aicpu_l1_hbg_register_execution_slot",   "simpler_aicpu_l1_hbg_prepare_image_destinations",
+        "simpler_aicpu_l1_hbg_prepare_execution_context", "simpler_aicpu_l1_hbg_detach_execution_slot",
+        "simpler_aicpu_l1_hbg_register_callable",         "simpler_aicpu_kernel_exec",
     };
     if (count != nullptr) {
         *count = sizeof(kExtra) / sizeof(kExtra[0]);

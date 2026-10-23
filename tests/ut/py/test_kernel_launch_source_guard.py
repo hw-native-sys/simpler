@@ -37,7 +37,8 @@ def violations(source):
     code = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
     calls = set(re.findall(r"\b((?:aclrt|acl|rts|rt)[A-Z]\w*)\s*\(", code))
     banned = re.findall(
-        r"\b(?:malloc|calloc|realloc|free|make_graph_host_args|submit_graph_template)\s*\("
+        r"\b(?:malloc|calloc|realloc|free|make_graph_host_args|submit_graph_template|"
+        r"make_graph_dispatch_args|submit_graph_dispatch)\s*\("
         r"|\b(?:new|delete)\b|std::(?:vector|make_unique|make_shared)\b",
         code,
     )
@@ -72,6 +73,8 @@ def test_binder_has_one_enqueue_composition():
         "new int(1);",
         "std::vector<int> data;",
         "make_graph_host_args(source, args);",
+        "make_graph_dispatch_args(source, registration, args);",
+        "submit_graph_dispatch(source, registration, ops);",
     ],
 )
 def test_guard_rejects_forbidden_submission_operations(operation):

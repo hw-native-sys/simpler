@@ -439,7 +439,8 @@ void SchedulerContext::dispatch_shape(
                 auto wanted = is_pending ? CoreTracker::MixPlacement::PENDING : CoreTracker::MixPlacement::RUNNING;
                 selected_mix_clusters = tracker.get_mix_cluster_offset_states(cmask, wanted) & cores;
                 if (!selected_mix_clusters.has_value()) {
-                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    if (!disp_queues[static_cast<int32_t>(shape)].push(slot_state))
+                        sched_->latch_ready_queue_overflow(thread_idx);
                     continue;
                 }
             }
@@ -450,17 +451,20 @@ void SchedulerContext::dispatch_shape(
 
             if (slot_state->task_attrs.requires_sync_start()) {
                 if (is_pending) {
-                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    if (!disp_queues[static_cast<int32_t>(shape)].push(slot_state))
+                        sched_->latch_ready_queue_overflow(thread_idx);
                     continue;
                 }
                 int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
                 if (available < slot_state->logical_block_num) {
                     flush_publish();
                     if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
-                        disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                        if (!disp_queues[static_cast<int32_t>(shape)].push(slot_state))
+                            sched_->latch_ready_queue_overflow(thread_idx);
                     }
                     for (int rem = bi + 1; rem < got; rem++) {
-                        disp_queues[static_cast<int32_t>(shape)].push(batch[rem]);
+                        if (!disp_queues[static_cast<int32_t>(shape)].push(batch[rem]))
+                            sched_->latch_ready_queue_overflow(thread_idx);
                     }
                     entered_drain = true;
                     break;
@@ -495,7 +499,8 @@ void SchedulerContext::dispatch_shape(
             published_n++;
 
             if (start + claim < slot_state->logical_block_num) {
-                disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                if (!disp_queues[static_cast<int32_t>(shape)].push(slot_state))
+                    sched_->latch_ready_queue_overflow(thread_idx);
             }
 
             for (int32_t b = 0; b < claim; b++) {

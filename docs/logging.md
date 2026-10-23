@@ -324,7 +324,9 @@ trace/swimlane JSON while leaving event timestamps monotonic and relative. See
 Sim AICPU runs on a host CPU inside the host process and uses the same envelope
 and destination as every other bound host module. The `dev_vlog_*` names remain
 as the compatibility boundary `unified_log_device.cpp` consumes. Onboard AICPU
-uses the CANN dlog format. Device TIMING uses CANN WARN and adds a `[TIMING]`
+uses the CANN dlog format. Device TIMING requires both the snapshotted CANN WARN
+enable bit and the Host TIMING threshold before formatting, so suppressed device output does not
+pay for `vsnprintf`. It uses CANN WARN and adds a `[TIMING]`
 message tag.
 
 ## Configuration flow

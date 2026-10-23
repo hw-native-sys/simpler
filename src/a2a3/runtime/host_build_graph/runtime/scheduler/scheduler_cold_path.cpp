@@ -82,7 +82,7 @@ LoopAction SchedulerContext::check_exit_conditions(
     }
 
     task_count = total_tasks_;
-    if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
+    if (task_count >= 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
         completed_.store(true, std::memory_order_release);
         LOG_INFO(
             "Thread %d: completed tasks %d/%d", thread_idx, completed_tasks_.load(std::memory_order_relaxed), task_count
@@ -839,6 +839,7 @@ int32_t SchedulerContext::pre_handshake_init(Runtime *runtime, int32_t aicpu_thr
     // and therefore before any register window is opened.
     if (is_chip_swimlane_enabled()) {
         chip_swimlane_aicpu_init(runtime->worker_count);
+        if (*runtime->kernel_dfx_args_slot() != 0) chip_swimlane_aicpu_record_run_boundary();
         chip_swimlane_level_ = get_chip_swimlane_level();
         if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
             // Sched-phase pool count must match the dump_args_init thread count

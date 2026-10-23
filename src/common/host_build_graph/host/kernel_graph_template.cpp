@@ -9,6 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "host_build_graph/kernel_graph_template.h"
+#include "host_build_graph/kernel_graph_dispatch.h"
+#include "host_build_graph/kernel_graph_prepared.h"
 
 #include <algorithm>
 #include <new>
@@ -16,6 +18,7 @@
 
 #include "host_build_graph/host_graph_build.h"
 #include "host_build_graph/kernel_external_tensor_wire.h"
+#include "host_build_graph/kernel_graph_image_validation.h"
 #include "host_build_graph/runtime_core.h"
 
 namespace hbg {
@@ -247,6 +250,8 @@ int make_graph_launch_template(
     GraphResourceRequirements required{};
     rc = get_graph_resource_requirements(build, layout, required);
     if (rc != 0) return rc;
+    layout.sched.capacities =
+        kernel_graph_queue_capacities(build.total_tasks, layout.task_capacity, required.graph_definition_bytes != 0);
     KernelWorkingBinding binding{};
     rc = bind_kernel_resources_for_launch(context, device_id, slot_generation, required, binding);
     if (rc != 0) return rc;
@@ -273,14 +278,15 @@ int make_graph_launch_template(
     header.destinations[3] = {binding.scheduler.address, binding.scheduler.capacity};
     std::vector<GraphImageRegion> regions;
     const uint64_t image_bytes[] = {
-        0, required.runtime_arena_bytes, required.graph_definition_bytes, required.scheduler_state_bytes
+        0, required.runtime_arena_bytes - layout.off_runtime, required.graph_definition_bytes,
+        required.scheduler_state_bytes
     };
     for (uint32_t i = 1; i <= 3; ++i) {
         if (image_bytes[i] == 0) continue;
         const uint64_t offset = (header.payload_bytes + 63) & ~uint64_t{63};
         header.payload_bytes = offset;
         if (!add_size(image_bytes[i], header.payload_bytes)) return PTO_RUNTIME_ERR_CAPACITY_EXCEEDED;
-        regions.push_back({static_cast<GraphImageKind>(i), 0, offset, image_bytes[i], 0});
+        regions.push_back({static_cast<GraphImageKind>(i), 0, offset, image_bytes[i], i == 1 ? layout.off_runtime : 0});
     }
     header.region_count = regions.size();
     header.payload_offset = (sizeof(header) + regions.size() * sizeof(GraphImageRegion) + 63) & ~uint64_t{63};
@@ -316,7 +322,7 @@ int make_graph_launch_template(
         build, image + layout.off_copied_end, binding.definitions.address, definitions, layout.sched.capacities.dummy
     );
     if (rc != 0) return rc;
-    std::memcpy(payload, image, required.runtime_arena_bytes);
+    std::memcpy(payload, image + layout.off_runtime, image_bytes[1]);
     SimplerKernelInvocationHeader invocation{};
     invocation.mode = SIMPLER_MODE_KERNEL;
     invocation.callable_id = identity.callable_id;
@@ -337,6 +343,40 @@ int make_graph_launch_template(
     return 0;
 } catch (const std::bad_alloc &) {
     return PTO_RUNTIME_ERR_INTERNAL;
+}
+
+int make_graph_prepared_dispatch(
+    const GraphLaunchTemplate &source, const HbgCallableRegistration &registration, GraphPreparedDispatch &out
+) {
+    if (validate_graph_packet(source.data(), source.size(), GraphPacketAddress::HostTemplate) != GraphPacketStatus::Ok)
+        return PTO_RUNTIME_ERR_INTERNAL;
+    GraphRestoreView view{};
+    const auto *packet = static_cast<const std::byte *>(source.data());
+    std::memcpy(&view.invocation, packet, sizeof(view.invocation));
+    std::memcpy(&view.graph, packet + sizeof(view.invocation), sizeof(view.graph));
+    view.payload = packet + sizeof(view.invocation) + view.graph.payload_offset;
+    for (size_t n = 0; n < 4; ++n)
+        view.slot.destinations[n] = view.graph.destinations[n];
+    GraphPreparedDispatch next{};
+    next.invocation = view.invocation;
+    next.invocation.payload_bytes = sizeof(next) - sizeof(next.invocation);
+    next.registration = registration;
+    next.graph = view.graph;
+    next.graph.checksum = 0;
+    for (uint32_t n = 0; n < view.graph.region_count; ++n) {
+        std::memcpy(
+            &next.regions[n], packet + sizeof(view.invocation) + sizeof(view.graph) + n * sizeof(GraphImageRegion),
+            sizeof(GraphImageRegion)
+        );
+        view.regions[static_cast<uint32_t>(next.regions[n].kind)] = next.regions[n];
+    }
+    next.checksum = graph_prepared_dispatch_checksum(next);
+    RuntimeArenaLayout layout{};
+    uint64_t sm_bytes = 0;
+    if (!valid_graph_prepared_dispatch(next) || !detail::validate_graph_images(view, layout, sm_bytes))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    out = next;
+    return 0;
 }
 
 int make_graph_host_args(const GraphLaunchTemplate &source, GraphHostArgs &out) {
@@ -365,6 +405,52 @@ int submit_graph_template(const GraphLaunchTemplate &source, const GraphHostLaun
     if (ops.launch == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     GraphHostArgs args;
     const int rc = make_graph_host_args(source, args);
+    return rc == 0 ? ops.launch(ops.context, args) : rc;
+}
+
+int make_graph_dispatch_args(
+    const GraphLaunchTemplate &source, const HbgCallableRegistration &registration, GraphHostArgs &out
+) {
+    if (validate_graph_packet(source.data(), source.size(), GraphPacketAddress::HostTemplate) !=
+            GraphPacketStatus::Ok ||
+        source.size() > UINT32_MAX - sizeof(GraphDispatchHeader))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    GraphDispatchHeader dispatch{};
+    GraphPacketHeader graph{};
+    std::memcpy(&dispatch.invocation, source.data(), sizeof(dispatch.invocation));
+    std::memcpy(&graph, static_cast<const std::byte *>(source.data()) + sizeof(dispatch.invocation), sizeof(graph));
+    dispatch.packet_bytes = source.size();
+    dispatch.registration = registration;
+    dispatch.invocation.payload_bytes = sizeof(dispatch) - sizeof(dispatch.invocation) + source.size();
+    dispatch.checksum = graph_dispatch_checksum(dispatch);
+    SimplerKernelInvocationHeader invocation{};
+    std::memcpy(&invocation, source.data(), sizeof(invocation));
+    GraphDispatchHeader checked{};
+    if (!read_graph_dispatch_header(&dispatch, sizeof(dispatch), checked) ||
+        !graph_dispatch_matches_packet(dispatch, invocation, graph))
+        return PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        GraphHostArgs next;
+        next.bytes = sizeof(dispatch) + source.size();
+        next.storage.resize((next.bytes + 7) / 8);
+        auto *data = reinterpret_cast<std::byte *>(next.storage.data());
+        std::memcpy(data, &dispatch, sizeof(dispatch));
+        std::memcpy(data + sizeof(dispatch), source.data(), source.size());
+        next.address_offset = sizeof(dispatch) + sizeof(invocation) + offsetof(GraphPacketHeader, inline_payload_addr);
+        next.data_offset = sizeof(dispatch) + sizeof(invocation) + graph.payload_offset;
+        out = std::move(next);
+        return 0;
+    } catch (const std::bad_alloc &) {
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+int submit_graph_dispatch(
+    const GraphLaunchTemplate &source, const HbgCallableRegistration &registration, const GraphHostLaunchOps &ops
+) {
+    if (ops.launch == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    GraphHostArgs args;
+    const int rc = make_graph_dispatch_args(source, registration, args);
     return rc == 0 ? ops.launch(ops.context, args) : rc;
 }
 

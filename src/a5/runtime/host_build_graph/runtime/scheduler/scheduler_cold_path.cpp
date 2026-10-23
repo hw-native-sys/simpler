@@ -82,7 +82,7 @@ LoopAction SchedulerContext::check_exit_conditions(
     }
 
     task_count = total_tasks_;
-    if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
+    if (task_count >= 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
         completed_.store(true, std::memory_order_release);
         LOG_INFO(
             "Thread %d: completed tasks %d/%d", thread_idx, completed_tasks_.load(std::memory_order_relaxed), task_count

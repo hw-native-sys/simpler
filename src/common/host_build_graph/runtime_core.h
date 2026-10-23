@@ -79,9 +79,9 @@ struct RuntimeArenaLayout {
     //                function of the layout, not of the run, so the device writes
     //                it at boot instead of receiving an initialization pattern
     //                over PCIe.
-    //   copied       [off_copied_begin, off_copied_end). Every byte carries this
-    //                run's own content, so bind ships the whole zone as one
-    //                contiguous range.
+    //   copied       [off_copied_begin, off_copied_end): alignment padding and
+    //                RuntimeContext. Program bind ships this contiguous zone;
+    //                kernel packets start at off_runtime, omitting leading padding.
     //
     // Past off_copied_end the device carries one further tail the host arena does
     // not: the shared-memory image, whose size is the submitted task count and
@@ -185,6 +185,16 @@ static_assert(
  */
 RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity);
 RuntimeArenaLayout runtime_reserve_layout(DeviceArena &arena, uint64_t task_capacity, uint64_t ready_capacity);
+
+namespace hbg {
+
+// Flat tasks contribute at most one pending entry per logical queue. Graph
+// Definitions can add internal tasks beyond total_tasks, so retain the window
+// bound for them. Physical reservations and offsets are independent of these caps.
+ReadyQueueCapacities
+kernel_graph_queue_capacities(uint32_t total_tasks, uint64_t task_window, bool has_definitions) noexcept;
+
+}  // namespace hbg
 
 /**
  * Phase 2 — write the data half of the runtime arena: standalone fields,
