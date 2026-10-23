@@ -45,6 +45,7 @@ struct RuntimeContext;
  *   - scheduler_dispatch.cpp    (task dispatch loop and helpers)
  */
 class SchedulerContext {
+    friend class MixAdmissionTestPeer;
     friend class SchedulerRetirementTestPeer;
 
 public:
