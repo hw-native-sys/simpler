@@ -671,6 +671,26 @@ tmr_case(test_args_dump_ordinary_close.cpp
     DEFINES  SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
     LINK     ${CMAKE_DL_LIBS})
 
+# Both architectures use detached shadows to observe forbidden terminal reads.
+set(SCOPE_STATS_ORDINARY_CLOSE_SOURCES ${CAPACITY_REFUSAL_SOURCES})
+list(FILTER SCOPE_STATS_ORDINARY_CLOSE_SOURCES EXCLUDE REGEX "/sim/host/profiling_copy\\.cpp$")
+
+hbg_case(test_scope_stats_ordinary_close.cpp
+    SOURCES
+        ${SCOPE_STATS_ORDINARY_CLOSE_SOURCES}
+        ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+    INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
+    DEFINES  SIMPLER_RUNTIME_NAME="host_build_graph"
+    LINK     ${CMAKE_DL_LIBS})
+
+tmr_case(test_scope_stats_ordinary_close.cpp
+    SOURCES
+        ${SCOPE_STATS_ORDINARY_CLOSE_SOURCES}
+        ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
+    INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
+    DEFINES  SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
+    LINK     ${CMAKE_DL_LIBS})
+
 # Each owner's own three answers to the all-or-nothing admission: which
 # refusal is re-attemptable, whether withdrawing an identity it never admitted
 # is exact, and whether a writer may still be reading its pools.

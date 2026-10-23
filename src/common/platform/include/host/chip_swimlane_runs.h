@@ -79,15 +79,17 @@ enum class AdmissionRefusal : int {
 /**
  * Why a run's artifact says what it says.
  *
- * `Published` and `PartialSafe` both produce a file; `CutUnknown` produces one
- * too, with `processing_complete = false`, because the reference handshake
- * proved the records were safe to move even though the transport count did
- * not settle. The remaining three produce no file and must wake every waiter.
+ * In retained collection, `Published`, `PartialSafe` and `CutUnknown` produce
+ * files only after the required reference handshake makes the records safe to
+ * move; `CutUnknown` carries incomplete counts. The remaining three produce no
+ * file and must wake every waiter. Ordinary collection also serializes these
+ * names for host-owned partial evidence. A verdict describes the artifact, not
+ * device termination: resource release still requires its owner's own proof.
  */
 enum class Verdict {
     Published,    // stages settled, nothing lost on the host side
     PartialSafe,  // stages settled, content incomplete (retired / evicted / untrusted)
-    CutUnknown,   // count unreachable, references proved released
+    CutUnknown,   // counts unknown; resource safety comes from the owner's protocol
     WriteFailed,  // sealed, but no file exists
     Quarantined,  // references not proved; nothing may be moved or freed
     CounterExhausted,

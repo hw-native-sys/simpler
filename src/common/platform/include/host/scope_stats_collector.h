@@ -17,8 +17,8 @@
  * split mgmt threads (drain polls per-thread ready queues and refills the
  * single instance's free_queue from recycled lanes; replenish returns done
  * buffers to recycled lanes). ScopeStatsCollector's collector thread shards
- * append each full buffer's ScopeStatsRecords to an in-memory vector. After
- * stop(), write_jsonl() renders them to
+ * append each full buffer's ScopeStatsRecords to host-owned storage. The
+ * ordinary run boundary renders safe evidence to
  * <output_dir>/scope_stats/scope_stats.jsonl.
  *
  * Memory mirroring is handled by the framework via the MemoryOps installed
@@ -34,12 +34,12 @@
  *                          (pre-fills free_queue; surplus → recycled pool).
  *   start(tf)            — Inherited: launches mgmt + collector threads.
  *   [device execution]
- *   stop()               — Inherited: drain queues, join threads.
- *   reconcile_counters() — Recover any un-flushed current buffer left by an
- *                          abnormal exit, then cross-check collected ==
- *                          total - dropped.
- *   write_jsonl()        — Emit scope_stats/scope_stats.jsonl
- *                          (meta line + one record/line).
+ *   close_ordinary_run() — With producer-stop proof: quiesce, recover held
+ *                          records and snapshot accounting; keep resident threads.
+ *                          Without proof: stop(false), join host readers and
+ *                          export host-owned samples with unknown accounting.
+ *   write_jsonl()        — Render the frozen host snapshot, never refresh live
+ *                          device state; direct use requires reconciliation.
  *   finalize()           — Free all device memory, unregister.
  *
  * Output (scope_stats/scope_stats.jsonl), NDJSON:
@@ -192,15 +192,21 @@ public:
     // Poll-thread hook: append the buffer's records to the in-memory vector.
     void on_buffer_collected(const ScopeStatsReadyBufferInfo &info);
 
-    // After stop(): recover a non-empty current buffer left by abnormal exit,
+    // Ordinary close recovers producer-held records only with a completion or
+    // independent producer-stop proof. Otherwise stop(false) joins host readers
+    // and exports only host-owned samples with unknown device accounting.
+    // Host-thread exit grants no authority to release device allocations.
+    int close_ordinary_run(const std::string &output_dir, bool producer_stop_proved);
+
+    // After producer stop and host quiescence: recover a non-empty current buffer left by abnormal exit,
     // warn on drops, and cross-check collected == total - dropped. Returns
     // true iff the run is clean.
     bool reconcile_counters();
 
-    // Render the collected records to
-    // <output_dir>/scope_stats/scope_stats.jsonl. Reads the static capacity
-    // metadata + fatal latch from the shared header (constant after
-    // orchestrator init). Must be called after stop().
+    // Render host-owned records and the checked, frozen metadata snapshot.
+    // Only close_ordinary_run can authorize a host-only unknown export; a
+    // skipped/failed direct reconciliation still refuses the direct export.
+    // Requires stopped or quiesced host readers.
     int write_jsonl(const std::string &output_dir);
 
     void finalize(ScopeStatsUnregisterCallback unregister_cb, const ScopeStatsFreeCallback &free_cb);
@@ -442,7 +448,13 @@ private:
     // A required producer must initialize this run before ordinary/unmapped
     // export. Zero also permits a producerless runtime's metadata-only artifact.
     uint64_t expected_producer_epoch_ = 0;
-    bool device_snapshot_valid_ = false;
+    simpler::dfx::scope_stats_runs::DeviceSnapshot device_snapshot_{};
+    // Owned at admission; an unproven close must not refresh the live header.
+    simpler::dfx::scope_stats_runs::CapacityMetadata ordinary_capacities_{};
+    bool ordinary_stop_unproved_ = false;
+    // Bound by begin_run, including producerless runs; direct legacy collectors
+    // without an admission retain their existing identity-observation behavior.
+    std::optional<uint64_t> ordinary_run_epoch_;
     uint64_t total_collected_ = 0;
     uint64_t refused_records_ = 0;
 
@@ -505,17 +517,19 @@ private:
     void append_buffer_records(const void *buf_host_ptr);
 
     /**
-     * Render one artifact's bytes. `extra` adds the background-mode metadata
-     * keys; a null `extra` reproduces today's metadata line exactly, which is
-     * what keeps the default path's file unchanged.
+     * Render host-owned artifact values. `extra` describes retained collection
+     * or an unproven ordinary close; null preserves the ordinary seven keys.
+     * Non-null `host_only_capacities` makes device accounting null and admits
+     * only its owned capacities, with null for absent capacity values.
      */
     static int render_jsonl_to(
         std::FILE *fp, const simpler::dfx::scope_stats_runs::DeviceSnapshot &device,
         const simpler::dfx::scope_stats_runs::RecordBlocks &records,
-        const simpler::dfx::scope_stats_runs::Collection *extra
+        const simpler::dfx::scope_stats_runs::Collection *extra,
+        const simpler::dfx::scope_stats_runs::CapacityMetadata *host_only_capacities = nullptr
     );
 
-    /** Today's unchecked read of the shared header, for the default path only. */
+    /** Read the shared mirror only while establishing a checked terminal snapshot. */
     simpler::dfx::scope_stats_runs::DeviceSnapshot snapshot_unchecked() const;
 
     /**

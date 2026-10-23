@@ -100,7 +100,7 @@ bool ScopeStatsCollector::charge_record_block(size_t bytes) {
 // ---------------------------------------------------------------------------
 
 bool ScopeStatsCollector::read_terminal_checked(scope_runs::DeviceSnapshot *out) {
-    device_snapshot_valid_ = false;
+    device_snapshot_ = {};
     if (out == nullptr || shm_host_ == nullptr) return false;
     *out = scope_runs::DeviceSnapshot{};
     if (fail_terminal_copy_) return false;
@@ -116,7 +116,7 @@ bool ScopeStatsCollector::read_terminal_checked(scope_runs::DeviceSnapshot *out)
     }
     rmb();
     *out = snapshot_unchecked();
-    device_snapshot_valid_ = out->valid;
+    device_snapshot_ = *out;
     return out->valid;
 }
 

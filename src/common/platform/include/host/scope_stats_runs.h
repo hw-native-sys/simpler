@@ -21,8 +21,9 @@
  * is charged by allocated capacity rather than by size, and the export a writer
  * thread owns outright.
  *
- * Nothing here is constructed when retention is off, and with it off every
- * ScopeStats path behaves exactly as it does today.
+ * Ordinary closes also use DeviceSnapshot and Collection to distinguish a
+ * checked terminal from host-only partial evidence. Budgets and background
+ * export slots remain exclusive to retained collection.
  */
 
 #pragma once

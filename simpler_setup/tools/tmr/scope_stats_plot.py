@@ -117,15 +117,16 @@ def _resource_has_data(pairs_by_ring: dict[int, list[tuple[dict, dict]]], resour
 
 
 def _pair_by_ring(records: list[dict]) -> dict[int, list[tuple[dict, dict]]]:
-    pending: dict[int, dict[str, list[dict]]] = defaultdict(lambda: defaultdict(list))
+    pending: dict[int, dict[tuple[int | None, str], list[dict]]] = defaultdict(lambda: defaultdict(list))
     pairs: dict[int, list[tuple[dict, dict]]] = defaultdict(list)
     for idx, rec in enumerate(records):
         rec["_record_index"] = idx
         ring, site, phase = rec["ring"], rec["site"], rec["phase"]
+        scope_key = (rec.get("run_epoch"), site)
         if phase == "begin":
-            pending[ring][site].append(rec)
+            pending[ring][scope_key].append(rec)
         elif phase == "end":
-            stack = pending[ring].get(site)
+            stack = pending[ring].get(scope_key)
             if stack:
                 pairs[ring].append((stack.pop(), rec))
             else:
@@ -369,6 +370,34 @@ def _summary_html(meta: dict, pairs_by_ring: dict[int, list[tuple[dict, dict]]],
     dropped = int(meta.get("dropped", 0) or 0)
     status_label = "Fatal" if fatal else ("Dropped records" if dropped else "Healthy: no fatal, no dropped")
     status_class = "danger" if fatal else ("warn" if dropped else "ok")
+    total_label = f"{int(meta.get('total', 0) or 0)} records"
+    collection_meta = ""
+    collection_note = ""
+    verdict = meta.get("collection_verdict")
+    counts_unknown = bool(meta.get("counts_unknown")) or verdict == "partial_cut_unknown"
+    if counts_unknown:
+        status_label = "Fatal; device counts unknown" if fatal else "Device statistics unknown"
+        status_class = "danger" if fatal else "warn"
+        total_label = "Device total: unknown"
+        fatal_label = "true" if fatal else "unknown"
+        collection_meta = f"<span>Device dropped: unknown</span><span>Device fatal: {fatal_label}</span>"
+        unknown_fields = (
+            "device totals and dropped records" if fatal else "device totals, dropped records, and fatal status"
+        )
+        collection_note = (
+            '<p class="subtle">Partial evidence: charts show retained paired samples only; '
+            f"{unknown_fields} are unknown.</p>"
+        )
+    elif verdict == "partial_safe":
+        status_label = "Partial collection" + (": fatal" if fatal else "")
+        status_class = "danger" if fatal else "warn"
+        collection_meta = f"<span>Device dropped: {dropped}</span><span>Device fatal: {str(fatal).lower()}</span>"
+        collection_note = '<p class="subtle">Partial evidence: charts show retained paired samples only.</p>'
+    if counts_unknown or verdict == "partial_safe":
+        for key, label in (("host_received_records", "Host received"), ("host_retained_records", "Host retained")):
+            value = meta.get(key)
+            count = f"{int(value)} records" if value is not None else "unknown"
+            collection_meta += f"<span>{label}: {count}</span>"
 
     return f"""
 <header class="report-head">
@@ -382,12 +411,12 @@ def _summary_html(meta: dict, pairs_by_ring: dict[int, list[tuple[dict, dict]]],
     </div>
     <div class="run-meta" aria-label="run metadata">
       <span class="status {status_class}">{_esc(status_label)}</span>
-      <span>{int(meta.get("total", 0) or 0)} records</span>
+      <span>{total_label}</span>{collection_meta}
       <span>{pair_count} total paired scopes</span>
       <span>{len(pairs_by_ring)} ring_depths</span>
     </div>
     <p class="subtle">Per-scope resource pressure across {_esc(_resource_list_text(resources))}. Use the
-    formulas as definitions, then start diagnosis with Top Peaks.</p>
+    formulas as definitions, then start diagnosis with Top Peaks.</p>{collection_note}
   </div>
 </header>
 {_formula_guide_html(resources)}
@@ -898,6 +927,14 @@ def process(jsonl_path: Path, out_dir: Path | None = None) -> list[Path]:
     pairs_by_ring = _pair_by_ring(records)
 
     body = [_summary_html(meta, pairs_by_ring, jsonl_path.name)]
+    unpaired_count = len(records) - 2 * sum(len(pairs) for pairs in pairs_by_ring.values())
+    if unpaired_count:
+        body.append(
+            '<section class="panel"><h2>Unpaired evidence</h2>'
+            f"<p>{unpaired_count} unpaired records are excluded from per-scope charts. "
+            f'See the raw JSONL in <span class="mono">{_esc(jsonl_path.name)}</span> for these samples; '
+            "no matching scope boundary was retained.</p></section>"
+        )
     for resource in RESOURCES:
         section = _resource_section(resource, meta, pairs_by_ring)
         if section:

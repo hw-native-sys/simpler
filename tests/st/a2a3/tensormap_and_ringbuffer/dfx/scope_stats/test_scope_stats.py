@@ -17,7 +17,7 @@ NDJSON. Enabling the flag is the entire user surface for the new API — the
 runtime takes care of the ``set_pending_site`` / ``scope_stats_begin`` /
 ``scope_stats_end`` calls. Schema lives in ``docs/dfx/scope-stats.md`` §3.
 
-Output (``scope_stats.jsonl``): line 1 is run metadata
+Successful output (``scope_stats.jsonl``): line 1 is run metadata
 (``{"fatal":bool,"dropped":uint,"total":uint}``); each subsequent
 line is one scope-boundary record carrying task/heap/dep_pool start-end.
 """

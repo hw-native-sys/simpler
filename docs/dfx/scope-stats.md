@@ -181,25 +181,66 @@ Metadata line (line 1):
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `fatal` | bool | `true` iff a fatal was latched during the run; records past it are diagnostic-only |
-| `dropped` | uint | Records dropped on device (free_queue empty / ready_queue full); `0` on a healthy run |
-| `total` | uint | Total records the device attempted (collected + dropped) |
-| `task_window_max` | int[] | Per-ring task-window capacity (indexed by `ring`) |
-| `heap_max` | int[] | Per-ring heap-byte capacity (indexed by `ring`) |
-| `dep_pool_max` | int[] | Per-ring dependency-list pool capacity (indexed by `ring`) |
-| `tensormap_max` | int | Tensormap entry capacity (scalar) |
+| `fatal` | bool or null | `true` iff a fatal was latched during the run; records past it are diagnostic-only |
+| `dropped` | uint or null | Records dropped on device (free_queue empty / ready_queue full); `0` on a healthy run |
+| `total` | uint or null | Total records the device attempted (collected + dropped) |
+| `task_window_max` | int[] or null | Per-ring task-window capacity (indexed by `ring`) |
+| `heap_max` | int[] or null | Per-ring heap-byte capacity (indexed by `ring`) |
+| `dep_pool_max` | int[] or null | Per-ring dependency-list pool capacity (indexed by `ring`) |
+| `tensormap_max` | int or null | Tensormap entry capacity (scalar) |
 
 Retained TMR runs carry these capacities from their resolved runtime layout into
 their own export slot, including when binding uses a cached arena. A delayed
 export therefore keeps its run's configuration after a successor initializes.
 Missing required capacity metadata refuses admission; numeric zero is not an
-unknown-capacity sentinel. The serialized, retention-off path reads capacities
-from the shared header after completion.
+unknown-capacity sentinel. The serialized, retention-off path freezes checked shared metadata after
+producer completion or an independent producer-stop proof.
 
 At the counting limit these two numbers saturate rather than wrap: the device
 counters clamp at `4294967295`, and a run that reaches it is reported with
 unknown counts instead of a small wrapped number that would look complete. The
-figure is the only way a default-mode artifact differs from earlier releases.
+figure does not certify that every attempted sample reached the host.
+
+### Ordinary close without producer-stop proof
+
+A failed execution fence does not prove that the device producer stopped.
+Without either execution completion or an independent producer-stop proof,
+the ordinary boundary stops chasing device publications, finishes entries
+already handed to host ownership, and joins its host readers. It does not
+read final shared accounting or recover the producer's unpublished buffer.
+Host-thread exit does not authorize freeing device allocations. Published
+buffers left in the device queue retain their original epoch; after restart,
+an admitted ordinary collector rejects and reports records from another epoch
+rather than importing them into its new run.
+
+If this run has host-owned samples, they are exported with this metadata:
+
+```json
+{"fatal": null, "dropped": null, "total": null, "task_window_max": null, "heap_max": null, "dep_pool_max": null, "tensormap_max": null, "collection_verdict": "partial_cut_unknown", "counts_unknown": true, "host_received_records": 2, "host_retained_records": 2}
+```
+
+`fatal`, `dropped` and `total` are unknown, not false or zero. The two host
+counts name received and retained samples; their difference records a host
+storage refusal and is not a device drop count. Capacities come only from
+this run's host binding, saved by value at admission. The binding supplies
+all four capacity fields together, or all four are `null`; numeric zero is
+never an unknown sentinel.
+
+A begin sample without its end remains in JSONL. The plot labels incomplete
+statistics and unpaired samples; it does not fabricate pairs, report unknown
+counts as healthy, or compute percentages from missing capacities. With no
+host sample, an unproven close emits no artifact; artifact absence proves
+neither zero samples nor zero loss. When reusing an output prefix, an empty
+unproven close removes only the old `scope_stats/scope_stats.jsonl`, so it
+cannot leave a predecessor's healthy artifact at the current result path;
+unrelated files remain. A removal failure is logged and returned. It does
+not export prior-run metadata.
+
+With a stop proof, ordinary collection keeps its resident threads, recovers
+held records and preserves its seven-key metadata line. A direct export
+without successful checked metadata still refuses, including read failure
+or a required producer that never initialized. Retained runs keep their
+stricter quarantine/no-artifact contract on incomplete execution.
 
 ### Background mode (`collect_across_runs=True`)
 
@@ -213,15 +254,16 @@ that says the files up to that point are published.** TMR only; on
 has. The default (`collect_across_runs=False`) path continues to attempt export at its
 run boundary.
 
-Four keys are added to the metadata line in this mode only, so a reader that
-ignores them sees the same shape as before:
+The four collection-quality keys below are used by background exports and
+by unproven ordinary closes. Proven ordinary exports keep their original
+seven-key metadata line:
 
 | Field | Type | Meaning |
 | ----- | ---- | ------- |
-| `collection_verdict` | string | `published`, `partial_safe` (loss, host refusal or a latched fatal, counts still known) or `partial_cut_unknown` (a saturated counter or an accounting mismatch) |
+| `collection_verdict` | string | `published`, `partial_safe` (loss, host refusal or a latched fatal, counts still known) or `partial_cut_unknown` (unproved producer stop, a saturated counter or an accounting mismatch) |
 | `counts_unknown` | bool | `true` only when the counts themselves cannot be trusted; a device fatal alone leaves this `false` |
-| `host_received_records` | uint | Records the host took delivery of, including one recovered unpublished buffer |
-| `host_retained_records` | uint | Of those, how many the 256 MiB per-collector budget kept |
+| `host_received_records` | uint | Records the host took delivery of; held-buffer recovery is included only when producer stop is proved |
+| `host_retained_records` | uint | Of those, how many host storage kept; the 256 MiB per-collector budget applies only to background collection |
 
 A run that ends without the producer handing its last buffer over leaves that
 buffer named in `current_buf_ptr`, possibly containing unsettled records and
@@ -413,11 +455,11 @@ ScopeStatsCollector                platform scope_stats_collector_aicpu.cpp
    append records to memory  ◀──┐      runtime samples task/heap/dep_pool/tensormap
       │                         │      runtime: scope_stats_begin()/end()
       │                         │         └─ emit record, append to buffer;
-  stop() (drain + join)         └──────────── push full buffer to ready_queue
-  reconcile_counters()               orch exit: flush remaining buffers
-    recover current_buf_ptr
-    if abnormal exit left one
-  write_jsonl()
+  proved close: quiesce        └──────────── push full buffer to ready_queue
+    recover held + snapshot          orch exit: flush remaining buffers
+  unproven close: stop(false)
+    join; host-owned samples only
+  write_jsonl() (frozen host values)
 ```
 
 A worked example is in

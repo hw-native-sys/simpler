@@ -30,6 +30,7 @@
 
 #include "host/scope_stats_collector.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cinttypes>
 #include <new>
@@ -91,7 +92,10 @@ int ScopeStatsCollector::init(
     total_collected_ = 0;
     refused_records_ = 0;
     expected_producer_epoch_ = 0;
-    device_snapshot_valid_ = false;
+    device_snapshot_ = {};
+    ordinary_capacities_ = {};
+    ordinary_stop_unproved_ = false;
+    ordinary_run_epoch_.reset();
     (void)records_.release();
     recovered_current_buf_ = 0;
     recovered_current_total_ = 0;
@@ -177,7 +181,10 @@ void ScopeStatsCollector::begin_run(
     uint64_t run_epoch, const simpler::dfx::scope_stats_runs::CapacityMetadata *capacities
 ) {
     expected_producer_epoch_ = capacities == nullptr || capacities->required ? run_epoch : 0;
-    device_snapshot_valid_ = false;
+    device_snapshot_ = {};
+    ordinary_capacities_ = capacities == nullptr ? simpler::dfx::scope_stats_runs::CapacityMetadata{} : *capacities;
+    ordinary_run_epoch_ = run_epoch;
+    ordinary_stop_unproved_ = false;
     {
         std::scoped_lock lock(records_mutex_);
         const size_t charged = records_.release();
@@ -217,6 +224,21 @@ void ScopeStatsCollector::append_buffer_records(const void *buf_host_ptr) {
     // the pool and being re-stamped by a later run.
     const uint64_t run_epoch = buf->run_epoch;
     const uint32_t local_seq = buf->local_seq;
+
+    // An unproven close can leave publications queued. A restarted ordinary
+    // collector may retire that transport entry but cannot adopt its records.
+    if (!terminal_banks_.opened() && ordinary_run_epoch_ && run_epoch != *ordinary_run_epoch_) {
+        foreign_epoch_records_ += n;
+        if (!foreign_epoch_reported_) {
+            LOG_ERROR(
+                "scope_stats: %u records stamped 0x%llx do not belong to ordinary run 0x%llx; not exported", n,
+                static_cast<unsigned long long>(run_epoch), static_cast<unsigned long long>(*ordinary_run_epoch_)
+            );
+            foreign_epoch_reported_ = true;
+            foreign_epoch_pending_report_ = true;
+        }
+        return;
+    }
 
     // Which run's receipts these records belong to. With a bank mapped the
     // answer is the identity the producer stamped, because more than one run
@@ -430,6 +452,23 @@ bool ScopeStatsCollector::open_run_terminal_banks(int expected_producers) {
 // reconcile_counters
 // ---------------------------------------------------------------------------
 
+int ScopeStatsCollector::close_ordinary_run(const std::string &output_dir, bool producer_stop_proved) {
+    if (producer_stop_proved) {
+        ordinary_stop_unproved_ = false;
+        quiesce();
+        reconcile_counters();
+    } else {
+        // Do not chase live publications or recover the device's held buffer.
+        // stop(false) still finishes already-handed host entries and joins them.
+        stop(false);
+        report_drain_drops();
+        device_snapshot_ = {};
+        ordinary_stop_unproved_ = true;
+    }
+    report_foreign_epoch_records();
+    return write_jsonl(output_dir);
+}
+
 bool ScopeStatsCollector::reconcile_counters() {
     if (shm_host_ == nullptr) return false;
     report_drain_drops();
@@ -448,7 +487,7 @@ bool ScopeStatsCollector::reconcile_counters() {
         if (host_ptr != nullptr) {
             if (profiling_copy_from_device(host_ptr, reinterpret_cast<void *>(buf_dev), sizeof(ScopeStatsBuffer)) !=
                 0) {
-                device_snapshot_valid_ = false;
+                device_snapshot_ = {};
                 LOG_ERROR("scope_stats: reading the held buffer failed; no artifact is written");
                 return false;
             }
@@ -583,35 +622,57 @@ simpler::dfx::scope_stats_runs::DeviceSnapshot ScopeStatsCollector::snapshot_unc
 }
 
 int ScopeStatsCollector::render_jsonl_to(
-    std::FILE *fp, const DeviceSnapshot &device, const RecordBlocks &records, const Collection *extra
+    std::FILE *fp, const DeviceSnapshot &device, const RecordBlocks &records, const Collection *extra,
+    const simpler::dfx::scope_stats_runs::CapacityMetadata *host_only_capacities
 ) {
-    // Line 1: run metadata. Per-ring capacities and the tensormap capacity are
-    // run-constants, so they live here once rather than on every record.
-    std::string task_window_max;
-    std::string heap_max;
-    std::string dep_pool_max;
-    for (int r = 0; r < SCOPE_STATS_MAX_RING_DEPTH; r++) {
-        char buf[32];
-        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", device.task_window_cap[r]);
-        task_window_max += buf;
-        std::snprintf(buf, sizeof(buf), "%s%" PRIu64, r == 0 ? "" : ", ", device.heap_cap[r]);
-        heap_max += buf;
-        std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", device.dep_pool_cap[r]);
-        dep_pool_max += buf;
+    DeviceSnapshot metadata = device;
+    if (host_only_capacities != nullptr && host_only_capacities->values) {
+        const auto &caps = *host_only_capacities->values;
+        std::copy(caps.task_window.begin(), caps.task_window.end(), metadata.task_window_cap);
+        std::copy(caps.heap.begin(), caps.heap.end(), metadata.heap_cap);
+        std::copy(caps.dep_pool.begin(), caps.dep_pool.end(), metadata.dep_pool_cap);
+        metadata.tensormap_cap = caps.tensormap;
     }
-    // heap_start/heap_end are monotonic cumulative bytes, not wrapping ring
-    // offsets — see docs/dfx/scope-stats.md.
-    if (std::fprintf(
-            fp,
-            "{\"fatal\": %s, \"dropped\": %u, \"total\": %u, "
-            "\"task_window_max\": [%s], \"heap_max\": [%s], \"dep_pool_max\": [%s], \"tensormap_max\": %d",
-            device.fatal_latched ? "true" : "false", device.dropped_records, device.total_records,
-            task_window_max.c_str(), heap_max.c_str(), dep_pool_max.c_str(), device.tensormap_cap
-        ) < 0) {
+    // Unknown close has no final device accounting. Its capacities, if known,
+    // come from the immutable host binding rather than the shared mirror.
+    if (host_only_capacities != nullptr) {
+        if (std::fprintf(fp, "{\"fatal\": null, \"dropped\": null, \"total\": null") < 0) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    } else if (std::fprintf(
+                   fp, "{\"fatal\": %s, \"dropped\": %u, \"total\": %u", metadata.fatal_latched ? "true" : "false",
+                   metadata.dropped_records, metadata.total_records
+               ) < 0) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    // Additive, and only in background mode: a default-path artifact keeps the
-    // seven keys it has today, in the same order.
+    if (host_only_capacities != nullptr && !host_only_capacities->values) {
+        if (std::fprintf(
+                fp, ", \"task_window_max\": null, \"heap_max\": null, \"dep_pool_max\": null, \"tensormap_max\": null"
+            ) < 0) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    } else {
+        std::string task_window_max;
+        std::string heap_max;
+        std::string dep_pool_max;
+        for (int r = 0; r < SCOPE_STATS_MAX_RING_DEPTH; r++) {
+            char buf[32];
+            std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", metadata.task_window_cap[r]);
+            task_window_max += buf;
+            std::snprintf(buf, sizeof(buf), "%s%" PRIu64, r == 0 ? "" : ", ", metadata.heap_cap[r]);
+            heap_max += buf;
+            std::snprintf(buf, sizeof(buf), "%s%d", r == 0 ? "" : ", ", metadata.dep_pool_cap[r]);
+            dep_pool_max += buf;
+        }
+        if (std::fprintf(
+                fp, ", \"task_window_max\": [%s], \"heap_max\": [%s], \"dep_pool_max\": [%s], \"tensormap_max\": %d",
+                task_window_max.c_str(), heap_max.c_str(), dep_pool_max.c_str(), metadata.tensormap_cap
+            ) < 0) {
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
+    // Retained exports and unproven ordinary closes report collection quality.
+    // A proved ordinary export keeps its existing seven-key metadata line.
     if (extra != nullptr &&
         std::fprintf(
             fp,
@@ -650,29 +711,44 @@ int ScopeStatsCollector::render_jsonl_to(
 
 int ScopeStatsCollector::write_jsonl(const std::string &output_dir) {
     if (!initialized_ || shm_host_ == nullptr) return 0;
-    if (!device_snapshot_valid_) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (!ordinary_stop_unproved_ && !device_snapshot_.valid) return PTO_RUNTIME_ERR_INVALID_STATE;
 
-    std::filesystem::path dir = std::filesystem::path(output_dir) / "scope_stats";
+    std::scoped_lock lock(records_mutex_);
+    const std::filesystem::path dir = std::filesystem::path(output_dir) / "scope_stats";
+    const std::string path = (dir / "scope_stats.jsonl").string();
     std::error_code ec;
+    // No host sample means no evidence for this run. A reused output prefix
+    // must not leave the predecessor's healthy file at the current result path.
+    if (ordinary_stop_unproved_ && records_.size() == 0) {
+        std::filesystem::remove(path, ec);
+        if (ec) {
+            LOG_ERROR("scope_stats: failed to remove stale artifact %s: %s", path.c_str(), ec.message().c_str());
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        return 0;
+    }
+
     std::filesystem::create_directories(dir, ec);
     if (ec) {
         LOG_WARN("scope_stats: failed to create output dir %s: %s", dir.c_str(), ec.message().c_str());
     }
-    const std::string path = (dir / "scope_stats.jsonl").string();
-
     std::FILE *fp = std::fopen(path.c_str(), "w");
     if (fp == nullptr) {
         LOG_ERROR("scope_stats: failed to open %s", path.c_str());
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    std::scoped_lock lock(records_mutex_);
-    const int rc = render_jsonl_to(fp, snapshot_unchecked(), records_, nullptr);
+    // This verdict describes only the host collection; it settles no device references.
+    const Collection unknown{simpler::dfx::runs::Verdict::CutUnknown, true, total_collected_, records_.size()};
+    const int rc = render_jsonl_to(
+        fp, device_snapshot_, records_, ordinary_stop_unproved_ ? &unknown : nullptr,
+        ordinary_stop_unproved_ ? &ordinary_capacities_ : nullptr
+    );
     std::fclose(fp);
 
     LOG_INFO(
-        "scope_stats: wrote %lu records (dropped=%u) to %s", static_cast<unsigned long>(records_.size()),
-        scope_stats_state(0)->dropped_record_count, path.c_str()
+        "scope_stats: wrote %lu host records (device accounting %s) to %s", static_cast<unsigned long>(records_.size()),
+        ordinary_stop_unproved_ ? "unknown" : "checked", path.c_str()
     );
     return rc;
 }
