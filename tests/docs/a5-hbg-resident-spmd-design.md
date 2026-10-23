@@ -618,18 +618,26 @@ TMR 的 stop-the-world / 二叉 ack 树 / coordinator / `force_gate` + doorbell 
 
 ## 9. Host 侧放行
 
-1. `scheduler_graph.h:59-61` 的谓词去掉 `logical_block_num == 1` **与** `!sync_start`。
-   剩下的 `active_subtasks >= 1 && <= 3` **恒真**（mask 只有 3 bit，0 已被 `runtime_maker.cpp:1174`
-   拦住），所以这个谓词随之失去意义 —— 但 `SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE`
-   （mode=4）**必须保留并换一个判据**，见第 2 条。
-2. **必须放宽 worker demand 校验** —— 这是放行的硬前置，不是优化：
+1. **`scheduler_resident_v0_task_shape_supported` 整个删除。** 去掉 `logical_block_num == 1`
+   与 `!sync_start` 之后，剩下的 `active_subtasks >= 1 && <= 3` **恒真**（mask 只有 3 bit，
+   0 已被 `runtime_maker.cpp` 的乘积上界硬拒），谓词失去意义。
 
-   `runtime_maker.cpp:1244,1249` 现在对**所有**任务取
-   `aic_worker_demand = max(block_num)`、`aiv_worker_demand = max(block_num × AIV 子任务数)`，
-   `aicore_lifecycle.cpp:242` 据此拒绝超出真实核数的图。对 non-sync_start 这是错的：
-   block_num 大于核数完全正常，blocks 分波次跑完即可。不改就会拒掉：
+   **连带：`SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE`（mode=4）一并退役。**
+   本稿初版想给它换个判据保住它，那是错的——**SPMD 不存在"回退"这个选项**（用户裁定，
+   2026-10-23）：AICore 调度跑不了的，AICPU 调度一样跑不了。于是 mode=4 没有任何产生者，
+   留着它就是在暗示一个已不存在的选择。枚举值、`aicore_scheduler_runtime_mode_is_explicit_legacy`
+   的分支、`select_legacy_scheduler` 的 `always_assert`、conftest 的 `_MODE_NAMES` /
+   `_LEGACY_MODES`、两处 UT 全部删掉；**mode=3（`TaskKind::GRAPH`）是仅剩的回退**，它的选择
+   在形状遍历之前（`runtime_maker.cpp` 的 `slot.task_kind == TaskKind::GRAPH` 分支），所以
+   三个钉 `legacy` 的 graph 用例不受放行影响（已核实）。
+2. **worker demand 收窄到只由 sync_start 贡献。** 这是放行的硬前置：
 
-   | 负载 | 现算法得出的 demand | 真实核数 | 结果 |
+   原先对**所有**任务取 `aic_worker_demand = max(block_num)`、
+   `aiv_worker_demand = max(block_num × AIV 子任务数)`，`aicore_lifecycle.cpp:242` 据此拒绝
+   超出真实核数的图。对 non-sync_start 这是错的：block_num 大于核数完全正常，blocks 分波次
+   跑完即可。不改就会拒掉：
+
+   | 负载 | 原算法得出的 demand | 真实核数 | 结果 |
    | ---- | ------------------: | -------: | ---- |
    | qwen3 decode 的 `q_proj_spmd`：`rt_submit_aic_task` + `set_block_num(50)`（`decode_fwd_layers.cpp:406,415`） | **AIC 50** | 36 | **拒绝 bind** |
    | CSA，`block_num` 最大 512 | AIV ≥ 512 | 72 | **拒绝 bind** |
@@ -638,29 +646,20 @@ TMR 的 stop-the-world / 二叉 ack 树 / coordinator / `force_gate` + doorbell 
    36 个。同一文件 `:532` 还有一个 `rt_submit_task(mixed_11, …)` 的 **Mix + sync_start** 任务
    （`set_require_sync_start(true)`@521、`set_block_num(24)`）。
 
+   改法：`const uint64_t sync_start_blocks = requires_sync_start() ? logical_block_num : 1;`
+   两处 demand 都用它。sync_start 仍贡献——它才真需要 co-residency。
+
+   **超限的 cohort 硬失败，不回退。** `aicore_lifecycle.cpp:242` 的检查原样保留。本稿初版
+   主张改成整图回退 legacy，理由是"今天所有 sync_start 图都回退 legacy 并能跑"——对超限的
+   图这句话不成立（用户确认 legacy 同样跑不了 `block_num > 核数` 的 sync_start）。回退只会
+   把一个 bind 期的清晰报错（`demand AIC=.. AIV=.. cores AIC=.. AIV=..`）换成 45s 设备超时，
+   诊断性严格变差。
+
    > **qwen 同时含 sync_start，这件事有两个后果。** 其一，它那条 sync_start 任务按本方案
    > **仍然贡献 demand**：AIC 24 ≤ 36、AIV 24×2 = 48 ≤ 72，**恰好过关** —— 它是"碰巧不触发"
    > 而不是"被放宽救下"，别把它算进放宽的收益里。其二，qwen 因此**不是一张 non-sync_start
    > 的图**，所以 §10.2 那条"S1 后对 non-sync_start 图不得出现回退日志"在 qwen 上要连 cohort
    > 路径一起看 —— 反过来说，这让 qwen 成了 S1 里同时覆盖两条路径的现成负载。
-
-   改法分两半：
-
-   - **non-sync_start 不再贡献 demand**，block_num 不设上限（分波次跑完即可）。
-   - **sync_start 仍贡献 demand**（它才真需要 co-residency），但超限时的处置
-     **从"硬失败"改成"整图回退 legacy"** —— 这就是 mode=4 的新判据。
-
-   这一半不是可选的。今天**所有** sync_start 图都回退 legacy 并能跑；若放行后让超限 cohort
-   撞上 `aicore_lifecycle.cpp:242` 的硬失败（`prepare_native_run failed with code -1000`），
-   那是一次**能力回退**——一张今天能跑的图从此跑不了。保留 mode=4 的另一个好处是
-   `spmd_legacy_fallback` 用例仍有被测对象（§10.4），而不是随谓词一起失去意义。
-
-   **回退必须判在 host 侧**，因为 `aicore_lifecycle.cpp:242` 那道检查在 AICPU 上、返回 -1
-   就是硬失败，没有"整图换调度器"的余地。host 有算核数所需的一切：
-   `runtime_maker.cpp:1489-1499` 已经在用 `runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM`
-   推 `total_cluster_count` 与 `total_aiv_count`。**但那段在准入循环（`:1150-1266`）之后**，
-   所以这几个数要提前算，或者把 cohort 的超限判断挪到它之后、与 `legacy_shape_task_ref`
-   汇合再决定。
 
    顺带一提，收窄后的 demand 口径与旧稿 §7.2 那张"按形状取上限"的表**自动等价**
    （Mix 的 `block_num × 2 ≤ 72` 即 `block_num ≤ 36 =` cluster 数），所以旧稿要求的那个新增
