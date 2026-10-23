@@ -1982,6 +1982,16 @@ class ChipWorker:
         return self._impl.run_stream_set_create_count
 
     @property
+    def scheduler_runtime_mode(self) -> int:
+        """SCHEDULER_RUNTIME_MODE_* of the most recent bind; 0 if none published."""
+        return self._impl.scheduler_runtime_mode
+
+    @property
+    def scheduler_mode_publish_count(self) -> int:
+        """How many binds have published a scheduler selection."""
+        return self._impl.scheduler_mode_publish_count
+
+    @property
     def pipeline_depth(self):
         return self._impl.pipeline_depth
 

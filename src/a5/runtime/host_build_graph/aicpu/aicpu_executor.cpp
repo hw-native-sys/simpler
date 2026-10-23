@@ -121,7 +121,128 @@ static bool wait_with_scheduler_timeout(Predicate predicate) {
     return true;
 }
 
+// A stalled run leaves its state still: the tasks that never finished keep the
+// fields that say what they were waiting for. Naming them is what separates a
+// waiter nobody woke from a task that was never routed at all.
+static void log_unfinished_tasks(Runtime *runtime) {
+    SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
+    if (context == nullptr) return;
+    cache_invalidate_range(context, 256);
+    void *scheduler_state_base = aicore_scheduler_state_base(context);
+    if (scheduler_state_base == nullptr) return;
+    auto *controls = scheduler_state_at<SchedulerTaskControl>(scheduler_state_base, context->task_controls_offset);
+    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(scheduler_state_base, context->task_metadata_offset);
+    const uint64_t count = context->graph_task_count;
+    cache_invalidate_range(controls, static_cast<size_t>(count) * sizeof(*controls));
+    cache_invalidate_range(metadata, static_cast<size_t>(count) * sizeof(*metadata));
+    uint64_t reported = 0;
+    struct TaskSnapshot {
+        uint64_t task;
+        int64_t state;
+        int64_t wake_head;
+        int64_t next_waiter;
+    };
+    TaskSnapshot snapshots[64];
+    uint64_t snapshot_count = 0;
+    for (uint64_t task = 0; task < count; ++task) {
+        if (!scheduler_task_is_executable(metadata[task].flags)) continue;
+        if (controls[task].state == static_cast<int64_t>(SchedulerTaskState::DONE)) continue;
+        if (reported++ >= 64) break;
+        if (snapshot_count < 64) {
+            snapshots[snapshot_count++] = {
+                task, controls[task].state, controls[task].wake_list_head, controls[task].next_waiter
+            };
+        }
+        for (uint64_t other = 0; other < count; ++other) {
+            if (controls[other].next_waiter != static_cast<int64_t>(task)) continue;
+            LOG_ERROR(
+                "A5 HBG AICore scheduler: task=%" PRIu64 " is linked from task=%" PRIu64 " (state=%" PRId64
+                " wake_head=%" PRId64 " waiting_producer=%" PRId32 ")",
+                task, other, controls[other].state, controls[other].wake_list_head, controls[other].waiting_producer
+            );
+        }
+        // waiting_producer is advisory: no functional path reads it, and the
+        // line it sits on is published as a whole, so a stale copy can be
+        // restored over it. The chain owner is whichever task's wake-list head
+        // actually names this one.
+        for (uint64_t owner = 0; owner < count; ++owner) {
+            if (controls[owner].wake_list_head != static_cast<int64_t>(task)) continue;
+            LOG_ERROR(
+                "A5 HBG AICore scheduler: task=%" PRIu64 " heads the wake list of task=%" PRIu64 " (state=%" PRId64
+                " flags=0x%x)",
+                task, owner, controls[owner].state, metadata[owner].flags
+            );
+        }
+        LOG_ERROR(
+            "A5 HBG AICore scheduler: unfinished task=%" PRIu64 " state=%" PRId64 " wake_head=%" PRId64
+            " next_waiter=%" PRId64 " fanin_index=%" PRId32 " waiting_producer=%" PRId32
+            " producer_state=%" PRId64 " producer_wake_head=%" PRId64 " active_mask=0x%x flags=0x%x",
+            task, controls[task].state, controls[task].wake_list_head, controls[task].next_waiter,
+            controls[task].next_fanin_index, controls[task].waiting_producer,
+            controls[task].waiting_producer >= 0 && static_cast<uint64_t>(controls[task].waiting_producer) < count ?
+                controls[controls[task].waiting_producer].state :
+                INT64_C(-1),
+            controls[task].waiting_producer >= 0 && static_cast<uint64_t>(controls[task].waiting_producer) < count ?
+                controls[controls[task].waiting_producer].wake_list_head :
+                INT64_C(-1),
+            metadata[task].active_mask, metadata[task].flags
+        );
+    }
+    // A task that is neither on a wake list nor in a queue was dropped between
+    // the two; one still queued was never dispatched. The inboxes say which.
+    auto *inboxes = scheduler_state_at<SchedulerReadyInbox>(scheduler_state_base, context->ready_inboxes_offset);
+    cache_invalidate_range(inboxes, SCHEDULER_READY_INBOX_CAPACITY * sizeof(*inboxes));
+    for (uint32_t index = 0; index < SCHEDULER_READY_INBOX_CAPACITY; ++index) {
+        const uint64_t packed = inboxes[index].endpoints;
+        // The endpoints pack two int32 task refs, head in the low half.
+        const int32_t head = static_cast<int32_t>(static_cast<uint32_t>(packed));
+        const int32_t tail = static_cast<int32_t>(static_cast<uint32_t>(packed >> 32));
+        if (head < 0 && tail < 0) continue;
+        LOG_ERROR(
+            "A5 HBG AICore scheduler: inbox %u not drained: head=%" PRId32 " tail=%" PRId32, index, head, tail
+        );
+    }
+    // The directory is what a thief consults before looking at an inbox, so a
+    // bit set over an empty inbox wastes scans and a bit clear over a full one
+    // hides the work. Either way it belongs next to the endpoints above.
+    auto *directory = scheduler_state_at<SchedulerReadyDirectory>(scheduler_state_base, context->ready_directory_offset);
+    cache_invalidate_range(directory, sizeof(*directory));
+    for (uint32_t type = 0; type < 3; ++type) {
+        for (uint32_t shard = 0; shard < SCHEDULER_READY_DIRECTORY_SHARD_COUNT; ++shard) {
+            const uint64_t bits = directory->core_types[type][shard].bits;
+            if (bits == 0) continue;
+            LOG_ERROR(
+                "A5 HBG AICore scheduler: directory type %u shard %u still flags 0x%" PRIx64, type, shard, bits
+            );
+        }
+    }
+    // The AICores are still running when this timeout fires, so one pass cannot
+    // tell a chain nobody will drain from one being walked at this instant. A
+    // second pass over the same tasks names whatever moved in between.
+    cache_invalidate_range(controls, static_cast<size_t>(count) * sizeof(*controls));
+    uint64_t moved = 0;
+    for (uint64_t i = 0; i < snapshot_count; ++i) {
+        const TaskSnapshot &before = snapshots[i];
+        const uint64_t task = before.task;
+        if (controls[task].state == before.state && controls[task].wake_list_head == before.wake_head &&
+            controls[task].next_waiter == before.next_waiter)
+            continue;
+        ++moved;
+        LOG_ERROR(
+            "A5 HBG AICore scheduler: task=%" PRIu64 " moved: state %" PRId64 "->%" PRId64 " wake_head %" PRId64
+            "->%" PRId64 " next_waiter %" PRId64 "->%" PRId64,
+            task, before.state, controls[task].state, before.wake_head, controls[task].wake_list_head,
+            before.next_waiter, controls[task].next_waiter
+        );
+    }
+    LOG_ERROR(
+        "A5 HBG AICore scheduler: second snapshot: %" PRIu64 " of %" PRIu64 " sampled tasks moved", moved,
+        snapshot_count
+    );
+}
+
 static void record_resident_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
+    log_unfinished_tasks(runtime);
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
     if (context != nullptr) {
         cache_invalidate_range(context, 128);
@@ -467,11 +588,14 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     LOG_ERROR(
                         "A5 HBG AICore scheduler: graph execution failed at task=%" PRIu64 " status=%" PRIu64
                         " core=%" PRIu64 " type=%" PRIu64 " graph_tasks=%" PRIu64 " storage=0x%" PRIx64
-                        " reserved=0x%" PRIx64 " window_last_index=0x%" PRIx64 " site=%" PRIu64,
-                        run_control->error_task_id, run_control->scheduler_error, run_control->error_core_id,
+                        " reserved=0x%" PRIx64 " window_last_index=0x%" PRIx64 " site=%" PRIu64 " executed=%" PRIu64
+                        " resolved=%" PRIu64 " expected=%" PRIu64 " inline=%" PRIu64,
+                        run_control->error_task_ref, run_control->scheduler_error, run_control->error_core_id,
                         run_control->error_core_type, run_control->error_graph_task_count,
                         run_control->error_storage_address, run_control->error_reserved_address,
-                        run_control->error_task_window_last_index, run_control->error_site
+                        run_control->error_task_window_last_index, run_control->error_site,
+                        run_control->executed_task_count, run_control->resolved_task_count,
+                        run_control->expected_task_count, run_control->inline_completed_count
                     );
                     supervisor_rc = publish_aicore_scheduler_runtime_error(runtime);
                     if (supervisor_rc == 0) supervisor_rc = -1;

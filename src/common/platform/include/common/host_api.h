@@ -140,6 +140,12 @@ struct HostApiOps {
     int (*acquire_scheduler_state_storage)(
         void *runner_ctx, uint32_t pipeline_slot, size_t bytes, size_t alignment, void **device_out, void **host_out
     );
+    // Records which device-side scheduler a bind selected, so a caller can
+    // observe the choice after the run. The runtime publishes the same value
+    // into its own launch descriptor, but that field is cleared when the run
+    // releases its bindings; the runner's copy is what outlives the run.
+    // Called only where a selection is published, never where one is cleared.
+    void (*record_scheduler_runtime_mode)(void *runner_ctx, uint32_t pipeline_slot, uint32_t mode);
     // Runner-owned host mirror of the runtime shared memory, one retained buffer
     // per pipeline slot: the block a host-side orchestrator (host_build_graph)
     // writes its shared-memory image into before the bounded H2D ships the live
@@ -398,6 +404,11 @@ public:
     void host_phase_pool_finish(uint64_t submitted_tasks, uint64_t invocation_id) const noexcept {
         if (ops_->host_phase_pool_finish != nullptr) {
             ops_->host_phase_pool_finish(runner_ctx_, pipeline_slot_, submitted_tasks, invocation_id);
+        }
+    }
+    void record_scheduler_runtime_mode(uint32_t mode) const noexcept {
+        if (ops_->record_scheduler_runtime_mode != nullptr) {
+            ops_->record_scheduler_runtime_mode(runner_ctx_, pipeline_slot_, mode);
         }
     }
     bool publish_chip_swimlane_extension(

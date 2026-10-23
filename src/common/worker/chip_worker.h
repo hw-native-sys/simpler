@@ -291,6 +291,14 @@ public:
     /// using the persistent bootstrap pair report 0.
     size_t run_stream_set_create_count() const;
 
+    /// Which device-side scheduler the most recent bind selected
+    /// (SCHEDULER_RUNTIME_MODE_*); 0 when none was published. Only the a5
+    /// host_build_graph runtime publishes one.
+    uint32_t last_scheduler_runtime_mode() const;
+
+    /// How many scheduler selections this worker's binds have published.
+    size_t scheduler_mode_publish_count() const;
+
     uint64_t malloc(size_t size);
     void free(uint64_t ptr);
     void copy_to(uint64_t dst, uint64_t src, size_t size);
@@ -596,6 +604,12 @@ private:
     GetAicpuDlopenCountFn get_aicpu_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_run_stream_set_create_count_fn_ = nullptr;
+    // Resolved optionally rather than through `load_symbol`: only the a5
+    // host_build_graph module records a scheduler selection, so a hard
+    // requirement would oblige every other runtime to export a stub.
+    using GetLastSchedulerRuntimeModeFn = uint32_t (*)(void *);
+    GetLastSchedulerRuntimeModeFn get_last_scheduler_runtime_mode_fn_ = nullptr;
+    GetAicpuDlopenCountFn get_scheduler_mode_publish_count_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;

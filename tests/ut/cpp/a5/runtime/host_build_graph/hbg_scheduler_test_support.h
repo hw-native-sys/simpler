@@ -133,12 +133,10 @@ struct FixtureStorage {
         test_graphs(workers),
         local_states(workers) {
         for (auto &local : test_contexts)
-            for (auto &lane : local.slots)
-                for (auto &slot : lane)
-                    scheduler_initialize_free_slot(&slot);
-        for (auto &lane : scheduler_local_state.slots)
-            for (auto &slot : lane)
+            for (auto &slot : local.slots)
                 scheduler_initialize_free_slot(&slot);
+        for (auto &slot : scheduler_local_state.slots)
+            scheduler_initialize_free_slot(&slot);
         EXPECT_TRUE(scheduler_plan_layout(task_count, task_count, 0, &layout, false, task_count * traces_per_task));
         scheduler_state = std::make_unique<SchedulerStateBuffer>(layout);
         run_control = scheduler_state_at<SchedulerRunControl>(scheduler_state->base(), layout.run_control_offset);
@@ -147,25 +145,33 @@ struct FixtureStorage {
         run_control->scheduler_count = workers;
         for (uint64_t worker = 0; worker < workers; ++worker) {
             SchedulerWorkerContext &context = contexts[worker];
-            context.core_type = static_cast<int32_t>(CoreType::AIV);
+            context.core_type =
+                static_cast<int32_t>(worker % PLATFORM_CORES_PER_BLOCKDIM == 0 ? CoreType::AIC : CoreType::AIV);
             context.task_controls_offset = layout.task_controls_offset;
             context.task_metadata_offset = layout.task_metadata_offset;
             context.ready_inboxes_offset = layout.ready_inboxes_offset;
             context.ready_directory_offset = layout.ready_directory_offset;
+            context.mix_payloads_offset = layout.mix_payloads_offset;
+            context.mix_traces_offset = layout.mix_traces_offset;
             context.trace_cells_offset = layout.trace_cells_offset;
             context.worker_contexts_offset = layout.worker_contexts_offset;
             context.callable_addresses_address = reinterpret_cast<uint64_t>(callable_addresses);
             context.callable_addresses_count = kFixtureCallableCount;
-            context.gang_coordinator_offset = layout.gang_coordinator_offset;
-            context.gang_cohorts_offset = layout.gang_cohorts_offset;
-            context.gang_participants_offset = layout.gang_participants_offset;
-            context.gang_commands_offset = layout.gang_commands_offset;
+            context.graph_summary_offset = layout.graph_summary_offset;
             context.dispatch_payload_offset =
                 layout.dispatch_payloads_offset + worker * SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
             context.graph_task_count = task_count;
             context.runtime_worker_count = workers;
             context.worker_index = worker;
             context.scheduler_index = worker;
+            // One cluster per three workers, each lane ranked within its own
+            // type, matching what the AICPU assigns during core discovery.
+            const uint64_t lane = worker % PLATFORM_CORES_PER_BLOCKDIM;
+            const uint64_t cluster = worker / PLATFORM_CORES_PER_BLOCKDIM;
+            context.cluster_count = (workers + PLATFORM_CORES_PER_BLOCKDIM - 1) / PLATFORM_CORES_PER_BLOCKDIM;
+            context.cluster_index = cluster;
+            context.type_rank =
+                static_cast<int32_t>(lane == 0 ? cluster : cluster * PLATFORM_AIV_CORES_PER_BLOCKDIM + (lane - 1));
         }
         metadata = scheduler_state_at<SchedulerTaskMetadata>(scheduler_state->base(), layout.task_metadata_offset);
         callable_addresses[1] = UINT64_C(0x1000);
@@ -194,23 +200,33 @@ struct FixtureStorage {
         config.task_metadata_offset = context->task_metadata_offset;
         config.ready_inboxes_offset = context->ready_inboxes_offset;
         config.ready_directory_offset = context->ready_directory_offset;
+        config.mix_payloads_offset = context->mix_payloads_offset;
+        config.mix_traces_offset = context->mix_traces_offset;
         local->profiling->trace_cells_offset = context->trace_cells_offset;
         local->profiling->activity_buffers_offset = context->activity_buffers_offset;
         config.worker_contexts_offset = context->worker_contexts_offset;
         config.callable_addresses_address = context->callable_addresses_address;
         config.callable_addresses_count = static_cast<uint32_t>(context->callable_addresses_count);
-        config.gang_coordinator_offset = context->gang_coordinator_offset;
+        config.graph_summary_offset = context->graph_summary_offset;
         config.runtime_worker_count = context->runtime_worker_count;
         config.scheduler_index = context->scheduler_index;
         config.scheduler_count = context->scheduler_count;
         config.self_lane = 0;
-        config.scheduler_lane = UINT8_MAX;
+        config.self_core_type = scheduler_core_type_index(context->core_type);
         for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
             config.worker_ids[lane] = context->cluster_worker_ids[lane];
             if (context->cluster_worker_ids[lane] == context->worker_index) config.self_lane = lane;
         }
         config.worker_ids[config.self_lane] = context->worker_index;
-        if (context->is_scheduler != 0) config.scheduler_lane = config.self_lane;
+        config.cluster_count = static_cast<uint16_t>(context->cluster_count);
+        // Each lane's rank comes from that lane's own context, as production
+        // reads it; a lane the case left unwired falls back to its position.
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            const uint64_t peer = config.worker_ids[lane];
+            config.cluster_type_ranks[lane] = peer < context->runtime_worker_count ?
+                                                  static_cast<uint16_t>(contexts[peer].type_rank) :
+                                                  static_cast<uint16_t>(lane == 0 ? 0 : lane - 1);
+        }
         return local;
     }
     std::vector<SchedulerLocalProfilingState> test_profiles;

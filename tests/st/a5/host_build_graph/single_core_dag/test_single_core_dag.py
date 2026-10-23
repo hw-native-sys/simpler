@@ -13,6 +13,7 @@ import ctypes
 import json
 from collections import Counter
 
+import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -31,6 +32,7 @@ GRAPH_CASES = {
 AUTOMATIC_CASES = {"aic_chain_64", "aiv_chain_64", "mixed_diamond_8"}
 
 
+@pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestHbgSingleCoreDag(SceneTestCase):
     RTOL = 0

@@ -9,6 +9,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """Graph Execution preserves MIX active slots and multi-block SPMD metadata."""
 
+import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -20,6 +21,7 @@ MAX_CLUSTERS = 36
 TOTAL_FLOATS = MAX_CLUSTERS * SLOTS_PER_BLOCK * FLOATS_PER_CACHE_LINE
 
 
+@pytest.mark.scheduler_mode("legacy")
 @scene_test(level=2, runtime="host_build_graph")
 class TestGraphExecutionMixSpmdHostBuildGraphA5(SceneTestCase):
     RTOL = 0

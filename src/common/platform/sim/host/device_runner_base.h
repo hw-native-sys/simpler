@@ -625,6 +625,27 @@ public:
     size_t aicpu_dlopen_count() const { return aicpu_dlopen_total_; }
     size_t host_dlopen_count() const { return host_dlopen_total_; }
 
+    /**
+     * Which device-side scheduler the most recent bind selected, as a
+     * SCHEDULER_RUNTIME_MODE_* value, or 0 when no bind has published one.
+     *
+     * Latched rather than read back from the runtime: the launch descriptor's
+     * copy is cleared when a run releases its bindings, so by the time a caller
+     * could look it is already 0. Never cleared here — a later bind overwrites
+     * it, and `scheduler_mode_publish_count()` is what distinguishes "this bind
+     * chose again" from "nothing has changed since the last one".
+     */
+    uint32_t last_scheduler_runtime_mode() const {
+        return last_scheduler_runtime_mode_.load(std::memory_order_relaxed);
+    }
+    size_t scheduler_mode_publish_count() const {
+        return scheduler_mode_publish_total_.load(std::memory_order_relaxed);
+    }
+    void record_scheduler_runtime_mode(uint32_t mode) {
+        last_scheduler_runtime_mode_.store(mode, std::memory_order_relaxed);
+        scheduler_mode_publish_total_.fetch_add(1, std::memory_order_relaxed);
+    }
+
 protected:
     // --- Helpers usable by subclass execution / finalize -----------------
     int ensure_device_initialized();
@@ -840,6 +861,9 @@ protected:
     std::unordered_set<int32_t> aicpu_seen_callable_ids_;
     size_t aicpu_dlopen_total_{0};
     size_t host_dlopen_total_{0};
+    // Written on the bind path, read by the caller's thread.
+    std::atomic<uint32_t> last_scheduler_runtime_mode_{0};
+    std::atomic<size_t> scheduler_mode_publish_total_{0};
     // AICPU executor SO: load-once, matching onboard's binaries_loaded_ pattern.
     // The aicpu_executor g_aicpu_executor static lives inside the dlopen'd DSO;
     // reloading it destroys orch_so_handle_ and breaks the orch-SO cache-hit path.

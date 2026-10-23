@@ -343,6 +343,12 @@ void ChipWorker::init(
         get_host_dlopen_count_fn_ = load_symbol<GetAicpuDlopenCountFn>(handle, "get_host_dlopen_count");
         get_run_stream_set_create_count_fn_ =
             load_symbol<GetAicpuDlopenCountFn>(handle, "get_run_stream_set_create_count");
+        // Optional: only the a5 host_build_graph module records a scheduler
+        // selection, so a null here is a fact about the backend.
+        get_last_scheduler_runtime_mode_fn_ =
+            reinterpret_cast<GetLastSchedulerRuntimeModeFn>(dlsym(handle, "get_last_scheduler_runtime_mode"));
+        get_scheduler_mode_publish_count_fn_ =
+            reinterpret_cast<GetAicpuDlopenCountFn>(dlsym(handle, "get_scheduler_mode_publish_count"));
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
         // ACL lifecycle + comm_* + kernel mode are part of the uniform
         // host_runtime.so ABI. Every platform runtime exports all of them —
@@ -740,6 +746,8 @@ void ChipWorker::clear_runtime_binding() {
     get_aicpu_dlopen_count_fn_ = nullptr;
     get_host_dlopen_count_fn_ = nullptr;
     get_run_stream_set_create_count_fn_ = nullptr;
+    get_last_scheduler_runtime_mode_fn_ = nullptr;
+    get_scheduler_mode_publish_count_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
     create_comm_stream_fn_ = nullptr;
@@ -1434,6 +1442,20 @@ size_t ChipWorker::run_stream_set_create_count() const {
         return 0;
     }
     return get_run_stream_set_create_count_fn_(device_ctx_);
+}
+
+uint32_t ChipWorker::last_scheduler_runtime_mode() const {
+    if (!initialized_ || get_last_scheduler_runtime_mode_fn_ == nullptr) {
+        return 0;
+    }
+    return get_last_scheduler_runtime_mode_fn_(device_ctx_);
+}
+
+size_t ChipWorker::scheduler_mode_publish_count() const {
+    if (!initialized_ || get_scheduler_mode_publish_count_fn_ == nullptr) {
+        return 0;
+    }
+    return get_scheduler_mode_publish_count_fn_(device_ctx_);
 }
 
 void *ChipWorker::create_comm_stream_checked(const char *op_name) {

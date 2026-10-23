@@ -69,21 +69,47 @@ struct SchedulerGraphView {
     // reintroduced over a value some earlier producer already put here.
     uint64_t reserved;
     uint64_t task_count;
-    // Kept in the wire view for diagnostics. HBG task ids directly index the
+    // Kept in the wire view for diagnostics. HBG task refs directly index the
     // whole-graph-resident tables and never wrap, so this value must not be
-    // used to mask an id (the configured capacity need not be a power of two).
+    // used to mask a ref (the configured capacity need not be a power of two).
     uint64_t task_window_last_index;
 };
 
+// The three predicates every reader of a task ref goes through. They exist so
+// that the one assumption behind them -- a ref is an index into tables sized by
+// task_count -- is stated in three places rather than at each of the forty-odd
+// sites that would otherwise open-code it. Widening the encoding to carry a
+// parent (which supporting a graph task's sub-tasks needs) changes these and the
+// two `_at` accessors in scheduler_ready.h, not a search for bare subscripts.
+
+// True when `ref` names a task this graph holds. A caller that is about to
+// subscript a table with the ref has to pass this first; the cast is the only
+// place the signed-to-unsigned narrowing lives.
+inline __aicore__ bool scheduler_task_ref_valid(const SchedulerGraphView &graph, int64_t ref) {
+    return ref >= 0 && static_cast<uint64_t>(ref) < graph.task_count;
+}
+
+// True when a fanin edge runs the way the host built it: a producer is submitted
+// before its consumer, so its ref is strictly smaller. Bootstrap's forward scan
+// depends on this, and a graph that violates it would have the scan waiting on a
+// producer that cannot have completed.
+inline __aicore__ bool scheduler_task_ref_precedes(int64_t producer, int64_t consumer) {
+    return producer >= 0 && producer < consumer;
+}
+
+// True when `ref` names no task. Every field that can hold a ref uses the same
+// negative sentinel, so this reads the absence rather than testing a sign.
+inline __aicore__ bool scheduler_task_ref_is_null(int64_t ref) { return ref < 0; }
+
 struct SchedulerTaskInfo {
-    int64_t task_id;
+    int64_t task_ref;
     int32_t kernel_id;
     int32_t subtask_slot;
     CoreType core_type;
 };
 
 struct SchedulerTaskShape {
-    int64_t task_id;
+    int64_t task_ref;
     int32_t kernel_ids[3];
     uint8_t active_mask;
     uint8_t reserved[3];
@@ -109,27 +135,27 @@ scheduler_dispatch_predicate_metadata_valid(uint64_t address, uint8_t element_si
     return operation <= 6 && valid_width && address != 0 && (address & (static_cast<uint64_t>(element_size) - 1)) == 0;
 }
 
-inline __aicore__ __gm__ uint8_t *scheduler_graph_storage(const SchedulerGraphView &graph, int64_t task_id) {
-    uint64_t slot = static_cast<uint64_t>(task_id);
+inline __aicore__ __gm__ uint8_t *scheduler_graph_storage(const SchedulerGraphView &graph, int64_t task_ref) {
+    uint64_t slot = static_cast<uint64_t>(task_ref);
     return reinterpret_cast<__gm__ uint8_t *>(graph.storage_address) + slot * SCHEDULER_GRAPH_TASK_STORAGE_STRIDE;
 }
-inline __aicore__ __gm__ uint8_t *scheduler_graph_descriptor(const SchedulerGraphView &graph, int64_t task_id) {
-    return scheduler_graph_storage(graph, task_id) + SCHEDULER_GRAPH_DESCRIPTOR_OFFSET;
+inline __aicore__ __gm__ uint8_t *scheduler_graph_descriptor(const SchedulerGraphView &graph, int64_t task_ref) {
+    return scheduler_graph_storage(graph, task_ref) + SCHEDULER_GRAPH_DESCRIPTOR_OFFSET;
 }
-inline __aicore__ __gm__ uint8_t *scheduler_graph_payload(const SchedulerGraphView &graph, int64_t task_id) {
-    return scheduler_graph_storage(graph, task_id) + SCHEDULER_GRAPH_PAYLOAD_OFFSET;
+inline __aicore__ __gm__ uint8_t *scheduler_graph_payload(const SchedulerGraphView &graph, int64_t task_ref) {
+    return scheduler_graph_storage(graph, task_ref) + SCHEDULER_GRAPH_PAYLOAD_OFFSET;
 }
 
 inline __aicore__ int32_t
-scheduler_graph_fanin_id(const SchedulerGraphView &graph, int64_t task_id, int32_t fanin_index) {
-    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_id);
+scheduler_graph_fanin_id(const SchedulerGraphView &graph, int64_t task_ref, int32_t fanin_index) {
+    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_ref);
     __gm__ uint8_t *field = payload + TASKPAYLOAD_FANIN_DELTA_OFFSET;
     int32_t delta = *reinterpret_cast<__gm__ int32_t *>(field);
     return reinterpret_cast<__gm__ int32_t *>(field + delta)[fanin_index];
 }
 
 inline __aicore__ SchedulerGraphResult
-scheduler_classify_task_shape(const SchedulerGraphView &graph, int64_t task_id, SchedulerTaskShape *shape) {
+scheduler_classify_task_shape(const SchedulerGraphView &graph, int64_t task_ref, SchedulerTaskShape *shape) {
     if (shape == nullptr) return SchedulerGraphResult::UNSUPPORTED_SHAPE;
     *shape = {
         -1,
@@ -139,14 +165,14 @@ scheduler_classify_task_shape(const SchedulerGraphView &graph, int64_t task_id, 
     };
     if (graph.task_count == 0) return SchedulerGraphResult::EMPTY;
     if (graph.reserved != 0) return SchedulerGraphResult::INVALID_ARGUMENTS;
-    if (graph.storage_address == 0 || task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count) {
+    if (graph.storage_address == 0 || !scheduler_task_ref_valid(graph, task_ref)) {
         return SchedulerGraphResult::INVALID_TASK_COUNT;
     }
 
-    __gm__ uint8_t *descriptor = scheduler_graph_descriptor(graph, task_id);
-    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_id);
-    uint64_t stored_task_id = *reinterpret_cast<__gm__ uint64_t *>(descriptor + SCHEDULER_GRAPH_TASK_ID_OFFSET);
-    if (stored_task_id != static_cast<uint64_t>(task_id)) return SchedulerGraphResult::INVALID_TASK_ID;
+    __gm__ uint8_t *descriptor = scheduler_graph_descriptor(graph, task_ref);
+    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_ref);
+    uint64_t stored_task_ref = *reinterpret_cast<__gm__ uint64_t *>(descriptor + SCHEDULER_GRAPH_TASK_ID_OFFSET);
+    if (stored_task_ref != static_cast<uint64_t>(task_ref)) return SchedulerGraphResult::INVALID_TASK_ID;
 
     int32_t fanin_count = *reinterpret_cast<__gm__ int32_t *>(payload + SCHEDULER_GRAPH_FANIN_COUNT_OFFSET);
     if (fanin_count < 0 || fanin_count > SCHEDULER_GRAPH_MAX_FANIN) {
@@ -157,10 +183,10 @@ scheduler_classify_task_shape(const SchedulerGraphView &graph, int64_t task_id, 
         return SchedulerGraphResult::INVALID_FANIN_ID;
     }
     for (int32_t i = 0; i < fanin_count; ++i) {
-        int32_t producer = scheduler_graph_fanin_id(graph, task_id, i);
-        if (producer < 0 || producer >= task_id) return SchedulerGraphResult::INVALID_FANIN_ID;
+        int32_t producer = scheduler_graph_fanin_id(graph, task_ref, i);
+        if (!scheduler_task_ref_precedes(producer, task_ref)) return SchedulerGraphResult::INVALID_FANIN_ID;
         for (int32_t prior = 0; prior < i; ++prior) {
-            if (scheduler_graph_fanin_id(graph, task_id, prior) == producer) {
+            if (scheduler_graph_fanin_id(graph, task_ref, prior) == producer) {
                 return SchedulerGraphResult::INVALID_FANIN_ID;
             }
         }
@@ -175,7 +201,7 @@ scheduler_classify_task_shape(const SchedulerGraphView &graph, int64_t task_id, 
     }
     if (shape->active_mask == 0) return SchedulerGraphResult::UNSUPPORTED_SHAPE;
 
-    shape->task_id = task_id;
+    shape->task_ref = task_ref;
     return SchedulerGraphResult::OK;
 }
 
@@ -187,14 +213,14 @@ struct SchedulerTaskPayloadArguments {
 };
 
 inline __aicore__ SchedulerGraphResult scheduler_parse_task_payload_arguments(
-    const SchedulerGraphView &graph, int64_t task_id, SchedulerTaskPayloadArguments *arguments
+    const SchedulerGraphView &graph, int64_t task_ref, SchedulerTaskPayloadArguments *arguments
 ) {
     if (arguments == nullptr) return SchedulerGraphResult::INVALID_ARGUMENTS;
     if (graph.reserved != 0) return SchedulerGraphResult::INVALID_ARGUMENTS;
-    if (graph.storage_address == 0 || task_id < 0 || static_cast<uint64_t>(task_id) >= graph.task_count) {
+    if (graph.storage_address == 0 || !scheduler_task_ref_valid(graph, task_ref)) {
         return SchedulerGraphResult::INVALID_TASK_COUNT;
     }
-    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_id);
+    __gm__ uint8_t *payload = scheduler_graph_payload(graph, task_ref);
     int32_t tensor_count = *reinterpret_cast<__gm__ int32_t *>(payload + TASKPAYLOAD_TENSOR_COUNT_OFFSET);
     int32_t scalar_count = *reinterpret_cast<__gm__ int32_t *>(payload + TASKPAYLOAD_SCALAR_COUNT_OFFSET);
     if (tensor_count < 0 || tensor_count > MAX_TENSOR_ARGS || scalar_count < 0 || scalar_count > MAX_SCALAR_ARGS ||
@@ -226,7 +252,7 @@ inline __aicore__ SchedulerGraphResult scheduler_materialize_task_payload_resolv
     }
     SchedulerTaskPayloadArguments parsed{};
     if (shared_arguments == nullptr) {
-        const SchedulerGraphResult status = scheduler_parse_task_payload_arguments(graph, task.task_id, &parsed);
+        const SchedulerGraphResult status = scheduler_parse_task_payload_arguments(graph, task.task_ref, &parsed);
         if (status != SchedulerGraphResult::OK) return status;
         shared_arguments = &parsed;
     }

@@ -3983,6 +3983,22 @@ NB_MODULE(_task_interface, m) {
             "Platforms using the persistent bootstrap pair report 0."
         )
         .def_prop_ro(
+            "scheduler_runtime_mode", &ChipWorker::last_scheduler_runtime_mode,
+            "Which device-side scheduler the most recent bind selected, as a "
+            "SCHEDULER_RUNTIME_MODE_* value: 1 = resident pending, 2 = resident "
+            "ready, 3 = legacy (graph task present), 4 = legacy (unsupported task "
+            "shape). 0 means no selection was ever published -- which is the "
+            "value every runtime other than the a5 host_build_graph one reports, "
+            "because only it selects between schedulers. Latched by the runner: "
+            "the runtime's own copy is cleared when a run releases its bindings."
+        )
+        .def_prop_ro(
+            "scheduler_mode_publish_count", &ChipWorker::scheduler_mode_publish_count,
+            "How many times this worker's binds have published a scheduler "
+            "selection. Tells 'this bind selected again' apart from 'the latch "
+            "still holds an earlier run's value', which the mode alone cannot."
+        )
+        .def_prop_ro(
             "committed_device_memory", &ChipWorker::committed_device_memory,
             "Total device HBM (bytes) currently committed by this worker's "
             "MemoryAllocator (user tensors + pooled arenas + runtime buffers). "

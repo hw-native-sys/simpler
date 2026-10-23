@@ -32,6 +32,31 @@ using scheduler_test::GraphBuffer;
 using scheduler_test::kFixtureCallableCount;
 using scheduler_test::SchedulerStateBuffer;
 
+// Put one task in a queue's inbox at `owner` and mark the directory for it, the
+// state a push from that owner's cluster leaves behind. Cases about where a
+// thief may look use this so they do not also depend on push routing.
+void seed_ready_inbox(
+    FixtureStorage &storage, SchedulerLocalState *local, uint32_t core_type_index, uint64_t owner, int64_t task_ref
+) {
+    auto *control = scheduler_task_control_at(storage.scheduler_state->base(), local, task_ref);
+    control->next_waiter = SCHEDULER_INBOX_EMPTY;
+    scheduler_ready_inbox_at(storage.scheduler_state->base(), local, core_type_index, owner)->endpoints =
+        scheduler_ready_endpoints_pack(task_ref, task_ref);
+    scheduler_ready_directory_set(
+        scheduler_ready_directory_at(storage.scheduler_state->base(), local), core_type_index, owner
+    );
+}
+
+// The AIV queue of a five-cluster run: ten owners, so ranks 0-6 fall in the
+// first directory shard and 7-9 in the second. An AIV rank maps back to the
+// worker that holds it as 3 * (rank / 2) + 1 + rank % 2.
+constexpr uint32_t kAivQueue = 1;
+constexpr uint64_t kAivWorkers = 15;
+
+uint64_t aiv_rank_worker(uint64_t rank) {
+    return 3 * (rank / PLATFORM_AIV_CORES_PER_BLOCKDIM) + 1 + rank % PLATFORM_AIV_CORES_PER_BLOCKDIM;
+}
+
 TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
     AicoreSchedulerLayout disabled{};
     ASSERT_TRUE(scheduler_plan_layout(1, 1, 0, &disabled));
@@ -42,23 +67,22 @@ TEST(SchedulerActivityBuffer, IsAllocatedOnlyWhenRequestedAndNeverWraps) {
     ASSERT_NE(enabled.activity_buffers_offset, 0u);
     EXPECT_EQ(
         enabled.total_size - disabled.total_size,
-        static_cast<uint64_t>(SCHEDULER_CLUSTER_CAPACITY) * sizeof(SchedulerActivityBuffer)
+        static_cast<uint64_t>(SCHEDULER_WORKER_CAPACITY) * sizeof(SchedulerActivityBuffer)
     );
     SchedulerStateBuffer storage(enabled);
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(storage.base(), enabled.worker_contexts_offset);
     auto *buffers = scheduler_state_at<SchedulerActivityBuffer>(storage.base(), enabled.activity_buffers_offset);
     contexts[0].worker_index = SCHEDULER_WORKER_CAPACITY - 1;
     contexts[0].is_scheduler = 1;
-    contexts[0].scheduler_index = SCHEDULER_CLUSTER_CAPACITY - 1;
+    contexts[0].scheduler_index = SCHEDULER_WORKER_CAPACITY - 1;
     SchedulerLocalState local{};
     SchedulerLocalProfilingState profile{};
     local.profiling = &profile;
     local.profiling->activity_buffers_offset = contexts[0].activity_buffers_offset;
     local.config.scheduler_index = contexts[0].scheduler_index;
     local.config.self_lane = 0;
-    local.config.scheduler_lane = 0;
     local.profiling->loop_iter = 17;
-    SchedulerActivityBuffer &buffer = buffers[SCHEDULER_CLUSTER_CAPACITY - 1];
+    SchedulerActivityBuffer &buffer = buffers[SCHEDULER_WORKER_CAPACITY - 1];
     buffer.committed = SCHEDULER_ACTIVITY_CAPACITY - 1;
 
     scheduler_append_idle_activity(storage.base(), &local, 10, 20);
@@ -93,7 +117,7 @@ TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
         graph.executable(0, 0);
         storage.contexts[1].core_type = static_cast<int32_t>(CoreType::AIC);
         SchedulerReadyClaim ready_claim{};
-        ready_claim.task_id = 0;
+        ready_claim.task_ref = 0;
         ready_claim.source = SchedulerReadySource::STOLEN;
         ready_claim.state_probe_start_cycles = 100;
         ready_claim.state_probe_end_cycles = 123;
@@ -106,7 +130,7 @@ TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
         auto *traces =
             scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
         EXPECT_EQ(traces[0].worker_id, level == 0 ? 0u : storage.contexts[1].worker_index);
-        EXPECT_EQ(traces[0].task_id, 0u);
+        EXPECT_EQ(traces[0].task_ref, 0u);
         EXPECT_EQ(
             traces[0].state_probe_scheduler_worker_id,
             level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL ? storage.contexts[1].worker_index : 0u
@@ -168,72 +192,68 @@ TEST(SchedulerBootstrap, RegistersOnlyOnFirstExecutableProducer) {
     EXPECT_EQ(stats.wake_cas_retry_count, 0u);
 }
 
-TEST(SchedulerBootstrap, PublishesExclusiveInboxAndAggregatesDirectory) {
-    FixtureStorage storage(2, 2);
+// Bootstrap publishes through the same type-routed push the steady state uses,
+// so a core must not leave work of another type in its own inbox: an AIC task
+// an AIV lane found during its graph scan belongs to the cluster's AIC.
+TEST(SchedulerBootstrap, PushesAppendedBatchToTheTypeOwnersInbox) {
+    FixtureStorage storage(2, 3);
     GraphBuffer graph(2);
     graph.executable(0, 0);
     graph.executable(1, 0);
-    storage.contexts[0].scheduler_index = 1;
-    storage.contexts[1].scheduler_index = 0;
+    for (uint64_t worker = 0; worker < 3; ++worker)
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
+            storage.contexts[worker].cluster_worker_ids[lane] = lane;
     SchedulerReadyBatch batch{};
     SchedulerReadyStats stats{};
-    ASSERT_TRUE(scheduler_bootstrap_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]), 0, &batch, &stats
-    ));
-    ASSERT_TRUE(scheduler_bootstrap_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]), 1, &batch, &stats
-    ));
-    uint64_t ready_types = 0;
-    ASSERT_TRUE(scheduler_bootstrap_ready_batch_publish(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]), 0, 0, &batch, &stats, &ready_types
-    ));
-    auto *directory =
-        scheduler_ready_directory_at(storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]));
-    directory->bootstrap_ready_types[0] = ready_types;
-    ASSERT_TRUE(scheduler_bootstrap_ready_directory_publish(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]), 2
-    ));
+    auto *publisher = storage.local_context(&storage.contexts[1], &storage.owner_states[1]);
+    ASSERT_EQ(publisher->config.self_lane, 1u);
+    ASSERT_TRUE(scheduler_bootstrap_ready_batch_append(storage.scheduler_state->base(), publisher, 0, &batch, &stats));
+    ASSERT_TRUE(scheduler_bootstrap_ready_batch_append(storage.scheduler_state->base(), publisher, 1, &batch, &stats));
+    ASSERT_TRUE(scheduler_ready_batch_push(storage.scheduler_state->base(), publisher, 0, &batch, &stats));
 
     auto *controls =
         scheduler_state_at<SchedulerTaskControl>(storage.scheduler_state->base(), storage.layout.task_controls_offset);
     EXPECT_EQ(controls[0].next_waiter, 1);
     EXPECT_EQ(controls[1].next_waiter, SCHEDULER_INBOX_EMPTY);
+    const uint64_t owner_endpoints =
+        scheduler_ready_inbox_at(storage.scheduler_state->base(), publisher, 0, 0)->endpoints;
+    EXPECT_EQ(scheduler_ready_endpoints_head(owner_endpoints), 0);
+    EXPECT_EQ(scheduler_ready_endpoints_tail(owner_endpoints), 1);
     EXPECT_EQ(
-        scheduler_ready_inbox_at(storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]), 0, 0)
-            ->head,
-        0
+        scheduler_ready_inbox_at(storage.scheduler_state->base(), publisher, 0, 1)->endpoints,
+        SCHEDULER_READY_ENDPOINTS_EMPTY
     );
+    auto *directory = scheduler_ready_directory_at(storage.scheduler_state->base(), publisher);
     EXPECT_EQ(directory->core_types[0][0].bits, 1u);
     EXPECT_EQ(directory->core_types[1][0].bits, 0u);
     EXPECT_EQ(stats.enqueue_count, 2u);
     EXPECT_EQ(stats.batch_count, 1u);
 }
 
-TEST(SchedulerReadyInbox, RejectsSchedulerCapacityBoundary) {
+TEST(SchedulerReadyInbox, RejectsReadyQueueBoundary) {
     FixtureStorage storage(1, 1);
     SchedulerReadyStats stats{};
     SchedulerReadyBatch batch{};
     ASSERT_TRUE(scheduler_ready_batch_append(
         storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), 0, &batch, &stats
     ));
-    uint64_t ready_types = 0;
 
-    EXPECT_FALSE(scheduler_bootstrap_ready_batch_publish(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), 0, SCHEDULER_CAPACITY, &batch,
-        &stats, &ready_types
-    ));
-    storage.contexts[0].scheduler_index = SCHEDULER_CAPACITY;
-    EXPECT_FALSE(scheduler_refresh_ready_inbox_type(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &storage.owner_states[0]), 0
-    ));
-    EXPECT_FALSE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &storage.owner_states[0]), 0,
-        &batch, &stats
-    ));
-    storage.contexts[0].scheduler_index = 0;
-    EXPECT_FALSE(scheduler_bootstrap_ready_directory_publish(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), SCHEDULER_CAPACITY + 1
-    ));
+    // A queue is addressed by its holders' rank within their own core type, so
+    // what bounds every access is that queue's live owner count -- not a worker
+    // id and not this core's Scheduler identity.
+    auto *local = storage.local_context(&storage.contexts[0], &storage.owner_states[0]);
+    EXPECT_TRUE(scheduler_refresh_ready_inbox_type(storage.scheduler_state->base(), local, 0));
+    local->config.cluster_count = 0;
+    EXPECT_FALSE(scheduler_refresh_ready_inbox_type(storage.scheduler_state->base(), local, 0));
+    EXPECT_FALSE(scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch, &stats));
+
+    local = storage.local_context(&storage.contexts[0], &storage.owner_states[0]);
+    EXPECT_FALSE(
+        scheduler_ready_batch_push(storage.scheduler_state->base(), local, SCHEDULER_READY_QUEUE_COUNT, &batch, &stats)
+    );
+    // An AIC holds the AIC and Mix queues; the AIV queue is not its to refresh.
+    EXPECT_FALSE(scheduler_refresh_ready_inbox_type(storage.scheduler_state->base(), local, 1));
+    EXPECT_TRUE(scheduler_refresh_ready_inbox_type(storage.scheduler_state->base(), local, SCHEDULER_MIX_QUEUE));
 }
 
 TEST(SchedulerReadyInbox, RequiresOwnerStateForPublishAndClaim) {
@@ -280,19 +300,19 @@ TEST(SchedulerReadyInbox, BatchPushAndInboxRefreshPreserveFifoAndDirectory) {
     );
     EXPECT_NE(directory->core_types[0][0].bits & 1, 0u);
     for (uint64_t index = 0; index < kTasks; ++index) {
-        int64_t task = SCHEDULER_TASK_ID_INVALID;
+        int64_t task = SCHEDULER_TASK_REF_INVALID;
         ASSERT_TRUE(scheduler_ready_pop_from_inbox(
             graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
             storage.run_control, 0, 0, &task, &stats
         ));
         EXPECT_EQ(task, static_cast<int64_t>(index));
     }
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 0, &task, &stats
     ));
-    EXPECT_EQ(task, SCHEDULER_TASK_ID_INVALID);
+    EXPECT_EQ(task, SCHEDULER_TASK_REF_INVALID);
     EXPECT_NE(directory->core_types[0][0].bits & 1, 0u);
     ASSERT_TRUE(scheduler_refresh_ready_inbox_type(
         storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0
@@ -306,9 +326,13 @@ TEST(SchedulerReadyInbox, RefreshesOnlyLocallyActiveQueueTypes) {
     GraphBuffer graph(1);
     graph.executable(0, 0);
     SchedulerLocalState scheduler_local_state{};
-    auto *inactive_inbox =
-        scheduler_ready_inbox_at(storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), 1, 0);
-    inactive_inbox->head = -2;
+    auto *inactive_inbox = scheduler_ready_inbox_at(
+        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), SCHEDULER_MIX_QUEUE, 0
+    );
+    // One endpoint naming a task while the other is empty is corruption, which
+    // a refresh of that type must reject rather than schedule against. Worker 0
+    // is its cluster's AIC, so the Mix queue is one it does hold.
+    inactive_inbox->endpoints = scheduler_ready_endpoints_pack(SCHEDULER_INBOX_EMPTY, 0);
 
     EXPECT_TRUE(scheduler_refresh_ready_inbox(
         storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &scheduler_local_state)
@@ -323,9 +347,20 @@ TEST(SchedulerReadyInbox, RefreshesOnlyLocallyActiveQueueTypes) {
         storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &scheduler_local_state), 0, &batch,
         &stats
     ));
+    // A push marks the shared directory for the target, which may be another
+    // core, so it cannot touch the target's local mask. Only the owner's own
+    // refresh mirrors the bit locally.
+    auto *directory = scheduler_ready_directory_at(
+        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &scheduler_local_state)
+    );
+    EXPECT_NE(directory->core_types[0][0].bits & 1, 0u);
+    EXPECT_EQ(scheduler_local_state.owner_ready_queue_mask, UINT32_C(0));
+    ASSERT_TRUE(scheduler_refresh_ready_inbox_type(
+        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &scheduler_local_state), 0
+    ));
     EXPECT_EQ(scheduler_local_state.owner_ready_queue_mask, UINT32_C(1));
 
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 0, &task, &stats
@@ -336,176 +371,41 @@ TEST(SchedulerReadyInbox, RefreshesOnlyLocallyActiveQueueTypes) {
     ));
     EXPECT_EQ(scheduler_local_state.owner_ready_queue_mask, UINT32_C(0));
 
+    // A queue this core cannot hold is skipped rather than refreshed, so
+    // activating the AIV queue on an AIC changes nothing.
     scheduler_owner_queue_activate(&scheduler_local_state, 1);
+    EXPECT_TRUE(scheduler_refresh_ready_inbox(
+        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &scheduler_local_state)
+    ));
+    scheduler_owner_queue_deactivate(&scheduler_local_state, 1);
+
+    scheduler_owner_queue_activate(&scheduler_local_state, SCHEDULER_MIX_QUEUE);
     EXPECT_FALSE(scheduler_refresh_ready_inbox(
         storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &scheduler_local_state)
     ));
 }
 
-TEST(SchedulerReadyInbox, OwnerPromotesPendingBankAfterPublishedBankDrains) {
-    constexpr uint64_t kTasks = 4;
-    FixtureStorage storage(kTasks, 1);
-    GraphBuffer graph(kTasks);
-    for (uint64_t task = 0; task < kTasks; ++task)
-        graph.executable(task, 0);
-    SchedulerLocalState &owner_state = storage.owner_states[0];
-    SchedulerReadyStats stats{};
-    SchedulerReadyBatch published{};
-    SchedulerReadyBatch pending{};
-    for (int64_t task = 0; task < 2; ++task)
-        ASSERT_TRUE(scheduler_ready_batch_append(
-            storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), task, &published, &stats
-        ));
-    for (int64_t task = 2; task < 4; ++task)
-        ASSERT_TRUE(scheduler_ready_batch_append(
-            storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), task, &pending, &stats
-        ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0, &published,
-        &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0, &pending, &stats
-    ));
-    const uint64_t endpoints = owner_state.owner_pending_endpoints[0];
-    EXPECT_EQ(scheduler_ready_pending_head(endpoints), 2);
-    EXPECT_EQ(scheduler_ready_pending_tail(endpoints), 3);
-
-    for (int64_t expected = 0; expected < 2; ++expected) {
-        int64_t task = SCHEDULER_TASK_ID_INVALID;
-        ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-            graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
-            storage.run_control, 0, 0, &task, &stats
-        ));
-        EXPECT_EQ(task, expected);
-    }
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
-        storage.run_control, 0, 0, &task, &stats
-    ));
-    EXPECT_EQ(task, SCHEDULER_TASK_ID_INVALID);
-    ASSERT_TRUE(scheduler_refresh_ready_inbox_type(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0
-    ));
-    for (int64_t expected = 2; expected < 4; ++expected) {
-        ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-            graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
-            storage.run_control, 0, 0, &task, &stats
-        ));
-        EXPECT_EQ(task, expected);
-    }
-}
-
-TEST(SchedulerReadyInbox, OlderPendingBankPrecedesBatchArrivingAfterDrain) {
-    constexpr uint64_t kTasks = 3;
-    FixtureStorage storage(kTasks, 1);
-    GraphBuffer graph(kTasks);
-    for (uint64_t task = 0; task < kTasks; ++task)
-        graph.executable(task, 0);
-    SchedulerLocalState &owner_state = storage.owner_states[0];
-    SchedulerReadyStats stats{};
-    for (int64_t task = 0; task < 2; ++task) {
-        SchedulerReadyBatch batch{};
-        ASSERT_TRUE(scheduler_ready_batch_append(
-            storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), task, &batch, &stats
-        ));
-        ASSERT_TRUE(scheduler_ready_batch_push(
-            storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0, &batch,
-            &stats
-        ));
-    }
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
-        storage.run_control, 0, 0, &task, &stats
-    ));
-    ASSERT_EQ(task, 0);
-
-    SchedulerReadyBatch arriving{};
-    ASSERT_TRUE(scheduler_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), 2, &arriving, &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0, &arriving, &stats
-    ));
-    EXPECT_EQ(scheduler_ready_pending_head(owner_state.owner_pending_endpoints[0]), 2);
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
-        storage.run_control, 0, 0, &task, &stats
-    ));
-    EXPECT_EQ(task, 1);
-    ASSERT_TRUE(scheduler_refresh_ready_inbox_type(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0
-    ));
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
-        storage.run_control, 0, 0, &task, &stats
-    ));
-    EXPECT_EQ(task, 2);
-}
-
-TEST(SchedulerReadyInbox, ThiefCannotObserveOrPromoteOwnerPendingBank) {
-    FixtureStorage storage(2, 2);
-    GraphBuffer graph(2);
-    graph.executable(0, 0);
-    graph.executable(1, 0);
-    SchedulerLocalState &owner_state = storage.owner_states[1];
-    SchedulerReadyStats stats{};
-    for (int64_t task = 0; task < 2; ++task) {
-        SchedulerReadyBatch batch{};
-        ASSERT_TRUE(scheduler_ready_batch_append(
-            storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]), task, &batch, &stats
-        ));
-        ASSERT_TRUE(scheduler_ready_batch_push(
-            storage.scheduler_state->base(), storage.local_context(&storage.contexts[1], &owner_state), 0, &batch,
-            &stats
-        ));
-    }
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
-        storage.run_control, 0, 1, &task, &stats
-    ));
-    ASSERT_EQ(task, 0);
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
-        storage.run_control, 0, 1, &task, &stats
-    ));
-    EXPECT_EQ(task, SCHEDULER_TASK_ID_INVALID);
-    EXPECT_EQ(scheduler_ready_pending_head(owner_state.owner_pending_endpoints[0]), 1);
-    ASSERT_TRUE(scheduler_refresh_ready_inbox_type(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[1], &owner_state), 0
-    ));
-    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
-        graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
-        storage.run_control, 0, 1, &task, &stats
-    ));
-    EXPECT_EQ(task, 1);
-}
-
 TEST(SchedulerReadyInbox, StealsOnlyFromMarkedVictim) {
-    FixtureStorage storage(1, 2);
+    // Two clusters, so the AIC queue has two owners and a steal has somewhere
+    // to come from: within one cluster an AIC task routes to the stealer itself.
+    FixtureStorage storage(1, 6);
     GraphBuffer graph(1);
     graph.executable(0, 0);
     SchedulerReadyBatch batch{};
     SchedulerReadyStats stats{};
-    ASSERT_TRUE(scheduler_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]), 0, &batch, &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[1], &storage.owner_states[1]), 0,
-        &batch, &stats
-    ));
+    auto *publisher = storage.local_context(&storage.contexts[3], &storage.owner_states[3]);
+    ASSERT_EQ(publisher->self_type_rank(), 1u);
+    ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), publisher, 0, &batch, &stats));
+    ASSERT_TRUE(scheduler_ready_batch_push(storage.scheduler_state->base(), publisher, 0, &batch, &stats));
 
     uint64_t cursor = 1;
     SchedulerReadyClaim claim{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&storage.contexts[0], &storage.owner_states[0]), storage.run_control, 2, 0, &cursor,
+        storage.local_context(&storage.contexts[0], &storage.owner_states[0]), storage.run_control, 6, 0, &cursor,
         &stats, &claim
     ));
-    EXPECT_EQ(claim.task_id, 0);
+    EXPECT_EQ(claim.task_ref, 0);
     EXPECT_EQ(claim.inbox_index, 1u);
     EXPECT_EQ(claim.source, SchedulerReadySource::STOLEN);
     EXPECT_EQ(stats.steal_count, 1u);
@@ -522,111 +422,64 @@ TEST(SchedulerReadyInbox, DirectoryShardIgnoresSchedulerTail) {
     EXPECT_EQ(scheduler_load_ready_directory_shard(directory, 9, 0, 7), UINT64_C(1) << 1);
 }
 
-TEST(SchedulerReadyInbox, BootstrapPublishesIndependentDirectoryShards) {
-    FixtureStorage storage(1, 14);
-    auto *directory =
-        scheduler_ready_directory_at(storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]));
-    directory->bootstrap_ready_types[0] = UINT64_C(1) << 0;
-    directory->bootstrap_ready_types[6] = UINT64_C(1) << 0;
-    directory->bootstrap_ready_types[7] = UINT64_C(1) << 1;
-    directory->bootstrap_ready_types[13] = (UINT64_C(1) << 0) | (UINT64_C(1) << 1);
-
-    ASSERT_TRUE(scheduler_bootstrap_ready_directory_publish(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), 14
-    ));
-
-    EXPECT_EQ(directory->core_types[0][0].bits, (UINT64_C(1) << 0) | (UINT64_C(1) << 6));
-    EXPECT_EQ(directory->core_types[1][0].bits, 0u);
-    EXPECT_EQ(directory->core_types[0][1].bits, UINT64_C(1) << 6);
-    EXPECT_EQ(directory->core_types[1][1].bits, (UINT64_C(1) << 0) | (UINT64_C(1) << 6));
-}
-
-TEST(SchedulerReadyInbox, BootstrapPublishesMixDirectoryWhenPresent) {
-    FixtureStorage storage(1, 2);
-    auto *local = storage.local_context(&storage.contexts[0]);
-    local->has_mix = true;
-    auto *directory = scheduler_ready_directory_at(storage.scheduler_state->base(), local);
-    directory->bootstrap_ready_types[1] = UINT64_C(1) << SCHEDULER_MIX_QUEUE;
-    ASSERT_TRUE(scheduler_bootstrap_ready_directory_publish(storage.scheduler_state->base(), local, 2));
-    EXPECT_EQ(directory->core_types[SCHEDULER_MIX_QUEUE][0].bits, UINT64_C(1) << 1);
-    EXPECT_EQ(directory->core_types[0][0].bits, 0u);
-    EXPECT_EQ(directory->core_types[1][0].bits, 0u);
-}
-
 TEST(SchedulerReadyInbox, SparseDirectoryWrapsWithinShard) {
-    FixtureStorage storage(2, 14);
+    FixtureStorage storage(2, kAivWorkers);
     GraphBuffer graph(2);
-    graph.executable(0, 0);
-    graph.executable(1, 0);
+    graph.executable(0, 1);
+    graph.executable(1, 1);
     SchedulerReadyStats stats{};
-    SchedulerReadyBatch high_batch{};
-    SchedulerReadyBatch low_batch{};
-    ASSERT_TRUE(scheduler_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[13], nullptr), 0, &high_batch, &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[13], &storage.owner_states[13]), 0,
-        &high_batch, &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[8], nullptr), 1, &low_batch, &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[8], &storage.owner_states[8]), 0,
-        &low_batch, &stats
-    ));
+    auto *thief = storage.local_context(&storage.contexts[aiv_rank_worker(7)], &storage.owner_states[0]);
+    ASSERT_EQ(thief->self_type_rank(), 7u);
+    seed_ready_inbox(storage, thief, kAivQueue, 9, 0);
+    seed_ready_inbox(storage, thief, kAivQueue, 8, 1);
 
-    uint64_t cursor = 12;
+    uint64_t cursor = 9;
     SchedulerReadyClaim claim{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&storage.contexts[7], &storage.owner_states[7]), storage.run_control, 14, 0, &cursor,
+        graph.graph(), storage.scheduler_state->base(), thief, storage.run_control, kAivWorkers, kAivQueue, &cursor,
         &stats, &claim
     ));
-    EXPECT_EQ(claim.task_id, 0);
-    EXPECT_EQ(claim.inbox_index, 13u);
+    EXPECT_EQ(claim.task_ref, 0);
+    EXPECT_EQ(claim.inbox_index, 9u);
+    // Past the shard's last owner, so the cursor wraps to its first.
     EXPECT_EQ(cursor, 7u);
 
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
-        graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&storage.contexts[7], &storage.owner_states[7]), storage.run_control, 14, 0, &cursor,
+        graph.graph(), storage.scheduler_state->base(), thief, storage.run_control, kAivWorkers, kAivQueue, &cursor,
         &stats, &claim
     ));
-    EXPECT_EQ(claim.task_id, 1);
+    EXPECT_EQ(claim.task_ref, 1);
     EXPECT_EQ(claim.inbox_index, 8u);
     EXPECT_EQ(cursor, 9u);
 }
 
 TEST(SchedulerReadyInbox, DoesNotStealAcrossDirectoryShards) {
-    FixtureStorage storage(1, 14);
+    FixtureStorage storage(1, kAivWorkers);
     GraphBuffer graph(1);
-    graph.executable(0, 0);
-    SchedulerReadyBatch batch{};
+    graph.executable(0, 1);
     SchedulerReadyStats stats{};
-    ASSERT_TRUE(scheduler_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[8], nullptr), 0, &batch, &stats
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[8], &storage.owner_states[8]), 0,
-        &batch, &stats
-    ));
+    auto *owner = storage.local_context(&storage.contexts[aiv_rank_worker(8)], &storage.owner_states[0]);
+    ASSERT_EQ(owner->self_type_rank(), 8u);
+    seed_ready_inbox(storage, owner, kAivQueue, 8, 0);
 
+    // Rank 0 is in the first shard, so the seeded owner is outside its reach.
     uint64_t cursor = 1;
     SchedulerReadyClaim claim{};
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&storage.contexts[0], &storage.owner_states[0]), storage.run_control, 14, 0, &cursor,
-        &stats, &claim
+        storage.local_context(&storage.contexts[aiv_rank_worker(0)], &storage.owner_states[1]), storage.run_control,
+        kAivWorkers, kAivQueue, &cursor, &stats, &claim
     ));
-    EXPECT_EQ(claim.task_id, SCHEDULER_TASK_ID_INVALID);
+    EXPECT_EQ(claim.task_ref, SCHEDULER_TASK_REF_INVALID);
 
+    // Rank 7 shares the second shard with it, so the steal lands.
     cursor = 8;
     ASSERT_TRUE(scheduler_claim_ready_for_slot(
         graph.graph(), storage.scheduler_state->base(),
-        storage.local_context(&storage.contexts[7], &storage.owner_states[7]), storage.run_control, 14, 0, &cursor,
-        &stats, &claim
+        storage.local_context(&storage.contexts[aiv_rank_worker(7)], &storage.owner_states[2]), storage.run_control,
+        kAivWorkers, kAivQueue, &cursor, &stats, &claim
     ));
-    EXPECT_EQ(claim.task_id, 0);
+    EXPECT_EQ(claim.task_ref, 0);
     EXPECT_EQ(claim.inbox_index, 8u);
     EXPECT_EQ(claim.source, SchedulerReadySource::STOLEN);
 }
@@ -639,7 +492,7 @@ TEST(SchedulerDispatch, RejectsKernelIdBeforeCallableTableAccess) {
     storage.metadata[0].kernel_ids[0] = static_cast<uint16_t>(kFixtureCallableCount);
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -658,7 +511,7 @@ TEST(SchedulerDispatch, RejectsInvalidSingleSubtaskShapeBeforeMetadataIndex) {
     storage.metadata[0].active_mask = 0;
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -676,7 +529,7 @@ TEST(SchedulerDispatch, RejectsCoreTypeMismatch) {
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIV);
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -695,7 +548,7 @@ TEST(SchedulerDispatch, RejectsUnknownTargetCoreType) {
     storage.metadata[0].active_mask = 2;
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -714,14 +567,14 @@ TEST(SchedulerDispatch, DispatchSequenceIsIndependentOfSlotGenerationAndRejectsZ
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
         ready_claim, 0, storage.ssbuf_region
     ));
-    EXPECT_EQ(storage.scheduler_local_state.slots[0][0].generation, 1u);
+    EXPECT_EQ(storage.scheduler_local_state.slots[0].generation, 1u);
     uint32_t pending_slot = UINT32_MAX;
     uint64_t publication = 0;
     ASSERT_TRUE(scheduler_local_ready_pop(&storage.scheduler_local_state, &pending_slot, &publication));
@@ -732,7 +585,7 @@ TEST(SchedulerDispatch, DispatchSequenceIsIndependentOfSlotGenerationAndRejectsZ
     storage.run_control->error_claimed = 0;
     storage.run_control->scheduler_error = 0;
     slot_claim.slot_index = 1;
-    ready_claim.task_id = 1;
+    ready_claim.task_ref = 1;
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
@@ -761,7 +614,7 @@ TEST(SchedulerDispatch, RejectsAKernelIdPastThePublishedCallableCount) {
 
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
@@ -773,7 +626,7 @@ TEST(SchedulerDispatch, RejectsAKernelIdPastThePublishedCallableCount) {
     EXPECT_EQ(payload->function_bin_addr, UINT64_C(0x1000)) << "the last id inside the count still dispatches";
 
     slot_claim.slot_index = 1;
-    ready_claim.task_id = 1;
+    ready_claim.task_ref = 1;
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
@@ -793,7 +646,7 @@ TEST(SchedulerDispatch, AcceptsLastCallableAndInlineSentinel) {
     storage.callable_addresses[kFixtureCallableCount - 1] = UINT64_C(0x2000);
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
@@ -807,7 +660,7 @@ TEST(SchedulerDispatch, AcceptsLastCallableAndInlineSentinel) {
     storage.metadata[1].kernel_ids[0] = UINT16_MAX;
     storage.metadata[1].flags |= SCHEDULER_TASK_INLINE;
     slot_claim.slot_index = 1;
-    ready_claim.task_id = 1;
+    ready_claim.task_ref = 1;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
@@ -875,7 +728,7 @@ TEST(SchedulerPredicate, MalformedPredicateStopsDispatchWithoutPublishingSlot) {
     storage.metadata[0].flags |= SCHEDULER_TASK_HAS_PREDICATE;
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -884,7 +737,7 @@ TEST(SchedulerPredicate, MalformedPredicateStopsDispatchWithoutPublishingSlot) {
     ));
     EXPECT_EQ(storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_PREDICATE));
-    EXPECT_NE(storage.scheduler_local_state.slots[0][0].state, SchedulerDispatchSlotState::READY);
+    EXPECT_NE(storage.scheduler_local_state.slots[0].state, SchedulerDispatchSlotState::READY);
 }
 
 TEST(SchedulerPredicate, FailedPredicatePublishesDependencyOnlyDispatch) {
@@ -897,7 +750,7 @@ TEST(SchedulerPredicate, FailedPredicatePublishesDependencyOnlyDispatch) {
     storage.metadata[0].flags |= SCHEDULER_TASK_HAS_PREDICATE;
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
-    ready_claim.task_id = 0;
+    ready_claim.task_ref = 0;
 
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -932,7 +785,7 @@ TEST(SchedulerReadyInbox, ConcurrentConsumersNeverDuplicateTask) {
     std::atomic<bool> failed{false};
     auto consume = [&](uint64_t worker) {
         while (!failed.load(std::memory_order_relaxed) && claimed.load(std::memory_order_relaxed) < kTasks) {
-            int64_t task = SCHEDULER_TASK_ID_INVALID;
+            int64_t task = SCHEDULER_TASK_REF_INVALID;
             if (!scheduler_ready_pop_from_inbox(
                     graph.graph(), storage.scheduler_state->base(),
                     storage.local_context(&storage.contexts[worker], nullptr), storage.run_control, 0, 0, &task, nullptr
@@ -1004,7 +857,7 @@ TEST(SchedulerReadyInbox, OwnerPushRacesThiefWithoutLosingTasks) {
         for (uint64_t spin = 0; spin < kSpinLimit && !failed.load(std::memory_order_relaxed) &&
                                 claimed.load(std::memory_order_relaxed) < kTasks;
              ++spin) {
-            int64_t task = SCHEDULER_TASK_ID_INVALID;
+            int64_t task = SCHEDULER_TASK_REF_INVALID;
             if (!scheduler_ready_pop_from_inbox(
                     graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]),
                     storage.run_control, 0, 0, &task, nullptr
@@ -1028,56 +881,65 @@ TEST(SchedulerReadyInbox, OwnerPushRacesThiefWithoutLosingTasks) {
         EXPECT_EQ(count.load(), 1u);
 }
 
-TEST(SchedulerReadyInbox, PendingPromotionRacesThiefWithoutReplayingTasks) {
+// The inbox head is a Treiber stack any core may push onto, so the directory
+// bit cannot simply follow the owner's view of its own head. That bit is the
+// only thing that tells a consumer -- the owner's own slot fill included -- to
+// look at the inbox at all, so a push landing between the owner's head load and
+// its clear must still leave the bit set once both have run.
+TEST(SchedulerReadyInbox, ConcurrentPushesSurviveOwnerDirectoryClear) {
     constexpr uint64_t kTasks = 2048;
-    constexpr uint64_t kSpinLimit = 10000000;
-    FixtureStorage storage(kTasks, 2);
+    constexpr uint64_t kPusherCount = 2;
+    constexpr uint64_t kWorkers = 3;
+    constexpr uint64_t kSpinLimit = 20000000;
+    FixtureStorage storage(kTasks, kWorkers);
     GraphBuffer graph(kTasks);
     for (uint64_t task = 0; task < kTasks; ++task)
         graph.executable(task, 0);
-    SchedulerLocalState &owner_state = storage.owner_states[0];
-    SchedulerReadyBatch published{};
-    ASSERT_TRUE(scheduler_ready_batch_append(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), 0, &published, nullptr
-    ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0, &published,
-        nullptr
-    ));
-    SchedulerReadyBatch pending{};
-    for (uint64_t task = 1; task < kTasks; ++task)
-        ASSERT_TRUE(scheduler_ready_batch_append(
-            storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]), task, &pending, nullptr
-        ));
-    ASSERT_TRUE(scheduler_ready_batch_push(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0, &pending, nullptr
-    ));
-    ASSERT_NE(scheduler_ready_pending_head(owner_state.owner_pending_endpoints[0]), SCHEDULER_INBOX_EMPTY);
+    for (uint64_t worker = 0; worker < kWorkers; ++worker)
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
+            storage.contexts[worker].cluster_worker_ids[lane] = lane;
 
     std::vector<std::atomic<uint32_t>> seen(kTasks);
     std::atomic<uint64_t> claimed{0};
     std::atomic<bool> failed{false};
+
+    std::vector<std::thread> pushers;
+    pushers.reserve(kPusherCount);
+    for (uint64_t pusher = 0; pusher < kPusherCount; ++pusher) {
+        pushers.emplace_back([&, pusher] {
+            auto *local = storage.local_context(&storage.contexts[1 + pusher], &storage.owner_states[1 + pusher]);
+            for (uint64_t task = pusher; task < kTasks && !failed.load(std::memory_order_relaxed);
+                 task += kPusherCount) {
+                SchedulerReadyBatch batch{};
+                if (!scheduler_ready_batch_append(
+                        storage.scheduler_state->base(), local, static_cast<int64_t>(task), &batch, nullptr
+                    ) ||
+                    !scheduler_ready_batch_push(storage.scheduler_state->base(), local, 0, &batch, nullptr)) {
+                    failed.store(true, std::memory_order_relaxed);
+                    return;
+                }
+                std::this_thread::yield();
+            }
+        });
+    }
     std::thread owner([&] {
+        auto *local = storage.local_context(&storage.contexts[0], &storage.owner_states[0]);
         for (uint64_t spin = 0; spin < kSpinLimit && !failed.load(std::memory_order_relaxed) &&
                                 claimed.load(std::memory_order_relaxed) < kTasks;
              ++spin) {
-            if (!scheduler_refresh_ready_inbox_type(
-                    storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0
-                )) {
+            if (!scheduler_refresh_ready_inbox_type(storage.scheduler_state->base(), local, 0)) {
                 failed.store(true, std::memory_order_relaxed);
                 return;
             }
-            std::this_thread::yield();
-        }
-    });
-    std::thread thief([&] {
-        for (uint64_t spin = 0; spin < kSpinLimit && !failed.load(std::memory_order_relaxed) &&
-                                claimed.load(std::memory_order_relaxed) < kTasks;
-             ++spin) {
-            int64_t task = SCHEDULER_TASK_ID_INVALID;
+            // Gate on the directory exactly as a slot fill does: a bit lost to
+            // the clear hides the inbox from its owner and strands the work.
+            if (!scheduler_ready_directory_nonempty(storage.scheduler_state->base(), local, kWorkers, 0)) {
+                std::this_thread::yield();
+                continue;
+            }
+            int64_t task = SCHEDULER_TASK_REF_INVALID;
             if (!scheduler_ready_pop_from_inbox(
-                    graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[1]),
-                    storage.run_control, 0, 0, &task, nullptr
+                    graph.graph(), storage.scheduler_state->base(), local, storage.run_control, 0, 0, &task, nullptr
                 )) {
                 failed.store(true, std::memory_order_relaxed);
                 return;
@@ -1086,12 +948,11 @@ TEST(SchedulerReadyInbox, PendingPromotionRacesThiefWithoutReplayingTasks) {
                 seen[static_cast<size_t>(task)].fetch_add(1, std::memory_order_relaxed);
                 claimed.fetch_add(1, std::memory_order_relaxed);
             }
-            std::this_thread::yield();
         }
     });
+    for (auto &pusher : pushers)
+        pusher.join();
     owner.join();
-    thief.join();
-    if (claimed.load(std::memory_order_relaxed) != kTasks) failed.store(true, std::memory_order_relaxed);
 
     EXPECT_FALSE(failed.load());
     EXPECT_EQ(claimed.load(), kTasks);
@@ -1146,11 +1007,11 @@ TEST(SchedulerReadyWake, ConcurrentRegistrationAndCloseResolveEveryConsumerExact
     closer.join();
 
     while (!failed.load(std::memory_order_relaxed)) {
-        int64_t task = SCHEDULER_TASK_ID_INVALID;
+        int64_t task = SCHEDULER_TASK_REF_INVALID;
         ASSERT_TRUE(scheduler_ready_pop_from_inbox(
             graph.graph(), storage.scheduler_state->base(), reader, storage.run_control, 0, 0, &task, nullptr
         ));
-        if (task == SCHEDULER_TASK_ID_INVALID) break;
+        if (task == SCHEDULER_TASK_REF_INVALID) break;
         seen[static_cast<size_t>(task)].fetch_add(1, std::memory_order_relaxed);
     }
     EXPECT_FALSE(failed.load());
@@ -1187,7 +1048,7 @@ TEST(SchedulerReadyWake, WakeResolvePublishesConsumerToSchedulerLocalInbox) {
         &completion, 0, true, nullptr, UINT32_MAX
     ));
     EXPECT_EQ(completion.resolve_count, 1u);
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 0, &task, &ready
@@ -1197,6 +1058,9 @@ TEST(SchedulerReadyWake, WakeResolvePublishesConsumerToSchedulerLocalInbox) {
     EXPECT_EQ(wake.wake_migrate_count, 1u);
 }
 
+// A push appends, so work a completion resolves is consumed after work that was
+// already queued: the queue is one FIFO per core and type, with no second bank
+// to promote between the two pops.
 TEST(SchedulerReadyWake, WakeResolveQueuesBehindOlderPublishedWork) {
     FixtureStorage storage(3, 1);
     GraphBuffer graph(3);
@@ -1230,17 +1094,13 @@ TEST(SchedulerReadyWake, WakeResolveQueuesBehindOlderPublishedWork) {
         storage.run_control, 0, &wake, &ready, &completion, 0, true, nullptr, UINT32_MAX
     ));
     EXPECT_EQ(completion.resolve_count, 1u);
-    EXPECT_EQ(scheduler_ready_pending_head(owner_state.owner_pending_endpoints[0]), 1);
 
-    int64_t task = SCHEDULER_TASK_ID_INVALID;
+    int64_t task = SCHEDULER_TASK_REF_INVALID;
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 0, &task, &ready
     ));
-    ASSERT_EQ(task, 2);
-    ASSERT_TRUE(scheduler_refresh_ready_inbox_type(
-        storage.scheduler_state->base(), storage.local_context(&storage.contexts[0], &owner_state), 0
-    ));
+    EXPECT_EQ(task, 2);
     ASSERT_TRUE(scheduler_ready_pop_from_inbox(
         graph.graph(), storage.scheduler_state->base(), storage.local_context(&storage.contexts[0]),
         storage.run_control, 0, 0, &task, &ready

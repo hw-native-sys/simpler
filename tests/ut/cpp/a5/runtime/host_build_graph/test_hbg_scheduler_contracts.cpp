@@ -112,8 +112,8 @@ TEST(SchedulerState, PlansAndInitializesReadyState) {
         EXPECT_EQ(controls[task].wake_list_head, SCHEDULER_WAKE_LIST_OPEN);
     }
     auto *ready = scheduler_state_at<SchedulerReadyInbox>(storage.base(), layout.ready_inboxes_offset);
-    for (uint64_t inbox = 0; inbox < SCHEDULER_CORE_TYPE_COUNT * SCHEDULER_WORKER_CAPACITY; ++inbox)
-        EXPECT_EQ(ready[inbox].head, SCHEDULER_INBOX_EMPTY);
+    for (uint64_t inbox = 0; inbox < SCHEDULER_READY_INBOX_CAPACITY; ++inbox)
+        EXPECT_EQ(ready[inbox].endpoints, SCHEDULER_READY_ENDPOINTS_EMPTY);
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(storage.base(), layout.worker_contexts_offset);
     EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved0, 0u);
     EXPECT_EQ(contexts[0].scheduler_ssbuf_reserved1, 0u);
@@ -141,11 +141,13 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 128u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 1024u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
-    EXPECT_NE(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_waiter) / 64);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, dispatch[1]), 0x20u);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, traces[0]), 0x40u);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, traces[1]), 0x80u);
-    EXPECT_EQ(offsetof(SchedulerSsbufLane, completion), 0xc0u);
+    // Both chain links belong to the atomic line: they are written as single
+    // device words, and nothing publishes that line as a whole, so no producer's
+    // writeback can restore a stale copy of another's link.
+    EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_waiter) / 64);
+    EXPECT_NE(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_fanin_index) / 64);
+    EXPECT_EQ(offsetof(SchedulerSsbufLane, mix_completion), 0x00u);
+    EXPECT_EQ(sizeof(SchedulerSsbufLane), 0x40u);
     EXPECT_EQ(
         offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64, offsetof(SchedulerTaskTrace, complete_loop_iter) / 64
     );
@@ -163,15 +165,15 @@ TEST(SchedulerSsbuf, InitializesDirtyMailboxWithoutTouchingUserStorage) {
     alignas(64) std::array<uint8_t, SCHEDULER_SSBUF_HARDWARE_SIZE> hardware{};
     hardware.fill(0xa5);
     auto *region = scheduler_ssbuf_region(reinterpret_cast<uint64_t>(hardware.data()));
-    scheduler_ssbuf_initialize(region, 1);
+    scheduler_ssbuf_initialize(region);
 
     EXPECT_EQ(reinterpret_cast<uint8_t *>(region) - hardware.data(), SCHEDULER_SSBUF_REGION_OFFSET);
-    EXPECT_TRUE(scheduler_ssbuf_is_initialized(region, 1));
+    EXPECT_TRUE(scheduler_ssbuf_is_initialized(region));
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-            EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].dispatch[slot].publication), 0u);
+        for (uint32_t slot = 0; slot < SCHEDULER_MIX_SLOT_COUNT; ++slot) {
+            EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->mix_dispatch[lane][slot].publication), 0u);
         }
-        EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].completion.publication), 0u);
+        EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].mix_completion.publication), 0u);
     }
     EXPECT_EQ(hardware[SCHEDULER_SSBUF_REGION_OFFSET - 1], 0xa5);
 }
@@ -254,7 +256,7 @@ TEST(SchedulerGraph, NonPowerOfTwoWindowKeepsDirectTaskIdIndexing) {
     EXPECT_EQ(scheduler_graph_payload(graph, 1), reinterpret_cast<uint8_t *>(&storage[1].payload));
     SchedulerTaskShape shape{};
     EXPECT_EQ(scheduler_classify_task_shape(graph, 1, &shape), SchedulerGraphResult::OK);
-    EXPECT_EQ(shape.task_id, 1);
+    EXPECT_EQ(shape.task_ref, 1);
 }
 
 TEST(SchedulerGraph, ValidatesNonEmptyFanins) {
