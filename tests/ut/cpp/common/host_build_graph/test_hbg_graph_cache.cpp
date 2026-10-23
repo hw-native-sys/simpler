@@ -99,7 +99,7 @@ std::vector<std::byte> make_test_definition(
     for (SubTaskDefinition &task : tasks) {
         std::fill(std::begin(task.kernel_id), std::end(task.kernel_id), INVALID_KERNEL_ID);
         task.kernel_id[0] = 42;
-        task.active_mask = 1;
+        task.active_mask = LaneMask::aic();
         task.logical_block_num = 1;
         task.total_required_subtasks = 1;
         task.tensor_count = 1;
@@ -132,7 +132,7 @@ std::vector<std::byte> make_test_definition(
         // require and no kernel on any slot — bind_graph_topology pairs each
         // mask bit with its slot's kernel id. active_mask is what
         // ChipTaskSlotState::task_kind is read from.
-        tasks[0].active_mask = 0;
+        tasks[0].active_mask = LaneMask::none();
         tasks[0].total_required_subtasks = 0;
         std::fill(std::begin(tasks[0].kernel_id), std::end(tasks[0].kernel_id), INVALID_KERNEL_ID);
     }
@@ -154,7 +154,7 @@ std::vector<std::byte> make_test_definition(
         // Cleared kernel ids keep the mask/kernel pairing check from rejecting
         // this image first, so only the flag conjunction can.
         tasks[1].ed_flags |= ED_FLAG_CANDIDATE;
-        tasks[1].active_mask = 0;
+        tasks[1].active_mask = LaneMask::none();
         tasks[1].total_required_subtasks = 0;
         std::fill(std::begin(tasks[1].kernel_id), std::end(tasks[1].kernel_id), INVALID_KERNEL_ID);
     }
@@ -919,7 +919,7 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
     // Poison every field the rebuild is responsible for restoring. A replay that
     // preserved any of them would leave the poison observable.
     storage.task.kernel_id[0] = 314;
-    storage.slot.active_mask = ActiveMask(3);
+    storage.slot.active_mask = LaneMask::from_bits(3);
     storage.payload.scalar_data()[0] = 2718;
     execution->task_at(1).payload.scalar_data()[0] = 31415;
     storage.payload.tensor_data()[0].version = 1618;
@@ -936,7 +936,7 @@ TEST(GraphExecutionReplay, ResubmissionRebuildsFromDefinition) {
         graph_execution_materialize_slice(outer_slot, *execution, heap.image(), 2), GraphMaterializeResult::MATERIALIZED
     );
     EXPECT_EQ(storage.task.kernel_id[0], 42);
-    EXPECT_EQ(storage.slot.active_mask.raw(), 1);
+    EXPECT_EQ(storage.slot.active_mask.bits(), 1);
     EXPECT_EQ(storage.payload.scalar_data()[0], 99U);
     EXPECT_EQ(execution->task_at(1).payload.scalar_data()[0], 18U);
     EXPECT_EQ(storage.payload.tensor_data()[0].version, 0);
@@ -1312,6 +1312,21 @@ TEST(GraphDefinitionObject, RejectsNegativeSubTaskArgOffset) {
     auto *header = reinterpret_cast<GraphDefinition *>(definition.data());
     auto *tasks = reinterpret_cast<SubTaskDefinition *>(definition.data() + header->off_sub_tasks);
     tasks[1].tensor_offset = -1;
+    const TestDefinitionObject definition_object(definition);
+    OuterHeap heap(definition);
+    EXPECT_EQ(heap.initialize_execution(definition_object, reinterpret_cast<uint64_t>(boundary.data()), 17), nullptr);
+}
+
+TEST(GraphDefinitionObject, RejectsHighLaneBitsInWireImage) {
+    constexpr uint64_t GRAPH_KEY_VALUE = 0x4567;
+    std::array<uint8_t, 64> boundary{};
+    std::vector<std::byte> definition =
+        make_test_definition(GRAPH_KEY_VALUE, reinterpret_cast<uint64_t>(boundary.data()));
+    auto *header = reinterpret_cast<GraphDefinition *>(definition.data());
+    auto *tasks = reinterpret_cast<SubTaskDefinition *>(definition.data() + header->off_sub_tasks);
+    const uint8_t invalid_lanes = 0x80;
+    // A serialized image can carry bytes that no LaneMask constructor produces.
+    std::memcpy(&tasks[0].active_mask, &invalid_lanes, sizeof(invalid_lanes));
     const TestDefinitionObject definition_object(definition);
     OuterHeap heap(definition);
     EXPECT_EQ(heap.initialize_execution(definition_object, reinterpret_cast<uint64_t>(boundary.data()), 17), nullptr);

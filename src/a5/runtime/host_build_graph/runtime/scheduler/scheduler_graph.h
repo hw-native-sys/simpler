@@ -11,6 +11,8 @@
 
 #pragma once
 
+#include "common/lane_mask.h"
+
 #include <stddef.h>
 #include <stdint.h>
 
@@ -85,7 +87,7 @@ struct SchedulerTaskInfo {
 struct SchedulerTaskShape {
     int64_t task_id;
     int32_t kernel_ids[3];
-    uint8_t active_mask;
+    LaneMask active_mask;
     uint8_t reserved[3];
 };
 
@@ -100,6 +102,8 @@ static_assert(sizeof(SchedulerGraphView) == 32, "read-only graph view layout cha
 static_assert(offsetof(SchedulerGraphView, storage_address) == 0, "storage address offset changed");
 static_assert(sizeof(SchedulerTaskInfo) == 24, "root classification result layout changed");
 static_assert(sizeof(SchedulerTaskShape) == 24, "task shape result layout changed");
+static_assert(offsetof(SchedulerTaskShape, active_mask) == 20);
+static_assert(std::is_trivially_copyable_v<SchedulerTaskShape> && std::is_standard_layout_v<SchedulerTaskShape>);
 static_assert(sizeof(SchedulerDispatchPredicate) == 24, "dispatch predicate layout changed");
 
 inline __aicore__ bool
@@ -134,7 +138,7 @@ scheduler_classify_task_shape(const SchedulerGraphView &graph, int64_t task_id, 
     *shape = {
         -1,
         {SCHEDULER_GRAPH_INVALID_KERNEL_ID, SCHEDULER_GRAPH_INVALID_KERNEL_ID, SCHEDULER_GRAPH_INVALID_KERNEL_ID},
-        0,
+        LaneMask::none(),
         {0, 0, 0}
     };
     if (graph.task_count == 0) return SchedulerGraphResult::EMPTY;
@@ -171,9 +175,9 @@ scheduler_classify_task_shape(const SchedulerGraphView &graph, int64_t task_id, 
         if (kernel_ids[slot] == SCHEDULER_GRAPH_INVALID_KERNEL_ID) continue;
         if (kernel_ids[slot] < 0) return SchedulerGraphResult::UNSUPPORTED_SHAPE;
         shape->kernel_ids[slot] = kernel_ids[slot];
-        shape->active_mask |= static_cast<uint8_t>(1U << slot);
+        shape->active_mask |= LaneMask::of(static_cast<SubtaskSlot>(slot));
     }
-    if (shape->active_mask == 0) return SchedulerGraphResult::UNSUPPORTED_SHAPE;
+    if (shape->active_mask.is_empty()) return SchedulerGraphResult::UNSUPPORTED_SHAPE;
 
     shape->task_id = task_id;
     return SchedulerGraphResult::OK;

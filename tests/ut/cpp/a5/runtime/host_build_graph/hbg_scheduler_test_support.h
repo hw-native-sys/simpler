@@ -76,10 +76,11 @@ public:
         std::copy(fanins.begin(), fanins.end(), storage_[task].payload.fanin_data());
     }
 
-    void mixed(size_t task, uint8_t active_mask) {
+    void mixed(size_t task, LaneMask active_mask) {
         ASSERT_LT(task, task_count_);
         for (uint8_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
-            if ((active_mask & (1U << subtask_slot)) != 0) storage_[task].task.kernel_id[subtask_slot] = 1;
+            if (active_mask.has(static_cast<SubtaskSlot>(subtask_slot)))
+                storage_[task].task.kernel_id[subtask_slot] = 1;
         }
         storage_[task].payload.fanin_count = 0;
     }
@@ -173,7 +174,7 @@ struct FixtureStorage {
             metadata[task].kernel_ids[0] = 1;
             metadata[task].kernel_ids[1] = UINT16_MAX;
             metadata[task].kernel_ids[2] = UINT16_MAX;
-            metadata[task].active_mask = 1;
+            metadata[task].active_mask = LaneMask::aic();
             metadata[task].trace_index_base = task;
             metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
         }

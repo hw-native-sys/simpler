@@ -137,7 +137,7 @@ struct MinimalSchedulerState {
         ctx->graph_storage_address = reinterpret_cast<uint64_t>(storage.data());
         // One executable task with subtask slot 0 active.
         metadata()[0].flags = SCHEDULER_TASK_EXECUTABLE;
-        metadata()[0].active_mask = 1;
+        metadata()[0].active_mask = LaneMask::aic();
         metadata()[0].trace_index_base = 0;
         metadata()[0].kernel_ids[0] = 5;
         runtime->publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_RESIDENT_READY, reinterpret_cast<uint64_t>(ctx));

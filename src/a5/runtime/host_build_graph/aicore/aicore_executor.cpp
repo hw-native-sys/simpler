@@ -200,7 +200,7 @@ __aicore__ bool bootstrap_ready_graph(
                         SchedulerRouteResult::READY_TO_ENQUEUE;
         if (route == SchedulerRouteResult::ERROR) return false;
         if (route == SchedulerRouteResult::READY_TO_ENQUEUE) {
-            const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, metadata->active_mask);
+            const uint32_t core_type = scheduler_task_ready_queue(metadata->flags, scheduler_task_lanes(*metadata));
             if (!scheduler_bootstrap_ready_batch_append(
                     scheduler_state_base, scheduler, static_cast<int64_t>(task_id), &batches[core_type],
                     phase_timing_enabled ? &stats->ready : nullptr, profiling_level

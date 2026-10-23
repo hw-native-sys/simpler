@@ -20,28 +20,9 @@
 
 #include <stdint.h>
 
+#include "common/lane_mask.h"
+
 inline constexpr int32_t INVALID_KERNEL_ID = -1;
-
-/**
- * Subtask slot count: AIC, AIV0, AIV1
- */
-inline constexpr int32_t SUBTASK_SLOT_COUNT = 3;
-
-/**
- * Subtask slot indices
- */
-enum class SubtaskSlot : uint8_t {
-    AIC = 0,
-    AIV0 = 1,
-    AIV1 = 2,
-};
-
-/**
- * Subtask mask bits (for ActiveMask)
- */
-inline constexpr uint8_t SUBTASK_MASK_AIC = (1u << 0);   // 0x1
-inline constexpr uint8_t SUBTASK_MASK_AIV0 = (1u << 1);  // 0x2
-inline constexpr uint8_t SUBTASK_MASK_AIV1 = (1u << 2);  // 0x4
 
 // Dispatch-predicate comparison operator. The scheduler evaluates the predicate
 // at the dispatch point — the task is ready (fanin satisfied), so the predicate
@@ -91,85 +72,6 @@ struct DispatchPredicate {
         }
     }
 };
-
-/**
- * Resource shape — classifies a MixedKernels into one of 3 scheduling buckets.
- *
- * Multi-subtask tasks (2+ active slots) are all scheduled as MIX. Dispatch
- * chooses one cluster, then uses active_mask to decide which cores in that
- * cluster must be placed together: all used cores idle -> running placement;
- * all used cores already running with free pending slots -> pending placement;
- * mixed used-core state is rejected and retried later.
- *
- * DUMMY is a synthetic shape for dep-only tasks (no AICore dispatch). Tasks
- * with an empty core_mask route to a dedicated DUMMY ready queue and are
- * completed inline by the scheduler dispatch loop, bypassing core allocation.
- */
-enum class ResourceShape : uint8_t {
-    AIC = 0,    // Single AIC
-    AIV = 1,    // Single AIV
-    MIX = 2,    // Full cluster (dispatch uses active_mask)
-    DUMMY = 3,  // Dependency-only (no AICore dispatch)
-};
-
-// Number of *dispatchable* resource shapes (AIC, AIV, MIX). DUMMY does not
-// allocate a per-shape ready_queue entry / local buffer — it lives in a
-// dedicated queue inside SchedulerState.
-inline constexpr int32_t NUM_RESOURCE_SHAPES = 3;
-
-/**
- * Bitmask of active subtask slots (AIC/AIV0/AIV1), sizeof == 1.
- *
- * Pure subtask-slot mask: only the low 3 bits (core_mask) are meaningful, so it
- * can be OR/==-combined when building MIX clusters without dragging unrelated
- * flag bits along. Per-task scheduling flags live on TaskAttrs instead.
- */
-class ActiveMask {
-public:
-    constexpr ActiveMask() = default;
-    constexpr explicit ActiveMask(uint8_t raw) :
-        raw_(raw) {}
-
-    uint8_t raw() const { return raw_; }
-
-    bool subtask_active(SubtaskSlot slot) const { return (raw_ & (1u << static_cast<uint8_t>(slot))) != 0; }
-
-    uint8_t core_mask() const { return raw_ & 0x07u; }
-
-    // No subtask slot is active, so nothing dispatches to a core. Sole definition
-    // of "dummy": both ResourceShape::DUMMY below and TaskKind::DUMMY derive from
-    // it, so the two cannot disagree.
-    bool is_dummy() const { return core_mask() == 0; }
-
-    ResourceShape to_shape() const {
-        if (is_dummy()) return ResourceShape::DUMMY;
-        uint8_t cmask = core_mask();
-        int bit_count = __builtin_popcount(cmask);
-        if (bit_count >= 2) return ResourceShape::MIX;
-        if (cmask & SUBTASK_MASK_AIC) return ResourceShape::AIC;
-        return ResourceShape::AIV;
-    }
-
-    bool operator==(ActiveMask other) const { return raw_ == other.raw_; }
-    bool operator!=(ActiveMask other) const { return raw_ != other.raw_; }
-
-    ActiveMask operator|(ActiveMask other) const { return ActiveMask(raw_ | other.raw_); }
-    ActiveMask &operator|=(ActiveMask other) {
-        raw_ |= other.raw_;
-        return *this;
-    }
-
-    ActiveMask operator&(uint8_t mask) const { return ActiveMask(raw_ & mask); }
-
-    bool has_mask(uint8_t mask) const { return (raw_ & mask) != 0; }
-
-    explicit operator bool() const { return raw_ != 0; }
-
-private:
-    uint8_t raw_{0};
-};
-
-static_assert(sizeof(ActiveMask) == 1, "ActiveMask must be exactly 1 byte");
 
 /**
  * Per-task scheduling attributes, packed into one byte on ChipTaskSlotState.
@@ -247,12 +149,12 @@ struct MixedKernels {
     int32_t aiv0_kernel_id{INVALID_KERNEL_ID};
     int32_t aiv1_kernel_id{INVALID_KERNEL_ID};
 
-    ActiveMask to_active_mask() const {
-        uint8_t mask = 0;
-        if (aic_kernel_id != INVALID_KERNEL_ID) mask |= SUBTASK_MASK_AIC;
-        if (aiv0_kernel_id != INVALID_KERNEL_ID) mask |= SUBTASK_MASK_AIV0;
-        if (aiv1_kernel_id != INVALID_KERNEL_ID) mask |= SUBTASK_MASK_AIV1;
-        return ActiveMask(mask);
+    LaneMask to_lanes() const {
+        LaneMask lanes;
+        if (aic_kernel_id != INVALID_KERNEL_ID) lanes |= LaneMask::aic();
+        if (aiv0_kernel_id != INVALID_KERNEL_ID) lanes |= LaneMask::aiv0();
+        if (aiv1_kernel_id != INVALID_KERNEL_ID) lanes |= LaneMask::aiv1();
+        return lanes;
     }
 };
 

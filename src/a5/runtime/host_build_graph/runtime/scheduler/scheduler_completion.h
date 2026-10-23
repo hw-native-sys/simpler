@@ -95,9 +95,10 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         if (local_slot->mix_tracker >= SCHEDULER_MIX_TRACKER_COUNT) valid_subtask = false;
         else {
             mix_tracker = &scheduler->mix_trackers[local_slot->mix_tracker];
-            const uint8_t bit = valid_subtask ? 1U << local_slot->subtask_slot : 0;
-            valid_subtask = valid_subtask && mix_tracker->task_id == task_id && (mix_tracker->active_mask & bit) != 0 &&
-                            (mix_tracker->completed_mask & bit) == 0;
+            const LaneMask bit =
+                valid_subtask ? LaneMask::of(static_cast<SubtaskSlot>(local_slot->subtask_slot)) : LaneMask::none();
+            valid_subtask = valid_subtask && mix_tracker->task_id == task_id &&
+                            mix_tracker->active_mask.intersects(bit) && !mix_tracker->completed_mask.intersects(bit);
         }
     }
     if (!valid_subtask) {
@@ -179,7 +180,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     bool refilled = false;
     bool task_complete = true;
     if (mix_tracker != nullptr) {
-        mix_tracker->completed_mask |= 1U << completed_subtask_slot;
+        mix_tracker->completed_mask |= LaneMask::of(static_cast<SubtaskSlot>(completed_subtask_slot));
         task_complete = mix_tracker->completed_mask == mix_tracker->active_mask;
         if (task_complete) mix_tracker->task_id = SCHEDULER_TASK_ID_INVALID;
     }

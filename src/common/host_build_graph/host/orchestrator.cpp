@@ -317,14 +317,14 @@ void calculate_output_layout(const CoreTaskArgs &args, OutputLayout &layout) {
 }  // namespace simpler::hbg
 
 static bool prepare_task(
-    OrchestratorState *orch, const CoreTaskArgs &args, uint64_t total_output_size, ActiveMask active_mask,
+    OrchestratorState *orch, const CoreTaskArgs &args, uint64_t total_output_size, LaneMask active_mask,
     TaskAttrs task_attrs, PreparedTask *out
 ) {
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
     auto &allocator = orch->task_allocator;
 
     int16_t block_num = args.launch_spec.block_num();
-    int32_t active_subtasks_per_block = __builtin_popcount(active_mask.core_mask());
+    int32_t active_subtasks_per_block = active_mask.count();
     int32_t total_required_subtasks = static_cast<int32_t>(block_num) * active_subtasks_per_block;
     if (block_num <= 0 || total_required_subtasks > std::numeric_limits<int16_t>::max()) {
         orch->report_fatal(
@@ -388,7 +388,7 @@ static bool prepare_task(
     out->slot_state->logical_block_num = block_num;
     out->slot_state->active_mask = active_mask;
     out->slot_state->task_attrs = task_attrs;
-    out->slot_state->task_kind = active_mask.is_dummy() ? TaskKind::DUMMY : TaskKind::KERNEL;
+    out->slot_state->task_kind = active_mask.is_empty() ? TaskKind::DUMMY : TaskKind::KERNEL;
     orch->ready_queue_populations.add_task(active_mask, task_attrs, out->slot_state->task_kind);
     // payload.fanin_count is left untouched here: submit_task_common zeroes it before
     // its fanin appends, which accumulate into it in place.
@@ -580,7 +580,7 @@ resolve_dispatch_predicate(OrchestratorState *orch, const CoreTaskPredicate &pre
 // computation (explicit_deps + auto), output registration, slot init, and
 // Orch-side wiring/ready publication.
 static TaskOutputTensors submit_task_common(
-    OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
+    OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
     ORCH_STEP_START();
@@ -797,8 +797,8 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
         return TaskOutputTensors{};
     }
     // === Validate submit inputs ===
-    ActiveMask active_mask = mixed_kernels.to_active_mask();
-    if (!static_cast<bool>(active_mask)) {
+    LaneMask active_mask = mixed_kernels.to_lanes();
+    if (active_mask.is_empty()) {
         report_fatal(
             SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__,
             "MixedKernels names no active slot; set at least one of aic/aiv0/aiv1 kernel_id"
@@ -814,13 +814,13 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
     // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
     // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
     MixedKernels normalized = mixed_kernels;
-    bool has_aic = active_mask.has_mask(SUBTASK_MASK_AIC);
-    bool has_aiv0 = active_mask.has_mask(SUBTASK_MASK_AIV0);
-    bool has_aiv1 = active_mask.has_mask(SUBTASK_MASK_AIV1);
+    bool has_aic = active_mask.has_aic();
+    bool has_aiv0 = active_mask.has_aiv0();
+    bool has_aiv1 = active_mask.has_aiv1();
     if (!has_aic && has_aiv1 && !has_aiv0) {
         normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
         normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
-        active_mask = normalized.to_active_mask();
+        active_mask = normalized.to_lanes();
     }
 
     TaskAttrs task_attrs;
@@ -898,12 +898,12 @@ TaskOutputTensors OrchestratorState::submit_dummy_task(const CoreTaskArgs &args)
 
     if (active_graph_recording(orch) != nullptr) {
         return graph_record_submit_sub_task(
-            orch, args, ActiveMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
+            orch, args, LaneMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
         );
     }
 
     return submit_task_common(
-        orch, args, ActiveMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
+        orch, args, LaneMask{}, task_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
     );
 }
 
@@ -960,7 +960,7 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
         TaskAttrs alloc_attrs;
         alloc_attrs.set_early_resolve(true);
         return graph_record_submit_sub_task(
-            orch, args, ActiveMask{}, alloc_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
+            orch, args, LaneMask{}, alloc_attrs, INVALID_KERNEL_ID, INVALID_KERNEL_ID, INVALID_KERNEL_ID
         );
     }
 
@@ -969,7 +969,7 @@ TaskOutputTensors OrchestratorState::alloc_tensors(const CoreTaskArgs &args) {
     PreparedTask prepared;
     // Kernel-less alloc task: no active subtasks, no dispatch-time attributes. The
     // early-dispatch hint is force-set below (see the flag-the-creator note).
-    if (!prepare_task(orch, args, layout.total_output_size, ActiveMask{}, TaskAttrs{}, &prepared)) {
+    if (!prepare_task(orch, args, layout.total_output_size, LaneMask{}, TaskAttrs{}, &prepared)) {
         return TaskOutputTensors{};
     }
 

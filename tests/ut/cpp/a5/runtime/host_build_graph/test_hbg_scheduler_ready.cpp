@@ -131,10 +131,10 @@ TEST(SchedulerBootstrap, RegistersOnlyOnFirstExecutableProducer) {
     graph.executable(0, 0);
     graph.executable(1, 1, {0});
     graph.executable(3, 1, {2, 1});
-    storage.metadata[1].active_mask = 2;
+    storage.metadata[1].active_mask = LaneMask::aiv0();
     storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     storage.metadata[2].flags = 0;
-    storage.metadata[3].active_mask = 2;
+    storage.metadata[3].active_mask = LaneMask::aiv0();
     storage.metadata[3].flags |= SCHEDULER_TASK_HAS_FANIN;
     auto *controls =
         scheduler_state_at<SchedulerTaskControl>(storage.scheduler_state->base(), storage.layout.task_controls_offset);
@@ -655,7 +655,7 @@ TEST(SchedulerDispatch, RejectsInvalidSingleSubtaskShapeBeforeMetadataIndex) {
     GraphBuffer graph(1);
     graph.executable(0, 0);
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
-    storage.metadata[0].active_mask = 0;
+    storage.metadata[0].active_mask = LaneMask::none();
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_id = 0;
@@ -692,7 +692,7 @@ TEST(SchedulerDispatch, RejectsUnknownTargetCoreType) {
     graph.executable(0, 1);
     storage.contexts[0].core_type = 2;
     storage.metadata[0].kernel_ids[1] = 1;
-    storage.metadata[0].active_mask = 2;
+    storage.metadata[0].active_mask = LaneMask::aiv0();
     SchedulerFreeSlotClaim slot_claim{0, 0, 0, 0};
     SchedulerReadyClaim ready_claim{};
     ready_claim.task_id = 0;
@@ -1253,7 +1253,7 @@ TEST(SchedulerReadyWake, RejectsInvalidWaiterShapeBeforeReadyBatchIndex) {
     GraphBuffer graph(2);
     graph.executable(0, 0);
     graph.executable(1, 0, {0});
-    storage.metadata[1].active_mask = 0;
+    storage.metadata[1].active_mask = LaneMask::none();
     storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_EQ(
         scheduler_route_task(

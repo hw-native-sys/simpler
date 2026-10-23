@@ -59,6 +59,8 @@ endmacro()
 platform_single_case(test_kernel_execution_state.cpp
     SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_execution_state.cpp)
 
+platform_single_case(test_lane_mask.cpp)
+
 # The growth coordinator is production: the onboard host runtime links this
 # same translation unit, so the trim, the retry policy and the holder discovery
 # under test are the ones the device runner calls rather than a copy of them.

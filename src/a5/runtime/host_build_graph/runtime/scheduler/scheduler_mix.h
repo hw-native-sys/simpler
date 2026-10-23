@@ -33,8 +33,8 @@ inline __aicore__ bool scheduler_dispatch_mix_ready(
     }
     auto &tracker = local->mix_trackers[placement.tracker];
     tracker.task_id = ready.task_id;
-    tracker.active_mask = metadata.active_mask;
-    tracker.completed_mask = 0;
+    tracker.active_mask = scheduler_task_lanes(metadata);
+    tracker.completed_mask = LaneMask::none();
     for (uint8_t i = 0; i < placement.count; ++i) {
         const auto &claim = placement.slots[i];
         auto &slot = local->slots[claim.cluster_lane][claim.slot_index];
@@ -150,7 +150,7 @@ inline __aicore__ bool scheduler_publish_refill_candidates(
                 if (worker >= local->config.runtime_worker_count || target_lane == local->config.self_lane) continue;
                 const auto *target = scheduler_worker_context_at(base, local, worker);
                 if (scheduler_core_type_index(target->core_type) !=
-                    scheduler_task_ready_queue(metadata.flags, metadata.active_mask))
+                    scheduler_task_ready_queue(metadata.flags, scheduler_task_lanes(metadata)))
                     continue;
                 for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
                     const auto &state = local->slots[target_lane][slot];
@@ -180,8 +180,8 @@ inline __aicore__ bool scheduler_publish_refill_candidates(
                 }
             } else {
                 if (!scheduler_ready_batch_append(
-                        base, local, task, &batches[scheduler_task_ready_queue(metadata.flags, metadata.active_mask)],
-                        stats, 0
+                        base, local, task,
+                        &batches[scheduler_task_ready_queue(metadata.flags, scheduler_task_lanes(metadata))], stats, 0
                     ))
                     return false;
             }

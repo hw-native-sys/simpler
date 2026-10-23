@@ -84,7 +84,7 @@ protected:
         slot.fanout_lock.store(0);
         slot.fanout_head = nullptr;
         slot.ring_id = ring_id;
-        slot.active_mask = ActiveMask(SUBTASK_MASK_AIC);
+        slot.active_mask = LaneMask::aic();
         slot.completed_subtasks.store(0);
         slot.total_required_subtasks = 1;
         slot.logical_block_num = 1;
@@ -316,7 +316,7 @@ TEST_F(WiringTest, SyncStartStagingFinalizeRetriesProducerFirstRendezvous) {
     init_slot(sync_consumer, CHIP_TASK_PENDING, 1, 1);
     init_slot(downstream, CHIP_TASK_PENDING, 1, 1);
 
-    sync_consumer.active_mask = ActiveMask(SUBTASK_MASK_AIV0);
+    sync_consumer.active_mask = LaneMask::aiv0();
     sync_consumer.task_attrs.set_sync_start();
     sync_consumer.task_attrs.set_early_resolve(true);
     sync_consumer.logical_block_num = 2;
@@ -351,7 +351,7 @@ TEST_F(WiringTest, SyncStartProducerReleaseCompletesStagerFirstRendezvous) {
     init_slot(sync_consumer, CHIP_TASK_PENDING, 1, 1);
     init_slot(downstream, CHIP_TASK_PENDING, 1, 1);
 
-    sync_consumer.active_mask = ActiveMask(SUBTASK_MASK_AIV0);
+    sync_consumer.active_mask = LaneMask::aiv0();
     sync_consumer.task_attrs.set_sync_start();
     sync_consumer.task_attrs.set_early_resolve(true);
     sync_consumer.logical_block_num = 2;
@@ -380,7 +380,7 @@ TEST_F(WiringTest, SyncStartProducerReleaseCompletesStagerFirstRendezvous) {
 TEST_F(WiringTest, EarlySyncFinishBetweenReleasePhasesRetainsOwnerCompleteState) {
     alignas(64) ChipTaskSlotState sync_consumer;
     init_slot(sync_consumer, CHIP_TASK_PENDING, 1, 1);
-    sync_consumer.active_mask = ActiveMask(SUBTASK_MASK_AIV0);
+    sync_consumer.active_mask = LaneMask::aiv0();
     sync_consumer.task_attrs.set_sync_start();
     sync_consumer.logical_block_num = 2;
     sync_consumer.payload->early_dispatch_state.store(EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
@@ -418,12 +418,12 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
     // Consumer1: needs 1 more fanin to become ready
     init_slot(consumer1, CHIP_TASK_PENDING, 2, 1);
     consumer1.fanin_refcount.store(1);  // 1 of 2 satisfied
-    consumer1.active_mask = ActiveMask(SUBTASK_MASK_AIC);
+    consumer1.active_mask = LaneMask::aic();
 
     // Consumer2: this release will make it ready
     init_slot(consumer2, CHIP_TASK_PENDING, 2, 1);
     consumer2.fanin_refcount.store(1);  // 1 of 2 satisfied
-    consumer2.active_mask = ActiveMask(SUBTASK_MASK_AIC);
+    consumer2.active_mask = LaneMask::aic();
 
     // Build fanout chain: producer -> consumer2 -> consumer1
     DepListEntry dep_entries[2];

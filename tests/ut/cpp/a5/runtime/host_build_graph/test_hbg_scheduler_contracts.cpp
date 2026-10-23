@@ -387,9 +387,8 @@ TEST(SchedulerMetadata, ProjectsExistingSubmitTypesWithoutChangingTheirSemantics
     attrs.set_sync_start();
     attrs.set_predicate();
     attrs.set_timing_slot(7);
-    const uint8_t flags = scheduler_task_metadata_flags_from_submit_state(
-        ActiveMask(SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0), attrs, 2, true, false
-    );
+    const uint8_t flags =
+        scheduler_task_metadata_flags_from_submit_state(LaneMask::aic() | LaneMask::aiv0(), attrs, 2, true, false);
     EXPECT_TRUE(scheduler_task_is_executable(flags));
     EXPECT_TRUE(scheduler_task_has_fanin(flags));
     EXPECT_TRUE(scheduler_task_is_mix(flags));
@@ -400,7 +399,7 @@ TEST(SchedulerMetadata, ProjectsExistingSubmitTypesWithoutChangingTheirSemantics
     EXPECT_EQ(attrs.timing_slot(), 7);
 
     const uint8_t inline_flags =
-        scheduler_task_metadata_flags_from_submit_state(ActiveMask(SUBTASK_MASK_AIV0), TaskAttrs{}, 1, false, true);
+        scheduler_task_metadata_flags_from_submit_state(LaneMask::aiv0(), TaskAttrs{}, 1, false, true);
     EXPECT_EQ(inline_flags, SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_INLINE);
 }
 

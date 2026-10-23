@@ -384,7 +384,7 @@ protected:
             ChipTaskSlotState &s = storage[i].slot;
             s.reset_for_reuse();
             s.sub_task_local_id = static_cast<int32_t>(i);
-            s.active_mask = ActiveMask(SUBTASK_MASK_AIV0);
+            s.active_mask = LaneMask::aiv0();
             s.graph_context = &execution;
             execution.reset_task_state(static_cast<int32_t>(i));
         }

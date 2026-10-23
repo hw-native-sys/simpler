@@ -147,7 +147,7 @@ protected:
         slot.fanout_lock.store(0);
         slot.fanout_head = nullptr;
         slot.ring_id = ring_id;
-        slot.active_mask = ActiveMask(SUBTASK_MASK_AIC);
+        slot.active_mask = LaneMask::aic();
         slot.completed_subtasks.store(0);
         slot.total_required_subtasks = 1;
         slot.logical_block_num = 1;
@@ -174,7 +174,7 @@ protected:
         slot.fanout_lock.store(0, std::memory_order_relaxed);
         slot.fanout_head = nullptr;
         slot.ring_id = ring_id;
-        slot.active_mask = ActiveMask(SUBTASK_MASK_AIC);
+        slot.active_mask = LaneMask::aic();
         slot.completed_subtasks.store(0, std::memory_order_relaxed);
         slot.total_required_subtasks = 1;
         slot.logical_block_num = 1;
@@ -444,7 +444,7 @@ TEST(CoreTrackerTest, MixPartiallyRunningClusterAdmittedAsPerCorePlacement) {
     // Per-core dispatch then puts the idle AIC/AIV1 on their running slots (marked
     // running so the completion poller tracks them) and the busy AIV0 on its pending
     // slot, executing after the in-flight AIV-only task.
-    constexpr uint8_t used_mask = SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1;
+    constexpr LaneMask used_mask = LaneMask::aic() | LaneMask::aiv0() | LaneMask::aiv1();
     EXPECT_EQ(tracker.classify_mix_cluster(cluster_offset, used_mask), CoreTracker::MixPlacement::PENDING);
 
     // Not all used cores are idle, so the IDLE phase skips this cluster; it is
@@ -507,7 +507,7 @@ TEST(CoreTrackerTest, MixClassifyIgnoresUnusedBusyCoreForRunningPlacement) {
     constexpr int32_t cluster_offset = 0;
     tracker.change_core_state(cluster_offset + 2);  // AIV1 running, unused by this 1c1v task
 
-    auto placement = tracker.classify_mix_cluster(cluster_offset, SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0);
+    auto placement = tracker.classify_mix_cluster(cluster_offset, LaneMask::aic() | LaneMask::aiv0());
     EXPECT_EQ(placement, CoreTracker::MixPlacement::RUNNING);
 }
 
@@ -521,7 +521,7 @@ TEST(CoreTrackerTest, MixClassifyAllowsPendingForUsedRunningCoresOnly) {
     tracker.change_core_state(cluster_offset + 1);
     tracker.set_pending_occupied(cluster_offset + 2);  // Unused AIV1 must not block this 1c1v task
 
-    auto placement = tracker.classify_mix_cluster(cluster_offset, SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0);
+    auto placement = tracker.classify_mix_cluster(cluster_offset, LaneMask::aic() | LaneMask::aiv0());
     EXPECT_EQ(placement, CoreTracker::MixPlacement::PENDING);
 }
 
@@ -535,7 +535,7 @@ TEST(CoreTrackerTest, MixClassifyAdmitsMixedUsedCoresAsPending) {
 
     // Mixed used-core state (AIC idle, AIV0 running) is admitted as PENDING; the
     // idle AIC takes its running slot and the busy AIV0 takes its pending slot.
-    auto placement = tracker.classify_mix_cluster(cluster_offset, SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0);
+    auto placement = tracker.classify_mix_cluster(cluster_offset, LaneMask::aic() | LaneMask::aiv0());
     EXPECT_EQ(placement, CoreTracker::MixPlacement::PENDING);
 }
 
@@ -549,11 +549,11 @@ TEST(CoreTrackerTest, MixClassifyRejectsOccupiedPendingSlotInUsedMask) {
     tracker.change_core_state(cluster_offset + 1);
     tracker.set_pending_occupied(cluster_offset + 1);
 
-    auto placement = tracker.classify_mix_cluster(cluster_offset, SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0);
+    auto placement = tracker.classify_mix_cluster(cluster_offset, LaneMask::aic() | LaneMask::aiv0());
     EXPECT_EQ(placement, CoreTracker::MixPlacement::REJECT);
 }
 
-TEST(CoreTrackerTest, MixRunningClusterHelpersUseActiveMask) {
+TEST(CoreTrackerTest, MixRunningClusterHelpersUseLaneMask) {
     CoreTracker tracker;
     tracker.init(2);
     tracker.set_cluster(0, 0, 1, 2);
@@ -562,7 +562,7 @@ TEST(CoreTrackerTest, MixRunningClusterHelpersUseActiveMask) {
     tracker.change_core_state(2);
     tracker.change_core_state(5);
 
-    constexpr uint8_t used_mask = SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0;
+    constexpr LaneMask used_mask = LaneMask::aic() | LaneMask::aiv0();
 
     EXPECT_EQ(tracker.get_idle_core_offset_states(ResourceShape::MIX).count(), 0);
     EXPECT_EQ(tracker.count_mix_running_clusters(used_mask), 2);
@@ -574,7 +574,7 @@ TEST(CoreTrackerTest, MixRunningClusterHelpersRejectOccupiedUsedPendingSlot) {
     tracker.init(1);
     tracker.set_cluster(0, 0, 1, 2);
 
-    constexpr uint8_t used_mask = SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0;
+    constexpr LaneMask used_mask = LaneMask::aic() | LaneMask::aiv0();
     tracker.set_pending_occupied(1);
 
     EXPECT_EQ(tracker.count_mix_running_clusters(used_mask), 0);
@@ -589,7 +589,7 @@ TEST(CoreTrackerTest, CountAvailableBlocksAivIncludesFreePendingSlots) {
     tracker.change_core_state(1);
     tracker.change_core_state(4);
 
-    constexpr uint8_t aiv_mask = SUBTASK_MASK_AIV0;
+    constexpr LaneMask aiv_mask = LaneMask::aiv0();
     constexpr int32_t exact_fit = 4;
     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::AIV, aiv_mask, false), 2);
     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::AIV, aiv_mask, true), exact_fit);
@@ -606,7 +606,7 @@ TEST(CoreTrackerTest, CountAvailableBlocksMixCountsLogicalClusters) {
 
     tracker.change_core_state(4);
 
-    constexpr uint8_t used_mask = SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1;
+    constexpr LaneMask used_mask = LaneMask::aic() | LaneMask::aiv0() | LaneMask::aiv1();
     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::MIX, used_mask, false), 1);
     EXPECT_EQ(tracker.count_available_blocks(ResourceShape::MIX, used_mask, true), 2);
 }
@@ -616,7 +616,7 @@ TEST(CoreTrackerTest, CountAvailableBlocksMixRejectsOccupiedUsedPendingSlot) {
     tracker.init(1);
     tracker.set_cluster(0, 0, 1, 2);
 
-    constexpr uint8_t used_mask = SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0;
+    constexpr LaneMask used_mask = LaneMask::aic() | LaneMask::aiv0();
     tracker.change_core_state(1);
     tracker.set_pending_occupied(1);
 
@@ -629,7 +629,7 @@ TEST(CoreTrackerTest, CountAvailableBlocksMixIgnoresUnavailableUnusedCore) {
     tracker.init(1);
     tracker.set_cluster(0, 0, 1, 2);
 
-    constexpr uint8_t used_mask = SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0;
+    constexpr LaneMask used_mask = LaneMask::aic() | LaneMask::aiv0();
     tracker.change_core_state(2);
     tracker.set_pending_occupied(2);
 

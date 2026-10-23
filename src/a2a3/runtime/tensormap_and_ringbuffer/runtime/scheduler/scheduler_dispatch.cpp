@@ -243,9 +243,6 @@ int SchedulerContext::prepare_block_for_dispatch(
     if (is_dump_args_enabled()) {
         dump_args_for_task<SUBTASK_SLOT_COUNT>(
             thread_idx, *slot_state.task, *slot_state.payload, slot_state.active_mask, ArgsDumpStage::BEFORE_DISPATCH,
-            [](ActiveMask active_mask, int raw_subtask_id) {
-                return active_mask.subtask_active(static_cast<SubtaskSlot>(raw_subtask_id));
-            },
             [this](int32_t func_id) {
                 return get_function_bin_addr(func_id);
             }
@@ -254,28 +251,28 @@ int SchedulerContext::prepare_block_for_dispatch(
 #endif
     CoreTracker &tracker = core_trackers_[thread_idx];
     if (shape == ResourceShape::MIX) {
-        uint8_t cmask = slot_state.active_mask.core_mask();
+        LaneMask lanes = slot_state.active_mask;
         int n = 0;
         // Per-core slot placement (#1308): an idle used core takes its running slot
         // (tracked by the completion poller), a busy used core takes its gated pending slot
         // (promoted on completion). Gated sync_start staging relies on this — it passes
         // to_pending=true so every busy core opts into a pending slot; the non-zero
         // src_payload gate keeps the whole cohort waiting for the rendezvous.
-        if (cmask & SUBTASK_MASK_AIC) {
+        if (lanes.has_aic()) {
             bool p = to_pending && !tracker.is_aic_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
                 thread_idx, tracker.get_aic_core_offset(core_offset), slot_state, SubtaskSlot::AIC, p, block_idx,
                 force_gate
             );
         }
-        if (cmask & SUBTASK_MASK_AIV0) {
+        if (lanes.has_aiv0()) {
             bool p = to_pending && !tracker.is_aiv0_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
                 thread_idx, tracker.get_aiv0_core_offset(core_offset), slot_state, SubtaskSlot::AIV0, p, block_idx,
                 force_gate
             );
         }
-        if (cmask & SUBTASK_MASK_AIV1) {
+        if (lanes.has_aiv1()) {
             bool p = to_pending && !tracker.is_aiv1_core_idle(core_offset);
             out_handles[n++] = prepare_subtask_to_core(
                 thread_idx, tracker.get_aiv1_core_offset(core_offset), slot_state, SubtaskSlot::AIV1, p, block_idx,
@@ -283,7 +280,7 @@ int SchedulerContext::prepare_block_for_dispatch(
             );
         }
 #if SIMPLER_DFX
-        sched_chip_swimlane_[thread_idx].phase_dispatch_count += __builtin_popcount(cmask);
+        sched_chip_swimlane_[thread_idx].phase_dispatch_count += lanes.count();
 #endif
         return n;
     } else if (shape == ResourceShape::AIC) {
@@ -394,11 +391,11 @@ void SchedulerContext::dispatch_shape(
 
             if (is_mix) {
                 auto candidates = cores;
-                uint8_t cmask = slot_state->active_mask.core_mask();
+                LaneMask lanes = slot_state->active_mask;
                 auto wanted = is_pending ? CoreTracker::MixPlacement::PENDING : CoreTracker::MixPlacement::RUNNING;
                 while (candidates.has_value()) {
                     int32_t cluster_offset = candidates.pop_first();
-                    if (tracker.classify_mix_cluster(cluster_offset, cmask) == wanted) {
+                    if (tracker.classify_mix_cluster(cluster_offset, lanes) == wanted) {
                         selected_mix_clusters |= CoreTracker::BitStates(1ULL << cluster_offset);
                     }
                 }
@@ -749,11 +746,11 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
         CoreTracker::BitStates bucket;
         if (is_mix) {
             auto wanted = is_idle ? CoreTracker::MixPlacement::RUNNING : CoreTracker::MixPlacement::PENDING;
-            uint8_t cmask = c->active_mask.core_mask();
+            LaneMask lanes = c->active_mask;
             CoreTracker::BitStates candidates = tracker.get_cluster_offset_states();
             while (candidates.has_value()) {
                 int32_t cluster_offset = candidates.pop_first();
-                if (tracker.classify_mix_cluster(cluster_offset, cmask) == wanted) {
+                if (tracker.classify_mix_cluster(cluster_offset, lanes) == wanted) {
                     bucket |= CoreTracker::BitStates(1ULL << cluster_offset);
                 }
             }
@@ -834,7 +831,7 @@ int32_t SchedulerContext::try_early_dispatch(
                 sched_->cancel_early_sync_drain(*c);
             } else if (drain_state_.sync_start_pending.load(std::memory_order_acquire) == 0 &&
                        tracker.count_available_blocks(
-                           c->active_mask.to_shape(), c->active_mask.core_mask(), /*include_pending=*/true
+                           c->active_mask.to_shape(), c->active_mask, /*include_pending=*/true
                        ) >= c->logical_block_num) {
                 // From this point onward the operation is all-or-nothing. Only this
                 // scheduler mutates its tracker, and global drain coordinators must

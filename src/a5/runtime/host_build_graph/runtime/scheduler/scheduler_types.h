@@ -10,6 +10,8 @@
  */
 #pragma once
 
+#include "common/lane_mask.h"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -382,15 +384,15 @@ public:
     // already-running core takes its pending slot and executes after its in-flight
     // task. REJECT only when a used core's pending slot is already occupied (no free
     // slot) or the mask is empty.
-    MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
+    MixPlacement classify_mix_cluster(int32_t cluster_offset, LaneMask lanes) const {
         BitStates used;
-        if (core_mask & SUBTASK_MASK_AIC) {
+        if (lanes.has_aic()) {
             used |= BitStates::bit(cluster_offset);
         }
-        if (core_mask & SUBTASK_MASK_AIV0) {
+        if (lanes.has_aiv0()) {
             used |= BitStates::bit(cluster_offset + 1);
         }
-        if (core_mask & SUBTASK_MASK_AIV1) {
+        if (lanes.has_aiv1()) {
             used |= BitStates::bit(cluster_offset + 2);
         }
         if (!used.has_value() || (pending_occupied_ & used).has_value()) {
@@ -404,12 +406,12 @@ public:
         return MixPlacement::PENDING;
     }
 
-    BitStates get_mix_cluster_offset_states(uint8_t core_mask, MixPlacement placement) const {
+    BitStates get_mix_cluster_offset_states(LaneMask lanes, MixPlacement placement) const {
         BitStates result;
         BitStates candidates = get_cluster_offset_states();
         while (candidates.has_value()) {
             int32_t cluster_offset = candidates.pop_first();
-            if (classify_mix_cluster(cluster_offset, core_mask) == placement) {
+            if (classify_mix_cluster(cluster_offset, lanes) == placement) {
                 result |= BitStates::bit(cluster_offset);
             }
         }
@@ -423,61 +425,61 @@ public:
     // This is unsafe for immediate (non-gated) dispatch — hence separate from
     // classify_mix_cluster, which forces a single placement for the whole cluster.
 
-    // Cores of `cluster_offset` named by core_mask.
-    BitStates mix_used_cores(int32_t cluster_offset, uint8_t core_mask) const {
+    // Cores of `cluster_offset` named by lanes.
+    BitStates mix_used_cores(int32_t cluster_offset, LaneMask lanes) const {
         BitStates used;
-        if (core_mask & SUBTASK_MASK_AIC) used |= BitStates::bit(cluster_offset);
-        if (core_mask & SUBTASK_MASK_AIV0) used |= BitStates::bit(cluster_offset + 1);
-        if (core_mask & SUBTASK_MASK_AIV1) used |= BitStates::bit(cluster_offset + 2);
+        if (lanes.has_aic()) used |= BitStates::bit(cluster_offset);
+        if (lanes.has_aiv0()) used |= BitStates::bit(cluster_offset + 1);
+        if (lanes.has_aiv1()) used |= BitStates::bit(cluster_offset + 2);
         return used;
     }
 
     // Every used core has SOME free slot: a core lacks one only when it is running AND
     // its pending slot is occupied (both slots taken).
-    bool mix_cluster_all_slots(int32_t cluster_offset, uint8_t core_mask) const {
-        BitStates used = mix_used_cores(cluster_offset, core_mask);
+    bool mix_cluster_all_slots(int32_t cluster_offset, LaneMask lanes) const {
+        BitStates used = mix_used_cores(cluster_offset, lanes);
         if (!used.has_value()) return false;
         BitStates no_slot = (~core_states_) & pending_occupied_;  // running AND pending taken
         return !(used & no_slot).has_value();
     }
 
     // Used cores that are idle -> will take a running slot (rendezvous seed count).
-    int32_t mix_cluster_idle_core_count(int32_t cluster_offset, uint8_t core_mask) const {
-        return (mix_used_cores(cluster_offset, core_mask) & core_states_).count();
+    int32_t mix_cluster_idle_core_count(int32_t cluster_offset, LaneMask lanes) const {
+        return (mix_used_cores(cluster_offset, lanes) & core_states_).count();
     }
 
     // Clusters where every used core has a free slot (gated MIX split gate/iteration).
-    BitStates get_mix_split_cluster_offset_states(uint8_t core_mask) const {
+    BitStates get_mix_split_cluster_offset_states(LaneMask lanes) const {
         BitStates result;
         BitStates candidates = get_cluster_offset_states();
         while (candidates.has_value()) {
             int32_t off = candidates.pop_first();
-            if (mix_cluster_all_slots(off, core_mask)) {
+            if (mix_cluster_all_slots(off, lanes)) {
                 result |= BitStates::bit(off);
             }
         }
         return result;
     }
 
-    int32_t count_mix_split_clusters(uint8_t core_mask) const {
-        return get_mix_split_cluster_offset_states(core_mask).count();
+    int32_t count_mix_split_clusters(LaneMask lanes) const {
+        return get_mix_split_cluster_offset_states(lanes).count();
     }
 
-    BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {
-        return get_mix_cluster_offset_states(core_mask, MixPlacement::RUNNING);
+    BitStates get_mix_running_cluster_offset_states(LaneMask lanes) const {
+        return get_mix_cluster_offset_states(lanes, MixPlacement::RUNNING);
     }
 
-    int32_t count_mix_running_clusters(uint8_t core_mask) const {
-        return get_mix_running_cluster_offset_states(core_mask).count();
+    int32_t count_mix_running_clusters(LaneMask lanes) const {
+        return get_mix_running_cluster_offset_states(lanes).count();
     }
 
     // Number of whole logical blocks this tracker can accept for sync_start
     // staging. AIC/AIV count cores; MIX counts clusters because one logical MIX
     // block may occupy multiple cores in the same cluster. Gated early staging
     // includes pending slots, while ready staging is restricted to idle slots.
-    int32_t count_available_blocks(ResourceShape shape, uint8_t core_mask, bool include_pending) const {
+    int32_t count_available_blocks(ResourceShape shape, LaneMask lanes, bool include_pending) const {
         if (shape == ResourceShape::MIX) {
-            return include_pending ? count_mix_split_clusters(core_mask) : count_mix_running_clusters(core_mask);
+            return include_pending ? count_mix_split_clusters(lanes) : count_mix_running_clusters(lanes);
         }
         if (shape == ResourceShape::DUMMY) return 0;
 
@@ -718,13 +720,13 @@ enum SchedulerTaskMetadataFlags : uint8_t {
 
 #if !defined(__CCE_AICORE__)
 // Derive the compact AICore metadata from the established HBG scheduling
-// types. This is a host-only projection: ActiveMask and TaskAttrs remain the
+// types. This is a host-only projection: LaneMask and TaskAttrs remain the
 // source of truth, while SchedulerTaskMetadata stays a 16-byte GM read model.
 inline uint8_t scheduler_task_metadata_flags_from_submit_state(
-    ActiveMask active_mask, TaskAttrs task_attrs, int32_t logical_block_num, bool has_fanin, bool inline_task
+    LaneMask active_mask, TaskAttrs task_attrs, int32_t logical_block_num, bool has_fanin, bool inline_task
 ) {
     uint8_t flags = SCHEDULER_TASK_EXECUTABLE;
-    const uint32_t active_subtasks = static_cast<uint32_t>(__builtin_popcount(active_mask.core_mask()));
+    const uint32_t active_subtasks = static_cast<uint32_t>(active_mask.count());
     if (has_fanin) flags |= SCHEDULER_TASK_HAS_FANIN;
     if (active_subtasks > 1) flags |= SCHEDULER_TASK_MIX;
     if (logical_block_num > 1) flags |= SCHEDULER_TASK_SPMD;
@@ -739,20 +741,32 @@ constexpr int32_t SCHEDULER_TASK_TIMING_SLOT_COUNT = 16;
 
 struct alignas(16) SchedulerTaskMetadata {
     uint16_t kernel_ids[3];
-    uint8_t active_mask;
+    LaneMask active_mask;
     uint8_t flags;
     uint32_t trace_index_base;
     int32_t timing_slot;
 };
 
+inline __aicore__ LaneMask scheduler_task_lanes(const SchedulerTaskMetadata &metadata) { return metadata.active_mask; }
+
+#if defined(__CCE_AICORE__)
+inline __aicore__ LaneMask scheduler_task_lanes(const __gm__ SchedulerTaskMetadata &metadata) {
+    LaneMask lanes;
+    // The one-byte POD copy transfers the field from GM into a local value.
+    __builtin_memcpy(&lanes, &metadata.active_mask, sizeof(lanes));
+    return lanes;
+}
+#endif
+
 // One task's subtask slots, as `kernel_ids` and `active_mask` above count them.
 inline constexpr uint8_t SCHEDULER_TASK_SUBTASK_SLOTS = 3;
 
-inline __aicore__ uint32_t scheduler_task_trace_index(uint32_t trace_index_base, uint8_t active_mask, uint8_t subtask) {
-    return trace_index_base + static_cast<uint32_t>(__builtin_popcount(active_mask & ((1U << subtask) - 1)));
+inline __aicore__ uint32_t
+scheduler_task_trace_index(uint32_t trace_index_base, LaneMask active_mask, uint8_t subtask) {
+    return trace_index_base + static_cast<uint32_t>(__builtin_popcount(active_mask.bits() & ((1U << subtask) - 1)));
 }
-inline __aicore__ uint32_t scheduler_task_ready_queue(uint8_t flags, uint8_t active_mask) {
-    return (flags & SCHEDULER_TASK_MIX) != 0 ? SCHEDULER_MIX_QUEUE : ((active_mask & 1U) != 0 ? 0U : 1U);
+inline __aicore__ uint32_t scheduler_task_ready_queue(uint8_t flags, LaneMask active_mask) {
+    return (flags & SCHEDULER_TASK_MIX) != 0 ? SCHEDULER_MIX_QUEUE : (active_mask.has_aic() ? 0U : 1U);
 }
 
 inline __aicore__ bool scheduler_task_is_executable(uint8_t flags) { return (flags & SCHEDULER_TASK_EXECUTABLE) != 0; }
@@ -844,7 +858,8 @@ struct alignas(128) SchedulerGangCohort {
     int64_t task_id;
     uint64_t generation;
     uint64_t priority_bit;
-    uint64_t active_mask;
+    LaneMask active_mask;
+    uint8_t lane_padding[7];
     uint64_t logical_block_num;
     uint64_t participant_count;
     uint64_t local_stride;
@@ -861,7 +876,8 @@ struct alignas(128) SchedulerGangCohort {
 struct alignas(128) SchedulerGangParticipant {
     volatile uint64_t config_generation;
     int64_t task_id;
-    uint32_t active_mask;
+    LaneMask active_mask;
+    uint8_t lane_padding[3];
     uint32_t logical_block_num;
     uint32_t local_expected_subtasks;
     uint32_t local_published_subtasks;
@@ -1205,6 +1221,8 @@ struct alignas(64) SchedulerTaskPmuCell {
 static_assert(sizeof(SchedulerTaskPmuCell) == 64, "one PMU cell per cache line");
 
 static_assert(sizeof(SchedulerTaskMetadata) == 16, "task metadata layout changed");
+static_assert(offsetof(SchedulerTaskMetadata, active_mask) == 6);
+static_assert(std::is_trivially_copyable_v<SchedulerTaskMetadata> && std::is_standard_layout_v<SchedulerTaskMetadata>);
 static_assert(alignof(SchedulerTaskMetadata) == 16, "task metadata alignment changed");
 static_assert(sizeof(SchedulerTaskControl) == 128, "task control layout changed");
 static_assert(alignof(SchedulerTaskControl) == 128, "task control alignment changed");
@@ -1218,8 +1236,16 @@ static_assert(
     "owner-only gang state must not share the priority line"
 );
 static_assert(sizeof(SchedulerGangCohort) == 128, "gang cohort layout changed");
+static_assert(offsetof(SchedulerGangCohort, active_mask) == 32);
+static_assert(offsetof(SchedulerGangCohort, logical_block_num) == 40);
+static_assert(std::is_trivially_copyable_v<SchedulerGangCohort> && std::is_standard_layout_v<SchedulerGangCohort>);
 static_assert(alignof(SchedulerGangCohort) == 128, "gang cohort alignment changed");
 static_assert(sizeof(SchedulerGangParticipant) == 128, "gang participant layout changed");
+static_assert(offsetof(SchedulerGangParticipant, active_mask) == 16);
+static_assert(offsetof(SchedulerGangParticipant, logical_block_num) == 20);
+static_assert(
+    std::is_trivially_copyable_v<SchedulerGangParticipant> && std::is_standard_layout_v<SchedulerGangParticipant>
+);
 static_assert(alignof(SchedulerGangParticipant) == 128, "gang participant alignment changed");
 static_assert(sizeof(SchedulerGangCommand) == 128, "gang command layout changed");
 static_assert(alignof(SchedulerGangCommand) == 128, "gang command alignment changed");

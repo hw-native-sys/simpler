@@ -308,7 +308,7 @@ bool graph_submit_outer(
     );
     orch->tensor_pool_cursor += tensor_slots;
     orch->scalar_pool_cursor += scalar_span;
-    slot.active_mask = ActiveMask{};
+    slot.active_mask = LaneMask{};
     slot.task_attrs = TaskAttrs{};
     slot.total_required_subtasks = 0;
     // A shell places no block, but this must stay positive: an early-released
@@ -487,7 +487,7 @@ bool graph_finalize_pending_submissions(OrchestratorState *orch, GraphHostState 
 }  // namespace
 
 TaskOutputTensors graph_record_submit_sub_task(
-    OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
+    OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 ) {
     ORCH_PHASE_START();
@@ -544,8 +544,7 @@ TaskOutputTensors graph_record_submit_sub_task(
     // recording unsupported and makes commit fail-fast, rather than baking a
     // truncated or negative count into the cached Definition (which the device
     // would expand into a sub-task that never completes).
-    const int32_t required_subtasks =
-        static_cast<int32_t>(task.logical_block_num) * __builtin_popcount(active_mask.core_mask());
+    const int32_t required_subtasks = static_cast<int32_t>(task.logical_block_num) * active_mask.count();
     if (task.logical_block_num <= 0 || required_subtasks > std::numeric_limits<int16_t>::max()) {
         recording.unsupported = true;
         task.total_required_subtasks = 0;

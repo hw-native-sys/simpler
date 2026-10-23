@@ -692,9 +692,9 @@ bool bind_graph_definitions(
                 // singles out GRAPH and routes everything else by shape, and a Graph
                 // body member is never the shell, so the shape decides. Derived here
                 // the same way the device derives it, so the two cannot drift.
-                const ActiveMask mask(tasks[i].active_mask);
+                const LaneMask mask(tasks[i].active_mask);
                 packed_definition.ready_queue_populations.add_task(
-                    mask, TaskAttrs(tasks[i].task_attrs), mask.is_dummy() ? TaskKind::DUMMY : TaskKind::KERNEL
+                    mask, TaskAttrs(tasks[i].task_attrs), mask.is_empty() ? TaskKind::DUMMY : TaskKind::KERNEL
                 );
             }
             packed_definition.populations_ready = true;

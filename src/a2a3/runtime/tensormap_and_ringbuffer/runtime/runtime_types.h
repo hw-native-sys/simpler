@@ -540,8 +540,8 @@ struct alignas(64) ChipTaskSlotState {
     TaskDescriptor *task;
 
     // --- Set per-submit (depend on task inputs) ---
-    ActiveMask active_mask;  // Bitmask of active subtask slots (set once)
-    uint8_t ring_id;         // Ring layer (immutable after init)
+    LaneMask active_mask;  // Bitmask of active subtask slots (set once)
+    uint8_t ring_id;       // Ring layer (immutable after init)
     // Single per-task attributes byte (early-dispatch hint, sync_start,
     // has_predicate, selective timing tag). Lives on slot_state (not payload) so
     // fanin walks and the completion path read them off the already-hot producer
@@ -706,6 +706,7 @@ struct alignas(64) ChipTaskSlotState {
 };
 
 static_assert(sizeof(ChipTaskSlotState) == 64);
+static_assert(offsetof(ChipTaskSlotState, active_mask) == 48);
 // FaninSpillEntry packs DepFlags into the low bits of a ChipTaskSlotState*.
 // That is only lossless while the type is aligned past those tag bits.
 static_assert(
