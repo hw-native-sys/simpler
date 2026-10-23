@@ -33,8 +33,10 @@ TQ=1 requires callback execution on a different thread; TQ=0 requires the caller
 thread. Golden values are checked only after every framework successor has
 been enqueued and the final framework stream completion boundary returns.
 
-The optional system test covers both runtimes and both policies. It is manual
-because generic onboard environments need not include torch_npu. Run this suite
+The system test covers both runtimes and both policies. Its manual marker keeps
+it out of generic environments; the dedicated `st-framework-eager-a2a3` PR and
+Daily job explicitly selects all four cases in an isolated framework venv.
+Selecting the suite without its dependencies fails. See [CI qualification](../../../../docs/ci.md#framework-eager-qualification-a2a3) for the pinned compatibility contract. Run this suite
 serially inside one exclusive `task-submit` allocation of one device, as below;
 resource-parallel dispatch and xdist are not qualified by this example:
 

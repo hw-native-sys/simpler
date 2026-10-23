@@ -8,6 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Optional live framework-queue consumer of the ordinary public Worker."""
 
+import hashlib
+import importlib.metadata
 import importlib.util
 import json
 import os
@@ -24,8 +26,13 @@ pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), py
 
 @pytest.fixture(scope="module")
 def framework_module(tmp_path_factory):
-    if importlib.util.find_spec("torch_npu") is None:
-        pytest.skip("the optional reference consumer requires matching torch and torch_npu")
+    dependencies = {}
+    for module, distribution in (("torch", "torch"), ("torch_npu", "torch-npu")):
+        spec = importlib.util.find_spec(module)
+        if spec is None:
+            pytest.fail(f"selected framework consumer requires matching torch and torch_npu; missing {module}")
+        dependencies[module] = {"version": importlib.metadata.version(distribution), "path": spec.origin}
+    print("FRAMEWORK_DEPENDENCIES " + json.dumps(dependencies, sort_keys=True), flush=True)
     directory = tmp_path_factory.mktemp("framework-eager-module")
     result = subprocess.run(
         [sys.executable, str(_EXAMPLE), "--compile-only", "--build-dir", str(directory)],
@@ -36,7 +43,14 @@ def framework_module(tmp_path_factory):
         env={**os.environ, "TORCH_DEVICE_BACKEND_AUTOLOAD": "0", "MAX_JOBS": "2"},
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "FRAMEWORK_QUEUE_MODULE " in result.stdout
+    modules = [
+        line.removeprefix("FRAMEWORK_QUEUE_MODULE ")
+        for line in result.stdout.splitlines()
+        if line.startswith("FRAMEWORK_QUEUE_MODULE ")
+    ]
+    assert len(modules) == 1, result.stdout + result.stderr
+    print(result.stdout, end="", flush=True)
+    print("FRAMEWORK_QUEUE_MODULE_SHA256 " + hashlib.sha256(Path(modules[0]).read_bytes()).hexdigest(), flush=True)
     return directory
 
 
@@ -73,6 +87,8 @@ def test_framework_queue_orders_public_worker(runtime, task_queue, framework_mod
         },
     )
     (tmp_path / "consumer.log").write_text(result.stdout + result.stderr)
+    print("FRAMEWORK_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
+    print(result.stdout, end="", flush=True)
     assert result.returncode == 0, result.stdout + result.stderr
     records = [
         line.removeprefix("FRAMEWORK_EAGER_PASS ")

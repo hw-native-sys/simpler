@@ -43,7 +43,11 @@ def build_bridge(directory: Path) -> Path:
     extension = CppExtension(
         name="_simpler_framework_queue",
         sources=[str(HERE / "queue_callback.cpp")],
-        include_dirs=[str(package / "include")],
+        include_dirs=[
+            str(package / "include"),
+            str(package / "include/third_party/acl/inc"),
+            str(package / "include/third_party/hccl/inc"),
+        ],
         library_dirs=[str(package / "lib")],
         libraries=["torch_npu"],
         runtime_library_dirs=[str(package / "lib")],

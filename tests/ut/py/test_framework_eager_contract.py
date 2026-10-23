@@ -1,0 +1,150 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+"""CPU checks of the selected hardware test's dependency and JUnit contract."""
+
+import os
+import runpy
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import pytest
+
+_ROOT = Path(__file__).resolve().parents[3]
+_ST_RELATIVE = Path("tests/st/a2a3/framework_eager/test_framework_eager.py")
+_ST = _ROOT / _ST_RELATIVE
+_VERIFY = _ROOT / ".github/actions/setup-framework-eager/verify_results.py"
+_CASES = {
+    f"test_framework_queue_orders_public_worker[{queue}-{runtime}]"
+    for queue in ("0", "1")
+    for runtime in ("tensormap_and_ringbuffer", "host_build_graph")
+}
+
+
+def _run_selected_contract(tmp_path, *, missing):
+    # Only the external compiler/device subprocess is replaced. Pytest executes
+    # the actual fixture, four parameterizations, and consumer JSON assertions.
+    (tmp_path / "pytest.ini").write_text(
+        "[pytest]\nmarkers =\n    requires_hardware\n    platforms(value)\n    manual\n"
+    )
+    test_path = tmp_path / _ST_RELATIVE
+    test_path.parent.mkdir(parents=True)
+    test_path.write_text(
+        f"""
+import builtins
+import json
+import runpy
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+real_import = builtins.__import__
+def import_without_framework(name, *args, **kwargs):
+    if name.split(".")[0] in ("torch", "torch_npu"):
+        raise AssertionError("the CPU test contract must not import a framework backend")
+    return real_import(name, *args, **kwargs)
+builtins.__import__ = import_without_framework
+
+original = runpy.run_path({str(_ST)!r})
+framework_module = original["framework_module"]
+test_framework_queue_orders_public_worker = original["test_framework_queue_orders_public_worker"]
+pytestmark = original["pytestmark"]
+
+@pytest.fixture(scope="session", autouse=True)
+def cpu_transport():
+    patch = pytest.MonkeyPatch()
+    namespace = framework_module.__wrapped__.__globals__
+    missing = {missing!r}
+    def find_spec(name):
+        assert name in ("torch", "torch_npu")
+        return None if name == missing else SimpleNamespace(origin="/cpu-contract/" + name)
+    def run(command, **kwargs):
+        assert kwargs["env"]["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
+        if "--compile-only" in command:
+            module = Path(command[command.index("--build-dir") + 1]) / "cpu-contract.so"
+            module.write_bytes(b"CPU test transport; no framework code")
+            output = "FRAMEWORK_QUEUE_MODULE " + str(module) + "\\n"
+        else:
+            runtime = command[command.index("--runtime") + 1]
+            queue = kwargs["env"]["TASK_QUEUE_ENABLE"]
+            summary = dict(verified=True, calls=3, runtime=runtime, task_queue=queue,
+                caller_tensors_retained=True, caller_stream_after_close=True,
+                callback_error_observed=True, zero_stream_preflight_refusals=1,
+                caller_thread=1, callback_threads=[1 if queue == "0" else 2] * 3)
+            output = "FRAMEWORK_EAGER_PASS " + json.dumps(summary) + "\\n"
+        return SimpleNamespace(returncode=0, stdout=output, stderr="")
+    patch.setitem(namespace, "importlib", SimpleNamespace(
+        util=SimpleNamespace(find_spec=find_spec),
+        metadata=SimpleNamespace(version=lambda name: "CPU-contract")))
+    patch.setitem(namespace, "subprocess", SimpleNamespace(run=run))
+    yield
+    patch.undo()
+"""
+    )
+    (tmp_path / "conftest.py").write_text(
+        'def pytest_addoption(parser):\n    parser.addoption("--device", default="0")\n'
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-c",
+            "pytest.ini",
+            "--rootdir=.",
+            "--import-mode=importlib",
+            "--confcutdir=.",
+            "--junitxml=results.xml",
+            "-q",
+            str(_ST_RELATIVE),
+        ],
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+        env={**os.environ, "PYTEST_DISABLE_PLUGIN_AUTOLOAD": "1"},
+    )
+    return result, ET.parse(tmp_path / "results.xml").getroot().findall(".//testcase")
+
+
+def test_selected_framework_matrix_has_four_passed_junit_cases(tmp_path):
+    result, cases = _run_selected_contract(tmp_path, missing=None)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(cases) == 4
+    assert {case.attrib["name"] for case in cases} == _CASES
+    assert all(not list(case) for case in cases)
+    runpy.run_path(str(_VERIFY))["verify_results"](tmp_path / "results.xml")
+
+
+def test_framework_ci_verifier_rejects_changed_actual_junit_classname(tmp_path):
+    result, _ = _run_selected_contract(tmp_path, missing=None)
+    assert result.returncode == 0, result.stdout + result.stderr
+    verify_results = runpy.run_path(str(_VERIFY))["verify_results"]
+    path = tmp_path / "results.xml"
+    verify_results(path)
+    tree = ET.parse(path)
+    case = tree.getroot().find(".//testcase")
+    assert case is not None
+    case.set("classname", "wrong.framework_module")
+    tree.write(path)
+    with pytest.raises(ValueError, match="Expected the four framework eager nodeids"):
+        verify_results(path)
+
+
+@pytest.mark.parametrize("missing", ["torch", "torch_npu"])
+def test_selected_framework_matrix_fails_missing_dependency_instead_of_skipping(tmp_path, missing):
+    result, cases = _run_selected_contract(tmp_path, missing=missing)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert len(cases) == 4
+    assert {case.attrib["name"] for case in cases} == _CASES
+    assert all(case.find("error") is not None and case.find("skipped") is None for case in cases)
+    assert "requires matching torch and torch_npu" in result.stdout

@@ -42,6 +42,11 @@ jobs:
       session_timeout_seconds: 1800
       job_timeout_minutes: 60
 
+  st-framework-eager-a2a3:
+    uses: ./.github/workflows/_st-framework-eager-a2a3.yml
+    with:
+      runs_on: '["self-hosted","a2a3"]'
+
   st-onboard-a2a3:
     uses: ./.github/workflows/_st-npu-a2a3.yml
     with:

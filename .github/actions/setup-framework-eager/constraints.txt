@@ -1,0 +1,4 @@
+# https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md
+# CANN 9.0.0 / PyTorch 2.7.1 / torch_npu 2.7.1.post4
+torch==2.7.1+cpu
+torch_npu==2.7.1.post4
