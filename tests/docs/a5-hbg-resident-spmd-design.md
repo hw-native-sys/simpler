@@ -1,0 +1,946 @@
+# a5 HBG resident 调度器支持 SPMD 设计（per-core 版）
+
+> 面向：simpler 仓库的 runtime 开发者与本设计的评审者。
+> 状态：设计稿，尚未实现。本稿**取代**基于 cluster-scheduler 模型的旧稿。
+> 范围：a5 架构 `host_build_graph` 的 resident AICore 调度器。
+>
+> **基线**：分支 `a5-hbg-per-core-phase-a` @ `872591b7`（per-core 改造阶段 1 + D1b + D3a 已落地）。
+> 文内行号一律按此 commit，repo 相对路径。per-core 改造本身见
+> [a5-hbg-per-core-scheduler-plan.md](a5-hbg-per-core-scheduler-plan.md) 与
+> [a5-hbg-per-core-scheduler-progress.md](a5-hbg-per-core-scheduler-progress.md)。
+>
+> **全文的 108 / 36 / 72 是容量常量，不是实测核数。** `SCHEDULER_WORKER_CAPACITY = 108`
+> （36 cluster × 3），而本机实测 `num_cores` 是 **96**（32 cluster，32 AIC + 64 AIV）。
+> progress §A4 专门记过一次把容量当实测值写进基线的错（"21/108"应为"21/96"）。
+> 凡本文说"全机""所有核"，按运行时真实的 `cluster_count` 读；写用例阈值时一律从 run
+> 自报的 `num_cores` 推导，**不要写死这三个数**。
+
+## 1. 问题与现状
+
+`scheduler_resident_v0_task_shape_supported`
+（`src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h:58-61`）：
+
+```cpp
+return active_subtasks >= 1 && active_subtasks <= 3 && logical_block_num == 1 && !sync_start;
+```
+
+四个 clause 里只有 `logical_block_num == 1` 实际生效。命中后
+`host/runtime_maker.cpp:1259-1266` 对**整张图**调 `select_legacy_scheduler`，没有 per-task 混合模式
+——图里只要有一个 SPMD 任务，整个 run 都用不上 resident 调度。
+
+排查关键字：`A5 HBG: retaining AICPU scheduling for task ref=... with SPMD or sync-start shape`。
+
+这不是边缘情况。`examples/a5/host_build_graph/qwen3_14b_decode/kernels/orchestration/decode_fwd_layers.cpp`
+一层内就有数十个 SPMD 任务（`set_block_num` 1~50，另有一个 Mix SPMD 在 `:532`）；分支自带的
+`examples/a5/host_build_graph/deepseek_v4_pro_csa/` 整图 60 个多 block 任务、最大 `block_num=512`。
+
+## 2. 旧稿为何必须重构
+
+旧稿的实现前提是「每核一个 Scheduler」改造先行，并据此声明"任何空出来的核都能自己到队首认领
+block"。改造已落地，但它同时改掉了旧稿赖以成立的另外几件事。
+
+| 旧稿前提 | 现状 | 后果 |
+| -------- | ---- | ---- |
+| 每 cluster 一个 Scheduler 管 3 lane；Mix 由主管理核放置 | 每核自调度；Mix 由本 cluster **AIC** 协调、写 AIC 独占的 mix 槽（`scheduler_ready.h:236`、`scheduler_mix.h:80-82`） | 认领主体 36 → 108（容量；实测机为 96）。"空闲 lane 数"不再由任何一方集中掌握，`scheduler_claim_spmd_blocks` 里"算本 cluster 该 type 的空闲 lane 数 k"这一步**没有数据来源** |
+| ready inbox 任何核都能消费（偷同 shard） | **D1b**：按 core type + `type_rank` 编址（36/72/36，`scheduler_types.h:686-695`）；push 只投**本 cluster** 同 type 核（`scheduler_ready.h:990-999`）；steal 只扫自己那 7 个 owner 的 shard（`scheduler_ready.h:1265-1288`） | **致命**。躺在某个 inbox 里的任务只有 7 个同 type 核能看见。实测单根扇出只摸到 14/96 核（progress §A4）。`block_num=50` 的任务**不可能**靠"待在 ready 队列里等人认领"铺开 |
+| 「队首非空 → 全局停取新任务」 | 旧模型 36 个 Scheduler 各停，代价 3 lane | 现在是 108 个核各停。AIC-only 的 SPMD 会让 **72 个 AIV 停工**。旧稿 §3 已证明 non-sync_start 不需要它；本稿 §8.2 进一步发现 **sync_start 也不需要**（co-residency 由 §8.1 的四条保证），所以这条规则整体降级为可选的延迟优化 |
+| `next_block`/`completed_subtasks` 放 TaskControl 第一条线，"是否拆到别的线由实测决定" | progress §7.10 已证明：第二条线被整线回写时会**还原该核缓存里的旧副本** | 不是实测取舍而是**硬约束**：跨核 RMW 字段只能放第一条线。该线现为 `state`/`wake_list_head`/`next_waiter` + `padding[40]`（`scheduler_types.h:838-862`），仍够放 |
+| Mix 的 SPMD「一个计数器同时覆盖 block 维与 lane 维」 | per-core 的 `mix_trackers` 是**核本地**的（`scheduler_ready.h:231` 的 `has_mix` 同族） | block 内聚合用本地 tracker，block 间聚合必须走 GM 原子：**两级**而非一级 |
+| §7.2 host 侧按形状校验 `block_num` 上限 | **已经实现**：`aic_worker_demand = max(block_num)`、`aiv_worker_demand = max(block_num × AIV 子任务数)`（`runtime_maker.cpp:1244,1249` → `:1326-1327`），`aicpu/aicore_lifecycle.cpp:242` 比对真实核数 | 不必新增。但它**管的是所有 SPMD 任务而不只是 sync_start**，见 §9 —— 不放宽就会拒掉 qwen 与 CSA |
+| §7.4 gang 预留字段"留给实现阶段决定" | 阶段 B 已全删，`scheduler_task_is_gang` 也没了 | 无事可做。但这意味着放行后**下游没有任何守卫**：形状准入门是唯一事实来源（见 §9 末） |
+
+### 2.1 三个旧稿没有的发现
+
+1. **trace 索引不含 block。** `scheduler_task_trace_index`（`scheduler_types.h:813-815`）只按
+   subtask 取偏移，而 `trace_index_base` 按 `block_num × active_subtasks` 步进
+   （`runtime_maker.cpp:1253`）——空间已预留，索引却没用上，一个 SPMD 任务的所有 block 会写进
+   **同一个 trace cell**。见 §7.3。
+2. **SPMD + predicate 被 host 硬拒而非回退**：`runtime_maker.cpp:1185` 的
+   `has_predicate() && (active_subtasks != 1 || logical_block_num != 1)` 直接 `return false`
+   （`prepare_native_run failed with code -1000`，已由 `tests/st/a5/host_build_graph/mix_predicated_dispatch`
+   钉住）。⇒ **SPMD 路径上不存在 predicate 一致性问题**，旧稿关于求值收归一处的顾虑在此不适用。
+3. **Mix 的 payload 仍由 AIC 准备**：`scheduler_mix.h:47-62` 的 `prepare` 循环跑在协调者上，
+   执行侧 `aicore_executor.cpp:464-466` 是 `observe_dispatch_payload_*`（读别人写的 payload）。
+   计划 D3 的"prepare 搬到 AIV 侧"**未实现**。⇒ 对 SPMD 的影响不是"谁认领"（Mix block 的
+   认领者就是协调者自己），而是**一次认领要写几份 payload**：非 Mix 的认领核写自己那一份，
+   Mix 的协调者要替两个 AIV 各写一份到它们的 mix payload 区，`block_idx` 也由它写三遍。
+
+## 3. 硬约束（逐条复核）
+
+| # | 约束 | 变化 |
+| - | ---- | ---- |
+| 3.1 | 一个核的视野：本 cluster 三条 lane（`config.worker_ids[0..2]`，lane0=AIC）；跨 cluster 必须经 GM | 不变 |
+| 3.2 | ready inbox 的链接字段 `next_waiter` 只有一个，一个任务同时只在一条链上（wake 链或 ready 链） | 不变。**所以这条链无法表达"N 个核各认领一段 block"** |
+| 3.3 | 同一核的 2 个 slot 是排队位不是执行位：executor 取 `local_ready_mask` 里最老的那个（`scheduler_ready.h:450-467`），串行执行 | 不变。认领宽度必须按**核**算，不按 slot 算 |
+| 3.4 | generation 不可撤销：`stage` 一旦发布，该 slot 的消费者就锁定这个号 | 不变。不存在"先 stage 再放弃" |
+| 3.5 | `resolved_task_count` 每 task 只能加 1（`aicpu/aicpu_executor.cpp` 的收尾核对） | 不变 |
+| 3.6 | SSBUF 跨 cluster 不可寻址 | 不变。做不到 TMR 式的全局 rendezvous |
+| 3.7 | **跨核 RMW 字段只能放 TaskControl 第一条线**，且该线不得被 `publish_cache_line` 整线发布 | **新增**（progress §7.10 的结论） |
+| 3.8 | GM 的**读改写**原语只有 64 位：`scheduler_gm_fetch_add` / `_fetch_or` / `_fetch_and` **只有 `uint64_t`** 一个重载，CAS 有 `int64_t`+`uint64_t`（`scheduler_memory.h:195-258`）。非 RMW 的 store/load **有 32 位形式**（`scheduler_gm_store(uint32_t&)`@175、`scheduler_gm_query_u32_pair`@137），所以不能由本条推出"32 位共享字段不存在"。`scheduler_gm_query` 走 `ld_dev` 绕过标量 DCache，读一致、无需 invalidate | **新增**。所有新增**计数器**一律 `uint64_t` |
+| 3.9 | **一个核在 `execute_task` 内部时整个调度循环停摆** —— 它不取任务、不服务完成、不读 SPMD 队首。sync_start 的 block 在 barrier 上自旋就处于这个状态 | **新增**。§8.1 的直填旁路与"每核 ≤1 块"都源于此 |
+| 3.10 | 本核就绪槽按 **generation 最小**优先执行（`scheduler_local_ready_pop`，`scheduler_ready.h:450-467`），generation 是本核单调递增的 `dispatch_sequence` | **新增**。§8.1 两个 cohort 不互锁**依赖**这条；改槽选择策略就会破坏它 |
+
+## 4. 调度模型：队首即认领对象，任务自身游标作权威
+
+§2 的致命项决定了模型：**SPMD 任务不能靠"躺在 per-core 队列里"被认领**，因为那种队列的可见
+半径是 7 个同 type 核。所以 SPMD 任务进一条**全局唯一的 MPMC 队列**，而**队首就是当前正在
+认领 block 的那个任务**。
+
+```
+         resolve / bootstrap
+                 │  (SPMD flag)
+                 ▼
+        ┌────────────────────────────────────────────┐
+        │  SPMD ready 队列：全局唯一 MPMC             │
+        │  endpoints = CAS 打包的闭区间 (head, tail)  │
+        │                                            │
+        │   head ──► 当前认领对象（不被取走）          │
+        │   ...  ──► 排队等待的后续 SPMD 任务          │
+        └────────────────────────────────────────────┘
+                     │ 读 endpoints 取 head（1 次 ld_dev）
+     ┌───────────────┼───────────────┐
+     ▼               ▼               ▼
+ 核 A 认领 block i  核 B 认领 block j  核 C 认领 block k
+ （CAS 任务自己的 next_block；全部认领完后任何核都可推进 head）
+```
+
+- **进入**：SPMD 任务与普通任务一样被 resolve 成 ready，但进这条全局队列，不按 core type 或
+  `type_rank` 分片。任何核都能 push。
+- **认领**：任何核空出 dispatch 槽时读一次 `endpoints` 取 head；队首任务与自己 core type
+  匹配就 CAS 它的 `next_block` 取一个 block。
+- **让位**：队首的 block 全部认领完（**不是执行完**）后，任何观察到这一点的核都可以推进 head。
+
+### 4.1 不需要独立的"认领槽"——队首就是它
+
+队首天然具备一个独立槽位要提供的两件事，这是旧稿的论证，本稿照用：
+
+- **认领期间稳定**：队列是 FIFO，入队只改 tail（空队列那一次 CAS 同时设好两端），
+  所以新任务永远顶不掉正在认领的队首。若改成 LIFO，入队就是 CAS head，新任务会把正在认领的
+  那个顶下去 —— 两个任务同时在认领，直接破坏"一次一个"。
+- **"进入认领中"的唯一权**：空队列时入队的那一次 `CAS(endpoints, EMPTY, …)` 本身就是互斥，
+  赢家的任务成为队首。不需要第二个 CAS 去抢一个槽。
+
+一个独立槽位唯一能多提供的是**让 core type 不匹配的核少读一次 metadata**（把形状预先摊在槽
+的 tag 里）。而 `SchedulerTaskMetadata` 是 16 字节、落在一条 cache line 内
+（`scheduler_types.h:805-811`），且认领成功后 prepare 本来就要读它 —— 省下的只是不匹配者的
+一次 `ld_dev`，不值得用一个新结构 + 搬运协议去换。
+
+**于是现有 `SchedulerReadyInbox` 原样够用，零新结构。** progress §7.9 已把它做成 CAS 打包的
+闭区间 FIFO、§7.10 把链接字段改成 `atomicExch` 并搬到只走原子原语的第一条缓存线 —— 它本来
+就是 MPMC 的。SPMD 与普通队列的差别只在**消费方式**：
+
+| | 普通 ready 队列 | SPMD 队列 |
+| --- | --- | --- |
+| 看有没有工作 | 读 `endpoints` | 同 |
+| 取工作 | pop：CAS 推进 head，**任务被取走** | **peek**：只读 head，任务留在原地 |
+| 何时推进 head | 取走时立即 | **队首 block 全部认领完之后**（延迟 pop，走现有 `scheduler_ready_pop_from_inbox`） |
+
+### 4.2 同时只有一个 SPMD 任务处于认领中
+
+旧稿的规则，本稿**原样保留**。它的作用不止于 sync_start 互斥（那只是它顺带覆盖的一条）：
+
+- **它让"认领失败"只有一种处置。** Mix block 要落在本 cluster 的 (AIC + AIV) 上，如果只有
+  AIC 空、两个 AIV 还在执行，placement 就失败 —— 此时正确的动作是**本轮放弃、等下一轮**，
+  而不能转而认领别的 SPMD 任务。队首唯一，所以"不能转而认领别的"是**结构性事实**，不是一条
+  要靠代码纪律维持的规则。这对 sync_start 尤其要紧：cohort 正在集结时跑去认领一个 AIC-only
+  任务，会把本该留给 cohort 的核占走。
+- **它免掉了"认领谁"的选择点。** 多个任务同时可认领时，核每轮都要在它们之间选，而选错
+  （持续挑 non-sync_start）会让 cohort 饿死 —— 那需要一整套优先级规则。队首唯一，没有选择。
+- **它本身就是 sync_start 的互斥。** 队首唯一那个任务要么是 cohort 要么不是，两个 cohort
+  不可能同时在认领，**不需要任何额外的令牌位**。
+
+代价是**旧稿**（那份文档的 §4.5）已经承认过的那笔：**AIC-only 的任务在认领期间，AIV 核
+拿不到它的 block**（它们仍会从自己 inbox 取普通任务，只是吃不到这个 SPMD 任务的并行度）。
+本稿接受这笔代价，不做任何消除它的设计。
+
+**权威在任务自己的 `next_block`，不在队列。** 认领不动 `endpoints`，只 CAS
+`SchedulerTaskControl::next_block`。于是 head 已经推进、而某个核还在用旧 head 的情形是无害的：
+它会去 CAS 一个已认领干净的任务，`current >= block_num` 使 CAS 不成立，无副作用 —— 错误路径
+在结构上不存在，而不是靠协议防它（与 progress F-1 同一思路）。
+
+### 4.3 为什么 SPMD 队列是全局唯一的 MPMC 队列
+
+**per-core 分片对 SPMD 毫无价值,还要付扩容的代价。** 分片（D1b 按 `type_rank` 编址）的收益是
+让同 shard 的 7 个 owner 同类型、让 steal 命中率高；但 SPMD 任务**不是被 pop 去执行的**,它只是
+等着被搬进认领槽,进槽之后谁都能认领。所以分片对它只剩下坏处:
+
+| | per-core 36 inbox | **全局唯一（选定）** |
+| --- | --- | --- |
+| inbox 数组 | 144 → **180** | 144 → **145** |
+| directory | `[3][11]` → `[4][11]` | **不要** —— 只有一个 owner,判空直接读它的 `endpoints` |
+| steal | 要配第 4 个 victim cursor + 扫 shard | **不需要**,没有第二个 owner 可偷 |
+| 搬进槽的角色 | 只有持有该 inbox 的 AIC | **任何核** |
+| 可见半径 | 7 个同 type 核 | 全机 |
+
+**现有 `SchedulerReadyInbox` 已经是 MPMC 的**,直接复用,零新结构:progress §7.10 把 `endpoints`
+改成 CAS 打包的闭区间两端、把链接字段 `next_waiter` 改成 `atomicExch` 并搬到只走原子原语的第一
+条缓存线。全局 SPMD 队列就是这个结构的一个实例,`owner_count = 1`。
+
+落地参数：
+
+- `SCHEDULER_READY_QUEUE_COUNT` 3 → 4。保留 queue 维度是为了 `resolve_completion` 的
+  `batches[]` 与 `scheduler_task_ready_queue()` 分类机制原样可用,不必为 SPMD 另开一条发布路径。
+- `scheduler_ready_queue_capacity(3) = 1`、`base(3) = 144`,
+  `SCHEDULER_READY_INBOX_CAPACITY = 144 + 1 = 145`。
+- `scheduler_ready_queue_owner_count(ctx, 3) = 1`、`scheduler_ready_push_target(ctx, 3, ref) = 0`。
+
+**三处必须动的**（其余自动泛化）：
+
+| 函数 | 现在对 `core_type_index == 3` 的行为 | 要怎样 |
+| ---- | ------------------------------------ | ------ |
+| `scheduler_ready_queue_base`（`scheduler_types.h:691-695`） | `0?0 : 1?36 : 36*(1+2)` ⇒ **108,与 `base(2)` 撞车** | 显式 `base(3) = 144`。**这是会静默共享队列的错误**；`:1203-1207` 的 contiguous 断言只枚举了 0/1/2,补到 3 才抓得住 |
+| `scheduler_ready_queue_holder`（`scheduler_ready.h:614-616`） | `(3==1)==(self==1)` ⇒ 只有 AIC 为真 | 全局队列**所有核都是持有者**,要对 queue 3 返回 true |
+| `scheduler_refresh_ready_inbox` / `_type`（`scheduler_ready.h:938-978`） | 维护 directory bit、`owner_ready_queue_mask` | queue 3 **跳过 directory 那一整套**,判空直接读 `endpoints` |
+
+`scheduler_ready_queue_capacity` / `_owner_count` / `_push_target` 三个**不用改**:
+非 1 分支天然给出 1 / 1 / 0（前两个需把 `clusters` 换成按 type 取值,见上表参数）。
+
+**`ready_victim_cursors` 仍要扩到 4 个元素**（两处花括号现在只写 2 个初值,
+`aicore_executor.cpp:245-248`、`:281-284`,第三个靠零初始化兜着）——queue 3 不走 steal,
+但数组按 `QUEUE_COUNT` 声明,少写一个初值就又回到"写少了但恰好没错"的状态。
+
+### 4.4 队首占用期很长，但只影响其他 SPMD 任务
+
+队首在它的 block **全部认领完**之前不让位，而"认领完"对大任务是个很长的过程：
+`block_num = 512` 在约 96 个核、每核每轮 1 块、每核 2 槽的节奏下，要经历好几波**执行**才认领
+得完（秒级），不是几轮 CAS。所以后续 SPMD 任务在队列里等很久是常态而非例外。
+
+**这正是 SPMD 不能混进 AIC/AIV ready 队列的理由。** 混进去，队首那个 SPMD 任务会把排在它
+后面的**普通任务**一起堵住（D1b 把 MIX 单独成链是同一考虑）。给 SPMD 一条自己的队列，
+等待只发生在 SPMD 之间，而这正是"一次一个"本来就接受的串行。
+
+### 4.5 SPMD 优先于其余一切取任务，但不停取
+
+核每轮的次序是：**先看 SPMD 队首，再填 Mix，最后看自己的 inbox**。SPMD 排在最前而不只是
+排在 inbox 之前，因为 **Mix 填槽争的正是 Mix SPMD 认领要用的那批资源** —— 协调者的自有槽
+与本 cluster 的 mix 槽。先跑 Mix，普通 Mix 工作会把放置容量吃掉，一个 Mix SPMD 队首就探不到
+位置、白等一轮。这同时是 sync_start cohort 能够集结的 liveness 来源（§8.1 第 1 条）。
+
+但这只是**次序**，不是停取：队首与本核 core type 不匹配、或 placement 失败时，本核照常
+往下去填 Mix、去 inbox 取普通任务。旧稿那条"队首非空即全局停取新任务"**不采用** —— 在
+per-core 下它会让 72 个 AIV 核为一个 AIC-only 任务整体空转（§8.2 另有论证说明它也不是
+正确性所需）。
+
+每核每轮至多认领 1 个 block（约束 3.3）。**这条是定下来的，不作为开放项**：一次认领多块虽能
+减少 CAS 轮数，但会让先空出来的核把 block 抢走、后空出来的核无事可做，负载均衡直接退化。
+CAS 轮数可以忍，不均衡不可以。第二个 dispatch 槽由后续轮次自然补上 —— 别人都忙时槽照样填满，
+别人空闲时不抢跑。
+
+## 5. 数据结构变更
+
+### 5.1 没有新的共享结构
+
+SPMD 队列复用 `SchedulerReadyInbox`（§4.1），认领游标与完成计数挂在任务自己的
+`SchedulerTaskControl` 上（§5.2）。**本设计不引入任何新的 GM 共享结构** —— 既没有认领槽，
+也没有 summary 位图或 entry 数组。
+
+这一节保留，是为了让下一个读者知道"找不到新结构"不是遗漏。
+
+### 5.2 `SchedulerTaskControl` 第一条线（`scheduler_types.h:838-862`）
+
+| 字段 | 读写 | 说明 |
+| ---- | ---- | ---- |
+| `next_block`（新增 `volatile uint64_t`） | 认领者 CAS | 下一个未认领 block。权威游标（§4 第 2 点） |
+| `completed_blocks`（新增 `volatile uint64_t`） | 完成者 `fetch_add` | 已完成 block 数 |
+| `block_num`（新增 `volatile uint64_t`） | host 写一次，核经 `gm_query` 读 | 本任务 block 总数 |
+
+**三个字段都必须是 `uint64_t`，不能用 `int64_t`。** `scheduler_gm_fetch_add`
+（`scheduler_memory.h:195-203`）**只有 `uint64_t` 一个重载**，`_fetch_or` / `_fetch_and`
+同样只有 `uint64_t`；只有 CAS 两种都有。写成 `int64_t`
+会在 `fetch_add` 那一行直接编不过。
+
+该线现用 24 字节（`state`@846 / `wake_list_head`@847 / `next_waiter`@852）+
+`atomic_line_padding[40]`@853，加三个 64 位字后为 48 + `padding[16]`，
+`sizeof == 128`（`:1177`）与两条 offset 断言（`offsetof(next_waiter) < 64`@1182、
+`offsetof(next_fanin_index) == 64`@1184）都不变。
+
+**`block_num` 放这条线而不是 `SchedulerTaskMetadata`**：metadata 是 16 字节的热结构
+（`scheduler_types.h:805-811`，`static_assert` 在 `:1175`），每个任务每次 dispatch 都要读，
+为 SPMD 加字段会让全图 metadata 读放大一倍。而第一条线只经 `ld_dev` 读，不需要 invalidate
+（约束 3.8），放一个只读字没有代价。
+
+**反转旧稿一条结论**：旧稿把 `next_block` 与 `completed_subtasks` 的 false sharing 列为
+"待实测确认，可能拆到另一条线"。**不能拆** —— 第二条线会被
+`scheduler_publish_cache_line(&control->next_fanin_index)`（`scheduler_ready.h:1671`，另一处在 `:706`）整线回写，
+把该核缓存里的旧副本拍回 GM。这正是 progress §7.10 那个真机回归的机制。注释里要写明这是
+约束而非取舍。
+
+### 5.3 `SchedulerLocalSlotState`（`scheduler_ready.h:144-150`）
+
+需要携带 `block_idx` 到完成路径（计数不需要它，trace 需要，见 §7.3）。当前 15 字节用满 + 1 字节
+padding，而 `block_idx` 要 16 位（非 sync_start 的 block_num 不设上限，CSA 已有 512）。
+
+取**加宽到 24 字节**并同步 `sizeof(SchedulerLocalSlotState) == 16` 与
+`sizeof(SchedulerLocalState) == 432` 两条断言（`scheduler_ready.h:312-313`）。这两条是防意外
+膨胀的 tripwire，不是 host↔device wire 契约（local state 是核本地的），可以改。
+8 个 slot state 共 +64 字节。
+
+> `aicore_executor.cpp:119-120` 记着"把时间戳挪出 kernel 调用的 live set，否则 resident 循环
+> 的 spill 会在 A5 上 fault"。局部状态变大不是免费的。若实测出现栈压力，退路是把
+> `state`（4 个取值）与 `subtask_slot`（0~2 + 无效）压进一个字节腾出空间，保持 16 字节。
+
+### 5.4 其他
+
+| 对象 | 变更 |
+| ---- | ---- |
+| `SchedulerGraphSummary`（`scheduler_types.h:885-888`） | 加 `spmd_task_count`，派生 `local->has_spmd`。**没有 SPMD 的图一轮都不读 SPMD 队列** —— 每核每轮一次 GM load 不是免费的，这个门必须有，形状照 `has_mix` |
+| `SchedulerFreeSlotClaim` | 加 `uint16_t block_idx{0}` 与 `uint16_t block_num{1}`（prepare 要把两者写进 payload，commit/completion 要用 block_idx 取 trace 下标）。**不设哨兵**：非 SPMD 任务就是「第 0 块，共 1 块」，这是它的真实形状而不是"没有值"，所以每个既有派发点一个分支都不用加 |
+| `SchedulerLocalSlotState` | 同样带 `block_idx` 与 **`block_num`**。后者是 §7.1 判「要不要跨 block 聚合」的依据（`block_num > 1`），放在槽里使完成路径不必读 metadata，也省掉 §7.1 原本要做的 `gm_query(control->block_num)` |
+| `SchedulerReadySource`（`scheduler_types.h:740-744`） | 加 `SPMD_CLAIM = 3`。不加的话这些 block 在 swimlane 里会伪装成 `LOCAL`，而 `ready_source` 正是 §10.2 用来判断 block 从哪来的字段 |
+| `SchedulerErrorSite`（`scheduler_types.h:914-947`） | 新增条目，沿用现有分段编号（ready 80 段 / bootstrap 90 段）：`SPMD_CLAIM_INVALID_BLOCK`、`SPMD_COMPLETION_OVERRUN`（`completed_blocks > block_num`）。**没有专属 site 的失败在设备日志里无法归因** —— `running-onboard.md` 的 507018 triage 整套流程都是按 site 走的 |
+
+**不需要** 任何新的 layout offset：没有新结构，所以 `AicoreSchedulerLayout`、
+`SchedulerWorkerContext` 的 `topology_reserved`、`SchedulerLocalConfig` 全都不动。
+SPMD 队列是 `ready_inboxes` 数组里的第 145 个元素，已有的 `ready_inboxes_offset` 就能寻址。
+
+## 6. 认领与发布
+
+整条路径只有一个新函数 `scheduler_claim_spmd_block`，它同时承担 peek、认领、推进 head 三件事
+—— 没有"搬上板"这一步，队首就是认领对象（§4.1）。
+
+### 6.1 调用点：主循环里自己的一次调用，排在所有取任务之前
+
+**不能放进 `scheduler_fill_own_slots`。** 那个函数开头就有
+`!scheduler_has_usable_slot(...) || !scheduler_ready_directory_nonempty(...)` 的提前返回
+（`scheduler_dispatch.h:45-51`），而 SPMD 队列**不进 directory**（§4.3），所以塞在那道闸门
+之后的认领**一次都不会执行**。
+
+门控 `local->has_spmd`，位置是 `scheduler_service_cluster_completions` 之后、
+**`scheduler_fill_mix_after_completions` 之前**，`scheduler_fill_own_slots` 更在其后。
+放在 Mix 之前是必须的，理由见 §4.5：两者争同一批放置资源。
+
+一个有利的副作用：完成路径攒下的 `direct_mix_ready` 候选是在
+`scheduler_fill_mix_after_completions` 里才真正派发的，所以认领排在它前面，等于让队首先看到
+那些刚空出来的 mix 槽。
+
+**bootstrap 不特殊处理**：`bootstrap_ready_graph` 照常 batch + push，root SPMD 任务在第一个
+稳态轮次被认领。bootstrap 与稳态同一条路径。
+
+### 6.2 认领（任何核）
+
+1. 读 `endpoints`，取 head。`EMPTY` ⇒ 返回（一次 `ld_dev`）。
+2. 读队首任务的 metadata，判形状：
+   - 与本核 core type 不匹配 ⇒ 返回（去 inbox 取普通任务，§4.4）。Mix 型只有
+     `is_mix_coordinator()` 继续。
+   - 是 sync_start 时，先扫本核自己的槽（自有 2 个 + 协调者的 mix 3×2）确认没有同一
+     `task_ref`（§8.1 第 2 条）。
+3. **先探放置，再 CAS 认领。顺序不能反。**
+   - 非 Mix：确认本核有 `state == FREE` 的自有槽。
+   - Mix：跑一遍 `scheduler_plan_mix_placement`，它可能失败（本 cluster 的 mix 槽或自有槽不空）。
+   - 探测**不改任何共享状态**，所以失败就是**本轮放弃、返回**，没有需要回滚的东西，
+     也**没有"换一个 SPMD 任务试试"这个选项**（队首唯一，§4.2）。
+   反过来写（先 CAS 后放置）会把一个 block 认领下来却无处安放，而 `next_block` **不能回退**
+   —— 那个 block 就永久丢失，任务的 `completed_blocks` 永远凑不满。
+4. 循环 CAS 推进 `control->next_block`，认领 **1 个**（约束 3.3）：
+
+   ```cpp
+   uint64_t current = scheduler_gm_query(control->next_block);
+   uint64_t claimed = UINT64_MAX;
+   while (current < block_num) {
+       const uint64_t observed = scheduler_gm_compare_exchange(control->next_block, current, current + 1);
+       if (observed == current) { claimed = current; break; }
+       current = observed;
+   }
+   ```
+
+   `current >= block_num` 退出 ⇒ 队首已认领干净，去推进 head（§6.3）再返回。
+   这也是"head 已被别人推进、本核还拿着旧 head"的唯一后果：权威在任务自己的游标上，
+   所以那次 CAS 不成立，无副作用（§4.2 末）。
+5. 填槽：构造带 `block_idx = claimed` 与 `block_num` 的 `SchedulerFreeSlotClaim`，
+   以及 `source = SchedulerReadySource::SPMD_CLAIM`（**新增枚举值**，否则这些 block 在
+   swimlane 里会伪装成 `LOCAL`，而 `ready_source` 正是 §10.2 用来判断 block 从哪来的字段）
+   的 `SchedulerReadyClaim`，走现成的 `scheduler_fill_dispatch_slot`。
+
+   **Mix 的三个值要填进 placement。** `scheduler_plan_mix_placement` 产出的
+   `placement.slots[0..2]` 本身就是三个 `SchedulerFreeSlotClaim`，所以 `block_idx` /
+   `block_num` 要在第 3 步探测成功后写进这三个 claim，`scheduler_dispatch_mix_ready` 随后把
+   它们原样传给三次 `scheduler_prepare_dispatch_slot` —— 不要在 prepare 里重新读 GM
+   （§6.4）。三个 subtask 共享同一个 `block_idx`：它们是同一个 block 的不同部分。
+6. 若 `claimed + 1 == block_num` ⇒ 推进 head（§6.3）。
+
+#### 稳态轮询的真实代价是两次 GM 访问，用一个核本地的字消掉第二次
+
+第 1 步是一次 `ld_dev`，但**第 2 步的 metadata 读更贵**：`SchedulerTaskMetadata` 是走
+DCache 的 16 字节结构，要 `scheduler_observe_cache_line`。所以"每核每轮一次 GM load"是错的，
+实际是一次 `ld_dev` 加一次 cache-line observe。
+
+最糟的场景恰好是 §4.2 已经接受的那个：一个 AIC-only 的 `block_num=512` 任务占着队首数秒，
+期间 **72 个 AIV 核每一轮都付这两次而一块也拿不到**。§4.2 把这笔账只记成"吃不到并行度"，
+漏了它同时是持续的轮询开销。
+
+**消掉它只要一个核本地的字**：记住上轮看到的 head `task_ref` 与当时判出的结论
+（匹配 / 不匹配 / 是 cohort）。head 没动就跳过第 2 步，稳态退回真正的一次 `ld_dev`。
+head 变了才重读 metadata。这是纯本地状态，不涉及任何共享结构，也不改变任何不变式 ——
+权威仍在任务自己的 `next_block` 上（§4.2 末），memo 过期的唯一后果是多跑一次 CAS 失败。
+
+**§8.1 第 1 条的直填抑制必须复用这个 memo。** 那条规则要求完成路径去读 SPMD 队首，
+而 §7.1 为了省掉完成路径上一次 metadata 读专门把判据放进了槽 —— 不复用 memo 就等于把省下
+的读原样加回同一条路径。门控顺序：`has_spmd` 为假直接跳过；为真时先比 memo 的 head，
+没变就用上轮结论。
+
+### 6.3 推进 head（让位给下一个 SPMD 任务）
+
+**就是现有的 pop**：`scheduler_ready_pop_from_inbox` 对 SPMD 队列调用一次，把 head 推到
+`next_waiter`。它的 CAS 以 `endpoints` 当前值为期望，所以两个核同时推进只有一个成功，
+另一个重试时发现 head 已变、或队列已空，都是正常路径。
+
+**`placement` 必须传 `nullptr`。这一条会静默挂死，不是风格问题。**
+`scheduler_ready_pop_from_inbox`（`scheduler_ready.h:1186`）里有：
+
+```cpp
+if (placement != nullptr && !scheduler_plan_mix_placement(..., head, placement)) return true;  // 不 pop
+```
+
+Mix 队列的调用方靠这一行实现"放不下就别取"。照抄到 SPMD 队列上会在**最坏的时刻**生效：
+一个 Mix SPMD 队首的 block 全部认领完时，它的 mix 槽**正被自己的 block 占着**，所以
+placement 必然失败 ⇒ head 永不推进 ⇒ 其后每个 SPMD 任务永久饿死。表现是 45s op-execute
+timeout 且**无 allocator fatal**，即 `running-onboard.md` 那张表里最难归因的"假死锁"签名。
+
+放置与让位在这里是两件无关的事：让位发生在 block 已经全部认领完之后，此刻没有任何东西
+要放。配一条 UT —— 构造一个 mix 槽占满的 Mix SPMD 队首，断言 head 仍然推进。
+
+**任何观察到 `next_block >= block_num` 的核都可以推进**，不必是认领到最后一块的那个 ——
+这样即便那个核紧接着进了长 kernel（约束 3.9：此时它的调度循环整个停摆），队首也不会被
+一直占着。
+
+**不需要三态占位，因为没有"搬运"这一步。** 任务从入队到让位始终在同一条链上，
+一生只入链一次（progress F-1 的性质原样成立）。
+
+### 6.4 把 block 送进 payload
+
+`scheduler_prepare_dispatch_slot`（`scheduler_ready.h:1325`）末尾补两行：
+
+```cpp
+payload->local_context.block_idx = slot_claim.block_idx;
+payload->local_context.block_num = slot_claim.block_num;
+```
+
+**两个值都从 claim 来，不在这里重新读 GM。** 认领那一步为了跑 CAS 循环本来就已经读过
+`control->block_num`（§6.2 第 4 步），所以 `SchedulerFreeSlotClaim` 同时带 `block_idx` 与
+`block_num` 两个 `uint16_t`。`scheduler_prepare_dispatch_slot` 在 Mix 下会被调三次，让它各自
+重读一次 GM 是没必要的。
+
+**不需要分支，因为非 SPMD 不是特例。** claim 的默认值就是 `0 / 1`，而那正是单块任务的真实
+形状；写成哨兵（曾考虑的 `BLOCK_IDX_NONE = UINT16_MAX`）会在这里和另外三个取下标的地方各引
+入一个 `== NONE ? 0 : x` 三元，去表达一件 `0` 已经表达了的事。
+
+这两个字段现在由 `host/runtime_maker.cpp:1386-1387` 在 per-run 镜像里硬编码成 `0 / 1`，
+resident 路径从不更新 —— **SPMD 在数据结构层面无法表达，根源就在这里**。legacy AICPU 路径
+写的是同样两个字段（`runtime/scheduler/scheduler_dispatch.cpp:178-179`），可作对照。
+非 SPMD 任务仍得到 `0 / 1`，与现状一致，不需要分支。
+
+`local_context` 在 CL0，而 `scheduler_writeback_dispatch_payload` 本来就回写整个 512B
+（`scheduler_memory.h:77-85`），**cache 维护代码一行不改**。
+
+## 7. 完成聚合
+
+### 7.1 两级计数
+
+`scheduler_service_cluster_completion_slot` 的 `task_complete` 分支
+（`scheduler_completion.h:181-186`）扩展为：
+
+```cpp
+bool task_complete = true;
+if (mix_tracker != nullptr) {
+    ... 现有 Mix 逻辑不变,聚合的是「这个 block 的各子任务」...
+}
+// 判据来自槽本身:block_num 是派发时从 claim 写进去的,而 host 写一次 control->block_num
+// 后再不改变,两者恒等。所以这里既不读 metadata 也不读 GM,而单块任务一条原子都不付。
+// completed_blocks 是 uint64_t —— fetch_add 没有 int64 重载(§5.2)。
+if (task_complete && completed_block_num > 1) {
+    const uint64_t done = scheduler_gm_fetch_add(control->completed_blocks, 1) + 1;
+    task_complete = (done == completed_block_num);
+}
+```
+
+**判据是 `block_num > 1`,不是哨兵。** 本稿初版曾给 `block_idx` 设一个
+`SCHEDULER_BLOCK_IDX_NONE = UINT16_MAX` 哨兵来回答"要不要跨 block 聚合",**已撤销**:
+非 SPMD 任务就是「第 0 块,共 1 块」,那是它的真实形状而非"没有值"。把 `block_num` 一并
+存进 `SchedulerLocalSlotState` 是免费的(槽已因对齐填到 24 字节),于是判据成了它的定义本身,
+省掉四处 `== NONE ? 0 : x` 三元,也省掉这里原本要做的 `gm_query(control->block_num)`。
+
+这个函数在**关 timing 的运行里**不读 `SchedulerTaskMetadata`,上面的判据必须保持这个性质
+—— 为拿 `flags` 去加载 metadata 会给每个任务的完成路径添一次 GM 读。但不要在注释里写成
+"这个函数从不读 metadata":开了 timing 时 `:132` 的 `scheduler_trace_index_at` 内部第一行
+就是 `scheduler_task_metadata_at`,那一次读本来就付了,而 §7.3 正要给同一个函数加形参。
+
+- **非 Mix SPMD**：一个 block 就是一个子任务，每块一次 GM 原子。
+- **Mix SPMD**：block 内由认领它的那个 AIC 的**本地** tracker 聚合（不变），tracker 凑齐时才
+  做一次 GM 原子。所以是 `block_num` 次原子，而不是 `block_num × popcount(active_mask)` 次
+  —— 比旧稿"一个计数器同时覆盖 block 维与 lane 维"更省，而且本地 tracker 本来就在那里。
+
+`completed_block_num` 与 `completed_block_idx` 都要和现有的 `completed_subtask_slot` 一样，
+在**清槽之前**从 `local_slot` 取出来（`scheduler_completion.h:176` 取 `completed_subtask_slot`，
+清槽在 `:187-190`）——前者是上面的判据，后者是 §7.3 的 trace 下标。**S0 已经把 trace 下标
+那一处做好了**（它在 `:132`，天然早于清槽）；S1 只需在同一函数里把 `block_num` 也取出来。
+
+> **同一个 Mix SPMD 任务在同一个 AIC 上可以有两个 tracker**（两个 block 各一个，
+> `SCHEDULER_MIX_TRACKER_COUNT = 6` 够用）。看着像 bug 其实不是：tracker 按
+> `local_slot->mix_tracker` **按下标**查，不按 task_ref 查，所以两个同 task_ref 的 tracker
+> 互不干扰。sync_start 则被 §8.1 第 2 条禁止出现这种情况。
+
+`task_complete` 为 true 之后下游**完全不动**：DONE 置位、wake list 解依赖、`++pending_completed`
+全部沿用，`resolved_task_count` 仍每 task 加 1，约束 3.5 满足。
+
+### 7.2 非末块不得解依赖
+
+`scheduler_resolve_completion` 只在 `task_complete` 为真时被调用，而 `direct_ready`（完成时把
+刚唤醒的后继直填回刚空出的槽）是在它**内部**产生的，所以非末块自动既不解依赖也不直填。
+这条要在代码里写成 present-tense 不变式并配一个 UT：解两次依赖的表现是
+`site=62 COMPLETION_WAKE_ALREADY_CLOSED`（progress §7.10 见过这个签名）。
+
+### 7.3 trace 必须按 block 展开
+
+`scheduler_task_trace_index` 改为：
+
+```cpp
+trace_index_base + block_idx * popcount(active_mask) + popcount(active_mask & ((1u << subtask) - 1))
+```
+
+非 SPMD 传 `block_idx = 0`，结果与现状逐位相同。`trace_index_base` 本来就按
+`block_num × active_subtasks` 步进，**空间已经预留**（§2.1 第 1 点）。
+调用点三处：`scheduler_commit_dispatch_slot`、完成路径的 `scheduler_trace_index_at`
+（`scheduler_ready.h:838-841`，签名要加 `block_idx` 形参，值从 `local_slot->block_idx` 来）、
+以及 `resolve_completion` 里那段 `ready_transition_cycles` 循环（`scheduler_ready.h:1636-1648`）
+—— 最后一处在"还没有任何 block 被认领"的时刻执行，只写 block 0 的 cell。
+
+下游影响待确认：`simpler_setup/tools/swimlane_converter.py` 会收到**同一 task_id 的多条
+记录**（每 block 一条，`worker_id` 各不相同）。这正是验证"block 真的铺开了"所需的数据，
+但 converter 与 `dfx/chip_swimlane` 用例的断言需要同步核对。
+
+## 8. sync_start
+
+sync_start 的 kernel 内部有跨 block barrier，硬要求是 **co-residency**（所有 block 都拿到核），
+不是"同一纳秒启动"。先到的在 barrier 上等后到的，正常。
+
+旧稿 §3 的死锁分析仍然成立，逐条复核后不变：
+
+- non-sync_start 之间并发认领不死锁（已认领的 block 跑完即释放核）；
+- non-sync_start 与 cohort 并存不死锁（同理）；
+- **只有两个 sync_start cohort 之间会死锁**（各占一半、都等凑齐）。
+
+### 8.1 co-residency 靠哪四条成立
+
+旧稿的"全局停取"**不在**这个集合里（§8.2）。而"一次一个"直接免掉了两条本来会需要的规则：
+cohort 之间的互斥令牌、以及"cohort 优先于 non-sync_start"的优先级规则 —— 队首唯一，
+两者都成了结构性事实。
+
+| # | 规则 | 没有它会怎样 |
+| - | ---- | ------------ |
+| 1 | **SPMD 优先于 inbox（§4.4 的次序），且队首是 cohort 时抑制直填** | 直填绕过这个次序（见下方「直填旁路」），核永远没有空槽给 cohort |
+| 2 | **每核每 cohort 至多 1 个 block** | 单核内自锁：块 B 在 barrier 等 B'，而 B' 正排在同一个核的另一个槽里等 B 让出执行流（约束 3.3）。判据见下方「谁来判、扫哪些槽」 |
+| 3 | **`block_num ≤` 该形状可用核数** | barrier 永远等不齐。由 §9 第 2 条保留下来的 demand 校验提供 |
+| 4 | **队首在 block 全部认领完之前不让位**（§6.3） | 若中途让位，cohort 的剩余 block 再也没人认领 |
+
+**两个 cohort 不可能同时在认领**，因为队首唯一：C2 要等 C1 的 block 全部认领完、head 推进
+之后才成为队首。所以旧稿需要的"cohort 互斥"与本稿初版设想的 `summary bit[32]` 令牌
+**都不需要存在**。
+
+#### C1 必然完成：令牌不存在了，但这条链仍要走一遍
+
+head 在"C1 全部认领完"（而非全部完成）时就推进，C2 随即成为队首并开始被认领。此时 C1 的某些
+block 可能还在槽里排队未执行，所以"C1 必然凑齐"需要一条链：
+
+- C2 的块一定在 C1 之后被认领 ⇒ 它的 generation 更大（generation 是本核单调递增的
+  `dispatch_sequence`）；
+- 执行取 generation 最小（约束 3.10）⇒ 同一核上 C1 的块**必先于** C2 的块执行；
+- 于是 C1 的块前面只可能排着**一定会完成**的东西（普通任务或 non-sync_start 的块），
+  **绝不会排着另一个 cohort 的块** ⇒ C1 凑齐 ⇒ 完成 ⇒ C2 才真正开始跑。
+
+**这条链是约束 3.10 的唯一用户。** 谁把槽选择从"最老优先"改成 LIFO 或轮转，就静默破坏了
+sync_start 的正确性：X 先跑 C2 块等 C2 齐、Y 先跑 C1 块等 C1 齐，各自的另一半压在对方的
+第二个槽里。
+
+#### 第 2 条：谁来判、扫哪些槽
+
+判据不需要新增状态 —— block 一直占着槽直到完成，所以"扫槽找同一个 `task_ref`"就是精确判断，
+且随完成自动失效。但**扫哪些槽取决于谁是认领者**，两种情况不同：
+
+| cohort 形状 | 认领者 | 扫什么 |
+| ----------- | ------ | ------ |
+| AIC-only / AIV-only | **执行核自己** | 自己的 `slots[0..1]` |
+| Mix | **本 cluster 的协调者 AIC** | 自己的 `slots[0..1]` **加** `mix_slots[1..2][0..1]`（三条 lane 全覆盖） |
+
+**Mix 的判据只能由协调者做，这一点容易写错。** AIV 核执行 mix 槽里的任务时，task_ref 是从
+SSBUF 的 `mix_dispatch` 读的（`aicore_executor.cpp:453`），它的 local state 里**根本没有
+mix 槽的 slot state** —— 那份状态由协调者独占持有（`scheduler_ready.h:296` 的注释写明了
+这件事）。所以 AIV 核无法自查"我是不是已经有这个 cohort 的块"；必须由协调者在认领时
+一次性确认整个 cluster 的三条 lane 都没有它。
+
+好在这正是协调者本来就能做到的：`mix_slots` 只有它写，所以它看到的是权威状态而非快照
+（这与 §6.2 第 3 步 Mix placement 探测之所以精确是同一个理由）。
+
+#### 直填旁路：为什么第 1 条不只是"检查次序"
+
+执行器主循环的顺序是
+`scheduler_service_cluster_completions` → `scheduler_fill_mix_after_completions` →
+`scheduler_fill_own_slots`，而**直填发生在第一步内部**：一个核完成任务后，把自己刚解出的
+后继直接填回刚空出的槽（commit `344fc19e` 恢复的路径，`scheduler_completion.h` 的
+`resolved_ready`）。它绕过 ready 队列 —— **也绕过 SPMD 队首那次检查**。所以把队首检查排在
+`fill_own_slots` 之前并不够：只要每次完成都能解出一个后继，这个核在队首检查的那一刻
+**永远没有空槽**。
+
+后果在有限 DAG 里不是死锁（链总会耗尽），但严重程度接近：cohort 的集结被拖到"图里其余
+可达工作基本跑完"，而**已认领的 block 此时卡在 barrier 里自旋——那个核在 `execute_task`
+内部，整个调度循环都停了**（约束 3.9），连它的第二个槽都不会再被填。真实负载上这与挂死无异。
+
+所以第 1 条要补一句：**队首是 cohort 且其 core type 与本核相符时，跳过直填**，让那个槽空出来
+给队首。这是旧稿"全局停取"的最小必要版本 —— 只针对直填、只针对 cohort、只针对匹配的
+core type，而不是让整类核停止取新任务。
+
+推论：**槽里的普通任务一定会终止** —— 任务只有在 fanin 全 DONE 之后才会被放进槽，所以它不可能
+反过来依赖这个 cohort。于是有了 1~4，每个核都会在"一个普通任务的时长"之内空出槽，并在那一刻
+优先认领 cohort block。**但请注意这个"一个普通任务的时长"正是第 1 条补丁买来的** ——
+没有抑制直填，它会变成"剩余图的时长"。
+
+### 8.2 停取规则是性能项，不是正确性项
+
+「队首是 cohort 期间，该类型的核只认领 cohort block，**不从自己 inbox 取新任务**」——
+注意它与 §8.1 第 1 条的补丁不是一回事：补丁只拦**直填**（因为直填连队首都不看），
+这里拦的是**从 inbox 正常取任务**（那条路径本来就排在队首检查之后）。由 §8.1 的
+推论，没有它 cohort 同样会凑齐，只是每个核可能先跑完手上那个普通任务，barrier 的等待因此变长。
+所以它是**可选的延迟优化**：范围按 `tag` 的 core type 收窄（AIC-only 的 cohort 不冻结 AIV 核），
+实测 barrier 等待成为瓶颈时再加。
+
+> 本稿初版把它列为"唯一一处错了会静默挂死的机制"。那是错的 —— 把 §8.1 的四条判据写全之后，
+> 它落在正确性集合之外。记在此处是因为"停取"听起来像安全底线，容易被下一个人重新当成必需品。
+
+**一个 per-core 新增的延迟项（同样非正确性）**：Mix cohort 的 AIV 子任务落在 mix 槽上，而执行器
+先取自有槽、再扫 mix 槽（`aicore_executor.cpp:366-445`）—— 计划 D4 的"mix 优先 + 有界让行"
+**未实现**。所以 cohort 的 AIV 子任务可能排在两个普通任务之后。有界，不死锁，但会把 barrier
+等待拉长，和上面那条是同一类问题、同一个处置：实测说话。
+
+**不设超时。** cohort 已 ready 说明其 fanin 全 DONE，不依赖任何待执行任务；§8.1 的四条保证
+每个核都会在有限时间内空出槽并优先认领 cohort block。cohort 必然凑齐。
+
+TMR 的 stop-the-world / 二叉 ack 树 / coordinator / `force_gate` + doorbell / rendezvous launch
+在此**一个都不需要**，理由与旧稿相同（它们服务于"没有 SPMD 互斥"的前提）。
+
+## 9. Host 侧放行
+
+1. `scheduler_graph.h:59-61` 的谓词去掉 `logical_block_num == 1` **与** `!sync_start`。
+   剩下的 `active_subtasks >= 1 && <= 3` **恒真**（mask 只有 3 bit，0 已被 `runtime_maker.cpp:1174`
+   拦住），所以这个谓词随之失去意义 —— 但 `SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE`
+   （mode=4）**必须保留并换一个判据**，见第 2 条。
+2. **必须放宽 worker demand 校验** —— 这是放行的硬前置，不是优化：
+
+   `runtime_maker.cpp:1244,1249` 现在对**所有**任务取
+   `aic_worker_demand = max(block_num)`、`aiv_worker_demand = max(block_num × AIV 子任务数)`，
+   `aicore_lifecycle.cpp:242` 据此拒绝超出真实核数的图。对 non-sync_start 这是错的：
+   block_num 大于核数完全正常，blocks 分波次跑完即可。不改就会拒掉：
+
+   | 负载 | 现算法得出的 demand | 真实核数 | 结果 |
+   | ---- | ------------------: | -------: | ---- |
+   | qwen3 decode 的 `q_proj_spmd`：`rt_submit_aic_task` + `set_block_num(50)`（`decode_fwd_layers.cpp:406,415`） | **AIC 50** | 36 | **拒绝 bind** |
+   | CSA，`block_num` 最大 512 | AIV ≥ 512 | 72 | **拒绝 bind** |
+
+   第一行是查实的（不是按 Mix 形状推的）：它是 AIC-only，50 个 block 要 50 个 AIC，而全机只有
+   36 个。同一文件 `:532` 还有一个 `rt_submit_task(mixed_11, …)` 的 **Mix + sync_start** 任务
+   （`set_require_sync_start(true)`@521、`set_block_num(24)`）。
+
+   > **qwen 同时含 sync_start，这件事有两个后果。** 其一，它那条 sync_start 任务按本方案
+   > **仍然贡献 demand**：AIC 24 ≤ 36、AIV 24×2 = 48 ≤ 72，**恰好过关** —— 它是"碰巧不触发"
+   > 而不是"被放宽救下"，别把它算进放宽的收益里。其二，qwen 因此**不是一张 non-sync_start
+   > 的图**，所以 §10.2 那条"S1 后对 non-sync_start 图不得出现回退日志"在 qwen 上要连 cohort
+   > 路径一起看 —— 反过来说，这让 qwen 成了 S1 里同时覆盖两条路径的现成负载。
+
+   改法分两半：
+
+   - **non-sync_start 不再贡献 demand**，block_num 不设上限（分波次跑完即可）。
+   - **sync_start 仍贡献 demand**（它才真需要 co-residency），但超限时的处置
+     **从"硬失败"改成"整图回退 legacy"** —— 这就是 mode=4 的新判据。
+
+   这一半不是可选的。今天**所有** sync_start 图都回退 legacy 并能跑；若放行后让超限 cohort
+   撞上 `aicore_lifecycle.cpp:242` 的硬失败（`prepare_native_run failed with code -1000`），
+   那是一次**能力回退**——一张今天能跑的图从此跑不了。保留 mode=4 的另一个好处是
+   `spmd_legacy_fallback` 用例仍有被测对象（§10.4），而不是随谓词一起失去意义。
+
+   **回退必须判在 host 侧**，因为 `aicore_lifecycle.cpp:242` 那道检查在 AICPU 上、返回 -1
+   就是硬失败，没有"整图换调度器"的余地。host 有算核数所需的一切：
+   `runtime_maker.cpp:1489-1499` 已经在用 `runtime->get_worker_count() / PLATFORM_CORES_PER_BLOCKDIM`
+   推 `total_cluster_count` 与 `total_aiv_count`。**但那段在准入循环（`:1150-1266`）之后**，
+   所以这几个数要提前算，或者把 cohort 的超限判断挪到它之后、与 `legacy_shape_task_ref`
+   汇合再决定。
+
+   顺带一提，收窄后的 demand 口径与旧稿 §7.2 那张"按形状取上限"的表**自动等价**
+   （Mix 的 `block_num × 2 ≤ 72` 即 `block_num ≤ 36 =` cluster 数），所以旧稿要求的那个新增
+   校验**不需要写** —— 现成的这条就是它。
+3. 既有的两道乘积上界保留：`logical_block_num > UINT16_MAX / active_subtasks`
+   （`runtime_maker.cpp:1174`）与 `expected_subtasks > UINT16_MAX`（`:1184`）。
+   `total_required_subtasks` 与 trace cell 数都受它们约束。
+4. **三个新字段有两处初始化点，必须写明归属。** 设备侧 `scheduler_init_data_from_layout`
+   （`scheduler_types.h:1366`）先 `__builtin_memset(base, 0, total_size)`，再对每个 control
+   显式写 4 个字段（`state` / `wake_list_head` / `next_waiter` / `waiting_producer`）；而每个
+   任务的 `logical_block_num` 只有 host 侧 `create_scheduler_state`（`runtime_maker.cpp:1088`）
+   知道。所以：`next_block = 0` / `completed_blocks = 0` 跟着设备侧那个显式循环走（与已有的
+   4 个字段并列），`block_num` 由 host 写，非 SPMD 填 1。
+   **不写明归属的后果会被零值掩盖** —— memset 恰好给出 0，于是"两边都以为对方负责"在今天
+   能跑，直到 layout 变了或 memset 被收窄才爆。
+5. `scheduler_task_ready_queue`（`scheduler_types.h:816-818`）先判 SPMD flag 再判 MIX，
+   使 Mix+SPMD 也进 SPMD 队列。认领者从 metadata 读形状（§6.2 第 2 步），不需要别处再存一份。
+
+> **准入门是唯一事实来源。** 阶段 B 删掉了 `scheduler_task_is_gang` 及其全部下游守卫
+> （progress D-2），当时记下的附带后果正是此刻要处理的第一件事：放行后，一个形状错误的 SPMD
+> 任务不会再被下游拒绝，而是**静默走错路径**。所以 §9 的五条里每一条都要有对应的负向用例
+> （见 §10.4），不能只靠"跑通了"。
+
+## 10. 落地顺序与验证
+
+### 10.1 阶段划分
+
+| 阶段 | 内容 | 出口条件 |
+| ---- | ---- | -------- |
+| **S0** | 基础设施：SPMD ready 队列（全局唯一，复用 `SchedulerReadyInbox`）、`inbox_base`/`holder`/`refresh`/`push_target` 四处改动、TaskControl 三个字段、`has_spmd` 门、`block_idx`+`block_num` 贯穿 claim/payload/slot/trace，外加 `TaskType` 枚举（见下）。**不改准入谓词** | **已完成**（分支 `a5-hbg-resident-spmd`，未提交）：C++ UT 317 全绿、a5sim ST 全绿。队列恒空、`has_spmd` 恒假 |
+
+> **S0 实做时比本节原计划多了一笔：`core_type_index` → `enum class TaskType`。**
+> 第 4 条队列让这个名字彻底失效 —— 0/1/2/3 是 AIC/AIV/MIX/SPMD **队列**，而
+> `self_core_type` / `scheduler_core_type_index()` 仍是真正的 core type，两者共用名字又共用
+> 0/1 编码。`scheduler_self_task_type()` 是它们唯一相遇处。换成枚举后编译器逼出约 60 处隐式
+> 转换，其中一处是真 bug：`scheduler_resolve_completion` 的 `direct_core_type` 名义是 core
+> type，UT 却传 `MIX_QUEUE`(2) 表示"不直填"。顺带把误导人的 `capacity`/`owner_count` 改成
+> `inbox_capacity`/`inbox_count` —— 它们是**inbox 个数**，不是队列能排几个任务（一个 inbox
+> 是侵入式链表，任务数无上限；SPMD 队列只有 1 个 inbox 正是因此才够用）。
+| **S1** | 全部放行：认领、推进 head、两级计数、demand 放宽 + mode=4 换判据、§8.1 的四条。non-sync_start / sync_start / Mix 一并 | 新增 ST 全绿；`scheduler_mode` 断言为 resident；分布断言显示 block 真的跨 cluster；CSA 门禁转为通过 |
+
+S0 单独合入的价值与阶段 0（改名）相同：它是可验证的零行为变化改动，把 S1 的 diff 压到只剩
+真正的逻辑。
+
+**sync_start 不单独成阶段的理由**：它的增量只有"认领时扫自己槽"（§8.1 第 2 条）、直填抑制
+（§8.1 第 1 条）、以及可选的停取早返回 —— 与 non-sync_start 共用队列 / 认领 / 计数 /
+`block_idx` 的全部代码。互斥令牌**不存在**（队首唯一即互斥，§8.1）。
+§8.2 把停取规则定性为性能项之后，S1 里只有两处失败不会当场报错：
+
+| 出错的地方 | 表现 |
+| ---------- | ---- |
+| 认领 / 两级计数 / 推进 head | `site=44 DISPATCH_INVALID_SHAPE`、`site=62 COMPLETION_WAKE_ALREADY_CLOSED`、或结果比对失败 |
+| demand / 准入 | bind 直接拒绝，或 `scheduler_mode` 断言报 legacy |
+| §8.1 的第 2 条（每核 ≤1 块） | cohort 死锁 ⇒ 45s op-execute timeout 且**无 allocator fatal**，即 `.claude/rules/running-onboard.md` 的"假死锁"签名 |
+| §8.1 第 1 条的直填补丁 | **不是死锁，所以更难发现**：cohort 最终会凑齐，只是要等图里其余可达工作跑完。表现为 cohort 用例"能过但异常慢"，或在大图里撞上 45s 超时。**用例必须量 cohort 的集结时间，不能只断言结果正确** |
+
+后两行是 S1 里仅有的两处需要靠签名/时延识别的失败，所以它们的用例（§10.4 的 cohort 满额档）
+要先写。其余的都会当场报错。
+
+### 10.2 S1 的主验收信号
+
+**"测试绿"不能证明改动生效** —— SPMD 用例即使整图回退 legacy 也会结果正确地通过。这是本设计
+最容易误判的一点，但阶段 A 已经把工具建好了：
+
+| 信号 | 来源 | 判据 |
+| ---- | ---- | ---- |
+| 走的是 resident 而非 legacy | `@pytest.mark.scheduler_mode("resident")`（阶段 A2 的 conftest fixture，`tests/st/a5/host_build_graph/conftest.py`） | 每个用例无条件校验，且 `published == 0` 也算失败 |
+| block 真的铺开了 | chip_swimlane 的每 block 一条记录（§7.3），distinct `worker_id` | 阈值按 run 自报的 `num_cores` 推导，照 `fanout_imbalance` 的 `test_fanout_spread_is_wide` 写法，**自建 Worker 自开 swimlane**，不能用 `if level == 0: return` 那种会静默跳过的形态 |
+| 日志里不再出现回退 | `A5 HBG: retaining AICPU scheduling ... with SPMD or sync-start shape` | S1 后对 non-sync_start 图不得出现 |
+| 端到端性能真的改善 | 同一用例改前（legacy）/ 改后（resident）对照 | 口径照 progress §0.5「控制变量」：同一张卡、`--rounds 100`、Trimmed Avg、剔零轮与首轮、2% 以内不算信号 |
+
+**CSA 用例是天然的验收负载**（progress F-6）：它整图因 SPMD 回退 legacy，其门禁
+`run.py l4 -d 0 --require-aicore-scheduler` 现在**必须失败**，S1 后应当**转为通过** ——
+这是一个已经建好、语义明确、且不依赖新写断言的验收点。唯一阻塞是 399 MiB 冻结数据缺失，
+缺数据时 pytest 明确 skip，不会把跳过当成功。
+
+### 10.3 必须新增的 C++ UT
+
+`tests/ut/cpp/a5/runtime/host_build_graph/` 现有 10 个文件 144 个 `TEST`，改 `runtime/` 下的
+C++ **必须跑它**（`.claude/skills/testing/SKILL.md:146` 给出命令本身；`:143` 那行把
+`src/{arch}/runtime/<rt>/*` 的 scope 定为单 runtime pytest，要靠 `:148`「Mixed → 升到最宽
+scope」才推到 C++ UT —— 所以这是**推出来的**而不是直接写明的，但 progress §7.6 记过一次只跑 sim ST 就
+提交、结果 UT 编不过的教训）。SPMD 的大部分不变式在 UT 里比在真机上好守得多：
+
+| 落点 | 测什么 |
+| ---- | ------ |
+| `test_hbg_scheduler_contracts.cpp` | **S0 已做**：`inbox_base(SPMD) == 144` 且不与 MIX 撞车、`inbox_capacity(SPMD) == 1`、`INBOX_CAPACITY == 145` 与补到 SPMD 的 tiling / contiguous static_assert；SPMD 无 directory 行；`scheduler_task_ready_queue` 中 SPMD 压过 MIX；`scheduler_self_task_type` 不映射到 SPMD；trace 下标按 block 步进且 block 0 与改前逐位相同；`SchedulerTaskControl` 三个新字段 `offsetof < 64` 且 `sizeof == 128` 不变；单块任务是「第 0 块共 1 块」 |
+| `test_hbg_scheduler_ready.cpp` | SPMD 队列的 push target 恒为 0；`holder(3, *)` 对两种 core type 都为真；`refresh` 对 queue 3 不碰 directory；**peek 不推进 head**（读完 `endpoints` 后队列状态不变） |
+| `test_hbg_scheduler_dispatch.cpp` | 认领循环（并发 CAS 下 `block_num` 个 block 恰好各被认领一次、无重无漏）；**先探放置后 CAS**（构造一个放不下的 Mix 场景，断言 `next_block` 没动）；拿旧 head 去认领一个已认领干净的任务应无副作用；**全部认领完才推进 head**，推进后下一个 SPMD 任务成为队首 |
+| 同上 | 两级计数：`block_num - 1` 次完成不得置 DONE、不得解依赖、`pending_completed` 不增；第 `block_num` 次三者同时发生一次 |
+| 同上 | cohort：同一核第二次认领同 `task_ref` 必须被拒（§8.1 第 2 条）；**队首是 cohort 时完成路径不得直填**（§8.1 的直填旁路——构造"完成后解出一个同类型后继"的场景，断言那个槽留给了队首） |
+
+UT 覆盖不到的只有两类：`aicore_executor.cpp`（**C++ UT 不编译它**，设备侧由 ccec 编）和真实
+并发时序。前者靠 `pip install --no-build-isolation -e .` 之后的 sim/onboard 兜，后者靠 §10.4
+的 manual 规模档。
+
+### 10.4 ST 的家底与缺口（已调查，2026-10-22）
+
+> **用户决定：先把功能做好，暂不移植 TMR 用例。** 本节是调查结论的留存，供移植阶段开工时
+> 直接取用，**不是 S1 的前置条件**。但其中「S1 必然变红的 4 个用例」是 S1 自己要处理的。
+
+#### 家底：HBG 侧没有一个能在 resident 上跑多块
+
+`tests/st/a5/host_build_graph/` 下 `block_num > 1` 的用例**总共 4 个，全部钉死
+`scheduler_mode("legacy")` 或 manual**：
+
+| 用例 | 形状 | 状态 | S1 之后 |
+| ---- | ---- | ---- | ------- |
+| `spmd_legacy_fallback::TestSpmdLegacyFallback` | AIC-only `block_num=2` | 非 manual，钉 `legacy` | **变红**（见下） |
+| `single_root::TestHbgSingleAicSpmdLegacyFallback` | 同上 | 非 manual，**无 marker** | 行为改变但不报错 |
+| `graph_execution::...MixSpmd` | Mix + sync_start，`block_num = cluster 数` | 非 manual，钉 `legacy` | **变红**；但 `TaskKind::GRAPH` 仍回退 legacy（§13），所以它**应该继续绿** —— 要核实 |
+| `graph_sync_start_early_dispatch` | Mix sync_start 满 cluster 宽 | 非 manual，钉 `legacy` | 同上 |
+| `spmd_paged_attention` | Mix `block_num=24` | **全部 manual**，仅 a5 | 不在默认门禁里 |
+
+**`spmd_legacy_fallback` 连"真的跑了 2 块"都证明不了**：它的 kernel 只写 `out[0]=42`，
+两块写同一地址，所以 golden 对块数和块序都不敏感。它唯一守住的是那个 `legacy` marker。
+
+**S1 的处置**：按 §9 第 2 条把它改向到"`block_num` 超过本机该形状核数的 sync_start cohort"
+—— 那是 mode=4 唯一剩下的产生者。`conftest.py:48` 的 `_LEGACY_MODES = {3, 4}` 同时接受两种
+legacy，改向时顺手收紧成只接受 4。`single_root` 那个继承版按 progress 的记录本来就守不住
+（父类先跑时它绑到父类的单块图），一并删掉。
+
+#### 三条核心性质：HBG 没有，TMR 也没有
+
+| 性质 | 为什么现有用例守不住 |
+| ---- | -------------------- |
+| **非末块不得解依赖**（§7.2） | 所有 golden 只看最终输出。提前解依赖只在"后继读前驱全部块的输出"时才暴露，而现有用例的后继要么不存在、要么不读 |
+| **两级计数**（Mix 的 block 内 subtask + block 间 block） | 同上，且需要让同一 block 内 AIC 与 AIV 完成时间错开才测得到 |
+| **block 真的跨 cluster 铺开** | `graph_execution` 只断言"每个 `block_idx` 出现一次" —— 所有块挤在一个核上也能过 |
+
+这三条**必须新写**，是移植阶段的最高优先级。前两条是计数逻辑最容易写错的地方，而且错了之后
+**结果可能仍然正确**。
+
+#### 可移植清单（TMR 侧，9 个低到中成本）
+
+kernel 基本不动（HBG 已有先例直接引用 TMR 的 kernel），编排各改三处：`Tensor` 类型、
+`set_core_num` → `set_block_num`、`layout` 汇报方式。最对口的两个：
+
+| TMR 用例 | 直接对应本设计的什么 |
+| -------- | -------------------- |
+| `spmd_multiblock_mix` | 5 个无依赖 Mix 任务同时 ready，`block_num ∈ {2,8,12,24,48}` —— 队首唯一 + 超 cluster 数 |
+| `spmd_batch_dispatch_oob` | 2 个 `block_num=48` 背靠背 —— 队首唯一的核心场景 |
+| `spmd_multiblock_aiv` | AIV-only 多块（HBG 完全没有），最大 96 |
+| `spmd_starvation` | 18 个普通 Mix + 2 个 sync_start Mix 交错 —— SPMD 混 sync_start 不饿死 |
+| `spmd_sync_start{,_aiv,_edge}` | sync_start 各形状；`_edge` 是满额档候选 |
+| `spmd_sync_start_stress` | 54 任务 / 6 轮，kernel 近空 —— **最适合做调度开销基线** |
+
+**不要移植** `spmd_sync_start_mix_spill`（依赖 TMR 独有的 pre-stage / rendezvous 机制，HBG 下
+语义不同）与 `spmd_sync_start_early_dispatch`（HBG 已有 Graph 版）。
+
+仍缺、TMR 也没有的档：`block_num = 7`（跨 cluster 非整数倍）、AIV-only 128、Mix 64、
+**AIC-only 多块**（TMR 一个都没有）。
+
+#### 性能对照有一个结构性障碍
+
+`conftest.py` 的 `scheduler_mode` **是断言，不是切换开关**。S1 之后 SPMD 不再回退，
+**同一个二进制跑不出 legacy 那一侧**。所以对照只能**跨 commit**做（S0 的 HEAD vs S1 的 HEAD），
+这与 progress §0.5 要求的"同一张卡、同一时段、自己跑的 before/after"仍能满足，但必须记清
+是两个构建而非一个开关。
+
+另外唯一能自动跑的 `spmd_paged_attention` 只有**一个** SPMD 任务，调度开销被计算完全淹没 ——
+它测的是单任务多块吞吐，不是本设计关心的东西。调度开销要靠移植后的 `spmd_sync_start_stress`
+（54 任务、kernel 近空）。
+
+#### 两个未查实的问题（开工前要确认）
+
+1. **HBG 里多个无依赖多块任务是否真的同时 ready** —— 取决于入队时机。这直接决定"队首唯一"
+   用例怎么构造：若它们不是同时 ready，用例就退化成串行提交，守不住队列排队。
+2. **大 `block_num` 开 swimlane 会不会超时** —— `fanout_imbalance` 在 1024 任务时撞过
+   scheduler timeout（记在该用例注释里），所以 `block_num = 512` + swimlane 的分布断言
+   规模要先试探。
+
+### 10.5 回归口径
+
+```bash
+# 改了 C++ 之后,顺序固定(progress §0.5)
+pip install --no-build-isolation -e .
+cmake --build tests/ut/cpp/build -j 24 && ctest --test-dir tests/ut/cpp/build -LE requires_hardware
+LD_LIBRARY_PATH=/opt/gcc-15/lib python -m pytest tests/st/a5/host_build_graph --platform a5sim -q
+```
+
+**性能/规模档必须带 `--manual include`**：progress §7.10 那个 MPMC 真机回归正是在 manual
+规模档上暴露的，pytest 默认口径完全覆盖不到。SPMD 的并发度比它更高，这一条尤其适用。
+
+## 11. 风险
+
+| 风险 | 说明 / 对策 |
+| ---- | ---- |
+| **队首轮询开销** | 每核每轮一次 `ld_dev` 读 `endpoints`，**外加一次 metadata 的 cache-line observe**（§6.2 末）。`has_spmd` 门使无 SPMD 的图完全不付（§5.4）；有 SPMD 时靠核本地的 head memo 让稳态退回一次 `ld_dev`。最糟的场景是 AIC-only 大任务占队首数秒，72 个 AIV 核持续付而一块也拿不到。若实测仍显形，退路是降频到每 N 轮一次 —— 代价是认领延迟，不是正确性（O-7） |
+| **认领 CAS 争用** | `block_num = 512` 时约 96 核在一个 `next_block` 上 CAS。量级与 ready `endpoints` 的 CAS 相同（已在用），但 `ld_dev` 严格串行（见 `.claude/rules/ascend.md`），需实测（O-8）。**不能靠"一次认领多块"缓解** —— 那条已被负载均衡否掉 |
+| **非末块误解依赖** | 表现为 `site=62`，不是静默错误。§7.2 的不变式 + UT |
+| **第二条线陷阱复发** | 任何新增的跨核 RMW 字段若放错线，失效形态是"旧值被还原成历史上合法的值"，极难定位（progress §7.10 造了七个观测仪器，六个是坏的）。TaskControl 第一条线要写明"不得整线发布"，并配 `offsetof < 64` 的 static_assert |
+| **队首长期占用** | 队首在 block 全部认领完前不让位，大任务可达秒级（§4.4）。只影响其他 SPMD 任务 —— 这是"一次一个"本来就接受的串行。多 SPMD 排队用例（§10.4）守住"不丢任务、不乱序" |
+| **铺开与收束的不对称** | SPMD 的 block 经全局队首发现，绕开了 per-core 队列 7 核的可见半径，能摊到全机；但它的**后继**走回普通队列 —— 只有最后一块 `resolve_completion`（§7.2），把全部 waiter 推给**那个核自己 cluster** 的同 type peer，再往外只能靠同 shard 的 7 个核偷。于是占用形态是宽 → 窄 → 宽，且"最后完成的是哪个核"随机，后继落到哪个 cluster 不可预测。**后继数量与 `block_num` 无关**（那是图的性质），所以这不是 SPMD 放大了扇出，而是它让本来就存在的收束（`fanout_imbalance` 量到的 14/96）前后反差变显眼。不在本设计范围内修；记在此处是因为 §10.2 的分布断言会先在这里显形，别误判成 block 没铺开 |
+| **局部状态膨胀** | `SchedulerLocalSlotState` 16 → 24 字节，8 个 slot 共 +64B。executor 的 spill-to-fault 前科（`aicore_executor.cpp:119-120`）说明这不免费。退路：压 `state` + `subtask_slot` 进一个字节 |
+| **swimlane 下游** | 同一 task_id 多条记录（§7.3）。converter 与 `dfx/chip_swimlane` 用例需同步核对，否则 DFX 产物结构变化会被当成失败 |
+| **demand 放宽的副作用** | 放宽后 `aic/aiv_worker_demand` 只反映 sync_start。lifecycle 的那条检查注释与日志文本要同步改，否则它说的和它做的不是一回事 |
+| **Mix cohort 的 barrier 等待** | §8.2 末尾那条延迟项。有界不死锁，S1 实测决定是否补 D4（与 O-6 同一处置） |
+
+## 12. 开放项（本稿**没有**定下来的事）
+
+以下**两条**是设计选择而非查实结论。写在这里是为了下一个人不要把它们当既定事实接着往下盖。
+
+> **已定（用户决策）**：
+> ① sync_start 与 non-sync_start **同期做**，Mix SPMD 与非 Mix **同期做**。
+> ② **每核每轮只认领 1 个 block** —— 一次认领多块虽能减少 CAS 轮数，但会让先空出来的核把
+> block 抢走、后空出来的核无事可做，**负载均衡直接退化**。CAS 轮数可以忍，不均衡不可以。
+> ③ SPMD ready 队列**全局唯一、MPMC**，不按 core type 或 rank 分片（§4.2）。
+> ④ **同时只有一个 SPMD 任务处于认领中**，由队首直接承担，**不设独立的认领槽**（§4.1、§4.2）。
+> ⑤ **「一次一个」是硬性指标，不是待权衡项**（用户决策，2026-10-23）。它把 SPMD 任务之间
+> 压成严格串行，而 qwen 一层内有数十个 SPMD 任务、CSA 整图 60 个 —— 若它们大多相互独立，
+> 这就是方案的主要吞吐瓶颈。**仍然这么做**：先保证功能，可并发的 block 认领留作后续的
+> 独立设计。所以不要把"队首唯一"当成可以顺手放宽的性能项去改 —— 它同时承担互斥、
+> 认领失败的处置、cohort 不饿死三件事（§4.2），放宽等于重做 §6~§8。
+> ⑥ **非 SPMD 任务不设哨兵**：它就是「第 0 块，共 1 块」。初版的
+> `SCHEDULER_BLOCK_IDX_NONE = UINT16_MAX` 已撤销，判据是 `block_num > 1`（§7.1）。
+> 本稿初版曾设想一个 8 entry 的 claim board，已整体撤销 —— 它的全部收益都建立在"多个任务
+> 并发认领"之上，而那条放宽未经同意、也没有把"认领失败怎么办""cohort 如何不被饿死"设计完整。
+
+| # | 开放项 | 现状取值与依据强度 | 怎么定 |
+| - | ------ | ------------------ | ------ |
+| O-6 | **从 inbox 取新任务的停取规则做不做** | §8.2 定性为性能项，**首版不做** | barrier 等待若在 cohort 用例上成为瓶颈，再按队首任务的 core type 收窄着加。同一处置适用于 D4 的 mix 让行。**注意这条不包括 §8.1 第 1 条的直填抑制** —— 那条是必做的 |
+| O-7 | **`has_spmd` 为真时的每轮轮询开销** | 门本身是必须的（§5.4）；§6.2 末的 head memo 让稳态只付一次 `ld_dev`，**两者都未实测** | 先确认 memo 真的把 metadata 读压到了 head 变动那几轮。若仍显形，退路是降频到每 N 轮读一次 —— 代价是认领延迟，不是正确性。看小图档：`multi_core_dag` 的 `mixed_chain_1` / `mixed_chain_2`（都标了 `"manual": True`，采集要带 `--manual include`；progress 记的固定开销地板约 124~128 us） |
+| O-8 | **`next_block` 的 CAS 争用** | 量级与现用的 ready `endpoints` CAS 相同，**未实测** | `block_num = 512` 时约 96 核抢一个字。用 CSA 量 CAS 重试数。**不能靠"一次认领多块"缓解** —— 那条已被负载均衡否掉（见上方已定 ②） |
+
+## 13. 换窗口接手须读
+
+本文自包含到可以照着开工，但有三件事在它之外：
+
+| 事项 | 在哪 |
+| ---- | ---- |
+| **环境与复现**（venv、`source set_env.sh`、`LD_LIBRARY_PATH=/opt/gcc-15/lib`、改 C++ 后的固定三步、onboard 跑法、性能采集脚本与两个坑） | [a5-hbg-per-core-scheduler-progress.md](a5-hbg-per-core-scheduler-progress.md) §0.5，**自包含，照着走即可** |
+| **per-core 改造的决策与教训**（D-1~D-9、F-1~F-6、§7.9 的 FIFO 返工、§7.10 的 MPMC 回归与"七个坏掉的观测仪器"） | 同上。本文多处引用，不重复 |
+| **基线分支** | `a5-hbg-resident-spmd` @ `60b7edd1`（S0），其基线是 `30e5302d`（per-core 改造完成点，**不是 main，也不是 `feat/fully_distributed_within_core`**） |
+
+开工前的状态核对：
+
+```bash
+cd /data/disk2/pyptouser/chenpeng/workspace/simpler
+git log --oneline -1 a5-hbg-resident-spmd    # 应为 60b7edd1（S0）
+git worktree list                             # 本设计的只读 worktree 可能还在 .claude/worktrees/spmd-read
+source .venv/bin/activate && pip install --no-build-isolation -e .   # HEAD 动过就必须重装
+```
+
+**S0 已落地，S1 尚未写一行代码。** 文档里所有 `file:line` 原按 `872591b7` 核对
+（2026-10-21，含 9 处行号修正）；S0 之后 `scheduler_ready.h` / `scheduler_types.h` 行号已明显
+漂移，且 `core_type_index` / `scheduler_ready_queue_capacity` 等名字**已不存在**（见 §10.1 的
+注），引用前先 grep。
+
+### 已定的决策（不要重开）
+
+见 §12 开头的「已定」列表。其中两条最容易被"优化"掉，所以在此重复：
+
+1. **同时只有一个 SPMD 任务处于认领中**，由队首直接承担，**不设独立认领槽**。
+   本稿初版曾设想 8 entry 的 claim board，**已整体撤销** —— 它的收益全建立在"多任务并发
+   认领"上，而那条放宽会引出"认领失败换不换任务""cohort 如何不被饿死"两整套设计。
+2. **每核每轮只认领 1 个 block**。一次多块能减少 CAS 轮数，但先空出来的核会把 block 抢走，
+   **负载均衡直接退化**。
+
+### 还没做的事
+
+| | |
+| --- | --- |
+| 代码 | **S0 已完成并提交**（`60b7edd1`，分支 `a5-hbg-resident-spmd`，基线 `30e5302d`）；S1 未开始 |
+| 用例 | 按用户决定**先做功能、暂不移植**（§10.4 存了调查结论） |
+| 开放项 | O-6 / O-7 / O-8 全是实测项，S0 不碰 |
+
+**S1 开工第一件事**：§6.3 的 `placement = nullptr`、§6.2 末的 head memo，这两条都是 S0
+之后新加进本稿的，而且都属于"错了不会当场报错"的那一类 —— 前者是假死锁签名，后者是
+持续的轮询开销。先把它们和 §8.1 的四条一起落在代码里，再谈认领逻辑本身。
+
+## 14. 不在范围
+
+- **`TaskKind::GRAPH`**（graph execution）仍整图回退 legacy（`runtime_maker.cpp:1105-1111`）。
+  task_ref 今天的编码是 GLOBAL 任务的表下标，SUB_TASK 没有表槽位 —— 阶段 0 的三个访问器就是为
+  那次扩展留的接口，与本设计无关。
+- **SPMD + predicate**：host 硬拒（§2.1 第 2 点），本设计不放开。
+- **a2a3 的 HBG resident 路径**：它没有 resident scheduler。
+- **"resolve 时直接把任务放到队首"优化**（§4.1 末）、**停取规则**（§8.2 / O-6）与
+  **D4 执行流让行**（§8.2 末）：三者都要等 S1 的实测数据说话。
+- **D2 的 SSBUF cluster 内快通道**：与本设计正交。注意它会重新定义 SSBUF 里现在空着的那
+  576 字节（`scheduler_ssbuf.h:96-97` 的两条 static_assert 守着），**SPMD 不占用那块空间** ——
+  SPMD 队列与认领游标都必须在 GM，因为认领者跨 cluster（约束 3.6）。
