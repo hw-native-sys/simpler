@@ -2508,7 +2508,7 @@ class SceneTestCase:
         one device is provided (or any L3 case needs more than its single
         device), the outer invocation becomes a test dispatcher that spawns
         per-case subprocesses via ``parallel_scheduler``; each child re-enters
-        this function in single-group mode via ``--runtime`` + ``--level``.
+        this function in single-group mode via ``--resource-child``.
         """
         import argparse  # noqa: PLC0415
 
@@ -2600,7 +2600,7 @@ class SceneTestCase:
         parser.add_argument(
             "--runtime",
             default=None,
-            help="Only run classes with this _st_runtime (child-mode marker when combined with --level)",
+            help="Only run classes with this _st_runtime",
         )
         parser.add_argument(
             "--level",
@@ -2612,8 +2612,9 @@ class SceneTestCase:
             # rankN numbering is per L3 Worker and collides above it.
             choices=[2, 3],
             default=None,
-            help="Only run classes with this _st_level (child-mode marker when combined with --runtime)",
+            help="Only run classes with this _st_level",
         )
+        parser.add_argument("--resource-child", action="store_true", help=argparse.SUPPRESS)
         parser.add_argument(
             "-x", "--exitfirst", action="store_true", help="Stop on first failing case (matches pytest -x)"
         )
@@ -2715,8 +2716,7 @@ class SceneTestCase:
         module = sys.modules[module_name]
         test_classes = _discover_module_test_classes(module)
 
-        # Apply --runtime/--level filters (child mode sets both; parent may also
-        # use them when the user wants a narrow run).
+        # Apply --runtime/--level filters for both parent and child runs.
         if args.runtime is not None:
             test_classes = [c for c in test_classes if getattr(c, "_st_runtime", None) == args.runtime]
         if args.level is not None:
@@ -2739,10 +2739,8 @@ class SceneTestCase:
         for cls, case in selected:
             selected_by_cls.setdefault(cls, []).append(case)
 
-        # Child mode: both --runtime and --level set. Run inline without
-        # spawning further subprocesses; this is the path dispatcher
-        # children take after we re-enter run_module.
-        child_mode = args.runtime is not None and args.level is not None
+        # A dispatcher child runs inline without spawning further subprocesses.
+        child_mode = args.resource_child
 
         if not child_mode:
             has_multi_dev_case = any(
@@ -2874,6 +2872,7 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
                 _rt,
                 "--level",
                 "3",
+                "--resource-child",
             ]
 
         # Per-case output_prefix is chosen inside the child by run_class_cases,
@@ -2967,6 +2966,7 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
                     _rt,
                     "--level",
                     "2",
+                    "--resource-child",
                 ]
                 for f in _filters:
                     cmd += ["--case", f]

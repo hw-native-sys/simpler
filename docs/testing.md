@@ -207,7 +207,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--rounds N` | | 1 | Run each case N times (reuses the same Worker across rounds) |
 | `--device IDS` | `-d` | `0` | Single id (`0`), range (`0-7`), or list (`0,2,5`). Sets the device-id pool for L3 cases and the available slots for L2 fanout. |
 | `--max-parallel N` | | `auto` | Max in-flight subprocesses (make-style). `auto` = `min(nproc, len(--device))` on sim, `len(--device)` on hardware. Decouples device-id pool size from parallelism; use to throttle sim on a CPU-constrained runner. |
-| `--runtime NAME` | | (all) | Restrict to one runtime (also used internally as the child-mode marker) |
+| `--runtime NAME` | | (all) | Restrict to one runtime; normal dispatch still applies. |
 | `--level {2,3,4}` | | (all) | Restrict to one scene-test level. Level 4 selects network1 wrappers. |
 | `--exclude-level {2,3,4}` | | (none) | Exclude tests explicitly carrying that scene-test level. Ordinary onboard lanes use `--exclude-level 4`. |
 | `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
@@ -306,7 +306,7 @@ Worked examples:
 | `--exitfirst` | both | `-x` | pytest ships `-x` → standalone mirrors it so the flag behaves identically across entry points. |
 | `--rounds` | both | **(none)** | pytest-xdist already uses `-n` for worker count. Standalone originally had `-n` for `--rounds`, creating a letter-level collision whenever a user switched between pytest (`-n 8` = 8 workers) and standalone (`-n 8` = 8 rounds). Removed in [#574](https://github.com/hw-native-sys/simpler/pull/574); do not reintroduce. |
 | `--max-parallel` | both | **(none)** | `-j` would be the natural make-style short, but pytest reserves all lowercase single letters (`parser.addoption` rejects lowercase shorts). Standalone mirrors this to keep both CLIs identical — no short in either, always spell out `--max-parallel`. |
-| `--runtime` / `--level` | both | **(none)** | Internal child-mode markers; users rarely type them. No short keeps them distinctive. |
+| `--runtime` / `--level` | both | **(none)** | Selection filters; no short keeps them distinctive. A hidden child marker controls dispatcher recursion. |
 | `--skip-golden`, `--enable-chip-swimlane`, `--dump-args`, `--enable-pmu`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
 
 Practical guidance when adding a new CLI option:
@@ -440,7 +440,7 @@ The dispatcher only takes over when there's actual work to parallelize or isolat
 
 - `--collect-only`
 - Only one runtime is present and no L3 cases are collected (single L2 batch)
-- Both `--runtime` and `--level` are set (child-mode marker — used internally by spawned subprocesses)
+- The internal `--resource-child` marker is set on a dispatcher subprocess
 
 ## Hardware Classification
 
@@ -954,10 +954,10 @@ For every collected resource job (L3 ``SceneTestCase`` classes and standalone py
 
 ```text
 # L3 class job
-pytest <nodeid> --runtime <rt> --level 3 --device <alloc-range>
+pytest <nodeid> --resource-child --runtime <rt> --level 3 --device <alloc-range>
 
 # Standalone resource function job
-pytest <nodeid> --runtime <rt> --device <alloc-range>
+pytest <nodeid> --resource-child --runtime <rt> --device <alloc-range>
 ```
 
 When a subprocess completes, its devices return to the free set and the queue is re-tried. Jobs that need more devices than currently free **wait**; jobs that need more than the whole pool **fail the batch up front**.
@@ -967,7 +967,7 @@ When a subprocess completes, its devices return to the free set and the queue is
 After the Resource phase drains, one subprocess is spawned per runtime:
 
 ```text
-pytest --runtime <rt> --level 2 --device 8-11 -n 4 --dist loadfile
+pytest --resource-child --runtime <rt> --level 2 --device 8-11 -n 4 --dist loadfile
 ```
 
 `pytest-xdist` starts 4 workers (`gw0`..`gw3`). Each worker's `pytest_configure` slices `--device 8-11` down to a single id (`gw0` → `8`, `gw1` → `9`, ...), and `st_worker` is session-scoped, so the worker initializes exactly one `ChipWorker(device=N)` and reuses it for every L2 class routed to it. `--dist loadfile` keeps all cases from one test file on the same worker, amortizing any file-level setup cost.

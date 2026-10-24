@@ -498,4 +498,36 @@ def test_standalone_dispatch_forwards_every_diagnostic_flag(monkeypatch) -> None
     assert "--enable-dep-gen" in command
     assert "--enable-scope-stats" in command
     assert "--enable-swimlane-overhead" in command
+    assert "--resource-child" in command
     assert command[0] == sys.executable
+
+
+@pytest.mark.parametrize("child", [False, True])
+def test_standalone_runtime_and_level_filter_without_marking_a_child(monkeypatch, child) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    scene_class = type("FilteredScene", (), {"_st_level": 2, "_st_runtime": "host_build_graph"})
+    dispatched = []
+
+    monkeypatch.setattr(scene_test_module, "ensure_pto_isa_root", lambda **_kwargs: None)
+    monkeypatch.setattr(scene_test_module, "_discover_module_test_classes", lambda _module: [scene_class])
+    monkeypatch.setattr(
+        scene_test_module,
+        "_select_cases",
+        lambda _classes, _platform, _selectors, _manual: [(scene_class, {"name": "selected"})],
+    )
+    monkeypatch.setattr(
+        scene_test_module,
+        "_dispatch_test_phases_standalone",
+        lambda *_args: dispatched.append(True) or True,
+    )
+    monkeypatch.setattr(scene_test_module, "_standalone_worker_groups", lambda _selected: {})
+    argv = ["test_scene.py", "-p", "a2a3sim", "-d", "0-1", "--runtime", "host_build_graph", "--level", "2"]
+    if child:
+        argv.append("--resource-child")
+    monkeypatch.setattr(sys, "argv", argv)
+
+    with pytest.raises(SystemExit) as result:
+        SceneTestCase.run_module(__name__)
+
+    assert result.value.code == 0
+    assert dispatched == ([] if child else [True])

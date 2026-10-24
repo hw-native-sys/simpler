@@ -29,7 +29,6 @@ Two host behaviours are exercised, because they genuinely differ:
 """
 
 import os
-import time
 
 import pytest
 from simpler.task_interface import (
@@ -37,7 +36,6 @@ from simpler.task_interface import (
     CallConfig,
     ChipCallable,
     CoreCallable,
-    _flush_host_log,
     _host_log_dropped_records,
 )
 from simpler.worker import Worker
@@ -51,33 +49,6 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = "tensormap_and_ringbuffer"
 KERNELS = os.path.join(HERE, "kernels")
 ORCH_DIR = os.path.join(KERNELS, "orchestration")
-
-
-def _wait_for_host_log(capfd, markers: tuple[str, ...], dropped_before: int, timeout_s: float = 5.0) -> str:
-    """Poll for required records and report queue loss instead of trusting one flush deadline."""
-    chunks: list[str] = []
-    deadline = time.monotonic() + timeout_s
-    last_flush = False
-    while True:
-        last_flush = _flush_host_log(100)
-        captured = capfd.readouterr()
-        chunks.extend((captured.err, captured.out))
-        log = "".join(chunks)
-        if all(marker in log for marker in markers):
-            dropped_after = _host_log_dropped_records()
-            assert dropped_after == dropped_before, (
-                f"host-log drop counter changed while waiting for {markers}: "
-                f"before={dropped_before}, after={dropped_after}"
-            )
-            return log
-        if time.monotonic() >= deadline:
-            dropped_after = _host_log_dropped_records()
-            missing = [marker for marker in markers if marker not in log]
-            raise AssertionError(
-                f"host-log records did not arrive within {timeout_s:.1f}s: missing={missing}, "
-                f"last_flush={last_flush}, dropped_delta={dropped_after - dropped_before}, tail={log[-2000:]!r}"
-            )
-        time.sleep(0.01)
 
 
 # case -> dict(orch, code, runtime_env, kernel, marker, explain)
@@ -334,7 +305,7 @@ def _make_worker(platform: str, device_id: int, case_name: str, monkeypatch):
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.parametrize("case_name", _SIM_CASE_PARAMS)
-def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monkeypatch, capfd):
+def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monkeypatch, capfd, drain_host_log):
     """sim: the runtime status (``code -N``) reaches the host directly."""
     configure_logging("error")
     case = CASES[case_name]
@@ -345,12 +316,10 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
     try:
         with pytest.raises(RuntimeError, match=rf"(run_runtime|run) failed with code -{case['code']}\b"):
             worker.run(handle, None, config)
-        log = _wait_for_host_log(
-            capfd,
-            (case["marker"], "error detail:", case["explain"], "error hint:"),
-            dropped_before,
-        )
+        log = drain_host_log(capfd)
+        assert case["marker"] in log, log
         _assert_annotated(log, case)
+        assert _host_log_dropped_records() == dropped_before, "host-log records were dropped"
     finally:
         worker.close()
 
@@ -360,7 +329,7 @@ def test_fatal_code_surfaces_on_sim(st_platform, st_device_ids, case_name, monke
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.timeout(90)  # hang cases hold a core ~15-20 s; bound a wedge
 @pytest.mark.parametrize("case_name", list(CASES))
-def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_name, monkeypatch, capfd):
+def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_name, monkeypatch, capfd, drain_host_log):
     """onboard: the watchdog may mask the code as 507xxx, but the device class still reaches the host log."""
     # warning, not error: the run-result fallback asserted below is a LOG_WARN.
     configure_logging("warning")
@@ -373,12 +342,10 @@ def test_device_error_class_reaches_host_log(st_platform, st_device_ids, case_na
         # run fails. The point of the test is the device-classified host LOG.
         with pytest.raises(RuntimeError):
             worker.run(handle, None, config)
-        log = _wait_for_host_log(
-            capfd,
-            (case["marker"], "error detail:", case["explain"], "error hint:"),
-            dropped_before,
-        )
+        log = drain_host_log(capfd)
+        assert case["marker"] in log, log
         _assert_annotated(log, case)
+        assert _host_log_dropped_records() == dropped_before, "host-log records were dropped"
         # The detail must come from the result the run's own device side
         # published, not from the shared header a successor may already have
         # reset. The runtime warns whenever it falls back to that header, and

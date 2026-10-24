@@ -10,7 +10,7 @@
 
 Runtime isolation: CANN's AICPU framework caches the user .so per device context.
 Switching runtimes on the same device within one process causes hangs. When multiple
-runtimes are collected and --runtime is not specified, pytest_runtestloop spawns a
+runtimes are collected and this is not a dispatcher child, pytest_runtestloop spawns a
 subprocess per runtime so each gets a clean CANN context. See docs/testing.md.
 """
 
@@ -126,6 +126,106 @@ class Network1Peer(typing.NamedTuple):
     session_listen_host: str
 
 
+@pytest.fixture
+def drain_host_log(tmp_path_factory):
+    """Read new host-log output from the process's active sink.
+
+    A `[STRACE]` record reaches stderr or ``host.<pid>.log`` through the process
+    writer thread, so a bare ``capfd.readouterr()`` both races the writer and
+    misses records after a run binds the logger to its output directory. Track
+    the file cursor as well as captured output so repeated drains consume each
+    record exactly once regardless of which sink is active. Bind an unbound
+    logger to a session directory because direct chip runs need a file source
+    when exporting host clock alignment logs. The logger's first file binding
+    is process-wide and cannot be undone.
+
+    The wait is bounded but it is not the verdict. Producers are quiescent by the
+    time a test reads — the run has completed — so `pending_record_count`
+    reaching zero is a real drain rather than a deadline standing in for
+    correctness, and the caller's own assertion stays the thing that decides.
+    Exhausting the bound means the writer is genuinely stuck, and the message
+    reports the drop counter so a queue loss is not mistaken for a slow drain.
+    """
+    from _task_interface import (  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+        _host_log_directory,
+        _monotonic_now_ns,
+        _set_host_log_directory,
+    )
+    from simpler.task_interface import (  # noqa: PLC0415
+        _flush_host_log,
+        _host_log_dropped_records,
+        _host_log_pending_records,
+    )
+
+    if not _host_log_directory():
+        _set_host_log_directory(str(tmp_path_factory.mktemp("host-logs")))
+    file_directory = _host_log_directory()
+    fixture_start_ns = _monotonic_now_ns()
+    file_offset = 0
+    if file_directory:
+        host_log = Path(file_directory) / f"host.{os.getpid()}.log"
+        if host_log.exists():
+            file_offset = host_log.stat().st_size
+
+    def _read_file_tail() -> str:
+        nonlocal file_directory, file_offset
+        active_directory = _host_log_directory()
+        if not active_directory:
+            file_directory = ""
+            file_offset = 0
+            return ""
+
+        changed_directory = active_directory != file_directory
+        if changed_directory:
+            file_directory = active_directory
+            file_offset = 0
+        host_log = Path(active_directory) / f"host.{os.getpid()}.log"
+        try:
+            with host_log.open("rb") as stream:
+                stream.seek(file_offset)
+                chunk = stream.read()
+                file_offset = stream.tell()
+        except FileNotFoundError:
+            return ""
+        text = chunk.decode("utf-8", errors="replace")
+        if not changed_directory:
+            return text
+
+        # The bind may happen after fixture setup but before this first read.
+        # Starting at EOF would discard this test's already-flushed records;
+        # starting at zero without a cutoff would replay an earlier session.
+        # Every unified record carries the same monotonic envelope, so retain
+        # precisely the records produced after this fixture began.
+        kept = []
+        for line in text.splitlines(keepends=True):
+            match = re.match(r"\[mono_ns=(\d+)\]", line)
+            if match is not None and int(match.group(1)) >= fixture_start_ns:
+                kept.append(line)
+        return "".join(kept)
+
+    def _drain(capfd, timeout_s: float = 5.0) -> str:
+        dropped_before = _host_log_dropped_records()
+        chunks: list[str] = []
+        deadline = time.monotonic() + timeout_s
+        while True:
+            flushed = _flush_host_log(100)
+            captured = capfd.readouterr()
+            chunks.extend((captured.err, captured.out))
+            if flushed and _host_log_pending_records() == 0:
+                chunks.append(_read_file_tail())
+                return "".join(chunks)
+            if time.monotonic() >= deadline:
+                pending = _host_log_pending_records()
+                dropped = _host_log_dropped_records() - dropped_before
+                raise AssertionError(
+                    f"host-log writer did not drain within {timeout_s:.1f}s: "
+                    f"pending={pending}, dropped_delta={dropped}, last_flush={flushed}"
+                )
+            time.sleep(0.01)
+
+    return _drain
+
+
 def pytest_addoption(parser):
     """Register CLI options."""
     parser.addoption("--platform", action="store", default=None, help="Target platform (e.g., a2a3sim, a2a3)")
@@ -143,7 +243,12 @@ def pytest_addoption(parser):
         default="exclude",
         help="Manual test handling: exclude (default), include, only",
     )
-    parser.addoption("--runtime", action="store", default=None, help="Only run tests for this runtime")
+    parser.addoption(
+        "--runtime",
+        action="store",
+        default=None,
+        help="Only run tests for this runtime",
+    )
     parser.addoption(
         "--test-environment", default="default", help="Registered dependency environment (default: default)"
     )
@@ -648,7 +753,7 @@ def pytest_itemcollected(item):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
-    """Filter ST tests by --platform / --runtime / level axes; order L3 before L2.
+    """Filter ST tests by platform, runtime, and level; order L3 before L2.
 
     Static filter mismatches (wrong level, wrong runtime, wrong platform)
     are **deselected** rather than marked ``pytest.skip`` so they don't
@@ -731,7 +836,7 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
                 continue
 
         # runtime-isolation filter for non-@scene_test tests: if the item
-        # declares ``@pytest.mark.runtime("X")`` and a --runtime filter is
+        # declares ``@pytest.mark.runtime("X")`` and a runtime filter is
         # active, deselect when they don't match. Prevents
         # test_explicit_fatal_reports and friends from running under every
         # runtime's subprocess.
@@ -789,9 +894,8 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
 # ---------------------------------------------------------------------------
 # Test dispatcher: Resource phase (device-aware parallel subprocesses for L3
 # classes *and* standalone resource-marked functions) + L2 phase (per-runtime
-# subprocess). Activated only when neither --runtime nor --level is set by
-# the caller. Dispatcher-spawned children set both, so they fall through to
-# pytest's default runtestloop without recursing.
+# subprocess). Dispatcher-spawned children carry --resource-child, so they
+# fall through to pytest's default runtestloop without recursing.
 # ---------------------------------------------------------------------------
 
 
@@ -1240,7 +1344,7 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
     manual_mode = cfg.getoption("--manual", default="exclude")
     max_parallel = _resolve_max_parallel(cfg, platform or "", device_ids)
 
-    base_args = _base_pytest_argv(session, strip_options=("--exclude-level",))
+    base_args = _base_pytest_argv(session, strip_options=("--exclude-level", "--runtime", "--level"))
     cwd = session.config.invocation_params.dir
 
     # ----- Phase 1: Resource (L3 classes + standalone resource functions) -----
@@ -1329,7 +1433,7 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
             flush=True,
         )
     for rt in l2_runtimes:
-        cmd = base_args + ["--runtime", rt, "--level", "2"]
+        cmd = base_args + ["--resource-child", "--runtime", rt, "--level", "2"]
         if xdist_active:
             cmd += xdist_options
         # Per-runtime sink for the in-process poison guards (issue #1110). Each
@@ -1430,32 +1534,15 @@ def pytest_collection_finish(session):
 
 
 def pytest_runtestloop(session):
-    """Dispatch Resource + L2 + leftover phases unless caller is in child mode.
-
-    Child mode (a Resource child, runtime-filtered runs, L2/L3 level-filtered
-    runs, or --collect-only) skips the dispatcher and falls through to
-    pytest's default runtestloop. Level 4 network1 selection is not child
-    mode; it still uses the Resource dispatcher.
-    """
-    runtime_filter = session.config.getoption("--runtime")
+    """Dispatch Resource + L2 + leftover phases unless this is a child run."""
     level_filter = session.config.getoption("--level")
 
-    # One job the parent already scheduled. A runtime-less job carries no other
-    # option that says so, and a parent narrowed to that same single item is
-    # otherwise indistinguishable from its own child — which would run the test
-    # in this process instead of scheduling it, enforcing no device_count and
-    # providing none of the isolation the phase exists for.
+    # Selection flags do not identify a child: an outer run may be narrowed to
+    # the same runtime, level, or nodeid as a job it still needs to dispatch.
     if session.config.getoption("--resource-child"):
         return
 
-    # Child mode: if the caller filters by runtime, or by the SceneTestCase
-    # levels the dispatcher itself uses for children, it wants direct control.
-    if runtime_filter is not None:
-        return
-    if _normalize_cli_scene_level(level_filter) in (SceneTestLevel.CHIP, SceneTestLevel.NODE):
-        return
-
-    # User explicitly asked for collect-only / scoped-run — don't orchestrate.
+    # Collect-only never executes items.
     if session.config.getoption("--collect-only", default=False):
         return
 
@@ -1848,7 +1935,7 @@ def _l2_poison_retry(base_args, rt, selectors, cwd):
     worked. Runs *without* the sink env so a retried class that itself
     re-poisons is not collected again: this is a single bounded pass, not a
     recursive loop. Returns the subprocess return code."""
-    cmd = base_args + ["--runtime", rt, "--level", "2"]
+    cmd = base_args + ["--resource-child", "--runtime", rt, "--level", "2"]
     for sel in selectors:
         cmd += ["--case", sel]
     env = {k: v for k, v in os.environ.items() if k != _L2_POISON_SINK_ENV}
