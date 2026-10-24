@@ -94,9 +94,61 @@ executor, then drains MPI sends. Native `Worker.close()` releases the Python
 GIL so progress can release outbound byte credit during teardown. Python
 still enforces init-owner thread affinity and serializes close attempts.
 
+### Per-rank close reports
+
+Each L3 reports `command=observed` only after validating its own `SHUTDOWN`
+frame. It reports `cleanup=succeeded` or `failed` after the command loop's
+buffer release, heartbeat channel close, and local `Worker.close()` attempt.
+The L4 context reports its own close separately; its `command=not_observed`
+means close started locally, without an incoming shutdown command. An L4
+report does not acknowledge any L3's shutdown or release.
+
+Reports go directly to a separate TCP listener in the external supervisor,
+using the startup host and a port carried in the inline runtime manifest.
+All MPI hosts must be able to reach that listener. No shared filesystem or
+rank-0 gather is required, and task frames continue to use Direct MPI.
+The listener uses the existing startup token for authentication. Each rank
+sends at most two records, with a one-second total socket budget per record;
+an unavailable report channel leaves the corresponding observation unknown.
+Report delivery is acknowledged only after the receiver accepts the record.
+
+Schema 1 includes `job_id`, `session_id`, MPI `rank`, `worker_id` (`null` for
+L4), `role`, `sequence`, `command`, `cleanup`, and `failures`. Sequence 1
+records close entry and has no release result; sequence 2 records the local
+release result and repeats the command observation, so it remains usable if
+the first record is missing. A report is limited to 32 KiB of JSON, with at
+most eight failure details of 512 UTF-8 bytes each. The length-prefixed TCP
+envelope, including authentication, is bounded by the 64 KiB startup codec.
+Exact repeats are idempotent. Older sequences, conflicting repeats, unknown
+versions, wrong identities, extra fields, and incomplete records are rejected
+without overwriting accepted observations.
+
+`run_supervisor(..., cleanup_reports=reports)` fills the supplied dictionary
+with immutable `MpiDirectCleanupReport` values keyed by MPI rank on return or
+exception. Every expected rank has a row: sequence 0 means nothing arrived,
+and sequence 1 with `cleanup=unknown` means close entry arrived without its
+release result. The supervisor also emits one JSON line per rank under the
+`mpi_direct_cleanup` key when the job ends. These are in-memory observations
+and output summaries, not a persistent recovery journal.
+
+`cleanup=succeeded` means the reporting process's local close operations
+returned successfully. It does not prove process exit or that every external
+resource disappeared. Rank reports cannot contain a process-exit claim;
+the supervisor summary labels that separate observation `process_exit=unknown`.
+The launcher's return code remains the job's return code, not a per-rank exit
+status. Ordinary L3 release errors, and L4 release errors after shutdown has
+been sent to all routes, are reported and return nonzero without an immediate
+MPI Abort; fatal communication failures still abort the world.
+A crash, Abort, or a close that hangs may leave only a command observation or
+no report at all. Independent shutdown deadlines, persistent report storage,
+output backpressure, and residual-resource recovery belong to the subsequent
+work tracked by #2659.
+
+### Job failure handling
+
 The supervisor owns the launcher process group; the launcher owns the MPI
 world. A rank failure, invalid frame, or shared credit/health timeout fails
-the whole world. Runtime errors call `MPI_Abort`. A controller crash relies
+the whole world. Fatal runtime errors call `MPI_Abort`. A controller crash relies
 on the launcher's rank-failure cleanup. A network partition is detected through
 MPI errors or the finite session/heartbeat deadline, rather than a daemon lease.
 The supervisor runs on Python's main thread. On `SIGTERM` or `SIGHUP` it
