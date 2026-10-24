@@ -9,6 +9,12 @@ Accept an Issue number or URL, or an explicitly scoped set of Issues. Resume
 from current GitHub state instead of repeating triage on every invocation.
 GitHub is the business record; do not register a duplicate task in another queue.
 
+When called by [maintainer](../maintainer/SKILL.md), preserve its selected write
+scope, authority and observation context. Linked items outside that scope remain
+read-only; return the result to the caller without starting another maintenance loop.
+Developers may use this workflow for their own scope without acquiring maintainer
+permissions or taking over other contributors' work.
+
 ## Read the current situation
 
 Use [GitHub setup](../../lib/github/setup.md) to identify repository and account.

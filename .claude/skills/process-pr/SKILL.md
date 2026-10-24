@@ -9,6 +9,12 @@ Accept a PR number or URL, or an explicitly scoped set of PRs. Take the next
 justified action from its current state. The PR author owns delivery; reviewers
 review it. Do not require a PR assignee or use the committer as its owner.
 
+When called by [maintainer](../maintainer/SKILL.md), preserve its selected write
+scope, authority and observation context. Linked items outside that scope remain
+read-only; return the result to the caller without starting another maintenance loop.
+Developers may use this workflow for their own scope without acquiring maintainer
+permissions or taking over other contributors' work.
+
 ## Establish scope and authority
 
 Use [GitHub setup](../../lib/github/setup.md). Read the PR body, author, base and
