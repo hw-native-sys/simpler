@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 """CPU checks of the selected hardware test's dependency and JUnit contract."""
 
+import json
 import os
 import subprocess
 import sys
@@ -197,3 +198,61 @@ def test_framework_setup_preserves_the_callers_installed_toolchain(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert output.read_text() == f"cann_env={script}\n"
+
+
+@pytest.mark.parametrize("mode", ["exclude", "include", "only", "invalid"])
+def test_framework_workflow_propagates_manual_selection(tmp_path, mode):
+    workflow = yaml.load((_ROOT / ".github/workflows/_st-framework-eager-a2a3.yml").read_text(), Loader=yaml.BaseLoader)
+    assert workflow["on"]["workflow_call"]["inputs"]["manual_mode"]["default"] == "exclude"
+    daily = yaml.load((_ROOT / ".github/workflows/daily.yml").read_text(), Loader=yaml.BaseLoader)
+    assert daily["jobs"]["st-framework-eager-a2a3"]["with"]["manual_mode"] == "include"
+    step = next(step for step in workflow["jobs"]["run"]["steps"] if "run" in step)
+    assert step["env"]["MANUAL_MODE"] == "${{ inputs.manual_mode }}"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    python = tmp_path / ".venv-framework/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text(
+        f"#!{sys.executable}\nimport json, os, sys\n"
+        "with open(os.environ['ARGV_LOG'], 'a') as stream: stream.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+    )
+    python.chmod(0o755)
+    task = bin_dir / "task-submit"
+    task.write_text(
+        f"#!{sys.executable}\nimport json, os, subprocess, sys\n"
+        "args = sys.argv[1:]\n"
+        "assert ['--env', 'MANUAL_MODE'] == args[2:4], args\n"
+        "subprocess.run(['bash', '-e', '-c', args[args.index('--run') + 1]], "
+        "env={**os.environ, 'TASK_DEVICE': '0'}, check=True)\n"
+    )
+    task.chmod(0o755)
+    git = bin_dir / "git"
+    git.write_text("#!/bin/sh\nprintf 'CPU-workflow-contract\\n'\n")
+    git.chmod(0o755)
+    cann = tmp_path / "toolkit env.sh"
+    cann.write_text(":\n")
+    log = tmp_path / "argv.jsonl"
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", step["run"]],
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "CANN_ENV": str(cann),
+            "MANUAL_MODE": mode,
+            "ARGV_LOG": str(log),
+        },
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if mode == "invalid":
+        assert result.returncode != 0
+        assert "manual_mode must be" in result.stdout
+        assert not log.exists()
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        commands = [json.loads(line) for line in log.read_text().splitlines()]
+        command = next(args for args in commands if args[:2] == ["-m", "pytest"])
+        assert command[command.index("--manual") + 1] == mode

@@ -46,6 +46,7 @@ jobs:
     uses: ./.github/workflows/_st-framework-eager-a2a3.yml
     with:
       runs_on: '["self-hosted","a2a3"]'
+      manual_mode: include
 
   st-onboard-a2a3:
     uses: ./.github/workflows/_st-npu-a2a3.yml

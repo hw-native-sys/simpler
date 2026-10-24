@@ -299,8 +299,11 @@ them across `examples tests/st` with `--test-environment torch_npu`; it does
 not enumerate directories or cases. Ordinary sweeps and compile warm-up select
 the implicit `default` environment, including in Daily. Framework dependencies
 live only in `.venv-framework`, separate from the Program/fork sweep's `.venv`.
-Environment selection is independent of `manual`; these automated tests are
-not manual.
+Environment selection is independent of `manual`. The reusable job accepts the
+same `manual_mode` contract as other scene-test jobs: Per-PR and emergency
+callers default to `exclude`, while Daily passes `include`. The existing four
+framework cases are automated, but a future manual case in this environment is
+discovered and included by Daily without another workflow edit.
 
 The dedicated environment uses `--system-site-packages` and installs local,
 pinned wheels for CPU Torch 2.7.1 and torch_npu 2.7.1.post4. The pins constrain
