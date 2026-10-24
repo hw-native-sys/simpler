@@ -130,6 +130,7 @@ def capture_probe(tmp_path_factory):
     sources = [
         _SOURCE / "driver.cpp",
         _ROOT / "src/common/platform/shared/host/kernel_execution_state.cpp",
+        _ROOT / "src/common/platform/shared/host/kernel_device_resources.cpp",
         _ROOT / "src/common/platform/onboard/host/kernel_platform_ops.cpp",
         _ROOT / "src/common/aicpu_loader/host/load_aicpu_op.cpp",
         _ROOT / "src/common/log/unified_log_host.cpp",
