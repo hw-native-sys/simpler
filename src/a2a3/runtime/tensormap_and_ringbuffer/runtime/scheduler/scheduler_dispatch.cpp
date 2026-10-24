@@ -399,7 +399,7 @@ void SchedulerContext::dispatch_shape(
                 while (candidates.has_value()) {
                     int32_t cluster_offset = candidates.pop_first();
                     if (tracker.classify_mix_cluster(cluster_offset, cmask) == wanted) {
-                        selected_mix_clusters |= CoreTracker::BitStates(1ULL << cluster_offset);
+                        selected_mix_clusters |= CoreTracker::BitStates::bit(cluster_offset);
                     }
                 }
                 if (!selected_mix_clusters.has_value()) {
@@ -754,7 +754,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
             while (candidates.has_value()) {
                 int32_t cluster_offset = candidates.pop_first();
                 if (tracker.classify_mix_cluster(cluster_offset, cmask) == wanted) {
-                    bucket |= CoreTracker::BitStates(1ULL << cluster_offset);
+                    bucket |= CoreTracker::BitStates::bit(cluster_offset);
                 }
             }
         } else {
