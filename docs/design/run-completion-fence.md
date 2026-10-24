@@ -58,6 +58,19 @@ prepared run. Public `Worker.init(borrowed_context_generation=...)` and
 `Worker.submit(..., caller_stream=...)` use this same native path. Capture/replay
 is rejected by the eager entry.
 
+The kernel migration also carries the integration branch's
+`KernelDeviceResources`, invocation-header validation and three-stream binder.
+`KernelExecutionState` owns prepared/frozen resource views and validates the real
+caller-supplied context generation on binding. Failed resource release retains
+both the allocation and stream/event owners for explicit close retry.
+
+These imported modules have host contract tests. Their runtime launch callers
+are not migrated here: the dedicated launch entry still rejects calls and its
+capability remains disabled. The native eager lane continues to own its existing
+arenas, stream bindings and completion fences. Runtime-specific launch owners
+and device packet consumers must be adapted with their real execution tests;
+module tests alone do not establish a working dedicated kernel path.
+
 ## Borrowed caller ordering
 
 The caller orders its own device input writes before the native launch and may
