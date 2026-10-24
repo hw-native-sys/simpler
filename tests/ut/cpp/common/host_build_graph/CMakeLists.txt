@@ -58,6 +58,9 @@ macro(hbg_cases)
     simpler_ut_cases(hbg_case ${ARGV})
 endmacro()
 
+hbg_case(test_hbg_scope_mode.cpp)
+
+
 # These drive the real orchestrator, so they link the orchestrator object
 # library. That is the whole of what they have beyond a plain case.
 hbg_cases(
