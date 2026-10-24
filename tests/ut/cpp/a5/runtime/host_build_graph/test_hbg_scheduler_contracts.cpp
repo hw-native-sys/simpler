@@ -228,6 +228,52 @@ TEST(AicpuReadyWatchdog, RefreshDuringExpiryUsesNewClockSample) {
     EXPECT_EQ(samples, 2);
 }
 
+TEST(AicpuReadyWatchdog, ProgressPublicationAheadOfSampleDoesNotExpire) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(101);
+    uint64_t now = 100;
+    bool ready = false;
+    int relaxations = 0;
+    EXPECT_TRUE(watchdog.wait_until_ready(
+        [&] {
+            return ready;
+        },
+        [&] {
+            return now;
+        },
+        [&] {
+            now = 102;
+            ready = true;
+            ++relaxations;
+        },
+        2000
+    ));
+    EXPECT_EQ(relaxations, 1);
+}
+
+TEST(AicpuReadyWatchdog, OlderClockSampleStillExpiresAtProgressDeadline) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(101);
+    uint64_t now = 100;
+    int samples = 0;
+    EXPECT_FALSE(watchdog.wait_until_ready(
+        [] {
+            return false;
+        },
+        [&] {
+            ++samples;
+            return now;
+        },
+        [&] {
+            now = now == 100 ? 102 : 2101;
+        },
+        2000
+    ));
+    EXPECT_EQ(now, 2101u);
+    EXPECT_EQ(samples, 3);
+    EXPECT_EQ(watchdog.last_progress(), 101u);
+}
+
 TEST(AicpuReadyWatchdog, InvocationResetDropsPriorProgress) {
     AicpuReadyWatchdog watchdog;
     watchdog.reset(100);
