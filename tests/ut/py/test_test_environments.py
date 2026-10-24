@@ -491,3 +491,51 @@ def pytest_configure(config):
     assert result.returncode != 0, result.stdout + result.stderr
     assert not list(tmp_path.glob("body-*"))
     assert "direct pytest execution only" in result.stdout + result.stderr
+
+
+def _installed_toolchain(home, version, *, nested=False, script=True):
+    manifest_home = home / f"{os.uname().machine}-linux" if nested else home
+    manifest_home.mkdir(parents=True)
+    (manifest_home / "ascend_toolkit_install.info").write_text(f"version={version}\n")
+    if script:
+        (home / "set_env.sh").write_text("# Selection tests never execute this script.\n")
+    return home / "set_env.sh"
+
+
+def test_toolchain_selection_uses_installed_manifest_and_deduplicates_aliases(tmp_path, monkeypatch, capsys):
+    root = tmp_path / "Ascend"
+    active = root / "cann-beta"
+    _installed_toolchain(active, "9.2.0-beta.1")
+    _installed_toolchain(root / "ascend-toolkit" / "9.0.0", "9.2.0-beta.1")
+    exact = root / "ascend-toolkit" / "release-without-version-in-name"
+    expected = _installed_toolchain(exact, "9.0.0", nested=True)
+    (root / "ascend-toolkit" / "latest").symlink_to(exact, target_is_directory=True)
+    monkeypatch.setattr(test_environments, "_ASCEND_ROOT", root)
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(active))
+
+    assert test_environments.select_toolchain("torch_npu") == expected
+    inventory = json.loads(capsys.readouterr().out.removeprefix("TEST_ENVIRONMENT_TOOLCHAINS "))
+    assert sum(entry["home"] == str(exact) for entry in inventory["installed"]) == 1
+
+
+def test_toolchain_selection_preserves_an_exact_active_toolkit(tmp_path, monkeypatch):
+    root = tmp_path / "Ascend"
+    _installed_toolchain(root / "cann-first", "9.0.0")
+    active = tmp_path / "active-toolkit"
+    expected = _installed_toolchain(active, "9.0.0")
+    monkeypatch.setattr(test_environments, "_ASCEND_ROOT", root)
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(active))
+
+    assert test_environments.select_toolchain("torch_npu") == expected
+
+
+@pytest.mark.parametrize("version,script", [("9.2.0-beta.1", True), ("9.0.0", False)])
+def test_toolchain_selection_refuses_incompatible_or_incomplete_installation(tmp_path, monkeypatch, version, script):
+    root = tmp_path / "Ascend"
+    active = root / "ascend-toolkit" / "9.0.0"
+    _installed_toolchain(active, version, script=script)
+    monkeypatch.setattr(test_environments, "_ASCEND_ROOT", root)
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(active))
+
+    with pytest.raises(ValueError, match=r"No installed CANN 9\.0\.0 with set_env\.sh"):
+        test_environments.select_toolchain("torch_npu")
