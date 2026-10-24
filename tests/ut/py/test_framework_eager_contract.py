@@ -15,6 +15,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
+import yaml
 
 from simpler_setup.test_environments import verify_results
 
@@ -169,3 +170,30 @@ def test_selected_framework_matrix_fails_missing_dependency_instead_of_skipping(
     assert {case.attrib["name"] for case in cases} == _CASES
     assert all(case.find("error") is not None and case.find("skipped") is None for case in cases)
     assert "requires matching torch and torch_npu" in result.stdout
+
+
+def test_framework_setup_preserves_the_callers_installed_toolchain(tmp_path):
+    action = yaml.safe_load((_ROOT / ".github/actions/setup-framework-eager/action.yml").read_text())
+    bootstrap = action["runs"]["steps"][0]["run"]
+    home = tmp_path / "caller toolkit"
+    home.mkdir()
+    (home / "ascend_toolkit_install.info").write_text("version=9.0.0\n")
+    script = home / "set_env.sh"
+    script.write_text(f'export ASCEND_HOME_PATH="{home}"\n')
+    default = tmp_path / "runner-default.sh"
+    default.write_text('export ASCEND_HOME_PATH="/not-the-callers-toolkit"\n')
+    # The runner's default script is a filesystem boundary; the action body
+    # and actual selector otherwise execute unchanged, without loading CANN.
+    bootstrap = bootstrap.replace("/usr/local/Ascend/cann/set_env.sh", str(default))
+    output = tmp_path / "action-output"
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", bootstrap],
+        cwd=_ROOT,
+        env={**os.environ, "ASCEND_HOME_PATH": str(home), "GITHUB_OUTPUT": str(output)},
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert output.read_text() == f"cann_env={script}\n"

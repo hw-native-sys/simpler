@@ -13,9 +13,6 @@ runs:
       id: toolchain
       shell: bash
       run: |
-        if [[ -f /usr/local/Ascend/cann/set_env.sh ]]; then
-          source /usr/local/Ascend/cann/set_env.sh
-        fi
         python3 simpler_setup/test_environments.py select torch_npu
 
     - name: Install isolated framework dependencies and runtime
