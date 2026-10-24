@@ -40,14 +40,18 @@ checking optional dependencies and do not emit execution plans.
 
 The framework eager corpus shares one session-scoped optional bridge fixture.
 Its same-stream, cross-stream, alias/INOUT, callback-failure recovery and
-per-call-value modules are discovered by their environment declaration; adding
+per-call-value and pre-admission-refusal modules are discovered by their
+environment declaration; adding
 a module does not require an expected-nodeid list or workflow path edit. Run the
 declared environment serially under one
 exclusive device allocation; a filtered plan proves only that filtered set.
 The recovery consumer also exercises the public direct-chip close path: accepted
 handles are drained before workspace ownership can be released, without
 individual user waits. Native timeout/context refusals and retryable close debt
-are covered separately by CPU lifecycle contracts.
+are covered separately by CPU lifecycle contracts. The pre-admission consumer
+checks stale Buffer registration and a distinct caller-created RTS context in
+real queue callbacks, restores the caller context, and completes healthy work
+on the same Worker without issuing an invalid device access.
 
 The registry and verifier live in `simpler_setup/test_environments.py`. Package
 pins have one source in the profile's constraints file. Adding a test to an

@@ -5,8 +5,8 @@ host emission queue. Torch operations produce two DEVICE inputs; the ordinary
 public Worker launches one add kernel; a Torch tensor addition consumes its
 output on the same framework stream. TMR and HBG use the same consumer.
 Additional consumers exercise caller-stream switching, aliased INOUT views,
-accepted callback failures and per-call values through that same public Worker
-and host queue bridge.
+accepted callback failures, per-call values and pre-admission refusals through
+that same public Worker and host queue bridge.
 
 | Consumer | Executable assertions |
 | -------- | --------------------- |
@@ -14,6 +14,7 @@ and host queue bridge.
 | `cross_stream.py` | Separate producer and consumer streams, caller A → B → A on one Worker, explicit framework event dependencies |
 | `alias_inout.py` | One Buffer backing full and partially overlapping strided views, INPUT plus INOUT, repeated updates and unchanged guards |
 | `failure_recovery.py` | A Python callback fails after submit acceptance; later requests complete and init-thread Worker close retires all accepted runs |
+| `preflight_recovery.py` | Stale Buffer registration and wrong caller context are refused before acceptance; the same Worker then completes three healthy requests |
 | `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
 
 Public `Worker.close()` drains accepted direct-chip runs through their normal
@@ -149,6 +150,19 @@ caller-owned until retirement: changing contents is not an early-free test.
 TMR's unsupported HOST/NONE operand is refused before a subsequent valid DEVICE
 request on the same Worker. No tensor H2D transfer is implicit, and this does
 not add HOST tensor support to TMR.
+
+`preflight_recovery.py` exercises two refusals inside the actual framework
+callback: an argument Tensor whose Buffer registration has closed, then a submit
+from a distinct caller-created RTS context. The backing allocations remain alive;
+the checks use the existing provenance liveness and `ExecutionContextRefused`
+contracts rather than an invalid device address or kernel fault. Each refusal
+is followed by healthy work on the same Worker. The wrong-context callback
+restores its original context before its healthy submit; a third
+healthy request follows.
+After the final framework boundary it checks independent golden results, retires
+runs, closes the Worker and Buffers, reuses the Torch stream, and destroys only
+the alternate caller-owned context. Unproved completion retains these owners.
+This covers pre-admission refusal recovery, not native partial-launch recovery.
 
 These are bounded reference cases. Full framework process shutdown, arbitrary
 strides or cross-tile overlap, A5 and capture remain separate qualification.
