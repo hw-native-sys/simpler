@@ -22,7 +22,7 @@
 namespace {
 
 // A task arg bound for a remote worker: a REMOTE_SIDECAR placeholder naming remote buffer 9 on
-// worker 3, with no local backing of its own. That is the only backend this wire accepts.
+// worker 3, with no local backing of its own.
 Tensor remote_arg_tensor() {
     Tensor tensor{};
     tensor.buffer.magic = BUFFER_DESCRIPTOR_MAGIC;
@@ -135,6 +135,33 @@ TEST(RemoteWire, TaskPayloadRejectsAnArgWithALocalBacking) {
     payload.args.tensors.push_back(arg);
 
     EXPECT_THROW((void)remote_l3::encode_task_payload(payload), std::runtime_error);
+}
+
+TEST(RemoteWire, DomainTensorRoundTripsWithoutLocalAddressOrSidecar) {
+    Tensor arg = remote_arg_tensor();
+    arg.buffer.address_space = static_cast<uint8_t>(AddressSpace::DEVICE);
+    arg.buffer.backend_kind = static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW);
+    arg.buffer.body_len = 28;
+    arg.buffer.nbytes = 32;
+    arg.byte_offset = 8;
+    const uint64_t domain = 7;
+    const uint64_t generation = 3;
+    const uint64_t slice_offset = 64;
+    std::memcpy(arg.buffer.body, &domain, sizeof(domain));
+    std::memcpy(arg.buffer.body + 8, &generation, sizeof(generation));
+    std::memcpy(arg.buffer.body + 20, &slice_offset, sizeof(slice_offset));
+    validate_tensor(arg);
+    remote_l3::TaskPayloadWire payload;
+    payload.args.tensors.push_back(arg);
+    payload.args.remote_desc.resize(1);
+    const auto encoded = remote_l3::encode_task_payload(payload);
+    const auto decoded = remote_l3::decode_task_payload(encoded.data(), encoded.size());
+    ASSERT_EQ(decoded.args.tensors.size(), 1u);
+    EXPECT_TRUE(decoded.args.tensors[0].buffer == arg.buffer);
+    EXPECT_EQ(decoded.args.tensors[0].byte_offset, 8u);
+    EXPECT_FALSE(decoded.args.remote_desc[0].present);
+    std::memset(arg.buffer.body + 8, 0, sizeof(generation));
+    EXPECT_THROW(validate_tensor(arg), std::invalid_argument);
 }
 
 TEST(RemoteWire, TensorRecordCarriesWholeBackingAndByteOffset) {

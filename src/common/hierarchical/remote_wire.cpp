@@ -340,15 +340,16 @@ CallConfig decode_call_config(const uint8_t *data, size_t size, size_t &offset) 
 // shapes, strides, dtype). Shapes and strides travel as ndims-many entries, so the slots past
 // `ndims` that validate_tensor requires zero are never on the wire and cannot arrive dirty.
 //
-// A remote TASK argument carries no local backing — the authoritative descriptor of its backing is
-// the per-argument RemoteTensorDesc sidecar — so the only backend this wire accepts is
-// REMOTE_SIDECAR, in both directions. The Tensor record still follows the ordinary local ABI:
-// descriptor.nbytes is the whole backing and byte_offset is the view origin. The sidecar carries
-// the transport locator for the same view and is checked against the decoded Tensor by the session.
+// A remote TASK argument carries either a REMOTE_SIDECAR transport placeholder or a DOMAIN_WINDOW
+// logical slice resolved against an existing receiver grant. Neither carries a foreign device VA.
+// The Tensor record follows the ordinary local ABI: descriptor.nbytes is the whole backing and
+// byte_offset is the view origin. A sidecar carries the transport locator for that same view and is
+// checked against the decoded Tensor by the session; domain slices require no sidecar.
 std::vector<uint8_t> encode_tensor(const Tensor &tensor) {
     const BufferDescriptor &desc = tensor.buffer;
     ensure(
-        desc.backend_kind == static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR),
+        desc.backend_kind == static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR) ||
+            desc.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW),
         "remote_wire: a remote TASK tensor must carry no local backing"
     );
     ensure(
@@ -390,7 +391,8 @@ Tensor decode_tensor(const uint8_t *data, size_t size, size_t &offset) {
     desc.access = get_u8(data, size, offset);
     desc.backend_kind = get_u8(data, size, offset);
     ensure(
-        desc.backend_kind == static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR),
+        desc.backend_kind == static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR) ||
+            desc.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW),
         "remote_wire: a remote TASK tensor must carry no local backing"
     );
     desc.nbytes = get_u64(data, size, offset);

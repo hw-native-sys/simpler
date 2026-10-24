@@ -747,6 +747,7 @@ def test_mixed_local_remote_import_failure_rolls_back_local_node(monkeypatch):
                     rank_count,
                     profile_id,
                     window_size,
+                    _host_enabled,
                 ) = LOCAL_PREPARE_REQUEST.unpack_from(payload, 0)
                 descriptor = GlobalDomainDescriptor(
                     version=GLOBAL_DOMAIN_VERSION,
@@ -1028,8 +1029,10 @@ def test_global_domain_backend_release_failure_is_terminal(monkeypatch):
 def test_global_domain_release_uses_allocation_run_after_graph_build(monkeypatch):
     from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
     from simpler.task_interface import CommBufferSpec  # noqa: PLC0415
+    from simpler.worker import _Lifecycle  # noqa: PLC0415
 
     worker, resources, node_ids = _failure_injection_worker()
+    worker._lifecycle = _Lifecycle.READY
     _install_global_domain_failure_injector(
         monkeypatch,
         worker,
@@ -1205,7 +1208,7 @@ def test_node_import_reuses_prepared_attachment_row_for_view():
 
 
 def test_node_release_invalidates_committed_view_before_partial_fanout_failure():
-    from simpler.task_interface import GlobalCommDomainView  # noqa: PLC0415
+    from simpler.task_interface import CommDomainRef, GlobalCommDomainView  # noqa: PLC0415
     from simpler.worker import (  # noqa: PLC0415
         CTRL_GLOBAL_DOMAIN_RELEASE,
         Worker,
@@ -1213,6 +1216,7 @@ def test_node_release_invalidates_committed_view_before_partial_fanout_failure()
     )
 
     prepare, imported = _local_node_domain_commands()
+    imported = replace(imported, owner_instance_id=b"creator1", buffer_ids=(40, 41))
     timeouts = []
 
     class FakeNativeWorker:
@@ -1245,11 +1249,19 @@ def test_node_release_invalidates_committed_view_before_partial_fanout_failure()
     )
     worker._global_node_domains[imported.domain_id] = state
     try:
+        ref = CommDomainRef(b"creator1", imported.domain_id, imported.generation)
+        borrowed = worker._get_domain(ref)
+        assert borrowed.borrowed and worker._get_domain(ref) is borrowed
         with pytest.raises(RuntimeError, match="partial release failed"):
             worker._release_global_domain_node(GlobalDomainReleaseCommand(imported.domain_id, imported.generation))
 
         assert state.phase is GlobalDomainPhase.ABORT
         assert not view.committed
+        assert borrowed.released and not borrowed.freed
+        with pytest.raises(KeyError):
+            worker._get_domain(ref)
+        with pytest.raises(RuntimeError, match="released"):
+            borrowed.member(0)
         with pytest.raises(KeyError, match="not committed"):
             worker._get_global_domain(imported.domain_id)
         with pytest.raises(RuntimeError, match="not committed"):
@@ -1258,6 +1270,7 @@ def test_node_release_invalidates_committed_view_before_partial_fanout_failure()
         native.fail_second = False
         worker._release_global_domain_node(GlobalDomainReleaseCommand(imported.domain_id, imported.generation))
         assert worker._global_node_domains == {}
+        assert borrowed.freed
         assert timeouts == [6.5, 6.5, 6.5, 6.5]
     finally:
         worker._global_node_domains.clear()

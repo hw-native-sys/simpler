@@ -63,7 +63,6 @@ from .global_comm_domain import (
     decode_release_command,
     encode_comm_init_result,
     encode_copy_result,
-    encode_descriptor_table,
     resolve_global_comm_capability,
 )
 from .remote_l3_protocol import (
@@ -576,22 +575,21 @@ def _import_wire_buffer(export_desc: Any, shm_name: str, base: int) -> Buffer:
     )
 
 
-def _materialize_task_args(
+def _materialize_task_args(  # noqa: PLR0912 -- domain-grant preflight precedes existing sidecar materialization
     args: RemoteTaskArgsWire,
     buffers: dict[tuple[int, ...], _RemoteBufferEntry],
     worker_id: int,
     *,
     mint_inline_buffer: Callable[[int], Buffer],
+    domain_resolver: Callable | None = None,
 ) -> tuple[TaskArgs, list[Buffer]]:
     """The wire ``TaskArgs`` a remote TASK's orchestration function receives.
 
-    The wire carries each argument as the submitter's own ``REMOTE_SIDECAR`` ``Tensor``: its view
-    (shapes, strides, dtype) is taken verbatim, and the sidecar names the local backing that view is
-    rebuilt over. Every element is therefore a ``Tensor`` over a backing this runner holds, so an
-    orchestration function forwards its own args to a chip child exactly as one at any other level
-    does. The returned ``Buffer`` list is the session-scoped backings minted for this task's
-    HOST_INLINE payloads; they live no longer than the run and the caller closes them once it
-    returns.
+    ``REMOTE_SIDECAR`` views are rebuilt over the local backing named by their sidecar.
+    ``DOMAIN_WINDOW`` tensors retain their identity and view after validation against an existing
+    node grant. All domain grants are checked before allocating any inline backing. An orchestration
+    function can forward either form to a chip child. The returned ``Buffer`` list holds this task's
+    session-scoped HOST_INLINE backings; the caller closes them when the run returns.
     """
     if len(args.remote_desc) != len(args.tensors):
         raise ValueError("remote TASK descriptor count does not match tensor count")
@@ -600,6 +598,14 @@ def _materialize_task_args(
 
     try:
         for tensor, sidecar in zip(args.tensors, args.remote_desc):
+            if tensor.buffer.backend_kind == BackendKind.DOMAIN_WINDOW:
+                if sidecar.present or domain_resolver is None:
+                    raise ValueError("remote domain Tensor requires an existing node grant and no sidecar")
+                domain_resolver(tensor.buffer)
+        for tensor, sidecar in zip(args.tensors, args.remote_desc):
+            if tensor.buffer.backend_kind == BackendKind.DOMAIN_WINDOW:
+                task_args.add_tensor(tensor)
+                continue
             if not sidecar.present:
                 raise ValueError("remote TASK tensor payload requires a RemoteTensorRef sidecar")
             desc = sidecar.desc
@@ -1095,8 +1101,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                                 else None
                             )
                             if result is None:
-                                descriptors = inner_worker._prepare_global_domain_node(command, worker_id)  # noqa: SLF001
-                                result = encode_descriptor_table(descriptors)
+                                result = inner_worker._prepare_global_domain_reply(command, worker_id)  # noqa: SLF001
                             _control_result_reply(
                                 conn,
                                 manifest,
@@ -1219,7 +1224,11 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 if orch_fn is None:
                     raise KeyError(f"remote TASK dispatcher has no callable hashid {task.callable_digest.hex()}")
                 task_args, inline_backings = _materialize_task_args(
-                    task.args, buffers, worker_id, mint_inline_buffer=mint_session_buffer
+                    task.args,
+                    buffers,
+                    worker_id,
+                    mint_inline_buffer=mint_session_buffer,
+                    domain_resolver=inner_worker._resolve_domain_buffer,
                 )
                 try:
                     task.config.output_prefix = _level_capture_prefix(task.config.output_prefix, inner_worker)

@@ -5500,14 +5500,13 @@ class TestRunHandle:
         """The owner's failure reaches every later caller, so no path reports
         success for an allocation whose backend release did not happen.
 
-        ``_release_all_live_domains`` keeps an un-freed handle in
-        ``_live_domains`` precisely so ``close()`` reports it as a residual; a
-        second caller that returned success would erase that.
+        The sweep transfers failed releases to teardown without reporting
+        them freed or replaying the backend operation.
         """
         worker = Worker(level=3, num_sub_workers=0)
         worker._worker = cast(Any, object())
         boom = RuntimeError("backend release failed")
-        _entered, in_backend, let_go = self._gated_domain_worker(worker, target_id=7, outcome=boom)
+        entered, in_backend, let_go = self._gated_domain_worker(worker, target_id=7, outcome=boom)
         let_go.set()
 
         resources = worker_mod._RunResources()
@@ -5518,13 +5517,20 @@ class TestRunHandle:
         assert in_backend.is_set()
         assert not contested.freed
 
-        # The sweep is the second caller: it must see the failure, keep the
-        # handle, leave `freed` false, and report the failure to its own caller
-        # rather than returning as if the domain were reclaimed.
+        # The sweep reports the cached failure and hands ownership to teardown.
         with pytest.raises(RuntimeError, match="backend release failed"):
             worker._release_all_live_domains()
         assert not contested.freed, "a failed release must not be reported as freed"
-        assert "contested" in worker._live_domains, "a failed release must stay a detectable residual"
+        assert "contested" not in worker._live_domains
+        assert not worker._cleanup_journal.empty
+        replacement = self._retired_domain(worker, resources, "contested", 8)
+        with pytest.raises(RuntimeError, match="backend release failed"):
+            worker._free_domain_after_fence(contested)
+        assert worker._live_domains["contested"] is replacement
+        error = worker._cleanup_journal.drive_kinds({"domain-retirement"})
+        assert isinstance(error, RuntimeError) and "reclamation is unconfirmed" in str(error)
+        assert not contested.freed and not worker._cleanup_journal.empty
+        assert entered == [7], "a cached failure must never retry the backend free"
 
     def test_allocate_domain_outside_graph_construction_is_rejected(self):
         worker = Worker(level=3, num_sub_workers=0)
@@ -6365,7 +6371,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
             def committed(*args):
                 ctypes.c_uint64.from_address(args[5]).value = 1
-                return 0xC7, 0xB000
+                return 0xC7, 0xB000, 64
 
             cw.comm_alloc_domain_windows = committed
             mailbox = memoryview(bytearray(worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST)))
@@ -6932,7 +6938,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 assert reply_shms is not None
                 reply = reply_shms[0]
                 assert reply.buf is not None
-                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0)
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0, 4096)
 
             monkeypatch.setattr(worker, "_dispatch_control_domain", commit_domain)
         else:
@@ -7029,7 +7035,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                 interrupt_main()
                 reply = reply_shms[0]
                 assert reply.buf is not None
-                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0)
+                worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply.buf, 0, 1, 0, 0, 0, 4096)
 
             monkeypatch.setattr(worker, "_dispatch_control_domain", commit_domain)
         else:
@@ -7704,7 +7710,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             staged_shms.extend(reply_shms.values())
             reply_buf = reply_shms[0].buf
             assert reply_buf is not None
-            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, 0xC7, 0xB000, 0)
+            worker_mod._DOMAIN_REPLY_HEADER.pack_into(reply_buf, 0, 1, 0xC7, 0xB000, 0, 64)
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", successful_dispatch)
         real_close = worker_mod.os.close

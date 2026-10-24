@@ -1445,6 +1445,12 @@ void Orchestrator::validate_remote_sidecars(
         for (int32_t i = 0; i < args.tensor_count(); ++i) {
             const Tensor &ref = args.tensor(i);
             const RemoteTensorSidecar &tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
+            if (ref.buffer.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW)) {
+                if (tensor_sidecar.present) {
+                    throw std::invalid_argument("Orchestrator: domain Tensor cannot carry a remote sidecar");
+                }
+                continue;
+            }
             // A remote arg carries no local backing: its Tensor is a placeholder (nbytes 0 or a
             // REMOTE_SIDECAR backend) and the real descriptor lives in the sidecar.
             bool has_local_backing =

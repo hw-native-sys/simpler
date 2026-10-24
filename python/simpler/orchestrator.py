@@ -49,6 +49,7 @@ from .task_interface import (
     ChipCallable,
     CommBufferSpec,
     CommDomainHandle,
+    CommDomainRef,
     DataType,
     DeviceMemoryInfo,
     GlobalCommDomainHandle,
@@ -527,6 +528,7 @@ class Orchestrator:
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
         workers: Sequence[int] | None = None,
+        host_windows=None,
     ) -> CommDomainHandle:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
 
@@ -542,7 +544,13 @@ class Orchestrator:
         if workers is not None and self._worker is not None and self._worker.level != 3:
             raise TypeError("legacy workers= is only supported by an L3 Worker")
         return self._domain(
-            name, members if members is not None else workers, window_size, buffers, retain_after_run, reuse=False
+            name,
+            members if members is not None else workers,
+            window_size,
+            buffers,
+            retain_after_run,
+            reuse=False,
+            host_windows=host_windows,
         )
 
     def get_or_allocate_domain(
@@ -553,15 +561,18 @@ class Orchestrator:
         window_size: int,
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
+        host_windows=None,
     ) -> CommDomainHandle:
         """Return the same live handle on an exact configuration match, otherwise create it.
 
         Member order, full buffer definitions, window request, retention and topology must match.
         A hit neither allocates nor initializes the existing window.
         """
-        return self._domain(name, members, window_size, buffers, retain_after_run, reuse=True)
+        return self._domain(
+            name, members, window_size, buffers, retain_after_run, reuse=True, host_windows=host_windows
+        )
 
-    def _domain(self, name, members, window_size, buffers, retain_after_run, *, reuse):
+    def _domain(self, name, members, window_size, buffers, retain_after_run, *, reuse, host_windows=None):
         if self._worker is None:
             raise RuntimeError("domain allocation requires an Orchestrator bound to a Worker")
         return self._worker._comm_domain(
@@ -571,16 +582,33 @@ class Orchestrator:
             buffers=buffers,
             retain_after_run=retain_after_run,
             reuse=reuse,
+            host_windows=host_windows,
         )
 
-    def get_domain(self, name: str) -> CommDomainHandle:
-        """Look up a live domain by name in its creator Worker; never create a domain."""
+    def copy_domain(
+        self, dst: Buffer, src: Buffer, *, worker: int, nbytes: int, dst_offset: int = 0, src_offset: int = 0
+    ) -> None:
+        """Synchronously copy two granted windows through an explicit local domain chip."""
+        if self._worker is None:
+            raise RuntimeError("domain copy requires a bound Worker")
+        self._worker._copy_domain_windows(
+            dst, src, worker=worker, nbytes=nbytes, dst_offset=dst_offset, src_offset=src_offset
+        )
+
+    def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:
+        """Look up an owned domain by name or ref, or borrow an already-granted domain by ref."""
         if self._worker is None:
             raise RuntimeError("get_domain requires an Orchestrator bound to a Worker")
         return self._worker._get_domain(name)
 
     def release_domain(self, handle: CommDomainHandle) -> None:
         """Release a domain through its creating Worker's completion fence."""
+        if (
+            self._worker is None
+            or handle._ref is None
+            or handle._ref.owner_instance_id != self._worker._owner_instance_id
+        ):
+            raise ValueError("release_domain requires the domain's creating Worker")
         handle.release()
 
     def allocate_global_domain(
@@ -656,11 +684,25 @@ class Orchestrator:
     def _copy_domain(self, handle, rank, data, buffer, offset, *, writing):
         if self._worker is None:
             raise RuntimeError("domain copy requires an Orchestrator bound to a Worker")
+        with (
+            self._worker._operation_lease("domain copy", allow_continuation=True),
+            contextlib.nullcontext()
+            if _callback_frame_for(self._worker) is not None
+            else self._worker._control_reservation("domain copy"),
+        ):
+            return self._copy_domain_locked(handle, rank, data, buffer, offset, writing=writing)
+
+    def _copy_domain_locked(self, handle, rank, data, buffer, offset, *, writing):
+        assert self._worker is not None
+        if not handle.borrowed:
+            if handle._ref is None or handle._ref.owner_instance_id != self._worker._owner_instance_id:
+                raise ValueError("domain copy requires the domain's creating Worker")
+            self._worker._use_domain(handle)
         size = len(data) if writing else data
         handle._require_live()
         absolute = self._global_copy_range(handle, buffer=buffer, offset=offset, nbytes=size)
         handle.member(rank)
-        if not handle.workers:
+        if not handle.workers and not handle.borrowed:
             if writing:
                 self._worker._copy_to_global_domain(handle, rank, data, absolute)
                 return None

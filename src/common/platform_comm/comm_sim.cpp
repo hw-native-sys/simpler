@@ -84,7 +84,7 @@ struct SharedHeader {
 // Build a session-scoped shm name component from a caller-controlled id.
 uint32_t hash_id(const char *id) {
     size_t h = std::hash<std::string>{}(id ? id : "default");
-    return static_cast<uint32_t>(h ^ (h >> 32));
+    return static_cast<uint32_t>(h ^ (h >> 32U));
 }
 
 std::string make_shm_name(uint32_t process_tree_id, uint32_t session_id) {
@@ -213,6 +213,10 @@ struct GlobalDomainAllocation {
 
     uint32_t rank = 0;
     uint32_t nranks = 0;
+    bool host_enabled = false;
+    bool import_started = false;
+    bool views_released = false;
+    std::vector<GlobalPeerMapping> host_mappings;
     std::string shm_name;
     void *local_base = nullptr;
     size_t mapping_size = 0;
@@ -555,9 +559,11 @@ extern "C" int comm_barrier(CommHandle h) {
 
 extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out, size_t *actual_window_size_out
 ) try {
-    if (h == nullptr || rank_ids == nullptr || device_ctx_out == nullptr || local_window_base_out == nullptr) return -1;
+    if (h == nullptr || rank_ids == nullptr || device_ctx_out == nullptr || local_window_base_out == nullptr ||
+        actual_window_size_out == nullptr)
+        return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         std::fprintf(
             stderr, "[comm_sim rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)\n",
@@ -698,6 +704,7 @@ extern "C" int comm_alloc_domain_windows(
 
     *device_ctx_out = reinterpret_cast<uint64_t>(alloc->host_ctx.get());
     *local_window_base_out = reinterpret_cast<uint64_t>(local_window);
+    *actual_window_size_out = window_size;
     h->domain_allocations.emplace(allocation_id, std::move(alloc));
     return 0;
 } catch (const std::exception &e) {
@@ -772,14 +779,14 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
 
 extern "C" int comm_global_domain_prepare(
     uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
-    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+    uint32_t host_enabled, CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
 ) try {
     if (domain_id == 0 || rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count ||
         window_size == 0 || profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM || descriptor_out == nullptr ||
         local_window_base_out == nullptr) {
         return -1;
     }
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    std::scoped_lock lock(global_domain_allocations_mutex);
     if (global_domain_allocations.count(domain_id) != 0) {
         return -1;
     }
@@ -809,6 +816,7 @@ extern "C" int comm_global_domain_prepare(
     std::memset(base, 0, window_size);
 
     auto allocation = std::make_unique<GlobalDomainAllocation>();
+    allocation->host_enabled = host_enabled != 0;
     allocation->rank = domain_rank;
     allocation->nranks = rank_count;
     allocation->shm_name = shm_name;
@@ -837,18 +845,21 @@ extern "C" int comm_global_domain_prepare(
 }
 
 extern "C" int comm_global_domain_import(
-    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
+    uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count,
+    const CommGlobalDomainDescriptor *hosts, size_t host_count, uint64_t *device_ctx_out
 ) try {
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
     if (it == global_domain_allocations.end() || descriptors == nullptr || device_ctx_out == nullptr) {
         return -1;
     }
     auto &allocation = it->second;
-    if (descriptor_count != allocation->nranks || allocation->host_ctx != nullptr) {
+    if (descriptor_count != allocation->nranks || allocation->host_ctx != nullptr || allocation->import_started ||
+        allocation->views_released) {
         return -1;
     }
 
+    allocation->import_started = true;
     std::vector<const CommGlobalDomainDescriptor *> rank_order(descriptor_count, nullptr);
     for (size_t i = 0; i < descriptor_count; ++i) {
         const auto &descriptor = descriptors[i];
@@ -893,6 +904,28 @@ extern "C" int comm_global_domain_import(
         ctx->windowsOut[rank] = reinterpret_cast<uint64_t>(base);
     }
 
+    if ((host_count != 0) != allocation->host_enabled || host_count > descriptor_count || (host_count && !hosts))
+        return -1;
+    for (size_t i = allocation->host_mappings.size(); i < host_count; ++i) {
+        const auto &host = hosts[i];
+        if (host.version != COMM_GLOBAL_DOMAIN_VERSION || host.profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM ||
+            host.domain_rank != descriptor_count + i || host.rank_count != descriptor_count || !host.mapping_size ||
+            !host.handle_size || host.handle_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES)
+            return -1;
+        std::string name(reinterpret_cast<const char *>(host.handle), host.handle_size);
+        int fd = shm_open(name.c_str(), O_RDWR, 0600);
+        if (fd < 0) return -1;
+        struct stat backing{};
+        if (fstat(fd, &backing) != 0 || backing.st_size < 0 ||
+            static_cast<uint64_t>(backing.st_size) < host.mapping_size) {
+            close(fd);
+            return -1;
+        }
+        void *base = mmap(nullptr, host.mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        close(fd);
+        if (base == MAP_FAILED) return -1;
+        allocation->host_mappings.emplace_back(base, host.mapping_size);
+    }
     allocation->peer_mappings = std::move(peer_mappings);
     *device_ctx_out = reinterpret_cast<uint64_t>(ctx.get());
     allocation->host_ctx = std::move(ctx);
@@ -905,12 +938,19 @@ extern "C" int comm_global_domain_import(
     return -1;
 }
 
-extern "C" int comm_global_domain_release(uint64_t domain_id) try {
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+extern "C" int comm_global_domain_release(uint64_t domain_id, uint32_t stage) try {
+    std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
     if (it == global_domain_allocations.end()) {
         return 0;
     }
+    auto &a = *it->second;
+    if (stage > 2 || (a.host_enabled && stage == 0) || (stage == 2 && !a.views_released)) return -1;
+    a.host_ctx.reset();
+    a.peer_mappings.clear();
+    a.host_mappings.clear();
+    a.views_released = true;
+    if (stage == 1) return 0;
     global_domain_allocations.erase(it);
     return 0;
 } catch (const std::exception &e) {
@@ -919,6 +959,40 @@ extern "C" int comm_global_domain_release(uint64_t domain_id) try {
 } catch (...) {
     std::fprintf(stderr, "[comm_sim] global_domain_release: unknown exception\n");
     return -1;
+}
+
+static std::pair<void *, size_t> global_window(GlobalDomainAllocation &a, uint32_t slot) {
+    if (slot < a.nranks && a.host_ctx) return {reinterpret_cast<void *>(a.host_ctx->windowsIn[slot]), a.mapping_size};
+    const size_t index = slot - a.nranks;
+    if (slot < a.nranks || index >= a.host_mappings.size()) return {nullptr, 0};
+    return {a.host_mappings[index].base, a.host_mappings[index].size};
+}
+
+extern "C" int comm_global_domain_window(uint64_t id, uint32_t slot, uint64_t *base, size_t *size) {
+    std::scoped_lock lock(global_domain_allocations_mutex);
+    auto it = global_domain_allocations.find(id);
+    if (it == global_domain_allocations.end() || !base || !size || it->second->views_released) return -1;
+    auto view = global_window(*it->second, slot);
+    if (!view.first) return -1;
+    *base = reinterpret_cast<uint64_t>(view.first);
+    *size = view.second;
+    return 0;
+}
+
+extern "C" int comm_global_domain_copy(
+    uint64_t id, uint32_t dst_slot, size_t dst_offset, uint32_t src_slot, size_t src_offset, size_t bytes, void *
+) {
+    std::scoped_lock lock(global_domain_allocations_mutex);
+    auto it = global_domain_allocations.find(id);
+    if (it == global_domain_allocations.end() || !bytes || !it->second->host_enabled || it->second->views_released)
+        return -1;
+    auto dst = global_window(*it->second, dst_slot), src = global_window(*it->second, src_slot);
+    if (!dst.first || !src.first || dst_offset > dst.second || bytes > dst.second - dst_offset ||
+        src_offset > src.second || bytes > src.second - src_offset ||
+        (dst_slot == src_slot && dst_offset < src_offset + bytes && src_offset < dst_offset + bytes))
+        return -1;
+    std::memcpy(static_cast<char *>(dst.first) + dst_offset, static_cast<char *>(src.first) + src_offset, bytes);
+    return 0;
 }
 
 extern "C" int comm_destroy(CommHandle h) try {

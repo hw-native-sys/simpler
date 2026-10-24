@@ -20,6 +20,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/pair.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
@@ -311,6 +312,12 @@ public:
         }
     }
 
+    void export_fabric(void *handle, void *token) const {
+        using Export = int (*)(void *, uint64_t, int, void *);
+        auto export_handle = reinterpret_cast<Export>(resolve_symbol("aclrtMemExportToShareableHandleV2"));
+        acl_check(export_handle(handle, 1, 2, token), "aclrtMemExportToShareableHandleV2");
+    }
+
 private:
     static constexpr int kAclSuccess = 0;
     static constexpr int kAclMemcpyHostToDevice = 1;
@@ -358,6 +365,75 @@ AclRuntimeApi &acl_api() {
     });
     return *api;
 }
+
+// Explicitly released by the node domain after every imported view is acknowledged gone.
+// Destruction cannot prove that acknowledgement and therefore does not free the allocation.
+class DomainHostMemory {
+public:
+    nb::tuple allocate(int device, uint32_t numa, uint64_t logical_bytes) {
+        if (handle_ || base_ || !logical_bytes) throw std::invalid_argument("Host allocation is not empty");
+        auto &api = acl_api();
+        api.bind_device_with_check(device);
+        device_ = device;
+        LocalAclPhysicalMemProp prop{};
+        prop.memAttr = 16;          // ACL_MEM_P2P_HUGE
+        prop.location = {numa, 4};  // ACL_MEM_LOCATION_TYPE_HOST_NUMA
+        size_t granularity = 0;
+        check(api.aclrtMemGetAllocationGranularity(&prop, 0, &granularity), "Host granularity");
+        if (!granularity || logical_bytes > SIZE_MAX - (granularity - 1))
+            throw std::invalid_argument("Host allocation extent overflow");
+        size_ = (logical_bytes + granularity - 1) / granularity * granularity;
+        logical_bytes_ = logical_bytes;
+        check(api.aclrtMallocPhysical(&handle_, size_, &prop, 0), "Host physical allocation");
+        check(api.aclrtReserveMemAddress(&base_, size_, 0, nullptr, 1), "Host VA reservation");
+        check(api.aclrtMapMem(base_, size_, 0, handle_, 0), "Host owner mapping");
+        mapped_ = true;
+        std::memset(base_, 0, logical_bytes_);
+        api.export_fabric(handle_, token_.data());
+        return nb::make_tuple(size_, nb::bytes(reinterpret_cast<const char *>(token_.data()), token_.size()));
+    }
+    nb::bytes read(uint64_t offset, uint64_t bytes) const {
+        bounds(offset, bytes);
+        return nb::bytes(static_cast<const char *>(base_) + offset, bytes);
+    }
+    void write(uint64_t offset, const nb::bytes &data) {
+        bounds(offset, data.size());
+        std::memcpy(static_cast<char *>(base_) + offset, data.c_str(), data.size());
+    }
+    void release() {
+        if (!base_ && !handle_) return;
+        auto &api = acl_api();
+        api.bind_device_with_check(device_);
+        if (mapped_) {
+            check(api.aclrtUnmapMem(base_), "Host unmap");
+            mapped_ = false;
+        }
+        if (base_) {
+            check(api.aclrtReleaseMemAddress(base_), "Host VA release");
+            base_ = nullptr;
+        }
+        if (handle_) {
+            check(api.aclrtFreePhysical(handle_), "Host physical free");
+            handle_ = nullptr;
+        }
+    }
+
+private:
+    int device_ = -1;
+    void *base_ = nullptr;
+    void *handle_ = nullptr;
+    bool mapped_ = false;
+    uint64_t size_ = 0;
+    uint64_t logical_bytes_ = 0;
+    std::array<uint8_t, 128> token_{};
+    static void check(int rc, const char *op) {
+        if (rc) throw std::runtime_error(std::string(op) + " failed with code " + std::to_string(rc));
+    }
+    void bounds(uint64_t offset, uint64_t bytes) const {
+        if (!mapped_ || offset > logical_bytes_ || bytes > logical_bytes_ - offset)
+            throw std::invalid_argument("Host access exceeds the live logical window");
+    }
+};
 
 std::string region_shm_name_for_open(const std::string &token) {
     if (token.empty()) {
@@ -1930,6 +2006,7 @@ uint64_t encode_scalar(nb::handle value) {
 struct ProvenanceEntry {
     BufferDescriptor descriptor;
     int32_t owner_worker_id;
+    std::vector<int32_t> targets;
 };
 
 struct ProvenanceTable {
@@ -2043,6 +2120,12 @@ BufferDescriptor decode_buffer_descriptor_wire(const uint8_t *raw, size_t size) 
 #endif
 
 NB_MODULE(_task_interface, m) {
+    nb::class_<DomainHostMemory>(m, "_DomainHostMemory")
+        .def(nb::init<>())
+        .def("allocate", &DomainHostMemory::allocate)
+        .def("read", &DomainHostMemory::read)
+        .def("write", &DomainHostMemory::write)
+        .def("release", &DomainHostMemory::release);
     m.doc() = "Nanobind bindings for task_interface (DataType, Buffer/Tensor wire ABI, ChipTensor, TaskArgs variants)";
 
     // Source commit this extension was compiled from; "" when git was
@@ -2263,7 +2346,8 @@ NB_MODULE(_task_interface, m) {
         .value("REMOTE_SIDECAR", BackendKind::REMOTE_SIDECAR)
         .value("DEVICE_MALLOC", BackendKind::DEVICE_MALLOC)
         .value("FORK_COW", BackendKind::FORK_COW)
-        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE);
+        .value("VMM_SHAREABLE", BackendKind::VMM_SHAREABLE)
+        .value("DOMAIN_WINDOW", BackendKind::DOMAIN_WINDOW);
 
     // --- CanonicalIdentity ---
     // Equality and hashing fold exactly the three meaningful fields, so a decode with dirty wire
@@ -2930,7 +3014,9 @@ NB_MODULE(_task_interface, m) {
                 const int32_t n = self.tensor_count();
                 for (int32_t i = 0; i < n; ++i) {
                     const auto backend = static_cast<BackendKind>(self.tensor(i).buffer.backend_kind);
-                    if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW) return true;
+                    if (backend == BackendKind::DEVICE_MALLOC || backend == BackendKind::VMM_WINDOW ||
+                        backend == BackendKind::DOMAIN_WINDOW)
+                        return true;
                 }
                 return false;
             },
@@ -2969,10 +3055,11 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "insert",
-            [](ProvenanceTable &self, const BufferDescriptor &descriptor, int32_t owner_worker_id) {
-                self.entries[descriptor.identity] = ProvenanceEntry{descriptor, owner_worker_id};
+            [](ProvenanceTable &self, const BufferDescriptor &descriptor, int32_t owner_worker_id,
+               const std::vector<int32_t> &targets) {
+                self.entries[descriptor.identity] = ProvenanceEntry{descriptor, owner_worker_id, targets};
             },
-            nb::arg("descriptor"), nb::arg("owner_worker_id"),
+            nb::arg("descriptor"), nb::arg("owner_worker_id"), nb::arg("targets") = std::vector<int32_t>{},
             "Register one allocation, keyed by its descriptor's identity."
         )
 
@@ -3012,9 +3099,15 @@ NB_MODULE(_task_interface, m) {
                 for (int32_t i = 0; i < n; ++i) {
                     const BufferDescriptor &d = args.tensor(i).buffer;
                     const auto backend = static_cast<BackendKind>(d.backend_kind);
-                    if (backend != BackendKind::DEVICE_MALLOC && backend != BackendKind::VMM_WINDOW) continue;
+                    if (backend != BackendKind::DEVICE_MALLOC && backend != BackendKind::VMM_WINDOW &&
+                        backend != BackendKind::DOMAIN_WINDOW)
+                        continue;
                     auto it = self.entries.find(d.identity);
-                    if (it == self.entries.end() || it->second.owner_worker_id != target_worker_id) {
+                    if (it == self.entries.end() ||
+                        (it->second.targets.empty() ?
+                             it->second.owner_worker_id != target_worker_id :
+                             std::find(it->second.targets.begin(), it->second.targets.end(), target_worker_id) ==
+                                 it->second.targets.end())) {
                         return nb::make_tuple(i, PROV_NOT_LIVE);
                     }
                     // Authorization and execution consume the same Buffer, so a same-identity
@@ -4100,18 +4193,19 @@ NB_MODULE(_task_interface, m) {
                 if (commit_flag_address == 0 || commit_flag_address % alignof(uint64_t) != 0) {
                     throw std::invalid_argument("comm_alloc_domain_windows: commit flag address is invalid");
                 }
-                auto [device_ctx, local_window_base] =
+                auto [device_ctx, local_window_base, actual_window_size] =
                     self.comm_alloc_domain_windows(comm_handle, allocation_id, rank_ids, domain_rank, window_size);
                 __atomic_store_n(
                     reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address)), uint64_t{1},
                     __ATOMIC_RELEASE
                 );
-                return nb::make_tuple(device_ctx, local_window_base);
+                return nb::make_tuple(device_ctx, local_window_base, actual_window_size);
             },
             nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
             nb::arg("window_size"), nb::arg("commit_flag_address"),
             "Collectively allocate a fresh per-rank pool for a subset; returns "
-            "(device_ctx, local_window_base) for this rank and publishes the commit flag before result conversion."
+            "(device_ctx, local_window_base, actual_window_size) for this rank and publishes the commit flag before "
+            "result conversion."
         )
         .def(
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),
@@ -4121,33 +4215,41 @@ NB_MODULE(_task_interface, m) {
         .def(
             "comm_global_domain_prepare",
             [](ChipWorker &self, uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size,
-               uint32_t profile) {
-                auto [descriptor, local_window_base, actual_window_size] =
-                    self.comm_global_domain_prepare(domain_id, domain_rank, rank_count, window_size, profile);
+               uint32_t profile, bool host_enabled) {
+                auto [descriptor, local_window_base, actual_window_size] = self.comm_global_domain_prepare(
+                    domain_id, domain_rank, rank_count, window_size, profile, host_enabled
+                );
                 return nb::make_tuple(
                     nb::bytes(reinterpret_cast<const char *>(descriptor.data()), descriptor.size()), local_window_base,
                     actual_window_size
                 );
             },
             nb::arg("domain_id"), nb::arg("domain_rank"), nb::arg("rank_count"), nb::arg("window_size"),
-            nb::arg("profile"), "Create a Global CommDomain local window and return its transport descriptor."
+            nb::arg("profile"), nb::arg("host_enabled") = false,
+            "Create a Global CommDomain local window and return its transport descriptor."
         )
         .def(
             "comm_global_domain_import",
-            [](ChipWorker &self, uint64_t domain_id, nb::bytes descriptors) {
+            [](ChipWorker &self, uint64_t domain_id, nb::bytes descriptors, nb::bytes hosts) {
                 std::vector<uint8_t> descriptor_bytes(
                     reinterpret_cast<const uint8_t *>(descriptors.c_str()),
                     reinterpret_cast<const uint8_t *>(descriptors.c_str()) + descriptors.size()
                 );
-                return self.comm_global_domain_import(domain_id, descriptor_bytes);
+                std::vector<uint8_t> host_bytes(
+                    reinterpret_cast<const uint8_t *>(hosts.c_str()),
+                    reinterpret_cast<const uint8_t *>(hosts.c_str()) + hosts.size()
+                );
+                return self.comm_global_domain_import(domain_id, descriptor_bytes, host_bytes);
             },
-            nb::arg("domain_id"), nb::arg("descriptors"),
+            nb::arg("domain_id"), nb::arg("descriptors"), nb::arg("hosts") = nb::bytes("", 0),
             "Import a rank-ordered Global CommDomain descriptor table and return the device context."
         )
         .def(
             "comm_global_domain_release", &ChipWorker::comm_global_domain_release, nb::arg("domain_id"),
-            "Release a prepared or imported Global CommDomain."
+            nb::arg("stage") = 0, "Release a prepared or imported Global CommDomain."
         )
+        .def("comm_global_domain_window", &ChipWorker::comm_global_domain_window)
+        .def("comm_global_domain_copy", &ChipWorker::comm_global_domain_copy)
         .def("comm_barrier", &ChipWorker::comm_barrier, nb::arg("comm_handle"), "Synchronize all ranks.")
         .def(
             "comm_destroy", &ChipWorker::comm_destroy, nb::arg("comm_handle"),

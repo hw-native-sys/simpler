@@ -1272,18 +1272,21 @@ remote_l3::TaskPayloadWire RemoteL3Endpoint::build_task_payload(const TaskSlotSt
         const Tensor &ref = a.tensor(i);
         RemoteTensorSidecar tensor_sidecar{};
         if (!sidecar.tensors.empty()) tensor_sidecar = sidecar.tensors[static_cast<size_t>(i)];
-        // The sidecar is the sole authority for a remote argument's backing, so the sender's own
-        // backing never crosses: an arg bound for a remote worker is a REMOTE_SIDECAR placeholder
-        // whose identity names the remote buffer. Orchestrator::validate_remote_sidecars rejects a
-        // local backing alongside a sidecar at submit; this is the encoder's own guard.
-        if (ref.buffer.backend_kind != static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR)) {
+        // Remote arguments name backing through a sidecar or an existing domain grant; the sender's
+        // device VA never crosses. The submit gate rejects local backing alongside a sidecar;
+        // this is the encoder's own guard.
+        const bool domain = ref.buffer.backend_kind == static_cast<uint8_t>(BackendKind::DOMAIN_WINDOW);
+        if (domain && tensor_sidecar.present) {
+            throw std::runtime_error("RemoteL3Endpoint: domain Tensor cannot carry a remote sidecar");
+        }
+        if (!domain && ref.buffer.backend_kind != static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR)) {
             throw std::runtime_error(
                 "RemoteL3Endpoint::build_task_payload: a remote task arg must carry no local backing"
             );
         }
         // Every argument's backing is named by its own sidecar, so an absent one leaves the
         // placeholder naming nothing the runner could resolve.
-        if (!tensor_sidecar.present) {
+        if (!domain && !tensor_sidecar.present) {
             throw std::runtime_error("RemoteL3Endpoint::build_task_payload: tensor submitted without remote sidecar");
         }
         payload.args.tensors.push_back(ref);

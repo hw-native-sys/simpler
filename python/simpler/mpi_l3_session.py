@@ -19,7 +19,7 @@ import struct
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .global_comm_domain import (
@@ -105,7 +105,7 @@ class MpiGlobalDomainExchange:
         return list(result[0])
 
     def prepare_import(self, command: GlobalDomainCommand, inner_worker: Worker, worker_id: int) -> bytes | None:
-        if command.phase is not GlobalDomainPhase.PREPARE_EXPORT:
+        if command.host_windows or command.phase is not GlobalDomainPhase.PREPARE_EXPORT:
             return None
         if {int(member.node_worker_id) for member in command.members} != self._group_worker_id_set:
             return None
@@ -161,17 +161,7 @@ class MpiGlobalDomainExchange:
             release_local()
             raise
 
-        import_command = GlobalDomainCommand(
-            phase=GlobalDomainPhase.IMPORT,
-            domain_id=command.domain_id,
-            generation=command.generation,
-            name=command.name,
-            profile=command.profile,
-            window_size=command.window_size,
-            members=command.members,
-            buffers=command.buffers,
-            descriptors=descriptors,
-        )
+        import_command = replace(command, phase=GlobalDomainPhase.IMPORT, descriptors=descriptors, attachments=())
         import_ok = True
         import_error = ""
         try:

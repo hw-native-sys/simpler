@@ -350,17 +350,20 @@ A `Tensor` on the wire is materialized differently by each consumer:
 
 | Consumer | What it does |
 | -------- | ------------ |
-| **Chip leaf (L2 runtime)** | Decode the POD blob with `read_args_from_blob`, then materialize each one to a `ChipTensor` (map-once, keyed by canonical identity) via `ImportRegistry.materialize_args`, including **strided** views, and submit with `_submit_chip_run_materialized`. |
+| **Chip leaf (L2 runtime)** | Decode the POD blob with `read_args_from_blob`, then materialize each one to a `ChipTensor` via `ImportRegistry.materialize_args`, including **strided** views, and submit with `_submit_chip_run_materialized`. Ordinary mappings are cached by identity; domain windows revalidate their grant on every use. |
 | **Python sub-worker** (compute) | Map each one into a `MappedArg`; the callable computes with `torch.frombuffer(arg.buffer, ...)`. No `ChipTensor`. |
-| **Nested L4→L3 orch** (forwarding) | **Re-export** each backing to a descriptor `H'` that keeps the source's canonical identity — no pass-through, no map on the forwarding hop. |
+| **Nested L4→L3 orch** (forwarding) | **Re-export** ordinary backings to a descriptor `H'` that keeps the source's canonical identity, without mapping. Domain windows keep their logical descriptor after validation against an existing node grant. |
 
-**Re-export (no pass-through).** An upper-level tensor is forwarded on receipt as a
+**Re-export.** An ordinary upper-level tensor is forwarded on receipt as a
 descriptor `H'` that keeps the source's **canonical identity unchanged** (invariant
 across every edge — an L4 buffer forwarded L4→L3→L2 carries one identity at all
 three layers; only role / materialized VA / view change), per-backing and without
 mapping. A downstream compute leaf maps lazily, so pure forwarding carries no map
 cost. Dependency inference keys on the invariant identity, so an alias /
 retain-release does not split across layers.
+
+Domain windows already carry an address-free descriptor, which is validated
+against the receiving node's existing grant and forwarded unchanged.
 
 ## Canonical identity
 
@@ -388,8 +391,17 @@ gates, or keys on it.
 | `FORK_SHM` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork `MAP_SHARED` host buffer (e.g. `share_memory_()`), writable from the child |
 | `FORK_COW` | the same VA, no map | exactly 8 bytes, a non-zero u64 LE base | a pre-fork plain host buffer: copy-on-write, so **READ only** |
 | `VMM_WINDOW` | the device VA of the window carved by `allocate_domain`, no map | exactly 8 bytes, a non-zero u64 LE base | communication-domain window / buffer |
+| `DOMAIN_WINDOW` (7) | the slice base resolved against a live endpoint/chip grant | exactly 28 bytes, `<QQIQ>`: domain id, generation, window slot, slice byte offset | logical domain Buffer, forwarded through L3 to a granted chip |
 | `DEVICE_MALLOC` | the device pointer, no map (chip-local) | exactly 8 bytes, a non-zero u64 LE base | `alloc_child_tensor` |
 | `REMOTE_SIDECAR` | (P2) resolved via the remote transport | empty | an arg to a remote L3; the descriptor rides in the sidecar |
+
+For `DOMAIN_WINDOW`, the creator incarnation is carried by canonical identity;
+slots below the device-rank count name HBM, and subsequent slots name the
+node-ordered Host pools. Domain protocol version 3 rejects older peers; the
+unchanged body length does not imply semantic compatibility.
+Tensor view offsets remain in the Tensor. `ImportRegistry.materialize` rechecks
+the committed grant even on a cache hit, while cache-only `require` refuses
+domain windows. See the [communication-domain contract](comm-domain.md#unified-creation-and-reuse).
 
 **The body rule is enforced, not advisory.** `backend_kind` is what selects how a
 consumer reads `body`, so a body that does not fit that reading is not a smaller

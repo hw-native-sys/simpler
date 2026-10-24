@@ -47,7 +47,7 @@ def _run_controls(monkeypatch, init_results, commands):
         )
     )
     cw.comm_init.side_effect = init_results
-    cw.comm_alloc_domain_windows.return_value = (0xC7, 0xB000)
+    cw.comm_alloc_domain_windows.return_value = (0xC7, 0xB000, 4096)
     responses = []
     owner = worker_mod.mint_owner_instance_id()
     store = ProviderRegionStore(
@@ -127,7 +127,7 @@ def test_bootstrap_handle_is_forwarded_without_mutating_runtime(monkeypatch):
     assert allocated[:5] == (0x1234, 7, [0], 0, 64)
     assert allocated[5] != 0
     cw.comm_release_domain_windows.assert_called_once_with(0x1234, 7, 1, 0)
-    assert published == (1, 0xC7, 0xB000, 0)
+    assert published == (1, 0xC7, 0xB000, 0, 4096)
 
     cold, refused, _ = _run_controls(monkeypatch, [], [worker_mod._CTRL_ALLOC_DOMAIN, worker_mod._CTRL_RELEASE_DOMAIN])
     assert all(code == 1 and "CTRL_COMM_INIT must succeed first" in message for code, message in refused)

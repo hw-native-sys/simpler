@@ -29,6 +29,7 @@ from __future__ import annotations
 import atexit
 import contextlib
 import ctypes
+import operator
 import os
 import shutil
 import sys
@@ -40,7 +41,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from math import prod
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     # Annotation-only: `CallableHandle` is imported lazily at its use site, and
@@ -127,6 +128,7 @@ from _task_interface import (
 )
 
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
+from .comm_domain import CommDomainRef, HostWindowSpec
 from .comm_endpoints import DEVICE_AICPU
 
 
@@ -148,7 +150,7 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
             raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
 
 
-def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> ChipStorageTaskArgs:
+def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry, domain_resolver=None) -> ChipStorageTaskArgs:
     """Resolve accepted argument descriptors into this process's chip-only POD.
 
     The caller owns submission/callable checks, backing retention and the registry's
@@ -157,7 +159,7 @@ def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> Chi
     """
     if not isinstance(args, TaskArgs):
         raise TypeError("chip argument materialization requires address-free TaskArgs")
-    resolved = registry.materialize_args(args)
+    resolved = registry.materialize_args(args, domain_resolver)
     return _ti_module.materialize_task_args(args, resolved)
 
 
@@ -284,6 +286,9 @@ __all__ = [
     "CommBufferSpec",
     "ChipDomainContext",
     "CommDomainHandle",
+    "CommDomainRef",
+    "HostWindowSpec",
+    "CommDomainMember",
     "GlobalCommDomainHandle",
     "GlobalCommDomainView",
 ]
@@ -1112,6 +1117,9 @@ class ChipDomainContext:
     buffers: dict[str, Buffer]
 
 
+CommDomainMember = GlobalDomainMember
+
+
 class CommDomainHandle:
     """User-facing handle for one dynamically-allocated CommDomain.
 
@@ -1126,19 +1134,20 @@ class CommDomainHandle:
 
         live           — allocated, indexable, can be passed to submit_*
         released       — release() called; further indexing raises;
-                          backend memory still alive until Worker.run drain
-        freed          — backend release_domain has executed, memory gone
+                          physical reclamation is pending or unconfirmed
+        freed          — physical reclamation has been confirmed
 
     Most users only see ``released``; the ``live → released`` transition
     happens at ``with`` exit (or explicit ``release()``), and the
-    ``released → freed`` transition is the runtime's job at end-of-run.
+    ``released → freed`` transition requires proven completion and physical
+    reclamation. Failed or unconfirmed cleanup remains tracked and is reported.
 
     Callers must treat handle attributes and context/buffer mappings as read-only
     metadata. Reassignment is unsupported; configure through allocation arguments
     and end ownership through ``release()``. Buffer contents remain writable.
-    Each run consuming domain Buffers must obtain the domain through allocation or
-    lookup; carrying Buffers directly across runs is unsupported. Retained handles
-    may be inspected and released serially after run completion.
+    Submitted Tensor identities register domain use in the current run, including
+    cached Tensors. Scalar-only use requires explicit lookup in that run. Retained
+    handles may be inspected and released serially after run completion.
     """
 
     __slots__ = (
@@ -1149,6 +1158,7 @@ class CommDomainHandle:
         "_domain_size",
         "_domain_ranks",
         "_release_fn",
+        "_release_scope",
         "_released",
         "_freed",
         "members",
@@ -1159,6 +1169,10 @@ class CommDomainHandle:
         "retain_after_run",
         "attachments",
         "_config",
+        "_ref",
+        "requested_window_size",
+        "_host_buffers",
+        "_local_host_fn",
     )
 
     def __init__(  # noqa: PLR0913 -- preserve the L3 and legacy L4 constructor keywords
@@ -1178,6 +1192,12 @@ class CommDomainHandle:
         attachments: tuple[GlobalDomainAttachment, ...] = (),
         _domain_size: int | None = None,
         _domain_ranks: dict[int, int] | None = None,
+        ref: CommDomainRef | None = None,
+        borrowed: bool = False,
+        host_buffers=None,
+        local_host_fn=None,
+        requested_window_size: int | None = None,
+        _release_scope: Callable[[CommDomainHandle], contextlib.AbstractContextManager] = contextlib.nullcontext,
     ) -> None:
         self.name = name
         self.workers = tuple(workers)
@@ -1187,7 +1207,8 @@ class CommDomainHandle:
         self._domain_ranks = (
             {worker: rank for rank, worker in enumerate(self.workers)} if _domain_ranks is None else dict(_domain_ranks)
         )
-        self._release_fn = _release_fn
+        self._release_fn = None if borrowed else _release_fn
+        self._release_scope = _release_scope
         self.members = tuple(members)
         self.buffers = tuple(buffers)
         self.domain_id = self.allocation_id if domain_id is None else int(domain_id)
@@ -1196,8 +1217,12 @@ class CommDomainHandle:
         self.retain_after_run = bool(retain_after_run)
         self.attachments = tuple(attachments)
         self._config = None
+        self._host_buffers = dict(host_buffers or {})
+        self._local_host_fn = local_host_fn
         self._released = False
         self._freed = False
+        self._ref = ref
+        self.requested_window_size = self.mapping_size if requested_window_size is None else int(requested_window_size)
 
     def __getitem__(self, chip_idx: int) -> ChipDomainContext:
         self._require_live()
@@ -1207,18 +1232,44 @@ class CommDomainHandle:
         if self._released:
             raise RuntimeError(f"CommDomainHandle({self.name!r}) is already released")
 
-    def member(self, domain_rank: int) -> GlobalDomainMember:
-        """Return rank-ordered topology metadata, without a remote device address."""
+    def member(self, domain_rank: int) -> CommDomainMember:
+        """Return a member's topology and ordinary Buffers, indexed by domain rank."""
         self._require_live()
         rank = int(domain_rank)
         if rank < 0 or rank >= len(self.members):
             raise IndexError(f"domain rank {rank} is out of range")
         return self.members[rank]
 
+    def host(self, node_worker_id: int) -> Buffer:
+        """The node's logical DRAM pool; every chip consumes the same backing identity."""
+        self._require_live()
+        return self._host_buffers[operator.index(node_worker_id)]
+
+    def local_host(self):
+        """Protected byte access to the owning L3's local DRAM, without exposing its VA."""
+        self._require_live()
+        if self._local_host_fn is None:
+            raise RuntimeError("this handle has no local Host owner")
+        return self._local_host_fn()
+
     def local_context(self, domain_rank: int) -> ChipDomainContext:
         """Return this creator's local chip mapping; L4 creators hold no such mappings."""
         member = self.member(domain_rank)
-        return self[member.local_worker_id]
+        context = self[member.local_worker_id]
+        if context.domain_rank != member.domain_rank:
+            raise KeyError(f"domain rank {domain_rank} is not mapped on this node")
+        return context
+
+    @property
+    def ref(self) -> CommDomainRef:
+        self._require_live()
+        if self._ref is None:
+            raise RuntimeError("domain has no exported reference")
+        return self._ref
+
+    @property
+    def borrowed(self) -> bool:
+        return self._release_fn is None
 
     def buffer_range(self, name: str) -> tuple[int, int]:
         self._require_live()
@@ -1231,44 +1282,50 @@ class CommDomainHandle:
 
     @property
     def released(self) -> bool:
-        """True once ``release()`` (or ``with`` exit) has been called.
+        """True once logical release has been accepted through ``release()`` or ``with`` exit.
 
-        Backend memory may still be alive — it is freed by the Worker after
-        DAG drain at end-of-run.  Use this to gate further indexing /
-        submission, not to assert physical teardown (use ``freed`` for that).
+        Backend memory may still be alive until completion and successful cleanup.
+        Use this to gate further indexing/submission, not to assert physical
+        teardown (use ``freed`` for that).
         """
         return self._released
 
     @property
     def freed(self) -> bool:
-        """True once the backend ``comm_release_domain_windows`` has executed.
+        """True once physical reclamation has been confirmed.
 
-        Flips after the owning run's fence and physical release. Releasing a
-        retained handle after run completion frees it synchronously. An ``orch_fn``
-        will never observe ``True`` for a handle it released within the same run.
+        Accepted uses must finish first. A retained domain released serially
+        after run completion is freed synchronously on success. Failed or
+        unconfirmed cleanup remains tracked and is reported.
         """
         return self._freed
 
     def release(self) -> None:
         """Mark this handle for collective release.  Idempotent.
 
-        Inside an orch function, this is a non-blocking mark — the actual
-        backend ``comm_release_domain_windows`` runs after
-        the owning run's completion wait so that tasks already submitted with
+        Inside an orch function, this is a non-blocking mark — backend cleanup
+        follows the owning run's completion wait so that tasks already submitted with
         this domain's ``device_ctx`` see live memory through execution.
-        Serial release after run completion frees a retained domain immediately.
+        Serial release after run completion attempts immediate physical release.
+        Failure is reported and the cleanup obligation remains tracked.
 
         After this returns, the handle is treated as released for the
         user's purposes: ``__getitem__`` raises, repeated ``release()`` is
         a no-op, and the orch function must not pass it to further
         ``submit_*`` calls.
         """
+        if self._release_fn is None:
+            raise RuntimeError("borrowed communication domain cannot be released")
         if self._released:
             return
-        self._released = True
-        self._release_fn(self)
+        with self._release_scope(self):
+            if not self._released:
+                self._released = True
+                self._release_fn(self)
 
     def __enter__(self) -> CommDomainHandle:
+        if self.borrowed:
+            raise RuntimeError("borrowed communication domain cannot enter a releasing context")
         self._require_live()
         return self
 
@@ -1285,7 +1342,7 @@ class CommDomainHandle:
         return f"CommDomainHandle(name={self.name!r}, workers={self.workers}, {state})"
 
 
-# The legacy L4 spelling denotes the same owning handle type.
+# The legacy L4 spelling denotes the same public handle type.
 GlobalCommDomainHandle = CommDomainHandle
 
 

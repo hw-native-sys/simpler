@@ -1076,7 +1076,7 @@ class ImportRegistry:
         self._by_identity: dict[CanonicalIdentity, ImportedBuffer] = {}
         self._context = context
 
-    def materialize(self, desc: BufferDescriptor) -> ImportedBuffer:
+    def materialize(self, desc: BufferDescriptor, domain_resolver=None) -> ImportedBuffer:
         """Map ``desc``'s backing into this process on first sight of its identity; reuse the
         cached ImportedBuffer thereafter (map-once).
 
@@ -1094,6 +1094,8 @@ class ImportRegistry:
         named mechanism out. Nothing after selection looks at ``backend_kind`` again. A mechanism
         that reaches the backing without producing an address is refused *here* rather than there --
         this returns a mapping, and that is the only narrowing it applies to the judgment.
+
+        Domain windows instead require an endpoint grant resolver on every call, including cache hits.
         """
         key = desc.identity
         cached = self._by_identity.get(key)
@@ -1108,7 +1110,21 @@ class ImportRegistry:
                     f"identity names one backing, so the mapping already handed out is kept and "
                     f"this is refused"
                 )
-            return cached
+            if desc.backend_kind != BackendKind.DOMAIN_WINDOW:
+                return cached
+        if desc.backend_kind == BackendKind.DOMAIN_WINDOW:
+            if domain_resolver is None or self._context.deployment not in (DEVICE_AICORE, DEVICE_AICPU):
+                raise ValueError("communication domain has no live grant at this endpoint")
+            imported = ImportedBuffer(
+                key,
+                domain_resolver(desc),
+                desc.nbytes,
+                desc.address_space,
+                descriptor=desc,
+                capabilities=capabilities_for_adapter(AdapterKind.DIRECT_MAP, desc.access),
+            )
+            self._by_identity[key] = imported
+            return imported
         kind, profile = select_adapter(desc, self._context)
         resolver = _RESOLVERS.get(profile)
         if resolver is None:
@@ -1134,13 +1150,13 @@ class ImportRegistry:
         self._by_identity[key] = imported
         return imported
 
-    def materialize_args(self, args) -> dict[CanonicalIdentity, tuple[int, int]]:
+    def materialize_args(self, args, domain_resolver=None) -> dict[CanonicalIdentity, tuple[int, int]]:
         """Materialize every embedded descriptor in a ``TaskArgs`` and return the resolved map:
         identity -> (local base, address_space), scoped to this call's own tensors."""
         resolved: dict[CanonicalIdentity, tuple[int, int]] = {}
         for i in range(args.tensor_count()):
             desc = args.tensor(i).buffer
-            imported = self.materialize(desc)
+            imported = self.materialize(desc) if domain_resolver is None else self.materialize(desc, domain_resolver)
             resolved[desc.identity] = (imported.base, int(imported.address_space))
         return resolved
 
@@ -1174,12 +1190,15 @@ class ImportRegistry:
         This is a pure lookup: it never maps as a side effect, so an identity this endpoint has not
         materialized raises ``KeyError``. Missing identity and insufficient capability are
         intentionally different failures so callers can choose between materializing the backing and
-        selecting a different operation adapter.
+        selecting a different operation adapter. Domain windows require fresh grant resolution through
+        ``materialize`` and cannot be retrieved by this cache-only lookup.
         """
 
         imported = self._by_identity.get(identity)
         if imported is None:
             raise KeyError(f"ImportRegistry: no buffer registered for {identity}")
+        if imported.descriptor is not None and imported.descriptor.backend_kind == BackendKind.DOMAIN_WINDOW:
+            raise ValueError("communication domain requires materialize() with a live grant resolver")
         if need is None:
             return imported
         try:
