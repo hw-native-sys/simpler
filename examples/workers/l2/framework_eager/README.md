@@ -4,14 +4,24 @@ This bounded A3 reference consumer puts `Worker.submit` in torch_npu's actual
 host emission queue. Torch operations produce two DEVICE inputs; the ordinary
 public Worker launches one add kernel; a Torch tensor addition consumes its
 output on the same framework stream. TMR and HBG use the same consumer.
-Additional consumers exercise caller-stream switching and aliased INOUT views
-through that same public Worker and host queue bridge.
+Additional consumers exercise caller-stream switching, aliased INOUT views,
+accepted callback failures and per-call values through that same public Worker
+and host queue bridge.
 
 | Consumer | Executable assertions |
 | -------- | --------------------- |
 | `main.py` | Same-stream producers → Worker → successor; retained caller frames, observable callback error and close ordering |
 | `cross_stream.py` | Separate producer and consumer streams, caller A → B → A on one Worker, explicit framework event dependencies |
 | `alias_inout.py` | One Buffer backing full and partially overlapping strided views, INPUT plus INOUT, repeated updates and unchanged guards |
+| `failure_recovery.py` | A Python callback fails after submit acceptance; later requests complete and init-thread Worker close retires all accepted runs |
+| `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
+
+Public `Worker.close()` drains accepted direct-chip runs through their normal
+RunHandle completion and retirement path before checking workspace ownership.
+Callers need not individually wait successful runs before closing the Worker.
+A context refusal or timeout leaves the tree and ownership available for a later
+close retry; error delivery and completion proof remain separate. The framework
+must still publish and finish its queued callbacks before closing the Worker.
 
 The C++ extension uses torch_npu's existing `OpCommand::RunOpApi`. It provides
 no separate executor or public Torch integration API. PyPTO's process adapter
@@ -42,7 +52,7 @@ thread. Golden values are checked only after every framework successor has
 been enqueued and the final framework stream completion boundary returns.
 
 The system tests cover both runtimes and both policies. A session-scoped
-fixture builds the optional bridge artifact once. The cross-stream and alias
+fixture builds the optional bridge artifact once. The additional consumer
 CLIs load the unique existing artifact, building only when it is absent; the
 original same-stream CLI still checks its incremental build cache. All use
 the original `build_bridge` / `_load_bridge` helpers. The
@@ -114,6 +124,28 @@ views before any store, so the reference uses each step's pre-update snapshot.
 A framework successor checks the entire backing, including unchanged guard
 regions, after each update. Initial host-to-device preparation precedes all
 update chains; no host decision or device copy-back occurs between updates.
+
+`failure_recovery.py` publishes each accepted RunHandle to a caller-retained
+list before the first callback raises a Python exception. The queued-call
+result reports that exception; it does not cancel the accepted run. Two later
+requests and all framework successors complete with correct results. After the
+final framework boundary, the init thread calls `Worker.close()` without
+individual `RunHandle.wait()` calls, then closes Buffer wrappers and reuses the
+caller stream. This covers ordinary Python callback failure and successful
+close after completion, not failed native drain, device faults or close while
+an unpublished framework callback is pending. An unproved failure retains the
+caller and runtime owners.
+
+`value_arguments.py` submits fresh FLOAT32, INT8, UINT64 and FLOAT64 values for
+each call, then clears the TaskArgs and changes the scalar wrappers. High bits,
+signed values, FLOAT64-only precision and negative zero affect independent
+expected results. HBG additionally reads an explicit HOST tensor with
+`TensorTransfer.NONE` during host orchestration; changing its contents after
+submit must not alter the already prepared result. Its backing remains
+caller-owned until retirement: changing contents is not an early-free test.
+TMR's unsupported HOST/NONE operand is refused before a subsequent valid DEVICE
+request on the same Worker. No tensor H2D transfer is implicit, and this does
+not add HOST tensor support to TMR.
 
 These are bounded reference cases. Full framework process shutdown, arbitrary
 strides or cross-tile overlap, A5 and capture remain separate qualification.

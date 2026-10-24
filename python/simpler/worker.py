@@ -4780,10 +4780,13 @@ class _CloseAttempt:
     likewise leaves the native tree intact for a later attempt.
     """
 
-    __slots__ = ("_outcome",)
+    __slots__ = ("_outcome", "draining_chip_runs")
 
     def __init__(self) -> None:
         self._outcome: _CloseOutcome | None = None
+        # Error-delivery fact retained across retries once close takes these
+        # runs. Their completion still requires each actual fence.
+        self.draining_chip_runs = False
 
     @property
     def done(self) -> bool:
@@ -5675,9 +5678,9 @@ class Worker:
         # Exclusive for run admission, shared for control that belongs to no run:
         # such a command must exclude admission, but not other chips' commands.
         self._submit_mu = _SharedExclusiveLock()
-        # Guarded by _hierarchical_start_cv. Handles are installed before their
-        # orchestration callback can enqueue work and retired after fence-owned
-        # cleanup, so close() can drain the exact accepted set.
+        # Guarded by _hierarchical_start_cv. L3 handles precede orchestration;
+        # L2 handles are installed before the submission lease ends. Retirement
+        # follows fence-owned cleanup, so close() drains the exact accepted set.
         self._accepted_run_handles: set[RunHandle] = set()
         # A nonterminal cancellation or ambiguous finalization boundary has no
         # fence-owned cleanup Python can safely replay. Keep that run's callback
@@ -5726,9 +5729,8 @@ class Worker:
         # handle back to its run so waiting and finalization can find it.
         self._chip_runs: dict[int, Any] = {}
         self._chip_run_seq: int = 0
-        # Mirrors _chip_runs' own lifecycle (added/removed at the same two points) so
-        # release_buffer() can see an L2 run in flight: L2 dispatch never touches
-        # _accepted_run_handles/_submit_mu, so it is otherwise invisible to that check.
+        # Mirrors _chip_runs' own lifecycle so release_buffer() sees the actual
+        # L2 argument identities, which live outside the L3 orchestration resources.
         self._chip_run_touched_identities: dict[int, set[CanonicalIdentity]] = {}
 
         # Level-3+ internals
@@ -13486,7 +13488,13 @@ class Worker:
             self._chip_runs[run_id] = chip_run
         # The handle owns this invocation's argument values. Storage release is fenced by
         # the touched-identity registration until finalization, not by descriptor copies.
-        return RunHandle(self, run_id, (callable_id, args, cfg, chip_args))
+        handle = RunHandle(self, run_id, (callable_id, args, cfg, chip_args))
+        with self._hierarchical_start_cv:
+            # close() may already be CLOSED and waiting for this operation's
+            # lease. This accepted run still belongs to its eventual drain set.
+            self._accepted_run_handles.add(handle)
+            self._hierarchical_start_cv.notify_all()
+        return handle
 
     def _chip_run_for(self, run_id: int) -> Any | None:
         return self._chip_runs.get(run_id)
@@ -13637,6 +13645,11 @@ class Worker:
                 self._release_source_uses(run_id)
             else:
                 self._source_context_failed = True
+            handle._cache_finalization_error(native_error)
+            with self._hierarchical_start_cv:
+                handle._cleanup_published = True
+                self._accepted_run_handles.discard(handle)
+                self._hierarchical_start_cv.notify_all()
             return native_error
 
         # Two different failures, deliberately not merged. A task that failed is
@@ -14006,6 +14019,9 @@ class Worker:
                 self._lifecycle = _Lifecycle.CLOSED
                 self._invalidate_endpoint_registry()
                 attempt = _CloseAttempt()
+                # Teardown may fail before the native journal action captures
+                # this fact, so replacement attempts inherit that reporting debt.
+                attempt.draining_chip_runs = prior is not None and prior.draining_chip_runs
                 self._close_completion = attempt
                 self._hierarchical_start_cv.notify_all()
                 # One absolute budget covers both kinds of admitted work. A
@@ -14031,6 +14047,9 @@ class Worker:
                         )
                 if result is None:
                     handles_to_drain = tuple(self._accepted_run_handles)
+                    attempt.draining_chip_runs = attempt.draining_chip_runs or (
+                        self.level == 2 and bool(handles_to_drain)
+                    )
                     drain_complete = True
             if drain_complete:
                 # CLOSED prevents new admissions and active operations have
@@ -14450,22 +14469,19 @@ class Worker:
                 raise session_err
 
         if self.level == 2:
+            close_drained_chip_runs = self._close_completion is not None and self._close_completion.draining_chip_runs
 
             def _finalize_chip() -> None:
                 if self._chip_worker:
-                    # Close the lane before finalizing the worker: a handle the
-                    # caller never waited on still owns device work, and the
-                    # lane drains it here while the device is still up.
+                    # The lane must close while its device context is alive.
+                    # It also owns the native fallback for entries without a
+                    # remaining public handle.
                     #
-                    # The lane rethrows its poison on close. Whether that is
-                    # news depends on who has already seen it: waiting on a
-                    # handle delivers the run's error and retires its entry, so
-                    # a remaining entry is a run whose failure nobody has been
-                    # told about, and only then is close the first report. With
-                    # every run waited, the poison is the error those waits
-                    # already raised, and re-raising it here would turn a
-                    # handled run failure into an unhandled close failure.
-                    undelivered = bool(self._chip_runs)
+                    # Runs drained by this close have not delivered their errors
+                    # to an earlier caller. Capture that fact in the journal
+                    # action: retries may find their run maps already empty.
+                    # A poison already reported by individual waits is suppressed.
+                    undelivered = close_drained_chip_runs or bool(self._chip_runs)
                     try:
                         self._chip_worker._close_chip_run_lane()
                     except Exception:

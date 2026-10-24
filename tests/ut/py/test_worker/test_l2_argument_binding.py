@@ -483,6 +483,7 @@ def test_source_attach_interruption_rolls_back_registration_and_use(l2, monkeypa
 def test_worker_close_drains_an_unawaited_source_use(l2):
     worker, _, _ = l2
     source = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
+    worker._chip_worker._submit_chip_run_direct = lambda *_: SimpleNamespace(wait=lambda timeout: True)
     worker._submit_l2_locked(3, arguments(source), CallConfig())
     worker._chip_worker._close_chip_run_lane = lambda: None
     worker._chip_worker.workspace_report = lambda: ("disabled", {})
