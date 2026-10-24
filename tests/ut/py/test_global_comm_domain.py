@@ -495,6 +495,8 @@ def _mpi_static_worker():
     resources = _RunResources()
     worker._worker = object()
     worker._building_run_resources = resources
+    # The control stub represents an already activated mpirun group.
+    worker._mpi_l3_groups[0].session_active = True
     return worker, resources, node_ids
 
 

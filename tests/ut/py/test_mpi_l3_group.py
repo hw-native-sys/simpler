@@ -120,7 +120,8 @@ def test_unexpected_mpirun_exit_marks_group_terminal():
     process = _FakeProcess()
     process.returncode = 17
     process.wait = lambda: 17
-    worker._monitor_mpirun_group(group, cast(Any, process))
+    group.process = cast(Any, process)
+    worker._monitor_mpirun_group(group, cast(Any, process), group.session_epoch)
     try:
         assert mailbox.group_state is MailboxGroupState.TERMINAL
         assert "status 17" in mailbox.terminal_reason()

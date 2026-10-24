@@ -151,9 +151,10 @@ from `RemoteWorkerSpec`; a local L3 reads the same fields from its `Worker`
 configuration. All participating nodes must use the same profile.
 
 An MPI-launched group registered with `add_mpirun_worker_group` uses the same
-member contract. Rank 0 writes the group manifest before launch, every MPI rank
-must publish READY before the L4 parent exposes the returned worker ids, and
-the `MpiL3GroupSpec.hosts` order defines node ranks. Global CommDomain members
+member contract. Registration returns configuration ids and publishes the group
+atomically; it does not establish readiness. The parent writes the manifest
+before launch, and every MPI rank must publish READY before native attach.
+The `MpiL3GroupSpec.hosts` order defines node ranks. Global CommDomain members
 must include the complete returned group; their order still defines dense
 domain ranks. A full MPI group exchanges descriptors rank-side over an MPI
 collective, so the L4 import fanout is skipped; a partial group falls back to
@@ -181,6 +182,52 @@ The control flow is:
 `PREPARE_EXPORT`, `IMPORT`, `COMMIT`, and `ABORT`. Runtime data movement does
 not resend it: `COPY_TO_DOMAIN`/`COPY_FROM_DOMAIN` use
 `GlobalDomainCopyCommand`, and teardown uses `GlobalDomainReleaseCommand`.
+
+### MPI session identity and availability
+
+Each parent-owned `mpirun` group has a `session_epoch`, initially one.
+Successful startup makes that generation available. The first observed
+failure or group close advances the epoch and clears availability. Failure
+notifications apply only to the matching group, process and captured epoch;
+duplicate or delayed notifications cannot revoke another generation.
+Initialization publishes READY only after all groups pass their startup checks.
+
+The endpoint registry stores an immutable `MpiSessionView` for each rank's
+host and device endpoints. The view identifies the owner path, group, epoch,
+rank, worker and per-rank session, together with snapshot availability.
+MPI endpoint records must match the registry's owner nonce and directory
+version. `session_epoch` identifies a group generation; `registry_epoch`
+versions the owner's endpoint directory. A directory change alone does not
+advance a group's session epoch.
+
+Planning and region materialization validate the directory and selected
+session views, observe the selected processes and mailboxes, then recheck
+the views. An old session epoch is refused even when the directory version
+matches. A standalone resolver checks snapshot availability; live validation
+belongs to the owning Worker. Nested MPI configuration describes endpoints
+but does not establish their availability.
+
+A published group failure invalidates the cached registry. Old snapshots,
+including those selecting unaffected groups, must be refreshed. A fresh
+snapshot can authorize unaffected members; selecting a failed member is
+refused. Ordinary task and control admission checks lifecycle, cleanup and
+delegated-session errors. Shared runs and native error propagation can still
+affect otherwise healthy groups.
+
+After a valid delegated `ALLOCATED` reply, region materialization binds the
+release identity before rechecking session availability. A registry or session
+refusal aborts materialization through that release edge; refusal alone does
+not latch a fatal delegated-session error. Invalid allocation replies are
+fatal; incomplete release records an unreclaimable-resource error and prevents
+further work.
+
+Python mailbox access is serialized against close. Each observation waits up
+to 50 ms for the local guard; timeout refuses the operation without revoking
+the group. Close bounds its guard wait by the supplied cleanup timeout and
+retains the mailbox and ready directory for retry if the guard is busy.
+Session invalidation does not establish that native attachments, processes
+or remote resources have been released. The session epoch is an owner-local
+validation boundary; transport and domain commands carry their own identities.
 
 ### Attachment axis
 
