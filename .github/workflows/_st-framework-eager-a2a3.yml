@@ -35,15 +35,18 @@ jobs:
           persist-credentials: false
 
       - name: Set up framework environment
+        id: framework
         uses: ./.github/actions/setup-framework-eager
 
       - name: Run the declared framework environment exclusively
+        env:
+          CANN_ENV: ${{ steps.framework.outputs.cann_env }}
         run: |
-          source /usr/local/Ascend/cann/set_env.sh
+          source "$CANN_ENV"
           mkdir -p outputs/framework-eager-ci
           git rev-parse HEAD | tee outputs/framework-eager-ci/source.txt
-          task-submit --timeout 900 --max-time 900 --device auto --device-num 1 \
-            --run ".venv-framework/bin/python .github/actions/setup-framework-eager/identity.py && .venv-framework/bin/python -m pytest examples tests/st --platform a2a3 --test-environment torch_npu --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/framework-eager-ci/pytest --junitxml outputs/framework-eager-ci/results.xml"
+          task-submit --env CANN_ENV --timeout 900 --max-time 900 --device auto --device-num 1 \
+            --run "source \"\$CANN_ENV\" && .venv-framework/bin/python .github/actions/setup-framework-eager/identity.py && .venv-framework/bin/python -m pytest examples tests/st --platform a2a3 --test-environment torch_npu --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/framework-eager-ci/pytest --junitxml outputs/framework-eager-ci/results.xml"
           .venv-framework/bin/python -m simpler_setup.test_environments verify outputs/framework-eager-ci/results.plan.json outputs/framework-eager-ci/results.xml
 
       - name: Retain framework eager identities and logs

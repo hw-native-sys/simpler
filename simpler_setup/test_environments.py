@@ -45,6 +45,7 @@ ENVIRONMENTS = {
     ),
 }
 _PROPERTY_PREFIX = "simpler_"
+_ASCEND_ROOT = Path("/usr/local/Ascend")
 
 
 def _environment(name: str) -> TestEnvironment:
@@ -113,6 +114,59 @@ def requirements(name: str) -> dict[str, str]:
     return dict(line.strip().split("==", 1) for line in lines if line.strip() and not line.startswith("#"))
 
 
+def _manifest(home: Path) -> tuple[Path, dict[str, str]]:
+    candidates = [
+        home / "ascend_toolkit_install.info",
+        home / f"{platform.machine()}-linux/ascend_toolkit_install.info",
+    ]
+    manifest = next((path for path in candidates if path.is_file()), None)
+    if manifest is None:
+        raise ValueError(f"CANN install manifest missing under {home}")
+    fields = dict(line.split("=", 1) for line in manifest.read_text().splitlines() if "=" in line)
+    return manifest, fields
+
+
+def select_toolchain(name: str, *, roots: list[Path] | None = None) -> Path:
+    """Choose an installed exact-match toolkit without changing the host default."""
+    profile = _environment(name)
+    if profile.cann_version is None:
+        raise ValueError(f"{name} does not declare a CANN toolchain")
+    active = os.environ.get("ASCEND_HOME_PATH")
+    if roots is None:
+        roots = sorted(_ASCEND_ROOT.glob("cann*"))
+        roots += sorted((_ASCEND_ROOT / "ascend-toolkit").glob("*"))
+    roots = ([Path(active)] if active else []) + roots
+    seen = set()
+    installed = []
+    matches = []
+    for root in roots:
+        home = root.resolve()
+        if home in seen or not home.is_dir():
+            continue
+        seen.add(home)
+        entry: dict[str, object] = {"home": str(home)}
+        try:
+            manifest, fields = _manifest(home)
+            script = home / "set_env.sh"
+            entry.update(
+                manifest=str(manifest),
+                version=fields.get("version", "unknown"),
+                set_env=str(script),
+                set_env_exists=script.is_file(),
+            )
+            if fields.get("version") == profile.cann_version and script.is_file():
+                matches.append(script)
+        except (OSError, ValueError) as error:
+            entry["error"] = str(error)
+        installed.append(entry)
+    print("TEST_ENVIRONMENT_TOOLCHAINS " + json.dumps({"environment": name, "installed": installed}), flush=True)
+    if not matches:
+        raise ValueError(
+            f"No installed CANN {profile.cann_version} with set_env.sh for {name}; see toolchain inventory"
+        )
+    return matches[0]
+
+
 def preflight(name: str, *, packages: bool = True) -> dict:
     """Validate the active toolchain and package metadata without importing them."""
     profile = _environment(name)
@@ -125,14 +179,7 @@ def preflight(name: str, *, packages: bool = True) -> dict:
     }
     if profile.cann_version is not None:
         home = Path(os.environ["ASCEND_HOME_PATH"]).resolve()
-        candidates = [
-            home / "ascend_toolkit_install.info",
-            home / f"{platform.machine()}-linux/ascend_toolkit_install.info",
-        ]
-        manifest = next((path for path in candidates if path.is_file()), None)
-        if manifest is None:
-            raise ValueError(f"CANN install manifest missing under active ASCEND_HOME_PATH={home}")
-        fields = dict(line.split("=", 1) for line in manifest.read_text().splitlines() if "=" in line)
+        manifest, fields = _manifest(home)
         record.update(cann_home=str(home), manifest=str(manifest), cann=fields)
         if fields.get("version") != profile.cann_version:
             raise ValueError(f"{name} requires CANN {profile.cann_version}; active manifest reports {fields}")
@@ -288,6 +335,12 @@ def main() -> None:
         if len(args) > 1:
             selected = {args[1]: selected[args[1]]}
         print("\n".join(f"{name}=={version}" for name, version in selected.items()))
+    elif command == "select":
+        script = select_toolchain(args[0])
+        print("TEST_ENVIRONMENT_TOOLCHAIN_SELECTED " + str(script), flush=True)
+        if os.environ.get("GITHUB_OUTPUT"):
+            with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+                output.write(f"cann_env={script}\n")
     elif command == "preflight":
         print("TEST_ENVIRONMENT_TOOLCHAIN " + json.dumps(preflight(args[0], packages=False)), flush=True)
     elif command == "verify":

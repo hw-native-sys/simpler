@@ -1,21 +1,31 @@
 name: Set up framework eager environment
 description: Install the CANN 9.0.0 framework consumer in its own virtual environment.
 
+outputs:
+  cann_env:
+    description: Environment script for the exact compatible installed CANN toolkit.
+    value: ${{ steps.toolchain.outputs.cann_env }}
+
 runs:
   using: composite
   steps:
-    - name: Validate framework toolchain
+    - name: Select the installed framework toolchain
+      id: toolchain
       shell: bash
       run: |
-        source /usr/local/Ascend/cann/set_env.sh
-        python3 simpler_setup/test_environments.py preflight torch_npu
+        if [[ -f /usr/local/Ascend/cann/set_env.sh ]]; then
+          source /usr/local/Ascend/cann/set_env.sh
+        fi
+        python3 simpler_setup/test_environments.py select torch_npu
 
     - name: Install isolated framework dependencies and runtime
       shell: bash
       env:
         TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+        CANN_ENV: ${{ steps.toolchain.outputs.cann_env }}
       run: |
-        source /usr/local/Ascend/cann/set_env.sh
+        source "$CANN_ENV"
+        python3 simpler_setup/test_environments.py preflight torch_npu
         python3 -m venv --system-site-packages .venv-framework
         source .venv-framework/bin/activate
         python -m pip install --upgrade pip
