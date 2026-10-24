@@ -75,6 +75,7 @@ __all__ = [
     "MappedArg",
     "MappedArgs",
     "Tensor",
+    "buffer_reference",
     "capabilities_for_adapter",
     "create_host_shared_buffer",
     "host_ptr_nbytes",
@@ -334,6 +335,7 @@ class Buffer:
     # which is the derivation gate — a close() whose unlink raised leaves this false so a retry
     # attempts the unlink again.
     unlinked: bool = False
+    _remote_ref: tuple[int, int] | None = field(default=None, compare=False, repr=False)
     # Set only on a Buffer whose descriptor fields are final for the rest of its life — the private
     # snapshot `Worker._record_device_alloc` registers. `init=False` keeps `replace()` from carrying
     # it onto a copy, so a handle a caller still holds derives a fresh descriptor on every call and
@@ -485,6 +487,25 @@ def re_export(source: BufferDescriptor) -> Buffer:
         body=source.body,
         shm=None,
         base=0,
+    )
+
+
+def buffer_reference(
+    backing: Buffer | BufferDescriptor,
+    *,
+    owner_worker_id: int = 0,
+    remote_ref: tuple[int, int] | None = None,
+) -> Buffer:
+    """Name an existing backing without exposing an endpoint address or acquiring ownership."""
+    descriptor = backing.to_descriptor() if isinstance(backing, Buffer) else backing
+    return Buffer(
+        identity=descriptor.identity,
+        address_space=descriptor.address_space,
+        access=descriptor.access,
+        backend_kind=BackendKind.REMOTE_SIDECAR,
+        nbytes=descriptor.nbytes,
+        owner_worker_id=owner_worker_id,
+        _remote_ref=remote_ref,
     )
 
 

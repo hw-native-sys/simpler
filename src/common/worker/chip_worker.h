@@ -386,9 +386,9 @@ public:
     );
     /// Collectively allocate a fresh per-rank symmetric pool for a subset of
     /// ranks.  Multiple concurrent allocations are disambiguated by
-    /// `allocation_id`.  Returns (device_ctx, local_window_base).  Only
+    /// `allocation_id`. Returns (device_ctx, local_window_base, actual_window_size). Only
     /// participating ranks call this; non-members of the subset must not.
-    std::pair<uint64_t, uint64_t> comm_alloc_domain_windows(
+    std::tuple<uint64_t, uint64_t, size_t> comm_alloc_domain_windows(
         uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
         size_t window_size
     );
@@ -582,7 +582,7 @@ private:
     using CommGetWindowSizeFn = int (*)(void *, size_t *);
     using CommDeriveContextFn = int (*)(void *, const uint32_t *, size_t, uint32_t, size_t, size_t, uint64_t *);
     using CommAllocDomainWindowsFn =
-        int (*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint64_t *, uint64_t *);
+        int (*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint64_t *, uint64_t *, size_t *);
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommGlobalDomainPrepareFn =
         int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);

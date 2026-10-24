@@ -2220,7 +2220,7 @@ uint64_t ChipWorker::comm_derive_context(
     return device_ctx;
 }
 
-std::pair<uint64_t, uint64_t> ChipWorker::comm_alloc_domain_windows(
+std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
     size_t window_size
 ) {
@@ -2238,9 +2238,10 @@ std::pair<uint64_t, uint64_t> ChipWorker::comm_alloc_domain_windows(
     }
     uint64_t device_ctx = 0;
     uint64_t local_window_base = 0;
+    size_t actual_window_size = 0;
     int rc = comm_alloc_domain_windows_fn_(
         reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
-        window_size, &device_ctx, &local_window_base
+        window_size, &device_ctx, &local_window_base, &actual_window_size
     );
     if (rc != 0) {
         throw std::runtime_error("comm_alloc_domain_windows failed with code " + std::to_string(rc));
@@ -2248,7 +2249,7 @@ std::pair<uint64_t, uint64_t> ChipWorker::comm_alloc_domain_windows(
     if (device_ctx == 0 || local_window_base == 0) {
         throw std::runtime_error("comm_alloc_domain_windows returned null device_ctx / local_window_base");
     }
-    return {device_ctx, local_window_base};
+    return {device_ctx, local_window_base, actual_window_size};
 }
 
 void ChipWorker::comm_release_domain_windows(

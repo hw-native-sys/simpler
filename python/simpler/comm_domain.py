@@ -12,8 +12,25 @@ from __future__ import annotations
 
 import operator
 from dataclasses import dataclass, fields
+from typing import TYPE_CHECKING
 
-from .task_interface import CommBufferSpec
+if TYPE_CHECKING:
+    from .task_interface import CommBufferSpec
+
+
+@dataclass(frozen=True)
+class CommDomainRef:
+    """Immutable identity; access requires an existing grant on the receiving node."""
+
+    owner_instance_id: bytes
+    domain_id: int
+    generation: int
+
+    def __post_init__(self):
+        if not isinstance(self.owner_instance_id, bytes) or len(self.owner_instance_id) != 8:
+            raise ValueError("domain creator must be an 8-byte instance identity")
+        if not any(self.owner_instance_id) or not 0 <= self.domain_id < 2**64 or not 0 < self.generation < 2**64:
+            raise ValueError("invalid communication domain reference")
 
 
 @dataclass(frozen=True)
@@ -58,6 +75,8 @@ class DomainConfig:
         return cls(members, window_size, snapshot, bool(retain_after_run), tuple(topology))
 
     def specs(self) -> list[CommBufferSpec]:
+        from .task_interface import CommBufferSpec  # noqa: PLC0415
+
         return [CommBufferSpec(*buffer) for buffer in self.buffers]
 
     def difference(self, other: DomainConfig) -> str:

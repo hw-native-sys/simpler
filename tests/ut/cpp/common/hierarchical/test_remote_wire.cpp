@@ -22,7 +22,7 @@
 namespace {
 
 // A task arg bound for a remote worker: a REMOTE_SIDECAR placeholder naming remote buffer 9 on
-// worker 3, with no local backing of its own. That is the only backend this wire accepts.
+// worker 3, with no local backing of its own.
 Tensor remote_arg_tensor() {
     Tensor tensor{};
     tensor.buffer.magic = BUFFER_DESCRIPTOR_MAGIC;
@@ -135,6 +135,16 @@ TEST(RemoteWire, TaskPayloadRejectsAnArgWithALocalBacking) {
     payload.args.tensors.push_back(arg);
 
     EXPECT_THROW((void)remote_l3::encode_task_payload(payload), std::runtime_error);
+}
+
+TEST(RemoteWire, TensorRejectsRemovedDomainBackend) {
+    Tensor arg = remote_arg_tensor();
+    auto encoded = remote_l3::encode_tensor(arg);
+    arg.buffer.backend_kind = 7;
+    EXPECT_THROW((void)remote_l3::encode_tensor(arg), std::runtime_error);
+    encoded[OWNER_INSTANCE_ID_BYTES + sizeof(uint64_t) + sizeof(uint32_t) + 2] = 7;
+    size_t offset = 0;
+    EXPECT_THROW((void)remote_l3::decode_tensor(encoded.data(), encoded.size(), offset), std::runtime_error);
 }
 
 TEST(RemoteWire, TensorRecordCarriesWholeBackingAndByteOffset) {

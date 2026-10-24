@@ -4100,18 +4100,19 @@ NB_MODULE(_task_interface, m) {
                 if (commit_flag_address == 0 || commit_flag_address % alignof(uint64_t) != 0) {
                     throw std::invalid_argument("comm_alloc_domain_windows: commit flag address is invalid");
                 }
-                auto [device_ctx, local_window_base] =
+                auto [device_ctx, local_window_base, actual_window_size] =
                     self.comm_alloc_domain_windows(comm_handle, allocation_id, rank_ids, domain_rank, window_size);
                 __atomic_store_n(
                     reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address)), uint64_t{1},
                     __ATOMIC_RELEASE
                 );
-                return nb::make_tuple(device_ctx, local_window_base);
+                return nb::make_tuple(device_ctx, local_window_base, actual_window_size);
             },
             nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
             nb::arg("window_size"), nb::arg("commit_flag_address"),
             "Collectively allocate a fresh per-rank pool for a subset; returns "
-            "(device_ctx, local_window_base) for this rank and publishes the commit flag before result conversion."
+            "(device_ctx, local_window_base, actual_window_size) for this rank and publishes the commit flag before "
+            "result conversion."
         )
         .def(
             "comm_release_domain_windows", &ChipWorker::comm_release_domain_windows, nb::arg("comm_handle"),

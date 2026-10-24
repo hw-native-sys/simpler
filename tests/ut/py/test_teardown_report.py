@@ -418,6 +418,7 @@ def test_child_exit_publishes_after_exactly_one_finalize():
     # Both child exits that own a teardown share this helper, so the count is
     # what keeps the startup-failure path from gaining a second reset.
     assert cw.finalize_calls == 1
+    assert struct.unpack_from("=i", buf, worker_module._OFF_CHIP_FINALIZED)[0] == 1
     off = worker_module._OFF_TEARDOWN_REPORT
     raw = bytes(buf[off : off + SIMPLER_TEARDOWN_REPORT_BYTES])
     assert decode_teardown_report(raw, expected_pid=os.getpid()).committed
@@ -435,6 +436,7 @@ def test_a_raising_teardown_still_publishes_and_still_raises():
     # captured before throwing is still published.
     assert caught.value is boom
     assert cw.finalize_calls == 1
+    assert struct.unpack_from("=i", buf, worker_module._OFF_CHIP_FINALIZED)[0] == 0
     off = worker_module._OFF_TEARDOWN_REPORT
     raw = bytes(buf[off : off + SIMPLER_TEARDOWN_REPORT_BYTES])
     assert decode_teardown_report(raw, expected_pid=os.getpid()).committed
@@ -472,6 +474,48 @@ def _journal_one_chip_child(shm, pid, reports):
     journal = worker_module.CleanupJournal()
     worker_module._journal_child_survivors(journal, [], [], [shm], [pid], [], [], set(), reports)
     return journal
+
+
+@pytest.mark.parametrize("late", [False, True])
+@pytest.mark.parametrize("finalized", [False, True])
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_reaped_child_completion_is_independent_of_optional_report(monkeypatch, late, finalized, interrupted):
+    pid = 31336
+    shm = _FakeShm(None)
+    struct.pack_into("=i", shm._store, worker_module._OFF_CHIP_FINALIZED, int(finalized))
+    reports = {pid: TeardownReport()}
+    completed = set()
+
+    def already_reaped(*_args):
+        raise ChildProcessError
+
+    monkeypatch.setattr(worker_module.os, "waitpid", already_reaped)
+    record_completion = worker_module._record_chip_teardown_completion
+    calls = []
+
+    def record(shm, pid, completed):
+        if interrupted and not calls:
+            calls.append(True)
+            raise KeyboardInterrupt("receipt interrupted")
+        record_completion(shm, pid, completed)
+
+    monkeypatch.setattr(worker_module, "_record_chip_teardown_completion", record)
+    if late:
+        journal = worker_module.CleanupJournal()
+        worker_module._journal_child_survivors(journal, [], [], [shm], [pid], [], [], set(), reports, completed)
+        if interrupted:
+            assert isinstance(journal.drive(), KeyboardInterrupt)
+            assert not shm.closed
+        assert journal.drive() is None
+    else:
+        groups = cast(Any, [([shm], [pid])])
+        if interrupted:
+            with pytest.raises(KeyboardInterrupt, match="receipt interrupted"):
+                worker_module.Worker._reap_child_groups(groups, 0, {pid}, reports, completed)
+            assert groups[0][1] == [pid] and not shm.closed
+        worker_module.Worker._reap_child_groups(groups, 0, {pid}, reports, completed)
+    assert completed == ({pid} if finalized else set())
+    assert shm.closed and shm.unlinked
 
 
 def test_a_child_reaped_by_the_journal_still_yields_its_report(monkeypatch):

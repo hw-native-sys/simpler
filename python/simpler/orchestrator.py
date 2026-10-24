@@ -49,6 +49,7 @@ from .task_interface import (
     ChipCallable,
     CommBufferSpec,
     CommDomainHandle,
+    CommDomainRef,
     DataType,
     DeviceMemoryInfo,
     GlobalCommDomainHandle,
@@ -343,7 +344,6 @@ class Orchestrator:
                 raise TypeError("RemoteTensorRef is only supported for RemoteCallable NEXT_LEVEL submits")
             remote_sidecar = None
         _validate_remote_sidecar_access(c_args, remote_sidecar)
-        final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
         worker = self._worker
         # Provenance validation precedes run ownership publication. Once a remote
         # ref is published, only the run fence may release it because the native
@@ -355,6 +355,8 @@ class Orchestrator:
         with prov_guard:
             if needs_prov:
                 worker._child_prov_check_dispatch_locked(c_args, cpp_worker_id, api="submit_next_level")
+                remote_sidecar = worker._prepare_buffer_references(c_args, remote_sidecar, cpp_worker_id)
+            final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
             if worker is not None:
                 worker._adopt_remote_sidecar_refs((remote_sidecar,))
                 worker._record_touched_identities(c_args)
@@ -437,32 +439,41 @@ class Orchestrator:
         if remote_sidecars is not None:
             for c_args, remote_sidecar in zip(c_args_list, remote_sidecars):
                 _validate_remote_sidecar_access(c_args, remote_sidecar)
-        worker_id_sets = (
-            [
-                _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
-                for remote_sidecar in remote_sidecars
-            ]
-            if remote_sidecars is not None
-            else [list(eligible_worker_ids) for _ in args_list]
-            if eligible_worker_ids
-            else []
-        )
         # Per-member kind4 dispatch guard: each member's child_memory pointers
         # must be live on that member's exact submitted target.
         # Run this fallible analysis before publishing remote-ref ownership.
         worker = self._worker
         member_checks: list[tuple[int, TaskArgs]] = []
         if worker is not None:
-            for g, c_args in enumerate(c_args_list):
+            for index, c_args in enumerate(c_args_list):
                 if worker._names_device_allocation(c_args):
-                    member_checks.append((worker_ids[g], c_args))
+                    member_checks.append((index, c_args))
         prov_guard: Any = (
             worker._child_prov_lock if (worker is not None and member_checks) else contextlib.nullcontext()
         )
         with prov_guard:
-            for target_worker_id, c_args in member_checks:
+            for index, c_args in member_checks:
                 assert worker is not None
-                worker._child_prov_check_dispatch_locked(c_args, target_worker_id, api="submit_next_level_group")
+                worker._child_prov_check_dispatch_locked(c_args, worker_ids[index], api="submit_next_level_group")
+            for index, c_args in member_checks:
+                assert worker is not None
+                prepared = worker._prepare_buffer_references(
+                    c_args,
+                    remote_sidecars[index] if remote_sidecars is not None else None,
+                    worker_ids[index],
+                )
+                if remote_sidecars is not None:
+                    remote_sidecars[index] = prepared
+            worker_id_sets = (
+                [
+                    _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
+                    for remote_sidecar in remote_sidecars
+                ]
+                if remote_sidecars is not None
+                else [list(eligible_worker_ids) for _ in args_list]
+                if eligible_worker_ids
+                else []
+            )
             if worker is not None and remote_sidecars is not None:
                 worker._adopt_remote_sidecar_refs(remote_sidecars)
             if worker is not None:
@@ -573,14 +584,20 @@ class Orchestrator:
             reuse=reuse,
         )
 
-    def get_domain(self, name: str) -> CommDomainHandle:
-        """Look up a live domain by name in its creator Worker; never create a domain."""
+    def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:
+        """Look up an owned domain by name or ref, or borrow an already-granted domain by ref."""
         if self._worker is None:
             raise RuntimeError("get_domain requires an Orchestrator bound to a Worker")
         return self._worker._get_domain(name)
 
     def release_domain(self, handle: CommDomainHandle) -> None:
         """Release a domain through its creating Worker's completion fence."""
+        if (
+            self._worker is None
+            or handle._ref is None
+            or handle._ref.owner_instance_id != self._worker._owner_instance_id
+        ):
+            raise ValueError("release_domain requires the domain's creating Worker")
         handle.release()
 
     def allocate_global_domain(
@@ -656,11 +673,25 @@ class Orchestrator:
     def _copy_domain(self, handle, rank, data, buffer, offset, *, writing):
         if self._worker is None:
             raise RuntimeError("domain copy requires an Orchestrator bound to a Worker")
+        with (
+            self._worker._operation_lease("domain copy", allow_continuation=True),
+            contextlib.nullcontext()
+            if _callback_frame_for(self._worker) is not None
+            else self._worker._control_reservation("domain copy"),
+        ):
+            return self._copy_domain_locked(handle, rank, data, buffer, offset, writing=writing)
+
+    def _copy_domain_locked(self, handle, rank, data, buffer, offset, *, writing):
+        assert self._worker is not None
+        if not handle.borrowed:
+            if handle._ref is None or handle._ref.owner_instance_id != self._worker._owner_instance_id:
+                raise ValueError("domain copy requires the domain's creating Worker")
+            self._worker._use_domain(handle)
         size = len(data) if writing else data
         handle._require_live()
         absolute = self._global_copy_range(handle, buffer=buffer, offset=offset, nbytes=size)
         handle.member(rank)
-        if not handle.workers:
+        if not handle.workers and not handle.borrowed:
             if writing:
                 self._worker._copy_to_global_domain(handle, rank, data, absolute)
                 return None

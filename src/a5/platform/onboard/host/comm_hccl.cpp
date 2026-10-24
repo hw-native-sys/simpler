@@ -1355,7 +1355,7 @@ static bool init_rdma_workspace(
 // the peer imports live on `out->peer_windows` for comm_release_domain_windows.
 static int domain_alloc_via_ipc(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    uint64_t win_size, DomainAllocation *out
+    uint64_t win_size, DomainAllocation *out, size_t *actual_window_size_out
 ) {
     (void)rank_ids;
     const std::string &rootinfo = h->rootinfo_path;
@@ -1700,6 +1700,7 @@ static int domain_alloc_via_ipc(
         return -1;
     }
     out->device_ctx = reinterpret_cast<CommContext *>(newDevMem);
+    *actual_window_size_out = aligned_size;
     return 0;
 }
 
@@ -1851,9 +1852,9 @@ extern "C" int comm_barrier(CommHandle h) {
 
 extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out, size_t *actual_window_size_out
 ) try {
-    if (!h || !rank_ids || !device_ctx_out || !local_window_base_out) return -1;
+    if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         LOG_ERROR(
             "[comm rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)", h->rank,
@@ -1885,7 +1886,9 @@ extern "C" int comm_alloc_domain_windows(
     }
 
     auto alloc = std::make_unique<DomainAllocation>();
-    int rc = domain_alloc_via_ipc(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, alloc.get());
+    int rc = domain_alloc_via_ipc(
+        h, allocation_id, rank_ids, rank_count, domain_rank, window_size, alloc.get(), actual_window_size_out
+    );
     if (rc != 0) return rc;
 
     *device_ctx_out = reinterpret_cast<uint64_t>(alloc->device_ctx);

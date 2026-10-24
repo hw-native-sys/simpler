@@ -555,9 +555,11 @@ extern "C" int comm_barrier(CommHandle h) {
 
 extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out, size_t *actual_window_size_out
 ) try {
-    if (h == nullptr || rank_ids == nullptr || device_ctx_out == nullptr || local_window_base_out == nullptr) return -1;
+    if (h == nullptr || rank_ids == nullptr || device_ctx_out == nullptr || local_window_base_out == nullptr ||
+        actual_window_size_out == nullptr)
+        return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         std::fprintf(
             stderr, "[comm_sim rank %d] alloc_domain: bad args (rank_count=%zu domain_rank=%u window_size=%zu)\n",
@@ -698,6 +700,7 @@ extern "C" int comm_alloc_domain_windows(
 
     *device_ctx_out = reinterpret_cast<uint64_t>(alloc->host_ctx.get());
     *local_window_base_out = reinterpret_cast<uint64_t>(local_window);
+    *actual_window_size_out = window_size;
     h->domain_allocations.emplace(allocation_id, std::move(alloc));
     return 0;
 } catch (const std::exception &e) {
@@ -779,7 +782,7 @@ extern "C" int comm_global_domain_prepare(
         local_window_base_out == nullptr) {
         return -1;
     }
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    std::scoped_lock lock(global_domain_allocations_mutex);
     if (global_domain_allocations.count(domain_id) != 0) {
         return -1;
     }
@@ -839,7 +842,7 @@ extern "C" int comm_global_domain_prepare(
 extern "C" int comm_global_domain_import(
     uint64_t domain_id, const CommGlobalDomainDescriptor *descriptors, size_t descriptor_count, uint64_t *device_ctx_out
 ) try {
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
     if (it == global_domain_allocations.end() || descriptors == nullptr || device_ctx_out == nullptr) {
         return -1;
@@ -906,7 +909,7 @@ extern "C" int comm_global_domain_import(
 }
 
 extern "C" int comm_global_domain_release(uint64_t domain_id) try {
-    std::lock_guard<std::mutex> lock(global_domain_allocations_mutex);
+    std::scoped_lock lock(global_domain_allocations_mutex);
     auto it = global_domain_allocations.find(domain_id);
     if (it == global_domain_allocations.end()) {
         return 0;

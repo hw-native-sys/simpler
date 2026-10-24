@@ -1597,12 +1597,16 @@ void Orchestrator::infer_deps(
                     TensorAddressKind kind = desc.address_space == RemoteAddressSpace::HOST_INLINE ?
                                                  TensorAddressKind::HOST_INLINE :
                                                  TensorAddressKind::REMOTE_BUFFER;
-                    // A remote key already carries the view's offset, so every entry under one
-                    // of them denotes the same origin and a footprint adds nothing; the default
-                    // whole-backing one keeps this path's behaviour exactly as it was.
+                    const bool inline_payload = desc.address_space == RemoteAddressSpace::HOST_INLINE;
                     key = TensorKey::remote_buffer(
-                        kind, desc.owner_worker_id, desc.buffer_id, desc.generation, desc.offset
+                        kind, desc.owner_worker_id, desc.buffer_id, desc.generation, inline_payload ? desc.offset : 0
                     );
+                    if (!inline_payload) {
+                        view = tensor_footprint(r);
+                        // Imported ranges use the owner's byte origin, not the import's local origin.
+                        view.byte_offset = desc.offset;
+                        view.backing_nbytes = tensor_add_sat(desc.offset, desc.nbytes);
+                    }
                     has_key = true;
                 }
             }

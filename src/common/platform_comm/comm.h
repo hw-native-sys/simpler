@@ -244,18 +244,19 @@ int comm_derive_context(
  *                                domain order (length rank_count).
  * @param rank_count              Number of subset members.
  * @param domain_rank             This caller's dense rank in the subset.
- * @param window_size             Bytes per rank.  Backend must allocate
- *                                exactly this size; no auto-rounding.
+ * @param window_size             Requested bytes per rank. Backend may round
+ *                                up to its allocation granularity.
  * @param device_ctx_out          Receives a device pointer to a new
  *                                CommContext for the subset.
  * @param local_window_base_out   Receives this rank's local window start
  *                                address (for buffer carving on the
  *                                caller side).
+ * @param actual_window_size_out  Receives the allocated per-rank byte extent.
  * @return 0 on success, non-zero on failure.
  */
 int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out
+    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out, size_t *actual_window_size_out
 );
 
 /**

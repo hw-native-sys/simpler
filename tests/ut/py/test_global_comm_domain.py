@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import re
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from simpler.buffer import AddressSpace
+from simpler.buffer import AddressSpace, CanonicalIdentity
 from simpler.comm_endpoints import (
     _ADAPTER_KIND_IDS,
     _ADAPTER_PROFILE_IDS,
@@ -52,6 +53,7 @@ from simpler.global_comm_domain import (
     GlobalCommInitCommand,
     GlobalDomainAttachment,
     GlobalDomainBuffer,
+    GlobalDomainBufferRef,
     GlobalDomainCommand,
     GlobalDomainCopyCommand,
     GlobalDomainDescriptor,
@@ -61,12 +63,14 @@ from simpler.global_comm_domain import (
     decode_comm_init,
     decode_copy_command,
     decode_descriptor_table,
+    decode_domain_buffer_refs,
     decode_domain_command,
     decode_release_command,
     encode_comm_init,
     encode_comm_init_result,
     encode_copy_command,
     encode_descriptor_table,
+    encode_domain_buffer_refs,
     encode_domain_command,
     encode_release_command,
     resolve_global_comm_capability,
@@ -283,6 +287,70 @@ def test_global_domain_wire_rejects_attachments_after_prepare():
         encode_domain_command(command)
 
 
+@pytest.mark.parametrize("remote", [False, True])
+def test_domain_buffer_refs_round_trip_without_endpoint_addresses(remote):
+    identity = CanonicalIdentity(b"node-own", 19, 3)
+    reference = GlobalDomainBufferRef(6, 2, identity, 40 if remote else 0, 5 if remote else 0)
+    wire = encode_domain_buffer_refs((reference,))
+    assert len(wire) == 52
+    assert decode_domain_buffer_refs(wire) == (reference,)
+    assert decode_domain_buffer_refs(encode_domain_buffer_refs(())) == ()
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"rank": -1},
+        {"rank": 64},
+        {"slice_index": 64},
+        {"reference_id": 0},
+        {"reference_generation": 0},
+        {"reference_id": 2**64},
+        {"identity": CanonicalIdentity(bytes(8), 1, 1)},
+        {"identity": CanonicalIdentity(b"node-own", 0, 1)},
+        {"identity": CanonicalIdentity(b"node-own", 1, 0)},
+    ],
+)
+def test_domain_buffer_refs_reject_invalid_identity_or_locator(changes):
+    reference = GlobalDomainBufferRef(0, 0, CanonicalIdentity(b"node-own", 1, 1), 8, 1)
+    with pytest.raises(ValueError):
+        encode_domain_buffer_refs((replace(reference, **changes),))
+
+
+@pytest.mark.parametrize("duplicate", ["slice", "identity", "locator"])
+def test_domain_buffer_refs_reject_ambiguous_mappings(duplicate):
+    first = GlobalDomainBufferRef(0, 0, CanonicalIdentity(b"node-own", 1, 1), 8, 1)
+    second = GlobalDomainBufferRef(1, 0, CanonicalIdentity(b"node-own", 2, 1), 9, 1)
+    changes = {
+        "slice": {"rank": 0},
+        "identity": {"identity": first.identity},
+        "locator": {"reference_id": first.reference_id},
+    }
+    with pytest.raises(ValueError, match="duplicate"):
+        encode_domain_buffer_refs((first, replace(second, **changes[duplicate])))
+
+
+@pytest.mark.parametrize("corruption", ["magic", "count", "truncated", "trailing", "zero-generation", "duplicate"])
+def test_domain_buffer_refs_decode_rejects_malformed_wire(corruption):
+    reference = GlobalDomainBufferRef(0, 0, CanonicalIdentity(b"node-own", 1, 1), 8, 1)
+    wire = bytearray(encode_domain_buffer_refs((reference,)))
+    if corruption == "magic":
+        wire[:4] = b"BAD!"
+    elif corruption == "count":
+        struct.pack_into("<I", wire, 4, 4097)
+    elif corruption == "truncated":
+        del wire[-1:]
+    elif corruption == "trailing":
+        wire += b"x"
+    elif corruption == "zero-generation":
+        struct.pack_into("<I", wire, 32, 0)
+    else:
+        struct.pack_into("<I", wire, 4, 2)
+        wire += wire[8:]
+    with pytest.raises(ValueError):
+        decode_domain_buffer_refs(bytes(wire))
+
+
 def test_global_domain_attachment_table_requires_complete_unique_receiver_rows():
     def make_command(attachments: tuple[GlobalDomainAttachment, ...]) -> GlobalDomainCommand:
         return GlobalDomainCommand(
@@ -428,6 +496,27 @@ def _failure_injection_worker(*, platform: str = "a2a3sim", profile: str = "sim"
     return worker, resources, node_ids
 
 
+def _committed_buffer_refs(command, worker_id):
+    return encode_domain_buffer_refs(
+        tuple(
+            GlobalDomainBufferRef(
+                member.domain_rank,
+                index,
+                CanonicalIdentity(
+                    (worker_id + 1).to_bytes(8, "little"),
+                    4096 * command.domain_id + 64 * member.domain_rank + index + 1,
+                    1,
+                ),
+                64 * member.domain_rank + index + 1,
+                1,
+            )
+            for member in command.members
+            if member.node_worker_id == worker_id
+            for index in range(len(command.buffers))
+        )
+    )
+
+
 def _install_global_domain_failure_injector(monkeypatch, worker, *, fail_phase, fail_node):
     from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
 
@@ -451,6 +540,8 @@ def _install_global_domain_failure_injector(monkeypatch, worker, *, fail_phase, 
         calls.append((command.phase, worker_id))
         if command.phase is fail_phase and worker_id == fail_node:
             raise RuntimeError(f"injected {command.phase.name} failure")
+        if command.phase is GlobalDomainPhase.COMMIT:
+            return _committed_buffer_refs(command, worker_id)
         if command.phase is not GlobalDomainPhase.PREPARE_EXPORT:
             return b""
         descriptors = tuple(
@@ -547,6 +638,55 @@ def test_global_domain_transaction_aborts_all_prepared_nodes_after_phase_failure
         assert abort_nodes == list(node_ids)
         assert worker._live_global_domains == {}
         assert resources.live_global_domains == {}
+    finally:
+        _close_failure_injection_worker(worker, resources)
+
+
+@pytest.mark.parametrize("corruption", ["missing", "wrong-node", "local-locator", "duplicate-identity", "malformed"])
+def test_invalid_commit_references_abort_without_publishing_a_handle(monkeypatch, corruption):
+    from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
+    from simpler.task_interface import CommBufferSpec  # noqa: PLC0415
+
+    worker, resources, node_ids = _failure_injection_worker()
+    calls = _install_global_domain_failure_injector(monkeypatch, worker, fail_phase=None, fail_node=-1)
+    original = worker._global_domain_control
+    first_identity = None
+
+    def control(worker_id, control_name, payload):
+        nonlocal first_identity
+        reply = original(worker_id, control_name, payload)
+        if ControlName(control_name) is not ControlName.ALLOC_DOMAIN:
+            return reply
+        if decode_domain_command(payload).phase is not GlobalDomainPhase.COMMIT:
+            return reply
+        refs = decode_domain_buffer_refs(reply)
+        if corruption == "missing":
+            return encode_domain_buffer_refs(())
+        if corruption == "malformed":
+            return b"short"
+        if corruption == "wrong-node":
+            refs = (replace(refs[0], rank=1),)
+        elif corruption == "local-locator":
+            refs = (replace(refs[0], reference_id=0, reference_generation=0),)
+        elif first_identity is None:
+            first_identity = refs[0].identity
+        else:
+            refs = (replace(refs[0], identity=first_identity),)
+        return encode_domain_buffer_refs(refs)
+
+    monkeypatch.setattr(worker, "_global_domain_control", control)
+    try:
+        with pytest.raises((RuntimeError, ValueError)):
+            worker._allocate_global_domain(
+                name="invalid-refs",
+                members=tuple((node, 0) for node in node_ids),
+                window_size=4096,
+                buffers=[CommBufferSpec("payload", "uint8", 32, 32)],
+                retain_after_run=False,
+            )
+        assert [node for phase, node in calls if phase is GlobalDomainPhase.ABORT] == list(node_ids)
+        assert worker._live_global_domains == resources.live_global_domains == {}
+        assert len(worker._child_alloc) == 0
     finally:
         _close_failure_injection_worker(worker, resources)
 
@@ -1028,8 +1168,10 @@ def test_global_domain_backend_release_failure_is_terminal(monkeypatch):
 def test_global_domain_release_uses_allocation_run_after_graph_build(monkeypatch):
     from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
     from simpler.task_interface import CommBufferSpec  # noqa: PLC0415
+    from simpler.worker import _Lifecycle  # noqa: PLC0415
 
     worker, resources, node_ids = _failure_injection_worker()
+    worker._lifecycle = _Lifecycle.READY
     _install_global_domain_failure_injector(
         monkeypatch,
         worker,
@@ -1148,7 +1290,9 @@ def test_node_import_failure_rolls_back_partial_local_ranks_and_uses_configured_
         worker.close()
 
 
-def test_node_import_reuses_prepared_attachment_row_for_view():
+@pytest.mark.parametrize("commit_failure", [None, "missing", "wrong_chip", "descriptor"])
+def test_node_import_reuses_prepared_attachment_row_for_view(commit_failure):
+    from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
     from simpler.worker import (  # noqa: PLC0415
         CTRL_GLOBAL_DOMAIN_IMPORT,
         CTRL_GLOBAL_DOMAIN_RELEASE,
@@ -1156,13 +1300,17 @@ def test_node_import_reuses_prepared_attachment_row_for_view():
         LOCAL_IMPORT_REPLY,
         Worker,
         _GlobalNodeDomainState,
+        _GlobalNodeRuntime,
+        _run_local_global_domain_control,
     )
 
     prepare, imported = _local_node_domain_commands()
+    import_workers = []
 
     class FakeNativeWorker:
         def control_payload(self, _kind, _worker_id, control, _payload, _timeout):
             if control == CTRL_GLOBAL_DOMAIN_IMPORT:
+                import_workers.append(_worker_id)
                 return LOCAL_IMPORT_REPLY.pack(
                     LOCAL_DOMAIN_MAGIC,
                     GLOBAL_DOMAIN_VERSION,
@@ -1195,9 +1343,57 @@ def test_node_import_reuses_prepared_attachment_row_for_view():
         assert state.command.attachments == prepare.attachments
         assert state.view is not None
         assert state.view.attachments == prepare.attachments_for_node(0)
+        identities = tuple(context.buffers["payload"].identity for context in state.contexts.values())
+        worker._import_global_domain_node(imported, 0)
+        assert import_workers == [0, 1]
+        assert tuple(context.buffers["payload"].identity for context in state.contexts.values()) == identities
 
-        worker._commit_global_domain_node(commit)
+        first = state.contexts[0].buffers["payload"]
+        snapshot = worker._child_alloc.get(first.identity)
+        assert snapshot is not None
+        if commit_failure is not None:
+            if commit_failure == "missing":
+                worker._child_alloc.revoke(first.identity)
+            else:
+                changes = {"owner_worker_id": 1} if commit_failure == "wrong_chip" else {"nbytes": snapshot.nbytes + 64}
+                worker._child_alloc.register(replace(snapshot, **changes))
+            with pytest.raises(ValueError, match="no matching registered backing"):
+                worker._commit_global_domain_node(commit)
+            assert state.phase is GlobalDomainPhase.IMPORT and not state.view.committed
+            worker._child_alloc.register(snapshot)
+
+        backings = worker._commit_global_domain_node(commit)
         assert state.view.committed
+        worker._import_global_domain_node(imported, 0)
+        assert worker._commit_global_domain_node(commit) == backings
+        assert tuple(buffer.identity for buffer in backings.values()) == identities
+        assert all(buffer is worker._child_alloc.get(buffer.identity) for buffer in backings.values())
+        assert backings[(0, 0)] is not first
+        runtime = _GlobalNodeRuntime(
+            worker_id=0,
+            device_ids=(0, 1),
+            platform="a2a3sim",
+            comm_profile="sim",
+            global_device_ranks=(0, 1),
+            node_rank=0,
+            node_count=1,
+            cluster_id="unit",
+            is_remote=False,
+        )
+        init = GlobalCommInitCommand("unit", "topology", "sim", 0, 1, commit.members)
+        refs = decode_domain_buffer_refs(
+            _run_local_global_domain_control(
+                worker, runtime, {"topology": init}, ControlName.ALLOC_DOMAIN, encode_domain_command(commit)
+            )
+        )
+        assert tuple(ref.identity for ref in refs) == identities
+        assert all(ref.reference_id == ref.reference_generation == 0 for ref in refs)
+        assert import_workers == [0, 1]
+        changed = replace(
+            imported, descriptors=(replace(imported.descriptors[0], handle=b"changed"), imported.descriptors[1])
+        )
+        with pytest.raises(RuntimeError, match="changes its descriptor table"):
+            worker._import_global_domain_node(changed, 0)
     finally:
         worker._release_global_domain_node(GlobalDomainReleaseCommand(prepare.domain_id, prepare.generation))
         worker._worker = None
@@ -1205,7 +1401,7 @@ def test_node_import_reuses_prepared_attachment_row_for_view():
 
 
 def test_node_release_invalidates_committed_view_before_partial_fanout_failure():
-    from simpler.task_interface import GlobalCommDomainView  # noqa: PLC0415
+    from simpler.task_interface import CommDomainRef, GlobalCommDomainView  # noqa: PLC0415
     from simpler.worker import (  # noqa: PLC0415
         CTRL_GLOBAL_DOMAIN_RELEASE,
         Worker,
@@ -1213,6 +1409,7 @@ def test_node_release_invalidates_committed_view_before_partial_fanout_failure()
     )
 
     prepare, imported = _local_node_domain_commands()
+    imported = replace(imported, owner_instance_id=b"creator1")
     timeouts = []
 
     class FakeNativeWorker:
@@ -1245,11 +1442,19 @@ def test_node_release_invalidates_committed_view_before_partial_fanout_failure()
     )
     worker._global_node_domains[imported.domain_id] = state
     try:
+        ref = CommDomainRef(b"creator1", imported.domain_id, imported.generation)
+        borrowed = worker._get_domain(ref)
+        assert borrowed.borrowed and worker._get_domain(ref) is borrowed
         with pytest.raises(RuntimeError, match="partial release failed"):
             worker._release_global_domain_node(GlobalDomainReleaseCommand(imported.domain_id, imported.generation))
 
         assert state.phase is GlobalDomainPhase.ABORT
         assert not view.committed
+        assert borrowed.released and not borrowed.freed
+        with pytest.raises(KeyError):
+            worker._get_domain(ref)
+        with pytest.raises(RuntimeError, match="released"):
+            borrowed.member(0)
         with pytest.raises(KeyError, match="not committed"):
             worker._get_global_domain(imported.domain_id)
         with pytest.raises(RuntimeError, match="not committed"):
@@ -1258,6 +1463,7 @@ def test_node_release_invalidates_committed_view_before_partial_fanout_failure()
         native.fail_second = False
         worker._release_global_domain_node(GlobalDomainReleaseCommand(imported.domain_id, imported.generation))
         assert worker._global_node_domains == {}
+        assert borrowed.freed
         assert timeouts == [6.5, 6.5, 6.5, 6.5]
     finally:
         worker._global_node_domains.clear()
@@ -1478,7 +1684,7 @@ def test_global_domain_control_ids_do_not_overlap_worker_controls():
     assert len(control_ids) == len(set(control_ids))
 
 
-def test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import(monkeypatch):
+def test_mpirun_group_global_domain_collects_each_commit_without_l4_import(monkeypatch):
     from simpler.remote_l3_protocol import ControlName  # noqa: PLC0415
     from simpler.task_interface import CommBufferSpec  # noqa: PLC0415
 
@@ -1503,6 +1709,7 @@ def test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import(mo
         commands.append(command)
         calls.append((command.phase, worker_id))
         if command.phase is GlobalDomainPhase.PREPARE_EXPORT:
+            assert group
             descriptors = tuple(
                 GlobalDomainDescriptor(
                     version=GLOBAL_DOMAIN_VERSION,
@@ -1517,6 +1724,9 @@ def test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import(mo
             return encode_descriptor_table(descriptors)
         if command.phase is GlobalDomainPhase.IMPORT:
             raise RuntimeError("L4 broker IMPORT should not run for a full mpirun group")
+        if command.phase is GlobalDomainPhase.COMMIT:
+            assert not group
+            return _committed_buffer_refs(command, worker_id)
         return b""
 
     monkeypatch.setattr(worker, "_global_domain_control", control)
@@ -1535,9 +1745,9 @@ def test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import(mo
         counts = Counter(phase for phase, _worker_id in calls)
         assert counts["COMM_INIT"] == 2
         assert counts[GlobalDomainPhase.PREPARE_EXPORT] == 1
-        assert counts[GlobalDomainPhase.COMMIT] == 1
+        assert counts[GlobalDomainPhase.COMMIT] == 2
         assert counts[GlobalDomainPhase.IMPORT] == 0
-        assert len(commands) == 2
+        assert len(commands) == 3
         prepare_command = next(command for command in commands if command.phase is GlobalDomainPhase.PREPARE_EXPORT)
         commit_command = next(command for command in commands if command.phase is GlobalDomainPhase.COMMIT)
         assert prepare_command.attachments
@@ -1549,7 +1759,7 @@ def test_mpirun_group_global_domain_uses_mpi_prepare_commit_without_l4_import(mo
             for phase, worker_id in calls
             if phase in (GlobalDomainPhase.PREPARE_EXPORT, GlobalDomainPhase.COMMIT)
         ]
-        assert group_phases == [node_ids[0], node_ids[0]]
+        assert group_phases == [node_ids[0], node_ids[0], node_ids[1]]
         assert worker._live_global_domains["mpi-static"] is handle
         assert resources.live_global_domains["mpi-static"] is handle
     finally:
