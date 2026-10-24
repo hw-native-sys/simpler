@@ -37,3 +37,9 @@ clang-format -i <file>
 3. Create new subdirectories under your assigned directory as needed
 4. When in doubt, ask the user before making changes to other areas
 5. **Avoid including private information in documentation or code** such as usernames, absolute paths with usernames, or other personally identifiable information. Use relative paths or generic placeholders instead
+
+## Substantial task delivery
+
+Use [.claude/skills/develop-task/SKILL.md](.claude/skills/develop-task/SKILL.md)
+for goal/design alignment, internal task dependencies, parallel agents and
+reviewed delivery. Small changes can use the focused skills directly.
