@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Optional live framework-queue consumer of the ordinary public Worker."""
+"""Live framework-queue consumer of the ordinary public Worker."""
 
 import hashlib
 import importlib.metadata
@@ -21,7 +21,7 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[4]
 _EXAMPLE = _ROOT / "examples/workers/l2/framework_eager/main.py"
-pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), pytest.mark.manual]
+pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), pytest.mark.test_environment("torch_npu")]
 
 
 @pytest.fixture(scope="module")

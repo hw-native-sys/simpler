@@ -80,7 +80,7 @@ jobs:
       - name: Compile scene-test kernels (a2a3)
         run: |
           source /usr/local/Ascend/cann/set_env.sh
-          .venv/bin/python -m simpler_setup.tools.scene_test_compile examples tests/st --ignore tests/st/a2a3/framework_eager \
+          .venv/bin/python -m simpler_setup.tools.scene_test_compile examples tests/st \
             --platform a2a3 --exclude-level 4 --require-pto-isa --compile-workers 32 -q \
             --manual "$MANUAL_MODE"
 
@@ -114,13 +114,13 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-            --run ".venv/bin/python -m pytest examples tests/st --ignore tests/st/a2a3/framework_eager -m 'not sdma and not sdma_fault' --platform a2a3 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
+            --run ".venv/bin/python -m pytest examples tests/st -m 'not sdma and not sdma_fault' --platform a2a3 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
 
       - name: SDMA pytest (a2a3)
         if: inputs.manual_mode != 'only'
         run: |
           source /usr/local/Ascend/cann/set_env.sh
-          SDMA_TESTS="examples tests/st --ignore tests/st/a2a3/framework_eager -m 'sdma and not sdma_fault'"
+          SDMA_TESTS="examples tests/st -m 'sdma and not sdma_fault'"
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num 2 \
             --run ".venv/bin/python -m pytest $SDMA_TESTS --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
 
@@ -129,7 +129,7 @@ jobs:
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num 1 \
-            --run ".venv/bin/python -m pytest examples tests/st --ignore tests/st/a2a3/framework_eager -m sdma_fault --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
+            --run ".venv/bin/python -m pytest examples tests/st -m sdma_fault --platform a2a3 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 600"
 
       - name: DFX smokes (a2a3)
         if: inputs.include_dfx_smokes

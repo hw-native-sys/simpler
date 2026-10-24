@@ -8,28 +8,7 @@ runs:
       shell: bash
       run: |
         source /usr/local/Ascend/cann/set_env.sh
-        python3 - <<'PY'
-        import json
-        import os
-        import platform
-        import sys
-        from pathlib import Path
-
-        home = Path(os.environ["ASCEND_HOME_PATH"]).resolve()
-        candidates = [home / "ascend_toolkit_install.info",
-                      home / f"{platform.machine()}-linux/ascend_toolkit_install.info"]
-        manifest = next((path for path in candidates if path.is_file()), None)
-        if manifest is None:
-            raise SystemExit(f"CANN install manifest missing under active ASCEND_HOME_PATH={home}")
-        fields = dict(line.split("=", 1) for line in manifest.read_text().splitlines() if "=" in line)
-        print("FRAMEWORK_CI_TOOLCHAIN " + json.dumps({
-            "python": sys.version, "executable": sys.executable,
-            "machine": platform.machine(), "libc": platform.libc_ver(),
-            "cann_home": str(home), "manifest": str(manifest), "cann": fields,
-        }), flush=True)
-        if fields.get("version") != "9.0.0":
-            raise SystemExit("Framework CI requires CANN 9.0.0 for the pinned torch_npu 2.7.1.post4 pair")
-        PY
+        python3 simpler_setup/test_environments.py preflight torch_npu
 
     - name: Install isolated framework dependencies and runtime
       shell: bash
@@ -41,23 +20,23 @@ runs:
         source .venv-framework/bin/activate
         python -m pip install --upgrade pip
         constraints=.github/actions/setup-framework-eager/constraints.txt
+        mapfile -t requirements < <(python simpler_setup/test_environments.py requirements torch_npu)
         # Explicit local wheels shadow inherited distributions without changing them.
-        python -m pip install --ignore-installed --no-deps 'torch==2.7.1+cpu' --index-url https://download.pytorch.org/whl/cpu
-        python -m pip install --ignore-installed --no-deps 'torch_npu==2.7.1.post4'
-        python -m pip install -c "$constraints" 'torch==2.7.1+cpu' 'torch_npu==2.7.1.post4' \
+        python -m pip install --ignore-installed --no-deps "${requirements[0]}" --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install --ignore-installed --no-deps "${requirements[1]}"
+        python -m pip install -c "$constraints" "${requirements[@]}" \
           'scikit-build-core>=0.10' 'nanobind>=2,<3' 'cmake>=3.20' ninja setuptools
         python -m pip install -c "$constraints" --no-build-isolation \
           --config-settings=build.targets=build_package_a2a3 '.[test]'
-        python - <<'PY'
-        import importlib.metadata
-        import importlib.util
+        python - <<'PYEOF'
         import json
         import sys
         from pathlib import Path
 
-        versions = {name: importlib.metadata.version(name) for name in ("torch", "torch_npu")}
-        assert versions == {"torch": "2.7.1+cpu", "torch_npu": "2.7.1.post4"}, versions
-        modules = {name: importlib.util.find_spec(name).origin for name in versions}
-        assert all(Path(path).is_relative_to(Path(sys.prefix)) for path in modules.values()), modules
-        print("FRAMEWORK_CI_PACKAGES " + json.dumps({"versions": versions, "modules": modules}), flush=True)
-        PY
+        from simpler_setup.test_environments import preflight
+
+        record = preflight("torch_npu")
+        assert all(Path(package["path"]).is_relative_to(Path(sys.prefix))
+                   for package in record["packages"].values()), record
+        print("TEST_ENVIRONMENT_PACKAGES " + json.dumps(record), flush=True)
+        PYEOF

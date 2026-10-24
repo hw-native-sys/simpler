@@ -20,6 +20,7 @@ import torch
 import torch_npu
 
 from simpler_setup.environment import PROJECT_ROOT
+from simpler_setup.test_environments import preflight
 
 
 def _identity(path):
@@ -30,8 +31,7 @@ def _identity(path):
 def main():
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     assert _task_interface.__build_commit__ == source, (_task_interface.__build_commit__, source)
-    assert torch.__version__ == "2.7.1+cpu", torch.__version__
-    assert torch_npu.__version__ == "2.7.1.post4", torch_npu.__version__
+    preflight("torch_npu")
     modules = {
         name: _identity(module.__file__)
         for name, module in (("torch", torch), ("torch_npu", torch_npu), ("native", _task_interface))

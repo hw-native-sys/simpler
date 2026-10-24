@@ -37,14 +37,14 @@ jobs:
       - name: Set up framework environment
         uses: ./.github/actions/setup-framework-eager
 
-      - name: Run all four framework eager combinations exclusively
+      - name: Run the declared framework environment exclusively
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           mkdir -p outputs/framework-eager-ci
           git rev-parse HEAD | tee outputs/framework-eager-ci/source.txt
           task-submit --timeout 900 --max-time 900 --device auto --device-num 1 \
-            --run ".venv-framework/bin/python .github/actions/setup-framework-eager/identity.py && .venv-framework/bin/python -m pytest tests/st/a2a3/framework_eager/test_framework_eager.py --platform a2a3 --manual include --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/framework-eager-ci/pytest --junitxml outputs/framework-eager-ci/results.xml"
-          .venv-framework/bin/python .github/actions/setup-framework-eager/verify_results.py outputs/framework-eager-ci/results.xml
+            --run ".venv-framework/bin/python .github/actions/setup-framework-eager/identity.py && .venv-framework/bin/python -m pytest examples tests/st --platform a2a3 --test-environment torch_npu --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/framework-eager-ci/pytest --junitxml outputs/framework-eager-ci/results.xml"
+          .venv-framework/bin/python -m simpler_setup.test_environments verify outputs/framework-eager-ci/results.plan.json outputs/framework-eager-ci/results.xml
 
       - name: Retain framework eager identities and logs
         if: always()
