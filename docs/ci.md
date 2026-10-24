@@ -329,7 +329,10 @@ accepted-handle drain before workspace teardown, preserving late close-only
 lane errors and retryable cleanup. Typed-value consumers perform three
 DEVICE calls, plus three explicit HOST/NONE-control calls on HBG; TMR checks
 clean HOST refusal followed by valid DEVICE work. A session-scoped fixture
-compiles the shared host bridge once. The client wait is bounded at 15 minutes,
+compiles the shared host bridge once. The ScopeStats consumer adds four
+queued calls with off/on/on/off selection and independent output prefixes.
+TMR checks nested scope records and allocation frontiers; HBG checks metadata
+only. Those cases enter the same collection plan without a workflow case list. The client wait is bounded at 15 minutes,
 including queueing; the execution watchdog is also 15 minutes. Individual
 subprocess timeouts do not reserve additional aggregate execution time.
 The final pytest collection freezes a nonempty source/environment/nodeid plan

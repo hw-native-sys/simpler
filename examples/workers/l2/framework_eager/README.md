@@ -15,6 +15,7 @@ and host queue bridge.
 | `alias_inout.py` | One Buffer backing full and partially overlapping strided views, INPUT plus INOUT, repeated updates and unchanged guards |
 | `failure_recovery.py` | A Python callback fails after submit acceptance; later requests complete and init-thread Worker close retires all accepted runs |
 | `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
+| `scope_statistics.py` | Per-call ScopeStats selection with two nested task scopes; TMR records and allocation frontiers, HBG metadata only |
 
 Public `Worker.close()` drains accepted direct-chip runs through their normal
 RunHandle completion and retirement path before checking workspace ownership.
@@ -155,3 +156,18 @@ strides or cross-tile overlap, A5 and capture remain separate qualification.
 
 This is a reference consumer of the existing eager contract, not acceptance of
 PyPTO production dispatch, vLLM/model numerics, A5 or capture/replay.
+
+## Per-call ScopeStats
+
+`scope_statistics.py` queues four calls with ScopeStats off/on/on/off. Each call
+submits two vector-add tasks in nested scopes; the final Torch successor checks
+10, 16, 22 and 28. After each accepted submit, the callback changes the caller
+config and output prefix. Only the two enabled calls may export records to their
+original prefixes.
+
+TMR checks six ordered root/outer/inner boundaries, distinct run epochs, and
+cumulative task/heap allocation frontiers. HBG exports metadata only because
+it has no device scope producer. These checks establish diagnostic attribution;
+they do not measure live allocations, overlap or performance. Retirement and
+export occur after the final framework completion boundary. Unknown outcomes
+retain the caller and runtime owners.
