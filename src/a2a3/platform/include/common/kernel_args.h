@@ -250,9 +250,13 @@ struct AicoreLaunchArgs {
     // this run's report. Zero on a kernel/persistent launch, which keeps the
     // `aicore_done != 0` predicate.
     uint64_t report_epoch;
+    // Zero for ordinary native runs. Capture admission publishes the dynamic
+    // report epoch before the fork event releases this entry.
+    uint64_t capture_control{0};
+    uint64_t capture_generation{0};
 };
 
-static_assert(sizeof(AicoreLaunchArgs) == 40, "AicoreLaunchArgs size drift");
+static_assert(sizeof(AicoreLaunchArgs) == 56, "AicoreLaunchArgs size drift");
 
 /**
  * Fill the `AicoreLaunchArgs` fields every architecture shares, from the

@@ -32,9 +32,10 @@
 
 /** The carrier and format of this run's entry-argument values. */
 enum class EntryArgsSource : uint32_t {
-    Descriptor = 0,        // inside the published Runtime descriptor
-    LaunchEnvelope = 1,    // appended to the AICPU launch arguments, copied by RTS
-    KernelInvocation = 2,  // validated kernel packet in the RTS launch package
+    Descriptor = 0,               // inside the published Runtime descriptor
+    LaunchEnvelope = 1,           // appended to the AICPU launch arguments, copied by RTS
+    KernelInvocation = 2,         // validated kernel packet in the RTS launch package
+    KernelCaptureInvocation = 3,  // registered fixed image with per-replay device admission
 };
 
 /**

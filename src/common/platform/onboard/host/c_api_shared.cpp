@@ -38,6 +38,7 @@
 #include "runtime_c_api.h"
 #include "task_args_wire.h"
 #include "native_run_context.h"
+#include "kernel_capture_api.h"
 
 #include <acl/acl.h>
 #include <dlfcn.h>
@@ -1038,6 +1039,8 @@ static int enter_kernel_callable_preparation(DeviceRunnerBase *runner, const cha
         LOG_ERROR("%s: the kernel context no longer accepts preparation", entry);
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
+    const int capture_rc = quiesce_kernel_capture_for_callable_change(runner, -1, false);
+    if (capture_rc != 0) return capture_rc;
     return runner->enter_run_thread();
 }
 
@@ -1079,7 +1082,7 @@ static int prepare_kernel_callable_on_runner(
 static int
 prepare_kernel_callable_locked(DeviceRunnerBase *runner, int32_t callable_id, const void *callable, const char *entry) {
     try {
-        if (runner->native_runs_outstanding()) {
+        if (runner->native_runs_outstanding() && runner->kernel_capture_owner() == nullptr) {
             LOG_ERROR("%s: native run must be finalized before mutating the callable registry", entry);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
@@ -1100,7 +1103,7 @@ static int
 register_callable_locked(DeviceContextHandle ctx, int32_t callable_id, const void *callable, const char *entry) {
     if (ctx == NULL || callable == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
-    if (runner->native_runs_outstanding()) {
+    if (runner->native_runs_outstanding() && runner->kernel_capture_owner() == nullptr) {
         LOG_ERROR("%s: native run must be finalized before mutating the callable registry", entry);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -1108,6 +1111,8 @@ register_callable_locked(DeviceContextHandle ctx, int32_t callable_id, const voi
         LOG_ERROR("%s: callable_id=%d is already registered; unregister it before reuse", entry, callable_id);
         return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     }
+    const int capture_rc = quiesce_kernel_capture_for_callable_change(runner, -1, false);
+    if (capture_rc != 0) return capture_rc;
 
     try {
         int rc = runner->ensure_device_initialized();
@@ -1144,7 +1149,7 @@ static int register_callable_auto_id(
     const bool kernel = runner->execution_mode_latch().is_kernel();
     try {
         std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
-        if (runner->native_runs_outstanding()) {
+        if (runner->native_runs_outstanding() && runner->kernel_capture_owner() == nullptr) {
             LOG_ERROR("%s: native run must be finalized before mutating the callable registry", entry);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
@@ -1293,6 +1298,10 @@ native_run_context(DeviceContextHandle ctx, RuntimeHandle runtime, const char *o
     auto *state = static_cast<OnboardNativeRunContext *>(runtime);
     if (state->runner != static_cast<DeviceRunnerBase *>(ctx)) {
         LOG_ERROR("%s: prepared run belongs to a different device context", operation);
+        return nullptr;
+    }
+    if (state->capture_execution != nullptr) {
+        LOG_ERROR("%s: a graph lease retains this run; use the capture lifecycle", operation);
         return nullptr;
     }
     return state;
@@ -1702,6 +1711,7 @@ int simpler_prepare_run(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    if (runner->kernel_capture_owner() != nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
     const int context_rc = runner->validate_current_context();
     if (context_rc != 0) return context_rc;
     if (runner->execution_mode_latch().is_kernel()) {
@@ -2440,6 +2450,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // A refused environment leaves the run owned for a retry on its context.
     const int context_rc = state->runner->validate_current_context();
     if (context_rc != 0) return context_rc;
+    if (!state->retained_device_use.can_finalize(state->identity())) return PTO_RUNTIME_ERR_INVALID_STATE;
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
@@ -2465,9 +2476,17 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // is not, which is why the launch transaction reports its own progress
     // where it happens. The ledger keeps that earlier report, so the branch
     // below can only ever add "never submitted" to a run no launch claimed.
-    note_workspace_fact(
-        state, launched ? WorkspaceManager::RunFact::Launched : WorkspaceManager::RunFact::NoDeviceSubmission
-    );
+    if (state->retained_device_use.retained()) {
+        note_workspace_fact(state, WorkspaceManager::RunFact::DeviceReferencesRetained);
+        if (state->retained_device_use.observed_execution())
+            note_workspace_fact(state, WorkspaceManager::RunFact::Launched);
+        note_workspace_fact(state, WorkspaceManager::RunFact::DrainAttempted);
+        note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
+    } else {
+        note_workspace_fact(
+            state, launched ? WorkspaceManager::RunFact::Launched : WorkspaceManager::RunFact::NoDeviceSubmission
+        );
+    }
     // Drain and copy-back need the correct current device. Program owns that
     // binding; a borrowed context only verifies the caller's binding.
     int attach_rc = PTO_RUNTIME_ERR_INTERNAL;
@@ -2676,12 +2695,14 @@ int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     try {
         DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
         std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
-        if (runner->native_runs_outstanding()) {
+        if (runner->native_runs_outstanding() && runner->kernel_capture_owner() == nullptr) {
             LOG_ERROR(
                 "simpler_unregister_callable: native run must be finalized before mutating the callable registry"
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        const int capture_rc = quiesce_kernel_capture_for_callable_change(runner, callable_id, true);
+        if (capture_rc != 0) return capture_rc;
         return runner->unregister_callable(callable_id);
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -3004,6 +3025,7 @@ int simpler_kernel_mode_init(
             runner->set_dispatcher_binary(std::move(dispatcher_vec));
         }
         rc = runner->init_kernel_context(device_id);
+        if (rc == 0) runner->set_kernel_context_generation(context_generation);
     } catch (...) {
         rc = PTO_RUNTIME_ERR_INTERNAL;
     }

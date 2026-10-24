@@ -15,6 +15,7 @@
 #include "aicore/aicore_profiling_state.h"
 #include "common/core_type.h"
 #include "common/kernel_args.h"
+#include "task_interface/kernel_capture.h"
 #include "common/chip_swimlane_profiling.h"
 #include "common/platform_config.h"
 #include "common/pmu_profiling.h"
@@ -118,8 +119,25 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(
     uint64_t runtime_args, uint32_t enable_profiling_flag, uint32_t force_simt_anchor,
     uint64_t chip_swimlane_aicore_rotation_table, uint64_t aicore_pmu_ring_addrs, uint64_t pmu_reg_addrs,
-    uint64_t report_epoch
+    uint64_t report_epoch, uint64_t capture_control, uint64_t capture_generation
 ) {
+    if (capture_control != 0) {
+        auto *control = reinterpret_cast<__gm__ const simpler::tmr::KernelCaptureControl *>(capture_control);
+        dcci(control, ENTIRE_DATA_CACHE);
+        dsb(static_cast<mem_dsb_t>(0));
+        // Rejected replays return before publishing a handshake or opening any
+        // register window. A failure of the admitted replay does not revoke its
+        // late cores: those still enter the mainline retirement protocol.
+        if (capture_generation == 0 || control->capture_generation != capture_generation ||
+            control->runtime_address != runtime_args ||
+            control->decision != static_cast<uint32_t>(simpler::tmr::CaptureDecision::Admitted) ||
+            control->replay_epoch == 0)
+            return;
+        report_epoch = control->replay_epoch;
+    } else if (capture_generation != 0) {
+        return;
+    }
+
     // Calculate block_idx for this core
 #ifdef __DAV_VEC__
     block_idx = get_block_idx() * get_subblockdim() + get_subblockid() + get_block_num();

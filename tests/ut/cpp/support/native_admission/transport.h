@@ -23,6 +23,17 @@ struct Control {
     int copy_rc{0};
     size_t stream_create_calls{0};
     size_t fail_stream_create{0};
+    int stream_sync_rc{0};
+    bool fail_stream_id{false};
+    bool capture_active{false};
+    bool *capture_refuse_after_core{nullptr};
+    size_t capture_record_allocation_failures{0};
+    bool capture_loader_throws{false};
+    bool capture_registration_throws{false};
+    size_t capture_registration_calls{0};
+    size_t capture_core_calls{0};
+    size_t capture_cpu_calls{0};
+    size_t capture_sync_calls{0};
 };
 Control &control();
 }  // namespace native_admission_transport

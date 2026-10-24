@@ -19,10 +19,12 @@
 #include "call_config.h"
 #include "common/host_api.h"
 #include "native_run_execution.h"
+#include "retained_device_use.h"
 #include "native_run_phase.h"
 #include "native_run_storage_tag.h"
 #include "runtime_c_api.h"
 #include "runtime.h"
+#include "host/kernel_capture_owner.h"
 
 /**
  * The single placement-owned carrier for one progressable native lifecycle.
@@ -80,8 +82,10 @@ struct NativeRunContext {
     int completion_rc{-1};
     std::atomic<NativeRunPhase> phase{NativeRunPhase::Prepared};
     std::unique_ptr<typename Runner::PreparedExecution> prepared_execution{};
+    std::unique_ptr<KernelCaptureOwner> capture_execution{};
     std::unique_ptr<typename Runner::ActiveExecution> active_execution{};
     LaunchPermit launch_permit{};
+    RetainedDeviceUse retained_device_use{};
     char trace_attrs[192]{};
     // True only for a launch entry that has not attempted execution-visible
     // submission, or whose returned transaction explicitly reports NotStarted.
