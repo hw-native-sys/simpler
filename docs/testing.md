@@ -49,6 +49,11 @@ handles are drained before workspace ownership can be released, without
 individual user waits. Native timeout/context refusals and retryable close debt
 are covered separately by CPU lifecycle contracts.
 
+The ScopeStats consumer uses the same declared environment and shared bridge.
+It checks off/on/on/off selection, per-call exports and nested scope attribution
+on TMR. HBG is explicitly metadata only; neither path treats allocation
+frontiers as live usage or claims performance.
+
 The registry and verifier live in `simpler_setup/test_environments.py`. Package
 pins have one source in the profile's constraints file. Adding a test to an
 existing environment requires no workflow edit. A new environment requires an
