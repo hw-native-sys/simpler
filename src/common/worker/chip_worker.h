@@ -202,6 +202,9 @@ public:
      */
     enum class NativeLaunch : int { Launched, DiagnosticCreditFull };
     NativeLaunch launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream = nullptr);
+    void kernel_launch(int32_t callable_id, const ChipStorageTaskArgs *args, void *caller_stream);
+    uint64_t retain_kernel_graph();
+    void release_kernel_graph(uint64_t lease);
     void validate_caller_stream(void *caller_stream);
     void validate_execution_context() const;
     /**
@@ -720,6 +723,8 @@ private:
     KernelInitFn kernel_init_fn_ = nullptr;
     KernelPrepareCallableFn kernel_prepare_callable_fn_ = nullptr;
     KernelLaunchFn kernel_launch_fn_ = nullptr;
+    decltype(&simpler_kernel_mode_retain_graph) kernel_retain_graph_fn_ = nullptr;
+    decltype(&simpler_kernel_mode_release_graph) kernel_release_graph_fn_ = nullptr;
     void *device_ctx_ = nullptr;
     std::vector<CommSession> comm_sessions_;
     std::unordered_map<uint64_t, size_t> comm_session_index_;

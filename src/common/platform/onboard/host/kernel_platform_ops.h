@@ -25,8 +25,7 @@
  * The context-lifetime operation table backed by CANN.
  *
  * Every entry is a free CANN call, so the table carries no receiver and its
- * `context` stays null. Events are created with ACL_EVENT_SYNC: the launch
- * sequence waits on them from a stream and never queries their status from
- * the host.
+ * `context` stays null. Events are created with ACL_EVENT_SYNC for stream
+ * waits and host queries of the submission tail's completion status.
  */
 KernelContextOps make_onboard_kernel_context_ops();

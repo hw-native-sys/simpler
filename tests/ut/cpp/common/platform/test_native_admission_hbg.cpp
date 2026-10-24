@@ -9,11 +9,49 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "fixture.h"
+#include "callable.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 
 extern "C" int args_dump_capture_supported_impl(void);
 
 namespace native_admission_test {
+TEST_F(NativeAdmissionTest, RegistrationRefusesInsideBorrowedPreparation) {
+    Runner runner;
+    ASSERT_EQ(runner.execution_mode_latch().latch(SIMPLER_MODE_KERNEL), 0);
+    KernelContextOps ops;
+    ops.get_current_device = [](void *, int *id) noexcept {
+        *id = 0;
+        return 0;
+    };
+    ops.get_current_context = [](void *, void **ctx) noexcept {
+        static int token;
+        *ctx = &token;
+        return 0;
+    };
+    ops.create_hidden_stream = ops.get_current_context;
+    ops.create_event = ops.get_current_context;
+    ops.destroy_hidden_stream = [](void *, void *) noexcept {
+        return 0;
+    };
+    ops.destroy_event = ops.destroy_hidden_stream;
+    ASSERT_EQ(runner.kernel_execution_state().initialize(0, ops), 0);
+    ASSERT_EQ(runner.kernel_execution_state().mark_ready_enqueued(), 0);
+    const uint8_t binary[] = {0x01};
+    const auto image = make_chip_callable(nullptr, 0, "orch", binary, sizeof(binary), nullptr, nullptr, 0, "");
+    Attempt outer(runner, 1, 20);
+    outer.args.tensor(0).transfer = TensorTransfer::NONE;
+    outer.args.tensor(0).address_space = AddressSpace::DEVICE;
+    callback_hook = [&] {
+        ASSERT_TRUE(runner.native_runs_outstanding());
+        int32_t id = 99;
+        const int rc = simpler_register_callable_v2(&runner, image.data(), image.size(), &id);
+        EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_EQ(id, -1);
+    };
+    ASSERT_EQ(outer.prepare(), 0);
+    EXPECT_EQ(callbacks, 1);
+}
+
 TEST_F(NativeAdmissionTest, CallbackRejectsAnotherContextBeforeChangingItsRunState) {
     Runner outer_runner;
     Runner inner_runner;

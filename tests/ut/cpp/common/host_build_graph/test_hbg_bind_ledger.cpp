@@ -43,6 +43,18 @@
 #include "common/host_api.h"
 #include "common/launch_entry_args.h"
 #include "host_build_graph/host/graph_host_state.h"
+#include "host_build_graph/host_graph_build.h"
+#include "host_build_graph/kernel_resource_requirements.h"
+#include "host_build_graph/kernel_graph_template.h"
+#include "aicpu/platform_aicpu_affinity.h"
+#include "aicpu/platform_entry_args.h"
+#include "host_build_graph/kernel_callable_registration.h"
+#include "host_build_graph/kernel_graph_execution.h"
+#include "host_build_graph/kernel_graph_execution_entry.h"
+#include "host_build_graph/kernel_graph_slot_control.h"
+#include "host_build_graph/kernel_graph_packet_reader.h"
+#include "host_build_graph/kernel_graph_packet_parser.h"
+#include "host_build_graph/device/graph_image_source.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 #include "host_build_graph/host/host_tensor_access.h"
 #include "host/raii_scope_guard.h"
@@ -68,6 +80,23 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api);
 extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api);
 
 namespace {
+
+hbg::GraphExecutionStatus prepare_packet_for_test(
+    const void *packet, size_t bytes, int device_id, uint64_t binary_id,
+    const simpler::kernel::PreparedInvocationView &trusted, hbg::GraphExecutionPreparation &out,
+    const hbg::GraphExecutionPreparationOps &ops = {},
+    hbg::GraphPacketAddress mode = hbg::GraphPacketAddress::DeviceCopy
+) {
+    hbg::ParsedGraphPacket parsed;
+    hbg::GraphSlotRegistration registration;
+    auto status = hbg::read_graph_execution_packet(packet, bytes, device_id, binary_id, registration, parsed, {}, mode);
+    if (status == hbg::GraphSlotStatus::Poisoned) return hbg::GraphExecutionStatus::Poisoned;
+    if (status != hbg::GraphSlotStatus::Ok) return hbg::GraphExecutionStatus::Rejected;
+    hbg::ValidatedGraphExecutionBinding binding;
+    status = hbg::validate_graph_execution_binding(parsed, registration, trusted, binding);
+    if (status != hbg::GraphSlotStatus::Ok) return hbg::GraphExecutionStatus::Rejected;
+    return hbg::prepare_graph_execution(binding, out, ops);
+}
 
 constexpr size_t kAlign = 1024;
 
@@ -903,7 +932,7 @@ TEST_F(HbgBindLedgerTest, TheDeviceImageCarriesNoHostOnlyBytes) {
     // prefix — so the exclusions below cover every byte that can cross, not
     // just the ones a steady-state run re-sends.
     std::vector<uint8_t> image(image_bytes);
-    std::memcpy(image.data(), &runtime, image_bytes);
+    std::memcpy(image.data(), &runtime.dev, image_bytes);
 
     auto contains = [&image](const void *needle, size_t bytes) {
         const auto *first = static_cast<const uint8_t *>(needle);
@@ -2556,4 +2585,370 @@ TEST_F(HbgBindLedgerTest, LaunchStagingLeavesOnlyTheLargeImageOnThePrepareCopyPa
     EXPECT_EQ(fake_.copy_count, copies);
     EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
     EXPECT_EQ(fake_.copy_count, copies);
+}
+
+class HbgGraphPrepareCapacityTest : public HbgBindLedgerTest,
+                                    public ::testing::WithParamInterface<uint64_t> {};
+
+TEST_P(HbgGraphPrepareCapacityTest, CompletedGraphBuildMeasuresWithoutDeviceAllocationOrPublication) {
+    Runtime runtime;
+    init_runtime(runtime);
+    RuntimeContext context{};
+    HostTensorAccessor access;
+    hbg::GraphBuild build;
+    constexpr uint64_t capacity = 16;
+    const uint64_t sm_bytes = SharedMemoryHandle::calculate_size(capacity);
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ChipTaskArgs args;
+    const int status = hbg::build_graph(&runtime, &api_, access, &context, sm_bytes, capacity, &eps_, args, build);
+    ASSERT_GT(status, 0);
+    if (GetParam() != 0) {
+        // Queue capacity may exceed the live population of this invocation.
+        auto populations = build.ready_queue_populations;
+        populations.graph_prepare = GetParam();
+        ASSERT_TRUE(populations.derive_capacities(&build.ready_queue_capacities));
+    }
+    EXPECT_TRUE(build.build_complete);
+    EXPECT_EQ(build.total_tasks, status);
+    EXPECT_GT(build.heap_bytes, 0U);
+    EXPECT_GT(build.image_bytes, 0U);
+    ASSERT_EQ(build.definitions.objects.size(), 1U);
+    EXPECT_GT(build.definitions.bytes, 0U);
+    EXPECT_EQ(build.definitions.bindings.size(), 1U);
+    EXPECT_EQ(fake_.device_malloc_count, 0);
+    EXPECT_TRUE(fake_.gm_heap.empty());
+    EXPECT_TRUE(fake_.runtime_arena.empty());
+    EXPECT_EQ(fake_.copy_count, 0);
+    EXPECT_EQ(fake_.section_publications, 0U);
+    EXPECT_EQ(runtime.pending_publication().bytes, 0U);
+    EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::None);
+    EXPECT_EQ(g_orch_runtime, nullptr);
+    DeviceArena arena;
+    const RuntimeArenaLayout layout = runtime_reserve_layout(arena, capacity);
+    hbg::GraphResourceRequirements requirements;
+    ASSERT_EQ(hbg::measure_graph_resources(build, layout, hbg::RuntimeArchitecture::A2A3, 0, requirements), 0);
+    EXPECT_EQ(requirements.gm_heap_bytes, build.heap_bytes);
+    EXPECT_EQ(requirements.runtime_arena_bytes, layout.off_copied_end + build.image_bytes);
+    EXPECT_EQ(requirements.graph_definition_bytes, build.definitions.bytes);
+    hbg::KernelResourceCapacity capacity_plan;
+    ASSERT_EQ(hbg::KernelResourceCapacity::create(&requirements, 1, capacity_plan), 0);
+    KernelExecutionState execution_context;
+    uintptr_t next_handle = 16;
+    const auto create_handle = [](void *state, void **out) noexcept {
+        *out = reinterpret_cast<void *>((*static_cast<uintptr_t *>(state))++);
+        return 0;
+    };
+    KernelContextOps handles{
+        &next_handle,
+        [](void *, int *device) noexcept {
+            *device = 0;
+            return 0;
+        },
+        [](void *, void **current) noexcept {
+            *current = reinterpret_cast<void *>(1);
+            return 0;
+        },
+        create_handle,
+        [](void *, void *) noexcept {
+            return 0;
+        },
+        create_handle,
+        [](void *, void *) noexcept {
+            return 0;
+        }
+    };
+    const uint64_t context_generation = GetParam() + 7;
+    ASSERT_EQ(execution_context.initialize(0, handles, context_generation), 0);
+    RAIIScopeGuard execution_close([&execution_context] {
+        EXPECT_EQ(execution_context.close(), 0);
+    });
+    const KernelResourceOps allocations{
+        nullptr,
+        [](void *, size_t bytes) -> void * {
+            return std::malloc(bytes);
+        },
+        [](void *, void *address) {
+            std::free(address);
+            return 0;
+        }
+    };
+    ASSERT_EQ(capacity_plan.prepare(execution_context, allocations), 0);
+    hbg::GraphSlotRegistration registration{};
+    EXPECT_EQ(
+        capacity_plan.make_registration(execution_context, 0, context_generation, 123, registration),
+        PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    ASSERT_EQ(execution_context.freeze_resources(), 0);
+    EXPECT_EQ(
+        capacity_plan.make_registration(execution_context, 0, context_generation + 1, 123, registration),
+        PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    ASSERT_EQ(capacity_plan.make_registration(execution_context, 0, context_generation, 123, registration), 0);
+    ASSERT_TRUE(hbg::is_valid_graph_slot_registration(registration));
+    hbg::GraphInvocationIdentity identity{0, 0, 0, 19, 11, 12, 13};
+    hbg::GraphLaunchTemplate snapshot;
+    ASSERT_EQ(hbg::make_graph_launch_template(build, context, registration, identity, snapshot), 0);
+    EXPECT_EQ(
+        hbg::validate_graph_packet(snapshot.data(), snapshot.size(), hbg::GraphPacketAddress::HostTemplate),
+        hbg::GraphPacketStatus::Ok
+    );
+    // The template sends the copied zone and compact image; device-only scheduler
+    // queues occupy the working allocation but contribute no launch bytes.
+    EXPECT_LT(snapshot.size(), requirements.runtime_arena_bytes);
+    hbg::GraphHostArgs first, second;
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, first), 0);
+    ASSERT_EQ(hbg::make_graph_host_args(snapshot, second), 0);
+    const uint64_t payload_address = reinterpret_cast<uintptr_t>(first.storage.data()) + first.data_offset;
+    std::memcpy(
+        reinterpret_cast<std::byte *>(first.storage.data()) + first.address_offset, &payload_address,
+        sizeof(payload_address)
+    );
+    EXPECT_EQ(
+        hbg::validate_graph_packet(first.storage.data(), first.bytes, hbg::GraphPacketAddress::DeviceCopy),
+        hbg::GraphPacketStatus::Ok
+    );
+    EXPECT_EQ(
+        hbg::validate_graph_packet(second.storage.data(), second.bytes, hbg::GraphPacketAddress::HostTemplate),
+        hbg::GraphPacketStatus::Ok
+    );
+    EXPECT_EQ(
+        hbg::validate_graph_packet(snapshot.data(), snapshot.size(), hbg::GraphPacketAddress::HostTemplate),
+        hbg::GraphPacketStatus::Ok
+    );
+    ASSERT_EQ(hbg::install_graph_execution_slot(&registration, sizeof(registration)), hbg::GraphSlotStatus::Ok);
+    auto *registry = reinterpret_cast<hbg::GraphSlotRegistry *>(registration.registry.address);
+    RAIIScopeGuard registry_detach([registry] {
+        hbg::detach_graph_slot_registry(registry);
+    });
+    const simpler::kernel::PreparedInvocationView trusted{identity.callable_id, 0, 0, identity.generation};
+    hbg::GraphExecutionPreparation prepared;
+    const auto valid_capacities = build.ready_queue_capacities;
+    const auto reject_capacity = [&](ReadyQueueCapacities invalid_capacities) {
+        build.ready_queue_capacities = invalid_capacities;
+        hbg::GraphLaunchTemplate invalid_snapshot;
+        ASSERT_EQ(hbg::make_graph_launch_template(build, context, registration, identity, invalid_snapshot), 0);
+        const uint64_t attempt = registry->execution.attempt;
+        EXPECT_EQ(
+            prepare_packet_for_test(
+                invalid_snapshot.data(), invalid_snapshot.size(), 0, 123, trusted, prepared, {},
+                hbg::GraphPacketAddress::RelativeLaunch
+            ),
+            hbg::GraphExecutionStatus::InvalidImage
+        );
+        EXPECT_EQ(registry->execution.attempt, attempt);
+    };
+    for (uint64_t invalid :
+         {uint64_t{0}, uint64_t{3}, GRAPH_PREPARE_QUEUE_CAPACITY_LIMIT + 1, 2 * GRAPH_PREPARE_QUEUE_CAPACITY_LIMIT}) {
+        auto capacities = valid_capacities;
+        capacities.graph_prepare = invalid;
+        reject_capacity(capacities);
+    }
+    auto oversized = valid_capacities;
+    oversized.ready[0] = 2 * READY_QUEUE_CAPACITY_LIMIT;
+    reject_capacity(oversized);
+    oversized = valid_capacities;
+    oversized.ready_sync[0] = 2 * READY_QUEUE_CAPACITY_LIMIT;
+    reject_capacity(oversized);
+    oversized = valid_capacities;
+    oversized.dummy = 2 * READY_QUEUE_CAPACITY_LIMIT;
+    reject_capacity(oversized);
+    build.ready_queue_capacities = valid_capacities;
+    simpler::kernel::HbgCallableBinding live{
+        reinterpret_cast<uint64_t>(&runtime), context_generation, identity.generation, identity.callable_id, 0, 0, 0
+    };
+    ASSERT_EQ(simpler_aicpu_l1_hbg_register_callable(&live), 0);
+    RAIIScopeGuard callable_revoke([&live] {
+        EXPECT_EQ(simpler_aicpu_l1_hbg_revoke_callable(&live), 0);
+        set_platform_entry_args(0, {});
+    });
+    platform_aicpu_affinity_set_thread_idx(0);
+    std::vector<std::byte> invocation(LAUNCH_ENVELOPE_HEADER_BYTES + second.bytes);
+    std::memcpy(invocation.data() + LAUNCH_ENVELOPE_HEADER_BYTES, second.storage.data(), second.bytes);
+    PlatformEntryArgs launch_view{};
+    launch_view.args_base = invocation.data();
+    launch_view.offset = LAUNCH_ENVELOPE_HEADER_BYTES;
+    launch_view.source = static_cast<uint32_t>(EntryArgsSource::HbgKernelInvocation);
+    launch_view.graph_offset = LAUNCH_ENVELOPE_HEADER_BYTES;
+    launch_view.graph_bytes = second.bytes;
+    launch_view.graph_source = static_cast<uint32_t>(GraphSectionSource::RestoredSlot);
+    set_platform_entry_args(0, launch_view);
+    ASSERT_EQ(hbg::restore_kernel_graph(&runtime), 0);
+    EXPECT_EQ(runtime.dev.host_total_tasks, build.total_tasks);
+    EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::RestoredSlot);
+    const auto reader = graph_image_view_for_reader(runtime);
+    EXPECT_EQ(reader.section, reinterpret_cast<const std::byte *>(registration.destinations[2].address));
+    EXPECT_GT(reader.bytes, 0U);
+    ASSERT_EQ(hbg::retire_kernel_graph(&runtime, 0), 0);
+    ASSERT_EQ(simpler_aicpu_l1_hbg_revoke_callable(&live), 0);
+    EXPECT_NE(hbg::restore_kernel_graph(&runtime), 0);
+    ASSERT_EQ(simpler_aicpu_l1_hbg_register_callable(&live), 0);
+    set_platform_entry_args(0, {});
+    EXPECT_EQ(
+        hbg::validate_graph_packet(second.storage.data(), second.bytes, hbg::GraphPacketAddress::DeviceCopy),
+        hbg::GraphPacketStatus::InvalidHeader
+    );
+    ASSERT_EQ(
+        prepare_packet_for_test(
+            second.storage.data(), second.bytes, 0, 123, trusted, prepared, {}, hbg::GraphPacketAddress::RelativeLaunch
+        ),
+        hbg::GraphExecutionStatus::Ok
+    );
+    ASSERT_EQ(
+        hbg::retire_graph_execution(registry, prepared.generation, {hbg::GraphExecutionRetirement::Completed}),
+        hbg::GraphExecutionStatus::Ok
+    );
+    EXPECT_EQ(
+        prepare_packet_for_test(second.storage.data(), second.bytes, 0, 123, trusted, prepared),
+        hbg::GraphExecutionStatus::Rejected
+    );
+    ASSERT_EQ(
+        prepare_packet_for_test(first.storage.data(), first.bytes, 0, 123, trusted, prepared),
+        hbg::GraphExecutionStatus::Ok
+    );
+    ASSERT_NE(prepared.runtime, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(prepared.runtime), registration.destinations[1].address + layout.off_runtime);
+    EXPECT_EQ(prepared.total_tasks, static_cast<uint32_t>(build.total_tasks));
+    EXPECT_EQ(
+        prepare_packet_for_test(first.storage.data(), first.bytes, 0, 123, trusted, prepared),
+        hbg::GraphExecutionStatus::Busy
+    );
+    const uint64_t first_generation = prepared.generation;
+    prepared.runtime->total_cycles = 765;
+    std::memset(reinterpret_cast<void *>(registration.destinations[0].address), 0x55, build.heap_bytes);
+    ASSERT_EQ(
+        hbg::retire_graph_execution(registry, first_generation, {hbg::GraphExecutionRetirement::Completed}),
+        hbg::GraphExecutionStatus::Ok
+    );
+    ASSERT_EQ(
+        prepare_packet_for_test(first.storage.data(), first.bytes, 0, 123, trusted, prepared),
+        hbg::GraphExecutionStatus::Ok
+    );
+    EXPECT_GT(prepared.generation, first_generation);
+    EXPECT_EQ(prepared.runtime->total_cycles, 0);
+    EXPECT_EQ(*reinterpret_cast<const uint8_t *>(registration.destinations[0].address), 0U);
+    ASSERT_EQ(
+        hbg::retire_graph_execution(registry, prepared.generation, {hbg::GraphExecutionRetirement::Completed}),
+        hbg::GraphExecutionStatus::Ok
+    );
+    // A valid checksum does not confer callable authority on a stale capture.
+    const uint64_t attempt = registry->execution.attempt;
+    auto stale = trusted;
+    ++stale.generation;
+    EXPECT_EQ(
+        prepare_packet_for_test(first.storage.data(), first.bytes, 0, 123, stale, prepared),
+        hbg::GraphExecutionStatus::Rejected
+    );
+    EXPECT_EQ(registry->execution.attempt, attempt);
+    hbg::GraphExecutionPreparationOps copy_failure{};
+    copy_failure.copy = [](void *, void *, const void *, size_t) {
+        return false;
+    };
+    EXPECT_EQ(
+        prepare_packet_for_test(first.storage.data(), first.bytes, 0, 123, trusted, prepared, copy_failure),
+        hbg::GraphExecutionStatus::CopyFailed
+    );
+    EXPECT_EQ(
+        prepare_packet_for_test(first.storage.data(), first.bytes, 0, 123, trusted, prepared),
+        hbg::GraphExecutionStatus::Quarantined
+    );
+    ASSERT_EQ(
+        hbg::retire_graph_execution(
+            registry, registry->execution.attempt, {hbg::GraphExecutionRetirement::ControlledFailure}
+        ),
+        hbg::GraphExecutionStatus::Ok
+    );
+    ASSERT_EQ(
+        prepare_packet_for_test(first.storage.data(), first.bytes, 0, 123, trusted, prepared),
+        hbg::GraphExecutionStatus::Ok
+    );
+    EXPECT_EQ(
+        hbg::retire_graph_execution(registry, prepared.generation, {hbg::GraphExecutionRetirement::FatalFailure, -1}),
+        hbg::GraphExecutionStatus::Poisoned
+    );
+    EXPECT_EQ(
+        prepare_packet_for_test(first.storage.data(), first.bytes, 0, 123, trusted, prepared),
+        hbg::GraphExecutionStatus::Poisoned
+    );
+    const uint64_t measured = requirements.runtime_arena_bytes;
+    EXPECT_EQ(
+        hbg::measure_graph_resources(build, layout, hbg::RuntimeArchitecture::A2A3, UINT64_MAX, requirements),
+        runtime_status_from_error_code(SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED)
+    );
+    EXPECT_EQ(requirements.runtime_arena_bytes, measured);
+    EXPECT_EQ(fake_.device_malloc_count, 0);
+    EXPECT_EQ(fake_.copy_count, 0);
+    EXPECT_EQ(
+        hbg::build_graph(&runtime, &api_, access, &context, sm_bytes, capacity, &eps_, args, build),
+        PTO_RUNTIME_ERR_INVALID_STATE
+    );
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    GraphPreparePopulation, HbgGraphPrepareCapacityTest,
+    ::testing::Values(uint64_t{0}, uint64_t{16384}, uint64_t{16385}, uint64_t{32768})
+);
+
+TEST_F(HbgBindLedgerTest, TemplateClearsStaleDefinitionIdentityFromRetainedMirror) {
+    Runtime runtime;
+    init_runtime(runtime);
+    RuntimeContext context{};
+    HostTensorAccessor access;
+    constexpr uint64_t capacity = 16;
+    const uint64_t sm_bytes = SharedMemoryHandle::calculate_size(capacity);
+    eps_ = {mixed_orch_entry, capture_orch_bind};
+    ChipTaskArgs args;
+    hbg::GraphBuild build;
+    ASSERT_GT(hbg::build_graph(&runtime, &api_, access, &context, sm_bytes, capacity, &eps_, args, build), 0);
+    ASSERT_EQ(build.total_tasks, 1);
+
+    const auto mirror_offsets = sm_layout::segment_offsets(build.task_capacity);
+    auto *mirror_tasks =
+        reinterpret_cast<ChipTaskStorage *>(static_cast<std::byte *>(build.sm_mirror) + mirror_offsets.storage);
+    ASSERT_EQ(mirror_tasks[0].slot.task_kind, TaskKind::KERNEL);
+    // The platform retains this mirror across binds; a previous Graph bind can
+    // leave its Definition offset in a slot this build reuses as an ordinary task.
+    mirror_tasks[0].task.graph_definition_offset = 0x1234;
+
+    DeviceArena arena;
+    const RuntimeArenaLayout layout = runtime_reserve_layout(arena, capacity);
+    hbg::GraphResourceRequirements requirements;
+    ASSERT_EQ(hbg::measure_graph_resources(build, layout, hbg::RuntimeArchitecture::A2A3, 0, requirements), 0);
+    alignas(1024) hbg::GraphSlotRegistry registry{};
+    hbg::GraphSlotRegistration registration{};
+    registration.magic = hbg::GRAPH_SLOT_MAGIC;
+    registration.version = hbg::GRAPH_SLOT_VERSION;
+    registration.bytes = sizeof(registration);
+    registration.flags = hbg::GRAPH_SLOT_FROZEN_SERIAL;
+    registration.device_id = 0;
+    registration.slot_generation = 7;
+    registration.runtime_binary_id = 123;
+    registration.destinations[0] = {0x100000, requirements.gm_heap_bytes};
+    registration.destinations[1] = {0x200000, requirements.runtime_arena_bytes};
+    registration.destinations[2] = requirements.graph_definition_bytes == 0 ?
+                                       hbg::GraphDestination{0, 0} :
+                                       hbg::GraphDestination{0x300000, requirements.graph_definition_bytes};
+    registration.registry = {reinterpret_cast<uintptr_t>(&registry), sizeof(registry)};
+    ASSERT_TRUE(hbg::calculate_graph_slot_packet_capacity(registration.destinations, registration.max_packet_bytes));
+    registration.checksum = hbg::calculate_graph_slot_registration_checksum(registration);
+    ASSERT_TRUE(hbg::is_valid_graph_slot_registration(registration));
+
+    const hbg::GraphInvocationIdentity identity{0, 0, 0, 19, 11, 12, 13};
+    hbg::GraphLaunchTemplate snapshot;
+    ASSERT_EQ(hbg::make_graph_launch_template(build, context, registration, identity, snapshot), 0);
+    hbg::ParsedGraphPacket parsed;
+    ASSERT_EQ(
+        hbg::parse_graph_packet(snapshot.data(), snapshot.size(), hbg::GraphPacketAddress::HostTemplate, parsed),
+        hbg::GraphPacketStatus::Ok
+    );
+    ASSERT_EQ(parsed.graph.region_count, 1U);
+    const uint64_t copied_begin = parsed.regions[1].destination_offset;
+    ASSERT_GE(parsed.graph.sm_offset, copied_begin);
+    const auto task_offsets = sm_layout::segment_offsets(
+        sm_layout::image_extents({static_cast<uint64_t>(parsed.graph.total_tasks), 0, 0, 0})
+    );
+    const auto *image_tasks = reinterpret_cast<const ChipTaskStorage *>(
+        parsed.payload + (parsed.graph.sm_offset - copied_begin) + task_offsets.storage
+    );
+    EXPECT_EQ(image_tasks[0].slot.task_kind, TaskKind::KERNEL);
+    EXPECT_EQ(image_tasks[0].task.graph_definition_offset, 0U);
 }

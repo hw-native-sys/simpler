@@ -363,14 +363,8 @@ void ChipWorker::init(
         // resolve unconditionally and never half-load. The versioned
         // registration entries below are optional on purpose.
         //
-        // simpler_kernel_mode_supported does not answer which runtime has a
-        // kernel backend: it answers whether kernel-mode launches are
-        // available, and stays zero while simpler_kernel_mode_launch is a
-        // rejecting stub — so it is zero on a runtime that can already
-        // establish a kernel context. The runtime-capability question is
-        // answered by simpler_kernel_mode_init, which refuses with
-        // PTO_RUNTIME_ERR_UNSUPPORTED and establishes nothing when its runtime
-        // cannot size kernel resources. Neither gates symbol resolution.
+        // Dedicated launch support is separate from borrowed context init and
+        // native eager support; all builds export the common entry family.
         ensure_acl_ready_fn_ = module->required<EnsureAclReadyFn>("ensure_acl_ready_ctx");
         create_comm_stream_fn_ = module->required<CreateCommStreamFn>("create_comm_stream_ctx");
         destroy_comm_stream_fn_ = module->required<DestroyCommStreamFn>("destroy_comm_stream_ctx");
@@ -608,6 +602,9 @@ void ChipWorker::init(
     kernel_init_fn_ = kernel_init_fn;
     kernel_prepare_callable_fn_ = kernel_prepare_callable_fn;
     kernel_launch_fn_ = kernel_launch_fn;
+    kernel_retain_graph_fn_ = module->optional<decltype(kernel_retain_graph_fn_)>("simpler_kernel_mode_retain_graph");
+    kernel_release_graph_fn_ =
+        module->optional<decltype(kernel_release_graph_fn_)>("simpler_kernel_mode_release_graph");
     device_id_ = device_id;
     // Published only once the runtime is up: the rollback paths above leave the
     // default K=1 contract in place, so a failed init never reports the counts
@@ -814,12 +811,35 @@ void ChipWorker::clear_runtime_binding() {
     kernel_init_fn_ = nullptr;
     kernel_prepare_callable_fn_ = nullptr;
     kernel_launch_fn_ = nullptr;
+    kernel_retain_graph_fn_ = nullptr;
+    kernel_release_graph_fn_ = nullptr;
     runtime_bufs_.clear();
     runtime_module_.reset();
     pipeline_generations_.reset();
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
     initialized_ = false;
     device_id_ = -1;
+}
+
+void ChipWorker::kernel_launch(int32_t id, const ChipStorageTaskArgs *args, void *stream) {
+    if (!initialized_ || kernel_launch_fn_ == nullptr)
+        throw std::runtime_error("kernel launch requires an initialized worker");
+    const int rc = kernel_launch_fn_(device_ctx_, id, args, stream);
+    if (rc != 0) throw std::runtime_error("kernel launch failed with code " + std::to_string(rc));
+}
+uint64_t ChipWorker::retain_kernel_graph() {
+    if (!initialized_ || kernel_retain_graph_fn_ == nullptr)
+        throw std::runtime_error("kernel graph lifetime unsupported");
+    uint64_t lease = 0;
+    const int rc = kernel_retain_graph_fn_(device_ctx_, &lease);
+    if (rc != 0) throw std::runtime_error("retain kernel graph failed with code " + std::to_string(rc));
+    return lease;
+}
+void ChipWorker::release_kernel_graph(uint64_t lease) {
+    if (!initialized_ || kernel_release_graph_fn_ == nullptr)
+        throw std::runtime_error("kernel graph lifetime unsupported");
+    const int rc = kernel_release_graph_fn_(device_ctx_, lease);
+    if (rc != 0) throw std::runtime_error("release kernel graph failed with code " + std::to_string(rc));
 }
 
 int32_t ChipWorker::register_callable(const void *callable, size_t callable_size) {

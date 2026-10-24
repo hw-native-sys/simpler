@@ -16,7 +16,8 @@
 #include <cstdint>
 #include <mutex>
 
-#include "runtime_c_api.h"
+#include "worker/runtime_c_api.h"
+#include "host/kernel_device_resources.h"
 
 /**
  * The stream and event operations this state machine performs.
@@ -63,8 +64,9 @@ enum class KernelContextPhase : uint8_t {
 };
 
 /**
- * The two streams a context creates and owns. Only Aicore is hidden in the
- * capture sense; Aicpu is a dedicated private stream. Neither is the caller's.
+ * The two streams a context creates and owns. Both are private streams;
+ * neither is the caller's. Stream creation alone does not establish capture
+ * support or a captured-graph resource lease.
  */
 enum class KernelStreamKind : uint8_t {
     Aicpu = 0,
@@ -73,9 +75,9 @@ enum class KernelStreamKind : uint8_t {
 };
 
 /**
- * One event per edge of the chained caller ↔ aicpu ↔ aicore synchronization,
- * plus the call tail. Caller and aicore are never adjacent, so no event joins
- * them directly.
+ * Reserved context events for chained caller ↔ aicpu ↔ aicore synchronization,
+ * plus the call tail. Native eager ordering uses the separate per-slot
+ * RunCallerOrder / RunCompletionFence event owners, not these handles.
  *
  * AicoreStart is recorded on the aicpu stream *before* the AICPU launch: the
  * AICPU orchestrator spins on AICore's handshake report, so an AicoreStart
@@ -101,15 +103,20 @@ enum class KernelEventKind : uint8_t {
 /**
  * Context-lifetime state for the borrowed kernel execution mode.
  *
- * This object owns the dedicated AICPU stream, hidden AICore stream and event set; every
- * graph-visible persistent execution resource belongs here rather than in a
- * per-invocation object. The caller stream is never stored or destroyed —
- * each launch receives it as a borrowed argument.
+ * This object owns the dedicated AICPU/AICore streams and reserved event set.
+ * A5 native eager runs borrow this stream pair; A2/A3 runs borrow a separate
+ * RunStreamPair. Neither run bindings nor per-slot event owners destroy this
+ * object's streams. The caller stream is never stored or destroyed here.
+ * The owner must prove all users quiescent before close(); phase and poison
+ * state alone are not completion proofs.
  *
  * Phase machine:
  *   New → (initialize) → Collecting → ReadyEnqueued
  *   Collecting/ReadyEnqueued → (poison, on partial-enqueue failure) → Poisoned
  *   Collecting/ReadyEnqueued/Poisoned → (close) → Closing → Closed
+ * Resource preparation starts in Collecting; prepared resources must be frozen
+ * before mark_ready_enqueued(). accepts_launch() is the sole launch predicate;
+ * accepts_dispatch() covers preparation work and is not launch admission.
  * Initializing is held only inside initialize()'s critical section and the
  * lock is released with the phase already past it, so no caller observes it;
  * close()'s rejection of it is defensive. The stream and event sets are the
@@ -142,7 +149,31 @@ public:
     KernelExecutionState(const KernelExecutionState &) = delete;
     KernelExecutionState &operator=(const KernelExecutionState &) = delete;
 
-    int initialize(int requested_device_id, const KernelContextOps &ops);
+    // Adopts the caller's current device/context. context_generation is the
+    // nonzero caller identity checked by all later resource bindings.
+    int initialize(int requested_device_id, const KernelContextOps &ops, uint64_t context_generation = 1);
+    // First preparation is allowed only in Collecting. Repeats are idempotent
+    // checks in Collecting/ReadyEnqueued: schema, arena kinds and offsets must
+    // match, regions may not grow, and the returned views follow the requested
+    // sizes. A failed rollback moves the context to Closing.
+    int prepare_resources(const KernelResourceLayout &layout, const KernelResourceOps &ops);
+    // Freezes the prepared allocation capacity. A context with prepared
+    // resources must freeze before mark_ready_enqueued().
+    int freeze_resources();
+    // Copies the frozen views for registration preparation. Allowed while
+    // Collecting or ReadyEnqueued; out owns its snapshot.
+    int inspect_frozen_resources(
+        int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+        KernelResourceBinding &out
+    ) const;
+    // Copies the frozen views for a launch. Requires accepts_launch(); out owns
+    // its snapshot, but the addresses are valid only while resources are live.
+    int bind_resources_for_launch(
+        int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+        KernelResourceBinding &out
+    ) const;
+    bool resources_prepared() const;
+    bool resources_frozen() const;
     /**
      * Check the caller's current device and RTS context without rebinding.
      * Before adoption there is nothing to validate. The borrowed identity
@@ -150,12 +181,24 @@ public:
      * after this object's streams and events have been released.
      */
     int validate_current_context() const;
+    // Enters the launch-ready phase. Idempotent in ReadyEnqueued. If resources
+    // have been prepared, they must already be frozen.
     int mark_ready_enqueued();
+    // Admission for preparation work (for example callable publication), open
+    // in Collecting and ReadyEnqueued. This is not the launch predicate.
+    bool accepts_dispatch() const;
+    // Launch predicate: ReadyEnqueued, with prepared resources frozen. A
+    // context that never prepared resources may launch without a binding.
+    bool accepts_launch() const;
     void poison(int runtime_error);
+    // Stops admission without releasing handles needed by runtime-specific cleanup.
+    // Idempotent in Closing/Closed; close() completes resource release.
+    int begin_close();
+    // Releases resources, then streams/events. A failed release stays Closing
+    // for an explicit retry; the destructor performs no runtime calls.
     int close();
 
     KernelContextPhase phase() const;
-    bool accepts_dispatch() const;
     int device_id() const;
     int last_runtime_error() const;
     int unexpected_teardown_error() const;
@@ -167,10 +210,13 @@ private:
     int validate_current_context_locked() const;
     int cleanup_owned_resources_locked();
     bool has_live_resources_locked() const;
+    bool accepts_launch_locked() const;
 
     mutable std::mutex mutex_;
     KernelContextPhase phase_{KernelContextPhase::New};
     int device_id_{-1};
+    uint64_t context_generation_{0};
+    KernelDeviceResources resources_;
     void *borrowed_context_{nullptr};
     int last_runtime_error_{0};
     int unexpected_teardown_error_{0};

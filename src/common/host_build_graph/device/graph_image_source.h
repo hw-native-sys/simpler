@@ -41,7 +41,13 @@ inline GraphImageView graph_image_view_for_reader(const Runtime &runtime) {
     const uint32_t bytes = runtime.get_graph_section_bytes();
     if (source == GraphSectionSource::None || bytes == 0) return view;
 
-    if (source == GraphSectionSource::HostSnapshot) {
+    if (source == GraphSectionSource::RestoredSlot) {
+        const auto args = get_platform_entry_args(platform_aicpu_affinity_thread_idx());
+        if (args.source != static_cast<uint32_t>(EntryArgsSource::HbgKernelInvocation) ||
+            args.graph_source != static_cast<uint32_t>(GraphSectionSource::RestoredSlot))
+            return view;
+    }
+    if (source == GraphSectionSource::HostSnapshot || source == GraphSectionSource::RestoredSlot) {
         const uint64_t base = runtime.get_graph_section_base();
         if (base == 0) return view;
         view.section = reinterpret_cast<const std::byte *>(base);

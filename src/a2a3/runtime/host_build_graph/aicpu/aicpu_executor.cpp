@@ -19,6 +19,7 @@
 #include "aicpu/device_run_result_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "runtime.h"
+#include "host_build_graph/kernel_graph_execution_entry.h"
 #include "spin_hint.h"
 
 // Runtime headers (full struct definition for create/destroy + SIMPLER_SCOPE)
@@ -233,6 +234,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     // cores like every other thread — host_build_graph has no device-side
     // orchestrator, so there is no orch/sched split.
     if (thread_idx == aicpu_thread_num_ - 1) {
+        const int restore_status = hbg::restore_kernel_graph(runtime);
         void *prebuilt_arena = runtime->get_prebuilt_arena_base();
         size_t off_runtime = runtime->get_prebuilt_runtime_offset();
 
@@ -246,9 +248,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // leave rt null so the dispatch block below skips, and still publish
         // runtime_init_ready_ (single point at the block's end) so the peer
         // threads stop spinning.
-        bool boot_ok = (prebuilt_arena != nullptr);
+        bool boot_ok = (restore_status == 0 && prebuilt_arena != nullptr);
         if (!boot_ok) {
-            LOG_ERROR("Thread %d: host-orch: prebuilt_arena_base is null", thread_idx);
+            LOG_ERROR(
+                "Thread %d: graph boot rejected: restore_status=%d arena=%p", thread_idx, restore_status, prebuilt_arena
+            );
             rt = nullptr;
             run_rc = -1;
         }
@@ -536,6 +540,8 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
+        const int restore_retirement = hbg::retire_kernel_graph(runtime, runtime_rc != 0 ? runtime_rc : rc);
+        if (restore_retirement != 0 && runtime_rc == 0) runtime_rc = restore_retirement;
         g_aicpu_executor.publish_run_terminal();
     }
 

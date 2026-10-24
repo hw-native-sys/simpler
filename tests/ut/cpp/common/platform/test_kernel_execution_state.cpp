@@ -11,10 +11,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
+#include <vector>
 
 #include "host/execution_mode_latch.h"
 #include "host/kernel_execution_state.h"
+#include "host/kernel_launch_binder.h"
 
 namespace {
 
@@ -37,6 +41,8 @@ struct FakeContextOps {
     int events_created{0};
     int events_destroyed{0};
     uintptr_t next_handle{1};
+    void *destroy_failure_handle{nullptr};
+    std::vector<void *> destroyed_handles;
     static FakeContextOps *self(void *context) { return static_cast<FakeContextOps *>(context); }
 
     static int get_current_device(void *context, int *device_id) noexcept {
@@ -58,13 +64,18 @@ struct FakeContextOps {
         *stream = reinterpret_cast<void *>(ops->next_handle++);
         return 0;
     }
-    static int destroy_hidden_stream(void *context, void *) noexcept {
+    static int destroy_hidden_stream(void *context, void *handle) noexcept {
         auto *ops = self(context);
+        if (handle == ops->destroy_failure_handle) {
+            ops->destroy_failure_handle = nullptr;
+            return -43;
+        }
         if (ops->destroy_failures_remaining > 0) {
             ops->destroy_failures_remaining--;
             return -43;
         }
         ops->streams_destroyed++;
+        ops->destroyed_handles.push_back(handle);
         return 0;
     }
     static int create_event(void *context, void **event) noexcept {
@@ -74,13 +85,18 @@ struct FakeContextOps {
         *event = reinterpret_cast<void *>(ops->next_handle++);
         return 0;
     }
-    static int destroy_event(void *context, void *) noexcept {
+    static int destroy_event(void *context, void *handle) noexcept {
         auto *ops = self(context);
+        if (handle == ops->destroy_failure_handle) {
+            ops->destroy_failure_handle = nullptr;
+            return -43;
+        }
         if (ops->destroy_failures_remaining > 0) {
             ops->destroy_failures_remaining--;
             return -43;
         }
         ops->events_destroyed++;
+        ops->destroyed_handles.push_back(handle);
         return 0;
     }
 
@@ -94,6 +110,34 @@ struct FakeContextOps {
 
 constexpr size_t kStreamCount = static_cast<size_t>(KernelStreamKind::Count);
 constexpr size_t kEventCount = static_cast<size_t>(KernelEventKind::Count);
+
+TEST(KernelExecutionState, BeginCloseStopsAdmissionButPreservesCleanupHandles) {
+    FakeContextOps fake;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    ASSERT_EQ(state.mark_ready_enqueued(), 0);
+    fake.current_device = 4;
+    EXPECT_EQ(state.begin_close(), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_TRUE(state.accepts_dispatch());
+    fake.current_device = 3;
+    ASSERT_EQ(state.begin_close(), 0);
+    EXPECT_EQ(state.begin_close(), 0);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closing);
+    EXPECT_FALSE(state.accepts_dispatch());
+    EXPECT_FALSE(state.accepts_launch());
+    EXPECT_EQ(state.mark_ready_enqueued(), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_TRUE(state.has_live_resources());
+    EXPECT_EQ(fake.events_destroyed, 0);
+    EXPECT_EQ(fake.streams_destroyed, 0);
+    EXPECT_EQ(state.last_runtime_error(), 0);
+    fake.destroy_failures_remaining = 1;
+    EXPECT_EQ(state.close(), -43);
+    EXPECT_EQ(state.begin_close(), 0);
+    EXPECT_EQ(state.close(), 0);
+    EXPECT_FALSE(state.has_live_resources());
+    EXPECT_EQ(state.begin_close(), 0);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closed);
+}
 
 TEST(KernelExecutionState, NoBorrowedIdentityNeedsNoCallerContext) {
     KernelExecutionState state;
@@ -202,6 +246,45 @@ TEST_P(KernelContextCreationFailure, EveryCreationPointRollsBackAndCanRetry) {
 
 INSTANTIATE_TEST_SUITE_P(
     AllStreamsAndEvents, KernelContextCreationFailure, ::testing::Range(0, static_cast<int>(kStreamCount + kEventCount))
+);
+
+class KernelContextCloseFailure : public ::testing::TestWithParam<int> {};
+
+TEST_P(KernelContextCloseFailure, OnlyTheFailedHandleSurvivesAndIsDestroyedOnceOnRetry) {
+    FakeContextOps fake;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    std::vector<void *> handles;
+    for (size_t i = 0; i < kStreamCount; ++i)
+        handles.push_back(state.hidden_stream(static_cast<KernelStreamKind>(i)));
+    for (size_t i = 0; i < kEventCount; ++i)
+        handles.push_back(state.event(static_cast<KernelEventKind>(i)));
+    void *failed = handles.at(GetParam());
+    fake.destroy_failure_handle = failed;
+    EXPECT_EQ(state.close(), -43);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closing);
+    EXPECT_FALSE(state.accepts_dispatch());
+    ASSERT_EQ(fake.destroyed_handles.size(), handles.size() - 1);
+    for (size_t i = 0; i < handles.size(); ++i) {
+        void *remaining = i < kStreamCount ? state.hidden_stream(static_cast<KernelStreamKind>(i)) :
+                                             state.event(static_cast<KernelEventKind>(i - kStreamCount));
+        EXPECT_EQ(remaining, handles[i] == failed ? failed : nullptr);
+    }
+    fake.current_context = reinterpret_cast<void *>(0x2000);
+    EXPECT_EQ(state.close(), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(fake.destroyed_handles.size(), handles.size() - 1);
+    fake.current_context = reinterpret_cast<void *>(0x1000);
+    EXPECT_EQ(state.close(), 0);
+    EXPECT_FALSE(state.has_live_resources());
+    EXPECT_EQ(state.close(), 0);
+    ASSERT_EQ(fake.destroyed_handles.size(), handles.size());
+    for (void *handle : handles) {
+        EXPECT_EQ(std::count(fake.destroyed_handles.begin(), fake.destroyed_handles.end(), handle), 1);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllStreamsAndEvents, KernelContextCloseFailure, ::testing::Range(0, static_cast<int>(kStreamCount + kEventCount))
 );
 
 TEST(KernelExecutionState, DestructionWithoutCloseMakesNoRuntimeCalls) {
@@ -390,6 +473,7 @@ TEST(KernelExecutionState, ReadyEnqueuedKeepsAdmissionOpen) {
     EXPECT_EQ(state.phase(), KernelContextPhase::ReadyEnqueued);
     EXPECT_EQ(state.mark_ready_enqueued(), 0);  // append admission stays open
     EXPECT_TRUE(state.accepts_dispatch());
+    EXPECT_TRUE(state.accepts_launch());  // no prepared resources to freeze
 }
 
 TEST(KernelExecutionState, MarkReadyEnqueuedRejectedOffPath) {
@@ -509,6 +593,335 @@ TEST(KernelExecutionState, TeardownErrorSlotIsSeparateFromRuntimeError) {
     EXPECT_EQ(state.close(), 0);
     // The first teardown failure stays latched after a successful retry.
     EXPECT_EQ(state.unexpected_teardown_error(), -43);
+}
+
+struct FakeResourceOps {
+    int allocations{0};
+    int releases{0};
+    int release_failures{0};
+    int allocation_failure_at{0};
+
+    KernelResourceOps table() {
+        return {
+            this,
+            [](void *context, size_t bytes) -> void * {
+                auto &fake = *static_cast<FakeResourceOps *>(context);
+                ++fake.allocations;
+                if (fake.allocations == fake.allocation_failure_at) return nullptr;
+                return std::malloc(bytes);
+            },
+            [](void *context, void *ptr) {
+                auto &fake = *static_cast<FakeResourceOps *>(context);
+                if (fake.release_failures > 0) {
+                    --fake.release_failures;
+                    return -71;
+                }
+                ++fake.releases;
+                std::free(ptr);
+                return 0;
+            },
+        };
+    }
+};
+
+KernelResourceLayout resource_layout() {
+    KernelResourceLayout layout;
+    layout.schema = 41;
+    layout.contract.abi_version = PTO_PIPELINE_CONTRACT_ABI_VERSION;
+    layout.contract.pipeline_depth = 1;
+    layout.contract.resource_count = 3;
+    layout.contract.resources[0] = {PTO_PIPELINE_GM_HEAP, PTO_PIPELINE_DEVICE_SCRATCH, 4096};
+    layout.contract.resources[1] = {PTO_PIPELINE_AICPU_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
+    layout.contract.resources[2] = {PTO_PIPELINE_AICORE_STREAM, PTO_PIPELINE_EXEC_HANDLE, 0};
+    layout.regions = {{PTO_PIPELINE_GM_HEAP, 0, 4096}};
+    return layout;
+}
+
+TEST(KernelExecutionStateResources, InvalidLayoutRejectsBeforeAllocation) {
+    FakeContextOps handles;
+    FakeResourceOps memory;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, handles.table(), 19), 0);
+    auto layout = resource_layout();
+    layout.regions[0].offset = 4096;
+    EXPECT_EQ(state.prepare_resources(layout, memory.table()), PTO_RUNTIME_ERR_INTERNAL);
+    layout = resource_layout();
+    layout.regions.push_back(layout.regions[0]);
+    EXPECT_EQ(state.prepare_resources(layout, memory.table()), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(memory.allocations, 0);
+    EXPECT_EQ(state.close(), 0);
+}
+
+TEST(KernelExecutionStateResources, FrozenCapacityCannotGrowOrChangeSchemaAndReusesOriginalAddress) {
+    FakeContextOps handles;
+    FakeResourceOps memory;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, handles.table(), 19), 0);
+    ASSERT_EQ(state.prepare_resources(resource_layout(), memory.table()), 0);
+    ASSERT_EQ(state.freeze_resources(), 0);
+    auto layout = resource_layout();
+    ++layout.schema;
+    EXPECT_EQ(state.prepare_resources(layout, memory.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    layout = resource_layout();
+    layout.regions[0].bytes += 1;
+    layout.contract.resources[0].bytes_per_copy += 1;
+    EXPECT_EQ(state.prepare_resources(layout, memory.table()), PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE);
+    EXPECT_EQ(state.prepare_resources(resource_layout(), memory.table()), 0);
+    EXPECT_EQ(memory.allocations, 1);
+    EXPECT_EQ(state.close(), 0);
+}
+
+TEST(KernelExecutionStateResources, RepeatedPrepareRejectsChangedRegionOffset) {
+    FakeContextOps handles;
+    FakeResourceOps memory;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, handles.table(), 19), 0);
+    auto layout = resource_layout();
+    layout.contract.resources[0].bytes_per_copy = 8192;
+    ASSERT_EQ(state.prepare_resources(layout, memory.table()), 0);
+    ASSERT_EQ(state.freeze_resources(), 0);
+    layout.regions[0].offset = 1024;
+    EXPECT_EQ(state.prepare_resources(layout, memory.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(memory.allocations, 1);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Collecting);
+    EXPECT_EQ(state.close(), 0);
+}
+
+TEST(KernelExecutionStateResources, PartialAllocationFailureWithFailedRollbackRetainsBothResourceOwners) {
+    FakeContextOps handles;
+    FakeResourceOps memory;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, handles.table(), 19), 0);
+    auto layout = resource_layout();
+    layout.contract.resource_count = 4;
+    layout.contract.resources[3] = {PTO_PIPELINE_GM_SM, PTO_PIPELINE_DEVICE_SCRATCH, 4096};
+    layout.regions.push_back({PTO_PIPELINE_GM_SM, 0, 4096});
+    memory.allocation_failure_at = 2;
+    memory.release_failures = 1;
+    EXPECT_EQ(state.prepare_resources(layout, memory.table()), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closing);
+    EXPECT_EQ(state.unexpected_teardown_error(), -71);
+    EXPECT_EQ(memory.releases, 0);
+    EXPECT_EQ(handles.streams_destroyed, 0);
+    EXPECT_EQ(handles.events_destroyed, 0);
+    EXPECT_TRUE(state.has_live_resources());
+    EXPECT_EQ(state.close(), 0);
+    EXPECT_EQ(memory.releases, 1);
+    EXPECT_EQ(handles.streams_destroyed, 2);
+    EXPECT_EQ(handles.events_destroyed, 5);
+}
+
+TEST(KernelExecutionStateResources, ZeroGenerationIsRejectedBeforeCreatingHandles) {
+    FakeContextOps handles;
+    KernelExecutionState state;
+    EXPECT_EQ(state.initialize(3, handles.table(), 0), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(state.phase(), KernelContextPhase::New);
+    EXPECT_EQ(handles.streams_created, 0);
+    EXPECT_EQ(handles.events_created, 0);
+}
+
+TEST(KernelExecutionStateResources, FrozenBindingChecksGenerationAndPreservesAddressAfterRefusal) {
+    FakeContextOps handles;
+    FakeResourceOps memory;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, handles.table(), 19), 0);
+    ASSERT_EQ(state.prepare_resources(resource_layout(), memory.table()), 0);
+    ASSERT_TRUE(state.resources_prepared());
+    ASSERT_EQ(state.freeze_resources(), 0);
+    ASSERT_TRUE(state.resources_frozen());
+    const uint64_t required[] = {4096};
+    KernelResourceBinding binding;
+    EXPECT_EQ(state.bind_resources_for_launch(3, 19, 41, required, 1, binding), PTO_RUNTIME_ERR_INVALID_STATE);
+    ASSERT_EQ(state.inspect_frozen_resources(3, 19, 41, required, 1, binding), 0);
+    const auto address = binding.regions[0].address;
+    ASSERT_NE(address, 0u);
+    ASSERT_EQ(state.mark_ready_enqueued(), 0);
+    EXPECT_EQ(state.bind_resources_for_launch(3, 18, 41, required, 1, binding), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(state.bind_resources_for_launch(4, 19, 41, required, 1, binding), PTO_RUNTIME_ERR_INVALID_STATE);
+    const uint64_t too_large[] = {4097};
+    EXPECT_EQ(state.bind_resources_for_launch(3, 19, 41, too_large, 1, binding), PTO_RUNTIME_ERR_PREPARED_INCOMPATIBLE);
+    ASSERT_EQ(state.bind_resources_for_launch(3, 19, 41, required, 1, binding), 0);
+    EXPECT_EQ(binding.regions[0].address, address);
+    EXPECT_EQ(memory.allocations, 1);
+    EXPECT_EQ(memory.releases, 0);
+    ASSERT_EQ(state.close(), 0);
+    EXPECT_EQ(memory.releases, 1);
+    // The binding owns its snapshot, so closing the state cannot dangle it.
+    EXPECT_EQ(binding.regions.size(), 1U);
+    EXPECT_EQ(binding.regions[0].address, address);
+}
+
+TEST(KernelExecutionStateResources, MemoryCloseFailureKeepsHandlesForRetry) {
+    FakeContextOps handles;
+    FakeResourceOps memory;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, handles.table(), 19), 0);
+    ASSERT_EQ(state.prepare_resources(resource_layout(), memory.table()), 0);
+    memory.release_failures = 1;
+    EXPECT_EQ(state.close(), -71);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closing);
+    EXPECT_TRUE(state.has_live_resources());
+    EXPECT_EQ(state.unexpected_teardown_error(), -71);
+    EXPECT_EQ(handles.streams_destroyed, 0);
+    EXPECT_EQ(handles.events_destroyed, 0);
+    EXPECT_EQ(state.prepare_resources(resource_layout(), memory.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    ASSERT_EQ(state.close(), 0);
+    EXPECT_EQ(memory.releases, 1);
+    EXPECT_EQ(handles.streams_destroyed, handles.streams_created);
+    EXPECT_EQ(handles.events_destroyed, handles.events_created);
+    EXPECT_FALSE(state.has_live_resources());
+}
+
+TEST(KernelExecutionStateResources, RepeatedPrepareFollowsRequestedRegionSizes) {
+    FakeContextOps handles;
+    FakeResourceOps memory;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, handles.table(), 19), 0);
+    auto layout = resource_layout();
+    ASSERT_EQ(state.prepare_resources(layout, memory.table()), 0);
+    ASSERT_EQ(state.freeze_resources(), 0);
+    const uint64_t full[] = {4096};
+    KernelResourceBinding binding;
+    ASSERT_EQ(state.inspect_frozen_resources(3, 19, 41, full, 1, binding), 0);
+    const auto address = binding.regions[0].address;
+    ASSERT_NE(address, 0u);
+    EXPECT_EQ(binding.regions[0].capacity, 4096U);
+
+    layout.regions[0].bytes = 2048;
+    ASSERT_EQ(state.prepare_resources(layout, memory.table()), 0);
+    const uint64_t half[] = {2048};
+    ASSERT_EQ(state.inspect_frozen_resources(3, 19, 41, half, 1, binding), 0);
+    EXPECT_EQ(binding.regions[0].address, address);
+    EXPECT_EQ(binding.regions[0].capacity, 2048U);
+
+    layout.regions[0].bytes = 0;
+    ASSERT_EQ(state.prepare_resources(layout, memory.table()), 0);
+    const uint64_t none[] = {0};
+    ASSERT_EQ(state.inspect_frozen_resources(3, 19, 41, none, 1, binding), 0);
+    EXPECT_EQ(binding.regions[0].address, 0U);
+    EXPECT_EQ(binding.regions[0].capacity, 0U);
+
+    layout.regions[0].bytes = 4096;
+    ASSERT_EQ(state.prepare_resources(layout, memory.table()), 0);
+    ASSERT_EQ(state.inspect_frozen_resources(3, 19, 41, full, 1, binding), 0);
+    EXPECT_EQ(binding.regions[0].address, address);
+    EXPECT_EQ(binding.regions[0].capacity, 4096U);
+    EXPECT_EQ(memory.allocations, 1);
+    EXPECT_EQ(memory.releases, 0);
+    ASSERT_EQ(state.close(), 0);
+    EXPECT_EQ(memory.releases, 1);
+}
+
+TEST(KernelExecutionStateResources, LaunchReadinessRequiresReadyAndFrozenResources) {
+    FakeContextOps handles;
+    FakeResourceOps memory;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, handles.table(), 19), 0);
+    EXPECT_TRUE(state.accepts_dispatch());
+    EXPECT_FALSE(state.accepts_launch());
+    ASSERT_EQ(state.prepare_resources(resource_layout(), memory.table()), 0);
+    // Prepared but not frozen: mark_ready_enqueued must refuse to make the
+    // context launch-ready.
+    EXPECT_EQ(state.mark_ready_enqueued(), PTO_RUNTIME_ERR_INVALID_STATE);
+    ASSERT_EQ(state.freeze_resources(), 0);
+    EXPECT_FALSE(state.accepts_launch());
+    ASSERT_EQ(state.mark_ready_enqueued(), 0);
+    EXPECT_TRUE(state.accepts_launch());
+    EXPECT_TRUE(state.accepts_dispatch());
+    const uint64_t required[] = {4096};
+    KernelResourceBinding binding;
+    ASSERT_EQ(state.bind_resources_for_launch(3, 19, 41, required, 1, binding), 0);
+    ASSERT_EQ(state.close(), 0);
+}
+
+TEST(KernelExecutionStateResources, FirstPreparationAfterLaunchReadyIsRejected) {
+    FakeContextOps handles;
+    FakeResourceOps memory;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, handles.table(), 19), 0);
+    ASSERT_EQ(state.mark_ready_enqueued(), 0);
+    EXPECT_TRUE(state.accepts_launch());
+    EXPECT_EQ(state.prepare_resources(resource_layout(), memory.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(memory.allocations, 0);
+    ASSERT_EQ(state.close(), 0);
+}
+
+TEST(KernelExecutionStateResources, LaunchBindingAndBinderShareTheReadyState) {
+    namespace kl = simpler::kernel_launch;
+    FakeContextOps handles;
+    FakeResourceOps memory;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, handles.table(), 19), 0);
+    ASSERT_EQ(state.prepare_resources(resource_layout(), memory.table()), 0);
+    ASSERT_EQ(state.freeze_resources(), 0);
+    ASSERT_EQ(state.mark_ready_enqueued(), 0);
+    ASSERT_TRUE(state.accepts_launch());
+    const uint64_t required[] = {4096};
+    KernelResourceBinding binding;
+    ASSERT_EQ(state.bind_resources_for_launch(3, 19, 41, required, 1, binding), 0);
+
+    struct GateState {
+        int finishes{0};
+    } gate_state;
+    kl::KernelLaunchGateOps gate;
+    gate.context = &gate_state;
+    gate.acquire = [](void *, const kl::KernelInvocationBinding &, void *, kl::KernelLaunchAdmission *out) noexcept {
+        out->handles = {
+            nullptr,
+            reinterpret_cast<void *>(1),
+            reinterpret_cast<void *>(2),
+            reinterpret_cast<void *>(3),
+            reinterpret_cast<void *>(4),
+            reinterpret_cast<void *>(5),
+            reinterpret_cast<void *>(6),
+            reinterpret_cast<void *>(7)
+        };
+        out->previous_caller_identity = 0;
+        return 0;
+    };
+    gate.finish = [](void *p, const kl::KernelLaunchResult &result) noexcept {
+        if (result.status == 0) ++static_cast<GateState *>(p)->finishes;
+    };
+    gate.query_tail = [](void *, void *, bool *complete) noexcept {
+        *complete = true;
+        return 0;
+    };
+    kl::KernelLaunchOps ops;
+    ops.wait_event = [](void *, void *, void *) noexcept {
+        return 0;
+    };
+    ops.memset_handshake = [](void *, void *) noexcept {
+        return 0;
+    };
+    ops.record_event = [](void *, void *, void *) noexcept {
+        return 0;
+    };
+    ops.launch_aicpu = [](void *, void *) noexcept {
+        return 0;
+    };
+    ops.launch_aicore = [](void *, void *) noexcept {
+        return 0;
+    };
+    std::vector<uint8_t> packet(1, 0);
+    const auto result =
+        kl::launch_bound_kernel({packet.data(), packet.size(), nullptr, 0}, reinterpret_cast<void *>(100), gate, ops);
+    EXPECT_EQ(result.status, 0);
+    EXPECT_EQ(gate_state.finishes, 1);
+    ASSERT_EQ(state.close(), 0);
+}
+
+TEST(KernelExecutionStateResources, PreparationChecksTheBorrowedCurrentDeviceBeforeAllocating) {
+    FakeContextOps handles;
+    FakeResourceOps memory;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, handles.table(), 19), 0);
+    handles.current_device = 4;
+    EXPECT_EQ(state.prepare_resources(resource_layout(), memory.table()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(memory.allocations, 0);
+    handles.current_device = 3;
+    ASSERT_EQ(state.prepare_resources(resource_layout(), memory.table()), 0);
+    EXPECT_EQ(memory.allocations, 1);
+    EXPECT_EQ(state.close(), 0);
 }
 
 }  // namespace

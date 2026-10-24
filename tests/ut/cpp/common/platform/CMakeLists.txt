@@ -56,8 +56,13 @@ endmacro()
 # Kernel-mode phase machine and restricted-vocabulary tables, table-driven with
 # fake ops: init/close balance, poison, sticky CLOSING with retry, and the
 # separate runtime-error vs teardown-error slots.
+platform_single_case(test_kernel_launch_binder.cpp
+    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_launch_binder.cpp)
+
 platform_single_case(test_kernel_execution_state.cpp
-    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_execution_state.cpp)
+    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_execution_state.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_device_resources.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_launch_binder.cpp)
 
 # The growth coordinator is production: the onboard host runtime links this
 # same translation unit, so the trim, the retry policy and the holder discovery
@@ -847,7 +852,7 @@ set(NATIVE_ADMISSION_INCLUDES
     ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context
     ${SIMPLER_SRC}/common/log
     ${SIMPLER_SRC}/common/worker)
-hbg_case(test_native_admission.cpp
+hbg_case(test_native_admission.cpp TIMEOUT 30
     SOURCES ${NATIVE_ADMISSION_SOURCES}
         ${CMAKE_SOURCE_DIR}/support/native_admission/hbg_preparation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test_native_admission_hbg.cpp
@@ -860,7 +865,31 @@ hbg_case(test_native_admission.cpp
     INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
     DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
-tmr_case(test_native_admission.cpp
+# The a2a3 HBG close implementation owns private per-callable argument state.
+# This target exercises its real C API admission and teardown with CPU transport.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    string(REPLACE "@arch@" "a2a3" HBG_KERNEL_CLOSE_SOURCES "${NATIVE_ADMISSION_SOURCES}")
+    simpler_ut_add_target(NAME test_a2a3_hbg_kernel_close TIMEOUT 30
+        LABEL no_hardware PRIVATE_WORKDIR
+        OBJS a2a3_hbg_objs
+        SOURCES ${CMAKE_SOURCE_DIR}/a2a3/runtime/host_build_graph/test_kernel_close.cpp
+            ${HBG_KERNEL_CLOSE_SOURCES}
+            ${CMAKE_SOURCE_DIR}/support/native_admission/hbg_preparation.cpp
+            ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_launch_binder.cpp
+            ${SIMPLER_SRC}/a2a3/runtime/host_build_graph/host/runtime_maker.cpp
+            ${_hbg_orch_host_sources}
+            ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
+            ${HBG_HOST_DIR}/host_phase_trace.cpp
+            ${HBG_SHARED_RUNTIME_SOURCES}
+            ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+        INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
+        INCLUDES ${SIMPLER_SRC}/a2a3/platform/onboard/host
+        DEFINES SIMPLER_RUNTIME_NAME="host_build_graph" SIMPLER_PLATFORM_NAME="a2a3sim"
+        LINK_OPTIONS -Wl,--wrap=register_callable_impl
+        LINK a2a3_ut_support ${CMAKE_DL_LIBS})
+endif()
+
+tmr_case(test_native_admission.cpp TIMEOUT 30
     SOURCES ${NATIVE_ADMISSION_SOURCES}
         ${CMAKE_SOURCE_DIR}/support/native_admission/tmr_preparation.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp

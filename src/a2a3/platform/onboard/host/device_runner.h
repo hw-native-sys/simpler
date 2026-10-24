@@ -164,6 +164,7 @@ public:
      * address is a query result and owns nothing.
      */
     int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
+    int configure_kernel_affinity(Runtime &runtime) override;
 
     /**
      * Fill `InitArgs.l2_cache_offset` from the driver's per-device report.

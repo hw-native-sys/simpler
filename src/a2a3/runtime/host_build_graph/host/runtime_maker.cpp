@@ -66,6 +66,8 @@
 #include "host_build_graph/host/host_tensor_access.h"
 #include "host_build_graph/host/retained_prepare_plan.h"
 #include "host_build_graph/host/graph_host_state.h"
+#include "host_build_graph/host_graph_build.h"
+#include "host_build_graph/kernel_resource_requirements.h"
 #include "host_build_graph/host/host_phase_trace.h"
 #include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/host/orch_ops.h"
@@ -533,39 +535,18 @@ struct DefinitionUploads {
 // claimed, so this pass writes the headers, copies in whatever did not fit, and
 // records the used prefix for synchronous publication. Device initial classify
 // replaces each task's graph_context with an execution constructed in its own heap.
-bool bind_graph_definitions(
-    Runtime *runtime, const HostApi *api, GraphHostState &graph_state, DefinitionUploads *uploads,
-    ReadyQueuePopulations *ready_queue_populations
+int32_t bind_graph_definitions(
+    Runtime *runtime, const HostApi *api, const hbg::GraphTaskDefinitionBindings &definition_bindings,
+    DefinitionUploads *uploads
 ) {
     *uploads = DefinitionUploads{};
-    const size_t count = graph_host_upload_count(graph_state);
-    GraphHostDefinitionList definitions = graph_host_definitions(graph_state);
+    const size_t count = definition_bindings.bindings.size();
     const auto align_up = [](size_t value) {
         return (value + GRAPH_DEFINITION_OBJECT_ALIGN - 1) & ~(GRAPH_DEFINITION_OBJECT_ALIGN - 1);
     };
-    struct PackedDefinition {
-        size_t object_offset;   // of the object's header, from the block base
-        size_t image_bytes;     // the Definition image alone
-        const std::byte *copy;  // the image to copy in, or nullptr when built in place
-        ReadyQueuePopulations ready_queue_populations;
-        bool populations_ready{false};
-    };
-    std::unordered_map<uint64_t, PackedDefinition> packed;
-    // Objects the recorders built already occupy the arena's used prefix at the
-    // offsets they claimed, so the block starts out that long and the rest are
-    // appended past them.
-    size_t block_bytes = graph_host_arena_used(graph_state);
-    for (const GraphHostDefinition &entry : definitions.entries) {
-        if (entry.bytes < sizeof(GraphDefinition)) continue;
-        if (entry.spill == nullptr) {
-            packed.emplace(entry.graph_key, PackedDefinition{entry.object_offset, entry.bytes, nullptr, {}, false});
-            continue;
-        }
-        const size_t object_offset = block_bytes;
-        block_bytes += align_up(sizeof(GraphDefinitionHeader) + entry.bytes);
-        packed.emplace(entry.graph_key, PackedDefinition{object_offset, entry.bytes, entry.spill, {}, false});
-        uploads->spilled++;
-    }
+    const auto &packed = definition_bindings.objects;
+    const size_t block_bytes = definition_bindings.bytes;
+    uploads->spilled = definition_bindings.spilled;
 
     // Named before anything is packed, so a run with no Graph task leaves the
     // device expecting nothing rather than inheriting a predecessor's section.
@@ -583,7 +564,7 @@ bool bind_graph_definitions(
             LOG_ERROR(
                 "host-orch: failed to retain %zu bytes for %zu Graph Definition object(s)", block_bytes, packed.size()
             );
-            return false;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         staging = static_cast<std::byte *>(staging_addr);
         for (const auto &[key, object] : packed) {
@@ -613,7 +594,7 @@ bool bind_graph_definitions(
         uint64_t section_base = 0;
         if (api->publish_graph_section(staging, block_bytes, &section_source, &section_base) != 0) {
             LOG_ERROR("host-orch: failed to carry %zu Definition byte(s) to the device", block_bytes);
-            return false;
+            return PTO_RUNTIME_ERR_INTERNAL;
         }
         // Which carrier delivered it is the platform's answer, not this bind's:
         // onboard it is the launch package RTS copies, in simulation a run-owned
@@ -632,83 +613,11 @@ bool bind_graph_definitions(
         record_bind_phase(HostPhaseKind::BindGraphPack, pack_phase, attrs, block_bytes);
     }
 
-    for (size_t index = 0; index < count; ++index) {
-        std::optional<GraphHostUpload> upload = graph_host_upload(graph_state, index);
-        if (!upload.has_value() || upload->outer_slot == nullptr || upload->outer_slot->task_kind != TaskKind::GRAPH) {
-            LOG_ERROR("host-orch: invalid pending Graph task");
-            return false;
-        }
-        auto object_it = packed.find(upload->graph_key);
-        if (object_it == packed.end() || staging == nullptr) {
-            LOG_ERROR("host-orch: Graph task has no matching prepared Definition object");
-            return false;
-        }
-        // Validate the prepared bytes that publication will copy to the device.
-        const auto *definition = reinterpret_cast<const GraphDefinition *>(
-            staging + object_it->second.object_offset + sizeof(GraphDefinitionHeader)
-        );
-        if (definition->total_bytes != object_it->second.image_bytes) {
-            LOG_ERROR("host-orch: Graph task has no matching prepared Definition object");
-            return false;
-        }
-        GraphExecutionStorageLayout storage_layout{};
-        if (definition->task_count <= 0 || definition->task_count > SUB_TASK_MAX_NUM ||
-            definition->graph_key != upload->graph_key ||
-            !graph_execution_storage_layout(
-                definition->task_count, definition->tensor_arg_count, definition->scalar_arg_count,
-                definition->edge_count, &storage_layout
-            ) ||
-            storage_layout.total_bytes != definition->execution_storage_bytes ||
-            upload->outer_slot->to_payload().tensor_count != definition->boundary_tensor_count ||
-            upload->outer_slot->to_payload().scalar_count != definition->boundary_scalar_count) {
-            LOG_ERROR("host-orch: invalid Graph Definition for task");
-            return false;
-        }
-        const uintptr_t outer_base =
-            reinterpret_cast<uintptr_t>(upload->outer_slot->to_descriptor().packed_buffer_base);
-        const uintptr_t outer_end = reinterpret_cast<uintptr_t>(upload->outer_slot->to_descriptor().packed_buffer_end);
-        if (outer_end < outer_base || definition->required_heap > UINTPTR_MAX - outer_base ||
-            storage_layout.total_bytes > outer_end - outer_base ||
-            definition->required_heap > outer_end - outer_base - storage_layout.total_bytes) {
-            LOG_ERROR("host-orch: Graph runtime storage does not fit its outer task heap");
-            return false;
-        }
-        const uintptr_t storage_addr = outer_base + definition->required_heap;
-        if (storage_addr % alignof(ChipTaskStorage) != 0) {
-            LOG_ERROR("host-orch: Graph runtime storage address is misaligned");
-            return false;
-        }
-        PackedDefinition &packed_definition = object_it->second;
-        if (!packed_definition.populations_ready) {
-            const SubTaskDefinition *tasks = graph_definition_array<SubTaskDefinition>(
-                *definition, definition->off_sub_tasks, definition->task_count
-            );
-            if (tasks == nullptr) {
-                LOG_ERROR("host-orch: invalid Graph Definition sub-task array");
-                return false;
-            }
-            for (int32_t i = 0; i < definition->task_count; ++i) {
-                // Sizing takes the kind materialize will give this task. add_task
-                // singles out GRAPH and routes everything else by shape, and a Graph
-                // body member is never the shell, so the shape decides. Derived here
-                // the same way the device derives it, so the two cannot drift.
-                const ActiveMask mask(tasks[i].active_mask);
-                packed_definition.ready_queue_populations.add_task(
-                    mask, TaskAttrs(tasks[i].task_attrs), mask.is_dummy() ? TaskKind::DUMMY : TaskKind::KERNEL
-                );
-            }
-            packed_definition.populations_ready = true;
-        }
-        ready_queue_populations->add(packed_definition.ready_queue_populations);
-        // The Definition is named by its position in this run's section, not by an
-        // address: the bytes reach the device as the tail of each AICPU thread's
-        // own launch arguments, so no address in them is shared. graph_context
-        // stays null until the device installs this task's execution.
-        upload->outer_slot->to_descriptor().graph_definition_offset =
-            static_cast<uint32_t>(object_it->second.object_offset + sizeof(GraphDefinitionHeader));
-        upload->outer_slot->graph_context = nullptr;
+    for (const auto &[slot, offset] : definition_bindings.bindings) {
+        slot->to_descriptor().graph_definition_offset = offset;
+        slot->graph_context = nullptr;
     }
-    return true;
+    return 0;
 }
 
 struct GraphHostStateBinding {
@@ -830,11 +739,17 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     return total_tasks;
 }
 
-int32_t run_host_orchestration(
-    Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, RuntimeContext *rt,
-    DeviceArena &host_arena, const RuntimeArenaLayout &layout, uint64_t sm_size, uint64_t task_capacity,
-    void *host_orch_func_ptr, const ChipTaskArgs &orch_l2, HostPreparePlan &plan
+}  // namespace
+
+int32_t hbg::build_graph(
+    Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, RuntimeContext *rt, uint64_t sm_size,
+    uint64_t task_capacity, void *host_orch_func_ptr, const ChipTaskArgs &orch_l2, GraphBuild &build
 ) {
+    if (build.build_complete || build.graph_state) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (runtime == nullptr || api == nullptr || rt == nullptr || host_orch_func_ptr == nullptr || task_capacity == 0 ||
+        task_capacity > static_cast<uint64_t>(TaskId::GLOBAL_TASK_MAX_NUM) ||
+        sm_size != SharedMemoryHandle::calculate_size(task_capacity))
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     // The dep_gen graph belongs to the orchestration that is about to run.
     dep_gen_host_graph_begin_capture();
 
@@ -888,7 +803,7 @@ int32_t run_host_orchestration(
     }
 
     // Initialize the host SM header (ring flow control) so submit_task can run.
-    SharedMemoryHandle host_sm_handle;
+    SharedMemoryHandle &host_sm_handle = build.host_sm_handle;
     if (!host_sm_handle.init(host_sm, sm_size, task_capacity)) {
         LOG_ERROR("host-orch: host SM init failed");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -913,7 +828,8 @@ int32_t run_host_orchestration(
         }
     }
 
-    GraphHostStatePtr graph_state = make_graph_host_state(definition_arena);
+    build.graph_state = make_graph_host_state(definition_arena);
+    GraphHostStatePtr &graph_state = build.graph_state;
     if (!graph_state) {
         LOG_ERROR("host-orch: failed to allocate Graph host state");
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -950,7 +866,7 @@ int32_t run_host_orchestration(
 
     // What the .so holds for this bind is released when this function leaves, by whichever
     // path: the state it covers -- the Graph Config registry today -- is paired with
-    // graph_state below, which is a local of this function and dies the same way. The
+    // graph_state owned by the build's exclusive workspace lease. The
     // bound context is one of them: orch_ctx is a local of this frame, so the .so's
     // global may not outlive it. Unbinding after finish() keeps the context reachable
     // for whatever the .so still does there.
@@ -1031,12 +947,11 @@ int32_t run_host_orchestration(
     // Submission already classified each slot while its fields were hot.
     ReadyQueuePopulations ready_queue_populations = orchestrator.ready_queue_populations;
 
-    // Bind Graph tasks to retained Definition addresses. The slot holds the
-    // prepared source until synchronous publication consumes it.
-    DefinitionUploads definition_uploads{};
-    if (!bind_graph_definitions(runtime, api, *graph_state, &definition_uploads, &ready_queue_populations)) {
+    if (!hbg::resolve_graph_task_definitions(*graph_state, ready_queue_populations, build.definitions)) {
+        LOG_ERROR("host-orch: invalid or oversized Graph Definition plan");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    ready_queue_populations = build.definitions.populations;
 
     ReadyQueueCapacities ready_queue_capacities{};
     const int32_t ready_queue_status = derive_ready_queue_capacities(ready_queue_populations, &ready_queue_capacities);
@@ -1083,7 +998,43 @@ int32_t run_host_orchestration(
         static_cast<uint64_t>(orch_state.scalar_pool_cursor),
     };
     const uint64_t image_bytes = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage)).end;
+
+    const uint64_t used_heap = orchestrator.task_allocator.heap_used_bytes();
+    if (used_heap > UINT64_MAX - (DeviceArena::kDefaultBaseAlign - 1))
+        return runtime_status_from_error_code(SIMPLER_ERROR_SUBMIT_CAPACITY_EXCEEDED);
+    build.sm_mirror = host_sm;
+    build.task_capacity = task_capacity;
+    build.total_tasks = total_tasks;
+    build.ready_queue_populations = ready_queue_populations;
+    build.ready_queue_capacities = ready_queue_capacities;
+    build.bind_usage = bind_usage;
+    build.image_bytes = image_bytes;
+    build.heap_bytes = CHIP_ALIGN_UP(std::max<uint64_t>(used_heap, CHIP_ALIGN_SIZE), DeviceArena::kDefaultBaseAlign);
+    build.architecture = hbg::RuntimeArchitecture::A2A3;
+    build.build_complete = true;
+    return total_tasks;
+}
+
+namespace {
+
+int32_t run_host_orchestration(
+    Runtime *runtime, const HostApi *api, HostTensorAccessor &tensor_access, RuntimeContext *rt,
+    DeviceArena &host_arena, const RuntimeArenaLayout &layout, uint64_t sm_size, uint64_t task_capacity,
+    void *host_orch_func_ptr, const ChipTaskArgs &orch_l2, HostPreparePlan &plan
+) {
+    hbg::GraphBuild build;
+    const int32_t build_status =
+        hbg::build_graph(runtime, api, tensor_access, rt, sm_size, task_capacity, host_orch_func_ptr, orch_l2, build);
+    if (build_status < 0) return build_status;
+    const int32_t total_tasks = build.total_tasks;
+    void *host_sm = build.sm_mirror;
+    auto &host_sm_handle = build.host_sm_handle;
+    const auto &bind_usage = build.bind_usage;
+    const uint64_t image_bytes = build.image_bytes;
     runtime->dev.sm_image_bytes = image_bytes;
+    DefinitionUploads definition_uploads{};
+    const int32_t definition_status = bind_graph_definitions(runtime, api, build.definitions, &definition_uploads);
+    if (definition_status != 0) return definition_status;
 
     // Only now are both sizes known, so this is where the two device regions are
     // committed: the arena up to its shared-memory tail, and the graph heap to the
@@ -1102,10 +1053,8 @@ int32_t run_host_orchestration(
     // same boundary it starts on, so an access at the tail of the last packed buffer
     // stays inside the region even when its width exceeds the bytes that buffer
     // asked for.
-    const uint64_t heap_bytes = CHIP_ALIGN_UP(
-        std::max<uint64_t>(orchestrator.task_allocator.heap_used_bytes(), CHIP_ALIGN_SIZE),
-        DeviceArena::kDefaultBaseAlign
-    );
+    const uint64_t heap_bytes =
+        CHIP_ALIGN_UP(std::max<uint64_t>(build.heap_bytes, CHIP_ALIGN_SIZE), DeviceArena::kDefaultBaseAlign);
     plan.host_sm = host_sm;
     plan.sm_size = sm_size;
     plan.task_capacity = task_capacity;
@@ -1822,13 +1771,11 @@ extern "C" int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi 
     return rc;
 }
 
-// host_build_graph resolves orchestration on the host, so it exports no AICPU
-// entries beyond the base {simpler_aicpu_exec, simpler_aicpu_init} — in
-// particular it does not export simpler_aicpu_register_callable. Reporting an
-// empty extra-symbol set keeps the common AICPU loader from looking for it.
 extern "C" const char *const *runtime_extra_aicpu_symbols(size_t *count) {
-    if (count != nullptr) {
-        *count = 0;
-    }
-    return nullptr;
+    static const char *symbols[] = {
+        "simpler_aicpu_l1_hbg_register_execution_slot", "simpler_aicpu_l1_hbg_detach_execution_slot",
+        "simpler_aicpu_l1_hbg_register_callable", "simpler_aicpu_l1_hbg_revoke_callable"
+    };
+    if (count != nullptr) *count = sizeof(symbols) / sizeof(symbols[0]);
+    return symbols;
 }

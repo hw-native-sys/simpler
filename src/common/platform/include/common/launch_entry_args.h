@@ -21,6 +21,10 @@
  * Borrowed TMR eager calls use a framed kernel invocation on the launch route;
  * its registered occupancy and run binding are checked before consumption.
  *
+ * HBG kernel packets carry independently registered identity and restore into
+ * fixed context storage. Their Definition view uses RestoredSlot only after
+ * the boot owner validates and restores the packet.
+ *
  * Shared by the host that selects the route, the platform AICPU entry that
  * forwards the launch header, and the runtime that decodes it.
  */
@@ -32,9 +36,10 @@
 
 /** The carrier and format of this run's entry-argument values. */
 enum class EntryArgsSource : uint32_t {
-    Descriptor = 0,        // inside the published Runtime descriptor
-    LaunchEnvelope = 1,    // appended to the AICPU launch arguments, copied by RTS
-    KernelInvocation = 2,  // validated kernel packet in the RTS launch package
+    Descriptor = 0,           // inside the published Runtime descriptor
+    LaunchEnvelope = 1,       // appended to the AICPU launch arguments, copied by RTS
+    KernelInvocation = 2,     // validated kernel packet in the RTS launch package
+    HbgKernelInvocation = 4,  // graph packet checked against a registered fixed HBG slot
 };
 
 /**
@@ -54,6 +59,7 @@ enum class GraphSectionSource : uint32_t {
     None = 0,            // this run submitted no Graph task
     LaunchEnvelope = 1,  // appended to the AICPU launch arguments, copied by RTS
     HostSnapshot = 2,    // a run-owned host snapshot, simulation only
+    RestoredSlot = 3,    // context-owned Definitions published after device restore
 };
 
 /**

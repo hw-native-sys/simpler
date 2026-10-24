@@ -1702,9 +1702,13 @@ int simpler_prepare_run(
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    std::unique_lock<std::mutex> kernel_lock(runner->callable_registration_mutex(), std::defer_lock);
+    if (runner->execution_mode_latch().is_kernel()) kernel_lock.lock();
     const int context_rc = runner->validate_current_context();
     if (context_rc != 0) return context_rc;
     if (runner->execution_mode_latch().is_kernel()) {
+        const int idle_rc = runner->admit_hbg_native_run();
+        if (idle_rc != 0) return idle_rc;
         if (!runner->kernel_execution_state().accepts_dispatch()) return PTO_RUNTIME_ERR_INVALID_STATE;
         const int args_rc = validate_kernel_run_args(args);
         if (args_rc != 0) {
@@ -1772,6 +1776,9 @@ int simpler_prepare_run(
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         state->runner_reserved = true;
+        // The reservation excludes registration, teardown and dedicated launch.
+        // Release the admission lock before orchestration can call back into the C API.
+        if (kernel_lock.owns_lock()) kernel_lock.unlock();
         // A retry owns the same slot but receives a fresh attempt identity.
         // Adopt before attach/reclaim/provision/bind can fail; exact-epoch
         // cleanup then settles the saved plan even if bind is never reached.
@@ -2940,18 +2947,20 @@ int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) {
  * Kernel-mode lifecycle
  *
  * Init and prepare create context-owned resources on a borrowed device.
- * Launch remains a rejecting stub, so supported() reports 0. Structural
+ * HBG on A2/A3 submits copied graph packets through the caller stream. Structural
  * argument validation is shared with the simulated components through
  * kernel_entry_validation.h.
  * =========================================================================== */
 
-int simpler_kernel_mode_supported(DeviceContextHandle) { return 0; }
+int runtime_hbg_kernel_supported_impl();
+
+int simpler_kernel_mode_supported(DeviceContextHandle) { return runtime_hbg_kernel_supported_impl(); }
 
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
     const CallConfig *config, uint64_t context_generation
-) {
+) try {
     int rc = validate_kernel_init_args(
         ctx, device_id, aicpu_binary, aicpu_size, aicore_binary, aicore_size, dispatcher_binary, dispatcher_size,
         config, context_generation
@@ -2978,6 +2987,7 @@ int simpler_kernel_mode_init(
     }
 
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
     // A same-mode latch is idempotent, but initialization is not. Reject
     // reuse before replacing executors. The adopted device identity also
     // catches init failures whose resource rollback
@@ -3003,7 +3013,8 @@ int simpler_kernel_mode_init(
             std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
             runner->set_dispatcher_binary(std::move(dispatcher_vec));
         }
-        rc = runner->init_kernel_context(device_id);
+        const HostApi api(runner, 0, 0, 0, &g_host_api_ops);
+        rc = runner->init_kernel_context(device_id, context_generation, config, &api);
     } catch (...) {
         rc = PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -3012,11 +3023,13 @@ int simpler_kernel_mode_init(
         return rc;
     }
     return 0;
+} catch (...) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 int simpler_kernel_mode_prepare_callable(
     DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
-) {
+) try {
     int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size);
     if (rc != 0) return rc;
     rc = validate_kernel_callable_image(callable, callable_size);
@@ -3024,13 +3037,52 @@ int simpler_kernel_mode_prepare_callable(
     auto *runner = static_cast<DeviceRunnerBase *>(ctx);
     std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
     return prepare_kernel_callable_locked(runner, callable_id, callable, "simpler_kernel_mode_prepare_callable");
+} catch (...) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
-int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
+int simpler_kernel_mode_launch(
+    DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream
+) try {
     const int rc = validate_kernel_launch_args(ctx, callable_id, args, caller_stream);
     if (rc != 0) return rc;
-    LOG_ERROR("simpler_kernel_mode_launch: no live kernel context on this device context");
-    return PTO_RUNTIME_ERR_INVALID_STATE;
+    auto *runner = static_cast<DeviceRunnerBase *>(ctx);
+    std::unique_lock<std::mutex> lock(runner->callable_registration_mutex(), std::try_to_lock);
+    if (!lock.owns_lock() || !runner->execution_mode_latch().is_kernel() || runner->native_runs_outstanding())
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int stream_rc = runner->validate_current_context();
+    if (stream_rc != 0) return stream_rc;
+    const HostApi api(runner, 0, 0, 0, &g_host_api_ops);
+    return runner->launch_hbg_kernel_callable(
+        callable_id, *static_cast<const ChipStorageTaskArgs *>(args), caller_stream, &api
+    );
+} catch (...) {
+    return PTO_RUNTIME_ERR_INTERNAL;
+}
+
+int simpler_kernel_mode_retain_graph(DeviceContextHandle ctx, uint64_t *lease) try {
+    if (lease == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *lease = 0;
+    if (ctx == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (runtime_hbg_kernel_supported_impl() == 0) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    auto *runner = static_cast<DeviceRunnerBase *>(ctx);
+    std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+    if (!runner->execution_mode_latch().is_kernel()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int rc = runner->validate_current_context();
+    return rc == 0 ? runner->retain_hbg_kernel_graph(lease) : rc;
+} catch (...) {
+    return PTO_RUNTIME_ERR_INTERNAL;
+}
+int simpler_kernel_mode_release_graph(DeviceContextHandle ctx, uint64_t lease) try {
+    if (ctx == nullptr || lease == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (runtime_hbg_kernel_supported_impl() == 0) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    auto *runner = static_cast<DeviceRunnerBase *>(ctx);
+    std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+    if (!runner->execution_mode_latch().is_kernel()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int rc = runner->validate_current_context();
+    return rc == 0 ? runner->release_hbg_kernel_graph(lease) : rc;
+} catch (...) {
+    return PTO_RUNTIME_ERR_INTERNAL;
 }
 
 }  // extern "C"
