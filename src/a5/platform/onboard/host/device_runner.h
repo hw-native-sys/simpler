@@ -279,10 +279,9 @@ private:
     // are released in finalize().
     void cleanup_execution(PreparedExecution &prepared, bool launched) noexcept;
 
-    // On an AICore launch/sync error, best-effort drain the device so a later
-    // enqueue on the same DeviceRunner can recover in place; if the drain itself
-    // errors the context is unrecoverable without a full reset, so flip
-    // device_unusable_ and let admission/enqueue fail fast.
+    // Quarantine needs no current device; recovery may drain an owned device.
+    // Both keep admission closed until owner recovery or terminal quarantine.
+    void mark_device_unusable(int runtime_rc) override;
     void recover_device_or_mark_unusable(int aicore_rc) override;
 
     // Force-reset the card via aclrtResetDeviceForce to clear an op-timeout

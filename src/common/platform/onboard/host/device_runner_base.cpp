@@ -2481,6 +2481,8 @@ int DeviceRunnerBase::record_host_orch_callable(
 }
 
 int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
+    // Native reservation release is not a device-completion proof.
+    if (!can_accept_run()) return PTO_RUNTIME_ERR_INVALID_STATE;
     const int context_rc = validate_current_context();
     if (context_rc != 0) return context_rc;
     auto it = callables_.find(callable_id);

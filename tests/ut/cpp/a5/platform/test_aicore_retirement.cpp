@@ -233,6 +233,24 @@ TEST(AicoreRetirement, LeavesAnUnacknowledgedCoreUnclosed) {
     EXPECT_TRUE(cores[1].closed());
 }
 
+TEST(AicoreRetirement, AckAfterDeadlineDoesNotCompleteRetirementWithoutAnOwner) {
+    CoreRegs core;
+    AicoreTeardownControl gate{};
+    const AicoreExitTarget target{core.addr(), &gate};
+    bool released = true;
+    ASSERT_EQ(platform_retire_aicore_group(&target, 1, 0, &released), -1);
+    ASSERT_FALSE(released);
+    const uint32_t request = gate.exit_request;
+    ASSERT_TRUE(request == AICORE_EXIT_NONCE_0 || request == AICORE_EXIT_NONCE_1);
+
+    write_reg(target.reg_addr, RegId::COND, request);
+    EXPECT_EQ(read_reg(target.reg_addr, RegId::COND), request);
+    EXPECT_TRUE(core.signalled());
+    EXPECT_FALSE(core.closed());
+    EXPECT_EQ(gate.post_close_release, 0U);
+    EXPECT_FALSE(released);
+}
+
 // An unretired core leaves the host nothing but a stream timeout, so the caller
 // needs the group to say which ones they were.
 TEST(AicoreRetirement, ReportsWhichCoresWereReleased) {

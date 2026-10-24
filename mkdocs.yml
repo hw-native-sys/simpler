@@ -187,4 +187,5 @@ nav:
       - macOS libomp collision: troubleshooting/macos-libomp-collision.md
       - cpput gtest ABI: troubleshooting/ut-cpp-gtest-abi.md
       - a2a3 worker retirement: troubleshooting/a2a3-worker-retirement.md
+      - AICore retirement recovery: troubleshooting/aicore-retirement-recovery.md
   - Investigations: investigations/README.md

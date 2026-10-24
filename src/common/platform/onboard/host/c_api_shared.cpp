@@ -1429,6 +1429,12 @@ static void note_workspace_fact(OnboardNativeRunContext *state, WorkspaceManager
     state->runner->note_workspace_run_fact(state->descriptor.pipeline_slot, state->descriptor.run_epoch, fact);
 }
 
+static void quarantine_undrained_run(DeviceRunnerBase &runner, int rc) noexcept {
+    try {
+        runner.mark_device_unusable(rc);
+    } catch (...) {}
+}
+
 /**
  * Whether the loaded runtime declares its pooled arena regions per run.
  *
@@ -2311,12 +2317,16 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         const int attach_rc = state->runner->enter_run_thread();
         if (attach_rc != 0) {
             drain.device_rc = attach_rc;
+            quarantine_undrained_run(*state->runner, attach_rc);
             LOG_ERROR("simpler_wait_run: enter_run_thread failed: %d (%s)", attach_rc, state->trace_attrs);
         } else if (state->active_execution != nullptr) {
             drain = state->runner->drain_execution(*state->active_execution);
+        } else {
+            quarantine_undrained_run(*state->runner, drain.device_rc);
         }
     } catch (...) {
         drain = DrainOutcome{};
+        quarantine_undrained_run(*state->runner, drain.device_rc);
         LOG_ERROR("simpler_wait_run: drain threw (%s)", state->trace_attrs);
     }
     if (state->completion_rc == 0) state->completion_rc = drain.combined();
@@ -2477,6 +2487,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         attach_rc = PTO_RUNTIME_ERR_INTERNAL;
     }
     if (attach_rc != 0) {
+        if (phase == NativeRunPhase::Running && launched) quarantine_undrained_run(*state->runner, attach_rc);
         LOG_ERROR("simpler_finalize_run: attach_current_thread failed: %d (%s)", attach_rc, state->trace_attrs);
     }
     if (phase == NativeRunPhase::Running && launched) {
@@ -2489,6 +2500,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
                 drain = state->runner->drain_execution(*state->active_execution);
             } catch (...) {
                 drain = DrainOutcome{};
+                quarantine_undrained_run(*state->runner, drain.device_rc);
                 LOG_ERROR("simpler_finalize_run: drain_execution threw (%s)", state->trace_attrs);
             }
         }

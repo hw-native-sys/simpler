@@ -1014,13 +1014,16 @@ int DeviceRunner::queue_cross_run_wait(
     return 0;
 }
 
-void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
-    // Admission is closed before recovery performs any fallible operation.
+void DeviceRunner::mark_device_unusable(int runtime_rc) {
     device_unusable_.store(true, std::memory_order_release);
+    if (execution_mode_latch_.is_kernel()) kernel_exec_state_.poison(runtime_rc);
+}
+
+void DeviceRunner::recover_device_or_mark_unusable(int aicore_rc) {
+    mark_device_unusable(aicore_rc);
     // A borrowed context cannot drain or reset the caller's entire device.
     // Poison stops this runner's admission; recovery belongs to the caller.
     if (execution_mode_latch_.is_kernel()) {
-        kernel_exec_state_.poison(aicore_rc);
         LOG_ERROR("Execution error %d: borrowed device context marked unusable", aicore_rc);
         return;
     }

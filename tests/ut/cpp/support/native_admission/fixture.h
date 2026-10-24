@@ -61,8 +61,21 @@ public:
         chip_callable_buffers_[1] = ChipCallableBuffer{};
     }
     void use_other_entry() { callables_[1].host_orch_func_ptr = alternate_entry_points(); }
+    void allocate_callable() {
+        void *allocation = mem_alloc_.alloc(64);
+        ASSERT_NE(allocation, nullptr);
+        chip_callable_buffers_[1] = ChipCallableBuffer{reinterpret_cast<uint64_t>(allocation), 64, 1};
+    }
+    int callable_refcount() const { return chip_callable_buffers_.at(1).refcount; }
+    void note_device_suspicion() { device_health_.note_own_device_fault(1); }
     ~Runner() override { EXPECT_EQ(finalize(), 0); }
     bool can_accept_run() const override { return !admission_poisoned; }
+    void mark_device_unusable(int rc) override {
+        admission_poisoned = true;
+        quarantine_rc = rc;
+        ++quarantine_calls;
+        if (quarantine_throws) throw std::runtime_error("quarantine bookkeeping failed");
+    }
     void recover_device_or_mark_unusable(int rc) override {
         ++recovery_calls;
         recovery_rc = rc;
@@ -89,6 +102,11 @@ public:
     int recovery_rc{0};
     int launch_calls{0};
     int drain_calls{0};
+    int quarantine_calls{0};
+    int quarantine_rc{0};
+    bool quarantine_throws{false};
+    bool drain_throws{false};
+    DrainOutcome drain_result = DrainOutcome::device_complete(0);
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
         ++launch_calls;
         if (launch_throws) throw std::runtime_error("unknown launch progress");
@@ -114,7 +132,8 @@ public:
     int poll_execution(const ActiveExecution &) override { return SIMPLER_NATIVE_RUN_POLL_NOT_READY; }
     DrainOutcome drain_execution(ActiveExecution &) override {
         ++drain_calls;
-        return DrainOutcome::device_complete(0);
+        if (drain_throws) throw std::runtime_error("completion not observed");
+        return drain_result;
     }
     int finalize_impl() override { return finalize_common(); }
     void arm_host_dep_gen_capture(bool enabled) override { set_dep_gen_capture(enabled); }

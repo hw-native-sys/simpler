@@ -159,6 +159,9 @@ struct AicoreExitTarget {
 // values against one shared deadline. Close/read back every acknowledged
 // window, drain the closes, then release only those cores. An unacknowledged
 // core is neither closed nor released; it remains owned by host recovery.
+// ACK arriving after return does not run another close/release pass. A failed
+// group remains retained until device-owner recovery proves it safe to retire;
+// repeating a kernel or publishing another request is not that proof.
 //
 // `released`, when non-null, receives one flag per target on every return,
 // including rejection. A count above PLATFORM_MAX_CORES is rejected and only

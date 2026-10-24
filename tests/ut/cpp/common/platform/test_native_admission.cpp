@@ -309,6 +309,132 @@ TEST_F(NativeAdmissionTest, UnstartedLaunchWithFailedCleanupPublishesNoReleasePr
     );
 }
 
+TEST_F(NativeAdmissionTest, LostDrainAttachmentStopsAdmissionWithoutReleasingSubmittedWork) {
+    for (bool finalize_without_wait : {false, true}) {
+        SCOPED_TRACE(finalize_without_wait);
+        EXPECT_EXIT(
+            {
+                Runner runner;
+                Attempt active(runner, 0, 10);
+                if (active.prepare() != 0 || simpler_launch_run(&runner, active.storage) != 0) std::_Exit(1);
+                control().attach_rc = -77;
+                const int rc = finalize_without_wait ? simpler_finalize_run(&runner, active.storage) :
+                                                       simpler_wait_run(&runner, active.storage);
+                if (rc != -77) std::_Exit(2);
+                if (runner.accepts_new_run()) std::_Exit(3);
+                SimplerWorkspaceReport report{};
+                if (!runner.workspace_report(&report) || active.consume_release()) std::_Exit(4);
+                if (finalize_without_wait ? report.quarantined_blocks == 0 : !runner.holds_epoch(10)) std::_Exit(4);
+                if (runner.drain_calls != 0) std::_Exit(5);
+                if (runner.quarantine_rc != -77 || runner.recovery_calls != 0) std::_Exit(6);
+                control().attach_rc = 0;
+                Attempt next(runner, 1, 20);
+                if (next.prepare() == 0 || runner.launch_calls != 1) std::_Exit(7);
+                std::_Exit(0);
+            },
+            ::testing::ExitedWithCode(0), ""
+        );
+    }
+}
+
+TEST_F(NativeAdmissionTest, EscapingDrainExceptionStopsAdmissionAndPreservesResources) {
+    for (bool finalize_without_wait : {false, true}) {
+        SCOPED_TRACE(finalize_without_wait);
+        EXPECT_EXIT(
+            {
+                Runner runner;
+                Attempt active(runner, 0, 10);
+                if (active.prepare() != 0 || simpler_launch_run(&runner, active.storage) != 0) std::_Exit(1);
+                runner.drain_throws = true;
+                runner.quarantine_throws = true;
+                const int rc = finalize_without_wait ? simpler_finalize_run(&runner, active.storage) :
+                                                       simpler_wait_run(&runner, active.storage);
+                if (rc != PTO_RUNTIME_ERR_INTERNAL) std::_Exit(2);
+                if (runner.accepts_new_run() || active.consume_release()) std::_Exit(3);
+                SimplerWorkspaceReport report{};
+                if (!runner.workspace_report(&report)) std::_Exit(3);
+                if (finalize_without_wait ? report.quarantined_blocks == 0 : !runner.holds_epoch(10)) std::_Exit(3);
+                if (runner.drain_calls != 1 || runner.quarantine_calls != 1) std::_Exit(4);
+                Attempt next(runner, 1, 20);
+                if (next.prepare() == 0 || runner.launch_calls != 1) std::_Exit(5);
+                std::_Exit(0);
+            },
+            ::testing::ExitedWithCode(0), ""
+        );
+    }
+}
+
+TEST_F(NativeAdmissionTest, DiagnosticsFailureAfterProvedCompletionDoesNotQuarantine) {
+    Runner runner;
+    runner.allocate_callable();
+    Attempt active(runner, 0, 10);
+    ASSERT_EQ(active.prepare(), 0);
+    ASSERT_EQ(simpler_launch_run(&runner, active.storage), 0);
+    runner.drain_result = DrainOutcome::device_complete(-59);
+    EXPECT_EQ(simpler_wait_run(&runner, active.storage), -59);
+    EXPECT_TRUE(runner.accepts_new_run());
+    EXPECT_EQ(runner.quarantine_calls, 0);
+    EXPECT_EQ(simpler_finalize_run(&runner, active.storage), -59);
+    EXPECT_TRUE(active.empty());
+    EXPECT_TRUE(runner.accepts_new_run());
+    EXPECT_EQ(runner.quarantine_calls, 0);
+    SimplerWorkspaceReport report{};
+    ASSERT_TRUE(runner.workspace_report(&report));
+    EXPECT_EQ(report.quarantined_blocks, 0u);
+    const size_t bytes = control().bytes;
+    EXPECT_EQ(simpler_unregister_callable(&runner, 1), 0);
+    EXPECT_FALSE(runner.has_callable(1));
+    EXPECT_EQ(control().bytes, bytes - 64);
+}
+
+TEST_F(NativeAdmissionTest, UndrainedFinalizationRetainsCallableCodeAndTables) {
+    for (int failure = 0; failure < 4; ++failure) {
+        SCOPED_TRACE(failure);
+        EXPECT_EXIT(
+            {
+                Runner runner;
+                runner.allocate_callable();
+                Attempt active(runner, 0, 10);
+                if (active.prepare() != 0) std::_Exit(1);
+                if (failure == 3) {
+                    runner.partial_launch = true;
+                    runner.launch_refusal_rc = -4321;
+                }
+                if (simpler_launch_run(&runner, active.storage) != (failure == 3 ? -4321 : 0)) std::_Exit(1);
+                if (failure < 2) control().attach_rc = -77;
+                else if (failure == 2) runner.drain_throws = true;
+                const int rc = failure < 2 ? -77 : failure == 2 ? PTO_RUNTIME_ERR_INTERNAL : -4321;
+                if (failure == 0 && simpler_wait_run(&runner, active.storage) != rc) std::_Exit(2);
+                if (simpler_finalize_run(&runner, active.storage) != rc) std::_Exit(3);
+                control().attach_rc = 0;
+                if (runner.accepts_new_run() || runner.native_runs_outstanding()) std::_Exit(4);
+                if (failure == 3 && (runner.recovery_calls != 1 || runner.quarantine_calls != 0)) std::_Exit(4);
+                const size_t bytes = control().bytes;
+                if (simpler_unregister_callable(&runner, 1) != PTO_RUNTIME_ERR_INVALID_STATE) std::_Exit(5);
+                if (runner.unregister_callable(1) != PTO_RUNTIME_ERR_INVALID_STATE) std::_Exit(6);
+                if (!runner.has_callable(1) || runner.callable_refcount() != 1 || control().bytes != bytes)
+                    std::_Exit(7);
+                std::_Exit(0);
+            },
+            ::testing::ExitedWithCode(0), ""
+        );
+    }
+}
+
+TEST_F(NativeAdmissionTest, DeviceHealthSuspicionDoesNotBlockProvedCallableRelease) {
+    Runner runner;
+    runner.allocate_callable();
+    Attempt completed(runner, 0, 10);
+    ASSERT_EQ(simpler_run(&runner, completed.storage, 1, &completed.args, &completed.config, &completed.descriptor), 0);
+    runner.note_device_suspicion();
+    ASSERT_FALSE(runner.accepts_new_run());
+    ASSERT_TRUE(runner.can_accept_run());
+    const size_t bytes = control().bytes;
+    EXPECT_EQ(simpler_unregister_callable(&runner, 1), 0);
+    EXPECT_FALSE(runner.has_callable(1));
+    EXPECT_EQ(control().bytes, bytes - 64);
+}
+
 TEST_F(NativeAdmissionTest, ActualStagingAdapterTrimsIdleStorageThenRetriesOnce) {
     Runner runner;
     control().ceiling = 50 * kUnit;

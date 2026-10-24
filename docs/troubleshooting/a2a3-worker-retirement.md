@@ -1,5 +1,8 @@
 # A2/A3 worker retirement: CLOSE must precede return
 
+For deadline failure, late ACK and device ownership, see
+[AICore retirement failure and device-owner recovery](aicore-retirement-recovery.md).
+
 The A2/A3 persistent worker must not return after merely acknowledging EXIT.
 It must wait until the AICPU has closed the group's fast-path register windows
 and explicitly released the workers through global memory (GM).

@@ -1499,6 +1499,14 @@ public:
     bool accepts_new_run() const { return device_admits_new_run(!can_accept_run(), device_health_); }
 
     /**
+     * Stop admission when submitted work has no completion proof. This path
+     * needs no current device/context and performs no RTS operation. The arch
+     * flag is set before fallible host bookkeeping; only owner recovery may
+     * retire it. The default is for runners with no device state.
+     */
+    virtual void mark_device_unusable(int /*runtime_rc*/) {}
+
+    /**
      * An AICore launch or stream sync failed outside the per-run path. The arch
      * runner drains what it can and flips its device-unusable flag, so the next
      * admission fails fast and finalize() takes its fatal teardown path instead of
