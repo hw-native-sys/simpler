@@ -144,7 +144,9 @@ def pytest_addoption(parser):
         help="Manual test handling: exclude (default), include, only",
     )
     parser.addoption("--runtime", action="store", default=None, help="Only run tests for this runtime")
-    parser.addoption("--test-environment", default="default", help="Declared test environment (default or torch_npu)")
+    parser.addoption(
+        "--test-environment", default="default", help="Registered dependency environment (default: default)"
+    )
     parser.addoption(
         "--resource-child",
         action="store_true",

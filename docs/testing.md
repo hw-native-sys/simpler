@@ -12,6 +12,38 @@ Three axioms govern hardware classification across all test categories:
 
 These principles apply uniformly to ut-py (pytest markers), ut-cpp (ctest labels), and st (`@scene_test(platforms=[...])`).
 
+### Test environments
+
+Tests requiring an isolated dependency set declare
+`@pytest.mark.test_environment("torch_npu")` on a module, class, function or
+parameter. Every inherited declaration applies: repeated identical names are
+idempotent, conflicting or unknown names are errors, even on skipped or
+otherwise deselected items. Unmarked tests belong to `default`.
+
+`--test-environment` selects one registered environment; its default is
+`default`. The same pytest selection applies to scene-test compile warm-up and
+resource/runtime children. Platform, runtime, `-m`, `-k` and `manual` remain
+independent filters. Environment classification is not dependency detection:
+missing or incompatible dependencies fail a selected environment; they never
+silently move tests or skip qualification. Test modules must remain safe to
+collect without their optional backend; import it in fixtures or consumers.
+
+The `torch_npu` profile requires `--junitxml`: a single pytest invocation writes
+its final collection to the adjacent `.plan.json` file, executes it, then checks
+its actual JUnit against that plan. Source, environment and canonical nodeids
+must match, and every selected case must pass exactly once. Empty collection,
+missing/foreign/duplicate cases and any skip/error/failure are errors. This
+strict mode supports direct execution only. SceneTestCase, resource dispatch
+and xdist are rejected; default sweeps keep their existing execution strategy.
+Collect-only and compile warm-up select environments without importing or
+checking optional dependencies and do not emit execution plans.
+
+The registry and verifier live in `simpler_setup/test_environments.py`. Package
+pins have one source in the profile's constraints file. Adding a test to an
+existing environment requires no workflow edit. A new environment requires an
+explicit registry entry and reviewed installation/runner strategy; profiles do
+not install arbitrary dependencies or infer new CI runners.
+
 ### Assertion principle: no wall-clock proxies
 
 Off-hardware tests (sim, ut-py/ut-cpp, github-hosted) must not assert wall-clock

@@ -8,61 +8,77 @@
 # -----------------------------------------------------------------------------------------------------------
 """Strict CI receipts reject skipped, missing, duplicated or foreign cases."""
 
-import importlib.util
+import json
 import xml.etree.ElementTree as ET
-from pathlib import Path
 
 import pytest
 
-_SCRIPT = Path(__file__).resolve().parents[3] / ".github/actions/setup-framework-eager/verify_results.py"
-_SPEC = importlib.util.spec_from_file_location("framework_eager_results", _SCRIPT)
-assert _SPEC is not None and _SPEC.loader is not None
-_MODULE = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_MODULE)
+from simpler_setup.test_environments import _plan_digest, _source, verify_results
 
 
-def _write(path, names, outcome=None):
+def _write(tmp_path, names, outcome=None):
+    plan = {
+        "source": _source(),
+        "environment": "torch_npu",
+        "platform": "a2a3",
+        "cases": [{"nodeid": name, "classname": "tests.test_example", "name": name.split("::")[-1]} for name in names],
+    }
+    plan_path = tmp_path / "results.plan.json"
+    plan_path.write_text(json.dumps(plan))
     suite = ET.Element("testsuite")
-    for nodeid in names:
-        classname, name = nodeid.split("::")
-        case = ET.SubElement(suite, "testcase", classname=classname, name=name)
+    for planned in plan["cases"]:
+        case = ET.SubElement(suite, "testcase", classname=planned["classname"], name=planned["name"])
+        properties = ET.SubElement(case, "properties")
+        for name, value in (
+            ("simpler_nodeid", planned["nodeid"]),
+            ("simpler_source", plan["source"]),
+            ("simpler_environment", plan["environment"]),
+            ("simpler_plan", _plan_digest(plan)),
+        ):
+            ET.SubElement(properties, "property", name=name, value=value)
         if outcome:
             ET.SubElement(case, outcome)
+    path = tmp_path / "results.xml"
     ET.ElementTree(suite).write(path)
-    return path
+    return plan_path, path
 
 
-def test_exact_framework_matrix_passes(tmp_path, capsys):
-    _MODULE.verify_results(_write(tmp_path / "results.xml", sorted(_MODULE.EXPECTED)))
-    assert "FRAMEWORK_CI_VERIFIED " in capsys.readouterr().out
+def test_collected_environment_plan_passes(tmp_path, capsys):
+    verify_results(*_write(tmp_path, ["tests/test_example.py::test_first", "tests/test_example.py::test_second"]))
+    assert "TEST_ENVIRONMENT_VERIFIED " in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("outcome", ["skipped", "error", "failure"])
-def test_framework_matrix_requires_actual_passes(tmp_path, outcome):
+def test_environment_plan_requires_actual_passes(tmp_path, outcome):
     with pytest.raises(ValueError, match="did not pass"):
-        _MODULE.verify_results(_write(tmp_path / "results.xml", sorted(_MODULE.EXPECTED), outcome))
+        verify_results(*_write(tmp_path, ["tests/test_example.py::test_first"], outcome))
 
 
 @pytest.mark.parametrize("mutation", ["empty", "missing", "duplicate", "foreign"])
-def test_framework_matrix_requires_exact_nodeids(tmp_path, mutation):
-    names = sorted(_MODULE.EXPECTED)
+def test_environment_plan_requires_exact_nodeids(tmp_path, mutation):
+    plan, path = _write(tmp_path, ["tests/test_example.py::test_first", "tests/test_example.py::test_second"])
+    tree = ET.parse(path)
+    root = tree.getroot()
     if mutation == "empty":
-        names = []
+        root.clear()
     elif mutation == "missing":
-        names.pop()
+        root.remove(root[-1])
     elif mutation == "duplicate":
-        names[-1] = names[0]
+        root.append(root[0])
     else:
-        names[-1] = names[-1].replace("test_framework_queue_orders_public_worker", "test_foreign")
-    with pytest.raises(ValueError, match="four framework eager nodeids"):
-        _MODULE.verify_results(_write(tmp_path / "results.xml", names))
+        nodeid_property = root[0].find("properties/property")
+        assert nodeid_property is not None
+        nodeid_property.set("value", "tests/foreign.py::test_foreign")
+    tree.write(path)
+    with pytest.raises(ValueError, match="not executed|foreign or duplicate"):
+        verify_results(plan, path)
 
 
 @pytest.mark.parametrize("outcome", ["failures", "errors", "skipped"])
-def test_framework_matrix_rejects_suite_level_errors(tmp_path, outcome):
-    path = _write(tmp_path / "results.xml", sorted(_MODULE.EXPECTED))
+def test_environment_plan_rejects_suite_level_errors(tmp_path, outcome):
+    plan, path = _write(tmp_path, ["tests/test_example.py::test_first"])
     tree = ET.parse(path)
     tree.getroot().set(outcome, "1")
     tree.write(path)
-    with pytest.raises(ValueError, match="suite reports"):
-        _MODULE.verify_results(path)
+    with pytest.raises(ValueError, match="reports a failure"):
+        verify_results(plan, path)

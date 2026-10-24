@@ -287,16 +287,20 @@ not need `--max-parallel` manually.
 
   The arch flags subtract `NON_CODE` before deciding, so a non-code-only change already makes both `false`. An arch-gated job therefore needs no separate non-code check. See [`.claude/rules/ci-change-detection.md`](../.claude/rules/ci-change-detection.md) for the invariants these gates must keep.
 
-- **SDMA tests run in isolated tasks inside `st-onboard-a2a3`.** After excluding `tests/st/a2a3/framework_eager` for its dedicated job, three selections partition the remaining corpus (`examples tests/st`): the ordinary sweep takes `-m "not sdma and not sdma_fault"` with `--exclude-level 4`, one queued task runs `-m "sdma and not sdma_fault"` for the demos, and a separate one-device task runs `-m sdma_fault` for the AICore fault-injection case. The three are disjoint and exhaustive over both markers, and all three name the same paths, so a case cannot land in two tasks or in none. Provisioning the SDMA workspace creates 48 device-only STARS streams that live in the device fault domain, and tearing them down once any AICore task has poisoned that card blocks minutes rather than milliseconds — whether the teardown is a device reset or an explicit stream destroy ([#1425](https://github.com/hw-native-sys/simpler/issues/1425)). The cost therefore falls on whichever process still holds those streams when the fault happens, which is why the fault-injection case gets a task containing nothing else. Separate `task-submit` tasks preserve that on every onboard runner, independent of pytest ordering. Network1 tests are selected by `--level 4` in `st-network1-onboard-a2a3` and explicitly excluded from ordinary onboard ST lanes.
+- **SDMA tests run in isolated tasks inside `st-onboard-a2a3`.** Within the default test environment, three selections partition the corpus (`examples tests/st`): the ordinary sweep takes `-m "not sdma and not sdma_fault"` with `--exclude-level 4`, one queued task runs `-m "sdma and not sdma_fault"` for the demos, and a separate one-device task runs `-m sdma_fault` for the AICore fault-injection case. The three are disjoint and exhaustive over both markers, and all three name the same paths, so a case cannot land in two tasks or in none. Provisioning the SDMA workspace creates 48 device-only STARS streams that live in the device fault domain, and tearing them down once any AICore task has poisoned that card blocks minutes rather than milliseconds — whether the teardown is a device reset or an explicit stream destroy ([#1425](https://github.com/hw-native-sys/simpler/issues/1425)). The cost therefore falls on whichever process still holds those streams when the fault happens, which is why the fault-injection case gets a task containing nothing else. Separate `task-submit` tasks preserve that on every onboard runner, independent of pytest ordering. Network1 tests are selected by `--level 4` in `st-network1-onboard-a2a3` and explicitly excluded from ordinary onboard ST lanes.
 
 ### Framework eager qualification (a2a3)
 
 `st-framework-eager-a2a3` runs on every affected PR, in the emergency lane,
 and in Daily. Its PR gate is the same `a2a3_changed && st_affected` gate as the
 ordinary A3 scene tests. All three callers reuse `_st-framework-eager-a2a3.yml`.
-The ordinary A3 sweep excludes `tests/st/a2a3/framework_eager`, including in
-Daily: that suite's framework dependencies live only in `.venv-framework`,
-separate from the Program/fork sweep's `.venv`.
+Tests declare `@pytest.mark.test_environment("torch_npu")`. The job discovers
+them across `examples tests/st` with `--test-environment torch_npu`; it does
+not enumerate directories or cases. Ordinary sweeps and compile warm-up select
+the implicit `default` environment, including in Daily. Framework dependencies
+live only in `.venv-framework`, separate from the Program/fork sweep's `.venv`.
+Environment selection is independent of `manual`; these automated tests are
+not manual.
 
 The dedicated environment uses `--system-site-packages` and installs local,
 pinned wheels for CPU Torch 2.7.1 and torch_npu 2.7.1.post4. The pins constrain
@@ -312,8 +316,17 @@ One `task-submit` allocation of one device runs TMR/HBG × `TASK_QUEUE_ENABLE=0/
 serially, three calls per case. The client wait is bounded at 15 minutes,
 including queueing; the execution watchdog is also 15 minutes. Individual
 subprocess timeouts do not reserve additional aggregate execution time.
-The post-run JUnit check requires all four exact
-case identities to pass with no skips, errors or failures. Logs contain the
+The final pytest collection freezes a nonempty source/environment/nodeid plan
+next to the JUnit file. Every case carries its original nodeid and plan/source
+identity into JUnit. One shared verifier requires exactly that selected set to
+pass, with no duplicates, foreign cases, skips, errors or failures. A new test
+declaring the same environment automatically enters the plan. This verifies
+execution of the selected set; the tests themselves declare the qualification
+matrix. Strict receipts currently support direct pytest execution only; a
+profile selecting resource-dispatched, SceneTestCase or xdist execution fails
+explicitly rather than accepting incomplete child results. The default
+environment retains its existing dispatcher and does not claim this strict
+JUnit aggregation. Logs contain the
 source/native build identities, runtime and framework module hashes, compiled
 bridge identity and consumer results; `framework-eager-a2a3-*` artifacts retain
 JUnit and per-case logs even on failure. This qualifies the reference

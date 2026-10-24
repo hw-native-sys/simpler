@@ -9,7 +9,6 @@
 """CPU checks of the selected hardware test's dependency and JUnit contract."""
 
 import os
-import runpy
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -17,10 +16,11 @@ from pathlib import Path
 
 import pytest
 
+from simpler_setup.test_environments import verify_results
+
 _ROOT = Path(__file__).resolve().parents[3]
 _ST_RELATIVE = Path("tests/st/a2a3/framework_eager/test_framework_eager.py")
 _ST = _ROOT / _ST_RELATIVE
-_VERIFY = _ROOT / ".github/actions/setup-framework-eager/verify_results.py"
 _CASES = {
     f"test_framework_queue_orders_public_worker[{queue}-{runtime}]"
     for queue in ("0", "1")
@@ -32,7 +32,7 @@ def _run_selected_contract(tmp_path, *, missing):
     # Only the external compiler/device subprocess is replaced. Pytest executes
     # the actual fixture, four parameterizations, and consumer JSON assertions.
     (tmp_path / "pytest.ini").write_text(
-        "[pytest]\nmarkers =\n    requires_hardware\n    platforms(value)\n    manual\n"
+        "[pytest]\nmarkers =\n    requires_hardware\n    platforms(value)\n    test_environment(value)\n"
     )
     test_path = tmp_path / _ST_RELATIVE
     test_path.parent.mkdir(parents=True)
@@ -90,7 +90,29 @@ def cpu_transport():
 """
     )
     (tmp_path / "conftest.py").write_text(
-        'def pytest_addoption(parser):\n    parser.addoption("--device", default="0")\n'
+        f"""
+import subprocess
+import sys
+import pytest
+sys.path.insert(0, {str(_ROOT)!r})
+from simpler_setup import test_environments as environments
+
+def pytest_addoption(parser):
+    parser.addoption("--device", default="0")
+    parser.addoption("--test-environment", default="torch_npu")
+
+def pytest_collection_finish(session):
+    # Device/compiler transport is synthetic in this CPU fixture contract.
+    environments.preflight = lambda name: {{"environment": name, "cpu_transport": True}}
+    environments._source = lambda: subprocess.check_output(
+        ["git", "-C", {str(_ROOT)!r}, "rev-parse", "HEAD"], text=True).strip()
+    environments.prepare_session(session)
+
+@pytest.hookimpl(hookwrapper=True, tryfirst=True)
+def pytest_sessionfinish(session):
+    yield
+    environments.finish_session(session)
+"""
     )
     result = subprocess.run(
         [
@@ -121,23 +143,22 @@ def test_selected_framework_matrix_has_four_passed_junit_cases(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert len(cases) == 4
     assert {case.attrib["name"] for case in cases} == _CASES
-    assert all(not list(case) for case in cases)
-    runpy.run_path(str(_VERIFY))["verify_results"](tmp_path / "results.xml")
+    assert all(not any(child.tag in {"failure", "error", "skipped"} for child in case) for case in cases)
+    verify_results(tmp_path / "results.plan.json", tmp_path / "results.xml")
 
 
 def test_framework_ci_verifier_rejects_changed_actual_junit_classname(tmp_path):
     result, _ = _run_selected_contract(tmp_path, missing=None)
     assert result.returncode == 0, result.stdout + result.stderr
-    verify_results = runpy.run_path(str(_VERIFY))["verify_results"]
     path = tmp_path / "results.xml"
-    verify_results(path)
+    verify_results(tmp_path / "results.plan.json", path)
     tree = ET.parse(path)
     case = tree.getroot().find(".//testcase")
     assert case is not None
     case.set("classname", "wrong.framework_module")
     tree.write(path)
-    with pytest.raises(ValueError, match="Expected the four framework eager nodeids"):
-        verify_results(path)
+    with pytest.raises(ValueError, match="wrong JUnit identity"):
+        verify_results(tmp_path / "results.plan.json", path)
 
 
 @pytest.mark.parametrize("missing", ["torch", "torch_npu"])

@@ -33,16 +33,17 @@ TQ=1 requires callback execution on a different thread; TQ=0 requires the caller
 thread. Golden values are checked only after every framework successor has
 been enqueued and the final framework stream completion boundary returns.
 
-The system test covers both runtimes and both policies. Its manual marker keeps
-it out of generic environments; the dedicated `st-framework-eager-a2a3` PR and
-Daily job explicitly selects all four cases in an isolated framework venv.
+The system test covers both runtimes and both policies. Its
+`test_environment("torch_npu")` marker selects an isolated framework venv in the
+dedicated `st-framework-eager-a2a3` PR and Daily job. The default environment
+automatically deselects these tests; no directory exclusion is needed.
 Selecting the suite without its dependencies fails. See [CI qualification](../../../../docs/ci.md#framework-eager-qualification-a2a3) for the pinned compatibility contract. Run this suite
 serially inside one exclusive `task-submit` allocation of one device, as below;
 resource-parallel dispatch and xdist are not qualified by this example:
 
 ```sh
 .claude/skills/onboard-arch-precheck/check.sh a2a3
-task-submit --timeout 900 --max-time 900 --device auto --device-num 1 --run   'python -m pytest tests/st/a2a3/framework_eager --platform a2a3 --device "$TASK_DEVICE" --manual include -v'
+task-submit --timeout 900 --max-time 900 --device auto --device-num 1 --run   'python -m pytest examples tests/st --test-environment torch_npu --platform a2a3 --device "$TASK_DEVICE" --junitxml outputs/framework-eager-ci/results.xml -v'
 ```
 
 ## Ordering and lifetime contract

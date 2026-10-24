@@ -22,8 +22,8 @@ runs:
         constraints=.github/actions/setup-framework-eager/constraints.txt
         mapfile -t requirements < <(python simpler_setup/test_environments.py requirements torch_npu)
         # Explicit local wheels shadow inherited distributions without changing them.
-        python -m pip install --ignore-installed --no-deps "${requirements[0]}" --index-url https://download.pytorch.org/whl/cpu
-        python -m pip install --ignore-installed --no-deps "${requirements[1]}"
+        python -m pip install --ignore-installed --no-deps "$(python simpler_setup/test_environments.py requirements torch_npu torch)" --index-url https://download.pytorch.org/whl/cpu
+        python -m pip install --ignore-installed --no-deps "$(python simpler_setup/test_environments.py requirements torch_npu torch_npu)"
         python -m pip install -c "$constraints" "${requirements[@]}" \
           'scikit-build-core>=0.10' 'nanobind>=2,<3' 'cmake>=3.20' ninja setuptools
         python -m pip install -c "$constraints" --no-build-isolation \

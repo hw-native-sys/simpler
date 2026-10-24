@@ -32,12 +32,16 @@ class TestEnvironment:
     execution: str
     constraints: str | None = None
     cann_version: str | None = None
+    modules: tuple[tuple[str, str], ...] = ()
 
 
 ENVIRONMENTS = {
     "default": TestEnvironment("dispatcher"),
     "torch_npu": TestEnvironment(
-        "direct", ".github/actions/setup-framework-eager/constraints.txt", "9.0.0"
+        "direct",
+        ".github/actions/setup-framework-eager/constraints.txt",
+        "9.0.0",
+        (("torch", "torch"), ("torch_npu", "torch_npu")),
     ),
 }
 _PROPERTY_PREFIX = "simpler_"
@@ -93,11 +97,19 @@ def requirements(name: str) -> dict[str, str]:
 def preflight(name: str, *, packages: bool = True) -> dict:
     """Validate the active toolchain and package metadata without importing them."""
     profile = _environment(name)
-    record = {"environment": name, "python": sys.version, "executable": sys.executable,
-              "machine": platform.machine(), "libc": platform.libc_ver()}
+    record = {
+        "environment": name,
+        "python": sys.version,
+        "executable": sys.executable,
+        "machine": platform.machine(),
+        "libc": platform.libc_ver(),
+    }
     if profile.cann_version is not None:
         home = Path(os.environ["ASCEND_HOME_PATH"]).resolve()
-        candidates = [home / "ascend_toolkit_install.info", home / f"{platform.machine()}-linux/ascend_toolkit_install.info"]
+        candidates = [
+            home / "ascend_toolkit_install.info",
+            home / f"{platform.machine()}-linux/ascend_toolkit_install.info",
+        ]
         manifest = next((path for path in candidates if path.is_file()), None)
         if manifest is None:
             raise ValueError(f"CANN install manifest missing under active ASCEND_HOME_PATH={home}")
@@ -107,14 +119,16 @@ def preflight(name: str, *, packages: bool = True) -> dict:
             raise ValueError(f"{name} requires CANN {profile.cann_version}; active manifest reports {fields}")
     if packages:
         installed = {}
-        for module, expected in requirements(name).items():
+        pinned = requirements(name)
+        for distribution, module in profile.modules:
+            expected = pinned[distribution]
             spec = importlib.util.find_spec(module)
             if spec is None:
                 raise ValueError(f"Selected test environment {name} requires {module}=={expected}; module is missing")
-            version = importlib.metadata.version(module)
+            version = importlib.metadata.version(distribution)
             if version != expected:
                 raise ValueError(f"Selected test environment {name} requires {module}=={expected}; found {version}")
-            installed[module] = {"version": version, "path": spec.origin}
+            installed[distribution] = {"module": module, "version": version, "path": spec.origin}
         record["packages"] = installed
     return record
 
@@ -126,6 +140,8 @@ def _plan_digest(plan: dict) -> str:
 def prepare_session(session) -> None:
     """Freeze the final collection once; default keeps its existing dispatcher."""
     import pytest  # noqa: PLC0415
+
+    # Pytest owns the spelling of its JUnit classname and parameterized name.
     from _pytest.junitxml import mangle_test_address  # noqa: PLC0415
 
     config = session.config
@@ -156,27 +172,52 @@ def prepare_session(session) -> None:
         raise pytest.UsageError("Duplicate nodeids in selected test environment")
     try:
         identity = preflight(name)
-    except (ValueError, OSError, KeyError, importlib.metadata.PackageNotFoundError) as error:
+    except (
+        ValueError,
+        OSError,
+        KeyError,
+        subprocess.CalledProcessError,
+        importlib.metadata.PackageNotFoundError,
+    ) as error:
         raise pytest.UsageError(str(error)) from error
-    plan = {"source": _source(), "environment": name, "platform": config.getoption("--platform", default=None),
-            "cases": cases}
+    try:
+        source = _source()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise pytest.UsageError(f"Cannot identify the test source checkout: {error}") from error
+    plan = {
+        "source": source,
+        "environment": name,
+        "platform": config.getoption("--platform", default=None),
+        "cases": cases,
+    }
     destination = Path(xmlpath).with_suffix(".plan.json")
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text(json.dumps(plan, indent=2) + "\n")
     digest = _plan_digest(plan)
     for item in session.items:
-        item.user_properties.extend([
-            ("simpler_nodeid", item.nodeid), ("simpler_source", plan["source"]),
-            ("simpler_environment", name), ("simpler_plan", digest),
-        ])
+        item.user_properties.extend(
+            [
+                ("simpler_nodeid", item.nodeid),
+                ("simpler_source", plan["source"]),
+                ("simpler_environment", name),
+                ("simpler_plan", digest),
+            ]
+        )
     session._test_environment_receipt = (destination, Path(xmlpath))
-    print("TEST_ENVIRONMENT_PLAN " + json.dumps({"path": str(destination), "plan": plan, "identity": identity}), flush=True)
+    print(
+        "TEST_ENVIRONMENT_PLAN " + json.dumps({"path": str(destination), "plan": plan, "identity": identity}),
+        flush=True,
+    )
 
 
 def verify_results(plan_path: Path, xml_path: Path) -> None:
     plan = json.loads(plan_path.read_text())
     profile = _environment(plan["environment"])
-    if profile.execution != "direct" or plan["source"] != _source():
+    try:
+        source = _source()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ValueError(f"Cannot identify the test source checkout: {error}") from error
+    if profile.execution != "direct" or plan["source"] != source:
         raise ValueError("Test plan source or execution environment does not match this checkout")
     expected = {case["nodeid"]: case for case in plan["cases"]}
     if not expected or len(expected) != len(plan["cases"]):
@@ -193,8 +234,12 @@ def verify_results(plan_path: Path, xml_path: Path) -> None:
         if nodeid not in expected or nodeid in observed:
             raise ValueError(f"Missing, foreign or duplicate test receipt: {nodeid}")
         target = expected[nodeid]
-        required = {"simpler_nodeid": nodeid, "simpler_source": plan["source"],
-                    "simpler_environment": plan["environment"], "simpler_plan": _plan_digest(plan)}
+        required = {
+            "simpler_nodeid": nodeid,
+            "simpler_source": plan["source"],
+            "simpler_environment": plan["environment"],
+            "simpler_plan": _plan_digest(plan),
+        }
         for key, value in required.items():
             if properties.count((key, value)) != 1 or sum(name == key for name, _ in properties) != 1:
                 raise ValueError(f"Test receipt has wrong source, environment or plan: {nodeid}")
@@ -221,7 +266,10 @@ def finish_session(session) -> None:
 def main() -> None:
     command, *args = sys.argv[1:]
     if command == "requirements":
-        print("\n".join(f"{name}=={version}" for name, version in requirements(args[0]).items()))
+        selected = requirements(args[0])
+        if len(args) > 1:
+            selected = {args[1]: selected[args[1]]}
+        print("\n".join(f"{name}=={version}" for name, version in selected.items()))
     elif command == "preflight":
         print("TEST_ENVIRONMENT_TOOLCHAIN " + json.dumps(preflight(args[0], packages=False)), flush=True)
     elif command == "verify":
