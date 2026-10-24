@@ -328,7 +328,11 @@ init-thread close without individual waits. Public L2 close uses the common
 accepted-handle drain before workspace teardown, preserving late close-only
 lane errors and retryable cleanup. Typed-value consumers perform three
 DEVICE calls, plus three explicit HOST/NONE-control calls on HBG; TMR checks
-clean HOST refusal followed by valid DEVICE work. A session-scoped fixture
+clean HOST refusal followed by valid DEVICE work. Diagnostic-selection consumers
+queue four calls: off, swimlane1/PMU2, swimlane3/PMU4, off; after mutating the
+accepted caller configs, they verify original export destinations and run
+attribution. PMU/swimlane collection can wait and does not qualify other DFX
+collectors. A session-scoped fixture
 compiles the shared host bridge once. The client wait is bounded at 15 minutes,
 including queueing; the execution watchdog is also 15 minutes. Individual
 subprocess timeouts do not reserve additional aggregate execution time.
@@ -348,7 +352,8 @@ bridge identity and consumer results; `framework-eager-a2a3-*` artifacts retain
 JUnit and per-case logs even on failure. This qualifies the reference
 consumers' same-stream and cross-stream eager ordering, caller-owned lifetimes,
 bounded aliased INOUT assertions, ordinary callback-error recovery and per-call
-value semantics. It does not qualify native failed-drain recovery, pending
+value semantics and per-call PMU/swimlane selection/export attribution. It does
+not qualify native failed-drain recovery, pending
 framework-callback close or early HOST-backing release. It does not establish
 overlap, arbitrary strides/cross-tile aliasing, PyPTO dispatch, A5 or
 capture/replay.
