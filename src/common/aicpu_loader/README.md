@@ -3,10 +3,10 @@
 Source for `libsimpler_aicpu_dispatcher.so` — a transient bootstrap-only helper
 loaded by CANN's preinstalled `libaicpu_extend_kernels.so`. Its only job is to
 write the bundled runtime SO bytes to the main `aicpu_scheduler`'s preinstall
-path under a content-fingerprint + device-id filename:
+process directory under a content-fingerprint + device-id filename:
 
 ```text
-/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so
+/usr/lib64/aicpu_kernels/<vf>/aicpu_kernels_device/<hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so
 ```
 
 The `<device_id>` suffix isolates the paired dies of one a2a3 chip (which share
@@ -14,8 +14,8 @@ the preinstall filesystem) so they never write/rename/execute one shared file �
 concurrent bootstrap on a shared file corrupted the mmap'd image and faulted
 `simpler_aicpu_exec` (507018 → chip fault → 507899 cascade).
 
-The dispatcher SO itself is **never** persisted to disk and **never** dispatches
-at per-task launch time. After bootstrap, the host registers the preinstall
+CANN manages loading the dispatcher SO during bootstrap; the dispatcher does
+not run at per-task launch time. After bootstrap, the host registers the preinstall
 file via `rtsBinaryLoadFromFile` (JSON load, cpuKernelMode=0) and
 resolves every symbol the runtime declares it exports via
 `rtsFuncGetByName` (a miss is a build/registration error, not an optional
@@ -26,8 +26,13 @@ preinstall file; the dispatcher is out of the picture once bootstrap returns.
 The source is runtime-agnostic. It is built per-arch under
 `build/lib/<arch>/dispatcher/libsimpler_aicpu_dispatcher.so`, one per arch and
 shared across every runtime. A single process binding multiple runtimes
-therefore shares one dispatcher SO on disk; the host process-level
-fingerprint cache deduplicates bootstrap calls by inner-SO Build-ID.
+therefore shares one dispatcher SO on disk. Each runner uploads into CANN's
+`<hostPid>_<localDeviceId>` directory, including after device reset. CANN removes
+that directory at process-session teardown.
+
+Historical files in the shared root remain untouched. CANN can still select
+those files first; recovering incorrect historical content is outside this
+change.
 
 ## Argument ABI boundaries
 

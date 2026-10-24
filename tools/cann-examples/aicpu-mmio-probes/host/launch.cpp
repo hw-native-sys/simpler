@@ -11,8 +11,8 @@
 // launch.cpp — host driver for the AICPU-only MMIO probes.
 //
 // Same Path-A dispatcher bootstrap as tools/cann-examples/aicpu-kernel-launch
-// (dlopen libaicpu_extend_kernels.so, write our inner SO under
-// /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/, fingerprint + register
+// (dlopen libaicpu_extend_kernels.so, write our inner SO into the CANN
+// process directory, fingerprint + register
 // via rtsBinaryLoadFromFile, rtsLaunchCpuKernel). The only extra step is
 // the AICPU-visible AICore register bases used by the probe SO.
 //
@@ -408,9 +408,7 @@ int main(int argc, char **argv) {
     char base[64];
     std::snprintf(base, sizeof(base), "simpler_inner_%016lx_%d.so", fp, device_id);
     std::string so_basename = base;
-    std::printf(
-        "[bootstrap] inner landed at /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/%s (fp=%016lx)\n", base, fp
-    );
+    std::printf("[bootstrap] inner SO uploaded to CANN process directory as %s (fp=%016lx)\n", base, fp);
 
     struct TempFile {
         std::string path;

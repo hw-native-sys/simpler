@@ -134,6 +134,7 @@ target_include_directories(aicpu_dispatcher
         # src/common is needed so `#include "utils/elf_build_id.h"` resolves
         # (matches a2a3 sibling; same Build-ID fingerprint protocol).
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common
+        ${ASCEND_HOME_PATH}/pkg_inc
         ${ASCEND_HOME_PATH}/include
 )
 

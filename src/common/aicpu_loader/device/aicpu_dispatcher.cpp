@@ -14,7 +14,7 @@
  * See aicpu_dispatcher.h for architecture. The dispatcher SO exists only
  * to provide a piece of code that runs with sched-thread (HwHiAiUser)
  * permissions for one purpose: write the bundled runtime SO bytes to
- * the main aicpu_scheduler's preinstall path under a content-fingerprint
+ * the main aicpu_scheduler's process directory under a content-fingerprint
  * filename. Once Init returns, this SO is no longer referenced — host's
  * subsequent rtsBinaryLoadFromFile calls target the runtime SO file directly.
  */
@@ -28,10 +28,12 @@
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <string>
 
+#include "aicpu/aicpu_schedule/aicpu_context.h"
 #include "utils/elf_build_id.h"
 
 // dlog wrapper so error paths show up in device log without depending on
@@ -95,46 +97,51 @@ uint64_t Fingerprint(const char *data, uint64_t len) {
     return simpler::common::utils::elf_build_id_64(data, static_cast<std::size_t>(len));
 }
 
-// Preinstall path — HwHiAiUser owns this dir, the sched thread can write here.
-// device-side /tmp is mounted read-only / restricted in CANN 9.0.
+// CANN resolves and removes this process-owned directory at session teardown.
 std::string MakeInnerSoPath(uint64_t fp, uint64_t device_id) {
+    aicpu::aicpuContext_t ctx{};
+    if (aicpu::aicpuGetContext == nullptr || aicpu::GetUniqueVfId == nullptr ||
+        aicpu::aicpuGetContext(&ctx) != aicpu::AICPU_ERROR_NONE || ctx.hostPid <= 0) {
+        DispatcherLog("cannot determine CANN process SO directory");
+        return {};
+    }
     char buf[256];
     snprintf(
-        buf, sizeof(buf), "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_%016lx_%lu.so", fp, device_id
+        buf, sizeof(buf), "/usr/lib64/aicpu_kernels/%u/aicpu_kernels_device/%d_%u/simpler_inner_%016llx_%llu.so",
+        aicpu::GetUniqueVfId(), ctx.hostPid, ctx.deviceId, static_cast<unsigned long long>(fp),
+        static_cast<unsigned long long>(device_id)
     );
     return buf;
 }
 
-// Atomic write: write to a per-process temp path, then rename onto the target.
-// Several CI workers may bootstrap on different devices simultaneously and all
-// land at the same fingerprinted target path; without atomic rename a reader
-// (a sibling aicpu_scheduler's dlopen during its rtsBinaryLoadFromFile call) can observe a
-// truncated/partially-written file and fail with 507018 or 507046.
-//
-// Same fingerprint → same content, so whichever rename wins yields identical
-// bytes; existing dlopen handles in any aicpu_scheduler stay bound to their
-// captured inode and are unaffected by later renames. We don't fast-path on
-// the file already existing — a stale corrupt file from a pre-fix run could
-// match the fingerprint by chance, and the atomic rename overwrites cheaply.
+// Per-upload temporary files and atomic rename publish complete SOs to concurrent
+// readers. Existing dlopen handles remain bound to their original inode.
 bool WriteBytes(const std::string &path, const char *data, uint64_t len) {
     char tmp_path[320];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", path.c_str(), static_cast<int>(getpid()));
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", path.c_str());
+    int fd = mkstemp(tmp_path);
+    if (fd < 0) return false;
+    close(fd);
     {
         std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
         if (!f.is_open()) {
             DispatcherLog("open %s for write failed: %s", tmp_path, strerror(errno));
+            unlink(tmp_path);
             return false;
         }
         f.write(data, static_cast<std::streamsize>(len));
-        bool good = f.good();
         f.close();
+        bool good = f.good();
         if (!good) {
             DispatcherLog("write %s failed", tmp_path);
             unlink(tmp_path);
             return false;
         }
     }
-    (void)chmod(tmp_path, 0755);
+    if (chmod(tmp_path, 0755) != 0) {
+        unlink(tmp_path);
+        return false;
+    }
     if (rename(tmp_path, path.c_str()) != 0) {
         DispatcherLog("rename %s -> %s failed: %s", tmp_path, path.c_str(), strerror(errno));
         unlink(tmp_path);
@@ -169,10 +176,8 @@ __attribute__((visibility("default"))) uint32_t DynTileFwkBackendKernelServer(vo
     return 0;
 }
 
-// Init: write the bundled runtime SO bytes to a fingerprint-named file under
-// the main scheduler's preinstall path, return. Once this returns, host's
-// host's subsequent rtsBinaryLoadFromFile can resolve the runtime SO directly — this dispatcher SO
-// never gets referenced again.
+// Init publishes the bundled runtime SO into CANN's process-owned directory.
+// Subsequent rtsBinaryLoadFromFile calls resolve it by basename.
 __attribute__((visibility("default"))) uint32_t DynTileFwkBackendKernelServerInit(void *args) {
     if (args == nullptr) {
         simpler_dispatcher::DispatcherLog("Init: args==nullptr");
@@ -192,8 +197,15 @@ __attribute__((visibility("default"))) uint32_t DynTileFwkBackendKernelServerIni
     }
     const char *inner_bytes = reinterpret_cast<const char *>(d->inner_so_bin);
     uint64_t fp = simpler_dispatcher::Fingerprint(inner_bytes, d->inner_so_len);
-    std::string path = simpler_dispatcher::MakeInnerSoPath(fp, d->device_id);
+    const std::string path = simpler_dispatcher::MakeInnerSoPath(fp, d->device_id);
+    if (path.empty()) return 1;
+    const std::string dir = path.substr(0, path.find_last_of('/'));
+    if (mkdir(dir.c_str(), 0755) != 0 && errno != EEXIST) {
+        simpler_dispatcher::DispatcherLog("mkdir %s failed: %s", dir.c_str(), strerror(errno));
+        return 1;
+    }
     if (!simpler_dispatcher::WriteBytes(path, inner_bytes, d->inner_so_len)) {
+        simpler_dispatcher::DispatcherLog("Init: stage %s failed", path.c_str());
         return 1;
     }
     simpler_dispatcher::DispatcherLog("Init: wrote %s (%lu bytes)", path.c_str(), d->inner_so_len);

@@ -14,24 +14,22 @@
  *
  * Three-phase architecture:
  *
- *   1. BootstrapDispatcher (per-DeviceRunner, idempotent across instances in
- *      the same process via a content-fingerprint cache): bundles dispatcher
+ *   1. BootstrapDispatcher (per-DeviceRunner): bundles dispatcher
  *      SO bytes + runtime SO bytes into a single
  *      `rtAicpuKernelLaunchExWithArgs` (kernel_type =
  *      `KERNEL_TYPE_AICPU_KFC`) targeting libaicpu_extend_kernels. Our
  *      dispatcher then writes the runtime SO to
- *      `/usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so`
+ *      `<preinstall>/<hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so`
  *      using sched-thread (HwHiAiUser) write permission. The dispatcher SO
- *      itself is never persisted to disk.
+ *      bootstrap load is managed by CANN.
  *
  *   2. Init (per-DeviceRunner): JSON-registers the runtime SO via
  *      `rtsBinaryLoadFromFile` (cpuKernelMode=0, kernelSo points at the
  *      preinstall basename), then resolves runtime SO entry points such as
  *      `simpler_aicpu_exec`, `simpler_aicpu_init`, and
  *      `simpler_aicpu_register_callable` to `rtFuncHandle`s via
- *      `rtsFuncGetByName`. JSON is per-process
- *      (`/tmp/simpler_inner_<fp>_<pid>.json`) so concurrent multi-chip /
- *      multi-worker tests don't race on a shared file.
+ *      `rtsFuncGetByName`. JSON uses `/tmp/simpler_inner_<fp>_<pid>.json`;
+ *      loaders with the same fingerprint in one host process share this path.
  *
  *   3. LaunchBuiltInOp (per-task): `rtsLaunchCpuKernel` on the cached
  *      `rtFuncHandle`. No per-launch string marshalling, no global op
