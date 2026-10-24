@@ -466,9 +466,18 @@ public:
 
     enum class DispatchPhase : uint8_t { IDLE, PENDING };
 
-    BitStates get_dispatchable_cores(ResourceShape shape, DispatchPhase phase) const {
-        return (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) :
-                                                get_pending_core_offset_states(shape);
+    BitStates without_reserved_cores(BitStates candidates, uint8_t reserved_mask) const {
+        BitStates reserved;
+        if (reserved_mask & SUBTASK_MASK_AIC) reserved |= aic_mask_;
+        if (reserved_mask & SUBTASK_MASK_AIV0) reserved |= aic_mask_ << 1;
+        if (reserved_mask & SUBTASK_MASK_AIV1) reserved |= aic_mask_ << 2;
+        return candidates & ~reserved;
+    }
+
+    BitStates get_dispatchable_cores(ResourceShape shape, DispatchPhase phase, uint8_t reserved_mask = 0) const {
+        auto candidates =
+            (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) : get_pending_core_offset_states(shape);
+        return without_reserved_cores(candidates, reserved_mask);
     }
 
     // --- Bit offset <-> worker_id mapping ---
@@ -541,8 +550,8 @@ struct alignas(64) SchedChipSwimlaneCounters {
 // sync_start drain coordination
 // =============================================================================
 
-// When sync_start_pending != 0, all scheduler threads skip dispatch
-// (only process completions) until the fixed coordinator finishes launching all blocks.
+// Owners may fill unreserved idle V lanes before acknowledging the drain round.
+// Tracker state is quiescent from the current-round ACK through cohort staging.
 struct alignas(64) SyncStartDrainState {
     std::atomic<int32_t> sync_start_pending{0};              // 0=normal; -1=initializing; >0=active (value=block_num)
     std::atomic<ChipTaskSlotState *> pending_task{nullptr};  // held task (not re-queued)
@@ -554,12 +563,14 @@ struct alignas(64) SyncStartDrainState {
     std::atomic<int32_t> drain_stage_go{0};          // 0=hold; 1=parallel staging enabled
     std::atomic<uint32_t> drain_stage_done_mask{0};  // bit per scheduler thread
     std::atomic<int32_t> drain_running_staged{0};    // total running-slot cores staged
-    int32_t _pad[7];
+    std::atomic<uint32_t> reserved_core_mask{7};     // physical lane demand of the held cohort
+    int32_t _pad[6];
 };
 static_assert(sizeof(SyncStartDrainState) == 64);
 static_assert(offsetof(SyncStartDrainState, pending_task) == 8);
 static_assert(offsetof(SyncStartDrainState, drain_attempt) == 16);
 static_assert(offsetof(SyncStartDrainState, drain_stage_go) == 24);
+static_assert(offsetof(SyncStartDrainState, reserved_core_mask) == 36);
 
 constexpr uint64_t SYNC_START_DRAIN_ACK_SUBTREE_READY = uint64_t{1} << 63;
 constexpr uint64_t SYNC_START_DRAIN_ATTEMPT_MASK = ~SYNC_START_DRAIN_ACK_SUBTREE_READY;

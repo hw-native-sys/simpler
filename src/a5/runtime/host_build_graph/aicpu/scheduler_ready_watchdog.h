@@ -30,7 +30,10 @@ public:
         while (!ready()) {
             const uint64_t observed_progress = last_progress();
             const uint64_t now = clock();
-            if (scheduler_watchdog_expired(observed_progress, now, timeout_cycles)) {
+            // A shared publication can be newer than this clock sample.
+            // Forward elapsed intervals occupy the lower half of the counter range.
+            const uint64_t elapsed = now - observed_progress;
+            if (elapsed < (uint64_t{1} << 63) && scheduler_watchdog_expired(observed_progress, now, timeout_cycles)) {
                 if (ready()) return true;
                 // A new publication requires a fresh clock sample: its timestamp
                 // may be later than `now`. Polling alone never extends the budget.

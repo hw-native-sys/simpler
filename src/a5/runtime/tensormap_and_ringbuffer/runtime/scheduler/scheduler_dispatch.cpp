@@ -83,7 +83,8 @@ bool SchedulerContext::has_idle_in_other_threads(int32_t self_thread_idx, Resour
 }
 
 int SchedulerContext::pop_ready_tasks_batch(
-    ChipReadyQueue *queues, ResourceShape shape, int32_t thread_idx, ChipTaskSlotState **out, int max_count
+    ChipReadyQueue *queues, ResourceShape shape, int32_t thread_idx, ChipTaskSlotState **out, int max_count,
+    uint8_t *core_mask_snapshots
 ) {
 #if SIMPLER_DFX
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
@@ -91,11 +92,12 @@ int SchedulerContext::pop_ready_tasks_batch(
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
     int count = sched_->get_ready_tasks_batch(
-        queues, shape, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]
+        queues, shape, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx],
+        core_mask_snapshots
     );
     chip_swimlane.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
-    int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
+    int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count, core_mask_snapshots);
 #endif
     if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) {
         if (count > 0) {
@@ -106,7 +108,7 @@ int SchedulerContext::pop_ready_tasks_batch(
     }
 #else
     (void)thread_idx;
-    int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count);
+    int count = sched_->get_ready_tasks_batch(queues, shape, out, max_count, core_mask_snapshots);
 #endif
     return count;
 }
@@ -275,7 +277,7 @@ int SchedulerContext::prepare_block_for_dispatch(
 
 void SchedulerContext::dispatch_shape(
     int32_t thread_idx, ChipReadyQueue *disp_queues, ResourceShape shape, CoreTracker::DispatchPhase phase,
-    CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
+    CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed, uint8_t reserved_core_mask
 ) {
 #if SIMPLER_SCHED_PROFILING
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
@@ -284,13 +286,15 @@ void SchedulerContext::dispatch_shape(
 
     bool is_pending = (phase == CoreTracker::DispatchPhase::PENDING);
     bool is_mix = (shape == ResourceShape::MIX);
-    auto cores = is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
+    auto cores =
+        is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase, reserved_core_mask);
     if (!cores.has_value()) return;
 
     while (cores.has_value() && !entered_drain) {
         int want = cores.count();
         ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
-        int got = pop_ready_tasks_batch(disp_queues, shape, thread_idx, batch, want);
+        uint8_t core_masks[CoreTracker::MAX_CLUSTERS * 3];
+        int got = pop_ready_tasks_batch(disp_queues, shape, thread_idx, batch, want, core_masks);
         if (got == 0) break;
 
         // sync_start exclusion gate.
@@ -365,28 +369,28 @@ void SchedulerContext::dispatch_shape(
                 while (candidates.has_value()) {
                     int32_t cluster_offset = candidates.pop_first();
                     if (tracker.classify_mix_cluster(cluster_offset, cmask) == wanted) {
-                        selected_mix_clusters |= CoreTracker::BitStates(1ULL << cluster_offset);
+                        selected_mix_clusters |= CoreTracker::BitStates::bit(cluster_offset);
                     }
                 }
                 if (!selected_mix_clusters.has_value()) {
-                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    disp_queues[static_cast<int32_t>(shape)].push(slot_state, core_masks[bi]);
                     continue;
                 }
             }
 
             if (slot_state->task_attrs.requires_sync_start()) {
                 if (is_pending) {
-                    disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                    disp_queues[static_cast<int32_t>(shape)].push(slot_state, core_masks[bi]);
                     continue;
                 }
                 int32_t available = is_mix ? selected_mix_clusters.count() : cores.count();
                 if (available < slot_state->logical_block_num) {
                     flush_publish();
                     if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
-                        disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                        disp_queues[static_cast<int32_t>(shape)].push(slot_state, core_masks[bi]);
                     }
                     for (int rem = bi + 1; rem < got; rem++) {
-                        disp_queues[static_cast<int32_t>(shape)].push(batch[rem]);
+                        disp_queues[static_cast<int32_t>(shape)].push(batch[rem], core_masks[rem]);
                     }
                     entered_drain = true;
                     break;
@@ -398,7 +402,7 @@ void SchedulerContext::dispatch_shape(
                 // These came off this queue and no other owner holds them, so a
                 // drop would lose them: retry until the space they vacated is
                 // free again.
-                while (!disp_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi)) {}
+                while (!disp_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi, &core_masks[bi])) {}
                 break;
             }
 
@@ -416,7 +420,7 @@ void SchedulerContext::dispatch_shape(
             published_n++;
 
             if (start + claim < slot_state->logical_block_num) {
-                disp_queues[static_cast<int32_t>(shape)].push(slot_state);
+                disp_queues[static_cast<int32_t>(shape)].push(slot_state, core_masks[bi]);
             }
 
             for (int32_t b = 0; b < claim; b++) {
@@ -450,7 +454,8 @@ void SchedulerContext::dispatch_shape(
         if (!dispatched_any) break;
 
         if (!cores.has_value()) {
-            cores = is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
+            cores = is_mix ? tracker.get_cluster_offset_states() :
+                             tracker.get_dispatchable_cores(shape, phase, reserved_core_mask);
         }
     }
 }
@@ -471,18 +476,20 @@ void SchedulerContext::run_staging_order(
     const ResourceShape *aic_aiv = kAicAivOrder[thread_idx & 1];
 
     // ===== IDLE stage =====
-    if (stage(ResourceShape::MIX, Phase::IDLE)) return;
+    if (stage(ResourceShape::MIX, Phase::IDLE, 0)) return;
 
-    // MIX-IDLE residual: AIC/AIV (both IDLE and PENDING) yield for this pass.
-    // MIX-PENDING below still runs — that is the core of "mix strict priority":
-    // pending slots are spent on mix before AIC/AIV get any chance.
-    bool skip_aic_aiv = residual_mix();
-
-    if (!skip_aic_aiv) {
+    auto stage_unreserved = [&](CoreTracker::DispatchPhase phase, uint8_t reserved) {
         for (int i = 0; i < 2; i++) {
-            if (stage(aic_aiv[i], Phase::IDLE)) return;
+            ResourceShape shape = aic_aiv[i];
+            uint8_t shape_mask = shape == ResourceShape::AIC ? SUBTASK_MASK_AIC : SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1;
+            if ((reserved & shape_mask) == shape_mask) continue;
+            if (phase == Phase::PENDING && has_idle_in_other_threads(thread_idx, shape)) continue;
+            if (stage(shape, phase, reserved)) return true;
         }
-    }
+        return false;
+    };
+    uint8_t reserved_after_idle = residual_mix();
+    if (stage_unreserved(Phase::IDLE, reserved_after_idle)) return;
 
     if (pmu_active) return;
 
@@ -493,27 +500,19 @@ void SchedulerContext::run_staging_order(
     // progress for MIX is preserved: at least one thread will run MIX-IDLE next
     // pass and consume the residual.
     //
-    // The gate is NOT subject to skip_aic_aiv — residual mix continues to drain
-    // via pending slots on this thread when no peer is idle.
+    // Residual MIX can use pending slots when no peer has an idle cluster.
     if (!has_idle_in_other_threads(thread_idx, ResourceShape::MIX)) {
-        if (stage(ResourceShape::MIX, Phase::PENDING)) return;
+        if (stage(ResourceShape::MIX, Phase::PENDING, 0)) return;
     }
 
-    // Re-check after MIX-PENDING. If MIX-IDLE already set skip_aic_aiv, leave
-    // it set; otherwise, escalate iff PENDING-MIX left residual.
-    if (!skip_aic_aiv && residual_mix()) {
-        skip_aic_aiv = true;
-    }
+    // Preserve the original whole-pass priority when every lane was reserved.
+    // There is no spare lane to recover in this case; admitting pure work into
+    // pending slots earlier would change the full-MIX scheduling policy.
+    constexpr uint8_t all_lanes = SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1;
+    if (reserved_after_idle == all_lanes) return;
 
-    if (skip_aic_aiv) return;
-
-    // AIC/AIV-PENDING gate: a peer-idle skip is a delay, not a loss — the peer
-    // will pull from the global queue on its next IDLE pass.
-    for (int i = 0; i < 2; i++) {
-        ResourceShape s = aic_aiv[i];
-        if (has_idle_in_other_threads(thread_idx, s)) continue;
-        if (stage(s, Phase::PENDING)) return;
-    }
+    // A partial-MIX residual may have drained; re-check its available lanes.
+    stage_unreserved(Phase::PENDING, residual_mix());
 }
 
 void SchedulerContext::dispatch_ready_tasks(
@@ -534,15 +533,15 @@ void SchedulerContext::dispatch_ready_tasks(
     if (sched_->sync_task_seen.load(std::memory_order_acquire) != 0) {
         run_staging_order(
             thread_idx, pmu_active,
-            [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
+            [&](ResourceShape shape, CoreTracker::DispatchPhase phase, uint8_t reserved) {
                 dispatch_shape(
                     thread_idx, sched_->ready_sync_queues, shape, phase, tracker, entered_drain, made_progress,
-                    try_pushed
+                    try_pushed, reserved
                 );
                 return entered_drain;
             },
             [&] {
-                return has_residual_sync_mix();
+                return residual_sync_mix_core_mask();
             }
         );
         if (entered_drain) return;
@@ -551,15 +550,33 @@ void SchedulerContext::dispatch_ready_tasks(
     // Tier 1: regular ready work.
     run_staging_order(
         thread_idx, pmu_active,
-        [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
+        [&](ResourceShape shape, CoreTracker::DispatchPhase phase, uint8_t reserved) {
             dispatch_shape(
-                thread_idx, sched_->ready_queues, shape, phase, tracker, entered_drain, made_progress, try_pushed
+                thread_idx, sched_->ready_queues, shape, phase, tracker, entered_drain, made_progress, try_pushed,
+                reserved
             );
             return entered_drain;
         },
         [&] {
-            return has_residual_mix();
+            return residual_mix_core_mask();
         }
+    );
+}
+
+void SchedulerContext::dispatch_spare_aiv_before_drain(
+    int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
+) {
+    if (pmu_active || is_completed() || drain_state_.sync_start_pending.load(std::memory_order_acquire) <= 0) return;
+    uint64_t attempt = drain_state_.drain_attempt.load(std::memory_order_acquire);
+    if (drain_ack_tokens_[thread_idx].load(std::memory_order_acquire) == sync_start_drain_ack_subtree_token(attempt))
+        return;
+    uint8_t reserved = static_cast<uint8_t>(drain_state_.reserved_core_mask.load(std::memory_order_relaxed)) |
+                       residual_mix_core_mask() | residual_sync_mix_core_mask();
+    if ((reserved & (SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1)) == (SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1)) return;
+    bool entered_drain = false;
+    dispatch_shape(
+        thread_idx, sched_->ready_queues, ResourceShape::AIV, CoreTracker::DispatchPhase::IDLE, tracker, entered_drain,
+        made_progress, try_pushed, reserved
     );
 }
 
@@ -668,8 +685,9 @@ int32_t SchedulerContext::stage_consumer_blocks(
 // gated pending slot. Producer propagation and late wiring push candidates to the
 // shape's queue when dispatch_fanin becomes complete, so the shape is the queue
 // index (no per-consumer to_shape()). Returns the number of blocks staged.
-int32_t
-SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, CoreTracker::DispatchPhase phase) {
+int32_t SchedulerContext::early_dispatch_shape(
+    int32_t thread_idx, ResourceShape shape, CoreTracker::DispatchPhase phase, uint8_t reserved_core_mask
+) {
     CoreTracker &tracker = core_trackers_[thread_idx];
     int32_t s = static_cast<int32_t>(shape);
     bool is_mix = (shape == ResourceShape::MIX);
@@ -679,7 +697,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
     // phase's dispatchable-core count. Skip the queue entirely when no core is free
     // for this shape+phase (avoids a pointless pop + immediate push-back).
     CoreTracker::BitStates cores =
-        is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase);
+        is_mix ? tracker.get_cluster_offset_states() : tracker.get_dispatchable_cores(shape, phase, reserved_core_mask);
     if (!cores.has_value()) return 0;
 
     int32_t total_staged = 0;
@@ -696,7 +714,8 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
     // next range and stage CONCURRENTLY — a wide consumer is filled by all idle
     // threads in parallel. When cores run out mid-batch the unprocessed remainder
     // is pushed back for peers (mirrors normal's push_batch of the unconsumed tail).
-    int got = sched_->early_dispatch_queues[s].pop_batch_tagged(batch, task_id_snapshots, cores.count());
+    uint8_t core_masks[CoreTracker::MAX_CLUSTERS * 3];
+    int got = sched_->early_dispatch_queues[s].pop_batch_tagged(batch, task_id_snapshots, cores.count(), core_masks);
     for (int bi = 0; bi < got; bi++) {
         ChipTaskSlotState *c = batch[bi];
         if (c->task->task_id != task_id_snapshots[bi]) continue;
@@ -717,11 +736,11 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
             while (candidates.has_value()) {
                 int32_t cluster_offset = candidates.pop_first();
                 if (tracker.classify_mix_cluster(cluster_offset, cmask) == wanted) {
-                    bucket |= CoreTracker::BitStates(1ULL << cluster_offset);
+                    bucket |= CoreTracker::BitStates::bit(cluster_offset);
                 }
             }
         } else {
-            bucket = tracker.get_dispatchable_cores(shape, phase);
+            bucket = tracker.get_dispatchable_cores(shape, phase, reserved_core_mask);
         }
         int32_t freecores = bucket.has_value() ? bucket.count() : 0;
         if (freecores == 0) {  // no cores for this shape+phase — give this + the unprocessed rest back
@@ -729,7 +748,9 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
             // producer release: try_early_dispatch_release rings whatever is staged
             // and routes the unstaged remainder to the ready queue, because it
             // returns on next_block_idx rather than on the claim state.
-            if (!sched_->early_dispatch_queues[s].push_batch_tagged(&batch[bi], &task_id_snapshots[bi], got - bi))
+            if (!sched_->early_dispatch_queues[s].push_batch_tagged(
+                    &batch[bi], &task_id_snapshots[bi], got - bi, &core_masks[bi]
+                ))
                 LOG_DEBUG(
                     "[EARLY_DISPATCH] queue full on batch re-push, dropping %d candidate(s) to normal dispatch",
                     got - bi
@@ -741,7 +762,7 @@ SchedulerContext::early_dispatch_shape(int32_t thread_idx, ResourceShape shape, 
         if (claim == 0) continue;  // nothing left to claim -> drop (no re-push)
         // Re-push for concurrent peers BEFORE the expensive staging.
         if (start + claim < c->logical_block_num) {
-            if (!sched_->early_dispatch_queues[s].push_tagged(c, task_id_snapshots[bi]))
+            if (!sched_->early_dispatch_queues[s].push_tagged(c, task_id_snapshots[bi], core_masks[bi]))
                 LOG_DEBUG(
                     "[EARLY_DISPATCH] queue full on re-push, consumer=0x%" PRIx64, TaskId::to_uint64(c->task->task_id)
                 );
@@ -824,12 +845,12 @@ int32_t SchedulerContext::try_early_dispatch(
 
     run_staging_order(
         thread_idx, pmu_active,
-        [&](ResourceShape shape, CoreTracker::DispatchPhase phase) {
-            total_staged += early_dispatch_shape(thread_idx, shape, phase);
+        [&](ResourceShape shape, CoreTracker::DispatchPhase phase, uint8_t reserved) {
+            total_staged += early_dispatch_shape(thread_idx, shape, phase, reserved);
             return false;
         },
         [&] {
-            return has_residual_early_mix();
+            return residual_early_mix_core_mask();
         }
     );
 
@@ -1110,6 +1131,31 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 2 drain check
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
+            // Complete owner-local tracker writes before handle_drain_mode
+            // publishes this attempt's ACK and the coordinator reads trackers.
+            dispatch_spare_aiv_before_drain(thread_idx, tracker, pmu_active, made_progress, try_pushed);
+#if SIMPLER_DFX
+            if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES && chip_swimlane.phase_dispatch_count > 0) {
+                uint64_t dispatch_t1 = get_sys_cnt_aicpu();
+                uint64_t pop_hit_delta = chip_swimlane.pop_hit - chip_swimlane.pop_hit_at_last_emit;
+                uint64_t pop_miss_delta = chip_swimlane.pop_miss - chip_swimlane.pop_miss_at_last_emit;
+                debug_assert(pop_hit_delta < (1ULL << 32));
+                debug_assert(pop_miss_delta < (1ULL << 32));
+                int16_t phase_end_shared[CHIP_SWIMLANE_NUM_QUEUE_SHAPES];
+                capture_phase_end(phase_end_shared);
+                chip_swimlane_aicpu_record_sched_phase(
+                    thread_idx, SchedPhaseKind::Dispatch, _t0_phase, dispatch_t1, chip_swimlane.sched_loop_count,
+                    chip_swimlane.phase_dispatch_count, static_cast<uint32_t>(pop_hit_delta),
+                    static_cast<uint32_t>(pop_miss_delta), phase_start_shared, phase_end_shared
+                );
+                for (int s = 0; s < CHIP_SWIMLANE_NUM_QUEUE_SHAPES; s++)
+                    phase_start_shared[s] = phase_end_shared[s];
+                _t0_phase = dispatch_t1;
+                chip_swimlane.phase_dispatch_count = 0;
+                chip_swimlane.pop_hit_at_last_emit = chip_swimlane.pop_hit;
+                chip_swimlane.pop_miss_at_last_emit = chip_swimlane.pop_miss;
+            }
+#endif
 #if SIMPLER_DFX
             uint64_t drain_t0 = (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHED_PHASES) ? get_sys_cnt_aicpu() : 0;
             uint64_t drain_stage_wall = 0;
