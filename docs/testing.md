@@ -57,6 +57,12 @@ handles are drained before workspace ownership can be released, without
 individual user waits. Native timeout/context refusals and retryable close debt
 are covered separately by CPU lifecycle contracts.
 
+The argument-capture consumer is discovered in the same environment. It
+checks OFF/FULL/HYBRID/OFF snapshots and exact two-task argument payloads,
+including a runtime-owned intermediate. A real Worker materialization CPU
+contract covers native geometry; CPU recording tests do not qualify device
+collection or framework ordering.
+
 The registry and verifier live in `simpler_setup/test_environments.py`. Package
 pins have one source in the profile's constraints file. Selector and preflight
 share a minimum CANN version line of 9.0, without an architecture allowlist.
