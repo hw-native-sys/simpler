@@ -329,7 +329,11 @@ accepted-handle drain before workspace teardown, preserving late close-only
 lane errors and retryable cleanup. Typed-value consumers perform three
 DEVICE calls, plus three explicit HOST/NONE-control calls on HBG; TMR checks
 clean HOST refusal followed by valid DEVICE work. A session-scoped fixture
-compiles the shared host bridge once. The client wait is bounded at 15 minutes,
+compiles the shared host bridge once. Argument-capture cases queue four
+OFF/FULL/HYBRID/OFF calls, each with two dependent tasks and a runtime-owned
+intermediate. They verify exact task-time payloads, materialized geometry and
+per-call export ownership as well as Torch outputs and guards; they enter the
+same dynamic plan without a workflow case list. The client wait is bounded at 15 minutes,
 including queueing; the execution watchdog is also 15 minutes. Individual
 subprocess timeouts do not reserve additional aggregate execution time.
 The final pytest collection freezes a nonempty source/environment/nodeid plan
