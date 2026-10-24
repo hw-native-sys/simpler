@@ -78,6 +78,25 @@ def environment_argv(config) -> list[str]:
     return ["--test-environment", config.getoption("--test-environment", default="default")]
 
 
+def validate_execution(config) -> None:
+    """Reject distributed execution before a controller can start workers."""
+    import pytest  # noqa: PLC0415
+
+    name = config.getoption("--test-environment", default="default")
+    if _environment(name).execution != "direct":
+        return
+    distributed = bool(config.getoption("numprocesses", default=None)) or (
+        config.getoption("dist", default="no") != "no" and bool(config.getoption("tx", default=()))
+    )
+    if (
+        distributed
+        or hasattr(config, "workerinput")
+        or config.getoption("looponfail", default=False)
+        or config.getoption("--resource-child", default=False)
+    ):
+        raise pytest.UsageError(f"{name} strict receipts support direct pytest execution only")
+
+
 def _checkout() -> Path:
     return Path(subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip())
 
@@ -153,8 +172,7 @@ def prepare_session(session) -> None:
         raise pytest.UsageError(f"{name} requires --junitxml to verify every selected test")
     if session.testsfailed or not session.items:
         raise pytest.UsageError(f"{name} requires a nonempty successful collection")
-    if config.getoption("--resource-child", default=False) or config.getoption("numprocesses", default=None):
-        raise pytest.UsageError(f"{name} strict receipts support direct pytest execution only")
+    validate_execution(config)
     cases = []
     for item in session.items:
         if environment_for_item(item) != name:

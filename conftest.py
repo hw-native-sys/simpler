@@ -542,6 +542,7 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "test_environment(name): required registered test environment")
     try:
         _test_environments.select_environment([], config.getoption("--test-environment"))
+        _test_environments.validate_execution(config)
     except ValueError as error:
         raise pytest.UsageError(str(error)) from error
 
