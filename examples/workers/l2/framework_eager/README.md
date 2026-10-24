@@ -19,6 +19,9 @@ and host queue bridge.
 Public `Worker.close()` drains accepted direct-chip runs through their normal
 RunHandle completion and retirement path before checking workspace ownership.
 Callers need not individually wait successful runs before closing the Worker.
+Unwaited L2 handles and their argument snapshots stay retained until
+`RunHandle.wait()` finalizes them or `Worker.close()` drains them. Long-lived
+callers should regularly retire completed handles to bound this host bookkeeping.
 A context refusal or timeout leaves the tree and ownership available for a later
 close retry; error delivery and completion proof remain separate. The framework
 must still publish and finish its queued callbacks before closing the Worker.
