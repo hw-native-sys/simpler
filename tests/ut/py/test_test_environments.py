@@ -121,6 +121,8 @@ real._test_environments.preflight = package_preflight
         timeout=60,
         check=False,
     )
+    (directory / "pytest.stdout").write_text(result.stdout)
+    (directory / "pytest.stderr").write_text(result.stderr)
     return result, directory / "results.plan.json", directory / "results.xml"
 
 
@@ -422,3 +424,70 @@ def test_actual_preflight_checks_metadata_without_importing_backends(tmp_path, m
     versions["torch_npu"] = "wrong-version"
     with pytest.raises(ValueError, match="found wrong-version"):
         test_environments.preflight("torch_npu")
+
+
+def _recording_direct_source(directory):
+    return (
+        _DIRECT.format(count=2)
+        .replace("import pytest", "import os\nfrom pathlib import Path\nimport pytest")
+        .replace(
+            "assert index >= 0",
+            f'Path({str(directory)!r}, "body-" + str(index)).write_text('
+            'os.environ.get("PYTEST_XDIST_WORKER", "controller"))',
+        )
+    )
+
+
+@pytest.mark.parametrize("arguments", [("-n", "2"), ("--dist", "load", "--tx", "2*popen")])
+def test_real_xdist_controller_refuses_strict_environment_before_bodies(tmp_path, arguments):
+    result, plan, _ = _run_pytest(
+        tmp_path, _recording_direct_source(tmp_path), "-p", "xdist.plugin", *arguments, "--max-worker-restart=0"
+    )
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not list(tmp_path.glob("body-*"))
+    assert not plan.exists()
+    assert "direct pytest execution only" in result.stdout + result.stderr
+
+
+def test_real_xdist_n_zero_preserves_direct_collection_and_receipts(tmp_path):
+    result, plan, xml = _run_pytest(tmp_path, _recording_direct_source(tmp_path), "-p", "xdist.plugin", "-n", "0")
+    _success(result)
+    assert {path.name: path.read_text() for path in tmp_path.glob("body-*")} == {
+        "body-0": "controller",
+        "body-1": "controller",
+    }
+    test_environments.verify_results(plan, xml)
+
+
+def test_real_xdist_workerinput_is_rejected_even_after_worker_options_are_reset(tmp_path):
+    # A default controller reaches a real xdist worker. The worker selects the
+    # strict profile before the production configure hook; workerinput is real.
+    extra = f"""
+import json
+original_configure = pytest_configure
+def pytest_configure(config):
+    if hasattr(config, "workerinput"):
+        record = {{"workerinput": config.workerinput,
+                   "numprocesses": config.getoption("numprocesses", default=None),
+                   "dist": config.getoption("dist", default=None)}}
+        Path({str(tmp_path)!r}, "worker-" + config.workerinput["workerid"] + ".json").write_text(json.dumps(record))
+        config.option.test_environment = "torch_npu"
+    original_configure(config)
+"""
+    result, _, _ = _run_pytest(
+        tmp_path,
+        _recording_direct_source(tmp_path),
+        "-p",
+        "xdist.plugin",
+        "-n",
+        "1",
+        "--max-worker-restart=0",
+        profile="default",
+        extra_conftest=extra,
+    )
+    records = [json.loads(path.read_text()) for path in tmp_path.glob("worker-*.json")]
+    assert records and records[0]["workerinput"]["workerid"] == "gw0"
+    assert records[0]["numprocesses"] is None
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert not list(tmp_path.glob("body-*"))
+    assert "direct pytest execution only" in result.stdout + result.stderr
