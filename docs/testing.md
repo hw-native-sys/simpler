@@ -40,7 +40,8 @@ checking optional dependencies and do not emit execution plans.
 
 The framework eager corpus shares one session-scoped optional bridge fixture.
 Its same-stream, cross-stream, alias/INOUT, callback-failure recovery and
-per-call-value modules are discovered by their environment declaration; adding
+per-call-value and diagnostic-selection modules are discovered by their environment
+declaration; adding
 a module does not require an expected-nodeid list or workflow path edit. Run the
 declared environment serially under one
 exclusive device allocation; a filtered plan proves only that filtered set.
