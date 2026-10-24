@@ -151,12 +151,12 @@ TEST(HbgReadyQueueSizing, DerivesCapacityForEachReachablePopulation) {
     predicated_sync_start.set_predicate();
     predicated_sync_start.set_sync_start();
 
-    populations.add_task(ActiveMask(SUBTASK_MASK_AIC), TaskAttrs{}, TaskKind::KERNEL, 9400);
-    populations.add_task(ActiveMask(SUBTASK_MASK_AIV0), sync_start, TaskKind::KERNEL, 3);
-    populations.add_task(ActiveMask(SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0), predicate, TaskKind::KERNEL, 5);
-    populations.add_task(ActiveMask{}, TaskAttrs{}, TaskKind::DUMMY);
-    populations.add_task(ActiveMask(SUBTASK_MASK_AIV1), predicated_sync_start, TaskKind::KERNEL, 3);
-    populations.add_task(ActiveMask{}, TaskAttrs{}, TaskKind::GRAPH, 7);
+    populations.add_task(LaneMask::aic(), TaskAttrs{}, TaskKind::KERNEL, 9400);
+    populations.add_task(LaneMask::aiv0(), sync_start, TaskKind::KERNEL, 3);
+    populations.add_task(LaneMask::aic() | LaneMask::aiv0(), predicate, TaskKind::KERNEL, 5);
+    populations.add_task(LaneMask{}, TaskAttrs{}, TaskKind::DUMMY);
+    populations.add_task(LaneMask::aiv1(), predicated_sync_start, TaskKind::KERNEL, 3);
+    populations.add_task(LaneMask{}, TaskAttrs{}, TaskKind::GRAPH, 7);
 
     ReadyQueueCapacities capacities{};
     ASSERT_TRUE(populations.derive_capacities(&capacities));
@@ -170,7 +170,7 @@ TEST(HbgReadyQueueSizing, DerivesCapacityForEachReachablePopulation) {
 
 TEST(HbgReadyQueueSizing, RejectsPopulationPastReservationLimit) {
     ReadyQueuePopulations populations{};
-    populations.add_task(ActiveMask(SUBTASK_MASK_AIC), TaskAttrs{}, TaskKind::KERNEL, READY_QUEUE_CAPACITY_LIMIT + 1);
+    populations.add_task(LaneMask::aic(), TaskAttrs{}, TaskKind::KERNEL, READY_QUEUE_CAPACITY_LIMIT + 1);
 
     ReadyQueueCapacities capacities{};
     EXPECT_FALSE(populations.derive_capacities(&capacities));
@@ -179,8 +179,8 @@ TEST(HbgReadyQueueSizing, RejectsPopulationPastReservationLimit) {
 TEST(HbgReadyQueueSizing, RejectsMergedPopulationPastReservationLimit) {
     ReadyQueuePopulations first{};
     ReadyQueuePopulations second{};
-    first.add_task(ActiveMask(SUBTASK_MASK_AIC), TaskAttrs{}, TaskKind::KERNEL, 20000);
-    second.add_task(ActiveMask(SUBTASK_MASK_AIC), TaskAttrs{}, TaskKind::KERNEL, 20000);
+    first.add_task(LaneMask::aic(), TaskAttrs{}, TaskKind::KERNEL, 20000);
+    second.add_task(LaneMask::aic(), TaskAttrs{}, TaskKind::KERNEL, 20000);
 
     first.add(second);
 
@@ -190,7 +190,7 @@ TEST(HbgReadyQueueSizing, RejectsMergedPopulationPastReservationLimit) {
 
 TEST(HbgReadyQueueSizing, BindRejectionReturnsReadyQueueOverflow) {
     ReadyQueuePopulations populations{};
-    populations.add_task(ActiveMask(SUBTASK_MASK_AIC), TaskAttrs{}, TaskKind::KERNEL, READY_QUEUE_CAPACITY_LIMIT + 1);
+    populations.add_task(LaneMask::aic(), TaskAttrs{}, TaskKind::KERNEL, READY_QUEUE_CAPACITY_LIMIT + 1);
     ReadyQueueCapacities capacities{};
 
     const int32_t status = derive_ready_queue_capacities(populations, &capacities);

@@ -499,9 +499,9 @@ bool AicoreLifecycle::collect_run_pmu_records(Runtime *runtime, uint64_t *missin
     uint64_t missing = 0;
     for (uint64_t task_id = 0; task_id < task_count; ++task_id) {
         if (!scheduler_task_is_executable(metadata[task_id].flags)) continue;
-        const uint8_t active_mask = metadata[task_id].active_mask;
+        const LaneMask active_mask = metadata[task_id].active_mask;
         for (uint8_t subtask = 0; subtask < SUBTASK_SLOT_COUNT; ++subtask) {
-            if ((active_mask & static_cast<uint8_t>(1U << subtask)) == 0) continue;
+            if (!active_mask.has(static_cast<SubtaskSlot>(subtask))) continue;
             SchedulerTaskPmuCell &cell =
                 cells[scheduler_task_trace_index(metadata[task_id].trace_index_base, active_mask, subtask)];
             cache_invalidate_range(&cell, sizeof(cell));

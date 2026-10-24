@@ -100,7 +100,7 @@ struct GraphPredicate {
 
 struct SubTaskDefinition {
     int32_t kernel_id[SUBTASK_SLOT_COUNT];
-    uint8_t active_mask;
+    LaneMask active_mask;
     uint8_t task_attrs;
     // Early-dispatch verdicts (ED_FLAG_CANDIDATE / ED_FLAG_TRACKED), decided once
     // per recorded shape rather than per execution: a body's structure is fixed by
@@ -230,6 +230,7 @@ static_assert(std::is_standard_layout_v<SubTaskDefinition>);
 // either, but pinning the size makes a new field's padding cost visible in the diff
 // that adds it rather than silently.
 static_assert(sizeof(SubTaskDefinition) == 80, "a SubTaskDefinition field changed the wire layout");
+static_assert(offsetof(SubTaskDefinition, active_mask) == 12);
 static_assert(std::is_trivially_copyable_v<GraphPredicate>);
 static_assert(std::is_standard_layout_v<GraphPredicate>);
 static_assert(std::is_trivially_copyable_v<GraphDefinition>);

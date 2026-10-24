@@ -41,6 +41,6 @@ GraphRecording *active_graph_recording(OrchestratorState *orch);
 // recording's tensor pool, which is allocated at the cap and never grows, so they
 // stay valid for the rest of the recording.
 TaskOutputTensors graph_record_submit_sub_task(
-    OrchestratorState *orch, const CoreTaskArgs &args, ActiveMask active_mask, TaskAttrs task_attrs,
+    OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
     int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
 );

@@ -119,7 +119,6 @@ bool bind_graph_topology(GraphExecution &execution, const GraphImageView &image,
     }
 
     uint64_t required_heap = 0;
-    constexpr uint8_t VALID_ACTIVE_MASK = (1U << SUBTASK_SLOT_COUNT) - 1U;
     for (int32_t i = 0; i < definition.task_count; ++i) {
         SubTaskDefinition task{};
         uint64_t sub_task_offset = 0;
@@ -140,13 +139,13 @@ bool bind_graph_topology(GraphExecution &execution, const GraphImageView &image,
             task.tensor_count > definition.tensor_arg_count - task.tensor_offset ||
             task.scalar_offset > definition.scalar_arg_count ||
             task.scalar_count > definition.scalar_arg_count - task.scalar_offset ||
-            (task.active_mask & ~VALID_ACTIVE_MASK) != 0 ||
+            !LaneMask::try_from_bits(task.active_mask.bits()).has_value() ||
             (task.ed_flags & ~(ED_FLAG_CANDIDATE | ED_FLAG_TRACKED)) != 0 || task.reserved != 0 ||
             task.logical_block_num <= 0 || task.total_required_subtasks < 0) {
             return false;
         }
         for (int32_t slot = 0; slot < SUBTASK_SLOT_COUNT; ++slot) {
-            const bool active = (task.active_mask & (1U << slot)) != 0;
+            const bool active = task.active_mask.has(static_cast<SubtaskSlot>(slot));
             if (active != (task.kernel_id[slot] != INVALID_KERNEL_ID)) return false;
         }
         const uint64_t output_bytes = CHIP_ALIGN_UP(static_cast<uint64_t>(task.total_output_size), CHIP_ALIGN_SIZE);
@@ -176,7 +175,7 @@ bool bind_graph_topology(GraphExecution &execution, const GraphImageView &image,
         }
         if ((consumer_task.ed_flags & ED_FLAG_CANDIDATE) != 0 &&
             (begin == end || consumer_task.predicate_slot != 0 ||
-             ActiveMask(consumer_task.active_mask).to_shape() == ResourceShape::DUMMY)) {
+             consumer_task.active_mask.to_shape() == ResourceShape::DUMMY)) {
             return false;
         }
         for (int32_t edge = begin; edge < end; ++edge) {
@@ -442,7 +441,7 @@ GraphMaterializeResult graph_execution_materialize_slice(
         // visible to one: materialization publishes tasks incrementally, so a
         // peer may scan this index as soon as published_tasks passes it.
         execution.reset_task_state(i);
-        slot.active_mask = ActiveMask(source.active_mask);
+        slot.active_mask = source.active_mask;
         slot.task_attrs = TaskAttrs(source.task_attrs);
         // Recording decided these once for the whole body; every execution of the
         // same Definition qualifies the same tasks, so materialization only
@@ -453,7 +452,7 @@ GraphMaterializeResult graph_execution_materialize_slice(
         slot.sub_task_local_id = i;
         // A task in a Graph body is an ordinary leaf, classified by the same rule as
         // one submitted outside a Graph. Its membership is carried by graph_context.
-        slot.task_kind = slot.active_mask.is_dummy() ? TaskKind::DUMMY : TaskKind::KERNEL;
+        slot.task_kind = slot.active_mask.is_empty() ? TaskKind::DUMMY : TaskKind::KERNEL;
         // A root carries no recorded verdict — qualification needs a producer to
         // bet on and a root has none inside the body — but an early-released
         // shell stages roots on the body's behalf, and push_ready_routed reads

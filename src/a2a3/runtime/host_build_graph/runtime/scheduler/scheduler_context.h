@@ -531,7 +531,7 @@ private:
     );
 
     bool enter_drain_mode(ChipTaskSlotState *slot_state, int32_t block_num);
-    int32_t count_global_available(ResourceShape shape, uint8_t core_mask, bool include_pending = false);
+    int32_t count_global_available(ResourceShape shape, LaneMask lanes, bool include_pending = false);
     struct SyncStartStageResult {
         int32_t staged_blocks{0};
         int32_t running_cores{0};

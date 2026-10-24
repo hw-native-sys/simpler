@@ -187,7 +187,7 @@ static void publish_aicore_task_timing(Runtime *runtime) {
         if (slot < 0 || slot >= NUM_TASK_TIMING_SLOTS) continue;
         if (!scheduler_task_is_executable(metadata[task_id].flags)) continue;
         for (uint8_t subtask = 0; subtask < 3; ++subtask) {
-            if ((metadata[task_id].active_mask & (1U << subtask)) == 0) continue;
+            if (!metadata[task_id].active_mask.has(static_cast<SubtaskSlot>(subtask))) continue;
             auto &trace = traces[scheduler_task_trace_index(
                 metadata[task_id].trace_index_base, metadata[task_id].active_mask, subtask
             )];

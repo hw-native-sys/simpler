@@ -79,7 +79,7 @@ void configure_normal_aiv_cluster(FixtureStorage &storage, uint64_t task_count) 
     for (uint64_t task = 0; task < task_count; ++task) {
         storage.metadata[task].kernel_ids[0] = UINT16_MAX;
         storage.metadata[task].kernel_ids[1] = 1;
-        storage.metadata[task].active_mask = 2;
+        storage.metadata[task].active_mask = LaneMask::aiv0();
         storage.metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
     }
 }
@@ -323,7 +323,7 @@ TEST(SchedulerClusterCompletion, SelfSlotsKeepDistinctSampledTraces) {
         local->set_timing_slot(1, index, index);
         slot.state = SchedulerDispatchSlotState::READY;
         slot.generation = ++local->dispatch_sequences[1];
-        storage.metadata[index].active_mask = 2;
+        storage.metadata[index].active_mask = LaneMask::aiv0();
         local->profiling->executor_traces[index].kernel_start_cycles = 100 + index;
         local->profiling->executor_traces[index].kernel_end_cycles = 200 + index;
         local->local_completed_generations[index] = slot.generation;
@@ -803,7 +803,7 @@ TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
     FixtureStorage storage(2, 3);
     GraphBuffer graph(2);
     graph.executable(0, 0);
-    graph.mixed(1, 3);
+    graph.mixed(1, LaneMask::aic() | LaneMask::aiv0());
     SchedulerWorkerContext &scheduler = storage.contexts[1];
     scheduler.is_scheduler = 1;
     scheduler.scheduler_count = 1;
@@ -812,7 +812,7 @@ TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
     scheduler.cluster_worker_ids[1] = 1;
     scheduler.cluster_worker_ids[2] = 2;
     storage.contexts[0].core_type = static_cast<int32_t>(CoreType::AIC);
-    storage.metadata[1].active_mask = 3;
+    storage.metadata[1].active_mask = (LaneMask::aic() | LaneMask::aiv0());
     uint64_t *callables = storage.callable_addresses;
     callables[1] = 0x1000;
     for (uint32_t slot_index = 0; slot_index < SCHEDULER_PENDING_SLOT_COUNT; ++slot_index)
@@ -1634,9 +1634,9 @@ struct MixFixture {
             set_task(task, 7);
     }
     void set_task(uint32_t task, uint8_t mask) {
-        graph.mixed(task, mask);
+        graph.mixed(task, LaneMask::from_bits(mask));
         auto &metadata = storage.metadata[task];
-        metadata.active_mask = mask;
+        metadata.active_mask = LaneMask::from_bits(mask);
         metadata.flags = SCHEDULER_TASK_EXECUTABLE | (__builtin_popcount(mask) > 1 ? SCHEDULER_TASK_MIX : 0);
         metadata.trace_index_base = task * 3;
         metadata.timing_slot = -1;

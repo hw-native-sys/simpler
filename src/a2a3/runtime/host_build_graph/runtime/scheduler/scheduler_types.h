@@ -367,15 +367,15 @@ public:
     // already-running core takes its pending slot and executes after its in-flight
     // task. REJECT only when a used core's pending slot is already occupied (no free
     // slot) or the mask is empty.
-    MixPlacement classify_mix_cluster(int32_t cluster_offset, uint8_t core_mask) const {
+    MixPlacement classify_mix_cluster(int32_t cluster_offset, LaneMask lanes) const {
         BitStates used;
-        if (core_mask & SUBTASK_MASK_AIC) {
+        if (lanes.has_aic()) {
             used |= BitStates::bit(cluster_offset);
         }
-        if (core_mask & SUBTASK_MASK_AIV0) {
+        if (lanes.has_aiv0()) {
             used |= BitStates::bit(cluster_offset + 1);
         }
-        if (core_mask & SUBTASK_MASK_AIV1) {
+        if (lanes.has_aiv1()) {
             used |= BitStates::bit(cluster_offset + 2);
         }
         if (!used.has_value() || (pending_occupied_ & used).has_value()) {
@@ -389,12 +389,12 @@ public:
         return MixPlacement::PENDING;
     }
 
-    BitStates get_mix_cluster_offset_states(uint8_t core_mask, MixPlacement placement) const {
+    BitStates get_mix_cluster_offset_states(LaneMask lanes, MixPlacement placement) const {
         BitStates result;
         BitStates candidates = get_cluster_offset_states();
         while (candidates.has_value()) {
             int32_t cluster_offset = candidates.pop_first();
-            if (classify_mix_cluster(cluster_offset, core_mask) == placement) {
+            if (classify_mix_cluster(cluster_offset, lanes) == placement) {
                 result |= BitStates::bit(cluster_offset);
             }
         }
@@ -408,61 +408,61 @@ public:
     // This is unsafe for immediate (non-gated) dispatch — hence separate from
     // classify_mix_cluster, which forces a single placement for the whole cluster.
 
-    // Cores of `cluster_offset` named by core_mask.
-    BitStates mix_used_cores(int32_t cluster_offset, uint8_t core_mask) const {
+    // Cores of `cluster_offset` named by lanes.
+    BitStates mix_used_cores(int32_t cluster_offset, LaneMask lanes) const {
         BitStates used;
-        if (core_mask & SUBTASK_MASK_AIC) used |= BitStates::bit(cluster_offset);
-        if (core_mask & SUBTASK_MASK_AIV0) used |= BitStates::bit(cluster_offset + 1);
-        if (core_mask & SUBTASK_MASK_AIV1) used |= BitStates::bit(cluster_offset + 2);
+        if (lanes.has_aic()) used |= BitStates::bit(cluster_offset);
+        if (lanes.has_aiv0()) used |= BitStates::bit(cluster_offset + 1);
+        if (lanes.has_aiv1()) used |= BitStates::bit(cluster_offset + 2);
         return used;
     }
 
     // Every used core has SOME free slot: a core lacks one only when it is running AND
     // its pending slot is occupied (both slots taken).
-    bool mix_cluster_all_slots(int32_t cluster_offset, uint8_t core_mask) const {
-        BitStates used = mix_used_cores(cluster_offset, core_mask);
+    bool mix_cluster_all_slots(int32_t cluster_offset, LaneMask lanes) const {
+        BitStates used = mix_used_cores(cluster_offset, lanes);
         if (!used.has_value()) return false;
         BitStates no_slot = (~core_states_) & pending_occupied_;  // running AND pending taken
         return !(used & no_slot).has_value();
     }
 
     // Used cores that are idle -> will take a running slot (rendezvous seed count).
-    int32_t mix_cluster_idle_core_count(int32_t cluster_offset, uint8_t core_mask) const {
-        return (mix_used_cores(cluster_offset, core_mask) & core_states_).count();
+    int32_t mix_cluster_idle_core_count(int32_t cluster_offset, LaneMask lanes) const {
+        return (mix_used_cores(cluster_offset, lanes) & core_states_).count();
     }
 
     // Clusters where every used core has a free slot (gated MIX split gate/iteration).
-    BitStates get_mix_split_cluster_offset_states(uint8_t core_mask) const {
+    BitStates get_mix_split_cluster_offset_states(LaneMask lanes) const {
         BitStates result;
         BitStates candidates = get_cluster_offset_states();
         while (candidates.has_value()) {
             int32_t off = candidates.pop_first();
-            if (mix_cluster_all_slots(off, core_mask)) {
+            if (mix_cluster_all_slots(off, lanes)) {
                 result |= BitStates::bit(off);
             }
         }
         return result;
     }
 
-    int32_t count_mix_split_clusters(uint8_t core_mask) const {
-        return get_mix_split_cluster_offset_states(core_mask).count();
+    int32_t count_mix_split_clusters(LaneMask lanes) const {
+        return get_mix_split_cluster_offset_states(lanes).count();
     }
 
-    BitStates get_mix_running_cluster_offset_states(uint8_t core_mask) const {
-        return get_mix_cluster_offset_states(core_mask, MixPlacement::RUNNING);
+    BitStates get_mix_running_cluster_offset_states(LaneMask lanes) const {
+        return get_mix_cluster_offset_states(lanes, MixPlacement::RUNNING);
     }
 
-    int32_t count_mix_running_clusters(uint8_t core_mask) const {
-        return get_mix_running_cluster_offset_states(core_mask).count();
+    int32_t count_mix_running_clusters(LaneMask lanes) const {
+        return get_mix_running_cluster_offset_states(lanes).count();
     }
 
     // Number of whole logical blocks this tracker can accept for sync_start
     // staging. AIC/AIV count cores; MIX counts clusters because one logical MIX
     // block may occupy multiple cores in the same cluster. Gated early staging
     // includes pending slots, while ready staging is restricted to idle slots.
-    int32_t count_available_blocks(ResourceShape shape, uint8_t core_mask, bool include_pending) const {
+    int32_t count_available_blocks(ResourceShape shape, LaneMask lanes, bool include_pending) const {
         if (shape == ResourceShape::MIX) {
-            return include_pending ? count_mix_split_clusters(core_mask) : count_mix_running_clusters(core_mask);
+            return include_pending ? count_mix_split_clusters(lanes) : count_mix_running_clusters(lanes);
         }
         if (shape == ResourceShape::DUMMY) return 0;
 

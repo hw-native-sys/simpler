@@ -1059,9 +1059,9 @@ bool bind_graph_definitions(
                 // singles out GRAPH and routes everything else by shape, and a Graph
                 // body member is never the shell, so the shape decides. Derived here
                 // the same way the device derives it, so the two cannot drift.
-                const ActiveMask mask(tasks[i].active_mask);
+                const LaneMask mask(tasks[i].active_mask);
                 packed_definition.ready_queue_populations.add_task(
-                    mask, TaskAttrs(tasks[i].task_attrs), mask.is_dummy() ? TaskKind::DUMMY : TaskKind::KERNEL
+                    mask, TaskAttrs(tasks[i].task_attrs), mask.is_empty() ? TaskKind::DUMMY : TaskKind::KERNEL
                 );
             }
             packed_definition.populations_ready = true;
@@ -1171,7 +1171,7 @@ bool create_scheduler_state(
         bool inline_dispatch_task = false;
         if (status != SchedulerGraphResult::OK) {
             bool inline_completed_task =
-                status == SchedulerGraphResult::UNSUPPORTED_SHAPE && slot.active_mask.raw() == 0 &&
+                status == SchedulerGraphResult::UNSUPPORTED_SHAPE && slot.active_mask.is_empty() &&
                 slot.logical_block_num == 1 && slot.total_required_subtasks == 0 &&
                 host_sm_handle.header->tasks.is_completed(task_id) && slot.task_attrs.allow_early_resolve() &&
                 !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
@@ -1179,7 +1179,7 @@ bool create_scheduler_state(
                 inline_completed_task_ids.push_back(task_id);
                 continue;
             }
-            inline_dispatch_task = status == SchedulerGraphResult::UNSUPPORTED_SHAPE && slot.active_mask.raw() == 0 &&
+            inline_dispatch_task = status == SchedulerGraphResult::UNSUPPORTED_SHAPE && slot.active_mask.is_empty() &&
                                    slot.logical_block_num == 1 && slot.total_required_subtasks == 0 &&
                                    !host_sm_handle.header->tasks.is_completed(task_id) &&
                                    !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
@@ -1191,16 +1191,15 @@ bool create_scheduler_state(
                 return false;
             }
             shape.task_id = task_id;
-            shape.active_mask = SUBTASK_MASK_AIV0;
+            shape.active_mask = LaneMask::aiv0();
         }
         // Ordinary tasks retain the existing ChipTaskSlotState scheduling
         // semantics. Only the legacy inline-dispatch fallback synthesizes its
         // AIV0 execution shape because it has no active subtask in the slot.
-        const uint8_t classified_active_mask = shape.active_mask;
-        const ActiveMask metadata_active_mask =
-            inline_dispatch_task ? ActiveMask(classified_active_mask) : slot.active_mask;
-        const uint8_t active_mask = metadata_active_mask.core_mask();
-        const uint32_t active_subtasks = static_cast<uint32_t>(__builtin_popcount(active_mask));
+        const LaneMask classified_active_mask = shape.active_mask;
+        const LaneMask metadata_active_mask = inline_dispatch_task ? classified_active_mask : slot.active_mask;
+        const LaneMask active_mask = metadata_active_mask;
+        const uint32_t active_subtasks = static_cast<uint32_t>(active_mask.count());
         if (slot.logical_block_num <= 0) {
             LOG_ERROR(
                 "A5 HBG AICore scheduler: task id=%" PRId64 " has invalid block_num=%d", task_id, slot.logical_block_num
@@ -1216,7 +1215,7 @@ bool create_scheduler_state(
             return false;
         }
         const uint32_t expected_subtasks = logical_block_num * active_subtasks;
-        if ((!inline_dispatch_task && (slot.active_mask.raw() != classified_active_mask ||
+        if ((!inline_dispatch_task && (slot.active_mask != classified_active_mask ||
                                        static_cast<uint32_t>(slot.total_required_subtasks) != expected_subtasks)) ||
             expected_subtasks > UINT16_MAX || host_sm_handle.header->tasks.is_completed(task_id) ||
             (slot.task_attrs.has_predicate() && (active_subtasks != 1 || logical_block_num != 1))) {
@@ -1228,7 +1227,7 @@ bool create_scheduler_state(
             return false;
         }
         for (uint32_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
-            if ((active_mask & (1U << subtask_slot)) == 0 || inline_dispatch_task) continue;
+            if (!active_mask.has(static_cast<SubtaskSlot>(subtask_slot)) || inline_dispatch_task) continue;
             const int32_t kernel_id = shape.kernel_ids[subtask_slot];
             if (kernel_id < 0 || kernel_id >= CHIP_MAX_FUNC_ID || runtime->get_function_bin_addr(kernel_id) == 0) {
                 LOG_ERROR(
@@ -1261,7 +1260,7 @@ bool create_scheduler_state(
         }
         SchedulerTaskMetadata &metadata = task_metadata[static_cast<size_t>(task_id)];
         for (uint32_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
-            metadata.kernel_ids[subtask_slot] = (active_mask & (1U << subtask_slot)) != 0 ?
+            metadata.kernel_ids[subtask_slot] = active_mask.has(static_cast<SubtaskSlot>(subtask_slot)) ?
                                                     static_cast<uint16_t>(shape.kernel_ids[subtask_slot]) :
                                                     UINT16_MAX;
         }
@@ -1274,11 +1273,11 @@ bool create_scheduler_state(
         sampled_task_timing_enabled =
             sampled_task_timing_enabled ||
             (metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT);
-        if ((active_mask & 1U) != 0) {
+        if (active_mask.has_aic()) {
             ++aic_task_count;
             aic_worker_demand = std::max<uint64_t>(aic_worker_demand, logical_block_num);
         }
-        const uint32_t active_aiv_subtasks = active_subtasks - ((active_mask & 1U) != 0 ? 1U : 0U);
+        const uint32_t active_aiv_subtasks = active_subtasks - (active_mask.has_aic() ? 1U : 0U);
         if (active_aiv_subtasks != 0) {
             ++aiv_task_count;
             aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, logical_block_num * active_aiv_subtasks);

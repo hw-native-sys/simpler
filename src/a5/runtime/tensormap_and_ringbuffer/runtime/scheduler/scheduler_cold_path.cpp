@@ -506,11 +506,7 @@ int32_t SchedulerContext::handle_timeout_exit(
                 [this, thread_idx](const ChipTaskSlotState &slot_state) {
                     dump_args_for_task<SUBTASK_SLOT_COUNT>(
                         thread_idx, *slot_state.task, *slot_state.payload, slot_state.active_mask,
-                        ArgsDumpStage::AFTER_COMPLETION,
-                        [](ActiveMask active_mask, int raw_subtask_id) {
-                            return active_mask.subtask_active(static_cast<SubtaskSlot>(raw_subtask_id));
-                        },
-                        [this](int32_t func_id) {
+                        ArgsDumpStage::AFTER_COMPLETION, [this](int32_t func_id) {
                             return get_function_bin_addr(func_id);
                         }
                     );

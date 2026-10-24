@@ -21,7 +21,7 @@ TEST(HostBuildGraphCoreTrackerTest, MixPlacementSelectionPreservesClustersAboveB
         tracker.set_cluster(cluster, offset, offset + 1, offset + 2);
     }
 
-    constexpr uint8_t used_mask = SUBTASK_MASK_AIC | SUBTASK_MASK_AIV0 | SUBTASK_MASK_AIV1;
+    constexpr LaneMask used_mask = LaneMask::aic() | LaneMask::aiv0() | LaneMask::aiv1();
     int32_t high_offset = (CoreTracker::MAX_CLUSTERS - 1) * 3;
     auto running = tracker.get_mix_cluster_offset_states(used_mask, CoreTracker::MixPlacement::RUNNING);
     EXPECT_EQ(running.count(), CoreTracker::MAX_CLUSTERS);
