@@ -32,6 +32,22 @@ Accept optional PR number (`123`, `#123`) to update a specific PR, or no input (
 3. [Lookup PR](../../lib/github/lookup-pr.md) by PR number (if provided) or by upstream head branch (`$HEAD_BRANCH` with `--head "$UPSTREAM_REMOTE:$HEAD_BRANCH"` for cross-fork) or by local branch name to check for existing PR
 4. **If PR number provided:** Run [detect-permission](../../lib/github/detect-permission.md) to setup cross-fork push target
 
+## Business context
+
+Read the latest linked Issue and confirmed design before publishing. One PR should
+deliver a meaningful agreed feature. The author owns delivery; do not require a PR
+assignee. A small self-contained change does not require a new Issue merely to open
+its PR. Preserve existing publication authorization and other authors' latest edits.
+
+Use `Fixes #N` only for complete resolution where closure on merge is appropriate.
+Use `Related to #N` for partial work, parent tracks or outstanding post-merge
+acceptance. Do not close an entire track from one child delivery. The title/body
+must describe final behavior, validation and limitations rather than review history.
+
+After publication use [fix-pr](../fix-pr/SKILL.md) for authorized feedback and CI
+follow-through. Maintainer review routing and merge are handled by
+[process-pr](../process-pr/SKILL.md); publishing does not itself authorize merging.
+
 ## Route
 
 | Existing PR? | Commits ahead? | Uncommitted? | Route |
@@ -96,7 +112,7 @@ gh pr create \
 - [ ] Simulation tests pass
 - [ ] Hardware tests pass (if applicable)
 
-Fixes #ISSUE_NUMBER (if applicable)
+Related to #ISSUE_NUMBER (if applicable; use Fixes only for complete resolution)
 EOF
 )"
 ```
@@ -143,7 +159,9 @@ If rebase introduces changes, re-validate the commit.
 
 ### B3. Update PR Title/Body
 
-If the commit message changed, update the PR to match:
+Reread the latest remote title/body and preserve others' changes. If scope,
+behavior, validation or limitations changed, update the relevant sections even
+when the commit subject stayed the same:
 
 ```bash
 gh pr edit --title "Updated title" --body "Updated body"

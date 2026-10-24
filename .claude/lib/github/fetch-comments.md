@@ -103,8 +103,11 @@ jq -r "${P}.comments.nodes[].id" /tmp/pr-feedback.json | grep -Fxv -f "$LEDGER"
 echo "$NODE_ID" >> "$LEDGER"
 ```
 
-`createdAt` / `submittedAt` is the fallback when the ledger is missing: anything
-predating the current HEAD commit's push was, in practice, already seen.
+This ledger only avoids duplicate replies; it is not proof of acceptance. Keep
+unresolved disputes visible, and re-read edited feedback and new replies even when
+an earlier ID was recorded. If the ledger is missing, reconstruct handling from
+actual replies and current code. Timestamps or a later push do not prove old
+feedback was read or addressed.
 
 ## Filtering bot noise (surface C)
 

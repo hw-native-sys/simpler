@@ -13,9 +13,9 @@ Create tasks to track progress through this workflow:
 
 1. Match input to PR
 2. Detect & classify issues
-3. Get user confirmation
+3. Reconcile scope and existing authorization
 4. Fix issues & push (fold into one commit — amend/squash, never append)
-5. Reply to all feedback; resolve the threads that support it
+5. Reply to actionable feedback; resolve only settled threads
 6. Re-check (loop until clean)
 
 ## Input
@@ -103,9 +103,15 @@ gh pr checks <NUMBER>
 
 Present: "**Iteration N** — Found X unresolved review threads, Y unhandled review bodies / conversation comments, and Z failed/pending checks."
 
-**Exit condition:** All checks green AND no unresolved threads AND no unhandled
-review bodies or conversation comments → done. Pending checks do NOT count as
-clean, and an unanswered conversation comment does NOT count as clean.
+**Exit condition:** Required checks pass under repository policy at the current
+head, non-required failures are triaged, and no blocking feedback remains across
+all three surfaces. Pending or unexplained skipped required checks are not success.
+Informational comments need no reply. A handled-ID entry only records processing;
+it does not prove a disputed finding accepted or a changes-requested review cleared.
+Re-read edited comments and new replies even if their earlier IDs were handled.
+A new head requires reconciling review and CI again. Author-side repairs complete
+does not mean maintainer approval or merge; hand that state to
+[process-pr](../process-pr/SKILL.md).
 
 ### Step 3: Detect Permission
 
@@ -159,36 +165,23 @@ For large logs: `gh run view --job <JOB_ID> --log-failed 2>&1 | grep -E "error:|
 
 **External checks** (non-GitHub Actions): no run ID exists — open the `link` URL directly to view logs from the external provider.
 
-### Step 5: Get User Confirmation
+### Step 5: Reconcile Scope and Authorization
 
-Present ALL issues in a numbered list:
+Summarize findings by feedback surface and CI failure, with the planned disposition:
+fix, explain, discuss or informational. Reuse the user's existing authorization.
+An instruction to fix the PR covers routine repairs within its agreed scope; do not
+require the user to select every null check, build repair or already-approved rebase.
 
-Label each item with its surface so the user can see nothing was dropped:
+Ask only about unresolved material design/scope trade-offs, disputed requirements
+or actions outside the authorized scope. Continue independent authorized fixes.
+Permission to write the fork is not permission to take over another author's work:
+confirm the writing scope and inspect active work before an authorized maintainer
+repair. Review-only requests do not enter this mutation workflow.
 
-```text
-Inline review threads:
-  1. [A] src/foo.cpp:42 — Missing null check (reviewer: alice)
-  2. [B] src/bar.py:15 — Style suggestion (reviewer: coderabbitai)
-Review bodies:
-  3. [A] CHANGES_REQUESTED — "split the ring resize out of this PR" (reviewer: bob)
-Conversation comments:
-  4. [A] "please rebase onto main, base moved" (reviewer: alice)
-  5. [C] CodeRabbit walkthrough — no action
-CI Failures:
-  6. [CI] build — error: 'Foo' is not a member of 'pto2'
-```
-
-Ask which to address/skip:
-
-- Recommend addressing Category A + CI items
-- Mark Category B with rationale for skipping or addressing
-- Mark Category C as skippable by default
-
-**User choices per comment:** Address (make changes) / Skip (resolve as-is) / Discuss (need clarification)
-
-Only proceed with the comments the user explicitly selects. Do NOT auto-resolve any comment without user consent.
-
-On subsequent iterations, reuse prior "address all" policy for same categories. When unsure about a comment's category, default to B.
+Keep permission to publish replies and resolve threads explicit in the task scope;
+reuse it when already granted. If missing, prepare the fix and proposed replies
+before asking about publication. Do not equate disagreement or a decision to skip
+an item with reviewer acceptance. Informational feedback needs no repetitive reply.
 
 ### Step 6: Work Location Setup & Fix Issues
 
@@ -227,7 +220,7 @@ churn. This is the default on **every** iteration.
 Stage the fix and count what is ahead of the base you rebased onto above:
 
 ```bash
-git add -A
+git add <intended-files>
 COMMITS_AHEAD=$(git rev-list HEAD --not "$BASE_REF" --count)
 ```
 
@@ -288,10 +281,13 @@ comments`, not the untouched original.
 
 ### Step 7: Reply and Resolve
 
-Every item presented in Step 5 gets an answer. How depends on its surface (see
+Every actionable item in Step 5 gets a disposition; informational noise needs no reply. How depends on its surface (see
 [reply-and-resolve](../../lib/github/reply-and-resolve.md)).
 
-**Surface A — inline review threads.** Both steps are mandatory:
+**Surface A — inline review threads.** For an accepted fix, reply with the
+change and validation, then resolve within the authorized scope. Leave disputed
+or unverified findings open until the reviewer or authorized maintainer accepts
+the disposition. A reply alone does not settle a disagreement. For settled items:
 
 1. **Reply** using the comment's `databaseId`:
 
@@ -330,7 +326,7 @@ the same feedback next iteration and the loop never converges.
 Reply templates:
 
 - **Fixed** → "Fixed — description of change" (do **not** cite a commit SHA: the PR commit is amended/squashed and force-pushed each iteration, so any SHA you quote is immediately stale)
-- **Skip** → "Follows `.claude/rules/<file>` — explanation"
+- **Discuss** → Explain the evidence and proposed disposition; leave the finding pending until accepted
 - **Ack** → "Acknowledged!"
 
 ### Step 8: Wait and Re-check
@@ -366,18 +362,18 @@ Then loop back to Step 2.
 
 - [ ] PR matched and validated
 - [ ] **All three feedback surfaces fetched** — inline threads, review bodies, conversation comments — plus CI status
-- [ ] ALL issues presented to user for selection, labelled by surface
+- [ ] Findings classified by surface; routine fixes use existing authority, unresolved material decisions are surfaced
 - [ ] Fixes folded into the PR (amended/squashed — **no appended `fix(pr)` commit**)
 - [ ] Verified `git rev-list HEAD --not "$BASE_REF" --count` == 1 before pushing
 - [ ] Changes force-pushed with `--force-with-lease` (single commit)
-- [ ] Inline threads replied to **and** resolved
+- [ ] Settled inline threads replied to and resolved; disputed findings remain explicitly pending
 - [ ] Review bodies / conversation comments replied to and recorded in the handled-ID ledger
 - [ ] Waited for CI/reviews and re-checked
 - [ ] Loop exited: all clean OR max iterations reached
 
 ## Remember
 
-**Not all comments require code changes.** Evaluate against `.claude/rules/` first. When in doubt, consult user.
+**Not all comments require code changes.** Evaluate against `.claude/rules/` first. Ask about material unresolved decisions; handle routine authorized repairs directly.
 
 **Feedback is not only inline review threads.** A review summary body or a plain
 conversation comment carries no `isResolved` flag and no file anchor, but it can

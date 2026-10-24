@@ -1,159 +1,85 @@
 ---
 name: fix-issue
-description: Fix a GitHub issue by fetching content, creating a branch, planning the fix, and implementing it. Use when the user asks to fix a specific issue number or work on a GitHub issue.
+description: Implement a GitHub Issue as its assignee or delegated contributor, selecting direct repair or develop-task planning and following through to a reviewed PR. Use when asked to fix or work on an Issue; use process-issue for maintainer triage.
 ---
 
-# Fix Issue Workflow
+# Fix an Issue
 
-Fetch GitHub issue, create branch, plan, and implement the fix.
+## Establish the task and owner
 
-## Workflow
+Use [GitHub setup](../../lib/github/setup.md) for repository, account and remotes.
+Read the latest Issue body, comments, assignee, state, related design, children,
+dependencies and linked PRs. Check current main and overlapping open/draft PRs
+before starting another implementation. Resume existing authorized work where
+appropriate. For a closed Issue, reconcile its resolution with the request: an
+explicit follow-up may proceed, but do not silently reopen or redo completed work.
 
-1. Setup (authenticate + detect role)
-2. Fetch issue content
-3. Assign issue to me
-4. Create issue branch
-5. Enter plan mode to design fix
-6. Implement the fix
-7. Run tests (use `testing` skill)
-8. Commit changes (use `git-commit` skill)
-9. Create PR (use `github-pr` skill)
+- If the user is the assignee, continue within the agreed scope.
+- If unassigned, follow maintainer/module-owner routing from
+  [process-issue](../process-issue/SKILL.md). Explicit delegation or permission to
+  claim may authorize self-assignment; do not auto-assign every unowned Issue.
+- If another person owns it, preserve that assignment. Explicit delegation or
+  independent investigation may proceed with clear scope and integration ownership;
+  otherwise clarify before competing implementation. Read-only investigation can
+  still establish what is needed.
+- Assignment failure is not a successful claim. Report it; separately authorized
+  implementation may continue without pretending the business owner changed.
 
-## Step 1: Setup
+If personal WudiTask coordination is enabled, use its installed skill to acquire
+or verify this execution before writing, and recheck before publication. Preserve
+the task/run identity through downstream skills. Do not require team-wide locks,
+a second business registration or separate claims for child agents.
 
-1. [Setup](../../lib/github/setup.md) — authenticate and detect context (role, remotes, state)
+## Decide whether to use develop-task
 
-This sets `ROLE` (owner/fork), `BASE_REF`, `PUSH_REMOTE`, `DEFAULT_BRANCH`, `PR_REPO_OWNER`, `PR_REPO_NAME`, and `PR_HEAD_PREFIX`.
+Choose based on the actual work, not merely that it came from an Issue:
 
-## Step 2: Fetch Issue Content
+| Situation | Execution path |
+| --------- | -------------- |
+| Bounded repair, known approach, focused validation | Implement directly with the focused skills below; no mandatory DAG or subagents |
+| Several dependent deliverables, material design choices, useful authorized parallel work, or substantial continuation across sessions | Use [develop-task](../develop-task/SKILL.md) to align design, plan dependencies and integrate results |
+| Existing accepted plan or active develop-task execution | Resume it and preserve approvals; do not start another manager or replan from scratch |
+| Initially small work reveals wider dependencies or unresolved architecture | Escalate to develop-task with evidence already collected |
 
-Use `PR_REPO_OWNER/PR_REPO_NAME` as the issue repo (upstream for fork contributors, origin for owners):
+A missing include with a clear build failure normally goes direct; a resource-lifetime
+change across backends normally needs `develop-task`. Neither path mandates a
+particular Plan Mode API. Ask about unresolved material scope/design decisions,
+not routine implementation already authorized. State the chosen path and why briefly.
 
-```bash
-gh issue view ISSUE_NUMBER --repo "$PR_REPO_OWNER/$PR_REPO_NAME"
-gh issue view ISSUE_NUMBER --repo "$PR_REPO_OWNER/$PR_REPO_NAME" \
-  --json number,title,body,state,labels
-```
+On handoff, pass Issue identity, ownership, acceptance, approvals, overlap findings
+and any personal execution identity. `develop-task` then owns execution; do not
+have it invoke this entry again for the same established context.
 
-**Parse**: Issue number, title, description, state (open/closed), labels
+## Implement and validate
 
-**If issue is closed**: Ask user if they still want to work on it.
+For direct work, state intended behavior, likely cause and focused validation.
+Follow `CLAUDE.md` and applicable rules. Use an isolated branch/worktree based on
+current `$BASE_REF`, or resume the established task branch. Inspect worktrees before
+creating or switching branches; never reset a branch another writer holds.
 
-## Step 3: Assign Issue to Me
+Reproduce defects where practical, make the bounded change and use
+[testing](../testing/SKILL.md) for appropriate checks. Keep one meaningful delivery
+per PR; do not split one owner's work into trivial child Issues or PRs to populate
+a DAG. If scope changes, reconcile acceptance and design before claiming completion.
+Documentation-only work needs document checks, not runtime tests.
 
-Before assigning, check if someone is already working on the issue:
+## Deliver and follow through
 
-```bash
-gh issue view ISSUE_NUMBER --repo "$PR_REPO_OWNER/$PR_REPO_NAME" \
-  --json assignees --jq '.assignees[].login'
-```
+Use [git-commit](../git-commit/SKILL.md) and [github-pr](../github-pr/SKILL.md) within
+the user's publication authorization. Describe final behavior, evidence and limits;
+preserve the repository's single final commit convention.
 
-**If assigned to current user**: Continue — already claimed.
+Link the Issue in the PR. Use `Fixes #N` only when the PR fully satisfies that Issue
+and closure on merge is appropriate. For partial delivery, parent tracks or pending
+post-merge acceptance, use `Related to #N` and state what remains. Do not automatically
+add closing keywords to every Issue reference.
 
-**If assigned to someone else**: Ask the user whether to proceed or pick a different issue.
+Use [fix-pr](../fix-pr/SKILL.md) for authorized feedback and CI follow-through.
+Report readiness for the exact current head. The maintainer's
+[process-pr](../process-pr/SKILL.md) owns review routing and authorized merge;
+creating a PR does not authorize merging it or taking over that role.
 
-**If unassigned**: Assign to yourself (best-effort — skip gracefully if permissions are insufficient):
-
-```bash
-gh issue edit ISSUE_NUMBER --repo "$PR_REPO_OWNER/$PR_REPO_NAME" --add-assignee @me
-```
-
-If the assignment fails due to permissions, continue with the workflow — do not block.
-
-## Step 4: Create Issue Branch
-
-Use a prefix that matches the issue type:
-
-| Issue Type | Branch Prefix |
-| ---------- | ------------- |
-| Bug fix | `fix/` |
-| New feature | `feat/` |
-| Refactoring | `refactor/` |
-| Documentation | `docs/` |
-| Other | `support/` |
-
-```bash
-git checkout "$BASE_REF"
-BRANCH_NAME="fix/issue-${ISSUE_NUM}-short-description"
-git checkout -b "$BRANCH_NAME"
-```
-
-**Important**: Always branch from `$BASE_REF` (detected by Setup). For owners this is `origin/main`, for fork contributors this is `upstream/main`.
-
-## Step 5: Enter Plan Mode
-
-Use `EnterPlanMode` to design the fix.
-
-**Plan should cover**:
-
-- Root cause analysis (for bugs)
-- Files that need changes
-- Implementation strategy
-- Testing approach (simulation, hardware, or both)
-- Which runtime(s) are affected
-
-## Step 6: Implement the Fix
-
-After plan approval, follow project conventions:
-
-1. Make code changes following plan
-2. Follow `.claude/rules/` conventions
-3. Stay within your assigned directory (see `CLAUDE.md` Directory Ownership)
-4. Add/update tests if applicable
-
-## Step 7: Run Tests
-
-```text
-/testing
-```
-
-Fix any failures before committing.
-
-## Step 8: Commit Changes
-
-```text
-/git-commit
-```
-
-**Commit message format**:
-
-```text
-Fix: brief description
-
-Fixes #ISSUE_NUMBER
-
-Detailed explanation of the fix.
-```
-
-## Step 9: Create PR
-
-```text
-/github-pr
-```
-
-This will automatically detect the role (owner/fork) and create the PR against the correct repo with the right `--head` prefix.
-
-## Common Issue Types
-
-| Type | Approach |
-| ---- | -------- |
-| Bug fix | Reproduce, root cause, fix, add regression test |
-| Feature request | Plan design, implement, add tests |
-| Refactoring | Plan changes, ensure tests pass |
-| Documentation | Fix/improve docs, verify examples work |
-
-## Checklist
-
-- [ ] Setup completed (role and remotes detected)
-- [ ] Issue content fetched and understood
-- [ ] Issue assignment attempted (best-effort)
-- [ ] Issue branch created from `$BASE_REF`
-- [ ] Plan created and approved
-- [ ] Fix implemented following `.claude/rules/`
-- [ ] Tests passing
-- [ ] Changes committed with issue reference (`Fixes #N`)
-- [ ] PR created via `/github-pr`
-
-## Remember
-
-**Reference the issue number** in commit messages using `Fixes #ISSUE_NUMBER` for auto-linking.
+Update confirmed progress in the Issue body and design discussion in comments when
+authorized. Reread before editing, preserve concurrent changes and verify writes.
+Report separately what is implemented, published, reviewed, merged and accepted;
+do not close a parent Issue because one delivery PR landed.

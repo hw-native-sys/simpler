@@ -48,11 +48,16 @@ Use the repository's existing skills for each operation:
 
 | Work | Existing workflow |
 | ---- | ----------------- |
-| Start from an Issue | [fix-issue](../fix-issue/SKILL.md) |
+| Establish Issue context, only if not already supplied | [fix-issue](../fix-issue/SKILL.md) |
 | Choose and run checks | [testing](../testing/SKILL.md) |
 | Commit and publish a PR | [git-commit](../git-commit/SKILL.md), [github-pr](../github-pr/SKILL.md) |
 | Review the implementation | [review-pr](../review-pr/SKILL.md) |
 | Address feedback and failed CI | [fix-pr](../fix-pr/SKILL.md) |
+
+When entered from `fix-issue`, reuse its established context and chosen plan. Do
+not call back into it for the same task or create another main agent. Maintainer
+triage and lifecycle management belong to [process-issue](../process-issue/SKILL.md)
+and [process-pr](../process-pr/SKILL.md), not to child implementation agents.
 
 These workflows retain their own permissions and project requirements. Design
 approval alone does not authorize public messages, merging or unrelated changes.

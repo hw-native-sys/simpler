@@ -9,6 +9,21 @@ Analyze and review PR changes using the correct merge-base diff.
 Optionally cross-check against independent local CLI reviewers when
 the user explicitly opts in — see [Input](#input).
 
+## Role and review freshness
+
+This skill performs technical review. Maintainer routing, readiness and merge
+follow-through belong to [process-pr](../process-pr/SKILL.md); author repairs belong
+to [fix-pr](../fix-pr/SKILL.md). Review-only work does not authorize changing the
+author's branch, posting a GitHub review or merging. Reuse explicit publication
+authority if supplied; otherwise return the review to the user.
+
+Record the actual reviewed base and head SHA and confirm the inspected checkout
+matches the PR head. Read existing discussion and findings before repeating them.
+If the head changes during review, reconcile the new diff or label the result as
+covering the old head. CI green is not a substitute for review; an agent's favorable
+verdict is not approval by a required GitHub reviewer. Preserve unresolved disputes
+and distinguish verified defects from hypotheses or optional improvements.
+
 ## Input
 
 Accept PR number (`123`, `#123`), or no input (review current branch

@@ -1,12 +1,14 @@
 # Reply and Resolve
 
 How to answer each of the three feedback surfaces from
-[fetch-comments](./fetch-comments.md). Every piece of feedback gets a reply;
-only surface A can additionally be resolved.
+[fetch-comments](./fetch-comments.md). Every actionable item gets a disposition; informational noise needs no reply;
+only surface A can additionally be resolved. Use existing publication authority;
+these API examples do not independently authorize posting or resolving.
 
 ## Surface A — inline review threads
 
-Both steps are required.
+For accepted and verified fixes, reply and resolve. Disputed or unverified
+findings stay open pending reviewer or authorized maintainer agreement.
 
 ### Step 1: Reply to the comment
 
@@ -20,7 +22,7 @@ gh api "repos/${PR_REPO_OWNER}/${PR_REPO_NAME}/pulls/${PR_NUMBER}/comments/${COM
 **Response templates:**
 
 - Fixed: `'Fixed — description'`
-- Skip: `'Current code follows .claude/rules/<file>'`
+- Discuss: explain why the current code follows a rule; keep the disputed finding pending
 - Acknowledged: `'Acknowledged, thank you!'`
 
 ### Step 2: Resolve the thread
@@ -39,7 +41,8 @@ mutation ResolveThread($threadId: ID!) {
 
 `$THREAD_ID` is the `id` field from the `reviewThreads.nodes[]` returned by [fetch-comments](./fetch-comments.md).
 
-**Both steps are mandatory.** Do not skip the resolve step.
+Resolve settled findings; do not resolve a disagreement merely because an
+explanation was posted. Thread resolution does not dismiss a blocking review.
 
 ## Surfaces B and C — review bodies and conversation comments
 
@@ -54,7 +57,9 @@ echo "$NODE_ID" >> "/tmp/pr-${PR_NUMBER}-handled.txt"
 
 - **Address the author by `@login`** — a conversation comment is not threaded, so without the mention it is unclear which feedback it answers. Quote the point being answered when several are outstanding.
 - **Batch one reply per iteration.** Answering five conversation comments with five separate posts spams the PR; one comment with a short bullet per point is the norm.
-- **Recording the ID is what makes the reply stick.** Skip it and the next iteration re-presents the same feedback as unaddressed.
+- **Record processing, not acceptance.** The ID avoids duplicate replies, but a
+  disputed item remains pending. Reconsider edited feedback and new replies; an ID
+  alone cannot prove a concern resolved.
 - Feedback that is purely informational (bot walkthrough, "nice work") needs no reply — just record its ID.
 
 Template for a batched reply:

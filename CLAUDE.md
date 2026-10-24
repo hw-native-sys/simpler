@@ -43,3 +43,17 @@ clang-format -i <file>
 Use [.claude/skills/develop-task/SKILL.md](.claude/skills/develop-task/SKILL.md)
 for goal/design alignment, internal task dependencies, parallel agents and
 reviewed delivery. Small changes can use the focused skills directly.
+
+## GitHub work by role
+
+- Maintainer: [process-issue](.claude/skills/process-issue/SKILL.md) for Issue
+  triage, ownership and closure; [process-pr](.claude/skills/process-pr/SKILL.md)
+  for review routing, merge readiness and authorized merge/Issue follow-through.
+- Assignee: [fix-issue](.claude/skills/fix-issue/SKILL.md), which selects direct
+  repair or `develop-task` according to the work's complexity.
+- PR author: [github-pr](.claude/skills/github-pr/SKILL.md) to publish and
+  [fix-pr](.claude/skills/fix-pr/SKILL.md) for feedback and CI repairs.
+- Reviewer: [review-pr](.claude/skills/review-pr/SKILL.md) for technical review.
+
+Issues carry an accountable assignee; PRs carry their author and requested reviewers.
+These workflows share GitHub records, not a second task queue.
