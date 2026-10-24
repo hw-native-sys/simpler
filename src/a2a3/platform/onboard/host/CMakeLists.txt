@@ -137,14 +137,19 @@ target_compile_definitions(host_runtime PRIVATE
 )
 
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
-    target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
+    target_compile_definitions(host_runtime PRIVATE
+        SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1
+        PTO_COMM_WORKSPACE_SDMA_SUPPORTED=1
+        PTO_COMM_WORKSPACE_URMA_SUPPORTED=0
+        PTO_COMM_WORKSPACE_RDMA_SUPPORTED=0
+    )
 endif()
 
 set(SIMPLER_PTO_ISA_BUILD_COMMIT "" CACHE STRING
     "PTO-ISA commit used for host_runtime cache key")
 
-# Bake the resolved pto-isa commit into the compile command. pto-isa headers
-# (e.g. kSdmaMaxChan in sdma_workspace_manager.hpp) are compiled into this .so,
+# Bake the resolved pto-isa commit into the compile command. pto-isa workspace
+# headers (e.g. kSdmaWorkspaceBytes) are compiled into this .so,
 # but a pto-isa update leaves the runtime repo HEAD — and the pto-isa header
 # mtimes — untouched, so a plain reinstall serves a stale object from ccache.
 # This define perturbs the ccache key so a pto-isa bump forces a real recompile.
@@ -188,6 +193,7 @@ endif()
 # CANN 9.x exposes the working non-V2 HCCL entry points through libhcomm.
 # Link it explicitly so comm_hccl.cpp can follow the same initialization path
 # as the pto-isa communication tests.
+unset(HCOMM_LIB CACHE)
 find_library(
     HCOMM_LIB
     NAMES hcomm
@@ -228,6 +234,10 @@ target_link_directories(host_runtime
     PRIVATE
         ${ASCEND_HOME_PATH}/lib64
         ${ASCEND_HOME_PATH}/runtime/lib64
+)
+
+set_target_properties(host_runtime PROPERTIES
+    BUILD_RPATH "${ASCEND_HOME_PATH}/lib64;${ASCEND_HOME_PATH}/runtime/lib64;${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/lib64"
 )
 
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")

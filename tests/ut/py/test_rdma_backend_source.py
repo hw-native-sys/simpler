@@ -43,12 +43,15 @@ def test_rdma_kernel_backend_exposes_deferred_adapter_contract() -> None:
     assert "TGET_ASYNC<pto::comm::DmaEngine::RDMA>" in backend
     assert "TPUT_ASYNC<pto::comm::DmaEngine::RDMA>" in backend
     assert "register_rdma_async_event" in backend
+    assert "CompletionRecordCount(session)" in backend
+    assert "CompletionRecordAt(session, 0U)" in backend
+    assert "CompletionKind::RDMA_HNS1825_CQE" in backend
     assert "COMPLETION_ENGINE_ROCE" in backend
-    assert "COMPLETION_TYPE_RDMA_EVENT_HANDLE" in backend
-    assert "event.handle," in backend
+    assert "COMPLETION_TYPE_RDMA_HNS1825_CQE" in backend
+    assert "reinterpret_cast<uint64_t>(record.addr)" in backend
     assert "COMPLETION_ENGINE_ROCE," in backend
-    assert "COMPLETION_TYPE_RDMA_EVENT_HANDLE," in backend
-    assert "reinterpret_cast<uint64_t>(workspace)" in backend
+    assert "COMPLETION_TYPE_RDMA_HNS1825_CQE," in backend
+    assert "reinterpret_cast<uint64_t>(workspace)" not in backend
 
 
 def test_rdma_kernel_backend_uses_peer_mr_base_not_windows_in() -> None:
@@ -64,11 +67,11 @@ def test_rdma_completion_type_is_registered_in_async_wait() -> None:
     wait_source = ASYNC_WAIT.read_text(encoding="utf-8")
     type_source = MAILBOX_TYPES.read_text(encoding="utf-8")
 
-    assert "#define COMPLETION_TYPE_RDMA_EVENT_HANDLE 3" in type_source
+    assert "#define COMPLETION_TYPE_RDMA_HNS1825_CQE 3" in type_source
     assert "backend/rdma/rdma_completion_scheduler.h" in wait_source
-    assert "rdma_event_handle_poll_op" in wait_source
-    assert "rdma_event_handle_retire_op" in wait_source
-    assert "COMPLETION_TYPE_RDMA_EVENT_HANDLE = 3" in wait_source
+    assert "rdma_hns1825_cqe_poll_op" in wait_source
+    assert "rdma_hns1825_cqe_retire_op" in wait_source
+    assert "COMPLETION_TYPE_RDMA_HNS1825_CQE = 3" in wait_source
 
 
 def test_a5_host_cmake_gates_rdma_workspace_overlay() -> None:
@@ -88,8 +91,8 @@ def test_a5_comm_hccl_keeps_urma_and_rdma_workspace_paths_macro_gated() -> None:
 
     assert "#ifdef SIMPLER_ENABLE_PTO_URMA_WORKSPACE" in source
     assert "#ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE" in source
-    assert '#include "pto/comm/async/rdma/rdma_workspace_manager.hpp"' in source
-    assert "std::unique_ptr<pto::comm::rdma::RdmaWorkspaceManager> rdma_workspace" in source
+    assert '#include "pto/comm/workspace.hpp"' in source
+    assert "pto::comm::Workspace rdma_workspace" in source
 
 
 def test_a5_comm_hccl_uses_mr1374_rdma_host_api_shape() -> None:
@@ -110,8 +113,9 @@ def test_a5_comm_hccl_uses_mr1374_rdma_host_api_shape() -> None:
     assert 's.find("\\"CLOS\\"", dev_key_pos)' in source
     assert "hccn_tool -g -dev_info -i %d" in source
     assert '\\"addr\\"' in source
-    assert "manager->Init(config)" in source
-    assert "WorkspaceInitResult::READY" in source
+    assert "pto::comm::RdmaTransportConfig" in source
+    assert "pto::comm::CreateWorkspace(pto::comm::DmaEngine::RDMA" in source
+    assert "WorkspaceStatus::Ok" in source
     assert "RdmaBackend::HNS_1825" not in source
 
 
@@ -139,46 +143,36 @@ def test_kernel_compiler_adds_ascend_device_headers_for_rdma_backend_headers() -
     assert "for inc_dir in self.get_ascend_incore_include_dirs():" in source
 
 
-def test_rdma_scheduler_abi_matches_mr1374_workspace_and_hns1825_contexts() -> None:
+def test_rdma_scheduler_consumes_the_exported_completion_record() -> None:
     source = RDMA_SCHEDULER.read_text(encoding="utf-8")
 
-    assert "uint32_t rank_count;" in source
-    assert "uint32_t reserved;" in source
-    assert "uint32_t local_token_id" not in source
-    assert "static_assert(sizeof(RdmaWqCtx) == 96" in source
-    assert "static_assert(sizeof(RdmaCqCtx) == 64" in source
-    assert "struct Hns1825Cqe" in source
-    assert "static_assert(sizeof(Hns1825Cqe) == 32" in source
-    assert "struct RdmaMemInfo" in source
-    assert "static_assert(sizeof(RdmaMemInfo) == 24" in source
-    assert "uint32_t cqe_size;" in source
-    assert "1u << cq_ctx.cqe" not in source
-    assert "db_sw_addr" in source
-    assert "is_hns1825_cqe_owner_ready" in source
-    assert "const uint32_t cq_ring = cq_ctx.depth;" in source
-    assert "kHns1825CqeMaxGenNum" not in source
-    assert "owner_id_qpn" in source
-    assert "op_sr_wqebb" in source
+    assert "poll_rdma_hns1825_cqe_record(uint64_t cqe_addr, uint32_t expected_owner)" in source
+    assert "kRdmaCqeOwnerBit" in source
+    assert "retire_rdma_hns1825_cqe_record" in source
+
+    # The record carries the CQE address and the owner value that marks it done, so the scheduler
+    # holds no copy of the RDMA queue layout and no ABI-drift guard for one.
+    assert "struct RdmaInfo" not in source
+    assert "struct RdmaWqCtx" not in source
+    assert "struct RdmaCqCtx" not in source
+    assert "struct Hns1825Cqe" not in source
+    assert "struct RdmaMemInfo" not in source
+    assert "load_wq_ctx" not in source
+    assert "load_cq_ctx" not in source
+    assert "load_mem_info" not in source
+    assert "poll_rdma_event_handle" not in source
+    assert "ABI drift" not in source
 
 
-def test_rdma_scheduler_stall_snapshot_reports_sq_and_cq_progress() -> None:
+def test_rdma_scheduler_stall_snapshot_reads_the_record() -> None:
     source = RDMA_SCHEDULER.read_text(encoding="utf-8")
 
-    assert "load_device_u32_or_zero" in source
-    assert "load_wq_ctx" in source
-    assert "load_cq_ctx" in source
-    assert "load_mem_info" in source
-    assert "sq=0x%llx rq=0x%llx scq=0x%llx rcq=0x%llx mem=0x%llx" in source
-    assert "%s wqn=%u depth=%u wqe_size=%u head=%u tail=%u db_sw_be=0x%x" in source
-    assert "head_addr=0x%llx " in source
-    assert "tail_addr=0x%llx db_hw=0x%llx db_sw=0x%llx" in source
-    assert "%s cqn=%u depth=%u cqe_size=%u cur_head=%u cur_tail=%u target_head=%u" in source
-    assert "db_sw_be=0x%x cq_buf=0x%llx" in source
-    assert "log_rdma_mem_snapshot" in source
-    assert "log_rdma_wqe_snapshot" in source
-    assert "%s wqe index=%u addr=0x%llx raw64=" in source
-    assert 'log_rdma_wq_snapshot("rq"' in source
-    assert 'log_rdma_cq_snapshot("rcq"' in source
+    assert "log_rdma_hns1825_cqe_record_snapshot" in source
+    assert "op_sr_wqebb=0x%x" in source
+    assert "log_rdma_wq_snapshot" not in source
+    assert "log_rdma_cq_snapshot" not in source
+    assert "log_rdma_mem_snapshot" not in source
+    assert "log_rdma_wqe_snapshot" not in source
 
 
 def test_rdma_domain_bootstrap_resolves_env_arrays_by_domain_rank() -> None:

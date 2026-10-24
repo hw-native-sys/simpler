@@ -94,9 +94,8 @@ UrmaTput(const DstTensor &dst, const SrcTensor &src, __gm__ uint8_t *workspace, 
 namespace pto2::detail {
 
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
-inline __aicore__ bool register_urma_async_event(
-    AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session, __gm__ uint8_t *workspace
-);
+inline __aicore__ bool
+register_urma_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session);
 
 }  // namespace pto2::detail
 
@@ -192,7 +191,7 @@ inline __aicore__ bool submit_urma_request_once(AsyncCtx &ctx, UrmaRequestDescri
     } else {
         event = pto::comm::TPUT_ASYNC<pto::comm::DmaEngine::URMA>(desc.dst, desc.src, session);
     }
-    if (!pto2::detail::register_urma_async_event(ctx, event, session, desc.workspace)) {
+    if (!pto2::detail::register_urma_async_event(ctx, event, session)) {
         return false;
     }
     pto2::detail::defer_flush(ctx);
@@ -301,9 +300,8 @@ inline __aicore__ void defer_flush(AsyncCtx & /*ctx*/) { __asm__ __volatile__(""
 #endif
 
 template <typename PtoAsyncEvent, typename PtoAsyncSession>
-inline __aicore__ bool register_urma_async_event(
-    AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session, __gm__ uint8_t *workspace
-) {
+inline __aicore__ bool
+register_urma_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsyncSession &session) {
     if (!ctx.task_token.is_valid() || ctx.completion_count == nullptr || ctx.completion_entries == nullptr) {
         (void)event.Wait(session);
         return true;
@@ -313,23 +311,35 @@ inline __aicore__ bool register_urma_async_event(
     }
 
     const uint32_t engine = static_cast<uint32_t>(event.engine);
-    if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::URMA) || workspace == nullptr) {
+    const uint32_t record_count = event.CompletionRecordCount(session);
+    if (engine != static_cast<uint32_t>(::pto::comm::DmaEngine::URMA) || record_count == 0U ||
+        record_count > ctx.completion_capacity) {
         defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         (void)event.Wait(session);
         return false;
     }
 
-    CompletionToken token{
-        event.handle,
-        0,
-        COMPLETION_ENGINE_URMA,
-        COMPLETION_TYPE_URMA_EVENT_HANDLE,
-        reinterpret_cast<uint64_t>(workspace),
-    };
-    if (!register_completion_condition(ctx, token)) {
-        defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
-        (void)event.Wait(session);
-        return false;
+    for (uint32_t record_index = 0U; record_index < record_count; ++record_index) {
+        const auto record = event.CompletionRecordAt(session, record_index);
+        if (record.kind != ::pto::comm::CompletionKind::URMA_CQE_DW0 || record.addr == nullptr ||
+            record.expected > 1ULL) {
+            defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            (void)event.Wait(session);
+            return false;
+        }
+
+        CompletionToken token{
+            reinterpret_cast<uint64_t>(record.addr),
+            static_cast<uint32_t>(record.expected),
+            COMPLETION_ENGINE_URMA,
+            COMPLETION_TYPE_URMA_CQE_RECORD,
+            0,
+        };
+        if (!register_completion_condition(ctx, token)) {
+            defer_error(ctx, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED);
+            (void)event.Wait(session);
+            return false;
+        }
     }
     return true;
 }

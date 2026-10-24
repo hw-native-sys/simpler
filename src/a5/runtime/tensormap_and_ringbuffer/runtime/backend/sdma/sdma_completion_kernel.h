@@ -101,18 +101,19 @@ register_pto_async_event(AsyncCtx &ctx, const PtoAsyncEvent &event, const PtoAsy
         return;
     }
 
-    uint64_t post_id = 0;
-    uint32_t queue_num = 0;
-    __gm__ uint8_t *post_done_base = session.sdmaRuntimeCtx.postDoneBase;
-    if (!::pto::comm::sdma::detail::DecodeSdmaEventHandle(event.handle, post_id, queue_num) ||
-        post_done_base == nullptr) {
+    const uint32_t record_count = event.CompletionRecordCount(session);
+    if (record_count == 0U || record_count > ctx.completion_capacity) {
         defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         return;
     }
-    for (uint32_t queue_id = 0; queue_id < queue_num; ++queue_id) {
-        register_sdma_post_done_record(
-            ctx, ::pto::comm::sdma::detail::GetPostDoneRecordAddr(post_done_base, queue_id), post_id
-        );
+    for (uint32_t record_index = 0U; record_index < record_count; ++record_index) {
+        const auto record = event.CompletionRecordAt(session, record_index);
+        if (record.kind != ::pto::comm::CompletionKind::SDMA_POST_DONE || record.addr == nullptr ||
+            record.expected == 0ULL) {
+            defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+            return;
+        }
+        register_sdma_post_done_record(ctx, record.addr, record.expected);
     }
 }
 

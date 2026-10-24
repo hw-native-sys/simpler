@@ -48,7 +48,7 @@
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-#include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
+#include "pto/comm/workspace.hpp"
 #endif
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation
@@ -1076,14 +1076,6 @@ static int domain_alloc_via_ipc(
     return 0;
 }
 
-// Host wrapper owning one SDMA-enabled Worker's provisioned resources. The
-// opaque handle returned to the runner IS this manager; dma_workspace_release()
-// destroys it. There is no per-device generation gate: an SDMA-enabled Worker
-// owns its provider for its whole life and releases it at finalize.
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-using SdmaManager = pto::comm::sdma::SdmaWorkspaceManager;
-#endif
-
 extern "C" uint32_t dma_workspace_supported_mask(void) {
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     return uint32_t{1} << DMA_WORKSPACE_SDMA;
@@ -1095,9 +1087,8 @@ extern "C" uint32_t dma_workspace_supported_mask(void) {
 extern "C" uint32_t dma_workspace_channel_count(void) {
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     // kSdmaMaxChannelGroups, not the device-side kSdmaMaxChannel: the two are the
-    // same 48 (PTO static_asserts kPostMaxQueues == kSdmaMaxChannelGroups) but
-    // only this one comes in through the host-safe workspace-manager header, and
-    // it is what SdmaWorkspaceManager::Init actually creates streams for.
+    // same 48 (PTO static_asserts kPostMaxQueues == kSdmaMaxChannelGroups) and
+    // this is the host-visible count used by the unified SDMA workspace provider.
     return pto::comm::sdma::kSdmaMaxChannelGroups;
 #else
     return 0;
@@ -1115,29 +1106,16 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
     if ((required_mask & (uint32_t{1} << DMA_WORKSPACE_SDMA)) == 0) return 0;
     if (count <= DMA_WORKSPACE_SDMA) return -1;
     try {
-        auto manager = std::make_unique<SdmaManager>();
-        bool init_ok = false;
-        try {
-            // Init creates the 48 STARS streams + 16KB workspace. It may fail
-            // after creating only a subset; destructing that partial manager on
-            // an error-state card can itself stall, so leak it on failure rather
-            // than risk the stall.
-            init_ok = manager->Init();
-        } catch (...) {
-            LOG_ERROR("SdmaWorkspaceManager::Init threw; abandoning its partial resources");
-        }
-        if (!init_ok) {
-            (void)manager.release();
+        auto workspace = std::make_unique<pto::comm::Workspace>();
+        pto::comm::WorkspaceRequest req{};
+        const auto status = pto::comm::CreateWorkspace(pto::comm::DmaEngine::SDMA, req, workspace.get());
+        if (status != pto::comm::WorkspaceStatus::Ok || workspace->addr == nullptr) {
+            pto::comm::AbandonWorkspace(workspace.get());
+            LOG_ERROR("dma_workspace_provision: SDMA workspace creation failed (status=%d)", static_cast<int>(status));
             return -1;
         }
-        const uint64_t addr = reinterpret_cast<uint64_t>(manager->GetWorkspaceAddr());
-        if (addr == 0) {
-            (void)manager.release();
-            LOG_ERROR("dma_workspace_provision: manager returned a null workspace address");
-            return -1;
-        }
-        addr_out[DMA_WORKSPACE_SDMA] = addr;
-        *handle_out = manager.release();
+        addr_out[DMA_WORKSPACE_SDMA] = reinterpret_cast<uint64_t>(workspace->addr);
+        *handle_out = workspace.release();
         return 0;
     } catch (...) {
         LOG_ERROR("dma_workspace_provision: exception while provisioning SDMA");
@@ -1152,8 +1130,8 @@ extern "C" void dma_workspace_release(void *handle) {
 #ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     if (!handle) return;
     try {
-        std::unique_ptr<SdmaManager> manager(static_cast<SdmaManager *>(handle));
-        manager.reset();
+        std::unique_ptr<pto::comm::Workspace> workspace(static_cast<pto::comm::Workspace *>(handle));
+        pto::comm::DestroyWorkspace(workspace.get());
     } catch (...) {
         LOG_ERROR("dma_workspace_release: exception while releasing SDMA resources");
     }
@@ -1780,7 +1758,6 @@ extern "C" int comm_destroy(CommHandle h) try {
             if (rc == 0) rc = -1;
         }
     }
-
     // NOTE: we do NOT destroy h->stream — it is caller-owned.
     // We also do NOT call aclrtResetDevice / aclFinalize here.  Device/ACL
     // lifecycle belongs to DeviceRunner, whose finalize() releases all
