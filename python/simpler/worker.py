@@ -268,6 +268,16 @@ from .global_comm_domain import (
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
+from .session_cleanup import (
+    GROUP_CLEANUP_RECORD_NAME,
+    MAX_RECORD_BYTES,
+    CleanupOutcome,
+    ProcessExit,
+    SessionCleanupReport,
+    ShutdownCommand,
+    decode_runner_record,
+    format_cleanup_failure,
+)
 from .task_interface import (
     MAILBOX_ARGS_CAPACITY,
     MAILBOX_ERROR_MSG_SIZE,
@@ -3284,6 +3294,24 @@ def _provider_sweep_debt_errors(results: tuple[ProviderReleaseResult, ...]) -> l
     return errors
 
 
+def _read_group_cleanup_record(ready_dir: str) -> SessionCleanupReport | None:
+    """Read back the cleanup record rank 0 left beside the group manifest.
+
+    A missing, oversized or undecodable file is the unknown answer: the group
+    was reaped before rank 0 could write one, or it never reached its own
+    teardown. Read before the directory is removed and only after the group has
+    been waited on, which is what makes a present record a complete one.
+    """
+    try:
+        with open(os.path.join(ready_dir, GROUP_CLEANUP_RECORD_NAME), "rb") as f:
+            raw = f.read(MAX_RECORD_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > MAX_RECORD_BYTES:
+        return None
+    return decode_runner_record(raw)
+
+
 def _read_teardown_report(shm: SharedMemory, child_pid: int) -> TeardownReport:
     """Copy one reaped child's teardown record out of its mailbox.
 
@@ -5745,6 +5773,10 @@ class Worker:
         # keyed by that child's pid. Absent means the child never reaped, which
         # is a different answer from an uncommitted record.
         self._teardown_reports: dict[int, TeardownReport] = {}
+        # What closing each remote L3 session established about its shutdown
+        # command, its process and its resource release, keyed by remote worker
+        # id. Absent means this Worker never closed that session.
+        self._session_cleanup_reports: dict[int, SessionCleanupReport] = {}
         self._sub_shms: list[SharedMemory] = []
         self._sub_pids: list[int] = []
 
@@ -6400,16 +6432,38 @@ class Worker:
         )
 
     def _close_remote_session(self, session: _RemoteSession, *, timeout_s: float = 1.0) -> None:
-        """Best-effort protocol shutdown for a remote L3 session."""
+        """Send a remote L3 session the shutdown command, and record what that established.
+
+        The row is written here rather than returned, because this is where the
+        facts are known and because nothing in the close sequence may depend on
+        a return value: one session's bookkeeping cannot be allowed to strand
+        the sessions after it.
+
+        Delivery is best-effort: one unreachable session must not strand the
+        rest, and this lane is not where a healthy session learns to stop. A
+        delivery that fails is therefore a launcher note on this session's row,
+        not an error that stops the close.
+
+        Every peer-side fact is UNKNOWN here by construction, which is the
+        honest answer rather than a gap left to be filled in later: this lane
+        carries no acknowledgement, a send that succeeds locally only proves the
+        bytes were queued, and the session's process belongs to the remote
+        daemon, which this Worker cannot reap or question.
+        """
 
         from .remote_l3_protocol import FrameHeader, FrameType, send_frame  # noqa: PLC0415
 
+        notes: tuple[str, ...] = ()
         try:
             with socket.create_connection((session.command_host, session.command_port), timeout=timeout_s) as sock:
                 sock.settimeout(timeout_s)
                 send_frame(sock, FrameHeader(FrameType.SHUTDOWN, session.session_id, session.worker_id, 0))
-        except BaseException:  # noqa: BLE001
-            pass
+        except BaseException as exc:  # noqa: BLE001 -- recorded per session, never raised past this lane
+            notes = (format_cleanup_failure("remote L3 session shutdown delivery", exc),)
+        report = SessionCleanupReport(worker_id=session.worker_id, notes=notes)
+        self._session_cleanup_reports[session.worker_id] = report
+        if notes:
+            self._warn_session_cleanup((report,))
 
     def _close_remote_sessions(self, sessions: list[_RemoteSession]) -> None:
         for session in reversed(sessions):
@@ -6417,8 +6471,29 @@ class Worker:
 
     def _release_remote_sessions(self) -> None:
         sessions = list(self._remote_sessions)
-        self._close_remote_sessions(sessions)
-        self._remote_sessions.clear()
+        try:
+            self._close_remote_sessions(sessions)
+        finally:
+            # Every session here has had its shutdown attempted, so none may
+            # keep a registry entry: a surviving entry would make a later close
+            # re-address a session this one already released.
+            self._remote_sessions.clear()
+
+    @staticmethod
+    def _warn_session_cleanup(reports: Iterable[SessionCleanupReport]) -> list[str]:
+        """Put every incomplete session close on stderr, and return those lines.
+
+        The ledger is queried deliberately, so a close that could not account
+        for a session has to be visible without being asked. Visible, not
+        fatal: see ``session_cleanup_reports`` for why a peer's release is
+        reported rather than raised.
+        """
+        lines = [report.describe() for report in reports]
+        if lines:
+            sys.stderr.write("\n".join(f"[worker pid={os.getpid()}] WARN: session cleanup {line}" for line in lines))
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+        return lines
 
     @staticmethod
     def _new_remote_session_id() -> int:
@@ -6435,17 +6510,21 @@ class Worker:
         group: _MpiL3GroupRuntime,
         *,
         timeout_s: float,
+        reports: dict[int, SessionCleanupReport] | None = None,
     ) -> list[str]:
         failures: list[str] = []
         group.closing = True
         proc = group.process
         if proc is not None:
             try:
-                # The remote sessions received SHUTDOWN before this runs, so a
-                # healthy group exits by itself once its ranks close their
-                # inner workers. SIGTERM is the backstop, not the first move:
-                # a rank interrupted mid native teardown dies uncleanly and
-                # mpirun reports the whole job as a bad termination.
+                # Waited first, because a rank interrupted mid native teardown
+                # dies uncleanly and mpirun reports the whole job as a bad
+                # termination. The wait is all that stands between a group and
+                # that outcome: no shutdown command reaches these ranks, since
+                # MpiGroupMailboxChannel::shutdown() runs only from
+                # RemoteL3Endpoint::request_progress_stop() and a healthy close
+                # never calls it, so SIGTERM below is the only move rather than
+                # a backstop. The ledger reports this as command=NOT_OBSERVED.
                 if proc.poll() is None:
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         proc.wait(timeout=timeout_s)
@@ -6483,6 +6562,15 @@ class Worker:
                 failures.append(f"close mailbox: {exc}")
             finally:
                 group.mailbox = None
+        # Read before the directory goes, and after the wait above: a record
+        # present now is one rank 0 finished writing.
+        record = None if group.ready_dir is None else _read_group_cleanup_record(group.ready_dir)
+        if record is not None and record.cleanup is CleanupOutcome.FAILED:
+            # Warned, not added to this close's failures. The list below is
+            # teardown debt this Worker owns and can retry; a peer's release
+            # already happened on another process and no retry here changes it,
+            # so it belongs in the ledger and on stderr.
+            Worker._warn_session_cleanup((record,))
         try:
             if group.ready_dir is not None:
                 shutil.rmtree(group.ready_dir)
@@ -6493,7 +6581,73 @@ class Worker:
         finally:
             group.ready_dir = None
             group.manifest_path = None
-        return [f"MPI L3 group {group.group_id} cleanup {failure}" for failure in failures]
+        group_failures = [f"MPI L3 group {group.group_id} cleanup {failure}" for failure in failures]
+        if reports is not None:
+            Worker._record_mpirun_group_cleanup(group, proc, record, tuple(group_failures), reports)
+        return group_failures
+
+    @staticmethod
+    def _record_mpirun_group_cleanup(
+        group: _MpiL3GroupRuntime,
+        proc: subprocess.Popen[Any] | None,
+        record: SessionCleanupReport | None,
+        notes: tuple[str, ...],
+        reports: dict[int, SessionCleanupReport],
+    ) -> None:
+        """Fill one ledger row per rank of a group this Worker has closed.
+
+        The three events reach this host by three different routes, and the row
+        keeps them apart rather than deriving one from another:
+
+        - the **release** result arrives only from rank 0, the one rank that
+          shares a filesystem with this launcher, so every other rank's row
+          reports it UNKNOWN;
+        - the **command** comes from the same record but is a group fact — the
+          shutdown opcode is broadcast to every rank before any of them acts on
+          it — so it applies to all rows;
+        - the **process** is this Worker's own observation of the one ``mpirun``
+          it owns, and it stands even when no record was written, which is what
+          separates a group that was reaped silently from one still running.
+
+        A rank whose release failed without being rank 0 therefore shows as
+        ``cleanup=unknown`` with a non-zero ``exit_status``: mpirun fails the
+        job when any rank does.
+
+        ``notes`` are this Worker's own group-level observations — a process it
+        could not reap, a mailbox it could not unlink — so every row of the
+        group carries the same ones.
+
+        A later close attempt never weakens a row. Retried teardown runs with
+        the process handle and the manifest directory already dropped, so it
+        observes strictly less than the attempt that did the work; only a row
+        that gained a record is replaced.
+        """
+        if proc is None:
+            process_exit, exit_status = ProcessExit.UNKNOWN, None
+        else:
+            # Sampled once: EXITED must come with the status that made it exit,
+            # and a second poll could answer a different question.
+            status = proc.poll()
+            if status is None:
+                process_exit, exit_status = ProcessExit.RUNNING, None
+            else:
+                process_exit, exit_status = ProcessExit.EXITED, int(status)
+        for rank in group.ranks:
+            own = record if record is not None and record.rank == rank.rank else None
+            previous = reports.get(rank.worker_id)
+            if previous is not None and (previous.committed or own is None):
+                continue
+            reports[rank.worker_id] = SessionCleanupReport(
+                worker_id=rank.worker_id,
+                committed=own is not None,
+                command=ShutdownCommand.UNKNOWN if record is None else record.command,
+                process_exit=process_exit,
+                exit_status=exit_status,
+                cleanup=CleanupOutcome.UNKNOWN if own is None else own.cleanup,
+                failures=() if own is None else own.failures,
+                notes=notes,
+                rank=rank.rank,
+            )
 
     def _close_mpirun_groups(
         self,
@@ -6503,7 +6657,7 @@ class Worker:
     ) -> None:
         failures: list[str] = []
         for group in reversed(self._mpi_l3_groups):
-            failures.extend(self._close_mpirun_group(group, timeout_s=timeout_s))
+            failures.extend(self._close_mpirun_group(group, timeout_s=timeout_s, reports=self._session_cleanup_reports))
         if failures:
             sys.stderr.write("\n".join(f"[worker pid={os.getpid()}] WARN: {failure}" for failure in failures) + "\n")
             sys.stderr.flush()
@@ -12944,6 +13098,49 @@ class Worker:
         behind it, and an unknown record asserts nothing at all.
         """
         return dict(self._teardown_reports)
+
+    def session_cleanup_reports(self) -> dict[int, SessionCleanupReport]:
+        """What closing each remote L3 session established, keyed by worker id.
+
+        Valid once ``close()`` has run; before that the map is empty, because a
+        row is written as each session is closed. A retried close never weakens
+        a row it already wrote.
+
+        Three events, deliberately kept apart, because a single answer cannot
+        carry them: whether the peer read the shutdown command, whether its
+        process exited and with what status, and what its own resource release
+        returned. Each is independently unknown-able, and ``UNKNOWN`` is a real
+        answer rather than a defect — it says this route cannot see that far.
+
+        A missing key is a session this Worker never closed. A row whose
+        ``committed`` is false is one that was closed without the peer's own
+        record reaching this host: the process died before writing it, or the
+        route has no way to carry it back. ``process_exit`` is this Worker's own
+        observation and stands either way, so a group reaped without a record
+        is distinguishable from one still running.
+
+        What each route can see today:
+
+        - **mpirun group** — rank 0 writes its release result beside the group
+          manifest and this Worker reads it after reaping ``mpirun``. The other
+          ranks do not share this filesystem, so their rows report
+          ``cleanup=UNKNOWN``; their releases show up as the group's
+          ``exit_status``, which mpirun makes non-zero when any rank fails.
+        - **TCP remote session** — every peer-side field is ``UNKNOWN``. That
+          lane carries no acknowledgement, and the session's process belongs to
+          the remote daemon, which this Worker can neither reap nor question. A
+          shutdown this Worker could not even deliver is recorded in ``notes``.
+
+        Observation only, and that governs who fails. A row reporting
+        ``CleanupOutcome.FAILED`` goes to stderr but does not fail ``close()``:
+        the release happened in another process, and no retry on this side
+        changes it, so it is reported rather than raised. What still fails a
+        close is this Worker's own teardown debt — a process it could not reap,
+        a mailbox it could not unlink — which a later attempt can retry.
+        ``CleanupOutcome.SUCCEEDED`` is what the peer's own ``Worker.close()``
+        returned, and a row that reports UNKNOWN asserts nothing at all.
+        """
+        return dict(self._session_cleanup_reports)
 
     def _release_all_buffers(self) -> None:
         """Close + unlink every owner Buffer (called from close()).
