@@ -130,7 +130,7 @@ inline constexpr uint64_t kFixtureCallableCount = 1024;
 struct FixtureStorage {
     explicit FixtureStorage(
         uint64_t task_count, uint64_t workers = 2, uint64_t traces_per_task = 1,
-        const SchedulerSpmdRequirements &spmd = {}
+        const SchedulerSpmdRequirements &spmd = {}, bool protocol_profiling = false
     ) :
         test_profiles(workers),
         test_contexts(workers),
@@ -141,9 +141,9 @@ struct FixtureStorage {
                 scheduler_initialize_free_slot(&slot);
         for (auto &slot : scheduler_local_state.slots)
             scheduler_initialize_free_slot(&slot);
-        EXPECT_TRUE(
-            scheduler_plan_layout(task_count, task_count, 0, &layout, false, task_count * traces_per_task, spmd)
-        );
+        EXPECT_TRUE(scheduler_plan_layout(
+            task_count, task_count, 0, &layout, false, task_count * traces_per_task, spmd, protocol_profiling
+        ));
         scheduler_state = std::make_unique<SchedulerStateBuffer>(layout);
         run_control = scheduler_state_at<SchedulerRunControl>(scheduler_state->base(), layout.run_control_offset);
         contexts = scheduler_state_at<SchedulerWorkerContext>(scheduler_state->base(), layout.worker_contexts_offset);

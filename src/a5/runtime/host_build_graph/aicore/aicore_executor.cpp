@@ -583,6 +583,13 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         context->exit_ack_publish_cycles = stats.exit_ack_publish_cycles;
         scheduler_publish_cache_line(&context->completion_enqueue_cycles);
     }
+    if constexpr (WithProfiling) {
+        if (profile.protocol_layout_offset != 0)
+            scheduler_protocol_finish(
+                scheduler_state_base, &scheduler_local_state,
+                config_valid && scheduler_gm_fetch_add(run_control->scheduler_error, UINT64_C(0)) == 0
+            );
+    }
     // Complete preceding GM writes before ACK. Stays outside profiling: the
     // tail is optional, this ordering is not.
     OUT_OF_ORDER_STORE_BARRIER();

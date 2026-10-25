@@ -993,3 +993,73 @@ stream 无 dropped/truncated。不是只检查身份行数等于普通执行行�
 日志 `outputs/spmd-execution-identity-final-r2-python-20261025.log`。本次阶段提交包含入口快照、
 共享 DFX extension 的透明传递、严格连接与配对检查、两视图展示、CSA 身份门禁和相应 TDD；
 不包含用户未跟踪的 atomic_probe、原始泳道或 TMR CSA。历史结果不改写为新的通过证据。
+
+## 2026-10-25：完整协议采集的存储与准入／局部关闭接线
+
+起点为 `fb413ad12`，本阶段不 push。完整协议采集仍在实现，不能把本节的局部事件
+或 CPU helper 测试当作原样 CSA 的全协议审计通过。
+
+Host 布局增加可选的协议记录区，使用已有 trace 索引空间以及实际 task、worker、
+协同任务数量规划：task 的准入／完成两条独立 64B line、逐成员观察／关闭记录、
+block owner／三 lane 记录、kernel 执行记录和逐 worker 序号／终态。
+没有全局 trace 原子计数器，没有每核一份全 block 历史，没有 Scalar 动态分配。
+GraphSummary 复用 padding 存放协议区 offset，仍为 128B；本核常驻状态仍为 504B，
+仅可选 profiling 状态从 240B 增至 248B。Host 生产入口尚未开启该区，
+后续须接完事件和导出审计后复用既有 L4 配置，不增加新的用户功能开关。
+
+新增布局测试覆盖 3／63／66／96／108 个 worker、精确大小与互不重叠、epoch 0/MAX、
+旧缓冲区重用清零、缩小运行不暴露旧尾部、乘积／总长溢出和关闭诊断时保持原布局。
+首轮 5 项实际 RED 暴露 Summary 的 protocol offset 要在布局初始化时发布，而不能等到
+后续任务记录初始化；修复后该测试目标共 114 项通过。
+日志 `outputs/spmd-protocol-layout-red-20261025.log`、`outputs/spmd-protocol-layout-green-20261025.log`。
+
+真实准入 helper 在短锁内记录成功发布的前／后区间；锁竞争 RETRY 不生成虚假事件。
+成员首次观察记录实际关键读得到的 commit_tail，重复 poll 不重复记事件。
+普通 LocalDone 记录实际已耗尽 cursor 和本核未退役槽位；GM Mix 的 AIC 记录其实际 cursor
+与写出的 seal，AIV 记录读到的 seal，cursor 用 UINT64_MAX 表示未观察，不从 N 伪造观察值。
+这些记录均发生在清除本核义务之前；零工作成员无需等 TaskDone。
+发布者的结束时间可能晚于消费者观察时间，因此保留区间与每核局部序号，
+后续审计不能简单按全局时间排序推断因果。
+
+新增准入测试先得到 4 项 RED，接线后转绿；GM 零工作 cluster 关闭测试另有 1 项 RED 后转绿。
+还覆盖了不同发布者共同定序、epoch 0/MAX、worker 65 与物理核 ID 区分、重复记录不覆盖、
+序号不回绕、坏布局／残留 worker 状态拒绝、关闭采集不写协议区等。
+诊断错误用单写者 sticky flags 保存，不伪造成功记录，也不因采集失败改写正常调度完成数。
+真实 executor 的公共退出尾部刷新 worker 终态，成功与失败分开；测试实际调用该 executor，
+确认晚启动 C/V 零工作成员先完成全部本核关闭，再 ACK；已有错误或 seal 超时保留不完整状态。
+
+16 个相关 C++ targets 共 571 项通过，日志 `outputs/spmd-protocol-all-cpp-20261025.log`。
+首轮 runtime 重编未通过：AICore 链接报告 `__multi3` 未定义，不能据此运行旧二进制作新代码验收。
+最小 CCEC 探针 `outputs/spmd-protocol-arithmetic-probe-20261025.cpp` 的 ELF 重定位显示：
+唯一 `__multi3` 调用位于动态 `tasks > UINT64_MAX / workers` 溢出检查函数；
+固定 640B 除法以及先验证各操作数上界的函数没有该调用。
+修正为检查 task 数不超过 INT32_MAX、worker 数不超过既有容量，再计算乘积；
+Host 的通用 checked arithmetic 保留。修正后的 runtime 重编及受影响测试正在执行，结果续记。
+格式化使用仓库 pre-commit 固定的 clang-format 21；系统版本 18 的额外换行已由规范版本纠正。
+
+尚待接线：block claim／完成票号、组发布／到达／释放、kernel entry／return／输出可见／退役、
+逻辑 TaskDone 和实际 ordinary entry permit、Host 导出、完整原生因果审计及严格 CSA 门禁。
+本节没有完成 sync_start，也没有形成关闭完整 trace 后的性能结论。
+
+修正后的 runtime 重编通过，日志 `outputs/spmd-protocol-events-runtime-build-r2-20261025.log`；
+AIC 合并对象不再含未定义 `__multi3`。重新构建的 16 个相关 C++ targets 共 571 项通过，
+Python 合约／CSA／转换器／身份检查共 1766 项通过，日志分别为
+`outputs/spmd-protocol-all-cpp-r2-20261025.log`、`outputs/spmd-protocol-python-20261025.log`。
+本阶段相对上一提交增加 42 项 C++ 检查，不将完整测试目标的数量当作全是新增用例。
+
+HBG 仿真 42 passed、378 deselected（52.76 秒），A5 60 passed、4 skipped、356 deselected
+（150.29 秒）。日志 `outputs/spmd-protocol-hbg-sim-20261025.log` 和
+`outputs/spmd-protocol-native-20261025/hbg.log`。按当前 CI 配置，仿真 session timeout 为 600 秒，
+onboard 为 1200 秒；两者显式排除已知误收集的双卡 TMR RDMA 目录，不宣称多卡覆盖。
+架构预检查脚本依旧因本机没有 npu-smi 退出；CANN query 确认 Ascend950PR_958b、32 C／64 V，
+按用户明确要求直接在设备 0 运行；本机没有 task-submit，不宣称有该队列的隔离保障。
+
+原样 CSA 严格 L4 回归：`outputs/csa-hbg-l4-oktn_ne5/result.json`，两轮各七项 golden、
+2308 条执行身份、133 条依赖边、107/107 Host 记录、producer=aicore、
+block_identity_verified=true，冻结 case 与基线一致。
+这里使用的是新编译 runtime，但 Host 尚未分配协议区；因此证明现有 CSA 路径未回归，
+不证明上述新增事件的设备采集或完整协议审计。后者必须在剩余接线和导出完成后另行验收。
+本次阶段提交只固化已通过检查的记录基础和接线，不包含输出产物或用户未跟踪文件。
+
+适用 pre-commit 检查全部通过，日志 `outputs/spmd-protocol-precommit-20261025.log`；
+未跳过 clang-format、clang-tidy、cpplint 或文档检查。此后只补充本段验收记录，未改变已测源码。

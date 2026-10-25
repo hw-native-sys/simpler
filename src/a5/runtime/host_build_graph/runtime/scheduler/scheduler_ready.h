@@ -251,6 +251,7 @@ struct SchedulerLocalConfig {
 struct SchedulerLocalProfilingState {
     uint64_t trace_cells_offset{0};
     uint64_t activity_buffers_offset{0};
+    uint64_t protocol_layout_offset{0};
     SchedulerExecutorTaskTrace executor_traces[SCHEDULER_PENDING_SLOT_COUNT]{};
     SchedulerWorkerTraceCache worker_traces[PLATFORM_CORES_PER_BLOCKDIM]{};
     // Indexed by (lane, slot) like the slots themselves, which is what keeps a
@@ -365,7 +366,7 @@ static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 120, "64-bi
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 504, "64-bit local state size changed");
 static_assert(
-    sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 240, "64-bit local profiling size changed"
+    sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 248, "64-bit local profiling size changed"
 );
 
 // Called once after READY acquire, before any bootstrap or mailbox operation.

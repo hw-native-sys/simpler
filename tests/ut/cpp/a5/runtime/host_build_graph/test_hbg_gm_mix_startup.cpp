@@ -39,8 +39,8 @@ void identity_test_kernel(__gm__ int64_t *) {
 }
 
 struct StartupFixture {
-    explicit StartupFixture(const std::array<uint8_t, 2> &masks) :
-        storage(2, 6, 3, SchedulerSpmdRequirements{6, 2, 2, 2}) {
+    explicit StartupFixture(const std::array<uint8_t, 2> &masks, bool protocol_profiling = false) :
+        storage(2, 6, 3, SchedulerSpmdRequirements{6, 2, 2, 2}, protocol_profiling) {
         startup_reg_base = registers.data();
         graph_view = graph.graph();
         uint32_t trace = 0;
@@ -94,8 +94,10 @@ struct StartupFixture {
 
     void finish_both_tasks_on_cluster_zero() {
         std::array<SchedulerLocalState, 3> locals{};
+        std::array<SchedulerLocalProfilingState, 3> profiles{};
         std::array<SchedulerAdmissionLocalState, 3> admissions{};
         for (uint32_t lane = 0; lane < 3; ++lane) {
+            if (storage.layout.protocol_layout_offset != 0) locals[lane].profiling = &profiles[lane];
             ASSERT_TRUE(scheduler_initialize_local_config(base(), &storage.contexts[lane], &graph_view, &locals[lane]));
             ASSERT_TRUE(scheduler_initialize_admission(base(), &locals[lane], &admissions[lane]));
             locals[lane].admission = &admissions[lane];
@@ -177,7 +179,9 @@ struct StartupFixture {
         scheduler_gm_store(storage.run_control->bootstrap_arrived_count, UINT64_C(5));
         write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
         write_reg(RegId::COND, 0);
-        run_resident_scheduler<false>(&storage.contexts[worker], storage.run_control, base(), 0, 0, 0);
+        if (storage.layout.protocol_layout_offset != 0)
+            run_resident_scheduler<true>(&storage.contexts[worker], storage.run_control, base(), 4, 0, 0);
+        else run_resident_scheduler<false>(&storage.contexts[worker], storage.run_control, base(), 0, 0, 0);
     }
 
     scheduler_test::FixtureStorage storage;
@@ -255,6 +259,68 @@ TEST(HbgGmMixStartupExit, MissingCoordinatorSealTimeoutIdentifiesTheWaitingTaskA
     EXPECT_EQ(startup_kernel_calls, 0u);
     EXPECT_EQ(startup_ssbuf_calls, 0u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.seal(0, 1), UINT64_C(0)), 0u);
+}
+
+TEST(HbgProtocolStartupExit, RealExecutorFinishesLateZeroWorkMembersAfterClosingEveryObligation) {
+    StartupFixture fixture({6, 7}, true);
+    fixture.finish_both_tasks_on_cluster_zero();
+    auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    auto *members = scheduler_state_at<SchedulerProtocolMemberTrace>(
+        fixture.base(), fixture.storage.layout.protocol.members_offset
+    );
+    for (uint32_t worker = 3; worker < 6; ++worker) {
+        fixture.run_late_worker(worker);
+        ASSERT_EQ(fixture.storage.run_control->scheduler_error, 0u);
+        EXPECT_EQ(read_reg(RegId::COND), AICORE_EXITED_VALUE);
+        EXPECT_EQ(workers[worker].finished, 1u);
+        EXPECT_EQ(workers[worker].error_flags, 0u);
+        EXPECT_EQ(workers[worker].next_sequence, 4u);
+        EXPECT_EQ(members[worker].observed.sequence, 1u);
+        EXPECT_EQ(members[worker].closed.sequence, 2u);
+        EXPECT_EQ(members[6 + worker].observed.sequence, 3u);
+        EXPECT_EQ(members[6 + worker].closed.sequence, 4u);
+        EXPECT_EQ(startup_kernel_calls, 0u);
+        EXPECT_EQ(startup_ssbuf_calls, 0u);
+    }
+}
+
+TEST(HbgProtocolStartupExit, RealExecutorErrorExitDoesNotMarkUnfinishedProtocolSuccessful) {
+    StartupFixture fixture({6, 6}, true);
+    fixture.finish_both_tasks_on_cluster_zero();
+    scheduler_record_error(
+        fixture.storage.run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS,
+        &fixture.graph_view, &fixture.storage.contexts[3], SchedulerErrorSite::ORDERED_EXIT_IN_FLIGHT
+    );
+    fixture.run_late_worker();
+    const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(workers[3].finished, 2u);
+    EXPECT_EQ(workers[3].next_sequence, 0u);
+    EXPECT_EQ(fixture.seal(0, 1), 0u);
+    EXPECT_EQ(fixture.seal(1, 1), 0u);
+    EXPECT_EQ(read_reg(RegId::COND), AICORE_EXITED_VALUE);
+}
+
+TEST(HbgProtocolStartupExit, RealExecutorSealTimeoutPreservesObservedButUnclosedMember) {
+    StartupFixture fixture({6, 6}, true);
+    fixture.finish_both_tasks_on_cluster_zero();
+    fixture.storage.run_control->scheduler_timeout_cycles = PLATFORM_PROF_SYS_CNT_FREQ / 1000;
+    fixture.run_late_worker(4);
+    const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    const auto *members = scheduler_state_at<SchedulerProtocolMemberTrace>(
+        fixture.base(), fixture.storage.layout.protocol.members_offset
+    );
+    EXPECT_EQ(workers[4].finished, 2u);
+    EXPECT_EQ(workers[4].next_sequence, 1u);
+    EXPECT_EQ(members[4].observed.sequence, 1u);
+    EXPECT_EQ(members[4].closed.sequence, 0u);
+    EXPECT_EQ(fixture.storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
+    EXPECT_EQ(read_reg(RegId::COND), AICORE_EXITED_VALUE);
 }
 
 class HbgExecutionIdentityEntry : public ::testing::TestWithParam<std::tuple<uint32_t, uint64_t>> {};

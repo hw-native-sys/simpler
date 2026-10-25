@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "scheduler_ready.h"
+#include "scheduler_protocol.h"
 
 enum class SchedulerAdmissionResult : uint8_t { PROGRESS, RETRY, ERROR };
 
@@ -87,6 +87,7 @@ scheduler_initialize_admission(__gm__ void *base, const SchedulerLocalState *loc
         next.gm_mix.mailbox_offset = summary->group_mailboxes_offset + cluster * sizeof(SchedulerGroupMailbox);
         next.gm_mix.cluster_index = static_cast<uint32_t>(cluster);
     }
+    if (!scheduler_protocol_bind(base, local)) return false;
     next.initialized = true;
     *out = next;
     return true;
@@ -314,6 +315,7 @@ inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission(
     if (valid && tail >= admission->capacity)
         valid = scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_LOG_CAPACITY);
     if (valid) {
+        scheduler_protocol_admission(base, local, task, tail, record->flags, true);
         record->order_key = tail;
         scheduler_publish_cache_line(record);
         auto *log = scheduler_state_at<int64_t>(base, admission->log_offset);
@@ -322,6 +324,7 @@ inline __aicore__ SchedulerAdmissionResult scheduler_try_commit_admission(
         scheduler_cache_barrier();
         scheduler_gm_store(shared->commit_tail, tail + 1);
         scheduler_cache_barrier();
+        scheduler_protocol_admission(base, local, task, tail, record->flags, false);
     }
     scheduler_gm_store(shared->commit_lock, UINT64_C(0));
     if (!valid) return SchedulerAdmissionResult::ERROR;
@@ -385,6 +388,7 @@ inline __aicore__ bool scheduler_refresh_local_obligation(
             admission->current_block_num = record->logical_block_num;
             admission->current_active_mask = record->active_mask;
             admission->current_flags = record->flags;
+            scheduler_protocol_member_observed(base, local, admission, tail);
             return true;
         }
         if (admission->current_task_ref != SCHEDULER_TASK_REF_INVALID)
@@ -593,6 +597,7 @@ inline __aicore__ bool scheduler_close_ordered_obligation(
     if (cursor < admission->current_block_num) return true;
     if (cursor != admission->current_block_num || admission->scan_cursor >= admission->capacity)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+    scheduler_protocol_member_closed(base, local, admission, cursor, 0, 0);
     ++admission->scan_cursor;
     admission->current_task_ref = SCHEDULER_TASK_REF_INVALID;
     admission->current_block_num = 0;

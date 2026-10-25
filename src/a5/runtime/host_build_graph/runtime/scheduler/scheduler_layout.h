@@ -13,6 +13,8 @@
 
 #include <cstdint>
 
+#include "scheduler_protocol_types.h"
+
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING = 1;
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_READY = 2;
 // A zeroed Handshake is not a scheduler choice. Every supported fallback is
@@ -59,4 +61,6 @@ struct AicoreSchedulerLayout {
     uint64_t group_mailboxes_offset;
     uint64_t mix_close_seals_offset;
     uint64_t mix_close_seal_count;
+    uint64_t protocol_layout_offset;
+    SchedulerProtocolLayout protocol;
 };

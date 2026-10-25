@@ -70,6 +70,8 @@ inline __aicore__ bool scheduler_gm_mix_close(
     const auto *record = scheduler_admission_record_at(base, &admission, admission.current_task_ref);
     auto *seals = scheduler_state_at<uint64_t>(base, record->mix_close_seals_offset);
     auto &seal = seals[group.cluster_index];
+    uint64_t closed_cursor = UINT64_MAX;
+    uint64_t close_seal = 0;
     if (local->is_mix_coordinator()) {
         if (group.phase != SchedulerGmMixPhase::IDLE) return true;
         const uint64_t cursor = scheduler_gm_fetch_add(
@@ -88,6 +90,8 @@ inline __aicore__ bool scheduler_gm_mix_close(
             );
         scheduler_cache_barrier();
         scheduler_gm_store(seal, group.task_last_seq + 1);
+        closed_cursor = cursor;
+        close_seal = group.task_last_seq + 1;
     } else {
         if (!critical && scheduler_gm_query(seal) == 0) return true;
         const uint64_t published = scheduler_gm_fetch_add(seal, UINT64_C(0));
@@ -102,11 +106,13 @@ inline __aicore__ bool scheduler_gm_mix_close(
                 return scheduler_admission_fail(
                     graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_CLOSE_INVALID
                 );
+        close_seal = published;
     }
     if (admission.scan_cursor >= admission.capacity)
         return scheduler_admission_fail(
             graph, local, run, admission.current_task_ref, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER
         );
+    scheduler_protocol_member_closed(base, local, &admission, closed_cursor, close_seal, group.task_last_seq);
     ++admission.scan_cursor;
     admission.current_task_ref = SCHEDULER_TASK_REF_INVALID;
     admission.current_block_num = 0;

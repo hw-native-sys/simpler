@@ -60,8 +60,8 @@ struct GmExecution {
 };
 
 struct GmMixFixture {
-    explicit GmMixFixture(const std::vector<GmShape> &shapes) :
-        storage(shapes.size(), 6, gm_trace_capacity(shapes), gm_requirements(shapes)),
+    explicit GmMixFixture(const std::vector<GmShape> &shapes, bool protocol_profiling = false) :
+        storage(shapes.size(), 6, gm_trace_capacity(shapes), gm_requirements(shapes), protocol_profiling),
         graph(shapes.size()) {
         uint32_t trace = 0;
         for (uint64_t task = 0; task < shapes.size(); ++task) {
@@ -454,6 +454,34 @@ TEST(HbgGmMix, KernelReturnWithoutCompletionReleaseDoesNotRetireTheGroup) {
     ASSERT_TRUE(fixture.complete_task(0, 0));
     EXPECT_EQ(scheduler_gm_load(fixture.control(0)->state), static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(fixture.locals[0]->pending_completed, 1u);
+}
+
+TEST(HbgGmMixProtocol, ZeroWorkMembersRecordTheActualSealWithoutInventingCursorReads) {
+    GmMixFixture fixture({{1, 6}}, true);
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    auto *members = scheduler_state_at<SchedulerProtocolMemberTrace>(
+        fixture.base(), fixture.storage.layout.protocol.members_offset
+    );
+    bool closed = false;
+    ASSERT_TRUE(fixture.close(4, &closed));
+    EXPECT_FALSE(closed);
+    EXPECT_EQ(members[4].closed.sequence, 0u);
+    for (uint32_t worker = 3; worker < 6; ++worker) {
+        ASSERT_TRUE(fixture.close(worker, &closed));
+        EXPECT_TRUE(closed);
+        EXPECT_EQ(members[worker].observed.sequence, 1u);
+        EXPECT_EQ(members[worker].closed.sequence, 2u);
+        EXPECT_EQ(members[worker].close_seal, 1u);
+        EXPECT_EQ(members[worker].last_group_seq, 0u);
+        EXPECT_EQ(members[worker].closed_cursor, worker == 3 ? UINT64_C(1) : UINT64_MAX);
+        EXPECT_EQ(members[worker].pending_mask, 0u);
+        EXPECT_EQ(members[worker].worker_index, worker);
+    }
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 0u);
+    EXPECT_EQ(members[0].closed.sequence, 0u);
+    EXPECT_EQ(members[1].closed.sequence, 0u);
 }
 
 TEST(HbgGmMix, AZeroWorkClusterPublishesSealOneWhileAnotherClusterStillOwnsTheLastBlock) {

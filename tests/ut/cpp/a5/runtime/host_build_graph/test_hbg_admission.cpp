@@ -44,9 +44,9 @@ SchedulerSpmdRequirements admission_requirements(const std::vector<AdmissionShap
 struct AdmissionFixture {
     explicit AdmissionFixture(
         const std::vector<AdmissionShape> &shapes, uint64_t workers = 6, uint64_t epoch = 17,
-        std::vector<uint64_t> permutation = {}
+        std::vector<uint64_t> permutation = {}, bool protocol_profiling = false
     ) :
-        storage(shapes.size(), workers, 3, admission_requirements(shapes, workers)),
+        storage(shapes.size(), workers, 3, admission_requirements(shapes, workers), protocol_profiling),
         graph(shapes.size()),
         admissions(workers),
         locals(workers) {
@@ -946,5 +946,267 @@ TEST(HbgAdmission, ConcurrentRealCommitsPublishUniqueCompleteContiguousLogEntrie
     for (uint64_t thread = 0; thread < thread_count; ++thread)
         EXPECT_EQ(fixture.admissions[thread * 3].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
 }
+
+TEST(HbgAdmissionProtocol, SuccessfulPublicationRecordsActualPublisherOrderAndEpoch) {
+    for (uint64_t epoch : {UINT64_C(0), UINT64_MAX}) {
+        AdmissionFixture fixture({{2, 1}, {2, 2}}, 6, epoch, {}, true);
+        auto *tasks = scheduler_state_at<SchedulerProtocolTaskTrace>(
+            fixture.base(), fixture.storage.layout.protocol.tasks_offset
+        );
+        ASSERT_TRUE(fixture.publish(1, 1));
+        ASSERT_TRUE(fixture.publish(0, 3));
+        EXPECT_EQ(tasks[1].admission.before.sequence, 1u);
+        EXPECT_EQ(tasks[1].admission.after.sequence, 2u);
+        EXPECT_EQ(tasks[1].admission.task_ref, 1);
+        EXPECT_EQ(tasks[1].admission.order_key, 0u);
+        EXPECT_EQ(tasks[1].admission.worker_index, 1u);
+        EXPECT_EQ(tasks[1].admission.run_epoch, epoch);
+        EXPECT_EQ(tasks[0].admission.before.sequence, 1u);
+        EXPECT_EQ(tasks[0].admission.after.sequence, 2u);
+        EXPECT_EQ(tasks[0].admission.order_key, 1u);
+        EXPECT_EQ(tasks[0].admission.worker_index, 3u);
+        EXPECT_EQ(tasks[0].completion.before.sequence, 0u);
+        EXPECT_EQ(tasks[1].completion.after.sequence, 0u);
+    }
+}
+
+TEST(HbgAdmissionProtocol, CommitRetryDoesNotInventASequenceOrPublishAnInterval) {
+    AdmissionFixture fixture({{2, 1}}, 6, 17, {}, true);
+    SchedulerReadyClaim ready{};
+    ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
+    ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
+    ASSERT_TRUE(fixture.prepare(0));
+    auto *task =
+        scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.storage.layout.protocol.tasks_offset);
+    auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    scheduler_gm_store(fixture.control()->commit_lock, UINT64_C(4));
+    EXPECT_EQ(fixture.commit(0), SchedulerAdmissionResult::RETRY);
+    EXPECT_EQ(task->admission.before.sequence, 0u);
+    EXPECT_EQ(task->admission.after.sequence, 0u);
+    EXPECT_EQ(workers[0].next_sequence, 0u);
+    scheduler_gm_store(fixture.control()->commit_lock, UINT64_C(0));
+    EXPECT_EQ(fixture.commit(0), SchedulerAdmissionResult::PROGRESS);
+    EXPECT_EQ(task->admission.before.sequence, 1u);
+    EXPECT_EQ(task->admission.after.sequence, 2u);
+    EXPECT_EQ(workers[0].next_sequence, 2u);
+}
+
+TEST(HbgAdmissionProtocol, MemberObservationIsUniqueAndNonMembersProduceNoObligation) {
+    AdmissionFixture fixture({{2, 1}, {2, 2}}, 6, 17, {}, true);
+    ASSERT_TRUE(fixture.publish(0));
+    ASSERT_TRUE(fixture.publish(1));
+    ASSERT_TRUE(fixture.refresh(3));
+    ASSERT_TRUE(fixture.refresh(1));
+    auto *members = scheduler_state_at<SchedulerProtocolMemberTrace>(
+        fixture.base(), fixture.storage.layout.protocol.members_offset
+    );
+    EXPECT_EQ(members[3].observed.sequence, 1u);
+    EXPECT_EQ(members[3].task_ref, 0);
+    EXPECT_EQ(members[3].observed_tail, 2u);
+    EXPECT_EQ(members[3].worker_index, 3u);
+    EXPECT_EQ(members[1].observed.sequence, 0u);
+    EXPECT_EQ(members[6 + 1].observed.sequence, 3u);
+    EXPECT_EQ(members[6 + 1].task_ref, 1);
+    EXPECT_EQ(members[6 + 1].order_key, 1u);
+    EXPECT_EQ(members[6 + 1].observed_tail, 2u);
+    const auto observed = members[3].observed.sequence;
+    ASSERT_TRUE(fixture.refresh(3));
+    EXPECT_EQ(members[3].observed.sequence, observed);
+}
+
+TEST(HbgAdmissionProtocol, ZeroWorkMemberClosesAtCursorExhaustionBeforeTaskDone) {
+    AdmissionFixture fixture({{2, 1}}, 6, 17, {}, true);
+    ASSERT_TRUE(fixture.publish(0));
+    for (uint64_t worker : {UINT64_C(0), UINT64_C(3)}) {
+        fixture.locals[worker]->admission = &fixture.admissions[worker];
+        ASSERT_TRUE(fixture.refresh(worker));
+    }
+    auto *members = scheduler_state_at<SchedulerProtocolMemberTrace>(
+        fixture.base(), fixture.storage.layout.protocol.members_offset
+    );
+    bool closed = true;
+    ASSERT_TRUE(scheduler_close_ordered_obligation(
+        fixture.graph.graph(), fixture.base(), fixture.locals[3], fixture.run(), &closed
+    ));
+    EXPECT_FALSE(closed);
+    EXPECT_EQ(members[3].closed.sequence, 0u);
+    for (uint32_t index = 0; index < 2; ++index) {
+        uint32_t block = UINT32_MAX;
+        ASSERT_EQ(
+            scheduler_claim_ordered_cursor(
+                fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &block
+            ),
+            SchedulerBlockClaimResult::CLAIMED
+        );
+        EXPECT_EQ(block, index);
+    }
+    ASSERT_TRUE(scheduler_close_ordered_obligation(
+        fixture.graph.graph(), fixture.base(), fixture.locals[3], fixture.run(), &closed
+    ));
+    EXPECT_TRUE(closed);
+    EXPECT_EQ(members[3].closed.sequence, 2u);
+    EXPECT_EQ(members[3].closed_cursor, 2u);
+    EXPECT_EQ(members[3].pending_mask, 0u);
+    EXPECT_EQ(members[3].close_seal, 0u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.task_control(0)->completed_blocks, UINT64_C(0)), 0u);
+    EXPECT_EQ(fixture.admissions[3].scan_cursor, 1u);
+}
+
+TEST(HbgAdmissionProtocol, DuplicateAndWrongIdentityKeepTheFirstRecordAndSetStickyErrors) {
+    AdmissionFixture fixture({{2, 1}}, 6, 0, {}, true);
+    ASSERT_TRUE(fixture.publish(0));
+    auto *task =
+        scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.storage.layout.protocol.tasks_offset);
+    const auto first = task->admission;
+    scheduler_protocol_admission(fixture.base(), fixture.locals[0], 0, 0, 255, true);
+    scheduler_protocol_admission(fixture.base(), fixture.locals[0], 0, 0, 255, false);
+    scheduler_protocol_admission(fixture.base(), fixture.locals[0], -1, 0, 0, true);
+    EXPECT_EQ(std::memcmp(&task->admission, &first, sizeof(first)), 0);
+    auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(worker->error_flags, SCHEDULER_PROTOCOL_DUPLICATE | SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+    EXPECT_EQ(worker->next_sequence, 2u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
+}
+
+TEST(HbgAdmissionProtocol, SequenceNeverWrapsAndAnIncompletePublicationStaysIncomplete) {
+    AdmissionFixture fixture({{2, 1}}, 6, UINT64_MAX, {}, true);
+    auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    worker->next_sequence = UINT64_MAX - 1;
+    ASSERT_TRUE(fixture.publish(0));
+    const auto *task =
+        scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.storage.layout.protocol.tasks_offset);
+    EXPECT_EQ(task->admission.before.sequence, UINT64_MAX);
+    EXPECT_EQ(task->admission.after.sequence, 0u);
+    EXPECT_EQ(worker->next_sequence, UINT64_MAX);
+    EXPECT_EQ(worker->error_flags, SCHEDULER_PROTOCOL_SEQUENCE_OVERFLOW);
+    EXPECT_EQ(task->admission.run_epoch, UINT64_MAX);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 1u);
+}
+
+TEST(HbgAdmissionProtocol, FinishedWorkerRejectsLateEventsAndFailedExitIsNotSuccessful) {
+    for (bool success : {false, true}) {
+        AdmissionFixture fixture({{2, 1}}, 6, 17, {}, true);
+        scheduler_protocol_finish(fixture.base(), fixture.locals[0], success);
+        auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+            fixture.base(), fixture.storage.layout.protocol.workers_offset
+        );
+        EXPECT_EQ(worker->finished, success ? 1u : 2u);
+        scheduler_protocol_admission(fixture.base(), fixture.locals[0], 0, 0, 0, true);
+        EXPECT_EQ(worker->error_flags, SCHEDULER_PROTOCOL_AFTER_FINISH);
+        EXPECT_EQ(worker->next_sequence, 0u);
+        scheduler_protocol_finish(fixture.base(), fixture.locals[0], !success);
+        EXPECT_EQ(worker->finished, success ? 1u : 2u);
+        EXPECT_EQ(worker->error_flags, SCHEDULER_PROTOCOL_AFTER_FINISH | SCHEDULER_PROTOCOL_DUPLICATE);
+    }
+}
+
+TEST(HbgAdmissionProtocol, DisabledCaptureDoesNotAllocateOrTouchProtocolState) {
+    AdmissionFixture fixture({{2, 1}});
+    EXPECT_EQ(fixture.storage.layout.protocol_layout_offset, 0u);
+    EXPECT_EQ(fixture.locals[0]->profiling->protocol_layout_offset, 0u);
+    ASSERT_TRUE(fixture.publish(0));
+    ASSERT_TRUE(fixture.refresh(0));
+    scheduler_protocol_finish(fixture.base(), fixture.locals[0], true);
+    EXPECT_EQ(fixture.locals[0]->profiling->protocol_layout_offset, 0u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
+}
+
+class HbgProtocolLayoutCorruption : public ::testing::TestWithParam<int> {};
+
+TEST(HbgAdmissionProtocol, CompactWorkerBeyondFirstBitmapWordKeepsItsActualIdentity) {
+    AdmissionFixture fixture({{2, 2}}, 66, 0, {}, true);
+    ASSERT_TRUE(fixture.publish(0, 65));
+    ASSERT_TRUE(fixture.refresh(65));
+    const auto *tasks =
+        scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.storage.layout.protocol.tasks_offset);
+    const auto *members = scheduler_state_at<SchedulerProtocolMemberTrace>(
+        fixture.base(), fixture.storage.layout.protocol.members_offset
+    );
+    EXPECT_EQ(tasks[0].admission.worker_index, 65u);
+    EXPECT_EQ(tasks[0].admission.after.sequence, 2u);
+    EXPECT_EQ(members[65].worker_index, 65u);
+    EXPECT_EQ(members[65].observed.sequence, 3u);
+    EXPECT_EQ(members[65].run_epoch, 0u);
+    EXPECT_EQ(members[65].observed_tail, 1u);
+    EXPECT_NE(fixture.storage.contexts[65].physical_core_id, 65);
+}
+
+TEST_P(HbgProtocolLayoutCorruption, BootstrapRejectsBadLayoutAndRetainedWorkerState) {
+    AdmissionFixture fixture({{2, 1}}, 6, 17, {}, true);
+    auto *layout =
+        scheduler_state_at<SchedulerProtocolLayout>(fixture.base(), fixture.storage.layout.protocol_layout_offset);
+    auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(fixture.base(), layout->workers_offset);
+    switch (GetParam()) {
+    case 0:
+        layout->magic ^= 1;
+        break;
+    case 1:
+        layout->run_epoch ^= 1;
+        break;
+    case 2:
+        ++layout->task_count;
+        break;
+    case 3:
+        --layout->worker_count;
+        break;
+    case 4:
+        ++layout->cooperative_task_count;
+        break;
+    case 5:
+        ++layout->member_count;
+        break;
+    case 6:
+        layout->tasks_offset = layout->members_offset;
+        break;
+    case 7:
+        layout->members_offset = layout->blocks_offset;
+        break;
+    case 8:
+        layout->blocks_offset = layout->executions_offset;
+        break;
+    case 9:
+        layout->executions_offset = layout->workers_offset;
+        break;
+    case 10:
+        ++layout->workers_offset;
+        break;
+    case 11:
+        --layout->storage_end_offset;
+        break;
+    case 12:
+        layout->trace_count = UINT64_MAX;
+        break;
+    case 13:
+        worker->run_epoch ^= 1;
+        break;
+    case 14:
+        ++worker->worker_index;
+        break;
+    case 15:
+        worker->next_sequence = 1;
+        break;
+    case 16:
+        worker->error_flags = 1;
+        break;
+    case 17:
+        worker->finished = 1;
+        break;
+    case 18:
+        fixture.locals[0]->profiling = nullptr;
+        break;
+    }
+    SchedulerAdmissionLocalState admission{};
+    EXPECT_FALSE(scheduler_initialize_admission(fixture.base(), fixture.locals[0], &admission));
+    EXPECT_FALSE(admission.initialized);
+    if (fixture.locals[0]->profiling != nullptr) EXPECT_EQ(fixture.locals[0]->profiling->protocol_layout_offset, 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(InvalidProtocolStorage, HbgProtocolLayoutCorruption, ::testing::Range(0, 19));
 
 }  // namespace

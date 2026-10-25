@@ -982,7 +982,8 @@ struct alignas(128) SchedulerGraphSummary {
     uint64_t group_mailboxes_offset;
     uint64_t mix_close_seals_offset;
     uint64_t run_epoch;
-    uint8_t cache_line_padding[32];
+    uint64_t protocol_layout_offset;
+    uint8_t cache_line_padding[24];
 };
 
 struct alignas(64) SchedulerReadyDirectoryShard {
@@ -1534,9 +1535,37 @@ inline bool scheduler_plan_spmd_storage(uint64_t *cursor, AicoreSchedulerLayout 
     return true;
 }
 
+inline bool scheduler_plan_protocol_storage(uint64_t *cursor, AicoreSchedulerLayout *layout, uint64_t trace_count) {
+    if (cursor == nullptr || layout == nullptr) return false;
+    if (layout->spmd.worker_count == 0) return false;
+    auto &protocol = layout->protocol;
+    protocol.magic = SCHEDULER_PROTOCOL_MAGIC;
+    protocol.task_count = layout->task_count;
+    protocol.worker_count = layout->spmd.worker_count;
+    protocol.trace_count = trace_count;
+    protocol.cooperative_task_count = layout->spmd.cooperative_task_count;
+    if (!scheduler_layout_checked_mul(protocol.cooperative_task_count, protocol.worker_count, &protocol.member_count))
+        return false;
+    uint64_t bytes = 0;
+#define SCHEDULER_PROTOCOL_RESERVE(count, type, field)              \
+    (scheduler_layout_checked_mul((count), sizeof(type), &bytes) && \
+     scheduler_layout_reserve(cursor, bytes, alignof(type), &(field)))
+    const bool valid =
+        SCHEDULER_PROTOCOL_RESERVE(1, SchedulerProtocolLayout, layout->protocol_layout_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(protocol.task_count, SchedulerProtocolTaskTrace, protocol.tasks_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(protocol.member_count, SchedulerProtocolMemberTrace, protocol.members_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(protocol.trace_count, SchedulerProtocolBlockTrace, protocol.blocks_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(protocol.trace_count, SchedulerProtocolExecutionTrace, protocol.executions_offset) &&
+        SCHEDULER_PROTOCOL_RESERVE(protocol.worker_count, SchedulerProtocolWorkerTrace, protocol.workers_offset);
+#undef SCHEDULER_PROTOCOL_RESERVE
+    if (valid) protocol.storage_end_offset = *cursor;
+    return valid;
+}
+
 inline bool scheduler_plan_layout(
     uint64_t task_count, uint64_t aic_task_count, uint64_t aiv_task_count, AicoreSchedulerLayout *layout,
-    bool enable_activity_profiling = false, uint64_t trace_count = 0, const SchedulerSpmdRequirements &spmd = {}
+    bool enable_activity_profiling = false, uint64_t trace_count = 0, const SchedulerSpmdRequirements &spmd = {},
+    bool enable_protocol_profiling = false
 ) {
     // A ready inbox holds its endpoints as int32 task refs, so a graph whose
     // refs would not fit that encoding cannot be scheduled at all.
@@ -1578,6 +1607,8 @@ inline bool scheduler_plan_layout(
         (enable_activity_profiling &&
          !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerActivityBuffer, activity_buffers_offset)) ||
         !scheduler_plan_spmd_storage(&cursor, &next) ||
+        (enable_protocol_profiling &&
+         !scheduler_plan_protocol_storage(&cursor, &next, trace_count == 0 ? task_count : trace_count)) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
 #undef SCHEDULER_RESERVE_ARRAY
         return false;
@@ -1594,6 +1625,12 @@ scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout,
         layout.total_size > UINT64_MAX - device_base_address)
         return false;
     __builtin_memset(base, 0, static_cast<size_t>(layout.total_size));
+    if (layout.protocol_layout_offset != 0) {
+        *scheduler_state_at<SchedulerProtocolLayout>(base, layout.protocol_layout_offset) = layout.protocol;
+        auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(base, layout.protocol.workers_offset);
+        for (uint64_t worker = 0; worker < layout.protocol.worker_count; ++worker)
+            workers[worker].worker_index = worker;
+    }
     auto *run = scheduler_state_at<SchedulerRunControl>(base, layout.run_control_offset);
     run->error_run_epoch = UINT64_MAX;
     run->error_order_key = UINT64_MAX;
@@ -1646,6 +1683,7 @@ scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout,
     summary->admission_control_offset = layout.admission_control_offset;
     summary->group_mailboxes_offset = layout.group_mailboxes_offset;
     summary->mix_close_seals_offset = layout.mix_close_seals_offset;
+    summary->protocol_layout_offset = layout.protocol_layout_offset;
     if (layout.spmd.cooperative_task_count != 0) {
         for (uint64_t task = 0; task < layout.task_count; ++task) {
             const uint64_t offset = layout.admission_records_offset + task * layout.admission_record_stride;
@@ -1701,6 +1739,13 @@ inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLa
 
     auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, layout.graph_summary_offset);
     summary->run_epoch = run_epoch;
+    if (layout.protocol_layout_offset != 0) {
+        auto *protocol = scheduler_state_at<SchedulerProtocolLayout>(base, layout.protocol_layout_offset);
+        protocol->run_epoch = run_epoch;
+        auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(base, protocol->workers_offset);
+        for (uint64_t worker = 0; worker < protocol->worker_count; ++worker)
+            workers[worker].run_epoch = run_epoch;
+    }
     uint64_t mix_index = 0;
     for (uint64_t task = 0; task < layout.task_count; ++task) {
         const auto &meta = metadata[task];
