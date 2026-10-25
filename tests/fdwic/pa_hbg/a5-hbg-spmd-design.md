@@ -10,7 +10,8 @@
 
 设计基线为 f5cc679bb，约定更新于 2026-10-23。纯 C/V 与 GM Mix 普通多 block 已接入生产执行路径；
 原样 CSA 的七项 golden 和严格 resident L4 门禁已通过；
-首错误身份与退出冷日志已接线；显式 block/slot 身份与完整协议 trace、sync_start 和性能比较仍待完成。
+首错误身份、退出冷日志及显式 block/slot 身份已接线；原样 CSA 身份审计已通过。
+完整协议事件 trace、sync_start 和性能比较仍待完成。
 下文区分当前能力与目标合同，2026-10-25 起的编码和实测证据集中记录在
 [实现过程](spmd/implementation-progress.md)，不以结构或接口存在代替执行验收。
 
@@ -87,8 +88,9 @@ N=1 和多 block Mix 共用 GM 组协议，AIC 只负责组领取、身份发布
   每次 payload 准备写入原 N 和实际 block，N=1 与多 block 反复复用也不保留旧 context。
 - 只有最后一个 block 完成才沿既有 wake-list 释放逻辑后继。
   本核在 cursor=N 且已领取工作全部退役后关闭义务，不等待远端 TaskDone。
-- trace 存储、完成索引和导出连接键已区分 block；完整的 order、LocalDone、组发布／释放
-  事件及严格 native adapter 尚未实现，不能以普通泳道转换成功代替协议审计。
+- trace 存储、完成索引和导出连接键已区分 block；kernel 入口采集原 N、block/slot、
+  generation、epoch/order/group 和 cluster/lane，独立对象保留到原始及 Perfetto 泳道。
+  LocalDone、共同准入、组发布／释放事件及完整 native adapter 尚未实现。
 - `scheduler_runtime_mode` 与 `scheduler_mode_publish_count` 逐轮验证 resident 来源，
   不必要求所有功能测试先打开完整泳道。原有单 block predicate 继续保留。
 - GM Mix 已使用 descriptor／ack／保留到 run 结束的 seal，各 lane 自备参数，

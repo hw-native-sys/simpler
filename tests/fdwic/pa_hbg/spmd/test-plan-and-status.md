@@ -14,7 +14,8 @@
 每次都要求本轮 resident 来源和完整输出，不接受 legacy 正确输出。
 GM Mix 已接入且可与纯多 block 同图：六种 mask 矩阵在仿真／A5 各 270 次通过，
 新 44 个 GM 事件场景各 180 次通过。原样 CSA 七项 golden 和严格 resident L4 门禁已通过。
-首错误身份与退出冷日志已接线；显式 block/slot 身份与完整协议 trace、sync_start 和性能比较仍未完成；
+首错误身份与退出冷日志已接线；显式 block/slot 身份及原样 CSA 的身份审计通过；
+完整协议事件 trace、sync_start 和性能比较仍未完成；
 逐轮日志、失败修复证据和能力边界见实现过程。
 
 ## 一、四层检查分别证明什么
@@ -91,6 +92,12 @@ N2→Dummy→N1 依赖、Host 已完成节点、有限服务链和畸形 metadat
 设备探针与业务用例的硬件编译还须通过 text 映像门禁：非空 allocated `.rodata`／
 `.rodata.*` 不能被仅提取 `.text` 的加载器静默丢弃。ELF 和缓存策略回归分别覆盖
 拒绝不完整映像、空／非 allocated 控制项及硬件缓存失效；仿真成功不能替代该检查。
+
+[显式身份读端](../../../ut/py/test_hbg_execution_identity.py) 检查精确连接、缺字段、
+重复 block／槽代次、epoch 极值和 Perfetto 两个执行视图；历史无身份数据不补造字段。
+真实 executor 另有 AIC/AIV0/AIV1 × L0/1/2/4 的 12 个入口快照用例，kernel 改写 payload
+也不得改变已经采集的身份。CSA 图审计比较原图的完整 task/block/slot 集合，严格 resident
+入口拒绝仅有正确数量与 producer 的 capture。采集需单轮运行，现有 runner 在 rounds>1 时关闭泳道。
 
 ## 二、已经造好的边界与尚欠设备证明的部分
 
@@ -245,7 +252,7 @@ python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
   --platform a5sim --case mask1_n1 --case mask2_n1 \
   --case mask1_n2 --case mask2_n2 --pto-session-timeout 600 -q
 
-# 仍须保留红灯：多 block Mix 尚未接线，不能接受 legacy 回退。
+# GM Mix 多 block 必须走 resident，不能接受 legacy 回退。
 python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
   --platform a5sim --case mask3_n2 --pto-session-timeout 600 -q
 
@@ -255,9 +262,12 @@ python tests/fdwic/pa_hbg/spmd/test_ordered_execution.py -p a5sim --rounds 3
 # 已确认本机为 A5 后执行；无 task-submit 时按环境约定直接使用设备。
 python tests/fdwic/pa_hbg/spmd/test_ordered_execution.py -p a5 -d 0 --rounds 3
 
-# 生产实现完成后的全矩阵；当前运行不应全绿。
+# 普通 C/V 与 GM Mix 全矩阵：必须保持原 N、身份及 resident 来源。
 python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
   --platform a5 --device 0 --pto-session-timeout 1200 -q
+
+# 显式身份采集单轮运行；不要与 --rounds > 1 合用，否则 runner 会关闭泳道。
+python tests/fdwic/pa_hbg/spmd/test_spmd_contract.py -p a5 -d 0 --enable-chip-swimlane 4
 
 # AIV 完成到 Mix 后继的交接；可换成 -p a5 -d 0 在真机执行。
 python tests/fdwic/pa_hbg/spmd/test_aiv_mix_handoff.py -p a5sim --rounds 3
@@ -265,10 +275,10 @@ python tests/fdwic/pa_hbg/spmd/test_aiv_mix_handoff.py -p a5sim --rounds 3
 # 与用户原图逐项核对；原图缺失会明确失败。普通 UT 仅依赖小夹具。
 python -m pytest tests/fdwic/pa_hbg/spmd/test_cla_source.py -q
 
-# CLA 原生 TDD：当前返回非零，错误应是探针记录／哨兵通过后仍 mode=4。
+# CLA 原生 TDD：同时要求探针记录／哨兵正确和本轮 resident 来源。
 python -m pytest tests/fdwic/pa_hbg/spmd/test_cla_hbg.py \
   --platform a5sim --case cla_full --pto-session-timeout 600 -q
-# 用 --case 逐个选其他六个场景；实现完成后不传 --case 跑全部。
+# 用 --case 逐个选其他六个场景；不传 --case 跑全部。
 ~~~
 
 这里的 CASES 由 SceneTestCase 内部循环执行，不是 90 个独立 pytest node：

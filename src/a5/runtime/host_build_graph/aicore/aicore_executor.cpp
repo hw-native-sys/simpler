@@ -392,6 +392,10 @@ __aicore__ bool run_ready_dispatch_loop(
                     phase_timing_enabled
                 );
             }
+            if (commit_scheduler_trace)
+                scheduler_capture_execution_identity(
+                    scheduler_state_base, context, slot_index, ready_generation, payload
+                );
             OUT_OF_ORDER_STORE_BARRIER();
             uint64_t kernel_start = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             execute_task(payload);

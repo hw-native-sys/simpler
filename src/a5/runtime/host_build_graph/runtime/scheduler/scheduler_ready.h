@@ -939,6 +939,39 @@ inline __aicore__ uint32_t scheduler_trace_index_at(
     return scheduler_task_trace_index(metadata->trace_index_base, metadata->active_mask, subtask, block_idx);
 }
 
+inline __aicore__ void scheduler_capture_execution_identity(
+    __gm__ void *base, SchedulerLocalState *local, uint32_t pending_slot, uint32_t generation,
+    __gm__ const DispatchPayload *payload
+) {
+    const auto &slot = local->slots[pending_slot];
+    auto *traces = scheduler_state_at<SchedulerTaskTrace>(base, local->profiling->trace_cells_offset);
+    auto *trace = &traces[scheduler_trace_index_at(base, local, slot.task_ref, slot.subtask_slot, slot.block_idx)];
+    const auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, local->config.graph_summary_offset);
+    scheduler_observe_cache_line(&trace->descriptor_cache_observed_cycles);
+    trace->execution_run_epoch = summary->run_epoch;
+    trace->execution_order_key = UINT64_MAX;
+    trace->execution_group_seq = 0;
+    uint32_t flags = SCHEDULER_TRACE_IDENTITY_CAPTURED;
+    if (payload->function_bin_addr != 0) flags |= SCHEDULER_TRACE_EXECUTED;
+    if (slot.cooperative && local->admission != nullptr) {
+        trace->execution_order_key = local->admission->scan_cursor;
+        flags |= SCHEDULER_TRACE_ORDERED;
+        if (slot.gm_mix) {
+            trace->execution_group_seq = local->admission->gm_mix.group_seq;
+            flags |= SCHEDULER_TRACE_GROUP;
+        }
+    }
+    trace->execution_block_idx = static_cast<uint32_t>(payload->local_context.block_idx);
+    trace->execution_block_num = static_cast<uint32_t>(payload->local_context.block_num);
+    trace->execution_subtask_slot = slot.subtask_slot;
+    trace->execution_pending_slot = pending_slot;
+    trace->execution_generation = generation;
+    trace->execution_cluster_index = static_cast<uint32_t>(local->config.shared_context->cluster_index);
+    trace->execution_cluster_lane = local->config.self_lane;
+    trace->execution_identity_flags = flags;
+    scheduler_publish_cache_line(&trace->descriptor_cache_observed_cycles);
+}
+
 inline __aicore__ bool scheduler_bootstrap_ready_batch_append(
     __gm__ void *scheduler_state_base, SchedulerLocalState *context, int64_t task_ref, SchedulerReadyBatch *batch,
     SchedulerReadyStats *stats, uint64_t profiling_level = 0

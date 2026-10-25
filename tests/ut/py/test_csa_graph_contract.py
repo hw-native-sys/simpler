@@ -88,3 +88,57 @@ def test_capture_metadata_corruption_is_rejected(mutation):
         deps["tasks"][0]["early_dispatch"] = True
     with pytest.raises(ValueError):
         graph_contract.validate_graph(deps)
+
+
+def execution_rows():
+    return [
+        dict(
+            task_id=node["task_id"],
+            core_type="aic" if slot == 0 else "aiv",
+            run_epoch=1,
+            start_time_us=node["task_id"] * 1000000 + block * 4 + slot,
+            end_time_us=node["task_id"] * 1000000 + block * 4 + slot + 1,
+            block_idx=block,
+            block_num=node["block_num"],
+            subtask_slot=slot,
+            executed=True,
+        )
+        for node in NODES
+        for block in range(node["block_num"])
+        for slot, kernel in enumerate(node["kernel_ids"])
+        if kernel >= 0
+    ]
+
+
+def test_all_real_csa_execution_identities_match_the_external_graph():
+    rows = execution_rows()
+    assert len(rows) == 2308
+    assert graph_contract.audit_execution(dependency_capture(), rows)["block_identity_verified"] is True
+
+
+@pytest.mark.parametrize(
+    "mutation", ("duplicate_block", "wrong_slot", "wrong_block_num", "missing_field", "not_executed")
+)
+def test_exact_counts_cannot_hide_corrupt_csa_block_identity(mutation):
+    rows = execution_rows()
+    target = next(row for row in rows if row["block_idx"] == 1 and row["subtask_slot"] == 1)
+    if mutation == "duplicate_block":
+        target["block_idx"] = 0
+    elif mutation == "wrong_slot":
+        target["subtask_slot"] = 2
+    elif mutation == "wrong_block_num":
+        target["block_num"] += 1
+    elif mutation == "missing_field":
+        del target["block_idx"]
+    else:
+        target["executed"] = False
+    with pytest.raises(ValueError, match="identity"):
+        graph_contract.audit_execution(dependency_capture(), rows)
+
+
+def test_historical_csa_rows_stay_explicitly_unverified():
+    rows = execution_rows()
+    for row in rows:
+        for field in ("block_idx", "block_num", "subtask_slot", "executed"):
+            del row[field]
+    assert graph_contract.audit_execution(dependency_capture(), rows)["block_identity_verified"] is False

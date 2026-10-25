@@ -2274,6 +2274,8 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
     const std::string *aicore_tasks_extension = extension(ChipSwimlaneExtensionSection::AicoreTasks);
     const std::string *scheduler_tasks_extension = extension(ChipSwimlaneExtensionSection::SchedulerTasks);
     const std::string *aicpu_lifecycle_extension = extension(ChipSwimlaneExtensionSection::AicpuLifecycleRecords);
+    const std::string *execution_identity_extension =
+        extension(ChipSwimlaneExtensionSection::AicoreExecutionIdentities);
 
     // Every stream is independently useful for DFX. In particular, a legal
     // HBG can contain only host-side dummy/hidden-allocation records and no
@@ -2539,6 +2541,9 @@ int ChipSwimlaneCollector::write_swimlane_json(const RunExport &data) {
             outfile << "]";
             LOG_INFO("  aicore_tasks: %zu records", total);
         }
+    }
+    if (execution_identity_extension != nullptr) {
+        outfile << ",\n  \"aicore_execution_identities\": " << *execution_identity_extension;
     }
     if (data.level >= ChipSwimlaneLevel::SCHEDULE_TIMING) {
         outfile << ",\n  \"" << chip_swimlane_extension_section_name(ChipSwimlaneExtensionSection::SchedulerTasks)

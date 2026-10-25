@@ -1010,6 +1010,11 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
     elif aicore_rows:
         raise ValueError(f"level {level} requires Scheduler task timing records")
 
+    if "aicore_execution_identities" in data:
+        from simpler_setup.tools.hbg.execution_identity import attach_execution_identities  # noqa: PLC0415
+
+        attach_execution_identities(data["aicore_execution_identities"], tasks, runtime_name)
+
     # Sorting by task_id alone would interleave two runs' executions of the same
     # task. Epoch leads so each run's tasks stay contiguous.
     tasks.sort(key=lambda t: (t["run_epoch"], int(t["task_id"])))
@@ -1357,6 +1362,26 @@ def _with_run_epoch(args, row):
     """
     if "run_epoch" in row:
         args["run_epoch"] = row["run_epoch"]
+    return args
+
+
+def _with_execution_identity(args, row):
+    _with_run_epoch(args, row)
+    if "block_idx" in row:
+        for field in (
+            "reg_task_id",
+            "block_idx",
+            "block_num",
+            "subtask_slot",
+            "pending_slot",
+            "dispatch_generation",
+            "order_key",
+            "group_seq",
+            "cluster_index",
+            "cluster_lane",
+            "executed",
+        ):
+            args[field] = row[field]
     return args
 
 
@@ -2310,7 +2335,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
         events.append(
             {
-                "args": _with_run_epoch(
+                "args": _with_execution_identity(
                     {
                         "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
                         "fanout-hint": fanout_str,
@@ -2422,7 +2447,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
 
             events.append(
                 {
-                    "args": _with_run_epoch(
+                    "args": _with_execution_identity(
                         {
                             "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
                             "dispatch-time-us": dispatch_us,

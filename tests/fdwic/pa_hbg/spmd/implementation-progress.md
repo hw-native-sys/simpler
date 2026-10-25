@@ -28,7 +28,7 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 | 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | own/direct、持久候选与 GM Mix 均已接线；完整事件审计待补 |
 | 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | A5／仿真功能和 L1/L4 逐 block 检查通过 |
 | 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | A5／仿真矩阵、重叠及 TPipe PA 已通过；首错误身份与冷日志已接线 |
-| 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | CSA 数值／2308 记录／来源通过；显式身份与全协议事件未完成 |
+| 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | CSA 数值／2308 显式身份／来源通过；全协议事件未完成 |
 | 6 | sync_start 不同位置领取和局部跨任务推进 | 两独立满核任务、部分交叠、超容量、早返回不重领 | 未实现 |
 | 7 | 性能对比 | 同 kernel／输入／拓扑，无完整插桩运行；诊断运行分开 | 未测量 |
 
@@ -901,3 +901,95 @@ C/V 后端对同一条件表达式的生成物不相同，不能把 AIC 的跳�
 本次阶段提交涵盖首错误身份、确切槽定位、AICPU 冷日志、原生探针和 text 门禁及其缓存失效；
 不含用户未跟踪的原始泳道、TMR CSA、atomic_probe，不改 frozen kernel／golden。
 下一项仍是显式执行身份与完整原生协议 trace，之后实现 sync_start 和同配置性能比较。
+
+## 2026-10-25：接通显式执行身份
+
+起点 `ae6474adf` 已完成详细中文提交、未 push。提交后重编成功，binding 版本与 HEAD 一致，
+三份 runtime 二进制 SHA256 与 `csa-hbg-l4-vtupzkkq` 的已验收运行相同，冻结源码仍一致。
+本阶段继续实现完整 trace 的执行身份部分；准入／claim／LocalDone／组释放等原生事件仍需随后接线，
+不能用身份完整替代全协议审计。
+
+沿用 DFX 的 runtime extension 机制，保留原七列执行行及五列 scheduler 行，
+增加可选 `aicore_execution_identities` 对象，以 epoch/core/reg_task_id 精确连接。
+新测试对当前真实转换器获得 48 红／1 绿：原实现忽略该对象，缺字段、错绑、重复身份均可漏过。
+日志 `outputs/spmd-execution-identity-red-20261025.log`；严格读取后 49 项通过。
+
+设备在真实 kernel 入口、调用前采集 payload 的原 N 与 block，连同 logical slot、
+pending slot、generation、epoch、order、group、cluster/lane 和是否实际调用 kernel。
+使用 SchedulerTaskTrace 最后一条 64B line 的预留与尾部对齐空间，大小保持 384B；
+不增加本核 DAG、槽数量、运行期分配或新的功能开关。L0 不采集，predicate 跳过显式标记 executed=false。
+记录先发布到 GM，既有 completion 再发布 trace.valid；导出不从行号推导 block。
+
+首次编译因新 helper 放在 scheduler_trace_index_at 定义之前失败；移动到实际依赖之后，
+没有补假的接口。第二轮 runtime 与相关 C++ 编译通过，日志分别为
+`outputs/spmd-execution-identity-runtime-build-r2-20261025.log` 与
+`outputs/spmd-execution-identity-cpp-build-r2-20261025.log`。
+
+新增 12 个真正调用 executor 循环的 CPU 参数用例：AIC/AIV0/AIV1 × L0/1/2/4，
+测试 kernel 主动改写 payload 为 block=77、N=99，仍要求 trace 保留入口 0/1，防止事后采样假绿。
+第一次执行在 AIV 用例 SIGSEGV；gdb 定位到测试 kernel，原因是夹具未填写 cluster_worker_ids，
+其测试指针使用了无效 lane 映射。修正夹具并用 20 秒进程超时复跑，17 项（旧 5＋新 12）全部通过，
+日志 `outputs/spmd-execution-identity-entry-gdb-20261025.log`、`outputs/spmd-execution-identity-entry-r2-20261025.log`。
+没有因此改变生产调度路径。
+
+CSA 图审计新增 6 项实际 RED，旧实现即便有显式身份仍一概返回 false，且不拒绝同数量的重复 block、
+错 slot、错 N、部分缺字段或未执行行。严格 resident 入口另有 2 项 RED，确认仅 producer=aicore
+不足以满足新的身份验收；已有 --require-aicore-scheduler 现要求身份验证为 true，不新增 CLI 开关。
+历史不带身份的 capture 仍可读取，但保持 block_identity_verified=false。
+相关 parser／CSA／converter 456 项通过，日志 `outputs/spmd-execution-identity-reader-regression-20261025.log`。
+
+最小 mask3 N1 仿真和 A5 都通过，并逐项核对各 5 条真实导出身份；输出分别为
+`outputs/TestHbgSpmdContract_mask3_n1_20261025_134301`、`outputs/TestHbgSpmdContract_mask3_n1_20261025_134305`。
+原样 CSA 严格 L4 通过：`outputs/csa-hbg-l4-y2ihg7u5/result.json`，两轮各七项 golden，
+2308 条执行的 task/block/slot 集合与冻结图完全一致，block_identity_verified=true，producer=aicore。
+这仍不是完整原生准入与组协议事件的证明；本阶段尚未完成全部回归或提交。
+
+读端补充 Mix 四种 mask、epoch 0/MAX、跨 epoch 重用连接键、显式 null 与历史缺字段的区别，
+共 63 项检查通过。Perfetto 的 Worker/Scheduler 视图起初未带新字段，两个测试实际 RED；
+保留执行身份到两个视图的 args 后转绿，未更改时间、flow 连接键或普通七列／五列格式。
+共享采集器另验证新 extension 的对象根、单次写入、封存后独立导出、下一 run 不继承。
+7 个共享 targets 共 125 项通过；16 个调度 targets 共 529 项通过，相关 Python 首轮 1754 项通过。
+日志 `outputs/spmd-execution-identity-common-green-20261025.log`、
+`outputs/spmd-execution-identity-final-cpp-20261025.log`、`outputs/spmd-execution-identity-final-python-20261025.log`。
+
+90 场景两轮功能矩阵在仿真和 A5 各 180 次通过，但 runner 明确记录
+`chip swimlane disabled: --rounds > 1`，该结果只能作为无泳道功能回归。
+离线核对预期产物时发现没有文件，随后改用单轮采集，不修改 runner 的现有规则。
+单轮 L4 仿真 90 场景通过，逐文件读取共 26303 条显式身份，
+日志 `outputs/spmd-execution-identity-l4-matrix-sim-20261025.log`；对应 A5 单轮矩阵仍待运行。
+
+对 `csa-hbg-l4-y2ihg7u5` 重新转换为 `L4-identities.json`：Scheduler View 有 2308 条，
+Worker View 共 2334 条中的额外 26 条是 Host alloc 标记，不是 kernel。
+初次离线脚本把所有 Worker event 都当成 kernel，计数断言失败；核对名称、phase 与
+kernel-duration-us 后，两视图均有 2308 个唯一 kernel 身份，非 kernel 标记不补造 block。
+最终 HBG 仿真 42 passed、378 deselected（145.79 秒），A5 60 passed、4 skipped、356 deselected
+（294.01 秒）；两者均排除已知误收集的双卡 TMR 目录，未声称已验证多卡。
+
+格式化与静态检查发现两个新校验函数的分支数超限，已按字段检查／连接一致性、
+执行身份／依赖时序拆开，不用 noqa 绕过。格式化后 runtime 重编、5 个受影响 C++ targets
+及 Python 1761 项通过；该轮之后又增加 5 项身份配对反例，下述最终回归另计。
+单轮 A5 L4 的 90 场景通过，`outputs/spmd-execution-identity-native-20261025/l4-matrix.log`。
+仿真／A5 各 90 份文件、26303 条身份，目录不重合；按原测试计划精确核对 task/block/slot 集合、
+原 N、普通与协同任务的 order/group 空值边界、Mix 同 block 同 cluster/group，以及各 scheduler
+stream 无 dropped/truncated。不是只检查身份行数等于普通执行行数。
+
+最终原样 CSA L4：`outputs/csa-hbg-l4-k7xbr0k2/result.json`，两轮各七项 golden、2308 个
+唯一身份、producer=aicore、block_identity_verified=true；本次直接生成的 L4.json 在两个
+执行视图均保留 2308 个唯一身份。另外，CLA 原图形状的 7 个探针场景在仿真／A5 单轮 L4 通过，
+各 2746 个身份与其计划逐项匹配；这是 CLA 调度形状探针，不是原始 CLA 数学 kernel。
+日志 `outputs/spmd-execution-identity-cla-sim-20261025.log` 和上述 native 目录的 `cla.log`。
+
+审计器补充 5 项实际 RED：同一 Mix block 的 cluster/group_seq 不一致、缺一条／全部 group_seq，
+以及多 block 缺 order_key。补齐跨 lane 同组检查和必需 order 后，68 项读端检查通过，
+与 CSA、转换器合计 475 项通过；日志 `outputs/spmd-execution-identity-pairing-red-20261025.log`、
+`outputs/spmd-execution-identity-pairing-green-20261025.log`。加严后的读端重新接受上述所有真实采集，
+并重新通过 CSA 严格入口。完整协议事件仍未采集，身份配对验证不冒充准入／LocalDone／释放审计。
+
+适用提交检查全部通过，日志 `outputs/spmd-execution-identity-precommit-final-20261025.log`。
+本阶段只增加 DFX 身份采集与验收，不修改冻结 CSA、调度顺序、block 领取或通信协议；
+后续仍须实现完整原生协议事件、sync_start 和同配置性能比较，不自动 push。
+
+最后一轮合约／CSA／转换器／显式身份 Python 回归 1766 项通过，
+日志 `outputs/spmd-execution-identity-final-r2-python-20261025.log`。本次阶段提交包含入口快照、
+共享 DFX extension 的透明传递、严格连接与配对检查、两视图展示、CSA 身份门禁和相应 TDD；
+不包含用户未跟踪的 atomic_probe、原始泳道或 TMR CSA。历史结果不改写为新的通过证据。

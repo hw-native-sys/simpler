@@ -62,6 +62,41 @@ def validate_graph(deps):
     return projected
 
 
+def _audit_block_identity(tasks, rows):
+    identity_fields = {"block_idx", "block_num", "subtask_slot", "executed"}
+    has_identity = any(identity_fields.intersection(row) for row in rows)
+    if has_identity:
+        expected_identities = {
+            (ref, block, slot)
+            for ref, task in tasks.items()
+            for block in range(task["block_num"])
+            for slot, kernel in enumerate(task["kernel_ids"])
+            if kernel >= 0
+        }
+        actual_identities = set()
+        for row in rows:
+            if not identity_fields.issubset(row):
+                raise ValueError("CSA execution identity is partially missing")
+            block, blocks, slot = (row[field] for field in ("block_idx", "block_num", "subtask_slot"))
+            ref = row["task_id"]
+            if (
+                any(type(value) is not int for value in (block, blocks, slot))
+                or row["executed"] is not True
+                or blocks != tasks[ref]["block_num"]
+                or not 0 <= block < blocks
+                or not 0 <= slot < 3
+                or ("aic" if slot == 0 else "aiv") != row["core_type"]
+            ):
+                raise ValueError("CSA execution identity contradicts the graph")
+            identity = (ref, block, slot)
+            if identity not in expected_identities or identity in actual_identities:
+                raise ValueError("CSA execution identity is duplicated or unexpected")
+            actual_identities.add(identity)
+        if actual_identities != expected_identities:
+            raise ValueError("CSA execution identity coverage is incomplete")
+    return has_identity
+
+
 def audit_execution(deps, rows):
     tasks = {int(t["task_id"]): t for t in deps["tasks"]}
     if len(tasks) != len(deps["tasks"]):
@@ -80,6 +115,7 @@ def audit_execution(deps, rows):
     epochs = {row["run_epoch"] for row in rows}
     if len(epochs) != 1 or any(type(e) is not int or e <= 0 for e in epochs):
         raise ValueError("CSA capture must contain one positive run epoch")
+    has_identity = _audit_block_identity(tasks, rows)
     starts, ends = {}, {}
     for row in rows:
         start, end = row["start_time_us"], row["end_time_us"]
@@ -122,5 +158,5 @@ def audit_execution(deps, rows):
         "execution_epoch": next(iter(epochs)),
         "per_kind_executions": dict(Counter(row["core_type"] for row in rows)),
         "dependency_edges_checked": sum(len(v) for v in parents.values()),
-        "block_identity_verified": False,
+        "block_identity_verified": has_identity,
     }

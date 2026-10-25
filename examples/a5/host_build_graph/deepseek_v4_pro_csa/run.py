@@ -100,6 +100,8 @@ def validate_trace(raw_path, deps_path, level, *, require_aicore=False):
             )
     if require_aicore and producer != "aicore":
         raise ValueError("Distributed scheduler required: need an L4 trace with scheduler producer=aicore")
+    if require_aicore and summary.get("block_identity_verified") is not True:
+        raise ValueError("Distributed scheduler requires verified explicit block identity")
     timeline = parsed.get("timeline_metadata", {})
     return {
         **summary,

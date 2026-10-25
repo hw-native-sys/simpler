@@ -15,6 +15,7 @@
 
 #include <array>
 #include <cstdint>
+#include <tuple>
 
 #include "hbg_scheduler_test_support.h"
 
@@ -26,8 +27,16 @@ namespace {
 thread_local volatile uint8_t *startup_reg_base = nullptr;
 uint64_t startup_kernel_calls = 0;
 uint64_t startup_ssbuf_calls = 0;
+DispatchPayload *identity_test_payload = nullptr;
 
 void count_kernel_entry(__gm__ int64_t *) { ++startup_kernel_calls; }
+
+void identity_test_kernel(__gm__ int64_t *) {
+    ++startup_kernel_calls;
+    identity_test_payload->local_context.block_idx = 77;
+    identity_test_payload->local_context.block_num = 99;
+    write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+}
 
 struct StartupFixture {
     explicit StartupFixture(const std::array<uint8_t, 2> &masks) :
@@ -247,6 +256,71 @@ TEST(HbgGmMixStartupExit, MissingCoordinatorSealTimeoutIdentifiesTheWaitingTaskA
     EXPECT_EQ(startup_ssbuf_calls, 0u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.seal(0, 1), UINT64_C(0)), 0u);
 }
+
+class HbgExecutionIdentityEntry : public ::testing::TestWithParam<std::tuple<uint32_t, uint64_t>> {};
+
+TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCanChangeIt) {
+    const auto [worker, level] = GetParam();
+    scheduler_test::FixtureStorage storage(1, 3, 1);
+    scheduler_test::BasicGraphBuffer<1> graph(1);
+    graph.executable(0, worker == 0 ? 0 : 1);
+    auto &metadata = storage.metadata[0];
+    metadata.active_mask = worker == 0 ? 1 : 2;
+    metadata.kernel_ids[0] = worker == 0 ? 1 : UINT16_MAX;
+    metadata.kernel_ids[1] = worker == 0 ? UINT16_MAX : 1;
+    metadata.timing_slot = -1;
+    auto *base = storage.scheduler_state->base();
+    ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, 59));
+    storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&identity_test_kernel);
+    storage.test_graphs[worker] = graph.graph();
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        storage.contexts[worker].cluster_worker_ids[lane] = lane;
+    auto *local = storage.local_context(&storage.contexts[worker]);
+    local->config.scheduler_count = 3;
+    auto *run = storage.run_control;
+    run->expected_task_count = 1;
+    SchedulerReadyBatch batch{};
+    ASSERT_TRUE(scheduler_ready_batch_append(base, local, 0, &batch, nullptr));
+    ASSERT_TRUE(scheduler_ready_batch_push(base, local, worker == 0 ? 0 : 1, &batch, nullptr));
+    std::array<uint8_t, 64> registers{};
+    startup_reg_base = registers.data();
+    startup_kernel_calls = 0;
+    identity_test_payload =
+        scheduler_state_at<DispatchPayload>(base, local->dispatch_payload_offset(local->config.self_lane, 0));
+    write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+    SchedulerWorkerStats stats{};
+    ASSERT_TRUE(run_ready_dispatch_loop(graph.graph(), base, local, run, &stats, level));
+    ASSERT_EQ(startup_kernel_calls, 1u);
+    ASSERT_EQ(identity_test_payload->local_context.block_idx, 77);
+    uint64_t refilled = 0;
+    ASSERT_TRUE(scheduler_service_cluster_completions(
+        graph.graph(), base, local, run, nullptr, nullptr, nullptr, level, &refilled, nullptr
+    ));
+    const auto *trace = scheduler_state_at<SchedulerTaskTrace>(base, storage.layout.trace_cells_offset);
+    if (level == 0) {
+        EXPECT_EQ(trace->execution_identity_flags, 0u);
+    } else {
+        EXPECT_EQ(trace->valid, 1u);
+        EXPECT_EQ(trace->execution_run_epoch, 59u);
+        EXPECT_EQ(trace->execution_order_key, UINT64_MAX);
+        EXPECT_EQ(trace->execution_group_seq, 0u);
+        EXPECT_EQ(trace->execution_block_idx, 0u);
+        EXPECT_EQ(trace->execution_block_num, 1u);
+        EXPECT_EQ(trace->execution_subtask_slot, worker == 0 ? 0u : 1u);
+        EXPECT_EQ(trace->execution_pending_slot, 0u);
+        EXPECT_EQ(trace->execution_generation, 1u);
+        EXPECT_EQ(trace->execution_cluster_index, 0u);
+        EXPECT_EQ(trace->execution_cluster_lane, worker);
+        EXPECT_EQ(trace->execution_identity_flags, SCHEDULER_TRACE_IDENTITY_CAPTURED | SCHEDULER_TRACE_EXECUTED);
+    }
+    startup_reg_base = nullptr;
+    identity_test_payload = nullptr;
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    LanesAndProfilingLevels, HbgExecutionIdentityEntry,
+    ::testing::Combine(::testing::Values(0u, 1u, 2u), ::testing::Values<uint64_t>(0, 1, 2, 4))
+);
 
 }  // namespace
 

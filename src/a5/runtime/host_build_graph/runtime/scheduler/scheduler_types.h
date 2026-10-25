@@ -1257,6 +1257,13 @@ struct alignas(128) SchedulerWorkerContext {
     uint64_t scheduler_tail_reserved[32];
 };
 
+enum SchedulerExecutionIdentityFlags : uint32_t {
+    SCHEDULER_TRACE_IDENTITY_CAPTURED = 1U << 0,
+    SCHEDULER_TRACE_EXECUTED = 1U << 1,
+    SCHEDULER_TRACE_ORDERED = 1U << 2,
+    SCHEDULER_TRACE_GROUP = 1U << 3,
+};
+
 struct alignas(128) SchedulerTaskTrace {
     // Dispatch publishes this line before READY; completion publishes valid.
     volatile uint64_t valid;
@@ -1299,7 +1306,17 @@ struct alignas(128) SchedulerTaskTrace {
 
     // The completion Scheduler consolidates the Executor's staged timing here.
     uint64_t descriptor_cache_observed_cycles;
-    uint64_t executor_reserved[3];
+    uint64_t execution_run_epoch;
+    uint64_t execution_order_key;
+    uint64_t execution_group_seq;
+    uint32_t execution_block_idx;
+    uint32_t execution_block_num;
+    uint32_t execution_subtask_slot;
+    uint32_t execution_pending_slot;
+    uint32_t execution_generation;
+    uint32_t execution_identity_flags;
+    uint32_t execution_cluster_index;
+    uint32_t execution_cluster_lane;
 };
 
 static_assert(sizeof(SchedulerTaskMetadata) == 16, "task metadata layout changed");
@@ -1379,6 +1396,8 @@ static_assert(offsetof(SchedulerWorkerContext, wake_cas_retry_count) == 512, "wa
 static_assert(offsetof(SchedulerWorkerContext, completion_enqueue_cycles) == 640, "termination stats offset changed");
 static_assert(offsetof(SchedulerWorkerContext, scheduler_tail_reserved) == 768, "worker reserved tail offset changed");
 static_assert(sizeof(SchedulerTaskTrace) == 384, "task trace layout changed");
+static_assert(offsetof(SchedulerTaskTrace, execution_run_epoch) == 328, "execution identity offset changed");
+static_assert(offsetof(SchedulerTaskTrace, execution_cluster_lane) == 380, "execution identity exceeds trace tail");
 static_assert(
     offsetof(SchedulerTaskTrace, dispatch_start_cycles) % 64 == 0,
     "Scheduler-owned dispatch and completion fields must begin on a cache-line boundary"

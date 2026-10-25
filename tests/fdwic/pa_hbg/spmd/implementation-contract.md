@@ -4,7 +4,8 @@
 定义已确认语义；本页把它收敛为可开始编码的正确性基线。
 共同准入、Host 预分配、纯 C/V 的 own/direct 入口、cursor 和 LocalDone 已接入生产路径。
 GM Mix 也已接入，原样 CSA 的数值与严格 resident L4 门禁已通过；
-首错误身份与退出冷日志已接线；显式 block/slot 身份与完整协议 trace、sync_start 和性能比较仍未完成。
+首错误身份、退出冷日志及显式 block/slot 身份已接线，原样 CSA 身份审计通过；
+完整协议事件 trace、sync_start 和性能比较仍未完成。
 本页保留全部目标合同；已实现字段和实测范围以 [实现过程](implementation-progress.md) 为准，
 不以存在字段替代执行验收。
 初始 TDD 覆盖和历史红绿状态见 [测试入口和验收状态](test-plan-and-status.md)。
@@ -237,7 +238,15 @@ predicate 跳过不伪造执行身份；不支持的多 block 组合仍由能力
 纯 C/V 的 trace 索引包含 `block_idx * popcount(mask)`；Host 导出使用该完整索引作为
 `reg_task_id`，保留逻辑 task_ref 作为 task token。转换器把 reg_task_id 纳入执行身份，
 避免同一核连续执行同一 task 的不同 block 时合并记录或连错 flow。
-这只补齐逐 block 存储／连接键，不提供尚未采集的 order、LocalDone 和 GM 组事件。
+入口身份另以 `aicore_execution_identities` 对象导出，schema 为 `hbg-execution-identity-v1`，
+producer 为 aicore，records 用 epoch/core/reg_task_id 与执行行一一连接。
+字段包括 task_id、block_idx、block_num、subtask_slot、pending_slot、dispatch_generation、
+order_key、group_seq、cluster_index、cluster_lane、executed。未参与共同准入或 GM 组时相应字段为 null；
+predicate 跳过保留 executed=false，不冒充 kernel 执行。N/block 来自调用前的 payload 快照，
+不从行序、trace 索引或完成数推导。Trace 保持 384B，最后一条 cache line 发布身份后才调用 kernel，
+completion 的既有 valid 最后发布；L0 不写身份。读端拒绝缺字段、错绑、重复执行及槽代次。
+CSA 严格门禁按冻结图核对完整 task/block/slot 集合；历史无身份 capture 保持未验证。
+这些记录不提供尚未采集的 LocalDone、共同准入发布和 GM 组释放事件。
 
 ### 每条发布链必须有设备侧证明
 
@@ -288,7 +297,7 @@ AICPU 首写者明确记录未知 task/core/扩展身份，bootstrap/execution/t
 | 2 | ready 唯一领取、准入发布及 executor/completion 统一 entry gate | B 先于未 ready A；三入口不可越序；旁路发布竞态 | own/direct 与 GM Mix 已接线；完整协议事件审计待补 |
 | 3 | 普通 C/V cursor、原 N、block 退役与分波 demand | N=1、容量两侧、512；晚 block 不早放后继；快核跨 task 重叠 | 原生纯 C/V 已有通过证据 |
 | 4 | GM descriptor/ack/seal，各 lane 自备 payload，无 SSBUF | mask 3/5/6/7、配对、暂停最后发布者、局部关闭和槽复用 | C++、仿真／A5 矩阵和重叠通过；首错误身份与冷日志已接线 |
-| 5 | block/order/placement/来源导出及严格审计器 | 完整因果链、不重不漏、无截断；原样 CSA 七项 golden 与 resident 来源 | CSA 七项 golden／2308 记录／来源通过；显式身份与完整协议事件待补 |
+| 5 | block/order/placement/来源导出及严格审计器 | 完整因果链、不重不漏、无截断；原样 CSA 七项 golden 与 resident 来源 | CSA 七项 golden／2308 显式身份／来源通过；完整协议事件待补 |
 | 6 | sync_start 一次领取／不同位置容量 | 满核独立任务、交叠成员、超容量、早返回不二次领取 | 未开放 |
 | 7 | 相同 kernel/输入/拓扑的控制开销对比 | 区分无完整插桩性能与诊断运行，不能由 CPU 模型推算收益 | 未完成 |
 

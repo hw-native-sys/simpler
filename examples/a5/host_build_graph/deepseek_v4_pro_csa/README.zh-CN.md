@@ -192,7 +192,7 @@ python -m pytest -q \
 
 [graph_contract.json](graph_contract.json) 来源于本次 A5 HBG 的 `deps.json`，保留原始采集 SHA256、commit 和输入清单摘要。图包含 79 个执行任务、2 个 Dummy、133 条去重后的图内依赖边，60 个多 block 任务、2308 条执行记录（AIC 864 / AIV 1444）。Host 已完成的分配节点另列为 `host_ready_refs`，不伪造它们的设备执行。
 
-[graph_contract.py](graph_contract.py) 在 `run.py l1/l4` 中检查原始 kernel 组合、block 数、依赖和 tensor view，并检查逐任务 AIC/AIV 数量、单次正数 epoch、包括 Dummy 在内的前驱执行完成时序。保留 schema 缺失项的边界：原始泳道**不提供 `block_idx` / `subtask_slot`**，结果明确写 `block_identity_verified=false`；2308 条记录不等于证明 2308 个唯一 block 身份。精确领取身份仍需配合 [SPMD 原生探针](../../../../tests/fdwic/pa_hbg/spmd/test_spmd_contract.py)。
+[graph_contract.py](graph_contract.py) 在 `run.py l1/l4` 中检查原始 kernel 组合、block 数、依赖和 tensor view，并检查逐任务 AIC/AIV 数量、单次正数 epoch、包括 Dummy 在内的前驱执行完成时序。A5 resident 的新 capture 通过 `aicore_execution_identities` 提供入口采集的 `block_idx` / `subtask_slot`，并按原图逐项核对 2308 个唯一身份。历史不带该对象的数据仍返回 `block_identity_verified=false`，不能按记录数补造身份；严格 `--require-aicore-scheduler` 入口要求该项为 true。完整协议事件仍需配合 [SPMD 原生探针](../../../../tests/fdwic/pa_hbg/spmd/test_spmd_contract.py) 和后续协议采集。
 
 CPU TDD 分为两层：
 
@@ -242,7 +242,8 @@ Host 构图 107/107、无 dropped/truncated，scheduler producer 为 `aicore`。
 deps/timing 两轮各七项数值比较均通过；输入、54 个 kernel、52 项 ABI、原 N 和校验标准未变。
 两个无 kernel Dummy 不占物理 trace，但仍在逻辑完成与依赖链中。
 
-结果保留 `block_identity_verified=false`，因为现有原始 schema 不提供显式 block_idx/subtask_slot。
-因此这次通过证明原样业务、来源、数量与依赖时序，不替代完整共同准入／组协议事件审计。
+上述历史结果保留 `block_identity_verified=false`，当时的 schema 没有显式 block_idx/subtask_slot。
+当前入口已采集显式身份，原样 CSA 的严格 L4 身份审计通过，结果为 true；
+这仍不替代完整共同准入／组协议事件审计。
 首错误身份与退出冷日志已接线；sync_start 和无插桩性能比较仍待完成。所有失败定位和逐步复验仅集中记录于
 [实现过程](../../../../tests/fdwic/pa_hbg/spmd/implementation-progress.md)，不修改本页历史基线数值。

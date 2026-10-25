@@ -9,8 +9,8 @@
 
 """Resident-only native acceptance: block identity, exactly-once execution and real fanin.
 
-These are intentional red acceptance tests for the not-yet-implemented multi-block
-resident path. A numerically correct legacy fallback MUST fail the mode assertion.
+Ordinary C/V and GM Mix retain their original block counts, including waves beyond
+physical capacity. A numerically correct legacy fallback MUST fail the mode assertion.
 """
 
 import torch

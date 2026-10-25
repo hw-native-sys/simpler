@@ -565,6 +565,45 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         return false;
     }
 
+    std::ostringstream identities_json;
+    identities_json << "{\"schema\":\"hbg-execution-identity-v1\",\"producer\":\"aicore\",\"records\":[";
+    bool first_identity = true;
+    for (uint64_t trace_index : emitted_traces) {
+        const SchedulerTaskTrace &trace = traces[trace_index];
+        const uint32_t flags = trace.execution_identity_flags;
+        if ((flags & SCHEDULER_TRACE_IDENTITY_CAPTURED) == 0 || (flags & ~UINT32_C(15)) != 0 ||
+            trace.execution_run_epoch != swimlane_run_epoch) {
+            LOG_WARN("A5 HBG: missing or stale execution identity at trace=%" PRIu64, trace_index);
+            return false;
+        }
+        if (!first_identity) identities_json << ",";
+        first_identity = false;
+        identities_json << "\n{\"run_epoch\":" << trace.execution_run_epoch << ",\"core_id\":" << trace.worker_id
+                        << ",\"reg_task_id\":" << trace_index << ",\"task_id\":" << trace.task_ref
+                        << ",\"block_idx\":" << trace.execution_block_idx
+                        << ",\"block_num\":" << trace.execution_block_num
+                        << ",\"subtask_slot\":" << trace.execution_subtask_slot
+                        << ",\"pending_slot\":" << trace.execution_pending_slot
+                        << ",\"dispatch_generation\":" << trace.execution_generation
+                        << ",\"cluster_index\":" << trace.execution_cluster_index
+                        << ",\"cluster_lane\":" << trace.execution_cluster_lane << ",\"order_key\":";
+        if ((flags & SCHEDULER_TRACE_ORDERED) != 0) identities_json << trace.execution_order_key;
+        else identities_json << "null";
+        identities_json << ",\"group_seq\":";
+        if ((flags & SCHEDULER_TRACE_GROUP) != 0) identities_json << trace.execution_group_seq;
+        else identities_json << "null";
+        identities_json << ",\"executed\":" << ((flags & SCHEDULER_TRACE_EXECUTED) != 0 ? "true" : "false") << "}";
+    }
+    identities_json << "]}";
+    const std::string identities_payload = identities_json.str();
+    if (!api->publish_chip_swimlane_extension(
+            ChipSwimlaneExtensionSection::AicoreExecutionIdentities, identities_payload.c_str(),
+            identities_payload.size()
+        )) {
+        LOG_WARN("A5 HBG: failed to publish execution identities");
+        return false;
+    }
+
     if (need_scheduler_timing) {
         std::ostringstream scheduler_tasks_json;
         scheduler_tasks_json << "{\n    \"producer\": \"aicore\",\n    \"records\": [";
