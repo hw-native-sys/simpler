@@ -23,6 +23,7 @@
 #include "hbg_scheduler_test_support.h"
 #include "scheduler/scheduler_gm_mix.h"
 #include "scheduler/scheduler_dispatch.h"
+#include "scheduler/scheduler_protocol_execute.h"
 
 namespace {
 
@@ -206,8 +207,9 @@ struct GmMixFixture {
             local->local_ready_mask |= static_cast<uint8_t>(1U << slot);
             return false;
         }
-        const auto *payload =
+        auto *payload =
             scheduler_state_at<DispatchPayload>(base(), local->dispatch_payload_offset(local->config.self_lane, slot));
+        if (scheduler_protocol_enabled(local)) scheduler_execute_protocol_task(base(), local, slot, payload);
         *execution = {
             local->slots[slot].task_ref,
             static_cast<uint32_t>(payload->local_context.block_idx),
@@ -1078,6 +1080,13 @@ TEST_P(HbgGmProtocolEvents, CapturesPublicationDescriptorActualAcksAndUniqueBloc
     EXPECT_GT(record.owner.completion_after.sequence, record.owner.completion_before.sequence);
     EXPECT_EQ(record.owner.completion_ticket, 0u);
     EXPECT_EQ(record.owner.worker_index, 0u);
+    ASSERT_TRUE(fixture.complete_task(0, 0));
+    const auto *tasks =
+        scheduler_state_at<SchedulerProtocolTaskTrace>(fixture.base(), fixture.storage.layout.protocol.tasks_offset);
+    EXPECT_GT(tasks[0].completion.before.sequence, record.owner.completion_after.sequence);
+    EXPECT_GT(tasks[0].completion.after.sequence, tasks[0].completion.before.sequence);
+    EXPECT_EQ(tasks[0].completion.order_key, 0u);
+    EXPECT_EQ(tasks[0].completion.worker_index, 0u);
     EXPECT_EQ(blocks[1].owner.claim_after.sequence, 0u);
     const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
         fixture.base(), fixture.storage.layout.protocol.workers_offset

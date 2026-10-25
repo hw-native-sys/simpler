@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "scheduler_protocol.h"
+#include "scheduler_ready.h"
 
 inline __aicore__ __gm__ SchedulerProtocolBlockTrace *scheduler_protocol_block_at(
     __gm__ void *base, const SchedulerLocalState *local, __gm__ const SchedulerProtocolLayout *layout, uint32_t block

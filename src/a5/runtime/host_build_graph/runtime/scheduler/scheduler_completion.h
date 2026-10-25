@@ -54,7 +54,9 @@ inline __aicore__ bool scheduler_complete_ordered_task(
     if (scheduler == nullptr || scheduler->admission == nullptr || !scheduler_task_ref_valid(graph, task_ref))
         return false;
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
+    scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
     scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, false);
     if (!scheduler_resolve_completion(
             graph, scheduler_state_base, scheduler, run_control, task_ref, wake_stats, ready_stats, completion_stats,
             profiling_level, false, scheduler_ordered_direct_sink(scheduler->admission),
@@ -200,6 +202,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         completed_trace->kernel_end_cycles = executor_trace.kernel_end_cycles;
     }
     const uint8_t completed_subtask_slot = local_slot->subtask_slot;
+    const uint32_t completed_block_idx = local_slot->block_idx;
     const bool gm_mix = local_slot->gm_mix;
     if (gm_mix && (!local_slot->cooperative || scheduler->admission == nullptr || mix_slot || mix_tracker != nullptr ||
                    cluster_lane != scheduler->config.self_lane || replacement_ready != nullptr)) {
@@ -230,6 +233,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         task_complete = result == SchedulerBlockFinishResult::TASK_LAST;
     }
     scheduler_mark_completion_consumed(scheduler, cluster_lane, pending_slot, completed_generation, mix_slot);
+    if (!mix_slot) scheduler_protocol_execution_consumed(scheduler_state_base, scheduler, pending_slot, *local_slot);
     uint64_t refill_start_cycles = 0;
     uint64_t refill_end_cycles = 0;
     bool refilled = false;
@@ -244,7 +248,9 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     SchedulerReadyClaim resolved_ready{};
     if (task_complete && scheduler->admission == nullptr) {
         __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
+        scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, true);
         scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+        scheduler_protocol_task_done(scheduler_state_base, scheduler, task_ref, false);
         // A peer AIV's remote Mix slot belongs to coordinator placement.
         SchedulerReadyClaim *direct_ready = nullptr;
         if (replacement_ready == nullptr && !mix_slot) {
@@ -323,6 +329,11 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         if (phase_timing_enabled) scheduler_writeback_cache_line(&completed_trace->descriptor_cache_observed_cycles);
         scheduler_cache_barrier();
         scheduler_gm_store(completed_trace->valid, UINT64_C(1));
+        if (!mix_slot)
+            scheduler_protocol_execution_trace_published(
+                scheduler_state_base, scheduler, task_ref, completed_block_idx, completed_subtask_slot, pending_slot,
+                completed_generation
+            );
         // The preceding barrier publishes trace lines before valid. The store
         // drains valid before pending_completed reaches resolved_task_count.
     } else if (completed_trace != nullptr) {

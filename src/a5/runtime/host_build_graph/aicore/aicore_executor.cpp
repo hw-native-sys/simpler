@@ -13,6 +13,7 @@
 #include "aicore/aicore_profiling_state.h"
 // AICore dependency scheduling uses one device-side protocol.
 #include "scheduler/scheduler_dispatch.h"
+#include "scheduler/scheduler_protocol_execute.h"
 #include "common/platform_config.h"
 #include "dispatch_payload.h"
 #include "runtime.h"
@@ -398,7 +399,9 @@ __aicore__ bool run_ready_dispatch_loop(
                 );
             OUT_OF_ORDER_STORE_BARRIER();
             uint64_t kernel_start = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
-            execute_task(payload);
+            if (scheduler_protocol_enabled(context))
+                scheduler_execute_protocol_task(scheduler_state_base, context, slot_index, payload);
+            else execute_task(payload);
             uint64_t kernel_end = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (commit_executor_trace) stage_task_trace_before_completion(&execution_trace, kernel_start, kernel_end);
             if (commit_executor_trace) context->profiling->executor_traces[slot_index] = execution_trace;

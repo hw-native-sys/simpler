@@ -1122,3 +1122,82 @@ HBG 仿真 42 passed、378 deselected（54.05 秒），A5 60 passed、4 skipped�
 适用 pre-commit 检查全部通过，日志 `outputs/spmd-protocol-block-precommit-20261025.log`。
 本次阶段提交包含上述 block／GM 接线及 12 项新增检查，不包含输出产物或用户未跟踪内容，
 不启用 Host 协议区，不新增用户配置开关，不 push。后续 kernel／TaskDone 接线仍须完成。
+
+## 2026-10-25：执行许可、kernel 阶段与逻辑完成接线
+
+起点 `9d5abf944`，继续完整协议采集，Host 协议区仍未启用。
+TaskDone 覆盖普通无准入上下文、协同任务、无 kernel 服务节点三条真实完成路径，
+区间包住 DONE 的实际发布；普通／服务节点的 order 为未知哨兵，不挪用无关当前义务。
+服务节点不产生执行身份、payload 或 kernel 事件。新增／加严测试取得 8 项实际 RED 后转绿，
+日志 `outputs/spmd-protocol-taskdone-red-20261025.log`、`outputs/spmd-protocol-taskdone-green-20261025.log`。
+
+为让 ready 内联服务节点和 completion 共用 recorder，低依赖记录 helper 通过模板接受现有
+本核状态；不移动调度状态、不新增构图或分配职责、不引入头文件循环依赖。
+既有 scheduler_cycles 原样下移到该公共记录层，时钟来源不变。
+执行记录扩至 256B，保存最终 payload 发布快照、entry permit、kernel 入口／返回／输出可见、
+完成代次消费、既有 trace.valid 发布，以及对应身份、来源和 publication mode。
+GraphSummary／RunControl／SchedulerTaskTrace 及本核调度状态大小不因此改变。
+
+普通许可保存实际 commit_tail 关键读的值；入口不重新读 tail 来改写已经授予的许可。
+无准入日志的运行明确标记 NO_LOG，不伪造原子读；协同许可保存实际当前 order／group。
+kernel 入口在调用前保存 payload 的原 N 和 block，返回点与既有输出屏障后的可见点分开采样。
+predicate 跳过只记录 dispatch／许可／消费，不伪造 kernel 返回或输出可见事件。
+完成代次的消费记录位于真实 mark_completion_consumed 之后；direct refill 覆盖槽后，
+旧 trace 发布仍使用先保存的 task/block/subtask/generation 定位，不挪用后继的身份。
+
+真实 executor 的三个 L4 lane 检查先实际 RED：kernel 会把 payload 改成 block=77、N=99，
+记录必须保留调用前 0/1，并区分上述阶段。日志 `outputs/spmd-protocol-execution-entry-red-20261025.log`。
+纯记录 helper 与实际调用 kernel 的包装分开；包装使用平台原有 OUT_OF_ORDER_STORE_BARRIER，
+A5 仍是 dsb(DSB_DDR)。首次扩展到无 inner_kernel 的纯 CPU 测试时确实遇到屏障宏未声明，
+随后把设备执行包装放入独立头文件，不用 host 空屏障替代设备语义。
+两个调度夹具在开启采集时调用同一生产包装执行真实 no-op 函数，
+不是通过手填 entry／returned 事件让完整链看起来存在。
+
+payload 发布快照的首版被合法“预填→让槽→重建”反例击穿：
+`outputs/spmd-protocol-execution-cpp-r4-20261025.log` 中一项失败。
+普通预填尚未获得 entry permit，因此可被重建，不能把两次准备判作两次执行。
+修正后只保留最终将进入 kernel 的实际发布区间、slot/generation、来源和发布次数；
+这类可撤销快照不占用不可撤销事件序号，避免覆盖快照造成序号洞或伪造时序。
+获准后的快照禁止覆盖；已领取的协同 block 禁止借此重复发布。
+后一个限制另取得实际 RED，见 `outputs/spmd-protocol-execution-cooperative-republish-red-20261025.log`。
+predicate 缓存仍被保留，重建不重新求值；两个预填槽没有共用一次旧许可。
+
+额外检查覆盖：许可之后新准入不能改变已读 tail、重复返回保留首现场、
+无效 pending slot 不访问越界、退出后不得写快照，以及真实 executor 中 direct refill
+的旧完成代次与新 kernel 代次分离。准备两个任务的测试图曾使用容量 1 的夹具类型，
+在运行前核对定义后改为容量 2，没有放宽生产图容量。
+最终首轮 16 个 C++ targets 共 591 项通过，日志 `outputs/spmd-protocol-execution-all-cpp-20261025.log`。
+
+设备首轮重编失败于 TaskDone 的 GM 引用传给要求 Scalar 本地引用的形状 helper，
+日志 `outputs/spmd-protocol-execution-runtime-build-20261025.log`。
+修正为先读取 16B SchedulerTaskMetadata 本地快照再调用原 helper，不改判定规则；
+修正后的 runtime 与 C++ 重编正在执行，结果续记。本节尚未完成新增事件的 A5 采集验收。
+
+第二轮 CCEC 仍拒绝从 GM 隐式复制构造整个 POD；CPU 16 个目标仍全部通过，
+说明普通 C++ 编译并不能验证 CCEC 地址空间规则。
+按已有 scheduler_load_dispatch_metadata 的逐字段读取方式，
+只把判定需要的 flags 和 logical_block_num 读入本地形状快照，再复用原判定函数。
+失败日志 `outputs/spmd-protocol-execution-runtime-build-r2-20261025.log` 保留，不用旧二进制补报通过。
+
+第三轮 runtime 重编通过，日志 `outputs/spmd-protocol-execution-runtime-build-r3-20261025.log`。
+修正后重新构建的 16 个 C++ targets 共 591 项通过；相对 `9d5abf944` 新增 8 项，
+另外加严了原有 executor、Mix 和预填让槽用例，未把修改过的原有检查重复计作新增。
+Python 合约／CSA／转换器／身份共 1766 项通过，日志分别为
+`outputs/spmd-protocol-execution-final-cpp-20261025.log`、`outputs/spmd-protocol-execution-python-20261025.log`。
+
+HBG 仿真 42 passed、378 deselected（50.91 秒），A5 60 passed、4 skipped、356 deselected
+（153.18 秒），日志 `outputs/spmd-protocol-execution-hbg-sim-20261025.log` 和
+`outputs/spmd-protocol-execution-native-20261025/hbg.log`。仍排除已知双卡 TMR 误收集项，
+设备由 CANN query 确认 Ascend950PR_958b；本机无 npu-smi／task-submit，按用户要求直接用卡。
+原样 CSA 严格 L4 `outputs/csa-hbg-l4-fhlpnykf/result.json`：两轮各七项 golden、
+2308 条身份、133 条依赖边、107/107 Host 记录，producer=aicore、block_identity_verified=true，
+冻结 case 与基线一致。两个新头文件在这次验收前加入索引，因此 provenance 的
+git diff HEAD 源码指纹包含它们；没有通过提交／索引状态掩盖采集代码。
+
+这些 native 结果仍是 Host 协议区未启用时的回归；新增执行事件目前由实际 CPU executor
+和生产包装检查，不能声称已完成它们在 A5 上的整链采集。
+后续直接接通既有 L4 下的 Host 预分配、原生导出和严格因果审计，然后完成 sync_start 与性能对比。
+本阶段不 push，不改变既有完成驱动依赖推进，也不增加全核完成屏障。
+
+适用 pre-commit 检查全部通过，日志 `outputs/spmd-protocol-execution-precommit-final-20261025.log`。
+阶段提交只包含本节接线、测试与统一过程记录；不包含输出产物或用户未跟踪内容。

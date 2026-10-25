@@ -31,6 +31,10 @@ DispatchPayload *identity_test_payload = nullptr;
 
 void count_kernel_entry(__gm__ int64_t *) { ++startup_kernel_calls; }
 
+void protocol_chain_kernel(__gm__ int64_t *) {
+    if (++startup_kernel_calls == 2) write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+}
+
 void identity_test_kernel(__gm__ int64_t *) {
     ++startup_kernel_calls;
     identity_test_payload->local_context.block_idx = 77;
@@ -153,7 +157,8 @@ struct StartupFixture {
                 ASSERT_TRUE(scheduler_ordered_can_enter_slot(graph_view, base(), &local, run, slot, &permit));
                 ASSERT_TRUE(permit);
                 auto *payload = scheduler_state_at<DispatchPayload>(base(), local.dispatch_payload_offset(lane, slot));
-                execute_task(payload);
+                if (scheduler_protocol_enabled(&local)) scheduler_execute_protocol_task(base(), &local, slot, payload);
+                else execute_task(payload);
                 local.local_completed_generations[slot] = scheduler_dispatch_generation(publication);
                 ASSERT_TRUE(scheduler_service_cluster_completions(
                     graph_view, base(), &local, run, nullptr, nullptr, nullptr, 0, nullptr, nullptr
@@ -327,7 +332,7 @@ class HbgExecutionIdentityEntry : public ::testing::TestWithParam<std::tuple<uin
 
 TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCanChangeIt) {
     const auto [worker, level] = GetParam();
-    scheduler_test::FixtureStorage storage(1, 3, 1);
+    scheduler_test::FixtureStorage storage(1, 3, 1, SchedulerSpmdRequirements{3, 1, 0, 0}, level == 4);
     scheduler_test::BasicGraphBuffer<1> graph(1);
     graph.executable(0, worker == 0 ? 0 : 1);
     auto &metadata = storage.metadata[0];
@@ -342,6 +347,7 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     for (uint32_t lane = 0; lane < 3; ++lane)
         storage.contexts[worker].cluster_worker_ids[lane] = lane;
     auto *local = storage.local_context(&storage.contexts[worker]);
+    ASSERT_TRUE(scheduler_protocol_bind(base, local));
     local->config.scheduler_count = 3;
     auto *run = storage.run_control;
     run->expected_task_count = 1;
@@ -381,12 +387,91 @@ TEST_P(HbgExecutionIdentityEntry, RealExecutorCapturesEntryPayloadBeforeKernelCa
     }
     startup_reg_base = nullptr;
     identity_test_payload = nullptr;
+    if (level == 4) {
+        const auto *tasks = scheduler_state_at<SchedulerProtocolTaskTrace>(base, storage.layout.protocol.tasks_offset);
+        EXPECT_NE(tasks[0].completion.before.sequence, 0u);
+        EXPECT_GT(tasks[0].completion.after.sequence, tasks[0].completion.before.sequence);
+        EXPECT_EQ(tasks[0].completion.worker_index, worker);
+        EXPECT_EQ(tasks[0].completion.order_key, UINT64_MAX);
+        EXPECT_EQ(tasks[0].completion.run_epoch, 59u);
+        const auto *event =
+            scheduler_state_at<SchedulerProtocolExecutionTrace>(base, storage.layout.protocol.executions_offset);
+        EXPECT_EQ(event->publication_count, 1u);
+        EXPECT_LE(event->publication_before_cycles, event->publication_after_cycles);
+        EXPECT_LE(event->publication_after_cycles, event->permit.cycles);
+        EXPECT_NE(event->permit.sequence, 0u);
+        EXPECT_GT(event->entry.sequence, event->permit.sequence);
+        EXPECT_GT(event->returned.sequence, event->entry.sequence);
+        EXPECT_GT(event->visible.sequence, event->returned.sequence);
+        EXPECT_GT(event->completion_consumed.sequence, event->visible.sequence);
+        EXPECT_GT(tasks[0].completion.before.sequence, event->completion_consumed.sequence);
+        EXPECT_GT(event->trace_published.sequence, event->completion_consumed.sequence);
+        EXPECT_LE(event->returned.cycles, event->visible.cycles);
+        EXPECT_EQ(event->run_epoch, 59u);
+        EXPECT_EQ(event->worker_index, worker);
+        EXPECT_EQ(event->block_idx, 0u);
+        EXPECT_EQ(event->logical_block_num, 1u);
+        EXPECT_EQ(event->pending_slot, 0u);
+        EXPECT_EQ(event->generation, 1u);
+        EXPECT_EQ(event->cluster_lane, worker);
+        EXPECT_EQ(
+            event->flags, SCHEDULER_PROTOCOL_ENTRY | SCHEDULER_PROTOCOL_EXECUTED | SCHEDULER_PROTOCOL_PERMIT_NO_LOG |
+                              SCHEDULER_PROTOCOL_PAYLOAD_PUBLISHED
+        );
+    }
 }
 
 INSTANTIATE_TEST_SUITE_P(
     LanesAndProfilingLevels, HbgExecutionIdentityEntry,
     ::testing::Combine(::testing::Values(0u, 1u, 2u), ::testing::Values<uint64_t>(0, 1, 2, 4))
 );
+
+TEST(HbgProtocolExecution, DirectRefillKeepsTheCompletedGenerationSeparateFromItsSuccessor) {
+    scheduler_test::FixtureStorage storage(2, 3, 1, SchedulerSpmdRequirements{3, 1, 0, 0}, true);
+    scheduler_test::BasicGraphBuffer<2> graph(2);
+    graph.executable(0, 0);
+    graph.executable(1, 0, {0});
+    storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    auto *base = storage.scheduler_state->base();
+    ASSERT_TRUE(scheduler_init_spmd_task_records(base, storage.layout, 73));
+    storage.callable_addresses[1] = reinterpret_cast<uint64_t>(&protocol_chain_kernel);
+    storage.test_graphs[0] = graph.graph();
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        storage.contexts[0].cluster_worker_ids[lane] = lane;
+    auto *local = storage.local_context(&storage.contexts[0]);
+    local->config.scheduler_count = 3;
+    ASSERT_TRUE(scheduler_protocol_bind(base, local));
+    auto *run = storage.run_control;
+    run->expected_task_count = 2;
+    ASSERT_EQ(scheduler_route_task(graph.graph(), base, local, run, 1, nullptr), SchedulerRouteResult::WAITING);
+    SchedulerReadyBatch batch{};
+    ASSERT_TRUE(scheduler_ready_batch_append(base, local, 0, &batch, nullptr));
+    ASSERT_TRUE(scheduler_ready_batch_push(base, local, 0, &batch, nullptr));
+    std::array<uint8_t, 64> registers{};
+    startup_reg_base = registers.data();
+    startup_kernel_calls = 0;
+    write_reg(RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
+    SchedulerWorkerStats stats{};
+    ASSERT_TRUE(run_ready_dispatch_loop(graph.graph(), base, local, run, &stats, 4));
+    ASSERT_EQ(startup_kernel_calls, 2u);
+    ASSERT_TRUE(scheduler_service_cluster_completions(
+        graph.graph(), base, local, run, nullptr, nullptr, nullptr, 4, nullptr, nullptr
+    ));
+    const auto *events =
+        scheduler_state_at<SchedulerProtocolExecutionTrace>(base, storage.layout.protocol.executions_offset);
+    EXPECT_EQ(events[0].task_ref, 0);
+    EXPECT_EQ(events[1].task_ref, 1);
+    EXPECT_EQ(events[0].pending_slot, events[1].pending_slot);
+    EXPECT_GT(events[1].generation, events[0].generation);
+    EXPECT_NE(events[0].trace_published.sequence, 0u);
+    EXPECT_GT(events[1].entry.sequence, events[0].trace_published.sequence);
+    EXPECT_GT(events[1].trace_published.sequence, events[1].completion_consumed.sequence);
+    EXPECT_EQ(events[1].ready_source, static_cast<uint32_t>(SchedulerReadySource::DIRECT_RESOLVE));
+    EXPECT_EQ(events[1].publication_mode, static_cast<uint32_t>(SchedulerPublicationMode::REFILL));
+    const auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(base, storage.layout.protocol.workers_offset);
+    EXPECT_EQ(worker->error_flags, 0u);
+    startup_reg_base = nullptr;
+}
 
 }  // namespace
 

@@ -12,6 +12,7 @@
 #pragma once
 
 #include "scheduler_protocol_block.h"
+#include "scheduler_protocol_execution.h"
 
 enum class SchedulerAdmissionResult : uint8_t { PROGRESS, RETRY, ERROR };
 
@@ -400,7 +401,7 @@ inline __aicore__ bool scheduler_refresh_local_obligation(
 
 inline __aicore__ bool scheduler_can_enter_ordinary(
     const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
-    SchedulerAdmissionLocalState *admission, bool *permit
+    SchedulerAdmissionLocalState *admission, bool *permit, uint64_t *observed_tail = nullptr
 ) {
     if (permit == nullptr)
         return scheduler_admission_fail(
@@ -417,6 +418,7 @@ inline __aicore__ bool scheduler_can_enter_ordinary(
                 graph, local, run, SCHEDULER_TASK_REF_INVALID, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER
             );
         *permit = true;
+        if (observed_tail != nullptr) *observed_tail = 0;
         return true;
     }
     auto *shared = scheduler_state_at<SchedulerAdmissionControl>(base, admission->control_offset);
@@ -428,6 +430,7 @@ inline __aicore__ bool scheduler_can_enter_ordinary(
     // This critical read grants one entry only. A later publication may wait
     // for that finite kernel, but cannot be ignored by its next invocation.
     *permit = tail == admission->scan_cursor;
+    if (*permit && observed_tail != nullptr) *observed_tail = tail;
     return true;
 }
 
@@ -680,9 +683,11 @@ inline __aicore__ bool scheduler_ordered_can_enter_slot(
              admission->gm_mix.subtask_slot != slot.subtask_slot))
             return scheduler_admission_fail(graph, local, run, slot.task_ref, SchedulerErrorSite::GROUP_INVALID_STATE);
         *permit = true;
+        scheduler_protocol_execution_permit(base, local, slot_index, UINT64_MAX, true);
         return true;
     }
-    if (!scheduler_can_enter_ordinary(graph, base, local, run, admission, permit)) return false;
+    uint64_t observed_tail = UINT64_MAX;
+    if (!scheduler_can_enter_ordinary(graph, base, local, run, admission, permit, &observed_tail)) return false;
     if (!*permit) return true;
     if (slot.candidate_index >= SCHEDULER_PENDING_SLOT_COUNT)
         return scheduler_admission_fail(
@@ -693,6 +698,7 @@ inline __aicore__ bool scheduler_ordered_can_enter_slot(
         return scheduler_admission_fail(
             graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
         );
+    scheduler_protocol_execution_permit(base, local, slot_index, observed_tail, admission->capacity != 0);
     admission->next_candidate = static_cast<uint8_t>((slot.candidate_index + 1) % SCHEDULER_PENDING_SLOT_COUNT);
     candidate = {};
     slot.candidate_index = UINT8_MAX;

@@ -22,8 +22,8 @@
 namespace {
 
 struct InlineFixture {
-    explicit InlineFixture(bool ordered = true, bool mix = false) :
-        storage(3, 3, 4, SchedulerSpmdRequirements{3, 1, 1, mix ? 1u : 0u}) {
+    explicit InlineFixture(bool ordered = true, bool mix = false, bool protocol = false) :
+        storage(3, 3, 4, SchedulerSpmdRequirements{3, 1, 1, mix ? 1u : 0u}, protocol) {
         graph.mixed(0, mix ? 3 : 2);
         graph.executable(2, 1);
         for (uint32_t task = 0; task < 3; ++task) {
@@ -52,6 +52,7 @@ struct InlineFixture {
             storage.test_graphs[worker] = graph.graph();
             locals[worker] = storage.local_context(&context);
             locals[worker]->has_mix = mix;
+            if (!ordered && protocol) EXPECT_TRUE(scheduler_protocol_bind(base(), locals[worker]));
             if (ordered) {
                 EXPECT_TRUE(scheduler_initialize_admission(base(), locals[worker], &admissions[worker]));
                 locals[worker]->admission = &admissions[worker];
@@ -338,5 +339,32 @@ TEST_P(HbgInvalidInlineMetadata, RefusesKernelCooperativeAndPredicateShapesWitho
 }
 
 INSTANTIATE_TEST_SUITE_P(InvalidServiceWireShapes, HbgInvalidInlineMetadata, ::testing::Range<uint32_t>(0, 8));
+
+TEST(HbgInlineProtocol, RecordsOnlyRealLogicalCompletionWithoutAdmissionOrKernel) {
+    for (bool ordered : {false, true}) {
+        InlineFixture fixture(ordered, false, true);
+        ASSERT_TRUE(fixture.enqueue(1));
+        ASSERT_TRUE(fixture.fill());
+        const auto *tasks = scheduler_state_at<SchedulerProtocolTaskTrace>(
+            fixture.base(), fixture.storage.layout.protocol.tasks_offset
+        );
+        const auto &done = tasks[1].completion;
+        EXPECT_EQ(done.before.sequence, 1u);
+        EXPECT_EQ(done.after.sequence, 2u);
+        EXPECT_EQ(done.task_ref, 1);
+        EXPECT_EQ(done.run_epoch, 61u);
+        EXPECT_EQ(done.worker_index, 1u);
+        EXPECT_EQ(done.order_key, UINT64_MAX);
+        EXPECT_NE(done.flags & SCHEDULER_TASK_INLINE, 0u);
+        EXPECT_EQ(tasks[1].admission.before.sequence, 0u);
+        EXPECT_EQ(tasks[0].completion.before.sequence, 0u);
+        const auto *executions = scheduler_state_at<SchedulerProtocolExecutionTrace>(
+            fixture.base(), fixture.storage.layout.protocol.executions_offset
+        );
+        for (uint64_t index = 0; index < fixture.storage.layout.protocol.trace_count; ++index)
+            EXPECT_EQ(executions[index].entry.sequence, 0u);
+        fixture.expect_no_dispatch(1);
+    }
+}
 
 }  // namespace

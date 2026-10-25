@@ -23,6 +23,7 @@
 #include "hbg_scheduler_test_support.h"
 #include "scheduler/scheduler_admission.h"
 #include "scheduler/scheduler_dispatch.h"
+#include "scheduler/scheduler_protocol_execute.h"
 
 namespace {
 
@@ -171,8 +172,9 @@ struct OrderedFixture {
             local->local_ready_mask |= static_cast<uint8_t>(1U << slot);
             return false;
         }
-        const auto *payload =
+        auto *payload =
             scheduler_state_at<DispatchPayload>(base(), local->dispatch_payload_offset(local->config.self_lane, slot));
+        if (scheduler_protocol_enabled(local)) scheduler_execute_protocol_task(base(), local, slot, payload);
         *execution = {
             local->slots[slot].task_ref,
             static_cast<uint32_t>(payload->local_context.block_idx),
@@ -356,7 +358,10 @@ TEST(HbgOrderedExecution, CursorExhaustionIsBoundedAndDoesNotCloseLiveLocalSlots
 }
 
 TEST(HbgOrderedExecution, TwoPrefilledOrdinaryCandidatesYieldSlotsAndPreservePredicateDecisions) {
-    OrderedFixture fixture({{1, 1}, {1, 1}, {2, 1}});
+    OrderedFixture fixture({{1, 1}, {1, 1}, {2, 1}}, true);
+    const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
+        fixture.base(), fixture.storage.layout.protocol.executions_offset
+    );
     alignas(64) uint64_t predicates[2]{1, 0};
     for (uint64_t task = 0; task < 2; ++task) {
         fixture.storage.metadata[task].flags |= SCHEDULER_TASK_HAS_PREDICATE;
@@ -379,6 +384,8 @@ TEST(HbgOrderedExecution, TwoPrefilledOrdinaryCandidatesYieldSlotsAndPreservePre
     OrderedExecution denied{};
     EXPECT_FALSE(fixture.begin(0, &denied));
     EXPECT_EQ(fixture.locals[0]->local_ready_mask, 3u);
+    EXPECT_EQ(events[0].permit.sequence, 0u);
+    EXPECT_EQ(events[1].permit.sequence, 0u);
     predicates[0] = 0;
     predicates[1] = 1;
     ASSERT_TRUE(fixture.fill(0));
@@ -410,7 +417,21 @@ TEST(HbgOrderedExecution, TwoPrefilledOrdinaryCandidatesYieldSlotsAndPreservePre
         ASSERT_TRUE(fixture.complete(ordinary));
     }
     EXPECT_EQ(resumed, (std::array<uint32_t, 2>{1, 1}));
+    EXPECT_NE(events[0].returned.sequence, 0u);
+    EXPECT_EQ(events[1].returned.sequence, 0u);
+    EXPECT_EQ(events[1].visible.sequence, 0u);
+    EXPECT_EQ(events[1].flags & SCHEDULER_PROTOCOL_EXECUTED, 0u);
+    for (uint32_t task = 0; task < 2; ++task) {
+        EXPECT_EQ(events[task].publication_count, 2u);
+        EXPECT_EQ(events[task].permit_tail, 1u);
+        EXPECT_NE(events[task].flags & SCHEDULER_PROTOCOL_PERMIT_TAIL, 0u);
+        EXPECT_GT(events[task].completion_consumed.sequence, events[task].entry.sequence);
+    }
     EXPECT_EQ(fixture.ready_stats[0].enqueue_count, enqueue_count);
+    const auto *protocol_workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(protocol_workers[0].error_flags, 0u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
 }
 
@@ -805,6 +826,145 @@ TEST(HbgOrderedProtocol, ConcurrentWorkersKeepUniqueOwnersAndContiguousLocalSequ
     EXPECT_TRUE(std::all_of(seen.begin(), seen.end(), [](bool value) {
         return value;
     }));
+}
+
+TEST(HbgOrderedProtocol, AdmissionAfterAnOrdinaryPermitCannotRewriteItsObservedTail) {
+    OrderedFixture fixture({{1, 1}, {2, 1}}, true);
+    ASSERT_TRUE(fixture.enqueue(0, 0));
+    ASSERT_TRUE(fixture.fill(0));
+    auto *local = fixture.locals[0];
+    uint32_t slot = UINT32_MAX;
+    uint64_t publication = 0;
+    ASSERT_TRUE(scheduler_local_ready_pop(local, &slot, &publication));
+    bool permit = false;
+    ASSERT_TRUE(
+        scheduler_ordered_can_enter_slot(fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, &permit)
+    );
+    ASSERT_TRUE(permit);
+    ASSERT_TRUE(fixture.admit(1, 3));
+    const auto *shared =
+        scheduler_state_at<SchedulerAdmissionControl>(fixture.base(), fixture.storage.layout.admission_control_offset);
+    EXPECT_EQ(shared->commit_tail, 1u);
+    auto *payload = scheduler_state_at<DispatchPayload>(fixture.base(), local->dispatch_payload_offset(0, slot));
+    scheduler_execute_protocol_task(fixture.base(), local, slot, payload);
+    const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
+        fixture.base(), fixture.storage.layout.protocol.executions_offset
+    );
+    EXPECT_EQ(events[0].permit_tail, 0u);
+    EXPECT_NE(events[0].flags & SCHEDULER_PROTOCOL_PERMIT_TAIL, 0u);
+    EXPECT_GT(events[0].entry.sequence, events[0].permit.sequence);
+    EXPECT_GT(events[0].returned.sequence, events[0].entry.sequence);
+    OrderedExecution execution{
+        0, 0, 1, 0, slot, scheduler_dispatch_generation(publication), payload->function_bin_addr
+    };
+    ASSERT_TRUE(fixture.complete(execution));
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(1)->completed_blocks, UINT64_C(0)), 0u);
+    const auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(worker[0].error_flags, 0u);
+}
+
+TEST(HbgOrderedProtocol, DuplicateReturnKeepsTheFirstReturnAndVisibilityPoints) {
+    OrderedFixture fixture({{2, 1}}, true);
+    ASSERT_TRUE(fixture.admit(0, 0));
+    ASSERT_TRUE(fixture.stage_one(0, 0));
+    OrderedExecution execution{};
+    ASSERT_TRUE(fixture.begin(0, &execution));
+    const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
+        fixture.base(), fixture.storage.layout.protocol.executions_offset
+    );
+    const auto returned = events[0].returned;
+    const auto visible = events[0].visible;
+    scheduler_protocol_execution_returned(fixture.base(), fixture.locals[0], execution.slot, 123, 456);
+    EXPECT_EQ(events[0].returned.cycles, returned.cycles);
+    EXPECT_EQ(events[0].returned.sequence, returned.sequence);
+    EXPECT_EQ(events[0].visible.cycles, visible.cycles);
+    EXPECT_EQ(events[0].visible.sequence, visible.sequence);
+    const auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(worker->error_flags, SCHEDULER_PROTOCOL_DUPLICATE);
+}
+
+TEST(HbgOrderedProtocol, InvalidReturnSlotLeavesExecutionRecordsUntouched) {
+    OrderedFixture fixture({{1, 1}}, true);
+    scheduler_protocol_execution_returned(fixture.base(), fixture.locals[0], UINT32_MAX, 0, 0);
+    const auto *event = scheduler_state_at<SchedulerProtocolExecutionTrace>(
+        fixture.base(), fixture.storage.layout.protocol.executions_offset
+    );
+    EXPECT_EQ(event->returned.sequence, 0u);
+    EXPECT_EQ(event->visible.sequence, 0u);
+    const auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(worker->next_sequence, 0u);
+    EXPECT_EQ(worker->error_flags, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+}
+
+TEST(HbgOrderedProtocol, ConsumedPermitPreventsPayloadSnapshotFromBeingReplaced) {
+    OrderedFixture fixture({{1, 1}}, true);
+    ASSERT_TRUE(fixture.enqueue(0, 0));
+    ASSERT_TRUE(fixture.fill(0));
+    OrderedExecution execution{};
+    ASSERT_TRUE(fixture.begin(0, &execution));
+    const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
+        fixture.base(), fixture.storage.layout.protocol.executions_offset
+    );
+    const auto first = events[0];
+    SchedulerReadyClaim ready{};
+    ready.task_ref = 0;
+    SchedulerFreeSlotClaim claim{0, execution.slot, execution.generation, 0};
+    scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], claim, ready, true);
+    EXPECT_EQ(events[0].publication_count, first.publication_count);
+    EXPECT_EQ(events[0].publication_before_cycles, first.publication_before_cycles);
+    EXPECT_EQ(events[0].publication_after_cycles, first.publication_after_cycles);
+    EXPECT_EQ(events[0].entry.sequence, first.entry.sequence);
+    const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(workers[0].error_flags, SCHEDULER_PROTOCOL_DUPLICATE);
+}
+
+TEST(HbgOrderedProtocol, FinishedWorkerCannotPublishEvenAnUnsequencedPayloadSnapshot) {
+    OrderedFixture fixture({{1, 1}}, true);
+    auto *local = fixture.locals[0];
+    scheduler_protocol_finish(fixture.base(), local, true);
+    SchedulerReadyClaim ready{};
+    ready.task_ref = 0;
+    SchedulerFreeSlotClaim claim{0, 0, 0, 0};
+    scheduler_protocol_payload_publication(fixture.base(), local, claim, ready, true);
+    const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
+        fixture.base(), fixture.storage.layout.protocol.executions_offset
+    );
+    EXPECT_EQ(events[0].publication_count, 0u);
+    const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(workers[0].next_sequence, 0u);
+    EXPECT_EQ(workers[0].error_flags, SCHEDULER_PROTOCOL_AFTER_FINISH);
+}
+
+TEST(HbgOrderedProtocol, CooperativePayloadCannotBeRepublishedBeforeItsFirstPermit) {
+    OrderedFixture fixture({{2, 1}}, true);
+    ASSERT_TRUE(fixture.admit(0, 0));
+    ASSERT_TRUE(fixture.stage_one(0, 0));
+    const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
+        fixture.base(), fixture.storage.layout.protocol.executions_offset
+    );
+    ASSERT_EQ(events[0].permit.sequence, 0u);
+    const auto first = events[0];
+    ++fixture.locals[0]->slots[0].generation;
+    SchedulerReadyClaim ready{};
+    ready.task_ref = 0;
+    SchedulerFreeSlotClaim claim{0, 0, fixture.locals[0]->slots[0].generation, 0};
+    scheduler_protocol_payload_publication(fixture.base(), fixture.locals[0], claim, ready, true);
+    EXPECT_EQ(events[0].publication_count, first.publication_count);
+    EXPECT_EQ(events[0].generation, first.generation);
+    const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(workers[0].error_flags, SCHEDULER_PROTOCOL_DUPLICATE);
 }
 
 }  // namespace

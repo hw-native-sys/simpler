@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "scheduler_memory.h"
+#include "scheduler_protocol.h"
 #include "scheduler_graph.h"
 #include "scheduler_error.h"
 #include "scheduler_ssbuf.h"
@@ -548,14 +548,6 @@ inline __aicore__ SchedulerDispatchSlotState scheduler_dispatch_state(uint64_t p
 
 inline __aicore__ uint32_t scheduler_dispatch_generation(uint64_t publication) {
     return static_cast<uint32_t>(publication >> 8);
-}
-
-inline __aicore__ uint64_t scheduler_cycles() {
-#if defined(__CCE_AICORE__) || defined(__CPU_SIM)
-    return get_sys_cnt_aicore();
-#else
-    return 0;
-#endif
 }
 
 inline __aicore__ uint32_t scheduler_core_type_index(int32_t core_type) {
@@ -1603,6 +1595,7 @@ inline __aicore__ void scheduler_commit_dispatch_slot(
     const uint64_t dispatch_start_cycles = prepare_start_cycles;
     const uint32_t generation = scheduler->slot_state(slot_claim)->generation;
     const uint64_t ready_publish_cycles = schedule_timing_enabled ? scheduler_cycles() : 0;
+    scheduler_protocol_payload_publication(scheduler_state_base, scheduler, slot_claim, ready_claim, true);
     if (slot_claim.mix) {
         scheduler_ssbuf_store_relaxed(
             &scheduler_mix_dispatch_control(ssbuf_region, slot_claim)->publication,
@@ -1611,6 +1604,7 @@ inline __aicore__ void scheduler_commit_dispatch_slot(
     } else {
         scheduler_local_ready_publish(scheduler, slot_claim.slot_index);
     }
+    scheduler_protocol_payload_publication(scheduler_state_base, scheduler, slot_claim, ready_claim, false);
     if (task_timing_enabled) {
         __gm__ SchedulerTaskTrace *traces =
             scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, scheduler->profiling->trace_cells_offset);
@@ -1876,7 +1870,9 @@ inline __aicore__ bool scheduler_complete_inline_task(
         );
         return false;
     }
+    scheduler_protocol_task_done(base, local, task_ref, true);
     scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    scheduler_protocol_task_done(base, local, task_ref, false);
     if (!scheduler_resolve_completion(
             graph, base, local, run, task_ref, nullptr, nullptr, nullptr, profiling_level, false, nullptr,
             local->config.self_core_type, nullptr

@@ -28,6 +28,8 @@
 
 namespace scheduler_test {
 
+inline void protocol_noop_kernel(__gm__ int64_t *) {}
+
 class SchedulerStateBuffer {
 public:
     explicit SchedulerStateBuffer(const AicoreSchedulerLayout &layout) :
@@ -180,7 +182,8 @@ struct FixtureStorage {
                 static_cast<int32_t>(lane == 0 ? cluster : cluster * PLATFORM_AIV_CORES_PER_BLOCKDIM + (lane - 1));
         }
         metadata = scheduler_state_at<SchedulerTaskMetadata>(scheduler_state->base(), layout.task_metadata_offset);
-        callable_addresses[1] = UINT64_C(0x1000);
+        callable_addresses[1] =
+            protocol_profiling ? reinterpret_cast<uint64_t>(&protocol_noop_kernel) : UINT64_C(0x1000);
         for (uint64_t task = 0; task < task_count; ++task) {
             metadata[task].kernel_ids[0] = 1;
             metadata[task].kernel_ids[1] = UINT16_MAX;
