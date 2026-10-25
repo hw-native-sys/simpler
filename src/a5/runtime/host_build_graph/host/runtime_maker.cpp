@@ -68,6 +68,7 @@
 #include "host_build_graph/graph_execution.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
+#include "scheduler_protocol_export.h"
 #include "host_build_graph/host_tensor_access.h"
 #include "host_build_graph/graph_host_state.h"
 #include "host_build_graph/host_phase_trace.h"
@@ -446,15 +447,13 @@ namespace {
 // name, so it is a wire contract and not a variable.
 constexpr const char *kSchedulerJsonTaskKey = "\"task_id\": ";
 
-// What a run's scheduler state leaves behind for the readers that come after
-// its bind: where the state is on the device, the layout that describes it, and
-// the HostApi the D2H readback goes through. The storage itself belongs to the
-// runner's pipeline slot, not here, so this record owns nothing and ends with
-// the run.
+// The device storage belongs to the pipeline slot. The frozen Host graph belongs
+// to this run and remains valid after the orchestration mirror is reused.
 struct SchedulerStateOwner {
     void *state_base;
     AicoreSchedulerLayout layout;
     const HostApi *api;
+    std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
 };
 
 std::mutex scheduler_state_owners_mutex;
@@ -501,6 +500,24 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     if (api->copy_from_device(host_base, owner.state_base, static_cast<size_t>(owner.layout.total_size)) != 0) {
         LOG_WARN("A5 HBG: failed to copy AICore Scheduler profiling state");
         return false;
+    }
+
+    if (owner.layout.protocol_layout_offset != 0) {
+        try {
+            const auto payload = scheduler_export_protocol(
+                host_base, static_cast<size_t>(owner.layout.total_size), owner.layout, api->run_epoch(),
+                owner.protocol_tasks
+            );
+            if (!api->publish_chip_swimlane_extension(
+                    ChipSwimlaneExtensionSection::AicoreProtocol, payload.c_str(), payload.size()
+                )) {
+                LOG_WARN("A5 HBG: failed to publish native protocol records");
+                return false;
+            }
+        } catch (const std::exception &error) {
+            LOG_WARN("A5 HBG: invalid native protocol image: %s", error.what());
+            return false;
+        }
     }
 
     const auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, owner.layout.worker_contexts_offset);
@@ -1341,11 +1358,21 @@ bool create_scheduler_state(
         cooperative_task_count,
         mix_task_count,
     };
+    const bool protocol_profiling = api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES);
+    std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
+    if (protocol_profiling) {
+        try {
+            protocol_tasks = scheduler_protocol_freeze_graph(host_graph, task_metadata);
+        } catch (const std::exception &error) {
+            LOG_ERROR("A5 HBG: failed to freeze protocol graph: %s", error.what());
+            return false;
+        }
+    }
     AicoreSchedulerLayout layout{};
     if (!scheduler_plan_layout(
             static_cast<uint64_t>(total_tasks), aic_task_count, aiv_task_count, &layout,
             api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
-            executable_subtask_count, spmd
+            executable_subtask_count, spmd, protocol_profiling
         ) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) {
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
@@ -1462,7 +1489,8 @@ bool create_scheduler_state(
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
-            runtime, SchedulerStateOwner{reinterpret_cast<void *>(aligned_address), layout, api}
+            runtime,
+            SchedulerStateOwner{reinterpret_cast<void *>(aligned_address), layout, api, std::move(protocol_tasks)}
         );
     }
     runtime->add_pending_metadata(

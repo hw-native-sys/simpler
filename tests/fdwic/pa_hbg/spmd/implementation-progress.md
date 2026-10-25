@@ -1201,3 +1201,99 @@ git diff HEAD 源码指纹包含它们；没有通过提交／索引状态掩盖
 
 适用 pre-commit 检查全部通过，日志 `outputs/spmd-protocol-execution-precommit-final-20261025.log`。
 阶段提交只包含本节接线、测试与统一过程记录；不包含输出产物或用户未跟踪内容。
+
+## 2026-10-25：Host 冻结图与原生协议导出
+
+起点 `6416d5c08`，继续完整协议采集。新增 `AicoreProtocol` 对象扩展，沿用既有
+ChipSwimlaneCollector 的 run-owned 快照和 JSON 写出，不另建采集器。
+导出用例先在 writer 未接线时失败：sealed run 丢失 `aicore_protocol`；补齐后
+HBG／TMR 两种导出目标通过，下一轮不继承旧对象，旧枚举值保持不变。
+日志 `outputs/spmd-protocol-export-common-red-20261025.log`、
+`outputs/spmd-protocol-export-common-green-20261025.log`。
+
+Host 在既有 L4 下启用协议预分配，同时保存按实际任务数和依赖边数分配的冻结图，
+内容为原 TaskMetadata 和原 fanin，不保留会被下一轮改写的 orchestration mirror 指针。
+L0–L3 不分配新增协议区。冷路径下载后先校验本轮 epoch、完整长度、对齐、协议头与
+Host 计划及 GraphSummary 的一致性，再从受检区域导出；成员 bitmap 必须属于自己的
+record，seal 必须落在计划的 Mix 区内，不能跟随坏 offset 任意读取。
+
+`hbg-native-protocol-v1` 保存冻结图、实际拓扑、完整准入日志、成员位图与 seal、
+TaskControl 终态、逐 worker 序号／错误／退出状态，以及各实际记录点。
+Stamp 使用 `[cycles, sequence]`，保留 cycle 0、epoch 0/MAX 和未知字段原始哨兵；
+未写入的全零事件对象可省略，部分写入、发布次数非零或错误状态不能被过滤成成功。
+输出没有 `protocol_verified` 之类的完成声明，序列化不替代后续因果审计。
+
+新增 Host 导出测试首轮因缺少实现头文件编译 RED；实现后的行为测试又发现 4 项失败：
+通用区域检查误将合法 `RunControl` 起始 offset 0 当作无效地址。
+修正为检查范围和类型对齐，协议是否启用另由 layout 字段判断，12 项全部通过。
+覆盖冻结图复用、Host 已完成节点不伪造事件、epoch 边界、损坏 header／summary、
+截断和错位缓冲、丢失任务、错绑 bitmap、越界 seal，以及保留原始异常记录／实际拓扑。
+日志 `outputs/spmd-protocol-export-red-20261025.log`、
+`outputs/spmd-protocol-export-cpp-r1-20261025.log`、
+`outputs/spmd-protocol-export-cpp-r2-20261025.log`。
+
+包含两架构／两 runtime collector、两种 run export 和新 Host exporter 的 7 个 C++ targets
+全部通过，日志 `outputs/spmd-protocol-export-common-cpp-20261025.log`。
+生产 runtime 正在重编；本节此时还没有启用协议后的 A5 捕获证据，后续结果续记。
+
+首轮重编成功。A5 `mask7_n2` L4 golden 通过，真实协议对象含 96 个正常退出 worker、
+192 条成员记录、4 条 block、13 条执行，scheduler／worker 错误均为零；产物
+`outputs/TestHbgSpmdContract_mask7_n2_20261025_180150/chip_swimlane_records.json`。
+90 项仿真矩阵也完成，逐份确认存在协议对象，共 26303 条执行、全部 worker finished=1
+且 error_flags=0；日志 `outputs/spmd-protocol-export-sim-matrix-20261025.log`。
+这些只是实际采集和终态完整性的观察，不是完整因果审计结论。
+
+CSA 首轮失败发生在 L4 的 Host prepare，dep-gen 那一轮七项 golden 已通过；
+`outputs/csa-hbg-l4-2igazvbf/result.json` 如实记录 passed=false。
+检查发现冻结图把“无 kernel 但使用 AIV 路由的 INLINE 服务节点”误当成普通 kernel，
+其 active_mask 为 2 并不意味着有 AIV 执行。补充真实图／metadata 形状反例，
+实际 RED 抛出 `invalid frozen protocol graph`；允许已标记 INLINE 的服务节点，
+保留其原 flags／路由／依赖且不伪造 kernel，13 项 Host 导出测试全部通过。
+日志 `outputs/spmd-protocol-export-inline-red-20261025.log`、
+`outputs/spmd-protocol-export-inline-green-20261025.log`。修正后的 runtime 正在重编。
+
+修正后 runtime 重编成功，原样 CSA 严格 L4 通过，产物
+`outputs/csa-hbg-l4-am5bizn1/result.json`：两轮各七项 golden、2308 条执行身份、133 条依赖边、
+107/107 Host 记录、producer=aicore，冻结 case 与基线一致。
+这一轮实际启用了协议区，不再是关闭新增采集的回归。
+原始数据在 `outputs/TestDeepSeekV4ProCSAHBG_B4S2Seed0_20261025_180836/chip_swimlane_records.json`。
+
+新增统一读端 `simpler_setup/tools/hbg/native_protocol.py`，严格核对对象字段、整数类型、
+表长度、稀疏索引和 Stamp 格式，保留失败／部分记录供诊断。
+独立的 `audit_protocol_sequences` 检查 epoch、worker 身份、错误和退出状态，
+按每核 sequence 检查唯一、连续、与 next_sequence 一致及本核时钟单调；
+不按全局时间排序，不为可重建 payload 的发布快照补 sequence。
+其结果只标记 `sequence_integrity_verified`，不代表完整协议因果或执行集合已获证明。
+
+读端测试先因缺少模块实际 RED，补实现后 58 项通过，覆盖所有根字段缺失、未知 schema、
+布尔冒充整数、越界／重复行、坏 Stamp、序号洞／重复／截断、跨 epoch、错误和未结束 worker，
+并验证 cycle 0、epoch 0/MAX 及诊断读取不改变输入。
+日志 `outputs/spmd-protocol-reader-red-20261025.log`、`outputs/spmd-protocol-reader-green-20261025.log`。
+读取真实产物后：90 份仿真捕获共 427122 个事件，90 份 A5 捕获共 459234 个事件，
+每组各 26303 条执行；CSA 另有 46733 个事件／2308 条执行。全部通过逐核序号检查，
+没有以执行结果填补缺事件。A5 证据 `outputs/spmd-protocol-export-native-20261025/sequence-audit.log`。
+
+17 个相关 C++ targets 共 604 项通过（此前 591 项加本次 13 项），
+Python 读端／合约／CSA／转换器共 1824 项通过。
+日志 `outputs/spmd-protocol-export-all-cpp-20261025.log`、
+`outputs/spmd-protocol-export-python-r2-20261025.log`。
+更宽的 A5sim 全 runtime 命令退出 0，覆盖其资源调度子进程；最终 pytest 的 deselected 数
+不是通过数，未把它计入 90 份协议矩阵或虚构为 scene pass 数。
+日志 `outputs/spmd-protocol-export-all-sim-20261025.log`。
+A5 全 runtime 命令因单卡池无法容纳双卡 `TestUrmaDeferredCompletionDemo` 在资源检查阶段退出，
+日志 `outputs/spmd-protocol-export-native-20261025/all-runtime.log`；没有把它算作通过，
+另行执行相关 HBG 回归，不宣称双卡硬件覆盖。
+
+最终 A5 HBG 回归为 60 passed、4 skipped、356 deselected（148.87 秒），
+日志 `outputs/spmd-protocol-export-native-20261025/hbg.log`。
+本机设备经 CANN query 确认为 Ascend950PR_958b、32 C／64 V；npu-smi／task-submit 缺失，
+仍按用户明确要求直接用设备 0，未宣称队列隔离。
+读端 lint 报告的长行已整理，嵌套事件 schema 检查抽为独立 helper；没有屏蔽任何规则。
+整理后 Python 再次 1824 项通过，日志 `outputs/spmd-protocol-export-python-final-20261025.log`；
+全部适用 pre-commit 检查通过，日志 `outputs/spmd-protocol-export-precommit-final-20261025.log`。
+
+本次只提交已验收的 Host 采集／导出、统一 schema／序号检查、测试及中文状态记录，不 push。
+尚待完成：把冻结成员、准入／领取／许可／完成／seal／依赖连成严格原生因果审计，
+接入 CSA 严格门禁，再实现 sync_start 和无完整插桩的性能比较。
+当前不能用 sequence_integrity_verified 代替 protocol_verified，也不能以启用 L4 后的耗时
+推断实际调度性能收益。
