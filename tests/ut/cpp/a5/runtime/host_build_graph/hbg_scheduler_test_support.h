@@ -33,7 +33,8 @@ public:
     explicit SchedulerStateBuffer(const AicoreSchedulerLayout &layout) :
         base_(std::aligned_alloc(SCHEDULER_STATE_ALIGNMENT, layout.total_size)) {
         EXPECT_NE(base_, nullptr);
-        if (base_ != nullptr) EXPECT_TRUE(scheduler_init_data_from_layout(base_, layout));
+        if (base_ != nullptr)
+            EXPECT_TRUE(scheduler_init_data_from_layout(base_, layout, reinterpret_cast<uint64_t>(base_)));
     }
     ~SchedulerStateBuffer() { std::free(base_); }
     void *base() const { return base_; }

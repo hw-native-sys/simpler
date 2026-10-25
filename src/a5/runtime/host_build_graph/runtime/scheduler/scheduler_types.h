@@ -1363,8 +1363,12 @@ inline bool scheduler_plan_layout(
     return true;
 }
 
-inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout) {
-    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0) return false;
+inline bool
+scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout, uint64_t device_base_address) {
+    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
+        device_base_address == 0 || (device_base_address & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0 ||
+        layout.total_size > UINT64_MAX - device_base_address)
+        return false;
     __builtin_memset(base, 0, static_cast<size_t>(layout.total_size));
     auto *controls = scheduler_state_at<SchedulerTaskControl>(base, layout.task_controls_offset);
     for (uint64_t i = 0; i < layout.task_count; ++i) {
@@ -1386,6 +1390,19 @@ inline bool scheduler_init_data_from_layout(void *base, const AicoreSchedulerLay
         contexts[worker].cluster_worker_ids[1] = UINT64_MAX;
         contexts[worker].cluster_worker_ids[2] = UINT64_MAX;
     }
+    const auto initialize_payloads = [base, device_base_address](uint64_t offset, uint64_t count) {
+        for (uint64_t index = 0; index < count; ++index) {
+            const uint64_t payload_offset = offset + index * sizeof(DispatchPayload);
+            auto *payload = scheduler_state_at<DispatchPayload>(base, payload_offset);
+            const uint64_t device_payload = device_base_address + payload_offset;
+            payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, local_context);
+            payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, global_context);
+            payload->local_context.block_num = 1;
+            payload->local_context.async_ctx.task_token = TaskId::invalid();
+        }
+    };
+    initialize_payloads(layout.dispatch_payloads_offset, SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT);
+    initialize_payloads(layout.mix_payloads_offset, SCHEDULER_MIX_SLOT_CAPACITY);
     return true;
 }
 #endif

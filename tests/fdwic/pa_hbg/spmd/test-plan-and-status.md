@@ -1,7 +1,9 @@
 # A5 HBG SPMD 测试入口和验收状态
 
 对应 [编码契约](implementation-contract.md) 与 [C01–C56 边界矩阵](corner-cases-and-validation.md)。
-基线为 `f5cc679bbf3d`，记录日期 2026-10-23。
+以下原始验收基线为 `f5cc679bbf3d`，记录日期 2026-10-23。
+2026-10-25 起的生产编码结果在 [实现过程](implementation-progress.md) 持续记录；
+其中 payload 前置修复已使六种 mask 的 N=1 仿真各三轮通过，不覆盖本页历史失败证据。
 **模型通过不等于生产 SPMD 已实现；原生验收中的红灯必须保留，不能用回退或 skip 消掉。**
 
 真实 HBG CSA 另有 [业务 TDD 入口](../csa/test_csa_business.py)，保留 54 个原 kernel 与七项 golden。
@@ -171,7 +173,7 @@ python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
 python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
   --platform a5sim --case mask1_n2 --pto-session-timeout 600 -q
 
-# 目前暴露单 block Mix context 问题，不是多 block 门禁。
+# 初始基线暴露单 block Mix context 问题；修复后应通过，不是多 block 门禁。
 python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
   --platform a5sim --case mask3_n1 --pto-session-timeout 600 -q
 
@@ -236,9 +238,9 @@ tests/fdwic 不自动继承 tests/st 下的 scheduler_mode fixture，
 - 没有执行并通过完整 90 场景，也没有宣称 native sync_start、GM Mix 或 CSA 已通过。
   本次不报告性能收益；没有采集新生产协议的完整泳道。
 
-### 需要优先处理的真实代码缺口
+### 初始基线发现的真实代码缺口
 
-host/runtime_maker.cpp 只给普通 dispatch slots 设置两个 context 后缀地址及 block=0/N=1，
+在上述基线中，host/runtime_maker.cpp 只给普通 dispatch slots 设置两个 context 后缀地址及 block=0/N=1，
 独立的 mix_payloads 区缺少对应初始化。scheduler_prepare_dispatch_slot 修改函数和
 sub_block_id，却没有补齐这两个后缀；materialize 只写实际 tensor/scalar 参数。
 因此即使 N=1，使用 block/context accessor 的 Mix kernel 也可能失败。
@@ -246,7 +248,8 @@ sub_block_id，却没有补齐这两个后缀；materialize 只写实际 tensor/
 
 编码顺序增加一个前置门槛：**own 和 Mix 两类 payload 的完整初始化及第二次绑定验证**。
 修复后 mask3_n1 以及其他 mask 的 N=1 应转绿，然后再验多 block。
-本次不修改 runtime；问题同时记录到本地 KNOWN_ISSUES.md。
+最初 TDD 提交未修改 runtime。此缺口现已由统一初始化修复，
+C++ 重绑定和原生 N=1 仿真证据见实现过程；真机 bootstrap 问题仍单独追踪。
 
 ## 五、把测试接到后续生产实现
 

@@ -3,8 +3,8 @@
 基线：`f5cc679bbf3d`，2026-10-23。[设计总览](../a5-hbg-spmd-design.md)
 定义已确认语义；本页把它收敛为可开始编码的正确性基线。
 **以下新增结构、状态和函数名是拟实现接口，不是声称仓库已有这些 API。**
-本次只落设计和测试，不修改生产调度代码；覆盖与实测状态见
-[测试入口和验收状态](test-plan-and-status.md)。
+本页保留目标编码契约；生产代码的逐步落地与实测证据见 [实现过程](implementation-progress.md)。
+初始 TDD 覆盖和历史红绿状态见 [测试入口和验收状态](test-plan-and-status.md)。
 
 ## 一、存储、身份与能力边界
 
@@ -220,7 +220,7 @@ AICore 上包装函数的 C++ memory_order 参数本身不建立设备 fence；
 
 | 顺序 | 修改位置与具体工作 | 通过门槛 |
 | ---- | ------------------ | -------- |
-| 前置 | host/runtime_maker.cpp：补齐 own／独立 Mix payload 的两个 context 后缀及重绑定初始化 | 当前 mask3_n1 缺失 context 的红灯转绿；不通过 kernel 伪造 context 绕过 |
+| 前置 | scheduler_types.h 的公共初始化及 host/runtime_maker.cpp：补齐 own／独立 Mix payload 的两个 context 后缀及重绑定初始化 | mask3_n1 的 a5sim 红灯已转绿；真机 bootstrap 超时另查；不通过 kernel 伪造 context 绕过 |
 | 1 | scheduler_types.h/layout.h：新增 POD、offset、初始化、溢出检查；host/runtime_maker.cpp：实际大小预分配 | C++ 布局／初始化、二次运行、边界拒绝测试 |
 | 2 | scheduler_ready.h：一次领取准入所有权；新增准入 helper；executor/completion 接统一 entry gate | 旧 ready 原语回归；B 先于未 ready A；三入口不可越序；旁路发布竞态 |
 | 3 | dispatch/context、completion：普通 C/V cursor、原 N、block 级退役；maker/lifecycle 分开分波与共同驻留 demand | 纯 C/V N=1、容量两侧、512；晚 block 的消费者不早放行；快核跨 task 重叠 |

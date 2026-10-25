@@ -1304,7 +1304,7 @@ bool create_scheduler_state(
     // The only pass over this run's total_size: it zeroes and fills the whole
     // length, which is what makes a retained block's previous contents
     // unreachable.
-    if (!scheduler_init_data_from_layout(host_base, layout)) {
+    if (!scheduler_init_data_from_layout(host_base, layout, aligned_address)) {
         LOG_ERROR("A5 HBG AICore scheduler: failed to initialize scheduler state");
         return false;
     }
@@ -1377,17 +1377,6 @@ bool create_scheduler_state(
         context.task_window_last_index = task_window_size - 1;
         context.graph_task_count = static_cast<uint64_t>(total_tasks);
         context.worker_index = static_cast<uint64_t>(i);
-        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-            const uint64_t offset = context.dispatch_payload_offset + slot * sizeof(DispatchPayload);
-            auto *payload = scheduler_state_at<DispatchPayload>(host_base, offset);
-            const uint64_t device_payload = aligned_address + offset;
-            payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, local_context);
-            payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, global_context);
-            payload->local_context.block_idx = 0;
-            payload->local_context.block_num = 1;
-            payload->local_context.async_ctx.task_token = TaskId::invalid();
-            payload->src_payload = 0;
-        }
     }
 
     runtime->publish_scheduler_bootstrap(

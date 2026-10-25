@@ -8,8 +8,9 @@
 可以先统一发布 B，再发布 A。发布之后，任何参与者都不能自行颠倒这两个任务。
 这里的“顺序门槛”不是全芯片执行锁，也不要求所有参与者同时开始。
 
-代码基线为 f5cc679bb，约定更新于 2026-10-23。新状态及伪代码描述目标协议，
-不表示当前 runtime 已实现同名接口。
+设计基线为 f5cc679bb，约定更新于 2026-10-23。新状态及伪代码描述目标协议，
+不表示当前 runtime 已实现同名接口。2026-10-25 起的实际编码、验证及剩余工作
+集中记录在 [实现过程](spmd/implementation-progress.md)。
 
 阅读顺序：[运行时有序准入](spmd/ordered-execution-protocol.md)说明依赖、共同顺序与参与集合；
 [block 与 Mix 执行](spmd/block-and-mix-execution.md)说明领取、局部结束和完成发布；
@@ -78,8 +79,8 @@ AIV 通过 SSBUF 接收任务。目标保留 AIC 的组级协调，把远端参�
 - scheduler_resident_v0_task_shape_supported 仍要求 N 等于 1 且没有 sync_start。
 - runtime_maker 以逻辑 block 数估计 worker demand，lifecycle 再与实际核数比较；
   普通分波不能沿用“全部 block 都需同时占核”的需求检查。
-- 普通槽 LocalContext 仍预填 block_idx 为 0、block_num 为 1；独立 Mix payload 区还缺少
-  context 后缀初始化，新用例已在 N=1 复现。两类槽都要完整初始化，再按 block 设置。
+- 普通和独立 Mix payload 的 context 后缀现已统一按设备基址初始化，默认 block_idx 为 0、
+  block_num 为 1，并覆盖重绑定清零；多 block 路径仍须在领取后填写原 N 和实际 block。
 - Mix tracker、完成路径和 trace 索引仍不能直接表达一个 task 的多个 block。
 - 多 block 的最后一次完成才可发布 TaskDone 和推进 wake-list，不能每个 block 都释放后继。
 - 新增的 scheduler_runtime_mode 与 scheduler_mode_publish_count 可复用作回退门禁，
