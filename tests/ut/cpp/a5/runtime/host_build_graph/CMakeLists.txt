@@ -21,6 +21,14 @@ a5_hbg_case(test_hbg_ordered_execution.cpp
     INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
     DEFINES __CPU_SIM)
 
+a5_hbg_case(test_hbg_gm_mix.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM)
+
+a5_hbg_case(test_hbg_inline_services.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
+    DEFINES __CPU_SIM)
+
 a5_hbg_case(test_hbg_scheduler_bootstrap.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
@@ -40,6 +48,14 @@ a5_hbg_case(test_hbg_retirement_wiring.cpp
         ${HBG_COMMON_SHARED_DIR}/runtime.cpp
         ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp
         ${SIMPLER_SRC}/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_retirement_gc_link_option})
+
+a5_hbg_case(test_hbg_gm_mix_startup.cpp
+    INCLUDES
+        ${SIMPLER_SRC}/a5/platform/sim/aicore
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph
+    DEFINES __CPU_SIM
     COMPILE_OPTIONS -ffunction-sections -fdata-sections
     LINK_OPTIONS ${_retirement_gc_link_option})
 

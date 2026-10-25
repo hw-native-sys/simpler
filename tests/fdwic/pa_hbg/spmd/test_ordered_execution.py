@@ -134,11 +134,12 @@ class TestHbgOrderedExecution(_SpmdContract):
         total = 0
         for n, mask, base, tag, *_ in args.plan.tolist():
             for block in range(n):
-                slot = 0 if mask == 1 else 1
-                row = rows[base + block * 3 + slot]
-                row[0] = 1
-                row[8:12] = torch.tensor([block + 1, n, slot + 1, tag])
-                total += 1
+                for slot in range(3):
+                    if mask & (1 << slot):
+                        row = rows[base + block * 3 + slot]
+                        row[0] = 1
+                        row[8:12] = torch.tensor([block + 1, n, slot + 1, tag])
+                        total += 1
         rows[args.plan[0, 2].item() + args.plan[0, 0].item() * 3, 7] = 2 * total
 
     def _run_and_validate(self, worker, callable_obj, case, *args, **kwargs):
@@ -163,7 +164,7 @@ class TestHbgOrderedExecution(_SpmdContract):
             guard = actual[base + n * 3]
             assert guard[0].item() == 0, f"task {tag}: missing execution context"
             assert guard[1].item() == 0, f"task {tag}: original N or block index was corrupted"
-            task_rows = [base + block * 3 + (0 if mask == 1 else 1) for block in range(n)]
+            task_rows = [base + block * 3 + slot for block in range(n) for slot in range(3) if mask & (1 << slot)]
             active_rows.extend(task_rows)
             entered = actual[task_rows, 13]
             returned = actual[task_rows, 14]

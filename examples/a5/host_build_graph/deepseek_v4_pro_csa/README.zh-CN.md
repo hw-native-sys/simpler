@@ -2,7 +2,7 @@
 
 本目录提供原生 `SceneTestCase` 的 **HBG 独立用例**。冻结 kernel、参数 ABI、数据清单、七项 golden、运行和分析工具均在本目录内，不导入其他 runtime 的用例，也不依赖 PyPTO 或模型仓库。首次使用需另行导入固定数据，数据文件不进入 Git。
 
-**当前边界：HBG 已在 A5 跑通，但这个 CSA 的 AICore 分布式调度验收尚未通过。** 创建用例时的 `main@946f49ac` 只接受 `logical_block_num == 1` 且不要求 sync-start 的 resident 任务；历史 L4 记录的 `scheduler_tasks.producer` 和五个 scheduler stream 均为 `aicpu`。当前开发分支已支持纯 C/V 普通多 block，但多 block Mix 仍未开放，CSA 仍会整图选择 `LEGACY_UNSUPPORTED_SHAPE`。最新实现边界见 [SPMD 设计](../../../../tests/fdwic/pa_hbg/a5-hbg-spmd-design.md)。
+**当前边界：原样 CSA 的七项 golden 和严格 AICore resident L4 门禁已在 A5 通过。** 普通 C/V 与 GM Mix 支持原 N 分波；无 kernel Dummy 只推进逻辑依赖，不伪造物理执行。创建用例时的 `main@946f49ac` 仅支持单 block，历史结果仍属于 AICPU 回退，不能改写为本版证据。完整 block/slot 身份与协议事件、sync_start 和性能比较尚未完成。最新实现边界见 [SPMD 设计](../../../../tests/fdwic/pa_hbg/a5-hbg-spmd-design.md)，逐步实现和实测集中于 [实现过程](../../../../tests/fdwic/pa_hbg/spmd/implementation-progress.md)。
 
 因此，这份用例是后续扩展、调试 HBG 分布式调度的固定验收负载；**历史 AICPU 结果不能当作分布式调度的性能基线**。用例不通过拆任务、减少 SPMD block 数或改变 kernel 绕过限制。
 
@@ -32,7 +32,7 @@
 
 CPU 测试会逆向还原上述两项 C++ 文本适配，并检查还原后的 SHA256 与原文件一致；同时检查 52 个参数中只有 `hc_attn_scale` 改变传输方式。另有隔离子进程禁止导入 TMR 用例，确保 HBG 不依赖本地未提交文件。
 
-历史验收中首先触发回退的任务为 `task_id=7`、`kernel_ids=[1,2,-1]`、`block_num=4`；整份图包含 60 个多 block 任务，最大的 `block_num=512`。当前判定位置是 `src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h` 的 `scheduler_resident_task_shape_supported()` 与 `scheduler_resident_graph_shape_supported()`，整图回退位置是 `host/runtime_maker.cpp` 的 `create_scheduler_state()`。纯 C/V 分波开放不代表该多 block Mix 已获得支持；把 block 数直接改成 1 会改变计算，不能作为分布式路径接通的修复。
+历史验收中首先触发回退的任务为 `task_id=7`、`kernel_ids=[1,2,-1]`、`block_num=4`；整份图包含 60 个多 block 任务，最大的 `block_num=512`。当前判定位置是 `src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h` 的 `scheduler_resident_task_shape_supported()`，普通 C/V/Mix 均可原 N 执行；sync_start 仍由 `host/runtime_maker.cpp::create_scheduler_state()` 整图回退。把 block 数直接改成 1 会改变计算，不能作为分布式路径接通的修复。
 
 ## 2. 环境与复跑命令
 
@@ -85,7 +85,7 @@ python "$CSA_HBG/run.py" l4 -d 0
 python "$CSA_HBG/run.py" l4 -d 0 --require-aicore-scheduler
 ```
 
-最后一条命令在当前开发分支仍会明确失败，原因是 AICPU 回退，而不是 CSA 数值错误。后续分布式调度器支持本负载后，它应通过；不能删除这道检查来宣称分布式路径已经接通。`check`、`bench`、L1 不具备判断 scheduler producer 的证据，不能与此门禁等同。
+最后一条命令已在当前 GM Mix 实现上通过；旧分支 AICPU 回退仍必须失败。不能删除来源、记录数量、依赖时序或采集完整性检查来使它通过。`check`、`bench`、L1 不具备判断 scheduler producer 的证据，不能与此门禁等同；L4 的既有 schema 也尚未提供完整的 block/slot 和协议事件证明。
 
 最小入口与预编译命令：
 
@@ -233,3 +233,16 @@ python examples/a5/host_build_graph/deepseek_v4_pro_csa/run.py l4 \
 本次设备 0 为 `Ascend950PR_958b`，当前 checkout 为 `f5cc679bbf3d7d2058ca453aa6bf0b6686cff989`，Torch `2.12.0+cpu`。没有使用缺失的 `npu-smi` 或 `task-submit`，通过 CANN 查询确认 A5 后直接上卡，未获取设备锁。结果索引见 [results_20261023.json](../../../../tests/fdwic/pa_hbg/csa/results_20261023.json)，其中区分通过、预期红灯和排除的 batch 变换探索。
 
 原始日志保存在 `outputs/csa-business-a5-20261023-validated.log`（36 次调用，epoch 1–36）、`outputs/csa-resident-a5-20261023.log`、`outputs/csa-hbg-check-t5gdhdhv/`、`outputs/csa-hbg-l4-y96qddiu/`、`outputs/csa-hbg-l4-9zolp_hy/` 和 `outputs/csa-hbg-l1-ouk4nqas/`。后续改调度器时先确保业务组没有正确性回归，再将 resident 和 L4 来源门禁从红变绿；不要据此声称 sync_start 已获得硬件覆盖。
+
+## 6. GM Mix 接线后的验收边界
+
+2026-10-25 的原样严格 L4 已通过，结果为 `outputs/csa-hbg-l4-fdakpyh4/result.json`：
+79 个有 kernel 任务、2308 条执行（AIC 864／AIV 1444），133 条依赖时序检查，
+Host 构图 107/107、无 dropped/truncated，scheduler producer 为 `aicore`。
+deps/timing 两轮各七项数值比较均通过；输入、54 个 kernel、52 项 ABI、原 N 和校验标准未变。
+两个无 kernel Dummy 不占物理 trace，但仍在逻辑完成与依赖链中。
+
+结果保留 `block_identity_verified=false`，因为现有原始 schema 不提供显式 block_idx/subtask_slot。
+因此这次通过证明原样业务、来源、数量与依赖时序，不替代完整共同准入／组协议事件审计。
+错误身份补全、sync_start 和无插桩性能比较仍待完成。所有失败定位和逐步复验仅集中记录于
+[实现过程](../../../../tests/fdwic/pa_hbg/spmd/implementation-progress.md)，不修改本页历史基线数值。

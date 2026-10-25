@@ -8,8 +8,9 @@
 可以先统一发布 B，再发布 A。发布之后，任何参与者都不能自行颠倒这两个任务。
 这里的“顺序门槛”不是全芯片执行锁，也不要求所有参与者同时开始。
 
-设计基线为 f5cc679bb，约定更新于 2026-10-23。纯 C/V 普通多 block 已接入生产执行路径；
-GM Mix、完整协议 trace、原样 CSA resident 和 sync_start 仍是待完成目标。
+设计基线为 f5cc679bb，约定更新于 2026-10-23。纯 C/V 与 GM Mix 普通多 block 已接入生产执行路径；
+原样 CSA 的七项 golden 和严格 resident L4 门禁已通过；
+显式 block/slot 身份与完整协议 trace、错误身份补全、sync_start 和性能比较仍待完成。
 下文区分当前能力与目标合同，2026-10-25 起的编码和实测证据集中记录在
 [实现过程](spmd/implementation-progress.md)，不以结构或接口存在代替执行验收。
 
@@ -72,15 +73,14 @@ ready 队列是按类型和 owner 分布的 CAS FIFO，支持分片内领取／�
 它不是一个所有核共享的全局顺序源。纯 C/V 多 block 的共同准入层复用这些工作发现机制，
 用独立准入日志提供统一顺序；不能把各队列 FIFO 本身当作顺序证明。
 
-既有 N=1 Mix 仍由 cluster 的 AIC 选择 placement、准备各 lane payload、聚合完成，
-AIV 通过 SSBUF 接收任务；它尚未接入共同准入。无 Mix 的纯 C/V 路径已不依赖 SSBUF
-初始化或访问。目标中的 GM Mix 保留 AIC 组级协调，把远端参数准备交回各 lane。
+N=1 和多 block Mix 共用 GM 组协议，AIC 只负责组领取、身份发布与完成聚合，
+各 lane 使用自己的 ordinary slot 自备 payload；实际 resident executor 不初始化或访问 SSBUF。
+旧 SSBUF helper 仍有原语回归，但不是本版生产入口的后备调度通道。
 
 ### 当前已接线与剩余边界
 
-- `scheduler_resident_task_shape_supported` 已允许普通纯 C/V 的原 N；
-  `scheduler_resident_graph_shape_supported` 暂不允许纯多 block 与任意 Mix 同图。
-  即使 Mix 仅 N=1，这一组合也整图回退；sync_start、多 block Mix 仍未开放。
+- `scheduler_resident_task_shape_supported` 已允许普通 C/V/Mix 的原 N，
+  纯多 block 与 Mix 可以同图；sync_start 仍整图回退，多 block／Mix predicate 仍不支持。
 - Host 以执行形状的最小可用位置计算 demand，而不是要求全部普通 block 同时占核。
   纯 C/V 可跨多波执行；这不是 sync_start 的不同位置容量证明。
 - own/direct 路径通过同一有序 entry gate；每核最多两份不可撤销的 block 领取。
@@ -91,8 +91,11 @@ AIV 通过 SSBUF 接收任务；它尚未接入共同准入。无 Mix 的纯 C/V
   事件及严格 native adapter 尚未实现，不能以普通泳道转换成功代替协议审计。
 - `scheduler_runtime_mode` 与 `scheduler_mode_publish_count` 逐轮验证 resident 来源，
   不必要求所有功能测试先打开完整泳道。原有单 block predicate 继续保留。
-- 旧 resident gang 脚手架已移除；GM Mix 仍需实现 descriptor／ack／seal 及各 lane 自备参数，
-  不能借用旧 SSBUF 通道跳过共同顺序，也不能据此宣布原样 CSA 已完成。
+- GM Mix 已使用 descriptor／ack／保留到 run 结束的 seal，各 lane 自备参数，
+  AIC 收齐三条资源 lane 的 release 后才贡献一次 block 完成；mask 6 不伪造 AIC kernel。
+  正常 EXIT 在公共尾部排空本核义务，覆盖启动直接看见 EXIT 的零工作核；错误退出不补 seal。
+- 无 kernel 服务节点只推进依赖和逻辑完成，不分配 payload／kernel trace，
+  不等待无关 Mix 的资源义务；Host 已完成节点不在设备重复处理。
 
 ## 目标合同和参考接线
 
@@ -103,7 +106,7 @@ AIV 通过 SSBUF 接收任务；它尚未接入共同准入。无 Mix 的纯 C/V
 | task_ref | Host DAG 中的逻辑任务引用 | 当前 GLOBAL 表下标，不是运行顺序 |
 | order_key | ready 任务运行时获准执行的统一序号 | 不由各核独立生成，不等于 task_ref |
 | block_idx | 任务内逻辑 block，范围为 0 到 N 减一 | 分波时不重编号 |
-| subtask_slot | AIC、AIV0、AIV1 的逻辑 kernel 槽 | 不一定等于最终物理 AIV lane |
+| subtask_slot | AIC、AIV0、AIV1 的逻辑 kernel 槽 | 独立于物理身份；本版 Mix 按通信 ABI 固定对应 lane |
 
 核执行身份为 run_epoch、task_ref、block_idx、subtask_slot；通信槽另校验 generation。
 LocalDone(w, A) 表示 w 不再有 A 的未执行工作、待发布完成或资源义务，
@@ -144,7 +147,7 @@ LocalDone(w, A) 表示 w 不再有 A 的未执行工作、待发布完成或资�
 | aicpu/aicore_lifecycle.cpp | 拓扑发现、每核 scheduler、退出 | 分波需求与共同驻留需求分开；校验有效成员 |
 | runtime/scheduler/scheduler_ready.h | ready/wake 路由、CAS 队列、分片领取 | ready 不直接等价于多核执行许可；统一准入、身份及去重 |
 | runtime/scheduler/scheduler_completion.h | 本核退役、依赖推进、direct refill | block 完成与逻辑 task 完成分层；refill 不能越过本核义务 |
-| runtime/scheduler/scheduler_mix.h | AIC 的组级 placement 和完成跟踪 | 同 task 多 block、GM 控制、各 lane 自备参数 |
+| runtime/scheduler/scheduler_gm_mix.h | AIC 的组级领取、发布和完成聚合 | 原 N 分波、各 lane 自备参数、descriptor/ack/seal |
 | aicore/aicore_executor.cpp | 每核调用 kernel 和生命周期 | 普通／Mix 双入口统一检查；不能普通 slot 永久压住必需 Mix |
 | runtime/scheduler/scheduler_types.h 与 scheduler_layout.h | POD 布局、代次 | 准入序号、成员、领取／完成计数、溢出校验 |
 | runtime/scheduler/scheduler_graph.h | 引用和形状校验 | 后端及测试齐备后分阶段开放形状 |
@@ -182,7 +185,7 @@ LocalDone(w, A) 表示 w 不再有 A 的未执行工作、待发布完成或资�
 - [Host 形状、需求和参数初始化](../../../src/a5/runtime/host_build_graph/host/runtime_maker.cpp)
 - [ready/wake 路由和本核状态](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_ready.h)
 - [完成与 direct refill](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_completion.h)
-- [Mix 协调](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_mix.h)
+- [GM Mix 协调](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_gm_mix.h)
 - [设备主循环的普通与 Mix 入口](../../../src/a5/runtime/host_build_graph/aicore/aicore_executor.cpp)
 - [设备内存原语](../../../src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_memory.h)
 - [scheduler mode 验收 fixture](../../st/a5/host_build_graph/conftest.py)

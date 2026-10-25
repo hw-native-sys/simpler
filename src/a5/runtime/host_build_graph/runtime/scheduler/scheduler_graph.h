@@ -57,13 +57,8 @@ enum class SchedulerGraphResult : uint64_t {
 
 inline constexpr bool
 scheduler_resident_task_shape_supported(uint32_t active_subtasks, uint32_t logical_block_num, bool sync_start) {
-    return active_subtasks >= 1 && active_subtasks <= 3 && logical_block_num >= 1 && logical_block_num <= INT16_MAX &&
-           (active_subtasks == 1 || logical_block_num == 1) && !sync_start;
-}
-
-inline constexpr bool scheduler_resident_graph_shape_supported(bool has_multiblock, bool has_mix) {
-    // SSBUF Mix dispatch does not participate in the multi-block admission order.
-    return !has_multiblock || !has_mix;
+    return active_subtasks >= 1 && active_subtasks <= 3 && logical_block_num >= 1 &&
+           logical_block_num <= static_cast<uint32_t>(INT16_MAX) / active_subtasks && !sync_start;
 }
 
 struct SchedulerMinimumWorkerDemand {

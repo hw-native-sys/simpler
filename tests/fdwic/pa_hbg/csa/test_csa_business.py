@@ -8,7 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 
-"""Real CSA kernels and seven original goldens, with explicit resident-only RED gates."""
+"""Real CSA kernels and seven original goldens, with explicit resident-only provenance gates."""
 
 from examples.a5.host_build_graph.deepseek_v4_pro_csa import business_cases as variants
 from examples.a5.host_build_graph.deepseek_v4_pro_csa import fixture

@@ -13,7 +13,7 @@
 
 // AICore-resident completion library; scheduler_completion.cpp is the independent AICPU scheduler implementation.
 
-#include "scheduler_admission.h"
+#include "scheduler_gm_mix.h"
 
 // The caller publishes only at idle or in the common run epilogue. A barrier
 // keeps trace/error publication ahead of the terminal completion count.
@@ -38,12 +38,37 @@ inline __aicore__ void scheduler_account_failed_completion(
     ++scheduler->pending_completed;
 }
 
-// A Mix task resolved on the completion path, held for the coordinator to place
-// once the scan is done. An ordinary successor needs no such hand-off: the core
-// that resolved it owns the slot it came from and refills that slot directly.
+// Non-ordered Mix dispatch retains a ready successor for coordinator placement.
 struct SchedulerRefillCandidates {
     SchedulerReadyClaim mix_ready{};
 };
+
+// The caller's execution trace, or all released Mix lane traces, precedes
+// this logical completion. Mix successors enter the ready queue; own-type
+// successors may retain one persistent admission candidate.
+inline __aicore__ bool scheduler_complete_ordered_task(
+    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
+    __gm__ SchedulerRunControl *run_control, int64_t task_ref, uint64_t profiling_level, SchedulerWakeStats *wake_stats,
+    SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats
+) {
+    if (scheduler == nullptr || scheduler->admission == nullptr || !scheduler_task_ref_valid(graph, task_ref))
+        return false;
+    __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
+    scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    if (!scheduler_resolve_completion(
+            graph, scheduler_state_base, scheduler, run_control, task_ref, wake_stats, ready_stats, completion_stats,
+            profiling_level, false, scheduler_ordered_direct_sink(scheduler->admission),
+            scheduler->config.self_core_type, nullptr
+        )) {
+        scheduler_record_error(
+            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            SchedulerErrorSite::COMPLETION_RESOLVE_FAILED
+        );
+        return false;
+    }
+    ++scheduler->pending_completed;
+    return true;
+}
 
 inline __aicore__ bool scheduler_service_cluster_completion_slot(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
@@ -54,8 +79,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     SchedulerRefillCandidates *candidates = nullptr, bool mix_slot = false
 ) {
     if (direct_refilled != nullptr) *direct_refilled = false;
-    if (scheduler == nullptr || ((scheduler->has_mix || mix_slot) && ssbuf_region == nullptr) ||
-        cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
+    if (scheduler == nullptr || (mix_slot && ssbuf_region == nullptr) || cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
         pending_slot >= (mix_slot ? SCHEDULER_MIX_SLOT_COUNT : SCHEDULER_PENDING_SLOT_COUNT) ||
         completed_generation == 0)
         return false;
@@ -176,8 +200,17 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         completed_trace->kernel_end_cycles = executor_trace.kernel_end_cycles;
     }
     const uint8_t completed_subtask_slot = local_slot->subtask_slot;
-    bool task_complete = true;
-    if (local_slot->cooperative) {
+    const bool gm_mix = local_slot->gm_mix;
+    if (gm_mix && (!local_slot->cooperative || scheduler->admission == nullptr || mix_slot || mix_tracker != nullptr ||
+                   cluster_lane != scheduler->config.self_lane || replacement_ready != nullptr)) {
+        scheduler_record_error(
+            run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+            SchedulerErrorSite::BLOCK_COMPLETION_INVALID
+        );
+        return false;
+    }
+    bool task_complete = !gm_mix;
+    if (local_slot->cooperative && !gm_mix) {
         if (mix_slot || mix_tracker != nullptr || cluster_lane != scheduler->config.self_lane) {
             scheduler_record_error(
                 run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
@@ -209,17 +242,13 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     scheduler->set_timing_slot(cluster_lane, pending_slot, -1);
     const uint64_t completion_phase_end = phase_timing_enabled ? scheduler_cycles() : 0;
     SchedulerReadyClaim resolved_ready{};
-    if (task_complete) {
+    if (task_complete && scheduler->admission == nullptr) {
         __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
         scheduler_gm_store(control->state, static_cast<int64_t>(SchedulerTaskState::DONE));
-        // Own-slot successors have this core's type. Ordered scheduling keeps
-        // their ownership in the persistent candidate pool until entry is
-        // permitted; the ordinary path refills the freed slot immediately.
-        // A peer AIV's Mix slot is filled only through coordinator placement.
+        // A peer AIV's remote Mix slot belongs to coordinator placement.
         SchedulerReadyClaim *direct_ready = nullptr;
         if (replacement_ready == nullptr && !mix_slot) {
-            direct_ready =
-                scheduler->admission != nullptr ? scheduler_ordered_direct_sink(scheduler->admission) : &resolved_ready;
+            direct_ready = &resolved_ready;
         }
         if (!scheduler_resolve_completion(
                 graph, scheduler_state_base, scheduler, run_control, task_ref, wake_stats, ready_stats,
@@ -229,16 +258,9 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
                     &candidates->mix_ready :
                     nullptr
             )) {
-            if (scheduler->admission != nullptr) {
-                scheduler_record_error(
-                    run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
-                    SchedulerErrorSite::COMPLETION_RESOLVE_FAILED
-                );
-            } else {
-                scheduler_account_failed_completion(
-                    graph, scheduler, run_control, task_ref, SchedulerErrorSite::COMPLETION_RESOLVE_FAILED
-                );
-            }
+            scheduler_account_failed_completion(
+                graph, scheduler, run_control, task_ref, SchedulerErrorSite::COMPLETION_RESOLVE_FAILED
+            );
             return false;
         }
     }
@@ -277,7 +299,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
                 );
                 return false;
             }
-            refilled = true;
+            refilled = local_slot->state == SchedulerDispatchSlotState::READY;
         }
     }
     refill_end_cycles = phase_timing_enabled ? scheduler_cycles() : 0;
@@ -306,7 +328,22 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     } else if (completed_trace != nullptr) {
         scheduler_publish_cache_line(&completed_trace->kernel_start_cycles);
     }
-    if (task_complete) ++scheduler->pending_completed;
+    if (gm_mix) {
+        if (!scheduler_gm_mix_release_lane(
+                graph, scheduler_state_base, scheduler, run_control, task_ref, pending_slot, completed_generation
+            ))
+            return false;
+    } else if (task_complete) {
+        if (scheduler->admission != nullptr) {
+            if (!scheduler_complete_ordered_task(
+                    graph, scheduler_state_base, scheduler, run_control, task_ref, profiling_level, wake_stats,
+                    ready_stats, completion_stats
+                ))
+                return false;
+        } else {
+            ++scheduler->pending_completed;
+        }
+    }
     if (direct_refilled != nullptr) *direct_refilled = refilled;
     return true;
 }
@@ -317,7 +354,8 @@ inline __aicore__ bool scheduler_service_cluster_completions(
     SchedulerCompletionStats *completion_stats, uint64_t profiling_level, uint64_t *direct_refilled_slot_mask,
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, SchedulerRefillCandidates *candidates = nullptr
 ) {
-    if (scheduler == nullptr || (scheduler->has_mix && ssbuf_region == nullptr)) return false;
+    if (scheduler == nullptr || (scheduler->admission == nullptr && scheduler->has_mix && ssbuf_region == nullptr))
+        return false;
     if (direct_refilled_slot_mask != nullptr) *direct_refilled_slot_mask = 0;
     bool progress = false;
     // This core's own slots. A core retires only the slots it fills, so their
@@ -342,7 +380,7 @@ inline __aicore__ bool scheduler_service_cluster_completions(
                 UINT64_C(1) << (scheduler->config.self_lane * SCHEDULER_PENDING_SLOT_COUNT + pending_slot);
         progress = true;
     }
-    if (!scheduler->has_mix || !scheduler->is_mix_coordinator()) return progress;
+    if (scheduler->admission != nullptr || !scheduler->has_mix || !scheduler->is_mix_coordinator()) return progress;
     // The Mix slots this core coordinates, whose completions arrive in their own
     // inbox. Its own subtask of a Mix task sits in its own slots, covered above.
     for (uint32_t cluster_lane = 1; cluster_lane < PLATFORM_CORES_PER_BLOCKDIM; ++cluster_lane) {

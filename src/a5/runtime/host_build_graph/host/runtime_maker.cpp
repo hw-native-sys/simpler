@@ -1127,7 +1127,6 @@ bool create_scheduler_state(
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
     int64_t legacy_shape_task_ref = -1;
-    int64_t first_pure_multiblock_task_ref = -1;
     int64_t trace_overflow_task_ref = -1;
     // The progress byte is PENDING or COMPLETED throughout this walk, never
     // PUBLISHED: that value is stored only by the device dispatch path, which
@@ -1163,9 +1162,8 @@ bool create_scheduler_state(
             shape.task_ref = task_ref;
             shape.active_mask = SUBTASK_MASK_AIV0;
         }
-        // Ordinary tasks retain the existing ChipTaskSlotState scheduling
-        // semantics. Only the legacy inline-dispatch fallback synthesizes its
-        // AIV0 execution shape because it has no active subtask in the slot.
+        // Dependency-only nodes use AIV routing but have no physical execution
+        // or trace cell. Their logical completion still contributes to the run.
         const uint8_t classified_active_mask = shape.active_mask;
         const ActiveMask metadata_active_mask =
             inline_dispatch_task ? ActiveMask(classified_active_mask) : slot.active_mask;
@@ -1180,7 +1178,8 @@ bool create_scheduler_state(
         }
         const uint32_t logical_block_num = static_cast<uint32_t>(slot.logical_block_num);
         uint32_t expected_subtasks = 0;
-        if (!scheduler_subtask_count_checked(logical_block_num, active_subtasks, &expected_subtasks)) {
+        if (!inline_dispatch_task &&
+            !scheduler_subtask_count_checked(logical_block_num, active_subtasks, &expected_subtasks)) {
             LOG_ERROR(
                 "A5 HBG AICore scheduler: task ref=%" PRId64 " block/subtask product exceeds the int16 task contract",
                 task_ref
@@ -1232,8 +1231,9 @@ bool create_scheduler_state(
             )) {
             if (legacy_shape_task_ref < 0) legacy_shape_task_ref = task_ref;
         }
-        uint64_t next_subtask_count = 0;
-        if (!scheduler_trace_count_checked(executable_subtask_count, expected_subtasks, &next_subtask_count)) {
+        uint64_t next_subtask_count = executable_subtask_count;
+        if (!inline_dispatch_task &&
+            !scheduler_trace_count_checked(executable_subtask_count, expected_subtasks, &next_subtask_count)) {
             if (trace_overflow_task_ref < 0) trace_overflow_task_ref = task_ref;
             if (!scheduler_layout_checked_add(executable_subtask_count, expected_subtasks, &next_subtask_count)) {
                 LOG_ERROR("A5 HBG AICore scheduler: task ref=%" PRId64 " overflows the subtask count", task_ref);
@@ -1252,7 +1252,7 @@ bool create_scheduler_state(
         );
         metadata.trace_index_base =
             executable_subtask_count <= UINT32_MAX ? static_cast<uint32_t>(executable_subtask_count) : 0;
-        metadata.timing_slot = static_cast<int16_t>(slot.task_attrs.timing_slot());
+        metadata.timing_slot = inline_dispatch_task ? -1 : static_cast<int16_t>(slot.task_attrs.timing_slot());
         metadata.logical_block_num = static_cast<uint16_t>(logical_block_num);
         sampled_task_timing_enabled =
             sampled_task_timing_enabled ||
@@ -1269,8 +1269,6 @@ bool create_scheduler_state(
         aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, demand.aiv);
         if (!inline_dispatch_task) {
             if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
-            if (active_subtasks == 1 && logical_block_num > 1 && first_pure_multiblock_task_ref < 0)
-                first_pure_multiblock_task_ref = task_ref;
             if (logical_block_num > 1 || active_subtasks > 1 || slot.task_attrs.requires_sync_start())
                 ++cooperative_task_count;
         }
@@ -1282,14 +1280,10 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
     }
-    if (legacy_shape_task_ref < 0 &&
-        !scheduler_resident_graph_shape_supported(first_pure_multiblock_task_ref >= 0, mix_task_count != 0))
-        legacy_shape_task_ref = first_pure_multiblock_task_ref;
     if (legacy_shape_task_ref >= 0) {
         select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
         LOG_INFO(
-            "A5 HBG: retaining AICPU scheduling for task ref=%" PRId64
-            " with unsupported shape or protocol combination",
+            "A5 HBG: retaining AICPU scheduling for task ref=%" PRId64 " with unsupported task shape",
             legacy_shape_task_ref
         );
         return true;

@@ -70,48 +70,72 @@ TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
 }
 
-TEST(AicoreSchedulerState, ResidentAcceptsOrdinaryPureMultiBlockAndSingleBlockMix) {
-    for (uint32_t blocks : {1U, 2U, 3U, 33U, 97U, 512U, static_cast<uint32_t>(INT16_MAX)}) {
-        SCOPED_TRACE(blocks);
-        EXPECT_TRUE(scheduler_resident_task_shape_supported(1, blocks, false));
-        EXPECT_FALSE(scheduler_resident_task_shape_supported(1, blocks, true));
-    }
-    for (uint32_t active : {2U, 3U}) {
+TEST(AicoreSchedulerState, ResidentAcceptsOrdinaryPureAndMixMultiBlock) {
+    for (uint32_t active : {1U, 2U, 3U}) {
         SCOPED_TRACE(active);
-        EXPECT_TRUE(scheduler_resident_task_shape_supported(active, 1, false));
-        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, 2, false));
-        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, 1, true));
+        const uint32_t max_blocks = static_cast<uint32_t>(INT16_MAX) / active;
+        for (uint32_t blocks : {1U, 2U, 3U, 31U, 32U, 33U, 64U, 65U, 97U, 512U, max_blocks}) {
+            SCOPED_TRACE(blocks);
+            uint32_t subtasks = 0;
+            ASSERT_TRUE(scheduler_subtask_count_checked(blocks, active, &subtasks));
+            EXPECT_EQ(subtasks, blocks * active);
+            EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
+        }
     }
+}
+
+TEST(AicoreSchedulerState, ResidentShapeRejectsSubtaskProductOverflowAndInvalidDimensions) {
     EXPECT_FALSE(scheduler_resident_task_shape_supported(0, 1, false));
     EXPECT_FALSE(scheduler_resident_task_shape_supported(4, 1, false));
-    EXPECT_FALSE(scheduler_resident_task_shape_supported(1, 0, false));
-    EXPECT_FALSE(scheduler_resident_task_shape_supported(1, static_cast<uint32_t>(INT16_MAX) + 1, false));
-    EXPECT_FALSE(scheduler_resident_task_shape_supported(1, UINT32_MAX, false));
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(UINT32_MAX, 1, false));
+    for (uint32_t active : {1U, 2U, 3U}) {
+        SCOPED_TRACE(active);
+        const uint32_t max_blocks = static_cast<uint32_t>(INT16_MAX) / active;
+        for (uint32_t blocks : {0U, max_blocks + 1, static_cast<uint32_t>(INT16_MAX) + 1, UINT32_MAX}) {
+            SCOPED_TRACE(blocks);
+            EXPECT_FALSE(scheduler_resident_task_shape_supported(active, blocks, false));
+        }
+    }
 }
 
-TEST(AicoreSchedulerState, ResidentDoesNotMixMultiBlockAdmissionWithSingleBlockSsbufMix) {
-    EXPECT_TRUE(scheduler_resident_graph_shape_supported(false, false));
-    EXPECT_TRUE(scheduler_resident_graph_shape_supported(false, true));
-    EXPECT_TRUE(scheduler_resident_graph_shape_supported(true, false));
-    EXPECT_FALSE(scheduler_resident_graph_shape_supported(true, true));
+TEST(AicoreSchedulerState, ResidentKeepsSyncStartOnLegacyForAllSubtaskShapes) {
+    for (uint32_t active : {1U, 2U, 3U}) {
+        for (uint32_t blocks : {1U, 2U, 32U, 33U, 65U, 512U}) {
+            SCOPED_TRACE(active);
+            SCOPED_TRACE(blocks);
+            EXPECT_FALSE(scheduler_resident_task_shape_supported(active, blocks, true));
+        }
+    }
 }
 
-TEST(AicoreSchedulerState, WholeGraphProtocolDecisionDoesNotDependOnSubmissionOrder) {
+TEST(AicoreSchedulerState, OrdinaryMixMasksCanExecuteMoreBlocksThanPhysicalClusters) {
+    for (uint8_t mask : {3U, 5U, 6U, 7U}) {
+        SCOPED_TRACE(mask);
+        const uint32_t active = static_cast<uint32_t>(__builtin_popcount(mask));
+        for (uint32_t blocks : {SCHEDULER_CLUSTER_CAPACITY + 1, 512U}) {
+            SCOPED_TRACE(blocks);
+            EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
+            const auto demand = scheduler_minimum_worker_demand(mask);
+            EXPECT_EQ(demand.aic, 1u);
+            EXPECT_EQ(demand.aiv, (mask & 6U) == 6U ? 2u : 1u);
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, OrdinaryPureAndMixShapeValidationIsSubmissionOrderIndependent) {
     for (uint32_t mix_subtasks : {2U, 3U}) {
-        for (bool mix_first : {false, true}) {
-            SCOPED_TRACE(mix_subtasks);
-            SCOPED_TRACE(mix_first);
-            bool has_multiblock = false;
-            bool has_mix = false;
-            for (uint32_t index = 0; index < 2; ++index) {
-                const bool mix = (index == 0) == mix_first;
-                const uint32_t active = mix ? mix_subtasks : 1U;
-                const uint32_t blocks = mix ? 1U : 512U;
-                ASSERT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
-                has_multiblock = has_multiblock || blocks > 1;
-                has_mix = has_mix || active > 1;
+        for (uint32_t mix_blocks : {1U, 2U, 33U, 512U}) {
+            for (bool mix_first : {false, true}) {
+                SCOPED_TRACE(mix_subtasks);
+                SCOPED_TRACE(mix_blocks);
+                SCOPED_TRACE(mix_first);
+                for (uint32_t index = 0; index < 2; ++index) {
+                    const bool mix = (index == 0) == mix_first;
+                    const uint32_t active = mix ? mix_subtasks : 1U;
+                    const uint32_t blocks = mix ? mix_blocks : 512U;
+                    EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
+                }
             }
-            EXPECT_FALSE(scheduler_resident_graph_shape_supported(has_multiblock, has_mix));
         }
     }
 }

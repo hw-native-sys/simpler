@@ -113,6 +113,11 @@ AIV 读取 AIC 发布的同一个组身份，自行装配自己的 LocalContext 
 不能因为 task_ref 相同就默认配对，也不能独立领取恰好不同的 block。
 全局 block 编号不要求在每个 cluster 连续，局部组序号则必须连续。
 
+本版保留 kernel 通信端点的固定映射：mask 3 的 AIV0 在物理 AIV0，
+mask 5 的 AIV1 在物理 AIV1，mask 6/7 各在对应物理 lane。
+NO_SPLIT/SingleModeVec0 的硬件搬运目标不能由 payload.sub_block_id 改写，
+因此不按 block 奇偶轮换单 AIV；逻辑执行身份与物理身份仍分别记录和校验。
+
 记录分离 AIC 发布字段与各 lane 的到达／完成字段；每个 lane 只写自己的 token。
 多核不能用普通 store 合写一个 mask，需聚合时使用明确 owner 或已验证的原子。
 调度代码中的 SSBUF 指针检查、初始化、发布和完成读取一起迁移，不只替换一处通知。

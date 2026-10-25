@@ -4,6 +4,7 @@
 
 开始日期：2026-10-25；起点：`6c367c69f`；工作分支：`feat/fully_distributed_within_core`。
 按用户要求逐步实现、阶段性详细中文 commit，**不 push**。
+用户随后单独授权的推送已完成至 `c8374e37b`；后续实现继续遵守不自动 push 的原目标。
 本文件集中记录实现、失败定位、测试证据和剩余工作，不能用阶段完成替代整个目标完成。
 
 依据：
@@ -23,11 +24,11 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 | 顺序 | 交付 | 出口证据 | 当前状态 |
 | ---- | ---- | -------- | -------- |
 | 前置 | ordinary／Mix payload context 初始化与重绑定 | 原生 N=1 红灯转绿；真实初始化函数的 C++ 测试 | 已通过 C++、仿真与 A5 六种 mask 各十轮 |
-| 1 | 有界存储、准入记录、block 控制、GM 组状态 | POD／布局／溢出／重跑初始化测试 | 已落地；纯 C/V 已使用，GM 组协议待接线 |
-| 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | own/direct 与持久候选已接线；GM Mix 入口尚未实现 |
+| 1 | 有界存储、准入记录、block 控制、GM 组状态 | POD／布局／溢出／重跑初始化测试 | 已落地；纯 C/V 和 GM Mix 已使用 |
+| 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | own/direct、持久候选与 GM Mix 均已接线；完整事件审计待补 |
 | 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | A5／仿真功能和 L1/L4 逐 block 检查通过 |
-| 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | 未实现 |
-| 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | 逐 block 索引与连接键已接入；全协议事件和 CSA 未完成 |
+| 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | A5／仿真矩阵、重叠及 TPipe PA 已通过；完整诊断仍在补验 |
+| 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | CSA 数值／2308 记录／来源通过；显式身份与全协议事件未完成 |
 | 6 | sync_start 不同位置领取和局部跨任务推进 | 两独立满核任务、部分交叠、超容量、早返回不重领 | 未实现 |
 | 7 | 性能对比 | 同 kernel／输入／拓扑，无完整插桩运行；诊断运行分开 | 未测量 |
 
@@ -552,3 +553,197 @@ JSON 尚未导出 ready_source 数值、显式 block/N/order/generation 全套�
 保留原有历史红灯与原 CSA kernel/数据；未将已开放纯 C/V 误写成 CSA resident 已可用。
 下一项仍是所有 resident Mix（含 N=1）共同准入、GM descriptor/ack/seal 和各 lane 自备参数，
 之后才有资格开放纯多 block 与 Mix 同图，并执行原样 CSA resident 的严格验收。
+
+## 2026-10-25：GM Mix 分波与各 lane 自备参数接线
+
+纯 C/V 已提交为 `c8374e37b`，TLS 修复为 `030297fc7`；本轮未 push。
+提交后版本标记重建成功，日志 `outputs/spmd-ordered-postcommit-build-20261025.log`。
+改动前用原 `mask3_n2` 仿真入口复验，实际运行后被新鲜来源门禁以 mode=4 拒绝，
+退出状态为 1；这是能力红灯，不是编译失败，日志 `outputs/spmd-gm-mix-native-red-20261025.log`。
+
+采用现有 640B GroupMailbox 和持久 MixCloseSeal，不增加运行期分配。
+本核增加 40B GM 组状态（准入本地状态共 224B），区分全 run 的 group_seq、
+本 task 的 task_last_seq，以及 CLAIMED/PUBLISHED/ARRIVED/RUNNING/RELEASED。
+每 cluster 同时只保留一组；resource_mask 为本 cluster 的三条 lane，不扩大成全芯片屏障。
+单 AIV 的 mask 3/5 按 block 奇偶选物理 lane 1/2，逻辑 subtask 不改；
+mask 6/7 固定双 AIV 对应关系。inactive lane 只到达／释放，不制造 kernel 或完成贡献。
+
+接线分工：低层组协议放在 completion 可见的 `scheduler_gm_mix.h`；
+ordered 填槽移至 dispatch，避免 completion/admission/Mix 互相包含。
+各 lane 共用 own-slot prepare/entry/trace/退役，只有组协调 AIC 收齐 release 后贡献一次 block。
+完成驱动的后继仍沿既有 ready/wake 路径；当前 ordered Mix 后继首次入队，
+不放进旧 SSBUF 临时候选后遗失，也不共享普通候选的可变 sink。
+
+成功 EXIT 还须关闭未消费的 seal 和本核义务，才能向 AICPU ACK；
+该 drain 不领取新 block、不准备／执行 kernel。错误 EXIT 不补 released 或成功计数。
+全图 task 完成计数不被用来取代每 cluster 的最后发布／释放／关闭证据。
+
+Host contracts 新期望先得到 23 项中 3 个真实失败：普通多 block Mix、
+纯多 block 与 Mix 的图级限制及提交顺序组合；日志 `outputs/spmd-gm-mix-host-red-20261025.log`。
+最初一次编译撞到并发编辑的未完成结构字段，已明确排除，不把该编译错误算作行为红灯。
+GM 协议、真实 prepare/completion、跨 cluster 和退出场景的 C++ 测试正在补齐；
+截至此记录，尚未宣布新协议的仿真或 A5 执行已通过。
+
+首批 GM Mix 生产 helper 测试 57 项全部通过，旧 11 个相关 C++ target 也全部通过；
+日志 `outputs/spmd-gm-mix-cpp-first-20261025.log` 与 `outputs/spmd-gm-mix-existing-cpp-20261025.log`。
+完整构建先在实际 executor 编译单元暴露 EXIT 路径误用仅接受 int64 的 scheduler_gm_load；
+改用既有 uint64 的 fetch_add(0) 关键读后重建成功，日志 `outputs/spmd-gm-mix-build-r2-20261025.log`。
+这一编译错误不在 helper 单元测试的编译范围内，不把 C++ 单测通过外推为完整构建成功。
+
+原生仿真先运行 mask3_n1、mask3_n2、mask5_n2，各三轮共九次通过。
+第十次 mask6_n2 在退出阶段约十秒后报 core 20/21 not released，未返回测试结果，
+日志 `outputs/spmd-gm-mix-smoke-sim-20261025.log`。
+线程检查仅剩 sim-aiv-20/21 两个执行线程自旋；调试器 attach 不可用，没有拿到现场 seal 值。
+保存线程／调试器结果后仅终止本次挂起仿真进程，退出状态 143，不计作通过；未上卡或重置设备。
+
+静态核对发现一个确定的控制流遗漏：startup 直接看到 EXIT 的分支绕过主循环，
+也绕过新加入的成功退出 drain。零工作 cluster 的 AIC 可以在 bootstrap 只关闭第一条义务后，
+错过短暂 IDLE 而直接 ACK，留下后续 Mix seal 未发布；已进入主循环的 AIV 则等待该 seal。
+这是与现场线程分布吻合的解释，但不能声称已经从原挂起进程读到该状态。
+sim 的 retirement 等待十秒，drain watchdog 为二十秒，晚 ACK 后不会补发 return gate，
+因此后续持续自旋也可能已在 post_close_release 等待，不能把线程存活直接当成仍在 drain。
+下一步使用实际 executor 的 startup EXIT 路径造确定性红灯，
+将成功 drain 汇合到所有退出分支的实际 EXIT 确认之后、ACK 之前，而不是增加 timeout。
+
+实际 executor 的确定性回归已建立：`test_hbg_gm_mix_startup.cpp` 在同一编译单元
+包含生产 executor，先通过真实准入／组准备／测试 kernel／完成路径在 cluster 0 完成两个 Mix，
+然后让零工作 cluster 1 的 AIC 直接看到 EXIT。三个成功场景 `(3,6)/(6,6)/(6,7)`
+均准确失败于第二项 seal 仍为 0；第一项 seal、EXITED、没有新增 kernel、没有 SSBUF 读取均成立。
+错误轮的控制项通过，未伪造 seal；日志 `outputs/spmd-gm-mix-startup-exit-red-20261025.log`。
+这证明 startup 分支确实存在提前 ACK 的遗漏，不需要把原挂起现场中未读取的值当作证据。
+修复把唯一 drain 放到共同尾部的真实 EXIT 确认后、最终统计与 ACK 前，
+删除主循环内的另一份 drain，保持错误退出不补成功状态。
+
+### 原样 CSA 的单 AIV 通信 ABI 校正
+
+首版按 block 奇偶轮换 single-AIV 的假设不能沿用到冻结 CSA。
+实际 managed PTO-ISA pin 为 `418de18dde8fa33773dc5c384fdfe5506463b628`：
+`include/pto/npu/a5/TPush.hpp` 的 NO_SPLIT Acc→Vec 使用 SingleModeVec0，
+`TMov.hpp` 将其转为固定 subBlockId=false 并传给硬件搬运；目标 UB 不由 runtime payload 改写。
+CSA 的 `qr_head_aiv.cpp` 使用这一模式，其编排为 AIC/AIV0；所有十一个 MixedKernels 声明
+均为 AIC/AIV0/INVALID。既有 legacy 也按逻辑 bit 固定 AIV0/AIV1。
+旧 resident helper 可以任选 lane，不足以证明这种业务通信 ABI 可以任选；
+CCE builtin 与 payload sub_block_id 也不是同一个证据，不能靠它们的名字推断兼容。
+
+据此新增四项实际红灯：mask3/5 在奇偶 block 都须保留逻辑槽对应的物理 lane，
+观察者须拒绝偷偷挪到另一条 AIV 的 descriptor；旧映射四项均失败，
+日志 `outputs/spmd-gm-mix-single-vector-abi-red-20261025.log`。
+发布和校验统一改为 lane==subtask：mask3→AIV0、mask5→AIV1、mask6/7→各自两条 AIV。
+原测试里“必须轮换”的断言同步纠正为固定 ABI，不删身份／原 N／物理 sub_block 校验。
+不修改冻结 kernel，不把该源码证据冒充已经上卡测过错误放置。
+
+另增 44 个 GM 原生事件场景，每轮实际 60 次调用、三轮 180 次，
+覆盖四种 mask、N1/2/65、512→1→65→1→512 重用、慢头／中／尾、真实依赖和独立任务重叠。
+共享 ordered golden/comparator 按 mask 枚举全部 active slot，旧 32 场景不变；
+旧 96 项加新 184 项 CPU 夹具检查全部通过，日志 `outputs/spmd-gm-mix-native-fixture-cpu-20261025.log`。
+多 slot golden 的原错误先由 mask3_n1 的实际 CPU 夹具红灯固定，
+没有把旧“非纯 C 一律只检查 slot1”的比较逻辑照搬成 Mix 假绿。
+
+共尾退出与固定 ABI 修复后，61 项 GM helper 和 4 项真实 executor 启动退出测试全部通过，
+日志 `outputs/spmd-gm-mix-exit-abi-green-20261025.log`；完整构建 r3 也通过。
+原五场景仿真／A5 冒烟各三轮、15 次均通过，包含此前卡住的 mask6_n2。
+随后原始六种 mask × N 矩阵及槽复用共 90 场景各三轮，
+仿真和 A5 分别完成 270 次，全部保留逐轮输出和新鲜 resident 门禁。
+日志 `outputs/spmd-gm-mix-matrix-sim-20261025.log` 与
+`outputs/spmd-gm-mix-native-20261025/matrix.log`。
+
+新 GM 原生事件场景在仿真／A5 各完成 180 次，覆盖 mask6 无 AIC 事件、
+纯任务与 Mix 的真实前驱关系、快 cluster 跨 task 重叠、全 active slot 及大小图重用。
+日志 `outputs/spmd-gm-mix-events-sim-20261025.log` 与
+`outputs/spmd-gm-mix-native-20261025/events.log`。
+默认 HBG 仿真 42 passed、379 deselected（54.87 秒），A5 60 passed、4 skipped、
+356 deselected（158.71 秒），日志分别为 `outputs/spmd-gm-mix-hbg-sim-20261025.log`、
+`outputs/spmd-gm-mix-native-20261025/hbg.log`。
+真机仍直接使用已由 CANN 确认的设备 0，未使用不存在的 task-submit，也未获得队列锁隔离。
+
+### 无 kernel 服务节点的真实完成路径
+
+真实 TPipe PA SmallCase1 的 A5 L4 已通过：72 条执行和 72 条 scheduler 记录，
+producer=aicore、96 个 scheduler stream 全为 aicore，无 dropped/truncated。
+日志 `outputs/spmd-gm-mix-native-20261025/tpipe-small-l4.log`，
+产物 `outputs/TestSpmdPagedAttentionHbgA5_SmallCase1_20261025_094510/`。
+它证明原 kernel 通信可运行，但不替代完整 CSA 或 sync_start 验收。
+
+随后原样 CSA 的 deps/timing 两轮均通过七项 golden，严格 L4 却拒绝了 2310 条执行：
+期望是 2308，新增两条来自 task 14／27 两个 kernel_ids 全为 -1 的 Dummy 服务节点。
+`outputs/csa-hbg-l4-ojdh7gr2/result.json` 为 passed=false；
+原始执行与 scheduler 都为 2310、producer=aicore，无丢弃和截断。
+旧路径不是单纯导出问题：Host 为 pending inline 节点合成 AIV0 形状并分配一个 trace，
+设备 prepare 空 payload、发布 READY、走一次空 kernel 调用及完成记录。
+不得以过滤导出或放宽 2308 门禁代替修复执行语义。
+
+`test_hbg_inline_services.cpp` 先建立七项真实 RED：普通／ordered 路径占用假执行槽，
+无关 Mix 等待时服务节点被滞留，bootstrap／ordinary／direct 三处 ready transition
+覆盖后续 kernel 的零长度 trace 前缀，completion 误报 refill，以及 N2→Dummy→N1 依赖链。
+最初测试编译曾使用不存在的 queue 常量；改用实际 config.self_core_type 后才执行，
+七项全部实际失败，日志 `outputs/spmd-inline-services-red-20261025.log`。
+
+修复由 ready 唯一 owner 完成服务节点：DONE→既有 resolve_completion→pending_completed，
+后继首次入队而不递归 dispatch，不创建 payload、不增 generation、不生成 kernel trace。
+ordered discovery 收到服务候选后即释放候选额度，不受无关参与义务挡住；
+普通 fill 的临时 FILLING 槽恢复 FREE，direct completion 只有真正 READY 才报告 refill。
+Host 保留逻辑任务计数及 AIV ready 路由，但物理 subtask/trace 数为零，timing_slot=-1；
+三处 ready transition 均跳过 inline，避免写到下一 kernel 的 trace cell。
+
+补充长服务链每轮至多两项、Host 已完成节点不重做、重复完成和 resolve 失败不补成功计数，
+以及 sync/SPMD/Mix/predicate/kernel/N0/N2/非 executable 八种畸形 metadata 拒绝。
+累计 18 项全部通过，日志 `outputs/spmd-inline-services-green-20261025.log`。
+完整 runtime 重编译与原样 CSA 的后续验收单独记录，不以 CPU helper 通过替代设备证明。
+
+首轮重编成功、13 个相关 C++ targets 共 477 项通过；原样 CSA 在 Host prepare 返回 -1000，
+尚未进入设备，也没有生成 deps。产物 `outputs/csa-hbg-l4-xaxog_8m/result.json` 记录失败。
+核对发现 `scheduler_trace_count_checked` 有意拒绝 added=0，maker 在把 Dummy 的物理数改零后
+仍调用它，误设置 trace_overflow_task_ref。该检查的真实 kernel 合同不放宽；
+maker 对服务节点直接保持 trace 前缀，只有真实 kernel 调用非零计数与容量检查。
+这条 Host 缺口由实际业务入口暴露，不能用 helper 测试通过掩盖。
+
+修正后重新编译并执行同一条严格命令：
+
+```bash
+python examples/a5/host_build_graph/deepseek_v4_pro_csa/run.py \
+  l4 -d 0 --require-aicore-scheduler
+```
+
+`outputs/csa-hbg-l4-fdakpyh4/result.json` 为 passed=true：deps/timing 两次各七项 golden 全过，
+79 个有 kernel 任务、2308 条物理记录（AIC 864／AIV 1444）、单次正数 epoch、133 条依赖检查；
+producer=aicore、distributed_scheduler_verified=true，Host capture 107/107，dropped=0。
+严格门禁同时检查 scheduler 记录关联、stream 的 committed/dropped/truncated，均通过。
+未改变 54 个 kernel、52 项 ABI、数据、golden、block 数或验证器标准。
+`block_identity_verified=false` 仍如实保留：这份既有 schema 尚无显式 block_idx/subtask_slot，
+也没有完整 order/claim/LocalDone/group 事件，不能把数量完整升级成全身份协议证明。
+
+相关 CPU 回归 1427 passed（38.10 秒），包含协议、原生夹具、CSA 业务与真实快照、转换器，
+日志 `outputs/spmd-gm-mix-python-final-20261025.log`；服务节点修复后的 HBG 仿真
+42 passed、379 deselected（52.87 秒），日志 `outputs/spmd-inline-services-hbg-sim-20261025.log`。
+
+随后完整业务入口的 12 个业务变体加 3 个严格 resident 变体，各三轮，共 45 次全部通过，
+逐轮七项 golden（315 项）与新鲜调度发布检查保留，全部 scheduler_mode=1；
+日志 `outputs/spmd-gm-mix-csa-business-resident-20261025.log`。
+这包括页重排、scale 初值扰动、原 Worker/callable 反复运行；不改变冻结 workload。
+
+### GM Mix 阶段提交前复验与剩余工作
+
+所有适用 pre-commit 检查通过；首次 clang-format 只修正格式，重新暂存后复跑全绿，
+未使用 SKIP 或 no-verify。格式化后完整 runtime 重编及上述 13 个 C++ targets 再次通过，
+日志 `outputs/spmd-gm-mix-final-build-20261025.log`、`outputs/spmd-gm-mix-final-cpp-20261025.log`。
+最终 GM 事件仿真再完成 44 场景／180 次调用，
+日志 `outputs/spmd-gm-mix-final-events-sim-20261025.log`。
+最终 A5 HBG 回归 60 passed、4 skipped、356 deselected（215.89 秒），
+日志 `outputs/spmd-gm-mix-final-hbg-a5-20261025.log`。
+仍显式排除已知会被 runtime 过滤误收集的双卡 TMR RDMA 目录，不把单卡 HBG 验证冒充多卡回归。
+
+最终源码重编后的严格 CSA L4 再次通过：
+`outputs/csa-hbg-l4-96e7ioam/result.json`、`outputs/spmd-gm-mix-final-csa-l4-20261025.log`。
+独立核对原始产物为 2308 条执行、2308 条 scheduler 记录、96 个 aicore stream，
+dropped 合计 0、truncated 全 false；两轮七项输出通过，完整身份缺口仍如实保留。
+最终 A5 GM 事件复跑同样完成 44 场景／180 次调用、epoch 1–180，
+日志 `outputs/spmd-gm-mix-final-events-a5-20261025.log`。
+
+此阶段支持普通 C/V/Mix 原 N 分波和原样 CSA resident，但不是整个目标完成：
+
+- 错误记录还须补 epoch/order/block/group_seq/紧凑 worker/lane，覆盖准备失败、首写者竞争和退出错误。
+- 现有 L4 尚无完整原生协议事件；必须补显式身份、共同准入、claim、LocalDone、组发布／释放及严格 adapter。
+- sync_start 尚未开放；后续须实现不同位置容量与每位置一次领取，早返回不能重复领块，不加全员起跑屏障。
+- 同 kernel／输入／拓扑的无完整插桩性能比较尚未执行，不以 L4 或 CPU 模型推算收益。
+
+后续继续沿真实 RED→生产修复→CPU／仿真／A5 验证推进，过程只更新本文件，阶段提交不自动 push。

@@ -12,8 +12,10 @@
 当前纯 C/V 普通多 block 已接线：原生纯任务矩阵在仿真和 A5 各 90 次通过；
 新增 32 场景在最终纯 C/V 接线版本的 A5 完成 120 次，仿真在 TLS 生命周期修复后同样完成 120 次。
 每次都要求本轮 resident 来源和完整输出，不接受 legacy 正确输出。
-纯多 block 与任意 Mix 同图、GM Mix、sync_start、完整协议 trace 和原样 CSA resident
-仍未完成；L1/L4 与延迟发布 phase 修复的复验证据见实现过程。
+GM Mix 已接入且可与纯多 block 同图：六种 mask 矩阵在仿真／A5 各 270 次通过，
+新 44 个 GM 事件场景各 180 次通过。原样 CSA 七项 golden 和严格 resident L4 门禁已通过。
+显式 block/slot 身份与完整协议 trace、错误身份补全、sync_start 和性能比较仍未完成；
+逐轮日志、失败修复证据和能力边界见实现过程。
 
 ## 一、四层检查分别证明什么
 
@@ -61,21 +63,35 @@ CPU 包中另外有 [test_native_fixture.py](../../../ut/py/hbg_spmd_contracts/t
 [test_ordered_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_ordered_native_fixture.py)
 共 96 项，检查 32 场景夹具、坏记录、真假依赖、反向准入及每轮复用来源；这些仍是 CPU 检查。
 
+[test_hbg_gm_mix.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_gm_mix.cpp)
+共 61 项，检查真实 descriptor/ack/seal、四种 mask、固定物理 lane、原 N、暂停最后发布者、
+旧／未来 ack、错误身份、保留 seal、零工作成员、局部跨 task 推进及无新 kernel 的退出 drain。
+[test_hbg_gm_mix_startup.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_gm_mix_startup.cpp)
+另 4 项直接调用生产 executor，覆盖 startup 直接 EXIT 的 seal 收尾和错误退出不伪造 seal。
+[test_hbg_inline_services.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_inline_services.cpp)
+共 18 项，检查服务节点不产生 payload／generation／trace、三条 ready trace 路径、direct refill、
+N2→Dummy→N1 依赖、Host 已完成节点、有限服务链和畸形 metadata。
+
+[test_gm_mix_execution.py](test_gm_mix_execution.py) 的 44 场景每轮 60 次调用，
+覆盖四种 mask、N1/2/65、512→1→65→1→512、慢头／中／尾、真实依赖及独立任务重叠；
+[test_gm_mix_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_gm_mix_native_fixture.py)
+有 184 项 CPU 检查，拒绝坏记录。探针中的入口／返回序号不是完整调度协议事件。
+
 ## 二、已经造好的边界与尚欠设备证明的部分
 
 | 边界组 | 现有可执行测试 | 仍需随生产编码完成 |
 | ------ | -------------- | ------------------ |
 | C01–C11：N、mask、容量、身份、稀疏核 | test_shapes：合法／非法 N、32767 乘积边界、mask 4 规范化、sync 容量、拓扑重复／缺失、trace 索引 | Host 实际拒绝路径；discovery 与 placement 一致性；native 全矩阵 |
-| C12：view 和原 ABI | 原生不同 task 使用不相交 view，消费者读取完整 view | 原样 CSA workspace／reduction／TPipe |
-| C13–C16、C39、C42–C43 | 模型／交错检查；ordered 原生以实际入口／返回序号验证纯 C/V 独立任务重叠和真实依赖不早放行 | 带 order/成员的完整原生审计；GM Mix 与 sync_start 的对应检查 |
+| C12：view 和原 ABI | 原生不同 task 使用不相交 view；原样 CSA 七项 golden、TPipe PA L4 通过 | 持续保持原 kernel 与参数 ABI，补显式身份审计 |
+| C13–C16、C39、C42–C43 | 模型／交错检查；ordered 与 GM 原生验证独立任务重叠和真实依赖不早放行 | 带 order/成员的完整原生审计；sync_start 的对应检查 |
 | C17–C18、C22 | test_graphs：宽度 2/7/32/65/128 的 fanout/fanin、20 个固定 seed DAG；无 kernel 服务和空图 | 生产 wake-list 原子竞态与公平性；Host inline 不重复计数 |
-| C19–C20、C25–C28、C47–C49、C56 | model：一组一个身份、全部局部资源到达、mask 6 协调者、未发布最后组、cluster 独立关闭 | GM mailbox 逐步暂停、真实通信收尾、seal 与 mailbox 复用、inactive lane 释放 |
+| C19–C20、C25–C28、C47–C49、C56 | model 与 GM C++ helper：一组一个身份、资源到达、mask 6 协调者、最后发布暂停、seal 复用；原生通信与重叠 | 完整设备组事件审计与故障静止证明 |
 | C23–C24、C55 | sync_once、容量、早到／晚到、过载和 A/B 反序死锁反例 | 有界 barrier kernel、不同物理位置和真正的满核任务；当前原生矩阵未包含 sync_start |
 | C29–C33、C35–C38 | 模型边界；生产 C++ 重复完成；原生 retained 运行同 Worker/callable 切换 512→1→65→1→512 | GM Mix 代次／重绑、A5 故障静止与清理；不可用纯任务复用替代 |
 | C40–C41、C46、C50 | 准入去重、记录容量、准备不占可见洞、冻结成员、暂空非 EOF | 短锁和普通 entry permit 的线性化竞态、发布者失败 |
 | C44–C45、C54 | 模型反例；生产 own/direct gate、两普通候选停放且 predicate 不重算、不可撤销 block 领取 | GM Mix 统一 gate、三通道控制推进及公平性；两个普通 direct 链占满候选池仍可推迟发现协同任务 |
 | C51 | 新旧 publish_count、mode 0/3/4/非法值拒绝；原生每次比较同时验来源 | 接完整 trace 的实际 producer，不只依赖 hook |
-| C21、C34、C52–C53 | 纯 C/V 已去除 SSBUF 依赖；形状用例区分普通 N=2 resident 与 sync N=2 legacy | GM Mix 去除 SSBUF；Graph、多 block predicate、async 继续保留能力边界 |
+| C21、C34、C52–C53 | 纯 C/V 与 GM Mix 生产路径不使用 SSBUF；普通 N=2 resident 与 sync N=2 legacy 分别验收 | Graph、多 block predicate、async 继续保留能力边界 |
 
 test_trace_audit 对缺事件、重复事件、错 task/block/slot/N/order/generation/worker、
 跨 cluster 配对、提前 TaskDone、遗漏 LocalDone、旧 epoch、错误来源、截断、
