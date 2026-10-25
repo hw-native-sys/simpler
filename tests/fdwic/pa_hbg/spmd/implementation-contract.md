@@ -2,7 +2,8 @@
 
 基线：`f5cc679bbf3d`，2026-10-23。[设计总览](../a5-hbg-spmd-design.md)
 定义已确认语义；本页把它收敛为可开始编码的正确性基线。
-共同准入和执行状态机仍是目标协议；POD 布局、Host 预分配与初始化已开始落地。
+共同准入基础 helper、POD 布局、Host 预分配与初始化已开始落地；
+执行入口、cursor、LocalDone 及 GM Mix 状态机仍是待接线的目标协议。
 已实现字段和实测范围以 [实现过程](implementation-progress.md) 为准，不以存在字段替代执行验收。
 本页保留目标编码契约；生产代码的逐步落地与实测证据见 [实现过程](implementation-progress.md)。
 初始 TDD 覆盖和历史红绿状态见 [测试入口和验收状态](test-plan-and-status.md)。
@@ -73,8 +74,13 @@ Mix 按完整 cluster；两个 pending slots 不是两个执行位置。
 
 ### 准入函数与状态转换
 
-建议拆成 `try_claim_admission`、`prepare_admission_record`、
-`try_commit_admission`、`refresh_local_obligation`，参数使用现有 graph/state/local context。
+`scheduler_admission.h` 已提供 `scheduler_try_claim_admission`、
+`scheduler_prepare_admission_record`、`scheduler_try_commit_admission`、
+`scheduler_refresh_local_obligation` 和 `scheduler_can_enter_ordinary` 基础 helper，
+参数复用现有 graph/state/local context。调用方先唯一取得 ready 候选，
+仅成功 claim 才将其所有权转移给持久 pending；RETRY 不能让调用方丢弃候选。
+本地协议状态必须成功初始化；epoch 0 是合法身份，不能拿它兼作“未初始化”哨兵。
+这些 helper 尚未由 executor 的普通／Mix／direct refill 三入口调用，不代表 native 支持已经开放。
 
 | 转换 | 条件与唯一动作 | 暂时不能推进时 |
 | ---- | -------------- | -------------- |

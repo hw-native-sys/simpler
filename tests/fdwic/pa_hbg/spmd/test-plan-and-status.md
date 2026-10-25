@@ -41,6 +41,12 @@ CPU 包中另外有 [test_native_fixture.py](../../../ut/py/hbg_spmd_contracts/t
 × 五种交接场景，共 60 项。检查 AIV 后继入队、AIC direct 快路保留、已有队头优先、
 同轮两个后继不丢不重，以及 Mix 容量恢复后的可达性；不把这些检查算作共同准入协议完成。
 
+新增 [test_hbg_admission.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_admission.cpp)
+直接调用生产准入 helper：真实 ready pop 后唯一 claim、锁外准备、短锁连续提交、
+成员前沿及普通入口许可。覆盖 B 先于未 ready A、冻结位图、epoch、容量和身份拒绝，
+并以发布者和非成员读者并发检查日志前缀。它不调用模型来证明生产 helper，
+也不以 CPU 原子结果代替 A5 cache 可见性或尚未接线的 block 执行验收。
+
 ## 二、已经造好的边界与尚欠设备证明的部分
 
 | 边界组 | 现有可执行测试 | 仍需随生产编码完成 |

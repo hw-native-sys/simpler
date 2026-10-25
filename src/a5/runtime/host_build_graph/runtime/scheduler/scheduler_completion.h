@@ -13,7 +13,7 @@
 
 // AICore-resident completion library; scheduler_completion.cpp is the independent AICPU scheduler implementation.
 
-#include "scheduler_ready.h"
+#include "scheduler_admission.h"
 
 // The caller publishes only at idle or in the common run epilogue. A barrier
 // keeps trace/error publication ahead of the terminal completion count.

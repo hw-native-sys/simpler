@@ -24,7 +24,7 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 | ---- | ---- | -------- | -------- |
 | 前置 | ordinary／Mix payload context 初始化与重绑定 | 原生 N=1 红灯转绿；真实初始化函数的 C++ 测试 | 已通过 C++、仿真与 A5 六种 mask 各十轮 |
 | 1 | 有界存储、准入记录、block 控制、GM 组状态 | POD／布局／溢出／重跑初始化测试 | 已落地并通过布局与 N=1 回归；尚未运行协议 |
-| 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | 未实现 |
+| 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | 基础 helper 已实现；三入口及持久候选尚未接线 |
 | 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | 未实现 |
 | 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | 未实现 |
 | 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | 未实现 |
@@ -298,3 +298,88 @@ AIV 不接收自己无法消费的 Mix candidate，沿原完成驱动路径首�
   未使用 SKIP 或 no-verify。
 
 该修复只建立后续共同准入所依赖的可靠候选交接；并未开放多 block 或 GM Mix。
+
+## 2026-10-25：共同准入基础层与入口接线审查
+
+起点 `d78e3fbad`，该修复提交留在本地，未 push。
+本轮先实现可由真实 ready／completion 接入的准入基础层并补 C++ 交错测试；
+完整 entry gate、slot 让位和 block 执行仍是后续接线，不用 helper 通过代替 native 验收。
+
+### 接线时不能遗漏的边界
+
+- pending admission 必须跨 executor 循环保留。普通候选采用总量为两个的持久池，
+  pop／direct resolve 时取得一个容量名额，预填 slot 仅绑定该候选。
+  前序义务到来时可释放未执行 payload、保留候选身份，不能另加两个 backup 又让原池继续取任务。
+  释放预填 slot 不发布完成、不回退 dispatch generation；重新物化用新 generation。
+- 当前 prepare 会计算 predicate；暂存再恢复候选时不能无意重复求值。
+  接线需缓存已求值结果，或把 ordered 模式的求值移至真正 entry permit 后，只算一次。
+- 纯 C/V 多 block 首次开放时，只对不含 Mix 的整图启用新协议；
+  任意 Mix（包括 N=1）与纯多 block 同图仍须整图回退，直到 GM Mix 一起接入共同顺序。
+  全 N=1 图继续保留当前 resident 能力，不能倒退成 legacy。
+- 普通分波的 demand 是一个位置／一个组的最低需求，不是原 N 个同时驻留位置；
+  lifecycle 的完整 cluster、实际 W/C 和类型校验保持，不以 N 大而放宽拓扑。
+- 每次 prepare 都须写本次 block_idx 和原 block_num，包括多 block 后复用为 N=1 的场景。
+  dispatch、completion、ready-transition 和 sampled timing 都要按 block 处理 trace。
+- Host 目前以 task_ref 作 reg_task_id，同核多波会重号；导出需给每次执行唯一 join 身份。
+  converter 的 `(epoch, task_id, core_id)` 索引也会覆盖同核的不同 block，
+  需要随真实多 block trace 接线补回归，不能仅改 Host 七／五列记录就宣布全身份审计完成。
+- 当前 Host 没有识别任意异步 kernel 的 has_async 属性；resident 以无效 async token
+  使 deferred 注册失败。保留这条实际能力边界，不声称 Host 会自动识别并回退所有异步 kernel。
+
+### 本轮基础层范围
+
+准备记录与提交分开：成员依据紧凑 worker index 和已验证的真实核类型冻结，
+准备阶段不推进可见 tail；短锁只提交完整 record/log，最后发布连续 tail。
+每核扫描停在最早成员义务；不属于该任务的核跳过。
+ordinary permit 不隐式复用旧判断：先处理可见前缀，最后关键原子读取 tail，
+只有与本核 scan_cursor 一致且无 pending／current 义务时才允许一次 kernel。
+测试将用“先观察空前缀、另一核提交、再申请许可”的确定性交错检查这一点。
+
+本轮尚不实现 cursor 领取／LocalDone 关闭，不用手工清 current 的测试伪造这些性质。
+主循环、context、完成聚合、分波容量与完整 trace 齐备之前，不开放 N>1 的 native shape gate。
+
+### 已实现基础层与检查证据
+
+- `scheduler_admission.h` 实现初始化、claim、prepare、commit、refresh 和 ordinary permit，
+  使用已有 layout、ready claim、GM 原子／cache 包装及 first-error 通道；
+  新增 site 110–116，不改变旧诊断编号。
+- 每核协议状态为 88B，未增大既有 SchedulerLocalState，也未放入每核全图表。
+  prepare 先 acquire Host 初始化记录，按真实 compact worker index 冻结成员；
+  纯 C/V 只选对应类型，Mix 包含完整 cluster 的协调／资源成员。
+  普通 N=512 不要求成员数达到 N；sync 的准备容量检查按不同位置计，尚无 sync 执行。
+- record 和 bitmap 分行发布，packed log 仅原子单元访问；
+  短锁提交 order/ref/ADMITTED 后才推进 tail，锁竞争保留 pending。
+  refresh 每次最多扫描八条；缓存当前义务后不重复扫描 topology，不用 TaskDone 清除当前义务。
+- 首批 70 项真实 helper 测试通过。另补 epoch=0、未初始化本地状态的反例，
+  初版 ordinary permit 错误返回 true；真实红灯日志
+  `outputs/spmd-admission-uninitialized-red-20261025.log`。
+  在已有尾 padding 加 initialized 标志，只有初始化全部成功才置位，保持 88B；
+  71 项全部转绿，日志 `outputs/spmd-admission-green-20261025.log`。
+- 12 个发布线程提交 48 项任务时，增加一个真正并发的非成员 AIV reader。
+  写者首项提交后必须让读者观察非空未完结前缀，再继续后续项；
+  读者真实调用 refresh，检查单调前缀及成员义务，最后再核对完整唯一日志。
+  该测试重复 200 次通过，日志 `outputs/spmd-admission-concurrency-20261025.log`。
+  ready pop 在线程启动前完成，因此不把它声称为并发 ready FIFO 测试。
+- 首次 A5 编译发现 GM metadata 引用不能传给要求 Local Memory 引用的判断函数，
+  而 CPU 编译对此不报错；日志 `outputs/spmd-admission-build-20261025.log`。
+  两处改为复用 `scheduler_load_dispatch_metadata` 取得本地值，不新增另一套接口。
+- 修正后 editable 全构建通过，日志 `outputs/spmd-admission-build-r2-20261025.log`。
+  补充旧布局零 W/C summary、无协议区域的兼容测试后，准入专项共 72 项，
+  十个相关 C++ target 共 354 项通过，日志 `outputs/spmd-admission-cpp-verified-20261025.log`；
+  最终版本的并发专项又重复 200 次通过，日志 `outputs/spmd-admission-concurrency-r2-20261025.log`。
+- Python 相关回归 942 项通过（`outputs/spmd-admission-python-20261025.log`）；
+  HBG 默认仿真 42 passed、379 deselected（`outputs/spmd-admission-sim-20261025.log`）；
+  A5 默认 HBG 60 passed、4 skipped、356 deselected
+  （`outputs/spmd-admission-native-20261025/hbg.log`）。真机保持原有单卡 HBG 范围，
+  仅排除被宽目录误收的 TMR 双卡目录；CANN 再次确认 A5，无 task-submit 锁隔离。
+- AIV→Mix 交接仿真八场景各三轮共 24 次通过，
+  日志 `outputs/spmd-admission-handoff-sim-20261025.log`。
+  A5 同样各三轮共 24 次通过，三级 `TestSchedulerPhases` 也通过；
+  日志 `outputs/spmd-admission-native-20261025/{handoff,dfx3}.log`。
+- 首轮 pre-commit 仅自动调整两处 C++ 测试格式；重新暂存后全部适用钩子通过，
+  日志 `outputs/spmd-admission-precommit-r2-20261025.log`，未跳过适用检查。
+
+当前初始化的范围检查依赖合法 Host 镜像：检查地址算术、对齐和区域相对顺序，
+没有 allocation total_size 参数，不能宣称防住任意伪造的越界 offset。
+A5 构建及旧用例回归只验证新头的设备编译和已有行为；
+新发布协议的 GM 可见性仍须随 executor 接线进行真机验证。
