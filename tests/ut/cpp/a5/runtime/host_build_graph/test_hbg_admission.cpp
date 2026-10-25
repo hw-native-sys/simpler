@@ -258,6 +258,42 @@ TEST(HbgAdmission, ExistingPendingCandidateDoesNotConsumeAnotherReadyOwnership) 
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control()->commit_tail, UINT64_C(0)), 2u);
 }
 
+TEST(HbgAdmission, PublishedRunErrorRejectsReadyOwnershipWithoutChangingTheCandidate) {
+    AdmissionFixture fixture({{2, 1}});
+    SchedulerReadyClaim ready{};
+    ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
+    scheduler_record_error(
+        fixture.run(), 0, SchedulerGraphResult::TIMEOUT, nullptr, fixture.locals[3],
+        SchedulerErrorSite::ORDERED_EXIT_TIMEOUT
+    );
+    EXPECT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::ERROR);
+    EXPECT_EQ(ready.task_ref, 0);
+    EXPECT_EQ(fixture.admissions[0].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(fixture.task_control(0)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED));
+    EXPECT_EQ(fixture.control()->commit_tail, 0u);
+    EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::ORDERED_EXIT_TIMEOUT));
+}
+
+TEST(HbgAdmission, PublishedRunErrorPreventsPreparedCandidateFromCommitting) {
+    AdmissionFixture fixture({{2, 1}});
+    SchedulerReadyClaim ready{};
+    ASSERT_TRUE(fixture.ready_pop(0, 0, &ready));
+    ASSERT_EQ(fixture.claim(0, ready), SchedulerAdmissionResult::PROGRESS);
+    ASSERT_TRUE(fixture.prepare(0));
+    scheduler_record_error(
+        fixture.run(), 0, SchedulerGraphResult::TIMEOUT, nullptr, fixture.locals[3],
+        SchedulerErrorSite::ORDERED_EXIT_TIMEOUT
+    );
+    EXPECT_EQ(fixture.commit(0), SchedulerAdmissionResult::ERROR);
+    EXPECT_EQ(fixture.admissions[0].pending_task_ref, 0);
+    EXPECT_EQ(fixture.task_control(0)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::PREPARED));
+    EXPECT_EQ(fixture.control()->commit_tail, 0u);
+    EXPECT_EQ(fixture.control()->commit_lock, 0u);
+    EXPECT_EQ(fixture.log()[0], SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(fixture.record(0)->order_key, UINT64_MAX);
+    EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::ORDERED_EXIT_TIMEOUT));
+}
+
 TEST(HbgAdmission, DuplicateTaskOwnershipIsRejectedAcrossWorkers) {
     AdmissionFixture fixture({{2, 1}});
     SchedulerReadyClaim ready{};

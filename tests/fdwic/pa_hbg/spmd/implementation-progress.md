@@ -1836,3 +1836,154 @@ N=1 公共契约仍待用户选择，本轮没有改动；已有性能回退也�
 适用 pre-commit 检查全部通过，日志 `outputs/spmd-ready-order-precommit-20261025.log`。
 本次阶段提交限定 ready-order 验收、必要的共用探针复用、实际暴露的场景句柄缓存修复、
 相关测试和中文过程记录，不包含生成产物或用户未跟踪文件，仅本地 commit，不 push。
+
+## 2026-10-25：隔离测量拓扑重复缓存失效的成本
+
+起点 `da8f676d7`。上一轮实现与提交已完成；提交后构建成功，binding build_commit 与 HEAD 一致，
+三个 HBG runtime 二进制 SHA256 与已验证 CSA 版本相同。本轮转向 11.41 倍耗时回退的归因，
+不把共享原子读或代码体积直接当作已证明根因。
+
+源码有两个不同候选：scheduler_admission_context_valid 在多层 helper 中重复原子读取
+共享 scheduler_error；scheduler_admission_expected_members 每次重建成员集合时遍历全部
+worker，对每个 context 的 core_type 和 worker_index 所在两条 line 分别 invalidate＋barrier。
+先只隔离后者，暂不改变任何错误检查、block 领取、准入或组协议。
+
+发布链核对：Host 初始化 worker_index，AICPU post_handshake_init 完成实际 core_type／拓扑，
+cache_flush_range＋wmb 后通过 hs_config_done 的 release/acquire 才允许各线程发布 READY。
+run_resident_scheduler 在 bootstrap 和第一次准入扫描前调用整段 scheduler_observe_data_cache；
+本轮运行没有 writer 再改上述 context 前缀。这与动态准入 record／member bitmap 不同，
+后者的发布和观察操作仍全部保留。
+
+候选仅在独立 detached worktree tmp/spmd-topology-cache-20261025 的
+scheduler_admission_expected_members 中删除两条重复 observe 调用，并注释既有获取边界。
+仍逐 worker 校验索引、类型、数量，逐任务校验完整 member bitmap，未新增运行期开关或本地缓存字段。
+主工作仓生产代码保持不变；基准固定当前 da8f676d7，而不是改用持续变化的 main。
+
+沿用 benchmark 工作流的独立 venv，Torch 2.12.0+cpu、NumPy 2.5.2、nanobind 2.15.0、
+scikit-build-core 1.1.1、CMake 4.4.4 与 PTO pin
+418de18dde8fa33773dc5c384fdfe5506463b628 保持一致。58 个冻结数据文件独立导入并校验，
+不生成新的 golden。第一次 fixture 导入已复制数据，但随后的身份检查因尚无 _task_interface
+而退出，导致其后的 build 没有启动；调整为先 build 再核验，未使用旧绑定。
+构建及 fixture 核验日志为 outputs/spmd-topology-cache-build-20261025.log、
+outputs/spmd-topology-cache-fixture-20261025.log。
+
+候选的 test_a5_hbg_admission 实际运行 100 项全部通过，包括错误拓扑和非连续 worker 映射；
+ctest 汇总的 1 个目标不冒称只有 1 项或新增 100 项。候选严格 CSA L4 验收继续执行。
+最初主仓观测 csa-hbg-bench-pf66hu81 的 Device 中位数为 24660.832 μs，
+Host 为 106717.269 μs；它处于环境准备阶段，保留但不纳入正式对照。
+正式 A/B/B/A 将在构建结束后于同一设备 0 顺序执行，每批三轮正确性、五轮预热和一百轮测量；
+完整泳道关闭，Device 仍为含初始化／退出的 AICPU RunWall，不当作纯 kernel 时间。
+本机没有 npu-smi／task-submit，CANN query 确认 A5 32C/64V，按用户要求直接用卡，
+不宣称设备独占隔离，也不在测量期间查询设备或并行编译。
+
+候选构建完成后，严格 CSA L4 已通过：两轮各七项 golden、2308 条入口身份、133 条依赖、
+46733 个协议事件和原有 timing guard 均通过，producer=aicore。Host 的 107 条采集完整，
+无丢失记录。候选结果已按字节一致归档到
+outputs/spmd-topology-cache-worktree-evidence-20261025/csa-hbg-l4-37scv3ro。
+编译参数另核对 Host 49 项、AICPU 32 项以及 AICore 的实际 CCEC 命令：
+归一化工作树／venv 根路径后相同；Ninja depfile 哈希差异不当作编译参数差异。
+记录见 outputs/spmd-topology-cache-compile-comparison-20261025.log。
+
+正式同卡 A/B/B/A 全部结束，每批三轮正确性、五轮预热和一百轮测量；
+A 为原样 da8f676d7，B 仅删除上述两条 observe。
+复用 CSA 的 analyze_perf.summarize 重新解析每份 bench.log，与 result.json 完全一致；
+冻结输入 manifest、原构图摘要、Torch 和代码提交一致，同一实验臂的源码／二进制身份不变。
+
+| 批次 | Host 中位数（μs） | Device 中位数（μs） | 结果目录后缀 |
+| ---- | ----------------- | ------------------- | ------------ |
+| A1 | 102094.267 | 24617.169 | csa-hbg-bench-ok9v4d1f |
+| B1 | 123086.929 | 24539.536 | csa-hbg-bench-v29doil1 |
+| B2 | 101738.210 | 24611.080 | csa-hbg-bench-rq56g0mr |
+| A2 | 100980.506 | 24527.915 | csa-hbg-bench-kpzlnx1_ |
+
+两臂各合并 200 个测量样本：Device 中位数 A=24564.380 μs、B=24565.080 μs，
+变化 +0.00285%；P10/P90 分别为 23976.630/26143.776 和 24150.215/25270.439 μs。
+Host 中位数 A=101571.050 μs、B=102797.530 μs，变化 +1.208%；
+B1 的 Host 明显较慢，不能用 Device 相近宣称 Host 同样稳定。
+没有观测到可重复性能收益，不把静态调用次数当作耗时归因，候选不合入生产。
+两个 B 结果与 L4 目录均经 diff -qr 逐文件核对后归档到上述 worktree-evidence 目录，
+候选源码另存该目录的 scheduler_admission.h；完整对照与样本见
+outputs/spmd-topology-cache-comparison-20261025.json。A 结果仍在主仓 outputs 中。
+
+## 2026-10-25：隔离 admission 错误状态共享原子读
+
+上一轮完成度答复只核对状态，没有推进实现。本轮先复核并归档上述负结果，
+再继续定位性能，不改变未确认的 N=1 语义。
+
+scheduler_admission_context_valid 在 prepare、commit、刷新本核义务、领取、关闭、
+GM close/retire/observe/arrive/prepare_lane 等路径内读取同一个 scheduler_error，
+且读取使用 fetch_add(0)。外层循环已有低频 query，不能因此推断这些嵌套关键读没有成本。
+源码调用关系只是候选证据，还没有证明它导致 11.41 倍回退。
+
+复用独立 detached worktree，先恢复拓扑的两条 observe，再仅把 context_valid 的
+scheduler_error 读取从 fetch_add(0) 改为既有 scheduler_gm_query。
+这是诊断性替换，不是等价生产修复：ld_dev 对原子写可暂时看到旧值，
+即使正常 CSA 的 golden／协议通过，也不能证明错误后停止新 kernel 的契约。
+其他原子读取、错误 writer、退出尾部的关键错误读取均不改动；不添加环境开关，
+不在主仓弱化错误检查。本实验只判断共享 RMW 读取的性能影响，不能据此合入该替换。
+
+上板 gate 因缺少 npu-smi 无法识别；CANN query 实际确认 device 0 为
+Ascend950PR_958b、32C/64V，按用户已明确要求直接用卡，无 task-submit 锁隔离。
+构建采用独立 venv 的 Torch 2.12 与既有 PTO pin，日志
+outputs/spmd-error-query-build-20261025.log；构建完成前不启动测量或修改其源码。
+
+构建完成后诊断版严格 L4 通过，结果位于临时工作树
+outputs/csa-hbg-l4-98xcvvfl/result.json：两轮各七项 golden、2308 条执行身份、
+133 条依赖、完整原生协议及原有 timing guard 均通过，producer=aicore。
+该运行只证明没有触发错误的 CSA 路径，不证明 query 能替代错误状态的关键原子读。
+同卡 A/B/B/A 使用新的四个批次，构建和 C++ 检查全部结束后才开始；
+不把上一项实验的 A 样本混入本次正式对照。
+
+为后续优化保留实际错误行为门禁，复用现有 AdmissionFixture／GmMixFixture 新增六项 C++ 回归：
+先通过生产 scheduler_record_error 从另一个 worker 发布错误，再验证
+ready 所有权不转移、已准备准入不提交、Mix 不继续领取／发布、已准备的 active lane
+不能取得 kernel permit、已释放组不增加成功完成计数、局部完成的 sync_start 不补成功 seal。
+四项 Mix 检查分别遍历 mask 3/5/6/7；不把循环里的形状数冒称为独立 GTest 用例数。
+现有错误首现场和候选／组身份保持不变；没有修改生产代码或增加测试开关。
+
+原样生产实现下两个目标共 184 项通过（admission 102、GM Mix 82），
+日志 outputs/spmd-error-stop-cpp-20261025.log。
+另在 tmp/spmd-error-stop-mutation 中复制调度头文件，仅删除 context_valid 的错误检查，
+使用实际 CMake 编译／链接参数编译独立测试二进制；六项新增回归全部失败，
+JUnit 分别核对 2/2 和 4/4 失败，日志 outputs/spmd-error-stop-mutation-20261025.log。
+这是检查测试敏感性的故障变体，不是对生产行为的 RED 声明；主仓源码和二进制没有被替换。
+CPU 的 query 与 fetch_add 都是宿主原子操作，这组测试不能区分它们在 A5 上的可见性，
+因此不会把诊断替换通过这些测试当作生产可合入的依据。
+
+四批正式测量均完成并通过三轮七项 golden；现有 CSA 解析器重算 bench.log 与 result.json
+全部一致。完整泳道关闭，同卡顺序执行期间没有并行编译或设备查询。
+
+| 批次 | Host 中位数（μs） | Device 中位数（μs） | 结果目录后缀 |
+| ---- | ----------------- | ------------------- | ------------ |
+| A1 | 103052.185 | 24824.301 | csa-hbg-bench-dqcpfgq9 |
+| B1 | 90570.544 | 11672.296 | csa-hbg-bench-6sv78jz7 |
+| B2 | 97394.226 | 11637.792 | csa-hbg-bench-6pxr85zc |
+| A2 | 112716.177 | 24610.656 | csa-hbg-bench-smi3zsyj |
+
+每臂 200 个样本合并，Device 中位数为 A=24762.414 μs、B=11667.579 μs，
+变化 −52.882%，差值 13094.835 μs；P10/P90 分别为
+24186.687/25722.204 与 11233.502/12333.263 μs。
+Host 中位数 A=107625.305 μs、B=92743.799 μs，变化 −13.827%；
+Host 两批各自存在漂移，单独报告，不能与 Device 合成一个收益分数。
+
+结论是该共享 RMW 读取路径对当前 CSA 耗时有显著影响，
+不是说已经完成了可合入的 52.882% 优化，也不是说全部回退都由它造成。
+这项差分仍包含改指令后带来的竞争与调度交错变化，不能把 13.095 ms
+直接除以调用数当作单次 atomic 延迟。诊断版约 11.668 ms 仍明显慢于设计 AICPU 基线。
+后续生产改造必须保留错误后的 kernel entry、准入提交、完成计数和 Mix seal 门禁，
+优先区分只观察／无进展轮询与真正控制转移，不能直接推广本实验的一行 query 替换。
+
+两个 B 结果和 L4 已逐文件核对后归档到
+outputs/spmd-error-query-worktree-evidence-20261025，含诊断源码；
+汇总与全部样本位于 outputs/spmd-error-query-comparison-20261025.json。
+源码提交、PTO pin、Torch、冻结输入／构图在四组一致，同一臂的源码及二进制身份一致。
+主仓生产 runtime 无改动，本次阶段提交只收录六项错误回归、结果和调查索引。
+
+最终两个 C++ 目标复验通过，共 184 项；适用 pre-commit 检查通过，日志
+outputs/spmd-error-stop-cpp-final-20261025.log、outputs/spmd-error-query-precommit-r2-20261025.log。
+首次检查发现新表格分隔线未对齐、调查索引不符合既有英文索引规范；
+已修正分隔线，并让索引仅按原格式链接本中文过程文档，没有拆出第二份过程报告或绕过钩子。
+诊断版三个 runtime 二进制已另存归档 runtime 子目录，SHA256 与捕获身份一致；
+旧拓扑候选的 100 项 GTest 原始日志也已保存。
+确认相关运行全部结束后删除本次独立临时工作树，原始证据仍可在主仓 outputs 归档中恢复，
+不保留可误用的 query 诊断版工作仓。主仓用户未跟踪文件均保持原样，阶段提交不 push。

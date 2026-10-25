@@ -260,6 +260,102 @@ struct GmMixFixture {
 
 class HbgGmMixSyncStart : public ::testing::TestWithParam<uint8_t> {};
 
+TEST(HbgGmMix, PublishedRunErrorRejectsNewClaimAndDescriptorPublication) {
+    for (uint8_t mask : {3, 5, 6, 7}) {
+        SCOPED_TRACE(mask);
+        GmMixFixture fixture({{2, mask}});
+        ASSERT_TRUE(fixture.admit(0));
+        ASSERT_TRUE(fixture.refresh_all());
+        ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+        scheduler_record_error(
+            fixture.run(), 0, SchedulerGraphResult::TIMEOUT, nullptr, fixture.locals[4],
+            SchedulerErrorSite::ORDERED_EXIT_TIMEOUT
+        );
+        EXPECT_EQ(fixture.claim(1), SchedulerBlockClaimResult::ERROR);
+        EXPECT_FALSE(fixture.publish(0));
+        EXPECT_EQ(fixture.control(0)->next_block, 1u);
+        EXPECT_EQ(fixture.mailbox(0)->published_seq, 0u);
+        EXPECT_EQ(fixture.admissions[0].gm_mix.phase, SchedulerGmMixPhase::CLAIMED);
+        EXPECT_EQ(fixture.admissions[3].gm_mix.phase, SchedulerGmMixPhase::IDLE);
+    }
+}
+
+TEST(HbgGmMix, PublishedRunErrorRejectsAlreadyPreparedKernelEntryOnEveryActiveLane) {
+    for (uint8_t mask : {3, 5, 6, 7}) {
+        SCOPED_TRACE(mask);
+        GmMixFixture fixture({{2, mask}});
+        ASSERT_TRUE(fixture.admit(0));
+        ASSERT_TRUE(fixture.refresh_all());
+        ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+        ASSERT_TRUE(fixture.publish(0));
+        ASSERT_TRUE(fixture.rendezvous(0));
+        scheduler_record_error(
+            fixture.run(), 0, SchedulerGraphResult::TIMEOUT, nullptr, fixture.locals[4],
+            SchedulerErrorSite::ORDERED_EXIT_TIMEOUT
+        );
+        for (uint32_t lane = 0; lane < 3; ++lane) {
+            if ((mask & (1U << lane)) == 0) continue;
+            auto *local = fixture.locals[lane];
+            const auto slot = fixture.admissions[lane].gm_mix.slot_index;
+            ASSERT_EQ(local->slots[slot].state, SchedulerDispatchSlotState::READY);
+            bool permit = true;
+            EXPECT_FALSE(scheduler_ordered_can_enter_slot(
+                fixture.graph.graph(), fixture.base(), local, fixture.run(), slot, &permit
+            ));
+            EXPECT_FALSE(permit);
+            EXPECT_EQ(local->slots[slot].state, SchedulerDispatchSlotState::READY);
+        }
+        EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
+        EXPECT_EQ(fixture.run()->resolved_task_count, 0u);
+    }
+}
+
+TEST(HbgGmMix, PublishedRunErrorDoesNotTurnReleasedLanesIntoSuccessfulBlockCompletion) {
+    for (uint8_t mask : {3, 5, 6, 7}) {
+        SCOPED_TRACE(mask);
+        GmMixFixture fixture({{2, mask}});
+        ASSERT_TRUE(fixture.admit(0));
+        ASSERT_TRUE(fixture.refresh_all());
+        ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+        ASSERT_TRUE(fixture.publish(0));
+        ASSERT_TRUE(fixture.rendezvous(0));
+        ASSERT_TRUE(fixture.finish_lanes(0));
+        scheduler_record_error(
+            fixture.run(), 0, SchedulerGraphResult::TIMEOUT, nullptr, fixture.locals[4],
+            SchedulerErrorSite::ORDERED_EXIT_TIMEOUT
+        );
+        EXPECT_EQ(fixture.retire(0), SchedulerGmMixResult::ERROR);
+        EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
+        EXPECT_EQ(fixture.run()->resolved_task_count, 0u);
+        EXPECT_EQ(fixture.seal(0, 0), 0u);
+    }
+}
+
+TEST(HbgGmMix, PublishedRunErrorDoesNotSealALocallyCompletedSyncTask) {
+    for (uint8_t mask : {3, 5, 6, 7}) {
+        SCOPED_TRACE(mask);
+        GmMixFixture fixture({{2, mask, true}});
+        ASSERT_TRUE(fixture.admit(0));
+        ASSERT_TRUE(fixture.refresh_all());
+        ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+        ASSERT_TRUE(fixture.publish(0));
+        ASSERT_TRUE(fixture.rendezvous(0));
+        ASSERT_TRUE(fixture.finish_lanes(0));
+        ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::PROGRESS);
+        scheduler_record_error(
+            fixture.run(), 0, SchedulerGraphResult::TIMEOUT, nullptr, fixture.locals[4],
+            SchedulerErrorSite::ORDERED_EXIT_TIMEOUT
+        );
+        bool closed = true;
+        EXPECT_FALSE(fixture.close(0, &closed));
+        EXPECT_FALSE(closed);
+        EXPECT_EQ(fixture.seal(0, 0), 0u);
+        EXPECT_EQ(fixture.admissions[0].current_task_ref, 0);
+        EXPECT_EQ(fixture.admissions[0].scan_cursor, 0u);
+        EXPECT_EQ(fixture.control(0)->completed_blocks, 1u);
+    }
+}
+
 TEST_P(HbgGmMixSyncStart, LocalSealAndNextTaskDoNotWaitForRemoteClusterClaim) {
     const uint8_t mask = GetParam();
     GmMixFixture fixture({{2, mask, true}, {2, mask, true}});
