@@ -47,9 +47,11 @@ reviewed delivery. Small changes can use the focused skills directly.
 ## GitHub work by role
 
 Use [maintainer](.claude/skills/maintainer/SKILL.md) to maintain a selected repository,
-Issue, track or personal work scope. Developers and committers can use it too;
-scope does not grant extra authority. It discovers changes and routes to the
-focused workflows below. Recurring wakeups require separately configured scheduling.
+Issue, track or personal work scope, optionally filtering PR target branches.
+It keeps an on-demand action table and brings concrete decisions to the user.
+Developers and committers can use it too; scope does not grant extra authority.
+It routes to the focused workflows below. Ongoing monitoring requires a verified
+wake mechanism; a requested single inspection does not start one.
 
 - Maintainer: [process-issue](.claude/skills/process-issue/SKILL.md) for Issue
   triage, ownership and closure; [process-pr](.claude/skills/process-pr/SKILL.md)
