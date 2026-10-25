@@ -14,10 +14,10 @@ DEVICE-controlled updates to caller-owned storage.
 | `main.py` | Same-stream producers → Worker → successor; retained caller frames, observable callback error and close ordering |
 | `cross_stream.py` | Separate producer and consumer streams, caller A → B → A on one Worker, explicit framework event dependencies |
 | `alias_inout.py` | One Buffer backing full and partially overlapping strided views, INPUT plus INOUT, repeated updates and unchanged guards |
+| `scope_statistics.py` | Per-call ScopeStats selection with two nested task scopes; TMR records and allocation frontiers, HBG metadata only |
 | `failure_recovery.py` | A Python callback fails after submit acceptance; later requests complete and init-thread Worker close retires all accepted runs |
 | `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
 | `persistent_state.py` | Twelve DEVICE-controlled weighted cache updates, unchanged guards and weights, zero acceptance and revisited rows |
-| `scope_statistics.py` | Per-call ScopeStats selection with two nested task scopes; TMR records and allocation frontiers, HBG metadata only |
 
 Public `Worker.close()` drains accepted direct-chip runs through their normal
 RunHandle completion and retirement path before checking workspace ownership.
@@ -122,6 +122,19 @@ final consumer boundary is explicitly drained; native backpressure may wait.
 The assertions check actual submission handles and golden values, not overlap
 or a deterministic numerical failure for every omitted dependency edge.
 
+`scope_statistics.py` queues four calls with ScopeStats off/on/on/off. Each call
+submits two vector-add tasks in nested scopes; the final Torch successor checks
+10, 16, 22 and 28. After each accepted submit, the callback changes the caller
+config and output prefix. Only the two enabled calls may export records to their
+original prefixes.
+
+TMR checks six ordered root/outer/inner boundaries, distinct run epochs, and
+cumulative task/heap allocation frontiers. HBG exports metadata only because
+it has no device scope producer. These checks establish diagnostic attribution;
+they do not measure live allocations, overlap or performance. Retirement and
+export occur after the final framework completion boundary. Unknown outcomes
+retain the caller and runtime owners.
+
 `alias_inout.py` uses one Torch allocation wrapped by one Buffer. Its distinct
 64 × 64 Tensor views have row stride 96 and nonzero byte offsets. Each mode
 performs successive INPUT + INOUT updates on that same backing: either full
@@ -170,18 +183,3 @@ strides or cross-tile overlap, A5 and capture remain separate qualification.
 
 This is a reference consumer of the existing eager contract, not acceptance of
 PyPTO production dispatch, vLLM/model numerics, A5 or capture/replay.
-
-## Per-call ScopeStats
-
-`scope_statistics.py` queues four calls with ScopeStats off/on/on/off. Each call
-submits two vector-add tasks in nested scopes; the final Torch successor checks
-10, 16, 22 and 28. After each accepted submit, the callback changes the caller
-config and output prefix. Only the two enabled calls may export records to their
-original prefixes.
-
-TMR checks six ordered root/outer/inner boundaries, distinct run epochs, and
-cumulative task/heap allocation frontiers. HBG exports metadata only because
-it has no device scope producer. These checks establish diagnostic attribution;
-they do not measure live allocations, overlap or performance. Retirement and
-export occur after the final framework completion boundary. Unknown outcomes
-retain the caller and runtime owners.

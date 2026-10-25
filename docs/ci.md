@@ -319,6 +319,11 @@ this compatibility. Setup prints Python, host architecture, CANN manifest,
 distribution versions and module locations; backend imports happen inside the
 exclusive device task with automatic backend loading disabled beforehand.
 
+The ScopeStats consumer adds four queued calls with off/on/on/off selection
+and independent output prefixes. TMR checks nested scope records and allocation
+frontiers; HBG checks metadata only. Those cases enter the same collection plan
+without a workflow case list.
+
 One `task-submit` allocation of one device runs the selected consumers serially
 for TMR/HBG × `TASK_QUEUE_ENABLE=0/1`. Same-stream and cross-stream consumers
 perform three calls; the alias consumer performs three updates for each of
@@ -333,11 +338,7 @@ perform twelve DEVICE cursor/count-controlled weighted updates to one cache,
 including zero acceptance and revisited rows. Framework snapshots check the
 entire backing against an independent multi-step reference, guards and unchanged
 weights. No host control readback decides later kernel work. A session-scoped fixture
-compiles the shared host bridge once. The ScopeStats consumer adds four
-queued calls with off/on/on/off selection and independent output prefixes.
-TMR checks nested scope records and allocation frontiers; HBG checks metadata
-only. Those cases enter the same collection plan without a workflow case list.
-The client wait is bounded at 15 minutes,
+compiles the shared host bridge once. The client wait is bounded at 15 minutes,
 including queueing; the execution watchdog is also 15 minutes. Individual
 subprocess timeouts do not reserve additional aggregate execution time.
 The final pytest collection freezes a nonempty source/environment/nodeid plan
