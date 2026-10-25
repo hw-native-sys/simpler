@@ -807,8 +807,25 @@ struct alignas(16) SchedulerTaskMetadata {
     uint8_t active_mask;
     uint8_t flags;
     uint32_t trace_index_base;
-    int32_t timing_slot;
+    int16_t timing_slot;
+    uint16_t logical_block_num;
 };
+
+inline __aicore__ bool
+scheduler_subtask_count_checked(uint64_t logical_block_num, uint32_t active_subtasks, uint32_t *out) {
+    if (out == nullptr || logical_block_num == 0 || active_subtasks == 0 || active_subtasks > 3 ||
+        logical_block_num > static_cast<uint64_t>(INT16_MAX) / active_subtasks)
+        return false;
+    *out = static_cast<uint32_t>(logical_block_num * active_subtasks);
+    return true;
+}
+
+inline __aicore__ bool scheduler_trace_count_checked(uint64_t prefix, uint64_t added, uint64_t *out) {
+    constexpr uint64_t capacity = static_cast<uint64_t>(UINT32_MAX) + 1;
+    if (out == nullptr || added == 0 || prefix > UINT32_MAX || added > capacity - prefix) return false;
+    *out = prefix + added;
+    return true;
+}
 
 inline __aicore__ uint32_t scheduler_task_trace_index(uint32_t trace_index_base, uint8_t active_mask, uint8_t subtask) {
     return trace_index_base + static_cast<uint32_t>(__builtin_popcount(active_mask & ((1U << subtask) - 1)));
@@ -835,6 +852,19 @@ inline __aicore__ bool scheduler_task_has_predicate(uint8_t flags) {
     return (flags & SCHEDULER_TASK_HAS_PREDICATE) != 0;
 }
 
+inline __aicore__ bool scheduler_task_requires_admission(const SchedulerTaskMetadata &metadata) {
+    return scheduler_task_is_executable(metadata.flags) && !scheduler_task_is_inline(metadata.flags) &&
+           (metadata.logical_block_num > 1 || scheduler_task_is_mix(metadata.flags) ||
+            scheduler_task_requires_sync_start(metadata.flags));
+}
+
+enum class SchedulerAdmissionState : uint64_t {
+    UNCLAIMED = 0,
+    CLAIMED = 1,
+    PREPARED = 2,
+    ADMITTED = 3,
+};
+
 struct alignas(128) SchedulerTaskControl {
     // Cross-core state publication, the wake-list RMWs, and the chain link share
     // the first line. Every field here is reached only through the atomic
@@ -850,7 +880,10 @@ struct alignas(128) SchedulerTaskControl {
     // them: a resolver detaches a whole wake list before routing its waiters,
     // and a batch is spliced into an inbox without rewriting its links.
     volatile int64_t next_waiter;
-    uint8_t atomic_line_padding[40];
+    volatile uint64_t next_block;
+    volatile uint64_t completed_blocks;
+    volatile uint64_t admission_state;
+    uint8_t atomic_line_padding[16];
 
     int32_t next_fanin_index;
     int32_t waiting_producer;
@@ -859,6 +892,56 @@ struct alignas(128) SchedulerTaskControl {
     uint64_t scheduler_worker_id;
     uint64_t completion_resolve_loop_iter;
     uint8_t scheduler_line_padding[24];
+};
+
+// Each record's bitmap follows its header within an independently aligned
+// stride. Preparation owns that whole range; published records are immutable.
+struct alignas(64) SchedulerAdmissionRecord {
+    uint64_t run_epoch;
+    int64_t task_ref;
+    uint64_t order_key;
+    uint64_t member_words_offset;
+    uint64_t mix_close_seals_offset;
+    uint32_t logical_block_num;
+    uint32_t member_count;
+    uint8_t active_mask;
+    uint8_t flags;
+    uint8_t reserved[14];
+};
+
+struct alignas(128) SchedulerAdmissionControl {
+    volatile uint64_t commit_lock;
+    uint8_t lock_padding[120];
+    alignas(128) volatile uint64_t commit_tail;
+    uint8_t tail_padding[120];
+};
+
+struct alignas(128) SchedulerGroupDescriptor {
+    uint64_t run_epoch;
+    int64_t task_ref;
+    uint64_t order_key;
+    uint64_t group_seq;
+    uint32_t block_idx;
+    uint32_t logical_block_num;
+    uint32_t cluster_index;
+    uint8_t active_mask;
+    uint8_t resource_mask;
+    uint8_t lane_subtasks[3];
+    uint8_t flags;
+    uint8_t reserved[78];
+};
+
+struct alignas(128) SchedulerGroupLaneAck {
+    volatile uint64_t arrived_seq;
+    volatile uint64_t released_seq;
+    uint8_t reserved[112];
+};
+
+struct alignas(128) SchedulerGroupMailbox {
+    SchedulerGroupDescriptor descriptor;
+    volatile uint64_t published_seq;
+    uint8_t publication_padding[120];
+    SchedulerGroupLaneAck lanes[3];
 };
 
 // A FIFO ready queue, addressed by both endpoints packed into one word.
@@ -884,7 +967,18 @@ struct alignas(128) SchedulerReadyInbox {
 // occupies its own cache line away from the state Schedulers mutate.
 struct alignas(128) SchedulerGraphSummary {
     uint64_t mix_task_count;
-    uint8_t cache_line_padding[120];
+    uint64_t cooperative_task_count;
+    uint64_t worker_count;
+    uint64_t cluster_count;
+    uint64_t admission_member_word_count;
+    uint64_t admission_records_offset;
+    uint64_t admission_record_stride;
+    uint64_t admission_log_offset;
+    uint64_t admission_control_offset;
+    uint64_t group_mailboxes_offset;
+    uint64_t mix_close_seals_offset;
+    uint64_t run_epoch;
+    uint8_t cache_line_padding[32];
 };
 
 struct alignas(64) SchedulerReadyDirectoryShard {
@@ -1174,8 +1268,22 @@ struct alignas(128) SchedulerTaskTrace {
 
 static_assert(sizeof(SchedulerTaskMetadata) == 16, "task metadata layout changed");
 static_assert(alignof(SchedulerTaskMetadata) == 16, "task metadata alignment changed");
+static_assert(offsetof(SchedulerTaskMetadata, timing_slot) == 12, "timing tag offset changed");
+static_assert(offsetof(SchedulerTaskMetadata, logical_block_num) == 14, "block count must occupy the metadata tail");
 static_assert(sizeof(SchedulerTaskControl) == 128, "task control layout changed");
 static_assert(alignof(SchedulerTaskControl) == 128, "task control alignment changed");
+static_assert(offsetof(SchedulerTaskControl, next_block) == 24, "block cursor must use the atomic line");
+static_assert(offsetof(SchedulerTaskControl, completed_blocks) == 32, "completion counter must use the atomic line");
+static_assert(offsetof(SchedulerTaskControl, admission_state) == 40, "admission state must use the atomic line");
+static_assert(sizeof(SchedulerAdmissionRecord) == 64, "admission header must occupy one cache line");
+static_assert(sizeof(SchedulerAdmissionControl) == 256, "admission control layout changed");
+static_assert(alignof(SchedulerAdmissionControl) == 128, "admission control requires isolated atomic regions");
+static_assert(offsetof(SchedulerAdmissionControl, commit_tail) == 128, "tail must not share the lock's atomic region");
+static_assert(sizeof(SchedulerGroupDescriptor) == 128, "group descriptor layout changed");
+static_assert(sizeof(SchedulerGroupLaneAck) == 128, "lane acknowledgements require separate atomic regions");
+static_assert(sizeof(SchedulerGroupMailbox) == 640, "group mailbox layout changed");
+static_assert(offsetof(SchedulerGroupMailbox, published_seq) == 128, "descriptor and publication must be separate");
+static_assert(offsetof(SchedulerGroupMailbox, lanes) == 256, "each lane must own its acknowledgement region");
 // Both chain links share the atomic line. A link has several producers, so it is
 // written as a single device word; keeping it off the line-published half is what
 // stops one producer's writeback from restoring its stale copy of the link.
@@ -1267,6 +1375,20 @@ static_assert(
 );
 static_assert(std::is_standard_layout_v<SchedulerTaskMetadata> && std::is_trivially_copyable_v<SchedulerTaskMetadata>);
 static_assert(std::is_standard_layout_v<SchedulerTaskControl> && std::is_trivially_copyable_v<SchedulerTaskControl>);
+static_assert(
+    std::is_standard_layout_v<SchedulerSpmdRequirements> && std::is_trivially_copyable_v<SchedulerSpmdRequirements>
+);
+static_assert(
+    std::is_standard_layout_v<SchedulerAdmissionRecord> && std::is_trivially_copyable_v<SchedulerAdmissionRecord>
+);
+static_assert(
+    std::is_standard_layout_v<SchedulerAdmissionControl> && std::is_trivially_copyable_v<SchedulerAdmissionControl>
+);
+static_assert(
+    std::is_standard_layout_v<SchedulerGroupDescriptor> && std::is_trivially_copyable_v<SchedulerGroupDescriptor>
+);
+static_assert(std::is_standard_layout_v<SchedulerGroupLaneAck> && std::is_trivially_copyable_v<SchedulerGroupLaneAck>);
+static_assert(std::is_standard_layout_v<SchedulerGroupMailbox> && std::is_trivially_copyable_v<SchedulerGroupMailbox>);
 static_assert(std::is_standard_layout_v<SchedulerReadyInbox> && std::is_trivially_copyable_v<SchedulerReadyInbox>);
 static_assert(std::is_standard_layout_v<SchedulerGraphSummary> && std::is_trivially_copyable_v<SchedulerGraphSummary>);
 static_assert(
@@ -1312,19 +1434,58 @@ inline bool scheduler_layout_reserve(uint64_t *cursor, uint64_t size, uint64_t a
     return true;
 }
 
+inline bool scheduler_spmd_requirements_valid(const SchedulerSpmdRequirements &spmd, uint64_t task_count) {
+    if (spmd.cooperative_task_count > task_count || spmd.mix_task_count > spmd.cooperative_task_count) return false;
+    if (spmd.worker_count == 0)
+        return spmd.cluster_count == 0 && spmd.cooperative_task_count == 0 && spmd.mix_task_count == 0;
+    return spmd.worker_count <= SCHEDULER_WORKER_CAPACITY && spmd.worker_count % PLATFORM_CORES_PER_BLOCKDIM == 0 &&
+           spmd.cluster_count == spmd.worker_count / PLATFORM_CORES_PER_BLOCKDIM;
+}
+
+inline bool scheduler_plan_spmd_storage(uint64_t *cursor, AicoreSchedulerLayout *layout) {
+    if (cursor == nullptr || layout == nullptr) return false;
+    if (layout->spmd.cooperative_task_count == 0) return true;
+    layout->admission_member_word_count = (layout->spmd.worker_count + 63) / 64;
+    uint64_t bytes = 0;
+    uint64_t record_bytes = 0;
+    if (!scheduler_layout_checked_mul(layout->admission_member_word_count, sizeof(uint64_t), &bytes) ||
+        !scheduler_layout_checked_add(sizeof(SchedulerAdmissionRecord), bytes, &record_bytes) ||
+        !scheduler_layout_checked_align(record_bytes, SCHEDULER_STATE_ALIGNMENT, &layout->admission_record_stride) ||
+        !scheduler_layout_reserve(
+            cursor, sizeof(SchedulerAdmissionControl), alignof(SchedulerAdmissionControl),
+            &layout->admission_control_offset
+        ) ||
+        !scheduler_layout_checked_mul(layout->task_count, layout->admission_record_stride, &bytes) ||
+        !scheduler_layout_reserve(cursor, bytes, SCHEDULER_STATE_ALIGNMENT, &layout->admission_records_offset) ||
+        !scheduler_layout_checked_mul(layout->spmd.cooperative_task_count, sizeof(int64_t), &bytes) ||
+        !scheduler_layout_reserve(cursor, bytes, SCHEDULER_STATE_ALIGNMENT, &layout->admission_log_offset))
+        return false;
+    if (layout->spmd.mix_task_count == 0) return true;
+    if (!scheduler_layout_checked_mul(layout->spmd.cluster_count, sizeof(SchedulerGroupMailbox), &bytes) ||
+        !scheduler_layout_reserve(cursor, bytes, alignof(SchedulerGroupMailbox), &layout->group_mailboxes_offset) ||
+        !scheduler_layout_checked_mul(
+            layout->spmd.mix_task_count, layout->spmd.cluster_count, &layout->mix_close_seal_count
+        ) ||
+        !scheduler_layout_checked_mul(layout->mix_close_seal_count, sizeof(uint64_t), &bytes) ||
+        !scheduler_layout_reserve(cursor, bytes, SCHEDULER_STATE_ALIGNMENT, &layout->mix_close_seals_offset))
+        return false;
+    return true;
+}
+
 inline bool scheduler_plan_layout(
     uint64_t task_count, uint64_t aic_task_count, uint64_t aiv_task_count, AicoreSchedulerLayout *layout,
-    bool enable_activity_profiling = false, uint64_t trace_count = 0
+    bool enable_activity_profiling = false, uint64_t trace_count = 0, const SchedulerSpmdRequirements &spmd = {}
 ) {
     // A ready inbox holds its endpoints as int32 task refs, so a graph whose
     // refs would not fit that encoding cannot be scheduled at all.
     if (layout == nullptr || aic_task_count > task_count || aiv_task_count > task_count ||
-        task_count > static_cast<uint64_t>(INT32_MAX))
+        task_count > static_cast<uint64_t>(INT32_MAX) || !scheduler_spmd_requirements_valid(spmd, task_count))
         return false;
     AicoreSchedulerLayout next{};
     next.task_count = task_count;
     next.aic_task_count = aic_task_count;
     next.aiv_task_count = aiv_task_count;
+    next.spmd = spmd;
     uint64_t cursor = 0;
     uint64_t bytes = 0;
 #define SCHEDULER_RESERVE_ARRAY(count, type, field)                 \
@@ -1354,6 +1515,7 @@ inline bool scheduler_plan_layout(
         !SCHEDULER_RESERVE_ARRAY(trace_count == 0 ? task_count : trace_count, SchedulerTaskTrace, trace_cells_offset) ||
         (enable_activity_profiling &&
          !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerActivityBuffer, activity_buffers_offset)) ||
+        !scheduler_plan_spmd_storage(&cursor, &next) ||
         !scheduler_layout_checked_align(cursor, SCHEDULER_STATE_ALIGNMENT, &next.total_size)) {
 #undef SCHEDULER_RESERVE_ARRAY
         return false;
@@ -1403,6 +1565,90 @@ scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout,
     };
     initialize_payloads(layout.dispatch_payloads_offset, SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT);
     initialize_payloads(layout.mix_payloads_offset, SCHEDULER_MIX_SLOT_CAPACITY);
+    auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, layout.graph_summary_offset);
+    summary->mix_task_count = layout.spmd.mix_task_count;
+    summary->cooperative_task_count = layout.spmd.cooperative_task_count;
+    summary->worker_count = layout.spmd.worker_count;
+    summary->cluster_count = layout.spmd.cluster_count;
+    summary->admission_member_word_count = layout.admission_member_word_count;
+    summary->admission_records_offset = layout.admission_records_offset;
+    summary->admission_record_stride = layout.admission_record_stride;
+    summary->admission_log_offset = layout.admission_log_offset;
+    summary->admission_control_offset = layout.admission_control_offset;
+    summary->group_mailboxes_offset = layout.group_mailboxes_offset;
+    summary->mix_close_seals_offset = layout.mix_close_seals_offset;
+    if (layout.spmd.cooperative_task_count != 0) {
+        for (uint64_t task = 0; task < layout.task_count; ++task) {
+            const uint64_t offset = layout.admission_records_offset + task * layout.admission_record_stride;
+            auto *record = scheduler_state_at<SchedulerAdmissionRecord>(base, offset);
+            record->task_ref = SCHEDULER_TASK_REF_INVALID;
+            record->order_key = UINT64_MAX;
+            record->member_words_offset = offset + sizeof(SchedulerAdmissionRecord);
+        }
+        // Log elements and packed close seals are atomic-only device words;
+        // adjacent publishers must never write back a cached whole line.
+        auto *log = scheduler_state_at<int64_t>(base, layout.admission_log_offset);
+        for (uint64_t index = 0; index < layout.spmd.cooperative_task_count; ++index)
+            log[index] = SCHEDULER_TASK_REF_INVALID;
+    }
+    if (layout.spmd.mix_task_count != 0) {
+        auto *mailboxes = scheduler_state_at<SchedulerGroupMailbox>(base, layout.group_mailboxes_offset);
+        for (uint64_t cluster = 0; cluster < layout.spmd.cluster_count; ++cluster) {
+            auto &descriptor = mailboxes[cluster].descriptor;
+            descriptor.task_ref = SCHEDULER_TASK_REF_INVALID;
+            descriptor.order_key = UINT64_MAX;
+            descriptor.block_idx = UINT32_MAX;
+            descriptor.cluster_index = UINT32_MAX;
+            for (uint8_t &subtask : descriptor.lane_subtasks)
+                subtask = UINT8_MAX;
+        }
+    }
+    return true;
+}
+
+inline bool scheduler_init_spmd_task_records(void *base, const AicoreSchedulerLayout &layout, uint64_t run_epoch) {
+    if (base == nullptr || (reinterpret_cast<uintptr_t>(base) & (SCHEDULER_STATE_ALIGNMENT - 1)) != 0) return false;
+    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(base, layout.task_metadata_offset);
+    uint64_t cooperative_count = 0;
+    uint64_t mix_count = 0;
+    for (uint64_t task = 0; task < layout.task_count; ++task) {
+        const auto &meta = metadata[task];
+        if (!scheduler_task_is_executable(meta.flags) || scheduler_task_is_inline(meta.flags)) continue;
+        const uint32_t active_subtasks = static_cast<uint32_t>(__builtin_popcount(meta.active_mask));
+        uint32_t expected_subtasks = 0;
+        if ((meta.active_mask & ~UINT8_C(7)) != 0 ||
+            !scheduler_subtask_count_checked(meta.logical_block_num, active_subtasks, &expected_subtasks) ||
+            scheduler_task_is_mix(meta.flags) != (active_subtasks > 1) ||
+            scheduler_task_is_spmd(meta.flags) != (meta.logical_block_num > 1) ||
+            (scheduler_task_requires_sync_start(meta.flags) && meta.logical_block_num == 1) ||
+            (scheduler_task_has_predicate(meta.flags) && (meta.logical_block_num != 1 || active_subtasks != 1)) ||
+            meta.timing_slot < -1 || meta.timing_slot >= SCHEDULER_TASK_TIMING_SLOT_COUNT)
+            return false;
+        if (scheduler_task_requires_admission(meta)) ++cooperative_count;
+        if (scheduler_task_is_mix(meta.flags)) ++mix_count;
+    }
+    if (cooperative_count != layout.spmd.cooperative_task_count || mix_count != layout.spmd.mix_task_count)
+        return false;
+
+    auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, layout.graph_summary_offset);
+    summary->run_epoch = run_epoch;
+    uint64_t mix_index = 0;
+    for (uint64_t task = 0; task < layout.task_count; ++task) {
+        const auto &meta = metadata[task];
+        if (!scheduler_task_requires_admission(meta)) continue;
+        auto *record = scheduler_state_at<SchedulerAdmissionRecord>(
+            base, layout.admission_records_offset + task * layout.admission_record_stride
+        );
+        record->task_ref = static_cast<int64_t>(task);
+        record->logical_block_num = meta.logical_block_num;
+        record->active_mask = meta.active_mask;
+        record->flags = meta.flags;
+        if (scheduler_task_is_mix(meta.flags)) {
+            record->mix_close_seals_offset =
+                layout.mix_close_seals_offset + mix_index * layout.spmd.cluster_count * sizeof(uint64_t);
+            ++mix_index;
+        }
+    }
     return true;
 }
 #endif

@@ -360,7 +360,8 @@ inline __aicore__ bool scheduler_initialize_local_config(
     config.mix_payloads_offset = context->mix_payloads_offset;
     config.mix_traces_offset = context->mix_traces_offset;
     auto *summary = scheduler_state_at<SchedulerGraphSummary>(base, config.graph_summary_offset);
-    scheduler_observe_cache_line(summary);
+    for (uint64_t offset = 0; offset < sizeof(*summary); offset += 64)
+        scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(summary) + offset);
     local->has_mix = summary->mix_task_count != 0;
     const uint64_t runtime_worker_count = context->runtime_worker_count;
     const uint64_t scheduler_count = context->scheduler_count;
@@ -1325,6 +1326,7 @@ inline __aicore__ SchedulerTaskMetadata scheduler_load_dispatch_metadata(
     metadata.active_mask = source->active_mask;
     metadata.flags = source->flags;
     metadata.timing_slot = source->timing_slot;
+    metadata.logical_block_num = source->logical_block_num;
     if (scheduler_task_timing_enabled(profiling_level)) metadata.trace_index_base = source->trace_index_base;
     return metadata;
 }

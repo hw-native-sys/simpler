@@ -207,6 +207,18 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
         LOG_ERROR("A5 HBG AICore scheduler: incomplete cluster topology AIC=%d AIV=%d", aic_count, aiv_count);
         return -1;
     }
+    auto *graph_summary =
+        scheduler_state_at<SchedulerGraphSummary>(scheduler_state_base, bootstrap_context->graph_summary_offset);
+    cache_invalidate_range(graph_summary, sizeof(*graph_summary));
+    if (graph_summary->worker_count != static_cast<uint64_t>(core_count_) ||
+        graph_summary->cluster_count != static_cast<uint64_t>(aic_count)) {
+        LOG_ERROR(
+            "A5 HBG AICore scheduler: planned topology differs from discovery (workers=%" PRIu64 " clusters=%" PRIu64
+            ", discovered workers=%d AIC=%d AIV=%d)",
+            graph_summary->worker_count, graph_summary->cluster_count, core_count_, aic_count, aiv_count
+        );
+        return -1;
+    }
     int32_t cluster_workers[SCHEDULER_CLUSTER_CAPACITY][PLATFORM_CORES_PER_BLOCKDIM];
     for (auto &cluster : cluster_workers)
         for (int32_t &worker : cluster)

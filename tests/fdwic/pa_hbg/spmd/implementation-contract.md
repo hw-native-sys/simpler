@@ -2,7 +2,8 @@
 
 基线：`f5cc679bbf3d`，2026-10-23。[设计总览](../a5-hbg-spmd-design.md)
 定义已确认语义；本页把它收敛为可开始编码的正确性基线。
-**以下新增结构、状态和函数名是拟实现接口，不是声称仓库已有这些 API。**
+共同准入和执行状态机仍是目标协议；POD 布局、Host 预分配与初始化已开始落地。
+已实现字段和实测范围以 [实现过程](implementation-progress.md) 为准，不以存在字段替代执行验收。
 本页保留目标编码契约；生产代码的逐步落地与实测证据见 [实现过程](implementation-progress.md)。
 初始 TDD 覆盖和历史红绿状态见 [测试入口和验收状态](test-plan-and-status.md)。
 
@@ -26,14 +27,23 @@ device 沿用完成驱动的 wake-list、ready inbox、直接后继候选和每�
 | 每 cluster 一个 GM GroupMailbox | 当前组 descriptor、published_seq、3 个 lane ack | AIC 写组身份，各 lane 写自己的 ack |
 | MixCloseSeal | 每 Mix task、每候选 cluster 一个 64 位结束 token | 本 cluster AIC 单次发布，直到本轮退出不复用 |
 
-TaskControl 当前第一条 64B line 已有 state/wake_list_head/next_waiter 三个 64 位原子字段，
-另有 40B padding。先审计尺寸，再以其中 24B 承载三个新字段；不是直接扩大每 task 结构。
+TaskControl 的第一条 64B line 原有 state/wake_list_head/next_waiter 三个 64 位原子字段，
+现已使用原 40B padding 中的 24B 承载 next_block/completed_blocks/admission_state，仍为 128B。
 新增字段不得与第二条普通写回 line 混用；补 sizeof、offsetof、alignment、POD 静态断言。
 AdmissionRecord 的位图按紧凑 worker index 编码，按实际 worker 数规划 word 数，
 不用物理 core ID 直接寻址。独立热点控制对象以 128B 对齐／步长隔离，
 这只是地址布局基线，不声称能够消除同一 cursor 的原子竞争。
 
+当前布局为 64B record 头加实际 bitmap word 数，整条 record stride 向 128B 对齐，
+避免不同准备者对相邻 task 位图整行写回时相互覆盖。
+TaskMetadata 使用 int16 timing_slot 与 uint16 原 N，共享原 4B 尾部，维持 16B；
+GraphSummary 的现有 padding 承载协议 offset／容量／Host run_epoch，维持 128B。
+AdmissionControl 的 lock/tail 各占 128B；GroupMailbox 为 descriptor 128B、
+published_seq 独占 128B、三个 lane ack 各 128B，共 640B。
+
 AdmissionLog 只存引用，记录按 task_ref 定位；不按 block 数扩大日志。
+紧凑 log 单元和 close seal 都只能通过原子读写，不能普通写单元再 dcci 整行；
+短提交锁不会自动消除不同发布者缓存中的旧行副本。
 MixCloseSeal 为 8 × Mix task 数 × 候选 cluster 数字节，避免复用 mailbox 后丢失前任务关闭通知。
 它不是第二套依赖图；所有大小都由 Host 按实际图分配，并做乘积／对齐溢出检查。
 参考模型为了审计保存所有 block 历史，生产路径不必为每 block 常驻完整模型对象。
@@ -45,7 +55,7 @@ MixCloseSeal 为 8 × Mix task 数 × 候选 cluster 数字节，避免复用 ma
 - 本地槽身份：仍须校验槽编号及该槽 generation；不能跨 own/Mix 通道直接比较原始 generation。
 - Mix 组身份：epoch、task、block、order、cluster、group_seq、active mask、placement。
 - Host 最窄边界是 `N > 0 && N * popcount(mask) <= INT16_MAX`，即 32767。
-  当前 resident maker 的 UINT16 检查更宽，不能把 65535 当实际允许上限。
+  resident maker 已改用该上界；uint16 的存储类型不代表允许到 65535。
 - 位移、block/subtask 乘积、trace 前缀先用足够宽类型计算，再检查后窄化。
   原子计数和 seq 不回绕；临近上限在新领取／发布前失败。
 - 无 kernel 的服务节点独立走既有逻辑完成，不假造一个 kernel block。

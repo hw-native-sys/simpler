@@ -64,8 +64,9 @@ N 小于成员数时，没有抢到 block 的成员完成耗尽检查便可关�
 ### 保证执行位置，不等待同时起跑
 
 sync_start 可以仍在运行时选择参与者，但每个相互等待的 block 必须绑定独立执行位置。
-一个可验证的首版选择是在共同准入记录中固定单射映射：纯 AIC 对 AIC，
+编码契约选用冻结候选集合内的动态领取、每个执行位置至多一次：纯 AIC 对 AIC，
 纯 AIV 对 AIV，Mix 对符合 mask／ABI 的不同 cluster 组。
+在共同准入时固定单射映射只是后续可比较的替代策略，不是当前实现的要求。
 
 这些位置可以还在执行更早的任务，不要求准入时全都空闲。
 公共顺序保证它们最终会结束前序义务并进入当前任务，不能被后序相交任务截走。
@@ -102,11 +103,12 @@ mask 6 只有两个 AIV kernel；AIC 仅做控制服务，不计入核执行总�
 
 ### 一组一份身份
 
-Host 预分配每个 Mix task/block 的 GM 控制记录，首版运行中不复用这些记录。
+Host 为每个候选 cluster 预分配一个可复用 GM mailbox，
+另为每个 Mix task／cluster 预分配保留到 run 结束的 close seal。
 AIC 领取 b 后发布 task_ref、order_key、block_idx、mask、物理组、run_epoch 和组序号。
 跨运行仍须 reset 和校验代次；普通两个参数 slot 的复用另按生命周期保护。
 
-每个 cluster 对同一 task 首版只保留一个执行中的 Mix 组。
+每个 cluster 首版任意时刻只保留一个执行中的 Mix 组，包括不同 task 之间。
 AIV 读取 AIC 发布的同一个组身份，自行装配自己的 LocalContext 与参数；
 不能因为 task_ref 相同就默认配对，也不能独立领取恰好不同的 block。
 全局 block 编号不要求在每个 cluster 连续，局部组序号则必须连续。
@@ -139,10 +141,10 @@ AIC 的“本 cluster 不再有 A”必须携带最后组序号，并晚于其�
 AIV 消费完该序号之前的组、完成本地收尾后才可关闭 A。
 不能因为自己暂时没看见新 dispatch 就退出 A，也不能在 AIC 还有未发布组时放行 B。
 
-控制记录不复用并不代表 UB/L1、事件、参数槽可提前复用。
 不得把 ARRIVED、写过请求、kernel 返回、通信已结束四件事混为一个标志。
-旧 block 全部必要完成后才复用硬件资源；旧控制记录保留到整轮安全结束，
-避免慢读者把新记录当成旧组的释放确认。
+旧 block 全部必要 lane 发布 released_seq、保证不再访问旧 descriptor/payload 后，
+AIC 才可复用 mailbox 及硬件资源。close seal 按 task 保留到整轮安全结束，
+不会被后续 task 的 mailbox 复用覆盖；慢读者核对 epoch／group_seq，不把新组当成旧组确认。
 
 ## 完成聚合和设备可见性
 

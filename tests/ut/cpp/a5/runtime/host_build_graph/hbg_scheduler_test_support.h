@@ -183,6 +183,7 @@ struct FixtureStorage {
             metadata[task].active_mask = 1;
             metadata[task].trace_index_base = task;
             metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
+            metadata[task].logical_block_num = 1;
         }
     }
 

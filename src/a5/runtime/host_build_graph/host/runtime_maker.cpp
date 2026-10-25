@@ -1110,6 +1110,12 @@ bool create_scheduler_state(
             return true;
         }
     }
+    const int32_t worker_count = runtime->get_worker_count();
+    if (worker_count <= 0 || worker_count > static_cast<int32_t>(SCHEDULER_WORKER_CAPACITY) ||
+        worker_count % PLATFORM_CORES_PER_BLOCKDIM != 0) {
+        LOG_ERROR("A5 HBG AICore scheduler: invalid worker count %d for complete clusters", worker_count);
+        return false;
+    }
     std::vector<int64_t> inline_completed_task_refs;
     std::vector<SchedulerTaskMetadata> task_metadata(static_cast<size_t>(total_tasks));
     uint64_t aic_task_count = 0;
@@ -1117,10 +1123,12 @@ bool create_scheduler_state(
     uint64_t aiv_task_count = 0;
     uint64_t executable_task_count = 0;
     uint64_t executable_subtask_count = 0;
+    uint64_t cooperative_task_count = 0;
     uint64_t mix_task_count = 0;
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
     int64_t legacy_shape_task_ref = -1;
+    int64_t trace_overflow_task_ref = -1;
     // The progress byte is PENDING or COMPLETED throughout this walk, never
     // PUBLISHED: that value is stored only by the device dispatch path, which
     // has not run yet, and orch::prepare_task resets every claimed slot this
@@ -1171,17 +1179,17 @@ bool create_scheduler_state(
             return false;
         }
         const uint32_t logical_block_num = static_cast<uint32_t>(slot.logical_block_num);
-        if (active_subtasks == 0 || logical_block_num > UINT16_MAX / active_subtasks) {
+        uint32_t expected_subtasks = 0;
+        if (!scheduler_subtask_count_checked(logical_block_num, active_subtasks, &expected_subtasks)) {
             LOG_ERROR(
-                "A5 HBG AICore scheduler: task ref=%" PRId64 " block/subtask product exceeds scheduler state capacity",
+                "A5 HBG AICore scheduler: task ref=%" PRId64 " block/subtask product exceeds the int16 task contract",
                 task_ref
             );
             return false;
         }
-        const uint32_t expected_subtasks = logical_block_num * active_subtasks;
         if ((!inline_dispatch_task && (slot.active_mask.raw() != classified_active_mask ||
                                        static_cast<uint32_t>(slot.total_required_subtasks) != expected_subtasks)) ||
-            expected_subtasks > UINT16_MAX || host_sm_handle.header->tasks.is_completed(task_ref) ||
+            host_sm_handle.header->tasks.is_completed(task_ref) ||
             (slot.task_attrs.has_predicate() && (active_subtasks != 1 || logical_block_num != 1))) {
             LOG_ERROR(
                 "A5 HBG AICore scheduler: task ref=%" PRId64
@@ -1224,6 +1232,14 @@ bool create_scheduler_state(
             )) {
             if (legacy_shape_task_ref < 0) legacy_shape_task_ref = task_ref;
         }
+        uint64_t next_subtask_count = 0;
+        if (!scheduler_trace_count_checked(executable_subtask_count, expected_subtasks, &next_subtask_count)) {
+            if (trace_overflow_task_ref < 0) trace_overflow_task_ref = task_ref;
+            if (!scheduler_layout_checked_add(executable_subtask_count, expected_subtasks, &next_subtask_count)) {
+                LOG_ERROR("A5 HBG AICore scheduler: task ref=%" PRId64 " overflows the subtask count", task_ref);
+                return false;
+            }
+        }
         SchedulerTaskMetadata &metadata = task_metadata[static_cast<size_t>(task_ref)];
         for (uint32_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
             metadata.kernel_ids[subtask_slot] = (active_mask & (1U << subtask_slot)) != 0 ?
@@ -1234,8 +1250,10 @@ bool create_scheduler_state(
         metadata.flags = scheduler_task_metadata_flags_from_submit_state(
             metadata_active_mask, slot.task_attrs, slot.logical_block_num, fanin_count != 0, inline_dispatch_task
         );
-        metadata.trace_index_base = static_cast<uint32_t>(executable_subtask_count);
-        metadata.timing_slot = slot.task_attrs.timing_slot();
+        metadata.trace_index_base =
+            executable_subtask_count <= UINT32_MAX ? static_cast<uint32_t>(executable_subtask_count) : 0;
+        metadata.timing_slot = static_cast<int16_t>(slot.task_attrs.timing_slot());
+        metadata.logical_block_num = static_cast<uint16_t>(logical_block_num);
         sampled_task_timing_enabled =
             sampled_task_timing_enabled ||
             (metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT);
@@ -1248,8 +1266,12 @@ bool create_scheduler_state(
             ++aiv_task_count;
             aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, logical_block_num * active_aiv_subtasks);
         }
-        if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
-        executable_subtask_count += expected_subtasks;
+        if (!inline_dispatch_task) {
+            if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
+            if (logical_block_num > 1 || active_subtasks > 1 || slot.task_attrs.requires_sync_start())
+                ++cooperative_task_count;
+        }
+        executable_subtask_count = next_subtask_count;
         ++executable_task_count;
     }
 
@@ -1265,12 +1287,25 @@ bool create_scheduler_state(
         );
         return true;
     }
+    if (trace_overflow_task_ref >= 0) {
+        LOG_ERROR(
+            "A5 HBG AICore scheduler: task ref=%" PRId64 " exceeds the uint32 trace index capacity",
+            trace_overflow_task_ref
+        );
+        return false;
+    }
 
+    const SchedulerSpmdRequirements spmd{
+        static_cast<uint64_t>(worker_count),
+        static_cast<uint64_t>(worker_count / PLATFORM_CORES_PER_BLOCKDIM),
+        cooperative_task_count,
+        mix_task_count,
+    };
     AicoreSchedulerLayout layout{};
     if (!scheduler_plan_layout(
             static_cast<uint64_t>(total_tasks), aic_task_count, aiv_task_count, &layout,
             api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
-            executable_subtask_count
+            executable_subtask_count, spmd
         ) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) {
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
@@ -1316,6 +1351,10 @@ bool create_scheduler_state(
     }
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(host_base, layout.task_metadata_offset);
     std::copy(task_metadata.begin(), task_metadata.end(), metadata);
+    if (!scheduler_init_spmd_task_records(host_base, layout, api->run_epoch())) {
+        LOG_ERROR("A5 HBG AICore scheduler: invalid cooperative task metadata or run epoch");
+        return false;
+    }
 
     const uint64_t device_sm_address = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
     auto *run_control = scheduler_state_at<SchedulerRunControl>(host_base, layout.run_control_offset);
@@ -1336,9 +1375,6 @@ bool create_scheduler_state(
     run_control->error_task_ref = UINT64_MAX;
     run_control->error_core_id = UINT64_MAX;
     run_control->error_core_type = UINT64_MAX;
-    auto *graph_summary = scheduler_state_at<SchedulerGraphSummary>(host_base, layout.graph_summary_offset);
-    graph_summary->mix_task_count = mix_task_count;
-
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, layout.worker_contexts_offset);
     int32_t aic_rank = 0;
     int32_t aiv_rank = 0;

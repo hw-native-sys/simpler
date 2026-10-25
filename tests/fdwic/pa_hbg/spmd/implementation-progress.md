@@ -23,7 +23,7 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 | 顺序 | 交付 | 出口证据 | 当前状态 |
 | ---- | ---- | -------- | -------- |
 | 前置 | ordinary／Mix payload context 初始化与重绑定 | 原生 N=1 红灯转绿；真实初始化函数的 C++ 测试 | 已通过 C++、仿真与 A5 六种 mask 各十轮 |
-| 1 | 有界存储、准入记录、block 控制、GM 组状态 | POD／布局／溢出／重跑初始化测试 | 未实现 |
+| 1 | 有界存储、准入记录、block 控制、GM 组状态 | POD／布局／溢出／重跑初始化测试 | 已落地并通过布局与 N=1 回归；尚未运行协议 |
 | 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | 未实现 |
 | 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | 未实现 |
 | 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | 未实现 |
@@ -185,3 +185,55 @@ AICPU 非 leader 线程在约 20 秒超时，leader 约 37.4 秒后才打印快�
 接下来实现编码契约第 1 项：有界 POD／offset／初始化／溢出检查及 Host 实际大小预分配，
 然后接入共同准入与普通多 block；保持现有 legacy 形状门禁直到相应 native 验收通过。
 完整目标继续进行，不因前置基线转绿而标为完成。
+
+## 2026-10-25：有界协议存储与 Host 接线
+
+本轮起点 `89b09f026`。并行审查 Host/epoch 链和缓存行布局，主线程实现布局与初始化，
+独立测试任务编写 C++ 边界用例；构建、设备验证和提交由主线程统一执行。
+
+### 具体落地
+
+- TaskMetadata 的 timing_slot 值域来自 TaskAttrs（-1 或 0..15），改用 int16；
+  腾出的 uint16 保存原 N，维持 16B，并补齐 metadata 手工复制路径，不能只改 struct。
+- TaskControl 在既有原子行 byte 24/32/40 放入三个 uint64 字段，整体仍为 128B；
+  第二条普通写回行的偏移仍为 64。GraphSummary 复用 padding，WorkerContext 不增长。
+- 新增 AdmissionRecord、AdmissionControl、GroupDescriptor/LaneAck/Mailbox 的 POD，
+  record 头 64B，后接按实际 W 计算的位图，stride 向 128B 取整；
+  log 只存 cooperative_count 个引用。无协同图不分配新协议区；无 Mix 图不分配组和 seal。
+- 每 cluster 一个 640B mailbox，descriptor、published_seq 和各 lane ack 分开；
+  close seal 保持 MixCount×C×8 字节。位图整行写回不能跨记录；log/seal 将采用原子读写，
+  不因短提交锁存在就普通写回可能过时的整行。
+- Host 使用实际 worker 数和完整 cluster 数规划；lifecycle 在 READY 前核对实际发现结果。
+  `api->run_epoch()` 已由 NativeRunDescriptor 传递，直接复用，不另造计数器。
+  UINT64_MAX 是生成器最后一个合法 epoch；布局不擅自拒绝。记录本身仍保持未准入状态。
+- 乘积检查使用原 int16 上界，trace 前缀在窄化前检查；resident 专用的 trace 容量错误
+  放在原 unsupported-shape fallback 之后处理，不改变超大 legacy 图的原回退优先级。
+- 每轮统一清零新控制状态，使用无效 task/order/lane 哨兵；静态记录填写先完整验证
+  所有 metadata 与数量，再写入，失败不留下半初始化记录。
+- 修正旧 block 文档中“每 task/block 一份且不复用”的描述，统一为编码契约的
+  per-cluster mailbox 与持久 per-task/cluster seal；同步明确 sync_start 的动态一次领取策略。
+
+### 当前验证及未开放部分
+
+新增 `test_hbg_spmd_layout.cpp` 的 104 项检查覆盖 3/63/66/96/108 worker、
+对齐/不重叠、空图/无协同/纯 SPMD/Mix、污染重初始化、设备地址重绑定、
+无效拓扑/数量/形状不部分写入、epoch 0/MAX、N×slot/trace 边界、无 profiling 时 N 的复制。
+另对同一大容量 retained block 做大 Mix+profiling → 小纯 SPMD → 大 Mix 的切换，
+以不同 epoch/N/mask 与 fresh 镜像逐字节比较，并检查小布局不会写入未使用尾部的 canary。
+最终 C++ 八个相关目标共 222 个 case 通过；日志 `outputs/spmd-layout-cpp-final-20261025.log`。
+editable 全构建通过（`outputs/spmd-layout-build-20261025.log`）；
+1026 个 Python 回归通过（`outputs/spmd-layout-python-20261025.log`），
+HBG 默认仿真 42 passed、379 deselected（`outputs/spmd-layout-sim-20261025.log`）。
+
+A5 device 0 六种 mask 的 N=1 各三轮、共 18 次通过；同一 Worker 的 epoch 为 1–18。
+真机默认 HBG 回归 60 passed、4 skipped；本次只排除宽目录中被误收的 TMR 双卡 RDMA 目录，
+未排除 HBG 用例。单独三级泳道检查通过。
+日志依次为 `outputs/spmd-layout-native-20261025/{probe,hbg,dfx3}.log`。
+目前只落存储与静态接线，尚无运行期准入发布或 block cursor 执行；
+N>1/sync_start 仍维持原门禁，不能将本轮布局用例转绿当作原生 SPMD 通过。
+
+入口审查另发现 AIV 完成普通任务时，直接唤醒的 Mix 后继可被留在无人消费的局部 candidate。
+独立真实 helper 复现为 AIV0/AIV1×mask 3/5/6/7 共 8 项失败，
+AIC direct 路径和禁用 direct sink 的 16 项对照通过；日志
+`outputs/spmd-direct-mix-repro-20261025.log`。这是后续依赖推进的前置问题，
+新复现文件与修复会单独提交，不混入已全绿的存储布局提交。
