@@ -66,4 +66,27 @@ a5_platform_case(test_return_gate_wait.cpp
     INCLUDES ${SIMPLER_SRC}/common/platform/sim/aicpu ${SIMPLER_SRC}/a5/platform/sim)
 set_tests_properties(test_a5_return_gate_wait PROPERTIES TIMEOUT 20)
 
+# The real sim wrapper is loaded and unloaded with each runtime's Runtime ABI.
+# The executor is an identity-checking fixture; pthread key accounting uses
+# the process's actual resource limit and calls the production wrapper.
+foreach(runtime ${SIMPLER_RUNTIMES})
+    simpler_runtime_tag(${runtime} runtime_tag)
+    simpler_ut_includes(a5 ${runtime} host tls_contract)
+    set(tls_fixture a5_${runtime_tag}_sim_tls_fixture)
+    add_library(${tls_fixture} SHARED
+        ${SIMPLER_SRC}/a5/platform/sim/aicore/kernel.cpp
+        support/sim_aicore_tls_fixture.cpp)
+    target_include_directories(${tls_fixture} PRIVATE
+        ${tls_contract}
+        ${SIMPLER_SRC}/a5/platform/sim/aicore)
+    target_link_libraries(${tls_fixture} PRIVATE pthread ${CMAKE_DL_LIBS})
+    simpler_ut_add_target(NAME test_a5_${runtime_tag}_sim_aicore_tls
+        SOURCES test_sim_aicore_tls.cpp
+        DEFINES SIM_TLS_FIXTURE_PATH="$<TARGET_FILE:${tls_fixture}>"
+        LINK ${CMAKE_DL_LIBS}
+        DEPENDS ${tls_fixture}
+        LABEL no_hardware
+        TIMEOUT 30)
+endforeach()
+
 simpler_ut_glob_cases(a5_platform_case)

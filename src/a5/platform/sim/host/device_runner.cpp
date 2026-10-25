@@ -311,6 +311,24 @@ int DeviceRunner::ensure_binaries_loaded() {
             LOG_ERROR("dlsym failed for aicore_execute_wrapper: %s", dlerror());
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        using InitializeAicoreSimTls = int (*)();
+        auto initialize_tls =
+            reinterpret_cast<InitializeAicoreSimTls>(dlsym(aicore_so_handle_, "initialize_aicore_sim_tls"));
+        if (initialize_tls == nullptr) {
+            LOG_ERROR("dlsym failed for initialize_aicore_sim_tls: %s", dlerror());
+            dlclose(aicore_so_handle_);
+            aicore_so_handle_ = nullptr;
+            aicore_execute_func_ = nullptr;
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        const int tls_rc = initialize_tls();
+        if (tls_rc != 0) {
+            LOG_ERROR("AICore sim pthread TLS initialization failed: %d", tls_rc);
+            dlclose(aicore_so_handle_);
+            aicore_so_handle_ = nullptr;
+            aicore_execute_func_ = nullptr;
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
         LOG_INFO("DeviceRunner(sim): Loaded aicore_execute_wrapper from %s", aicore_so_path_.c_str());
 
         auto set_identity_helpers =

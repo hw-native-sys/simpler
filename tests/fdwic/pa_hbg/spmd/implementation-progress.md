@@ -383,3 +383,55 @@ ordinary permit 不隐式复用旧判断：先处理可见前缀，最后关键�
 没有 allocation total_size 参数，不能宣称防住任意伪造的越界 offset。
 A5 构建及旧用例回归只验证新头的设备编译和已有行为；
 新发布协议的 GM 可见性仍须随 executor 接线进行真机验证。
+
+## 2026-10-25：重复运行暴露的 A5 模拟器 TLS 生命周期问题
+
+接入纯 C/V 执行后，原生纯任务矩阵在 A5 和仿真各 90 次通过；
+新增边界用例的 A5 全部 120 次也通过。仿真执行到同一进程第 101 次时，
+在新轮握手阶段超时，尚未进入准入循环；此前 30 个场景（含重叠和真实依赖）均通过。
+当时正在执行 512×3 → 1×3 → 65×3 → 1×3 → 512×3 的复用链，
+第 100 次已经返回并通过校验，第 101 次卡在 N=1 的第二轮，不能归因为 block 领取。
+日志 `outputs/spmd-ordered-contract-sim-20261025.log` 保留失败位置。
+
+检查发现模拟 AICore SO 每轮卸载，而生产 `kernel.cpp` 的首次 wrapper 调用
+通过 pthread_once 创建十个进程级 TLS key，原代码既不回收也不检查创建失败。
+本机 key 上限为 1024。独立 C++ 回归将实际生产 wrapper 编成可装卸 SO，
+用轻量 executor 只检查身份，不复制 TLS 实现；真实执行／卸载后，
+剩余 key 从 1021 降为 1011，确认每轮漏十个。
+旧代码在只剩五个 key 的部分创建场景还发生 SIGSEGV；这不是单纯的超时推测。
+原挂起仿真进程的调试器 attach 不可用；保存日志和线程列表后，仅终止本次失败进程，
+退出状态为 143，不计作成功，也没有停止其他会话或重置设备。
+
+修复保持 pthread TLS，不改回已知有 aarch64 TLSDESC 问题的 thread_local：
+
+- 逐项记录已创建 key，部分失败立即回滚，只删除实际拥有的 key。
+- SO 的生命周期对象在所有 core 线程已 join 后、模块卸载时释放全部 key。
+- 新增模拟包装内部初始化入口，与 wrapper 共享同一个 pthread_once；
+  loader 在线程启动前调用，失败关闭 SO、清空 handle/function pointer，
+  沿原内部错误返回，不 throw／abort 用户进程，也不让任务进入握手等待。
+- HBG/TMR 两种 Runtime ABI 各 23 项、共 46 项独立测试通过，
+  覆盖 128 次真实 wrapper 重载、剩余 0–9 个 key、回滚、其他 key 不被覆盖和重载恢复。
+
+这是模拟平台的独立修复，与纯 C/V 调度接线分开提交；不改变 A5 真机包装层。
+完整 editable 重建已通过（`outputs/spmd-ordered-build-r2-20261025.log`）；
+主构建树中 HBG/TMR 两个 TLS target 的 46 项也全部通过，
+日志 `outputs/spmd-ordered-cpp-final-20261025.log`。
+原失败场景不改用例、保持每轮数值和新鲜 resident 来源断言，
+在同一进程内完成全部 32 场景、120 次调用，退出状态为 0；
+日志 `outputs/spmd-ordered-contract-sim-r2-20261025.log` 明确包含第 101–120 次。
+同期最终版本 A5 120 次也通过（`outputs/spmd-ordered-native-20261025/contracts-r2.log`），
+这不表示 TLS 修复修改了真机路径，而是同一工作区纯 C/V 实现的验收证据。
+
+平台修复按最宽范围运行 `pytest examples tests/st --platform a5sim`，
+使用八个虚拟设备、并发 8、session timeout 600；默认非 manual 范围不额外筛 runtime。
+资源阶段 59 项、L2 HBG 18 项、L2 TMR 30 项，共 107 项通过，314 项按平台等条件未选中，
+总体退出状态为 0，耗时 241.59 秒；日志 `outputs/spmd-ordered-all-sim-20261025.log`。
+这里的 pytest 项目数不等于各 scene 内参数场景或每轮 kernel 调用数。
+
+首次提交检查扫描到已不存在的 `fully_distributed_within_core` runtime 的旧编译数据库，
+因缺少当前 TaskId include 路径产生 clang-tidy 解析错误，并误报非空构造函数可 default。
+核对当前两架构仅有 HBG/TMR build_config 后，将六份旧 runtime 顶层数据库原地改名为
+`compile_commands.json.obsolete-runtime-20261025` 留存；未删除旧构建产物或参考源码，
+也未修改有效 runtime 的编译选项来回避检查。
+使用当前 HBG/TMR 数据库的全部适用钩子通过，
+日志 `outputs/spmd-tls-precommit-r2-20261025.log`。
