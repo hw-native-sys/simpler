@@ -17,8 +17,9 @@
 #include "cla_plan.h"
 #include "orchestration_api.h"
 
-static inline void
-submit_cla_plan(const ChipTaskArgs &orch_args, const int64_t *sync_flags = nullptr, bool wait_for_peer = false) {
+static inline void submit_cla_plan(
+    const ChipTaskArgs &orch_args, const int64_t *sync_flags = nullptr, const int64_t *wait_peers = nullptr
+) {
     const auto &host_plan = orch_args.tensor(2).ref();
     if (host_plan.ndims != 2 || host_plan.shapes[1] != cla_contract::kPlanWidth || host_plan.dtype != DataType::INT64) {
         rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "CLA probe: invalid plan shape");
@@ -26,8 +27,8 @@ submit_cla_plan(const ChipTaskArgs &orch_args, const int64_t *sync_flags = nullp
     }
     const auto *rows = reinterpret_cast<const int64_t *>(host_plan.buffer.addr) + host_plan.start_offset;
     const uint32_t count = host_plan.shapes[0];
-    if (wait_for_peer && (count != 2 || sync_flags == nullptr)) {
-        rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "CLA probe: peer wait requires two controlled tasks");
+    if (wait_peers != nullptr && sync_flags == nullptr) {
+        rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "CLA probe: peer wait requires controlled tasks");
         return;
     }
     std::vector<TaskId> handles;
@@ -56,6 +57,14 @@ submit_cla_plan(const ChipTaskArgs &orch_args, const int64_t *sync_flags = nullp
         if (sync_flags != nullptr &&
             (sync_flags[task] < 0 || sync_flags[task] > 1 || (sync_flags[task] && (n <= 1 || mask == 0)))) {
             rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "CLA probe: invalid sync request");
+            return;
+        }
+        const int64_t wait_peer = wait_peers == nullptr ? -1 : wait_peers[task];
+        if (wait_peer < -1 || wait_peer >= count || wait_peer == task ||
+            (wait_peer >= 0 &&
+             (mask == 0 ||
+              rows[wait_peer * cla_contract::kPlanWidth + static_cast<uint32_t>(cla_contract::Field::Mask)] == 0))) {
+            rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "CLA probe: invalid peer task");
             return;
         }
         const auto dependencies = static_cast<uint32_t>(raw_dependencies);
@@ -92,7 +101,7 @@ submit_cla_plan(const ChipTaskArgs &orch_args, const int64_t *sync_flags = nullp
         args.launch_spec.set_block_num(n);
         if (sync_flags != nullptr) {
             args.add_scalar(sync_flags[task]);
-            args.add_scalar(wait_for_peer ? static_cast<int64_t>(1 - task) : int64_t{-1});
+            args.add_scalar(wait_peer);
             args.launch_spec.set_require_sync_start(sync_flags[task] != 0);
         }
         MixedKernels kernels;

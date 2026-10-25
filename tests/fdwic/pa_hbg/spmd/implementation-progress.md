@@ -25,7 +25,7 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 | ---- | ---- | -------- | -------- |
 | 前置 | ordinary／Mix payload context 初始化与重绑定 | 原生 N=1 红灯转绿；真实初始化函数的 C++ 测试 | 已通过 C++、仿真与 A5 六种 mask 各十轮 |
 | 1 | 有界存储、准入记录、block 控制、GM 组状态 | POD／布局／溢出／重跑初始化测试 | 已落地；纯 C/V 和 GM Mix 已使用 |
-| 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | own/direct、持久候选与 GM Mix 均已接线；完整原生事件审计通过 |
+| 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | own/direct、持久候选与 GM Mix 均已接线；完整原生审计通过；B 先于仍等前驱的 A 已有仿真／A5 各 84 项原生证据 |
 | 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | A5／仿真功能和 L1/L4 逐 block 检查通过 |
 | 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | A5／仿真矩阵、重叠及 TPipe PA 已通过；首错误身份与冷日志已接线 |
 | 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | CSA 数值／2308 显式身份／来源、全协议因果与独立图门禁通过 |
@@ -1739,3 +1739,100 @@ CLA／错误身份探针直接引用布局，有序／同步探针仍引用原�
 适用 pre-commit 检查通过，日志 `outputs/spmd-sync-ordered-precommit-r3-20261025.log`。
 本次阶段提交只包含测试／探针／中文过程记录，不包含产物或用户未跟踪文件，不 push。
 公共 N=1 契约仍待确认；性能回退根因仍未定位，本节不能被当作性能优化完成。
+
+## 2026-10-25：较晚提交的 B 先于仍等前驱的 A 执行
+
+起点 `215ee611e`；上一轮已完成测试实现、验证和本地提交，不是只报告状态。
+其提交后构建已完成，binding build_commit 与 HEAD 一致，三个 HBG runtime 二进制
+SHA256 与已验证的 csa-hbg-l4-jrabrt2o 相同。本节没有改生产 runtime。
+
+继续核对边界文档的 C39：“A 等 P、B 已 ready 时，B 先发布并执行，
+A 此时尚未 ready”。原有 HbgAdmission.ReadyTaskBMayCommitBeforeTaskAWhoseDependencyIsNotReady
+检查生产 helper 的路由和准入，但上一轮两个 ready 根任务的任意顺序不能替代该原生证据。
+
+新增 test_ready_order_execution.py，以 Host 顺序提交 P、A、B，只有 P→A 一条真实依赖。
+P 是 B 不参与的核类型上的普通单 block，有限等待 B 的首个 entry 才返回；
+A/B 的尾块继续使用已有可控交错协议，B 尾块等 A 首入，其他位置正常返回。
+因此 B 可以先进入而不会被 P 占据必需位置，A 仍必须等 P 真正完成；
+随后 A 必须能早于 B 全局完成进入，不能用全局完成屏障替代成员局部顺序。
+
+复用同一组三个 kernel、128B 记录、原子事件序号和逐轮 resident 来源校验。
+CLA Host helper 的等待目标改为逐 task 的 Host-only 引用数组，检查边界、自等待和 dummy，
+原双任务入口继续映射为 1/0 或不等待，保持其 Tensor／Scalar ABI；
+新入口是五个 Tensor，不读混合总下标作为 Scalar 下标。
+同步 guard 的 golden 与检查提取为共用函数，不复制相同校验。
+
+新矩阵每个平台 84 项：A 的七种 mask、B 的纯 C／AIV0／AIV1 三种形状，
+各选四种普通／sync_start 组合。同步用本机／仿真的类型满容量，普通用容量加一；
+P 的 N=1 不带 sync_start，不涉及尚未确认的公共接口契约。
+
+新验收器先复用完整身份、真实依赖和同步 guard 检查，三个特定反例实际 RED：
+Host 顺序全串行、B 虽先于 A 但 P 已完成、A 被迫等 B 全局完成。
+日志 `outputs/spmd-ready-order-oracle-red-20261025.log` 为 3 failed／178 passed；
+加入 B.entry < P.return 及 A.entry < B.last_return 的强断言后，
+新旧有序／同步 oracle 共 521 项通过，日志 `outputs/spmd-ready-order-oracle-green-20261025.log`。
+它们都是同一原子序列中的事件，不将跨核 cycle 数值当作顺序证明。
+
+三个仿真和 A5 冒烟场景已通过，完整矩阵、原生共同顺序审计和共用入口回归继续执行。
+上板预检缺少 npu-smi，CANN query 实际确认 Ascend950PR_958b、32C/64V；
+按用户要求直接使用设备 0，不宣称 task-submit 锁隔离。
+
+新矩阵仿真／A5 各 84 项全部通过，完整相关 Python 选择集 2370 项通过；
+日志 `outputs/spmd-ready-order-sim-matrix-20261025.log`、
+`outputs/spmd-ready-order-native-20261025/matrix.log`、
+`outputs/spmd-ready-order-python-20261025.log`。
+168 份原生捕获逐份审计通过：共同日志严格为 [2, 1]，即 B 的 order_key=0、A=1，
+P 没有共同准入记录，冻结图只有 P→A。另核对原 N、SYNC、kernel IDs 和实际拓扑，
+且每份原子事件均满足 B.entry < P.return < A.entry < B.last_return。
+仿真为 39156 事件／2662 执行，A5 为 148020 事件／10054 执行；
+日志 `outputs/spmd-ready-order-native-audit-20261025.log`。
+A5 的 A=Mix7、B=纯 C 同步场景中，B 首入为 1、P 返回为 6、A 首入为 66、B 末返为 67，
+直接证明准入不受未 ready 的早提交任务阻塞，也不添加 B 的全局完成屏障。
+
+共用入口混合回归在两平台均为 3 passed／1 failed：旧同步双任务类取得了
+sig_count=3、child_count=2 的父类 callable，而自身需要四个 Tensor 和三个 kernel。
+失败发生在 Host 参数核验阶段，没有执行错误的设备 kernel；不能把它解释成 AICore 调度失败。
+定位到 SceneTestCase 使用 getattr(type(self), "_st_l2_handle")，从父类继承了注册句柄，
+且未将缓存绑定到 Worker 或 callable。新增九项 CPU 测试先取得 7 failed／2 passed，
+日志 `outputs/spmd-ready-order-registration-red-20261025.log`。
+
+缓存改为测试实例持有的 (Worker, callable, handle)，只有两个对象身份都匹配才复用；
+注册成功后才发布新缓存，失败不覆盖原有效记录。保留同实例跨 case／round 的一次注册，
+不修改 Worker、Callable 或生产调度接口；清除两个旧测试中已无意义的类属性重置。
+修正后连同新 ready-order 类的五类混合回归在仿真和 A5 均通过，
+日志 `outputs/spmd-ready-order-probe-regression-sim-r2-20261025.log`、
+`outputs/spmd-ready-order-native-20261025/probe-regression-r2.log`。
+
+扩大框架回归时另有两项 CLI 测试因裸 import conftest 取到 tests/ut/py/conftest.py
+而缺少根插件函数；单独复跑同样失败，导入路径复核也确认不是句柄缓存造成。
+这两项改为从当前 pytest pluginmanager 按根文件路径取已加载插件，保留原断言，
+不改根 conftest 行为；完整框架回归与最终提交检查继续执行。
+
+调整 CLI 测试导入时曾误删文件内其他测试仍使用的 importlib，出现九项 NameError；
+补回该导入后，包含九项新注册缓存回归的框架选择集 216 项全部通过，
+日志 `outputs/spmd-ready-order-framework-green-r3-20261025.log`。未跳过失败测试。
+SPMD／CSA 相关 Python 选择集再次 2370 项通过，
+日志 `outputs/spmd-ready-order-python-r2-20261025.log`；
+完整 HBG 仿真回归 42 passed，日志 `outputs/spmd-ready-order-hbg-sim-20261025.log`。
+
+完整 HBG A5 回归 60 passed／4 skipped，日志 `outputs/spmd-ready-order-native-20261025/hbg.log`。
+继续仅排除已知误收集的双卡 TMR 目录和仍有 N=1 契约争议的本地容量测试文件，
+没有把未决断言计作通过；也不据此声称双卡回归已完成。
+共用场景框架的 A2/A3 HBG 仿真回归为 30 passed／7 skipped，
+日志 `outputs/spmd-ready-order-hbg-a2a3sim-20261025.log`，没有在 A5 卡上运行 A2/A3 二进制。
+
+句柄缓存修复后的原样 CSA 严格 L4 验收通过，结果 `outputs/csa-hbg-l4-lii5bvds/result.json`；
+producer=aicore，原样源文件、2308 执行身份、133 条依赖、原生因果审计与 timing guard 均通过，
+两轮各七项数值 golden 保持通过。没有修改业务 kernel、构图或输入来适配新测试。
+
+六个代表 ready-order 场景在两平台各重复十轮，分别 60 次通过，逐轮仍验证新鲜 resident
+来源、全部输出、同步 guard 和 B/P/A 的原子顺序；日志
+`outputs/spmd-ready-order-repeat-a5sim-20261025.log`、`outputs/spmd-ready-order-repeat-a5-20261025.log`。
+多轮不启用完整泳道，不计入 168 份 L4 证据。
+本构造明确限定先 ready 的 B 为纯 C/V，A 覆盖全部七种 mask；
+不把它冒称为 B 为 Mix 的相同原生构造，也不将 CPU 模型当作任意硬件故障退出的证明。
+N=1 公共契约仍待用户选择，本轮没有改动；已有性能回退也未因这些功能验证得到解决。
+
+适用 pre-commit 检查全部通过，日志 `outputs/spmd-ready-order-precommit-20261025.log`。
+本次阶段提交限定 ready-order 验收、必要的共用探针复用、实际暴露的场景句柄缓存修复、
+相关测试和中文过程记录，不包含生成产物或用户未跟踪文件，仅本地 commit，不 push。

@@ -29,6 +29,14 @@ from simpler_setup.scene_test import (
 )
 
 
+@pytest.fixture(scope="module")
+def root_conftest(pytestconfig):
+    path = Path(__file__).resolve().parents[3] / "conftest.py"
+    plugin = pytestconfig.pluginmanager.get_plugin(str(path))
+    assert plugin is not None, f"root pytest plugin was not loaded: {path}"
+    return plugin
+
+
 def _recording_converter(calls, merged=True):
     """Stand in for the converter subprocess, reporting the success it models.
 
@@ -295,13 +303,12 @@ def test_swimlane_overhead_requires_chip_swimlane() -> None:
         )
 
 
-def test_pytest_front_end_reports_a_usage_error_not_a_test_failure() -> None:
-    conftest = importlib.import_module("conftest")
+def test_pytest_front_end_reports_a_usage_error_not_a_test_failure(root_conftest) -> None:
     options = {"--enable-swimlane-overhead": True, "--enable-chip-swimlane": 0}
     config = SimpleNamespace(getoption=lambda name, default=None: options.get(name, default))
 
     with pytest.raises(pytest.UsageError, match="requires --enable-chip-swimlane"):
-        conftest._validate_diagnostic_flags(config)
+        root_conftest._validate_diagnostic_flags(config)
 
 
 def test_dep_gen_extension_hook_uses_the_shared_multi_round_gate() -> None:
@@ -434,9 +441,7 @@ def test_run_class_cases_names_the_case_without_args() -> None:
     assert str(failure.value) == "SceneTest case failed: FailingScene::empty_args"
 
 
-def test_run_class_cases_keeps_device_error_visible_to_poison_classifier() -> None:
-    conftest = importlib.import_module("conftest")
-
+def test_run_class_cases_keeps_device_error_visible_to_poison_classifier(root_conftest) -> None:
     class FailingScene:
         def _run_and_validate(self, *_args, **_kwargs):
             raise RuntimeError("prepare_native_run failed with code 507018")
@@ -458,7 +463,7 @@ def test_run_class_cases_keeps_device_error_visible_to_poison_classifier() -> No
         )
 
     excinfo = SimpleNamespace(type=type(failure.value), value=failure.value)
-    assert conftest._requires_l2_worker_retirement(excinfo)
+    assert root_conftest._requires_l2_worker_retirement(excinfo)
 
 
 def test_standalone_dispatch_forwards_every_diagnostic_flag(monkeypatch) -> None:

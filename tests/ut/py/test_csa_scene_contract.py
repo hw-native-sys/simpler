@@ -142,7 +142,6 @@ def test_actual_l2_round_loop_restores_all_seven_buffers_before_each_invocation(
     monkeypatch.setattr(test, "generate_args", initial_args)
     monkeypatch.setattr(test, "compute_golden", compute)
     monkeypatch.setattr(test, "_build_config", lambda *args, **kwargs: object())
-    monkeypatch.setattr(type(test), "_st_l2_handle", None, raising=False)
     monkeypatch.setattr(native_csa.original.TestDeepSeekV4ProCSAHBG, "compare_outputs", compare)
     monkeypatch.setattr(framework, "_child_memory_args", lambda *args: nullcontext(SimpleNamespace(tensors={})))
     monkeypatch.setattr(framework, "_build_l2_ref_args", lambda args, *rest, **kwargs: (args, names))

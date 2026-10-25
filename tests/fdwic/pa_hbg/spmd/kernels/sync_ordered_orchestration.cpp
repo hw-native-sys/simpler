@@ -22,7 +22,14 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
         rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "CLA probe: invalid sync flags");
         return;
     }
+    const bool wait_for_peer = args.scalar<int64_t>(0) != 0;
+    if (wait_for_peer && plan.shapes[0] != 2) {
+        rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "CLA probe: paired wait requires two tasks");
+        return;
+    }
+    const int64_t wait_peers[2] = {1, 0};
     submit_cla_plan(
-        args, reinterpret_cast<const int64_t *>(flags.buffer.addr) + flags.start_offset, args.scalar<int64_t>(0) != 0
+        args, reinterpret_cast<const int64_t *>(flags.buffer.addr) + flags.start_offset,
+        wait_for_peer ? wait_peers : nullptr
     );
 }
