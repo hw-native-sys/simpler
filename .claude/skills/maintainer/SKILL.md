@@ -101,6 +101,11 @@ An author's completed fix awaiting reviewer confirmation needs review, not anoth
 implementation. Green checks do not replace technical review. A merged delivery
 PR does not by itself prove its parent Issue or track is complete.
 
+Before asking for a merge decision, verify current-head acceptance, required checks,
+review and mergeability under the applicable branch rules. If evidence is missing,
+the next action is to obtain it or hand off that verification; do not ask the user
+to approve merging subject to checks the agent has not yet performed.
+
 ### Persistent action table and user interaction
 
 Maintain one table throughout the selected maintenance scope, including items that
@@ -130,6 +135,11 @@ concrete decisions at a time, ordered by impact: evidence, recommended action,
 next actor and what the user must confirm. Keep the rest queued. Batch similar
 actions only when their consequences remain easy to review.
 
+Default messages contain new actionable findings, decisions or meaningful completion.
+Keep unchanged items and existing pending decisions in the table, including when
+they are still important. Repeating them under a "still waiting" summary is also a
+reminder; do not append that inventory unless the user asks for status or the table.
+
 Reuse existing authorization for routine actions. For a deferred decision, retain
 the reason and reconsideration condition; silence is not approval. Deduplicate
 against prior proposals and live outcomes. Repeat a question or reminder only on
@@ -141,6 +151,9 @@ its dependent action, not unrelated monitoring or authorized work.
 1. **Recover first.** Read the previous checkpoint if present. Inspect pending
    actions with uncertain outcomes and read GitHub before retrying them. Do not
    restart an active implementation or duplicate a posted reply after a resume.
+   Reassess saved proposals against current evidence, scope and rules. If a prior
+   proposal was premature, withdraw or replace it in the table and history; a
+   pending user reply is not a reason to preserve an incorrect judgment.
 2. **Discover changes.** Fetch scope membership and current states, with pagination.
    Include new Issues/PRs, added or edited discussion, assignment and relationship
    changes, Draft transitions, new heads, reviews, checks and merge/close events.
@@ -172,6 +185,12 @@ for the next. A wait for an author, reviewer, CI or a human decision is a checkp
 with a next trigger, not an invitation to busy-loop or take over ownership.
 
 ## Resume and recurring use
+
+When starting or testing continuous monitoring, read
+[client monitoring](references/client-monitoring.md) for Claude Code, Codex desktop
+and Codex CLI setup, decision delivery and recovery. Use the installed client's
+actual capabilities; these clients do not share one loop command. A schedule is
+only configured until repeated automatic iterations have updated the same table.
 
 Persist scope and branch filters, authorization, observation boundary and the action
 table with per-item head/evidence, attempts and wake conditions. Avoid secrets.
@@ -205,9 +224,11 @@ because other users can legitimately update the same GitHub record.
 
 Notify on meaningful completion, actionable failure or a required decision. Stay
 quiet on unchanged background passes; avoid repetitive comments, mentions and review
-requests. A foreground request still receives a concise result. Return the scope,
-actual changes, outstanding actors/blockers and whether the next pass is scheduled
-or requires manual invocation.
+requests. If a background runner requires a result, record a brief no-new-action
+receipt for the runner without presenting old decisions to the user again. A
+foreground request still receives a concise result: report actual changes, new
+actors/blockers and any change in monitoring status. Repeat the scope or established
+blockers only when requested or needed to understand a new action.
 
 ## Example requests
 
