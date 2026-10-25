@@ -146,7 +146,8 @@ sync_start 阶段验收，前阶段保留未支持形状的拒绝／回退检查
 - [现有多 block legacy 门禁](../../../../tests/st/a5/host_build_graph/spmd_legacy_fallback/test_spmd_legacy_fallback.py)
 
 新增普通 SPMD 支持后，最后一个用例的“多 block 必须 legacy”预期要按支持范围更新；
-同时保留尚未支持的 sync_start／Graph 回退看护，不能只删掉失败的来源断言。
+sync_start 开放后必须把对应来源看护加严为 resident，同时保留尚未支持的 Graph 回退看护，
+不能只删掉失败的来源断言或同时接受 resident／legacy。
 
 ### 调度来源与设备验证
 

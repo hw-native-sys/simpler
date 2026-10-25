@@ -389,6 +389,7 @@ inline __aicore__ bool scheduler_refresh_local_obligation(
             admission->current_block_num = record->logical_block_num;
             admission->current_active_mask = record->active_mask;
             admission->current_flags = record->flags;
+            admission->sync_claimed = false;
             scheduler_protocol_member_observed(base, local, admission, tail);
             return true;
         }
@@ -468,12 +469,13 @@ inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_cursor(
     auto *admission = local == nullptr ? nullptr : local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerBlockClaimResult::ERROR;
     if (block_idx == nullptr || !scheduler_task_ref_valid(graph, admission->current_task_ref) ||
-        admission->current_block_num == 0 || scheduler_task_requires_sync_start(admission->current_flags)) {
+        admission->current_block_num == 0) {
         scheduler_admission_fail(
             graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_CURSOR_INVALID
         );
         return SchedulerBlockClaimResult::ERROR;
     }
+    if (admission->sync_claimed) return SchedulerBlockClaimResult::RETRY;
     auto *control = scheduler_task_control_at(base, local, admission->current_task_ref);
     uint64_t observed = scheduler_gm_query(control->next_block);
     bool critical = false;
@@ -492,6 +494,7 @@ inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_cursor(
         const uint64_t previous = scheduler_gm_compare_exchange(control->next_block, observed, observed + 1);
         if (previous == observed) {
             *block_idx = static_cast<uint32_t>(observed);
+            admission->sync_claimed = scheduler_task_requires_sync_start(admission->current_flags);
             scheduler_protocol_block_claim(base, local, *block_idx, claim_start, scheduler_protocol_cycles(local));
             return SchedulerBlockClaimResult::CLAIMED;
         }
@@ -511,7 +514,6 @@ inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block(
     if (!scheduler_task_ref_valid(graph, task) || slot_index >= SCHEDULER_PENDING_SLOT_COUNT ||
         local->slots[slot_index].state != SchedulerDispatchSlotState::FREE || admission->current_block_num == 0 ||
         scheduler_task_is_mix(admission->current_flags) ||
-        scheduler_task_requires_sync_start(admission->current_flags) ||
         scheduler_metadata_single_subtask_slot(admission->current_active_mask) == UINT8_MAX ||
         scheduler_task_ready_queue(admission->current_flags, admission->current_active_mask) !=
             local->config.self_core_type) {
@@ -597,15 +599,15 @@ inline __aicore__ bool scheduler_close_ordered_obligation(
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
     const int64_t task = admission->current_task_ref;
     if (scheduler_task_ref_is_null(task)) return true;
-    if (!scheduler_task_ref_valid(graph, task) || scheduler_task_is_mix(admission->current_flags) ||
-        scheduler_task_requires_sync_start(admission->current_flags))
+    if (!scheduler_task_ref_valid(graph, task) || scheduler_task_is_mix(admission->current_flags))
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER);
     for (const auto &slot : local->slots)
         if (slot.cooperative && slot.task_ref == task && slot.state != SchedulerDispatchSlotState::FREE) return true;
     const uint64_t cursor =
         scheduler_gm_fetch_add(scheduler_task_control_at(base, local, task)->next_block, UINT64_C(0));
-    if (cursor < admission->current_block_num) return true;
-    if (cursor != admission->current_block_num || admission->scan_cursor >= admission->capacity)
+    if (cursor < admission->current_block_num && !admission->sync_claimed) return true;
+    if (cursor > admission->current_block_num || (admission->sync_claimed && cursor == 0) ||
+        admission->scan_cursor >= admission->capacity)
         return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
     scheduler_protocol_member_closed(base, local, admission, cursor, 0, 0);
     ++admission->scan_cursor;
@@ -613,6 +615,7 @@ inline __aicore__ bool scheduler_close_ordered_obligation(
     admission->current_block_num = 0;
     admission->current_active_mask = 0;
     admission->current_flags = 0;
+    admission->sync_claimed = false;
     *closed = true;
     return true;
 }

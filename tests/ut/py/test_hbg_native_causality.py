@@ -26,6 +26,86 @@ def test_complete_wire_protocol_across_pure_mix_and_waves(mask, blocks):
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True
 
 
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+def test_sync_start_uses_distinct_positions_within_capacity(mask):
+    blocks = 4 if mask in (2, 4) else 2
+    raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,)).run()
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+def test_sync_start_capacity_is_not_pending_slot_count(mask):
+    blocks = 5 if mask in (2, 4) else 3
+    raw, identities = ProtocolBuilder([(mask, blocks, ())], sync_tasks=(0,)).run()
+    assert audit_protocol_sequences(raw)["sequence_integrity_verified"] is True
+    with pytest.raises(ValueError, match="sync_start.*capacity"):
+        audit_native_protocol(raw, identities)
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+def test_sync_start_rejects_two_blocks_on_one_position_even_if_first_returned(mask):
+    builder = ProtocolBuilder([(mask, 2, ())], sync_tasks=(0,))
+    builder.admit(0)
+    worker = 0 if mask & 1 or mask == 6 else 1
+    for block in range(2):
+        if mask.bit_count() > 1:
+            builder.mix_block(0, block, 0)
+        else:
+            owner = builder.claim(0, block, worker)
+            builder.execute(0, block, mask.bit_length() - 1, worker, owner=owner)
+    builder.actor(0, worker, "completion")
+    builder.close(0)
+    assert audit_protocol_sequences(builder.raw)["sequence_integrity_verified"] is True
+    with pytest.raises(ValueError, match="sync_start.*position"):
+        audit_native_protocol(builder.raw, builder.identities)
+
+
+@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+def test_sync_start_local_close_and_next_task_can_precede_remote_claim(mask):
+    builder = ProtocolBuilder([(mask, 2, ()), (mask, 2, ())], sync_tasks=(0, 1))
+    builder.admit(0)
+    builder.admit(1, observe_members=False)
+    mixed = mask.bit_count() > 1
+    for block, cluster in enumerate((0, 1)):
+        workers = [cluster * 3 + lane for lane in range(3)] if mixed else [cluster * 3 + int(mask != 1)]
+        for task in (0, 1):
+            if task == 1:
+                for member in builder.raw["members"]:
+                    if member["task_ref"] == task and member["worker_index"] in workers:
+                        builder.stamp(member, "observed")
+            if mixed:
+                builder.mix_block(task, block, cluster)
+            else:
+                owner = builder.claim(task, block, workers[0])
+                builder.execute(task, block, mask.bit_length() - 1, workers[0], owner=owner)
+            if block == 1:
+                builder.actor(task, workers[0], "completion")
+            for worker in workers:
+                builder.close(task, worker)
+    for task in (0, 1):
+        for member in builder.raw["members"]:
+            if member["task_ref"] != task or member["closed"][1]:
+                continue
+            if not member["observed"][1]:
+                builder.stamp(member, "observed")
+            builder.close(task, member["worker_index"])
+    assert audit_native_protocol(builder.raw, builder.identities)["protocol_verified"] is True
+    fast = next(row for row in builder.raw["members"] if row["closed_cursor"] == 1)
+    fast["closed_cursor"] = 0
+    with pytest.raises(ValueError, match="close cursor"):
+        audit_native_protocol(builder.raw, builder.identities)
+
+
+@pytest.mark.parametrize("mask", (2, 3, 5, 6, 7))
+def test_sync_start_zero_work_member_cannot_close_before_cursor_exhaustion(mask):
+    raw, identities = ProtocolBuilder([(mask, 2, ())], clusters=3, sync_tasks=(0,)).run()
+    assert audit_native_protocol(raw, identities)["protocol_verified"] is True
+    idle = next(row for row in raw["members"] if row["worker_index"] == (6 if mask != 2 else 4))
+    idle["closed_cursor"] = 1
+    with pytest.raises(ValueError, match="close cursor"):
+        audit_native_protocol(raw, identities)
+
+
 def test_host_completed_service_and_kernel_dependencies_remain_distinct():
     raw, identities = ProtocolBuilder([(None, 0, ()), (1, 1, (0,)), (0, 1, (1,)), (6, 2, (2,))]).run()
     assert audit_native_protocol(raw, identities)["protocol_verified"] is True

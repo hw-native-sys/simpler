@@ -1320,7 +1320,16 @@ bool create_scheduler_state(
         if (active_aiv_subtasks != 0) {
             ++aiv_task_count;
         }
-        const auto demand = scheduler_minimum_worker_demand(active_mask);
+        auto demand = scheduler_minimum_worker_demand(active_mask);
+        if (slot.task_attrs.requires_sync_start() &&
+            !scheduler_resident_worker_demand_checked(active_mask, logical_block_num, true, worker_count, &demand)) {
+            LOG_ERROR(
+                "A5 HBG AICore scheduler: sync-start task ref=%" PRId64
+                " block_num=%u mask=%u exceeds distinct execution positions in %d workers",
+                task_ref, logical_block_num, static_cast<uint32_t>(active_mask), worker_count
+            );
+            return false;
+        }
         aic_worker_demand = std::max<uint64_t>(aic_worker_demand, demand.aic);
         aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, demand.aiv);
         if (!inline_dispatch_task) {

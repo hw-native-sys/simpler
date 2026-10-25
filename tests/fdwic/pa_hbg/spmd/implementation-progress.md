@@ -1382,3 +1382,138 @@ dependency_timing_guard 均为 true，原始 case 仍与基线一致。
 全部适用 pre-commit 检查通过，日志 `outputs/spmd-native-causality-precommit-final-r3-20261025.log`。
 本次阶段提交包含审计、转换器／CSA 接线、TDD 和中文状态记录，不含输出产物或用户未跟踪内容，
 仅本地提交，不 push。后续继续 sync_start 和无完整插桩的性能验证。
+
+## 2026-10-25：sync_start 的不同位置领取与局部推进
+
+起点 `67251d83c`。上轮仅报告完成度，没有代码推进；本节继续目标中的 sync_start，
+保留完成驱动依赖、每核自主执行、GM Mix 和原样 CSA，不增加全员启动／完成屏障。
+
+复用现有 C++ 生产调度夹具，增加纯 C/V 的两槽至多一次领取、早返回后不再次领取、
+发布未来任务不清除当前绑定、快核先进入独立满核 B、普通后继恢复双槽分波，
+以及零工作成员只等领取耗尽、不等 TaskDone。Mix 四种 mask 检查本 cluster 早关闭、
+远端未领取时进入 B、mailbox 被 B 复用后迟到 AIV 仍能消费 A 的保留 seal。
+首轮测试编译暴露测试代码误用仅接收 int64 的 scheduler_gm_load 读取 uint64 计数；
+改用原有 fetch_add(0)，未修改原语。随后 11 个新增行为测试实际失败，见
+`outputs/spmd-sync-start-cpp-red-20261025.log`。
+
+实现仅在本核准入状态增加 sync_claimed，成功 CAS 后置位，跨 kernel 返回保留，
+只在当前义务关闭／新义务装入时清除，不在未来任务准入时清除。
+本地状态由 224B 增至 232B，主 SchedulerLocalState 和共享 POD 布局不变。
+纯 C/V 完成自身槽退役后可按实际 cursor 提前关闭；未领取成员仍等 cursor=N。
+Mix 每 cluster 至多一组，本组全部 release、聚合完成后 AIC 才能提前发 seal，
+AIV 仍逐一核验保留 seal，不用 cursor 替代资源收尾。11 个用例转绿；随后扩展夹具为
+实际大小的三 cluster，补四种 mask 的零工作 cluster／最后组尚未发布反例，共新增 15 项，
+两个目标通过，日志 `outputs/spmd-sync-start-cpp-green-r2-20261025.log`。
+
+原生审计新增 33 项 sync_start 检查，先实际 RED，见
+`outputs/spmd-sync-start-audit-red-20261025.log`。审计依据冻结拓扑检查不同位置容量，
+拒绝同核／同 cluster 重复领取；允许已领取成员退役后提前关闭，未领取成员不能提前关闭。
+关闭 cursor 的关键读限制在本核前一事件与 closed 之间，并与前后原子领取线性化点连接；
+不把读到的 cursor 强行视为 closed stamp 时刻的全局值。Mix seal 约束改接实际读值，
+保留全部 release 和组退役约束。新增测试及原有测试共 99 项通过，日志
+`outputs/spmd-sync-start-audit-green-20261025.log`。
+
+Host 入口正在接通独立容量检查与 demand：普通任务不按 N 占核，sync_start 纯 C/V
+按 N 个对应类型核、Mix 按 N 个完整 cluster（包括 inactive 资源 lane）计算。
+N=1 sync_start、multi-block predicate、Graph／async 的原有边界不扩大。
+容量 helper 的编译测试发现头文件包含顺序依赖，待当前构建结束后修正并复验；
+此处尚无新 runtime 或 A5 验收通过的声明。
+
+原生用例复用现有记录器，加入实际跨 block 等待和 block 0 早返回两类 kernel 行为，
+等待超过 5 秒写错误并返回，不把超时当作成功。覆盖两份独立任务、三种规模、
+纯 V 满 64 block、Mix 满 32 block、17 次任务复用；仍强制本轮 resident 来源与精确 golden。
+上板前按 onboard-arch-precheck 工作流检查；脚本因 npu-smi 不在 PATH 无法检测，
+CANN query 实际确认 Ascend950PR_958b、32 C／64 V。task-submit 不存在，
+按用户明确要求直接使用设备 0，不声称队列隔离。构建、上板和回归结果续记。
+
+容量 helper 的包含顺序问题已通过显式使用平台容量常量和头文件解决；
+首轮 runtime 构建也确实报同一错误，没有用旧二进制报通过。
+修正及格式整理后的重编成功，日志 `outputs/spmd-sync-start-runtime-build-r3-20261025.log`。
+17 个 C++ targets 共 621 项通过，Python 相关选择集 1945 项通过；日志
+`outputs/spmd-sync-start-all-cpp-r2-20261025.log`、`outputs/spmd-sync-start-python-r2-20261025.log`。
+相对上一提交新增 C++ 17 项、Python 47 项，不把修改的既有 shape 测试重复计作新增。
+
+仿真探针首跑因用户 kernel 默认 include 路径不含 inner_kernel.h 编译失败。
+测试夹具改为按已选 platform 附加原有 sim/onboard AICore 头文件目录，
+复用现成编译器／缓存与 get_sys_cnt_aicore，不增加 feature macro 或新的时钟实现。
+修正后 C/V/Mix 三项仿真小规模同步通过；A5 七种 mask 的 N=2 同步均通过。
+日志 `outputs/spmd-sync-start-sim-smoke-r2-20261025.log` 与
+`outputs/spmd-sync-start-native-20261025/smoke.log`。
+
+首轮完整矩阵暴露两类问题，失败记录保留。
+仿真的实际拓扑为 8 C／16 V（原生协议 worker_count=24，代码 SIM_AUTO_BLOCKDIM=8），
+32／64 block 的 sync_start 被 Host 正确拒绝，不能把普通分波矩阵直接用作共同驻留矩阵。
+现按平台分别覆盖满核：仿真 C/Mix=8、V=16，A5 C/Mix=32、V=64；小规模 2／7 共同覆盖。
+两个平台各有 47 个成功场景，没有用 skip 或放宽容量来掩盖失败。
+
+A5 首轮满核部分场景在探针内等待 5 秒后报错，见
+`outputs/spmd-sync-start-native-20261025/matrix.log`。
+读取失败捕获确认所有 block 位置唯一、协议因果审计通过，但部分 kernel 持续约 5e9 cycles。
+检查探针发现其只在 ld_dev query 看见目标计数后才进行关键原子读；
+scheduler_memory.h 已明确 query 可能看不到尚未从原子单元排出的写入，不能把它作为唯一进度条件。
+探针改为直接原子读取 arrival 计数，保持原 5 秒 timeout 和完整 golden，不修改生产调度原语。
+修正后的新一轮仿真／A5 各 47 项全部通过，日志
+`outputs/spmd-sync-start-sim-matrix-r2-20261025.log` 与
+`outputs/spmd-sync-start-native-20261025/matrix-r2.log`。两组输出目录无重合；失败捕获未计入通过数。
+
+另增加独立私有 worker 的真实 Host 拒绝测试，防止故意 bind 失败污染正常 scene worker。
+首轮使用旧用例中的 -1000 异常码不符当前 API，实际为 prepare_native_run 的 -7。
+继续核对日志发现超容量已由既有 Host orchestration 的 REQUIRE_SYNC_START_INVALID 提前拒绝，
+不会到达新增 resident maker demand 检查。测试应核验这个真实拒绝原因；
+新增 maker 检查和完整 cluster demand 则由 C++ helper 覆盖，不能把二者混称同一路径。
+
+N=1 的公共接口行为还发现一处契约不一致：common Host submit_task 仅在 N>1 时设置
+SYNC 标志，N=1 的 LaunchSpec 请求被归一化为普通单 block；因此公共接口不会触发
+resident maker 中“已经带 SYNC 标志但 N=1”的拒绝。这是既有行为，不是本次放开的结果。
+当前参考文档和 CPU 模型把 N=1 写成拒绝，尚未区分公共请求与设备 metadata。
+已向用户询问保留归一化还是改变共用 HBG 接口，未擅自修改 common Host。
+N=1 公共接口的七项 RED 保留，不能声称全部边界验收完成；
+超容量七项单独复验，原样 CSA 与已有 HBG 回归继续执行。
+
+通过标准转换器逐份复验修正后的 94 份捕获：仿真 47 份共 20402 个事件／1093 条执行，
+A5 47 份共 54914 个事件／2629 条执行，均获得 protocol_verified=true。
+仿真有 28 条、A5 有 14 条本核关闭记录的实际 cursor 仍小于 N，
+证明生产路径确实使用了提前局部关闭，而非只在模型中允许；不能据此单独断言下一任务
+一定早于远端返回，后一个合同另由生产 helper 的可控交错覆盖。
+日志 `outputs/spmd-sync-start-native-audit-20261025.log`。
+
+超容量七项在仿真与 A5 的实际资源子进程中逐项通过；外层汇总为 7 deselected，
+不能把外层数字当作通过数。日志 `outputs/spmd-sync-start-capacity-sim-overflow-20261025.log`
+与 `outputs/spmd-sync-start-native-20261025/capacity-overflow.log`。
+这次没有重跑 N=1 的七项未决断言，未将它们算成通过。
+
+已有 HBG 仿真回归首轮 41 passed、1 failed：
+`TestSpmdShapeSelection` 的 sync_start N=2 仍要求 mode=4，实际输出正确且 mode=1。
+这是新能力开放后需要加严到 resident 的旧期望，不应删除来源检查或允许两种模式；
+等正在运行的 A5 回归结束后再修改该文件并重跑。日志
+`outputs/spmd-sync-start-hbg-sim-20261025.log`。
+
+将已有 shape-selection 的 sync_start N=2 来源断言加严到 resident 后，完整 HBG 回归
+仿真 42 passed、A5 60 passed／4 skipped。日志
+`outputs/spmd-sync-start-hbg-sim-r2-20261025.log`、
+`outputs/spmd-sync-start-native-20261025/hbg-r2.log`。
+仅排除已知误收集的双卡 TMR 项，以及尚有 N=1 契约争议的新私有 worker 测试文件；
+后者的七项超容量已有独立通过证据，不把七项 N=1 RED 混入全绿声明。
+
+原样 CSA 新一轮严格 L4 `outputs/csa-hbg-l4-jrabrt2o/result.json` 通过，
+case_sources_match_baseline、block_identity_verified、protocol_verified、
+distributed_scheduler_verified、dependency_timing_guard 均为 true，producer=aicore；
+仍为两轮各七项 golden、2308 条执行身份及 133 条依赖边，未修改 CSA kernel 或构图。
+
+本次阶段提交限定已验证的 N>1 sync_start、对应审计／探针、既有来源断言与状态文档。
+新私有 worker 文件 `tests/st/a5/host_build_graph/sync_start_capacity/test_sync_start_capacity.py`
+保留在本地未提交：其中七项超容量已通过，七项 N=1 预期仍待用户确认，不能进入本次绿灯提交。
+N=1 的现有公共归一化未改变；完整目标仍须收口该契约，并完成无完整插桩的性能比较。
+
+最终 Python 选择集再次 1945 项通过，日志 `outputs/spmd-sync-start-python-final-20261025.log`；
+全部适用 pre-commit 检查通过，日志 `outputs/spmd-sync-start-precommit-final-20261025.log`。
+既有普通 90 场景也在新探针参数布局下重新执行，结果续记；这些普通场景不启用 sync_start。
+
+新参数布局下的普通 C/V／Mix 90 场景在仿真和 A5 均全部通过，含 N=512 分波和 17 task 复用，
+日志 `outputs/spmd-sync-start-ordinary-sim-20261025.log`、
+`outputs/spmd-sync-start-native-20261025/ordinary.log`。没有让不同平台同时写入同名 case 输出目录。
+
+普通矩阵另通过标准转换器复验 180 份捕获：仿真 427122 个事件、A5 459234 个事件，
+各 26303 条执行全部通过原生审计，日志 `outputs/spmd-sync-start-ordinary-audit-20261025.log`。
+本次合计重新审计普通／sync_start 矩阵 274 份捕获，CSA 独立验收不混入该数量。
+阶段提交仅本地保存，不 push；提交后按新 HEAD 重编绑定与 runtime，避免后续运行命中旧提交缓存。

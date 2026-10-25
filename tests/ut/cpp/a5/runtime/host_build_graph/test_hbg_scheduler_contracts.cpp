@@ -98,14 +98,52 @@ TEST(AicoreSchedulerState, ResidentShapeRejectsSubtaskProductOverflowAndInvalidD
     }
 }
 
-TEST(AicoreSchedulerState, ResidentKeepsSyncStartOnLegacyForAllSubtaskShapes) {
+TEST(AicoreSchedulerState, ResidentSyncStartShapeRequiresMultipleBlocksAndSeparateCapacityCheck) {
     for (uint32_t active : {1U, 2U, 3U}) {
-        for (uint32_t blocks : {1U, 2U, 32U, 33U, 65U, 512U}) {
+        for (uint32_t blocks : {2U, 32U, 33U, 65U, 512U}) {
             SCOPED_TRACE(active);
             SCOPED_TRACE(blocks);
-            EXPECT_FALSE(scheduler_resident_task_shape_supported(active, blocks, true));
+            EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, true));
+        }
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, 1, true));
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, 0, true));
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, UINT32_MAX, true));
+    }
+}
+
+TEST(AicoreSchedulerState, SyncDemandCountsDistinctCoresOrCompleteResourceClusters) {
+    for (uint64_t workers : {3U, 6U, 9U, 96U, 108U}) {
+        for (uint8_t mask : {1U, 2U, 4U, 3U, 5U, 6U, 7U}) {
+            SCOPED_TRACE(workers);
+            SCOPED_TRACE(mask);
+            const uint32_t positions = static_cast<uint32_t>(workers / 3) * ((mask == 2 || mask == 4) ? 2 : 1);
+            for (uint32_t blocks : {1U, 2U, positions, positions + 1, 512U, UINT32_MAX}) {
+                SCOPED_TRACE(blocks);
+                SchedulerMinimumWorkerDemand demand{};
+                const bool valid = blocks > 1 && blocks <= positions;
+                EXPECT_EQ(scheduler_resident_worker_demand_checked(mask, blocks, true, workers, &demand), valid);
+                if (valid) {
+                    const bool mix = __builtin_popcount(mask) > 1;
+                    EXPECT_EQ(demand.aic, (mix || mask == 1) ? blocks : 0u);
+                    EXPECT_EQ(demand.aiv, mix ? blocks * 2 : (mask == 1 ? 0 : blocks));
+                }
+            }
+            SchedulerMinimumWorkerDemand ordinary{};
+            ASSERT_TRUE(scheduler_resident_worker_demand_checked(mask, 512, false, workers, &ordinary));
+            const auto expected = scheduler_minimum_worker_demand(mask);
+            EXPECT_EQ(ordinary.aic, expected.aic);
+            EXPECT_EQ(ordinary.aiv, expected.aiv);
         }
     }
+}
+
+TEST(AicoreSchedulerState, ResidentDemandRejectsInvalidTopologyMaskAndOutput) {
+    SchedulerMinimumWorkerDemand demand{};
+    for (uint64_t workers : {UINT64_C(0), UINT64_C(1), UINT64_C(5), UINT64_C(109), UINT64_C(111), UINT64_MAX})
+        EXPECT_FALSE(scheduler_resident_worker_demand_checked(1, 2, true, workers, &demand));
+    for (uint8_t mask : {0U, 8U, 255U})
+        EXPECT_FALSE(scheduler_resident_worker_demand_checked(mask, 2, true, 96, &demand));
+    EXPECT_FALSE(scheduler_resident_worker_demand_checked(1, 2, true, 96, nullptr));
 }
 
 TEST(AicoreSchedulerState, OrdinaryMixMasksCanExecuteMoreBlocksThanPhysicalClusters) {

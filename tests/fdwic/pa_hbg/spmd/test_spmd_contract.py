@@ -13,10 +13,14 @@ Ordinary C/V and GM Mix retain their original block counts, including waves beyo
 physical capacity. A numerically correct legacy fallback MUST fail the mode assertion.
 """
 
+import copy
+
 import torch
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
+from simpler_setup.kernel_compiler import KernelCompiler
+from simpler_setup.scene_test import _pto_isa_compile_cache_token, compile_chip_callable_spec
 
 _RECORD_WORDS = 16
 _BLOCK_COUNTS = (1, 2, 3, 7, 31, 32, 33, 63, 64, 65, 96, 128, 129, 512)
@@ -81,6 +85,19 @@ class TestHbgSpmdContract(SceneTestCase):
         for mask in _MASKS
     ]
 
+    @classmethod
+    def compile_chip_callable(cls, platform):
+        compiler = KernelCompiler(platform=platform)
+        variant = "sim" if platform.endswith("sim") else "onboard"
+        spec = copy.deepcopy(cls.CALLABLE)
+        for kernel in spec["incores"]:
+            kernel["extra_include_dirs"] = [
+                *kernel.get("extra_include_dirs", []),
+                str(compiler.platform_dir / variant / "aicore"),
+            ]
+        cache_key = (cls.__module__, cls.__qualname__, platform, cls._st_runtime, _pto_isa_compile_cache_token())
+        return compile_chip_callable_spec(spec, platform, cls._st_runtime, cache_key)
+
     def generate_args(self, params):
         records_per_task = params["blocks"] * 3 + 1  # Extra record catches an out-of-range context.
         return TaskArgsBuilder(
@@ -90,6 +107,7 @@ class TestHbgSpmdContract(SceneTestCase):
             Scalar("mask", params["mask"]),
             Scalar("tasks", params["tasks"]),
             Scalar("tail_delay", params["tail_delay"]),
+            Scalar("sync_mode", params.get("sync_mode", 0)),
         )
 
     def compute_golden(self, args, params):
@@ -104,6 +122,8 @@ class TestHbgSpmdContract(SceneTestCase):
                         record[8:12] = torch.tensor([block + 1, params["blocks"], slot + 1, task + 1])
                         entries += 1
         args.summary[0] = entries
+        if params.get("sync_mode", 0):
+            records[:, -1, 2] = params["blocks"] * params["mask"].bit_count()
 
     def _run_and_validate(self, worker, *args, **kwargs):
         assert not kwargs.get("skip_golden", False), "contract acceptance cannot skip golden or invocation provenance"

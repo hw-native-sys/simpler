@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Pure AIC N=2 is resident; sync_start N=2 requires explicit legacy selection."""
+"""Ordinary and sync_start pure AIC N=2 both require fresh resident selection."""
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -68,7 +68,7 @@ class TestSpmdShapeSelection(SceneTestCase):
         count = self._selection_worker.scheduler_mode_publish_count
         assert count > self._selection_publish_count, "no fresh scheduler selection for this invocation"
         mode = self._selection_worker.scheduler_runtime_mode
-        expected_modes = (4,) if params["require_sync_start"] else (1, 2)
+        expected_modes = (1, 2)
         assert mode in expected_modes, f"expected scheduler mode {expected_modes}, invocation mode={mode}"
         self._selection_publish_count = count
         super().compare_outputs(test_args, golden_args, output_names, params)

@@ -15,7 +15,8 @@
 GM Mix 已接入且可与纯多 block 同图：六种 mask 矩阵在仿真／A5 各 270 次通过，
 新 44 个 GM 事件场景各 180 次通过。原样 CSA 七项 golden 和严格 resident L4 门禁已通过。
 首错误身份与退出冷日志已接线；显式 block/slot 身份及原样 CSA 的身份审计通过；
-完整协议事件 trace、sync_start 和性能比较仍未完成；
+完整原生协议采集、因果审计和 CSA 严格门禁已通过；N>1 sync_start 的仿真／A5
+各 47 项及原生审计通过，N=1 公共契约待确认，性能比较仍未完成；
 逐轮日志、失败修复证据和能力边界见实现过程。
 
 ## 一、四层检查分别证明什么
@@ -25,7 +26,7 @@ GM Mix 已接入且可与纯多 block 同图：六种 mask 矩阵在仿真／A5 
 | CPU 合同模型 | [model.py](../../../ut/py/hbg_spmd_contracts/model.py)、[types.py](../../../ut/py/hbg_spmd_contracts/types.py) | 身份、成员、动态领取、局部顺序、完成与代次；不是运行时实现 |
 | 交错与独立审计 | [explorer.py](../../../ut/py/hbg_spmd_contracts/explorer.py)、[trace_audit.py](../../../ut/py/hbg_spmd_contracts/trace_audit.py) | 穷举小状态空间、保留错误反例；独立检查事件，不调用模型状态转换来判对错 |
 | C++ 生产 helper | 原语、准入及 [有序执行测试](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_ordered_execution.cpp) | 真实 ready/dispatch/completion/helper；可控槽状态和重复完成，不证明设备 cache 或实际 kernel |
-| 原生 HBG 入口 | [test_spmd_contract.py](test_spmd_contract.py)、[test_ordered_execution.py](test_ordered_execution.py)、[kernels](kernels) | 实际 Host 编排、runtime、AIC/AIV kernel；本轮来源、完整身份、原 N、依赖及独立任务重叠 |
+| 原生 HBG 入口 | [test_spmd_contract.py](test_spmd_contract.py)、[test_ordered_execution.py](test_ordered_execution.py)、[test_sync_start.py](test_sync_start.py)、[kernels](kernels) | 实际 Host 编排、runtime、AIC/AIV kernel；本轮来源、完整身份、原 N、依赖、独立任务重叠及跨 block 等待 |
 
 CPU 包中另外有 [test_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_native_fixture.py)，
 检查原生用例的 golden、来源门禁、保护区和错误检测器本身；不能把它计作设备执行。
@@ -57,21 +58,24 @@ CPU 包中另外有 [test_native_fixture.py](../../../ut/py/hbg_spmd_contracts/t
 也不以 CPU 原子结果代替 A5 cache 可见性或原生 block 执行验收。
 
 [test_hbg_ordered_execution.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_ordered_execution.cpp)
-共 42 项，直接驱动生产有序填槽、entry gate 和完成路径：24 项 C/V 容量形状，
+共 59 项，直接驱动生产有序填槽、entry gate 和完成路径，包括 24 项 C/V 容量形状，
 8 项完成／LocalDone／候选所有权／predicate 停放行为，2 项无 SSBUF 的 N=3→N=1 依赖链，
 4 项普通队列探测时间和 2 项 COOPERATIVE 不伪造探测时间，另有 2 项真实 direct 后继
-延迟发布必须标记 DISPATCH、不能被误当作 inline refill 的检查。计时检查使用真实 CPU_SIM 时钟。
+延迟发布必须标记 DISPATCH、不能被误当作 inline refill 的检查；还覆盖显式身份、原生记录，
+以及新增 7 项 sync_start 至多一次领取、早返回、满核共同顺序、普通后继和零工作成员。
+计时检查使用真实 CPU_SIM 时钟。
 [test_ordered_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_ordered_native_fixture.py)
 共 96 项，检查 32 场景夹具、坏记录、真假依赖、反向准入及每轮复用来源；这些仍是 CPU 检查。
 
 [test_hbg_gm_mix.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_gm_mix.cpp)
-共 61 项，检查真实 descriptor/ack/seal、四种 mask、固定物理 lane、原 N、暂停最后发布者、
-旧／未来 ack、错误身份、保留 seal、零工作成员、局部跨 task 推进及无新 kernel 的退出 drain。
+共 78 项，检查真实 descriptor/ack/seal、四种 mask、固定物理 lane、原 N、暂停最后发布者、
+旧／未来 ack、错误身份、保留 seal、零工作成员、局部跨 task 推进及无新 kernel 的退出 drain，
+并覆盖原生记录和新增 8 项 sync_start 早关闭、迟到 AIV、零工作 cluster／未发布组。
 [test_hbg_gm_mix_startup.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_gm_mix_startup.cpp)
-另 5 项直接调用生产 executor，覆盖 startup 直接 EXIT 的 seal 收尾、
+另 21 项直接调用生产 executor，覆盖 startup 直接 EXIT 的 seal 收尾、
 错误退出不伪造 seal，以及缺少协调者 seal 时的超时身份。
 [test_hbg_inline_services.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_inline_services.cpp)
-共 18 项，检查服务节点不产生 payload／generation／trace、三条 ready trace 路径、direct refill、
+共 19 项，检查服务节点不产生 payload／generation／trace、三条 ready trace 路径、direct refill、
 N2→Dummy→N1 依赖、Host 已完成节点、有限服务链和畸形 metadata。
 
 [test_gm_mix_execution.py](test_gm_mix_execution.py) 的 44 场景每轮 60 次调用，
@@ -272,6 +276,10 @@ python tests/fdwic/pa_hbg/spmd/test_spmd_contract.py -p a5 -d 0 --enable-chip-sw
 # AIV 完成到 Mix 后继的交接；可换成 -p a5 -d 0 在真机执行。
 python tests/fdwic/pa_hbg/spmd/test_aiv_mix_handoff.py -p a5sim --rounds 3
 
+# sync_start：跨 block 等待与 block 0 早返回，必须是 resident；超时写错误，不能当通过。
+python tests/fdwic/pa_hbg/spmd/test_sync_start.py -p a5sim --enable-chip-swimlane 4
+python tests/fdwic/pa_hbg/spmd/test_sync_start.py -p a5 -d 0 --enable-chip-swimlane 4
+
 # 与用户原图逐项核对；原图缺失会明确失败。普通 UT 仅依赖小夹具。
 python -m pytest tests/fdwic/pa_hbg/spmd/test_cla_source.py -q
 
@@ -349,10 +357,11 @@ retire、block_done、task_done、cluster_close、local_done。
 start 必须给 task/block/slot/worker/N/order/generation/source，完整性检查不能猜缺失字段。
 
 当前样例 producer 明确是 reference；审计器默认要求 aicore，因此不能直接拿模型数据冒充设备结果。
-生产泳道的逐 block 索引和 reg_task_id 连接键已接入，但尚不输出完整的 order、LocalDone、
-GM 组生命周期事件；L1/L4 的转换与逐 block 检查也不能单独证明这一完整合同。
+生产 L4 已使用独立的 hbg-native-protocol-v1 格式采集 order、LocalDone 和 GM 组生命周期，
+由统一原生读端与因果审计器验证，并与独立 kernel 入口身份连接；不是把模型事件改名后输出。
+只有存在完整原生协议且审计通过才得到 protocol_verified，历史无协议捕获仍保持未验证。
 tick 是适配格式内的因果事件序号，不是已经验证过的跨核统一 cycle。
-接 native 时必须从实际采集到的发布／执行身份构造可验证因果序，
+原生审计从实际采集到的发布／执行身份、逐核序号与原子观察构造因果约束，
 缺少事件或无法确定次序时失败，不能为了通过校验事后编造事件。
 还要描述 own slot 与 Mix group 的不同 generation 域；不能将模型的单一 lease 序号
 直接等同于现有两通道的原始计数器。

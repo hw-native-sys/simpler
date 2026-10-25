@@ -14,7 +14,7 @@
 #include "orchestration_api.h"
 
 extern "C" __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &) {
-    return OrchestrationConfig{.expected_arg_count = 6};
+    return OrchestrationConfig{.expected_arg_count = 7};
 }
 
 extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
@@ -22,6 +22,7 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
     const auto mask = static_cast<uint32_t>(orch_args.scalar<int64_t>(1));
     const auto tasks = static_cast<uint32_t>(orch_args.scalar<int64_t>(2));
     const auto delay = orch_args.scalar<int64_t>(3);
+    const auto sync_mode = orch_args.scalar<int64_t>(4);
     const uint32_t shape[1] = {(static_cast<uint32_t>(blocks) * 3 + 1) * 16};
     MixedKernels kernels;
     kernels.aic_kernel_id = (mask & 1U) ? 0 : INVALID_KERNEL_ID;
@@ -36,7 +37,9 @@ extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry
         args.add_scalar(static_cast<int64_t>(mask));
         args.add_scalar(static_cast<int64_t>(task));
         args.add_scalar(delay);
+        args.add_scalar(sync_mode);
         args.launch_spec.set_block_num(blocks);
+        args.launch_spec.set_require_sync_start(sync_mode != 0);
         rt_submit_task(kernels, args);
     }
     CoreTaskArgs verify;

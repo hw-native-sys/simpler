@@ -16,6 +16,7 @@
 #include <pto/pto-inst.hpp>
 
 #include "intrinsic.h"
+#include "inner_kernel.h"
 #include "scheduler/scheduler_memory.h"
 #include "tensor.h"
 
@@ -55,6 +56,19 @@ static inline __aicore__ void record_execution(__gm__ int64_t *args, int32_t slo
     if (block < 0 || block >= expected_blocks || blocks != expected_blocks || !(mask & (1U << slot))) {
         scheduler_gm_fetch_add(records[expected_blocks * 3].atomic_padding[0], 1);
         return;
+    }
+    if (args[5] != 0) {
+        auto &arrived = records[expected_blocks * 3].atomic_padding[1];
+        scheduler_gm_fetch_add(arrived, 1);
+        const uint64_t expected = static_cast<uint64_t>(blocks) * __builtin_popcount(mask);
+        const uint64_t started = get_sys_cnt_aicore();
+        while (args[5] != 2 || block != 0) {
+            if (scheduler_gm_fetch_add(arrived, 0) == expected) break;
+            if (get_sys_cnt_aicore() - started > PLATFORM_PROF_SYS_CNT_FREQ * 5) {
+                scheduler_gm_fetch_add(records[expected_blocks * 3].atomic_padding[2], 1);
+                break;
+            }
+        }
     }
     // Delay before the final publication, exposing consumers released on claim exhaustion.
     if (block + 1 == blocks) {

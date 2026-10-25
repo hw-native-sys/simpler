@@ -11,7 +11,8 @@
 设计基线为 f5cc679bb，约定更新于 2026-10-23。纯 C/V 与 GM Mix 普通多 block 已接入生产执行路径；
 原样 CSA 的七项 golden 和严格 resident L4 门禁已通过；
 首错误身份、退出冷日志及显式 block/slot 身份已接线；原样 CSA 身份审计已通过。
-L4 原生协议采集、因果审计和原样 CSA 严格门禁已通过；sync_start 和性能比较仍待完成。
+L4 原生协议采集、因果审计和原样 CSA 严格门禁已通过；N>1 的 sync_start 已接线，
+仿真／A5 各 47 项及原生审计通过；N=1 公共请求的契约差异待确认，性能比较仍待完成。
 下文区分当前能力与目标合同，2026-10-25 起的编码和实测证据集中记录在
 [实现过程](spmd/implementation-progress.md)，不以结构或接口存在代替执行验收。
 
@@ -80,14 +81,16 @@ N=1 和多 block Mix 共用 GM 组协议，AIC 只负责组领取、身份发布
 
 ### 当前已接线与剩余边界
 
-- `scheduler_resident_task_shape_supported` 已允许普通 C/V/Mix 的原 N，
-  纯多 block 与 Mix 可以同图；sync_start 仍整图回退，多 block／Mix predicate 仍不支持。
+- `scheduler_resident_task_shape_supported` 允许普通 C/V/Mix 的原 N，以及 N>1 的 sync_start；
+  后者另由 Host 与准入准备检查不同执行位置容量，超容量拒绝，不按普通分波处理。
+  纯多 block 与 Mix 可以同图，多 block／Mix predicate 仍不支持。
 - Host 以执行形状的最小可用位置计算 demand，而不是要求全部普通 block 同时占核。
-  纯 C/V 可跨多波执行；这不是 sync_start 的不同位置容量证明。
+  纯 C/V 可跨多波执行；sync_start 的 demand 独立按 N 个对应核或完整 cluster 计算。
 - own/direct 路径通过同一有序 entry gate；每核最多两份不可撤销的 block 领取。
   每次 payload 准备写入原 N 和实际 block，N=1 与多 block 反复复用也不保留旧 context。
 - 只有最后一个 block 完成才沿既有 wake-list 释放逻辑后继。
-  本核在 cursor=N 且已领取工作全部退役后关闭义务，不等待远端 TaskDone。
+  普通任务在 cursor=N 且本核已领取工作全部退役后关闭义务，不等待远端 TaskDone。
+  sync_start 每个位置至多领取一次，已领取者退役即可关闭；未领取者仍等 cursor=N。
 - trace 存储、完成索引和导出连接键已区分 block；kernel 入口采集原 N、block/slot、
   generation、epoch/order/group 和 cluster/lane，独立对象保留到原始及 Perfetto 泳道。
   L4 已采集并导出 LocalDone、共同准入、组发布／释放、执行许可和完成事件，

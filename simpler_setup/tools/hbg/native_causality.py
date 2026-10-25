@@ -55,6 +55,7 @@ class NativeAudit:
         self.admission_points = {}
         self.done_points = {}
         self.claim_points = {}
+        self.close_reads = {}
         self.payload_points = {}
 
     def chain(self, record, *fields):
@@ -109,20 +110,22 @@ class NativeAudit:
                 )
                 continue
             require(flags & EXECUTABLE and bool(flags & FANIN) == bool(deps), "invalid executable task metadata")
-            require(not flags & SYNC, "sync_start native contract is not enabled")
             require(task["trace_base"] == prefix <= (1 << 32) - 1, "noncontiguous frozen trace prefix")
             if flags & INLINE:
                 require(
                     mask == 2
                     and blocks == 1
                     and task["kernel_ids"] == [65535] * 3
-                    and not flags & (MIX | SPMD | PREDICATE),
+                    and not flags & (MIX | SPMD | SYNC | PREDICATE),
                     "invalid inline service",
                 )
                 continue
             active = mask.bit_count()
             require(0 < mask < 8 and 0 < blocks * active <= 32767, "invalid frozen task shape")
             require(bool(flags & MIX) == (active > 1) and bool(flags & SPMD) == (blocks > 1), "shape/flags mismatch")
+            if flags & SYNC:
+                positions = self.raw["cluster_count"] * (2 if mask in (2, 4) else 1)
+                require(1 < blocks <= positions, "sync_start distinct position capacity exceeded or N=1")
             require(not flags & PREDICATE or (active == blocks == 1), "unsupported cooperative predicate")
             for slot, kernel in enumerate(task["kernel_ids"]):
                 require(0 <= kernel < 65535 if mask & (1 << slot) else kernel == 65535, "invalid frozen kernel mapping")
@@ -261,9 +264,8 @@ class NativeAudit:
             self.causal.add(publication, point(member, "observed"))
             if not self.tasks[ref]["flags"] & MIX:
                 require(
-                    member["closed_cursor"] == self.tasks[ref]["block_num"]
-                    and member["close_seal"] == member["last_group_seq"] == 0,
-                    "pure member closed before cursor exhaustion or with a Mix seal",
+                    member["close_seal"] == member["last_group_seq"] == 0,
+                    "pure member closed with a Mix seal",
                 )
             frontiers[worker].append(member)
         for members in frontiers.values():
@@ -516,10 +518,33 @@ class NativeAudit:
                 "duplicate or missing block completion ticket",
             )
             self.ordered_intervals([b["owner"] for b in by_ticket], "completion_before", "completion_after")
+            owned = defaultdict(list)
+            for block in blocks:
+                owned[block["owner"]["worker_index"]].append(block["owner"]["block_idx"])
+            if self.tasks[ref]["flags"] & SYNC:
+                require(all(len(indices) == 1 for indices in owned.values()), "sync_start reused an execution position")
             for worker in self.task_members[ref]:
-                member = self.member(ref, worker)
-                if member["closed_cursor"] != MAX:
-                    self.causal.add(self.claim_points[(ref, self.tasks[ref]["block_num"] - 1)], point(member, "closed"))
+                if self.tasks[ref]["flags"] & MIX and self.positions[worker][1]:
+                    continue
+                self.close_cursor(ref, worker, owned[worker])
+
+    def close_cursor(self, ref, worker, owned):
+        task, member = self.tasks[ref], self.member(ref, worker)
+        cursor, blocks = member["closed_cursor"], task["block_num"]
+        require(
+            0 < cursor <= blocks
+            and all(block < cursor for block in owned)
+            and (cursor == blocks or (task["flags"] & SYNC and owned)),
+            "invalid close cursor: unclaimed work without a retired sync_start position",
+        )
+        closed = point(member, "closed")
+        read = ("close_cursor_read", ref, worker)
+        self.close_reads[(ref, worker)] = read
+        self.causal.add(("event", worker, closed[2] - 1), read)
+        self.causal.add(read, closed)
+        self.causal.add(self.claim_points[(ref, cursor - 1)], read)
+        if cursor < blocks:
+            self.causal.add(read, self.claim_points[(ref, cursor)])
 
     def completions(self):
         for ref, task in self.tasks.items():

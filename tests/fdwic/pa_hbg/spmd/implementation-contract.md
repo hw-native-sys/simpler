@@ -5,7 +5,8 @@
 共同准入、Host 预分配、纯 C/V 的 own/direct 入口、cursor 和 LocalDone 已接入生产路径。
 GM Mix 也已接入，原样 CSA 的数值与严格 resident L4 门禁已通过；
 首错误身份、退出冷日志及显式 block/slot 身份已接线，原样 CSA 身份审计通过；
-L4 原生协议采集、因果审计和原样 CSA 严格门禁已通过；sync_start 和性能比较仍未完成。
+L4 原生协议采集、因果审计和原样 CSA 严格门禁已通过；N>1 的 sync_start 已接线，
+仿真／A5 各 47 项及原生审计通过；N=1 公共请求契约待确认，性能比较仍未完成。
 本页保留全部目标合同；已实现字段和实测范围以 [实现过程](implementation-progress.md) 为准，
 不以存在字段替代执行验收。
 初始 TDD 覆盖和历史红绿状态见 [测试入口和验收状态](test-plan-and-status.md)。
@@ -44,7 +45,7 @@ GraphSummary 的现有 padding 承载协议 offset／容量／Host run_epoch，�
 AdmissionControl 的 lock/tail 各占 128B；GroupMailbox 为 descriptor 128B、
 published_seq 独占 128B、三个 lane ack 各 128B，共 640B。
 
-GM Mix 执行接线后，`SchedulerAdmissionLocalState` 为 224B，含两个各 48B 的候选和 40B 组状态；
+`SchedulerAdmissionLocalState` 为 232B，含两个各 48B 的候选、40B 组状态和 sync_claimed；
 `SchedulerLocalSlotState` 为 24B，含 block 身份和 predicate 缓存，
 `SchedulerLocalState` 为 504B。候选只保留 task 所有权与重建所需状态，
 不会增加物理并发容量，也不保存每核全图或全部 block 历史。
@@ -77,10 +78,16 @@ Mix 按完整 cluster；两个 pending slots 不是两个执行位置。
 多 block predicate、Graph body、异步返回先保留现有拒绝／整图回退，不顺手删除形状门禁。
 普通单 block predicate 的现有语义必须保留。
 
-当前 `scheduler_resident_task_shape_supported` 允许普通 C/V/Mix 的 N≥1，
+当前 `scheduler_resident_task_shape_supported` 允许普通 C/V/Mix 的 N≥1、sync_start 的 N>1，
 仍检查 N×active_subtasks≤32767；纯多 block 与 Mix 可以同图，不再设置组合隔离门禁。
 所有 Mix 包括 N=1 均走 GM，生产 resident 调度不使用 SSBUF。
-sync_start 仍回退；多 block／Mix predicate 沿用 Host 明确拒绝，不能当作已支持。
+`scheduler_resident_worker_demand_checked` 对 sync_start 检查实际完整拓扑和不同位置容量；
+Mix 按每 block 一 AIC、两 AIV 的资源需求计数，不把 inactive lane 当作可让出的资源。
+准入准备再次核验冻结拓扑与容量。多 block／Mix predicate 仍沿用 Host 明确拒绝。
+
+N=1 的边界需要区分两层：已经带 SYNC 标志的设备 metadata 不合法，仍明确拒绝；
+现有公共 LaunchSpec 提交入口只在 N>1 时设置该标志，因此 N=1 请求被归一化成普通任务。
+是否把公共入口也改成拒绝尚待用户确认；本次不擅自改变共用 Host 接口。
 
 ## 二、完成驱动准入及普通旁路的线性化
 
@@ -167,7 +174,8 @@ LocalContext 始终设置原 N 与本次 b；参数 view 不自动再加 block �
 进入下一任务的条件是 cursor 已封闭且本核已领取 work 全部发布、执行、完成。
 快核可以在远端最后一个 block 仍运行时满足该条件；零工作成员也可以合法关闭。
 
-后续 sync_start 可复用动态领取，但本核对该 task 至多成功一次，**早返回也不能再领一次**。
+sync_start 复用动态领取，本核对该 task 至多成功一次，**早返回也不能再领一次**。
+成功 CAS 后 sync_claimed 跨 kernel 返回保留，当前义务关闭后清除；发布未来任务不清除此状态。
 未领取成员只在 cursor 耗尽后关闭；已领取者完成自己义务后可关闭。
 N 不超过冻结成员容量，加上不可跳过前序义务、公平控制推进，保证剩余 block 最终有不同位置。
 不加全员 ARRIVED 屏障，也不等全部核空闲才让首个 block 开始。
@@ -256,7 +264,10 @@ TaskDone 和依赖，并与独立入口身份逐字段连接。
 二者不能混作连接键。
 
 审计按本核 sequence 建立顺序链，发布线性化点限制在实际 before／after 之间，
-跨核边来自原子票号、已读 tail／ack／seal 和冻结依赖，最后检查约束图有无矛盾环。
+跨核边来自原子票号、已读 tail／cursor／ack／seal 和冻结依赖，最后检查约束图有无矛盾环。
+sync_start 另核验每位置至多一次；提前关闭必须属于已领取并退役的位置。
+关闭时的 cursor 关键读位于本核前一事件与 closed 之间，实际值约束前后领取线性化点，
+不要求远端最后一块先被领取，也不把记录时刻冒充读发生的时刻。
 不按跨核 cycle 全局排序；普通 permit 的关键读可以早于新的共同准入，
 消费者观察也可以早于发布者记录 after。虚拟线性化点不是新增设备事件，不占用 sequence。
 `protocol_verified=true` 仅在完整审计通过时产生；历史无协议对象仍可读，但不能通过严格门禁。
@@ -314,7 +325,7 @@ AICPU 首写者明确记录未知 task/core/扩展身份，bootstrap/execution/t
 | 3 | 普通 C/V cursor、原 N、block 退役与分波 demand | N=1、容量两侧、512；晚 block 不早放后继；快核跨 task 重叠 | 原生纯 C/V 已有通过证据 |
 | 4 | GM descriptor/ack/seal，各 lane 自备 payload，无 SSBUF | mask 3/5/6/7、配对、暂停最后发布者、局部关闭和槽复用 | C++、仿真／A5 矩阵和重叠通过；首错误身份与冷日志已接线 |
 | 5 | block/order/placement/来源导出及严格审计器 | 完整因果链、不重不漏、无截断；原样 CSA 七项 golden 与 resident 来源 | CSA 七项 golden／2308 身份／来源、原生因果审计和独立图一致性门禁通过 |
-| 6 | sync_start 一次领取／不同位置容量 | 满核独立任务、交叠成员、超容量、早返回不二次领取 | 未开放 |
+| 6 | sync_start 一次领取／不同位置容量 | 满核独立任务、交叠成员、超容量、早返回不二次领取 | N>1 的 C++／Python、仿真／A5 与原生审计通过；N=1 公共契约待确认 |
 | 7 | 相同 kernel/输入/拓扑的控制开销对比 | 区分无完整插桩性能与诊断运行，不能由 CPU 模型推算收益 | 未完成 |
 
 纯 C/V、GM Mix 已有生产 helper 和原生执行证据；

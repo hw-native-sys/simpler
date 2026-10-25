@@ -21,8 +21,7 @@ inline __aicore__ bool scheduler_gm_mix_context_valid(
     auto *admission = local == nullptr ? nullptr : local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
     if (!scheduler_task_ref_valid(graph, admission->current_task_ref) ||
-        !scheduler_task_is_mix(admission->current_flags) ||
-        scheduler_task_requires_sync_start(admission->current_flags) || admission->gm_mix.mailbox_offset == 0 ||
+        !scheduler_task_is_mix(admission->current_flags) || admission->gm_mix.mailbox_offset == 0 ||
         admission->gm_mix.cluster_index >= local->config.cluster_count ||
         local->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM)
         return scheduler_admission_fail(
@@ -77,8 +76,9 @@ inline __aicore__ bool scheduler_gm_mix_close(
         const uint64_t cursor = scheduler_gm_fetch_add(
             scheduler_task_control_at(base, local, admission.current_task_ref)->next_block, UINT64_C(0)
         );
-        if (cursor < admission.current_block_num) return true;
-        if (cursor != admission.current_block_num || group.task_last_seq == UINT64_MAX)
+        if (cursor < admission.current_block_num && !admission.sync_claimed) return true;
+        if (cursor > admission.current_block_num || (admission.sync_claimed && cursor == 0) ||
+            group.task_last_seq == UINT64_MAX)
             return scheduler_admission_fail(
                 graph, local, run, admission.current_task_ref, SchedulerErrorSite::GROUP_CLOSE_INVALID
             );
@@ -118,6 +118,7 @@ inline __aicore__ bool scheduler_gm_mix_close(
     admission.current_block_num = 0;
     admission.current_active_mask = 0;
     admission.current_flags = 0;
+    admission.sync_claimed = false;
     group.phase = SchedulerGmMixPhase::IDLE;
     group.task_last_seq = 0;
     group.slot_index = UINT8_MAX;
@@ -140,6 +141,7 @@ inline __aicore__ SchedulerBlockClaimResult scheduler_gm_mix_claim(
         return SchedulerBlockClaimResult::ERROR;
     }
     if (group.phase != SchedulerGmMixPhase::IDLE) return SchedulerBlockClaimResult::RETRY;
+    if (admission.sync_claimed) return SchedulerBlockClaimResult::RETRY;
     if (group.group_seq >= UINT64_MAX - 1) {
         const uint64_t cursor = scheduler_gm_fetch_add(
             scheduler_task_control_at(base, local, admission.current_task_ref)->next_block, UINT64_C(0)

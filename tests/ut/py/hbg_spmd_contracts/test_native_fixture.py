@@ -96,3 +96,21 @@ def test_native_matrix_has_unique_names_and_no_silent_skip_or_xfail(native):
     cases = native.TestHbgSpmdContract.CASES
     assert len(cases) == len({case["name"] for case in cases}) == 90
     assert all("skip_golden" not in case and "manual" not in case and "marks" not in case for case in cases)
+
+
+@pytest.mark.parametrize("mask", [1, 2, 4, 3, 5, 6, 7])
+@pytest.mark.parametrize("mode", [1, 2])
+def test_sync_golden_requires_every_arrival_and_rejects_barrier_timeout(native, mask, mode):
+    test = native.TestHbgSpmdContract()
+    params = {"mask": mask, "blocks": 2, "tasks": 2, "tail_delay": 0, "sync_mode": mode}
+    golden = test.generate_args(params)
+    test.compute_golden(golden, params)
+    guards = golden.records.view(2, 7, 16)[:, -1]
+    assert guards[:, 2].tolist() == [2 * mask.bit_count()] * 2
+    assert torch.count_nonzero(guards[:, 3]).item() == 0
+    actual = golden.clone()
+    actual.records.view(2, 7, 16)[0, -1, 3] = 1
+    test._contract_worker = SimpleNamespace(scheduler_runtime_mode=2, scheduler_mode_publish_count=2)
+    test._contract_publish_count = 1
+    with pytest.raises(AssertionError):
+        test.compare_outputs(actual, golden, ["records", "summary"], params)

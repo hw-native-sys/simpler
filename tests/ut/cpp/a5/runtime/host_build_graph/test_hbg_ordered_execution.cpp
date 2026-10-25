@@ -30,6 +30,7 @@ namespace {
 struct OrderedShape {
     uint16_t blocks;
     uint8_t mask;
+    bool sync_start{false};
 };
 
 uint64_t maximum_blocks(const std::vector<OrderedShape> &shapes) {
@@ -68,6 +69,7 @@ struct OrderedFixture {
             metadata.active_mask = shape.mask;
             metadata.logical_block_num = shape.blocks;
             metadata.flags = SCHEDULER_TASK_EXECUTABLE | (shape.blocks > 1 ? SCHEDULER_TASK_SPMD : 0);
+            if (shape.sync_start) metadata.flags |= SCHEDULER_TASK_SYNC_START;
             metadata.trace_index_base = trace;
             trace += shape.blocks;
             metadata.timing_slot = -1;
@@ -206,6 +208,127 @@ struct OrderedFixture {
     std::array<std::array<uint64_t, SCHEDULER_READY_QUEUE_COUNT>, 6> cursors{};
     std::array<SchedulerReadyStats, 6> ready_stats{};
 };
+
+class HbgOrderedSyncStart : public ::testing::TestWithParam<uint8_t> {};
+
+TEST_P(HbgOrderedSyncStart, TwoPendingSlotsAndEarlyReturnDoNotClaimAnotherPosition) {
+    const uint8_t mask = GetParam();
+    const uint32_t first = mask == 1 ? 0 : 1;
+    OrderedFixture fixture({{2, mask, true}});
+    ASSERT_TRUE(fixture.admit(0, first));
+    ASSERT_TRUE(fixture.fill(first));
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->next_block, UINT64_C(0)), 1u);
+    OrderedExecution execution{};
+    ASSERT_TRUE(fixture.begin(first, &execution));
+    EXPECT_EQ(execution.block, 0u);
+    EXPECT_EQ(execution.blocks, 2u);
+    bool closed = true;
+    ASSERT_TRUE(fixture.close(first, &closed));
+    EXPECT_FALSE(closed);
+    ASSERT_TRUE(fixture.complete(execution));
+    uint32_t block = UINT32_MAX;
+    EXPECT_EQ(
+        scheduler_claim_ordered_cursor(
+            fixture.graph.graph(), fixture.base(), fixture.locals[first], fixture.run(), &block
+        ),
+        SchedulerBlockClaimResult::RETRY
+    );
+    EXPECT_EQ(block, UINT32_MAX);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->next_block, UINT64_C(0)), 1u);
+    ASSERT_TRUE(fixture.close(first, &closed));
+    EXPECT_TRUE(closed);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 1u);
+    EXPECT_EQ(scheduler_gm_load(fixture.control(0)->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));
+}
+
+TEST_P(HbgOrderedSyncStart, FastMemberEntersNextFullTaskWithoutStealingLateMembersPosition) {
+    const uint8_t mask = GetParam();
+    const std::vector<uint32_t> members = mask == 1 ? std::vector<uint32_t>{0, 3} : std::vector<uint32_t>{1, 2, 4, 5};
+    const auto blocks = static_cast<uint16_t>(members.size());
+    OrderedFixture fixture({{blocks, mask, true}, {blocks, mask, true}});
+    ASSERT_TRUE(fixture.admit(0, members[0]));
+    ASSERT_TRUE(fixture.fill(members[0]));
+    // Publishing another task does not retire the current task's position.
+    ASSERT_TRUE(fixture.admit(1, members[0]));
+    OrderedExecution first{};
+    ASSERT_TRUE(fixture.begin(members[0], &first));
+    ASSERT_EQ(first.task, 0);
+    ASSERT_TRUE(fixture.complete(first));
+    bool closed = false;
+    ASSERT_TRUE(fixture.close(members[0], &closed));
+    ASSERT_TRUE(closed);
+    ASSERT_TRUE(fixture.fill(members[0]));
+    OrderedExecution next{};
+    ASSERT_TRUE(fixture.begin(members[0], &next));
+    EXPECT_EQ(next.task, 1);
+    EXPECT_EQ(next.block, 0u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->next_block, UINT64_C(0)), 1u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 1u);
+    for (uint32_t index = 1; index < members.size(); ++index) {
+        ASSERT_TRUE(fixture.fill(members[index]));
+        OrderedExecution late{};
+        ASSERT_TRUE(fixture.begin(members[index], &late));
+        EXPECT_EQ(late.task, 0);
+        EXPECT_EQ(late.block, index);
+        ASSERT_TRUE(fixture.complete(late));
+        ASSERT_TRUE(fixture.close(members[index], &closed));
+        ASSERT_TRUE(closed);
+        ASSERT_TRUE(fixture.fill(members[index]));
+        OrderedExecution successor{};
+        ASSERT_TRUE(fixture.begin(members[index], &successor));
+        EXPECT_EQ(successor.task, 1);
+        EXPECT_EQ(successor.block, index);
+        ASSERT_TRUE(fixture.complete(successor));
+    }
+    EXPECT_EQ(scheduler_gm_load(fixture.control(0)->state), static_cast<int64_t>(SchedulerTaskState::DONE));
+    EXPECT_EQ(scheduler_gm_load(fixture.control(1)->state), static_cast<int64_t>(SchedulerTaskState::BLOCKED));
+    ASSERT_TRUE(fixture.complete(next));
+    EXPECT_EQ(scheduler_gm_load(fixture.control(1)->state), static_cast<int64_t>(SchedulerTaskState::DONE));
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
+}
+
+TEST_P(HbgOrderedSyncStart, OrdinarySuccessorCanUseBothSlotsAfterSyncPositionRetires) {
+    const uint8_t mask = GetParam();
+    const uint32_t worker = mask == 1 ? 0 : 1;
+    OrderedFixture fixture({{2, mask, true}, {3, mask}});
+    ASSERT_TRUE(fixture.admit(0, worker));
+    ASSERT_TRUE(fixture.admit(1, worker));
+    ASSERT_TRUE(fixture.fill(worker));
+    OrderedExecution execution{};
+    ASSERT_TRUE(fixture.begin(worker, &execution));
+    ASSERT_TRUE(fixture.complete(execution));
+    bool closed = false;
+    ASSERT_TRUE(fixture.close(worker, &closed));
+    ASSERT_TRUE(closed);
+    ASSERT_TRUE(fixture.fill(worker));
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(1)->next_block, UINT64_C(0)), 2u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->next_block, UINT64_C(0)), 1u);
+    for (uint32_t index = 0; index < 2; ++index) {
+        ASSERT_TRUE(fixture.begin(worker, &execution));
+        EXPECT_EQ(execution.task, 1);
+        EXPECT_EQ(execution.block, index);
+        ASSERT_TRUE(fixture.complete(execution));
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(PureCAndV, HbgOrderedSyncStart, ::testing::Values<uint8_t>(1, 2));
+
+TEST(HbgOrderedExecution, SyncStartZeroWorkMemberWaitsForAllPositionsToBeClaimedNotCompleted) {
+    OrderedFixture fixture({{2, 2, true}});
+    ASSERT_TRUE(fixture.admit(0, 1));
+    ASSERT_TRUE(fixture.fill(1));
+    ASSERT_TRUE(scheduler_refresh_local_obligation(
+        fixture.graph.graph(), fixture.base(), fixture.locals[5], fixture.run(), &fixture.admissions[5]
+    ));
+    bool closed = true;
+    ASSERT_TRUE(fixture.close(5, &closed));
+    EXPECT_FALSE(closed);
+    ASSERT_TRUE(fixture.fill(2));
+    ASSERT_TRUE(fixture.close(5, &closed));
+    EXPECT_TRUE(closed);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->next_block, UINT64_C(0)), 2u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 0u);
+}
 
 class HbgOrderedBlockIdentity : public ::testing::TestWithParam<std::tuple<uint8_t, uint16_t>> {};
 

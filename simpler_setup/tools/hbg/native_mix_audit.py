@@ -136,13 +136,11 @@ def audit_mix(audit):
                 and audit.admissions[ref]["close_seals"][cluster] == last + 1,
                 "missing or stale retained Mix close seal",
             )
-            require(
-                member["closed_cursor"] == (MAX if lane else task["block_num"]),
-                "Mix close cursor is not an actual observation",
-            )
+            if lane:
+                require(member["closed_cursor"] == MAX, "Mix AIV close cursor is not an actual observation")
             seal = ("seal", ref, cluster)
             audit.causal.add(seal, point(member, "closed"))
             if lane == 0:
-                audit.causal.add(audit.claim_points[(ref, task["block_num"] - 1)], seal)
+                audit.causal.add(audit.close_reads[(ref, worker)], seal)
             for group in groups:
                 audit.causal.add(point(group, "completion_after"), seal)

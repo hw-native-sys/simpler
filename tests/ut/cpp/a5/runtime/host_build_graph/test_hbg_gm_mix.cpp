@@ -30,6 +30,7 @@ namespace {
 struct GmShape {
     uint16_t blocks;
     uint8_t mask;
+    bool sync_start{false};
 };
 
 uint64_t gm_trace_capacity(const std::vector<GmShape> &shapes) {
@@ -39,8 +40,8 @@ uint64_t gm_trace_capacity(const std::vector<GmShape> &shapes) {
     return maximum;
 }
 
-SchedulerSpmdRequirements gm_requirements(const std::vector<GmShape> &shapes) {
-    SchedulerSpmdRequirements result{6, 2, 0, 0};
+SchedulerSpmdRequirements gm_requirements(const std::vector<GmShape> &shapes, uint32_t clusters) {
+    SchedulerSpmdRequirements result{clusters * 3, clusters, 0, 0};
     for (const auto &shape : shapes) {
         const bool mix = __builtin_popcount(shape.mask) > 1;
         if (mix || shape.blocks > 1) ++result.cooperative_task_count;
@@ -61,9 +62,15 @@ struct GmExecution {
 };
 
 struct GmMixFixture {
-    explicit GmMixFixture(const std::vector<GmShape> &shapes, bool protocol_profiling = false) :
-        storage(shapes.size(), 6, gm_trace_capacity(shapes), gm_requirements(shapes), protocol_profiling),
-        graph(shapes.size()) {
+    explicit GmMixFixture(const std::vector<GmShape> &shapes, bool protocol_profiling = false, uint32_t clusters = 2) :
+        storage(
+            shapes.size(), clusters * 3, gm_trace_capacity(shapes), gm_requirements(shapes, clusters),
+            protocol_profiling
+        ),
+        graph(shapes.size()),
+        admissions(clusters * 3),
+        locals(clusters * 3),
+        cursors(clusters * 3) {
         uint32_t trace = 0;
         for (uint64_t task = 0; task < shapes.size(); ++task) {
             const auto shape = shapes[task];
@@ -73,6 +80,7 @@ struct GmMixFixture {
             metadata.logical_block_num = shape.blocks;
             metadata.flags = SCHEDULER_TASK_EXECUTABLE;
             if (shape.blocks > 1) metadata.flags |= SCHEDULER_TASK_SPMD;
+            if (shape.sync_start) metadata.flags |= SCHEDULER_TASK_SYNC_START;
             if (__builtin_popcount(shape.mask) > 1) metadata.flags |= SCHEDULER_TASK_MIX;
             metadata.trace_index_base = trace;
             trace += shape.blocks * static_cast<uint32_t>(__builtin_popcount(shape.mask));
@@ -82,19 +90,19 @@ struct GmMixFixture {
         }
         EXPECT_TRUE(scheduler_init_spmd_task_records(base(), storage.layout, 47));
         storage.ssbuf_region = nullptr;
-        storage.run_control->active_worker_count = 6;
-        storage.run_control->aic_active_worker_count = 2;
-        storage.run_control->aiv_active_worker_count = 4;
+        storage.run_control->active_worker_count = clusters * 3;
+        storage.run_control->aic_active_worker_count = clusters;
+        storage.run_control->aiv_active_worker_count = clusters * 2;
         storage.run_control->expected_task_count = shapes.size();
-        for (uint32_t worker = 0; worker < 6; ++worker) {
+        for (uint32_t worker = 0; worker < locals.size(); ++worker) {
             auto &context = storage.contexts[worker];
             context.is_scheduler = 1;
-            context.scheduler_count = 6;
+            context.scheduler_count = clusters * 3;
             for (uint32_t lane = 0; lane < 3; ++lane)
                 context.cluster_worker_ids[lane] = (worker / 3) * 3 + lane;
             storage.test_graphs[worker] = graph.graph();
         }
-        for (uint32_t worker = 0; worker < 6; ++worker) {
+        for (uint32_t worker = 0; worker < locals.size(); ++worker) {
             locals[worker] = storage.local_context(&storage.contexts[worker]);
             locals[worker]->has_mix = storage.layout.spmd.mix_task_count != 0;
             EXPECT_TRUE(scheduler_initialize_admission(base(), locals[worker], &admissions[worker]));
@@ -149,7 +157,7 @@ struct GmMixFixture {
         return scheduler_refresh_local_obligation(graph.graph(), base(), locals[worker], run(), &admissions[worker]);
     }
     bool refresh_all() {
-        for (uint32_t worker = 0; worker < 6; ++worker)
+        for (uint32_t worker = 0; worker < locals.size(); ++worker)
             if (!refresh(worker)) return false;
         return true;
     }
@@ -245,10 +253,84 @@ struct GmMixFixture {
 
     scheduler_test::FixtureStorage storage;
     scheduler_test::GraphBuffer graph;
-    std::array<SchedulerAdmissionLocalState, 6> admissions{};
-    std::array<SchedulerLocalState *, 6> locals{};
-    std::array<std::array<uint64_t, SCHEDULER_READY_QUEUE_COUNT>, 6> cursors{};
+    std::vector<SchedulerAdmissionLocalState> admissions;
+    std::vector<SchedulerLocalState *> locals;
+    std::vector<std::array<uint64_t, SCHEDULER_READY_QUEUE_COUNT>> cursors;
 };
+
+class HbgGmMixSyncStart : public ::testing::TestWithParam<uint8_t> {};
+
+TEST_P(HbgGmMixSyncStart, LocalSealAndNextTaskDoNotWaitForRemoteClusterClaim) {
+    const uint8_t mask = GetParam();
+    GmMixFixture fixture({{2, mask, true}, {2, mask, true}});
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.admit(1));
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    bool closed = true;
+    ASSERT_TRUE(fixture.close(0, &closed));
+    EXPECT_FALSE(closed);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.seal(0, 0), UINT64_C(0)), 0u);
+    ASSERT_TRUE(fixture.publish(0));
+    ASSERT_TRUE(fixture.rendezvous(0));
+    ASSERT_TRUE(fixture.finish_lanes(0));
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::PROGRESS);
+    EXPECT_EQ(fixture.claim(0), SchedulerBlockClaimResult::RETRY);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->next_block, UINT64_C(0)), 1u);
+    ASSERT_TRUE(fixture.close(0, &closed));
+    ASSERT_TRUE(closed);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.seal(0, 0), UINT64_C(0)), 2u);
+    // The retained seal remains valid after the next task replaces the mailbox.
+    ASSERT_TRUE(fixture.refresh(0));
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.publish(0));
+    EXPECT_EQ(fixture.mailbox(0)->descriptor.task_ref, 1);
+    EXPECT_EQ(fixture.mailbox(0)->descriptor.group_seq, 2u);
+    for (uint32_t worker : {1u, 2u}) {
+        ASSERT_TRUE(fixture.close(worker, &closed));
+        ASSERT_TRUE(closed);
+        ASSERT_TRUE(fixture.refresh(worker));
+    }
+    ASSERT_TRUE(fixture.rendezvous(0));
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 1u);
+    ASSERT_EQ(fixture.claim(1), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.publish(1));
+    EXPECT_EQ(fixture.mailbox(1)->descriptor.task_ref, 0);
+    EXPECT_EQ(fixture.mailbox(1)->descriptor.block_idx, 1u);
+    ASSERT_TRUE(fixture.rendezvous(1));
+    ASSERT_TRUE(fixture.finish_lanes(1));
+    ASSERT_EQ(fixture.retire(1), SchedulerGmMixResult::TASK_LAST);
+    ASSERT_TRUE(fixture.complete_task(0, 1));
+    ASSERT_TRUE(fixture.finish_lanes(0));
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::PROGRESS);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
+}
+
+TEST_P(HbgGmMixSyncStart, ZeroWorkClusterClosesOnlyAfterExhaustionWhileLastPublisherStillOwesItsGroup) {
+    GmMixFixture fixture({{2, GetParam(), true}}, false, 3);
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    bool closed = true;
+    ASSERT_TRUE(fixture.close(6, &closed));
+    EXPECT_FALSE(closed);
+    ASSERT_EQ(fixture.claim(1), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.close(6, &closed));
+    ASSERT_TRUE(closed);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.seal(0, 2), UINT64_C(0)), 1u);
+    for (uint32_t worker : {7u, 8u}) {
+        ASSERT_TRUE(fixture.close(worker, &closed));
+        EXPECT_TRUE(closed);
+    }
+    for (uint32_t worker : {0u, 1u, 2u, 3u, 4u, 5u}) {
+        ASSERT_TRUE(fixture.close(worker, &closed));
+        EXPECT_FALSE(closed);
+    }
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 0u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(AllMixMasks, HbgGmMixSyncStart, ::testing::Values<uint8_t>(3, 5, 6, 7));
 
 class HbgGmMixSingleVectorAbi : public ::testing::TestWithParam<uint8_t> {};
 

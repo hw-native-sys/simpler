@@ -17,7 +17,7 @@ MAX = (1 << 64) - 1
 
 
 class ProtocolBuilder:
-    def __init__(self, shapes, clusters=2, epoch=0):
+    def __init__(self, shapes, clusters=2, epoch=0, sync_tasks=()):
         self.raw: dict[str, Any] = capture(epoch)
         self.clock = 0
         self.groups = [0] * clusters
@@ -50,6 +50,8 @@ class ProtocolBuilder:
                 flags |= 32
             elif mask is not None:
                 flags |= (4 if mask.bit_count() > 1 else 0) | (8 if blocks > 1 else 0)
+            if ref in sync_tasks:
+                flags |= 16
             raw["tasks"].append(
                 dict(
                     task_ref=ref,
@@ -148,7 +150,7 @@ class ProtocolBuilder:
             if spec["flags"] & 4 or (w["core_type"] == 0) == bool(spec["active_mask"] & 1)
         ]
 
-    def admit(self, task, worker=0):
+    def admit(self, task, worker=0, observe_members=True):
         spec = self.raw["tasks"][task]
         self.raw["admission_log"].append(task)
         self.raw["commit_tail"] += 1
@@ -175,7 +177,8 @@ class ProtocolBuilder:
                 pending_mask=0,
             )
             self.raw["members"].append(row)
-            self.stamp(row, "observed")
+            if observe_members:
+                self.stamp(row, "observed")
 
     def claim(self, task, block, worker) -> dict[str, Any]:
         spec = self.raw["tasks"][task]
@@ -340,7 +343,7 @@ class ProtocolBuilder:
             worker = row["worker_index"]
             if only_worker is not None and worker != only_worker:
                 continue
-            row["closed_cursor"] = spec["block_num"]
+            row["closed_cursor"] = self.raw["task_controls"][task]["next_block"]
             if spec["flags"] & 4:
                 groups = [
                     b["owner"]["group_seq"]
