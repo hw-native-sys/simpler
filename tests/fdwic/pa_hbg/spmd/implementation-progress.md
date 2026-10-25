@@ -237,3 +237,64 @@ N>1/sync_start 仍维持原门禁，不能将本轮布局用例转绿当作原�
 AIC direct 路径和禁用 direct sink 的 16 项对照通过；日志
 `outputs/spmd-direct-mix-repro-20261025.log`。这是后续依赖推进的前置问题，
 新复现文件与修复会单独提交，不混入已全绿的存储布局提交。
+
+## 2026-10-25：AIV 完成到 Mix 后继的交接修复
+
+本轮起点 `3c72b320a`。此前三笔提交已按用户单独的 push 指令推送到
+`nalinaly/simpler:feat/fully_distributed_within_core`；本轮恢复阶段性提交、不自动 push。
+
+### 原因和修改范围
+
+`scheduler_service_cluster_completion_slot` 原先在 has_mix 且 candidates 非空时，
+无论完成者是 AIC 还是 AIV，都向依赖推进函数提供 direct Mix sink。
+但 `scheduler_fill_mix_after_completions` 只由 AIC 消费该 sink，
+executor 的 candidates 又是单轮局部变量。因此 AIV 解出唯一 Mix 后继时，
+前驱已成功 DONE、wake-list 已关闭，而后继既不在 ready inbox，也不在下一轮状态里。
+这不是前驱未完成或 Mix kernel 自身等待，而是调度候选所有权交接丢失。
+
+唯一生产调用点增加 `is_mix_coordinator()` 条件：AIC 保留原 direct fast path，
+AIV 不接收自己无法消费的 Mix candidate，沿原完成驱动路径首次发布到 Mix inbox。
+不重复入队，不增加全局 ready 表，不改变 kernel、shape gate、任务完成语义或 SSBUF 协议。
+
+### 验证记录
+
+- 修复前重跑 24 项真实 helper 回归，16 passed、8 failed；失败正好是两条物理 AIV
+  × mask 3/5/6/7。日志 `outputs/spmd-direct-mix-red-20261025.log`。
+- caller 条件修复后，同一 24 项全部通过，日志 `outputs/spmd-direct-mix-green-20261025.log`。
+  fixture 覆盖真实 route、wake-list、dispatch、completion 及后续 AIC placement，
+  不使用参考模型替代生产 helper。
+- 扩展为 60 项交接测试，新增已有 Mix 队头、同轮两个 Mix 后继、placement 满后恢复，
+  并检查 AIC completion 的中间态确实保留 direct candidate，防止“全部关闭快路”假绿。
+  结合原 222 项 C++ 回归，共九个 target、282 个 case 通过；
+  日志 `outputs/spmd-direct-mix-cpp-final-20261025.log`。
+- 新增 `test_aiv_mix_handoff.py` 和专用 Host orchestration，复用全部四个既有 kernel，
+  不复制设备实现。显式 TaskId 依赖形成 `AIV_i → Mix_i → AIV_(i+1)`，
+  四种 Mix mask 各取一对／17 对串链，保证每个普通 AIV 的唯一后继是 Mix。
+  校验 root 和 Mix 两套记录的 exactly-once、原 N、身份、保护区、padding，
+  保留每次调用的新鲜 resident mode；不额外声称验证了前驱数据可见性的完整时序。
+- editable 构建通过：`outputs/spmd-direct-mix-build-20261025.log`。
+  首轮 Python 命令遗漏 CSA 已有的 `TORCH_DEVICE_BACKEND_AUTOLOAD=0`，
+  Torch 2.12 加载系统不匹配的 torch_npu，在导入阶段失败，未进入设备执行。
+  补回原有环境设置后重跑；不降低 Torch 版本，不增加 runtime 开关。
+- 新交接探针 a5sim 八场景各三轮，共 24 次通过；A5 device 0 八场景各十轮，
+  共 80 次通过，同一 Worker 的 run_epoch 为 1–80。日志分别为
+  `outputs/spmd-direct-mix-native-sim-r2-20261025.log`、
+  `outputs/spmd-direct-mix-native-20261025/probe-r2.log`。
+  本机仍无 npu-smi/task-submit；CANN 查询再次确认 A5，按用户授权直接用卡、无队列锁隔离。
+- 追加检查发现 pytest 的 importlib 模式不能使用 standalone 的裸同目录导入；
+  按 `__package__` 选择相对或同目录导入，不吞 ImportError、不复制基类。
+  pytest 入口八场景通过（一个 pytest item），日志 `outputs/spmd-direct-mix-pytest-fixture-20261025.log`。
+- Python 合同／CLA／CSA／clock guard 本轮选择范围共 942 项通过，
+  日志 `outputs/spmd-direct-mix-python-r2-20261025.log`；不将它与前轮不同选择的计数相加。
+- HBG 默认仿真 42 passed、379 deselected；真机 60 passed、4 skipped、356 deselected。
+  真机仅显式排除宽目录误收的双卡 TMR RDMA 目录，未排除 HBG；
+  超时参数按当前 CI 分别为 600/1200 秒。日志分别为
+  `outputs/spmd-direct-mix-sim-r2-20261025.log`、`outputs/spmd-direct-mix-native-20261025/hbg.log`。
+- A5 `TestSchedulerPhases::test_run --enable-chip-swimlane 3` 通过，
+  保留原 provenance、task timing、scheduler/lifecycle 与时钟检查；
+  日志 `outputs/spmd-direct-mix-native-20261025/dfx3.log`。
+- 首轮全部适用提交钩子通过，日志 `outputs/spmd-direct-mix-precommit-20261025.log`；
+  最终暂存后检查也全部通过，日志 `outputs/spmd-direct-mix-precommit-final-20261025.log`，
+  未使用 SKIP 或 no-verify。
+
+该修复只建立后续共同准入所依赖的可靠候选交接；并未开放多 block 或 GM Mix。

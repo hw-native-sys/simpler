@@ -36,6 +36,11 @@ CPU 包中另外有 [test_native_fixture.py](../../../ut/py/hbg_spmd_contracts/t
 这里验证的是**原语使用前提**。如果主方案一次 pop 准入，就不需要为了测试新增条件摘头接口；
 如果改成延迟摘头，必须另加 expected-task 操作及其竞态测试。
 
+新增 [test_hbg_direct_mix_handoff.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_direct_mix_handoff.cpp)
+直接驱动 route／dispatch／completion／Mix placement：三条 producer lane × 四种 Mix mask
+× 五种交接场景，共 60 项。检查 AIV 后继入队、AIC direct 快路保留、已有队头优先、
+同轮两个后继不丢不重，以及 Mix 容量恢复后的可达性；不把这些检查算作共同准入协议完成。
+
 ## 二、已经造好的边界与尚欠设备证明的部分
 
 | 边界组 | 现有可执行测试 | 仍需随生产编码完成 |
@@ -146,6 +151,15 @@ TDD 推进顺序：先保持来源／协议／夹具检查绿色；再逐项消�
 只有本轮 resident 发布、精确执行身份、前驱哨兵同时通过才算转绿。
 禁止删除 mode 断言、减少原 N 或用 xfail 掩盖缺口。不能把 `mode=4` 的正确结果算作成功。
 
+### AIV→Mix 的八个基础回归场景
+
+[test_aiv_mix_handoff.py](test_aiv_mix_handoff.py)复用原生 record kernel、golden 和新鲜 resident 门禁，
+构造 `AIV_i → Mix_i → AIV_(i+1)`，每个普通 AIV 只有一个 Mix 后继。
+mask 3/5/6/7 分别运行一对和 17 对串链，共八个场景；全部保持 N=1。
+通过显式 TaskId 依赖连接两套不相交记录区，保留 kernel 的一 tensor 加四 scalar ABI。
+Host 同时精确比较 AIV 前驱和 Mix 的访问次数、身份、未激活槽、padding 及保护区；
+设备消费者沿真实 fanin 校验 Mix 输出。它是候选交接／活性回归，不替代多 block 或跨 task 重叠验收。
+
 ### 运行命令
 
 从仓库根目录，用当前项目 venv；源码更新后若原生扩展旧，先按仓库流程增量重编译。
@@ -187,6 +201,9 @@ python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
 
 # standalone 走相同来源／golden 门禁。
 python tests/fdwic/pa_hbg/spmd/test_spmd_contract.py -p a5sim --case mask1_n1
+
+# AIV 完成到 Mix 后继的交接；可换成 -p a5 -d 0 在真机执行。
+python tests/fdwic/pa_hbg/spmd/test_aiv_mix_handoff.py -p a5sim --rounds 3
 
 # 与用户原图逐项核对；原图缺失会明确失败。普通 UT 仅依赖小夹具。
 python -m pytest tests/fdwic/pa_hbg/spmd/test_cla_source.py -q

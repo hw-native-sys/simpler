@@ -205,7 +205,9 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
                 graph, scheduler_state_base, scheduler, run_control, task_ref, wake_stats, ready_stats,
                 completion_stats, profiling_level, false, direct_ready,
                 scheduler_metadata_core_type_index(completed_subtask_slot),
-                scheduler->has_mix && candidates != nullptr ? &candidates->mix_ready : nullptr
+                scheduler->has_mix && scheduler->is_mix_coordinator() && candidates != nullptr ?
+                    &candidates->mix_ready :
+                    nullptr
             )) {
             scheduler_account_failed_completion(
                 graph, scheduler, run_control, task_ref, SchedulerErrorSite::COMPLETION_RESOLVE_FAILED
