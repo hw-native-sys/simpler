@@ -25,12 +25,12 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 | ---- | ---- | -------- | -------- |
 | 前置 | ordinary／Mix payload context 初始化与重绑定 | 原生 N=1 红灯转绿；真实初始化函数的 C++ 测试 | 已通过 C++、仿真与 A5 六种 mask 各十轮 |
 | 1 | 有界存储、准入记录、block 控制、GM 组状态 | POD／布局／溢出／重跑初始化测试 | 已落地；纯 C/V 和 GM Mix 已使用 |
-| 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | own/direct、持久候选与 GM Mix 均已接线；完整事件审计待补 |
+| 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | own/direct、持久候选与 GM Mix 均已接线；完整原生事件审计通过 |
 | 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | A5／仿真功能和 L1/L4 逐 block 检查通过 |
 | 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | A5／仿真矩阵、重叠及 TPipe PA 已通过；首错误身份与冷日志已接线 |
-| 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | CSA 数值／2308 显式身份／来源通过；全协议事件未完成 |
-| 6 | sync_start 不同位置领取和局部跨任务推进 | 两独立满核任务、部分交叠、超容量、早返回不重领 | 未实现 |
-| 7 | 性能对比 | 同 kernel／输入／拓扑，无完整插桩运行；诊断运行分开 | 未测量 |
+| 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | CSA 数值／2308 显式身份／来源、全协议因果与独立图门禁通过 |
+| 6 | sync_start 不同位置领取和局部跨任务推进 | 两独立满核任务、部分交叠、超容量、早返回不重领 | N>1 已实现，仿真／A5 各 47 项及原生审计通过；N=1 公共契约待确认 |
+| 7 | 性能对比 | 同 kernel／输入／拓扑，无完整插桩运行；诊断运行分开 | 已完成：当前 Device 为基线 11.41 倍；前期 resident 已同量级回退，根因和优化另待验证 |
 
 退出、错误收敛、epoch／generation、Dummy 服务节点随功能交付，不延后处理。
 CPU 模型、原生探针、真实 CSA 各有独立证明范围；legacy 的正确结果不能证明 resident 功能。
@@ -1517,3 +1517,123 @@ N=1 的现有公共归一化未改变；完整目标仍须收口该契约，并�
 各 26303 条执行全部通过原生审计，日志 `outputs/spmd-sync-start-ordinary-audit-20261025.log`。
 本次合计重新审计普通／sync_start 矩阵 274 份捕获，CSA 独立验收不混入该数量。
 阶段提交仅本地保存，不 push；提交后按新 HEAD 重编绑定与 runtime，避免后续运行命中旧提交缓存。
+
+## 2026-10-25：同一 CSA 的无完整插桩性能对照
+
+起点 `a4132b6df`，上一轮属于实际代码／验证／提交进展，不是仅重述状态。
+沿用原构图、kernel、输入与七项 golden。N=1 公共接口的选择尚未收到用户确认，
+保持归一化不动；本节推进不依赖该选择的性能验证，不把目标缩成只验证 N>1。
+
+提交后构建 `outputs/spmd-sync-start-postcommit-build-20261025.log` 完成；
+实际 binding 的 **build_commit** 与 a4132b6df 一致，三个 HBG runtime 二进制 SHA256
+与已通过的 `csa-hbg-l4-jrabrt2o` 完全相同，原 CSA source manifest 仍匹配。
+
+使用 benchmark 工作流的隔离 worktree／独立 venv／同卡串行方法。
+上游 main 更新后的 merge-base 是 7e19db4df，但本任务的设计基线明确为 f5cc679bb；
+因此固定该版本做对照，不将持续变化的 main 或十月十四日历史耗时作为本次基线。
+临时 worktree 为 `tmp/spmd-perf-baseline-20261025`，分离 HEAD，不占用／移动现有开发分支。
+原工作区、simpler-scalar_scheduler 和既有 review worktree 均保持原样。
+
+已用 git diff 核对 f5cc679bb 到 a4132b6df 的 CSA kernel、编排、manifest、golden、
+验证器、测试入口与 analyze_perf 均未改变；PTO-ISA pin 均为
+`418de18dde8fa33773dc5c384fdfe5506463b628`。
+基线环境单独安装 Torch 2.12.0+cpu、numpy 2.5.2、nanobind 2.15.0、
+scikit-build-core 1.1.1、cmake 4.4.4、pytest 9.1.1，与当前主要版本一致。
+首次构建因独立环境缺 pathspec 在 metadata 阶段失败，补齐原有依赖后重编，
+保留 `outputs/spmd-perf-baseline-build-20261025.log` 与 r2 日志，不混用主工作区绑定。
+400MB 固定数据使用原 fixture.import_snapshot 导入并校验 SHA256，不重新生成 golden。
+
+计划复用现有 `run.py bench`：每臂先三轮七项正确性检查，再五轮预热和一百轮采样；
+完整 chip swimlane 为 0，仅保留既有 STRACE 时钟与固定阶段记录。
+Host 与 Device 分开报告；Device 为既有 AICPU RunWall 全设备生命周期，包含初始化／退出，
+不冒称纯 kernel 时间或 HBG 不存在的 Effective/Sched 窗口。
+调度来源另用 L4 核对，不将 L4 诊断耗时与无完整插桩基准混算。
+本机无 task-submit，沿用用户明确授权的设备 0 顺序执行；不声称独占锁隔离或跨设备可比性。
+当前仅在构建基线，尚未产生本轮性能结论。
+
+基线编译完成，binding 对应 f5cc679bb，源代码 diff 为空。L4 首次在导入 Worker 时
+发现缺少 cloudpickle，尚未运行 kernel；按当前环境补齐 cloudpickle 3.1.2 及其余主要
+Torch 依赖版本后再运行，未改基线源码。失败结果 `csa-hbg-l4-u6meeup3` 保留。
+新基线 L4 `tmp/spmd-perf-baseline-20261025/outputs/csa-hbg-l4-ka862xev/result.json`
+两轮各七项 golden 通过，scheduler producer=aicpu。它只作为 AICPU 对照，
+不冒充新 resident 的协议验收。
+
+同设备 0 按 A1→B1→B2→A2 顺序采样，A=f5cc679bb，B=a4132b6df。
+每组都有独立三轮正确性检查和五轮预热＋一百轮测量，完整泳道关闭；
+四组均 passed=true，源码／二进制身份在每组前后未变化，fixture manifest／构图摘要相同。
+标准解析器重新读取四份 bench.log，与各自 result.json 的统计逐项一致。
+汇总为 `outputs/spmd-perf-comparison-20261025.json`，保留全部样本与阶段时长。
+
+| 组别 | 调度来源 | Device 中位数（μs） | 结果目录 |
+| ---- | -------- | ------------------- | -------- |
+| A1 | 设计基线 AICPU | 2161.126 | 临时 worktree 的 outputs/csa-hbg-bench-zmz8ikow |
+| B1 | 当前 AICore resident | 24509.032 | outputs/csa-hbg-bench-pgmp0zkn |
+| B2 | 当前 AICore resident | 24606.033 | outputs/csa-hbg-bench-k2s_6ngr |
+| A2 | 设计基线 AICPU | 2137.535 | 临时 worktree 的 outputs/csa-hbg-bench-4uu673jh |
+
+合并每臂两百个测量样本，**当前 CSA 明显回退，不能宣称性能优化成功**：
+
+| 窗口 | A 中位数（μs） | B 中位数（μs） | B/A | 变化 |
+| ---- | -------------- | -------------- | --- | ---- |
+| Host | 77485.754 | 100344.804 | 1.295 | +29.50% |
+| Device | 2151.344 | 24554.408 | 11.414 | +1041.35% |
+
+Device 的 A 臂 P10/P90 为 2093.639／2204.554 μs，B 臂为 23838.803／26182.207 μs。
+反向复跑的 A 臂中位数只变化约 1.1%，B 臂约 0.4%；这次量级差异不能解释成普通采样漂移。
+没有 task-submit 锁隔离，仍不作“环境完全无干扰”的承诺，也不外推到其他 workload。
+各组 Host bind 中位数约 69.1–69.4 ms、validate 约 5.45–5.49 ms，
+而 runner_run 从约 2.42 ms 增为 24.8 ms；主要可见增量在设备窗口，
+不能把 Host 的全部 100 ms 都称为 Scalar 调度耗时。
+
+L4 仅作为独立诊断：当前已验证捕获有 61 次准入、1457 个 block owner、
+833 次 Mix 组发布、4640 条成员义务；2290 条执行来自 COOPERATIVE，
+DIRECT_RESOLVE 有 6 条，所有 2308 条 payload publication 都为 DISPATCH。
+当前按多核汇总的 idle 区间约 1.356 秒，不能当成设备串行等待时间。
+同核相邻 kernel 间隙中位 364.190 μs、P90 1978.991 μs，包含依赖与控制等待和采样开销。
+成功 block claim 的 L4 区间中位 0.325 μs，不含失败重试／未记录的轮询链；
+不能用它乘次数或用 L4 区间相减直接解释 L0 的 24.554 ms。
+诊断输出 `outputs/spmd-perf-current-l4-control-20261025.log`。
+
+源码中 scheduler_admission_context_valid 对同一 run.scheduler_error 做关键原子读，
+且多个热路径 helper 会重复调用，是待定量排查的共享热点候选；此处不是已证明根因。
+原 CSA 没有 sync_start 请求，所以本对照是整个普通多 block／GM Mix resident 方案
+相对 AICPU 基线的差异，不能归咎于新增 sync_start 一次领取分支。
+继续用同一临时 worktree 的 detached HEAD 对照 `6f2b470d4`（已有普通 resident，
+尚未加入完整协议采集），检查关闭 L4 时后续采集接线的影响。正式 A/B 基线仍为上述两版；
+已有四组结果保留，当前开发分支不切换，不修改调度代码来迎合基准。
+
+前期 resident 6f2b470d4 重编后先通过 L4 的七项 golden、执行数量与 aicore producer 检查，
+结果为临时 worktree 的 `csa-hbg-l4-3wooaho3`；该版本尚无当前的完整原生协议证明，
+不能把旧报告的 distributed_scheduler_verified 字段追认为新门禁通过。
+随后三轮正确性和五预热＋一百采样通过，`csa-hbg-bench-jkd494k5` 的
+Host 中位数 100604.256 μs、Device 中位数 24726.374 μs。
+当前合并 Device 中位数比此前期版本约低 0.70%，属于本次小幅波动范围；
+大幅回退已在普通多 block／GM Mix resident 接入时存在，不能说从完整协议采集才开始。
+这也不等于采集分支零成本：这里只测整体净差异，未逐项隔离后续提交。
+
+静态代码体积核对：AIC 的 .text 由 236840B 增至 527056B，AIV 由 240384B 增至 535080B。
+这里读取的是 ELF section，不是含调试信息的整个 .o 大小；体积增大本身不是已证明的
+性能根因，也不能据此把 L0 回退倍数归给 instruction cache。
+编译器身份、选项及 PTO pin 保存在 `outputs/spmd-perf-toolchain-20261025.json`，
+CANN CCEC/LLD 为所装 SDK 的 15.0.5，Host 为 GCC 13.3.0。
+
+临时 worktree 的完整 outputs 已复制到
+`outputs/spmd-perf-worktree-evidence-20261025/`，diff -qr 核对一致。
+最终比较文件为 `outputs/spmd-perf-comparison-final-20261025.json`，A1/A2 与前期 resident
+的结果路径指向该归档；各原始 result.json 保留原执行路径作为历史 provenance，不修改原记录。
+临时 worktree、独立 venv 和复制的固定数据按 benchmark 工作流清理；源码可由上述提交重建，
+固定数据仍在原 CSA 目录，所有独有实测日志／捕获已归档。未删除主工作仓或用户已有数据。
+
+本节仅完成性能验证和缩小归因范围，不宣称取得性能收益、不静默重构调度协议。
+下一步仍须确认 N=1 公共契约并完成最终逐项验收；若进入性能优化，需要用上述相同口径
+逐项验证共享轮询／拓扑检查等候选热点，同时保留所有执行与错误收敛合同。
+
+最终通过统一读端核对三版 L4：metadata.num_cores 均为 96、kernel 行均为 2308，
+实际执行行覆盖的紧凑 core_id 数也均为 96。
+当前冻结任务 metadata 没有 SYNC 标志，进一步限定了本次性能结论的适用范围。
+收口校验脚本曾错误地把 AICPU 的 core_to_thread 当作 raw 顶层公共字段，
+又把原始紧凑 kernel 数组当成字典，均在读取阶段报错；改为共同的 metadata.num_cores
+及标准 read_perf_data 解码后才完成上述核对。性能样本、统计与结论未改变。
+本次主仓改动仅为过程记录与三份状态文档，不改变生产代码；适用 pre-commit 检查全部通过，
+日志 `outputs/spmd-perf-precommit-r3-20261025.log`。表格对齐检查的前两次失败已修正，未绕过钩子。
+阶段提交继续使用详细中文日志，不 push；N=1 公共契约的未决测试仍留本地，未混入本次提交。
