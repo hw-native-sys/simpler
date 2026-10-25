@@ -10,7 +10,7 @@
 
 设计基线为 f5cc679bb，约定更新于 2026-10-23。纯 C/V 与 GM Mix 普通多 block 已接入生产执行路径；
 原样 CSA 的七项 golden 和严格 resident L4 门禁已通过；
-显式 block/slot 身份与完整协议 trace、错误身份补全、sync_start 和性能比较仍待完成。
+首错误身份与退出冷日志已接线；显式 block/slot 身份与完整协议 trace、sync_start 和性能比较仍待完成。
 下文区分当前能力与目标合同，2026-10-25 起的编码和实测证据集中记录在
 [实现过程](spmd/implementation-progress.md)，不以结构或接口存在代替执行验收。
 
@@ -96,6 +96,9 @@ N=1 和多 block Mix 共用 GM 组协议，AIC 只负责组领取、身份发布
   正常 EXIT 在公共尾部排空本核义务，覆盖启动直接看见 EXIT 的零工作核；错误退出不补 seal。
 - 无 kernel 服务节点只推进依赖和逻辑完成，不分配 payload／kernel trace，
   不等待无关 Mix 的资源义务；Host 已完成节点不在设备重复处理。
+- 首错误记录复用 RunControl 的 48B 预留区，保留 epoch/order/block/group_seq/worker/lane
+  和已采集字段位图。准备／完成错误按具体槽定位，退出超时保留当前义务；
+  AICPU 在 bootstrap、execution 和 terminal 冷路径输出身份，不把未知字段猜成 0。
 
 ## 目标合同和参考接线
 

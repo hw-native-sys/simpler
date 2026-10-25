@@ -4,7 +4,7 @@
 定义已确认语义；本页把它收敛为可开始编码的正确性基线。
 共同准入、Host 预分配、纯 C/V 的 own/direct 入口、cursor 和 LocalDone 已接入生产路径。
 GM Mix 也已接入，原样 CSA 的数值与严格 resident L4 门禁已通过；
-显式 block/slot 身份与完整协议 trace、错误身份补全、sync_start 和性能比较仍未完成。
+首错误身份与退出冷日志已接线；显式 block/slot 身份与完整协议 trace、sync_start 和性能比较仍未完成。
 本页保留全部目标合同；已实现字段和实测范围以 [实现过程](implementation-progress.md) 为准，
 不以存在字段替代执行验收。
 初始 TDD 覆盖和历史红绿状态见 [测试入口和验收状态](test-plan-and-status.md)。
@@ -257,6 +257,19 @@ AICore 上包装函数的 C++ memory_order 参数本身不建立设备 fence；
 ### 失败和退出
 
 错误记录首先保存 epoch/task/block/worker/seq/site，停止新 kernel 准入，不补成功计数。
+RunControl 仍为 384B，error_claimed/site 的既有 offset 为 256/328；
+末尾 48B 承载 epoch/order/block/group_seq/worker 五个 64 位字段、lane/identity_fields 两个 32 位字段。
+identity_fields 的 bit 0–5 分别表示 epoch/order/block/group_seq/worker/lane 已采集，
+不表示数值已通过协议合法性检查。未采集值为全 1；合法 epoch 0/MAX 依靠位图区分未知。
+
+通用 writer 位于 scheduler_error.h，取得 first-error CAS 后写全身份，barrier 后发布错误状态；
+OK 不占 claim，后写者不修改首现场。ready 从已有本核状态提取身份，
+不匹配当前义务时不挪用它的 order/group；当前 task 已退役组可保留最近身份，
+task_last_seq 清零后不再拿前 task 的组解释新 task。准备和 completion 使用确切 slot，
+不在两个预填槽之间猜测；无共同准入上下文时 epoch/order 保持未知。
+AICPU 首写者明确记录未知 task/core/扩展身份，bootstrap/execution/terminal 的统一冷日志
+在 acquire 发布状态后重新失效完整错误区，覆盖跨两条 64B line 的身份读取。
+
 已返回工作允许必要清理；尚在 kernel 内的核必须按已有设备错误与停机流程安全退出。
 队列空、日志暂空、cursor 耗尽、TaskDone 数达标中的任何一个单独成立，都不代表可回收。
 
@@ -274,11 +287,13 @@ AICore 上包装函数的 C++ memory_order 参数本身不建立设备 fence；
 | 1 | scheduler_types.h/layout.h 与 Host 实际大小预分配 | 布局／初始化、二次运行、溢出及边界拒绝 | 已实现 |
 | 2 | ready 唯一领取、准入发布及 executor/completion 统一 entry gate | B 先于未 ready A；三入口不可越序；旁路发布竞态 | own/direct 与 GM Mix 已接线；完整协议事件审计待补 |
 | 3 | 普通 C/V cursor、原 N、block 退役与分波 demand | N=1、容量两侧、512；晚 block 不早放后继；快核跨 task 重叠 | 原生纯 C/V 已有通过证据 |
-| 4 | GM descriptor/ack/seal，各 lane 自备 payload，无 SSBUF | mask 3/5/6/7、配对、暂停最后发布者、局部关闭和槽复用 | C++、仿真／A5 矩阵和重叠通过；完整错误身份待补 |
+| 4 | GM descriptor/ack/seal，各 lane 自备 payload，无 SSBUF | mask 3/5/6/7、配对、暂停最后发布者、局部关闭和槽复用 | C++、仿真／A5 矩阵和重叠通过；首错误身份与冷日志已接线 |
 | 5 | block/order/placement/来源导出及严格审计器 | 完整因果链、不重不漏、无截断；原样 CSA 七项 golden 与 resident 来源 | CSA 七项 golden／2308 记录／来源通过；显式身份与完整协议事件待补 |
 | 6 | sync_start 一次领取／不同位置容量 | 满核独立任务、交叠成员、超容量、早返回不二次领取 | 未开放 |
 | 7 | 相同 kernel/输入/拓扑的控制开销对比 | 区分无完整插桩性能与诊断运行，不能由 CPU 模型推算收益 | 未完成 |
 
 纯 C/V、GM Mix 已有生产 helper 和原生执行证据；
-完整 native trace adapter、错误身份和后续 sync_start 仍须补齐，参考模型不是实现的替代品。
+完整 native trace adapter 和后续 sync_start 仍须补齐，参考模型不是实现的替代品。
+私有错误区原生探针验证生产 writer 和设备原子发布，不触发真实 runtime 错误，
+不能据此声称任意物理核异常的静止／回收均已获得设备验证。
 不要先全局放开 shape predicate，再用 legacy 的正确输出宣布 SPMD 完成。

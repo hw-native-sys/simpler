@@ -1061,6 +1061,15 @@ enum class SchedulerErrorSite : uint64_t {
     ORDERED_EXIT_TIMEOUT = 126,
 };
 
+enum SchedulerErrorIdentityField : uint32_t {
+    SCHEDULER_ERROR_HAS_EPOCH = 1U << 0,
+    SCHEDULER_ERROR_HAS_ORDER = 1U << 1,
+    SCHEDULER_ERROR_HAS_BLOCK = 1U << 2,
+    SCHEDULER_ERROR_HAS_GROUP = 1U << 3,
+    SCHEDULER_ERROR_HAS_WORKER = 1U << 4,
+    SCHEDULER_ERROR_HAS_LANE = 1U << 5,
+};
+
 struct alignas(128) SchedulerRunControl {
     uint64_t aic_task_count;
     uint64_t aiv_task_count;
@@ -1109,7 +1118,13 @@ struct alignas(128) SchedulerRunControl {
     volatile uint64_t error_reserved_address;
     volatile uint64_t error_task_window_last_index;
     volatile uint64_t error_site;
-    uint64_t error_reserved[6];
+    volatile uint64_t error_run_epoch;
+    volatile uint64_t error_order_key;
+    volatile uint64_t error_block_idx;
+    volatile uint64_t error_group_seq;
+    volatile uint64_t error_worker_index;
+    volatile uint32_t error_cluster_lane;
+    volatile uint32_t error_identity_fields;
 };
 
 struct alignas(128) AicpuThreadLifecycleTrace {
@@ -1347,6 +1362,13 @@ static_assert(alignof(SchedulerRunControl) == 128, "run control alignment change
 static_assert(offsetof(SchedulerRunControl, executed_task_count) == 128, "lifecycle atomics need their own line");
 static_assert(offsetof(SchedulerRunControl, error_claimed) == 256, "error state needs its own line");
 static_assert(offsetof(SchedulerRunControl, error_site) == 328, "error site ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_run_epoch) == 336, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_order_key) == 344, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_block_idx) == 352, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_group_seq) == 360, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_worker_index) == 368, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_cluster_lane) == 376, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, error_identity_fields) == 380, "error identity ABI changed");
 static_assert(sizeof(AicpuThreadLifecycleTrace) == 128, "AICPU lifecycle trace layout changed");
 static_assert(sizeof(SchedulerWorkerContext) == 1024, "worker context layout changed");
 static_assert(alignof(SchedulerWorkerContext) == 128, "worker context alignment changed");
@@ -1553,6 +1575,13 @@ scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout,
         layout.total_size > UINT64_MAX - device_base_address)
         return false;
     __builtin_memset(base, 0, static_cast<size_t>(layout.total_size));
+    auto *run = scheduler_state_at<SchedulerRunControl>(base, layout.run_control_offset);
+    run->error_run_epoch = UINT64_MAX;
+    run->error_order_key = UINT64_MAX;
+    run->error_block_idx = UINT64_MAX;
+    run->error_group_seq = UINT64_MAX;
+    run->error_worker_index = UINT64_MAX;
+    run->error_cluster_lane = UINT32_MAX;
     auto *controls = scheduler_state_at<SchedulerTaskControl>(base, layout.task_controls_offset);
     for (uint64_t i = 0; i < layout.task_count; ++i) {
         controls[i].state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);

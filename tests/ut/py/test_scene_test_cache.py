@@ -420,6 +420,22 @@ def test_compile_artifact_key_includes_checkout_path_seen_by_compiler(tmp_path):
     assert keys[0] != keys[1]
 
 
+@pytest.mark.parametrize("platform", ("a5", "a2a3", "a5sim", "a2a3sim"))
+def test_text_extraction_policy_invalidates_hardware_incore_and_enclosing_callable(monkeypatch, tmp_path, platform):
+    from simpler_setup import elf_parser
+
+    source = tmp_path / "kernel.cpp"
+    source.write_text('extern "C" void kernel_entry() {}\n')
+    keys, outer = [], []
+    for policy in (1, 2):
+        monkeypatch.setattr(elf_parser, "ELF_TEXT_POLICY_VERSION", policy, raising=False)
+        key = scene_test_cache.compile_incore_artifact_key({"platform": platform}, source, [])
+        keys.append(key)
+        outer.append(scene_test_cache.compile_artifact_key({"platform": platform, "incore_key": key}, [(source, [])]))
+    assert (keys[0] != keys[1]) == (not platform.endswith("sim"))
+    assert (outer[0] != outer[1]) == (not platform.endswith("sim"))
+
+
 def test_incore_artifact_key_distinguishes_identical_sources_at_different_paths(tmp_path):
     keys = []
     for case_name in ("case-a", "case-b"):

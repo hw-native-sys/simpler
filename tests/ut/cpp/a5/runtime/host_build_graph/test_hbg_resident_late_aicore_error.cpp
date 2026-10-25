@@ -35,6 +35,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdint>
+#include <string>
 
 namespace {
 
@@ -139,6 +140,31 @@ TEST_F(ResidentFinalizer, AnUnclaimedAuditedPathPublishesNothing) {
 
     EXPECT_EQ(region.published, 0u) << "no record to publish";
     EXPECT_EQ(device_run_result_terminal(region, kEpoch).state, DeviceRunTerminalState::Undecided);
+}
+
+TEST_F(ResidentFinalizer, LateDiagnosticIdentityIsLoggedByTheActualFinalizer) {
+    ASSERT_TRUE(exit_wait_watchdog_fires());
+    run_control.error_task_ref = 5;
+    run_control.error_run_epoch = 0;
+    run_control.error_order_key = 2;
+    run_control.error_block_idx = 9;
+    run_control.error_group_seq = 7;
+    run_control.error_worker_index = 4;
+    run_control.error_cluster_lane = 1;
+    run_control.error_identity_fields = 63;
+    testing::internal::CaptureStderr();
+    const DeviceRunTerminal terminal = finalize_and_publish();
+    const auto output = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(terminal.state, DeviceRunTerminalState::Failed);
+    EXPECT_NE(output.find("phase=terminal"), std::string::npos);
+    EXPECT_NE(output.find("task=5"), std::string::npos);
+    EXPECT_NE(output.find("epoch=0"), std::string::npos);
+    EXPECT_NE(output.find("order=2"), std::string::npos);
+    EXPECT_NE(output.find("block=9"), std::string::npos);
+    EXPECT_NE(output.find("group_seq=7"), std::string::npos);
+    EXPECT_NE(output.find("worker=4"), std::string::npos);
+    EXPECT_NE(output.find("lane=1"), std::string::npos);
+    EXPECT_NE(output.find("identity_fields=0x3f"), std::string::npos);
 }
 
 }  // namespace

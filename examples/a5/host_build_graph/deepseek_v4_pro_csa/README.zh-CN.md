@@ -244,5 +244,5 @@ deps/timing 两轮各七项数值比较均通过；输入、54 个 kernel、52 �
 
 结果保留 `block_identity_verified=false`，因为现有原始 schema 不提供显式 block_idx/subtask_slot。
 因此这次通过证明原样业务、来源、数量与依赖时序，不替代完整共同准入／组协议事件审计。
-错误身份补全、sync_start 和无插桩性能比较仍待完成。所有失败定位和逐步复验仅集中记录于
+首错误身份与退出冷日志已接线；sync_start 和无插桩性能比较仍待完成。所有失败定位和逐步复验仅集中记录于
 [实现过程](../../../../tests/fdwic/pa_hbg/spmd/implementation-progress.md)，不修改本页历史基线数值。

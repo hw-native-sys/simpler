@@ -161,14 +161,14 @@ struct StartupFixture {
         scheduler_flush_completions(run, &locals[0]);
     }
 
-    void run_late_worker() {
+    void run_late_worker(uint32_t worker = 3) {
         startup_kernel_calls = 0;
         startup_ssbuf_calls = 0;
         scheduler_gm_store(storage.run_control->bootstrap_scan_arrived_count, UINT64_C(5));
         scheduler_gm_store(storage.run_control->bootstrap_arrived_count, UINT64_C(5));
         write_reg(RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
         write_reg(RegId::COND, 0);
-        run_resident_scheduler<false>(&storage.contexts[3], storage.run_control, base(), 0, 0, 0);
+        run_resident_scheduler<false>(&storage.contexts[worker], storage.run_control, base(), 0, 0, 0);
     }
 
     scheduler_test::FixtureStorage storage;
@@ -224,6 +224,28 @@ TEST(HbgGmMixStartupExit, FailedRunAcknowledgesExitWithoutFabricatingCloseSeals)
         scheduler_gm_fetch_add(fixture.storage.run_control->scheduler_error, UINT64_C(0)),
         static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS)
     );
+}
+
+TEST(HbgGmMixStartupExit, MissingCoordinatorSealTimeoutIdentifiesTheWaitingTaskAndWorker) {
+    StartupFixture fixture({6, 6});
+    fixture.finish_both_tasks_on_cluster_zero();
+    fixture.storage.run_control->scheduler_timeout_cycles = PLATFORM_PROF_SYS_CNT_FREQ / 1000;
+    fixture.run_late_worker(4);
+    const auto &run = *fixture.storage.run_control;
+    EXPECT_EQ(run.scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
+    EXPECT_EQ(run.error_site, static_cast<uint64_t>(SchedulerErrorSite::ORDERED_EXIT_TIMEOUT));
+    EXPECT_EQ(run.error_task_ref, 0u);
+    EXPECT_EQ(run.error_run_epoch, 59u);
+    EXPECT_EQ(run.error_order_key, 0u);
+    EXPECT_EQ(run.error_block_idx, UINT64_MAX);
+    EXPECT_EQ(run.error_group_seq, UINT64_MAX);
+    EXPECT_EQ(run.error_worker_index, 4u);
+    EXPECT_EQ(run.error_cluster_lane, 1u);
+    EXPECT_EQ(run.error_identity_fields, 51u);
+    EXPECT_EQ(read_reg(RegId::COND), AICORE_EXITED_VALUE);
+    EXPECT_EQ(startup_kernel_calls, 0u);
+    EXPECT_EQ(startup_ssbuf_calls, 0u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.seal(0, 1), UINT64_C(0)), 0u);
 }
 
 }  // namespace

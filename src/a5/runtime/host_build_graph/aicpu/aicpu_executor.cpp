@@ -268,7 +268,7 @@ static int32_t read_runtime_status(Runtime *runtime) {
     return runtime_status_from_error_code(sched_error_code);
 }
 
-static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime) {
+static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime, const char *phase = nullptr) {
     if (runtime == nullptr || runtime->get_gm_sm_ptr() == nullptr) return 0;
     auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
     SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
@@ -282,6 +282,7 @@ static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime) {
             );
         }
     }
+    if (phase != nullptr) log_aicore_scheduler_error_identity(run_control, phase);
     return settle_aicore_runtime_status(run_control, &header->sched_error_code);
 }
 
@@ -596,7 +597,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         run_control->executed_task_count, run_control->resolved_task_count,
                         run_control->expected_task_count, run_control->inline_completed_count
                     );
-                    supervisor_rc = publish_aicore_scheduler_runtime_error(runtime);
+                    supervisor_rc = publish_aicore_scheduler_runtime_error(runtime, "execution");
                     if (supervisor_rc == 0) supervisor_rc = -1;
                 }
                 if (supervisor_rc == 0 && run_control->resolved_task_count + run_control->inline_completed_count !=
@@ -680,7 +681,7 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     // zero, and the error carried by nothing. This is the boundary where every
     // participant has finished its shutdown partition, so one settle covers
     // every core.
-    const int32_t header_status = publish_aicore_scheduler_runtime_error(runtime);
+    const int32_t header_status = publish_aicore_scheduler_runtime_error(runtime, "terminal");
     const bool normal_path = normal_path_claims_.load(std::memory_order_acquire) == aicpu_thread_num_;
     terminal_publisher_.take(run_terminal_select(normal_path, header_status, terminal_), nullptr, 0);
 }

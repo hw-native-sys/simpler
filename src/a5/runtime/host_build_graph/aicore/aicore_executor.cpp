@@ -339,7 +339,8 @@ __aicore__ bool run_ready_dispatch_loop(
                     scheduler_dispatch_generation(local_generation) == 0) {
                     scheduler_record_error(
                         run_control, context->own_slots()[local_slot].task_ref, SchedulerGraphResult::INVALID_ARGUMENTS,
-                        &graph, context, SchedulerErrorSite::EXECUTOR_PREFERRED_SLOT_INVALID
+                        &graph, context, SchedulerErrorSite::EXECUTOR_PREFERRED_SLOT_INVALID,
+                        &context->own_slots()[local_slot]
                     );
                     return false;
                 }
@@ -378,7 +379,7 @@ __aicore__ bool run_ready_dispatch_loop(
             if (!scheduler_task_ref_valid(graph, task_ref) || ready_generation == 0) {
                 scheduler_record_error(
                     run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
-                    SchedulerErrorSite::EXECUTOR_INVALID_DISPATCH_SLOT
+                    SchedulerErrorSite::EXECUTOR_INVALID_DISPATCH_SLOT, local_slot
                 );
                 return false;
             }
@@ -531,8 +532,11 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     while (stats.exit_observed_cycles == 0 &&
            static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
         if (scheduler_watchdog_expired(exit_wait_start, get_sys_cnt_aicore(), timeout_cycles)) {
+            const int64_t task = scheduler_local_state.admission != nullptr ?
+                                     scheduler_local_state.admission->current_task_ref :
+                                     SCHEDULER_TASK_REF_INVALID;
             scheduler_record_error(
-                run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
+                run_control, task, SchedulerGraphResult::TIMEOUT, &graph, &scheduler_local_state,
                 SchedulerErrorSite::EXIT_WAIT_TIMEOUT
             );
             break;
@@ -554,8 +558,11 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
                 drained)
                 break;
             if (scheduler_watchdog_expired(drain_start, get_sys_cnt_aicore(), timeout_cycles)) {
+                const int64_t task = scheduler_local_state.admission != nullptr ?
+                                         scheduler_local_state.admission->current_task_ref :
+                                         SCHEDULER_TASK_REF_INVALID;
                 scheduler_record_error(
-                    run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
+                    run_control, task, SchedulerGraphResult::TIMEOUT, &graph, &scheduler_local_state,
                     SchedulerErrorSite::ORDERED_EXIT_TIMEOUT
                 );
                 break;

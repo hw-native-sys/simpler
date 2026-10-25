@@ -12,8 +12,11 @@
 #pragma once
 
 #include <atomic>
+#include <cinttypes>
 #include <cstdint>
 
+#include "aicpu/cache_maintenance.h"
+#include "common/unified_log.h"
 #include "host_build_graph/runtime_status.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
@@ -48,9 +51,38 @@ inline bool record_aicore_scheduler_runtime_error(
             &run_control->error_claimed, &expected, UINT64_C(1), false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE
         ))
         return false;
+    __atomic_store_n(&run_control->error_task_ref, UINT64_MAX, __ATOMIC_RELAXED);
+    __atomic_store_n(&run_control->error_core_id, UINT64_MAX, __ATOMIC_RELAXED);
+    __atomic_store_n(&run_control->error_core_type, UINT64_MAX, __ATOMIC_RELAXED);
+    __atomic_store_n(&run_control->error_run_epoch, UINT64_MAX, __ATOMIC_RELAXED);
+    __atomic_store_n(&run_control->error_order_key, UINT64_MAX, __ATOMIC_RELAXED);
+    __atomic_store_n(&run_control->error_block_idx, UINT64_MAX, __ATOMIC_RELAXED);
+    __atomic_store_n(&run_control->error_group_seq, UINT64_MAX, __ATOMIC_RELAXED);
+    __atomic_store_n(&run_control->error_worker_index, UINT64_MAX, __ATOMIC_RELAXED);
+    __atomic_store_n(&run_control->error_cluster_lane, UINT32_MAX, __ATOMIC_RELAXED);
+    __atomic_store_n(&run_control->error_identity_fields, UINT32_C(0), __ATOMIC_RELAXED);
     __atomic_store_n(&run_control->error_site, static_cast<uint64_t>(error_site), __ATOMIC_RELAXED);
     __atomic_store_n(&run_control->scheduler_error, static_cast<uint64_t>(scheduler_error), __ATOMIC_RELEASE);
     return true;
+}
+
+inline void log_aicore_scheduler_error_identity(SchedulerRunControl *run, const char *phase) {
+    if (run == nullptr) return;
+    const auto *error_line = reinterpret_cast<const uint8_t *>(run) + offsetof(SchedulerRunControl, error_claimed);
+    cache_invalidate_range(error_line, 128);
+    const uint64_t status = __atomic_load_n(&run->scheduler_error, __ATOMIC_ACQUIRE);
+    if (status == 0) return;
+    // The publication word is on the first 64B line. Reload both lines after
+    // acquiring it so a prefetched second line cannot carry an older identity.
+    cache_invalidate_range(error_line, 128);
+    LOG_ERROR(
+        "A5 HBG scheduler identity: phase=%s task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64 " type=%" PRIu64
+        " site=%" PRIu64 " epoch=%" PRIu64 " order=%" PRIu64 " block=%" PRIu64 " group_seq=%" PRIu64 " worker=%" PRIu64
+        " lane=%" PRIu32 " identity_fields=0x%" PRIx32,
+        phase, run->error_task_ref, status, run->error_core_id, run->error_core_type, run->error_site,
+        run->error_run_epoch, run->error_order_key, run->error_block_idx, run->error_group_seq, run->error_worker_index,
+        run->error_cluster_lane, run->error_identity_fields
+    );
 }
 
 /**

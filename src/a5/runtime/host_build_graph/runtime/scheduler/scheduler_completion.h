@@ -96,7 +96,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     if (local_slot->state != SchedulerDispatchSlotState::READY || local_slot->generation != completed_generation) {
         scheduler_record_error(
             run_control, published_task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
-            SchedulerErrorSite::COMPLETION_GENERATION_MISMATCH
+            SchedulerErrorSite::COMPLETION_GENERATION_MISMATCH, local_slot
         );
         return false;
     }
@@ -124,7 +124,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
     if (!valid_subtask) {
         scheduler_record_error(
             run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
-            SchedulerErrorSite::COMPLETION_GENERATION_MISMATCH
+            SchedulerErrorSite::COMPLETION_GENERATION_MISMATCH, local_slot
         );
         return false;
     }
@@ -205,7 +205,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
                    cluster_lane != scheduler->config.self_lane || replacement_ready != nullptr)) {
         scheduler_record_error(
             run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
-            SchedulerErrorSite::BLOCK_COMPLETION_INVALID
+            SchedulerErrorSite::BLOCK_COMPLETION_INVALID, local_slot
         );
         return false;
     }
@@ -214,7 +214,7 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         if (mix_slot || mix_tracker != nullptr || cluster_lane != scheduler->config.self_lane) {
             scheduler_record_error(
                 run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
-                SchedulerErrorSite::BLOCK_COMPLETION_INVALID
+                SchedulerErrorSite::BLOCK_COMPLETION_INVALID, local_slot
             );
             return false;
         }

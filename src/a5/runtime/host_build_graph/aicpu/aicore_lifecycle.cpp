@@ -355,6 +355,7 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
                 reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
             );
             if (run_control->scheduler_error != 0) {
+                log_aicore_scheduler_error_identity(run_control, "bootstrap");
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: bootstrap failed at task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64
                     " type=%" PRIu64 " site=%" PRIu64 " workers=%" PRIu64 " schedulers=%" PRIu64

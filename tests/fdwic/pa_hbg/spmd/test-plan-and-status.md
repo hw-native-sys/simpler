@@ -14,7 +14,7 @@
 每次都要求本轮 resident 来源和完整输出，不接受 legacy 正确输出。
 GM Mix 已接入且可与纯多 block 同图：六种 mask 矩阵在仿真／A5 各 270 次通过，
 新 44 个 GM 事件场景各 180 次通过。原样 CSA 七项 golden 和严格 resident L4 门禁已通过。
-显式 block/slot 身份与完整协议 trace、错误身份补全、sync_start 和性能比较仍未完成；
+首错误身份与退出冷日志已接线；显式 block/slot 身份与完整协议 trace、sync_start 和性能比较仍未完成；
 逐轮日志、失败修复证据和能力边界见实现过程。
 
 ## 一、四层检查分别证明什么
@@ -67,7 +67,8 @@ CPU 包中另外有 [test_native_fixture.py](../../../ut/py/hbg_spmd_contracts/t
 共 61 项，检查真实 descriptor/ack/seal、四种 mask、固定物理 lane、原 N、暂停最后发布者、
 旧／未来 ack、错误身份、保留 seal、零工作成员、局部跨 task 推进及无新 kernel 的退出 drain。
 [test_hbg_gm_mix_startup.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_gm_mix_startup.cpp)
-另 4 项直接调用生产 executor，覆盖 startup 直接 EXIT 的 seal 收尾和错误退出不伪造 seal。
+另 5 项直接调用生产 executor，覆盖 startup 直接 EXIT 的 seal 收尾、
+错误退出不伪造 seal，以及缺少协调者 seal 时的超时身份。
 [test_hbg_inline_services.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_inline_services.cpp)
 共 18 项，检查服务节点不产生 payload／generation／trace、三条 ready trace 路径、direct refill、
 N2→Dummy→N1 依赖、Host 已完成节点、有限服务链和畸形 metadata。
@@ -76,6 +77,20 @@ N2→Dummy→N1 依赖、Host 已完成节点、有限服务链和畸形 metadat
 覆盖四种 mask、N1/2/65、512→1→65→1→512、慢头／中／尾、真实依赖及独立任务重叠；
 [test_gm_mix_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_gm_mix_native_fixture.py)
 有 184 项 CPU 检查，拒绝坏记录。探针中的入口／返回序号不是完整调度协议事件。
+
+[test_hbg_error_identity.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_error_identity.cpp)
+有 26 项真实 helper 检查：首错误不可覆盖、32 轮竞争读取、合法 epoch 0/MAX、未知字段、
+当前／旧 task 的组身份、具体预填槽、参数准备／完成错误、AICPU 首写者及 retained reset。
+真实 executor 的 startup 测试增加 missing seal 超时定位，真实 AICPU finalizer 测试增加晚到错误日志检查。
+[test_error_identity.py](test_error_identity.py) 的私有 GM 探针有 46 场景，
+由 AIC/AIV 调用同一生产 writer，覆盖完整／部分身份、共享错误区、N1/2/65 和极值 epoch。
+其中两个单组 Mix 场景要求 C/V 实际到达后再竞争，检查两个参与者及赢家 lane；
+这是组内有界会合，不是多 block sync_start 已支持的证据。
+[test_error_identity_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_error_identity_native_fixture.py)
+有 262 项 CPU oracle 检查。设备探针不写真实 runtime 错误区，不替代物理故障停机与回收验证。
+设备探针与业务用例的硬件编译还须通过 text 映像门禁：非空 allocated `.rodata`／
+`.rodata.*` 不能被仅提取 `.text` 的加载器静默丢弃。ELF 和缓存策略回归分别覆盖
+拒绝不完整映像、空／非 allocated 控制项及硬件缓存失效；仿真成功不能替代该检查。
 
 ## 二、已经造好的边界与尚欠设备证明的部分
 

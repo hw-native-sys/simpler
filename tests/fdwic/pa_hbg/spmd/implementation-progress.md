@@ -4,7 +4,7 @@
 
 开始日期：2026-10-25；起点：`6c367c69f`；工作分支：`feat/fully_distributed_within_core`。
 按用户要求逐步实现、阶段性详细中文 commit，**不 push**。
-用户随后单独授权的推送已完成至 `c8374e37b`；后续实现继续遵守不自动 push 的原目标。
+用户随后单独授权的推送已完成至 `6f2b470d4`；后续实现继续遵守不自动 push 的原目标。
 本文件集中记录实现、失败定位、测试证据和剩余工作，不能用阶段完成替代整个目标完成。
 
 依据：
@@ -27,7 +27,7 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 | 1 | 有界存储、准入记录、block 控制、GM 组状态 | POD／布局／溢出／重跑初始化测试 | 已落地；纯 C/V 和 GM Mix 已使用 |
 | 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | own/direct、持久候选与 GM Mix 均已接线；完整事件审计待补 |
 | 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | A5／仿真功能和 L1/L4 逐 block 检查通过 |
-| 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | A5／仿真矩阵、重叠及 TPipe PA 已通过；完整诊断仍在补验 |
+| 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | A5／仿真矩阵、重叠及 TPipe PA 已通过；首错误身份与冷日志已接线 |
 | 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | CSA 数值／2308 记录／来源通过；显式身份与全协议事件未完成 |
 | 6 | sync_start 不同位置领取和局部跨任务推进 | 两独立满核任务、部分交叠、超容量、早返回不重领 | 未实现 |
 | 7 | 性能对比 | 同 kernel／输入／拓扑，无完整插桩运行；诊断运行分开 | 未测量 |
@@ -747,3 +747,157 @@ dropped 合计 0、truncated 全 false；两轮七项输出通过，完整身份
 - 同 kernel／输入／拓扑的无完整插桩性能比较尚未执行，不以 L4 或 CPU 模型推算收益。
 
 后续继续沿真实 RED→生产修复→CPU／仿真／A5 验证推进，过程只更新本文件，阶段提交不自动 push。
+
+## 2026-10-25：补齐首错误身份与退出诊断
+
+起点 `6f2b470d4` 已完成阶段提交、未 push；提交后重编成功，CSA 入口确认
+Torch 2.12、冻结源码一致、native binding 与提交一致，三个 runtime 二进制 SHA256
+与最终严格 L4 相同。工作树只有原有四项用户未跟踪内容，无遗留后台测试。
+
+原错误区只记录 task/core/site，48B 预留区清零；局部 admission 信息没有传入底层记录。
+`scheduler_admission_fail` 进一步退化成 shared context，EXIT watchdog 使用无效 task，
+AICPU 终态收敛虽然能返回错误，却不打印晚到错误的完整现场。
+另一个确定缺陷是 AICore writer 对 OK 状态也占用 first-error claim，导致后续真正错误不能发布。
+
+新增真实 C++ 测试 `test_hbg_error_identity.cpp`，最初直接读取现有预留区的 wire 字节，
+没有先添加未实现接口来制造编译红灯。17 项中 16 项实际失败，布局控制项通过；
+包括初始化／retained reset、epoch 0、各组阶段与 mask6 协调者、旧 task 残留、
+实际 Mix prepare 失败、AICore/AICPU 双向首写者和 32 轮并发一致性读取。
+日志 `outputs/spmd-error-identity-red-20261025.log`；初步补齐后 17 项全绿。
+
+追加三项实际 RED 揭示：UINT64_MAX 也可为合法 epoch，需有效性位；
+只有 shared context 时仍应保留已知 worker/lane；纯任务两个预填槽需要精确归属失败槽。
+日志 `outputs/spmd-error-identity-boundary-red-20261025.log` 为 17 绿／3 红。
+诊断仍复用 48B：epoch/order/block/group_seq/worker 各 64 位，lane 和有效性位各 32 位，
+RunControl 仍为 384B，error_claimed/site 的原 offset 不变，新增字段 offset 静态断言。
+未知字段保留全 1，并以独立 valid_fields 区分合法极值；epoch 0 不作未初始化哨兵。
+
+共同准入和组的本地结构声明移到 ready 的局部状态区，布局不变，不新增运行期缓存或分配。
+错误冷路径直接读取已经持有的状态；当前 task 不匹配时不套用另一义务的 order/group。
+IDLE 只有 task_last_seq 明确归属当前 task 时保留最近已退役组；切到下一 task 后不使用旧组字段。
+参数准备按实际 FILLING 槽记录 block，generation 和 block 完成错误也传递具体槽；
+仅无共同准入上下文的普通 N1 不声称知道 epoch/order，已知 block 0 仍记录并标有效。
+
+首错误 CAS 的唯一获胜者写全部身份，经 barrier 最后发布 scheduler_error；
+AICPU 的首写者显式发布未知身份，后写者不修改已发布现场。OK 不占 claim。
+AICPU 冷日志在观察发布状态后再次失效完整错误区，避免第二条 64B line 的旧预取数据；
+bootstrap、execution、terminal 均可输出相同身份格式，正常路径不打印错误日志。
+
+两项实际调用生产路径的 RED 也已建立：零工作 AIV 在 EXIT drain 等不到 AIC seal，
+应定位当前 task/epoch/order/worker；真实 terminal finalizer 应打印晚到错误的全部已知字段。
+`outputs/spmd-error-exit-red-20261025.log` 两个目标分别新增一项失败，既有控制项仍绿。
+接线后 20 项身份检查、5 项真实 executor startup/EXIT、6 项真实 AICPU finalizer
+共 31 项通过，日志 `outputs/spmd-error-exit-green-20261025.log`。
+正在补普通 completion 和空上下文边界、完整回归与设备原语验证；尚未完成该阶段验收或提交。
+
+补充检查发现 AICPU 首写者还会保留已污染的旧 task/core/type，
+26 项中该项实际失败；统一清为未知后完整 15 个 C++ targets 共 510 项通过。
+日志 `outputs/spmd-error-identity-aicpu-red-20261025.log` 与 `outputs/spmd-error-identity-cpp-20261025.log`。
+完整 runtime 首轮重编也通过，日志 `outputs/spmd-error-identity-runtime-build-20261025.log`。
+
+新增设备侧私有 GM 探针及 254 项 CPU oracle 检查，检查首写者、完整／部分身份、
+epoch 0/MAX、保留区、每块观测和本轮 resident 来源。探针不写真实 scheduler 的错误区，
+也不把构造的 worker 身份当作真实物理 placement；生产调用点的状态提取由 C++ 测试单独覆盖。
+最初探针引入整个 ready 头，因用户 kernel include 路径没有私有 inner_kernel 时钟声明而编译失败，
+两次失败分别为未声明 get_sys_cnt_aicore、找不到 inner_kernel.h，未进入执行。
+没有增加假的时钟实现或修改公共 kernel 编译路径。
+
+通用 first-error 原子发布提取到 scheduler_error.h，ready 保留本核状态提取与调用点封装，
+设备探针直接复用这一个发布实现；不复制 writer，也不需要执行器的时钟／寄存器依赖。
+读端等待采用有限次原子查询，观察发布后核对完整身份；后写者不得覆盖首写者。
+仿真最小原生用例通过，日志 `outputs/spmd-error-identity-smoke-sim-r3-20261025.log`。
+CPU 探针 oracle 254 passed，日志 `outputs/spmd-error-identity-native-fixture-20261025.log`。
+设备 precheck 仍因缺少 npu-smi 退出，CANN 查询已确认设备 0 为 Ascend950PR_958b，
+按用户要求直接使用本机卡、无 task-submit 锁，查询留存 `outputs/spmd-error-identity-device-20261025.log`。
+
+通用发布入口提取后完整 runtime 重编通过，15 个相关 C++ targets 共 510 项再次通过，
+另补跑实际退休接线 7 项通过，共 517 项；日志为 `outputs/spmd-error-identity-final-cpp-20261025.log`
+和 `outputs/spmd-error-identity-retirement-20261025.log`。所有适用静态／格式检查通过。
+首轮 44 个设备探针场景在仿真／A5 各三轮、132 次通过；
+日志 `outputs/spmd-error-identity-matrix-sim-20261025.log`、`outputs/spmd-error-identity-native-20261025/matrix.log`。
+HBG 仿真 42 passed、379 deselected（102.17 秒），A5 60 passed、4 skipped、356 deselected（157.83 秒）。
+单卡 A5 仍显式排除已知误收集的双卡 TMR RDMA 目录；未以此声称多卡回归完成。
+Python 合约／CSA 快照／转换器等首轮 1681 项通过，日志 `outputs/spmd-error-identity-python-20261025.log`。
+
+原样 CSA 严格 L4 保持通过，`outputs/csa-hbg-l4-buvxzzb6/result.json`：
+两轮各七项 golden、2308 条执行、133 条依赖时序、107/107 Host 构图记录，producer=aicore；
+block_identity_verified=false 仍保留，既有 L4 不因此获得完整协议身份能力。
+
+首轮共享地址场景不强制多个物理执行位置同时到达，故不能单凭它声称实际竞争一定发生。
+追加两个 N=1、mask3 的 GM Mix 场景：同组 C/V 进入后在探针自有词上有界会合，
+两方到达后才对同一私有错误区发布；检查到达数 2、每 lane 一次执行、赢家及其 lane 一致。
+它不跨组等待，不打开 sync_start，不写真实调度器错误区。总计 46 场景，CPU oracle 增至 262 项，
+仿真三轮 138 次通过，日志 `outputs/spmd-error-identity-matrix-sim-final-20261025.log`；
+对应 A5 最终矩阵仍在复验，终态结果另记。
+
+### 追加设备验证暴露只提取 text 的跳转表遗漏
+
+46 场景的 A5 复跑实际失败在第一个原有单 AIC 场景（scenario0），没有到达新增 Mix 场景。
+首次运行报告 AICore 异常和 507018，之后同一 Worker 已 poisoned，后续条目都是连带拒绝，
+不能计成 46 次独立硬件失败，更不能把原先 132 次成功算作新版本通过。
+日志 `outputs/spmd-error-identity-native-20261025/matrix-final.log`；现场 PID 1976630 的
+device/plog 保存在该输出目录的 ascend/debug 下。框架自动 force reset 设备 0，
+明确报告 probe confirmed clean 和旧 generation 已退休；未手工扩大复位范围，源码与 Host 数据保留。
+
+保存并仅离线重编生成物后发现确定缺陷：
+`outputs/spmd-error-identity-elf-20261025/error_identity_aic.cpp.incore_wn8losko.o`
+的 .rela.text 在 offset 0x440 引用 JTI0_0；链接 ELF 的 .rodata 在 0x1000、24B，
+.text 在 0x2000、1448B。六路条件被 CCEC 降为跳转表；当前提取器只带走 .text，
+已链接的映像又没有剩余 .rela.text，于是遗漏必要 .rodata 仍被接受。
+设备故障 PC 超出实际 callable code 范围，与读到错误跳转表后的非法跳转相符；
+本机 llvm-objdump 对该指令集只输出 not available，未据此伪造指令级反汇编结论。
+
+新增 Host 门禁 RED：非空 allocated .rodata/.rodata.* 必须拒绝，空／非 allocated 控制项允许；
+硬件缓存键须随提取合同变化，不能继续复用已经丢弃跳转表的旧裸代码。
+探针的 expected_fields 改由 Host 标量提供，保留独立 Host oracle，不改 frozen CSA 或生产调度语义。
+该修复仍在验证；本阶段未提交、未 push，不以仿真通过替代新的 A5 复验。
+
+### text 门禁修复后的重新验收
+
+Host 门禁先获得 8 项实际 RED（其余 47 项控制测试通过），再实现 allocated
+`.rodata`／`.rodata.*` 拒绝；空或未分配的只读段仍接受。硬件 incore 缓存键携带
+text 提取策略版本，外层 callable 键随之变化；仿真缓存键不受影响。
+这不是把完整 ELF 装载能力加入 runtime，也没有改 linker、kernel ABI 或冻结 CSA。
+日志 `outputs/spmd-error-rodata-red-20261025.log` 与 `outputs/spmd-error-rodata-green-20261025.log`。
+
+离线复核原失败 ELF 已被门禁拒绝；传入 expected_fields 标量后的 AIC/AIV
+分别提取出完整的 1360B／1504B text。原样 CSA 的 54 个 kernel 在新门禁下预编译通过，
+日志 `outputs/spmd-error-rodata-csa-precompile-20261025.log`。
+恢复测试的单 AIC 场景三轮通过；随后使用 `--case lane2_*` 被 CLI 拒绝，
+此入口只接受精确场景名，该次没有设备执行。改用两个完整 Mix 场景名后各三轮通过，
+日志为 `recovered-mixed-zero.log`、`recovered-mixed-max.log`，均在上述 native 输出目录。
+
+修正后的完整 46 场景在仿真／A5 各三轮、138 次调用全部通过：
+`outputs/spmd-error-identity-matrix-sim-safe-20261025.log`、
+`outputs/spmd-error-identity-native-20261025/matrix-safe.log`。
+本轮 Python 合约、CSA 快照、转换器、ELF、编译缓存及 kernel compiler 回归 1768 项通过，
+日志 `outputs/spmd-error-identity-python-safe-20261025.log`。
+16 个相关 C++ targets 再跑全部通过，包含 517 项具体检查，
+日志 `outputs/spmd-error-identity-cpp-safe-20261025.log`。
+
+新 text 门禁下原样 CSA 严格 L4 再次通过：`outputs/csa-hbg-l4-vtupzkkq/result.json`。
+两轮各七项 golden，2308 条执行（AIC 864、AIV 1444）、133 条依赖时序，
+107/107 条 Host 构图记录，producer=aicore；冻结 case 与基线一致。
+`block_identity_verified=false` 没有放宽，完整原生协议事件仍是下一项实现工作。
+
+用户随后明确要求推送已有提交，`6f2b470d4` 已核对远端 SHA 并推送到
+`nalinaly/simpler` 的 `feat/fully_distributed_within_core`；本节未提交改动没有随之推送。
+后续恢复阶段性中文 commit、不自动 push 的原目标，最终 HBG 回归及提交检查结果续记于此。
+
+最终 HBG 仿真 42 passed、378 deselected（140.49 秒），A5 60 passed、4 skipped、
+356 deselected（288.94 秒）。仿真也显式排除相同双卡 TMR 目录，故比前一轮少一个 deselected，
+不是丢失 HBG 测试。日志 `outputs/spmd-error-identity-hbg-sim-safe-20261025.log` 和
+`outputs/spmd-error-identity-native-20261025/hbg-safe.log`。本机依旧直接用卡，无 task-submit 锁。
+
+补核对四份保存 ELF 时，最初误把原 AIV 也列为应拒绝，检查脚本因此失败；
+readelf 确认原 AIV 无 allocated .rodata，1640B text 可接受。修正的是离线核对预期，
+不是放宽门禁：原失败 AIC 拒绝，原 AIV 及修正后 AIC/AIV 接受。
+C/V 后端对同一条件表达式的生成物不相同，不能把 AIC 的跳转表结论直接套给 AIV。
+
+最终提交检查全部适用项通过，日志 `outputs/spmd-error-identity-precommit-final-r2-20261025.log`。
+首轮 ruff 仅重排探针 CASES 表达式，已比较格式化前后 AST 相同；
+格式化后探针 oracle、ELF、缓存、compiler 共 341 项再次通过，
+日志 `outputs/spmd-error-identity-postformat-20261025.log`。未跳过检查，未改生产 C++ 或 kernel。
+本次阶段提交涵盖首错误身份、确切槽定位、AICPU 冷日志、原生探针和 text 门禁及其缓存失效；
+不含用户未跟踪的原始泳道、TMR CSA、atomic_probe，不改 frozen kernel／golden。
+下一项仍是显式执行身份与完整原生协议 trace，之后实现 sync_start 和同配置性能比较。

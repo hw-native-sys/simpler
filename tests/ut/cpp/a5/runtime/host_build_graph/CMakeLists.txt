@@ -29,6 +29,12 @@ a5_hbg_case(test_hbg_inline_services.cpp
     INCLUDES ${SIMPLER_SRC}/a5/platform/sim/aicore
     DEFINES __CPU_SIM)
 
+a5_hbg_case(test_hbg_error_identity.cpp
+    INCLUDES
+        ${SIMPLER_SRC}/a5/platform/sim/aicore
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
+    DEFINES __CPU_SIM)
+
 a5_hbg_case(test_hbg_scheduler_bootstrap.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
     SOURCES  ${HBG_COMMON_SHARED_DIR}/runtime.cpp)

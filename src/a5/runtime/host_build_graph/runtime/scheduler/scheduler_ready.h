@@ -13,6 +13,7 @@
 
 #include "scheduler_memory.h"
 #include "scheduler_graph.h"
+#include "scheduler_error.h"
 #include "scheduler_ssbuf.h"
 
 enum class SchedulerRouteResult : uint64_t {
@@ -119,6 +120,51 @@ struct SchedulerReadyClaim {
     uint64_t state_probe_start_cycles{0};
     uint64_t state_probe_end_cycles{0};
 };
+
+struct SchedulerOrderedCandidate {
+    SchedulerReadyClaim ready{};
+    uint8_t slot_index{UINT8_MAX};
+    bool predicate_cached{false};
+    bool predicate_pass{true};
+};
+
+enum class SchedulerGmMixPhase : uint8_t { IDLE, CLAIMED, PUBLISHED, ARRIVED, RUNNING, RELEASED };
+
+struct SchedulerGmMixLocalState {
+    uint64_t mailbox_offset{0};
+    uint64_t group_seq{0};
+    uint64_t task_last_seq{0};
+    uint32_t block_idx{0};
+    uint32_t cluster_index{UINT32_MAX};
+    uint32_t slot_generation{0};
+    uint8_t slot_index{UINT8_MAX};
+    uint8_t subtask_slot{UINT8_MAX};
+    SchedulerGmMixPhase phase{SchedulerGmMixPhase::IDLE};
+};
+
+struct SchedulerAdmissionLocalState {
+    uint64_t epoch{0};
+    uint64_t control_offset{0};
+    uint64_t records_offset{0};
+    uint64_t record_stride{0};
+    uint64_t log_offset{0};
+    uint64_t capacity{0};
+    uint64_t member_word_count{0};
+    int64_t pending_task_ref{SCHEDULER_TASK_REF_INVALID};
+    uint64_t scan_cursor{0};
+    int64_t current_task_ref{SCHEDULER_TASK_REF_INVALID};
+    uint32_t current_block_num{0};
+    uint8_t current_active_mask{0};
+    uint8_t current_flags{0};
+    bool initialized{false};
+    uint8_t next_candidate{0};
+    SchedulerOrderedCandidate candidates[SCHEDULER_PENDING_SLOT_COUNT]{};
+    SchedulerGmMixLocalState gm_mix{};
+};
+
+static_assert(sizeof(SchedulerOrderedCandidate) == 48, "ordered candidate size changed");
+static_assert(sizeof(SchedulerGmMixLocalState) == 40, "GM group-local state size changed");
+static_assert(sizeof(SchedulerAdmissionLocalState) == 224, "admission-local state size changed");
 
 struct SchedulerFreeSlotClaim {
     uint64_t worker_id{UINT64_MAX};
@@ -227,8 +273,6 @@ struct SchedulerMixTracker {
     uint8_t active_mask{0};
     uint8_t completed_mask{0};
 };
-
-struct SchedulerAdmissionLocalState;
 
 struct SchedulerLocalState {
     SchedulerLocalConfig config{};
@@ -680,32 +724,69 @@ inline __aicore__ void scheduler_append_idle_activity(
     scheduler_gm_store(buffer->committed, committed + 1);
 }
 
-inline __aicore__ void scheduler_record_error(
-    __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerGraphResult status,
-    const SchedulerGraphView *graph = nullptr, __gm__ const SchedulerWorkerContext *context = nullptr,
-    SchedulerErrorSite error_site = SchedulerErrorSite::UNKNOWN
+inline __aicore__ SchedulerErrorIdentity scheduler_error_identity(
+    const SchedulerLocalState *local, int64_t task_ref, const SchedulerLocalSlotState *slot = nullptr
 ) {
-    if (scheduler_gm_compare_exchange(run_control->error_claimed, UINT64_C(0), UINT64_C(1)) != 0) return;
-    scheduler_gm_store(run_control->error_task_ref, static_cast<uint64_t>(task_ref));
-    if (graph != nullptr) {
-        scheduler_gm_store(run_control->error_graph_task_count, graph->task_count);
-        scheduler_gm_store(run_control->error_storage_address, graph->storage_address);
-        scheduler_gm_store(run_control->error_task_window_last_index, graph->task_window_last_index);
+    SchedulerErrorIdentity identity{};
+    if (local == nullptr) return identity;
+    if (local->config.self_lane < PLATFORM_CORES_PER_BLOCKDIM &&
+        local->worker_id() < local->config.runtime_worker_count) {
+        identity.worker_index = local->worker_id();
+        identity.cluster_lane = local->config.self_lane;
+        identity.valid_fields |= SCHEDULER_ERROR_HAS_WORKER | SCHEDULER_ERROR_HAS_LANE;
     }
-    if (context != nullptr) {
-        scheduler_gm_store(run_control->error_core_id, static_cast<uint64_t>(context->physical_core_id));
-        scheduler_gm_store(run_control->error_core_type, static_cast<uint64_t>(context->core_type));
+    const auto *admission = local->admission;
+    if (admission != nullptr && admission->initialized) {
+        identity.run_epoch = admission->epoch;
+        identity.valid_fields |= SCHEDULER_ERROR_HAS_EPOCH;
+        if (!scheduler_task_ref_is_null(task_ref) && task_ref == admission->current_task_ref) {
+            identity.order_key = admission->scan_cursor;
+            identity.valid_fields |= SCHEDULER_ERROR_HAS_ORDER;
+            const auto &group = admission->gm_mix;
+            const bool owns_group =
+                group.phase >= SchedulerGmMixPhase::CLAIMED && group.phase <= SchedulerGmMixPhase::RELEASED;
+            const bool retired_current_group = group.phase == SchedulerGmMixPhase::IDLE && group.task_last_seq != 0 &&
+                                               group.task_last_seq == group.group_seq;
+            if (scheduler_task_is_mix(admission->current_flags) && group.group_seq != 0 &&
+                (owns_group || retired_current_group)) {
+                identity.block_idx = group.block_idx;
+                identity.group_seq = group.group_seq;
+                identity.valid_fields |= SCHEDULER_ERROR_HAS_BLOCK | SCHEDULER_ERROR_HAS_GROUP;
+            }
+        }
     }
-    scheduler_gm_store(run_control->error_site, static_cast<uint64_t>(error_site));
-    scheduler_gm_store(run_control->scheduler_error, static_cast<uint64_t>(status));
+    if (slot != nullptr && !scheduler_task_ref_is_null(task_ref) && slot->task_ref == task_ref &&
+        slot->state != SchedulerDispatchSlotState::FREE && slot->state != SchedulerDispatchSlotState::EMPTY) {
+        identity.block_idx = slot->block_idx;
+        identity.valid_fields |= SCHEDULER_ERROR_HAS_BLOCK;
+    }
+    return identity;
 }
 
 inline __aicore__ void scheduler_record_error(
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, SchedulerGraphResult status,
     const SchedulerGraphView *graph, const SchedulerLocalState *local,
-    SchedulerErrorSite error_site = SchedulerErrorSite::UNKNOWN
+    SchedulerErrorSite error_site = SchedulerErrorSite::UNKNOWN, const SchedulerLocalSlotState *slot = nullptr
 ) {
-    scheduler_record_error(run_control, task_ref, status, graph, local->config.shared_context, error_site);
+    const auto identity = scheduler_error_identity(local, task_ref, slot);
+    scheduler_record_error(
+        run_control, task_ref, status, graph, local != nullptr ? local->config.shared_context : nullptr, error_site,
+        &identity
+    );
+}
+
+inline __aicore__ void scheduler_record_dispatch_error(
+    __gm__ SchedulerRunControl *run, int64_t task_ref, SchedulerGraphResult status, const SchedulerGraphView *graph,
+    const SchedulerLocalState *local, const SchedulerLocalSlotState *slot, const SchedulerTaskMetadata &metadata,
+    SchedulerErrorSite site
+) {
+    auto identity = scheduler_error_identity(local, task_ref, slot);
+    if (slot != nullptr && slot->state == SchedulerDispatchSlotState::FILLING &&
+        scheduler_task_ref_is_null(slot->task_ref) && !slot->cooperative && metadata.logical_block_num == 1) {
+        identity.block_idx = 0;
+        identity.valid_fields |= SCHEDULER_ERROR_HAS_BLOCK;
+    }
+    scheduler_record_error(run, task_ref, status, graph, local->config.shared_context, site, &identity);
 }
 
 inline __aicore__ void scheduler_publish_waiter_metadata(
@@ -1376,9 +1457,9 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
          target->core_type != static_cast<int32_t>(CoreType::AIV)) ||
         !scheduler_task_is_executable(metadata.flags) ||
         scheduler_metadata_core_type_index(subtask_slot) != scheduler_core_type_index(target->core_type)) {
-        scheduler_record_error(
+        scheduler_record_dispatch_error(
             run_control, ready_claim.task_ref, SchedulerGraphResult::UNSUPPORTED_SHAPE, &graph, scheduler,
-            SchedulerErrorSite::DISPATCH_INVALID_SHAPE
+            scheduler->slot_state(slot_claim), metadata, SchedulerErrorSite::DISPATCH_INVALID_SHAPE
         );
         return false;
     }
@@ -1395,9 +1476,9 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
     if (!inline_task && !scheduler_lookup_callable_address(
                             callable_addresses, scheduler->config.callable_addresses_count, kernel_id, &callable_address
                         )) {
-        scheduler_record_error(
-            run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_CALLABLE, &graph, scheduler,
-            SchedulerErrorSite::DISPATCH_INVALID_CALLABLE
+        scheduler_record_dispatch_error(
+            run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_CALLABLE, &graph, scheduler, &reserved,
+            metadata, SchedulerErrorSite::DISPATCH_INVALID_CALLABLE
         );
         return false;
     }
@@ -1429,9 +1510,9 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
                 const SchedulerPredicateResult predicate =
                     scheduler_evaluate_task_predicate(graph, ready_claim.task_ref);
                 if (predicate == SchedulerPredicateResult::MALFORMED) {
-                    scheduler_record_error(
+                    scheduler_record_dispatch_error(
                         run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
-                        SchedulerErrorSite::DISPATCH_INVALID_PREDICATE
+                        &reserved, metadata, SchedulerErrorSite::DISPATCH_INVALID_PREDICATE
                     );
                     return false;
                 }
@@ -1442,8 +1523,8 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
         }
     }
     if (status != SchedulerGraphResult::OK) {
-        scheduler_record_error(
-            run_control, ready_claim.task_ref, status, &graph, scheduler,
+        scheduler_record_dispatch_error(
+            run_control, ready_claim.task_ref, status, &graph, scheduler, &reserved, metadata,
             SchedulerErrorSite::DISPATCH_MATERIALIZE_FAILED
         );
         return false;
