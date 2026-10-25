@@ -147,6 +147,11 @@ struct SchedulerLocalSlotState {
     SchedulerDispatchSlotState state{SchedulerDispatchSlotState::EMPTY};
     uint8_t subtask_slot{UINT8_MAX};
     uint8_t mix_tracker{UINT8_MAX};
+    bool cooperative{false};
+    uint32_t block_idx{0};
+    uint8_t candidate_index{UINT8_MAX};
+    bool predicate_cached{false};
+    bool predicate_pass{true};
 };
 
 struct SchedulerWorkerTraceCache {
@@ -222,9 +227,12 @@ struct SchedulerMixTracker {
     uint8_t completed_mask{0};
 };
 
+struct SchedulerAdmissionLocalState;
+
 struct SchedulerLocalState {
     SchedulerLocalConfig config{};
     SchedulerLocalProfilingState *profiling{nullptr};
+    SchedulerAdmissionLocalState *admission{nullptr};
     uint64_t pending_completed{0};
     SchedulerMixTracker mix_trackers[SCHEDULER_MIX_TRACKER_COUNT]{};
     uint32_t dispatch_sequence{0};
@@ -309,8 +317,8 @@ static_assert(SCHEDULER_READY_QUEUE_COUNT <= 8, "owner ready mask must fit one b
 static_assert(alignof(SchedulerLocalSlotState) == alignof(uint64_t));
 static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 120, "64-bit local config size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 16, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 432, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 504, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 240, "64-bit local profiling size changed"
 );
@@ -842,10 +850,11 @@ inline __aicore__ SchedulerRouteResult scheduler_bootstrap_route_task(
     return SchedulerRouteResult::READY_TO_ENQUEUE;
 }
 
-inline __aicore__ uint32_t
-scheduler_trace_index_at(__gm__ void *base, SchedulerLocalState *local, int64_t task_ref, uint8_t subtask) {
+inline __aicore__ uint32_t scheduler_trace_index_at(
+    __gm__ void *base, SchedulerLocalState *local, int64_t task_ref, uint8_t subtask, uint32_t block_idx = 0
+) {
     const auto *metadata = scheduler_task_metadata_at(base, local, task_ref);
-    return scheduler_task_trace_index(metadata->trace_index_base, metadata->active_mask, subtask);
+    return scheduler_task_trace_index(metadata->trace_index_base, metadata->active_mask, subtask, block_idx);
 }
 
 inline __aicore__ bool scheduler_bootstrap_ready_batch_append(
@@ -867,11 +876,14 @@ inline __aicore__ bool scheduler_bootstrap_ready_batch_append(
             scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->profiling->trace_cells_offset);
         const auto &metadata = *scheduler_task_metadata_at(scheduler_state_base, context, task_ref);
         const uint64_t now = scheduler_cycles();
-        for (uint8_t subtask = 0; subtask < 3; ++subtask) {
-            if ((metadata.active_mask & (1U << subtask)) == 0) continue;
-            auto &trace = cells[scheduler_task_trace_index(metadata.trace_index_base, metadata.active_mask, subtask)];
-            trace.ready_transition_cycles = now;
-            scheduler_writeback_cache_line(&trace.ready_transition_cycles);
+        for (uint32_t block = 0; block < metadata.logical_block_num; ++block) {
+            for (uint8_t subtask = 0; subtask < 3; ++subtask) {
+                if ((metadata.active_mask & (1U << subtask)) == 0) continue;
+                auto &trace =
+                    cells[scheduler_task_trace_index(metadata.trace_index_base, metadata.active_mask, subtask, block)];
+                trace.ready_transition_cycles = now;
+                scheduler_writeback_cache_line(&trace.ready_transition_cycles);
+            }
         }
     }
     ++batch->count;
@@ -900,12 +912,14 @@ inline __aicore__ bool scheduler_ready_batch_append(
         const uint8_t mask = metadata->active_mask;
         const uint32_t trace_base = metadata->trace_index_base;
         const uint64_t transition_cycles = scheduler_cycles();
-        for (uint8_t subtask = 0; subtask < 3; ++subtask) {
-            if ((mask & (1U << subtask)) == 0) continue;
-            __gm__ SchedulerTaskTrace *trace = &cells[scheduler_task_trace_index(trace_base, mask, subtask)];
-            scheduler_observe_cache_line(&trace->ready_transition_cycles);
-            trace->ready_transition_cycles = transition_cycles;
-            scheduler_publish_cache_line(&trace->ready_transition_cycles);
+        for (uint32_t block = 0; block < metadata->logical_block_num; ++block) {
+            for (uint8_t subtask = 0; subtask < 3; ++subtask) {
+                if ((mask & (1U << subtask)) == 0) continue;
+                __gm__ SchedulerTaskTrace *trace = &cells[scheduler_task_trace_index(trace_base, mask, subtask, block)];
+                scheduler_observe_cache_line(&trace->ready_transition_cycles);
+                trace->ready_transition_cycles = transition_cycles;
+                scheduler_publish_cache_line(&trace->ready_transition_cycles);
+            }
         }
     }
     ++batch->count;
@@ -1313,6 +1327,11 @@ inline __aicore__ void scheduler_initialize_free_slot(SchedulerLocalSlotState *l
     local_slot->state = SchedulerDispatchSlotState::FREE;
     local_slot->mix_tracker = UINT8_MAX;
     local_slot->subtask_slot = UINT8_MAX;
+    local_slot->cooperative = false;
+    local_slot->block_idx = 0;
+    local_slot->candidate_index = UINT8_MAX;
+    local_slot->predicate_cached = false;
+    local_slot->predicate_pass = true;
 }
 
 inline __aicore__ SchedulerTaskMetadata scheduler_load_dispatch_metadata(
@@ -1338,7 +1357,8 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, uint8_t subtask_slot, uint64_t *prepare_start_cycles = nullptr,
     const SchedulerTaskPayloadArguments *arguments = nullptr, bool write_arguments = true
 ) {
-    if (ssbuf_region == nullptr || scheduler == nullptr || !scheduler_task_ref_valid(graph, ready_claim.task_ref) ||
+    if (scheduler == nullptr || ((scheduler->has_mix || slot_claim.mix) && ssbuf_region == nullptr) ||
+        !scheduler_task_ref_valid(graph, ready_claim.task_ref) ||
         slot_claim.worker_id >= scheduler->config.runtime_worker_count ||
         slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT || slot_claim.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM)
         return false;
@@ -1401,15 +1421,20 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
             graph, task, callable_address, payload, arguments, write_arguments
         );
         if (status == SchedulerGraphResult::OK && scheduler_task_has_predicate(metadata.flags)) {
-            const SchedulerPredicateResult predicate = scheduler_evaluate_task_predicate(graph, ready_claim.task_ref);
-            if (predicate == SchedulerPredicateResult::MALFORMED) {
-                scheduler_record_error(
-                    run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
-                    SchedulerErrorSite::DISPATCH_INVALID_PREDICATE
-                );
-                return false;
+            if (!reserved.predicate_cached) {
+                const SchedulerPredicateResult predicate =
+                    scheduler_evaluate_task_predicate(graph, ready_claim.task_ref);
+                if (predicate == SchedulerPredicateResult::MALFORMED) {
+                    scheduler_record_error(
+                        run_control, ready_claim.task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+                        SchedulerErrorSite::DISPATCH_INVALID_PREDICATE
+                    );
+                    return false;
+                }
+                reserved.predicate_cached = true;
+                reserved.predicate_pass = predicate == SchedulerPredicateResult::PASS;
             }
-            if (predicate == SchedulerPredicateResult::FAIL) payload->function_bin_addr = 0;
+            if (!reserved.predicate_pass) payload->function_bin_addr = 0;
         }
     }
     if (status != SchedulerGraphResult::OK) {
@@ -1419,6 +1444,8 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
         );
         return false;
     }
+    payload->local_context.block_idx = reserved.block_idx;
+    payload->local_context.block_num = metadata.logical_block_num;
     payload->global_context.sub_block_id =
         scheduler_task_is_mix(metadata.flags) ? (slot_claim.cluster_lane == 2 ? 1 : 0) : (subtask_slot == 2 ? 1 : 0);
     return true;
@@ -1468,14 +1495,16 @@ inline __aicore__ void scheduler_commit_dispatch_slot(
     if (task_timing_enabled) {
         __gm__ SchedulerTaskTrace *traces =
             scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, scheduler->profiling->trace_cells_offset);
-        __gm__ SchedulerTaskTrace *trace =
-            &traces[scheduler_task_trace_index(metadata.trace_index_base, metadata.active_mask, subtask_slot)];
+        __gm__ SchedulerTaskTrace *trace = &traces[scheduler_task_trace_index(
+            metadata.trace_index_base, metadata.active_mask, subtask_slot, scheduler->slot_state(slot_claim)->block_idx
+        )];
         trace->worker_id = slot_claim.worker_id;
         trace->task_ref = static_cast<uint64_t>(ready_claim.task_ref);
         if (phase_timing_enabled) {
             trace->ready_source = static_cast<uint64_t>(ready_claim.source);
             trace->publication_mode = static_cast<uint64_t>(ready_claim.publication_mode);
-            if (ready_claim.source == SchedulerReadySource::DIRECT_RESOLVE) {
+            if (ready_claim.source == SchedulerReadySource::DIRECT_RESOLVE ||
+                ready_claim.source == SchedulerReadySource::COOPERATIVE) {
                 trace->state_probe_scheduler_worker_id = UINT64_MAX;
                 trace->state_probe_start_cycles = 0;
                 trace->state_probe_end_cycles = 0;
@@ -1645,13 +1674,15 @@ inline __aicore__ bool scheduler_resolve_completion(
                         scheduler_state_base, context->profiling->trace_cells_offset
                     );
                     const uint64_t transition_cycles = scheduler_cycles();
-                    for (uint8_t subtask = 0; subtask < 3; ++subtask) {
-                        if ((metadata->active_mask & (1U << subtask)) == 0) continue;
-                        auto &trace = cells[scheduler_task_trace_index(
-                            metadata->trace_index_base, metadata->active_mask, subtask
-                        )];
-                        trace.ready_transition_cycles = transition_cycles;
-                        scheduler_writeback_cache_line(&trace.ready_transition_cycles);
+                    for (uint32_t block = 0; block < metadata->logical_block_num; ++block) {
+                        for (uint8_t subtask = 0; subtask < 3; ++subtask) {
+                            if ((metadata->active_mask & (1U << subtask)) == 0) continue;
+                            auto &trace = cells[scheduler_task_trace_index(
+                                metadata->trace_index_base, metadata->active_mask, subtask, block
+                            )];
+                            trace.ready_transition_cycles = transition_cycles;
+                            scheduler_writeback_cache_line(&trace.ready_transition_cycles);
+                        }
                     }
                 }
             } else if (!scheduler_ready_batch_append(

@@ -1,13 +1,19 @@
 # A5 HBG SPMD 测试入口和验收状态
 
 对应 [编码契约](implementation-contract.md) 与 [C01–C56 边界矩阵](corner-cases-and-validation.md)。
-以下原始验收基线为 `f5cc679bbf3d`，记录日期 2026-10-23。
-2026-10-25 起的生产编码结果在 [实现过程](implementation-progress.md) 持续记录；
-其中 payload 前置修复已使六种 mask 的 N=1 仿真各三轮通过，不覆盖本页历史失败证据。
+初始验收基线为 `f5cc679bbf3d`，记录日期 2026-10-23；第四节保留该时点的失败证据。
+2026-10-25 起的生产编码和逐轮结果集中在 [实现过程](implementation-progress.md)，
+本页维护测试入口与覆盖边界，不以历史红灯描述当前已修复路径。
 **模型通过不等于生产 SPMD 已实现；原生验收中的红灯必须保留，不能用回退或 skip 消掉。**
 
 真实 HBG CSA 另有 [业务 TDD 入口](../csa/test_csa_business.py)，保留 54 个原 kernel 与七项 golden。
 覆盖范围、A5 实跑记录和独立 resident 红灯见 [CSA 中文说明](../../../../examples/a5/host_build_graph/deepseek_v4_pro_csa/README.zh-CN.md)。
+
+当前纯 C/V 普通多 block 已接线：原生纯任务矩阵在仿真和 A5 各 90 次通过；
+新增 32 场景在最终纯 C/V 接线版本的 A5 完成 120 次，仿真在 TLS 生命周期修复后同样完成 120 次。
+每次都要求本轮 resident 来源和完整输出，不接受 legacy 正确输出。
+纯多 block 与任意 Mix 同图、GM Mix、sync_start、完整协议 trace 和原样 CSA resident
+仍未完成；L1/L4 与延迟发布 phase 修复的复验证据见实现过程。
 
 ## 一、四层检查分别证明什么
 
@@ -15,8 +21,8 @@
 | ---- | ---- | -------------- |
 | CPU 合同模型 | [model.py](../../../ut/py/hbg_spmd_contracts/model.py)、[types.py](../../../ut/py/hbg_spmd_contracts/types.py) | 身份、成员、动态领取、局部顺序、完成与代次；不是运行时实现 |
 | 交错与独立审计 | [explorer.py](../../../ut/py/hbg_spmd_contracts/explorer.py)、[trace_audit.py](../../../ut/py/hbg_spmd_contracts/trace_audit.py) | 穷举小状态空间、保留错误反例；独立检查事件，不调用模型状态转换来判对错 |
-| 现有 C++ 原语 | [test_hbg_spmd_primitives.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_spmd_primitives.cpp) | 真正调用仓库 ready-pop／generation helper，固定其当前语义；不是新调度器 |
-| 原生 HBG 入口 | [test_spmd_contract.py](test_spmd_contract.py)、[kernels](kernels) | 编译 Host 编排和 AIC/AIV kernel，执行实际 runtime，检查本轮 resident 来源、每个身份、原 N、依赖结果 |
+| C++ 生产 helper | 原语、准入及 [有序执行测试](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_ordered_execution.cpp) | 真实 ready/dispatch/completion/helper；可控槽状态和重复完成，不证明设备 cache 或实际 kernel |
+| 原生 HBG 入口 | [test_spmd_contract.py](test_spmd_contract.py)、[test_ordered_execution.py](test_ordered_execution.py)、[kernels](kernels) | 实际 Host 编排、runtime、AIC/AIV kernel；本轮来源、完整身份、原 N、依赖及独立任务重叠 |
 
 CPU 包中另外有 [test_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_native_fixture.py)，
 检查原生用例的 golden、来源门禁、保护区和错误检测器本身；不能把它计作设备执行。
@@ -45,7 +51,15 @@ CPU 包中另外有 [test_native_fixture.py](../../../ut/py/hbg_spmd_contracts/t
 直接调用生产准入 helper：真实 ready pop 后唯一 claim、锁外准备、短锁连续提交、
 成员前沿及普通入口许可。覆盖 B 先于未 ready A、冻结位图、epoch、容量和身份拒绝，
 并以发布者和非成员读者并发检查日志前缀。它不调用模型来证明生产 helper，
-也不以 CPU 原子结果代替 A5 cache 可见性或尚未接线的 block 执行验收。
+也不以 CPU 原子结果代替 A5 cache 可见性或原生 block 执行验收。
+
+[test_hbg_ordered_execution.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_ordered_execution.cpp)
+共 42 项，直接驱动生产有序填槽、entry gate 和完成路径：24 项 C/V 容量形状，
+8 项完成／LocalDone／候选所有权／predicate 停放行为，2 项无 SSBUF 的 N=3→N=1 依赖链，
+4 项普通队列探测时间和 2 项 COOPERATIVE 不伪造探测时间，另有 2 项真实 direct 后继
+延迟发布必须标记 DISPATCH、不能被误当作 inline refill 的检查。计时检查使用真实 CPU_SIM 时钟。
+[test_ordered_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_ordered_native_fixture.py)
+共 96 项，检查 32 场景夹具、坏记录、真假依赖、反向准入及每轮复用来源；这些仍是 CPU 检查。
 
 ## 二、已经造好的边界与尚欠设备证明的部分
 
@@ -53,15 +67,15 @@ CPU 包中另外有 [test_native_fixture.py](../../../ut/py/hbg_spmd_contracts/t
 | ------ | -------------- | ------------------ |
 | C01–C11：N、mask、容量、身份、稀疏核 | test_shapes：合法／非法 N、32767 乘积边界、mask 4 规范化、sync 容量、拓扑重复／缺失、trace 索引 | Host 实际拒绝路径；discovery 与 placement 一致性；native 全矩阵 |
 | C12：view 和原 ABI | 原生不同 task 使用不相交 view，消费者读取完整 view | 原样 CSA workspace／reduction／TPipe |
-| C13–C16、C39、C42–C43 | test_order_and_completion、test_interleavings：快核进入 B、真依赖禁止、B 先于未 ready A、非成员前进、交叠成员 | 对真实 kernel 起止记录证明重叠与顺序 |
+| C13–C16、C39、C42–C43 | 模型／交错检查；ordered 原生以实际入口／返回序号验证纯 C/V 独立任务重叠和真实依赖不早放行 | 带 order/成员的完整原生审计；GM Mix 与 sync_start 的对应检查 |
 | C17–C18、C22 | test_graphs：宽度 2/7/32/65/128 的 fanout/fanin、20 个固定 seed DAG；无 kernel 服务和空图 | 生产 wake-list 原子竞态与公平性；Host inline 不重复计数 |
 | C19–C20、C25–C28、C47–C49、C56 | model：一组一个身份、全部局部资源到达、mask 6 协调者、未发布最后组、cluster 独立关闭 | GM mailbox 逐步暂停、真实通信收尾、seal 与 mailbox 复用、inactive lane 释放 |
 | C23–C24、C55 | sync_once、容量、早到／晚到、过载和 A/B 反序死锁反例 | 有界 barrier kernel、不同物理位置和真正的满核任务；当前原生矩阵未包含 sync_start |
-| C29–C33、C35–C38 | stale lease、generation／epoch 上限、重复完成、输出可见性、错误不放行、重跑换 shape | A5 cache 发布、硬件错误静止与清理；真实重新绑定的所有槽初始化 |
+| C29–C33、C35–C38 | 模型边界；生产 C++ 重复完成；原生 retained 运行同 Worker/callable 切换 512→1→65→1→512 | GM Mix 代次／重绑、A5 故障静止与清理；不可用纯任务复用替代 |
 | C40–C41、C46、C50 | 准入去重、记录容量、准备不占可见洞、冻结成员、暂空非 EOF | 短锁和普通 entry permit 的线性化竞态、发布者失败 |
-| C44–C45、C54 | 三种 source 的模型门禁、双通道循环等待反例、两个 pending 槽不是两个位置 | 实际 own/Mix/direct refill 统一 gate、让出预填 payload、控制服务饥饿 |
+| C44–C45、C54 | 模型反例；生产 own/direct gate、两普通候选停放且 predicate 不重算、不可撤销 block 领取 | GM Mix 统一 gate、三通道控制推进及公平性；两个普通 direct 链占满候选池仍可推迟发现协同任务 |
 | C51 | 新旧 publish_count、mode 0/3/4/非法值拒绝；原生每次比较同时验来源 | 接完整 trace 的实际 producer，不只依赖 hook |
-| C21、C34、C52–C53 | 保留现有能力边界；本次不假装实现 Graph/predicate/async/无 SSBUF | 对应生产 gate 的正反用例、GM 路径去除 SSBUF 初始化依赖 |
+| C21、C34、C52–C53 | 纯 C/V 已去除 SSBUF 依赖；形状用例区分普通 N=2 resident 与 sync N=2 legacy | GM Mix 去除 SSBUF；Graph、多 block predicate、async 继续保留能力边界 |
 
 test_trace_audit 对缺事件、重复事件、错 task/block/slot/N/order/generation/worker、
 跨 cluster 配对、提前 TaskDone、遗漏 LocalDone、旧 epoch、错误来源、截断、
@@ -140,6 +154,16 @@ kernel 读取 block/N 使用现有 get_block_idx(args)/get_block_num(args)。
 仅在调用前检查 ABI 后缀指针是否为空，避免当前实现缺 context 时把合同失败变成设备异常；
 不补造 context，不改为相信输入 scalar 的 N，也不篡改原 block 数。
 
+### 纯 C/V 有序执行的 32 个场景
+
+[test_ordered_execution.py](test_ordered_execution.py)复用 CLA 编排和 32 列 plan ABI：
+14 个容量形状、2 个 N=1/SPMD 交替依赖链、6 个头／中／尾慢 block 汇合、
+4 个独立任务重叠、4 个真实 A→B 依赖，以及 2 个保留 Worker/callable 的大小交替复用场景。
+后两场景各执行五次 shape，所以 `--rounds 3` 是 120 次 invocation，不是 96 次。
+入口／返回以诊断原子序号记录，依赖消费者同时检查全部前驱输出；允许独立 B 先获准执行。
+必须完整比对 inactive 槽、padding、保护区及原 N，不以最终计数代替中途依赖检查。
+这些原子序号不含 order_key、物理核身份或 LocalDone，不能替代严格协议 trace，亦不是性能基准。
+
 ### CLA 的七个 TDD 场景
 
 [test_cla_hbg.py](test_cla_hbg.py)复用现有 128B 记录、设备原子包装和 SceneTestCase。
@@ -176,37 +200,33 @@ source .venv/bin/activate
 # CPU 合同、交错、审计器及用例自身检查。
 python -m pytest tests/ut/py/hbg_spmd_contracts -q
 
-# C++ 实际原语 + 既有 ready/dispatch/contracts/bootstrap 回归。
+# C++ 实际原语、准入、有序执行及既有路径回归。
 cmake -B tests/ut/cpp/build -S tests/ut/cpp
 cmake --build tests/ut/cpp/build -j 8 --target \
   test_a5_hbg_spmd_primitives test_a5_hbg_scheduler_ready \
   test_a5_hbg_scheduler_dispatch test_a5_hbg_scheduler_contracts \
-  test_a5_hbg_scheduler_bootstrap
+  test_a5_hbg_scheduler_bootstrap test_a5_hbg_admission test_a5_hbg_ordered_execution
 ctest --test-dir tests/ut/cpp/build --output-on-failure \
-  -R '^(test_a5_hbg_spmd_primitives|test_a5_hbg_scheduler_(ready|dispatch|contracts|bootstrap))$'
+  -R '^(test_a5_hbg_(spmd_primitives|admission|ordered_execution)|test_a5_hbg_scheduler_(ready|dispatch|contracts|bootstrap))$'
 
-# 当前纯 C/V 的单 block 绿色基线。
+# 纯 C/V 的 N=1/N=2 当前均要求 resident 通过。
 python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
-  --platform a5sim --case mask1_n1 --case mask2_n1 --pto-session-timeout 600 -q
+  --platform a5sim --case mask1_n1 --case mask2_n1 \
+  --case mask1_n2 --case mask2_n2 --pto-session-timeout 600 -q
 
-# 目前应失败：不能接受 N=2 回退到 legacy。
+# 仍须保留红灯：多 block Mix 尚未接线，不能接受 legacy 回退。
 python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
-  --platform a5sim --case mask1_n2 --pto-session-timeout 600 -q
+  --platform a5sim --case mask3_n2 --pto-session-timeout 600 -q
 
-# 初始基线暴露单 block Mix context 问题；修复后应通过，不是多 block 门禁。
-python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
-  --platform a5sim --case mask3_n1 --pto-session-timeout 600 -q
+# 32 场景的每次运行都校验来源；含 retained 复用，共 120 次 invocation。
+python tests/fdwic/pa_hbg/spmd/test_ordered_execution.py -p a5sim --rounds 3
 
-# A5 真机，同一套入口；可用 --rounds 3 检查本轮来源及重复绑定。
-python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
-  --platform a5 --device 0 --case mask1_n1 --case mask2_n1 --pto-session-timeout 600 -q
+# 已确认本机为 A5 后执行；无 task-submit 时按环境约定直接使用设备。
+python tests/fdwic/pa_hbg/spmd/test_ordered_execution.py -p a5 -d 0 --rounds 3
 
 # 生产实现完成后的全矩阵；当前运行不应全绿。
 python -m pytest tests/fdwic/pa_hbg/spmd/test_spmd_contract.py \
-  --platform a5 --device 0 --pto-session-timeout 600 -q
-
-# standalone 走相同来源／golden 门禁。
-python tests/fdwic/pa_hbg/spmd/test_spmd_contract.py -p a5sim --case mask1_n1
+  --platform a5 --device 0 --pto-session-timeout 1200 -q
 
 # AIV 完成到 Mix 后继的交接；可换成 -p a5 -d 0 在真机执行。
 python tests/fdwic/pa_hbg/spmd/test_aiv_mix_handoff.py -p a5sim --rounds 3
@@ -227,7 +247,10 @@ python -m pytest tests/fdwic/pa_hbg/spmd/test_cla_hbg.py \
 tests/fdwic 不自动继承 tests/st 下的 scheduler_mode fixture，
 因此在类的公共运行／比较 hook 内检查，pytest 和 standalone 都生效。
 
-## 四、本次验证记录及发现
+## 四、2026-10-23 初始验证记录及发现
+
+本节保留初始失败时点，不代表当前分支仍有相同故障；payload、bootstrap、
+纯 C/V 多 block 的后续修复及红绿对应关系见实现过程，不覆盖或重写下面的历史证据。
 
 - 已按当前源码重建本地扩展，消除 `85dafc4 → f5cc679` 的二进制／源码不匹配。
 - 基础 CPU 包原为 423 项；CLA 增量后，加上原图来源门禁共 501 项通过，新增 78 项。
@@ -245,7 +268,7 @@ tests/fdwic 不自动继承 tests/st 下的 scheduler_mode fixture，
   纯 C/V 的 mask1_n1、mask2_n1 曾在 resident 来源及完整输出检查下通过。
   mask1_n2 在同一设备被 mode=4 门禁拒绝，未被算成 resident 成功。
   最终版本追加 --rounds 3 复跑时，mask1_n1 在首轮也触发相同超时，后续轮次和 mask2 未执行；
-  因此当前真机基线是**未稳定验收**，不能把先前一次通过当作最终全绿。
+  因此该时点真机基线是**未稳定验收**，不能把先前一次通过当作最终全绿。
 - 单 block Mix 的 mask3_n1 在 a5sim 暴露缺失 context；
   GDB 在 get_block_idx 的解引用处确认 LocalContext 后缀为零。
   加入保护后稳定以明确断言失败，不能将此红灯改成接受缺少上下文。
@@ -272,7 +295,7 @@ sub_block_id，却没有补齐这两个后缀；materialize 只写实际 tensor/
 编码顺序增加一个前置门槛：**own 和 Mix 两类 payload 的完整初始化及第二次绑定验证**。
 修复后 mask3_n1 以及其他 mask 的 N=1 应转绿，然后再验多 block。
 最初 TDD 提交未修改 runtime。此缺口现已由统一初始化修复，
-C++ 重绑定和原生 N=1 仿真证据见实现过程；真机 bootstrap 问题仍单独追踪。
+C++ 重绑定和 N=1 仿真／真机、bootstrap 修复证据均见实现过程。
 
 ## 五、把测试接到后续生产实现
 
@@ -285,6 +308,8 @@ retire、block_done、task_done、cluster_close、local_done。
 start 必须给 task/block/slot/worker/N/order/generation/source，完整性检查不能猜缺失字段。
 
 当前样例 producer 明确是 reference；审计器默认要求 aicore，因此不能直接拿模型数据冒充设备结果。
+生产泳道的逐 block 索引和 reg_task_id 连接键已接入，但尚不输出完整的 order、LocalDone、
+GM 组生命周期事件；L1/L4 的转换与逐 block 检查也不能单独证明这一完整合同。
 tick 是适配格式内的因果事件序号，不是已经验证过的跨核统一 cycle。
 接 native 时必须从实际采集到的发布／执行身份构造可验证因果序，
 缺少事件或无法确定次序时失败，不能为了通过校验事后编造事件。

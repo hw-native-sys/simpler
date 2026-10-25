@@ -56,8 +56,25 @@ enum class SchedulerGraphResult : uint64_t {
 };
 
 inline constexpr bool
-scheduler_resident_v0_task_shape_supported(uint32_t active_subtasks, uint32_t logical_block_num, bool sync_start) {
-    return active_subtasks >= 1 && active_subtasks <= 3 && logical_block_num == 1 && !sync_start;
+scheduler_resident_task_shape_supported(uint32_t active_subtasks, uint32_t logical_block_num, bool sync_start) {
+    return active_subtasks >= 1 && active_subtasks <= 3 && logical_block_num >= 1 && logical_block_num <= INT16_MAX &&
+           (active_subtasks == 1 || logical_block_num == 1) && !sync_start;
+}
+
+inline constexpr bool scheduler_resident_graph_shape_supported(bool has_multiblock, bool has_mix) {
+    // SSBUF Mix dispatch does not participate in the multi-block admission order.
+    return !has_multiblock || !has_mix;
+}
+
+struct SchedulerMinimumWorkerDemand {
+    uint32_t aic;
+    uint32_t aiv;
+};
+
+inline constexpr SchedulerMinimumWorkerDemand scheduler_minimum_worker_demand(uint8_t active_mask) {
+    const uint32_t vectors = ((active_mask & 2U) != 0 ? 1U : 0U) + ((active_mask & 4U) != 0 ? 1U : 0U);
+    // Ordinary blocks can execute in waves. A dual-AIV Mix still needs an AIC coordinator.
+    return {((active_mask & 1U) != 0 || vectors > 1) ? 1U : 0U, vectors};
 }
 
 struct SchedulerGraphView {

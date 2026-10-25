@@ -23,11 +23,11 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 | 顺序 | 交付 | 出口证据 | 当前状态 |
 | ---- | ---- | -------- | -------- |
 | 前置 | ordinary／Mix payload context 初始化与重绑定 | 原生 N=1 红灯转绿；真实初始化函数的 C++ 测试 | 已通过 C++、仿真与 A5 六种 mask 各十轮 |
-| 1 | 有界存储、准入记录、block 控制、GM 组状态 | POD／布局／溢出／重跑初始化测试 | 已落地并通过布局与 N=1 回归；尚未运行协议 |
-| 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | 基础 helper 已实现；三入口及持久候选尚未接线 |
-| 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | 未实现 |
+| 1 | 有界存储、准入记录、block 控制、GM 组状态 | POD／布局／溢出／重跑初始化测试 | 已落地；纯 C/V 已使用，GM 组协议待接线 |
+| 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | own/direct 与持久候选已接线；GM Mix 入口尚未实现 |
+| 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | A5／仿真功能和 L1/L4 逐 block 检查通过 |
 | 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | 未实现 |
-| 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | 未实现 |
+| 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | 逐 block 索引与连接键已接入；全协议事件和 CSA 未完成 |
 | 6 | sync_start 不同位置领取和局部跨任务推进 | 两独立满核任务、部分交叠、超容量、早返回不重领 | 未实现 |
 | 7 | 性能对比 | 同 kernel／输入／拓扑，无完整插桩运行；诊断运行分开 | 未测量 |
 
@@ -435,3 +435,120 @@ A5 构建及旧用例回归只验证新头的设备编译和已有行为；
 也未修改有效 runtime 的编译选项来回避检查。
 使用当前 HBG/TMR 数据库的全部适用钩子通过，
 日志 `outputs/spmd-tls-precommit-r2-20261025.log`。
+
+TLS 修复独立提交为 `030297fc7`，未 push；下面的调度接线不包含在该提交中。
+
+## 2026-10-25：纯 C/V 有序分波、局部关闭与完成聚合
+
+### 实际接线和能力边界
+
+- 在无 Mix 的图中初始化本核准入状态，存在协同任务时才启用有序执行路径。
+  纯 C/V 普通 N>1 开放；“纯多 block + 任意 Mix”暂时整图回退，
+  不让已接线的 own/direct 与旧 SSBUF Mix 绕过共同顺序。
+  全 N=1 Mix 原路径保留，GM Mix／sync_start 仍未实现。
+- 两个候选额度独立于两个 payload 槽。ordinary 取得实际 entry permit 后才释放候选额度；
+  早序义务出现时停放尚未进入 kernel 的普通 READY 槽，保存已求值 predicate，
+  释放可重建 payload，不重复入队、不重复求值，也不伪造完成。
+- pure block 以最多八次 CAS 尝试不可撤销领取，cursor 达 N 时用关键原子读确认，
+  不继续累加溢出。领取成功立即绑定 task/block/本核 slot；每次 prepare 都填原 N 和实际 block。
+- 每个 block 返回后经既有 slot generation 防重复消费，再递交 completed_blocks。
+  只有旧值为 N−1 的完成者写逻辑 DONE、推进 wake-list、增加逻辑完成数。
+  LocalDone 只要求 cursor=N 且本核的该 task 槽全部退役，不等待远端 TaskDone。
+- Host demand 按相应类型的最少执行位置计，不要求原 N 同时驻留；
+  mask 6 的 AIC 协调职责不因没有 AIC kernel 而丢失。
+  普通 N=2 和 sync N=2 在同一既有数值用例中分别断言 resident 与 legacy 来源。
+- 无 Mix 的调度不查找、不初始化、不等待 SSBUF；prepare/completion/bootstrap 接受空 SSBUF。
+  本地 slot 为 24B、SchedulerLocalState 为 504B、准入状态含两个 48B 候选共 184B，
+  没有增加每核全图表或运行期 heap 分配。
+- trace 地址包含 block 索引，Host 的 reg_task_id 使用唯一 trace_index，
+  converter 的执行连接键增加 reg_task_id，避免同 task 同核的不同 block 共用事件锚点。
+  这还不是含 order／LocalDone／GM 组身份的完整协议 adapter。
+
+两个普通 direct 链可持续占满候选池，导致协同候选直到某条有限链结束才被发现。
+合法有限 DAG 的推进不等于固定轮数的发现公平性；本实现没有后者的保证。
+当前 probe 有额外原子事件记录，所有时间仅用于诊断，不能据此报告调度性能收益。
+
+### TDD 与功能验收
+
+- 实际 ordered helper 的 C++ 40 项覆盖 24 项容量形状、8 项领取／完成／LocalDone／
+  predicate 停放行为，以及 8 项无 SSBUF 和 probe 时间边界。
+  最后 8 项初次运行时，2 项无 SSBUF 直接暴露真实空指针门禁问题；
+  其中计时断言还遇到通用 CPP fixture 的 scheduler_cycles 恒零，不能把它算成生产计时红灯。
+  target 改用既有 CPU_SIM 后，暂撤生产计时修复，得到 36 通过／4 个 ordinary probe 失败
+  （`outputs/spmd-ordered-clock-red-20261025.log`）；恢复实际 claim 前后计时后 40 项全绿
+  （`outputs/spmd-ordered-no-ssbuf-green-20261025.log`）。cooperative 不伪造队列 probe。
+- converter 新增 15 项先得到 13 失败／2 通过，再修正完整执行连接键后全部通过。
+  新原生夹具 96 项覆盖坏记录、反向独立准入、真实依赖及每一轮来源门禁。
+- 13 个 C++ target 共 443 项通过，其中 HBG 397、TLS 46；
+  日志 `outputs/spmd-ordered-cpp-final-20261025.log`。
+- Python 当前相关回归 884 项全部通过，无失败／跳过：SPMD 合同 649、
+  converter/归属/捕获/时钟/开销 223、四种 exporter 身份 12。
+  exporter 首轮因缺少测试二进制跳过 8 项，补编四个既有 collector targets 后 12 项全部运行；
+  日志 `outputs/spmd-python-regression-counts-final-20261025.log`。
+- 原纯任务矩阵 A5／仿真各 90 次通过；新增 ordered 32 场景每轮 golden 与来源门禁均启用。
+  30 个普通场景各三轮，加两个 512→1→65→1→512 retained 序列各三轮，
+  A5 和修复后仿真分别完成 120 次；包含慢块位于头／中／尾、真实跨类型后继、
+  无依赖的 C→C／V→V／C→V／V→C 实际重叠。
+  日志 `outputs/spmd-ordered-native-20261025/contracts-r2.log` 与
+  `outputs/spmd-ordered-contract-sim-r2-20261025.log`。
+- 默认 A5 HBG 回归 60 passed、4 skipped、356 deselected，耗时 198 秒，
+  日志 `outputs/spmd-ordered-native-20261025/hbg.log`。
+  沿用已记录的单卡排除项：被宽目录 runtime 过滤误收的 TMR 双卡 RDMA 目录；
+  本机无 task-submit，运行没有队列锁隔离。仿真最宽范围 107 项结果见 TLS 一节。
+
+### L1/L4 实际产物检查暴露的记录缺口
+
+在 A5 对 pure_c_n65、pure_v_n65、alternate_n1_spmd_mask1 各采集 L1/L4，
+每场景一轮，保留 golden 和新鲜来源检查；六次调用全部成功。
+相应执行条数为 130、130、583，raw 的唯一连接键、规范化结果及两个视图的执行数量均核对。
+不用 retained 五轮场景做多轮泳道证明：它目前复用同一 output_prefix，固定文件仅保留最后一轮。
+
+L4 交替图虽有完整 583 条 kernel／完成记录，却只导出 580 条发布 phase：
+三个普通 direct 后继先进入持久候选池，再由 ordered fill 发布，仍携带旧 REFILL 标记；
+旧 exporter 认为这类发布应由前驱完成路径的 refill phase 表达，因此抑制自身 dispatch。
+新路径没有在 completion 内填槽，不能保留这一标记。
+新增 C/V 两项测试真实完成 N=2 的生产任务并取得 N=1 direct 后继，
+确认 completion 未填槽、候选未丢失，再调用 ordered fill；两项仅在 publication_mode
+实际 REFILL、预期 DISPATCH 处失败，其余身份、计时、依赖和完成断言通过。
+日志 `outputs/spmd-ordered-deferred-publication-red-20261025.log`。
+实际修复只在 ordered 普通候选填槽处使用既有 DISPATCH 标记，保留 DIRECT_RESOLVE 来源，
+不修改旧 inactive 路径。修复后 42 项全部通过，
+日志 `outputs/spmd-ordered-deferred-publication-green-20261025.log`。
+
+最终 editable 重建 `outputs/spmd-ordered-build-r4-20261025.log` 成功；
+13 个 C++ target 重新构建运行，共 445 项（HBG 399、TLS 46）通过，
+日志 `outputs/spmd-ordered-cpp-final-r2-20261025.log`。
+所有适用 pre-commit 钩子通过，日志 `outputs/spmd-ordered-precommit-final-20261025.log`；
+先前一次只由 clang-format 自动修整已有 AICPU 文件和测试格式，未跳过检查，随后重建复验。
+
+A5 同样六个 L1/L4 场景复采成功；逐项审计结果为：
+
+- 每份 raw、规范化行、Worker bars 均为 130／130／583；L4 Scheduler timing 和 bars 一一匹配。
+  每 task 的 reg_task_id 完整覆盖各自 trace 前缀，没有重复键，且实际覆盖同核执行多个 block。
+- L4 的每 task 发布 phase 数与执行数相等。交替图 dispatch 582 + worksteal 1 = 583；
+  task 2／4／6 各恢复一条 dispatch，不再缺失。
+- 交替图仅 task 0 有一次真正队列 state_probe，1577 个 cycle；两个纯 N65 图无伪造 probe。
+  这只是诊断事实，不将其外推为性能基准。
+- 每份 L4 的 96 个 scheduler streams 均为 aicore，dropped=0、truncated=0；
+  complete 按 block、resolve 按逻辑 task 的条数也匹配。
+- 审计前后 raw/merged 的 SHA-256 不变。日志
+  `outputs/spmd-ordered-trace-artifact-audit-final-20261025.log` 记录六个准确产物目录。
+
+JSON 尚未导出 ready_source 数值、显式 block/N/order/generation 全套字段，
+没有准入／可见性／LocalDone／GM 组的完整因果事件链。
+逐 block 泳道通过不能代替第五项的完整协议审计；这部分继续保持未完成。
+
+最终版本 ordered 场景在 A5／仿真再次各 120 次通过，
+日志 `outputs/spmd-ordered-native-20261025/contracts-final.log` 与
+`outputs/spmd-ordered-contract-sim-final-20261025.log`。
+原有三级 `TestSchedulerPhases::resolve_dummy` 也通过；
+日志 `outputs/spmd-ordered-native-20261025/dfx3-final.log`。
+最终 HBG 默认仿真 42 passed、379 deselected，耗时 58.61 秒，
+日志 `outputs/spmd-ordered-hbg-sim-final-20261025.log`。
+最终 A5 HBG 默认回归 60 passed、4 skipped、356 deselected，耗时 156.98 秒，
+日志 `outputs/spmd-ordered-native-20261025/hbg-final.log`；完整命令链退出状态为 0。
+
+同步设计总览、编码契约、测试入口和 CSA README 的实际门禁名称／能力说明。
+保留原有历史红灯与原 CSA kernel/数据；未将已开放纯 C/V 误写成 CSA resident 已可用。
+下一项仍是所有 resident Mix（含 N=1）共同准入、GM descriptor/ack/seal 和各 lane 自备参数，
+之后才有资格开放纯多 block 与 Mix 同图，并执行原样 CSA resident 的严格验收。

@@ -741,6 +741,7 @@ enum class SchedulerReadySource : uint8_t {
     LOCAL = 0,
     STOLEN = 1,
     DIRECT_RESOLVE = 2,
+    COOPERATIVE = 3,
 };
 
 enum class SchedulerPublicationMode : uint8_t {
@@ -827,8 +828,11 @@ inline __aicore__ bool scheduler_trace_count_checked(uint64_t prefix, uint64_t a
     return true;
 }
 
-inline __aicore__ uint32_t scheduler_task_trace_index(uint32_t trace_index_base, uint8_t active_mask, uint8_t subtask) {
-    return trace_index_base + static_cast<uint32_t>(__builtin_popcount(active_mask & ((1U << subtask) - 1)));
+inline __aicore__ uint32_t
+scheduler_task_trace_index(uint32_t trace_index_base, uint8_t active_mask, uint8_t subtask, uint32_t block_idx = 0) {
+    const uint64_t offset = static_cast<uint64_t>(block_idx) * __builtin_popcount(active_mask) +
+                            __builtin_popcount(active_mask & ((1U << subtask) - 1U));
+    return static_cast<uint32_t>(static_cast<uint64_t>(trace_index_base) + offset);
 }
 inline __aicore__ uint32_t scheduler_task_ready_queue(uint8_t flags, uint8_t active_mask) {
     return (flags & SCHEDULER_TASK_MIX) != 0 ? SCHEDULER_MIX_QUEUE : ((active_mask & 1U) != 0 ? 0U : 1U);
@@ -1045,6 +1049,9 @@ enum class SchedulerErrorSite : uint64_t {
     ADMISSION_LOG_CAPACITY = 114,
     ADMISSION_EPOCH_MISMATCH = 115,
     ADMISSION_INVALID_FRONTIER = 116,
+    BLOCK_CURSOR_INVALID = 117,
+    BLOCK_COMPLETION_INVALID = 118,
+    ORDERED_CANDIDATE_INVALID = 119,
 };
 
 struct alignas(128) SchedulerRunControl {

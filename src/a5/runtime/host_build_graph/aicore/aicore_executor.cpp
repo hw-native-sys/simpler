@@ -143,8 +143,8 @@ __aicore__ bool bootstrap_ready_graph(
     __gm__ SchedulerRunControl *run_control, uint64_t scheduler_count, SchedulerWorkerStats *stats,
     uint64_t profiling_level, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region
 ) {
-    if (scheduler_count == 0 || scheduler->config.scheduler_index >= scheduler_count || ssbuf_region == nullptr ||
-        scheduler == nullptr)
+    if (scheduler == nullptr || scheduler_count == 0 || scheduler->config.scheduler_index >= scheduler_count ||
+        (scheduler->has_mix && ssbuf_region == nullptr))
         return false;
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
     const uint64_t timeout_cycles = scheduler_gm_query(run_control->scheduler_timeout_cycles);
@@ -273,13 +273,14 @@ __aicore__ bool run_ready_dispatch_loop(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *context,
     __gm__ SchedulerRunControl *run_control, SchedulerWorkerStats *stats, uint64_t profiling_level
 ) {
-    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region = scheduler_ssbuf_region(platform_ssbuf_hardware_base_address());
+    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region =
+        context->has_mix ? scheduler_ssbuf_region(platform_ssbuf_hardware_base_address()) : nullptr;
     const uint32_t cluster_lane = context->config.self_lane;
     const bool task_timing_enabled = scheduler_task_timing_enabled(profiling_level);
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
     const uint64_t scheduler_count = context->config.scheduler_count;
     if (scheduler_count == 0) return false;
-    if (ssbuf_region == nullptr || cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM) return false;
+    if ((context->has_mix && ssbuf_region == nullptr) || cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM) return false;
     uint64_t ready_victim_cursors[SCHEDULER_READY_QUEUE_COUNT]{
         (context->config.scheduler_index + 1) % scheduler_count,
         (context->config.scheduler_index + 1) % scheduler_count,
@@ -376,6 +377,17 @@ __aicore__ bool run_ready_dispatch_loop(
                 }
                 ready_slot = static_cast<int32_t>(local_slot);
                 ready_generation = scheduler_dispatch_generation(local_generation);
+                if (context->admission != nullptr) {
+                    bool permit = false;
+                    if (!scheduler_ordered_can_enter_slot(
+                            graph, scheduler_state_base, context, run_control, local_slot, &permit
+                        ))
+                        return false;
+                    if (!permit) {
+                        scheduler_local_ready_publish(context, local_slot);
+                        ready_slot = -1;
+                    }
+                }
             }
         }
         if (ready_slot >= 0) {
@@ -444,7 +456,7 @@ __aicore__ bool run_ready_dispatch_loop(
         // Kept as its own block rather than folded into the path above, because
         // every one of those four endpoints differs and only the kernel call is
         // shared.
-        if (context->config.self_lane != 0) {
+        if (context->has_mix && context->config.self_lane != 0) {
             for (uint32_t mix_slot = 0; mix_slot < SCHEDULER_MIX_SLOT_COUNT; ++mix_slot) {
                 const SCHEDULER_SSBUF volatile SchedulerSsbufDispatchControl *mix_control =
                     &ssbuf_region->mix_dispatch[cluster_lane][mix_slot];
@@ -553,10 +565,15 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     SchedulerWorkerStats stats{};
     std::conditional_t<WithProfiling, SchedulerLocalProfilingState, SchedulerNoProfilingState> profile{};
     SchedulerLocalState scheduler_local_state{};
+    SchedulerAdmissionLocalState admission{};
     if constexpr (WithProfiling) scheduler_local_state.profiling = &profile;
-    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region = scheduler_ssbuf_region(platform_ssbuf_hardware_base_address());
-    const bool config_valid =
+    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region = nullptr;
+    bool config_valid =
         scheduler_initialize_local_config(scheduler_state_base, context, &graph, &scheduler_local_state);
+    if (config_valid && !scheduler_local_state.has_mix) {
+        config_valid = scheduler_initialize_admission(scheduler_state_base, &scheduler_local_state, &admission);
+        if (config_valid && admission.capacity != 0) scheduler_local_state.admission = &admission;
+    }
     if (!config_valid)
         scheduler_record_error(
             run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
@@ -567,7 +584,8 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     if (config_valid) {
         scheduler_observe_data_cache(reinterpret_cast<__gm__ void *>(graph.storage_address));
         descriptor_cache_observed_cycles = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
-        if (context->is_scheduler != 0) {
+        if (scheduler_local_state.has_mix) {
+            ssbuf_region = scheduler_ssbuf_region(platform_ssbuf_hardware_base_address());
             scheduler_ssbuf_initialize(ssbuf_region);
         }
         if (context->is_scheduler != 0 &&
@@ -612,7 +630,8 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
         }
         write_reg(RegId::COND, AICORE_IDLE_VALUE);
         if (config_valid) {
-            if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM || !scheduler_ssbuf_is_initialized(ssbuf_region)) {
+            if (cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
+                (scheduler_local_state.has_mix && !scheduler_ssbuf_is_initialized(ssbuf_region))) {
                 scheduler_record_error(
                     run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
                     SchedulerErrorSite::EXECUTOR_INVALID_DISPATCH_SLOT

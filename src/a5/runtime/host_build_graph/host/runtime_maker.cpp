@@ -550,7 +550,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 trace.kernel_start_cycles - trace.ready_observe_cycles :
                 0;
         if (!first_task) tasks_json << ",";
-        tasks_json << "\n    [" << trace.worker_id << ", " << task_ref << ", " << task_ref << ", "
+        tasks_json << "\n    [" << trace.worker_id << ", " << task_ref << ", " << trace_index << ", "
                    << trace.kernel_start_cycles << ", " << trace.kernel_end_cycles << ", " << receive_to_start << ", "
                    << swimlane_run_epoch << "]";
         first_task = false;
@@ -571,9 +571,8 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         bool first_scheduler_task = true;
         for (uint64_t trace_index : emitted_traces) {
             const SchedulerTaskTrace &trace = traces[trace_index];
-            const uint64_t task_ref = trace.task_ref;
             if (!first_scheduler_task) scheduler_tasks_json << ",";
-            scheduler_tasks_json << "\n      [" << trace.worker_id << ", " << task_ref << ", "
+            scheduler_tasks_json << "\n      [" << trace.worker_id << ", " << trace_index << ", "
                                  << trace.dispatch_end_cycles << ", " << trace.complete_start_cycles << ", "
                                  << swimlane_run_epoch << "]";
             first_scheduler_task = false;
@@ -1128,6 +1127,7 @@ bool create_scheduler_state(
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
     int64_t legacy_shape_task_ref = -1;
+    int64_t first_pure_multiblock_task_ref = -1;
     int64_t trace_overflow_task_ref = -1;
     // The progress byte is PENDING or COMPLETED throughout this walk, never
     // PUBLISHED: that value is stored only by the device dispatch path, which
@@ -1155,7 +1155,7 @@ bool create_scheduler_state(
                                    !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
             if (!inline_dispatch_task) {
                 LOG_ERROR(
-                    "A5 HBG AICore scheduler: invalid v0 task ref=%" PRId64 " status=%" PRIu64, task_ref,
+                    "A5 HBG AICore scheduler: invalid task ref=%" PRId64 " status=%" PRIu64, task_ref,
                     static_cast<uint64_t>(status)
                 );
                 return false;
@@ -1227,7 +1227,7 @@ bool create_scheduler_state(
             LOG_ERROR("A5 HBG AICore scheduler: sync-start task ref=%" PRId64 " must have block_num > 1", task_ref);
             return false;
         }
-        if (!scheduler_resident_v0_task_shape_supported(
+        if (!scheduler_resident_task_shape_supported(
                 active_subtasks, logical_block_num, slot.task_attrs.requires_sync_start()
             )) {
             if (legacy_shape_task_ref < 0) legacy_shape_task_ref = task_ref;
@@ -1259,15 +1259,18 @@ bool create_scheduler_state(
             (metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT);
         if ((active_mask & 1U) != 0) {
             ++aic_task_count;
-            aic_worker_demand = std::max<uint64_t>(aic_worker_demand, logical_block_num);
         }
         const uint32_t active_aiv_subtasks = active_subtasks - ((active_mask & 1U) != 0 ? 1U : 0U);
         if (active_aiv_subtasks != 0) {
             ++aiv_task_count;
-            aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, logical_block_num * active_aiv_subtasks);
         }
+        const auto demand = scheduler_minimum_worker_demand(active_mask);
+        aic_worker_demand = std::max<uint64_t>(aic_worker_demand, demand.aic);
+        aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, demand.aiv);
         if (!inline_dispatch_task) {
             if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
+            if (active_subtasks == 1 && logical_block_num > 1 && first_pure_multiblock_task_ref < 0)
+                first_pure_multiblock_task_ref = task_ref;
             if (logical_block_num > 1 || active_subtasks > 1 || slot.task_attrs.requires_sync_start())
                 ++cooperative_task_count;
         }
@@ -1279,10 +1282,14 @@ bool create_scheduler_state(
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
     }
+    if (legacy_shape_task_ref < 0 &&
+        !scheduler_resident_graph_shape_supported(first_pure_multiblock_task_ref >= 0, mix_task_count != 0))
+        legacy_shape_task_ref = first_pure_multiblock_task_ref;
     if (legacy_shape_task_ref >= 0) {
         select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
         LOG_INFO(
-            "A5 HBG: retaining AICPU scheduling for task ref=%" PRId64 " with SPMD or sync-start shape",
+            "A5 HBG: retaining AICPU scheduling for task ref=%" PRId64
+            " with unsupported shape or protocol combination",
             legacy_shape_task_ref
         );
         return true;

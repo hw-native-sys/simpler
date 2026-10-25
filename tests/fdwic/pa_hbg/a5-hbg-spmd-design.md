@@ -8,9 +8,10 @@
 可以先统一发布 B，再发布 A。发布之后，任何参与者都不能自行颠倒这两个任务。
 这里的“顺序门槛”不是全芯片执行锁，也不要求所有参与者同时开始。
 
-设计基线为 f5cc679bb，约定更新于 2026-10-23。新状态及伪代码描述目标协议，
-不表示当前 runtime 已实现同名接口。2026-10-25 起的实际编码、验证及剩余工作
-集中记录在 [实现过程](spmd/implementation-progress.md)。
+设计基线为 f5cc679bb，约定更新于 2026-10-23。纯 C/V 普通多 block 已接入生产执行路径；
+GM Mix、完整协议 trace、原样 CSA resident 和 sync_start 仍是待完成目标。
+下文区分当前能力与目标合同，2026-10-25 起的编码和实测证据集中记录在
+[实现过程](spmd/implementation-progress.md)，不以结构或接口存在代替执行验收。
 
 阅读顺序：[运行时有序准入](spmd/ordered-execution-protocol.md)说明依赖、共同顺序与参与集合；
 [block 与 Mix 执行](spmd/block-and-mix-execution.md)说明领取、局部结束和完成发布；
@@ -64,28 +65,34 @@ sync_start 在普通多 block／CSA 验收之后开放。Graph body、异步 ker
 
 f5cc679bb 已把 scheduler 数量改为实际 worker 数量，各核持有自己的普通 dispatch slots。
 完成路径关闭 wake-list、推进剩余依赖、按 AIC/AIV/Mix 类型发布 ready；
-同类型后继还可以直接填入本核空出的 slot，不必先回到队列。
+同类型后继还可以由完成路径直接接续，不必先回到队列。
+有序模式下先保存在本核候选池，仍须经过本核前沿和实际执行前的许可检查。
 
 ready 队列是按类型和 owner 分布的 CAS FIFO，支持分片内领取／偷取。
-它不是一个所有核共享的全局顺序源：不同队列、direct refill 和 Mix 通道之间
-没有 SPMD 所需的统一准入顺序。可复用这些工作发现机制，不能把 FIFO 当作顺序证明。
+它不是一个所有核共享的全局顺序源。纯 C/V 多 block 的共同准入层复用这些工作发现机制，
+用独立准入日志提供统一顺序；不能把各队列 FIFO 本身当作顺序证明。
 
-Mix 当前由 cluster 的 AIC 选择 placement、准备各 lane payload、聚合完成，
-AIV 通过 SSBUF 接收任务。目标保留 AIC 的组级协调，把远端参数准备交回各 lane，
-并将调度控制迁移到 GM。普通核的自调度能力不需要重新实现。
+既有 N=1 Mix 仍由 cluster 的 AIC 选择 placement、准备各 lane payload、聚合完成，
+AIV 通过 SSBUF 接收任务；它尚未接入共同准入。无 Mix 的纯 C/V 路径已不依赖 SSBUF
+初始化或访问。目标中的 GM Mix 保留 AIC 组级协调，把远端参数准备交回各 lane。
 
-### 不能只放开形状门禁
+### 当前已接线与剩余边界
 
-- scheduler_resident_v0_task_shape_supported 仍要求 N 等于 1 且没有 sync_start。
-- runtime_maker 以逻辑 block 数估计 worker demand，lifecycle 再与实际核数比较；
-  普通分波不能沿用“全部 block 都需同时占核”的需求检查。
-- 普通和独立 Mix payload 的 context 后缀现已统一按设备基址初始化，默认 block_idx 为 0、
-  block_num 为 1，并覆盖重绑定清零；多 block 路径仍须在领取后填写原 N 和实际 block。
-- Mix tracker、完成路径和 trace 索引仍不能直接表达一个 task 的多个 block。
-- 多 block 的最后一次完成才可发布 TaskDone 和推进 wake-list，不能每个 block 都释放后继。
-- 新增的 scheduler_runtime_mode 与 scheduler_mode_publish_count 可复用作回退门禁，
-  不必要求所有功能测试先打开完整泳道。
-- 旧 resident gang 脚手架及 scheduler_task_is_gang 已移除；不能把旧字段当作可接续实现。
+- `scheduler_resident_task_shape_supported` 已允许普通纯 C/V 的原 N；
+  `scheduler_resident_graph_shape_supported` 暂不允许纯多 block 与任意 Mix 同图。
+  即使 Mix 仅 N=1，这一组合也整图回退；sync_start、多 block Mix 仍未开放。
+- Host 以执行形状的最小可用位置计算 demand，而不是要求全部普通 block 同时占核。
+  纯 C/V 可跨多波执行；这不是 sync_start 的不同位置容量证明。
+- own/direct 路径通过同一有序 entry gate；每核最多两份不可撤销的 block 领取。
+  每次 payload 准备写入原 N 和实际 block，N=1 与多 block 反复复用也不保留旧 context。
+- 只有最后一个 block 完成才沿既有 wake-list 释放逻辑后继。
+  本核在 cursor=N 且已领取工作全部退役后关闭义务，不等待远端 TaskDone。
+- trace 存储、完成索引和导出连接键已区分 block；完整的 order、LocalDone、组发布／释放
+  事件及严格 native adapter 尚未实现，不能以普通泳道转换成功代替协议审计。
+- `scheduler_runtime_mode` 与 `scheduler_mode_publish_count` 逐轮验证 resident 来源，
+  不必要求所有功能测试先打开完整泳道。原有单 block predicate 继续保留。
+- 旧 resident gang 脚手架已移除；GM Mix 仍需实现 descriptor／ack／seal 及各 lane 自备参数，
+  不能借用旧 SSBUF 通道跳过共同顺序，也不能据此宣布原样 CSA 已完成。
 
 ## 目标合同和参考接线
 

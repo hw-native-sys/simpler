@@ -43,6 +43,11 @@ inline __aicore__ bool scheduler_fill_own_slots(
 ) {
     if (failed != nullptr) *failed = false;
     if (scheduler == nullptr) return false;
+    if (scheduler->admission != nullptr)
+        return scheduler_fill_ordered_slots(
+            graph, scheduler_state_base, scheduler, run_control, ready_victim_cursors, ready_stats, profiling_level,
+            failed, ssbuf_region
+        );
     const uint32_t core_type = scheduler->config.self_core_type;
     if (!scheduler_has_usable_slot(scheduler, core_type, skip_slot_mask)) return false;
     // A core polls its own inbox on every pass. The directory gates only the

@@ -2,10 +2,10 @@
 
 基线：`f5cc679bbf3d`，2026-10-23。[设计总览](../a5-hbg-spmd-design.md)
 定义已确认语义；本页把它收敛为可开始编码的正确性基线。
-共同准入基础 helper、POD 布局、Host 预分配与初始化已开始落地；
-执行入口、cursor、LocalDone 及 GM Mix 状态机仍是待接线的目标协议。
-已实现字段和实测范围以 [实现过程](implementation-progress.md) 为准，不以存在字段替代执行验收。
-本页保留目标编码契约；生产代码的逐步落地与实测证据见 [实现过程](implementation-progress.md)。
+共同准入、Host 预分配、纯 C/V 的 own/direct 入口、cursor 和 LocalDone 已接入生产路径。
+GM Mix、完整协议 trace、原样 CSA resident 和 sync_start 仍未完成。
+本页保留全部目标合同；已实现字段和实测范围以 [实现过程](implementation-progress.md) 为准，
+不以存在字段替代执行验收。
 初始 TDD 覆盖和历史红绿状态见 [测试入口和验收状态](test-plan-and-status.md)。
 
 ## 一、存储、身份与能力边界
@@ -42,6 +42,11 @@ GraphSummary 的现有 padding 承载协议 offset／容量／Host run_epoch，�
 AdmissionControl 的 lock/tail 各占 128B；GroupMailbox 为 descriptor 128B、
 published_seq 独占 128B、三个 lane ack 各 128B，共 640B。
 
+纯 C/V 执行接线后，`SchedulerAdmissionLocalState` 为 184B，含两个各 48B 的候选；
+`SchedulerLocalSlotState` 为 24B，含 block 身份和 predicate 缓存，
+`SchedulerLocalState` 为 504B。候选只保留 task 所有权与重建所需状态，
+不会增加物理并发容量，也不保存每核全图或全部 block 历史。
+
 AdmissionLog 只存引用，记录按 task_ref 定位；不按 block 数扩大日志。
 紧凑 log 单元和 close seal 都只能通过原子读写，不能普通写单元再 dcci 整行；
 短提交锁不会自动消除不同发布者缓存中的旧行副本。
@@ -70,6 +75,12 @@ Mix 按完整 cluster；两个 pending slots 不是两个执行位置。
 多 block predicate、Graph body、异步返回先保留现有拒绝／整图回退，不顺手删除形状门禁。
 普通单 block predicate 的现有语义必须保留。
 
+当前 `scheduler_resident_task_shape_supported` 允许普通纯 C/V 的 N≥1；
+`scheduler_resident_graph_shape_supported` 对“纯多 block + 任意 Mix”整图回退，
+避免已接线的 own/direct 协议与尚未接线的 SSBUF Mix 通道混跑。
+全 N=1 图中的既有 Mix 路径继续保留；无 Mix 的纯 C/V 调度不再要求 SSBUF。
+这只是分步开放边界，不是最终允许削减多 block Mix／原样 CSA 的范围。
+
 ## 二、完成驱动准入及普通旁路的线性化
 
 ### 准入函数与状态转换
@@ -80,7 +91,9 @@ Mix 按完整 cluster；两个 pending slots 不是两个执行位置。
 参数复用现有 graph/state/local context。调用方先唯一取得 ready 候选，
 仅成功 claim 才将其所有权转移给持久 pending；RETRY 不能让调用方丢弃候选。
 本地协议状态必须成功初始化；epoch 0 是合法身份，不能拿它兼作“未初始化”哨兵。
-这些 helper 尚未由 executor 的普通／Mix／direct refill 三入口调用，不代表 native 支持已经开放。
+纯 C/V 的 `scheduler_fill_ordered_slots` 发现／发布候选，executor 的
+`scheduler_ordered_can_enter_slot` 在实际执行前校验许可；完成路径的 direct 候选
+进入同一个持久候选池。GM Mix 入口尚未接入，不能声称三入口已经全部统一。
 
 | 转换 | 条件与唯一动作 | 暂时不能推进时 |
 | ---- | -------------- | -------------- |
@@ -116,8 +129,9 @@ worker 扫描已发布日志的本核投影，跳过非成员，停在最早未 
 
 ### 普通 slot 与 direct refill 不能有隐藏旁路
 
-普通、远端 Mix、direct refill 三条 kernel 入口统一调用拟新增的 `can_enter_kernel`。
-不能沿用“普通槽先执行、无普通槽才看 Mix”的固定优先级。
+目标要求普通、远端 Mix、direct refill 三条 kernel 入口服从同一前沿。
+启用共同准入的纯 C/V 图，其 own/direct 已统一调用 `scheduler_ordered_can_enter_slot`；
+GM Mix 接线时还须消除“普通槽先执行、无普通槽才看 Mix”的固定优先级。
 已经预填的后序候选不代表已经获得执行许可。
 
 普通单 block 的基线线性化点是**执行前对 commit_tail 的关键原子读**：
@@ -130,11 +144,19 @@ worker 扫描已发布日志的本核投影，跳过非成员，停在最早未 
 让最早义务使用执行资源。禁止重复入队、覆盖候选或用伪完成“腾槽”。
 短提交锁和尚未发布的组责任都不得跨入一个可能阻塞的后序 kernel。
 
+当前候选池与两个 payload 槽分开：普通候选实际进入 kernel 后才释放候选额度，
+较早协同义务到来时，只停放尚未进入 kernel 的 READY 普通槽，缓存已求值 predicate，
+释放 payload 后重建，不重复求值、不重复入队。direct 候选池满时沿既有队列首次入队。
+来源与发布方式分开：保留到候选池后再填槽的后继仍为 DIRECT_RESOLVE 来源，
+实际 publication_mode 为 DISPATCH；只有在 completion 内直接填槽才是 REFILL。
+两个普通 direct 链可能持续占满候选池，使队列中的协同任务推迟到某条有限链结束才被发现；
+有限合法 DAG 的推进不等于固定轮数的发现公平性，当前没有这样的公平上界保证。
+
 ## 三、block 领取、GM Mix 与局部关闭
 
 ### 纯 C/V 的不可撤销领取
 
-拟新增 `claim_next_block(task, worker)`：
+当前纯 C/V 使用 `scheduler_claim_ordered_block`：
 先确认本核最早义务、类型与候选容量，再用有界 CAS 将 next_block 从 b 改为 b+1。
 b 等于 N 返回 EXHAUSTED，不继续 fetch_add 造成无限越界；成功即绑定唯一 owner，
 不回滚 cursor、不偷取已领取工作。参数准备失败必须失败收敛，不能重新发出同一 block。
@@ -144,7 +166,7 @@ LocalContext 始终设置原 N 与本次 b；参数 view 不自动再加 block �
 进入下一任务的条件是 cursor 已封闭且本核已领取 work 全部发布、执行、完成。
 快核可以在远端最后一个 block 仍运行时满足该条件；零工作成员也可以合法关闭。
 
-sync_start 继续用动态领取，但本核对该 task 至多成功一次，**早返回也不能再领一次**。
+后续 sync_start 可复用动态领取，但本核对该 task 至多成功一次，**早返回也不能再领一次**。
 未领取成员只在 cursor 耗尽后关闭；已领取者完成自己义务后可关闭。
 N 不超过冻结成员容量，加上不可跳过前序义务、公平控制推进，保证剩余 block 最终有不同位置。
 不加全员 ARRIVED 屏障，也不等全部核空闲才让首个 block 开始。
@@ -196,7 +218,8 @@ cursor、组发布、组完成、cluster seal、LocalDone 是五件不同的事�
 ### 两级完成，唯一释放后继
 
 纯任务的本核退役相当于 block 完成；Mix 由本组 AIC 聚合 active lanes 和资源释放后完成。
-`finish_block` 对 completed_blocks 加一；只有读到旧值 N−1 的完成者进入现有逻辑完成路径，
+纯 C/V 的 `scheduler_finish_ordered_block` 对 completed_blocks 加一；
+只有读到旧值 N−1 的完成者进入现有逻辑完成路径，
 关闭 wake-list、推进后继、更新逻辑 task 计数一次。旧值大于等于 N 属于错误。
 重复 lane/slot 完成先通过 epoch、slot/group generation 和本地消费状态拦截，
 不能寄希望于“总数最终等于 N”。
@@ -204,6 +227,11 @@ cursor、组发布、组完成、cluster seal、LocalDone 是五件不同的事�
 TaskDone 负责依赖，LocalDone 负责成员顺序；不能互相代用。
 服务节点沿用一次性完成协议，Host inline 已完成节点不能在设备再完成一次。
 predicate 跳过不伪造执行身份；不支持的多 block 组合仍由能力检查处理。
+
+纯 C/V 的 trace 索引包含 `block_idx * popcount(mask)`；Host 导出使用该完整索引作为
+`reg_task_id`，保留逻辑 task_ref 作为 task token。转换器把 reg_task_id 纳入执行身份，
+避免同一核连续执行同一 task 的不同 block 时合并记录或连错 flow。
+这只补齐逐 block 存储／连接键，不提供尚未采集的 order、LocalDone 和 GM 组事件。
 
 ### 每条发布链必须有设备侧证明
 
@@ -234,17 +262,17 @@ AICore 上包装函数的 C++ memory_order 参数本身不建立设备 fence；
 
 下表短路径均相对 `src/a5/runtime/host_build_graph/`；每步只开放已经通过门槛的能力。
 
-| 顺序 | 修改位置与具体工作 | 通过门槛 |
-| ---- | ------------------ | -------- |
-| 前置 | scheduler_types.h 的公共初始化及 host/runtime_maker.cpp：补齐 own／独立 Mix payload 的两个 context 后缀及重绑定初始化 | 六种 mask 的 N=1 仿真各三轮、A5 各十轮通过；真机另修复不变 timeout 的共享 GM 轮询；不通过 kernel 伪造 context 绕过 |
-| 1 | scheduler_types.h/layout.h：新增 POD、offset、初始化、溢出检查；host/runtime_maker.cpp：实际大小预分配 | C++ 布局／初始化、二次运行、边界拒绝测试 |
-| 2 | scheduler_ready.h：一次领取准入所有权；新增准入 helper；executor/completion 接统一 entry gate | 旧 ready 原语回归；B 先于未 ready A；三入口不可越序；旁路发布竞态 |
-| 3 | dispatch/context、completion：普通 C/V cursor、原 N、block 级退役；maker/lifecycle 分开分波与共同驻留 demand | 纯 C/V N=1、容量两侧、512；晚 block 的消费者不早放行；快核跨 task 重叠 |
-| 4 | scheduler_mix.h、executor：GM descriptor/ack/seal，各 lane 自备 payload，删除该路径 SSBUF 依赖 | mask 3/5/6/7；同 block 配对；暂停最后发布者；局部关闭与槽复用 |
-| 5 | trace 索引及导出：含 block/order/placement/来源；连接严格审计器 | 不重不漏；无截断；完整因果链；原样 CSA 七项 golden 与 resident 来源 |
-| 6 | sync_start：一次领取／不同位置容量；保留早开始与局部跨 task 推进 | 两独立满核任务、部分交叠成员、超容量拒绝、早返回不二次领取 |
-| 7 | 在相同 kernel/输入/拓扑下测量新增控制开销 | 比较无完整插桩性能与诊断运行，不能从 CPU 模型推算收益 |
+| 顺序 | 修改位置与具体工作 | 通过门槛 | 当前范围 |
+| ---- | ------------------ | -------- | -------- |
+| 前置 | 公共 payload/context 初始化及 bootstrap | 六种 mask 的 N=1 重复运行，不通过 kernel 伪造 context | 已验证；详见实现过程 |
+| 1 | scheduler_types.h/layout.h 与 Host 实际大小预分配 | 布局／初始化、二次运行、溢出及边界拒绝 | 已实现 |
+| 2 | ready 唯一领取、准入发布及 executor/completion 统一 entry gate | B 先于未 ready A；三入口不可越序；旁路发布竞态 | own/direct 已接线；GM Mix 入口待实现 |
+| 3 | 普通 C/V cursor、原 N、block 退役与分波 demand | N=1、容量两侧、512；晚 block 不早放后继；快核跨 task 重叠 | 原生纯 C/V 已有通过证据 |
+| 4 | GM descriptor/ack/seal，各 lane 自备 payload，无 SSBUF | mask 3/5/6/7、配对、暂停最后发布者、局部关闭和槽复用 | 未实现 |
+| 5 | block/order/placement/来源导出及严格审计器 | 完整因果链、不重不漏、无截断；原样 CSA 七项 golden 与 resident 来源 | 逐 block 索引／连接键已接入；完整协议与 CSA 待验收 |
+| 6 | sync_start 一次领取／不同位置容量 | 满核独立任务、交叠成员、超容量、早返回不二次领取 | 未开放 |
+| 7 | 相同 kernel/输入/拓扑的控制开销对比 | 区分无完整插桩性能与诊断运行，不能由 CPU 模型推算收益 | 未完成 |
 
-第 2 步的普通旁路发布竞态、GM 实际可见性、完整 native trace adapter
-仍需随生产实现补 C++/设备测试；本次参考模型不是这些实现的替代品。
+纯 C/V 已有生产 helper 和原生执行证据；GM Mix 的实际可见性、三入口协同、
+完整 native trace adapter 仍需随生产实现补齐，参考模型不是这些实现的替代品。
 不要先全局放开 shape predicate，再用 legacy 的正确输出宣布 SPMD 完成。

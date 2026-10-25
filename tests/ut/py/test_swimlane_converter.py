@@ -1661,6 +1661,122 @@ def test_spmd_pred_routes_dependency_to_earliest_slice(tmp_path):
     assert sched_flow[1]["ts"] == tasks[4]["dispatch_time_us"]
 
 
+@pytest.mark.parametrize("runtime", [HBG_RUNTIME, TMR_RUNTIME])
+@pytest.mark.parametrize("level", [1, 2, 4])
+def test_perf_data_preserves_each_block_dispatch_identity(tmp_path, runtime, level):
+    capture = Capture(runtime=runtime, level=level)
+    for index, dispatch_id in enumerate((0, (1 << 32) - 1)):
+        arguments = {
+            "task_id": 7,
+            "core_id": 0,
+            "reg_task_id": dispatch_id,
+            "start": 100 + index * 100,
+            "end": 150 + index * 100,
+            "run_epoch": 9,
+        }
+        if level == 1:
+            capture.aicore_task(**arguments)
+        else:
+            capture.task(**arguments)
+    raw = tmp_path / "capture.json"
+    raw.write_text(json.dumps(capture.build()))
+
+    tasks = sc.read_perf_data(raw)["tasks"]
+
+    assert [task["reg_task_id"] for task in tasks] == [0, (1 << 32) - 1]
+    assert [task["task_id"] for task in tasks] == [7, 7]
+    assert [task["run_epoch"] for task in tasks] == [9, 9]
+    assert len({sc._execution_key(task) for task in tasks}) == 2
+
+
+@pytest.mark.parametrize("runtime", [HBG_RUNTIME, TMR_RUNTIME])
+@pytest.mark.parametrize("level", [1, 4])
+@pytest.mark.parametrize("reverse_blocks", [False, True])
+def test_multiblock_same_core_flows_bind_to_earliest_execution(tmp_path, runtime, level, reverse_blocks):
+    capture = Capture(runtime=runtime, level=level, clock_freq_hz=1_000_000)
+    for task_id, shift in ((7, 0), (8, 200)):
+        blocks = [(0, 90, 100, 140, 160), (1, 130, 170, 180, 190)]
+        for block, dispatch, start, end, finish in reversed(blocks) if reverse_blocks else blocks:
+            arguments = {
+                "task_id": task_id,
+                "reg_task_id": task_id * 2 + block,
+                "start": start + shift,
+                "end": end + shift,
+                "receive_to_start": 5,
+                "run_epoch": 11,
+            }
+            if level == 1:
+                capture.aicore_task(**arguments)
+            else:
+                capture.task(**arguments, dispatch=dispatch + shift, finish=finish + shift)
+    raw = tmp_path / "capture.json"
+    raw.write_text(json.dumps(capture.build()))
+    data = sc.read_perf_data(raw)
+    out = tmp_path / "trace.json"
+    _trace(
+        data["tasks"],
+        str(out),
+        deps_edges={7: [8]},
+        deps_block_map={7: 2, 8: 2},
+        runtime_name=runtime,
+    )
+    events = json.loads(out.read_text())["traceEvents"]
+
+    for pid in (4,) if level == 1 else (3, 4):
+        flows = [event for event in events if event.get("name") == "dependency" and event.get("pid") == pid]
+        assert len(flows) == 2
+        for task_id, phase in ((7, "s"), (8, "f")):
+            bars = [
+                event
+                for event in events
+                if event.get("ph") == "X" and event.get("pid") == pid and event.get("args", {}).get("taskId") == task_id
+            ]
+            assert len(bars) == 2
+            if pid == 3:
+                assert len({event["tid"] for event in bars}) == 2, "overlapping dispatches need separate lanes"
+            anchor = min(bars, key=lambda event: event["ts"])
+            flow = next(event for event in flows if event["ph"] == phase)
+            assert flow["bind_id"] == anchor["id"]
+            assert flow["tid"] == anchor["tid"]
+            assert flow["ts"] == anchor["ts"]
+
+
+def test_multiblock_same_core_complete_flow_binds_to_matching_execution(tmp_path):
+    raw = tmp_path / "capture.json"
+    raw.write_text(
+        json.dumps(
+            Capture(runtime=TMR_RUNTIME, level=4, clock_freq_hz=1_000_000)
+            .metadata(core_to_thread=[0])
+            .task(task_id=7, reg_task_id=0, start=100, end=140, dispatch=90, finish=160)
+            .task(task_id=7, reg_task_id=1, start=170, end=180, dispatch=130, finish=190)
+            .sched_phase(phase="complete", start=185, end=195)
+            .build()
+        )
+    )
+    data = sc.read_perf_data(raw)
+    out = tmp_path / "trace.json"
+    _trace(
+        data["tasks"],
+        str(out),
+        scheduler_phases=data["scheduler_records"],
+        core_to_thread=data["core_to_thread"],
+        deps_block_map={7: 2},
+        runtime_name=TMR_RUNTIME,
+    )
+    events = json.loads(out.read_text())["traceEvents"]
+    for pid in (3, 4):
+        bars = [event for event in events if event.get("ph") == "X" and event.get("pid") == pid]
+        anchor = min(bars, key=lambda event: event["ts"])
+        starts = [
+            event
+            for event in events
+            if event.get("name") == "complete" and event.get("ph") == "s" and event.get("pid") == pid
+        ]
+        assert len(starts) == 1
+        assert starts[0]["bind_id"] == anchor["id"]
+        assert starts[0]["tid"] == anchor["tid"]
+
+
 def test_spmd_succ_routes_dependency_to_earliest_slice(tmp_path):
     pred_id = 100
     succ_id = 200

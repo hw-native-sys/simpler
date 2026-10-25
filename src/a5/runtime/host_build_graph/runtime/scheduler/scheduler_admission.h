@@ -15,6 +15,13 @@
 
 enum class SchedulerAdmissionResult : uint8_t { PROGRESS, RETRY, ERROR };
 
+struct SchedulerOrderedCandidate {
+    SchedulerReadyClaim ready{};
+    uint8_t slot_index{UINT8_MAX};
+    bool predicate_cached{false};
+    bool predicate_pass{true};
+};
+
 struct SchedulerAdmissionLocalState {
     uint64_t epoch{0};
     uint64_t control_offset{0};
@@ -30,9 +37,12 @@ struct SchedulerAdmissionLocalState {
     uint8_t current_active_mask{0};
     uint8_t current_flags{0};
     bool initialized{false};
+    uint8_t next_candidate{0};
+    SchedulerOrderedCandidate candidates[SCHEDULER_PENDING_SLOT_COUNT]{};
 };
 
-static_assert(sizeof(SchedulerAdmissionLocalState) == 88, "admission-local state size changed");
+static_assert(sizeof(SchedulerOrderedCandidate) == 48, "ordered candidate size changed");
+static_assert(sizeof(SchedulerAdmissionLocalState) == 184, "admission-local state size changed");
 
 inline __aicore__ bool scheduler_admission_range_end(uint64_t offset, uint64_t count, uint64_t stride, uint64_t *end) {
     if (stride == 0 || count > (UINT64_MAX - offset) / stride) return false;
@@ -426,5 +436,348 @@ inline __aicore__ bool scheduler_can_enter_ordinary(
     // This critical read grants one entry only. A later publication may wait
     // for that finite kernel, but cannot be ignored by its next invocation.
     *permit = tail == admission->scan_cursor;
+    return true;
+}
+
+inline __aicore__ SchedulerReadyClaim *scheduler_ordered_direct_sink(SchedulerAdmissionLocalState *admission) {
+    if (admission == nullptr || !admission->initialized) return nullptr;
+    for (auto &candidate : admission->candidates) {
+        if (scheduler_task_ref_is_null(candidate.ready.task_ref)) {
+            candidate = {};
+            return &candidate.ready;
+        }
+    }
+    return nullptr;
+}
+
+inline __aicore__ bool
+scheduler_ordered_retain_candidate(SchedulerAdmissionLocalState *admission, const SchedulerReadyClaim &ready) {
+    if (admission == nullptr || scheduler_task_ref_is_null(ready.task_ref) ||
+        ready.task_ref == admission->pending_task_ref || ready.task_ref == admission->current_task_ref)
+        return false;
+    for (const auto &candidate : admission->candidates)
+        if (candidate.ready.task_ref == ready.task_ref) return false;
+    auto *sink = scheduler_ordered_direct_sink(admission);
+    if (sink == nullptr) return false;
+    *sink = ready;
+    return true;
+}
+
+enum class SchedulerBlockClaimResult : uint8_t { CLAIMED, EXHAUSTED, RETRY, ERROR };
+enum class SchedulerBlockFinishResult : uint8_t { PARTIAL, TASK_LAST, ERROR };
+
+inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_block(
+    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    uint32_t slot_index
+) {
+    auto *admission = local == nullptr ? nullptr : local->admission;
+    if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return SchedulerBlockClaimResult::ERROR;
+    const int64_t task = admission->current_task_ref;
+    if (!scheduler_task_ref_valid(graph, task) || slot_index >= SCHEDULER_PENDING_SLOT_COUNT ||
+        local->slots[slot_index].state != SchedulerDispatchSlotState::FREE || admission->current_block_num == 0 ||
+        scheduler_task_is_mix(admission->current_flags) ||
+        scheduler_task_requires_sync_start(admission->current_flags) ||
+        scheduler_metadata_single_subtask_slot(admission->current_active_mask) == UINT8_MAX ||
+        scheduler_task_ready_queue(admission->current_flags, admission->current_active_mask) !=
+            local->config.self_core_type) {
+        scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+        return SchedulerBlockClaimResult::ERROR;
+    }
+    auto *control = scheduler_task_control_at(base, local, task);
+    uint64_t observed = scheduler_gm_query(control->next_block);
+    bool critical = false;
+    for (uint32_t attempt = 0; attempt < 8; ++attempt) {
+        if (observed >= admission->current_block_num) {
+            if (!critical) observed = scheduler_gm_fetch_add(control->next_block, UINT64_C(0));
+            if (observed == admission->current_block_num) return SchedulerBlockClaimResult::EXHAUSTED;
+            if (observed > admission->current_block_num) {
+                scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+                return SchedulerBlockClaimResult::ERROR;
+            }
+        }
+        const uint64_t previous = scheduler_gm_compare_exchange(control->next_block, observed, observed + 1);
+        if (previous == observed) {
+            auto &slot = local->slots[slot_index];
+            slot.task_ref = task;
+            slot.block_idx = static_cast<uint32_t>(observed);
+            slot.cooperative = true;
+            slot.candidate_index = UINT8_MAX;
+            slot.predicate_cached = false;
+            slot.mix_tracker = UINT8_MAX;
+            slot.subtask_slot = scheduler_metadata_single_subtask_slot(admission->current_active_mask);
+            slot.state = SchedulerDispatchSlotState::FILLING;
+            return SchedulerBlockClaimResult::CLAIMED;
+        }
+        observed = previous;
+        critical = true;
+    }
+    return SchedulerBlockClaimResult::RETRY;
+}
+
+// Generation consumption belongs to the completion caller. Its successful
+// generation check makes this contribution unique; an error terminates the run.
+inline __aicore__ SchedulerBlockFinishResult scheduler_finish_ordered_block(
+    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    uint32_t slot_index
+) {
+    auto *admission = local == nullptr ? nullptr : local->admission;
+    if (!scheduler_admission_context_valid(graph, base, local, run, admission))
+        return SchedulerBlockFinishResult::ERROR;
+    if (slot_index >= SCHEDULER_PENDING_SLOT_COUNT) {
+        scheduler_admission_fail(
+            graph, local, run, admission->current_task_ref, SchedulerErrorSite::BLOCK_COMPLETION_INVALID
+        );
+        return SchedulerBlockFinishResult::ERROR;
+    }
+    const auto &slot = local->slots[slot_index];
+    if (!slot.cooperative || slot.state != SchedulerDispatchSlotState::READY ||
+        slot.task_ref != admission->current_task_ref || !scheduler_task_ref_valid(graph, slot.task_ref) ||
+        slot.block_idx >= admission->current_block_num || scheduler_task_is_mix(admission->current_flags)) {
+        scheduler_admission_fail(graph, local, run, slot.task_ref, SchedulerErrorSite::BLOCK_COMPLETION_INVALID);
+        return SchedulerBlockFinishResult::ERROR;
+    }
+    auto *control = scheduler_task_control_at(base, local, slot.task_ref);
+    scheduler_cache_barrier();
+    const uint64_t previous = scheduler_gm_fetch_add(control->completed_blocks, UINT64_C(1));
+    if (previous >= admission->current_block_num) {
+        scheduler_admission_fail(graph, local, run, slot.task_ref, SchedulerErrorSite::BLOCK_COMPLETION_INVALID);
+        return SchedulerBlockFinishResult::ERROR;
+    }
+    return previous + 1 == admission->current_block_num ? SchedulerBlockFinishResult::TASK_LAST :
+                                                          SchedulerBlockFinishResult::PARTIAL;
+}
+
+inline __aicore__ bool scheduler_close_ordered_obligation(
+    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    bool *closed
+) {
+    if (closed == nullptr) return false;
+    *closed = false;
+    auto *admission = local == nullptr ? nullptr : local->admission;
+    if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
+    const int64_t task = admission->current_task_ref;
+    if (scheduler_task_ref_is_null(task)) return true;
+    if (!scheduler_task_ref_valid(graph, task) || scheduler_task_is_mix(admission->current_flags) ||
+        scheduler_task_requires_sync_start(admission->current_flags))
+        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER);
+    for (const auto &slot : local->slots)
+        if (slot.cooperative && slot.task_ref == task && slot.state != SchedulerDispatchSlotState::FREE) return true;
+    const uint64_t cursor =
+        scheduler_gm_fetch_add(scheduler_task_control_at(base, local, task)->next_block, UINT64_C(0));
+    if (cursor < admission->current_block_num) return true;
+    if (cursor != admission->current_block_num || admission->scan_cursor >= admission->capacity)
+        return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_CURSOR_INVALID);
+    ++admission->scan_cursor;
+    admission->current_task_ref = SCHEDULER_TASK_REF_INVALID;
+    admission->current_block_num = 0;
+    admission->current_active_mask = 0;
+    admission->current_flags = 0;
+    *closed = true;
+    return true;
+}
+
+inline __aicore__ bool scheduler_ordered_park_ordinary(
+    const SchedulerGraphView &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+) {
+    auto *admission = local->admission;
+    for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
+        auto &slot = local->slots[index];
+        if (slot.state != SchedulerDispatchSlotState::READY || slot.cooperative ||
+            (local->local_ready_mask & (1U << index)) == 0)
+            continue;
+        if (slot.candidate_index >= SCHEDULER_PENDING_SLOT_COUNT)
+            return scheduler_admission_fail(
+                graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
+            );
+        auto &candidate = admission->candidates[slot.candidate_index];
+        if (candidate.ready.task_ref != slot.task_ref || candidate.slot_index != index)
+            return scheduler_admission_fail(
+                graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
+            );
+        candidate.predicate_cached = slot.predicate_cached;
+        candidate.predicate_pass = slot.predicate_pass;
+        candidate.slot_index = UINT8_MAX;
+        local->local_ready_mask &= static_cast<uint8_t>(~(1U << index));
+        scheduler_initialize_free_slot(&slot);
+        local->set_timing_slot(local->config.self_lane, index, -1);
+    }
+    return true;
+}
+
+inline __aicore__ SchedulerAdmissionResult scheduler_ordered_publish_pending(
+    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+) {
+    auto *admission = local->admission;
+    if (scheduler_task_ref_is_null(admission->pending_task_ref)) return SchedulerAdmissionResult::PROGRESS;
+    if (!scheduler_prepare_admission_record(graph, base, local, run, admission)) return SchedulerAdmissionResult::ERROR;
+    return scheduler_try_commit_admission(graph, base, local, run, admission);
+}
+
+inline __aicore__ bool scheduler_fill_ordered_slots(
+    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    uint64_t *victim_cursors, SchedulerReadyStats *ready_stats, uint64_t profiling_level, bool *failed,
+    SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region
+) {
+    if (failed == nullptr) return false;
+    *failed = false;
+    auto *admission = local == nullptr ? nullptr : local->admission;
+    if (!scheduler_admission_context_valid(graph, base, local, run, admission)) {
+        *failed = true;
+        return false;
+    }
+    bool progress = !scheduler_task_ref_is_null(admission->pending_task_ref);
+    auto published = scheduler_ordered_publish_pending(graph, base, local, run);
+    if (published != SchedulerAdmissionResult::PROGRESS) {
+        *failed = published == SchedulerAdmissionResult::ERROR;
+        return false;
+    }
+    // Discovery is bounded by candidate credits, not by physical slot capacity.
+    // A later cooperative task may be admitted while an earlier one is in flight.
+    const uint32_t type = local->config.self_core_type;
+    const bool steal = scheduler_ready_directory_nonempty(base, local, local->config.scheduler_count, type);
+    for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
+        auto &candidate = admission->candidates[index];
+        if (scheduler_task_ref_is_null(candidate.ready.task_ref)) {
+            candidate = {};
+            const uint64_t probe_start = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+            if (!scheduler_claim_ready_for_slot(
+                    graph, base, local, run, local->config.scheduler_count, type, &victim_cursors[type], ready_stats,
+                    &candidate.ready, nullptr, steal
+                )) {
+                *failed = true;
+                return progress;
+            }
+            if (scheduler_task_ref_is_null(candidate.ready.task_ref)) continue;
+            candidate.ready.state_probe_start_cycles = probe_start;
+            candidate.ready.state_probe_end_cycles =
+                scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+            progress = true;
+        }
+        const auto metadata = scheduler_load_dispatch_metadata(base, local, candidate.ready.task_ref, profiling_level);
+        if (!scheduler_task_requires_admission(metadata)) continue;
+        if (candidate.slot_index != UINT8_MAX ||
+            scheduler_try_claim_admission(graph, base, local, run, admission, candidate.ready) !=
+                SchedulerAdmissionResult::PROGRESS) {
+            scheduler_admission_fail(
+                graph, local, run, candidate.ready.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
+            );
+            *failed = true;
+            return progress;
+        }
+        candidate = {};
+        published = scheduler_ordered_publish_pending(graph, base, local, run);
+        if (published != SchedulerAdmissionResult::PROGRESS) {
+            *failed = published == SchedulerAdmissionResult::ERROR;
+            return true;
+        }
+        progress = true;
+    }
+    if (!scheduler_refresh_local_obligation(graph, base, local, run, admission)) {
+        *failed = true;
+        return progress;
+    }
+    if (!scheduler_task_ref_is_null(admission->current_task_ref)) {
+        if (!scheduler_ordered_park_ordinary(graph, local, run)) {
+            *failed = true;
+            return progress;
+        }
+        for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
+            if (local->slots[index].state != SchedulerDispatchSlotState::FREE) continue;
+            const auto claim_result = scheduler_claim_ordered_block(graph, base, local, run, index);
+            if (claim_result == SchedulerBlockClaimResult::ERROR) {
+                *failed = true;
+                return progress;
+            }
+            if (claim_result != SchedulerBlockClaimResult::CLAIMED) break;
+            auto &slot = local->slots[index];
+            SchedulerReadyClaim ready{};
+            ready.task_ref = slot.task_ref;
+            ready.source = SchedulerReadySource::COOPERATIVE;
+            const SchedulerFreeSlotClaim claim{local->worker_id(), index, slot.generation, local->config.self_lane};
+            if (!scheduler_fill_dispatch_slot(graph, base, local, run, claim, ready, profiling_level, ssbuf_region)) {
+                *failed = true;
+                return progress;
+            }
+            progress = true;
+        }
+        bool closed = false;
+        if (!scheduler_close_ordered_obligation(graph, base, local, run, &closed)) *failed = true;
+        return progress || closed;
+    }
+    bool may_prepare = false;
+    if (!scheduler_can_enter_ordinary(graph, base, local, run, admission, &may_prepare)) {
+        *failed = true;
+        return progress;
+    }
+    if (!may_prepare) return progress;
+    for (uint32_t offset = 0; offset < SCHEDULER_PENDING_SLOT_COUNT; ++offset) {
+        const uint32_t candidate_index = (admission->next_candidate + offset) % SCHEDULER_PENDING_SLOT_COUNT;
+        auto &candidate = admission->candidates[candidate_index];
+        if (scheduler_task_ref_is_null(candidate.ready.task_ref) || candidate.slot_index != UINT8_MAX) continue;
+        for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
+            auto &slot = local->slots[index];
+            if (slot.state != SchedulerDispatchSlotState::FREE) continue;
+            slot.candidate_index = static_cast<uint8_t>(candidate_index);
+            slot.predicate_cached = candidate.predicate_cached;
+            slot.predicate_pass = candidate.predicate_pass;
+            slot.state = SchedulerDispatchSlotState::FILLING;
+            candidate.ready.publication_mode = SchedulerPublicationMode::DISPATCH;
+            const SchedulerFreeSlotClaim claim{local->worker_id(), index, slot.generation, local->config.self_lane};
+            if (!scheduler_fill_dispatch_slot(
+                    graph, base, local, run, claim, candidate.ready, profiling_level, ssbuf_region
+                )) {
+                *failed = true;
+                return progress;
+            }
+            candidate.slot_index = static_cast<uint8_t>(index);
+            candidate.predicate_cached = slot.predicate_cached;
+            candidate.predicate_pass = slot.predicate_pass;
+            progress = true;
+            break;
+        }
+    }
+    return progress;
+}
+
+inline __aicore__ bool scheduler_ordered_can_enter_slot(
+    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    uint32_t slot_index, bool *permit
+) {
+    if (permit == nullptr) return false;
+    *permit = false;
+    auto *admission = local == nullptr ? nullptr : local->admission;
+    if (!scheduler_admission_context_valid(graph, base, local, run, admission)) return false;
+    if (slot_index >= SCHEDULER_PENDING_SLOT_COUNT)
+        return scheduler_admission_fail(
+            graph, local, run, SCHEDULER_TASK_REF_INVALID, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
+        );
+    auto &slot = local->slots[slot_index];
+    if (slot.state != SchedulerDispatchSlotState::READY)
+        return scheduler_admission_fail(
+            graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
+        );
+    if (!scheduler_task_ref_is_null(admission->pending_task_ref)) return true;
+    if (slot.cooperative) {
+        if (slot.task_ref != admission->current_task_ref || slot.block_idx >= admission->current_block_num)
+            return scheduler_admission_fail(
+                graph, local, run, slot.task_ref, SchedulerErrorSite::ADMISSION_INVALID_FRONTIER
+            );
+        *permit = true;
+        return true;
+    }
+    if (!scheduler_can_enter_ordinary(graph, base, local, run, admission, permit)) return false;
+    if (!*permit) return true;
+    if (slot.candidate_index >= SCHEDULER_PENDING_SLOT_COUNT)
+        return scheduler_admission_fail(
+            graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
+        );
+    auto &candidate = admission->candidates[slot.candidate_index];
+    if (candidate.ready.task_ref != slot.task_ref || candidate.slot_index != slot_index)
+        return scheduler_admission_fail(
+            graph, local, run, slot.task_ref, SchedulerErrorSite::ORDERED_CANDIDATE_INVALID
+        );
+    admission->next_candidate = static_cast<uint8_t>((slot.candidate_index + 1) % SCHEDULER_PENDING_SLOT_COUNT);
+    candidate = {};
+    slot.candidate_index = UINT8_MAX;
     return true;
 }

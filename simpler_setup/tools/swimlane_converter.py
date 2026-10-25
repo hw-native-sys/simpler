@@ -963,6 +963,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             tasks.append(
                 {
                     "task_id": task_token,
+                    "reg_task_id": reg_task_id,
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
@@ -980,7 +981,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             )
     elif aicore_rows and level == 1:
         for row in aicore_rows:
-            core_id, task_token, _reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
+            core_id, task_token, reg_task_id, start_cycles, end_cycles, r2s_cycles, run_epoch = row
             r2s_cycles = int(r2s_cycles)
             run_epoch = int(run_epoch)
             core_id = int(core_id)
@@ -992,6 +993,7 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             tasks.append(
                 {
                     "task_id": task_token,
+                    "reg_task_id": int(reg_task_id),
                     "func_id": -1,
                     "core_id": core_id,
                     "core_type": _core_type(core_id),
@@ -1415,15 +1417,14 @@ def _select_complete_for_finish(indexed_phases, finish_us):
 
 
 def _execution_key(row):
-    """Identity of one execution instance: ``(run_epoch, task_id, core_id)``.
+    """Identity of one dispatch: ``(run_epoch, task_id, core_id, reg_task_id)``.
 
-    Task ids and core ids both repeat across runs, so an index keyed on that
-    pair alone is overwritten by whichever run is emitted last, and every
-    earlier run's flow then binds to a slice belonging to the later one. The
-    static graph in deps.json is run-independent and stays keyed by bare
-    task_id; this key is only for per-execution indexes.
+    Multi-block tasks can execute repeatedly on one core within the same run.
+    The dispatch id distinguishes those executions; the static dependency graph
+    still uses the original task_id. Older normalized rows without a dispatch
+    id retain their run/task/core identity.
     """
-    return (row["run_epoch"], row["task_id"], row["core_id"])
+    return (row["run_epoch"], row["task_id"], row["core_id"], row.get("reg_task_id"))
 
 
 def _flow_anchor_rows(task_id, task_map, spmd_task_ids, slice_start, aicpu_worker_anchor_map=None):
@@ -3134,7 +3135,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
             for anchor in task_worker_anchors[task_key]:
                 # Worker View (pid=4): anchor on the kernel slice (end_time_us).
                 src_tid = core_to_tid[anchor["core_id"]]
-                src_event_id = task_to_event_id.get((run_epoch, tid, anchor["core_id"]))
+                src_event_id = task_to_event_id.get(_execution_key(anchor))
                 events.append(
                     {
                         "cat": "flow",
@@ -3168,10 +3169,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0913, PLR0915
                 anchor_finish_us = anchor.get("finish_time_us")
                 if anchor_finish_us is None or anchor_finish_us <= 0:
                     continue
-                sched_src_tid = task_to_scheduler_tid.get(
-                    (run_epoch, tid, anchor["core_id"]), core_to_tid[anchor["core_id"]]
-                )
-                sched_src_event_id = task_to_scheduler_event_id.get((run_epoch, tid, anchor["core_id"]))
+                sched_src_tid = task_to_scheduler_tid.get(_execution_key(anchor), core_to_tid[anchor["core_id"]])
+                sched_src_event_id = task_to_scheduler_event_id.get(_execution_key(anchor))
                 events.append(
                     {
                         "cat": "flow",

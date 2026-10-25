@@ -70,11 +70,71 @@ TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
 }
 
-TEST(AicoreSchedulerState, ResidentAcceptsSingleBlockOrdinaryMix) {
-    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(1, 1, false));
-    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(2, 1, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 2, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 1, true));
+TEST(AicoreSchedulerState, ResidentAcceptsOrdinaryPureMultiBlockAndSingleBlockMix) {
+    for (uint32_t blocks : {1U, 2U, 3U, 33U, 97U, 512U, static_cast<uint32_t>(INT16_MAX)}) {
+        SCOPED_TRACE(blocks);
+        EXPECT_TRUE(scheduler_resident_task_shape_supported(1, blocks, false));
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(1, blocks, true));
+    }
+    for (uint32_t active : {2U, 3U}) {
+        SCOPED_TRACE(active);
+        EXPECT_TRUE(scheduler_resident_task_shape_supported(active, 1, false));
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, 2, false));
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, 1, true));
+    }
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(0, 1, false));
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(4, 1, false));
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(1, 0, false));
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(1, static_cast<uint32_t>(INT16_MAX) + 1, false));
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(1, UINT32_MAX, false));
+}
+
+TEST(AicoreSchedulerState, ResidentDoesNotMixMultiBlockAdmissionWithSingleBlockSsbufMix) {
+    EXPECT_TRUE(scheduler_resident_graph_shape_supported(false, false));
+    EXPECT_TRUE(scheduler_resident_graph_shape_supported(false, true));
+    EXPECT_TRUE(scheduler_resident_graph_shape_supported(true, false));
+    EXPECT_FALSE(scheduler_resident_graph_shape_supported(true, true));
+}
+
+TEST(AicoreSchedulerState, WholeGraphProtocolDecisionDoesNotDependOnSubmissionOrder) {
+    for (uint32_t mix_subtasks : {2U, 3U}) {
+        for (bool mix_first : {false, true}) {
+            SCOPED_TRACE(mix_subtasks);
+            SCOPED_TRACE(mix_first);
+            bool has_multiblock = false;
+            bool has_mix = false;
+            for (uint32_t index = 0; index < 2; ++index) {
+                const bool mix = (index == 0) == mix_first;
+                const uint32_t active = mix ? mix_subtasks : 1U;
+                const uint32_t blocks = mix ? 1U : 512U;
+                ASSERT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
+                has_multiblock = has_multiblock || blocks > 1;
+                has_mix = has_mix || active > 1;
+            }
+            EXPECT_FALSE(scheduler_resident_graph_shape_supported(has_multiblock, has_mix));
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, OrdinaryDemandCountsOneExecutionPositionOrMixGroup) {
+    struct DemandCase {
+        uint8_t mask;
+        uint32_t aic;
+        uint32_t aiv;
+    };
+    for (const DemandCase &test : {
+             DemandCase{1, 1, 0},
+             DemandCase{2, 0, 1},
+             DemandCase{3, 1, 1},
+             DemandCase{5, 1, 1},
+             DemandCase{6, 1, 2},
+             DemandCase{7, 1, 2},
+         }) {
+        SCOPED_TRACE(test.mask);
+        const auto demand = scheduler_minimum_worker_demand(test.mask);
+        EXPECT_EQ(demand.aic, test.aic);
+        EXPECT_EQ(demand.aiv, test.aiv);
+    }
 }
 
 TEST(AicoreSchedulerWatchdog, UsesElapsedWallClockBudget) {

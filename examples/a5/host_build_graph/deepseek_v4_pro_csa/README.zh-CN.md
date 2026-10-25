@@ -2,9 +2,9 @@
 
 本目录提供原生 `SceneTestCase` 的 **HBG 独立用例**。冻结 kernel、参数 ABI、数据清单、七项 golden、运行和分析工具均在本目录内，不导入其他 runtime 的用例，也不依赖 PyPTO 或模型仓库。首次使用需另行导入固定数据，数据文件不进入 Git。
 
-**当前边界：HBG 已在 A5 跑通，但当前主线对这个 CSA 使用的是 AICPU 调度，不是 AICore 分布式调度。** `main@946f49ac` 的 resident v0 只接受 `logical_block_num == 1` 且不要求 sync-start 的任务。CSA 有多 block 的 SPMD 任务，整图会选择 `LEGACY_UNSUPPORTED_SHAPE`；本机 L4 记录的 `scheduler_tasks.producer` 和五个 scheduler stream 均为 `aicpu`。
+**当前边界：HBG 已在 A5 跑通，但这个 CSA 的 AICore 分布式调度验收尚未通过。** 创建用例时的 `main@946f49ac` 只接受 `logical_block_num == 1` 且不要求 sync-start 的 resident 任务；历史 L4 记录的 `scheduler_tasks.producer` 和五个 scheduler stream 均为 `aicpu`。当前开发分支已支持纯 C/V 普通多 block，但多 block Mix 仍未开放，CSA 仍会整图选择 `LEGACY_UNSUPPORTED_SHAPE`。最新实现边界见 [SPMD 设计](../../../../tests/fdwic/pa_hbg/a5-hbg-spmd-design.md)。
 
-因此，这份用例是后续扩展、调试 HBG 分布式调度的固定验收负载；**当前结果不能当作分布式调度的性能基线**。本次没有修改 runtime、拆任务、减少 SPMD block 数或改变 kernel 来绕过限制。
+因此，这份用例是后续扩展、调试 HBG 分布式调度的固定验收负载；**历史 AICPU 结果不能当作分布式调度的性能基线**。用例不通过拆任务、减少 SPMD block 数或改变 kernel 绕过限制。
 
 ## 1. 入口与适配范围
 
@@ -32,7 +32,7 @@
 
 CPU 测试会逆向还原上述两项 C++ 文本适配，并检查还原后的 SHA256 与原文件一致；同时检查 52 个参数中只有 `hc_attn_scale` 改变传输方式。另有隔离子进程禁止导入 TMR 用例，确保 HBG 不依赖本地未提交文件。
 
-触发当前回退的第一项任务为 `task_id=7`、`kernel_ids=[1,2,-1]`、`block_num=4`；整份图包含 60 个多 block 任务，最大的 `block_num=512`。判定位置是 `src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h` 的 `scheduler_resident_v0_task_shape_supported()`，整图回退位置是 `host/runtime_maker.cpp` 的 `create_scheduler_state()`。把 block 数直接改成 1 会改变计算，不能作为分布式路径接通的修复。
+历史验收中首先触发回退的任务为 `task_id=7`、`kernel_ids=[1,2,-1]`、`block_num=4`；整份图包含 60 个多 block 任务，最大的 `block_num=512`。当前判定位置是 `src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_graph.h` 的 `scheduler_resident_task_shape_supported()` 与 `scheduler_resident_graph_shape_supported()`，整图回退位置是 `host/runtime_maker.cpp` 的 `create_scheduler_state()`。纯 C/V 分波开放不代表该多 block Mix 已获得支持；把 block 数直接改成 1 会改变计算，不能作为分布式路径接通的修复。
 
 ## 2. 环境与复跑命令
 
@@ -85,7 +85,7 @@ python "$CSA_HBG/run.py" l4 -d 0
 python "$CSA_HBG/run.py" l4 -d 0 --require-aicore-scheduler
 ```
 
-最后一条命令在当前主线会明确失败，原因是 AICPU 回退，而不是 CSA 数值错误。后续分布式调度器支持本负载后，它应通过；不能删除这道检查来宣称分布式路径已经接通。`check`、`bench`、L1 不具备判断 scheduler producer 的证据，不能与此门禁等同。
+最后一条命令在当前开发分支仍会明确失败，原因是 AICPU 回退，而不是 CSA 数值错误。后续分布式调度器支持本负载后，它应通过；不能删除这道检查来宣称分布式路径已经接通。`check`、`bench`、L1 不具备判断 scheduler producer 的证据，不能与此门禁等同。
 
 最小入口与预编译命令：
 
