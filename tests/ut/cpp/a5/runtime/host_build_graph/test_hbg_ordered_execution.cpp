@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <thread>
 #include <tuple>
 #include <vector>
 
@@ -54,8 +56,8 @@ struct OrderedExecution {
 };
 
 struct OrderedFixture {
-    explicit OrderedFixture(const std::vector<OrderedShape> &shapes) :
-        storage(shapes.size(), 6, maximum_blocks(shapes), ordered_requirements(shapes)),
+    explicit OrderedFixture(const std::vector<OrderedShape> &shapes, bool protocol_profiling = false) :
+        storage(shapes.size(), 6, maximum_blocks(shapes), ordered_requirements(shapes), protocol_profiling),
         graph(shapes.size()) {
         uint32_t trace = 0;
         for (uint64_t task = 0; task < shapes.size(); ++task) {
@@ -658,5 +660,151 @@ TEST_P(HbgOrderedDeferredPublication, DirectSuccessorPublishedLaterIsDispatchNot
 }
 
 INSTANTIATE_TEST_SUITE_P(PureCAndV, HbgOrderedDeferredPublication, ::testing::Values<uint8_t>(1, 2));
+
+TEST(HbgOrderedProtocol, RecordsClaimOwnerAndActualCompletionTicketRatherThanBlockOrder) {
+    for (uint8_t mask : {1, 2}) {
+        OrderedFixture fixture({{2, mask}}, true);
+        const uint32_t first = mask == 1 ? 0 : 1;
+        const uint32_t second = mask == 1 ? 3 : 2;
+        ASSERT_TRUE(fixture.admit(0, first));
+        ASSERT_TRUE(fixture.stage_one(first, 0));
+        ASSERT_TRUE(fixture.stage_one(second, 0));
+        auto *blocks = scheduler_state_at<SchedulerProtocolBlockTrace>(
+            fixture.base(), fixture.storage.layout.protocol.blocks_offset
+        );
+        for (uint32_t block = 0; block < 2; ++block) {
+            const auto &owner = blocks[block].owner;
+            EXPECT_NE(owner.claim_before.sequence, 0u);
+            EXPECT_GT(owner.claim_after.sequence, owner.claim_before.sequence);
+            EXPECT_LE(owner.claim_before.cycles, owner.claim_after.cycles);
+            EXPECT_EQ(owner.run_epoch, 37u);
+            EXPECT_EQ(owner.task_ref, 0);
+            EXPECT_EQ(owner.block_idx, block);
+            EXPECT_EQ(owner.worker_index, block == 0 ? first : second);
+            EXPECT_EQ(owner.logical_block_num, 2u);
+            EXPECT_EQ(owner.active_mask, mask);
+            EXPECT_EQ(owner.group_seq, 0u);
+            EXPECT_EQ(owner.completion_before.sequence, 0u);
+        }
+        OrderedExecution first_execution{}, second_execution{};
+        ASSERT_TRUE(fixture.begin(first, &first_execution));
+        ASSERT_TRUE(fixture.begin(second, &second_execution));
+        ASSERT_TRUE(fixture.complete(second_execution));
+        EXPECT_EQ(blocks[1].owner.completion_ticket, 0u);
+        EXPECT_GT(blocks[1].owner.completion_before.sequence, blocks[1].owner.claim_after.sequence);
+        EXPECT_GT(blocks[1].owner.completion_after.sequence, blocks[1].owner.completion_before.sequence);
+        EXPECT_EQ(blocks[0].owner.completion_after.sequence, 0u);
+        ASSERT_TRUE(fixture.complete(first_execution));
+        EXPECT_EQ(blocks[0].owner.completion_ticket, 1u);
+        EXPECT_GT(blocks[0].owner.completion_after.sequence, blocks[0].owner.completion_before.sequence);
+        EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 2u);
+    }
+}
+
+TEST(HbgOrderedProtocol, ExhaustedCursorDoesNotInventAnotherClaim) {
+    OrderedFixture fixture({{2, 1}}, true);
+    ASSERT_TRUE(fixture.admit(0, 0));
+    ASSERT_TRUE(fixture.stage_one(0, 0));
+    ASSERT_TRUE(fixture.stage_one(0, 1));
+    const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    const uint64_t sequence = workers[0].next_sequence;
+    uint32_t block = UINT32_MAX;
+    EXPECT_EQ(
+        scheduler_claim_ordered_cursor(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &block),
+        SchedulerBlockClaimResult::EXHAUSTED
+    );
+    EXPECT_EQ(workers[0].next_sequence, sequence);
+    EXPECT_EQ(block, UINT32_MAX);
+    const auto *blocks =
+        scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
+    EXPECT_NE(blocks[0].owner.claim_after.sequence, 0u);
+    EXPECT_NE(blocks[1].owner.claim_after.sequence, 0u);
+}
+
+TEST(HbgOrderedProtocol, OutOfRangeTracePrefixDoesNotWriteOutsideThePlannedBlockRegion) {
+    OrderedFixture fixture({{2, 1}}, true);
+    ASSERT_TRUE(fixture.admit(0, 0));
+    fixture.storage.metadata[0].trace_index_base = UINT32_MAX;
+    ASSERT_TRUE(scheduler_refresh_local_obligation(
+        fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &fixture.admissions[0]
+    ));
+    uint32_t block = UINT32_MAX;
+    ASSERT_EQ(
+        scheduler_claim_ordered_cursor(fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), &block),
+        SchedulerBlockClaimResult::CLAIMED
+    );
+    EXPECT_EQ(block, 0u);
+    const auto *records =
+        scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
+    EXPECT_EQ(records[0].owner.claim_after.sequence, 0u);
+    EXPECT_EQ(records[1].owner.claim_after.sequence, 0u);
+    const auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(worker->error_flags, SCHEDULER_PROTOCOL_INVALID_IDENTITY);
+    EXPECT_EQ(worker->finished, 0u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
+}
+
+TEST(HbgOrderedProtocol, ConcurrentWorkersKeepUniqueOwnersAndContiguousLocalSequences) {
+    constexpr uint32_t count = 128;
+    OrderedFixture fixture({{count, 1}}, true);
+    ASSERT_TRUE(fixture.admit(0, 0));
+    for (uint32_t worker : {0u, 3u})
+        ASSERT_TRUE(scheduler_refresh_local_obligation(
+            fixture.graph.graph(), fixture.base(), fixture.locals[worker], fixture.run(), &fixture.admissions[worker]
+        ));
+    std::array<std::vector<uint32_t>, 2> claimed;
+    std::atomic<uint32_t> arrived{0};
+    std::atomic<bool> failed{false};
+    const auto claim = [&](uint32_t participant) {
+        arrived.fetch_add(1, std::memory_order_acq_rel);
+        while (arrived.load(std::memory_order_acquire) != 2) {}
+        while (true) {
+            uint32_t block = UINT32_MAX;
+            const auto result = scheduler_claim_ordered_cursor(
+                fixture.graph.graph(), fixture.base(), fixture.locals[participant * 3], fixture.run(), &block
+            );
+            if (result == SchedulerBlockClaimResult::EXHAUSTED) break;
+            if (result == SchedulerBlockClaimResult::ERROR) {
+                failed.store(true);
+                break;
+            }
+            if (result == SchedulerBlockClaimResult::CLAIMED) claimed[participant].push_back(block);
+        }
+    };
+    std::thread first(claim, 0);
+    std::thread second(claim, 1);
+    first.join();
+    second.join();
+    ASSERT_FALSE(failed.load());
+    EXPECT_EQ(claimed[0].size() + claimed[1].size(), count);
+    std::array<bool, count> seen{};
+    const auto *records =
+        scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
+    const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    for (uint32_t participant = 0; participant < 2; ++participant) {
+        uint64_t sequence = participant == 0 ? 3 : 1;
+        for (uint32_t block : claimed[participant]) {
+            ASSERT_LT(block, count);
+            EXPECT_FALSE(seen[block]);
+            seen[block] = true;
+            const auto &owner = records[block].owner;
+            EXPECT_EQ(owner.worker_index, participant * 3);
+            EXPECT_EQ(owner.block_idx, block);
+            EXPECT_EQ(owner.claim_before.sequence, ++sequence);
+            EXPECT_EQ(owner.claim_after.sequence, ++sequence);
+        }
+        EXPECT_EQ(workers[participant * 3].next_sequence, sequence);
+        EXPECT_EQ(workers[participant * 3].error_flags, 0u);
+    }
+    EXPECT_TRUE(std::all_of(seen.begin(), seen.end(), [](bool value) {
+        return value;
+    }));
+}
 
 }  // namespace

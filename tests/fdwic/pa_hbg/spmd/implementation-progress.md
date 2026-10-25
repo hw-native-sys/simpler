@@ -1063,3 +1063,62 @@ block_identity_verified=true，冻结 case 与基线一致。
 
 适用 pre-commit 检查全部通过，日志 `outputs/spmd-protocol-precommit-20261025.log`；
 未跳过 clang-format、clang-tidy、cpplint 或文档检查。此后只补充本段验收记录，未改变已测源码。
+
+## 2026-10-25：block 与 GM 组协议事件接线
+
+起点 `60e0e37e7` 已详细中文提交、未 push；提交后重编成功，binding commit 与 HEAD 一致，
+三个 runtime SHA256 均与 `csa-hbg-l4-oktn_ne5` 的通过产物相同。本节继续完整协议采集，
+Host 生产入口仍未启用协议区，既有执行身份不能替代这里尚未完成的设备事件验收。
+
+真实 cursor CAS 成功后记录领取前／后时间和唯一 owner；失败重试及 EXHAUSTED 不生成事件。
+时间在实际 CAS 两侧读取，序号只在成功领取后分配，不为失败尝试制造序号洞。
+block 完成记录真实 completed_blocks 原子的返回票号，不能用 block_idx 充当完成顺序。
+纯 C/V 使用确切 slot 的 block，GM 使用 AIC 当前组的 block；记录区越界仅留下诊断错误，
+不越界写入，不篡改正常调度计数。
+
+GM 发布前后包住 descriptor 写回和 published_seq 原子发布。
+AIC 记录自己发布后的 descriptor 就绪，AIV 在实际观察、校验 descriptor 后记录就绪；
+各 lane 保存实际 descriptor 的 epoch/task/order/group/block/cluster/N/mask/placement，
+不是从最终 kernel 数量还原。arrive/release 各记录实际原子发布的前后区间。
+全体 ack 检查保存实际三次关键读的数值以及观察事件；旧值或未来值导致等待／错误时，
+不生成“收齐”证据。相同有效 ack 被重复检查不重复生成事件。
+
+为了保留独立的 descriptor／ack 观察点和三条原始 ack，lane 诊断记录由 128B 增为 256B，
+整个 block 记录由 640B 增为 1024B；owner 复用原预留区，仍为 192B。
+各写者依然分开 cache line，block 记录仍按实际 trace 索引空间一次性预分配，
+没有每核全图副本、全局 trace 原子计数器或 Scalar 内存分配。
+记录区尚未对外导出，因此没有把旧捕获按新布局强行解析；Host 和设备须一起重编。
+
+最初 6 项新增检查实际 RED（纯 C/V 两项、四种 Mix mask 各一项），接线后转绿。
+后续补充旧 ack／跨组复用、不同 cluster 相同 group_seq、UINT64_MAX−1 组序号、
+重复发布保护、越界 trace prefix、并发 cursor 的唯一 owner 和连续局部序号。
+并发测试只验证真实 cursor 原语，不把直接批量调用 cursor 当作两个 payload 槽的完整执行循环。
+已有未来 arrive/release ack 两项测试也开启采集并断言没有伪造成功观察点。
+
+相关 16 个 C++ targets 首轮通过 582 项；追加并发检查后 ordered target 为 46 项通过。
+日志 `outputs/spmd-protocol-block-red-20261025.log`、`outputs/spmd-protocol-block-all-cpp-20261025.log`、
+`outputs/spmd-protocol-block-concurrent-20261025.log`。
+runtime 重编通过，日志 `outputs/spmd-protocol-block-runtime-build-20261025.log`。
+下一步仍是 kernel 入口／返回／输出可见／退役、TaskDone 和普通 entry permit，
+然后完成 Host 导出与严格因果审计；不以本节的结构和 CPU 测试宣布完整协议验收。
+
+追加并发 cursor 检查后，最终 16 个 C++ targets 共 583 项通过，相对 `60e0e37e7` 新增 12 项，
+日志 `outputs/spmd-protocol-block-final-cpp-20261025.log`；Python 1766 项通过，
+日志 `outputs/spmd-protocol-block-python-20261025.log`。
+HBG 仿真 42 passed、378 deselected（54.05 秒），A5 60 passed、4 skipped、356 deselected
+（153.27 秒），日志 `outputs/spmd-protocol-block-hbg-sim-20261025.log` 和
+`outputs/spmd-protocol-block-native-20261025/hbg.log`。仍显式排除双卡 TMR 误收集项。
+原样 CSA 严格 L4 `outputs/csa-hbg-l4-_x6yab27/result.json` 通过两轮各七项 golden、
+2308 条身份、133 条依赖边，producer=aicore、block_identity_verified=true，冻结 case 未改。
+架构仍由 CANN query 确认 Ascend950PR_958b；依用户要求直接使用本机设备 0。
+这些 native 结果是新增协议区未启用时的回归证据，新增事件值目前由真实 C++ helper 检查，
+不能据此宣布 GM 协议事件已经完成 A5 采集验收。
+
+后续接入 completion 事件时还须区分实际代码中的 block 计数贡献、槽清理、trace 发布：
+纯 C/V 当前先贡献 completed_blocks，再清理本核槽和发布 trace，最后推进逻辑完成。
+不能把这些不同位置伪装成同一个时间点；native 审计必须利用实际票号、发布区间和可见性链，
+不能为了满足参考模型的单一全局时间顺序而补造事件，或引入等待所有核 trace 收尾的全局屏障。
+
+适用 pre-commit 检查全部通过，日志 `outputs/spmd-protocol-block-precommit-20261025.log`。
+本次阶段提交包含上述 block／GM 接线及 12 项新增检查，不包含输出产物或用户未跟踪内容，
+不启用 Host 协议区，不新增用户配置开关，不 push。后续 kernel／TaskDone 接线仍须完成。

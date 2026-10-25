@@ -805,7 +805,7 @@ INSTANTIATE_TEST_SUITE_P(
 );
 
 TEST(HbgGmMix, FutureArrivedAcknowledgementIsRejectedInsteadOfSatisfyingTheBarrier) {
-    GmMixFixture fixture({{1, 7}});
+    GmMixFixture fixture({{1, 7}}, true);
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
     ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
@@ -819,10 +819,14 @@ TEST(HbgGmMix, FutureArrivedAcknowledgementIsRejectedInsteadOfSatisfyingTheBarri
     EXPECT_FALSE(fixture.prepare(0, &progress));
     EXPECT_EQ(fixture.locals[0]->local_ready_mask, 0u);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 0u);
+    const auto *record =
+        scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
+    EXPECT_EQ(record->lanes[0].arrivals_observed.sequence, 0u);
+    EXPECT_EQ(record->owner.completion_before.sequence, 0u);
 }
 
 TEST(HbgGmMix, FutureReleasedAcknowledgementIsRejectedBeforeBlockContribution) {
-    GmMixFixture fixture({{1, 7}});
+    GmMixFixture fixture({{1, 7}}, true);
     ASSERT_TRUE(fixture.admit(0));
     ASSERT_TRUE(fixture.refresh_all());
     ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
@@ -832,6 +836,11 @@ TEST(HbgGmMix, FutureReleasedAcknowledgementIsRejectedBeforeBlockContribution) {
     scheduler_gm_store(fixture.mailbox(0)->lanes[2].released_seq, UINT64_C(2));
     EXPECT_EQ(fixture.retire(0), SchedulerGmMixResult::ERROR);
     EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(0)->completed_blocks, UINT64_C(0)), 0u);
+    const auto *record =
+        scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
+    EXPECT_EQ(record->owner.releases_observed.sequence, 0u);
+    EXPECT_EQ(record->owner.completion_before.sequence, 0u);
+    EXPECT_NE(record->lanes[2].release_after.sequence, 0u);
 }
 
 TEST(HbgGmMix, WrongRetainedSealCannotAdvanceALateVectorFrontier) {
@@ -1009,5 +1018,215 @@ TEST_P(HbgGmMixOwnPrepare, HasMixDoesNotRequireSsbufForAnOwnPayloadPreparation) 
 }
 
 INSTANTIATE_TEST_SUITE_P(PureAndMixedPayloads, HbgGmMixOwnPrepare, ::testing::Values<uint8_t>(1, 2, 3, 5, 6, 7));
+
+class HbgGmProtocolEvents : public ::testing::TestWithParam<uint8_t> {};
+
+TEST_P(HbgGmProtocolEvents, CapturesPublicationDescriptorActualAcksAndUniqueBlockCompletion) {
+    const uint8_t mask = GetParam();
+    GmMixFixture fixture({{1, mask}}, true);
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    auto *blocks =
+        scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
+    auto &record = blocks[0];
+    ASSERT_NE(record.owner.claim_after.sequence, 0u);
+    EXPECT_EQ(record.owner.publish_before.sequence, 0u);
+    EXPECT_EQ(record.lanes[1].descriptor_ready.sequence, 0u);
+    bool progress = true;
+    ASSERT_TRUE(fixture.observe(1, &progress));
+    EXPECT_FALSE(progress);
+    ASSERT_TRUE(fixture.publish(0));
+    EXPECT_GT(record.owner.publish_before.sequence, record.owner.claim_after.sequence);
+    EXPECT_GT(record.owner.publish_after.sequence, record.owner.publish_before.sequence);
+    EXPECT_EQ(record.owner.group_seq, 1u);
+    EXPECT_EQ(record.owner.active_mask, mask);
+    EXPECT_EQ(record.owner.logical_block_num, 1u);
+    EXPECT_GT(record.lanes[0].descriptor_ready.sequence, record.owner.publish_after.sequence);
+    EXPECT_EQ(record.lanes[1].descriptor_ready.sequence, 0u);
+    ASSERT_TRUE(fixture.rendezvous(0));
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        const auto &event = record.lanes[lane];
+        EXPECT_EQ(event.worker_index, lane);
+        EXPECT_EQ(event.lane, lane);
+        EXPECT_EQ(event.run_epoch, 47u);
+        EXPECT_EQ(event.group_seq, 1u);
+        EXPECT_EQ(event.active_mask, mask);
+        EXPECT_EQ(event.resource_mask, 7u);
+        EXPECT_EQ(event.logical_block_num, 1u);
+        EXPECT_GT(event.arrive_before.sequence, event.descriptor_ready.sequence);
+        EXPECT_GT(event.arrive_after.sequence, event.arrive_before.sequence);
+        EXPECT_GT(event.arrivals_observed.sequence, event.arrive_after.sequence);
+        for (uint32_t peer = 0; peer < 3; ++peer) {
+            EXPECT_EQ(event.arrived_seq[peer], 1u);
+            EXPECT_EQ(event.lane_subtasks[peer], (mask & (1U << peer)) != 0 ? peer : UINT8_MAX);
+        }
+        if ((mask & (1U << lane)) != 0) EXPECT_EQ(event.release_before.sequence, 0u);
+        else EXPECT_GT(event.release_before.sequence, event.arrivals_observed.sequence);
+    }
+    EXPECT_EQ(fixture.retire(0), SchedulerGmMixResult::WAIT);
+    EXPECT_EQ(record.owner.releases_observed.sequence, 0u);
+    EXPECT_EQ(record.owner.completion_before.sequence, 0u);
+    ASSERT_TRUE(fixture.finish_lanes(0));
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        EXPECT_GT(record.lanes[lane].release_after.sequence, record.lanes[lane].release_before.sequence);
+        EXPECT_EQ(record.owner.released_seq[lane], 1u);
+    }
+    EXPECT_GT(record.owner.releases_observed.sequence, record.lanes[0].release_after.sequence);
+    EXPECT_GT(record.owner.completion_before.sequence, record.owner.releases_observed.sequence);
+    EXPECT_GT(record.owner.completion_after.sequence, record.owner.completion_before.sequence);
+    EXPECT_EQ(record.owner.completion_ticket, 0u);
+    EXPECT_EQ(record.owner.worker_index, 0u);
+    EXPECT_EQ(blocks[1].owner.claim_after.sequence, 0u);
+    const auto *workers = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        EXPECT_EQ(workers[lane].error_flags, 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(AllMixMasks, HbgGmProtocolEvents, ::testing::Values<uint8_t>(3, 5, 6, 7));
+
+TEST(HbgGmMixProtocol, OldAcksCannotCreateNewGroupEvidenceAndMailboxReuseKeepsEarlierRecords) {
+    GmMixFixture fixture({{2, 7}}, true);
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.publish(0));
+    ASSERT_TRUE(fixture.rendezvous(0));
+    ASSERT_TRUE(fixture.finish_lanes(0));
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::PROGRESS);
+    auto *blocks =
+        scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
+    const auto first = blocks[0];
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.publish(0));
+    bool progress = false;
+    for (uint32_t lane : {1u, 2u})
+        ASSERT_TRUE(fixture.observe(lane, &progress));
+    ASSERT_TRUE(fixture.arrive(0, &progress));
+    ASSERT_TRUE(fixture.prepare(0, &progress));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(blocks[3].lanes[0].arrivals_observed.sequence, 0u);
+    EXPECT_EQ(blocks[3].lanes[0].release_before.sequence, 0u);
+    for (uint32_t lane : {1u, 2u})
+        ASSERT_TRUE(fixture.arrive(lane, &progress));
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        ASSERT_TRUE(fixture.prepare(lane, &progress));
+    const uint64_t checked_sequence = blocks[3].lanes[0].arrivals_observed.sequence;
+    ASSERT_NE(checked_sequence, 0u);
+    bool all = false;
+    ASSERT_TRUE(scheduler_gm_mix_check_acks(
+        fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), false, &all
+    ));
+    EXPECT_TRUE(all);
+    EXPECT_EQ(blocks[3].lanes[0].arrivals_observed.sequence, checked_sequence);
+    for (uint32_t lane = 0; lane < 3; ++lane)
+        for (uint32_t peer = 0; peer < 3; ++peer)
+            EXPECT_EQ(blocks[3].lanes[lane].arrived_seq[peer], 2u);
+    for (uint32_t lane : {0u, 1u}) {
+        GmExecution execution{};
+        ASSERT_TRUE(fixture.begin(lane, &execution));
+        ASSERT_TRUE(fixture.complete(execution));
+    }
+    EXPECT_EQ(fixture.retire(0), SchedulerGmMixResult::WAIT);
+    EXPECT_EQ(blocks[3].owner.releases_observed.sequence, 0u);
+    EXPECT_EQ(blocks[3].owner.completion_before.sequence, 0u);
+    GmExecution last{};
+    ASSERT_TRUE(fixture.begin(2, &last));
+    ASSERT_TRUE(fixture.complete(last));
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
+    for (uint32_t peer = 0; peer < 3; ++peer)
+        EXPECT_EQ(blocks[3].owner.released_seq[peer], 2u);
+    EXPECT_EQ(blocks[3].owner.completion_ticket, 1u);
+    EXPECT_EQ(blocks[0].owner.claim_before.sequence, first.owner.claim_before.sequence);
+    EXPECT_EQ(blocks[0].owner.completion_after.sequence, first.owner.completion_after.sequence);
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        EXPECT_EQ(blocks[0].lanes[lane].descriptor_ready.sequence, first.lanes[lane].descriptor_ready.sequence);
+        EXPECT_EQ(blocks[0].lanes[lane].release_after.sequence, first.lanes[lane].release_after.sequence);
+        EXPECT_EQ(blocks[0].lanes[lane].group_seq, 1u);
+    }
+}
+
+TEST(HbgGmMixProtocol, SameSequenceInDifferentClustersDoesNotAliasBlockOrLaneRecords) {
+    GmMixFixture fixture({{2, 6}}, true);
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    for (uint32_t cluster = 0; cluster < 2; ++cluster) {
+        ASSERT_EQ(fixture.claim(cluster), SchedulerBlockClaimResult::CLAIMED);
+        ASSERT_TRUE(fixture.publish(cluster));
+        ASSERT_TRUE(fixture.rendezvous(cluster));
+    }
+    const auto *blocks =
+        scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
+    for (uint32_t cluster = 0; cluster < 2; ++cluster) {
+        ASSERT_TRUE(fixture.finish_lanes(cluster));
+        ASSERT_EQ(
+            fixture.retire(cluster), cluster == 0 ? SchedulerGmMixResult::PROGRESS : SchedulerGmMixResult::TASK_LAST
+        );
+        const auto &record = blocks[cluster * 2];
+        EXPECT_EQ(record.owner.cluster_index, cluster);
+        EXPECT_EQ(record.owner.worker_index, cluster * 3);
+        EXPECT_EQ(record.owner.block_idx, cluster);
+        EXPECT_EQ(record.owner.group_seq, 1u);
+        EXPECT_EQ(record.owner.completion_ticket, cluster);
+        for (uint32_t lane = 0; lane < 3; ++lane) {
+            EXPECT_EQ(record.lanes[lane].worker_index, cluster * 3 + lane);
+            EXPECT_EQ(record.lanes[lane].cluster_index, cluster);
+            EXPECT_EQ(record.lanes[lane].block_idx, cluster);
+            EXPECT_EQ(record.lanes[lane].group_seq, 1u);
+            EXPECT_NE(record.lanes[lane].release_after.sequence, 0u);
+        }
+    }
+    EXPECT_EQ(blocks[1].owner.claim_after.sequence, 0u);
+}
+
+TEST(HbgGmMixProtocol, FullWidthGroupSequenceIsPreservedInObservedAckValues) {
+    GmMixFixture fixture({{1, 7}}, true);
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    const uint64_t previous = UINT64_MAX - 2;
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        fixture.admissions[lane].gm_mix.group_seq = previous;
+        scheduler_gm_store(fixture.mailbox(0)->lanes[lane].arrived_seq, previous);
+        scheduler_gm_store(fixture.mailbox(0)->lanes[lane].released_seq, previous);
+    }
+    scheduler_gm_store(fixture.mailbox(0)->published_seq, previous);
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.publish(0));
+    ASSERT_TRUE(fixture.rendezvous(0));
+    ASSERT_TRUE(fixture.finish_lanes(0));
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
+    const auto *record =
+        scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
+    EXPECT_EQ(record->owner.group_seq, UINT64_MAX - 1);
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        EXPECT_EQ(record->owner.released_seq[lane], UINT64_MAX - 1);
+        EXPECT_EQ(record->lanes[lane].group_seq, UINT64_MAX - 1);
+        for (uint32_t peer = 0; peer < 3; ++peer)
+            EXPECT_EQ(record->lanes[lane].arrived_seq[peer], UINT64_MAX - 1);
+    }
+}
+
+TEST(HbgGmMixProtocol, ReplayedPublicationCannotOverwriteItsFirstInterval) {
+    GmMixFixture fixture({{1, 7}}, true);
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.publish(0));
+    const auto *record =
+        scheduler_state_at<SchedulerProtocolBlockTrace>(fixture.base(), fixture.storage.layout.protocol.blocks_offset);
+    const auto first = record->owner;
+    scheduler_protocol_group_publish(fixture.base(), fixture.locals[0], true);
+    scheduler_protocol_group_publish(fixture.base(), fixture.locals[0], false);
+    EXPECT_EQ(record->owner.publish_before.sequence, first.publish_before.sequence);
+    EXPECT_EQ(record->owner.publish_after.sequence, first.publish_after.sequence);
+    EXPECT_EQ(record->owner.group_seq, first.group_seq);
+    const auto *worker = scheduler_state_at<SchedulerProtocolWorkerTrace>(
+        fixture.base(), fixture.storage.layout.protocol.workers_offset
+    );
+    EXPECT_EQ(worker->error_flags, SCHEDULER_PROTOCOL_DUPLICATE);
+}
 
 }  // namespace

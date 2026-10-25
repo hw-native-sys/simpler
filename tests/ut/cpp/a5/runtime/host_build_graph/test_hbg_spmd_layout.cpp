@@ -857,7 +857,7 @@ TEST(HbgProtocolTrace, PreservesRunAndTraceWireSizesAndSeparatesConcurrentWriter
     EXPECT_EQ(offsetof(SchedulerGraphSummary, protocol_layout_offset), 96u);
     EXPECT_EQ(offsetof(SchedulerProtocolTaskTrace, completion), 64u);
     EXPECT_EQ(offsetof(SchedulerProtocolBlockTrace, lanes), 256u);
-    EXPECT_EQ(sizeof(SchedulerProtocolLaneTrace), 128u);
+    EXPECT_EQ(sizeof(SchedulerProtocolLaneTrace), 256u);
 }
 
 TEST(HbgProtocolTrace, RetainedResetErasesAllEvidenceAndBindsTheLiteralNewEpoch) {

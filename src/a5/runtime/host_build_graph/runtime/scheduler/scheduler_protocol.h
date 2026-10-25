@@ -94,9 +94,9 @@ inline __aicore__ void scheduler_protocol_fail(
     scheduler_publish_cache_line(worker);
 }
 
-inline __aicore__ bool scheduler_protocol_stamp(
+inline __aicore__ bool scheduler_protocol_stamp_at(
     __gm__ void *base, const SchedulerLocalState *local, __gm__ const SchedulerProtocolLayout *layout,
-    __gm__ SchedulerProtocolStamp *stamp
+    __gm__ SchedulerProtocolStamp *stamp, uint64_t cycles
 ) {
     auto *worker = scheduler_protocol_worker_at(base, local, layout);
     if (stamp->sequence != 0) {
@@ -112,10 +112,39 @@ inline __aicore__ bool scheduler_protocol_stamp(
         scheduler_protocol_fail(base, local, layout, SCHEDULER_PROTOCOL_SEQUENCE_OVERFLOW);
         return false;
     }
-    stamp->cycles = scheduler_cycles();
+    stamp->cycles = cycles;
     stamp->sequence = sequence + 1;
     worker->next_sequence = sequence + 1;
     return true;
+}
+
+inline __aicore__ bool scheduler_protocol_stamp(
+    __gm__ void *base, const SchedulerLocalState *local, __gm__ const SchedulerProtocolLayout *layout,
+    __gm__ SchedulerProtocolStamp *stamp
+) {
+    return scheduler_protocol_stamp_at(base, local, layout, stamp, scheduler_cycles());
+}
+
+inline __aicore__ bool scheduler_protocol_enabled(const SchedulerLocalState *local) {
+    return local != nullptr && local->profiling != nullptr && local->profiling->protocol_layout_offset != 0;
+}
+
+inline __aicore__ uint64_t scheduler_protocol_cycles(const SchedulerLocalState *local) {
+    return scheduler_protocol_enabled(local) ? scheduler_cycles() : 0;
+}
+
+template <typename T>
+inline __aicore__ void scheduler_protocol_publish_record(__gm__ T *record) {
+    for (uint64_t offset = 0; offset < sizeof(T); offset += 64)
+        scheduler_writeback_cache_line(reinterpret_cast<__gm__ uint8_t *>(record) + offset);
+    scheduler_cache_barrier();
+}
+
+template <typename T>
+inline __aicore__ void scheduler_protocol_observe_record(__gm__ T *record) {
+    for (uint64_t offset = 0; offset < sizeof(T); offset += 64)
+        scheduler_invalidate_cache_line(reinterpret_cast<__gm__ uint8_t *>(record) + offset);
+    scheduler_cache_barrier();
 }
 
 inline __aicore__ void scheduler_protocol_admission(

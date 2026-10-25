@@ -175,6 +175,7 @@ inline __aicore__ bool scheduler_gm_mix_publish(
         );
     auto *mailbox = scheduler_gm_mix_mailbox(base, local);
     auto *descriptor = &mailbox->descriptor;
+    scheduler_protocol_group_publish(base, local, true);
     descriptor->run_epoch = admission.epoch;
     descriptor->task_ref = admission.current_task_ref;
     descriptor->order_key = admission.scan_cursor;
@@ -194,8 +195,10 @@ inline __aicore__ bool scheduler_gm_mix_publish(
         scheduler_writeback_cache_line(reinterpret_cast<__gm__ uint8_t *>(descriptor) + offset);
     scheduler_cache_barrier();
     scheduler_gm_store(mailbox->published_seq, group.group_seq);
+    scheduler_protocol_group_publish(base, local, false);
     group.task_last_seq = group.group_seq;
     group.phase = SchedulerGmMixPhase::PUBLISHED;
+    scheduler_protocol_group_descriptor(base, local, descriptor);
     return true;
 }
 
@@ -244,6 +247,7 @@ inline __aicore__ bool scheduler_gm_mix_observe(
     group.slot_index = UINT8_MAX;
     group.slot_generation = 0;
     group.phase = SchedulerGmMixPhase::PUBLISHED;
+    scheduler_protocol_group_descriptor(base, local, descriptor);
     *progress = true;
     return true;
 }
@@ -260,8 +264,10 @@ inline __aicore__ bool scheduler_gm_mix_arrive(
     for (const auto &slot : local->slots)
         if (slot.state != SchedulerDispatchSlotState::FREE) return true;
     auto *mailbox = scheduler_gm_mix_mailbox(base, local);
+    scheduler_protocol_lane_publication(base, local, false, true);
     scheduler_cache_barrier();
     scheduler_gm_store(mailbox->lanes[local->config.self_lane].arrived_seq, group.group_seq);
+    scheduler_protocol_lane_publication(base, local, false, false);
     group.phase = SchedulerGmMixPhase::ARRIVED;
     *progress = true;
     return true;
@@ -274,10 +280,13 @@ inline __aicore__ bool scheduler_gm_mix_check_acks(
     *all = false;
     auto *mailbox = scheduler_gm_mix_mailbox(base, local);
     const uint64_t seq = local->admission->gm_mix.group_seq;
+    const bool record = scheduler_protocol_enabled(local);
+    uint64_t observations[PLATFORM_CORES_PER_BLOCKDIM];
     for (uint8_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
         auto &value = releases ? mailbox->lanes[lane].released_seq : mailbox->lanes[lane].arrived_seq;
         if (scheduler_gm_query(value) < seq) return true;
         const uint64_t observed = scheduler_gm_fetch_add(value, UINT64_C(0));
+        if (record) observations[lane] = observed;
         if (observed < seq) return true;
         if (observed != seq)
             return scheduler_admission_fail(
@@ -285,15 +294,18 @@ inline __aicore__ bool scheduler_gm_mix_check_acks(
             );
     }
     *all = true;
+    if (record) scheduler_protocol_group_acks(base, local, releases, observations);
     return true;
 }
 
 inline __aicore__ void scheduler_gm_mix_publish_release(__gm__ void *base, SchedulerLocalState *local) {
     auto &group = local->admission->gm_mix;
+    scheduler_protocol_lane_publication(base, local, true, true);
     scheduler_cache_barrier();
     scheduler_gm_store(
         scheduler_gm_mix_mailbox(base, local)->lanes[local->config.self_lane].released_seq, group.group_seq
     );
+    scheduler_protocol_lane_publication(base, local, true, false);
     group.phase = SchedulerGmMixPhase::RELEASED;
 }
 

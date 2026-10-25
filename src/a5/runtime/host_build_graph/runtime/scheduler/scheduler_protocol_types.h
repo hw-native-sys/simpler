@@ -93,8 +93,11 @@ struct alignas(64) SchedulerProtocolBlockOwner {
     uint32_t worker_index;
     uint32_t block_idx;
     uint32_t cluster_index;
-    uint32_t flags;
-    uint64_t reserved[5];
+    uint16_t logical_block_num;
+    uint8_t active_mask;
+    uint8_t flags;
+    SchedulerProtocolStamp releases_observed;
+    uint64_t released_seq[3];
 };
 
 struct alignas(128) SchedulerProtocolLaneTrace {
@@ -112,7 +115,13 @@ struct alignas(128) SchedulerProtocolLaneTrace {
     uint32_t lane;
     uint32_t active_mask;
     uint32_t flags;
-    uint64_t reserved;
+    uint64_t arrived_seq[3];
+    SchedulerProtocolStamp descriptor_ready;
+    SchedulerProtocolStamp arrivals_observed;
+    uint32_t logical_block_num;
+    uint32_t resource_mask;
+    uint8_t lane_subtasks[3];
+    uint8_t reserved[5];
 };
 
 struct alignas(128) SchedulerProtocolBlockTrace {
@@ -139,7 +148,7 @@ struct alignas(128) SchedulerProtocolExecutionTrace {
     uint64_t group_seq;
 };
 
-// One worker owns this whole line; no global event counter participates in scheduling.
+// One worker owns this record; no global event counter participates in scheduling.
 struct alignas(128) SchedulerProtocolWorkerTrace {
     uint64_t run_epoch;
     uint64_t worker_index;
@@ -156,9 +165,9 @@ static_assert(sizeof(SchedulerProtocolTaskTrace) == 128);
 static_assert(offsetof(SchedulerProtocolTaskTrace, completion) == 64);
 static_assert(sizeof(SchedulerProtocolMemberTrace) == 128);
 static_assert(sizeof(SchedulerProtocolBlockOwner) == 192);
-static_assert(sizeof(SchedulerProtocolLaneTrace) == 128);
+static_assert(sizeof(SchedulerProtocolLaneTrace) == 256);
 static_assert(offsetof(SchedulerProtocolBlockTrace, lanes) == 256);
-static_assert(sizeof(SchedulerProtocolBlockTrace) == 640);
+static_assert(sizeof(SchedulerProtocolBlockTrace) == 1024);
 static_assert(sizeof(SchedulerProtocolExecutionTrace) == 128);
 static_assert(sizeof(SchedulerProtocolWorkerTrace) == 128);
 static_assert(

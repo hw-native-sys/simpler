@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "scheduler_protocol.h"
+#include "scheduler_protocol_block.h"
 
 enum class SchedulerAdmissionResult : uint8_t { PROGRESS, RETRY, ERROR };
 
@@ -485,9 +485,11 @@ inline __aicore__ SchedulerBlockClaimResult scheduler_claim_ordered_cursor(
                 return SchedulerBlockClaimResult::ERROR;
             }
         }
+        const uint64_t claim_start = scheduler_protocol_cycles(local);
         const uint64_t previous = scheduler_gm_compare_exchange(control->next_block, observed, observed + 1);
         if (previous == observed) {
             *block_idx = static_cast<uint32_t>(observed);
+            scheduler_protocol_block_claim(base, local, *block_idx, claim_start, scheduler_protocol_cycles(local));
             return SchedulerBlockClaimResult::CLAIMED;
         }
         observed = previous;
@@ -542,8 +544,13 @@ inline __aicore__ SchedulerBlockFinishResult scheduler_contribute_ordered_block(
         return SchedulerBlockFinishResult::ERROR;
     }
     auto *control = scheduler_task_control_at(base, local, task);
+    const uint32_t block = slot != nullptr                                 ? slot->block_idx :
+                           scheduler_task_is_mix(admission->current_flags) ? admission->gm_mix.block_idx :
+                                                                             UINT32_MAX;
+    scheduler_protocol_block_complete(base, local, block, true, UINT64_MAX);
     scheduler_cache_barrier();
     const uint64_t previous = scheduler_gm_fetch_add(control->completed_blocks, UINT64_C(1));
+    scheduler_protocol_block_complete(base, local, block, false, previous);
     if (previous >= admission->current_block_num) {
         scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::BLOCK_COMPLETION_INVALID, slot);
         return SchedulerBlockFinishResult::ERROR;
