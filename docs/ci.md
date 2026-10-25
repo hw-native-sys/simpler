@@ -308,12 +308,20 @@ discovered and included by Daily without another workflow edit.
 The dedicated environment uses `--system-site-packages` and installs local,
 pinned wheels for CPU Torch 2.7.1 and torch_npu 2.7.1.post4. The pins constrain
 subsequent test/SDK installation too. The profile selects an already installed
-CANN 9.0.0 toolkit by its actual manifest, preferring an active exact match.
-The selected `set_env.sh` is used for installation, compilation and inside the
-exclusive task; the system default symlink is not changed. If no matching
-installation exists, setup fails with the inspected toolkit inventory. Its
-active manifest must still say 9.0.0, matching the [Ascend compatibility table](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md).
-Unknown or different versions, missing dependencies, and failed imports are
+toolkit by its actual manifest and host architecture. The exact qualified pairs
+are CANN 9.0.0 on `aarch64` and `x86_64`, plus CANN 9.2.0-beta.2 on `aarch64`.
+The 9.0 pair follows the [Ascend compatibility table](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md).
+The 9.2 beta pair passed the [ARM64 A3 framework experiment](https://github.com/hw-native-sys/simpler/actions/runs/40190729557/job/121165491940)
+with these unchanged Torch pins; 9.2 on x86_64 is not yet qualified.
+This does not admit arbitrary 9.x releases.
+
+An already active qualified toolkit is preferred. Otherwise setup scans its
+existing roots in deterministic order, without using directory names as version
+claims. The selected `set_env.sh` is used for installation, compilation and inside
+the exclusive task; the system default symlink is not changed. If no qualified
+installation exists, setup fails with the inspected toolkit inventory and allowed
+version/architecture pairs. Preflight checks the actual active manifest against
+the same rule. Unknown versions, missing dependencies, and failed imports are
 errors rather than skipped qualification. Runner labels alone do not establish
 this compatibility. Setup prints Python, host architecture, CANN manifest,
 distribution versions and module locations; backend imports happen inside the

@@ -242,10 +242,19 @@ def passing_receipt(tmp_path_factory):
         "source",
         "environment",
         "classname",
+        "plan_identity",
     ],
 )
 def test_real_verifier_rejects_corrupted_actual_junit(tmp_path, passing_receipt, change):
     plan, xml = passing_receipt
+    if change == "plan_identity":
+        changed_plan = json.loads(plan.read_text())
+        changed_plan["identity"]["cann"] = {"version": "unqualified"}
+        mutated_plan = tmp_path / "mutated.plan.json"
+        mutated_plan.write_text(json.dumps(changed_plan))
+        with pytest.raises(ValueError, match="wrong source, environment or plan"):
+            test_environments.verify_results(mutated_plan, xml)
+        return
     tree = ET.parse(xml)
     suite = next(tree.getroot().iter("testsuite"))
     cases = list(suite.iter("testcase"))
@@ -393,6 +402,7 @@ def pytest_configure(config):
 
 
 def test_actual_preflight_checks_metadata_without_importing_backends(tmp_path, monkeypatch):
+    monkeypatch.setattr(test_environments.platform, "machine", lambda: "aarch64")
     requirements = test_environments.requirements("torch_npu")
     home = tmp_path / "cann"
     home.mkdir()
@@ -494,7 +504,7 @@ def pytest_configure(config):
 
 
 def _installed_toolchain(home, version, *, nested=False, script=True):
-    manifest_home = home / f"{os.uname().machine}-linux" if nested else home
+    manifest_home = home / f"{test_environments.platform.machine()}-linux" if nested else home
     manifest_home.mkdir(parents=True)
     (manifest_home / "ascend_toolkit_install.info").write_text(f"version={version}\n")
     if script:
@@ -503,6 +513,7 @@ def _installed_toolchain(home, version, *, nested=False, script=True):
 
 
 def test_toolchain_selection_uses_installed_manifest_and_deduplicates_aliases(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(test_environments.platform, "machine", lambda: "aarch64")
     root = tmp_path / "Ascend"
     active = root / "cann-beta"
     _installed_toolchain(active, "9.2.0-beta.1")
@@ -519,6 +530,7 @@ def test_toolchain_selection_uses_installed_manifest_and_deduplicates_aliases(tm
 
 
 def test_toolchain_selection_preserves_an_exact_active_toolkit(tmp_path, monkeypatch):
+    monkeypatch.setattr(test_environments.platform, "machine", lambda: "aarch64")
     root = tmp_path / "Ascend"
     _installed_toolchain(root / "cann-first", "9.0.0")
     active = tmp_path / "active-toolkit"
@@ -531,11 +543,101 @@ def test_toolchain_selection_preserves_an_exact_active_toolkit(tmp_path, monkeyp
 
 @pytest.mark.parametrize("version,script", [("9.2.0-beta.1", True), ("9.0.0", False)])
 def test_toolchain_selection_refuses_incompatible_or_incomplete_installation(tmp_path, monkeypatch, version, script):
+    monkeypatch.setattr(test_environments.platform, "machine", lambda: "aarch64")
     root = tmp_path / "Ascend"
     active = root / "ascend-toolkit" / "9.0.0"
     _installed_toolchain(active, version, script=script)
     monkeypatch.setattr(test_environments, "_ASCEND_ROOT", root)
     monkeypatch.setenv("ASCEND_HOME_PATH", str(active))
 
-    with pytest.raises(ValueError, match=r"No installed CANN 9\.0\.0 with set_env\.sh"):
+    with pytest.raises(ValueError, match=r"No installed qualified CANN with set_env\.sh"):
         test_environments.select_toolchain("torch_npu")
+
+
+@pytest.mark.parametrize(
+    "version,machine,qualified",
+    [
+        ("9.0.0", "aarch64", True),
+        ("9.0.0", "x86_64", True),
+        ("9.2.0-beta.2", "aarch64", True),
+        ("9.2.0-beta.2", "x86_64", False),
+        ("9.2.0-beta.1", "aarch64", False),
+        ("9.2.0", "aarch64", False),
+        ("9.3.0", "aarch64", False),
+    ],
+)
+def test_toolchain_qualification_matches_selection_and_preflight(
+    tmp_path, monkeypatch, capsys, version, machine, qualified
+):
+    home = tmp_path / "misleading-name-9.0.0"
+    expected = _installed_toolchain(home, version)
+    monkeypatch.setattr(test_environments.platform, "machine", lambda: machine)
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(home))
+    real_import = builtins.__import__
+
+    def without_framework(name, *args, **kwargs):
+        assert name.split(".")[0] not in {"torch", "torch_npu"}
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_framework)
+    if qualified:
+        assert test_environments.select_toolchain("torch_npu", roots=[]) == expected
+        record = test_environments.preflight("torch_npu", packages=False)
+        assert record["cann"]["version"] == version
+        assert record["machine"] == machine
+    else:
+        with pytest.raises(ValueError, match="No installed qualified CANN"):
+            test_environments.select_toolchain("torch_npu", roots=[])
+        with pytest.raises(ValueError, match="not qualified"):
+            test_environments.preflight("torch_npu", packages=False)
+    inventory = json.loads(capsys.readouterr().out.removeprefix("TEST_ENVIRONMENT_TOOLCHAINS "))
+    assert inventory["installed"][0]["version"] == version
+    assert inventory["machine"] == machine
+
+
+@pytest.mark.parametrize("active_version,fallback_version", [("9.0.0", "9.2.0-beta.2"), ("9.2.0-beta.2", "9.0.0")])
+def test_each_qualified_active_toolchain_precedes_fallback(tmp_path, monkeypatch, active_version, fallback_version):
+    active = tmp_path / "active"
+    expected = _installed_toolchain(active, active_version)
+    fallback = tmp_path / "fallback"
+    _installed_toolchain(fallback, fallback_version)
+    monkeypatch.setattr(test_environments.platform, "machine", lambda: "aarch64")
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(active))
+    assert test_environments.select_toolchain("torch_npu", roots=[fallback]) == expected
+
+
+@pytest.mark.parametrize("machine,active_version", [("aarch64", "9.2.0-beta.1"), ("x86_64", "9.2.0-beta.2")])
+def test_unqualified_active_falls_back_but_preflight_checks_actual_active(
+    tmp_path, monkeypatch, machine, active_version
+):
+    active = tmp_path / "active"
+    _installed_toolchain(active, active_version)
+    fallback = tmp_path / "fallback"
+    expected = _installed_toolchain(fallback, "9.0.0")
+    later = tmp_path / "later"
+    _installed_toolchain(later, "9.0.0")
+    monkeypatch.setattr(test_environments.platform, "machine", lambda: machine)
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(active))
+    assert test_environments.select_toolchain("torch_npu", roots=[fallback, later]) == expected
+    with pytest.raises(ValueError, match="not qualified"):
+        test_environments.preflight("torch_npu", packages=False)
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(expected.parent))
+    assert test_environments.preflight("torch_npu", packages=False)["cann"]["version"] == "9.0.0"
+
+
+def test_final_collection_plan_preserves_preflight_identity(tmp_path):
+    result, plan_path, _ = _run_pytest(tmp_path, _DIRECT.format(count=1))
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(plan_path.read_text())["identity"] == {"environment": "torch_npu", "CPU_contract": True}
+
+
+def test_toolchain_manifest_is_required_by_selection_and_preflight(tmp_path, monkeypatch):
+    home = tmp_path / "cann-9.2.0-beta.2"
+    home.mkdir()
+    (home / "set_env.sh").write_text("# No manifest; the directory name is not qualification.\n")
+    monkeypatch.setattr(test_environments.platform, "machine", lambda: "aarch64")
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(home))
+    with pytest.raises(ValueError, match="No installed qualified CANN"):
+        test_environments.select_toolchain("torch_npu", roots=[])
+    with pytest.raises(ValueError, match="CANN install manifest missing"):
+        test_environments.preflight("torch_npu", packages=False)

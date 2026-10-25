@@ -1,4 +1,5 @@
 # https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md
-# CANN 9.0.0 / PyTorch 2.7.1 / torch_npu 2.7.1.post4
+# PyTorch 2.7.1 / torch_npu 2.7.1.post4; qualified CANN/machine pairs live in
+# simpler_setup/test_environments.py (9.0.0 and ARM64 9.2.0-beta.2).
 torch==2.7.1+cpu
 torch_npu==2.7.1.post4
