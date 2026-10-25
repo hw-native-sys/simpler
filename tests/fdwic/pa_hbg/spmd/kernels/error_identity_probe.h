@@ -11,7 +11,7 @@
 
 #pragma once
 
-#include "record.h"
+#include "execution_record.h"
 #include "scheduler/scheduler_error.h"
 
 static inline __aicore__ void error_identity_probe(__gm__ int64_t *args, uint32_t lane) {

@@ -29,7 +29,7 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 | 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | A5／仿真功能和 L1/L4 逐 block 检查通过 |
 | 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | A5／仿真矩阵、重叠及 TPipe PA 已通过；首错误身份与冷日志已接线 |
 | 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | CSA 数值／2308 显式身份／来源、全协议因果与独立图门禁通过 |
-| 6 | sync_start 不同位置领取和局部跨任务推进 | 两独立满核任务、部分交叠、超容量、早返回不重领 | N>1 已实现，仿真／A5 各 47 项及原生审计通过；N=1 公共契约待确认 |
+| 6 | sync_start 不同位置领取和局部跨任务推进 | 两独立满核任务、部分交叠、超容量、早返回不重领 | N>1 已实现；仿真／A5 各 47 项基础、112 项异构交叠／依赖／分波切换及原生审计通过；N=1 公共契约待确认 |
 | 7 | 性能对比 | 同 kernel／输入／拓扑，无完整插桩运行；诊断运行分开 | 已完成：当前 Device 为基线 11.41 倍；前期 resident 已同量级回退，根因和优化另待验证 |
 
 退出、错误收敛、epoch／generation、Dummy 服务节点随功能交付，不延后处理。
@@ -1637,3 +1637,105 @@ CANN CCEC/LLD 为所装 SDK 的 15.0.5，Host 为 GCC 13.3.0。
 本次主仓改动仅为过程记录与三份状态文档，不改变生产代码；适用 pre-commit 检查全部通过，
 日志 `outputs/spmd-perf-precommit-r3-20261025.log`。表格对齐检查的前两次失败已修正，未绕过钩子。
 阶段提交继续使用详细中文日志，不 push；N=1 公共契约的未决测试仍留本地，未混入本次提交。
+
+## 2026-10-25：异构 sync_start 的原生重叠与依赖验收
+
+起点 `892fe6cac`。上一轮只核对完成度，没有代码推进；本节补最终验收中的直接证据，
+不改公共 N=1 行为，不调整生产调度协议，也不把功能用例的等待时间用于性能结论。
+此前 47 项同步矩阵覆盖同类任务连续执行，原生提前 LocalDone 记录并不能单独证明
+后任务已进入 kernel；新增检查直接观察两个任务的 kernel 原子事件序号。
+
+复用 CLA 的 32 列 plan、显式 fanin、128B 执行记录、原子 entry/return 序号和
+既有 resident 新鲜来源门禁。Host 提交循环提取到共用 cla_submit.h，原三参数入口不变；
+新入口以 Host-only sync_flags 指定每项请求，另用一个 Scalar 指定是否构造可控交错，
+合计四个 Tensor 和一个 Scalar；不给普通任务加入同步语义。
+任务内会合复用同一条有界原子 arrival 检查，5 秒超时写哨兵并失败；
+不依赖跨核 cycle，不改变生产发布原语。真实依赖场景不等待后继；
+独立场景只让尾块有界等待另一任务的首个 entry，其他执行位置先正常返回，
+从而直接检验“局部关闭后进入后任务”而不是依赖有限延迟恰巧产生交叠。
+
+新增 test_sync_ordered_execution.py：每个平台覆盖 mask 1–7 的全部 49 种有序配对，
+各有独立重叠和真实依赖两个场景；再加入 7 种 mask 的同步→普通／普通→同步切换，
+合计每平台 112 项。同步按实际满容量：仿真 C/Mix=8、V=16，A5 C/Mix=32、V=64；
+普通一侧使用容量加一，检查能恢复分波。独立任务不强制 Host 提交顺序，
+但必须观察到执行区间交叠；真实依赖则要求后继进入晚于前驱所有 block 返回，
+并保留逐输出的可见性检查。两类场景都不接受 legacy 回退或重复／缺失身份。
+
+新增验收器的第一轮测试因模块尚未创建而报 FileNotFoundError，
+`outputs/spmd-sync-ordered-oracle-red-20261025.log` 仅是缺入口记录，不是生产行为 RED。
+接通后新旧有序探针 CPU 检查 336 项通过；首轮仿真／A5 各 112 项通过。
+继续审查发现“最终 arrival 数正确”不能证明任务内会合真正等待了所有入口：
+增加保持事件全排列、完整 arrival 与正确输出的早返回反例，原验收器实际 DID NOT RAISE，
+见 `outputs/spmd-sync-ordered-barrier-oracle-red-20261025.log`。
+加严为每个同步任务 max(entry) < min(return) 后，新旧有序探针 337 项通过，
+日志 `outputs/spmd-sync-ordered-oracle-green-r2-20261025.log`；对应两平台矩阵正在重跑。
+
+上板预检脚本缺少 npu-smi，CANN query 实际确认 device 0 为 Ascend950PR_958b、32C/64V；
+沿用用户明确要求直接用卡，不宣称 task-submit 锁隔离。上一提交后的构建已完成，
+binding build_commit 为 892fe6cac，三个 HBG runtime 二进制 SHA256 与已验证 CSA 捕获
+csa-hbg-l4-jrabrt2o 相同。当前只修改测试／探针和过程记录，无生产 runtime 源码变更。
+加严后的原生协议审计、共用探针回归与提交检查结果续记。
+
+加严验收器后的第二轮：A5 112 项通过，仿真 111 项通过、mask1→4 的独立场景
+未产生交叠而失败。失败捕获的原生协议仍通过，仿真统一时钟下两项 kernel 区间为
+63017.687–86108.066 μs 和 87049.650–146433.276 μs，确实没有交叠；
+原样单独复跑通过，但不能据此抹掉批次失败或声称固定忙循环可稳定制造交错。
+因此独立场景改为上述有界同伴 entry 等待，保留所有输出、事件顺序与重叠断言。
+
+可控交错首跑的 Host 接线误用了 scalar(4)：ChipTaskArgs 的 Scalar 下标独立于 Tensor，
+实际应读取 scalar<int64_t>(0)。未初始化槽值导致仿真普通侧没有 entry 计数、
+A5 部分真实依赖场景错误启用同伴等待，均被验收器捕获；这是探针错误，不是生产调度回退。
+仿真批次自然退出；检查 Worker 的 finally/close 路径后，仅向本次 A5 runner 发送 SIGINT，
+其退出码 130，未强杀设备进程、未重置设备；失败日志保留为 matrix-r3。
+修正后还增加逐尾块 active lane 的等待分支次数，防止未启用等待的探针误报可控交错成功。
+
+第四轮仿真／A5 各 112 项全部通过，分别为 63 项独立重叠和 49 项真实依赖。
+日志 `outputs/spmd-sync-ordered-sim-matrix-r4-20261025.log`、
+`outputs/spmd-sync-ordered-native-20261025/matrix-r4.log` 保存逐场景的实际原子事件区间。
+244 项新增 CPU 验收器检查覆盖每一项 plan、拒绝串行伪重叠、允许两种 ready 顺序、
+早返回／超时／缺失到达／未执行等待分支、错误身份和 inactive 槽；
+与旧有序探针合计 340 项通过，完整相关 Python 选择集合计 2189 项通过。
+日志 `outputs/spmd-sync-ordered-oracle-green-r4-20261025.log`、
+`outputs/spmd-sync-ordered-python-r4-20261025.log`。
+
+标准转换器逐份复验 224 份第四轮捕获，全部原生因果审计通过；另对照请求逐项检查
+原 N、kernel IDs、SYNC 标志、完整拓扑与真实 fanin。纯 AIV1 请求由既有 Host
+归一化为 mask2／kernel_id=2，审计按这个实际 ABI 核对，不误写成 Mix 的 slot2 placement。
+日志 `outputs/spmd-sync-ordered-native-audit-r4-20261025.log`。
+
+第四轮原生审计：仿真 62192 个事件／3608 条执行，A5 244976 个事件／14360 条执行。
+63 项独立场景中，分别有 28／37 项是第二个提交的任务先进入，验收没有把 Host 顺序
+误当共同 ready 顺序。A5 纯 C→Mix7 场景的原子事件为：C 首入 1、末入 32、
+首返 33、末返 65；Mix 首入 64、末入 160、首返 161、末返 256。
+64 < 65 是后任务进入早于前任务最后返回的直接证据，不需要比较跨核时钟。
+
+共用探针首次仿真回归为 5 passed／2 failed，失败的 CLA 和首错误身份探针均无法找到
+inner_kernel.h。record.h 在 sync_start 接线时引入计时头文件，而这两项只需要记录布局，
+没有使用添加平台 AICore include 路径的有序探针编译入口；不能把它们遗漏在回归之外。
+将未改变的 128B ExecutionRecord 与 tensor_data 提取到 execution_record.h，
+CLA／错误身份探针直接引用布局，有序／同步探针仍引用原计时和同步 helper，
+不复制编译器、不改全局 include 路径、不扩展生产 API。
+调整后仿真和 A5 的 7 个共用探针测试类全部通过，包括普通分波、原 47 项同步、
+有序执行、GM Mix、CLA 图、AIV→Mix 交接与错误身份。
+日志 `outputs/spmd-sync-ordered-probe-regression-sim-r2-20261025.log`、
+`outputs/spmd-sync-ordered-native-20261025/probe-regression-r2.log`。
+
+布局拆分后的第五轮仿真／A5 新矩阵再次各 112 项通过；224 份捕获再次经完整原生审计，
+事件／执行总数与第四轮相同。这轮第二个提交任务先进入的独立场景分别为 27／28 项，
+共同顺序取决于本次 ready 竞争，不人为固定。相关 Python 选择集再次 2189 项通过。
+最终矩阵、审计和 Python 日志为 `outputs/spmd-sync-ordered-sim-matrix-r5-20261025.log`、
+`outputs/spmd-sync-ordered-native-20261025/matrix-r5.log`、
+`outputs/spmd-sync-ordered-native-audit-r5-20261025.log`、
+`outputs/spmd-sync-ordered-python-r5-20261025.log`。
+提交检查发现 Ruff E501 的诊断打印行过长，以及两个新 Python 文件的 docstring
+不符合源码语言检查；分别拆分 witness 打印并调整源码说明，中文过程文档保持不变。
+这些修正不改变验收语义，未绕过钩子。
+
+最终六个代表场景（C/V 不相交、C/Mix、mask6 协调、真实依赖及两向普通分波切换）
+分别在仿真／A5 连续运行十轮，每平台 60 次均通过；逐轮重新核验 resident 来源和全部哨兵，
+没有用一次成功替代后续轮次。多轮按框架规则关闭完整泳道，不混入上述 224 份 L4 审计数量。
+日志 `outputs/spmd-sync-ordered-repeat-a5sim-20261025.log`、
+`outputs/spmd-sync-ordered-repeat-a5-20261025.log`；最终新旧 oracle 再次 340 项通过。
+适用 pre-commit 检查通过，日志 `outputs/spmd-sync-ordered-precommit-r3-20261025.log`。
+本次阶段提交只包含测试／探针／中文过程记录，不包含产物或用户未跟踪文件，不 push。
+公共 N=1 契约仍待确认；性能回退根因仍未定位，本节不能被当作性能优化完成。

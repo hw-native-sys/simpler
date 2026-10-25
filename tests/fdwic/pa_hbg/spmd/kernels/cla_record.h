@@ -12,7 +12,7 @@
 #pragma once
 
 #include "cla_plan.h"
-#include "record.h"
+#include "execution_record.h"
 
 static inline __aicore__ int64_t
 cla_check_predecessors(__gm__ ExecutionRecord *all, __gm__ int64_t *plan, __gm__ int64_t *row) {

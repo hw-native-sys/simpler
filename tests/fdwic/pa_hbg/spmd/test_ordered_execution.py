@@ -38,7 +38,7 @@ def make_ordered_plan(params):
     if scenario == "alternate":
         shapes = [(n, mask) for n in (1, 512, 1, 65, 1, 2, 1)]
     elif scenario in ("overlap", "edge"):
-        shapes = [(blocks, mask), (blocks, params["other_mask"])]
+        shapes = params.get("shapes", [(blocks, mask), (blocks, params["other_mask"])])
     elif scenario == "fanin":
         shapes = [(blocks, mask), (1, 2 if mask == 1 else 1)]
     else:

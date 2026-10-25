@@ -11,33 +11,20 @@
 
 #pragma once
 
-#include <cstddef>
-#include <cstdint>
-#include <pto/pto-inst.hpp>
-
-#include "intrinsic.h"
+#include "execution_record.h"
 #include "inner_kernel.h"
-#include "scheduler/scheduler_memory.h"
-#include "tensor.h"
 
-// The atomic word and writeback metadata occupy different 64B cache lines.
-// Never write back a stale copy of the line holding the atomic visit count.
-struct alignas(128) ExecutionRecord {
-    volatile uint64_t visits;
-    uint64_t atomic_padding[7];
-    int64_t block_plus_one;
-    int64_t block_num;
-    int64_t slot_plus_one;
-    int64_t task_plus_one;
-    int64_t metadata_padding[4];
-};
-
-static_assert(sizeof(ExecutionRecord) == 128);
-static_assert(offsetof(ExecutionRecord, block_plus_one) == 64);
-
-static inline __aicore__ __gm__ int64_t *tensor_data(int64_t tensor_arg) {
-    auto *tensor = reinterpret_cast<__gm__ Tensor *>(tensor_arg);
-    return reinterpret_cast<__gm__ int64_t *>(tensor->buffer.addr) + tensor->start_offset;
+static inline __aicore__ void record_sync_arrival(__gm__ ExecutionRecord &guard, uint64_t expected, bool wait) {
+    auto &arrived = guard.atomic_padding[1];
+    scheduler_gm_fetch_add(arrived, 1);
+    const uint64_t started = get_sys_cnt_aicore();
+    while (wait) {
+        if (scheduler_gm_fetch_add(arrived, 0) == expected) break;
+        if (get_sys_cnt_aicore() - started > PLATFORM_PROF_SYS_CNT_FREQ * 5) {
+            scheduler_gm_fetch_add(guard.atomic_padding[2], 1);
+            break;
+        }
+    }
 }
 
 static inline __aicore__ void record_execution(__gm__ int64_t *args, int32_t slot) {
@@ -58,17 +45,8 @@ static inline __aicore__ void record_execution(__gm__ int64_t *args, int32_t slo
         return;
     }
     if (args[5] != 0) {
-        auto &arrived = records[expected_blocks * 3].atomic_padding[1];
-        scheduler_gm_fetch_add(arrived, 1);
         const uint64_t expected = static_cast<uint64_t>(blocks) * __builtin_popcount(mask);
-        const uint64_t started = get_sys_cnt_aicore();
-        while (args[5] != 2 || block != 0) {
-            if (scheduler_gm_fetch_add(arrived, 0) == expected) break;
-            if (get_sys_cnt_aicore() - started > PLATFORM_PROF_SYS_CNT_FREQ * 5) {
-                scheduler_gm_fetch_add(records[expected_blocks * 3].atomic_padding[2], 1);
-                break;
-            }
-        }
+        record_sync_arrival(records[expected_blocks * 3], expected, args[5] != 2 || block != 0);
     }
     // Delay before the final publication, exposing consumers released on claim exhaustion.
     if (block + 1 == blocks) {
