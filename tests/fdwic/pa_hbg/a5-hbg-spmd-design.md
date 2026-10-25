@@ -11,7 +11,7 @@
 设计基线为 f5cc679bb，约定更新于 2026-10-23。纯 C/V 与 GM Mix 普通多 block 已接入生产执行路径；
 原样 CSA 的七项 golden 和严格 resident L4 门禁已通过；
 首错误身份、退出冷日志及显式 block/slot 身份已接线；原样 CSA 身份审计已通过。
-L4 原生协议事件采集与逐核序号完整性检查已接通；完整因果审计、sync_start 和性能比较仍待完成。
+L4 原生协议采集、因果审计和原样 CSA 严格门禁已通过；sync_start 和性能比较仍待完成。
 下文区分当前能力与目标合同，2026-10-25 起的编码和实测证据集中记录在
 [实现过程](spmd/implementation-progress.md)，不以结构或接口存在代替执行验收。
 
@@ -91,7 +91,8 @@ N=1 和多 block Mix 共用 GM 组协议，AIC 只负责组领取、身份发布
 - trace 存储、完成索引和导出连接键已区分 block；kernel 入口采集原 N、block/slot、
   generation、epoch/order/group 和 cluster/lane，独立对象保留到原始及 Perfetto 泳道。
   L4 已采集并导出 LocalDone、共同准入、组发布／释放、执行许可和完成事件，
-  逐核序号完整性检查已通过；完整 native 因果审计仍待补齐。
+  原生因果审计已连接冻结图、实际成员、执行身份和完成链，并通过 CSA 严格门禁。
+  跨核约束使用实际票号和观察值，不把跨核 cycle 数值当作全局顺序。
 - `scheduler_runtime_mode` 与 `scheduler_mode_publish_count` 逐轮验证 resident 来源，
   不必要求所有功能测试先打开完整泳道。原有单 block predicate 继续保留。
 - GM Mix 已使用 descriptor／ack／保留到 run 结束的 seal，各 lane 自备参数，

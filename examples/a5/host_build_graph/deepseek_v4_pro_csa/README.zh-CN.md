@@ -2,7 +2,7 @@
 
 本目录提供原生 `SceneTestCase` 的 **HBG 独立用例**。冻结 kernel、参数 ABI、数据清单、七项 golden、运行和分析工具均在本目录内，不导入其他 runtime 的用例，也不依赖 PyPTO 或模型仓库。首次使用需另行导入固定数据，数据文件不进入 Git。
 
-**当前边界：原样 CSA 的七项 golden 和严格 AICore resident L4 门禁已在 A5 通过。** 普通 C/V 与 GM Mix 支持原 N 分波；无 kernel Dummy 只推进逻辑依赖，不伪造物理执行。创建用例时的 `main@946f49ac` 仅支持单 block，历史结果仍属于 AICPU 回退，不能改写为本版证据。完整 block/slot 身份与协议事件、sync_start 和性能比较尚未完成。最新实现边界见 [SPMD 设计](../../../../tests/fdwic/pa_hbg/a5-hbg-spmd-design.md)，逐步实现和实测集中于 [实现过程](../../../../tests/fdwic/pa_hbg/spmd/implementation-progress.md)。
+**当前边界：原样 CSA 的七项 golden、显式 block/slot 身份和原生协议因果审计已在 A5 通过严格 L4 门禁。** 普通 C/V 与 GM Mix 支持原 N 分波；无 kernel Dummy 只推进逻辑依赖，不伪造物理执行。创建用例时的 `main@946f49ac` 仅支持单 block，历史结果仍属于 AICPU 回退，不能改写为本版证据。sync_start 和性能比较尚未完成。最新实现边界见 [SPMD 设计](../../../../tests/fdwic/pa_hbg/a5-hbg-spmd-design.md)，逐步实现和实测集中于 [实现过程](../../../../tests/fdwic/pa_hbg/spmd/implementation-progress.md)。
 
 因此，这份用例是后续扩展、调试 HBG 分布式调度的固定验收负载；**历史 AICPU 结果不能当作分布式调度的性能基线**。用例不通过拆任务、减少 SPMD block 数或改变 kernel 绕过限制。
 
@@ -81,11 +81,11 @@ python "$CSA_HBG/run.py" bench -d 0
 python "$CSA_HBG/run.py" l1 -d 0
 python "$CSA_HBG/run.py" l4 -d 0
 
-# 分布式调度验收门禁：必须有 L4 证据，且 producer 必须为 aicore。
+# 分布式调度验收：L4、AICore 来源、执行身份和原生协议因果证明必须齐全。
 python "$CSA_HBG/run.py" l4 -d 0 --require-aicore-scheduler
 ```
 
-最后一条命令已在当前 GM Mix 实现上通过；旧分支 AICPU 回退仍必须失败。不能删除来源、记录数量、依赖时序或采集完整性检查来使它通过。`check`、`bench`、L1 不具备判断 scheduler producer 的证据，不能与此门禁等同；L4 的既有 schema 也尚未提供完整的 block/slot 和协议事件证明。
+最后一条命令已在当前 GM Mix 实现上通过；旧分支 AICPU 回退仍必须失败。不能删除来源、记录数量、依赖因果或采集完整性检查来使它通过。`check`、`bench`、L1 不具备完整协议证明，不能与此门禁等同。历史仅带执行身份、没有 `aicore_protocol` 的 L4 捕获仍可读取，但也不能通过当前严格门禁。
 
 最小入口与预编译命令：
 
@@ -192,7 +192,7 @@ python -m pytest -q \
 
 [graph_contract.json](graph_contract.json) 来源于本次 A5 HBG 的 `deps.json`，保留原始采集 SHA256、commit 和输入清单摘要。图包含 79 个执行任务、2 个 Dummy、133 条去重后的图内依赖边，60 个多 block 任务、2308 条执行记录（AIC 864 / AIV 1444）。Host 已完成的分配节点另列为 `host_ready_refs`，不伪造它们的设备执行。
 
-[graph_contract.py](graph_contract.py) 在 `run.py l1/l4` 中检查原始 kernel 组合、block 数、依赖和 tensor view，并检查逐任务 AIC/AIV 数量、单次正数 epoch、包括 Dummy 在内的前驱执行完成时序。A5 resident 的新 capture 通过 `aicore_execution_identities` 提供入口采集的 `block_idx` / `subtask_slot`，并按原图逐项核对 2308 个唯一身份。历史不带该对象的数据仍返回 `block_identity_verified=false`，不能按记录数补造身份；严格 `--require-aicore-scheduler` 入口要求该项为 true。完整协议事件仍需配合 [SPMD 原生探针](../../../../tests/fdwic/pa_hbg/spmd/test_spmd_contract.py) 和后续协议采集。
+[graph_contract.py](graph_contract.py) 在 `run.py l1/l4` 中检查原始 kernel 组合、block 数、依赖和 tensor view，并检查逐任务 AIC/AIV 数量、单次正数 epoch 和包括 Dummy 在内的依赖。A5 resident 的新 capture 通过 `aicore_execution_identities` 提供入口采集的 `block_idx` / `subtask_slot`，并按原图逐项核对 2308 个唯一身份。L4 另以 `aicore_protocol` 记录实际准入、成员、领取、许可、组握手和完成；统一审计器基于本核序号和跨核发布／观察建立因果偏序，不把跨核时间戳当作全局顺序。冻结图须与独立 dep-gen 的任务、kernel、原 N 和 fanin 完全一致。严格入口同时要求 `block_identity_verified=true` 与 `protocol_verified=true`；历史缺失相应对象时保持未验证，不能按条数补造证明。
 
 CPU TDD 分为两层：
 
@@ -243,7 +243,9 @@ deps/timing 两轮各七项数值比较均通过；输入、54 个 kernel、52 �
 两个无 kernel Dummy 不占物理 trace，但仍在逻辑完成与依赖链中。
 
 上述历史结果保留 `block_identity_verified=false`，当时的 schema 没有显式 block_idx/subtask_slot。
-当前入口已采集显式身份，原样 CSA 的严格 L4 身份审计通过，结果为 true；
-这仍不替代完整共同准入／组协议事件审计。
+当前入口已采集显式身份和原生协议事件，严格 L4 的身份与因果审计均通过，
+结果同时为 `block_identity_verified=true` 和 `protocol_verified=true`。
+仅带显式身份的历史结果不因此获得完整协议证明；Perfetto metadata 保留本轮原生审计摘要。
+原有 kernel 依赖时序检查同时保留为额外保守门禁，并报告 `dependency_timing_guard=true`，不能代替协议证明。
 首错误身份与退出冷日志已接线；sync_start 和无插桩性能比较仍待完成。所有失败定位和逐步复验仅集中记录于
 [实现过程](../../../../tests/fdwic/pa_hbg/spmd/implementation-progress.md)，不修改本页历史基线数值。

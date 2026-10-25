@@ -44,7 +44,7 @@ def validate_task_capture(raw_path, deps_path, level):
         raise ValueError("CSA task capture is incomplete or the workload changed")
     if len(raw["aicore_tasks"]) != len(parsed["tasks"]):
         raise ValueError("AICore rows were lost during parsing")
-    obligations = graph_contract.audit_execution(deps, parsed["tasks"])
+    obligations = graph_contract.audit_execution(deps, parsed["tasks"], protocol=raw.get("aicore_protocol"))
     summary = {
         "logical_tasks": len(actual),
         "physical_tasks": len(parsed["tasks"]),
@@ -102,12 +102,14 @@ def validate_trace(raw_path, deps_path, level, *, require_aicore=False):
         raise ValueError("Distributed scheduler required: need an L4 trace with scheduler producer=aicore")
     if require_aicore and summary.get("block_identity_verified") is not True:
         raise ValueError("Distributed scheduler requires verified explicit block identity")
+    if require_aicore and summary.get("protocol_verified") is not True:
+        raise ValueError("Distributed scheduler requires verified native protocol")
     timeline = parsed.get("timeline_metadata", {})
     return {
         **summary,
         "runtime": workload.RUNTIME,
         "scheduler_producer": producer,
-        "distributed_scheduler_verified": producer == "aicore",
+        "distributed_scheduler_verified": producer == "aicore" and summary.get("protocol_verified") is True,
         "require_aicore_scheduler": require_aicore,
         "host_capture": metadata.get("host_capture"),
         "clock_alignment_status": timeline.get("clock_alignment", {}).get("status"),
@@ -120,7 +122,9 @@ def main(argv=None):
     parser.add_argument("mode", choices=("check", "bench", "l1", "l4"))
     parser.add_argument("-d", "--device", type=int, default=0)
     parser.add_argument(
-        "--require-aicore-scheduler", action="store_true", help="L4 only: reject AICPU scheduler fallback"
+        "--require-aicore-scheduler",
+        action="store_true",
+        help="L4 only: require AICore identities and native causal proof",
     )
     args = parser.parse_args(argv)
     if args.require_aicore_scheduler and args.mode != "l4":

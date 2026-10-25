@@ -97,7 +97,53 @@ def _audit_block_identity(tasks, rows):
     return has_identity
 
 
-def audit_execution(deps, rows):
+def validate_native_graph(deps, protocol):
+    frozen = {task["task_ref"]: task for task in protocol["tasks"]}
+    expected = {int(task["task_id"]): task for task in deps["tasks"]}
+    device = {ref: task for ref, task in frozen.items() if task["flags"] & 1}
+    if device.keys() != expected.keys():
+        raise ValueError("CSA native protocol graph task set differs from dependency capture")
+    parents = defaultdict(set)
+    for edge in deps["edges"]:
+        parents[int(edge["succ"])].add(int(edge["pred"]))
+    for ref, task in device.items():
+        kernels = [kernel if kernel != 65535 else -1 for kernel in task["kernel_ids"]]
+        if (
+            kernels != expected[ref]["kernel_ids"]
+            or task["block_num"] != expected[ref]["block_num"]
+            or set(task["dependencies"]) != parents[ref]
+        ):
+            raise ValueError(f"CSA native protocol graph shape/fanin mismatch: {ref}")
+
+
+def _audit_dependency_timestamps(tasks, parents, starts, ends):
+    resolved = {}
+    visiting = set()
+
+    def execution_predecessors(ref):
+        if ref in visiting:
+            raise ValueError("cyclic CSA dependency")
+        if ref in resolved:
+            return resolved[ref]
+        visiting.add(ref)
+        result = set()
+        for pred in parents[ref]:
+            if pred in ends:
+                result.add(pred)
+            result.update(execution_predecessors(pred))
+        visiting.remove(ref)
+        resolved[ref] = result
+        return result
+
+    for succ in tasks:
+        predecessors = execution_predecessors(succ)
+        if succ in starts:
+            for pred in predecessors:
+                if ends[pred] > starts[succ]:
+                    raise ValueError(f"CSA dependency started early: {pred} -> {succ}")
+
+
+def audit_execution(deps, rows, *, protocol=None):
     tasks = {int(t["task_id"]): t for t in deps["tasks"]}
     if len(tasks) != len(deps["tasks"]):
         raise ValueError("duplicate CSA logical task")
@@ -130,33 +176,19 @@ def audit_execution(deps, rows):
         if pred in tasks and succ in tasks:
             parents[succ].add(pred)
 
-    resolved = {}
-    visiting = set()
+    _audit_dependency_timestamps(tasks, parents, starts, ends)
+    proof = {"protocol_verified": False}
+    if protocol is not None:
+        from simpler_setup.tools.hbg.native_causality import audit_native_protocol  # noqa: PLC0415
 
-    def execution_predecessors(ref):
-        if ref in visiting:
-            raise ValueError("cyclic CSA dependency")
-        if ref in resolved:
-            return resolved[ref]
-        visiting.add(ref)
-        result = set()
-        for pred in parents[ref]:
-            if pred in ends:
-                result.add(pred)
-            result.update(execution_predecessors(pred))
-        visiting.remove(ref)
-        resolved[ref] = result
-        return result
-
-    for succ in tasks:
-        predecessors = execution_predecessors(succ)
-        if succ in starts:
-            for pred in predecessors:
-                if ends[pred] > starts[succ]:
-                    raise ValueError(f"CSA dependency started early: {pred} -> {succ}")
+        proof = audit_native_protocol(protocol, rows)
+        validate_native_graph(deps, protocol)
     return {
+        **proof,
         "execution_epoch": next(iter(epochs)),
         "per_kind_executions": dict(Counter(row["core_type"] for row in rows)),
         "dependency_edges_checked": sum(len(v) for v in parents.values()),
         "block_identity_verified": has_identity,
+        "dependency_order_source": "native_protocol" if protocol is not None else "kernel_timestamps",
+        "dependency_timing_guard": True,
     }

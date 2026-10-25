@@ -1297,3 +1297,88 @@ A5 全 runtime 命令因单卡池无法容纳双卡 `TestUrmaDeferredCompletionD
 接入 CSA 严格门禁，再实现 sync_start 和无完整插桩的性能比较。
 当前不能用 sequence_integrity_verified 代替 protocol_verified，也不能以启用 L4 后的耗时
 推断实际调度性能收益。
+
+## 2026-10-25：原生协议因果审计与严格门禁
+
+起点 `9c545163e` 已本地中文提交、未 push。提交后重编成功，binding 与该 HEAD 一致，
+HBG 三个运行时二进制 SHA256 与 `csa-hbg-l4-am5bizn1` 的通过产物完全一致。
+本节继续原生审计与 CSA 门禁，不改变设备调度路径。
+
+新增审计器核对冻结图、真实拓扑、准入日志／成员投影、所有 block 的唯一 owner／完成票号、
+最终 payload／许可／kernel／消费／trace 的完整链、两槽代次、GM descriptor／arrive／release、
+保留 seal、LocalDone、TaskDone 及依赖。真实入口身份另作逐字段连接，不用 trace 序号猜 block。
+首批测试含“逐核序号与计数仍然正确、但协议内容错误”的变异，不能仅复用完整性检查使它们通过。
+
+真实 CSA 捕获先暴露审计侧两项错误假设，均保留失败日志。
+一是已有泳道 `core_id` 实为紧凑 worker 编号，不能与拓扑的硬件核号直接连接；
+生产 `trace->worker_id = slot_claim.worker_id` 和 `SchedulerLocalState::worker_id()` 已核对。
+补充二者不同的反例取得 RED，再按原接口连接；日志
+`outputs/spmd-native-causality-worker-join-red-20261025.log`。
+二是按跨核 cycle 区间重建原子完成票号顺序会误拒绝真实记录：CSA task 22 的票号 4/5
+在不同 worker 上有相反的数值时间区间。这一现象不足以单独认定调度错误或时钟偏移原因。
+日志 `outputs/spmd-native-causality-captures-r2-20261025.log` 保留该失败。
+
+因果检查使用逐 worker 的事件序号链，以及发布前／后之间的虚拟线性化点。
+这些虚拟点是审计约束，不伪装成设备采集事件，不占实际 sequence。
+跨核边来自实际原子票号、已读 tail／ack／seal 与冻结依赖；不把跨核时间戳当全局时钟。
+只在本核使用 cycle 单调性和 payload 快照的时间边界，最终检查整个约束图是否存在矛盾环。
+普通 permit 的关键读位于前一条本核事件与 permit 记录之间，允许新准入在读之后、
+记录／kernel 入口之前发布；不能因采样开销而给它补一道全局完成屏障。
+
+合法测试明确覆盖：B 可以先于较小 task_ref 的 A 准入、本核关闭 A 后在远端 TaskDone(A)
+之前进入 B、不参与 A 的核旁路、独立核时钟偏移、消费者观察早于发布者 after stamp、
+普通 payload 重建和 predicate 跳过。另一个真实 RED 指出仅检查 payload 发布时的两槽复用
+仍可能漏掉三次提前不可撤销领取；已把每个纯任务 claim 也绑定到前次槽消费之后。
+日志 `outputs/spmd-native-causality-capacity-red-20261025.log`。
+
+初版已通过 CSA 加仿真／A5 矩阵共 182 份原生捕获，日志
+`outputs/spmd-native-causality-captures-r4-20261025.log`；加严两槽领取后的矩阵还需复验。
+转换器与 CSA 门禁的 7 项实际 RED 保存在 `outputs/spmd-native-causality-gates-red-20261025.log`。
+接线后，存在协议对象就必须通过统一审计；历史无对象仍可读取但不获得原生证明。
+严格 CSA 还把本轮冻结图与独立 dep-gen 的任务、kernel、原 N 和全部 fanin 逐项核对。
+原生路径引入因果证明；原有 kernel 依赖时序检查仍需作为额外保守检查保留，见本节后续收口。
+本节正在进行边界扩展、格式检查及完整复验，尚未提交，也未宣称 sync_start 或性能工作完成。
+
+加严后通过标准转换器重新读取全部 182 份捕获，原始协议与入口身份完整连接，
+仿真 90 份共 427122 个事件／26303 条执行，A5 92 份（90 份矩阵加小型 Mix 和 CSA）
+共 506539 个事件／28624 条执行，全部得到 protocol_verified=true。
+日志 `outputs/spmd-native-causality-converter-matrix-20261025.log`。
+新增测试还明确允许两个待退役领取、direct refill 先准备新 payload 再清理旧 trace、
+epoch 0/MAX 和任意 JSON 行序；测试数据的类型标注和长行已整理，没有屏蔽 lint 规则。
+
+本阶段新增 63 项原生因果／转换器测试、2 项严格门禁拒绝测试、5 项独立图一致性测试，
+与已有读端／SPMD／CSA／快照／转换器合并共 1894 项通过（38.26 秒）。
+日志 `outputs/spmd-native-causality-python-20261025.log`。
+代码改动均在 Host 分析／用例侧，设备二进制和调度热路径未改变。
+
+随后重新上 A5 设备 0 运行原样 CSA 严格 L4，
+`outputs/csa-hbg-l4-10n3f_mf/result.json` 通过两轮各七项 golden、2308 条显式身份、
+133 条图内依赖、107/107 Host 记录及完整原生审计。
+实际原生证据为 46733 个事件、96 个 worker、81 个设备逻辑节点（79 kernel + 2 服务节点）、
+61 个协同 task、4640 条成员义务、1457 个协同 block；
+block_identity_verified／protocol_verified／distributed_scheduler_verified 均为 true，
+dependency_order_source=native_protocol。原 kernel、构图和固定数据与基线一致。
+生成的 L4.json metadata 同样保留 hbg_protocol_audit，不靠最终输出数值替代协议检查。
+设备由 CANN query 确认 Ascend950PR_958b；本机缺少 npu-smi／task-submit，按用户要求直接用卡。
+
+SPMD 设计／编码契约和 CSA 中文入口说明已更新为当前严格门禁，历史结果不追认新证明。
+剩余目标仍是 sync_start 的不同位置容量／至多一次领取／最终可推进，以及关闭完整插桩后的性能比较；
+本节没有扩大支持范围，没有新增运行配置开关，也没有 push。
+
+收口时增加反例：即使原生协议对象合法，独立 kernel 行的前驱结束／后继开始发生明显冲突，
+也不能跳过 CSA 原有时序检查。首版 native 分支确实漏过该反例，实际 RED 记录于
+`outputs/spmd-native-causality-timing-guard-red-20261025.log`。
+修正为原有 timing guard 始终执行，原生因果审计和独立图校验作为额外必需条件；
+报告保留 dependency_order_source=native_protocol，并显式标记 dependency_timing_guard=true。
+这不把未校准的跨核 cycle 用作原生协议全序，也不因新证明而放宽既有业务门禁。
+
+最终增加空图、纯 Host 完成、纯服务节点三项检查，以及保留 timing guard 的一项反例。
+本阶段新增总计 74 项（66 项因果／转换器、2 项严格门禁、6 项图一致性／时序守护），
+完整 Python 选择集 1898 项通过（37.61 秒），日志
+`outputs/spmd-native-causality-python-final-r2-20261025.log`。
+保留 timing guard 后再次新跑原样 A5 CSA，`outputs/csa-hbg-l4-8gsn4ngo/result.json`
+同时通过原数值、来源、显式身份、原生协议、独立图和原时序检查；三个 verified 标记及
+dependency_timing_guard 均为 true，原始 case 仍与基线一致。
+全部适用 pre-commit 检查通过，日志 `outputs/spmd-native-causality-precommit-final-r3-20261025.log`。
+本次阶段提交包含审计、转换器／CSA 接线、TDD 和中文状态记录，不含输出产物或用户未跟踪内容，
+仅本地提交，不 push。后续继续 sync_start 和无完整插桩的性能验证。

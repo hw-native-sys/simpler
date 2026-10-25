@@ -140,7 +140,7 @@ def test_invalid_hbg_measurement_is_rejected(tmp_path, mutation):
         perf.summarize(log, warmup=0, rounds=2 if mutation == "missing_round" else 1)
 
 
-def _trace(monkeypatch, producer="aicpu", identity=True):
+def _trace(monkeypatch, producer="aicpu", identity=True, protocol=True):
     raw = {
         "metadata": {
             "runtime": "host_build_graph",
@@ -164,6 +164,8 @@ def _trace(monkeypatch, producer="aicpu", identity=True):
         "timeline_metadata": {"clock_alignment": {"status": "bounded"}, "cross_domain_latency_available": True},
     }
     summary = {} if identity is None else {"block_identity_verified": identity}
+    if protocol is not None:
+        summary["protocol_verified"] = protocol
     monkeypatch.setattr(runner, "validate_task_capture", lambda *args: (raw, parsed, summary))
     return raw, parsed
 
@@ -190,6 +192,14 @@ def test_resident_counts_without_explicit_block_identity_cannot_pass_strict_gate
     _trace(monkeypatch, "aicore", identity)
     with pytest.raises(ValueError, match="identity"):
         runner.validate_trace(None, None, 4, require_aicore=True)
+
+
+@pytest.mark.parametrize("protocol", (False, None))
+def test_resident_identity_without_native_causal_proof_cannot_pass_strict_gate(monkeypatch, protocol):
+    _trace(monkeypatch, "aicore", protocol=protocol)
+    with pytest.raises(ValueError, match="protocol"):
+        runner.validate_trace(None, None, 4, require_aicore=True)
+    assert runner.validate_trace(None, None, 4)["distributed_scheduler_verified"] is False
 
 
 def test_l1_cannot_establish_scheduler_provenance(monkeypatch):

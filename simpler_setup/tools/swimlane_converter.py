@@ -1015,6 +1015,14 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
 
         attach_execution_identities(data["aicore_execution_identities"], tasks, runtime_name)
 
+    protocol_audit = None
+    if "aicore_protocol" in data:
+        from simpler_setup.tools.hbg.native_causality import audit_native_protocol  # noqa: PLC0415
+
+        if runtime_name != "host_build_graph" or level != 4 or scheduler_task_producer != "aicore":
+            raise ValueError("native protocol requires an AICore-produced HBG L4 capture")
+        protocol_audit = audit_native_protocol(data["aicore_protocol"], tasks)
+
     # Sorting by task_id alone would interleave two runs' executions of the same
     # task. Epoch leads so each run's tasks stay contiguous.
     tasks.sort(key=lambda t: (t["run_epoch"], int(t["task_id"])))
@@ -1178,6 +1186,10 @@ def _decode_perf_data(data, *, timeline_origin_ns=None, placement=None, source=N
             out["timeline_metadata"]["host_clock_domain_id"] = str(host_clock_domain_id)
     if core_to_thread:
         out["core_to_thread"] = core_to_thread
+    if protocol_audit is not None:
+        out["native_protocol"] = data["aicore_protocol"]
+        out["protocol_audit"] = protocol_audit
+        out.setdefault("timeline_metadata", {})["hbg_protocol_audit"] = protocol_audit
     return out
 
 

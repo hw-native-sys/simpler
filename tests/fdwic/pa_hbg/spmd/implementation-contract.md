@@ -5,7 +5,7 @@
 共同准入、Host 预分配、纯 C/V 的 own/direct 入口、cursor 和 LocalDone 已接入生产路径。
 GM Mix 也已接入，原样 CSA 的数值与严格 resident L4 门禁已通过；
 首错误身份、退出冷日志及显式 block/slot 身份已接线，原样 CSA 身份审计通过；
-L4 原生协议事件采集与逐核序号完整性检查已接通；完整因果审计、sync_start 和性能比较仍未完成。
+L4 原生协议采集、因果审计和原样 CSA 严格门禁已通过；sync_start 和性能比较仍未完成。
 本页保留全部目标合同；已实现字段和实测范围以 [实现过程](implementation-progress.md) 为准，
 不以存在字段替代执行验收。
 初始 TDD 覆盖和历史红绿状态见 [测试入口和验收状态](test-plan-and-status.md)。
@@ -249,7 +249,20 @@ CSA 严格门禁按冻结图核对完整 task/block/slot 集合；历史无身�
 执行身份对象本身不提供 LocalDone、共同准入发布和 GM 组释放事件。
 L4 另以 `aicore_protocol` 对象导出这些真实记录，schema 为 `hbg-native-protocol-v1`，
 同时保留 Host 冻结图和设备终态。统一读端在 `simpler_setup/tools/hbg/native_protocol.py`；
-它目前校验 schema 与逐核序号完整性，不将其标为完整协议因果验证通过。
+它校验 schema 与逐核序号完整性，`native_causality.py`、`native_mix_audit.py` 与
+`native_order.py` 进一步检查冻结图／成员、两槽生命周期、实际完成票号、组握手与关闭、
+TaskDone 和依赖，并与独立入口身份逐字段连接。
+既有泳道 `core_id` 使用紧凑 worker 编号；协议拓扑 `workers[].core_id` 保存硬件核号，
+二者不能混作连接键。
+
+审计按本核 sequence 建立顺序链，发布线性化点限制在实际 before／after 之间，
+跨核边来自原子票号、已读 tail／ack／seal 和冻结依赖，最后检查约束图有无矛盾环。
+不按跨核 cycle 全局排序；普通 permit 的关键读可以早于新的共同准入，
+消费者观察也可以早于发布者记录 after。虚拟线性化点不是新增设备事件，不占用 sequence。
+`protocol_verified=true` 仅在完整审计通过时产生；历史无协议对象仍可读，但不能通过严格门禁。
+CSA 还对照独立 dep-gen 核验冻结任务、kernel、原 N 和全部 fanin；
+原生路径的依赖证明为该因果检查；CSA 原有 kernel 依赖时序检查作为额外保守检查继续保留，
+不能用时间戳检查代替原生证明，也不能在有原生证明时静默跳过旧检查。
 
 ### 每条发布链必须有设备侧证明
 
@@ -297,15 +310,15 @@ AICPU 首写者明确记录未知 task/core/扩展身份，bootstrap/execution/t
 | ---- | ------------------ | -------- | -------- |
 | 前置 | 公共 payload/context 初始化及 bootstrap | 六种 mask 的 N=1 重复运行，不通过 kernel 伪造 context | 已验证；详见实现过程 |
 | 1 | scheduler_types.h/layout.h 与 Host 实际大小预分配 | 布局／初始化、二次运行、溢出及边界拒绝 | 已实现 |
-| 2 | ready 唯一领取、准入发布及 executor/completion 统一 entry gate | B 先于未 ready A；三入口不可越序；旁路发布竞态 | own/direct 与 GM Mix 已接线；完整协议事件审计待补 |
+| 2 | ready 唯一领取、准入发布及 executor/completion 统一 entry gate | B 先于未 ready A；三入口不可越序；旁路发布竞态 | own/direct 与 GM Mix 已接线，原生协议审计通过 |
 | 3 | 普通 C/V cursor、原 N、block 退役与分波 demand | N=1、容量两侧、512；晚 block 不早放后继；快核跨 task 重叠 | 原生纯 C/V 已有通过证据 |
 | 4 | GM descriptor/ack/seal，各 lane 自备 payload，无 SSBUF | mask 3/5/6/7、配对、暂停最后发布者、局部关闭和槽复用 | C++、仿真／A5 矩阵和重叠通过；首错误身份与冷日志已接线 |
-| 5 | block/order/placement/来源导出及严格审计器 | 完整因果链、不重不漏、无截断；原样 CSA 七项 golden 与 resident 来源 | CSA 七项 golden／2308 身份／来源通过；原生协议事件导出和序号检查通过，完整因果审计待补 |
+| 5 | block/order/placement/来源导出及严格审计器 | 完整因果链、不重不漏、无截断；原样 CSA 七项 golden 与 resident 来源 | CSA 七项 golden／2308 身份／来源、原生因果审计和独立图一致性门禁通过 |
 | 6 | sync_start 一次领取／不同位置容量 | 满核独立任务、交叠成员、超容量、早返回不二次领取 | 未开放 |
 | 7 | 相同 kernel/输入/拓扑的控制开销对比 | 区分无完整插桩性能与诊断运行，不能由 CPU 模型推算收益 | 未完成 |
 
 纯 C/V、GM Mix 已有生产 helper 和原生执行证据；
-完整 native 因果审计和后续 sync_start 仍须补齐，参考模型不是实现的替代品。
+后续 sync_start 和性能比较仍须完成，参考模型不是实现的替代品。
 私有错误区原生探针验证生产 writer 和设备原子发布，不触发真实 runtime 错误，
 不能据此声称任意物理核异常的静止／回收均已获得设备验证。
 不要先全局放开 shape predicate，再用 legacy 的正确输出宣布 SPMD 完成。
