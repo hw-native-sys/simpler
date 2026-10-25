@@ -345,15 +345,27 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
             if (run_control->scheduler_error != 0) {
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: bootstrap failed at task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64
-                    " type=%" PRIu64 " site=%" PRIu64,
+                    " type=%" PRIu64 " site=%" PRIu64 " workers=%" PRIu64 " schedulers=%" PRIu64
+                    " scan_arrived=%" PRIu64 " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64
+                    " bootstrap_complete=%" PRIu64,
                     run_control->error_task_ref, run_control->scheduler_error, run_control->error_core_id,
-                    run_control->error_core_type, run_control->error_site
+                    run_control->error_core_type, run_control->error_site, run_control->active_worker_count,
+                    run_control->scheduler_count, run_control->bootstrap_scan_arrived_count,
+                    run_control->bootstrap_scan_complete, run_control->bootstrap_arrived_count,
+                    run_control->bootstrap_complete
                 );
                 return -1;
             }
         }
         if (scheduler_watchdog_expired(watchdog_start, get_sys_cnt_aicpu(), timeout_cycles)) {
-            LOG_ERROR("%s", "A5 HBG AICore Scheduler bootstrap timeout");
+            LOG_ERROR(
+                "A5 HBG AICore Scheduler bootstrap timeout: workers=%" PRIu64 " schedulers=%" PRIu64
+                " scan_arrived=%" PRIu64 " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64
+                " bootstrap_complete=%" PRIu64,
+                run_control->active_worker_count, run_control->scheduler_count,
+                run_control->bootstrap_scan_arrived_count, run_control->bootstrap_scan_complete,
+                run_control->bootstrap_arrived_count, run_control->bootstrap_complete
+            );
             record_lifecycle_timeout(runtime, SchedulerErrorSite::BOOTSTRAP_COMPLETE_TIMEOUT);
             return -1;
         }

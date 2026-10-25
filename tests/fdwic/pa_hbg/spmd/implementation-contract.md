@@ -220,7 +220,7 @@ AICore 上包装函数的 C++ memory_order 参数本身不建立设备 fence；
 
 | 顺序 | 修改位置与具体工作 | 通过门槛 |
 | ---- | ------------------ | -------- |
-| 前置 | scheduler_types.h 的公共初始化及 host/runtime_maker.cpp：补齐 own／独立 Mix payload 的两个 context 后缀及重绑定初始化 | mask3_n1 的 a5sim 红灯已转绿；真机 bootstrap 超时另查；不通过 kernel 伪造 context 绕过 |
+| 前置 | scheduler_types.h 的公共初始化及 host/runtime_maker.cpp：补齐 own／独立 Mix payload 的两个 context 后缀及重绑定初始化 | 六种 mask 的 N=1 仿真各三轮、A5 各十轮通过；真机另修复不变 timeout 的共享 GM 轮询；不通过 kernel 伪造 context 绕过 |
 | 1 | scheduler_types.h/layout.h：新增 POD、offset、初始化、溢出检查；host/runtime_maker.cpp：实际大小预分配 | C++ 布局／初始化、二次运行、边界拒绝测试 |
 | 2 | scheduler_ready.h：一次领取准入所有权；新增准入 helper；executor/completion 接统一 entry gate | 旧 ready 原语回归；B 先于未 ready A；三入口不可越序；旁路发布竞态 |
 | 3 | dispatch/context、completion：普通 C/V cursor、原 N、block 级退役；maker/lifecycle 分开分波与共同驻留 demand | 纯 C/V N=1、容量两侧、512；晚 block 的消费者不早放行；快核跨 task 重叠 |

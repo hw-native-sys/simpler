@@ -22,7 +22,7 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 
 | 顺序 | 交付 | 出口证据 | 当前状态 |
 | ---- | ---- | -------- | -------- |
-| 前置 | ordinary／Mix payload context 初始化与重绑定 | 原生 N=1 红灯转绿；真实初始化函数的 C++ 测试 | 代码与仿真完成；真机初始化问题另查 |
+| 前置 | ordinary／Mix payload context 初始化与重绑定 | 原生 N=1 红灯转绿；真实初始化函数的 C++ 测试 | 已通过 C++、仿真与 A5 六种 mask 各十轮 |
 | 1 | 有界存储、准入记录、block 控制、GM 组状态 | POD／布局／溢出／重跑初始化测试 | 未实现 |
 | 2 | 一次 ready 领取、共同准入、三入口统一顺序门禁 | 发布竞态、B 可先准入、非成员旁路、无重复入队 | 未实现 |
 | 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | 未实现 |
@@ -49,7 +49,9 @@ CPU 模型、原生探针、真实 CSA 各有独立证明范围；legacy 的正�
 
 ### 验证记录
 
-- 本地 `.venv-csa`，Torch 2.12，编译并发 8。
+- 本地 `.venv-csa`，Torch 2.12，设置 `CMAKE_BUILD_PARALLEL_LEVEL=8 MAX_JOBS=8`。
+  后续核对发现 runtime 编译器显式传入 `--parallel min(cpu_count, 32)`，
+  且多 runtime 并发构建；因此环境变量并不代表全流程实际总并发上限为 8。
   基线与修改后 editable 构建均通过：`outputs/spmd-build-baseline-20261025.log`、
   `outputs/spmd-payload-build-20261025.log`。
 - 红灯：`mask3_n1` a5sim 报 `SPMD LocalContext/GlobalContext missing pointer`，
@@ -92,3 +94,94 @@ TaskControl 原子区可复用 40B padding 中的 24B；禁止普通写回覆盖
 `TaskDone` 与 `LocalDone` 分离，Mix cursor 耗尽与 cluster seal 分离。
 前置 context 修复独立提交。下一项先补 bootstrap 超时的精确状态证据并修复真机基线，
 同时按上述顺序推进实际存储与执行路径，不只改模型或放宽验收。
+
+## 2026-10-25：resident bootstrap 真机基线调查与修复
+
+前置修复已提交为 `0a6460982`，未 push。
+当前完整目标仍未达到：共同准入、多 block、GM Mix、原样 CSA resident、sync_start 和性能验收均未完成。
+
+已有设备日志仅能证明 AICPU 等 bootstrap 结束超时，不能区分卡在扫描注册还是首波 dispatch。
+在 `aicore_lifecycle.cpp::wait_bootstrap_complete` 的错误／超时冷路径补充
+worker 数、scheduler 数、scan arrived/complete、dispatch arrived/complete 的一次性快照。
+不改变调度路径，不加环境开关，不在热循环输出日志；据真机快照确定下一步。
+诊断构建日志：`outputs/spmd-bootstrap-diagnostic-build-20261025.log`。
+
+首次状态快照来自 `outputs/spmd-bootstrap-state-20261025/`：
+32 AIC／64 AIV 已完成发现，失败时 `workers=96 schedulers=96 scan_arrived=96`
+且 `scan_complete=1 dispatch_arrived=96 bootstrap_complete=1`。
+AICPU 非 leader 线程在约 20 秒超时，leader 约 37.4 秒后才打印快照并退出。
+这不能直接证明“某个核从未到达”，也不能仅凭最终值证明它何时可见。
+下一次诊断仅增加 bootstrap poll 的调用次数、单次 cache observe 最大耗时与总耗时，
+区分观察阻塞与真正晚到；诊断计时不作为最终性能实现保留。
+
+第二次加入诊断计时、仍保留原 cache observe 的单根用例偶然通过，
+但设备执行约 13.625 秒（`outputs/spmd-bootstrap-observe-20261025/`），
+并非稳定基线。A/B 把 AICPU poll 改成 acquire load 后仍失败：
+`polls=34 max_observe_cycles=21012475385 elapsed_cycles=21110745578`，
+最终四个 bootstrap 状态仍为 96/1/96/1。
+证据在 `outputs/spmd-bootstrap-acquire-20261025/`；
+因此撤回此尝试，不以“删除 civac”作为已证实的修复。
+
+继续核对发现 AICore 的 register-release／exit wait 每次循环都查询同一个 GM timeout 字段，
+而该配置由 AICPU 在 READY 前发布后不再写入。
+下一候选只在 READY 后缓存该常量（bootstrap scan wait 同样缓存），
+保持 AICPU 原来的 cache observe 路径，检验集中 GM 轮询与异常长观察区间的关系。
+构建／执行日志：`outputs/spmd-bootstrap-local-timeout-build-20261025.log`、
+`outputs/spmd-bootstrap-local-timeout-20261025/`；未验证前不声明根因或性能收益。
+
+该候选的同一单根真机用例连续三轮通过；AICPU bootstrap 等待分别为
+50306／48838／54377 cycles（本机 1 GHz，即约 50.306／48.838／54.377 微秒）。
+观察区间最大值约 10.0／14.5／10.1 微秒，未再出现前述秒级阻塞。
+这是启动路径的对照证据，不是最终 SPMD 或 CSA 的性能报告。
+当前可复现改善边界是减少不变 timeout 的共享 GM 轮询；
+尚未证明具体 cache／HA／bank 仲裁的微架构原因，不以此推导新的硬件规则。
+
+最终候选移除临时逐 poll 计时和成功日志，只保留出错冷路径的 bootstrap 状态快照。
+不改 watchdog 的阈值、比较方式或错误处理；timeout 的写入者仅有 Host 初始化
+和 READY 前的 AICPU 配置，READY 后本核缓存具有明确的不变性依据。
+
+无临时计时版本的验证：
+
+- A5 真机：六种 mask 的 N=1 各十轮，共 60 次，全部通过。
+  同一 Worker 运行，run_epoch 连续 1–60；保留原探针／golden／保护区／来源断言，
+  不放宽 timeout，不关闭多 block 的红灯门禁。
+  命令为 `python tests/fdwic/pa_hbg/spmd/test_spmd_contract.py -p a5 -d 0`
+  加六个 `--case mask{1,2,3,5,6,7}_n1` 参数与 `--rounds 10`。
+  日志 `outputs/spmd-bootstrap-fix-native-20261025/run.log`。
+- C++：原有六个目标加 lifecycle retirement 目标，共 7 个目标、118 个 case 全部通过。
+  日志 `outputs/spmd-bootstrap-fix-cpp-20261025.log`。
+- 构建和首轮提交钩子通过：`outputs/spmd-bootstrap-fix-build-20261025.log`、
+  `outputs/spmd-bootstrap-fix-precommit-20261025.log`。
+- HBG 默认仿真回归：42 passed、379 deselected，日志
+  `outputs/spmd-bootstrap-fix-a5sim-regression-20261025.log`。
+- 首次宽目录真机回归：59 passed、4 skipped、1 failed、1 error，日志
+  `outputs/spmd-bootstrap-fix-a5-regression-20261025/run.log`。
+  error 来自被收入的 TMR 双卡 RDMA 用例，单卡 setup 报 `need 2 devices`，未执行该业务。
+  failure 来自 DFX 测试：未开启泳道时 output_prefix 为 `.`，测试 helper 递归读取了历史
+  `chip_swimlane_records.json`，误把已转换的旧 clock_alignment 当作本轮提前写入。
+  独立真机复跑仍复现，见 `outputs/spmd-bootstrap-fix-dfx-isolated-20261025/run.log`；
+  该失败发生在后处理断言，不是 kernel 数值或 resident 初始化失败。
+- 修正 DFX helper：只有本轮开启泳道时才枚举 capture，保持原 finalizer 及 after_finalize 回调。
+  不删除历史输出，不放宽启用 profiling 时的严格断言。
+  新增 5 个 Python 回归：关闭 profiling 不扫描目录；已有 clock_alignment 仍拒绝；
+  三级缺 Host 时钟日志仍拒绝；一／二级多余日志仍拒绝。
+  红灯为 1 failed、4 passed，修复后结合全部 SPMD／CLA／CSA 回归共 1026 passed。
+  日志 `outputs/spmd-clock-guard-red-20261025.log`、`outputs/spmd-bootstrap-fix-python-20261025.log`。
+- 最终真机改用明确范围：`pytest examples/a5/host_build_graph tests/st/a5/host_build_graph`
+  加 `--platform a5 --exclude-level 4 --device 0 --max-parallel 1 --pto-session-timeout 600 -q`。
+  产品的分组 runner 全部成功退出；子任务总结累计 48 passed、4 skipped，
+  不把子任务的 deselected 数累加为新的测试项。
+  日志 `outputs/spmd-bootstrap-fix-a5-hbg-only-20261025/run.log`。
+- 单独运行 `TestSchedulerPhases::test_run --enable-chip-swimlane 3` 真机通过，
+  保留 provenance、时钟日志、task timing、scheduler/lifecycle 等原断言；
+  日志 `outputs/spmd-bootstrap-fix-a5-hbg-only-20261025/dfx-level3.log`。
+- 最终提交检查全部适用钩子通过，包含 Python 类型、格式以及 C++ 检查；
+  日志 `outputs/spmd-bootstrap-fix-precommit-r2-20261025.log`。
+
+### 当前交付边界与下一项
+
+普通／Mix context 初始化和当前单 block resident 基线已修复并验证。
+尚未增加共同准入日志、SPMD cursor、GM Mix 组控制或 native 全身份 trace。
+接下来实现编码契约第 1 项：有界 POD／offset／初始化／溢出检查及 Host 实际大小预分配，
+然后接入共同准入与普通多 block；保持现有 legacy 形状门禁直到相应 native 验收通过。
+完整目标继续进行，不因前置基线转绿而标为完成。

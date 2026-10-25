@@ -147,6 +147,7 @@ __aicore__ bool bootstrap_ready_graph(
         scheduler == nullptr)
         return false;
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
+    const uint64_t timeout_cycles = scheduler_gm_query(run_control->scheduler_timeout_cycles);
     if (phase_timing_enabled) stats->bootstrap_start_cycles = scheduler_cycles();
     SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
     uint64_t tasks_per_scheduler = graph.task_count / scheduler_count;
@@ -200,9 +201,7 @@ __aicore__ bool bootstrap_ready_graph(
         const uint64_t barrier_start = scheduler_cycles();
         while (scheduler_gm_query(run_control->bootstrap_scan_complete) == 0) {
             if (scheduler_gm_query(run_control->scheduler_error) != 0) return false;
-            if (scheduler_watchdog_expired(
-                    barrier_start, scheduler_cycles(), scheduler_gm_query(run_control->scheduler_timeout_cycles)
-                )) {
+            if (scheduler_watchdog_expired(barrier_start, scheduler_cycles(), timeout_cycles)) {
                 scheduler_record_error(
                     run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, scheduler,
                     SchedulerErrorSite::BOOTSTRAP_SCAN_TIMEOUT
@@ -543,6 +542,8 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     uint64_t profiling_level, uint64_t aicore_entry_cycles, uint64_t handshake_publish_cycles
 ) {
     const bool phase_timing_enabled = scheduler_phase_timing_enabled(profiling_level);
+    // READY publishes this run's timeout; no writer changes it during execution.
+    const uint64_t timeout_cycles = scheduler_gm_query(run_control->scheduler_timeout_cycles);
     SchedulerGraphView graph{
         context->graph_storage_address,
         context->graph_reserved_address,
@@ -587,9 +588,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     const uint64_t register_wait_start = get_sys_cnt_aicore();
     while (startup_signal != AICPU_IDLE_TASK_ID && startup_signal != AICORE_EXIT_SIGNAL) {
         startup_signal = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
-        if (scheduler_watchdog_expired(
-                register_wait_start, get_sys_cnt_aicore(), scheduler_gm_query(run_control->scheduler_timeout_cycles)
-            )) {
+        if (scheduler_watchdog_expired(register_wait_start, get_sys_cnt_aicore(), timeout_cycles)) {
             scheduler_record_error(
                 run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
                 SchedulerErrorSite::REGISTER_RELEASE_TIMEOUT
@@ -632,9 +631,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     const uint64_t exit_wait_start = get_sys_cnt_aicore();
     while (stats.exit_observed_cycles == 0 &&
            static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE)) != AICORE_EXIT_SIGNAL) {
-        if (scheduler_watchdog_expired(
-                exit_wait_start, get_sys_cnt_aicore(), scheduler_gm_query(run_control->scheduler_timeout_cycles)
-            )) {
+        if (scheduler_watchdog_expired(exit_wait_start, get_sys_cnt_aicore(), timeout_cycles)) {
             scheduler_record_error(
                 run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, context,
                 SchedulerErrorSite::EXIT_WAIT_TIMEOUT
