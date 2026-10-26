@@ -63,20 +63,14 @@ TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING));
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_RESIDENT_READY));
     EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH));
-    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_resident(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
 
     EXPECT_FALSE(aicore_scheduler_runtime_mode_is_explicit_legacy(0));
     EXPECT_FALSE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING));
     EXPECT_FALSE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_RESIDENT_READY));
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH));
-    EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
-}
-
-TEST(AicoreSchedulerState, ResidentAcceptsSingleBlockOrdinaryMix) {
-    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(1, 1, false));
-    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(2, 1, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 2, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 1, true));
+    // A graph task is the only fallback left. The retired mode 4 named a shape
+    // the resident scheduler declined, and nothing declines a shape now.
+    EXPECT_FALSE(aicore_scheduler_runtime_mode_is_explicit_legacy(4));
 }
 
 TEST(AicoreSchedulerWatchdog, UsesElapsedWallClockBudget) {

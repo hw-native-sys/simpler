@@ -92,24 +92,5 @@ class TestHbgSingleAivRoot(SceneTestCase):
         args.out[:] = args.a + args.b
 
 
-@scene_test(level=2, runtime="host_build_graph")
-class TestHbgSingleAicSpmdLegacyFallback(TestHbgSingleAicRoot):
-    CALLABLE = {
-        **TestHbgSingleAicRoot.CALLABLE,
-        "orchestration": {
-            "source": "kernels/orchestration/single_aic_spmd_fallback_orch.cpp",
-            "function_name": "aicpu_orchestration_entry",
-            "signature": [D.INOUT],
-        },
-    }
-    CASES = [
-        {
-            "name": "single_aic_spmd_legacy_fallback",
-            "platforms": ["a5sim", "a5"],
-            "params": {},
-        },
-    ]
-
-
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)

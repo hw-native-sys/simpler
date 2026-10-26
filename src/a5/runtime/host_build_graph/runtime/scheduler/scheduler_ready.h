@@ -249,6 +249,23 @@ struct SchedulerLocalState {
     // serial: a graph that can never fill that queue must not pay for it.
     bool has_spmd{false};
 
+    // The SPMD queue head this core last looked at, with the shape facts it
+    // read from that task. A round that finds the head unchanged needs no
+    // metadata read, which is what keeps the steady-state poll at the one
+    // ld_dev of the endpoints: the alternative costs every core a cache-line
+    // observe per round for as long as one task holds the head, which for a
+    // large task is seconds.
+    //
+    // The completion path consults it too, and may therefore act on a view one
+    // round old. That is safe in both directions: a head that has since
+    // advanced suppresses one direct refill that need not have been, and a head
+    // that has since arrived delays a cohort by one round, after which the
+    // claim pass below refreshes this.
+    int64_t spmd_head_ref{SCHEDULER_TASK_REF_INVALID};
+    uint16_t spmd_head_block_num{0};
+    uint8_t spmd_head_active_mask{0};
+    uint8_t spmd_head_flags{0};
+
     inline __aicore__ explicit SchedulerLocalState(SchedulerLocalProfilingState *profile = nullptr) :
         profiling(profile) {}
     // True on the one core that coordinates this cluster's Mix tasks: its AIC.
@@ -333,7 +350,7 @@ static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 120, "64-bi
 // (see the note on stage_task_trace_before_execution). Eight slot states per
 // core means every byte added here costs eight.
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 496, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 512, "64-bit local state size changed");
 static_assert(
     sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 240, "64-bit local profiling size changed"
 );
@@ -536,6 +553,27 @@ inline __aicore__ uint8_t scheduler_metadata_single_subtask_slot(uint8_t active_
     if (active_mask == 1U) return 0;
     if (active_mask == 2U) return 1;
     return UINT8_MAX;
+}
+
+// Which core type a task of this shape runs on, or none when the shape is not
+// one a single core takes whole. A Mix task has no single answer, which is why
+// its coordinator is named by cluster lane instead.
+inline __aicore__ bool scheduler_shape_runs_on_core_type(uint8_t active_mask, uint32_t self_core_type) {
+    const uint8_t subtask = scheduler_metadata_single_subtask_slot(active_mask);
+    return subtask < 3 && scheduler_metadata_core_type_index(subtask) == self_core_type;
+}
+
+// Whether the SPMD head this core last saw is a sync-start cohort it could run.
+// The completion path consults this to hold a slot open for that cohort rather
+// than refilling it with a successor it just resolved -- without it, a core
+// that resolves a successor on every completion never has a free slot at the
+// moment the claim pass looks, and the cohort assembles only once the rest of
+// the reachable graph has drained.
+inline __aicore__ bool scheduler_spmd_head_is_own_cohort(const SchedulerLocalState *local) {
+    if (local == nullptr || scheduler_task_ref_is_null(local->spmd_head_ref)) return false;
+    if (!scheduler_task_requires_sync_start(local->spmd_head_flags)) return false;
+    if (scheduler_task_is_mix(local->spmd_head_flags)) return local->is_mix_coordinator();
+    return scheduler_shape_runs_on_core_type(local->spmd_head_active_mask, local->config.self_core_type);
 }
 
 inline __aicore__ SchedulerPredicateResult

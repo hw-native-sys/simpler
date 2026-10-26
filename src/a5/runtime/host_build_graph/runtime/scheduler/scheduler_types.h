@@ -1019,7 +1019,9 @@ enum class SchedulerErrorSite : uint64_t {
     COMPLETION_GENERATION_MISMATCH = 74,
     EXECUTOR_PREFERRED_SLOT_INVALID = 79,
     READY_INBOX_REFRESH_FAILED = 80,
-    SPMD_CLAIM_INVALID_BLOCK = 81,
+    // 81 was a block-count range check the host already makes; retired rather
+    // than left as a site nothing can report. These values are diagnostic ABI,
+    // so the number is not reused.
     SPMD_COMPLETION_OVERRUN = 82,
     BOOTSTRAP_FAILED = 90,
     CONTEXT_READY_TIMEOUT = 91,

@@ -37,15 +37,16 @@ import pytest
 
 # Mirrors SCHEDULER_RUNTIME_MODE_* in
 # src/a5/runtime/host_build_graph/runtime/scheduler/scheduler_layout.h.
+# Mode 4 named a shape the resident scheduler declined and is retired: SPMD and
+# sync-start are its own now, and what it cannot run no other scheduler can.
 _MODE_NAMES = {
     0: "none",
     1: "resident (pending)",
     2: "resident (ready)",
     3: "legacy (graph task)",
-    4: "legacy (unsupported shape)",
 }
 _RESIDENT_MODES = frozenset({1, 2})
-_LEGACY_MODES = frozenset({3, 4})
+_LEGACY_MODES = frozenset({3})
 _EXPECTED = {"resident": _RESIDENT_MODES, "legacy": _LEGACY_MODES}
 
 

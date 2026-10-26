@@ -55,11 +55,6 @@ enum class SchedulerGraphResult : uint64_t {
     TIMEOUT = 10,
 };
 
-inline constexpr bool
-scheduler_resident_v0_task_shape_supported(uint32_t active_subtasks, uint32_t logical_block_num, bool sync_start) {
-    return active_subtasks >= 1 && active_subtasks <= 3 && logical_block_num == 1 && !sync_start;
-}
-
 struct SchedulerGraphView {
     // Base of the ChipTaskStorage array. One address, because a task's descriptor
     // and payload are members of one entry rather than peers in two arrays.

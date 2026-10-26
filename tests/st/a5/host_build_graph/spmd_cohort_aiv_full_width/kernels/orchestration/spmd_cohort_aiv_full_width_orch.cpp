@@ -9,6 +9,19 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+/**
+ * One AIV cohort exactly as wide as the machine's AIV population.
+ *
+ * The AIC cohort of spmd_cohort_full_width is one block per cluster; this one
+ * is one block per AIV, which is several per cluster. So the widest cohort of
+ * this kind is a different number, read from a different query, and placing it
+ * means filling every AIV of every cluster rather than one core of each.
+ *
+ * Args layout: [out] + {} -- nothing to configure, the topology decides.
+ */
+
+#include <cstdint>
+
 #include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
@@ -19,10 +32,16 @@ __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_c
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
-    CoreTaskArgs root;
-    root.add_inout(args.tensor(0).ref());
-    root.launch_spec.set_block_num(2);
-    rt_submit_aic_task(0, root);
+    const int32_t aivs = rt_available_aiv_count();
+    if (aivs < 1) {
+        rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "topology reports %d AIV cores", aivs);
+        return;
+    }
+    CoreTaskArgs cohort;
+    cohort.add_inout(args.tensor(0).ref());
+    cohort.launch_spec.set_block_num(aivs);
+    cohort.launch_spec.set_require_sync_start(true);
+    rt_submit_aiv_task(0, cohort);
 }
 
 }  // extern "C"

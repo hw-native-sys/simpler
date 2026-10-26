@@ -1074,9 +1074,7 @@ void release_scheduler_state(Runtime *runtime) {
 }
 
 void select_legacy_scheduler(Runtime *runtime, const HostApi *api, uint32_t mode) {
-    always_assert(
-        mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE
-    );
+    always_assert(mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH);
     runtime->publish_scheduler_bootstrap(mode, 0);
     if (api != nullptr) api->record_scheduler_runtime_mode(mode);
     for (int32_t i = 0; i < runtime->get_worker_count(); ++i) {
@@ -1126,7 +1124,6 @@ bool create_scheduler_state(
     uint64_t spmd_task_count = 0;
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
-    int64_t legacy_shape_task_ref = -1;
     // The progress byte is PENDING or COMPLETED throughout this walk, never
     // PUBLISHED: that value is stored only by the device dispatch path, which
     // has not run yet, and orch::prepare_task resets every claimed slot this
@@ -1225,11 +1222,6 @@ bool create_scheduler_state(
             LOG_ERROR("A5 HBG AICore scheduler: sync-start task ref=%" PRId64 " must have block_num > 1", task_ref);
             return false;
         }
-        if (!scheduler_resident_v0_task_shape_supported(
-                active_subtasks, logical_block_num, slot.task_attrs.requires_sync_start()
-            )) {
-            if (legacy_shape_task_ref < 0) legacy_shape_task_ref = task_ref;
-        }
         SchedulerTaskMetadata &metadata = task_metadata[static_cast<size_t>(task_ref)];
         for (uint32_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
             metadata.kernel_ids[subtask_slot] = (active_mask & (1U << subtask_slot)) != 0 ?
@@ -1245,14 +1237,27 @@ bool create_scheduler_state(
         sampled_task_timing_enabled =
             sampled_task_timing_enabled ||
             (metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT);
+        // Worker demand is what the topology is checked against, and only a
+        // sync-start task makes a demand at all: its blocks wait on each other
+        // inside the kernel, so every one of them has to hold a core at the
+        // same time. An ordinary task of many blocks needs no such thing --
+        // its blocks are claimed as cores free up and run in as many waves as
+        // it takes, so a block count above the core count is routine rather
+        // than a reason to reject the graph.
+        //
+        // A cohort wider than the machine is rejected outright, not run some
+        // other way: there is no second scheduler that could satisfy its
+        // barrier either, so a fallback would only trade this bind-time
+        // message for a device timeout.
+        const uint64_t sync_start_blocks = slot.task_attrs.requires_sync_start() ? logical_block_num : 1;
         if ((active_mask & 1U) != 0) {
             ++aic_task_count;
-            aic_worker_demand = std::max<uint64_t>(aic_worker_demand, logical_block_num);
+            aic_worker_demand = std::max<uint64_t>(aic_worker_demand, sync_start_blocks);
         }
         const uint32_t active_aiv_subtasks = active_subtasks - ((active_mask & 1U) != 0 ? 1U : 0U);
         if (active_aiv_subtasks != 0) {
             ++aiv_task_count;
-            aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, logical_block_num * active_aiv_subtasks);
+            aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, sync_start_blocks * active_aiv_subtasks);
         }
         if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
         if (scheduler_task_is_spmd(metadata.flags)) ++spmd_task_count;
@@ -1264,14 +1269,6 @@ bool create_scheduler_state(
     if (executable_task_count + inline_completed_task_refs.size() != static_cast<uint64_t>(total_tasks)) {
         LOG_ERROR("A5 HBG AICore scheduler: task metadata does not cover the graph");
         return false;
-    }
-    if (legacy_shape_task_ref >= 0) {
-        select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
-        LOG_INFO(
-            "A5 HBG: retaining AICPU scheduling for task ref=%" PRId64 " with SPMD or sync-start shape",
-            legacy_shape_task_ref
-        );
-        return true;
     }
 
     AicoreSchedulerLayout layout{};
@@ -1399,6 +1396,28 @@ bool create_scheduler_state(
             payload->local_context.async_ctx.task_token = TaskId::invalid();
             payload->src_payload = 0;
         }
+    }
+
+    // The Mix payloads need the same prefill, and for the same reason: a
+    // kernel reaches its LocalContext and GlobalContext through these two
+    // argument slots, and nothing on the dispatch path writes them -- the
+    // materialize step fills only the task's own arguments.
+    //
+    // They are a separate array rather than part of any worker's own payloads,
+    // because a Mix slot belongs to a peer AIV and is addressed by that AIV's
+    // rank. Left zero, a Mix subtask that asks which block it is dereferences a
+    // null context; that went unnoticed while no Mix kernel asked, and a Mix
+    // SPMD kernel has to ask.
+    for (uint32_t index = 0; index < SCHEDULER_MIX_SLOT_CAPACITY; ++index) {
+        const uint64_t offset = layout.mix_payloads_offset + index * sizeof(DispatchPayload);
+        auto *payload = scheduler_state_at<DispatchPayload>(host_base, offset);
+        const uint64_t device_payload = aligned_address + offset;
+        payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, local_context);
+        payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, global_context);
+        payload->local_context.block_idx = 0;
+        payload->local_context.block_num = 1;
+        payload->local_context.async_ctx.task_token = TaskId::invalid();
+        payload->src_payload = 0;
     }
 
     runtime->publish_scheduler_bootstrap(

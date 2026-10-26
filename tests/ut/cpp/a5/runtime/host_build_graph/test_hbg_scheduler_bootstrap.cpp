@@ -72,7 +72,7 @@ TEST_F(SchedulerBootstrapFields, LegacySelectionClearsTheResidentBase) {
     EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
     EXPECT_EQ(aicore_scheduler_bootstrap_context(&runtime), nullptr);
 
-    runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE, 0);
+    runtime.publish_scheduler_bootstrap(SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH, 0);
     EXPECT_FALSE(aicore_scheduler_runtime_enabled(&runtime));
     EXPECT_TRUE(aicore_scheduler_explicit_legacy_enabled(&runtime));
     EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0u);

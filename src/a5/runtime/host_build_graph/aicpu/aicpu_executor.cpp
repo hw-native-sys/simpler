@@ -187,6 +187,16 @@ static void log_unfinished_tasks(Runtime *runtime) {
                 INT64_C(-1),
             metadata[task].active_mask, metadata[task].flags
         );
+        // A task of many blocks is unfinished for one of two reasons the fields
+        // above cannot tell apart: blocks nobody claimed, or blocks claimed and
+        // never counted back. The cursor against the counter says which.
+        if (scheduler_task_is_spmd(metadata[task].flags)) {
+            LOG_ERROR(
+                "A5 HBG AICore scheduler: unfinished task=%" PRIu64 " blocks: next=%" PRIu64 " completed=%" PRIu64
+                " of %" PRIu64,
+                task, controls[task].next_block, controls[task].completed_blocks, controls[task].block_num
+            );
+        }
     }
     // A task that is neither on a wake list nor in a queue was dropped between
     // the two; one still queued was never dispatched. The inboxes say which.

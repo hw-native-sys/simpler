@@ -20,6 +20,11 @@
 #include <vector>
 
 #include "scheduler/scheduler_mix.h"
+// Not only for the cases below: this is the one build that compiles the SPMD
+// claim path for the host toolchain at all. Without it the device build is the
+// first thing to see a change here, and a failure there is a wheel that does
+// not build rather than a test that fails.
+#include "scheduler/scheduler_spmd.h"
 #include "runtime_types.h"
 #include "hbg_scheduler_test_support.h"
 
@@ -1528,4 +1533,534 @@ TEST(SchedulerDispatch, SequenceExhaustionDoesNotPublishOrWrap) {
     ));
     EXPECT_EQ(f.local->dispatch_sequence, UINT32_MAX);
     EXPECT_EQ(f.local->local_ready_mask, 0u);
+}
+
+// One cluster, with the SPMD queue holding whatever a case puts there. The
+// cluster's AIC is the core under test: it is both an ordinary claimer and the
+// coordinator a Mix claim has to go through.
+struct SpmdFixture {
+    static constexpr uint32_t kTasks = 6;
+    FixtureStorage storage{kTasks, PLATFORM_CORES_PER_BLOCKDIM, 16};
+    GraphBuffer graph{kTasks};
+    SchedulerLocalState *local;
+
+    SpmdFixture() {
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            auto &context = storage.contexts[lane];
+            context.is_scheduler = 1;
+            context.scheduler_index = lane;
+            context.scheduler_count = PLATFORM_CORES_PER_BLOCKDIM;
+            for (uint32_t peer = 0; peer < PLATFORM_CORES_PER_BLOCKDIM; ++peer)
+                context.cluster_worker_ids[peer] = peer;
+        }
+        storage.run_control->scheduler_count = PLATFORM_CORES_PER_BLOCKDIM;
+        storage.callable_addresses[1] = 0x1000;
+        local = storage.local_context(&storage.contexts[0], &storage.scheduler_local_state);
+        local->has_spmd = true;
+        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot)
+            scheduler_initialize_free_slot(&local->slots[slot]);
+        for (uint32_t lane = 1; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
+            for (uint32_t slot = 0; slot < SCHEDULER_MIX_SLOT_COUNT; ++slot)
+                scheduler_initialize_free_slot(&local->mix_slots[lane][slot]);
+    }
+
+    // `mask` is the task's shape; `blocks` its block count, which also decides
+    // whether the SPMD flag is set at all.
+    void set_task(uint32_t task, uint8_t mask, uint16_t blocks, bool sync_start = false) {
+        graph.mixed(task, mask);
+        auto &metadata = storage.metadata[task];
+        metadata.active_mask = mask;
+        metadata.flags = static_cast<uint8_t>(
+            SCHEDULER_TASK_EXECUTABLE | (__builtin_popcount(mask) > 1 ? SCHEDULER_TASK_MIX : 0) |
+            (blocks > 1 ? SCHEDULER_TASK_SPMD : 0) | (sync_start ? SCHEDULER_TASK_SYNC_START : 0)
+        );
+        metadata.trace_index_base = task * 16;
+        metadata.timing_slot = -1;
+        for (uint8_t subtask = 0; subtask < 3; ++subtask)
+            metadata.kernel_ids[subtask] = (mask & (1U << subtask)) != 0 ? 1 : UINT16_MAX;
+        control(task)->block_num = blocks;
+    }
+
+    void enqueue(uint32_t task) {
+        SchedulerReadyBatch batch{};
+        ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), local, task, &batch, nullptr));
+        ASSERT_TRUE(scheduler_ready_batch_push(
+            storage.scheduler_state->base(), local,
+            scheduler_task_ready_queue(storage.metadata[task].flags, storage.metadata[task].active_mask), &batch,
+            nullptr
+        ));
+    }
+
+    __gm__ SchedulerTaskControl *control(uint32_t task) {
+        return scheduler_task_control_at(storage.scheduler_state->base(), local, task);
+    }
+
+    int64_t head() {
+        const uint64_t packed =
+            scheduler_ready_inbox_at(storage.scheduler_state->base(), local, TaskType::SPMD, 0)->endpoints;
+        return scheduler_ready_endpoints_empty(packed) ? SCHEDULER_TASK_REF_INVALID :
+                                                         scheduler_ready_endpoints_head(packed);
+    }
+
+    bool claim(bool *progress = nullptr) {
+        return scheduler_claim_spmd_block(
+            graph.graph(), storage.scheduler_state->base(), local, storage.run_control, nullptr, 0,
+            storage.ssbuf_region, progress
+        );
+    }
+
+    // Which of this core's own slots a claim just filled. A claim takes the
+    // first free slot, so a completion frees that one and the next claim takes
+    // it again -- the slot a block lands in is not its index.
+    uint32_t slot_holding(int64_t task_ref) {
+        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot)
+            if (local->own_slots()[slot].state == SchedulerDispatchSlotState::READY &&
+                local->own_slots()[slot].task_ref == task_ref)
+                return slot;
+        return UINT32_MAX;
+    }
+};
+
+// The head stays put while its blocks are handed out, which is what lets a task
+// of many blocks reach cores its publisher's queue shard never could.
+TEST(SchedulerSpmdClaim, HandsOutEveryBlockExactlyOnceThenYieldsTheHead) {
+    SpmdFixture f;
+    f.set_task(0, 0b001, 4);
+    f.set_task(1, 0b001, 2);
+    f.enqueue(0);
+    f.enqueue(1);
+
+    // Two slots per core, so four blocks take two passes with a completion in
+    // between. The head must not move until the last one is taken.
+    std::vector<uint16_t> seen;
+    for (uint32_t round = 0; round < 2; ++round) {
+        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
+            bool progress = false;
+            ASSERT_TRUE(f.claim(&progress));
+            ASSERT_TRUE(progress) << "round " << round << " slot " << slot;
+            seen.push_back(f.local->own_slots()[slot].block_idx);
+            EXPECT_EQ(f.local->own_slots()[slot].block_num, 4u);
+        }
+        if (round == 0) {
+            EXPECT_EQ(f.head(), 0) << "the head must not yield with blocks left";
+            for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot)
+                scheduler_initialize_free_slot(&f.local->slots[slot]);
+        }
+    }
+    std::sort(seen.begin(), seen.end());
+    EXPECT_EQ(seen, (std::vector<uint16_t>{0, 1, 2, 3}));
+    EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 4u);
+    // Claimed clean, so the next SPMD task is the head.
+    EXPECT_EQ(f.head(), 1);
+}
+
+// The cursor cannot be put back, so a block taken with nowhere to run is lost
+// for the rest of the run and the task's completed count never reaches its
+// total. Probing first is what makes "it did not fit" cost nothing.
+TEST(SchedulerSpmdClaim, LeavesTheCursorAloneWhenThereIsNowhereToPutTheBlock) {
+    SpmdFixture f;
+    f.set_task(0, 0b001, 4);
+    f.enqueue(0);
+    for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot)
+        f.local->slots[slot].state = SchedulerDispatchSlotState::READY;
+
+    bool progress = false;
+    ASSERT_TRUE(f.claim(&progress));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 0u);
+    EXPECT_EQ(f.head(), 0);
+}
+
+// A core whose type the head does not match leaves it alone and goes on to its
+// own inbox. Nothing about the task changes.
+TEST(SchedulerSpmdClaim, IgnoresAHeadThisCoreCannotRun) {
+    SpmdFixture f;
+    f.set_task(0, 0b010, 4);  // AIV-only, and this core is the cluster's AIC.
+    f.enqueue(0);
+
+    bool progress = false;
+    ASSERT_TRUE(f.claim(&progress));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 0u);
+    EXPECT_EQ(f.head(), 0);
+    EXPECT_EQ(f.local->own_slots()[0].state, SchedulerDispatchSlotState::FREE);
+}
+
+// A core still holding the old head finds the task already claimed clean. The
+// authority is the task's own cursor, so that costs one failed comparison
+// rather than needing a protocol to prevent it.
+TEST(SchedulerSpmdClaim, AClaimAgainstAnExhaustedHeadYieldsItInstead) {
+    SpmdFixture f;
+    f.set_task(0, 0b001, 2);
+    f.set_task(1, 0b001, 2);
+    f.enqueue(0);
+    f.enqueue(1);
+    scheduler_gm_store(f.control(0)->next_block, UINT64_C(2));
+
+    bool progress = false;
+    ASSERT_TRUE(f.claim(&progress));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 2u);
+    EXPECT_EQ(f.head(), 1);
+}
+
+// A graph with no SPMD task must not pay for the queue at all: the gate is what
+// keeps an endpoints read off every core's every pass.
+TEST(SchedulerSpmdClaim, ReadsNothingWhenTheGraphHasNoSpmdTask) {
+    SpmdFixture f;
+    f.local->has_spmd = false;
+    f.set_task(0, 0b001, 4);
+    f.enqueue(0);
+
+    bool progress = false;
+    ASSERT_TRUE(f.claim(&progress));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 0u);
+    EXPECT_TRUE(scheduler_task_ref_is_null(f.local->spmd_head_ref));
+}
+
+// Two blocks of one cohort on one core self-lock: the second waits in a slot
+// the first cannot release, because the first is spinning in a barrier with its
+// core's whole scheduling loop stopped behind it.
+TEST(SchedulerSpmdClaim, RefusesASecondBlockOfTheSameCohortOnOneCore) {
+    SpmdFixture f;
+    f.set_task(0, 0b001, 4, /*sync_start=*/true);
+    f.enqueue(0);
+
+    bool progress = false;
+    ASSERT_TRUE(f.claim(&progress));
+    ASSERT_TRUE(progress);
+    EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 1u);
+
+    // The second slot is free, but it is the same core and the same cohort.
+    progress = false;
+    ASSERT_TRUE(f.claim(&progress));
+    EXPECT_FALSE(progress);
+    EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 1u);
+
+    // An ordinary SPMD task has no such restriction: its blocks wait on nothing.
+    f.set_task(0, 0b001, 4);
+    f.local->spmd_head_ref = SCHEDULER_TASK_REF_INVALID;
+    progress = false;
+    ASSERT_TRUE(f.claim(&progress));
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 2u);
+}
+
+// The head's shape is read once and remembered, so a pass that finds the head
+// unchanged costs the endpoints load alone. Every core pays this on every pass
+// for as long as one task holds the head.
+TEST(SchedulerSpmdClaim, RemembersTheHeadsShapeUntilTheHeadMoves) {
+    SpmdFixture f;
+    f.set_task(0, 0b001, 3);
+    f.enqueue(0);
+
+    bool progress = false;
+    ASSERT_TRUE(f.claim(&progress));
+    ASSERT_TRUE(progress);
+    EXPECT_EQ(f.local->spmd_head_ref, 0);
+    EXPECT_EQ(f.local->spmd_head_block_num, 3u);
+    EXPECT_EQ(f.local->spmd_head_active_mask, 0b001);
+
+    // Draining the queue clears the memo rather than leaving it to describe a
+    // task that is no longer the head.
+    scheduler_gm_store(f.control(0)->next_block, UINT64_C(3));
+    ASSERT_TRUE(f.claim(&progress));
+    EXPECT_TRUE(scheduler_task_ref_is_null(f.local->spmd_head_ref));
+}
+
+// Only the last block of a task resolves its dependents. A block that reported
+// completion as if it were the whole task would release successors onto data
+// its siblings had not written yet.
+TEST(SchedulerSpmdCompletion, HoldsTheTaskOpenUntilItsLastBlockFinishes) {
+    SpmdFixture f;
+    f.set_task(0, 0b001, 4);
+    f.enqueue(0);
+
+    for (uint32_t block = 0; block < 4; ++block) {
+        bool progress = false;
+        ASSERT_TRUE(f.claim(&progress));
+        ASSERT_TRUE(progress) << "block " << block;
+        const uint32_t slot = f.slot_holding(0);
+        ASSERT_NE(slot, UINT32_MAX) << "block " << block;
+        f.local->local_ready_mask &= ~(1U << slot);
+        ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+            f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, slot,
+            f.local->slots[slot].generation, nullptr, nullptr, nullptr, 0, nullptr, nullptr, f.storage.ssbuf_region,
+            nullptr, false
+        )) << "block "
+           << block;
+        const bool last = block == 3;
+        EXPECT_EQ(scheduler_gm_query(f.control(0)->completed_blocks), block + 1);
+        EXPECT_EQ(scheduler_gm_query(f.control(0)->state) == static_cast<int64_t>(SchedulerTaskState::DONE), last)
+            << "block " << block;
+        EXPECT_EQ(f.local->pending_completed, last ? 1u : 0u) << "block " << block;
+    }
+}
+
+// A task of one block counts nothing: its completion must not touch the shared
+// counter, which is what keeps the ordinary path free of an SPMD cost.
+TEST(SchedulerSpmdCompletion, ASingleBlockTaskCountsNoBlocks) {
+    SpmdFixture f;
+    f.set_task(0, 0b001, 1);
+    f.enqueue(0);
+
+    SchedulerReadyClaim ready{};
+    ready.task_ref = 0;
+    const SchedulerFreeSlotClaim claim{0, 0, f.local->slots[0].generation, 0};
+    f.local->slots[0].state = SchedulerDispatchSlotState::FILLING;
+    ASSERT_TRUE(scheduler_fill_dispatch_slot(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, claim, ready, 0,
+        f.storage.ssbuf_region
+    ));
+    f.local->local_ready_mask &= ~1U;
+    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, 0,
+        f.local->slots[0].generation, nullptr, nullptr, nullptr, 0, nullptr, nullptr, f.storage.ssbuf_region, nullptr,
+        false
+    ));
+    EXPECT_EQ(scheduler_gm_query(f.control(0)->completed_blocks), 0u);
+    EXPECT_EQ(scheduler_gm_query(f.control(0)->state), static_cast<int64_t>(SchedulerTaskState::DONE));
+}
+
+// Yielding the head and placing a block are unrelated, and conflating them
+// deadlocks at the worst moment: a Mix head whose last block was just taken has
+// its own blocks sitting in the cluster's Mix slots, so a placement probe
+// cannot succeed. A pop handed a placement would leave the head where it is and
+// every later SPMD task would starve behind it.
+TEST(SchedulerSpmdClaim, YieldsAMixHeadWhoseOwnBlocksFillTheCluster) {
+    SpmdFixture f;
+    f.local->has_mix = true;
+    f.set_task(0, 0b111, 2);
+    f.set_task(1, 0b111, 2);
+    f.enqueue(0);
+    f.enqueue(1);
+
+    for (uint32_t block = 0; block < 2; ++block) {
+        bool progress = false;
+        ASSERT_TRUE(f.claim(&progress));
+        ASSERT_TRUE(progress) << "block " << block;
+    }
+    EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 2u);
+
+    // Both blocks are resident, so nothing in the cluster can be placed.
+    SchedulerMixPlacement placement{};
+    ASSERT_FALSE(scheduler_plan_mix_placement(f.storage.scheduler_state->base(), f.local, 0, &placement));
+    EXPECT_EQ(f.head(), 1) << "the head must yield on its cursor, not on whether it could be placed";
+}
+
+// A direct refill bypasses the claim pass, so a core that resolves a successor
+// on every completion is never seen with a free slot. The cohort then assembles
+// only once the rest of the reachable graph drains, while its already-claimed
+// blocks spin in a barrier holding cores whose scheduling loops are stopped.
+TEST(SchedulerSpmdClaim, HoldsASlotOpenForACohortInsteadOfRefillingIt) {
+    SpmdFixture f;
+    f.set_task(0, 0b001, 1);
+    f.set_task(1, 0b001, 1);
+    // Task 1 waits on task 0, so completing task 0 resolves a successor of this
+    // core's own type -- exactly what the refill path takes.
+    f.graph.executable(1, 0, {0});
+    f.set_task(2, 0b001, 4, /*sync_start=*/true);
+    f.enqueue(2);
+
+    auto dispatch_task_zero = [&] {
+        SchedulerReadyClaim ready{};
+        ready.task_ref = 0;
+        const SchedulerFreeSlotClaim claim{0, 0, f.local->slots[0].generation, 0};
+        f.local->slots[0].state = SchedulerDispatchSlotState::FILLING;
+        ASSERT_TRUE(scheduler_fill_dispatch_slot(
+            f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, claim, ready, 0,
+            f.storage.ssbuf_region
+        ));
+        f.local->local_ready_mask &= ~1U;
+        scheduler_gm_store(f.control(0)->wake_list_head, INT64_C(1));
+        scheduler_gm_store(f.control(1)->next_waiter, SCHEDULER_TASK_REF_INVALID);
+    };
+
+    // The head is read from this core's memo, which the claim pass maintains.
+    SchedulerSpmdHeadVerdict verdict = SchedulerSpmdHeadVerdict::EMPTY;
+    ASSERT_TRUE(scheduler_observe_spmd_head(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, &verdict
+    ));
+    ASSERT_EQ(verdict, SchedulerSpmdHeadVerdict::CLAIMABLE);
+    ASSERT_TRUE(scheduler_spmd_head_is_own_cohort(f.local));
+
+    dispatch_task_zero();
+    bool refilled = true;
+    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, 0,
+        f.local->slots[0].generation, nullptr, nullptr, nullptr, 0, nullptr, &refilled, f.storage.ssbuf_region, nullptr,
+        false
+    ));
+    EXPECT_FALSE(refilled) << "the slot belongs to the cohort at the head";
+    EXPECT_EQ(f.local->slots[0].state, SchedulerDispatchSlotState::FREE);
+    // The successor is not dropped: it joins the queue the ordinary fill reads.
+    const uint64_t aic_endpoints =
+        scheduler_ready_inbox_at(f.storage.scheduler_state->base(), f.local, TaskType::AIC, 0)->endpoints;
+    EXPECT_EQ(scheduler_ready_endpoints_head(aic_endpoints), 1);
+
+    // Without a cohort at the head the same completion refills the slot, which
+    // is what says the suppression is the cohort's doing and not an accident of
+    // this setup.
+    SpmdFixture g;
+    g.set_task(0, 0b001, 1);
+    g.set_task(1, 0b001, 1);
+    g.graph.executable(1, 0, {0});
+    SchedulerReadyClaim ready{};
+    ready.task_ref = 0;
+    const SchedulerFreeSlotClaim claim{0, 0, g.local->slots[0].generation, 0};
+    g.local->slots[0].state = SchedulerDispatchSlotState::FILLING;
+    ASSERT_TRUE(scheduler_fill_dispatch_slot(
+        g.graph.graph(), g.storage.scheduler_state->base(), g.local, g.storage.run_control, claim, ready, 0,
+        g.storage.ssbuf_region
+    ));
+    g.local->local_ready_mask &= ~1U;
+    scheduler_gm_store(g.control(0)->wake_list_head, INT64_C(1));
+    scheduler_gm_store(g.control(1)->next_waiter, SCHEDULER_TASK_REF_INVALID);
+    ASSERT_TRUE(scheduler_task_ref_is_null(g.local->spmd_head_ref));
+
+    refilled = false;
+    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+        g.graph.graph(), g.storage.scheduler_state->base(), g.local, g.storage.run_control, 0, 0,
+        g.local->slots[0].generation, nullptr, nullptr, nullptr, 0, nullptr, &refilled, g.storage.ssbuf_region, nullptr,
+        false
+    ));
+    EXPECT_TRUE(refilled);
+    EXPECT_EQ(g.local->slots[0].task_ref, 1);
+}
+
+// Two cores deciding at once that the head owes nothing is ordinary, not a
+// corner: every core racing for the last block ends its claim loop with the
+// cursor past the end, and every one of them then tries to advance. The second
+// must not carry off the task that just became the head -- its blocks are all
+// still unclaimed, and off the queue nothing can find them.
+//
+// An unguarded pop does exactly that. Its CAS makes the update atomic, not the
+// decision: the loser re-reads the endpoints, finds the successor, and pops it.
+TEST(SchedulerSpmdClaim, ASecondAdvanceDoesNotCarryOffTheNewHead) {
+    SpmdFixture f;
+    f.set_task(0, 0b001, 2);
+    f.set_task(1, 0b001, 4);
+    f.enqueue(0);
+    f.enqueue(1);
+    scheduler_gm_store(f.control(0)->next_block, UINT64_C(2));
+
+    // The first core observes the exhausted head and yields it.
+    ASSERT_TRUE(scheduler_advance_spmd_head(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, nullptr
+    ));
+    EXPECT_EQ(f.head(), 1);
+
+    // The second arrives with the same conclusion about the same task.
+    ASSERT_TRUE(scheduler_advance_spmd_head(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, nullptr
+    ));
+    EXPECT_EQ(f.head(), 1) << "the late advance took a head that still had every block to give out";
+    EXPECT_EQ(scheduler_gm_query(f.control(1)->next_block), 0u);
+
+    // And the claim path still reaches task 1's blocks.
+    bool progress = false;
+    ASSERT_TRUE(f.claim(&progress));
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(scheduler_gm_query(f.control(1)->next_block), 1u);
+}
+
+namespace {
+
+// Dispatch task 0 into slot 0 and register task 1 as its waiter, so completing
+// task 0 resolves a successor this core could take straight back.
+void arrange_completion_with_successor(SpmdFixture &f) {
+    SchedulerReadyClaim ready{};
+    ready.task_ref = 0;
+    const SchedulerFreeSlotClaim claim{0, 0, f.local->slots[0].generation, 0};
+    f.local->slots[0].state = SchedulerDispatchSlotState::FILLING;
+    ASSERT_TRUE(scheduler_fill_dispatch_slot(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, claim, ready, 0,
+        f.storage.ssbuf_region
+    ));
+    f.local->local_ready_mask &= ~1U;
+    scheduler_gm_store(f.control(0)->wake_list_head, INT64_C(1));
+    scheduler_gm_store(f.control(1)->next_waiter, SCHEDULER_TASK_REF_INVALID);
+}
+
+bool complete_slot_zero(SpmdFixture &f, bool *refilled) {
+    return scheduler_service_cluster_completion_slot(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, 0, 0,
+        f.local->slots[0].generation, nullptr, nullptr, nullptr, 0, nullptr, refilled, f.storage.ssbuf_region, nullptr,
+        false
+    );
+}
+
+int64_t aic_inbox_head(SpmdFixture &f) {
+    const uint64_t packed =
+        scheduler_ready_inbox_at(f.storage.scheduler_state->base(), f.local, TaskType::AIC, 0)->endpoints;
+    return scheduler_ready_endpoints_empty(packed) ? SCHEDULER_TASK_REF_INVALID :
+                                                     scheduler_ready_endpoints_head(packed);
+}
+
+}  // namespace
+
+// The completion path consults this core's memo of the SPMD head rather than
+// the queue, which costs it no GM access and makes its view up to one round
+// old. Stale in the direction of "a cohort is waiting" when none is: the slot
+// is held open for nothing, and the successor has to still be somewhere.
+TEST(SchedulerSpmdClaim, AStaleCohortMemoCostsAHoldButNeverTheWork) {
+    SpmdFixture f;
+    f.set_task(0, 0b001, 1);
+    f.set_task(1, 0b001, 1);
+    f.graph.executable(1, 0, {0});
+    // A cohort this core could run, as the memo last saw it -- and nothing on
+    // the queue, as the queue is now.
+    f.local->spmd_head_ref = 2;
+    f.local->spmd_head_flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_SPMD | SCHEDULER_TASK_SYNC_START;
+    f.local->spmd_head_active_mask = 0b001;
+    f.local->spmd_head_block_num = 4;
+    ASSERT_TRUE(scheduler_spmd_head_is_own_cohort(f.local));
+
+    arrange_completion_with_successor(f);
+    bool refilled = true;
+    ASSERT_TRUE(complete_slot_zero(f, &refilled));
+
+    EXPECT_FALSE(refilled);
+    EXPECT_EQ(f.local->slots[0].state, SchedulerDispatchSlotState::FREE);
+    // The hold is the whole cost: the successor is queued, so the ordinary
+    // fill takes it on this same pass.
+    EXPECT_EQ(aic_inbox_head(f), 1) << "a hold that drops the successor is not a hold, it is a loss";
+
+    // And a look at the real queue retires the memo rather than leaving it to
+    // hold slots open forever.
+    SchedulerSpmdHeadVerdict verdict = SchedulerSpmdHeadVerdict::CLAIMABLE;
+    ASSERT_TRUE(scheduler_observe_spmd_head(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, &verdict
+    ));
+    EXPECT_EQ(verdict, SchedulerSpmdHeadVerdict::EMPTY);
+    EXPECT_FALSE(scheduler_spmd_head_is_own_cohort(f.local));
+}
+
+// Stale the other way: a cohort reached the head after this core last looked.
+// The refill goes ahead, which costs the cohort a round -- and the next look
+// is what ends that, so the staleness has to be bounded by the claim pass
+// refreshing the memo rather than by anything the completion does.
+TEST(SchedulerSpmdClaim, AMemoThatHasNotSeenTheCohortYetRefreshesOnTheNextLook) {
+    SpmdFixture f;
+    f.set_task(0, 0b001, 1);
+    f.set_task(1, 0b001, 1);
+    f.graph.executable(1, 0, {0});
+    f.set_task(2, 0b001, 4, /*sync_start=*/true);
+    f.enqueue(2);
+    ASSERT_TRUE(scheduler_task_ref_is_null(f.local->spmd_head_ref));
+
+    arrange_completion_with_successor(f);
+    bool refilled = false;
+    ASSERT_TRUE(complete_slot_zero(f, &refilled));
+    EXPECT_TRUE(refilled) << "nothing told this core a cohort had arrived, so the slot is refilled";
+    EXPECT_EQ(f.local->slots[0].task_ref, 1);
+
+    // The claim pass looks at the queue every round, so the window is one.
+    SchedulerSpmdHeadVerdict verdict = SchedulerSpmdHeadVerdict::EMPTY;
+    ASSERT_TRUE(scheduler_observe_spmd_head(
+        f.graph.graph(), f.storage.scheduler_state->base(), f.local, f.storage.run_control, &verdict
+    ));
+    EXPECT_EQ(verdict, SchedulerSpmdHeadVerdict::CLAIMABLE);
+    EXPECT_TRUE(scheduler_spmd_head_is_own_cohort(f.local));
 }

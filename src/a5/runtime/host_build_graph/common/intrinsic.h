@@ -186,7 +186,6 @@ static __aicore__ inline int32_t get_block_idx(__gm__ int64_t *args) {
 /**
  * Return how many logical blocks the current task requires.
  * All blocks of the same task see the same value.
- * Currently always returns 1 (block_dim>1 not yet implemented).
  *
  * Note: this is NOT the same as RUNTIME_CONFIG.block_dim in
  * kernel_config.py, which controls how many physical cores are launched.

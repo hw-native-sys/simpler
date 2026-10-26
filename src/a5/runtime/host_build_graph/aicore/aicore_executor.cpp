@@ -12,7 +12,7 @@
 #include "aicore/aicore.h"
 #include "aicore/aicore_profiling_state.h"
 // AICore dependency scheduling uses one device-side protocol.
-#include "scheduler/scheduler_mix.h"
+#include "scheduler/scheduler_spmd.h"
 #include "common/platform_config.h"
 #include "dispatch_payload.h"
 #include "runtime.h"
@@ -341,6 +341,21 @@ __aicore__ bool run_ready_dispatch_loop(
                 profiling_level, &direct_refilled_slot_mask, ssbuf_region, &refill_candidates
             );
             scheduler_progress = completion_progress;
+            // Before every other source of work. A block of the SPMD head is
+            // the only work no other core can take on this core's behalf, and
+            // the Mix fill below competes for exactly what a Mix SPMD claim
+            // needs: the coordinator's own slots and its cluster's Mix slots.
+            // Running Mix first would let ordinary Mix work consume the
+            // placement capacity the head was waiting for.
+            //
+            // It is an ordering, not a hold -- a head this core cannot run, or
+            // one it cannot place, leaves it to take Mix and inbox work below
+            // exactly as before.
+            if (!scheduler_claim_spmd_block(
+                    graph, scheduler_state_base, context, run_control, phase_timing_enabled ? &stats->ready : nullptr,
+                    profiling_level, ssbuf_region, &scheduler_progress
+                ))
+                return false;
             if (!scheduler_fill_mix_after_completions(
                     graph, scheduler_state_base, context, run_control, &refill_candidates.mix_ready,
                     &ready_victim_cursors[scheduler_task_type_index(TaskType::MIX)],

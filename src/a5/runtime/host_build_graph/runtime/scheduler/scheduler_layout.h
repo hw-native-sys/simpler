@@ -18,8 +18,12 @@ constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_READY = 2;
 // A zeroed Handshake is not a scheduler choice. Every supported fallback is
 // published explicitly so an ordinary run cannot silently drift back to the
 // legacy dependency scheduler while continuing to pass result-only tests.
+//
+// A graph task is the only one left: a shape the resident scheduler declines is
+// no longer a thing, because SPMD and sync-start are now its own, and anything
+// it cannot run the legacy scheduler cannot run either. Mode 4 named that case
+// and is retired with it; the number is not reused.
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH = 3;
-constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE = 4;
 
 struct AicoreSchedulerLayout {
     uint64_t total_size;

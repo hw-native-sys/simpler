@@ -175,6 +175,9 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         completed_trace->kernel_end_cycles = executor_trace.kernel_end_cycles;
     }
     const uint8_t completed_subtask_slot = local_slot->subtask_slot;
+    // Read with the subtask slot and for the same reason: both say what this
+    // dispatch was, and the clear below is about to forget them.
+    const uint16_t completed_block_num = local_slot->block_num;
     scheduler_mark_completion_consumed(scheduler, cluster_lane, pending_slot, completed_generation, mix_slot);
     uint64_t refill_start_cycles = 0;
     uint64_t refill_end_cycles = 0;
@@ -184,6 +187,28 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         mix_tracker->completed_mask |= 1U << completed_subtask_slot;
         task_complete = mix_tracker->completed_mask == mix_tracker->active_mask;
         if (task_complete) mix_tracker->task_ref = SCHEDULER_TASK_REF_INVALID;
+    }
+    // Aggregation is two levels for a Mix SPMD task and one for the rest. The
+    // tracker above closes a block -- its subtasks, on this core, in local
+    // state. This closes the task: one atomic per block rather than one per
+    // subtask of every block.
+    //
+    // The count comes from the slot, not from the task: the host writes
+    // control->block_num once and never revisits it, so the copy a dispatch
+    // carried is the same value, and a task of one block pays no atomic and
+    // reads no GM at all.
+    if (task_complete && completed_block_num > 1) {
+        __gm__ SchedulerTaskControl *block_control =
+            scheduler_task_control_at(scheduler_state_base, scheduler, task_ref);
+        const uint64_t done = scheduler_gm_fetch_add(block_control->completed_blocks, 1) + 1;
+        if (done > completed_block_num) {
+            scheduler_record_error(
+                run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, scheduler,
+                SchedulerErrorSite::SPMD_COMPLETION_OVERRUN
+            );
+            return false;
+        }
+        task_complete = done == completed_block_num;
     }
     local_slot->task_ref = SCHEDULER_TASK_REF_INVALID;
     local_slot->state = SchedulerDispatchSlotState::FREE;
@@ -203,7 +228,18 @@ inline __aicore__ bool scheduler_service_cluster_completion_slot(
         // the coordinator's alone. resolve_completion hands back a candidate
         // only when the successor's type matches the subtask that just
         // completed, so what lands here is always this core's own kind of work.
-        SchedulerReadyClaim *direct_ready = replacement_ready == nullptr && !mix_slot ? &resolved_ready : nullptr;
+        //
+        // Except while a sync-start cohort this core could run holds the SPMD
+        // head. A direct refill bypasses the claim pass entirely, so a core
+        // that resolves a successor on every completion is never seen with a
+        // free slot and the cohort assembles only once the rest of the
+        // reachable graph has drained -- while its already-claimed blocks spin
+        // in a barrier, each holding a core whose scheduling loop is stopped.
+        // Finite, but indistinguishable from a hang on a real graph. The head
+        // is read from this core's memo, so this costs no GM access.
+        const bool hold_slot_for_cohort = scheduler_spmd_head_is_own_cohort(scheduler);
+        SchedulerReadyClaim *direct_ready =
+            replacement_ready == nullptr && !mix_slot && !hold_slot_for_cohort ? &resolved_ready : nullptr;
         if (!scheduler_resolve_completion(
                 graph, scheduler_state_base, scheduler, run_control, task_ref, wake_stats, ready_stats,
                 completion_stats, profiling_level, false, direct_ready,

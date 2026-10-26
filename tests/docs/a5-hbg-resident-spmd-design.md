@@ -287,7 +287,7 @@ padding，而 `block_idx` 要 16 位（非 sync_start 的 block_num 不设上限
 | `SchedulerFreeSlotClaim` | 加 `uint16_t block_idx{0}` 与 `uint16_t block_num{1}`（prepare 要把两者写进 payload，commit/completion 要用 block_idx 取 trace 下标）。**不设哨兵**：非 SPMD 任务就是「第 0 块，共 1 块」，这是它的真实形状而不是"没有值"，所以每个既有派发点一个分支都不用加 |
 | `SchedulerLocalSlotState` | 同样带 `block_idx` 与 **`block_num`**。后者是 §7.1 判「要不要跨 block 聚合」的依据（`block_num > 1`），放在槽里使完成路径不必读 metadata，也省掉 §7.1 原本要做的 `gm_query(control->block_num)` |
 | `SchedulerReadySource`（`scheduler_types.h:740-744`） | 加 `SPMD_CLAIM = 3`。不加的话这些 block 在 swimlane 里会伪装成 `LOCAL`，而 `ready_source` 正是 §10.2 用来判断 block 从哪来的字段 |
-| `SchedulerErrorSite`（`scheduler_types.h:914-947`） | 新增条目，沿用现有分段编号（ready 80 段 / bootstrap 90 段）：`SPMD_CLAIM_INVALID_BLOCK`、`SPMD_COMPLETION_OVERRUN`（`completed_blocks > block_num`）。**没有专属 site 的失败在设备日志里无法归因** —— `running-onboard.md` 的 507018 triage 整套流程都是按 site 走的 |
+| `SchedulerErrorSite`（`scheduler_types.h:914-947`） | 新增 `SPMD_COMPLETION_OVERRUN`（`completed_blocks > block_num`），沿用 ready 的 80 段。**没有专属 site 的失败在设备日志里无法归因** —— `running-onboard.md` 的 507018 triage 整套流程都是按 site 走的。初版还想加一个 `SPMD_CLAIM_INVALID_BLOCK` 查 block_num 范围，**不要加**：host 侧已经硬拒，设备侧永不可达（见 §10.4 的实做修正 5） |
 
 **不需要** 任何新的 layout offset：没有新结构，所以 `AicoreSchedulerLayout`、
 `SchedulerWorkerContext` 的 `topology_reserved`、`SchedulerLocalConfig` 全都不动。
@@ -383,6 +383,37 @@ head 变了才重读 metadata。这是纯本地状态，不涉及任何共享结
 **就是现有的 pop**：`scheduler_ready_pop_from_inbox` 对 SPMD 队列调用一次，把 head 推到
 `next_waiter`。它的 CAS 以 `endpoints` 当前值为期望，所以两个核同时推进只有一个成功，
 另一个重试时发现 head 已变、或队列已空，都是正常路径。
+
+> **以上两句是错的，S1 实测推翻（2026-10-23）。不要照它实现。**
+>
+> CAS 保证的是**更新原子**，不是**决定正确**。两个核都判定旧队首已认领干净时：第一个 CAS
+> 成功把 head 推到后继；第二个 CAS 失败后**重试，读到新队首，把它也弹掉**——而新队首的
+> block 一个都还没发完，弹掉之后再没有任何队列能找到它。
+>
+> 两个核同时到达这一步是**常态而非竞态边角**：抢最后一块的所有核，CAS 循环都以
+> `current >= block_num` 结束，于是都会去推进。
+>
+> 实测签名（`spmd_mixed_waves` 一个 4×8 的波，第一次跑就命中）：
+>
+> | 任务 | next_block | completed | block_num |
+> | ---- | ---------: | --------: | --------: |
+> | AIC_SPMD | 7 | 7 | 16 |
+> | MIX_SPMD | 1 | 1 | 8 |
+> | MIX_COHORT | 1 | 1 | 4 |
+>
+> `next_block == completed < block_num` 且**队列为空**——认领中途停了，队首却已让位。
+> 表现为 45s op-execute 超时、无 allocator fatal，即"假死锁"签名。
+>
+> **正确做法：推进必须带上"我认为该让位的是谁"，head 不是它就放手。** 这也顺带解决了
+> `placement` 那条（见下），因为不再复用 `scheduler_ready_pop_from_inbox`：
+>
+> ```cpp
+> scheduler_advance_spmd_head(..., int64_t exhausted, ...)
+>   读 endpoints；空 ⇒ 返回
+>   head != exhausted ⇒ 返回（别人已经推过了）
+>   取 next_waiter（未发布则重读）
+>   CAS(endpoints, packed, next_packed)；失败重试，但每轮都重新校验 head
+> ```
 
 **`placement` 必须传 `nullptr`。这一条会静默挂死，不是风格问题。**
 `scheduler_ready_pop_from_inbox`（`scheduler_ready.h:1186`）里有：
@@ -556,6 +587,17 @@ sync_start 的正确性：X 先跑 C2 块等 C2 齐、Y 先跑 C1 块等 C1 齐�
 判据不需要新增状态 —— block 一直占着槽直到完成，所以"扫槽找同一个 `task_ref`"就是精确判断，
 且随完成自动失效。但**扫哪些槽取决于谁是认领者**，两种情况不同：
 
+> **"随完成自动失效"这句的另一面，构造用例时会直接撞上。** 槽是在 block **完成**那一刻
+> 清掉的，所以一个立即返回的 kernel 根本不在扫描视野里停留：它的核转头就能领走同一个
+> cohort 的第二块。这不是缺陷——真正 barrier 的 cohort 里，第一块在所有块就位之前不可能
+> 完成，槽一直占着，判据就是精确的；一个互相不等的 "cohort" 也确实没有东西可以死锁。
+>
+> 但它意味着 **"每核恰好一块"这个分布只在 kernel 真的占住核时才是性质，否则是赛跑。**
+> 2026-10-23 的满宽 AIV cohort 用例就栽在这里：16 个块落在 **9 个核**上，而同一断言在
+> 8 核的 AIC 版上一直是绿的——后者只是块数少、赛跑赢面大。两个用例现在都改用一个先自旋
+> 再 stamp 的 kernel（`spmd_cohort_full_width/kernels/aic/kernel_stamp_block_resident.cpp`），
+> 把 barrier 的"占住槽"这一面补上；AIC 版此前的绿是**运气**，不是看护。
+
 | cohort 形状 | 认领者 | 扫什么 |
 | ----------- | ------ | ------ |
 | AIC-only / AIV-only | **执行核自己** | 自己的 `slots[0..1]` |
@@ -649,11 +691,26 @@ TMR 的 stop-the-world / 二叉 ack 树 / coordinator / `force_gate` + doorbell 
    改法：`const uint64_t sync_start_blocks = requires_sync_start() ? logical_block_num : 1;`
    两处 demand 都用它。sync_start 仍贡献——它才真需要 co-residency。
 
-   **超限的 cohort 硬失败，不回退。** `aicore_lifecycle.cpp:242` 的检查原样保留。本稿初版
-   主张改成整图回退 legacy，理由是"今天所有 sync_start 图都回退 legacy 并能跑"——对超限的
-   图这句话不成立（用户确认 legacy 同样跑不了 `block_num > 核数` 的 sync_start）。回退只会
-   把一个 bind 期的清晰报错（`demand AIC=.. AIV=.. cores AIC=.. AIV=..`）换成 45s 设备超时，
+   **超限的 cohort 硬失败，不回退。** 本稿初版主张改成整图回退 legacy，理由是"今天所有
+   sync_start 图都回退 legacy 并能跑"——对超限的图这句话不成立（用户确认 legacy 同样跑不了
+   `block_num > 核数` 的 sync_start）。回退只会把一个 bind 期的清晰报错换成 45s 设备超时，
    诊断性严格变差。
+
+   > **但真正说话的不是 `aicore_lifecycle.cpp:242`（S1 实测，2026-10-23）。**
+   > 共享的 HBG orchestrator 里早就有一道**无条件**守卫
+   > （`src/common/host_build_graph/host/orchestrator.cpp:815`）：任何 `block_num > 1` 且
+   > `require_sync_start` 的任务，在 **submit 时**就按 `total_aiv_count`（AIV 形状）或
+   > `total_cluster_count`（MIX/AIC）拒掉，报
+   > `REQUIRE_SYNC_START_INVALID / require_sync_start block_num=N > limit=M (deadlock guaranteed)`，
+   > 还带 hint 与文档链接。图根本到不了 `create_scheduler_state`。
+   >
+   > **`:242` 仍然保留，但它不是这条路径的守卫。** 它比的是**握手时实际发现**的核数，而编排
+   > 用的是 orchestration 时的拓扑——两者可能不同（有核没握上手）。它是"拓扑中途缩水"的兜底，
+   > 与刚退役的 `SPMD_CLAIM_INVALID_BLOCK`（和同一个值比第二次）性质不同，不要一并删掉。
+   >
+   > 用例 `spmd_cohort_too_wide` **成对**断言这两半：64 块 + sync_start 必须被拒、64 块无
+   > sync_start 必须跑通。只断言一半没有意义——"所有任务都算 demand"会两个都拒，
+   > "都不算"会两个都收。
 
    > **qwen 同时含 sync_start，这件事有两个后果。** 其一，它那条 sync_start 任务按本方案
    > **仍然贡献 demand**：AIC 24 ≤ 36、AIV 24×2 = 48 ≤ 72，**恰好过关** —— 它是"碰巧不触发"
@@ -699,7 +756,186 @@ TMR 的 stop-the-world / 二叉 ack 树 / coordinator / `force_gate` + doorbell 
 > type，UT 却传 `MIX_QUEUE`(2) 表示"不直填"。顺带把误导人的 `capacity`/`owner_count` 改成
 > `inbox_capacity`/`inbox_count` —— 它们是**inbox 个数**，不是队列能排几个任务（一个 inbox
 > 是侵入式链表，任务数无上限；SPMD 队列只有 1 个 inbox 正是因此才够用）。
-| **S1** | 全部放行：认领、推进 head、两级计数、demand 放宽 + mode=4 换判据、§8.1 的四条。non-sync_start / sync_start / Mix 一并 | 新增 ST 全绿；`scheduler_mode` 断言为 resident；分布断言显示 block 真的跨 cluster；CSA 门禁转为通过 |
+| **S1** | 全部放行：认领、推进 head、两级计数、demand 收窄、§8.1 的四条。non-sync_start / sync_start / Mix 一并 | 新增 ST 全绿；`scheduler_mode` 断言为 resident；分布断言显示 block 真的跨 cluster；CSA 门禁转为通过 |
+
+#### S1 的实际覆盖（2026-10-26）
+
+##### 当前进度
+
+| 口径 | 结果 | 日期 |
+| ---- | ---- | ---- |
+| C++ UT（`ctest -LE requires_hardware`） | 317 全绿，其中 SPMD 14 条 | **10-26，重编后重跑** |
+| a5sim 全量（`--manual include`） | 33 scene + 20 standalone 全绿 | **10-26，最终构建上重跑** |
+| **a5 onboard，12 个 `spmd_*` 目录** | **全绿**，含 `manual` 压力档 | **10-26** |
+| a5 onboard，其余 20 个 a5 HBG 目录 | **19 绿 / 1 红**：`paged_attention::Case2`（见下） | **10-26** |
+| **硬件口径反证** | 3 条全部变红（见下） | **10-26** |
+
+**"全量绿"默认不含 `manual` 档**（§10.5 要求带 `--manual include`，前几轮的全量都漏了这个）。
+
+**H（直填抑制：cohort 真的及时集结）不再追。** 它在 sim 上造不出来——抑制开/关噪声内相同、
+断言本身 flaky，见下。硬件时序与 sim 不同，所以"硬件上也造不出来"**没有被验证过**，只是
+决定不花这个成本。**这一格长期留 ❌**，下面那段测量数据是将来重新讨论 §8.1 第 1 条时的
+起点，不是待办。
+
+> **硬件口径的反证：3 条全部变红，用例在硬件上确实还有鉴别力。** 这件事必须单独做，
+> 因为 dcci 那个 bug 已经证明"sim 绿"有系统性盲区，同理"sim 上能反证"也不蕴含
+> "硬件上还有鉴别力"——`spmd_last_block_releases` 靠非 0 块自旋 20 万次撑出观测窗口，
+> 硬件主频与 sim 不同，窗口完全可能被压没，那它在 onboard 档就是个永远绿的空壳。
+>
+> | 把实现改成 | 用例 | 硬件上的表现 |
+> | ---------- | ---- | ------------ |
+> | 两级计数外层 `done == 1`（第一块即完成） | `spmd_last_block_releases` | `-7.0 vs 28.0`：block 0 写了 0.0，其余 7 块仍是哨兵 |
+> | `fanin_count >= 1`（每次解依赖都入队） | `spmd_multi_fanin` | 6 个 consumer 槽错，与 sim 同形 |
+> | 允许 SPMD 后继直填刚空出的槽 | `spmd_releases_spmd` | 17 个槽错，stage 1–3 几乎全是哨兵 |
+>
+> 三条的红形态都与 sim 上同一反证一致，说明窗口没有被硬件时序压没。反证后已全部撤回，
+> 三个用例在硬件上重新变绿，`src/` 无残留。
+>
+> **`paged_attention::Case2` 上板红，与 SPMD 无关，但不能当它不存在。** 它报
+> `FATAL: Graph Too Large!  Tasks: used=16384/16384` —— 这是容量判决，不是缺陷：
+> 同目录的 `Case1` 显式写了 `"runtime_env": {"ring_task_window": 131072}`，**`Case2`
+> 一个都没写**，于是吃默认的 16384，装不下它的图。
+>
+> 它是 `manual: True` 且 `platforms` 只有 `a5`，所以 sim 永远够不着、PR 门禁也不跑
+> （`ci.yml` 的 `st-onboard-a5` 不传 `manual_mode`，默认 `exclude`）。**但 `daily.yml`
+> 的 `st-onboard-a5` 传了 `manual_mode: include`，每天的全量上板扫会跑到它。**
+> 所以"CI 不跑"只对 PR 门禁成立，对 Daily 不成立。
+>
+> 归因**已实测**，不是推断：`git stash` 掉 `src/` 的全部 S1 改动、重装后跑同一个 case，
+> **失败完全一致**（同样的 `prepare_native_run -1000`、同样的 `Tasks: used=16384/16384`）。
+> 所以它是既存缺陷，与 S1 无关。修法是给 `Case2` 补上 `ring_task_window`，照 `Case1` 的
+> 写法——**不在本次改动范围内，没动。**
+
+#### 用例清单：每个目录测什么
+
+12 个 `spmd_*` 目录，共 24 个可执行用例（scene case + standalone test 分开计）。
+
+| 目录 | 用例 | 这一条钉住的点 |
+| ---- | ---- | -------------- |
+| `spmd_multiblock_aic` | `aic_block_num_8` | AIC 多块的基本派发：每块拿到互不相同的 `block_idx`，且都看到同一个 `block_num` |
+| | `aiv_block_num_16` | 认领者是 AIV 自己而非 cluster 的 AIC |
+| | `aiv_block_num_128_waves` | `block_num > 核数`：demand 收窄后不再拒图，分波次跑完 |
+| | `test_spmd_blocks_reach_past_one_shard` | 块真的跨 shard 铺开——全局队列绕开了 7 核可见半径 |
+| `spmd_last_block_releases` | `sum_of_8_blocks` | **两级计数的外层**：只有末块解依赖。consumer 读每一块的槽，非 0 块自旋制造窗口 |
+| `spmd_mix_block_closes_last` | `mix_blocks_6` | **两级计数的内层**：一个 Mix block 在它**最后一个**子任务上关闭，不是第一个 |
+| `spmd_releases_spmd` | `chain_of_4_spmd_stages` | SPMD 后继**必须入队、不可直填**（没有核能独占一个全机认领的任务）；4 级链每级都让队列空一次 |
+| `spmd_multi_fanin` | `fanin_4_into_spmd` | fanin=4 的 SPMD 后继**只在最后一次解依赖时入队**；4 个前驱分属 AIC/AIV/AIC-SPMD/AIV-SPMD，覆盖两条不同的解依赖代码路径 |
+| `spmd_cohort_full_width` | `test_full_width_cohort_uses_every_core_once` | 满宽 AIC cohort：每核恰好一块。宽度取自拓扑，少一块就有余量、错了看不出来 |
+| `spmd_cohort_aiv_full_width` | `test_full_width_aiv_cohort_uses_every_aiv_once` | 形状决定谁能认领：`mask 0b010` 的块**只有 AIV 能领**，AIC 必须拒。宽度是 AIV 数，比 AIC 多 |
+| `spmd_sync_start_mix_aiv` | `mix_aiv_cohort_8` | 没有 AIC 子任务的 Mix cohort（`flags` 说 MIX 但只有两个 AIV） |
+| | `test_cohort_blocks_land_on_distinct_clusters` | 该形状的放置必须**扫 mix 槽**；只扫自有槽会漏判 |
+| `spmd_cohort_too_wide` | `test_cohort_wider_than_the_machine_is_refused` | 超宽 cohort 在**提交时**被拒，报错指名 demand 与核数 |
+| | `test_ordinary_task_that_wide_runs_in_waves` | 同样宽度的**非** sync_start 任务照常跑——与上一条成对才有意义 |
+| | `test_sync_start_on_a_single_block_is_dropped_not_refused` | 一块的 cohort 静默降级为普通任务，**不是报错** |
+| `spmd_predicated` | `test_predicate_on_a_multi_block_task_is_refused` ×2（gate 两种取值） | predicate × 多 block 在 bind 期拒图；gate 取值不影响结论——影响了就说明 gate 被读过 |
+| | `test_the_same_predicate_on_one_block_runs` ×2 | 同一个 predicate 在单块上正常工作——否则上一条会被"predicate 整体坏掉"满足 |
+| `spmd_mixed_waves` | `waves_4x8` / `waves_4x8_shifted` | 8 种形状（普通/SPMD × AIC/AIV/Mix + 两种 cohort）成波同时 ready，交叉组合**不死锁**。两个 seed 错开形状与波边界的相对位置 |
+| | `waves_40x24_stress`（manual） | 同一转换重复数百次、单波宽于整机的规模档 |
+| `spmd_paged_attention` | （manual） | 真实负载形状下的 SPMD |
+
+**这张清单读法**：每行"钉住的点"是**该用例唯一能抓到的东西**。能被别的用例抓到的性质
+不写在这里——否则一条失败会指向三个地方，而这正是这张表想避免的。
+
+| 场景 | 它唯一能抓到的东西 | 载体 | 状态 |
+| ---- | ------------------ | ---- | ---- |
+| AIV-only 多块 | 认领者是 AIV 而非 cluster 的 AIC；HBG 此前零覆盖 | `spmd_multiblock_aic::aiv_block_num_16` | ✅ |
+| block_num > 核数 | demand 收窄 + 分波次执行 | `spmd_multiblock_aic::aiv_block_num_128_waves` | ✅ |
+| block 跨 shard 铺开 | 全局队列绕开 7 核可见半径 | `test_spmd_blocks_reach_past_one_shard` | ✅ |
+| AIV-only Mix cohort 放置 | **扫 mix 槽**（扫自有槽会漏判此形状） | `test_cohort_blocks_land_on_distinct_clusters` | ✅ |
+| 非末块不解依赖 | 后继被提前放行读到未写数据 | `spmd_last_block_releases` | ✅ **已反证** |
+| 多 SPMD 同时 ready / 由 producer 解出 / 交叉与规模 | 队首唯一、推进 head、混合形状并发**不死锁** | `spmd_mixed_waves` | ✅ |
+| 两 cohort 背靠背**不互锁** | 队首唯一即互斥 | `spmd_mixed_waves`（调色板同波含两种 cohort） | ◐ §8.1 的 generation 序"C1 必然完成"链未单独断言 |
+| **满宽 cohort** | 最紧的 co-residency：少一块就有余量，错了也看不出来 | `spmd_cohort_full_width` | ✅ |
+| 超宽 cohort 被拒 / 同宽普通任务跑通 | §9 改过的 demand 判据，**成对**才有意义 | `spmd_cohort_too_wide` | ✅ |
+| Mix 子任务完成错开 | **两级计数的内层**——block 内聚合 | `spmd_mix_block_closes_last` | ✅ **已反证** |
+| 直填抑制：memo 陈旧时**不丢工作** | 两个陈旧方向各自的安全性 | C++ UT（`AStaleCohortMemo…` / `AMemoThatHasNotSeen…`） | ✅ |
+| **直填抑制：cohort 真的及时集结** | §8.1 第 1 条的**目的**——没有它，cohort 要等图里其余可达工作跑完 | — | ❌ **试过，造不出来**（见下） |
+| **AIV-only cohort** | `mask 0b010` + sync_start；调色板里只有 AIC 与 Mix cohort | `spmd_cohort_aiv_full_width` | ✅ **已反证** |
+| **SPMD → SPMD 依赖** | SPMD 任务的 producer 也是 SPMD；`spmd_mixed_waves` 的每个波都挂在普通 join 上 | `spmd_releases_spmd` | ✅ **已反证** |
+| **SPMD 任务多 fanin** | 多个 producer 解出同一个 SPMD 任务 | `spmd_multi_fanin` | ✅ **已反证** |
+| **sync_start + block_num=1** | 编排侧 `block_num > 1` 才 `set_sync_start()` | `spmd_cohort_too_wide::…single_block_is_dropped…` | ✅ 但**不是"被拒"**（见下） |
+| **predicate × 多 block** | 两个特性从未在一张图里碰过；bind 直接拒图 | `spmd_predicated` | ✅ 钉住现状（**既存限制**，见 `KNOWN_ISSUES.md`） |
+| **onboard** | sim 是 8 cluster，硬件 32/36；时序与竞争完全不同 | 全部 12 个 `spmd_*` 目录 | ✅ **2026-10-26 首次上板，并由此揪出一个 bug（见下）** |
+
+> **上板前这张表每一格都是 sim 口径，而 sim 看不见 cache。** 2026-10-26 第一次把
+> `spmd_*` 送上 a5 硬件，12 个目录里当场红了 3 个——全是"kernel 读另一个核写的 GM"
+> 的那几个（`spmd_last_block_releases`、`spmd_mix_block_closes_last`、
+> `spmd_releases_spmd`），只写不读的 `spmd_multiblock_aic` 照常绿。
+>
+> 根因**不在 runtime，在这批测试 kernel 自己**：`dcci` 在 CCE 与 `pto/common/cpu_stub.hpp`
+> 里都是**函数**，从来不是宏，而这些 kernel 写的是 `#ifndef dcci` 就把它 `#define` 成空操作。
+> 这个条件**恒真**，于是上板时整套 cache 维护被编译掉：producer 从不回写，consumer 读到初值。
+> 仓里另外 60 个 kernel 用的都是 `#ifdef PTO_CPUSTUB_HPP`（只在 CPU stub 下置空）——
+> **是 SPMD 这批自己另起了一套写法**，不是仓库没有约定。
+>
+> 两个"看起来很像"的假设都被**测**掉而不是想掉：给完成路径加
+> `block_idx < block_num` 的独立对账（没响）、给 bootstrap 加游标非零检查（没响）。
+> 真正定性的是 chip swimlane——8 个 block 最晚结束 `…195492276`，consumer 开始
+> `…195502470`，**晚 10 µs**。**解依赖是对的**，最初顺着"没等所有 block"查是查错了方向。
+> 这两个诊断用的守卫事后都已撤回，`src/` 没有因此留下改动。
+>
+> 修法两步，都照仓里已有写法：14 个 kernel 的守卫改成 `#ifdef PTO_CPUSTUB_HPP`；4 个读前驱
+> 输出的 kernel 补上读前失效（`dcci(ptr, SINGLE_CACHE_LINE)` + `dsb`），照
+> `fanout_imbalance/kernels/fanout_worker.cpp`。注意**不能写成
+> `cache_line_t::SINGLE_CACHE_LINE`**：这些文件自己 `#define SINGLE_CACHE_LINE 0`，宏先展开
+> 会变成 `cache_line_t::0`，sim 编得过、ccec 编不过。
+>
+> 留下的规矩：**新 kernel 直接照抄仓里已有的前导，不要自己发明条件编译**；以及
+> **每造完一个用例就上板一次**，sim 绿不代表硬件绿，这条表之前整体是 sim 口径就是代价。
+>
+> **这张表自己的教训：`spmd_mixed_waves` 覆盖的是"不死锁"，不是"不被拖慢"。**
+> 它的 golden 顺序无关——这正是它能跑任意形状、任意规模的前提，也正因如此它对**时序**
+> 完全不敏感。先前据它把"cohort 与普通任务交错"标成已覆盖是高报：那条规则
+> （§8.1 第 1 条）的目的是 cohort 不被直填饿死，而饿死的表现是慢，不是错。
+>
+> 另外两条（SPMD→SPMD 依赖、SPMD 多 fanin）在开工前的维度分析里出现过，但**没有被带进
+> 那张"不冗余场景"表**——筛选时漏掉的，不是后来才想到的。凡是依赖关系落在 SPMD 任务
+> **之后**的场景都在这个盲区里：`spmd_mixed_waves` 的每个波都挂在普通 join 上，所以
+> "末块解依赖"这条今天改过两次的路径，只有 `spmd_last_block_releases` 一个 AIC-only 的
+> consumer 在守。
+>
+> **直填抑制（§8.1 第 1 条）的收益，在 sim 上量不出来。** 2026-10-23 试过一个专门的用例：
+> 满宽 cohort + 每核两条自我补给的链（两个 dispatch 槽都占满）+ 一个 gate 任务把 cohort 的
+> 到达推迟到链跑起来之后（否则 cohort 只是**赢在起跑**——认领排在 `fill_own_slots` 之前，
+> 和链同时 ready 时它先拿到空槽，根本不存在饥饿）。把抑制编译掉再跑同一个图：
+>
+> ```text
+> 抑制关闭: cohort (665500, 966730)   最后一层 (3054520, 5247200)
+> 抑制开启: cohort (634880, 937320)   最后一层 (3095980, 5300250)
+> ```
+>
+> 噪声范围内相同。而且那个用例**本身是 flaky 的**——换一轮跑，cohort 就落到最后一层之后去了，
+> 它断言的顺序根本不稳定。已删除：交一个 flaky 用例比不交更坏，噪声会盖住真实失败。
+>
+> 所以这条留在 ❌，而且**结论比"没测"更强一点**：要么这个形状上直填根本没发生，要么认领
+> 那一遍无论如何都能摸到每个刚空出的槽——从外面看两者一样。§8.1 第 1 条是否真的必要是
+> **开放的**，上面的数据是重新讨论它时的起点。也可能只是 8 核、空 kernel 的规模下观察不到。
+>
+> **"已反证"是比"通过"强的状态**：故意把实现改坏，确认该用例变红。本轮对三处做过——
+> 两级计数的**外层**旁路后 `spmd_last_block_releases` 报 `-7.0 vs 28.0`（consumer 在第一块
+> 完成时被放行，读到 7 个哨兵）；**内层**旁路后 `spmd_mix_block_closes_last` 报
+> `site=74 COMPLETION_GENERATION_MISMATCH`——注意这里**不是**数据错误：每个子任务都去关闭
+> tracker 并清掉 `task_ref`，同 block 的第二个子任务当场被既有校验拦住，比数据错误早一步；
+> 以及用探针确认 `manual` / 多 case 的 case 真的被执行（`waves_40x24_stress` 报 1001 个任务）。
+> 对"错了结果可能仍然正确"的性质，不做这一步就只是自我安慰。
+>
+> 2026-10-23 补的三条也都反证过：把两级计数外层改成"第一块即完成"，`spmd_releases_spmd`
+> 报 18 个槽被污染（stage 1–3 的全部 block）；把 `type == direct_type` 放宽到允许 SPMD 直填，
+> 同一用例再次变红（SPMD 后继被当成单块塞进刚空出的槽，只跑了 block 0）；把
+> `fanin_count == 1` 放宽成 `>= 1`，`spmd_multi_fanin` 报 6 个 consumer 槽错（任务被重复入队）；
+> 把 `scheduler_shape_runs_on_core_type` 改成恒真，`spmd_cohort_aiv_full_width` 直接 poison
+> （AIC 核认领了 AIV-only 的块）。
+>
+> **`sync_start + block_num=1` 这条的"被拒"是写错了的预期。** 编排侧
+> `src/common/host_build_graph/host/orchestrator.cpp:815` 是
+> `if (block_num > 1 && args.launch_spec.require_sync_start())` —— block_num 为 1 时
+> `set_sync_start()` **根本不会被调用**，属性在建图之前就没了。所以
+> `runtime_maker.cpp:1221` 那条 `sync-start task must have block_num > 1` 守卫，
+> **从这套 API 过来的任何图都碰不到**，它是防御性 backstop 而非可观测契约。
+>
+> 一块的 cohort 一经派发就天然共驻，没有东西要等，静默清掉属性在语义上是对的，不是缺陷。
+> 所以这一格落到 `spmd_cohort_too_wide` 里断言的是**它照常跑完**，而不是它被拒绝——
+> 断言拒绝等于断言一条没有调用者的路径。
 
 S0 单独合入的价值与阶段 0（改名）相同：它是可验证的零行为变化改动，把 S1 的 diff 压到只剩
 真正的逻辑。
@@ -757,6 +993,43 @@ UT 覆盖不到的只有两类：`aicore_executor.cpp`（**C++ UT 不编译它**
 的 manual 规模档。
 
 ### 10.4 ST 的家底与缺口（已调查，2026-10-22）
+
+> **S1 实做修正（2026-10-23）。** 本节下面的调查结论仍然有效，但开工后有四件事与它不同，
+> 其中两件改变了后续用例的写法：
+>
+> 1. **`mix_payloads` 数组的 context 指针从未被初始化** —— 既有缺陷，S1 发现并修复。
+>    只有每核自有槽的 payload 预填了 `args[48]/[49]`（Local/GlobalContext），mix 槽那一份没有。
+>    于是任何落在 mix 槽上的子任务一调 `get_block_idx()` / `get_block_num()` /
+>    `get_sub_block_id()` 就解引用空指针（sim 上表现为 host 段错误，因为 kernel 是 dlopen 在
+>    host 跑的）。一直没被发现，是因为现有 HBG Mix kernel 没有一个读 context；**而 Mix SPMD
+>    必须读 `get_block_idx`**，所以不修这条路根本走不通。a2a3 的 HBG 没有 mix payload 数组，
+>    不受影响。
+> 2. **a5sim 是 8 cluster / 24 核**（8 AIC + 16 AIV）。本机 a5 是 32 cluster，别的机器 36。
+>    用例规模一律由 `rt_available_cluster_count()` / `rt_available_aiv_count()` 在编排里推，
+>    或取与拓扑无关的值；**Python 侧没有核数接口**，要拿只能从 swimlane 的 `metadata` 读。
+> 3. **普通 SPMD 任务的 block 分布不确定。** 同一张图量到过 8 个核，也量到过 7 个——一个核
+>    会在相邻轮次里拿第二块而另一个核一块没拿到。设计只承诺"每核每轮至多 1 块"，从不承诺
+>    均分，所以铺开断言只能是**下限**。而且在 AIC 上测不出来：sim 只有 8 个 AIC，一个
+>    directory shard 容 7 个 owner，余量只有 1 个核。用 AIV（sim 16 个）才有余量。
+> 4. **cohort 的放置断言反而是确定性的。** 规则 2（每核每 cohort 至多一块）是硬约束而非调度
+>    偏好，所以"N 块占据 N 个互不相同的 cluster"要么成立要么不成立，不会抖。这使得 sync_start
+>    的放置**不需要**写一个会挂死 45s 的 barrier kernel 来验证——TMR 的 sync_start kernel 里
+>    本来也没有 barrier，没有现成的可借。
+> 5. **`SPMD_CLAIM_INVALID_BLOCK` 已删除。** 它判 `block_num == 0 || > UINT16_MAX`，而
+>    `runtime_maker` 在 host 侧已经硬拒这两种情况，设备侧永远不可能看到——不可达的守卫
+>    比没有守卫更坏，它暗示了一种不存在的失败。`SPMD_COMPLETION_OVERRUN` 保留：
+>    `completed_blocks > block_num` 是计数逻辑自身出错的签名，不是输入问题。
+>
+> **S1 至今改出的缺陷（两个，归属不同）：**
+>
+> | 缺陷 | 谁引入的 | 为什么之前没暴露 |
+> | ---- | -------- | ---------------- |
+> | mix payload 的 context 指针未初始化 | **per-core 改造**（建 `mix_payloads` 时漏了），不是 SPMD | HBG 现有 Mix kernel 一个都不读 context；而 Mix SPMD kernel 必须读 `get_block_idx` |
+> | 推进 head 缺身份校验 | **SPMD 方案本身**，而且 §6.3 明确论证过它安全 | 只有队列里排着第二个 SPMD 任务时才可能发生；前面 5 个用例全是单 SPMD 任务 |
+>
+> 由此得到一条判读规则：**设计里凡是用"因为是 CAS / 原子"收尾的论证，都按未验证对待。**
+> 同型的只有 §6.3 一处（已修）；§4.2 靠的是 CAS **失败**（安全侧），§6.2 的放置探测靠的是
+> 协调者独占写 mix 槽，都不是从原子性推出的。
 
 > **用户决定：先把功能做好，暂不移植 TMR 用例。** 本节是调查结论的留存，供移植阶段开工时
 > 直接取用，**不是 S1 的前置条件**。但其中「S1 必然变红的 4 个用例」是 S1 自己要处理的。
