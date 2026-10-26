@@ -752,6 +752,122 @@ TEST_P(HbgGmMixInactiveLane, InactiveResourceLaneMustArriveButNeverRunsAKernel) 
 
 INSTANTIATE_TEST_SUITE_P(MasksWithInactiveResourceMember, HbgGmMixInactiveLane, ::testing::Values<uint8_t>(3, 5, 6));
 
+class HbgGmMixOrdinaryResource : public ::testing::TestWithParam<std::tuple<uint8_t, uint32_t, uint32_t>> {};
+
+TEST_P(HbgGmMixOrdinaryResource, ArrivesOnlyAfterRealOrdinarySlotCompletionIsConsumed) {
+    const auto [mask, lane, pending_slot] = GetParam();
+    const uint8_t ordinary_mask = lane == 0 ? 1 : 2;
+    GmMixFixture fixture({{1, ordinary_mask}, {1, ordinary_mask}, {1, mask}});
+    auto *local = fixture.locals[lane];
+    const uint32_t core_type = lane == 0 ? 0 : 1;
+    const uint32_t first_task = lane == 2 ? 1 : 0;
+    SchedulerReadyBatch batch{};
+    for (uint32_t task : {first_task, 1U - first_task}) {
+        ASSERT_EQ(
+            scheduler_route_task(fixture.graph.graph(), fixture.base(), local, fixture.run(), task, nullptr),
+            SchedulerRouteResult::READY_TO_ENQUEUE
+        );
+        ASSERT_TRUE(scheduler_ready_batch_append(fixture.base(), local, task, &batch, nullptr));
+    }
+    ASSERT_TRUE(scheduler_ready_batch_push(fixture.base(), local, core_type, &batch, nullptr));
+    ASSERT_TRUE(fixture.fill(lane));
+    ASSERT_EQ(local->local_ready_mask, 3u);
+    GmExecution ordinary{};
+    ASSERT_TRUE(fixture.begin(lane, &ordinary));
+    ASSERT_EQ(ordinary.slot, 0u);
+    if (pending_slot == 1) {
+        ASSERT_TRUE(fixture.complete(ordinary));
+        ASSERT_TRUE(fixture.begin(lane, &ordinary));
+    }
+    ASSERT_EQ(ordinary.slot, pending_slot);
+    ASSERT_FALSE(local->slots[pending_slot].cooperative);
+    ASSERT_EQ(local->slots[pending_slot].state, SchedulerDispatchSlotState::READY);
+    const uint32_t consumed = scheduler_consumed_completion_generation(local, lane, pending_slot);
+    ASSERT_LT(consumed, ordinary.generation);
+
+    ASSERT_TRUE(fixture.admit(2, 3));
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_TRUE(scheduler_ordered_park_ordinary(fixture.graph.graph(), local, fixture.run()));
+    ASSERT_EQ(local->local_ready_mask, 0u);
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.publish(0));
+    bool progress = false;
+    for (uint32_t member : {1U, 2U})
+        ASSERT_TRUE(fixture.observe(member, &progress));
+    for (uint32_t member : {0U, 1U, 2U}) {
+        if (member == lane) continue;
+        ASSERT_TRUE(fixture.arrive(member, &progress));
+        EXPECT_TRUE(progress);
+    }
+
+    for (bool returned : {false, true}) {
+        SCOPED_TRACE(returned);
+        if (returned) local->local_completed_generations[pending_slot] = ordinary.generation;
+        EXPECT_EQ(local->local_completed_generations[pending_slot] == ordinary.generation, returned);
+        EXPECT_EQ(scheduler_consumed_completion_generation(local, lane, pending_slot), consumed);
+        progress = true;
+        ASSERT_TRUE(fixture.arrive(lane, &progress));
+        EXPECT_FALSE(progress);
+        EXPECT_EQ(fixture.admissions[lane].gm_mix.phase, SchedulerGmMixPhase::PUBLISHED);
+        EXPECT_EQ(scheduler_gm_fetch_add(fixture.mailbox(0)->lanes[lane].arrived_seq, UINT64_C(0)), 0u);
+        EXPECT_EQ(local->slots[pending_slot].task_ref, ordinary.task);
+        EXPECT_EQ(local->slots[pending_slot].generation, ordinary.generation);
+        EXPECT_EQ(local->slots[pending_slot].state, SchedulerDispatchSlotState::READY);
+        for (uint32_t member : {0U, 1U, 2U}) {
+            progress = true;
+            ASSERT_TRUE(fixture.prepare(member, &progress));
+            EXPECT_FALSE(progress);
+            EXPECT_EQ(fixture.locals[member]->local_ready_mask, 0u);
+        }
+        EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(2)->completed_blocks, UINT64_C(0)), 0u);
+    }
+
+    ASSERT_TRUE(fixture.complete(ordinary));
+    ASSERT_EQ(local->slots[pending_slot].state, SchedulerDispatchSlotState::FREE);
+    EXPECT_EQ(scheduler_consumed_completion_generation(local, lane, pending_slot), ordinary.generation);
+    ASSERT_TRUE(fixture.arrive(lane, &progress));
+    EXPECT_TRUE(progress);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.mailbox(0)->lanes[lane].arrived_seq, UINT64_C(0)), 1u);
+    for (uint32_t member : {0U, 1U, 2U}) {
+        ASSERT_TRUE(fixture.prepare(member, &progress));
+        EXPECT_TRUE(progress);
+        const bool active = (mask & (1U << member)) != 0;
+        EXPECT_EQ(
+            fixture.admissions[member].gm_mix.phase,
+            active ? SchedulerGmMixPhase::RUNNING : SchedulerGmMixPhase::RELEASED
+        );
+        EXPECT_EQ(fixture.locals[member]->local_ready_mask != 0, active);
+    }
+    ASSERT_TRUE(fixture.finish_lanes(0));
+    ASSERT_EQ(fixture.retire(0), SchedulerGmMixResult::TASK_LAST);
+    ASSERT_TRUE(fixture.complete_task(2, 0));
+    for (uint32_t worker = 0; worker < fixture.locals.size(); ++worker) {
+        bool closed = false;
+        ASSERT_TRUE(fixture.close(worker, &closed));
+        EXPECT_TRUE(closed);
+    }
+    ASSERT_TRUE(fixture.fill(lane));
+    GmExecution resumed{};
+    if (pending_slot == 0) {
+        ASSERT_TRUE(fixture.begin(lane, &resumed));
+        EXPECT_EQ(resumed.task, 1 - ordinary.task);
+        EXPECT_FALSE(local->slots[resumed.slot].cooperative);
+        ASSERT_TRUE(fixture.complete(resumed));
+    }
+    EXPECT_FALSE(fixture.begin(lane, &resumed));
+    for (uint32_t task : {0U, 1U, 2U})
+        EXPECT_EQ(scheduler_gm_load(fixture.control(task)->state), static_cast<int64_t>(SchedulerTaskState::DONE));
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.control(2)->completed_blocks, UINT64_C(0)), 1u);
+    EXPECT_EQ(scheduler_gm_fetch_add(fixture.run()->scheduler_error, UINT64_C(0)), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    EveryMaskLaneAndOwnSlot, HbgGmMixOrdinaryResource,
+    ::testing::Combine(
+        ::testing::Values<uint8_t>(3, 5, 6, 7), ::testing::Values<uint32_t>(0, 1, 2), ::testing::Values<uint32_t>(0, 1)
+    )
+);
+
 TEST(HbgGmMix, KernelReturnWithoutCompletionReleaseDoesNotRetireTheGroup) {
     GmMixFixture fixture({{1, 7}});
     ASSERT_TRUE(fixture.admit(0));

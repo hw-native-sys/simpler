@@ -69,6 +69,10 @@ MixCloseSeal 为 8 × Mix task 数 × 候选 cluster 数字节，避免复用 ma
 - Mix 组身份：epoch、task、block、order、cluster、group_seq、active mask、placement。
 - Host 最窄边界是 `N > 0 && N * popcount(mask) <= INT16_MAX`，即 32767。
   resident maker 已改用该上界；uint16 的存储类型不代表允许到 65535。
+- 公共 HBG `LaunchSpec::set_block_num` 以 int64_t 接收请求，检查 int16_t 范围后再窄化。
+  超出范围保存为非法 0，既有 Host submit 以 INVALID_ARGS 拒绝且不发布任务存储。
+  字段布局维持 4B／align 2；可表示值原样保存，0 和负值仍由 submit 拒绝。
+  旧编排必须重新编译；调用者显式提前转为 int16_t 后的信息丢失不在 setter 内补造。
 - 位移、block/subtask 乘积、trace 前缀先用足够宽类型计算，再检查后窄化。
   原子计数和 seq 不回绕；临近上限在新领取／发布前失败。
 - 无 kernel 的服务节点独立走既有逻辑完成，不假造一个 kernel block。
@@ -79,7 +83,11 @@ MixCloseSeal 为 8 × Mix task 数 × 候选 cluster 数字节，避免复用 ma
 sync_start 的 N 必须不超过本轮冻结成员中不同执行位置数：C 按 AIC，V 按 AIV，
 Mix 按完整 cluster；两个 pending slots 不是两个执行位置。
 先开放普通 C/V、GM Mix、原样 CSA，再开放 sync_start。
-多 block predicate、Graph body、异步返回先保留现有拒绝／整图回退，不顺手删除形状门禁。
+多 block／Mix predicate 保留 Host 拒绝，Graph body 保留整图回退，不顺手删除形状门禁。
+异步返回未开放：resident payload 的 task token 无效、completion 三指针为空、capacity=0，
+公开 register_completion_condition 返回 false。Host 没有任意异步 kernel 的自动识别／回退机制。
+save_expected_notification_counter 不传播注册 bool，也不自动等待；不能用它假定同步降级。
+SDMA adapter 的 event.Wait 分支是独立的同步等待合同，不等于本版支持 deferred 返回。
 普通单 block predicate 的现有语义必须保留。
 
 当前 `scheduler_resident_task_shape_supported` 允许普通 C/V/Mix 的 N≥1、sync_start 的 N>1，
@@ -323,6 +331,13 @@ AICPU 首写者明确记录未知 task/core/扩展身份，bootstrap/execution/t
 
 已返回工作允许必要清理；尚在 kernel 内的核必须按已有设备错误与停机流程安全退出。
 队列空、日志暂空、cursor 耗尽、TaskDone 数达标中的任何一个单独成立，都不代表可回收。
+
+公开 Worker 当前对任何 finalize 失败保守毒化 run lane，并保留 caller buffer 借用；
+不能把有界 kernel 最终返回解释成同 Worker 可以再次提交或提前 free。
+有界 timeout 验收分别检查真实 kernel returned／visible、所属 AICPU 分区退出时序、
+未释放依赖、失败收尾、拒绝重提／free，以及 close 后新 Worker 的正常运行。
+失败 capture 不满足成功协议的全图终态，不能要求 protocol_verified=true 来证明故障；
+workers.finished=2 只表示 ACK 前的失败记录，必须结合 fence、退出与关闭证据。
 
 正常退出需图终态完整、所有局部义务和控制事务收尾、trace 完整；
 异常重跑需确认旧访问静止后再清零并更换 epoch。保持 run 级存储直到生命周期握手完成。

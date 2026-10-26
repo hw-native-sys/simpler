@@ -62,10 +62,16 @@ sync_start 也可以动态领取，但每个执行位置至多领一个相互等
 普通纯 AIC、纯 AIV、多 block Mix 必须支持原逻辑 N，包括超过物理容量的分波。
 Mix 的 mask 3、5、6、7 保留各自语义；mask 6 可以由 AIC 协调，但不能伪造 AIC kernel。
 
-sync_start 在普通多 block／CSA 验收之后开放。Graph body、异步 kernel、
-运行期扩图和多 block predicate 不自动获得支持；继续明确拒绝或沿用整图 legacy 回退。
+sync_start 在普通多 block／CSA 验收之后开放。Graph body 沿用整图 legacy 回退，
+多 block／Mix predicate 明确拒绝，运行期扩图不在本版范围。
+resident 不提供 deferred completion 上下文，公开注册接口返回 false；
+Host 不会自动识别任意异步 kernel 并回退。kernel 必须处理注册失败，不能提前返回假装完成。
 要求 resident 的验收必须把任何回退判为失败，不能用正确输出代替调度来源检查。
 已有严格“全体到齐后才执行”的 sync_start 调用合同仍须逐项核对，不能静默放宽。
+
+公共 HBG LaunchSpec 接受 int64_t block 请求，在窄化为原 int16_t 字段前检查范围；
+超出字段范围保存为非法 0，由既有 Host 校验拒绝，不能把 65537 静默变成 1。
+合法请求和 N=1 同步归一化不变；旧编排需要重编，显式预先窄化的调用者数据无法恢复。
 
 ## 当前代码与需要补齐的部分
 

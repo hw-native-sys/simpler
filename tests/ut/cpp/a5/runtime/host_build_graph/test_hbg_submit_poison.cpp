@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <tuple>
 #include <vector>
 
@@ -38,6 +39,9 @@
 #include "host_build_graph/task_id.h"
 
 namespace {
+
+static_assert(sizeof(LaunchSpec) == 4);
+static_assert(alignof(LaunchSpec) == 2);
 
 constexpr uint8_t POISON = 0xAA;
 // A void* / int32 whose bytes are all 0xAA — what an unwritten field would read as.
@@ -231,4 +235,138 @@ TEST_P(HbgSubmitLaunchSpecTest, SyncRequestPreservesShapeAndOnlyMarksMultipleBlo
 INSTANTIATE_TEST_SUITE_P(
     AllShapes, HbgSubmitLaunchSpecTest,
     ::testing::Combine(::testing::Values(1, 2), ::testing::Values(1, 2, 4, 3, 5, 6, 7), ::testing::Bool())
+);
+
+namespace {
+
+std::vector<std::tuple<int, int, bool>> block_count_boundaries() {
+    std::vector<std::tuple<int, int, bool>> cases;
+    for (int mask : {1, 2, 4, 3, 5, 6, 7})
+        for (int blocks : {0, -1, static_cast<int>(std::numeric_limits<int16_t>::min())})
+            cases.emplace_back(blocks, mask, false);
+    for (int mask : {3, 5, 6}) {
+        cases.emplace_back(16383, mask, true);
+        cases.emplace_back(16384, mask, false);
+    }
+    cases.emplace_back(10922, 7, true);
+    cases.emplace_back(10923, 7, false);
+    for (int mask : {1, 2, 4})
+        cases.emplace_back(std::numeric_limits<int16_t>::max(), mask, true);
+    return cases;
+}
+
+}  // namespace
+
+class HbgSubmitBlockCountBoundary : public HbgSubmitPoisonTest,
+                                    public ::testing::WithParamInterface<std::tuple<int, int, bool>> {};
+
+TEST_P(HbgSubmitBlockCountBoundary, ValidatesRepresentableCountAndProductBeforePublishingStorage) {
+    const auto [blocks, mask, valid] = GetParam();
+    ASSERT_GE(blocks, std::numeric_limits<int16_t>::min());
+    ASSERT_LE(blocks, std::numeric_limits<int16_t>::max());
+    poison_task_table();
+    orch.begin_scope();
+    const int32_t count_before = orch.task_allocator.active_count();
+    const auto &next_storage = sm_handle->header->tasks.storage_at(count_before);
+    std::vector<uint8_t> storage_before(sizeof(next_storage));
+    std::memcpy(storage_before.data(), &next_storage, storage_before.size());
+    const auto state_before = sm_handle->header->tasks.task_states[count_before].load(std::memory_order_relaxed);
+
+    uint32_t shape[] = {16};
+    TensorCreateInfo output_info(shape, 1, DataType::FLOAT32);
+    CoreTaskArgs args;
+    args.add_output(output_info);
+    args.add_scalar(UINT64_C(0x12345678));
+    args.launch_spec.set_block_num(static_cast<int16_t>(blocks));
+    const MixedKernels kernels{
+        (mask & 1) != 0 ? 10 : INVALID_KERNEL_ID,
+        (mask & 2) != 0 ? 11 : INVALID_KERNEL_ID,
+        (mask & 4) != 0 ? 12 : INVALID_KERNEL_ID,
+    };
+    const auto output = orch.submit_task(kernels, args);
+    orch.end_scope();
+    EXPECT_EQ(args.launch_spec.block_num(), blocks);
+
+    if (!valid) {
+        EXPECT_FALSE(output.task_id().is_valid());
+        EXPECT_EQ(output.size(), 0U);
+        EXPECT_EQ(orch.fatal_code.load(std::memory_order_acquire), SIMPLER_ERROR_INVALID_ARGS);
+        EXPECT_EQ(orch.task_allocator.active_count(), count_before);
+        EXPECT_EQ(std::memcmp(storage_before.data(), &next_storage, storage_before.size()), 0);
+        EXPECT_EQ(sm_handle->header->tasks.task_states[count_before].load(std::memory_order_relaxed), state_before);
+        return;
+    }
+
+    ASSERT_TRUE(output.task_id().is_valid());
+    EXPECT_EQ(orch.fatal_code.load(std::memory_order_acquire), SIMPLER_ERROR_NONE);
+    EXPECT_EQ(orch.task_allocator.active_count(), count_before + 1);
+    const auto &entry = sm_handle->header->tasks.storage_at(output.task_id().local_id());
+    EXPECT_EQ(entry.slot.logical_block_num, blocks);
+    EXPECT_EQ(entry.slot.total_required_subtasks, blocks * __builtin_popcount(static_cast<unsigned>(mask)));
+    EXPECT_EQ(entry.slot.active_mask.core_mask(), mask == 4 ? 2 : mask);
+    EXPECT_FALSE(entry.slot.task_attrs.requires_sync_start());
+    EXPECT_EQ(entry.task.kernel_id[0], kernels.aic_kernel_id);
+    EXPECT_EQ(entry.task.kernel_id[1], mask == 4 ? 12 : kernels.aiv0_kernel_id);
+    EXPECT_EQ(entry.task.kernel_id[2], mask == 4 ? INVALID_KERNEL_ID : kernels.aiv1_kernel_id);
+    EXPECT_EQ(output.size(), 1U);
+    ASSERT_EQ(entry.payload.scalar_count, 1);
+    EXPECT_EQ(entry.payload.scalar_data()[0], UINT64_C(0x12345678));
+    EXPECT_EQ(
+        sm_handle->header->tasks.task_states[output.task_id().local_id()].load(std::memory_order_relaxed),
+        CHIP_TASK_PENDING
+    );
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    CountsAndSignedProduct, HbgSubmitBlockCountBoundary, ::testing::ValuesIn(block_count_boundaries())
+);
+
+class HbgSubmitWideBlockCount : public HbgSubmitPoisonTest,
+                                public ::testing::WithParamInterface<std::tuple<int64_t, int, bool>> {};
+
+TEST_P(HbgSubmitWideBlockCount, RejectsOutOfRangeInputBeforePublishingStorage) {
+    const auto [blocks, mask, request_sync] = GetParam();
+    ASSERT_TRUE(blocks < std::numeric_limits<int16_t>::min() || blocks > std::numeric_limits<int16_t>::max());
+    poison_task_table();
+    orch.total_cluster_count = 2;
+    orch.total_aiv_count = 4;
+    orch.begin_scope();
+    const int32_t count_before = orch.task_allocator.active_count();
+    const auto &next_storage = sm_handle->header->tasks.storage_at(count_before);
+    std::vector<uint8_t> storage_before(sizeof(next_storage));
+    std::memcpy(storage_before.data(), &next_storage, storage_before.size());
+    const auto state_before = sm_handle->header->tasks.task_states[count_before].load(std::memory_order_relaxed);
+
+    uint32_t shape[] = {16};
+    TensorCreateInfo output_info(shape, 1, DataType::FLOAT32);
+    CoreTaskArgs args;
+    args.add_output(output_info);
+    args.add_scalar(UINT64_C(0x12345678));
+    args.launch_spec.set_block_num(blocks);
+    args.launch_spec.set_require_sync_start(request_sync);
+    const MixedKernels kernels{
+        (mask & 1) != 0 ? 10 : INVALID_KERNEL_ID,
+        (mask & 2) != 0 ? 11 : INVALID_KERNEL_ID,
+        (mask & 4) != 0 ? 12 : INVALID_KERNEL_ID,
+    };
+    const auto output = orch.submit_task(kernels, args);
+    orch.end_scope();
+
+    EXPECT_EQ(args.launch_spec.require_sync_start(), request_sync);
+    EXPECT_FALSE(output.task_id().is_valid());
+    EXPECT_EQ(output.size(), 0U);
+    EXPECT_EQ(orch.fatal_code.load(std::memory_order_acquire), SIMPLER_ERROR_INVALID_ARGS);
+    EXPECT_EQ(orch.task_allocator.active_count(), count_before);
+    EXPECT_EQ(std::memcmp(storage_before.data(), &next_storage, storage_before.size()), 0);
+    EXPECT_EQ(sm_handle->header->tasks.task_states[count_before].load(std::memory_order_relaxed), state_before);
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    WideValuesAndSyncRequest, HbgSubmitWideBlockCount,
+    ::testing::Combine(
+        ::testing::Values<int64_t>(
+            32768, 65537, 131073, -65535, std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max()
+        ),
+        ::testing::Values(1, 2, 4, 3, 5, 6, 7), ::testing::Bool()
+    )
 );

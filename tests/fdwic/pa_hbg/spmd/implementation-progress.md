@@ -2309,3 +2309,175 @@ outputs/spmd-n1-boundary-a5-20261026/pytest-final.log。
 后续继续逐项核对边界，尤其保留发布者／协调者失败、阻塞 kernel 的真实静止和回收
 尚缺设备证明这一事实；不能把私有错误区的 writer 探针当成实际 runtime 故障停机。
 阶段提交仅包含上述测试与中文合同／过程，不包含产物和用户未跟踪文件，不 push。
+
+## 2026-10-26：资源交接、真实超时与输入边界验收
+
+### 审计结论和本轮范围
+
+继续遵守“先验收边界，性能后续处理”。按 C01–C56 对照真实源码与现有证据，
+不把模型、生产 helper、原生 kernel 三个层次互相替代。已有 A5 capture 的 96 个紧凑
+worker 对应不连续物理 ID，C11 并非完全缺少实卡证据；本轮主要补 C19/C27 的受控资源交接、
+C21 的来源守卫、C31/C32 的真实有界失败、C03/C04 的公共入口边界，以及 C34 的实际能力描述。
+
+### 普通任务尚占用 Mix 资源：24 项 helper 反例
+
+test_hbg_gm_mix.cpp 新增四种 mask × 三条物理 lane × 两个 own slot，共 24 场景。
+普通任务通过真实 route、batch push、fill、entry permit 进入执行状态，不只是手填一个忙标志。
+分别在“尚未返回”和“local completion generation 已写、尚未消费”时尝试 Mix arrive，
+必须仍为 PUBLISHED、arrived_seq=0，其他伙伴不得 prepare；真实 completion 消费后才允许握手。
+inactive lane 仍履行资源义务但不增加 kernel；slot0 场景同时验证另一个普通候选被停放、
+在 Mix 关闭后恢复，不丢失也不重复。
+
+完整 GM helper 目标 119/119 通过，日志 outputs/spmd-mix-ordinary-resource-final-20261026.log。
+临时副本只删除 scheduler_gm_mix_arrive 的 busy-slot 检查，24/24 红灯，
+首个错误即非法推进为 ARRIVED；主生产源码未改。
+副本位于 tmp/spmd-mix-arrive-mutation.X37ooR，日志
+outputs/spmd-mix-ordinary-resource-mutation-20261026.log。
+另以合成坏事件检查正式原生审计器，它拒绝旧 ordinary kernel 内出现新的组调度事件；
+未发现这一 reader 漏洞，不为此另造审计器。
+这些是受控 helper／坏记录证据，不声称在 A5 上精确暂停了同一时点的普通 kernel。
+
+### 宽 block 请求静默窄化：真实 RED 与最小修复
+
+真实 Host fixture 补 32 项可表示范围边界：七种 mask 的 0/-1/INT16_MIN，
+双 lane 的 16383/16384、三 lane 的 10922/10923、单 lane 的 32767。
+拒绝要求 INVALID_ARGS、无有效 TaskId、allocator 及下一条 poison storage/state 均未改变；
+合法值核对原 N、精确乘积、kernel 映射和 PENDING。与此前 29 项合计 61/61 通过，
+见 outputs/spmd-host-shape-boundary-full-20261026.log。
+
+继续追查窄化前的输入发现真实缺陷：set_block_num 的 int16_t 形参使宽值在进入函数前
+丢失信息；本机 int64_t 的 65537、131073、-65535 都变成 1，真实 submit 返回有效任务。
+CSA 生成编排存在直接传 int64_t 表达式的合法调用，不能只靠模型拒绝宽整数证明公共接口。
+
+新增六个 int64_t 极值／越界值 × 七种 mask × sync false/true，共 84 项正式回归，
+直接传宽值，不在测试里先转 int16_t。修复前 42 失败、42 通过；42 个失败不仅错误接受
+任务，还改写 poison storage/state，日志 outputs/spmd-host-wide-count-red-20261026.log。
+
+公共 common HBG setter 改为 int64_t 形参，在 int16_t 范围内原样保存，范围外保存现有非法 0，
+交给既有 Host submit 拒绝。没有新增字段、宏或重载，LaunchSpec 的 sizeof=4、align=2
+由实际编译断言保护；N=1 归一化和合法 N、可表示负值的旧行为不变。
+这影响 A5/A2A3 的 HBG，不顺带修改独立的 TMR setter。
+修复后完整 Host 目标 145/145 通过，见 outputs/spmd-host-wide-count-green-20261026.log。
+
+兼容边界不能省略：精确成员函数指针签名发生变化，仓内未找到这类绑定；
+旧已编译编排仍需重新编译，不能只更换 runtime；调用者显式先 cast 后丢失的信息无法恢复。
+现有磁盘编译缓存递归哈希传递头，实际 CSA 的 32 个 include 闭包文件包含本 common 头，
+SPMD probe 的 24 个闭包文件也包含；新 Python 进程会使旧编排缓存失效。
+进程内 _compile_cache 在内容 key 前返回，热改头后仍须重启进程或显式清缓存。
+
+存量 host_build_graph_validation 新增六种宽输入的真实编排路径，A5sim/A2A3sim 各
+14/14 通过，分别见 outputs/spmd-host-validation-a5sim-20261026.log 与
+outputs/spmd-host-validation-a2a3sim-20261026.log；不修改原八种拒绝场景的含义。
+
+### predicate：来源与拒绝形状分别验收
+
+predicated_dispatch 的真／假两场景增加每轮 publish_count 与 resident mode 检查，
+放在真实 compare_outputs 路径，standalone 同样生效；拒绝 skip_golden。
+mix_predicated_dispatch 复用原有效 kernel，扩展为 Mix N1/N2 和纯 C/V N2，共 22 个拒绝场景，
+每个形状分别使用真假 gate。必须同时出现 prepare -1000 与生产 Host 的完整合并诊断，
+不能把任意编译／绑定失败当作 predicate 拒绝，也不把合并诊断称为专用 predicate 错误码。
+
+两平台的 22 个独立拒绝用例和一个 scene-test 类内的两个正向场景均通过，
+日志 outputs/spmd-c21-predicate-sim-20261026.log、outputs/spmd-c21-predicate-a5-20261026.log。
+新增 test_predicate_native_fixture.py 的 25 项 CPU 检查覆盖错误 mode、旧 latch、
+重复轮次缺发布、坏 golden、skip 和真实参数矩阵；它们不是设备执行。
+
+### 有界 kernel 阻塞触发真实 HBG watchdog
+
+新增 resident_failure 原生入口及薄 kernel；复用 ExecutionRecord、verify_fanin、正式编译器。
+七种 mask 的每个实际 kernel lane 分别阻塞，N=1/2，共 24 个场景；其中 mask6 的
+AIC 仍只是协调者，实际阻塞者为 V0 或 V1。kernel 按设备 SYS_CNT 等待 2500ms 后返回，
+复用已有 SIMPLER_SCHEDULER_TIMEOUT_MS=2000，不引入新生产开关，也不直接写真实错误区。
+
+先健康运行，再在同 Worker/callable 上触发超时，要求真实 finalize -100。
+同一外部分配 buffer 在错误返回后正常 D2H，检查已进入 kernel 的最后写入与返回标记、
+未执行后继的零哨兵、所有 padding/保护区；错误后同 Worker 重提必须拒绝，
+两个 caller buffer 的 free 必须因仍被 run 借用而拒绝。close 有界结束后，新 Worker
+运行同 callable 的健康版本并通过完整 golden 与成功原生审计。
+
+这里没有修改 Worker 的全局故障合同：当前任何 finalize 失败都会保守毒化 lane、
+保留 caller borrow；kernel 自行返回不等于调用者可以复用失败 Worker。
+初次草案根据 executor 内部支持而使用一个 AICPU 线程，实际 healthy prepare 即 -1000；
+核对公共 sim/onboard runner 后确认都要求 0 或至少两个线程，改用合法的两个线程。
+执行进度 watchdog 与 peer shutdown-barrier watchdog 可以竞争首写，合法 site 分别为 95/102，
+都必须对应真实 scheduler_error=TIMEOUT(10)，不接受 bootstrap 等无关超时。
+
+A5 的退出 ACK 预算固定为 1 秒，sim 为 10 秒；有界 kernel 在调度超时后约 0.5 秒返回，
+不是用超过退出预算的长 stall 冒充正常退出。本用例不声称验证 STARS 杀死不可返回 kernel。
+
+失败 capture 不要求成功协议的 protocol_verified：检查实际 entry/returned/visible 及其
+同核 sequence、真实持续周期、后继无入口、未伪造 completed_blocks/TaskDone/resolved_count。
+全部 worker 必须唯一完整且 finished=2、无协议记录错误；这只是 ACK 前的失败记录，
+另外按 stalled worker 的紧凑 index 对应实际 AICPU 分区，要求该分区的 EXIT 发生在
+kernel 内，exit_wait 结束不早于该 kernel 的 visible，再结合 native fence 返回、
+buffer 保留、close 和新 Worker 恢复构成证据。不能用别的分区的晚结束时间顶替。
+
+CPU 坏记录自检先抓出 missing/duplicate worker 两个漏检（2 RED），加严集合后转绿；
+另增加错分区、提前退休、缺返回、假完成、重复控制记录等反例。
+独立 review 再发现自洽截短 worker 清单和 EXIT start 不能代表发送结束两处弱断言；
+两项先 RED，再以 metadata.num_cores 为独立数量锚点、要求所属分区的 signal_end
+早于 kernel returned 且不晚于 wait_start，转绿。正式 oracle 共 34 项。
+测试日志保留在 outputs/spmd-runtime-failure-oracle-red-20261026.log 及后续 green/final 日志。
+
+仿真与 A5 的完整矩阵均 24/24 通过，每平台 72 次实际运行（48 次健康、24 次预期失败），
+另有 24 次重提被毒化 lane 拒绝，未计作新的设备执行。
+原始目录 outputs/resident-failure-* 每项保存三份 capture 和 result.json；
+汇总见 outputs/spmd-runtime-failure-capture-audit-20261026.json。
+全部 144 份捕获独立复核：96 份健康记录走正式成功审计，48 份失败记录走上述失败断言，
+失败不是伪造成功记录。加严完整 worker／所属分区检查后对全部旧捕获重审通过；
+wide setter 重编后又在 A5 跑纯 V1 和 2V Mix 两项，覆盖最终检查及新 Host 二进制。
+日志 outputs/spmd-failure-matrix-sim-20261026.log、
+outputs/spmd-runtime-failure-a5-20261026/matrix.log 与 postfix.log。
+
+该证据覆盖有界 kernel 阻塞触发真实调度错误及失败隔离；
+不代替组描述发布前协调者失败、无 kernel 的 AIC 协调者物理失败、不可返回核的全部退出证明。
+未把这些剩余范围写成已经完成，也未用性能测量替代边界验收。
+
+### 重编和原样业务回归
+
+common 头变更后 editable 重编通过，日志 outputs/spmd-boundary-wide-count-build-20261026.log。
+原样 CSA 的严格 L4 入口通过，结果 outputs/csa-hbg-l4-jt01od6w/result.json：
+两轮各七项 golden、2308 个执行身份、133 条依赖边、完整原生协议、原时序守卫，
+来源为 aicore，业务源码仍匹配冻结基线。记录包含本轮 tracked diff 和实际三份二进制身份，
+没有修改 CSA 输入、kernel 或 block 数。
+
+### deferred API 能力边界的原生检查
+
+审计纠正了“async 与 Graph 一样由 Host 自动识别并回退”的笼统描述：Host 只显式识别
+Graph 等现有形状，不能通过 kernel 函数识别任意异步行为。resident 不提供 deferred
+上下文，register_completion_condition 返回 false；save_expected_notification_counter
+丢弃返回值，不自动等待。SDMA adapter 另有 event.Wait 分支，但本轮不声称验证了
+真实 SDMA 的同步降级或错误传播，也不新增异步返回支持。
+
+新增 test_async_boundary.py，复用原 SPMD 编排、ExecutionRecord、verify_fanin 和编译 helper。
+薄 kernel 在原记录的空闲 metadata 中记录有效 token、三个非空指针、非零容量的位掩码，
+两次公开注册返回值及完成哨兵；正常 resident 的前三项均为零，哨兵为 0xC34。
+counter 使用真正分配且已满足的零值，不发 DMA；即使错误走 legacy，注册条件也不会
+人为制造无界等待，但来源／返回值／上下文检查必须失败。
+
+七种 mask × N1/N2，共 14 场景；同 Worker/callable 每场景三轮，逐轮 fresh resident
+来源、完整原身份、保护区、API 记录和真实 fanin 均验证。新增 CPU oracle 54 项，
+检查错误上下文、错误返回、缺哨兵、旧来源、坏输出、跳过校验及父类不得混收。
+
+A5 首轮通过；sim 首轮编译失败，首错误是 PTO type.hpp 使用 uint8_t 而探针此前未先
+包含 cstdint。补齐探针自己的标准类型头后，两平台最终各 14 场景、42 次运行通过，
+日志 outputs/spmd-c34-async-native-sim-final-20261026.log 与
+outputs/spmd-c34-async-native-a5-final-20261026.log。没有修改 PTO 仓、公共 async API 或 runtime。
+本用例按三轮功能口径运行，不声称三轮都采集了完整 L4。
+
+Python 合同包此前 1651 项通过，outputs/spmd-boundary-contracts-all-final-20261026.log；
+review 新增两个坏记录反例后的最终数量与日志见本节收尾。
+Host submit 与 GM Mix 两个最终 C++ 目标分别 145、119 项通过，合计 264 项，
+outputs/spmd-boundary-cpp-final-20261026.log；不能把两个目标通过写成全部 C++ 仓库通过。
+最后按完整 worker、正确生命周期分区、唯一 task_controls 及同 Worker epoch 递增
+重新审计原 144 个 capture 和重编后追加的六个 capture，结果见
+outputs/spmd-runtime-failure-capture-final-audit-20261026.json。
+
+当前仍不以这些阶段检查宣布整体完成；原目标的逐项证据审查继续，
+未覆盖的不可返回／发布者物理故障等范围保留明确边界。阶段提交使用详细中文日志，不 push。
+
+本节最终收尾：review 后 Python 合同包 1653/1653 通过，
+outputs/spmd-boundary-contracts-reviewed-final-20261026.log；150 份捕获按最终 worker 数量锚点
+及所属分区 signal_end 时序重审通过，outputs/spmd-runtime-failure-capture-reviewed-audit-20261026.json。
+全部适用 pre-commit 通过，outputs/spmd-boundary-precommit-final-20261026.log。
+用户要求本次提交完成后先停下；提交后暂停，不再启动新编译、测试或后续开发，不 push。

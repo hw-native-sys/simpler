@@ -83,11 +83,14 @@ Mix 仍需共同准入和三条资源 lane 的组握手，mask 6 不增加 AIC k
 共 96 项，检查 32 场景夹具、坏记录、真假依赖、反向准入及每轮复用来源；这些仍是 CPU 检查。
 
 [test_hbg_gm_mix.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_gm_mix.cpp)
-共 95 项，检查真实 descriptor/ack/seal、四种 mask、固定物理 lane、原 N、暂停最后发布者、
+共 119 项，检查真实 descriptor/ack/seal、四种 mask、固定物理 lane、原 N、暂停最后发布者、
 旧／未来 ack、错误身份、保留 seal、零工作成员、局部跨 task 推进及无新 kernel 的退出 drain，
 并覆盖原生记录和 8 项 sync_start 早关闭、迟到 AIV、零工作 cluster／未发布组。
 另有错误后停止领取／发布／执行／完成／seal、AIC/AIV 合法阶段的 service 停机门禁，
 以及同轮 publish→arrive 推进和退役后下一轮才领新组的检查。
+新增 24 项真实普通任务 route→fill→entry→completion 与 Mix arrive 的可控交错：
+四种 Mix mask × 三条物理 lane × 两个 own slot，未返回或 completion 尚未消费均不得到达；
+临时副本删除 busy-slot 门禁时 24/24 红灯。它是生产 helper 证据，不是实际硬件资源占用测量。
 [test_hbg_gm_mix_startup.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_gm_mix_startup.cpp)
 另 21 项直接调用生产 executor，覆盖 startup 直接 EXIT 的 seal 收尾、
 错误退出不伪造 seal，以及缺少协调者 seal 时的超时身份。
@@ -114,6 +117,19 @@ N2→Dummy→N1 依赖、Host 已完成节点、有限服务链和畸形 metadat
 `.rodata.*` 不能被仅提取 `.text` 的加载器静默丢弃。ELF 和缓存策略回归分别覆盖
 拒绝不完整映像、空／非 allocated 控制项及硬件缓存失效；仿真成功不能替代该检查。
 
+[真实有界故障入口](../../../st/a5/host_build_graph/resident_failure/test_resident_failure.py)
+覆盖所有 mask 的实际 kernel lane × N1/N2，共 24 场景，仿真／A5 均通过。
+每项先健康运行，再触发真实 watchdog，检查阻塞者实际返回、后继不执行、失败 Worker
+拒绝重提和释放 caller buffer，关闭后新 Worker 健康运行。失败原始协议单独审计，
+不冒充成功协议；完整 worker 集合、所属 AICPU 退出分区、epoch 与 task_controls 均检查。
+34 项 [坏记录检查](../../../ut/py/hbg_spmd_contracts/test_runtime_failure_fixture.py) 不能算设备故障。
+
+[deferred 注册边界](test_async_boundary.py) 复用原 SPMD 入口，七种 mask × N1/N2 各三轮，
+仿真／A5 均通过。检查无效 token、空 slab、零容量、两次公开注册返回 false 和原 golden，
+不是 Host 自动识别异步 kernel，也不是 deferred 或 SDMA 硬件支持验收。
+54 项 [CPU 守卫](../../../ut/py/hbg_spmd_contracts/test_async_boundary_fixture.py) 覆盖坏上下文、
+错误注册返回、旧来源及缺哨兵；原样设备调用来源另按每轮发布计数验证。
+
 [显式身份读端](../../../ut/py/test_hbg_execution_identity.py) 检查精确连接、缺字段、
 重复 block／槽代次、epoch 极值和 Perfetto 两个执行视图；历史无身份数据不补造字段。
 真实 executor 另有 AIC/AIV0/AIV1 × L0/1/2/4 的 12 个入口快照用例，kernel 改写 payload
@@ -124,17 +140,17 @@ N2→Dummy→N1 依赖、Host 已完成节点、有限服务链和畸形 metadat
 
 | 边界组 | 现有可执行测试 | 当前证据与剩余边界 |
 | ------ | -------------- | ------------------ |
-| C01–C11：N、mask、容量、身份、稀疏核 | test_shapes：合法／非法 N、32767 乘积边界、mask 4 规范化、sync 容量、拓扑重复／缺失、trace 索引 | 合法形状原生矩阵和身份审计已通过；边界拒绝、稀疏拓扑须区分 Host/helper 与实卡证明范围 |
+| C01–C11：N、mask、容量、身份、稀疏核 | 模型及真实 Host submit：负值、乘积边界、宽 int64 请求、mask4 规范化；真实准入 helper 的坏成员拒绝 | Host 145 项通过；宽 N 修复前 42 个错误提交成功、修复后拒绝；A5 现有捕获已覆盖稀疏物理 ID，不能说完全缺证据 |
 | C12：view 和原 ABI | 原生不同 task 使用不相交 view；原样 CSA 七项 golden、TPipe PA L4 通过 | CSA 显式身份及原生协议审计已通过；持续保持原 kernel 与参数 ABI |
 | C13–C16、C39、C42–C43 | 模型／交错检查；ordered 与 GM 原生验证独立任务重叠和真实依赖不早放行 | order/成员及 sync_start 原生审计已通过；C39 三节点设备构造的 B 限于纯 C/V，A 覆盖七种 mask |
 | C17–C18、C22 | test_graphs：宽度 2/7/32/65/128 的 fanout/fanin、20 个固定 seed DAG；无 kernel 服务和空图 | 生产 wake-list 原子竞态与公平性；Host inline 不重复计数 |
 | C19–C20、C25–C28、C47–C49、C56 | model 与 GM C++ helper：一组一个身份、资源到达、mask 6 协调者、最后发布暂停、seal 复用；原生通信与重叠 | 完整设备组事件审计已通过；不据此宣称任意物理故障的静止／回收已验证 |
 | C23–C24、C55 | sync_once、容量、早到／晚到、过载和 A/B 反序死锁反例 | N>1 的有界 barrier、不同位置、满核与提前局部推进已有原生证据；N=1 保留公共归一化，新增验收见实现过程 |
-| C29–C33、C35–C38 | 模型边界；生产 C++ 重复完成；原生 retained 运行同 Worker/callable 切换 512→1→65→1→512 | GM Mix 代次／重绑、A5 故障静止与清理；不可用纯任务复用替代 |
+| C29–C33、C35–C38 | 模型、生产 helper、retained 形状切换；新增真实有界 kernel 阻塞触发 watchdog | C/V/Mix N1/N2 的仿真／A5 各 24 项故障及恢复通过；尚不能代替组发布者／无 kernel 协调者物理失败、不可返回核的全部退出证明 |
 | C40–C41、C46、C50 | 准入去重、记录容量、准备不占可见洞、冻结成员、暂空非 EOF | 短锁和 entry permit 的 CPU 竞态及原生因果审计已有证据；正常捕获不证明发布者物理失败的回收 |
 | C44–C45、C54 | 模型反例；生产 own/direct gate、两普通候选停放且 predicate 不重算、不可撤销 block 领取 | GM Mix 统一 gate 与原生推进已验证；两个普通 direct 链占满候选池仍可推迟发现协同任务，没有固定轮数公平上界 |
 | C51 | 新旧 publish_count、mode 0/3/4/非法值拒绝；原生每次比较同时验来源 | L4 已核对 aicore producer、显式身份及完整协议；无协议的历史捕获仍不算已验证 |
-| C21、C34、C52–C53 | 纯 C/V 与 GM Mix 生产路径不使用 SSBUF；普通 N=2 与 sync N=2 均要求 resident | Graph、多 block predicate、async 继续保留能力边界 |
+| C21、C34、C52–C53 | predicate 正向逐轮 resident 守卫、22 种不支持组合拒绝；Graph 原生 legacy 守卫；无 SSBUF 的生产路径 | deferred API 关闭与 Host Graph 回退分开；不存在任意 async kernel 的 Host 自动识别，新增 API 探针状态见实现过程 |
 
 test_trace_audit 对缺事件、重复事件、错 task/block/slot/N/order/generation/worker、
 跨 cluster 配对、提前 TaskDone、遗漏 LocalDone、旧 epoch、错误来源、截断、
