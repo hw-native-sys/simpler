@@ -41,6 +41,8 @@ class Worker:
 
 @dataclass(frozen=True)
 class Task:
+    """Protocol metadata; sync_start is the stored flag, not a public LaunchSpec request."""
+
     ref: int
     blocks: int
     mask: int

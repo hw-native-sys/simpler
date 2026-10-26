@@ -18,6 +18,8 @@ Mix 保留 AIC 有限协调，各执行 lane 自备参数，控制通信使用 G
 顺序只约束参与者：本核关闭 A 后可进入独立 B，不等待 A 的全局完成；非参与者可以旁路。
 普通多 block 允许分波；sync_start 保证不同执行位置和最终参与，不添加全员同时开始屏障。
 Graph、异步返回、多 block predicate 不自动开放；既有单 block predicate 必须回归。
+2026-10-26 用户确认先做边界验收，性能优化后续自行处理；保留公共 N=1 的归一化行为。
+下文历史“待确认”与早期反向预期记录保留原貌，以本节和最新验收记录为准。
 
 ## 分步交付与状态
 
@@ -29,7 +31,7 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 | 3 | 纯 C/V 多 block、完成聚合、分波容量 | N=1／容量两侧／512；身份不重不漏；独立任务可重叠 | A5／仿真功能和 L1/L4 逐 block 检查通过 |
 | 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | A5／仿真矩阵、重叠及 TPipe PA 已通过；首错误身份与冷日志已接线 |
 | 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | CSA 数值／2308 显式身份／来源、全协议因果与独立图门禁通过 |
-| 6 | sync_start 不同位置领取和局部跨任务推进 | 两独立满核任务、部分交叠、超容量、早返回不重领 | N>1 已实现；仿真／A5 各 47 项基础、112 项异构交叠／依赖／分波切换及原生审计通过；N=1 公共契约待确认 |
+| 6 | sync_start 不同位置领取和局部跨任务推进 | 两独立满核任务、部分交叠、超容量、早返回不重领 | N>1 已实现；仿真／A5 各 47 项基础、112 项异构交叠／依赖／分波切换及原生审计通过；N=1 公共归一化已确认，新增验收见末节 |
 | 7 | 性能对比 | 同 kernel／输入／拓扑，无完整插桩运行；诊断运行分开 | 初次 Device 为设计基线 11.41 倍；共享错误 RMW 已有显著归因差分，GM service 阶段裁剪相对同批 resident 对照降低 6.58%，整体回退未消除 |
 
 退出、错误收敛、epoch／generation、Dummy 服务节点随功能交付，不延后处理。
@@ -2238,3 +2240,72 @@ outputs/spmd-ordinary-prepare-baseline-evidence-20261026，其 runtime 子目录
 阶段提交限定按需准备、三个边界回归、准备／执行许可合同和测试状态纠偏，
 不包含产物、N=1 未决文件或用户未跟踪内容，不 push。
 下一步转向完整目标的逐项验收收口，不能用这些局部优化替代 N=1 公共契约及剩余证据审查。
+
+## 2026-10-26：公共 N=1 同步请求的归一化边界验收
+
+### 用户决策与范围
+
+用户明确要求先验收边界、性能后续自行处理，并确认保留归一化行为。
+公共 LaunchSpec 的 N=1、require_sync_start=true 请求被接受，生成的 TaskAttrs 不带
+多 block SYNC_START；它不把 Mix 改成纯 V，不取消组内配对、资源握手或完成聚合。
+内部绕过公共接口制造的 N=1+SYNC metadata 继续拒绝。
+
+这是对现有公共行为的确认，不是修改 Host 接口来迁就测试。
+原先未提交容量文件中七项“公共 N=1 必须拒绝”的预期按确认后的合同替换为完整正向验收；
+没有使用 xfail、skip、legacy 回退或省略校验来消除历史红灯。
+前面各节当时的未决／失败记录保留，当前决定同步到设计总览、编码契约和测试状态。
+
+### 可执行检查
+
+- 复用 test_hbg_submit_poison.cpp 的真实 Host orchestrator fixture，向毒化任务表提交
+  七种 mask × N=1/2 × 请求 true/false，共 28 项。验证输入 LaunchSpec 未改写、
+  N 和子任务数量、有效 kernel 与 mask、输出数量、标量内容、真实 fanin；
+  N=1 生成标志为 false，合法 N=2 保留请求。纯 mask4 的旧槽归一化与 Mix 固定槽分开断言。
+- test_shapes.py 将原单项拒绝明确命名为“显式存储标志”的拒绝，并扩展为七种 mask；
+  Task 类型文档明确 sync_start 是协议 metadata，不是公共请求。
+- 正式纳入 tests/st/a5/host_build_graph/sync_start_capacity/test_sync_start_capacity.py。
+  复用 test_spmd_contract.py 的原编排、三个 record kernel、fanin kernel 和 golden，
+  不复制一套 kernel。七个 N=1 场景每个在同一 Worker/callable 上连续执行 1→0→1 请求，
+  每轮两项被测任务加真实 fanin 后继，共每平台 21 次成功调用。
+- 每次核对 scheduler_mode_publish_count 新增、mode 为 resident、全部整数输出和保护区，
+  并使用正式 read_perf_data 的完整协议审计。额外核对生成 metadata 不带 SPMD/SYNC 标志、
+  原 kernel/slot/N 不变、exactly-once 身份集合、Mix 仍有两项准入和每组 3 条资源 lane。
+  mask6 的实际执行集合仅含两个 AIV；纯 V 无虚假组。kernel 内有界到达检查验证
+  N=1 Mix 的真实参与者仍能相互会合，关闭多 block 标志并不取消组内协作。
+- 七个超容量场景继续走真实 Host 拒绝：纯 V 的 N=73、C/Mix 的 N=37，覆盖当前实现
+  支持的最大 36C/72V 拓扑以上。每个错误绑定使用独立 Worker，要求确切 -7 返回及
+  REQUIRE_SYNC_START_INVALID 日志；不是把设备超时算成容量拒绝。
+
+### 已核对的结果
+
+代码与已安装绑定均为 d91821298275817e27d3dd14b9c3d01bd5f00118，Torch 2.12.0+cpu。
+本轮没有改动 runtime、公共 Host 实现、业务 kernel 或输入。
+架构脚本因 npu-smi 缺失无法识别；按用户的本机执行授权，使用既有 cann_query 查询确认
+device 0 为 Ascend950PR_958b、32C/64V。A5 单卡串行运行，无 task-submit 独占，
+本轮只作正确性与协议验收，不据耗时作性能推断。
+
+- C++ 真实 Host 目标：29 项通过，含原 1 项毒化测试与新增 28 项；
+  outputs/spmd-n1-submit-cpp-final-20261026.log。
+- Python 形状边界：196 项通过；完整 hbg_spmd_contracts 包：1540 项通过；
+  outputs/spmd-n1-shapes-pytest-20261026.log、outputs/spmd-n1-contracts-pytest-20261026.log。
+- 首轮仿真和 A5 各 14 个独立 pytest 用例全部通过，每平台包含 21 次正向调用和 7 次拒绝。
+  outputs/spmd-n1-boundary-sim-20261026.log、outputs/spmd-n1-boundary-a5-20261026/pytest.log。
+  主 pytest 最后显示 no tests ran 是资源调度器把 14 个普通函数分派到子进程后的汇总口径，
+  逐项 PASS 和各子 pytest 的 1 passed 才是本轮用例通过证据。
+
+首轮使用 pytest 临时目录，后续子进程会清理较早 capture；为保留可复核原始证据，
+用例改为每个 mask 创建独立 outputs/sync-start-n1-* 目录，并重新执行两平台完整矩阵。
+这只改变诊断产物保留位置，不改变参数、调度策略或断言。
+
+最终文件版本在仿真和 A5 均为 14/14 通过：
+outputs/spmd-n1-boundary-sim-final-20261026.log、
+outputs/spmd-n1-boundary-a5-20261026/pytest-final.log。
+另逐文件重新调用归一化检查及正式原生审计，确认每平台恰有 21 个完整 capture、
+93 个实际 kernel 执行身份和 24 个 Mix block 组；每个 mask 的三轮 run_epoch 均递增且不重复。
+两平台共 42 个原始 capture 的路径及计数见 outputs/spmd-n1-capture-audit-20261026.json。
+每个 capture 还包含原始协议和执行记录，可以独立复核，不把 golden 数量冒充协议事件数量。
+
+本轮收口的是 N=1 公共合同，不等于 C01–C56 已全部完成。
+后续继续逐项核对边界，尤其保留发布者／协调者失败、阻塞 kernel 的真实静止和回收
+尚缺设备证明这一事实；不能把私有错误区的 writer 探针当成实际 runtime 故障停机。
+阶段提交仅包含上述测试与中文合同／过程，不包含产物和用户未跟踪文件，不 push。

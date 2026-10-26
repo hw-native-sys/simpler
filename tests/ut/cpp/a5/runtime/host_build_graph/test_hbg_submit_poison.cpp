@@ -28,6 +28,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <tuple>
 #include <vector>
 
 #include "utils/device_arena.h"
@@ -177,3 +178,57 @@ TEST_F(HbgSubmitPoisonTest, EveryDeviceReadFieldIsWrittenOverPoison) {
     EXPECT_EQ(cons_pl.fanin_count, 1);
     EXPECT_EQ(cons_pl.fanin_data()[0], root.task_id().local_id());
 }
+
+class HbgSubmitLaunchSpecTest : public HbgSubmitPoisonTest,
+                                public ::testing::WithParamInterface<std::tuple<int, int, bool>> {};
+
+TEST_P(HbgSubmitLaunchSpecTest, SyncRequestPreservesShapeAndOnlyMarksMultipleBlocks) {
+    const auto [blocks, mask, request_sync] = GetParam();
+    poison_task_table();
+    orch.total_cluster_count = 2;
+    orch.total_aiv_count = 4;
+    orch.begin_scope();
+
+    CoreTaskArgs producer_args;
+    const auto producer = orch.submit_task(MixedKernels{20, INVALID_KERNEL_ID, INVALID_KERNEL_ID}, producer_args);
+    ASSERT_TRUE(producer.task_id().is_valid());
+    const TaskId dependency[] = {producer.task_id()};
+    uint32_t shape[] = {16};
+    TensorCreateInfo output_info(shape, 1, DataType::FLOAT32);
+    CoreTaskArgs args;
+    args.add_output(output_info);
+    args.add_scalar(UINT64_C(0x12345678));
+    args.set_dependencies(dependency, 1);
+    args.launch_spec.set_block_num(static_cast<int16_t>(blocks));
+    args.launch_spec.set_require_sync_start(request_sync);
+    const MixedKernels kernels{
+        (mask & 1) != 0 ? 10 : INVALID_KERNEL_ID,
+        (mask & 2) != 0 ? 11 : INVALID_KERNEL_ID,
+        (mask & 4) != 0 ? 12 : INVALID_KERNEL_ID,
+    };
+    const auto output = orch.submit_task(kernels, args);
+    ASSERT_TRUE(output.task_id().is_valid());
+    orch.end_scope();
+
+    const auto &entry = sm_handle->header->tasks.storage_at(output.task_id().local_id());
+    EXPECT_EQ(args.launch_spec.block_num(), blocks);
+    EXPECT_EQ(args.launch_spec.require_sync_start(), request_sync);
+    EXPECT_EQ(entry.slot.logical_block_num, blocks);
+    EXPECT_EQ(entry.slot.active_mask.core_mask(), mask == 4 ? 2 : mask);
+    EXPECT_EQ(entry.slot.total_required_subtasks, blocks * __builtin_popcount(static_cast<unsigned>(mask)));
+    EXPECT_EQ(entry.slot.task_attrs.requires_sync_start(), request_sync && blocks > 1);
+    EXPECT_EQ(entry.task.kernel_id[0], kernels.aic_kernel_id);
+    EXPECT_EQ(entry.task.kernel_id[1], mask == 4 ? 12 : kernels.aiv0_kernel_id);
+    EXPECT_EQ(entry.task.kernel_id[2], mask == 4 ? INVALID_KERNEL_ID : kernels.aiv1_kernel_id);
+    EXPECT_EQ(output.size(), 1U);
+    ASSERT_EQ(entry.payload.tensor_count, 1);
+    ASSERT_EQ(entry.payload.scalar_count, 1);
+    EXPECT_EQ(entry.payload.scalar_data()[0], UINT64_C(0x12345678));
+    ASSERT_EQ(entry.payload.fanin_count, 1);
+    EXPECT_EQ(entry.payload.fanin_data()[0], producer.task_id().local_id());
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllShapes, HbgSubmitLaunchSpecTest,
+    ::testing::Combine(::testing::Values(1, 2), ::testing::Values(1, 2, 4, 3, 5, 6, 7), ::testing::Bool())
+);

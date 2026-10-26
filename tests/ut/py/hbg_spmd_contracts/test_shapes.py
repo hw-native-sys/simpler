@@ -73,9 +73,10 @@ def test_sync_start_capacity_is_per_shape(mask, capacity):
     assert not rejected.state(0).blocks
 
 
-def test_sync_start_one_block_remains_invalid():
+@pytest.mark.parametrize("mask", [1, 2, 4, 3, 5, 6, 7])
+def test_explicit_sync_flag_in_single_block_metadata_remains_invalid(mask):
     with pytest.raises(ContractViolation, match="SYNC_SINGLE_BLOCK"):
-        Task(0, 1, 1, sync_start=True)
+        Task(0, 1, mask, sync_start=True)
 
 
 @pytest.mark.parametrize("mask", [1, 2, 3, 5, 6, 7])

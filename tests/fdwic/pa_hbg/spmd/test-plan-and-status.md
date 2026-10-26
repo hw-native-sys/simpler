@@ -17,7 +17,8 @@ GM Mix 已接入且可与纯多 block 同图：六种 mask 矩阵在仿真／A5 
 首错误身份与退出冷日志已接线；显式 block/slot 身份及原样 CSA 的身份审计通过；
 完整原生协议采集、因果审计和 CSA 严格门禁已通过；N>1 sync_start 的仿真／A5
 各 47 项基础矩阵及原生审计通过；另有每平台 112 项异构同步／普通交叠与依赖、
-84 项较晚 ready B 先行的原生检查。N=1 公共契约仍待确认。
+84 项较晚 ready B 先行的原生检查。N=1 公共请求已确认保留归一化：不带多 block
+SYNC_START 标志，但保留 Mix、原 N、执行身份与组内资源协议；内部显式畸形标志仍拒绝。
 性能比较与局部优化已有实测，整体回退尚未消除；
 逐轮数值、日志、失败修复证据和能力边界集中见实现过程。
 
@@ -32,6 +33,16 @@ GM Mix 已接入且可与纯多 block 同图：六种 mask 矩阵在仿真／A5 
 
 CPU 包中另外有 [test_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_native_fixture.py)，
 检查原生用例的 golden、来源门禁、保护区和错误检测器本身；不能把它计作设备执行。
+
+[公共 sync_start 边界](../../../st/a5/host_build_graph/sync_start_capacity/test_sync_start_capacity.py)
+复用现有 SPMD 探针和 golden，覆盖七种 mask 的 N=1 请求与超容量拒绝。
+每个正向用例在同一 Worker/callable 上运行同步请求 1→0→1，逐轮检查新的 resident 来源、
+全部输出和保护区、原 N／kernel／slot 身份、无 SYNC_START 标志及完整原生协议。
+Mix 仍需共同准入和三条资源 lane 的组握手，mask 6 不增加 AIC kernel。
+每轮 L4 存放在 outputs/sync-start-n1-* 下，不依赖 pytest 临时目录的保留数量。
+[真实 Host submit 测试](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_submit_poison.cpp)
+另覆盖七种 mask × N=1/2 × 请求 true/false，共 28 项，检查归一化不改变原请求、
+参数和依赖，N>1 仍带合法 SYNC_START；CPU 模型的七项畸形 N=1 metadata 拒绝与此分层。
 
 协议模型把共同发布／唯一领取视为原子动作，所有有 kernel 的节点均表示为准入节点。
 状态枚举不模拟设备 cache、失败核停机或真实 GM mailbox；随机 DAG 检查使用固定 seed，
@@ -118,7 +129,7 @@ N2→Dummy→N1 依赖、Host 已完成节点、有限服务链和畸形 metadat
 | C13–C16、C39、C42–C43 | 模型／交错检查；ordered 与 GM 原生验证独立任务重叠和真实依赖不早放行 | order/成员及 sync_start 原生审计已通过；C39 三节点设备构造的 B 限于纯 C/V，A 覆盖七种 mask |
 | C17–C18、C22 | test_graphs：宽度 2/7/32/65/128 的 fanout/fanin、20 个固定 seed DAG；无 kernel 服务和空图 | 生产 wake-list 原子竞态与公平性；Host inline 不重复计数 |
 | C19–C20、C25–C28、C47–C49、C56 | model 与 GM C++ helper：一组一个身份、资源到达、mask 6 协调者、最后发布暂停、seal 复用；原生通信与重叠 | 完整设备组事件审计已通过；不据此宣称任意物理故障的静止／回收已验证 |
-| C23–C24、C55 | sync_once、容量、早到／晚到、过载和 A/B 反序死锁反例 | N>1 的有界 barrier、不同位置、满核与提前局部推进已有原生证据；N=1 公共契约未决 |
+| C23–C24、C55 | sync_once、容量、早到／晚到、过载和 A/B 反序死锁反例 | N>1 的有界 barrier、不同位置、满核与提前局部推进已有原生证据；N=1 保留公共归一化，新增验收见实现过程 |
 | C29–C33、C35–C38 | 模型边界；生产 C++ 重复完成；原生 retained 运行同 Worker/callable 切换 512→1→65→1→512 | GM Mix 代次／重绑、A5 故障静止与清理；不可用纯任务复用替代 |
 | C40–C41、C46、C50 | 准入去重、记录容量、准备不占可见洞、冻结成员、暂空非 EOF | 短锁和 entry permit 的 CPU 竞态及原生因果审计已有证据；正常捕获不证明发布者物理失败的回收 |
 | C44–C45、C54 | 模型反例；生产 own/direct gate、两普通候选停放且 predicate 不重算、不可撤销 block 领取 | GM Mix 统一 gate 与原生推进已验证；两个普通 direct 链占满候选池仍可推迟发现协同任务，没有固定轮数公平上界 |
