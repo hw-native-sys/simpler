@@ -1,6 +1,6 @@
 # Framework queue → public Worker eager execution
 
-This bounded A3 reference consumer puts `Worker.submit` in torch_npu's actual
+These bounded reference consumers select A3 (`a2a3`) or A5 (`a5`) and put `Worker.submit` in torch_npu's actual
 host emission queue. Torch operations produce two DEVICE inputs; the ordinary
 public Worker launches one add kernel; a Torch tensor addition consumes its
 output on the same framework stream. TMR and HBG use the same consumer.
@@ -20,7 +20,7 @@ DEVICE-controlled updates to caller-owned storage.
 | `preflight_recovery.py` | Stale Buffer registration and wrong caller context are refused before acceptance; the same Worker then completes three healthy requests |
 | `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
 | `persistent_state.py` | Twelve DEVICE-controlled weighted cache updates, unchanged guards and weights, zero acceptance and revisited rows |
-| `argument_capture.py` | Per-call OFF/FULL/HYBRID/OFF ArgsDump snapshots, exact task-time payloads and a runtime-owned intermediate |
+| `argument_capture.py` | OFF/FULL/HYBRID/OFF ArgsDump payloads on supported runtimes; explicit A5 HBG refusal and recovery |
 
 Public `Worker.close()` drains accepted direct-chip runs through their normal
 RunHandle completion and retirement path before checking workspace ownership.
@@ -53,6 +53,13 @@ Run hardware through the queue, after architecture detection:
 task-submit --timeout 600 --max-time 180 --device auto --device-num 1 --run   'TASK_QUEUE_ENABLE=1 TORCH_DEVICE_BACKEND_AUTOLOAD=0 MAX_JOBS=2 python examples/workers/l2/framework_eager/main.py --runtime tensormap_and_ringbuffer --device "$TASK_DEVICE"'
 ```
 
+Pass `--platform a5` to select A5 on a matching runner; the default is
+`a2a3`. The selected platform routes canonical compilation, public Worker
+construction and the PASS record together. Compile-cache keys include it, so
+A3 and A5 artifacts cannot alias. Keep the same platform in the architecture
+precheck and pytest invocation below. A5 execution requires its own successful
+CI qualification; existing A3 measurements do not establish A5 support.
+
 Select `host_build_graph` for HBG, and run `TASK_QUEUE_ENABLE=0` separately for
 the synchronous framework emission policy. A PASS record contains the actual
 caller/callback native thread IDs and the number of verified invocations.
@@ -66,9 +73,9 @@ CLIs load the unique existing artifact, building only when it is absent; the
 original same-stream CLI still checks its incremental build cache. All use
 the original `build_bridge` / `_load_bridge` helpers. The
 `test_environment("torch_npu")` marker selects an isolated framework venv in the
-dedicated `st-framework-eager-a2a3` PR and Daily job. The default environment
+dedicated `st-framework-eager-a2a3` and `st-framework-eager-a5` PR and Daily jobs. The default environment
 automatically deselects these tests; no directory exclusion is needed.
-Selecting the suite without its dependencies fails. See [CI qualification](../../../../docs/ci.md#framework-eager-qualification-a2a3) for the pinned compatibility contract. Run this suite
+Selecting the suite without its dependencies fails. See [CI qualification](../../../../docs/ci.md#framework-eager-qualification-a2a3-and-a5) for the pinned compatibility contract. Run this suite
 serially inside one exclusive `task-submit` allocation of one device, as below;
 resource-parallel dispatch and xdist are not qualified by this example:
 
@@ -206,10 +213,11 @@ This is a bounded persistent-state/accepted-prefix reference, not a complete
 MTP model, dynamic host task generation or throughput result.
 
 These are bounded reference cases. Full framework process shutdown, arbitrary
-strides or cross-tile overlap, A5 and capture remain separate qualification.
+strides or cross-tile overlap and capture remain separate qualification.
 
 This is a reference consumer of the existing eager contract, not acceptance of
-PyPTO production dispatch, vLLM/model numerics, A5 or capture/replay.
+PyPTO production dispatch, vLLM/model numerics or capture/replay. Each platform
+requires its own actual environment, collection and execution receipts.
 
 ## Per-call argument capture
 
@@ -221,7 +229,8 @@ geometry. The L2 adapter folds the view offset into its address and exports
 zero native start offsets. Task attribution uses these materialized shapes,
 not an ordering of opaque task IDs.
 
-Four queued calls select argument capture OFF/FULL/HYBRID/OFF. FULL checks all
+Four queued attempts select argument capture OFF/FULL/HYBRID/OFF. On A2/A3
+(both runtimes) and A5 TMR, all four calls are accepted. FULL checks all
 six task arguments; HYBRID checks the three marked arguments. Exact payload
 bytes, before/after stages, geometry, epoch and completeness are checked after
 the final framework boundary and retirement. Torch successors independently
@@ -229,3 +238,20 @@ check final outputs and caller backing guards. Mutating the accepted caller
 config and prefix must not change the selected capture or export destination.
 Unknown outcomes retain every caller/runtime owner. This qualifies the bounded
 reference workload, not capture/replay or arbitrary task graphs.
+
+A5 HBG has no per-task argument-dump producer. Its same queue sequence requires
+the existing typed `RunPreparationRefused` with the native unsupported status
+`-1001` for FULL and HYBRID. Neither refused request may return an accepted run,
+launch work, change caller inputs or outputs, or create argument-dump files.
+The OFF calls before and after must produce the correct Torch successors and
+preserve guards on the same Worker. All caller owners remain alive through
+the final boundary, retirement and close; the caller stream is used again after
+Worker close. `FRAMEWORK_ARGUMENT_DUMP_REFUSAL_RECOVERY_PASS` reports two accepted
+calls and two refusals with `args_dump_supported=false` and
+`payloads_verified=false`; it is not a payload-capture result.
+
+Required A5 HBG per-task argument capture remains unimplemented and tracked under
+[#2666](https://github.com/hw-native-sys/simpler/issues/2666). This refusal and
+recovery qualification does not close it. The existing
+[task-boundary producer investigation](../../../../docs/investigations/2026-10-a5-resident-per-task-args-capture.md)
+describes that missing producer.

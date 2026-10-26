@@ -84,7 +84,7 @@ def _check_exports(root: Path, runtime: str):
     return epochs
 
 
-def run(runtime: str, device: int, bridge_path: Path, root: Path):
+def run(runtime: str, device: int, bridge_path: Path, root: Path, *, platform="a2a3"):
     import torch  # noqa: PLC0415
     import torch_npu  # noqa: PLC0415, F401 -- registers the framework backend
     from simpler.task_interface import CallConfig  # noqa: PLC0415
@@ -101,8 +101,8 @@ def run(runtime: str, device: int, bridge_path: Path, root: Path):
     frames, queued, runs = [], [], []
     retired = False
     try:
-        worker = Worker(level=2, device_id=device, platform="a2a3", runtime=runtime)
-        handle = worker.register(reference._compile(runtime))
+        worker = Worker(level=2, device_id=device, platform=platform, runtime=runtime)
+        handle = worker.register(reference._compile(runtime, platform=platform))
         worker.init(borrowed_context_generation=1)
         frames, weak_tensors = reference._prepare_frames(torch, worker, handle, stream, raw_stream, len(_SELECTIONS))
         for index, frame in enumerate(frames):
@@ -145,6 +145,7 @@ def run(runtime: str, device: int, bridge_path: Path, root: Path):
         retired = True
         epochs = _check_exports(root, runtime)
         summary = dict(
+            platform=platform,
             runtime=runtime,
             task_queue=task_queue,
             calls=len(runs),
@@ -175,6 +176,7 @@ def run(runtime: str, device: int, bridge_path: Path, root: Path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", choices=["tensormap_and_ringbuffer", "host_build_graph"], required=True)
+    parser.add_argument("--platform", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--build-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
@@ -183,7 +185,7 @@ def main():
     if len(modules) > 1:
         parser.error("--build-dir contains multiple framework queue bridges")
     path = modules[0] if modules else reference.build_bridge(options.build_dir)
-    run(options.runtime, options.device, path, options.output_dir)
+    run(options.runtime, options.device, path, options.output_dir, platform=options.platform)
 
 
 if __name__ == "__main__":

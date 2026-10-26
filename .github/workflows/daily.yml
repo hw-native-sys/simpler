@@ -43,9 +43,17 @@ jobs:
       job_timeout_minutes: 60
 
   st-framework-eager-a2a3:
-    uses: ./.github/workflows/_st-framework-eager-a2a3.yml
+    uses: ./.github/workflows/_st-framework-eager.yml
     with:
+      platform: a2a3
       runs_on: '["self-hosted","a2a3"]'
+      manual_mode: include
+
+  st-framework-eager-a5:
+    uses: ./.github/workflows/_st-framework-eager.yml
+    with:
+      platform: a5
+      runs_on: '["self-hosted","a5"]'
       manual_mode: include
 
   st-onboard-a2a3:

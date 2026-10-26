@@ -53,6 +53,12 @@ The CPU checker contracts exercise export validation; actual collector behavior
 requires the framework hardware cases. Diagnostic collection may wait, and this
 consumer does not qualify other DFX collectors or capture/replay.
 
+The framework eager tests live in `tests/st/worker/framework_eager` and run on
+`--platform a2a3` or `--platform a5`. Each consumer uses that platform for
+compilation, Worker construction and its result record; compile caches include
+the platform. A shared host bridge does not establish device compatibility.
+Each platform needs its own actual plan, JUnit and environment identity.
+
 The framework eager corpus shares one session-scoped optional bridge fixture.
 Its same-stream, cross-stream, alias/INOUT, callback-failure recovery and
 per-call-value and persistent-DEVICE-state modules are discovered by their
@@ -72,8 +78,15 @@ caller context before its healthy submit, and a third healthy request follows.
 The allocation stays alive throughout; no invalid device access is issued.
 
 The argument-capture consumer is discovered in the same environment. It
-checks OFF/FULL/HYBRID/OFF snapshots and exact two-task argument payloads,
-including a runtime-owned intermediate. A real Worker materialization CPU
+checks OFF/FULL/HYBRID/OFF snapshots and exact two-task argument payloads on
+A2/A3 (both runtimes) and A5 TMR, including a runtime-owned intermediate.
+A5 HBG instead exercises the existing typed unsupported refusal for FULL and
+HYBRID, verifies no accepted run, tensor writes or dump files, and checks healthy
+OFF calls before and after plus caller-stream reuse after Worker close. Its
+refusal result explicitly reports no verified payloads; actual A5 HBG per-task
+capture remains unimplemented and tracked under
+[#2666](https://github.com/hw-native-sys/simpler/issues/2666); refusal tests do not
+deliver that capability. A real Worker materialization CPU
 contract covers native geometry; CPU recording tests do not qualify device
 collection or framework ordering.
 

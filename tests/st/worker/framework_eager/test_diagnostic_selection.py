@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Real queue ordering for complete/partial alias and persistent INOUT backing."""
+"""Queued per-call DFX selections retain their own exported records."""
 
 import json
 import os
@@ -16,13 +16,18 @@ from pathlib import Path
 
 import pytest
 
-_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/alias_inout.py"
-pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), pytest.mark.test_environment("torch_npu")]
+_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/diagnostic_selection.py"
+pytestmark = [
+    pytest.mark.requires_hardware,
+    pytest.mark.platforms(["a2a3", "a5"]),
+    pytest.mark.test_environment("torch_npu"),
+]
 
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_framework_alias_inout(runtime, task_queue, framework_module, tmp_path, request):
+def test_framework_diagnostic_selection(runtime, task_queue, framework_module, tmp_path, request):
+    platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
     logs.mkdir()
@@ -31,14 +36,16 @@ def test_framework_alias_inout(runtime, task_queue, framework_module, tmp_path, 
             sys.executable,
             "-u",
             str(_EXAMPLE),
+            "--platform",
+            platform,
             "--runtime",
             runtime,
             "--device",
             device,
             "--build-dir",
             str(framework_module),
-            "--calls",
-            "3",
+            "--output-dir",
+            str(tmp_path / "diagnostics"),
         ],
         capture_output=True,
         text=True,
@@ -53,21 +60,22 @@ def test_framework_alias_inout(runtime, task_queue, framework_module, tmp_path, 
         },
     )
     (tmp_path / "consumer.log").write_text(result.stdout + result.stderr)
-    print("FRAMEWORK_ALIAS_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
+    print("FRAMEWORK_DIAGNOSTICS_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
     print(result.stdout, end="", flush=True)
     assert result.returncode == 0, result.stdout + result.stderr
     records = [
-        line.removeprefix("FRAMEWORK_ALIAS_INOUT_PASS ")
+        json.loads(line.removeprefix("FRAMEWORK_DIAGNOSTIC_SELECTION_PASS "))
         for line in result.stdout.splitlines()
-        if line.startswith("FRAMEWORK_ALIAS_INOUT_PASS ")
+        if line.startswith("FRAMEWORK_DIAGNOSTIC_SELECTION_PASS ")
     ]
     assert len(records) == 1, result.stdout + result.stderr
-    summary = json.loads(records[0])
-    assert summary["verified"] and summary["calls_per_alias"] == 3 and summary["calls"] == 6
+    summary = records[0]
+    assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
-    assert summary["aliases"] == ["full", "partial"]
-    assert summary["shape"] == [64, 64] and summary["strides"] == [96, 1]
-    assert summary["offsets"] == {"full": [256, 256], "partial": [256, 288]}
-    assert summary["caller_frame_retained"] and summary["guard_verified"] and summary["state_reused"]
-    assert len(summary["callback_threads"]) == 6
+    assert summary["verified"] and summary["observed"] == [8.0, 12.0, 16.0, 20.0]
+    assert summary["calls"] == 4 and summary["selections"] == [[0, 0], [1, 2], [3, 4], [0, 0]]
+    assert summary["caller_configs_mutated"]
+    assert len(summary["run_epochs"]) == len(set(summary["run_epochs"])) == 2
+    assert all(epoch > 0 for epoch in summary["run_epochs"])
+    assert len(summary["callback_threads"]) == 4
     assert all((thread != summary["caller_thread"]) == (task_queue == "1") for thread in summary["callback_threads"])

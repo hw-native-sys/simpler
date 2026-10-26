@@ -167,7 +167,7 @@ def _submit_frame(frame, contexts, runs, refusals):
     runs.append(frame["worker"].submit(frame["callable"], frame["args"], caller_stream=frame["raw_stream"]))
 
 
-def run(runtime, device, bridge_path):
+def run(runtime, device, bridge_path, *, platform="a2a3"):
     import torch  # noqa: PLC0415
     import torch_npu  # noqa: PLC0415, F401 -- registers the framework backend
     from simpler.worker import Worker  # noqa: PLC0415
@@ -184,9 +184,9 @@ def run(runtime, device, bridge_path):
     retired = False
     try:
         contexts.create()
-        worker = Worker(level=2, device_id=device, platform="a2a3", runtime=runtime)
+        worker = Worker(level=2, device_id=device, platform=platform, runtime=runtime)
         capsule["worker"] = worker
-        handle = worker.register(reference._compile(runtime))
+        handle = worker.register(reference._compile(runtime, platform=platform))
         capsule["callable"] = handle
         worker.init(borrowed_context_generation=1)
         frames, references = reference._prepare_frames(torch, worker, handle, stream, raw_stream, 3)
@@ -231,6 +231,7 @@ def run(runtime, device, bridge_path):
         retired = True
         del _UNPROVEN[id(capsule)]
         summary = dict(
+            platform=platform,
             runtime=runtime,
             task_queue=task_queue,
             calls=len(runs),
@@ -263,6 +264,7 @@ def run(runtime, device, bridge_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", choices=["tensormap_and_ringbuffer", "host_build_graph"], required=True)
+    parser.add_argument("--platform", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--build-dir", type=Path, required=True)
     options = parser.parse_args()
@@ -271,7 +273,7 @@ def main():
         modules = [_helpers().build_bridge(options.build_dir)]
     if len(modules) != 1:
         parser.error("--build-dir must contain exactly one framework queue bridge")
-    run(options.runtime, options.device, modules[0])
+    run(options.runtime, options.device, modules[0], platform=options.platform)
 
 
 if __name__ == "__main__":

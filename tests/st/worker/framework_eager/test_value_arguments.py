@@ -17,12 +17,17 @@ from pathlib import Path
 import pytest
 
 _EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/value_arguments.py"
-pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), pytest.mark.test_environment("torch_npu")]
+pytestmark = [
+    pytest.mark.requires_hardware,
+    pytest.mark.platforms(["a2a3", "a5"]),
+    pytest.mark.test_environment("torch_npu"),
+]
 
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
 def test_framework_value_arguments(runtime, task_queue, framework_module, tmp_path, request):
+    platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
     logs.mkdir()
@@ -31,6 +36,8 @@ def test_framework_value_arguments(runtime, task_queue, framework_module, tmp_pa
             sys.executable,
             "-u",
             str(_EXAMPLE),
+            "--platform",
+            platform,
             "--runtime",
             runtime,
             "--device",
@@ -63,6 +70,7 @@ def test_framework_value_arguments(runtime, task_queue, framework_module, tmp_pa
     summary = records[0]
     host = runtime == "host_build_graph"
     expected = [49.0, 8.0, 83.5] + ([54.0, 1.0, 92.5] if host else [])
+    assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
     assert summary["verified"] and summary["observed"] == expected and summary["calls"] == len(expected)
     assert summary["caller_args_cleared"] and summary["wrappers_mutated"] and summary["host_backing_retained"]

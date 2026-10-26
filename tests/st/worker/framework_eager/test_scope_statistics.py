@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Persistent DEVICE controls and caller-owned weighted cache through real callbacks."""
+"""Nested ScopeStats records belong to each real framework-queued invocation."""
 
 import json
 import os
@@ -16,13 +16,18 @@ from pathlib import Path
 
 import pytest
 
-_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/persistent_state.py"
-pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), pytest.mark.test_environment("torch_npu")]
+_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/scope_statistics.py"
+pytestmark = [
+    pytest.mark.requires_hardware,
+    pytest.mark.platforms(["a2a3", "a5"]),
+    pytest.mark.test_environment("torch_npu"),
+]
 
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_framework_persistent_state(runtime, task_queue, framework_module, tmp_path, request):
+def test_framework_scope_statistics_each_invocation(runtime, task_queue, framework_module, tmp_path, request):
+    platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
     logs.mkdir()
@@ -31,12 +36,16 @@ def test_framework_persistent_state(runtime, task_queue, framework_module, tmp_p
             sys.executable,
             "-u",
             str(_EXAMPLE),
+            "--platform",
+            platform,
             "--runtime",
             runtime,
             "--device",
             device,
             "--build-dir",
             str(framework_module),
+            "--output-dir",
+            str(tmp_path / "diagnostics"),
         ],
         capture_output=True,
         text=True,
@@ -51,36 +60,27 @@ def test_framework_persistent_state(runtime, task_queue, framework_module, tmp_p
         },
     )
     (tmp_path / "consumer.log").write_text(result.stdout + result.stderr)
-    print("FRAMEWORK_PERSISTENT_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
+    print("FRAMEWORK_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
     print(result.stdout, end="", flush=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    records = [
-        line.removeprefix("FRAMEWORK_PERSISTENT_STATE_PASS ")
+    summaries = [
+        json.loads(line.removeprefix("FRAMEWORK_SCOPE_STATISTICS_PASS "))
         for line in result.stdout.splitlines()
-        if line.startswith("FRAMEWORK_PERSISTENT_STATE_PASS ")
+        if line.startswith("FRAMEWORK_SCOPE_STATISTICS_PASS ")
     ]
-    assert len(records) == 1, result.stdout + result.stderr
-    summary = json.loads(records[0])
+    assert len(summaries) == 1, result.stdout + result.stderr
+    summary = summaries[0]
+    assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
-    assert summary["verified"] and summary["calls"] == 12
-    assert summary["controls"] == [
-        [0, 0],
-        [1, 2],
-        [6, 1],
-        [0, 4],
-        [4, 0],
-        [3, 3],
-        [2, 2],
-        [7, 1],
-        [4, 4],
-        [0, 0],
-        [5, 2],
-        [1, 3],
-    ]
-    assert summary["cache_shape"] == [8, 32] and summary["cache_strides"] == [64, 1]
-    assert summary["cache_byte_offset"] == 256
-    assert summary["checksums"] == [-38, 1018, 2602, 6826, 6826, 490, -3206, -7430, -16934, -16934, -22742, -35414]
-    assert summary["caller_frame_retained"] and summary["guard_verified"] and summary["zero_accept_verified"]
-    assert summary["weights_verified"] and summary["persistent_state_verified"]
-    assert len(summary["callback_threads"]) == 12
+    assert summary["verified"] and summary["calls"] == 4
+    assert summary["selections"] == [False, True, True, False] and summary["observed"] == [10, 16, 22, 28]
+    assert summary["caller_configs_mutated"] and summary["caller_tensors_retained"]
+    assert summary["metadata_only"] == (runtime == "host_build_graph")
+    epochs = summary["run_epochs"]
+    if runtime == "tensormap_and_ringbuffer":
+        assert len(epochs) == len(set(epochs)) == 2 and all(epoch > 0 for epoch in epochs)
+    else:
+        assert epochs == []
+    assert len(summary["user_scope_sites"]) == 2
+    assert len(summary["callback_threads"]) == 4
     assert all((thread != summary["caller_thread"]) == (task_queue == "1") for thread in summary["callback_threads"])

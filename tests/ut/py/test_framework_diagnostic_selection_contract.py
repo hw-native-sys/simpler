@@ -230,15 +230,19 @@ def transport(consumer, monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "simpler.worker", SimpleNamespace(Worker=Worker))
-    monkeypatch.setattr(consumer.reference, "_compile", lambda runtime: "compiled")
+    monkeypatch.setattr(consumer.reference, "_compile", lambda runtime, *, platform="a2a3": "compiled")
     monkeypatch.setattr(consumer.reference, "_load_bridge", lambda path: bridge)
     monkeypatch.setattr(consumer.reference, "_prepare_frames", prepare)
     return SimpleNamespace(events=events, snapshots=snapshots, state=state, error=error, workers=workers, refs=refs)
 
 
 @pytest.mark.parametrize("runtime", ["host_build_graph", "tensormap_and_ringbuffer"])
-def test_whole_consumer_freezes_config_and_retires_after_final_boundary(consumer, transport, tmp_path, runtime):
-    summary = consumer.run(runtime, 0, Path("recording.so"), tmp_path / "diagnostics")
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_whole_consumer_freezes_config_and_retires_after_final_boundary(
+    consumer, transport, tmp_path, runtime, platform
+):
+    summary = consumer.run(runtime, 0, Path("recording.so"), tmp_path / "diagnostics", platform=platform)
+    assert summary["platform"] == platform
     assert summary["observed"] == [8, 12, 16, 20] and summary["run_epochs"] == [2, 3]
     assert summary["caller_configs_mutated"]
     assert [(level, event) for _, _, level, event in transport.snapshots] == [(0, 0), (1, 2), (3, 4), (0, 0)]
@@ -263,9 +267,11 @@ def test_whole_consumer_unknown_completion_keeps_owners(consumer, transport, tmp
 
 
 @pytest.mark.parametrize("defect", [None, "wrong_value", "wrong_selection", "mixed_epoch", "missing_mutation"])
-def test_real_st_rejects_incomplete_summary(tmp_path, monkeypatch, defect):
-    st = _load(_ROOT / "tests/st/a2a3/framework_eager/test_diagnostic_selection.py", "diagnostic_st")
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_real_st_rejects_incomplete_summary(tmp_path, monkeypatch, defect, platform):
+    st = _load(_ROOT / "tests/st/worker/framework_eager/test_diagnostic_selection.py", "diagnostic_st")
     summary = dict(
+        platform=platform,
         runtime="host_build_graph",
         task_queue="1",
         verified=True,
@@ -289,12 +295,15 @@ def test_real_st_rejects_incomplete_summary(tmp_path, monkeypatch, defect):
         returncode=0, stdout="FRAMEWORK_DIAGNOSTIC_SELECTION_PASS " + json.dumps(summary), stderr=""
     )
 
-    def run(*args, **kwargs):
+    def run(command, **kwargs):
+        assert command[command.index("--platform") + 1] == platform
         assert kwargs["env"]["MAX_JOBS"] == "2"
         return result
 
     monkeypatch.setattr(st, "subprocess", SimpleNamespace(run=run))
-    request = SimpleNamespace(config=SimpleNamespace(getoption=lambda name: "0"))
+    request = SimpleNamespace(
+        config=SimpleNamespace(getoption=lambda name: {"--device": "0", "--platform": platform}[name])
+    )
     if defect is None:
         st.test_framework_diagnostic_selection("host_build_graph", "1", tmp_path, tmp_path, request)
     else:

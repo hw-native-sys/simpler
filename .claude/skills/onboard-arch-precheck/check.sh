@@ -43,6 +43,11 @@ case "$REQUESTED" in
         ;;
 esac
 
+# Preserve successful but unusable driver output alongside the detection error.
+board_failure() {
+    printf 'onboard-arch-precheck: %s\nSuccessful board query: %s\n%s\n' "$1" "$2" "$3" >&2
+}
+
 # detect_silicon prints "arch|soc_name|short_soc_version" on stdout.
 # Uses npu-smi to identify the chip + the CANN platform_config ini to map
 # SoC → Short_SoC_version → repo arch. Same Short_SoC_version → arch table
@@ -94,8 +99,8 @@ detect_silicon() {
     fi
     chip=$(awk -F: '/Chip Name/ { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' <<<"$board")
     npu=$(awk -F:  '/NPU Name/  { gsub(/^[ \t]+|[ \t]+$/, "", $2); print $2; exit }' <<<"$board")
-    if [ -z "$chip" ] || [ -z "$npu" ]; then
-        echo "onboard-arch-precheck: npu-smi did not return Chip Name + NPU Name (chip='$chip' npu='$npu'). Run \`$query\` manually to see the driver's own error, and \`task-submit --run \"$query\"\` if this host restricts DCMI to root." >&2
+    if [ -z "$chip" ]; then
+        board_failure "npu-smi did not return Chip Name (chip='$chip' npu='$npu')." "$query" "$board"
         return 1
     fi
 
@@ -110,7 +115,7 @@ detect_silicon() {
         fi
     done
     if [ -z "$config_dir" ]; then
-        echo "onboard-arch-precheck: no CANN platform_config dir found under ${ASCEND_HOME_PATH}/{aarch64,x86_64}-linux/data/" >&2
+        board_failure "no CANN platform_config dir found under ${ASCEND_HOME_PATH}/{aarch64,x86_64}-linux/data/" "$query" "$board"
         return 1
     fi
 
@@ -119,42 +124,53 @@ detect_silicon() {
     #   910 9xxx:     Ascend910_9392 (chip _ npu)
     #   950 DT/PR:    Ascend950DT_9586 / Ascend950PR_9579
     local soc=""
-    case "$chip" in
-        Ascend910)
-            if [[ "$npu" =~ ^B ]]; then
-                soc="${chip}${npu}"
-            else
-                soc="${chip}_${npu}"
-            fi
-            ;;
-        Ascend950)
-            for prefix in DT PR; do
-                if [ -f "${config_dir}/${chip}${prefix}_${npu}.ini" ]; then
-                    soc="${chip}${prefix}_${npu}"
-                    break
-                fi
-            done
-            [ -z "$soc" ] && soc="${chip}_${npu}"
-            ;;
-        Ascend950DT|Ascend950PR)
-            soc="${chip}_${npu}"
-            ;;
-        *)
-            echo "onboard-arch-precheck: unrecognized Chip Name '$chip'. Update check.sh + docs/hardware/chip-architecture.md if a new family was added." >&2
+    if [ -z "$npu" ]; then
+        # Some drivers report the full SoC as Chip Name without NPU Name.
+        # Accept only an exact installed CANN name, with an optional Ascend prefix.
+        if [[ "$chip" =~ ^(Ascend)?[0-9][[:alnum:]_]*$ ]]; then
+            soc="Ascend${chip#Ascend}"
+        else
+            board_failure "unrecognized full Chip Name '$chip' without NPU Name." "$query" "$board"
             return 1
-            ;;
-    esac
+        fi
+    else
+        case "$chip" in
+            Ascend910)
+                if [[ "$npu" =~ ^B ]]; then
+                    soc="${chip}${npu}"
+                else
+                    soc="${chip}_${npu}"
+                fi
+                ;;
+            Ascend950)
+                for prefix in DT PR; do
+                    if [ -f "${config_dir}/${chip}${prefix}_${npu}.ini" ]; then
+                        soc="${chip}${prefix}_${npu}"
+                        break
+                    fi
+                done
+                [ -z "$soc" ] && soc="${chip}_${npu}"
+                ;;
+            Ascend950DT|Ascend950PR)
+                soc="${chip}_${npu}"
+                ;;
+            *)
+                board_failure "unrecognized Chip Name '$chip'. Update check.sh + docs/hardware/chip-architecture.md if a new family was added." "$query" "$board"
+                return 1
+                ;;
+        esac
+    fi
 
     local ini="${config_dir}/${soc}.ini"
     if [ ! -f "$ini" ]; then
-        echo "onboard-arch-precheck: CANN ini not found at ${ini} (Chip='$chip', NPU='$npu'). The SoC name pattern in check.sh may be stale." >&2
+        board_failure "CANN ini not found at ${ini} (Chip='$chip', NPU='$npu'). The SoC name pattern in check.sh may be stale." "$query" "$board"
         return 1
     fi
 
     local short
     short=$(awk -F= '/^Short_SoC_version=/ { gsub(/\r$/, "", $2); print $2; exit }' "$ini")
     if [ -z "$short" ]; then
-        echo "onboard-arch-precheck: ${ini} missing Short_SoC_version line" >&2
+        board_failure "${ini} missing Short_SoC_version line" "$query" "$board"
         return 1
     fi
 
@@ -168,7 +184,7 @@ detect_silicon() {
         Ascend910_93) arch=a2a3 ;;   # Atlas A3 series (910_9362..9392)
         Ascend950)    arch=a5 ;;
         *)
-            echo "onboard-arch-precheck: unsupported Short_SoC_version '$short' (SoC=$soc). Update check.sh + docs/hardware/chip-architecture.md." >&2
+            board_failure "unsupported Short_SoC_version '$short' (SoC=$soc). Update check.sh + docs/hardware/chip-architecture.md." "$query" "$board"
             return 1
             ;;
     esac

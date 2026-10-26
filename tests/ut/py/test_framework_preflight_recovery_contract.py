@@ -28,7 +28,7 @@ from simpler.worker import Worker, _Lifecycle
 
 _ROOT = Path(__file__).resolve().parents[3]
 _CONSUMER = _ROOT / "examples/workers/l2/framework_eager/preflight_recovery.py"
-_ST = _ROOT / "tests/st/a2a3/framework_eager/test_preflight_recovery.py"
+_ST = _ROOT / "tests/st/worker/framework_eager/test_preflight_recovery.py"
 
 
 def _load(path, name):
@@ -218,7 +218,7 @@ def transport(consumer, monkeypatch):
     monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
     monkeypatch.setattr(consumer, "_helpers", lambda: reference)
     monkeypatch.setattr(consumer, "_context_api", lambda: api)
-    monkeypatch.setattr(reference, "_compile", lambda runtime: object())
+    monkeypatch.setattr(reference, "_compile", lambda runtime, *, platform="a2a3": object())
     empty = torch.empty
 
     def cpu_empty(*args, **kwargs):
@@ -297,8 +297,10 @@ def test_real_worker_rejects_stale_source_before_native_and_reuses_fresh_registr
 
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
-def test_actual_consumer_recording_keeps_recovery_and_retirement_order(consumer, transport, runtime):
-    summary = consumer.run(runtime, 0, Path("recording.so"))
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_actual_consumer_recording_keeps_recovery_and_retirement_order(consumer, transport, runtime, platform):
+    summary = consumer.run(runtime, 0, Path("recording.so"), platform=platform)
+    assert summary["platform"] == platform
     assert summary["observed"] == [8, 12, 16] and summary["refusals"] == ["source", "context"]
     assert summary["source_registration_replaced"] and summary["alternate_destroyed"]
     assert summary["caller_context_preserved"] and summary["caller_stream_after_close"]
@@ -438,8 +440,9 @@ def test_actual_consumer_rejects_unrelated_source_value_error(consumer, transpor
     assert not any(event[0] == "destroy" for event in transport.api.events)
 
 
-def _summary(runtime, queue) -> dict:
+def _summary(runtime, queue, platform="a2a3") -> dict:
     return dict(
+        platform=platform,
         runtime=runtime,
         task_queue=queue,
         calls=3,
@@ -456,11 +459,12 @@ def _summary(runtime, queue) -> dict:
     )
 
 
-def _invoke_st(tmp_path, monkeypatch, records, runtime, queue, code=0):
+def _invoke_st(tmp_path, monkeypatch, records, runtime, queue, code=0, *, platform="a2a3"):
     st = _load(_ST, "framework_preflight_st")
 
     def run(command, **kwargs):
         assert Path(command[2]) == _CONSUMER
+        assert command[command.index("--platform") + 1] == platform
         assert kwargs["env"]["TASK_QUEUE_ENABLE"] == queue
         assert kwargs["env"]["TORCH_DEVICE_BACKEND_AUTOLOAD"] == "0"
         return SimpleNamespace(
@@ -470,14 +474,17 @@ def _invoke_st(tmp_path, monkeypatch, records, runtime, queue, code=0):
         )
 
     monkeypatch.setattr(st, "subprocess", SimpleNamespace(run=run))
-    request = SimpleNamespace(config=SimpleNamespace(getoption=lambda _: "0"))
+    request = SimpleNamespace(
+        config=SimpleNamespace(getoption=lambda name: {"--device": "0", "--platform": platform}[name])
+    )
     st.test_framework_preflight_recovery(runtime, queue, tmp_path, tmp_path, request)
 
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("queue", ["0", "1"])
-def test_actual_st_accepts_complete_result(tmp_path, monkeypatch, runtime, queue):
-    _invoke_st(tmp_path, monkeypatch, [_summary(runtime, queue)], runtime, queue)
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_actual_st_accepts_complete_result(tmp_path, monkeypatch, runtime, queue, platform):
+    _invoke_st(tmp_path, monkeypatch, [_summary(runtime, queue, platform)], runtime, queue, platform=platform)
 
 
 @pytest.mark.parametrize(

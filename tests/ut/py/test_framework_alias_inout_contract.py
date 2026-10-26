@@ -24,7 +24,7 @@ from simpler.task_interface import TensorArgType
 
 _ROOT = Path(__file__).resolve().parents[3]
 _CONSUMER = _ROOT / "examples/workers/l2/framework_eager/alias_inout.py"
-_ST = _ROOT / "tests/st/a2a3/framework_eager/test_alias_inout.py"
+_ST = _ROOT / "tests/st/worker/framework_eager/test_alias_inout.py"
 
 
 def _load(path, name):
@@ -159,6 +159,7 @@ def test_caller_frames_retain_real_tensors_after_construction_and_gc(consumer, t
 
 def _summary(queue="1"):
     return dict(
+        platform="a2a3",
         runtime="host_build_graph",
         task_queue=queue,
         verified=True,
@@ -188,7 +189,9 @@ def _invoke_st(tmp_path, monkeypatch, records, *, queue="1", returncode=0):
         return SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
 
     monkeypatch.setattr(module, "subprocess", SimpleNamespace(run=run))
-    request = SimpleNamespace(config=SimpleNamespace(getoption=lambda _: "0"))
+    request = SimpleNamespace(
+        config=SimpleNamespace(getoption=lambda name: {"--device": "0", "--platform": "a2a3"}[name])
+    )
     module.test_framework_alias_inout("host_build_graph", queue, tmp_path, tmp_path, request)
 
 

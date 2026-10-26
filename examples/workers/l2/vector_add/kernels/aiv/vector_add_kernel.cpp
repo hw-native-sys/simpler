@@ -24,8 +24,6 @@
 
 #include "tensor.h"
 
-using namespace pto;
-
 #include "pipe_sync.h"
 
 #ifndef __gm__
@@ -61,30 +59,30 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     constexpr int vRows = 128;
     constexpr int vCols = 128;
 
-    using DynShapeDim5 = Shape<1, 1, 1, vRows, vCols>;
-    using DynStridDim5 = Stride<1, 1, 1, kTCols_, 1>;
-    using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
-    using TileData = Tile<TileType::Vec, float, kTRows_, kTCols_, BLayout::RowMajor, -1, -1>;
+    using DynShapeDim5 = pto::Shape<1, 1, 1, vRows, vCols>;
+    using DynStridDim5 = pto::Stride<1, 1, 1, kTCols_, 1>;
+    using GlobalData = pto::GlobalTensor<float, DynShapeDim5, DynStridDim5>;
+    using TileData = pto::Tile<pto::TileType::Vec, float, kTRows_, kTCols_, pto::BLayout::RowMajor, -1, -1>;
 
     TileData src0Tile(vRows, vCols);
     TileData src1Tile(vRows, vCols);
     TileData dstTile(vRows, vCols);
-    TASSIGN(src0Tile, 0x0);
-    TASSIGN(src1Tile, 0x10000);
-    TASSIGN(dstTile, 0x20000);
+    pto::TASSIGN(src0Tile, 0x0);
+    pto::TASSIGN(src1Tile, 0x10000);
+    pto::TASSIGN(dstTile, 0x20000);
 
     GlobalData src0Global(src0);
     GlobalData src1Global(src1);
     GlobalData dstGlobal(out);
 
-    TLOAD(src0Tile, src0Global);
-    TLOAD(src1Tile, src1Global);
+    pto::TLOAD(src0Tile, src0Global);
+    pto::TLOAD(src1Tile, src1Global);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    TADD(dstTile, src0Tile, src1Tile);
+    pto::TADD(dstTile, src0Tile, src1Tile);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    TSTORE(dstGlobal, dstTile);
+    pto::TSTORE(dstGlobal, dstTile);
 
     pipe_sync();
 }

@@ -304,7 +304,7 @@ def transport(consumer, monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "simpler.worker", SimpleNamespace(Worker=Worker))
-    monkeypatch.setattr(consumer, "_compile", lambda runtime: "compiled")
+    monkeypatch.setattr(consumer, "_compile", lambda runtime, *, platform="a2a3": "compiled")
     monkeypatch.setattr(consumer, "_check_exports", check)
     monkeypatch.setattr(consumer.reference, "_load_bridge", lambda path: bridge)
     monkeypatch.setattr(consumer.reference, "_prepare_frames", prepare)
@@ -312,8 +312,10 @@ def transport(consumer, monkeypatch):
 
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
-def test_whole_consumer_freezes_each_config_and_exports_before_close(consumer, transport, tmp_path, runtime):
-    result = consumer.run(runtime, 0, Path("recording.so"), tmp_path / "diagnostics")
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_whole_consumer_freezes_each_config_and_exports_before_close(consumer, transport, tmp_path, runtime, platform):
+    result = consumer.run(runtime, 0, Path("recording.so"), tmp_path / "diagnostics", platform=platform)
+    assert result["platform"] == platform
     assert result["observed"] == [10, 16, 22, 28] and result["caller_configs_mutated"]
     assert result["run_epochs"] == ([2, 3] if runtime == "tensormap_and_ringbuffer" else [])
     assert [enabled for _, _, enabled in transport.snapshots] == [False, True, True, False]
@@ -343,8 +345,9 @@ def test_unknown_completion_or_export_failure_retains_all_owners(consumer, trans
     "defect", [None, "wrong_value", "wrong_selection", "mixed_epoch", "missing_mutation", "wrong_thread"]
 )
 def test_actual_st_rejects_invalid_summary(tmp_path, monkeypatch, defect):
-    st = _load(_ROOT / "tests/st/a2a3/framework_eager/test_scope_statistics.py", "scope_st")
+    st = _load(_ROOT / "tests/st/worker/framework_eager/test_scope_statistics.py", "scope_st")
     summary = dict(
+        platform="a2a3",
         runtime="tensormap_and_ringbuffer",
         task_queue="1",
         verified=True,
@@ -376,7 +379,9 @@ def test_actual_st_rejects_invalid_summary(tmp_path, monkeypatch, defect):
         return result
 
     monkeypatch.setattr(st, "subprocess", SimpleNamespace(run=run))
-    request = SimpleNamespace(config=SimpleNamespace(getoption=lambda name: "0"))
+    request = SimpleNamespace(
+        config=SimpleNamespace(getoption=lambda name: {"--device": "0", "--platform": "a2a3"}[name])
+    )
     if defect is None:
         st.test_framework_scope_statistics_each_invocation("tensormap_and_ringbuffer", "1", tmp_path, tmp_path, request)
     else:

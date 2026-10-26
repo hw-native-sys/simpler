@@ -21,7 +21,7 @@ import yaml
 from simpler_setup.test_environments import verify_results
 
 _ROOT = Path(__file__).resolve().parents[3]
-_ST_RELATIVE = Path("tests/st/a2a3/framework_eager/test_framework_eager.py")
+_ST_RELATIVE = Path("tests/st/worker/framework_eager/test_framework_eager.py")
 _ST = _ROOT / _ST_RELATIVE
 _CASES = {
     f"test_framework_queue_orders_public_worker[{queue}-{runtime}]"
@@ -30,7 +30,7 @@ _CASES = {
 }
 
 
-def _run_selected_contract(tmp_path, *, missing):
+def _run_selected_contract(tmp_path, *, missing, platform="a2a3"):
     # Only the external compiler/device subprocess is replaced. Pytest executes
     # the actual fixture, four parameterizations, and consumer JSON assertions.
     (tmp_path / "pytest.ini").write_text(
@@ -76,8 +76,9 @@ def cpu_transport():
             output = "FRAMEWORK_QUEUE_MODULE " + str(module) + "\\n"
         else:
             runtime = command[command.index("--runtime") + 1]
+            assert command[command.index("--platform") + 1] == {platform!r}
             queue = kwargs["env"]["TASK_QUEUE_ENABLE"]
-            summary = dict(verified=True, calls=3, runtime=runtime, task_queue=queue,
+            summary = dict(verified=True, calls=3, platform={platform!r}, runtime=runtime, task_queue=queue,
                 caller_tensors_retained=True, caller_stream_after_close=True,
                 callback_error_observed=True, zero_stream_preflight_refusals=1,
                 caller_thread=1, callback_threads=[1 if queue == "0" else 2] * 3)
@@ -102,6 +103,7 @@ from simpler_setup import test_environments as environments
 
 def pytest_addoption(parser):
     parser.addoption("--device", default="0")
+    parser.addoption("--platform", default={platform!r})
     parser.addoption("--test-environment", default="torch_npu")
 
 def pytest_collection_finish(session):
@@ -141,8 +143,9 @@ def pytest_sessionfinish(session):
     return result, ET.parse(tmp_path / "results.xml").getroot().findall(".//testcase")
 
 
-def test_selected_framework_matrix_has_four_passed_junit_cases(tmp_path):
-    result, cases = _run_selected_contract(tmp_path, missing=None)
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_selected_framework_matrix_has_four_passed_junit_cases(tmp_path, platform):
+    result, cases = _run_selected_contract(tmp_path, missing=None, platform=platform)
     assert result.returncode == 0, result.stdout + result.stderr
     assert len(cases) == 4
     assert {case.attrib["name"] for case in cases} == _CASES
@@ -230,14 +233,16 @@ def test_framework_setup_preserves_the_callers_installed_toolchain(tmp_path, ver
         assert not output.exists()
 
 
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
 @pytest.mark.parametrize("mode", ["exclude", "include", "only", "invalid"])
-def test_framework_workflow_propagates_manual_selection(tmp_path, mode):
-    workflow = yaml.load((_ROOT / ".github/workflows/_st-framework-eager-a2a3.yml").read_text(), Loader=yaml.BaseLoader)
+def test_framework_workflow_propagates_manual_selection(tmp_path, mode, platform):
+    workflow = yaml.load((_ROOT / ".github/workflows/_st-framework-eager.yml").read_text(), Loader=yaml.BaseLoader)
     assert workflow["on"]["workflow_call"]["inputs"]["manual_mode"]["default"] == "exclude"
     daily = yaml.load((_ROOT / ".github/workflows/daily.yml").read_text(), Loader=yaml.BaseLoader)
-    assert daily["jobs"]["st-framework-eager-a2a3"]["with"]["manual_mode"] == "include"
+    assert daily["jobs"][f"st-framework-eager-{platform}"]["with"]["manual_mode"] == "include"
     step = next(step for step in workflow["jobs"]["run"]["steps"] if "run" in step)
     assert step["env"]["MANUAL_MODE"] == "${{ inputs.manual_mode }}"
+    assert step["env"]["PLATFORM"] == "${{ inputs.platform }}"
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     python = tmp_path / ".venv-framework/bin/python"
@@ -251,7 +256,8 @@ def test_framework_workflow_propagates_manual_selection(tmp_path, mode):
     task.write_text(
         f"#!{sys.executable}\nimport json, os, subprocess, sys\n"
         "args = sys.argv[1:]\n"
-        "assert ['--env', 'MANUAL_MODE'] == args[2:4], args\n"
+        "if args == ['--list']: sys.exit(0)\n"
+        "assert args[:6] == ['--env', 'CANN_ENV', '--env', 'MANUAL_MODE', '--env', 'PLATFORM'], args\n"
         "subprocess.run(['bash', '-e', '-c', args[args.index('--run') + 1]], "
         "env={**os.environ, 'TASK_DEVICE': '0'}, check=True)\n"
     )
@@ -259,6 +265,13 @@ def test_framework_workflow_propagates_manual_selection(tmp_path, mode):
     git = bin_dir / "git"
     git.write_text("#!/bin/sh\nprintf 'CPU-workflow-contract\\n'\n")
     git.chmod(0o755)
+    precheck = tmp_path / ".claude/skills/onboard-arch-precheck/check.sh"
+    precheck.parent.mkdir(parents=True)
+    precheck.write_text(f'#!/bin/sh\n[ "$1" = "{platform}" ]\n')
+    precheck.chmod(0o755)
+    smi = bin_dir / "npu-smi"
+    smi.write_text("#!/bin/sh\nprintf 'CPU workflow inventory transport\\n'\n")
+    smi.chmod(0o755)
     cann = tmp_path / "toolkit env.sh"
     cann.write_text(":\n")
     log = tmp_path / "argv.jsonl"
@@ -270,6 +283,7 @@ def test_framework_workflow_propagates_manual_selection(tmp_path, mode):
             "PATH": f"{bin_dir}:{os.environ['PATH']}",
             "CANN_ENV": str(cann),
             "MANUAL_MODE": mode,
+            "PLATFORM": platform,
             "ARGV_LOG": str(log),
         },
         capture_output=True,
@@ -286,6 +300,7 @@ def test_framework_workflow_propagates_manual_selection(tmp_path, mode):
         commands = [json.loads(line) for line in log.read_text().splitlines()]
         command = next(args for args in commands if args[:2] == ["-m", "pytest"])
         assert command[command.index("--manual") + 1] == mode
+        assert command[command.index("--platform") + 1] == platform
 
 
 @pytest.mark.parametrize("selection", ["shared", "missing", "empty"])

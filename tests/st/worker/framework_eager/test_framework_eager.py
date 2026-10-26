@@ -18,12 +18,17 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[4]
 _EXAMPLE = _ROOT / "examples/workers/l2/framework_eager/main.py"
-pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), pytest.mark.test_environment("torch_npu")]
+pytestmark = [
+    pytest.mark.requires_hardware,
+    pytest.mark.platforms(["a2a3", "a5"]),
+    pytest.mark.test_environment("torch_npu"),
+]
 
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
 def test_framework_queue_orders_public_worker(runtime, task_queue, framework_module, tmp_path, request):
+    platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
     logs.mkdir()
@@ -32,6 +37,8 @@ def test_framework_queue_orders_public_worker(runtime, task_queue, framework_mod
             sys.executable,
             "-u",
             str(_EXAMPLE),
+            "--platform",
+            platform,
             "--runtime",
             runtime,
             "--device",
@@ -65,6 +72,7 @@ def test_framework_queue_orders_public_worker(runtime, task_queue, framework_mod
     assert len(records) == 1, result.stdout + result.stderr
     summary = json.loads(records[0])
     assert summary["verified"] and summary["calls"] == 3
+    assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
     assert summary["caller_tensors_retained"] and summary["caller_stream_after_close"]
     assert summary["callback_error_observed"] and summary["zero_stream_preflight_refusals"] == 1

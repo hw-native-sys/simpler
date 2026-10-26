@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A queued request failure preserves accepted work and later healthy requests."""
+"""Persistent DEVICE controls and caller-owned weighted cache through real callbacks."""
 
 import json
 import os
@@ -16,13 +16,18 @@ from pathlib import Path
 
 import pytest
 
-_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/failure_recovery.py"
-pytestmark = [pytest.mark.requires_hardware, pytest.mark.platforms(["a2a3"]), pytest.mark.test_environment("torch_npu")]
+_EXAMPLE = Path(__file__).resolve().parents[4] / "examples/workers/l2/framework_eager/persistent_state.py"
+pytestmark = [
+    pytest.mark.requires_hardware,
+    pytest.mark.platforms(["a2a3", "a5"]),
+    pytest.mark.test_environment("torch_npu"),
+]
 
 
 @pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
 @pytest.mark.parametrize("task_queue", ["0", "1"])
-def test_framework_recovers_after_accepted_callback_failure(runtime, task_queue, framework_module, tmp_path, request):
+def test_framework_persistent_state(runtime, task_queue, framework_module, tmp_path, request):
+    platform = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
     logs.mkdir()
@@ -31,6 +36,8 @@ def test_framework_recovers_after_accepted_callback_failure(runtime, task_queue,
             sys.executable,
             "-u",
             str(_EXAMPLE),
+            "--platform",
+            platform,
             "--runtime",
             runtime,
             "--device",
@@ -51,21 +58,37 @@ def test_framework_recovers_after_accepted_callback_failure(runtime, task_queue,
         },
     )
     (tmp_path / "consumer.log").write_text(result.stdout + result.stderr)
-    print("FRAMEWORK_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
+    print("FRAMEWORK_PERSISTENT_CONSUMER_LOG " + str(tmp_path / "consumer.log"), flush=True)
     print(result.stdout, end="", flush=True)
     assert result.returncode == 0, result.stdout + result.stderr
-    summaries = [
-        json.loads(line.removeprefix("FRAMEWORK_FAILURE_RECOVERY_PASS "))
+    records = [
+        line.removeprefix("FRAMEWORK_PERSISTENT_STATE_PASS ")
         for line in result.stdout.splitlines()
-        if line.startswith("FRAMEWORK_FAILURE_RECOVERY_PASS ")
+        if line.startswith("FRAMEWORK_PERSISTENT_STATE_PASS ")
     ]
-    assert len(summaries) == 1, result.stdout + result.stderr
-    summary = summaries[0]
+    assert len(records) == 1, result.stdout + result.stderr
+    summary = json.loads(records[0])
+    assert summary["platform"] == platform
     assert summary["runtime"] == runtime and summary["task_queue"] == task_queue
-    assert summary["verified"] and summary["calls"] == 3
-    assert summary["submissions"] == [0, 1, 2] and summary["callback_errors"] == [0]
-    assert summary["observed"] == [8, 12, 16]
-    assert summary["caller_tensors_retained"] and summary["close_without_individual_wait"]
-    assert summary["buffers_closed_after_worker"] and summary["caller_stream_after_close"]
-    assert len(summary["callback_threads"]) == 3
+    assert summary["verified"] and summary["calls"] == 12
+    assert summary["controls"] == [
+        [0, 0],
+        [1, 2],
+        [6, 1],
+        [0, 4],
+        [4, 0],
+        [3, 3],
+        [2, 2],
+        [7, 1],
+        [4, 4],
+        [0, 0],
+        [5, 2],
+        [1, 3],
+    ]
+    assert summary["cache_shape"] == [8, 32] and summary["cache_strides"] == [64, 1]
+    assert summary["cache_byte_offset"] == 256
+    assert summary["checksums"] == [-38, 1018, 2602, 6826, 6826, 490, -3206, -7430, -16934, -16934, -22742, -35414]
+    assert summary["caller_frame_retained"] and summary["guard_verified"] and summary["zero_accept_verified"]
+    assert summary["weights_verified"] and summary["persistent_state_verified"]
+    assert len(summary["callback_threads"]) == 12
     assert all((thread != summary["caller_thread"]) == (task_queue == "1") for thread in summary["callback_threads"])

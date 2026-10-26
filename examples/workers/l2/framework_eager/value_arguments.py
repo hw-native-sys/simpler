@@ -44,7 +44,7 @@ def _reference():
     return module
 
 
-def _compile(runtime, *, host_control=False):
+def _compile(runtime, platform="a2a3", *, host_control=False):
     from simpler.task_interface import ArgDirection as D  # noqa: PLC0415
 
     from simpler_setup.scene_test import compile_chip_callable_spec  # noqa: PLC0415
@@ -67,9 +67,9 @@ def _compile(runtime, *, host_control=False):
                 }
             ],
         },
-        "a2a3",
+        platform,
         runtime,
-        f"framework-values-{runtime}-{host_control}",
+        f"framework-values-{platform}-{runtime}-{host_control}",
     )
 
 
@@ -99,7 +99,7 @@ def _expected(index, host_control=False):
     return (index + 2) * scale + bias + (_CONTROLS[index] if host_control else 0) + 0.5
 
 
-def run(runtime, device, bridge_path):
+def run(runtime, device, bridge_path, *, platform="a2a3"):
     import torch  # noqa: PLC0415
     import torch_npu  # noqa: PLC0415, F401 -- registers the NPU framework backend
     from simpler.buffer import Buffer  # noqa: PLC0415
@@ -111,10 +111,10 @@ def run(runtime, device, bridge_path):
     torch.npu.set_device(device)
     stream = torch.npu.Stream(device=device)
     raw_stream = stream.npu_stream
-    worker = Worker(level=2, device_id=device, platform="a2a3", runtime=runtime)
-    handles = {False: worker.register(_compile(runtime))}
+    worker = Worker(level=2, device_id=device, platform=platform, runtime=runtime)
+    handles = {False: worker.register(_compile(runtime, platform=platform))}
     if runtime == "host_build_graph":
-        handles[True] = worker.register(_compile(runtime, host_control=True))
+        handles[True] = worker.register(_compile(runtime, platform=platform, host_control=True))
     worker.init(borrowed_context_generation=1)
     frames, queued, runs, refusals = [], [], [], []
     caller_thread, queue = threading.get_native_id(), os.environ.get("TASK_QUEUE_ENABLE", "1")
@@ -199,6 +199,7 @@ def run(runtime, device, bridge_path):
                 buffer.close()
         retired = True
         summary = dict(
+            platform=platform,
             runtime=runtime,
             task_queue=queue,
             calls=len(runs),
@@ -239,6 +240,7 @@ def run(runtime, device, bridge_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", choices=["tensormap_and_ringbuffer", "host_build_graph"], required=True)
+    parser.add_argument("--platform", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--build-dir", type=Path, required=True)
     options = parser.parse_args()
@@ -246,7 +248,7 @@ def main():
     if len(modules) > 1:
         parser.error("--build-dir contains multiple framework queue bridges")
     path = modules[0] if modules else _reference().build_bridge(options.build_dir)
-    run(options.runtime, options.device, path)
+    run(options.runtime, options.device, path, platform=options.platform)
 
 
 if __name__ == "__main__":

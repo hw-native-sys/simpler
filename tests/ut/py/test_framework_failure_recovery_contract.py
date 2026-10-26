@@ -27,7 +27,7 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
 _CONSUMER = _ROOT / "examples/workers/l2/framework_eager/failure_recovery.py"
-_ST = _ROOT / "tests/st/a2a3/framework_eager/test_failure_recovery.py"
+_ST = _ROOT / "tests/st/worker/framework_eager/test_failure_recovery.py"
 
 
 def _load(path, name):
@@ -187,7 +187,7 @@ def recording_transport(consumer, monkeypatch):
     )
     monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())
     monkeypatch.setitem(sys.modules, "simpler.worker", SimpleNamespace(Worker=Worker))
-    monkeypatch.setattr(consumer.reference, "_compile", lambda runtime: "compiled")
+    monkeypatch.setattr(consumer.reference, "_compile", lambda runtime, *, platform="a2a3": "compiled")
     monkeypatch.setattr(consumer.reference, "_load_bridge", lambda path: bridge)
     monkeypatch.setattr(consumer.reference, "_prepare_frames", prepare)
     return SimpleNamespace(
@@ -195,8 +195,10 @@ def recording_transport(consumer, monkeypatch):
     )
 
 
-def test_full_consumer_recovers_and_closes_unwaited_accepted_runs(consumer, recording_transport):
-    summary = consumer.run("host_build_graph", 0, Path("recording-transport.so"))
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_full_consumer_recovers_and_closes_unwaited_accepted_runs(consumer, recording_transport, platform):
+    summary = consumer.run("host_build_graph", 0, Path("recording-transport.so"), platform=platform)
+    assert summary["platform"] == platform
     assert summary["observed"] == [8, 12, 16] and summary["callback_errors"] == [0]
     assert summary["submissions"] == [0, 1, 2]
     events = recording_transport.events
@@ -230,6 +232,7 @@ def test_full_consumer_unknown_completion_retains_owners_and_primary_error(consu
 def test_real_hardware_test_rejects_incomplete_recovery_summary(tmp_path, monkeypatch, defect):
     st = _load(_ST, "framework_failure_recovery_st")
     summary = dict(
+        platform="a2a3",
         runtime="host_build_graph",
         task_queue="1",
         verified=True,
@@ -254,7 +257,9 @@ def test_real_hardware_test_rejects_incomplete_recovery_summary(tmp_path, monkey
         summary["buffers_closed_after_worker"] = False
     result = SimpleNamespace(returncode=0, stdout="FRAMEWORK_FAILURE_RECOVERY_PASS " + json.dumps(summary), stderr="")
     monkeypatch.setattr(st, "subprocess", SimpleNamespace(run=lambda *args, **kwargs: result))
-    request = SimpleNamespace(config=SimpleNamespace(getoption=lambda name: "0"))
+    request = SimpleNamespace(
+        config=SimpleNamespace(getoption=lambda name: {"--device": "0", "--platform": "a2a3"}[name])
+    )
     if defect is None:
         st.test_framework_recovers_after_accepted_callback_failure("host_build_graph", "1", tmp_path, tmp_path, request)
     else:

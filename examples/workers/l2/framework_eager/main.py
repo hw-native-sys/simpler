@@ -70,7 +70,7 @@ def _load_bridge(path: Path):
     return module
 
 
-def _compile(runtime):
+def _compile(runtime, platform="a2a3"):
     from simpler.task_interface import ArgDirection  # noqa: PLC0415
 
     from simpler_setup.scene_test import compile_chip_callable_spec  # noqa: PLC0415
@@ -91,7 +91,7 @@ def _compile(runtime):
             }
         ],
     }
-    return compile_chip_callable_spec(spec, "a2a3", runtime, f"framework-eager-{runtime}")
+    return compile_chip_callable_spec(spec, platform, runtime, f"framework-eager-{platform}-{runtime}")
 
 
 def _prepare_frames(torch, worker, handle, stream, raw_stream, calls):
@@ -132,7 +132,7 @@ def _prepare_frames(torch, worker, handle, stream, raw_stream, calls):
     return frames, weak_tensors
 
 
-def run(runtime: str, device: int, bridge_path: Path, calls: int = 3):
+def run(runtime: str, device: int, bridge_path: Path, calls: int = 3, *, platform="a2a3"):
     import torch  # noqa: PLC0415
     import torch_npu  # noqa: PLC0415, F401 -- registers the NPU framework backend
     from simpler.worker import Worker  # noqa: PLC0415
@@ -140,8 +140,8 @@ def run(runtime: str, device: int, bridge_path: Path, calls: int = 3):
     bridge = _load_bridge(bridge_path)
     torch.npu.set_device(device)
     stream = torch.npu.Stream(device=device)
-    worker = Worker(level=2, device_id=device, platform="a2a3", runtime=runtime)
-    handle = worker.register(_compile(runtime))
+    worker = Worker(level=2, device_id=device, platform=platform, runtime=runtime)
+    handle = worker.register(_compile(runtime, platform=platform))
     worker.init(borrowed_context_generation=1)
     frames, queued, runs, refusals = [], [], [], []
     caller_thread = threading.get_native_id()
@@ -227,6 +227,7 @@ def run(runtime: str, device: int, bridge_path: Path, calls: int = 3):
             assert torch.equal(result, torch.full(SHAPE, frames[0]["expected"] * 2, dtype=result.dtype))
         retired = True
         summary = {
+            "platform": platform,
             "runtime": runtime,
             "task_queue": task_queue,
             "calls": calls,
@@ -263,6 +264,7 @@ def main():
     parser.add_argument(
         "--runtime", choices=["tensormap_and_ringbuffer", "host_build_graph"], default="tensormap_and_ringbuffer"
     )
+    parser.add_argument("--platform", choices=["a2a3", "a5"], default="a2a3")
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--calls", type=int, default=3)
     parser.add_argument("--build-dir", type=Path, default=ROOT / "build/framework_eager")
@@ -273,7 +275,7 @@ def main():
     path = build_bridge(options.build_dir)
     print("FRAMEWORK_QUEUE_MODULE " + str(path), flush=True)
     if not options.compile_only:
-        run(options.runtime, options.device, path, options.calls)
+        run(options.runtime, options.device, path, options.calls, platform=options.platform)
 
 
 if __name__ == "__main__":

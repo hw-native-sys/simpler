@@ -16,11 +16,11 @@ import pytest
 from simpler_setup.test_environments import _plan_digest, _source, verify_results
 
 
-def _write(tmp_path, names, outcome=None):
+def _write(tmp_path, names, outcome=None, *, platform="a2a3"):
     plan = {
         "source": _source(),
         "environment": "torch_npu",
-        "platform": "a2a3",
+        "platform": platform,
         "cases": [{"nodeid": name, "classname": "tests.test_example", "name": name.split("::")[-1]} for name in names],
     }
     plan_path = tmp_path / "results.plan.json"
@@ -43,8 +43,13 @@ def _write(tmp_path, names, outcome=None):
     return plan_path, path
 
 
-def test_collected_environment_plan_passes(tmp_path, capsys):
-    verify_results(*_write(tmp_path, ["tests/test_example.py::test_first", "tests/test_example.py::test_second"]))
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_collected_environment_plan_passes(tmp_path, capsys, platform):
+    verify_results(
+        *_write(
+            tmp_path, ["tests/test_example.py::test_first", "tests/test_example.py::test_second"], platform=platform
+        )
+    )
     assert "TEST_ENVIRONMENT_VERIFIED " in capsys.readouterr().out
 
 

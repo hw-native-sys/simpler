@@ -86,14 +86,19 @@ in-flight `task-submit` device locks).
 
 Pipeline:
 
-1. `npu-smi info -t board -i 0 -c 0` → get `Chip Name` + `NPU Name` (~600 ms,
+1. `npu-smi info -t board -i 0 -c 0` → get `Chip Name` and, when reported, `NPU Name` (~600 ms,
    no ACL init, no device binding). On failure, retry the same query via
    `task-submit --run "…"` when available, since some shared hosts restrict
    DCMI to root. If it still fails, try `npu-smi info -t board -i 0` without
    `-c 0`, with the same privilege retry: some devices/tools reject `-c`.
    Retries depend on exit status; only a successful query is parsed. If all
    attempts fail, report their commands, exit statuses and output, then exit 1.
-2. Construct CANN SoC name per family:
+   A successful but unusable board report is retained in detection errors.
+2. When `NPU Name` is absent or empty, accept `Chip Name` only as a full SoC
+   token matching an exact installed CANN INI filename after adding the
+   `Ascend` prefix if absent (e.g. `910B2C` → `Ascend910B2C.ini`). The same
+   `Short_SoC_version` validation below still applies. Otherwise construct
+   the CANN SoC name per family:
    - `Ascend910` + `B*` NPU → `Ascend910B3` (or B1/B2/B4)
    - `Ascend910` + numeric NPU → `Ascend910_9392` (Atlas A3 SKUs)
    - `Ascend950` + NPU → look for `Ascend950DT_<NPU>` or `Ascend950PR_<NPU>`;
