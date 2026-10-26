@@ -111,7 +111,7 @@ set_target_properties(aicpu_kernel PROPERTIES OUTPUT_NAME aicpu_kernel)
 # rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC), invokes
 # DynTileFwkBackendKernelServerInit, which writes the bundled inner SO bytes
 # (passed via the extended DeviceArgs at offsets 120/128) to
-# /usr/lib64/aicpu_kernels/0/aicpu_kernels_device/simpler_inner_<fp>_<device_id>.so
+# <preinstall>/<hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so
 # under a content-fingerprint + device-id basename. After bootstrap the host registers the
 # preinstall file via rtsBinaryLoadFromFile + rtsFuncGetByName and launches
 # per-task through rtsLaunchCpuKernel; the dispatcher SO itself is never
@@ -141,6 +141,7 @@ target_include_directories(aicpu_dispatcher
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CUSTOM_INCLUDE_DIRS}
+        ${ASCEND_HOME_PATH}/pkg_inc
         # src/common is needed so `#include "utils/elf_build_id.h"` resolves;
         # host_runtime.so already has this on its include path (see host
         # CMakeLists), and the dispatcher uses the same header to fingerprint

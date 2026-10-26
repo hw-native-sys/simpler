@@ -308,16 +308,41 @@ discovered and included by Daily without another workflow edit.
 The dedicated environment uses `--system-site-packages` and installs local,
 pinned wheels for CPU Torch 2.7.1 and torch_npu 2.7.1.post4. The pins constrain
 subsequent test/SDK installation too. The profile selects an already installed
-CANN 9.0.0 toolkit by its actual manifest, preferring an active exact match.
-The selected `set_env.sh` is used for installation, compilation and inside the
-exclusive task; the system default symlink is not changed. If no matching
-installation exists, setup fails with the inspected toolkit inventory. Its
-active manifest must still say 9.0.0, matching the [Ascend compatibility table](https://github.com/Ascend/pytorch/blob/master/COMPATIBILITY.en.md).
-Unknown or different versions, missing dependencies, and failed imports are
+toolkit by its actual manifest. Selector and preflight share a minimum CANN
+version line of 9.0, comparing numeric major/minor values without an architecture
+allowlist. Separated release/build labels are opaque: 9.0.RC1, 9.1.T500,
+9.2.0-beta.2, 9.10 and 10.0 meet the minimum. Missing or malformed versions and
+version lines below 9.0 are rejected. This is an admission policy, not a claim
+that all admitted releases and hardware combinations have been tested.
+
+CANN 9.0.0 on x86_64 has framework CI coverage. CANN 9.2.0-beta.2 passed the
+[ARM64 A3 framework experiment](https://github.com/hw-native-sys/simpler/actions/runs/40190729557/job/121165491940)
+with these unchanged Torch pins. Those execution results remain the measured
+compatibility evidence; other admitted combinations need their own validation.
+
+An already active toolkit meeting the minimum is preferred. Otherwise setup scans its
+existing roots in deterministic order, without using directory names as version
+claims. The selected `set_env.sh` is used for installation, compilation and inside
+the exclusive task; the system default symlink is not changed. If no installation meeting the minimum
+exists, setup fails with the inspected toolkit inventory and required
+minimum version line. Preflight checks the actual active manifest against
+the same rule. Unknown versions, missing dependencies, and failed imports are
 errors rather than skipped qualification. Runner labels alone do not establish
 this compatibility. Setup prints Python, host architecture, CANN manifest,
 distribution versions and module locations; backend imports happen inside the
 exclusive device task with automatic backend loading disabled beforehand.
+
+The ScopeStats consumer adds four queued calls with off/on/on/off selection
+and independent output prefixes. TMR checks nested scope records and allocation
+frontiers; HBG checks metadata only. Those cases enter the same collection plan
+without a workflow case list.
+
+The diagnostic-selection consumer queues four calls on one Worker: diagnostics
+off, swimlane level 1 / PMU event 2, level 3 / event 4, then off again. It changes
+the original CallConfig selectors and output prefixes after each accepted submit,
+then checks the submitted selections, original export destinations and per-run
+attribution. PMU and swimlane collection can wait; this does not qualify other
+DFX collectors or claim overlapping execution.
 
 One `task-submit` allocation of one device runs the selected consumers serially
 for TMR/HBG × `TASK_QUEUE_ENABLE=0/1`. Same-stream and cross-stream consumers
@@ -328,11 +353,11 @@ init-thread close without individual waits. Public L2 close uses the common
 accepted-handle drain before workspace teardown, preserving late close-only
 lane errors and retryable cleanup. Typed-value consumers perform three
 DEVICE calls, plus three explicit HOST/NONE-control calls on HBG; TMR checks
-clean HOST refusal followed by valid DEVICE work. Diagnostic-selection consumers
-queue four calls: off, swimlane1/PMU2, swimlane3/PMU4, off; after mutating the
-accepted caller configs, they verify original export destinations and run
-attribution. PMU/swimlane collection can wait and does not qualify other DFX
-collectors. A session-scoped fixture
+clean HOST refusal followed by valid DEVICE work. Persistent-state consumers
+perform twelve DEVICE cursor/count-controlled weighted updates to one cache,
+including zero acceptance and revisited rows. Framework snapshots check the
+entire backing against an independent multi-step reference, guards and unchanged
+weights. No host control readback decides later kernel work. A session-scoped fixture
 compiles the shared host bridge once. The client wait is bounded at 15 minutes,
 including queueing; the execution watchdog is also 15 minutes. Individual
 subprocess timeouts do not reserve additional aggregate execution time.
@@ -352,7 +377,7 @@ bridge identity and consumer results; `framework-eager-a2a3-*` artifacts retain
 JUnit and per-case logs even on failure. This qualifies the reference
 consumers' same-stream and cross-stream eager ordering, caller-owned lifetimes,
 bounded aliased INOUT assertions, ordinary callback-error recovery and per-call
-value semantics and per-call PMU/swimlane selection/export attribution. It does
+value semantics and bounded DEVICE-controlled persistent cache state. It does
 not qualify native failed-drain recovery, pending
 framework-callback close or early HOST-backing release. It does not establish
 overlap, arbitrary strides/cross-tile aliasing, PyPTO dispatch, A5 or

@@ -174,12 +174,23 @@ def test_selected_framework_matrix_fails_missing_dependency_instead_of_skipping(
     assert "requires matching torch and torch_npu" in result.stdout
 
 
-def test_framework_setup_preserves_the_callers_installed_toolchain(tmp_path):
+@pytest.mark.parametrize(
+    "version,machine,qualified",
+    [
+        ("9.0.0", "aarch64", True),
+        ("9.0.0", "x86_64", True),
+        ("9.2.0-beta.2", "aarch64", True),
+        ("9.2.0-beta.2", "x86_64", True),
+        ("10.0.0", "x86_64", True),
+        ("8.9.0", "aarch64", False),
+    ],
+)
+def test_framework_setup_preserves_the_callers_installed_toolchain(tmp_path, version, machine, qualified):
     action = yaml.safe_load((_ROOT / ".github/actions/setup-framework-eager/action.yml").read_text())
     bootstrap = action["runs"]["steps"][0]["run"]
     home = tmp_path / "caller toolkit"
     home.mkdir()
-    (home / "ascend_toolkit_install.info").write_text("version=9.0.0\n")
+    (home / "ascend_toolkit_install.info").write_text(f"version={version}\n")
     script = home / "set_env.sh"
     script.write_text(f'export ASCEND_HOME_PATH="{home}"\n')
     default = tmp_path / "runner-default.sh"
@@ -188,17 +199,35 @@ def test_framework_setup_preserves_the_callers_installed_toolchain(tmp_path):
     # and actual selector otherwise execute unchanged, without loading CANN.
     bootstrap = bootstrap.replace("/usr/local/Ascend/cann/set_env.sh", str(default))
     output = tmp_path / "action-output"
+    # Model a Linux toolkit and isolate fallback inventory from the test host.
+    (tmp_path / "sitecustomize.py").write_text(
+        f"import platform\nfrom pathlib import Path\nplatform.machine = lambda: {machine!r}\n"
+        "original_glob = Path.glob\n"
+        "Path.glob = lambda path, pattern: iter(()) if path in "
+        "(Path('/usr/local/Ascend'), Path('/usr/local/Ascend/ascend-toolkit')) "
+        "else original_glob(path, pattern)\n"
+    )
     result = subprocess.run(
         ["bash", "-e", "-o", "pipefail", "-c", bootstrap],
         cwd=_ROOT,
-        env={**os.environ, "ASCEND_HOME_PATH": str(home), "GITHUB_OUTPUT": str(output)},
+        env={
+            **os.environ,
+            "ASCEND_HOME_PATH": str(home),
+            "GITHUB_OUTPUT": str(output),
+            "PYTHONPATH": os.pathsep.join((str(tmp_path), os.environ.get("PYTHONPATH", ""))),
+        },
         capture_output=True,
         text=True,
         timeout=30,
         check=False,
     )
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert output.read_text() == f"cann_env={script}\n"
+    if qualified:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert output.read_text() == f"cann_env={script}\n"
+    else:
+        assert result.returncode != 0
+        assert "No installed CANN meeting the minimum" in result.stderr
+        assert not output.exists()
 
 
 @pytest.mark.parametrize("mode", ["exclude", "include", "only", "invalid"])

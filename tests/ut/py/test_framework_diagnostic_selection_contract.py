@@ -249,9 +249,8 @@ def test_whole_consumer_freezes_config_and_retires_after_final_boundary(consumer
 
 
 @pytest.mark.parametrize("failure", ["fail_boundary", "fail_retire"])
-def test_whole_consumer_unknown_completion_keeps_owners(consumer, transport, tmp_path, monkeypatch, failure):
+def test_whole_consumer_unknown_completion_keeps_owners(consumer, transport, tmp_path, failure):
     setattr(transport.state, failure, True)
-    monkeypatch.setattr(consumer.os, "write", lambda *args: None)
     with pytest.raises(RuntimeError) as caught:
         consumer.run("host_build_graph", 0, Path("recording.so"), tmp_path / "diagnostics")
     assert caught.value is transport.error

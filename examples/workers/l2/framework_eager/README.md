@@ -6,16 +6,19 @@ public Worker launches one add kernel; a Torch tensor addition consumes its
 output on the same framework stream. TMR and HBG use the same consumer.
 Additional consumers exercise caller-stream switching, aliased INOUT views,
 accepted callback failures and per-call values through that same public Worker
-and host queue bridge. Diagnostic selections also use that same queued submission path.
+and host queue bridge. A persistent-state consumer reuses that path across
+DEVICE-controlled updates to caller-owned storage.
 
 | Consumer | Executable assertions |
 | -------- | --------------------- |
 | `main.py` | Same-stream producers → Worker → successor; retained caller frames, observable callback error and close ordering |
 | `cross_stream.py` | Separate producer and consumer streams, caller A → B → A on one Worker, explicit framework event dependencies |
 | `alias_inout.py` | One Buffer backing full and partially overlapping strided views, INPUT plus INOUT, repeated updates and unchanged guards |
+| `scope_statistics.py` | Per-call ScopeStats selection with two nested task scopes; TMR records and allocation frontiers, HBG metadata only |
+| `diagnostic_selection.py` | Per-call PMU and chip-swimlane snapshots, original export destinations and enabled-run attribution |
 | `failure_recovery.py` | A Python callback fails after submit acceptance; later requests complete and init-thread Worker close retires all accepted runs |
 | `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
-| `diagnostic_selection.py` | Per-call PMU/swimlane selection, submitted config/prefix snapshots and exported run attribution |
+| `persistent_state.py` | Twelve DEVICE-controlled weighted cache updates, unchanged guards and weights, zero acceptance and revisited rows |
 
 Public `Worker.close()` drains accepted direct-chip runs through their normal
 RunHandle completion and retirement path before checking workspace ownership.
@@ -120,6 +123,30 @@ final consumer boundary is explicitly drained; native backpressure may wait.
 The assertions check actual submission handles and golden values, not overlap
 or a deterministic numerical failure for every omitted dependency edge.
 
+`scope_statistics.py` queues four calls with ScopeStats off/on/on/off. Each call
+submits two vector-add tasks in nested scopes; the final Torch successor checks
+10, 16, 22 and 28. After each accepted submit, the callback changes the caller
+config and output prefix. Only the two enabled calls may export records to their
+original prefixes.
+
+TMR checks six ordered root/outer/inner boundaries, distinct run epochs, and
+cumulative task/heap allocation frontiers. HBG exports metadata only because
+it has no device scope producer. These checks establish diagnostic attribution;
+they do not measure live allocations, overlap or performance. Retirement and
+export occur after the final framework completion boundary. Unknown outcomes
+retain the caller and runtime owners.
+
+`diagnostic_selection.py` queues four calls on one Worker: diagnostics off,
+swimlane level 1 / PMU event 2, level 3 / event 4, then off again. Each actual
+submit is followed by changes to the original CallConfig selectors and output
+prefix. After the final framework boundary, handle retirement exports the
+submitted selections to their original destinations. The checks require
+correct successors, distinct enabled-run epochs and matching PMU/swimlane
+attribution; off calls and the mutated poison destination produce no records.
+This covers PMU and chip swimlane only, not ScopeStats, args dump or dependency
+graph export. Native admission and diagnostic collection may wait; this is
+ordering and attribution evidence, not overlap or throughput.
+
 `alias_inout.py` uses one Torch allocation wrapped by one Buffer. Its distinct
 64 × 64 Tensor views have row stride 96 and nonzero byte offsets. Each mode
 performs successive INPUT + INOUT updates on that same backing: either full
@@ -151,16 +178,17 @@ TMR's unsupported HOST/NONE operand is refused before a subsequent valid DEVICE
 request on the same Worker. No tensor H2D transfer is implicit, and this does
 not add HOST tensor support to TMR.
 
-`diagnostic_selection.py` queues four calls on one Worker: diagnostics off,
-swimlane level 1 / PMU event 2, level 3 / event 4, then off again. Each actual
-submit is followed by changes to the original CallConfig selectors and output
-prefix. After the final framework boundary, handle retirement exports the
-submitted selections to their original destinations. The checks require
-correct successors, distinct enabled-run epochs and matching PMU/swimlane
-attribution; off calls and the mutated poison destination produce no records.
-This covers PMU and chip swimlane only, not ScopeStats, args dump or dependency
-graph export. Native admission and diagnostic collection may wait; this is
-ordering and attribution evidence, not overlap or throughput.
+`persistent_state.py` keeps one DEVICE weights vector and one caller-owned
+8 × 32 strided cache alive across twelve requests. DEVICE cursor/count controls
+select a prefix of four proposal rows inside a fixed kernel; host orchestration
+does not read the controls or choose subsequent work. Each accepted row adds its
+weighted proposal to the existing cache. Zero counts and revisited rows test
+retention across calls. Framework successors snapshot the entire backing after
+each update, then compare against an independent multi-step reference and
+unchanged padding/guards and read-only weights. H2D initialization precedes the
+first callback; controls/proposals change through framework DEVICE operations.
+This is a bounded persistent-state/accepted-prefix reference, not a complete
+MTP model, dynamic host task generation or throughput result.
 
 These are bounded reference cases. Full framework process shutdown, arbitrary
 strides or cross-tile overlap, A5 and capture remain separate qualification.
