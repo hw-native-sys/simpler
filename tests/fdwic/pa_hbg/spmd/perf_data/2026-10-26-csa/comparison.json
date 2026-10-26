@@ -1,0 +1,1058 @@
+{
+  "date": "2026-10-26",
+  "source_model_commit": "d1de019cb5e84bcb26b28d9c53756c8ac0fb78e8",
+  "batch": 4,
+  "sequence": 2,
+  "seed": 0,
+  "runtime": "host_build_graph",
+  "platform": "a5",
+  "device": 0,
+  "soc": "Ascend950PR_958b",
+  "aic": 32,
+  "aiv": 64,
+  "cann": "9.1.0",
+  "warmup": 5,
+  "measured_rounds_per_arm": 100,
+  "chip_swimlane_level": 0,
+  "task_submit_lock": false,
+  "process_monitor_period_seconds": 0.25,
+  "isolation_limit": "No task-submit lock; no other A5 CLI test observed during selected measurements. This does not prove absence of all external activity.",
+  "changed_linked_kernel_fingerprints": [],
+  "excluded_runs": {
+    "artifacts/aicpu-bench": {
+      "use_for_performance_comparison": false,
+      "reason": "Another session's A5 ready-order execution matrix was observed during the run. Both used the only visible device, device 0.",
+      "observed_other_process_id": 278238,
+      "correctness_passed": true,
+      "original_artifacts_preserved": true
+    }
+  },
+  "comparison": {
+    "device_us": {
+      "aicpu_median_us": 2133.4925000000003,
+      "aicore_median_us": 22664.0575,
+      "delta_us": 20530.565,
+      "aicore_over_aicpu": 10.622984378899854,
+      "change_percent": 962.2984378899854
+    },
+    "host_us": {
+      "aicpu_median_us": 77407.93549999999,
+      "aicore_median_us": 98906.58499999999,
+      "delta_us": 21498.6495,
+      "aicore_over_aicpu": 1.2777318547657173,
+      "change_percent": 27.773185476571726
+    }
+  },
+  "arms": {
+    "aicpu": {
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "f5cc679bbf3d7d2058ca453aa6bf0b6686cff989",
+        "simpler_branch": "",
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "project_root": "<isolated-aicpu-worktree>",
+        "runtime_sha256": {
+          "libhost_runtime.so": "081bce389f9815866186f028e32ef7cd95913b9846368d8baf9ecdc6f6137c3a",
+          "libaicpu_kernel.so": "57f31198bf23d25508826b00ee09ac1682529c1feeade877eab497c1e4d11dbd",
+          "aicore_kernel.o": "3a121ad62b45bd3b243d40f19d7a2265894d859ca8363aab5ae669289392e5bb"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 3,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "metrics": {
+        "host_us": {
+          "min": 76966.95,
+          "p10": 77152.8565,
+          "median": 77407.93549999999,
+          "p90": 77853.1341,
+          "mean": 78053.97167,
+          "max": 89265.455,
+          "samples": [
+            88346.502,
+            84732.461,
+            86129.123,
+            87203.873,
+            77433.032,
+            77696.737,
+            77767.538,
+            77298.924,
+            77589.902,
+            77089.444,
+            77248.837,
+            77828.177,
+            77112.334,
+            77103.604,
+            77159.537,
+            77634.67,
+            77281.077,
+            77183.154,
+            77436.194,
+            77105.965,
+            77930.238,
+            77168.684,
+            77320.412,
+            77545.058,
+            77196.04,
+            77182.401,
+            77051.377,
+            77231.315,
+            77375.642,
+            77482.352,
+            77564.797,
+            77202.736,
+            76985.994,
+            77157.359,
+            77083.797,
+            77418.998,
+            76966.95,
+            77160.196,
+            77255.425,
+            77305.681,
+            77719.213,
+            77585.202,
+            77009.037,
+            77545.114,
+            77175.876,
+            77775.03,
+            77059.807,
+            77177.81,
+            77393.686,
+            81815.286,
+            83757.446,
+            77160.614,
+            77417.045,
+            77675.515,
+            77364.092,
+            77599.461,
+            77545.67,
+            78080.625,
+            77400.703,
+            77366.131,
+            77602.831,
+            77518.626,
+            77769.838,
+            77402.213,
+            77338.257,
+            77646.839,
+            77386.217,
+            77487.885,
+            77427.952,
+            77282.235,
+            77584.874,
+            77356.061,
+            77583.055,
+            77641.563,
+            77306.874,
+            81906.571,
+            89265.455,
+            77795.084,
+            77658.142,
+            77844.567,
+            77318.443,
+            77395.855,
+            77603.741,
+            77345.763,
+            77495.856,
+            77363.862,
+            77720.064,
+            77618.429,
+            77389.052,
+            77804.181,
+            77397.651,
+            77679.578,
+            77506.818,
+            77259.181,
+            77408.374,
+            77253.669,
+            77428.678,
+            77224.207,
+            77381.229,
+            77407.497
+          ]
+        },
+        "device_us": {
+          "min": 2007.707,
+          "p10": 2090.8952,
+          "median": 2133.4925000000003,
+          "p90": 2188.0558,
+          "mean": 2134.16611,
+          "max": 2223.852,
+          "samples": [
+            2150.622,
+            2139.498,
+            2206.328,
+            2042.828,
+            2112.685,
+            2158.748,
+            2105.926,
+            2095.273,
+            2174.255,
+            2086.868,
+            2136.26,
+            2131.844,
+            2134.343,
+            2104.882,
+            2109.398,
+            2111.056,
+            2121.082,
+            2214.287,
+            2109.147,
+            2176.89,
+            2092.335,
+            2187.482,
+            2186.148,
+            2135.754,
+            2054.922,
+            2107.176,
+            2091.333,
+            2104.157,
+            2193.257,
+            2137.687,
+            2164.606,
+            2148.185,
+            2174.232,
+            2052.156,
+            2133.858,
+            2220.554,
+            2185.237,
+            2086.955,
+            2117.98,
+            2092.353,
+            2156.924,
+            2129.557,
+            2176.361,
+            2147.686,
+            2099.295,
+            2092.368,
+            2157.903,
+            2135.823,
+            2195.308,
+            2139.376,
+            2072.159,
+            2169.285,
+            2150.998,
+            2097.412,
+            2176.097,
+            2107.976,
+            2193.22,
+            2170.877,
+            2041.717,
+            2118.973,
+            2213.044,
+            2131.656,
+            2127.507,
+            2145.964,
+            2125.21,
+            2134.818,
+            2117.981,
+            2209.464,
+            2147.97,
+            2144.93,
+            2165.948,
+            2123.893,
+            2133.087,
+            2155.344,
+            2145.221,
+            2121.192,
+            2152.618,
+            2046.25,
+            2172.931,
+            2152.081,
+            2130.85,
+            2103.585,
+            2131.229,
+            2111.345,
+            2117.457,
+            2122.801,
+            2133.127,
+            2155.763,
+            2118.047,
+            2204.79,
+            2139.132,
+            2223.852,
+            2007.707,
+            2121.73,
+            2172.323,
+            2099.395,
+            2073.89,
+            2148.319,
+            2115.545,
+            2100.713
+          ]
+        }
+      },
+      "trace": {
+        "logical_tasks": 79,
+        "physical_tasks": 2308,
+        "clock_freq_hz": 1000000000,
+        "level": 4,
+        "runtime": "host_build_graph",
+        "scheduler_producer": "aicpu",
+        "distributed_scheduler_verified": false,
+        "require_aicore_scheduler": false,
+        "host_capture": {
+          "status": "complete",
+          "expected_records": 107,
+          "recorded_records": 107,
+          "pool_records": 117,
+          "dropped_records": 0,
+          "error": null
+        },
+        "clock_alignment_status": "bounded",
+        "cross_domain_latency_available": true,
+        "file": "<local-archive>/artifacts/aicpu-l4/L4.json"
+      },
+      "benchmark_artifact": "artifacts/aicpu-bench-clean",
+      "trace_artifact": "artifacts/aicpu-l4",
+      "observed_overlaps": 0,
+      "kernel_fingerprints": {
+        "0": {
+          "bytes": 1920,
+          "fnv1a64": "0xc977e28d1be50594"
+        },
+        "1": {
+          "bytes": 1128,
+          "fnv1a64": "0xf83f45396c4d3032"
+        },
+        "2": {
+          "bytes": 72,
+          "fnv1a64": "0x3f88fe80a9bf096c"
+        },
+        "3": {
+          "bytes": 1840,
+          "fnv1a64": "0x713a851fd3ed9dd0"
+        },
+        "4": {
+          "bytes": 15032,
+          "fnv1a64": "0xc3e5873059fb872f"
+        },
+        "5": {
+          "bytes": 4424,
+          "fnv1a64": "0x8fc13602c18d8f13"
+        },
+        "6": {
+          "bytes": 2344,
+          "fnv1a64": "0x7ea4762c5e6d84e9"
+        },
+        "7": {
+          "bytes": 808,
+          "fnv1a64": "0x7f6de147a6fd7378"
+        },
+        "8": {
+          "bytes": 3656,
+          "fnv1a64": "0xe59fe3e9663e02f2"
+        },
+        "9": {
+          "bytes": 1000,
+          "fnv1a64": "0x3e92654216022e75"
+        },
+        "10": {
+          "bytes": 3640,
+          "fnv1a64": "0xa96ec483e1bb62f9"
+        },
+        "11": {
+          "bytes": 2376,
+          "fnv1a64": "0x7090c56f065b018"
+        },
+        "12": {
+          "bytes": 1888,
+          "fnv1a64": "0x17efec28f48e8039"
+        },
+        "13": {
+          "bytes": 2144,
+          "fnv1a64": "0xc3a318b74c637b9"
+        },
+        "14": {
+          "bytes": 2808,
+          "fnv1a64": "0x688eaf5422bfd252"
+        },
+        "15": {
+          "bytes": 2360,
+          "fnv1a64": "0xf9853d126dd53222"
+        },
+        "16": {
+          "bytes": 5192,
+          "fnv1a64": "0xee9b9093436cc113"
+        },
+        "17": {
+          "bytes": 1000,
+          "fnv1a64": "0xe94fae7d734b3fe9"
+        },
+        "18": {
+          "bytes": 3640,
+          "fnv1a64": "0x9f1424af88badf90"
+        },
+        "19": {
+          "bytes": 8520,
+          "fnv1a64": "0x1c5d8d88903ae24c"
+        },
+        "20": {
+          "bytes": 1032,
+          "fnv1a64": "0x8a5ec693f4c81d2d"
+        },
+        "21": {
+          "bytes": 1576,
+          "fnv1a64": "0xe6a60dc6d3dcc112"
+        },
+        "22": {
+          "bytes": 5424,
+          "fnv1a64": "0x472888f1d4dbaffa"
+        },
+        "23": {
+          "bytes": 9800,
+          "fnv1a64": "0x96155ff50aadec63"
+        },
+        "24": {
+          "bytes": 2808,
+          "fnv1a64": "0x5ddfc25df83b61e3"
+        },
+        "25": {
+          "bytes": 2360,
+          "fnv1a64": "0xaa2a3696386ca08a"
+        },
+        "26": {
+          "bytes": 3120,
+          "fnv1a64": "0x261c83f31bd30649"
+        },
+        "27": {
+          "bytes": 216,
+          "fnv1a64": "0xd9a84bc6042bb32e"
+        },
+        "28": {
+          "bytes": 248,
+          "fnv1a64": "0xe26e7d86da12bdce"
+        },
+        "29": {
+          "bytes": 6216,
+          "fnv1a64": "0x3a792d77ee54adc5"
+        },
+        "30": {
+          "bytes": 632,
+          "fnv1a64": "0xa99256f3b929702c"
+        },
+        "31": {
+          "bytes": 1120,
+          "fnv1a64": "0x8e1f1be0eecd3541"
+        },
+        "32": {
+          "bytes": 1176,
+          "fnv1a64": "0x721f39c10d83cc62"
+        },
+        "33": {
+          "bytes": 3168,
+          "fnv1a64": "0x49b13cc7a1e5cd5f"
+        },
+        "34": {
+          "bytes": 432,
+          "fnv1a64": "0x3d245de369b463d7"
+        },
+        "35": {
+          "bytes": 11592,
+          "fnv1a64": "0xda575b8623314273"
+        },
+        "36": {
+          "bytes": 3152,
+          "fnv1a64": "0x369b29e348c0f42d"
+        },
+        "37": {
+          "bytes": 9112,
+          "fnv1a64": "0xd40fe754923d5067"
+        },
+        "38": {
+          "bytes": 23088,
+          "fnv1a64": "0x247b5c4694ecc84d"
+        },
+        "39": {
+          "bytes": 2376,
+          "fnv1a64": "0xe36928ce5ee2c201"
+        },
+        "40": {
+          "bytes": 168,
+          "fnv1a64": "0xda20b85891ebc4e2"
+        },
+        "41": {
+          "bytes": 11096,
+          "fnv1a64": "0xd14502d1b8abc68c"
+        },
+        "42": {
+          "bytes": 4440,
+          "fnv1a64": "0x58da2d2aab8e09e6"
+        },
+        "43": {
+          "bytes": 4440,
+          "fnv1a64": "0x910bd520980ab464"
+        },
+        "44": {
+          "bytes": 2920,
+          "fnv1a64": "0xd24b39ec768f5630"
+        },
+        "45": {
+          "bytes": 7752,
+          "fnv1a64": "0x78846156e79e09fd"
+        },
+        "46": {
+          "bytes": 272,
+          "fnv1a64": "0xd54f2790ffab00c0"
+        },
+        "47": {
+          "bytes": 1000,
+          "fnv1a64": "0x4471da668742d644"
+        },
+        "48": {
+          "bytes": 3640,
+          "fnv1a64": "0xc1d6a13a9aae3331"
+        },
+        "49": {
+          "bytes": 320,
+          "fnv1a64": "0xb36ae26b3acca8a"
+        },
+        "50": {
+          "bytes": 1000,
+          "fnv1a64": "0xa5771367b18447a"
+        },
+        "51": {
+          "bytes": 3640,
+          "fnv1a64": "0xcac7e3e043c38e73"
+        },
+        "52": {
+          "bytes": 7752,
+          "fnv1a64": "0x3bb0f957aed7265d"
+        },
+        "53": {
+          "bytes": 4184,
+          "fnv1a64": "0xfd40003cedadb656"
+        }
+      }
+    },
+    "aicore": {
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "98215088b941820778a22e397d0f526fa9f3bd8a",
+        "simpler_branch": "",
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "project_root": "<isolated-aicore-worktree>",
+        "runtime_sha256": {
+          "libhost_runtime.so": "04349a1af5686be211d3444fd0b7057c44b54296cc604f30a684137067f15191",
+          "libaicpu_kernel.so": "66d6267e6def9db8ed4dabfbf619c629c80c3c18cb5bf5d0da086806ad7f7ffb",
+          "aicore_kernel.o": "59116af3afc1fbbc72cc01afadf203b52f642be70f2e37ecdd3d7fe6f1be9277"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 3,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "metrics": {
+        "host_us": {
+          "min": 97847.536,
+          "p10": 98167.9682,
+          "median": 98906.58499999999,
+          "p90": 103565.7791,
+          "mean": 99902.00411,
+          "max": 119661.172,
+          "samples": [
+            107850.342,
+            98764.554,
+            99497.615,
+            98409.399,
+            99295.319,
+            98671.33,
+            98458.303,
+            97847.536,
+            97909.332,
+            98903.985,
+            99206.65,
+            98924.315,
+            98439.198,
+            99194.447,
+            98566.534,
+            99186.687,
+            99034.375,
+            98554.269,
+            97981.157,
+            98499.361,
+            103645.88,
+            99508.216,
+            99254.531,
+            107125.107,
+            102673.163,
+            98224.711,
+            99966.916,
+            98735.841,
+            97875.134,
+            99293.458,
+            99302.213,
+            98376.318,
+            98445.019,
+            98281.524,
+            98311.988,
+            98356.64,
+            99193.632,
+            98436.133,
+            98031.528,
+            98571.983,
+            99579.216,
+            98109.992,
+            98839.959,
+            99096.05,
+            105915.306,
+            99835.052,
+            100589.876,
+            98606.448,
+            98424.311,
+            97877.778,
+            99882.006,
+            98403.006,
+            98821.535,
+            98423.757,
+            99187.181,
+            100262.258,
+            99162.906,
+            98781.051,
+            98330.345,
+            98960.511,
+            99306.786,
+            98599.792,
+            99355.215,
+            99013.353,
+            114105.532,
+            106637.177,
+            98462.3,
+            99165.653,
+            99869.63,
+            98367.525,
+            99441.296,
+            98614.463,
+            99421.693,
+            98755.447,
+            99482.879,
+            103556.879,
+            104020.15,
+            98975.873,
+            99334.822,
+            98189.787,
+            105878.653,
+            102507.115,
+            98452.046,
+            98031.452,
+            119661.172,
+            98034.012,
+            98819.282,
+            100407.868,
+            99907.527,
+            98174.41,
+            99637.661,
+            98341.757,
+            100727.954,
+            98487.879,
+            98909.185,
+            98223.146,
+            98295.102,
+            106488.862,
+            98582.402,
+            98063.487
+          ]
+        },
+        "device_us": {
+          "min": 21820.826,
+          "p10": 22142.438400000003,
+          "median": 22664.0575,
+          "p90": 23626.022399999998,
+          "mean": 22782.73664,
+          "max": 24544.193,
+          "samples": [
+            22525.315,
+            22689.495,
+            23196.214,
+            22664.835,
+            23694.661,
+            22822.342,
+            22596.995,
+            21820.826,
+            22268.638,
+            22718.664,
+            23167.924,
+            22807.829,
+            22723.298,
+            22874.654,
+            22736.752,
+            23354.182,
+            21988.243,
+            22541.239,
+            22335.329,
+            22138.752,
+            22639.458,
+            22769.047,
+            22649.552,
+            22633.481,
+            23850.851,
+            22697.703,
+            23412.728,
+            22579.397,
+            22256.967,
+            22939.641,
+            22732.872,
+            22456.757,
+            22644.084,
+            22135.992,
+            22477.299,
+            22590.293,
+            23127.332,
+            22380.988,
+            22108.191,
+            22817.863,
+            23176.289,
+            22301.354,
+            22906.527,
+            22601.969,
+            22142.848,
+            23857.94,
+            24544.193,
+            22466.803,
+            22599.411,
+            22245.121,
+            23523.842,
+            22468.669,
+            23045.502,
+            21880.805,
+            23179.989,
+            24091.459,
+            23430.116,
+            22450.015,
+            22675.384,
+            23059.89,
+            23252.447,
+            22304.022,
+            23533.295,
+            22881.208,
+            22319.827,
+            22318.971,
+            22591.044,
+            22750.285,
+            22867.144,
+            22663.28,
+            23174.886,
+            22455.578,
+            23644.899,
+            22904.529,
+            23158.182,
+            23731.727,
+            22043.012,
+            22576.066,
+            23470.171,
+            22515.928,
+            23883.706,
+            22428.074,
+            22591.334,
+            22128.661,
+            22705.359,
+            22383.734,
+            23119.429,
+            22249.132,
+            24194.077,
+            22477.085,
+            23623.925,
+            22414.685,
+            21867.709,
+            22861.136,
+            22574.368,
+            22571.42,
+            22319.091,
+            23711.896,
+            22677.161,
+            22120.372
+          ]
+        }
+      },
+      "trace": {
+        "logical_tasks": 79,
+        "physical_tasks": 2308,
+        "clock_freq_hz": 1000000000,
+        "level": 4,
+        "sequence_integrity_verified": true,
+        "event_count": 46733,
+        "worker_count": 96,
+        "protocol_verified": true,
+        "device_logical_tasks": 81,
+        "executions": 2308,
+        "cooperative_tasks": 61,
+        "member_obligations": 4640,
+        "blocks": 1457,
+        "execution_epoch": 1,
+        "per_kind_executions": {
+          "aiv": 1444,
+          "aic": 864
+        },
+        "dependency_edges_checked": 133,
+        "block_identity_verified": true,
+        "dependency_order_source": "native_protocol",
+        "dependency_timing_guard": true,
+        "runtime": "host_build_graph",
+        "scheduler_producer": "aicore",
+        "distributed_scheduler_verified": true,
+        "require_aicore_scheduler": true,
+        "host_capture": {
+          "status": "complete",
+          "expected_records": 107,
+          "recorded_records": 107,
+          "pool_records": 117,
+          "dropped_records": 0,
+          "error": null
+        },
+        "clock_alignment_status": "bounded",
+        "cross_domain_latency_available": true,
+        "file": "<local-archive>/artifacts/aicore-l4/L4.json"
+      },
+      "benchmark_artifact": "artifacts/aicore-bench-clean",
+      "trace_artifact": "artifacts/aicore-l4",
+      "observed_overlaps": 0,
+      "kernel_fingerprints": {
+        "0": {
+          "bytes": 1920,
+          "fnv1a64": "0xc977e28d1be50594"
+        },
+        "1": {
+          "bytes": 1128,
+          "fnv1a64": "0xf83f45396c4d3032"
+        },
+        "2": {
+          "bytes": 72,
+          "fnv1a64": "0x3f88fe80a9bf096c"
+        },
+        "3": {
+          "bytes": 1840,
+          "fnv1a64": "0x713a851fd3ed9dd0"
+        },
+        "4": {
+          "bytes": 15032,
+          "fnv1a64": "0xc3e5873059fb872f"
+        },
+        "5": {
+          "bytes": 4424,
+          "fnv1a64": "0x8fc13602c18d8f13"
+        },
+        "6": {
+          "bytes": 2344,
+          "fnv1a64": "0x7ea4762c5e6d84e9"
+        },
+        "7": {
+          "bytes": 808,
+          "fnv1a64": "0x7f6de147a6fd7378"
+        },
+        "8": {
+          "bytes": 3656,
+          "fnv1a64": "0xe59fe3e9663e02f2"
+        },
+        "9": {
+          "bytes": 1000,
+          "fnv1a64": "0x3e92654216022e75"
+        },
+        "10": {
+          "bytes": 3640,
+          "fnv1a64": "0xa96ec483e1bb62f9"
+        },
+        "11": {
+          "bytes": 2376,
+          "fnv1a64": "0x7090c56f065b018"
+        },
+        "12": {
+          "bytes": 1888,
+          "fnv1a64": "0x17efec28f48e8039"
+        },
+        "13": {
+          "bytes": 2144,
+          "fnv1a64": "0xc3a318b74c637b9"
+        },
+        "14": {
+          "bytes": 2808,
+          "fnv1a64": "0x688eaf5422bfd252"
+        },
+        "15": {
+          "bytes": 2360,
+          "fnv1a64": "0xf9853d126dd53222"
+        },
+        "16": {
+          "bytes": 5192,
+          "fnv1a64": "0xee9b9093436cc113"
+        },
+        "17": {
+          "bytes": 1000,
+          "fnv1a64": "0xe94fae7d734b3fe9"
+        },
+        "18": {
+          "bytes": 3640,
+          "fnv1a64": "0x9f1424af88badf90"
+        },
+        "19": {
+          "bytes": 8520,
+          "fnv1a64": "0x1c5d8d88903ae24c"
+        },
+        "20": {
+          "bytes": 1032,
+          "fnv1a64": "0x8a5ec693f4c81d2d"
+        },
+        "21": {
+          "bytes": 1576,
+          "fnv1a64": "0xe6a60dc6d3dcc112"
+        },
+        "22": {
+          "bytes": 5424,
+          "fnv1a64": "0x472888f1d4dbaffa"
+        },
+        "23": {
+          "bytes": 9800,
+          "fnv1a64": "0x96155ff50aadec63"
+        },
+        "24": {
+          "bytes": 2808,
+          "fnv1a64": "0x5ddfc25df83b61e3"
+        },
+        "25": {
+          "bytes": 2360,
+          "fnv1a64": "0xaa2a3696386ca08a"
+        },
+        "26": {
+          "bytes": 3120,
+          "fnv1a64": "0x261c83f31bd30649"
+        },
+        "27": {
+          "bytes": 216,
+          "fnv1a64": "0xd9a84bc6042bb32e"
+        },
+        "28": {
+          "bytes": 248,
+          "fnv1a64": "0xe26e7d86da12bdce"
+        },
+        "29": {
+          "bytes": 6216,
+          "fnv1a64": "0x3a792d77ee54adc5"
+        },
+        "30": {
+          "bytes": 632,
+          "fnv1a64": "0xa99256f3b929702c"
+        },
+        "31": {
+          "bytes": 1120,
+          "fnv1a64": "0x8e1f1be0eecd3541"
+        },
+        "32": {
+          "bytes": 1176,
+          "fnv1a64": "0x721f39c10d83cc62"
+        },
+        "33": {
+          "bytes": 3168,
+          "fnv1a64": "0x49b13cc7a1e5cd5f"
+        },
+        "34": {
+          "bytes": 432,
+          "fnv1a64": "0x3d245de369b463d7"
+        },
+        "35": {
+          "bytes": 11592,
+          "fnv1a64": "0xda575b8623314273"
+        },
+        "36": {
+          "bytes": 3152,
+          "fnv1a64": "0x369b29e348c0f42d"
+        },
+        "37": {
+          "bytes": 9112,
+          "fnv1a64": "0xd40fe754923d5067"
+        },
+        "38": {
+          "bytes": 23088,
+          "fnv1a64": "0x247b5c4694ecc84d"
+        },
+        "39": {
+          "bytes": 2376,
+          "fnv1a64": "0xe36928ce5ee2c201"
+        },
+        "40": {
+          "bytes": 168,
+          "fnv1a64": "0xda20b85891ebc4e2"
+        },
+        "41": {
+          "bytes": 11096,
+          "fnv1a64": "0xd14502d1b8abc68c"
+        },
+        "42": {
+          "bytes": 4440,
+          "fnv1a64": "0x58da2d2aab8e09e6"
+        },
+        "43": {
+          "bytes": 4440,
+          "fnv1a64": "0x910bd520980ab464"
+        },
+        "44": {
+          "bytes": 2920,
+          "fnv1a64": "0xd24b39ec768f5630"
+        },
+        "45": {
+          "bytes": 7752,
+          "fnv1a64": "0x78846156e79e09fd"
+        },
+        "46": {
+          "bytes": 272,
+          "fnv1a64": "0xd54f2790ffab00c0"
+        },
+        "47": {
+          "bytes": 1000,
+          "fnv1a64": "0x4471da668742d644"
+        },
+        "48": {
+          "bytes": 3640,
+          "fnv1a64": "0xc1d6a13a9aae3331"
+        },
+        "49": {
+          "bytes": 320,
+          "fnv1a64": "0xb36ae26b3acca8a"
+        },
+        "50": {
+          "bytes": 1000,
+          "fnv1a64": "0xa5771367b18447a"
+        },
+        "51": {
+          "bytes": 3640,
+          "fnv1a64": "0xcac7e3e043c38e73"
+        },
+        "52": {
+          "bytes": 7752,
+          "fnv1a64": "0x3bb0f957aed7265d"
+        },
+        "53": {
+          "bytes": 4184,
+          "fnv1a64": "0xfd40003cedadb656"
+        }
+      }
+    }
+  },
+  "publication": {
+    "raw_swimlane_committed": false,
+    "runtime_binaries_committed": false,
+    "absolute_paths": "Replaced by descriptive placeholders; unmodified local reports remain archived.",
+    "strace_files": {
+      "aicpu": "aicpu.strace.txt",
+      "aicore": "aicore.strace.txt"
+    },
+    "local_archive": "reports/csa_scheduler_compare_20261026.oikNk1"
+  }
+}
