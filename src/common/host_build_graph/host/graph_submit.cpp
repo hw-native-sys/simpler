@@ -359,8 +359,9 @@ bool graph_submit_outer(
             INVALID_KERNEL_ID,
         };
         dep_gen_host_graph_begin_task(
-            task_id, orch->in_manual_scope(), /*early_dispatch=*/false, kernel_ids_capture.data(),
-            slot.logical_block_num, args.tensor_count(), args.tensor_data(), args.tag_data()
+            task_id, orch->in_manual_scope(), /*early_dispatch=*/false, slot.task_attrs.requires_sync_start(),
+            slot.task_attrs.has_predicate(), kernel_ids_capture.data(), slot.logical_block_num, args.tensor_count(),
+            args.tensor_data(), args.tag_data()
         );
         const bool ok =
             compute_task_fanin(boundary_inputs, orch->tensor_map, orch->in_manual_scope(), emit, DepGraphAnnotate{});

@@ -109,22 +109,24 @@ class TestGraphExecutionHostBuildGraph(SceneTestCase):
             deps = json.load(f)
 
         tasks = deps.get("tasks", [])
-        assert [int(task["task_id"]) for task in tasks] == list(range(8)), (
-            "dep-gen must capture the seed, two outer GRAPH tasks, and the five-task fallback Graph body"
+        # The bodies the Graph tasks replay are in graph_definitions[], not tasks[]
+        # (the dfx/dep_gen ST checks them).
+        assert [int(task["task_id"]) for task in tasks] == list(range(4)), (
+            "dep-gen must capture the seed and the three outer GRAPH tasks"
         )
         outer_graph_ids = {
             int(task["task_id"])
             for task in tasks
             if task.get("kernel_ids") == [-1, -1, -1] and len(task.get("args", [])) == 3
         }
-        assert outer_graph_ids == {1, 7}, f"outer GRAPH tasks missing from deps.json: {outer_graph_ids}"
+        assert outer_graph_ids == {1, 2, 3}, f"outer GRAPH tasks missing from deps.json: {outer_graph_ids}"
 
         outer_edges = {
             (int(edge["pred"]), int(edge["succ"]), edge.get("source"))
             for edge in deps.get("edges", [])
             if int(edge["succ"]) in outer_graph_ids
         }
-        assert outer_edges == {(0, 1, "creator"), (0, 7, "creator")}, (
+        assert outer_edges == {(0, 1, "creator"), (0, 2, "creator"), (0, 3, "creator")}, (
             f"outer GRAPH boundary edges differ from runtime dependencies: {outer_edges}"
         )
 
