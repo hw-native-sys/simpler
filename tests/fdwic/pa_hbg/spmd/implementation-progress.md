@@ -4,7 +4,7 @@
 
 开始日期：2026-10-25；起点：`6c367c69f`；工作分支：`feat/fully_distributed_within_core`。
 按用户要求逐步实现、阶段性详细中文 commit，**不 push**。
-用户随后单独授权的推送已完成至 `6f2b470d4`；后续实现继续遵守不自动 push 的原目标。
+用户随后单独授权的推送已完成至 `98215088b`；后续实现继续遵守不自动 push 的原目标。
 本文件集中记录实现、失败定位、测试证据和剩余工作，不能用阶段完成替代整个目标完成。
 
 依据：
@@ -2481,3 +2481,193 @@ outputs/spmd-boundary-contracts-reviewed-final-20261026.log；150 份捕获按�
 及所属分区 signal_end 时序重审通过，outputs/spmd-runtime-failure-capture-reviewed-audit-20261026.json。
 全部适用 pre-commit 通过，outputs/spmd-boundary-precommit-final-20261026.log。
 用户要求本次提交完成后先停下；提交后暂停，不再启动新编译、测试或后续开发，不 push。
+
+## 2026-10-26：恢复边界验收与证据收口
+
+用户恢复目标并要求完成剩余工作，同时澄清此前对原始 FDWIC 文档的讨论仅作参考，
+不转成本轮的新实现要求。继续验收当前 HBG／SPMD 合同，不因此改回 SPSC、改变 2V
+协调者或拆除现有 Mix 资源握手；性能优化仍留待后续。起点为已推送的 `98215088b`，
+本轮新增提交不 push。既有未跟踪 CLA、TMR 和 atomic_probe 文件继续保持原样。
+
+先补 C39 的 B=Mix 原生组合。已有三节点 P→A、独立 B 用 P 的非成员核等待 B，
+但 Mix 包含全部资源成员，不能直接把 B 的 mask 扩为 Mix：若 B 先准入，P 可能被
+普通入口挡住，而 B 的尾部等待 A、A 又等待 P，会由测试构造自己制造循环等待。
+
+拟复用现有 kernel／编排接口加入一个普通 V 的桥接任务 Q：P 为普通 C，Q 在 kernel
+里等 P 已进入后返回；真实图依赖是 P→A、Q→B，P 等 B 首次进入，B 尾部等 A 首次进入。
+Q 与 P 不争同一个执行核；B 只有在 P 已进入后才 ready，其他 cluster 可先执行 B
+并让 P 返回。该控制只用于测试，不修改 runtime、参数 ABI 或添加行为开关。
+将保留原三节点纯 C/V 场景，并覆盖 A/B 七种 mask 与普通／sync_start 的四种组合。
+正式测试和实测结果在完成后追加，不将此计划当作通过证据。
+
+### C39：A/B 全 mask 的 ready 顺序与局部重叠
+
+上述四任务桥接已落地，保留原三任务纯 B 路径；复用原 sync_ordered kernel 和 plan ABI，
+没有修改生产调度器。矩阵从每平台 84 项扩为 196 项，合计 392 项。
+首次 RED 在 editable 重编期间误用了旧版本绑定，五项 import/setup error 不计作有效行为红灯。
+重编完成后真正的夹具 RED 为五项：原矩阵缺少 Mix B，四种 Mix B 均没有桥接。
+补齐后 ready fixture 429/429 通过，含 20 个 Mix B 错误时序／桥接反例。
+日志为 outputs/spmd-c39-mix-b-fixture-red-20261026.log 与 green 日志。
+
+本轮 editable 重编成功，outputs/spmd-boundary-resume-build-20261026.log；
+本机无 npu-smi／task-submit，既有 CANN query 确认 Ascend950、32C/64V、A5，
+按用户要求直接使用 device 0，不把本轮无独占条件下的时间作为性能基线。
+
+仿真／A5 的完整矩阵均 196/196 通过，另有两平台各两项 smoke。
+矩阵启用 L4 与独立 dep-gen：每份捕获均走 read_perf_data 的正式因果审计，
+要求 sequence_integrity_verified 和 protocol_verified；再比对原输入的 N、函数／mask、
+真实 P→A／Q→B、独立 deps.json 及 B→A 的共同日志。
+纯 B 的准入日志为 [2,1]，Mix B 为 [3,2]，不靠 Host task_ref 顺序推测设备执行。
+392 份均通过，明细及原始文件哈希在 outputs/spmd-c39-capture-audit-20261026.json。
+运行日志为 outputs/spmd-c39-mix-b-a5-matrix-20261026.log 和 a5sim 对应日志。
+error 日志级别没有 Host 时钟对齐记录，不影响本核 sequence／跨核 ticket 的协议证据；
+不据此声称 Host 与设备精确同钟或得到性能收益。
+
+本项完成后的合同包 1901/1901 通过，outputs/spmd-boundary-contracts-resume-20261026.log。
+后续不可返回 kernel 的夹具又增加测试，最终总数另记。
+
+### C31/C32：不可返回 kernel 的真实超时、保留与恢复
+
+复用 resident_failure 的编译入口、ExecutionRecord、真实 fanin 和 caller buffer，
+测试 kernel 的负 stall_ms 输入表示 block0 指定 lane 永久循环。其余输入仍为原有有界等待。
+没有新增生产 env、宏、错误注入接口或特殊 runtime；正式 runtime 二进制没有变化。
+单独的硬件测试固定 N=2、遍历七种 mask 的全部 12 条实际执行 lane。
+仿真无 STARS，平台 marker 与运行时断言都禁止该入口进入 a5sim；原 24 个有界场景仍可仿真。
+
+超时链复用现有 TMR 故障用例的配置：scheduler 2000ms、op 3000000us、stream 4000ms，
+不启用 SDMA。测试仍先健康运行，在同 Worker 上失败，然后验证重提和两个 caller buffer
+的 free 均被拒绝；close 后新 Worker 使用同 callable 再通过完整输出和成功原生协议。
+STARS 故障后设备访问可能已被毒化，不发 D2H；失败结果明确 output_verified=false，
+并且要求存在真实 Host 导出的失败协议，不将缺失 capture 静默当成功。
+
+失败 oracle 复用已有检查并区分两类：有界 kernel 必须有真实 return/visible 和全部失败退出
+worker；不可返回 kernel 必须有精确 block/slot 入口，return、visible、消费、trace 发布均为零，
+唯一未确认退出的 worker 必须就是阻塞者。所属 AICPU 分区的 EXIT ACK 等待至少一秒，
+其他分区较晚的时间不能替代本分区。两类均保留真实根任务／后继、完整 worker 集合、
+首错误 TIMEOUT(10)、非成功 task_controls、未释放 fanin 和 epoch 检查。
+全局 watchdog 不知道的首错误字段仍保持 unknown；不拿首写者冒充实际阻塞 kernel。
+
+新增 CPU 检查先 RED，再补入两类判定后 51/51 通过。包含缺入口、假返回／可见／消费／trace、
+假退出 ACK、多一个未知未退出核、错 AICPU 分区、短 ACK 等待、提前退出和伪完成等反例；
+这是 oracle 自检，不算设备故障。日志 outputs/spmd-nonreturning-oracle-red-20261026.log
+与 green 日志，平台隔离检查另有 fixture-red／fixture-green 日志。
+
+A5 全部 12/12 通过，单次 run 报错 4.319–4.337s，失败 Worker close 8.680–10.147s，
+这里只用来验证有界退出，不能当作正常调度性能。36 份捕获包含 24 份健康成功协议和
+12 份不可返回失败协议，离线按正式 reader／失败 oracle 重审通过，三轮 epoch 严格递增。
+原始 capture 与哈希、每项三轮结果见 outputs/spmd-nonreturning-capture-audit-20261026.json；
+设备矩阵日志 outputs/spmd-nonreturning-a5-20261026/matrix.log。
+最初单项 smoke 的 result 未挂入失败 capture，后续独立读取确认原文件存在，
+随后正式矩阵改为强制验证失败记录；不拿初版宽松 smoke 替代最终 12 项结果。
+
+本证据证明执行 kernel 永不返回时的当前超时链、caller borrow 保留、错误后拒绝与恢复。
+组描述发布前／无 kernel AIC 协调者的错误门禁，仍使用现有生产 helper 的受控阶段测试，
+其中四种 Mix mask 均覆盖失败后不得领取／发布／执行／贡献完成／写成功 seal。
+这些证据层次已经明确；不为匹配参考方案而添加生产故障开关，
+也不把“任意物理坏核、驱动失效、掉电后继续运行”追加为本次实现要求。
+
+### 参考边界 C01–C56 的覆盖核对
+
+下表是对当前实现的证据索引，不把参考文档中的建议、旧 FDWIC 的通道形态或未开放能力
+追加为强制实现要求。H 表示真实 Host／生产 C++ helper，M 表示模型／坏记录检查，
+D 表示真实 runtime／kernel 的仿真或 A5 记录。三者不能互相替代；
+普通多 block、Mix 分波、sync_start 最终一致推进和原样 CSA 仍是本次功能主线。
+C++ 入口在 tests/ut/cpp/a5/runtime/host_build_graph，模型在 tests/ut/py/hbg_spmd_contracts；
+原生专项入口位于本目录，另有 tests/st/a5/host_build_graph 的能力及失败回归。
+
+| 编号 | 当前实现与对应证据 | 明确的范围 |
+| ---- | ------------------ | ---------- |
+| C01 | H submit/layout、M shapes、D spmd_contract | 原 N、block/slot 集合与全输出；不只比较计数 |
+| C02 | H ordered、D ordered/gm_mix_execution、原样 CSA N=512 | 普通分波；不同平台容量另按本轮拓扑检查 |
+| C03 | H submit_poison 的宽 int64、0、负数；D validation | 窄化前拒绝，非法请求不得改 poison storage |
+| C04 | H submit_poison/layout 乘积、前缀与对齐溢出 | Host 可表示范围而非 uint16 字段最大值 |
+| C05 | H admission 容量、D 纯 C/V、sync_start | V 按实际 AIV 数，不按 cluster 数 |
+| C06 | H gm_mix、D 四种 Mix mask 的身份／组协议 | mask6 的 C 只协调，不伪造 kernel |
+| C07 | H zero-work close、M order、D 小 N 的组协议 | 零工作成员仍关闭义务，非成员可直接越过 |
+| C08 | H admission/layout 坏拓扑、M 原生审计坏记录 | 唯一位置、冻结成员和重复身份均拒绝 |
+| C09 | M/native fixture 对漏块和重复块的反例、D 精确集合 | 总数正确不能掩盖身份错误 |
+| C10 | H admission/bootstrap 无效拓扑与成员校验 | 不在线缩减已发布成员以掩盖缺核 |
+| C11 | H 紧凑位图、M 稀疏 ID、D 96 worker 的稀疏物理 ID | 物理 ID 与 worker index 分离 |
+| C12 | D 原样 CSA、原生 task view、payload_context | 保留业务 ABI；不擅自给共享 tensor 叠加 block 偏移 |
+| C13 | H ordered/gm_mix、D overlap 与 sync_ordered | 本地关闭可越入独立后继，不等远端 TaskDone |
+| C14 | D 相同负载的 edge/fanin、独立 deps 和完整协议 | 真依赖仍等全部前驱输出发布 |
+| C15 | H admission 并发提交、M 反序死锁反例、D order_key | 执行依据共同准入，不依据各核观察顺序 |
+| C16 | M 部分相交集合、H 成员投影、D C/V/Mix 交叠 | 当前生产选固定类型／完整 cluster，不新增任意用户成员接口 |
+| C17 | H ready/wake、M 固定 seed DAG、D CLA/CSA | 完成驱动推进链、菱形及跨类型 fanin |
+| C18 | H 并发 wake-list、D fanout_imbalance | 有限 HBG 内不丢唤醒；不承诺无限生产者下的固定等待轮数 |
+| C19 | H 24 项真实 ordinary→Mix 资源交接、M 坏记录 | 精确暂停点是 helper 证据，不冒充硬件逐指令暂停 |
+| C20 | H partial completion、D 慢头／中／尾与 fanin | cursor=N 不等于 TaskDone |
+| C21 | H predicate、D 两个正向及 22 个拒绝组合 | 单 block 原语保留；多 block／Mix predicate 未开放 |
+| C22 | H inline_services、M 空图、D 带 Dummy 的 CSA | 无 kernel 服务不增加物理执行计数 |
+| C23 | H sync_once、D sync_start/sync_ordered | 早到可执行，晚到成员的前序义务不被截走 |
+| C24 | H 容量门禁、D 满容量和超容量拒绝 | 两个 pending slots 不算两个物理位置 |
+| C25 | H gm_mix/payload_context、D 原生组协议与通信 | 每 lane 自备参数，同一组身份配对 |
+| C26 | H fast cluster、D 独立 Mix 跨 task 重叠 | 不新增全 cluster 的 TaskDone 屏障 |
+| C27 | H 四种 mask × 三条 lane × 两槽资源交接 | inactive lane 仍等待旧资源，但不计作 kernel |
+| C28 | H generation/seal、D 多 block 连续复用与 CSA | 每组 release 收齐再复用 mailbox |
+| C29 | H dispatch/gm_mix/layout、M 旧 epoch/generation 反例 | 旧消息不贡献新一轮完成 |
+| C30 | H 布局／序号极值拒绝、M wrap 反例 | 不依赖实际执行到 uint64 上限才验收 |
+| C31 | H 已发布错误在各阶段关闭入口，D 有界／不可返回 kernel | 非执行协调者／发布者失败的阶段门禁用 H；不宣称任意物理故障注入 |
+| C32 | D 真实超时身份、borrow 保留、拒绝重提、close／恢复 | 不可返回核不伪造 ACK，也不做故障后 D2H |
+| C33 | H retained reset、D 大小 N 交替及同 callable 重复 | 每轮新 epoch／新来源，未使用区不读取旧状态 |
+| C34 | D Graph 回退和 deferred API false、M 来源守卫 | 不开放异步返回；不把 API false 说成自动识别任意 async kernel |
+| C35 | H payload_context、D 精确 block/slot/N/generation | own slot 复用不覆盖其他 block 的上下文 |
+| C36 | H 发布原语、D 原生 ticket／本核 sequence 因果链 | 输出可见与完成消费分开；不只看 counter 阈值 |
+| C37 | H 不可撤销 cursor/slot 所有权、M 迟到转移反例 | 当前无动态转移接口，不增加已关闭成员 |
+| C38 | H ready/admission 一次性所有权及旧 generation 拒绝 | 不把旧 intrusive 节点无条件再次入队 |
+| C39 | D 新增每平台 196 项，392 份 L4＋独立 deps 审计 | A/B 全 mask，ready B 先行且 A 可早于 B 尾部进入 |
+| C40 | H 真实并发准入、D 唯一共同日志／身份审计 | 同 task 只准入一次，不按 block 重复 generic pop |
+| C41 | H 准备不发布、锁竞争不造洞、坏记录拒绝 | 物理发布者任意停机未逐点注入；错误使用 run 失败链，不抢锁恢复 |
+| C42 | D overlap、C39 与协议里的独立后继准入 | 短锁不持有到 task 全局完成 |
+| C43 | H nonmember entry、D C/V 独立重叠 | 无义务且无资源冲突的类型不被全局最慢核挡住 |
+| C44 | H 两候选停放、direct refill、逐次 entry permit | 不丢所有权，不重复 predicate，不沿用旧许可 |
+| C45 | H ordered/Mix service、D 有限图和长串 Mix | 已知义务优先；候选池不保证固定轮数内发现全部协同任务 |
+| C46 | H 冻结位图／坏成员拒绝、M 迟到成员反例 | 不支持发布后扩张成员集合 |
+| C47 | H cursor 饱和、未退役 slot 和暂停领取者 | 无转交事务；不可撤销所有权成立后才允许零工作关闭 |
+| C48 | H claim 后暂停 publish、D 组发布／close 审计 | 没看见新 mailbox 不等于没有未发布组 |
+| C49 | H 保留 seal 与最后组交错、D LocalDone 因果链 | seal 携带最后序号，不覆盖后就丢旧关闭通知 |
+| C50 | H startup/drain、M 暂空、D 长尾与 fanin | 暂空不当 EOF；正常退出排空控制义务 |
+| C51 | M fresh mode/count 反例、D 每轮来源与 aicore producer | 不凭旧 latch 或正确 golden 接受 legacy |
+| C52 | H 能力门禁、D 支持／拒绝／回退分组 | 保留未支持形状，不为“全绿”盲改 marker |
+| C53 | H nullptr SSBUF startup、D 全部 GM Mix 及 CSA | 实际 resident 路径不要求 SSBUF |
+| C54 | H pending/prepared 禁止 kernel entry；提交代码有限短段 | 锁内无 kernel、成员／ready 等待；不改为全任务锁 |
+| C55 | H sync 提前关闭、D 有界 barrier 的迟到／重叠场景 | 保证最终一致位置，不增加同时开始门槛 |
+| C56 | H mask6 coordinator/close、D 2V Mix 全身份 | AIC 协调义务完成后才局部关闭，不增加 C kernel |
+
+本轮重编并运行上述 A5 HBG 目录全部 21 个 C++ 目标，共 842 个 GTest 用例通过，
+日志 outputs/spmd-boundary-a5-hbg-cpp-build-20261026.log 与 cpp-tests 日志。
+不把这些目标说成整个仓库所有 C++ 单元测试已运行。
+同时纠正测试入口页 ordered 目标数量的旧笔误：实际为 62，而非 63。
+
+Python 全量首轮在收集 Qwen 用例时发现 .venv-csa 缺少已在 pyproject test extras 声明的
+safetensors；只在该虚拟环境补齐 0.8.0，没有改系统 Python、Torch 2.12 或测试预期。
+完整重跑 tests/ut/py 得到 5842 passed、84 skipped、1191 warnings，耗时 592.78s，
+outputs/spmd-boundary-all-py-resume-final-20261026.log。首次收集失败日志保留，
+不把缺依赖的运行记为通过；84 项既有跳过也不算已验证。
+
+### 本轮回归与收口
+
+拆出共用故障执行器、增加负 stall 输入后，原有有界故障场景在仿真／A5 再次各 24/24
+通过，没有只跑新故障入口。两平台合计 144 份捕获按最终 oracle 重审，96 份健康协议、
+48 份有界失败协议全部通过；outputs/spmd-bounded-refactor-capture-audit-20261026.json。
+运行日志 outputs/spmd-bounded-refactor-sim-20261026.log 和 a5 对应日志。
+仿真执行时明确 deselect 12 项不可返回用例，避免在无 STARS 的环境中永久阻塞。
+
+最后原样 CSA 的严格 L4 再次通过，outputs/csa-hbg-l4-pug5_ig0/result.json：
+两轮各七项 golden、2308 个执行身份、133 条依赖、96 worker、46733 个协议事件，
+producer=aicore、protocol_verified/block_identity_verified 均为 true。
+冻结业务源码仍一致，Torch 为 2.12.0+cpu；使用 HEAD 98215088b 的生产 runtime，
+本轮修改仅为测试和说明。该结果的 tracked_diff_sha256 只覆盖 src/python/simpler_setup，
+空值不代表整个工作树干净；测试／文档 diff 由本次提交保留。
+CSA README 的旧“sync_start 尚未完成”文字同步纠正：CSA 自身不使用该属性，
+同步能力由独立矩阵验收，不修改冻结业务代码来制造同步证据。
+
+C39 另逐项复核 frozen flags 与输入 sync_flags，392/392 一致，
+outputs/spmd-c39-flags-audit-20261026.json。最终专项 Python 合同包为 1918/1918，
+outputs/spmd-boundary-contracts-resume-final-20261026.log；适用 pre-commit 全部通过，
+outputs/spmd-boundary-resume-precommit-20261026.log。
+
+当前功能和边界验收按以上支持范围收口；不以参考文档添加旧 SPSC/SSBUF 架构要求，
+也不把未开放的 predicate／Graph resident／deferred／动态转移扩展列作本轮必做。
+性能优化仍按用户安排留待后续，现有性能回退没有被“测试通过”掩盖。
+阶段提交仅包含本轮相关测试与中文记录，不包含既有未跟踪文件，不 push。

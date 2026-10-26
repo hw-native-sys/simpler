@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Bad-record checks for the bounded-stall fixture, not device failure evidence."""
+"""Bad-record checks for the resident-timeout fixture, not device failure evidence."""
 
 import copy
 import importlib.util
@@ -86,6 +86,82 @@ def test_both_real_timeout_writers_have_the_same_containment_requirements(native
     raw = _capture()
     raw["aicore_protocol"]["first_error"]["site"] = site
     native._check_failed_capture(raw, 2, 3, 0)
+
+
+def test_nonreturning_probe_is_hardware_only_and_covers_each_executing_lane(native):
+    test = native.test_nonreturning_kernel_timeout_keeps_failed_run_contained
+    platforms = [mark.args[0] for mark in test.pytestmark if mark.name == "platforms"]
+    assert platforms == [["a5"]]
+    shapes = [mark.args[1] for mark in test.pytestmark if mark.name == "parametrize"]
+    assert len(shapes) == 1
+    assert sorted(shapes[0]) == [(mask, lane) for mask in range(1, 8) for lane in range(3) if mask & (1 << lane)]
+
+
+def _nonreturning_capture():
+    raw = _capture()
+    protocol = raw["aicore_protocol"]
+    protocol["workers"][0]["finished"] = 0
+    execution = protocol["executions"][0]
+    for field in ("returned", "visible", "completion_consumed", "trace_published"):
+        execution[field] = [0, 0]
+    raw["aicpu_lifecycle_records"][0]["exit_wait_end_cycles"] = 3_000_000_200
+    return raw
+
+
+def test_nonreturning_capture_proves_missing_return_and_exit_ack_timeout(native):
+    native._check_failed_capture(_nonreturning_capture(), 2, 3, 0, nonreturning=True)
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    (
+        "missing_entry",
+        "return",
+        "visible",
+        "consumed",
+        "trace",
+        "fake_ack",
+        "extra_unfinished",
+        "wrong_partition",
+        "short_exit_wait",
+        "premature_exit",
+        "late_signal_end",
+        "consumer_entered",
+        "task_done",
+        "completed_blocks",
+        "resolved_count",
+    ),
+)
+def test_nonreturning_capture_rejects_fabricated_completion_or_unrelated_failure(native, corruption):
+    raw = _nonreturning_capture()
+    protocol = raw["aicore_protocol"]
+    execution = protocol["executions"][0]
+    if corruption == "missing_entry":
+        execution["entry"] = [0, 0]
+    elif corruption in ("return", "visible", "consumed", "trace"):
+        field = {
+            "return": "returned",
+            "visible": "visible",
+            "consumed": "completion_consumed",
+            "trace": "trace_published",
+        }[corruption]
+        execution[field] = [2_500_000_100, 2]
+    elif corruption == "fake_ack":
+        protocol["workers"][0]["finished"] = 2
+    elif corruption == "extra_unfinished":
+        protocol["workers"][1]["finished"] = 0
+    elif corruption == "wrong_partition":
+        execution["worker_index"] = 2
+        protocol["workers"][0]["finished"] = 2
+        protocol["workers"][2]["finished"] = 0
+    elif corruption == "short_exit_wait":
+        raw["aicpu_lifecycle_records"][0]["exit_wait_end_cycles"] -= 1
+    elif corruption == "late_signal_end":
+        raw["aicpu_lifecycle_records"][0]["exit_signal_end_cycles"] = 3_100_000_000
+    else:
+        _corrupt_shutdown(raw, corruption)
+    with pytest.raises(AssertionError):
+        native._check_failed_capture(raw, 2, 3, 0, nonreturning=True)
 
 
 @pytest.mark.parametrize(

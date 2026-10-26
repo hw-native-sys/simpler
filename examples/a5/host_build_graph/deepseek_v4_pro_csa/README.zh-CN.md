@@ -2,7 +2,7 @@
 
 本目录提供原生 `SceneTestCase` 的 **HBG 独立用例**。冻结 kernel、参数 ABI、数据清单、七项 golden、运行和分析工具均在本目录内，不导入其他 runtime 的用例，也不依赖 PyPTO 或模型仓库。首次使用需另行导入固定数据，数据文件不进入 Git。
 
-**当前边界：原样 CSA 的七项 golden、显式 block/slot 身份和原生协议因果审计已在 A5 通过严格 L4 门禁。** 普通 C/V 与 GM Mix 支持原 N 分波；无 kernel Dummy 只推进逻辑依赖，不伪造物理执行。创建用例时的 `main@946f49ac` 仅支持单 block，历史结果仍属于 AICPU 回退，不能改写为本版证据。sync_start 和性能比较尚未完成。最新实现边界见 [SPMD 设计](../../../../tests/fdwic/pa_hbg/a5-hbg-spmd-design.md)，逐步实现和实测集中于 [实现过程](../../../../tests/fdwic/pa_hbg/spmd/implementation-progress.md)。
+**当前边界：原样 CSA 的七项 golden、显式 block/slot 身份和原生协议因果审计已在 A5 通过严格 L4 门禁。** 普通 C/V 与 GM Mix 支持原 N 分波；无 kernel Dummy 只推进逻辑依赖，不伪造物理执行。创建用例时的 `main@946f49ac` 仅支持单 block，历史结果仍属于 AICPU 回退，不能改写为本版证据。本 CSA 不设置 sync_start；该能力已由独立矩阵验收，不能拿 CSA 通过代替同步语义证明。性能优化按用户要求留待后续。最新实现边界见 [SPMD 设计](../../../../tests/fdwic/pa_hbg/a5-hbg-spmd-design.md)，逐步实现和实测集中于 [实现过程](../../../../tests/fdwic/pa_hbg/spmd/implementation-progress.md)。
 
 因此，这份用例是后续扩展、调试 HBG 分布式调度的固定验收负载；**历史 AICPU 结果不能当作分布式调度的性能基线**。用例不通过拆任务、减少 SPMD block 数或改变 kernel 绕过限制。
 

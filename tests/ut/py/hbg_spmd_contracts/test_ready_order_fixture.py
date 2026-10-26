@@ -37,11 +37,13 @@ def _sample(native, params, mode="valid", *, b_before_p=False):
     test.compute_golden(golden, params)
     actual = golden.clone()
     rows = actual.records.view(-1, 16)
-    p, a, b = [
+    groups = [
         [base + block * 3 + slot for block in range(n) for slot in range(3) if mask & (1 << slot)]
         for n, mask, base, *_ in actual.plan.tolist()
     ]
-    b_tail_count = int(actual.plan[2, 1]).bit_count()
+    p, a, b = groups[0], groups[-2], groups[-1]
+    q = groups[1] if len(groups) == 4 else []
+    b_tail_count = int(actual.plan[-1, 1]).bit_count()
 
     def enter(group):
         return [(row, 13) for row in group]
@@ -50,9 +52,25 @@ def _sample(native, params, mode="valid", *, b_before_p=False):
         return [(row, 14) for row in group]
 
     if mode == "host_order":
-        events = enter(p) + finish(p) + enter(a) + finish(a) + enter(b) + finish(b)
+        events = enter(p) + finish(p) + enter(q) + finish(q) + enter(a) + finish(a) + enter(b) + finish(b)
     elif mode == "no_overlap":
-        events = enter(p) + enter(b) + finish(b) + finish(p) + enter(a) + finish(a)
+        events = enter(p) + enter(q) + finish(q) + enter(b) + finish(b) + finish(p) + enter(a) + finish(a)
+    elif q:
+        assert not b_before_p
+        if mode == "bridge_before_p":
+            start = enter(q) + finish(q) + enter(p)
+        else:
+            start = enter(p) + enter(q) + finish(q)
+        if mode == "late_b":
+            start += finish(p) + enter(b) + finish(b[:-b_tail_count]) + enter(a[:1])
+        elif mode == "early_a":
+            start += enter(b[:b_tail_count]) + enter(a[:1]) + finish(p)
+            start += enter(b[b_tail_count:]) + finish(b[:-b_tail_count])
+        else:
+            assert mode in ("valid", "bridge_before_p")
+            start += enter(b[:b_tail_count]) + finish(p) + enter(b[b_tail_count:])
+            start += finish(b[:-b_tail_count]) + enter(a[:1])
+        events = start + finish(b[-b_tail_count:]) + enter(a[1:]) + finish(a)
     else:
         start = enter(b) + enter(p) if b_before_p else enter(p) + enter(b)
         if mode == "late_b":
@@ -70,23 +88,32 @@ def _sample(native, params, mode="valid", *, b_before_p=False):
     return test, actual, golden
 
 
-@pytest.mark.parametrize("case_index", range(168))
-def test_every_case_has_actual_fanin_nonmember_predecessor_and_bounded_probe(ready_native, case_index):
+@pytest.mark.parametrize("case_index", range(392))
+def test_every_case_has_actual_fanin_and_bounded_peer_waits(ready_native, case_index):
     case = ready_native.TestHbgReadyOrderExecution.CASES[case_index]
     params = case["params"]
     test, actual, golden = _sample(ready_native, params)
-    p, a, b = golden.plan.tolist()
+    plan = golden.plan.tolist()
+    p, a, b = plan[0], plan[-2], plan[-1]
     assert p[0] == 1 and p[1] == (2 if b[1] == 1 else 1)
-    assert golden.sync_flags.tolist() == [0, *params["sync_flags"]]
-    assert golden.wait_peers.tolist() == [2, 2, 1]
-    assert [row[5:7] for row in (p, a, b)] == [[0, 0], [1, 1], [0, 0]]
+    if b[1].bit_count() > 1:
+        assert len(plan) == 4 and plan[1][:2] == [1, 2]
+        assert golden.sync_flags.tolist() == [0, 0, *params["sync_flags"]]
+        assert golden.wait_peers.tolist() == [3, 0, 3, 2]
+        assert [row[5:7] for row in plan] == [[0, 0], [0, 0], [1, 1], [1, 1]]
+        assert b[8] == b[20] == 1
+    else:
+        assert len(plan) == 3
+        assert golden.sync_flags.tolist() == [0, *params["sync_flags"]]
+        assert golden.wait_peers.tolist() == [2, 2, 1]
+        assert [row[5:7] for row in plan] == [[0, 0], [1, 1], [0, 0]]
     assert a[8] == a[20] == 0
     assert torch.equal(golden.plan, golden.host_plan)
     end = 0
-    for index, row in enumerate((p, a, b)):
+    for index, row in enumerate(plan):
         n, mask, base, tag, delay, *_ = row
         assert base == end and tag == index + 1 and row[7] == n - 1 and delay == 0
-        if index:
+        if index >= len(plan) - 2:
             capacity = params["clusters"] * (2 if mask in (2, 4) else 1)
             assert n == capacity + (not golden.sync_flags[index].item())
         end += n * 3 + 1
@@ -149,7 +176,7 @@ def test_complete_event_order_cannot_hide_other_contract_failures(ready_native, 
 def test_matrix_preserves_all_modes_and_reuses_existing_kernel_functions(ready_native):
     cls = ready_native.TestHbgReadyOrderExecution
     cases = cls.CASES
-    assert len(cases) == len({case["name"] for case in cases}) == 168
+    assert len(cases) == len({case["name"] for case in cases}) == 392
     assert all("skip_golden" not in c and "manual" not in c and "marks" not in c for c in cases)
     for platform in ("a5sim", "a5"):
         shapes = {
@@ -158,8 +185,31 @@ def test_matrix_preserves_all_modes_and_reuses_existing_kernel_functions(ready_n
             if c["platforms"] == [platform]
             for p in [c["params"]]
         }
-        assert shapes == {(a, b, (sa, sb)) for a in range(1, 8) for b in (1, 2, 4) for sa in (0, 1) for sb in (0, 1)}
+        assert shapes == {(a, b, (sa, sb)) for a in range(1, 8) for b in range(1, 8) for sa in (0, 1) for sb in (0, 1)}
     assert all(
         Path(entry["source"]).name == f"sync_ordered_slot_{slot}.cpp"
         for slot, entry in enumerate(cls.CALLABLE["incores"])
     )
+
+
+@pytest.mark.parametrize("mask", (3, 5, 6, 7))
+def test_mix_b_has_a_readiness_bridge_that_cannot_hold_its_predecessors_core(ready_native, mask):
+    params = {"scenario": "ready_before", "mask": 6, "other_mask": mask, "clusters": 8, "sync_flags": (1, 1)}
+    args = ready_native.TestHbgReadyOrderExecution().generate_args(params)
+    assert args.plan.shape == (4, 32), "Mix B needs P, an entry bridge Q, A and B"
+    p, q, a, b = args.plan.tolist()
+    assert p[:2] == [1, 1] and q[:2] == [1, 2]
+    assert [row[5:7] for row in (p, q, a, b)] == [[0, 0], [0, 0], [1, 1], [1, 1]]
+    assert a[8] == a[20] == 0
+    assert b[8] == b[20] == 1
+    assert args.wait_peers.tolist() == [3, 0, 3, 2]
+    assert args.sync_flags.tolist() == [0, 0, 1, 1]
+
+
+@pytest.mark.parametrize("mask", (3, 5, 6, 7))
+@pytest.mark.parametrize("mode", ("host_order", "late_b", "no_overlap", "early_a", "bridge_before_p"))
+def test_mix_b_oracle_rejects_missing_readiness_and_overlap_evidence(ready_native, mask, mode):
+    params = {"scenario": "ready_before", "mask": 7, "other_mask": mask, "clusters": 8, "sync_flags": (1, 1)}
+    test, actual, golden = _sample(ready_native, params, mode)
+    with pytest.raises(AssertionError):
+        test.compare_outputs(actual, golden, ["records"], params)

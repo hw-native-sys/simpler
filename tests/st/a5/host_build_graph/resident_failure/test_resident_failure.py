@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-"""Real resident timeout with bounded kernels, retained caller buffers and failed-lane containment."""
+"""Real resident timeouts, retained caller buffers and failed-lane containment."""
 
 import json
 import tempfile
@@ -51,7 +51,7 @@ def _compile(platform):
         "incores": [
             {
                 "func_id": lane,
-                "name": f"bounded_stall_{lane}",
+                "name": f"runtime_stall_{lane}",
                 "source": str(_KERNELS / f"runtime_failure_{lane}.cpp"),
                 "core_type": "aic" if lane == 0 else "aiv",
                 "signature": [ArgDirection.INOUT],
@@ -111,7 +111,7 @@ def _check_output(values, blocks, mask, *, failed):
     torch.testing.assert_close(values[1], summary, rtol=0, atol=0)
 
 
-def _check_failed_capture(raw, blocks, mask, lane):
+def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False):
     protocol = raw["aicore_protocol"]
     assert protocol["producer"] == "aicore"
     assert protocol["scheduler_error"] == 10
@@ -121,7 +121,7 @@ def _check_failed_capture(raw, blocks, mask, lane):
     assert worker_count == raw["metadata"]["num_cores"]
     assert len(protocol["workers"]) == worker_count
     assert {worker["worker_index"] for worker in protocol["workers"]} == set(range(worker_count))
-    assert all(worker["finished"] == 2 and worker["error_flags"] == 0 for worker in protocol["workers"])
+    assert all(worker["error_flags"] == 0 for worker in protocol["workers"])
     roots = [task for task in protocol["tasks"] if task["active_mask"] and 3 not in task["kernel_ids"]]
     consumers = [task for task in protocol["tasks"] if 3 in task["kernel_ids"]]
     assert len(roots) == len(consumers) == 1
@@ -136,10 +136,20 @@ def _check_failed_capture(raw, blocks, mask, lane):
     ]
     assert len(stalled) == 1
     execution = stalled[0]
-    assert 0 < execution["entry"][1] < execution["returned"][1] < execution["visible"][1]
-    assert execution["entry"][0] <= execution["returned"][0] <= execution["visible"][0]
     frequency = raw["metadata"]["clock_freq_hz"]
-    assert execution["returned"][0] - execution["entry"][0] >= _STALL_MS * frequency // 1000
+    if nonreturning:
+        assert all(value > 0 for value in execution["entry"])
+        for field in ("returned", "visible", "completion_consumed", "trace_published"):
+            assert execution[field] == [0, 0]
+        assert all(
+            worker["finished"] == (0 if worker["worker_index"] == execution["worker_index"] else 2)
+            for worker in protocol["workers"]
+        )
+    else:
+        assert all(worker["finished"] == 2 for worker in protocol["workers"])
+        assert 0 < execution["entry"][1] < execution["returned"][1] < execution["visible"][1]
+        assert execution["entry"][0] <= execution["returned"][0] <= execution["visible"][0]
+        assert execution["returned"][0] - execution["entry"][0] >= _STALL_MS * frequency // 1000
     lifecycle = raw["aicpu_lifecycle_records"]
     assert len(lifecycle) == 2
     assert {record["aicpu_thread_id"] for record in lifecycle} == {0, 1}
@@ -153,9 +163,14 @@ def _check_failed_capture(raw, blocks, mask, lane):
     assert len(owners) == 1
     owner = owners[0]
     assert execution["entry"][0] < owner["exit_signal_start_cycles"] <= owner["exit_signal_end_cycles"]
-    assert owner["exit_signal_end_cycles"] < execution["returned"][0]
     assert owner["exit_signal_end_cycles"] <= owner["exit_wait_start_cycles"]
-    assert execution["visible"][0] <= owner["exit_wait_end_cycles"]
+    if nonreturning:
+        # The onboard A5 EXIT ACK budget is one second. No ACK/return may be
+        # invented when STARS, rather than the kernel, ends the operation.
+        assert owner["exit_wait_end_cycles"] - owner["exit_wait_start_cycles"] >= frequency
+    else:
+        assert owner["exit_signal_end_cycles"] < execution["returned"][0]
+        assert execution["visible"][0] <= owner["exit_wait_end_cycles"]
     assert all(record["exit_wait_end_cycles"] >= record["exit_wait_start_cycles"] > 0 for record in lifecycle)
     assert not any(entry["task_ref"] == consumer["task_ref"] for entry in protocol["executions"])
     control_rows = protocol["task_controls"]
@@ -171,16 +186,41 @@ def _check_failed_capture(raw, blocks, mask, lane):
 @pytest.mark.parametrize("mask,lane", _SHAPES)
 @pytest.mark.parametrize("blocks", (1, 2))
 def test_bounded_kernel_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, blocks, monkeypatch):
+    _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatch, _STALL_MS)
+
+
+@pytest.mark.platforms(["a5"])
+@pytest.mark.timeout(180)
+@pytest.mark.parametrize("mask,lane", _SHAPES)
+def test_nonreturning_kernel_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, monkeypatch):
+    # The simulator has no STARS watchdog; a non-returning kernel would wedge it.
+    assert st_platform == "a5"
+    monkeypatch.setenv("SIMPLER_OP_EXECUTE_TIMEOUT_US", "3000000")
+    monkeypatch.setenv("SIMPLER_STREAM_SYNC_TIMEOUT_MS", "4000")
+    _exercise_failure(st_platform, st_device_ids, mask, lane, 2, monkeypatch, -1)
+
+
+def _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatch, stall_ms):
     monkeypatch.setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", str(_TIMEOUT_MS))
+    nonreturning = stall_ms < 0
+    failure_kind = "nonreturning" if nonreturning else "bounded"
     callable_obj = _compile(st_platform)
     output_root = _ROOT / "outputs"
     output_root.mkdir(exist_ok=True)
     artifacts = Path(
-        tempfile.mkdtemp(prefix=f"resident-failure-{st_platform}-m{mask}-l{lane}-n{blocks}-", dir=output_root)
+        tempfile.mkdtemp(
+            prefix=f"resident-failure-{failure_kind}-{st_platform}-m{mask}-l{lane}-n{blocks}-", dir=output_root
+        )
     )
     evidence = []
     for recovery in (False, True):
-        worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=int(st_device_ids[0]))
+        worker = Worker(
+            level=2,
+            platform=st_platform,
+            runtime="host_build_graph",
+            device_id=int(st_device_ids[0]),
+            enable_sdma=False,
+        )
         buffers = []
         failed = False
         try:
@@ -189,9 +229,9 @@ def test_bounded_kernel_timeout_keeps_failed_run_contained(st_platform, st_devic
             values = [torch.zeros(size, dtype=torch.int64) for size in ((blocks * 3 + 1) * 16, 16)]
             for value in values:
                 buffers.append(worker.malloc(value.nbytes))
-            for stall_ms in (0,) if recovery else (0, _STALL_MS):
-                args = _args(worker, buffers, values, blocks, mask, lane, stall_ms)
-                prefix = artifacts / ("recovered" if recovery else "failed" if stall_ms else "healthy")
+            for duration in (0,) if recovery else (0, stall_ms):
+                args = _args(worker, buffers, values, blocks, mask, lane, duration)
+                prefix = artifacts / ("recovered" if recovery else "failed" if duration else "healthy")
                 prefix.mkdir()
                 config = CallConfig()
                 # The public runner requires at least two threads; either watchdog can publish first.
@@ -200,23 +240,30 @@ def test_bounded_kernel_timeout_keeps_failed_run_contained(st_platform, st_devic
                 config.output_prefix = str(prefix)
                 before = worker.scheduler_mode_publish_count
                 started = time.monotonic()
-                if stall_ms:
+                if duration:
                     failed = True
-                    with pytest.raises(RuntimeError, match=r"finalize_native_run failed with code -100\b"):
+                    codes = r"(-100|507(046|018|000))" if nonreturning else "-100"
+                    with pytest.raises(RuntimeError, match=rf"finalize_native_run failed with code {codes}\b") as error:
                         worker.run(handle, args, config)
                 else:
                     worker.run(handle, args, config)
-                assert time.monotonic() - started < 20
+                elapsed = time.monotonic() - started
+                assert elapsed < 20
                 assert worker.scheduler_mode_publish_count > before
                 assert worker.scheduler_runtime_mode in (1, 2)
-                for buffer, value in zip(buffers, values, strict=True):
-                    worker.copy_from(value, buffer)
-                _check_output(values, blocks, mask, failed=failed)
+                # A STARS-killed op can poison device access; its D2H output is
+                # not readable evidence. Host-exported failure records remain
+                # mandatory and must not masquerade as a successful capture.
+                if not (failed and nonreturning):
+                    for buffer, value in zip(buffers, values, strict=True):
+                        worker.copy_from(value, buffer)
+                    _check_output(values, blocks, mask, failed=failed)
                 path, raw = _capture(prefix)
                 if failed:
                     assert raw["aicore_protocol"]["run_epoch"] > evidence[-1]["run_epoch"]
-                    _check_failed_capture(raw, blocks, mask, lane)
-                    assert values[0].view(-1, 16)[lane, 0] == 1
+                    _check_failed_capture(raw, blocks, mask, lane, nonreturning=nonreturning)
+                    if not nonreturning:
+                        assert values[0].view(-1, 16)[lane, 0] == 1
                     rejected_count = worker.scheduler_mode_publish_count
                     with pytest.raises(RuntimeError, match="poisoned"):
                         worker.run(handle, args, config)
@@ -233,7 +280,9 @@ def test_bounded_kernel_timeout_keeps_failed_run_contained(st_platform, st_devic
                         "scheduler_error": raw["aicore_protocol"]["scheduler_error"],
                         "error_site": raw["aicore_protocol"]["first_error"]["site"],
                         "run_epoch": raw["aicore_protocol"]["run_epoch"],
-                        "output_verified": True,
+                        "output_verified": not (failed and nonreturning),
+                        "native_error": str(error.value) if failed else None,
+                        "run_seconds": elapsed,
                         "runtime_mode": worker.scheduler_runtime_mode,
                         "resubmit_refused": failed,
                         "borrowed_buffers_kept": failed,
@@ -246,9 +295,11 @@ def test_bounded_kernel_timeout_keeps_failed_run_contained(st_platform, st_devic
             closing = time.monotonic()
             worker.close()
             close_elapsed = time.monotonic() - closing
-            assert close_elapsed < 20
+            assert close_elapsed < (60 if nonreturning and failed else 20)
             if evidence:
                 evidence[-1]["worker_close_seconds"] = close_elapsed
     (artifacts / "result.json").write_text(
-        json.dumps({"mask": mask, "lane": lane, "blocks": blocks, "runs": evidence}, indent=2)
+        json.dumps(
+            {"mask": mask, "lane": lane, "blocks": blocks, "failure_kind": failure_kind, "runs": evidence}, indent=2
+        )
     )

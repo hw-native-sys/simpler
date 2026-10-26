@@ -51,29 +51,41 @@ class TestHbgReadyOrderExecution(_OrderedExecution):
         }
         for platform, clusters in (("a5sim", 8), ("a5", 32))
         for mask in range(1, 8)
-        for other in (1, 2, 4)
+        for other in range(1, 8)
         for flags in ((0, 0), (0, 1), (1, 0), (1, 1))
     ]
 
     def generate_args(self, params):
-        # P is outside B's participant set. Waiting for B cannot occupy a
-        # position B needs to enter, even if P starts after B is admitted.
+        # Pure B leaves P outside its member set. Mix B needs Q's completion
+        # to make it ready only after P has entered on a different core type.
         predecessor_mask = 2 if params["other_mask"] == 1 else 1
-        shapes = [(1, predecessor_mask)] + [
+        mix_b = params["other_mask"].bit_count() > 1
+        roots = [(1, predecessor_mask)] + ([(1, 2)] if mix_b else [])
+        shapes = roots + [
             (params["clusters"] * (2 if mask in (2, 4) else 1) + (0 if sync else 1), mask)
             for mask, sync in zip((params["mask"], params["other_mask"]), params["sync_flags"], strict=True)
         ]
         plan, records = make_ordered_plan({**params, "scenario": "overlap", "shapes": shapes, "tail_delay": 0})
-        plan[1, 5:7] = 1
-        plan[1, 8] = plan[1, 20] = 0
+        a, b = len(roots), len(roots) + 1
+        plan[a, 5:7] = 1
+        plan[a, 8] = plan[a, 20] = 0
+        if mix_b:
+            plan[b, 5:7] = 1
+            plan[b, 8] = plan[b, 20] = 1
         return TaskArgsBuilder(
             TensorArg("records", torch.zeros(records * 16, dtype=torch.int64)),
             TensorArg("plan", plan),
             TensorArg("host_plan", plan.clone(), transfer=TensorTransfer.NONE),
             TensorArg(
-                "sync_flags", torch.tensor((0, *params["sync_flags"]), dtype=torch.int64), transfer=TensorTransfer.NONE
+                "sync_flags",
+                torch.tensor((*([0] * len(roots)), *params["sync_flags"]), dtype=torch.int64),
+                transfer=TensorTransfer.NONE,
             ),
-            TensorArg("wait_peers", torch.tensor((2, 2, 1), dtype=torch.int64), transfer=TensorTransfer.NONE),
+            TensorArg(
+                "wait_peers",
+                torch.tensor(([b, 0] if mix_b else [b]) + [b, a], dtype=torch.int64),
+                transfer=TensorTransfer.NONE,
+            ),
         )
 
     def compute_golden(self, args, params):
@@ -86,7 +98,10 @@ class TestHbgReadyOrderExecution(_OrderedExecution):
             masks=golden_args.plan[:, 1].tolist(), sync_flags=golden_args.sync_flags.tolist(), events=intervals
         )
         print(f"[READY_ORDER] {witness}")
-        predecessor, earlier, ready = intervals
+        predecessor, earlier, ready = intervals[0], intervals[-2], intervals[-1]
+        if params["other_mask"].bit_count() > 1:
+            assert len(intervals) == 4
+            assert predecessor[0] < intervals[1][2], "Mix B's readiness bridge returned before P entered"
         assert ready[0] < predecessor[3], "B did not enter while A was blocked on P"
         assert earlier[0] < ready[3], "A did not enter before independent B finished"
         super().compare_outputs(test_args, golden_args, output_names, params)

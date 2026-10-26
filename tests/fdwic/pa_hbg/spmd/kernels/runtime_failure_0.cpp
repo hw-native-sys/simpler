@@ -11,4 +11,4 @@
 
 #include "runtime_failure_probe.h"
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) { record_bounded_stall(args, 0); }
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) { record_runtime_stall(args, 0); }
