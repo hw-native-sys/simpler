@@ -45,7 +45,7 @@ The orchestrator runs on the AICPU, where the host cannot observe it, so the
 inputs to each submit are captured and the graph is reconstructed afterwards.
 
 - **Capture point.** `pto_orchestrator::submit_task` writes a
-  `DepGenRecord` (task_id, scope flag, tensor blobs, arg types,
+  `DepGenRecord` (task_id, scope and launch flags, tensor blobs, arg types,
   explicit deps, kernel ids, and SPMD block num) into a per-thread
   shared-memory ring buffer for every call when `enable_dep_gen` is on.
 - **In-memory drain.** The host `DepGenCollector` (background mgmt
@@ -392,11 +392,10 @@ and `"auto"` otherwise. `kernel_ids` is the per-subslot
 means a normal single-block task and values greater than `1` identify
 SPMD tasks. Tools that only need task-pair edges can ignore this block.
 
-The host-orchestrated writer (`host_build_graph`) adds two launch
-attributes to every task: `sync_start` (its blocks start together or not
-at all) and `predicated` (a dispatch predicate may skip its kernel, and a
-skipped task may leave no AICore record). The device-orchestrated writer
-omits both; consumers must treat them as optional and absent as `false`.
+Every task also carries two launch attributes: `sync_start` (its blocks
+start together or not at all) and `predicated` (a dispatch predicate may skip
+its kernel, and a skipped task may leave no AICore record). Both writers emit
+them; `tensormap_and_ringbuffer` carries them through `DepGenRecord.flags`.
 
 ### `tensors[]`
 

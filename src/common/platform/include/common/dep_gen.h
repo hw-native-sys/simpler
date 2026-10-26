@@ -87,12 +87,15 @@ constexpr int DEP_GEN_TERMINAL_PRODUCER = 0;
 /**
  * Bitmask flags for DepGenRecord.flags / DepGenOverflowRecord.flags.
  *
- * IN_MANUAL_SCOPE is the only flag the host capture path cares about; the
- * overflow flags are wire-format markers consumed only by the replay scan.
+ * IN_MANUAL_SCOPE, EARLY_DISPATCH, SYNC_START and PREDICATED describe the submit
+ * and reach deps.json; the overflow flags are wire-format markers consumed only
+ * by the replay scan.
  */
 enum DepGenRecordFlags : uint32_t {
     DEP_GEN_FLAG_IN_MANUAL_SCOPE = 1u << 0,  // submit happened inside a manual scope
     DEP_GEN_FLAG_EARLY_DISPATCH = 1u << 4,   // submit had allow_early_resolve set (flagged producer)
+    DEP_GEN_FLAG_SYNC_START = 1u << 5,       // the task's blocks start together or not at all
+    DEP_GEN_FLAG_PREDICATED = 1u << 6,       // a dispatch predicate may skip the task's kernel
     DEP_GEN_FLAG_HAS_OVERFLOW = 1u << 1,     // base record: at least one overflow record follows
     DEP_GEN_FLAG_OVERFLOW = 1u << 2,         // this slot is a DepGenOverflowRecord, not a DepGenRecord
     DEP_GEN_FLAG_LAST_OVERFLOW = 1u << 3,    // overflow record: end of chain (no further overflow follows)

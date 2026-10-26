@@ -136,7 +136,8 @@ protected:
             TaskId dep = simpler::ut::test_task_id(first_task_id + static_cast<uint32_t>(i) - 1);
             const uint8_t kind = kCreatorEdgeDepKinds;
             dep_gen_aicpu_record_submit(
-                me, /*in_manual_scope=*/false, /*early_dispatch=*/false, /*tensor_count=*/0,
+                me, /*in_manual_scope=*/false, /*early_dispatch=*/false, /*sync_start=*/false, /*predicated=*/false,
+                /*tensor_count=*/0,
                 /*tensor_ptrs=*/nullptr, /*arg_types=*/nullptr,
                 /*explicit_dep_count=*/i == 0 ? 0 : 1, /*explicit_deps=*/i == 0 ? nullptr : &dep,
                 /*explicit_dep_kinds_raw=*/i == 0 ? nullptr : &kind, kCreatorEdgeDepKinds, /*block_num=*/1, kernel_ids
@@ -519,8 +520,8 @@ TEST_F(DepGenRetainedTest, RetentionOffProducesTheSameBytesAsRetentionOn) {
         TaskId dep = simpler::ut::test_task_id(0xB000 + static_cast<uint32_t>(i) - 1);
         const uint8_t kind = kCreatorEdgeDepKinds;
         dep_gen_aicpu_record_submit(
-            me, false, false, 0, nullptr, nullptr, i == 0 ? 0 : 1, i == 0 ? nullptr : &dep, i == 0 ? nullptr : &kind,
-            kCreatorEdgeDepKinds, 1, kernel_ids
+            me, false, false, false, false, 0, nullptr, nullptr, i == 0 ? 0 : 1, i == 0 ? nullptr : &dep,
+            i == 0 ? nullptr : &kind, kCreatorEdgeDepKinds, 1, kernel_ids
         );
     }
     dep_gen_aicpu_flush();
@@ -632,7 +633,8 @@ TEST_F(DepGenMappedTest, AnOverflowChainStillPublishes) {
         deps[i] = simpler::ut::test_task_id(0x3300 + static_cast<uint32_t>(i));
     const int32_t kernel_ids[3] = {-1, -1, -1};
     dep_gen_aicpu_record_submit(
-        simpler::ut::test_task_id(0x33FF), /*in_manual_scope=*/false, /*early_dispatch=*/false, /*tensor_count=*/0,
+        simpler::ut::test_task_id(0x33FF), /*in_manual_scope=*/false, /*early_dispatch=*/false, /*sync_start=*/false,
+        /*predicated=*/false, /*tensor_count=*/0,
         /*tensor_ptrs=*/nullptr, /*arg_types=*/nullptr, kDepCount, deps.data(), /*explicit_dep_kinds_raw=*/nullptr,
         kCreatorEdgeDepKinds, /*block_num=*/1, kernel_ids
     );
