@@ -31,3 +31,5 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
 else()
     simpler_ut_skip_dir(platform_comm)
 endif()
+
+add_subdirectory(aicpu_loader)

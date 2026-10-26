@@ -37,7 +37,7 @@ Python process (ChipWorker)
     |     +-- LoadAicpuOp::BootstrapDispatcher()
     |     |     |
     |     |     +-- rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC)
-    |     |           dispatcher writes simpler_inner_<fp>_<device_id>.so
+    |     |           dispatcher writes <hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so
     |     |
     |     +-- LoadAicpuOp::Init()
     |     |     |
@@ -51,8 +51,9 @@ Python process (ChipWorker)
 ```
 
 Key difference: onboard does **not** dlopen AICPU/AICore as host-side SOs.
-The runtime AICPU SO is written once to the device preinstall path through
+The runtime AICPU SO is uploaded per runner into CANN's process directory through
 the dispatcher bootstrap, then registered and launched by CANN runtime handles.
+TSD removes the process directory at session teardown.
 AICore remains a CANN-registered binary blob.
 
 ## RTLD Flags and Rationale
@@ -273,7 +274,7 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 | -------- | ------- | --------- |
 | Host runtime | `RuntimeModule` shared by context and native storage | Per runtime group, released after its final proven consumer; terminal failure retains code |
 | Dispatcher SO bytes | `DeviceRunnerBase::dispatcher_so_binary_` | Init-only: passed to `LoadAicpuOp::BootstrapDispatcher`, then cleared |
-| Runtime AICPU SO | Preinstall file `simpler_inner_<fp>_<device_id>.so` | Written once through dispatcher bootstrap, then registered via `rtsBinaryLoadFromFile` |
+| Runtime AICPU SO | Process-directory file `simpler_inner_<fp>_<device_id>.so` | Uploaded per runner; TSD removes the directory at session teardown |
 | AICPU entry handles | `LoadAicpuOp` cached `rtFuncHandle`s | Per-runtime-group: reused by `rtsLaunchCpuKernel` on every task |
 | AICore binary | `rtRegisterAllKernel` handle | Lazily registered on the first `launch_aicore_kernel()`, then the cached handle is reused |
 | Kernel binaries | `func_id_to_addr_` (device GM addresses) | Per-task: uploaded to device GM, cached by func_id |
@@ -282,7 +283,7 @@ Applies to all 4 runtime executors: a2a3 (hbg, tmr), a5 (hbg, tmr).
 ### Key difference
 
 Onboard caches more aggressively. The `DeviceRunner` persists across tasks
-within a runtime group, the runtime AICPU SO is preinstalled once through the
+within a runtime group, each runner uploads its runtime AICPU SO through the
 dispatcher bootstrap, and per-task launches reuse cached `rtFuncHandle`s.
 Simulation also retains the AICPU SO across runs so `g_aicpu_executor` can
 reuse its orchestration-SO cache; `AicpuExecutor::deinit()` resets its per-run
@@ -384,7 +385,7 @@ device_worker_main(device_id)
             rtStreamCreate(AICPU + AICore)
             LoadAicpuOp::BootstrapDispatcher()
               rtAicpuKernelLaunchExWithArgs(KERNEL_TYPE_AICPU_KFC)
-              dispatcher writes simpler_inner_<fp>_<device_id>.so
+              dispatcher writes <hostPid>_<localDeviceId>/simpler_inner_<fp>_<device_id>.so
             LoadAicpuOp::Init()
               rtsBinaryLoadFromFile()
               rtsFuncGetByName(simpler_aicpu_exec, ...)

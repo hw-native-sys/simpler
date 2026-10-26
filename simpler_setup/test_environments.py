@@ -20,6 +20,7 @@ import importlib.util
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
@@ -31,7 +32,7 @@ from pathlib import Path
 class TestEnvironment:
     execution: str
     constraints: str | None = None
-    cann_version: str | None = None
+    cann_minimum: tuple[int, int] | None = None
     modules: tuple[tuple[str, str], ...] = ()
 
 
@@ -40,7 +41,7 @@ ENVIRONMENTS = {
     "torch_npu": TestEnvironment(
         "direct",
         ".github/actions/setup-framework-eager/constraints.txt",
-        "9.0.0",
+        (9, 0),
         (("torch", "torch"), ("torch_npu", "torch_npu")),
     ),
 }
@@ -126,11 +127,20 @@ def _manifest(home: Path) -> tuple[Path, dict[str, str]]:
     return manifest, fields
 
 
+def _accepts_cann_version(profile: TestEnvironment, version: str | None) -> bool:
+    """Compare CANN major/minor lines; separated release/build labels are opaque."""
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)(?:[._+-][A-Za-z0-9]+)*", version or "")
+    if match is None or profile.cann_minimum is None:
+        return False
+    return (int(match[1]), int(match[2])) >= profile.cann_minimum
+
+
 def select_toolchain(name: str, *, roots: list[Path] | None = None) -> Path:
-    """Choose an installed exact-match toolkit without changing the host default."""
+    """Choose an installed toolkit meeting the minimum CANN version line without changing the host default."""
     profile = _environment(name)
-    if profile.cann_version is None:
+    if not profile.cann_minimum:
         raise ValueError(f"{name} does not declare a CANN toolchain")
+    machine = platform.machine()
     active = os.environ.get("ASCEND_HOME_PATH")
     if roots is None:
         roots = sorted(_ASCEND_ROOT.glob("cann*"))
@@ -154,15 +164,19 @@ def select_toolchain(name: str, *, roots: list[Path] | None = None) -> Path:
                 set_env=str(script),
                 set_env_exists=script.is_file(),
             )
-            if fields.get("version") == profile.cann_version and script.is_file():
+            if _accepts_cann_version(profile, fields.get("version")) and script.is_file():
                 matches.append(script)
         except (OSError, ValueError) as error:
             entry["error"] = str(error)
         installed.append(entry)
-    print("TEST_ENVIRONMENT_TOOLCHAINS " + json.dumps({"environment": name, "installed": installed}), flush=True)
+    print(
+        "TEST_ENVIRONMENT_TOOLCHAINS " + json.dumps({"environment": name, "machine": machine, "installed": installed}),
+        flush=True,
+    )
     if not matches:
         raise ValueError(
-            f"No installed CANN {profile.cann_version} with set_env.sh for {name}; see toolchain inventory"
+            f"No installed CANN meeting the minimum with set_env.sh for {name} on {machine}; "
+            f"requires CANN {profile.cann_minimum[0]}.{profile.cann_minimum[1]} or newer; see toolchain inventory"
         )
     return matches[0]
 
@@ -177,12 +191,16 @@ def preflight(name: str, *, packages: bool = True) -> dict:
         "machine": platform.machine(),
         "libc": platform.libc_ver(),
     }
-    if profile.cann_version is not None:
+    if profile.cann_minimum:
         home = Path(os.environ["ASCEND_HOME_PATH"]).resolve()
         manifest, fields = _manifest(home)
         record.update(cann_home=str(home), manifest=str(manifest), cann=fields)
-        if fields.get("version") != profile.cann_version:
-            raise ValueError(f"{name} requires CANN {profile.cann_version}; active manifest reports {fields}")
+        if not _accepts_cann_version(profile, fields.get("version")):
+            raise ValueError(
+                f"{name} active CANN does not meet the minimum version; "
+                f"requires CANN {profile.cann_minimum[0]}.{profile.cann_minimum[1]} or newer; "
+                f"active manifest reports {fields}"
+            )
     if packages:
         installed = {}
         pinned = requirements(name)
@@ -253,6 +271,7 @@ def prepare_session(session) -> None:
         "source": source,
         "environment": name,
         "platform": config.getoption("--platform", default=None),
+        "identity": identity,
         "cases": cases,
     }
     destination = Path(xmlpath).with_suffix(".plan.json")

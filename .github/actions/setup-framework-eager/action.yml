@@ -1,5 +1,5 @@
 name: Set up framework eager environment
-description: Install the CANN 9.0.0 framework consumer in its own virtual environment.
+description: Install the CANN 9.0+ framework consumer in its own virtual environment.
 
 outputs:
   cann_env:
