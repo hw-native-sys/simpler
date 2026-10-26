@@ -49,7 +49,6 @@ struct FakeBoundary {
 
 struct FakeRuntime {
     const OrchOps *ops;
-    ScopeMode pending_scope_mode{ScopeMode::AUTO};
     std::mutex mutex;
     std::condition_variable cv;
     bool record_entered{false};
@@ -108,7 +107,6 @@ struct FakeRuntime {
 };
 
 static_assert(offsetof(FakeRuntime, ops) == 0);
-static_assert(offsetof(FakeRuntime, pending_scope_mode) == offsetof(OrchContext, pending_scope_mode));
 
 FakeRuntime *as_fake(OrchContext *ctx) { return reinterpret_cast<FakeRuntime *>(ctx); }
 
@@ -227,7 +225,7 @@ bool fake_graph_end(OrchContext *ctx) {
 
 void fake_graph_commit(OrchContext *ctx) { as_fake(ctx)->commit_calls++; }
 
-void fake_scope_begin(OrchContext *ctx) { as_fake(ctx)->scope_begin_calls++; }
+void fake_scope_begin(OrchContext *ctx, ScopeMode) { as_fake(ctx)->scope_begin_calls++; }
 
 void fake_scope_end(OrchContext *ctx) { as_fake(ctx)->scope_end_calls++; }
 

@@ -227,15 +227,14 @@ struct RuntimeContext;
  * orchestrator itself all run on the host, so none of this is uploaded to the
  * device and none of it may be reached from device code.
  *
- * The orchestration .so compiles against the two-field partial definition in
- * orchestration_api.h, which must keep agreeing with the first two members here
+ * The orchestration .so compiles against the ops-pointer partial definition in
+ * orchestration_api.h, which must keep agreeing with the first member here
  * (C struct layout guarantee). The remaining members name host-only types the .so
  * has no link dependency on, which is why it sees only the prefix.
  */
 struct OrchContext {
-    // Kept first, and in this order, to match the .so's partial definition.
+    // Kept first to match the .so's partial definition.
     const OrchOps *ops;
-    ScopeMode pending_scope_mode;
 
     // The orchestrator this call submits into. Host-owned, with non-trivial
     // scratch; outlives the call but not the bind that created it.
@@ -251,14 +250,11 @@ struct OrchContext {
     RuntimeContext *rt;
 };
 
-// The .so compiles against the two-field partial definition in orchestration_api.h
-// and reaches both members through it, so their offsets are an ABI the compiler
+// The .so compiles against the ops-pointer partial definition in orchestration_api.h
+// and reaches that member through it, so its offset is an ABI the compiler
 // cannot otherwise see across the two translation units. The partial definition
-// carries the same pair of assertions.
+// carries the same assertion.
 static_assert(offsetof(OrchContext, ops) == 0, "OrchContext ops layout drift");
-static_assert(
-    offsetof(OrchContext, pending_scope_mode) == sizeof(const OrchOps *), "OrchContext pending_scope_mode layout drift"
-);
 
 // =============================================================================
 // Orchestrator Profiling Data

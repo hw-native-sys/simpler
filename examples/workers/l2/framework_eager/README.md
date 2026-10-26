@@ -19,6 +19,7 @@ DEVICE-controlled updates to caller-owned storage.
 | `preflight_recovery.py` | Stale Buffer registration and wrong caller context are refused before acceptance; the same Worker then completes three healthy requests |
 | `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
 | `persistent_state.py` | Twelve DEVICE-controlled weighted cache updates, unchanged guards and weights, zero acceptance and revisited rows |
+| `argument_capture.py` | Per-call OFF/FULL/HYBRID/OFF ArgsDump snapshots, exact task-time payloads and a runtime-owned intermediate |
 
 Public `Worker.close()` drains accepted direct-chip runs through their normal
 RunHandle completion and retirement path before checking workspace ownership.
@@ -197,3 +198,22 @@ strides or cross-tile overlap, A5 and capture remain separate qualification.
 
 This is a reference consumer of the existing eager contract, not acceptance of
 PyPTO production dispatch, vLLM/model numerics, A5 or capture/replay.
+
+## Per-call argument capture
+
+`argument_capture.py` submits two dependent vector-add tasks per call:
+`mid = A + B`, then `out = mid + B`. The intermediate is created by the runtime;
+only A, B and out are caller arguments. A is a contiguous one-dimensional view
+with a nonzero caller backing offset; B, out and mid have two-dimensional
+geometry. The L2 adapter folds the view offset into its address and exports
+zero native start offsets. Task attribution uses these materialized shapes,
+not an ordering of opaque task IDs.
+
+Four queued calls select argument capture OFF/FULL/HYBRID/OFF. FULL checks all
+six task arguments; HYBRID checks the three marked arguments. Exact payload
+bytes, before/after stages, geometry, epoch and completeness are checked after
+the final framework boundary and retirement. Torch successors independently
+check final outputs and caller backing guards. Mutating the accepted caller
+config and prefix must not change the selected capture or export destination.
+Unknown outcomes retain every caller/runtime owner. This qualifies the bounded
+reference workload, not capture/replay or arbitrary task graphs.

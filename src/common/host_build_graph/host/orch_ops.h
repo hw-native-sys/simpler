@@ -40,15 +40,15 @@
 
 // Every op runs on the host and takes the orchestration context, so this table
 // belongs to orchestration rather than to the device-side runtime. The
-// orchestration .so sees OrchContext as an incomplete type plus the two-field
+// orchestration .so sees OrchContext as an incomplete type plus the ops-pointer
 // partial definition in orchestration_api.h; the host sees the full struct in
-// host/orchestrator.h. Both agree on the first two fields, which is what makes
+// host/orchestrator.h. Both agree on the first field, which is what makes
 // the partial definition well-defined.
 struct OrchContext;
 
 struct OrchOps {
     TaskOutputTensors (*submit_task)(OrchContext *ctx, const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
-    void (*scope_begin)(OrchContext *ctx);
+    void (*scope_begin)(OrchContext *ctx, ScopeMode mode);
     void (*scope_end)(OrchContext *ctx);
     void (*orchestration_done)(OrchContext *ctx);
     bool (*is_fatal)(OrchContext *ctx);

@@ -78,11 +78,7 @@ static void graph_commit_impl(OrchContext *ctx) {
     if (ctx != nullptr) ctx->orchestrator->graph_commit();
 }
 
-void rt_scope_begin(OrchContext *ctx) {
-    ScopeMode mode = ctx->pending_scope_mode;
-    ctx->pending_scope_mode = ScopeMode::AUTO;
-    ctx->orchestrator->begin_scope(mode);
-}
+void rt_scope_begin(OrchContext *ctx, ScopeMode mode) { ctx->orchestrator->begin_scope(mode); }
 
 void rt_scope_end(OrchContext *ctx) { ctx->orchestrator->end_scope(); }
 

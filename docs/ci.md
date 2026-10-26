@@ -351,7 +351,11 @@ perform twelve DEVICE cursor/count-controlled weighted updates to one cache,
 including zero acceptance and revisited rows. Framework snapshots check the
 entire backing against an independent multi-step reference, guards and unchanged
 weights. No host control readback decides later kernel work. A session-scoped fixture
-compiles the shared host bridge once. The client wait is bounded at 15 minutes,
+compiles the shared host bridge once. Argument-capture cases queue four
+OFF/FULL/HYBRID/OFF calls, each with two dependent tasks and a runtime-owned
+intermediate. They verify exact task-time payloads, materialized geometry and
+per-call export ownership as well as Torch outputs and guards; they enter the
+same dynamic plan without a workflow case list. The client wait is bounded at 15 minutes,
 including queueing; the execution watchdog is also 15 minutes. Individual
 subprocess timeouts do not reserve additional aggregate execution time.
 

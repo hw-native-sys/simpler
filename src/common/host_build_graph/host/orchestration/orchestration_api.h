@@ -63,9 +63,8 @@
 /**
  * Partial OrchContext definition for orchestration.
  *
- * Exposes the ops pointer (for runtime calls) and pending_scope_mode
- * (read directly by inline scope wrappers). The full struct (in
- * host/orchestrator.h) has the same first fields, so accessing them through
+ * Exposes the ops pointer for runtime calls. The full struct (in
+ * host/orchestrator.h) has the same first field, so accessing it through
  * this definition is well-defined (C struct layout guarantee). The full one
  * stays out of here because it names OrchestratorState and HostTensorAccessor,
  * which the orchestration .so has no link dependency on.
@@ -75,17 +74,13 @@
  */
 struct OrchContext {
     const OrchOps *ops;
-    ScopeMode pending_scope_mode;
 };
 
 // The host library compiles the full definition in host/orchestrator.h, which
-// carries three more members after these two. Both sides assert the same offsets
+// carries three more members after this one. Both sides assert the same offset
 // so a reorder on either one fails to compile rather than silently disagreeing
 // across the two translation units.
 static_assert(offsetof(OrchContext, ops) == 0, "OrchContext ops layout drift");
-static_assert(
-    offsetof(OrchContext, pending_scope_mode) == sizeof(const OrchOps *), "OrchContext pending_scope_mode layout drift"
-);
 
 // =============================================================================
 // Inline Convenience Wrappers (call through ops table)
@@ -274,8 +269,7 @@ static inline void rt_scope_begin(ScopeMode mode = ScopeMode::AUTO) {
     if (ctx->ops->is_fatal(ctx)) {
         return;
     }
-    ctx->pending_scope_mode = mode;
-    ctx->ops->scope_begin(ctx);
+    ctx->ops->scope_begin(ctx, mode);
 }
 
 static inline void rt_scope_end() {
@@ -418,8 +412,7 @@ public:
     explicit ScopeGuard(ScopeMode mode = ScopeMode::AUTO) :
         ctx_(current_orch_context()) {
         if (!ctx_->ops->is_fatal(ctx_)) {
-            ctx_->pending_scope_mode = mode;
-            ctx_->ops->scope_begin(ctx_);
+            ctx_->ops->scope_begin(ctx_, mode);
         }
     }
     ~ScopeGuard() {
