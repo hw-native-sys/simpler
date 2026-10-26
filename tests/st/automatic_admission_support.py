@@ -510,7 +510,9 @@ class AutomaticAdmissionScene(SceneTestCase):
         trace = stream_evidence._RunTrace(worker) if tmr else evidence._RunTrace(worker)
         good_error, failure_error = None, None
         cleanup_errors = []
-        with entries(worker) as views:
+        with contextlib.ExitStack() as exports, entries(worker) as views:
+            # A retained run error can keep this frame alive through its traceback.
+            exports.callback(tensors.clear)
             case_runs = evidence._CaseRuns(views)
             try:
                 good = self.submit(worker, buffers)
@@ -523,6 +525,7 @@ class AutomaticAdmissionScene(SceneTestCase):
                     "good predecessor launched",
                 )
                 bad_buffers, bad_tensors = self.group(worker)
+                exports.callback(bad_tensors.clear)
                 if self._st_runtime == "host_build_graph":
                     # The HBG callback reports its failure before device launch.
                     with pytest.raises(RuntimeError):
@@ -716,6 +719,8 @@ class AutomaticTwoEndpointScene(AutomaticAdmissionScene):
                         tensors[2], torch.full_like(tensors[2], self.expected((2.0, 7.0)[index]))
                     )
         finally:
+            for _, tensors in groups:
+                tensors.clear()
             st_worker.close()
             if thread:
                 thread.join(_TIMEOUT)

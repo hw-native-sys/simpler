@@ -276,6 +276,7 @@ from .global_comm_domain import (
     resolve_global_comm_capability,
     validate_descriptor_table,
 )
+from .host_ddr import HostMappingRegistry
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import (
     Orchestrator,
@@ -302,6 +303,7 @@ from .task_interface import (
     PROV_NOT_LIVE,
     SIMPLER_TEARDOWN_REPORT_BYTES,
     TEARDOWN_REPORT_SCHEMA,
+    ArgDirection,
     CallConfig,
     ChipCallable,
     ChipDomainContext,
@@ -12657,6 +12659,9 @@ class Worker:
         if identities:
             assert self._device_buffer_source is not None
             self._device_buffer_source.release(identities)
+        registry = self._chip_import_registry
+        if registry is not None and registry.host_mappings is not None:
+            registry.host_mappings.release(run_id)
 
     def _record_device_alloc(self, handle: Buffer, *, domain_allocation_id: int | None = None) -> None:
         """Make ``handle`` a live device allocation operands may name. Caller holds ``_child_prov_lock``.
@@ -13507,20 +13512,36 @@ class Worker:
     # ------------------------------------------------------------------
 
     def create_buffer(self, nbytes: int) -> Buffer:
-        """Allocate a shared ``Buffer`` owned by this Worker (P1-B).
-
-        The backing is a POSIX shm; the Buffer carries a typed canonical identity and a
-        self-describing descriptor, so a consumer can resolve it with no prior handshake: the
-        descriptor travels embedded in every ``Tensor`` built over this Buffer and the consumer
-        materializes it lazily on first receipt (map-once, keyed by canonical identity). At L3+ that
-        consumer is a forked child; at L2 (a leaf, no children) the Worker itself materializes the
-        tensor in-process on ``run``. Build a tensor over ``buffer.shm.buf`` with the buffer protocol.
-        Not thread-safe against a concurrent run/create/free on the same Worker.
-        """
+        """Allocate ordinary shared Host storage owned by this Worker."""
         if self.level < 2:
             raise TypeError("create_buffer requires a level >= 2 Worker")
         with self._operation_lease("create_buffer", allow_continuation=True):
             return self._create_buffer_locked(int(nbytes))
+
+    def _l2_import_registry(self) -> ImportRegistry:
+        with self._registry_lock:
+            if self._chip_import_registry is None:
+                registry = ImportRegistry(
+                    ImportContext(deployment=DEVICE_AICPU, device_owner_instance_id=self._owner_instance_id)
+                )
+                owner = weakref.ref(self)
+                chip = self._chip_worker
+                environment = getattr(chip, "_execution_environment", None)
+
+                def lookup(identity):
+                    worker = owner()
+                    return None if worker is None else worker._buffers.get(int(identity.buffer_id))
+
+                registry.host_mappings = HostMappingRegistry(
+                    chip,
+                    lambda: (worker := owner()) is not None
+                    and worker._chip_worker is chip
+                    and getattr(chip, "_execution_environment", None) == environment
+                    and not worker._source_context_failed,
+                    lookup,
+                )
+                self._chip_import_registry = registry
+            return self._chip_import_registry
 
     def alloc_shared_tensor(self, shapes: tuple[int, ...], dtype) -> Buffer:
         """Allocate a runtime-managed intermediate buffer (the ``Tensor`` form of ``orch.alloc``).
@@ -13686,21 +13707,14 @@ class Worker:
         two checks run sequentially rather than under one shared lock. Neither is checked once
         ``buffer`` is already closed, matching ``Buffer.close()``'s own idempotency.
 
-        Unlike ``Worker.free``, this L2 check is a sample rather than a fence: it reads the set,
-        releases ``_registry_lock``, and only then closes the backing, so a submission accepted in
-        between still maps an identity this call is about to unlink. ``free`` closes that window by
-        rechecking under the chip lock a direct L2 submission publishes beneath; there is no
-        equivalent lock spanning a host backing's close, and adding one is P2 lifecycle work
-        (``docs/buffer-abi.md``).
+        Owned Host backing has a second fence in ``Buffer.close``: acquisition and close
+        share its owner lock, so a first submission cannot register released storage. Busy
+        close leaves admission open. Live Python exports also prevent close before teardown.
 
-        The entry survives a failed close, so ``_release_all_buffers`` still reports the leak at
-        close() rather than losing it here — the import-cache broadcast only fires once close() has
-        actually succeeded, so a failed release never tells a descendant to drop a mapping the owner
-        still considers live. The converse does not hold, and is the one asymmetry here: a
-        ``Buffer.close()`` whose ``shm.close()`` raises has still unlinked the name (its ``finally``
-        runs the unlink), so the backing can be nameless while descendants keep mappings this call
-        never told them to drop. A descendant materializing that identity afterwards gets the named
-        ``FileNotFoundError`` from ``ImportRegistry.materialize``, not a silent bad mapping.
+        The entry survives a failed close, so ``_release_all_buffers`` can retry it. Import-cache
+        invalidation happens only after close succeeds. Once exports and native registrations
+        retire, unlink is attempted even if local shm close fails. The surviving owner entry
+        retains that mapping for cleanup retry; an already successful unlink is not repeated.
 
         The slot is dropped only when it still holds *this* buffer: a buffer_id minted elsewhere can
         collide with a registry key, and evicting the live entry it names would strand that
@@ -14265,6 +14279,34 @@ class Worker:
                     return handle
         return None
 
+    @staticmethod
+    def _validate_map_aliases(target, args):
+        for i in range(args.tensor_count()):
+            if args.transfer(i) != TensorTransfer.MAP:
+                continue
+            mapped = args.tensor(i)
+            for j in range(args.tensor_count()):
+                if args.transfer(j) != TensorTransfer.H2D:
+                    continue
+                copied = args.tensor(j)
+                if mapped.buffer.identity != copied.buffer.identity:
+                    continue
+                readonly = target is not None and all(
+                    k < target.sig_count and target.sig(k) == ArgDirection.IN for k in (i, j)
+                )
+                if readonly:
+                    continue
+
+                def extent(tensor):
+                    return get_element_size(tensor.dtype) * (
+                        1 + sum((size - 1) * stride for size, stride in zip(tensor.shapes, tensor.strides))
+                    )
+
+                if mapped.byte_offset < copied.byte_offset + extent(copied) and copied.byte_offset < (
+                    mapped.byte_offset + extent(mapped)
+                ):
+                    raise ValueError("overlapping H2D/MAP arguments with a writer are unsupported")
+
     def _prepare_l2_args(
         self,
         callable_id: int,
@@ -14288,6 +14330,9 @@ class Worker:
         if borrowed and any(args.transfer(i) == TensorTransfer.H2D for i in range(args.tensor_count())):
             raise ValueError("borrowed submission does not copy HOST tensors to DEVICE")
         _validate_host_control_access(self._callable_registry.get(callable_id), args)
+        if borrowed and any(args.transfer(i) == TensorTransfer.MAP for i in range(args.tensor_count())):
+            raise ValueError("MAP requires an owning direct L2 Worker context")
+        self._validate_map_aliases(self._callable_registry.get(callable_id), args)
         touched = self._identities_in_args(args)
         # Device identity validation and accepted-use publication share free's chip lock.
         # After publication, the touched set refuses free through run finalization, including
@@ -14317,6 +14362,10 @@ class Worker:
                 if sources:
                     self._chip_source_uses[run_id] = sources
         try:
+            registry = self._l2_import_registry()
+            if registry.host_mappings is not None:
+                registry.host_mappings.acquire(run_id, args)
+
             chip_args = self._materialize_l2_args(args)
             target = self._callable_registry.get(callable_id)
             directions = [target.sig(i) for i in range(target.sig_count)] if target is not None else []
@@ -14438,6 +14487,11 @@ class Worker:
                     handle._error = exc
                 handle._framework_source_release_unknown = True
                 raise handle._error
+        # Host release is idempotent by run id. A retry keeps the run records
+        # but cannot repeat a Device-source decrement already committed above.
+        registry = self._chip_import_registry
+        if registry is not None and registry.host_mappings is not None:
+            registry.host_mappings.release(run_id)
         handle._native_submission._retire()
         # No fallible source release remains after removing these records.
         with self._registry_lock:
@@ -14523,6 +14577,8 @@ class Worker:
         return self._chip_runs.get(run_id)
 
     def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
+        if args is not None and any(args.transfer(i) == TensorTransfer.MAP for i in range(args.tensor_count())):
+            raise ValueError("MAP requires a direct L2 Worker; L3 preparation is unsupported")
         assert self._orch is not None
         assert self._worker is not None
         if getattr(cfg, "output_prefix", ""):
@@ -14811,22 +14867,13 @@ class Worker:
         ``args`` is a ``TaskArgs`` or ``None`` (no args). The chip-only POD
         ``ChipStorageTaskArgs`` is not accepted here; this boundary requires address-free ``TaskArgs``.
         """
-        registry = self._chip_import_registry
-        if registry is None:
-            # This worker runs its own chip in-process (no fork, no mailbox): it is its own device
-            # endpoint, so DEVICE backings it materializes must be its own.
-            context = ImportContext(
-                deployment=DEVICE_AICPU,
-                device_owner_instance_id=self._owner_instance_id,
-            )
-            registry = ImportRegistry(context)
-            self._chip_import_registry = registry
-        if args is None:
-            args = TaskArgs()
-        return _materialize_chip_task_args(args, registry)
+        registry = self._l2_import_registry()
+        return _materialize_chip_task_args(TaskArgs() if args is None else args, registry)
 
     def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
         """Materialize an L2 leaf's tensor args and run the kernel to completion."""
+        if args is not None and any(args.transfer(i) == TensorTransfer.MAP for i in range(args.tensor_count())):
+            raise ValueError("MAP requires Worker.run/submit lifetime reservations")
         _validate_host_control_access(self._callable_registry.get(callable_id), TaskArgs() if args is None else args)
         chip_args = self._materialize_l2_args(args)
         assert self._chip_worker is not None
@@ -15681,11 +15728,17 @@ class Worker:
                     except BaseException as exc:  # noqa: BLE001
                         if self._framework_observation_roots or exc is not self._framework_observation_error:
                             raise
+                    registry = self._chip_import_registry
+                    if registry is not None and registry.host_mappings is not None:
+                        registry.host_mappings.close_idle()
                     # Zero from exceptional owner close proves terminal teardown;
                     # a run error does not supply that proof or block its attempt.
                     self._chip_worker.finalize()
                     for run_id in tuple(self._chip_source_uses.keys() | self._chip_call_values.keys()):
                         self._release_source_uses(run_id)
+                    registry = self._chip_import_registry
+                    if registry is not None and registry.host_mappings is not None:
+                        registry.host_mappings.release_after_context_close()
                     with self._registry_lock:
                         self._chip_runs.clear()
                         self._chip_run_touched_identities.clear()

@@ -97,7 +97,7 @@ entire rank window, including page-alignment padding; use `buffer_range(name)`
 to select a named slice. All named buffers on a rank share that mapping.
 `buffer.tensor(...)` already names the selected slice through
 its owning Device's mapping; its task argument uses the ordinary domain-buffer
-path, without `map_view` or a whole-table H2D copy.
+path, without a per-call MAP request or a whole-table H2D copy.
 
 Host table partitioning is a business decision. The two rank windows can hold
 different shards, replicas, or independent tables. The library associates each

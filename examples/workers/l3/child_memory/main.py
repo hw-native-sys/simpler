@@ -143,7 +143,7 @@ def run(platform: str, device_id: int) -> int:
 
     torch.manual_seed(0)
     f32 = DataType.FLOAT32
-    a = w = f1 = f2 = None
+    a = w = f1 = f2 = got = None
     try:
         # Born-shared input/output buffers (post-fork). The chip child maps each backing by name, so
         # torch is used only here at the run boundary to fill the inputs and read the outputs.
@@ -194,7 +194,7 @@ def run(platform: str, device_id: int) -> int:
         assert torch.equal(f1, f2), "f1 and f2 diverged — weight buffer was not preserved"
         print("[child_memory] golden + cross-invocation checks PASSED")
     finally:
-        a = w = f1 = f2 = None  # drop views before close unlinks the shm
+        a = w = f1 = f2 = got = None  # drop views before close unlinks the shm
         worker.close()
     return 0
 

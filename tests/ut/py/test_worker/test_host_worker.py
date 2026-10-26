@@ -8457,11 +8457,12 @@ class TestChipChildCopyHandles:
             src_view, dst_view = src_shm.buf, dst_shm.buf
             assert src_view is not None
             assert dst_view is not None
-            src_view[:64] = payload
-            assert bytes(dst_view[:64]) != payload
-            hw.copy_to(device, src)
-            hw.copy_from(dst, device)
-            assert bytes(dst_view[:64]) == payload
+            with src_view, dst_view:
+                src_view[:64] = payload
+                assert bytes(dst_view[:64]) != payload
+                hw.copy_to(device, src)
+                hw.copy_from(dst, device)
+                assert bytes(dst_view[:64]) == payload
 
 
 class TestChipMainLoopDigestRegister:

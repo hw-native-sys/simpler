@@ -403,3 +403,11 @@ TEST(RemoteWire, RejectsTransferThatTheProtocolWouldLose) {
         EXPECT_THROW((void)remote_l3::encode_remote_task_args(args), std::runtime_error);
     }
 }
+
+TEST(RemoteWire, MapRequestCannotBeSilentlyDroppedByRemoteEncoding) {
+    remote_l3::RemoteTaskArgsWire args;
+    args.tensors.push_back(remote_arg_tensor());
+    args.tensors[0].buffer.address_space = static_cast<uint8_t>(AddressSpace::HOST);
+    args.transfers.push_back(TensorTransfer::MAP);
+    EXPECT_THROW((void)remote_l3::encode_remote_task_args(args), std::runtime_error);
+}

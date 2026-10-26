@@ -109,9 +109,55 @@ it is the resolved `addr` + `size`. That is the whole of what materialization do
 `AddressSpace` describes the backing's physical HOST/DEVICE location. `Tensor` holds
 only the backing descriptor and view geometry. `TensorTransfer` belongs to each
 TaskArgs entry: `NONE` borrows storage, `H2D` requests Program-managed device storage,
-and `D2H` is reserved and rejected. Callable direction still controls input copies
+`MAP` requests local direct Device access to Host storage, and `D2H` is reserved
+and rejected. Callable direction still controls input copies
 and output copy-back; H2D does not mean every argument is copied in. Buffer identity,
 import grants and `TensorArgType` access checks are unchanged.
+
+`Worker.create_buffer(nbytes)` retains ordinary shared Host backing and its native
+grant. A direct A5 L2 Worker accepts an explicit per-call mapping request:
+
+```python
+buffer = l2.create_buffer(nbytes)
+tensor = buffer.tensor(shape, DataType.BFLOAT16)
+args.add_tensor(tensor, TensorArgType.INPUT, transfer=TensorTransfer.MAP)
+l2.submit(entry, args).wait()  # entry declares IN; MTE finishes before completion
+l2.release_buffer(buffer)
+```
+
+`add_tensor` records MAP without registering memory or changing the Tensor. During
+submission the owning L2 Worker validates the source grant, retains the Buffer,
+and registers its whole POSIX_SHM backing in the current A5 context. Registration
+uses ACL HostRegister/GetDevicePointer and is cached until Buffer release. No
+table-sized Device replica is allocated. Subsequent calls and views reuse the
+registration while preserving their own offsets and geometry.
+
+The ImportRegistry resolves each argument separately as `(base, address_space,
+execution_transfer)`. MAP lowers to the mapped Device base with DEVICE/NONE;
+native NONE and H2D entries keep their own address and transfer. Canonical Buffer
+identity remains common for grants, aliasing and dependency tracking. Overlapping
+H2D/MAP arguments with a callable writer are rejected before preparation.
+
+Tensor remains 144 bytes and BufferDescriptor 88 bytes. Byte 141 is the per-call
+transfer carrier; bytes 142–143 remain padding. No mapping reference is stored in
+a Tensor or transmitted on the wire. Mapping ownership stays in the consumer's
+registry. MAP forwarding to L3+, remote workers, Host compute leaves, borrowed L2
+contexts and unresolved native ChipWorker execution is unsupported and rejected.
+
+MAP supports callable IN / OUT / INOUT and ordinary TensorArgType grant checks.
+Device writes go directly to Host backing without a D2H copy. Finish CPU writes
+before submission; wait for Device writers before reading their results on CPU,
+and for all Device uses before modifying or releasing Host storage. Successful
+completion releases the call's uses but keeps the cached registration. Failed
+direct and queued calls also release uses when native last-use and cleanup proofs
+permit it. Framework completion also retires owned HOST/NONE uses on borrowed
+contexts before publishing terminal state; unknown completion retains those uses.
+Exceptional owner teardown unregisters idle cache entries before
+finalizing the device context, while retaining mappings with unproven uses. Busy
+release refuses without revoking admission. Once unregister begins, failed cleanup
+retains backing/context and rejects new uses until cleanup succeeds. Unknown
+completion retains resources. Python memoryviews and derived NumPy arrays must
+also be released before closing backing. See the [example](../examples/a5/tensormap_and_ringbuffer/host_ddr_gather/README.md).
 
 ```python
 view = Tensor(buffer, shapes=(16,), dtype=DataType.FLOAT32)
@@ -127,8 +173,9 @@ changes `view`. Omitted transfer in `TaskArgs.add_tensor` or the transitional L2
 `address_space`. Both spellings use the same add-time defaults.
 
 Mailbox slots preserve each request in byte 141, formerly reserved view padding;
-standalone Tensor values do not carry it. Re-export and L2 materialization preserve
-the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE.
+standalone Tensor values do not carry it. Re-export preserves the request alongside
+the view. L2 materialization lowers MAP to DEVICE/NONE and preserves native requests.
+Chip binders accept HOST/H2D and DEVICE/NONE.
 HBG also accepts HOST/NONE with a declared IN/OUT/INOUT direction; TMR device
 orchestration returns UNSUPPORTED for it. Invalid location/transfer pairs return
 INVALID_ARGUMENT before tensor content copying or device allocation. HOST/H2D also requires canonical
@@ -329,18 +376,17 @@ read outputs) or **inside a Python sub-worker** (a compute leaf):
 
 ```python
 h = worker.create_buffer(n * 4)
-torch.frombuffer(h.shm.buf, dtype=torch.float32, count=n).fill_(5.0)  # before run()
+torch.frombuffer(h.host_view(), dtype=torch.float32, count=n).fill_(5.0)  # before run()
 worker.run(my_orch, ...)                                             # orch names tensors only
-result = torch.frombuffer(out_h.shm.buf, dtype=torch.float32, count=n)  # after run()
+result = torch.frombuffer(out_h.host_view(), dtype=torch.float32, count=n)  # after run()
 ```
 
-> **`h.shm` is transitional — wrap it.** Byte access belongs on the view, not on the
-> backing object: a `POSIX_SHM` buffer has an `shm` and a device one never will, so
-> code written against `h.shm.buf` forks by backend and cannot be told "this backing
-> has no host mapping" — it just gets `None`. The accessor that replaces it lands with
-> the view algebra; until then, put `h.shm.buf` behind one helper of your own so the
-> switch is a one-line change. Note also that a `frombuffer` tensor keeps the
-> memoryview alive: drop it before `close()`, or the release raises `BufferError`.
+Use `buffer.host_view()` to export a local Host memoryview independently of its
+backing implementation. Device or closed Buffers reject this operation. Release
+the export and any derived views before closing storage; a live buffer-protocol
+export prevents the underlying mapping from closing. Existing `.shm.buf` callers
+remain supported. Libraries that extract raw pointers must keep the export alive
+for the duration of their use. CPU writes are not synchronized with device readers.
 
 ## How a tensor reaches its consumer (three-way split)
 
@@ -357,7 +403,7 @@ A `Tensor` on the wire is materialized differently by each consumer:
 
 | Consumer | What it does |
 | -------- | ------------ |
-| **Chip leaf (L2 runtime)** | Decode the POD blob with `read_args_from_blob`, then materialize each one to a `ChipTensor` (map-once, keyed by canonical identity) via `ImportRegistry.materialize_args`, including **strided** views, and submit with `_submit_chip_run_materialized`. |
+| **Chip leaf (L2 runtime)** | Decode the POD blob with `read_args_from_blob`, then materialize each one to a `ChipTensor` (native identity or validated mapping reference) via `ImportRegistry.materialize_args`, including **strided** views, and submit with `_submit_chip_run_materialized`. |
 | **Python sub-worker** (compute) | Map each one into a `MappedArg`; the callable computes with `torch.frombuffer(arg.buffer, ...)`. No `ChipTensor`. |
 | **Nested L4→L3 orch** (forwarding) | **Re-export** each backing to a descriptor `H'` that keeps the source's canonical identity — no pass-through, no map on the forwarding hop. |
 
