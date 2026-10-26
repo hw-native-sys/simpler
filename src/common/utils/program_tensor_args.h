@@ -41,6 +41,10 @@ inline int validate_program_tensor_transfers(
         const auto &t = args->tensor(i);
         const char *reason = tensor_transfer_error(t.address_space, t.transfer);
         int status = PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        if (t.transfer == TensorTransfer::MAP) {
+            reason = "MAP requires Worker submission preparation";
+            status = PTO_RUNTIME_ERR_UNSUPPORTED;
+        }
         if (reason == nullptr && t.address_space == AddressSpace::HOST) {
             status = PTO_RUNTIME_ERR_UNSUPPORTED;
             if (t.transfer == TensorTransfer::NONE) {

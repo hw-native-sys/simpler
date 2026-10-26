@@ -109,6 +109,56 @@ def test_prepare_is_not_submit_and_unregister_refusal_preserves_handle(prepared)
     chip.worker.unregister(chip.callable)
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+def test_prepared_map_keeps_device_binding_and_reservation_through_retirement(prepared, monkeypatch, cancel):
+    import ctypes  # noqa: PLC0415
+    import struct  # noqa: PLC0415
+
+    from simpler.buffer import AddressSpace  # noqa: PLC0415
+    from simpler.task_interface import ArgDirection, ChipCallable, DataType, TaskArgs, TensorTransfer  # noqa: PLC0415
+
+    chip, pending = prepared
+    unmapped = []
+    monkeypatch.setattr(chip.impl, "_host_ddr_mapping_supported", True, raising=False)
+    monkeypatch.setattr(chip.impl, "_map_host_ddr", lambda *_: 0x40000000, raising=False)
+    monkeypatch.setattr(chip.impl, "_unmap_host_ddr", unmapped.append, raising=False)
+    entry = chip.worker.register(
+        ChipCallable.build(
+            signature=[ArgDirection.IN, ArgDirection.IN], func_name="map_probe", binary=b"\0", children=[]
+        )
+    )
+    table = chip.worker.create_buffer(64)
+    with table.host_view() as memory:
+        struct.pack_into("<i", memory, 16, 17)
+    tensor = table.tensor((4,), DataType.INT32, byte_offset=16)
+    args = TaskArgs()
+    args.add_tensor(tensor, transfer=TensorTransfer.NONE)
+    args.add_tensor(tensor, transfer=TensorTransfer.MAP)
+
+    handle = chip.worker.prepare_submission(entry, args, caller_stream=123)
+    bound = pending[0].values[1]
+    assert bound.tensor(0).data != table.base + 16
+    assert ctypes.c_int32.from_address(bound.tensor(0).data).value == 17
+    assert bound.tensor(1).data == 0x40000010
+    assert bound.tensor(1).address_space == AddressSpace.DEVICE
+    assert bound.transfer(1) == TensorTransfer.NONE
+    assert args.tensor(1).buffer.address_space == AddressSpace.HOST
+    assert args.transfer(1) == TensorTransfer.MAP
+    with pytest.raises(RuntimeError, match="in-flight"):
+        chip.worker.release_buffer(table)
+    assert not unmapped
+
+    if cancel:
+        assert handle.cancel()
+    else:
+        pending[0].submit()
+        handle.wait()
+    assert pending[0].retired
+    assert not chip.worker._chip_import_registry.host_mappings._uses
+    chip.worker.release_buffer(table)
+    assert table.closed and unmapped == [table.base]
+
+
 def test_cancel_wakes_wait_and_retires_owners(prepared):
     chip, pending = prepared
 

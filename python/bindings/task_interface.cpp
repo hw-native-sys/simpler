@@ -1777,29 +1777,38 @@ CtypesFormat classify_ctypes_format(const char *format) {
     }
 }
 
-// Resolve one wire tensor onto a local base and build the address-bearing device POD.
-// `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
-// materializing each embedded descriptor.
-ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict resolved) {
-    uint64_t elem = get_element_size(r.dtype);
-    if (elem == 0) {
-        throw std::runtime_error("materialize: unknown dtype");
+// Each binding belongs to one argument, including aliases with different access requests.
+ChipTensor materialize_one(const Tensor &r, TensorTransfer request, nb::tuple binding) {
+    validate_tensor(r);
+    if (binding.size() != 3) throw std::invalid_argument("materialize: expected base, address space and transfer");
+    const auto base = nb::cast<uint64_t>(binding[0]);
+    const auto space_value = nb::cast<int>(binding[1]);
+    const auto transfer_value = nb::cast<int>(binding[2]);
+    if ((space_value != static_cast<int>(AddressSpace::HOST) &&
+         space_value != static_cast<int>(AddressSpace::DEVICE)) ||
+        (transfer_value != static_cast<int>(TensorTransfer::NONE) &&
+         transfer_value != static_cast<int>(TensorTransfer::H2D))) {
+        throw std::invalid_argument("materialize: invalid execution placement or transfer");
     }
-    if (r.byte_offset % elem != 0) {
-        throw std::runtime_error("materialize: byte_offset is not a multiple of dtype size");
+    const auto space = static_cast<AddressSpace>(space_value);
+    const auto transfer = static_cast<TensorTransfer>(transfer_value);
+    const bool mapped = request == TensorTransfer::MAP;
+    if (mapped) {
+        if (r.buffer.address_space != static_cast<uint8_t>(AddressSpace::HOST) || space != AddressSpace::DEVICE ||
+            transfer != TensorTransfer::NONE) {
+            throw std::invalid_argument("materialize: MAP requires a prepared DEVICE/NONE binding");
+        }
+    } else if (space != static_cast<AddressSpace>(r.buffer.address_space) || transfer != request) {
+        throw std::invalid_argument("materialize: native binding differs from the argument request");
     }
-    nb::object key = nb::cast(r.buffer.identity);
-    if (!resolved.contains(key)) {
-        throw std::runtime_error("materialize: canonical identity not in the import registry");
+    if (const char *error = tensor_transfer_error(space, transfer)) throw std::invalid_argument(error);
+    const uint64_t extent = tensor_extent_bytes(r);
+    if (!base || base > UINT64_MAX - r.byte_offset || base + r.byte_offset > UINT64_MAX - extent) {
+        throw std::invalid_argument("materialize: invalid address range");
     }
-    nb::tuple val = nb::cast<nb::tuple>(resolved[key]);
-    auto base = nb::cast<uint64_t>(val[0]);
-    auto addr_space = nb::cast<int>(val[1]);
-    // The view origin is base + byte_offset (start_offset folded into addr); strides carry any
-    // non-row-major layout (transpose / permute / step-slice), which ChipTensor expresses natively.
     return make_tensor_strided(
         reinterpret_cast<void *>(static_cast<uintptr_t>(base + r.byte_offset)), r.shapes, r.strides, r.ndims, r.dtype,
-        static_cast<AddressSpace>(addr_space), transfer
+        space, transfer
     );
 }
 
@@ -2252,7 +2261,8 @@ NB_MODULE(_task_interface, m) {
     nb::enum_<TensorTransfer>(m, "TensorTransfer", nb::is_arithmetic())
         .value("NONE", TensorTransfer::NONE)
         .value("H2D", TensorTransfer::H2D)
-        .value("D2H", TensorTransfer::D2H);
+        .value("D2H", TensorTransfer::D2H)
+        .value("MAP", TensorTransfer::MAP);
 
     nb::enum_<AccessMode>(m, "AccessMode", nb::is_arithmetic())
         .value("READ", AccessMode::READ)
@@ -4008,6 +4018,9 @@ NB_MODULE(_task_interface, m) {
             "supports_concurrent_native_prepare", &ChipWorker::supports_concurrent_native_prepare,
             "Whether non-diagnostic native preparation may overlap one active run in another slot."
         )
+        .def_prop_ro("_host_ddr_mapping_supported", &ChipWorker::host_ddr_mapping_supported)
+        .def("_map_host_ddr", &ChipWorker::map_host_ddr, nb::call_guard<nb::gil_scoped_release>())
+        .def("_unmap_host_ddr", &ChipWorker::unmap_host_ddr, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "launch_depth", &ChipWorker::launch_depth,
             "How many runs this worker may have launched at once, after its request was resolved "
@@ -4234,10 +4247,12 @@ NB_MODULE(_task_interface, m) {
 
     m.def(
         "materialize_task_args",
-        [](const TaskArgs &args, nb::dict resolved) -> ChipStorageTaskArgs {
+        [](const TaskArgs &args, nb::list resolved) -> ChipStorageTaskArgs {
+            if (resolved.size() != static_cast<size_t>(args.tensor_count()))
+                throw std::invalid_argument("materialize: argument binding count mismatch");
             ChipStorageTaskArgs out;
             for (int32_t i = 0; i < args.tensor_count(); i++) {
-                out.add_tensor(materialize_one(args.tensor(i), args.transfer(i), resolved));
+                out.add_tensor(materialize_one(args.tensor(i), args.transfer(i), nb::cast<nb::tuple>(resolved[i])));
             }
             for (int32_t i = 0; i < args.scalar_count(); i++) {
                 out.add_scalar(args.scalar(i));
@@ -4247,12 +4262,11 @@ NB_MODULE(_task_interface, m) {
         nb::arg("args"), nb::arg("resolved"),
         "Materialize a TaskArgs held in this process into the runtime.so-ABI ChipStorageTaskArgs "
         "POD — the sole path to that POD, whether the args are an L2 leaf's own or a chip child's "
-        "read back from its mailbox with read_args_from_blob. Each tensor's embedded buffer "
-        "identity is resolved via `resolved` {CanonicalIdentity: (local_base, address_space)}; "
-        "addr = base + byte_offset. The caller pre-populates `resolved` by materializing each "
-        "embedded descriptor on first receipt. Strided views (transpose / permute / step-slice) "
-        "materialize to strided ChipTensors. Rejects an unknown identity and a non-dtype-aligned "
-        "byte_offset."
+        "read back from its mailbox with read_args_from_blob. Each tensor "
+        "is bound through the corresponding resolved list entry (base, address_space, execution_transfer). "
+        "MAP entries require DEVICE/NONE; native requests preserve placement and transfer. "
+        "The caller retains the validated registration and backing through execution. "
+        "The byte offset is applied once, and strided views retain their geometry."
     );
 
     m.def(

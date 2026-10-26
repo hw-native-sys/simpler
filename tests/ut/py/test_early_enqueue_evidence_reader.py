@@ -38,6 +38,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from simpler.buffer import create_host_shared_buffer, mint_owner_instance_id
 
 #: The suites carrying this reader. Both are loaded, because they hold separate copies of it and a
 #: repair applied to one would otherwise go missing from the other.
@@ -401,7 +402,50 @@ def _controlled_stream_fault_case(
         count=count,
         log=log,
         sampler_events=sampler_events,
+        worker=worker,
+        handle_type=Handle,
     )
+
+
+@pytest.mark.parametrize("scene", ["a2a3_narrow", "a5_narrow", "a5_wide"])
+@pytest.mark.parametrize("wrong_success_output", [False, True])
+def test_fault_tracebacks_do_not_pin_host_outputs(scene, wrong_success_output, monkeypatch, tmp_path):
+    controlled = _controlled_stream_fault_case(
+        scene, monkeypatch, tmp_path, fault_index=1, wrong_success_output=wrong_success_output
+    )
+    buffers, errors = [], []
+    owner = mint_owner_instance_id()
+
+    def create_buffer(size):
+        buffer = create_host_shared_buffer(size, owner, len(buffers) + 1)
+        buffers.append(buffer)
+        return buffer
+
+    original_wait = controlled.handle_type.wait
+
+    def retain_failure(handle):
+        try:
+            return original_wait(handle)
+        except RuntimeError as error:
+            errors.append(error)
+            raise
+
+    monkeypatch.setattr(controlled.worker, "create_buffer", create_buffer)
+    monkeypatch.setattr(controlled.handle_type, "wait", retain_failure)
+    try:
+        if wrong_success_output:
+            with pytest.raises(AssertionError, match="successful call.*incorrect output"):
+                controlled.invoke()
+        else:
+            controlled.invoke()
+        assert errors and all(error.__traceback__ is not None for error in errors)
+        for buffer in buffers:
+            buffer.close()
+    finally:
+        for error in errors:
+            error.__traceback__ = None
+        for buffer in buffers:
+            buffer.close()
 
 
 @pytest.mark.parametrize(

@@ -135,7 +135,10 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
     """Check callable-side host access before descriptors become address-only PODs."""
     for i in range(args.tensor_count()):
         buffer = args.tensor(i).buffer
-        if buffer.address_space != AddressSpace.HOST or args.transfer(i) != TensorTransfer.NONE:
+        if buffer.address_space != AddressSpace.HOST or args.transfer(i) not in (
+            TensorTransfer.NONE,
+            TensorTransfer.MAP,
+        ):
             continue
         direction = target.sig(i) if target is not None and i < target.sig_count else None
         needed = {
@@ -146,7 +149,9 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
         # Wire TaskArgs do not carry dependency tags. The callable signature governs
         # actual host reads/writes, so a weaker caller tag cannot widen the grant.
         if needed is None or buffer.access not in (needed, AccessMode.READWRITE):
-            raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
+            raise ValueError(
+                f"argument {i}: HOST/{args.transfer(i).name} access grant does not cover callable direction {direction}"
+            )
 
 
 def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> ChipStorageTaskArgs:
@@ -1955,7 +1960,10 @@ class ChipWorker:
                     if args.transfer(i) == TensorTransfer.NONE:
                         continue
                     if args.transfer(i) != TensorTransfer.H2D:
-                        raise ValueError(f"ChipWorker.run: argument {i} requires NONE or H2D transfer")
+                        raise ValueError(
+                            f"ChipWorker.run: argument {i} requires NONE or H2D; "
+                            "use Worker(level=2).submit for MAP preparation and lifetime validation"
+                        )
                     tensor = args.tensor(i)
                     expected = 1
                     shapes, strides = tensor.shapes, tensor.strides

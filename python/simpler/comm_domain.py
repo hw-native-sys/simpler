@@ -10,18 +10,14 @@
 
 from __future__ import annotations
 
-import ctypes
 import operator
-import threading
-import weakref
-from collections.abc import Iterable
-from contextlib import ExitStack
 from dataclasses import dataclass, fields
 from multiprocessing import resource_tracker
-from multiprocessing.shared_memory import SharedMemory
 from typing import TYPE_CHECKING
 
 from _task_interface import AddressSpace
+
+from ._host_exports import HostSharedMemory, seal_host_mappings  # noqa: F401 -- shared public cleanup helper
 
 if TYPE_CHECKING:
     from .task_interface import CommBufferSpec
@@ -127,7 +123,7 @@ class DomainConfig:
         return ""
 
 
-class HostBufferMapping(SharedMemory):
+class HostBufferMapping(HostSharedMemory):
     """Borrow an L2-owned POSIX window through the standard SharedMemory API.
 
     L3 only closes its mapping. Creation and unlink belong to the native L2
@@ -135,9 +131,6 @@ class HostBufferMapping(SharedMemory):
     """
 
     def __init__(self, name: str, size: int):
-        self._export_lock = threading.RLock()
-        self._export_count = 0
-        self._closing = False
         if not name or len(name) > 31 or not all(c.isascii() and (c.isalnum() or c in "_-") for c in name):
             raise ValueError("invalid Host domain shared memory name")
         try:
@@ -151,53 +144,3 @@ class HostBufferMapping(SharedMemory):
 
     def unlink(self) -> None:
         raise RuntimeError("Host domain shared memory belongs to L2; use domain.release()")
-
-    @property
-    def buf(self) -> memoryview | None:
-        """Export the whole window, retaining a borrow through derived views."""
-        with self._export_lock:
-            if self._mmap is None:
-                return None
-            if self._closing:
-                raise BufferError("Host domain mapping is closing; new CPU exports are forbidden")
-            # NumPy can discard a temporary memoryview and keep only its base.
-            # Keep the real mmap export in the carrier's finalizer, so derived
-            # arrays pin it too. Explicit release orders the mmap unpin before
-            # the borrow count drops, independent of ctypes deallocation order.
-            backing = memoryview(self._mmap)
-            address = ctypes.addressof(ctypes.c_ubyte.from_buffer(backing))
-            carrier = (ctypes.c_ubyte * self.size).from_address(address)
-            finalizer = weakref.finalize(carrier, self._release_export, backing)
-            finalizer.atexit = False
-            self._export_count += 1
-            return memoryview(carrier).cast("B")
-
-    def _release_export(self, backing: memoryview) -> None:
-        with self._export_lock:
-            backing.release()
-            self._export_count -= 1
-
-    def close(self) -> None:
-        with self._export_lock:
-            seal_host_mappings((self,))
-            super().close()
-
-
-def seal_host_mappings(mappings: Iterable[HostBufferMapping]) -> None:
-    """Reject live exports, then prevent new ones across the entire release set.
-
-    Nothing changes if any mapping is borrowed. Locks cover admission only;
-    callers may wait for device fences and release native resources afterwards.
-    """
-    ordered = sorted({id(mapping): mapping for mapping in mappings}.values(), key=id)
-    with ExitStack() as locks:
-        for mapping in ordered:
-            locks.enter_context(mapping._export_lock)
-        for mapping in ordered:
-            if mapping._export_count:
-                raise BufferError(
-                    f"Host domain mapping {mapping.name!r} has live CPU exports; "
-                    "drop arrays and release memoryviews before closing or releasing the domain"
-                )
-        for mapping in ordered:
-            mapping._closing = True

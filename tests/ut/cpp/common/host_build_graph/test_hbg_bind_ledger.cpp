@@ -2322,7 +2322,8 @@ TEST_F(HbgBindLedgerTest, RejectsUnsupportedTransferBeforeReadingEarlierArgument
     const uint32_t shape[] = {16};
     // Any copy of the first input is a fault, not a weak copy-count assertion.
     const ChipTensor first = make_tensor_external(reinterpret_cast<void *>(1), shape, 1, DataType::UINT8);
-    for (auto transfer : {TensorTransfer::H2D, TensorTransfer::D2H, static_cast<TensorTransfer>(255)}) {
+    for (auto transfer :
+         {TensorTransfer::H2D, TensorTransfer::D2H, TensorTransfer::MAP, static_cast<TensorTransfer>(255)}) {
         SCOPED_TRACE(static_cast<int>(transfer));
         ChipTensor invalid = first;
         invalid.transfer = transfer;
@@ -2331,7 +2332,10 @@ TEST_F(HbgBindLedgerTest, RejectsUnsupportedTransferBeforeReadingEarlierArgument
         args.add_tensor(first);
         args.add_tensor(invalid);
         const ArgDirection sig[] = {ArgDirection::IN, ArgDirection::IN};
-        EXPECT_EQ(bind(runtime, args, sig, 2), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+        EXPECT_EQ(
+            bind(runtime, args, sig, 2),
+            transfer == TensorTransfer::MAP ? PTO_RUNTIME_ERR_UNSUPPORTED : PTO_RUNTIME_ERR_INVALID_ARGUMENT
+        );
         EXPECT_EQ(fake_.copy_count, 0);
         EXPECT_TRUE(fake_.live.empty());
     }

@@ -377,6 +377,10 @@ public:
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
 
+    bool host_ddr_mapping_supported() const noexcept;
+    uint64_t map_host_ddr(uint64_t host, uint64_t bytes);
+    void unmap_host_ddr(uint64_t host);
+
     /// One span of a caller device allocation a run names. The lane's
     /// vocabulary for the borrow it takes on a run's behalf; the wire form it
     /// becomes is the platform's (`CallerBufferSpan`).
@@ -1099,6 +1103,14 @@ private:
     // thread, as enforced by Worker.close().
     std::optional<ExecutionEnvironment> execution_environment_;
     bool device_owner_reserved_ = false;
+    struct HostDdrMapping {
+        uint64_t bytes;
+        uint64_t mapped{0};
+        unsigned registered{0};
+        bool closing{false};
+    };
+    std::mutex host_ddr_mutex_;
+    std::unordered_map<uint64_t, HostDdrMapping> host_ddr_mappings_;
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;

@@ -268,11 +268,12 @@ def test_create_export_import_resolve_zero_copy():
         assert owner_shm is not None
         assert consumer_shm is not None
         owner_buf = owner_shm.buf
-        consumer_buf = consumer_shm.buf
         assert owner_buf is not None
-        assert consumer_buf is not None
-        owner_buf[:4] = b"\xde\xad\xbe\xef"
-        assert bytes(consumer_buf[:4]) == b"\xde\xad\xbe\xef"
+        with owner_buf:
+            consumer_buf = consumer_shm.buf
+            assert consumer_buf is not None
+            owner_buf[:4] = b"\xde\xad\xbe\xef"
+            assert bytes(consumer_buf[:4]) == b"\xde\xad\xbe\xef"
     finally:
         reg.close()
         buffer.close()
@@ -754,14 +755,14 @@ def test_materialize_args_scopes_the_returned_map_to_this_calls_tensors():
     args1 = ti.TaskArgs()
     args1.add_tensor(h1.tensor(shapes=(16,), dtype=DataType.FLOAT32))
     resolved1 = reg.materialize_args(args1)
-    assert set(resolved1) == {h1.identity}
+    assert resolved1 == [(h1.base, int(AddressSpace.DEVICE), int(TensorTransfer.NONE))]
 
     args2 = ti.TaskArgs()
     args2.add_tensor(h2.tensor(shapes=(16,), dtype=DataType.FLOAT32))
     resolved2 = reg.materialize_args(args2)
     # h1 is still live in the registry's own history (map-once), but this call's args never
     # referenced it, so it must not appear in this call's returned map.
-    assert set(resolved2) == {h2.identity}
+    assert resolved2 == [(h2.base, int(AddressSpace.DEVICE), int(TensorTransfer.NONE))]
 
 
 def test_materialize_remote_sidecar_rejected():
@@ -1256,7 +1257,10 @@ def test_transfer_survives_mailbox_and_materialization_without_changing_identity
     raw = ctypes.create_string_buffer(encode_blob([tensor, other], transfers=[transfer, TensorTransfer.H2D]))
     args = read_args_from_blob(ctypes.addressof(raw), len(raw))
     # Materialization resolves addresses; it must not read either tensor's contents.
-    resolved = {descriptor.identity: (1, int(AddressSpace.HOST))}
+    resolved = [
+        (1, int(AddressSpace.HOST), int(transfer)),
+        (1, int(AddressSpace.HOST), int(TensorTransfer.H2D)),
+    ]
     native = materialize_task_args(args, resolved)
     assert args.transfer(0) == transfer
     assert native.transfer(0) == transfer
@@ -1293,6 +1297,7 @@ def test_chip_tensor_location_and_transfer_are_independent_of_legacy_flag():
     ("space", "transfer", "message"),
     [
         (AddressSpace.DEVICE, TensorTransfer.H2D, "H2D requires HOST"),
+        (AddressSpace.DEVICE, TensorTransfer.MAP, "MAP requires HOST"),
         (AddressSpace.DEVICE, TensorTransfer.D2H, "D2H parameters are unsupported"),
         (AddressSpace.HOST, TensorTransfer.D2H, "D2H parameters are unsupported"),
     ],
@@ -1328,3 +1333,49 @@ def test_task_args_owns_transfer_without_mutating_the_source_view():
     args.clear()
     args.add_tensor(tensor)
     assert args.transfer(0) == TensorTransfer.H2D
+
+
+def test_map_and_native_aliases_materialize_per_argument():
+    from _task_interface import materialize_task_args  # noqa: PLC0415
+
+    descriptor = _descriptor_with_path_id(0)
+    tensor = descriptor.tensor((1,), DataType.FLOAT32, byte_offset=4)
+    args = TaskArgs()
+    args.add_tensor(tensor, transfer=TensorTransfer.NONE)
+    args.add_tensor(tensor, transfer=TensorTransfer.MAP)
+    result = materialize_task_args(
+        args,
+        [
+            (4096, int(AddressSpace.HOST), int(TensorTransfer.NONE)),
+            (8192, int(AddressSpace.DEVICE), int(TensorTransfer.NONE)),
+        ],
+    )
+    assert result.tensor(0).data == 4100
+    assert result.tensor(1).data == 8196
+    assert result.tensor(0).address_space == AddressSpace.HOST
+    assert result.tensor(1).address_space == AddressSpace.DEVICE
+    assert result.transfer(1) == TensorTransfer.NONE
+    assert args.transfer(1) == TensorTransfer.MAP
+    assert args.tensor(0) == args.tensor(1) == tensor
+
+
+@pytest.mark.parametrize(
+    "bindings, error",
+    [
+        ([], "binding count"),
+        ([(4096, int(AddressSpace.HOST), int(TensorTransfer.MAP))], "invalid execution"),
+        ([(4096, int(AddressSpace.DEVICE), int(TensorTransfer.H2D))], "prepared DEVICE/NONE"),
+        ([(4096, 256, int(TensorTransfer.NONE))], "invalid execution"),
+        ([(4096, int(AddressSpace.DEVICE), 256)], "invalid execution"),
+        ([(0, int(AddressSpace.DEVICE), int(TensorTransfer.NONE))], "invalid address range"),
+        ([((1 << 64) - 4, int(AddressSpace.DEVICE), int(TensorTransfer.NONE))], "invalid address range"),
+    ],
+)
+def test_map_materialization_rejects_missing_or_unprepared_binding(bindings, error):
+    from _task_interface import materialize_task_args  # noqa: PLC0415
+
+    tensor = _descriptor_with_path_id(0).tensor((2,), DataType.FLOAT32)
+    args = TaskArgs()
+    args.add_tensor(tensor, transfer=TensorTransfer.MAP)
+    with pytest.raises(ValueError, match=error):
+        materialize_task_args(args, bindings)
