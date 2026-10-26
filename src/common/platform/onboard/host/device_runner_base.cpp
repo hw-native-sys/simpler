@@ -1748,7 +1748,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
     return ensure_dma_workspace_warmed();
 }
 
-int DeviceRunnerBase::init_kernel_context(int device_id) {
+int DeviceRunnerBase::init_kernel_context(int device_id, uint64_t context_generation) {
     int rc = adopt_borrowed_device(device_id);
     if (rc != 0) return rc;
 
@@ -1758,7 +1758,7 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
     clear_staged_workspace();
     if (rc != 0) return rc;
 
-    rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops());
+    rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops(), context_generation);
     if (rc != 0) {
         LOG_ERROR("init_kernel_context: context stream/event creation failed: %d", rc);
         return rc;

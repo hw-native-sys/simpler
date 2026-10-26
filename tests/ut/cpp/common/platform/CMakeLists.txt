@@ -56,8 +56,13 @@ endmacro()
 # Kernel-mode phase machine and restricted-vocabulary tables, table-driven with
 # fake ops: init/close balance, poison, sticky CLOSING with retry, and the
 # separate runtime-error vs teardown-error slots.
+platform_single_case(test_kernel_launch_binder.cpp
+    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_launch_binder.cpp)
+
 platform_single_case(test_kernel_execution_state.cpp
-    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_execution_state.cpp)
+    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_execution_state.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_device_resources.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_launch_binder.cpp)
 
 # The growth coordinator is production: the onboard host runtime links this
 # same translation unit, so the trim, the retry policy and the holder discovery
