@@ -26,6 +26,7 @@ Analysis CLIs that consume these outputs are documented in
 | [The host_build_graph bind phases](hbg-bind-phases.md) | What the bind segments are, the switches that expose them, and how to compare two branches on the qwen and dsv4 decode cases |
 | [Device-side phase timing](device-phases.md) | Fixed AICPU phases and the variable-phase plan |
 | [Scheduler-Overhead Model](sched-overhead-model.md) | Is the scheduler the bottleneck, or starved — the model behind `--overhead` |
+| [Scheduler Benchmark](scheduler-benchmark.md) | How long a run took and where the time went — dispatch cost and schedule cost, against a near-optimal schedule and a lower bound |
 
 ## Per-task traces
 
