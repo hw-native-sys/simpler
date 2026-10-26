@@ -30,7 +30,7 @@ Graph、异步返回、多 block predicate 不自动开放；既有单 block pre
 | 4 | GM Mix descriptor／ack／seal、各 lane 自备 payload | mask 3/5/6/7；最后发布者暂停；代次／槽复用 | A5／仿真矩阵、重叠及 TPipe PA 已通过；首错误身份与冷日志已接线 |
 | 5 | 完整 native 身份 trace 和原样 CSA resident | 七项 golden；2308 执行身份；来源严格门禁 | CSA 数值／2308 显式身份／来源、全协议因果与独立图门禁通过 |
 | 6 | sync_start 不同位置领取和局部跨任务推进 | 两独立满核任务、部分交叠、超容量、早返回不重领 | N>1 已实现；仿真／A5 各 47 项基础、112 项异构交叠／依赖／分波切换及原生审计通过；N=1 公共契约待确认 |
-| 7 | 性能对比 | 同 kernel／输入／拓扑，无完整插桩运行；诊断运行分开 | 已完成：当前 Device 为基线 11.41 倍；前期 resident 已同量级回退，根因和优化另待验证 |
+| 7 | 性能对比 | 同 kernel／输入／拓扑，无完整插桩运行；诊断运行分开 | 初次 Device 为设计基线 11.41 倍；共享错误 RMW 已有显著归因差分，GM service 阶段裁剪相对同批 resident 对照降低 6.58%，整体回退未消除 |
 
 退出、错误收敛、epoch／generation、Dummy 服务节点随功能交付，不延后处理。
 CPU 模型、原生探针、真实 CSA 各有独立证明范围；legacy 的正确结果不能证明 resident 功能。
@@ -1987,3 +1987,125 @@ outputs/spmd-error-stop-cpp-final-20261025.log、outputs/spmd-error-query-precom
 旧拓扑候选的 100 项 GTest 原始日志也已保存。
 确认相关运行全部结束后删除本次独立临时工作树，原始证据仍可在主仓 outputs 归档中恢复，
 不保留可误用的 query 诊断版工作仓。主仓用户未跟踪文件均保持原样，阶段提交不 push。
+
+## 2026-10-25：按 GM 本核阶段跳过必定无进展的 service 调用
+
+起点 9e540ea05，上一轮完成了六项错误回归、两项隔离测量和阶段提交。
+共享错误 RMW 已有显著性能差分，但不能把 query 诊断版合入。
+本轮只调整 scheduler_service_gm_mix 对既有 helper 的调用条件，不更改原子原语或错误 writer，
+不引入错误缓存、降频开关、协议字段、SSBUF 或新的调度顺序。
+
+目前每轮无条件调用 close，然后调用 retire 或 observe，最后无条件 arrive 和 prepare_lane。
+这些 helper 在关键错误检查之后，会按本核 phase 直接返回无进展：
+retire 只在 AIC 的 RELEASED 阶段推进，observe 只在 AIV 的 IDLE/RELEASED 阶段推进，
+arrive 只处理 PUBLISHED，prepare_lane 只处理 ARRIVED。
+本核 phase 只由本核改变，不是远端可更新的共享轮询值。
+
+候选在 service 调用处按上述阶段选择 helper，仍每轮先调用完整 close：
+它保留关键错误读取、GM context 校验、AIV 的 retained seal 观察和关闭。
+真正领取、发布、到达、准备、退役、kernel permit 与完成的 helper 保留原错误检查。
+每次调用后重新检查当前 phase，不能把轮首快照贯穿整轮，
+否则同一轮 publish→arrive→prepare 会被错误拆开。
+retire 成功仍结束本次 service，不在同一调用内顺手领取下一组。
+
+新增 13 项 C++ 检查先在未改动的生产实现上运行：
+11 项覆盖 AIC 六个合法阶段、AIV 五个合法阶段的已发布错误，检查无状态／计数推进；
+另两项检查 publish→arrive 的同轮推进、inactive lane 资源释放，
+以及全部 release 前不退役、退役后下一轮才领取新组。
+复用真实生产 helper 进入各阶段，不直接伪造 phase。
+测试不声称 CPU 能证明 A5 原子延迟；性能仍需无完整插桩的同卡对照。
+
+固定基线 worktree 为 tmp/spmd-mix-service-baseline-20261025，detached 在 9e540ea05，
+使用独立 venv、Torch 2.12、同一 PTO pin 和冻结 CSA 输入。
+主仓上一提交的重建与基线构建仍在进行，运行时源码尚未修改。
+
+主仓上一提交重建已成功，binding 为 9e540ea05，AICore runtime SHA256
+仍为 76c289ea68f7f0895542e7d0468e7c472472ffaae06192ac217f1962f5ba7ced。
+新 13 项检查在原实现上通过，GM Mix 共 95 项；日志
+outputs/spmd-mix-service-before-cpp-20261025.log。
+随后仅在 scheduler_dispatch.h 落地上述 phase 条件，关键原子 helper 无改动；
+改造后 admission 102 项、GM Mix 95 项通过，日志 outputs/spmd-mix-service-cpp-20261025.log。
+
+临时头文件副本另构造两项故障变体，不修改生产源码：
+把所有 phase 判断固定为 service 轮首值，两项同轮推进／退役节奏测试全部失败；
+仅在 RUNNING 跳过 close，11 项错误阶段测试中的 AIC／AIV RUNNING 两项失败，
+其余九项通过。JUnit 核对用例数与失败数，见 outputs/spmd-mix-service-mutation-20261025.log。
+这验证了新增条件仍必须允许本轮状态变化、且不能把“无可推进工作”当作跳过错误检查的理由。
+
+基线独立构建已成功；CANN query 再次确认 device 0 为 A5 32C/64V。
+上板预检仍因缺少 npu-smi 无法识别，按用户要求直接用卡，未使用 task-submit 锁。
+运行进入 UTC 2026-10-26，沿用本次实验启动时的 20261025 日志前缀。
+候选重编、扩大的 C++ 回归和基线严格 CSA L4 验证正在进行，尚无本轮性能结论。
+
+候选重编成功；20 个相关 C++ 目标全部通过，实际 721 项 GTest，
+原始 GTest 输出保存为 outputs/spmd-mix-service-cpp-regression-gtest-20261025.log。
+候选严格 CSA L4 已通过，结果 outputs/csa-hbg-l4-a3kjfkz4/result.json；
+基线为独立工作树 outputs/csa-hbg-l4-2lofkxj3/result.json。
+两者均为 aicore 来源，两轮各七项 golden、2308 条入口身份、133 条依赖、
+完整原生协议和原有 timing guard 通过，原业务 kernel／构图／输入不变。
+
+九类专项仿真测试全部通过，日志 outputs/spmd-mix-service-probes-sim-20261025.log；
+本轮显式打开 L4，以各类 CASES 的实际平台筛选逐项定位新捕获，
+使用统一 read_perf_data 重新执行完整原生因果审计，要求每份 producer=aicore、
+protocol_verified=true，且原始执行行未在解析时丢失。
+470 份新捕获全部通过，共 972798 个协议事件、61907 条执行记录，
+清单及分组计数见 outputs/spmd-mix-service-probes-sim-audit-20261025.json。
+retained 多次调用仍逐次校验 golden 和新鲜来源；上述捕获数不冒称覆盖额外的所有调用快照。
+完整 HBG 仿真回归另有 42 项通过，见 outputs/spmd-mix-service-hbg-sim-20261025.log。
+继续排除已知误收集的双卡 TMR 目录和未决 N=1 公共容量用例，不把它们计作通过。
+
+A5 九类专项测试同样全部通过，日志 outputs/spmd-mix-service-native-20261025/probes.log；
+对应 470 份新 L4 捕获全部经相同完整因果审计，通过 1380222 个协议事件和 81587 条执行记录，
+见 outputs/spmd-mix-service-probes-a5-audit-20261025.json。
+两平台合计 940 份捕获；分别核对每个平台 CASES 的完整集合，不以文件数量相等替代逐项对应。
+测试继续覆盖普通 N=512 分波、GM mask 3/5/6/7、原 N 与槽复用、
+47 项基础 sync_start、112 项异构同步／普通交叠和依赖、84 项较晚 ready B 先行，
+既有哨兵、每轮新鲜 resident 来源和真实原子事件顺序断言均保留。
+
+基线与候选的 Host 49 项、AICPU 32 项编译命令及 AICore 8 条实际 CCEC argv
+在归一化工作树／venv 根路径后完全相同，见 outputs/spmd-mix-service-compile-comparison-20261025.json。
+两边 build/pto-isa 的实际 HEAD 均为 418de18dde8fa33773dc5c384fdfe5506463b628。
+主仓 Host／AICPU runtime SHA256 与改造前相同，仅 AICore runtime 变化；
+独立工作树的路径相关二进制差异不当作算法差异。
+完整 HBG A5 回归仍在进行，正式性能测量将在全部回归和审计进程结束后开始。
+
+完整 HBG A5 回归已通过：60 passed、4 skipped，见
+outputs/spmd-mix-service-native-20261025/hbg.log。没有改动或跳过新失败项。
+正式同卡 A/B/B/A 已在相关构建、审计和测试全部结束后启动；
+A 为独立 worktree 的原样 9e540ea05，B 为主仓仅一处 service 调用条件的候选。
+每批三轮七项 golden、五轮预热和一百轮测量，完整泳道关闭。
+
+正式四批全部通过，原样重算 bench.log 与 result.json 的统计一致；
+两边同一臂的源码／二进制身份前后不变，冻结输入、构图、PTO、Torch 和实际编译参数一致。
+结果如下，Device 仍为包含初始化／退出的 AICPU RunWall，不是纯 kernel 时间。
+
+| 批次 | Host 中位数（μs） | Device 中位数（μs） | 结果目录后缀 |
+| ---- | ----------------- | ------------------- | ------------ |
+| A1 | 105755.094 | 24808.418 | csa-hbg-bench-fjj_tveq |
+| B1 | 101458.451 | 23222.263 | csa-hbg-bench-akfmq10w |
+| B2 | 100511.835 | 23064.148 | csa-hbg-bench-kl6o3ngt |
+| A2 | 102958.212 | 24691.261 | csa-hbg-bench-gp8624xf |
+
+每臂合并 200 个测量样本：
+
+- Device：A=24763.732 μs，B=23135.453 μs，变化 −6.575%，减少 1628.280 μs。
+  P10/P90 分别为 24144.372/26067.692 与 22612.178/24075.239 μs。
+- Host：A=104099.092 μs，B=100788.646 μs，变化 −3.180%。
+  P10/P90 分别为 101580.604/120434.830 与 98824.743/105320.947 μs。
+
+这是保留全部关键错误读取和状态转换检查的实际改造结果，与上一轮仅供归因的 query 替换不同。
+候选通过功能／错误回归、完整协议审计，并在两批测量和反向对照中均有收益，保留该改动。
+不能把两次不同实验的百分比相加，也不能把此结果称为已恢复设计 AICPU 基线性能：
+约 23.135 ms 仍明显慢于初次对照的约 2.151 ms，剩余回退还需继续定位。
+
+完整汇总与样本见 outputs/spmd-mix-service-comparison-20261025.json。
+基线两个 benchmark 和 L4 目录经 diff -qr 核对后归档到
+outputs/spmd-mix-service-baseline-evidence-20261025；其中 runtime 子目录保留基线三个二进制。
+候选二进制保存在 outputs/spmd-mix-service-candidate-runtime-20261025，
+候选原始 L4 和两个 benchmark 目录仍在主仓 outputs；归档 SHA256 与捕获身份对应。
+
+适用 pre-commit 检查全部通过，日志 outputs/spmd-mix-service-precommit-final-20261025.log。
+确认没有相关活跃构建／运行后已删除独立基线工作树，基线证据可从上述归档恢复；
+主仓生产候选保留。两份设计入口只同步当前能力／性能摘要，所有过程仍集中在本文件。
+阶段提交限定 service 条件、13 项回归及三份已有中文文档，不提交输出产物、
+N=1 未决用例或用户未跟踪文件，不 push。

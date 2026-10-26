@@ -30,16 +30,19 @@ inline __aicore__ bool scheduler_service_gm_mix(
         return true;
     }
     if (local->is_mix_coordinator()) {
-        const auto retired = scheduler_gm_mix_retire(graph, base, local, run);
-        if (retired == SchedulerGmMixResult::ERROR) return false;
-        if (retired == SchedulerGmMixResult::TASK_LAST && !scheduler_complete_ordered_task(
-                                                              graph, base, local, run, admission.current_task_ref,
-                                                              profiling_level, wake_stats, ready_stats, completion_stats
-                                                          ))
-            return false;
-        if (retired == SchedulerGmMixResult::PROGRESS || retired == SchedulerGmMixResult::TASK_LAST) {
-            *progress = true;
-            return true;
+        if (group.phase == SchedulerGmMixPhase::RELEASED) {
+            const auto retired = scheduler_gm_mix_retire(graph, base, local, run);
+            if (retired == SchedulerGmMixResult::ERROR) return false;
+            if (retired == SchedulerGmMixResult::TASK_LAST &&
+                !scheduler_complete_ordered_task(
+                    graph, base, local, run, admission.current_task_ref, profiling_level, wake_stats, ready_stats,
+                    completion_stats
+                ))
+                return false;
+            if (retired == SchedulerGmMixResult::PROGRESS || retired == SchedulerGmMixResult::TASK_LAST) {
+                *progress = true;
+                return true;
+            }
         }
         if (group.phase == SchedulerGmMixPhase::IDLE) {
             const auto claimed = scheduler_gm_mix_claim(graph, base, local, run);
@@ -51,7 +54,7 @@ inline __aicore__ bool scheduler_service_gm_mix(
             if (!scheduler_gm_mix_publish(graph, base, local, run)) return false;
             *progress = true;
         }
-    } else {
+    } else if (group.phase == SchedulerGmMixPhase::IDLE || group.phase == SchedulerGmMixPhase::RELEASED) {
         bool observed = false;
         if (!scheduler_gm_mix_observe(graph, base, local, run, &observed)) return false;
         *progress = observed;
@@ -59,7 +62,10 @@ inline __aicore__ bool scheduler_service_gm_mix(
     }
     bool arrived = false;
     bool prepared = false;
-    if (!scheduler_gm_mix_arrive(graph, base, local, run, &arrived) ||
+    // Phase is core-local. Arrival may enable preparation in this same pass.
+    if (group.phase == SchedulerGmMixPhase::PUBLISHED && !scheduler_gm_mix_arrive(graph, base, local, run, &arrived))
+        return false;
+    if (group.phase == SchedulerGmMixPhase::ARRIVED &&
         !scheduler_gm_mix_prepare_lane(graph, base, local, run, profiling_level, &prepared))
         return false;
     *progress = *progress || arrived || prepared;

@@ -7,8 +7,9 @@ GM Mix 也已接入，原样 CSA 的数值与严格 resident L4 门禁已通过�
 首错误身份、退出冷日志及显式 block/slot 身份已接线，原样 CSA 身份审计通过；
 L4 原生协议采集、因果审计和原样 CSA 严格门禁已通过；N>1 的 sync_start 已接线，
 仿真／A5 各 47 项及原生审计通过；N=1 公共请求契约待确认。
-同卡无完整插桩对照已完成，当前固定 CSA 的 Device 中位数约为 AICPU 设计基线的 11.41 倍，
-性能回退尚未定位／优化，不能将功能通过写成性能收益。
+初次同卡无完整插桩对照中，固定 CSA 的 Device 中位数约为 AICPU 设计基线的 11.41 倍。
+后续 GM service 按本核阶段跳过无进展调用，相对同批 resident 对照降低 Device 中位数 6.58%，
+关键错误检查保留；整体回退尚未消除，不能将功能通过写成已经达到设计基线性能。
 本页保留全部目标合同；已实现字段和实测范围以 [实现过程](implementation-progress.md) 为准，
 不以存在字段替代执行验收。
 初始 TDD 覆盖和历史红绿状态见 [测试入口和验收状态](test-plan-and-status.md)。
@@ -328,7 +329,7 @@ AICPU 首写者明确记录未知 task/core/扩展身份，bootstrap/execution/t
 | 4 | GM descriptor/ack/seal，各 lane 自备 payload，无 SSBUF | mask 3/5/6/7、配对、暂停最后发布者、局部关闭和槽复用 | C++、仿真／A5 矩阵和重叠通过；首错误身份与冷日志已接线 |
 | 5 | block/order/placement/来源导出及严格审计器 | 完整因果链、不重不漏、无截断；原样 CSA 七项 golden 与 resident 来源 | CSA 七项 golden／2308 身份／来源、原生因果审计和独立图一致性门禁通过 |
 | 6 | sync_start 一次领取／不同位置容量 | 满核独立任务、交叠成员、超容量、早返回不二次领取 | N>1 的 C++／Python、仿真／A5 与原生审计通过；N=1 公共契约待确认 |
-| 7 | 相同 kernel/输入/拓扑的控制开销对比 | 区分无完整插桩性能与诊断运行，不能由 CPU 模型推算收益 | 已完成同卡 A/B/B/A；当前 Device 耗时为基线 11.41 倍，前期 resident 已同量级 |
+| 7 | 相同 kernel/输入/拓扑的控制开销对比 | 区分无完整插桩性能与诊断运行，不能由 CPU 模型推算收益 | 初次同卡对照为设计基线 11.41 倍；GM service 阶段裁剪相对同批 resident 对照降低 6.58%，整体回退未消除 |
 
 纯 C/V、GM Mix 已有生产 helper 和原生执行证据；
 N>1 sync_start 与性能对照已有实测证据，N=1 公共契约和最终逐项验收仍待收口；
