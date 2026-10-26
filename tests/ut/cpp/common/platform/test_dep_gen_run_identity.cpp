@@ -123,6 +123,7 @@ protected:
         const int32_t kernel_ids[3] = {-1, -1, -1};
         dep_gen_aicpu_record_submit(
             simpler::ut::test_task_id(task_id), /*in_manual_scope=*/false, /*early_dispatch=*/false,
+            /*sync_start=*/false, /*predicated=*/false,
             /*tensor_count=*/0,
             /*tensor_ptrs=*/nullptr, /*arg_types=*/nullptr, /*explicit_dep_count=*/0, /*explicit_deps=*/nullptr,
             /*explicit_dep_kinds_raw=*/nullptr, kCreatorEdgeDepKinds, /*block_num=*/1, kernel_ids

@@ -119,6 +119,9 @@ void dep_gen_aicpu_close_run();
  *
  * @param task_id             The assigned task_id for this submit
  * @param in_manual_scope     true iff the submit happened inside a manual scope
+ * @param early_dispatch      true iff the submit allows early resolve
+ * @param sync_start          true iff the task's blocks start together or not at all
+ * @param predicated          true iff a dispatch predicate may skip the task's kernel
  * @param tensor_count        Number of slots in tensor_ptrs / arg_types (≤ CORE_MAX_TENSOR_ARGS)
  * @param tensor_ptrs         Per-slot ChipTensor pointer (nullptr to skip the slot)
  * @param arg_types           Per-slot TensorArgType (interpreted as raw byte)
@@ -136,8 +139,8 @@ void dep_gen_aicpu_close_run();
  *                            hot path writing identity fields itself.
  */
 void dep_gen_aicpu_record_submit(
-    TaskId task_id, bool in_manual_scope, bool early_dispatch, int tensor_count, const void *const *tensor_ptrs,
-    const uint8_t *arg_types, int explicit_dep_count, const TaskId *explicit_deps,
+    TaskId task_id, bool in_manual_scope, bool early_dispatch, bool sync_start, bool predicated, int tensor_count,
+    const void *const *tensor_ptrs, const uint8_t *arg_types, int explicit_dep_count, const TaskId *explicit_deps,
     const uint8_t *explicit_dep_kinds_raw, uint8_t default_explicit_dep_kind, int block_num, const int32_t kernel_ids[3]
 );
 

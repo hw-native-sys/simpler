@@ -491,6 +491,8 @@ struct TaskTableEntry {
     TaskId task_id;
     bool in_manual_scope;
     bool early_dispatch;
+    bool sync_start;       // its blocks start together or not at all
+    bool predicated;       // a dispatch predicate may skip its kernel
     int32_t kernel_id[3];  // per-subslot {AIC, AIV0, AIV1}, -1 = inactive
     uint32_t block_num;
     ChargedVec<TaskArgEntry> args;
@@ -627,6 +629,8 @@ bool write_deps_json(
         // kernel without the AICore record carrying the field itself.
         out << ",\"kernel_ids\":[" << t.kernel_id[0] << ',' << t.kernel_id[1] << ',' << t.kernel_id[2] << ']';
         out << ",\"block_num\":" << t.block_num;
+        out << ",\"sync_start\":" << (t.sync_start ? "true" : "false");
+        out << ",\"predicated\":" << (t.predicated ? "true" : "false");
         out << ",\"args\":[";
         for (size_t a = 0; a < t.args.size(); a++) {
             if (a > 0) out << ',';
@@ -1000,11 +1004,15 @@ int emit_deps_json_body(
         // consumer-side blob so raw_shapes / dtype are populated (the
         // producer-side ChipTensorMapEntry drops raw_shapes to fit in two
         // cache lines).
-        TaskTableEntry task_entry{{},        false, false,
-                                  {0, 0, 0}, 0u,    ChargedVec<TaskArgEntry>(ChargedAlloc<TaskArgEntry>(&charger))};
+        TaskTableEntry task_entry{{},    false,
+                                  false, false,
+                                  false, {0, 0, 0},
+                                  0u,    ChargedVec<TaskArgEntry>(ChargedAlloc<TaskArgEntry>(&charger))};
         task_entry.task_id = rec.task_id;
         task_entry.in_manual_scope = in_manual_scope;
         task_entry.early_dispatch = (rec.flags & DEP_GEN_FLAG_EARLY_DISPATCH) != 0;
+        task_entry.sync_start = (rec.flags & DEP_GEN_FLAG_SYNC_START) != 0;
+        task_entry.predicated = (rec.flags & DEP_GEN_FLAG_PREDICATED) != 0;
         task_entry.kernel_id[0] = rec.kernel_id[0];
         task_entry.kernel_id[1] = rec.kernel_id[1];
         task_entry.kernel_id[2] = rec.kernel_id[2];
