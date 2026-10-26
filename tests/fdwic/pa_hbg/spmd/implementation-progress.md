@@ -2109,3 +2109,132 @@ outputs/spmd-mix-service-baseline-evidence-20261025；其中 runtime 子目录�
 主仓生产候选保留。两份设计入口只同步当前能力／性能摘要，所有过程仍集中在本文件。
 阶段提交限定 service 条件、13 项回归及三份已有中文文档，不提交输出产物、
 N=1 未决用例或用户未跟踪文件，不 push。
+
+## 2026-10-26：只在确有普通 payload 可准备时检查准备许可
+
+起点 bb0d976e4；上一轮已提交 GM service 阶段裁剪，实测 Device 降低 6.58%。
+提交后重建已成功，binding 与 HEAD 一致，AICore 二进制仍为
+d978ea3a80b0f5cbde27495bce6eac788921142d43967e04169f2cfebb248342。
+
+本轮检查 scheduler_fill_ordered_slots：刷新本核义务后，没有协同义务时会先调用
+scheduler_can_enter_ordinary，再扫描候选和空槽。因此没有普通候选、候选已经预填，
+或没有空槽的轮次仍执行共享错误 RMW 和 commit_tail 关键读，却不准备任何 payload。
+这是源码上的无效调用候选，不直接把调用次数换算成性能收益。
+
+候选仅把准备检查移动到首次找到“未准备候选＋FREE 槽”之后、写入槽状态之前。
+may_prepare 仍是本次 fill 调用的栈局部值，同轮准备可复用，跨轮不保留；
+它不赋予 kernel 执行许可，scheduler_ordered_can_enter_slot 仍逐次关键读取最新 tail。
+fill 入口的错误检查、本核义务刷新、协同领取／完成／关闭和真实执行入口均不改变。
+无可准备工作时跳过的是准备判断，不是执行判断，也不跳过发现新的协同义务。
+
+新增三项 C++ 检查先在原实现上通过：空轮询仍停止于已发布错误；
+空轮询不能授权后来出现的普通任务越过新协同准入；
+两个预填 ordinary 槽中的第一个已进入后，第二个仍须重新检查后来发布的协同任务。
+最后一项核对第一个 permit_tail=0、第二个在协同义务关闭后才得到 permit_tail=1，
+并保留每个任务只执行一次的断言。原实现的 ordered execution 共 63 项通过，
+日志 outputs/spmd-ordinary-prepare-before-cpp-20261026.log 和对应 before-gtest 原始记录。
+
+主仓改动目前只涉及 scheduler_dispatch.h 的准备判断位置；
+独立基线 worktree 固定 bb0d976e4，路径 tmp/spmd-ordinary-prepare-baseline-20261026，
+使用独立 venv、Torch 2.12、相同 PTO pin 与冻结输入。
+候选和基线均在构建，尚无本轮设备验证或性能结论。
+
+候选的 ordered execution 63 项、GM Mix 95 项、admission 102 项均通过，
+日志 outputs/spmd-ordinary-prepare-cpp-20261026.log。
+临时头文件副本分别去掉真实普通 kernel entry 的最新 tail 检查、去掉关键错误读取，
+对应新增测试各有一项实际失败，JUnit 均核对 1/1 failed；
+日志 outputs/spmd-ordinary-prepare-mutation-20261026.log。
+这些故障副本未用于设备运行，生产 helper 的关键错误与实际入口读取都保持原样。
+
+候选／基线构建均成功；20 个相关 C++ 目标全部通过，共 724 项 GTest，
+日志 outputs/spmd-ordinary-prepare-cpp-regression-20261026.log 与对应 gtest 原始记录。
+归一化路径后，Host 49 项、AICPU 32 项及 AICore 8 条实际编译命令完全相同，
+见 outputs/spmd-ordinary-prepare-compile-comparison-20261026.json。
+上板 gate 仍因无 npu-smi 无法识别；CANN query 确认 device 0 为 A5 32C/64V，
+按用户指示直接用卡，不声称 task-submit 锁隔离；预检日志保存为
+outputs/spmd-ordinary-prepare-preflight-20261026.log。
+独立基线严格 CSA L4 已通过，位于其 outputs/csa-hbg-l4-ty6i9tky/result.json。
+候选 L4 与专项仿真继续验证；新一轮捕获使用运行前路径清单排除历史捕获，
+不能把上一轮同名场景的成功记录算进本次验收。
+
+候选严格 CSA L4 已通过，结果 outputs/csa-hbg-l4-rzfs_upz/result.json：
+两轮各七项 golden、2308 条入口身份、133 条依赖、完整原生协议与原有 timing guard 均通过，
+producer=aicore。九类专项仿真测试全部通过，见
+outputs/spmd-ordinary-prepare-probes-sim-20261026.log。
+两边实际 PTO HEAD 均为 418de18dde8fa33773dc5c384fdfe5506463b628。
+本轮仍需完成新捕获审计、A5 专项、完整 HBG 回归和无完整插桩对照；
+不把已通过的功能结果先写成性能收益。
+
+收口审查还发现 test-plan-and-status.md 的细分表保留旧计数、
+“当前原生矩阵未包含 sync_start”等与其页首及实现过程矛盾的状态。
+需要依据已完成证据统一测试入口和覆盖边界，同时保留真实故障静止、N=1 公共语义等未决范围，
+不能只通过改文案把缺少设备证明的项目宣称完成。
+
+A5 九类专项测试全部通过，见 outputs/spmd-ordinary-prepare-native-20261026/probes.log。
+每个平台按 CASES 逐项选择本轮新捕获，排除运行前清单中的历史路径；
+仿真 470 份、A5 470 份均通过统一读端的完整原生因果审计。
+仿真为 972798 个事件／61907 条执行，A5 为 1380222 个事件／81587 条执行，
+明细分别保存在 outputs/spmd-ordinary-prepare-probes-sim-audit-20261026.json 和
+outputs/spmd-ordinary-prepare-probes-a5-audit-20261026.json。
+完整 HBG 回归为仿真 42 passed、A5 60 passed／4 skipped；日志
+outputs/spmd-ordinary-prepare-hbg-sim-20261026.log 和本轮 native 目录的 hbg.log。
+仍明确排除双卡 TMR 误收集与未决 N=1 容量文件，不把它们算作通过。
+
+同步 test-plan-and-status.md 的当前计数和覆盖说明：ordered execution 63、GM Mix 95、
+admission 102，补齐已验证的异构同步和 ready 顺序入口，撤销“当前未包含 sync_start”的过时描述。
+保留该文档第四节明确标注的初始失败记录，保留实际尚欠证明的范围；
+具体实现过程和性能数据仍只在本文件维护。
+适用 pre-commit 通过，见 outputs/spmd-ordinary-prepare-precommit-r2-20261026.log。
+
+所有回归、审计和构建结束后启动同卡 A/B/B/A；A 为原样 bb0d976e4，
+B 为同 HEAD 下只移动普通准备判断位置的主仓候选。
+每批三轮七项 golden、五轮预热和一百轮无完整泳道测量，分别报告 Host 和 Device。
+
+原 A/B/B/A 四批均通过正确性和计时完整性检查，现有 CSA 解析器重算 bench.log
+与 result.json 完全一致。固定的四批结果保存在 outputs/spmd-ordinary-prepare-comparison-20261026.json。
+
+| 批次 | Host 中位数（μs） | Device 中位数（μs） | 结果目录后缀 |
+| ---- | ----------------- | ------------------- | ------------ |
+| A1 | 168422.594 | 22987.996 | csa-hbg-bench-8iasba9u |
+| B1 | 98768.795 | 22300.737 | csa-hbg-bench-xj14x17r |
+| B2 | 98663.466 | 22603.330 | csa-hbg-bench-rh2poyl5 |
+| A2 | 122954.141 | 23122.565 | csa-hbg-bench-w09jtbt4 |
+
+原四批每臂 200 个样本合并：Device 中位数 A=23039.548 μs、B=22514.035 μs，
+变化 −2.281%，差值 525.514 μs；P10/P90 分别为 22464.513/23853.512 与
+22004.325/23136.517 μs。幅度较小，接近 benchmark 流程的 ±2% 波动区，不能夸大。
+Host 合并中位数为 A=160867.916 μs、B=98689.505 μs，但两批 A 差异很大，
+不把表面上的 −38.652% 作为该 AICore 改动的收益。
+
+明确发现 Host 波动后追加 B3→A3，参数仍为三轮 golden、五轮预热和一百轮测量；
+它是补充复测，不混入原 A/B/B/A 的 200 样本统计，也不删除原始不利样本。
+
+| 批次 | Host 中位数（μs） | Device 中位数（μs） | 结果目录后缀 |
+| ---- | ----------------- | ------------------- | ------------ |
+| B3 | 169824.176 | 22957.606 | csa-hbg-bench-_blyo46q |
+| A3 | 100094.614 | 23288.372 | csa-hbg-bench-lefnhq_c |
+
+补充 Device 差异 −1.420%，方向相同，但落入上述波动区，不能单独视为显著收益。
+Host 则反向变化 +69.664%，进一步排除“本改动带来稳定 Host 大幅收益”的说法。
+现有 STRACE 显示 Host 跳变集中在 bind 和 validate：高耗时的 A1/B3 分别约
+133.576/134.456 ms 与 10.576/10.862 ms，低耗时的 B1/B2/A3 分别约
+69.662/69.614/70.054 ms 与 5.478/5.472/5.496 ms。
+这是阶段归属证据，尚未定位其根因，不把它直接归因为页错误、频率或外部负载。
+补充检查与阶段统计见 outputs/spmd-ordinary-prepare-followup-20261026.json。
+
+保留该局部实现：它仅把原准备检查移到确有工作的位置，无新增持久状态，
+关键执行许可和错误检查均保留；功能与原生审计通过，Device 多批观察方向一致。
+性能结论限定为小幅改善观察，不承诺稳定 −2.281%，不与前一项优化的百分比相加，
+也不宣称整体回退已解决。准备判断与真实 entry permit 的区别同步写入编码契约。
+
+所有六批源码／二进制身份在各自实验臂一致，输入、构图、PTO、Torch 和实际编译参数一致。
+基线的三个 benchmark 和 L4 目录逐文件核对后归档到
+outputs/spmd-ordinary-prepare-baseline-evidence-20261026，其 runtime 子目录保存基线二进制；
+候选二进制保存到 outputs/spmd-ordinary-prepare-candidate-runtime-20261026，
+候选三个 benchmark 和 L4 原始目录仍保留在主仓 outputs。
+
+最终适用 pre-commit 全部通过，见 outputs/spmd-ordinary-prepare-precommit-final-20261026.log。
+确认本轮运行均已结束后删除独立基线工作树；基线结果和二进制已归档可恢复。
+阶段提交限定按需准备、三个边界回归、准备／执行许可合同和测试状态纠偏，
+不包含产物、N=1 未决文件或用户未跟踪内容，不 push。
+下一步转向完整目标的逐项验收收口，不能用这些局部优化替代 N=1 公共契约及剩余证据审查。

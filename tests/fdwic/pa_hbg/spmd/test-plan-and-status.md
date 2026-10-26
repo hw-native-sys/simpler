@@ -16,9 +16,10 @@ GM Mix 已接入且可与纯多 block 同图：六种 mask 矩阵在仿真／A5 
 新 44 个 GM 事件场景各 180 次通过。原样 CSA 七项 golden 和严格 resident L4 门禁已通过。
 首错误身份与退出冷日志已接线；显式 block/slot 身份及原样 CSA 的身份审计通过；
 完整原生协议采集、因果审计和 CSA 严格门禁已通过；N>1 sync_start 的仿真／A5
-各 47 项及原生审计通过，N=1 公共契约待确认；性能比较已完成，
-当前固定 CSA 的 Device 中位数约为设计基线的 11.41 倍，尚无性能收益；
-逐轮日志、失败修复证据和能力边界见实现过程。
+各 47 项基础矩阵及原生审计通过；另有每平台 112 项异构同步／普通交叠与依赖、
+84 项较晚 ready B 先行的原生检查。N=1 公共契约仍待确认。
+性能比较与局部优化已有实测，整体回退尚未消除；
+逐轮数值、日志、失败修复证据和能力边界集中见实现过程。
 
 ## 一、四层检查分别证明什么
 
@@ -57,21 +58,25 @@ CPU 包中另外有 [test_native_fixture.py](../../../ut/py/hbg_spmd_contracts/t
 成员前沿及普通入口许可。覆盖 B 先于未 ready A、冻结位图、epoch、容量和身份拒绝，
 并以发布者和非成员读者并发检查日志前缀。它不调用模型来证明生产 helper，
 也不以 CPU 原子结果代替 A5 cache 可见性或原生 block 执行验收。
+当前该目标 102 项，包含已发布错误后不得转移 ready 所有权或提交准入的回归。
 
 [test_hbg_ordered_execution.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_ordered_execution.cpp)
-共 59 项，直接驱动生产有序填槽、entry gate 和完成路径，包括 24 项 C/V 容量形状，
+共 63 项，直接驱动生产有序填槽、entry gate 和完成路径，包括 24 项 C/V 容量形状，
 8 项完成／LocalDone／候选所有权／predicate 停放行为，2 项无 SSBUF 的 N=3→N=1 依赖链，
 4 项普通队列探测时间和 2 项 COOPERATIVE 不伪造探测时间，另有 2 项真实 direct 后继
 延迟发布必须标记 DISPATCH、不能被误当作 inline refill 的检查；还覆盖显式身份、原生记录，
 以及新增 7 项 sync_start 至多一次领取、早返回、满核共同顺序、普通后继和零工作成员。
-计时检查使用真实 CPU_SIM 时钟。
+并检查空轮询仍停止于已发布错误、后到准入阻止普通任务越序、两个预填槽逐次取得入口许可。
+计时检查使用真实 CPU_SIM 时钟；这些用例不模拟 A5 cache 可见性。
 [test_ordered_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_ordered_native_fixture.py)
 共 96 项，检查 32 场景夹具、坏记录、真假依赖、反向准入及每轮复用来源；这些仍是 CPU 检查。
 
 [test_hbg_gm_mix.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_gm_mix.cpp)
-共 78 项，检查真实 descriptor/ack/seal、四种 mask、固定物理 lane、原 N、暂停最后发布者、
+共 95 项，检查真实 descriptor/ack/seal、四种 mask、固定物理 lane、原 N、暂停最后发布者、
 旧／未来 ack、错误身份、保留 seal、零工作成员、局部跨 task 推进及无新 kernel 的退出 drain，
-并覆盖原生记录和新增 8 项 sync_start 早关闭、迟到 AIV、零工作 cluster／未发布组。
+并覆盖原生记录和 8 项 sync_start 早关闭、迟到 AIV、零工作 cluster／未发布组。
+另有错误后停止领取／发布／执行／完成／seal、AIC/AIV 合法阶段的 service 停机门禁，
+以及同轮 publish→arrive 推进和退役后下一轮才领新组的检查。
 [test_hbg_gm_mix_startup.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_gm_mix_startup.cpp)
 另 21 项直接调用生产 executor，覆盖 startup 直接 EXIT 的 seal 收尾、
 错误退出不伪造 seal，以及缺少协调者 seal 时的超时身份。
@@ -106,19 +111,19 @@ N2→Dummy→N1 依赖、Host 已完成节点、有限服务链和畸形 metadat
 
 ## 二、已经造好的边界与尚欠设备证明的部分
 
-| 边界组 | 现有可执行测试 | 仍需随生产编码完成 |
+| 边界组 | 现有可执行测试 | 当前证据与剩余边界 |
 | ------ | -------------- | ------------------ |
-| C01–C11：N、mask、容量、身份、稀疏核 | test_shapes：合法／非法 N、32767 乘积边界、mask 4 规范化、sync 容量、拓扑重复／缺失、trace 索引 | Host 实际拒绝路径；discovery 与 placement 一致性；native 全矩阵 |
-| C12：view 和原 ABI | 原生不同 task 使用不相交 view；原样 CSA 七项 golden、TPipe PA L4 通过 | 持续保持原 kernel 与参数 ABI，补显式身份审计 |
-| C13–C16、C39、C42–C43 | 模型／交错检查；ordered 与 GM 原生验证独立任务重叠和真实依赖不早放行 | 带 order/成员的完整原生审计；sync_start 的对应检查 |
+| C01–C11：N、mask、容量、身份、稀疏核 | test_shapes：合法／非法 N、32767 乘积边界、mask 4 规范化、sync 容量、拓扑重复／缺失、trace 索引 | 合法形状原生矩阵和身份审计已通过；边界拒绝、稀疏拓扑须区分 Host/helper 与实卡证明范围 |
+| C12：view 和原 ABI | 原生不同 task 使用不相交 view；原样 CSA 七项 golden、TPipe PA L4 通过 | CSA 显式身份及原生协议审计已通过；持续保持原 kernel 与参数 ABI |
+| C13–C16、C39、C42–C43 | 模型／交错检查；ordered 与 GM 原生验证独立任务重叠和真实依赖不早放行 | order/成员及 sync_start 原生审计已通过；C39 三节点设备构造的 B 限于纯 C/V，A 覆盖七种 mask |
 | C17–C18、C22 | test_graphs：宽度 2/7/32/65/128 的 fanout/fanin、20 个固定 seed DAG；无 kernel 服务和空图 | 生产 wake-list 原子竞态与公平性；Host inline 不重复计数 |
-| C19–C20、C25–C28、C47–C49、C56 | model 与 GM C++ helper：一组一个身份、资源到达、mask 6 协调者、最后发布暂停、seal 复用；原生通信与重叠 | 完整设备组事件审计与故障静止证明 |
-| C23–C24、C55 | sync_once、容量、早到／晚到、过载和 A/B 反序死锁反例 | 有界 barrier kernel、不同物理位置和真正的满核任务；当前原生矩阵未包含 sync_start |
+| C19–C20、C25–C28、C47–C49、C56 | model 与 GM C++ helper：一组一个身份、资源到达、mask 6 协调者、最后发布暂停、seal 复用；原生通信与重叠 | 完整设备组事件审计已通过；不据此宣称任意物理故障的静止／回收已验证 |
+| C23–C24、C55 | sync_once、容量、早到／晚到、过载和 A/B 反序死锁反例 | N>1 的有界 barrier、不同位置、满核与提前局部推进已有原生证据；N=1 公共契约未决 |
 | C29–C33、C35–C38 | 模型边界；生产 C++ 重复完成；原生 retained 运行同 Worker/callable 切换 512→1→65→1→512 | GM Mix 代次／重绑、A5 故障静止与清理；不可用纯任务复用替代 |
-| C40–C41、C46、C50 | 准入去重、记录容量、准备不占可见洞、冻结成员、暂空非 EOF | 短锁和普通 entry permit 的线性化竞态、发布者失败 |
-| C44–C45、C54 | 模型反例；生产 own/direct gate、两普通候选停放且 predicate 不重算、不可撤销 block 领取 | GM Mix 统一 gate、三通道控制推进及公平性；两个普通 direct 链占满候选池仍可推迟发现协同任务 |
-| C51 | 新旧 publish_count、mode 0/3/4/非法值拒绝；原生每次比较同时验来源 | 接完整 trace 的实际 producer，不只依赖 hook |
-| C21、C34、C52–C53 | 纯 C/V 与 GM Mix 生产路径不使用 SSBUF；普通 N=2 resident 与 sync N=2 legacy 分别验收 | Graph、多 block predicate、async 继续保留能力边界 |
+| C40–C41、C46、C50 | 准入去重、记录容量、准备不占可见洞、冻结成员、暂空非 EOF | 短锁和 entry permit 的 CPU 竞态及原生因果审计已有证据；正常捕获不证明发布者物理失败的回收 |
+| C44–C45、C54 | 模型反例；生产 own/direct gate、两普通候选停放且 predicate 不重算、不可撤销 block 领取 | GM Mix 统一 gate 与原生推进已验证；两个普通 direct 链占满候选池仍可推迟发现协同任务，没有固定轮数公平上界 |
+| C51 | 新旧 publish_count、mode 0/3/4/非法值拒绝；原生每次比较同时验来源 | L4 已核对 aicore producer、显式身份及完整协议；无协议的历史捕获仍不算已验证 |
+| C21、C34、C52–C53 | 纯 C/V 与 GM Mix 生产路径不使用 SSBUF；普通 N=2 与 sync N=2 均要求 resident | Graph、多 block predicate、async 继续保留能力边界 |
 
 test_trace_audit 对缺事件、重复事件、错 task/block/slot/N/order/generation/worker、
 跨 cluster 配对、提前 TaskDone、遗漏 LocalDone、旧 epoch、错误来源、截断、
@@ -369,6 +374,7 @@ tick 是适配格式内的因果事件序号，不是已经验证过的跨核统
 
 新增 runtime helper 后，把其可控交错接入 C++ fixture，与参考合同逐项对照；
 模型的策略开关只用于测试错误协议，不是生产 feature flag。
-必须另补普通旁路 entry permit、GM descriptor/ack/seal 可见性与复用、
-inactive lane 资源释放、物理 Mix 配对和退出静止的实现测试。
-最后使用原样 CSA 的七项 golden、完整执行集合与来源门禁收口。
+普通旁路 entry permit、GM descriptor/ack/seal、inactive lane 释放和物理 Mix 配对
+已有 helper、原生探针及因果审计的分层检查；正常退出也有 drain／seal 验证。
+这些检查不替代任意物理故障下的静止和回收证明。
+原样 CSA 的七项 golden、完整执行集合与来源门禁已通过，后续修改继续保持这些门禁。

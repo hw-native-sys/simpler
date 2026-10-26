@@ -191,11 +191,6 @@ inline __aicore__ bool scheduler_fill_ordered_slots(
         return progress || closed;
     }
     bool may_prepare = false;
-    if (!scheduler_can_enter_ordinary(graph, base, local, run, admission, &may_prepare)) {
-        *failed = true;
-        return progress;
-    }
-    if (!may_prepare) return progress;
     for (uint32_t offset = 0; offset < SCHEDULER_PENDING_SLOT_COUNT; ++offset) {
         const uint32_t candidate_index = (admission->next_candidate + offset) % SCHEDULER_PENDING_SLOT_COUNT;
         auto &candidate = admission->candidates[candidate_index];
@@ -203,6 +198,14 @@ inline __aicore__ bool scheduler_fill_ordered_slots(
         for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
             auto &slot = local->slots[index];
             if (slot.state != SchedulerDispatchSlotState::FREE) continue;
+            // This decision covers preparation in this pass; each kernel entry rechecks admission.
+            if (!may_prepare) {
+                if (!scheduler_can_enter_ordinary(graph, base, local, run, admission, &may_prepare)) {
+                    *failed = true;
+                    return progress;
+                }
+                if (!may_prepare) return progress;
+            }
             slot.candidate_index = static_cast<uint8_t>(candidate_index);
             slot.predicate_cached = candidate.predicate_cached;
             slot.predicate_pass = candidate.predicate_pass;

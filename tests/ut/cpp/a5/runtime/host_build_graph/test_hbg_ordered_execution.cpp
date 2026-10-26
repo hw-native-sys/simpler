@@ -480,6 +480,89 @@ TEST(HbgOrderedExecution, CursorExhaustionIsBoundedAndDoesNotCloseLiveLocalSlots
     EXPECT_EQ(fixture.admissions[3].current_task_ref, 0);
 }
 
+TEST(HbgOrderedExecution, EmptyFillStillStopsOnAnAlreadyPublishedRunError) {
+    OrderedFixture fixture({{2, 1}, {1, 1}});
+    for (uint32_t poll = 0; poll < 8; ++poll)
+        ASSERT_TRUE(fixture.fill(0));
+    EXPECT_EQ(fixture.locals[0]->local_ready_mask, 0u);
+    EXPECT_EQ(fixture.admissions[0].current_task_ref, SCHEDULER_TASK_REF_INVALID);
+    scheduler_record_error(
+        fixture.run(), 0, SchedulerGraphResult::TIMEOUT, nullptr, fixture.locals[3],
+        SchedulerErrorSite::ORDERED_EXIT_TIMEOUT
+    );
+    EXPECT_FALSE(fixture.fill(0));
+    EXPECT_EQ(fixture.locals[0]->local_ready_mask, 0u);
+    for (const auto &candidate : fixture.admissions[0].candidates)
+        EXPECT_EQ(candidate.ready.task_ref, SCHEDULER_TASK_REF_INVALID);
+    for (const auto &slot : fixture.locals[0]->slots)
+        EXPECT_EQ(slot.state, SchedulerDispatchSlotState::FREE);
+    EXPECT_EQ(fixture.run()->error_worker_index, 3u);
+}
+
+TEST(HbgOrderedExecution, EmptyPollDoesNotGrantLaterOrdinaryWorkAPermitPastANewAdmission) {
+    OrderedFixture fixture({{1, 1}, {2, 1}});
+    for (uint32_t poll = 0; poll < 8; ++poll)
+        ASSERT_TRUE(fixture.fill(0));
+    ASSERT_TRUE(fixture.admit(1, 3));
+    ASSERT_TRUE(fixture.enqueue(0, 0));
+    ASSERT_TRUE(fixture.fill(0));
+    for (uint32_t block = 0; block < 2; ++block) {
+        OrderedExecution execution{};
+        ASSERT_TRUE(fixture.begin(0, &execution));
+        ASSERT_EQ(execution.task, 1);
+        ASSERT_TRUE(fixture.complete(execution));
+    }
+    ASSERT_TRUE(fixture.fill(0));
+    ASSERT_TRUE(fixture.fill(0));
+    OrderedExecution ordinary{};
+    ASSERT_TRUE(fixture.begin(0, &ordinary));
+    EXPECT_EQ(ordinary.task, 0);
+    EXPECT_EQ(fixture.admissions[0].scan_cursor, 1u);
+    EXPECT_EQ(fixture.control(1)->completed_blocks, 2u);
+    ASSERT_TRUE(fixture.complete(ordinary));
+    EXPECT_FALSE(fixture.begin(0, &ordinary));
+}
+
+TEST(HbgOrderedExecution, SecondPreparedOrdinarySlotRechecksAdmissionAfterTheFirstEntered) {
+    OrderedFixture fixture({{1, 1}, {1, 1}, {2, 1}}, true);
+    const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
+        fixture.base(), fixture.storage.layout.protocol.executions_offset
+    );
+    ASSERT_TRUE(fixture.enqueue(0, 0));
+    ASSERT_TRUE(fixture.enqueue(1, 0));
+    ASSERT_TRUE(fixture.fill(0));
+    ASSERT_EQ(fixture.locals[0]->local_ready_mask, 3u);
+    for (uint32_t poll = 0; poll < 8; ++poll)
+        ASSERT_TRUE(fixture.fill(0));
+    OrderedExecution first{};
+    ASSERT_TRUE(fixture.begin(0, &first));
+    ASSERT_GE(first.task, 0);
+    ASSERT_LT(first.task, 2);
+    const int64_t other = 1 - first.task;
+    EXPECT_EQ(events[first.task].permit_tail, 0u);
+    ASSERT_TRUE(fixture.admit(2, 3));
+    ASSERT_TRUE(fixture.complete(first));
+    OrderedExecution denied{};
+    EXPECT_FALSE(fixture.begin(0, &denied));
+    EXPECT_EQ(events[other].permit.sequence, 0u);
+    ASSERT_TRUE(fixture.fill(0));
+    for (uint32_t block = 0; block < 2; ++block) {
+        OrderedExecution execution{};
+        ASSERT_TRUE(fixture.begin(0, &execution));
+        ASSERT_EQ(execution.task, 2);
+        ASSERT_TRUE(fixture.complete(execution));
+    }
+    ASSERT_TRUE(fixture.fill(0));
+    ASSERT_TRUE(fixture.fill(0));
+    OrderedExecution second{};
+    ASSERT_TRUE(fixture.begin(0, &second));
+    EXPECT_EQ(second.task, other);
+    EXPECT_EQ(events[other].permit_tail, 1u);
+    EXPECT_EQ(events[first.task].permit_tail, 0u);
+    ASSERT_TRUE(fixture.complete(second));
+    EXPECT_FALSE(fixture.begin(0, &second));
+}
+
 TEST(HbgOrderedExecution, TwoPrefilledOrdinaryCandidatesYieldSlotsAndPreservePredicateDecisions) {
     OrderedFixture fixture({{1, 1}, {1, 1}, {2, 1}}, true);
     const auto *events = scheduler_state_at<SchedulerProtocolExecutionTrace>(
