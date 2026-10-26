@@ -1775,8 +1775,8 @@ CtypesFormat classify_ctypes_format(const char *format) {
 }
 
 // Resolve one wire tensor onto a local base and build the address-bearing device POD.
-// `resolved` maps CanonicalIdentity -> (local_base, address_space); the caller populates it by
-// materializing each embedded descriptor.
+// `resolved` maps native identity or (identity, mapping reference) to (local_base, address_space).
+// The consumer registry validates each argument before publishing this invocation's addresses.
 ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict resolved) {
     uint64_t elem = get_element_size(r.dtype);
     if (elem == 0) {
@@ -1785,7 +1785,8 @@ ChipTensor materialize_one(const Tensor &r, TensorTransfer transfer, nb::dict re
     if (r.byte_offset % elem != 0) {
         throw std::runtime_error("materialize: byte_offset is not a multiple of dtype size");
     }
-    nb::object key = nb::cast(r.buffer.identity);
+    nb::object key =
+        r.mapping_ref ? nb::object(nb::make_tuple(r.buffer.identity, r.mapping_ref)) : nb::cast(r.buffer.identity);
     if (!resolved.contains(key)) {
         throw std::runtime_error("materialize: canonical identity not in the import registry");
     }
@@ -2479,6 +2480,16 @@ NB_MODULE(_task_interface, m) {
         )
 
         .def_ro("buffer", &Tensor::buffer)
+        .def_ro("_mapping_ref", &Tensor::mapping_ref)
+        .def(
+            "_with_mapping_ref",
+            [](const Tensor &self, uint16_t ref) {
+                Tensor result = self;
+                result.mapping_ref = ref;
+                validate_tensor(result);
+                return result;
+            }
+        )
         .def_ro("byte_offset", &Tensor::byte_offset)
         .def_ro("ndims", &Tensor::ndims)
         .def_prop_ro(
@@ -2505,7 +2516,7 @@ NB_MODULE(_task_interface, m) {
             "__eq__",
             [](const Tensor &a, const Tensor &b) {
                 if (!(a.buffer == b.buffer) || a.byte_offset != b.byte_offset || a.ndims != b.ndims ||
-                    a.dtype != b.dtype) {
+                    a.dtype != b.dtype || a.mapping_ref != b.mapping_ref) {
                     return false;
                 }
                 for (uint32_t i = 0; i < a.ndims; ++i) {
@@ -2801,9 +2812,11 @@ NB_MODULE(_task_interface, m) {
             [](TaskArgs &self, const Tensor &t, TensorArgType tag, nb::object transfer) {
                 validate_tensor(t);
                 check_access_subset(t.buffer.access, tag);
-                const auto request = transfer.is_none() ?
-                                         legacy_tensor_transfer(static_cast<AddressSpace>(t.buffer.address_space)) :
-                                         nb::cast<TensorTransfer>(transfer);
+                const auto request =
+                    transfer.is_none() ?
+                        (t.mapping_ref ? TensorTransfer::NONE :
+                                         legacy_tensor_transfer(static_cast<AddressSpace>(t.buffer.address_space))) :
+                        nb::cast<TensorTransfer>(transfer);
                 self.add_tensor(t, tag, request);
             },
             nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT, nb::kw_only(), nb::arg("transfer") = nb::none(),
@@ -3991,6 +4004,9 @@ NB_MODULE(_task_interface, m) {
             "supports_concurrent_native_prepare", &ChipWorker::supports_concurrent_native_prepare,
             "Whether non-diagnostic native preparation may overlap one active run in another slot."
         )
+        .def_prop_ro("_host_ddr_mapping_supported", &ChipWorker::host_ddr_mapping_supported)
+        .def("_map_host_ddr", &ChipWorker::map_host_ddr, nb::call_guard<nb::gil_scoped_release>())
+        .def("_unmap_host_ddr", &ChipWorker::unmap_host_ddr, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "launch_depth", &ChipWorker::launch_depth,
             "How many runs this worker may have launched at once, after its request was resolved "

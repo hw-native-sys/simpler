@@ -128,6 +128,7 @@ from .buffer import (
     ImportContext,
     ImportRegistry,
     LocalEndpointBufferIdentityAllocator,
+    Tensor,
     _DeviceBufferSource,
     buffer_reference,
     capabilities_for_adapter,
@@ -274,6 +275,7 @@ from .global_comm_domain import (
     resolve_global_comm_capability,
     validate_descriptor_table,
 )
+from .host_ddr import HostMappingRegistry
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
@@ -12303,6 +12305,9 @@ class Worker:
         if identities:
             assert self._device_buffer_source is not None
             self._device_buffer_source.release(identities)
+        registry = self._chip_import_registry
+        if registry is not None and registry.host_mappings is not None:
+            registry.host_mappings.release(run_id)
 
     def _record_device_alloc(self, handle: Buffer, *, domain_allocation_id: int | None = None) -> None:
         """Make ``handle`` a live device allocation operands may name. Caller holds ``_child_prov_lock``.
@@ -13148,20 +13153,57 @@ class Worker:
     # ------------------------------------------------------------------
 
     def create_buffer(self, nbytes: int) -> Buffer:
-        """Allocate a shared ``Buffer`` owned by this Worker (P1-B).
-
-        The backing is a POSIX shm; the Buffer carries a typed canonical identity and a
-        self-describing descriptor, so a consumer can resolve it with no prior handshake: the
-        descriptor travels embedded in every ``Tensor`` built over this Buffer and the consumer
-        materializes it lazily on first receipt (map-once, keyed by canonical identity). At L3+ that
-        consumer is a forked child; at L2 (a leaf, no children) the Worker itself materializes the
-        tensor in-process on ``run``. Build a tensor over ``buffer.shm.buf`` with the buffer protocol.
-        Not thread-safe against a concurrent run/create/free on the same Worker.
-        """
+        """Allocate ordinary shared Host storage owned by this Worker."""
         if self.level < 2:
             raise TypeError("create_buffer requires a level >= 2 Worker")
         with self._operation_lease("create_buffer", allow_continuation=True):
             return self._create_buffer_locked(int(nbytes))
+
+    def _l2_import_registry(self) -> ImportRegistry:
+        if self._chip_import_registry is None:
+            self._chip_import_registry = ImportRegistry(
+                ImportContext(
+                    deployment=DEVICE_AICPU,
+                    device_owner_instance_id=self._owner_instance_id,
+                )
+            )
+        return self._chip_import_registry
+
+    def map_view(self, tensor: Tensor) -> Tensor:
+        """Return a local A5 Device view with the source Buffer's access grant.
+
+        The initialized Worker supplies the device/context. Whole-buffer registration
+        is reused by views, and each view keeps its own geometry and access lifetime.
+        """
+        if self.level != 2:
+            raise TypeError("map_view requires a direct level 2 Worker")
+        if not isinstance(tensor, Tensor):
+            raise TypeError("map_view requires a Tensor")
+        with self._operation_lease("map_view"):
+            buffer = self._buffers.get(int(tensor.buffer.identity.buffer_id))
+            if buffer is None or buffer.identity != tensor.buffer.identity:
+                raise ValueError("map_view requires Host storage owned by this L2 Worker")
+            registry = self._l2_import_registry()
+            if registry.host_mappings is None:
+                owner = weakref.ref(self)
+                chip = self._chip_worker
+                registry.host_mappings = HostMappingRegistry(
+                    chip,
+                    lambda: (worker := owner()) is not None
+                    and worker._chip_worker is chip
+                    and not worker._source_context_failed,
+                )
+            return registry.host_mappings.map_view(buffer, tensor)
+
+    def unmap_view(self, tensor: Tensor) -> None:
+        """Revoke this view after its accepted uses retire; failed cleanup is retryable."""
+        if self.level != 2 or not isinstance(tensor, Tensor) or not tensor._mapping_ref:
+            raise ValueError("unmap_view requires a mapped local L2 Tensor")
+        with self._operation_lease("unmap_view"):
+            registry = self._chip_import_registry
+            if registry is None or registry.host_mappings is None:
+                raise ValueError("mapped Host view belongs to another context")
+            registry.host_mappings.unmap_view(tensor)
 
     def alloc_shared_tensor(self, shapes: tuple[int, ...], dtype) -> Buffer:
         """Allocate a runtime-managed intermediate buffer (the ``Tensor`` form of ``orch.alloc``).
@@ -13906,6 +13948,11 @@ class Worker:
                     self._chip_source_uses[run_id] = sources
         native_entered = False
         try:
+            registry = self._l2_import_registry()
+            if registry.host_mappings is not None:
+                registry.host_mappings.acquire(run_id, args)
+            elif any(args.tensor(i)._mapping_ref for i in range(args.tensor_count())):
+                raise ValueError("mapped Host view is not owned by this L2 context")
             chip_args = self._materialize_l2_args(args)
             native_entered = True
             submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
@@ -13936,6 +13983,8 @@ class Worker:
         return self._chip_runs.get(run_id)
 
     def _submit_l3_locked(self, callable, args, cfg: CallConfig) -> RunHandle:
+        if args is not None and any(args.tensor(i)._mapping_ref for i in range(args.tensor_count())):
+            raise ValueError("local mapped Host views cannot be forwarded to L3 workers")
         assert self._orch is not None
         assert self._worker is not None
         if getattr(cfg, "output_prefix", ""):
@@ -14217,22 +14266,13 @@ class Worker:
         ``args`` is a ``TaskArgs`` or ``None`` (no args). The chip-only POD
         ``ChipStorageTaskArgs`` is not accepted here; this boundary requires address-free ``TaskArgs``.
         """
-        registry = self._chip_import_registry
-        if registry is None:
-            # This worker runs its own chip in-process (no fork, no mailbox): it is its own device
-            # endpoint, so DEVICE backings it materializes must be its own.
-            context = ImportContext(
-                deployment=DEVICE_AICPU,
-                device_owner_instance_id=self._owner_instance_id,
-            )
-            registry = ImportRegistry(context)
-            self._chip_import_registry = registry
-        if args is None:
-            args = TaskArgs()
-        return _materialize_chip_task_args(args, registry)
+        registry = self._l2_import_registry()
+        return _materialize_chip_task_args(TaskArgs() if args is None else args, registry)
 
     def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
         """Materialize an L2 leaf's tensor args and run the kernel to completion."""
+        if args is not None and any(args.tensor(i)._mapping_ref for i in range(args.tensor_count())):
+            raise ValueError("mapped Host views require Worker.run/submit lifetime reservations")
         _validate_host_control_access(self._callable_registry.get(callable_id), TaskArgs() if args is None else args)
         chip_args = self._materialize_l2_args(args)
         assert self._chip_worker is not None

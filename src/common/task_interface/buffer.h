@@ -231,7 +231,8 @@ struct Tensor {
     uint32_t shapes[MAX_TENSOR_DIMS];
     uint32_t strides[MAX_TENSOR_DIMS];
     DataType dtype;
-    uint8_t _pad[3];
+    uint8_t _pad[1];
+    uint16_t mapping_ref;  // Process-local registry reference; zero selects native access.
 };
 
 // Saturating u64 arithmetic. Every input below is wire-supplied, and `shapes[i]` and `strides[i]`
@@ -409,6 +410,8 @@ inline void validate_tensor(const Tensor &r) {
     const BufferDescriptor &h = r.buffer;
 
     validate_buffer_descriptor(h);
+    if (r.mapping_ref && h.address_space != static_cast<uint8_t>(AddressSpace::HOST))
+        reject("invalid Tensor: local mapping requires HOST backing");
 
     if (r.ndims == 0 || r.ndims > static_cast<uint32_t>(MAX_TENSOR_DIMS)) reject("invalid Tensor: ndims out of range");
     if (r.dtype >= DataType::DATA_TYPE_NUM) reject("invalid Tensor: unknown dtype");
@@ -629,3 +632,5 @@ static_assert(offsetof(Tensor, ndims) == 96);
 static_assert(offsetof(Tensor, shapes) == 100);
 static_assert(offsetof(Tensor, strides) == 120);
 static_assert(offsetof(Tensor, dtype) == 140);
+
+static_assert(offsetof(Tensor, mapping_ref) == 142);
