@@ -50,6 +50,7 @@
  * entries simply lacks the capability, and ChipWorker raises an explicit error
  * when a caller requests it:
  *   - registration: simpler_register_callable_v2
+ *   - graph lifetime: simpler_kernel_mode_retain_graph, simpler_kernel_mode_release_graph
  *
  * Native-run storage: caller allocates at least get_runtime_size() bytes with
  * get_runtime_alignment() alignment, zero-initializes it before first use, and
@@ -1003,7 +1004,8 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
  * concurrent auto-ID and explicit-ID registration cannot claim the same slot.
  * Registration is refused with PTO_RUNTIME_ERR_INTERNAL while a native run is
  * prepared or executing on the context. finalize_device takes the same lock;
- * runs, initialization and destroy do not, and callers still order those.
+ * kernel-mode native preparation holds it only until its reservation is acquired,
+ * before invoking orchestration. Callers still order runs, initialization and destroy.
  *
  * Explicit-ID registration rejects an already registered ID with
  * INVALID_ARGUMENT; auto-ID never returns an occupied slot. IDs may be reused
@@ -1075,7 +1077,7 @@ int simpler_run(
  * by a host-orchestrating runtime. No implicit tensor transfer is performed.
  * This preparation can allocate and synchronously publish metadata and must
  * run outside capture. Borrowed execution requires simpler_launch_run_on_stream;
- * the legacy simpler_kernel_mode_launch entry remains unsupported.
+ * A2/A3 HBG also provides capture-compatible submission through simpler_kernel_mode_launch.
  *
  * A clean failed preparation writes a host-only release marker and this
  * descriptor's run_epoch into its destroyed carrier storage. This marker is
@@ -1394,13 +1396,9 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
 /**
  * Return nonzero when this runtime can execute kernel-mode launches.
  *
- * Launches, not resources: it stays zero while simpler_kernel_mode_launch is a
- * rejecting stub, including on a runtime whose simpler_kernel_mode_init already
- * establishes a kernel context. Both onboard runtimes support initialization
- * and the shared native eager path via simpler_launch_run_on_stream. This
- * legacy capability bit does not advertise that native entry. Simulated
- * components refuse kernel init
- * with PTO_RUNTIME_ERR_UNSUPPORTED and establish nothing.
+ * A2/A3 onboard HBG provides dedicated launches. Other builds return zero;
+ * initialization and native eager execution have separate capability checks.
+ * Simulated builds refuse kernel init with PTO_RUNTIME_ERR_UNSUPPORTED.
  *
  * This is the capability question a caller asks before choosing between the
  * legacy kernel-mode entries and the shared native-run family. It is callable
@@ -1414,6 +1412,37 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
 int simpler_kernel_mode_supported(DeviceContextHandle ctx);
 
 /**
+ * Retain a graph lifetime token outside capture on an initialized, launch-ready
+ * A2/A3 onboard HBG kernel context with its borrowed RTS context current.
+ * A valid ctx is a live handle returned by create_device_context; lease points
+ * to writable uint64_t storage. Null arguments return INVALID_ARGUMENT; a
+ * non-null output is set to zero before any failure.
+ * Other builds return UNSUPPORTED after structural checks. On the supported
+ * build, a Program/uninitialized/closing/poisoned context returns INVALID_STATE.
+ * Success writes a nonzero token owned by this context. Token IDs are not
+ * reused while this runtime module remains loaded; retaining twice is allowed.
+ * Live tokens prevent callable revocation and context close, and bind dedicated
+ * submissions to one caller stream. The caller must serialize graph replays
+ * on that stream and retain every referenced tensor backing until destruction.
+ * The token owns no graph handle; caller code ends capture and destroys graphs.
+ * C++ exceptions return INTERNAL and leave the output zero.
+ */
+int simpler_kernel_mode_retain_graph(DeviceContextHandle ctx, uint64_t *lease);
+
+/**
+ * Release a token after the caller finishes every replay and destroys its graph.
+ * The ctx, runtime capability, Kernel mode and current-context requirements are
+ * the same as retain_graph. Null ctx or token zero returns INVALID_ARGUMENT;
+ * unknown, foreign-context or previously released tokens return INVALID_ARGUMENT.
+ * Releasing a non-last token only removes that token. The last release drains
+ * the two owned streams (never the borrowed caller stream or the device), so a
+ * captured graph that was never replayed can also retire safely.
+ * A drain failure returns its runtime error and keeps the token live for retry;
+ * C++ exceptions return INTERNAL. Neither entry is a capture-time operation.
+ */
+int simpler_kernel_mode_release_graph(DeviceContextHandle ctx, uint64_t lease);
+
+/**
  * Initialize a kernel-mode context on the caller's already-current device.
  *
  * A successful call latches kernel mode on the context — mutually exclusive
@@ -1424,9 +1453,11 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * only context-owned persistent handles used by asynchronous preparation and
  * launch. Cold-path bring-up may synchronize a context-owned stream — the AICPU
  * init handshake does — but never a caller stream and never the device; the
- * launch path synchronizes nothing at all. `config` is read here for the
- * runtime's admission check only. Each simpler_prepare_run() copies its own
- * config and resolves that invocation's shape, binding and diagnostics.
+ * launch path synchronizes nothing at all. A2/A3 HBG uses config to freeze
+ * launch shape, task capacity and fixed heap/definition capacity at init.
+ * ring_task_window[0] selects task capacity; ring_heap[0] bounds each of the
+ * heap and definition regions (zero selects 256 MiB). Native preparation
+ * separately resolves its invocation's shape, bindings and diagnostics.
  * `context_generation` is a nonzero host-process-unique identity minted by the
  * caller for sequential contexts; generation zero is invalid.
  * The native RTS context current at init is borrowed as well as the device.
@@ -1441,16 +1472,13 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Invalid generated resource contracts or
  * C++ exceptions during admission return PTO_RUNTIME_ERR_INTERNAL.
  * Simulated variants return PTO_RUNTIME_ERR_UNSUPPORTED and establish nothing.
- * Both onboard runtimes admit initialization; HBG determines per-run image
- * sizes at bind time rather than claiming a config-only size here.
+ * Both onboard runtimes admit initialization; A2/A3 HBG freezes configured
+ * capacity at init and checks each graph against it at launch.
  *
- * Success establishes this context's cold-path resources and latches kernel
- * mode. It does not mean kernel-mode launches are available:
- * simpler_kernel_mode_supported() answers that question and stays zero while
- * simpler_kernel_mode_launch is a rejecting stub. Nor does it retain the
- * validated contract or resolve per-preparation configuration — the contract
- * is validated and discarded, and `context_generation` is checked for being
- * nonzero and not yet given a retained lifecycle.
+ * Success establishes cold resources; simpler_kernel_mode_supported() reports
+ * whether this build also offers dedicated graph packet submission.
+ * HBG binds context_generation to its device execution slot, independently of
+ * each callable's occupancy generation.
  */
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
@@ -1476,16 +1504,27 @@ int simpler_kernel_mode_init(
  * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Registration is refused with
  * PTO_RUNTIME_ERR_INTERNAL while a native run is prepared or executing on the
  * context; retire the run before reusing the registry.
+ * On A2/A3 HBG, a control publication or completion-wait error poisons the
+ * context: close it before creating a replacement. Resources stay owned until
+ * cleanup succeeds. A submission rejected before acceptance needs no device
+ * revocation; an accepted publication is revoked even if its wait failed.
+ * C++ exceptions are returned as PTO_RUNTIME_ERR_INTERNAL.
  */
 int simpler_kernel_mode_prepare_callable(
     DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
 );
 
 /**
- * Reserved legacy single-call entry; currently a rejecting stub.
- * Native eager callers use simpler_prepare_run and simpler_launch_run_on_stream.
- *
- * The intended single-call contract is:
+ * Submit an A2/A3 HBG graph packet on the caller's stream.
+ * Other backends refuse this dedicated route. Native eager callers can use
+ * simpler_prepare_run and simpler_launch_run_on_stream outside capture.
+ * Captured calls require a graph lifetime token until all replays finish and
+ * the graph is destroyed. The caller retains tensor buffers for that lifetime.
+ * Dedicated launches refuse diagnostic flags in the init config; native eager
+ * preparation continues to support per-run diagnostics.
+ * Same-stream submissions are ordered; changing caller streams requires the
+ * previous submission tail to be complete. Native and dedicated execution
+ * cannot overlap on this context.
  *
  * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
  * caller-owned device addresses; they are passed through without ever being
@@ -1494,6 +1533,11 @@ int simpler_kernel_mode_prepare_callable(
  * stream-to-model attachment — keeping those out of the launch path is the
  * implementation's obligation. A return of 0 means the sequence was enqueued;
  * device execution may still be in flight and may still fail asynchronously.
+ * Validation/construction failure before enqueue leaves launch admission
+ * unchanged. Once enqueue is attempted, a failure poisons admission and keeps
+ * resources for explicit close after quiescence and graph destruction. C++
+ * exceptions return PTO_RUNTIME_ERR_INTERNAL, including inside launch callbacks;
+ * an error is not a completion proof and does not authorize freeing tensors.
  */
 int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream);
 

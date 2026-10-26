@@ -94,8 +94,33 @@ hbg_case(test_hbg_task_id.cpp ARCHS a2a3)
 # the orch library: that library carries hbg_orch_stubs.cpp, whose dep-gen and
 # host-phase stubs collide with the real TUs this test needs for
 # dep_gen_host_graph_begin_capture and the bind-phase records.
+hbg_case(test_hbg_definition_packing.cpp)
+
+hbg_case(test_hbg_slot_control.cpp
+    SOURCES ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_slot_control.cpp)
+
+hbg_case(test_hbg_packet_parser.cpp
+    SOURCES ${HBG_COMMON_SHARED_DIR}/kernel_graph_packet_parser.cpp)
+
+hbg_case(test_hbg_execution_validation.cpp
+    SOURCES
+        ${HBG_COMMON_SHARED_DIR}/kernel_graph_packet_parser.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_execution_validation.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_packet_reader.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_slot_control.cpp)
+
 hbg_case(test_hbg_bind_ledger.cpp
     SOURCES
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/platform_entry_args.cpp
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/platform_aicpu_affinity.cpp
+        ${HBG_HOST_DIR}/kernel_graph_template.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_execution.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_execution_entry.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_execution_validation.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_packet_reader.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_slot_control.cpp
+        ${SIMPLER_SRC}/common/platform/shared/host/kernel_execution_state.cpp
+        ${SIMPLER_SRC}/common/platform/shared/host/kernel_device_resources.cpp
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/host/runtime_maker.cpp
         ${HBG_HOST_DIR}/orchestrator.cpp
         ${HBG_HOST_DIR}/graph_recording.cpp
@@ -176,4 +201,54 @@ hbg_case(test_hbg_tensor_access.cpp
 # Everything else here is a case of this runtime with nothing beyond the
 # directory's own contract, built for both arches. Declaring one above takes it
 # out of this sweep, so the exceptions are the declarations themselves.
+hbg_case(test_hbg_kernel_registration.cpp ORCH
+    SOURCES
+        ${SIMPLER_SRC}/common/platform/sim/aicpu/platform_aicpu_affinity.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_execution_entry.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_execution.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_execution_validation.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_packet_reader.cpp
+        ${SIMPLER_SRC}/common/host_build_graph/device/kernel_graph_slot_control.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/platform_entry_args.cpp)
+
+# The real onboard HBG host boundary runs against CPU-backed RTS transport.
+# This does not execute AICPU/AICore or qualify capture on a CANN runtime.
+file(GLOB HBG_SUBMISSION_SHARED_HOST CONFIGURE_DEPENDS
+    ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/*.cpp)
+hbg_case(test_hbg_kernel_host_submission.cpp ARCHS a2a3
+    SOURCES
+        ${CMAKE_CURRENT_SOURCE_DIR}/support/hbg_host_submission/transport.cpp
+        ${SIMPLER_SRC}/a2a3/platform/onboard/host/hbg_kernel_launch.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_launch_binder.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_base.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/aicore_pmu_lease.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/c_api_shared.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_helpers.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/kernel_persistent_args.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_phase_capture.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/run_retention_probe.cpp
+        ${SIMPLER_SRC}/a2a3/platform/onboard/host/memory_allocator.cpp
+        ${HBG_SUBMISSION_SHARED_HOST}
+        ${SIMPLER_SRC}/a2a3/platform/shared/host/pmu_collector.cpp
+        ${SIMPLER_SRC}/a2a3/platform/sim/host/profiling_copy.cpp
+        ${SIMPLER_SRC}/common/platform_comm/comm_sim.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context/cpu_sim_context.cpp
+        ${SIMPLER_SRC}/common/log/host_log.cpp
+        ${SIMPLER_SRC}/a2a3/runtime/host_build_graph/host/runtime_maker.cpp
+        ${_hbg_orch_host_sources}
+        ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
+        ${HBG_HOST_DIR}/host_phase_trace.cpp
+        ${HBG_SHARED_RUNTIME_SOURCES}
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/args_dump_aicpu.cpp
+    INCLUDES_BEFORE
+        ${CMAKE_CURRENT_SOURCE_DIR}/support/hbg_host_submission
+        ${CMAKE_SOURCE_DIR}/support/native_admission
+        ${CMAKE_SOURCE_DIR}/support/kernel_args
+        ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host
+        ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context
+        ${SIMPLER_SRC}/common/log
+        ${SIMPLER_SRC}/common/worker
+    DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
+    LINK a2a3_ut_support ${CMAKE_DL_LIBS})
+
 simpler_ut_glob_cases(hbg_case)

@@ -1651,6 +1651,8 @@ int DeviceRunnerBase::finalize() {
     if (device_id_ == -1) return 0;
     const int rc = validate_current_context();
     if (rc != 0) return rc;
+    const int close_rc = close_hbg_kernel_runtime();
+    if (close_rc != 0) return close_rc;
     return finalize_impl();
 }
 
@@ -1748,7 +1750,28 @@ int DeviceRunnerBase::ensure_device_initialized() {
     return ensure_dma_workspace_warmed();
 }
 
-int DeviceRunnerBase::init_kernel_context(int device_id) {
+extern "C" __attribute__((weak)) int runtime_hbg_kernel_supported_impl() { return 0; }
+__attribute__((weak)) int DeviceRunnerBase::admit_hbg_native_run() { return 0; }
+__attribute__((weak)) int DeviceRunnerBase::configure_hbg_kernel_events() { return 0; }
+__attribute__((weak)) int DeviceRunnerBase::prepare_hbg_kernel_runtime(const CallConfig &, uint64_t, uint64_t) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+__attribute__((weak)) int DeviceRunnerBase::prepare_hbg_kernel_callable(int32_t) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+__attribute__((weak)) int
+DeviceRunnerBase::launch_hbg_kernel_callable(int32_t, const ChipStorageTaskArgs &, void *, const HostApi *) {
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+__attribute__((weak)) int DeviceRunnerBase::revoke_hbg_kernel_callable(int32_t) { return 0; }
+__attribute__((weak)) int DeviceRunnerBase::close_hbg_kernel_runtime() { return 0; }
+__attribute__((weak)) int DeviceRunnerBase::retain_hbg_kernel_graph(uint64_t *) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+__attribute__((weak)) int DeviceRunnerBase::release_hbg_kernel_graph(uint64_t) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+
+int DeviceRunnerBase::init_kernel_context(
+    int device_id, uint64_t context_generation, const CallConfig *config, const HostApi *api
+) {
+    // ensure_binaries_loaded releases the Host ELF buffer after loading it.
+    const uint64_t runtime_binary_id =
+        simpler::common::utils::elf_build_id_64(aicpu_so_binary_.data(), aicpu_so_binary_.size());
     int rc = adopt_borrowed_device(device_id);
     if (rc != 0) return rc;
 
@@ -1758,7 +1781,9 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
     clear_staged_workspace();
     if (rc != 0) return rc;
 
-    rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops());
+    rc = configure_hbg_kernel_events();
+    if (rc != 0) return rc;
+    rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops(), context_generation);
     if (rc != 0) {
         LOG_ERROR("init_kernel_context: context stream/event creation failed: %d", rc);
         return rc;
@@ -1783,7 +1808,15 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
     // The async-DMA workspace is program mode's SDMA channel; kernel mode
     // provisions none, so this launch publishes the all-zero addresses that
     // mean "that engine is unavailable".
-    return ensure_aicpu_init_launched(control_stream);
+    rc = ensure_aicpu_init_launched(control_stream);
+    if (rc != 0) return rc;
+    if (runtime_hbg_kernel_supported_impl() != 0 && config != nullptr && api != nullptr) {
+        rc = prepare_launch_shape(kernel_runtime_, *config);
+        if (rc == 0) rc = configure_kernel_affinity(kernel_runtime_);
+        if (rc == 0) rc = prepare_hbg_kernel_runtime(*config, context_generation, runtime_binary_id);
+        return rc;
+    }
+    return 0;
 }
 
 PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
@@ -1805,6 +1838,7 @@ PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
 }
 
 int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
+    if (runtime_hbg_kernel_supported_impl() != 0) return prepare_hbg_kernel_callable(callable_id);
     rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
     if (control_stream == nullptr) {
         LOG_ERROR("prepare_kernel_callable: no live kernel context");
@@ -2487,6 +2521,8 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
     if (it == callables_.end()) {
         return 0;
     }
+    const int revoke_rc = revoke_hbg_kernel_callable(callable_id);
+    if (revoke_rc != 0) return revoke_rc;
     CallableState state = std::move(it->second);
     callables_.erase(it);
     aicpu_seen_callable_ids_.erase(callable_id);
@@ -2723,10 +2759,7 @@ extern "C" int bind_callable_to_runtime_impl(
     const uint64_t *ring_dep_pool
 );
 
-int DeviceRunnerBase::bind_callable_to_runtime(
-    Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
-    const uint64_t *ring_heap, const uint64_t *ring_dep_pool
-) {
+int DeviceRunnerBase::bind_registered_callable_tables(Runtime &runtime, int32_t callable_id) {
     // Clear before anything else, including before the registry lookup: an id
     // that is gone is exactly the case where the reference still standing names
     // a block `unregister_callable` already freed, and the scheduler
@@ -2759,6 +2792,16 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     // descriptor itself was delivered at register time via RegisterCallableArgs.
     runtime.set_active_callable_id(callable_id);
 
+    return 0;
+}
+
+int DeviceRunnerBase::bind_callable_to_runtime(
+    Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
+    const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+) {
+    int rc = bind_registered_callable_tables(runtime, callable_id);
+    if (rc != 0) return rc;
+    const auto &state = callables_.at(callable_id);
     // Per-run binding (tensor args, GM heap, SM alloc). host_orch_func_ptr is
     // non-null only on the hbg path; signature is the cached ChipCallable
     // signature_[], plumbed end-to-end for per-tensor H2D/D2H direction
@@ -2857,6 +2900,10 @@ int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
 int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_common_impl(true); }
 
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
+    if (!abandon_device_resources) {
+        const int hbg_rc = close_hbg_kernel_runtime();
+        if (hbg_rc != 0) return hbg_rc;
+    }
     int rc = 0;
     auto capture = [&rc](int err) {
         if (err != 0 && rc == 0) rc = err;

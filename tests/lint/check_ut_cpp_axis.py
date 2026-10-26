@@ -104,6 +104,10 @@ SINGLE_CONTEXT_TREES = frozenset({"utils", "hierarchical", "runtime_status"})
 # is a gap to close rather than an absent combination, and its reason says so. A
 # stale entry is an error, so the table only shrinks.
 WAIVERS: dict[tuple[str, str], str] = {
+    ("common/host_build_graph/test_hbg_kernel_host_submission.cpp", "a5"): (
+        "the dedicated HBG host submission path links the A2/A3-only "
+        "hbg_kernel_launch.cpp; A5 has no supported dedicated HBG launch implementation"
+    ),
     ("common/platform/test_kernel_persistent_args.cpp", "a5/tensormap_and_ringbuffer"): (
         "the test asserts the uploaded Runtime prefix ends at teardown_gates; "
         "a5's tensormap_and_ringbuffer Runtime has no such device-initialized "

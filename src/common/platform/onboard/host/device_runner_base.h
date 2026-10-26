@@ -107,6 +107,11 @@
 #include "native_run_execution.h"
 #include "kernel_persistent_args.h"
 
+namespace hbg {
+struct KernelContextLaunchState;
+struct KernelCallableLaunchState;
+}  // namespace hbg
+
 struct HostApi;  // common/host_api.h — fwd-declared to keep task_interface headers out
 
 /**
@@ -376,7 +381,20 @@ public:
     // owned environment has no caller binding to validate; enter_run_thread
     // performs its thread attachment before device work.
     int validate_current_context() const;
-    int init_kernel_context(int device_id);
+    int init_kernel_context(
+        int device_id, uint64_t context_generation, const CallConfig *config = nullptr, const HostApi *api = nullptr
+    );
+    virtual int configure_kernel_affinity(Runtime &) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+    int admit_hbg_native_run();
+    int configure_hbg_kernel_events();
+    int prepare_hbg_kernel_runtime(const CallConfig &, uint64_t context_generation, uint64_t runtime_binary_id);
+    int prepare_hbg_kernel_callable(int32_t);
+    int launch_hbg_kernel_callable(int32_t, const ChipStorageTaskArgs &, void *, const HostApi *);
+    int revoke_hbg_kernel_callable(int32_t);
+    int close_hbg_kernel_runtime();
+    int retain_hbg_kernel_graph(uint64_t *);
+    int release_hbg_kernel_graph(uint64_t);
+    int bind_registered_callable_tables(Runtime &, int32_t);
     int prepare_kernel_callable(int32_t callable_id);
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
@@ -1012,9 +1030,8 @@ public:
 
     /**
      * Take ownership of the AICPU + AICore executor binaries. Called
-     * once by simpler_init at ChipWorker::init time; subsequent
-     * enqueue invocations read from `aicpu_so_binary_` /
-     * `aicore_kernel_binary_`.
+     * once during context initialization. AICPU bytes live through bootstrap
+     * and are then released; AICore bytes remain available for registration.
      */
     void set_executors(std::vector<uint8_t> aicpu_so_binary, std::vector<uint8_t> aicore_kernel_binary) {
         aicpu_so_binary_ = std::move(aicpu_so_binary);
@@ -2047,6 +2064,9 @@ public:
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
     const std::string &output_prefix() const { return output_prefix_; }
 
+private:
+    struct HbgKernelLaunchHelpers;
+
 protected:
     virtual LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) = 0;
 
@@ -2844,6 +2864,7 @@ protected:
         // hbg path (host already dlopen'd the orch SO)
         void *host_dlopen_handle{nullptr};
         void *host_orch_func_ptr{nullptr};
+        std::shared_ptr<hbg::KernelCallableLaunchState> hbg_launch_state;
     };
     std::unordered_map<int32_t, CallableState> callables_;
     // Held by every registration/unregistration entry point and by
@@ -2934,6 +2955,8 @@ protected:
     ExecutionModeLatch execution_mode_latch_;
     bool program_initialized_{false};
     KernelExecutionState kernel_exec_state_;
+    std::shared_ptr<hbg::KernelContextLaunchState> hbg_launch_context_;
+    uint64_t next_hbg_callable_generation_{1};
     PersistentKernelArgs persistent_args_;
     Runtime kernel_runtime_;
     int block_dim_{0};

@@ -3696,6 +3696,15 @@ NB_MODULE(_task_interface, m) {
             "from shm without rebuilding a PyChipCallable wrapper."
         )
         .def(
+            "kernel_launch",
+            [](ChipWorker &self, int32_t id, const ChipStorageTaskArgs &args, uintptr_t stream) {
+                self.kernel_launch(id, &args, reinterpret_cast<void *>(stream));
+            },
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("caller_stream")
+        )
+        .def("retain_kernel_graph", &ChipWorker::retain_kernel_graph)
+        .def("release_kernel_graph", &ChipWorker::release_kernel_graph, nb::arg("lease"))
+        .def(
             "run",
             [](ChipWorker &self, int32_t callable_id, ChipStorageTaskArgs &args, const CallConfig &config) {
                 self.run(callable_id, &args, config);

@@ -1617,4 +1617,13 @@ int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, con
     return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
+int simpler_kernel_mode_retain_graph(DeviceContextHandle ctx, uint64_t *lease) {
+    if (lease == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *lease = 0;
+    return ctx == nullptr ? PTO_RUNTIME_ERR_INVALID_ARGUMENT : PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+int simpler_kernel_mode_release_graph(DeviceContextHandle ctx, uint64_t lease) {
+    return ctx == nullptr || lease == 0 ? PTO_RUNTIME_ERR_INVALID_ARGUMENT : PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 }  // extern "C"

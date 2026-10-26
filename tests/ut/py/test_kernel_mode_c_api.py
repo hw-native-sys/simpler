@@ -1508,7 +1508,7 @@ def _run_borrowed_prepare(arch, runtime, device, release_failure=False):  # noqa
             committed = lib.committed_device_memory_ctx(ctx)
             assert lib.finalize_device(ctx) == PTO_RUNTIME_ERR_INVALID_STATE
             assert lib.committed_device_memory_ctx(ctx) == committed
-        assert lib.simpler_kernel_mode_supported(ctx) == 0
+        assert lib.simpler_kernel_mode_supported(ctx) == int(arch == "a2a3" and runtime == "host_build_graph")
         if release_failure:
             faults.set_binding_release_result(release_function, -4324)
             if runtime == "host_build_graph":

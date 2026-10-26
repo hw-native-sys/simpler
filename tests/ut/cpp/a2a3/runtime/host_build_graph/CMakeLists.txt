@@ -37,4 +37,7 @@ a2a3_hbg_case(test_hbg_submit_poison.cpp ORCH)
 a2a3_hbg_case(test_graph_activation.cpp
     SOURCES ${HBG_SHARED_RUNTIME_SOURCES})
 
+# Registered with the native-admission production source list in common/platform.
+simpler_ut_exclude_case(test_kernel_close.cpp)
+
 simpler_ut_glob_cases(a2a3_hbg_case)

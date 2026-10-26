@@ -147,7 +147,8 @@ enable_testing()
 # the same test source against their own runtime.
 set(KERNEL_PERSISTENT_ARGS_SRC
     ${SIMPLER_SRC}/common/platform/onboard/host/kernel_persistent_args.cpp
-    ${SIMPLER_SRC}/common/platform/shared/host/kernel_execution_state.cpp)
+    ${SIMPLER_SRC}/common/platform/shared/host/kernel_execution_state.cpp
+    ${SIMPLER_SRC}/common/platform/shared/host/kernel_device_resources.cpp)
 
 # Hardware-gated tests.  Only resolved when the project is configured with
 # -DSIMPLER_ENABLE_HARDWARE_TESTS=ON.  CI's no-hw `ut` job does not pass this

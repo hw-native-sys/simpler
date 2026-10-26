@@ -11,10 +11,12 @@
 
 #include "host/kernel_execution_state.h"
 
-int KernelExecutionState::initialize(int requested_device_id, const KernelContextOps &ops) {
+int KernelExecutionState::initialize(
+    int requested_device_id, const KernelContextOps &ops, uint64_t context_generation
+) {
     std::scoped_lock lock(mutex_);
     if (phase_ != KernelContextPhase::New) return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (requested_device_id < 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (requested_device_id < 0 || context_generation == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     if (!ops.valid()) return PTO_RUNTIME_ERR_INTERNAL;
 
     int current_device = -1;
@@ -30,6 +32,7 @@ int KernelExecutionState::initialize(int requested_device_id, const KernelContex
     ops_ = ops;
     device_id_ = requested_device_id;
     borrowed_context_ = current_context;
+    context_generation_ = context_generation;
 
     for (auto &stream : hidden_streams_) {
         rc = ops_.create_hidden_stream(ops_.context, &stream);
@@ -81,6 +84,7 @@ int KernelExecutionState::mark_ready_enqueued() {
     if (phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
+    if (resources_.prepared() && !resources_.frozen()) return PTO_RUNTIME_ERR_INVALID_STATE;
     phase_ = KernelContextPhase::ReadyEnqueued;
     return 0;
 }
@@ -90,6 +94,16 @@ void KernelExecutionState::poison(int runtime_error) {
     if (phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued) return;
     phase_ = KernelContextPhase::Poisoned;
     if (last_runtime_error_ == 0) last_runtime_error_ = runtime_error;
+}
+
+int KernelExecutionState::begin_close() {
+    std::scoped_lock lock(mutex_);
+    if (phase_ == KernelContextPhase::Initializing) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (phase_ == KernelContextPhase::Closed) return 0;
+    const int rc = validate_current_context_locked();
+    if (rc != 0) return rc;
+    phase_ = KernelContextPhase::Closing;
+    return 0;
 }
 
 int KernelExecutionState::close() {
@@ -121,7 +135,8 @@ int KernelExecutionState::close() {
 }
 
 int KernelExecutionState::cleanup_owned_resources_locked() {
-    int first_error = 0;
+    int first_error = resources_.close();
+    if (first_error != 0) return first_error;
     for (size_t i = events_.size(); i > 0; --i) {
         void *&event = events_[i - 1];
         if (event == nullptr) continue;
@@ -155,6 +170,15 @@ bool KernelExecutionState::accepts_dispatch() const {
     return phase_ == KernelContextPhase::Collecting || phase_ == KernelContextPhase::ReadyEnqueued;
 }
 
+bool KernelExecutionState::accepts_launch_locked() const {
+    return phase_ == KernelContextPhase::ReadyEnqueued && (!resources_.prepared() || resources_.frozen());
+}
+
+bool KernelExecutionState::accepts_launch() const {
+    std::scoped_lock lock(mutex_);
+    return accepts_launch_locked();
+}
+
 int KernelExecutionState::device_id() const {
     std::scoped_lock lock(mutex_);
     return device_id_;
@@ -186,6 +210,7 @@ void *KernelExecutionState::event(KernelEventKind kind) const {
 }
 
 bool KernelExecutionState::has_live_resources_locked() const {
+    if (resources_.has_live_resources()) return true;
     for (void *stream : hidden_streams_) {
         if (stream != nullptr) return true;
     }
@@ -193,4 +218,65 @@ bool KernelExecutionState::has_live_resources_locked() const {
         if (event != nullptr) return true;
     }
     return false;
+}
+
+int KernelExecutionState::prepare_resources(const KernelResourceLayout &layout, const KernelResourceOps &ops) {
+    std::scoped_lock lock(mutex_);
+    if (phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    // A first preparation after the context became launch-ready would allocate
+    // under a binding that may already be in flight. Only idempotent repeats
+    // remain legal in ReadyEnqueued.
+    if (phase_ == KernelContextPhase::ReadyEnqueued && !resources_.prepared()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int current_rc = validate_current_context_locked();
+    if (current_rc != 0) return current_rc;
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = resources_.prepare(layout, ops);
+    } catch (...) {
+        // Host layout allocation may fail before any device mutation.
+    }
+    if (resources_.closing()) {
+        phase_ = KernelContextPhase::Closing;
+        if (unexpected_teardown_error_ == 0) unexpected_teardown_error_ = resources_.cleanup_error();
+    }
+    return rc;
+}
+
+int KernelExecutionState::freeze_resources() {
+    std::scoped_lock lock(mutex_);
+    if (phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    return resources_.freeze();
+}
+
+int KernelExecutionState::inspect_frozen_resources(
+    int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+    KernelResourceBinding &out
+) const {
+    std::scoped_lock lock(mutex_);
+    if ((phase_ != KernelContextPhase::Collecting && phase_ != KernelContextPhase::ReadyEnqueued) ||
+        device_id != device_id_ || generation != context_generation_)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    return resources_.bind(schema, required, count, out);
+}
+
+int KernelExecutionState::bind_resources_for_launch(
+    int device_id, uint64_t generation, uint64_t schema, const uint64_t *required, size_t count,
+    KernelResourceBinding &out
+) const {
+    std::scoped_lock lock(mutex_);
+    if (!accepts_launch_locked() || device_id != device_id_ || generation != context_generation_)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    return resources_.bind(schema, required, count, out);
+}
+
+bool KernelExecutionState::resources_prepared() const {
+    std::scoped_lock lock(mutex_);
+    return resources_.prepared();
+}
+
+bool KernelExecutionState::resources_frozen() const {
+    std::scoped_lock lock(mutex_);
+    return resources_.frozen();
 }

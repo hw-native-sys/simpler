@@ -73,6 +73,51 @@ def _prepare_callable(worker, contexts, callable_image):
     assert worker.register_callable(callable_image) == 0
 
 
+def _check_hbg_dedicated_launch(worker, lib, args, stream, destination, host, nbytes, expected):
+    from simpler.task_interface import CallConfig  # noqa: PLC0415
+
+    worker.kernel_launch(0, args, stream.value)
+    assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
+    lib.aclmdlRICaptureBegin.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.aclmdlRICaptureEnd.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    lib.aclmdlRIExecuteAsync.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.aclmdlRIDestroy.argtypes = [ctypes.c_void_p]
+    other = ctypes.c_void_p()
+    assert lib.aclrtCreateStream(ctypes.byref(other)) == 0
+    lease = worker.retain_kernel_graph()
+    graph = ctypes.c_void_p()
+    assert lib.aclmdlRICaptureBegin(stream, 0) == 0
+    worker.kernel_launch(0, args, stream.value)
+    assert lib.aclmdlRICaptureEnd(stream, ctypes.byref(graph)) == 0
+    with pytest.raises(RuntimeError, match="-1002"):
+        worker.kernel_launch(0, args, other.value)
+    with pytest.raises(RuntimeError):
+        worker.unregister_callable(0)
+    for _ in range(2):
+        assert lib.aclmdlRIExecuteAsync(graph, stream) == 0
+        assert lib.aclrtMemcpyAsync(ctypes.addressof(host), nbytes, destination, nbytes, 2, stream) == 0
+        assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
+        assert all(value == expected for value in host)
+    assert lib.aclmdlRIDestroy(graph) == 0
+    worker.release_kernel_graph(lease)
+    assert lib.aclrtDestroyStream(other) == 0
+    native = worker._submit_chip_run_direct(0, args, CallConfig(), caller_stream=stream.value)
+    native.wait()
+
+
+def _check_graph_mode(worker, arch, runtime, borrowed):
+    if runtime != "host_build_graph" or arch != "a2a3" or not borrowed:
+        code = "-1003" if runtime == "host_build_graph" and arch == "a2a3" else "-1001"
+        for operation in (worker.retain_kernel_graph, lambda: worker.release_kernel_graph(1)):
+            with pytest.raises(RuntimeError, match=code):
+                operation()
+    else:
+        with pytest.raises(RuntimeError, match="-1003"):
+            worker.retain_kernel_graph()
+        with pytest.raises(RuntimeError, match="-1004"):
+            worker.release_kernel_graph(1)
+
+
 def _run(arch, runtime, device, depth, borrowed):
     from _task_interface import _ChipWorker  # noqa: PLC0415
     from simpler.task_interface import (  # noqa: PLC0415
@@ -102,6 +147,7 @@ def _run(arch, runtime, device, depth, borrowed):
         device,
         borrowed_context_generation=77 if borrowed else None,
     )
+    _check_graph_mode(worker, arch, runtime, borrowed)
     lib.aclrtMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_int]
     lib.aclrtFree.argtypes = [ctypes.c_void_p]
     lib.aclrtCreateStream.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
@@ -217,6 +263,10 @@ def _run(arch, runtime, device, depth, borrowed):
             handle.wait()
             assert handle.done
         assert not handle_owner._chip_runs
+        if borrowed and arch == "a2a3" and runtime == "host_build_graph":
+            _check_hbg_dedicated_launch(
+                worker, lib, args, stream, current_device[2], current_host[2], nbytes, outputs[-1][1]
+            )
     finally:
         # Native teardown owns this bridge's resources; the public borrowed
         # initialization and admission path is not under test here.
