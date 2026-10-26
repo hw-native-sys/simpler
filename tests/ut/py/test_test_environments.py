@@ -516,8 +516,8 @@ def test_toolchain_selection_uses_installed_manifest_and_deduplicates_aliases(tm
     monkeypatch.setattr(test_environments.platform, "machine", lambda: "aarch64")
     root = tmp_path / "Ascend"
     active = root / "cann-beta"
-    _installed_toolchain(active, "9.2.0-beta.1")
-    _installed_toolchain(root / "ascend-toolkit" / "9.0.0", "9.2.0-beta.1")
+    _installed_toolchain(active, "8.9.0")
+    _installed_toolchain(root / "ascend-toolkit" / "9.0.0", "8.9.0")
     exact = root / "ascend-toolkit" / "release-without-version-in-name"
     expected = _installed_toolchain(exact, "9.0.0", nested=True)
     (root / "ascend-toolkit" / "latest").symlink_to(exact, target_is_directory=True)
@@ -541,7 +541,7 @@ def test_toolchain_selection_preserves_an_exact_active_toolkit(tmp_path, monkeyp
     assert test_environments.select_toolchain("torch_npu") == expected
 
 
-@pytest.mark.parametrize("version,script", [("9.2.0-beta.1", True), ("9.0.0", False)])
+@pytest.mark.parametrize("version,script", [("8.9.0", True), ("9.0.0", False)])
 def test_toolchain_selection_refuses_incompatible_or_incomplete_installation(tmp_path, monkeypatch, version, script):
     monkeypatch.setattr(test_environments.platform, "machine", lambda: "aarch64")
     root = tmp_path / "Ascend"
@@ -550,7 +550,7 @@ def test_toolchain_selection_refuses_incompatible_or_incomplete_installation(tmp
     monkeypatch.setattr(test_environments, "_ASCEND_ROOT", root)
     monkeypatch.setenv("ASCEND_HOME_PATH", str(active))
 
-    with pytest.raises(ValueError, match=r"No installed qualified CANN with set_env\.sh"):
+    with pytest.raises(ValueError, match=r"No installed CANN meeting the minimum with set_env\.sh"):
         test_environments.select_toolchain("torch_npu")
 
 
@@ -560,10 +560,31 @@ def test_toolchain_selection_refuses_incompatible_or_incomplete_installation(tmp
         ("9.0.0", "aarch64", True),
         ("9.0.0", "x86_64", True),
         ("9.2.0-beta.2", "aarch64", True),
-        ("9.2.0-beta.2", "x86_64", False),
-        ("9.2.0-beta.1", "aarch64", False),
-        ("9.2.0", "aarch64", False),
-        ("9.3.0", "aarch64", False),
+        ("9.2.0-beta.2", "x86_64", True),
+        ("9.2.0-beta.1", "aarch64", True),
+        ("9.2.0", "aarch64", True),
+        ("9.3", "aarch64", True),
+        ("9.10.0", "x86_64", True),
+        ("10.0", "x86_64", True),
+        ("10.0.0-beta.1", "aarch64", True),
+        ("9", "x86_64", False),
+        ("9.0", "aarch64", True),
+        ("9.0.1-beta.1", "x86_64", True),
+        ("9.0.0-beta.2", "aarch64", True),
+        ("9.0.0-rc.1", "x86_64", True),
+        ("9.1.T500", "aarch64", True),
+        ("9.0.RC1", "x86_64", True),
+        ("9.0garbage", "x86_64", False),
+        ("9.0-", "aarch64", False),
+        ("10", "x86_64", False),
+        ("8.99", "aarch64", False),
+        ("8.9.99", "aarch64", False),
+        ("unknown", "aarch64", False),
+        ("9.2broken", "x86_64", False),
+        ("9.2.0.1", "x86_64", True),
+        ("9.2.0-beta", "aarch64", True),
+        ("09.2.0", "aarch64", True),
+        ("", "aarch64", False),
     ],
 )
 def test_toolchain_qualification_matches_selection_and_preflight(
@@ -586,9 +607,9 @@ def test_toolchain_qualification_matches_selection_and_preflight(
         assert record["cann"]["version"] == version
         assert record["machine"] == machine
     else:
-        with pytest.raises(ValueError, match="No installed qualified CANN"):
+        with pytest.raises(ValueError, match="No installed CANN meeting the minimum"):
             test_environments.select_toolchain("torch_npu", roots=[])
-        with pytest.raises(ValueError, match="not qualified"):
+        with pytest.raises(ValueError, match="does not meet the minimum version"):
             test_environments.preflight("torch_npu", packages=False)
     inventory = json.loads(capsys.readouterr().out.removeprefix("TEST_ENVIRONMENT_TOOLCHAINS "))
     assert inventory["installed"][0]["version"] == version
@@ -606,7 +627,7 @@ def test_each_qualified_active_toolchain_precedes_fallback(tmp_path, monkeypatch
     assert test_environments.select_toolchain("torch_npu", roots=[fallback]) == expected
 
 
-@pytest.mark.parametrize("machine,active_version", [("aarch64", "9.2.0-beta.1"), ("x86_64", "9.2.0-beta.2")])
+@pytest.mark.parametrize("machine,active_version", [("aarch64", "8.9.0"), ("x86_64", "9.0garbage")])
 def test_unqualified_active_falls_back_but_preflight_checks_actual_active(
     tmp_path, monkeypatch, machine, active_version
 ):
@@ -619,7 +640,7 @@ def test_unqualified_active_falls_back_but_preflight_checks_actual_active(
     monkeypatch.setattr(test_environments.platform, "machine", lambda: machine)
     monkeypatch.setenv("ASCEND_HOME_PATH", str(active))
     assert test_environments.select_toolchain("torch_npu", roots=[fallback, later]) == expected
-    with pytest.raises(ValueError, match="not qualified"):
+    with pytest.raises(ValueError, match="does not meet the minimum version"):
         test_environments.preflight("torch_npu", packages=False)
     monkeypatch.setenv("ASCEND_HOME_PATH", str(expected.parent))
     assert test_environments.preflight("torch_npu", packages=False)["cann"]["version"] == "9.0.0"
@@ -637,7 +658,7 @@ def test_toolchain_manifest_is_required_by_selection_and_preflight(tmp_path, mon
     (home / "set_env.sh").write_text("# No manifest; the directory name is not qualification.\n")
     monkeypatch.setattr(test_environments.platform, "machine", lambda: "aarch64")
     monkeypatch.setenv("ASCEND_HOME_PATH", str(home))
-    with pytest.raises(ValueError, match="No installed qualified CANN"):
+    with pytest.raises(ValueError, match="No installed CANN meeting the minimum"):
         test_environments.select_toolchain("torch_npu", roots=[])
     with pytest.raises(ValueError, match="CANN install manifest missing"):
         test_environments.preflight("torch_npu", packages=False)

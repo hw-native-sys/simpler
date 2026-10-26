@@ -180,7 +180,9 @@ def test_selected_framework_matrix_fails_missing_dependency_instead_of_skipping(
         ("9.0.0", "aarch64", True),
         ("9.0.0", "x86_64", True),
         ("9.2.0-beta.2", "aarch64", True),
-        ("9.2.0-beta.2", "x86_64", False),
+        ("9.2.0-beta.2", "x86_64", True),
+        ("10.0.0", "x86_64", True),
+        ("8.9.0", "aarch64", False),
     ],
 )
 def test_framework_setup_preserves_the_callers_installed_toolchain(tmp_path, version, machine, qualified):
@@ -224,7 +226,7 @@ def test_framework_setup_preserves_the_callers_installed_toolchain(tmp_path, ver
         assert output.read_text() == f"cann_env={script}\n"
     else:
         assert result.returncode != 0
-        assert "No installed qualified CANN" in result.stderr
+        assert "No installed CANN meeting the minimum" in result.stderr
         assert not output.exists()
 
 
