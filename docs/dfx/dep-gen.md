@@ -112,6 +112,8 @@ nothing to capture-then-reconstruct.
   actually wires: creator retention (Step A) and tensormap lookup (Step B), plus
   the declared dependencies at STEP 1. The edges are the runtime's own, not a
   replay's inference, so they cannot drift from `compute_task_fanin` semantics.
+  A Graph task's body is recorded later, at bind, once `bind_graph_definitions`
+  has fixed the Definition it replays.
 - **No ring, no collector, no replay.** The device-side dep_gen writer, its
   shared-memory ring, and the drain thread are all skipped
   (`dep_gen_host_graph_active()` tells the runner). Nothing is dropped under
@@ -223,7 +225,7 @@ of them:
 
 **Retention bounds what is kept, not what may run.** At most two unpublished
 graphs, against the same 256 MiB per-exporter budget, charged from the actual
-capacity of the five vectors an export holds plus a 1 MiB serialization
+capacity of the vectors an export holds plus a 1 MiB serialization
 reservation and a fixed destination per slot. When both slots are taken, or a
 graph is larger than the budget can accept, **the calling thread publishes it
 immediately** rather than failing the run — that submit waits for the write, as
@@ -390,6 +392,12 @@ and `"auto"` otherwise. `kernel_ids` is the per-subslot
 means a normal single-block task and values greater than `1` identify
 SPMD tasks. Tools that only need task-pair edges can ignore this block.
 
+The host-orchestrated writer (`host_build_graph`) adds two launch
+attributes to every task: `sync_start` (its blocks start together or not
+at all) and `predicated` (a dispatch predicate may skip its kernel, and a
+skipped task may leave no AICore record). The device-orchestrated writer
+omits both; consumers must treat them as optional and absent as `false`.
+
 ### `tensors[]`
 
 One entry per unique `(buffer_addr, version)` pair touched by the trace.
@@ -430,6 +438,30 @@ keep the full annotation.
 inter-task data dependencies (e.g. embarrassingly parallel kernels
 under scope_end barriers). `tasks[]` and `tensors[]` still list every
 observed task and tensor — that is not an error.
+
+### `graph_definitions[]` and `graph_shells[]`
+
+`host_build_graph` only, and only when the run replayed a Graph. A Graph
+task is one kernel-less entry in `tasks[]`, but not every kernel-less entry
+is a Graph task: the ones `graph_shells[]` names are. The body each replays
+is written here, each Definition once however many Graph tasks replay it:
+
+```json
+"graph_definitions": [
+  {"definition": 0,
+   "tasks": [{"index": 0, "kernel_ids": [5,-1,-1], "block_num": 1, "sync_start": false, "predicated": false},
+             {"index": 1, "kernel_ids": [-1,9,-1], "block_num": 4, "sync_start": true, "predicated": false}],
+   "edges": [[0, 1]]}
+],
+"graph_shells": [{"task_id": "31", "definition": 0}, {"task_id": "32", "definition": 0}]
+```
+
+A body task is named by its `index` in the body and an edge by the indices
+of its producer and consumer. Body task `i` of Graph task `t` runs under
+`TaskId::make_sub_task(local_id(t), i)` — the id its AICore records carry —
+so a reader expands each shell into the tasks and edges it actually ran.
+The Graph task's own edges in `edges[]` connect its boundary to the rest
+of the graph.
 
 ---
 

@@ -24,11 +24,22 @@ import json
 
 import torch
 from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import TensorTransfer
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 
 KERNELS_BASE = "../../vector_example/kernels"
+# predicated_dispatch submits one task under a dispatch predicate.
+PREDICATED_KERNELS = "../../predicated_dispatch/kernels"
+# graph_execution replays config-keyed Graph Definitions, so its deps.json names
+# Graph bodies, one of them replayed by two Graph tasks.
+GRAPH_EXECUTION = "../../graph_execution"
+# Graph bodies whose tasks carry a launch attribute: a dispatch predicate, and a
+# sync-start cohort.
+GRAPH_PREDICATED = "../../graph_predicated_dispatch"
+GRAPH_SYNC_START = "../../graph_sync_start_early_dispatch"
+TMR_SYNC_START_KERNELS = "../../../tensormap_and_ringbuffer/spmd_sync_start_early_dispatch/kernels"
 
 
 def _output_dirs(test_cls_name, case_name):
@@ -186,6 +197,358 @@ class TestDepGenHostBuildGraph(SceneTestCase):
         )
 
         _assert_annotations(deps)
+
+
+@scene_test(level=2, runtime="host_build_graph")
+class TestDepGenHostBuildGraphLaunchAttributes(SceneTestCase):
+    """predicated_dispatch on host_build_graph: each task's launch attributes.
+
+    The orchestration puts one task under a dispatch predicate; deps.json must
+    mark that task, and only it, predicated.
+    """
+
+    RTOL = 0
+    ATOL = 0
+
+    CALLABLE = {
+        "orchestration": {
+            "source": f"{PREDICATED_KERNELS}/orchestration/predicated_dispatch_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.INOUT, D.INOUT, D.INOUT],  # X, Y, gate
+        },
+        "incores": [
+            {
+                "func_id": 0,
+                "name": "WRITE_CONST",
+                "source": f"{PREDICATED_KERNELS}/aic/kernel_write_const.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 1,
+                "name": "COPY_FIRST",
+                "source": f"{PREDICATED_KERNELS}/aic/kernel_copy_first.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.INOUT],
+            },
+            {
+                "func_id": 2,
+                "name": "CLOBBER",
+                "source": f"{PREDICATED_KERNELS}/aic/kernel_clobber.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 3,
+                "name": "WRITE_GATE",
+                "source": f"{PREDICATED_KERNELS}/aic/kernel_write_gate.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+        ],
+    }
+
+    CASES = [
+        {
+            "name": "gate_open",
+            "platforms": ["a5sim", "a5"],
+            "manual": ["a5sim"],
+            "config": {"aicpu_thread_num": 2},
+            "params": {"case": 2},
+        },
+    ]
+
+    def generate_args(self, params):
+        return TaskArgsBuilder(
+            TensorArg("x", torch.full((16,), -1.0, dtype=torch.float32)),
+            TensorArg("y", torch.full((16,), -1.0, dtype=torch.float32)),
+            TensorArg("gate", torch.full((16,), -1, dtype=torch.int32)),
+            Scalar("case", int(params["case"])),
+        )
+
+    def compute_golden(self, args, params):
+        # case=2 opens the gate, so the clobber dispatches and X/Y end at 999.0.
+        args.gate[0] = 1
+        args.x[0] = 999.0
+        args.y[0] = 999.0
+
+    def test_run(self, st_platform, st_worker, request):
+        dirs_before_run = {
+            case["name"]: _output_dirs("TestDepGenHostBuildGraphLaunchAttributes", case["name"])
+            for case in self._matching_cases(st_platform, request)
+        }
+        super().test_run(st_platform, st_worker, request)
+        if not self._effective_enable_dep_gen(request):
+            return
+        for case in self._matching_cases(st_platform, request):
+            self._post_validate(case, dirs_before_run[case["name"]])
+
+    def _post_validate(self, case, dirs_before_run):
+        deps = _load_deps("TestDepGenHostBuildGraphLaunchAttributes", case["name"], dirs_before_run)
+
+        # predicated_dispatch_orch.cpp, in submit order:
+        #   t0 WRITE_GATE  t1 WRITE_CONST  t2 CLOBBER (predicated)  t3 COPY_FIRST
+        tasks = deps.get("tasks", [])
+        attrs = [(t["sync_start"], t["predicated"]) for t in tasks]
+        assert attrs == [(False, False), (False, False), (False, True), (False, False)], attrs
+
+
+@scene_test(level=2, runtime="host_build_graph")
+class TestDepGenHostBuildGraphGraphBodies(SceneTestCase):
+    """graph_execution on host_build_graph: the bodies its Graph tasks replay.
+
+    A Graph task is one kernel-less entry in tasks[]. graph_definitions[] holds
+    each Definition once, its tasks by index and its internal edges, and
+    graph_shells[] names the one each Graph task replays.
+    """
+
+    RTOL = 1e-5
+    ATOL = 1e-5
+
+    CALLABLE = {
+        "orchestration": {
+            "source": f"{GRAPH_EXECUTION}/kernels/orchestration/graph_execution_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.IN, D.IN, D.OUT, D.OUT, D.OUT],
+        },
+        "incores": [
+            {
+                "func_id": 0,
+                "source": f"{KERNELS_BASE}/aiv/kernel_add.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.IN, D.OUT],
+            },
+            {
+                "func_id": 1,
+                "source": f"{KERNELS_BASE}/aiv/kernel_add_scalar.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.OUT],
+            },
+            {
+                "func_id": 2,
+                "source": f"{KERNELS_BASE}/aiv/kernel_mul.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.IN, D.OUT],
+            },
+        ],
+    }
+
+    CASES = [
+        {
+            "name": "graph_bodies",
+            "platforms": ["a5sim", "a5"],
+            "manual": ["a5sim"],
+            "params": {"shape": (128 * 128,)},
+        },
+    ]
+
+    def generate_args(self, params):
+        shape = params["shape"]
+        return TaskArgsBuilder(
+            TensorArg("a", torch.full(shape, 2.0, dtype=torch.float32)),
+            TensorArg("b", torch.full(shape, 3.0, dtype=torch.float32)),
+            TensorArg("output_1", torch.zeros(shape, dtype=torch.float32)),
+            TensorArg("output_3", torch.zeros(shape, dtype=torch.float32)),
+            TensorArg("output_5", torch.zeros(shape, dtype=torch.float32)),
+        )
+
+    def compute_golden(self, args, params):
+        base = args.a + args.b
+        args.output_1[:] = (base + 1.0) * (base + 2.0)
+        args.output_3[:] = (base + 100.0) * (base + 4.0)
+        args.output_5[:] = (base + 5.0) * (base + 6.0)
+
+    def test_run(self, st_platform, st_worker, request):
+        dirs_before_run = {
+            case["name"]: _output_dirs("TestDepGenHostBuildGraphGraphBodies", case["name"])
+            for case in self._matching_cases(st_platform, request)
+        }
+        super().test_run(st_platform, st_worker, request)
+        if not self._effective_enable_dep_gen(request):
+            return
+        for case in self._matching_cases(st_platform, request):
+            self._post_validate(case, dirs_before_run[case["name"]])
+
+    def _post_validate(self, case, dirs_before_run):
+        deps = _load_deps("TestDepGenHostBuildGraphGraphBodies", case["name"], dirs_before_run)
+
+        # graph_execution_orch.cpp: a seed task, then three Graph tasks; the first
+        # and the third share a config, and so one Definition.
+        graph_tasks = [int(t["task_id"]) for t in deps["tasks"] if t["kernel_ids"] == [-1, -1, -1]]
+        assert graph_tasks == [1, 2, 3], f"Graph tasks in tasks[]: {graph_tasks}"
+        shells = {int(s["task_id"]): s["definition"] for s in deps.get("graph_shells", [])}
+        assert shells == {1: 0, 2: 1, 3: 0}, f"graph_shells names the wrong bodies: {shells}"
+
+        # Each body is the orchestration's sub-DAG: add, two add_scalar and mul,
+        # with two kernel-less tasks.
+        definitions = deps.get("graph_definitions", [])
+        assert [d["definition"] for d in definitions] == [0, 1], definitions
+        for d in definitions:
+            kernels = [t["kernel_ids"] for t in d["tasks"]]
+            assert [t["index"] for t in d["tasks"]] == list(range(6)), d["tasks"]
+            assert kernels == [[-1, -1, -1], [-1, 0, -1], [-1, -1, -1], [-1, 1, -1], [-1, 1, -1], [-1, 2, -1]], kernels
+            assert all(t["block_num"] == 1 and not t["sync_start"] and not t["predicated"] for t in d["tasks"])
+            edges = sorted(map(tuple, d["edges"]))
+            assert edges == [(1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 5), (4, 5)], edges
+
+
+class _GraphBodyAttrsCase(SceneTestCase):
+    """Runs a Graph scene, then asserts the launch attributes of its body tasks.
+
+    Compute correctness is the scene's own test's to check; this one checks only
+    what deps.json records.
+    """
+
+    # (sync_start, predicated) per body task, by index.
+    BODY_ATTRS: list = []
+
+    def compute_golden(self, args, params):
+        pass
+
+    def compare_outputs(self, test_args, golden_args, output_names, params):
+        pass
+
+    def test_run(self, st_platform, st_worker, request):
+        name = type(self).__name__
+        dirs_before_run = {
+            case["name"]: _output_dirs(name, case["name"]) for case in self._matching_cases(st_platform, request)
+        }
+        super().test_run(st_platform, st_worker, request)
+        if not self._effective_enable_dep_gen(request):
+            return
+        for case in self._matching_cases(st_platform, request):
+            definitions = _load_deps(name, case["name"], dirs_before_run[case["name"]]).get("graph_definitions", [])
+            assert definitions, "deps.json records no Graph body"
+            for d in definitions:
+                got = [(t["sync_start"], t["predicated"]) for t in d["tasks"]]
+                assert got == self.BODY_ATTRS, f"definition {d['definition']}: got {got}, expected {self.BODY_ATTRS}"
+
+
+@scene_test(level=2, runtime="host_build_graph")
+class TestDepGenHostBuildGraphGraphPredicated(_GraphBodyAttrsCase):
+    """graph_predicated_dispatch: three of the body's five tasks run under a predicate."""
+
+    CALLABLE = {
+        "orchestration": {
+            "source": f"{GRAPH_PREDICATED}/kernels/orchestration/graph_predicated_dispatch_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.INOUT] * 8 + [D.IN] * 4,  # x0..x3, y0..y3, gate0..gate3
+        },
+        "incores": [
+            {
+                "func_id": 0,
+                "name": "WRITE_CONST",
+                "source": f"{PREDICATED_KERNELS}/aic/kernel_write_const.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 1,
+                "name": "COPY_FIRST",
+                "source": f"{PREDICATED_KERNELS}/aic/kernel_copy_first.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.INOUT],
+            },
+            {
+                "func_id": 2,
+                "name": "CLOBBER",
+                "source": f"{PREDICATED_KERNELS}/aic/kernel_clobber.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 3,
+                "name": "WRITE_GATE",
+                "source": f"{PREDICATED_KERNELS}/aic/kernel_write_gate.cpp",
+                "core_type": "aic",
+                "signature": [D.OUT],
+            },
+            {
+                "func_id": 4,
+                "name": "CLOBBER_ALT",
+                "source": f"{GRAPH_PREDICATED}/kernels/aic/kernel_clobber_alt.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+        ],
+    }
+
+    CASES = [
+        {
+            "name": "predicated_body",
+            "platforms": ["a5sim", "a5"],
+            "manual": ["a5sim"],
+            "params": {},
+        },
+    ]
+
+    # WRITE_GATE, WRITE_CONST, then CLOBBER, CLOBBER_ALT and COPY_FIRST under a predicate.
+    BODY_ATTRS = [(False, False), (False, False), (False, True), (False, True), (False, True)]
+
+    def generate_args(self, params):
+        # Every gate closed: a predicate's value decides a dispatch, not the
+        # attribute deps.json records.
+        xy = [TensorArg(f"{n}{i}", torch.full((16,), -1.0, dtype=torch.float32)) for n in "xy" for i in range(4)]
+        gates = [TensorArg(f"gate{i}", torch.zeros((16,), dtype=torch.int32)) for i in range(4)]
+        return TaskArgsBuilder(*xy, *gates, *(Scalar(f"internal_gate{i}", 0) for i in range(4)))
+
+
+@scene_test(level=2, runtime="host_build_graph")
+class TestDepGenHostBuildGraphGraphSyncStart(_GraphBodyAttrsCase):
+    """graph_sync_start_early_dispatch: the body's first task is a sync-start cohort."""
+
+    CALLABLE = {
+        "orchestration": {
+            "source": f"{GRAPH_SYNC_START}/kernels/orchestration/graph_sync_start_early_dispatch_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.INOUT, D.INOUT],
+        },
+        "incores": [
+            {
+                "func_id": 0,
+                "source": f"{TMR_SYNC_START_KERNELS}/aiv/kernel_spmd_write_slow.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 1,
+                "source": f"{GRAPH_EXECUTION}/kernels/aic/kernel_spmd_mix.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 2,
+                "source": f"{GRAPH_EXECUTION}/kernels/aiv/kernel_spmd_mix.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 3,
+                "source": f"{GRAPH_EXECUTION}/kernels/aiv/kernel_spmd_mix.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
+        ],
+    }
+
+    CASES = [
+        {
+            "name": "sync_start_body",
+            "platforms": ["a5sim", "a5"],
+            "manual": ["a5sim"],
+            "params": {},
+        },
+    ]
+
+    # The sync-start MIX cohort, then the ordinary tail it feeds.
+    BODY_ATTRS = [(True, False), (False, False)]
+
+    def generate_args(self, params):
+        # The orchestration's layout at its widest, 36 clusters: 118 cache lines.
+        return TaskArgsBuilder(
+            TensorArg("output", torch.full((118 * 16,), -1.0, dtype=torch.float32)),
+            TensorArg("layout", torch.zeros(1, dtype=torch.int32), transfer=TensorTransfer.NONE),
+        )
 
 
 if __name__ == "__main__":

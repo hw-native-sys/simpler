@@ -1067,6 +1067,9 @@ bool bind_graph_definitions(
             packed_definition.populations_ready = true;
         }
         ready_queue_populations->add(packed_definition.ready_queue_populations);
+        if (dep_gen_host_graph_enabled()) {
+            dep_gen_host_graph_add_graph_body(upload->outer_slot->to_descriptor().task_id, *definition);
+        }
         // The Definition is named by its position in this run's section, not by an
         // address: the bytes reach the device as the tail of each AICPU thread's
         // own launch arguments, so no address in them is shared. graph_context

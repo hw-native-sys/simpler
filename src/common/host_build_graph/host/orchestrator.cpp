@@ -612,8 +612,9 @@ static TaskOutputTensors submit_task_common(
             aiv1_kernel_id,
         };
         dep_gen_host_graph_begin_task(
-            task_id, orch->in_manual_scope(), args.allow_early_resolve(), kernel_ids_capture.data(),
-            args.launch_spec.block_num(), args.tensor_count(), args.tensor_data(), args.tag_data()
+            task_id, orch->in_manual_scope(), args.allow_early_resolve(), task_attrs.requires_sync_start(),
+            task_attrs.has_predicate(), kernel_ids_capture.data(), args.launch_spec.block_num(), args.tensor_count(),
+            args.tensor_data(), args.tag_data()
         );
     }
 

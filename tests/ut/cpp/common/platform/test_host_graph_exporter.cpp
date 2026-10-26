@@ -623,7 +623,7 @@ TEST_F(HostGraphExporterTest, AFlushTimeoutClaimsNothing) {
  * queued and the writer is held at the top of `publish`, so the injection
  * covers the publication and not `seal`. That boundary is about this file's
  * `take_stub`, which builds a graph and so allocates, where the production
- * hand-off only moves five vectors: `seal` is `noexcept`, so a failure inside
+ * hand-off only moves vectors: `seal` is `noexcept`, so a failure inside
  * the stub's build would terminate the process rather than exercise anything.
  */
 TEST_F(HostGraphExporterTest, AThrowingPublicationLeavesNoTemporaryBehind) {
