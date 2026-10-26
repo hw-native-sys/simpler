@@ -44,6 +44,18 @@ ENVIRONMENTS = {
         (9, 0),
         (("torch", "torch"), ("torch_npu", "torch_npu")),
     ),
+    "vllm_torch_npu": TestEnvironment(
+        "direct",
+        ".github/actions/setup-vllm-eager/constraints.txt",
+        (9, 0),
+        (
+            ("torch", "torch"),
+            ("torch-npu", "torch_npu"),
+            ("numpy", "numpy"),
+            ("vllm", "vllm"),
+            ("vllm-ascend", "vllm_ascend"),
+        ),
+    ),
 }
 _PROPERTY_PREFIX = "simpler_"
 _ASCEND_ROOT = Path("/usr/local/Ascend")
