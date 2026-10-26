@@ -162,6 +162,7 @@ nav:
       - PMU: dfx/pmu-profiling.md
       - Args dump: dfx/args-dump.md
       - dep_gen: dfx/dep-gen.md
+      - Scheduler benchmark: dfx/scheduler-benchmark.md
       - Scope stats: dfx/scope-stats.md
       - Backpressure: dfx/backpressure-design.md
       - Buffer capacity audit: dfx/dfx-buffer-capacity-audit.md

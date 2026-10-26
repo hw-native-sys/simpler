@@ -75,6 +75,7 @@ The analysis CLIs ship in the wheel under `simpler_setup.tools`; run them with
 | `strace_timing` | the run log | host/device wall-clock breakdown, per-round table |
 | `swimlane_converter` | `chip_swimlane_records_*.json` | a Perfetto trace plus a per-function task summary; `--overhead` overlays the scheduler-overhead counters |
 | `sched_overhead_analysis` | swimlane + deps | whether the scheduler is the bottleneck or starved |
+| `scheduler_benchmark` | swimlane + deps | how much of the run was dispatch and how much the schedule it chose |
 | `core_swimlane` | an args dump | intra-core pipeline trace for one task |
 | `deps_viewer`, `critical_path` | `deps.json` | the dependency graph, and its critical path |
 | `dump_viewer` | an args dump | the captured per-task arguments |
