@@ -111,8 +111,9 @@ jobs:
             --env VLLM_MODEL_DIR --env VLLM_ARTIFACT --env VLLM_PROMPT_IDS --env VLLM_ADAPTER_ROOT \
             --env VLLM_SOURCE_DIR --env VLLM_ASCEND_SOURCE_DIR \
             --timeout 7200 --max-time 7200 --device auto --device-num 1 \
-            --run "source \"\$CANN_ENV\" && source \"\$ATB_ENV\" && .venv-vllm/bin/python .github/actions/setup-vllm-eager/identity.py && .venv-vllm/bin/python -m pytest examples tests/st --platform a2a3 --test-environment vllm_torch_npu --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/vllm-eager-ci/pytest --junitxml outputs/vllm-eager-ci/results.xml"
+            --run "source \"\$CANN_ENV\" && source \"\$ATB_ENV\" && .venv-vllm/bin/python .github/actions/setup-vllm-eager/identity.py && .venv-vllm/bin/python -m pytest examples tests/st --platform a2a3 --test-environment vllm_torch_npu --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/vllm-eager-ci/pytest --junitxml outputs/vllm-eager-ci/results.xml && SIMPLER_SCHEDULER_TIMEOUT_MS=2000 SIMPLER_OP_EXECUTE_TIMEOUT_US=3000000 SIMPLER_STREAM_SYNC_TIMEOUT_MS=4000 .venv-vllm/bin/python -m pytest examples tests/st --platform a2a3 --test-environment torch_npu_2_10 --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/vllm-eager-ci/pytest-framework-eager --junitxml outputs/vllm-eager-ci/results-framework-eager.xml"
           .venv-vllm/bin/python -m simpler_setup.test_environments verify outputs/vllm-eager-ci/results.plan.json outputs/vllm-eager-ci/results.xml
+          .venv-vllm/bin/python -m simpler_setup.test_environments verify outputs/vllm-eager-ci/results-framework-eager.plan.json outputs/vllm-eager-ci/results-framework-eager.xml
 
       - name: Retain vLLM eager identities and logs
         if: always()

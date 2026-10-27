@@ -429,8 +429,11 @@ Qwen3-14B vLLM path tracked by issue #2715. Tests declare
 `@pytest.mark.test_environment("vllm_torch_npu")`. The dedicated A3 job installs
 the pinned vLLM 0.20.2 / vLLM-Ascend 0.20.2rc1 pair with Torch-NPU 2.10.0 using
 the staged upstream recipe, then runs the native vLLM baseline and the Simpler
-decode smoke in separate processes. The heavy cases are marked `manual`, so
-Daily includes them while ordinary PR sweeps exclude them.
+decode smoke in separate processes. The same exclusive task then runs the
+target-version framework eager suite through the `torch_npu_2_10` profile, so
+the existing `test_environment("torch_npu")` declarations are qualified on
+Torch-NPU 2.10.0 with their own plan/JUnit receipt. The heavy cases are marked
+`manual`, so Daily includes them while ordinary PR sweeps exclude them.
 
 The runner must provide the model, verified HBG artifact and frozen prompt IDs
 through the `VLLM_MODEL_DIR`, `VLLM_ARTIFACT` and `VLLM_PROMPT_IDS` repository
