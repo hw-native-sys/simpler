@@ -517,6 +517,42 @@ def test_vllm():
         assert plan.exists() == (profile != "default")
 
 
+def test_target_version_profile_reuses_the_declared_framework_suite():
+    profile = test_environments.ENVIRONMENTS["torch_npu_2_10"]
+    assert profile.execution == "direct"
+    assert profile.cann_minimum == (9, 0)
+    assert profile.suite == "torch_npu"
+    assert dict(profile.modules) == {"torch": "torch", "torch-npu": "torch_npu"}
+    requirements = test_environments.requirements("torch_npu_2_10")
+    assert requirements["torch"] == "2.10.0+cpu"
+    assert requirements["torch-npu"] == "2.10.0"
+
+
+def test_target_version_profile_selects_only_the_declared_framework_suite(tmp_path):
+    source = """
+import pytest
+
+def test_default():
+    pass
+
+@pytest.mark.test_environment("torch_npu")
+def test_framework():
+    pass
+
+@pytest.mark.test_environment("vllm_torch_npu")
+def test_vllm():
+    pass
+"""
+    result, plan_path, xml_path = _run_pytest(tmp_path, source, profile="torch_npu_2_10")
+    _success(result)
+    assert {case.get("name") for case in ET.parse(xml_path).getroot().iter("testcase")} == {"test_framework"}
+    plan = json.loads(plan_path.read_text())
+    assert plan["environment"] == "torch_npu_2_10"
+    assert plan["suite"] == "torch_npu"
+    test_environments.verify_results(plan_path, xml_path)
+    assert "TEST_ENVIRONMENT_VERIFIED" in result.stdout
+
+
 def _recording_direct_source(directory):
     return (
         _DIRECT.format(count=2)

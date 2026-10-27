@@ -34,6 +34,9 @@ class TestEnvironment:
     constraints: str | None = None
     cann_minimum: tuple[int, int] | None = None
     modules: tuple[tuple[str, str], ...] = ()
+    # Version-qualified profiles can qualify a suite that declares another
+    # environment name. The suite name must itself be a registered profile.
+    suite: str | None = None
 
 
 ENVIRONMENTS = {
@@ -43,6 +46,15 @@ ENVIRONMENTS = {
         ".github/actions/setup-framework-eager/constraints.txt",
         (9, 0),
         (("torch", "torch"), ("torch_npu", "torch_npu")),
+    ),
+    # Target vLLM-Ascend 0.20.2rc1 stack (issue #2715): the same declared
+    # framework eager suite on Torch-NPU 2.10.0 instead of the pinned 2.7.1.
+    "torch_npu_2_10": TestEnvironment(
+        "direct",
+        ".github/actions/setup-vllm-eager/constraints.txt",
+        (9, 0),
+        (("torch", "torch"), ("torch-npu", "torch_npu")),
+        suite="torch_npu",
     ),
     "vllm_torch_npu": TestEnvironment(
         "direct",
@@ -80,11 +92,17 @@ def environment_for_item(item) -> str:
     return next(iter(declared), "default")
 
 
+def declared_suite(name: str) -> str:
+    """Return the suite name that items declare for this environment profile."""
+    profile = _environment(name)
+    return profile.suite or name
+
+
 def select_environment(items, name: str):
-    _environment(name)
+    declared = declared_suite(name)
     selected, deselected = [], []
     for item in items:
-        (selected if environment_for_item(item) == name else deselected).append(item)
+        (selected if environment_for_item(item) == declared else deselected).append(item)
     return selected, deselected
 
 
@@ -244,6 +262,7 @@ def prepare_session(session) -> None:
     name = config.getoption("--test-environment", default="default")
     if _environment(name).execution != "direct" or config.getoption("collectonly", default=False):
         return
+    declared = declared_suite(name)
     xmlpath = config.getoption("xmlpath", default=None)
     if not xmlpath:
         raise pytest.UsageError(f"{name} requires --junitxml to verify every selected test")
@@ -252,7 +271,7 @@ def prepare_session(session) -> None:
     validate_execution(config)
     cases = []
     for item in session.items:
-        if environment_for_item(item) != name:
+        if environment_for_item(item) != declared:
             raise pytest.UsageError(f"Wrong environment in final collection: {item.nodeid}")
         if item.get_closest_marker("device_count") or getattr(getattr(item, "cls", None), "_st_level", None):
             raise pytest.UsageError(f"{name} cannot aggregate dispatcher results: {item.nodeid}")
@@ -282,6 +301,7 @@ def prepare_session(session) -> None:
     plan = {
         "source": source,
         "environment": name,
+        "suite": declared,
         "platform": config.getoption("--platform", default=None),
         "identity": identity,
         "cases": cases,
@@ -315,6 +335,8 @@ def verify_results(plan_path: Path, xml_path: Path) -> None:
         raise ValueError(f"Cannot identify the test source checkout: {error}") from error
     if profile.execution != "direct" or plan["source"] != source:
         raise ValueError("Test plan source or execution environment does not match this checkout")
+    if plan.get("suite", plan["environment"]) != (profile.suite or plan["environment"]):
+        raise ValueError("Test plan suite does not match its environment profile")
     expected = {case["nodeid"]: case for case in plan["cases"]}
     if not expected or len(expected) != len(plan["cases"]):
         raise ValueError("Test plan must contain unique, nonempty nodeids")

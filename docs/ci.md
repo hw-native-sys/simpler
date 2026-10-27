@@ -317,6 +317,14 @@ callers default to `exclude`, while Daily passes `include`. The existing
 framework cases are automated, but a future manual case in this environment is
 discovered and included by Daily without another workflow edit.
 
+The same declared suite has a target-version qualification profile,
+`torch_npu_2_10`. It selects the `test_environment("torch_npu")` cases with the
+vLLM-Ascend 0.20.2rc1 constraints in
+`.github/actions/setup-vllm-eager/constraints.txt` (CPU Torch 2.10.0 and
+torch_npu 2.10.0). The profile reuses the existing declarations instead of
+duplicating cases; its receipt plan records both the selected profile and the
+declared suite it qualifies.
+
 The dedicated environment uses `--system-site-packages` and installs local,
 pinned wheels for CPU Torch 2.7.1 and torch_npu 2.7.1.post4. The pins constrain
 subsequent test/SDK installation too. The profile selects an already installed
