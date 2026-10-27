@@ -267,9 +267,9 @@ void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *aicore_mailbox, con
             static_cast<unsigned long long>(detail.addr), static_cast<unsigned long long>(detail.backend_cookie),
             detail.expected_value, observed, static_cast<unsigned>(detail.retired)
         );
-        if (detail.completion_type == COMPLETION_TYPE_RDMA_EVENT_HANDLE) {
-            pto2::rdma_backend::log_rdma_event_handle_snapshot(
-                detail.addr, detail.backend_cookie, detail.entry_idx, detail.condition_idx
+        if (detail.completion_type == COMPLETION_TYPE_RDMA_HNS1825_CQE) {
+            pto2::rdma_backend::log_rdma_hns1825_cqe_record_snapshot(
+                detail.addr, detail.expected_value, detail.entry_idx, detail.condition_idx
             );
         }
     }

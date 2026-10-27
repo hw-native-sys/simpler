@@ -182,7 +182,12 @@ target_compile_definitions(host_runtime PRIVATE
 )
 
 if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
-    target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
+    target_compile_definitions(host_runtime PRIVATE
+        SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1
+        PTO_COMM_WORKSPACE_SDMA_SUPPORTED=1
+        PTO_COMM_WORKSPACE_URMA_SUPPORTED=0
+        PTO_COMM_WORKSPACE_RDMA_SUPPORTED=0
+    )
 endif()
 if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE
@@ -242,6 +247,7 @@ target_include_directories(host_runtime
 
 # Prefer libhccl when the CANN package ships it. Newer CANN packages may only
 # ship libhcomm, matching pto-isa's own A5 comm tests, so fall back to hcomm.
+unset(HCCL_LIB CACHE)
 find_library(HCCL_LIB
     NAMES hccl
     PATHS
@@ -249,6 +255,7 @@ find_library(HCCL_LIB
         ${ASCEND_ARCH_HOME}/lib64
     NO_DEFAULT_PATH
 )
+unset(HCOMM_LIB CACHE)
 find_library(HCOMM_LIB
     NAMES hcomm
     PATHS

@@ -275,9 +275,12 @@ class RuntimeBuilder:
             return ""
         if pto_isa_commit is None:
             pto_isa_commit = self._resolve_build_pto_isa_commit()
+        parts = [runtime_commit]
         if pto_isa_commit:
-            return f"{runtime_commit}:pto-isa={pto_isa_commit}"
-        return runtime_commit
+            parts.append(f"pto-isa={pto_isa_commit}")
+        if self._variant == "onboard":
+            parts.append(f"ascend-home={os.environ.get('ASCEND_HOME_PATH', '').strip()}")
+        return ":".join(parts)
 
     def _lookup_binaries(self, name: str, output_dir: Path) -> RuntimeBinaries:
         """Look up pre-built binaries from output_dir.
