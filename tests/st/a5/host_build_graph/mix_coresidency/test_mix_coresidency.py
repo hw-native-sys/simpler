@@ -72,9 +72,10 @@ TOTAL_SLOTS = RESULT_BASE + 8
 ARRIVED = 1.0
 POISON = -99.0
 UNWRITTEN = -1.0
-# Measured in spmd_cohort_saturation: this is about a second of waiting before
-# a lane gives up.
-BARRIER_SPIN = 200000000
+# How long a lane waits for its siblings, in milliseconds; the kernel
+# converts it with the platform's own tick rate. See spmd_cohort_saturation
+# for why this is a duration and not a spin count.
+BARRIER_WAIT_MS = 1000
 # Long enough that the AIVs are still inside it when the Mix task is placed,
 # and far shorter than the barrier so a correct run still assembles well
 # within the wait.
@@ -132,7 +133,7 @@ def _run(worker, handle, occupy_count, output_prefix=None):
         )
         args.add_scalar(occupy_count)
         args.add_scalar(OCCUPY_SPIN)
-        args.add_scalar(BARRIER_SPIN)
+        args.add_scalar(BARRIER_WAIT_MS)
         config = CallConfig()
         if output_prefix is not None:
             config.enable_chip_swimlane = 3
@@ -149,12 +150,12 @@ def _run(worker, handle, occupy_count, output_prefix=None):
 
 def _assert_mix_was_coresident(host_out, context):
     results = host_out[
-        RESULT_BASE * FLOATS_PER_CACHE_LINE : (RESULT_BASE + LANES_PER_BLOCK) * FLOATS_PER_CACHE_LINE :
-        FLOATS_PER_CACHE_LINE
+        RESULT_BASE * FLOATS_PER_CACHE_LINE : (RESULT_BASE + LANES_PER_BLOCK)
+        * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE
     ]
     arrivals = host_out[
-        ARRIVE_BASE * FLOATS_PER_CACHE_LINE : (ARRIVE_BASE + LANES_PER_BLOCK) * FLOATS_PER_CACHE_LINE :
-        FLOATS_PER_CACHE_LINE
+        ARRIVE_BASE * FLOATS_PER_CACHE_LINE : (ARRIVE_BASE + LANES_PER_BLOCK)
+        * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE
     ]
     assert torch.equal(arrivals, torch.full((LANES_PER_BLOCK,), ARRIVED)), (
         f"{context}: a subtask of the Mix task never ran at all: arrivals={arrivals.tolist()}"
@@ -216,8 +217,8 @@ def test_mix_subtasks_run_together_with_the_aivs_busy(st_platform, st_device_ids
 
         host_out = _run(worker, handle, occupy_count=aiv_count)
         occupied = host_out[
-            OCCUPY_BASE * FLOATS_PER_CACHE_LINE : (OCCUPY_BASE + aiv_count) * FLOATS_PER_CACHE_LINE :
-            FLOATS_PER_CACHE_LINE
+            OCCUPY_BASE * FLOATS_PER_CACHE_LINE : (OCCUPY_BASE + aiv_count)
+            * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE
         ]
         assert int((occupied == UNWRITTEN).sum()) == 0, (
             f"an occupying task never ran, so the AIVs were not actually busy: {occupied.tolist()}"

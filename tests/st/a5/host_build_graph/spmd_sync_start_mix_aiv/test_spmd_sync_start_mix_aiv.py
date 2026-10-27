@@ -65,8 +65,10 @@ FLOATS_PER_CACHE_LINE = 16
 LANES_PER_BLOCK = 2
 ARRIVED = 1.0
 POISON = -99.0
-# Measured in spmd_cohort_saturation: about a second before a lane gives up.
-SPIN_LIMIT = 200000000
+# How long a lane waits for its siblings, in milliseconds; the kernel
+# converts it with the platform's own tick rate. See spmd_cohort_saturation
+# for why this is a duration and not a spin count.
+BARRIER_WAIT_MS = 1000
 # Every block of a cohort has to be resident at once, so the width is bounded by
 # the narrowest topology this runs on: eight blocks need sixteen AIV cores, the
 # count of the smallest box here. Worker demand is checked against the same
@@ -115,7 +117,7 @@ class TestSpmdSyncStartMixAiv(SceneTestCase):
         return TaskArgsBuilder(
             TensorArg("out", torch.full((2 * lanes * FLOATS_PER_CACHE_LINE,), -1.0, dtype=torch.float32)),
             Scalar("blocks", params["blocks"]),
-            Scalar("spin_limit", SPIN_LIMIT),
+            Scalar("spin_limit", BARRIER_WAIT_MS),
         )
 
     def compute_golden(self, args, params):
@@ -174,7 +176,7 @@ def _find_swimlane_records(output_prefix: Path) -> Path:
 @pytest.mark.platforms(["a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-def test_cohort_blocks_land_on_distinct_clusters(st_platform, st_device_ids, tmp_path):
+def test_cohort_blocks_land_on_distinct_clusters(st_platform, st_device_ids, tmp_path, assert_cohorts_were_coresident):
     """No cluster runs two blocks of one cohort.
 
     Unlike the spread of an ordinary SPMD task, this is exact rather than a
@@ -204,7 +206,7 @@ def test_cohort_blocks_land_on_distinct_clusters(st_platform, st_device_ids, tmp
         args = TaskArgs()
         args.add_tensor(buffer.tensor(shapes=(slots,), dtype=DataType.FLOAT32), TensorArgType.INOUT)
         args.add_scalar(blocks)
-        args.add_scalar(SPIN_LIMIT)
+        args.add_scalar(BARRIER_WAIT_MS)
 
         output_prefix = tmp_path / "cohort_placement"
         output_prefix.mkdir(parents=True, exist_ok=True)
@@ -217,8 +219,9 @@ def test_cohort_blocks_land_on_distinct_clusters(st_platform, st_device_ids, tmp
         stamped = host_out[lanes * FLOATS_PER_CACHE_LINE : 2 * lanes * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE]
         poisoned = int((stamped == POISON).sum())
         assert poisoned == 0, (
-            f"{poisoned} of the cohort's {lanes} subtasks gave up waiting for the others, so the cohort was never "
-            f"resident all at once: {stamped.tolist()}"
+            f"{poisoned} of the cohort's {lanes} subtasks gave up waiting for the others. The barrier is the "
+            f"liveness net here -- the co-residency verdict itself comes from the swimlane below -- so this says "
+            f"the siblings never came at all, not merely that they came late: {stamped.tolist()}"
         )
         expected = torch.tensor([float(i // LANES_PER_BLOCK) for i in range(lanes)])
         assert torch.equal(stamped, expected), f"not every block/lane stamped its slot: {stamped.tolist()}"
@@ -240,6 +243,13 @@ def test_cohort_blocks_land_on_distinct_clusters(st_platform, st_device_ids, tmp
             f"a cohort of {blocks} blocks covered {len(cores)} AIV cores, not {subtasks}: {sorted(cores)}. "
             "Two blocks sharing a cluster is what this looks like, and it is what a coordinator does when it "
             "cannot see the blocks it already placed on its cluster's Mix slots."
+        )
+
+        # The co-residency verdict, from the run's own record rather than from
+        # whether the barrier timed out: a timeout races a wall clock and moves
+        # with machine load, whereas whether the intervals intersect does not.
+        assert_cohorts_were_coresident(
+            output_prefix, [subtasks], f"a Mix cohort of {blocks} blocks on two AIV lanes each"
         )
     finally:
         # A poisoned run still owns its device memory, so free() would raise and

@@ -17,12 +17,17 @@
  * return at once: a task that finishes immediately frees its slot before the
  * cohort's claim pass looks, and then there was never any competition.
  *
- * Args: [0] out tensor, [1] slot, [2] spin count.
+ * Args: [0] out tensor, [1] slot, [2] how long to hold the core, in ms.
  */
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
+#ifdef PTO_CPUSTUB_HPP
+#include <chrono>
+#endif
+
+#include "common/platform_config.h"
 #include "intrinsic.h"
 #include "tensor.h"
 
@@ -49,14 +54,31 @@
 constexpr int32_t FLOATS_PER_CACHE_LINE = 16;
 constexpr float RAN = 1.0f;
 
+// Held for a duration, not a spin count. An iteration costs a different amount
+// in the CPU-stub build than on silicon, so a count that occupies a core for
+// milliseconds in one occupies it for microseconds in the other -- and this
+// kernel exists only to still be running at a particular moment.
+#ifdef PTO_CPUSTUB_HPP
+static uint64_t busy_now_ticks() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count()
+    );
+}
+#else
+static __aicore__ uint64_t busy_now_ticks() { return get_sys_cnt(); }
+#endif
+
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
     const int32_t slot = static_cast<int32_t>(args[1]);
-    const int64_t spin = args[2];
+    const uint64_t hold_ticks =
+        static_cast<uint64_t>(args[2]) * (static_cast<uint64_t>(PLATFORM_PROF_SYS_CNT_FREQ) / 1000u);
 
+    const uint64_t started = busy_now_ticks();
     volatile int64_t sink = 0;
-    for (int64_t i = 0; i < spin; ++i) sink += i;
+    while (busy_now_ticks() - started < hold_ticks) sink += 1;
     (void)sink;
 
     const int32_t offset = slot * FLOATS_PER_CACHE_LINE;

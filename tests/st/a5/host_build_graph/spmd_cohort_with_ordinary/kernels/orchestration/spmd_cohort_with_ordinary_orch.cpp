@@ -29,8 +29,8 @@
  * palette and each wants the whole machine -- and destroyed what that case is
  * for, which is many shapes in flight at once.
  *
- * Args layout: [out] + {cohort_count, ordinary_count, ordinary_spin,
- * barrier_spin}.
+ * Args layout: [out] + {cohort_count, ordinary_count, ordinary_hold_ms,
+ * barrier_wait_ms}.
  */
 
 #include <cstdint>
@@ -47,7 +47,7 @@ constexpr int32_t kBusyAivFuncId = 5;
 
 // Slot map: the ordinary tasks' marks, then one arrival/result pair per
 // cohort, each sized for the widest cohort this run can submit.
-constexpr int64_t kMaxOrdinary = 256;
+constexpr int64_t kMaxOrdinary = 1536;
 constexpr int64_t kMaxLanesPerCohort = 320;
 constexpr int64_t kCohortBase = kMaxOrdinary;
 constexpr int64_t kSlotsPerCohort = 2 * kMaxLanesPerCohort;
@@ -64,7 +64,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     const simpler::hbg::Tensor &out = args.tensor(0).ref();
     const int64_t cohort_count = args.scalar<int64_t>(0);
     const int64_t ordinary_count = args.scalar<int64_t>(1);
-    const int64_t ordinary_spin = args.scalar<int64_t>(2);
+    const int64_t ordinary_hold_ms = args.scalar<int64_t>(2);
     const int64_t barrier_spin = args.scalar<int64_t>(3);
 
     const int32_t clusters = rt_available_cluster_count();
@@ -78,20 +78,18 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         return;
     }
 
-    // Submitted first so they are already holding cores when the cohorts are
-    // claimed. Alternating the core type keeps both kinds of competition in
-    // play: an AIC cohort contends with the AIC tasks, an AIV one with the
-    // AIV tasks, and a Mix one with both.
+    // All on the AIVs, and submitted first so they are already holding those
+    // cores when the cohorts are claimed. AIV-only on purpose: a Mix cohort's
+    // AIV subtasks are the ones that wait in Mix slots, and it is the backlog
+    // in front of them that this case measures. Putting half of this on the
+    // AICs would instead delay the cohort's placement, which is a different
+    // thing and would blunt the measurement.
     for (int64_t i = 0; i < ordinary_count; ++i) {
         CoreTaskArgs busy;
         busy.add_no_dep(out);
         busy.add_scalar(i);
-        busy.add_scalar(ordinary_spin);
-        if ((i % 2) == 0) {
-            rt_submit_aic_task(kBusyAicFuncId, busy);
-        } else {
-            rt_submit_aiv_task(kBusyAivFuncId, busy);
-        }
+        busy.add_scalar(ordinary_hold_ms);
+        rt_submit_aiv_task(kBusyAivFuncId, busy);
     }
 
     for (int64_t cohort = 0; cohort < cohort_count; ++cohort) {

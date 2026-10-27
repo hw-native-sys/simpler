@@ -61,8 +61,10 @@ MAX_BLOCKS = 160
 UNWRITTEN = -1.0
 ARRIVED = 1.0
 POISON = -99.0
-# Measured in spmd_cohort_saturation: about a second before a block gives up.
-SPIN_LIMIT = 200000000
+# How long a lane waits for its siblings, in milliseconds; the kernel
+# converts it with the platform's own tick rate. See spmd_cohort_saturation
+# for why this is a duration and not a spin count.
+BARRIER_WAIT_MS = 1000
 
 
 def _build_callable(platform):
@@ -111,7 +113,9 @@ def _find_swimlane_records(output_prefix: Path) -> Path:
 @pytest.mark.platforms(["a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-def test_full_width_aiv_cohort_uses_every_aiv_once(st_platform, st_device_ids, tmp_path):
+def test_full_width_aiv_cohort_uses_every_aiv_once(
+    st_platform, st_device_ids, tmp_path, assert_cohorts_were_coresident
+):
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     buffer = None
     try:
@@ -125,7 +129,7 @@ def test_full_width_aiv_cohort_uses_every_aiv_once(st_platform, st_device_ids, t
 
         args = TaskArgs()
         args.add_tensor(buffer.tensor(shapes=(slots,), dtype=DataType.FLOAT32), TensorArgType.INOUT)
-        args.add_scalar(SPIN_LIMIT)
+        args.add_scalar(BARRIER_WAIT_MS)
 
         output_prefix = tmp_path / "aiv_full_width"
         output_prefix.mkdir(parents=True, exist_ok=True)
@@ -160,24 +164,30 @@ def test_full_width_aiv_cohort_uses_every_aiv_once(st_platform, st_device_ids, t
             f"a block of the cohort never ran at all: {arrivals.tolist()}"
         )
         stamped = host_out[
-            MAX_BLOCKS * FLOATS_PER_CACHE_LINE : (MAX_BLOCKS + aiv_count) * FLOATS_PER_CACHE_LINE :
-            FLOATS_PER_CACHE_LINE
+            MAX_BLOCKS * FLOATS_PER_CACHE_LINE : (MAX_BLOCKS + aiv_count)
+            * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE
         ]
         poisoned = int((stamped == POISON).sum())
         assert poisoned == 0, (
-            f"{poisoned} of the cohort's {aiv_count} blocks gave up waiting for their siblings, so the cohort was "
-            f"never resident all at once: {stamped.tolist()}"
+            f"{poisoned} of the cohort's {aiv_count} blocks gave up waiting for their siblings. The barrier is the "
+            f"liveness net here -- the co-residency verdict itself comes from the swimlane below -- so this says "
+            f"the blocks never came at all, not merely that they came late: {stamped.tolist()}"
         )
         assert torch.equal(stamped, torch.arange(aiv_count, dtype=torch.float32)), (
             f"not every block stamped its slot: {stamped.tolist()}"
         )
         assert torch.all(
-            host_out[aiv_count * FLOATS_PER_CACHE_LINE : MAX_BLOCKS * FLOATS_PER_CACHE_LINE :
-                     FLOATS_PER_CACHE_LINE] == UNWRITTEN
+            host_out[aiv_count * FLOATS_PER_CACHE_LINE : MAX_BLOCKS * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE]
+            == UNWRITTEN
         )
         assert torch.all(
             host_out[(MAX_BLOCKS + aiv_count) * FLOATS_PER_CACHE_LINE :: FLOATS_PER_CACHE_LINE] == UNWRITTEN
         )
+        # The co-residency verdict, taken from the run's own record rather than
+        # from whether the barrier timed out: a timeout races a wall clock and
+        # moves with machine load, whereas whether the intervals intersect does
+        # not.
+        assert_cohorts_were_coresident(output_prefix, [aiv_count], f"a full-width AIV cohort of {aiv_count}")
     finally:
         # A poisoned run still owns its device memory, so free() would raise and
         # bury whatever actually failed. Closing the worker releases it.

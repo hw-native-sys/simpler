@@ -34,6 +34,7 @@ case.
 
 import json
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -68,19 +69,21 @@ SLOTS_PER_COHORT = 2 * MAX_LANES_PER_COHORT
 ARRIVED = 1.0
 POISON = -99.0
 UNWRITTEN = -1.0
-# How long a block waits for its siblings before giving up. The bound is in
-# iterations because a kernel has no portable wall clock, so the value is
-# measured rather than derived: the positive control below gave up after 11 ms
-# at 200_000 and 1.08 s at this value -- note that is a hundredfold in
-# iterations for a hundredfold in time only across the whole range, so the
-# relationship is not one an arithmetic guess would get right.
+# How long a block waits for its siblings before giving up, in milliseconds.
+# The kernel converts it with the platform's own tick rate, which is what makes
+# the number mean the same thing in simulation and on silicon.
 #
-# A second is long enough that no correct cohort is ever cut short by a slow
-# dispatch, and short enough that a broken one fails in seconds rather than
-# waiting out the device's own forty-five second op-execute timeout. It costs
-# nothing on the passing path: a cohort that assembles leaves the loop on its
-# first pass.
-SPIN_LIMIT = 200000000
+# It was a spin count first, and that was wrong in a way simulation could not
+# show: an iteration costs a different amount on each, so a count tuned to
+# 1.08 s in the CPU-stub build outlasted the device's op-execute timeout on
+# hardware, and the case died as a killed op instead of writing the poison it
+# exists to write.
+#
+# A second is long enough that no correct cohort is cut short by a slow
+# dispatch, and short enough to fail well inside that timeout. It costs nothing
+# on the passing path: a cohort that assembles leaves the loop on its first
+# pass.
+BARRIER_WAIT_MS = 1000
 
 
 def _build_callable(platform):
@@ -139,7 +142,7 @@ def _run(worker, handle, cohort_count, output_prefix=None, oversubscribed_blocks
             buffer.tensor(shapes=(slots * FLOATS_PER_CACHE_LINE,), dtype=DataType.FLOAT32), TensorArgType.INOUT
         )
         args.add_scalar(cohort_count)
-        args.add_scalar(SPIN_LIMIT)
+        args.add_scalar(BARRIER_WAIT_MS)
         args.add_scalar(oversubscribed_blocks)
         config = CallConfig()
         if output_prefix is not None:
@@ -179,10 +182,13 @@ def _check(host_out, cohort_count, aic_count, aiv_count):
         result_base = arrive_base + MAX_LANES_PER_COHORT
 
         results = host_out[
-            result_base * FLOATS_PER_CACHE_LINE : (result_base + lane_count) * FLOATS_PER_CACHE_LINE :
-            FLOATS_PER_CACHE_LINE
+            result_base * FLOATS_PER_CACHE_LINE : (result_base + lane_count)
+            * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE
         ]
         poisoned = int((results == POISON).sum())
+        # The barrier is the liveness net; the co-residency verdict is the
+        # swimlane check the callers make. Poison therefore means the siblings
+        # never came at all, not merely that they came late.
         assert poisoned == 0, (
             f"cohort {cohort} ({name}, {width} blocks x {lanes_per_block} lanes): {poisoned} of its lanes gave up "
             f"waiting for their siblings, so the cohort was never co-resident: {results.tolist()}"
@@ -195,8 +201,8 @@ def _check(host_out, cohort_count, aic_count, aiv_count):
         )
 
         arrivals = host_out[
-            arrive_base * FLOATS_PER_CACHE_LINE : (arrive_base + lane_count) * FLOATS_PER_CACHE_LINE :
-            FLOATS_PER_CACHE_LINE
+            arrive_base * FLOATS_PER_CACHE_LINE : (arrive_base + lane_count)
+            * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE
         ]
         assert torch.equal(arrivals, torch.full((lane_count,), ARRIVED)), (
             f"cohort {cohort} ({name}) has a lane that never arrived: {arrivals.tolist()}"
@@ -225,8 +231,6 @@ def test_the_barrier_actually_fires(st_platform, st_device_ids, tmp_path, capfd)
     read against: the bound is in iterations, and an iteration costs a
     different amount in simulation than on silicon.
     """
-    import time
-
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     try:
         handle = worker.register(_build_callable(st_platform))
@@ -244,8 +248,8 @@ def test_the_barrier_actually_fires(st_platform, st_device_ids, tmp_path, capfd)
         elapsed = time.monotonic() - started
 
         results = host_out[
-            MAX_LANES_PER_COHORT * FLOATS_PER_CACHE_LINE :
-            (MAX_LANES_PER_COHORT + blocks) * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE
+            MAX_LANES_PER_COHORT * FLOATS_PER_CACHE_LINE : (MAX_LANES_PER_COHORT + blocks)
+            * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE
         ]
         poisoned = int((results == POISON).sum())
         print(f"\n[BARRIER-CONTROL] blocks={blocks} aic={aic_count} poisoned={poisoned} elapsed={elapsed:.2f}s")
@@ -261,7 +265,7 @@ def test_the_barrier_actually_fires(st_platform, st_device_ids, tmp_path, capfd)
 @pytest.mark.platforms(["a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-def test_one_full_width_cohort_assembles(st_platform, st_device_ids, tmp_path):
+def test_one_full_width_cohort_assembles(st_platform, st_device_ids, tmp_path, assert_cohorts_were_coresident):
     """The premise: a cohort whose blocks wait for each other does assemble.
 
     Separate from the stress case below because it is the control. If blocks of
@@ -282,6 +286,10 @@ def test_one_full_width_cohort_assembles(st_platform, st_device_ids, tmp_path):
         aiv_count = sum(1 for kind in core_types if kind == "aiv")
         assert aic_count > 0 and aiv_count > 0, raw["metadata"]
         _check(host_out, 1, aic_count, aiv_count)
+        # From the run's own record rather than from whether the barrier timed
+        # out: a timeout races a wall clock and moves with machine load,
+        # whereas whether the intervals intersect does not.
+        assert_cohorts_were_coresident(output_prefix, [aic_count], "a single full-width AIC cohort")
     finally:
         worker.close()
 
@@ -290,7 +298,9 @@ def test_one_full_width_cohort_assembles(st_platform, st_device_ids, tmp_path):
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.parametrize("cohort_count", [2, 12])
-def test_back_to_back_full_width_cohorts_all_assemble(st_platform, st_device_ids, tmp_path, cohort_count):
+def test_back_to_back_full_width_cohorts_all_assemble(
+    st_platform, st_device_ids, tmp_path, cohort_count, assert_cohorts_were_coresident
+):
     """Many cohorts, each needing every core of its kind, one after another.
 
     Two is the smallest count that has a handover at all; twelve runs the same
@@ -315,5 +325,9 @@ def test_back_to_back_full_width_cohorts_all_assemble(st_platform, st_device_ids
         aic_count = sum(1 for kind in core_types if kind == "aic")
         aiv_count = sum(1 for kind in core_types if kind == "aiv")
         _check(host_out, cohort_count, aic_count, aiv_count)
+        widths = [
+            blocks * lanes for _, blocks, lanes in (_cohort_shape(c, aic_count, aiv_count) for c in range(cohort_count))
+        ]
+        assert_cohorts_were_coresident(output_prefix, widths, f"{cohort_count} back-to-back cohorts")
     finally:
         worker.close()

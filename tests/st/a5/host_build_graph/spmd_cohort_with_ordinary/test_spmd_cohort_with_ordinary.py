@@ -7,24 +7,40 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A cohort has to assemble while ordinary tasks are taking the same cores.
+"""A Mix cohort waits out the whole backlog in front of it, not one task.
 
 spmd_cohort_saturation runs cohorts back to back with nothing else in the
 graph, so every core a cohort needs is either idle or holding one of its own
-blocks. The question here is the other one: a cohort needs every core of its
-kind at once, and ordinary work is competing for exactly those cores.
+blocks. The question here is the other one: what an unrelated queue of
+ordinary work does to a cohort that needs those same cores.
 
-Everything is submitted without dependencies, so it is all ready at the same
-moment and the ordinary tasks are already running when the cohorts are
-claimed. They occupy their cores rather than returning at once -- one that
-finished immediately would free its slot before the claim pass looked, and
-there would have been no competition to measure.
+A Mix block's AIV subtasks wait in their cores' Mix slots, and the executor
+drains a core's own dispatch slots before it ever scans its Mix slots. So the
+subtask does not wait for the task that is running -- it waits for every
+ordinary task that core can still claim. The delay is the size of the backlog,
+and the backlog is unbounded.
 
-This is deliberately small. The alternative was to give spmd_mixed_waves' two
-cohort colours real barriers, but a quarter of that palette is cohorts and
-each wants the whole machine, so a thousand-task stress case would have become
-a strictly serial one -- destroying the only thing it is for, which is many
-shapes in flight at once. Its cohorts stay nominal and its docstring says so.
+That is why the ordinary work is a queue per AIV rather than one task each,
+and why each task holds its core for a measured duration rather than a spin
+count. An earlier version of this case did neither, and it reproduced nothing
+on silicon: two microsecond-long tasks per core leave a Mix subtask waiting
+for almost nothing, so the case was measuring whether the delay existed rather
+than how long it was. With a backlog the measurement is the same on both
+platforms --
+
+    simulation (8 AIC / 16 AIV):  latest start 1,100,044 us
+    a5 hardware (32 AIC / 64 AIV): latest start 1,100,078 us
+
+-- about 20 x 50 ms either way, which is the backlog, not the hardware.
+
+The bound between the two readings is what makes this discriminate rather than
+merely fail. Today a subtask waits out the whole queue; once a core's slots
+are one FIFO queue and a core that owes a Mix subtask stops claiming more, it
+waits out only the task already running. BARRIER_WAIT_MS sits between them, so
+the case goes green on the fix instead of needing a new number.
+
+Co-residency itself is decided from the swimlane rather than from whether the
+barrier timed out -- see the conftest fixture for why.
 """
 
 import json
@@ -61,7 +77,7 @@ BARRIER_AIV_LANE2 = os.path.join(BARRIER_DIR, "aiv", "kernel_cohort_barrier_lane
 
 FLOATS_PER_CACHE_LINE = 16
 # Mirrors the slot map in the orchestration.
-MAX_ORDINARY = 256
+MAX_ORDINARY = 1536
 MAX_LANES_PER_COHORT = 320
 COHORT_BASE = MAX_ORDINARY
 SLOTS_PER_COHORT = 2 * MAX_LANES_PER_COHORT
@@ -70,12 +86,27 @@ RAN = 1.0
 ARRIVED = 1.0
 POISON = -99.0
 UNWRITTEN = -1.0
-# Measured in spmd_cohort_saturation: about a second before a lane gives up.
-BARRIER_SPIN = 2000000000
-# Long enough that the ordinary tasks are still holding cores when the cohorts
-# are claimed, and far shorter than the barrier so a correct run assembles well
-# inside the wait.
-ORDINARY_SPIN = 2000000
+# How long a lane waits for its siblings, in milliseconds; the kernel
+# converts it with the platform's own tick rate. See spmd_cohort_saturation
+# for why this is a duration and not a spin count.
+# How long a Mix cohort's subtasks may wait for each other before the case
+# calls them not co-resident.
+BARRIER_WAIT_MS = 500
+# How long one ordinary task holds its core, and how many of them are queued
+# per AIV. The product is what matters, and the two bounds it has to sit
+# between are what make this case discriminate rather than merely fail:
+#
+#   today            a Mix subtask waits out the WHOLE backlog, because a core
+#                    drains its own dispatch slots before it ever scans its Mix
+#                    slots -- about ORDINARY_PER_AIV * ORDINARY_HOLD_MS
+#   once slots are   it waits out the one task already running, because a core
+#   one FIFO queue   that owes a Mix subtask stops claiming more -- about
+#                    ORDINARY_HOLD_MS
+#
+# So BARRIER_WAIT_MS is set above the second and below the first: 50 ms of
+# unavoidable wait passes, 1000 ms of backlog does not.
+ORDINARY_HOLD_MS = 50
+ORDINARY_PER_AIV = 20
 
 
 def _build_callable(platform):
@@ -131,8 +162,8 @@ def _run(worker, handle, cohort_count, ordinary_count, output_prefix=None):
         )
         args.add_scalar(cohort_count)
         args.add_scalar(ordinary_count)
-        args.add_scalar(ORDINARY_SPIN)
-        args.add_scalar(BARRIER_SPIN)
+        args.add_scalar(ORDINARY_HOLD_MS)
+        args.add_scalar(BARRIER_WAIT_MS)
         config = CallConfig()
         if output_prefix is not None:
             config.enable_chip_swimlane = 3
@@ -157,6 +188,24 @@ def _cohort_shape(cohort, aic_count, aiv_count):
     return "AIV", aiv_count, 1
 
 
+# The Mix cohort is the second one, so a run with only the AIC cohort has
+# nothing in a Mix slot to starve and passes. Everything from two cohorts up
+# carries the defect; three is kept because it was the shape that first showed
+# it, back when the construction needed the AIV-only cohort's own-slot blocks
+# to supply the backlog that ordinary work now supplies directly.
+_STARVES_THE_MIX_COHORT = pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Known defect: a Mix cohort's AIV subtasks wait out the entire backlog of ordinary work in "
+        "front of them, because a core drains its own dispatch slots before it ever scans its Mix "
+        "slots. Measured at about 20 x 50 ms of backlog on both a5sim and a5 silicon, against a 500 ms "
+        "bound. The fix is the dual-issue slot model in tests/docs/: one FIFO queue per core, and a "
+        "core that owes a Mix subtask stops claiming more work. strict, so that whoever lands it is "
+        "told to delete this marker rather than leaving a passing xfail behind."
+    ),
+)
+
+
 @pytest.mark.platforms(["a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
@@ -164,26 +213,12 @@ def _cohort_shape(cohort, aic_count, aiv_count):
     "cohort_count",
     [
         1,
-        2,
-        pytest.param(
-            3,
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason=(
-                    "Known defect: adding the AIV-only cohort starves the Mix cohort's AIV subtasks. "
-                    "A Mix block's AIV subtask sits in that core's Mix slot, an AIV-only cohort's block "
-                    "sits in its own dispatch slot, and the executor takes own slots unconditionally "
-                    "before it ever scans Mix slots -- so the AIV runs the later cohort first and the "
-                    "earlier one is never resident all at once. Confirmed three ways: this barrier, the "
-                    "chip swimlane (latest start after earliest end), and the 1/2/3 comparison above. "
-                    "strict so that whoever fixes the slot model is told to delete this marker."
-                ),
-            ),
-        ),
+        pytest.param(2, marks=_STARVES_THE_MIX_COHORT),
+        pytest.param(3, marks=_STARVES_THE_MIX_COHORT),
     ],
 )
 def test_cohorts_assemble_against_competing_ordinary_work(
-    st_platform, st_device_ids, tmp_path, cohort_count
+    st_platform, st_device_ids, tmp_path, cohort_count, assert_cohorts_were_coresident
 ):
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     try:
@@ -200,30 +235,34 @@ def test_cohorts_assemble_against_competing_ordinary_work(
         aiv_count = sum(1 for kind in core_types if kind == "aiv")
         assert aic_count > 0 and aiv_count > 0, raw["metadata"]
 
-        # Two ordinary tasks per core, so every core is busy and has another
-        # queued behind it when the cohorts are claimed.
-        ordinary_count = min(2 * (aic_count + aiv_count), MAX_ORDINARY)
-        host_out = _run(worker, handle, cohort_count=cohort_count, ordinary_count=ordinary_count)
+        # A backlog on the AIVs, not merely one task each. One task would make
+        # the Mix subtask wait once and then run; what this case is about is
+        # that today it waits for the whole queue, because a core drains its
+        # own dispatch slots before it scans its Mix slots. The backlog is
+        # what turns that difference into a number.
+        ordinary_count = min(ORDINARY_PER_AIV * aiv_count, MAX_ORDINARY)
+        real_prefix = tmp_path / f"run_{cohort_count}"
+        real_prefix.mkdir(parents=True, exist_ok=True)
+        host_out = _run(
+            worker, handle, cohort_count=cohort_count, ordinary_count=ordinary_count, output_prefix=real_prefix
+        )
 
         marks = host_out[0 : ordinary_count * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE]
         assert torch.equal(marks, torch.full((ordinary_count,), RAN)), (
             f"an ordinary task never ran, so the cohorts were not actually competing: {marks.tolist()}"
         )
 
+        # Every lane ran: a subtask that was never dispatched is a different
+        # failure from one that ran without its siblings, and the swimlane
+        # check below would report the first as a missing task rather than as
+        # a co-residency verdict.
         for cohort in range(cohort_count):
             name, width, lanes_per_block = _cohort_shape(cohort, aic_count, aiv_count)
             lane_count = width * lanes_per_block
             arrive_base = COHORT_BASE + cohort * SLOTS_PER_COHORT
-            result_base = arrive_base + MAX_LANES_PER_COHORT
-
-            # Arrivals first, deliberately. A lane that never ran and a lane
-            # that ran but timed out are different failures -- the first says
-            # the cohort was never fully dispatched, the second says it was
-            # dispatched too far apart to overlap -- and checking results
-            # first would report both as the same thing.
             arrivals = host_out[
-                arrive_base * FLOATS_PER_CACHE_LINE : (arrive_base + lane_count) * FLOATS_PER_CACHE_LINE :
-                FLOATS_PER_CACHE_LINE
+                arrive_base * FLOATS_PER_CACHE_LINE : (arrive_base + lane_count)
+                * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE
             ]
             missing = int((arrivals != ARRIVED).sum())
             assert missing == 0, (
@@ -232,30 +271,16 @@ def test_cohorts_assemble_against_competing_ordinary_work(
                 f"dispatched: {arrivals.tolist()}"
             )
 
-            results = host_out[
-                result_base * FLOATS_PER_CACHE_LINE : (result_base + lane_count) * FLOATS_PER_CACHE_LINE :
-                FLOATS_PER_CACHE_LINE
-            ]
-            poisoned = int((results == POISON).sum())
-            # Each lane also records how long it waited, in the cache line next
-            # to its verdict. Without it a failure cannot be read: a lane that
-            # waited out the whole limit says its siblings never came, and one
-            # that stopped early says the limit was the problem.
-            spins = host_out[
-                result_base * FLOATS_PER_CACHE_LINE + 1 :
-                (result_base + lane_count) * FLOATS_PER_CACHE_LINE + 1 : FLOATS_PER_CACHE_LINE
-            ]
-            assert poisoned == 0, (
-                f"cohort {cohort} ({name}, {width} blocks x {lanes_per_block} lanes): every lane ran, but "
-                f"{poisoned} of them gave up waiting for the others while {ordinary_count} ordinary tasks competed "
-                f"for the same cores -- so they were dispatched too far apart to ever overlap. A cohort that "
-                f"cannot assemble against ordinary work is a hang in any graph that mixes the two.\n"
-                f"  results = {results.tolist()}\n"
-                f"  spins   = {[int(s) for s in spins.tolist()]} (limit {BARRIER_SPIN})"
-            )
-            expected = torch.arange(width, dtype=torch.float32).repeat_interleave(lanes_per_block)
-            assert torch.equal(results, expected), (
-                f"cohort {cohort} ({name}) did not run every lane exactly once: {results.tolist()}"
-            )
+        # And they overlapped. Decided from the run's own record rather than
+        # from whether the barrier timed out: the barrier races a wall clock,
+        # so its verdict moved with machine load -- this case reported the
+        # defect alone and reported it absent after the rest of the suite, on
+        # one build. Whether two intervals intersect does not move.
+        widths = [
+            width * lanes for _, width, lanes in (_cohort_shape(c, aic_count, aiv_count) for c in range(cohort_count))
+        ]
+        assert_cohorts_were_coresident(
+            real_prefix, widths, f"{cohort_count} cohort(s) against {ordinary_count} ordinary tasks"
+        )
     finally:
         worker.close()

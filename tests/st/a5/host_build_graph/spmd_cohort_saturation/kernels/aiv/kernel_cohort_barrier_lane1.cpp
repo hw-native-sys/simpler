@@ -41,6 +41,11 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
+#ifdef PTO_CPUSTUB_HPP
+#include <chrono>
+#endif
+
+#include "common/platform_config.h"
 #include "intrinsic.h"
 #include "tensor.h"
 
@@ -74,12 +79,32 @@ constexpr float POISON = -99.0f;
 #define COHORT_LANE 1
 #endif
 
+// The wait is bounded in ticks, not iterations. An iteration costs a different
+// amount in the CPU-stub build than it does on silicon, so a limit tuned as a
+// count is either far too short on one of them or long enough on the other to
+// outlast the device's own op-execute timeout -- and then the failure is a
+// killed op rather than the poison this kernel writes, which is the one
+// outcome the case cannot read. Ticks are nanoseconds on both.
+#ifdef PTO_CPUSTUB_HPP
+static uint64_t cohort_now_ticks() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count()
+    );
+}
+#else
+static __aicore__ uint64_t cohort_now_ticks() { return get_sys_cnt(); }
+#endif
+
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
     const int32_t arrive_base = static_cast<int32_t>(args[1]);
     const int32_t result_base = static_cast<int32_t>(args[2]);
-    const int64_t spin_limit = args[3];
+    // Milliseconds, converted here so the caller never has to know the tick
+    // rate of the platform it is running on.
+    const uint64_t wait_ticks =
+        static_cast<uint64_t>(args[3]) * (static_cast<uint64_t>(PLATFORM_PROF_SYS_CNT_FREQ) / 1000u);
     const int32_t lanes_per_block = static_cast<int32_t>(args[4]);
 
     const int32_t block_idx = get_block_idx(args);
@@ -99,8 +124,9 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     // false "never co-resident", which is precisely the verdict this kernel
     // exists to make trustworthy.
     volatile __gm__ float *flags = out;
-    int64_t spin = 0;
-    for (; spin < spin_limit && !assembled; ++spin) {
+    const uint64_t started = cohort_now_ticks();
+    uint64_t waited = 0;
+    while (!assembled && waited < wait_ticks) {
         // Invalidate every flag, then one barrier, then read. An invalidate
         // without a barrier before the load is not guaranteed to have taken
         // effect, so a sibling's arrival can stay invisible for the whole wait.
@@ -114,15 +140,18 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
                 break;
             }
         }
+        waited = cohort_now_ticks() - started;
     }
 
     const int32_t offset = (result_base + own_lane) * FLOATS_PER_CACHE_LINE;
     out[offset] = assembled ? static_cast<float>(block_idx) : POISON;
-    // How long this lane waited, written only when it gave up. It is the
-    // number that separates "the siblings never came" from "the wait was too
-    // short", and a failure without it sends the reader back to re-run with a
-    // probe. Written only on the give-up path so that a correct run leaves the
-    // slot untouched and a fixed golden can still describe the whole buffer.
-    if (!assembled) out[offset + 1] = static_cast<float>(spin);
+    // How long this lane waited, in milliseconds, written only when it gave
+    // up. It is the number that separates "the siblings never came" from "the
+    // wait was too short", and a failure without it sends the reader back to
+    // re-run with a probe. Written only on the give-up path so that a correct
+    // run leaves the slot untouched and a fixed golden still describes the
+    // whole buffer.
+    if (!assembled)
+        out[offset + 1] = static_cast<float>(waited / (static_cast<uint64_t>(PLATFORM_PROF_SYS_CNT_FREQ) / 1000u));
     dcci(&out[offset], SINGLE_CACHE_LINE, CACHELINE_OUT);
 }
