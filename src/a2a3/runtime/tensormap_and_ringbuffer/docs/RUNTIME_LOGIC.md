@@ -935,3 +935,54 @@ void aicpu_orchestration_entry(uint64_t* args, int arg_count) {
     }
 }
 ```
+
+## Residual MIX lane priority
+
+The AICPU scheduler preserves physical lanes needed by residual MIX work. A queued MIX captures
+its AIC/AIV0/AIV1 mask when published; pure work can use the other lanes. Masks 3 and 5 leave one
+vector lane available, mask 6 leaves AIC available, and mask 7 reserves all three. The shape-agnostic
+early sync-start queue counts only its MIX entries; a pure entry has no MIX demand.
+
+Priority prefixes are ready-sync, ready-sync plus regular-ready, and then both normal sources plus
+early sync-start and regular-early. Early demand never protects lanes against normal-ready work.
+Each pure bucket, refill and block-range claim refreshes the applicable prefix and retains demand
+already observed during that attempt. The normal tiers share that observation; the next attempt
+starts fresh. Any nonzero pending-drain state reserves all lanes. These are scheduling snapshots,
+not an atomic reservation across scheduler threads.
+
+CoreTracker filters physical offsets before preparing pure IDLE or PENDING work. A pure vector
+block's logical AIV0 subtask may execute on either physical vector lane. A shape-only peer-idle hint
+does not suppress local PENDING work when only one physical vector lane is eligible. PMU keeps
+IDLE placement and disables PENDING and early staging. Normal admission and early sync-start
+cohort ownership remain independent of lane-demand accounting.
+
+A pure ready sync-start cohort uses one filtered bucket for its complete fit and claim. If it cannot
+fit while MIX protects any lane of its shape, it is requeued rather than entering a global drain
+that would bypass the lane filter. An exact fit uses the spare lanes. With no intersecting demand,
+the existing global-drain path remains available. A failed normal requeue reports
+`SIMPLER_ERROR_READY_QUEUE_OVERFLOW` and stops the dispatch pass.
+
+The shared `TaggedPtr` and `LaneDemandCounter` headers serve all four scheduler
+backends. The counter packs three 21-bit population counts into one atomic word.
+For these priority-prefix queues, a successful MIX batch claim adds its aggregate
+demand once before publishing the first cell. Batch pops capture all original
+handles and TaskIds, subtract one aggregate, then free the cells. A failed push
+claim, plain queue operation, or empty demand performs no counter RMW. The batch
+aggregate conservatively protects the claimed group; it is not a per-cell
+publication timestamp. A5 TMR uses the same types with its reservation-before-claim
+admission policy and corresponding in-flight capacity budget.
+
+Partial requeues retain the original tag. Early candidates retain their TaskId
+snapshot, including local sync-start cancellation. Normal entries retain the
+invalid-TaskId convention in both profiling and ordinary paths. Plain entries
+have an empty tag and no lane accounting. Queue cells remain 24 bytes; headers
+remain 192 bytes with enqueue/dequeue positions at offsets 64/128. Initialization
+resets demand; retained-position reuse does not. Failed normal requeue latches
+the error code and first reporting thread, and records all reporters in the
+error bitmap before stopping the pass.
+
+Host and AICPU components must come from matching runtime builds. Unchanged
+layout sizes do not make tagged entries compatible with a scheduler that treats
+every cell as an untagged pointer. The MIX/pure scene test checks numerical
+correctness; it does not assert temporal overlap. Production-scheduler unit
+tests check lane eligibility and placement.

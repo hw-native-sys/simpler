@@ -36,25 +36,6 @@
 // Cold-path helpers for the main dispatch loop (noinline to reduce hot-loop icache)
 // =============================================================================
 
-// Returns true iff this call won the first-writer CAS for sched_error_code — the
-// caller may then write companion fields (e.g. the stall detail) knowing they
-// describe the same observation that owns the latched code.
-static bool latch_scheduler_error(SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code) {
-    if (header == nullptr || error_code == SIMPLER_ERROR_NONE) {
-        return false;
-    }
-    // The first error code/thread pair wins; the bitmap cumulatively records all reporting threads.
-    int32_t expected = SIMPLER_ERROR_NONE;
-    bool won = header->sched_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel);
-    if (won) {
-        header->sched_error_thread.store(thread_idx, std::memory_order_release);
-    }
-    if (thread_idx >= 0 && thread_idx < 32) {
-        header->sched_error_bitmap.fetch_or(1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel);
-    }
-    return won;
-}
-
 LoopAction SchedulerContext::handle_orchestrator_exit(
     int32_t thread_idx, SharedMemoryHeader *header, Runtime *runtime, int32_t &task_count
 ) {
