@@ -437,9 +437,12 @@ Torch-NPU 2.10.0 with their own plan/JUnit receipt. The heavy cases are marked
 
 The runner must provide the model, verified HBG artifact and frozen prompt IDs
 through the `VLLM_MODEL_DIR`, `VLLM_ARTIFACT` and `VLLM_PROMPT_IDS` repository
-variables; `VLLM_ADAPTER_ROOT` selects the pinned #2605 checkout, or the
+variables; `VLLM_ADAPTER_ROOT` selects the adapter checkout, or the
 `qwen3_14b_serving_effective` directory that contains the fixed-shape adapter
-runner. `VLLM_ATB_ENV` pins the NNAL/ATB 9.0.0 environment script, and
+runner. The checkout must support the official stage-0 release layout; the #2605
+head `591f003b` alone requires the legacy `hbg_artifact_manifest.json` and a
+4096-row rope cache, so it cannot consume this release unchanged.
+`VLLM_ATB_ENV` pins the NNAL/ATB 9.0.0 environment script, and
 `VLLM_SOURCE_DIR` / `VLLM_ASCEND_SOURCE_DIR` may point at cached source
 checkouts. Missing paths, missing packages, wrong package versions, or an ATB
 line other than 9.0 fail the selected cases; they are not reported as skips.
