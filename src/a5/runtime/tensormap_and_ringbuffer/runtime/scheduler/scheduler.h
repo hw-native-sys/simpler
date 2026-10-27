@@ -1163,15 +1163,15 @@ struct SchedulerState {
 
     /**
      * Subtask completion: atomic counter model.
-     * Called when a single subtask (AIC, AIV0, or AIV1) finishes on any block.
-     * Atomically increments completed_subtasks and checks whether all subtasks
-     * across all blocks are done.
+     * Publishes completed subtasks after their deferred conditions are registered.
+     * A local batch can combine several completions of the same task.
+     * Checks whether all subtasks across all blocks are done.
      *
      * @return true if this was the last subtask, completing the entire task.
      */
-    bool on_subtask_complete(ChipTaskSlotState &slot_state) {
-        int16_t prev = slot_state.completed_subtasks.fetch_add(1, std::memory_order_acq_rel);
-        return (prev + 1) == slot_state.total_required_subtasks;
+    bool on_subtask_complete(ChipTaskSlotState &slot_state, int16_t count = 1) {
+        int16_t prev = slot_state.completed_subtasks.fetch_add(count, std::memory_order_acq_rel);
+        return (prev + count) == slot_state.total_required_subtasks;
     }
 
     /**

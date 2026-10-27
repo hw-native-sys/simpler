@@ -34,7 +34,15 @@
 
 namespace {
 inline constexpr int32_t DEFERRED_RELEASE_CAP = 256;
-}
+inline constexpr int32_t COMPLETION_POLL_BATCH_CAP = 8;
+
+struct CompletionObservation {
+    int32_t bit_pos;
+    uint32_t reg_value;
+    SlotTransition transition;
+    bool pending_gated;
+};
+}  // namespace
 
 // Pure function: read register result -> SlotTransition (no side effects).
 SlotTransition SchedulerContext::decide_slot_transition(
@@ -83,6 +91,8 @@ void SchedulerContext::complete_slot_task(
     ,
     uint64_t dispatch_ts, uint64_t finish_ts
 #endif
+    ,
+    int16_t *deferred_completion_count, bool flush_completion_count
 ) {
 #if SIMPLER_DFX
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
@@ -96,6 +106,16 @@ void SchedulerContext::complete_slot_task(
     AICoreCompletionMailbox *mailbox = rt_ != nullptr ? rt_->aicore_mailbox : nullptr;
     bool defer_completion_to_consumer = false;
 
+    auto flush_before_error_return = [&] {
+        if (deferred_completion_count != nullptr && *deferred_completion_count != 0) {
+            // The failed physical completion remains uncounted, so these valid
+            // earlier completions cannot retire the task.
+            bool task_complete = sched_->on_subtask_complete(slot_state, *deferred_completion_count);
+            always_assert(!task_complete);
+            *deferred_completion_count = 0;
+        }
+    };
+
     if (slot_state.payload != nullptr) {
         volatile DeferredCompletionSlab *deferred_slab = &deferred_slab_per_core_[core_id][expected_reg_task_id & 1];
         // A5 AICPU reads are coherent with AICore-published slab writes.
@@ -107,6 +127,7 @@ void SchedulerContext::complete_slot_task(
                 expected, slab_err, std::memory_order_acq_rel, std::memory_order_acquire
             );
             completed_.store(true, std::memory_order_release);
+            flush_before_error_return();
             return;
         }
 
@@ -117,6 +138,7 @@ void SchedulerContext::complete_slot_task(
                 expected, SIMPLER_ERROR_ASYNC_REGISTRATION_FAILED, std::memory_order_acq_rel, std::memory_order_acquire
             );
             completed_.store(true, std::memory_order_release);
+            flush_before_error_return();
             return;
         }
 
@@ -145,7 +167,13 @@ void SchedulerContext::complete_slot_task(
         }
     }
 
-    bool task_complete = sched_->on_subtask_complete(slot_state);
+    int16_t completion_count = 1;
+    if (deferred_completion_count != nullptr) {
+        ++*deferred_completion_count;
+        completion_count = flush_completion_count ? *deferred_completion_count : 0;
+        if (flush_completion_count) *deferred_completion_count = 0;
+    }
+    bool task_complete = completion_count != 0 && sched_->on_subtask_complete(slot_state, completion_count);
 
 #if SIMPLER_DFX
     // A multi-block task can retire several subtasks before its final block
@@ -281,163 +309,251 @@ void SchedulerContext::check_running_cores_for_completion(
     int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
     bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
 ) {
+    if (core_trackers_[thread_idx].get_groupable_running_cores().has_value()) {
+        poll_running_cores<true>(
+            thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress, deferred_release_slot_states,
+            deferred_release_count
+        );
+    } else {
+        poll_running_cores<false>(
+            thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress, deferred_release_slot_states,
+            deferred_release_count
+        );
+    }
+}
+
+template <bool Batched>
+void SchedulerContext::poll_running_cores(
+    int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
+    bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
+) {
 #if SIMPLER_SCHED_PROFILING
     auto &chip_swimlane = sched_chip_swimlane_[thread_idx];
 #endif
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto running_core_states = tracker.get_all_running_cores();
+    constexpr int32_t capacity = Batched ? COMPLETION_POLL_BATCH_CAP : 1;
+    CompletionObservation observations[capacity];
     while (running_core_states.has_value()) {
-        int32_t bit_pos = running_core_states.pop_first();
-        int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
-        CoreExecState &core = core_exec_states_[core_id];
-
-        // Skip gated early-dispatch cores still waiting for their doorbell.
-        {
-            ChipTaskSlotState *rs = core.running_slot_state;
-            if (rs != nullptr && rs->payload != nullptr &&
-                rs->payload->early_dispatch_state.load(std::memory_order_relaxed) == EARLY_DISPATCH_STAGING) {
+        int32_t observation_count = 0;
+        while (observation_count < capacity && running_core_states.has_value()) {
+            int32_t bit_pos = running_core_states.pop_first();
+            CoreExecState &core = core_exec_states_[tracker.get_core_id_by_offset(bit_pos)];
+            ChipTaskSlotState *running = core.running_slot_state;
+            if (running != nullptr && running->payload != nullptr &&
+                running->payload->early_dispatch_state.load(std::memory_order_relaxed) == EARLY_DISPATCH_STAGING) {
                 continue;
             }
+            auto &observation = observations[observation_count++];
+            observation.bit_pos = bit_pos;
+            // Each simulator COND load is an acquire; hardware reads are volatile.
+            // AICore-published memory is read only after the batch barrier.
+            observation.reg_value = reg_load_acquire(core.cond_ptr);
         }
+        if (observation_count == 0) continue;
 
-        // --- Judgment phase: read register, derive transition ---
-        // Use the precomputed cond_ptr (resolved once in handshake) to skip
-        // the reg_offset switch and reg_addr addition on every poll.
-        // reg_load_acquire makes this an atomic acquire under __CPU_SIM so it
-        // pairs with the AICore's release store of the FIN (without it the sim
-        // poll races the FIN publish and can miss it); on hardware it is the
-        // same plain volatile load the bare deref used to be.
-        uint64_t reg_val = static_cast<uint64_t>(reg_load_acquire(core.cond_ptr));
-        // ARM64 allows Device-nGnRnE -> Normal-cacheable load reorder; the
-        // rmb() pins any AICore-published cacheable reads downstream of the
-        // FIN observation. Replaces the post-`__sync_synchronize` that the
-        // old read_reg() helper carried implicitly.
+        // One barrier acquires every captured COND, including ACK-only and
+        // unmatched values, before any slab read or buffer reuse/publication.
         rmb();
-        int32_t reg_task_id = EXTRACT_TASK_ID(reg_val);
-        int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
-
-#if SIMPLER_SCHED_PROFILING
-        if (chip_swimlane.chip_swimlane_enabled) {
-            chip_swimlane.complete_probe_count++;
-        }
-#endif
-
-        // Phase 1+: gated == not yet launched (STAGING, or sync_start DISPATCHED rendezvous).
-        uint8_t pending_ss =
-            (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr) ?
-                core.pending_slot_state->payload->early_dispatch_state.load(std::memory_order_relaxed) :
-                static_cast<uint8_t>(EARLY_DISPATCH_NONE);
-        bool pending_gated =
-            (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr &&
-             (pending_ss == EARLY_DISPATCH_STAGING ||
-              (pending_ss == EARLY_DISPATCH_DISPATCHED && core.pending_slot_state->task_attrs.requires_sync_start())));
-        SlotTransition t = decide_slot_transition(
-            reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id, pending_gated
-        );
-        if (!t.matched) continue;
-
-#if SIMPLER_SCHED_PROFILING
-        if (chip_swimlane.chip_swimlane_enabled && (t.running_done || t.pending_done)) {
-            chip_swimlane.complete_hit_count++;
-        }
-#endif
-
 #if SIMPLER_DFX
-        // Capture finish_ts at the FIN observation point — right after rmb()
-        // pinned cacheable AICore reads downstream of the register load, and
-        // BEFORE any fanin / deferred-release work. Anything later would
-        // charge AICPU completion-processing cost to (end → finish).
-        uint64_t finish_ts = 0;
-        if (chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING && (t.pending_done || t.running_done)) {
-            finish_ts = get_sys_cnt_aicpu();
-        }
+        // This is the batch-acquisition time, before classification or callbacks.
+        // Later rows must not include earlier rows' completion work in end->finish.
+        uint64_t finish_ts = chip_swimlane_level_ >= ChipSwimlaneLevel::SCHEDULE_TIMING ? get_sys_cnt_aicpu() : 0;
 #endif
-
-#if SIMPLER_DFX
-        // Release an ACK-gated AICore swimlane buffer only after capturing the
-        // FIN observation timestamp. Publishing the retained buffer can do
-        // deferred-release work, which must not be charged to (end -> finish).
-        if (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED) {
-            chip_swimlane_aicpu_on_aicore_ack(core_id, thread_idx, static_cast<uint32_t>(reg_task_id));
-        }
+        constexpr int32_t MAX_BATCH_COMPLETIONS = 2 * capacity;
+        constexpr uint8_t NO_GROUP = UINT8_MAX;
+        static_assert(MAX_BATCH_COMPLETIONS < NO_GROUP);
+        [[maybe_unused]] int16_t completion_counts[MAX_BATCH_COMPLETIONS];
+        [[maybe_unused]] uint8_t completion_groups[MAX_BATCH_COMPLETIONS];
+        [[maybe_unused]] uint8_t last_group_event[MAX_BATCH_COMPLETIONS];
+        [[maybe_unused]] uint8_t *touched[MAX_BATCH_COMPLETIONS];
+        [[maybe_unused]] int32_t group_count = 0;
+        [[maybe_unused]] int32_t completion_event_count = 0;
+        for (int32_t i = 0; i < observation_count; ++i) {
+            auto &observation = observations[i];
+            CoreExecState &core = core_exec_states_[tracker.get_core_id_by_offset(observation.bit_pos)];
+            int32_t reg_task_id = EXTRACT_TASK_ID(observation.reg_value);
+            int32_t reg_state = EXTRACT_TASK_STATE(observation.reg_value);
+#if SIMPLER_SCHED_PROFILING
+            if (chip_swimlane.chip_swimlane_enabled) {
+                chip_swimlane.complete_probe_count++;
+            }
 #endif
-
-        // --- Apply phase: execute actions based on transition ---
-
-        // 1. Complete finished tasks (capture pointers before modifying core state)
-        if (t.pending_done) {
-            // Task-timing finish: latest FIN observation for a tagged task, folded
-            // as max. Sampled after the rmb above and before complete_slot_task runs
-            // fanin / deferred-completion (which may also clear pending_slot_state),
-            // matching L2's finish_time point. Independent of chip swimlane level, so
-            // it works in SIMPLER_DFX=0 builds; untagged tasks pay only the compare.
-            if (core.pending_slot_state->task_attrs.is_timed()) {
+            uint8_t pending_ss =
+                (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr) ?
+                    core.pending_slot_state->payload->early_dispatch_state.load(std::memory_order_relaxed) :
+                    static_cast<uint8_t>(EARLY_DISPATCH_NONE);
+            observation.pending_gated =
+                (core.pending_slot_state != nullptr && core.pending_slot_state->payload != nullptr &&
+                 (pending_ss == EARLY_DISPATCH_STAGING || (pending_ss == EARLY_DISPATCH_DISPATCHED &&
+                                                           core.pending_slot_state->task_attrs.requires_sync_start())));
+            observation.transition = decide_slot_transition(
+                reg_task_id, reg_state, core.running_reg_task_id, core.pending_reg_task_id, observation.pending_gated
+            );
+            const SlotTransition &t = observation.transition;
+            if (!t.matched) continue;
+#if SIMPLER_SCHED_PROFILING
+            if (chip_swimlane.chip_swimlane_enabled && (t.running_done || t.pending_done)) {
+                chip_swimlane.complete_hit_count++;
+            }
+#endif
+            // Outstanding physical completions keep these task pointers alive.
+            // Fold every tagged finish before any callback can retire a task;
+            // selective timing also runs with DFX=0 or chip swimlane disabled.
+            if (t.pending_done && core.pending_slot_state->task_attrs.is_timed()) {
                 aicpu_task_timing_finish(core.pending_slot_state->task_attrs.timing_slot(), thread_idx);
             }
-            complete_slot_task(
-                *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count
-#if SIMPLER_DFX
-                ,
-                core.pending_dispatch_timestamp, finish_ts
-#endif
-            );
-            cur_thread_completed++;
-        }
-        if (t.running_done) {
-            if (core.running_slot_state->task_attrs.is_timed()) {
+            if (t.running_done && core.running_slot_state->task_attrs.is_timed()) {
                 aicpu_task_timing_finish(core.running_slot_state->task_attrs.timing_slot(), thread_idx);
             }
-            complete_slot_task(
-                *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
-                completed_this_turn, deferred_release_slot_states, deferred_release_count
-#if SIMPLER_DFX
-                ,
-                core.running_dispatch_timestamp, finish_ts
-#endif
-            );
-            cur_thread_completed++;
-        }
-
-        // 2. Update slot data
-        if (t.running_freed) {
-            if (core.pending_slot_state != nullptr && !t.pending_done) {
-                ChipTaskSlotState *promoted = core.pending_slot_state;
-                bool sync_start_promote = pending_gated && promoted->task_attrs.requires_sync_start();
-                promote_pending_to_running(core);
-                if (sync_start_promote) {
-                    promoted->payload->running_slot_count.fetch_add(1, std::memory_order_seq_cst);
-                    if (sched_->try_launch_sync_start_cohort(*promoted)) {
-                        sched_->propagate_dispatch_fanin(*promoted);
+            if constexpr (Batched) {
+                auto append_completion = [&](ChipTaskSlotState *slot, bool groupable) {
+                    int32_t event = completion_event_count++;
+                    if (!groupable) {
+                        completion_groups[event] = NO_GROUP;
+                        return;
                     }
-                }
-            } else {
-                clear_running_slot(core);  // Case 1 or Case 3 (no pending)
+                    uint8_t &entry = completion_scratch_[thread_idx].cell(*slot);
+                    if (entry == 0) {
+                        int32_t group = group_count++;
+                        entry = static_cast<uint8_t>(group + 1);
+                        touched[group] = &entry;
+                        completion_counts[group] = 0;
+                    }
+                    uint8_t group = entry - 1;
+                    completion_groups[event] = group;
+                    last_group_event[group] = static_cast<uint8_t>(event);
+                };
                 if (t.pending_done) {
-                    // Case 1: pending FIN observed directly -- clear stale pending fields.
-                    // Without this, pending_reg_task_id retains a stale value that blocks
-                    // clear_pending_occupied and permanently degrades pipelining.
-                    core.pending_slot_state = nullptr;
-                    core.pending_reg_task_id = AICPU_TASK_INVALID;
+                    append_completion(core.pending_slot_state, tracker.is_pending_groupable(observation.bit_pos));
+                }
+                if (t.running_done) {
+                    append_completion(core.running_slot_state, tracker.is_running_groupable(observation.bit_pos));
                 }
             }
         }
 
-        // 3. Update tracker bitmap
-        bool is_idle = (core.running_reg_task_id == AICPU_TASK_INVALID);
-        if (is_idle) {
-            tracker.change_core_state(bit_pos);       // Mark idle
-            tracker.clear_pending_occupied(bit_pos);  // Idle safeguard: no payload to protect
-        } else if (t.pending_freed && core.pending_reg_task_id == AICPU_TASK_INVALID) {
-            // Case 4 (running ACK) or Case 2 (pending ACK): clear pending_occupied only
-            // when no pending task is currently held. Otherwise pending slot is occupied
-            // by a pre-loaded task and must stay protected.
-            tracker.clear_pending_occupied(bit_pos);
+        // The lookup is needed only for classification. Clear only touched cells
+        // before callbacks can retire/reuse a slot; application uses dense groups.
+        if constexpr (Batched) {
+            for (int32_t group = 0; group < group_count; ++group)
+                *touched[group] = 0;
         }
 
-        // 4. Progress signal (only when running task completes)
-        if (t.running_done) {
-            made_progress = true;
+        // A later local FIN pins every deferred count until its group's last
+        // event. Before that event, no owner can retire the task.
+        [[maybe_unused]] int32_t next_completion_event = 0;
+        // Only this owner changes its core slots. Earlier callbacks may release
+        // an installed gate, so retain the acquired transition and occupancy
+        // decision instead of reclassifying against a partly applied batch.
+        for (int32_t i = 0; i < observation_count; ++i) {
+            const auto &observation = observations[i];
+            const SlotTransition &t = observation.transition;
+            if (!t.matched) continue;
+            int32_t bit_pos = observation.bit_pos;
+            int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
+            CoreExecState &core = core_exec_states_[core_id];
+#if SIMPLER_DFX
+            int32_t reg_task_id = EXTRACT_TASK_ID(observation.reg_value);
+            // All observations in this batch precede ACK-buffer publication and
+            // completion work, including selective task timing with swimlane off.
+            if (chip_swimlane_level_ != ChipSwimlaneLevel::DISABLED) {
+                chip_swimlane_aicpu_on_aicore_ack(core_id, thread_idx, static_cast<uint32_t>(reg_task_id));
+            }
+#endif
+
+            // --- Apply phase: execute actions based on transition ---
+
+            // 1. Complete finished tasks (capture pointers before modifying core state)
+            if (t.pending_done) {
+                int16_t *count = nullptr;
+                bool flush = true;
+                if constexpr (Batched) {
+                    int32_t event = next_completion_event++;
+                    uint8_t group = completion_groups[event];
+                    if (group != NO_GROUP) {
+                        count = &completion_counts[group];
+                        flush = last_group_event[group] == event;
+                    }
+                }
+                complete_slot_task(
+                    *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
+                    completed_this_turn, deferred_release_slot_states, deferred_release_count
+#if SIMPLER_DFX
+                    ,
+                    core.pending_dispatch_timestamp, finish_ts
+#endif
+                    ,
+                    count, flush
+                );
+                cur_thread_completed++;
+            }
+            if (t.running_done) {
+                int16_t *count = nullptr;
+                bool flush = true;
+                if constexpr (Batched) {
+                    int32_t event = next_completion_event++;
+                    uint8_t group = completion_groups[event];
+                    if (group != NO_GROUP) {
+                        count = &completion_counts[group];
+                        flush = last_group_event[group] == event;
+                    }
+                }
+                complete_slot_task(
+                    *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
+                    completed_this_turn, deferred_release_slot_states, deferred_release_count
+#if SIMPLER_DFX
+                    ,
+                    core.running_dispatch_timestamp, finish_ts
+#endif
+                    ,
+                    count, flush
+                );
+                cur_thread_completed++;
+            }
+
+            // 2. Update slot data
+            if (t.running_freed) {
+                if (core.pending_slot_state != nullptr && !t.pending_done) {
+                    ChipTaskSlotState *promoted = core.pending_slot_state;
+                    bool sync_start_promote = observation.pending_gated && promoted->task_attrs.requires_sync_start();
+                    promote_pending_to_running(core);
+                    if constexpr (Batched) tracker.promote_pending_groupable(bit_pos);
+                    if (sync_start_promote) {
+                        promoted->payload->running_slot_count.fetch_add(1, std::memory_order_seq_cst);
+                        if (sched_->try_launch_sync_start_cohort(*promoted)) {
+                            sched_->propagate_dispatch_fanin(*promoted);
+                        }
+                    }
+                } else {
+                    clear_running_slot(core);  // Case 1 or Case 3 (no pending)
+                    if constexpr (Batched) tracker.clear_completion_slots(bit_pos);
+                    if (t.pending_done) {
+                        // Case 1: pending FIN observed directly -- clear stale pending fields.
+                        // Without this, pending_reg_task_id retains a stale value that blocks
+                        // clear_pending_occupied and permanently degrades pipelining.
+                        core.pending_slot_state = nullptr;
+                        core.pending_reg_task_id = AICPU_TASK_INVALID;
+                    }
+                }
+            }
+
+            // 3. Update tracker bitmap
+            bool is_idle = (core.running_reg_task_id == AICPU_TASK_INVALID);
+            if (is_idle) {
+                tracker.change_core_state(bit_pos);       // Mark idle
+                tracker.clear_pending_occupied(bit_pos);  // Idle safeguard: no payload to protect
+            } else if (t.pending_freed && core.pending_reg_task_id == AICPU_TASK_INVALID) {
+                // Case 4 (running ACK) or Case 2 (pending ACK): clear pending_occupied only
+                // when no pending task is currently held. Otherwise pending slot is occupied
+                // by a pre-loaded task and must stay protected.
+                tracker.clear_pending_occupied(bit_pos);
+            }
+
+            // 4. Progress signal (only when running task completes)
+            if (t.running_done) {
+                made_progress = true;
+            }
         }
     }
 }

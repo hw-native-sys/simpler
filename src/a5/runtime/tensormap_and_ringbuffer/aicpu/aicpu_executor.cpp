@@ -804,6 +804,13 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             }
 #endif
 
+            if (!sched_ctx_.prepare_completion_scratch(rt->prebuilt_layout.sizing.task_window_sizes)) {
+                LOG_ERROR("Thread %d: failed to allocate completion lookup", thread_idx);
+                rt = nullptr;
+                runtime_init_ready_.store(true, std::memory_order_release);
+                return -1;
+            }
+
             // Wire scheduler context to the newly created RuntimeContext before
             // releasing scheduler threads from runtime_init_ready_.
             sched_ctx_.bind_runtime(rt);

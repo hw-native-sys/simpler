@@ -165,10 +165,12 @@ SchedulerContext::PublishHandle SchedulerContext::prepare_subtask_to_core(
         core_exec_state.pending_subslot = subslot;
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
+        if (slot_state.total_required_subtasks > 1) tracker.set_pending_groupable(core_offset, true);
     } else {
         core_exec_state.running_subslot = subslot;
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
+        if (slot_state.total_required_subtasks > 1) tracker.set_running_groupable(core_offset, true);
         tracker.change_core_state(core_offset);
     }
     tracker.set_pending_occupied(core_offset);

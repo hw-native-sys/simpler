@@ -555,7 +555,7 @@ struct alignas(64) ChipTaskSlotState {
     std::atomic<uint8_t> lifecycle_flags{LIFECYCLE_FLAGS_NONE};
     int32_t dep_pool_mark{0};  // Dep pool top after Orch-side wiring
 
-    std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
+    std::atomic<int16_t> completed_subtasks{0};  // Published physical completions, individually or in local batches
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
     int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
     // Next block to dispatch. Normal dispatch and late early-dispatch stagers
