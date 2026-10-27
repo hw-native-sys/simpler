@@ -20,7 +20,7 @@ from pathlib import Path
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[4]
-_DEFAULT_ADAPTER = _ROOT / "examples/a2a3/host_build_graph/qwen3_14b_serving_effective"
+_ADAPTER_CASE = Path("examples/a2a3/host_build_graph/qwen3_14b_serving_effective")
 
 
 @dataclass(frozen=True)
@@ -44,12 +44,14 @@ def _required(name: str) -> Path:
 
 @pytest.fixture(scope="session")
 def adapter_runner() -> Path:
-    root = Path(os.environ.get("VLLM_ADAPTER_ROOT") or _DEFAULT_ADAPTER)
-    runner = root / "run_vllm_eager.py"
-    if not runner.is_file():
+    root = Path(os.environ.get("VLLM_ADAPTER_ROOT") or _ROOT)
+    candidates = [root / "run_vllm_eager.py", root / _ADAPTER_CASE / "run_vllm_eager.py"]
+    runner = next((candidate for candidate in candidates if candidate.is_file()), None)
+    if runner is None:
+        tried = ", ".join(str(candidate) for candidate in candidates)
         pytest.fail(
-            f"vLLM adapter runner not found at {runner}; "
-            "set VLLM_ADAPTER_ROOT to the pinned #2605 checkout or merge it first"
+            f"vLLM adapter runner not found under {root} (tried {tried}); set VLLM_ADAPTER_ROOT to the "
+            "pinned #2605 checkout or its qwen3_14b_serving_effective directory"
         )
     return runner
 
