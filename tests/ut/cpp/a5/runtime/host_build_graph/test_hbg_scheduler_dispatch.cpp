@@ -1688,8 +1688,15 @@ TEST(SchedulerSpmdClaim, IgnoresAHeadThisCoreCannotRun) {
 
 // A core still holding the old head finds the task already claimed clean. The
 // authority is the task's own cursor, so that costs one failed comparison
-// rather than needing a protocol to prevent it.
-TEST(SchedulerSpmdClaim, AClaimAgainstAnExhaustedHeadYieldsItInstead) {
+// rather than needing a protocol to prevent it -- and the core then leaves the
+// head alone.
+//
+// Leaving it alone is the point. The cursor is spent when the last block is
+// *claimed*, which is before that block's payload is published, so a core that
+// advanced the head on this signal would let the next task be claimed while the
+// previous one still had an undispatched block. The core that took the final
+// block advances the head instead, after its own dispatch succeeds.
+TEST(SchedulerSpmdClaim, AClaimAgainstAnExhaustedHeadLeavesTheHeadAlone) {
     SpmdFixture f;
     f.set_task(0, 0b001, 2);
     f.set_task(1, 0b001, 2);
@@ -1701,7 +1708,7 @@ TEST(SchedulerSpmdClaim, AClaimAgainstAnExhaustedHeadYieldsItInstead) {
     ASSERT_TRUE(f.claim(&progress));
     EXPECT_FALSE(progress);
     EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 2u);
-    EXPECT_EQ(f.head(), 1);
+    EXPECT_EQ(f.head(), 0);
 }
 
 // A graph with no SPMD task must not pay for the queue at all: the gate is what
@@ -1762,9 +1769,14 @@ TEST(SchedulerSpmdClaim, RemembersTheHeadsShapeUntilTheHeadMoves) {
     EXPECT_EQ(f.local->spmd_head_block_num, 3u);
     EXPECT_EQ(f.local->spmd_head_active_mask, 0b001);
 
-    // Draining the queue clears the memo rather than leaving it to describe a
-    // task that is no longer the head.
-    scheduler_gm_store(f.control(0)->next_block, UINT64_C(3));
+    // Taking the last block is what moves the head, and the core that took it
+    // is the one that moves it -- so this core sees the queue drain and clears
+    // the memo rather than leaving it to describe a task that no longer leads.
+    scheduler_gm_store(f.control(0)->next_block, UINT64_C(2));
+    ASSERT_TRUE(f.claim(&progress));
+    ASSERT_TRUE(scheduler_ready_endpoints_empty(scheduler_gm_query(
+        scheduler_ready_inbox_at(f.storage.scheduler_state->base(), f.local, TaskType::SPMD, 0)->endpoints
+    )));
     ASSERT_TRUE(f.claim(&progress));
     EXPECT_TRUE(scheduler_task_ref_is_null(f.local->spmd_head_ref));
 }

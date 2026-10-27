@@ -265,9 +265,22 @@ inline __aicore__ bool scheduler_claim_spmd_block(
         current = observed;
     }
     if (claimed == UINT64_MAX) {
-        // Claimed clean by other cores while this one was probing. The head
-        // owes nothing further, so let the next SPMD task have it.
-        return scheduler_advance_spmd_head(graph, base, local, run, task_ref, stats);
+        // Claimed clean by other cores while this one was probing, so there is
+        // nothing here for this core. The head is left alone deliberately.
+        //
+        // Advancing it here would be advancing on "the cursor is spent", and
+        // the cursor is spent at the moment the last block is *claimed* --
+        // before its payload is published. A core that moved the head on that
+        // signal lets the next task be claimed while the previous task's last
+        // block is still undispatched, so a target core can take work from the
+        // successor before it can even see the obligation it already owes.
+        //
+        // The core that claimed the final block advances the head instead, at
+        // the end of this function and only once its dispatch has succeeded.
+        // That is one round of extra latency for whoever loses the race here,
+        // and it is what makes "the head moved" mean "the previous task is
+        // fully dispatched".
+        return true;
     }
 
     SchedulerReadyClaim ready{};

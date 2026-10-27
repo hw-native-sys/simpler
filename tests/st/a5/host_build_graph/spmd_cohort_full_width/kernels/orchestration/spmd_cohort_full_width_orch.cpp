@@ -28,9 +28,13 @@
 
 extern "C" {
 
+// Slots reserved for the arrival flags before the results begin, sized for the
+// widest topology this runs on rather than for the one it is running on.
+constexpr int64_t SPMD_COHORT_MAX_BLOCKS = 160;
+
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &args) {
     (void)args;
-    return OrchestrationConfig{.expected_arg_count = 1};
+    return OrchestrationConfig{.expected_arg_count = 2};
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
@@ -41,6 +45,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     }
     CoreTaskArgs cohort;
     cohort.add_inout(args.tensor(0).ref());
+    // Arrival flags first, results after them, one lane per block. The blocks
+    // wait for each other, so this cohort fails loudly if it is not resident
+    // all at once rather than only reporting where its blocks landed.
+    cohort.add_scalar(static_cast<int64_t>(0));
+    cohort.add_scalar(static_cast<int64_t>(SPMD_COHORT_MAX_BLOCKS));
+    cohort.add_scalar(args.scalar<int64_t>(0));
+    cohort.add_scalar(static_cast<int64_t>(1));
     // One AIC per cluster, so the cluster count is the AIC count and this is
     // the widest cohort the submit-time guard will admit.
     cohort.launch_spec.set_block_num(clusters);

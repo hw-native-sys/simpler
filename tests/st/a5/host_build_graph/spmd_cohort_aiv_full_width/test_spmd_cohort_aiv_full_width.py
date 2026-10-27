@@ -50,17 +50,19 @@ from simpler_setup.pto_isa import ensure_pto_isa_root
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = "host_build_graph"
 ORCHESTRATION_SOURCE = os.path.join(HERE, "kernels", "orchestration", "spmd_cohort_aiv_full_width_orch.cpp")
-# Holds its core until the claim round is over, which is what makes the
-# distribution a property instead of a race -- see the kernel's own comment.
-KERNEL_SOURCE = os.path.join(HERE, "..", "spmd_cohort_full_width", "kernels", "aic", "kernel_stamp_block_resident.cpp")
+# The blocks wait for each other, so this case tests co-residency and not only
+# which cores the blocks landed on.
+KERNEL_SOURCE = os.path.join(HERE, "..", "spmd_cohort_saturation", "kernels", "aiv", "kernel_cohort_barrier.cpp")
 
 FLOATS_PER_CACHE_LINE = 16
-# The platform's ceiling on clusters times its AIVs per cluster, so the buffer
-# fits any box this runs on without the test knowing which one it is.
-MAX_CLUSTERS = 36
-MAX_AIV_PER_CLUSTER = 4
-MAX_BLOCKS = MAX_CLUSTERS * MAX_AIV_PER_CLUSTER
+# Mirrors SPMD_COHORT_MAX_BLOCKS in the orchestration: wide enough for the AIV
+# population of any box this runs on, without the test knowing which one.
+MAX_BLOCKS = 160
 UNWRITTEN = -1.0
+ARRIVED = 1.0
+POISON = -99.0
+# Measured in spmd_cohort_saturation: about a second before a block gives up.
+SPIN_LIMIT = 200000000
 
 
 def _build_callable(platform):
@@ -79,10 +81,24 @@ def _build_callable(platform):
         binary = extract_text_section(binary)
     orchestration = compiler.compile_orchestration(runtime_name=RUNTIME, source_path=ORCHESTRATION_SOURCE)
     return ChipCallable.build(
-        signature=[ArgDirection.INOUT],
+        signature=[ArgDirection.INOUT, ArgDirection.IN],
         func_name="aicpu_orchestration_entry",
         binary=orchestration,
-        children=[(0, CoreCallable.build(signature=[ArgDirection.INOUT], binary=binary))],
+        children=[
+            (
+                0,
+                CoreCallable.build(
+                    signature=[
+                        ArgDirection.INOUT,
+                        ArgDirection.IN,
+                        ArgDirection.IN,
+                        ArgDirection.IN,
+                        ArgDirection.IN,
+                    ],
+                    binary=binary,
+                ),
+            )
+        ],
     )
 
 
@@ -102,13 +118,14 @@ def test_full_width_aiv_cohort_uses_every_aiv_once(st_platform, st_device_ids, t
         handle = worker.register(_build_callable(st_platform))
         worker.init()
 
-        slots = MAX_BLOCKS * FLOATS_PER_CACHE_LINE
+        slots = 2 * MAX_BLOCKS * FLOATS_PER_CACHE_LINE
         host_out = torch.full((slots,), UNWRITTEN, dtype=torch.float32)
         buffer = worker.malloc(host_out.nbytes)
         worker.copy_to(buffer, host_out)
 
         args = TaskArgs()
         args.add_tensor(buffer.tensor(shapes=(slots,), dtype=DataType.FLOAT32), TensorArgType.INOUT)
+        args.add_scalar(SPIN_LIMIT)
 
         output_prefix = tmp_path / "aiv_full_width"
         output_prefix.mkdir(parents=True, exist_ok=True)
@@ -138,11 +155,29 @@ def test_full_width_aiv_cohort_uses_every_aiv_once(st_platform, st_device_ids, t
             "holding two blocks leaves another with none, which is a cohort that can never be resident."
         )
 
-        stamped = host_out[0 : aiv_count * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE]
+        arrivals = host_out[0 : aiv_count * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE]
+        assert torch.equal(arrivals, torch.full((aiv_count,), ARRIVED)), (
+            f"a block of the cohort never ran at all: {arrivals.tolist()}"
+        )
+        stamped = host_out[
+            MAX_BLOCKS * FLOATS_PER_CACHE_LINE : (MAX_BLOCKS + aiv_count) * FLOATS_PER_CACHE_LINE :
+            FLOATS_PER_CACHE_LINE
+        ]
+        poisoned = int((stamped == POISON).sum())
+        assert poisoned == 0, (
+            f"{poisoned} of the cohort's {aiv_count} blocks gave up waiting for their siblings, so the cohort was "
+            f"never resident all at once: {stamped.tolist()}"
+        )
         assert torch.equal(stamped, torch.arange(aiv_count, dtype=torch.float32)), (
             f"not every block stamped its slot: {stamped.tolist()}"
         )
-        assert torch.all(host_out[aiv_count * FLOATS_PER_CACHE_LINE :: FLOATS_PER_CACHE_LINE] == UNWRITTEN)
+        assert torch.all(
+            host_out[aiv_count * FLOATS_PER_CACHE_LINE : MAX_BLOCKS * FLOATS_PER_CACHE_LINE :
+                     FLOATS_PER_CACHE_LINE] == UNWRITTEN
+        )
+        assert torch.all(
+            host_out[(MAX_BLOCKS + aiv_count) * FLOATS_PER_CACHE_LINE :: FLOATS_PER_CACHE_LINE] == UNWRITTEN
+        )
     finally:
         # A poisoned run still owns its device memory, so free() would raise and
         # bury whatever actually failed. Closing the worker releases it.

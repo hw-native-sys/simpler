@@ -21,13 +21,14 @@ thirty-two-cluster one. Which also means the output cannot be a fixed golden,
 so this is a standalone case rather than a scene-test one: it checks what the
 run reports about itself.
 
-The blocks hold their cores rather than returning at once, and that is load
-bearing: the rule is enforced by a core scanning its own dispatch slots for the
-task, and a slot is cleared when its block completes. With a kernel that
-returns immediately, whether a core takes a second block depends on whether the
-claim round outran the first block -- so the assertion below would be measuring
-a race. The AIV cohort of spmd_cohort_aiv_full_width is where that showed:
-sixteen blocks landed on nine cores.
+The blocks wait for each other rather than returning at once, and that is load
+bearing twice over. It is what makes the case test co-residency at all -- a
+block that never waits cannot tell whether its siblings were running, so a
+cohort that had silently stopped being resident all at once would still pass.
+It is also what makes the distribution assertion sound: the one-block-per-core
+rule is enforced by a core scanning its own dispatch slots, and a slot is
+cleared when its block completes, so with a kernel that returns immediately
+whether a core takes a second block is a race rather than a property.
 """
 
 import json
@@ -54,13 +55,20 @@ from simpler_setup.pto_isa import ensure_pto_isa_root
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = "host_build_graph"
 ORCHESTRATION_SOURCE = os.path.join(HERE, "kernels", "orchestration", "spmd_cohort_full_width_orch.cpp")
-KERNEL_SOURCE = os.path.join(HERE, "kernels", "aic", "kernel_stamp_block_resident.cpp")
+KERNEL_SOURCE = os.path.join(
+    HERE, "..", "spmd_cohort_saturation", "kernels", "aic", "kernel_cohort_barrier.cpp"
+)
 
 FLOATS_PER_CACHE_LINE = 16
 # The platform's own ceiling on clusters, so the buffer fits any box this runs
-# on without the test having to know which one it is.
-MAX_BLOCKS = 36
+# on without the test having to know which one it is. Mirrors
+# SPMD_COHORT_MAX_BLOCKS in the orchestration.
+MAX_BLOCKS = 160
 UNWRITTEN = -1.0
+ARRIVED = 1.0
+POISON = -99.0
+# Measured in spmd_cohort_saturation: about a second before a block gives up.
+SPIN_LIMIT = 200000000
 
 
 def _build_callable(platform):
@@ -82,7 +90,21 @@ def _build_callable(platform):
         signature=[ArgDirection.INOUT],
         func_name="aicpu_orchestration_entry",
         binary=orchestration,
-        children=[(0, CoreCallable.build(signature=[ArgDirection.INOUT], binary=binary))],
+        children=[
+            (
+                0,
+                CoreCallable.build(
+                    signature=[
+                        ArgDirection.INOUT,
+                        ArgDirection.IN,
+                        ArgDirection.IN,
+                        ArgDirection.IN,
+                        ArgDirection.IN,
+                    ],
+                    binary=binary,
+                ),
+            )
+        ],
     )
 
 
@@ -102,13 +124,14 @@ def test_full_width_cohort_uses_every_core_once(st_platform, st_device_ids, tmp_
         handle = worker.register(_build_callable(st_platform))
         worker.init()
 
-        slots = MAX_BLOCKS * FLOATS_PER_CACHE_LINE
+        slots = 2 * MAX_BLOCKS * FLOATS_PER_CACHE_LINE
         host_out = torch.full((slots,), UNWRITTEN, dtype=torch.float32)
         buffer = worker.malloc(host_out.nbytes)
         worker.copy_to(buffer, host_out)
 
         args = TaskArgs()
         args.add_tensor(buffer.tensor(shapes=(slots,), dtype=DataType.FLOAT32), TensorArgType.INOUT)
+        args.add_scalar(SPIN_LIMIT)
 
         output_prefix = tmp_path / "full_width"
         output_prefix.mkdir(parents=True, exist_ok=True)
@@ -133,14 +156,32 @@ def test_full_width_cohort_uses_every_core_once(st_platform, st_device_ids, tmp_
             "holding two blocks leaves another with none, which is a cohort that can never be resident."
         )
 
-        stamped = host_out[0 : aic_count * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE]
+        arrivals = host_out[0 : aic_count * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE]
+        assert torch.equal(arrivals, torch.full((aic_count,), ARRIVED)), (
+            f"a block of the cohort never ran at all: {arrivals.tolist()}"
+        )
+        stamped = host_out[
+            MAX_BLOCKS * FLOATS_PER_CACHE_LINE : (MAX_BLOCKS + aic_count) * FLOATS_PER_CACHE_LINE :
+            FLOATS_PER_CACHE_LINE
+        ]
+        poisoned = int((stamped == POISON).sum())
+        assert poisoned == 0, (
+            f"{poisoned} of the cohort's {aic_count} blocks gave up waiting for their siblings, so the cohort was "
+            f"never resident all at once: {stamped.tolist()}"
+        )
         assert torch.equal(stamped, torch.arange(aic_count, dtype=torch.float32)), (
             f"not every block stamped its slot: {stamped.tolist()}"
         )
         # Nothing past the cohort's width ran, which is what says the width
         # came from the topology rather than from a constant that happened to
-        # match it.
-        assert torch.all(host_out[aic_count * FLOATS_PER_CACHE_LINE :: FLOATS_PER_CACHE_LINE] == UNWRITTEN)
+        # match it. Checked on both halves of the slot map.
+        assert torch.all(
+            host_out[aic_count * FLOATS_PER_CACHE_LINE : MAX_BLOCKS * FLOATS_PER_CACHE_LINE :
+                     FLOATS_PER_CACHE_LINE] == UNWRITTEN
+        )
+        assert torch.all(
+            host_out[(MAX_BLOCKS + aic_count) * FLOATS_PER_CACHE_LINE :: FLOATS_PER_CACHE_LINE] == UNWRITTEN
+        )
     finally:
         # A poisoned run still owns its device memory, so free() would raise and
         # bury whatever actually failed. Closing the worker releases it.

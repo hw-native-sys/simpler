@@ -54,10 +54,19 @@ from simpler_setup.pto_isa import ensure_pto_isa_root
 HERE = os.path.dirname(os.path.abspath(__file__))
 RUNTIME = "host_build_graph"
 ORCHESTRATION_SOURCE = os.path.join(HERE, "kernels", "orchestration", "spmd_sync_start_mix_aiv_orch.cpp")
-KERNEL_SOURCE = os.path.join(HERE, "kernels", "aiv", "kernel_stamp_block_lane.cpp")
+# Both subtasks wait for every subtask of every block, so this case tests
+# co-residency and not only which clusters the blocks reached.
+BARRIER_DIR = os.path.join(HERE, "..", "spmd_cohort_saturation", "kernels", "aiv")
+KERNEL_LANE0 = os.path.join(BARRIER_DIR, "kernel_cohort_barrier.cpp")
+KERNEL_LANE1 = os.path.join(BARRIER_DIR, "kernel_cohort_barrier_lane1.cpp")
+KERNEL_SOURCE = KERNEL_LANE0
 
 FLOATS_PER_CACHE_LINE = 16
 LANES_PER_BLOCK = 2
+ARRIVED = 1.0
+POISON = -99.0
+# Measured in spmd_cohort_saturation: about a second before a lane gives up.
+SPIN_LIMIT = 200000000
 # Every block of a cohort has to be resident at once, so the width is bounded by
 # the narrowest topology this runs on: eight blocks need sixteen AIV cores, the
 # count of the smallest box here. Worker demand is checked against the same
@@ -75,20 +84,20 @@ class TestSpmdSyncStartMixAiv(SceneTestCase):
         "orchestration": {
             "source": "kernels/orchestration/spmd_sync_start_mix_aiv_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
-            "signature": [D.INOUT, D.IN],
+            "signature": [D.INOUT, D.IN, D.IN],
         },
         "incores": [
             {
                 "func_id": 0,
-                "source": "kernels/aiv/kernel_stamp_block_lane.cpp",
+                "source": "../spmd_cohort_saturation/kernels/aiv/kernel_cohort_barrier.cpp",
                 "core_type": "aiv",
-                "signature": [D.INOUT],
+                "signature": [D.INOUT, D.IN, D.IN, D.IN, D.IN],
             },
             {
                 "func_id": 1,
-                "source": "kernels/aiv/kernel_stamp_block_lane.cpp",
+                "source": "../spmd_cohort_saturation/kernels/aiv/kernel_cohort_barrier_lane1.cpp",
                 "core_type": "aiv",
-                "signature": [D.INOUT],
+                "signature": [D.INOUT, D.IN, D.IN, D.IN, D.IN],
             },
         ],
     }
@@ -102,20 +111,22 @@ class TestSpmdSyncStartMixAiv(SceneTestCase):
     ]
 
     def generate_args(self, params):
-        slots = params["blocks"] * LANES_PER_BLOCK * FLOATS_PER_CACHE_LINE
+        lanes = params["blocks"] * LANES_PER_BLOCK
         return TaskArgsBuilder(
-            TensorArg("out", torch.full((slots,), -1.0, dtype=torch.float32)),
+            TensorArg("out", torch.full((2 * lanes * FLOATS_PER_CACHE_LINE,), -1.0, dtype=torch.float32)),
             Scalar("blocks", params["blocks"]),
+            Scalar("spin_limit", SPIN_LIMIT),
         )
 
     def compute_golden(self, args, params):
-        blocks = params["blocks"]
-        for block in range(blocks):
-            for lane in range(LANES_PER_BLOCK):
-                base = (block * LANES_PER_BLOCK + lane) * FLOATS_PER_CACHE_LINE
-                args.out[base] = float(block)
-                args.out[base + 1] = float(blocks)
-                args.out[base + 2] = float(lane)
+        lanes = params["blocks"] * LANES_PER_BLOCK
+        for lane in range(lanes):
+            # Arrival half: every subtask reaches its flag.
+            args.out[lane * FLOATS_PER_CACHE_LINE] = ARRIVED
+            # Result half: each subtask stamps its block, so a block's index
+            # appears once per lane. A lane that gave up waiting writes POISON
+            # instead, which no golden can contain.
+            args.out[(lanes + lane) * FLOATS_PER_CACHE_LINE] = float(lane // LANES_PER_BLOCK)
 
 
 def _build_callable(platform):
@@ -124,24 +135,33 @@ def _build_callable(platform):
     include_dirs = list(compiler.get_orchestration_include_dirs(RUNTIME)) + [
         str(compiler.project_root / "src" / "common")
     ]
-    binary = compiler.compile_incore(
-        source_path=KERNEL_SOURCE,
-        core_type="aiv",
-        pto_isa_root=pto_isa_root,
-        extra_include_dirs=include_dirs,
-    )
-    if not platform.endswith("sim"):
-        binary = extract_text_section(binary)
 
-    def incore():
-        return CoreCallable.build(signature=[ArgDirection.INOUT], binary=binary)
+    def incore(source):
+        binary = compiler.compile_incore(
+            source_path=source,
+            core_type="aiv",
+            pto_isa_root=pto_isa_root,
+            extra_include_dirs=include_dirs,
+        )
+        if not platform.endswith("sim"):
+            binary = extract_text_section(binary)
+        return CoreCallable.build(
+            signature=[
+                ArgDirection.INOUT,
+                ArgDirection.IN,
+                ArgDirection.IN,
+                ArgDirection.IN,
+                ArgDirection.IN,
+            ],
+            binary=binary,
+        )
 
     orchestration = compiler.compile_orchestration(runtime_name=RUNTIME, source_path=ORCHESTRATION_SOURCE)
     return ChipCallable.build(
-        signature=[ArgDirection.INOUT, ArgDirection.IN],
+        signature=[ArgDirection.INOUT, ArgDirection.IN, ArgDirection.IN],
         func_name="aicpu_orchestration_entry",
         binary=orchestration,
-        children=[(0, incore()), (1, incore())],
+        children=[(0, incore(KERNEL_LANE0)), (1, incore(KERNEL_LANE1))],
     )
 
 
@@ -175,7 +195,8 @@ def test_cohort_blocks_land_on_distinct_clusters(st_platform, st_device_ids, tmp
         handle = worker.register(_build_callable(st_platform))
         worker.init()
 
-        slots = blocks * LANES_PER_BLOCK * FLOATS_PER_CACHE_LINE
+        lanes = blocks * LANES_PER_BLOCK
+        slots = 2 * lanes * FLOATS_PER_CACHE_LINE
         host_out = torch.full((slots,), -1.0, dtype=torch.float32)
         buffer = worker.malloc(host_out.nbytes)
         worker.copy_to(buffer, host_out)
@@ -183,6 +204,7 @@ def test_cohort_blocks_land_on_distinct_clusters(st_platform, st_device_ids, tmp
         args = TaskArgs()
         args.add_tensor(buffer.tensor(shapes=(slots,), dtype=DataType.FLOAT32), TensorArgType.INOUT)
         args.add_scalar(blocks)
+        args.add_scalar(SPIN_LIMIT)
 
         output_prefix = tmp_path / "cohort_placement"
         output_prefix.mkdir(parents=True, exist_ok=True)
@@ -192,8 +214,13 @@ def test_cohort_blocks_land_on_distinct_clusters(st_platform, st_device_ids, tmp
         worker.run(handle, args, config)
 
         worker.copy_from(host_out, buffer)
-        stamped = host_out[0:slots:FLOATS_PER_CACHE_LINE]
-        expected = torch.tensor([float(i // LANES_PER_BLOCK) for i in range(blocks * LANES_PER_BLOCK)])
+        stamped = host_out[lanes * FLOATS_PER_CACHE_LINE : 2 * lanes * FLOATS_PER_CACHE_LINE : FLOATS_PER_CACHE_LINE]
+        poisoned = int((stamped == POISON).sum())
+        assert poisoned == 0, (
+            f"{poisoned} of the cohort's {lanes} subtasks gave up waiting for the others, so the cohort was never "
+            f"resident all at once: {stamped.tolist()}"
+        )
+        expected = torch.tensor([float(i // LANES_PER_BLOCK) for i in range(lanes)])
         assert torch.equal(stamped, expected), f"not every block/lane stamped its slot: {stamped.tolist()}"
 
         raw = json.loads(_find_swimlane_records(output_prefix).read_text())
