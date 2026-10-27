@@ -147,5 +147,6 @@ so you know exactly what silicon was detected (e.g.
   acquisition on a doomed-to-fail invocation.
 - [chip-architecture.md SoC → arch mapping](../../../docs/hardware/chip-architecture.md#identifying-which-chip-generation-you-have) —
   the authoritative table for `Short_SoC_version` → repo arch. The
-  `npu-smi` `Chip Name` is a coarser view (family-level only), which is
-  fine for the arch gate purpose.
+  `npu-smi` `Chip Name` can contain a family name or a full SoC. Both paths
+  require an exact installed CANN INI and validate its `Short_SoC_version`
+  before admitting the requested architecture.

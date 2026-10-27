@@ -30,11 +30,12 @@ shape. The executable job bodies live in reusable workflows:
 `_detect-changes.yml`, `_pre-commit.yml`, `_ut-no-hardware.yml`,
 `_packaging.yml`, `_profiling-flags-smoke.yml`, `_st-sim-a2a3.yml`,
 `_st-sim-a5.yml`, `_ut-npu-a2a3.yml`, `_ut-npu-a5.yml`,
-`_st-npu-a2a3.yml`, `_st-npu-a5.yml`, `_st-network1.yml`, and
-`_st-deepseek-a2a3.yml`, and `_st-framework-eager.yml`. The scene-test and
-NPU unit-test bodies are split one workflow per architecture so each job
-renders only its own steps. Shared step scaffolding that is safe to run
-after checkout lives in composite actions under `.github/actions/`
+`_st-npu-a2a3.yml`, `_st-npu-a5.yml`, `_st-network1.yml`,
+`_st-deepseek-a2a3.yml`, and `_st-framework-eager.yml`. The simulation,
+ordinary onboard, and NPU unit-test bodies are split by architecture so each
+job renders only its own steps. Framework eager shares `_st-framework-eager.yml`;
+callers supply matching `platform` and `runs_on` inputs. Shared step scaffolding
+that is safe to run after checkout lives in composite actions under `.github/actions/`
 (`apt-install`, `cache-pip`, `cache-ccache`, `setup-gcc-15`, `setup-venv`, and the three `network1-*` actions).
 `setup-gcc-15` accepts a complete, pre-provisioned GCC 15 toolchain on any
 Linux runner; automatic installation of missing Linux tools is Ubuntu-only,
@@ -74,10 +75,12 @@ PullRequest
   ├── st-sim-a5              (ubuntu + macOS)        — a5_changed && st_affected
   ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [needs ut_affected]
   ├── st-onboard-a2a3        (a2a3 self-hosted)      — a2a3_changed && st_affected
+  ├── st-framework-eager-a2a3 (a2a3 self-hosted)     — a2a3_changed && st_affected
   ├── st-network1-onboard-a2a3    (a2a3pod pair)          — a2a3_changed && st_affected
   ├── st-deepseek-onboard-a2a3    (a2a3 self-hosted)      — a2a3_changed && st_affected
   ├── ut-a5                  (a5 self-hosted)        — Python UT, a5 hardware [needs ut_affected]
-  └── st-onboard-a5          (a5 self-hosted)        — a5_changed && st_affected
+  ├── st-onboard-a5          (a5 self-hosted)        — a5_changed && st_affected
+  └── st-framework-eager-a5  (a5 self-hosted)        — a5_changed && st_affected
 ```
 
 | Job | Runner | What it runs |
@@ -87,8 +90,10 @@ PullRequest
 | `st-sim-a5` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a5sim` |
 | `ut-a2a3` | a2a3 self-hosted | `pytest tests/ut --platform a2a3` + `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` + build `tools/cann-examples/query` and run `query version` (no device) + build `tools/cann-examples/aicpu-device-query` and `tools/cann-examples/aicpu-kernel-launch` (host + cross-compiled device SO, link smoke only) |
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
+| `st-framework-eager-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
 | `ut-a5` | a5 self-hosted | `pytest tests/ut --platform a5` + build `tools/cann-examples/query` and run `query version` (no device) + build `tools/cann-examples/aicpu-device-query` and `tools/cann-examples/aicpu-kernel-launch` (link smoke only) |
 | `st-onboard-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --exclude-level 4 --device ...`, including SDMA tests, then adaptive-parallel DFX feature smokes |
+| `st-framework-eager-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
 | `st-network1-onboard-a2a3` | a pair of `a2a3pod` machines | `pytest examples tests/st --level 4 --platform a2a3 --device ... --max-parallel 1`, one L3 daemon on the peer |
 | `st-deepseek-onboard-a2a3` | a2a3 self-hosted | `pytest <the two deepseek_v4_flash_decode dirs> --platform a2a3 --manual only --device ...`, both 2-device cases concurrently, in parallel with `st-onboard-a2a3` |
 
