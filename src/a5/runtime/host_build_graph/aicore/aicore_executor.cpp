@@ -14,6 +14,8 @@
 #include "aicore/pmu_collector_aicore.h"
 // AICore dependency scheduling uses one device-side protocol.
 #include "scheduler/scheduler_mix.h"
+#include "scheduler/scheduler_args_dump.h"
+#include "scheduler/scheduler_args_dump_tensor.h"
 #include "common/platform_config.h"
 #include "dispatch_payload.h"
 #include "runtime.h"
@@ -93,6 +95,149 @@ __aicore__ __attribute__((always_inline)) void execute_task(__gm__ DispatchPaylo
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t *>(payload->args));
     OUT_OF_ORDER_STORE_BARRIER();
+}
+
+__aicore__ __attribute__((noinline)) bool publish_args_dump_request(
+    __gm__ SchedulerArgsDumpRequest *request, uint64_t epoch, uint64_t task_id, ArgsDumpStage stage,
+    uint32_t generation, uint64_t cursor, uint64_t byte_cursor
+) {
+    const uint64_t tick = request->tick;
+    if (tick == UINT64_MAX) return false;
+    request->run_epoch = epoch;
+    request->task_id = task_id;
+    request->stage = static_cast<uint64_t>(stage);
+    request->generation = generation;
+    request->arg_index = cursor;
+    request->byte_cursor = byte_cursor;
+    OUT_OF_ORDER_STORE_BARRIER();
+    request->tick = tick + 1;
+    scheduler_publish_cache_line(request);
+    return true;
+}
+
+struct ArgsDumpLineWriter {
+    __aicore__ void operator()(uint64_t line) const {
+        scheduler_writeback_cache_line(reinterpret_cast<__gm__ void *>(line));
+    }
+};
+
+__aicore__ __attribute__((noinline)) bool args_dump_boundary(
+    const SchedulerGraphView &graph, SchedulerLocalState *local, __gm__ SchedulerRunControl *run_control,
+    int64_t task_id, uint8_t subtask, uint32_t generation, ArgsDumpStage stage
+) {
+    const uint64_t address = local->config.shared_context->args_dump_address;
+    if (address == 0) return true;
+    auto *image = reinterpret_cast<__gm__ SchedulerArgsDumpHeader *>(address);
+    scheduler_observe_cache_line(image);
+    scheduler_observe_cache_line(reinterpret_cast<__gm__ uint8_t *>(image) + 64);
+    if (static_cast<uint64_t>(task_id) >= image->task_count) return false;
+    auto *map = reinterpret_cast<__gm__ uint32_t *>(address + image->task_indices_offset);
+    scheduler_observe_cache_line(&map[task_id]);
+    auto *task = scheduler_args_dump_task(image, task_id);
+    if (task == nullptr) return true;
+    scheduler_observe_cache_line(task);
+    const uint32_t worker = static_cast<uint32_t>(local->worker_id());
+    if (worker >= image->worker_count) return false;
+    auto *request = reinterpret_cast<__gm__ SchedulerArgsDumpRequest *>(address + image->requests_offset) + worker;
+    if (stage == ArgsDumpStage::AFTER_COMPLETION) {
+#if defined(__CCE_AICORE__)
+        pipe_barrier(PIPE_ALL);
+#endif
+        SchedulerTaskPayloadArguments arguments{};
+        if (scheduler_parse_task_payload_arguments(graph, task_id, &arguments) != SchedulerGraphResult::OK)
+            return false;
+        for (int32_t arg = 0; arg < arguments.tensor_count; ++arg) {
+            if ((task->output_tensor_mask & (UINT64_C(1) << arg)) == 0) continue;
+            const auto *tensor = reinterpret_cast<const __gm__ simpler::hbg::Tensor *>(arguments.tensors) + arg;
+            if (!scheduler_args_dump_tensor_lines(tensor, ArgsDumpLineWriter{})) return false;
+        }
+        scheduler_cache_barrier();
+    }
+    const auto arrival = scheduler_args_dump_arrive(task, stage, static_cast<SubtaskSlot>(subtask));
+    const bool publisher = arrival == SchedulerArgsDumpArrival::Publisher;
+    if (arrival == SchedulerArgsDumpArrival::Invalid && scheduler_gm_query(task->aborted) == 0) return false;
+    if (publisher) {
+        auto &word = stage == ArgsDumpStage::BEFORE_DISPATCH ? task->publisher_before : task->publisher_after;
+        scheduler_gm_store(word, scheduler_args_dump_publisher(worker, generation));
+        scheduler_observe_cache_line(request);
+        if (!publish_args_dump_request(request, image->run_epoch, task_id, stage, generation, 0, 0)) return false;
+    }
+    uint64_t progress_cycles = get_sys_cnt_aicore();
+    uint64_t last_tick = 0;
+    uint64_t last_cursor = 0;
+    uint64_t last_bytes = 0;
+    uint64_t last_departures = 0;
+    bool departed = false;
+    const uint64_t timeout_cycles = run_control->scheduler_timeout_cycles;
+    while (true) {
+        const uint64_t now = get_sys_cnt_aicore();
+        if (scheduler_gm_query(run_control->scheduler_error) != 0 ||
+            scheduler_watchdog_expired(progress_cycles, now, timeout_cycles)) {
+            (void)scheduler_gm_compare_exchange(task->aborted, UINT64_C(0), UINT64_C(1));
+            scheduler_record_error(
+                run_control, task_id, SchedulerGraphResult::TIMEOUT, &graph, local,
+                SchedulerErrorSite::ARGS_DUMP_BOUNDARY_TIMEOUT
+            );
+        }
+        const bool aborted = scheduler_gm_query(task->aborted) != 0;
+        const uint64_t publication = scheduler_gm_query(
+            stage == ArgsDumpStage::BEFORE_DISPATCH ? task->publisher_before : task->publisher_after
+        );
+        if ((publication & UINT32_MAX) != 0 && (publication & UINT32_MAX) <= image->worker_count) {
+            const uint32_t source_worker = static_cast<uint32_t>(publication) - 1;
+            auto *ack = reinterpret_cast<__gm__ SchedulerArgsDumpAck *>(address + image->acknowledgements_offset) +
+                        source_worker;
+            scheduler_observe_cache_line(ack);
+            SchedulerArgsDumpAck observed{};
+            const bool committed = scheduler_args_dump_observe_ack(ack, &observed);
+            const auto status = scheduler_args_dump_ack_status(observed);
+            const bool same_phase =
+                committed && observed.run_epoch == image->run_epoch && observed.task_id == task->task_id &&
+                observed.stage == static_cast<uint64_t>(stage) && observed.generation == publication >> 32;
+            const auto phase = scheduler_args_dump_poll_phase(
+                task, stage, static_cast<SubtaskSlot>(subtask), observed, image->run_epoch, &departed
+            );
+            if (phase == SchedulerArgsDumpPoll::Consumed) return true;
+            if (phase == SchedulerArgsDumpPoll::Invalid) return false;
+            if (phase == SchedulerArgsDumpPoll::Aborted) {
+                scheduler_record_error(
+                    run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, local,
+                    SchedulerErrorSite::ARGS_DUMP_REFUSED
+                );
+                return false;
+            }
+            if (!aborted && same_phase) {
+                if (observed.tick != last_tick && status == SchedulerArgsDumpStatus::InProgress &&
+                    (observed.arg_index > last_cursor ||
+                     (observed.arg_index == last_cursor && observed.byte_cursor > last_bytes))) {
+                    last_tick = observed.tick;
+                    last_cursor = observed.arg_index;
+                    last_bytes = observed.byte_cursor;
+                    progress_cycles = now;
+                }
+                if (publisher && observed.tick == request->tick &&
+                    (status == SchedulerArgsDumpStatus::InProgress || status == SchedulerArgsDumpStatus::WouldBlock)) {
+                    if (!publish_args_dump_request(
+                            request, image->run_epoch, task_id, stage, generation, observed.arg_index,
+                            observed.byte_cursor
+                        ))
+                        return false;
+                }
+            }
+        }
+        const uint64_t departures = scheduler_gm_query(scheduler_args_dump_masks(task, stage)) >> 8;
+        if (departures != last_departures && !aborted) {
+            last_departures = departures;
+            progress_cycles = now;
+        }
+        if (aborted && scheduler_watchdog_expired(progress_cycles, now, timeout_cycles)) {
+            scheduler_record_error(
+                run_control, task_id, SchedulerGraphResult::TIMEOUT, &graph, local,
+                SchedulerErrorSite::ARGS_DUMP_ABORT_TIMEOUT
+            );
+            return false;
+        }
+    }
 }
 
 __aicore__ __attribute__((always_inline)) void local_backoff(uint32_t iterations) {
@@ -502,6 +647,17 @@ __aicore__ bool run_ready_dispatch_loop(
                 );
             }
             OUT_OF_ORDER_STORE_BARRIER();
+            const uint8_t dump_subtask = scheduler_worker ? local_slot->subtask_slot : ssbuf_control->subtask_slot;
+            if (context->config.shared_context->args_dump_address != 0 &&
+                !args_dump_boundary(
+                    graph, context, run_control, task_id, dump_subtask, ready_generation, ArgsDumpStage::BEFORE_DISPATCH
+                )) {
+                scheduler_record_error(
+                    run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                    SchedulerErrorSite::ARGS_DUMP_REFUSED
+                );
+                return false;
+            }
             uint64_t kernel_start = commit_executor_trace || phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (pmu_reg_base != 0) pmu_aicore_begin();
             execute_task(payload);
@@ -529,6 +685,17 @@ __aicore__ bool run_ready_dispatch_loop(
                     published_trace->completion_id = execution_trace.completion_id;
                     published_trace->completion_inbox_index = execution_trace.completion_inbox_index;
                 }
+            }
+            if (context->config.shared_context->args_dump_address != 0 &&
+                !args_dump_boundary(
+                    graph, context, run_control, task_id, dump_subtask, ready_generation,
+                    ArgsDumpStage::AFTER_COMPLETION
+                )) {
+                scheduler_record_error(
+                    run_control, task_id, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                    SchedulerErrorSite::ARGS_DUMP_REFUSED
+                );
+                return false;
             }
             uint64_t completion_start = phase_timing_enabled ? get_sys_cnt_aicore() : 0;
             if (scheduler_worker) {

@@ -41,6 +41,11 @@ std::vector<RetireCall> retire_calls;
 std::vector<uint64_t> exit_signals;
 int32_t retirement_result = 0;
 std::mutex retire_mutex;
+bool dump_enabled = false;
+uint64_t dump_base = 0;
+int32_t dump_initializations = 0;
+std::vector<int> dump_flushes;
+std::vector<int> dump_closes;
 }  // namespace
 
 uint64_t platform_aicore_exit_deadline() { return std::numeric_limits<uint64_t>::max(); }
@@ -66,12 +71,11 @@ void write_reg(uint64_t, RegId, uint64_t) {}
 // record whether this run's enable survived its tasks. No case here programs a
 // PMU window, so there is nothing for it to observe.
 uint64_t read_reg(uint64_t, RegId) { return 0; }
-extern "C" bool is_dump_args_enabled() { return false; }
-// The shutdown partition settles its dump lane; this target links no args-dump
-// producer, and the stub above keeps either from being reached.
-void dump_args_flush(int) {}
-void dump_args_close_run(int) {}
-void dump_args_init(int, DumpArgsLevel) {}
+extern "C" bool is_dump_args_enabled() { return dump_enabled; }
+extern "C" uint64_t get_platform_dump_base() { return dump_base; }
+void dump_args_flush(int thread) { dump_flushes.push_back(thread); }
+void dump_args_close_run(int thread) { dump_closes.push_back(thread); }
+void dump_args_init(int, DumpArgsLevel) { ++dump_initializations; }
 
 class SchedulerContextTestPeer {
 public:
@@ -153,6 +157,11 @@ protected:
         retire_calls.clear();
         exit_signals.clear();
         retirement_result = 0;
+        dump_enabled = false;
+        dump_base = 0;
+        dump_initializations = 0;
+        dump_flushes.clear();
+        dump_closes.clear();
         set_pmu_enabled(false);
     }
 
@@ -247,6 +256,34 @@ TEST_F(HbgRetirementWiring, ResidentShutdownSignalsAndRetiresTheSameGatedPartiti
     EXPECT_EQ(exit_signals, std::vector<uint64_t>(kAddrs.begin(), kAddrs.end()));
     EXPECT_EQ(lifecycle.finish_shutdown_partition(0, runtime.get()), 0);
     expect_group(*runtime);
+}
+
+TEST_F(HbgRetirementWiring, EnabledDumpWithoutItsTransportRefusesBeforeProducerInitialization) {
+    auto runtime = std::make_unique<Runtime>();
+    runtime->set_worker_count(3);
+    dump_enabled = true;
+    AicoreLifecycle lifecycle;
+    EXPECT_NE(lifecycle.pre_handshake_init(runtime.get(), 1, 0), 0);
+    EXPECT_EQ(dump_initializations, 0);
+}
+
+TEST_F(HbgRetirementWiring, ArgumentAccountingWaitsForRetirementAndDoesNotCertifyAnIncompleteGraph) {
+    auto runtime = std::make_unique<Runtime>();
+    AicoreLifecycle lifecycle;
+    AicoreLifecycleTestPeer::seed(lifecycle, kAddrs, 3);
+    dump_enabled = true;
+    EXPECT_FALSE(lifecycle.settle_run_diagnostics(runtime.get(), true));
+    EXPECT_TRUE(dump_flushes.empty());
+    EXPECT_TRUE(dump_closes.empty());
+    for (int thread = 0; thread < 3; ++thread)
+        ASSERT_EQ(lifecycle.finish_shutdown_partition(thread, runtime.get()), 0);
+    ASSERT_TRUE(lifecycle.settle_run_diagnostics(runtime.get(), false));
+    EXPECT_EQ(dump_flushes, (std::vector<int>{0, 1, 2}));
+    EXPECT_TRUE(dump_closes.empty());
+    dump_flushes.clear();
+    ASSERT_TRUE(lifecycle.settle_run_diagnostics(runtime.get(), true));
+    EXPECT_EQ(dump_flushes, (std::vector<int>{0, 1, 2}));
+    EXPECT_EQ(dump_closes, (std::vector<int>{0, 1, 2}));
 }
 
 TEST_F(HbgRetirementWiring, ResidentClearsStaleRequestAndReleaseBeforeHandshake) {

@@ -17,12 +17,25 @@
  * type in the orchestration framework).
  */
 
-#ifndef SRC_COMMON_TASK_INTERFACE_DATA_TYPE_H_
-#define SRC_COMMON_TASK_INTERFACE_DATA_TYPE_H_
+#pragma once
 
-#include <array>
+#include <cstddef>
 #include <cstdint>
 #include <type_traits>
+
+// Pure helpers are callable from host and AICore contexts in a CCEC translation unit.
+// In orchestration / host builds, PTO_DEVICE_FUNC expands to nothing.
+#if defined(__DAV_VEC__) || defined(__DAV_CUBE__)
+// Ensure __aicore__ is available (CCE attribute for bisheng compiler).
+// Platform headers (inner_kernel.h) normally define this, but data_type.h
+// may be included before them.
+#ifndef __aicore__
+#define __aicore__ [aicore]
+#endif
+#define PTO_DEVICE_FUNC __attribute__((cce_host, cce_aicore))
+#else
+#define PTO_DEVICE_FUNC
+#endif
 
 template <typename T>
 inline constexpr bool is_supported_scalar_arg_v = std::is_arithmetic_v<std::remove_cv_t<std::remove_reference_t<T>>> ||
@@ -100,9 +113,9 @@ static_assert(sizeof(DataType) == 1, "DataType must stay 1 byte");
  * @param dtype Data type
  * @return Size in bytes (0 for unknown types)
  */
-inline uint64_t get_element_size(DataType dtype) {
+PTO_DEVICE_FUNC inline uint64_t get_element_size(DataType dtype) {
     // Order must match the enum definition exactly
-    constexpr static std::array<uint64_t, static_cast<int>(DataType::DATA_TYPE_NUM)> data_type_size = {
+    constexpr uint64_t data_type_size[static_cast<int>(DataType::DATA_TYPE_NUM)] = {
         4,  // case DataType::FLOAT32
         2,  // DataType::FLOAT16
         4,  // DataType::INT32
@@ -121,7 +134,7 @@ inline uint64_t get_element_size(DataType dtype) {
     };
     // Bounds-checked: `dtype` is a raw u8 on the wire, so a decoder can hand this any value.
     const auto index = static_cast<std::size_t>(dtype);
-    return index < data_type_size.size() ? data_type_size[index] : 0;
+    return index < sizeof(data_type_size) / sizeof(data_type_size[0]) ? data_type_size[index] : 0;
 }
 
 /**
@@ -170,21 +183,6 @@ inline const char *get_dtype_name(DataType dtype) {
 // =============================================================================
 // uint64_t Packing/Unpacking Utilities
 // =============================================================================
-
-// Kernel-callable qualifier: when compiling for AICore (ccec compiler defines
-// __DAV_VEC__ or __DAV_CUBE__), PTO_DEVICE_FUNC adds the __aicore__ attribute.
-// In orchestration / host builds, PTO_DEVICE_FUNC expands to nothing.
-#if defined(__DAV_VEC__) || defined(__DAV_CUBE__)
-// Ensure __aicore__ is available (CCE attribute for bisheng compiler).
-// Platform headers (inner_kernel.h) normally define this, but data_type.h
-// may be included before them.
-#ifndef __aicore__
-#define __aicore__ [aicore]
-#endif
-#define PTO_DEVICE_FUNC __aicore__
-#else
-#define PTO_DEVICE_FUNC
-#endif
 
 // -----------------------------------------------------------------------------
 // Unified template interface for all targets (AICore + CPU).
@@ -269,5 +267,3 @@ PTO_DEVICE_FUNC inline T from_u64(uint64_t bits) {
     c.u = bits;
     return c.v;
 }
-
-#endif  // SRC_COMMON_TASK_INTERFACE_DATA_TYPE_H_

@@ -371,59 +371,32 @@ def transport(consumer, monkeypatch, tmp_path):
 
 @pytest.mark.parametrize(
     "platform,runtime",
-    [("a2a3", "tensormap_and_ringbuffer"), ("a2a3", "host_build_graph"), ("a5", "tensormap_and_ringbuffer")],
+    [
+        ("a2a3", "tensormap_and_ringbuffer"),
+        ("a2a3", "host_build_graph"),
+        ("a5", "tensormap_and_ringbuffer"),
+        ("a5", "host_build_graph"),
+    ],
 )
 def test_whole_consumer_records_intended_modes_and_retirement(consumer, transport, runtime, platform):
     result = consumer.run(runtime, 0, Path("recording.so"), transport.root, platform=platform)
     assert result["platform"] == platform
     assert result["payloads_verified"] and result["config_snapshot_verified"] and result["guards_verified"]
     # This trace belongs to the synchronous recording enqueue, not to real Torch scheduling.
-    assert transport.events == ["submit"] * 4 + ["boundary"] + ["retire"] * 4 + ["close"]
+    assert transport.events == ["submit"] * 4 + ["boundary"] + ["retire"] * 4 + ["close", "boundary"]
     assert not consumer._UNPROVEN
 
 
-def test_a5_hbg_refuses_only_enabled_dumps_and_recovers_on_the_same_worker(consumer, transport):
-    transport.state.refuse_dump = True
-    result = consumer.run("host_build_graph", 0, Path("recording.so"), transport.root, platform="a5")
-    assert result["accepted_calls"] == result["calls"] == 2
-    assert result["args_dump_supported"] is False and result["payloads_verified"] is False
-    assert [(item["index"], item["level"]) for item in result["refusals"]] == [(1, 3), (2, 2)]
-    assert result["off_calls_verified"] and result["refusal_outputs_unchanged"]
-    assert result["caller_tensors_retained"] and result["caller_stream_after_close"]
-    assert result["payload_counts"] == [0, 0, 0, 0] and result["run_epochs"] == [None] * 4
-    assert transport.events == [
-        "submit",
-        "submit",
-        "refuse",
-        "submit",
-        "refuse",
-        "submit",
-        "boundary",
-        "retire",
-        "retire",
-        "close",
-        "boundary",
-    ]
-    assert not consumer._dump_files(transport.root) and not consumer._UNPROVEN
-
-
-@pytest.mark.parametrize(
-    "defect", ["wrong_status", "wrong_reason", "silent_accept", "output_write", "dump_files", "recovery"]
-)
-def test_a5_hbg_contract_rejects_false_refusals_writes_and_broken_recovery(consumer, transport, defect):
-    transport.state.refuse_dump, transport.state.defect = True, defect
-    with pytest.raises(AssertionError):
-        consumer.run("host_build_graph", 0, Path("recording.so"), transport.root, platform="a5")
-
-
-def test_a5_hbg_does_not_translate_an_untyped_failure_into_a_refusal(consumer, transport):
+def test_supported_dump_does_not_translate_an_untyped_failure_into_success(consumer, transport):
     transport.state.refuse_dump, transport.state.defect = True, "untyped"
     with pytest.raises(RuntimeError, match="prepare_native_run failed"):
         consumer.run("host_build_graph", 0, Path("recording.so"), transport.root, platform="a5")
     assert consumer._UNPROVEN and "close" not in transport.events
 
 
-@pytest.mark.parametrize("platform,runtime", [("a2a3", "host_build_graph"), ("a5", "tensormap_and_ringbuffer")])
+@pytest.mark.parametrize(
+    "platform,runtime", [(p, r) for p in ("a2a3", "a5") for r in ("host_build_graph", "tensormap_and_ringbuffer")]
+)
 def test_supported_dump_refusal_is_still_a_failure(consumer, transport, platform, runtime):
     transport.state.refuse_dump = True
     with pytest.raises(RunPreparationRefused):
@@ -431,20 +404,11 @@ def test_supported_dump_refusal_is_still_a_failure(consumer, transport, platform
     assert consumer._UNPROVEN and "close" not in transport.events
 
 
-def test_a5_hbg_unknown_boundary_retains_refused_and_accepted_caller_frames(consumer, transport):
-    transport.state.refuse_dump = transport.state.fail_boundary = True
-    with pytest.raises(RuntimeError, match="unknown completion"):
-        consumer.run("host_build_graph", 0, Path("recording.so"), transport.root, platform="a5")
-    worker, _, frames, queued, runs, _ = consumer._UNPROVEN[0]
-    assert worker is transport.worker and len(frames) == len(queued) == 4 and len(runs) == 2
-    assert all(not buffer.closed for frame in frames for buffer in frame["buffers"])
-    assert "retire" not in transport.events and "close" not in transport.events
-
-
-def test_unknown_completion_keeps_every_caller_frame(consumer, transport):
+@pytest.mark.parametrize("platform", ["a2a3", "a5"])
+def test_unknown_completion_keeps_every_caller_frame(consumer, transport, platform):
     transport.state.fail_boundary = True
     with pytest.raises(RuntimeError, match="unknown completion"):
-        consumer.run("host_build_graph", 0, Path("recording.so"), transport.root)
+        consumer.run("host_build_graph", 0, Path("recording.so"), transport.root, platform=platform)
     worker, handle, frames, queued, runs, stream = consumer._UNPROVEN[0]
     assert worker is transport.worker and handle is not None and stream.npu_stream == 17
     assert len(frames) == len(queued) == len(runs) == 4
@@ -533,6 +497,8 @@ def _summary(runtime, queue):
         caller_thread=10,
         callback_threads=[10 if queue == "0" else 11] * 4,
         guards_verified=True,
+        caller_tensors_retained=True,
+        caller_stream_after_close=True,
         payloads_verified=True,
         config_snapshot_verified=True,
         verified=True,
@@ -556,6 +522,12 @@ def _invoke_st(tmp_path, monkeypatch, summary, *, code=0, copies=1, platform="a2
 
 def test_actual_st_requires_complete_result(tmp_path, monkeypatch):
     _invoke_st(tmp_path, monkeypatch, _summary("host_build_graph", "1"))
+
+
+def test_actual_st_requires_real_a5_hbg_payloads(tmp_path, monkeypatch):
+    summary = _summary("host_build_graph", "1")
+    summary["platform"] = "a5"
+    _invoke_st(tmp_path, monkeypatch, summary, platform="a5")
 
 
 def _refusal_summary() -> dict:
@@ -588,39 +560,32 @@ def _refusal_summary() -> dict:
     return summary
 
 
-def test_actual_st_requires_the_explicit_a5_hbg_refusal_contract(tmp_path, monkeypatch):
-    _invoke_st(tmp_path, monkeypatch, _refusal_summary(), platform="a5")
+def test_actual_st_rejects_the_obsolete_a5_hbg_refusal_contract(tmp_path, monkeypatch):
+    with pytest.raises(AssertionError):
+        _invoke_st(tmp_path, monkeypatch, _refusal_summary(), platform="a5")
 
 
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("calls", 4),
-        ("accepted_calls", 4),
-        ("args_dump_supported", True),
-        ("payloads_verified", True),
-        ("refusals", []),
-        ("off_calls_verified", False),
-        ("refusal_outputs_unchanged", False),
+        ("calls", 2),
+        ("accepted_calls", 2),
+        ("args_dump_supported", False),
+        ("payloads_verified", False),
+        ("refusals", [dict(index=1, level=3, reason="prepare refused")]),
         ("caller_tensors_retained", False),
         ("caller_stream_after_close", False),
-        ("payload_counts", [0, 6, 3, 0]),
-        ("run_epochs", [None, 1, 2, None]),
-        ("records_per_enabled_call", 6),
+        ("payload_counts", [0, 0, 0, 0]),
+        ("run_epochs", [None] * 4),
+        ("records_per_enabled_call", 0),
         ("guards_verified", False),
         ("config_snapshot_verified", False),
     ],
 )
-def test_actual_st_rejects_false_a5_hbg_recovery_claims(tmp_path, monkeypatch, field, value):
-    summary = _refusal_summary()
+def test_actual_st_rejects_incomplete_a5_hbg_payload_claims(tmp_path, monkeypatch, field, value):
+    summary = _summary("host_build_graph", "1")
+    summary["platform"] = "a5"
     summary[field] = value
-    with pytest.raises(AssertionError):
-        _invoke_st(tmp_path, monkeypatch, summary, platform="a5")
-
-
-def test_actual_st_rejects_wrong_a5_hbg_refusal_reason(tmp_path, monkeypatch):
-    summary = _refusal_summary()
-    summary["refusals"][0]["reason"] = summary["refusals"][0]["reason"].replace("-1001", "-1004")
     with pytest.raises(AssertionError):
         _invoke_st(tmp_path, monkeypatch, summary, platform="a5")
 

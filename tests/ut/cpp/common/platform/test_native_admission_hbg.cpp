@@ -280,25 +280,21 @@ TEST_F(NativeAdmissionTest, CloseOwnsTheSavedGraphAfterItsCallback) {
     EXPECT_EQ(runner.charged(), 0u);
 }
 
-TEST_F(NativeAdmissionTest, UnsupportedArgsDumpReleasesExactAttemptBeforeValidRunFlushClose) {
-    if (args_dump_capture_supported_impl() != 0) GTEST_SKIP() << "This runtime supports ArgsDump";
+TEST_F(NativeAdmissionTest, SupportedArgsDumpPreparesAndReleasesBeforeTheNextRunFlushClose) {
+    ASSERT_EQ(args_dump_capture_supported_impl(), 1);
     Runner runner;
-    Attempt rejected(runner, 0, 10);
-    rejected.config.enable_dump_args = 1;
-    const auto allocations = control().allocations;
-    ASSERT_EQ(rejected.prepare(), PTO_RUNTIME_ERR_UNSUPPORTED);
-    EXPECT_EQ(callbacks, 0);
-    EXPECT_EQ(control().allocations, allocations);
-    EXPECT_EQ(runner.reservations(), 0u);
+    Attempt collecting(runner, 0, 10);
+    collecting.config.enable_dump_args = 1;
+    ASSERT_EQ(collecting.prepare(), 0);
+    EXPECT_EQ(callbacks, 1);
+    EXPECT_TRUE(runner.holds_epoch(10));
+    EXPECT_EQ(runner.reservations(), 1u);
+    ASSERT_EQ(simpler_finalize_run(&runner, collecting.storage), 0);
     EXPECT_FALSE(runner.holds_epoch(10));
-    EXPECT_EQ(runner.plan(0).phase, AutoAdmissionState::Phase::None);
-    EXPECT_FALSE(consume_released_preparation(rejected.storage, get_runtime_size(), 11));
-    ASSERT_TRUE(rejected.consume_release());
-    EXPECT_FALSE(rejected.consume_release());
-    EXPECT_TRUE(rejected.empty());
+    EXPECT_EQ(runner.reservations(), 0u);
     Attempt next(runner, 0, 20);
     ASSERT_EQ(simpler_run(&runner, next.storage, 1, &next.args, &next.config, &next.descriptor), 0);
-    EXPECT_EQ(callbacks, 1);
+    EXPECT_EQ(callbacks, 2);
     EXPECT_TRUE(next.empty());
     EXPECT_FALSE(runner.holds_epoch(20));
     char error[256]{};
@@ -306,8 +302,8 @@ TEST_F(NativeAdmissionTest, UnsupportedArgsDumpReleasesExactAttemptBeforeValidRu
     EXPECT_EQ(finalize_device(&runner), 0);
 }
 
-TEST_F(NativeAdmissionTest, UnsupportedArgsDumpCannotReplaceLiveCarrierOrItsEpoch) {
-    if (args_dump_capture_supported_impl() != 0) GTEST_SKIP() << "This runtime supports ArgsDump";
+TEST_F(NativeAdmissionTest, SupportedArgsDumpCannotReplaceLiveCarrierOrItsEpoch) {
+    ASSERT_EQ(args_dump_capture_supported_impl(), 1);
     Runner runner;
     Attempt live(runner, 0, 10);
     ASSERT_EQ(live.prepare(), 0);
@@ -324,8 +320,8 @@ TEST_F(NativeAdmissionTest, UnsupportedArgsDumpCannotReplaceLiveCarrierOrItsEpoc
     EXPECT_EQ(simpler_finalize_run(&runner, live.storage), 0);
 }
 
-TEST_F(NativeAdmissionTest, RecursiveUnsupportedArgsDumpDoesNotAcquireOrCertifyAnAttempt) {
-    if (args_dump_capture_supported_impl() != 0) GTEST_SKIP() << "This runtime supports ArgsDump";
+TEST_F(NativeAdmissionTest, RecursiveArgsDumpDoesNotAcquireOrCertifyAnAttempt) {
+    ASSERT_EQ(args_dump_capture_supported_impl(), 1);
     Runner runner;
     Attempt outer(runner, 0, 10);
     Attempt inner(runner, 1, 20);

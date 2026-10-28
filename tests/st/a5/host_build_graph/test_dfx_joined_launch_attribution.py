@@ -43,18 +43,9 @@ located in the retained writer's own namespace — not at a default-mode path:
                  dispatch identity. This is the owner the identity assertions read.
   pmu            ``pmu.csv``.
 
-**The argument dump is not one of them on this runtime, and the request for it is refused.** This
-route is the AICore Scheduler: the on-core schedulers both dispatch tasks and reap their
-completions, so no AICPU thread holds a task's own boundaries and there is no instant at which an
-argument's content is that task's. `args_dump_capture_supported_impl` answers 0 here and
-``simpler_prepare_run`` refuses an ``enable_dump_args`` request with ``PTO_RUNTIME_ERR_UNSUPPORTED``
-before the bind, which is what ``_assert_unsupported_owner_is_refused`` asserts over the same public
-API the rest of this suite uses: the run fails naming that code, no artifact tree is written under
-its prefix, and the lane still serves the owners this runtime does have. So the owner set above is
-what this backend supports rather than what every backend supports — the three other backends enable
-the argument dump too and their copies assert its records' content. The gap's design is
-``docs/investigations/2026-10-a5-resident-per-task-args-capture.md``; the capability is deferred to
-its own change.
+The argument dump joins that owner set. Resident AICore participants rendezvous at each selected
+task boundary, and the existing AICPU participants copy its records in bounded chunks before
+publishing a seal. The same retained collector and run identity rules apply to all three owners.
 
 ``collect_across_runs`` is on — declared on the class, which is where the framework grants it: it
 partitions the Worker group and reaches ``Worker(collect_across_runs=...)``, because retention is
@@ -71,11 +62,9 @@ pair serializes, no join is published, and every attribution claim above still h
 receipt is asserted on the onboard rows, where a join is reachable.
 
 **On host_build_graph.** The graph is built on the host, so dep_gen and scope_stats have no device
-producer here and are not terms in the pair decision. The owners judged are the swimlane and PMU,
-and the artifact the identity assertions read is the swimlane's, exactly as above: it is the one
-owner every backend has a device producer for. The argument dump is the third device owner on this
-runtime's a2a3 sibling and on both ``tensormap_and_ringbuffer`` backends; here it is unsupported, per
-the paragraph above.
+producer here and are not terms in the pair decision. The owners judged are swimlane, per-task
+argument dump and PMU. The swimlane artifact supplies the independent execution order used to
+check the argument dump's producer-output/consumer-input handoff.
 
 The mixed-mode case is a requirement rather than a degradation. A pair whose settings disagree —
 a different swimlane level, a different PMU event mode — cannot join, because each is one word in
@@ -145,12 +134,6 @@ _IDENTITY_OWNER = "chip_swimlane"
 #: The verdicts that leave a readable artifact. A run that settled as any of these published a
 #: complete terminal status; anything else means the collector could not settle this run.
 _PUBLISHING_VERDICTS = frozenset({"published", "partial_safe", "partial_cut_unknown"})
-
-#: `PTO_RUNTIME_ERR_UNSUPPORTED` (runtime_c_api.h), as it reaches a caller: `ChipWorker` reports a
-#: non-zero preparation result as `prepare_native_run failed with code <rc>`, and the chip child
-#: relays that text. The code is what the refusal is read by — a run that merely failed names
-#: something else, and this one says the request named a capability this runtime does not implement.
-_UNSUPPORTED_PREPARE_CODE = "code -1001"
 
 #: The span one *successful* joined launch publishes, carrying both runs' epochs and what the
 #: successor read of its predecessor's boundary once its own submission had completed. The runner
@@ -503,15 +486,9 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
     CONSUMER_INPUT_ARG = 0
     CONSUMER_OUTPUT_ARG = 1
 
-    #: Every owner this runtime has a device producer for. host_build_graph builds its graph on the
-    #: host, so dep_gen and scope_stats have none here; the argument dump has none on *this*
-    #: backend's route, which `UNSUPPORTED_OWNERS` states.
-    DEVICE_OWNERS = ("chip_swimlane", "pmu")
-    #: Owners this runtime has no device producer for and whose request it refuses outright, rather
-    #: than admitting and publishing an artifact that cannot be told from a capture that found
-    #: nothing. Named here so the owner set above reads as this backend's support rather than as a
-    #: claim about every backend.
-    UNSUPPORTED_OWNERS = ("dump_args",)
+    #: Graph and scope diagnostics stay on the host. All three device owners
+    #: collect together, including the task-time payload assertions below.
+    DEVICE_OWNERS = ("chip_swimlane", "dump_args", "pmu")
 
     CALLABLE = {
         "callables": [
@@ -573,7 +550,6 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         mixed = self._assert_pair_owns_its_records(worker, tmp_path / "mixed", simulated, disagree=True, trace=trace)
         self._assert_join_evidence(trace, mixed, expect_joined=False, what="a disagreeing pair")
 
-        self._assert_unsupported_owner_is_refused(worker, tmp_path / "unsupported")
         self._assert_no_artifact_without_diagnostics(worker, tmp_path / "off")
 
     # -- configurations --------------------------------------------------
@@ -1103,78 +1079,6 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
                 f"{pid} were {records}"
             )
 
-    def _assert_unsupported_owner_is_refused(self, worker, root: Path):
-        """An owner this runtime has no producer for is refused, and the lane keeps serving.
-
-        Read over the same public submission path as everything above, because the claim is about
-        what a caller gets: the refusal has to reach the request rather than the artifact. Three
-        things make it one, and the third is why it is not enough to see the run fail —
-
-          refused      the run fails naming `PTO_RUNTIME_ERR_UNSUPPORTED`, which `simpler_prepare_run`
-                       returns from the request itself. A run admitted and then found to have
-                       collected nothing fails too, after executing and after holding this owner's
-                       bank and this run's slot, and it reports a code of its own.
-          silent       no artifact tree exists below its prefix, for the unsupported owner or for
-                       the supported ones it also named. An empty manifest is indistinguishable
-                       from a capture that found nothing there was, which is the outcome this
-                       refusal exists to prevent.
-          survivable   the next run, naming only the owners this runtime does have, publishes all
-                       of them. A refusal that stopped the lane would make one unavailable owner
-                       cost a caller every diagnostic for the Worker's life.
-        """
-        trace = _ChildTrace(worker)
-        return _with_child_evidence(
-            trace, "the unsupported-owner refusal", lambda: self._unsupported_owner_is_refused(worker, root)
-        )
-
-    def _unsupported_owner_is_refused(self, worker, root: Path):
-        """The refusal itself, with its failures carried by the caller above."""
-        refused = root / "refused"
-        refused.mkdir(parents=True, exist_ok=True)
-        unsupported = list(type(self).UNSUPPORTED_OWNERS)
-        assert unsupported, "this backend declares no unsupported owner, so there is nothing to refuse"
-
-        # Every owner this runtime supports *and* the one it does not, so the refusal is read
-        # against a request that also asks for things this runtime can do.
-        config = self._build_config(
-            self.CASES[0]["config"],
-            enable_chip_swimlane=_SWIMLANE_TASK_TIMING,
-            enable_dump_args="dump_args" in unsupported,
-            enable_pmu=_PMU_PIPE_UTILIZATION,
-            output_prefix=str(refused),
-        )
-        error = self._submit_expecting_failure(worker, config, "the unsupported-owner refusal")
-        assert _UNSUPPORTED_PREPARE_CODE in str(error), (
-            f"the unsupported-owner refusal: requesting {unsupported} failed with {error!r}, which does not name "
-            f"{_UNSUPPORTED_PREPARE_CODE}; a run that was admitted and then could not settle this owner's "
-            f"accounting fails here too, and only this code says the request was refused for naming a capability "
-            f"this runtime does not implement"
-        )
-
-        worker.flush_diagnostics()
-        for owner in (*self._checked_owners(), *unsupported):
-            assert not _find_artifacts(refused, owner), (
-                f"the unsupported-owner refusal: a refused run published a {owner} artifact below {refused}; "
-                f"nothing was prepared, so nothing it named may have been written"
-            )
-
-        # The lane after it. Same owners minus the unsupported one, and every artifact present.
-        served = root / "served"
-        served.mkdir(parents=True, exist_ok=True)
-        supported = self._build_config(
-            self.CASES[0]["config"],
-            enable_chip_swimlane=_SWIMLANE_TASK_TIMING,
-            enable_pmu=_PMU_PIPE_UTILIZATION,
-            output_prefix=str(served),
-        )
-        self._submit_expecting_success(worker, supported, "the run after the unsupported-owner refusal")
-        worker.flush_diagnostics()
-        for owner in self._checked_owners():
-            assert _find_artifacts(served, owner), (
-                f"the run after the unsupported-owner refusal enabled {owner} and published no artifact below "
-                f"{served}; the refused run left this lane unable to serve an owner this runtime has"
-            )
-
     def _one_run_buffers(self, worker):
         """One run's three buffers, seeded so its result is checkable, and their views."""
         nbytes = SIZE * DTYPE.itemsize
@@ -1184,24 +1088,6 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         tensors[1].fill_(4.0)
         tensors[2].zero_()
         return buffers, tensors
-
-    def _submit_expecting_failure(self, worker, config, what: str) -> BaseException:
-        """Submit one run that must not complete, and return why it did not.
-
-        The failure may surface from either call — a submission the child refuses raises at
-        `submit`, and one it accepts and then fails raises at `wait` — so both are inside the
-        same guard and either is the answer.
-        """
-        buffers, tensors = self._one_run_buffers(worker)
-        error = None
-        try:
-            self._submit(worker, buffers, config, 0).wait()
-        except BaseException as raised:  # noqa: BLE001 -- the subject of this assertion
-            error = raised
-        finally:
-            tensors.clear()
-        assert error is not None, f"{what}: the run completed, so the request was served rather than refused"
-        return error
 
     def _submit_expecting_success(self, worker, config, what: str):
         """Submit one run that must complete, and check it computed its own result."""

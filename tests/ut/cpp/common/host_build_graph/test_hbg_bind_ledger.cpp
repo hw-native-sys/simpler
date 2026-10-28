@@ -57,6 +57,9 @@
 #include "host/platform_compile_info.h"
 #include "worker/runtime_c_api.h"
 #include "worker/native_run_context.h"
+#if __has_include("scheduler/scheduler_args_dump.h")
+#include "scheduler/scheduler_args_dump.h"
+#endif
 
 extern "C" int bind_callable_to_runtime_impl(
     Runtime *runtime, const HostApi *api, const ChipStorageTaskArgs *orch_args, void *host_orch_func_ptr,
@@ -204,6 +207,7 @@ void access_entry(const ChipTaskArgs &args) {
 struct FakeHostApi {
     int staging_status{0};
     int arena_status{0};
+    size_t requested_arena_bytes{0};
     bool retain_plan{false};
     std::shared_ptr<void> prepare_plan;
 
@@ -463,6 +467,14 @@ void ordinary_orch_entry(const ChipTaskArgs &) {
     ASSERT_TRUE(g_orch_runtime->orchestrator->submit_task(kernels, args).task_id().is_valid());
 }
 
+void scalar_dump_orch_entry(const ChipTaskArgs &) {
+    CoreTaskArgs args;
+    args.add_scalar(UINT64_C(0xfedcba9876543210));
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    ASSERT_TRUE(g_orch_runtime->orchestrator->submit_task(kernels, args).task_id().is_valid());
+}
+
 void two_task_orch_entry(const ChipTaskArgs &) {
     CoreTaskArgs args;
     MixedKernels kernels{};
@@ -520,6 +532,7 @@ void fake_set_retained(void *, uint32_t, void *addr, size_t size) {
     g_fake->retained_size = size;
 }
 int fake_setup_static_arena(void *, uint32_t, size_t heap, size_t, size_t arena) {
+    g_fake->requested_arena_bytes = arena;
     if (g_fake->arena_status != 0) return g_fake->arena_status;
     g_fake->gm_heap.assign(std::max<size_t>(heap, kAlign) + kAlign, 0);
     g_fake->runtime_arena.assign(std::max<size_t>(arena, kAlign) + kAlign, 0);
@@ -1796,8 +1809,8 @@ protected:
 
     // The one-entry function tables a registration would own: create_scheduler_state
     // refuses a task whose kernel id has no registered address.
-    void install_callable_tables(Runtime &rt) {
-        callable_ = make_callable<CORE_MAX_TENSOR_ARGS>(nullptr, 0, nullptr, 0);
+    void install_callable_tables(Runtime &rt, const ArgDirection *signature = nullptr, int32_t count = 0) {
+        callable_ = make_callable<CORE_MAX_TENSOR_ARGS>(signature, count, nullptr, 0);
         reinterpret_cast<CoreCallable *>(callable_.data())->set_resolved_addr(0x1000);
         object_table_[0] = reinterpret_cast<uint64_t>(callable_.data());
         entry_table_[0] = 0x1000;
@@ -2774,3 +2787,77 @@ TEST_F(HbgBindLedgerTest, LaunchStagingLeavesOnlyTheLargeImageOnThePrepareCopyPa
     EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
     EXPECT_EQ(fake_.copy_count, copies);
 }
+
+#if __has_include("scheduler/scheduler_args_dump.h")
+TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpTailIsChargedAndPublishedWithTheImageOutsideCompactSm) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    const ArgDirection signature[] = {ArgDirection::SCALAR};
+    install_callable_tables(runtime, signature, 1);
+    eps_ = {scalar_dump_orch_entry, capture_orch_bind};
+    ChipStorageTaskArgs args;
+    runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::OFF);
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    const uint64_t plain_sm_bytes = runtime.dev.sm_image_bytes;
+    const uint64_t plain_arena_bytes = fake_.requested_arena_bytes;
+    const uint64_t plain_upload_bytes = runtime.pending_publication().bytes;
+    ASSERT_EQ(release_run_bindings_impl(&runtime, &api_), 0);
+
+    runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
+    ASSERT_EQ(bind(runtime, args, nullptr, 0), 0);
+    ASSERT_FALSE(runtime.pending_publication().prerequisites.empty());
+    const auto &scheduler = runtime.pending_publication().prerequisites.front();
+    const auto context_offset =
+        runtime.dev.scheduler_bootstrap.worker_context_base - reinterpret_cast<uint64_t>(scheduler.device_target);
+    const auto *context = reinterpret_cast<const SchedulerWorkerContext *>(
+        static_cast<const uint8_t *>(scheduler.source) + context_offset
+    );
+    ASSERT_NE(context->args_dump_address, 0);
+    const auto &publication = runtime.pending_publication();
+    const uint64_t dump_offset = context->args_dump_address - reinterpret_cast<uint64_t>(publication.device_target);
+    ASSERT_LT(dump_offset, publication.bytes);
+    const auto *dump = reinterpret_cast<const SchedulerArgsDumpHeader *>(
+        static_cast<const uint8_t *>(publication.source) + dump_offset
+    );
+    EXPECT_EQ(dump->task_count, 1);
+    EXPECT_EQ(dump->selected_count, 1);
+    EXPECT_EQ(dump->initialized_count, 1);
+    EXPECT_EQ(runtime.dev.sm_image_bytes, plain_sm_bytes);
+    EXPECT_GE(
+        context->args_dump_address, reinterpret_cast<uint64_t>(runtime.dev.gm_sm_ptr_) + runtime.dev.sm_image_bytes
+    );
+    EXPECT_EQ(fake_.requested_arena_bytes - plain_arena_bytes, publication.bytes - plain_upload_bytes);
+    EXPECT_GE(fake_.requested_arena_bytes - plain_arena_bytes, dump->total_size);
+    EXPECT_TRUE(
+        std::all_of(
+            static_cast<const uint8_t *>(publication.device_target) + dump_offset,
+            static_cast<const uint8_t *>(publication.device_target) + publication.bytes, [](uint8_t value) {
+                return value == 0;
+            }
+        )
+    );
+    ASSERT_EQ(publish_run_image_impl(&runtime, &api_), 0);
+    const auto *published = reinterpret_cast<const SchedulerArgsDumpHeader *>(context->args_dump_address);
+    EXPECT_EQ(published->task_count, 1);
+    EXPECT_EQ(published->selected_count, 1);
+    EXPECT_EQ(published->total_size, dump->total_size);
+}
+
+TEST_F(HbgResidentSchedulerStorageTest, ArgsDumpArenaRefusalPublishesNoNewSchedulerOrRunImage) {
+    Runtime runtime;
+    init_runtime(runtime);
+    auto cleanup = cleanup_runtime(runtime);
+    const ArgDirection signature[] = {ArgDirection::SCALAR};
+    install_callable_tables(runtime, signature, 1);
+    eps_ = {scalar_dump_orch_entry, capture_orch_bind};
+    runtime.dev.dump_args_level = static_cast<uint32_t>(DumpArgsLevel::FULL);
+    fake_.arena_status = -81;
+    ChipStorageTaskArgs args;
+    EXPECT_EQ(bind(runtime, args, nullptr, 0), -81);
+    EXPECT_EQ(runtime.pending_publication().bytes, 0);
+    EXPECT_TRUE(runtime.pending_publication().prerequisites.empty());
+    EXPECT_EQ(runtime.dev.scheduler_bootstrap.worker_context_base, 0);
+    EXPECT_EQ(fake_.scheduler_acquires, 0);
+}
+#endif

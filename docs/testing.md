@@ -77,18 +77,16 @@ by healthy work on the same Worker. The wrong-context callback restores the
 caller context before its healthy submit, and a third healthy request follows.
 The allocation stays alive throughout; no invalid device access is issued.
 
-The argument-capture consumer is discovered in the same environment. It
-checks OFF/FULL/HYBRID/OFF snapshots and exact two-task argument payloads on
-A2/A3 (both runtimes) and A5 TMR, including a runtime-owned intermediate.
-A5 HBG instead exercises the existing typed unsupported refusal for FULL and
-HYBRID, verifies no accepted run, tensor writes or dump files, and checks healthy
-OFF calls before and after plus caller-stream reuse after Worker close. Its
-refusal result explicitly reports no verified payloads; actual A5 HBG per-task
-capture remains unimplemented and tracked under
-[#2666](https://github.com/hw-native-sys/simpler/issues/2666); refusal tests do not
-deliver that capability. A real Worker materialization CPU
-contract covers native geometry; CPU recording tests do not qualify device
-collection or framework ordering.
+The argument-capture consumer is discovered in the same environment. All four
+architecture/runtime combinations check OFF/FULL/HYBRID/OFF snapshots and exact
+two-task argument payloads, including a runtime-owned intermediate. The four
+calls are accepted and retain caller/runtime owners through retirement and close;
+the caller stream remains usable after Worker close. Both enabled calls verify six records; FULL verifies six payloads and HYBRID
+verifies three selected payloads. A5 HBG
+uses its resident task-boundary producer, rather than a refusal control.
+A real Worker materialization CPU contract covers native geometry; CPU recording
+tests do not qualify device collection or framework ordering. Program scene tests
+add task-time shared-buffer values, selection and Mix participant identity checks.
 
 The registry and verifier live in `simpler_setup/test_environments.py`. Package
 pins have one source in the profile's constraints file. Selector and preflight

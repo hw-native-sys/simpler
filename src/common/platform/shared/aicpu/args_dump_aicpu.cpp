@@ -20,6 +20,7 @@
 
 #include "aicpu/args_dump_aicpu.h"
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 
@@ -39,6 +40,9 @@ static uint64_t g_platform_dump_base = 0;
 static DumpDataHeader *s_dump_header = nullptr;
 static DumpBufferState *s_dump_states[PLATFORM_MAX_AICPU_THREADS] = {};
 static DumpMetaBuffer *s_current_dump_buf[PLATFORM_MAX_AICPU_THREADS] = {};
+
+static DumpArgReservation *s_open_records[PLATFORM_MAX_AICPU_THREADS] = {};
+static bool s_unsettled_record[PLATFORM_MAX_AICPU_THREADS] = {};
 
 static bool s_logged_ready_queue_full[PLATFORM_MAX_AICPU_THREADS] = {};
 static bool s_logged_no_free_meta_buffer[PLATFORM_MAX_AICPU_THREADS] = {};
@@ -118,6 +122,7 @@ void dump_args_close_run(int thread_idx) {
     if (thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
         return;
     }
+    if (dump_arg_has_open_record(thread_idx) || s_unsettled_record[thread_idx]) return;
     uint32_t live_at_close = 0;
     const DumpMetaBuffer *held = s_current_dump_buf[thread_idx];
     if (held != nullptr) {
@@ -389,12 +394,7 @@ bool should_dump_arg_at_stage(ArgsDumpRole role, ArgsDumpStage stage) {
     return false;
 }
 
-bool should_dump_task(ArgsDumpArgMask arg_mask) {
-    if (!is_dump_args_selective_mode()) {
-        return true;
-    }
-    return arg_mask != ARGS_DUMP_ARG_MASK_NONE;
-}
+bool should_dump_task(ArgsDumpArgMask arg_mask) { return dump_args_task_selected(g_dump_args_level, arg_mask); }
 
 bool should_dump_arg(ArgsDumpArgMask arg_mask, int32_t arg_index) {
     if (!is_dump_args_selective_mode()) {
@@ -616,14 +616,6 @@ struct CircularArenaWriter {
     }
 };
 
-static inline uint64_t get_dump_arg_num_elements(const ArgsDumpInfo &info) {
-    uint64_t elements = 1;
-    for (uint32_t d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
-        elements *= info.shapes[d];
-    }
-    return elements;
-}
-
 // PyTorch-style contiguous: strides[d] == prod(shapes[d+1..]) for all d.
 static inline bool dump_arg_is_contiguous(const ArgsDumpInfo &info) {
     if (info.ndims == 0) return true;
@@ -635,68 +627,10 @@ static inline bool dump_arg_is_contiguous(const ArgsDumpInfo &info) {
     return true;
 }
 
-static inline void write_dump_arg_contiguous_prefix(
-    CircularArenaWriter *writer, const ArgsDumpInfo &info, uint64_t elem_sz, uint64_t copy_bytes
-) {
-    const char *src = reinterpret_cast<const char *>(info.buffer_addr) + info.start_offset * elem_sz;
-    writer->write(src, copy_bytes);
-}
-
-// Recursive per-dim gather: at dim d we step shapes[d] times with element step
-// strides[d]. Inner-most dim writes `shapes[d]` contiguous elements (only valid
-// when strides[innermost] == 1 — non-unit innermost stride degrades to per-element).
-static void gather_dump_arg_dim(
-    CircularArenaWriter *writer, const ArgsDumpInfo &info, uint64_t elem_sz, uint32_t dim, uint64_t base_element_index,
-    uint64_t *remaining_bytes
-) {
-    if (*remaining_bytes == 0 || dim >= PLATFORM_DUMP_MAX_DIMS) {
-        return;
-    }
-    if (dim + 1 >= info.ndims) {
-        // Innermost dim: if strides[dim] == 1 the row is contiguous in memory and
-        // a single memcpy works. Otherwise emit element-by-element.
-        const uint32_t s = info.strides[dim];
-        if (s == 1) {
-            const char *src = reinterpret_cast<const char *>(info.buffer_addr) + base_element_index * elem_sz;
-            uint64_t row_bytes =
-                static_cast<uint64_t>(info.shapes[dim]) * elem_sz;  // promote first to avoid uint32 overflow
-            uint64_t bytes_to_copy = (row_bytes < *remaining_bytes) ? row_bytes : *remaining_bytes;
-            writer->write(src, bytes_to_copy);
-            *remaining_bytes -= bytes_to_copy;
-        } else {
-            for (uint32_t i = 0; i < info.shapes[dim] && *remaining_bytes >= elem_sz; i++) {
-                uint64_t pos = base_element_index + static_cast<uint64_t>(i) * static_cast<uint64_t>(s);
-                const char *src = reinterpret_cast<const char *>(info.buffer_addr) + pos * elem_sz;
-                writer->write(src, elem_sz);
-                *remaining_bytes -= elem_sz;
-            }
-        }
-        return;
-    }
-
-    const int32_t s = info.strides[dim];
-    for (uint32_t i = 0; i < info.shapes[dim] && *remaining_bytes > 0; i++) {
-        uint64_t next_base = base_element_index + static_cast<uint64_t>(i) * static_cast<uint64_t>(s);
-        gather_dump_arg_dim(writer, info, elem_sz, dim + 1, next_base, remaining_bytes);
-    }
-}
-
-static inline void write_dump_arg_logical_prefix(
-    CircularArenaWriter *writer, const ArgsDumpInfo &info, uint64_t elem_sz, uint64_t copy_bytes
-) {
-    if (copy_bytes == 0) {
-        return;
-    }
-    if (dump_arg_is_contiguous(info)) {
-        write_dump_arg_contiguous_prefix(writer, info, elem_sz, copy_bytes);
-        return;
-    }
-    // Walk the view origin first; per-dim recursion adds (i * strides[d]) for each axis.
-    uint64_t remaining_bytes = copy_bytes;
-    gather_dump_arg_dim(writer, info, elem_sz, 0, info.start_offset, &remaining_bytes);
-}
-
 void dump_args_init(int num_dump_threads, DumpArgsLevel level) {
+    for (int t = 0; t < PLATFORM_MAX_AICPU_THREADS; ++t) {
+        if (dump_arg_has_open_record(t)) return;
+    }
     void *dump_base = reinterpret_cast<void *>(get_platform_dump_base());
     if (dump_base == nullptr) {
         LOG_ERROR("platform dump base is NULL, cannot initialize args dump");
@@ -719,6 +653,7 @@ void dump_args_init(int num_dump_threads, DumpArgsLevel level) {
 
     // Pop initial metadata buffer from free_queue for each thread
     for (int t = 0; t < num_dump_threads; t++) {
+        s_unsettled_record[t] = false;
         DumpBufferState *state = get_dump_buffer_state(dump_base, t);
         s_dump_states[t] = state;
         // Transport cursors span invocations; ordinary host credits start at
@@ -788,119 +723,232 @@ void dump_args_init(int num_dump_threads, DumpArgsLevel level) {
     }
 }
 
-int dump_arg_record(int thread_idx, const ArgsDumpInfo &info) {
-    if (s_dump_header == nullptr) {
-        return -1;
-    }
-    if (thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS) {
-        return -1;
-    }
+bool dump_arg_has_open_record(int thread_idx) {
+    return thread_idx >= 0 && thread_idx < PLATFORM_MAX_AICPU_THREADS && s_open_records[thread_idx] != nullptr;
+}
 
-    DumpBufferState *state = s_dump_states[thread_idx];
-    DumpMetaBuffer *buf = s_current_dump_buf[thread_idx];
-    if (buf == nullptr) {
-        buf = try_pop_dump_meta_buffer(thread_idx, state, state != nullptr ? state->current_buf_seq : 0);
-        if (buf == nullptr) {
-            account_refused_record(thread_idx, state);
-            return -1;
-        }
-    }
+static bool owns_reservation(const DumpArgReservation *reservation) {
+    return reservation != nullptr && reservation->open() && reservation->lane < PLATFORM_MAX_AICPU_THREADS &&
+           s_open_records[reservation->lane] == reservation;
+}
 
-    // Switch metadata buffer if full
-    if (buf->count >= PLATFORM_DUMP_RECORDS_PER_BUFFER) {
-        if (switch_dump_meta_buffer(thread_idx) != 0) {
-            return -1;  // No free buffer
-        }
-        buf = s_current_dump_buf[thread_idx];
-        if (buf == nullptr) {
-            buf = try_pop_dump_meta_buffer(thread_idx, state, state != nullptr ? state->current_buf_seq : 0);
-            if (buf == nullptr) {
-                account_refused_record(thread_idx, state);
-                return -1;
-            }
-        }
-    }
+DumpArgFlushResult dump_args_try_flush(int thread_idx) {
+    if (s_dump_header == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS ||
+        s_dump_states[thread_idx] == nullptr)
+        return DumpArgFlushResult::Invalid;
+    if (dump_arg_has_open_record(thread_idx)) return DumpArgFlushResult::WouldBlock;
+    auto *state = s_dump_states[thread_idx];
+    auto *buffer = s_current_dump_buf[thread_idx];
+    if (buffer == nullptr || buffer->count == 0) return DumpArgFlushResult::Complete;
+    const uint32_t tail = s_dump_header->queue_tails[thread_idx];
+    const uint32_t next = (tail + 1) % PLATFORM_DUMP_READYQUEUE_SIZE;
+    if (next == s_dump_header->queue_heads[thread_idx]) return DumpArgFlushResult::WouldBlock;
+    rmb();
+    DumpDeviceModule::write_ready_entry(
+        dump_context(thread_idx), tail, reinterpret_cast<uint64_t>(buffer), state->current_buf_seq
+    );
+    wmb();
+    s_dump_header->queue_tails[thread_idx] = next;
+    s_current_dump_buf[thread_idx] = nullptr;
+    state->current_buf_ptr = 0;
+    ++state->current_buf_seq;
+    ++s_buffers_switched[thread_idx];
+    wmb();
+    return DumpArgFlushResult::Complete;
+}
 
-    // Reserve space in arena
-    // Compute actual tensor data size from shape (not buffer.size which may include padding)
-    ArgsDumpKind kind = static_cast<ArgsDumpKind>(info.kind);
-    uint64_t actual_elements = get_dump_arg_num_elements(info);
-    uint64_t elem_sz = get_element_size(static_cast<DataType>(info.dtype));
-    uint64_t bytes = actual_elements * elem_sz;
-    uint64_t copy_bytes = bytes;
+static bool try_arena_capacity(int lane, DumpBufferState *state, uint64_t bytes, uint64_t *offset) {
+    *offset = state->arena_write_offset;
+    if (bytes == 0) return true;
+    const uint64_t physical = state->arena_write_offset % state->arena_size;
+    if (bytes <= state->arena_size - physical && (physical != 0 || state->arena_write_offset == 0)) return true;
+    if (dump_args_try_flush(lane) != DumpArgFlushResult::Complete) return false;
+    if (state->completed_payload_count < state->published_payload_count) return false;
+    rmb();
+    if (physical != 0) {
+        const uint64_t padding = state->arena_size - physical;
+        if (state->arena_write_offset > UINT64_MAX - padding) return false;
+        *offset += padding;
+    }
+    return true;
+}
+
+static DumpArgBeginResult
+begin_dump_record(int thread_idx, const ArgsDumpInfo &info, DumpArgReservation *reservation, bool blocking) {
+    if (s_dump_header == nullptr || thread_idx < 0 || thread_idx >= PLATFORM_MAX_AICPU_THREADS ||
+        reservation == nullptr)
+        return DumpArgBeginResult::Refused;
+    if (dump_arg_has_open_record(thread_idx) || reservation->open()) return DumpArgBeginResult::WouldBlock;
+    auto *state = s_dump_states[thread_idx];
+    if (state == nullptr || g_dump_args_level == DumpArgsLevel::OFF) return DumpArgBeginResult::Refused;
+    auto refuse = [&] {
+        account_refused_record(thread_idx, state);
+        return DumpArgBeginResult::Refused;
+    };
+    if (info.ndims > PLATFORM_DUMP_MAX_DIMS || info.func_count < 0 || info.func_count > ARGS_DUMP_MAX_FUNC_IDS)
+        return refuse();
+    const bool scalar = info.kind == static_cast<uint8_t>(ArgsDumpKind::SCALAR);
+    const uint64_t element_bytes = get_element_size(static_cast<DataType>(info.dtype));
+    uint64_t elements = 1;
+    for (uint32_t dimension = 0; dimension < info.ndims; ++dimension) {
+        if (info.shapes[dimension] != 0 && elements > UINT64_MAX / info.shapes[dimension]) return refuse();
+        elements *= info.shapes[dimension];
+    }
+    if (element_bytes == 0 || elements > UINT64_MAX / element_bytes) return refuse();
+    uint64_t bytes = elements * element_bytes;
     bool truncated = false;
-    bool is_contiguous = dump_arg_is_contiguous(info);
-    bool is_scalar = kind == ArgsDumpKind::SCALAR;
-    bool capture_payload = info.capture_payload != 0;
-
-    if (is_scalar || (g_dump_args_level == DumpArgsLevel::HYBRID && !capture_payload)) {
-        copy_bytes = 0;
-    } else if (bytes > state->arena_size) {
-        // ChipTensor larger than entire arena — copy a partial sample
-        copy_bytes = state->arena_size / 2;
+    if (scalar || (g_dump_args_level == DumpArgsLevel::HYBRID && info.capture_payload == 0)) bytes = 0;
+    else if (bytes > state->arena_size) {
+        bytes = state->arena_size / 2;
         truncated = true;
     }
-
-    if (!ensure_dump_arena_capacity(thread_idx, state, copy_bytes)) {
-        account_refused_record(thread_idx, state);
-        return -1;
-    }
-    buf = s_current_dump_buf[thread_idx];
-    if (buf == nullptr) {
-        buf = try_pop_dump_meta_buffer(thread_idx, state, state->current_buf_seq);
-        if (buf == nullptr) {
-            account_refused_record(thread_idx, state);
-            return -1;
+    if (bytes != 0 && (info.buffer_addr == 0 || state->arena_base == 0 || state->arena_size == 0)) return refuse();
+    if (bytes != 0) {
+        uint64_t last_element = info.start_offset;
+        for (uint32_t dimension = 0; dimension < info.ndims; ++dimension) {
+            const uint64_t extent = static_cast<uint64_t>(info.shapes[dimension] - 1) * info.strides[dimension];
+            if (last_element > UINT64_MAX - extent) return refuse();
+            last_element += extent;
         }
+        if (last_element > (UINT64_MAX - element_bytes) / element_bytes ||
+            info.buffer_addr > UINT64_MAX - (last_element + 1) * element_bytes)
+            return refuse();
     }
+    const uint64_t rollback = state->arena_write_offset;
+    uint64_t offset = rollback;
+    auto *buffer = s_current_dump_buf[thread_idx];
+    if (blocking) {
+        if (buffer == nullptr) buffer = try_pop_dump_meta_buffer(thread_idx, state, state->current_buf_seq);
+        if (buffer == nullptr) return refuse();
+        if (buffer->count >= PLATFORM_DUMP_RECORDS_PER_BUFFER) {
+            if (switch_dump_meta_buffer(thread_idx) != 0) return refuse();
+        }
+        if (!ensure_dump_arena_capacity(thread_idx, state, bytes)) return refuse();
+        offset = state->arena_write_offset;
+    } else {
+        if (buffer != nullptr && buffer->count >= PLATFORM_DUMP_RECORDS_PER_BUFFER &&
+            dump_args_try_flush(thread_idx) != DumpArgFlushResult::Complete)
+            return DumpArgBeginResult::WouldBlock;
+        if (!try_arena_capacity(thread_idx, state, bytes, &offset)) return DumpArgBeginResult::WouldBlock;
+    }
+    buffer = s_current_dump_buf[thread_idx];
+    if (buffer == nullptr) {
+        buffer = blocking ? try_pop_dump_meta_buffer(thread_idx, state, state->current_buf_seq) :
+                            DumpEngine::try_pop_free(dump_context(thread_idx), state, state->current_buf_seq);
+    }
+    if (buffer == nullptr) return blocking ? refuse() : DumpArgBeginResult::WouldBlock;
+    if (offset > UINT64_MAX - bytes) return refuse();
+    *reservation = {};
+    reservation->info = info;
+    reservation->lane = thread_idx;
+    reservation->rollback_offset = rollback;
+    reservation->arena_offset = offset;
+    reservation->copy_bytes = bytes;
+    reservation->element_bytes = element_bytes;
+    reservation->contiguous = dump_arg_is_contiguous(info);
+    reservation->truncated = truncated;
+    state->arena_write_offset = offset + bytes;
+    s_open_records[thread_idx] = reservation;
+    return DumpArgBeginResult::Ready;
+}
 
-    uint64_t offset = state->arena_write_offset;
-    state->arena_write_offset = offset + copy_bytes;
+DumpArgBeginResult dump_arg_try_begin(int thread_idx, const ArgsDumpInfo &info, DumpArgReservation *reservation) {
+    return begin_dump_record(thread_idx, info, reservation, false);
+}
 
-    // Copy tensor data into arena (circular wraparound)
-    char *arena = reinterpret_cast<char *>(state->arena_base);
-    uint64_t arena_sz = state->arena_size;
-    CircularArenaWriter writer = {arena, arena_sz, offset, 0};
-    if (!is_scalar && copy_bytes > 0) {
-        write_dump_arg_logical_prefix(&writer, info, elem_sz, copy_bytes);
+DumpArgCopyResult dump_arg_copy_chunk(DumpArgReservation *reservation, uint64_t max_bytes) {
+    if (!owns_reservation(reservation) || max_bytes == 0) return DumpArgCopyResult::Invalid;
+    auto &record = *reservation;
+    auto *state = s_dump_states[record.lane];
+    uint64_t remaining = std::min(max_bytes, record.copy_bytes - record.copied);
+    CircularArenaWriter writer{
+        reinterpret_cast<char *>(state->arena_base), state->arena_size, record.arena_offset, record.copied
+    };
+    while (remaining != 0) {
+        uint64_t element = record.copied / record.element_bytes;
+        const uint64_t byte_in_element = record.copied % record.element_bytes;
+        uint64_t source_element = record.info.start_offset;
+        uint64_t count = remaining;
+        if (record.contiguous) source_element += element;
+        else {
+            for (int32_t dimension = record.info.ndims - 1; dimension >= 0; --dimension) {
+                const uint64_t coordinate = element % record.info.shapes[dimension];
+                element /= record.info.shapes[dimension];
+                source_element += coordinate * record.info.strides[dimension];
+            }
+            count = std::min(remaining, record.element_bytes - byte_in_element);
+        }
+        const auto *source = reinterpret_cast<const unsigned char *>(record.info.buffer_addr) +
+                             source_element * record.element_bytes + byte_in_element;
+        cache_invalidate_range(source, count);
+        rmb();
+        writer.write(source, count);
+        record.copied += count;
+        remaining -= count;
+    }
+    return record.copied == record.copy_bytes ? DumpArgCopyResult::Complete : DumpArgCopyResult::InProgress;
+}
+
+bool dump_arg_commit(DumpArgReservation *reservation) {
+    if (!owns_reservation(reservation) || reservation->copied != reservation->copy_bytes) return false;
+    const auto &info = reservation->info;
+    const int lane = reservation->lane;
+    auto *buffer = s_current_dump_buf[lane];
+    if (buffer == nullptr || buffer->count >= PLATFORM_DUMP_RECORDS_PER_BUFFER) return false;
+    auto *record = &buffer->records[buffer->count];
+    record->task_id = info.task_id;
+    record->arg_index = info.arg_index;
+    record->is_contiguous = reservation->contiguous ? 1 : 0;
+    record->role = static_cast<uint8_t>(info.role);
+    record->stage = static_cast<uint8_t>(info.stage);
+    record->ndims = info.ndims;
+    record->dtype = info.dtype;
+    record->truncated = reservation->truncated ? 1 : 0;
+    record->payload_offset = reservation->arena_offset;
+    record->payload_size = reservation->copy_bytes;
+    record->scalar_value = info.kind == static_cast<uint8_t>(ArgsDumpKind::SCALAR) ? info.scalar_value : 0;
+    record->kind = info.kind;
+    record->flags = info.flags;
+    record->func_count = static_cast<uint8_t>(info.func_count);
+    for (int32_t i = 0; i < info.func_count; ++i)
+        record->func_ids[i] = static_cast<uint16_t>(info.func_ids[i]);
+    record->start_offset = info.start_offset;
+    for (uint32_t i = 0; i < info.ndims; ++i) {
+        record->shapes[i] = info.shapes[i];
+        record->strides[i] = info.strides[i];
     }
     wmb();
-
-    // Append metadata record
-    uint32_t idx = buf->count;
-    ArgsDumpRecord *rec = &buf->records[idx];
-    rec->task_id = info.task_id;
-    rec->arg_index = info.arg_index;
-    rec->is_contiguous = is_contiguous ? 1 : 0;
-    rec->role = static_cast<uint8_t>(info.role);
-    rec->stage = static_cast<uint8_t>(info.stage);
-    rec->ndims = info.ndims;
-    rec->dtype = info.dtype;
-    rec->truncated = truncated ? 1 : 0;
-    rec->payload_offset = offset;
-    rec->payload_size = copy_bytes;
-    rec->scalar_value = is_scalar ? info.scalar_value : 0;
-    rec->kind = info.kind;
-    rec->flags = info.flags;
-    // func_ids carries the task's active-subtask set (its mix membership).
-    rec->func_count = static_cast<uint8_t>(info.func_count);
-    for (int32_t i = 0; i < info.func_count && i < ARGS_DUMP_MAX_FUNC_IDS; i++) {
-        rec->func_ids[i] = static_cast<uint16_t>(info.func_ids[i]);  // -1 -> 0xFFFF (unknown)
-    }
-    rec->start_offset = info.start_offset;
-    for (int d = 0; d < info.ndims && d < PLATFORM_DUMP_MAX_DIMS; d++) {
-        rec->shapes[d] = info.shapes[d];
-        rec->strides[d] = info.strides[d];
-    }
-    buf->count = idx + 1;
+    ++buffer->count;
     wmb();
+    saturating_add_u32(s_records_written[lane], 1);
+    s_open_records[lane] = nullptr;
+    reservation->lane = -1;
+    return true;
+}
 
-    saturating_add_u32(s_records_written[thread_idx], 1);
+bool dump_arg_abandon(DumpArgReservation *reservation) {
+    if (!owns_reservation(reservation)) return false;
+    const int lane = reservation->lane;
+    auto *state = s_dump_states[lane];
+    state->arena_write_offset = reservation->rollback_offset;
+    account_refused_record(lane, state);
+    s_unsettled_record[lane] = true;
+    s_open_records[lane] = nullptr;
+    reservation->lane = -1;
+    return true;
+}
 
-    return 0;
+int dump_arg_record(int thread_idx, const ArgsDumpInfo &info) {
+    DumpArgReservation reservation;
+    if (begin_dump_record(thread_idx, info, &reservation, true) != DumpArgBeginResult::Ready) return -1;
+    if (dump_arg_copy_chunk(&reservation, UINT64_MAX) == DumpArgCopyResult::Complete && dump_arg_commit(&reservation))
+        return 0;
+    (void)dump_arg_abandon(&reservation);
+    return -1;
 }
 
 void dump_args_flush(int thread_idx) {
+    if (dump_arg_has_open_record(thread_idx)) return;
     if (s_dump_header == nullptr) {
         return;
     }

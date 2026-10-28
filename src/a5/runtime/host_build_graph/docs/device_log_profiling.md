@@ -85,9 +85,9 @@ that block never exists in this runtime.
 ## Related Tools
 
 - `python -m simpler_setup.tools.strace_timing` summarizes host/device run markers.
-- `simpler_setup.tools.core_swimlane` reconstructs intra-core execution from dumps,
-  which this runtime cannot produce: it has no per-task argument capture, and an
-  `enable_dump_args` request is refused at preparation. Use the a2a3 sibling or
-  `tensormap_and_ringbuffer`.
+- `simpler_setup.tools.core_swimlane` reconstructs intra-core execution from task
+  records. Explicit `enable_dump_args` requests also collect task-time argument
+  metadata and selected payloads through the resident rendezvous producer;
+  see [ArgsDump](../../../../../docs/dfx/args-dump.md).
 - The repository's DFX analysis workflow combines scheduler timing with
   dependency and task records.

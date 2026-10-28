@@ -85,6 +85,25 @@ TEST(AicoreSchedulerWatchdog, UsesElapsedWallClockBudget) {
     EXPECT_TRUE(scheduler_watchdog_expired(UINT64_MAX - 10, 4, 15));
 }
 
+TEST(AicoreSchedulerWatchdog, SharedCopyProgressDoesNotExpireAgainstAnOlderSupervisorClockSample) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(100);
+    watchdog.record_progress(205);
+    EXPECT_FALSE(watchdog.progress_deadline_expired(200, 100));
+    EXPECT_FALSE(watchdog.progress_deadline_expired(304, 100));
+    EXPECT_TRUE(watchdog.progress_deadline_expired(305, 100));
+    EXPECT_EQ(watchdog.last_progress(), 205);
+    EXPECT_TRUE(watchdog.progress_deadline_expired(306, 100));
+    EXPECT_FALSE(watchdog.progress_deadline_expired(306, 0));
+    watchdog.reset(UINT64_MAX - 10);
+    EXPECT_FALSE(watchdog.progress_deadline_expired(3, 15));
+    EXPECT_TRUE(watchdog.progress_deadline_expired(4, 15));
+    watchdog.record_progress(4);
+    EXPECT_FALSE(watchdog.progress_deadline_expired(UINT64_MAX - 2, 15));
+    EXPECT_FALSE(watchdog.progress_deadline_expired(18, 15));
+    EXPECT_TRUE(watchdog.progress_deadline_expired(19, 15));
+}
+
 TEST(AicpuReadyWatchdog, RealProgressAllowsTotalExecutionBeyondBudget) {
     AicpuReadyWatchdog watchdog;
     watchdog.reset(0);
@@ -295,6 +314,19 @@ TEST(AicpuReadyWatchdog, InvocationResetDropsPriorProgress) {
         100
     ));
     EXPECT_EQ(now, 1100u);
+}
+
+TEST(AicpuReadyWatchdog, ADelayedParticipantCannotReplaceNewerCopyProgress) {
+    AicpuReadyWatchdog watchdog;
+    watchdog.reset(100);
+    watchdog.record_progress(180);
+    watchdog.record_progress(120);
+    EXPECT_EQ(watchdog.last_progress(), 180);
+    EXPECT_FALSE(scheduler_watchdog_expired(watchdog.last_progress(), 200, 100));
+    watchdog.reset(UINT64_MAX - 10);
+    watchdog.record_progress(4);
+    watchdog.record_progress(UINT64_MAX - 2);
+    EXPECT_EQ(watchdog.last_progress(), 4);
 }
 
 TEST(AicpuReadyWatchdog, SignalingBarrierKeepsFixedBudget) {

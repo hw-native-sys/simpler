@@ -32,6 +32,21 @@ runs:
             ;;
         esac
         source .venv/bin/activate
+        evidence_dir="$PWD/outputs/onboard-dfx-ci/$DFX_PLATFORM"
+        mkdir -p "$evidence_dir"
+        python -c '
+        import hashlib, json, os, pathlib, subprocess, sys
+        import _task_interface as native
+        source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        assert native.__build_commit__ == source, (native.__build_commit__, source)
+        platform = os.environ["DFX_PLATFORM"]
+        paths = pathlib.Path("build/lib", platform, "onboard")
+        files = [path for path in paths.glob("*/*") if path.name in ("libhost_runtime.so", "libaicpu_kernel.so", "aicore_kernel.o")]
+        print(json.dumps({"source": source, "native": native.__build_commit__, "platform": platform,
+                          "python": sys.version, "cann_env": str(pathlib.Path(os.environ["CANN_ENV"]).resolve()),
+                          "cann_home": os.environ.get("ASCEND_HOME_PATH"),
+                          "runtime_sha256": {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in files}}, indent=2))
+        ' > "$evidence_dir/identity.json"
 
         DRIVER="$RUNNER_TEMP/run-onboard-dfx-smokes-${DFX_PLATFORM}.sh"
         trap 'rm -f "$DRIVER"' EXIT
@@ -55,7 +70,9 @@ runs:
           seen_devices[$device]=1
         done
 
-        log_dir=$(mktemp -d)
+        evidence_dir="$PWD/outputs/onboard-dfx-ci/$platform"
+        log_dir="$evidence_dir/logs"
+        mkdir -p "$log_dir"
         declare -a job_labels=()
         declare -a job_pids=()
         declare -a job_logs=()
@@ -77,9 +94,51 @@ runs:
           done
         }
 
-        trap 'rm -rf -- "$log_dir"' EXIT
         trap 'cleanup_children; exit 130' INT
         trap 'cleanup_children; exit 143' TERM HUP
+
+        sample_inventory() {
+          local phase=$1
+          printf '%s\n' "$device_list" > "$evidence_dir/allocated-devices.txt"
+          # Keep queue ownership, never other users' command strings.
+          task-submit --list 2>&1 | awk '/^=== / || /^  (占用|空闲)/ {print}' > "$evidence_dir/queue-$phase.txt"
+          printf '%s\n' "${PIPESTATUS[0]}" > "$evidence_dir/queue-$phase.exit"
+          if npu-smi info > "$evidence_dir/npu-$phase.txt" 2>&1; then
+            echo 0 > "$evidence_dir/npu-$phase.exit"
+          else
+            printf '%s\n' "$?" > "$evidence_dir/npu-$phase.exit"
+            # This query-only retry takes no device or lock.
+            task-submit --run "npu-smi info" > "$evidence_dir/npu-$phase-privileged.txt" 2>&1
+            printf '%s\n' "$?" > "$evidence_dir/npu-$phase-privileged.exit"
+          fi
+        }
+
+        sample_inventory before
+
+        emit_failure_excerpt() {
+          python -c '
+        import pathlib, re, sys
+        root, index = pathlib.Path(sys.argv[1]), sys.argv[2]
+        pattern = re.compile(rb"error|failure|failed|timeout|error_site", re.IGNORECASE)
+        groups = ((root.parent / "failed", "*.log"), (root / "ascend" / index, "*.log"))
+        print("DFX first-error excerpt: bounded retained windows, not a complete log", flush=True)
+        for directory, glob in groups:
+            for path in sorted(directory.rglob(glob))[:4]:
+                try:
+                    size = path.stat().st_size
+                    start = max(0, size - 4 * 1024 * 1024)
+                    with path.open("rb") as stream:
+                        stream.seek(start)
+                        body = stream.read(4 * 1024 * 1024)
+                    match = pattern.search(body)
+                    offset = max(0, match.start() - 1024) if match else max(0, len(body) - 16384)
+                    excerpt = body[offset:offset + 16384]
+                    print(f"file={path.relative_to(root.parent)} source_bytes={size} offset={start + offset} excerpt_bytes={len(excerpt)}", flush=True)
+                    print(excerpt.decode("utf-8", errors="replace"), flush=True)
+                except OSError as error:
+                    print(f"Excerpt unavailable: {path.name}: {str(error)[:256]}", flush=True)
+        ' "$evidence_dir" "$1" || echo "DFX failure excerpt unavailable"
+        }
 
         start_job() {
           local label=$1
@@ -93,15 +152,18 @@ runs:
           fi
 
           local log_file="$log_dir/$index.log"
+          mkdir -p "$evidence_dir/ascend/$index"
           job_labels+=("$label")
           job_logs+=("$log_file")
           job_rcs+=(-1)
           job_devices+=("$device")
 
           echo "Starting $label on device $device"
+          ASCEND_PROCESS_LOG_PATH="$evidence_dir/ascend/$index" \
           python -m pytest "$@" \
             --platform "$platform" --device "$device" -p no:xdist \
-            --pto-session-timeout 600 --require-pto-isa >"$log_file" 2>&1 &
+            --pto-session-timeout 600 --require-pto-isa \
+            --basetemp "$evidence_dir/pytest/$index" >"$log_file" 2>&1 &
           job_pids+=("$!")
           active_device_jobs[$device]=$index
         }
@@ -169,6 +231,17 @@ runs:
           "tests/st/$platform/tensormap_and_ringbuffer/dfx/args_dump/test_args_dump.py" \
           --dump-args full
 
+        if [[ "$platform" == "a5" ]]; then
+          for mode in full hybrid partial; do
+            start_job "args_dump resident Program ($mode)" \
+              tests/st/a5/host_build_graph/dump_args/test_dump_args_example.py \
+              --runtime host_build_graph --dump-args "$mode"
+          done
+          start_job "args_dump resident Mix (full)" \
+            tests/st/a5/host_build_graph/single_block_mix/test_single_block_mix.py \
+            --runtime host_build_graph --dump-args full
+        fi
+
         # The directory, not a named file: every case here needs --enable-dep-gen
         # to assert anything, so one this job does not select reports a pass
         # having checked no graph. Both arches have a host-built dep_gen suite,
@@ -180,15 +253,19 @@ runs:
         for index in "${!job_labels[@]}"; do
           wait_job "$index"
         done
+        sample_inventory after
 
         failed=0
+        : > "$evidence_dir/status.tsv"
         for index in "${!job_labels[@]}"; do
           label=${job_labels[$index]}
           rc=${job_rcs[$index]}
+          printf '%s\t%s\t%s\t%s\n' "$index" "${job_devices[$index]}" "$rc" "$label" >> "$evidence_dir/status.tsv"
           echo "::group::DFX $label (exit=$rc)"
           cat "${job_logs[$index]}"
           echo "::endgroup::"
           if [[ $rc -ne 0 ]]; then
+            emit_failure_excerpt "$index"
             echo "::error title=DFX smoke failed::$label failed on ${platform} device ${job_devices[$index]} with exit code $rc"
             failed=1
           fi
@@ -199,8 +276,8 @@ runs:
 
         if [[ "$DFX_PLATFORM" == "a2a3" ]]; then
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-            --run "bash '$DRIVER' a2a3 \$TASK_DEVICE"
+            --run "bash '$DRIVER' a2a3 \$TASK_DEVICE" | tee "$evidence_dir/task-client.log"
         else
           task-submit --timeout 1800 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-            --run "bash '$DRIVER' a5 \$TASK_DEVICE"
+            --run "bash '$DRIVER' a5 \$TASK_DEVICE" | tee "$evidence_dir/task-client.log"
         fi

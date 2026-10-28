@@ -20,7 +20,7 @@ DEVICE-controlled updates to caller-owned storage.
 | `preflight_recovery.py` | Stale Buffer registration and wrong caller context are refused before acceptance; the same Worker then completes three healthy requests |
 | `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
 | `persistent_state.py` | Twelve DEVICE-controlled weighted cache updates, unchanged guards and weights, zero acceptance and revisited rows |
-| `argument_capture.py` | OFF/FULL/HYBRID/OFF ArgsDump payloads on supported runtimes; explicit A5 HBG refusal and recovery |
+| `argument_capture.py` | OFF/FULL/HYBRID/OFF task-time ArgsDump payloads on both architectures and runtimes |
 
 Public `Worker.close()` drains accepted direct-chip runs through their normal
 RunHandle completion and retirement path before checking workspace ownership.
@@ -239,19 +239,16 @@ config and prefix must not change the selected capture or export destination.
 Unknown outcomes retain every caller/runtime owner. This qualifies the bounded
 reference workload, not capture/replay or arbitrary task graphs.
 
-A5 HBG has no per-task argument-dump producer. Its same queue sequence requires
-the existing typed `RunPreparationRefused` with the native unsupported status
-`-1001` for FULL and HYBRID. Neither refused request may return an accepted run,
-launch work, change caller inputs or outputs, or create argument-dump files.
-The OFF calls before and after must produce the correct Torch successors and
-preserve guards on the same Worker. All caller owners remain alive through
-the final boundary, retirement and close; the caller stream is used again after
-Worker close. `FRAMEWORK_ARGUMENT_DUMP_REFUSAL_RECOVERY_PASS` reports two accepted
-calls and two refusals with `args_dump_supported=false` and
-`payloads_verified=false`; it is not a payload-capture result.
+A5 HBG uses its resident task-boundary argument producer for the same positive
+contract. Every Mix participant consumes the input seal before executing and the
+output seal before publishing completion. The sequence accepts all four calls;
+`FRAMEWORK_ARGUMENT_CAPTURE_PASS` reports `args_dump_supported=true`,
+`payloads_verified=true`, four accepted calls and no refusals. An unexpected
+preparation refusal propagates as a failure. All caller owners remain alive
+through the final boundary, retirement and close, and the caller stream is used
+again after Worker close.
 
-Required A5 HBG per-task argument capture remains unimplemented and tracked under
-[#2666](https://github.com/hw-native-sys/simpler/issues/2666). This refusal and
-recovery qualification does not close it. The existing
-[task-boundary producer investigation](../../../../docs/investigations/2026-10-a5-resident-per-task-args-capture.md)
-describes that missing producer.
+The [task-boundary producer investigation](../../../../docs/investigations/2026-10-a5-resident-per-task-args-capture.md)
+describes its bounded service, identity and stop contract. Simulator and CPU
+contracts complement onboard qualification; they do not establish hardware
+cache visibility or capture/replay support.

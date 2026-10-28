@@ -17,8 +17,7 @@
  * tensor data copying to arenas, metadata recording, and flushing.
  */
 
-#ifndef SRC_COMMON_PLATFORM_INCLUDE_AICPU_ARGS_DUMP_AICPU_H_
-#define SRC_COMMON_PLATFORM_INCLUDE_AICPU_ARGS_DUMP_AICPU_H_
+#pragma once
 
 #include <stdint.h>
 
@@ -92,21 +91,59 @@ bool get_dump_args_task_scalar_dtypes(TaskId task_id, uint32_t *scalar_count, ui
 bool get_dump_arg_role_from_direction(ArgDirection dir, ArgsDumpRole *role);
 int32_t count_callable_tensor_args(const CoreCallable &callable);
 bool should_dump_arg_at_stage(ArgsDumpRole role, ArgsDumpStage stage);
+inline bool dump_args_task_selected(DumpArgsLevel level, ArgsDumpArgMask arg_mask) {
+    return level == DumpArgsLevel::FULL || level == DumpArgsLevel::HYBRID ||
+           (level == DumpArgsLevel::PARTIAL && arg_mask != ARGS_DUMP_ARG_MASK_NONE);
+}
 bool should_dump_task(ArgsDumpArgMask arg_mask);
 bool should_dump_arg(ArgsDumpArgMask arg_mask, int32_t arg_index);
 bool has_dump_arg_flag(ArgsDumpArgMask arg_mask, int32_t arg_index);
 bool try_log_dump_args_layout_mismatch();
 int dump_arg_record(int thread_idx, const ArgsDumpInfo &info);
 
+enum class DumpArgBeginResult { Ready, WouldBlock, Refused };
+enum class DumpArgCopyResult { InProgress, Complete, Invalid };
+enum class DumpArgFlushResult { Complete, WouldBlock, Invalid };
+
+// AICPU-local ownership; the address remains stable until commit or abandon.
+struct DumpArgReservation {
+    ArgsDumpInfo info{};
+    uint64_t arena_offset{0};
+    uint64_t rollback_offset{0};
+    uint64_t copy_bytes{0};
+    uint64_t copied{0};
+    uint64_t element_bytes{0};
+    int32_t lane{-1};
+    bool contiguous{false};
+    bool truncated{false};
+
+    bool open() const { return lane >= 0; }
+    uint64_t copied_bytes() const { return copied; }
+    uint64_t payload_bytes() const { return copy_bytes; }
+};
+
+// A lane owns at most one reservation. WouldBlock leaves refusal counters unchanged.
+DumpArgBeginResult dump_arg_try_begin(int thread_idx, const ArgsDumpInfo &info, DumpArgReservation *reservation);
+// Positive byte budgets may split elements; zero is Invalid without progress.
+DumpArgCopyResult dump_arg_copy_chunk(DumpArgReservation *reservation, uint64_t max_bytes);
+// Only a complete reservation publishes metadata; abandon rolls back and counts one refusal.
+bool dump_arg_commit(DumpArgReservation *reservation);
+bool dump_arg_abandon(DumpArgReservation *reservation);
+bool dump_arg_has_open_record(int thread_idx);
+// Publishes committed records without waiting for queue space or a replacement buffer.
+DumpArgFlushResult dump_args_try_flush(int thread_idx);
+
 // Takes the three records it reads rather than a slot state to reach them from.
 // The two runtimes hold that relation differently — a ring slot names its records by
 // pointer, host_build_graph's storage by layout — and neither is this dump's concern,
 // so a caller passes what it already has in hand. The types differ per runtime too,
 // hence the deduced parameters.
-template <int MaxSubtaskSlots, typename TaskDescriptorT, typename TaskPayloadT, typename GetFunctionBinAddrFn>
-inline void dump_args_for_task(
+template <
+    int MaxSubtaskSlots, typename TaskDescriptorT, typename TaskPayloadT, typename GetFunctionBinAddrFn, typename Sink>
+inline void for_each_dump_arg_for_task(
     int32_t thread_idx, const TaskDescriptorT &descriptor, const TaskPayloadT &pl, LaneMask active_mask,
-    ArgsDumpStage stage, GetFunctionBinAddrFn get_function_bin_addr, const ArgsDumpTaskMetadata *task_metadata = nullptr
+    ArgsDumpStage stage, GetFunctionBinAddrFn get_function_bin_addr, Sink sink,
+    const ArgsDumpTaskMetadata *task_metadata = nullptr
 ) {
     // The record's func_ids[] must hold every active subtask's id. MaxSubtaskSlots
     // is SUBTASK_SLOT_COUNT at every call site, so this ties the record array
@@ -152,7 +189,9 @@ inline void dump_args_for_task(
     }
 
     // Reject negative too: tensor_count is signed and would wrap when cast below.
-    if (pl.tensor_count < 0 || pl.tensor_count > CORE_MAX_TENSOR_ARGS) {
+    if (pl.tensor_count < 0 || pl.tensor_count > CORE_MAX_TENSOR_ARGS || pl.scalar_count < 0 ||
+        pl.scalar_count > CORE_MAX_SCALAR_ARGS || sig_src->sig_count() < 0 ||
+        sig_src->sig_count() > CORE_MAX_TENSOR_ARGS) {
         return;
     }
 
@@ -208,7 +247,7 @@ inline void dump_args_for_task(
         for (int32_t i = 0; i < active_count; i++) {
             info.func_ids[i] = active_fids[i];
         }
-        dump_arg_record(thread_idx, info);
+        if (!sink(info)) return;
     }
 
     if (covered_count != pl.tensor_count && try_log_dump_args_layout_mismatch()) {
@@ -260,9 +299,47 @@ inline void dump_args_for_task(
             if (has_dump_arg_flag(dump_arg_flags, scalar_arg_index)) {
                 info.flags = ARGS_DUMP_RECORD_FLAG_ARG_INDEX_AMBIGUOUS;
             }
-            dump_arg_record(thread_idx, info);
+            if (!sink(info)) return;
         }
     }
+}
+
+template <int MaxSubtaskSlots, typename TaskDescriptorT, typename TaskPayloadT, typename GetFunctionBinAddrFn>
+inline bool next_dump_arg_for_task(
+    int32_t thread_idx, const TaskDescriptorT &descriptor, const TaskPayloadT &payload, LaneMask active_mask,
+    ArgsDumpStage stage, GetFunctionBinAddrFn get_function_bin_addr, uint32_t *cursor, ArgsDumpInfo *out,
+    const ArgsDumpTaskMetadata *task_metadata = nullptr
+) {
+    if (cursor == nullptr || out == nullptr) return false;
+    uint32_t visited = 0;
+    bool found = false;
+    for_each_dump_arg_for_task<MaxSubtaskSlots>(
+        thread_idx, descriptor, payload, active_mask, stage, get_function_bin_addr,
+        [&](const ArgsDumpInfo &info) {
+            if (visited++ < *cursor) return true;
+            *out = info;
+            ++*cursor;
+            found = true;
+            return false;
+        },
+        task_metadata
+    );
+    return found;
+}
+
+template <int MaxSubtaskSlots, typename TaskDescriptorT, typename TaskPayloadT, typename GetFunctionBinAddrFn>
+inline void dump_args_for_task(
+    int32_t thread_idx, const TaskDescriptorT &descriptor, const TaskPayloadT &payload, LaneMask active_mask,
+    ArgsDumpStage stage, GetFunctionBinAddrFn get_function_bin_addr, const ArgsDumpTaskMetadata *task_metadata = nullptr
+) {
+    for_each_dump_arg_for_task<MaxSubtaskSlots>(
+        thread_idx, descriptor, payload, active_mask, stage, get_function_bin_addr,
+        [&](const ArgsDumpInfo &info) {
+            (void)dump_arg_record(thread_idx, info);
+            return true;
+        },
+        task_metadata
+    );
 }
 
 // Dump the OUTPUT tensors of every task still RUNNING on a core, for the
@@ -469,5 +546,3 @@ extern "C" void set_platform_dump_args_run_terminal(uint64_t bank);
 void dump_args_close_run(int thread_idx);
 
 #endif
-
-#endif  // SRC_COMMON_PLATFORM_INCLUDE_AICPU_ARGS_DUMP_AICPU_H_

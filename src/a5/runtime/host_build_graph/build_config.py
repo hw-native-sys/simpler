@@ -10,8 +10,9 @@
 # All paths are relative to this file's directory (src/runtime/host_build_graph/)
 #
 # The host materializes the graph and uploads a read-only view. AICore workers
-# resolve dependencies and execute kernels. AICPU participates only in worker
-# initialization, run completion waiting, and teardown.
+# resolve dependencies and execute kernels. AICPU initializes and retires workers,
+# waits for run completion, and services enabled task-time argument dumps in
+# bounded chunks.
 #
 # The orchestration .so is built from src/common/host_build_graph/host/orchestration:
 # orchestration runs on the host for this runtime, so its API headers and the

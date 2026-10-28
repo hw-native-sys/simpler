@@ -371,15 +371,13 @@ including zero acceptance and revisited rows. Framework snapshots check the
 entire backing against an independent multi-step reference, guards and unchanged
 weights. No host control readback decides later kernel work. A session-scoped fixture
 compiles the shared host bridge once. Argument-dump contract cases queue four
-OFF/FULL/HYBRID/OFF attempts. A2/A3 (both runtimes) and A5 TMR accept all four,
-each with two dependent tasks and a runtime-owned intermediate, and verify exact
-task-time payloads, materialized geometry, per-call export ownership, Torch
-outputs and guards. A5 HBG requires typed unsupported refusals for FULL/HYBRID,
-unchanged inputs/outputs and no dump files, plus healthy OFF calls and reuse
-after close. Its distinct refusal summary cannot count as verified payloads;
-the required per-task capture remains unimplemented under
-[#2666](https://github.com/hw-native-sys/simpler/issues/2666). Refusal tests do not
-deliver that capability. All combinations
+OFF/FULL/HYBRID/OFF attempts. All four architecture/runtime combinations accept
+all four calls, each with two dependent tasks and a runtime-owned intermediate,
+and verify exact task-time payloads, materialized geometry, per-call export
+ownership, Torch outputs and guards. A5 HBG uses its resident task-boundary
+producer. The positive summary requires four accepted calls, no refusals and
+verified payloads; a refusal or an empty enabled capture fails the contract.
+All combinations
 enter the same dynamic plan without a workflow case list. The client wait is bounded at 15 minutes,
 including queueing; the execution watchdog is also 15 minutes. Individual
 subprocess timeouts do not reserve additional aggregate execution time.
@@ -481,16 +479,33 @@ sim jobs run on ephemeral GitHub-hosted runners with no restored cache, so they
 compile cold every time and get no warm-up step.
 
 The DFX smokes reuse the runner's device allocation after the main scene-test
-sweep. The `run-onboard-dfx-smokes` CI action distributes `dep_gen`, chip
-swimlane, PMU, and args dump round-robin across the allocated devices and keeps
-`-p no:xdist` inside each pytest process. Those are the four a5 smokes; a2a3
-adds a fifth smoke for host-build-graph `dep_gen`. A device runs at most one
-smoke at a time, so a one-device allocation runs serially while multiple
-devices run as many independent lanes as both the allocation and platform's
-smoke count permit. With four or fewer a2a3 devices, the fifth smoke waits to
-reuse its round-robin device. Each smoke retains its own log and exit status,
-so one failure does not suppress the remaining DFX results; the aggregate step
-fails after all logs have been reported.
+sweep. The `run-onboard-dfx-smokes` CI action distributes the platform's
+`dep_gen`, chip-swimlane, PMU and ArgsDump suites round-robin across the allocated
+devices and keeps `-p no:xdist` inside each pytest process. A5 additionally runs
+the resident HBG Program payload scenes in FULL/HYBRID/PARTIAL and the existing
+Mix suite in FULL. These explicitly enabled captures qualify different behavior
+from the ordinary Mix sweep with ArgsDump OFF. A device runs at most one smoke
+at a time; multiple devices run independent lanes, and a later smoke waits before
+reusing its assigned device. Each smoke retains its own log and exit status,
+so one failure does not suppress the remaining DFX results. The aggregate step
+fails after all logs have been reported. Existing task and session budgets are
+unchanged.
+
+The A5 `onboard-dfx-a5` artifact retains each smoke's log, exit status and
+pytest/CANN log directory, source/native/runtime identities, and the Program
+argument payloads. Failed Mix scenes copy up to eight native log tails of 4 MiB
+each before their process spool is removed; the index records original and
+retained sizes. Evidence collection preserves the original execution exception
+and reads no tensors whose completion is unknown. The same device allocation
+records queue ownership and `npu-smi info` process snapshots before and after the
+smokes, with a query-only privileged retry when the bare query fails. Compare
+these snapshots with the retained task/lock log when investigating interference.
+On a failed smoke, stdout also records at most four native and four CANN log
+excerpts of 16 KiB each, selected from bounded 4 MiB tail windows. Each excerpt
+identifies its file, original size and byte offset; it is not a complete first
+error history. This keeps bounded diagnostic evidence when artifact upload
+fails. Excerpt collection failure does not replace the smoke failure. Build
+caches and large successful Mix payloads are excluded from the artifact.
 
 A warm-up that cannot compile a class reports it and keeps going: the pass only
 fills a cache, so the locked pytest run that follows is what recompiles the

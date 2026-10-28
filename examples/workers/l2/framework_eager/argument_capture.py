@@ -8,9 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Capture task-time arguments after framework producers and before successors.
 
-Two dependent tasks use a runtime-owned intermediate. Supported runtimes check
-FULL bytes and HYBRID metadata/selected payloads. A5 HBG checks typed argument-dump
-refusal and recovery without claiming per-task payload collection.
+Two dependent tasks use a runtime-owned intermediate. Both runtimes on A3/A5
+check FULL bytes and HYBRID metadata/selected payloads at the task boundaries.
 Collection and admission may wait; this reference does not measure overlap.
 """
 
@@ -21,7 +20,6 @@ import gc
 import importlib.util
 import json
 import os
-import re
 import struct
 import threading
 import weakref
@@ -209,54 +207,23 @@ def _submit(frame, runs):
     frame["config"].output_prefix = str(frame["poison"])
 
 
-def _expect_dump_refusal(frame, runs, refusals):
-    from simpler.task_interface import RunPreparationRefused  # noqa: PLC0415
-
-    accepted = len(runs)
-    try:
-        _submit(frame, runs)
-    except RunPreparationRefused as error:
-        reason = str(error)
-        assert re.fullmatch(
-            r"prepare_native_run failed with code -1001 "
-            r"\(run_id=\d+ slot=\d+ generation=\d+ dispatch_id=\d+ run_epoch=\d+\)",
-            reason,
-        ), reason
-        assert len(runs) == accepted
-        refusals.append(dict(index=frame["index"], level=frame["level"], reason=reason))
-        frame["config"].enable_dump_args = 1
-        frame["config"].output_prefix = str(frame["poison"])
-    else:
-        raise AssertionError("A5 HBG accepted unsupported per-task argument capture")
-
-
-def _check_outputs(frames, args_dump_supported, torch):
+def _check_outputs(frames, torch):
     for index, frame in enumerate(frames):
-        backing, a, b, out, result = frame["tensors"]
-        if not args_dump_supported and frame["level"]:
-            assert out.cpu().flatten().tolist() == [-999.0] * COUNT
-            assert result.cpu().flatten().tolist() == [-1998.0] * COUNT
-            assert a.cpu().flatten().tolist() == _values(index)["a"]
-            assert b.cpu().flatten().tolist() == _values(index)["b"]
-        else:
-            assert result.cpu().flatten().tolist() == [2 * value for value in _values(index)["out"]]
+        backing, _, _, _, result = frame["tensors"]
+        assert result.cpu().flatten().tolist() == [2 * value for value in _values(index)["out"]]
         host_backing = backing.cpu()
         assert torch.all(host_backing[:OFFSET] == GUARD) and torch.all(host_backing[-OFFSET:] == GUARD)
 
 
-def _check_dump_contract(root, frames, args_dump_supported, stream, bridge, torch):
-    if args_dump_supported:
-        epochs = [_check_dump(root / str(index), index, level) for index, level in enumerate(LEVELS)]
-        assert len({epoch for epoch in epochs if epoch is not None}) == 2
-    else:
-        epochs = [_check_dump(root / str(index), index, 0) for index in range(len(LEVELS))]
-        assert epochs == [None] * len(LEVELS) and not _dump_files(root)
-        with torch.npu.stream(stream):
-            frames[-1]["tensors"][-1].add_(1)
-            bridge.finish_current_stream()
-            assert frames[-1]["tensors"][-1].cpu().flatten().tolist() == [
-                2 * value + 1 for value in _values(len(LEVELS) - 1)["out"]
-            ]
+def _check_dump_contract(root, frames, stream, bridge, torch):
+    epochs = [_check_dump(root / str(index), index, level) for index, level in enumerate(LEVELS)]
+    assert len({epoch for epoch in epochs if epoch is not None}) == 2
+    with torch.npu.stream(stream):
+        frames[-1]["tensors"][-1].add_(1)
+        bridge.finish_current_stream()
+        assert frames[-1]["tensors"][-1].cpu().flatten().tolist() == [
+            2 * value + 1 for value in _values(len(LEVELS) - 1)["out"]
+        ]
     return epochs
 
 
@@ -274,8 +241,7 @@ def run(runtime, device, bridge_path, root, *, platform="a2a3"):
     stream = torch.npu.Stream(device=device)
     worker = Worker(level=2, device_id=device, platform=platform, runtime=runtime)
     handle = worker.register(_compile(runtime, platform=platform))
-    frames, queued, runs, refusals = [], [], [], []
-    args_dump_supported = not (platform == "a5" and runtime == "host_build_graph")
+    frames, queued, runs = [], [], []
     retired = False
     try:
         worker.init(borrowed_context_generation=1)
@@ -319,27 +285,21 @@ def run(runtime, device, bridge_path, root, *, platform="a2a3"):
                 a.add_(5 * index)
                 b.add_(-index)
                 out.fill_(-999)
-                if not args_dump_supported and frame["level"]:
-                    queued.append(bridge.enqueue(lambda frame=frame: _expect_dump_refusal(frame, runs, refusals)))
-                else:
-                    queued.append(bridge.enqueue(lambda frame=frame: _submit(frame, runs)))
+                queued.append(bridge.enqueue(lambda frame=frame: _submit(frame, runs)))
                 torch.add(out, out, out=result)
             bridge.finish_current_stream()
         for callback in queued:
             callback.check()
             assert (callback.thread_id != caller_thread) == (task_queue == "1")
-        assert len(runs) == (len(LEVELS) if args_dump_supported else 2)
-        assert [(item["index"], item["level"]) for item in refusals] == (
-            [] if args_dump_supported else [(1, 3), (2, 2)]
-        )
-        _check_outputs(frames, args_dump_supported, torch)
+        assert len(runs) == len(LEVELS)
+        _check_outputs(frames, torch)
         for run_handle in runs:
             run_handle.wait()
         worker.close()
         for frame in frames:
             for buffer in frame["buffers"]:
                 buffer.close()
-        epochs = _check_dump_contract(root, frames, args_dump_supported, stream, bridge, torch)
+        epochs = _check_dump_contract(root, frames, stream, bridge, torch)
         assert not _dump_files(poison)
         assert all(reference() is not None for reference in references)
         summary = dict(
@@ -348,37 +308,27 @@ def run(runtime, device, bridge_path, root, *, platform="a2a3"):
             task_queue=task_queue,
             calls=len(runs),
             accepted_calls=len(runs),
-            args_dump_supported=args_dump_supported,
-            refusals=refusals,
+            args_dump_supported=True,
+            refusals=[],
             levels=list(LEVELS),
             shape=list(SHAPE),
             run_epochs=epochs,
-            payload_counts=[0, 6, 3, 0] if args_dump_supported else [0, 0, 0, 0],
-            records_per_enabled_call=6 if args_dump_supported else 0,
+            payload_counts=[0, 6, 3, 0],
+            records_per_enabled_call=6,
             caller_thread=caller_thread,
             callback_threads=[callback.thread_id for callback in queued],
             guards_verified=True,
-            payloads_verified=args_dump_supported,
+            payloads_verified=True,
+            caller_tensors_retained=True,
+            caller_stream_after_close=True,
             config_snapshot_verified=all(
                 frame["config"].enable_dump_args == 1 and frame["config"].output_prefix == str(poison)
                 for frame in frames
             ),
             verified=True,
         )
-        if not args_dump_supported:
-            summary.update(
-                off_calls_verified=True,
-                refusal_outputs_unchanged=True,
-                caller_tensors_retained=True,
-                caller_stream_after_close=True,
-            )
         retired = True
-        marker = (
-            "FRAMEWORK_ARGUMENT_CAPTURE_PASS "
-            if args_dump_supported
-            else "FRAMEWORK_ARGUMENT_DUMP_REFUSAL_RECOVERY_PASS "
-        )
-        print(marker + json.dumps(summary, sort_keys=True), flush=True)
+        print("FRAMEWORK_ARGUMENT_CAPTURE_PASS " + json.dumps(summary, sort_keys=True), flush=True)
         return summary
     finally:
         if not retired:

@@ -70,11 +70,11 @@ captured args — zero hand-written shapes or scalars.
   Tensor restoration is currently an a2a3-only capability; a5 metadata-only
   and zero-filled replays remain available.
 - **The case's runtime must capture arguments.** The dump this tool replays
-  from is the args dump, and a5 `host_build_graph` has no per-task capture: a
-  case under `tests/st/a5/host_build_graph/` is refused at preparation with
-  `-1001` and produces no dump. See
-  [args-dump.md §3.1.1](args-dump.md#311-the-capture-instant-is-the-tasks-and-where-that-is-unavailable).
-  The other three backends are unaffected.
+  from is ArgsDump. A5 `host_build_graph` captures at resident task boundaries
+  through an all-participant rendezvous and bounded AICPU producer; its existing
+  AICPU fallback uses the common blocking producer. See
+  [args-dump.md §3.1.1](args-dump.md#311-task-boundaries-on-the-a5-resident-scheduler).
+  This does not broaden the tool's a2a3-only tensor-restoration capability.
 - **Two trace outputs** — a native Insight `trace.json` and an
   auto-generated Perfetto-friendly variant (sub-laned + atomic flags;
   see [§3.4](#34-viewing-insight-vs-perfetto)).

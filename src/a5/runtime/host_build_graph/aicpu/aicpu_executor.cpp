@@ -14,10 +14,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 
 #include "aicore_lifecycle.h"
 #include "aicore_scheduler_error.h"
 #include "aicore_scheduler_state.h"
+#include "args_dump_service.h"
 #include "scheduler_ready_watchdog.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/cache_maintenance.h"
@@ -84,9 +86,13 @@ struct AicpuExecutor {
     std::atomic<int32_t> shutdown_signaled_{0};
     std::atomic<int32_t> run_status_{0};
 
-    // AICPU owns only the AICore launch/teardown lifecycle. AICore owns graph
-    // dependency resolution, Ready scheduling, and task execution.
+    // AICore owns graph dependency resolution, Ready scheduling and execution.
+    // AICPU owns launch/teardown and enabled argument-dump copy services.
     AicoreLifecycle aicore_lifecycle_;
+    // Allocated only for enabled runs, sized to the actual AICPU participants.
+    ResidentArgsDumpService *args_dump_services_{nullptr};
+    int32_t args_dump_service_count_{0};
+    bool args_dump_services_allocated_this_init_{false};
 
     // ===== Methods =====
     int32_t init(Runtime *runtime);
@@ -97,6 +103,17 @@ struct AicpuExecutor {
     // valid. Runs inside the completion gate's finalizer, on the last
     // participant out.
     void snapshot_run_terminal(Runtime *runtime, bool cores_retired);
+    bool args_dump_services_stopped() const {
+        if (args_dump_services_ == nullptr) return true;
+        for (int32_t thread = 0; thread < args_dump_service_count_; ++thread) {
+            if (args_dump_services_[thread].has_open_record() || dump_arg_has_open_record(thread)) return false;
+        }
+        return true;
+    }
+    bool begin_args_dump_initialization() {
+        args_dump_services_allocated_this_init_ = false;
+        return args_dump_services_ == nullptr;
+    }
     // Commit the decided record. Runs on the thread that claims cleanup, after
     // teardown and before it returns from the kernel.
     void publish_run_terminal();
@@ -249,11 +266,43 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
         // The 0 → 1 fixup already applied above.
         aicpu_thread_num_ = nthreads;
 
+        // A prior participant whose reservation did not stop still owns the
+        // service memory. Do not replace that stable ownership with a new run.
+        if (!begin_args_dump_initialization()) init_failed_.store(true, std::memory_order_release);
+
         hs_arrived_.store(0, std::memory_order_relaxed);
         hs_release_arrived_.store(0, std::memory_order_relaxed);
         hs_bootstrap_done_.store(false, std::memory_order_relaxed);
-        if (aicore_lifecycle_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
+        if (!init_failed_.load(std::memory_order_acquire) &&
+            aicore_lifecycle_.pre_handshake_init(runtime, aicpu_thread_num_, get_platform_regs()) != 0) {
             init_failed_.store(true, std::memory_order_release);
+        }
+        if (is_dump_args_enabled() && !init_failed_.load(std::memory_order_acquire)) {
+            auto *context = aicore_scheduler_bootstrap_context(runtime);
+            if (context == nullptr) {
+                init_failed_.store(true, std::memory_order_release);
+            } else if (context->args_dump_address != 0) {
+                args_dump_services_ = new (std::nothrow) ResidentArgsDumpService[nthreads];
+                if (args_dump_services_ != nullptr) {
+                    args_dump_service_count_ = nthreads;
+                    args_dump_services_allocated_this_init_ = true;
+                } else init_failed_.store(true, std::memory_order_release);
+                const SchedulerGraphView graph{
+                    context->graph_storage_address, context->graph_reserved_address, context->graph_task_count,
+                    context->task_window_last_index
+                };
+                for (int32_t thread = 0; args_dump_services_ != nullptr && thread < nthreads; ++thread) {
+                    if (!args_dump_services_[thread].initialize(
+                            reinterpret_cast<void *>(context->args_dump_address), graph,
+                            runtime->dev.callable_table_addr_, runtime->dev.callable_table_len_, thread, nthreads
+                        ))
+                        init_failed_.store(true, std::memory_order_release);
+                }
+                LOG_INFO(
+                    "A5 HBG ArgsDump: %d AICPU services, %zu local bytes", nthreads,
+                    static_cast<size_t>(nthreads) * sizeof(ResidentArgsDumpService)
+                );
+            }
         }
         hs_setup_done_.store(true, std::memory_order_release);
     } else {
@@ -355,6 +404,16 @@ int32_t AicpuExecutor::finish_failed_init(Runtime *runtime) {
     const int32_t nthreads = aicpu_thread_num_;
     const bool last = init_failure_arrived_.fetch_add(1, std::memory_order_acq_rel) + 1 == nthreads;
     if (last) {
+        // No participant enters run()/step() after failed init. A prior run's
+        // retained allocation is not owned by this initialization attempt.
+        if (args_dump_services_allocated_this_init_ && args_dump_services_stopped()) {
+            for (int32_t thread = 0; thread < args_dump_service_count_; ++thread)
+                args_dump_services_[thread].stop();
+            delete[] args_dump_services_;
+            args_dump_services_ = nullptr;
+            args_dump_service_count_ = 0;
+            args_dump_services_allocated_this_init_ = false;
+        }
         aicore_lifecycle_.deinit();
         completion_gate_.reset();
         ready_watchdog_.reset();
@@ -394,6 +453,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         return -1;
     }
     bool shutdown_wait_timed_out = false;
+    auto service_args_dump = [&] {
+        if (args_dump_services_ != nullptr && args_dump_services_[thread_idx].step())
+            ready_watchdog_.record_progress(get_sys_cnt_aicpu());
+    };
     if (thread_idx == aicpu_thread_num_ - 1) {
         int32_t supervisor_rc = 0;
         SchedulerWorkerContext *context = aicore_scheduler_bootstrap_context(runtime);
@@ -417,11 +480,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 uint64_t completion_poll_cycles = 0;
                 uint64_t error_poll_total = 0;
                 uint32_t error_poll_count = 0;
-                uint64_t last_progress_cycles = ready_watchdog_.last_progress();
                 uint64_t last_resolved_task_count = run_control->resolved_task_count;
                 bool bootstrap_was_complete = run_control->bootstrap_complete != 0;
                 const uint64_t timeout_cycles = resident_scheduler_timeout_cycles();
                 while (true) {
+                    service_args_dump();
                     const uint64_t poll_start = trace_enabled ? get_sys_cnt_aicpu() : 0;
                     cache_invalidate_range(
                         reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, executed_task_count),
@@ -434,7 +497,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         bootstrap_complete != bootstrap_was_complete) {
                         last_resolved_task_count = run_control->resolved_task_count;
                         bootstrap_was_complete = bootstrap_complete;
-                        last_progress_cycles = now;
                         ready_watchdog_.record_progress(now);
                     }
                     if (trace_enabled) {
@@ -459,7 +521,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         );
                         if (run_control->scheduler_error != 0) break;
                     }
-                    if (scheduler_watchdog_expired(last_progress_cycles, now, timeout_cycles)) {
+                    if (ready_watchdog_.progress_deadline_expired(now, timeout_cycles)) {
                         record_resident_timeout(runtime, SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT);
                         break;
                     }
@@ -516,7 +578,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 [] {
                     return get_sys_cnt_aicpu();
                 },
-                [] {
+                [&] {
+                    service_args_dump();
                     SPIN_WAIT_HINT();
                 },
                 resident_scheduler_timeout_cycles()
@@ -528,6 +591,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     int32_t run_rc =
         shutdown_wait_timed_out ? -SIMPLER_ERROR_SCHEDULER_TIMEOUT : run_status_.load(std::memory_order_acquire);
+    if (args_dump_services_ != nullptr) args_dump_services_[thread_idx].stop();
     aicore_lifecycle_.signal_shutdown_partition(thread_idx);
     shutdown_signaled_.fetch_add(1, std::memory_order_acq_rel);
     if (!wait_with_scheduler_timeout([this] {
@@ -560,9 +624,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         // the run owed. A partition that could not retire its cores returns
         // that failure and still arrives here.
         const bool cores_retired = aicore_lifecycle_.cores_retired();
-        (void)aicore_lifecycle_.settle_run_diagnostics(
-            runtime, run_status_.load(std::memory_order_acquire) == 0 && !shutdown_wait_timed_out
-        );
+        const bool graph_completed = run_status_.load(std::memory_order_acquire) == 0 && !terminal_.has_failure() &&
+                                     args_dump_services_stopped() &&
+                                     publish_aicore_scheduler_runtime_error(runtime) == 0;
+        (void)aicore_lifecycle_.settle_run_diagnostics(runtime, graph_completed);
         // The record is published either way — a run the host cannot read a
         // verdict for is worse than one that reports a failure — but a run
         // whose cores did not prove retirement did not finish the audited path,
@@ -625,6 +690,14 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     cache_invalidate_range(runtime, sizeof(runtime->dev));
 
     aicore_lifecycle_.deinit();
+    if (args_dump_services_stopped()) {
+        delete[] args_dump_services_;
+        args_dump_services_ = nullptr;
+        args_dump_service_count_ = 0;
+        args_dump_services_allocated_this_init_ = false;
+    } else {
+        LOG_ERROR("%s", "A5 HBG ArgsDump: an open reservation retains its service storage");
+    }
 
     completion_gate_.reset();
     // Both are this run's inputs to the terminal record, already folded into

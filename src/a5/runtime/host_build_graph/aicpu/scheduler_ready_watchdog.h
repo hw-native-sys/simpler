@@ -16,14 +16,30 @@
 #include "scheduler/scheduler_watchdog.h"
 
 // The init owner seeds this clock before releasing run participants. Only the
-// supervisor publishes actual bootstrap/resolved-task progress during execution.
+// supervisor publishes actual bootstrap/resolved-task progress during execution;
+// enabled diagnostic participants also publish completed copy/commit progress.
 class AicpuReadyWatchdog {
 public:
     void reset(uint64_t now = 0) { last_progress_.store(now, std::memory_order_release); }
 
-    void record_progress(uint64_t now) { last_progress_.store(now, std::memory_order_release); }
+    void record_progress(uint64_t now) {
+        uint64_t previous = last_progress_.load(std::memory_order_relaxed);
+        // A participant can be descheduled between sampling its clock and
+        // publishing it. Preserve a newer sample, including across clock wrap.
+        while (
+            static_cast<int64_t>(now - previous) > 0 &&
+            !last_progress_.compare_exchange_weak(previous, now, std::memory_order_release, std::memory_order_relaxed)
+        ) {}
+    }
 
     uint64_t last_progress() const { return last_progress_.load(std::memory_order_acquire); }
+
+    bool progress_deadline_expired(uint64_t now, uint64_t timeout_cycles) const {
+        const uint64_t elapsed = now - last_progress();
+        // A different participant's published sample can be newer than this
+        // observer's sample. Polling that observation does not renew progress.
+        return static_cast<int64_t>(elapsed) >= 0 && timeout_cycles != 0 && elapsed >= timeout_cycles;
+    }
 
     template <typename Ready, typename Clock, typename Relax>
     bool wait_until_ready(Ready ready, Clock clock, Relax relax, uint64_t timeout_cycles) const {

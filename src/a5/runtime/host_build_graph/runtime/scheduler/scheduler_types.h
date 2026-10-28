@@ -969,6 +969,9 @@ enum class SchedulerErrorSite : uint64_t {
     AICPU_HANDSHAKE_TIMEOUT = 100,
     AICPU_INIT_BARRIER_TIMEOUT = 101,
     AICPU_SHUTDOWN_BARRIER_TIMEOUT = 102,
+    ARGS_DUMP_BOUNDARY_TIMEOUT = 110,
+    ARGS_DUMP_ABORT_TIMEOUT = 111,
+    ARGS_DUMP_REFUSED = 112,
 };
 
 struct alignas(128) SchedulerRunControl {
@@ -1100,7 +1103,9 @@ struct alignas(128) SchedulerWorkerContext {
     volatile uint64_t scheduler_worker_id;
     volatile uint64_t is_scheduler;
     volatile uint64_t cluster_worker_ids[3];
-    uint64_t topology_reserved[3];
+    // Diagnostic tail of this run's charged arena; zero when no task is selected.
+    volatile uint64_t args_dump_address;
+    uint64_t topology_reserved[2];
 
     alignas(128) uint64_t bootstrap_task_count;
     uint64_t ready_enqueue_count;

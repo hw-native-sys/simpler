@@ -103,6 +103,90 @@ TEST_F(ResidentFinalizer, ACleanControlPublishesTheSuccessItClaimed) {
     EXPECT_EQ(header().load(), SIMPLER_ERROR_NONE) << "no write on a clean path";
 }
 
+TEST_F(ResidentFinalizer, FailedInitializationReleasesOnlyItsUnusedLocalServiceAllocation) {
+    ASSERT_TRUE(executor.begin_args_dump_initialization());
+    executor.args_dump_services_ = new ResidentArgsDumpService[1];
+    executor.args_dump_service_count_ = 1;
+    executor.args_dump_services_allocated_this_init_ = true;
+    executor.init_failed_.store(true);
+    EXPECT_EQ(executor.finish_failed_init(&runtime), -1);
+    EXPECT_EQ(executor.args_dump_services_, nullptr);
+    EXPECT_EQ(executor.args_dump_service_count_, 0);
+    EXPECT_FALSE(executor.args_dump_services_allocated_this_init_);
+    // The actual next-init admission guard no longer rejects a healthy/OFF
+    // attempt because of this stopped local allocation. No device poison or
+    // shared allocation is discharged by this gate.
+    EXPECT_TRUE(executor.begin_args_dump_initialization());
+}
+
+TEST_F(ResidentFinalizer, FailedInitializationPreservesAPriorUnknownServiceAllocation) {
+    executor.args_dump_services_ = new ResidentArgsDumpService[1];
+    executor.args_dump_service_count_ = 1;
+    auto *retained = executor.args_dump_services_;
+    ASSERT_FALSE(executor.begin_args_dump_initialization());
+    executor.init_failed_.store(true);
+    EXPECT_EQ(executor.finish_failed_init(&runtime), -1);
+    EXPECT_EQ(executor.args_dump_services_, retained);
+    EXPECT_EQ(executor.args_dump_service_count_, 1);
+    EXPECT_FALSE(executor.begin_args_dump_initialization());
+    delete[] retained;
+    executor.args_dump_services_ = nullptr;
+    executor.args_dump_service_count_ = 0;
+}
+
+TEST_F(ResidentFinalizer, FailedInitializationCannotAbandonAnOlderOpenProducerReservation) {
+    const size_t bytes = calc_dump_data_size(1);
+    std::unique_ptr<void, decltype(&std::free)> shared(std::aligned_alloc(64, (bytes + 63) / 64 * 64), &std::free);
+    ASSERT_NE(shared, nullptr);
+    std::memset(shared.get(), 0, bytes);
+    auto *dump_header = get_dump_header(shared.get());
+    dump_header->magic = ARGS_DUMP_MAGIC;
+    dump_header->num_dump_threads = 1;
+    auto metadata = std::make_unique<DumpMetaBuffer>();
+    auto *state = get_dump_buffer_state(shared.get(), 0);
+    std::array<uint8_t, 64> arena{};
+    state->arena_base = reinterpret_cast<uint64_t>(arena.data());
+    state->arena_size = arena.size();
+    state->free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(metadata.get());
+    state->free_queue.tail = 1;
+    set_dump_args_enabled(true);
+    set_platform_dump_base(reinterpret_cast<uint64_t>(shared.get()));
+    dump_args_init(1, DumpArgsLevel::FULL);
+    uint32_t source = 17;
+    ArgsDumpInfo info{};
+    info.task_id = TaskId::make_global(0);
+    info.buffer_addr = reinterpret_cast<uint64_t>(&source);
+    info.dtype = static_cast<uint8_t>(DataType::UINT32);
+    info.ndims = 1;
+    info.shapes[0] = 1;
+    info.strides[0] = 1;
+    info.kind = static_cast<uint8_t>(ArgsDumpKind::TENSOR);
+    info.role = ArgsDumpRole::INPUT;
+    info.stage = ArgsDumpStage::BEFORE_DISPATCH;
+    DumpArgReservation owner;
+    ASSERT_EQ(dump_arg_try_begin(0, info, &owner), DumpArgBeginResult::Ready);
+    ASSERT_TRUE(owner.open());
+    executor.args_dump_services_ = new ResidentArgsDumpService[1];
+    executor.args_dump_service_count_ = 1;
+    auto *retained = executor.args_dump_services_;
+    ASSERT_FALSE(executor.begin_args_dump_initialization());
+    executor.init_failed_.store(true);
+    EXPECT_EQ(executor.finish_failed_init(&runtime), -1);
+    EXPECT_EQ(executor.args_dump_services_, retained);
+    EXPECT_EQ(executor.args_dump_service_count_, 1);
+    EXPECT_TRUE(owner.open());
+    EXPECT_TRUE(dump_arg_has_open_record(0));
+    EXPECT_EQ(metadata->count, 0);
+    EXPECT_EQ(state->run_dropped_record_count, 0);
+    EXPECT_FALSE(executor.begin_args_dump_initialization());
+    EXPECT_TRUE(dump_arg_abandon(&owner));
+    delete[] retained;
+    executor.args_dump_services_ = nullptr;
+    executor.args_dump_service_count_ = 0;
+    set_platform_dump_base(0);
+    set_dump_args_enabled(false);
+}
+
 // First-wins: an error already latched keeps its own code, so a late timeout
 // cannot relabel the failure the run actually had.
 TEST_F(ResidentFinalizer, AnEarlierHeaderErrorKeepsPrecedence) {

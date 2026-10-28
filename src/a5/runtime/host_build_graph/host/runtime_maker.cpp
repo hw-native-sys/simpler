@@ -67,7 +67,9 @@
 #include "host_build_graph/host/dep_gen_host_graph.h"
 #include "host_build_graph/graph_execution.h"
 #include "scheduler/scheduler_graph.h"
+#include "scheduler/scheduler_args_dump.h"
 #include "scheduler/scheduler_types.h"
+#include "aicpu/args_dump_aicpu.h"
 #include "host_build_graph/host/host_tensor_access.h"
 #include "host_build_graph/host/retained_prepare_plan.h"
 #include "host_build_graph/host/graph_host_state.h"
@@ -200,26 +202,9 @@ extern "C" int joined_diagnostic_launch_supported_impl(void) {
 }
 
 extern "C" int args_dump_capture_supported_impl(void) {
-    // No per-task argument capture on this runtime. Its route is the AICore
-    // Scheduler, where the on-core schedulers both dispatch tasks and reap
-    // their completions, so no AICPU thread holds a task's own boundaries and
-    // `dump_args_for_task` has no instant to run at. The two instants an AICPU
-    // thread does own are the run's, and a read there is not that task's data:
-    // a consumer's input would carry the content from before its producer ran,
-    // and a buffer several tasks write in turn would report the last write as
-    // every one of their outputs.
-    //
-    // Zero for the runtime, not for a bind. The AICPU-scheduled fallback this
-    // runtime keeps is selected inside `create_scheduler_state` from the
-    // graph's own task kinds, and from nothing a caller states, so an answer
-    // that followed the selection would make the capture available or not
-    // depending on whether a graph happened to hold a task the resident route
-    // declines.
-    //
-    // `docs/investigations/2026-10-a5-resident-per-task-args-capture.md` is the
-    // design for a task-boundary producer here; the capability is deferred to
-    // its own change.
-    return 0;
+    // Resident participants seal the selected task's input and output phases;
+    // the legacy route retains its blocking task-boundary producer.
+    return 1;
 }
 
 // RuntimeEnv (call_config.h) is the cross-runtime ABI for per-ring config and
@@ -1124,7 +1109,7 @@ void select_legacy_scheduler(Runtime *runtime, uint32_t mode) {
 
 bool create_scheduler_state(
     Runtime *runtime, const HostApi *api, SharedMemoryHandle &host_sm_handle, int32_t total_tasks,
-    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments
+    uint64_t task_window_size, const sm_layout::SegmentOffsets &device_segments, uint64_t args_dump_address
 ) {
     release_scheduler_state(runtime);
     if (total_tasks < 0 || task_window_size == 0 || static_cast<uint64_t>(total_tasks) > task_window_size) {
@@ -1418,6 +1403,7 @@ bool create_scheduler_state(
         context.task_window_last_index = task_window_size - 1;
         context.graph_task_count = static_cast<uint64_t>(total_tasks);
         context.worker_index = static_cast<uint64_t>(i);
+        context.args_dump_address = args_dump_address;
         for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
             const uint64_t offset = context.dispatch_payload_offset + slot * sizeof(DispatchPayload);
             auto *payload = scheduler_state_at<DispatchPayload>(host_base, offset);
@@ -1450,6 +1436,32 @@ bool create_scheduler_state(
 
 using HostPreparePlan = RetainedHostPreparePlan<RuntimeArenaLayout>;
 
+bool plan_resident_args_dump(
+    Runtime *runtime, SharedMemoryHandle &host_sm_handle, int32_t total_tasks, uint64_t task_capacity,
+    SchedulerArgsDumpLayout *layout
+) {
+    if (total_tasks < 0 || static_cast<uint64_t>(total_tasks) > task_capacity) return false;
+    *layout = {};
+    const auto level = static_cast<DumpArgsLevel>(runtime->dev.dump_args_level);
+    if (level == DumpArgsLevel::OFF) return true;
+    uint64_t selected = 0;
+    for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
+        const auto &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
+        // The existing whole-graph legacy route retains its blocking producer.
+        if (slot.task_kind == TaskKind::GRAPH ||
+            (!slot.active_mask.is_empty() &&
+             !scheduler_resident_v0_task_shape_supported(
+                 slot.active_mask.count(), slot.logical_block_num, slot.task_attrs.requires_sync_start()
+             )))
+            return true;
+        if (!slot.active_mask.is_empty() && !host_sm_handle.header->tasks.is_completed(task_id) &&
+            (slot.to_payload().tensor_count != 0 || slot.to_payload().scalar_count != 0) &&
+            dump_args_task_selected(level, slot.to_payload().dump_metadata.dump_arg_mask))
+            ++selected;
+    }
+    return scheduler_args_dump_plan_layout(total_tasks, selected, runtime->get_worker_count(), true, layout);
+}
+
 int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &plan) {
     const auto &layout = plan.layout;
     auto &host_arena = plan.host_arena;
@@ -1459,11 +1471,20 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     const uint64_t image_bytes = plan.image_bytes;
     const int32_t total_tasks = plan.total_tasks;
     const auto &bind_usage = plan.bind_usage;
-    const uint64_t device_arena_bytes = layout.off_copied_end + image_bytes;
     const BindPhaseMark static_arena_phase = bind_phase_begin();
     runtime->dev.sm_image_bytes = image_bytes;
     SharedMemoryHandle host_sm_handle;
     if (!host_sm_handle.init(host_sm, plan.sm_size, task_capacity)) return PTO_RUNTIME_ERR_INTERNAL;
+    SchedulerArgsDumpLayout dump_layout{};
+    uint64_t dump_offset = 0;
+    uint64_t device_arena_bytes = 0;
+    if (!plan_resident_args_dump(runtime, host_sm_handle, total_tasks, task_capacity, &dump_layout) ||
+        !scheduler_args_dump_plan_arena(
+            layout.off_copied_end, image_bytes, dump_layout, &dump_offset, &device_arena_bytes
+        )) {
+        LOG_ERROR("%s", "A5 HBG: diagnostic arena layout overflow");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     if (const int rc = api->setup_static_arena(heap_bytes, /*gm_sm_size=*/0, device_arena_bytes); rc != 0) {
         return rc;
     }
@@ -1523,7 +1544,7 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     // CHIP_ALIGN_SIZE-aligned and ChipTaskSlotState is alignas(64), which a byte
     // vector's data() is not.
     const uint64_t copied_bytes = layout.off_copied_end - layout.off_copied_begin;
-    const uint64_t upload_bytes = copied_bytes + image_bytes;
+    const uint64_t upload_bytes = device_arena_bytes - layout.off_copied_begin;
     // Assembled in staging the runner retains rather than in a buffer that dies
     // with this frame: publication is a separate step, so the bytes have to still
     // be here when it reads them. Over-allocated by the alignment the layout
@@ -1548,8 +1569,34 @@ int32_t commit_host_plan(Runtime *runtime, const HostApi *api, HostPreparePlan &
     );
     always_assert(compacted == image_bytes);
 
+    if (dump_layout.total_size != 0) {
+        void *dump_image = upload_base + dump_offset - layout.off_copied_begin;
+        if (!scheduler_args_dump_init_image(
+                dump_image, dump_layout.total_size, dump_layout, api->run_epoch(),
+                static_cast<DumpArgsLevel>(runtime->dev.dump_args_level)
+            ))
+            return PTO_RUNTIME_ERR_INTERNAL;
+        for (int64_t task_id = 0; task_id < total_tasks; ++task_id) {
+            const auto &slot = host_sm_handle.header->tasks.get_slot_state_by_task_id(task_id);
+            if (slot.active_mask.is_empty() || host_sm_handle.header->tasks.is_completed(task_id) ||
+                (slot.to_payload().tensor_count == 0 && slot.to_payload().scalar_count == 0) ||
+                !dump_args_task_selected(
+                    static_cast<DumpArgsLevel>(runtime->dev.dump_args_level),
+                    slot.to_payload().dump_metadata.dump_arg_mask
+                ))
+                continue;
+            uint64_t mask = 0;
+            for (uint32_t subtask = 0; subtask < SUBTASK_SLOT_COUNT; ++subtask)
+                if (slot.active_mask.has(static_cast<SubtaskSlot>(subtask))) mask |= UINT64_C(1) << subtask;
+            if (!scheduler_args_dump_select_task(dump_image, task_id, mask)) return PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
+
     const sm_layout::SegmentOffsets device_segments = sm_layout::segment_offsets(sm_layout::image_extents(bind_usage));
-    if (!create_scheduler_state(runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments)) {
+    if (!create_scheduler_state(
+            runtime, api, host_sm_handle, total_tasks, task_capacity, device_segments,
+            dump_layout.total_size == 0 ? 0 : reinterpret_cast<uint64_t>(arena_dev) + dump_offset
+        )) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
