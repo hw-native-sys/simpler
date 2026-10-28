@@ -41,6 +41,11 @@ N=1 不设置多 block SYNC_START 标志，但 Mix 类型、组内配对和资�
 - 本核关闭 A 后可进入 B；真实 A→B 数据依赖仍须等待 A 的逻辑完成。
 - 先原样跑通 CSA 的普通多 block／Mix 分波，再完成 sync_start。
 
+当前 Mix 的准入成员是所有候选 cluster 的三个 lane；由于所有 cluster 都允许动态领取，
+实际覆盖全芯片。单个 block 的三 lane 握手仍只发生在其所属 cluster，不是全芯片同时起跑。
+不能将成员缩为仅 AIC，否则 AIV 可能跳过前序 Mix 并阻塞于后序 sync_start，令前序组无法到齐。
+详细边界见 [Mix 的局部资源与 task 成员](spmd/block-and-mix-execution.md#本地资源的进入和退出)。
+
 ### 普通多 block 与 sync_start 为什么分开
 
 这一区分针对执行位置的分配方式，不是两套相互矛盾的任务顺序。

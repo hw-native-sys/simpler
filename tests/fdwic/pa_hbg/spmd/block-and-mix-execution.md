@@ -125,8 +125,15 @@ NO_SPLIT/SingleModeVec0 的硬件搬运目标不能由 payload.sub_block_id 改�
 ### 本地资源的进入和退出
 
 TPipe 等机制可能使用同组缓冲和事件；执行 mask 不等于完整资源依赖。
-首版可保守地把 Mix 资源域限定为所属 cluster，将相关非执行 lane 纳入资源义务；
-没有证据不能扩大到整个芯片，也不能给纯 AIC 任务附加无关 AIV 义务。
+当前每个已领取 block 的资源握手覆盖其所属 cluster 的三个 lane，包括不执行 kernel 的 lane；
+这不代表其他 cluster 也要参加这一次组内 barrier，也不给纯 AIC 任务附加无关 AIV 义务。
+
+需要区分 block 的局部资源域和 task 的候选成员集合。当前所有 cluster 的 AIC 都可能动态领取
+同一个 Mix task，因此其准入成员覆盖全芯片 AIC/AIV；即使 N 很小、某个 cluster 最终没有工作，
+也必须观察并关闭该 task，不能预先跳过。若只把 AIC 列入成员，AIV 可以越过 Mix 进入后序
+sync_start 的阻塞 kernel，随后被前序 Mix 选中的 AIC 将等不到它到达。
+这是当前动态领取与三 lane 合同的约束，不是 TPipe 硬件资源覆盖全芯片的证明。
+候选 cluster 收窄需要在准入前统一冻结范围、同步限制实际领取者并重新证明活性，不属于当前实现。
 
 ~~~text
 AIC 发布本 block 组身份

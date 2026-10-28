@@ -84,6 +84,10 @@ that ...".
 
 Newest first.
 
+- [2026-10-csa-early-mix-retirement](../zh-cn/investigations/2026-10-csa-early-mix-retirement.md)
+
+- [2026-10-csa-close-prefilter](../zh-cn/investigations/2026-10-csa-close-prefilter.md)
+
 - [2026-10 — CSA admission_state 128B](../zh-cn/investigations/2026-10-csa-admission-state-isolation.md): B/A/A/B 2.975398ms → 2.956951ms (-0.62%); TaskControl 512B → 384B.
 - [2026-10 — CSA GM ACK preflight](../zh-cn/investigations/2026-10-csa-gm-ack-preflight.md): B/A/A/B 2.427204ms → 2.413268ms (-0.57%); A2/B2 3.381us, A1/A2 10.969us.
 - [2026-10 — A5 HBG GM seq/ACK/seal](../../tests/fdwic/pa_hbg/spmd/implementation-progress.md): B/A/A/B 6.751136ms → 6.898988ms (+2.19%).
