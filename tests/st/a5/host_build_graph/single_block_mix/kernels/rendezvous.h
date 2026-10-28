@@ -14,8 +14,10 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 #ifdef PTO_CPUSTUB_HPP
+#include <chrono>
 #include <thread>
 #endif
+#include "common/platform_config.h"
 #include "intrinsic.h"
 #include "tensor.h"
 
@@ -26,6 +28,25 @@ struct alignas(128) RendezvousFlag {
 
 static_assert(sizeof(RendezvousFlag) == 128);
 
+// How long a lane waits for the rest of its 1C2V before giving up.
+//
+// Bounded by elapsed time rather than by a poll count. A poll costs a
+// different amount in the CPU-stub build than on silicon, and it also costs
+// more when the machine is busy, so a count that is generous for this case
+// alone can run out when it runs beside other work.
+constexpr uint64_t RENDEZVOUS_WAIT_MS = 2000;
+
+#ifdef PTO_CPUSTUB_HPP
+static uint64_t rendezvous_now_ticks() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+            .count()
+    );
+}
+#else
+static __aicore__ uint64_t rendezvous_now_ticks() { return get_sys_cnt(); }
+#endif
+
 static __aicore__ void rendezvous(__gm__ int64_t *args, uint32_t lane) {
     auto *tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
     auto *state = reinterpret_cast<__gm__ RendezvousFlag *>(
@@ -35,7 +56,9 @@ static __aicore__ void rendezvous(__gm__ int64_t *args, uint32_t lane) {
     state[lane].value = 1;
     dcci(&state[lane], cache_line_t::SINGLE_CACHE_LINE, dcci_dst_t::CACHELINE_OUT);
     dsb((mem_dsb_t)0);
-    for (uint32_t poll = 0; poll < 10000000; ++poll) {
+    const uint64_t deadline_ticks = RENDEZVOUS_WAIT_MS * (static_cast<uint64_t>(PLATFORM_PROF_SYS_CNT_FREQ) / 1000u);
+    const uint64_t started = rendezvous_now_ticks();
+    while (rendezvous_now_ticks() - started < deadline_ticks) {
         bool arrived = true;
         for (uint32_t peer = 0; peer < 3; ++peer) {
             if (peer == lane || (mask & (1U << peer)) == 0) continue;

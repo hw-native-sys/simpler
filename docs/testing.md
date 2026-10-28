@@ -793,6 +793,63 @@ Key fields:
   Unknown keys fail when the `@scene_test` class is imported instead of being
   silently ignored. Case-level extension keys outside `config` remain allowed.
 
+### Kernels That Wait for Siblings (Mix, sync_start)
+
+A Mix task's 1C2V and a sync_start cohort's blocks are co-residency
+requirements: the subtasks are meant to be on cores at the same instant, and a
+kernel that proves it does so by waiting for its siblings to arrive. Two rules
+govern such a kernel, and they pull in opposite directions — **bound the wait
+by time, but never decide the verdict by time.**
+
+**Bound the wait by elapsed time, not by a poll count.** A poll costs a
+different amount in the CPU-stub build than on silicon, and it costs more again
+when the machine is busy, so a count calibrated while the case runs alone can
+run out when it runs beside other work. What the case then reports is not its
+own give-up value but a device op-execute timeout — the op is killed, and the
+failure looks like a runtime hang rather than the missing rendezvous it is.
+Convert a millisecond budget with the platform's own tick rate, the way the
+runtime does:
+
+```cpp
+#ifdef PTO_CPUSTUB_HPP
+static uint64_t now_ticks() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+#else
+static __aicore__ uint64_t now_ticks() { return get_sys_cnt(); }
+#endif
+
+constexpr uint64_t WAIT_MS = 2000;
+const uint64_t deadline = WAIT_MS * (static_cast<uint64_t>(PLATFORM_PROF_SYS_CNT_FREQ) / 1000u);
+const uint64_t started = now_ticks();
+while (now_ticks() - started < deadline) { /* ... */ }
+```
+
+Note the host-side guard spelling. Select the stub path on
+`#ifdef PTO_CPUSTUB_HPP`, which is how the kernels in this tree already do it —
+**not** on `#ifndef dcci`. `dcci` is a *function* in both the CCE and
+`cpu_stub.hpp` builds, so `#ifndef dcci` is unconditionally true and silently
+compiles the whole cache-maintenance path out of the onboard build.
+
+**Write a poison value when the wait expires** so the give-up is visible to
+`compute_golden` (see [Output Validation](#output-validation)) rather than
+only to someone reading a log. A value no correct run can produce — `-99.0` in
+the existing cases — turns a missed rendezvous into a result mismatch naming
+the lane.
+
+**Do not judge co-residency by whether the wait expired.** That measures a race
+against a wall clock, so the verdict moves with machine load: the same build can
+report the defect when the case runs alone and report it fixed when the case
+runs after the rest of the suite. Decide from the run's own record instead —
+the `assert_cohorts_were_coresident` fixture in
+`tests/st/a5/host_build_graph/conftest.py` reads `chip_swimlane_records.json`
+and checks that each cohort's subtask intervals intersect (its latest start
+precedes its earliest end). Load shifts where the intervals sit, never whether
+they intersect. The bounded wait is what keeps a non-co-resident run from
+hanging; the interval check is what decides whether it was co-resident.
+
 ### Output Validation
 
 By default every output tensor is compared against `compute_golden` with
