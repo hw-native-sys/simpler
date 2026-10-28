@@ -398,13 +398,14 @@ inline __aicore__ bool scheduler_refresh_local_obligation(
         if (!scheduler_task_ref_valid(graph, task))
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
         auto *record = scheduler_admission_record_at(base, admission, task);
-        scheduler_observe_cache_line(record);
+        // The validated run layout places the bitmap immediately after the
+        // header; an unvalidated record cannot redirect cache maintenance.
+        auto *words = reinterpret_cast<__gm__ uint64_t *>(record + 1);
+        scheduler_invalidate_cache_line(record);
+        scheduler_invalidate_cache_line(words);
+        scheduler_cache_barrier();
         if (record->run_epoch != admission->epoch)
             return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_EPOCH_MISMATCH);
-        if (!scheduler_admission_static_record_valid(base, local, admission, task, record))
-            return scheduler_admission_fail(graph, local, run, task, SchedulerErrorSite::ADMISSION_INVALID_RECORD);
-        auto *words = scheduler_state_at<uint64_t>(base, record->member_words_offset);
-        scheduler_observe_cache_line(words);
         auto *control = scheduler_task_control_at(base, local, task);
         if (record->order_key != admission->scan_cursor ||
             scheduler_gm_query(control->admission_state) != static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED) ||

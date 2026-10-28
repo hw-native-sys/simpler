@@ -479,6 +479,91 @@ TEST(HbgAdmission, VectorMembershipSetsWorkerBitsBeyondTheFirstWord) {
     }
 }
 
+TEST(HbgAdmission, PublishedSecondBitmapWordDistinguishesMembersAndNonmembers) {
+    for (uint8_t mask : {1, 2, 3, 5, 6, 7}) {
+        SCOPED_TRACE(mask);
+        AdmissionFixture fixture({{3, mask}}, 69);
+        ASSERT_TRUE(fixture.publish(0));
+        ASSERT_EQ(fixture.admissions[0].member_word_count, 2u);
+        for (uint64_t worker : {63u, 64u, 65u, 66u, 67u, 68u}) {
+            SCOPED_TRACE(worker);
+            const bool member = __builtin_popcount(mask) > 1 || (mask == 1 ? worker % 3 == 0 : worker % 3 != 0);
+            ASSERT_TRUE(fixture.refresh(worker));
+            const auto &admission = fixture.admissions[worker];
+            EXPECT_EQ(admission.current_task_ref, member ? 0 : SCHEDULER_TASK_REF_INVALID);
+            EXPECT_EQ(admission.scan_cursor, member ? 0u : 1u);
+            if (member) {
+                EXPECT_EQ(admission.current_block_num, 3u);
+                EXPECT_EQ(admission.current_active_mask, mask);
+            }
+            bool permit = true;
+            ASSERT_TRUE(fixture.ordinary_permit(worker, &permit));
+            EXPECT_EQ(permit, !member);
+        }
+    }
+}
+
+TEST(HbgAdmission, CorruptSecondBitmapWordIsRejectedByMembersAndNonmembersWithColdOrWarmTopology) {
+    for (bool warm_topology : {false, true}) {
+        SCOPED_TRACE(warm_topology);
+        for (uint64_t worker : {64u, 66u}) {
+            SCOPED_TRACE(worker);
+            for (uint32_t corruption = 0; corruption < 3; ++corruption) {
+                SCOPED_TRACE(corruption);
+                AdmissionFixture fixture({{3, 1}}, 69);
+                ASSERT_TRUE(fixture.publish(0));
+                ASSERT_EQ(fixture.members(0)[1], UINT64_C(4));
+                if (warm_topology) {
+                    uint64_t expected[(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
+                    uint32_t members = 0;
+                    ASSERT_TRUE(scheduler_admission_expected_members(
+                        fixture.base(), fixture.locals[worker], &fixture.admissions[worker], fixture.record(0),
+                        expected, &members
+                    ));
+                    ASSERT_EQ(fixture.admissions[worker].topology_worker_count, 69u);
+                }
+                if (corruption == 0) fixture.members(0)[1] = 0;
+                else if (corruption == 1) fixture.members(0)[1] = UINT64_C(1);
+                else fixture.members(0)[1] |= UINT64_C(1) << 63;
+                EXPECT_FALSE(fixture.refresh(worker));
+                EXPECT_EQ(fixture.admissions[worker].scan_cursor, 0u);
+                EXPECT_EQ(fixture.admissions[worker].current_task_ref, SCHEDULER_TASK_REF_INVALID);
+                EXPECT_EQ(
+                    fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::ADMISSION_INVALID_RECORD)
+                );
+            }
+        }
+    }
+}
+
+TEST(HbgAdmission, InvalidPublishedMemberOffsetsFailClosedForMembersAndNonmembers) {
+    for (uint64_t worker : {64u, 66u}) {
+        SCOPED_TRACE(worker);
+        for (uint32_t corruption = 0; corruption < 7; ++corruption) {
+            SCOPED_TRACE(corruption);
+            AdmissionFixture fixture({{3, 1}, {3, 1}}, 69);
+            ASSERT_TRUE(fixture.publish(0));
+            const uint64_t expected = fixture.record(0)->member_words_offset;
+            const uint64_t offsets[] = {
+                0,
+                1,
+                UINT64_MAX,
+                UINT64_MAX - 63,
+                expected + 8,
+                expected - sizeof(SchedulerAdmissionRecord),
+                fixture.record(1)->member_words_offset,
+            };
+            fixture.record(0)->member_words_offset = offsets[corruption];
+            EXPECT_FALSE(fixture.refresh(worker));
+            EXPECT_EQ(fixture.admissions[worker].scan_cursor, 0u);
+            EXPECT_EQ(fixture.admissions[worker].current_task_ref, SCHEDULER_TASK_REF_INVALID);
+            EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::ADMISSION_INVALID_RECORD));
+            EXPECT_EQ(scheduler_gm_query(fixture.control()->commit_tail), 1u);
+            EXPECT_EQ(scheduler_gm_query(fixture.log()[0]), 0);
+        }
+    }
+}
+
 TEST(HbgAdmission, MixMaskSixIncludesTheNonExecutingAICCoordinator) {
     AdmissionFixture fixture({{4, 6}});
     ASSERT_TRUE(fixture.publish(0));
