@@ -30,7 +30,8 @@ def _verify_runtime_clock_logs(monkeypatch, st_platform, after_finalize=None):
     original = scene_test_module.finalize_diagnostic_outputs
 
     def finalize(case_label, output_prefix, **kwargs):
-        for capture in output_prefix.rglob("chip_swimlane_records.json"):
+        captures = output_prefix.rglob("chip_swimlane_records.json") if kwargs.get("chip_swimlane", 0) else ()
+        for capture in captures:
             raw = json.loads(capture.read_text())
             logs = list(capture.parent.glob("host_clock_alignment.*.log"))
             has_host = raw["metadata"].get("orchestrator_source") == "host"

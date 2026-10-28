@@ -1307,7 +1307,11 @@ class TestA5ThreeRunCapacity(_A5EarlyEnqueueBase):
             trace,
             records,
             _EVIDENCE_BUDGET_S,
-            lambda seen: len(_established_pairs(seen, case_runs)) >= 2,
+            # Joined launches precede the retiring run's boundary log. Keep
+            # draining until both adjacent pairs can be judged, even if their
+            # measured order is wrong; the assertions below still reject it.
+            lambda seen: len(_established_pairs(seen, case_runs)) >= 2
+            and not _whole_operator_order(trace, seen, case_runs)[3],
         )
         assert records, (
             f"no joined-launch record reached this process from children {trace.pids}, so nothing carried the "

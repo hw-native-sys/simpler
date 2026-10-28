@@ -43,6 +43,12 @@ CASES = {
     "read_task_output": 5,
     "write_task_produced_tensor": 6,
     "read_alloc_tensors_output": 7,
+    "wide_count_wraps_to_one": 8,
+    "negative_count_wraps_to_one": 9,
+    "larger_count_wraps_to_one": 10,
+    "wide_count_first_overflow": 11,
+    "wide_count_int64_min": 12,
+    "wide_count_int64_max": 13,
 }
 
 

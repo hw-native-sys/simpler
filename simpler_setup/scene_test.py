@@ -2220,12 +2220,14 @@ class SceneTestCase:
         skip_golden = skip_golden or bool(case.get("skip_golden", self.SKIP_GOLDEN))
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
-        # The L2 entry point is `Worker.run(handle, args, cfg)`. Reuse the
-        # handle registered by the st_worker fixture / standalone path.
-        handle = getattr(type(self), "_st_l2_handle", None)
-        if handle is None:
+        # A registration belongs to one Worker and callable. Instance-local
+        # storage cannot inherit a parent's handle for a different signature.
+        registration = self.__dict__.get("_st_l2_registration")
+        if registration is None or registration[0] is not worker or registration[1] is not callable_obj:
             handle = worker.register(callable_obj)
-            type(self)._st_l2_handle = handle
+            self._st_l2_registration = (worker, callable_obj, handle)
+        else:
+            handle = registration[2]
 
         test_args = self.generate_args(params)
         with _child_memory_args(worker, test_args, orch_sig) as child_args:

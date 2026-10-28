@@ -28,12 +28,15 @@
 
 namespace scheduler_test {
 
+inline void protocol_noop_kernel(__gm__ int64_t *) {}
+
 class SchedulerStateBuffer {
 public:
     explicit SchedulerStateBuffer(const AicoreSchedulerLayout &layout) :
         base_(std::aligned_alloc(SCHEDULER_STATE_ALIGNMENT, layout.total_size)) {
         EXPECT_NE(base_, nullptr);
-        if (base_ != nullptr) EXPECT_TRUE(scheduler_init_data_from_layout(base_, layout));
+        if (base_ != nullptr)
+            EXPECT_TRUE(scheduler_init_data_from_layout(base_, layout, reinterpret_cast<uint64_t>(base_)));
     }
     ~SchedulerStateBuffer() { std::free(base_); }
     void *base() const { return base_; }
@@ -128,7 +131,10 @@ using GraphBuffer = BasicGraphBuffer<8192>;
 inline constexpr uint64_t kFixtureCallableCount = 1024;
 
 struct FixtureStorage {
-    explicit FixtureStorage(uint64_t task_count, uint64_t workers = 2, uint64_t traces_per_task = 1) :
+    explicit FixtureStorage(
+        uint64_t task_count, uint64_t workers = 2, uint64_t traces_per_task = 1,
+        const SchedulerSpmdRequirements &spmd = {}, bool protocol_profiling = false
+    ) :
         test_profiles(workers),
         test_contexts(workers),
         test_graphs(workers),
@@ -138,7 +144,9 @@ struct FixtureStorage {
                 scheduler_initialize_free_slot(&slot);
         for (auto &slot : scheduler_local_state.slots)
             scheduler_initialize_free_slot(&slot);
-        EXPECT_TRUE(scheduler_plan_layout(task_count, task_count, 0, &layout, false, task_count * traces_per_task));
+        EXPECT_TRUE(scheduler_plan_layout(
+            task_count, task_count, 0, &layout, false, task_count * traces_per_task, spmd, protocol_profiling
+        ));
         scheduler_state = std::make_unique<SchedulerStateBuffer>(layout);
         run_control = scheduler_state_at<SchedulerRunControl>(scheduler_state->base(), layout.run_control_offset);
         contexts = scheduler_state_at<SchedulerWorkerContext>(scheduler_state->base(), layout.worker_contexts_offset);
@@ -175,7 +183,8 @@ struct FixtureStorage {
                 static_cast<int32_t>(lane == 0 ? cluster : cluster * PLATFORM_AIV_CORES_PER_BLOCKDIM + (lane - 1));
         }
         metadata = scheduler_state_at<SchedulerTaskMetadata>(scheduler_state->base(), layout.task_metadata_offset);
-        callable_addresses[1] = UINT64_C(0x1000);
+        callable_addresses[1] =
+            protocol_profiling ? reinterpret_cast<uint64_t>(&protocol_noop_kernel) : UINT64_C(0x1000);
         for (uint64_t task = 0; task < task_count; ++task) {
             metadata[task].kernel_ids[0] = 1;
             metadata[task].kernel_ids[1] = UINT16_MAX;
@@ -183,6 +192,7 @@ struct FixtureStorage {
             metadata[task].active_mask = LaneMask::aic();
             metadata[task].trace_index_base = task;
             metadata[task].flags = SCHEDULER_TASK_EXECUTABLE;
+            metadata[task].logical_block_num = 1;
         }
     }
 

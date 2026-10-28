@@ -10,8 +10,7 @@
  */
 
 /**
- * mix_predicated_dispatch orchestration: one dispatch predicate governs all
- * subtasks of one Mix task.
+ * Predicate refusal fixture for a Mix or multi-block task.
  *
  *   gate_producer (WRITE_GATE)  writes gate[0] = gate_value (INT32)
  *   mix_task      (MixedKernels per mask) carries set_predicate(gate[0] > 0)
@@ -19,11 +18,9 @@
  *                 own sentinel slot: AIC -> s_aic[0]=11, AIV0 -> s_aiv0[0]=22,
  *                 AIV1 -> s_aiv1[0]=33.
  *
- * A Mix task's subtasks must execute or skip together. Because each subtask
- * writes a distinct slot, a split decision leaves a state that equals neither
- * "all skipped" nor "all executed", which the exact-match golden rejects.
+ * These shapes are rejected during Host preparation before any kernel executes.
  *
- * Args layout: [s_aic, s_aiv0, s_aiv1, gate] + {gate_value, mask} scalars.
+ * Args layout: [s_aic, s_aiv0, s_aiv1, gate] + {gate_value, mask, block_num} scalars.
  */
 
 #include <cstdint>
@@ -40,7 +37,7 @@ extern "C" {
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &orch_args) {
     (void)orch_args;
     return OrchestrationConfig{
-        .expected_arg_count = 6,  // 4 tensors + 2 scalars
+        .expected_arg_count = 7,  // 4 tensors + 3 scalars
     };
 }
 
@@ -52,14 +49,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     const int64_t gate_value = orch_args.scalar<int64_t>(0);
     const int64_t mask_value = orch_args.scalar<int64_t>(1);
+    const int64_t block_num = orch_args.scalar<int64_t>(2);
     if (gate_value != 0 && gate_value != 1) {
         rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "unsupported gate value %ld", gate_value);
         return;
     }
-    // A single-lane Mix needs at least two active subtasks; mask 1/2/4 would be
-    // an ordinary task and would not exercise the Mix predicate contract.
-    if (mask_value < 3 || mask_value > 7) {
-        rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "unsupported mix mask %ld", mask_value);
+    if (mask_value < 1 || mask_value > 7 || block_num < 1 || block_num > 2) {
+        rt_report_fatal(SIMPLER_ERROR_INVALID_ARGS, "unsupported shape mask=%ld blocks=%ld", mask_value, block_num);
         return;
     }
     const uint8_t mask = static_cast<uint8_t>(mask_value);
@@ -87,6 +83,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         pred.op = PredicateOp::GT;
         pred.target = 0;
         args.set_predicate(pred);
+        args.launch_spec.set_block_num(static_cast<int16_t>(block_num));
 
         MixedKernels kernels;
         kernels.aic_kernel_id = (mask & 1U) != 0 ? FUNC_MIX_AIC : INVALID_KERNEL_ID;

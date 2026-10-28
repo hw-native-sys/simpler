@@ -68,6 +68,7 @@
 #include "host_build_graph/graph_execution.h"
 #include "scheduler/scheduler_graph.h"
 #include "scheduler/scheduler_types.h"
+#include "scheduler_protocol_export.h"
 #include "host_build_graph/host/host_tensor_access.h"
 #include "host_build_graph/host/retained_prepare_plan.h"
 #include "host_build_graph/host/graph_host_state.h"
@@ -489,15 +490,13 @@ namespace {
 // name, so it is a wire contract and not a variable.
 constexpr const char *kSchedulerJsonTaskKey = "\"task_id\": ";
 
-// What a run's scheduler state leaves behind for the readers that come after
-// its bind: where the state is on the device, the layout that describes it, and
-// the HostApi the D2H readback goes through. The storage itself belongs to the
-// runner's pipeline slot, not here, so this record owns nothing and ends with
-// the run.
+// The device storage belongs to the pipeline slot. The frozen Host graph belongs
+// to this run and remains valid after the orchestration mirror is reused.
 struct SchedulerStateOwner {
     void *state_base;
     AicoreSchedulerLayout layout;
     const HostApi *api;
+    std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
 };
 
 std::mutex scheduler_state_owners_mutex;
@@ -544,6 +543,24 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
     if (api->copy_from_device(host_base, owner.state_base, static_cast<size_t>(owner.layout.total_size)) != 0) {
         LOG_WARN("A5 HBG: failed to copy AICore Scheduler profiling state");
         return false;
+    }
+
+    if (owner.layout.protocol_layout_offset != 0) {
+        try {
+            const auto payload = scheduler_export_protocol(
+                host_base, static_cast<size_t>(owner.layout.total_size), owner.layout, api->run_epoch(),
+                owner.protocol_tasks
+            );
+            if (!api->publish_chip_swimlane_extension(
+                    ChipSwimlaneExtensionSection::AicoreProtocol, payload.c_str(), payload.size()
+                )) {
+                LOG_WARN("A5 HBG: failed to publish native protocol records");
+                return false;
+            }
+        } catch (const std::exception &error) {
+            LOG_WARN("A5 HBG: invalid native protocol image: %s", error.what());
+            return false;
+        }
     }
 
     const auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, owner.layout.worker_contexts_offset);
@@ -593,7 +610,7 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
                 trace.kernel_start_cycles - trace.ready_observe_cycles :
                 0;
         if (!first_task) tasks_json << ",";
-        tasks_json << "\n    [" << trace.worker_id << ", " << task_ref << ", " << task_ref << ", "
+        tasks_json << "\n    [" << trace.worker_id << ", " << task_ref << ", " << trace_index << ", "
                    << trace.kernel_start_cycles << ", " << trace.kernel_end_cycles << ", " << receive_to_start << ", "
                    << swimlane_run_epoch << "]";
         first_task = false;
@@ -608,15 +625,53 @@ bool publish_aicore_scheduler_profiling(Runtime *runtime, const HostApi *api) {
         return false;
     }
 
+    std::ostringstream identities_json;
+    identities_json << "{\"schema\":\"hbg-execution-identity-v1\",\"producer\":\"aicore\",\"records\":[";
+    bool first_identity = true;
+    for (uint64_t trace_index : emitted_traces) {
+        const SchedulerTaskTrace &trace = traces[trace_index];
+        const uint32_t flags = trace.execution_identity_flags;
+        if ((flags & SCHEDULER_TRACE_IDENTITY_CAPTURED) == 0 || (flags & ~UINT32_C(15)) != 0 ||
+            trace.execution_run_epoch != swimlane_run_epoch) {
+            LOG_WARN("A5 HBG: missing or stale execution identity at trace=%" PRIu64, trace_index);
+            return false;
+        }
+        if (!first_identity) identities_json << ",";
+        first_identity = false;
+        identities_json << "\n{\"run_epoch\":" << trace.execution_run_epoch << ",\"core_id\":" << trace.worker_id
+                        << ",\"reg_task_id\":" << trace_index << ",\"task_id\":" << trace.task_ref
+                        << ",\"block_idx\":" << trace.execution_block_idx
+                        << ",\"block_num\":" << trace.execution_block_num
+                        << ",\"subtask_slot\":" << trace.execution_subtask_slot
+                        << ",\"pending_slot\":" << trace.execution_pending_slot
+                        << ",\"dispatch_generation\":" << trace.execution_generation
+                        << ",\"cluster_index\":" << trace.execution_cluster_index
+                        << ",\"cluster_lane\":" << trace.execution_cluster_lane << ",\"order_key\":";
+        if ((flags & SCHEDULER_TRACE_ORDERED) != 0) identities_json << trace.execution_order_key;
+        else identities_json << "null";
+        identities_json << ",\"group_seq\":";
+        if ((flags & SCHEDULER_TRACE_GROUP) != 0) identities_json << trace.execution_group_seq;
+        else identities_json << "null";
+        identities_json << ",\"executed\":" << ((flags & SCHEDULER_TRACE_EXECUTED) != 0 ? "true" : "false") << "}";
+    }
+    identities_json << "]}";
+    const std::string identities_payload = identities_json.str();
+    if (!api->publish_chip_swimlane_extension(
+            ChipSwimlaneExtensionSection::AicoreExecutionIdentities, identities_payload.c_str(),
+            identities_payload.size()
+        )) {
+        LOG_WARN("A5 HBG: failed to publish execution identities");
+        return false;
+    }
+
     if (need_scheduler_timing) {
         std::ostringstream scheduler_tasks_json;
         scheduler_tasks_json << "{\n    \"producer\": \"aicore\",\n    \"records\": [";
         bool first_scheduler_task = true;
         for (uint64_t trace_index : emitted_traces) {
             const SchedulerTaskTrace &trace = traces[trace_index];
-            const uint64_t task_ref = trace.task_ref;
             if (!first_scheduler_task) scheduler_tasks_json << ",";
-            scheduler_tasks_json << "\n      [" << trace.worker_id << ", " << task_ref << ", "
+            scheduler_tasks_json << "\n      [" << trace.worker_id << ", " << trace_index << ", "
                                  << trace.dispatch_end_cycles << ", " << trace.complete_start_cycles << ", "
                                  << swimlane_run_epoch << "]";
             first_scheduler_task = false;
@@ -1153,6 +1208,12 @@ bool create_scheduler_state(
             return true;
         }
     }
+    const int32_t worker_count = runtime->get_worker_count();
+    if (worker_count <= 0 || worker_count > static_cast<int32_t>(SCHEDULER_WORKER_CAPACITY) ||
+        worker_count % PLATFORM_CORES_PER_BLOCKDIM != 0) {
+        LOG_ERROR("A5 HBG AICore scheduler: invalid worker count %d for complete clusters", worker_count);
+        return false;
+    }
     std::vector<int64_t> inline_completed_task_refs;
     std::vector<SchedulerTaskMetadata> task_metadata(static_cast<size_t>(total_tasks));
     uint64_t aic_task_count = 0;
@@ -1160,10 +1221,12 @@ bool create_scheduler_state(
     uint64_t aiv_task_count = 0;
     uint64_t executable_task_count = 0;
     uint64_t executable_subtask_count = 0;
+    uint64_t cooperative_task_count = 0;
     uint64_t mix_task_count = 0;
     uint64_t aic_worker_demand = 0;
     uint64_t aiv_worker_demand = 0;
     int64_t legacy_shape_task_ref = -1;
+    int64_t trace_overflow_task_ref = -1;
     // The progress byte is PENDING or COMPLETED throughout this walk, never
     // PUBLISHED: that value is stored only by the device dispatch path, which
     // has not run yet, and orch::prepare_task resets every claimed slot this
@@ -1190,7 +1253,7 @@ bool create_scheduler_state(
                                    !slot.task_attrs.requires_sync_start() && !slot.task_attrs.has_predicate();
             if (!inline_dispatch_task) {
                 LOG_ERROR(
-                    "A5 HBG AICore scheduler: invalid v0 task ref=%" PRId64 " status=%" PRIu64, task_ref,
+                    "A5 HBG AICore scheduler: invalid task ref=%" PRId64 " status=%" PRIu64, task_ref,
                     static_cast<uint64_t>(status)
                 );
                 return false;
@@ -1200,7 +1263,9 @@ bool create_scheduler_state(
         }
         // Ordinary tasks retain the existing ChipTaskSlotState scheduling
         // semantics. Only the legacy inline-dispatch fallback synthesizes its
-        // AIV0 execution shape because it has no active subtask in the slot.
+        // AIV0 execution shape because it has no active subtask in the slot;
+        // such a node routes as AIV but owns no trace cell, so it is excluded
+        // from the subtask count the trace and PMU arrays are sized by.
         const LaneMask classified_active_mask = shape.active_mask;
         const LaneMask metadata_active_mask = inline_dispatch_task ? classified_active_mask : slot.active_mask;
         const LaneMask active_mask = metadata_active_mask;
@@ -1213,17 +1278,18 @@ bool create_scheduler_state(
             return false;
         }
         const uint32_t logical_block_num = static_cast<uint32_t>(slot.logical_block_num);
-        if (active_subtasks == 0 || logical_block_num > UINT16_MAX / active_subtasks) {
+        uint32_t expected_subtasks = 0;
+        if (!inline_dispatch_task &&
+            !scheduler_subtask_count_checked(logical_block_num, active_subtasks, &expected_subtasks)) {
             LOG_ERROR(
-                "A5 HBG AICore scheduler: task ref=%" PRId64 " block/subtask product exceeds scheduler state capacity",
+                "A5 HBG AICore scheduler: task ref=%" PRId64 " block/subtask product exceeds the int16 task contract",
                 task_ref
             );
             return false;
         }
-        const uint32_t expected_subtasks = logical_block_num * active_subtasks;
         if ((!inline_dispatch_task && (slot.active_mask != classified_active_mask ||
                                        static_cast<uint32_t>(slot.total_required_subtasks) != expected_subtasks)) ||
-            expected_subtasks > UINT16_MAX || host_sm_handle.header->tasks.is_completed(task_ref) ||
+            host_sm_handle.header->tasks.is_completed(task_ref) ||
             (slot.task_attrs.has_predicate() && (active_subtasks != 1 || logical_block_num != 1))) {
             LOG_ERROR(
                 "A5 HBG AICore scheduler: task ref=%" PRId64
@@ -1261,10 +1327,19 @@ bool create_scheduler_state(
             LOG_ERROR("A5 HBG AICore scheduler: sync-start task ref=%" PRId64 " must have block_num > 1", task_ref);
             return false;
         }
-        if (!scheduler_resident_v0_task_shape_supported(
+        if (!scheduler_resident_task_shape_supported(
                 active_subtasks, logical_block_num, slot.task_attrs.requires_sync_start()
             )) {
             if (legacy_shape_task_ref < 0) legacy_shape_task_ref = task_ref;
+        }
+        uint64_t next_subtask_count = executable_subtask_count;
+        if (!inline_dispatch_task &&
+            !scheduler_trace_count_checked(executable_subtask_count, expected_subtasks, &next_subtask_count)) {
+            if (trace_overflow_task_ref < 0) trace_overflow_task_ref = task_ref;
+            if (!scheduler_layout_checked_add(executable_subtask_count, expected_subtasks, &next_subtask_count)) {
+                LOG_ERROR("A5 HBG AICore scheduler: task ref=%" PRId64 " overflows the subtask count", task_ref);
+                return false;
+            }
         }
         SchedulerTaskMetadata &metadata = task_metadata[static_cast<size_t>(task_ref)];
         for (uint32_t subtask_slot = 0; subtask_slot < 3; ++subtask_slot) {
@@ -1276,22 +1351,39 @@ bool create_scheduler_state(
         metadata.flags = scheduler_task_metadata_flags_from_submit_state(
             metadata_active_mask, slot.task_attrs, slot.logical_block_num, fanin_count != 0, inline_dispatch_task
         );
-        metadata.trace_index_base = static_cast<uint32_t>(executable_subtask_count);
-        metadata.timing_slot = slot.task_attrs.timing_slot();
+        metadata.trace_index_base =
+            executable_subtask_count <= UINT32_MAX ? static_cast<uint32_t>(executable_subtask_count) : 0;
+        metadata.timing_slot = inline_dispatch_task ? -1 : static_cast<int16_t>(slot.task_attrs.timing_slot());
+        metadata.logical_block_num = static_cast<uint16_t>(logical_block_num);
         sampled_task_timing_enabled =
             sampled_task_timing_enabled ||
             (metadata.timing_slot >= 0 && metadata.timing_slot < SCHEDULER_TASK_TIMING_SLOT_COUNT);
         if (active_mask.has_aic()) {
             ++aic_task_count;
-            aic_worker_demand = std::max<uint64_t>(aic_worker_demand, logical_block_num);
         }
         const uint32_t active_aiv_subtasks = active_subtasks - (active_mask.has_aic() ? 1U : 0U);
         if (active_aiv_subtasks != 0) {
             ++aiv_task_count;
-            aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, logical_block_num * active_aiv_subtasks);
         }
-        if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
-        executable_subtask_count += expected_subtasks;
+        auto demand = scheduler_minimum_worker_demand(active_mask);
+        if (slot.task_attrs.requires_sync_start() &&
+            !scheduler_resident_worker_demand_checked(active_mask, logical_block_num, true, worker_count, &demand)) {
+            LOG_ERROR(
+                "A5 HBG AICore scheduler: sync-start task ref=%" PRId64
+                " block_num=%u lanes=aic%d/aiv0%d/aiv1%d exceeds distinct execution positions in %d workers",
+                task_ref, logical_block_num, active_mask.has_aic(), active_mask.has_aiv0(), active_mask.has_aiv1(),
+                worker_count
+            );
+            return false;
+        }
+        aic_worker_demand = std::max<uint64_t>(aic_worker_demand, demand.aic);
+        aiv_worker_demand = std::max<uint64_t>(aiv_worker_demand, demand.aiv);
+        if (!inline_dispatch_task) {
+            if (scheduler_task_is_mix(metadata.flags)) ++mix_task_count;
+            if (logical_block_num > 1 || active_subtasks > 1 || slot.task_attrs.requires_sync_start())
+                ++cooperative_task_count;
+        }
+        executable_subtask_count = next_subtask_count;
         ++executable_task_count;
     }
 
@@ -1302,17 +1394,40 @@ bool create_scheduler_state(
     if (legacy_shape_task_ref >= 0) {
         select_legacy_scheduler(runtime, api, SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE);
         LOG_INFO(
-            "A5 HBG: retaining AICPU scheduling for task ref=%" PRId64 " with SPMD or sync-start shape",
+            "A5 HBG: retaining AICPU scheduling for task ref=%" PRId64 " with unsupported task shape",
             legacy_shape_task_ref
         );
         return true;
     }
+    if (trace_overflow_task_ref >= 0) {
+        LOG_ERROR(
+            "A5 HBG AICore scheduler: task ref=%" PRId64 " exceeds the uint32 trace index capacity",
+            trace_overflow_task_ref
+        );
+        return false;
+    }
 
+    const SchedulerSpmdRequirements spmd{
+        static_cast<uint64_t>(worker_count),
+        static_cast<uint64_t>(worker_count / PLATFORM_CORES_PER_BLOCKDIM),
+        cooperative_task_count,
+        mix_task_count,
+    };
+    const bool protocol_profiling = api->chip_swimlane_level() >= static_cast<uint32_t>(ChipSwimlaneLevel::ORCH_PHASES);
+    std::vector<SchedulerProtocolTaskSpec> protocol_tasks;
+    if (protocol_profiling) {
+        try {
+            protocol_tasks = scheduler_protocol_freeze_graph(host_graph, task_metadata);
+        } catch (const std::exception &error) {
+            LOG_ERROR("A5 HBG: failed to freeze protocol graph: %s", error.what());
+            return false;
+        }
+    }
     AicoreSchedulerLayout layout{};
     if (!scheduler_plan_layout(
             static_cast<uint64_t>(total_tasks), aic_task_count, aiv_task_count, &layout,
             runtime->dev.chip_swimlane_level >= static_cast<uint32_t>(ChipSwimlaneLevel::SCHED_PHASES),
-            executable_subtask_count, api->pmu_enabled()
+            executable_subtask_count, spmd, protocol_profiling, api->pmu_enabled()
         ) ||
         layout.total_size > std::numeric_limits<uint64_t>::max() - (SCHEDULER_STATE_ALIGNMENT - 1)) {
         LOG_ERROR("A5 HBG AICore scheduler: scheduler state layout overflow");
@@ -1346,7 +1461,7 @@ bool create_scheduler_state(
     // The only pass over this run's total_size: it zeroes and fills the whole
     // length, which is what makes a retained block's previous contents
     // unreachable.
-    if (!scheduler_init_data_from_layout(host_base, layout)) {
+    if (!scheduler_init_data_from_layout(host_base, layout, aligned_address)) {
         LOG_ERROR("A5 HBG AICore scheduler: failed to initialize scheduler state");
         return false;
     }
@@ -1358,6 +1473,10 @@ bool create_scheduler_state(
     }
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(host_base, layout.task_metadata_offset);
     std::copy(task_metadata.begin(), task_metadata.end(), metadata);
+    if (!scheduler_init_spmd_task_records(host_base, layout, api->run_epoch())) {
+        LOG_ERROR("A5 HBG AICore scheduler: invalid cooperative task metadata or run epoch");
+        return false;
+    }
 
     const uint64_t device_sm_address = reinterpret_cast<uint64_t>(runtime->get_gm_sm_ptr());
     auto *run_control = scheduler_state_at<SchedulerRunControl>(host_base, layout.run_control_offset);
@@ -1378,9 +1497,6 @@ bool create_scheduler_state(
     run_control->error_task_ref = UINT64_MAX;
     run_control->error_core_id = UINT64_MAX;
     run_control->error_core_type = UINT64_MAX;
-    auto *graph_summary = scheduler_state_at<SchedulerGraphSummary>(host_base, layout.graph_summary_offset);
-    graph_summary->mix_task_count = mix_task_count;
-
     auto *contexts = scheduler_state_at<SchedulerWorkerContext>(host_base, layout.worker_contexts_offset);
     int32_t aic_rank = 0;
     int32_t aiv_rank = 0;
@@ -1420,17 +1536,6 @@ bool create_scheduler_state(
         context.task_window_last_index = task_window_size - 1;
         context.graph_task_count = static_cast<uint64_t>(total_tasks);
         context.worker_index = static_cast<uint64_t>(i);
-        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-            const uint64_t offset = context.dispatch_payload_offset + slot * sizeof(DispatchPayload);
-            auto *payload = scheduler_state_at<DispatchPayload>(host_base, offset);
-            const uint64_t device_payload = aligned_address + offset;
-            payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, local_context);
-            payload->args[PAYLOAD_GLOBAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, global_context);
-            payload->local_context.block_idx = 0;
-            payload->local_context.block_num = 1;
-            payload->local_context.async_ctx.task_token = TaskId::invalid();
-            payload->src_payload = 0;
-        }
     }
 
     runtime->publish_scheduler_bootstrap(
@@ -1440,7 +1545,8 @@ bool create_scheduler_state(
     {
         std::scoped_lock lock(scheduler_state_owners_mutex);
         scheduler_state_owners.emplace(
-            runtime, SchedulerStateOwner{reinterpret_cast<void *>(aligned_address), layout, api}
+            runtime,
+            SchedulerStateOwner{reinterpret_cast<void *>(aligned_address), layout, api, std::move(protocol_tasks)}
         );
     }
     runtime->add_pending_metadata(

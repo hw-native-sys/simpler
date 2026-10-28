@@ -28,6 +28,12 @@ void submit_zero_block_task() {
     rt_submit_aiv_task(FUNC_NOOP_AIV0, args);
 }
 
+void submit_wide_block_task(int64_t blocks) {
+    CoreTaskArgs args;
+    args.launch_spec.set_block_num(blocks);
+    rt_submit_aiv_task(FUNC_NOOP_AIV0, args);
+}
+
 void submit_overflowing_mix_task() {
     MixedKernels kernels;
     kernels.aic_kernel_id = FUNC_NOOP_AIC;
@@ -133,6 +139,24 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         return;
     case 7:
         read_alloc_tensors_output();
+        return;
+    case 8:
+        submit_wide_block_task(INT64_C(65537));
+        return;
+    case 9:
+        submit_wide_block_task(INT64_C(-65535));
+        return;
+    case 10:
+        submit_wide_block_task(INT64_C(131073));
+        return;
+    case 11:
+        submit_wide_block_task(INT64_C(32768));
+        return;
+    case 12:
+        submit_wide_block_task(std::numeric_limits<int64_t>::min());
+        return;
+    case 13:
+        submit_wide_block_task(std::numeric_limits<int64_t>::max());
         return;
     default:
         rt_report_fatal(

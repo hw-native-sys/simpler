@@ -7,34 +7,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A multi-block task keeps the whole graph on the legacy AICPU scheduler.
+"""Ordinary and sync_start pure AIC N=2 both require fresh resident selection."""
 
-`scheduler_resident_v0_task_shape_supported` admits a task only with
-`logical_block_num == 1`, so one `set_block_num(2)` task sends the entire graph
-to the legacy scheduler with `LEGACY_UNSUPPORTED_SHAPE`. Work that keeps SPMD on
-the legacy path depends on that, and the scheduler_mode marker is what proves it
-still happens rather than inferring it from a correct result -- legacy and
-resident both compute the same answer.
-
-This duplicates `single_root::TestHbgSingleAicSpmdLegacyFallback` on purpose.
-That class inherits from `TestHbgSingleAicRoot` and overrides only the
-orchestration, and when the parent class runs first the subclass binds the
-parent's single-block graph instead of its own: it reports resident, so it
-guards nothing in a full-suite run while still passing. This class inherits from
-nothing, so no sibling can substitute its graph. See KNOWN_ISSUES.md for the
-underlying defect; when that is fixed, the two are redundant and this one can go.
-"""
-
-import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 
 
-@pytest.mark.scheduler_mode("legacy")
 @scene_test(level=2, runtime="host_build_graph")
-class TestSpmdLegacyFallback(SceneTestCase):
+class TestSpmdShapeSelection(SceneTestCase):
     RTOL = 0
     ATOL = 0
 
@@ -58,15 +40,38 @@ class TestSpmdLegacyFallback(SceneTestCase):
         {
             "name": "aic_root_block_num_2",
             "platforms": ["a5sim", "a5"],
-            "params": {},
+            "params": {"require_sync_start": False},
+        },
+        {
+            "name": "aic_root_sync_start_block_num_2",
+            "platforms": ["a5sim", "a5"],
+            "params": {"require_sync_start": True},
         },
     ]
 
     def generate_args(self, params):
-        return TaskArgsBuilder(TensorArg("out", torch.zeros(16, dtype=torch.float32)))
+        return TaskArgsBuilder(
+            TensorArg("out", torch.zeros(16, dtype=torch.float32)),
+            Scalar("require_sync_start", int(params["require_sync_start"])),
+        )
 
     def compute_golden(self, args, params):
         args.out[0] = 42.0
+
+    def _run_and_validate(self, worker, *args, **kwargs):
+        assert not kwargs.get("skip_golden", False), "shape selection requires output and fresh-mode validation"
+        self._selection_worker = worker
+        self._selection_publish_count = worker.scheduler_mode_publish_count
+        super()._run_and_validate(worker, *args, **kwargs)
+
+    def compare_outputs(self, test_args, golden_args, output_names, params):
+        count = self._selection_worker.scheduler_mode_publish_count
+        assert count > self._selection_publish_count, "no fresh scheduler selection for this invocation"
+        mode = self._selection_worker.scheduler_runtime_mode
+        expected_modes = (1, 2)
+        assert mode in expected_modes, f"expected scheduler mode {expected_modes}, invocation mode={mode}"
+        self._selection_publish_count = count
+        super().compare_outputs(test_args, golden_args, output_names, params)
 
 
 if __name__ == "__main__":

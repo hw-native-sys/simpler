@@ -7,16 +7,16 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""A dispatch predicate on a Mix task is refused by the a5 HBG resident scheduler.
+"""Predicated Mix and multi-block tasks are refused by the a5 HBG resident scheduler.
 
 `create_scheduler_state()` requires a predicated task to carry exactly one
 active subtask and one logical block:
 
     slot.task_attrs.has_predicate() && (active_subtasks != 1 || logical_block_num != 1)
 
-A Mix task has two or three active subtasks, so pairing it with a predicate is
-refused while the graph is still being prepared, and the run fails. A single
-active subtask with a predicate is accepted and is covered by
+A Mix task has two or three active subtasks; a pure multi-block task has more
+than one logical block. Both are refused while the graph is prepared, regardless
+of the predicate value. One active subtask with one logical block is accepted and covered by
 `tests/st/a5/host_build_graph/predicated_dispatch/`.
 
 This test pins that boundary. It is a contract test, not an aspiration: the
@@ -32,6 +32,7 @@ session-scoped worker pool, whose other users would inherit a poisoned worker.
 
 import functools
 import os
+import re
 
 import pytest
 import torch
@@ -60,9 +61,10 @@ GATE_SOURCE = os.path.join(HERE, "..", "predicated_dispatch", "kernels", "aic", 
 
 ELEMS = 16
 
-# 0b011 / 0b101 / 0b110 / 0b111 — every single-lane Mix shape. 0b110 is the one
+# 0b011 / 0b101 / 0b110 / 0b111 — every Mix shape. 0b110 is the one
 # where the AIC holds no subtask of its own.
 MIX_MASKS = (3, 5, 6, 7)
+REFUSED_SHAPES = [(mask, 1) for mask in MIX_MASKS] + [(mask, 2) for mask in (1, 2, 4, *MIX_MASKS)]
 
 
 @functools.cache
@@ -104,10 +106,10 @@ def _build_callable(platform: str) -> ChipCallable:
 @pytest.mark.platforms(["a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-@pytest.mark.parametrize("mask", MIX_MASKS)
+@pytest.mark.parametrize("mask,blocks", REFUSED_SHAPES)
 @pytest.mark.parametrize("gate", (0, 1))
-def test_predicated_mix_task_is_refused(st_platform, st_device_ids, mask, gate, capfd, drain_host_log):
-    """Every Mix shape is refused, and the gate value does not change that.
+def test_predicated_cooperative_task_is_refused(st_platform, st_device_ids, mask, blocks, gate, capfd, drain_host_log):
+    """Mix and pure multi-block shapes are refused for either gate value.
 
     The refusal happens while the graph is prepared, before the predicate could
     be evaluated, so it cannot depend on whether the predicate would have held.
@@ -134,14 +136,18 @@ def test_predicated_mix_task_is_refused(st_platform, st_device_ids, mask, gate, 
             args.add_tensor(buffer.tensor(shapes=(ELEMS,), dtype=dtype), TensorArgType.INOUT)
         args.add_scalar(gate)
         args.add_scalar(mask)
+        args.add_scalar(blocks)
 
         config = CallConfig()
         config.aicpu_thread_num = 2
-        with pytest.raises(RuntimeError, match=r"failed with code -1000\b"):
+        with pytest.raises(RuntimeError, match=r"prepare_native_run failed with code -1000\b"):
             worker.run(handle, args, config)
 
         log = drain_host_log(capfd)
-        assert "uses predicate/early-resolve" in log, log
+        assert re.search(
+            r"A5 HBG AICore scheduler: task ref=\d+ has inconsistent shape/state or uses predicate/early-resolve",
+            log,
+        ), log
     finally:
         for buffer, _ in buffers:
             worker.free(buffer)

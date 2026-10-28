@@ -467,7 +467,7 @@ TEST(SchedulerClusterCompletion, PropagatesTraceToCompletionAndWokenTask) {
     EXPECT_EQ(producer->completion_resolve_start_cycles, 0u);
     EXPECT_EQ(producer->completion_resolve_end_cycles, 0u);
     EXPECT_EQ(producer->scheduler_worker_id, scheduler.worker_index);
-    EXPECT_EQ(traces[1].ready_transition_cycles, 0u);
+    EXPECT_EQ(traces[1].ready_transition_cycles, 1u);
     EXPECT_EQ(traces[0].valid, 1u);
     EXPECT_EQ(traces[0].kernel_start_cycles, 100u);
     EXPECT_EQ(traces[0].kernel_end_cycles, 200u);

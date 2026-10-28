@@ -704,7 +704,9 @@ class KernelCompiler:
         out-of-line template instantiations into the single output ``.text``.
 
         The linked image is position-independent: ``--image-base`` does not
-        change the emitted ``.text`` bytes.
+        change the emitted ``.text`` bytes. A separate allocated ``.rodata``
+        still lies outside the text-only payload; the extractor rejects such
+        images, including linked jump tables with no remaining relocations.
         """
         assert self.ccec is not None, "incore linking is only available for hardware platforms"
         linked_path = self._make_temp_path(

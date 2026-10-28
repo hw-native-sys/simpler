@@ -215,6 +215,17 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
         LOG_ERROR("A5 HBG AICore scheduler: incomplete cluster topology AIC=%d AIV=%d", aic_count, aiv_count);
         return -1;
     }
+    auto *graph_summary =
+        scheduler_state_at<SchedulerGraphSummary>(scheduler_state_base, bootstrap_context->graph_summary_offset);
+    if (graph_summary->worker_count != static_cast<uint64_t>(core_count_) ||
+        graph_summary->cluster_count != static_cast<uint64_t>(aic_count)) {
+        LOG_ERROR(
+            "A5 HBG AICore scheduler: planned topology differs from discovery (workers=%" PRIu64 " clusters=%" PRIu64
+            ", discovered workers=%d AIC=%d AIV=%d)",
+            graph_summary->worker_count, graph_summary->cluster_count, core_count_, aic_count, aiv_count
+        );
+        return -1;
+    }
     int32_t cluster_workers[SCHEDULER_CLUSTER_CAPACITY][PLATFORM_CORES_PER_BLOCKDIM];
     for (auto &cluster : cluster_workers)
         for (int32_t &worker : cluster)
@@ -343,17 +354,30 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
             if (run_control->scheduler_error != 0) {
                 // Error details are published before the error marker.
                 rmb();
+                log_aicore_scheduler_error_identity(run_control, "bootstrap");
                 LOG_ERROR(
                     "A5 HBG AICore scheduler: bootstrap failed at task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64
-                    " type=%" PRIu64 " site=%" PRIu64,
+                    " type=%" PRIu64 " site=%" PRIu64 " workers=%" PRIu64 " schedulers=%" PRIu64
+                    " scan_arrived=%" PRIu64 " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64
+                    " bootstrap_complete=%" PRIu64,
                     run_control->error_task_ref, run_control->scheduler_error, run_control->error_core_id,
-                    run_control->error_core_type, run_control->error_site
+                    run_control->error_core_type, run_control->error_site, run_control->active_worker_count,
+                    run_control->scheduler_count, run_control->bootstrap_scan_arrived_count,
+                    run_control->bootstrap_scan_complete, run_control->bootstrap_arrived_count,
+                    run_control->bootstrap_complete
                 );
                 return -1;
             }
         }
         if (scheduler_watchdog_expired(watchdog_start, get_sys_cnt_aicpu(), timeout_cycles)) {
-            LOG_ERROR("%s", "A5 HBG AICore Scheduler bootstrap timeout");
+            LOG_ERROR(
+                "A5 HBG AICore Scheduler bootstrap timeout: workers=%" PRIu64 " schedulers=%" PRIu64
+                " scan_arrived=%" PRIu64 " scan_complete=%" PRIu64 " dispatch_arrived=%" PRIu64
+                " bootstrap_complete=%" PRIu64,
+                run_control->active_worker_count, run_control->scheduler_count,
+                run_control->bootstrap_scan_arrived_count, run_control->bootstrap_scan_complete,
+                run_control->bootstrap_arrived_count, run_control->bootstrap_complete
+            );
             record_lifecycle_timeout(runtime, SchedulerErrorSite::BOOTSTRAP_COMPLETE_TIMEOUT);
             return -1;
         }
@@ -458,10 +482,10 @@ int32_t AicoreLifecycle::finish_shutdown_partition(int32_t thread_idx, Runtime *
  * identity and the kernel that ran.
  *
  * The coverage this run owes is taken from the graph rather than from the
- * cells: every active subtask of every executable task. A cell that is absent
- * or stamped with another task is therefore a *missing publication*, not a
- * subtask that did not run, and the caller settles nothing on that outcome.
- * Returns whether every owed cell was found.
+ * cells: every active subtask of every block of every executable task. A cell
+ * that is absent or stamped with another task is therefore a *missing
+ * publication*, not a subtask that did not run, and the caller settles nothing
+ * on that outcome. Returns whether every owed cell was found.
  */
 bool AicoreLifecycle::collect_run_pmu_records(Runtime *runtime, uint64_t *missing_out) {
     if (missing_out != nullptr) *missing_out = 0;
@@ -479,24 +503,26 @@ bool AicoreLifecycle::collect_run_pmu_records(Runtime *runtime, uint64_t *missin
     for (uint64_t task_id = 0; task_id < task_count; ++task_id) {
         if (!scheduler_task_is_executable(metadata[task_id].flags)) continue;
         const LaneMask active_mask = metadata[task_id].active_mask;
-        for (uint8_t subtask = 0; subtask < SUBTASK_SLOT_COUNT; ++subtask) {
-            if (!active_mask.has(static_cast<SubtaskSlot>(subtask))) continue;
-            SchedulerTaskPmuCell &cell = cells[scheduler_task_trace_index(
-                metadata[task_id].trace_index_base, active_mask, static_cast<SubtaskSlot>(subtask)
-            )];
-            if (cell.published != static_cast<uint32_t>(task_id) + 1U || cell.worker_id >= PLATFORM_MAX_CORES) {
-                ++missing;
-                continue;
+        for (uint32_t block = 0; block < metadata[task_id].logical_block_num; ++block) {
+            for (uint8_t subtask = 0; subtask < SUBTASK_SLOT_COUNT; ++subtask) {
+                if (!active_mask.has(static_cast<SubtaskSlot>(subtask))) continue;
+                SchedulerTaskPmuCell &cell = cells[scheduler_task_trace_index(
+                    metadata[task_id].trace_index_base, active_mask, static_cast<SubtaskSlot>(subtask), block
+                )];
+                if (cell.published != static_cast<uint32_t>(task_id) + 1U || cell.worker_id >= PLATFORM_MAX_CORES) {
+                    ++missing;
+                    continue;
+                }
+                pmu_aicpu_record_staged_task(
+                    static_cast<int>(cell.worker_id), kDiagnosticDumpLane,
+                    reinterpret_cast<TaskDescriptor *>(
+                        context->graph_storage_address + task_id * SCHEDULER_GRAPH_TASK_STORAGE_STRIDE
+                    )
+                        ->task_id,
+                    static_cast<uint32_t>(metadata[task_id].kernel_ids[subtask]), subtask_core_type(subtask),
+                    cell.total_cycles, cell.counters
+                );
             }
-            pmu_aicpu_record_staged_task(
-                static_cast<int>(cell.worker_id), kDiagnosticDumpLane,
-                reinterpret_cast<TaskDescriptor *>(
-                    context->graph_storage_address + task_id * SCHEDULER_GRAPH_TASK_STORAGE_STRIDE
-                )
-                    ->task_id,
-                static_cast<uint32_t>(metadata[task_id].kernel_ids[subtask]), subtask_core_type(subtask),
-                cell.total_cycles, cell.counters
-            );
         }
     }
     if (missing_out != nullptr) *missing_out = missing;

@@ -13,6 +13,8 @@
 
 #include <cstdint>
 
+#include "scheduler_protocol_types.h"
+
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_PENDING = 1;
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_READY = 2;
 // A zeroed Handshake is not a scheduler choice. Every supported fallback is
@@ -20,6 +22,13 @@ constexpr uint32_t SCHEDULER_RUNTIME_MODE_RESIDENT_READY = 2;
 // legacy dependency scheduler while continuing to pass result-only tests.
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH = 3;
 constexpr uint32_t SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE = 4;
+
+struct SchedulerSpmdRequirements {
+    uint64_t worker_count{0};
+    uint64_t cluster_count{0};
+    uint64_t cooperative_task_count{0};
+    uint64_t mix_task_count{0};
+};
 
 struct AicoreSchedulerLayout {
     uint64_t total_size;
@@ -44,4 +53,15 @@ struct AicoreSchedulerLayout {
     uint64_t executable_subtask_count;
     uint64_t aic_worker_demand;
     uint64_t aiv_worker_demand;
+    SchedulerSpmdRequirements spmd;
+    uint64_t admission_control_offset;
+    uint64_t admission_records_offset;
+    uint64_t admission_record_stride;
+    uint64_t admission_member_word_count;
+    uint64_t admission_log_offset;
+    uint64_t group_mailboxes_offset;
+    uint64_t mix_close_seals_offset;
+    uint64_t mix_close_seal_count;
+    uint64_t protocol_layout_offset;
+    SchedulerProtocolLayout protocol;
 };

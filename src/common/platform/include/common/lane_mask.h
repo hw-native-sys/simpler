@@ -92,6 +92,7 @@ public:
         return false;
     }
     SIMPLER_LANE_AICORE constexpr bool is_empty() const { return bits_ == 0; }
+    SIMPLER_LANE_AICORE constexpr bool is_aic() const { return bits_ == kAic; }
     SIMPLER_LANE_AICORE constexpr bool is_full() const { return bits_ == kAll; }
     SIMPLER_LANE_AICORE constexpr bool is_mix() const { return count() >= 2; }
     SIMPLER_LANE_AICORE constexpr bool is_valid() const { return (bits_ & ~kAll) == 0; }
@@ -120,6 +121,12 @@ public:
 
     SIMPLER_LANE_AICORE constexpr bool operator==(LaneMask other) const { return bits_ == other.bits_; }
     SIMPLER_LANE_AICORE constexpr bool operator!=(LaneMask other) const { return bits_ != other.bits_; }
+
+    // The byte wire structs already store and a reader memcpy's back, so this
+    // is what a serialized lane set is. Scheduling decisions take the queries
+    // above instead; this exists for carrying the value across a boundary that
+    // cannot hold the type.
+    SIMPLER_LANE_AICORE constexpr uint8_t raw() const { return bits_; }
 
 private:
     static constexpr int kBitWidth = SUBTASK_SLOT_COUNT;

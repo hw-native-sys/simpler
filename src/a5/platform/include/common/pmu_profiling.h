@@ -58,7 +58,6 @@ enum class PmuEventType : uint32_t {
 };
 
 constexpr uint32_t PMU_EVENT_TYPE_DEFAULT = static_cast<uint32_t>(PmuEventType::PIPE_UTILIZATION);
-constexpr int PMU_COUNTER_COUNT_A5 = 10;
 
 /**
  * What this core's control register read back right after its counting window

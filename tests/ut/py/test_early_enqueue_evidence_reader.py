@@ -27,8 +27,11 @@ copy of the rule would pass while the rule itself regressed. Nothing here touche
 cursor is planted, so the reader is driven over records that no run produced.
 """
 
+import ast
 import importlib.util
+import inspect
 import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -45,21 +48,30 @@ _SUCCESSOR = (2, 1)
 _PAIR = (_PREDECESSOR, _SUCCESSOR)
 
 
-@pytest.fixture(params=sorted(_SUITES), ids=sorted(_SUITES))
-def suite(request, monkeypatch):
+def _load_suite(name, relative_path, monkeypatch):
     """One early-enqueue scene module, loaded by path.
 
     By path rather than by import, so this does not depend on the scene tree being an importable
     package, and under a private module name so the ``SceneTestCase`` classes it defines are not
     reachable for collection from this lane.
     """
-    path = Path(__file__).resolve().parents[2] / _SUITES[request.param]
-    spec = importlib.util.spec_from_file_location(f"_evidence_reader_{request.param}", path)
+    path = Path(__file__).resolve().parents[2] / relative_path
+    spec = importlib.util.spec_from_file_location(f"_evidence_reader_{name}", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     return module
+
+
+@pytest.fixture(params=sorted(_SUITES), ids=sorted(_SUITES))
+def suite(request, monkeypatch):
+    return _load_suite(request.param, _SUITES[request.param], monkeypatch)
+
+
+@pytest.fixture
+def hbg_suite(monkeypatch):
+    return _load_suite("a5_hbg", "st/a5/host_build_graph/early_enqueue/test_early_enqueue.py", monkeypatch)
 
 
 def _planted_trace(suite, pids, identities, boundaries):
@@ -199,3 +211,68 @@ def test_another_endpoints_record_is_not_this_endpoints_evidence(suite):
     )
     assert detail[mine, _PAIR] == {"predecessor": None, "successor": None}
     assert suite._boundary_detail(trace, {_PAIR}, mine) == {(mine, _PAIR): {"predecessor": None, "successor": None}}
+
+
+def _three_run_wait_predicate(suite, trace, case_runs):
+    """Use the scene's actual wait condition, not a separately reimplemented oracle."""
+    method = suite.TestA5ThreeRunCapacity.test_three_runs_are_launched_and_accepted_at_once
+    tree = ast.parse(textwrap.dedent(inspect.getsource(method)))
+    waits = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_await_records"
+    ]
+    assert len(waits) == 1 and isinstance(waits[0].args[3], ast.Lambda)
+    expression = ast.Expression(waits[0].args[3])
+    return eval(
+        compile(expression, inspect.getfile(method), "eval"), {**vars(suite), "trace": trace, "case_runs": case_runs}
+    )
+
+
+@pytest.mark.parametrize("last_start", [500, 400, 350], ids=["ordered", "within_tick", "overlapping"])
+def test_hbg_three_run_wait_drains_a_late_boundary_without_hiding_overlap(hbg_suite, monkeypatch, last_start):
+    pid, third = 4242, (3, 2)
+    runs = _planted_case_runs(hbg_suite, [_PREDECESSOR, _SUCCESSOR, third])
+    trace = _planted_trace(
+        hbg_suite,
+        [pid],
+        {(pid, 1): _PREDECESSOR, (pid, 2): _SUCCESSOR, (pid, 3): third},
+        {(pid, 1): _planted_boundary(0, 100, 200), (pid, 2): _planted_boundary(0, 300, 400)},
+    )
+    joins = [_planted_join(pid, _PREDECESSOR, _SUCCESSOR), _planted_join(pid, _SUCCESSOR, third)]
+    reads = []
+
+    def take():
+        reads.append(None)
+        if len(reads) == 1:
+            return joins
+        trace.boundary_of_invocation[pid, 3] = _planted_boundary(0, last_start, 600)
+        return []
+
+    monkeypatch.setattr(trace, "take", take)
+    records = []
+    assert hbg_suite._await_records(trace, records, 1.0, _three_run_wait_predicate(hbg_suite, trace, runs))
+    assert len(reads) == 2, "the join rows arrived before the last boundary; the real wait must keep draining"
+    ordered, overlapping, within_tick, unmeasured = hbg_suite._whole_operator_order(trace, records, runs)
+    assert not unmeasured
+    assert _PAIR in ordered
+    last_pair = (_SUCCESSOR, third)
+    assert (last_pair in overlapping) == (last_start < 400)
+    assert (last_pair in within_tick) == (last_start == 400)
+    assert (last_pair in ordered) == (last_start > 400)
+
+
+def test_hbg_three_run_wait_does_not_accept_a_permanently_missing_boundary(hbg_suite, monkeypatch):
+    pid, third = 4242, (3, 2)
+    runs = _planted_case_runs(hbg_suite, [_PREDECESSOR, _SUCCESSOR, third])
+    trace = _planted_trace(
+        hbg_suite,
+        [pid],
+        {(pid, 1): _PREDECESSOR, (pid, 2): _SUCCESSOR, (pid, 3): third},
+        {(pid, 1): _planted_boundary(0, 100, 200), (pid, 2): _planted_boundary(0, 300, 400)},
+    )
+    joins = [_planted_join(pid, _PREDECESSOR, _SUCCESSOR), _planted_join(pid, _SUCCESSOR, third)]
+    monkeypatch.setattr(trace, "take", lambda: joins)
+    records = []
+    assert not hbg_suite._await_records(trace, records, 0, _three_run_wait_predicate(hbg_suite, trace, runs))
+    assert hbg_suite._whole_operator_order(trace, records, runs)[3] == {(_SUCCESSOR, third)}

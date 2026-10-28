@@ -28,6 +28,7 @@ never stalls on it. Chain:
          Y = 999.0. Proves the dispatch path is taken when the predicate holds.
 """
 
+import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
 
@@ -38,6 +39,7 @@ POISON = 999.0  # what the clobber writes if the predicate lets it dispatch
 INIT_VAL = -1.0
 
 
+@pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestPredicatedDispatchA5(SceneTestCase):
     """predicated_dispatch: scheduler evaluates the dispatch predicate at dispatch time."""
@@ -85,8 +87,7 @@ class TestPredicatedDispatchA5(SceneTestCase):
         ],
     }
 
-    # One scheduler owns every core, so both cases isolate predicate evaluation
-    # and task retirement from cross-scheduler routing.
+    # Two AICPU threads satisfy the public launch contract; each AICore schedules itself.
     CASES = [
         {
             "name": "PredicateFalseSkips",
@@ -120,6 +121,22 @@ class TestPredicatedDispatchA5(SceneTestCase):
         x_final = SENTINEL if gate_value == 0 else POISON
         args.x[0] = x_final
         args.y[0] = x_final
+
+    def _run_and_validate(self, worker, *args, **kwargs):
+        assert not kwargs.get("skip_golden", False), (
+            "predicate acceptance requires outputs and fresh resident provenance"
+        )
+        self._selection_worker = worker
+        self._selection_publish_count = worker.scheduler_mode_publish_count
+        super()._run_and_validate(worker, *args, **kwargs)
+
+    def compare_outputs(self, test_args, golden_args, output_names, params):
+        count = self._selection_worker.scheduler_mode_publish_count
+        assert count > self._selection_publish_count, "no fresh scheduler selection for this invocation"
+        mode = self._selection_worker.scheduler_runtime_mode
+        assert mode in (1, 2), f"predicate acceptance requires resident scheduling, invocation mode={mode}"
+        self._selection_publish_count = count
+        super().compare_outputs(test_args, golden_args, output_names, params)
 
 
 if __name__ == "__main__":

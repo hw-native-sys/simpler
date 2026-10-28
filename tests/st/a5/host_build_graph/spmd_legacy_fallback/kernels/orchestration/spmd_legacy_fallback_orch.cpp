@@ -15,13 +15,14 @@ extern "C" {
 
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &args) {
     (void)args;
-    return OrchestrationConfig{.expected_arg_count = 1};
+    return OrchestrationConfig{.expected_arg_count = 2};
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
     CoreTaskArgs root;
     root.add_inout(args.tensor(0).ref());
     root.launch_spec.set_block_num(2);
+    root.launch_spec.set_require_sync_start(args.scalar<int64_t>(0) != 0);
     rt_submit_aic_task(0, root);
 }
 

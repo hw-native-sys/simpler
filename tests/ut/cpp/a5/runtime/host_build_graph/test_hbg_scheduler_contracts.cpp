@@ -71,11 +71,142 @@ TEST(AicoreSchedulerState, DistinguishesResidentAndExplicitLegacyModes) {
     EXPECT_TRUE(aicore_scheduler_runtime_mode_is_explicit_legacy(SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE));
 }
 
-TEST(AicoreSchedulerState, ResidentAcceptsSingleBlockOrdinaryMix) {
-    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(1, 1, false));
-    EXPECT_TRUE(scheduler_resident_v0_task_shape_supported(2, 1, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 2, false));
-    EXPECT_FALSE(scheduler_resident_v0_task_shape_supported(1, 1, true));
+TEST(AicoreSchedulerState, ResidentAcceptsOrdinaryPureAndMixMultiBlock) {
+    for (uint32_t active : {1U, 2U, 3U}) {
+        SCOPED_TRACE(active);
+        const uint32_t max_blocks = static_cast<uint32_t>(INT16_MAX) / active;
+        for (uint32_t blocks : {1U, 2U, 3U, 31U, 32U, 33U, 64U, 65U, 97U, 512U, max_blocks}) {
+            SCOPED_TRACE(blocks);
+            uint32_t subtasks = 0;
+            ASSERT_TRUE(scheduler_subtask_count_checked(blocks, active, &subtasks));
+            EXPECT_EQ(subtasks, blocks * active);
+            EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, ResidentShapeRejectsSubtaskProductOverflowAndInvalidDimensions) {
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(0, 1, false));
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(4, 1, false));
+    EXPECT_FALSE(scheduler_resident_task_shape_supported(UINT32_MAX, 1, false));
+    for (uint32_t active : {1U, 2U, 3U}) {
+        SCOPED_TRACE(active);
+        const uint32_t max_blocks = static_cast<uint32_t>(INT16_MAX) / active;
+        for (uint32_t blocks : {0U, max_blocks + 1, static_cast<uint32_t>(INT16_MAX) + 1, UINT32_MAX}) {
+            SCOPED_TRACE(blocks);
+            EXPECT_FALSE(scheduler_resident_task_shape_supported(active, blocks, false));
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, ResidentSyncStartShapeRequiresMultipleBlocksAndSeparateCapacityCheck) {
+    for (uint32_t active : {1U, 2U, 3U}) {
+        for (uint32_t blocks : {2U, 32U, 33U, 65U, 512U}) {
+            SCOPED_TRACE(active);
+            SCOPED_TRACE(blocks);
+            EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, true));
+        }
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, 1, true));
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, 0, true));
+        EXPECT_FALSE(scheduler_resident_task_shape_supported(active, UINT32_MAX, true));
+    }
+}
+
+TEST(AicoreSchedulerState, SyncDemandCountsDistinctCoresOrCompleteResourceClusters) {
+    for (uint64_t workers : {3U, 6U, 9U, 96U, 108U}) {
+        for (LaneMask mask :
+             {LaneMask::aic(), LaneMask::aiv0(), LaneMask::aiv1(),
+              LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false),
+              LaneMask(/*aic=*/true, /*aiv0=*/false, /*aiv1=*/true), LaneMask::both_aiv(), LaneMask::all()}) {
+            SCOPED_TRACE(workers);
+            SCOPED_TRACE(mask.count());
+            const uint32_t positions =
+                static_cast<uint32_t>(workers / 3) * (mask.to_shape() == ResourceShape::AIV ? 2 : 1);
+            for (uint32_t blocks : {1U, 2U, positions, positions + 1, 512U, UINT32_MAX}) {
+                SCOPED_TRACE(blocks);
+                SchedulerMinimumWorkerDemand demand{};
+                const bool valid = blocks > 1 && blocks <= positions;
+                EXPECT_EQ(scheduler_resident_worker_demand_checked(mask, blocks, true, workers, &demand), valid);
+                if (valid) {
+                    const bool mix = mask.is_mix();
+                    const bool aic_only = mask == LaneMask::aic();
+                    EXPECT_EQ(demand.aic, (mix || aic_only) ? blocks : 0u);
+                    EXPECT_EQ(demand.aiv, mix ? blocks * 2 : (aic_only ? 0 : blocks));
+                }
+            }
+            SchedulerMinimumWorkerDemand ordinary{};
+            ASSERT_TRUE(scheduler_resident_worker_demand_checked(mask, 512, false, workers, &ordinary));
+            const auto expected = scheduler_minimum_worker_demand(mask);
+            EXPECT_EQ(ordinary.aic, expected.aic);
+            EXPECT_EQ(ordinary.aiv, expected.aiv);
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, ResidentDemandRejectsInvalidTopologyMaskAndOutput) {
+    SchedulerMinimumWorkerDemand demand{};
+    for (uint64_t workers : {UINT64_C(0), UINT64_C(1), UINT64_C(5), UINT64_C(109), UINT64_C(111), UINT64_MAX})
+        EXPECT_FALSE(scheduler_resident_worker_demand_checked(LaneMask::aic(), 2, true, workers, &demand));
+    // An empty lane set is the only mask the demand check can still be asked
+    // about and must refuse: a byte with bits outside the three lanes is not a
+    // LaneMask any caller can construct.
+    EXPECT_FALSE(scheduler_resident_worker_demand_checked(LaneMask::none(), 2, true, 96, &demand));
+    EXPECT_FALSE(scheduler_resident_worker_demand_checked(LaneMask::aic(), 2, true, 96, nullptr));
+}
+
+TEST(AicoreSchedulerState, OrdinaryMixMasksCanExecuteMoreBlocksThanPhysicalClusters) {
+    for (LaneMask mask :
+         {LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false), LaneMask(/*aic=*/true, /*aiv0=*/false, /*aiv1=*/true),
+          LaneMask::both_aiv(), LaneMask::all()}) {
+        SCOPED_TRACE(mask.count());
+        const uint32_t active = static_cast<uint32_t>(mask.count());
+        for (uint32_t blocks : {SCHEDULER_CLUSTER_CAPACITY + 1, 512U}) {
+            SCOPED_TRACE(blocks);
+            EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
+            const auto demand = scheduler_minimum_worker_demand(mask);
+            EXPECT_EQ(demand.aic, 1u);
+            EXPECT_EQ(demand.aiv, mask.has_both_aiv() ? 2u : 1u);
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, OrdinaryPureAndMixShapeValidationIsSubmissionOrderIndependent) {
+    for (uint32_t mix_subtasks : {2U, 3U}) {
+        for (uint32_t mix_blocks : {1U, 2U, 33U, 512U}) {
+            for (bool mix_first : {false, true}) {
+                SCOPED_TRACE(mix_subtasks);
+                SCOPED_TRACE(mix_blocks);
+                SCOPED_TRACE(mix_first);
+                for (uint32_t index = 0; index < 2; ++index) {
+                    const bool mix = (index == 0) == mix_first;
+                    const uint32_t active = mix ? mix_subtasks : 1U;
+                    const uint32_t blocks = mix ? mix_blocks : 512U;
+                    EXPECT_TRUE(scheduler_resident_task_shape_supported(active, blocks, false));
+                }
+            }
+        }
+    }
+}
+
+TEST(AicoreSchedulerState, OrdinaryDemandCountsOneExecutionPositionOrMixGroup) {
+    struct DemandCase {
+        LaneMask mask;
+        uint32_t aic;
+        uint32_t aiv;
+    };
+    for (const DemandCase &test : {
+             DemandCase{LaneMask::aic(), 1, 0},
+             DemandCase{LaneMask::aiv0(), 0, 1},
+             DemandCase{LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false), 1, 1},
+             DemandCase{LaneMask(/*aic=*/true, /*aiv0=*/false, /*aiv1=*/true), 1, 1},
+             DemandCase{LaneMask::both_aiv(), 1, 2},
+             DemandCase{LaneMask::all(), 1, 2},
+         }) {
+        SCOPED_TRACE(test.mask.count());
+        const auto demand = scheduler_minimum_worker_demand(test.mask);
+        EXPECT_EQ(demand.aic, test.aic);
+        EXPECT_EQ(demand.aiv, test.aiv);
+    }
 }
 
 TEST(AicoreSchedulerWatchdog, UsesElapsedWallClockBudget) {
@@ -409,7 +540,7 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 128u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 512u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 1024u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
     // Both chain links belong to the atomic line: they are written as single

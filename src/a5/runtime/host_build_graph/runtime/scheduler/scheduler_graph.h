@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #include "common/core_type.h"
+#include "common/platform_config.h"
 #include "dispatch_payload.h"
 
 #ifndef __gm__
@@ -58,8 +59,41 @@ enum class SchedulerGraphResult : uint64_t {
 };
 
 inline constexpr bool
-scheduler_resident_v0_task_shape_supported(uint32_t active_subtasks, uint32_t logical_block_num, bool sync_start) {
-    return active_subtasks >= 1 && active_subtasks <= 3 && logical_block_num == 1 && !sync_start;
+scheduler_resident_task_shape_supported(uint32_t active_subtasks, uint32_t logical_block_num, bool sync_start) {
+    return active_subtasks >= 1 && active_subtasks <= 3 && logical_block_num >= 1 &&
+           logical_block_num <= static_cast<uint32_t>(INT16_MAX) / active_subtasks &&
+           (!sync_start || logical_block_num > 1);
+}
+
+struct SchedulerMinimumWorkerDemand {
+    uint32_t aic;
+    uint32_t aiv;
+};
+
+inline constexpr SchedulerMinimumWorkerDemand scheduler_minimum_worker_demand(LaneMask active_mask) {
+    const uint32_t vectors = (active_mask.has_aiv0() ? 1U : 0U) + (active_mask.has_aiv1() ? 1U : 0U);
+    // Ordinary blocks can execute in waves. A dual-AIV Mix still needs an AIC coordinator.
+    return {(active_mask.has_aic() || vectors > 1) ? 1U : 0U, vectors};
+}
+
+inline constexpr bool scheduler_resident_worker_demand_checked(
+    LaneMask active_mask, uint32_t blocks, bool sync_start, uint64_t workers, SchedulerMinimumWorkerDemand *demand
+) {
+    if (demand == nullptr || active_mask.is_empty() || !active_mask.is_valid() || workers == 0 ||
+        workers > PLATFORM_MAX_CORES || workers % PLATFORM_CORES_PER_BLOCKDIM != 0 ||
+        !scheduler_resident_task_shape_supported(static_cast<uint32_t>(active_mask.count()), blocks, sync_start))
+        return false;
+    auto required = scheduler_minimum_worker_demand(active_mask);
+    if (sync_start) {
+        const bool mix = active_mask.is_mix();
+        const bool aic_only = active_mask.is_aic();
+        required.aic = (mix || aic_only) ? blocks : 0;
+        required.aiv = mix ? blocks * PLATFORM_AIV_CORES_PER_BLOCKDIM : (aic_only ? 0 : blocks);
+    }
+    const uint64_t clusters = workers / PLATFORM_CORES_PER_BLOCKDIM;
+    if (required.aic > clusters || required.aiv > clusters * PLATFORM_AIV_CORES_PER_BLOCKDIM) return false;
+    *demand = required;
+    return true;
 }
 
 struct SchedulerGraphView {

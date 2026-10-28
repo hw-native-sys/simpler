@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <thread>
@@ -148,6 +149,214 @@ TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
         );
     }
 }
+
+struct ReadyPublicationTraceCase {
+    LaneMask active_mask;
+    uint16_t blocks;
+    uint64_t level;
+    bool inline_task;
+};
+
+std::vector<ReadyPublicationTraceCase> ready_publication_trace_cases() {
+    std::vector<ReadyPublicationTraceCase> cases;
+    for (uint64_t level : {UINT64_C(1), UINT64_C(3), UINT64_C(4)}) {
+        for (LaneMask mask :
+             {LaneMask::aic(), LaneMask::aiv0(), LaneMask(/*aic=*/true, /*aiv0=*/true, /*aiv1=*/false),
+              LaneMask(/*aic=*/true, /*aiv0=*/false, /*aiv1=*/true), LaneMask::both_aiv(), LaneMask::all()}) {
+            for (uint16_t blocks : {1, 2, 512})
+                cases.push_back({mask, blocks, level, false});
+        }
+        cases.push_back({LaneMask::aiv0(), 1, level, true});
+    }
+    return cases;
+}
+
+class SchedulerReadyPublicationTrace : public ::testing::TestWithParam<ReadyPublicationTraceCase> {
+protected:
+    void SetUp() override {
+        const auto &param = GetParam();
+        const uint32_t traces_per_task = param.blocks * param.active_mask.count();
+        storage = std::make_unique<FixtureStorage>(3, 3, traces_per_task);
+        graph.executable(0, 0);
+        for (uint32_t worker = 0; worker < 3; ++worker) {
+            storage->contexts[worker].scheduler_count = 3;
+            for (uint32_t lane = 0; lane < 3; ++lane)
+                storage->contexts[worker].cluster_worker_ids[lane] = lane;
+        }
+        for (uint32_t task = 1; task < 3; ++task) {
+            auto &metadata = storage->metadata[task];
+            metadata.active_mask = param.active_mask;
+            metadata.logical_block_num = param.blocks;
+            metadata.trace_index_base = task * traces_per_task;
+            metadata.flags = SCHEDULER_TASK_EXECUTABLE;
+            if (param.active_mask.is_mix()) metadata.flags |= SCHEDULER_TASK_MIX;
+            if (param.blocks > 1) metadata.flags |= SCHEDULER_TASK_SPMD;
+            if (param.inline_task) metadata.flags |= SCHEDULER_TASK_INLINE;
+            if (!param.inline_task) graph.mixed(task, param.active_mask);
+            for (uint32_t slot = 0; slot < 3; ++slot)
+                metadata.kernel_ids[slot] =
+                    !param.inline_task && param.active_mask.has(static_cast<SubtaskSlot>(slot)) ? 1 : UINT16_MAX;
+        }
+        queue = scheduler_task_ready_queue(storage->metadata[1].flags, param.active_mask);
+        local = storage->local_context(&storage->contexts[queue == 1 ? 1 : 0]);
+        traces = scheduler_state_at<SchedulerTaskTrace>(base(), storage->layout.trace_cells_offset);
+        trace_snapshot.assign(3 * traces_per_task * sizeof(SchedulerTaskTrace), 0xa5);
+        ASSERT_FALSE(trace_snapshot.empty());
+        ASSERT_LE(storage->layout.trace_cells_offset + trace_snapshot.size(), storage->layout.total_size);
+        std::memcpy(traces, trace_snapshot.data(), trace_snapshot.size());
+    }
+
+    void *base() const { return storage->scheduler_state->base(); }
+
+    void expect_traces_unchanged() const {
+        EXPECT_EQ(std::memcmp(traces, trace_snapshot.data(), trace_snapshot.size()), 0);
+    }
+
+    void append_and_pop(bool bootstrap) {
+        SchedulerReadyBatch batch{};
+        SchedulerReadyStats ready{};
+        for (int64_t task : {1, 2}) {
+            const bool appended =
+                bootstrap ?
+                    scheduler_bootstrap_ready_batch_append(base(), local, task, &batch, &ready, GetParam().level) :
+                    scheduler_ready_batch_append(base(), local, task, &batch, &ready, GetParam().level);
+            ASSERT_TRUE(appended);
+        }
+        EXPECT_EQ(batch.head, 1);
+        EXPECT_EQ(batch.tail, 2);
+        EXPECT_EQ(batch.count, 2u);
+        EXPECT_EQ(ready.enqueue_count, 2u);
+        expect_traces_unchanged();
+
+        const uint64_t target = scheduler_ready_push_target(local, queue, batch.head);
+        ASSERT_TRUE(scheduler_ready_batch_push(base(), local, queue, &batch, &ready));
+        EXPECT_EQ(ready.batch_count, 1u);
+        EXPECT_EQ(batch.count, 0u);
+        for (int64_t expected : {INT64_C(1), INT64_C(2), SCHEDULER_TASK_REF_INVALID}) {
+            int64_t task = SCHEDULER_TASK_REF_INVALID;
+            ASSERT_TRUE(scheduler_ready_pop_from_inbox(
+                graph.graph(), base(), local, storage->run_control, queue, target, &task, &ready
+            ));
+            EXPECT_EQ(task, expected);
+        }
+        EXPECT_EQ(storage->run_control->scheduler_error, 0u);
+        expect_traces_unchanged();
+    }
+
+    std::unique_ptr<FixtureStorage> storage;
+    scheduler_test::BasicGraphBuffer<4> graph{3};
+    SchedulerLocalState *local{nullptr};
+    SchedulerTaskTrace *traces{nullptr};
+    uint32_t queue{0};
+    std::vector<uint8_t> trace_snapshot;
+};
+
+TEST_P(SchedulerReadyPublicationTrace, BootstrapPublishesLogicalTasksWithoutWritingExecutionTraces) {
+    append_and_pop(true);
+}
+
+TEST_P(SchedulerReadyPublicationTrace, AppendPublishesLogicalTasksWithoutWritingExecutionTraces) {
+    append_and_pop(false);
+}
+
+TEST_P(SchedulerReadyPublicationTrace, DirectResolveClaimsLogicalTaskWithoutWritingExecutionTraces) {
+    graph.payload(1).fanin_count = 1;
+    graph.payload(1).fanin_data()[0] = 0;
+    storage->metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    SchedulerWakeStats wake{};
+    SchedulerReadyStats ready{};
+    SchedulerCompletionStats completion{};
+    ASSERT_EQ(
+        scheduler_route_task(graph.graph(), base(), local, storage->run_control, 1, &wake),
+        SchedulerRouteResult::WAITING
+    );
+    auto *producer = scheduler_task_control_at(base(), local, 0);
+    scheduler_gm_store(producer->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    SchedulerReadyClaim direct{};
+    const bool mix = queue == SCHEDULER_MIX_QUEUE;
+    ASSERT_TRUE(scheduler_resolve_completion(
+        graph.graph(), base(), local, storage->run_control, 0, &wake, &ready, &completion, GetParam().level, true,
+        mix ? nullptr : &direct, local->config.self_core_type, mix ? &direct : nullptr
+    ));
+    EXPECT_EQ(direct.task_ref, 1);
+    EXPECT_EQ(direct.source, SchedulerReadySource::DIRECT_RESOLVE);
+    EXPECT_EQ(direct.publication_mode, SchedulerPublicationMode::REFILL);
+    EXPECT_EQ(producer->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
+    EXPECT_EQ(wake.wake_register_count, 1u);
+    EXPECT_EQ(wake.wake_close_count, 1u);
+    EXPECT_EQ(wake.wake_migrate_count, 1u);
+    EXPECT_EQ(completion.resolve_count, 1u);
+    EXPECT_EQ(ready.enqueue_count, 0u);
+    EXPECT_EQ(ready.batch_count, 0u);
+    EXPECT_EQ(storage->run_control->scheduler_error, 0u);
+    for (uint64_t target = 0; target < scheduler_ready_queue_owner_count(local, queue); ++target) {
+        int64_t task = SCHEDULER_TASK_REF_INVALID;
+        ASSERT_TRUE(scheduler_ready_pop_from_inbox(
+            graph.graph(), base(), local, storage->run_control, queue, target, &task, nullptr
+        ));
+        EXPECT_EQ(task, SCHEDULER_TASK_REF_INVALID);
+    }
+    expect_traces_unchanged();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllTaskShapes, SchedulerReadyPublicationTrace, ::testing::ValuesIn(ready_publication_trace_cases())
+);
+
+class SchedulerMixReadyPublicationTrace : public SchedulerReadyPublicationTrace {};
+
+std::vector<ReadyPublicationTraceCase> mix_ready_fallback_trace_cases() {
+    std::vector<ReadyPublicationTraceCase> cases;
+    for (const auto &param : ready_publication_trace_cases()) {
+        if (param.level >= SCHEDULER_PROFILING_SCHED_PHASES_LEVEL && param.active_mask.is_mix()) cases.push_back(param);
+    }
+    return cases;
+}
+
+TEST_P(SchedulerMixReadyPublicationTrace, DirectFallbackQueuesBothTasksWithoutWritingExecutionTraces) {
+    graph.payload(1).fanin_count = 1;
+    graph.payload(1).fanin_data()[0] = 0;
+    storage->metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
+    SchedulerWakeStats wake{};
+    SchedulerReadyStats ready{};
+    SchedulerCompletionStats completion{};
+    ASSERT_EQ(
+        scheduler_route_task(graph.graph(), base(), local, storage->run_control, 1, &wake),
+        SchedulerRouteResult::WAITING
+    );
+    auto *producer = scheduler_task_control_at(base(), local, 0);
+    scheduler_gm_store(producer->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    SchedulerReadyClaim direct{};
+    direct.task_ref = 2;
+    direct.source = SchedulerReadySource::DIRECT_RESOLVE;
+    direct.publication_mode = SchedulerPublicationMode::REFILL;
+    ASSERT_TRUE(scheduler_resolve_completion(
+        graph.graph(), base(), local, storage->run_control, 0, &wake, &ready, &completion, GetParam().level, true,
+        nullptr, local->config.self_core_type, &direct
+    ));
+    EXPECT_EQ(direct.task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(producer->wake_list_head, SCHEDULER_WAKE_LIST_CLOSED);
+    EXPECT_EQ(wake.wake_register_count, 1u);
+    EXPECT_EQ(wake.wake_close_count, 1u);
+    EXPECT_EQ(wake.wake_migrate_count, 1u);
+    EXPECT_EQ(completion.resolve_count, 1u);
+    EXPECT_EQ(ready.enqueue_count, 2u);
+    EXPECT_EQ(ready.batch_count, 1u);
+    EXPECT_EQ(storage->run_control->scheduler_error, 0u);
+    const uint64_t target = scheduler_ready_push_target(local, queue, 2);
+    for (int64_t expected : {INT64_C(2), INT64_C(1), SCHEDULER_TASK_REF_INVALID}) {
+        int64_t task = SCHEDULER_TASK_REF_INVALID;
+        ASSERT_TRUE(scheduler_ready_pop_from_inbox(
+            graph.graph(), base(), local, storage->run_control, queue, target, &task, &ready
+        ));
+        EXPECT_EQ(task, expected);
+    }
+    expect_traces_unchanged();
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllMixShapes, SchedulerMixReadyPublicationTrace, ::testing::ValuesIn(mix_ready_fallback_trace_cases())
+);
 
 TEST(SchedulerBootstrap, RegistersOnlyOnFirstExecutableProducer) {
     FixtureStorage storage(4, 2);
@@ -1133,6 +1342,267 @@ TEST(SchedulerReadyWake, RejectsInvalidWaiterShapeBeforeReadyBatchIndex) {
     ));
     EXPECT_EQ(storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::UNSUPPORTED_SHAPE));
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_INVALID_SHAPE));
+}
+
+struct MixPrefixFixture {
+    explicit MixPrefixFixture(uint32_t successors = 4, uint32_t producer_worker = 0) :
+        count(successors),
+        storage(successors + 3, 9, 3),
+        graph(successors + 3) {
+        graph.executable(0, 0);
+        graph.executable(1, 0);
+        for (uint32_t task = 2; task < count + 3; ++task) {
+            graph.mixed(task, LaneMask::all());
+            graph.executable(task, 0, task < count + 2 ? std::vector<int32_t>{0} : std::vector<int32_t>{});
+            auto &metadata = storage.metadata[task];
+            metadata.active_mask = LaneMask::all();
+            metadata.flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX;
+            if (task < count + 2) metadata.flags |= SCHEDULER_TASK_HAS_FANIN;
+            metadata.trace_index_base = task * 3;
+            metadata.kernel_ids[0] = metadata.kernel_ids[1] = metadata.kernel_ids[2] = 1;
+        }
+        for (uint32_t worker = 0; worker < 9; ++worker) {
+            auto &context = storage.contexts[worker];
+            context.is_scheduler = 1;
+            context.scheduler_count = 9;
+            for (uint32_t lane = 0; lane < 3; ++lane)
+                context.cluster_worker_ids[lane] = worker / 3 * 3 + lane;
+            storage.test_graphs[worker] = graph.graph();
+            locals[worker] = storage.local_context(&context);
+        }
+        producer = locals[producer_worker];
+        controls = scheduler_state_at<SchedulerTaskControl>(base(), storage.layout.task_controls_offset);
+    }
+
+    void *base() { return storage.scheduler_state->base(); }
+    void register_successors() {
+        // Registration prepends, so reverse registration gives the resolver
+        // the deterministic chain 2 -> 3 -> ... -> count + 1.
+        for (uint32_t task = count + 2; task-- > 2;)
+            ASSERT_EQ(
+                scheduler_route_task(graph.graph(), base(), producer, storage.run_control, task, nullptr),
+                SchedulerRouteResult::WAITING
+            );
+        ASSERT_EQ(controls[0].wake_list_head, 2);
+    }
+    bool resolve(uint32_t task = 0, SchedulerReadyClaim *direct_mix = nullptr) {
+        scheduler_gm_store(controls[task].state, static_cast<int64_t>(SchedulerTaskState::DONE));
+        return scheduler_resolve_completion(
+            graph.graph(), base(), producer, storage.run_control, task, &wake, &ready, &completion, 0, true, nullptr,
+            UINT32_MAX, direct_mix
+        );
+    }
+    bool pop(int64_t *task, uint32_t worker = 3) {
+        return scheduler_ready_pop_from_inbox(
+            graph.graph(), base(), locals[worker], storage.run_control, SCHEDULER_MIX_QUEUE, 0, task, nullptr
+        );
+    }
+    uint64_t endpoints() {
+        return scheduler_gm_query(scheduler_ready_inbox_at(base(), producer, SCHEDULER_MIX_QUEUE, 0)->endpoints);
+    }
+
+    uint32_t count;
+    FixtureStorage storage;
+    scheduler_test::BasicGraphBuffer<128> graph;
+    std::array<SchedulerLocalState *, 9> locals{};
+    SchedulerLocalState *producer{};
+    SchedulerTaskControl *controls{};
+    SchedulerWakeStats wake{};
+    SchedulerReadyStats ready{};
+    SchedulerCompletionStats completion{};
+};
+
+TEST(SchedulerReadyWake, MixFanoutPublishesOneBoundedPrefixAndPreservesFifoAndDirectFallback) {
+    for (uint32_t producer_worker : {0u, 1u, 2u}) {
+        for (uint32_t count : {1u, 2u, 3u, 4u}) {
+            for (bool older_queued : {false, true}) {
+                SCOPED_TRACE(producer_worker);
+                SCOPED_TRACE(count);
+                SCOPED_TRACE(older_queued);
+                MixPrefixFixture fixture(count, producer_worker);
+                fixture.register_successors();
+                if (older_queued) {
+                    SchedulerReadyBatch older{};
+                    ASSERT_TRUE(
+                        scheduler_ready_batch_append(fixture.base(), fixture.producer, count + 2, &older, nullptr)
+                    );
+                    ASSERT_TRUE(scheduler_ready_batch_push(
+                        fixture.base(), fixture.producer, SCHEDULER_MIX_QUEUE, &older, nullptr
+                    ));
+                }
+                SchedulerReadyClaim direct{};
+                ASSERT_TRUE(fixture.resolve(0, producer_worker == 0 ? &direct : nullptr));
+                const bool uses_direct = producer_worker == 0 && count == 1 && !older_queued;
+                EXPECT_EQ(fixture.ready.batch_count, uses_direct ? 0u : count >= 3 ? 2u : 1u);
+                EXPECT_EQ(fixture.ready.enqueue_count, uses_direct ? 0u : count);
+                EXPECT_EQ(fixture.wake.wake_migrate_count, count);
+                EXPECT_EQ(fixture.completion.resolve_count, 1u);
+                EXPECT_EQ(direct.task_ref, uses_direct ? 2 : SCHEDULER_TASK_REF_INVALID);
+                int64_t popped = SCHEDULER_TASK_REF_INVALID;
+                if (older_queued) {
+                    ASSERT_TRUE(fixture.pop(&popped));
+                    EXPECT_EQ(popped, count + 2);
+                }
+                for (uint32_t task = uses_direct ? 3 : 2; task < count + 2; ++task) {
+                    ASSERT_TRUE(fixture.pop(&popped));
+                    EXPECT_EQ(popped, task);
+                }
+                ASSERT_TRUE(fixture.pop(&popped));
+                EXPECT_EQ(popped, SCHEDULER_TASK_REF_INVALID);
+                EXPECT_EQ(fixture.storage.run_control->scheduler_error, 0u);
+            }
+        }
+    }
+}
+
+TEST(SchedulerReadyWake, InvalidSuffixLeavesOnlyTheAlreadyPublishedMixPrefixReachable) {
+    for (uint32_t corruption : {0u, 1u, 2u}) {
+        SCOPED_TRACE(corruption);
+        MixPrefixFixture fixture;
+        fixture.register_successors();
+        if (corruption == 1) fixture.controls[3].next_waiter = fixture.graph.graph().task_count;
+        else if (corruption == 2) {
+            fixture.graph.executable(4, 0, {0, 4});
+            ASSERT_EQ(fixture.graph.payload(4).fanin_count, 2);
+        } else {
+            fixture.storage.metadata[4].active_mask = LaneMask::none();
+            fixture.storage.metadata[4].flags &= ~SCHEDULER_TASK_MIX;
+        }
+        SchedulerReadyClaim direct{};
+        EXPECT_FALSE(fixture.resolve(0, &direct));
+        EXPECT_EQ(fixture.ready.batch_count, 1u);
+        EXPECT_EQ(fixture.ready.enqueue_count, 2u);
+        EXPECT_EQ(fixture.completion.resolve_count, 0u);
+        EXPECT_EQ(direct.task_ref, SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(scheduler_ready_endpoints_head(fixture.endpoints()), 2);
+        EXPECT_EQ(scheduler_ready_endpoints_tail(fixture.endpoints()), 3);
+        EXPECT_EQ(scheduler_gm_load(fixture.controls[2].next_waiter), 3);
+        EXPECT_EQ(scheduler_gm_load(fixture.controls[3].next_waiter), SCHEDULER_INBOX_EMPTY);
+        EXPECT_EQ(scheduler_gm_load(fixture.controls[4].next_waiter), 5);
+        EXPECT_EQ(scheduler_gm_load(fixture.controls[5].next_waiter), SCHEDULER_WAKE_LIST_OPEN);
+        EXPECT_EQ(
+            fixture.storage.run_control->error_site,
+            static_cast<uint64_t>(
+                corruption == 1 ? SchedulerErrorSite::COMPLETION_INVALID_WAITER :
+                corruption == 2 ? SchedulerErrorSite::UNKNOWN :
+                                  SchedulerErrorSite::COMPLETION_INVALID_SHAPE
+            )
+        );
+        if (corruption == 2)
+            EXPECT_EQ(
+                fixture.storage.run_control->scheduler_error,
+                static_cast<uint64_t>(SchedulerGraphResult::INVALID_FANIN_ID)
+            );
+        // Inspect terminal state only: no consumer or kernel runs after the error.
+    }
+}
+
+TEST(SchedulerReadyWake, ErrorsBeforeTheMixPrefixThresholdPublishNothing) {
+    for (uint32_t bad_position : {0u, 1u}) {
+        for (uint32_t corruption : {0u, 1u, 2u}) {
+            SCOPED_TRACE(bad_position);
+            SCOPED_TRACE(corruption);
+            MixPrefixFixture fixture;
+            fixture.register_successors();
+            if (corruption == 1) {
+                if (bad_position == 0) fixture.controls[0].wake_list_head = fixture.graph.graph().task_count;
+                else fixture.controls[2].next_waiter = fixture.graph.graph().task_count;
+            } else if (corruption == 2) {
+                const uint32_t task = 2 + bad_position;
+                fixture.graph.executable(task, 0, {0, static_cast<int32_t>(task)});
+                ASSERT_EQ(fixture.graph.payload(task).fanin_count, 2);
+            } else {
+                fixture.storage.metadata[2 + bad_position].active_mask = LaneMask::none();
+                fixture.storage.metadata[2 + bad_position].flags &= ~SCHEDULER_TASK_MIX;
+            }
+            SchedulerReadyClaim direct{};
+            EXPECT_FALSE(fixture.resolve(0, &direct));
+            EXPECT_EQ(fixture.ready.batch_count, 0u);
+            EXPECT_TRUE(scheduler_ready_endpoints_empty(fixture.endpoints()));
+            EXPECT_EQ(fixture.completion.resolve_count, 0u);
+            EXPECT_NE(fixture.storage.run_control->scheduler_error, 0u);
+            if (corruption == 2)
+                EXPECT_EQ(
+                    fixture.storage.run_control->scheduler_error,
+                    static_cast<uint64_t>(SchedulerGraphResult::INVALID_FANIN_ID)
+                );
+        }
+    }
+}
+
+TEST(SchedulerReadyWake, MixPrefixMigrationKeepsTheRemainingWakeChainAndPublishesEachReadyTaskOnce) {
+    for (uint32_t migrating : {2u, 3u, 4u, 5u}) {
+        SCOPED_TRACE(migrating);
+        MixPrefixFixture fixture;
+        fixture.graph.executable(migrating, 0, {0, 1});
+        fixture.register_successors();
+        SchedulerReadyClaim direct{};
+        ASSERT_TRUE(fixture.resolve(0, &direct));
+        EXPECT_EQ(fixture.ready.batch_count, 2u);
+        EXPECT_EQ(direct.task_ref, SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(fixture.controls[1].wake_list_head, migrating);
+        EXPECT_EQ(fixture.controls[migrating].waiting_producer, 1);
+        EXPECT_EQ(fixture.controls[migrating].next_fanin_index, 1);
+        int64_t popped = SCHEDULER_TASK_REF_INVALID;
+        for (uint32_t task = 2; task < 6; ++task) {
+            if (task == migrating) continue;
+            ASSERT_TRUE(fixture.pop(&popped));
+            EXPECT_EQ(popped, task);
+        }
+        ASSERT_TRUE(fixture.pop(&popped));
+        EXPECT_EQ(popped, SCHEDULER_TASK_REF_INVALID);
+        ASSERT_TRUE(fixture.resolve(1));
+        EXPECT_EQ(fixture.ready.batch_count, 3u);
+        ASSERT_TRUE(fixture.pop(&popped));
+        EXPECT_EQ(popped, migrating);
+        ASSERT_TRUE(fixture.pop(&popped));
+        EXPECT_EQ(popped, SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(fixture.storage.run_control->scheduler_error, 0u);
+    }
+}
+
+TEST(SchedulerReadyWake, ConcurrentConsumersReceiveEveryEarlyMixPrefixAndSuffixTaskExactlyOnce) {
+    constexpr uint32_t count = 64;
+    MixPrefixFixture fixture(count, 1);
+    fixture.register_successors();
+    std::array<std::atomic<uint32_t>, count> seen{};
+    std::atomic<bool> resolved{false};
+    std::atomic<bool> failed{false};
+    std::atomic<uint32_t> started{0};
+    std::vector<std::thread> consumers;
+    for (uint32_t worker : {0u, 3u, 6u}) {
+        consumers.emplace_back([&, worker] {
+            started.fetch_add(1, std::memory_order_release);
+            for (uint32_t spin = 0; spin < 10000000; ++spin) {
+                const bool producer_done = resolved.load(std::memory_order_acquire);
+                int64_t task = SCHEDULER_TASK_REF_INVALID;
+                if (!fixture.pop(&task, worker)) {
+                    failed.store(true, std::memory_order_release);
+                    return;
+                }
+                if (task >= 0) {
+                    if (task < 2 || task >= count + 2) failed.store(true, std::memory_order_release);
+                    else seen[task - 2].fetch_add(1, std::memory_order_relaxed);
+                } else if (producer_done) {
+                    return;
+                }
+                std::this_thread::yield();
+            }
+            failed.store(true, std::memory_order_release);
+        });
+    }
+    while (started.load(std::memory_order_acquire) != 3)
+        std::this_thread::yield();
+    if (!fixture.resolve()) failed.store(true, std::memory_order_release);
+    resolved.store(true, std::memory_order_release);
+    for (auto &consumer : consumers)
+        consumer.join();
+    EXPECT_FALSE(failed.load());
+    EXPECT_EQ(fixture.ready.batch_count, 2u);
+    for (const auto &occurrences : seen)
+        EXPECT_EQ(occurrences.load(), 1u);
+    EXPECT_TRUE(scheduler_ready_endpoints_empty(fixture.endpoints()));
+    EXPECT_EQ(fixture.storage.run_control->scheduler_error, 0u);
 }
 
 }  // namespace

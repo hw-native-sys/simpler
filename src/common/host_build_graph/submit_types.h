@@ -168,7 +168,7 @@ public:
     constexpr LaunchSpec() = default;
 
     int16_t block_num() const { return block_num_; }
-    void set_block_num(int16_t n) { block_num_ = n; }
+    void set_block_num(int64_t n) { block_num_ = n >= INT16_MIN && n <= INT16_MAX ? static_cast<int16_t>(n) : 0; }
 
     bool require_sync_start() const { return require_sync_start_; }
     void set_require_sync_start(bool v) { require_sync_start_ = v; }
