@@ -1,0 +1,227 @@
+{
+  "schema": "csa-mix-prefix-summary-v1",
+  "date": "2026-10-28",
+  "decision": "保留Mix前缀早发；地址隔离候选已撤回，不把跨布局差值归因prefix",
+  "artifact_root": "reports/csa_poursoul_20261027.Osnaam",
+  "sample_storage": "完整样本在各归档result.json中，不重复嵌入",
+  "comparison_layout": "128B close-seal / hbg-native-protocol-v6，仅为该已归档布局上的独立对照",
+  "current_layout": "8B close-seal / hbg-native-protocol-v5",
+  "order": "A/B/A/B",
+  "summary": {
+    "baseline": {
+      "n": 200,
+      "min": 2201.251,
+      "median": 2246.699,
+      "p90": 2281.8466,
+      "p99": 2318.95991,
+      "max": 2328.549
+    },
+    "candidate": {
+      "n": 200,
+      "min": 2183.017,
+      "median": 2227.8845,
+      "p90": 2273.1454,
+      "p99": 2340.79786,
+      "max": 2433.576
+    },
+    "reduction_us": 18.814499999999953,
+    "reduction_percent": 0.8374286008050011
+  },
+  "batches": [
+    {
+      "label": "idle-close128-after-a",
+      "arm": "baseline",
+      "result_sha256": "a209406d3211c62c9c31a541a788f59d659b3680622b676ff548f5109b5d3da3",
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "ded082f20fc88f2e4fc093f7e106c1c50c32666e",
+        "simpler_branch": "feat/fully_distributed_within_core",
+        "tracked_diff_sha256": "3597ad9ccf97d4c6b463a49d71690b3c95b0c401f5de85fd6611536f38ce7063",
+        "runtime_sha256": {
+          "libhost_runtime.so": "9ad77b0efd2a5f27cb29de4870ef9ff6a112d337a63efc93194db2f9a3ba5401",
+          "libaicpu_kernel.so": "7d576b0d0dafa51573050097c3d01110404e20098cda358c4b7f4599af36c006",
+          "aicore_kernel.o": "6d1f5fcf92c485fadf741bfbbc568351ab730ccb58737e0ab45575b989c3b204"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 3,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "device_us": {
+        "min": 2216.009,
+        "median": 2248.357,
+        "mean": 2252.72491,
+        "max": 2328.549
+      },
+      "host_us": {
+        "min": 78011.817,
+        "median": 78495.74650000001,
+        "mean": 79285.63814,
+        "max": 93994.778
+      },
+      "samples": 100,
+      "warmup": 5
+    },
+    {
+      "label": "idle-mixprefix-after-a",
+      "arm": "candidate",
+      "result_sha256": "f9a16099d05833d16d7385a5ee1a1eb21a97ea8b0b9cdbc23b378a0202edf7d6",
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "ded082f20fc88f2e4fc093f7e106c1c50c32666e",
+        "simpler_branch": "feat/fully_distributed_within_core",
+        "tracked_diff_sha256": "9fb016d9eda317d818dc646475573e2aea4dcfdec277be070d3f37cd6281e87a",
+        "runtime_sha256": {
+          "libhost_runtime.so": "9ad77b0efd2a5f27cb29de4870ef9ff6a112d337a63efc93194db2f9a3ba5401",
+          "libaicpu_kernel.so": "7d576b0d0dafa51573050097c3d01110404e20098cda358c4b7f4599af36c006",
+          "aicore_kernel.o": "bddf48462d9b5ac0f209012fbea543f1294ea5452f5176d7a369d8ba0a235875"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 3,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "device_us": {
+        "min": 2183.017,
+        "median": 2224.5775,
+        "mean": 2238.1032,
+        "max": 2433.576
+      },
+      "host_us": {
+        "min": 77897.783,
+        "median": 78313.56700000001,
+        "mean": 78542.3083,
+        "max": 84459.417
+      },
+      "samples": 100,
+      "warmup": 5
+    },
+    {
+      "label": "idle-mixprefix-before-a",
+      "arm": "baseline",
+      "result_sha256": "0d6944faf41a8f30838faac0c30a43142319295fff42dd44e8b867e46dd31d86",
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "ded082f20fc88f2e4fc093f7e106c1c50c32666e",
+        "simpler_branch": "feat/fully_distributed_within_core",
+        "tracked_diff_sha256": "3597ad9ccf97d4c6b463a49d71690b3c95b0c401f5de85fd6611536f38ce7063",
+        "runtime_sha256": {
+          "libhost_runtime.so": "9ad77b0efd2a5f27cb29de4870ef9ff6a112d337a63efc93194db2f9a3ba5401",
+          "libaicpu_kernel.so": "7d576b0d0dafa51573050097c3d01110404e20098cda358c4b7f4599af36c006",
+          "aicore_kernel.o": "6d1f5fcf92c485fadf741bfbbc568351ab730ccb58737e0ab45575b989c3b204"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 3,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "device_us": {
+        "min": 2201.251,
+        "median": 2245.7985,
+        "mean": 2248.70433,
+        "max": 2323.406
+      },
+      "host_us": {
+        "min": 77830.757,
+        "median": 87607.476,
+        "mean": 98256.24468,
+        "max": 470093.886
+      },
+      "samples": 100,
+      "warmup": 5
+    },
+    {
+      "label": "idle-mixprefix-after-b",
+      "arm": "candidate",
+      "result_sha256": "29a73d54b4176e18ed72e3ae59abf05eb3bf155ace6a959fd6b02c25308979f9",
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "ded082f20fc88f2e4fc093f7e106c1c50c32666e",
+        "simpler_branch": "feat/fully_distributed_within_core",
+        "tracked_diff_sha256": "9fb016d9eda317d818dc646475573e2aea4dcfdec277be070d3f37cd6281e87a",
+        "runtime_sha256": {
+          "libhost_runtime.so": "9ad77b0efd2a5f27cb29de4870ef9ff6a112d337a63efc93194db2f9a3ba5401",
+          "libaicpu_kernel.so": "7d576b0d0dafa51573050097c3d01110404e20098cda358c4b7f4599af36c006",
+          "aicore_kernel.o": "bddf48462d9b5ac0f209012fbea543f1294ea5452f5176d7a369d8ba0a235875"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 3,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "device_us": {
+        "min": 2196.749,
+        "median": 2229.934,
+        "mean": 2233.92969,
+        "max": 2296.551
+      },
+      "host_us": {
+        "min": 77995.649,
+        "median": 78318.338,
+        "mean": 78869.91713,
+        "max": 90827.14
+      },
+      "samples": 100,
+      "warmup": 5
+    }
+  ],
+  "checks": {
+    "matching_linked_kernel_count": 54,
+    "no_cli_overlap_observed": true,
+    "cpp_new_tests": 6,
+    "cpp_prefix_red_failed": 4,
+    "cpp_prefix_red_passed": 1,
+    "cpp_candidate_targets": 5,
+    "cpp_repeat_rounds": 50,
+    "strict_current_v5_l4_artifact": "artifacts/idle-prefix8-before-retire-l4",
+    "current_v5_benchmark_artifact": "artifacts/idle-prefix8-before-retire-a",
+    "current_v5_device_us_median": 2250.447,
+    "v6_l4_before": "artifacts/idle-close128-after-l4",
+    "v6_l4_after": "artifacts/idle-mixprefix-after-l4",
+    "l4_execution_identities": 2308,
+    "l4_events": 46733
+  },
+  "limits": [
+    "0.84%是同一128B/v6布局上测得的效果量，不宣称恢复8B后精确保持同一百分比",
+    "新8B/v5版本另行通过严格CSA捕获和完整Device测试",
+    "单次L4表明首投影早于Resolve结束启动，仍不替代无插桩测量",
+    "错误发现前合法前缀可能已执行；发现错误后原准入/entry门禁必须拒绝新工作",
+    "仍未达到完整Device低于1500us目标"
+  ]
+}

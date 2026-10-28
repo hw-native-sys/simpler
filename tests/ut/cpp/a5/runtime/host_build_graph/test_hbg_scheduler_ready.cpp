@@ -1343,4 +1343,265 @@ TEST(SchedulerReadyWake, RejectsInvalidWaiterShapeBeforeReadyBatchIndex) {
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::COMPLETION_INVALID_SHAPE));
 }
 
+struct MixPrefixFixture {
+    explicit MixPrefixFixture(uint32_t successors = 4, uint32_t producer_worker = 0) :
+        count(successors),
+        storage(successors + 3, 9, 3),
+        graph(successors + 3) {
+        graph.executable(0, 0);
+        graph.executable(1, 0);
+        for (uint32_t task = 2; task < count + 3; ++task) {
+            graph.mixed(task, 7);
+            graph.executable(task, 0, task < count + 2 ? std::vector<int32_t>{0} : std::vector<int32_t>{});
+            auto &metadata = storage.metadata[task];
+            metadata.active_mask = 7;
+            metadata.flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX;
+            if (task < count + 2) metadata.flags |= SCHEDULER_TASK_HAS_FANIN;
+            metadata.trace_index_base = task * 3;
+            metadata.kernel_ids[0] = metadata.kernel_ids[1] = metadata.kernel_ids[2] = 1;
+        }
+        for (uint32_t worker = 0; worker < 9; ++worker) {
+            auto &context = storage.contexts[worker];
+            context.is_scheduler = 1;
+            context.scheduler_count = 9;
+            for (uint32_t lane = 0; lane < 3; ++lane)
+                context.cluster_worker_ids[lane] = worker / 3 * 3 + lane;
+            storage.test_graphs[worker] = graph.graph();
+            locals[worker] = storage.local_context(&context);
+        }
+        producer = locals[producer_worker];
+        controls = scheduler_state_at<SchedulerTaskControl>(base(), storage.layout.task_controls_offset);
+    }
+
+    void *base() { return storage.scheduler_state->base(); }
+    void register_successors() {
+        // Registration prepends, so reverse registration gives the resolver
+        // the deterministic chain 2 -> 3 -> ... -> count + 1.
+        for (uint32_t task = count + 2; task-- > 2;)
+            ASSERT_EQ(
+                scheduler_route_task(graph.graph(), base(), producer, storage.run_control, task, nullptr),
+                SchedulerRouteResult::WAITING
+            );
+        ASSERT_EQ(controls[0].wake_list_head, 2);
+    }
+    bool resolve(uint32_t task = 0, SchedulerReadyClaim *direct_mix = nullptr) {
+        scheduler_gm_store(controls[task].state, static_cast<int64_t>(SchedulerTaskState::DONE));
+        return scheduler_resolve_completion(
+            graph.graph(), base(), producer, storage.run_control, task, &wake, &ready, &completion, 0, true, nullptr,
+            UINT32_MAX, direct_mix
+        );
+    }
+    bool pop(int64_t *task, uint32_t worker = 3) {
+        return scheduler_ready_pop_from_inbox(
+            graph.graph(), base(), locals[worker], storage.run_control, SCHEDULER_MIX_QUEUE, 0, task, nullptr
+        );
+    }
+    uint64_t endpoints() {
+        return scheduler_gm_query(scheduler_ready_inbox_at(base(), producer, SCHEDULER_MIX_QUEUE, 0)->endpoints);
+    }
+
+    uint32_t count;
+    FixtureStorage storage;
+    scheduler_test::BasicGraphBuffer<128> graph;
+    std::array<SchedulerLocalState *, 9> locals{};
+    SchedulerLocalState *producer{};
+    SchedulerTaskControl *controls{};
+    SchedulerWakeStats wake{};
+    SchedulerReadyStats ready{};
+    SchedulerCompletionStats completion{};
+};
+
+TEST(SchedulerReadyWake, MixFanoutPublishesOneBoundedPrefixAndPreservesFifoAndDirectFallback) {
+    for (uint32_t producer_worker : {0u, 1u, 2u}) {
+        for (uint32_t count : {1u, 2u, 3u, 4u}) {
+            for (bool older_queued : {false, true}) {
+                SCOPED_TRACE(producer_worker);
+                SCOPED_TRACE(count);
+                SCOPED_TRACE(older_queued);
+                MixPrefixFixture fixture(count, producer_worker);
+                fixture.register_successors();
+                if (older_queued) {
+                    SchedulerReadyBatch older{};
+                    ASSERT_TRUE(
+                        scheduler_ready_batch_append(fixture.base(), fixture.producer, count + 2, &older, nullptr)
+                    );
+                    ASSERT_TRUE(scheduler_ready_batch_push(
+                        fixture.base(), fixture.producer, SCHEDULER_MIX_QUEUE, &older, nullptr
+                    ));
+                }
+                SchedulerReadyClaim direct{};
+                ASSERT_TRUE(fixture.resolve(0, producer_worker == 0 ? &direct : nullptr));
+                const bool uses_direct = producer_worker == 0 && count == 1 && !older_queued;
+                EXPECT_EQ(fixture.ready.batch_count, uses_direct ? 0u : count >= 3 ? 2u : 1u);
+                EXPECT_EQ(fixture.ready.enqueue_count, uses_direct ? 0u : count);
+                EXPECT_EQ(fixture.wake.wake_migrate_count, count);
+                EXPECT_EQ(fixture.completion.resolve_count, 1u);
+                EXPECT_EQ(direct.task_ref, uses_direct ? 2 : SCHEDULER_TASK_REF_INVALID);
+                int64_t popped = SCHEDULER_TASK_REF_INVALID;
+                if (older_queued) {
+                    ASSERT_TRUE(fixture.pop(&popped));
+                    EXPECT_EQ(popped, count + 2);
+                }
+                for (uint32_t task = uses_direct ? 3 : 2; task < count + 2; ++task) {
+                    ASSERT_TRUE(fixture.pop(&popped));
+                    EXPECT_EQ(popped, task);
+                }
+                ASSERT_TRUE(fixture.pop(&popped));
+                EXPECT_EQ(popped, SCHEDULER_TASK_REF_INVALID);
+                EXPECT_EQ(fixture.storage.run_control->scheduler_error, 0u);
+            }
+        }
+    }
+}
+
+TEST(SchedulerReadyWake, InvalidSuffixLeavesOnlyTheAlreadyPublishedMixPrefixReachable) {
+    for (uint32_t corruption : {0u, 1u, 2u}) {
+        SCOPED_TRACE(corruption);
+        MixPrefixFixture fixture;
+        fixture.register_successors();
+        if (corruption == 1) fixture.controls[3].next_waiter = fixture.graph.graph().task_count;
+        else if (corruption == 2) {
+            fixture.graph.executable(4, 0, {0, 4});
+            ASSERT_EQ(fixture.graph.payload(4).fanin_count, 2);
+        } else {
+            fixture.storage.metadata[4].active_mask = 0;
+            fixture.storage.metadata[4].flags &= ~SCHEDULER_TASK_MIX;
+        }
+        SchedulerReadyClaim direct{};
+        EXPECT_FALSE(fixture.resolve(0, &direct));
+        EXPECT_EQ(fixture.ready.batch_count, 1u);
+        EXPECT_EQ(fixture.ready.enqueue_count, 2u);
+        EXPECT_EQ(fixture.completion.resolve_count, 0u);
+        EXPECT_EQ(direct.task_ref, SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(scheduler_ready_endpoints_head(fixture.endpoints()), 2);
+        EXPECT_EQ(scheduler_ready_endpoints_tail(fixture.endpoints()), 3);
+        EXPECT_EQ(scheduler_gm_load(fixture.controls[2].next_waiter), 3);
+        EXPECT_EQ(scheduler_gm_load(fixture.controls[3].next_waiter), SCHEDULER_INBOX_EMPTY);
+        EXPECT_EQ(scheduler_gm_load(fixture.controls[4].next_waiter), 5);
+        EXPECT_EQ(scheduler_gm_load(fixture.controls[5].next_waiter), SCHEDULER_WAKE_LIST_OPEN);
+        EXPECT_EQ(
+            fixture.storage.run_control->error_site,
+            static_cast<uint64_t>(
+                corruption == 1 ? SchedulerErrorSite::COMPLETION_INVALID_WAITER :
+                corruption == 2 ? SchedulerErrorSite::UNKNOWN :
+                                  SchedulerErrorSite::COMPLETION_INVALID_SHAPE
+            )
+        );
+        if (corruption == 2)
+            EXPECT_EQ(
+                fixture.storage.run_control->scheduler_error,
+                static_cast<uint64_t>(SchedulerGraphResult::INVALID_FANIN_ID)
+            );
+        // Inspect terminal state only: no consumer or kernel runs after the error.
+    }
+}
+
+TEST(SchedulerReadyWake, ErrorsBeforeTheMixPrefixThresholdPublishNothing) {
+    for (uint32_t bad_position : {0u, 1u}) {
+        for (uint32_t corruption : {0u, 1u, 2u}) {
+            SCOPED_TRACE(bad_position);
+            SCOPED_TRACE(corruption);
+            MixPrefixFixture fixture;
+            fixture.register_successors();
+            if (corruption == 1) {
+                if (bad_position == 0) fixture.controls[0].wake_list_head = fixture.graph.graph().task_count;
+                else fixture.controls[2].next_waiter = fixture.graph.graph().task_count;
+            } else if (corruption == 2) {
+                const uint32_t task = 2 + bad_position;
+                fixture.graph.executable(task, 0, {0, static_cast<int32_t>(task)});
+                ASSERT_EQ(fixture.graph.payload(task).fanin_count, 2);
+            } else {
+                fixture.storage.metadata[2 + bad_position].active_mask = 0;
+                fixture.storage.metadata[2 + bad_position].flags &= ~SCHEDULER_TASK_MIX;
+            }
+            SchedulerReadyClaim direct{};
+            EXPECT_FALSE(fixture.resolve(0, &direct));
+            EXPECT_EQ(fixture.ready.batch_count, 0u);
+            EXPECT_TRUE(scheduler_ready_endpoints_empty(fixture.endpoints()));
+            EXPECT_EQ(fixture.completion.resolve_count, 0u);
+            EXPECT_NE(fixture.storage.run_control->scheduler_error, 0u);
+            if (corruption == 2)
+                EXPECT_EQ(
+                    fixture.storage.run_control->scheduler_error,
+                    static_cast<uint64_t>(SchedulerGraphResult::INVALID_FANIN_ID)
+                );
+        }
+    }
+}
+
+TEST(SchedulerReadyWake, MixPrefixMigrationKeepsTheRemainingWakeChainAndPublishesEachReadyTaskOnce) {
+    for (uint32_t migrating : {2u, 3u, 4u, 5u}) {
+        SCOPED_TRACE(migrating);
+        MixPrefixFixture fixture;
+        fixture.graph.executable(migrating, 0, {0, 1});
+        fixture.register_successors();
+        SchedulerReadyClaim direct{};
+        ASSERT_TRUE(fixture.resolve(0, &direct));
+        EXPECT_EQ(fixture.ready.batch_count, 2u);
+        EXPECT_EQ(direct.task_ref, SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(fixture.controls[1].wake_list_head, migrating);
+        EXPECT_EQ(fixture.controls[migrating].waiting_producer, 1);
+        EXPECT_EQ(fixture.controls[migrating].next_fanin_index, 1);
+        int64_t popped = SCHEDULER_TASK_REF_INVALID;
+        for (uint32_t task = 2; task < 6; ++task) {
+            if (task == migrating) continue;
+            ASSERT_TRUE(fixture.pop(&popped));
+            EXPECT_EQ(popped, task);
+        }
+        ASSERT_TRUE(fixture.pop(&popped));
+        EXPECT_EQ(popped, SCHEDULER_TASK_REF_INVALID);
+        ASSERT_TRUE(fixture.resolve(1));
+        EXPECT_EQ(fixture.ready.batch_count, 3u);
+        ASSERT_TRUE(fixture.pop(&popped));
+        EXPECT_EQ(popped, migrating);
+        ASSERT_TRUE(fixture.pop(&popped));
+        EXPECT_EQ(popped, SCHEDULER_TASK_REF_INVALID);
+        EXPECT_EQ(fixture.storage.run_control->scheduler_error, 0u);
+    }
+}
+
+TEST(SchedulerReadyWake, ConcurrentConsumersReceiveEveryEarlyMixPrefixAndSuffixTaskExactlyOnce) {
+    constexpr uint32_t count = 64;
+    MixPrefixFixture fixture(count, 1);
+    fixture.register_successors();
+    std::array<std::atomic<uint32_t>, count> seen{};
+    std::atomic<bool> resolved{false};
+    std::atomic<bool> failed{false};
+    std::atomic<uint32_t> started{0};
+    std::vector<std::thread> consumers;
+    for (uint32_t worker : {0u, 3u, 6u}) {
+        consumers.emplace_back([&, worker] {
+            started.fetch_add(1, std::memory_order_release);
+            for (uint32_t spin = 0; spin < 10000000; ++spin) {
+                const bool producer_done = resolved.load(std::memory_order_acquire);
+                int64_t task = SCHEDULER_TASK_REF_INVALID;
+                if (!fixture.pop(&task, worker)) {
+                    failed.store(true, std::memory_order_release);
+                    return;
+                }
+                if (task >= 0) {
+                    if (task < 2 || task >= count + 2) failed.store(true, std::memory_order_release);
+                    else seen[task - 2].fetch_add(1, std::memory_order_relaxed);
+                } else if (producer_done) {
+                    return;
+                }
+                std::this_thread::yield();
+            }
+            failed.store(true, std::memory_order_release);
+        });
+    }
+    while (started.load(std::memory_order_acquire) != 3)
+        std::this_thread::yield();
+    if (!fixture.resolve()) failed.store(true, std::memory_order_release);
+    resolved.store(true, std::memory_order_release);
+    for (auto &consumer : consumers)
+        consumer.join();
+    EXPECT_FALSE(failed.load());
+    EXPECT_EQ(fixture.ready.batch_count, 2u);
+    for (const auto &occurrences : seen)
+        EXPECT_EQ(occurrences.load(), 1u);
+    EXPECT_TRUE(scheduler_ready_endpoints_empty(fixture.endpoints()));
+    EXPECT_EQ(fixture.storage.run_control->scheduler_error, 0u);
+}
+
 }  // namespace

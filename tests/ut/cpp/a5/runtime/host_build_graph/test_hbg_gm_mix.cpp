@@ -740,6 +740,89 @@ TEST(HbgGmMix, PublishedRunErrorRejectsAlreadyPreparedKernelEntryOnEveryActiveLa
     }
 }
 
+TEST(HbgGmMix, MixPrefixSuffixErrorRejectsNewAdmissionAndPreviouslyPermittedKernelEntry) {
+    GmMixFixture fixture({{2, 7}, {1, 1}, {1, 7}, {1, 7}, {1, 7}});
+    for (uint32_t task = 2; task <= 4; ++task) {
+        fixture.graph.executable(task, 0, {1});
+        fixture.storage.metadata[task].flags |= SCHEDULER_TASK_HAS_FANIN;
+    }
+    ASSERT_TRUE(scheduler_init_spmd_task_records(fixture.base(), fixture.storage.layout, 47));
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_EQ(fixture.claim(0), SchedulerBlockClaimResult::CLAIMED);
+    ASSERT_TRUE(fixture.publish(0));
+    ASSERT_TRUE(fixture.rendezvous(0));
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        const auto slot = fixture.admissions[lane].gm_mix.slot_index;
+        bool permit = false;
+        ASSERT_TRUE(scheduler_ordered_can_enter_slot(
+            fixture.graph.graph(), fixture.base(), fixture.locals[lane], fixture.run(), slot, &permit
+        ));
+        ASSERT_TRUE(permit);
+    }
+
+    auto *resolver = fixture.locals[3];
+    for (uint32_t task : {4u, 3u, 2u})
+        ASSERT_EQ(
+            scheduler_route_task(fixture.graph.graph(), fixture.base(), resolver, fixture.run(), task, nullptr),
+            SchedulerRouteResult::WAITING
+        );
+    fixture.graph.executable(4, 0, {1, 4});
+    ASSERT_EQ(fixture.graph.payload(4).fanin_count, 2);
+    scheduler_gm_store(fixture.control(1)->state, static_cast<int64_t>(SchedulerTaskState::DONE));
+    SchedulerReadyStats ready_stats{};
+    ASSERT_FALSE(scheduler_resolve_completion(
+        fixture.graph.graph(), fixture.base(), resolver, fixture.run(), 1, nullptr, &ready_stats, nullptr, 0, true,
+        nullptr, UINT32_MAX
+    ));
+    ASSERT_EQ(ready_stats.batch_count, 1u);
+    ASSERT_EQ(scheduler_read_error(fixture.run()), static_cast<uint64_t>(SchedulerGraphResult::INVALID_FANIN_ID));
+    const uint64_t first_error = scheduler_read_error(fixture.run());
+    const uint64_t first_site = fixture.run()->error_site;
+    const uint64_t first_task = fixture.run()->error_task_ref;
+    ASSERT_EQ(first_task, 4u);
+
+    // A published prefix is not rolled back. A consumer that already owns it
+    // must still pass the real admission gate after a later suffix failure.
+    SchedulerReadyClaim candidate{};
+    candidate.inbox_index = 1;
+    ASSERT_TRUE(scheduler_ready_pop_from_inbox(
+        fixture.graph.graph(), fixture.base(), resolver, fixture.run(), SCHEDULER_MIX_QUEUE, candidate.inbox_index,
+        &candidate.task_ref, nullptr
+    ));
+    ASSERT_EQ(candidate.task_ref, 2);
+    EXPECT_EQ(
+        scheduler_try_claim_admission(
+            fixture.graph.graph(), fixture.base(), resolver, fixture.run(), &fixture.admissions[3], candidate
+        ),
+        SchedulerAdmissionResult::ERROR
+    );
+    EXPECT_EQ(fixture.admissions[3].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
+    EXPECT_EQ(
+        scheduler_gm_query(fixture.control(2)->admission_state),
+        static_cast<uint64_t>(SchedulerAdmissionState::UNCLAIMED)
+    );
+    EXPECT_EQ(scheduler_gm_query(fixture.control(2)->admission_claim_lock), 0u);
+    const auto *shared =
+        scheduler_state_at<SchedulerAdmissionControl>(fixture.base(), fixture.storage.layout.admission_control_offset);
+    EXPECT_EQ(shared->commit_tail, 1u);
+    EXPECT_EQ(shared->commit_lock, 0u);
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        const auto slot = fixture.admissions[lane].gm_mix.slot_index;
+        bool permit = true;
+        EXPECT_FALSE(scheduler_ordered_can_enter_slot(
+            fixture.graph.graph(), fixture.base(), fixture.locals[lane], fixture.run(), slot, &permit
+        ));
+        EXPECT_FALSE(permit);
+        EXPECT_EQ(fixture.locals[lane]->slots[slot].state, SchedulerDispatchSlotState::READY);
+    }
+    EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
+    EXPECT_EQ(fixture.run()->resolved_task_count, 0u);
+    EXPECT_EQ(scheduler_read_error(fixture.run()), first_error);
+    EXPECT_EQ(fixture.run()->error_site, first_site);
+    EXPECT_EQ(fixture.run()->error_task_ref, first_task);
+}
+
 TEST(HbgGmMix, PublishedRunErrorDoesNotTurnReleasedLanesIntoSuccessfulBlockCompletion) {
     for (uint8_t mask : {3, 5, 6, 7}) {
         SCOPED_TRACE(mask);

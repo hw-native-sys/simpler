@@ -1702,6 +1702,7 @@ inline __aicore__ bool scheduler_resolve_completion(
     }
     if (wake_stats != nullptr) ++wake_stats->wake_close_count;
     SchedulerReadyBatch batches[SCHEDULER_READY_QUEUE_COUNT]{};
+    bool mix_prefix_published = false;
     while (waiter >= 0) {
         if (!scheduler_task_ref_valid(graph, waiter)) {
             scheduler_record_error(
@@ -1751,7 +1752,7 @@ inline __aicore__ bool scheduler_resolve_completion(
                 *direct_mix_ready = {};
             }
             bool direct_mix_available = false;
-            if (core_type == SCHEDULER_MIX_QUEUE && direct_mix_ready != nullptr &&
+            if (core_type == SCHEDULER_MIX_QUEUE && direct_mix_ready != nullptr && !mix_prefix_published &&
                 batches[core_type].head == SCHEDULER_INBOX_EMPTY) {
                 __gm__ SchedulerReadyInbox *inbox =
                     scheduler_ready_inbox_at(scheduler_state_base, context, core_type, context->self_type_rank());
@@ -1778,6 +1779,22 @@ inline __aicore__ bool scheduler_resolve_completion(
                     SchedulerErrorSite::COMPLETION_READY_APPEND_FAILED
                 );
                 return false;
+            }
+            // Mix prefixes and suffixes share one coordinator inbox. Publishing
+            // once lets consumers run while the remaining wake chain is routed.
+            if (next >= 0 && core_type == SCHEDULER_MIX_QUEUE && !mix_prefix_published &&
+                batches[core_type].count >= 2) {
+                if (scheduler_read_error(run_control) != 0) return false;
+                if (!scheduler_ready_batch_push(
+                        scheduler_state_base, context, core_type, &batches[core_type], ready_stats
+                    )) {
+                    scheduler_record_error(
+                        run_control, task_ref, SchedulerGraphResult::INVALID_ARGUMENTS, &graph, context,
+                        SchedulerErrorSite::COMPLETION_READY_PUBLISH_FAILED
+                    );
+                    return false;
+                }
+                mix_prefix_published = true;
             }
         }
         waiter = next;

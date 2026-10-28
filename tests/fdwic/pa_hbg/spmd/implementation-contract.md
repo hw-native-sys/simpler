@@ -139,6 +139,12 @@ PREPARED／ADMITTED 由同一准入 owner 发布；扫描者仍核验阶段、�
 完成服务可能在本轮 discovery 之后产生 direct 候选；其中 inline 服务和多 block／Mix 候选
 必须再经过 discovery 的服务／准入分类，不能落入普通单 block 的物理槽准备路径。
 
+Mix扇出有两个已就绪后继且等待链仍有剩余时，Resolve最多提前发布一次Ready前缀，
+剩余后继继续按原依赖逐个验证，最后批量入同一coordinator inbox；已发布链不再改写。
+前缀之后不重新建立direct Mix旁路，避免后缀越过前缀；纯AIV的按首节点奇偶分流规则不改。
+整次Resolve不是事务性提交：发现错误之前合法前缀可能已执行，错误发布后原准入和entry门禁
+必须拒绝新工作，不回滚已发布前缀，不继续发布未验证后缀。
+
 | 转换 | 条件与唯一动作 | 暂时不能推进时 |
 | ---- | -------------- | -------------- |
 | DATA_READY → CLAIMED | 既有 pop/refill 唯一取得逻辑 task；短领取锁内重查阶段并发布 CLAIMED | pending 已占用则 RETRY；重复所有权则 ERROR，不丢候选 |
