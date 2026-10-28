@@ -148,7 +148,6 @@ struct AsyncCtx {
 struct LocalContext {
     int32_t block_idx;  // Logical block index within the task [0, block_num)
     int32_t block_num;  // How many logical blocks this task requires.
-                        // Currently fixed to 1 (block_dim > 1 not yet implemented).
                         // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
                         // which controls how many physical cores the runtime launches.
     AsyncCtx async_ctx;
@@ -187,7 +186,6 @@ static __aicore__ inline int32_t get_block_idx(__gm__ int64_t *args) {
 /**
  * Return how many logical blocks the current task requires.
  * All blocks of the same task see the same value.
- * Currently always returns 1 (block_dim>1 not yet implemented).
  *
  * Note: this is NOT the same as RUNTIME_CONFIG.block_dim in
  * kernel_config.py, which controls how many physical cores are launched.

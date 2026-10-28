@@ -9,20 +9,35 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+/**
+ * One task, as wide as the caller asks and sync-start or not as the caller
+ * asks. The pair is the point: the same width is refused for a cohort and run
+ * for an ordinary task, because only a cohort needs every block resident at
+ * once.
+ *
+ * Args layout: [out] + {block_num, sync_start} scalars.
+ */
+
+#include <cstdint>
+
 #include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
 __attribute__((visibility("default"))) OrchestrationConfig aicpu_orchestration_config(const ChipTaskArgs &args) {
     (void)args;
-    return OrchestrationConfig{.expected_arg_count = 1};
+    return OrchestrationConfig{.expected_arg_count = 3};
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &args) {
-    CoreTaskArgs root;
-    root.add_inout(args.tensor(0).ref());
-    root.launch_spec.set_block_num(2);
-    rt_submit_aic_task(0, root);
+    const int64_t block_num = args.scalar<int64_t>(0);
+    const int64_t sync_start = args.scalar<int64_t>(1);
+
+    CoreTaskArgs task;
+    task.add_inout(args.tensor(0).ref());
+    task.launch_spec.set_block_num(static_cast<int32_t>(block_num));
+    if (sync_start != 0) task.launch_spec.set_require_sync_start(true);
+    rt_submit_aic_task(0, task);
 }
 
 }  // extern "C"

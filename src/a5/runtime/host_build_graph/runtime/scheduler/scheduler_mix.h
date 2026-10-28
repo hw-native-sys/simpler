@@ -84,8 +84,8 @@ inline __aicore__ bool scheduler_fill_cluster_mix_slots(
         SchedulerMixPlacement placement{};
         SchedulerReadyClaim ready{};
         if (!scheduler_claim_ready_for_slot(
-                graph, base, local, run, local->config.scheduler_count, SCHEDULER_MIX_QUEUE, victim_cursor, stats,
-                &ready, &placement, allow_steal
+                graph, base, local, run, local->config.scheduler_count, TaskType::MIX, victim_cursor, stats, &ready,
+                &placement, allow_steal, ssbuf
             ))
             return false;
         if (scheduler_task_ref_is_null(ready.task_ref)) return true;
@@ -105,14 +105,14 @@ inline __aicore__ bool scheduler_publish_direct_mix_candidate(
     // The ready-queue snapshot permits a direct attempt before the next queue
     // claim. A candidate without complete placement joins the queue first.
     SchedulerMixPlacement placement{};
-    if (scheduler_plan_mix_placement(base, local, candidate->task_ref, &placement)) {
+    if (scheduler_plan_mix_placement(base, local, candidate->task_ref, &placement, ssbuf)) {
         if (!scheduler_dispatch_mix_ready(graph, base, local, run, *candidate, placement, profiling_level, ssbuf))
             return false;
         if (progress != nullptr) *progress = true;
     } else {
         SchedulerReadyBatch batch{};
         if (!scheduler_ready_batch_append(base, local, candidate->task_ref, &batch, stats, profiling_level) ||
-            !scheduler_ready_batch_push(base, local, SCHEDULER_MIX_QUEUE, &batch, stats))
+            !scheduler_ready_batch_push(base, local, TaskType::MIX, &batch, stats))
             return false;
     }
     *candidate = {};

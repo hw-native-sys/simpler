@@ -19,7 +19,7 @@ inline bool aicore_scheduler_runtime_mode_is_resident(uint32_t mode) {
 }
 
 inline bool aicore_scheduler_runtime_mode_is_explicit_legacy(uint32_t mode) {
-    return mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH || mode == SCHEDULER_RUNTIME_MODE_LEGACY_UNSUPPORTED_SHAPE;
+    return mode == SCHEDULER_RUNTIME_MODE_LEGACY_GRAPH;
 }
 
 inline bool aicore_scheduler_runtime_enabled(const Runtime *runtime) {

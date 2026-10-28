@@ -50,49 +50,49 @@ struct alignas(32) SchedulerSsbufCompletionInbox {
 };
 
 struct alignas(64) SchedulerSsbufLane {
-    // Completions of this lane's Mix slots, which the coordinator polls. A
-    // lane's own slots complete in its local state, so nothing else about a
-    // lane crosses SSBUF.
+    // Completions of this lane's Mix subtask, which the coordinator polls so it
+    // can close the dispatch's tracker. The lane retires its own slot; what
+    // crosses SSBUF is the fact, not the retirement.
     SchedulerSsbufCompletionInbox mix_completion;
-    uint8_t reserved[32];
+    // Written by the coordinator alone, into whichever slot the index does not
+    // name.
+    SchedulerSsbufDispatchControl dispatch[SCHEDULER_LANE_SLOT_COUNT];
+    // Written by the lane alone. Reading it is how the coordinator tells a
+    // dispatch it left here from one the lane has already taken up.
+    volatile uint64_t current;
+    uint8_t reserved[24];
 };
 
 struct alignas(64) SchedulerSsbufRegion {
     // +0x000: initialization and layout contract
     SchedulerSsbufHeader header;
-    // +0x040: one 64-byte lane per cluster worker
+    // +0x040: one 128-byte lane per cluster worker
     SchedulerSsbufLane lanes[PLATFORM_CORES_PER_BLOCKDIM];
-    // +0x100: Mix dispatch, indexed by cluster lane. A Mix subtask needs
-    // everything an ordinary dispatch does and, once an AIV prepares its own
-    // payload, its subtask index and predicate result as well -- both of which
-    // fit the control's spare bytes.
-    SchedulerSsbufDispatchControl mix_dispatch[PLATFORM_CORES_PER_BLOCKDIM][SCHEDULER_MIX_SLOT_COUNT];
     // The region's size is fixed by the hardware window HBG owns, so the room
-    // the Mix structures do not take is declared rather than left implicit.
+    // the lanes do not take is declared rather than left implicit.
     uint8_t reserved
         [SCHEDULER_SSBUF_REGION_SIZE - sizeof(SchedulerSsbufHeader) -
-         PLATFORM_CORES_PER_BLOCKDIM * sizeof(SchedulerSsbufLane) -
-         PLATFORM_CORES_PER_BLOCKDIM * SCHEDULER_MIX_SLOT_COUNT * sizeof(SchedulerSsbufDispatchControl)];
+         PLATFORM_CORES_PER_BLOCKDIM * sizeof(SchedulerSsbufLane)];
 };
 
 static_assert(SCHEDULER_SSBUF_REGION_OFFSET + SCHEDULER_SSBUF_REGION_SIZE == SCHEDULER_SSBUF_HARDWARE_SIZE);
 static_assert(sizeof(SchedulerSsbufHeader) == 64);
 static_assert(sizeof(SchedulerSsbufDispatchControl) == 32);
 static_assert(sizeof(SchedulerSsbufCompletionInbox) == 32);
-static_assert(sizeof(SchedulerSsbufLane) == 64);
+static_assert(sizeof(SchedulerSsbufLane) == 128);
 static_assert(sizeof(SchedulerSsbufRegion) == SCHEDULER_SSBUF_REGION_SIZE);
-static_assert(SCHEDULER_PENDING_SLOT_COUNT == 2);
-static_assert(SCHEDULER_MIX_SLOT_COUNT == 2);
+static_assert(SCHEDULER_PENDING_SLOT_COUNT == 1);
 static_assert(offsetof(SchedulerSsbufDispatchControl, publication) % 8 == 0);
 static_assert(offsetof(SchedulerSsbufCompletionInbox, publication) % 8 == 0);
 static_assert(offsetof(SchedulerSsbufLane, mix_completion) == 0x00);
+static_assert(offsetof(SchedulerSsbufLane, dispatch) == 0x20);
+static_assert(offsetof(SchedulerSsbufLane, current) == 0x60);
 static_assert(offsetof(SchedulerSsbufRegion, lanes[0]) == 0x040);
-static_assert(offsetof(SchedulerSsbufRegion, lanes[1]) == 0x080);
-static_assert(offsetof(SchedulerSsbufRegion, lanes[2]) == 0x0c0);
-static_assert(offsetof(SchedulerSsbufRegion, mix_dispatch) == 0x100);
-// Over half the region is unclaimed now that a core publishes only Mix work
-// through it. A cross-core dispatch channel is what that room is for; sizing
-// one means recomputing this, not assuming the space is there.
+static_assert(offsetof(SchedulerSsbufRegion, lanes[1]) == 0x0c0);
+static_assert(offsetof(SchedulerSsbufRegion, lanes[2]) == 0x140);
+// Over half the region is unclaimed. A cross-core dispatch channel is what that
+// room is for; sizing one means recomputing this, not assuming the space is
+// there.
 static_assert(offsetof(SchedulerSsbufRegion, reserved) == 0x1c0);
 static_assert(sizeof(SchedulerSsbufRegion::reserved) == SCHEDULER_SSBUF_REGION_SIZE - 0x1c0);
 
@@ -158,9 +158,9 @@ inline __aicore__ void scheduler_ssbuf_initialize(SCHEDULER_SSBUF SchedulerSsbuf
     // explicit initialization when the layout is extended.
     scheduler_ssbuf_store_release(&region->header.init_generation, 0);
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        for (uint32_t slot = 0; slot < SCHEDULER_MIX_SLOT_COUNT; ++slot) {
-            scheduler_ssbuf_store_relaxed(&region->mix_dispatch[lane][slot].publication, 0);
-        }
+        for (uint32_t slot = 0; slot < SCHEDULER_LANE_SLOT_COUNT; ++slot)
+            scheduler_ssbuf_store_relaxed(&region->lanes[lane].dispatch[slot].publication, 0);
+        scheduler_ssbuf_store_relaxed(&region->lanes[lane].current, 0);
         scheduler_ssbuf_store_relaxed(&region->lanes[lane].mix_completion.publication, 0);
     }
     region->header.region_size = SCHEDULER_SSBUF_REGION_SIZE;

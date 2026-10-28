@@ -16,35 +16,41 @@
 #include "scheduler_completion.h"
 
 // A directory load is useful only when the corresponding work can be claimed,
-// so this must admit every slot scheduler_fill_own_slots would fill: rejecting
-// a fillable slot suppresses the directory query and starves its work.
-inline __aicore__ bool
-scheduler_has_usable_slot(const SchedulerLocalState *local, uint32_t core_type, uint64_t skip_slot_mask) {
-    if (local->config.self_core_type != core_type) return false;
-    for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-        if ((skip_slot_mask & (UINT64_C(1) << slot)) == 0 &&
-            local->own_slots()[slot].state == SchedulerDispatchSlotState::FREE)
-            return true;
-    }
-    return false;
+// so this must admit exactly what scheduler_fill_own_slots would fill:
+// rejecting a fillable position suppresses the directory query and starves its
+// work, and admitting an unfillable one costs a load for nothing.
+//
+// `refilled` says a completion pass already put a successor in the position
+// this pass would otherwise claim for.
+inline __aicore__ bool scheduler_has_usable_slot(const SchedulerLocalState *local, uint32_t core_type, bool refilled) {
+    if (local->config.self_core_type != core_type || refilled) return false;
+    return local->running.state == SchedulerDispatchSlotState::FREE;
 }
 
-// Fill this core's own free dispatch slots. One core, one core type, two slots:
-// a Scheduler schedules only itself, so there is no peer to prefer, no reserved
-// capacity to hold back, and no reason to defer a slot it is about to execute
-// from. `skip_slot_mask` names slots a completion pass already refilled.
+// Claim one task for this core's own account, into the position it runs from.
+// It claims only when that position is free, and the mailbox has already had
+// its chance by then: promotion runs earlier in the loop, so a free position
+// here means there was nothing of the coordinator's to take first. That
+// ordering is what keeps ordinary work from piling up in front of a Mix
+// subtask -- the whole backlog, not just the task then running, because
+// without it the core would go on claiming.
 //
 // The return value reports whether this pass made progress; `failed` separately
 // reports an aborted pass.
 inline __aicore__ bool scheduler_fill_own_slots(
     const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, uint64_t *ready_victim_cursors, SchedulerReadyStats *ready_stats,
-    uint64_t profiling_level, uint64_t skip_slot_mask, bool *failed, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region
+    uint64_t profiling_level, bool refilled, bool *failed, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region
 ) {
     if (failed != nullptr) *failed = false;
     if (scheduler == nullptr) return false;
     const uint32_t core_type = scheduler->config.self_core_type;
-    if (!scheduler_has_usable_slot(scheduler, core_type, skip_slot_mask)) return false;
+    // The queue this core claims from is the one its own core type runs. They
+    // are separate vocabularies that happen to share the AIC/AIV numbering, so
+    // the slot check below takes the core type and everything queue-side takes
+    // the task type.
+    const TaskType task_type = scheduler_self_task_type(core_type);
+    if (!scheduler_has_usable_slot(scheduler, core_type, refilled)) return false;
     // A core polls its own inbox on every pass. The directory gates only the
     // steal scan, which reads one peer endpoint per victim. Any publisher sets
     // an owner's bit and only that owner clears it, after observing its own
@@ -52,42 +58,35 @@ inline __aicore__ bool scheduler_fill_own_slots(
     // whatever is queued when a clear and a push cross, until a later push
     // sets the bit again.
     const bool allow_steal = scheduler_ready_directory_nonempty(
-        scheduler_state_base, scheduler, scheduler->config.scheduler_count, core_type
+        scheduler_state_base, scheduler, scheduler->config.scheduler_count, task_type
     );
 
     const uint64_t worker_id = scheduler->worker_id();
     const uint32_t self_lane = scheduler->config.self_lane;
-    uint64_t state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-    bool progress = false;
+    const uint64_t state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
 
-    for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-        if ((skip_slot_mask & (UINT64_C(1) << slot)) != 0) continue;
-        SchedulerLocalSlotState *local_slot = &scheduler->own_slots()[slot];
-        if (local_slot->state != SchedulerDispatchSlotState::FREE) continue;
+    SchedulerLocalSlotState *local_slot = &scheduler->running;
+    if (refilled || local_slot->state != SchedulerDispatchSlotState::FREE) return false;
 
-        SchedulerReadyClaim ready{};
-        if (!scheduler_claim_ready_for_slot(
-                graph, scheduler_state_base, scheduler, run_control, scheduler->config.scheduler_count, core_type,
-                &ready_victim_cursors[core_type], ready_stats, &ready, nullptr, allow_steal
-            )) {
-            if (failed != nullptr) *failed = true;
-            return progress;
-        }
-        // An empty inbox ends the pass: the next slot would query the same one.
-        if (scheduler_task_ref_is_null(ready.task_ref)) break;
-
-        ready.state_probe_start_cycles = state_probe_start_cycles;
-        ready.state_probe_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
-        const SchedulerFreeSlotClaim claim{worker_id, slot, local_slot->generation, self_lane};
-        local_slot->state = SchedulerDispatchSlotState::FILLING;
-        if (!scheduler_fill_dispatch_slot(
-                graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level, ssbuf_region
-            )) {
-            if (failed != nullptr) *failed = true;
-            return progress;
-        }
-        progress = true;
-        state_probe_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+    SchedulerReadyClaim ready{};
+    if (!scheduler_claim_ready_for_slot(
+            graph, scheduler_state_base, scheduler, run_control, scheduler->config.scheduler_count, task_type,
+            &ready_victim_cursors[scheduler_task_type_index(task_type)], ready_stats, &ready, nullptr, allow_steal
+        )) {
+        if (failed != nullptr) *failed = true;
+        return false;
     }
-    return progress;
+    if (scheduler_task_ref_is_null(ready.task_ref)) return false;
+
+    ready.state_probe_start_cycles = state_probe_start_cycles;
+    ready.state_probe_end_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
+    const SchedulerFreeSlotClaim claim{worker_id, local_slot->generation, self_lane};
+    local_slot->state = SchedulerDispatchSlotState::FILLING;
+    if (!scheduler_fill_dispatch_slot(
+            graph, scheduler_state_base, scheduler, run_control, claim, ready, profiling_level, ssbuf_region
+        )) {
+        if (failed != nullptr) *failed = true;
+        return false;
+    }
+    return true;
 }
