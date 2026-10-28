@@ -59,6 +59,7 @@ def capture_probe(tmp_path_factory):
             "-shared",
             "-fPIC",
             "-Wl,--build-id",
+            f"-I{_ROOT / 'src/common'}",
             str(_SOURCE / "cpu.cpp"),
             "-o",
             str(cpu),

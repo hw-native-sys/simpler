@@ -1,0 +1,1 @@
+{ global: simpler_aicpu_exec; simpler_aicpu_init; simpler_aicpu_register_callable; simpler_aicpu_finalize; probe_selected_config; probe_fail_close_at; probe_live_handles; local: *; };

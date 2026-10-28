@@ -31,7 +31,13 @@ _CASES = [
 
 
 @pytest.mark.parametrize(
-    "probe", ["runtime_publication_launch", "run_execution_streams", "run_caller_launch", "bootstrap_error"]
+    "probe",
+    [
+        "runtime_publication_launch",
+        "run_execution_streams",
+        "run_caller_launch",
+        "bootstrap_error",
+    ],
 )
 @pytest.mark.requires_hardware
 @pytest.mark.parametrize(("arch", "runtime"), _CASES)
@@ -83,7 +89,8 @@ def test_onboard_execution_contract(arch: str, runtime: str, probe: str, tmp_pat
     ]
     build = subprocess.run(command, cwd=entry["directory"], capture_output=True, text=True, timeout=120, check=False)
     assert build.returncode == 0, build.stdout + build.stderr
-    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=30, check=False)
+    run_args = [str(binary)]
+    result = subprocess.run(run_args, capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS:" in result.stdout
     if probe == "bootstrap_error":

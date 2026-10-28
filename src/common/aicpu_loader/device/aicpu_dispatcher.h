@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * AICPU Dispatcher — transient bootstrap-only upload helper.
+ * AICPU Dispatcher — bootstrap-only upload helper.
  *
  * Architecture
  * ============
@@ -46,7 +46,8 @@
  *      `rtFuncHandle`. The main aicpu_scheduler owns the dlopen of the
  *      preinstall file; this dispatcher SO is no longer in the picture.
  *
- * Each runner uploads its runtime SO into CANN's process-owned directory.
+ * Each runner stages its runtime SO in CANN's process-owned directory. An
+ * identical image reuses its immutable file across sequential Workers.
  * CANN removes the directory at session teardown; the dispatcher does not scan
  * historical files or reuse another process's uploads.
  */

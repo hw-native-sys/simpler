@@ -17,7 +17,21 @@
 namespace simpler_dispatcher {
 
 enum class BootstrapStatus : uint32_t { Pending, Success, Failed };
-enum class BootstrapStage : uint32_t { Pending, Context, Mkdir, Create, Write, Close, Chmod, Rename, Complete };
+enum class BootstrapStage : uint32_t {
+    Pending,
+    Context,
+    Mkdir,
+    Create,
+    Write,
+    Close,
+    Chmod,
+    Rename,
+    Complete,
+    Verify,
+    Link,
+    Unlink,
+    CacheHit
+};
 
 inline const char *bootstrap_stage_name(BootstrapStage stage) {
     switch (stage) {
@@ -39,6 +53,14 @@ inline const char *bootstrap_stage_name(BootstrapStage stage) {
         return "rename";
     case BootstrapStage::Complete:
         return "complete";
+    case BootstrapStage::Verify:
+        return "verify";
+    case BootstrapStage::Link:
+        return "link";
+    case BootstrapStage::Unlink:
+        return "unlink";
+    case BootstrapStage::CacheHit:
+        return "cache-hit";
     }
     return "unknown";
 }
@@ -49,6 +71,9 @@ constexpr uint32_t kBootstrapResultVersion = 1;
 // One bootstrap callback publishes this record before its stream completes.
 // capacity_valid marks a successful statvfs; capacity_errno preserves a failed
 // collection independently of the operation's original error_number.
+// Complete means a new immutable image was published. CacheHit means an existing
+// byte-identical image was verified; written_bytes counts only actual temporary
+// file writes, which can be zero or nonzero when another publisher wins a race.
 struct alignas(64) BootstrapResult {
     uint32_t magic{kBootstrapResultMagic};
     uint32_t version{kBootstrapResultVersion};

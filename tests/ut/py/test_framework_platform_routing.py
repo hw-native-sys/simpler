@@ -18,7 +18,15 @@ import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
 _EXAMPLES = _ROOT / "examples/workers/l2/framework_eager"
-_COMPILED = ("main", "alias_inout", "value_arguments", "persistent_state", "scope_statistics", "argument_capture")
+_COMPILED = (
+    "main",
+    "alias_inout",
+    "value_arguments",
+    "persistent_state",
+    "scope_statistics",
+    "argument_capture",
+    "lifecycle",
+)
 
 
 def _load(path, name):

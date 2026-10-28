@@ -15,8 +15,8 @@ submitting overlapping runs), so it needs a fresh worker whose private slot
 table and native-run lane start empty and are not left with residue for other
 pooled tests.
 
-Override ``st_worker`` here as class-scope, building a fresh L2 worker that does
-**not** enter ``_l2_worker_pool``. Cost: one extra init/close per test class.
+Override ``st_worker`` here as class-scope, building a fresh L2 worker after
+retiring any same-device pooled owner. Cost: one extra init/close per test class.
 """
 
 from __future__ import annotations
@@ -25,31 +25,6 @@ import pytest
 
 
 @pytest.fixture(scope="class")
-def st_worker(request, st_platform, device_pool):
-    """Yield a fresh class-scope L2 worker that does not enter the shared pool."""
-    cls = request.node.cls
-    if cls is None or not hasattr(cls, "_st_runtime"):
-        pytest.skip("isolated st_worker requires a SceneTestCase subclass")
-
-    runtime = cls._st_runtime
-
-    ids = device_pool.allocate(1)
-    if not ids:
-        pytest.fail("no devices available for isolated L2 worker")
-    dev_id = ids[0]
-    try:
-        from simpler.worker import Worker  # noqa: PLC0415
-
-        w = Worker(
-            level=2,
-            device_id=dev_id,
-            platform=st_platform,
-            runtime=runtime,
-        )
-        w.init()
-        try:
-            yield w
-        finally:
-            w.close()
-    finally:
-        device_pool.release(ids)
+def st_worker(_isolated_l2_worker):
+    """Use the shared isolated lifetime after any pooled owner has retired."""
+    return _isolated_l2_worker

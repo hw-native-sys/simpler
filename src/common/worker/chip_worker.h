@@ -129,6 +129,11 @@ public:
     /// The caller keeps its context current through successful finalize. Failed
     /// rollback requires explicit finalize if it could not close; that worker
     /// cannot be reinitialized.
+    /// Onboard admission allows one execution ChipWorker per process/device,
+    /// across both modes and all runtime modules. Other framework operators
+    /// and simulator virtual devices do not participate in that reservation.
+    /// Logical terminal close without confirmed cleanup retains the device
+    /// reservation until process exit; it does not establish device recovery.
 
     void init(
         const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
@@ -573,6 +578,7 @@ private:
     using SimplerUnregisterCallableFn = int (*)(void *, int32_t);
     using GetAicpuDlopenCountFn = size_t (*)(void *);
     using FinalizeDeviceFn = int (*)(void *);
+    using ExecutionEnvironmentReleasableFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);
     using CreateCommStreamFn = void *(*)(void *);
     using DestroyCommStreamFn = int (*)(void *, void *);
@@ -702,6 +708,7 @@ private:
     GetAicpuDlopenCountFn get_host_dlopen_count_fn_ = nullptr;
     GetAicpuDlopenCountFn get_run_stream_set_create_count_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
+    ExecutionEnvironmentReleasableFn execution_environment_releasable_fn_ = nullptr;
     EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
     CreateCommStreamFn create_comm_stream_fn_ = nullptr;
     DestroyCommStreamFn destroy_comm_stream_fn_ = nullptr;
@@ -788,7 +795,7 @@ private:
         bool pipeline_leased, NativeRunProvenance provenance
     );
     void cleanup_native_runs_noexcept() noexcept;
-    void clear_runtime_binding();
+    void clear_runtime_binding(bool release_device_reservation = true);
     void abandon_after_failed_teardown(std::exception_ptr error) noexcept;
     /** How many runs remain tracked and not proved destroyed, including live runs. */
     size_t unproven_native_run_count() const noexcept;
@@ -996,6 +1003,7 @@ private:
     // Cleared only after successful teardown. Control calls run on the owning
     // thread, as enforced by Worker.close().
     std::optional<ExecutionEnvironment> execution_environment_;
+    bool device_owner_reserved_ = false;
     int device_id_ = -1;
     bool initialized_ = false;
     bool finalized_ = false;

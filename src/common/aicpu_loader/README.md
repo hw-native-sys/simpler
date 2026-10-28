@@ -34,6 +34,25 @@ Historical files in the shared root remain untouched. CANN can still select
 those files first; recovering incorrect historical content is outside this
 change.
 
+## Sequential Worker lifetime
+
+The onboard execution owner is unique per process/device. The dispatcher uses
+one immutable runtime file per image fingerprint/device in CANN's process-owned
+directory. An identical bootstrap reuses its inode; differing bytes at the same
+name fail. Initial publication never overwrites another publisher's image.
+Successful close/recreate therefore creates no new runtime file for that image.
+Changed images use distinct fingerprint names.
+
+Close runs `simpler_aicpu_finalize` on the still-live control stream after eager
+users retire. The entry acknowledges backend-owned cleanup before RTS binary
+registration unload. TMR closes its device orchestration handles; HBG owns those
+handles on the host. Per-run executor teardown remains responsible for run state.
+A failed or unacknowledged cleanup retains the request, registration and source
+owners for retry; successful enqueue alone is not a cleanup acknowledgement.
+Caller tensors, weights and externally backed arenas are never released by this
+hook. The immutable runtime image/file can remain in CANN's session cache;
+logical Worker close makes no physical-unmap promise.
+
 ## Argument ABI boundaries
 
 The dispatcher bootstrap uses a private `DeviceArgs` ABI. Host-side
@@ -59,14 +78,18 @@ and a device-to-host copy. Missing, stale or malformed results reject bootstrap.
 Expected context and filesystem failures return through this result without
 faulting the CANN stream. The Host console reports the failing stage, original
 errno (or a separate context error), device, target path, requested bytes and
-completed bytes. ENOSPC/EDQUOT additionally trigger one bounded device-side
+actual temporary-file bytes written. `Complete` confirms new-file publication;
+`CacheHit` confirms a verified existing inode and can report zero bytes written.
+ENOSPC/EDQUOT additionally trigger one bounded device-side
 `statvfs` query; failure of that diagnostic cannot replace the original error.
 There is no directory scan or deletion of historical uploads. Open/write/close/
-chmod/rename failures remove only the attempt's unique temporary file and
+chmod/link failures remove only the attempt's unique temporary file and
 preserve any previously published target.
 
 Actual CANN launch, stream-sync and result-copy errors retain their original
-return code. A failed stream is not read as if it had published a filesystem
+return code. All four bootstrap buffers, including the result, stay owned on
+ambiguous enqueue, wait or result-copy failure; close retries the same request.
+A failed stream is not read as if it had published a filesystem
 diagnostic; a generic 507018 by itself still does not identify an upload error.
 When an upload failure is reported in a valid result after successful CANN
 synchronization, bootstrap returns `PTO_RUNTIME_ERR_INTERNAL`. It does not

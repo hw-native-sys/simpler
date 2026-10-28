@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace native_admission_transport {
 Control &control() {
@@ -29,7 +30,19 @@ Control &control() {
 }  // namespace native_admission_transport
 namespace {
 std::unordered_map<void *, size_t> allocations;
+std::unordered_set<void *> streams;
+}  // namespace
+namespace native_admission_transport {
+void release_provider_state() {
+    for (auto &entry : allocations)
+        std::free(entry.first);
+    allocations.clear();
+    for (void *stream : streams)
+        std::free(stream);
+    streams.clear();
+    control().bytes = 0;
 }
+}  // namespace native_admission_transport
 extern "C" {
 // The CPU transport has no device SDMA channels to warm up.
 uint32_t dma_workspace_channel_count(void) { return 0; }
@@ -46,6 +59,10 @@ int rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
     return 0;
 }
 int rtFree(void *ptr) {
+    if (native_admission_transport::control().retired) {
+        ++native_admission_transport::control().calls_after_retire;
+        return -4244;
+    }
     auto it = allocations.find(ptr);
     if (it == allocations.end()) return ptr == nullptr ? 0 : -1;
     native_admission_transport::control().bytes -= it->second;
@@ -71,14 +88,25 @@ int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMe
     return 0;
 }
 int rtSetDevice(int32_t) { return native_admission_transport::control().attach_rc; }
-int rtDeviceReset(int32_t) { return 0; }
+int rtDeviceReset(int32_t) {
+    auto &c = native_admission_transport::control();
+    c.retired = true;
+    if (c.reset_error == 0) native_admission_transport::release_provider_state();
+    return c.reset_error;
+}
 int rtStreamCreate(rtStream_t *out, int32_t) {
     auto &c = native_admission_transport::control();
     if (++c.stream_create_calls == c.fail_stream_create) return -4242;
     *out = std::malloc(1);
+    if (*out != nullptr) streams.insert(*out);
     return *out ? 0 : -12;
 }
 int rtStreamDestroy(rtStream_t p) {
+    if (native_admission_transport::control().retired) {
+        ++native_admission_transport::control().calls_after_retire;
+        return -4244;
+    }
+    streams.erase(p);
     std::free(p);
     return 0;
 }
@@ -149,7 +177,11 @@ int dlog_setlevel(int, int, int) { return 0; }
 }
 namespace host {
 LoadAicpuOp::~LoadAicpuOp() = default;
-int LoadAicpuOp::Finalize() { return 0; }
+int LoadAicpuOp::Finalize(rtStream_t) {
+    auto &c = native_admission_transport::control();
+    ++c.loader_finalize_calls;
+    return c.loader_finalize_error;
+}
 void LoadAicpuOp::ForgetWithoutUnload() {}
 int LoadAicpuOp::BootstrapDispatcher(const void *, size_t, const void *, size_t, rtStream_t, int) { return -1; }
 int LoadAicpuOp::Init(const std::vector<std::string> &) { return -1; }

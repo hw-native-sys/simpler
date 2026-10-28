@@ -12,6 +12,7 @@ DEVICE-controlled updates to caller-owned storage.
 | Consumer | Executable assertions |
 | -------- | --------------------- |
 | `main.py` | Same-stream producers → Worker → successor; retained caller frames, observable callback error and close ordering |
+| `lifecycle.py` | Two sequential Worker generations, opposite X/Y registration order, eight checked calls and caller storage/context survival after each close |
 | `cross_stream.py` | Separate producer and consumer streams, caller A → B → A on one Worker, explicit framework event dependencies |
 | `alias_inout.py` | One Buffer backing full and partially overlapping strided views, INPUT plus INOUT, repeated updates and unchanged guards |
 | `scope_statistics.py` | Per-call ScopeStats selection with two nested task scopes; TMR records and allocation frontiers, HBG metadata only |
@@ -21,6 +22,27 @@ DEVICE-controlled updates to caller-owned storage.
 | `value_arguments.py` | Per-call FLOAT32, INT8, UINT64 and FLOAT64 values; HBG HOST/NONE controls and TMR clean HOST refusal followed by valid DEVICE calls |
 | `persistent_state.py` | Twelve DEVICE-controlled weighted cache updates, unchanged guards and weights, zero acceptance and revisited rows |
 | `argument_capture.py` | OFF/FULL/HYBRID/OFF ArgsDump payloads on supported runtimes; explicit A5 HBG refusal and recovery |
+
+One process owns at most one onboard execution Worker per device. Program and
+Kernel use the same admission rule; another device and ordinary Torch operators
+remain usable. One Worker can register many callables and queue runs. A second
+same-device Worker must wait for a fully proven close or init rollback; unknown
+cleanup keeps the execution reservation.
+
+`lifecycle.py` closes its first Worker before initializing its successor in the
+same caller context. Each generation keeps its two original callable handles
+through four queued requests; registration order reverses across generations.
+The successor uses the same runtime by default. `--successor-runtime` selects
+`host_build_graph` or `tensormap_and_ringbuffer` for a transition in that same
+caller context, with freshly compiled X/Y callables for the selected backend.
+The scene tests cover both transition directions and same-runtime recreation
+under both queue modes. Before each close, native orchestration-load counters
+must show HBG `(host=2, AICPU=0)` or TMR `(host=0, AICPU=2)`.
+The full arithmetic chain is `[3, 7, 13, 17, 22, 34, 41, 57]`, with guarded,
+disjoint I/O and Torch successors. After each close a Torch operation still
+produces `17`; all earlier business tensors are checked again after both closes.
+This is an eager lifecycle check. External captured-graph lifetime is outside
+this contract.
 
 Public `Worker.close()` drains accepted direct-chip runs through their normal
 RunHandle completion and retirement path before checking workspace ownership.

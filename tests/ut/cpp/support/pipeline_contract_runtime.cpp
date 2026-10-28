@@ -126,6 +126,8 @@ size_t get_run_stream_set_create_count(DeviceContextHandle ctx) { return 0; }
 
 int finalize_device(DeviceContextHandle ctx) { return PTO_RUNTIME_ERR_INTERNAL; }
 
+int simpler_execution_environment_releasable_ctx(DeviceContextHandle ctx) { return 0; }
+
 int ensure_acl_ready_ctx(void *, int) { return PTO_RUNTIME_ERR_INTERNAL; }
 
 void *create_comm_stream_ctx(void *) { return nullptr; }

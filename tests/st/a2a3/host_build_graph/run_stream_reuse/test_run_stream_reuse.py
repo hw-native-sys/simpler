@@ -29,7 +29,6 @@ import itertools
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.worker import Worker
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _build_chip_task_args, _build_l2_ref_args, _compare_outputs
@@ -400,30 +399,26 @@ class TestRunStreamReuseHbg(SceneTestCase):
         finally:
             st_worker.unregister(add_handle)
 
-    def test_unleased_runs_do_not_consume_lease_generations(self, st_platform, st_worker):
-        """A slot pool's first lease is admitted however many runs precede it.
+    def test_unleased_runs_do_not_consume_lease_generations(
+        self, st_platform, device_pool, _l2_worker_pool, _l2_poisoned
+    ):
+        """A fresh slot pool admits generation 1 after three unleased runs.
 
-        `RunResourceArena` is the only mint, and it starts every set at
-        generation 1. A consumer that minted generations for its own unleased
-        runs would have advanced past that, and the first real lease it was
-        ever handed would be rejected as stale. This needs a worker whose
-        generations no other test has touched, hence a second one.
+        Other methods can have advanced a pooled Worker's leases. Retire that
+        owner and keep this fresh lifetime inside this method, so no class-owned
+        Worker overlaps a later pooled method even when test order changes.
         """
         if st_platform != "a2a3":
             pytest.skip("pipeline slot leases are an a2a3 onboard resource")
 
-        other = Worker(level=2, **st_worker._config)
-        other.init()
-        try:
-            handle = other.register(self.build_callable(st_platform))
+        with _l2_worker_pool.isolated(st_platform, self._st_runtime, device_pool, _l2_poisoned) as worker:
+            handle = worker.register(self.build_callable(st_platform))
             try:
                 for _ in range(3):
-                    self._run_registered(other, handle, subtract=False)
-                self._run_registered_with_lease(other, handle, slot_id=0, generation=1)
+                    self._run_registered(worker, handle, subtract=False)
+                self._run_registered_with_lease(worker, handle, slot_id=0, generation=1)
             finally:
-                other.unregister(handle)
-        finally:
-            other.close()
+                worker.unregister(handle)
 
     def test_depth_two_slot_is_generation_safe(self, st_platform, st_worker):
         if st_platform != "a2a3":

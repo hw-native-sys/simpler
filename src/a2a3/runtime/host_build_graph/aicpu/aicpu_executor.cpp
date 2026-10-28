@@ -121,6 +121,15 @@ struct AicpuExecutor {
 
 static AicpuExecutor g_aicpu_executor;
 
+// HBG orchestration handles belong to the host. Per-run deinit releases its
+// device execution state, so cold close has no persistent callable to destroy.
+extern "C" int32_t aicpu_release_callables() {
+    return rt != nullptr || g_aicpu_executor.init_done_.load(std::memory_order_acquire) ||
+                   g_aicpu_executor.runtime_init_ready_.load(std::memory_order_acquire) ?
+               -1 :
+               0;
+}
+
 // ===== AicpuExecutor Method Implementations =====
 
 int32_t AicpuExecutor::init(Runtime *runtime) {

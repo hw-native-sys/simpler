@@ -29,6 +29,7 @@ import sys
 import tempfile
 import time
 import typing
+from contextlib import contextmanager
 from pathlib import Path
 
 # Make simpler's TIMING and NUL levels acceptable to pytest's `--log-level` validator.
@@ -1692,15 +1693,55 @@ class _L2WorkerPool(dict):
         super().__init__()
         self.retired: list[object] = []
 
-    def retire(self, key):
-        worker = self.pop(key, None)
-        if worker is None:
-            return
+    def _close_worker(self, worker):
         try:
             worker.close()
         except BaseException:  # noqa: BLE001
             self.retired.append(worker)
             raise
+
+    def retire(self, key):
+        worker = self.pop(key, None)
+        if worker is not None:
+            self._close_worker(worker)
+
+    def retire_device(self, device_id, poisoned_runtimes):
+        if any(getattr(worker, "_st_device_id", None) == device_id for worker in self.retired):
+            raise RuntimeError(f"L2 Worker cleanup is retained for device {device_id}; refusing another initialization")
+        for key in list(self):
+            if key[1] != device_id:
+                continue
+            try:
+                self.retire(key)
+            except BaseException:
+                poisoned_runtimes.add(key[0])
+                raise
+
+    @contextmanager
+    def isolated(self, platform, runtime, device_pool, poisoned_runtimes):
+        """Fresh private tables with a device lifetime that cannot overlap the pool."""
+        ids = device_pool.allocate(1)
+        if not ids:
+            pytest.fail("no devices available for isolated L2 worker")
+        try:
+            self.retire_device(ids[0], poisoned_runtimes)
+            from simpler.worker import Worker  # noqa: PLC0415
+
+            worker = Worker(level=2, device_id=ids[0], platform=platform, runtime=runtime)
+            worker._st_device_id = ids[0]
+            try:
+                worker.init()
+                yield worker
+            except BaseException as original_error:
+                try:
+                    self._close_worker(worker)
+                except BaseException as cleanup_error:
+                    raise original_error from cleanup_error
+                raise
+            else:
+                self._close_worker(worker)
+        finally:
+            device_pool.release(ids)
 
 
 # A final session-teardown close can still fail (for example an operation that
@@ -1959,6 +2000,16 @@ def _l2_poisoned():
     return set()
 
 
+@pytest.fixture(scope="class")
+def _isolated_l2_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
+    """Class-owned L2 Worker with empty tables, disjoint from pooled lifetimes."""
+    cls = request.node.cls
+    if cls is None or not hasattr(cls, "_st_runtime"):
+        pytest.skip("isolated st_worker requires a SceneTestCase subclass")
+    with _l2_worker_pool.isolated(st_platform, cls._st_runtime, device_pool, _l2_poisoned) as worker:
+        yield worker
+
+
 @pytest.fixture()
 def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):  # noqa: PLR0912
     """Per-test Worker.
@@ -2017,16 +2068,9 @@ def st_worker(request, st_platform, device_pool, _l2_worker_pool, _l2_poisoned):
         device_pool.release(ids)
         key = (runtime, dev_id, wants_sdma)
 
-        # At most one runtime-specific Worker may own a device: finalization
-        # resets resources that would invalidate every other Worker on it.
-        for stale_key in list(_l2_worker_pool):
-            if stale_key[1] != dev_id:
-                continue
-            try:
-                _l2_worker_pool.retire(stale_key)
-            except Exception:
-                _l2_poisoned.add(stale_key[0])
-                raise
+        # A dedicated scene fixture can have used the same physical device.
+        # Both fixture paths retire through the pool's existing close authority.
+        _l2_worker_pool.retire_device(dev_id, _l2_poisoned)
 
         from simpler.worker import Worker  # noqa: PLC0415
 

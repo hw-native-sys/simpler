@@ -26,10 +26,10 @@
  *   2. Init (per-DeviceRunner): JSON-registers the runtime SO via
  *      `rtsBinaryLoadFromFile` (cpuKernelMode=0, kernelSo points at the
  *      preinstall basename), then resolves runtime SO entry points such as
- *      `simpler_aicpu_exec`, `simpler_aicpu_init`, and
- *      `simpler_aicpu_register_callable` to `rtFuncHandle`s via
- *      `rtsFuncGetByName`. JSON uses `/tmp/simpler_inner_<fp>_<pid>.json`;
- *      loaders with the same fingerprint in one host process share this path.
+ *      `simpler_aicpu_exec`, `simpler_aicpu_init`, `simpler_aicpu_finalize`,
+ *      and `simpler_aicpu_register_callable` to `rtFuncHandle`s via
+ *      `rtsFuncGetByName`. JSON uses `/tmp/simpler_inner_<fp>_<device>_<pid>.json`;
+ *      device-scoped loaders use a stable per-process descriptor path.
  *
  *   3. LaunchBuiltInOp (per-task): `rtsLaunchCpuKernel` on the cached
  *      `rtFuncHandle`. No per-launch string marshalling, no global op
@@ -108,7 +108,7 @@ public:
      * @brief JSON-register the runtime SO and resolve its entry handles.
      *
      * @param extra_symbols  Runtime-specific AICPU entry symbols beyond the base
-     *                       set ({RunName, InitName}, exported by every runtime).
+     *                       set ({RunName, InitName, FinalizeName}, exported by every runtime).
      *                       Each runtime's host part reports what it additionally
      *                       exports — e.g. TMARB adds RegisterCallableName, while
      *                       host_build_graph reports none. This keeps the common
@@ -117,28 +117,37 @@ public:
     int Init(const std::vector<std::string> &extra_symbols);
 
     /**
-     * @brief Release binary handle + function handles + temporary JSON.
+     * @brief Acknowledge backend callable cleanup, then unload RTS registration.
      *
-     * All-or-nothing, and idempotent once it has succeeded. A failing
+     * The caller proves supported eager runs have retired and supplies their
+     * still-live control stream. CANN may retain the immutable runtime image.
+     * A failed cleanup/wait/copy/free keeps the request, binary, entry handles
+     * and descriptor for an explicit close retry on the original stream.
+     *
+     * Registration unload is idempotent once it has succeeded. A failing
      * `rtsBinaryUnload` leaves the loader in its loaded state — handle, entry
      * handles and JSON descriptor all retained — and returns the error, so the
      * binary keeps an owner able to retry the unload. Clearing the handle over
      * a failed unload would leave the device-side binary loaded with nothing
      * naming it.
      *
-     * @return 0 when the loader holds nothing, the unload error otherwise.
+     * @return 0 when logical resources have retired; otherwise the cleanup,
+     *         wait, copy, free or registration-unload error.
      */
-    int Finalize();
+    int Finalize(rtStream_t control_stream = nullptr);
 
     /**
      * @brief Whether a device-side binary is still loaded under this loader.
      *
-     * True between a successful `Init` and a successful `Finalize`, which makes
+     * Includes retained bootstrap buffers and cold-close requests, as well as
+     * the registration between `Init` and `Finalize`. This makes
      * it true after a failed `Finalize` as well. A context's destruction guard
      * reads this, because a close that released every other owner and failed to
      * unload the binary has not closed the context.
      */
-    bool has_live_resources() const { return binary_handle_ != nullptr; }
+    bool has_live_resources() const {
+        return binary_handle_ != nullptr || finalize_result_ != nullptr || !bootstrap_buffers_.empty();
+    }
 
     /**
      * @brief Forget the binary and entry handles without calling rtsBinaryUnload.
@@ -175,13 +184,26 @@ public:
 
 private:
     void *binary_handle_ = nullptr;
+    std::vector<void *> bootstrap_buffers_;
+    rtStream_t bootstrap_stream_ = nullptr;
+    bool bootstrap_complete_ = false;
+    bool initialized_ = false;
+    bool bootstrap_acknowledged_ = false;
+    bool bootstrap_upload_ok_ = false;
+    size_t bootstrap_inner_len_ = 0;
+    int FinishBootstrap(bool require_success = false);
+    void *finalize_result_ = nullptr;
+    rtStream_t finalize_stream_ = nullptr;
+    bool finalize_submitted_ = false;
+    bool finalize_acknowledged_ = false;
+    int FinalizeCallables(rtStream_t control_stream);
     std::unordered_map<std::string, rtFuncHandle> func_handles_;
     std::string json_file_path_;
     uint64_t inner_fp_ = 0;
     int device_id_ = 0;
     std::string inner_so_basename_;
     // Full set of AICPU entry symbols to JSON-register and resolve: the base
-    // {RunName, InitName} plus the runtime-reported extras passed to Init().
+    // {RunName, InitName, FinalizeName} plus the runtime-reported extras passed to Init().
     std::vector<std::string> kernel_symbols_;
 
     bool GenerateAicpuOpJson(const std::string &json_path, const std::string &kernel_so);
@@ -193,6 +215,7 @@ private:
 namespace KernelNames {
 constexpr const char *RunName = "simpler_aicpu_exec";   // multi-threaded exec
 constexpr const char *InitName = "simpler_aicpu_init";  // per-device one-shot invariants
+constexpr const char *FinalizeName = "simpler_aicpu_finalize";
 constexpr const char *RegisterCallableName = "simpler_aicpu_register_callable";
 }  // namespace KernelNames
 

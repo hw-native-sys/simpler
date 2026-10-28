@@ -1911,8 +1911,7 @@ int DeviceRunnerBase::ensure_binaries_loaded(rtStream_t control_stream) {
     // One-shot bootstrap: libaicpu_extend_kernels invokes our dispatcher,
     // which writes the runtime AICPU SO bytes to
     // simpler_inner_<fp>_<device_id>.so in the device-side preinstall path.
-    // The dispatcher SO itself is never persisted to disk — only the
-    // transient libaicpu_extend_kernels dlopen. Subsequent per-task AICPU
+    // CANN owns the dispatcher load/cache. Subsequent per-task AICPU
     // launches resolve symbols via rtsBinaryLoadFromFile + rtsFuncGetByName +
     // rtsLaunchCpuKernel directly against the preinstall file.
     int rc = load_aicpu_op_.BootstrapDispatcher(
@@ -2489,16 +2488,15 @@ int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
     if (it == callables_.end()) {
         return 0;
     }
+    if (it->second.host_dlopen_handle != nullptr) {
+        if (dlclose(it->second.host_dlopen_handle) != 0) return PTO_RUNTIME_ERR_INTERNAL;
+        it->second.host_dlopen_handle = nullptr;
+    }
     CallableState state = std::move(it->second);
     callables_.erase(it);
     aicpu_seen_callable_ids_.erase(callable_id);
     release_chip_callable_buffer(state.chip_buffer_hash);
 
-    if (state.host_dlopen_handle != nullptr) {
-        // hbg path: no device-side orch SO handle, just dlclose the host handle.
-        dlclose(state.host_dlopen_handle);
-        return 0;
-    }
     return 0;
 }
 
@@ -2859,6 +2857,13 @@ int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
 int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_common_impl(true); }
 
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
+    if (!abandon_device_resources) {
+        if (execution_mode_latch().is_kernel()) {
+            const int rc = kernel_exec_state_.begin_close();
+            if (rc != 0) return rc;
+        }
+        common_cleanup_pending_ = true;
+    }
     int rc = 0;
     auto capture = [&rc](int err) {
         if (err != 0 && rc == 0) rc = err;
@@ -2935,6 +2940,24 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         );
         capture(PTO_RUNTIME_ERR_INVALID_STATE);
     }
+    // The control stream and callable source allocations remain live until
+    // device-side cleanup acknowledges completion AND RTS unload succeeds.
+    // Native finalization has already refused outstanding eager runs.
+    if (!abandon_device_resources) {
+        if (rc != 0) return rc;
+        rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
+        if (control_stream == nullptr) control_stream = stream_aicpu_;
+        const int loader_rc = load_aicpu_op_.Finalize(control_stream);
+        if (loader_rc != 0) return loader_rc;
+        // HBG's orchestration images are host-owned. Preserve any failed
+        // handle and the remaining source/control owners for explicit retry.
+        for (auto &item : callables_) {
+            void *&handle = item.second.host_dlopen_handle;
+            if (handle == nullptr) continue;
+            if (dlclose(handle) != 0) return PTO_RUNTIME_ERR_INTERNAL;
+            handle = nullptr;
+        }
+    }
     if (stream_aicpu_ != nullptr) {
         if (!abandon_device_resources) {
             capture(rtStreamDestroy(stream_aicpu_));
@@ -2962,25 +2985,9 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
 
     bool kernel_cleanup_failed = false;
 
-    // LoadAicpuOp holds a binary_handle_ from rtsBinaryLoadFromFile; unload it
-    // here while RTS is live so ~LoadAicpuOp's idempotent Finalize() no-ops
-    // instead of unloading after aclFinalize (see the invariant above).
     if (abandon_device_resources) {
         load_aicpu_op_.ForgetWithoutUnload();
-        // A force reset invalidates every device allocation at once. If the
-        // reset failed, the device is quarantined and per-allocation rtFree is
-        // still unsafe. Forget allocator ownership before the shared host-side
-        // cleanup below, so arena/free backstops become local no-ops. Per-run
-        // kernel arguments live on PreparedExecution and are abandoned by
-        // cleanup_execution() before finalize is reached.
         mem_alloc_.abandon_after_device_failure();
-    } else {
-        // A failed unload keeps the loader's handle, so a kernel close must
-        // report the failure: its device is borrowed and never reset, which
-        // makes this close the only thing that can retire the binary.
-        const int loader_rc = load_aicpu_op_.Finalize();
-        capture(loader_rc);
-        kernel_cleanup_failed = execution_mode_latch().is_kernel() && loader_rc != 0;
     }
 
     // aicore_bin_handle_ was registered once via rtRegisterAllKernel; CANN
@@ -2990,8 +2997,8 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     sdma_warmup_bin_handle_ = nullptr;
     sdma_warmed_ = false;
     binaries_loaded_ = false;
-    // The inner AICPU SO is unloaded with the binaries above, so its latched
-    // globals are gone too — clear the one-shot guard so a reused runner
+    // RTS registration is retired above; CANN may retain the immutable SO.
+    // Clear the one-shot guard so a reused runner
     // re-launches simpler_aicpu_init after the next ensure_binaries_loaded().
     aicpu_init_launched_ = false;
 
@@ -3033,14 +3040,10 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
         chip_callable_buffers_.clear();
     }
 
-    // hbg path: dlclose any host orch handles callers forgot to unregister.
-    // finalize() is the last chance; Worker.close() does not auto-unregister
-    // each callable_id, so without this loop the host process leaks one
-    // dlopen handle per (re)created Worker — observable in long-running
-    // pytest sessions.
-    for (auto &kv : callables_) {
-        if (kv.second.host_dlopen_handle != nullptr) {
-            dlclose(kv.second.host_dlopen_handle);
+    if (abandon_device_resources) {
+        // Host orchestration handles are independent of the retired device.
+        for (auto &item : callables_) {
+            if (item.second.host_dlopen_handle != nullptr) (void)dlclose(item.second.host_dlopen_handle);
         }
     }
     callables_.clear();
@@ -3255,6 +3258,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     if (abandon_device_resources) {
         LOG_WARN("Fatal teardown: host-side ownership cleared without further device calls");
     }
+    common_cleanup_pending_ = false;
     return rc;
 }
 

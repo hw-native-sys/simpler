@@ -216,10 +216,15 @@ public:
         retire_run_fence(prepared);
         // The last created event is the caller tail, not a context event.
         failed_destroy_event = &tokens[16 + next_event - 1];
+        void *control_stream = kernel_execution_state().hidden_stream(KernelStreamKind::Aicpu);
         assert(finalize_common() == -778);
-        assert(!kernel_execution_state().has_live_resources());
+        assert(kernel_execution_state().has_live_resources());
+        assert(kernel_execution_state().phase() == KernelContextPhase::Closing);
+        assert(!kernel_execution_state().accepts_dispatch());
+        assert(kernel_execution_state().hidden_stream(KernelStreamKind::Aicpu) == control_stream);
         assert(kernel_resources_live());
         assert(finalize_common() == 0);
+        assert(!kernel_execution_state().has_live_resources());
     }
     void finish() {
         // This probe owns only host-backed stub objects. No device task can

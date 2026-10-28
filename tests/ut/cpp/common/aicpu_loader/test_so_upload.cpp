@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <sys/resource.h>
 #include <sys/statvfs.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
@@ -33,6 +34,8 @@ aicpu::aicpuContext_t context{1, 0, 123, 7};
 aicpu::status_t context_status = aicpu::AICPU_ERROR_NONE;
 #if defined(__linux__)
 int fault_write_errno;
+int fault_close_errno;
+int fault_link_errno;
 bool fail_capacity;
 int capacity_calls;
 #endif
@@ -40,10 +43,23 @@ int capacity_calls;
 
 #if defined(__linux__)
 extern "C" ssize_t __real_write(int, const void *, size_t);
+extern "C" int __real_close(int);
+extern "C" int __real_link(const char *, const char *);
 extern "C" int __real_statvfs(const char *, struct statvfs *);
 extern "C" ssize_t __wrap_write(int fd, const void *data, size_t count) {
     if (fault_write_errno == 0) return __real_write(fd, data, count);
     errno = fault_write_errno;
+    return -1;
+}
+extern "C" int __wrap_close(int fd) {
+    const int rc = __real_close(fd);
+    if (fault_close_errno == 0) return rc;
+    errno = fault_close_errno;
+    return -1;
+}
+extern "C" int __wrap_link(const char *source, const char *target) {
+    if (fault_link_errno == 0) return __real_link(source, target);
+    errno = fault_link_errno;
     return -1;
 }
 extern "C" int __wrap_statvfs(const char *path, struct statvfs *capacity) {
@@ -126,7 +142,7 @@ protected:
     std::string dir;
     void SetUp() override {
 #if defined(__linux__)
-        fault_write_errno = capacity_calls = 0;
+        fault_write_errno = fault_close_errno = fault_link_errno = capacity_calls = 0;
         fail_capacity = false;
 #endif
         char path[] = "/tmp/simpler-so-upload-XXXXXX";
@@ -135,7 +151,7 @@ protected:
     }
     void TearDown() override {
 #if defined(__linux__)
-        fault_write_errno = 0;
+        fault_write_errno = fault_close_errno = fault_link_errno = 0;
 #endif
         fs::remove_all(dir);
     }
@@ -143,8 +159,8 @@ protected:
 
 #if defined(__linux__)
 TEST_F(SoUploadFiles, CapacityErrorsPublishOneBoundedQueryAndPreserveTarget) {
-    const std::string path = dir + "/owned.so";
-    std::ofstream(path) << "old";
+    const std::string path = dir + "/owned.so", previous_path = dir + "/history.so";
+    std::ofstream(previous_path) << "old";
     for (int error : {ENOSPC, EDQUOT}) {
         SCOPED_TRACE(error);
         fault_write_errno = error;
@@ -164,7 +180,7 @@ TEST_F(SoUploadFiles, CapacityErrorsPublishOneBoundedQueryAndPreserveTarget) {
         EXPECT_EQ(result.free_blocks, 0u);
         EXPECT_EQ(result.available_blocks, 0u);
         EXPECT_EQ(result.free_inodes, 11u);
-        std::ifstream previous(path);
+        std::ifstream previous(previous_path);
         EXPECT_EQ(std::string(std::istreambuf_iterator<char>(previous), {}), "old");
         EXPECT_EQ(std::distance(fs::directory_iterator(dir), fs::directory_iterator()), 1);
     }
@@ -217,22 +233,49 @@ TEST_F(SoUploadFiles, FailedWritePreservesErrnoBeforeCleanup) {
     );
 }
 
-TEST_F(SoUploadFiles, ConcurrentRepeatedWritesAreAtomicAndLeaveOtherFilesAlone) {
+TEST_F(SoUploadFiles, SequentialGenerationsKeepOneImmutableImage) {
+    const std::string path = dir + "/owned.so";
+    const std::string bytes(65536, 'a');
+    BootstrapResult result;
+    ASSERT_TRUE(WriteBytes(path, bytes.data(), bytes.size(), result));
+    struct stat original{};
+    ASSERT_EQ(stat(path.c_str(), &original), 0);
+    for (int generation = 0; generation < 8; ++generation) {
+        BootstrapResult hit;
+        ASSERT_TRUE(WriteBytes(path, bytes.data(), bytes.size(), hit));
+        EXPECT_EQ(hit.stage, BootstrapStage::CacheHit);
+        EXPECT_EQ(hit.written_bytes, 0u);
+        struct stat current{};
+        ASSERT_EQ(stat(path.c_str(), &current), 0);
+        EXPECT_EQ(current.st_ino, original.st_ino);
+        EXPECT_EQ(current.st_dev, original.st_dev);
+        EXPECT_EQ(std::distance(fs::directory_iterator(dir), fs::directory_iterator()), 1);
+    }
+    const std::string collision(bytes.size(), 'b');
+    BootstrapResult collision_result;
+    EXPECT_FALSE(WriteBytes(path, collision.data(), collision.size(), collision_result));
+    EXPECT_EQ(collision_result.stage, BootstrapStage::Verify);
+    EXPECT_EQ(collision_result.error_number, EINVAL);
+    std::ifstream file(path, std::ios::binary);
+    EXPECT_TRUE(std::string(std::istreambuf_iterator<char>(file), {}) == bytes);
+}
+
+TEST_F(SoUploadFiles, ConcurrentPublicationChoosesOneImmutableImageAndLeavesOtherFilesAlone) {
     const std::string path = dir + "/owned.so", history = dir + "/simpler_inner_1_0.so";
     std::ofstream(history) << "history";
-    std::array<bool, 4> good{true, true, true, true};
+    std::array<int, 4> successes{};
     std::array<std::thread, 4> writers;
     for (size_t i = 0; i < writers.size(); ++i)
         writers[i] = std::thread([&, i] {
             const std::string bytes(65536, 'a' + i);
             BootstrapResult result;
             for (int k = 0; k < 20; ++k)
-                if (!WriteBytes(path, bytes.data(), bytes.size(), result)) good[i] = false;
+                if (WriteBytes(path, bytes.data(), bytes.size(), result)) ++successes[i];
         });
     for (auto &writer : writers)
         writer.join();
-    for (bool result : good)
-        EXPECT_TRUE(result);
+    EXPECT_EQ(std::count(successes.begin(), successes.end(), 20), 1);
+    EXPECT_EQ(std::count(successes.begin(), successes.end(), 0), 3);
     std::ifstream file(path, std::ios::binary);
     const std::string actual((std::istreambuf_iterator<char>(file)), {});
     ASSERT_EQ(actual.size(), 65536);
@@ -266,11 +309,47 @@ TEST_F(SoUploadFiles, FailedUploadPreservesExistingTargetAndAllowsRetry) {
             EXPECT_EQ(std::string(std::istreambuf_iterator<char>(previous), {}), "old");
         }
         BootstrapResult result;
+        if (existing) {
+            EXPECT_FALSE(WriteBytes(path, bytes.data(), bytes.size(), result));
+            EXPECT_EQ(result.stage, BootstrapStage::Verify);
+            EXPECT_EQ(result.error_number, EINVAL);
+            ASSERT_TRUE(fs::remove(path));
+        }
         ASSERT_TRUE(WriteBytes(path, bytes.data(), bytes.size(), result));
         EXPECT_EQ(result.written_bytes, bytes.size());
         std::ifstream retried(path, std::ios::binary);
         EXPECT_EQ(std::string(std::istreambuf_iterator<char>(retried), {}), bytes);
         ASSERT_TRUE(fs::remove(path));
     }
+}
+#if defined(__linux__)
+TEST_F(SoUploadFiles, FailedCloseOrLinkPreservesOriginalStageAndLeavesNoPartialFile) {
+    const auto path = dir + "/owned.so";
+    for (bool close_failure : {true, false}) {
+        fault_close_errno = close_failure ? EIO : 0;
+        fault_link_errno = close_failure ? 0 : EACCES;
+        BootstrapResult result;
+        EXPECT_FALSE(WriteBytes(path, "runtime", 7, result));
+        EXPECT_EQ(result.stage, close_failure ? BootstrapStage::Close : BootstrapStage::Link);
+        EXPECT_EQ(result.error_number, close_failure ? EIO : EACCES);
+        EXPECT_TRUE(fs::is_empty(dir));
+    }
+}
+#endif
+
+TEST_F(SoUploadFiles, VerificationRefusesSymlinksAndNonRegularFiles) {
+    const auto path = dir + "/owned.so";
+    fs::create_directory(path);
+    BootstrapResult directory;
+    EXPECT_FALSE(WriteBytes(path, "x", 1, directory));
+    EXPECT_EQ(directory.stage, BootstrapStage::Verify);
+    EXPECT_EQ(directory.error_number, EINVAL);
+    fs::remove(path);
+    std::ofstream(dir + "/target.so") << "x";
+    fs::create_symlink(dir + "/target.so", path);
+    BootstrapResult symlink;
+    EXPECT_FALSE(WriteBytes(path, "x", 1, symlink));
+    EXPECT_EQ(symlink.stage, BootstrapStage::Verify);
+    EXPECT_EQ(symlink.error_number, ELOOP);
 }
 }  // namespace

@@ -117,6 +117,22 @@ TEST(KernelExecutionState, SameDeviceDifferentContextRefusesCloseWithoutReleasin
     EXPECT_FALSE(state.has_live_resources());
 }
 
+TEST(KernelExecutionState, BeginCloseStopsAdmissionWithoutRetiringColdCleanupStreams) {
+    FakeContextOps fake;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    void *stream = state.hidden_stream(KernelStreamKind::Aicpu);
+    ASSERT_EQ(state.begin_close(), 0);
+    EXPECT_FALSE(state.accepts_dispatch());
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closing);
+    EXPECT_EQ(state.hidden_stream(KernelStreamKind::Aicpu), stream);
+    EXPECT_EQ(fake.streams_destroyed, 0);
+    EXPECT_EQ(fake.events_destroyed, 0);
+    ASSERT_EQ(state.begin_close(), 0);
+    EXPECT_EQ(state.close(), 0);
+    EXPECT_FALSE(state.has_live_resources());
+}
+
 TEST(KernelExecutionState, MissingContextOrQueryFailureCreatesNoResources) {
     FakeContextOps fake;
     KernelExecutionState state;

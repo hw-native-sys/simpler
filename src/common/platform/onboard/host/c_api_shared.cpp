@@ -816,6 +816,23 @@ int finalize_device(DeviceContextHandle ctx) {
     return run_context_teardown(steps, proof_slot(runner));
 }
 
+// Private native admission proof. A terminal teardown can return zero while
+// abandoning unresolved owners, so its return code alone cannot admit a successor.
+int simpler_execution_environment_releasable_ctx(DeviceContextHandle ctx) {
+    if (ctx == nullptr) return 0;
+    try {
+        auto *runner = static_cast<DeviceRunnerBase *>(ctx);
+        std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
+        return may_initialize_context(
+                   runner->teardown_proof(), runner->native_runs_outstanding(), runner->device_id() >= 0
+               ) ?
+                   1 :
+                   0;
+    } catch (...) {
+        return 0;
+    }
+}
+
 int simpler_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,

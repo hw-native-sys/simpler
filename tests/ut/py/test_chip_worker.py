@@ -217,7 +217,7 @@ def kernel_symbol_runtime(tmp_path_factory):
     cache = {}
     next_library_id = 0
 
-    def build(
+    def build(  # noqa: PLR0913 -- independently selectable native lifecycle faults
         *,
         supported=0,
         missing=(),
@@ -228,6 +228,8 @@ def kernel_symbol_runtime(tmp_path_factory):
         early_failure=None,
         lifecycle_log=None,
         workspace=False,
+        init_gate=False,
+        unproven_cleanup=False,
     ):
         nonlocal next_library_id
         key = (
@@ -240,9 +242,11 @@ def kernel_symbol_runtime(tmp_path_factory):
             early_failure,
             lifecycle_log,
             workspace,
+            init_gate,
+            unproven_cleanup,
         )
         # Fault scripts retain their consumed failure budget in the loaded DSO.
-        if finalize_failures == 0 and key in cache:
+        if finalize_failures == 0 and not init_gate and key in cache:
             return cache[key]
         source = build_dir / f"runtime_{next_library_id}.cpp"
         next_library_id += 1
@@ -250,11 +254,18 @@ def kernel_symbol_runtime(tmp_path_factory):
         library = source.with_suffix(".so")
         size = "0" if early_failure == "size" else "sizeof(uint64_t)"
         alignment = "3 * alignof(uint64_t)" if early_failure == "alignment" else "alignof(uint64_t)"
+        releasable = (
+            "0" if early_failure == "grant_cleanup" else "(context->initialized == 0 || context->cleanup_proven)"
+        )
         source.write_text(
             '#include "runtime_c_api.h"\n'
             "#include <cstdlib>\n"
             "#include <cstdio>\n"
             "#include <memory>\n"
+            "#include <atomic>\n"
+            "#include <condition_variable>\n"
+            "#include <chrono>\n"
+            "#include <mutex>\n"
             f"static const char *lifecycle_log = {json.dumps(str(lifecycle_log)) if lifecycle_log else 'nullptr'};\n"
             "static void record(const char *event) {\n"
             "    if (!lifecycle_log) return;\n"
@@ -263,7 +274,26 @@ def kernel_symbol_runtime(tmp_path_factory):
             '    std::fprintf(file, "%s\\n", event);\n'
             "    std::fclose(file);\n"
             "}\n"
-            "static int live_contexts = 0;\n"
+            "static std::atomic<int> live_contexts{0}, creates{0}, program_inits{0};\n"
+            'extern "C" int test_creates() { return creates; }\n'
+            'extern "C" int test_program_inits() { return program_inits; }\n'
+            f"static bool gate_init = {'true' if init_gate else 'false'};\n"
+            "static bool init_entered = false, init_released = false;\n"
+            "static std::mutex init_mutex;\n"
+            "static std::condition_variable init_changed;\n"
+            'extern "C" int test_wait_init() {\n'
+            "    std::unique_lock<std::mutex> lock(init_mutex);\n"
+            "    return init_changed.wait_for(lock, std::chrono::seconds(5), [] { return init_entered; });\n"
+            "}\n"
+            'extern "C" void test_release_init() {\n'
+            "    std::lock_guard<std::mutex> lock(init_mutex); init_released = true; init_changed.notify_all();\n"
+            "}\n"
+            "static void enter_init() {\n"
+            "    std::unique_lock<std::mutex> lock(init_mutex);\n"
+            "    if (!gate_init) return;\n"
+            "    gate_init = false; init_entered = true; init_changed.notify_all();\n"
+            "    init_changed.wait(lock, [] { return init_released; });\n"
+            "}\n"
             "static int destroys = 0, closes = 0, borrowed_inits = 0, validation = 0;\n"
             'extern "C" int test_destroys() { return destroys; }\n'
             'extern "C" int test_closes() { return closes; }\n'
@@ -274,7 +304,8 @@ def kernel_symbol_runtime(tmp_path_factory):
             '    Scratch() { ++live_scratch; record("scratch-created"); }\n'
             '    ~Scratch() { --live_scratch; record("scratch-destroyed"); }\n'
             "};\n"
-            "struct Context { uint64_t initialized = 0, workspace_limit = 0; std::shared_ptr<void> scratch; };\n"
+            "struct Context { uint64_t initialized = 0, workspace_limit = 0; std::shared_ptr<void> scratch; "
+            "bool cleanup_proven = false; };\n"
             "struct ContextLeakCheck {\n"
             "    ~ContextLeakCheck() {\n"
             "        if (live_contexts != 0 || live_scratch != 0) std::abort();\n"
@@ -289,15 +320,24 @@ def kernel_symbol_runtime(tmp_path_factory):
             # not export the setter is a stale build, not an opt-out. This stub
             # accepts the pointer and ignores it, as it does the log state.
             'extern "C" void simpler_bind_device_fault_monitor(void *) {}\n'
-            "DeviceContextHandle create_device_context() { ++live_contexts; return new Context; }\n"
+            "DeviceContextHandle create_device_context() { ++creates; ++live_contexts; return new Context; }\n"
             "void destroy_device_context(DeviceContextHandle ctx) {\n"
             "    ++destroys; --live_contexts; delete static_cast<Context *>(ctx);\n"
             '    record("context-destroyed");\n'
             "}\n"
             f"static int finalize_failures = {finalize_failures};\n"
-            "int finalize_device(DeviceContextHandle) {\n"
+            + (
+                'extern "C" int simpler_execution_environment_releasable_ctx(DeviceContextHandle ctx) {\n'
+                "    auto *context = static_cast<Context *>(ctx);\n"
+                f"    return {releasable};\n"
+                "}\n"
+                if "simpler_execution_environment_releasable_ctx" not in missing
+                else ""
+            )
+            + "int finalize_device(DeviceContextHandle ctx) {\n"
             "    ++closes;\n"
             "    if (finalize_failures > 0) { --finalize_failures; return -77; }\n"
+            f"    static_cast<Context *>(ctx)->cleanup_proven = {'false' if unproven_cleanup else 'true'};\n"
             "    return 0;\n"
             "}\n"
             f"size_t get_runtime_size() {{ return {size}; }}\n"
@@ -311,6 +351,7 @@ def kernel_symbol_runtime(tmp_path_factory):
             "int simpler_init(DeviceContextHandle ctx, int, const uint8_t *, size_t, const uint8_t *, size_t,\n"
             "                 const uint8_t *, size_t, const CallConfig *, int, const void *, uint64_t) {\n"
             "    auto *context = static_cast<Context *>(ctx);\n"
+            "    ++program_inits; enter_init();\n"
             "    context->initialized = 1;\n"
             "    context->scratch = std::make_shared<Scratch>();\n"
             f"    return {init_result};\n"
@@ -339,7 +380,7 @@ def kernel_symbol_runtime(tmp_path_factory):
                     "    out->budget_enforced = workspace_limit != 0; out->limit_bytes = workspace_limit; return 0;\n"
                     "}\n"
                 )
-        if early_failure == "grant":
+        if early_failure in ("grant", "grant_cleanup"):
             with source.open("a", encoding="utf-8") as output:
                 output.write("int simpler_set_run_resource_grant_ctx(DeviceContextHandle, uint32_t) { return -89; }\n")
         if borrowed:
@@ -348,7 +389,8 @@ def kernel_symbol_runtime(tmp_path_factory):
                     "int simpler_kernel_mode_init(DeviceContextHandle ctx, int, const uint8_t *, size_t, "
                     "const uint8_t *, size_t, const uint8_t *, size_t, const CallConfig *cfg, uint64_t generation) {\n"
                     "    auto *context = static_cast<Context *>(ctx);\n"
-                    "    if (cfg == nullptr || generation != 77 || context->initialized != 0) std::abort();\n"
+                    "    enter_init();\n"
+                    "    if (cfg == nullptr || generation == 0 || context->initialized != 0) std::abort();\n"
                     f"    ++borrowed_inits; context->initialized = {0 if init_result == -1001 else 2};\n"
                     f"    return {init_result};\n"
                     "}\n"
@@ -470,6 +512,13 @@ class TestChipWorkerKernelSymbols:
                     del worker
                     gc.collect()
                     assert Path(sys.argv[2]).read_text().splitlines() == ["scratch-created"]
+                    successor = _ChipWorker()
+                    try:
+                        successor.init(sys.argv[1], os.devnull, os.devnull, "", device_id=0)
+                    except RuntimeError as error:
+                        assert "device 0 already has an execution Worker" in str(error)
+                    else:
+                        raise AssertionError("failed destructor released the device reservation")
                     os._exit(0)
                     """),
                 str(runtime),
@@ -537,7 +586,10 @@ class TestChipWorkerKernelSymbols:
         finally:
             worker.finalize()
 
-    @pytest.mark.parametrize("missing", (*_KERNEL_LIFECYCLE_SYMBOLS, "simpler_kernel_mode_supported"))
+    @pytest.mark.parametrize(
+        "missing",
+        (*_KERNEL_LIFECYCLE_SYMBOLS, "simpler_kernel_mode_supported", "simpler_execution_environment_releasable_ctx"),
+    )
     def test_missing_required_kernel_symbol_allows_retry(self, kernel_symbol_runtime, missing):
         # Every kernel-mode entry is required of every runtime, so any one of
         # them missing fails init regardless of what supported() would answer.
@@ -901,6 +953,208 @@ class TestPublicWorkerBorrowed:
         worker.close()
 
 
+class TestChipWorkerDeviceOwner:
+    @pytest.mark.parametrize("first_borrowed", [False, True])
+    @pytest.mark.parametrize("second_borrowed", [False, True])
+    @pytest.mark.parametrize("different_runtime", [False, True])
+    def test_same_device_refused_before_context_creation(
+        self, kernel_symbol_runtime, first_borrowed, second_borrowed, different_runtime
+    ):
+        runtime = kernel_symbol_runtime(borrowed=True)
+        other_runtime = kernel_symbol_runtime(borrowed=True, supported=1) if different_runtime else runtime
+        observer = ctypes.CDLL(str(other_runtime))
+        first, second, other_device = _ChipWorker(), _ChipWorker(), _ChipWorker()
+        first_options = {"borrowed_context_generation": 77} if first_borrowed else {}
+        second_options = {"borrowed_context_generation": 88} if second_borrowed else {}
+        try:
+            first.init(str(runtime), os.devnull, os.devnull, "", 0, **first_options)
+            environment = first._execution_environment
+            before = observer.test_creates(), observer.test_program_inits(), observer.test_borrowed_inits()
+            with pytest.raises(RuntimeError, match="device 0 already has an execution Worker"):
+                second.init(str(other_runtime), os.devnull, os.devnull, "", 0, **second_options)
+            assert before == (observer.test_creates(), observer.test_program_inits(), observer.test_borrowed_inits())
+            assert first._execution_environment == environment
+            assert second._execution_environment is None
+            with pytest.raises(RuntimeError, match="already initialized"):
+                first.init(str(runtime), os.devnull, os.devnull, "", 0, **first_options)
+            other_device.init(str(other_runtime), os.devnull, os.devnull, "", 1, **second_options)
+            first.finalize()
+            second.init(str(other_runtime), os.devnull, os.devnull, "", 0, **second_options)
+            successor_environment = second._execution_environment
+            first.finalize()
+            contender = _ChipWorker()
+            with pytest.raises(RuntimeError, match="device 0 already has an execution Worker"):
+                contender.init(str(runtime), os.devnull, os.devnull, "", 0, **first_options)
+            assert second._execution_environment == successor_environment
+        finally:
+            first.finalize()
+            second.finalize()
+            other_device.finalize()
+
+    @pytest.mark.parametrize("borrowed", [False, True])
+    def test_concurrent_init_reserves_device_before_bootstrap(self, kernel_symbol_runtime, borrowed):
+        runtime = kernel_symbol_runtime(borrowed=True, init_gate=True)
+        observer = ctypes.CDLL(str(runtime))
+        first, second = _ChipWorker(), _ChipWorker()
+        options = {"borrowed_context_generation": 77} if borrowed else {}
+        errors = []
+
+        def initialize():
+            try:
+                first.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+            except Exception as error:
+                errors.append(error)
+
+        thread = threading.Thread(target=initialize)
+        thread.start()
+        try:
+            assert observer.test_wait_init() == 1
+            before = observer.test_creates()
+            with pytest.raises(RuntimeError, match="device 0 already has an execution Worker"):
+                second.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+            assert observer.test_creates() == before
+        finally:
+            observer.test_release_init()
+            thread.join(10)
+            assert not thread.is_alive()
+            first.finalize()
+            second.finalize()
+        assert not errors
+
+    @pytest.mark.parametrize("borrowed", [False, True])
+    def test_failed_close_keeps_reservation_until_retry(self, kernel_symbol_runtime, borrowed):
+        runtime = kernel_symbol_runtime(borrowed=True, finalize_failures=1)
+        healthy = kernel_symbol_runtime(borrowed=True)
+        first, successor = _ChipWorker(), _ChipWorker()
+        options = {"borrowed_context_generation": 77} if borrowed else {}
+        try:
+            first.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+            with pytest.raises(RuntimeError, match="device teardown failed"):
+                first.finalize()
+            with pytest.raises(RuntimeError, match="device 0 already has an execution Worker"):
+                successor.init(str(healthy), os.devnull, os.devnull, "", 0, **options)
+            first.finalize()
+            successor.init(str(healthy), os.devnull, os.devnull, "", 0, **options)
+        finally:
+            first.finalize()
+            successor.finalize()
+
+    @pytest.mark.parametrize("borrowed", [False, True])
+    @pytest.mark.parametrize("failed_cleanup", [False, True])
+    def test_init_rollback_releases_only_after_proven_cleanup(self, kernel_symbol_runtime, borrowed, failed_cleanup):
+        failing = kernel_symbol_runtime(borrowed=True, init_result=-66, finalize_failures=int(failed_cleanup))
+        healthy = kernel_symbol_runtime(borrowed=True)
+        observer = ctypes.CDLL(str(failing))
+        first, successor = _ChipWorker(), _ChipWorker()
+        options = {"borrowed_context_generation": 77} if borrowed else {}
+        try:
+            before = observer.test_closes(), observer.test_destroys()
+            with pytest.raises(RuntimeError, match="rollback failed" if failed_cleanup else "failed with code -66"):
+                first.init(str(failing), os.devnull, os.devnull, "", 0, **options)
+            assert observer.test_closes() == before[0] + 1
+            if failed_cleanup:
+                assert observer.test_destroys() == before[1]
+                assert first._execution_environment is not None
+                with pytest.raises(RuntimeError, match="device 0 already has an execution Worker"):
+                    successor.init(str(healthy), os.devnull, os.devnull, "", 0, **options)
+                first.finalize()
+            else:
+                assert observer.test_destroys() == before[1] + 1
+                assert first._execution_environment is None
+            successor.init(str(healthy), os.devnull, os.devnull, "", 0, **options)
+        finally:
+            first.finalize()
+            successor.finalize()
+
+    def test_simulator_classification_keeps_virtual_device_admission(self, kernel_symbol_runtime):
+        runtime = kernel_symbol_runtime()
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent("""\
+                    import os
+                    import sys
+                    from _task_interface import _ChipWorker
+
+                    runtime = sys.argv[1]
+                    first, second = _ChipWorker(), _ChipWorker()
+                    try:
+                        first.init(runtime, os.devnull, os.devnull, "", 0, sim_context_path=runtime)
+                        second.init(runtime, os.devnull, os.devnull, "", 0, sim_context_path=runtime)
+                        assert first._execution_environment != second._execution_environment
+                    finally:
+                        first.finalize()
+                        second.finalize()
+                    """),
+                str(runtime),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    @pytest.mark.parametrize("failure_stage", ["none", "native", "grant"])
+    @pytest.mark.parametrize("borrowed", [False, True])
+    def test_logical_terminal_close_keeps_unproven_device_reserved(
+        self, kernel_symbol_runtime, failure_stage, borrowed
+    ):
+        runtime = kernel_symbol_runtime(
+            borrowed=True,
+            init_result=-66 if failure_stage == "native" else 0,
+            early_failure="grant_cleanup" if failure_stage == "grant" else None,
+            unproven_cleanup=True,
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent("""\
+                    import os
+                    import sys
+                    from _task_interface import _ChipWorker
+
+                    runtime, failure_stage, borrowed = sys.argv[1], sys.argv[2], int(sys.argv[3])
+                    options = {"borrowed_context_generation": 77} if borrowed else {}
+                    first, successor = _ChipWorker(), _ChipWorker()
+                    if failure_stage != "none":
+                        try:
+                            first.init(runtime, os.devnull, os.devnull, "", 0, **options)
+                        except RuntimeError as error:
+                            assert "rollback" in str(error)
+                            expected = "refused a grant" if failure_stage == "grant" else "failed with code -66"
+                            assert expected in str(error)
+                            assert first._execution_environment is not None
+                        else:
+                            raise AssertionError("failed init unexpectedly succeeded")
+                    else:
+                        first.init(runtime, os.devnull, os.devnull, "", 0, **options)
+                    first.finalize()
+                    assert first._execution_environment is None
+                    first.finalize()
+                    del first
+                    try:
+                        successor.init(runtime, os.devnull, os.devnull, "", 0, **options)
+                    except RuntimeError as error:
+                        assert "device 0 already has an execution Worker" in str(error)
+                    else:
+                        raise AssertionError("logical terminal close released an unproven reservation")
+                    successor.finalize()
+                    """),
+                str(runtime),
+                failure_stage,
+                str(int(borrowed)),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+
 class TestChipWorkerExecutionEnvironment:
     @pytest.mark.parametrize("borrowed", [False, True])
     def test_environment_is_unique_and_survives_refusal(self, kernel_symbol_runtime, borrowed):
@@ -911,7 +1165,7 @@ class TestChipWorkerExecutionEnvironment:
         options = {"borrowed_context_generation": 77} if borrowed else {}
         try:
             first.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
-            second.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+            second.init(str(runtime), os.devnull, os.devnull, "", 1, **options)
             environment = first._execution_environment
             pid, incarnation, generation, device_id, is_borrowed = environment
             assert pid == os.getpid() and incarnation > 0 and generation > 0
@@ -960,6 +1214,9 @@ class TestChipWorkerExecutionEnvironment:
             assert worker.device_id == -1
             assert worker._execution_environment is None
             healthy = kernel_symbol_runtime(borrowed=borrowed)
+            successor = _ChipWorker()
+            successor.init(str(healthy), os.devnull, os.devnull, "", 0, **options)
+            successor.finalize()
             worker.init(str(healthy), os.devnull, os.devnull, "", 0, **options)
             assert worker.initialized and worker.runtime_slot_count == 1
             environment = worker._execution_environment
@@ -988,12 +1245,19 @@ class TestChipWorkerExecutionEnvironment:
                         except ExecutionContextRefused:
                             continue
                         os._exit(2)
+                    child_owner = _ChipWorker()
+                    child_owner.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+                    assert child_owner._execution_environment[0] == os.getpid()
+                    child_owner.finalize()
                 except BaseException:
                     os._exit(3)
                 os._exit(0)
             _, status = os.waitpid(pid, 0)
             assert os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0, status
             worker._validate_execution_context()
+            contender = _ChipWorker()
+            with pytest.raises(RuntimeError, match="device 0 already has an execution Worker"):
+                contender.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
         finally:
             worker.finalize()
 

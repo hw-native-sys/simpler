@@ -14,15 +14,18 @@
 #include "chip_run_lane.h"
 #include "common/host_log_binding.h"
 #include "device_fault_monitor_host.h"
+#include "device_execution_owners.h"
 #include "host_log.h"
 #include "pipeline_contract.h"
 #include "runtime_module.h"
 #include "host/raii_scope_guard.h"
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include <atomic>
+#include <cerrno>
 #include <cassert>
 #include <cstdlib>
 #include <cstdio>
@@ -37,6 +40,50 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+namespace simpler::worker {
+
+namespace {
+
+struct ResidentOwners {
+    DeviceExecutionOwners *table = nullptr;
+    int error = 0;
+};
+
+extern const ResidentOwners owner_registry;
+void owners_before_fork() { owner_registry.table->before_fork(); }
+void owners_after_fork_in_parent() { owner_registry.table->after_fork(); }
+void owners_after_fork_in_child() { owner_registry.table->after_fork(); }
+
+// Establish fork coordination while the resident module loads, before its
+// entrypoints are usable. A lazy function-static guard can itself be inherited
+// mid-initialization. Fork during module loading is outside this contract.
+const ResidentOwners owner_registry = []() noexcept {
+    ResidentOwners state;
+    try {
+        auto created = std::make_unique<DeviceExecutionOwners>();
+        state.error = pthread_atfork(owners_before_fork, owners_after_fork_in_parent, owners_after_fork_in_child);
+        if (state.error == 0) state.table = created.release();
+    } catch (...) {
+        state.error = ENOMEM;
+    }
+    // Registered callbacks retain this storage until process exit. Startup
+    // failure is reported on lookup, never by throwing from a static initializer.
+    return state;
+}();
+
+}  // namespace
+
+DeviceExecutionOwners &resident_device_execution_owners() {
+    if (owner_registry.error != 0 || owner_registry.table == nullptr) {
+        throw std::runtime_error(
+            "cannot initialize device-owner fork handlers: " + std::to_string(owner_registry.error)
+        );
+    }
+    return *owner_registry.table;
+}
+
+}  // namespace simpler::worker
 
 namespace {
 
@@ -120,6 +167,20 @@ uint64_t next_environment_incarnation() {
         }
     }
     throw std::overflow_error("execution environment identity space is exhausted");
+}
+
+void claim_device_owner(const ChipWorker::ExecutionEnvironment &environment) {
+    if (!simpler::worker::resident_device_execution_owners().claim(environment)) {
+        throw std::runtime_error(
+            "device " + std::to_string(environment.device_id) +
+            " already has an execution Worker in this process; confirmed cleanup is required before initializing "
+            "another"
+        );
+    }
+}
+
+void release_device_owner(const ChipWorker::ExecutionEnvironment &environment) {
+    simpler::worker::resident_device_execution_owners().release(environment);
 }
 
 uint64_t next_native_run_epoch() {
@@ -356,6 +417,10 @@ void ChipWorker::init(
         get_run_stream_set_create_count_fn_ =
             module->required<GetAicpuDlopenCountFn>("get_run_stream_set_create_count");
         finalize_device_fn_ = module->required<FinalizeDeviceFn>("finalize_device");
+        if (sim_context_path.empty()) {
+            execution_environment_releasable_fn_ =
+                module->required<ExecutionEnvironmentReleasableFn>("simpler_execution_environment_releasable_ctx");
+        }
         // ACL lifecycle + comm_* + the required kernel-mode entries are part of
         // the uniform host_runtime.so ABI. Every platform runtime exports all of
         // them — a runtime without a real backend (today: a5 for comm) ships
@@ -421,15 +486,19 @@ void ChipWorker::init(
     pipeline_generations_.resize(resolved_contract.pipeline_depth);
 
     const uint64_t incarnation = next_environment_incarnation();
+    const ExecutionEnvironment environment{
+        static_cast<uint64_t>(getpid()), incarnation, borrowed_context_generation.value_or(incarnation), device_id,
+        borrowed_context_generation.has_value()
+    };
+    if (sim_context_path.empty()) {
+        claim_device_owner(environment);
+        device_owner_reserved_ = true;
+    }
+    execution_environment_ = environment;
     device_ctx_ = create_device_context_fn_();
     if (device_ctx_ == nullptr) {
         throw std::runtime_error("create_device_context returned null");
     }
-
-    execution_environment_ = ExecutionEnvironment{
-        static_cast<uint64_t>(getpid()), incarnation, borrowed_context_generation.value_or(incarnation), device_id,
-        borrowed_context_generation.has_value()
-    };
 
     try {
         // The grant reaches the runtime before anything can name a set, so every
@@ -464,9 +533,21 @@ void ChipWorker::init(
         }
         runtime_bufs_.swap(runtime_bufs);
     } catch (...) {
+        if (device_owner_reserved_ && execution_environment_releasable_fn_(device_ctx_) != 1) {
+            runtime_module_ = module;
+            device_id_ = device_id;
+            try {
+                throw;
+            } catch (const std::exception &error) {
+                throw std::runtime_error(
+                    std::string(error.what()) +
+                    "; ChipWorker initialization rollback could not prove cleanup; keeping the context and host "
+                    "runtime loaded; finalize is required"
+                );
+            }
+        }
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
-        execution_environment_.reset();
         throw;
     }
 
@@ -479,6 +560,7 @@ void ChipWorker::init(
     // catch block so the buffers and any partially-resolved handle are torn
     // down symmetrically.
     bool borrowed_init_attempted = false;
+    bool program_init_attempted = false;
     int init_rc = 0;
     try {
         std::vector<uint8_t> aicpu_bytes = read_binary_file(aicpu_path);
@@ -569,6 +651,7 @@ void ChipWorker::init(
             // UNSUPPORTED establishes no resource owner and owes no close.
             if (init_rc == PTO_RUNTIME_ERR_UNSUPPORTED) borrowed_init_attempted = false;
         } else {
+            program_init_attempted = !simulated;
             init_rc = simpler_init_fn_(
                 device_ctx_, device_id, aicpu_bytes.data(), aicpu_bytes.size(), aicore_bytes.data(),
                 aicore_bytes.size(), dispatcher_ptr, dispatcher_bytes.size(), prewarm_config, enable_sdma ? 1 : 0,
@@ -582,21 +665,21 @@ void ChipWorker::init(
             );
         }
     } catch (...) {
-        // A borrowed runner's destroy entry refuses live owners. Only a
-        // successful explicit close makes destroying and unloading it safe.
-        if (borrowed_init_attempted) {
+        // Onboard init can leave device resources behind on failure. Only a
+        // successful explicit close proves this device reservation is retired.
+        if (borrowed_init_attempted || program_init_attempted) {
             const int close_rc = finalize_device_fn_(device_ctx_);
-            if (close_rc != 0) {
+            if (close_rc != 0 || execution_environment_releasable_fn_(device_ctx_) != 1) {
                 runtime_module_ = module;
                 device_id_ = device_id;
                 throw std::runtime_error(
-                    "ChipWorker borrowed init failed with code " + std::to_string(init_rc) + "; rollback failed (" +
-                    std::to_string(close_rc) + "); keeping the context and host runtime loaded; finalize is required"
+                    std::string(borrowed_init_attempted ? "ChipWorker borrowed init" : "ChipWorker init") +
+                    " failed with code " + std::to_string(init_rc) + "; rollback failed (" + std::to_string(close_rc) +
+                    "); cleanup is unproven; keeping the context and host runtime loaded; finalize is required"
                 );
             }
         }
-        // Program rollback runs the runner destructor without an explicit
-        // finalize: a failed sim attach must not release a sibling's context.
+        // A failed sim attach must not release a sibling's virtual context.
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
         clear_runtime_binding();
@@ -730,17 +813,18 @@ void ChipWorker::finalize() {
             "); keeping the context and host runtime loaded"
         );
     }
+    const bool release_device_reservation =
+        !device_owner_reserved_ || execution_environment_releasable_fn_(device_ctx_) == 1;
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
         destroy_device_context_fn_(device_ctx_);
         device_ctx_ = nullptr;
     }
     assert(device_ctx_ == nullptr);
-    clear_runtime_binding();
+    clear_runtime_binding(release_device_reservation);
     finalized_ = true;
 }
 
-void ChipWorker::clear_runtime_binding() {
-    execution_environment_.reset();
+void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     create_device_context_fn_ = nullptr;
     simpler_init_fn_ = nullptr;
     destroy_device_context_fn_ = nullptr;
@@ -796,6 +880,7 @@ void ChipWorker::clear_runtime_binding() {
     get_host_dlopen_count_fn_ = nullptr;
     get_run_stream_set_create_count_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
+    execution_environment_releasable_fn_ = nullptr;
     ensure_acl_ready_fn_ = nullptr;
     create_comm_stream_fn_ = nullptr;
     destroy_comm_stream_fn_ = nullptr;
@@ -825,6 +910,14 @@ void ChipWorker::clear_runtime_binding() {
     pipeline_contract_ = {PTO_PIPELINE_CONTRACT_ABI_VERSION, 0, 1, {}};
     initialized_ = false;
     device_id_ = -1;
+    if (device_owner_reserved_) {
+        assert(execution_environment_.has_value());
+        // Logical terminal retirement can clear the binding without proving
+        // cleanup. Its reservation remains in the registry until process exit.
+        if (release_device_reservation) release_device_owner(*execution_environment_);
+        device_owner_reserved_ = false;
+    }
+    execution_environment_.reset();
 }
 
 int32_t ChipWorker::register_callable(const void *callable, size_t callable_size) {

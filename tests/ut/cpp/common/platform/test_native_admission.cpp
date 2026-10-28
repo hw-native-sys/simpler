@@ -58,6 +58,87 @@ int fake_create_event(void *, void **event) noexcept {
 int fake_destroy_event(void *, void *) noexcept { return 0; }
 }  // namespace
 
+extern "C" int simpler_execution_environment_releasable_ctx(DeviceContextHandle);
+
+TEST_F(NativeAdmissionTest, ProgramColdCleanupDebtAbandonsOnlyAfterResetAttempt) {
+    class CloseRunner : public Runner {
+    public:
+        void own_sources() {
+            ASSERT_NE(mem_alloc_.alloc(64), nullptr);
+            ASSERT_EQ(rtStreamCreate(&stream_aicpu_, 0), 0);
+        }
+        bool pending() const { return common_cleanup_pending_; }
+        void retire(bool reset_ok) { retire_loader_after_device_teardown(reset_ok); }
+    };
+    for (int reset_error : {0, -4245}) {
+        SCOPED_TRACE(reset_error);
+        CloseRunner runner;
+        runner.own_sources();
+        control().loader_finalize_error = -4243;
+        EXPECT_EQ(finalize_device(&runner), -4243);
+        EXPECT_TRUE(runner.pending());
+        EXPECT_EQ(control().bytes, 64u);
+        EXPECT_EQ(runner.teardown_proof(), TeardownProof::Unresolved);
+        control().reset_error = reset_error;
+        EXPECT_EQ(rtDeviceReset(0), reset_error);
+        runner.retire(reset_error == 0);
+        EXPECT_FALSE(runner.pending());
+        EXPECT_EQ(control().calls_after_retire, 0u);
+        EXPECT_EQ(runner.teardown_proof(), TeardownProof::Unresolved);
+        EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 0);
+        // Provider fixture cleanup is external to every per-resource RTS path.
+        native_admission_transport::release_provider_state();
+        control().retired = false;
+        control().loader_finalize_error = 0;
+    }
+}
+
+TEST_F(NativeAdmissionTest, NativeReleasableProofReadsRealSuccessfulCloseAndOutstandingUsers) {
+    Runner runner;
+    EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 0);
+    ASSERT_EQ(finalize_device(&runner), 0);
+    EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 1);
+    int owner = 0;
+    ASSERT_TRUE(runner.try_reserve_native_run(&owner, 1, arena_bank(1), true));
+    EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 0);
+    const size_t close_calls = control().loader_finalize_calls;
+    EXPECT_NE(finalize_device(&runner), 0);
+    EXPECT_EQ(control().loader_finalize_calls, close_calls);
+    runner.release_native_run_reservation(&owner);
+    EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 0);
+    ASSERT_EQ(finalize_device(&runner), 0);
+    EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 1);
+}
+
+TEST_F(NativeAdmissionTest, KernelColdCleanupFailureStopsAdmissionAndRetainsItsControlStream) {
+    Runner runner;
+    ASSERT_EQ(runner.execution_mode_latch().latch(SIMPLER_MODE_KERNEL), 0);
+    KernelContextOps ops{&runner,
+                         fake_current_device,
+                         fake_current_context,
+                         fake_create_hidden_stream,
+                         fake_destroy_hidden_stream,
+                         fake_create_event,
+                         fake_destroy_event};
+    ASSERT_EQ(runner.kernel_execution_state().initialize(0, ops), 0);
+    ASSERT_TRUE(runner.kernel_execution_state().accepts_dispatch());
+    void *stream = runner.kernel_execution_state().hidden_stream(KernelStreamKind::Aicpu);
+    control().loader_finalize_error = -4243;
+    ASSERT_EQ(finalize_device(&runner), -4243);
+    EXPECT_EQ(runner.kernel_execution_state().phase(), KernelContextPhase::Closing);
+    EXPECT_FALSE(runner.kernel_execution_state().accepts_dispatch());
+    EXPECT_EQ(runner.kernel_execution_state().hidden_stream(KernelStreamKind::Aicpu), stream);
+    const uint8_t binary[] = {1};
+    const auto image = make_chip_callable(nullptr, 0, "orch", binary, sizeof(binary), nullptr, nullptr, 0, "");
+    EXPECT_EQ(
+        simpler_kernel_mode_prepare_callable(&runner, 3, image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    control().loader_finalize_error = 0;
+    EXPECT_EQ(finalize_device(&runner), 0);
+    EXPECT_EQ(runner.kernel_execution_state().phase(), KernelContextPhase::Closed);
+    EXPECT_FALSE(runner.kernel_execution_state().has_live_resources());
+}
+
 TEST_F(NativeAdmissionTest, RegistrationRefusesWhileANativeRunIsOutstanding) {
     Runner runner;
     ASSERT_EQ(runner.execution_mode_latch().latch(SIMPLER_MODE_KERNEL), 0);

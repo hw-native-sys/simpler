@@ -206,20 +206,38 @@ struct AicpuExecutor {
     // teardown and before it returns from the kernel.
     void publish_run_terminal();
 
-    ~AicpuExecutor() {
-        // Process-wide teardown (the single static instance dies here). Every
-        // in-use callable_id slot is dlclose()'d here; each is otherwise kept
-        // alive across runs for cache-hit reuse.
-        for (auto &e : orch_so_table_) {
-            if (!e.in_use) continue;
-            if (e.handle != nullptr) dlclose(e.handle);
-            if (e.path[0] != '\0') unlink(e.path);
-            e = OrchSoEntry{};
+    static int32_t release_callable(OrchSoEntry &entry, int (*close_so)(void *) = dlclose) {
+        if (entry.handle != nullptr) {
+            if (close_so(entry.handle) != 0) return -1;
+            entry.handle = nullptr;
+            entry.func = nullptr;
+            entry.bind = nullptr;
+            entry.config_func = nullptr;
         }
+        if (entry.path[0] != '\0' && unlink(entry.path) != 0 && errno != ENOENT) return -1;
+        entry = OrchSoEntry{};
+        return 0;
     }
+
+    int32_t release_callables(int (*close_so)(void *) = dlclose) {
+        // Per-run deinit owns scheduler/runtime teardown. Never retire a
+        // callable while a run still has its entry or bound runtime in use.
+        if (rt != nullptr || init_done_.load(std::memory_order_acquire) ||
+            runtime_init_ready_.load(std::memory_order_acquire))
+            return -1;
+        int32_t result = 0;
+        for (auto &entry : orch_so_table_) {
+            if (release_callable(entry, close_so) != 0) result = -1;
+        }
+        return result;
+    }
+
+    ~AicpuExecutor() { (void)release_callables(); }
 };
 
 static AicpuExecutor g_aicpu_executor;
+
+extern "C" int32_t aicpu_release_callables() { return g_aicpu_executor.release_callables(); }
 
 // The register_callable payload mirrors the runtime's orch symbol-name
 // capacity; keep the two in lockstep so a name that fits in Runtime also fits
@@ -448,14 +466,7 @@ int32_t AicpuExecutor::load_orch_so(
     // register_callable launch which has no phase buffer (the run-path SoLoad
     // slot is simply 0 now that run never loads).
     LOG_INFO("Thread %d: New orch SO detected (callable_id=%d), (re)loading", thread_idx, callable_id);
-    if (entry.handle != nullptr) {
-        dlclose(entry.handle);
-    }
-    if (entry.path[0] != '\0') {
-        // Unlink the old file so the new open() lands on a fresh inode.
-        unlink(entry.path);
-    }
-    entry = OrchSoEntry{};
+    if (release_callable(entry) != 0) return -1;
 
     const void *so_data = reinterpret_cast<const void *>(dev_orch_so_addr);
     size_t so_size = dev_orch_so_size;
@@ -503,6 +514,8 @@ int32_t AicpuExecutor::load_orch_so(
         return -1;
     }
     LOG_DEBUG("Thread %d: dlopen succeeded, handle=%p", thread_idx, handle);
+    entry.handle = handle;
+    snprintf(entry.path, sizeof(entry.path), "%s", so_path);
 
     const char *bind_log_error = nullptr;
     if (bind_orchestration_host_log_state(handle, &bind_log_error) != 0) {
@@ -510,8 +523,7 @@ int32_t AicpuExecutor::load_orch_so(
             "Thread %d: failed to bind orchestration host-log state: %s", thread_idx,
             bind_log_error ? bind_log_error : "invalid shared state"
         );
-        dlclose(handle);
-        unlink(so_path);
+        (void)release_callable(entry);
         return -1;
     }
 
@@ -533,14 +545,12 @@ int32_t AicpuExecutor::load_orch_so(
     const char *entry_dlsym_error = dlerror();
     if (entry_dlsym_error != nullptr) {
         LOG_ERROR("Thread %d: dlsym failed for entry symbol '%s': %s", thread_idx, entry_symbol, entry_dlsym_error);
-        dlclose(handle);
-        unlink(so_path);
+        (void)release_callable(entry);
         return -1;
     }
     if (orch_func == nullptr) {
         LOG_ERROR("Thread %d: dlsym returned NULL for entry symbol '%s'", thread_idx, entry_symbol);
-        dlclose(handle);
-        unlink(so_path);
+        (void)release_callable(entry);
         return -1;
     }
 

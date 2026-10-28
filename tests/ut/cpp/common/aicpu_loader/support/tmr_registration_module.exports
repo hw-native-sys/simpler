@@ -1,0 +1,7 @@
+_simpler_aicpu_exec
+_simpler_aicpu_init
+_simpler_aicpu_register_callable
+_simpler_aicpu_finalize
+_probe_selected_config
+_probe_fail_close_at
+_probe_live_handles

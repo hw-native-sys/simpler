@@ -2734,17 +2734,21 @@ protected:
      */
     void retire_loader_after_device_teardown(bool reset_confirmed) {
         if (execution_mode_latch_.is_kernel()) return;
-        if (!load_aicpu_op_.has_live_resources()) return;
-        if (reset_confirmed) {
-            LOG_WARN("finalize: device reset ended the generation of the retained AICPU binary handle; forgetting it");
-        } else {
-            LOG_ERROR(
-                "finalize: device reset did not complete and the AICPU binary handle is still retained; forgetting it "
-                "without unloading — the binary may still be resident, and no further call is issued against this "
-                "device"
-            );
+        if (load_aicpu_op_.has_live_resources()) {
+            if (reset_confirmed) {
+                LOG_WARN("finalize: reset retired the retained AICPU registration; forgetting its handles");
+            } else {
+                LOG_ERROR("finalize: reset is unconfirmed; abandoning AICPU handles without another device call");
+            }
+            load_aicpu_op_.ForgetWithoutUnload();
         }
-        load_aicpu_op_.ForgetWithoutUnload();
+        if (common_cleanup_pending_) {
+            // Program's existing tail attempted its reset after common cleanup
+            // failed. No individual device release is legal past that boundary,
+            // including when the reset itself failed. Clear only bookkeeping.
+            (void)abandon_common_after_device_failure();
+            mark_teardown_unresolved();
+        }
     }
 
     void release_graph_definition_staging();
@@ -2941,6 +2945,7 @@ protected:
     TeardownProof teardown_proof_{TeardownProof::NotAttempted};
     ExecutionModeLatch execution_mode_latch_;
     bool program_initialized_{false};
+    bool common_cleanup_pending_{false};
     KernelExecutionState kernel_exec_state_;
     PersistentKernelArgs persistent_args_;
     Runtime kernel_runtime_;

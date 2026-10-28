@@ -9,24 +9,25 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * AICPU Dispatcher implementation — transient bootstrap-only upload helper.
+ * AICPU Dispatcher implementation — bootstrap-only upload helper.
  *
  * See aicpu_dispatcher.h for architecture. The dispatcher SO exists only
  * to provide a piece of code that runs with sched-thread (HwHiAiUser)
  * permissions for one purpose: write the bundled runtime SO bytes to
  * the main aicpu_scheduler's process directory under a content-fingerprint
- * filename. Once Init returns, this SO is no longer referenced — host's
- * subsequent rtsBinaryLoadFromFile calls target the runtime SO file directly.
+ * filename. CANN owns the dispatcher load/cache; subsequent per-task launches
+ * target the registered runtime SO directly.
  */
 
 #include "aicpu_dispatcher.h"
 
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <unistd.h>
 
-#include <cerrno>
 #include <algorithm>
+#include <cerrno>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
@@ -138,17 +139,59 @@ std::string MakeInnerSoPath(uint64_t fp, uint64_t device_id, BootstrapResult *re
     return buf;
 }
 
-// Per-upload temporary files and atomic rename publish complete SOs to concurrent
-// readers. Existing dlopen handles remain bound to their original inode.
+// A runtime image may remain mapped after registration unload. Verify and reuse
+// its immutable inode; publication must never replace an existing image.
+bool ExistingImageMatches(const std::string &path, const char *data, uint64_t len, BootstrapResult &report) {
+    const int fd = open(path.c_str(), O_RDONLY | O_NOFOLLOW);
+    if (fd < 0) {
+        ReportFailure(report, BootstrapStage::Verify, errno, path);
+        return false;
+    }
+    struct stat info{};
+    int error = 0;
+    if (fstat(fd, &info) != 0) error = errno;
+    else if (!S_ISREG(info.st_mode) || info.st_size < 0 || static_cast<uint64_t>(info.st_size) != len) error = EINVAL;
+    char bytes[4096];
+    uint64_t offset = 0;
+    while (error == 0 && offset < len) {
+        const size_t count = static_cast<size_t>(std::min<uint64_t>(sizeof(bytes), len - offset));
+        const ssize_t got = read(fd, bytes, count);
+        if (got < 0 && errno == EINTR) continue;
+        if (got < 0) error = errno;
+        else if (got == 0 || std::memcmp(bytes, data + offset, static_cast<size_t>(got)) != 0) error = EINVAL;
+        else offset += static_cast<uint64_t>(got);
+    }
+    const int close_rc = close(fd);
+    const int close_error = errno;
+    if (error != 0) {
+        ReportFailure(report, BootstrapStage::Verify, error, path);
+        return false;
+    }
+    if (close_rc != 0) {
+        ReportFailure(report, BootstrapStage::Close, close_error, path);
+        return false;
+    }
+    report.stage = BootstrapStage::CacheHit;
+    return true;
+}
+
 bool WriteBytes(const std::string &path, const char *data, uint64_t len, BootstrapResult &report) {
     report.requested_bytes = len;
     report.written_bytes = 0;
+    struct stat existing{};
+    if (lstat(path.c_str(), &existing) == 0) return ExistingImageMatches(path, data, len, report);
+    if (errno != ENOENT) {
+        ReportFailure(report, BootstrapStage::Verify, errno, path);
+        return false;
+    }
     char tmp_path[320];
-    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", path.c_str());
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", path.c_str()) >= static_cast<int>(sizeof(tmp_path))) {
+        ReportFailure(report, BootstrapStage::Create, ENAMETOOLONG, path);
+        return false;
+    }
     int fd = mkstemp(tmp_path);
     if (fd < 0) {
-        const int error_number = errno;
-        ReportFailure(report, BootstrapStage::Create, error_number, path);
+        ReportFailure(report, BootstrapStage::Create, errno, path);
         return false;
     }
     const auto fail = [&](BootstrapStage stage, int error_number) {
@@ -175,8 +218,21 @@ bool WriteBytes(const std::string &path, const char *data, uint64_t len, Bootstr
     fd = -1;
     if (close_rc != 0) return fail(BootstrapStage::Close, close_error);
     if (chmod(tmp_path, 0755) != 0) return fail(BootstrapStage::Chmod, errno);
-    if (rename(tmp_path, path.c_str()) != 0) {
-        return fail(BootstrapStage::Rename, errno);
+    if (link(tmp_path, path.c_str()) != 0) {
+        // Another bootstrap can publish first. A fingerprint collision must
+        // preserve that inode and report the verification error, not EEXIST.
+        const int link_error = errno;
+        if (link_error != EEXIST) return fail(BootstrapStage::Link, link_error);
+        if (!ExistingImageMatches(path, data, len, report)) {
+            unlink(tmp_path);
+            return false;
+        }
+    } else {
+        report.stage = BootstrapStage::Complete;
+    }
+    if (unlink(tmp_path) != 0) {
+        ReportFailure(report, BootstrapStage::Unlink, errno, path);
+        return false;
     }
     return true;
 }
@@ -251,9 +307,11 @@ __attribute__((visibility("default"))) uint32_t DynTileFwkBackendKernelServerIni
         return finish();
     }
     if (!simpler_dispatcher::WriteBytes(path, inner_bytes, d->inner_so_len, result)) return finish();
-    simpler_dispatcher::DispatcherLog("Init: wrote %s (%lu bytes)", path.c_str(), d->inner_so_len);
+    simpler_dispatcher::DispatcherLog(
+        "Init: %s %s (requested=%lu written=%lu bytes)", simpler_dispatcher::bootstrap_stage_name(result.stage),
+        path.c_str(), d->inner_so_len, result.written_bytes
+    );
     result.status = simpler_dispatcher::BootstrapStatus::Success;
-    result.stage = simpler_dispatcher::BootstrapStage::Complete;
     return finish();
 }
 

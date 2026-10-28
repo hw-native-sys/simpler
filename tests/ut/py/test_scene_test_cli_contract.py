@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
 import json
 import sys
 from pathlib import Path
@@ -27,6 +28,15 @@ from simpler_setup.scene_test import (
     run_class_cases,
     standalone_pytest_options,
 )
+
+
+def _root_conftest():
+    path = Path(__file__).resolve().parents[3] / "conftest.py"
+    spec = importlib.util.spec_from_file_location("_cli_root_conftest", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _recording_converter(calls, merged=True):
@@ -296,7 +306,7 @@ def test_swimlane_overhead_requires_chip_swimlane() -> None:
 
 
 def test_pytest_front_end_reports_a_usage_error_not_a_test_failure() -> None:
-    conftest = importlib.import_module("conftest")
+    conftest = _root_conftest()
     options = {"--enable-swimlane-overhead": True, "--enable-chip-swimlane": 0}
     config = SimpleNamespace(getoption=lambda name, default=None: options.get(name, default))
 
@@ -435,7 +445,7 @@ def test_run_class_cases_names_the_case_without_args() -> None:
 
 
 def test_run_class_cases_keeps_device_error_visible_to_poison_classifier() -> None:
-    conftest = importlib.import_module("conftest")
+    conftest = _root_conftest()
 
     class FailingScene:
         def _run_and_validate(self, *_args, **_kwargs):

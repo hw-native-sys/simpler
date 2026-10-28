@@ -62,6 +62,9 @@ list(LENGTH AICPU_KERNEL_SOURCES NUM_AICPU_KERNEL_SOURCES)
 message(STATUS "AICpu kernel: ${NUM_AICPU_KERNEL_SOURCES} source files")
 message(VERBOSE "AICpu kernel sources: ${AICPU_KERNEL_SOURCES}")
 add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
+# CANN can retain the preceding runtime image after its Worker closes.
+# Each successor image must call its own executor/configuration functions.
+target_link_options(aicpu_kernel PRIVATE -Wl,-Bsymbolic-functions)
 include("${SIMPLER_CMAKE_DIR}/profiling_config.cmake")
 simpler_configure_profiling(aicpu_kernel)
 
