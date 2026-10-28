@@ -208,6 +208,12 @@ tail 已整体切换到隔离信号发布域：持有提交锁的唯一活动写
 两个普通 direct 链可能持续占满候选池，使队列中的协同任务推迟到某条有限链结束才被发现；
 有限合法 DAG 的推进不等于固定轮数的发现公平性，当前没有这样的公平上界保证。
 
+本轮poll若已经检查所有适用own inbox及偷取目录均为空，且没有pending、candidate或local READY，
+可以只在本次fill略过重复discovery；这省去空领取路径的目录清位与重读，不新增GM判空。
+scheduler_count/index等异常不能被空提示掩盖，仍进入原领取校验。提示不改变共享状态、
+不授予ownership或entry permit，不跨fill缓存；并发Ready发布最迟由后续重新探测发现。
+共同准入前缀刷新、当前义务服务及Mix的retire→next-claim/publish顺序不受影响。
+
 ## 三、block 领取、GM Mix 与局部关闭
 
 ### 纯 C/V 的不可撤销领取

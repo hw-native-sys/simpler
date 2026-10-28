@@ -2145,4 +2145,183 @@ TEST(HbgGmMixProtocol, ReplayedPublicationCannotOverwriteItsFirstInterval) {
     EXPECT_EQ(worker->error_flags, SCHEDULER_PROTOCOL_DUPLICATE);
 }
 
+class HbgGmMixReadyProbe : public ::testing::TestWithParam<uint8_t> {};
+
+TEST_P(HbgGmMixReadyProbe, EmptyReadySnapshotStillRefreshesAdmissionAndRetiresThenClaims) {
+    GmMixFixture fixture({{2, GetParam()}});
+    ASSERT_TRUE(fixture.admit(0));
+    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    ASSERT_EQ(fixture.admissions[0].current_task_ref, SCHEDULER_TASK_REF_INVALID);
+    bool empty = false;
+    EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], &empty));
+    EXPECT_TRUE(empty);
+    ASSERT_TRUE(fixture.fill(0));
+    EXPECT_EQ(fixture.admissions[0].current_task_ref, 0);
+    EXPECT_EQ(fixture.control(0)->next_block, 1u);
+    EXPECT_EQ(fixture.mailbox(0)->published_seq, 1u);
+    ASSERT_TRUE(fixture.refresh_all());
+    ASSERT_TRUE(fixture.rendezvous(0));
+    ASSERT_TRUE(fixture.finish_lanes(0));
+    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    empty = false;
+    EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], &empty));
+    EXPECT_TRUE(empty);
+    ASSERT_TRUE(fixture.fill(0));
+    EXPECT_EQ(fixture.control(0)->completed_blocks, 1u);
+    EXPECT_EQ(fixture.control(0)->next_block, 2u);
+    EXPECT_EQ(fixture.mailbox(0)->published_seq, 2u);
+    EXPECT_EQ(fixture.admissions[0].gm_mix.phase, SchedulerGmMixPhase::ARRIVED);
+    EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+}
+
+TEST_P(HbgGmMixReadyProbe, MissingReleaseDoesNotAdvanceAndTheNextFillSeesNewReady) {
+    GmMixFixture fixture({{2, GetParam()}, {1, GetParam()}});
+    ASSERT_NO_FATAL_FAILURE(prepare_service_phase(fixture, {0, SchedulerGmMixPhase::RUNNING}));
+    const uint32_t late_lane = (GetParam() & 4) != 0 ? 2 : 1;
+    GmExecution late{};
+    ASSERT_TRUE(fixture.begin(late_lane, &late));
+    for (uint32_t lane = 0; lane < 3; ++lane) {
+        if (lane == late_lane || (GetParam() & (1U << lane)) == 0) continue;
+        GmExecution execution{};
+        ASSERT_TRUE(fixture.begin(lane, &execution));
+        ASSERT_TRUE(fixture.complete(execution));
+    }
+    ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+    bool empty = false;
+    EXPECT_FALSE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], &empty));
+    EXPECT_TRUE(empty);
+    ASSERT_TRUE(fixture.fill(0));
+    EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
+    EXPECT_EQ(fixture.control(0)->next_block, 1u);
+    EXPECT_EQ(fixture.mailbox(0)->published_seq, 1u);
+    ASSERT_TRUE(fixture.enqueue(1));
+    empty = true;
+    EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], &empty));
+    EXPECT_FALSE(empty);
+    ASSERT_TRUE(fixture.fill(0));
+    EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
+    EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
+    EXPECT_EQ(fixture.mailbox(0)->lanes[late_lane].released_seq, 0u);
+    ASSERT_TRUE(fixture.complete(late));
+    ASSERT_TRUE(fixture.fill(0));
+    EXPECT_EQ(fixture.control(0)->completed_blocks, 1u);
+    EXPECT_EQ(fixture.control(0)->next_block, 2u);
+    EXPECT_EQ(fixture.mailbox(0)->published_seq, 2u);
+    EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+}
+
+INSTANTIATE_TEST_SUITE_P(AllMasks, HbgGmMixReadyProbe, ::testing::Values<uint8_t>(3, 5, 6, 7));
+
+TEST(HbgGmMixReadyProbeOwnership, CandidatePendingAndLocalReadyNeverReuseAnEmptyHint) {
+    for (uint32_t owned = 0; owned < 3; ++owned) {
+        SCOPED_TRACE(owned);
+        GmMixFixture fixture({{2, 7}, {1, static_cast<uint8_t>(owned == 0 ? 1 : 7)}});
+        ASSERT_NO_FATAL_FAILURE(prepare_service_phase(fixture, {0, SchedulerGmMixPhase::RUNNING}));
+        auto *local = fixture.locals[0];
+        if (owned != 2) {
+            GmExecution executing{};
+            ASSERT_TRUE(fixture.begin(0, &executing));
+            ASSERT_EQ(local->local_ready_mask, 0u);
+            ASSERT_TRUE(fixture.enqueue(1));
+            if (owned == 0) {
+                ASSERT_TRUE(fixture.fill(0));
+                bool retained = false;
+                for (const auto &candidate : fixture.admissions[0].candidates)
+                    retained = retained || candidate.ready.task_ref == 1;
+                ASSERT_TRUE(retained);
+            } else {
+                SchedulerReadyClaim candidate{};
+                ASSERT_TRUE(scheduler_ready_pop_from_inbox(
+                    fixture.graph.graph(), fixture.base(), local, fixture.run(), SCHEDULER_MIX_QUEUE, 0,
+                    &candidate.task_ref, nullptr
+                ));
+                ASSERT_EQ(candidate.task_ref, 1);
+                ASSERT_EQ(
+                    scheduler_try_claim_admission(
+                        fixture.graph.graph(), fixture.base(), local, fixture.run(), &fixture.admissions[0], candidate
+                    ),
+                    SchedulerAdmissionResult::PROGRESS
+                );
+                ASSERT_EQ(fixture.admissions[0].pending_task_ref, 1);
+            }
+        } else {
+            ASSERT_NE(local->local_ready_mask, 0u);
+        }
+        ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+        const uint8_t ready_mask = local->local_ready_mask;
+        bool empty = true;
+        EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), local, &empty));
+        EXPECT_FALSE(empty);
+        ASSERT_TRUE(fixture.fill(0));
+        if (owned == 1) {
+            EXPECT_EQ(fixture.admissions[0].pending_task_ref, SCHEDULER_TASK_REF_INVALID);
+            EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
+        } else if (owned == 2) {
+            EXPECT_EQ(local->local_ready_mask, ready_mask);
+        } else {
+            bool retained = false;
+            for (const auto &candidate : fixture.admissions[0].candidates)
+                retained = retained || candidate.ready.task_ref == 1;
+            EXPECT_TRUE(retained);
+        }
+        EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
+        EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+    }
+}
+
+TEST(HbgGmMixReadyProbeOwnership, OwnReadyWithoutDirectoryAndShardReadyBothKeepDiscoveryEnabled) {
+    for (bool remote : {false, true}) {
+        SCOPED_TRACE(remote);
+        GmMixFixture fixture({{2, 7}, {1, 7}});
+        ASSERT_TRUE(fixture.admit(0));
+        ASSERT_TRUE(fixture.refresh_all());
+        ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+        ASSERT_TRUE(fixture.enqueue(1, remote ? 3 : 0));
+        if (!remote) {
+            // Model the legal interval between inbox publication and its directory bit.
+            scheduler_ready_directory_clear(
+                scheduler_ready_directory_at(fixture.base(), fixture.locals[0]), SCHEDULER_MIX_QUEUE, 0
+            );
+        }
+        bool empty = true;
+        EXPECT_TRUE(
+            scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), fixture.locals[0], &empty)
+        );
+        EXPECT_FALSE(empty);
+        SchedulerReadyStats ready{};
+        bool failed = false;
+        scheduler_fill_own_slots(
+            fixture.graph.graph(), fixture.base(), fixture.locals[0], fixture.run(), fixture.cursors[0].data(), &ready,
+            0, 0, &failed, nullptr
+        );
+        EXPECT_FALSE(failed);
+        EXPECT_EQ(fixture.control(1)->admission_state, static_cast<uint64_t>(SchedulerAdmissionState::ADMITTED));
+        EXPECT_EQ(ready.pop_count, 1u);
+        EXPECT_EQ(ready.steal_count, remote ? 1u : 0u);
+        EXPECT_EQ(scheduler_read_error(fixture.run()), 0u);
+    }
+}
+
+TEST(HbgGmMixReadyProbeOwnership, InvalidDiscoveryCountAndIndexCannotBeHiddenByAnEmptyHint) {
+    for (uint32_t invalid = 0; invalid < 3; ++invalid) {
+        SCOPED_TRACE(invalid);
+        GmMixFixture fixture({{2, 7}});
+        ASSERT_NO_FATAL_FAILURE(prepare_service_phase(fixture, {0, SchedulerGmMixPhase::RUNNING}));
+        ASSERT_TRUE(fixture.finish_lanes(0));
+        ASSERT_NO_FATAL_FAILURE(clear_drained_ready_directories(fixture));
+        auto *local = fixture.locals[0];
+        if (invalid == 0) local->config.scheduler_count = 0;
+        else if (invalid == 1) local->config.scheduler_count = SCHEDULER_WORKER_CAPACITY + 1;
+        else local->config.scheduler_index = local->config.scheduler_count;
+        bool empty = true;
+        EXPECT_TRUE(scheduler_ordered_poll_may_progress(fixture.graph.graph(), fixture.base(), local, &empty));
+        EXPECT_FALSE(empty);
+        EXPECT_FALSE(fixture.fill(0));
+        EXPECT_EQ(fixture.control(0)->completed_blocks, 0u);
+        EXPECT_EQ(fixture.control(0)->next_block, 1u);
+        EXPECT_EQ(fixture.mailbox(0)->published_seq, 1u);
+        EXPECT_EQ(fixture.admissions[0].gm_mix.phase, SchedulerGmMixPhase::RELEASED);
+    }
+}
+
 }  // namespace

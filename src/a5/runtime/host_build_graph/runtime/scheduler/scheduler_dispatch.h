@@ -77,8 +77,10 @@ inline __aicore__ bool scheduler_service_gm_mix(
 // changes ownership, a frontier, an acknowledgement, or a completion count.
 // Stale observations may postpone work; every positive hint takes the normal
 // ownership validation path before doing that work.
-inline __aicore__ bool
-scheduler_ordered_poll_may_progress(const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local) {
+inline __aicore__ bool scheduler_ordered_poll_may_progress(
+    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, bool *ready_probe_empty = nullptr
+) {
+    if (ready_probe_empty != nullptr) *ready_probe_empty = false;
     const auto &admission = *local->admission;
     if (admission.capacity == 0 || admission.scan_cursor > admission.capacity || local->local_ready_mask != 0 ||
         !scheduler_task_ref_is_null(admission.pending_task_ref))
@@ -102,6 +104,12 @@ scheduler_ordered_poll_may_progress(const SchedulerGraphView &graph, __gm__ void
             scheduler_ready_directory_nonempty(base, local, local->config.scheduler_count, type))
             return true;
     }
+    // Reuse only this poll's completed negative Ready probes. Invalid discovery
+    // configuration must still reach the original claim validation path.
+    if (ready_probe_empty != nullptr && local->config.scheduler_count != 0 &&
+        local->config.scheduler_count <= SCHEDULER_WORKER_CAPACITY &&
+        local->config.scheduler_index < local->config.scheduler_count)
+        *ready_probe_empty = true;
     if (scheduler_task_ref_is_null(admission.current_task_ref)) {
         auto *control = scheduler_state_at<SchedulerAdmissionControl>(base, admission.control_offset);
         return scheduler_gm_query(control->commit_tail) != admission.scan_cursor;
@@ -142,7 +150,8 @@ inline __aicore__ bool scheduler_fill_ordered_slots(
         *failed = true;
         return false;
     }
-    if (!scheduler_ordered_poll_may_progress(graph, base, local)) return false;
+    bool ready_probe_empty = false;
+    if (!scheduler_ordered_poll_may_progress(graph, base, local, &ready_probe_empty)) return false;
     if (scheduler_read_error(run) != 0) {
         *failed = true;
         return false;
@@ -157,7 +166,10 @@ inline __aicore__ bool scheduler_fill_ordered_slots(
     // Discovery is bounded by candidate credits, not by physical slot capacity.
     // A later cooperative task may be admitted while an earlier one is in flight.
     const uint32_t queues = local->has_mix && local->is_mix_coordinator() ? 2 : 1;
-    for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT && published != SchedulerAdmissionResult::RETRY;
+    // A concurrent Ready publication may wait for the next finite poll. The
+    // hint grants no ownership or entry permit and never survives this fill.
+    for (uint32_t index = 0; (!ready_probe_empty || victim_cursors == nullptr) &&
+                             index < SCHEDULER_PENDING_SLOT_COUNT && published != SchedulerAdmissionResult::RETRY;
          ++index) {
         auto &candidate = admission->candidates[index];
         if (scheduler_task_ref_is_null(candidate.ready.task_ref)) {
