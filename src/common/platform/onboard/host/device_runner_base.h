@@ -376,7 +376,7 @@ public:
     // owned environment has no caller binding to validate; enter_run_thread
     // performs its thread attachment before device work.
     int validate_current_context() const;
-    int init_kernel_context(int device_id);
+    int init_kernel_context(int device_id, uint64_t context_generation);
     int prepare_kernel_callable(int32_t callable_id);
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */

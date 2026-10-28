@@ -3003,7 +3003,7 @@ int simpler_kernel_mode_init(
             std::vector<uint8_t> dispatcher_vec(dispatcher_binary, dispatcher_binary + dispatcher_size);
             runner->set_dispatcher_binary(std::move(dispatcher_vec));
         }
-        rc = runner->init_kernel_context(device_id);
+        rc = runner->init_kernel_context(device_id, context_generation);
     } catch (...) {
         rc = PTO_RUNTIME_ERR_INTERNAL;
     }
