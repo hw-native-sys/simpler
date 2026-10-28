@@ -55,7 +55,7 @@ def _sample(native, params, *, overlap=None, reverse=False):
     return test, actual, golden
 
 
-@pytest.mark.parametrize("case_index", range(32))
+@pytest.mark.parametrize("case_index", range(44))
 def test_each_native_case_has_valid_shape_identity_events_and_dependency_projection(ordered_native, case_index):
     params = ordered_native.TestHbgOrderedExecution.CASES[case_index]["params"]
     test, actual, golden = _sample(ordered_native, params)
@@ -235,7 +235,11 @@ def test_ordered_acceptance_cannot_disable_golden_or_provenance(ordered_native):
 
 def test_matrix_is_unique_unguarded_and_reuses_existing_orchestration(ordered_native):
     cases = ordered_native.TestHbgOrderedExecution.CASES
-    assert len(cases) == len({case["name"] for case in cases}) == 32
+    assert len(cases) == len({case["name"] for case in cases}) == 44
+    for mask, positions in ((1, 8), (1, 32), (2, 16), (2, 64)):
+        shapes = {case["params"].get("blocks") for case in cases if case["params"]["mask"] == mask}
+        assert {1, 2, 3} <= shapes
+        assert {positions * 2 - 1, positions * 2, positions * 2 + 1} <= shapes
     assert all("skip_golden" not in case and "manual" not in case and "marks" not in case for case in cases)
     source = Path(ordered_native.TestHbgOrderedExecution.CALLABLE["orchestration"]["source"])
     assert source == Path(ordered_native.__file__).parent / "kernels/cla_orchestration.cpp"

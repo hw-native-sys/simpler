@@ -49,11 +49,8 @@ void record_lifecycle_timeout(Runtime *runtime, SchedulerErrorSite error_site) {
     if (context == nullptr) return;
     cache_invalidate_range(context, 128);
     SchedulerRunControl *run_control = aicore_scheduler_run_control(context);
-    if (run_control == nullptr ||
-        !record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site))
-        return;
-    cache_flush_range(reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128);
-    wmb();
+    if (run_control == nullptr) return;
+    (void)record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site);
 }
 
 }  // namespace
@@ -352,7 +349,8 @@ int32_t AicoreLifecycle::wait_bootstrap_complete(Runtime *runtime) {
         if (++error_poll_count == 64) {
             error_poll_count = 0;
             cache_invalidate_range(
-                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
+                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed),
+                sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, error_claimed)
             );
             if (run_control->scheduler_error != 0) {
                 log_aicore_scheduler_error_identity(run_control, "bootstrap");

@@ -322,7 +322,8 @@ inline std::string scheduler_export_protocol(
     std::ostringstream out;
     {
         JsonObject root(out);
-        root.string("schema", "hbg-native-protocol-v1");
+        // v5 records transient claim ownership separately from the published phase.
+        root.string("schema", "hbg-native-protocol-v5");
         root.string("producer", "aicore");
         root.number("run_epoch", epoch);
         root.number("task_count", plan.task_count);
@@ -399,8 +400,10 @@ inline std::string scheduler_export_protocol(
             row.number("task_ref", task);
             row.number("state", controls[task].state);
             row.number("next_block", controls[task].next_block);
+            row.number("claim_tickets", controls[task].claim_tickets);
             row.number("completed_blocks", controls[task].completed_blocks);
             row.number("admission_state", controls[task].admission_state);
+            row.number("admission_claim_lock", controls[task].admission_claim_lock);
         }
         out << ']';
         sparse(

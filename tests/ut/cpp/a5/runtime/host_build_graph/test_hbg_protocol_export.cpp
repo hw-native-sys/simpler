@@ -50,7 +50,9 @@ struct ProtocolExportFixture : ::testing::Test {
 TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFabricatingEvents) {
     at<SchedulerTaskMetadata>(layout.task_metadata_offset)[0].logical_block_num = 99;
     const auto json = dump();
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v1\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v5\""), std::string::npos);
+    EXPECT_NE(json.find("\"claim_tickets\":0"), std::string::npos);
+    EXPECT_NE(json.find("\"admission_claim_lock\":0"), std::string::npos);
     EXPECT_NE(json.find("\"block_num\":2"), std::string::npos);
     EXPECT_EQ(json.find("\"block_num\":99"), std::string::npos);
     EXPECT_NE(json.find("\"dependencies\":[0]"), std::string::npos);

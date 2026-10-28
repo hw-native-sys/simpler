@@ -9,11 +9,16 @@
 真实 HBG CSA 另有 [业务 TDD 入口](../csa/test_csa_business.py)，保留 54 个原 kernel 与七项 golden。
 覆盖范围、A5 实跑记录和独立 resident 红灯见 [CSA 中文说明](../../../../examples/a5/host_build_graph/deepseek_v4_pro_csa/README.zh-CN.md)。
 
-当前纯 C/V 普通多 block 已接线：原生纯任务矩阵在仿真和 A5 各 90 次通过；
+接线阶段的记录：纯 C/V 普通多 block 的原生纯任务矩阵在仿真和 A5 各 90 次通过；
 新增 32 场景在最终纯 C/V 接线版本的 A5 完成 120 次，仿真在 TLS 生命周期修复后同样完成 120 次。
 每次都要求本轮 resident 来源和完整输出，不接受 legacy 正确输出。
 GM Mix 已接入且可与纯多 block 同图：六种 mask 矩阵在仿真／A5 各 270 次通过，
 新 44 个 GM 事件场景各 180 次通过。原样 CSA 七项 golden 和严格 resident L4 门禁已通过。
+以上保留接线时计数。2026-10-27 小 N 取号实验后，纯有序场景扩为 44 项、GM 场景扩为 68 项；
+连同其余边界和发布／错误探针，当前两平台各 651 项、10 个场景类通过，另各 24 项 N1/N2 真实故障通过。
+准入阶段发布版及保留的 ACK 边界回归合计 C++ 为 21 目标、1121 项，Python 为 3335 项；
+两波版的各七项 N=2P 故障结果作为历史证据保留，不冒充当前最终全矩阵。
+最终版本仍须补完整旧故障矩阵及全 HBG 回归，逐轮验收范围以实现记录为准。
 首错误身份与退出冷日志已接线；显式 block/slot 身份及原样 CSA 的身份审计通过；
 完整原生协议采集、因果审计和 CSA 严格门禁已通过；N>1 sync_start 的仿真／A5
 各 47 项基础矩阵及原生审计通过；另有每平台 112 项异构同步／普通交叠与依赖、
@@ -69,28 +74,52 @@ Mix 仍需共同准入和三条资源 lane 的组握手，mask 6 不增加 AIC k
 成员前沿及普通入口许可。覆盖 B 先于未 ready A、冻结位图、epoch、容量和身份拒绝，
 并以发布者和非成员读者并发检查日志前缀。它不调用模型来证明生产 helper，
 也不以 CPU 原子结果代替 A5 cache 可见性或原生 block 执行验收。
-当前该目标 102 项，包含已发布错误后不得转移 ready 所有权或提交准入的回归。
+当前该目标 109 项，包含已发布错误后不得转移 ready 所有权或提交准入的回归。
+还检查同轮复用已验证的拓扑位图、跨 run 清空缓存，以及缓存建立后仍拒绝后续发布记录的错误成员。
+五项短领取锁／阶段测试检查忙锁不转移、不释放别人的锁，迟到 CAS 后重查阶段并释放自己的锁，
+重复领取竞态、发布后阶段不合法仍拒绝成员／非成员。额外重复 200 轮，不算新增定义。
+
+[test_hbg_spmd_layout.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_spmd_layout.cpp)
+新增两个计数器布局检查：next_block／completed_blocks 各自独占 128B，且 64 位 CAS／加法只改目标字，
+不破坏相邻 task、原状态／链表 metadata 和 padding。旧同 line 布局使隔离检查实际失败；
+TaskControl 512B 步长、保留字段 offset、整幅初始化、大小任务切换与 retained reset 均有检查。
+阶段信号独占 offset384 的 128B，短领取锁位于 offset40；新增隔离与逐字节完整性检查，
+全宽发布／CAS 不得改坏相邻 task、metadata、其他计数器或 padding。
 
 [test_hbg_ordered_execution.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_ordered_execution.cpp)
-共 62 项，直接驱动生产有序填槽、entry gate 和完成路径，包括 24 项 C/V 容量形状，
+共 100 项，直接驱动生产有序填槽、entry gate 和完成路径，包括 24 项 C/V 容量形状，
 8 项完成／LocalDone／候选所有权／predicate 停放行为，2 项无 SSBUF 的 N=3→N=1 依赖链，
 4 项普通队列探测时间和 2 项 COOPERATIVE 不伪造探测时间，另有 2 项真实 direct 后继
 延迟发布必须标记 DISPATCH、不能被误当作 inline refill 的检查；还覆盖显式身份、原生记录，
 以及新增 7 项 sync_start 至多一次领取、早返回、满核共同顺序、普通后继和零工作成员。
 并检查空轮询仍停止于已发布错误、后到准入阻止普通任务越序、两个预填槽逐次取得入口许可。
+只读轮询预筛另覆盖 hint 不消费任务／不授予入口许可，以及目录位缺失时仍发现 own inbox。
+取号路径另有 36 项：N2/3、N=2P−1/2P/2P+1、最后有效票尚未确认、并发尾票有界、零工作成员不能提前关闭、
+N1／sync_start 保留 CAS、已发布错误与坏计数、32767 上界、prepare/commit 的旧票号拒绝，
+以及两次原子操作后发现不一致时不返回 block 身份、不生成伪 claim 事件。
 计时检查使用真实 CPU_SIM 时钟；这些用例不模拟 A5 cache 可见性。
 [test_ordered_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_ordered_native_fixture.py)
-共 96 项，检查 32 场景夹具、坏记录、真假依赖、反向准入及每轮复用来源；这些仍是 CPU 检查。
+共 108 项，检查 44 场景夹具、坏记录、真假依赖、反向准入及每轮复用来源；这些仍是 CPU 检查。
 
 [test_hbg_gm_mix.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_gm_mix.cpp)
-共 119 项，检查真实 descriptor/ack/seal、四种 mask、固定物理 lane、原 N、暂停最后发布者、
+共 346 项，检查真实 descriptor/ack/seal、四种 mask、固定物理 lane、原 N、暂停最后发布者、
 旧／未来 ack、错误身份、保留 seal、零工作成员、局部跨 task 推进及无新 kernel 的退出 drain，
 并覆盖原生记录和 8 项 sync_start 早关闭、迟到 AIV、零工作 cluster／未发布组。
 另有错误后停止领取／发布／执行／完成／seal、AIC/AIV 合法阶段的 service 停机门禁，
-以及同轮 publish→arrive 推进和退役后下一轮才领新组的检查。
+以及同轮 publish→arrive、release 齐备后同轮退役并领取下一组的检查。
+有界连续推进新增 21 项：覆盖四种 Mix mask、迟到 release、远端仍执行前任务、错误门禁、
+零工作义务预算，以及完成时直接产生 N=1／2／8／65 后继仍须正确分类为普通／准入任务。
+取号路径新增四种 mask 的暂停窗口：无效尾票不能封闭最后一张尚未确认的有效票，
+确认后零工作 cluster 可关闭，但不能伪造全 task 完成；切换后继必须清除 ticket_exhausted。
 新增 24 项真实普通任务 route→fill→entry→completion 与 Mix arrive 的可控交错：
 四种 Mix mask × 三条物理 lane × 两个 own slot，未返回或 completion 尚未消费均不得到达；
 临时副本删除 busy-slot 门禁时 24/24 红灯。它是生产 helper 证据，不是实际硬件资源占用测量。
+只读轮询预筛另有 20 项，覆盖未发布组、缺失 arrival/release ack、后到普通任务、
+描述发布和 retained seal 唤醒；预筛的否定结果不能当作任务完成或 kernel 入口许可。
+保留 174 项 ACK 回归：162 项 arrival/release × 三种全宽序号 × 27 种旧／当前／未来 lane 组合，
+固定“旧前缀等待、未来前缀报错、全体相等才确认”；另 12 项覆盖四种 mask × 每条迟到 lane，
+即使普通 ready 候选持续触发服务，也不能提前准备、释放或制造协议证据。
+这些回归在原实现和预检查候选上均通过；预检查候选因收益未超出批次变化而撤回，不保留生产改动。
 [test_hbg_gm_mix_startup.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_gm_mix_startup.cpp)
 另 21 项直接调用生产 executor，覆盖 startup 直接 EXIT 的 seal 收尾、
 错误退出不伪造 seal，以及缺少协调者 seal 时的超时身份。
@@ -98,37 +127,70 @@ Mix 仍需共同准入和三条资源 lane 的组握手，mask 6 不增加 AIC k
 共 19 项，检查服务节点不产生 payload／generation／trace、三条 ready trace 路径、direct refill、
 N2→Dummy→N1 依赖、Host 已完成节点、有限服务链和畸形 metadata。
 
-[test_gm_mix_execution.py](test_gm_mix_execution.py) 的 44 场景每轮 60 次调用，
-覆盖四种 mask、N1/2/65、512→1→65→1→512、慢头／中／尾、真实依赖及独立任务重叠；
+[test_gm_mix_execution.py](test_gm_mix_execution.py) 的 68 场景每轮 84 次调用，
+覆盖四种 mask、N1/2/3/15/16/17/63/64/65、512→1→65→1→512、慢头／中／尾、真实依赖及独立任务重叠；
 [test_gm_mix_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_gm_mix_native_fixture.py)
-有 184 项 CPU 检查，拒绝坏记录。探针中的入口／返回序号不是完整调度协议事件。
+有 208 项 CPU 检查，拒绝坏记录。探针中的入口／返回序号不是完整调度协议事件。
 
 [test_hbg_error_identity.cpp](../../../ut/cpp/a5/runtime/host_build_graph/test_hbg_error_identity.cpp)
-有 26 项真实 helper 检查：首错误不可覆盖、32 轮竞争读取、合法 epoch 0/MAX、未知字段、
+有 29 项真实 helper 检查：首错误不可覆盖、32 轮竞争读取、合法 epoch 0/MAX、未知字段、
 当前／旧 task 的组身份、具体预填槽、参数准备／完成错误、AICPU 首写者及 retained reset。
 真实 executor 的 startup 测试增加 missing seal 超时定位，真实 AICPU finalizer 测试增加晚到错误日志检查。
-[test_error_identity.py](test_error_identity.py) 的私有 GM 探针有 46 场景，
+[test_error_identity.py](test_error_identity.py) 的私有 GM 探针有 50 场景，
 由 AIC/AIV 调用同一生产 writer，覆盖完整／部分身份、共享错误区、N1/2/65 和极值 epoch。
 其中两个单组 Mix 场景要求 C/V 实际到达后再竞争，检查两个参与者及赢家 lane；
 这是组内有界会合，不是多 block sync_start 已支持的证据。
 [test_error_identity_native_fixture.py](../../../ut/py/hbg_spmd_contracts/test_error_identity_native_fixture.py)
-有 262 项 CPU oracle 检查。设备探针不写真实 runtime 错误区，不替代物理故障停机与回收验证。
+有 336 项 CPU oracle 检查。新状态独占 line 后，还覆盖 AICPU 身份／状态写回顺序、冷日志读取范围，
+以及 C→V／V→C 在发布者返回后的首次状态读取；该首次读取不允许重试。
+设备探针不写真实 runtime 错误区，不替代物理故障停机与回收验证。
+
+[test_admission_signal_publication.py](test_admission_signal_publication.py) 验证全局准入发布所用的生产 helper：
+37 个参数定义、每平台 29 场景，覆盖 C/V 轮换持锁、独立 notice 后首次 tail/log 读取、相邻追加、
+完整 128B payload、符号位、epoch 0/MAX 和延迟发布者；普通 N1/2/65，
+共享 sync_start 的仿真 N1/2/8、真机 N1/2/32（最多 96 参与者）。
+不对被测 tail/log/阶段信号做 RMW；首次读取不重试。同核检查 CLAIMED／PREPARED 首次观察，
+跨核检查 ADMITTED、日志和完整 payload；独立 notice／提交锁仍用原子读写。
+两平台均通过；285 项 [oracle 与平台边界检查](../../../ut/py/hbg_spmd_contracts/test_admission_signal_native_fixture.py)
+逐字拒绝坏控制／guard／记录，检查满核容量、来源与不可跳过 golden。它不替代真实调度的严格 L4。
+
 设备探针与业务用例的硬件编译还须通过 text 映像门禁：非空 allocated `.rodata`／
 `.rodata.*` 不能被仅提取 `.text` 的加载器静默丢弃。ELF 和缓存策略回归分别覆盖
 拒绝不完整映像、空／非 allocated 控制项及硬件缓存失效；仿真成功不能替代该检查。
 
 [真实有界故障入口](../../../st/a5/host_build_graph/resident_failure/test_resident_failure.py)
 覆盖所有 mask 的实际 kernel lane × N1/N2，共 24 场景，仿真／A5 均通过。
+另有 N257 的七种大 N 取号故障，在 A5／仿真通过，检查实际原始票数及有效领取上界；
+这七项与基础 24 项分开记录，最终有界回归需同时选择 bounded 和 large_ticket，不能只筛前者。
 每项先健康运行，再触发真实 watchdog，检查阻塞者实际返回、后继不执行、失败 Worker
 拒绝重提和释放 caller buffer，关闭后新 Worker 健康运行。失败原始协议单独审计，
 不冒充成功协议；完整 worker 集合、所属 AICPU 退出分区、epoch 与 task_controls 均检查。
-51 项 [夹具与坏记录检查](../../../ut/py/hbg_spmd_contracts/test_runtime_failure_fixture.py) 不能算设备故障。
+另有七种 N=2P 故障：真机为 N64／128、仿真为 N16／32，捕获内再次核对实际 cluster 数，
+两波版 v3 在两平台通过；当前真实采集要求 v5，不接受旧 producer 代替新路径验收。
+最终有界回归须同时包含 bounded、large_ticket 和 two_wave 三组。
+359 项 [夹具与坏记录检查](../../../ut/py/hbg_spmd_contracts/test_runtime_failure_fixture.py) 不能算设备故障。
+新增部分检查 N257 各种核形状的合法尾票与超额票、有效数越界、后继误领、旧 schema、缺失拓扑；
+旧 synthetic capture 缺少 cluster_count 的遗漏已补齐，并重跑完整相关 Python 套件。
+当前 v5 的两平台各 24 个 N1/N2 有界故障已重跑，覆盖所有实际执行 lane、健康→故障→新 Worker 恢复；
+48 份失败现场的短领取锁全为零，N1 仍无票数，不伪造完成或消费者执行。
+它不替代最终大 N／两波／不可返回核的全矩阵回归。
 同一入口另有 A5 专用的不可返回 kernel 矩阵：七种 mask 的每条执行 lane，N=2，
 共 12 项。使用既有 scheduler／STARS／stream timeout，要求实际入口后没有返回、
 没有完成或消费记录，所属 AICPU 的 EXIT ACK 等满预算，不伪造 worker 退出确认；
 失败 Worker 拒绝重提及 free，close 有界结束后新 Worker 的完整 golden／L4 通过。
 不可返回 kernel 不进入仿真；故障后不发 D2H，不把无法安全读取的输出写成已校验。
 这些用例不模拟任意位置的物理坏核，也不证明掉电或驱动失效时仍可恢复。
+
+原生 v2 审计另新增 95 项 Python 检查：保留 v1 历史读取，精确要求 v2 票数字段，
+验证 [N,N+P]、小 N／sync_start 零票数及有效领取必须恰为 N；坏类型、缺失、越界均拒绝。
+wire 解析可保留失败现场的原始坏值用于诊断，不等同于完整因果审计通过。
+v3 另增 122 项协议检查：N=2P 采用取号、相邻档位、N1／sync_start 保持零票数，
+v2 的同一边界仍必须走 CAS；有效领取／完成数不因票数合法而放宽。真实历史 v1/v2 CSA 捕获也已重审通过。
+v4 另增 192 项协议检查：普通 N>1、小 N 合法尾票、N1／sync_start 零票数，及 v1/v2/v3 各自严格语义。
+当前读端重审真实历史 v1/v2/v3 CSA 捕获均通过；12 个并发 helper 用例重复 200 轮、2400 次执行通过，
+重复轮次不计为新增用例定义。
+v5 另增 75 项 wire／因果检查：短领取锁字段必须存在、类型严格、成功终态为零，
+普通取号与 sync_start 条件不变；历史 schema 不接受混入新字段。真实 v1–v4 捕获重审均通过。
 
 [ready 顺序入口](test_ready_order_execution.py) 在仿真／A5 各覆盖
 A 七种 mask × B 七种 mask × 普通／sync_start 四种组合，共 196 场景。
@@ -244,12 +306,12 @@ kernel 读取 block/N 使用现有 get_block_idx(args)/get_block_num(args)。
 仅在调用前检查 ABI 后缀指针是否为空，避免当前实现缺 context 时把合同失败变成设备异常；
 不补造 context，不改为相信输入 scalar 的 N，也不篡改原 block 数。
 
-### 纯 C/V 有序执行的 32 个场景
+### 纯 C/V 有序执行的 44 个场景
 
 [test_ordered_execution.py](test_ordered_execution.py)复用 CLA 编排和 32 列 plan ABI：
-14 个容量形状、2 个 N=1/SPMD 交替依赖链、6 个头／中／尾慢 block 汇合、
+26 个容量形状（包含 N3 和真机／仿真两波阈值邻域）、2 个 N=1/SPMD 交替依赖链、6 个头／中／尾慢 block 汇合、
 4 个独立任务重叠、4 个真实 A→B 依赖，以及 2 个保留 Worker/callable 的大小交替复用场景。
-后两场景各执行五次 shape，所以 `--rounds 3` 是 120 次 invocation，不是 96 次。
+后两场景各执行五次 shape，所以 `--rounds 3` 是 156 次 invocation，不是 132 次。
 入口／返回以诊断原子序号记录，依赖消费者同时检查全部前驱输出；允许独立 B 先获准执行。
 必须完整比对 inactive 槽、padding、保护区及原 N，不以最终计数代替中途依赖检查。
 这些原子序号不含 order_key、物理核身份或 LocalDone，不能替代严格协议 trace，亦不是性能基准。
@@ -405,7 +467,9 @@ retire、block_done、task_done、cluster_close、local_done。
 start 必须给 task/block/slot/worker/N/order/generation/source，完整性检查不能猜缺失字段。
 
 当前样例 producer 明确是 reference；审计器默认要求 aicore，因此不能直接拿模型数据冒充设备结果。
-生产 L4 已使用独立的 hbg-native-protocol-v1 格式采集 order、LocalDone 和 GM 组生命周期，
+生产 L4 使用独立的 hbg-native-protocol-v5 格式采集 order、LocalDone、GM 组生命周期、原始票数和短领取锁，
+读端继续严格支持历史 v1–v4；v4/v5 以普通 N>1 定义取号范围，v3 为 N≥2P，v2 为 N>2P，
+均不放宽原有有效领取／完成／身份／依赖约束。
 由统一原生读端与因果审计器验证，并与独立 kernel 入口身份连接；不是把模型事件改名后输出。
 只有存在完整原生协议且审计通过才得到 protocol_verified，历史无协议捕获仍保持未验证。
 tick 是适配格式内的因果事件序号，不是已经验证过的跨核统一 cycle。

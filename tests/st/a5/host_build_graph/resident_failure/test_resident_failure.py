@@ -28,6 +28,7 @@ _KERNELS = _ROOT / "tests/fdwic/pa_hbg/spmd/kernels"
 _STALL_MS = 2500
 _TIMEOUT_MS = 2000
 _SHAPES = [(mask, lane) for mask in (1, 2, 4, 3, 5, 6, 7) for lane in range(3) if mask & (1 << lane)]
+_TICKET_SHAPES = ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2))
 
 pytestmark = [
     pytest.mark.platforms(["a5sim", "a5"]),
@@ -179,6 +180,31 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False):
     assert set(controls) == {task["task_ref"] for task in protocol["tasks"]}
     assert controls[root["task_ref"]]["completed_blocks"] < blocks
     assert controls[consumer["task_ref"]]["completed_blocks"] == 0
+    positions = protocol["cluster_count"] * (2 if mask in (2, 4) else 1)
+    assert protocol["schema"] in (
+        "hbg-native-protocol-v2",
+        "hbg-native-protocol-v3",
+        "hbg-native-protocol-v4",
+        "hbg-native-protocol-v5",
+    )
+    if protocol["schema"] == "hbg-native-protocol-v5":
+        assert all(
+            type(control.get("admission_claim_lock")) is int and control["admission_claim_lock"] == 0
+            for control in control_rows
+        )
+    minimum_blocks = (
+        2
+        if protocol["schema"] in ("hbg-native-protocol-v4", "hbg-native-protocol-v5")
+        else positions * 2 + (1 if protocol["schema"] == "hbg-native-protocol-v2" else 0)
+    )
+    uses_tickets = blocks >= minimum_blocks
+    tickets = controls[root["task_ref"]]["claim_tickets"]
+    if uses_tickets:
+        assert 1 <= tickets <= blocks + positions
+        assert controls[root["task_ref"]]["next_block"] <= min(blocks, tickets)
+    else:
+        assert tickets == 0
+    assert controls[consumer["task_ref"]]["claim_tickets"] == 0
     assert protocol["resolved_task_count"] == 0
     assert all(controls[ref]["state"] == 0 for ref in (root["task_ref"], consumer["task_ref"]))
 
@@ -200,7 +226,41 @@ def test_nonreturning_kernel_timeout_keeps_failed_run_contained(st_platform, st_
     _exercise_failure(st_platform, st_device_ids, mask, lane, 2, monkeypatch, -1)
 
 
-def _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatch, stall_ms):
+@pytest.mark.parametrize("mask,lane", _TICKET_SHAPES)
+def test_large_ticket_claim_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, monkeypatch):
+    # 257 exceeds twice every supported single-chip claimant population.
+    _exercise_failure(st_platform, st_device_ids, mask, lane, 257, monkeypatch, _STALL_MS)
+
+
+def _two_wave_blocks(platform, mask):
+    # Match the topology used by the native/sim capacity boundary matrix.
+    clusters = {"a5": 32, "a5sim": 8}[platform]
+    return clusters * (2 if mask in (2, 4) else 1) * 2
+
+
+def _check_two_wave_topology(protocol, blocks, mask, required):
+    if not required:
+        return
+    assert protocol["schema"] in ("hbg-native-protocol-v3", "hbg-native-protocol-v4", "hbg-native-protocol-v5")
+    positions = protocol["cluster_count"] * (2 if mask in (2, 4) else 1)
+    assert blocks == positions * 2, "two-wave fault must use the actual device topology"
+
+
+@pytest.mark.parametrize("mask,lane", _TICKET_SHAPES)
+def test_two_wave_ticket_claim_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, monkeypatch):
+    _exercise_failure(
+        st_platform,
+        st_device_ids,
+        mask,
+        lane,
+        _two_wave_blocks(st_platform, mask),
+        monkeypatch,
+        _STALL_MS,
+        two_wave=True,
+    )
+
+
+def _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatch, stall_ms, *, two_wave=False):
     monkeypatch.setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", str(_TIMEOUT_MS))
     nonreturning = stall_ms < 0
     failure_kind = "nonreturning" if nonreturning else "bounded"
@@ -259,6 +319,8 @@ def _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatc
                         worker.copy_from(value, buffer)
                     _check_output(values, blocks, mask, failed=failed)
                 path, raw = _capture(prefix)
+                assert raw["aicore_protocol"]["schema"] == "hbg-native-protocol-v5"
+                _check_two_wave_topology(raw["aicore_protocol"], blocks, mask, two_wave)
                 if failed:
                     assert raw["aicore_protocol"]["run_epoch"] > evidence[-1]["run_epoch"]
                     _check_failed_capture(raw, blocks, mask, lane, nonreturning=nonreturning)

@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "hbg_scheduler_test_support.h"
+#include "scheduler/scheduler_memory.h"
 
 namespace {
 
@@ -83,8 +84,10 @@ void expect_empty_protocol(void *base, const AicoreSchedulerLayout &layout) {
     for (uint64_t task = 0; task < layout.task_count; ++task) {
         SCOPED_TRACE(task);
         EXPECT_EQ(controls[task].next_block, 0u);
+        EXPECT_EQ(controls[task].claim_tickets, 0u);
         EXPECT_EQ(controls[task].completed_blocks, 0u);
         EXPECT_EQ(controls[task].admission_state, 0u);
+        EXPECT_EQ(controls[task].admission_claim_lock, 0u);
     }
     if (layout.spmd.cooperative_task_count == 0) return;
     const auto *control = scheduler_state_at<SchedulerAdmissionControl>(base, layout.admission_control_offset);
@@ -142,15 +145,89 @@ TEST(HbgSpmdLayout, PreservesCompactMetadataAndAtomicLineBoundaries) {
     EXPECT_EQ(offsetof(SchedulerTaskMetadata, logical_block_num), 14u);
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskMetadata::timing_slot), int16_t>));
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskMetadata::logical_block_num), uint16_t>));
-    EXPECT_EQ(sizeof(SchedulerTaskControl), 128u);
+    EXPECT_EQ(sizeof(SchedulerTaskControl), 512u);
     EXPECT_EQ(alignof(SchedulerTaskControl), 128u);
-    EXPECT_EQ(offsetof(SchedulerTaskControl, next_block), 24u);
-    EXPECT_EQ(offsetof(SchedulerTaskControl, completed_blocks), 32u);
-    EXPECT_EQ(offsetof(SchedulerTaskControl, admission_state), 40u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, claim_tickets), 24u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, next_block), 128u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, completed_blocks), 256u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, admission_state), 384u);
+    EXPECT_EQ(offsetof(SchedulerTaskControl, admission_claim_lock), 40u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, next_fanin_index), 64u);
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::next_block), volatile uint64_t>));
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::completed_blocks), volatile uint64_t>));
     EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::admission_state), volatile uint64_t>));
+    EXPECT_TRUE((std::is_same_v<decltype(SchedulerTaskControl::admission_claim_lock), volatile uint64_t>));
+}
+
+TEST(HbgSpmdLayout, TaskBlockCountersOwnSeparate128ByteRegions) {
+    constexpr size_t cursor = offsetof(SchedulerTaskControl, next_block);
+    constexpr size_t completed = offsetof(SchedulerTaskControl, completed_blocks);
+    EXPECT_EQ(cursor % 128, 0u);
+    EXPECT_EQ(completed % 128, 0u);
+    EXPECT_NE(cursor / 128, completed / 128);
+    EXPECT_NE(cursor / 128, offsetof(SchedulerTaskControl, state) / 128);
+    EXPECT_NE(completed / 128, offsetof(SchedulerTaskControl, next_fanin_index) / 128);
+    EXPECT_LE(cursor + 128, sizeof(SchedulerTaskControl));
+    EXPECT_LE(completed + 128, sizeof(SchedulerTaskControl));
+    EXPECT_EQ(sizeof(SchedulerTaskControl) % 128, 0u);
+}
+
+TEST(HbgSpmdLayout, AdmissionPhaseOwnsAnIsolatedBypassPublicationRegion) {
+    constexpr size_t phase = offsetof(SchedulerTaskControl, admission_state);
+    EXPECT_EQ(phase % 128, 0u);
+    for (size_t atomic :
+         {offsetof(SchedulerTaskControl, state), offsetof(SchedulerTaskControl, claim_tickets),
+          offsetof(SchedulerTaskControl, next_block), offsetof(SchedulerTaskControl, completed_blocks)})
+        EXPECT_NE(phase / 128, atomic / 128);
+    EXPECT_LE(phase + 128, sizeof(SchedulerTaskControl));
+}
+
+TEST(HbgSpmdLayout, CounterUpdatesLeaveOtherTaskAndMetadataBytesUntouched) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(3, 3, 0, &layout));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    ASSERT_NE(storage.base(), nullptr);
+    auto *controls = scheduler_state_at<SchedulerTaskControl>(storage.base(), layout.task_controls_offset);
+    std::array<uint8_t, 3 * sizeof(SchedulerTaskControl)> expected{};
+    std::memcpy(expected.data(), controls, expected.size());
+    for (uint64_t task = 0; task < 3; ++task) {
+        const uint64_t cursor = (UINT64_C(1) << 32) + task;
+        const uint64_t completed = (UINT64_C(1) << 33) + task;
+        EXPECT_EQ(scheduler_gm_compare_exchange(controls[task].next_block, UINT64_C(0), cursor), 0u);
+        EXPECT_EQ(scheduler_gm_fetch_add(controls[task].completed_blocks, completed), 0u);
+        const size_t row = task * sizeof(SchedulerTaskControl);
+        std::memcpy(expected.data() + row + offsetof(SchedulerTaskControl, next_block), &cursor, sizeof(cursor));
+        std::memcpy(
+            expected.data() + row + offsetof(SchedulerTaskControl, completed_blocks), &completed, sizeof(completed)
+        );
+        EXPECT_EQ(std::memcmp(expected.data(), controls, expected.size()), 0);
+    }
+}
+
+TEST(HbgSpmdLayout, AdmissionPublicationAndLockLeaveAllOtherTaskBytesUntouched) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(3, 3, 0, &layout));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    auto *controls = scheduler_state_at<SchedulerTaskControl>(storage.base(), layout.task_controls_offset);
+    std::array<uint8_t, 3 * sizeof(SchedulerTaskControl)> expected{};
+    std::memcpy(expected.data(), controls, expected.size());
+    for (uint64_t task = 0; task < 3; ++task) {
+        const uint64_t phase = UINT64_MAX - task;
+        const uint64_t lock = (UINT64_C(1) << 32) + task;
+        EXPECT_EQ(scheduler_gm_compare_exchange(controls[task].admission_claim_lock, UINT64_C(0), lock), 0u);
+        scheduler_publish_signal(controls[task].admission_state, phase);
+        EXPECT_EQ(scheduler_gm_query(controls[task].admission_state), phase);
+        const size_t row = task * sizeof(SchedulerTaskControl);
+        std::memcpy(expected.data() + row + offsetof(SchedulerTaskControl, admission_state), &phase, sizeof(phase));
+        std::memcpy(expected.data() + row + offsetof(SchedulerTaskControl, admission_claim_lock), &lock, sizeof(lock));
+        EXPECT_EQ(std::memcmp(expected.data(), controls, expected.size()), 0);
+        scheduler_gm_store(controls[task].admission_claim_lock, UINT64_C(0));
+        const uint64_t unlocked = 0;
+        std::memcpy(
+            expected.data() + row + offsetof(SchedulerTaskControl, admission_claim_lock), &unlocked, sizeof(unlocked)
+        );
+        EXPECT_EQ(std::memcmp(expected.data(), controls, expected.size()), 0);
+    }
 }
 
 TEST(HbgSpmdLayout, IsolatesAdmissionAndMailboxAtomicOwners) {
@@ -852,7 +929,7 @@ INSTANTIATE_TEST_SUITE_P(ActualWorkers, HbgProtocolTraceLayout, ::testing::Value
 
 TEST(HbgProtocolTrace, PreservesRunAndTraceWireSizesAndSeparatesConcurrentWriters) {
     EXPECT_EQ(sizeof(SchedulerGraphSummary), 128u);
-    EXPECT_EQ(sizeof(SchedulerRunControl), 384u);
+    EXPECT_EQ(sizeof(SchedulerRunControl), 512u);
     EXPECT_EQ(sizeof(SchedulerTaskTrace), 384u);
     EXPECT_EQ(offsetof(SchedulerGraphSummary, protocol_layout_offset), 96u);
     EXPECT_EQ(offsetof(SchedulerProtocolTaskTrace, completion), 64u);

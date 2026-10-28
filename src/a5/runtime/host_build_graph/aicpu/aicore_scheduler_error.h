@@ -62,18 +62,28 @@ inline bool record_aicore_scheduler_runtime_error(
     __atomic_store_n(&run_control->error_cluster_lane, UINT32_MAX, __ATOMIC_RELAXED);
     __atomic_store_n(&run_control->error_identity_fields, UINT32_C(0), __ATOMIC_RELAXED);
     __atomic_store_n(&run_control->error_site, static_cast<uint64_t>(error_site), __ATOMIC_RELAXED);
+    // Identity write-back completes before the independent status line can
+    // become visible to an AICore device load.
+    cache_flush_range(
+        reinterpret_cast<const uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed),
+        offsetof(SchedulerRunControl, scheduler_error) - offsetof(SchedulerRunControl, error_claimed)
+    );
     __atomic_store_n(&run_control->scheduler_error, static_cast<uint64_t>(scheduler_error), __ATOMIC_RELEASE);
+    cache_flush_range(
+        reinterpret_cast<const uint8_t *>(run_control) + offsetof(SchedulerRunControl, scheduler_error),
+        sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, scheduler_error)
+    );
     return true;
 }
 
 inline void log_aicore_scheduler_error_identity(SchedulerRunControl *run, const char *phase) {
     if (run == nullptr) return;
     const auto *error_line = reinterpret_cast<const uint8_t *>(run) + offsetof(SchedulerRunControl, error_claimed);
-    cache_invalidate_range(error_line, 128);
+    cache_invalidate_range(error_line, sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, error_claimed));
     const uint64_t status = __atomic_load_n(&run->scheduler_error, __ATOMIC_ACQUIRE);
     if (status == 0) return;
-    // The publication word is on the first 64B line. Reload both lines after
-    // acquiring it so a prefetched second line cannot carry an older identity.
+    // The identity spans two 64B lines, separate from the publication word.
+    // Reload both after acquiring the status to exclude prefetched identity.
     cache_invalidate_range(error_line, 128);
     LOG_ERROR(
         "A5 HBG scheduler identity: phase=%s task=%" PRIu64 " status=%" PRIu64 " core=%" PRIu64 " type=%" PRIu64

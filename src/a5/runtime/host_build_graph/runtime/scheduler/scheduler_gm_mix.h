@@ -73,9 +73,13 @@ inline __aicore__ bool scheduler_gm_mix_close(
     uint64_t close_seal = 0;
     if (local->is_mix_coordinator()) {
         if (group.phase != SchedulerGmMixPhase::IDLE) return true;
-        const uint64_t cursor = scheduler_gm_fetch_add(
-            scheduler_task_control_at(base, local, admission.current_task_ref)->next_block, UINT64_C(0)
-        );
+        auto *control = scheduler_task_control_at(base, local, admission.current_task_ref);
+        if (scheduler_gm_query(control->next_block) < admission.current_block_num && !admission.sync_claimed)
+            return true;
+        // The query may only postpone closing. The error gate and the atomic
+        // exhausted-cursor confirmation precede publishing a close seal.
+        if (scheduler_read_error(run) != 0) return false;
+        const uint64_t cursor = scheduler_gm_fetch_add(control->next_block, UINT64_C(0));
         if (cursor < admission.current_block_num && !admission.sync_claimed) return true;
         if (cursor > admission.current_block_num || (admission.sync_claimed && cursor == 0) ||
             group.task_last_seq == UINT64_MAX)
@@ -94,6 +98,7 @@ inline __aicore__ bool scheduler_gm_mix_close(
         close_seal = group.task_last_seq + 1;
     } else {
         if (!critical && scheduler_gm_query(seal) == 0) return true;
+        if (scheduler_read_error(run) != 0) return false;
         const uint64_t published = scheduler_gm_fetch_add(seal, UINT64_C(0));
         if (published == 0) return true;
         if ((group.phase != SchedulerGmMixPhase::IDLE && group.phase != SchedulerGmMixPhase::RELEASED) ||
@@ -119,6 +124,7 @@ inline __aicore__ bool scheduler_gm_mix_close(
     admission.current_active_mask = 0;
     admission.current_flags = 0;
     admission.sync_claimed = false;
+    admission.ticket_exhausted = false;
     group.phase = SchedulerGmMixPhase::IDLE;
     group.task_last_seq = 0;
     group.slot_index = UINT8_MAX;
@@ -131,6 +137,7 @@ inline __aicore__ bool scheduler_gm_mix_close(
 inline __aicore__ SchedulerBlockClaimResult scheduler_gm_mix_claim(
     const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
+    // No shared ownership changes until the cursor helper's error gate.
     if (!scheduler_gm_mix_context_valid(graph, base, local, run)) return SchedulerBlockClaimResult::ERROR;
     auto &admission = *local->admission;
     auto &group = admission.gm_mix;
@@ -386,6 +393,8 @@ inline __aicore__ bool scheduler_gm_mix_release_lane(
 inline __aicore__ SchedulerGmMixResult scheduler_gm_mix_retire(
     const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
+    // The completion contribution below owns the error gate. A partial
+    // release observation neither retires the group nor contributes a block.
     if (!scheduler_gm_mix_context_valid(graph, base, local, run)) return SchedulerGmMixResult::ERROR;
     auto &admission = *local->admission;
     auto &group = admission.gm_mix;

@@ -69,7 +69,7 @@ def _sample(native, params, *, overlap=None, reverse=False):
     return test, actual, golden
 
 
-@pytest.mark.parametrize("case_index", range(44))
+@pytest.mark.parametrize("case_index", range(68))
 def test_every_gm_case_checks_all_active_logical_slots_and_original_shape(gm_native, case_index):
     params = gm_native.TestHbgGmMixExecution.CASES[case_index]["params"]
     test, actual, golden = _sample(gm_native, params)
@@ -244,10 +244,13 @@ def test_no_gm_reuse_round_may_use_stale_or_legacy_provenance(gm_native, monkeyp
     assert len(observed) == broken_step + 1
 
 
-def test_gm_matrix_counts_all_sixty_invocations_without_silent_weakening(gm_native):
+def test_gm_matrix_counts_all_eighty_four_invocations_without_silent_weakening(gm_native):
     cases = gm_native.TestHbgGmMixExecution.CASES
-    assert len(cases) == len({case["name"] for case in cases}) == 44
-    assert sum(len(case["params"].get("invocation_blocks", (0,))) for case in cases) == 60
+    assert len(cases) == len({case["name"] for case in cases}) == 68
+    assert sum(len(case["params"].get("invocation_blocks", (0,))) for case in cases) == 84
+    for mask in (3, 5, 6, 7):
+        shapes = {case["params"].get("blocks") for case in cases if case["params"]["mask"] == mask}
+        assert {1, 2, 3, 15, 16, 17, 63, 64, 65} <= shapes
     assert all("skip_golden" not in case and "manual" not in case and "marks" not in case for case in cases)
     kernels = gm_native.TestHbgGmMixExecution.CALLABLE["incores"]
     assert [(kernel["func_id"], kernel["core_type"]) for kernel in kernels] == [(0, "aic"), (1, "aiv"), (2, "aiv")]

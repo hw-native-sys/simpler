@@ -558,6 +558,21 @@ class NativeAudit:
                 control["next_block"] == control["completed_blocks"] == (task["block_num"] if cooperative else 0),
                 "terminal block counters mismatch",
             )
+            if self.raw["schema"] == "hbg-native-protocol-v5":
+                require(control["admission_claim_lock"] == 0, "invalid terminal admission claim lock")
+            if self.raw["schema"] != "hbg-native-protocol-v1":
+                positions = self.raw["cluster_count"] * (2 if task["active_mask"] in (2, 4) else 1)
+                minimum_blocks = (
+                    2
+                    if self.raw["schema"] in ("hbg-native-protocol-v4", "hbg-native-protocol-v5")
+                    else positions * 2 + (1 if self.raw["schema"] == "hbg-native-protocol-v2" else 0)
+                )
+                uses_tickets = cooperative and not task["flags"] & SYNC and task["block_num"] >= minimum_blocks
+                tickets = control["claim_tickets"]
+                require(
+                    task["block_num"] <= tickets <= task["block_num"] + positions if uses_tickets else tickets == 0,
+                    "invalid terminal claim ticket counter",
+                )
             if not task["flags"] & EXECUTABLE:
                 continue
             done = self.actors[ref]["completion"]

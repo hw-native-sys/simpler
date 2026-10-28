@@ -101,6 +101,54 @@ def test_literal_epochs_and_cycle_zero_survive_without_claiming_causality(epoch)
     assert raw == before
 
 
+@pytest.mark.parametrize("tickets", (0, 1, (1 << 64) - 1))
+@pytest.mark.parametrize("schema", ("hbg-native-protocol-v2", "hbg-native-protocol-v3", "hbg-native-protocol-v4"))
+def test_versioned_protocol_preserves_raw_ticket_values_for_incomplete_capture_diagnosis(tickets, schema):
+    raw = capture()
+    raw["schema"] = schema
+    raw["task_controls"][0]["claim_tickets"] = tickets
+    before = copy.deepcopy(raw)
+    assert read_native_protocol(raw) == before
+
+
+def test_v1_does_not_silently_accept_v2_ticket_fields():
+    raw = capture()
+    raw["task_controls"][0]["claim_tickets"] = 0
+    with pytest.raises(ValueError, match="unknown fields"):
+        read_native_protocol(raw)
+
+
+@pytest.mark.parametrize("value", (0, 1, (1 << 64) - 1))
+def test_v5_preserves_admission_claim_lock_for_failed_capture_diagnosis(value):
+    raw = capture()
+    raw["schema"] = "hbg-native-protocol-v5"
+    raw["task_controls"][0].update(claim_tickets=0, admission_claim_lock=value)
+    before = copy.deepcopy(raw)
+    assert read_native_protocol(raw) == before
+
+
+@pytest.mark.parametrize("value", (None, True, -1, 1 << 64, "0"))
+def test_v5_requires_a_typed_admission_claim_lock(value):
+    raw = capture()
+    raw["schema"] = "hbg-native-protocol-v5"
+    raw["task_controls"][0]["claim_tickets"] = 0
+    if value is not None:
+        raw["task_controls"][0]["admission_claim_lock"] = value
+    with pytest.raises(ValueError, match="missing or unknown fields" if value is None else "admission_claim_lock"):
+        read_native_protocol(raw)
+
+
+@pytest.mark.parametrize("version", (1, 2, 3, 4))
+def test_legacy_protocol_does_not_silently_accept_v5_claim_lock(version):
+    raw = capture()
+    raw["schema"] = f"hbg-native-protocol-v{version}"
+    if version != 1:
+        raw["task_controls"][0]["claim_tickets"] = 0
+    raw["task_controls"][0]["admission_claim_lock"] = 0
+    with pytest.raises(ValueError, match="unknown fields"):
+        read_native_protocol(raw)
+
+
 @pytest.mark.parametrize("field", tuple(capture()))
 def test_every_root_field_is_required(field):
     raw = capture()

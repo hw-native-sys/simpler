@@ -99,8 +99,8 @@ def _array(value, path, count=None, *, signed=False):
         _number(item, f"{path}[{index}]", signed=signed)
 
 
-def _record(record, kind, path):
-    numbers = NUMBERS[kind].split()
+def _record(record, kind, path, extra_numbers=()):
+    numbers = NUMBERS[kind].split() + list(extra_numbers)
     stamps = STAMPS.get(kind, "").split()
     arrays = ARRAYS.get(kind, {})
     _object(record, {*numbers, *stamps, *arrays}, path)
@@ -129,7 +129,17 @@ def _indices(rows, count, path, *, key="index", dense=False):
 def read_native_protocol(section):
     """Validate the wire schema; preserve incomplete/error records for diagnosis."""
     _object(section, ROOT_NUMBERS | ROOT_TABLES | {"schema", "producer", "first_error"}, "root")
-    if section["schema"] != "hbg-native-protocol-v1" or section["producer"] != "aicore":
+    if (
+        section["schema"]
+        not in (
+            "hbg-native-protocol-v1",
+            "hbg-native-protocol-v2",
+            "hbg-native-protocol-v3",
+            "hbg-native-protocol-v4",
+            "hbg-native-protocol-v5",
+        )
+        or section["producer"] != "aicore"
+    ):
         _error("unknown schema or producer")
     for field in ROOT_NUMBERS:
         _number(section[field], field)
@@ -147,7 +157,10 @@ def read_native_protocol(section):
     ):
         _indices(section[table], count, table, key=key, dense=True)
         for row in section[table]:
-            _record(row, kind, f"{table}[{row[key]}]")
+            extra = ("claim_tickets",) if kind == "control" and section["schema"] != "hbg-native-protocol-v1" else ()
+            if kind == "control" and section["schema"] == "hbg-native-protocol-v5":
+                extra += ("admission_claim_lock",)
+            _record(row, kind, f"{table}[{row[key]}]", extra)
     for row in section["admissions"]:
         if len(row["member_words"]) != (section["worker_count"] + 63) // 64:
             _error("member bitmap length mismatch")

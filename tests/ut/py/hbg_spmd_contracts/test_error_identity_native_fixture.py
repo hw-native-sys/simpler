@@ -30,9 +30,9 @@ def native():
         yield module
 
 
-@pytest.mark.parametrize("case", range(46))
+@pytest.mark.parametrize("case", range(50))
 def test_each_native_case_has_complete_golden_and_private_guards(native, case):
-    assert len(native.TestHbgErrorIdentity.CASES) == 46
+    assert len(native.TestHbgErrorIdentity.CASES) == 50
     params = native.TestHbgErrorIdentity.CASES[case]["params"]
     probe = native.TestHbgErrorIdentity()
     args = probe.generate_args(params)
@@ -41,7 +41,7 @@ def test_each_native_case_has_complete_golden_and_private_guards(native, case):
 
 
 @pytest.mark.parametrize("shared", (0, 1))
-@pytest.mark.parametrize("word", range(64))
+@pytest.mark.parametrize("word", range(96))
 def test_every_identity_and_guard_word_is_checked(native, shared, word):
     params = dict(lane=1, blocks=65, shared=shared, epoch=-1, scenario=0)
     controls, checks = native.expected_probe(params)
@@ -102,10 +102,26 @@ def test_mixed_race_requires_two_actual_participants_and_the_winners_lane(native
     controls, checks = native.expected_probe(params, [winner])
     native.validate_probe(controls, checks, params)
     if field == "arrival":
-        controls[48] = 1
+        controls[64] = 1
     elif field == "missing_lane":
         checks.view(2, 16)[1, 0] = 0
     else:
         controls[47] ^= 1
+    with pytest.raises(AssertionError):
+        native.validate_probe(controls, checks, params)
+
+
+@pytest.mark.parametrize("scenario", (6, 7))
+@pytest.mark.parametrize("fault", ("wrong_writer", "missing_status", "missing_notice"))
+def test_directed_publication_requires_status_after_the_designated_writer_returns(native, scenario, fault):
+    params = dict(lane=2, blocks=2, shared=1, epoch=61, scenario=scenario)
+    controls, checks = native.expected_probe(params)
+    native.validate_probe(controls, checks, params)
+    if fault == "wrong_writer":
+        controls, checks = native.expected_probe(params, [1 - (scenario - 6)])
+    elif fault == "missing_status":
+        controls[48] = 0
+    else:
+        controls[65] = 0
     with pytest.raises(AssertionError):
         native.validate_probe(controls, checks, params)

@@ -28,16 +28,20 @@ device 沿用完成驱动的 wake-list、ready inbox、直接后继候选和每�
 | 存储 | 字段／大小依据 | 写入者与生命周期 |
 | ---- | -------------- | ---------------- |
 | 现有 TaskMetadata | 原 N、mask、函数、参数、trace base | Host 初始化，本轮只读 |
-| 现有 TaskControl 的原子区 | 新增 next_block、completed_blocks、admission_state | 领取者／完成者；只能原子访问 |
+| 现有 TaskControl 的原子区 | next_block、claim_tickets、completed_blocks、admission_claim_lock | 领取者／完成者；只能原子访问 |
+| TaskControl 的阶段信号区 | admission_state，独占 128B | 唯一准入者发布；禁止 AICore RMW 或 cached writeback |
 | AdmissionRecord | epoch、task_ref、order_key、成员位图、形状／策略、Mix seal offset | 唯一准入者准备；发布后只读 |
 | AdmissionLog | 长度为可协同准入 task 数的 task_ref 数组；commit_tail、短提交锁 | 任意合法发布者；一次提交一个引用 |
 | 本核本地状态 | scan_cursor、current_obligation、两个候选身份、当前 lease、sync_claimed | 仅本核修改，不增每核全图表 |
 | 每 cluster 一个 GM GroupMailbox | 当前组 descriptor、published_seq、3 个 lane ack | AIC 写组身份，各 lane 写自己的 ack |
 | MixCloseSeal | 每 Mix task、每候选 cluster 一个 64 位结束 token | 本 cluster AIC 单次发布，直到本轮退出不复用 |
 
-TaskControl 的第一条 64B line 原有 state/wake_list_head/next_waiter 三个 64 位原子字段，
-现已使用原 40B padding 中的 24B 承载 next_block/completed_blocks/admission_state，仍为 128B。
-新增字段不得与第二条普通写回 line 混用；补 sizeof、offsetof、alignment、POD 静态断言。
+TaskControl 为 512B：state/wake_list_head/next_waiter 仍在第一条 64B line，admission_claim_lock 的 offset 为 40；
+offset 24 的 claim_tickets 复用原 padding，offset 32–39 为零 padding；第二条普通写回 line 仍从 offset 64 开始。
+next_block、completed_blocks 分别独占 offset 128、256 起的 128B 区域，均只能原子访问。
+admission_state 独占 offset384 起的 128B 区域，由 st_dev＋DSB 发布、ld_dev 读取，
+整条信号 line 不与原子字、cached store 或 dirty writeback 混用。
+保持 sizeof、offsetof、alignment、POD 静态断言，Host 初始化／上传与所有访问步长从 sizeof 推导。
 AdmissionRecord 的位图按紧凑 worker index 编码，按实际 worker 数规划 word 数，
 不用物理 core ID 直接寻址。独立热点控制对象以 128B 对齐／步长隔离，
 这只是地址布局基线，不声称能够消除同一 cursor 的原子竞争。
@@ -49,14 +53,16 @@ GraphSummary 的现有 padding 承载协议 offset／容量／Host run_epoch，�
 AdmissionControl 的 lock/tail 各占 128B；GroupMailbox 为 descriptor 128B、
 published_seq 独占 128B、三个 lane ack 各 128B，共 640B。
 
-`SchedulerAdmissionLocalState` 为 232B，含两个各 48B 的候选、40B 组状态和 sync_claimed；
+`SchedulerAdmissionLocalState` 为 256B，含两个各 48B 的候选、40B 组状态、sync_claimed，
+以及本轮不变拓扑的 AIC 位图与有效 worker 数缓存；缓存随每轮初始化重置。
 `SchedulerLocalSlotState` 为 24B，含 block 身份和 predicate 缓存，
 `SchedulerLocalState` 为 504B。候选只保留 task 所有权与重建所需状态，
 不会增加物理并发容量，也不保存每核全图或全部 block 历史。
 
 AdmissionLog 只存引用，记录按 task_ref 定位；不按 block 数扩大日志。
-紧凑 log 单元和 close seal 都只能通过原子读写，不能普通写单元再 dcci 整行；
-短提交锁不会自动消除不同发布者缓存中的旧行副本。
+紧凑 log 单元在提交锁保护下由唯一发布者用 st_dev＋DSB 写入，发布后不可变，由 ld_dev 读取；
+commit_tail 同样使用隔离的 bypass 信号区。close seal 仍使用原子读写。
+这些紧凑数组都不能普通写单元再 dcci 整行；短锁不会自动消除不同发布者缓存中的旧行副本。
 MixCloseSeal 为 8 × Mix task 数 × 候选 cluster 数字节，避免复用 mailbox 后丢失前任务关闭通知。
 它不是第二套依赖图；所有大小都由 Host 按实际图分配，并做乘积／对齐溢出检查。
 参考模型为了审计保存所有 block 历史，生产路径不必为每 block 常驻完整模型对象。
@@ -118,13 +124,24 @@ N>1 的合法请求继续设置 SYNC_START，超过对应类型执行位置容�
 参数复用现有 graph/state/local context。调用方先唯一取得 ready 候选，
 仅成功 claim 才将其所有权转移给持久 pending；RETRY 不能让调用方丢弃候选。
 本地协议状态必须成功初始化；epoch 0 是合法身份，不能拿它兼作“未初始化”哨兵。
+唯一领取使用 task 自己的 admission_claim_lock：CAS 0→1 后再次确认阶段为 UNCLAIMED，
+发布 CLAIMED 后释放锁，再将候选转入 pending。迟到的重复领取必须因阶段非零而拒绝；
+取得锁后遇错须释放自己的锁，没有取得锁则不能释放别人的锁。
+此锁不跨准备、kernel 或等待持有，也不是保持到 TaskDone 的全局锁。
+PREPARED／ADMITTED 由同一准入 owner 发布；扫描者仍核验阶段、身份、epoch、成员和顺序。
 纯 C/V 的 `scheduler_fill_ordered_slots` 发现／发布候选，executor 的
 `scheduler_ordered_can_enter_slot` 在实际执行前校验许可；完成路径的 direct 候选
 进入同一个持久候选池。GM Mix 使用本核 own slot，入口再核对组、block、slot 和 generation。
 
+满足三 lane release 后，同一次服务可退役当前组并领取／发布下一组；
+本地 close 后可继续观察下一义务，每次 fill 最多连续处理两个已关闭义务。
+等待伙伴时立即返回，不以连续推进替代错误检查、执行许可或全员 release 确认。
+完成服务可能在本轮 discovery 之后产生 direct 候选；其中 inline 服务和多 block／Mix 候选
+必须再经过 discovery 的服务／准入分类，不能落入普通单 block 的物理槽准备路径。
+
 | 转换 | 条件与唯一动作 | 暂时不能推进时 |
 | ---- | -------------- | -------------- |
-| DATA_READY → CLAIMED | 既有 pop/refill 唯一取得逻辑 task；再校验一次状态 | 返回无工作，不丢候选 |
+| DATA_READY → CLAIMED | 既有 pop/refill 唯一取得逻辑 task；短领取锁内重查阶段并发布 CLAIMED | pending 已占用则 RETRY；重复所有权则 ERROR，不丢候选 |
 | CLAIMED → PREPARED | 冻结成员与角色、校验形状、初始化 cursor/计数 | 错误终止本轮；不假造完成 |
 | PREPARED → ADMITTED | 短锁内填 order、发布记录与日志元素、最后推进连续 tail | 竞争失败保留候选，先做可推进控制工作 |
 | ADMITTED → TASK_DONE | 所有 block 成功完成且可见 | 继续服务，不以领取耗尽代替完成 |
@@ -135,7 +152,7 @@ ready pop 只做一次；task 离开 ready 后由准入记录维护 block cursor
 不是“仅删除我先前看见的 A”。若将来采用延迟摘头，必须另有 expected-task 条件摘除原语；
 新增 C++ 回归已固定这一边界，不能误用旧接口。
 
-准备成员在锁外进行。锁内只完成有限的记录提交：
+准备成员不持锁。独立的全局 commit_lock 内只完成有限的记录提交：
 检查 epoch/error/capacity → 取当前 tail → 填完整记录及引用 → 发布 → tail 加一 → 解锁。
 不可先公开 fetch_add 的预留洞；不可持锁等待其他核、ready、kernel、组到达或 TaskDone。
 持锁者异常走 run failure，不在其他核还可能使用记录时擅自“抢锁恢复”。
@@ -161,8 +178,10 @@ worker 扫描已发布日志的本核投影，跳过非成员，停在最早未 
 Mix 作为当前义务推进，不采用“普通槽先执行、无普通槽才看 Mix”的固定优先级。
 已经预填的后序候选不代表已经获得执行许可。
 
-普通单 block 的基线线性化点是**执行前对 commit_tail 的关键原子读**：
-本核先处理到可见前缀，再以 atomic-current read 确认 tail 未推进，且没有未关闭义务。
+普通单 block 的线性化点是**执行前对 commit_tail 的关键 bypass 读**：
+本核先处理到可见前缀，再以 ld_dev 确认 tail 未推进，且没有未关闭义务。
+tail 已整体切换到隔离信号发布域：持有提交锁的唯一活动写者用 st_dev＋DSB_DDR 发布，
+该 line 不混用 AICore 原子、cached store 或 dirty writeback；不是只替换旧原子 writer 的 reader。
 该次读授予仅本次 kernel 的 entry permit；之后提交的协同 task 可以包含该核，
 但必须容忍这一个已获准的有限普通 kernel 收尾。读前已经提交的义务不可忽略。
 每次续接都重新验证；两个预填槽不能共用一个过期 permit。
@@ -188,13 +207,20 @@ Mix 作为当前义务推进，不采用“普通槽先执行、无普通槽才�
 ### 纯 C/V 的不可撤销领取
 
 当前纯 C/V 使用 `scheduler_claim_ordered_block`：
-先确认本核最早义务、类型与候选容量，再用有界 CAS 将 next_block 从 b 改为 b+1。
-b 等于 N 返回 EXHAUSTED，不继续 fetch_add 造成无限越界；成功即绑定唯一 owner，
-不回滚 cursor、不偷取已领取工作。参数准备失败必须失败收敛，不能重新发出同一 block。
+先确认本核最早义务、类型与候选容量。N1 和 sync_start 用有界 CAS 将 next_block 从 b 改为 b+1，
+b 等于 N 返回 EXHAUSTED。普通 N>1 时用 claim_tickets 的 FAA 返回值作为实际 block 票号，
+P 为纯 C／Mix 的 cluster 数或纯 V 的两倍 cluster 数，不按 task ID 或模型名称特判。
+有效票 t<N 再对 next_block 加一；这条路径的 next_block 是有效领取确认数，不是当前票号。
+每个位置至多一次无效尾票，本地 ticket_exhausted 随当前义务保持并在关闭／新 run 初始化时清除，
+故原始票数最多 N+P，而有效领取数仍不超过 N。无效票不产生 block owner、payload 或完成贡献。
+成功票号即不可撤销的单块所有权，不回滚、不偷取；参数准备失败必须失败收敛，不能重发该 block。
+只持有本次 helper 调用的一张票，不扩大两槽或 Mix 的既有在飞额度。
+记录准备及正式准入提交均要求 claim_tickets 为零，不能重新使用带旧票号的 task。
 
 LocalContext 始终设置原 N 与本次 b；参数 view 不自动再加 block 偏移。
 普通模式本核最多两个已领取未退役候选，实际 kernel 同时至多一个。
 进入下一任务的条件是 cursor 已封闭且本核已领取 work 全部发布、执行、完成。
+取号分路也必须强确认 next_block==N；仅看到票号耗尽不能越过尚未发布有效领取确认的最后一张票。
 快核可以在远端最后一个 block 仍运行时满足该条件；零工作成员也可以合法关闭。
 
 sync_start 复用动态领取，本核对该 task 至多成功一次，**早返回也不能再领一次**。
@@ -278,11 +304,17 @@ predicate 跳过保留 executed=false，不冒充 kernel 执行。N/block 来自
 completion 的既有 valid 最后发布；L0 不写身份。读端拒绝缺字段、错绑、重复执行及槽代次。
 CSA 严格门禁按冻结图核对完整 task/block/slot 集合；历史无身份 capture 保持未验证。
 执行身份对象本身不提供 LocalDone、共同准入发布和 GM 组释放事件。
-L4 另以 `aicore_protocol` 对象导出这些真实记录，schema 为 `hbg-native-protocol-v1`，
+L4 另以 `aicore_protocol` 对象导出这些真实记录，当前 schema 为 `hbg-native-protocol-v5`，
 同时保留 Host 冻结图和设备终态。统一读端在 `simpler_setup/tools/hbg/native_protocol.py`；
 它校验 schema 与逐核序号完整性，`native_causality.py`、`native_mix_audit.py` 与
 `native_order.py` 进一步检查冻结图／成员、两槽生命周期、实际完成票号、组握手与关闭、
 TaskDone 和依赖，并与独立入口身份逐字段连接。
+v2–v5 要求每个 task control 的 claim_tickets 字段，终态取号任务必须在 [N,N+P]，其他任务必须为零；
+v2 的普通任务阈值严格为 N>2P，v3 为 N≥2P，v4/v5 为 N>1，N1／sync_start 均不取号。
+v5 另要求 admission_claim_lock 原始字段，成功终态必须为零；失败 wire 记录保留实际值用于诊断。
+next_block==completed_blocks==N 的有效 block 条件保持原样。读端继续严格支持 v1–v4 历史记录，
+不为缺失字段补默认值，也不接受 v1 混入票数字段或在同一 schema 下改变阈值语义。
+失败记录保留原始票数，不能仅靠 wire 解析宣称终态正确。
 既有泳道 `core_id` 使用紧凑 worker 编号；协议拓扑 `workers[].core_id` 保存硬件核号，
 二者不能混作连接键。
 
@@ -302,26 +334,40 @@ CSA 还对照独立 dep-gen 核验冻结任务、kernel、原 N 和全部 fanin�
 
 | 状态 | 写方动作 | 读方动作 |
 | ---- | -------- | -------- |
-| AdmissionRecord/log element | 写只读区，按涉及 cache line 写回并 barrier，最后原子发布 tail | query 可作预筛；关键读确认 tail，失效记录，再使用 |
+| AdmissionRecord/log element/tail | 写回完整 record 并 barrier；st_dev＋DSB 发布 log cell；原子置 ADMITTED 并 barrier；最后 st_dev＋DSB 发布 tail | ld_dev 关键读取 tail/log，失效 record/bitmap，原子确认 ADMITTED 并核验完整记录，再使用 |
 | TaskControl 新字段 | 始终使用现有原子包装 | 控制转移用关键原子操作，不用过时快照 |
 | Mix descriptor | C 写回完整 descriptor，barrier，原子发布 seq | lane 原子确认 seq、失效 descriptor、barrier、核对身份 |
 | lane ack／cluster seal | 完成对应先行动作，再原子发布带代次值 | 关键读核对 epoch/seq，不把旧值当新值 |
 | 输出 → block 完成 → TaskDone | 按 kernel 及运行时合同完成输出发布，再递交各层完成 | 消费者遵守已有 payload/输出可见性边界，不仅检查总数 |
 
-现有 scheduler_gm_query 是 ld_dev 预筛，不是所有权或 payload acquire。
+对原子发布的协议字，scheduler_gm_query 是 ld_dev 预筛，不是所有权或 payload acquire。
 AICore 上包装函数的 C++ memory_order 参数本身不建立设备 fence；
 复用 scheduler_memory.h 中明确的原子、写回、失效、barrier，逐字段审计。
 多写者原子 line 不能被普通 dcci 写回旧副本。CPU 原子模型不证明这些硬件性质。
 
+准入 tail 独占 128B；commit_lock 保持 CAS／原子释放，轮换写者必须完成发布后才能交接。
+紧凑 log 中每个 cell 每 run 只写一次，整片 log 统一使用 bypass 发布／读取，不能让相邻 cell
+混入原子更新或 cached store／dirty writeback。Host 初始化在启动前完成，导出发生在静止之后。
+error status 使用相同的受限 64 位发布 helper，但身份字段与 ADMITTED 等其他原子字不因此改协议。
+29 个原生发布场景分别在真机／仿真验证轮换发布者、首次读取、相邻追加和满核共享前缀，
+再由原样 CSA 的严格 L4 核验实际入口、身份与依赖；不能仅以 CPU acquire/release 推断硬件可见性。
+
 ### 失败和退出
 
 错误记录首先保存 epoch/task/block/worker/seq/site，停止新 kernel 准入，不补成功计数。
-RunControl 仍为 384B，error_claimed/site 的既有 offset 为 256/328；
-末尾 48B 承载 epoch/order/block/group_seq/worker 五个 64 位字段、lane/identity_fields 两个 32 位字段。
+RunControl 为 512B，error_claimed/site 的既有 offset 为 256/328；
+offset 336–383 的 48B 承载 epoch/order/block/group_seq/worker 五个 64 位字段、lane/identity_fields 两个 32 位字段。
+错误状态位于独占 128B 区域的 offset 384，旧 offset 264 为零填充，不与原子身份字段共 cache line。
 identity_fields 的 bit 0–5 分别表示 epoch/order/block/group_seq/worker/lane 已采集，
 不表示数值已通过协议合法性检查。未采集值为全 1；合法 epoch 0/MAX 依靠位图区分未知。
 
 通用 writer 位于 scheduler_error.h，取得 first-error CAS 后写全身份，barrier 后发布错误状态；
+状态字的 AICore 写入使用 st_dev，完成 DSB_DDR 后返回；状态读取统一走 scheduler_read_error 的 ld_dev。
+这一单写者状态 line 不允许任何 AICore atomic，包括 fetch_add(0)，也不允许 cached store／旧行写回。
+AICPU 首写者先写回完整身份区，再 release store 状态并写回独立状态区；CPU／仿真 reader 使用 acquire load。
+bootstrap、execution、terminal 与冷日志的缓存失效范围均覆盖新状态位置，不能仍停在旧 384B 边界。
+状态改走同一非原子发布／读取路径不改变 claim、发布、执行入口、完成、关闭或退出处的错误门禁。
+其他 cursor／seq／ack／seal 继续使用原来的原子协议，不能套用此读取规则。
 OK 不占 claim，后写者不修改首现场。ready 从已有本核状态提取身份，
 不匹配当前义务时不挪用它的 order/group；当前 task 已退役组可保留最近身份，
 task_last_seq 清零后不再拿前 task 的组解释新 task。准备和 completion 使用确切 slot，
@@ -361,6 +407,6 @@ workers.finished=2 只表示 ACK 前的失败记录，必须结合 fence、退�
 纯 C/V、GM Mix 已有生产 helper 和原生执行证据；
 N>1 sync_start 与性能对照已有实测证据，N=1 公共契约已确认，最终逐项验收仍待收口；
 参考模型不是实现的替代品，性能回退也未因完成测量而得到解决。
-私有错误区原生探针验证生产 writer 和设备原子发布，不触发真实 runtime 错误，
+私有错误区原生探针验证生产 writer 和状态发布／读取，不触发真实 runtime 错误，
 不能据此声称任意物理核异常的静止／回收均已获得设备验证。
 不要先全局放开 shape predicate，再用 legacy 的正确输出宣布 SPMD 完成。

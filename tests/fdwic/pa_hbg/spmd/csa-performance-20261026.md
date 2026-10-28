@@ -86,8 +86,15 @@ Host / Device 原始标记，保留时间、时钟域和调用身份，去掉外
 两组均无重叠记录。本机没有 `task-submit`，没有硬件独占锁，
 进程观察也不证明不存在所有外部负载。
 
-泳道图、raw、完整日志、受测二进制和被排除样本仅保留在本地
-`reports/csa_scheduler_compare_20261026.oikNk1/`，不纳入本次提交。
+泳道图、raw、完整日志、受测二进制和被排除样本仅保留在本地工作区的
+`reports/csa_scheduler_compare_20261026.oikNk1/`，即从 simpler 仓库根目录访问
+`../reports/csa_scheduler_compare_20261026.oikNk1/`，不纳入本次提交。
+该归档下可直接打开的两份 Perfetto 泳道为：
+
+- AICPU：`artifacts/aicpu-l4/L4.json`。
+- AICore：`artifacts/aicore-l4/L4.json`。
+
+各自同目录保留 `chip_swimlane_records.json`、`deps.json` 与 `result.json`。
 结果只覆盖此固定 CSA 负载，不外推到其他 batch、模型或多卡。
 
 ## 复核与复跑

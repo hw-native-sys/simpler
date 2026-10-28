@@ -90,8 +90,8 @@ class TestHbgOrderedExecution(_SpmdContract):
         [
             _case(f"pure_{kind}_n{n}", "shape", mask, blocks=n)
             for kind, mask, counts in (
-                ("c", 1, (1, 2, 31, 32, 33, 65, 512)),
-                ("v", 2, (1, 2, 63, 64, 65, 129, 512)),
+                ("c", 1, (1, 2, 3, 15, 16, 17, 31, 32, 33, 63, 64, 65, 512)),
+                ("v", 2, (1, 2, 3, 31, 32, 33, 63, 64, 65, 127, 128, 129, 512)),
             )
             for n in counts
         ]

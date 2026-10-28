@@ -41,7 +41,8 @@ inline __aicore__ bool scheduler_service_gm_mix(
                 return false;
             if (retired == SchedulerGmMixResult::PROGRESS || retired == SchedulerGmMixResult::TASK_LAST) {
                 *progress = true;
-                return true;
+                if (!scheduler_gm_mix_close(graph, base, local, run, &closed)) return false;
+                if (closed) return true;
             }
         }
         if (group.phase == SchedulerGmMixPhase::IDLE) {
@@ -72,6 +73,62 @@ inline __aicore__ bool scheduler_service_gm_mix(
     return true;
 }
 
+// A false hint skips only this poll. It neither grants a kernel permit nor
+// changes ownership, a frontier, an acknowledgement, or a completion count.
+// Stale observations may postpone work; every positive hint takes the normal
+// ownership validation path before doing that work.
+inline __aicore__ bool
+scheduler_ordered_poll_may_progress(const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local) {
+    const auto &admission = *local->admission;
+    if (admission.capacity == 0 || admission.scan_cursor > admission.capacity || local->local_ready_mask != 0 ||
+        !scheduler_task_ref_is_null(admission.pending_task_ref))
+        return true;
+    for (const auto &candidate : admission.candidates)
+        if (!scheduler_task_ref_is_null(candidate.ready.task_ref)) return true;
+
+    const uint32_t queues = local->has_mix && local->is_mix_coordinator() ? 2 : 1;
+    for (uint32_t index = 0; index < queues; ++index) {
+        const uint32_t type = index == 0 ? local->config.self_core_type : SCHEDULER_MIX_QUEUE;
+        if (type >= SCHEDULER_READY_QUEUE_COUNT || local->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
+            !scheduler_ready_queue_holder(type, local->config.self_core_type))
+            return true;
+        const uint64_t own = local->self_type_rank();
+        if (own >= scheduler_ready_queue_owner_count(local, type) || own >= scheduler_ready_queue_capacity(type))
+            return true;
+        auto *inbox = scheduler_ready_inbox_at(base, local, type, own);
+        // Own work is never gated solely by the directory: a push and an
+        // owner's clear can cross before the directory publication drains.
+        if (scheduler_gm_query(inbox->endpoints) != SCHEDULER_READY_ENDPOINTS_EMPTY ||
+            scheduler_ready_directory_nonempty(base, local, local->config.scheduler_count, type))
+            return true;
+    }
+    if (scheduler_task_ref_is_null(admission.current_task_ref)) {
+        auto *control = scheduler_state_at<SchedulerAdmissionControl>(base, admission.control_offset);
+        return scheduler_gm_query(control->commit_tail) != admission.scan_cursor;
+    }
+    if (!scheduler_task_ref_valid(graph, admission.current_task_ref) || !scheduler_task_is_mix(admission.current_flags))
+        return true;
+    const auto &group = admission.gm_mix;
+    if (group.mailbox_offset == 0 || group.cluster_index >= local->config.cluster_count) return true;
+    auto *mailbox = scheduler_gm_mix_mailbox(base, local);
+    if (!local->is_mix_coordinator() &&
+        (group.phase == SchedulerGmMixPhase::IDLE || group.phase == SchedulerGmMixPhase::RELEASED)) {
+        const auto *record = scheduler_admission_record_at(base, &admission, admission.current_task_ref);
+        auto *seals = scheduler_state_at<uint64_t>(base, record->mix_close_seals_offset);
+        return scheduler_gm_query(seals[group.cluster_index]) != 0 ||
+               scheduler_gm_query(mailbox->published_seq) > group.group_seq;
+    }
+    const bool releases = group.phase == SchedulerGmMixPhase::RELEASED && local->is_mix_coordinator();
+    if (group.phase == SchedulerGmMixPhase::ARRIVED || releases) {
+        if (group.group_seq == 0 || group.group_seq == UINT64_MAX) return true;
+        for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
+            auto &ack = releases ? mailbox->lanes[lane].released_seq : mailbox->lanes[lane].arrived_seq;
+            if (scheduler_gm_query(ack) < group.group_seq) return false;
+        }
+    }
+    return true;
+}
+
 inline __aicore__ bool scheduler_fill_ordered_slots(
     const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t *victim_cursors, SchedulerReadyStats *ready_stats, uint64_t profiling_level, bool *failed,
@@ -82,6 +139,11 @@ inline __aicore__ bool scheduler_fill_ordered_slots(
     *failed = false;
     auto *admission = local == nullptr ? nullptr : local->admission;
     if (!scheduler_admission_context_valid(graph, base, local, run, admission)) {
+        *failed = true;
+        return false;
+    }
+    if (!scheduler_ordered_poll_may_progress(graph, base, local)) return false;
+    if (scheduler_read_error(run) != 0) {
         *failed = true;
         return false;
     }
@@ -150,11 +212,14 @@ inline __aicore__ bool scheduler_fill_ordered_slots(
         }
         progress = true;
     }
-    if (!scheduler_refresh_local_obligation(graph, base, local, run, admission)) {
-        *failed = true;
-        return progress;
-    }
-    if (!scheduler_task_ref_is_null(admission->current_task_ref)) {
+    // Discovery and completion service regain control after at most two
+    // closed obligations; no member waits for a peer inside this pass.
+    for (uint32_t step = 0; step < SCHEDULER_PENDING_SLOT_COUNT; ++step) {
+        if (!scheduler_refresh_local_obligation(graph, base, local, run, admission)) {
+            *failed = true;
+            return progress;
+        }
+        if (scheduler_task_ref_is_null(admission->current_task_ref)) break;
         if (!scheduler_ordered_park_ordinary(graph, local, run)) {
             *failed = true;
             return progress;
@@ -163,9 +228,13 @@ inline __aicore__ bool scheduler_fill_ordered_slots(
             bool group_progress = false;
             if (!scheduler_service_gm_mix(
                     graph, base, local, run, profiling_level, wake_stats, ready_stats, completion_stats, &group_progress
-                ))
+                )) {
                 *failed = true;
-            return progress || group_progress;
+                return progress || group_progress;
+            }
+            progress = progress || group_progress;
+            if (scheduler_task_ref_is_null(admission->current_task_ref)) continue;
+            return progress;
         }
         for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
             if (local->slots[index].state != SchedulerDispatchSlotState::FREE) continue;
@@ -187,14 +256,22 @@ inline __aicore__ bool scheduler_fill_ordered_slots(
             progress = true;
         }
         bool closed = false;
-        if (!scheduler_close_ordered_obligation(graph, base, local, run, &closed)) *failed = true;
-        return progress || closed;
+        if (!scheduler_close_ordered_obligation(graph, base, local, run, &closed)) {
+            *failed = true;
+            return progress;
+        }
+        progress = progress || closed;
+        if (!closed) return progress;
     }
     bool may_prepare = false;
     for (uint32_t offset = 0; offset < SCHEDULER_PENDING_SLOT_COUNT; ++offset) {
         const uint32_t candidate_index = (admission->next_candidate + offset) % SCHEDULER_PENDING_SLOT_COUNT;
         auto &candidate = admission->candidates[candidate_index];
         if (scheduler_task_ref_is_null(candidate.ready.task_ref) || candidate.slot_index != UINT8_MAX) continue;
+        // Completion can retain a direct successor after discovery. Inline
+        // services and cooperative successors still require that path.
+        const auto metadata = scheduler_load_dispatch_metadata(base, local, candidate.ready.task_ref, profiling_level);
+        if (scheduler_task_is_inline(metadata.flags) || scheduler_task_requires_admission(metadata)) continue;
         for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
             auto &slot = local->slots[index];
             if (slot.state != SchedulerDispatchSlotState::FREE) continue;
@@ -277,7 +354,7 @@ inline __aicore__ bool scheduler_drain_ordered_exit(
         return true;
     }
     auto *control = scheduler_state_at<SchedulerAdmissionControl>(base, admission->control_offset);
-    const uint64_t tail = scheduler_gm_fetch_add(control->commit_tail, UINT64_C(0));
+    const uint64_t tail = scheduler_gm_query(control->commit_tail);
     if (tail != admission->capacity || admission->scan_cursor > tail)
         return scheduler_admission_fail(
             graph, local, run, SCHEDULER_TASK_REF_INVALID, SchedulerErrorSite::ORDERED_EXIT_IN_FLIGHT

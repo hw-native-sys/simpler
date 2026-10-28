@@ -2671,3 +2671,1119 @@ outputs/spmd-boundary-resume-precommit-20261026.log。
 也不把未开放的 predicate／Graph resident／deferred／动态转移扩展列作本轮必做。
 性能优化仍按用户安排留待后续，现有性能回退没有被“测试通过”掩盖。
 阶段提交仅包含本轮相关测试与中文记录，不包含既有未跟踪文件，不 push。
+
+## 2026-10-27：对照 poursoul 分支定位 CSA 空轮询开销
+
+用户要求比较 poursoul/a5-hbg-resident-spmd，并将合理改进落实到当前实现。
+起点 be28cfadc；保留上轮未提交的三项 TODO 与归档路径说明，不在本轮实现这些扩展。
+取回对方固定版本 1d96d66c0355，单独 detached worktree 和 venv，
+工作记录位于工作区 reports/csa_poursoul_20261027.Osnaam。
+原业务 54 个 kernel、构图和 manifest 无差异，PTO pin、CANN、Torch 2.12 相同；
+运行日志中的 54 个代码长度／FNV1a64 指纹逐项相同。
+本机 CANN query 再次确认 A5 32C/64V；无 npu-smi/task-submit，沿用用户授权直接用卡，
+同卡串行采样，0.25s 进程观察只作为干扰排查，不当作硬件独占证明。
+
+当前原版两批各 3 轮正确性＋5 轮预热＋100 轮计时完成，Device 中位数分别为
+22273.8325us、22569.4855us；产物 artifacts/current-before-a、current-before-b。
+对方 L4 的两轮七项 golden 通过，原始 producer=aicore，但有 2310 行而非预期 2308 行，
+其原版转换器报 duplicate aicore_tasks join key: (1,85,22)，结果保留为失败。
+这不能仅凭重复连接键判断是 kernel 重复执行还是采集问题，不能冒称完整协议已验证。
+对方首批 bench 的三轮 golden 通过；105 轮计时在 run_epoch=13 失败，
+设备记录 TIMEOUT，resolved=31、expected=107、inline=26，随后框架完成 reset。
+已完成轮次出现秒级长尾，不把失败批次或挑出的最快轮当作对方稳定性能。
+两边四份来源／基准记录均未观察到另一个 A5 CLI 测试进程重叠。
+
+代码对照：对方通过全局 SPMD 队首、形状 memo 和 ld_dev 做观察，
+用 CAS 领取、最后领取者发布后推进队首；Mix 仍用 SSBUF，不能直接替换当前 GM 协议。
+当前 ordered fill 对空候选仍反复进入 ready pop，空 inbox 会原子清目录；
+上下文与各层 Mix helper 又反复 fetch_add(0) 同一个全局 scheduler_error。
+已有 10 月 25 日诊断只将所有错误读改 query 的实验不能合入，本轮不重复放宽关键读。
+
+候选只增加每轮的只读 may-progress 预筛：看 own inbox、可偷取目录、准入 tail、
+本地候选／槽，以及 Mix 的描述序号、保留 seal、arrival/release ack。
+own inbox 不依赖目录位，以保留 push/clear 交错时的可发现性。
+否定结果只推迟本轮 fill，不领取、不提交、不关闭、不贡献完成、不授予 kernel 许可；
+肯定结果回到原有原子路径，并先重新原子读取错误字。所有实际控制转换的错误门禁保持原样。
+错误观察允许无进展轮询使用 query；不是把控制转换的 fetch_add 换成 query。
+没有新 env、宏、ABI 字段、heap、SSBUF 路径，也不缓存跨轮 entry permit。
+新增 CPU 用例覆盖等待未发布组、到达／释放缺伙伴、后到普通任务、retained seal、
+准入 tail 推进、目录位缺失但 own queue 有工作、以及先前 hint 不能掩盖随后错误。
+以下继续记录同一候选的实测与验收；不将诊断捕获和无插桩基准混为一个口径。
+
+### 启动开销与任务执行窗口必须分开
+
+对方第二批 105 轮计时也失败：在 run_epoch=32 报 SCHEDULER_TIMEOUT，
+设备日志 site=101 对应 AICPU_INIT_BARRIER_TIMEOUT；首批在第 13 轮失败。
+两批各自此前三轮七项 golden 均通过，但不能从失败批次截取快样本计算正式中位数。
+失败产物为 artifacts/poursoul-a、poursoul-b，框架均完成 reset；不是通过增加超时掩盖。
+
+只看上述失败会漏掉用户指出的执行阶段差距，因此额外原样采集双方 L1，
+并把 L4 的设备生命周期拆开。所有时间由同一 1 GHz 设备计数器换算：
+
+| 单次诊断捕获 | 当前候选（ms） | 对方（ms） |
+| ------------ | -------------- | ---------- |
+| L1 首个任务开始到最后任务结束 | 15.041979 | 7.086483 |
+| L4 首个任务开始到最后任务结束 | 16.309754 | 7.176110 |
+| L4 最长单线程 bootstrap 等待 | 0.194552 | 2101.712108 |
+| L4 首次 register release 开始到最后 exit signal 开始 | 16.470024 | 7.202997 |
+
+L1 显示当前候选任务窗口仍约为对方的 2.12 倍，不能以对方启动超时否认这个差距。
+不过这是各一份带插桩的诊断记录，不是多轮无插桩中位数；两边 L4 插桩内容也不完全相同。
+L1 原始记录位于 artifacts/current-after-l1、poursoul-l1；L4 对应 after-l4、poursoul-l4。
+当前 L1 转换通过，对方 L1 转换再次因重复键 (1,55,22) 失败；保留原始数据，不去重后冒充通过。
+
+进一步逐 task 对比，双方所有有 kernel 任务的记录总数一致；对方多的两行分别是
+task 14、27，deps.json 中 kernel_ids 均为 [-1,-1,-1]，是无 kernel 的 Dummy 节点。
+重复键的样本是在同一核执行同一 task 的不同时间区间，却重复使用同一 reg_task_id；
+多 block 本来就可能由同一核执行多次，这首先是执行记录身份不能唯一连接的问题，
+不是已证实的业务 kernel 重复执行。总数一致仍不能代替逐 block 唯一性验证，
+所以对方捕获依旧不具备当前严格身份／协议验收的证据。
+
+### 代码差距与本轮修改边界
+
+| 路径 | 当前实现的成本 | 对方做法与本轮处理 |
+| ---- | -------------- | ------------------ |
+| 无工作轮询 | 即使 ready 为空仍进入候选领取、目录原子清理和多层全局错误字 RMW | 借鉴只读观察；本轮增加 may-progress 预筛，消除这一部分反复维护 |
+| 普通多 block／协同任务发现 | 每核有准入日志扫描、本地义务和普通任务入口许可 | 对方只观察共同 SPMD 队首，并缓存不变形状；不直接删除当前的成员／入口语义 |
+| Mix 派发 | GM 描述、三资源 lane arrival/release、保留 close seal；每 cluster 当前只有一组握手状态 | 对方由 AIC 经 SSBUF 给 V 派发，并使用多槽；它改变通道与流水方式，不是等价替换几次原子读 |
+| 有效控制转换 | claim、publish、prepare、entry、retire 等仍含多层校验和全局错误字原子读 | 本轮只减少无进展路径；有实际动作时恢复原有原子检查，不沿用旧许可 |
+
+第一项的可消除成本已通过同一当前实现的前后对照证实；其余几项是源码可见的剩余差异，
+尚未逐项消融，不能把剩余约 8 ms 全归因于 SSBUF、准入日志或某一条指令。
+对方最后领取者 dispatch 后推进队首，并不自动证明所有较早领取者都已发布；
+sync_start 的 live-slot 判定也不同于当前 task-lifetime 的至多一次领取。
+这些语义边界不能随性能优化直接丢弃。本轮不新增 SSBUF，不改共同顺序和完成驱动依赖，
+不要求全部核同时开始，也不把非成员变成等待全任务完成。
+
+### 当前实现的无完整插桩基准
+
+四批使用同卡、同冻结 CSA、同 Torch 2.12、同 54 个已链接 kernel 代码指纹，
+每批先独立三轮正确性检查，再做 5 轮预热＋100 轮正式采样，chip_swimlane_level=0。
+Device 是 AICPU RunWall 所代表的完整设备生命周期，不是纯 kernel 时间；Host 单独报告。
+
+| 指标 | 修改前两批合并中位数 | 修改后两批合并中位数 | 降幅 |
+| ---- | -------------------- | -------------------- | ---- |
+| Device | 22.407817 ms | 15.712522 ms | 29.8793% |
+| Host | 101.463757 ms | 94.810750 ms | 6.5570% |
+
+每侧合并 200 个原始样本后求中位数，不取两批中位数的平均。
+修改前 Device 两批为 22.273833／22.569486 ms，修改后为 15.580174／15.791073 ms。
+修改前 Device P10/P90 为 21.867247／23.041914 ms，修改后为 15.435603／15.988095 ms。
+四批之间没有编译或其他本助手用卡工作；进程观察未发现另一个 A5 CLI。
+无 task-submit 硬件锁，且采样顺序是前两批后两批、没有 ABBA 反转，保留这些实验限制。
+
+工作区 reports/csa_poursoul_20261027.Osnaam/analyze_runs.py 重解析各 bench.log，
+与 result.json 的每个样本比对，核对 fixture、构图、54 个代码指纹、插桩等级、二进制身份
+及进程重叠记录，输出 comparison.json；失败批次不进入性能统计。
+候选生产 diff SHA256 为 38c8202c98be594bf3bd63d5055fc851c4c9da4754e2a5fe35fde2334d7a6526。
+这仅覆盖 src/python/simpler_setup，不表示整个工作树干净；保留此前 TODO／路径说明和未跟踪文件。
+
+### 回归证据
+
+新增 22 项生产 helper 检查；A5 HBG 全部 21 个 C++ 目标合计 864 项通过，
+日志 outputs/csa-idle-prefilter-cpp-all-20261027.log。
+Python 合同／原生身份和因果审计共 2085 项通过，outputs/csa-idle-prefilter-py-20261027.log。
+这两项是 CPU 验证，不代替 A5 实际执行。
+
+原样 CSA 严格 L4：两轮各七项 golden、2308 个执行身份、133 条依赖、96 workers、
+46733 个原生协议事件均通过，producer=aicore，protocol_verified 与 block_identity_verified 为 true；
+其 runtime SHA 与两批候选基准一致，见 artifacts/current-after-l4/result.json。
+仿真 HBG 目录回归 79 passed、41 deselected；SPMD 等八个原生测试类全部通过，
+共选择 536 个场景（保留复用场景内部多次 invocation，不把一次 invocation 冒称一个新增用例）。
+日志 outputs/csa-idle-prefilter-hbg-sim-final-20261027.log、csa-idle-prefilter-spmd-sim-20261027.log。
+首次 pytest 命令误带只属于编译工具的 --compile-workers，收集前退出；去掉该参数后重跑，
+不将该次失败算成通过，也没有新增测试选项。
+同一第一阶段候选的 A5 HBG 目录回归完成：112 passed、4 skipped、4 deselected，
+包含真实不可返回核的超时／回收场景，耗时 835.35s；八个专项类再通过 536 个场景，
+日志 outputs/csa-idle-prefilter-hbg-a5-20261027.log、csa-idle-prefilter-spmd-a5-20261027.log。
+
+### 继续对齐 7.2 ms 执行窗口
+
+用户进一步明确：重点是吸收对方约 7.2 ms 的启动后执行性能，不以启动失败代替差距分析。
+因此后续仍保持原样 CSA，分别看任务窗口与正式 Device/Host，不再把启动异常当作主结论。
+
+工作区 analyze_windows.py 从双方 L1 的最后结束任务逆向跟随最晚结束的真实 kernel 前驱，
+穿过无 kernel 节点，得到一条**观测依赖链**。当前第一阶段候选的链内任务跨度合计
+7078.966us、相邻前驱最后返回至后继首 block 开始的间隔合计 7872.627us；
+对方为 5749.368us、1332.254us。加上各自根节点相对整图首执行的偏移，分别重建
+15041.979us 与 7086.483us 的总窗口。它不是把全图所有并行任务的间隔相加，
+也不是无插桩统计意义上的关键路径；间隔包含完成发布、依赖推进、准入与资源握手。
+两条观测链不必包含相同节点，单次调度顺序也会变化。
+
+例子：第一阶段 L4 中 task 101 的 admission 发布到首 block 进入约 1696.674us；
+task 23 的前驱 completion 发布到自身 admission 约 520.708us，admission 到首执行
+另 116.446us。说明不能只优化 kernel 参数准备，也要减少无效观察对真正控制推进的干扰。
+这些是定位线索，不把 L1 的某条长尾与另一轮 L4 的某条事件强行一一对应。
+
+第二个独立实验把只读 empty 预筛细化到每次候选 ready 队列探测。
+三目标 306 项 CPU 检查、三轮七项 CSA golden 及 100 个正式样本通过，Device 中位数
+15605.724us，L1 窗口 15010.138us；与第一阶段两批的正常波动重叠，没有可信额外收益。
+因此已撤回该实验的生产 helper 和专用测试，不为不足 1% 的变化保留额外分支。
+源码快照 candidate-two.patch、artifacts/current-work-poll-a 与 current-work-poll-l1 保留用于复核。
+
+第三个实验只合并同一实际动作之前的重复强错误检查：纯 block wrapper 最终仍经
+claim cursor／completion contribution 的原子错误门禁；普通 entry 仍经 ordinary permit，
+协同 entry 在授予许可前保留原子错误门禁。已有本地义务、尚未发生 close 的观察可以用 query，
+真正扫描／采用新义务、发布 seal、消费 seal 时仍强读错误和 cursor/seal。
+GM claim／retire 分别由 cursor／contribution 承担强门禁，不缓存健康状态或 kernel 许可，
+不修改 GM 协议、共同顺序、N=1 归一化、成员集合或完成驱动依赖。
+现有 305 项三目标 CPU 回归通过；独立三轮七项 golden 与 100 个正式样本通过，
+Device 中位数 13545.510us，L1 任务窗口 13084.024us，保留该改动。
+产物 artifacts/current-strong-gate-a、current-strong-gate-l1，源码 candidate-three.patch。
+
+第四个实验复用 READY 之后不再变化的拓扑。此前每个 worker 每读一条准入记录，
+scheduler_admission_expected_members 都重新扫描全部 worker 的 core_type／worker_index；
+当前 CSA 有 61 个协同任务和 96 个 worker，重复验证的量级远大于每轮一次完整拓扑检查。
+不能仅以静态次数推断耗时，因此仍独立测量。本轮不是重做 10 月 25 日“只删两条 observe”
+的零收益实验：首次扫描的 observe 全保留，改变的是之后不再重复整个扫描／重建过程。
+
+缓存归属本核本轮的 SchedulerAdmissionLocalState，只记 compact worker 的 AIC 位图和
+已验证 worker 数；首次遍历完整核验编号、类型、C/V 数量，不依赖物理 ID 连续或 C/V 交错排列。
+未验证完整时不提交部分缓存。V／Mix 位图从已验证事实和有效尾位掩码派生；
+每条发布记录的成员数、位图、epoch、flags、形状和偏移仍照常验证，不信任发布记录自证正确。
+下一轮 initialize_admission 将缓存清零，即使新一轮拓扑改变也重新核验。
+本地状态从 232B 增到 256B；没有新增 GM 布局字段、动态 heap、环境开关或 SSBUF 路径。
+原拓扑错误测试增加“不留下部分缓存”的断言，另增加两项缓存复用／跨轮清空、
+暖缓存后错误成员记录仍被拒绝的生产 helper 检查；三目标共 307 项通过。
+
+同卡第四阶段两批各 5 轮预热＋100 轮正式样本、各自三轮七项 golden 均通过：
+
+| 指标 | 修改前两批合并 | 当前最终候选两批合并 | 降幅 |
+| ---- | -------------- | -------------------- | ---- |
+| Device 中位数 | 22.407817 ms | 11.492358 ms | 48.7127% |
+| Host 中位数 | 101.463757 ms | 92.773618 ms | 8.5648% |
+
+最终 Device 两批分别为 11.496566／11.492358 ms，合并 P10/P90 为
+11.245694／11.769803 ms。Host 两批为 95.443614／90.412381 ms，存在可见漂移，
+不把合并 Host 的降幅说成同样稳定，也不与 Device 合成一个指标。
+所有正式样本再次逐项重解析，仍是相同的冻结业务、54 个 kernel 指纹与 0 级完整泳道设置；
+两批与严格 L4 的生产源码 diff／三个 runtime 二进制身份一致。
+最终生产 diff SHA256 为 36b23ec1f79ce7a2bd8157664ff23a26b94af9ab0d6ba18bb4d5ab8e31d530ad。
+
+最新严格 L4 仍通过 2308 个执行身份、133 条依赖、46733 个协议事件和完整 golden；
+artifacts/current-topology-l4/result.json，泳道 L4.json；对应 L1 位于 current-topology-l1/L1.json。
+comparison.json 已更新为修改前与最终候选的 200＋200 样本对照，原阶段的 result.json 和源码
+快照仍保留。候选最新 L1 任务窗口 11.054759 ms，未追平对方 7.086483 ms；
+观测依赖链的任务跨度 5818.233us、链间隔 5170.633us、根偏移 65.893us，
+与对方相比剩余差异主要仍在任务之间的推进间隔，不能仅靠替换 kernel 参数准备解决。
+
+另确认对方 scheduler_plan_mix_placement 对单条活跃 AIV 可以选两条 V 中的空闲 lane，
+并有多槽；当前 GM 仍固定逻辑／物理 lane 对应，三资源 lane 都参加握手。
+缩小 inactive V 的资源义务会修改现有组协议，不等于使用只读查询；用户已明确要求
+保留三 lane 协议，只优化现有实现。因此本轮保持三 lane、单组 GM 和固定 C/V 对应关系，
+不做资源组缩减或 SSBUF 改造，不混入上述收益。
+
+### 最终候选回归与异步日志读取修正
+
+最终 21 个 A5 HBG C++ 目标共 866 项通过，Python 合同／因果／身份审计 2085 项通过；
+日志 outputs/csa-final-cpp-20261027.log、csa-final-py-20261027.log。
+HBG 仿真目录 79 passed、41 deselected；仿真与 A5 的八个专项类各覆盖 536 个场景并通过，
+分别见 outputs/csa-final-hbg-sim-20261027.log、csa-final-spmd-sim-20261027.log、
+csa-final-spmd-a5-20261027.log。场景中的大／小 N 多次复用仍逐 invocation 校验来源和输出。
+
+A5 HBG 全目录首次为 111 passed、1 failed、4 skipped、4 deselected，
+outputs/csa-final-hbg-a5-20261027.log。唯一失败是 early_enqueue 的
+test_three_runs_are_launched_and_accepted_at_once：三份输出及三 run 同时接受都通过，
+第一对的设备顺序也已测得，但第三个 run 的设备边界记录尚未被异步日志游标读到。
+原样独立复测通过，outputs/csa-final-three-runs-alone-20261027.log；
+不把首次全目录运行改写成全绿，也不据此判定核执行发生乱序。
+
+现有测试的等待条件只要求两条 joined-launch 记录，可能在对应边界记录到达前结束读取。
+复用 test_early_enqueue_evidence_reader.py 的真实模块加载、游标和记录夹具，
+增加四项确定性检查，直接提取原场景的等待 lambda 并调用其实际 _await_records：
+ordered／同 tick／真实 overlap 三种迟到边界，以及永不出现的第三边界。
+旧条件下四项全部失败（只读取一次／错误接受缺失边界），既有六项通过，
+outputs/csa-three-run-evidence-red-20261027.log。
+
+修正只让该三 run 用例继续读取到两个相邻 pair 都有可判定的设备边界；
+真实 overlap 仍进入原失败断言，永久缺失仍在原 10 秒预算后失败，不增加延时或放宽顺序要求。
+十项 reader 单测全部通过，outputs/csa-three-run-evidence-final-20261027.log。
+完整 early_enqueue 模块上板复测 7 passed、3 skipped，原失败用例再独立复测通过；
+outputs/csa-three-run-evidence-native-module-20261027.log 与 native-repeat 日志。
+这次只修改测试读取条件，没有改 host logger、Worker、设备运行时或最终候选二进制。
+其余全目录 111 项使用同一候选已通过，因此只重跑受该测试改动影响的模块，不声称又做了一次全目录运行。
+
+完整样本、两批中位数、最终／基线来源、54 个代码指纹、诊断窗口与测量限制已保存到
+[性能数据](perf_data/2026-10-27-csa-poursoul/comparison.json)，不含私有绝对路径。
+原始完整产物仍在工作区 reports/csa_poursoul_20261027.Osnaam，最终三个 runtime 二进制
+另保存在 runtime-candidate，便于与后续改动区分。本轮保留已有未提交 TODO／路径说明和未跟踪文件，
+没有 commit 或 push；三项既有功能 TODO 仍未在本轮扩展实现。
+
+当前源码／二进制与归档的最终 200 个样本逐项复核一致，性能 JSON 也重新核算了中位数。
+原始失败、RED 和后续通过日志均保留，不以最后成功覆盖前面的失败。
+对照临时工作树在确认无源码改动、归档对方二进制并核对捕获 SHA256 后清理；
+固定版本 1d96d66c035582cfaae51cf98dbdd801c4a17379 仍保留在
+refs/remotes/poursoul/a5-hbg-resident-spmd，可重建对照环境。
+runtime-peer 与 runtime-candidate、全部 artifacts 和复算脚本不随清理删除。
+
+## 2026-10-27：CSA 低于 2ms 的性能优化实施计划（待执行）
+
+完整计划已移至 [CSA AICore 调度低于 2ms 的性能优化实施计划](csa-sub2ms-optimization-plan.md)。
+后续在独立文档维护实施步骤、约束与验收标准；本文件继续记录实际执行过程及结果。
+
+## 2026-10-27：低于 2ms 计划开始执行，基线与连续推进边界
+
+用户要求按独立计划开展，目标已激活；保留三 lane／GM 通道和原样 CSA，不自动提交。
+对方 poursoul/a5-hbg-resident-spmd 已有本地引用，经确认仍为 1d96d66c035582cfaae51cf98dbdd801c4a17379，
+后续直接复用，不重复拉取或重跑旧比较。可借鉴完成服务后继续领取、同一 SPMD 队首的静态信息缓存；
+不搬用其 SSBUF 交接和不同的槽位配置。
+
+P0 核验：当前生产 diff 与前节的 36b23ec1… 一致，Host／AICPU／AICore 三个二进制摘要也一致。
+CANN 查询 device 0 为 Ascend950PR_958b，32C／64V、两个 AICore DIE；
+按用户要求直接用卡，无 task-submit 隔离，监测未发现其他 A5 CLI 重叠，不能据此排除所有外部干扰。
+新基线 sub2ms-baseline-a 的三轮七项 golden 通过，5 次预热后 100 次正式 Device 中位数为
+11494.6495us，Host 中位数 87301.5965us，与此前设备侧 11.492358ms 一致。
+原始归档仍使用工作区 reports/csa_poursoul_20261027.Osnaam/artifacts，新增标签不覆盖旧结果。
+
+P1 假设：已满足条件的 retire→下一组领取，以及 close→后继义务观察，无需额外绕回外层调度循环。
+候选保持三 lane release 齐备才退役、保留 seal 和故障门禁；每次最多连续处理两个已关闭义务，
+遇到伙伴未到或未释放立即返回，不在内部自旋。
+
+第一轮新增 17 个 C++ 测试：原实现 13 失败／4 通过，实施后全部通过。
+另将已有“必须下一次调用才能发布下一组”的策略断言改为“本次发布，等待下一组到达时不推进”。
+相关两组累计 220 个测试通过，第一次原生重建完成后开始严格 L4 的前置依赖采集。
+
+首次上板没有通过：outputs/csa-hbg-l4-wgi4dzh5 的 deps.log 报 native finalize -5；
+同目录 ascend/debug/device-0 的设备日志给出 task=38、status=6、site=119（ORDERED_CANDIDATE_INVALID）。
+不以宿主错误猜测死锁，也不继续拿失败版本计时。task 38 是 N=8 的纯 AIC 后继。
+已在 CPU 确定性复现：Mix 完成可在 discovery 之后直接保留同类型多 block 候选，
+连续 close 后落入普通准备路径，绕过下一轮准入；后续再尝试准入时发现它已有物理槽而报错。
+
+新增四个参数化回归用例覆盖 mask 3／5／6／7，各自验证后继 N=1／2／8／65：
+修复前四个均失败，N=2 时已观察到未准入候选被错误准备。
+修复要求晚到的 direct 后继仍经 discovery 的 inline／admission 分类；
+普通准备阶段不处理这两类候选，不放宽状态校验。修复后 GM Mix 160 个、有序执行 64 个通过。
+随后完成设备版和仿真版重建，进入以下回归与正式对照；不将 CPU 通过替代设备验收。
+
+日志：outputs/csa-sub2ms-baseline-a-20261027.log、csa-sub2ms-p1-red.log、
+csa-sub2ms-p1-direct-red.log、csa-sub2ms-p1-direct-green.log、csa-sub2ms-p1-ordered-green-r2.log。
+首版生产 diff 保存在对照目录 sub2ms-p1.patch；失败捕获归档为 artifacts/sub2ms-p1-l4。
+
+### P1 修正版回归与正式 A/B/B/A 对照
+
+- 相同 21 个相关 C++ 目标重建并通过，共 887 个 GTest，较起点增加 21 个。
+  日志 outputs/csa-sub2ms-p1-cpp-exact-r2.log；此前一次过宽的 CTest 正则选入未构建目标，
+  有 Not Run，记录保留在 csa-sub2ms-p1-cpp-all-r2.log，不计为通过。
+- 协议身份／因果／时钟解析 230 个 Python 测试通过，日志 csa-sub2ms-p1-python-protocol.log。
+  完整 hbg_spmd_contracts 另有 1918 个通过，日志 csa-sub2ms-p1-python-contracts.log，合计 2148 个。
+- 八类边界在 a5sim 和 a5 各运行 536 个场景，均通过，分别见
+  csa-sub2ms-p1-boundary-sim.log 和 csa-sub2ms-p1-boundary-a5.log。
+- 严格 L4 sub2ms-p1-fixed-l4 通过，两轮各七项 golden、79 个 kernel 逻辑任务、
+  2308 个执行身份、133 条依赖、46733 个原生协议事件、96 个 worker 全部核验；producer=aicore。
+
+四批按 A/B/B/A 顺序串行，每批三轮七项 golden 后做 5 轮预热＋100 个正式样本，
+计时期间没有编译、其他设备测试或设备查询。回测 A 时同时恢复了基线源码和已归档的原生二进制，
+并确认源 diff 与二进制摘要均与 A1 一致；A2 完成后已恢复 B 的源码与二进制。
+四批 54 个链接后 kernel 的 func_id／code_bytes／code_fnv1a64 逐项一致。
+
+| 批次 | 原始归档标签 | Device 中位数（us） | Host 中位数（us） |
+| ---- | ------------ | ------------------- | ----------------- |
+| A1 | sub2ms-baseline-a | 11494.6495 | 87301.5965 |
+| B1 | sub2ms-p1-fixed-a | 10956.3375 | 86777.6945 |
+| B2 | sub2ms-p1-fixed-b | 10974.0385 | 101887.7640 |
+| A2 | sub2ms-baseline-b | 11512.3445 | 87483.1255 |
+
+每臂 200 样本合并，Device 中位数 A=11503.623us、B=10970.472us，下降约 4.63%。
+Device P90/P99：A=11767.809/11894.439us，B=11282.142/11431.328us。
+Host 的 B2 明显漂移，不能宣称本轮取得同样稳定的端到端收益；本轮生产改动未改变 Host／AICPU 二进制。
+完整样本、版本及验证范围见
+[P1 对照数据](perf_data/2026-10-27-csa-poursoul/sub2ms-p1-comparison.json)。
+
+独立 L1 捕获 sub2ms-p1-fixed-l1 的任务窗口为 11.017379ms，起点旧 L1 为 11.054759ms；
+单次插桩窗口没有复现无插桩中位数的全部改善，不把两种口径混算。
+其中 16 路投影／pack 区间为 2.471294ms（起点 2.764711ms），
+task 23 的 512 block 跨度为 2.523887ms（起点 2.642464ms）。
+其余区间也发生变化，不能把局部减少量累加成额外承诺；task 23 单任务仍超过最终 2ms 预算。
+
+保留本候选，当前生产 diff SHA256 为 5d7b44ac576e1a904a5db0584bc8cbdd907c1aabf80217ffaee11f38b78a9196，
+AICore runtime SHA256 为 e708c67fe784164d20d23e77afb6c4e120c3916cf629a8c67c06fd8276738690。
+Host／AICPU 摘要与起点相同；归档二进制为 runtime-sub2ms-p1，生产补丁为 sub2ms-p1-fixed.patch。
+下一步进入 P2，并继续推进 P3；不把约 0.53ms 的改善当作 2ms 目标完成。未 commit 或 push。
+P2 的复用必须区分不变图元数据与可写执行 payload：当前 execute_task 将 GM args 以 int64_t* 传入 kernel，
+不能仅凭同一 task 身份就假定上一块的参数数组未被 kernel 改写。优先处理重复控制和不变解析结果，
+若复用实际参数值，必须说明 ABI／所有权依据并覆盖 kernel 改写与跨轮地址变化。
+
+## 2026-10-27：P2 控制成本实验——单写者错误状态的独立发布路径
+
+起点为 P1 的 5d7b44ac…／e708c67f…；本节按假设、实现、回归和实测顺序记录，最终结果见下文。
+复核 P1 L4 的 task 23：512 次 claim 的中位数为 0.322us，publish 为 0.914us，
+publish→最后 arrival 为 38.591us，最后 arrival→各 lane 确认的中位数为 11.117us，
+各 active lane 确认→kernel entry 为 16.258us，kernel 片段为 9.234us，
+最后 release→完成贡献为 31.246us；同 cluster 480 个相邻组的领取间隔中位数为 159.839us。
+这些是插桩下相互关联的区间，不能相加当作独立成本；但足以将控制路径排在参数拷贝微调之前。
+
+保持全部错误检查点，尝试改变错误状态的发布方式，而非再次做“atomic writer 不变、reader 改 query”的旧诊断。
+first-error CAS 已经选出唯一写者，故状态无需多写者 RMW；目前 AICore 仍以 atomic 发布状态，
+迫使关键 reader 使用 fetch_add(0)，所有核因此访问同一个 RMW 字。
+
+本机 CANN 的 impl/kernel_scalar.h 中，WriteGmByPassDCacheImpl 使用 st_dev，
+ReadGmByPassDCacheImpl 使用 ld_dev；没有臆造 intrinsic。
+[CANN DataSyncBarrier 文档](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/sync_control/intra_core_sync/DataSyncBarrier_ISASI.md)
+给出的发布模式是数据写入、GM barrier、最后发布标志，读者通过 bypass-DCache 读取标志和数据。
+[WriteGmBypassDCache 说明](https://asc.gitcode.com/api/SIMD-API/basic_api/scalar_compute/WriteGmBypassDCache_ISASI.html)
+另要求避免旧 dirty cache line 后续覆盖，因此本候选把状态与原子身份字段隔离，且状态不走 cached store。
+
+具体候选：RunControl 从 384B 扩至 512B，身份字段 offset 保持不变，状态从 264 移至独占区域的 384；
+first-error CAS／身份原子写／既有 barrier 不变，状态改 st_dev＋DSB_DDR。
+所有 AICore 状态 reader 统一使用 scheduler_read_error；旧 critical/query 分支不再表示两种发布域，移除该分支参数。
+AICPU 的 release store 保持原样。cursor／descriptor seq／ack／seal 完全不变，三 lane 规则不变。
+它借用了 P4 的热点字段隔离方法服务 P2 的重复控制成本；P3 的多 block 周转目标仍须继续完成。
+
+新布局门禁在旧实现实际失败，原状态 offset=264、与 error_claimed 同 cache line；日志
+outputs/csa-sub2ms-error-layout-red.log。四个相关 C++ 目标随后通过，错误探针 oracle 已扩大至 336 项并通过。
+私有错误区扩大至每组 96 个 64 位字，覆盖新状态区和邻接 guards；原 46 场景保留，
+新增 C→V、V→C 两方向及 epoch 0/MAX，共 50 场景。
+定向用例先确认双方进入，再由指定 lane 发布；写者返回后通过独立 notice 通知读者，
+读者只读一次状态，不能靠重试掩盖发布返回后的旧值。另检查指定赢家、完整首现场和 guard。
+真实有界 watchdog／后继不得执行／buffer 保留和退出仍须单独验收，私有探针不替代真实故障。
+
+AICPU 路径同步审计发现原缓存维护使用 error_claimed 起的固定 128B，状态移出该区后必须调整。
+writer 现在先完成身份区 cache_flush_range，再写状态并完成状态区写回；调用方不重复旧范围写回。
+bootstrap／execution／terminal 的失效范围按 sizeof/offsetof 推导，冷日志 acquire 状态后再失效身份区。
+新增两个 C++ 缓存动作门禁，检查实际写回顺序及冷日志范围。仅在独立临时编译副本恢复旧 AICPU helper，
+两个门禁均失败（缺少两个有序写回、冷日志只失效旧 128B）；生产版 29 项错误身份检查通过。
+这是回归敏感性 mutation，不冒称编译错误或 CPU 模型证明了设备 cache 可见性。
+
+首轮 A5 私有探针 50 场景通过；仿真在原 scenario 5 有一次错误位 128（固定一百万次轮询提前耗尽），
+最终 arrival 已为 2、全部错误状态与首现场正确。同一场景独立三轮通过。
+探针改用已有 get_sys_cnt_aicore／PLATFORM_PROF_SYS_CNT_FREQ 的 5 秒截止时间，保持 arrival==2 和 notice==1 门槛；
+定向状态读取仍为一次。增加时钟头后首次仿真编译缺少 inner_kernel.h include path，
+已复用 TestHbgSpmdContract 的平台编译入口，不新造平台路径。
+最终两平台各 50 场景通过；336 项 oracle 及全部相关 Python 检查共 2222 项通过。
+对应日志 outputs/csa-sub2ms-error-native-probe-sim.log、csa-sub2ms-error-sim-arrival-alone.log、
+csa-sub2ms-error-native-probe-sim-r2.log、csa-sub2ms-error-native-probe-sim-r3.log、
+csa-sub2ms-error-native-probe-a5-r3.log、csa-sub2ms-error-cache-mutation.log 和 csa-sub2ms-error-python-all.log。
+进一步强化探针：看到状态后，先通过普通 bypass 读取八项首现场，再进行任何身份 RMW；
+这样不能靠身份 fetch_add(0) 补齐可见性而掩盖发布缺陷。两平台各 50 场景再次通过，
+日志 csa-sub2ms-error-visible-identity-sim.log 和 csa-sub2ms-error-visible-identity-a5.log。
+
+### 独立错误状态发布的回归与正式对照
+
+- 最终重建同一组 21 个 C++ 目标，890 个 GTest 全通过；
+  日志 outputs/csa-sub2ms-error-cpp-final-build.log 和 csa-sub2ms-error-cpp-final.log。
+- 相关 Python 检查共 2222 项通过；八类边界在 a5sim／a5 各覆盖 536 场景，均通过，
+  日志 csa-sub2ms-error-python-all.log、csa-sub2ms-error-boundary-sim.log 和 csa-sub2ms-error-boundary-a5.log。
+- A5 真实有界故障矩阵 24 项全部通过，包括健康调用、故障调用及恢复调用；
+  日志 csa-sub2ms-error-bounded-a5.log。12 项 nonreturning 被明确排除，不能写成完整故障矩阵通过。
+- 严格 L4 sub2ms-error-l4 通过：两轮各七项 golden，79 个 kernel 逻辑任务、2308 个执行身份、
+  133 条依赖、46733 个协议事件、96 个 worker，producer=aicore；无协议丢失或截断。
+
+四批仍按 A/B/B/A 串行，各三轮七项 golden 后做 5 轮预热＋100 个正式样本。
+回测 A 时同时恢复 P1 源码与三个原生二进制，并核对摘要；结束后恢复本候选。
+四批 54 个链接后 kernel 的 func_id／code_bytes／code_fnv1a64 逐项一致。
+正式采样期间无编译、设备查询或本次工作的其他设备测试；监测未发现竞争 A5 CLI，
+本机无 task-submit 隔离，不能据此证明不存在全部外部干扰。
+
+| 批次 | 原始归档标签 | Device 中位数（us） | Host 中位数（us） |
+| ---- | ------------ | ------------------- | ----------------- |
+| A1 | sub2ms-error-before-a | 11015.8690 | 81115.7160 |
+| B1 | sub2ms-error-after-a | 6800.8245 | 70673.0935 |
+| B2 | sub2ms-error-after-b | 6933.5740 | 77861.4590 |
+| A2 | sub2ms-error-before-b | 10994.2725 | 104749.0260 |
+
+每臂 200 样本合并，完整 Device 中位数 A=11009.9035us、B=6882.211us，下降约 37.49%。
+Device P90/P99：A=11311.3857/11408.72884us，B=7434.5545/7929.2617us；
+最小／最大：A=10598.816/11417.485us，B=6308.656/8168.084us。
+Host 合并中位数 A=85219.667us、B=76926.992us，但前后批次明显漂移，不能宣称同样稳定的端到端收益。
+这是状态布局和发布／读取方式的组合收益，不能将差值除以检查次数倒推单条 atomic 的耗时。
+全部样本、版本、kernel 指纹及验证边界见
+[错误状态发布对照数据](perf_data/2026-10-27-csa-poursoul/sub2ms-error-publication-comparison.json)。
+
+独立 L1 捕获 sub2ms-error-l1：任务窗口 6.340275ms，P1 旧捕获为 11.017379ms。
+task 23 的 512 block 跨度从 2.523887ms 降为 1.706733ms；
+task 56 最后返回到 16 路 pack 全部返回的区间从 2.471294ms 降为 0.739188ms；
+此后到最后 kernel 返回为 0.508644ms，之前为 0.707295ms。
+对方既有 L1 任务窗口为 7.086483ms，不能把它当作对方完整 Device 中位数；不重复拉取对方分支。
+
+当前 L4 中，task 23 的 publish→最后 arrival 中位数从 38.591us 降为 5.804us，
+最后 arrival→lane 确认为 2.155us，确认→entry 为 6.726us，最后 release→完成贡献为 7.309us。
+同 cluster 相邻组领取间隔中位数为 59.504us，P90 为 125.712us；
+claim 中位数反而从 0.322us 升至 1.718us。不同插桩捕获不能相减构造精确成本，
+但这些变化说明移除全局错误状态 RMW 热点后，块级争用／周转不均需要继续单独定位。
+
+保留候选：生产 diff SHA256 为 2ce671e30227a7a1fde33d818851211ebbe4f021df5d193e1fa3ce11d12f6b78。
+原生 Host／AICPU／AICore 的 SHA256 分别为：
+
+```text
+3f5a6c76d287cc6574c8222599fe1fbcb21c442f3bd1d3068f9f98f688e5c266
+787fb404c0d72e0210f087425a977bd4e894ee070f9ac624c7394106e05b4d0f
+7f348a096dca0ed2cf4c35f4958e3b05ef08fc44b797526175a6da2aeedd4dd3
+```
+
+原始捕获仍在工作区 reports/csa_poursoul_20261027.Osnaam/artifacts，
+补丁与二进制归档为 sub2ms-error-publication.patch、runtime-sub2ms-error-publication。
+仿真 runtime 也已从候选重建。SDK llvm-objdump 对 AICore 对象只输出不可用指令，
+本节没有获得反汇编级证据；依据是本机头文件、成功编译与原生可见性／协议实测。
+
+下一轮优先围绕块级周转验证两个独立假设，不直接叠加：
+已强确认的不可变 admission 前缀可供后续扫描复用，但普通 entry permit 仍须检查最新提交前沿；
+GM 通道中具有唯一写者的发布序号／ACK／seal 是否需要 RMW，须逐字审计读写域并补原生发布测试。
+后者不得减少三 lane 确认，不能把多写者 cursor、完成计数或准入锁一并改掉。
+当前完整 Device 为 6.882211ms，未达 2ms；最终非返回故障与全 HBG 回归仍待完成。未 commit 或 push。
+本轮收口再次逐项核对四批归档中的全部计时样本、生产 diff 和二进制摘要；
+最终 pre-commit 全部适用检查通过，git diff --check 通过，生产摘要保持 2ce671e3…。
+
+## 2026-10-27：P3／P4 实验——三 lane GM 单写者信号
+
+本轮起点为 2ce671e3…，完整 Device 6.882211ms；以下是待验证候选，不是已取得的收益。
+每个 cluster 的 published_seq 由固定 C 写；每个 arrived_seq/released_seq 由所属 lane 写；
+每个 task/cluster 的 seal 由对应 C 写。所有权已由准入、cluster 映射和状态机确定，
+这些字段不再需要 RMW 竞争所有权。共享 next_block、completed_blocks、准入锁及 log/tail 仍保持原子。
+
+候选只改变上述单写者字的发布／读取方式：st_dev＋DSB_DDR 后返回，读者用 ld_dev；
+descriptor 仍完整写回、barrier 后发布，读者仍失效 descriptor、barrier 并核对全部身份。
+三个 lane 的 arrival/release 都要逐项等于当前 seq；旧 ACK 等待，未来 ACK 报错。
+C 仅在三 lane release 全部成立后退役或改写 descriptor；seal 的发布完成先于下一 task 的 descriptor 发布。
+晚到 V 仍消费旧 task 留存 seal，不要求远端全任务完成，也不把 inactive lane 从资源组去掉。
+
+发布区、每 lane ACK 区均为既有独立 128B；紧凑 seal 区虽由多个 C 写相邻字，
+所有这些字统一采用按字 bypass store，整区没有 AICore atomic 或 cached store／writeback。
+Host 初始化只发生在旧 run 已静默、新 run 尚未启动时，DFX 只在静默后读取最终图像。
+错误状态发布复用同一小型发布 helper，仍独占自己的区域；不改变布局或错误检查点。
+
+现有 160 个 GM 状态机用例覆盖协议条件，本轮补充原生内存路径探针：
+三 lane 多轮复用 mailbox、每次发布返回后通知对端首次读取、descriptor 全字段可见性、
+相邻 cluster seal 并发写、跨轮保留 seal、全宽 seq 及迟到 lane。
+探针自己的通知字保持原子且与被测信号隔离，不能对被测字做 RMW 来补齐可见性。
+这是发布机制验收，不把新 helper 首次编译失败伪称业务 RED；数值和完整调度协议另以原样 CSA 严格 L4 验收。
+
+探针开发首轮 oracle 拒绝了将最后 seq 推到保留值 UINT64_MAX 的参数；将起始值从 -18 改为 -19，
+末次 seq 为 UINT64_MAX-1、seal 为 UINT64_MAX。另补上 case 级 skip_golden 拒绝入口。
+396 项 oracle 通过，首轮失败日志保留在 outputs/csa-sub2ms-gm-signal-oracle.log，不算生产缺陷 RED。
+38 个发布探针和 50 个错误身份探针在 a5/a5sim 均通过，相关 C++ 21 目标／890 GTest 通过；
+Python 合同 2388 项、身份／协议／时钟 131 项、因果 99 项通过，共 2618 项。
+八类边界各 536 场景在 A5／仿真通过，日志均以 csa-sub2ms-gm-signal- 为前缀。
+
+首次 L4 sub2ms-gm-signals-l4 的数值、身份和协议本身通过，但外层干扰门禁拒绝：
+当时有一个 pytest --collect-only --platform a5 命令，只收集故障用例，没有执行设备测试，
+被监测器记录为 10 次竞争 CLI 观察。未修改门禁或抹掉记录，串行重采 sub2ms-gm-signals-l4-r2 通过，
+其 overlap 列表为空；79 个 kernel 逻辑任务、2308 个执行身份、133 条依赖、46733 个协议事件、96 个 worker 完整。
+本次源码 diff 为 04ea07d8fb703d0dc80efa6224d5be5b839cd83c8b9379602161fb90a1e2ce59，
+AICore 二进制为 bedf2910db89282cba2146da47b1948e39e20a10df114e96419275bfb0ee95a0；Host／AICPU 与起点相同。
+归档为 sub2ms-gm-signals.patch 和 runtime-sub2ms-gm-signals；故障验收及无插桩对照结论如下。
+
+### GM 信号实验结论：没有收益，撤回
+
+N=2、mask 3/5/6/7 的全部九种活跃 kernel lane 故障在 A5 通过，包含健康调用、
+真实阻塞／watchdog、后继不执行、失败 Worker 保留及恢复调用。
+日志 outputs/csa-sub2ms-gm-signal-bounded-mix-a5.log，九个独立子进程 PASS；
+外层显示 no tests ran 是独立调度器收集／分发方式，不用该行抹掉或虚构子进程结果。
+本候选未重跑其余故障矩阵和全 HBG 回归，不作为最终交付验收。
+
+本轮对称顺序为 B/A/A/B，每批三轮七项 golden 后做 5 次预热＋100 个正式样本。
+每次切换同时恢复源文件和对应三个原生二进制，并核对摘要；四批 54 个链接后 kernel 指纹完全相同。
+四份竞争 CLI 监测均为空，正式采样不并行编译、测试或设备查询。
+
+| 批次 | 原始归档标签 | Device 中位数（us） | Host 中位数（us） |
+| ---- | ------------ | ------------------- | ----------------- |
+| B1 | sub2ms-gm-signals-after-a | 6871.5835 | 142144.2685 |
+| A1 | sub2ms-gm-signals-before-a | 6750.1090 | 82724.2950 |
+| A2 | sub2ms-gm-signals-before-b | 6751.7165 | 139567.3560 |
+| B2 | sub2ms-gm-signals-after-b | 6931.5495 | 83310.9015 |
+
+每臂 200 样本：Device 合并中位数 A=6751.136us、B=6898.988us，候选慢约 2.19%，不采纳。
+P90/P99：A=7395.5335/7704.14625us，B=7601.9224/7834.57065us；
+最小／最大：A=6167.563/7948.327us，B=6408.497/7863.654us。
+Host 在两档明显漂移，不能用 Host 的合并中位数或某个最低样本替代 Device 结论。
+完整数据与版本见 [GM 信号对照数据](perf_data/2026-10-27-csa-poursoul/sub2ms-gm-signals-comparison.json)。
+
+同口径 L4 辅助分析：task 23 的 publish→最后 arrival 中位数由 5.804us 降为 5.2175us，
+最后 release→完成贡献由 7.309us 降为 6.0425us，但相邻组领取周期中位数从 59.467us 升至 70.052us，
+该 task 首末跨度从 1.190497ms 升至 1.483445ms。局部区间改善没有转换成完整执行收益。
+这里的 claim 区间只记录获胜 CAS，不包含前面的失败重试；不能据此推算重试次数或累加独立成本。
+该实验否定的是本轮完整替换的性能收益，不是否定已经通过的私有发布可见性结果，
+也不否定此前全局错误状态热点改造的收益；两者访问拓扑不同。
+
+已恢复生产 diff 2ce671e3… 及原生 3f5a6c76…／787fb404…／7f348a09…，仿真 runtime 重新构建为同一源码。
+四个实验生产文件的差分及七个专用探针文件保存在工作区
+reports/csa_poursoul_20261027.Osnaam/sub2ms-gm-signals-experiment.patch，
+撤回前通过 reverse check，撤回后通过 git apply --check，可恢复重验。
+七个本轮新增探针文件已从工作树移除，原有测试未删除；合同和测试目录索引已恢复，不留下失效链接。
+
+下一项假设更直接针对 block 争用：SchedulerTaskControl 当前 next_block 位于 offset 24，
+completed_blocks 位于 offset 32，两者与 state/wake-list 在同一 64B line。
+先只把两计数器分别移至独立 128B 区域，保留状态、依赖和 metadata 的既有 offset，
+同步布局断言、Host/AICPU/AICore 和严格导出验证，再独立实测；不同时改 CAS 领取算法。
+这仍只是可证伪假设，不能把 128B 微基准的收益直接当作 CSA 的收益。
+当前保留版本仍是错误状态发布优化版；2ms 目标未达成，未 commit 或 push。
+
+## 2026-10-27：P3／P4 实验——领取与完成计数的 128B 隔离
+
+生产起点仍为 2ce671e3…，上一轮回测 Device 合并中位数为 6.751136ms。
+假设：同 task 的 next_block 与 completed_blocks 目前同占第一条 64B line，
+领取 CAS 与完成 fetch_add 因此共享访问热点；将它们隔开可能改善块级周转。
+这不能消除同一个 next_block 自身的多写者竞争，也不能先验承诺完整 CSA 收益。
+
+本候选只调整 SchedulerTaskControl 布局：第一条 line 的状态／链表／admission_state，
+第二条 line 的单 owner 元数据均保持既有 offset；next_block 移至独立 offset 128，
+completed_blocks 移至独立 offset 256，整体从 128B 扩至 384B。
+旧 offset 24/32 留作零 padding，Host 对整幅 state 的初始化／上传长度和所有访问步长仍从 sizeof 推导。
+所有原子、CAS 次数上限、关闭条件、三 lane、sync_start、LocalDone/TaskDone 和错误门禁不变。
+先验证布局、64 位读写宽度、相邻 task 与 metadata 字节保护，再重建三个 native 组件及仿真，
+运行既有协议／retained reset／边界场景和原样 CSA 严格 L4，最后做同卡性能对照决定保留或撤回。
+
+布局 RED 已确认：旧版两个 offset 为 24/32，新隔离测试失败，字节保护测试通过。
+实现后补齐数组步长检查的 128→384 断言；保留了首轮该旧断言失败的日志，未删除边界检查。
+相关 21 个 C++ 目标共 892 项通过，Python 合同及原生协议解析 2222 项通过。
+A5／仿真各 536 个调度场景加 50 个错误身份场景通过，日志前缀为 outputs/csa-sub2ms-counter-split-。
+严格 L4 sub2ms-counter-split-l4 通过：79 个 kernel 逻辑任务、2308 个执行身份、133 条依赖、
+46733 个协议事件、96 个 worker，producer=aicore，竞争 CLI 观察列表为空。
+
+原生重建后的源码 diff 为 bd7cb824a944b857fda3b99d92cc3885bb644cb75baecfbe7ea01eca63e2042c，
+Host／AICPU／AICore SHA256 分别为：
+
+```text
+1e9185453855f3c9d89d7c29c3540635baae5c6b5a18302a1d33d27db3ea18f5
+943c65b3e43c7f6b51fff41df1dbe89066d4efa76dbf9a84f958abe4f2a77b99
+a7ad367eed0353282d12ab26a85e4b5f95e2c6983f5d06d0165219ee481969d0
+```
+
+补丁／二进制为 sub2ms-counter-split.patch、runtime-sub2ms-counter-split。
+CSA 有 107 个 TaskControl，包含 26 个 Host inline 节点；该数组增加 27392B，不能只按 79 个 kernel task 计算。
+字段隔离也改变后续 state 区域的起始地址，因此最终对照只能归因于本次布局组合，不能直接倒推出单次 bank 冲突延时。
+同口径 L4 的 task 23（512 block）跨度为 0.658218ms，旧错误状态版为 1.190497ms；
+task 56（纯 V、256 block）为 1.042620ms，旧为 1.910258ms。整段任务窗口 5.829542ms，旧为 7.727527ms。
+这些是单份插桩捕获，仅用于定位；无插桩 Device 成绩及最终保留结论仍待下文对照。
+
+### 计数器隔离的对称复测与保留结论
+
+N=2、mask 3/5/6/7 全部九种活跃 lane 的 A5 有界故障通过，包含健康／故障／恢复调用，
+日志 csa-sub2ms-counter-split-bounded-mix-a5.log。完整 nonreturning 和全 HBG 最终回归仍未完成。
+
+按 B/A/A/B 串行做四批；每批三轮七项 golden、5 次预热、100 个正式样本。
+切换同时恢复匹配源文件和三个 runtime 二进制，并核对 source/runtime 摘要；
+最终恢复 B，仿真也已从 B 重建。四批 54 个链接后 kernel 指纹逐项一致，竞争 CLI 监测均为空。
+正式采样没有并行编译、测试或设备查询；本机仍无 task-submit 隔离，不据此排除全部外部干扰。
+
+| 批次 | 原始归档标签 | Device 中位数（us） | Host 中位数（us） |
+| ---- | ------------ | ------------------- | ----------------- |
+| B1 | sub2ms-counter-split-after-a | 6044.7965 | 81639.8765 |
+| A1 | sub2ms-counter-split-before-a | 6808.9625 | 82509.2695 |
+| A2 | sub2ms-counter-split-before-b | 6764.0405 | 79991.3260 |
+| B2 | sub2ms-counter-split-after-b | 6051.9980 | 82112.2555 |
+
+每臂 200 样本，完整 Device 合并中位数 A=6781.4045us、B=6048.0335us，下降约 10.81%。
+P90/P99：A=7383.4615/7853.00746us，B=6446.9397/7013.24278us；
+最小／最大：A=6279.036/8102.838us，B=5580.583/7225.49us。
+Host 合并中位数 A=82108.186us、B=81760.398us，但候选尾部有较大漂移，不宣称同等端到端收益。
+完整样本、版本、kernel 指纹和验收范围见
+[计数器隔离对照数据](perf_data/2026-10-27-csa-poursoul/sub2ms-counter-split-comparison.json)。
+
+独立 L1 sub2ms-counter-split-l1 的身份／依赖时序检查及七项 golden 通过，任务窗口 6.047269ms。
+与旧错误状态版 L1 的 6.340275ms 相比，它只复现了部分局部改善：
+task 23 为 1.438738ms（旧 1.706733ms），task 56 反而为 1.079325ms（旧 0.943429ms）。
+16 路投影／pack 区间为 0.665164ms（旧 0.739188ms），之后收尾为 0.333395ms（旧 0.508644ms）。
+不能将单份 L1、L4 与跨批次 Device 中位数相减归因；L1 不提供完整原生协议证明，协议证明来自独立 L4。
+保留依据是对称复测中的完整 Device 收益及协议／正确性验收，而非选取最有利的单个插桩区间。
+
+当前生产为 bd7cb824…／a7ad367e…，TaskControl 为 384B；三 lane、原 CAS 领取和原完成计数算法未变。
+下一轮转向大 N 普通任务的共享 cursor 领取争用，先保持单次一个 block、无额外预留和 sync_start 单次约束；
+同时只读审计准入日志中可由发布链证明的重复强读，不在同一候选里混入两类修改。
+完整 Device 仍为 6.048034ms，2ms 目标未完成。未 commit 或 push。
+
+## 2026-10-27：P3 实验——大 N 的单块取号领取
+
+起点为 bd7cb824…，本轮假设是减少同一共享 cursor 上的失败 CAS，而不是减少三 lane 协议条件。
+普通 task 在 N>2P 时采用取号，P 为合法领取位置数：纯 C／Mix 为 cluster 数，纯 V 为其两倍；
+小 N 与 sync_start 保留原有八次上限的 CAS 路径，不增加配置开关，不对 CSA 的 task ID 特判。
+
+TaskControl 仍为 384B，复用 offset 24 的 padding 存 claim_tickets；
+独立 offset 128 的 next_block 改作本路径的有效领取确认数，completed_blocks 仍在 offset 256。
+每次先 FAA 取得不可撤销的单个票号 t；t<N 才对 next_block 加一并返回实际 block t。
+因此取号顺序与确认顺序可以不同，但 next_block 最终仍恰为 N，不让越界票号变成有效领取。
+只有一个新的未确认票号可能暂存在每个 Scalar 的 helper 调用内，未增加候选槽或预留批次。
+
+每个领取位置最多得到一次 t>=N 的无效尾票，此后本地 ticket_exhausted 阻止继续取号。
+合法运行的 claim_tickets 不超过 N+P；已有 next_block>N 的拒绝条件不放宽。
+无效票不能记录 block owner、发布 descriptor、产生 payload 或增加完成数。
+特别是“最后有效票已经取走，但 next_block 仍为 N-1”时，其他核即使拿到无效票也不能关闭；
+仍须强确认 next_block==N、退役本地实际工作、满足原 seal／三 lane 条件。
+sync_start 仍通过原 cursor 保留前缀意义和每位置至多一次领取，不走这一分路。
+
+错误入口检查仍在取号前；已取到有效票后的确认是不可撤销所有权的记账，不代表 kernel 获得执行许可。
+prepare、entry、completion、close 的错误门禁继续各自生效。
+按原生记录，claim_before/after 包围实际取号及有效确认；成功 block 的取号顺序仍按 block_idx 线性化。
+新增 hbg-native-protocol-v2 的 claim_tickets 最终事实，强制校验大 N 的 [N,N+P] 范围，
+小 N／sync_start／非协同任务必须为 0；next_block==completed_blocks==N 的原审计条件不改。
+读取器继续严格支持 v1，既不为 v2 缺失字段补默认值，也不接受 v1 偷带 v2 字段。
+
+先增加字段但仍运行原 CAS 算法时，九项定向 C++ 用例中六项新取号／暂停窗口检查失败、三项小 N／sync_start 检查通过。
+这是新机制的 TDD，不称为旧正确实现的业务缺陷。Python v2 新增验收先有 49 失败／42 通过，
+实现后对应协议检查通过；仍须扩大 C++／仿真／原生边界和 N257 实际故障验收，再测性能。
+
+随后补充的“准备后票号被污染”门禁实际发现候选漏查：prepare 已检查，但 commit 尚未检查 claim_tickets。
+三种纯核形状均在提交阶段失败于新断言；增加提交前零值门禁后通过。
+日志 csa-sub2ms-ticket-commit-red.log 保留，不把只修 prepare 当成完整发布门禁。
+
+完成重建后，21 个 C++ 目标共 917 项通过（较起点新增 25 项），Python 共 2317 项通过（新增 95 项）。
+新检查覆盖 N=2P/2P+1、纯 C/V、四种 Mix mask、暂停最后有效票、并发尾票、
+LocalDone 不冒充 TaskDone、sync_start 不走取号、错误前置门禁、静态坏计数与 32767 上界。
+原有 536 个调度场景及 50 个错误身份场景在 A5／仿真均通过。
+新增 N257 的七种实际阻塞 lane 故障也在两平台通过，包含健康／故障／恢复调用、真实超时、
+后继不执行与 buffer 保留；失败记录额外确认实际使用了取号路径及原始票数上界。
+这七项不是完整 nonreturning 或全部旧小 N 故障矩阵，最终全量验收仍待完成。
+
+严格 L4 sub2ms-ticket-l4 通过：79 个 kernel 逻辑任务、2308 个执行身份、133 条依赖、
+46733 个协议事件、96 个 worker，producer=aicore、schema=v2，竞争 CLI 记录为空。
+task 23 原始票数／有效领取／完成均为 512；task 56 分别为 267／256／256，11 张尾票未成为执行身份。
+同口径 L4 的 task 56 跨度为 94.254us（计数器隔离版 1042.620us），
+task 23 为 653.236us（旧 658.218us），整段任务窗口为 5171.970us（旧 5829.542us）。
+这仍是单份插桩捕获，正式 Device 收益待对称复测。
+
+本候选生产 diff 为 5e504fbbb2cbb41d0312eea01869c2e2b8d8b4c0d11a4816d505c7ff25f1b3b5，
+原生 Host／AICPU／AICore SHA256 分别为：
+
+```text
+7130a6ec389bc7d18e230e05b8fb82c35e1d12cdeaccce4d78c6e90d4ef62180
+b7e60aa50ed8a879b32c7fc982632c50695e5d4efa76dbf9a84f958abe4f2a77b99
+3ceedd08d58a24934c3aca7f87a55877cbe7fce5924011ed5f9101b7847a2471
+```
+
+源码／二进制归档为 sub2ms-ticket.patch、runtime-sub2ms-ticket；日志以 outputs/csa-sub2ms-ticket- 开头。
+
+### 单块取号的正式对照与保留结论
+
+另补三种纯核形状的“取号与有效计数不一致”后置门禁测试，确认已发生的原子修改不回滚，
+但不能返回 block 身份、生成 claim 事件或进入 payload 槽。最终 21 个 C++ 目标共 920 项通过；
+Python 2317 项、两平台各 586 个调度／错误身份场景和各七项 N257 有界故障证据不变。
+
+四批顺序 B/A/A/B，每批三轮七项 golden 后做 5 次预热＋100 个正式样本。
+切换时一同恢复 runtime 源码、原生解析器和匹配的三个二进制，核对摘要；最终恢复候选 B。
+四批 54 个链接后 kernel 指纹完全一致，竞争 CLI 监测均为空；正式采样无并行编译、测试和设备查询。
+
+| 批次 | 原始归档标签 | Device 中位数（us） | Host 中位数（us） |
+| ---- | ------------ | ------------------- | ----------------- |
+| B1 | sub2ms-ticket-after-a | 3913.2185 | 79626.8215 |
+| A1 | sub2ms-ticket-before-a | 6049.8940 | 82048.0350 |
+| A2 | sub2ms-ticket-before-b | 6123.9050 | 135584.5290 |
+| B2 | sub2ms-ticket-after-b | 3908.5030 | 79909.6065 |
+
+每臂 200 样本，完整 Device 合并中位数 A=6099.053us、B=3913.2185us，下降约 35.84%。
+P90/P99：A=6472.2738/6779.35257us，B=4246.8639/4402.74536us；
+最小／最大：A=5678.716/7060.857us，B=3632.926/4419.227us。
+Host 合并中位数 A=115073.55us、B=79725.5465us，但 A2 明显漂移，不将该差值认定为同等端到端收益。
+全部样本、版本、kernel 指纹、协议事实及验证范围见
+[单块取号对照数据](perf_data/2026-10-27-csa-poursoul/sub2ms-ticket-comparison.json)。
+
+独立 L1 sub2ms-ticket-l1 的七项 golden、身份及依赖时序检查通过。
+任务窗口为 3.552768ms，计数器隔离版旧捕获为 6.047269ms；
+task 23 为 0.478195ms（旧 1.438738ms），task 56 为 0.083285ms（旧 1.079325ms）。
+16 路投影／pack 区间为 0.665240ms（旧 0.665164ms），后续收尾为 0.316552ms（旧 0.333395ms）。
+不同插桩捕获之间会变化，不把 L1 窗口与完整 Device 中位数相减当作固定启动成本。
+
+沿 L4 冻结依赖、穿过无 kernel 中间节点，按每步最后返回的可执行前驱分解观测到的路径，
+5.171970ms 窗口恰为 2.379680ms 的 task 跨度、2.769384ms 的任务间区间及 0.022906ms 根偏移。
+task 跨度包含内部 block 周转，任务间区间包含完成发布、依赖推进、准入和资源等待；
+不能将它们称为纯计算下界或纯 idle，也不能与无插桩收益累加。
+这说明继续只压大 N 内部周转不够，下一轮转向全局准入发布／读取链，保持全部前沿、身份和错误检查。
+
+保留 5e504fbb…／3ceedd08… 候选；原 CAS 小 N／sync_start 路径、三 lane、每次单块与原在飞额度均保留。
+当前完整 Device 为 3.913219ms，仍未达到 2ms。完整旧小 N 故障、nonreturning 和全 HBG 最终回归仍待完成。
+未 commit 或 push。
+
+## 2026-10-27：P2／P4 实验——全局准入 tail 与不可变日志的发布域
+
+起点为 5e504fbb…，本轮不改取号阈值、槽位或三 lane 协议。
+假设：每个已发布准入被大量 C/V 读取，commit_tail 和 log cell 的读用 RMW 会在共享地址排队。
+与此前无收益的 cluster 私有 GM ACK 实验不同，这里是全局多读者通道；仍须单独对照，不能套用前例收益。
+
+commit_lock 继续用 CAS／原子释放；tail 独占 128B，唯一活动写者由该锁串行选出。
+每个 log cell 每 run 只写一次；整个紧凑 log 区统一使用 bypass 写／读，运行中不混用原子或 cached store／dirty writeback。
+先写回完整 record，再发布 log cell，原子写 ADMITTED 并 barrier，最后以 st_dev＋DSB 发布 tail；
+完成发布后才释放提交锁。记录、bitmap、epoch、容量与当前前沿的全部验证保留，ADMITTED 仍用原子确认。
+普通 entry 和最终 drain 每次读取当前 tail，不跨轮缓存许可，不仅把旧 atomic writer 的 reader 改为 query。
+原错误状态的同等 st_dev＋DSB 写法抽到受限的 64 位发布 helper，错误检查点和 AICPU 缓存维护不变。
+
+新增 29 个私有发布场景：C/V 轮换持锁、签名 64 位 log cell、相邻 cell 后续追加、完整 128B payload、
+独立原子 notice 之后的首次 tail／log 读取、最终前缀复查、epoch 0/MAX 与延迟发布者。
+普通私有 arena 覆盖 N1/2/65；共享 arena 覆盖 N1/2/32，后者使用真实 sync_start，保证参与位置最终都能进入。
+最多 96 个 C/V 共同发布同一个 tail；探针不对被测 tail/log 做任何 RMW。
+275 项 oracle 检查已通过，逐字破坏控制／padding／记录，并拒绝旧 provenance 和跳过 golden。
+这些检查不会冒称证明硬件可见性；现有 CPU 并发准入用例本来应通过，本轮不伪造业务 RED。
+下一步以原生首次读取和原样 CSA 严格 L4 确认，再测完整 Device 收益。
+
+### 本轮回归中的测试夹具修正
+
+首轮 Python 为 2585 通过、7 失败：上一轮最后补充大 N 故障取号校验后，旧 synthetic capture
+缺少 cluster_count，错误在 KeyError，而非设备失败。此前 2317 项通过的记录发生在该校验补充之前，
+不能覆盖这次遗漏。现补齐显式拓扑、v2 schema 和计数字段，不增加默认值、不放宽 validator；
+再补 45 项正反例，覆盖三种纯核／Mix 形状、合法尾票、超额票、无票、有效数超过 N／票数、
+后继误取号、旧 schema 和缺失拓扑。该模块 96 项通过。
+
+首轮仿真发布探针在 N32 sync_start 被 Host 正确拒绝（code 7）：仿真只有 8 个 cluster。
+这是测试平台划分错误，不是允许超容量同步；改为仿真 N8 满核、真机 N32 满核，
+共 37 个定义、每平台各 29 个发布场景。追加两项平台容量及全部位置覆盖检查。
+仿真与真机的发布／错误身份探针各 2 个类通过（29＋50 场景），不把首次失败算作通过。
+修正后完整相关 Python 套件为 2647 项通过；21 个 C++ 目标也已通过。
+当前实验生产 diff 为 ac04d013…，AICore 二进制 51da86e3…，尚未测定性能收益。
+
+### 准入信号发布的正式对照与保留结论
+
+两平台各 586 个调度／错误身份场景通过，N257 七项真实有界故障分别通过。
+严格 L4 sub2ms-admission-signal-l4 通过七项 golden、79 个有 kernel 的任务、2308 个执行身份、
+133 条依赖、46733 个协议事件和 96 个 worker 的完整审计；producer=aicore，schema=v2。
+仍未重跑完整旧小 N 故障、nonreturning 和最终全 HBG 回归，不能扩大本轮验收范围。
+
+正式四批顺序 B/A/A/B，每批三轮七项 golden、5 次预热及 100 个正式样本。
+五个生产头文件和三个原生二进制成套切换，分别核对 5e504fbb…／3ceedd08… 和 ac04d013…／51da86e3…。
+54 个链接后 kernel 指纹四批完全相同；竞争 A5 CLI 监测为空，正式采样不并行编译、测试或设备查询。
+
+| 批次 | 原始归档标签 | Device 中位数（us） | Host 中位数（us） |
+| ---- | ------------ | ------------------- | ----------------- |
+| B1 | sub2ms-admission-signal-after-a | 3598.1390 | 79293.5145 |
+| A1 | sub2ms-admission-signal-before-a | 3955.6575 | 79480.9040 |
+| A2 | sub2ms-admission-signal-before-b | 3940.7690 | 79937.7320 |
+| B2 | sub2ms-admission-signal-after-b | 3640.6390 | 70233.9555 |
+
+每臂 200 个样本，Device 合并中位数 A=3947.760us、B=3623.8835us，下降约 8.20%。
+P90/P99：A=4219.5457/4381.36312us，B=3917.7704/4075.39864us；
+最小／最大：A=3640.183/4518.437us，B=3288.194/4118.370us。
+Host 合并中位数 A=79702.7295us、B=78996.685us，但 B2 有明显漂移，不据此声称同等端到端收益。
+完整样本、摘要、kernel 指纹、验证范围及限制见
+[准入信号对照数据](perf_data/2026-10-27-csa-poursoul/sub2ms-admission-signal-comparison.json)。
+
+L4 任务窗口 4.701860ms，task23=0.648232ms、task56=0.076303ms。
+观测到的末尾依赖路径分解为 task 跨度 2.160157ms、任务间区间 2.530332ms、根偏移 0.011371ms；
+这仍包含块级周转、完成／依赖／准入／资源等待，不能当作纯计算下界或把各次捕获的差值直接相加。
+保留 ac04d013…；当前完整 Device 为 3.623884ms，未达到 2ms，最终审计仍未完成。
+未 commit 或 push。
+
+独立 L1 sub2ms-admission-signal-l1 的七项 golden、2308 个身份和依赖时序检查通过；
+完整原生协议仍由独立 L4 提供，L1 不冒称 protocol_verified。
+L1 任务窗口 3.342643ms（取号版旧捕获 3.552768ms）；task23=0.462578ms（旧 0.478195ms），
+task56=0.066284ms（旧 0.083285ms）。起点到 task56 最后返回为 2.607869ms（旧 2.570976ms），
+此后到 16 路 pack 全部返回的区间为 0.415045ms（旧 0.665240ms），剩余收尾为 0.319729ms（旧 0.316552ms）。
+这份捕获的改善主要在后段分支区间，前段并未改善；不能据此将全部任务间等待都归因于准入 tail。
+下一轮优先定位前段 2.61ms 中的块周转与完成／后继推进，不继续围绕已缩短的分支尾段盲目微调。
+
+下一项可证伪候选：task24 的 active_mask=2、N=128，真实 P=64，恰好等于 2P，
+当前策略仍走 CAS；L1 跨度 0.513334ms，L4 为 0.337984ms。不同插桩捕获的跨度并不相同，
+不能把它全部定性为 CAS 时间，但足以优先做边界单项实验。task32 为 N64 的 1C1V Mix，
+也恰在 P32 的 2P 边界，L1 跨度 0.205716ms。先确认领取及资源周转，再单独调整策略；
+若采用新阈值，必须版本化原生证据且继续严格读取历史 v2，不悄悄放宽旧 schema。
+
+## 2026-10-27：P3 实验——普通两波边界采用单块取号
+
+起点为 ac04d013…／完整 Device 3.623884ms。唯一运行时策略变化是 N>2P 改为 N≥2P；
+不改变一次一个 block、有效领取数、尾票上界 N+P、不可撤销所有权、槽位额度、三 lane 或 sync_start。
+新增等号处的纯核领取、最后有效票尚未确认不能关闭、Mix 完整执行／退役／drain，
+以及两种平台容量的阈值前一档／等号／后一档场景。
+
+生产原生证据升为 v3，字段布局与 v2 相同，但 v3 显式表示包含等号的领取策略。
+解析器继续严格支持 v1/v2；同一 N=2P 记录在 v2 必须无取号、在 v3 必须有合法取号，
+不能改变 schema 后仍接受另一策略，也不能用合法原始票数掩盖有效领取数不等于 N。
+失败夹具按同样版本规则检查计数，并独立断言实际捕获的 cluster 数确实构成两波边界，
+不是只凭平台字符串宣称覆盖边界。
+
+TDD：改生产代码前，三个相关 C++ 目标因新阈值／schema 断言失败；新增 v3 的 Python 选择集
+80 失败、45 通过，失败来自缺失 v3 支持及其正例，而非编译错误。改动后相关三目标和完整协议
+Python 374 项通过。扩展原生正常场景共增加 30 项／平台，故障场景增加七项两波边界／平台。
+全量相关 C++ 21 目标通过；原生与仿真 runtime 正在重建，尚无本候选的设备性能结论。
+
+后续验证：C++ 共 932 项、Python 共 2838 项通过，静态检查通过。
+原生／仿真 runtime 重建完成，生产 diff=e59d3419…，AICore=03cc02ca…，Host=8316f032…；
+AICPU=f7c66ab4… 与上一版相同。两平台各 10 个场景类通过，包含新增阈值邻域及既有发布／错误探针。
+新解析器对真实历史 sub2ms-counter-split-l4（v1）和 sub2ms-admission-signal-l4（v2）
+重新完成 2308 执行／46733 事件的协议审计。正在运行七种两波边界的真实有界故障。
+
+### 两波边界实验的正式结果
+
+两平台七种 N=2P 有界故障全部通过。每项都有健康运行、真实超时失败、关闭后新 Worker 恢复；
+失败后禁止重提及释放仍被借用的 buffer，不放行依赖后继、不伪造 TaskDone。
+按当前 CASES 的平台筛选重新计数，两平台各 645 个场景定义、10 个类；所有类通过。
+本候选没有重跑旧 N1/N2、N257、nonreturning 及最终全 HBG 回归，不以历史结果代替最终版本验收。
+
+严格 L4 sub2ms-ticket-boundary-l4 通过两轮七项 golden，79 个有 kernel 的逻辑任务、2308 个执行身份、
+133 条依赖、46733 个协议事件和 96 个 worker 完整，producer=aicore、schema=v3。
+task24 的 raw/valid/completed 均为 128，task32 均为 64，确认等号处实际采用取号；
+task23 为 512/512/512，task56 为 265/256/256，九张无效尾票不算执行。
+
+四批顺序 B/A/A/B，每批三轮七项 golden、5 次预热及 100 个正式样本。
+四个生产文件（含解析器）和三个原生二进制成套切换，分别验证 ac04d013…／51da86e3… 与
+e59d3419…／03cc02ca…；最终恢复候选。54 个链接后 kernel 指纹完全相同，竞争 CLI 监测为空，
+正式采样期间无并行编译、测试或设备查询。
+
+| 批次 | 原始归档标签 | Device 中位数（us） | Host 中位数（us） |
+| ---- | ------------ | ------------------- | ----------------- |
+| B1 | sub2ms-ticket-boundary-after-a | 2962.2250 | 78840.7180 |
+| A1 | sub2ms-ticket-boundary-before-a | 3634.4225 | 79745.8335 |
+| A2 | sub2ms-ticket-boundary-before-b | 3651.1140 | 79728.9585 |
+| B2 | sub2ms-ticket-boundary-after-b | 2977.0220 | 79118.7620 |
+
+每臂 200 样本，完整 Device 合并中位数 A=3642.847us、B=2969.6125us，下降约 18.48%。
+P90/P99：A=3946.4265/4173.72667us，B=3109.6574/3187.69046us；
+最小／最大：A=3370.479/4184.325us，B=2822.884/3204.294us。
+Host 合并中位数 A=79733.7165us、B=78922.957us；不以 Host 比值替代 Device 比值。
+完整样本、摘要、kernel 指纹、两平台十四份故障结果位置及验证范围见
+[两波边界对照数据](perf_data/2026-10-27-csa-poursoul/sub2ms-ticket-boundary-comparison.json)。
+
+独立 L1 窗口为 2.927161ms（上版捕获 3.342643ms）：task24 从 0.513334 降到 0.036699ms，
+task32 从 0.205716 降到 0.050504ms；task23 为 0.477052ms、task56 为 0.062088ms。
+task22 从旧捕获的 0.119834ms 增到 0.189906ms，不能只选改善项报告。
+起点到 task56 最后返回为 2.162963ms，后续到 16 路 pack 全部返回为 0.404985ms，收尾为 0.359213ms。
+L1 的身份和依赖时序检查通过，完整原生协议门禁由独立 L4 提供。
+
+L4 窗口 4.293501ms；末尾观测依赖链分解为 task 跨度 1.699514ms、任务间区间 2.550978ms、
+根偏移 0.043009ms。相比上一份 L4，主要缩短的是 task 内部跨度，任务间区间仍大。
+这些跨度含调度／同步等待，不能称为纯计算下界或用跨捕获相减得到纯原子耗时。
+后续重点核查共享准入状态确认与实际块级准备／关闭成本，不扩大到重写三 lane 协议。
+保留 e59d3419…；完整 Device 2.969613ms，尚未达到 2ms，最终审计未完成。未 commit 或 push。
+
+## 2026-10-27：P4 实验——准入状态独立原子区域
+
+以 e59d3419… 为基线，先仅调整布局，不改变任何原子操作、阶段推进或错误检查。
+admission_state 从 offset40 移至独占 128B 的 offset384；TaskControl 384→512B，
+state/wake/claim_tickets、缓存 metadata、next_block、completed_blocks 的原 offset 均保留。
+CSA 的 107 个控制记录合计增加 13696B；数组步长与后续区域地址随之改变，
+因此测到的效果是这组布局变化，不自动归因于一个字段的 bank 冲突或单次原子延时。
+三 lane、N≥2P 单块取号、sync_start、原生 v3 及冻结业务均不变。
+
+先修改两个 CPU 目标的布局／步长断言并新增独立原子区域检查，旧布局如期失败。
+逐字比对再覆盖准入状态的全宽 CAS 成功／失败，不允许改坏相邻 task、metadata 或 padding。
+实现后 21 个 C++ 目标共 933 项、Python 2838 项通过，静态检查通过；两平台 runtime 已重建。
+当前实验生产 diff=c93239e1…，Host=422f4b46…、AICPU=b9684ee2…、AICore=12b19c7c…。
+正在跑两平台边界和故障路径，尚未取得本实验的性能结论。
+
+### 独立准入区域的测量与撤回
+
+候选在两平台各 645 个场景、各七项两波真实故障通过。原样 CSA 严格 L4 通过七项 golden、
+79 个有 kernel 任务、2308 个执行身份、133 条依赖、46733 个协议事件与 96 个 worker 的完整审计。
+L4 窗口 4.206362ms，仅作诊断；不以它替代完整 Device 对照。
+
+正式 B/A/A/B，每批三轮七项 golden、5 次预热＋100 正式样本；源码头文件与三个原生二进制成套切换。
+四批 54 个链接后 kernel 指纹相同，竞争 A5 CLI 监测为空，采样无并行编译、测试或设备查询。
+
+| 批次 | 归档标签 | Device 中位数（us） | Host 中位数（us） |
+| ---- | -------- | ------------------- | ----------------- |
+| B1 | sub2ms-admission-isolation-after-a | 2955.6550 | 80478.2475 |
+| A1 | sub2ms-admission-isolation-before-a | 2990.0350 | 144166.9345 |
+| A2 | sub2ms-admission-isolation-before-b | 2963.1440 | 74082.8655 |
+| B2 | sub2ms-admission-isolation-after-b | 2957.5390 | 79004.9165 |
+
+每臂 200 样本，Device 合并中位数 A=2975.3975us、B=2956.951us，候选改善约 0.62%。
+P90/P99：A=3095.9351/3156.42363us，B=3077.533/3138.52285us；
+最小／最大：A=2828.364/3211.654us，B=2814.289/3191.350us。
+Host 合并中位数 A=109167.7955us、B=79602.582us，但 A1 明显漂移，不能认定同等 Host 收益。
+
+第二对只差约 5.6us（0.19%），小于基线两批约 26.9us 的变化。
+不是严格零收益结论，但尚不足以为将每条控制记录扩大 33% 背书；没有继续为这个微小差值扩大试验。
+撤回本轮三个源／测试文件的实验改动，恢复 e59d3419… 及对应三个原生二进制，仿真运行时也恢复重建。
+实验代码、测试与二进制分别保留在候选快照和归档，不保留在当前工作树中。
+恢复后 21 个 C++ 目标共 932 项通过，仿真运行时重建完成；原生三个二进制摘要与 e59d3419… 基线一致。
+
+完整数据见[准入区域隔离对照](perf_data/2026-10-27-csa-poursoul/sub2ms-admission-isolation-comparison.json)，
+判定及重开条件见[调查记录](../../../../docs/zh-cn/investigations/2026-10-csa-admission-state-isolation.md)。
+当前保留版本仍是完整 Device 2.969613ms 的两波边界取号版，未达到 2ms，未 commit／push。
+
+下一项优先检查小 N 普通任务的 CAS 争用，而非继续给原子字段加 padding。
+例如 task22 为 N48 的纯 V；上一份 L4 中实际调用窗口中位数约 0.967us、最忙 worker 的调用窗口和约 3us，
+但其任务跨度明显更长。调用窗口仍包含 kernel 内部等待，不是纯计算下界；这一差异只用于排序实验。
+先证明取号上界 N+P、每位置一次无效尾票、有效数恰为 N 和最后预留未确认不能关闭等性质
+在 N<2P 时仍成立，再单独测试让更多普通多 block 采用单块取号。N1 与 sync_start 保持原有路径。
+
+## 2026-10-27：P3 实验——普通 N>1 全部采用单块取号
+
+基线为 e59d3419…，TaskControl 保持 384B。本轮仅扩展已有取号分路的适用范围：
+普通 N>1 使用原有 FAA 票号＋有效确认计数，N1 与 sync_start 保持原路径，不扩大槽位或三 lane 额度。
+每个位置在 helper 内至多持有一张未确认票；因此前序未确认票不超过 P−1，
+已有 `ticket <= previous + P - 1` 检查不依赖 N≥2P。无效尾票至多每位置一次，仍有 raw≤N+P；
+只有有效票确认会增加 next_block，关闭仍强确认 next_block==N，不能把 raw 耗尽当作发布完成。
+
+CPU 检查扩展到 N2/3：有效块与身份唯一、并发尾票不重复增加、最后有效票未确认时不关闭，
+Mix 不发提前 seal、切换 N1 后继清除本地耗尽标记；并发领取矩阵覆盖纯 C／两种纯 V、N2/3/128。
+普通实机矩阵增加六个 N3 场景，原用例、ABI 与 golden 复用。
+
+原生证据升至 v4：普通多 block 要求合法票数，N1／sync_start 必须零票数；
+v1/v2/v3 按各自历史合同继续严格读取。新故障检查区分旧版小 N 零票数与 v4 的有效票数，
+实际设备故障采集还要求当前 v4 producer，不能拿历史版本回退当作新路径通过。
+
+生产修改前，三个相关 C++ 目标失败；协议选择集 150 失败、48 通过，故障夹具选择集 64 失败、113 通过。
+实现后相关 C++ 三目标、协议与故障记录 849 项通过；全量回归和两平台重建正在进行，暂无性能结论。
+
+全量相关 C++ 为 21 目标、940 项通过，Python 3184 项通过，静态检查通过。
+两平台重建完成，生产 diff=3796d807…，Host=1a1ade8f…、AICore=ae61b359…；AICPU 保持 f7c66ab4…。
+两平台各 651 个场景定义、10 个场景类通过。新解析器对真实 v1/v2/v3 CSA 捕获重新审计通过，
+不把读端接受旧格式等同于允许旧策略冒充 v4。
+目前选择 N=2 的全部 12 种实际执行 lane 做真实有界故障；没有把这批当作完整 N1／大 N／nonreturning 最终回归。
+
+### 小 N 取号的测量与保留
+
+上述 N2 有界故障在两平台各 12 项全部通过，均经过健康→实际 watchdog 故障→新 Worker 恢复。
+真机 P32／64，raw 为 2–7、有效领取为 2、完成为 0 或 1；不伪造 TaskDone、后继或 buffer 释放。
+12 个并发 C++ 用例额外重复 200 轮，共 2400 次执行通过，重复轮次不计新增测试定义。
+原样 CSA 严格 L4 通过七项 golden、79 个 kernel task、2308 个执行身份、133 条依赖、
+46733 个协议事件及 96 个 worker；producer 为 aicore、schema 为 v4。
+task22 的 raw/valid/completed 为 86/48/48，38 张无效尾票不产生执行；task23 为 512/512/512。
+
+正式 B/A/A/B，每批三轮七项 golden、5 次预热＋100 正式样本。
+四个生产文件（含解析器）及三个原生二进制成套切换并验证摘要；54 个链接后 kernel 指纹完全一致。
+并发 A5 CLI 监测为空，正式采样无并行编译、测试或设备查询。未使用 task-submit，
+这是按用户要求在本机直接运行并监测，不把 CLI 监测当作系统级独占证明。
+
+| 批次 | 归档标签 | Device 中位数（us） | Host 中位数（us） |
+| ---- | -------- | ------------------- | ----------------- |
+| B1 | sub2ms-small-ticket-after-a | 2756.7165 | 78474.7400 |
+| A1 | sub2ms-small-ticket-before-a | 2982.7675 | 135737.5015 |
+| A2 | sub2ms-small-ticket-before-b | 2982.9205 | 78934.9950 |
+| B2 | sub2ms-small-ticket-after-b | 2747.4075 | 78778.9150 |
+
+每臂 200 样本，完整 Device 合并中位数 A=2982.7675us、B=2752.322us，下降约 7.73%。
+P90/P99：A=3091.5422/3170.19387us，B=2791.5435/2857.30116us；
+最小／最大：A=2802.504/3201.781us，B=2662.865/2925.469us。
+Host 合并中位数 A=98497.8035us、B=78569.581us，但 A1 漂移，不能声称稳定的 Host 端到端收益。
+全部 400 个 Device 和 400 个 Host 样本、摘要、kernel 指纹、故障结果位置与限制见
+[小 N 取号对照数据](perf_data/2026-10-27-csa-poursoul/sub2ms-small-ticket-comparison.json)。
+
+独立 L1 窗口 2.586128ms；相较两波版捕获，task22 从 0.189906 降到 0.026078ms，
+task23 为 0.476573ms、task24 为 0.035253ms、task32 为 0.051722ms、task56 为 0.066909ms。
+起点到 task56 返回为 1.840548ms，随后到 16 路 pack 全返回为 0.445788ms，收尾为 0.299792ms；
+投影／pack 区间较前捕获的 0.404985ms 略长，不选择性忽略退化项。
+L1 验证身份和依赖时间关系；完整原生协议由独立 L4 提供，L4 窗口为 4.088190ms。
+L4 跨核累计 idle 包含等待与控制推进，不能当成单一函数耗时，更不能与完整 Device 相减作精确分账。
+
+保留 3796d807… 及相应三件原生二进制。TaskControl 仍为 384B，N1／sync_start、三 lane 组协议不变。
+完整 Device 2.752322ms，尚未达到 2ms；完整最终故障矩阵、受影响 HBG 全回归和五批目标验收仍未完成。
+下一项核查共享准入阶段强读及完成到后继可见成本，不盲目重试已撤回的私有 ACK 替换。未 commit／push。
+
+## 2026-10-27：P4 实验——准入所有权与阶段发布分离
+
+以 3796d807…／完整 Device 2.752322ms 为基线。准入扫描每个 worker 对每条已发布记录读取一次
+admission_state，当前是 FAA0 强读；不能直接把 reader 改成 query，而保持同一字段的 CAS／原子 writer。
+实验将原 offset40 改为短暂的 admission_claim_lock，阶段状态放到独立 128B 区域 offset384，
+TaskControl 为 512B。锁只保护 UNCLAIMED→CLAIMED 的唯一领取；持锁后重查阶段，
+发布 CLAIMED 后释放，不能跨准备、kernel 或等待持锁。未取得锁的调用不得释放别人的锁；
+迟到重复领取即使 CAS 成功，也必须因阶段非零而失败并释放自己取得的锁。
+
+CLAIMED／PREPARED／ADMITTED 由唯一 owner 使用已有 st_dev＋DSB 发布，读端用 ld_dev；
+整条信号 line 不允许 AICore RMW／cached store／dirty writeback。原有状态、身份、成员、epoch、
+零计数和错误门禁保留；commit_lock 及全局日志连续提交不变。既有 128B 布局单项实验已测且撤回，
+本轮假设是消除同字 RMW 争用，不能把其收益归因于 padding，也不预设一定有效。
+
+先补布局与步长断言，原布局的两个 C++ 目标失败；布局接线后、领取逻辑尚未改变时，
+busy claim lock 用例实际失败（原路径错误地无视该锁）；重复领取、阶段顺序和并发反例继续保留。
+原生 v5 要求独立记录 claim lock，成功终态必须为零；v1–v4 保持各自历史字段与票数语义。
+协议选择集在实现前 71 失败、4 通过；故障坏记录集也先于 producer／reader 修改运行。
+尚在实验，不作为已保留生产版本或最终性能成绩。
+
+故障夹具 RED 为 76 失败、283 通过；实现后发现一个新测试将缺字段报错文本误写为字段名，
+解析器实际已正确拒绝，按既有 missing/unknown 消息修正断言后完整 Python 3335 项通过。
+相关 C++ 共 21 目标、947 项通过；五项锁／阶段检查重复 200 轮、1000 次用例执行通过，
+其中重复领取用例每轮内部 32 次竞态，不能将这些重复次数计为新增定义。
+真实历史 v1/v2/v3/v4 捕获重审均通过；两平台各 651 个边界场景、10 个场景类通过。
+发布探针在同核检查 CLAIMED／PREPARED 首次读取，跨核检查 ADMITTED 和完整 payload，
+不对被测阶段信号做原子读；本轮全部 N1/N2 有界故障正在验证。
+生产 diff=33685149…，Host=129d3283…、AICPU=88c99bf8…、AICore=6db71a70…，两平台均已重建。
+当前无本候选性能结论，保留版本的可靠成绩仍为 2.752322ms。
+
+### 阶段信号版的测量与保留（2026-10-28）
+
+两平台各 24 个 N1/N2 有界故障全部通过，共 48 份失败现场、96 次健康／恢复运行；
+所有失败现场的 claim lock 为零，失败 Worker 拒绝重提、保留 caller buffer，不伪造消费者执行。
+原样 CSA 严格 L4 通过七项 golden、79 个 kernel task、2308 个执行身份、133 条依赖、
+46733 个协议事件和 96 个 worker；producer 为 aicore、schema 为 v5，全部终态 claim lock 为零。
+
+正式 B/A/A/B，每批三轮七项 golden、5 次预热＋100 正式样本。
+五个生产文件及三个原生二进制成套切换，分别核对 3796d807… 和 33685149…；最终恢复候选。
+四批 54 个链接后 kernel 指纹相同，CLI 竞争监测为空，正式采样没有其他编译、测试或设备查询。
+
+| 批次 | 归档标签 | Device 中位数（us） | Host 中位数（us） |
+| ---- | -------- | ------------------- | ----------------- |
+| B1 | sub2ms-admission-phase-after-a | 2412.6830 | 128080.6795 |
+| A1 | sub2ms-admission-phase-before-a | 2744.5210 | 78718.9865 |
+| A2 | sub2ms-admission-phase-before-b | 2754.5665 | 78803.9770 |
+| B2 | sub2ms-admission-phase-after-b | 2415.9850 | 78771.3960 |
+
+每臂 200 样本，完整 Device 合并中位数 A=2748.478us、B=2413.584us，下降约 12.18%。
+P90/P99：A=2788.5559/2834.85044us，B=2448.8138/2498.61277us；
+最小／最大：A=2660.378/2888.641us，B=2359.166/2522.606us。
+Host 合并中位数 A=78788.2545us、B=82491.1635us；B1 明显漂移，B2 则接近两批基线，
+不宣称稳定 Host 收益，也不以混合漂移估算稳定 Host 回退比例。
+完整样本、摘要、kernel 指纹、48 份故障结果位置和限制见
+[阶段信号对照数据](perf_data/2026-10-27-csa-poursoul/sub2ms-admission-phase-comparison.json)。
+
+独立 L1 窗口 2.263827ms，上版捕获为 2.586128ms；task22 从 0.026078 降到 0.009486ms，
+task23 为 0.468421ms、task24 为 0.042982ms、task32 为 0.052850ms、task56 为 0.063340ms。
+起点到 task56 返回为 1.599998ms，随后到 16 路 pack 全返回为 0.395619ms，收尾为 0.268210ms。
+task24 比前捕获的 0.035253ms 略长，不能把各 task 观测差都解释为固定收益。
+独立 L4 窗口为 3.730040ms，前捕获为 4.088190ms；插桩窗口不替代完整 Device。
+
+本轮对照包含 512B 布局、短领取锁和阶段发布方式的整体变化。之前单纯布局实验的基线是更早的
+N≥2P 策略，不能从 12.18% 中减去其 0.62% 来宣称精确的发布收益。保留整体方案的依据是
+重复对照收益及边界／故障通过，代价是 CSA 的 107 条控制记录共增加 13696B。
+TaskControl、Host/AICPU/AICore 和读端已同步；无新增运行开关、业务削减或三 lane 语义变化。
+
+保留 33685149…；完整 Device 2.413584ms，距 2ms 仍约 0.414ms，最终审计未完成。
+大 N／两波／不可返回核最终故障矩阵、受影响 HBG 全回归和五批目标验收仍待完成。未 commit／push。
+
+## 2026-10-28：P2/P3 实验——三 lane ACK 的完整只读预检查
+
+基线 33685149…／完整 Device 2.413584ms。当前 check_acks 逐 lane 执行 query＋FAA0，
+前面 lane 已到达而后面未到达时，会对前缀做无效强读；外层存在普通 ready 候选等原因时，
+外层 idle 预筛不会跳过服务，这些前缀强读可能反复发生。
+本轮只把已有 query 前移为有界预检查：见旧值立即等待，三条均可能齐备才逐条 FAA0；
+提前见未来值则转入原顺序的强确认，不让后面的旧值吞掉既有未来序号报错。
+任何积极结果仍需要三条强读和精确等号，不减少 arrive/release、inactive lane 义务或入口门禁。
+
+先补 162 项旧／当前／未来序号组合（arrival/release × 三种全宽序号 × 27 种 lane 组合），
+以及 12 项四种 Mix mask × 迟到 lane、普通 ready 候选持续触发服务但不得提前准备的实际 helper 场景。
+原实现上 GM 目标 346 项通过：这是冻结不变量，不伪称性能改动必须让正确基线出现功能红灯。
+后续以同卡完整 Device 对照决定是否保留，不将源码减少了潜在 RMW 等同于已有收益。
+
+修改后相关 C++ 共 21 目标、1121 项通过，Python 3335 项通过，静态检查通过。
+两平台各 651 个边界场景、10 个场景类通过；本轮选择 Mix mask3/5/6/7 的全部九条执行 lane 做 N2 有界故障，
+不将该子集替代最终完整故障矩阵。两平台 runtime 已重建，生产 diff=7db67da1…；
+Host=129d3283…、AICPU=88c99bf8… 不变，AICore=116af907…，尚无本轮性能结论。
+
+### ACK 预检查的对照与撤回
+
+两平台各九项 Mix N2 有界故障通过，共 18 份失败现场和 36 次健康／恢复运行；
+严格 L4 通过 79 个 kernel task、2308 个执行身份、133 条依赖、46733 个事件和 96 个 worker。
+L4 窗口 3.779990ms，上版为 3.730040ms；诊断捕获也未显示整体缩短，不以它替代完整 Device。
+
+正式 B/A/A/B，每批三轮七项 golden、5 次预热＋100 正式样本。
+单个生产头文件和三个原生二进制成套切换；四批 54 个链接后 kernel 指纹完全相同。
+CLI 竞争监测为空，正式采样无并行编译、测试或设备查询。
+
+| 批次 | 归档标签 | Device 中位数（us） | Host 中位数（us） |
+| ---- | -------- | ------------------- | ----------------- |
+| B1 | sub2ms-ack-preflight-after-a | 2409.3880 | 78510.2905 |
+| A1 | sub2ms-ack-preflight-before-a | 2432.1635 | 78297.4310 |
+| A2 | sub2ms-ack-preflight-before-b | 2421.1945 | 78267.2570 |
+| B2 | sub2ms-ack-preflight-after-b | 2417.8135 | 78200.0790 |
+
+每臂 200 样本，完整 Device 合并中位数 A=2427.2035us、B=2413.2675us，差约 0.57%。
+P90/P99：A=2467.0622/2544.84858us，B=2456.8312/2514.53876us；
+最小／最大：A=2364.850/2636.755us，B=2358.299/2568.625us。
+Host 合并中位数 A=78284.901us、B=78283.768us，基本持平。
+
+第二对仅差 3.381us，低于两批基线间的 10.969us；第一对差 22.7755us，差值不稳定。
+不继续为这个微小差值扩大测量，撤回生产预检查，恢复 33685149… 和三件匹配原生二进制。
+这不是严格零效果结论；本轮证据不足以把它列为已证明的优化。
+新增 174 项回归检查原有合同，在原实现上也通过，因此保留；实验代码、二进制和全部样本均归档。
+恢复后的仿真构建完成，21 目标、1121 项 C++ 回归通过；原生三个二进制摘要与 33685149… 基线一致。
+完整性能仍以已保留阶段发布版的 2.413584ms 为准。
+
+完整数据见[ACK 预检查对照](perf_data/2026-10-27-csa-poursoul/sub2ms-ack-preflight-comparison.json)，
+判定见[调查记录](../../../../docs/zh-cn/investigations/2026-10-csa-gm-ack-preflight.md)。
+下一项转向领取耗尽／局部关闭对全局计数的重复强确认，先验证不可变确认发布的所有权与可见性。
+不改变三 lane 条件，不把无效尾票或仅预留未确认当成完成。目标仍未达到，未 commit／push。
+
+## 2026-10-28：按用户要求提交已验收的阶段版本
+
+本次提交范围为已保留的 2.413584ms 版本、边界回归和完整性能样本／调查记录。
+受测源码由 be28cfadc 加生产 diff 33685149… 标识；提交后 HEAD 的普通工作树 diff 会归零，
+不能把归零误解为二进制或受测源码丢失。匹配二进制为 Host=129d3283…、AICPU=88c99bf8…、AICore=6db71a70…。
+
+刚开始的 claim_seal 草稿没有设备构建或性能结果，不进入本次提交。
+四个未完成文件、原基线及初步红灯日志已在工作区 reports/csa_poursoul_20261027.Osnaam 和 outputs 中保留；
+工作树已恢复受测版，生产代码仍为 v5，没有 claim_seal 字段或 helper。
+其待验证设计留在优化计划中，不表示已实现。
+
+提交不包含 TMR CSA、历史 atomic_probe、外部泳道图、无关未跟踪 fixture、构建产物或完整原始 trace。
+它是阶段保存，不宣称低于 2ms 的目标或最终五批／全故障验收已完成。
+
+提交前恢复后复核：21 个 C++ 目标、1121 项通过；Python 3345 项通过（包含 early-enqueue 证据读端）。
+按 HBG 目录补跑等级低于 4、manual exclude 的回归：A5 76 项通过、4 项跳过、4 项取消选择；
+a5sim 55 项通过、29 项取消选择。resident_failure 从该目录扫描中单独排除，使用本版本此前
+两平台各 24 个 N1/N2 独立故障及恢复结果，不把这次目录扫描称为完整故障矩阵重跑。
+静态检查全部通过。日志为 outputs/csa-checkpoint-20261028-{cpp,python,a5,a5sim,precommit}.log。

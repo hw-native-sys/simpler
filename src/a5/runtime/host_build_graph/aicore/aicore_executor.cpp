@@ -200,7 +200,7 @@ __aicore__ bool bootstrap_ready_graph(
         uint32_t barrier_backoff = kInitialBackoffIterations;
         const uint64_t barrier_start = scheduler_cycles();
         while (scheduler_gm_query(run_control->bootstrap_scan_complete) == 0) {
-            if (scheduler_gm_query(run_control->scheduler_error) != 0) return false;
+            if (scheduler_read_error(run_control) != 0) return false;
             if (scheduler_watchdog_expired(barrier_start, scheduler_cycles(), timeout_cycles)) {
                 scheduler_record_error(
                     run_control, SCHEDULER_TASK_REF_INVALID, SchedulerGraphResult::TIMEOUT, &graph, scheduler,
@@ -289,7 +289,7 @@ __aicore__ bool run_ready_dispatch_loop(
         }
         if (++scheduler_error_poll_count == kSchedulerErrorPollInterval) {
             scheduler_error_poll_count = 0;
-            if (scheduler_gm_query(run_control->scheduler_error) != 0) return false;
+            if (scheduler_read_error(run_control) != 0) return false;
         }
 
         if (phase_timing_enabled) ++context->profiling->loop_iter;
@@ -555,7 +555,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     // interval. Both startup and dispatch-loop exits close their obligations
     // here, before the acknowledgement allows the AICPU to retire that core.
     wait_for_aicpu_exit_signal();
-    if (config_valid && scheduler_gm_fetch_add(run_control->scheduler_error, UINT64_C(0)) == 0) {
+    if (config_valid && scheduler_read_error(run_control) == 0) {
         const uint64_t drain_start = get_sys_cnt_aicore();
         while (true) {
             bool drained = false;
@@ -589,8 +589,7 @@ __aicore__ __attribute__((noinline)) void run_resident_scheduler(
     if constexpr (WithProfiling) {
         if (profile.protocol_layout_offset != 0)
             scheduler_protocol_finish(
-                scheduler_state_base, &scheduler_local_state,
-                config_valid && scheduler_gm_fetch_add(run_control->scheduler_error, UINT64_C(0)) == 0
+                scheduler_state_base, &scheduler_local_state, config_valid && scheduler_read_error(run_control) == 0
             );
     }
     // Complete preceding GM writes before ACK. Stays outside profiling: the
@@ -670,7 +669,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     const uint64_t context_wait_start = get_sys_cnt_aicore();
     while (handshake->aicpu_ready != SCHEDULER_RUNTIME_MODE_RESIDENT_READY && startup_signal != AICORE_EXIT_SIGNAL) {
         scheduler_observe_cache_line(handshake);
-        if (scheduler_gm_query(pending_run_control->scheduler_error) != 0) {
+        if (scheduler_read_error(pending_run_control) != 0) {
             startup_signal = AICORE_EXIT_SIGNAL;
             break;
         }

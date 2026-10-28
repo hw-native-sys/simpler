@@ -12,6 +12,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <type_traits>
 
 #include "scheduler_types.h"
 
@@ -127,8 +128,9 @@ inline __aicore__ int64_t scheduler_gm_load(__gm__ volatile int64_t &value) {
 #endif
 }
 
-// A5 ld_dev bypasses the scalar DCache. It is only an observation/prefilter
-// primitive; ownership changes use the CAS/exchange/fetch wrappers below.
+// A5 ld_dev bypasses the scalar DCache. Atomic-published words require
+// atomic confirmation; bypass-published signals use this read directly.
+// Ownership changes use the CAS/exchange/fetch wrappers below.
 // Publication-protected metadata is invalidated separately before consumption.
 // The memory order every wrapper below takes is honored by the host and sim
 // build, whose implementation is a C++ atomic. An AICore reaches ordering
@@ -166,11 +168,23 @@ inline __aicore__ uint64_t scheduler_gm_query_u32_pair(__gm__ volatile uint32_t 
 #endif
 }
 
-// A store publishes a word other cores take ownership from -- a task's state, a
-// chain link, an error field -- so it is an atomic exchange whose result is
-// discarded, never a device store plus a barrier. A device store leaves the word
-// exposed to a cache-line writeback: any core holding that line can restore its
-// stale copy of the word, and the cores here share lines by design.
+// Each word has one active writer. Publication completes before ownership
+// handoff. While workers run, its whole cache line excludes AICore RMW,
+// cached stores and dirty writeback. Payload ordering belongs to the caller.
+template <typename Word>
+inline __aicore__ void scheduler_publish_signal(__gm__ volatile Word &value, Word desired) {
+    static_assert(std::is_same_v<Word, int64_t> || std::is_same_v<Word, uint64_t>);
+#if defined(__CCE_AICORE__)
+    auto *address = reinterpret_cast<__gm__ uint64_t *>(const_cast<__gm__ Word *>(&value));
+    st_dev(static_cast<uint64_t>(desired), address, 0);
+    dsb(DSB_DDR);
+#else
+    __atomic_store_n(&value, desired, __ATOMIC_RELEASE);
+#endif
+}
+
+// Shared ownership words and atomic-published data retain atomic exchange.
+// Their lines exclude cached writes that could restore old values.
 inline __aicore__ void
 scheduler_gm_store(__gm__ volatile int64_t &value, int64_t desired, int order = __ATOMIC_RELEASE) {
 #if defined(__CCE_AICORE__)

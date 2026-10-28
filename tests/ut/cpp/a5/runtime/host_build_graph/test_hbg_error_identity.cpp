@@ -16,11 +16,49 @@
 #include <array>
 #include <atomic>
 #include <thread>
+#include <vector>
 
 #include "aicore_scheduler_error.h"
 #include "hbg_scheduler_test_support.h"
 #include "scheduler/scheduler_completion.h"
 #include "scheduler/scheduler_gm_mix.h"
+
+namespace {
+
+struct ErrorCacheEvent {
+    const void *address;
+    size_t bytes;
+    bool flush;
+    uint64_t status;
+};
+
+struct ErrorCacheTrace;
+thread_local ErrorCacheTrace *active_cache_trace = nullptr;
+
+struct ErrorCacheTrace {
+    explicit ErrorCacheTrace(SchedulerRunControl *value) :
+        run(value) {
+        active_cache_trace = this;
+    }
+    ~ErrorCacheTrace() { active_cache_trace = nullptr; }
+    SchedulerRunControl *run;
+    std::vector<ErrorCacheEvent> events;
+};
+
+void record_cache_access(const void *address, size_t bytes, bool flush) {
+    if (active_cache_trace == nullptr) return;
+    active_cache_trace->events.push_back(
+        {address, bytes, flush, __atomic_load_n(&active_cache_trace->run->scheduler_error, __ATOMIC_ACQUIRE)}
+    );
+}
+
+}  // namespace
+
+// Host-only cache-operation recording; device visibility has separate native probes.
+namespace aicpu_cache_maintenance {
+void invalidate_range_impl(const void *address, size_t bytes) { record_cache_access(address, bytes, false); }
+void flush_range_impl(const void *address, size_t bytes) { record_cache_access(address, bytes, true); }
+}  // namespace aicpu_cache_maintenance
 
 namespace {
 
@@ -92,12 +130,61 @@ struct ErrorFixture {
     std::array<SchedulerAdmissionLocalState, 3> admissions{};
 };
 
-TEST(HbgErrorIdentity, ReusesTheExistingDiagnosticCacheLineWithoutChangingWireOffsets) {
-    EXPECT_EQ(sizeof(SchedulerRunControl), 384u);
+TEST(HbgErrorIdentity, DedicatedStatusLinePreservesDiagnosticIdentityOffsets) {
+    EXPECT_EQ(sizeof(SchedulerRunControl), 512u);
     EXPECT_EQ(offsetof(SchedulerRunControl, error_claimed), 256u);
     EXPECT_EQ(offsetof(SchedulerRunControl, error_site), 328u);
     EXPECT_EQ(kIdentityOffset, 336u);
-    EXPECT_EQ(kIdentityOffset + sizeof(Identity), sizeof(SchedulerRunControl));
+    EXPECT_EQ(kIdentityOffset + sizeof(Identity), offsetof(SchedulerRunControl, scheduler_error));
+}
+
+TEST(HbgErrorIdentity, PublishedStatusHasNoAtomicWriterOnItsCacheLine) {
+    constexpr size_t status_offset = offsetof(SchedulerRunControl, scheduler_error);
+    EXPECT_EQ(status_offset % 128, 0u);
+    EXPECT_NE(status_offset / 64, offsetof(SchedulerRunControl, error_claimed) / 64);
+    EXPECT_NE(status_offset / 64, offsetof(SchedulerRunControl, error_task_ref) / 64);
+    EXPECT_NE(status_offset / 64, offsetof(SchedulerRunControl, error_identity_fields) / 64);
+    EXPECT_EQ(status_offset, 384u);
+}
+
+TEST(HbgErrorIdentity, AicpuFlushesIdentityBeforePublishingAndFlushingStatus) {
+    ErrorFixture fixture;
+    ErrorCacheTrace trace(fixture.run());
+    ASSERT_TRUE(record_aicore_scheduler_runtime_error(
+        fixture.run(), SchedulerGraphResult::TIMEOUT, SchedulerErrorSite::EXECUTION_PROGRESS_TIMEOUT
+    ));
+    ASSERT_EQ(trace.events.size(), 2u);
+    const auto *base = reinterpret_cast<const uint8_t *>(fixture.run());
+    EXPECT_EQ(trace.events[0].address, base + offsetof(SchedulerRunControl, error_claimed));
+    EXPECT_EQ(trace.events[0].bytes, 128u);
+    EXPECT_TRUE(trace.events[0].flush);
+    EXPECT_EQ(trace.events[0].status, 0u);
+    EXPECT_EQ(trace.events[1].address, base + offsetof(SchedulerRunControl, scheduler_error));
+    EXPECT_EQ(trace.events[1].bytes, 128u);
+    EXPECT_TRUE(trace.events[1].flush);
+    EXPECT_EQ(trace.events[1].status, static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
+    EXPECT_FALSE(record_aicore_scheduler_runtime_error(
+        fixture.run(), SchedulerGraphResult::INVALID_ARGUMENTS, SchedulerErrorSite::GROUP_INVALID_STATE
+    ));
+    EXPECT_EQ(trace.events.size(), 2u);
+}
+
+TEST(HbgErrorIdentity, ColdLogObservesTheSeparateStatusLineBeforeReloadingIdentity) {
+    ErrorFixture fixture;
+    fixture.record();
+    ErrorCacheTrace trace(fixture.run());
+    testing::internal::CaptureStderr();
+    log_aicore_scheduler_error_identity(fixture.run(), "terminal");
+    const auto message = testing::internal::GetCapturedStderr();
+    EXPECT_FALSE(message.empty());
+    ASSERT_EQ(trace.events.size(), 2u);
+    const auto *base = reinterpret_cast<const uint8_t *>(fixture.run());
+    EXPECT_EQ(trace.events[0].address, base + offsetof(SchedulerRunControl, error_claimed));
+    EXPECT_EQ(trace.events[0].bytes, 256u);
+    EXPECT_FALSE(trace.events[0].flush);
+    EXPECT_EQ(trace.events[1].address, base + offsetof(SchedulerRunControl, error_claimed));
+    EXPECT_EQ(trace.events[1].bytes, 128u);
+    EXPECT_FALSE(trace.events[1].flush);
 }
 
 TEST(HbgErrorIdentity, InitializationAndRetainedResetUseUnknownInsteadOfValidZeroIdentities) {
@@ -122,7 +209,7 @@ TEST(HbgErrorIdentity, EpochZeroIsKnownWhenTheAdmissionContextWasInitialized) {
 
 uint32_t read_valid_fields(const SchedulerRunControl &run) {
     const auto *word = reinterpret_cast<const volatile uint32_t *>(
-        reinterpret_cast<const uint8_t *>(&run) + sizeof(SchedulerRunControl) - sizeof(uint32_t)
+        reinterpret_cast<const uint8_t *>(&run) + offsetof(SchedulerRunControl, error_identity_fields)
     );
     return __atomic_load_n(word, __ATOMIC_RELAXED);
 }
@@ -274,6 +361,7 @@ TEST(HbgErrorIdentity, AicpuFirstWriterPublishesUnknownRatherThanStaleAicoreIden
     EXPECT_EQ(fixture.run()->error_core_type, UINT64_MAX);
     EXPECT_EQ(read_valid_fields(*fixture.run()), 0u);
     EXPECT_EQ(fixture.run()->error_site, static_cast<uint64_t>(SchedulerErrorSite::AICPU_INIT_BARRIER_TIMEOUT));
+    EXPECT_EQ(scheduler_read_error(fixture.run()), static_cast<uint64_t>(SchedulerGraphResult::TIMEOUT));
 }
 
 TEST(HbgErrorIdentity, OrdinarySingleBlockPreparationHasKnownBlockWithoutClaimingAnAdmissionOrder) {
@@ -389,7 +477,7 @@ TEST(HbgErrorIdentity, PublishedStatusAlwaysCarriesOneCoherentWinningIdentity) {
         std::thread b(publish, 2, 1);
         while (ready.load(std::memory_order_acquire) != 2) {}
         go.store(true, std::memory_order_release);
-        while (__atomic_load_n(&fixture.run()->scheduler_error, __ATOMIC_ACQUIRE) == 0) {}
+        while (scheduler_read_error(fixture.run()) == 0) {}
         const uint64_t task = __atomic_load_n(&fixture.run()->error_task_ref, __ATOMIC_RELAXED);
         const auto identity = read_identity(*fixture.run());
         a.join();

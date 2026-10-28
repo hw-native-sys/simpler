@@ -69,6 +69,20 @@ Host 不会自动识别任意异步 kernel 并回退。kernel 必须处理注册
 要求 resident 的验收必须把任何回退判为失败，不能用正确输出代替调度来源检查。
 已有严格“全体到齐后才执行”的 sync_start 调用合同仍须逐项核对，不能静默放宽。
 
+### 后续功能 TODO
+
+2026-10-27 确认：以下三项留待后续补齐，本次仅记录，不修改当前能力门禁或调度实现。
+
+- [ ] **多 block／Mix 的 predicate 条件执行**：当前 Host 明确拒绝，只有普通单 block、
+  单执行 lane 支持 predicate。后续补齐逻辑任务级条件判定及各 block／lane 一致的跳过与完成语义。
+- [ ] **Graph 类型任务的 AICore resident 执行**：当前出现 TaskKind::GRAPH 时整次运行回退 AICPU。
+  后续支持这类封装图／子图任务；这里不是指已经支持的普通 HBG 任务依赖图。
+- [ ] **异步返回与 deferred completion**：后续支持 kernel 先返回、异步操作完成后才释放依赖。
+  当前 resident 不提供有效 deferred 上下文，register_completion_condition 返回 false，
+  Host 不会自动识别任意异步 kernel 并替它回退；保留此边界直到独立验收通过。
+
+### 公共 block 请求边界
+
 公共 HBG LaunchSpec 接受 int64_t block 请求，在窄化为原 int16_t 字段前检查范围；
 超出字段范围保存为非法 0，由既有 Host 校验拒绝，不能把 65537 静默变成 1。
 合法请求和 N=1 同步归一化不变；旧编排需要重编，显式预先窄化的调用者数据无法恢复。

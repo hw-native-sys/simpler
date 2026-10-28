@@ -244,13 +244,8 @@ static void record_resident_timeout(Runtime *runtime, SchedulerErrorSite error_s
     if (context != nullptr) {
         cache_invalidate_range(context, 128);
         SchedulerRunControl *run_control = aicore_scheduler_run_control(context);
-        if (run_control != nullptr &&
-            record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site)) {
-            cache_flush_range(
-                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
-            );
-            wmb();
-        }
+        if (run_control != nullptr)
+            (void)record_aicore_scheduler_runtime_error(run_control, SchedulerGraphResult::TIMEOUT, error_site);
     }
     if (runtime != nullptr && runtime->get_gm_sm_ptr() != nullptr) {
         auto *header = static_cast<SharedMemoryHeader *>(runtime->get_gm_sm_ptr());
@@ -278,7 +273,8 @@ static int32_t publish_aicore_scheduler_runtime_error(Runtime *runtime, const ch
         run_control = aicore_scheduler_run_control(context);
         if (run_control != nullptr) {
             cache_invalidate_range(
-                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
+                reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed),
+                sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, error_claimed)
             );
         }
     }
@@ -571,7 +567,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                         error_poll_count = 0;
                         ++error_poll_total;
                         cache_invalidate_range(
-                            reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed), 128
+                            reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, error_claimed),
+                            sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, error_claimed)
                         );
                         if (run_control->scheduler_error != 0) break;
                     }
@@ -582,7 +579,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                     SPIN_WAIT_HINT();
                 }
                 cache_invalidate_range(
-                    reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, executed_task_count), 256
+                    reinterpret_cast<uint8_t *>(run_control) + offsetof(SchedulerRunControl, executed_task_count),
+                    sizeof(SchedulerRunControl) - offsetof(SchedulerRunControl, executed_task_count)
                 );
                 if (run_control->scheduler_error != 0) {
                     LOG_ERROR(

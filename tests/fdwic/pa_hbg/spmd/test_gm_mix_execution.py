@@ -44,7 +44,11 @@ class TestHbgGmMixExecution(_OrderedExecution):
         ],
     }
     CASES = (
-        [_case(f"mix_mask{mask}_n{blocks}", "shape", mask, blocks=blocks) for mask in _MASKS for blocks in (1, 2, 65)]
+        [
+            _case(f"mix_mask{mask}_n{blocks}", "shape", mask, blocks=blocks)
+            for mask in _MASKS
+            for blocks in (1, 2, 3, 15, 16, 17, 63, 64, 65)
+        ]
         + [
             _case(
                 f"mix_fanin_mask{mask}_slow_{position}",

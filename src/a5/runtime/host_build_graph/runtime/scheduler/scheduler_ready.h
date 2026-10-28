@@ -159,13 +159,18 @@ struct SchedulerAdmissionLocalState {
     bool initialized{false};
     uint8_t next_candidate{0};
     bool sync_claimed{false};
+    bool ticket_exhausted{false};
     SchedulerOrderedCandidate candidates[SCHEDULER_PENDING_SLOT_COUNT]{};
     SchedulerGmMixLocalState gm_mix{};
+    // READY freezes topology for this run. This cache contains membership
+    // facts only, never a task frontier or an execution permission.
+    uint64_t topology_cube_words[(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
+    uint64_t topology_worker_count{0};
 };
 
 static_assert(sizeof(SchedulerOrderedCandidate) == 48, "ordered candidate size changed");
 static_assert(sizeof(SchedulerGmMixLocalState) == 40, "GM group-local state size changed");
-static_assert(sizeof(SchedulerAdmissionLocalState) == 232, "admission-local state size changed");
+static_assert(sizeof(SchedulerAdmissionLocalState) == 256, "admission-local state size changed");
 
 struct SchedulerFreeSlotClaim {
     uint64_t worker_id{UINT64_MAX};

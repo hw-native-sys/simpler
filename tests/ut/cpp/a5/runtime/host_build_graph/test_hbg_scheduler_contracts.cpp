@@ -260,7 +260,7 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 128u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 512u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 1024u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
     // Both chain links belong to the atomic line: they are written as single

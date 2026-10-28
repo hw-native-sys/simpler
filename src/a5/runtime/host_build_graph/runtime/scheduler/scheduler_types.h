@@ -850,6 +850,16 @@ inline __aicore__ bool scheduler_task_requires_sync_start(uint8_t flags) {
     return (flags & SCHEDULER_TASK_SYNC_START) != 0;
 }
 
+inline __aicore__ uint64_t scheduler_block_claim_positions(uint8_t active_mask, uint64_t clusters) {
+    return clusters * (active_mask == 2 || active_mask == 4 ? 2 : 1);
+}
+
+inline __aicore__ bool
+scheduler_task_uses_ticket_claim(uint8_t flags, uint8_t active_mask, uint64_t blocks, uint64_t clusters) {
+    const uint64_t positions = scheduler_block_claim_positions(active_mask, clusters);
+    return !scheduler_task_requires_sync_start(flags) && positions != 0 && blocks > 1;
+}
+
 inline __aicore__ bool scheduler_task_is_inline(uint8_t flags) { return (flags & SCHEDULER_TASK_INLINE) != 0; }
 
 inline __aicore__ bool scheduler_task_has_predicate(uint8_t flags) {
@@ -884,9 +894,9 @@ struct alignas(128) SchedulerTaskControl {
     // them: a resolver detaches a whole wake list before routing its waiters,
     // and a batch is spliced into an inbox without rewriting its links.
     volatile int64_t next_waiter;
-    volatile uint64_t next_block;
-    volatile uint64_t completed_blocks;
-    volatile uint64_t admission_state;
+    volatile uint64_t claim_tickets;
+    uint8_t control_padding[8];
+    volatile uint64_t admission_claim_lock;
     uint8_t atomic_line_padding[16];
 
     int32_t next_fanin_index;
@@ -896,6 +906,15 @@ struct alignas(128) SchedulerTaskControl {
     uint64_t scheduler_worker_id;
     uint64_t completion_resolve_loop_iter;
     uint8_t scheduler_line_padding[24];
+
+    alignas(128) volatile uint64_t next_block;
+    uint8_t block_cursor_padding[120];
+    alignas(128) volatile uint64_t completed_blocks;
+    uint8_t block_completion_padding[120];
+    // Only the claimed owner publishes this phase after the claim lock
+    // serializes UNCLAIMED. This whole region excludes RMW and cached writes.
+    alignas(128) volatile uint64_t admission_state;
+    uint8_t admission_phase_padding[120];
 };
 
 // Each record's bitmap follows its header within an independently aligned
@@ -914,6 +933,8 @@ struct alignas(64) SchedulerAdmissionRecord {
 };
 
 struct alignas(128) SchedulerAdmissionControl {
+    // Only the lock uses atomics. Tail publishers are serialized by the lock
+    // and complete their bypass store before releasing it.
     volatile uint64_t commit_lock;
     uint8_t lock_padding[120];
     alignas(128) volatile uint64_t commit_tail;
@@ -1110,7 +1131,7 @@ struct alignas(128) SchedulerRunControl {
     volatile uint64_t sampled_task_timing_enabled;
 
     volatile uint64_t error_claimed;
-    volatile uint64_t scheduler_error;
+    uint64_t error_status_padding;
     volatile uint64_t error_task_ref;
     volatile uint64_t error_core_id;
     volatile uint64_t error_core_type;
@@ -1126,6 +1147,9 @@ struct alignas(128) SchedulerRunControl {
     volatile uint64_t error_worker_index;
     volatile uint32_t error_cluster_lane;
     volatile uint32_t error_identity_fields;
+    // Only the elected error writer publishes this word. Its line has no
+    // atomic RMW or cached AICore store, including readers that add zero.
+    alignas(128) volatile uint64_t scheduler_error;
 };
 
 struct alignas(128) AicpuThreadLifecycleTrace {
@@ -1324,11 +1348,17 @@ static_assert(sizeof(SchedulerTaskMetadata) == 16, "task metadata layout changed
 static_assert(alignof(SchedulerTaskMetadata) == 16, "task metadata alignment changed");
 static_assert(offsetof(SchedulerTaskMetadata, timing_slot) == 12, "timing tag offset changed");
 static_assert(offsetof(SchedulerTaskMetadata, logical_block_num) == 14, "block count must occupy the metadata tail");
-static_assert(sizeof(SchedulerTaskControl) == 128, "task control layout changed");
+static_assert(sizeof(SchedulerTaskControl) == 512, "task control layout changed");
 static_assert(alignof(SchedulerTaskControl) == 128, "task control alignment changed");
-static_assert(offsetof(SchedulerTaskControl, next_block) == 24, "block cursor must use the atomic line");
-static_assert(offsetof(SchedulerTaskControl, completed_blocks) == 32, "completion counter must use the atomic line");
-static_assert(offsetof(SchedulerTaskControl, admission_state) == 40, "admission state must use the atomic line");
+static_assert(offsetof(SchedulerTaskControl, claim_tickets) == 24, "ticket cursor must use the atomic region");
+static_assert(offsetof(SchedulerTaskControl, next_block) == 128, "block cursor must own its atomic region");
+static_assert(offsetof(SchedulerTaskControl, completed_blocks) == 256, "completion counter must own its atomic region");
+static_assert(
+    offsetof(SchedulerTaskControl, admission_claim_lock) == 40, "admission claim lock must use the atomic line"
+);
+static_assert(
+    offsetof(SchedulerTaskControl, admission_state) == 384, "admission state requires an isolated signal region"
+);
 static_assert(sizeof(SchedulerAdmissionRecord) == 64, "admission header must occupy one cache line");
 static_assert(sizeof(SchedulerAdmissionControl) == 256, "admission control layout changed");
 static_assert(alignof(SchedulerAdmissionControl) == 128, "admission control requires isolated atomic regions");
@@ -1375,7 +1405,7 @@ static_assert(
 static_assert(sizeof(SchedulerExecutorTaskTrace) == 48, "executor trace payload layout changed");
 static_assert(alignof(SchedulerExecutorTaskTrace) == alignof(uint64_t), "executor trace must have natural alignment");
 static_assert(offsetof(SchedulerExecutorTaskTrace, completion_inbox_index) == 40, "executor trace layout changed");
-static_assert(sizeof(SchedulerRunControl) == 384, "run control layout changed");
+static_assert(sizeof(SchedulerRunControl) == 512, "run control layout changed");
 static_assert(alignof(SchedulerRunControl) == 128, "run control alignment changed");
 static_assert(offsetof(SchedulerRunControl, executed_task_count) == 128, "lifecycle atomics need their own line");
 static_assert(offsetof(SchedulerRunControl, error_claimed) == 256, "error state needs its own line");
@@ -1387,6 +1417,7 @@ static_assert(offsetof(SchedulerRunControl, error_group_seq) == 360, "error iden
 static_assert(offsetof(SchedulerRunControl, error_worker_index) == 368, "error identity ABI changed");
 static_assert(offsetof(SchedulerRunControl, error_cluster_lane) == 376, "error identity ABI changed");
 static_assert(offsetof(SchedulerRunControl, error_identity_fields) == 380, "error identity ABI changed");
+static_assert(offsetof(SchedulerRunControl, scheduler_error) == 384, "error publication needs its own line");
 static_assert(sizeof(AicpuThreadLifecycleTrace) == 128, "AICPU lifecycle trace layout changed");
 static_assert(sizeof(SchedulerWorkerContext) == 1024, "worker context layout changed");
 static_assert(alignof(SchedulerWorkerContext) == 128, "worker context alignment changed");
@@ -1692,8 +1723,8 @@ scheduler_init_data_from_layout(void *base, const AicoreSchedulerLayout &layout,
             record->order_key = UINT64_MAX;
             record->member_words_offset = offset + sizeof(SchedulerAdmissionRecord);
         }
-        // Log elements and packed close seals are atomic-only device words;
-        // adjacent publishers must never write back a cached whole line.
+        // Log elements use bypass stores; packed close seals use atomics.
+        // Neither region permits device cached stores or dirty writeback.
         auto *log = scheduler_state_at<int64_t>(base, layout.admission_log_offset);
         for (uint64_t index = 0; index < layout.spmd.cooperative_task_count; ++index)
             log[index] = SCHEDULER_TASK_REF_INVALID;
