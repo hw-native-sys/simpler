@@ -83,6 +83,30 @@ def test_simpler_decode_smoke(run_backend, native_result, vllm_paths, tmp_path):
     assert all(len(row) == TOKENS for row in data["rounds"][0]["tokens"])
 
 
+@pytest.mark.manual
+def test_native_single_active_request(single_active_native_result):
+    data, _ = single_active_native_result
+    assert data["backend"] == "native"
+    assert data["requests"] == 1
+    assert data["simpler"] is None
+    assert len(data["rounds"]) == 1
+    tokens = data["rounds"][0]["tokens"]
+    assert len(tokens) == 1
+    assert all(len(row) == TOKENS for row in tokens)
+
+
+@pytest.mark.manual
+def test_simpler_single_active_decode(run_single_active_backend, single_active_native_result, vllm_paths, tmp_path):
+    native_data, reference = single_active_native_result
+    data, _ = run_single_active_backend(vllm_paths, tmp_path, "simpler", reference)
+    assert data["backend"] == "simpler"
+    assert data["requests"] == 1
+    assert data["simpler"] == [{"steps": TOKENS - 1, "failed": False}]
+    assert len(data["rounds"]) == 1
+    assert data["rounds"][0]["tokens"] == native_data["rounds"][0]["tokens"]
+    assert all(len(row) == TOKENS for row in data["rounds"][0]["tokens"])
+
+
 def test_simpler_backend_refuses_missing_artifact(adapter_runner, tmp_path):
     result = subprocess.run(
         [

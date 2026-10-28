@@ -51,7 +51,7 @@ def adapter_runner() -> Path:
         tried = ", ".join(str(candidate) for candidate in candidates)
         pytest.fail(
             f"vLLM adapter runner not found under {root} (tried {tried}); set VLLM_ADAPTER_ROOT to the "
-            "pinned #2605 checkout or its qwen3_14b_serving_effective directory"
+            "pinned adapter checkout or its qwen3_14b_serving_effective directory"
         )
     return runner
 
@@ -78,7 +78,14 @@ def _device(request) -> str:
     return str(request.config.getoption("--device")).split("-")[0].split(",")[0]
 
 
-def _run_backend(request, paths: VllmPaths, directory: Path, backend: str, reference: Path | None = None):
+def _run_backend(
+    request,
+    paths: VllmPaths,
+    directory: Path,
+    backend: str,
+    reference: Path | None = None,
+    requests: int = 16,
+):
     output = directory / f"{backend}.json"
     command = [
         sys.executable,
@@ -96,6 +103,8 @@ def _run_backend(request, paths: VllmPaths, directory: Path, backend: str, refer
         "2",
         "--rounds",
         "1",
+        "--requests",
+        str(requests),
         "--output",
         str(output),
     ]
@@ -134,5 +143,18 @@ def native_result(request, vllm_paths, tmp_path_factory):
 def run_backend(request):
     def _run(paths: VllmPaths, directory: Path, backend: str, reference: Path | None = None):
         return _run_backend(request, paths, directory, backend, reference)
+
+    return _run
+
+
+@pytest.fixture(scope="session")
+def single_active_native_result(request, vllm_paths, tmp_path_factory):
+    return _run_backend(request, vllm_paths, tmp_path_factory.mktemp("vllm-single-native"), "native", requests=1)
+
+
+@pytest.fixture
+def run_single_active_backend(request):
+    def _run(paths: VllmPaths, directory: Path, backend: str, reference: Path | None = None):
+        return _run_backend(request, paths, directory, backend, reference, requests=1)
 
     return _run

@@ -441,14 +441,22 @@ variables; `VLLM_ADAPTER_ROOT` selects the adapter checkout, or the
 `qwen3_14b_serving_effective` directory that contains the fixed-shape adapter
 runner. The checkout must support the official stage-0 release layout; the #2605
 head `591f003b` alone requires the legacy `hbg_artifact_manifest.json` and a
-4096-row rope cache, so it cannot consume this release unchanged.
+4096-row rope cache, so it cannot consume this release unchanged. Pin the
+adapter checkout from #2758 (`33d266bd555980875fa9a0e5e9c65ef7728bcb9e`) or a
+later revision that keeps the stage-0 contract; its runner validates the
+canonical 3338-token prompt
+(`83d41b1d59bda5281cf2489944632d71247d38c4fdf37bf347d4935297d4d00d`), so
+`VLLM_PROMPT_IDS` must name that prompt file rather than another
+3338-token workload.
 `VLLM_ATB_ENV` pins the NNAL/ATB 9.0.0 environment script, and
 `VLLM_SOURCE_DIR` / `VLLM_ASCEND_SOURCE_DIR` may point at cached source
 checkouts. Missing paths, missing packages, wrong package versions, or an ATB
 line other than 9.0 fail the selected cases; they are not reported as skips.
 The job retains `identity.json`, the environment status/freeze files, the
-plan/JUnit and per-case logs. It does not qualify numerical equivalence beyond
-the two-token smoke; the 128-token gate remains with #2605.
+plan/JUnit and per-case logs. Both backends run the 16-request cohort (Gate 4a)
+and one active request with isolated fixed-shape padding (Gate 4b) through the
+same adapter contract. It does not qualify numerical equivalence beyond the
+two-token smoke; the 128-token gate remains with #2429.
 
 ### CPU emergency lane (`ci-self-cpu.yml`) and the `/run-cpu` button
 
