@@ -1307,6 +1307,7 @@ struct alignas(128) SchedulerTaskTrace {
     uint64_t completion_id;
     uint64_t completion_inbox_index;
 
+    // Reserved profiling word; Ready publication does not write execution traces.
     alignas(64) uint64_t ready_transition_cycles;
     uint64_t fanin_timing_reserved[4];
     uint64_t aicore_entry_cycles;

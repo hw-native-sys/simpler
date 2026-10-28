@@ -1,0 +1,1126 @@
+{
+  "schema": "csa-ready-trace-comparison-v1",
+  "date": "2026-10-28",
+  "scope": {
+    "change": "删除逻辑任务 Ready 发布时无消费者的逐执行实例时间戳写入",
+    "runtime": "host_build_graph",
+    "scheduler": "aicore",
+    "device": 0,
+    "soc": "Ascend950PR_958b",
+    "scheduler_task_trace_bytes": 384,
+    "scheduler_task_control_bytes": 512,
+    "protocol_schema": "hbg-native-protocol-v5",
+    "protocol_and_abi_unchanged": true
+  },
+  "measurement": {
+    "artifact_root": "reports/csa_poursoul_20261027.Osnaam",
+    "order": [
+      "baseline bench",
+      "baseline L4",
+      "baseline L1",
+      "after L4",
+      "after L1",
+      "after bench"
+    ],
+    "benchmark_warmup": 5,
+    "benchmark_measured_samples_per_arm": 100,
+    "trace_captures_per_level_per_arm": 1,
+    "kernel_window_definition": "max(kernel end) - min(kernel start)，不含 Worker View 的 local_setup",
+    "gap_definition": "前驱最后一个 kernel 返回到后继第一个 kernel 开始；t56 取所有有 kernel 前驱的最大返回时间",
+    "no_concurrent_build_tests_or_device_queries_during_measurement": true,
+    "isolation": "无 task-submit，直接使用本机设备；A5 CLI 监测为空，不证明系统级独占",
+    "limitations": [
+      "每个等级每臂只有一次独立捕获；L4/L1比值不是统计保证",
+      "level0/1不执行被删除的循环，不将其小幅变化直接归因于本次修复",
+      "t56的最晚返回前驱随运行变化，不固定引用历史t53 Resolve",
+      "初次基线启动被旧绑定提交戳拒绝，正常重编绑定后重采；失败尝试不计入样本",
+      "Host中位数80775.1695→83473.111us，未声称Host收益"
+    ]
+  },
+  "observed": {
+    "before": {
+      "l1_window_us": 2288.619,
+      "l4_window_us": 3750.828,
+      "l1_gaps_us": {
+        "t22_t23": 21.584,
+        "t31_t32": 28.973,
+        "t56_latest_kernel_predecessor": 25.949
+      },
+      "l4_gaps_us": {
+        "t22_t23": 467.287,
+        "t31_t32": 93.697,
+        "t56_latest_kernel_predecessor": 145.911
+      },
+      "l4_resolve_us": {
+        "t22": 433.413,
+        "t31": 57.905
+      }
+    },
+    "after": {
+      "l1_window_us": 2229.12,
+      "l4_window_us": 2799.637,
+      "l1_gaps_us": {
+        "t22_t23": 22.951,
+        "t31_t32": 25.073,
+        "t56_latest_kernel_predecessor": 31.387
+      },
+      "l4_gaps_us": {
+        "t22_t23": 38.644,
+        "t31_t32": 40.272,
+        "t56_latest_kernel_predecessor": 41.613
+      },
+      "l4_resolve_us": {
+        "t22": 0.556,
+        "t31": 3.622
+      }
+    }
+  },
+  "checks": {
+    "kernel_fingerprints": [
+      [
+        0,
+        1920,
+        "0xc977e28d1be50594"
+      ],
+      [
+        1,
+        1128,
+        "0xf83f45396c4d3032"
+      ],
+      [
+        2,
+        72,
+        "0x3f88fe80a9bf096c"
+      ],
+      [
+        3,
+        1840,
+        "0x713a851fd3ed9dd0"
+      ],
+      [
+        4,
+        15032,
+        "0xc3e5873059fb872f"
+      ],
+      [
+        5,
+        4424,
+        "0x8fc13602c18d8f13"
+      ],
+      [
+        6,
+        2344,
+        "0x7ea4762c5e6d84e9"
+      ],
+      [
+        7,
+        808,
+        "0x7f6de147a6fd7378"
+      ],
+      [
+        8,
+        3656,
+        "0xe59fe3e9663e02f2"
+      ],
+      [
+        9,
+        1000,
+        "0x3e92654216022e75"
+      ],
+      [
+        10,
+        3640,
+        "0xa96ec483e1bb62f9"
+      ],
+      [
+        11,
+        2376,
+        "0x7090c56f065b018"
+      ],
+      [
+        12,
+        1888,
+        "0x17efec28f48e8039"
+      ],
+      [
+        13,
+        2144,
+        "0xc3a318b74c637b9"
+      ],
+      [
+        14,
+        2808,
+        "0x688eaf5422bfd252"
+      ],
+      [
+        15,
+        2360,
+        "0xf9853d126dd53222"
+      ],
+      [
+        16,
+        5192,
+        "0xee9b9093436cc113"
+      ],
+      [
+        17,
+        1000,
+        "0xe94fae7d734b3fe9"
+      ],
+      [
+        18,
+        3640,
+        "0x9f1424af88badf90"
+      ],
+      [
+        19,
+        8520,
+        "0x1c5d8d88903ae24c"
+      ],
+      [
+        20,
+        1032,
+        "0x8a5ec693f4c81d2d"
+      ],
+      [
+        21,
+        1576,
+        "0xe6a60dc6d3dcc112"
+      ],
+      [
+        22,
+        5424,
+        "0x472888f1d4dbaffa"
+      ],
+      [
+        23,
+        9800,
+        "0x96155ff50aadec63"
+      ],
+      [
+        24,
+        2808,
+        "0x5ddfc25df83b61e3"
+      ],
+      [
+        25,
+        2360,
+        "0xaa2a3696386ca08a"
+      ],
+      [
+        26,
+        3120,
+        "0x261c83f31bd30649"
+      ],
+      [
+        27,
+        216,
+        "0xd9a84bc6042bb32e"
+      ],
+      [
+        28,
+        248,
+        "0xe26e7d86da12bdce"
+      ],
+      [
+        29,
+        6216,
+        "0x3a792d77ee54adc5"
+      ],
+      [
+        30,
+        632,
+        "0xa99256f3b929702c"
+      ],
+      [
+        31,
+        1120,
+        "0x8e1f1be0eecd3541"
+      ],
+      [
+        32,
+        1176,
+        "0x721f39c10d83cc62"
+      ],
+      [
+        33,
+        3168,
+        "0x49b13cc7a1e5cd5f"
+      ],
+      [
+        34,
+        432,
+        "0x3d245de369b463d7"
+      ],
+      [
+        35,
+        11592,
+        "0xda575b8623314273"
+      ],
+      [
+        36,
+        3152,
+        "0x369b29e348c0f42d"
+      ],
+      [
+        37,
+        9112,
+        "0xd40fe754923d5067"
+      ],
+      [
+        38,
+        23088,
+        "0x247b5c4694ecc84d"
+      ],
+      [
+        39,
+        2376,
+        "0xe36928ce5ee2c201"
+      ],
+      [
+        40,
+        168,
+        "0xda20b85891ebc4e2"
+      ],
+      [
+        41,
+        11096,
+        "0xd14502d1b8abc68c"
+      ],
+      [
+        42,
+        4440,
+        "0x58da2d2aab8e09e6"
+      ],
+      [
+        43,
+        4440,
+        "0x910bd520980ab464"
+      ],
+      [
+        44,
+        2920,
+        "0xd24b39ec768f5630"
+      ],
+      [
+        45,
+        7752,
+        "0x78846156e79e09fd"
+      ],
+      [
+        46,
+        272,
+        "0xd54f2790ffab00c0"
+      ],
+      [
+        47,
+        1000,
+        "0x4471da668742d644"
+      ],
+      [
+        48,
+        3640,
+        "0xc1d6a13a9aae3331"
+      ],
+      [
+        49,
+        320,
+        "0xb36ae26b3acca8a"
+      ],
+      [
+        50,
+        1000,
+        "0xa5771367b18447a"
+      ],
+      [
+        51,
+        3640,
+        "0xcac7e3e043c38e73"
+      ],
+      [
+        52,
+        7752,
+        "0x3bb0f957aed7265d"
+      ],
+      [
+        53,
+        4184,
+        "0xfd40003cedadb656"
+      ]
+    ],
+    "same_linked_kernels_all_six_runs": true,
+    "cli_overlap_observations_all_six_runs": 0
+  },
+  "tests": {
+    "new_cpp_definitions": 195,
+    "red_new_failed": 132,
+    "red_new_passed": 63,
+    "red_updated_existing_failed": 1,
+    "final_cpp_targets_passed": 21,
+    "final_cpp_definitions_passed": 1316,
+    "python_passed": 3479,
+    "a5sim": {"passed": 55, "deselected": 29},
+    "a5": {"passed": 76, "skipped": 4, "deselected": 4},
+    "scene_scope": "A5 HBG examples 和 tests/st；排除 level4、manual、resident_failure",
+    "a5_final_log": "outputs/csa-readytrace-a5-runtime.log",
+    "a5sim_final_log": "outputs/csa-readytrace-a5sim-regression.log",
+    "incomplete_a5_attempts_counted_as_pass": false,
+    "full_fault_matrix_rerun": false
+  },
+  "runs": [
+    {
+      "label": "readytrace-baseline-bench-b",
+      "mode": "bench",
+      "passed": true,
+      "device": 0,
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "ded082f20fc88f2e4fc093f7e106c1c50c32666e",
+        "simpler_branch": "feat/fully_distributed_within_core",
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "runtime_sha256": {
+          "libhost_runtime.so": "129d3283eab660e51cbffb8f059af5565289ff43ccfd53f1198c9d67d51e7a1f",
+          "libaicpu_kernel.so": "88c99bf8a4144d005efe178f7428b23169849c33d2772ac9ebdc2928def952f7",
+          "aicore_kernel.o": "6db71a70af6735ef25f49a5232cedb7cd1634b4fda0110c8eec134cb6555c466"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 3,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "benchmark": {
+        "warmup": 5,
+        "rounds": 100,
+        "chip_swimlane_level": 0,
+        "metrics": {
+          "host_us": {
+            "min": 79611.554,
+            "median": 80775.16949999999,
+            "mean": 82165.90393,
+            "max": 94628.678,
+            "samples": [
+              80475.921,
+              80017.698,
+              79915.019,
+              80509.764,
+              80755.528,
+              80194.941,
+              80349.341,
+              80232.517,
+              83105.85,
+              83845.579,
+              80958.273,
+              82475.699,
+              91661.141,
+              81500.645,
+              82159.706,
+              80181.23,
+              81017.409,
+              80115.077,
+              80541.054,
+              80357.026,
+              81521.892,
+              82693.895,
+              80368.208,
+              80130.723,
+              86263.618,
+              86602.235,
+              82311.986,
+              82008.788,
+              85188.1,
+              86448.972,
+              85900.676,
+              85409.467,
+              84878.385,
+              83792.758,
+              90720.65,
+              80659.301,
+              80509.011,
+              82748.537,
+              83324.707,
+              81878.946,
+              81927.537,
+              86386.128,
+              84292.789,
+              85593.735,
+              81723.181,
+              80273.79,
+              80537.826,
+              80231.468,
+              94171.045,
+              81143.032,
+              80770.928,
+              80884.736,
+              80660.094,
+              80293.916,
+              80946.957,
+              80376.622,
+              80206.432,
+              80606.651,
+              82414.23,
+              82526.378,
+              80261.586,
+              80868.651,
+              80681.411,
+              80698.971,
+              80826.223,
+              80592.884,
+              80544.499,
+              80521.639,
+              79736.507,
+              80325.716,
+              80597.397,
+              81028.862,
+              85554.791,
+              94628.678,
+              80386.553,
+              81133.857,
+              80723.011,
+              81143.61,
+              81945.726,
+              80779.411,
+              79989.168,
+              80077.662,
+              85556.192,
+              80625.509,
+              80065.621,
+              80238.394,
+              79611.554,
+              79728.044,
+              83997.355,
+              85948.536,
+              81484.706,
+              80078.353,
+              80608.863,
+              79737.081,
+              93532.456,
+              80264.273,
+              80059.062,
+              80982.83,
+              80746.414,
+              80580.589
+            ]
+          },
+          "device_us": {
+            "min": 2367.555,
+            "median": 2415.6225,
+            "mean": 2418.6118,
+            "max": 2534.852,
+            "samples": [
+              2377.247,
+              2408.927,
+              2423.083,
+              2443.11,
+              2390.393,
+              2404.344,
+              2408.752,
+              2420.622,
+              2451.086,
+              2452.431,
+              2405.218,
+              2439.32,
+              2421.305,
+              2421.946,
+              2375.517,
+              2420.758,
+              2388.122,
+              2414.481,
+              2484.565,
+              2380.885,
+              2415.029,
+              2478.606,
+              2416.216,
+              2403.398,
+              2430.609,
+              2444.165,
+              2394.171,
+              2436.964,
+              2408.662,
+              2426.058,
+              2378.884,
+              2445.377,
+              2395.993,
+              2430.712,
+              2414.359,
+              2425.539,
+              2394.734,
+              2404.105,
+              2431.508,
+              2397.63,
+              2423.554,
+              2401.107,
+              2418.12,
+              2410.882,
+              2425.656,
+              2396.386,
+              2441.75,
+              2410.794,
+              2392.006,
+              2438.014,
+              2395.114,
+              2427.786,
+              2385.037,
+              2459.071,
+              2525.723,
+              2405.136,
+              2419.564,
+              2388.821,
+              2393.158,
+              2380.374,
+              2409.027,
+              2396.372,
+              2420.053,
+              2402.025,
+              2534.852,
+              2456.967,
+              2440.712,
+              2417.308,
+              2405.547,
+              2410.422,
+              2412.135,
+              2372.313,
+              2429.88,
+              2387.319,
+              2411.761,
+              2417.692,
+              2413.905,
+              2435.138,
+              2448.872,
+              2396.107,
+              2394.557,
+              2385.263,
+              2424.834,
+              2432.404,
+              2396.801,
+              2405.574,
+              2418.863,
+              2417.419,
+              2417.2,
+              2519.987,
+              2425.524,
+              2492.294,
+              2450.317,
+              2398.202,
+              2373.839,
+              2425.328,
+              2430.546,
+              2425.416,
+              2397.966,
+              2367.555
+            ]
+          }
+        }
+      },
+      "trace": null
+    },
+    {
+      "label": "readytrace-baseline-l1",
+      "mode": "l1",
+      "passed": true,
+      "device": 0,
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "ded082f20fc88f2e4fc093f7e106c1c50c32666e",
+        "simpler_branch": "feat/fully_distributed_within_core",
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "runtime_sha256": {
+          "libhost_runtime.so": "129d3283eab660e51cbffb8f059af5565289ff43ccfd53f1198c9d67d51e7a1f",
+          "libaicpu_kernel.so": "88c99bf8a4144d005efe178f7428b23169849c33d2772ac9ebdc2928def952f7",
+          "aicore_kernel.o": "6db71a70af6735ef25f49a5232cedb7cd1634b4fda0110c8eec134cb6555c466"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 2,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "benchmark": null,
+      "trace": {
+        "logical_tasks": 79,
+        "physical_tasks": 2308,
+        "clock_freq_hz": 1000000000,
+        "level": 1,
+        "protocol_verified": false,
+        "execution_epoch": 1,
+        "per_kind_executions": {
+          "aiv": 1444,
+          "aic": 864
+        },
+        "dependency_edges_checked": 133,
+        "block_identity_verified": true,
+        "dependency_order_source": "kernel_timestamps",
+        "dependency_timing_guard": true,
+        "runtime": "host_build_graph",
+        "scheduler_producer": null,
+        "distributed_scheduler_verified": false,
+        "require_aicore_scheduler": false,
+        "host_capture": null,
+        "clock_alignment_status": null,
+        "cross_domain_latency_available": false
+      }
+    },
+    {
+      "label": "readytrace-baseline-l4",
+      "mode": "l4",
+      "passed": true,
+      "device": 0,
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "ded082f20fc88f2e4fc093f7e106c1c50c32666e",
+        "simpler_branch": "feat/fully_distributed_within_core",
+        "tracked_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "runtime_sha256": {
+          "libhost_runtime.so": "129d3283eab660e51cbffb8f059af5565289ff43ccfd53f1198c9d67d51e7a1f",
+          "libaicpu_kernel.so": "88c99bf8a4144d005efe178f7428b23169849c33d2772ac9ebdc2928def952f7",
+          "aicore_kernel.o": "6db71a70af6735ef25f49a5232cedb7cd1634b4fda0110c8eec134cb6555c466"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 2,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "benchmark": null,
+      "trace": {
+        "logical_tasks": 79,
+        "physical_tasks": 2308,
+        "clock_freq_hz": 1000000000,
+        "level": 4,
+        "sequence_integrity_verified": true,
+        "event_count": 46733,
+        "worker_count": 96,
+        "protocol_verified": true,
+        "device_logical_tasks": 81,
+        "executions": 2308,
+        "cooperative_tasks": 61,
+        "member_obligations": 4640,
+        "blocks": 1457,
+        "execution_epoch": 1,
+        "per_kind_executions": {
+          "aiv": 1444,
+          "aic": 864
+        },
+        "dependency_edges_checked": 133,
+        "block_identity_verified": true,
+        "dependency_order_source": "native_protocol",
+        "dependency_timing_guard": true,
+        "runtime": "host_build_graph",
+        "scheduler_producer": "aicore",
+        "distributed_scheduler_verified": true,
+        "require_aicore_scheduler": true,
+        "host_capture": {
+          "status": "complete",
+          "expected_records": 107,
+          "recorded_records": 107,
+          "pool_records": 117,
+          "dropped_records": 0,
+          "error": null
+        },
+        "clock_alignment_status": "bounded",
+        "cross_domain_latency_available": true
+      }
+    },
+    {
+      "label": "readytrace-after-l4",
+      "mode": "l4",
+      "passed": true,
+      "device": 0,
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "ded082f20fc88f2e4fc093f7e106c1c50c32666e",
+        "simpler_branch": "feat/fully_distributed_within_core",
+        "tracked_diff_sha256": "6cdda7d76f25be61e22419720ba7f223736f3664e80f873444cd4c3da8a53612",
+        "runtime_sha256": {
+          "libhost_runtime.so": "5670ffc0833cef2d80a38238b24c1c7c60b527db874e18ff100eba0cf3e00117",
+          "libaicpu_kernel.so": "370d10d2234053583caa95a1ab4a7f45090c76a7a4690af46ed9c9b825f6c89f",
+          "aicore_kernel.o": "6e29b23a5d9224e4b5b6cd5e9f30ab527534dc909c36eabd67fbc15f8b080ba6"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 2,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "benchmark": null,
+      "trace": {
+        "logical_tasks": 79,
+        "physical_tasks": 2308,
+        "clock_freq_hz": 1000000000,
+        "level": 4,
+        "sequence_integrity_verified": true,
+        "event_count": 46733,
+        "worker_count": 96,
+        "protocol_verified": true,
+        "device_logical_tasks": 81,
+        "executions": 2308,
+        "cooperative_tasks": 61,
+        "member_obligations": 4640,
+        "blocks": 1457,
+        "execution_epoch": 1,
+        "per_kind_executions": {
+          "aiv": 1444,
+          "aic": 864
+        },
+        "dependency_edges_checked": 133,
+        "block_identity_verified": true,
+        "dependency_order_source": "native_protocol",
+        "dependency_timing_guard": true,
+        "runtime": "host_build_graph",
+        "scheduler_producer": "aicore",
+        "distributed_scheduler_verified": true,
+        "require_aicore_scheduler": true,
+        "host_capture": {
+          "status": "complete",
+          "expected_records": 107,
+          "recorded_records": 107,
+          "pool_records": 117,
+          "dropped_records": 0,
+          "error": null
+        },
+        "clock_alignment_status": "bounded",
+        "cross_domain_latency_available": true
+      }
+    },
+    {
+      "label": "readytrace-after-l1",
+      "mode": "l1",
+      "passed": true,
+      "device": 0,
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "ded082f20fc88f2e4fc093f7e106c1c50c32666e",
+        "simpler_branch": "feat/fully_distributed_within_core",
+        "tracked_diff_sha256": "6cdda7d76f25be61e22419720ba7f223736f3664e80f873444cd4c3da8a53612",
+        "runtime_sha256": {
+          "libhost_runtime.so": "5670ffc0833cef2d80a38238b24c1c7c60b527db874e18ff100eba0cf3e00117",
+          "libaicpu_kernel.so": "370d10d2234053583caa95a1ab4a7f45090c76a7a4690af46ed9c9b825f6c89f",
+          "aicore_kernel.o": "6e29b23a5d9224e4b5b6cd5e9f30ab527534dc909c36eabd67fbc15f8b080ba6"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 2,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "benchmark": null,
+      "trace": {
+        "logical_tasks": 79,
+        "physical_tasks": 2308,
+        "clock_freq_hz": 1000000000,
+        "level": 1,
+        "protocol_verified": false,
+        "execution_epoch": 1,
+        "per_kind_executions": {
+          "aiv": 1444,
+          "aic": 864
+        },
+        "dependency_edges_checked": 133,
+        "block_identity_verified": true,
+        "dependency_order_source": "kernel_timestamps",
+        "dependency_timing_guard": true,
+        "runtime": "host_build_graph",
+        "scheduler_producer": null,
+        "distributed_scheduler_verified": false,
+        "require_aicore_scheduler": false,
+        "host_capture": null,
+        "clock_alignment_status": null,
+        "cross_domain_latency_available": false
+      }
+    },
+    {
+      "label": "readytrace-after-bench-a",
+      "mode": "bench",
+      "passed": true,
+      "device": 0,
+      "identity": {
+        "runtime": "host_build_graph",
+        "fixture_id": "deepseek-v4-pro-csa-b4-s2-seed0-torch212",
+        "fixture_manifest_sha256": "d1511befaae48a3b692a723320a076064e2ebb1bced193175866c692f9909b45",
+        "torch": "2.12.0+cpu",
+        "simpler_commit": "ded082f20fc88f2e4fc093f7e106c1c50c32666e",
+        "simpler_branch": "feat/fully_distributed_within_core",
+        "tracked_diff_sha256": "6cdda7d76f25be61e22419720ba7f223736f3664e80f873444cd4c3da8a53612",
+        "runtime_sha256": {
+          "libhost_runtime.so": "5670ffc0833cef2d80a38238b24c1c7c60b527db874e18ff100eba0cf3e00117",
+          "libaicpu_kernel.so": "370d10d2234053583caa95a1ab4a7f45090c76a7a4690af46ed9c9b825f6c89f",
+          "aicore_kernel.o": "6e29b23a5d9224e4b5b6cd5e9f30ab527534dc909c36eabd67fbc15f8b080ba6"
+        },
+        "case_sources_match_baseline": true,
+        "hbg_orchestration_sha256": "0a516fb17e870b3872f54245a702e4235258aef8d18de4b98a0be57f656810f0",
+        "host_only_arguments": [
+          "hc_attn_scale"
+        ]
+      },
+      "correctness": {
+        "rounds": 3,
+        "outputs_per_round": 7,
+        "passed": true
+      },
+      "benchmark": {
+        "warmup": 5,
+        "rounds": 100,
+        "chip_swimlane_level": 0,
+        "metrics": {
+          "host_us": {
+            "min": 80154.292,
+            "median": 83473.111,
+            "mean": 84259.94622,
+            "max": 106273.367,
+            "samples": [
+              85270.631,
+              83069.201,
+              84203.377,
+              81804.043,
+              83173.135,
+              81842.457,
+              94623.474,
+              87947.272,
+              84903.62,
+              85054.181,
+              84879.44,
+              80734.275,
+              81222.508,
+              90347.061,
+              81619.121,
+              81787.204,
+              85152.893,
+              86672.978,
+              82712.492,
+              84008.987,
+              85759.175,
+              82018.587,
+              81268.63,
+              90949.399,
+              85394.725,
+              83386.592,
+              84071.557,
+              84632.191,
+              81516.981,
+              82786.378,
+              82696.775,
+              83145.672,
+              83559.63,
+              85177.501,
+              82653.646,
+              83109.42,
+              89591.927,
+              84483.597,
+              84183.776,
+              85965.501,
+              83287.657,
+              81647.916,
+              82839.519,
+              83673.896,
+              85634.653,
+              83625.146,
+              83385.254,
+              84915.224,
+              94633.439,
+              84424.05,
+              85934.559,
+              85769.515,
+              86884.346,
+              85168.694,
+              87074.078,
+              84179.706,
+              85078.584,
+              83886.576,
+              85841.062,
+              82152.897,
+              84037.117,
+              84639.407,
+              84820.404,
+              83200.772,
+              82488.36,
+              82207.515,
+              80828.488,
+              81781.797,
+              82958.412,
+              84108.068,
+              86618.74,
+              106273.367,
+              90488.903,
+              80986.524,
+              81385.04,
+              82147.8,
+              80817.63,
+              80448.522,
+              81226.085,
+              85806.5,
+              80689.22,
+              81656.26,
+              81519.152,
+              83052.416,
+              83254.118,
+              83574.427,
+              84082.457,
+              96146.987,
+              85483.013,
+              81465.748,
+              80651.962,
+              80386.926,
+              80639.774,
+              80154.292,
+              80522.842,
+              92159.641,
+              80185.345,
+              82976.948,
+              81076.967,
+              81629.895
+            ]
+          },
+          "device_us": {
+            "min": 2337.524,
+            "median": 2388.3845,
+            "mean": 2396.38652,
+            "max": 2526.266,
+            "samples": [
+              2391.007,
+              2365.498,
+              2402.025,
+              2381.008,
+              2412.554,
+              2386.024,
+              2419.558,
+              2406.283,
+              2396.578,
+              2347.061,
+              2375.5,
+              2374.838,
+              2375.097,
+              2351.603,
+              2434.167,
+              2378.131,
+              2383.6,
+              2398.727,
+              2424.13,
+              2388.937,
+              2362.893,
+              2421.692,
+              2386.61,
+              2424.448,
+              2369.524,
+              2408.888,
+              2365.391,
+              2370.797,
+              2430.93,
+              2371.868,
+              2398.801,
+              2407.364,
+              2508.371,
+              2447.832,
+              2371.424,
+              2407.396,
+              2389.183,
+              2373.81,
+              2399.675,
+              2361.887,
+              2387.214,
+              2520.663,
+              2387.427,
+              2426.714,
+              2385.642,
+              2360.428,
+              2406.337,
+              2390.374,
+              2361.812,
+              2407.465,
+              2462.719,
+              2419.126,
+              2407.193,
+              2372.071,
+              2337.524,
+              2392.091,
+              2404.591,
+              2362.916,
+              2363.049,
+              2413.755,
+              2375.127,
+              2518.905,
+              2380.154,
+              2393.296,
+              2379.843,
+              2382.743,
+              2421.998,
+              2378.794,
+              2409.441,
+              2373.824,
+              2381.042,
+              2363.388,
+              2383.705,
+              2442.587,
+              2526.266,
+              2384.75,
+              2401.261,
+              2369.371,
+              2348.568,
+              2382.318,
+              2386.975,
+              2396.707,
+              2393.077,
+              2363.577,
+              2451.928,
+              2346.216,
+              2370.657,
+              2380.237,
+              2389.407,
+              2395.824,
+              2390.081,
+              2466.513,
+              2365.846,
+              2384.167,
+              2390.956,
+              2387.832,
+              2412.295,
+              2461.682,
+              2400.028,
+              2367.045
+            ]
+          }
+        }
+      },
+      "trace": null
+    }
+  ]
+}

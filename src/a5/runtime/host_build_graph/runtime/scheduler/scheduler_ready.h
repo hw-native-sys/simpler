@@ -973,7 +973,7 @@ inline __aicore__ void scheduler_capture_execution_identity(
 
 inline __aicore__ bool scheduler_bootstrap_ready_batch_append(
     __gm__ void *scheduler_state_base, SchedulerLocalState *context, int64_t task_ref, SchedulerReadyBatch *batch,
-    SchedulerReadyStats *stats, uint64_t profiling_level = 0
+    SchedulerReadyStats *stats, uint64_t = 0
 ) {
     if (batch == nullptr || !scheduler_task_ref_valid(*context->config.graph, task_ref)) return false;
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
@@ -985,22 +985,6 @@ inline __aicore__ bool scheduler_bootstrap_ready_batch_append(
         scheduler_gm_store(tail->next_waiter, task_ref);
     }
     batch->tail = task_ref;
-    if (scheduler_phase_timing_enabled(profiling_level) &&
-        !scheduler_task_is_inline(scheduler_task_metadata_at(scheduler_state_base, context, task_ref)->flags)) {
-        __gm__ SchedulerTaskTrace *cells =
-            scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->profiling->trace_cells_offset);
-        const auto &metadata = *scheduler_task_metadata_at(scheduler_state_base, context, task_ref);
-        const uint64_t now = scheduler_cycles();
-        for (uint32_t block = 0; block < metadata.logical_block_num; ++block) {
-            for (uint8_t subtask = 0; subtask < 3; ++subtask) {
-                if ((metadata.active_mask & (1U << subtask)) == 0) continue;
-                auto &trace =
-                    cells[scheduler_task_trace_index(metadata.trace_index_base, metadata.active_mask, subtask, block)];
-                trace.ready_transition_cycles = now;
-                scheduler_writeback_cache_line(&trace.ready_transition_cycles);
-            }
-        }
-    }
     ++batch->count;
     if (stats != nullptr) ++stats->enqueue_count;
     return true;
@@ -1008,7 +992,7 @@ inline __aicore__ bool scheduler_bootstrap_ready_batch_append(
 
 inline __aicore__ bool scheduler_ready_batch_append(
     __gm__ void *scheduler_state_base, SchedulerLocalState *context, int64_t task_ref, SchedulerReadyBatch *batch,
-    SchedulerReadyStats *stats, uint64_t profiling_level = 0
+    SchedulerReadyStats *stats, uint64_t = 0
 ) {
     if (batch == nullptr || !scheduler_task_ref_valid(*context->config.graph, task_ref)) return false;
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(scheduler_state_base, context, task_ref);
@@ -1020,24 +1004,6 @@ inline __aicore__ bool scheduler_ready_batch_append(
         scheduler_gm_store(tail->next_waiter, task_ref);
     }
     batch->tail = task_ref;
-    if (scheduler_phase_timing_enabled(profiling_level) &&
-        !scheduler_task_is_inline(scheduler_task_metadata_at(scheduler_state_base, context, task_ref)->flags)) {
-        __gm__ SchedulerTaskTrace *cells =
-            scheduler_state_at<SchedulerTaskTrace>(scheduler_state_base, context->profiling->trace_cells_offset);
-        const auto *metadata = scheduler_task_metadata_at(scheduler_state_base, context, task_ref);
-        const uint8_t mask = metadata->active_mask;
-        const uint32_t trace_base = metadata->trace_index_base;
-        const uint64_t transition_cycles = scheduler_cycles();
-        for (uint32_t block = 0; block < metadata->logical_block_num; ++block) {
-            for (uint8_t subtask = 0; subtask < 3; ++subtask) {
-                if ((mask & (1U << subtask)) == 0) continue;
-                __gm__ SchedulerTaskTrace *trace = &cells[scheduler_task_trace_index(trace_base, mask, subtask, block)];
-                scheduler_observe_cache_line(&trace->ready_transition_cycles);
-                trace->ready_transition_cycles = transition_cycles;
-                scheduler_publish_cache_line(&trace->ready_transition_cycles);
-            }
-        }
-    }
     ++batch->count;
     if (stats != nullptr) ++stats->enqueue_count;
     return true;
@@ -1804,22 +1770,6 @@ inline __aicore__ bool scheduler_resolve_completion(
                 direct_claim->task_ref = waiter;
                 direct_claim->source = SchedulerReadySource::DIRECT_RESOLVE;
                 direct_claim->publication_mode = SchedulerPublicationMode::REFILL;
-                if (phase_timing_enabled && !scheduler_task_is_inline(metadata->flags)) {
-                    __gm__ SchedulerTaskTrace *cells = scheduler_state_at<SchedulerTaskTrace>(
-                        scheduler_state_base, context->profiling->trace_cells_offset
-                    );
-                    const uint64_t transition_cycles = scheduler_cycles();
-                    for (uint32_t block = 0; block < metadata->logical_block_num; ++block) {
-                        for (uint8_t subtask = 0; subtask < 3; ++subtask) {
-                            if ((metadata->active_mask & (1U << subtask)) == 0) continue;
-                            auto &trace = cells[scheduler_task_trace_index(
-                                metadata->trace_index_base, metadata->active_mask, subtask, block
-                            )];
-                            trace.ready_transition_cycles = transition_cycles;
-                            scheduler_writeback_cache_line(&trace.ready_transition_cycles);
-                        }
-                    }
-                }
             } else if (!scheduler_ready_batch_append(
                            scheduler_state_base, context, waiter, &batches[core_type], ready_stats, profiling_level
                        )) {
