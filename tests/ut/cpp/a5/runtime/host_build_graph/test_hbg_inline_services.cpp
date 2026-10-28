@@ -219,12 +219,16 @@ TEST(HbgInlineService, TwoBlocksThenDummyReleaseTheSuccessorExactlyOnce) {
     ASSERT_TRUE(fixture.enqueue(0));
     ASSERT_TRUE(fixture.fill());
     ASSERT_EQ(fixture.locals[1]->slots[0].task_ref, 0);
-    ASSERT_EQ(fixture.locals[1]->slots[1].task_ref, 0);
+    ASSERT_EQ(fixture.locals[1]->slots[0].block_idx, 0u);
+    ASSERT_EQ(fixture.locals[1]->slots[1].state, SchedulerDispatchSlotState::FREE);
     ASSERT_TRUE(fixture.complete(1, 0));
     EXPECT_EQ(fixture.locals[1]->pending_completed, 0u);
     EXPECT_NE(scheduler_gm_load(fixture.control(1).state), static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(fixture.control(2).waiting_producer, 1);
-    ASSERT_TRUE(fixture.complete(1, 1));
+    ASSERT_TRUE(fixture.fill());
+    ASSERT_EQ(fixture.locals[1]->slots[0].task_ref, 0);
+    ASSERT_EQ(fixture.locals[1]->slots[0].block_idx, 1u);
+    ASSERT_TRUE(fixture.complete(1, 0));
     ASSERT_TRUE(fixture.fill());
     EXPECT_EQ(scheduler_gm_load(fixture.control(1).state), static_cast<int64_t>(SchedulerTaskState::DONE));
     EXPECT_EQ(fixture.locals[1]->pending_completed, 2u);

@@ -236,7 +236,7 @@ inline __aicore__ bool scheduler_fill_ordered_slots(
             if (scheduler_task_ref_is_null(admission->current_task_ref)) continue;
             return progress;
         }
-        for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT; ++index) {
+        for (uint32_t index = 0; index < SCHEDULER_PENDING_SLOT_COUNT && local->local_ready_mask == 0; ++index) {
             if (local->slots[index].state != SchedulerDispatchSlotState::FREE) continue;
             const auto claim_result = scheduler_claim_ordered_block(graph, base, local, run, index);
             if (claim_result == SchedulerBlockClaimResult::ERROR) {
