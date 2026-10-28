@@ -1,8 +1,10 @@
 # a5 HBG resident 调度器支持 SPMD 设计（per-core 版）
 
 > 面向：simpler 仓库的 runtime 开发者与本设计的评审者。
-> 状态：**已实现**（S0 / S1 / S2 全部落地，最后一个 commit 是 `d1ebfd1dc`）。功能面
-> C++ UT、a5sim、a5 上板全绿；**性能未测**，见 §13「还没做的事」。
+> 状态：**已实现，但性能未达预期**。S0 / S1 / S2 全部落地（最后一个 commit 是
+> `d1ebfd1dc`），功能面 C++ UT、a5sim、a5 上板全绿。**但多 SPMD 任务的负载上，resident
+> 比它取代的 legacy AICPU 调度慢 6~9 倍**（§10.2 实测）——这条分支的卖点目前没有兑现。
+> 读本文前先读 §10.2 的那张表。
 > 本稿**取代**基于 cluster-scheduler 模型的旧稿。
 > 范围：a5 架构 `host_build_graph` 的 resident AICore 调度器。
 >
@@ -1300,7 +1302,42 @@ S0 单独合入的价值与阶段 0（改名）相同：它是可验证的零行
 | 走的是 resident 而非 legacy | `@pytest.mark.scheduler_mode("resident")`（阶段 A2 的 conftest fixture，`tests/st/a5/host_build_graph/conftest.py`） | 每个用例无条件校验，且 `published == 0` 也算失败 |
 | block 真的铺开了 | chip_swimlane 的每 block 一条记录（§7.3），distinct `worker_id` | 阈值按 run 自报的 `num_cores` 推导，照 `fanout_imbalance` 的 `test_fanout_spread_is_wide` 写法，**自建 Worker 自开 swimlane**，不能用 `if level == 0: return` 那种会静默跳过的形态 |
 | 日志里不再出现回退 | `A5 HBG: retaining AICPU scheduling ... with SPMD or sync-start shape` | S1 后对 non-sync_start 图不得出现 |
-| 端到端性能真的改善 | 同一用例改前（legacy）/ 改后（resident）对照 | 口径照 progress §0.5「控制变量」：同一张卡、`--rounds 100`、Trimmed Avg、剔零轮与首轮、2% 以内不算信号 |
+| 端到端性能真的改善 | 同一用例改前（legacy）/ 改后（resident）对照 | **已测，结论是大幅变慢** —— 见下 |
+
+#### 性能实测（2026-10-28，`30e5302d` ↔ `1b4a1c2d`）
+
+口径照 progress §0.5：同一张卡、一次 task-submit 分配内交替跑、每侧 3 个独立样本、
+Trimmed Avg `device_wall`、**两侧区间不重叠才算信号**（不是比均值差）。
+
+**多 SPMD 任务的负载上，resident 比 legacy 慢 6~9 倍。**
+
+| 用例 | 基线 legacy AICPU | 当前 resident AICore | 变化 |
+| ---- | ----------------: | -------------------: | ---: |
+| `spmd_mixed_waves::waves_4x8` | 853 / 854 / 855 us | 5374 / 5930 / 5420 us | **+553%** |
+| `spmd_mixed_waves::waves_4x8_shifted` | 847 / 846 / 848 us | 5696 / 6013 / 5631 us | **+582%** |
+| `spmd_mixed_waves::waves_40x24_stress` | 17.6 / 17.8 / 17.6 ms | 166 / 165 / 166 ms | **+838%** |
+
+组内散布 0.18~0.78%，三个 case 方向一致。**这正是 §12 ⑤ 预言过的那笔代价**：每波 8 种
+形状、任务之间相互独立，而全局 SPMD 队列队首唯一，本可并发的任务被排成了队。当时的决定是
+"先保证功能，可并发的 block 认领留作后续的独立设计"——现在那笔代价有数字了。
+
+> **机制尚未钉死。** 上面只有"负载形状吻合 + 本文自己的预言"，没有直接证据。另一个同样
+> 说得通的嫌疑是 O-7 的队首轮询开销（每核每轮一次 `ld_dev` 加一次 metadata observe，在
+> 40×24 这种规模下很贵）。**动手修之前先开 swimlane 确认是哪一个**，否则可能修错地方。
+
+非 SPMD 的负载没有退化。`tools/benchmark_rounds.sh` 的 a5/HBG 列表里 8 个 case 全部测过，
+三处真改善（`batch_paged_attention` −5.7%、`paged_attention_unroll_manual_scope` Case2
+−4.1%、`alternating_matmul_add` −1.0%），其余区间重叠判不出。其中
+`alternating_matmul_add` 这一条顺带回答了「取消自领预取有没有代价」：**没有，反而快了**。
+
+> **这张列表测不到 SPMD，别拿它当 SPMD 的验收。** 8 个 case 里 7 个 `block_num` 全是 1，
+> 唯一有 SPMD 的 `qwen3_14b_decode` 走 `rt_submit_graph` → `TaskKind::GRAPH` → **两侧都回退
+> legacy**（§14），所以它在那张表里只是占位。SPMD 的对照要自己造：把当前的用例目录拷进
+> 基线 worktree 就能跑，基线运行时会拒掉 SPMD 形状、自然回退 legacy。
+>
+> **`spmd_paged_attention` 不是合格的 SPMD 验收负载**，尽管它是唯一两侧都存在的。它只有
+> 一个 SPMD 任务（§10.4 早就写过这句），调度开销被 24 个 block 的计算淹没，测出来是
+> −1%~−3% 的"没变慢"，与多任务负载上的 6~9 倍截然相反。**用它下结论会得到完全错误的答案。**
 
 **CSA 用例是天然的验收负载**（progress F-6）：它整图因 SPMD 回退 legacy，其门禁
 `run.py l4 -d 0 --require-aicore-scheduler` 现在**必须失败**，S1 后应当**转为通过** ——
@@ -1482,6 +1519,12 @@ LD_LIBRARY_PATH=/opt/gcc-15/lib python -m pytest tests/st/a5/host_build_graph --
 > 这就是方案的主要吞吐瓶颈。**仍然这么做**：先保证功能，可并发的 block 认领留作后续的
 > 独立设计。所以不要把"队首唯一"当成可以顺手放宽的性能项去改 —— 它同时承担互斥、
 > 认领失败的处置、cohort 不饿死三件事（§4.2），放宽等于重做 §6~§8。
+>
+> **这笔代价 2026-10-28 测出来了：6~9 倍**（§10.2 的性能实测）。预言的形状和实测的形状
+> 完全对上——`spmd_mixed_waves` 每波 8 种相互独立的形状，正是"大多相互独立"那一类。
+> 上面"仍然这么做"的决定当时是对的（功能优先），但**它现在是这条分支最大的未结事项**，
+> 不再是一个抽象的权衡。下一步见 §8.1 末尾的 ticket 全序路线——那条当时写着"不要先于
+> 双发射做"，而双发射已经落地，时机到了。
 > ⑥ **非 SPMD 任务不设哨兵**：它就是「第 0 块，共 1 块」。初版的
 > `SCHEDULER_BLOCK_IDX_NONE = UINT16_MAX` 已撤销，判据是 `block_num > 1`（§7.1）。
 > 本稿初版曾设想一个 8 entry 的 claim board，已整体撤销 —— 它的全部收益都建立在"多个任务
@@ -1533,13 +1576,14 @@ source .venv/bin/activate && pip install --no-build-isolation -e .   # HEAD 动�
 | | |
 | --- | --- |
 | 代码 | **S0 / S1 / S2 全部完成并提交**，最后一个是 `d1ebfd1dc` |
-| 性能 | **未测。** 两步都是行为变化——S2 的第一步取消了自领预取，第二步让 Mix 走统一次序——而"预取在本核上零收益"是论证不是实测。口径照 progress §0.5 的控制变量，对 merge-base 做 A/B |
+| 性能 | **已测（2026-10-28）。非 SPMD 负载无退化、三处改善；但多 SPMD 任务负载上 resident 比 legacy 慢 6~9 倍**，见 §10.2。这是这条分支最大的未结事项，机制尚未钉死 |
 | 用例 | 按用户决定**先做功能、暂不移植** TMR 用例（§10.4 存了调查结论） |
 | 开放项 | O-6 / O-7 / O-8 仍未实测 |
 | 既存缺陷 | `KNOWN_ISSUES.md` 里两条与本设计无关但会在全量里显红：`dfx` 的 `clock_alignment` 断言、`paged_attention::Case2` 缺 `ring_task_window`。两条都做过基线对照 |
 
-**接手第一件事是量性能**，因为功能面已经全绿，而两步改造动的都是每个核每轮的取任务节奏。
-per-core 那组 A/B 里 `benchmark_bgemm` +12.9%、`fanout_imbalance` +11.3% 说明这个量级看得见。
+**接手第一件事是把那 6~9 倍的机制钉死**：§10.2 只给出了现象和一个吻合的预言，没有直接
+证据。开 swimlane 看那些 SPMD 任务是不是真的被队首串行化了，还是 O-7 的队首轮询开销。
+修之前先分清，否则可能修错地方。
 
 ## 14. 不在范围
 
