@@ -143,7 +143,12 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_waiter) / 64);
     EXPECT_NE(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, next_fanin_index) / 64);
     EXPECT_EQ(offsetof(SchedulerSsbufLane, mix_completion), 0x00u);
-    EXPECT_EQ(sizeof(SchedulerSsbufLane), 0x40u);
+    // The lane carries both directions of the handoff: the two dispatch slots
+    // the coordinator fills, the index the lane flips to take one up, and the
+    // completion it reports back.
+    EXPECT_EQ(offsetof(SchedulerSsbufLane, dispatch), 0x20u);
+    EXPECT_EQ(offsetof(SchedulerSsbufLane, current), 0x60u);
+    EXPECT_EQ(sizeof(SchedulerSsbufLane), 0x80u);
     EXPECT_EQ(
         offsetof(SchedulerTaskTrace, dispatch_start_cycles) / 64, offsetof(SchedulerTaskTrace, complete_loop_iter) / 64
     );
@@ -166,9 +171,12 @@ TEST(SchedulerSsbuf, InitializesDirtyMailboxWithoutTouchingUserStorage) {
     EXPECT_EQ(reinterpret_cast<uint8_t *>(region) - hardware.data(), SCHEDULER_SSBUF_REGION_OFFSET);
     EXPECT_TRUE(scheduler_ssbuf_is_initialized(region));
     for (uint32_t lane = 0; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane) {
-        for (uint32_t slot = 0; slot < SCHEDULER_MIX_SLOT_COUNT; ++slot) {
-            EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->mix_dispatch[lane][slot].publication), 0u);
-        }
+        // Both slots start unpublished and the index starts at 0, so the slot
+        // a coordinator may write is slot 1 and nothing reads as a dispatch.
+        for (uint32_t slot = 0; slot < SCHEDULER_LANE_SLOT_COUNT; ++slot)
+            EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].dispatch[slot].publication), 0u);
+        EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].current), 0u);
+        EXPECT_TRUE(scheduler_lane_pending_slot(region, lane));
         EXPECT_EQ(scheduler_ssbuf_load_relaxed(&region->lanes[lane].mix_completion.publication), 0u);
     }
     EXPECT_EQ(hardware[SCHEDULER_SSBUF_REGION_OFFSET - 1], 0xa5);
@@ -479,7 +487,7 @@ TEST(SchedulerBlockIndex, ASingleBlockTaskIsBlockZeroOfOne) {
     EXPECT_EQ(SchedulerLocalSlotState{}.block_num, 1U);
     // A claim written positionally still defaults its block fields, which is
     // what keeps every existing dispatch site unchanged.
-    const SchedulerFreeSlotClaim positional{3, 1, 7, 2, true};
+    const SchedulerFreeSlotClaim positional{3, 7, 2, true};
     EXPECT_EQ(positional.block_idx, 0U);
     EXPECT_EQ(positional.block_num, 1U);
     // Block 0 of 1 lands exactly where a task with no block concept landed.

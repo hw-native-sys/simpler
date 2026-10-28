@@ -1,11 +1,15 @@
 # a5 HBG resident 调度器支持 SPMD 设计（per-core 版）
 
 > 面向：simpler 仓库的 runtime 开发者与本设计的评审者。
-> 状态：设计稿，尚未实现。本稿**取代**基于 cluster-scheduler 模型的旧稿。
+> 状态：**已实现**（S0 / S1 / S2 全部落地，最后一个 commit 是 `d1ebfd1dc`）。功能面
+> C++ UT、a5sim、a5 上板全绿；**性能未测**，见 §13「还没做的事」。
+> 本稿**取代**基于 cluster-scheduler 模型的旧稿。
 > 范围：a5 架构 `host_build_graph` 的 resident AICore 调度器。
 >
-> **基线**：分支 `a5-hbg-per-core-phase-a` @ `872591b7`（per-core 改造阶段 1 + D1b + D3a 已落地）。
-> 文内行号一律按此 commit，repo 相对路径。per-core 改造本身见
+> **行号已全部作废。** 文内 `file:line` 原按 `872591b7` 写，而 S0~S2 大改过
+> `scheduler_ready.h` / `scheduler_types.h` / `scheduler_completion.h` /
+> `aicore_executor.cpp`，多个符号名也已不存在（见 §13）。**引用任何符号前先 grep。**
+> per-core 改造本身见
 > [a5-hbg-per-core-scheduler-plan.md](a5-hbg-per-core-scheduler-plan.md) 与
 > [a5-hbg-per-core-scheduler-progress.md](a5-hbg-per-core-scheduler-progress.md)。
 >
@@ -78,7 +82,7 @@ block"。改造已落地，但它同时改掉了旧稿赖以成立的另外几�
 | 3.7 | **跨核 RMW 字段只能放 TaskControl 第一条线**，且该线不得被 `publish_cache_line` 整线发布 | **新增**（progress §7.10 的结论） |
 | 3.8 | GM 的**读改写**原语只有 64 位：`scheduler_gm_fetch_add` / `_fetch_or` / `_fetch_and` **只有 `uint64_t`** 一个重载，CAS 有 `int64_t`+`uint64_t`（`scheduler_memory.h:195-258`）。非 RMW 的 store/load **有 32 位形式**（`scheduler_gm_store(uint32_t&)`@175、`scheduler_gm_query_u32_pair`@137），所以不能由本条推出"32 位共享字段不存在"。`scheduler_gm_query` 走 `ld_dev` 绕过标量 DCache，读一致、无需 invalidate | **新增**。所有新增**计数器**一律 `uint64_t` |
 | 3.9 | **一个核在 `execute_task` 内部时整个调度循环停摆** —— 它不取任务、不服务完成、不读 SPMD 队首。sync_start 的 block 在 barrier 上自旋就处于这个状态 | **新增**。§8.1 的直填旁路与"每核 ≤1 块"都源于此 |
-| 3.10 | 本核就绪槽按 **generation 最小**优先执行（`scheduler_local_ready_pop`，`scheduler_ready.h:450-467`），generation 是本核单调递增的 `dispatch_sequence` | **新增**。曾被当作「两个 cohort 不互锁」的依据，**那条链已于 2026-10-27 实测证伪**（§8.1）：自有槽与 mix 槽是两套独立的 generation 序列，执行器又无条件先取自有槽，所以本条只在单一通道内成立。信箱模型落地后次序由 running / 信箱本身表达，generation 只剩完成匹配一个用途 |
+| 3.10 | 本核就绪槽按 **generation 最小**优先执行（`scheduler_local_ready_pop`，`scheduler_ready.h:450-467`），generation 是本核单调递增的 `dispatch_sequence` | **新增**。曾被当作「两个 cohort 不互锁」的依据，**那条链已于 2026-10-27 实测证伪**（§8.1）：自有槽与 mix 槽是两套独立的 generation 序列，执行器又无条件先取自有槽，所以本条只在单一通道内成立。滚动槽落地后次序由 running 与那两个槽本身表达，generation 只剩完成匹配一个用途 |
 
 ## 4. 调度模型：队首即认领对象，任务自身游标作权威
 
@@ -609,12 +613,12 @@ ticket 已开跑"**。于是任一时刻**最多一个 cohort 处于累积态**�
 | 新增状态 | — | 全局位图 + allocator 选举 | 每 cohort 一个 ticket |
 | 与现有结构的距离 | — | 远 | **近，是现有设计的推广** |
 
-**不要先于槽模型改造做。** 信箱模型解决"同一个核上的义务次序"，ticket 解决"多个 cohort 之间"，
-两者正交**但有依赖**：ticket 的归纳同样要靠"核内 FIFO、前面的更老"，而那正是信箱模型提供的。
+**不要先于槽模型改造做。** 滚动槽解决"同一个核上的义务次序"，ticket 解决"多个 cohort 之间"，
+两者正交**但有依赖**：ticket 的归纳同样要靠"核内 FIFO、前面的更老"，而那正是滚动槽提供的。
 槽模型未统一之前上 ticket，等于在两个不稳的地基上同时施工。
 
 路线 B 的收益是**吞吐**（cohort 运行态可重叠），**需要上板基线才能判断值不值得**。建议次序：
-上板基线 → 信箱模型 → 量 cohort 串行的实际代价 → 代价显著再上 ticket。
+上板基线 → 滚动槽 → 量 cohort 串行的实际代价 → 代价显著再上 ticket。
 
 #### C1 必然完成：这条链是错的（2026-10-27 实测证伪）
 
@@ -649,7 +653,7 @@ ticket 已开跑"**。于是任一时刻**最多一个 cohort 处于累积态**�
 > （不会主动放弃）看到的是**无界延迟**，期间它的 AIC 子任务一直占着核空转；要得到永久挂死，
 > 需要后继 cohort 也依赖被 C1 占住的核。那个形状**尚未构造**。
 >
-> 正确的修复不是在现有槽模型上加判据，而是**换掉槽模型**：见下面的「执行位 + 跨核信箱」。
+> 正确的修复不是在现有槽模型上加判据，而是**换掉槽模型**：见下面的「每 lane 两个槽 + 一个滚动位」。
 
 下面是原来的链，**保留作为被证伪的记录**：
 
@@ -666,23 +670,26 @@ block 可能还在槽里排队未执行，所以"C1 必然凑齐"需要一条链
 sync_start 的正确性：X 先跑 C2 块等 C2 齐、Y 先跑 C1 块等 C1 齐，各自的另一半压在对方的
 第二个槽里。
 
-#### 执行位 + 跨核信箱（2026-10-27 决定，取代 §8.1 第 2 条的扫槽判据）
+#### 每 lane 两个槽 + 一个滚动位（2026-10-28 落地，取代 §8.1 第 2 条的扫槽判据）
 
-> 本节一度叫「双发射槽模型」。那个名字把它读成一条两级发射队列，而它不是：深度是
-> **1 个执行位 + 1 个跨核信箱**，信箱只为 Mix 存在。照「两个对等的槽轮流发」去实现，
-> 会在「谁能写第二个槽」上重新撞回单写者问题。
+> 本节先后叫过「双发射槽模型」和「执行位 + 跨核信箱」。前者把它读成两级发射队列；后者
+> 设想的是深度 1 的信箱加 `published`/`consumed` 两个字握手，**实现时发现那个形状是错的**
+> —— 协调者只有一份记录，放第二个 Mix 时会把正在运行那个的记录覆盖掉。下面是实际落地的
+> 形状，与前两版都不同。
 
-上面那条被证伪的链说明问题不在判据，在**槽模型本身**。现在是按类别分的四个槽
+上面那条被证伪的链说明问题不在判据，在**槽模型本身**。改造前是按类别分的四个槽
 ——`slots[2]`（自有）加 `mix_slots[lane][2]`（协调者持有）——一个核最多压四个义务，
-而执行器对类别有**无条件偏好**（`aicore_executor.cpp:406-461` 取到自有槽就执行并
-`continue`，mix 扫描在 `:472`）。正是"按类别排序"造出了那个洞。
+而执行器对类别有**无条件偏好**（取到自有槽就执行并 `continue`，mix 扫描在其后）。
+正是"按类别排序"造出了那个洞。
 
-换成：每核一个 `running`（执行位）加一个 `pending`（跨核信箱），不分类别，
-**信箱优先于自领**，`running` 空出后由 `pending` 晋升。
+换成：**每核一个 `running` 执行位；每条 AIV lane 另有两个槽和一个滚动位 `current`。**
+owner 跑的是它自己的 `running`，协调者填的是 `current` **没有**指向的那个槽。owner 取走
+一个派发时把位翻过来——**这一次写同时完成"晋升 pending"和"释放旧槽"两件事**。
+不分类别，**晋升优先于自领**。
 
-**「信箱优先于自领」是这次改造的目的，不是一条防御性判据。** 没有它，Mix 子任务照样排在
-无界的自领工作后面 —— 那正是 `spmd_cohort_with_ordinary` 复现的积压饿死。下面「实现清单」
-第 3 条是它的落点。
+**「晋升优先于自领」是这次改造的目的，不是一条防御性判据。** 没有它，Mix 子任务照样排在
+无界的自领工作后面 —— 那正是 `spmd_cohort_with_ordinary` 复现的积压饿死。它由**循环次序**
+保证：晋升排在所有认领之前，所以走到自领时 `running` 仍空，就意味着当时没有待晋升的东西。
 
 ##### 谁能写什么
 
@@ -690,30 +697,42 @@ sync_start 的正确性：X 先跑 C2 块等 C2 齐、Y 先跑 C1 块等 C1 齐�
 
 | 字 | **唯一**写者 | 条件 |
 | ---- | ---- | ---- |
-| `running` | **owner 自己**（自领、晋升或直填） | 自领仅当**本地完全空**（running 与信箱都空） |
-| `pending.published` | **本 cluster 的协调者** | Mix 放置时要求**三条 lane 的信箱都已被取走**，全或无 |
-| `pending.consumed` | **owner 自己** | 晋升之后回写，等于告诉协调者信箱空了 |
+| `running` | **owner 自己**（自领、晋升或直填） | 自领仅当 `running` 空，而晋升已经在它之前跑过 |
+| lane 的 `dispatch[current ^ 1]` | **本 cluster 的协调者** | 放置时判**自己的记录** `mix_placed[lane][current ^ 1]` 是否 FREE |
+| lane 的 `current` 位 | **owner 自己** | 取走一个派发时翻转 |
+| lane 的 `mix_completion` | **owner 自己** | 按槽打包两个 generation |
 
-**协调者不写 `running`，即使它看到 running 是空的。** 这一条是整个模型无锁的来源：
-两个字各有唯一写者，不需要原子操作。让协调者走"running 空就直接填"的捷径，就会和 owner
-的自填撞在同一个字上，单写者性质立刻消失。代价只是空 running 的核多等一轮晋升。
+**协调者不写别人的 `running`，即使它看到那是空的。** 这一条是整个模型无锁的来源：每个字
+各有唯一写者，不需要原子操作。让协调者走"running 空就直接填"的捷径，就会和 owner 的自领
+撞在同一个字上，单写者性质立刻消失。代价只是空 running 的核多等一轮晋升。
 
-**owner 也不写 `pending.published`，清空信箱同样不行。** 晋升之后「信箱空了」这件事由
-第三个字表达：owner 把它刚取走的那个 `published` 值**原样回写**进 `consumed`，协调者放置
-前判的是 `consumed == published`。少了这个字，最自然的写法 —— owner 顺手把 `published`
-清零 —— 会让它有两个写者。这是**回收**，与下面「撕裂」那条讲的**发布**不是一回事，
-两边都要有协议。
+**lane 0 不走这条交接。** 协调者的 AIC 子任务直接坐进它自己的 `running` —— 它就是那条 lane
+的 owner，自己写自己不违反上面任何一条。所以只有两条 AIV lane 有滚动槽。
 
-**回写的是值，不是一个忙闲标志位。** 标志位有**丢发布**的竞态：协调者写 `published = G`，
-owner 还没观察到，标志位仍是上一轮留下的「空」，协调者下一轮又判为空，于是把 `G'` 盖在
-没被取走的 `G` 上。那个 Mix 任务就此消失 —— fanin 已解、任务永不执行、没有任何核报错，
-正是 `.claude/rules/running-onboard.md` 那张表里最难归因的「假死锁」签名。协调者自己记得
-发过什么也补不上这个窗口：它缺的恰好是「对方取没取」，而标志位分不清「这一次取的」和
-「上一次取的」。要分清就得让 owner 的写带序，哪怕只有 1 bit 翻转 —— 那已经是 generation
-的退化形式，不如直接回写 64 位原值。
+**放置判的是协调者自己的记录，不是那个位。** 位在"已写入、未被取走"的整个窗口里不动，
+只看位会让第二次放置盖掉第一次没被取走的发布 —— 那个 Mix 任务就此消失，fanin 已解、
+任务永不执行、没有任何核报错，正是 `.claude/rules/running-onboard.md` 那张表里最难归因的
+「假死锁」签名。记录是协调者独占写的本地状态，判它精确且无竞态；记录在**协调者处理完那份
+的完成**时才置回 FREE。
 
-**`consumed` 放 `SchedulerSsbufLane::reserved`**：与 `mix_completion` 同结构、同方向、
-同写者（owner 写，协调者轮询），布局零增长。
+> **按槽成对，是这个模型最容易写错的地方。** 一条 lane 同时有两个派发在飞——一个在
+> `running` 里跑，一个在另一个槽里备好——所以**每 lane 的每一样东西都必须是两份**：
+> SSBUF 控制字、协调者的记录、payload 缓冲、executor trace。`current ^ 1` 这一个索引同时
+> 决定这四者的位置。
+>
+> 落地时这条连错三次，每次都要一轮 sim 才暴露，而且症状各不相同：
+>
+> | 收成一份的东西 | 症状 |
+> | ---- | ---- |
+> | 协调者记录 | `site=74`，完成的 generation 对不上记录 |
+> | `mix_completion` 单字 | `site=102` 静默挂死：lane 先后完成两个派发，第二个报告覆盖第一个，被覆盖的那个永不关闭 |
+> | payload 缓冲 | **无任何错误码**，golden 少掉 1/16 —— 协调者给 pending 构造 payload 时覆盖了 lane 正在执行的那一份 |
+>
+> 判据：**凡是按 lane 索引、且生命周期跨越「派发到完成」的结构，都要按槽成对。**
+> 唯一的例外是 `mix_completion` 的 inbox 本身——它是一个字，但里面按槽打包两个 generation。
+
+边界两条，都安全：一条 lane 只属于一个 cluster，所以它的两个槽只有一个协调者会写；
+`current` 位只有那条 lane 自己会翻。
 
 > **GM 那条「第二条线被整线回写会还原旧副本」的陷阱（约束 3.7、progress §7.10）在 SSBUF
 > 上不存在。** SSBUF 的读写就是一条 volatile 访存加 `dsb` 定序（`scheduler_ssbuf.h` 的
@@ -721,21 +740,15 @@ owner 还没观察到，标志位仍是上一轮留下的「空」，协调者�
 > 写在这里，是因为从 §7.10 过来的读者很容易把那条陷阱外推到 SSBUF，然后为了躲一个不存在
 > 的问题去拆结构。
 
-边界两条，都安全：一条 lane 只属于一个 cluster，所以 `published` 只有一个协调者会写；
-lane 0 的 owner 就是协调者本人，它自己的信箱由自己写，没有跨核。**lane 0 仍然走信箱**，
-不开「协调者直接填自己 running」的捷径 —— 否则三条 lane 的放置条件各不相同，全或无就要
-分两种写法。
+##### 滚动槽只为 Mix 存在，而自领不预取并不是代价
 
-##### 信箱只为 Mix 存在，而自领不预取并不是代价
+那两个槽的存在理由只有一个：**协调者不能写别人的 `running`，需要一个地方把 Mix 子任务
+放下，等 owner 自己来取。** 没有 Mix 的图里它们一次都不被使用，所以整套照 `has_mix` 门控
+（形状与 `has_spmd` 相同，§5.4），常态下一个字都不读。
 
-`pending` 的存在理由只有一个：**协调者不能写 `running`，需要一个地方把 Mix 子任务放下，
-等 owner 自己来取。** 没有 Mix 的图里它一次都不被使用，所以它照 `has_mix` 门控（形状与
-`has_spmd` 相同，§5.4），常态下一个字都不读。
-
-于是**普通任务的深度就是 1**。今天不是：`scheduler_fill_own_slots`（`scheduler_dispatch.h`）
-是一个遍历 `SCHEDULER_PENDING_SLOT_COUNT` 的循环，一趟把所有 `FREE` 槽都填掉，所以一个核
-一轮能从 inbox 领走两个任务。它看起来像流水，但核一进 `execute_task` 整个调度循环就停摆
-（约束 3.9），取和构造没有任何东西能与执行重叠：
+于是**普通任务的深度就是 1**。改造前不是：`scheduler_fill_own_slots` 是一个遍历自有槽数的
+循环，一趟把所有 `FREE` 槽都填掉，所以一个核一轮能从 inbox 领走两个任务。它看起来像流水，
+但核一进 `execute_task` 整个调度循环就停摆（约束 3.9），取和构造没有任何东西能与执行重叠：
 
 ```text
 取A、取B → 构造A → 构造B → 执行A → 执行B
@@ -752,20 +765,23 @@ lane 0 的 owner 就是协调者本人，它自己的信箱由自己写，没有
 与构造时，那条 lane 的 AIV 正在跑第一个 —— **这是两个核真并行**，第二个位置买到的是
 实打实的不空档。所以 `SCHEDULER_MIX_SLOT_COUNT = 2` 有它的理由，不是和自有槽一样的遗留。
 
-信箱模型把这个深度**原样保留**：
+滚动槽把这个深度**原样保留**：
 
 ```text
-今天： mix_slots[lane][0] 在跑     mix_slots[lane][1] 已备好
-信箱： running 在跑（Mix 子任务）  pending 信箱里已备好
+改造前： mix_slots[lane][0] 在跑        mix_slots[lane][1] 已备好
+落地后： running 在跑（Mix 子任务）     dispatch[current ^ 1] 已备好
 ```
 
 变的不是深度，是**那两个位置不再是 Mix 专属** —— `running` 既可能是 Mix 子任务也可能是
 普通任务，于是普通活不能再无限插到 Mix 子任务前面。这正是本节要解的那个饿死。
-**读到「预取没有收益」时不要顺手把信箱也砍掉**：那句话只对同核的预取成立。
+**读到「预取没有收益」时不要顺手把滚动槽也砍掉**：那句话只对同核的预取成立。
 
 依赖链不受影响：完成路径解出的后继**直填进 `running`**（刚空出的就是它），这是 owner
-写自己的字，不经过队列也不空转一轮。前提是信箱为空 —— 信箱非空时那个位置属于晋升，
-后继照常入队。
+写自己的字，不经过队列也不空转一轮。
+
+> **一个落地时才看见的差异。** 一条 lane 的第二个槽只有在它**取走第一个之后**才空出来，
+> 所以一个 cluster 的 Mix 放置是「放一个、等翻位、再放一个」，而不是一趟放两个。稳态吞吐
+> 不变（仍是一个在跑、一个备好），但冷启动时第二个 Mix 要多等一轮。量性能时盯着它。
 
 ##### 为什么不死锁
 
@@ -775,9 +791,9 @@ lane 0 的 owner 就是协调者本人，它自己的信箱由自己写，没有
 普通任务（更老的 cohort 不存在）⇒ 普通任务必然终止 ⇒ 它的块全部进入 running ⇒ 凑齐 ⇒
 完成 ⇒ 释放核 ⇒ 次老的同理。依次解开。
 
-**gap 3 被消除**：AIV 欠着 Mix 子任务时本地不空，没有资格自己领 AIV-only cohort 的块。
-**Mix↔Mix 同槽号的隐患也消失**：三条 lane 全空的要求使同一 cluster 同时最多一个 Mix
-任务 pending，不存在两条 lane 挑到不同槽号。
+**gap 3 被消除**：AIV 欠着 Mix 子任务时 `running` 不空，没有资格自己领 AIV-only cohort
+的块。**Mix↔Mix 同槽号的隐患也消失**：协调者只往每条 lane 的 `current ^ 1` 写，而那个位
+由 lane 自己翻，不存在两条 lane 挑到不同槽号。
 
 ##### 这条归纳依赖什么
 
@@ -794,91 +810,85 @@ lane 0 的 owner 就是协调者本人，它自己的信箱由自己写，没有
 
 ##### 四个并发问题，分别处置
 
-owner 写 `running` 与协调者写 `pending.published` **会同时发生**，但不是同一个字的写-写
+owner 写 `running` 与协调者写那条 lane 的另一个槽**会同时发生**，但不是同一个字的写-写
 冲突。真正要处理的是另外四件：
 
 | 问题 | 是否发生 | 处置 |
 | ---- | ---- | ---- |
-| 同字写-写 | **否** | 前提是协调者不写 running、owner 不写 `published` |
+| 同字写-写 | **否** | 前提是协调者不写别人的 running、owner 不写 `dispatch[]` |
 | **次序倒置**（TOCTOU） | **会** | 见下，不致死锁 |
 | **撕裂** | **会** | 必须单字发布 |
-| **回收** | **会** | 第三个字 `consumed`，见上方「谁能写什么」 |
+| **重复放置** | **会** | 判协调者自己的记录而不是那个位，见上方「谁能写什么」 |
 
-**次序倒置**：两边的前置检查都是"读—判断—写"，中间有窗口 —— owner 读到本地空、同时协调者
-读到 pending 空，结果是 `(running=自领的 X, pending=C)`，而 C 可能比 X 更早被决定放置。
+**次序倒置**：两边的前置检查都是"读—判断—写"，中间有窗口 —— owner 读到 `running` 空、
+同时协调者读到自己的记录空，结果是 `(running=自领的 X, 另一个槽=C)`，而 C 可能比 X 更早
+被决定放置。
 
 它**不致死锁，前提是 A1 在**：队首唯一 ⇒ 同一时刻只有一个 cohort 在被领取；A1 又保证队首在
 上一个 cohort 最后一块派发完成前不动 ⇒ **两个 cohort 不可能并发获取** ⇒ 被倒置挤到前面的 X
 只可能是普通任务 ⇒ 必然终止 ⇒ C 迟早进入 running。代价是集结延迟。共驻本身仍然成立：cohort
 块一旦进入 running 就卡在 barrier 不退出，所以只会累积，最终全部在核上。
 
-**撕裂**发生在晋升那一刻：owner 读 `pending` 准备搬运时，协调者可能正写到一半。解法仓里现成
-——`SchedulerSsbufDispatchControl` 的 `publication` 是最后写的单个 volatile uint64，消费侧只
-认它。合并槽位后 `pending` 沿用同一套协议：**先写内容，最后单字 release 发布**，owner 只在
-publication 有效时才晋升。
+**撕裂**发生在晋升那一刻：owner 读那个槽准备搬运时，协调者可能正写到一半。解法仓里现成
+——`SchedulerSsbufDispatchControl` 的 `publication` 是最后写的单个 volatile uint64，消费侧
+只认它：**先写内容，最后单字 release 发布**，owner 只在 publication 有效时才晋升。而「有效」
+的判据是 generation 变了，不是槽被填了——槽里一直留着上一轮的内容，owner 为此记一份
+`consumed_dispatch_generations[2]`，纯本地。
 
 ##### 代价
 
-**本稿初版把「流水变浅」列为这里的主要代价，那是错的** —— 上面「信箱只为 Mix 存在」已经
-算过：取与构造无法与执行重叠，预取只是挪早，本核上零收益。所以取消自领预取不花钱，反而把
-任务留在共享队列里给真正空闲的核。这一格原本写着「用正确性换、要实测代价」，那笔实测不需要了。
+**本稿初版把「流水变浅」列为这里的主要代价，那是错的** —— 上面那一节已经算过：取与构造
+无法与执行重叠，预取只是挪早，本核上零收益。所以取消自领预取不花钱，反而把任务留在共享
+队列里给真正空闲的核。这一格原本写着「用正确性换、要实测代价」，那笔实测不需要了。
 
-真正的代价有两条，都在 Mix 上：
+真正的代价有三条，都在 Mix 上：
 
-- **Mix 子任务要多等一轮。** 协调者把它放进信箱，owner 下一轮循环才晋升。这是单写者的
-  直接后果，换不掉 —— 让协调者直接写 running 就是上面否掉的那条捷径。
+- **Mix 子任务要多等一轮。** 协调者把它放进另一个槽，owner 下一轮循环才晋升。这是单写者
+  的直接后果，换不掉 —— 让协调者直接写别人的 running 就是上面否掉的那条捷径。
+- **一个 cluster 的两个 Mix 放置之间隔着一次翻位**（上方「一个落地时才看见的差异」）。
 - **协调者自身卡在 barrier 时，该 cluster 的放置与完成服务停摆**（约束 3.9）。按归纳不致
   死锁，但会放大集结延迟。
 
-##### 实现清单（按依赖序）
+##### 实现清单（按落地结果）
 
-1. `SchedulerLocalSlotState` 从 `slots[2]` + `mix_slots[lane][2]` 合并为每 lane 一个
-   `{running, pending}`，信箱带 `published` / `consumed` 两个字。容量随之重算：
-   `SCHEDULER_MIX_SLOT_COUNT` 2 → 1 —— 这个 1 指的是**信箱**，lane 的第二个 Mix 位置
-   由 `running` 顶上，所以每条 lane 的 Mix 深度仍是 2，**并发度没有被砍半**（理由见上方
-   「不对称」一段）。`SCHEDULER_MIX_TRACKER_COUNT` 相应从 `3 × SCHEDULER_MIX_SLOT_COUNT`
-   （6）收到 **2**：它数的是协调者手上同时在飞的 Mix 派发，而一个 cluster 最多一个在
-   running、一个在信箱。tracker 耗尽是软失败 —— `scheduler_plan_mix_placement` 返回
-   false，任务回 ready 队列下轮再试 —— 所以算紧是安全的
-2. SSBUF 布局重排：`mix_dispatch[3][2]` 缩成每 lane 一个信箱加一个 `consumed` 字。
-   `scheduler_ssbuf.h` 末尾那几条 offset / size static_assert 连同 `reserved` 的尺寸一起
-   重算 —— 那里的注释写明了「sizing one means recomputing this」，不要假设空间就在那儿
-3. 执行器去掉「先自有后 mix」的分支，改成取 `running`；两条路径现在有四个不同端点
-   （task_ref 来源、payload 位置、trace 去向、generation 发布），**合并时把差异收敛到
-   「取 payload」一步**，其余共用。这是改动最大的一条
-4. 自领路径加「本地空」前置条件，也就是「信箱优先于自领」。这一条是目的，不是判据
-5. `plan_mix_placement` 改成「三条 lane 都 `consumed == published`」的全或无；协调者去掉
-   写 running 的捷径，lane 0 也走信箱
-6. **完成路径只移交退槽那一半，其余不动。** 今天 AIV 执行完 Mix 子任务只往
-   `lanes[lane].mix_completion` 发布一个 generation，协调者在自己的循环里轮询，既聚合
-   tracker、解依赖，**也负责退槽**。新模型里 `running` 的单写者是 owner，所以退槽移交
-   给它：**owner 退自己的 running、晋升信箱、回写 `consumed`**。发布 generation 与协调者
-   轮询聚合那一半**原样保留，不需要新机制**。所以净改动比「把
-   `scheduler_service_cluster_completion_slot` 一分为二」小得多——owner 多三件事，
-   协调者少一件
-7. 信箱整体照 `has_mix` 门控，形状照 `has_spmd`（§5.4）
+1. `SchedulerLocalSlotState` 从 `slots[2]` + `mix_slots[lane][2]` 变成每核一个 `running`
+   加协调者的 `mix_placed[lane][2]`。槽状态带 `from_mailbox` 与 `lane_slot` 两个字段：
+   合并执行路径之后，「这份活从哪来、占哪个槽」不能再靠代码分支隐式表达
+2. SSBUF 的 lane 从 64 字节扩到 128：`mix_completion` + `dispatch[2]` + `current`，
+   删掉原来的 `mix_dispatch[3][2]`。`scheduler_ssbuf.h` 末尾那几条 offset / size
+   static_assert 连同 `reserved` 的尺寸一起重算 —— 那里的注释写明了「sizing one means
+   recomputing this」，不要假设空间就在那儿
+3. 执行器去掉「先自有后 mix」的分支，改成取 `running`。原来两条路径有四个不同端点
+   （task_ref 来源、payload 位置、trace 去向、completion 去向），合并后**差异剩两处**：
+   取 payload 的竞技场，和完成发布到哪里 —— 都由 `from_mailbox` 决定。这是改动最大的一条
+4. 晋升排在循环里所有认领之前。「晋升优先于自领」由这个次序保证，自领处不另加判断
+5. `plan_mix_placement` 判协调者自己的记录；协调者不写别人的 running；**lane 0 不走交接**
+6. **完成路径分叉**：`from_mailbox` 的活由 owner 清槽 + 按槽发布 generation，**不解依赖**
+   —— Mix 任务只有协调者知道三个子任务是否都到齐。自领的活照旧在本地结算
+7. 整套照 `has_mix` 门控，形状照 `has_spmd`（§5.4）
 
 ##### 验收
 
-`spmd_cohort_with_ordinary` 的 `cohort_count` **2 与 3 两档**都是 `xfail(strict)`。
-**这个模型落地后它们会因「意外通过」而失败**，那就是要删掉标记的信号 —— 不要先删标记
-再改代码。
+`spmd_cohort_with_ordinary` 的 `cohort_count` 2 与 3 两档原本是 `xfail(strict)`。
+**模型落地后它们作为普通用例通过，标记已删**（2026-10-28，a5sim）。
 
-C++ UT 至少要钉四条，它们都属于「错了不会当场报错」的那一类：
+C++ UT 钉住的几条，都属于「错了不会当场报错」的那一类：
 
 | 落点 | 测什么 |
 | ---- | ------ |
-| 信箱握手 | `consumed != published` 时放置必须失败——这一条同时钉住「回写值而非标志位」：协调者在上一次发布尚未被取走时再次放置，不得成功 |
-| 信箱优先 | 信箱非空时自领必须被拒；`running` 空且信箱非空时，晋升先于一切 |
-| 全或无 | 三条 lane 有一条信箱未被取走时，整个 Mix 放置不得发生任何一半 |
-| 退槽移交 | owner 退 running 并回写 `consumed`，但**不**解依赖；协调者收到完成才聚合 tracker 并解依赖 |
+| 放置判据 | 协调者的记录非 FREE 时放置必须失败——这一条钉住「判记录而不是判位」 |
+| 晋升优先 | `running` 空且另一个槽有新 generation 时，晋升先于自领 |
+| 全或无 | 一条 lane 放不下时，整个 Mix 放置不得发生任何一半 |
+| 完成分叉 | owner 清槽并按槽发布，但**不**解依赖；协调者收到完成才聚合 tracker 并解依赖 |
+| 按槽成对 | 一条 lane 先后完成两个派发，两个都要被协调者看见（钉住 `mix_completion` 的按槽打包） |
 
 #### 第 2 条：谁来判、扫哪些槽
 
-> **这一节描述的是今天的四槽模型。信箱模型落地后它整节退役**：核一次只持有一个执行位加
-> 一个信箱，而信箱优先于自领，所以「同一个核已经有这个 cohort 的另一块」这件事不再需要
-> 扫槽去判 —— 本地非空就不自领，结构上就排除了。下面保留，是因为在那之前它仍然是现行
-> 判据，而且「随完成自动失效」那一段对**写用例**仍然成立。
+> **这一节写的是改造前的四槽模型，但判据本身没有退役，只是扫描对象换了。** 落地后扫的是
+> `running` 加协调者的 `mix_placed[lane][2]` —— 非 Mix 的 cohort 块结构上不可能在一个核上
+> 出现两块（只有一个 `running`），而 AIV-only 的 Mix cohort 仍然可能被放进同一个 cluster
+> 两次，所以扫 `mix_placed` 那一半是**必需**的，扫 `running` 那一半是冗余防线。
+> 下面的论证原样成立，「随完成自动失效」那一段对**写用例**尤其仍然成立。
 
 判据不需要新增状态 —— block 一直占着槽直到完成，所以"扫槽找同一个 `task_ref`"就是精确判断，
 且随完成自动失效。但**扫哪些槽取决于谁是认领者**，两种情况不同：
@@ -1042,7 +1052,7 @@ TMR 的 stop-the-world / 二叉 ack 树 / coordinator / `force_gate` + doorbell 
 
 | 阶段 | 内容 | 出口条件 |
 | ---- | ---- | -------- |
-| **S0** | 基础设施：SPMD ready 队列（全局唯一，复用 `SchedulerReadyInbox`）、`inbox_base`/`holder`/`refresh`/`push_target` 四处改动、TaskControl 三个字段、`has_spmd` 门、`block_idx`+`block_num` 贯穿 claim/payload/slot/trace，外加 `TaskType` 枚举（见下）。**不改准入谓词** | **已完成**（分支 `a5-hbg-resident-spmd`，未提交）：C++ UT 317 全绿、a5sim ST 全绿。队列恒空、`has_spmd` 恒假 |
+| **S0** | 基础设施：SPMD ready 队列（全局唯一，复用 `SchedulerReadyInbox`）、`inbox_base`/`holder`/`refresh`/`push_target` 四处改动、TaskControl 三个字段、`has_spmd` 门、`block_idx`+`block_num` 贯穿 claim/payload/slot/trace，外加 `TaskType` 枚举（见下）。**不改准入谓词** | **已完成**（`60b7edd1`）：C++ UT 317 全绿、a5sim ST 全绿。队列恒空、`has_spmd` 恒假 |
 
 > **S0 实做时比本节原计划多了一笔：`core_type_index` → `enum class TaskType`。**
 > 第 4 条队列让这个名字彻底失效 —— 0/1/2/3 是 AIC/AIV/MIX/SPMD **队列**，而
@@ -1052,7 +1062,8 @@ TMR 的 stop-the-world / 二叉 ack 树 / coordinator / `force_gate` + doorbell 
 > type，UT 却传 `MIX_QUEUE`(2) 表示"不直填"。顺带把误导人的 `capacity`/`owner_count` 改成
 > `inbox_capacity`/`inbox_count` —— 它们是**inbox 个数**，不是队列能排几个任务（一个 inbox
 > 是侵入式链表，任务数无上限；SPMD 队列只有 1 个 inbox 正是因此才够用）。
-| **S1** | 全部放行：认领、推进 head、两级计数、demand 收窄、§8.1 的四条。non-sync_start / sync_start / Mix 一并 | 新增 ST 全绿；`scheduler_mode` 断言为 resident；分布断言显示 block 真的跨 cluster；CSA 门禁转为通过 |
+| **S1** | 全部放行：认领、推进 head、两级计数、demand 收窄、§8.1 的四条。non-sync_start / sync_start / Mix 一并 | **已完成**（`ec51a1149` 起四个 commit）：C++ UT 317 全绿、a5sim 全绿、12 个 `spmd_*` 目录上板全绿 |
+| **S2** | 槽模型：自有槽 2 → 1，然后每 lane 两个槽加一个滚动位（§8.1） | **已完成**（`9f02feb5a`、`d1ebfd1dc`）：C++ UT 317 全绿、a5sim 23 scene + 29 standalone 全绿且无 xfail、a5 上板 33 目录通过。`spmd_cohort_with_ordinary` 的三档都转为普通通过 |
 
 #### S1 的实际覆盖（2026-10-26）
 
@@ -1490,21 +1501,22 @@ LD_LIBRARY_PATH=/opt/gcc-15/lib python -m pytest tests/st/a5/host_build_graph --
 | ---- | ---- |
 | **环境与复现**（venv、`source set_env.sh`、`LD_LIBRARY_PATH=/opt/gcc-15/lib`、改 C++ 后的固定三步、onboard 跑法、性能采集脚本与两个坑） | [a5-hbg-per-core-scheduler-progress.md](a5-hbg-per-core-scheduler-progress.md) §0.5，**自包含，照着走即可** |
 | **per-core 改造的决策与教训**（D-1~D-9、F-1~F-6、§7.9 的 FIFO 返工、§7.10 的 MPMC 回归与"七个坏掉的观测仪器"） | 同上。本文多处引用，不重复 |
-| **基线分支** | `a5-hbg-resident-spmd` @ `60b7edd1`（S0），其基线是 `30e5302d`（per-core 改造完成点，**不是 main，也不是 `feat/fully_distributed_within_core`**） |
+| **基线分支** | `a5-hbg-resident-spmd` @ `d1ebfd1dc`（S2 完成点），其基线是 `30e5302d`（per-core 改造完成点，**不是 main，也不是 `feat/fully_distributed_within_core`**） |
 
 开工前的状态核对：
 
 ```bash
 cd /data/disk2/pyptouser/chenpeng/workspace/simpler
-git log --oneline -1 a5-hbg-resident-spmd    # 应为 60b7edd1（S0）
+git log --oneline -1 a5-hbg-resident-spmd    # 应为 d1ebfd1dc（S2）
 git worktree list                             # 本设计的只读 worktree 可能还在 .claude/worktrees/spmd-read
 source .venv/bin/activate && pip install --no-build-isolation -e .   # HEAD 动过就必须重装
 ```
 
-**S0 已落地，S1 尚未写一行代码。** 文档里所有 `file:line` 原按 `872591b7` 核对
-（2026-10-21，含 9 处行号修正）；S0 之后 `scheduler_ready.h` / `scheduler_types.h` 行号已明显
-漂移，且 `core_type_index` / `scheduler_ready_queue_capacity` 等名字**已不存在**（见 §10.1 的
-注），引用前先 grep。
+**S0 / S1 / S2 都已落地。** 文档里所有 `file:line` 原按 `872591b7` 核对（2026-10-21，含 9
+处行号修正），之后 `scheduler_ready.h` / `scheduler_types.h` / `scheduler_completion.h` /
+`aicore_executor.cpp` 都被大改过，行号全部作废；`core_type_index`、
+`scheduler_ready_queue_capacity`、`SCHEDULER_PENDING_SLOT_COUNT`、`mix_slots`、
+`SCHEDULER_MIX_SLOT_COUNT` 这些名字**已不存在**。**引用任何符号前先 grep。**
 
 ### 已定的决策（不要重开）
 
@@ -1520,13 +1532,14 @@ source .venv/bin/activate && pip install --no-build-isolation -e .   # HEAD 动�
 
 | | |
 | --- | --- |
-| 代码 | **S0 已完成并提交**（`60b7edd1`，分支 `a5-hbg-resident-spmd`，基线 `30e5302d`）；S1 未开始 |
-| 用例 | 按用户决定**先做功能、暂不移植**（§10.4 存了调查结论） |
-| 开放项 | O-6 / O-7 / O-8 全是实测项，S0 不碰 |
+| 代码 | **S0 / S1 / S2 全部完成并提交**，最后一个是 `d1ebfd1dc` |
+| 性能 | **未测。** 两步都是行为变化——S2 的第一步取消了自领预取，第二步让 Mix 走统一次序——而"预取在本核上零收益"是论证不是实测。口径照 progress §0.5 的控制变量，对 merge-base 做 A/B |
+| 用例 | 按用户决定**先做功能、暂不移植** TMR 用例（§10.4 存了调查结论） |
+| 开放项 | O-6 / O-7 / O-8 仍未实测 |
+| 既存缺陷 | `KNOWN_ISSUES.md` 里两条与本设计无关但会在全量里显红：`dfx` 的 `clock_alignment` 断言、`paged_attention::Case2` 缺 `ring_task_window`。两条都做过基线对照 |
 
-**S1 开工第一件事**：§6.3 的 `placement = nullptr`、§6.2 末的 head memo，这两条都是 S0
-之后新加进本稿的，而且都属于"错了不会当场报错"的那一类 —— 前者是假死锁签名，后者是
-持续的轮询开销。先把它们和 §8.1 的四条一起落在代码里，再谈认领逻辑本身。
+**接手第一件事是量性能**，因为功能面已经全绿，而两步改造动的都是每个核每轮的取任务节奏。
+per-core 那组 A/B 里 `benchmark_bgemm` +12.9%、`fanout_imbalance` +11.3% 说明这个量级看得见。
 
 ## 14. 不在范围
 

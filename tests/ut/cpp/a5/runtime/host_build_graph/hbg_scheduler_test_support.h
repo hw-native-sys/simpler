@@ -133,10 +133,8 @@ struct FixtureStorage {
         test_graphs(workers),
         local_states(workers) {
         for (auto &local : test_contexts)
-            for (auto &slot : local.slots)
-                scheduler_initialize_free_slot(&slot);
-        for (auto &slot : scheduler_local_state.slots)
-            scheduler_initialize_free_slot(&slot);
+            scheduler_initialize_free_slot(&local.running);
+        scheduler_initialize_free_slot(&scheduler_local_state.running);
         EXPECT_TRUE(scheduler_plan_layout(task_count, task_count, 0, &layout, false, task_count * traces_per_task));
         scheduler_state = std::make_unique<SchedulerStateBuffer>(layout);
         run_control = scheduler_state_at<SchedulerRunControl>(scheduler_state->base(), layout.run_control_offset);
@@ -158,8 +156,7 @@ struct FixtureStorage {
             context.callable_addresses_address = reinterpret_cast<uint64_t>(callable_addresses);
             context.callable_addresses_count = kFixtureCallableCount;
             context.graph_summary_offset = layout.graph_summary_offset;
-            context.dispatch_payload_offset =
-                layout.dispatch_payloads_offset + worker * SCHEDULER_PENDING_SLOT_COUNT * sizeof(DispatchPayload);
+            context.dispatch_payload_offset = layout.dispatch_payloads_offset + worker * sizeof(DispatchPayload);
             context.graph_task_count = task_count;
             context.runtime_worker_count = workers;
             context.worker_index = worker;

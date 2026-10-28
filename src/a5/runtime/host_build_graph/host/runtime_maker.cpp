@@ -1378,15 +1378,14 @@ bool create_scheduler_state(
         context.graph_storage_address = device_sm_address + device_segments.storage;
         context.graph_reserved_address = 0;
         context.scheduler_state_base_address = aligned_address;
-        context.dispatch_payload_offset = layout.dispatch_payloads_offset + static_cast<uint64_t>(i) *
-                                                                                SCHEDULER_PENDING_SLOT_COUNT *
-                                                                                sizeof(DispatchPayload);
+        context.dispatch_payload_offset =
+            layout.dispatch_payloads_offset + static_cast<uint64_t>(i) * sizeof(DispatchPayload);
         context.trace_cells_offset = layout.trace_cells_offset;
         context.task_window_last_index = task_window_size - 1;
         context.graph_task_count = static_cast<uint64_t>(total_tasks);
         context.worker_index = static_cast<uint64_t>(i);
-        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-            const uint64_t offset = context.dispatch_payload_offset + slot * sizeof(DispatchPayload);
+        {
+            const uint64_t offset = context.dispatch_payload_offset;
             auto *payload = scheduler_state_at<DispatchPayload>(host_base, offset);
             const uint64_t device_payload = aligned_address + offset;
             payload->args[PAYLOAD_LOCAL_CONTEXT_INDEX] = device_payload + offsetof(DispatchPayload, local_context);

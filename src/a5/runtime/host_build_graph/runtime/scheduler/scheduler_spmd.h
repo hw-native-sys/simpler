@@ -196,30 +196,27 @@ inline __aicore__ bool scheduler_claim_spmd_block(
     const bool is_mix = scheduler_task_is_mix(local->spmd_head_flags);
 
     // A cohort's blocks wait on each other inside the kernel, so two of them on
-    // one core self-lock: the second sits in a dispatch slot the first cannot
+    // one core self-lock: the second sits in a position the first cannot
     // release, because the first is spinning in a barrier and its core's whole
     // scheduling loop is stopped with it. Scanning for the task is an exact
     // test that needs no shared state and expires on its own, since a block
-    // holds its slot until it completes -- and the question is purely local,
-    // so no peer has to be told the answer.
+    // holds its position until it completes -- and the question is purely
+    // local, so no peer has to be told the answer.
     //
-    // The Mix slots are scanned only because a Mix task need not have an AIC
+    // The mailboxes are scanned only because a Mix task need not have an AIC
     // subtask: the flags say MIX whenever more than one subtask is live, which
-    // includes two AIVs and no AIC. A Mix block with an AIC subtask always puts
-    // it in the coordinator's own slots, so the first loop already finds it;
-    // an AIV-only one lands entirely on Mix slots and would otherwise be missed.
-    // Only the coordinator can run either test for a Mix cohort anyway: an AIV
-    // executing a Mix slot reads its task from SSBUF and holds no slot state
-    // for it, so it cannot see what it is already running.
+    // includes two AIVs and no AIC. A Mix block with an AIC subtask always
+    // seats it in the coordinator's own position, so the first test already
+    // finds it; an AIV-only one lands entirely in the lanes' mailboxes and
+    // would otherwise be missed. Only the coordinator can run either test for a
+    // Mix cohort anyway: an AIV that promoted a mailbox holds the dispatch but
+    // not the record of which cohort the coordinator was assembling.
     if (scheduler_task_requires_sync_start(local->spmd_head_flags)) {
-        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot)
-            if (local->own_slots()[slot].task_ref == task_ref) return true;
+        if (local->running.task_ref == task_ref) return true;
         if (is_mix) {
-            // Lane 0 is the coordinator itself and holds no Mix slot, so the
-            // live ones are the two AIV lanes' two slots each.
             for (uint32_t lane = 1; lane < PLATFORM_CORES_PER_BLOCKDIM; ++lane)
-                for (uint32_t slot = 0; slot < SCHEDULER_MIX_SLOT_COUNT; ++slot)
-                    if (local->mix_slots[lane][slot].task_ref == task_ref) return true;
+                for (uint32_t slot = 0; slot < SCHEDULER_LANE_SLOT_COUNT; ++slot)
+                    if (local->mix_placed[lane][slot].task_ref == task_ref) return true;
         }
     }
 
@@ -229,16 +226,10 @@ inline __aicore__ bool scheduler_claim_spmd_block(
     // changes no shared state, so failing it costs nothing to undo -- and with
     // one task at the head there is no second task to try instead.
     SchedulerMixPlacement placement{};
-    uint32_t own_slot = UINT32_MAX;
     if (is_mix) {
-        if (!scheduler_plan_mix_placement(base, local, task_ref, &placement)) return true;
-    } else {
-        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-            if (local->own_slots()[slot].state != SchedulerDispatchSlotState::FREE) continue;
-            own_slot = slot;
-            break;
-        }
-        if (own_slot == UINT32_MAX) return true;
+        if (!scheduler_plan_mix_placement(base, local, task_ref, &placement, ssbuf)) return true;
+    } else if (local->running.state != SchedulerDispatchSlotState::FREE) {
+        return true;
     }
 
     __gm__ SchedulerTaskControl *control = scheduler_task_control_at(base, local, task_ref);
@@ -297,8 +288,8 @@ inline __aicore__ bool scheduler_claim_spmd_block(
         }
         dispatched = scheduler_dispatch_mix_ready(graph, base, local, run, ready, placement, profiling_level, ssbuf);
     } else {
-        SchedulerLocalSlotState *slot_state = &local->own_slots()[own_slot];
-        SchedulerFreeSlotClaim claim{local->worker_id(), own_slot, slot_state->generation, local->config.self_lane};
+        SchedulerLocalSlotState *slot_state = &local->running;
+        SchedulerFreeSlotClaim claim{local->worker_id(), slot_state->generation, local->config.self_lane};
         claim.block_idx = block_idx;
         claim.block_num = block_num;
         slot_state->state = SchedulerDispatchSlotState::FILLING;

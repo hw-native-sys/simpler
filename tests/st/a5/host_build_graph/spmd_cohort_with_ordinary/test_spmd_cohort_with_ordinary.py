@@ -188,35 +188,17 @@ def _cohort_shape(cohort, aic_count, aiv_count):
     return "AIV", aiv_count, 1
 
 
-# The Mix cohort is the second one, so a run with only the AIC cohort has
-# nothing in a Mix slot to starve and passes. Everything from two cohorts up
-# carries the defect; three is kept because it was the shape that first showed
-# it, back when the construction needed the AIV-only cohort's own-slot blocks
-# to supply the backlog that ordinary work now supplies directly.
-_STARVES_THE_MIX_COHORT = pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Known defect: a Mix cohort's AIV subtasks wait out the entire backlog of ordinary work in "
-        "front of them, because a core drains its own dispatch slots before it ever scans its Mix "
-        "slots. Measured at about 20 x 50 ms of backlog on both a5sim and a5 silicon, against a 500 ms "
-        "bound. The fix is the dual-issue slot model in tests/docs/: one FIFO queue per core, and a "
-        "core that owes a Mix subtask stops claiming more work. strict, so that whoever lands it is "
-        "told to delete this marker rather than leaving a passing xfail behind."
-    ),
-)
+# A run with only the AIC cohort has nothing in a lane's second slot to starve,
+# so it passed even while the defect was live. Everything from two cohorts up
+# exercised it; three is kept because it was the shape that first showed it,
+# back when the construction needed the AIV-only cohort's own-slot blocks to
+# supply the backlog that ordinary work now supplies directly.
 
 
 @pytest.mark.platforms(["a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-@pytest.mark.parametrize(
-    "cohort_count",
-    [
-        1,
-        pytest.param(2, marks=_STARVES_THE_MIX_COHORT),
-        pytest.param(3, marks=_STARVES_THE_MIX_COHORT),
-    ],
-)
+@pytest.mark.parametrize("cohort_count", [1, 2, 3])
 def test_cohorts_assemble_against_competing_ordinary_work(
     st_platform, st_device_ids, tmp_path, cohort_count, assert_cohorts_were_coresident
 ):

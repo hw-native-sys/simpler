@@ -637,20 +637,17 @@ inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
 // holding it where a core that is idle now cannot reach it, which is the same
 // trade the SPMD claim already settled by taking one block per round.
 inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 1;
-// A Mix task's AIV subtasks land on slots whose only writer is the cluster's
-// AIC, held separately from each AIV's own slot. Sole ownership is what makes
-// the AIC's capacity probe exact: it sees only its own history there, so a
-// placement it plans cannot be taken away between the probe and the claim, and
-// no back-pressure protocol is needed.
+// A lane runs one of its two dispatch slots and the coordinator fills the
+// other. Which is which is the lane's own rolling index: the coordinator writes
+// the slot the index does not name, and the lane flips the index when it takes
+// that one up -- one write that both promotes the pending dispatch and releases
+// the slot the finished one occupied.
 //
-// A separate constant rather than more of the count above: these two answer
-// different questions. A core's own count is how much work it hoards from the
-// shared queues, which is why it is one; this one is how many Mix dispatches a
-// cluster can have outstanding, which its coordinator alone decides. Five places
-// pack two 32-bit generations into one 64-bit word (scheduler_ssbuf.h,
-// scheduler_ready.h, scheduler_completion.h, scheduler_dispatch.h), so this one
-// cannot exceed two without widening all of them.
-inline constexpr uint32_t SCHEDULER_MIX_SLOT_COUNT = 2;
+// Two is what makes filling ahead possible at all: the coordinator builds the
+// next dispatch on its own core while the lane is still executing the previous
+// one, so every per-lane structure a dispatch touches -- control word, record,
+// payload, trace -- comes in pairs indexed by this same slot.
+inline constexpr uint32_t SCHEDULER_LANE_SLOT_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
 
 // What a ready task is, which is also the queue it waits in. AIC and AIV share
@@ -758,8 +755,12 @@ inline constexpr uint32_t SCHEDULER_READY_INBOX_CAPACITY =
 // ready queue. The traces sit in global memory rather than the cluster's SSBUF
 // because the SSBUF's remaining room goes to the dispatch and completion
 // tokens, which are on the dispatch path where the traces are not.
+// Every per-lane structure a dispatch touches is indexed by the same slot the
+// lane's rolling index names: the SSBUF control the coordinator publishes, the
+// record it keeps, the payload it builds, and the trace the lane writes back.
+// Two of each per AIV, because two dispatches are live at once.
 inline constexpr uint32_t SCHEDULER_MIX_SLOT_CAPACITY =
-    SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM * SCHEDULER_MIX_SLOT_COUNT;
+    SCHEDULER_CLUSTER_CAPACITY * PLATFORM_AIV_CORES_PER_BLOCKDIM * SCHEDULER_LANE_SLOT_COUNT;
 
 // Shards are allocated per queue at the widest queue's count so the directory
 // stays a rectangular array; the unused tail of a narrower queue is never set,
@@ -1437,9 +1438,7 @@ inline bool scheduler_plan_layout(
             PLATFORM_MAX_AICPU_THREADS, AicpuThreadLifecycleTrace, aicpu_lifecycle_traces_offset
         ) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, SchedulerWorkerContext, worker_contexts_offset) ||
-        !SCHEDULER_RESERVE_ARRAY(
-            SCHEDULER_WORKER_CAPACITY * SCHEDULER_PENDING_SLOT_COUNT, DispatchPayload, dispatch_payloads_offset
-        ) ||
+        !SCHEDULER_RESERVE_ARRAY(SCHEDULER_WORKER_CAPACITY, DispatchPayload, dispatch_payloads_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskMetadata, task_metadata_offset) ||
         !SCHEDULER_RESERVE_ARRAY(task_count, SchedulerTaskControl, task_controls_offset) ||
         !SCHEDULER_RESERVE_ARRAY(SCHEDULER_READY_INBOX_CAPACITY, SchedulerReadyInbox, ready_inboxes_offset) ||

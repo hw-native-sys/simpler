@@ -123,7 +123,7 @@ TEST(SchedulerProfilingLevel, DispatchWritesTaskIdentityBeforePhaseDetails) {
         ASSERT_TRUE(scheduler_fill_dispatch_slot(
             graph.graph(), storage.scheduler_state->base(),
             storage.local_context(&storage.contexts[1], &storage.scheduler_local_state), storage.run_control,
-            SchedulerFreeSlotClaim{1, 0, 0, 0}, ready_claim, level, storage.ssbuf_region
+            SchedulerFreeSlotClaim{1, 0, 0}, ready_claim, level, storage.ssbuf_region
         ));
         auto *traces =
             scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
@@ -577,20 +577,18 @@ TEST(SchedulerDispatch, DispatchSequenceIsIndependentOfSlotGenerationAndRejectsZ
         storage.local_context(&storage.contexts[0], &storage.scheduler_local_state), storage.run_control, slot_claim,
         ready_claim, 0, storage.ssbuf_region
     ));
-    EXPECT_EQ(storage.scheduler_local_state.slots[0].generation, 1u);
-    uint32_t pending_slot = UINT32_MAX;
+    EXPECT_EQ(storage.scheduler_local_state.running.generation, 1u);
     uint64_t publication = 0;
-    ASSERT_TRUE(scheduler_local_ready_pop(&storage.scheduler_local_state, &pending_slot, &publication));
-    EXPECT_EQ(pending_slot, 0u);
+    ASSERT_TRUE(scheduler_local_ready_pop(&storage.scheduler_local_state, &publication));
     EXPECT_EQ(publication, scheduler_dispatch_publication(1, SchedulerDispatchSlotState::READY));
 
     storage.callable_addresses[1] = 0;
     storage.run_control->error_claimed = 0;
     storage.run_control->scheduler_error = 0;
-    // A core has one dispatch slot, so a second task reuses it: retire the
-    // first and claim the slot at the generation it now carries.
-    scheduler_initialize_free_slot(&storage.scheduler_local_state.slots[0]);
-    slot_claim.generation = storage.scheduler_local_state.slots[0].generation;
+    // A core runs one task at a time, so a second task reuses the position:
+    // retire the first and claim it at the generation it now carries.
+    scheduler_initialize_free_slot(&storage.scheduler_local_state.running);
+    slot_claim.generation = storage.scheduler_local_state.running.generation;
     ready_claim.task_ref = 1;
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -631,8 +629,8 @@ TEST(SchedulerDispatch, RejectsAKernelIdPastThePublishedCallableCount) {
     );
     EXPECT_EQ(payload->function_bin_addr, UINT64_C(0x1000)) << "the last id inside the count still dispatches";
 
-    scheduler_initialize_free_slot(&storage.scheduler_local_state.slots[0]);
-    slot_claim.generation = storage.scheduler_local_state.slots[0].generation;
+    scheduler_initialize_free_slot(&storage.scheduler_local_state.running);
+    slot_claim.generation = storage.scheduler_local_state.running.generation;
     ready_claim.task_ref = 1;
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -666,8 +664,8 @@ TEST(SchedulerDispatch, AcceptsLastCallableAndInlineSentinel) {
 
     storage.metadata[1].kernel_ids[0] = UINT16_MAX;
     storage.metadata[1].flags |= SCHEDULER_TASK_INLINE;
-    scheduler_initialize_free_slot(&storage.scheduler_local_state.slots[0]);
-    slot_claim.generation = storage.scheduler_local_state.slots[0].generation;
+    scheduler_initialize_free_slot(&storage.scheduler_local_state.running);
+    slot_claim.generation = storage.scheduler_local_state.running.generation;
     ready_claim.task_ref = 1;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -745,7 +743,7 @@ TEST(SchedulerPredicate, MalformedPredicateStopsDispatchWithoutPublishingSlot) {
     ));
     EXPECT_EQ(storage.run_control->scheduler_error, static_cast<uint64_t>(SchedulerGraphResult::INVALID_ARGUMENTS));
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_PREDICATE));
-    EXPECT_NE(storage.scheduler_local_state.slots[0].state, SchedulerDispatchSlotState::READY);
+    EXPECT_NE(storage.scheduler_local_state.running.state, SchedulerDispatchSlotState::READY);
 }
 
 TEST(SchedulerPredicate, FailedPredicatePublishesDependencyOnlyDispatch) {
