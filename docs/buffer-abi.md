@@ -113,6 +113,32 @@ and `D2H` is reserved and rejected. Callable direction still controls input copi
 and output copy-back; H2D does not mean every argument is copied in. Buffer identity,
 import grants and `TensorArgType` access checks are unchanged.
 
+`Worker.create_buffer(nbytes, *, device_readable=False)` preserves ordinary Host
+backing and staging. On a direct A5 onboard L2 Worker, `True` maps the owned
+POSIX_SHM backing for synchronous device reads, including URMA=OFF builds.
+The capability check uses symbols in the loaded runtime before allocating backing;
+an environment variable cannot enable a missing binary capability. The Buffer and
+its Tensor views stay HOST, with READ permission. Descriptor byte 5 stores the
+boolean policy; the descriptor remains 88 bytes and its remaining padding is zero.
+`re_export()` rejects device-readable Host descriptors, including wire-decoded
+descriptors: forwarding cannot preserve the owning L2 mapping. Ordinary Buffer
+forwarding is unchanged.
+
+A True table requires `TensorArgType.INPUT`, explicit callable `ArgDirection.IN`,
+and `TensorTransfer.NONE` (the automatic default for this policy). Materialization
+uses the owning L2 context's ACL device mapping; its internal ChipTensor is marked
+DEVICE/NONE to bypass staging. This does not change the backing's address space.
+Neither table storage nor a whole-table H2D copy is allocated. The kernel chooses
+which bytes to read and completes its MTE operations before returning.
+
+Wait for every submitted use before updating or releasing Host backing. Both
+`release_buffer` and `Buffer.close` reject in-flight or unproven uses. Unregister
+must succeed before the backing is closed; a failed cleanup keeps an explicit
+owner for retry. Cross-process descriptor transport and cross-rank URMA integration
+are not enabled by this local mapping policy. See the
+[example](../examples/a5/tensormap_and_ringbuffer/host_ddr_gather/README.md) and
+[implementation record](design/a5-host-ddr-pr1-results.md).
+
 ```python
 view = Tensor(buffer, shapes=(16,), dtype=DataType.FLOAT32)
 args.add_tensor(view, transfer=TensorTransfer.NONE)

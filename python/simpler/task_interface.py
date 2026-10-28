@@ -134,6 +134,12 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
     """Check callable-side host access before descriptors become address-only PODs."""
     for i in range(args.tensor_count()):
         buffer = args.tensor(i).buffer
+        if buffer.device_readable:
+            direction = target.sig(i) if target is not None and i < target.sig_count else None
+            if direction != ArgDirection.IN or args.tag(i) != TensorArgType.INPUT:
+                raise ValueError(f"argument {i}: device_readable Host table requires explicit IN and INPUT")
+            if args.transfer(i) != TensorTransfer.NONE:
+                raise ValueError(f"argument {i}: device_readable Host table cannot use staging transfers")
         if buffer.address_space != AddressSpace.HOST or args.transfer(i) != TensorTransfer.NONE:
             continue
         direction = target.sig(i) if target is not None and i < target.sig_count else None
@@ -148,7 +154,9 @@ def _validate_host_control_access(target: ChipCallable | None, args: TaskArgs) -
             raise ValueError(f"argument {i}: HOST/NONE Buffer grant does not cover callable direction {direction}")
 
 
-def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> ChipStorageTaskArgs:
+def _materialize_chip_task_args(
+    args: TaskArgs, registry: ImportRegistry, host_mappings: dict | None = None
+) -> ChipStorageTaskArgs:
     """Resolve accepted argument descriptors into this process's chip-only POD.
 
     The caller owns submission/callable checks, backing retention and the registry's
@@ -157,7 +165,17 @@ def _materialize_chip_task_args(args: TaskArgs, registry: ImportRegistry) -> Chi
     """
     if not isinstance(args, TaskArgs):
         raise TypeError("chip argument materialization requires address-free TaskArgs")
-    resolved = registry.materialize_args(args)
+    resolved = {}
+    for i in range(args.tensor_count()):
+        descriptor = args.tensor(i).buffer
+        if descriptor.device_readable:
+            base = (host_mappings or {}).get(descriptor.identity)
+            if not base:
+                raise ValueError("device_readable Host buffer requires its owning L2 device mapping")
+            resolved[descriptor.identity] = (base, int(AddressSpace.DEVICE))
+        else:
+            imported = registry.materialize(descriptor)
+            resolved[descriptor.identity] = (imported.base, int(imported.address_space))
     return _ti_module.materialize_task_args(args, resolved)
 
 

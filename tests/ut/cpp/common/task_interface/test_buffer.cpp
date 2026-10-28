@@ -24,6 +24,7 @@
 
 #include "buffer.h"
 #include "task_args.h"
+#include "task_args_wire.h"
 
 namespace {
 
@@ -102,6 +103,38 @@ TEST(BufferAbi, StructSizesAreFrozen) {
     EXPECT_EQ(sizeof(CanonicalIdentity), 32u);
     EXPECT_EQ(sizeof(Tensor), 144u);
     EXPECT_EQ(sizeof(BufferDescriptor), 88u);
+    EXPECT_EQ(offsetof(BufferDescriptor, device_readable), 5u);
+}
+
+TEST(BufferAbi, DeviceReadablePolicyRequiresReadOnlyHostBacking) {
+    Tensor table = make_tensor();
+    table.buffer.device_readable = 1;
+    EXPECT_NO_THROW(validate_tensor(table));
+    table.buffer.access = static_cast<uint8_t>(AccessMode::READWRITE);
+    EXPECT_THROW(validate_tensor(table), std::invalid_argument);
+    table.buffer.access = static_cast<uint8_t>(AccessMode::READ);
+    table.buffer.device_readable = 2;
+    EXPECT_THROW(validate_tensor(table), std::invalid_argument);
+    table = make_device_tensor();
+    table.buffer.device_readable = 1;
+    EXPECT_THROW(validate_tensor(table), std::invalid_argument);
+}
+
+TEST(BufferAbi, ReadableTableRejectsMutatedTagAndWireTransfer) {
+    Tensor table = make_tensor();
+    table.buffer.device_readable = 1;
+    TaskArgs args;
+    args.add_tensor(table);
+    EXPECT_EQ(args.transfer(0), TensorTransfer::NONE);
+    std::vector<uint8_t> blob(task_args_blob_size(args));
+    write_blob(blob.data(), args);
+    auto view = read_blob(blob.data(), blob.size());
+    EXPECT_TRUE(view.tensors(0).buffer.device_readable);
+    blob[TASK_ARGS_BLOB_HEADER_SIZE + TASK_ARG_TRANSFER_OFFSET] = static_cast<uint8_t>(TensorTransfer::H2D);
+    EXPECT_THROW(view.transfer(0), std::invalid_argument);
+    args.tag(0) = TensorArgType::NO_DEP;
+    EXPECT_THROW(validate_submit_args({args}), std::invalid_argument);
+    EXPECT_THROW(write_blob(blob.data(), args), std::invalid_argument);
 }
 
 TEST(BufferAbi, ConstantsAreFrozen) {

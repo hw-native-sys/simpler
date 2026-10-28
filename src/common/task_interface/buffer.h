@@ -176,7 +176,8 @@ struct BufferDescriptor {
     uint8_t address_space;
     uint8_t access;
     uint8_t backend_kind;
-    uint8_t _pad0[3];
+    uint8_t device_readable;
+    uint8_t _pad0[2];
     CanonicalIdentity identity;
     uint64_t nbytes;
     uint32_t owner_worker_path_id;
@@ -204,7 +205,7 @@ static_assert(offsetof(BufferDescriptor, body) == 56);
 inline bool operator==(const BufferDescriptor &a, const BufferDescriptor &b) {
     const size_t body_len = a.body_len < DESC_MAX_BYTES ? a.body_len : DESC_MAX_BYTES;
     return a.identity == b.identity && a.address_space == b.address_space && a.access == b.access &&
-           a.backend_kind == b.backend_kind && a.nbytes == b.nbytes &&
+           a.backend_kind == b.backend_kind && a.device_readable == b.device_readable && a.nbytes == b.nbytes &&
            a.owner_worker_path_id == b.owner_worker_path_id && a.body_len == b.body_len &&
            std::memcmp(a.body, b.body, body_len) == 0;
 }
@@ -295,6 +296,11 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     };
 
     if (h.magic != BUFFER_DESCRIPTOR_MAGIC) reject("invalid BufferDescriptor: magic");
+    if (h.device_readable > 1) reject("invalid BufferDescriptor: device_readable must be boolean");
+    if (h.device_readable && (h.address_space != static_cast<uint8_t>(AddressSpace::HOST) ||
+                              h.backend_kind != static_cast<uint8_t>(BackendKind::POSIX_SHM) ||
+                              h.access != static_cast<uint8_t>(AccessMode::READ)))
+        reject("device_readable requires read-only HOST/POSIX_SHM backing");
     if (h.address_space > static_cast<uint8_t>(AddressSpace::DEVICE))
         reject("invalid BufferDescriptor: address_space out of range");
     if (h.access > static_cast<uint8_t>(AccessMode::READWRITE)) reject("invalid BufferDescriptor: access out of range");

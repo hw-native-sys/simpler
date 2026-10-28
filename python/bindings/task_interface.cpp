@@ -1984,6 +1984,7 @@ std::array<uint8_t, sizeof(BufferDescriptor)> encode_buffer_descriptor_wire(cons
     store_le_u8(wire.data() + offsetof(BufferDescriptor, address_space), desc.address_space);
     store_le_u8(wire.data() + offsetof(BufferDescriptor, access), desc.access);
     store_le_u8(wire.data() + offsetof(BufferDescriptor, backend_kind), desc.backend_kind);
+    store_le_u8(wire.data() + offsetof(BufferDescriptor, device_readable), desc.device_readable);
     std::memcpy(
         wire.data() + offsetof(BufferDescriptor, identity) + offsetof(CanonicalIdentity, owner_instance_id),
         desc.identity.owner_instance_id, OWNER_INSTANCE_ID_BYTES
@@ -2015,6 +2016,7 @@ BufferDescriptor decode_buffer_descriptor_wire(const uint8_t *raw, size_t size) 
     desc.address_space = load_le_u8(raw + offsetof(BufferDescriptor, address_space));
     desc.access = load_le_u8(raw + offsetof(BufferDescriptor, access));
     desc.backend_kind = load_le_u8(raw + offsetof(BufferDescriptor, backend_kind));
+    desc.device_readable = load_le_u8(raw + offsetof(BufferDescriptor, device_readable));
     std::memcpy(
         desc.identity.owner_instance_id,
         raw + offsetof(BufferDescriptor, identity) + offsetof(CanonicalIdentity, owner_instance_id),
@@ -2333,7 +2335,8 @@ NB_MODULE(_task_interface, m) {
         .def(
             "__init__",
             [](BufferDescriptor *self, const CanonicalIdentity &identity, AddressSpace address_space, AccessMode access,
-               BackendKind backend_kind, uint64_t nbytes, nb::bytes body, uint32_t owner_worker_path_id) {
+               BackendKind backend_kind, uint64_t nbytes, nb::bytes body, uint32_t owner_worker_path_id,
+               bool device_readable) {
                 if (body.size() > DESC_MAX_BYTES) {
                     throw std::invalid_argument(
                         "backend body exceeds DESC_MAX_BYTES (" + std::to_string(DESC_MAX_BYTES) + "), got " +
@@ -2345,6 +2348,7 @@ NB_MODULE(_task_interface, m) {
                 self->address_space = static_cast<uint8_t>(address_space);
                 self->access = static_cast<uint8_t>(access);
                 self->backend_kind = static_cast<uint8_t>(backend_kind);
+                self->device_readable = device_readable;
                 self->identity = identity;
                 self->nbytes = nbytes;
                 self->owner_worker_path_id = owner_worker_path_id;
@@ -2353,7 +2357,8 @@ NB_MODULE(_task_interface, m) {
                 validate_buffer_descriptor(*self);
             },
             nb::arg("identity"), nb::arg("address_space"), nb::arg("access"), nb::arg("backend_kind"),
-            nb::arg("nbytes"), nb::arg("body") = nb::bytes(""), nb::arg("owner_worker_path_id") = 0
+            nb::arg("nbytes"), nb::arg("body") = nb::bytes(""), nb::arg("owner_worker_path_id") = 0,
+            nb::arg("device_readable") = false
         )
 
         .def_ro("identity", &BufferDescriptor::identity)
@@ -2373,6 +2378,12 @@ NB_MODULE(_task_interface, m) {
             "backend_kind",
             [](const BufferDescriptor &self) {
                 return static_cast<BackendKind>(self.backend_kind);
+            }
+        )
+        .def_prop_ro(
+            "device_readable",
+            [](const BufferDescriptor &self) {
+                return self.device_readable != 0;
             }
         )
         .def_ro("nbytes", &BufferDescriptor::nbytes)
@@ -2801,9 +2812,14 @@ NB_MODULE(_task_interface, m) {
             [](TaskArgs &self, const Tensor &t, TensorArgType tag, nb::object transfer) {
                 validate_tensor(t);
                 check_access_subset(t.buffer.access, tag);
-                const auto request = transfer.is_none() ?
-                                         legacy_tensor_transfer(static_cast<AddressSpace>(t.buffer.address_space)) :
-                                         nb::cast<TensorTransfer>(transfer);
+                const auto request =
+                    transfer.is_none() ?
+                        (t.buffer.device_readable ?
+                             TensorTransfer::NONE :
+                             legacy_tensor_transfer(static_cast<AddressSpace>(t.buffer.address_space))) :
+                        nb::cast<TensorTransfer>(transfer);
+                if (t.buffer.device_readable && (tag != TensorArgType::INPUT || request != TensorTransfer::NONE))
+                    throw std::invalid_argument("device_readable Host tables require INPUT and no staging transfer");
                 self.add_tensor(t, tag, request);
             },
             nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT, nb::kw_only(), nb::arg("transfer") = nb::none(),
@@ -3989,6 +4005,9 @@ NB_MODULE(_task_interface, m) {
             "supports_concurrent_native_prepare", &ChipWorker::supports_concurrent_native_prepare,
             "Whether non-diagnostic native preparation may overlap one active run in another slot."
         )
+        .def_prop_ro("_host_ddr_mapping_supported", &ChipWorker::host_ddr_mapping_supported)
+        .def("_map_host_ddr", &ChipWorker::map_host_ddr, nb::call_guard<nb::gil_scoped_release>())
+        .def("_unmap_host_ddr", &ChipWorker::unmap_host_ddr, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
             "launch_depth", &ChipWorker::launch_depth,
             "How many runs this worker may have launched at once, after its request was resolved "

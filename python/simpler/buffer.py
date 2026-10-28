@@ -58,6 +58,7 @@ from .comm_endpoints import (
     RegionAccessReasonCode,
     buffer_adapter_candidates,
 )
+from .host_ddr import HostDdrSource
 
 __all__ = [
     "AccessMode",
@@ -340,9 +341,16 @@ class Buffer:
     # a field it changes stays visible to the provenance comparison that rejects it.
     _descriptor: BufferDescriptor | None = field(default=None, init=False, compare=False, repr=False)
 
-    _source_registration: tuple[_DeviceBufferSource, CanonicalIdentity] | None = field(
+    _source_registration: tuple[_DeviceBufferSource | HostDdrSource, CanonicalIdentity] | None = field(
         default=None, init=False, compare=False, repr=False
     )
+
+    _device_readable: bool = field(default=False, init=False, compare=False, repr=False)
+
+    @property
+    def device_readable(self) -> bool:
+        """Whether device kernels may read this Host backing without staging."""
+        return self._device_readable
 
     @classmethod
     def wrap(
@@ -381,6 +389,7 @@ class Buffer:
             backend_kind=self.backend_kind,
             nbytes=self.nbytes,
             body=self.body,
+            device_readable=self.device_readable,
         )
         if self._source_registration is not None:
             source, identity = self._source_registration
@@ -474,7 +483,11 @@ def re_export(source: BufferDescriptor) -> Buffer:
     materializes lazily. Dependency inference keys on the (invariant) identity, so an alias /
     retain-release does not split across layers. Re-export is per-backing (memoize by identity), so
     pure forwarding carries no per-tensor map cost.
+
+    Device-readable Host buffers require their owning L2 mapping and cannot be re-exported.
     """
+    if source.device_readable:
+        raise ValueError("device_readable Host buffers cannot be re-exported; use their owning L2 Worker")
     return Buffer(
         identity=source.identity,
         owner_worker_path_id=source.owner_worker_path_id,

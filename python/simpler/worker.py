@@ -270,6 +270,7 @@ from .global_comm_domain import (
     resolve_global_comm_capability,
     validate_descriptor_table,
 )
+from .host_ddr import HostDdrSource
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
@@ -11960,6 +11961,7 @@ class Worker:
         self._source_context_failed = False
         self._source_attachments: set[CanonicalIdentity] = set()
         self._chip_source_uses: dict[int, tuple[CanonicalIdentity, ...]] = {}
+        self._host_ddr_source: HostDdrSource | None = None
         # Which identities each CommDomain allocation minted, so its release revokes them together.
         self._domain_members: dict[int, set[CanonicalIdentity]] = {}
         # Guards every device-allocation table. Entry points take it (`_require_device_capability`,
@@ -12047,6 +12049,8 @@ class Worker:
         if identities:
             assert self._device_buffer_source is not None
             self._device_buffer_source.release(identities)
+        if self._host_ddr_source is not None:
+            self._host_ddr_source.release(run_id)
 
     def _record_device_alloc(self, handle: Buffer, *, domain_allocation_id: int | None = None) -> None:
         """Make ``handle`` a live device allocation operands may name. Caller holds ``_child_prov_lock``.
@@ -12840,7 +12844,7 @@ class Worker:
     # Post-fork zero-copy host buffers
     # ------------------------------------------------------------------
 
-    def create_buffer(self, nbytes: int) -> Buffer:
+    def create_buffer(self, nbytes: int, *, device_readable: bool = False) -> Buffer:
         """Allocate a shared ``Buffer`` owned by this Worker (P1-B).
 
         The backing is a POSIX shm; the Buffer carries a typed canonical identity and a
@@ -12850,11 +12854,44 @@ class Worker:
         consumer is a forked child; at L2 (a leaf, no children) the Worker itself materializes the
         tensor in-process on ``run``. Build a tensor over ``buffer.shm.buf`` with the buffer protocol.
         Not thread-safe against a concurrent run/create/free on the same Worker.
+
+        ``device_readable=False`` preserves ordinary Host staging and copy rules.
+        True requires direct L2 and a compatible loaded A5 onboard runtime.
+        The backing stays HOST and is mapped once for synchronous device reads;
+        Tensor views inherit the policy and never allocate whole-table staging.
+        Parameters must be INPUT with explicit callable direction IN.
         """
         if self.level < 2:
             raise TypeError("create_buffer requires a level >= 2 Worker")
+        if not isinstance(device_readable, bool):
+            raise TypeError("create_buffer: device_readable must be a bool")
+        if device_readable and self.level != 2:
+            raise TypeError("device_readable=True requires a single-process level 2 Worker")
         with self._operation_lease("create_buffer", allow_continuation=True):
-            return self._create_buffer_locked(int(nbytes))
+            if device_readable:
+                if not getattr(self._chip_worker, "_host_ddr_mapping_supported", False):
+                    raise RuntimeError("device_readable=True requires an A5 onboard runtime with Host mapping support")
+            buffer = self._create_buffer_locked(int(nbytes))
+            if not device_readable:
+                return buffer
+            buffer.access = AccessMode.READ
+            buffer._device_readable = True
+            if self._host_ddr_source is None:
+                owner = weakref.ref(self)
+                chip = self._chip_worker
+                self._host_ddr_source = HostDdrSource(
+                    chip,
+                    lambda: (worker := owner()) is not None
+                    and worker._chip_worker is chip
+                    and not worker._source_context_failed,
+                )
+            try:
+                self._host_ddr_source.register(buffer)
+            except BaseException:
+                # Keep failed cleanup owned and retryable through Worker.close().
+                self.release_buffer(buffer)
+                raise
+            return buffer
 
     def alloc_shared_tensor(self, shapes: tuple[int, ...], dtype) -> Buffer:
         """Allocate a runtime-managed intermediate buffer (the ``Tensor`` form of ``orch.alloc``).
@@ -13606,6 +13643,10 @@ class Worker:
                     self._chip_source_uses[run_id] = sources
         native_entered = False
         try:
+            if self._host_ddr_source is not None:
+                self._host_ddr_source.acquire(run_id, args)
+            elif any(args.tensor(i).buffer.device_readable for i in range(args.tensor_count())):
+                raise ValueError("device_readable Host buffer is not owned by this L2 context")
             chip_args = self._materialize_l2_args(args)
             native_entered = True
             submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
@@ -13917,10 +13958,13 @@ class Worker:
             self._chip_import_registry = registry
         if args is None:
             args = TaskArgs()
-        return _materialize_chip_task_args(args, registry)
+        mappings = self._host_ddr_source.mapped_bases() if self._host_ddr_source is not None else None
+        return _materialize_chip_task_args(args, registry, mappings)
 
     def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
         """Materialize an L2 leaf's tensor args and run the kernel to completion."""
+        if args is not None and any(args.tensor(i).buffer.device_readable for i in range(args.tensor_count())):
+            raise ValueError("device_readable Host buffers require Worker.run/submit lifetime reservations")
         _validate_host_control_access(self._callable_registry.get(callable_id), TaskArgs() if args is None else args)
         chip_args = self._materialize_l2_args(args)
         assert self._chip_worker is not None

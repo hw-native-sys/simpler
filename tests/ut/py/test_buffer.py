@@ -1101,7 +1101,7 @@ def test_buffer_descriptor_wire_codec_rejects_malformed_input():
         _decode_buffer_descriptor_wire(bytes(dirty_handle))
 
     dirty_pad = bytearray(wire)
-    dirty_pad[5] = 0xA5
+    dirty_pad[6] = 0xA5
     dirty_pad[54] = 0xA5
     assert _decode_buffer_descriptor_wire(bytes(dirty_pad)) == desc
 

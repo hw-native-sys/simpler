@@ -692,6 +692,11 @@ void ChipWorker::finalize() {
             " run storage block(s) and kept the context and the host runtime loaded"
         );
     }
+    {
+        std::lock_guard<std::mutex> lock(host_ddr_mutex_);
+        if (!host_ddr_mappings_.empty())
+            throw std::runtime_error("ChipWorker::finalize: device-readable Host buffers still retain mappings");
+    }
     // Global domains are independent of the legacy communicator sessions.
     // Release them while the host runtime and device context are still alive.
     if (comm_global_domain_release_fn_ != nullptr) {
@@ -2062,6 +2067,44 @@ void ChipWorker::clear_comm_sessions() {
     comm_sessions_.clear();
     comm_session_index_.clear();
     base_comm_handle_ = 0;
+}
+
+bool ChipWorker::host_ddr_mapping_supported() const noexcept {
+    return runtime_module_ != nullptr && runtime_module_->optional<void *>("host_ddr_map_ctx") != nullptr &&
+           runtime_module_->optional<void *>("host_ddr_unmap_ctx") != nullptr;
+}
+
+uint64_t ChipWorker::map_host_ddr(uint64_t host, uint64_t bytes) {
+    if (!initialized_ || !host_ddr_mapping_supported())
+        throw std::runtime_error("device_readable Host mapping requires an initialized A5 onboard runtime");
+    if (!host || !bytes || host > UINT64_MAX - bytes)
+        throw std::invalid_argument("Host mapping requires a nonempty address range");
+    validate_execution_context();
+    std::lock_guard<std::mutex> lock(host_ddr_mutex_);
+    auto [it, inserted] = host_ddr_mappings_.try_emplace(host, HostDdrMapping{bytes});
+    if (!inserted) {
+        if (it->second.bytes == bytes && it->second.mapped) return it->second.mapped;
+        throw std::runtime_error("Host mapping already exists or awaits failed-initialization cleanup");
+    }
+    using Map = int (*)(DeviceContextHandle, int, uint64_t, uint64_t, uint64_t *, unsigned *);
+    auto map = runtime_module_->required<Map>("host_ddr_map_ctx");
+    const int rc = map(device_ctx_, device_id_, host, bytes, &it->second.mapped, &it->second.registered);
+    if (rc != 0) {
+        if (!it->second.registered) host_ddr_mappings_.erase(it);
+        throw std::runtime_error("Host DDR mapping failed: " + std::to_string(rc));
+    }
+    return it->second.mapped;
+}
+
+void ChipWorker::unmap_host_ddr(uint64_t host) {
+    std::lock_guard<std::mutex> lock(host_ddr_mutex_);
+    auto it = host_ddr_mappings_.find(host);
+    if (it == host_ddr_mappings_.end()) return;
+    validate_execution_context();
+    using Unmap = int (*)(DeviceContextHandle, int, uint64_t);
+    const int rc = runtime_module_->required<Unmap>("host_ddr_unmap_ctx")(device_ctx_, device_id_, host);
+    if (rc != 0) throw std::runtime_error("Host DDR unmapping failed: " + std::to_string(rc));
+    host_ddr_mappings_.erase(it);
 }
 
 uint64_t ChipWorker::malloc(size_t size) {

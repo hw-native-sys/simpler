@@ -74,10 +74,16 @@ public:
     using Base::tensor_data;
 
     void add_tensor(const Tensor &t, TensorArgType tag = TensorArgType::INPUT) {
-        add_tensor(t, tag, legacy_tensor_transfer(static_cast<AddressSpace>(t.buffer.address_space)));
+        add_tensor(
+            t, tag,
+            t.buffer.device_readable ? TensorTransfer::NONE :
+                                       legacy_tensor_transfer(static_cast<AddressSpace>(t.buffer.address_space))
+        );
     }
 
     void add_tensor(const Tensor &t, TensorArgType tag, TensorTransfer transfer) {
+        if (t.buffer.device_readable && (tag != TensorArgType::INPUT || transfer != TensorTransfer::NONE))
+            throw std::invalid_argument("device_readable Host tables require INPUT and no staging transfer");
         if (const char *error = tensor_transfer_error(static_cast<AddressSpace>(t.buffer.address_space), transfer)) {
             throw std::invalid_argument(error);
         }
@@ -98,6 +104,8 @@ public:
 
     TensorTransfer transfer(int32_t i) const {
         const auto request = transfers_.at(static_cast<size_t>(i));
+        if (tensor(i).buffer.device_readable && (tag(i) != TensorArgType::INPUT || request != TensorTransfer::NONE))
+            throw std::invalid_argument("device_readable Host tables require INPUT and no staging transfer");
         if (const char *error =
                 tensor_transfer_error(static_cast<AddressSpace>(tensor(i).buffer.address_space), request)) {
             throw std::invalid_argument(error);
@@ -152,6 +160,8 @@ struct TaskArgsView {
         const auto request = static_cast<TensorTransfer>(
             tensor_bytes[static_cast<size_t>(i) * sizeof(Tensor) + TASK_ARG_TRANSFER_OFFSET]
         );
+        if (t.buffer.device_readable && request != TensorTransfer::NONE)
+            throw std::invalid_argument("device_readable Host tables cannot use staging transfers");
         if (const char *error = tensor_transfer_error(static_cast<AddressSpace>(t.buffer.address_space), request)) {
             throw std::invalid_argument(error);
         }
