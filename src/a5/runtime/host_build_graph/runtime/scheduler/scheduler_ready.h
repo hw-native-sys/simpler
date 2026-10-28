@@ -139,6 +139,14 @@ struct SchedulerFreeSlotClaim {
     uint16_t block_num{1};
 };
 
+// How many slots the set this claim names actually has. A claim's slot_index is
+// an index into one of two differently sized sets, and which one is the claim's
+// own `mix` flag, so every bound check on it has to ask the flag rather than
+// assume a count.
+inline __aicore__ uint32_t scheduler_slot_limit(const SchedulerFreeSlotClaim &claim) {
+    return claim.mix ? SCHEDULER_MIX_SLOT_COUNT : SCHEDULER_PENDING_SLOT_COUNT;
+}
+
 // Where a Mix dispatch is published. Only a Mix slot is published through SSBUF
 // at all: it is the one slot a core does not fill for itself, so its holder has
 // to be told. A core's own dispatch stays in local state, which is where its
@@ -230,7 +238,15 @@ struct SchedulerLocalProfilingState {
     }
 };
 
-inline constexpr uint32_t SCHEDULER_MIX_TRACKER_COUNT = PLATFORM_CORES_PER_BLOCKDIM * SCHEDULER_PENDING_SLOT_COUNT;
+// One tracker per outstanding Mix dispatch on this cluster's coordinator, which
+// is what aggregates that dispatch's subtasks. Sized by the Mix slots a cluster
+// has, never by a core's own slot count: how much work a core hoards for itself
+// says nothing about how many Mix dispatches its coordinator can have in the
+// air. This is an upper bound and not a tight one -- a dispatch takes one slot
+// per lane, so SCHEDULER_MIX_SLOT_COUNT of them can be outstanding at once --
+// and running out is not an error: placement fails and the task waits in the
+// ready queue for the next round.
+inline constexpr uint32_t SCHEDULER_MIX_TRACKER_COUNT = PLATFORM_CORES_PER_BLOCKDIM * SCHEDULER_MIX_SLOT_COUNT;
 struct SchedulerMixTracker {
     int64_t task_ref{SCHEDULER_TASK_REF_INVALID};
     uint8_t active_mask{0};
@@ -347,12 +363,13 @@ static_assert(alignof(SchedulerLocalState) == alignof(uint64_t));
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalConfig) == 120, "64-bit local config size changed");
 // Tripwires against unintended growth of core-local state, not a wire contract:
 // the executor already spills enough to fault on A5 when this grows carelessly
-// (see the note on stage_task_trace_before_execution). Eight slot states per
-// core means every byte added here costs eight.
+// (see the note on stage_task_trace_before_execution). Seven slot states per
+// core -- its own one plus the cluster's six Mix slots -- means every byte added
+// to one costs seven.
 static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalSlotState) == 24, "64-bit local slot size changed");
-static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 512, "64-bit local state size changed");
+static_assert(sizeof(void *) != 8 || sizeof(SchedulerLocalState) == 480, "64-bit local state size changed");
 static_assert(
-    sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 240, "64-bit local profiling size changed"
+    sizeof(void *) != 8 || sizeof(SchedulerLocalProfilingState) == 184, "64-bit local profiling size changed"
 );
 
 // Called once after READY acquire, before any bootstrap or mailbox operation.
@@ -494,23 +511,13 @@ scheduler_local_ready_pop(SchedulerLocalState *scheduler_local_state, uint32_t *
     if (slot_index == nullptr || publication == nullptr || scheduler_local_state->local_ready_mask == 0 ||
         scheduler_local_state->config.self_lane >= PLATFORM_CORES_PER_BLOCKDIM)
         return false;
-    uint32_t oldest = UINT32_MAX;
-    for (uint32_t selected = 0; selected < SCHEDULER_PENDING_SLOT_COUNT; ++selected) {
-        if ((scheduler_local_state->local_ready_mask & (1U << selected)) == 0) continue;
-        const auto &slot = scheduler_local_state->slots[selected];
-        if (oldest == UINT32_MAX || slot.generation < scheduler_local_state->slots[oldest].generation)
-            oldest = selected;
-    }
-    if (oldest != UINT32_MAX) {
-        scheduler_local_state->local_ready_mask &= ~(1U << oldest);
-        *slot_index = oldest;
-        const auto &slot = scheduler_local_state->slots[oldest];
-        // A local notification owns this slot until it is consumed here. Keep
-        // an invalid state in the token so the Executor rejects it.
-        *publication = (static_cast<uint64_t>(slot.generation) << 8) | static_cast<uint64_t>(slot.state);
-        return true;
-    }
-    return false;
+    scheduler_local_state->local_ready_mask &= ~UINT32_C(1);
+    *slot_index = 0;
+    const auto &slot = scheduler_local_state->slots[0];
+    // A local notification owns this slot until it is consumed here. Keep an
+    // invalid state in the token so the Executor rejects it.
+    *publication = (static_cast<uint64_t>(slot.generation) << 8) | static_cast<uint64_t>(slot.state);
+    return true;
 }
 
 inline __aicore__ void scheduler_owner_queue_activate(SchedulerLocalState *scheduler_local_state, TaskType type) {
@@ -1401,7 +1408,8 @@ inline __aicore__ bool scheduler_prepare_dispatch_slot(
 ) {
     if (ssbuf_region == nullptr || scheduler == nullptr || !scheduler_task_ref_valid(graph, ready_claim.task_ref) ||
         slot_claim.worker_id >= scheduler->config.runtime_worker_count ||
-        slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT || slot_claim.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM)
+        slot_claim.slot_index >= scheduler_slot_limit(slot_claim) ||
+        slot_claim.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM)
         return false;
     if (prepare_start_cycles != nullptr)
         *prepare_start_cycles = scheduler_phase_timing_enabled(profiling_level) ? scheduler_cycles() : 0;
@@ -1588,7 +1596,7 @@ inline __aicore__ bool scheduler_fill_dispatch_slot(
     const SchedulerReadyClaim &ready_claim, uint64_t profiling_level, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region
 ) {
     if (scheduler == nullptr || slot_claim.cluster_lane >= PLATFORM_CORES_PER_BLOCKDIM ||
-        slot_claim.slot_index >= SCHEDULER_PENDING_SLOT_COUNT)
+        slot_claim.slot_index >= scheduler_slot_limit(slot_claim))
         return false;
     auto &slot = *scheduler->slot_state(slot_claim);
     if (slot.state == SchedulerDispatchSlotState::FREE && slot.generation == slot_claim.generation)

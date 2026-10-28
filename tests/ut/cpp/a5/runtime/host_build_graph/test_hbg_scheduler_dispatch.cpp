@@ -159,24 +159,22 @@ TEST(SchedulerSsbufCompletionInbox, ReadyWordPreservesSignedTimingSlotAndGenerat
     }
 }
 
-TEST(SchedulerClusterCompletion, AccumulatesBatchOnSuccessAndBothKindsOfErrorExit) {
+// A core services one own slot per pass, so the three outcomes are driven one
+// at a time: a clean completion, a resolve that fails, and a generation the
+// slot never published.
+TEST(SchedulerClusterCompletion, CountsACompletionAndTakesBothKindsOfErrorExit) {
     for (int failure = 0; failure < 3; ++failure) {
+        SCOPED_TRACE(failure);
         FixtureStorage storage(2, 2);
         GraphBuffer graph(2);
         graph.executable(0, 0);
         graph.executable(1, 0);
         auto &scheduler = storage.contexts[0];
         prepare_completed_normal_slot(storage, scheduler);
-        auto &second = storage.scheduler_local_state.slots[1];
-        scheduler_initialize_free_slot(&second);
-        second.task_ref = 1;
-        second.subtask_slot = 0;
-        second.state = SchedulerDispatchSlotState::READY;
-        second.generation = ++storage.scheduler_local_state.dispatch_sequence;
         auto *control =
-            scheduler_task_control_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 1);
+            scheduler_task_control_at(storage.scheduler_state->base(), storage.local_context(&scheduler), 0);
         if (failure == 1) control->wake_list_head = SCHEDULER_WAKE_LIST_CLOSED;
-        storage.scheduler_local_state.local_completed_generations[1] = second.generation + (failure == 2 ? 1 : 0);
+        if (failure == 2) storage.scheduler_local_state.local_completed_generations[0] += 1;
         EXPECT_EQ(
             scheduler_service_cluster_completions(
                 graph.graph(), storage.scheduler_state->base(),
@@ -185,9 +183,12 @@ TEST(SchedulerClusterCompletion, AccumulatesBatchOnSuccessAndBothKindsOfErrorExi
             ),
             failure == 0
         );
-        EXPECT_EQ(storage.scheduler_local_state.pending_completed, failure == 2 ? 1u : 2u);
+        // A resolve that fails still counts the task, so resolved_task_count
+        // stays consistent with what the run dispatched; a generation the slot
+        // never published is rejected before that and counts nothing.
+        EXPECT_EQ(storage.scheduler_local_state.pending_completed, failure == 2 ? 0u : 1u);
         EXPECT_EQ(storage.run_control->scheduler_error == 0, failure == 0);
-        EXPECT_EQ(scheduler_consumed_completion_generation(&storage.scheduler_local_state, 0, 0), 1u);
+        if (failure == 0) EXPECT_EQ(scheduler_consumed_completion_generation(&storage.scheduler_local_state, 0, 0), 1u);
     }
 }
 
@@ -636,38 +637,37 @@ TEST(SchedulerClusterCompletion, CachesStableWorkerTraceAfterFirstCompletion) {
     target.trace_register_release_cycles = 13;
     target.trace_descriptor_cache_observed_cycles = 14;
 
+    // A core has one slot, so the two completions are two rounds on it. The
+    // cache is what the second round must read: the target reports new numbers
+    // by then, and the trace still has to carry the first round's.
     SchedulerLocalState scheduler_local_state{};
-    for (uint32_t pending_slot = 0; pending_slot < SCHEDULER_PENDING_SLOT_COUNT; ++pending_slot) {
-        SchedulerLocalSlotState *local_slot = &scheduler_local_state.slots[pending_slot];
+    SchedulerLocalSlotState *local_slot = &scheduler_local_state.slots[0];
+    for (int64_t task_ref = 0; task_ref < 2; ++task_ref) {
+        if (task_ref == 1) {
+            target.trace_aicore_entry_cycles = 21;
+            target.trace_handshake_publish_cycles = 22;
+            target.trace_register_release_cycles = 23;
+            target.trace_descriptor_cache_observed_cycles = 24;
+        }
         scheduler_initialize_free_slot(local_slot);
         SchedulerReadyClaim ready{};
-        ready.task_ref = pending_slot;
+        ready.task_ref = task_ref;
         ASSERT_TRUE(scheduler_fill_dispatch_slot(
             graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
-            storage.run_control, SchedulerFreeSlotClaim{0, pending_slot, local_slot->generation, 0}, ready,
+            storage.run_control, SchedulerFreeSlotClaim{0, 0, local_slot->generation, 0}, ready,
             SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, storage.ssbuf_region
         ));
-        auto *executor_trace = &scheduler_local_state.profiling->executor_traces[pending_slot];
-        executor_trace->kernel_start_cycles = 100 + pending_slot;
-        executor_trace->kernel_end_cycles = 200 + pending_slot;
+        auto *executor_trace = &scheduler_local_state.profiling->executor_traces[0];
+        executor_trace->kernel_start_cycles = 100 + task_ref;
+        executor_trace->kernel_end_cycles = 200 + task_ref;
+
+        ASSERT_TRUE(scheduler_service_cluster_completion_slot(
+            graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
+            storage.run_control, 0, 0, local_slot->generation, nullptr, nullptr, nullptr,
+            SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr, nullptr, storage.ssbuf_region
+        ));
+        ASSERT_TRUE((scheduler_local_state.profiling->worker_trace_valid_mask & 1U) != 0);
     }
-
-    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
-        graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
-        storage.run_control, 0, 0, scheduler_local_state.slots[0].generation, nullptr, nullptr, nullptr,
-        SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr, nullptr, storage.ssbuf_region
-    ));
-    ASSERT_TRUE((scheduler_local_state.profiling->worker_trace_valid_mask & 1U) != 0);
-
-    target.trace_aicore_entry_cycles = 21;
-    target.trace_handshake_publish_cycles = 22;
-    target.trace_register_release_cycles = 23;
-    target.trace_descriptor_cache_observed_cycles = 24;
-    ASSERT_TRUE(scheduler_service_cluster_completion_slot(
-        graph.graph(), storage.scheduler_state->base(), storage.local_context(&scheduler, &scheduler_local_state),
-        storage.run_control, 0, 1, scheduler_local_state.slots[1].generation, nullptr, nullptr, nullptr,
-        SCHEDULER_PROFILING_SCHED_PHASES_LEVEL, nullptr, nullptr, storage.ssbuf_region
-    ));
 
     auto *traces =
         scheduler_state_at<SchedulerTaskTrace>(storage.scheduler_state->base(), storage.layout.trace_cells_offset);
@@ -792,7 +792,10 @@ TEST(SchedulerNormalDispatch, FindsOwnQueuedWorkWithItsDirectoryBitClear) {
     EXPECT_EQ(local->own_slots()[0].state, SchedulerDispatchSlotState::READY);
 }
 
-TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
+// A core has one dispatch slot, so a pass fills at most one task and there is
+// no "later fill" to preserve earlier progress across. What survives is the
+// reporting: a fill that fails names its site and publishes nothing.
+TEST(SchedulerNormalDispatch, AFailedFillNamesItsSiteAndPublishesNothing) {
     FixtureStorage storage(2, 3);
     GraphBuffer graph(2);
     graph.executable(0, 0);
@@ -810,12 +813,13 @@ TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
     auto *local = storage.local_context(&scheduler, &storage.scheduler_local_state);
     SchedulerReadyBatch batch{};
     SchedulerReadyStats ready_stats{};
-    for (int64_t task_ref = 0; task_ref < 2; ++task_ref) {
-        auto *control = scheduler_task_control_at(storage.scheduler_state->base(), local, task_ref);
+    // Only the Mix-shaped task is queued: an AIC queue holding it is the shape
+    // error this exercises, and with one slot a well-formed task ahead of it
+    // would simply end the pass before it was reached.
+    {
+        auto *control = scheduler_task_control_at(storage.scheduler_state->base(), local, 1);
         control->state = static_cast<int64_t>(SchedulerTaskState::BLOCKED);
-        ASSERT_TRUE(
-            scheduler_ready_batch_append(storage.scheduler_state->base(), local, task_ref, &batch, &ready_stats)
-        );
+        ASSERT_TRUE(scheduler_ready_batch_append(storage.scheduler_state->base(), local, 1, &batch, &ready_stats));
     }
     ASSERT_TRUE(
         scheduler_ready_batch_push(storage.scheduler_state->base(), local, TaskType::AIC, &batch, &ready_stats)
@@ -823,49 +827,17 @@ TEST(SchedulerNormalDispatch, PreservesProgressWhenALaterFillFails) {
 
     uint64_t victim_cursors[SCHEDULER_CORE_TYPE_COUNT]{};
     bool failed = false;
-    EXPECT_TRUE(scheduler_fill_own_slots(
+    EXPECT_FALSE(scheduler_fill_own_slots(
         graph.graph(), storage.scheduler_state->base(), local, storage.run_control, victim_cursors, &ready_stats, 0, 0,
         &failed, storage.ssbuf_region
     ));
     EXPECT_TRUE(failed);
-    EXPECT_EQ(local->own_slots()[0].task_ref, 0);
-    EXPECT_EQ(local->own_slots()[0].state, SchedulerDispatchSlotState::READY);
-    EXPECT_EQ(local->own_slots()[1].task_ref, SCHEDULER_TASK_REF_INVALID);
-    EXPECT_EQ(local->own_slots()[1].state, SchedulerDispatchSlotState::FILLING);
-    // Slot 0 dispatched and slot 1 did not, so only slot 0 is published.
-    EXPECT_EQ(local->local_ready_mask, 1u);
+    EXPECT_EQ(local->own_slots()[0].state, SchedulerDispatchSlotState::FILLING);
+    // The slot was taken out of FREE but never reached READY, so nothing is
+    // published for the executor to pick up.
+    EXPECT_EQ(local->local_ready_mask, 0u);
     EXPECT_NE(storage.run_control->scheduler_error, 0u);
     EXPECT_EQ(storage.run_control->error_site, static_cast<uint64_t>(SchedulerErrorSite::DISPATCH_INVALID_SHAPE));
-}
-
-TEST(SchedulerLocalReady, OlderDispatchPrecedesReusedLowerSlot) {
-    SchedulerLocalState scheduler_local_state{};
-    scheduler_local_state.config.self_lane = 1;
-    scheduler_local_state.slots[0].generation = 1;
-    scheduler_local_state.slots[1].generation = 2;
-    scheduler_local_state.slots[0].state = SchedulerDispatchSlotState::READY;
-    scheduler_local_state.slots[1].state = SchedulerDispatchSlotState::READY;
-    const uint64_t slot_0_publication = scheduler_dispatch_publication(1, SchedulerDispatchSlotState::READY);
-    const uint64_t slot_1_publication = scheduler_dispatch_publication(2, SchedulerDispatchSlotState::READY);
-    scheduler_local_ready_publish(&scheduler_local_state, 0);
-    scheduler_local_ready_publish(&scheduler_local_state, 1);
-
-    uint32_t pending_slot = UINT32_MAX;
-    uint64_t publication = 0;
-    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, &pending_slot, &publication));
-    EXPECT_EQ(pending_slot, 0u);
-    EXPECT_EQ(publication, slot_0_publication);
-
-    scheduler_local_state.slots[0].generation = 3;
-    scheduler_local_ready_publish(&scheduler_local_state, 0);
-    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, &pending_slot, &publication));
-    EXPECT_EQ(pending_slot, 1u);
-    EXPECT_EQ(publication, slot_1_publication);
-
-    ASSERT_TRUE(scheduler_local_ready_pop(&scheduler_local_state, &pending_slot, &publication));
-    EXPECT_EQ(pending_slot, 0u);
-    EXPECT_EQ(publication, scheduler_dispatch_publication(3, SchedulerDispatchSlotState::READY));
-    EXPECT_EQ(scheduler_local_state.local_ready_mask, 0u);
 }
 
 TEST(SchedulerLocalReady, InvalidSlotStateIsNotReconstructedAsReady) {
@@ -1071,9 +1043,9 @@ TEST(SchedulerNormalDispatch, NoUsableCapacityDoesNotAccessDirectory) {
     EXPECT_FALSE(scheduler_has_usable_slot(local, own_type, 0));
 
     // A free slot is capacity unless a completion pass already refilled it.
-    local->own_slots()[1].state = SchedulerDispatchSlotState::FREE;
+    local->own_slots()[0].state = SchedulerDispatchSlotState::FREE;
     EXPECT_TRUE(scheduler_has_usable_slot(local, own_type, 0));
-    EXPECT_FALSE(scheduler_has_usable_slot(local, own_type, UINT64_C(1) << 1));
+    EXPECT_FALSE(scheduler_has_usable_slot(local, own_type, UINT64_C(1) << 0));
     // Work of another type is never this core's capacity.
     EXPECT_FALSE(scheduler_has_usable_slot(local, own_type == 0 ? 1 : 0, 0));
 }
@@ -1194,21 +1166,21 @@ TEST(SchedulerMix, MasksHaveIndependentPayloadsAndStablePhysicalContext) {
 
 TEST(SchedulerMix, TwoPublishedMixesReleaseEachLaneBeforeWholeTask) {
     MixFixture f;
+    // AIV-only Mix for both. The coordinator has one own slot, so two Mix tasks
+    // with an AIC subtask cannot be in the air at once and the second would
+    // never be published -- which is a different property from the one here.
+    f.set_task(0, 6);
+    f.set_task(1, 6);
     f.enqueue(0);
     f.enqueue(1);
     ASSERT_TRUE(f.dispatch());
-    for (uint32_t lane = 0; lane < 3; ++lane) {
+    for (uint32_t lane = 1; lane < 3; ++lane) {
         EXPECT_EQ(f.slot(lane, 0).task_ref, 0);
         EXPECT_EQ(f.slot(lane, 1).task_ref, 1);
         EXPECT_EQ(f.slot(lane, 1).generation, 2u);
     }
-    ASSERT_TRUE(f.complete(0, 0));
-    EXPECT_EQ(f.slot(0, 0).state, SchedulerDispatchSlotState::FREE);
-    EXPECT_EQ(f.local->pending_completed, 0u);
-    ASSERT_TRUE(f.complete(0, 1));
-    EXPECT_EQ(f.local->pending_completed, 0u);
-    EXPECT_EQ(f.slot(1, 0).task_ref, 0);
     ASSERT_TRUE(f.complete(1, 0));
+    EXPECT_EQ(f.slot(1, 0).state, SchedulerDispatchSlotState::FREE);
     EXPECT_EQ(f.local->pending_completed, 0u);
     ASSERT_TRUE(f.complete(2, 0));
     EXPECT_EQ(f.local->pending_completed, 1u);
@@ -1220,8 +1192,9 @@ TEST(SchedulerMix, TwoPublishedMixesReleaseEachLaneBeforeWholeTask) {
 
 TEST(SchedulerMix, CapacityCheckLeavesTaskAvailableAndPreservesReservations) {
     MixFixture f;
+    // The coordinator's one own slot is busy, so a Mix task with an AIC subtask
+    // has nowhere to go and the candidate must survive the probe untouched.
     f.local->slots[0].state = SchedulerDispatchSlotState::FILLING;
-    f.local->slots[1].state = SchedulerDispatchSlotState::READY;
     SchedulerReadyClaim candidate{};
     candidate.task_ref = 0;
     candidate.source = SchedulerReadySource::DIRECT_RESOLVE;
@@ -1235,10 +1208,12 @@ TEST(SchedulerMix, CapacityCheckLeavesTaskAvailableAndPreservesReservations) {
     ASSERT_TRUE(f.dispatch());
     EXPECT_EQ(f.sequence(1), 0u);
     EXPECT_EQ(f.slot(0, 0).state, SchedulerDispatchSlotState::FILLING);
-    f.local->slots[1].state = SchedulerDispatchSlotState::FREE;
+    // Freeing it is what lets the queued task place, and the reservation it
+    // made on the AIV lanes is still the one it gets.
+    scheduler_initialize_free_slot(&f.local->slots[0]);
     ASSERT_TRUE(f.dispatch());
-    EXPECT_EQ(f.slot(0, 1).task_ref, 0);
-    EXPECT_EQ(f.slot(0, 0).state, SchedulerDispatchSlotState::FILLING);
+    EXPECT_EQ(f.slot(0, 0).task_ref, 0);
+    EXPECT_EQ(f.sequence(1), 1u);
 }
 
 TEST(SchedulerMix, FailedPreparationPublishesNothingAndConsumesNoSequence) {
@@ -1261,6 +1236,11 @@ TEST(SchedulerMix, FailedPreparationPublishesNothingAndConsumesNoSequence) {
 
 TEST(SchedulerMix, DirectCandidateDoesNotOvertakeQueuedMix) {
     MixFixture f;
+    // AIV-only Mix for both: the coordinator has one own slot, so two Mix tasks
+    // carrying an AIC subtask cannot be in the air together, and the ordering
+    // this pins would never get a second task to order.
+    f.set_task(1, 6);
+    f.set_task(2, 6);
     f.graph.executable(2, 0, {0});
     f.storage.metadata[2].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_EQ(
@@ -1277,7 +1257,7 @@ TEST(SchedulerMix, DirectCandidateDoesNotOvertakeQueuedMix) {
     ));
     EXPECT_EQ(candidate.task_ref, SCHEDULER_TASK_REF_INVALID);
     ASSERT_TRUE(f.dispatch());
-    for (uint32_t lane = 0; lane < 3; ++lane) {
+    for (uint32_t lane = 1; lane < 3; ++lane) {
         EXPECT_EQ(f.slot(lane, 0).task_ref, 1);
         EXPECT_EQ(f.slot(lane, 1).task_ref, 2);
     }
@@ -1285,6 +1265,8 @@ TEST(SchedulerMix, DirectCandidateDoesNotOvertakeQueuedMix) {
 
 TEST(SchedulerMix, DirectCandidatePrecedesMixQueuedAfterResolve) {
     MixFixture f;
+    f.set_task(1, 6);
+    f.set_task(2, 6);
     f.graph.executable(1, 0, {0});
     f.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_EQ(
@@ -1308,7 +1290,7 @@ TEST(SchedulerMix, DirectCandidatePrecedesMixQueuedAfterResolve) {
     ));
     EXPECT_TRUE(progress);
     EXPECT_EQ(candidate.task_ref, SCHEDULER_TASK_REF_INVALID);
-    for (uint32_t lane = 0; lane < 3; ++lane) {
+    for (uint32_t lane = 1; lane < 3; ++lane) {
         EXPECT_EQ(f.slot(lane, 0).task_ref, 1);
         EXPECT_EQ(f.slot(lane, 1).task_ref, 2);
     }
@@ -1316,6 +1298,9 @@ TEST(SchedulerMix, DirectCandidatePrecedesMixQueuedAfterResolve) {
 
 TEST(SchedulerMix, DirectCandidateQueuesWhenRequiredLaneIsBusy) {
     MixFixture f;
+    // The direct candidate is AIV-only, so what refuses it is the busy lane
+    // rather than the coordinator's one own slot, which task 2 takes below.
+    f.set_task(1, 6);
     f.graph.executable(1, 0, {0});
     f.storage.metadata[1].flags |= SCHEDULER_TASK_HAS_FANIN;
     ASSERT_EQ(
@@ -1347,7 +1332,6 @@ TEST(SchedulerMix, DirectCandidateQueuesWhenRequiredLaneIsBusy) {
     for (auto &slot : f.local->mix_slots[2])
         slot.state = SchedulerDispatchSlotState::FREE;
     ASSERT_TRUE(f.dispatch());
-    EXPECT_EQ(f.slot(0, 1).task_ref, 1);
     EXPECT_EQ(f.slot(1, 1).task_ref, 1);
     EXPECT_EQ(f.slot(2, 0).task_ref, 1);
 }
@@ -1380,6 +1364,10 @@ TEST(SchedulerMix, CompletedMixPassesUnlockedMixToDirectCandidate) {
 
 TEST(SchedulerMix, MultipleUnlockedMixesKeepWakeOrder) {
     MixFixture f;
+    // Both successors are AIV-only Mix, so the wake order is what decides which
+    // lane slot each takes rather than the coordinator's single own slot.
+    f.set_task(1, 6);
+    f.set_task(2, 6);
     for (uint32_t task : {1U, 2U}) {
         f.graph.executable(task, 0, {0});
         f.storage.metadata[task].flags |= SCHEDULER_TASK_HAS_FANIN;
@@ -1398,7 +1386,7 @@ TEST(SchedulerMix, MultipleUnlockedMixesKeepWakeOrder) {
     ASSERT_TRUE(f.complete(2, 0, &candidates));
     EXPECT_EQ(candidates.mix_ready.task_ref, SCHEDULER_TASK_REF_INVALID);
     ASSERT_TRUE(f.dispatch());
-    for (uint32_t lane = 0; lane < 3; ++lane) {
+    for (uint32_t lane = 1; lane < 3; ++lane) {
         EXPECT_EQ(f.slot(lane, 0).task_ref, 2);
         EXPECT_EQ(f.slot(lane, 1).task_ref, 1);
     }
@@ -1441,23 +1429,33 @@ TEST(SchedulerMix, PartialCompletionsAllowMoreThanTwoLiveMixes) {
     f.enqueue(0);
     f.enqueue(1);
     ASSERT_TRUE(f.dispatch());
-    // Task 0 holds the AIC slot and lane 1's first Mix slot; task 1 holds lane
-    // 1's second and lane 2's first. Freeing both of lane 1's leaves each task
-    // still partly live while making room for two more.
+    // Task 0 holds the coordinator's own slot and lane 1's first Mix slot; task
+    // 1 holds lane 1's second and lane 2's first. Freeing both of lane 1's
+    // leaves each task still partly live while making room for another.
     ASSERT_TRUE(f.complete(1, 0));
     ASSERT_TRUE(f.complete(1, 1));
     EXPECT_EQ(f.local->pending_completed, 0u);
-    f.enqueue(2);
+    // Task 3 first: a Mix task that cannot be placed stays at the head of its
+    // queue rather than being popped, so queuing task 2 ahead of it would stall
+    // the pass on a task the coordinator has no own slot for.
     f.enqueue(3);
+    f.enqueue(2);
     ASSERT_TRUE(f.dispatch());
     uint32_t live = 0;
     for (const auto &tracker : f.local->mix_trackers)
         live += tracker.task_ref >= 0;
-    EXPECT_EQ(live, 4u);
+    // Three, not four: task 2 carries an AIC subtask and the coordinator's one
+    // own slot is still holding task 0's, so it waits at the head of the queue.
+    EXPECT_EQ(live, 3u);
+    EXPECT_EQ(f.slot(0, 0).task_ref, 0) << "task 0's AIC subtask is what keeps task 2 out";
 }
 
 TEST(SchedulerMix, NoStealPolicyStillAdmitsLocalMix) {
     MixFixture f;
+    // AIV-only Mix for both, so the two land on lane slots: the coordinator's
+    // single own slot could not hold a second Mix subtask.
+    f.set_task(0, 6);
+    f.set_task(1, 6);
     // Two clusters, so the Mix queue has an owner this core can only reach by
     // stealing: inside one cluster a Mix task routes to this very Scheduler.
     f.local->config.cluster_count = 2;
@@ -1471,12 +1469,12 @@ TEST(SchedulerMix, NoStealPolicyStillAdmitsLocalMix) {
     );
 
     ASSERT_TRUE(f.dispatch(false));
-    EXPECT_EQ(f.sequence(0), 0u);
+    EXPECT_EQ(f.sequence(1), 0u);
     f.enqueue(1);
     ASSERT_TRUE(f.dispatch(false));
-    EXPECT_EQ(f.slot(0, 0).task_ref, 1);
+    EXPECT_EQ(f.slot(1, 0).task_ref, 1);
     ASSERT_TRUE(f.dispatch(true));
-    EXPECT_EQ(f.slot(0, 1).task_ref, 0);
+    EXPECT_EQ(f.slot(1, 1).task_ref, 0);
 }
 
 TEST(SchedulerMix, CompletionTracesUseLogicalSubtaskRatherThanPhysicalLane) {
@@ -1630,21 +1628,18 @@ TEST(SchedulerSpmdClaim, HandsOutEveryBlockExactlyOnceThenYieldsTheHead) {
     f.enqueue(0);
     f.enqueue(1);
 
-    // Two slots per core, so four blocks take two passes with a completion in
+    // One slot per core, so four blocks take four rounds with a completion in
     // between. The head must not move until the last one is taken.
     std::vector<uint16_t> seen;
-    for (uint32_t round = 0; round < 2; ++round) {
-        for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot) {
-            bool progress = false;
-            ASSERT_TRUE(f.claim(&progress));
-            ASSERT_TRUE(progress) << "round " << round << " slot " << slot;
-            seen.push_back(f.local->own_slots()[slot].block_idx);
-            EXPECT_EQ(f.local->own_slots()[slot].block_num, 4u);
-        }
-        if (round == 0) {
+    for (uint32_t round = 0; round < 4; ++round) {
+        bool progress = false;
+        ASSERT_TRUE(f.claim(&progress));
+        ASSERT_TRUE(progress) << "round " << round;
+        seen.push_back(f.local->own_slots()[0].block_idx);
+        EXPECT_EQ(f.local->own_slots()[0].block_num, 4u);
+        if (round < 3) {
             EXPECT_EQ(f.head(), 0) << "the head must not yield with blocks left";
-            for (uint32_t slot = 0; slot < SCHEDULER_PENDING_SLOT_COUNT; ++slot)
-                scheduler_initialize_free_slot(&f.local->slots[slot]);
+            scheduler_initialize_free_slot(&f.local->slots[0]);
         }
     }
     std::sort(seen.begin(), seen.end());
@@ -1729,9 +1724,16 @@ TEST(SchedulerSpmdClaim, ReadsNothingWhenTheGraphHasNoSpmdTask) {
 // Two blocks of one cohort on one core self-lock: the second waits in a slot
 // the first cannot release, because the first is spinning in a barrier with its
 // core's whole scheduling loop stopped behind it.
-TEST(SchedulerSpmdClaim, RefusesASecondBlockOfTheSameCohortOnOneCore) {
+//
+// An AIV-only Mix cohort is the shape that reaches the rule. A core has one own
+// slot, so for every other shape a block of this cohort already occupies it and
+// the placement probe refuses the second block before the scan is consulted.
+// This one takes no AIC slot at all and leaves a free Mix slot on both lanes,
+// so the scan is the only thing standing in the way.
+TEST(SchedulerSpmdClaim, RefusesASecondBlockOfTheSameCohortOnOneCluster) {
     SpmdFixture f;
-    f.set_task(0, 0b001, 4, /*sync_start=*/true);
+    f.local->has_mix = true;
+    f.set_task(0, 0b110, 4, /*sync_start=*/true);
     f.enqueue(0);
 
     bool progress = false;
@@ -1739,14 +1741,14 @@ TEST(SchedulerSpmdClaim, RefusesASecondBlockOfTheSameCohortOnOneCore) {
     ASSERT_TRUE(progress);
     EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 1u);
 
-    // The second slot is free, but it is the same core and the same cohort.
     progress = false;
     ASSERT_TRUE(f.claim(&progress));
     EXPECT_FALSE(progress);
     EXPECT_EQ(scheduler_gm_query(f.control(0)->next_block), 1u);
 
-    // An ordinary SPMD task has no such restriction: its blocks wait on nothing.
-    f.set_task(0, 0b001, 4);
+    // An ordinary SPMD task of the same shape has no such restriction: its
+    // blocks wait on nothing, and the lanes' second Mix slots take them.
+    f.set_task(0, 0b110, 4);
     f.local->spmd_head_ref = SCHEDULER_TASK_REF_INVALID;
     progress = false;
     ASSERT_TRUE(f.claim(&progress));
@@ -1772,11 +1774,15 @@ TEST(SchedulerSpmdClaim, RemembersTheHeadsShapeUntilTheHeadMoves) {
     // Taking the last block is what moves the head, and the core that took it
     // is the one that moves it -- so this core sees the queue drain and clears
     // the memo rather than leaving it to describe a task that no longer leads.
+    // The slot the first block took has to come back first: a core with no free
+    // slot never reaches the cursor at all.
+    scheduler_initialize_free_slot(&f.local->slots[0]);
     scheduler_gm_store(f.control(0)->next_block, UINT64_C(2));
     ASSERT_TRUE(f.claim(&progress));
     ASSERT_TRUE(scheduler_ready_endpoints_empty(scheduler_gm_query(
         scheduler_ready_inbox_at(f.storage.scheduler_state->base(), f.local, TaskType::SPMD, 0)->endpoints
     )));
+    scheduler_initialize_free_slot(&f.local->slots[0]);
     ASSERT_TRUE(f.claim(&progress));
     EXPECT_TRUE(scheduler_task_ref_is_null(f.local->spmd_head_ref));
 }
@@ -1843,8 +1849,11 @@ TEST(SchedulerSpmdCompletion, ASingleBlockTaskCountsNoBlocks) {
 TEST(SchedulerSpmdClaim, YieldsAMixHeadWhoseOwnBlocksFillTheCluster) {
     SpmdFixture f;
     f.local->has_mix = true;
-    f.set_task(0, 0b111, 2);
-    f.set_task(1, 0b111, 2);
+    // AIV-only Mix, so both blocks fit the cluster: a shape with an AIC subtask
+    // would need the coordinator's one own slot twice and never place the
+    // second block at all.
+    f.set_task(0, 0b110, 2);
+    f.set_task(1, 0b110, 2);
     f.enqueue(0);
     f.enqueue(1);
 

@@ -630,17 +630,26 @@ inline uint64_t sync_start_drain_ack_subtree_token(uint64_t attempt) {
 // =============================================================================
 inline constexpr uint64_t SCHEDULER_STATE_ALIGNMENT = 128;
 inline constexpr uint64_t SCHEDULER_WORKER_CAPACITY = 108;
-inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 2;
+// A core executes one task at a time and its scheduling loop is stopped for the
+// whole of that task, so claiming a second task up front overlaps with nothing:
+// the claim and the payload build cost the same whether they happen before the
+// first kernel or between the two. A second slot only moves work earlier while
+// holding it where a core that is idle now cannot reach it, which is the same
+// trade the SPMD claim already settled by taking one block per round.
+inline constexpr uint32_t SCHEDULER_PENDING_SLOT_COUNT = 1;
 // A Mix task's AIV subtasks land on slots whose only writer is the cluster's
-// AIC, held separately from each AIV's own two slots. Sole ownership is what
-// makes the AIC's capacity probe exact: it sees only its own history there, so
-// a placement it plans cannot be taken away between the probe and the claim,
-// and no back-pressure protocol is needed.
+// AIC, held separately from each AIV's own slot. Sole ownership is what makes
+// the AIC's capacity probe exact: it sees only its own history there, so a
+// placement it plans cannot be taken away between the probe and the claim, and
+// no back-pressure protocol is needed.
 //
-// Deliberately a second constant rather than widening SCHEDULER_PENDING_SLOT_COUNT:
-// five places pack two 32-bit generations into one 64-bit word (scheduler_ssbuf.h,
-// scheduler_ready.h, scheduler_completion.h, scheduler_dispatch.h), and a count
-// of four would overflow every one of them.
+// A separate constant rather than more of the count above: these two answer
+// different questions. A core's own count is how much work it hoards from the
+// shared queues, which is why it is one; this one is how many Mix dispatches a
+// cluster can have outstanding, which its coordinator alone decides. Five places
+// pack two 32-bit generations into one 64-bit word (scheduler_ssbuf.h,
+// scheduler_ready.h, scheduler_completion.h, scheduler_dispatch.h), so this one
+// cannot exceed two without widening all of them.
 inline constexpr uint32_t SCHEDULER_MIX_SLOT_COUNT = 2;
 inline constexpr uint32_t SCHEDULER_CORE_TYPE_COUNT = 2;
 

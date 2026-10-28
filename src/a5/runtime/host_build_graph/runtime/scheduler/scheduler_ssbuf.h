@@ -81,7 +81,7 @@ static_assert(sizeof(SchedulerSsbufDispatchControl) == 32);
 static_assert(sizeof(SchedulerSsbufCompletionInbox) == 32);
 static_assert(sizeof(SchedulerSsbufLane) == 64);
 static_assert(sizeof(SchedulerSsbufRegion) == SCHEDULER_SSBUF_REGION_SIZE);
-static_assert(SCHEDULER_PENDING_SLOT_COUNT == 2);
+static_assert(SCHEDULER_PENDING_SLOT_COUNT == 1);
 static_assert(SCHEDULER_MIX_SLOT_COUNT == 2);
 static_assert(offsetof(SchedulerSsbufDispatchControl, publication) % 8 == 0);
 static_assert(offsetof(SchedulerSsbufCompletionInbox, publication) % 8 == 0);

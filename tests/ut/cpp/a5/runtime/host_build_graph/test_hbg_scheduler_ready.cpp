@@ -587,7 +587,10 @@ TEST(SchedulerDispatch, DispatchSequenceIsIndependentOfSlotGenerationAndRejectsZ
     storage.callable_addresses[1] = 0;
     storage.run_control->error_claimed = 0;
     storage.run_control->scheduler_error = 0;
-    slot_claim.slot_index = 1;
+    // A core has one dispatch slot, so a second task reuses it: retire the
+    // first and claim the slot at the generation it now carries.
+    scheduler_initialize_free_slot(&storage.scheduler_local_state.slots[0]);
+    slot_claim.generation = storage.scheduler_local_state.slots[0].generation;
     ready_claim.task_ref = 1;
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -628,7 +631,8 @@ TEST(SchedulerDispatch, RejectsAKernelIdPastThePublishedCallableCount) {
     );
     EXPECT_EQ(payload->function_bin_addr, UINT64_C(0x1000)) << "the last id inside the count still dispatches";
 
-    slot_claim.slot_index = 1;
+    scheduler_initialize_free_slot(&storage.scheduler_local_state.slots[0]);
+    slot_claim.generation = storage.scheduler_local_state.slots[0].generation;
     ready_claim.task_ref = 1;
     EXPECT_FALSE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -662,7 +666,8 @@ TEST(SchedulerDispatch, AcceptsLastCallableAndInlineSentinel) {
 
     storage.metadata[1].kernel_ids[0] = UINT16_MAX;
     storage.metadata[1].flags |= SCHEDULER_TASK_INLINE;
-    slot_claim.slot_index = 1;
+    scheduler_initialize_free_slot(&storage.scheduler_local_state.slots[0]);
+    slot_claim.generation = storage.scheduler_local_state.slots[0].generation;
     ready_claim.task_ref = 1;
     ASSERT_TRUE(scheduler_fill_dispatch_slot(
         graph.graph(), storage.scheduler_state->base(),
@@ -670,7 +675,7 @@ TEST(SchedulerDispatch, AcceptsLastCallableAndInlineSentinel) {
         ready_claim, 0, storage.ssbuf_region
     ));
     payload = scheduler_state_at<DispatchPayload>(
-        storage.scheduler_state->base(), storage.contexts[0].dispatch_payload_offset + sizeof(DispatchPayload)
+        storage.scheduler_state->base(), storage.contexts[0].dispatch_payload_offset
     );
     EXPECT_EQ(payload->function_bin_addr, 0u);
     EXPECT_EQ(storage.run_control->scheduler_error, 0u);

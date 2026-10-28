@@ -297,7 +297,6 @@ __aicore__ bool run_ready_dispatch_loop(
     // coordinator about them. Both are per Mix slot and local to this core.
     uint32_t executed_mix_generations[SCHEDULER_MIX_SLOT_COUNT]{};
     uint64_t mix_completion_publication = 0;
-    uint32_t scan_start = 0;
     uint64_t next_dispatch_sequence = 1;
     uint32_t backoff_iterations = kInitialBackoffIterations;
     uint32_t scheduler_error_poll_count = 0;
@@ -456,7 +455,6 @@ __aicore__ bool run_ready_dispatch_loop(
                 stats->kernel_cycles += kernel_end - kernel_start;
                 stats->completion_enqueue_cycles += completion_end - completion_start;
             }
-            scan_start = (slot_index + 1) % SCHEDULER_PENDING_SLOT_COUNT;
             backoff_iterations = kInitialBackoffIterations;
             continue;
         }
