@@ -705,3 +705,5 @@ extern "C" void unified_log_info(const char *, const char *, ...) {}
 extern "C" void unified_log_error(const char *, const char *, ...) {}
 extern "C" void unified_log_debug(const char *, const char *, ...) {}
 extern "C" void unified_log_host_span(const SimplerHostSpan *) {}
+extern "C" SimplerHostTraceState *unified_log_host_trace_state() { return nullptr; }
+extern "C" uint64_t unified_log_host_trace_allocate_inv() { return 0; }

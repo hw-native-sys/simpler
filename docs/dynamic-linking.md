@@ -196,10 +196,24 @@ uses `pthread_key_t` (POSIX TLS) for per-thread state in framework SOs.
 | `g_cluster_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread cluster identity (for TPUSH/TPOP) |
 | `s_orch_thread_idx` | `__thread int` | AICPU SO | Profiling thread index (profiling off by default) |
 | `g_platform_phase_base` | plain global + `extern "C"` setter | AICPU SO | Device-phase buffer base; published by host (onboard kernel.cpp / sim dlsym), read by the `[STRACE]` phase stamps. Per-thread slotting via the affinity pthread-key index, not TLS. |
-| strace `inv`/`depth`/`hid` | `pthread_key_t` (`ThreadState`) | host runtime SO | Per-thread `[STRACE]` host-trace state (was C++ `thread_local`, converted per this rule). |
+| strace `inv`/`depth`/`hid` | process-owned `pthread_key_t` (`SimplerHostTraceState`) | resident `_task_interface` host-log owner; borrowed by runtime/generated SOs | Scalar trace state allocated with `calloc`, freed by libc at thread exit. |
 | onboard prepare ownership | `pthread_key_t` | host runtime SO | Rejects same-thread recursive prepare across contexts; the key is deleted when the module unloads. |
 | `execution_context` | `thread_local` | Kernel SO (PTO ISA) | Per-thread execution context (fallback, cached values only) |
 | `NPUMemoryModel::instance` | `thread_local` | Kernel SO (PTO ISA) | Per-core memory model simulation |
+
+### STRACE ownership across module unload
+
+STRACE borrows one process-owned pthread key through the bound host-log state.
+The resident host-log owner creates the key; consumers neither create nor delete
+it. Values contain scalar invocation, depth and callable IDs, are allocated with
+`calloc`, and use libc `free` at thread exit. Unloading a consumer leaves no
+thread-exit callback pointing into that consumer.
+
+Unbound consumers stay silent. Key creation, allocation or assignment failure
+disables the affected trace scope; failed assignment frees the unpublished value.
+The log owner and consumers must be rebuilt together because the shared state
+layout includes the key and invocation counter. See [logging.md](logging.md)
+for the owner lifetime and binding contract.
 
 ### Known Risks
 

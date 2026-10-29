@@ -55,4 +55,21 @@ simpler_ut_add_target(NAME test_sim_device_log
     INCLUDES ${SIMPLER_COMMON_PLATFORM_DIR}/include ${SIMPLER_LOG_DIR}/include
     LABEL no_hardware)
 
+add_library(test_strace_consumer SHARED
+    ${CMAKE_SOURCE_DIR}/common/support/strace_consumer.cpp ${HOST_LOG_TEST_SOURCES})
+target_include_directories(test_strace_consumer PRIVATE ${log_includes})
+target_compile_options(test_strace_consumer PRIVATE -fvisibility=hidden
+    $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>)
+target_link_libraries(test_strace_consumer PRIVATE pthread)
+log_case(test_strace_lifetime.cpp
+    DEFINES TEST_STRACE_CONSUMER_PATH="$<TARGET_FILE:test_strace_consumer>"
+    LINK ${CMAKE_DL_LIBS} DEPENDS test_strace_consumer TIMEOUT 15)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    log_case(test_strace_allocation_failure.cpp
+        LINK "-Wl,--wrap=calloc,--wrap=free,--wrap=pthread_setspecific")
+else()
+    simpler_ut_exclude_case(test_strace_allocation_failure.cpp)
+endif()
+
 simpler_ut_glob_cases(log_case)

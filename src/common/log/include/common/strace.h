@@ -57,45 +57,14 @@
 
 #if SIMPLER_HOST_STRACE
 
-#include <pthread.h>
-
-#include <atomic>
-#include <cstdlib>
-
 #include "common/host_span.h"
 #include "common/log_clock.h"
 
 namespace simpler::strace {
 
-// Per-thread trace state (active invocation id, nesting depth, callable hash).
-// Held behind a pthread_key rather than C++ `thread_local`: the repo bans
-// thread_local in SOs (ELF TLSDESC issues across dlopen — see
-// docs/dynamic-linking.md), so all per-thread state uses POSIX TLS.
-struct ThreadState {
-    uint64_t inv = 0;
-    int depth = 0;
-    uint64_t hid = 0;
-};
+using ThreadState = SimplerHostTraceState;
 
-inline pthread_key_t &strace_key() {
-    static pthread_key_t key;
-    return key;
-}
-
-inline ThreadState *strace_state() {
-    static pthread_once_t once = PTHREAD_ONCE_INIT;
-    pthread_once(&once, []() {
-        pthread_key_create(&strace_key(), [](void *p) {
-            std::free(p);
-        });
-    });
-    auto *st = static_cast<ThreadState *>(pthread_getspecific(strace_key()));
-    if (st == nullptr) {
-        st = static_cast<ThreadState *>(std::calloc(1, sizeof(ThreadState)));
-        pthread_setspecific(strace_key(), st);
-    }
-    return st;
-}
+inline ThreadState *strace_state() { return unified_log_host_trace_state(); }
 
 inline void emit_record(
     const char *name, uint64_t invocation_id, uint64_t callable_hash, int32_t depth, int64_t timestamp_ns,
@@ -110,16 +79,18 @@ public:
     explicit StraceScope(const char *name, const char *attrs = "") :
         name_(name),
         attrs_(attrs),
+        state_(strace_state()),
         t0_ns_(simpler::log::monotonic_now_ns()) {
-        ++depth();
+        if (state_ != nullptr) ++state_->depth;
     }
 
     ~StraceScope() {
+        if (state_ == nullptr) return;
         const int64_t t1_ns = simpler::log::monotonic_now_ns();
         // depth printed is the scope's own level (post-decrement so the
         // outermost scope prints depth=0).
-        const int d = --depth();
-        emit_record(name_, inv(), hid(), d, t0_ns_, t1_ns - t0_ns_, attrs_);
+        const int d = --state_->depth;
+        emit_record(name_, state_->inv, state_->hid, d, t0_ns_, t1_ns - t0_ns_, attrs_);
     }
 
     StraceScope(const StraceScope &) = delete;
@@ -134,28 +105,32 @@ public:
      *  would start at 1 and the parser would merge their spans. The resolved id
      *  is stored in the per-thread slot (`inv()`) so nested scopes / emit_span_at
      *  on this thread read the right value. */
-    static uint64_t allocate_inv() {
-        static std::atomic<uint64_t> global_inv{0};
-        return global_inv.fetch_add(1, std::memory_order_acq_rel) + 1;
-    }
+    static uint64_t allocate_inv() { return unified_log_host_trace_allocate_inv(); }
     static uint64_t next_inv() {
+        auto *state = strace_state();
+        if (state == nullptr) return 0;
         const uint64_t id = allocate_inv();
-        inv() = id;
+        state->inv = id;
         return id;
     }
     /** Set the callable hash for spans emitted on this thread. */
-    static void set_hid(uint64_t h) { hid() = h; }
+    static void set_hid(uint64_t h) {
+        if (auto *state = strace_state()) state->hid = h;
+    }
     /** Current invocation id / callable hash for this thread (for emit_span_at). */
-    static uint64_t current_inv() { return inv(); }
-    static uint64_t current_hid() { return hid(); }
+    static uint64_t current_inv() {
+        auto *state = strace_state();
+        return state != nullptr ? state->inv : 0;
+    }
+    static uint64_t current_hid() {
+        auto *state = strace_state();
+        return state != nullptr ? state->hid : 0;
+    }
 
 private:
-    static uint64_t &inv() { return strace_state()->inv; }
-    static int &depth() { return strace_state()->depth; }
-    static uint64_t &hid() { return strace_state()->hid; }
-
     const char *name_;
     const char *attrs_;
+    ThreadState *state_;
     int64_t t0_ns_;
 };
 
@@ -167,21 +142,24 @@ private:
 class StraceContextScope {
 public:
     StraceContextScope(uint64_t inv, uint64_t hid, int base_depth) :
-        state_(strace_state()),
-        saved_(*state_) {
+        state_(strace_state()) {
+        if (state_ == nullptr) return;
+        saved_ = *state_;
         state_->inv = inv;
         state_->hid = hid;
         state_->depth = base_depth;
     }
 
-    ~StraceContextScope() { *state_ = saved_; }
+    ~StraceContextScope() {
+        if (state_ != nullptr) *state_ = saved_;
+    }
 
     StraceContextScope(const StraceContextScope &) = delete;
     StraceContextScope &operator=(const StraceContextScope &) = delete;
 
 private:
     ThreadState *state_;
-    ThreadState saved_;
+    ThreadState saved_{};
 };
 
 /** Current steady-clock timestamp in the marker grammar's nanosecond unit. */
@@ -199,7 +177,7 @@ inline long long strace_now_ns() { return static_cast<long long>(simpler::log::m
  */
 inline void
 emit_span_at(const char *name, long long ts_ns, long long dur_ns, int depth, const char *attrs = "clk=dev") {
-    emit_record(name, StraceScope::current_inv(), StraceScope::current_hid(), depth, ts_ns, dur_ns, attrs);
+    if (auto *state = strace_state()) emit_record(name, state->inv, state->hid, depth, ts_ns, dur_ns, attrs);
 }
 
 /** Emit an explicitly timed host-domain span in the active invocation. */
