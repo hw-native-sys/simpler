@@ -93,6 +93,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     RUNTIME_ENV_RING_COUNT,
     WorkerType,
+    _CallArgumentSnapshot,
     _emit_host_span,
     _mailbox_load_i32,
     _mailbox_load_u64,
@@ -5017,6 +5018,12 @@ class _AbandonedRunKeepaliveCursor:
                     self.first_error = exc
 
 
+# A native queue cannot participate in Python's cyclic GC. These roots pin the
+# Python owners until explicit wait/close establishes safe retirement, including
+# when the application drops all of its Python handles while a callback is queued.
+_native_submission_roots: dict[PreparedSubmission, tuple[Any, ...]] = {}
+
+
 class RunHandle:
     """Completion handle returned by :meth:`Worker.submit`.
 
@@ -5379,6 +5386,48 @@ class RunHandle:
             else:
                 self._clear_acceptance_owner()
             raise
+
+
+class PreparedSubmission(RunHandle):
+    """One-shot native submission with the ordinary RunHandle completion contract.
+
+    Pass ``native_handle`` to a native adapter on the Python thread. The adapter
+    retains a NativeSubmissionRef and calls submit from its framework queue.
+    Cancel a prepared invocation if enqueue fails. wait()/Worker.close() retire
+    owners; an unsubmitted, uncancelled invocation makes close time out safely.
+    External tensor and stream owners belong in prepare_submission(keepalive=...).
+    """
+
+    @property
+    def safe_to_release(self) -> bool:
+        """Whether existing cleanup has discharged this call's external owner uses.
+
+        Independent of success: wait() still raises the original execution error.
+        A timeout or unknown cleanup keeps this false until safe owner recovery.
+        """
+        with self._cv:
+            return self._terminal and self not in _native_submission_roots
+
+    @property
+    def native_handle(self):
+        return self._native_submission.capsule()
+
+    def cancel(self) -> bool:
+        """Cancel before native submit starts and attempt retirement.
+
+        True means submission was cancelled, not that cleanup succeeded. Check
+        safe_to_release before dropping owners; failed retirement retains them
+        for Worker.close(). False means the token was already consumed/cancelled.
+        An exception is not proof that cancellation did not take effect: keep
+        tracking the ticket until safe retirement or successful owner close.
+        """
+        if not self._native_submission.cancel():
+            return False
+        try:
+            self.wait()
+        except RunPreparationRefused:
+            pass
+        return True
 
 
 def _exit_after_host_log_flush(status: int) -> NoReturn:
@@ -5767,6 +5816,7 @@ class Worker:
         # is the admission authority and holds its own FIFO; this only maps a
         # handle back to its run so waiting and finalization can find it.
         self._chip_runs: dict[int, Any] = {}
+        self._chip_run_callable_ids: dict[int, int] = {}
         self._chip_run_seq: int = 0
         # Mirrors _chip_runs' own lifecycle so release_buffer() sees the actual
         # L2 argument identities, which live outside the L3 orchestration resources.
@@ -8626,8 +8676,13 @@ class Worker:
         release a known-bad entry would just exhaust the resource space
         faster.
 
+        The last L2 registration remains valid while an ordinary run or prepared
+        submission retains its use. Retry after safe retirement; physical device
+        completion alone does not release the registration use.
+
         Raises:
           KeyError: handle was never registered.
+          RuntimeError: the last registration still has an unretired L2 use.
         """
         if self._pre_start_unregister_if_needed(handle_or_slot):
             return
@@ -8660,6 +8715,8 @@ class Worker:
             cid = state.slot_id
             if cid in self._pending_unregister_cids:
                 raise KeyError("UNREGISTER_TOMBSTONE_ACTIVE: callable handle already pending unregister")
+            if self.level == 2 and state.ref_count == 1 and cid in self._chip_run_callable_ids.values():
+                raise RuntimeError("Worker.unregister: callable is referenced by an unretired L2 use")
             self._live_handles.pop(handle_id, None)
             state.ref_count -= 1
             should_broadcast_decrement = self.level >= 3
@@ -12288,6 +12345,7 @@ class Worker:
         self._source_context_failed = False
         self._source_attachments: set[CanonicalIdentity] = set()
         self._chip_source_uses: dict[int, tuple[CanonicalIdentity, ...]] = {}
+        self._chip_call_values: dict[int, Any] = {}
         # Which identities each CommDomain allocation minted, so its release revokes them together.
         self._domain_members: dict[int, set[CanonicalIdentity]] = {}
         # Guards every device-allocation table. Entry points take it (`_require_device_capability`,
@@ -12372,6 +12430,7 @@ class Worker:
     def _release_source_uses(self, run_id: int) -> None:
         with self._registry_lock:
             identities = self._chip_source_uses.pop(run_id, ())
+            self._chip_call_values.pop(run_id, None)
         if identities:
             assert self._device_buffer_source is not None
             self._device_buffer_source.release(identities)
@@ -13394,7 +13453,7 @@ class Worker:
 
         The L2 check is independent (a separate run-id namespace with no callback to serialize
         against — ``_chip_run_touched_identities`` is published under ``_registry_lock`` when the
-        submission is accepted, before it materializes anything, see ``_submit_l2_locked``), so the
+        submission is accepted, before it materializes anything, see ``_prepare_l2_args``), so the
         two checks run sequentially rather than under one shared lock. Neither is checked once
         ``buffer`` is already closed, matching ``Buffer.close()``'s own idempotency.
 
@@ -13555,6 +13614,42 @@ class Worker:
         self._teardown_delegated_fatal_if_safe()
         return result
 
+    def prepare_submission(
+        self, callable, args=None, config=None, *, caller_stream: int, keepalive: tuple[Any, ...] = ()
+    ) -> PreparedSubmission:
+        """Reserve a direct L2 submission for a GIL-free native queue callback.
+
+        Preparation snapshots arguments/configuration without device launch or
+        waiting for lane capacity. caller_stream and external storage owners must
+        remain alive until wait/close; pass their Python owners in keepalive.
+        The callback's successful native submit establishes the caller exit wait.
+        This API does not support capture or L3 Python orchestration.
+        """
+        if self.level != 2:
+            raise ValueError("prepare_submission requires a direct L2 Worker")
+        stream = _nonzero_uint64(caller_stream, "caller_stream")
+        owners = tuple(keepalive)
+        with self._operation_lease("prepare_submission"):
+            cfg = config if config is not None else CallConfig()
+            state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
+            if getattr(cfg, "output_prefix", ""):
+                _bind_host_log_session_directory()
+            run_id, args, chip_args, values = self._prepare_l2_args(
+                state.slot_id, args, caller_stream=stream, original_handle=callable
+            )
+            assert self._chip_worker is not None
+            try:
+                native = self._chip_worker._prepare_chip_submission(state.slot_id, chip_args, cfg, caller_stream=stream)
+            except BaseException:
+                self._discard_l2_reservation(run_id, safe=True)
+                raise
+            owners = (state.slot_id, args, cfg, chip_args, values, *owners)
+            handle = PreparedSubmission(self, run_id, owners)
+            handle._native_submission = native
+            _native_submission_roots[handle] = (self, owners)
+            self._accept_l2_run(run_id, native, handle)
+            return handle
+
     def run(self, callable, args=None, config=None, *, caller_stream: int | None = None) -> None:
         """Execute one task or DAG synchronously as ``submit(...).wait()``.
 
@@ -13576,8 +13671,7 @@ class Worker:
             state = self._resolve_handle(callable, expected_namespace="LOCAL_CHIP")
             if getattr(cfg, "output_prefix", ""):
                 _bind_host_log_session_directory()
-            submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
-            return self._submit_l2_locked(state.slot_id, args, cfg, **submit_options)
+            return self._submit_l2_locked(state.slot_id, args, cfg, caller_stream=caller_stream)
 
         while True:
             with self._submit_mu.exclusive():
@@ -13931,16 +14025,10 @@ class Worker:
                     return handle
         return None
 
-    def _submit_l2_locked(
-        self, callable_id: int, args, cfg: CallConfig, *, caller_stream: int | None = None
-    ) -> RunHandle:
-        """Admit one direct-chip run and return a handle to it while it runs.
-
-        The lane is the sole admission authority. Its runtime contract permits
-        one active plus one prepared compatible run; otherwise submission drains
-        the predecessor and retains depth-one behavior. The caller owns the
-        completion fence through :meth:`RunHandle.wait`.
-        """
+    def _prepare_l2_args(
+        self, callable_id: int, args, *, caller_stream: int | None, original_handle: CallableHandle | None = None
+    ):
+        """Snapshot and reserve call values before native execution or queue handoff."""
         assert self._chip_worker is not None
         if self._device_buffer_source is not None:
             self._device_buffer_source._check_context()
@@ -13964,44 +14052,78 @@ class Worker:
         # `release_buffer` pops. Published any later, a release racing that window would see no
         # entry for a run that has already cached the mapping it is about to drop.
         with contextlib.ExitStack() as reservation:
-            if self._names_device_allocation(args):
+            device_backed = self._names_device_allocation(args)
+            if device_backed:
                 reservation.enter_context(self._child_prov_worker_lock(0))
                 reservation.enter_context(self._child_prov_lock)
-                sources = self._attach_source_buffers_locked(args)
-            else:
-                sources = ()
             with self._registry_lock:
+                if original_handle is not None:
+                    # Slots are reusable; the original live handle, not slot presence,
+                    # identifies the callable protected by this reservation.
+                    state = self._resolve_handle_locked(original_handle, expected_namespace="LOCAL_CHIP")
+                    if state.slot_id != callable_id:
+                        raise KeyError("callable identity changed before submission reservation")
+                sources = self._attach_source_buffers_locked(args) if device_backed else ()
                 self._chip_run_seq += 1
                 run_id = self._chip_run_seq
                 self._chip_run_touched_identities[run_id] = touched
+                self._chip_run_callable_ids[run_id] = callable_id
                 if sources:
                     self._chip_source_uses[run_id] = sources
-        native_entered = False
         try:
             chip_args = self._materialize_l2_args(args)
-            native_entered = True
-            submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
-            chip_run = self._chip_worker._submit_chip_run_direct(callable_id, chip_args, cfg, **submit_options)
-        except BaseException as error:
+            target = self._callable_registry.get(callable_id)
+            directions = [target.sig(i) for i in range(target.sig_count)] if target is not None else []
+            values = _CallArgumentSnapshot(chip_args, directions)
+            chip_args = values.args
+            # A native entry can fail without returning a handle or release proof.
+            # The existing safe-use retirement boundary also owns these call values.
             with self._registry_lock:
-                self._chip_run_touched_identities.pop(run_id, None)
-            # Only this invocation's native release verdict discharges its source
-            # reservation after entry; arbitrary exceptions carry no lifetime proof.
-            if not native_entered or isinstance(error, RunPreparationRefused):
-                self._release_source_uses(run_id)
-            else:
-                self._source_context_failed = True
+                self._chip_call_values[run_id] = values
+        except BaseException:
+            self._discard_l2_reservation(run_id, safe=True)
             raise
+        return run_id, args, chip_args, values
+
+    def _discard_l2_reservation(self, run_id: int, *, safe: bool) -> None:
+        """Roll back a call that has not published a RunHandle."""
         with self._registry_lock:
-            self._chip_runs[run_id] = chip_run
-        # The handle owns this invocation's argument values. Storage release is fenced by
-        # the touched-identity registration until finalization, not by descriptor copies.
-        handle = RunHandle(self, run_id, (callable_id, args, cfg, chip_args))
+            self._chip_run_touched_identities.pop(run_id, None)
+            self._chip_run_callable_ids.pop(run_id, None)
+        if safe:
+            self._release_source_uses(run_id)
+        else:
+            self._source_context_failed = True
+
+    def _accept_l2_run(self, run_id: int, native, handle: RunHandle) -> None:
+        with self._registry_lock:
+            self._chip_runs[run_id] = native
         with self._hierarchical_start_cv:
-            # close() may already be CLOSED and waiting for this operation's
-            # lease. This accepted run still belongs to its eventual drain set.
+            # close() may be waiting for this operation's lease; its drain set
+            # must include the accepted run before that lease is released.
             self._accepted_run_handles.add(handle)
             self._hierarchical_start_cv.notify_all()
+
+    def _retire_native_submission(self, handle: PreparedSubmission) -> None:
+        """Release Python roots only after native retirement succeeds."""
+        handle._native_submission._retire()
+        _native_submission_roots.pop(handle, None)
+
+    def _submit_l2_locked(
+        self, callable_id: int, args, cfg: CallConfig, *, caller_stream: int | None = None
+    ) -> RunHandle:
+        """Submit through the existing lane admission and completion authority."""
+        run_id, args, chip_args, values = self._prepare_l2_args(callable_id, args, caller_stream=caller_stream)
+        assert self._chip_worker is not None
+        submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
+        try:
+            native = self._chip_worker._submit_chip_run_direct(callable_id, chip_args, cfg, **submit_options)
+        except BaseException as error:
+            # Arbitrary native failures carry no proof that source uses ended.
+            self._discard_l2_reservation(run_id, safe=isinstance(error, RunPreparationRefused))
+            raise
+        handle = RunHandle(self, run_id, (callable_id, args, cfg, chip_args, values))
+        self._accept_l2_run(run_id, native, handle)
         return handle
 
     def _chip_run_for(self, run_id: int) -> Any | None:
@@ -14151,19 +14273,25 @@ class Worker:
             if was_l2_run:
                 self._chip_run_touched_identities.pop(run_id, None)
         if was_l2_run:
-            if native_error is None or isinstance(native_error, RunPreparationRefused):
+            prepared = isinstance(handle, PreparedSubmission)
+            safe = native_error is None or isinstance(native_error, RunPreparationRefused)
+            recovery_required = False
+            if not safe and prepared:
+                recovery_required = chip_run._owner_recovery_required
+                safe = not recovery_required
+            if safe:
+                with self._registry_lock:
+                    self._chip_run_callable_ids.pop(run_id, None)
                 self._release_source_uses(run_id)
+                if prepared:
+                    self._retire_native_submission(handle)
             else:
                 self._source_context_failed = True
             handle._cache_finalization_error(native_error)
-            if (
-                native_error is not None
-                and not isinstance(native_error, RunPreparationRefused)
-                and chip_run.lane_poisoned
-                and chip_run._owner_recovery_required
-            ):
-                # A failed run can still owe carrier teardown or caller last-use
-                # proof. Its backing stays until owner close confirms recovery.
+            if not safe and not prepared:
+                recovery_required = chip_run.lane_poisoned and chip_run._owner_recovery_required
+            if recovery_required:
+                assert native_error is not None
                 self._publish_abandoned_run(handle, native_error)
                 return native_error
             with self._hierarchical_start_cv:
@@ -15028,11 +15156,15 @@ class Worker:
                     # Zero from exceptional owner close proves terminal teardown;
                     # a run error does not supply that proof or block its attempt.
                     self._chip_worker.finalize()
-                    for run_id in tuple(self._chip_source_uses):
+                    for run_id in tuple(self._chip_source_uses.keys() | self._chip_call_values.keys()):
                         self._release_source_uses(run_id)
                     with self._registry_lock:
                         self._chip_runs.clear()
                         self._chip_run_touched_identities.clear()
+                        self._chip_run_callable_ids.clear()
+                    for handle in tuple(_native_submission_roots):
+                        if handle._worker is self:
+                            self._retire_native_submission(handle)
                     self._chip_worker = None
                     if lane_error is not None:
                         errors.append(lane_error)

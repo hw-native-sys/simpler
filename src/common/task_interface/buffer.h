@@ -50,7 +50,7 @@
 #include <string>
 #include <type_traits>
 
-#include "data_type.h"
+#include "tensor_geometry.h"
 
 // Leading sentinel of a BufferDescriptor, NOT a version. A descriptor decoder needs a cheap
 // leading discriminator because `TaskArgs.add_tensor` accepts raw bytes; the sentinel rejects most
@@ -233,45 +233,6 @@ struct Tensor {
     DataType dtype;
     uint8_t _pad[3];
 };
-
-// Saturating u64 arithmetic. Every input below is wire-supplied, and `shapes[i]` and `strides[i]`
-// are each u32, so one product alone reaches ~2^64: an unsaturated sum would wrap to a SMALL extent
-// and pass the bound check in validate_tensor while the view really spans exabytes.
-inline uint64_t tensor_mul_sat(uint64_t a, uint64_t b) {
-#if defined(__clang__) || defined(__GNUC__)
-    uint64_t result = 0;
-    return __builtin_mul_overflow(a, b, &result) ? UINT64_MAX : result;
-#else
-    return (a != 0 && b > UINT64_MAX / a) ? UINT64_MAX : a * b;
-#endif
-}
-inline uint64_t tensor_add_sat(uint64_t a, uint64_t b) {
-#if defined(__clang__) || defined(__GNUC__)
-    uint64_t result = 0;
-    return __builtin_add_overflow(a, b, &result) ? UINT64_MAX : result;
-#else
-    return (a > UINT64_MAX - b) ? UINT64_MAX : a + b;
-#endif
-}
-
-// Sentinel `tensor_extent_bytes` returns when a view's extent does not fit 64 bits. No real backing
-// is 16 EiB, so a Tensor whose extent lands here describes no representable view and is rejected.
-inline constexpr uint64_t TENSOR_EXTENT_UNREPRESENTABLE = UINT64_MAX;
-
-// Byte extent of a (possibly strided) view: the last addressable element, plus one element.
-// Saturates at TENSOR_EXTENT_UNREPRESENTABLE rather than wrapping, so an extent a hostile
-// shape/stride cannot express is rejected instead of comparing as a small, in-bounds value.
-// Callers that have not yet validated the view must not trust the result for anything but a bound.
-inline uint64_t view_extent_bytes(const uint32_t *shapes, const uint32_t *strides, uint32_t ndims, DataType dtype) {
-    uint64_t last_elem = 0;
-    for (uint32_t i = 0; i < ndims && i < static_cast<uint32_t>(MAX_TENSOR_DIMS); ++i) {
-        if (shapes[i] == 0) continue;
-        last_elem = tensor_add_sat(
-            last_elem, tensor_mul_sat(static_cast<uint64_t>(shapes[i] - 1), static_cast<uint64_t>(strides[i]))
-        );
-    }
-    return tensor_mul_sat(tensor_add_sat(last_elem, 1), get_element_size(dtype));
-}
 
 inline uint64_t tensor_extent_bytes(const Tensor &r) {
     return view_extent_bytes(r.shapes, r.strides, r.ndims, r.dtype);

@@ -36,6 +36,9 @@
 #include "runtime_c_api.h"
 #include "types.h"
 
+template <class Run>
+class QueuedSubmission;
+
 /** Opaque identity for one prepared native run owned by a ChipWorker. */
 struct ChipWorkerNativeRun {
     uint32_t slot_id{0};
@@ -299,6 +302,12 @@ public:
         int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
         volatile int32_t *accepted_state = nullptr, int32_t accepted_value = 0, void *caller_stream = nullptr
     );
+    // The owner retains this worker, callable, storage and stream through
+    // consumption and safe retirement; preparation does not launch device work.
+    std::shared_ptr<QueuedSubmission<ChipRun>> prepare_chip_submission(
+        int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, void *caller_stream
+    );
+
     void close_chip_run_lane();
     /**
      * Stop the run lane admitting anything further, finishing every run that

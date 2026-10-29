@@ -10,6 +10,7 @@
  */
 
 #include "chip_worker.h"
+#include "queued_submission.h"
 
 #include "chip_run_lane.h"
 #include "common/host_log_binding.h"
@@ -1354,6 +1355,24 @@ ChipRun ChipWorker::submit_chip_run(
 ) {
     if (run_lane_ == nullptr) throw std::runtime_error("ChipWorker run lane is not initialized");
     return run_lane_->submit(callable_id, args, config, accepted_state, accepted_value, caller_stream);
+}
+
+std::shared_ptr<QueuedSubmission<ChipRun>> ChipWorker::prepare_chip_submission(
+    int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config, void *caller_stream
+) {
+    validate_execution_context();
+    validate_caller_stream(caller_stream);
+    config.validate();
+    return std::make_shared<QueuedSubmission<ChipRun>>([this, callable_id, args, config, caller_stream] {
+        // Preflight refusal precedes lane admission and cannot enqueue device work.
+        try {
+            validate_execution_context();
+            validate_caller_stream(caller_stream);
+        } catch (const std::exception &error) {
+            throw RunPreparationRefused(error.what());
+        }
+        return submit_chip_run(callable_id, args, config, nullptr, 0, caller_stream);
+    });
 }
 
 void ChipWorker::stop_chip_run_lane_admission() noexcept {
