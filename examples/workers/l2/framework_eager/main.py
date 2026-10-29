@@ -44,6 +44,7 @@ def build_bridge(directory: Path) -> Path:
         name="_simpler_framework_queue",
         sources=[str(HERE / "queue_callback.cpp")],
         include_dirs=[
+            str(ROOT / "src/common/worker"),
             str(package / "include"),
             str(package / "include/third_party/acl/inc"),
             str(package / "include/third_party/hccl/inc"),

@@ -20,6 +20,7 @@
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
+#include <nanobind/stl/shared_ptr.h>
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
@@ -60,6 +61,7 @@
 #include "callable_protocol.h"
 #include "chip_run_lane.h"
 #include "chip_worker.h"
+#include "native_submission_bind.h"
 #include "common/host_span_names.h"
 #include "common/host_span_scope.h"
 #include "common/log_clock.h"
@@ -3599,6 +3601,7 @@ NB_MODULE(_task_interface, m) {
         );
 
     // --- ChipWorker ---
+    bind_native_submission(m);
     nb::class_<ChipWorker>(m, "_ChipWorker")
         .def(nb::init<>())
         .def(
@@ -3759,6 +3762,28 @@ NB_MODULE(_task_interface, m) {
             "Stop the run lane admitting anything further and finish every not-yet-launched run without "
             "launching it. For a caller that has established nothing more may reach the device; the ordinary "
             "close cannot serve that, because a drain launches before it waits."
+        )
+        .def(
+            "_prepare_chip_submission",
+            [](ChipWorker &self, int32_t callable_id, const ChipStorageTaskArgs &args, const CallConfig &config,
+               uintptr_t caller_stream) {
+                self.validate_caller_stream(reinterpret_cast<void *>(caller_stream));
+                config.validate();
+                return std::make_shared<NativeSubmissionState>([&self, callable_id, args, config, caller_stream] {
+                    // These checks precede lane admission and cannot enqueue work.
+                    try {
+                        self.validate_execution_context();
+                        self.validate_caller_stream(reinterpret_cast<void *>(caller_stream));
+                    } catch (const std::exception &error) {
+                        throw RunPreparationRefused(error.what());
+                    }
+                    return self.submit_chip_run(
+                        callable_id, args, config, nullptr, 0, reinterpret_cast<void *>(caller_stream)
+                    );
+                });
+            },
+            nb::arg("callable_id"), nb::arg("args"), nb::arg("config"), nb::kw_only(), nb::arg("caller_stream"),
+            nb::call_guard<nb::gil_scoped_release>()
         )
         .def(
             "_submit_chip_run_direct",

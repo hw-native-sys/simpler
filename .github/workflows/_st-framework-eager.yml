@@ -65,7 +65,8 @@ jobs:
           mkdir -p outputs/framework-eager-ci
           git rev-parse HEAD | tee outputs/framework-eager-ci/source.txt
           task-submit --list
-          task-submit --env CANN_ENV --env MANUAL_MODE --env PLATFORM --timeout 900 --max-time 900 --device auto --device-num 1 \
+          # Client waiting includes device queue time; the execution budget starts after dispatch.
+          task-submit --env CANN_ENV --env MANUAL_MODE --env PLATFORM --timeout 1800 --max-time 900 --device auto --device-num 1 \
             --run "source \"\$CANN_ENV\" && .claude/skills/onboard-arch-precheck/check.sh \"\$PLATFORM\" && npu-smi info > outputs/framework-eager-ci/npu-smi.txt && .venv-framework/bin/python .github/actions/setup-framework-eager/identity.py --platform \"\$PLATFORM\" && .venv-framework/bin/python -m pytest examples tests/st --platform \"\$PLATFORM\" --test-environment torch_npu --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/framework-eager-ci/pytest --junitxml outputs/framework-eager-ci/results.xml"
           .venv-framework/bin/python -m simpler_setup.test_environments verify outputs/framework-eager-ci/results.plan.json outputs/framework-eager-ci/results.xml
 

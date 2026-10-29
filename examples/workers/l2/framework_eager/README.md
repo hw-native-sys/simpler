@@ -277,3 +277,19 @@ Required A5 HBG per-task argument capture remains unimplemented and tracked unde
 recovery qualification does not close it. The existing
 [task-boundary producer investigation](../../../../docs/investigations/2026-10-a5-resident-per-task-args-capture.md)
 describes that missing producer.
+
+## Native submission reference
+
+`native_submission.py` uses `Worker.prepare_submission` and the native capsule
+SDK to submit from the Torch NPU queue without acquiring GIL. It retains tensor
+and stream owners until completion, verifies three dependent results
+`8, 22, 50`, checks duplicate/cancelled token refusal, and releases a native
+reference on a background thread while Python holds GIL. With task queue enabled,
+controlled gates exercise both `stream.query()` and `torch.npu.empty_cache()`.
+
+The system test is `tests/st/worker/framework_eager/test_native_submission.py`.
+Run it in the declared `torch_npu` test environment with `--junitxml`, the matching
+`--platform`, and a device reserved through `task-submit`. Both HBG and TMR and
+queue enabled/disabled are covered. The adapter must inspect callback failures
+before consuming outputs; cancellation does not produce an output tensor.
+This reference does not migrate the PyPTO adapter or qualify capture/replay.
