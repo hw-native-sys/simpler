@@ -68,6 +68,9 @@ LoopAction SchedulerContext::handle_orchestrator_exit(
             "completed_tasks=%d, total_tasks=%d",
             thread_idx, orch_err, completed_tasks_.load(std::memory_order_relaxed), total_tasks_
         );
+        if (orch_err == SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT) {
+            log_owned_dispatch_records(thread_idx, StallDumpReport::Shutdown);
+        }
         emergency_shutdown(runtime);
         return LoopAction::BREAK_LOOP;
     }
@@ -100,6 +103,9 @@ LoopAction SchedulerContext::check_idle_fatal_error(int32_t thread_idx, SharedMe
     int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
     if (orch_err != SIMPLER_ERROR_NONE) {
         LOG_ERROR("Thread %d: Fatal error detected (code=%d), sending EXIT_SIGNAL to all cores", thread_idx, orch_err);
+        if (orch_err == SIMPLER_ERROR_TENSOR_WAIT_TIMEOUT) {
+            log_owned_dispatch_records(thread_idx, StallDumpReport::Shutdown);
+        }
         emergency_shutdown(runtime);
         return LoopAction::BREAK_LOOP;
     }
@@ -219,6 +225,34 @@ bool SchedulerContext::no_thread_owns_running_task() const {
         }                                            \
     } while (0)
 
+void SchedulerContext::log_owned_dispatch_records(int32_t thread_idx, StallDumpReport report) {
+    if (thread_idx < 0 || thread_idx >= active_sched_threads_) return;
+    const CoreTracker &tracker = core_trackers_[thread_idx];
+    STALL_DUMP_LOG(
+        report, "[STALL thread=%d] publication_records=owner_local implicit_wait_metadata=unavailable", thread_idx
+    );
+    for (int32_t i = 0; i < tracker.core_num(); ++i) {
+        const int32_t core_id = tracker.core_ids()[i];
+        const CoreExecState &core = core_exec_states_[core_id];
+        const int32_t tokens[] = {core.running_reg_task_id, core.pending_reg_task_id};
+        for (int slot = 0; slot < 2; ++slot) {
+            if (tokens[slot] == AICPU_TASK_INVALID) continue;
+            const uint32_t bank = static_cast<uint32_t>(tokens[slot]) & 1u;
+            const DispatchPayload &payload = payload_per_core_[core_id][bank];
+            // The owner writes these control fields before publication. A gated
+            // AICore can fill args; args and pointed-to source data are not read.
+            STALL_DUMP_LOG(
+                report,
+                "[STALL thread=%d] SLOT core=%d slot=%s token=%d bank=%u task_id=0x%" PRIx64
+                " block=%d/%d function_bin_addr=0x%" PRIx64 " src_payload=0x%" PRIx64,
+                thread_idx, core_id, slot == 0 ? "running" : "pending", tokens[slot], bank,
+                TaskId::to_uint64(payload.local_context.async_ctx.task_token), payload.local_context.block_idx,
+                payload.local_context.block_num, payload.function_bin_addr, payload.src_payload
+            );
+        }
+    }
+}
+
 void SchedulerContext::log_global_stall_diagnostics(
     int32_t trigger_thread_idx, int32_t idle_iterations, int32_t last_progress_count
 ) {
@@ -304,6 +338,7 @@ void SchedulerContext::log_global_stall_diagnostics(
 }
 
 void SchedulerContext::log_stall_diagnostics(int32_t thread_idx, int32_t idle_iterations, StallDumpReport report) {
+    if (report == StallDumpReport::Periodic) log_owned_dispatch_records(thread_idx, report);
     CoreTracker &tracker = core_trackers_[thread_idx];
 
     // CLUSTER lines: one per cluster this thread owns.
@@ -462,6 +497,7 @@ int32_t SchedulerContext::handle_timeout_exit(
         header->sched_stall_detail.store(cls.detail, std::memory_order_release);
     }
     if (begin_emergency_shutdown()) {
+        log_owned_dispatch_records(thread_idx, StallDumpReport::Shutdown);
         log_shutdown_stall_snapshot(thread_idx, idle_iterations, last_progress_count, "scheduler_timeout");
 #if SIMPLER_DFX
         // Capture the in-flight kernels' partial output before signalling the
