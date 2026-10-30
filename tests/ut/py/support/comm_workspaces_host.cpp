@@ -307,6 +307,18 @@ static void assert_urma_sender_storage(const CommContext &ctx) {
     assert(capacity == simpler::urma::sender_view_offset(workspace.size, workspace_fixture::device_aiv_count));
 }
 
+// A failed initializer keeps admission closed until its owner is aborted.
+static void check_failed_admission(CommHandle h, uint64_t failed_id, uint64_t &next_id) {
+    if (!h->last_allocation_id || *h->last_allocation_id != failed_id) return;
+    assert(h->domain_admission_stopped);
+    const uint32_t ranks[] = {0, 1};
+    uint64_t ctx = 0, base = 0;
+    size_t size = 0;
+    assert(comm_alloc_domain_windows(h, next_id++, ranks, h->nranks, 0, 4096, 0, &ctx, &base, &size) != 0);
+    assert(ctx == 0 && base == 0 && size == 0);
+    assert(*h->last_allocation_id == failed_id);
+}
+
 static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
     using namespace workspace_fixture;
     const int old_nranks = h->nranks;
@@ -317,14 +329,16 @@ static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
         // Rank 1 is represented by its real announce/barrier file formats;
         // rank 0 runs the production two-rank allocation and cleanup path.
         assert(domain_write_announce(h->rootinfo_path, id, 1, h->run_token, getpid(), 1, 42));
-        for (const char *phase : {"p2p_ready", "release"}) {
+        for (const char *phase : {"p2p_ready", "release", "release_consumed"}) {
             std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), 1));
             marker << "1";
             assert(marker.good());
         }
         uint64_t base = 0;
         size_t size = 0;
-        return comm_alloc_domain_windows(h, id, ranks, 2, 0, 4096, mask, &ctx, &base, &size);
+        const int rc = comm_alloc_domain_windows(h, id, ranks, 2, 0, 4096, mask, &ctx, &base, &size);
+        if (rc != 0) check_failed_admission(h, id, next_id);
+        return rc;
     };
     uint64_t held_id = 0, held_ctx = 0;
     assert(allocate(1, held_id, held_ctx) == 0);
@@ -629,12 +643,12 @@ static void test_host_domain(const std::string &scenario) {
     }
     uint64_t device_context = 0;
     if (scenario == "host_coexist") {
-        assert(domain_write_announce(h->rootinfo_path, 2, 1, h->run_token, getpid(), 1, 42));
-        for (const char *phase : {"p2p_ready", "release"}) {
-            std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(2, phase), 1));
+        assert(domain_write_announce(h->rootinfo_path, 0, 1, h->run_token, getpid(), 1, 42));
+        for (const char *phase : {"p2p_ready", "release", "release_consumed"}) {
+            std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(0, phase), 1));
             marker << "1";
         }
-        assert(comm_alloc_domain_windows(h.get(), 2, ranks, 2, 0, 4096, 2, &device_context, &base, &size) == 0);
+        assert(comm_alloc_domain_windows(h.get(), 0, ranks, 2, 0, 4096, 2, &device_context, &base, &size) == 0);
         base = size = 0;
         assert(live[1] == 1);
     }
@@ -753,8 +767,8 @@ static void test_host_domain(const std::string &scenario) {
     assert(device[7] == 0x12345678);
     device[9] = 0x98765432;
     assert(cpu[9] == 0x98765432);
-    {
-        std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(1, "release"), 1));
+    for (const auto *phase : {"release", "release_consumed"}) {
+        std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(1, phase), 1));
         marker << "1";
     }
     if (fail_host_unregister) {
@@ -796,7 +810,7 @@ static void test_host_domain(const std::string &scenario) {
             const auto *device_view = reinterpret_cast<const CommContext *>(device_context);
             assert(device_view->windowsIn[0] != 0 && device_view->windowsIn[1] == 0);
             assert(comm_workspace<CommWorkspaceKind::URMA>(*device_view).addr != 0);
-            assert(comm_release_domain_windows(h.get(), 2, 2, 0) == 0);
+            assert(comm_release_domain_windows(h.get(), 0, 2, 0) == 0);
         }
         assert(h->domain_allocations.empty() && mappings.empty() && physical_handles == 0);
         assert(shm_open(path.c_str(), O_RDWR, 0) < 0 && errno == ENOENT);
@@ -842,7 +856,7 @@ static void test_host_mte_domain(const std::string &scenario) {
         const auto peer_name = scenario == "host_mte_missing" ? name + "_absent" : name;
         const auto payload = std::to_string(peer_rank) + " " + std::to_string(peer_size) + " " + peer_name;
         assert(file_marker_handshake::publish_marker(path, payload.c_str()));
-        for (const auto *phase : {"host_mapped", "release"})
+        for (const auto *phase : {"host_mapped", "release", "release_consumed"})
             assert(
                 file_marker_handshake::publish_marker(
                     barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), 1)
@@ -1061,7 +1075,7 @@ int main(int argc, char **argv) {
         const size_t count = (mask & 2) ? 2 : 1;
         if (count == 2) {
             assert(domain_write_announce(h->rootinfo_path, id, 1, h->run_token, getpid(), 1, 42));
-            for (const char *phase : {"p2p_ready", "release"}) {
+            for (const char *phase : {"p2p_ready", "release", "release_consumed"}) {
                 std::ofstream marker(
                     barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), 1)
                 );
@@ -1071,7 +1085,9 @@ int main(int argc, char **argv) {
         }
         uint64_t base = 0;
         size_t size = 0;
-        return comm_alloc_domain_windows(h, id, ranks, count, 0, 4096, mask, &ctx, &base, &size, config);
+        const int rc = comm_alloc_domain_windows(h, id, ranks, count, 0, 4096, mask, &ctx, &base, &size, config);
+        if (rc != 0) check_failed_admission(h, id, next_id);
+        return rc;
     };
     auto release = [&](uint64_t id) {
         const auto count = h->domain_allocations.at(id)->nranks;
@@ -1088,7 +1104,7 @@ int main(int argc, char **argv) {
             comm_alloc_domain_windows(h, next_id, invalid_ranks, 2, 0, 4096, 2, &first_ctx, &base, &size) ==
             COMM_DOMAIN_URMA_CONFIG_INVALID
         );
-        assert(h->used_domain_ids.empty() && h->domain_allocations.empty());
+        assert(!h->last_allocation_id && h->domain_allocations.empty());
         assert(first_ctx == 0 && base == 0 && size == 0 && mappings.empty() && started[1] == 0);
     }
     assert(
@@ -1096,10 +1112,10 @@ int main(int argc, char **argv) {
             h, next_id, wrong_local_rank, 2, 1, 4096, 2, "host-reordered", &first_ctx, &base, &size
         ) == COMM_DOMAIN_URMA_CONFIG_INVALID
     );
-    assert(h->used_domain_ids.empty() && h->domain_allocations.empty() && mappings.empty());
+    assert(!h->last_allocation_id && h->domain_allocations.empty() && mappings.empty());
     for (uint32_t mask : {3u, 6u, 10u}) {
         assert(allocate(mask, first, first_ctx) == COMM_DOMAIN_WORKSPACE_UNSUPPORTED);
-        assert(h->used_domain_ids.empty() && h->domain_allocations.empty() && mappings.empty());
+        assert(!h->last_allocation_id && h->domain_allocations.empty() && mappings.empty());
     }
     assert(allocate(0, first, first_ctx) == 0);
     assert(started[0] == 0 && started[1] == 0 && started[2] == 0);

@@ -238,6 +238,7 @@ def kernel_symbol_runtime(tmp_path_factory):
         init_error=None,
         progress=False,
         shared_storage=False,
+        comm_admission=False,
     ):
         nonlocal next_library_id
         key = (
@@ -255,6 +256,7 @@ def kernel_symbol_runtime(tmp_path_factory):
             init_error,
             progress,
             shared_storage,
+            comm_admission,
         )
         # Fault scripts retain their consumed failure budget in the loaded DSO.
         if finalize_failures == 0 and not init_gate and key in cache:
@@ -634,6 +636,38 @@ def kernel_symbol_runtime(tmp_path_factory):
                     "CallerStorageReleaseFn, void *) { return -79; }\n"
                 )
 
+        comm_symbols = {
+            "ensure_acl_ready_ctx",
+            "create_comm_stream_ctx",
+            "destroy_comm_stream_ctx",
+            "comm_init",
+            "comm_release_domain_windows",
+            "comm_alloc_domain_windows",
+            "comm_destroy",
+        }
+        if comm_admission:
+            with source.open("a", encoding="utf-8") as output:
+                output.write(
+                    textwrap.dedent("""
+                    #include "../platform_comm/comm.h"
+                    extern "C" int ensure_acl_ready_ctx(void *, int) { return 0; }
+                    extern "C" void *create_comm_stream_ctx(void *) { return reinterpret_cast<void *>(2); }
+                    extern "C" int destroy_comm_stream_ctx(void *, void *) { return 0; }
+                    extern "C" CommHandle comm_init(int, int, void *, const char *) {
+                        return reinterpret_cast<CommHandle>(1);
+                    }
+                    extern "C" int comm_release_domain_windows(CommHandle, uint64_t, size_t, uint32_t) {
+                        record("marker-unlink-failed"); return -1;
+                    }
+                    extern "C" int comm_alloc_domain_windows(
+                        CommHandle, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t,
+                        uint64_t *, uint64_t *, size_t *, const CommWorkspaceConfig *) {
+                        return COMM_DOMAIN_ADMISSION_STOPPED;
+                    }
+                    extern "C" int comm_destroy(CommHandle) { record("comm-destroyed"); return 0; }
+                """)
+                )
+
         # These symbols are only resolved during init; any invocation is a test failure.
         # A separate TU keeps the sentinels independent of the C ABI parameter lists.
         sentinels.write_text(
@@ -643,6 +677,7 @@ def kernel_symbol_runtime(tmp_path_factory):
                 f'std::fprintf(stderr, "unexpected runtime leaf: {symbol}\\n"); std::abort(); }}\n'
                 for symbol in (*unused_symbols, *_KERNEL_LIFECYCLE_SYMBOLS)
                 if symbol not in missing
+                and not (comm_admission and symbol in comm_symbols)
                 and not (memory and symbol in memory_symbols)
                 and not (progress and symbol in progress_symbols)
                 and not (
@@ -661,6 +696,8 @@ def kernel_symbol_runtime(tmp_path_factory):
                 "-fPIC",
                 "-I",
                 str(worker_headers),
+                "-I",
+                str(worker_headers.parent / "platform/include"),
                 str(source),
                 str(sentinels),
                 "-o",
@@ -778,6 +815,26 @@ def _submit_progress_call(worker, handle):
 
 
 class TestChipWorkerKernelSymbols:
+    def test_domain_admission_refusal_preserves_base_teardown(self, kernel_symbol_runtime, tmp_path):
+        lifecycle_log = tmp_path / "comm-lifecycle.log"
+        runtime = kernel_symbol_runtime(comm_admission=True, lifecycle_log=lifecycle_log)
+        worker = _ChipWorker()
+        try:
+            worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
+            handle = worker.comm_init(0, 1, str(tmp_path / "root.bin"))
+            with pytest.raises(RuntimeError, match="comm_release_domain_windows"):
+                worker.comm_release_domain_windows(handle, 7, 1, 0)
+            with pytest.raises(RuntimeError, match="admission stopped"):
+                ownership = ctypes.c_uint64(0)
+                worker.comm_alloc_domain_windows(handle, 8, [0], 0, 4096, ctypes.addressof(ownership))
+            assert ownership.value == 2
+            assert worker.communication_cleanup_confirmed()
+            worker.comm_destroy(handle)
+            assert "comm-destroyed" in lifecycle_log.read_text().splitlines()
+            assert "marker-unlink-failed" in lifecycle_log.read_text().splitlines()
+        finally:
+            worker.finalize()
+
     @pytest.mark.parametrize("detail", ["", "actual operator timeout 4294967 us exceeds stream 4000 ms; adjust budget"])
     def test_program_init_failure_reports_context_detail_before_cleanup(self, kernel_symbol_runtime, tmp_path, detail):
         lifecycle_log = tmp_path / "init-error-lifecycle.log"

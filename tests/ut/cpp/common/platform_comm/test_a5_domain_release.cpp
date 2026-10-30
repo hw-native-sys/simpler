@@ -1,0 +1,177 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#include <gtest/gtest.h>
+
+#include <filesystem>
+#include <fstream>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "a5/platform/onboard/host/comm_hccl.cpp"
+
+namespace simpler::ccu {
+bool HcommMissionStreamPool::close() {
+    if (!entries_.empty()) return false;
+    closed_ = true;
+    return true;
+}
+bool HcommDomainChannels::close() { return communicator == nullptr; }
+bool query_window_token(uint64_t, uint64_t, uint64_t &) {
+    ADD_FAILURE() << "refused allocation reached CCU window lookup";
+    return false;
+}
+void create_hcomm_domain_channels(
+    HcclComm, uint64_t, const std::vector<uint32_t> &, uint32_t, std::shared_ptr<HcommDomainChannels> &, CommCcuMode
+) {
+    ADD_FAILURE() << "refused allocation reached CCU channel creation";
+}
+}  // namespace simpler::ccu
+
+namespace {
+std::vector<int> calls;
+int fail_call = -1;
+int destroyed_comms = 0;
+aclError injected(int operation) {
+    calls.push_back(operation);
+    if (fail_call == 0) return static_cast<aclError>(40 + calls.size());
+    return static_cast<int>(calls.size()) == fail_call ? 42 : ACL_SUCCESS;
+}
+}  // namespace
+
+extern "C" aclError aclrtUnmapMem(void *) { return injected(1); }
+extern "C" aclError aclrtReleaseMemAddress(void *) { return injected(2); }
+extern "C" aclError aclrtFreePhysical(aclrtDrvMemHandle) { return injected(3); }
+extern "C" aclError aclrtFree(void *) { return injected(4); }
+extern "C" HcclResult HcclCommDestroy(HcclComm) {
+    ++destroyed_comms;
+    return HCCL_SUCCESS;
+}
+
+TEST(A5DomainReleaseHelper, MarkerUnlinkFailureAllowsBaseTeardownButKeepsAdmissionStopped) {
+    const auto directory = std::filesystem::temp_directory_path() / ("simpler_a5_unlink_" + std::to_string(getpid()));
+    ASSERT_TRUE(std::filesystem::create_directory(directory));
+    auto *handle = new CommHandle_{};
+    handle->rootinfo_path = (directory / "root.bin").string();
+    handle->run_token = 1;
+    handle->nranks = 1;
+    handle->hccl_comm = reinterpret_cast<HcclComm>(1);
+    for (int id : {7, 8}) {
+        auto allocation = std::make_unique<DomainAllocation>();
+        allocation->rank = 0;
+        allocation->nranks = 1;
+        allocation->initialized = id == 7;
+        handle->domain_allocations.emplace(id, std::move(allocation));
+    }
+    const auto blocked = file_marker_handshake::marker_path(handle->rootinfo_path, 1, "alloc_7_ipc_announce", 0);
+    ASSERT_TRUE(std::filesystem::create_directory(blocked));
+    std::ofstream(blocked + "/entry") << "occupied";
+    fail_call = -1;
+    EXPECT_EQ(comm_release_domain_windows(handle, 7, 1, 0), -1);
+    EXPECT_FALSE(handle->cleanup_failed);
+    EXPECT_EQ(handle->domain_allocations.count(7), 0U);
+    EXPECT_TRUE(handle->domain_admission_stopped);
+    EXPECT_EQ(comm_abort_domain_windows(handle, 8, 1, 0), 0);
+    EXPECT_TRUE(handle->domain_admission_stopped);
+    const uint32_t rank = 0;
+    uint64_t ctx = 0, base = 0;
+    size_t bytes = 0;
+    EXPECT_EQ(
+        comm_alloc_domain_windows(handle, 9, &rank, 1, 0, 4096, 0, &ctx, &base, &bytes), COMM_DOMAIN_ADMISSION_STOPPED
+    );
+    const auto before = destroyed_comms;
+    EXPECT_NE(comm_destroy(handle), COMM_RECLAMATION_UNCONFIRMED);
+    EXPECT_EQ(destroyed_comms, before + 1);
+    std::filesystem::remove_all(directory);
+}
+
+class A5DomainRelease : public testing::TestWithParam<int> {};
+
+TEST(A5DomainReleaseHelper, AbortOfAnotherAllocationKeepsFailedInitializerBlocked) {
+    CommHandle_ handle{};
+    for (uint64_t id : {1, 2}) {
+        auto allocation = std::make_unique<DomainAllocation>();
+        allocation->nranks = 1;
+        allocation->initialized = id == 1;
+        handle.domain_allocations.emplace(id, std::move(allocation));
+    }
+    handle.last_allocation_id = 2;
+    handle.domain_admission_stopped = true;
+    EXPECT_EQ(comm_abort_domain_windows(&handle, 1, 1, 0), 0);
+    EXPECT_TRUE(handle.domain_admission_stopped);
+    EXPECT_EQ(comm_abort_domain_windows(&handle, 2, 1, 0), 0);
+    EXPECT_FALSE(handle.domain_admission_stopped);
+}
+
+TEST_P(A5DomainRelease, ErrorsBlockRetirementAndAdmission) {
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("simpler_a5_release_" + std::to_string(getpid()) + "_" + std::to_string(GetParam()));
+    ASSERT_TRUE(std::filesystem::create_directory(directory));
+    CommHandle_ handle{};
+    handle.rootinfo_path = (directory / "root.bin").string();
+    handle.run_token = 1;
+    auto allocation = std::make_unique<DomainAllocation>();
+    allocation->rank = 0;
+    allocation->nranks = 1;
+    allocation->initialized = true;
+    allocation->local_mapped = true;
+    int local{}, peer{};
+    allocation->local_buf = &local;
+    allocation->own_handle = reinterpret_cast<aclrtDrvMemHandle>(&local);
+    allocation->peer_windows.push_back({&peer, reinterpret_cast<aclrtDrvMemHandle>(&peer), true});
+    handle.domain_allocations.emplace(7, std::move(allocation));
+    calls.clear();
+    fail_call = GetParam();
+    const int result = comm_release_domain_windows(&handle, 7, 1, 0);
+    const std::vector<int> all_calls{1, 2, 3, 1, 2, 3};
+    EXPECT_EQ(
+        calls, (GetParam() > 0 ? std::vector<int>(all_calls.begin(), all_calls.begin() + GetParam()) : all_calls)
+    );
+    const auto arrival = file_marker_handshake::marker_path(handle.rootinfo_path, 1, "alloc_7_release", 0);
+    if (GetParam() > 0) {
+        EXPECT_NE(result, 0);
+        EXPECT_EQ(handle.domain_allocations.size(), 1U);
+        EXPECT_TRUE(handle.cleanup_failed);
+        EXPECT_TRUE(handle.domain_admission_stopped);
+        EXPECT_TRUE(std::filesystem::exists(arrival));
+        EXPECT_FALSE(
+            std::filesystem::exists(
+                file_marker_handshake::marker_path(handle.rootinfo_path, 1, "alloc_7_release_consumed", 0)
+            )
+        );
+    } else {
+        EXPECT_EQ(result, 0);
+        EXPECT_TRUE(handle.domain_allocations.empty());
+        EXPECT_FALSE(handle.domain_admission_stopped);
+        EXPECT_FALSE(std::filesystem::exists(arrival));
+    }
+    std::filesystem::remove_all(directory);
+}
+
+INSTANTIATE_TEST_SUITE_P(AclFailures, A5DomainRelease, testing::Values(-1, 1, 2, 3, 4, 5, 6));
+
+TEST(A5DomainReleaseHelper, LocalAclAllocationPropagatesFreeStatus) {
+    for (int failure : {-1, 1}) {
+        SCOPED_TRACE(failure);
+        int buffer{};
+        DomainAllocation allocation{};
+        allocation.local_buf = &buffer;
+        calls.clear();
+        fail_call = failure;
+        EXPECT_EQ(
+            release_domain_window(allocation.local_buf, allocation.own_handle, allocation.local_mapped), failure < 0
+        );
+        EXPECT_EQ(calls, (std::vector<int>{4}));
+        EXPECT_EQ(allocation.local_buf, failure > 0 ? &buffer : nullptr);
+        EXPECT_EQ(allocation.own_handle, nullptr);
+    }
+}

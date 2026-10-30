@@ -330,7 +330,7 @@ static void test_overlapping_domains(CommHandle h, const std::vector<uint32_t> &
     auto allocate = [&](uint64_t id, const std::vector<uint32_t> &ranks, uint32_t rank) {
         const uint32_t peer = 1 - rank;
         assert(domain_write_announce(h->rootinfo_path, id, peer, h->run_token, getpid(), ranks[peer], 0));
-        for (const char *phase : {"p2p_ready", "release"}) {
+        for (const char *phase : {"p2p_ready", "release", "release_consumed"}) {
             std::ofstream marker(
                 barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), peer)
             );
@@ -433,7 +433,7 @@ int main(int argc, char **argv) {
     const uint64_t id = 1;
     const bool mapped = peer_failure != PeerFailure::NONE || scenario == "late_import" || scenario == "mapped_success";
     assert(domain_write_announce(h->rootinfo_path, id, 1, h->run_token, getpid(), 1, mapped ? 42 : 0));
-    for (const char *phase : {"p2p_ready", "release"}) {
+    for (const char *phase : {"p2p_ready", "release", "release_consumed"}) {
         if (scenario == "abort_unpublished" && std::strcmp(phase, "release") == 0) continue;
         std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), 1));
         marker << "1";
@@ -450,7 +450,7 @@ int main(int argc, char **argv) {
                 COMM_DOMAIN_WORKSPACE_UNSUPPORTED
             );
         }
-        assert(h->used_domain_ids.empty() && h->domain_allocations.empty() && mappings.empty());
+        assert(!h->last_allocation_id && h->domain_allocations.empty() && mappings.empty());
         delete h;
         std::filesystem::remove_all(folder);
         return 0;
@@ -542,7 +542,7 @@ int main(int argc, char **argv) {
         } else {
             const uint64_t second_id = 2;
             assert(domain_write_announce(h->rootinfo_path, second_id, 1, h->run_token, getpid(), 1, 0));
-            for (const char *phase : {"p2p_ready", "release"}) {
+            for (const char *phase : {"p2p_ready", "release", "release_consumed"}) {
                 std::ofstream marker(
                     barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(second_id, phase), 1)
                 );
