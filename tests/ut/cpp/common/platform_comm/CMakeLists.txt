@@ -45,4 +45,15 @@ endmacro()
 platform_comm_case(test_comm_lifecycle.cpp
     DEFINES PTO_HOST_RUNTIME_LIB_PATH="${HOST_RUNTIME_LIB}")
 
+# Uses the CANN headers/libraries but replaces only the three VMM release calls;
+# the production release entry point runs on the CPU with synthetic windows.
+simpler_ut_plain_case(test_a5_domain_release.cpp
+    SOURCES ${HOST_LOG_TEST_SOURCES}
+    INCLUDES ${SIMPLER_SRC} ${SIMPLER_SRC}/common
+             ${SIMPLER_COMMON_PLATFORM_DIR}/include ${ASCEND_HOME_PATH}/include
+             ${SIMPLER_LOG_DIR} ${SIMPLER_LOG_DIR}/include
+    LINK ${ASCENDCL_LIB} ${ASCEND_HOME_PATH}/lib64/libhccl.so ${CMAKE_DL_LIBS}
+    LABEL requires_hardware_a2a3)
+add_dependencies(test_comm_lifecycle test_a5_domain_release)
+
 simpler_ut_glob_cases(platform_comm_case)

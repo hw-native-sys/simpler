@@ -27,6 +27,7 @@
 
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
+#include "host/comm_generation_lease.h"
 
 #include <array>
 #include <chrono>
@@ -39,6 +40,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -108,6 +110,9 @@ struct CommHandle_ {
     int nranks;
     std::string rootinfo_path;
     uint64_t run_token = 0;
+    file_marker_handshake::GenerationLease generation_lease;
+    bool domain_admission_stopped = false;
+    std::optional<uint64_t> last_allocation_id;
 
     // Caller-owned: supplied to comm_init, never created or destroyed here.
     aclrtStream stream = nullptr;
@@ -178,8 +183,18 @@ barrier_marker_path(const std::string &rootinfo_path, uint64_t run_token, const 
     return file_marker_handshake::marker_path(rootinfo_path, run_token, tag, rank);
 }
 
-static void cleanup_handshake_files(const std::string &rootinfo_path) {
-    (void)file_marker_handshake::cleanup(rootinfo_path);
+static void log_marker_error(const file_marker_handshake::Result &result) {
+    LOG_ERROR(
+        "[comm] marker failure stage=%s rank=%d path=%s errno=%d failures=%zu",
+        file_marker_handshake::stage_name(result.stage), result.rank, result.path.c_str(), result.system_error.value(),
+        result.failure_count
+    );
+}
+
+static bool cleanup_handshake_files(const std::string &rootinfo_path) {
+    const auto result = file_marker_handshake::cleanup(rootinfo_path);
+    if (!result.ok()) log_marker_error(result);
+    return result.ok();
 }
 
 static bool
@@ -247,14 +262,20 @@ static bool file_barrier(
 // either may be nullptr before its respective step completed.  Base-comm peer
 // imports (alloc_windows_via_ipc) are not tracked and remain reclaimed by
 // aclrtResetDevice; per-domain peer imports are tracked and freed via this call.
-static void release_own_vmm_window(void *va, aclrtDrvMemHandle handle) {
+static void record_first_error(aclError status, aclError *first_error) {
+    if (*first_error == ACL_SUCCESS && status != ACL_SUCCESS) *first_error = status;
+}
+
+static aclError release_own_vmm_window(void *va, aclrtDrvMemHandle handle) {
+    aclError first_error = ACL_SUCCESS;
     if (va != nullptr) {
-        aclrtUnmapMem(va);
-        aclrtReleaseMemAddress(va);
+        record_first_error(aclrtUnmapMem(va), &first_error);
+        record_first_error(aclrtReleaseMemAddress(va), &first_error);
     }
     if (handle != nullptr) {
-        aclrtFreePhysical(handle);
+        record_first_error(aclrtFreePhysical(handle), &first_error);
     }
+    return first_error;
 }
 
 // RDMA-aware raw-window release for domain_alloc_via_ipc failure paths: under
@@ -272,27 +293,28 @@ static void release_domain_window_raw(void *buf, aclrtDrvMemHandle handle) {
 // Release every per-peer VMM import recorded on a domain allocation and clear
 // the list, so a re-release is a no-op.  Own window and device_ctx are freed
 // separately by the caller.
-static void release_domain_peer_windows(DomainAllocation &alloc) {
+static aclError release_domain_peer_windows(DomainAllocation &alloc) {
+    aclError first_error = ACL_SUCCESS;
     for (auto &pw : alloc.peer_windows) {
-        release_own_vmm_window(pw.first, pw.second);
+        record_first_error(release_own_vmm_window(pw.first, pw.second), &first_error);
     }
     alloc.peer_windows.clear();
+    return first_error;
 }
 
 // Release the own local window.  Under the RDMA overlay the window is a plain
 // low-segment aclrtMalloc pointer (own_handle == nullptr); otherwise it is a
 // VMM-mapped VA with a physical handle.
-static void release_domain_local_buffer(DomainAllocation &alloc) {
-    if (alloc.local_buf == nullptr) return;
+static aclError release_domain_local_buffer(DomainAllocation &alloc) {
+    if (alloc.local_buf == nullptr) return ACL_SUCCESS;
 #ifdef SIMPLER_ENABLE_PTO_RDMA_WORKSPACE
-    aclrtFree(alloc.local_buf);
-    alloc.local_buf = nullptr;
-    alloc.own_handle = nullptr;
+    const aclError status = aclrtFree(alloc.local_buf);
 #else
-    release_own_vmm_window(alloc.local_buf, alloc.own_handle);
+    const aclError status = release_own_vmm_window(alloc.local_buf, alloc.own_handle);
+#endif
     alloc.local_buf = nullptr;
     alloc.own_handle = nullptr;
-#endif
+    return status;
 }
 
 }  // namespace
@@ -326,6 +348,11 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     h->nranks = nranks;
     h->rootinfo_path = rootinfo_path;
     h->stream = static_cast<aclrtStream>(stream);
+    if (!h->generation_lease.acquire(h->rootinfo_path)) {
+        LOG_ERROR("[comm rank %d] generation lease unavailable: %s", rank, rootinfo_path);
+        delete h;
+        return nullptr;
+    }
 
     // NOTE: aclInit / aclrtSetDevice / stream creation are intentionally NOT
     // performed here — the caller (DeviceRunner::ensure_acl_ready + a stream
@@ -336,7 +363,10 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     // RootInfo exchange
     HcclRootInfo rootInfo{};
     if (rank == 0) {
-        cleanup_handshake_files(h->rootinfo_path);
+        if (!cleanup_handshake_files(h->rootinfo_path)) {
+            delete h;
+            return nullptr;
+        }
         h->run_token = make_run_token(rank);
         HcclResult hret = hccl_get_root_info(&rootInfo);
         if (hret != HCCL_SUCCESS) {
@@ -1876,6 +1906,13 @@ extern "C" int comm_alloc_domain_windows(
         return -1;
     }
 
+    if (h->domain_admission_stopped || (h->last_allocation_id && allocation_id <= *h->last_allocation_id)) {
+        LOG_ERROR("[comm rank %d] domain admission stopped or allocation_id reused/out of order", h->rank);
+        return -1;
+    }
+    h->last_allocation_id = allocation_id;
+    // Admission remains stopped unless the full allocation transaction commits.
+    h->domain_admission_stopped = true;
     auto alloc = std::make_unique<DomainAllocation>();
     int rc = domain_alloc_via_ipc(h, allocation_id, rank_ids, rank_count, domain_rank, window_size, alloc.get());
     if (rc != 0) return rc;
@@ -1884,6 +1921,7 @@ extern "C" int comm_alloc_domain_windows(
     *local_window_base_out = reinterpret_cast<uint64_t>(alloc->local_buf);
     *actual_window_size_out = alloc->mapping_size;
     h->domain_allocations.emplace(allocation_id, std::move(alloc));
+    h->domain_admission_stopped = false;
     return 0;
 } catch (const std::exception &e) {
     LOG_ERROR("[comm] alloc_domain: exception: %s", e.what());
@@ -1914,6 +1952,8 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         return -1;
     }
     int rc = 0;
+    const bool prior_admission_stopped = h->domain_admission_stopped;
+    h->domain_admission_stopped = true;
     // Best-effort subset barrier so peers don't free local memory under each
     // other.  If a peer crashed mid-allocation, the timeout returns false and
     // we proceed with local teardown anyway — same shape as comm_destroy.
@@ -1933,13 +1973,23 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
     // local_buf and every peer import are VMM-mapped VAs, not aclrtMalloc
     // pointers: unmap + release the VA reservation, then free the physical
     // handle.
-    release_domain_peer_windows(*alloc);
-    if (alloc->local_buf) {
-        release_domain_local_buffer(*alloc);
-        alloc->local_buf = nullptr;
-        alloc->own_handle = nullptr;
+    aclError release_status = release_domain_peer_windows(*alloc);
+    record_first_error(release_domain_local_buffer(*alloc), &release_status);
+    if (release_status != ACL_SUCCESS) {
+        LOG_ERROR("[comm rank %d] release_domain: release VMM windows -> %d", h->rank, release_status);
+        if (rc == 0) rc = -1;
+    }
+    if (rc == 0) {
+        const auto retired = file_marker_handshake::retire_allocation(
+            h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count), h->run_token, allocation_id
+        );
+        if (!retired.ok()) {
+            log_marker_error(retired);
+            rc = -1;
+        }
     }
     h->domain_allocations.erase(it);
+    if (rc == 0) h->domain_admission_stopped = prior_admission_stopped;
     return rc;
 } catch (const std::exception &e) {
     LOG_ERROR("[comm] release_domain: exception: %s", e.what());
@@ -1997,8 +2047,9 @@ extern "C" int comm_destroy(CommHandle h) try {
         auto &alloc = kv.second;
         if (alloc->device_ctx) aclrtFree(alloc->device_ctx);
         reset_domain_urma_workspace(*alloc);
-        release_domain_peer_windows(*alloc);
-        if (alloc->local_buf) release_domain_local_buffer(*alloc);
+        aclError release_status = release_domain_peer_windows(*alloc);
+        record_first_error(release_domain_local_buffer(*alloc), &release_status);
+        if (release_status != ACL_SUCCESS && rc == 0) rc = -1;
     }
     h->domain_allocations.clear();
     reset_base_urma_workspace(h);
@@ -2026,6 +2077,7 @@ extern "C" int comm_destroy(CommHandle h) try {
         const auto destroy_release =
             file_marker_handshake::release_after_cleanup(h->rootinfo_path, h->rank, h->nranks, h->run_token);
         if (!destroy_release.ok()) {
+            log_marker_error(destroy_release);
             LOG_WARN(
                 "[comm rank %d] comm_destroy: final release failed during %s for rank %d", h->rank,
                 file_marker_handshake::stage_name(destroy_release.stage), destroy_release.rank

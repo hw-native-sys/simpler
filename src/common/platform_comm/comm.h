@@ -238,8 +238,9 @@ int comm_derive_context(
  * @param h                       Base handle from comm_init().
  * @param allocation_id           Caller-assigned unique id; scopes the
  *                                handshake / barrier filenames.  Must be
- *                                unique among currently-live allocations
- *                                on this handle.
+ *                                strictly increasing on each onboard handle,
+ *                                including failed/released allocations. Calls
+ *                                on a handle must be serialized.
  * @param rank_ids                Base-communicator rank ids in dense
  *                                domain order (length rank_count).
  * @param rank_count              Number of subset members.

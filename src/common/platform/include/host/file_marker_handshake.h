@@ -12,6 +12,7 @@
 #ifndef SIMPLER_COMMON_PLATFORM_INCLUDE_HOST_FILE_MARKER_HANDSHAKE_H
 #define SIMPLER_COMMON_PLATFORM_INCLUDE_HOST_FILE_MARKER_HANDSHAKE_H
 
+#include <array>
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
@@ -48,6 +49,10 @@ struct Result {
     Error error{Error::NONE};
     Stage stage{Stage::COMPLETE};
     int rank{-1};
+    std::string path;
+    std::error_code system_error;
+    size_t failure_count{0};
+    bool rootinfo_retired{true};
 
     bool ok() const { return error == Error::NONE; }
 };
@@ -117,30 +122,43 @@ inline bool publish_marker(const std::string &path) {
     return true;
 }
 
+inline void record_cleanup_error(Result &result, const std::string &path, std::error_code ec) {
+    if (!ec) return;
+    if (result.ok()) {
+        result.error = Error::CLEANUP_FAILED;
+        result.stage = Stage::CLEANUP;
+        result.path = path;
+        result.system_error = ec;
+    }
+    ++result.failure_count;
+}
+
 inline Result cleanup(const std::string &rootinfo_path) {
-    // Retiring rootinfo is the generation-safety fence: followers must not be
-    // released while they could still consume its old token. Barrier markers
-    // are token-scoped, so their sweep remains best-effort; unrelated entries
-    // in a shared directory such as /tmp must not hold every follower hostage.
-    std::error_code rootinfo_ec;
-    std::filesystem::remove(rootinfo_path, rootinfo_ec);
+    Result result;
+    std::error_code ec;
+    std::filesystem::remove(rootinfo_path, ec);
+    result.rootinfo_retired = !ec;
+    record_cleanup_error(result, rootinfo_path, ec);
 
     const std::string prefix = "barrier_" + handshake_prefix(rootinfo_path) + "_";
     const std::string dir = handshake_dir(rootinfo_path);
-    std::error_code ec;
     std::filesystem::directory_iterator entry(dir, ec);
     const std::filesystem::directory_iterator end;
     while (!ec && entry != end) {
-        std::error_code entry_ec;
-        if (entry->is_regular_file(entry_ec)) {
-            const std::string name = entry->path().filename().string();
-            if (name.rfind(prefix, 0) == 0 && name.size() >= 6 && name.substr(name.size() - 6) == ".ready") {
-                std::filesystem::remove(entry->path(), entry_ec);
+        const std::string name = entry->path().filename().string();
+        if (name.rfind(prefix, 0) == 0 && name.size() >= 6 && name.substr(name.size() - 6) == ".ready") {
+            std::error_code entry_ec;
+            const auto status = entry->symlink_status(entry_ec);
+            if (!entry_ec && !std::filesystem::is_regular_file(status)) {
+                entry_ec = std::make_error_code(std::errc::invalid_argument);
             }
+            if (!entry_ec) std::filesystem::remove(entry->path(), entry_ec);
+            record_cleanup_error(result, entry->path().string(), entry_ec);
         }
         entry.increment(ec);
     }
-    return rootinfo_ec ? Result{Error::CLEANUP_FAILED, Stage::CLEANUP, -1} : Result{};
+    record_cleanup_error(result, dir, ec);
+    return result;
 }
 
 inline Result wait_for_path(
@@ -211,9 +229,9 @@ inline Result release_after_cleanup(
 ) {
     if (rank == 0) {
         Result cleanup_result = cleanup(rootinfo_path);
-        if (!cleanup_result.ok()) return cleanup_result;
+        if (!cleanup_result.rootinfo_retired) return cleanup_result;
 
-        Result first_error;
+        Result first_error = cleanup_result;
         for (int follower_rank = 1; follower_rank < nranks; ++follower_rank) {
             if (!publish_marker(release_path(rootinfo_path, run_token, follower_rank)) && first_error.ok()) {
                 first_error = {Error::MARKER_WRITE_FAILED, Stage::RELEASE_PUBLISH, follower_rank};
@@ -232,6 +250,39 @@ inline Result release_after_cleanup(
     const bool removed = std::filesystem::remove(path, ec);
     if (ec || !removed) return {Error::MARKER_REMOVE_FAILED, Stage::RELEASE_REMOVE, rank};
     return {};
+}
+
+// All callers have completed the allocation's release barrier before entry.
+// A consumed marker is the last publication by that rank for this allocation.
+inline Result retire_allocation(
+    const std::string &rootinfo_path, int rank, int nranks, uint64_t run_token, uint64_t allocation_id,
+    WaitOptions options = {}
+) {
+    const std::string prefix = "alloc_" + std::to_string(allocation_id) + "_";
+    const std::string consumed = prefix + "release_consumed";
+    const std::string own = marker_path(rootinfo_path, run_token, consumed, rank);
+    if (!publish_marker(own)) return {Error::MARKER_WRITE_FAILED, Stage::DEPARTURE_PUBLISH, rank, own};
+    if (rank != 0) return {};
+    const auto deadline = std::chrono::steady_clock::now() + options.timeout;
+    for (int peer = 0; peer < nranks; ++peer) {
+        Result result = wait_for_marker(
+            rootinfo_path, run_token, consumed.c_str(), peer, Stage::DEPARTURE_WAIT, deadline, options.poll_interval
+        );
+        if (!result.ok()) return result;
+    }
+    // Every release-barrier reader has departed; no rank reads consumed markers after publishing its own.
+    constexpr std::array<const char *, 7> phases{"fabric_announce", "fabric_ready", "ipc_announce",    "ipc_p2p_ready",
+                                                 "p2p_ready",       "release",      "release_consumed"};
+    Result result;
+    for (const auto *phase : phases) {
+        for (int peer = 0; peer < nranks; ++peer) {
+            const auto path = marker_path(rootinfo_path, run_token, prefix + phase, peer);
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            record_cleanup_error(result, path, ec);
+        }
+    }
+    return result;
 }
 
 }  // namespace file_marker_handshake

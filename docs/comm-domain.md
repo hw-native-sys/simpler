@@ -582,3 +582,40 @@ simpler stays framework-free — torch/numpy appear only on the caller's side.
 - `examples/a2a3/tensormap_and_ringbuffer/sdma_async_completion_demo/` — host
   staging via `copy_to` + cross-rank `SdmaTget`; the SDMA workspace is
   provisioned by constructing the `Worker` with `enable_sdma=True`.
+
+### File-handshake retirement on onboard backends
+
+A2/A3 and A5 dynamic allocation IDs increase strictly within each base
+communicator. Reusing or decreasing an ID is rejected before publishing files.
+The Worker allocates these IDs monotonically. Native callers serialize calls
+on a communicator and use the same ordering contract.
+
+After the subset release barrier, every member publishes a consumption ACK and
+ceases reading that allocation's handshake files. Subset domain rank zero waits
+for all ACKs and deletes the exact allocation/token's announce, readiness,
+release and ACK paths. A failed allocation or retirement stops new allocations
+on that communicator. Cleanup errors identify the path, stage and system error;
+rootinfo retirement and marker-sweep diagnostics remain distinct so a sweep
+error cannot strand a follower after the rootinfo fence succeeds.
+
+Local onboard Workers use private per-user communication generation directories
+on the local temporary filesystem. The parent and every native communicator
+hold shared `flock` leases. A subsequent Worker reclaims a managed generation
+only after obtaining its exclusive lease; a late native join validates the
+lease inode after acquiring its lock and refuses an unlinked generation.
+Admission permits at most 64 live managed generations per user and refuses new
+generations when reclamation fails. Crash recovery therefore depends on kernel
+lease lifetime, including surviving ranks, rather than PID or file age. Lease
+retirement proves file-protocol quiescence, not device resource reclamation.
+
+This recovery contract requires local POSIX filesystem locking. External rootinfo
+paths retain caller ownership, and existing flat `/tmp` handshake files require
+separate operator recovery. Shared-filesystem/multi-host generation recovery and
+simulator shared-memory crash recovery are separate contracts.
+
+Marker retirement removes the published marker paths. Temporary publication
+files are reclaimed with an abandoned managed generation after exclusive lease
+acquisition; temporary files for external rootinfo paths retain caller ownership.
+Initialization rejects sweep errors even after rootinfo retirement so a new
+communicator cannot start with unreported cleanup debt. During destruction,
+rootinfo retirement permits the follower handoff while sweep errors remain visible.
