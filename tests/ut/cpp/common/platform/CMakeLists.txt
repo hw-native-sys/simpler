@@ -100,13 +100,25 @@ platform_single_case(test_memory_allocator.cpp
 # needs nothing compiled in but the CANN platform stand-in.
 platform_cases(
     test_profiler_device_engine.cpp
-    test_worker_chip_orch_endpoint.cpp
     test_region_instance_view.cpp
     PER_ARCH)
 
-# SPSQ region template is header-only under src/common/platform and opens no
-# arch or runtime headers, so one build covers it.
-platform_single_case(test_region_template.cpp)
+# The example header reaches device_time.h, which includes the arch
+# platform_config.h. Those two copies differ, so one build cannot stand
+# for both.
+platform_case(test_spsc_queue_reference.cpp PER_ARCH
+    INCLUDES ${SIMPLER_SRC}/../examples/workers/l3/worker_chip_message_queue/kernels/orchestration)
+
+# The helper calls rt_report_endpoint_failure through the orchestration ops
+# table. That table's context type is the runtime's, so one build cannot stand
+# for both.
+platform_case(test_region_endpoint_diagnostics.cpp PER_ARCH PER_RUNTIME
+    INCLUDES
+        ${SIMPLER_SRC}/@arch@/runtime/@runtime@/orchestration
+        ${SIMPLER_SRC}/@arch@/runtime/@runtime@/runtime
+        ${SIMPLER_SRC}/@arch@/runtime/@runtime@/common
+        ${SIMPLER_SRC}/common/@runtime@/host/orchestration
+        ${SIMPLER_SRC}/common/@runtime@/host)
 
 platform_case(test_scope_stats_collector.cpp PER_ARCH
     SOURCES
@@ -914,7 +926,7 @@ simpler_ut_cases(platform_single_case
     test_run_stream_pair.cpp
     test_teardown_proof.cpp
     test_teardown_recorder.cpp
-    test_worker_chip_orch_comm.cpp
+    test_region_task_args.cpp
     test_workspace_manager.cpp
     test_workspace_staging.cpp)
 

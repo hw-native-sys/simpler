@@ -133,6 +133,27 @@ bool OrchestratorState::report_fatal_owned(int32_t error_code, const char *func,
     return owned;
 }
 
+void OrchestratorState::report_endpoint_failure(
+    uint32_t kind, uint64_t session_bits, uint64_t transaction_id, const char *func, const char *message
+) {
+    EndpointFailureIdentity identity{};
+    identity.kind = kind;
+    identity.reserved = 0;
+    identity.session_instance_id_bits = session_bits;
+    identity.transaction_id = transaction_id;
+    const bool shaped = endpoint_failure_identity_is_well_formed(identity) && identity.kind != 0;
+    int32_t latched = SIMPLER_ERROR_NONE;
+    const bool owned = orch_mark_fatal_owned(this, SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, &latched);
+    if (owned && shaped) {
+        endpoint_failure = identity;
+    }
+    if (message == nullptr || message[0] == '\0') {
+        unified_log_error(func, "FATAL(code=%d)", SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
+        return;
+    }
+    unified_log_error(func, "FATAL(code=%d): %s", SIMPLER_ERROR_EXPLICIT_ORCH_FATAL, message);
+}
+
 bool OrchestratorState::init(void *sm_base, void *gm_heap, uint64_t heap_size, uint64_t max_tasks) {
     // Reset in place rather than by move-assignment: fatal_code is a std::atomic,
     // which is neither copy- nor move-assignable, and a re-init has to clear every

@@ -43,7 +43,8 @@ struct NativeRunContext {
         descriptor(descriptor_in),
         host_api(
             runner_in, descriptor_in.pipeline_slot, descriptor_in.arena_bank, descriptor_in.run_epoch, host_api_ops,
-            HostApi::DiagnosticConfig{static_cast<uint32_t>(config_in.enable_chip_swimlane), config_in.enable_pmu > 0}
+            HostApi::DiagnosticConfig{static_cast<uint32_t>(config_in.enable_chip_swimlane), config_in.enable_pmu > 0},
+            descriptor_in.endpoint_failure
         ),
         trace_hid(trace_hid_in) {
         // Publish the storage tag only after every potentially-throwing member

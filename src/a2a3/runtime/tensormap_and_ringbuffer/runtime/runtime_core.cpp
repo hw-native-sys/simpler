@@ -85,6 +85,13 @@ void rt_report_fatal(RuntimeContext *rt, int32_t error_code, const char *func, c
     va_end(args);
 }
 
+void rt_report_endpoint_failure(
+    RuntimeContext *rt, uint32_t kind, uint64_t session_bits, uint64_t transaction_id, const char *func,
+    const char *message
+) {
+    rt->orchestrator.report_endpoint_failure(kind, session_bits, transaction_id, func, message);
+}
+
 // Wait for all producers of this tensor to be safe for data access.
 // Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
 // For reads: wait until each producer COMPLETED (done writing).
@@ -307,6 +314,7 @@ static const RuntimeOps s_runtime_ops = {
 #else
     .scope_set_site = nullptr,
 #endif
+    .report_endpoint_failure = rt_report_endpoint_failure,
 };
 
 // =============================================================================

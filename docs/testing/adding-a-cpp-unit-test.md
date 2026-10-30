@@ -94,7 +94,7 @@ Where a group differs only in which file it is, declare them together:
 platform_cases(
     test_profiler_device_engine.cpp
     test_worker_chip_message_queue.cpp
-    test_worker_chip_orch_endpoint.cpp
+    test_region_task_args.cpp
     test_region_instance_view.cpp
     PER_ARCH)
 ```

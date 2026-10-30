@@ -19,10 +19,11 @@ import os
 import struct
 
 import pytest
+from simpler import comm_endpoints as ce
+from simpler.comm_region import NotifyOp, WaitCmp
 from simpler.task_interface import ArgDirection as D
 from simpler.task_interface import CallConfig, ChipCallable, CoreCallable, DataType, TaskArgs
 from simpler.worker import Worker
-from simpler.worker_chip_orch_comm import NotifyOp, WaitCmp
 
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.kernel_compiler import KernelCompiler
@@ -122,8 +123,13 @@ def run_closed_loop_stream(platform: str, device_id: int) -> None:
         config.aicpu_thread_num = 2
 
         def orch(orch_handle, _args, cfg):
-            region = orch_handle.create_worker_chip_region(
-                worker_id=0, payload_bytes=_PAYLOAD_BYTES, counter_bytes=_COUNTER_BYTES
+            host = ce.at("L3", ce.HOST_CPU)
+            device = ce.at("L3/L2[0]", ce.DEVICE_AICPU)
+            region = orch_handle.create_region(
+                members=(host, device),
+                topology=ce.SingleOwner(provider=device),
+                payload_bytes=_PAYLOAD_BYTES,
+                counter_bytes=_COUNTER_BYTES,
             )
             data_ready = region.counter(_DATA_READY_COUNTER)
             completion = region.counter(_COMPLETION_COUNTER)

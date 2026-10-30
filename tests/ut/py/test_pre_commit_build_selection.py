@@ -9,6 +9,7 @@
 
 import importlib.util
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -127,6 +128,82 @@ def test_clang_tidy_hook_delegates_path_matching_to_the_shared_helper() -> None:
 )
 def test_clang_tidy_path_selection_has_one_case_sensitive_contract(path: str, expected: bool) -> None:
     assert PATH_HELPER_MODULE.should_run_clang_tidy(path) is expected
+
+
+def test_missing_compile_driver_falls_back_to_the_cxx_on_path(monkeypatch, tmp_path: Path) -> None:
+    module = _load_clang_tidy_module(monkeypatch)
+    missing = tmp_path / "c++"
+    monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/c++" if name == "c++" else None)
+
+    rewritten = module._rewrite_argv([str(missing), "-c", "file.cpp"])
+
+    assert rewritten[0] == "/usr/bin/c++"
+
+
+def test_newer_clang_tidy_drops_the_scoped_lock_check(monkeypatch) -> None:
+    module = _load_clang_tidy_module(monkeypatch)
+
+    def fake_run(argv, **kwargs):
+        assert argv[:3] == ["clang-tidy", "--checks=modernize-use-scoped-lock", "--list-checks"]
+        return subprocess.CompletedProcess(argv, 0, stdout="    modernize-use-scoped-lock\n", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    assert module._scoped_lock_override() == ["--checks=-modernize-use-scoped-lock"]
+
+
+def test_clang_tidy_18_keeps_its_configured_checks(monkeypatch) -> None:
+    module = _load_clang_tidy_module(monkeypatch)
+
+    def fake_run(argv, **kwargs):
+        return subprocess.CompletedProcess(argv, 0, stdout="Enabled checks:\n", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    assert module._scoped_lock_override() == []
+
+
+def test_clang_tidy_header_filter_ignores_third_party_include_trees() -> None:
+    pattern = re.compile(yaml.safe_load((REPO_ROOT / ".clang-tidy").read_text())["HeaderFilterRegex"])
+    third_party = "/home/runner/work/simpler/simpler/build/pto-isa/include/pto/comm/async/urma/urma_types.hpp"
+    project = "/home/runner/work/simpler/simpler/src/common/platform/include/common/host_api.h"
+
+    assert pattern.search(third_party) is None
+    assert pattern.search(project) is not None
+
+
+def test_libstdcxx_paths_stay_empty_when_clang_tidy_sees_atomic(monkeypatch) -> None:
+    module = _load_clang_tidy_module(monkeypatch)
+    monkeypatch.setattr(module, "_tidy_needs_libstdcxx_isystem", lambda: False)
+
+    assert module._libstdcxx_isystem_args() == []
+
+
+def test_missing_stdlib_uses_host_gxx_include_paths(monkeypatch) -> None:
+    module = _load_clang_tidy_module(monkeypatch)
+    monkeypatch.setattr(module.shutil, "which", lambda name: "/usr/bin/c++" if name in {"c++", "g++"} else None)
+
+    def fake_run(argv, **kwargs):
+        assert argv[0] == "/usr/bin/c++"
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout="",
+            stderr=(
+                "#include <...> search starts here:\n"
+                " /usr/include/c++/12\n"
+                " /usr/include/c++/12/backward\n"
+                " /usr/lib/gcc/include\n"
+                "End of search list.\n"
+            ),
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    assert module._host_libstdcxx_isystem_args() == [
+        "--extra-arg=-isystem/usr/include/c++/12",
+        "--extra-arg=-isystem/usr/include/c++/12/backward",
+    ]
 
 
 @pytest.mark.parametrize(

@@ -19,17 +19,13 @@
 #include <type_traits>
 #include <utility>
 
+#include "aicpu/region_instance_view.h"
 #include "common/region_instance_semantics.h"
+#include "common/region_task_args.h"
 
 namespace spsc_queue {
 
-inline constexpr uint32_t kSpscQueueMagic = 0x53505351u;
-inline constexpr uint16_t kSpscQueueAbiMajor = 1;
-inline constexpr uint16_t kSpscQueueAbiMinor = 0;
-inline constexpr uint64_t kSpscQueueMagicVersion = (static_cast<uint64_t>(kSpscQueueMagic) << 32) |
-                                                   (static_cast<uint64_t>(kSpscQueueAbiMajor) << 16) |
-                                                   kSpscQueueAbiMinor;
-inline constexpr size_t kSpscQueueEndpointBindingScalarCount = 10;
+inline constexpr size_t kSpscQueueConfigScalarCount = 3;
 inline constexpr uint64_t kDescriptorBytes = 32;
 inline constexpr uint64_t kArenaAlignment = 64;
 inline constexpr uint64_t kDescriptorRingAlignment = 8;
@@ -77,14 +73,7 @@ struct SpscQueueLayout {
     static bool create(uint64_t depth, uint64_t input_arena_bytes, uint64_t output_arena_bytes, SpscQueueLayout *out);
 };
 
-struct SpscQueueEndpointBinding {
-    uint64_t magic_version;
-    uint64_t session_instance_id_bits;
-    uint64_t transaction_id;
-    uint64_t payload_base;
-    uint64_t payload_bytes;
-    uint64_t counter_base;
-    uint64_t counter_bytes;
+struct SpscQueueConfig {
     uint64_t depth;
     uint64_t input_arena_bytes;
     uint64_t output_arena_bytes;
@@ -121,7 +110,6 @@ struct SpscQueueOutputReservation {
 enum class SpscQueueErrorKind : uint32_t {
     NONE = 0,
     BAD_ARGUMENT = 1,
-    BAD_BINDING = 2,
     INVALID_DESCRIPTOR = 3,
     OWNERSHIP = 4,
     REMOTE_ABORTED = 5,
@@ -140,8 +128,6 @@ enum class SpscQueueOp : uint32_t {
 struct SpscQueueError {
     SpscQueueErrorKind kind;
     SpscQueueOp op;
-    uint64_t session_instance_id_bits;
-    uint64_t transaction_id;
     char message[256];
 };
 
@@ -189,22 +175,6 @@ inline uint64_t load_u64_le(const uint8_t *src) {
     return value;
 }
 
-inline bool session_instance_id_to_bits(const uint8_t *bytes, size_t nbytes, uint64_t *out) {
-    if (bytes == nullptr || out == nullptr || nbytes != 8) {
-        return false;
-    }
-    *out = load_u64_le(bytes);
-    return true;
-}
-
-inline bool session_instance_id_from_bits(uint64_t bits, uint8_t *out, size_t nbytes) {
-    if (out == nullptr || nbytes != 8) {
-        return false;
-    }
-    store_u64_le(out, bits);
-    return true;
-}
-
 inline bool encode_descriptor(const SpscQueueDescriptor &descriptor, uint8_t *out, size_t nbytes) {
     if (out == nullptr || nbytes != kDescriptorBytes) {
         return false;
@@ -225,37 +195,6 @@ inline bool decode_descriptor(const uint8_t *src, size_t nbytes, SpscQueueDescri
         load_u64_le(src + 8),
         load_u64_le(src + 16),
         load_u64_le(src + 24),
-    };
-    *out = decoded;
-    return true;
-}
-
-inline bool encode_endpoint_binding(const SpscQueueEndpointBinding &binding, uint64_t *out, size_t count) {
-    if (out == nullptr || count != kSpscQueueEndpointBindingScalarCount ||
-        binding.magic_version != kSpscQueueMagicVersion || binding.transaction_id == 0) {
-        return false;
-    }
-    out[0] = binding.magic_version;
-    out[1] = binding.session_instance_id_bits;
-    out[2] = binding.transaction_id;
-    out[3] = binding.payload_base;
-    out[4] = binding.payload_bytes;
-    out[5] = binding.counter_base;
-    out[6] = binding.counter_bytes;
-    out[7] = binding.depth;
-    out[8] = binding.input_arena_bytes;
-    out[9] = binding.output_arena_bytes;
-    return true;
-}
-
-inline bool decode_endpoint_binding(const uint64_t *scalars, size_t count, SpscQueueEndpointBinding *out) {
-    if (scalars == nullptr || out == nullptr || count != kSpscQueueEndpointBindingScalarCount ||
-        scalars[0] != kSpscQueueMagicVersion || scalars[2] == 0) {
-        return false;
-    }
-    SpscQueueEndpointBinding decoded{
-        scalars[0], scalars[1], scalars[2], scalars[3], scalars[4],
-        scalars[5], scalars[6], scalars[7], scalars[8], scalars[9],
     };
     *out = decoded;
     return true;
@@ -869,12 +808,12 @@ public:
         uint64_t reservation_nbytes_{0};
     };
 
-    SpscQueueEndpoint(const SpscQueueEndpointBinding &binding, RegionView view, MonotonicClock clock) :
+    SpscQueueEndpoint(RegionView view, SpscQueueConfig config, MonotonicClock clock) :
         view_(std::move(view)),
         clock_(clock),
         input_queue_(this),
         output_queue_(this) {
-        construct(binding);
+        construct(config);
     }
 
     SpscQueueEndpoint(const SpscQueueEndpoint &) = delete;
@@ -883,6 +822,9 @@ public:
     SpscQueueEndpoint &operator=(SpscQueueEndpoint &&) = delete;
 
     const SpscQueueError &error() const { return error_; }
+    const RegionViewError *region_error() const { return has_region_error_ ? &region_error_ : nullptr; }
+    uint64_t region_error_counter_addr() const { return region_error_counter_addr_; }
+    int32_t region_error_counter_operand() const { return region_error_counter_operand_; }
     const SpscQueueLayout &layout() const { return layout_; }
     bool live() const { return live_; }
     InputQueue &input() { return input_queue_; }
@@ -891,42 +833,25 @@ public:
 private:
     uint64_t owner_cookie() const { return static_cast<uint64_t>(reinterpret_cast<uintptr_t>(this)); }
 
-    void construct(const SpscQueueEndpointBinding &binding) {
-        if (binding.magic_version != kSpscQueueMagicVersion || binding.transaction_id == 0) {
-            identity_trusted_ = false;
-            set_error(SpscQueueErrorKind::BAD_BINDING, SpscQueueOp::INIT, "invalid queue binding");
-            return;
-        }
-        identity_trusted_ = true;
-        error_.session_instance_id_bits = binding.session_instance_id_bits;
-        error_.transaction_id = binding.transaction_id;
-
+    void construct(SpscQueueConfig config) {
         if (clock_.now_ns == nullptr) {
             set_error(SpscQueueErrorKind::BAD_ARGUMENT, SpscQueueOp::INIT, "clock is null");
             return;
         }
         if (view_.failed()) {
+            note_view_failure(0, 0, false);
             set_error(SpscQueueErrorKind::ENDPOINT_ERROR, SpscQueueOp::INIT, view_.error().message);
             return;
         }
-
+        if (!SpscQueueLayout::create(config.depth, config.input_arena_bytes, config.output_arena_bytes, &layout_)) {
+            set_error(SpscQueueErrorKind::BAD_ARGUMENT, SpscQueueOp::INIT, "invalid queue layout");
+            return;
+        }
         RegionPartLocalSpan payload_span = view_.payload().span();
         RegionPartLocalSpan counter_span = view_.counter().span();
-        if (binding.payload_base == 0 || binding.payload_bytes == 0 || binding.counter_base == 0 ||
-            binding.counter_bytes == 0 || payload_span.base != binding.payload_base ||
-            payload_span.logical_bytes != binding.payload_bytes || counter_span.base != binding.counter_base ||
-            counter_span.logical_bytes != binding.counter_bytes) {
-            set_error(SpscQueueErrorKind::BAD_BINDING, SpscQueueOp::INIT, "view spans do not match binding");
-            return;
-        }
-        if (!SpscQueueLayout::create(binding.depth, binding.input_arena_bytes, binding.output_arena_bytes, &layout_)) {
-            set_error(SpscQueueErrorKind::BAD_BINDING, SpscQueueOp::INIT, "invalid queue layout");
-            return;
-        }
-        if (layout_.payload_bytes != binding.payload_bytes || layout_.counter_bytes != binding.counter_bytes) {
-            set_error(
-                SpscQueueErrorKind::BAD_BINDING, SpscQueueOp::INIT, "reconstructed layout does not match binding"
-            );
+        if (layout_.payload_bytes != payload_span.logical_bytes ||
+            layout_.counter_bytes != counter_span.logical_bytes) {
+            set_error(SpscQueueErrorKind::BAD_ARGUMENT, SpscQueueOp::INIT, "queue layout does not match region spans");
             return;
         }
         if (MaxInflight > layout_.depth) {
@@ -941,22 +866,30 @@ private:
 
     bool ensure_live() const { return live_ && error_.kind == SpscQueueErrorKind::NONE; }
 
+    void note_view_failure(uint64_t counter_offset, int32_t operand, bool counter_access) {
+        if (has_region_error_ || !view_.failed()) {
+            return;
+        }
+        has_region_error_ = true;
+        region_error_ = view_.error();
+        region_error_counter_operand_ = operand;
+        region_error_counter_addr_ = 0;
+        if (!counter_access) {
+            return;
+        }
+        RegionPartLocalSpan span = view_.counter().span();
+        if (counter_offset <= span.logical_bytes && span.logical_bytes - counter_offset >= 4 &&
+            (counter_offset % 4) == 0) {
+            region_error_counter_addr_ = span.base + counter_offset;
+        }
+    }
+
     void format_error_message(const char *detail) {
         const char *text = detail == nullptr ? "" : detail;
-        if (identity_trusted_) {
-            snprintf(
-                error_.message, sizeof(error_.message),
-                "SPSC queue endpoint error op=%s kind=%" PRIu32 " session=0x%016" PRIx64 " transaction=%" PRIu64
-                " msg=%s",
-                spsc_queue_op_name(error_.op), static_cast<uint32_t>(error_.kind), error_.session_instance_id_bits,
-                error_.transaction_id, text
-            );
-        } else {
-            snprintf(
-                error_.message, sizeof(error_.message), "SPSC queue endpoint error op=%s kind=%" PRIu32 " msg=%s",
-                spsc_queue_op_name(error_.op), static_cast<uint32_t>(error_.kind), text
-            );
-        }
+        snprintf(
+            error_.message, sizeof(error_.message), "SPSC reference example op=%s kind=%" PRIu32 " msg=%s",
+            spsc_queue_op_name(error_.op), static_cast<uint32_t>(error_.kind), text
+        );
     }
 
     void set_error(SpscQueueErrorKind kind, SpscQueueOp op, const char *message) {
@@ -984,6 +917,7 @@ private:
         SpscQueueCounterSample sample{};
         if (!view_.counter().test(layout_.initiator_abort_offset, 1, RegionWaitCmp::GE, sample)) {
             if (view_.failed()) {
+                note_view_failure(layout_.initiator_abort_offset, 1, true);
                 poison(SpscQueueErrorKind::ENDPOINT_ERROR, op, view_.error().message);
             } else {
                 poison(SpscQueueErrorKind::ENDPOINT_ERROR, op, "peer abort sample failed");
@@ -1010,8 +944,10 @@ private:
         }
         uint64_t remaining = deadline - now;
         int32_t observed = 0;
-        bool woke = view_.counter().wait(offset, counter_low32(local_value), RegionWaitCmp::NE, remaining, observed);
+        int32_t operand = counter_low32(local_value);
+        bool woke = view_.counter().wait(offset, operand, RegionWaitCmp::NE, remaining, observed);
         if (view_.failed()) {
+            note_view_failure(offset, operand, true);
             poison(SpscQueueErrorKind::ENDPOINT_ERROR, op, view_.error().message);
             return false;
         }
@@ -1026,8 +962,10 @@ private:
 
     bool refresh_counter(uint64_t offset, uint64_t &local, SpscQueueOp op) {
         SpscQueueCounterSample sample{};
-        if (!view_.counter().test(offset, counter_low32(local), RegionWaitCmp::NE, sample)) {
+        int32_t operand = counter_low32(local);
+        if (!view_.counter().test(offset, operand, RegionWaitCmp::NE, sample)) {
             if (view_.failed()) {
+                note_view_failure(offset, operand, true);
                 poison(SpscQueueErrorKind::ENDPOINT_ERROR, op, view_.error().message);
             } else {
                 poison(SpscQueueErrorKind::ENDPOINT_ERROR, op, "counter test failed");
@@ -1045,8 +983,10 @@ private:
     }
 
     bool notify_counter(uint64_t offset, uint64_t value, SpscQueueOp op) {
-        if (!view_.counter().notify(offset, counter_low32(value), RegionNotifyOp::Set)) {
+        int32_t operand = counter_low32(value);
+        if (!view_.counter().notify(offset, operand, RegionNotifyOp::Set)) {
             if (view_.failed()) {
+                note_view_failure(offset, operand, true);
                 poison(SpscQueueErrorKind::ENDPOINT_ERROR, op, view_.error().message);
             } else {
                 poison(SpscQueueErrorKind::ENDPOINT_ERROR, op, "counter notify failed");
@@ -1060,6 +1000,7 @@ private:
         out = SpscQueuePayloadView{0, 0};
         if (!view_.payload().read(offset, nbytes, out)) {
             if (view_.failed()) {
+                note_view_failure(0, 0, false);
                 poison(SpscQueueErrorKind::ENDPOINT_ERROR, op, view_.error().message);
             } else {
                 poison(SpscQueueErrorKind::ENDPOINT_ERROR, op, "payload read failed");
@@ -1072,6 +1013,7 @@ private:
     bool payload_write(uint64_t offset, const void *src, uint64_t nbytes, SpscQueueOp op) {
         if (!view_.payload().write(offset, src, nbytes)) {
             if (view_.failed()) {
+                note_view_failure(0, 0, false);
                 poison(SpscQueueErrorKind::ENDPOINT_ERROR, op, view_.error().message);
             } else {
                 poison(SpscQueueErrorKind::ENDPOINT_ERROR, op, "payload write failed");
@@ -1145,59 +1087,41 @@ private:
     RegionView view_;
     MonotonicClock clock_{};
     SpscQueueLayout layout_{};
-    SpscQueueError error_{SpscQueueErrorKind::NONE, SpscQueueOp::INIT, 0, 0, ""};
-    bool identity_trusted_{false};
+    SpscQueueError error_{SpscQueueErrorKind::NONE, SpscQueueOp::INIT, ""};
+    RegionViewError region_error_{};
+    uint64_t region_error_counter_addr_{0};
+    int32_t region_error_counter_operand_{0};
+    bool has_region_error_{false};
     bool live_{false};
     InputQueue input_queue_;
     OutputQueue output_queue_;
 };
 
-static_assert(kSpscQueueMagic == 0x53505351u, "SPSQ magic changed");
-static_assert(kSpscQueueAbiMajor == 1, "SPSQ ABI major changed");
-static_assert(kSpscQueueAbiMinor == 0, "SPSQ ABI minor changed");
-static_assert(kSpscQueueMagicVersion == 0x5350535100010000ull, "SPSQ packed magic_version changed");
-static_assert(kSpscQueueEndpointBindingScalarCount == 10, "SPSQ binding scalar count changed");
-static_assert(kDescriptorBytes == 32, "SPSQ descriptor size changed");
-static_assert(kArenaAlignment == 64, "SPSQ arena alignment changed");
-static_assert(kCounterStride == 64, "SPSQ counter stride changed");
-static_assert(kCounterBytes == 384, "SPSQ counter bytes changed");
-static_assert(kMaxDepth == (1ull << 30), "SPSQ max depth changed");
-static_assert(kInputDescTailOffset == 0, "SPSQ input tail offset changed");
-static_assert(kInputDescHeadOffset == 64, "SPSQ input head offset changed");
-static_assert(kOutputDescTailOffset == 128, "SPSQ output tail offset changed");
-static_assert(kOutputDescHeadOffset == 192, "SPSQ output head offset changed");
-static_assert(kInitiatorAbortOffset == 256, "SPSQ initiator abort offset changed");
-static_assert(kPeerAbortOffset == 320, "SPSQ peer abort offset changed");
+static_assert(kSpscQueueConfigScalarCount == 3, "SPSC config scalar count changed");
+static_assert(kDescriptorBytes == 32, "SPSC descriptor size changed");
+static_assert(kArenaAlignment == 64, "SPSC arena alignment changed");
+static_assert(kCounterStride == 64, "SPSC counter stride changed");
+static_assert(kCounterBytes == 384, "SPSC counter bytes changed");
+static_assert(kMaxDepth == (1ull << 30), "SPSC max depth changed");
+static_assert(kInputDescTailOffset == 0, "SPSC input tail offset changed");
+static_assert(kInputDescHeadOffset == 64, "SPSC input head offset changed");
+static_assert(kOutputDescTailOffset == 128, "SPSC output tail offset changed");
+static_assert(kOutputDescHeadOffset == 192, "SPSC output head offset changed");
+static_assert(kInitiatorAbortOffset == 256, "SPSC initiator abort offset changed");
+static_assert(kPeerAbortOffset == 320, "SPSC peer abort offset changed");
 static_assert(sizeof(SpscQueueDescriptor) == 32, "SpscQueueDescriptor ABI size changed");
 static_assert(offsetof(SpscQueueDescriptor, seq) == 0, "SpscQueueDescriptor::seq offset changed");
 static_assert(offsetof(SpscQueueDescriptor, opcode) == 8, "SpscQueueDescriptor::opcode offset changed");
 static_assert(offsetof(SpscQueueDescriptor, payload_offset) == 16, "SpscQueueDescriptor::payload_offset changed");
 static_assert(offsetof(SpscQueueDescriptor, payload_nbytes) == 24, "SpscQueueDescriptor::payload_nbytes changed");
-static_assert(sizeof(SpscQueueEndpointBinding) == 80, "SpscQueueEndpointBinding ABI size changed");
-static_assert(kSpscQueueEndpointBindingScalarCount * sizeof(uint64_t) == 80, "SPSQ binding scalar bytes changed");
-static_assert(offsetof(SpscQueueEndpointBinding, magic_version) == 0, "binding magic_version offset changed");
-static_assert(offsetof(SpscQueueEndpointBinding, session_instance_id_bits) == 8, "binding session bits offset changed");
-static_assert(offsetof(SpscQueueEndpointBinding, transaction_id) == 16, "binding transaction_id offset changed");
-static_assert(offsetof(SpscQueueEndpointBinding, payload_base) == 24, "binding payload_base offset changed");
-static_assert(offsetof(SpscQueueEndpointBinding, payload_bytes) == 32, "binding payload_bytes offset changed");
-static_assert(offsetof(SpscQueueEndpointBinding, counter_base) == 40, "binding counter_base offset changed");
-static_assert(offsetof(SpscQueueEndpointBinding, counter_bytes) == 48, "binding counter_bytes offset changed");
-static_assert(offsetof(SpscQueueEndpointBinding, depth) == 56, "binding depth offset changed");
-static_assert(offsetof(SpscQueueEndpointBinding, input_arena_bytes) == 64, "binding input_arena_bytes offset changed");
-static_assert(
-    offsetof(SpscQueueEndpointBinding, output_arena_bytes) == 72, "binding output_arena_bytes offset changed"
-);
 static_assert(std::is_standard_layout_v<SpscQueueDescriptor>, "SpscQueueDescriptor must be standard layout");
 static_assert(std::is_trivially_copyable_v<SpscQueueDescriptor>, "SpscQueueDescriptor must be trivially copyable");
-static_assert(std::is_standard_layout_v<SpscQueueEndpointBinding>, "SpscQueueEndpointBinding must be standard layout");
-static_assert(
-    std::is_trivially_copyable_v<SpscQueueEndpointBinding>, "SpscQueueEndpointBinding must be trivially copyable"
-);
+static_assert(std::is_standard_layout_v<SpscQueueConfig>, "SpscQueueConfig must be standard layout");
 static_assert(std::is_standard_layout_v<SpscQueueLayout>, "SpscQueueLayout must be standard layout");
 static_assert(std::is_standard_layout_v<SpscQueuePayloadView>, "SpscQueuePayloadView must be standard layout");
 static_assert(std::is_trivially_copyable_v<SpscQueuePayloadView>, "SpscQueuePayloadView must be trivially copyable");
 static_assert(sizeof(SpscQueuePayloadView) == 16, "SpscQueuePayloadView size changed");
 static_assert(std::is_standard_layout_v<SpscQueueError>, "SpscQueueError must be standard layout");
-static_assert(offsetof(SpscQueueError, session_instance_id_bits) == 8, "SpscQueueError session offset changed");
+static_assert(offsetof(SpscQueueError, message) == 8, "SpscQueueError message offset changed");
 
 }  // namespace spsc_queue

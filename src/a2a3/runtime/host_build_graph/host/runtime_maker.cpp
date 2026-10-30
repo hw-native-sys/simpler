@@ -878,6 +878,13 @@ int32_t run_host_orchestration(
     RAIIScopeGuard retained_storage_return([&storage, &orchestrator]() {
         storage.swap_storage(orchestrator);
     });
+    struct EndpointFailurePublish {
+        const HostApi *api;
+        OrchestratorState *orch;
+        ~EndpointFailurePublish() {
+            if (api != nullptr && orch != nullptr) api->record_endpoint_failure(orch->endpoint_failure);
+        }
+    } endpoint_failure_publish{api, &orchestrator};
     // The graph heap is allocated out of the HEAP_VIRTUAL_BASE window: its device
     // region is committed below, once this pass has revealed how many bytes it
     // actually needs, and compact_live_image moves every address the orchestrator

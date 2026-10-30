@@ -98,4 +98,10 @@ struct OrchOps {
     // caller record the body inline instead.
     bool (*graph_record_start)(OrchContext *ctx, const GraphTaskArgs &args, void *job);
     void (*graph_record_wait)(OrchContext *ctx);
+
+    // Publishes an EndpointFailureIdentity only when this call latches the run's first fatal.
+    void (*report_endpoint_failure)(
+        OrchContext *ctx, uint32_t kind, uint64_t session_bits, uint64_t transaction_id, const char *func,
+        const char *message
+    );
 };

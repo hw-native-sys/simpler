@@ -237,6 +237,7 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
     for (uint32_t slot = 0; slot < depth; ++slot) {
         worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), worker.runtime_module_);
     }
+    worker.endpoint_failures_.assign(worker.runtime_bufs_.size(), {});
     worker.prepare_run_fn_ = prepare_run;
     worker.launch_run_fn_ = launch_run;
     worker.poll_run_fn_ = poll_run;

@@ -33,6 +33,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "common/endpoint_failure_identity.h"
 #include "host_build_graph/host/task_allocator.h"
 #include "host_build_graph/host/ready_queue_sizing.h"
 #include "graph_cache.h"
@@ -103,6 +104,8 @@ struct OrchestratorState final {
     // at every entry. The CAS in orch_mark_fatal is what makes first-writer-wins
     // hold across those threads rather than only within one.
     std::atomic<int32_t> fatal_code{SIMPLER_ERROR_NONE};
+    // Allocation identity of the fatal that latched fatal_code, or zero.
+    EndpointFailureIdentity endpoint_failure{};
 
     // Hidden alloc tasks complete synchronously inside the orchestrator and
     // therefore bypass the executor's normal worker-completion counter path.
@@ -157,6 +160,9 @@ struct OrchestratorState final {
     bool init(void *sm_base, void *gm_heap, uint64_t heap_size, uint64_t max_tasks);
 
     void report_fatal(int32_t error_code, const char *func, const char *fmt, ...);
+    void report_endpoint_failure(
+        uint32_t kind, uint64_t session_bits, uint64_t transaction_id, const char *func, const char *message
+    );
 
     /**
      * The same report, and whether this call is the one that latched the field.

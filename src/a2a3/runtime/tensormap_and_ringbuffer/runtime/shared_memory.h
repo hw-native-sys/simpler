@@ -40,6 +40,7 @@
 
 #include <stddef.h>
 
+#include "common/endpoint_failure_identity.h"
 #include "utils/device_arena.h"
 #include "runtime_types.h"
 
@@ -161,6 +162,9 @@ struct alignas(CHIP_ALIGN_SIZE) SharedMemoryHeader {
     std::atomic<int32_t> sched_stall_orch_done;    // orchestrator_done flag at timeout (0/1)
     std::atomic<TaskId> sched_stall_task_id;       // S1: stuck task_id (invalid() if N/A)
     std::atomic<int32_t> sched_stall_core;         // S1: stuck core id (-1 if N/A)
+
+    // Allocation identity of the fatal that latched orch_error_code, or zero.
+    EndpointFailureIdentity endpoint_failure;
 };
 
 static_assert(sizeof(SharedMemoryHeader) == 896, "SharedMemoryHeader layout drift");
@@ -187,6 +191,10 @@ static_assert(
 constexpr size_t SHARED_MEMORY_ERROR_TAIL_OFFSET = offsetof(SharedMemoryHeader, orch_error_code);
 constexpr size_t SHARED_MEMORY_ERROR_TAIL_BYTES = sizeof(SharedMemoryHeader) - SHARED_MEMORY_ERROR_TAIL_OFFSET;
 static_assert(SHARED_MEMORY_ERROR_TAIL_BYTES == 112, "SharedMemoryHeader error tail is no longer the header's end");
+static_assert(SHARED_MEMORY_ERROR_TAIL_BYTES <= 256, "SharedMemoryHeader error tail exceeds the run-result payload");
+static_assert(
+    offsetof(SharedMemoryHeader, endpoint_failure) == 848, "SharedMemoryHeader endpoint_failure layout drift"
+);
 
 // =============================================================================
 // Shared Memory Handle

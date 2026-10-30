@@ -41,6 +41,7 @@ Checks: >
 
 WarningsAsErrors: '*'
 
-HeaderFilterRegex: '(src|include)/.*'
+# `include/` also matches third-party trees such as build/pto-isa/include.
+HeaderFilterRegex: '(^|/)src/'
 
 FormatStyle: file

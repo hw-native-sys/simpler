@@ -269,3 +269,50 @@ TEST(HostApiTest, LegacyDiagnosticQueriesKeepRunnerFallbackAndAbsentDefaults) {
     EXPECT_TRUE(legacy.pmu_enabled());
     EXPECT_EQ(legacy.chip_swimlane_level(), 3u);
 }
+
+TEST(HostApi, EndpointFailureSinkKeepsTheFirstWellFormedRecord) {
+    EndpointFailureIdentity sink{};
+    HostApiOps ops{};
+    const HostApi api(nullptr, 0, 0, 1, &ops, std::nullopt, &sink);
+
+    EndpointFailureIdentity malformed{};
+    malformed.kind = kEndpointFailureKindRegion;
+    malformed.reserved = 1;
+    malformed.transaction_id = 4;
+    api.record_endpoint_failure(malformed);
+    EXPECT_EQ(sink.kind, 0u);
+
+    EndpointFailureIdentity empty{};
+    api.record_endpoint_failure(empty);
+    EXPECT_EQ(sink.kind, 0u);
+
+    EndpointFailureIdentity region{};
+    region.kind = kEndpointFailureKindRegion;
+    region.session_instance_id_bits = 0xabc;
+    region.transaction_id = 9;
+    api.record_endpoint_failure(region);
+
+    EndpointFailureIdentity later{};
+    later.kind = kEndpointFailureKindRegion;
+    later.transaction_id = 3;
+    api.record_endpoint_failure(later);
+    EndpointFailureIdentity retired{};
+    retired.kind = 2;
+    retired.transaction_id = 4;
+    api.record_endpoint_failure(retired);
+    EXPECT_EQ(sink.kind, kEndpointFailureKindRegion);
+    EXPECT_EQ(sink.session_instance_id_bits, 0xabcu);
+    EXPECT_EQ(sink.transaction_id, 9u);
+
+    EndpointFailureIdentity untrusted_sink{};
+    const HostApi untrusted_api(nullptr, 0, 0, 1, &ops, std::nullopt, &untrusted_sink);
+    EndpointFailureIdentity untrusted{};
+    untrusted.kind = kEndpointFailureKindRegion;
+    untrusted_api.record_endpoint_failure(untrusted);
+    EXPECT_EQ(untrusted_sink.kind, kEndpointFailureKindRegion);
+    EXPECT_EQ(untrusted_sink.session_instance_id_bits, 0u);
+    EXPECT_EQ(untrusted_sink.transaction_id, 0u);
+
+    const HostApi absent(nullptr, 0, 0, 1, &ops, std::nullopt, nullptr);
+    absent.record_endpoint_failure(region);
+}

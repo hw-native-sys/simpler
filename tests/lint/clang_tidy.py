@@ -16,6 +16,7 @@ If no sim build cache exists, the sim runtimes are built first:
     python simpler_setup/build_runtimes.py
 """
 
+import functools
 import json
 import os
 import platform
@@ -24,6 +25,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from clang_tidy_paths import should_run_clang_tidy
@@ -66,11 +68,107 @@ def _macos_isysroot_args() -> list[str]:
     ]
 
 
+@functools.lru_cache(maxsize=1)
+def _scoped_lock_override() -> list[str]:
+    """Drop modernize-use-scoped-lock on clang-tidy builds that have it.
+
+    CI lints with clang-tidy 18, which does not ship this check. A newer local
+    binary flags every ``std::lock_guard`` in headers included by the file
+    under analysis, so the hook fails on code the CI clang-tidy accepts.
+    """
+    try:
+        listed = subprocess.run(
+            ["clang-tidy", "--checks=modernize-use-scoped-lock", "--list-checks"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return []
+    if "modernize-use-scoped-lock" not in listed.stdout:
+        return []
+    return ["--checks=-modernize-use-scoped-lock"]
+
+
+@functools.lru_cache(maxsize=1)
+def _tidy_needs_libstdcxx_isystem() -> bool:
+    """Return whether this clang-tidy binary cannot parse libstdc++ on its own.
+
+    Distro clang-tidy already asks the host ``c++`` driver for its include
+    tree. Adding those directories again with ``-isystem`` makes that binary
+    diagnose third-party headers. An upstream LLVM clang-tidy does not inherit
+    the distro tree from ``/usr/bin/c++``, so ``#include <atomic>`` fails until
+    the directories are passed explicitly.
+    """
+    compiler = shutil.which("c++") or shutil.which("g++")
+    if compiler is None or shutil.which("clang-tidy") is None:
+        return False
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "probe.cpp"
+            source.write_text("#include <atomic>\nint probe() { return 0; }\n")
+            command = f"{compiler} -std=c++17 -c {source}"
+            (Path(tmp) / "compile_commands.json").write_text(
+                json.dumps([{"directory": tmp, "file": str(source), "command": command}])
+            )
+            probed = subprocess.run(
+                ["clang-tidy", f"-p={tmp}", "--quiet", str(source)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+    except OSError:
+        return False
+    return "'atomic' file not found" in probed.stdout or "'atomic' file not found" in probed.stderr
+
+
+def _host_libstdcxx_isystem_args() -> list[str]:
+    """Return ``-isystem`` args for the libstdc++ directories host g++ searches."""
+    compiler = shutil.which("c++") or shutil.which("g++")
+    if compiler is None:
+        return []
+    try:
+        probed = subprocess.run(
+            [compiler, "-E", "-x", "c++", "-", "-v"],
+            input="",
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        return []
+    collecting = False
+    args: list[str] = []
+    for line in probed.stderr.splitlines():
+        if line.startswith("#include <...> search starts here:"):
+            collecting = True
+            continue
+        if line.startswith("End of search list"):
+            break
+        if not collecting:
+            continue
+        include = line.strip()
+        if "/include/c++/" in include:
+            args.append(f"--extra-arg=-isystem{include}")
+    return args
+
+
+def _libstdcxx_isystem_args() -> list[str]:
+    """Give clang-tidy the host libstdc++ tree only when it cannot see one."""
+    if platform.system() == "Darwin" or not _tidy_needs_libstdcxx_isystem():
+        return []
+    return _host_libstdcxx_isystem_args()
+
+
 # Suppress compiler flags that are valid for GCC but unknown to clang.
-_SUPPRESS_ARGS = [
-    "--extra-arg=-Wno-unknown-warning-option",
-    "--extra-arg=-Wno-unused-command-line-argument",
-] + _macos_isysroot_args()
+_SUPPRESS_ARGS = (
+    [
+        "--extra-arg=-Wno-unknown-warning-option",
+        "--extra-arg=-Wno-unused-command-line-argument",
+    ]
+    + _macos_isysroot_args()
+    + _libstdcxx_isystem_args()
+)
 
 # GCC-only flags to strip from compile_commands.json before passing to clang-tidy.
 _GCC_ONLY_FLAGS = {"-fno-gnu-unique"}
@@ -111,11 +209,27 @@ def _strip_target_triple(compiler: str) -> str:
     return str(path.with_name(match["driver"] + (match["suffix"] or "")))
 
 
+def _compiler_for_tidy(compiler: str) -> str:
+    """Return a host C++ driver clang-tidy can query for the standard library.
+
+    A recorded driver may be a symlink whose real name carries a target triple,
+    or a path from another environment that is not installed here. Either one
+    leaves clang-tidy with no C++ standard library include directories.
+    """
+    path = Path(compiler)
+    if path.is_symlink():
+        compiler = str(path.resolve())
+    stripped = _strip_target_triple(compiler)
+    if Path(stripped).is_file():
+        return stripped
+    return shutil.which("c++") or shutil.which("g++") or stripped
+
+
 def _rewrite_argv(argv: list[str]) -> list[str]:
     """Drop GCC-only flags and any target-triple prefix from a compile command."""
     if not argv:
         return argv
-    return [_strip_target_triple(argv[0])] + [arg for arg in argv[1:] if arg not in _GCC_ONLY_FLAGS]
+    return [_compiler_for_tidy(argv[0])] + [arg for arg in argv[1:] if arg not in _GCC_ONLY_FLAGS]
 
 
 def _rewrite_entry(entry: dict) -> bool:
@@ -322,7 +436,7 @@ def main() -> int:
 
         for db_dir in db_dirs:
             result = subprocess.run(
-                ["clang-tidy", f"-p={db_dir}", "--quiet"] + _SUPPRESS_ARGS + [f],
+                ["clang-tidy", f"-p={db_dir}", "--quiet"] + _scoped_lock_override() + _SUPPRESS_ARGS + [f],
                 check=False,
                 capture_output=True,
                 text=True,

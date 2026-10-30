@@ -35,7 +35,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 #: uses is the grant it is given, which every per-run resource is built to.
 _UNLIMITED_DEPTH = 0xFFFFFFFF
 _MAX_RESOURCES = 8
-_CONTRACT_ABI_VERSION = 1
+#: Mirrors `PTO_PIPELINE_CONTRACT_ABI_VERSION` in runtime_c_api.h.
+_CONTRACT_ABI_VERSION = 2
 
 # RUNTIME_ENV_FIELD_GROUPS(3) * RUNTIME_ENV_RING_COUNT(4).
 _RUNTIME_ENV_UINT64_FIELDS = 12

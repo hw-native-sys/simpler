@@ -723,27 +723,15 @@ class Orchestrator:
                 with self._worker._registry_lock:
                     self._worker._buffers.pop(int(host.identity.buffer_id), None)
 
-    def create_worker_chip_region(self, *, worker_id: int, payload_bytes: int, counter_bytes: int):
-        """Create an L3-L2 communication region on one NEXT_LEVEL chip worker."""
+    def create_region(self, *, members, topology, payload_bytes, counter_bytes):
+        """Create a single-owner region for this orchestration callback's run."""
         if self._worker is None:
-            raise RuntimeError("create_worker_chip_region requires an Orchestrator bound to a Worker")
-        with self._control_admission("create_worker_chip_region"):
-            return self._worker._create_worker_chip_region(int(worker_id), int(payload_bytes), int(counter_bytes))
-
-    def create_worker_chip_queue(
-        self, *, worker_id: object, depth: object, input_arena_bytes: object, output_arena_bytes: object
-    ):
-        """Create an L3-L2 message queue on one NEXT_LEVEL chip worker."""
-        if self._worker is None:
-            raise RuntimeError("create_worker_chip_queue requires an Orchestrator bound to a Worker")
-        from .worker_chip_message_queue import create_worker_chip_queue  # noqa: PLC0415
-
-        return create_worker_chip_queue(
-            self,
-            worker_id=worker_id,
-            depth=depth,
-            input_arena_bytes=input_arena_bytes,
-            output_arena_bytes=output_arena_bytes,
+            raise RuntimeError("create_region requires an Orchestrator bound to a Worker")
+        return self._worker._create_region(
+            members=members,
+            topology=topology,
+            payload_bytes=payload_bytes,
+            counter_bytes=counter_bytes,
         )
 
     # ------------------------------------------------------------------
@@ -900,7 +888,7 @@ class Orchestrator:
             access=AccessMode.READWRITE,
             backend_kind=BackendKind.FORK_SHM,
         )
-        self._worker._register_worker_chip_orch_comm_host_buffer(handle)
+        self._worker._register_region_host_buffer(handle)
         return handle
 
     # ------------------------------------------------------------------
