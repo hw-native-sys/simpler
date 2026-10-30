@@ -49,4 +49,6 @@ int aclrtMemset(void *, size_t, int32_t, size_t);
 int aclrtSetOpExecuteTimeOutV2(uint64_t, uint64_t *);
 int aclrtStreamGetId(aclrtStream, int32_t *);
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *, aclmdlRI *);
+using aclrtCallback = void (*)(void *);
+int aclmdlRIDestroyRegisterCallback(aclmdlRI, aclrtCallback, void *);
 }

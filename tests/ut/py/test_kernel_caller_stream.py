@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 from test_kernel_mode_c_api import (
+    PTO_RUNTIME_ERR_UNSUPPORTED,
     CallConfig,
     NativeRunDescriptor,
     _binaries,
@@ -70,6 +71,42 @@ def _close_case(lib, ctx, *, run, pending, streams, device_buffers, host_buffers
     contexts.close()
 
 
+def _check_capture_prepare_refusal(lib, ctx, run, args, config, descriptor, stream, device, host, nbytes):
+    committed = lib.committed_device_memory_ctx(ctx)
+    assert lib.aclmdlRICaptureBegin(stream, 0) == 0
+    model = ctypes.c_void_p()
+    try:
+        rc = lib.simpler_prepare_run(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor))
+        assert rc == PTO_RUNTIME_ERR_UNSUPPORTED, rc
+        assert lib.committed_device_memory_ctx(ctx) == committed
+        # A refusal must leave the caller's capture usable.
+        assert lib.aclrtMemcpyAsync(device, nbytes, host, nbytes, 1, stream) == 0
+    finally:
+        assert lib.aclmdlRICaptureEnd(stream, ctypes.byref(model)) == 0
+        assert lib.aclmdlRIDestroy(model) == 0
+
+
+def _check_capture_launch_refusal(lib, ctx, run, stream, device, host, nbytes):
+    assert lib.aclmdlRICaptureBegin(stream, 0) == 0
+    model = ctypes.c_void_p()
+    try:
+        assert lib.simpler_launch_run(ctx, run) == PTO_RUNTIME_ERR_UNSUPPORTED
+        assert lib.aclrtMemcpyAsync(device, nbytes, host, nbytes, 1, stream) == 0
+    finally:
+        assert lib.aclmdlRICaptureEnd(stream, ctypes.byref(model)) == 0
+        assert lib.aclmdlRIDestroy(model) == 0
+
+
+def _check_launch_binding(lib, ctx, run, streams, epoch, descriptor):
+    stream = streams[epoch % 2]
+    if descriptor.caller_stream:
+        assert lib.simpler_launch_run_on_stream(ctx, run, streams[(epoch + 1) % 2], None) == -1003
+    if epoch == 3:
+        assert lib.simpler_launch_run(ctx, run) == 0
+    else:
+        assert lib.simpler_launch_run_on_stream(ctx, run, stream, None) == 0
+
+
 def _run(arch, runtime, device, faults_path=None):
     from simpler.task_interface import AddressSpace, ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
 
@@ -98,6 +135,9 @@ def _run(arch, runtime, device, faults_path=None):
         ctypes.c_int,
         ctypes.c_void_p,
     ]
+    lib.aclmdlRICaptureBegin.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.aclmdlRICaptureEnd.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    lib.aclmdlRIDestroy.argtypes = [ctypes.c_void_p]
     lib.simpler_launch_run_on_stream.argtypes = [ctypes.c_void_p] * 4
     lib.simpler_wait_run.argtypes = lib.simpler_poll_run.argtypes = [ctypes.c_void_p] * 2
     streams = [ctypes.c_void_p(), ctypes.c_void_p()]
@@ -133,7 +173,9 @@ def _run(arch, runtime, device, faults_path=None):
             )
             == 0
         )
-        assert lib.simpler_kernel_mode_prepare_callable(ctx, 0, image, len(image)) == 0
+        callable_id = ctypes.c_int32(-1)
+        assert lib.simpler_register_callable_v2(ctx, image, len(image), ctypes.byref(callable_id)) == 0
+        assert callable_id.value == 0
         storage, run = _native_run_storage(lib)
         args = ChipStorageTaskArgs()
         for ptr in device_buffers:
@@ -144,7 +186,13 @@ def _run(arch, runtime, device, faults_path=None):
             views.append((ctypes.c_float * size).from_address(ptr.value))
         for epoch in range(1, 5):
             stream = streams[epoch % 2]
-            descriptor = NativeRunDescriptor(generation=1, run_epoch=epoch)
+            descriptor = NativeRunDescriptor(
+                generation=1, run_epoch=epoch, caller_stream=stream.value if epoch % 2 else None
+            )
+            if epoch == 1 and faults is None:
+                _check_capture_prepare_refusal(
+                    lib, ctx, run, args, config, descriptor, stream, device_buffers[0], host_buffers[0], nbytes
+                )
             assert (
                 lib.simpler_prepare_run(ctx, run, 0, args.__ptr__(), ctypes.byref(config), ctypes.byref(descriptor))
                 == 0
@@ -172,6 +220,8 @@ def _run(arch, runtime, device, faults_path=None):
                     assert lib.finalize_device(ctx) != 0
                     assert faults.descriptor_source_frees() == 0
                 return
+            if epoch == 3:
+                _check_capture_launch_refusal(lib, ctx, run, stream, device_buffers[0], host_buffers[0], nbytes)
             # No synchronization separates caller writes from launch. These
             # buffers stay alive through the caller's final read below.
             for index in range(2):
@@ -179,7 +229,7 @@ def _run(arch, runtime, device, faults_path=None):
                 assert lib.aclrtMemcpyAsync(device_buffers[index], nbytes, host_buffers[index], nbytes, 1, stream) == 0
             with contexts.other():
                 assert lib.simpler_launch_run_on_stream(ctx, run, stream, None) == -1003
-            assert lib.simpler_launch_run_on_stream(ctx, run, stream, None) == 0
+            _check_launch_binding(lib, ctx, run, streams, epoch, descriptor)
             assert lib.aclrtMemcpyAsync(host_buffers[2], nbytes, device_buffers[2], nbytes, 2, stream) == 0
             # This is the user's stream, not either runtime stream. Numeric
             # output must be ready before simpler_wait_run/finalize is called.

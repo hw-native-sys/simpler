@@ -21,9 +21,8 @@
 
 /**
  * Structural argument validation shared by every host-runtime component's
- * kernel-mode entries. Both platform c_api implementations (onboard and sim)
- * route through these checks, so a stub and a real implementation accept and
- * reject exactly the same arguments. Each function returns 0 or
+ * borrowed initialization and common registration. Both onboard and simulator
+ * entry points use the same structural checks before lifecycle admission. Each function returns 0 or
  * PTO_RUNTIME_ERR_INVALID_ARGUMENT and mutates nothing; logging stays with
  * the callers.
  */
@@ -49,9 +48,8 @@ inline int validate_kernel_init_args(
     return 0;
 }
 
-inline int validate_kernel_prepare_callable_args(
-    const void *ctx, int32_t callable_id, const void *callable, size_t callable_size
-) {
+inline int
+validate_callable_registration_args(const void *ctx, int32_t callable_id, const void *callable, size_t callable_size) {
     if (ctx == nullptr || callable == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     if (callable_size < sizeof(ChipCallable)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
@@ -118,12 +116,5 @@ inline int validate_kernel_run_args(const void *args) {
             return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
         }
     }
-    return 0;
-}
-
-inline int
-validate_kernel_launch_args(const void *ctx, int32_t callable_id, const void *args, const void *caller_stream) {
-    if (ctx == nullptr || args == nullptr || caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
-    if (callable_id < 0 || callable_id >= MAX_REGISTERED_CALLABLE_IDS) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     return 0;
 }

@@ -50,3 +50,11 @@ void dep_gen_host_graph_add_tensormap_edge(
 uint64_t host_phase_now_ns() { return 0; }
 
 void host_phase_record(uint64_t, uint64_t, uint32_t, uint64_t, uint32_t) {}
+
+bool host_phase_breakdown_enabled() { return false; }
+
+void host_phase_record_bind(uint32_t, uint64_t, const char *, uint64_t, uint64_t) {}
+
+void host_phase_trace_note_submitted(uint64_t) {}
+
+void dep_gen_host_graph_begin_capture() {}

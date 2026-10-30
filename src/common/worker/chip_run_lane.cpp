@@ -76,6 +76,7 @@ struct ChipRunState {
      * the same run does not move it. On expiry only this un-launched run
      * fails; every run ahead keeps its own outcome.
      */
+    bool recorded{false};
     bool credit_blocked{false};
     const char *credit_blocked_owner{nullptr};
     uint64_t credit_blocked_generation{0};
@@ -289,7 +290,7 @@ struct ChipRunLaneState {
     void prepare(const std::shared_ptr<ChipRunState> &run) {
         run->native_run = worker->prepare_native_run_for_lane(
             run->callable_id, &run->args, run->config, run->lease, run->run_id, run->dispatch_id, run->accepted_state,
-            run->accepted_value, run->pipeline_leased, run->provenance
+            run->accepted_value, run->pipeline_leased, run->provenance, run->caller_stream
         );
         run->phase = ChipRunState::Phase::PREPARED;
         run->disposition = ChipRunPreparationDisposition::NATIVE_PREPARED;
@@ -502,9 +503,18 @@ struct ChipRunLaneState {
         // be missed by a waiter that parks on it.
         const uint64_t generation_before = credit_generation();
         try {
-            if (worker->launch_native_run(run->native_run, run->caller_stream) ==
-                ChipWorker::NativeLaunch::DiagnosticCreditFull) {
+            const auto launch = worker->launch_native_run(run->native_run, run->caller_stream);
+            if (launch == ChipWorker::NativeLaunch::DiagnosticCreditFull) {
                 note_credit_blocked(run, generation_before, /*at_front=*/true);
+                return;
+            }
+            if (launch == ChipWorker::NativeLaunch::Recorded) {
+                // The receipt promises graph ownership, including known caller
+                // allocations. Finish only the host carrier; no execution fence
+                // was crossed and no completion wait is owed.
+                run->recorded = true;
+                run->credit_blocked = false;
+                finish(run);
                 return;
             }
             run->credit_blocked = false;
@@ -1152,6 +1162,13 @@ void ChipRun::abandon() {
     if (run_->error != nullptr) std::rethrow_exception(run_->error);
 }
 
+bool ChipRun::recorded() const {
+    if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
+    lane_->validate_process();
+    std::lock_guard<std::mutex> lk(lane_->mu);
+    return run_->recorded;
+}
+
 bool ChipRun::launched() const {
     if (lane_ == nullptr || run_ == nullptr) throw std::runtime_error("empty ChipRun handle");
     lane_->validate_process();
@@ -1358,7 +1375,8 @@ ChipRun ChipRunLane::submit(
             state_->launch_ready_prefix();
         }
         state_->rethrow_run_error(run);
-        if (!run->crossed_launch_fence) throw std::runtime_error("caller-stream run did not reach launch");
+        if (!run->crossed_launch_fence && !run->recorded)
+            throw std::runtime_error("caller-stream run did not reach launch or recording");
     }
     return ChipRun(state_, std::move(run));
 }

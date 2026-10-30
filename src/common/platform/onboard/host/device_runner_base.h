@@ -42,6 +42,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -68,6 +69,7 @@
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/arena_replacement_transaction.h"
+#include "host/captured_graph_resources.h"
 #include "host/teardown_proof.h"
 #include "host/workspace_staging.h"
 #include "host/chip_swimlane_collector.h"
@@ -375,13 +377,40 @@ public:
     // device and RTS context without changing them. Also used for abandoning
     // an unlaunched run.
     int enter_run_thread();
+    // Graph replay and native launches share device executor state. While a
+    // recorded graph is retained, their caller stream supplies serialization.
+    bool native_recording_caller_matches(void *caller) const {
+        void *recorded = native_recording_caller_.load(std::memory_order_acquire);
+        return recorded == nullptr || recorded == caller;
+    }
     int validate_caller_stream(rtStream_t caller);
+    virtual bool supports_native_capture() const { return false; }
+    virtual int reserve_native_capture_streams() { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+    int reserve_native_capture_resources(uint32_t slot, uint32_t bank, void *caller);
+    int begin_native_capture_prepare(uint32_t slot, bool capture) {
+        auto &args = slot_persistent_args_[slot];
+        args.capture_preparing = capture;
+        if (!capture) {
+            args.capture_resources_reserved = false;
+            return 0;
+        }
+        if (!supports_native_capture() || !args.capture_resources_reserved || !run_fences_[slot]->events_ready() ||
+            !caller_orders_[slot]->events_ready() || args.runtime_args == nullptr ||
+            (args.retained_runtime_args && args.retained_runtime_args.use_count() > 1))
+            return PTO_RUNTIME_ERR_UNSUPPORTED;
+        return 0;
+    }
     // A borrowed environment must be current before resource mutation. An
     // owned environment has no caller binding to validate; enter_run_thread
     // performs its thread attachment before device work.
     int validate_current_context() const;
-    int init_kernel_context(int device_id);
-    int prepare_kernel_callable(int32_t callable_id);
+    int init_kernel_context(int device_id, uint64_t context_generation);
+    virtual int configure_kernel_affinity(Runtime &) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
+    int configure_hbg_kernel_events();
+    int bind_registered_callable_tables(Runtime &, int32_t);
+    // Stage persistent kernel arguments and open launch admission after the
+    // runtime has registered this callable on the device.
+    int prepare_kernel_callable_after_registration(int32_t callable_id);
 
     /** Allocate / free / copy on the per-Worker `MemoryAllocator` + CANN runtime. */
     void *allocate_tensor(std::size_t bytes);
@@ -658,6 +687,16 @@ public:
 
     /** Whether this context's workspace regions have an owner. */
     bool workspace_enabled() const { return workspace_.enabled(); }
+    bool workspace_capture_references_live() const { return workspace_.has_capture_references(); }
+    bool captured_resources_live() const { return !captured_graph_resources_.empty(); }
+    bool captured_callable_live(int32_t callable_id) const {
+        return captured_graph_resources_.holds_callable(callable_id);
+    }
+    int prepare_native_resource_reuse(uint32_t pipeline_slot);
+    int retain_native_run_resources(
+        void *model, void *caller, uint32_t pipeline_slot, uint32_t arena_bank, int32_t callable_id = -1
+    );
+    int retire_native_graph_resources();
 
     /**
      * Let this context size its own concurrency from the resources it proves.
@@ -1016,9 +1055,8 @@ public:
 
     /**
      * Take ownership of the AICPU + AICore executor binaries. Called
-     * once by simpler_init at ChipWorker::init time; subsequent
-     * enqueue invocations read from `aicpu_so_binary_` /
-     * `aicore_kernel_binary_`.
+     * once during context initialization. AICPU bytes live through bootstrap
+     * and are then released; AICore bytes remain available for registration.
      */
     void set_executors(std::vector<uint8_t> aicpu_so_binary, std::vector<uint8_t> aicore_kernel_binary) {
         aicpu_so_binary_ = std::move(aicpu_so_binary);
@@ -1358,13 +1396,53 @@ public:
      */
     bool has_callable(int32_t callable_id) const;
 
-    /**
-     * Serializes the registration, unregistration and finalize entry points,
-     * so an auto-ID scan and the ID it claims are one atomic step with respect
-     * to explicit-ID registration and unregistration. Runs, initialization and
-     * destroy are still caller-serialized.
-     */
-    std::mutex &callable_registration_mutex() { return callable_registration_mu_; }
+    // The short admission lock never spans user code. A reservation keeps the
+    // registry exclusive. During graph retirement, callbacks on any thread must
+    // refuse instead of waiting for the execution waiting for those callbacks.
+    class CallableRegistrationReservation {
+    public:
+        CallableRegistrationReservation(DeviceRunnerBase &runner, bool reject_waiters, bool enabled = true) {
+            if (!enabled) {
+                accepted_ = true;
+                return;
+            }
+            std::unique_lock<std::mutex> lock(runner.callable_registration_mu_);
+            if (reject_waiters) {
+                if (runner.callable_registration_busy_) return;
+            } else {
+                runner.callable_registration_cv_.wait(lock, [&runner] {
+                    return !runner.callable_registration_busy_ || runner.registry_callbacks_refuse_;
+                });
+                if (runner.registry_callbacks_refuse_) return;
+            }
+            runner.callable_registration_busy_ = true;
+            runner.registry_callbacks_refuse_ = reject_waiters;
+            runner_ = &runner;
+            accepted_ = true;
+            // Wake ordinary waiters so they can refuse a non-waiting reservation.
+            runner.callable_registration_cv_.notify_all();
+        }
+        ~CallableRegistrationReservation() { release(); }
+        void release() {
+            if (runner_ == nullptr) return;
+            std::lock_guard<std::mutex> lock(runner_->callable_registration_mu_);
+            runner_->registry_callbacks_refuse_ = false;
+            runner_->callable_registration_busy_ = false;
+            runner_->callable_registration_cv_.notify_all();
+            runner_ = nullptr;
+        }
+        CallableRegistrationReservation(const CallableRegistrationReservation &) = delete;
+        CallableRegistrationReservation &operator=(const CallableRegistrationReservation &) = delete;
+        bool accepted() const { return accepted_; }
+
+    private:
+        DeviceRunnerBase *runner_ = nullptr;
+        bool accepted_ = false;
+    };
+
+    CallableRegistrationReservation reserve_callable_registry(bool reject_waiters = false, bool enabled = true) {
+        return CallableRegistrationReservation(*this, reject_waiters, enabled);
+    }
 
     /**
      * Content-derived stable identity for a registered callable: the
@@ -1494,10 +1572,10 @@ public:
      *
      * Composes the arch's own quarantine with the device-fault channel's
      * generation-scoped suspicion; `device_admits_new_run` states what each
-     * refusal means and how each clears. Admission sites ask this. The two
-     * diagnostic readers of `can_accept_run()` — the clock-correlation session's
-     * abandon flag — deliberately keep asking the arch flag alone, because a
-     * matched notice says nothing about whether this run's own DFX resources are
+     * refusal means and how each clears. Admission sites ask this. The
+     * teardown and clock-correlation readers of `can_accept_run()` deliberately
+     * keep asking the arch flag alone, because a matched notice says nothing
+     * about whether this run's own DFX resources are
      * safe to release normally.
      */
     bool accepts_new_run() const { return device_admits_new_run(!can_accept_run(), device_health_); }
@@ -1521,6 +1599,7 @@ public:
 
     /** Invalidate retained run streams after new AICore code is published. */
     virtual void mark_run_streams_stale() {}
+    virtual std::shared_ptr<void> pin_capture_stream_generation() const { return {}; }
 
     /**
      * Whether this runner can order one run's submission behind another's right
@@ -1572,6 +1651,9 @@ public:
             streams(std::exchange(other.streams, RunStreams{})),
             artifact_identity(other.artifact_identity),
             caller_stream(std::exchange(other.caller_stream, nullptr)),
+            capture_model(std::exchange(other.capture_model, nullptr)),
+            capture_resources_retained(other.capture_resources_retained),
+            arena_bank(other.arena_bank),
             resources_owned(std::exchange(other.resources_owned, false)),
             aicore_retirement_attempted(std::exchange(other.aicore_retirement_attempted, false)),
             joinable_boundary(other.joinable_boundary),
@@ -1613,6 +1695,9 @@ public:
          */
         NativeRunArtifactIdentity artifact_identity{};
         rtStream_t caller_stream{nullptr};
+        void *capture_model{nullptr};
+        bool capture_resources_retained{false};
+        uint32_t arena_bank{0};
         bool resources_owned{false};
         bool aicore_retirement_attempted{false};
         /**
@@ -1781,6 +1866,8 @@ public:
         std::unique_ptr<PreparedExecution> prepared{};
         std::unique_ptr<ActiveExecution> active{};
         LaunchReceipt receipt{};
+        RecordingReceipt recording_receipt{};
+        bool recording_attempted{false};
 
         bool poisoned() const { return progress == LaunchProgress::Partial; }
     };
@@ -1798,6 +1885,16 @@ public:
      * an explicit NotStarted result returns it for rollback.
      */
     LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) noexcept;
+    int retain_recording_resources(PreparedExecution &prepared, uint32_t bank);
+    int queue_execution_preparation(PreparedExecution &prepared, LaunchProgressSink &sink);
+    template <typename Gate>
+    int queue_recording_entry(PreparedExecution &prepared, LaunchProgressSink &sink, Gate &&gate) {
+        return caller_orders_[prepared.pipeline_slot]->fork(prepared.identity, sink, [&] {
+            const int rc = publish_for_launch(prepared.kernel_args, prepared.streams.aicpu, sink);
+            return rc == 0 ? gate() : rc;
+        });
+    }
+
     virtual void abandon_prepared_execution(PreparedExecution &prepared) noexcept = 0;
 
     /**
@@ -2059,6 +2156,7 @@ public:
     void set_output_prefix(const char *prefix) { output_prefix_ = (prefix != nullptr) ? prefix : ""; }
     const std::string &output_prefix() const { return output_prefix_; }
 
+private:
 protected:
     virtual LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) = 0;
 
@@ -2867,6 +2965,9 @@ protected:
     // an explicit-ID claim of the same slot; runs, initialization and destroy
     // are serialized by their callers instead.
     std::mutex callable_registration_mu_;
+    std::condition_variable callable_registration_cv_;
+    bool callable_registration_busy_ = false;
+    std::atomic<bool> registry_callbacks_refuse_{false};
     uint64_t next_callable_generation_{1};
     // Opaque provider handle from dma_workspace_provision(), owned for the
     // Worker's life and released by finalize_common(). Null unless the Worker
@@ -2951,6 +3052,8 @@ protected:
     bool program_initialized_{false};
     bool common_cleanup_pending_{false};
     KernelExecutionState kernel_exec_state_;
+    CapturedGraphResources captured_graph_resources_;
+    std::atomic<void *> native_recording_caller_{nullptr};
     PersistentKernelArgs persistent_args_;
     Runtime kernel_runtime_;
     int block_dim_{0};
@@ -3120,8 +3223,8 @@ protected:
     // slot's next run cannot read the previous one's completion. Held by
     // pointer because the fence is non-copyable, so the array cannot be
     // brace-initialised without naming every slot.
-    RunResourceSlots<std::unique_ptr<RunCompletionFence>> run_fences_;
-    RunResourceSlots<std::unique_ptr<RunCallerOrder>> caller_orders_;
+    RunResourceSlots<std::shared_ptr<RunCompletionFence>> run_fences_;
+    RunResourceSlots<std::shared_ptr<RunCallerOrder>> caller_orders_;
 
     /**
      * Per-set storage an arch runner owns itself, built but not yet adopted.
@@ -3148,8 +3251,8 @@ protected:
         RunResourceSlots<RetainedSmMirror>::Storage run_image_stagings;
         RunResourceSlots<std::unique_ptr<ArenaBank>>::Storage arena_banks;
         RunResourceSlots<SlotPersistentArgs>::Storage slot_persistent_args;
-        RunResourceSlots<std::unique_ptr<RunCompletionFence>>::Storage run_fences;
-        RunResourceSlots<std::unique_ptr<RunCallerOrder>>::Storage caller_orders;
+        RunResourceSlots<std::shared_ptr<RunCompletionFence>>::Storage run_fences;
+        RunResourceSlots<std::shared_ptr<RunCallerOrder>>::Storage caller_orders;
         RunResourceSlots<NativeRunIdentity>::Storage whole_operator_boundaries;
         RunResourceSlots<void *>::Storage device_wall_dev_ptrs;
         RunResourceSlots<DeviceRunTiming>::Storage device_run_timing;
@@ -3315,6 +3418,10 @@ protected:
     // slot's runs, and the host's copy of what the last such run published. Not
     // gated on diagnostics — an error result must survive with capture off.
     RunResourceSlots<void *> device_run_result_dev_ptrs_;
+    // Shared by slot generations; a successor on another slot must observe the
+    // same first failure. Its cache line is never part of an image restoration.
+    void *native_execution_first_error_{nullptr};
+    bool native_execution_first_error_initialized_{false};
     RunResourceSlots<DeviceRunResultRegion> device_run_results_;
     // Which run each cached copy was read for, and what that read left behind.
     // Together they make the read once-per-run and keep the three read states

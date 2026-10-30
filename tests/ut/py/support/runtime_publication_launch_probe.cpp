@@ -23,6 +23,12 @@
 // initialized; entering stream/event setup is observable and fails closed.
 static int device_ops = 0;
 static int copy_error = 0;
+// Device allocations are host buffers in this probe, including the capture control tail.
+extern "C" aclError aclrtMemset(void *dst, size_t capacity, int32_t value, size_t bytes) {
+    assert(dst != nullptr && bytes <= capacity);
+    std::memset(dst, value, bytes);
+    return ACL_SUCCESS;
+}
 extern "C" rtError_t rtMalloc(void **p, uint64_t n, uint32_t, uint16_t) {
     *p = std::malloc(n);
     return *p ? 0 : -1;
@@ -96,7 +102,9 @@ int main() {
         assert(!outcome.poisoned());
         outcome.prepared->kernel_args.release_run_view();
     }
-    std::printf("Runtime extent: %llu bytes per slot\n", static_cast<unsigned long long>(slot.runtime_upload_bytes));
+    std::printf(
+        "Runtime extent: %llu bytes per slot\n", static_cast<unsigned long long>(slot.runtime_upload.capacity())
+    );
     assert(release_slot_persistent_args(slot, allocator) == 0);
     std::puts("PASS: four launch refusals; owner retained, NotStarted, zero stream/event creation");
 }

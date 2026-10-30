@@ -369,6 +369,54 @@ bool DeviceRunner::dep_gen_flush_retained(int timeout_ms, std::string *error) {
 
 void DeviceRunner::dep_gen_finish_retained() { dep_gen_collector_.finish_retained_runs(); }
 
+int DeviceRunner::configure_kernel_affinity(Runtime &runtime) {
+    std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
+    std::vector<int32_t> allowed;
+    runtime.set_aicpu_allowed_cpu_count(0);
+    runtime.set_aicpu_launch_count(0);
+    if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
+        LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    int resolved_aicpu = resolve_aicpu_thread_num(
+        runtime.get_aicpu_thread_num(), static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM
+    );
+    if (resolved_aicpu < 0) return PTO_RUNTIME_ERR_INTERNAL;
+    if (!pto::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
+        LOG_ERROR(
+            "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(), resolved_aicpu
+        );
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    runtime.set_aicpu_thread_num(resolved_aicpu);
+    const size_t cap = runtime.aicpu_allowed_cpus_capacity();
+    if (allowed.size() > cap) {
+        LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
+    for (size_t i = 0; i < allowed.size(); ++i)
+        allowed_cpus[i] = allowed[i];
+    runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
+    int32_t launch_n = static_cast<int32_t>(user_cpus.size());
+    if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
+        launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+    }
+    runtime.set_aicpu_launch_count(launch_n);
+
+    std::string dump;
+    for (size_t i = 0; i < allowed.size(); ++i) {
+        if (i) dump += ", ";
+        dump += std::to_string(allowed[i]);
+        if (i + 1 == allowed.size()) dump += "(last)";
+    }
+    LOG_INFO(
+        "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
+        runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
+    );
+    return 0;
+}
+
 int DeviceRunner::prepare_execution(
     Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
     std::unique_ptr<PreparedExecution> *prepared
@@ -450,53 +498,9 @@ int DeviceRunner::prepare_execution(
     // shape as a5. Host probes the AICPU user pool once, chooses the active
     // cpu_ids deterministically, writes them into Runtime, and the AICPU-side
     // gate only matches sched_getcpu() against this table.
-    {
-        std::vector<pto::a2a3::AicpuLogicalCpu> user_cpus;
-        std::vector<int32_t> allowed;
-        runtime.set_aicpu_allowed_cpu_count(0);
-        runtime.set_aicpu_launch_count(0);
-        if (!pto::a2a3::probe_aicpu_topology(static_cast<uint32_t>(device_id_), user_cpus)) {
-            LOG_ERROR("A2A3 AICPU topology probe failed; cannot configure affinity gate");
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        int resolved_aicpu = resolve_aicpu_thread_num(
-            runtime.get_aicpu_thread_num(), static_cast<int>(user_cpus.size()), PLATFORM_DEFAULT_AICPU_THREAD_NUM
-        );
-        if (resolved_aicpu < 0) return PTO_RUNTIME_ERR_INTERNAL;
-        if (!pto::a2a3::compute_allowed_cpus(user_cpus, resolved_aicpu, allowed)) {
-            LOG_ERROR(
-                "A2A3 AICPU topology has %zu user cpus, cannot fit %d active threads", user_cpus.size(), resolved_aicpu
-            );
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        runtime.set_aicpu_thread_num(resolved_aicpu);
-        launch_aicpu_num = resolved_aicpu;
-        const size_t cap = runtime.aicpu_allowed_cpus_capacity();
-        if (allowed.size() > cap) {
-            LOG_ERROR("A2A3 compute_allowed_cpus returned %zu > cap %zu", allowed.size(), cap);
-            return PTO_RUNTIME_ERR_INTERNAL;
-        }
-        int32_t *allowed_cpus = runtime.get_aicpu_allowed_cpus();
-        for (size_t i = 0; i < allowed.size(); ++i)
-            allowed_cpus[i] = allowed[i];
-        runtime.set_aicpu_allowed_cpu_count(static_cast<int32_t>(allowed.size()));
-        int32_t launch_n = static_cast<int32_t>(user_cpus.size());
-        if (launch_n > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
-            launch_n = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
-        }
-        runtime.set_aicpu_launch_count(launch_n);
-
-        std::string dump;
-        for (size_t i = 0; i < allowed.size(); ++i) {
-            if (i) dump += ", ";
-            dump += std::to_string(allowed[i]);
-            if (i + 1 == allowed.size()) dump += "(last)";
-        }
-        LOG_INFO(
-            "A2A3 AICPU ALLOWED_CPUS = [%s] (active=%d, launch=%d, user_cpus=%zu)", dump.c_str(),
-            runtime.get_aicpu_thread_num(), runtime.get_aicpu_launch_count(), user_cpus.size()
-        );
-    }
+    rc = configure_kernel_affinity(runtime);
+    if (rc != 0) return rc;
+    launch_aicpu_num = runtime.get_aicpu_thread_num();
 
     // Resolve the orchestration SO into a device-resident buffer and refresh
     // runtime metadata before the Runtime struct is uploaded to device.
@@ -628,6 +632,11 @@ void DeviceRunner::cleanup_execution(PreparedExecution &prepared, bool retire_ai
 }
 
 void DeviceRunner::abandon_prepared_execution(PreparedExecution &prepared) noexcept {
+    if (prepared.capture_resources_retained) {
+        prepared.kernel_args.release_run_view();
+        prepared.resources_owned = false;
+        return;
+    }
     cleanup_execution(prepared, /*retire_aicore=*/true);
 }
 
@@ -727,7 +736,52 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
     return launch_run(prepared, std::move(permit));
 }
 
+LaunchTransactionResult DeviceRunner::record_native_run(PreparedExecution &prepared, LaunchPermit permit) {
+    return exact_recording_transaction(
+        prepared.identity, std::move(permit), prepared.capture_model, [&](LaunchProgressSink &sink) -> int {
+            if (!supports_native_capture() || prepared.config.diagnostics_any() || prepared.caller_stream == nullptr)
+                return PTO_RUNTIME_ERR_UNSUPPORTED;
+            if (run_streams_.aicpu() == nullptr || run_streams_.aicore() == nullptr) return PTO_RUNTIME_ERR_UNSUPPORTED;
+            prepared.streams = {run_streams_.aicpu(), run_streams_.aicore()};
+            activate_launch_shape(*prepared.runtime);
+            int rc = arm_run_fence(prepared);
+            if (rc != 0) return rc;
+            rc = retain_recording_resources(prepared, prepared.arena_bank);
+            if (rc != 0) return rc;
+            auto &args = prepared.kernel_args.args;
+            args.run_result_data_base =
+                reinterpret_cast<uint64_t>(args.runtime_args) + runtime_device_extent_size(*prepared.runtime);
+            args.device_wall_data_base = 0;
+            rc = queue_recording_entry(prepared, sink, [&] {
+                return queue_execution_preparation(prepared, sink);
+            });
+            if (rc != 0) return rc;
+            rc = launch_aicore_kernel(prepared.streams.aicore, args);
+            if (rc != 0) return rc;
+            sink.mark_submitted();
+            rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore);
+            if (rc != 0) return rc;
+            const int count = prepared.runtime->get_aicpu_launch_count() > 0 ?
+                                  prepared.runtime->get_aicpu_launch_count() :
+                                  prepared.launch_aicpu_num;
+            rc = launch_aicpu_payload(
+                prepared.streams.aicpu, prepared.kernel_args.launch_payload(),
+                prepared.kernel_args.launch_payload_bytes(), host::KernelNames::RunName, count
+            );
+            if (rc != 0) return rc;
+            rc = aclrtStreamWaitEvent(
+                prepared.streams.aicpu, run_fence(prepared.pipeline_slot)
+                                            .boundary_event(prepared.identity, RunCompletionFence::StreamRole::Aicore)
+            );
+            if (rc != 0) return rc;
+            rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
+            return rc == 0 ? queue_caller_exit(prepared) : rc;
+        }
+    );
+}
+
 LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, LaunchPermit permit) {
+    if (prepared.capture_model != nullptr) return record_native_run(prepared, std::move(permit));
     Runtime &runtime = *prepared.runtime;
     const int num_aicore = prepared.num_aicore;
     const int launch_aicpu_num = prepared.launch_aicpu_num;
@@ -890,15 +944,17 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             // kernels, and it is the only thing a successor can safely be
             // ordered behind.
             //
-            // A caller-bound run requires this reference; reservation failure
-            // fails its launch. Without a caller, an optional successor boundary
-            // can degrade to non-joinable. Once the wait is attempted, failure
-            // is Partial because the stream may already hold the reference.
+            // Caller ordering and common preparation require this reference;
+            // reservation failure fails their launch. Only the legacy caller-free
+            // path may degrade to non-joinable. An attempted wait failure is
+            // Partial because the stream may already hold the reference.
             void *core_done = nullptr;
             bool whole_operator = false;
-            const bool needs_join = prepared.joinable_boundary || prepared.caller_stream != nullptr;
+            const bool needs_join = prepared.joinable_boundary || prepared.caller_stream != nullptr ||
+                                    prepared.kernel_args.args.execution_control != 0;
             const int own_rc = needs_join ? open_own_boundary_wait(prepared, &core_done) : 0;
-            if (prepared.caller_stream != nullptr && own_rc != 0) return own_rc;
+            if ((prepared.caller_stream != nullptr || prepared.kernel_args.args.execution_control != 0) && own_rc != 0)
+                return own_rc;
             if (needs_join && own_rc == 0) {
                 int wait_rc = queue_own_boundary_wait(prepared, streams.aicpu, core_done);
                 if (wait_rc != 0) return wait_rc;

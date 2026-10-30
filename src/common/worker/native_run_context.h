@@ -78,6 +78,7 @@ struct NativeRunContext {
     long long runner_trace_start_ns{0};
     uint64_t clock_log_offset{0};
     int completion_rc{-1};
+    void *capture_model{nullptr};
     std::atomic<NativeRunPhase> phase{NativeRunPhase::Prepared};
     std::unique_ptr<typename Runner::PreparedExecution> prepared_execution{};
     std::unique_ptr<typename Runner::ActiveExecution> active_execution{};

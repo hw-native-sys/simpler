@@ -69,3 +69,16 @@ a5_platform_case(test_return_gate_wait.cpp
 set_tests_properties(test_a5_return_gate_wait PROPERTIES TIMEOUT 20)
 
 simpler_ut_glob_cases(a5_platform_case)
+
+# Compile the same common execution contract against the actual A5 native entry.
+simpler_ut_add_target(NAME test_a5_native_execution_entry
+    ARCH a5 RUNTIME host_build_graph TIER aicpu
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a3/platform/test_native_capture_entry.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../a2a3/platform/support/native_capture_entry_stubs.cpp
+            ${SIMPLER_SRC}/a5/platform/onboard/aicpu/kernel.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/platform_entry_args.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+            ${SIMPLER_SRC}/common/host_build_graph/shared/runtime.cpp
+    INCLUDES ${CMAKE_CURRENT_SOURCE_DIR}/support/native_execution_entry
+    LINK a5_ut_support
+    LABEL no_hardware)

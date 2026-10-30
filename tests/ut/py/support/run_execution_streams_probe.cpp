@@ -33,6 +33,12 @@ static rtStream_t failing_sync_stream = nullptr;
 static int device_frees = 0;
 static rtStream_t publication_stream = nullptr;
 static std::vector<rtStream_t> queried, synchronized, recorded;
+// Device allocations are host buffers in this probe, including the capture control tail.
+extern "C" aclError aclrtMemset(void *dst, size_t capacity, int32_t value, size_t bytes) {
+    assert(dst != nullptr && bytes <= capacity);
+    std::memset(dst, value, bytes);
+    return ACL_SUCCESS;
+}
 extern "C" rtError_t rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
     *out = std::malloc(bytes);
     return *out == nullptr ? -1 : 0;
@@ -204,7 +210,7 @@ static void check_cleanup_wait_failure(SimplerExecutionMode mode, int failing_si
     auto &slot = runner.slot_persistent_args(0);
     assert(prepared.kernel_args.prepare_runtime_args(runtime, runner.allocator(), slot) == 0);
     void *allocation = slot.runtime_args;
-    void *upload_source = slot.runtime_upload_source;
+    void *upload_source = slot.runtime_upload.data();
     assert(allocation != nullptr);
     events_created = 0;
     assert(runner.arm_run_fence(prepared) == 0);

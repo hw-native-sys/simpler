@@ -140,6 +140,7 @@ else()
     message(STATUS "CUSTOM_SOURCE_DIRS not set, using only core sources")
 endif()
 
+
 # Create shared library
 list(LENGTH HOST_RUNTIME_SOURCES NUM_HOST_RUNTIME_SOURCES)
 message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")

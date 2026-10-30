@@ -12,6 +12,8 @@
 // storage. The stub observes API boundaries; descriptor preparation stays real.
 #include <gtest/gtest.h>
 
+#include "host/captured_graph_resources.h"
+
 #include <cstdlib>
 #include <cstring>
 #include <new>
@@ -20,6 +22,8 @@
 #include <limits>
 
 #include "acl/acl.h"
+#include "common/device_run_result.h"
+#include "common/native_execution_control.h"
 #include "device_runner_helpers.h"
 
 namespace {
@@ -28,6 +32,8 @@ namespace {
 constexpr unsigned char kDeviceMark = 0xa5;
 
 struct RtsState {
+    size_t control_bytes = 0;
+    int memset_rc = 0;
     int alloc_rc = 0;
     int copy_rc = 0;
     int copies = 0;
@@ -87,6 +93,14 @@ protected:
     }
 };
 }  // namespace
+
+extern "C" size_t native_capture_result_bytes_impl() { return rts.control_bytes; }
+extern "C" aclError aclrtMemset(void *dst, size_t capacity, int value, size_t count) {
+    if (rts.memset_rc != 0) return rts.memset_rc;
+    if (count > capacity) return -1;
+    std::memset(dst, value, count);
+    return 0;
+}
 
 extern "C" rtError_t rtMalloc(void **ptr, uint64_t bytes, uint32_t, uint16_t) {
     if (rts.alloc_rc != 0) return rts.alloc_rc;
@@ -166,6 +180,105 @@ TEST(KernelArgsDefaults, FreshRuntimeStartsWithDiagnosticsDisabled) {
     fresh->~Runtime();
 }
 
+TEST_F(KernelArgsPublication, CaptureRefusesLargerPublicationWithoutAllocatingOrChangingStorage) {
+    rts.control_bytes = 64;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    helper.release_run_view();
+    const auto previous = slot.runtime_upload.data();
+    const auto capacity = slot.runtime_upload.capacity();
+    const int allocations = rts.host_allocations;
+    std::vector<std::byte> image(capacity + 64);
+    ASSERT_EQ(slot.staged_launch_metadata.append({image.data(), image.data(), image.size()}), 0);
+    slot.capture_preparing = true;
+    EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(slot.runtime_upload.data(), previous);
+    EXPECT_EQ(slot.runtime_upload.capacity(), capacity);
+    EXPECT_EQ(rts.host_allocations, allocations);
+}
+
+TEST_F(KernelArgsPublication, ReplayControlIsColdInitializedAndNotInTheUploadImage) {
+    rts.control_bytes = sizeof(DeviceRunResultRegion);
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    auto *tail = reinterpret_cast<unsigned char *>(slot.runtime_args) + slot.runtime_bytes;
+    for (size_t i = 0; i < rts.control_bytes; ++i)
+        EXPECT_EQ(tail[i], 0);
+    std::memset(tail, 37, rts.control_bytes);
+    helper.release_run_view();
+    slot.capture_preparing = true;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    for (size_t i = 0; i < rts.control_bytes; ++i)
+        EXPECT_EQ(tail[i], 37);
+    EXPECT_EQ(slot.runtime_bytes, runtime_device_extent_size(runtime));
+    EXPECT_EQ(rts.allocations, 1);
+}
+
+TEST_F(KernelArgsPublication, ReplayControlInitializationFailureDoesNotPublishTheAllocation) {
+    rts.control_bytes = sizeof(DeviceRunResultRegion);
+    rts.memset_rc = -71;
+    EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), -71);
+    EXPECT_EQ(slot.runtime_args, nullptr);
+    EXPECT_EQ(rts.allocations, rts.frees);
+}
+
+TEST_F(KernelArgsPublication, CapturedPublicationResetsReportsWithoutChangingReplayControlOrNativeIdentity) {
+    rts.control_bytes = sizeof(DeviceRunResultRegion);
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, this, rts.sink), 0);
+    helper.release_run_view();
+
+    slot.capture_preparing = true;
+    rts.defer = true;
+    rts.queued.clear();
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    helper.args.run_result_epoch = 73;
+    AicoreLaunchArgs core_args{};
+    fill_shared_launch_args(core_args, helper.args);
+    ASSERT_EQ(core_args.report_epoch, 0u);
+    ASSERT_EQ(helper.args.run_result_epoch, 73u);
+    ASSERT_EQ(helper.publish_runtime_args(false, this, rts.sink), 0);
+    ASSERT_FALSE(rts.queued.empty());
+    auto *descriptor = reinterpret_cast<DeviceRuntimeLaunchDesc *>(slot.runtime_args);
+    auto *control_bytes = reinterpret_cast<unsigned char *>(slot.runtime_args) + slot.runtime_bytes;
+
+    // Re-execute the recorded DMA descriptors, not Host preparation. Every
+    // previous report is dirty even though the frozen native identity repeats.
+    for (uint64_t sequence : {1u, 2u, 74u}) {
+        std::memset(descriptor->workers, 0x5a, sizeof(descriptor->workers));
+        DeviceRunResultRegion control{};
+        control.published = sequence;
+        std::memcpy(control_bytes, &control, sizeof(control));
+        for (const auto &copy : rts.queued)
+            std::memcpy(copy.target, copy.source, copy.bytes);
+        const auto *workers = reinterpret_cast<const unsigned char *>(descriptor->workers);
+        for (size_t i = 0; i < sizeof(descriptor->workers); ++i)
+            ASSERT_EQ(workers[i], 0u);
+        std::memcpy(&control, control_bytes, sizeof(control));
+        EXPECT_EQ(control.published, sequence) << "only ordered preparation may reset the result marker";
+        EXPECT_EQ(core_args.report_epoch, 0u);
+        EXPECT_EQ(helper.args.run_result_epoch, 73u);
+    }
+}
+
+TEST_F(KernelArgsPublication, OrdinaryPublicationCannotEraseCompletionOrFirstError) {
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    auto *control = reinterpret_cast<NativeExecutionControl *>(helper.args.execution_control);
+    ASSERT_NE(control, nullptr);
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(control) % alignof(NativeExecutionControl), 0u);
+    EXPECT_EQ(control->sequence, 0u);
+    EXPECT_EQ(control->remaining_callbacks, 0u);
+    control->sequence = 19;
+    control->first_error = -81;
+    control->remaining_callbacks = 2;
+    ASSERT_EQ(helper.publish_runtime_args(false, this, rts.sink), 0);
+    helper.release_run_view();
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    EXPECT_EQ(reinterpret_cast<NativeExecutionControl *>(helper.args.execution_control), control);
+    ASSERT_EQ(helper.publish_runtime_args(false, this, rts.sink), 0);
+    EXPECT_EQ(control->sequence, 19u);
+    EXPECT_EQ(control->first_error, -81);
+    EXPECT_EQ(control->remaining_callbacks, 2u);
+}
+
 TEST_F(KernelArgsPublication, PrepareDoesNotPublishAndOwnsAnIndependentSnapshot) {
     EXPECT_FALSE(helper.runtime_args_published());
     runtime.dev.worker_count = 7;
@@ -174,7 +287,7 @@ TEST_F(KernelArgsPublication, PrepareDoesNotPublishAndOwnsAnIndependentSnapshot)
     EXPECT_FALSE(helper.runtime_args_published());
     EXPECT_EQ(rts.copies, 0);
     EXPECT_EQ(slot.runtime_bytes, sizeof(DeviceRuntimeLaunchDesc));
-    EXPECT_EQ(allocator.committed_bytes(), sizeof(DeviceRuntimeLaunchDesc));
+    EXPECT_EQ(allocator.committed_bytes(), sizeof(DeviceRuntimeLaunchDesc) + sizeof(NativeExecutionControl));
     const auto *bytes = reinterpret_cast<const unsigned char *>(slot.runtime_args);
     for (size_t i = 0; i < slot.runtime_bytes; ++i)
         ASSERT_EQ(bytes[i], kDeviceMark);
@@ -422,30 +535,30 @@ TEST_F(KernelArgsPublication, LaunchPublicationQueuesAnImmutableSourceOnItsExecu
     runtime.dev.worker_count = 19;
     helper.release_run_view();
     ASSERT_EQ(rts.host_frees, 0);
-    ASSERT_EQ(rts.pending_source, slot.runtime_upload_source);
+    ASSERT_EQ(rts.pending_source, slot.runtime_upload.data());
     std::memcpy(rts.pending_target, rts.pending_source, rts.pending_bytes);
     EXPECT_EQ(published_worker_count(), 7);
 }
 
 TEST_F(KernelArgsPublication, PinnedSourceIsReusedAndItsReleaseFailureRemainsRetryable) {
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
-    void *source = slot.runtime_upload_source;
+    void *source = slot.runtime_upload.data();
     ASSERT_NE(source, nullptr);
     ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
     ASSERT_TRUE(rts.sink.submitted());
     helper.release_run_view();
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
-    EXPECT_EQ(slot.runtime_upload_source, source);
+    EXPECT_EQ(slot.runtime_upload.data(), source);
     EXPECT_EQ(rts.host_allocations, 1);
     rts.host_free_rc = -79;
     EXPECT_EQ(release_slot_persistent_args(slot, allocator), -79);
-    EXPECT_EQ(slot.runtime_upload_source, source);
+    EXPECT_EQ(slot.runtime_upload.data(), source);
     EXPECT_EQ(slot.runtime_args, nullptr);
     EXPECT_EQ(rts.host_frees, 0);
     rts.host_free_rc = 0;
     EXPECT_EQ(release_slot_persistent_args(slot, allocator), 0);
     EXPECT_EQ(rts.host_frees, 1);
-    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+    EXPECT_EQ(slot.runtime_upload.data(), nullptr);
 }
 
 TEST_F(KernelArgsPublication, PinnedAllocationFailurePrecedesAnyPublicationAndCanRetry) {
@@ -454,7 +567,7 @@ TEST_F(KernelArgsPublication, PinnedAllocationFailurePrecedesAnyPublicationAndCa
     EXPECT_EQ(rts.async_copies, 0);
     EXPECT_FALSE(rts.sink.submitted());
     EXPECT_FALSE(helper.launchable());
-    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+    EXPECT_EQ(slot.runtime_upload.data(), nullptr);
     rts.host_alloc_rc = 0;
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
     EXPECT_EQ(rts.allocations, 1);
@@ -468,7 +581,7 @@ TEST_F(KernelArgsPublication, FailedAsyncEnqueueCannotCertifyNoSubmission) {
     EXPECT_TRUE(rts.sink.submitted());
     EXPECT_FALSE(helper.runtime_args_published());
     EXPECT_EQ(helper.launch_payload(), nullptr);
-    EXPECT_NE(slot.runtime_upload_source, nullptr);
+    EXPECT_NE(slot.runtime_upload.data(), nullptr);
     EXPECT_EQ(rts.host_frees, 0);
 }
 
@@ -476,12 +589,12 @@ TEST_F(KernelArgsPublication, AbandonmentNeverFreesAPotentialDmaSource) {
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
     rts.defer = true;
     ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
-    void *source = slot.runtime_upload_source;
+    void *source = slot.runtime_upload.data();
     void *destination = slot.runtime_args;
     abandon_slot_persistent_args(slot);
     ASSERT_EQ(rts.host_frees, 0);
     ASSERT_EQ(rts.frees, 0);
-    EXPECT_EQ(slot.runtime_upload_source, nullptr);
+    EXPECT_EQ(slot.runtime_upload.data(), nullptr);
     // Finish the modeled reader before reclaiming the test's orphaned blocks.
     std::memcpy(rts.pending_target, rts.pending_source, rts.pending_bytes);
     std::free(source);
@@ -503,7 +616,7 @@ TEST_F(KernelArgsPublication, MetadataValuesArePublishedBeforeDescriptorFromSlot
     EXPECT_EQ(rts.copies, 0);
     EXPECT_EQ(first, 0U);
     EXPECT_EQ(second, 0U);
-    EXPECT_EQ(slot.runtime_upload_bytes, slot.runtime_bytes + sizeof(first) + sizeof(second));
+    EXPECT_EQ(slot.runtime_upload.capacity(), slot.runtime_bytes + sizeof(first) + sizeof(second));
     KernelArgsHelper moved(std::move(helper));
     helper.release_run_view();
     rts.defer = true;
@@ -515,7 +628,7 @@ TEST_F(KernelArgsPublication, MetadataValuesArePublishedBeforeDescriptorFromSlot
     EXPECT_EQ(rts.queued[0].target, &first);
     EXPECT_EQ(rts.queued[1].target, &second);
     EXPECT_EQ(rts.queued[2].target, slot.runtime_args);
-    auto *pinned = static_cast<std::byte *>(slot.runtime_upload_source);
+    auto *pinned = static_cast<std::byte *>(slot.runtime_upload.data());
     ASSERT_EQ(rts.queued[0].source, pinned + slot.runtime_bytes);
     ASSERT_EQ(rts.queued[1].source, pinned + slot.runtime_bytes + sizeof(first));
     ASSERT_EQ(rts.queued[2].source, pinned);
@@ -553,7 +666,7 @@ TEST_F(KernelArgsPublication, EveryMetadataEnqueueFailureStopsTheDescriptorAndRe
         EXPECT_EQ(second, failure > 2 ? value : 0U);
         EXPECT_EQ(published_worker_count(), static_cast<int>(0xa5a5a5a5U));
         EXPECT_EQ(rts.host_frees, 0);
-        EXPECT_NE(slot.runtime_upload_source, nullptr);
+        EXPECT_NE(slot.runtime_upload.data(), nullptr);
         EXPECT_NE(helper.publish_runtime_args(false, &rts, rts.sink), 0);
         EXPECT_EQ(rts.copies, failure);
     }
@@ -570,7 +683,8 @@ TEST_F(KernelArgsPublication, MetadataSourceGrowthFailuresAreRetryableWithoutDev
     ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
     ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
     Runtime *destination = slot.runtime_args;
-    void *old_source = slot.runtime_upload_source;
+    void *old_source = slot.runtime_upload.data();
+    const auto old_capacity = slot.runtime_upload.capacity();
     uint64_t value = 73, target = 0;
     const HostMetadataRegion region{&target, &value, sizeof(value)};
     ASSERT_EQ(slot.staged_launch_metadata.prepare(&region, 1), 0);
@@ -578,14 +692,14 @@ TEST_F(KernelArgsPublication, MetadataSourceGrowthFailuresAreRetryableWithoutDev
     rts.sink = {};
     rts.host_free_rc = -71;
     EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), -71);
-    EXPECT_EQ(slot.runtime_upload_source, old_source);
+    EXPECT_EQ(slot.runtime_upload.data(), old_source);
     EXPECT_FALSE(helper.launchable());
     EXPECT_FALSE(rts.sink.submitted());
     rts.host_free_rc = 0;
     rts.host_alloc_rc = -72;
     EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), -72);
-    EXPECT_EQ(slot.runtime_upload_source, nullptr);
-    EXPECT_EQ(slot.runtime_upload_bytes, 0U);
+    EXPECT_EQ(slot.runtime_upload.data(), old_source);
+    EXPECT_EQ(slot.runtime_upload.capacity(), old_capacity);
     EXPECT_EQ(slot.runtime_args, destination);
     EXPECT_TRUE(rts.queued.empty());
     rts.host_alloc_rc = 0;
@@ -649,4 +763,127 @@ TEST_F(KernelArgsPublication, AppendedResetPreservesEarlierMetadataAndOwnsItsSna
     EXPECT_EQ(rts.queued[0].target, &target);
     EXPECT_EQ(rts.queued[1].target, &reset_target);
     EXPECT_EQ(rts.queued[2].target, slot.runtime_args);
+}
+
+namespace {
+struct UploadGraph {
+    CapturedGraphResources resources;
+    void (*notify)(void *){nullptr};
+    void *notification_data{nullptr};
+    int registration_rc{0};
+
+    int retain(SlotPersistentArgs &slot) {
+        auto source = slot.runtime_upload.retain();
+        return resources.retain(
+            this, {},
+            [&](void *, void (*callback)(void *), void *data) {
+                if (registration_rc == 0) {
+                    notify = callback;
+                    notification_data = data;
+                }
+                return registration_rc;
+            },
+            nullptr, {}, {{source, [](void *data) {
+                               return static_cast<PinnedUploadStorage *>(data)->release();
+                           }}}
+        );
+    }
+    void destroy() { notify(notification_data); }
+};
+}  // namespace
+
+TEST_F(KernelArgsPublication, GraphRetainsPublishedSourceAcrossSameSlotPreparation) {
+    UploadGraph graph;
+    runtime.dev.worker_count = 7;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(graph.retain(slot), 0);
+    rts.defer = true;
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    const void *captured_source = rts.pending_source;
+    const auto bytes = rts.pending_bytes;
+    const auto *first = static_cast<const std::byte *>(captured_source);
+    const std::vector<std::byte> snapshot(first, first + bytes);
+    helper.release_run_view();
+    runtime.dev.worker_count = 19;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    EXPECT_NE(slot.runtime_upload.data(), captured_source);
+    EXPECT_EQ(rts.host_allocations, 2);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    EXPECT_EQ(std::memcmp(captured_source, snapshot.data(), bytes), 0);
+    EXPECT_EQ(rts.host_frees, 0);
+    graph.destroy();
+    EXPECT_EQ(rts.host_frees, 0);
+    ASSERT_EQ(graph.resources.retire_after_drain(), 0);
+    EXPECT_EQ(rts.host_frees, 1);
+    helper.release_run_view();
+}
+
+TEST_F(KernelArgsPublication, GraphSourceRetirementRetriesFailedFreeAfterSlotRelease) {
+    UploadGraph graph;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(graph.retain(slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    helper.release_run_view();
+    ASSERT_EQ(release_slot_persistent_args(slot, allocator), 0);
+    EXPECT_EQ(rts.host_frees, 0);
+    EXPECT_EQ(graph.resources.retire_after_drain(), PTO_RUNTIME_ERR_INVALID_STATE);
+    graph.destroy();
+    rts.host_free_rc = -79;
+    EXPECT_EQ(graph.resources.retire_after_drain(), -79);
+    EXPECT_FALSE(graph.resources.empty());
+    rts.host_free_rc = 0;
+    ASSERT_EQ(graph.resources.retire_after_drain(), 0);
+    EXPECT_TRUE(graph.resources.empty());
+    EXPECT_EQ(rts.host_frees, 1);
+}
+
+TEST_F(KernelArgsPublication, RefusedGraphRegistrationPreservesOrdinarySourceReuse) {
+    UploadGraph graph;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    void *source = slot.runtime_upload.data();
+    graph.registration_rc = -91;
+    EXPECT_EQ(graph.retain(slot), -91);
+    EXPECT_TRUE(graph.resources.empty());
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    helper.release_run_view();
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    EXPECT_EQ(slot.runtime_upload.data(), source);
+    EXPECT_EQ(rts.host_allocations, 1);
+    helper.release_run_view();
+}
+
+TEST_F(KernelArgsPublication, CapturedSourceReplacementFailureLeavesOldContentsOwned) {
+    UploadGraph graph;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    ASSERT_EQ(graph.retain(slot), 0);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    void *source = slot.runtime_upload.data();
+    helper.release_run_view();
+    rts.host_alloc_rc = -78;
+    EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), -78);
+    EXPECT_EQ(slot.runtime_upload.data(), source);
+    EXPECT_EQ(rts.host_frees, 0);
+    rts.host_alloc_rc = 0;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    EXPECT_NE(slot.runtime_upload.data(), source);
+    helper.release_run_view();
+    graph.destroy();
+    ASSERT_EQ(graph.resources.retire_after_drain(), 0);
+}
+
+TEST_F(KernelArgsPublication, RetainedSourceCannotGrowAndRetirementAllowsSlotReuse) {
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    auto source = slot.runtime_upload.retain();
+    ASSERT_NE(source, nullptr);
+    EXPECT_EQ(source->reserve(source->capacity() + 1), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(source->retain(), nullptr);
+    ASSERT_EQ(helper.publish_runtime_args(false, &rts, rts.sink), 0);
+    helper.release_run_view();
+    ASSERT_EQ(source->release(), 0);
+    source.reset();
+    EXPECT_EQ(slot.runtime_upload.retain(), nullptr);
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    EXPECT_NE(slot.runtime_upload.data(), nullptr);
+    EXPECT_EQ(rts.host_allocations, 2);
+    helper.release_run_view();
 }

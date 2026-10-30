@@ -11,10 +11,12 @@
 
 #include "host/kernel_execution_state.h"
 
-int KernelExecutionState::initialize(int requested_device_id, const KernelContextOps &ops) {
+int KernelExecutionState::initialize(
+    int requested_device_id, const KernelContextOps &ops, uint64_t context_generation
+) {
     std::scoped_lock lock(mutex_);
     if (phase_ != KernelContextPhase::New) return PTO_RUNTIME_ERR_INVALID_STATE;
-    if (requested_device_id < 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (requested_device_id < 0 || context_generation == 0) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     if (!ops.valid()) return PTO_RUNTIME_ERR_INTERNAL;
 
     int current_device = -1;

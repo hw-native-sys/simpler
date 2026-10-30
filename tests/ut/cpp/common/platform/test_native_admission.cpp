@@ -134,6 +134,12 @@ TEST_F(NativeAdmissionTest, NativeReleasableProofReadsRealSuccessfulCloseAndOuts
     EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 0);
     ASSERT_EQ(finalize_device(&runner), 0);
     EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 1);
+    {
+        auto reservation = runner.reserve_callable_registry(true);
+        ASSERT_TRUE(reservation.accepted());
+        EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 0);
+    }
+    EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 1);
     int owner = 0;
     ASSERT_TRUE(runner.try_reserve_native_run(&owner, 1, arena_bank(1), true));
     EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 0);
@@ -166,8 +172,10 @@ TEST_F(NativeAdmissionTest, KernelColdCleanupFailureStopsAdmissionAndRetainsItsC
     EXPECT_EQ(runner.kernel_execution_state().hidden_stream(KernelStreamKind::Aicpu), stream);
     const uint8_t binary[] = {1};
     const auto image = make_chip_callable(nullptr, 0, "orch", binary, sizeof(binary), nullptr, nullptr, 0, "");
+    EXPECT_EQ(simpler_register_callable(&runner, 3, image.data()), PTO_RUNTIME_ERR_INVALID_STATE);
+    int32_t callable_id = -1;
     EXPECT_EQ(
-        simpler_kernel_mode_prepare_callable(&runner, 3, image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_STATE
+        simpler_register_callable_v2(&runner, image.data(), image.size(), &callable_id), PTO_RUNTIME_ERR_INVALID_STATE
     );
     control().loader_finalize_error = 0;
     EXPECT_EQ(finalize_device(&runner), 0);
@@ -324,7 +332,6 @@ TEST_F(NativeAdmissionTest, RegistrationRefusesWhileANativeRunIsOutstanding) {
     const auto image = make_chip_callable(nullptr, 0, "orch", binary, sizeof(binary), nullptr, nullptr, 0, "");
     int32_t auto_id = 99;
     EXPECT_EQ(simpler_register_callable(&runner, 2, image.data()), PTO_RUNTIME_ERR_INTERNAL);
-    EXPECT_EQ(simpler_kernel_mode_prepare_callable(&runner, 3, image.data(), image.size()), PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_EQ(simpler_register_callable_v2(&runner, image.data(), image.size(), &auto_id), PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_EQ(auto_id, -1);
     runner.release_native_run_reservation(&owner);

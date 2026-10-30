@@ -345,6 +345,7 @@ static bool prepare_task(
     ChipTaskStorage &storage = orch->sm_header->tasks.storage_at(out->alloc_result.task_id);
     out->slot_state = &storage.slot;
     out->task = &storage.task;
+    out->task->graph_definition_offset = 0;
     out->payload = &storage.payload;
 
     // Bind the three argument regions before prefetch() and init(), both of which

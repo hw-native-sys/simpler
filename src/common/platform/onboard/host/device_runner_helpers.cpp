@@ -21,11 +21,15 @@
 #include <runtime/rt.h>
 
 #include <cstring>
+#include <new>
 
 #include "acl/acl.h"
 #include "acl/error_codes/rt_error_codes.h"
 #include "common/unified_log.h"
+#include "common/native_execution_control.h"
 #include "host/acl_error_log.h"
+
+extern "C" __attribute__((weak)) size_t native_capture_result_bytes_impl() { return 0; }
 
 namespace {
 
@@ -114,6 +118,90 @@ int publish_for_launch(KernelArgsHelper &kernel_args, rtStream_t aicpu_stream, L
     return rc;
 }
 
+std::shared_ptr<PinnedUploadStorage> PinnedUploadStorage::retain() {
+    if (retained_source_ || data() == nullptr) return {};
+    if (captured_) return captured_;
+    if (data_ == nullptr || cleanup_debt_ != nullptr) return {};
+    auto retained = std::make_shared<PinnedUploadStorage>();
+    retained->retained_source_ = true;
+    retained->data_ = std::exchange(data_, nullptr);
+    retained->capacity_ = std::exchange(capacity_, 0);
+    captured_ = std::move(retained);
+    return captured_;
+}
+
+int PinnedUploadStorage::reserve(uint64_t bytes, bool allow_growth) {
+    if (!allow_growth && (cleanup_debt_ != nullptr || bytes > capacity() || (captured_ && captured_.use_count() > 1)))
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (retained_source_) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (captured_) {
+        if (captured_.use_count() == 1) {
+            data_ = std::exchange(captured_->data_, nullptr);
+            capacity_ = std::exchange(captured_->capacity_, 0);
+            captured_.reset();
+        } else {
+            // The old source stays reachable if allocation fails. A new source
+            // is required even when the captured allocation has enough capacity.
+            void *replacement = nullptr;
+            if (bytes != 0) {
+                const int rc = rtMallocHost(&replacement, bytes, 0);
+                if (rc != 0) return rc;
+                if (replacement == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+            }
+            data_ = replacement;
+            capacity_ = bytes;
+            captured_.reset();
+            return 0;
+        }
+    }
+    // Settle a rejected replacement before attempting another allocation.
+    if (cleanup_debt_ != nullptr) {
+        const int rc = rtFreeHost(cleanup_debt_);
+        if (rc != 0) return rc;
+        cleanup_debt_ = nullptr;
+    }
+    if (bytes <= capacity_) return 0;
+    void *replacement = nullptr;
+    const int alloc_rc = rtMallocHost(&replacement, bytes, 0);
+    if (alloc_rc != 0) return alloc_rc;
+    if (replacement == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (data_ != nullptr) {
+        const int free_rc = rtFreeHost(data_);
+        if (free_rc != 0) {
+            if (rtFreeHost(replacement) != 0) cleanup_debt_ = replacement;
+            return free_rc;
+        }
+    }
+    data_ = replacement;
+    capacity_ = bytes;
+    return 0;
+}
+
+int PinnedUploadStorage::release() {
+    if (captured_) {
+        if (captured_.use_count() == 1) {
+            const int rc = captured_->release();
+            if (rc != 0) return rc;
+        }
+        captured_.reset();
+    }
+    int first_error = 0;
+    if (cleanup_debt_ != nullptr) {
+        first_error = rtFreeHost(cleanup_debt_);
+        if (first_error == 0) cleanup_debt_ = nullptr;
+    }
+    if (data_ != nullptr) {
+        const int rc = rtFreeHost(data_);
+        if (rc != 0) {
+            if (first_error == 0) first_error = rc;
+        } else {
+            data_ = nullptr;
+            capacity_ = 0;
+        }
+    }
+    return first_error;
+}
+
 int KernelArgsHelper::prepare_runtime_args(
     const Runtime &host_runtime, MemoryAllocator &allocator, SlotPersistentArgs &slot
 ) {
@@ -146,11 +234,30 @@ int KernelArgsHelper::prepare_runtime_args(
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (slot.runtime_args == nullptr) {
-        void *runtime_dev = allocator_->alloc(runtime_extent);
+    const bool captured_destination = slot.retained_runtime_args && slot.retained_runtime_args.use_count() > 1;
+    const size_t capture_bytes = native_capture_result_bytes_impl();
+    const size_t execution_offset =
+        (runtime_extent + capture_bytes + alignof(NativeExecutionControl) - 1) & ~(alignof(NativeExecutionControl) - 1);
+    const size_t control_bytes = execution_offset - runtime_extent + sizeof(NativeExecutionControl);
+    if (slot.capture_preparing && (slot.runtime_args == nullptr || captured_destination || capture_bytes == 0))
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (slot.runtime_args == nullptr || captured_destination) {
+        void *runtime_dev = allocator_->alloc(runtime_extent + control_bytes);
         if (runtime_dev == nullptr) {
             LOG_ERROR("Alloc for runtime_args failed");
             return PTO_RUNTIME_ERR_INTERNAL;
+        }
+        if (control_bytes != 0) {
+            const int rc =
+                aclrtMemset(static_cast<char *>(runtime_dev) + runtime_extent, control_bytes, 0, control_bytes);
+            if (rc != 0) {
+                (void)allocator_->free(runtime_dev);
+                return rc;
+            }
+        }
+        if (captured_destination) {
+            slot.retained_runtime_args->slot_owned = false;
+            slot.retained_runtime_args.reset();
         }
         slot.runtime_args = reinterpret_cast<Runtime *>(runtime_dev);
         slot.runtime_bytes = runtime_extent;
@@ -164,28 +271,15 @@ int KernelArgsHelper::prepare_runtime_args(
     const uint64_t metadata_bytes = slot.staged_launch_metadata.size();
     if (metadata_bytes > UINT64_MAX - runtime_extent) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     const uint64_t upload_bytes = runtime_extent + metadata_bytes;
-    // Reservation excludes every previous DMA reader before this storage grows.
-    // A failed free retains ownership; a failed allocation leaves a retryable slot.
-    if (slot.runtime_upload_source != nullptr && slot.runtime_upload_bytes < upload_bytes) {
-        const int free_rc = rtFreeHost(slot.runtime_upload_source);
-        if (free_rc != 0) return free_rc;
-        slot.runtime_upload_source = nullptr;
-        slot.runtime_upload_bytes = 0;
-    }
-    if (slot.runtime_upload_source == nullptr) {
-        void *source = nullptr;
-        const int host_rc = rtMallocHost(&source, upload_bytes, 0);
-        if (host_rc != 0) return host_rc;
-        if (source == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-        slot.runtime_upload_source = source;
-        slot.runtime_upload_bytes = upload_bytes;
-    }
+    const int host_rc = slot.runtime_upload.reserve(upload_bytes, !slot.capture_preparing);
+    if (host_rc != 0) return host_rc;
+    if (!slot.capture_preparing) slot.eager_upload_bytes = upload_bytes;
     // A block whose handshake region has never been published still holds
     // whatever the allocator returned, so the first publication onto it carries
     // that region from the ctor-zeroed host copy. Every later publication stops
     // before it: the device owns those words from then on, and re-sending them
     // would overwrite a report or a reply.
-    const bool initializing = !slot.workers_initialized;
+    const bool initializing = slot.capture_preparing || !slot.workers_initialized;
     // The snapshot is always the descriptor route's length, which is the longer
     // of the two: the launch route publishes a prefix of it. Capturing the
     // longer one is what lets the route be chosen after this point without
@@ -202,6 +296,7 @@ int KernelArgsHelper::prepare_runtime_args(
         if (slot.launch_package.size() < package_bytes) slot.launch_package.resize(package_bytes);
     }
     args.runtime_args = slot.runtime_args;
+    args.execution_control = reinterpret_cast<uint64_t>(slot.runtime_args) + execution_offset;
     // Captured with the snapshot: the length this run's descriptor names for its
     // Definition section, which the publication compares against what the bind
     // staged on the slot.
@@ -313,7 +408,7 @@ void *KernelArgsHelper::launch_payload() {
 int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream_t stream, LaunchProgressSink &sink) {
     if (runtime_args_state_ != RuntimeArgsState::Prepared) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (args.runtime_args == nullptr || slot_ == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-    if (stream == nullptr || slot_->runtime_upload_source == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (stream == nullptr || slot_->runtime_upload.data() == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
 
     // The first publication onto a block sends the whole initialized prefix,
     // entry storage included, so its values are in the descriptor whether or
@@ -416,8 +511,8 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream
             // Metadata and descriptor occupy disjoint ranges of the slot's
             // pinned source. Neither range changes until this run retires.
             const int metadata_rc = launch_metadata_.publish(
-                static_cast<std::byte *>(slot_->runtime_upload_source) + slot_->runtime_bytes,
-                slot_->runtime_upload_bytes - slot_->runtime_bytes,
+                static_cast<std::byte *>(slot_->runtime_upload.data()) + slot_->runtime_bytes,
+                slot_->runtime_upload.capacity() - slot_->runtime_bytes,
                 [stream, &sink](void *target, const void *metadata, size_t length) {
                     sink.mark_submitted();
                     return rtMemcpyAsync(target, length, metadata, length, RT_MEMCPY_HOST_TO_DEVICE, stream);
@@ -440,12 +535,12 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream
             // the mechanism — a warm failure leaves `workers_initialized` set,
             // so the next prepare sends this same length again.
             slot_->published_prefix_bytes = 0;
-            if (bytes > slot_->runtime_upload_bytes) return PTO_RUNTIME_ERR_INTERNAL;
-            std::memcpy(slot_->runtime_upload_source, source, bytes);
+            if (bytes > slot_->runtime_upload.capacity()) return PTO_RUNTIME_ERR_INTERNAL;
+            std::memcpy(slot_->runtime_upload.data(), source, bytes);
             // A failed enqueue does not prove the stream holds no DMA reader.
             sink.mark_submitted();
             const int copy_rc = rtMemcpyAsync(
-                args.runtime_args, bytes, slot_->runtime_upload_source, bytes, RT_MEMCPY_HOST_TO_DEVICE, stream
+                args.runtime_args, bytes, slot_->runtime_upload.data(), bytes, RT_MEMCPY_HOST_TO_DEVICE, stream
             );
             if (copy_rc != 0) return copy_rc;
             if (prefix_cacheable) {
@@ -487,20 +582,25 @@ int KernelArgsHelper::publish_runtime_args(bool launch_route_permitted, rtStream
 
 int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allocator) {
     int first_error = 0;
-    if (slot.runtime_args != nullptr) {
+    if (slot.retained_runtime_args && slot.retained_runtime_args.use_count() > 1) {
+        slot.retained_runtime_args->slot_owned = false;
+        slot.retained_runtime_args.reset();
+        slot.runtime_args = nullptr;
+    } else if (slot.runtime_args != nullptr) {
         const int rc = allocator.free(slot.runtime_args);
         if (rc != 0) first_error = rc;
-        else slot.runtime_args = nullptr;
-    }
-    if (slot.runtime_upload_source != nullptr) {
-        const int rc = rtFreeHost(slot.runtime_upload_source);
-        if (rc != 0) {
-            if (first_error == 0) first_error = rc;
-        } else {
-            slot.runtime_upload_source = nullptr;
+        else {
+            slot.runtime_args = nullptr;
+            if (slot.retained_runtime_args) slot.retained_runtime_args->address = nullptr;
+            slot.retained_runtime_args.reset();
         }
     }
-    if (first_error == 0) slot = SlotPersistentArgs{};
+    const int host_rc = slot.runtime_upload.release();
+    if (first_error == 0) first_error = host_rc;
+    if (first_error == 0) {
+        slot.~SlotPersistentArgs();
+        new (&slot) SlotPersistentArgs{};
+    }
     return first_error;
 }
 
@@ -508,4 +608,7 @@ int release_slot_persistent_args(SlotPersistentArgs &slot, MemoryAllocator &allo
 // queued DMA may still read the pinned source as well as name the device block.
 // Freeing that source before a reader stops is a host-memory use-after-free;
 // abandonment leaves it allocated for the rest of this process.
-void abandon_slot_persistent_args(SlotPersistentArgs &slot) { slot = SlotPersistentArgs{}; }
+void abandon_slot_persistent_args(SlotPersistentArgs &slot) {
+    slot.~SlotPersistentArgs();
+    new (&slot) SlotPersistentArgs{};
+}

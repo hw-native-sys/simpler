@@ -242,6 +242,71 @@ TEST(ChipRunLaneJoinedLaunchTest, CallerSubmitQueuesItsExitBeforeReturning) {
     lane.close();
 }
 
+TEST(ChipRunLaneJoinedLaunchTest, RecordedSubmissionFinishesHostCarrierWithoutExecutionWait) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    g_launch_rc[0] = SIMPLER_NATIVE_RUN_RECORDED;
+    ChipRun run = lane.submit(1, host_args(), CallConfig{});
+    EXPECT_TRUE(run.recorded());
+    EXPECT_FALSE(run.launched());
+    EXPECT_TRUE(run.done());
+    EXPECT_FALSE(g_complete[0]);
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "finalize0"}));
+    EXPECT_FALSE(lane.poisoned());
+    // Host finalization makes the slot reusable, without claiming that a replay
+    // has happened or converting this run into an eager predecessor.
+    g_launch_rc[0] = 0;
+    ChipRun eager = lane.submit(1, host_args(), CallConfig{});
+    EXPECT_TRUE(eager.launched());
+    EXPECT_FALSE(eager.recorded());
+    lane.close();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, CallerRecordedSubmissionFinishesWithoutExecutionAcceptance) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_streams(worker);
+    int caller;
+    ChipRunLane lane(worker);
+    g_launch_rc[0] = SIMPLER_NATIVE_RUN_RECORDED;
+    ChipRun run = lane.submit(1, host_args(), CallConfig{}, nullptr, 0, &caller);
+    EXPECT_TRUE(run.recorded());
+    EXPECT_FALSE(run.launched());
+    EXPECT_TRUE(run.done());
+    EXPECT_FALSE(g_complete[0]);
+    EXPECT_EQ(g_events, (Events{"prepare0", "launch0", "finalize0"}));
+    EXPECT_FALSE(lane.poisoned());
+    // Host finalization makes the slot reusable, without claiming that a replay
+    // has happened or converting this run into an eager predecessor.
+    g_launch_rc[0] = 0;
+    ChipRun eager = lane.submit(1, host_args(), CallConfig{}, nullptr, 0, &caller);
+    EXPECT_TRUE(eager.launched());
+    EXPECT_FALSE(eager.recorded());
+    lane.close();
+}
+
+TEST(ChipRunLaneJoinedLaunchTest, CallerPrepareRefusalKeepsLaneRetryable) {
+    ChipWorker worker;
+    prime_worker(worker);
+    prime_caller_streams(worker);
+    ChipRunLane lane(worker);
+    int caller;
+    worker.prepare_run_fn_ = [](void *, void *runtime, int32_t, const void *, const CallConfig *,
+                                const NativeRunDescriptor *descriptor) -> int {
+        EXPECT_NE(descriptor->caller_stream, nullptr);
+        publish_released_preparation(runtime, descriptor->run_epoch);
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    };
+    EXPECT_THROW(lane.submit(1, host_args(), CallConfig{}, nullptr, 0, &caller), RunPreparationRefused);
+    EXPECT_FALSE(lane.poisoned());
+    EXPECT_TRUE(g_caller_streams.empty());
+    worker.prepare_run_fn_ = prepare_run;
+    ChipRun retry = lane.submit(1, host_args(), CallConfig{}, nullptr, 0, &caller);
+    EXPECT_TRUE(retry.launched());
+    lane.close();
+}
+
 TEST(ChipRunLaneJoinedLaunchTest, CallerSubmitWaitsForDepthOnePredecessorBeforeReturning) {
     ChipWorker worker;
     prime_worker(worker, 1);

@@ -62,6 +62,16 @@ public:
         return runner.run_fence(pipeline_slot);
     }
 
+    // This fixture observes the existing fork event, without queuing a new
+    // task or waiting for either kernel's completion. It proves common reset
+    // has finished before the probe interprets an unstamped Core report.
+    static int wait_preparation(DeviceRunnerBase &runner, const PreparedExecution &prepared, int timeout_ms) {
+        auto &order = *runner.caller_orders_[prepared.pipeline_slot];
+        std::lock_guard<std::mutex> lock(order.mutex_);
+        if (!order.owns(prepared.identity) || !order.submitted_) return PTO_RUNTIME_ERR_INVALID_STATE;
+        return order.ops_.wait(order.events_[RunCallerOrder::Fork], timeout_ms);
+    }
+
     /** The bounded whole-pair synchronize `wait_run_fence` falls back to. */
     static int sync_streams(DeviceRunnerBase &runner, rtStream_t aicpu, rtStream_t aicore) {
         return runner.sync_stream_pair(aicpu, aicore);

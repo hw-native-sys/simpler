@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -159,6 +160,24 @@ public:
             borrows_[identity] = std::move(taken);
         }
         return all_resolved;
+    }
+
+    /**
+     * Snapshot a run's known caller allocations for a captured graph. The token
+     * owns host references only: retain it before recording and release it only
+     * after graph destruction and drain. Slot reuse cannot replace this snapshot.
+     * Unknown external spans remain the caller's lifetime responsibility.
+     */
+    std::shared_ptr<void> retain_capture(uint64_t identity) {
+        auto token = std::make_shared<CaptureBorrow>(this);
+        std::scoped_lock lk(mu_);
+        std::vector<uint64_t> taken;
+        const auto borrowed = borrows_.find(identity);
+        if (borrowed != borrows_.end()) taken = borrowed->second;
+        const auto written = writes_.find(identity);
+        if (written != writes_.end()) taken.insert(taken.end(), written->second.begin(), written->second.end());
+        capture_borrows_.emplace(token.get(), std::move(taken));
+        return token;
     }
 
     /**
@@ -380,9 +399,24 @@ private:
         if (entry != allocations_.end()) entry->second.write_unproven = true;
     }
 
+    struct CaptureBorrow {
+        explicit CaptureBorrow(CallerDeviceBuffers *owner_in) :
+            owner(owner_in) {}
+        ~CaptureBorrow() {
+            std::scoped_lock lk(owner->mu_);
+            owner->capture_borrows_.erase(this);
+        }
+        CallerDeviceBuffers *owner;
+    };
+
     bool borrowed_locked(uint64_t base) const {
         const auto entry = allocations_.find(base);
         if (entry != allocations_.end() && entry->second.release_refused) return true;
+        for (const auto &[token, held] : capture_borrows_) {
+            (void)token;
+            for (const uint64_t one : held)
+                if (one == base) return true;
+        }
         for (const auto &[identity, held] : borrows_) {
             (void)identity;
             for (const uint64_t one : held) {
@@ -395,6 +429,7 @@ private:
     mutable std::mutex mu_;
     std::unordered_map<uint64_t, Entry> allocations_;
     std::unordered_map<uint64_t, std::vector<uint64_t>> borrows_;
+    std::unordered_map<const void *, std::vector<uint64_t>> capture_borrows_;
     // Which allocations each run has said it produces. Separate from `borrows_` because the two
     // answer different questions and are established at different moments: the borrow at
     // admission, the declaration at that run's own bind.

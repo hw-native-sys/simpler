@@ -69,6 +69,10 @@ struct PlatformEntryArgs {
     uint32_t graph_offset{0};
     uint32_t graph_bytes{0};
     uint32_t graph_source{static_cast<uint32_t>(GraphSectionSource::None)};
+    // Capture publication resets reports before the common stream fork.
+    bool unstamped_reports{false};
+    // Fixed before the fork; nonzero requests the ordinary empty shutdown path.
+    int32_t dispatch_error{0};
 };
 
 /**

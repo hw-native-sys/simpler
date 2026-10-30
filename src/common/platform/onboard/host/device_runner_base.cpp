@@ -20,6 +20,7 @@
  */
 
 #include "device_runner_base.h"
+#include "common/native_execution_control.h"
 
 #include "run_resource_arena.h"
 
@@ -280,10 +281,14 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
         // Backend exceptions carry no proof that the device saw no submission.
         transaction.rc = PTO_RUNTIME_ERR_INTERNAL;
         transaction.progress = LaunchProgress::Partial;
+        transaction.recording_attempted = outcome.prepared->capture_model != nullptr;
     }
     outcome.rc = transaction.rc;
     outcome.progress = transaction.progress;
     outcome.receipt = std::move(transaction.receipt);
+    outcome.recording_receipt = transaction.recording_receipt;
+    outcome.recording_attempted = transaction.recording_attempted;
+    if (transaction.recording_attempted) return outcome;
     if (transaction.progress == LaunchProgress::NotStarted) {
         withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
     } else {
@@ -349,13 +354,13 @@ DeviceRunnerBase::RunResourceStaging DeviceRunnerBase::build_run_resources(size_
     for (std::unique_ptr<ArenaBank> &bank : staged.arena_banks) {
         bank = std::make_unique<ArenaBank>(&arena_alloc_trampoline, &arena_free_trampoline, this);
     }
-    staged.run_fences = RunResourceSlots<std::unique_ptr<RunCompletionFence>>::build(granted);
-    for (std::unique_ptr<RunCompletionFence> &fence : staged.run_fences) {
-        fence = std::make_unique<RunCompletionFence>(make_acl_event_ops());
+    staged.run_fences = RunResourceSlots<std::shared_ptr<RunCompletionFence>>::build(granted);
+    for (std::shared_ptr<RunCompletionFence> &fence : staged.run_fences) {
+        fence = std::make_shared<RunCompletionFence>(make_acl_event_ops());
     }
-    staged.caller_orders = RunResourceSlots<std::unique_ptr<RunCallerOrder>>::build(granted);
-    for (std::unique_ptr<RunCallerOrder> &order : staged.caller_orders) {
-        order = std::make_unique<RunCallerOrder>(
+    staged.caller_orders = RunResourceSlots<std::shared_ptr<RunCallerOrder>>::build(granted);
+    for (std::shared_ptr<RunCallerOrder> &order : staged.caller_orders) {
+        order = std::make_shared<RunCallerOrder>(
             make_acl_event_ops(),
             [](void *stream, void *event) {
                 return static_cast<int>(aclrtStreamWaitEvent(stream, event));
@@ -419,6 +424,7 @@ void DeviceRunnerBase::commit_run_resources(size_t granted, RunResourceStaging &
 bool DeviceRunnerBase::set_run_resource_grant(size_t granted) {
     if (granted == 0) return false;
     if (granted == granted_run_resource_sets_) return true;
+    if (captured_resources_live()) return false;
     // Anything already committed belongs to a set at its current index, and a
     // run's lease names its set by that index, so the grant is settled before
     // the first run and never while one is in flight. Each owner that can answer
@@ -893,11 +899,11 @@ int DeviceRunnerBase::reference_bank_arenas(
             workspace_.note_published(region, owned);
             continue;
         }
-        // `reference` returns one bool for four conditions, so the refusal
+        // `reference` returns one bool for several conditions, so the refusal
         // names which one from state this class can already read. Without it a
         // refusal here says only that the region has a block the ledger will
         // not hand back, and not why.
-        const char *why = "its reference slots are full";
+        const char *why = "capture references forbid reuse or its run reference slots are full";
         if (!workspace_.owns(owned)) {
             why = "the ledger no longer holds it";
         } else if (workspace_.block_state(owned) == WorkspaceManager::BlockState::Quarantined) {
@@ -1038,22 +1044,23 @@ int DeviceRunnerBase::acquire_retained_temp(
     *addr_out = retained_temp_addrs_[pipeline_slot];
     *size_out = retained_temp_sizes_[pipeline_slot];
     if (bytes == 0 || bytes <= retained_temp_sizes_[pipeline_slot]) {
-        // A request the retained block already covers allocates nothing, but
-        // this run is about to write and read it, so it registers as a consumer
-        // anyway — otherwise a later growth would find no reference and treat
-        // those bytes as free to overwrite.
-        if (bytes != 0 && workspace_.enabled() && *addr_out != nullptr) {
-            if (!workspace_.reference(*addr_out, g_workspace_plan.epoch)) {
-                LOG_ERROR(
-                    "acquire_retained_temp: slot %u could not register this run as a consumer of %p", pipeline_slot,
-                    *addr_out
-                );
-                return PTO_RUNTIME_ERR_INTERNAL;
-            }
+        if (bytes == 0 || !workspace_.enabled() || *addr_out == nullptr) return 0;
+        // Capacity reuse still registers the run before it can write. A captured
+        // generation instead takes the existing managed replacement path below.
+        if (workspace_.reference(*addr_out, g_workspace_plan.epoch)) {
             auto_admission_.note_input_staging_held(pipeline_slot);
+            return 0;
         }
-        return 0;
+        if (!workspace_.capture_blocks_reuse(*addr_out, g_workspace_plan.epoch)) {
+            LOG_ERROR(
+                "acquire_retained_temp: slot %u could not register this run as a consumer of %p", pipeline_slot,
+                *addr_out
+            );
+            return PTO_RUNTIME_ERR_INTERNAL;
+        }
     }
+
+    if (slot_persistent_args_[pipeline_slot].capture_preparing) return PTO_RUNTIME_ERR_UNSUPPORTED;
 
     if (!workspace_.enabled()) {
         // Unmanaged: the sequence RetainedTempBump used to run itself — release
@@ -1409,6 +1416,13 @@ bool DeviceRunnerBase::lookup_prebuilt_runtime_arena_cache(
     // The cache holds one entry and its bases point into bank 0, so any other
     // bank must rebuild rather than be handed a region it does not own.
     if (arena_bank != 0) return false;
+    // A cache hit must not bypass the existing replacement transaction when
+    // another owner still protects the captured generation's contents.
+    if (workspace_.has_capture_references()) {
+        for (size_t region = 0; region < 3; ++region)
+            if (workspace_.capture_blocks_reuse(arena_region_backing(arena_bank, region), g_workspace_plan.epoch))
+                return false;
+    }
     return prebuilt_runtime_arena_cache_.lookup(
         hash, key_data, key_size, gm_heap_base, sm_base, runtime_arena_base, runtime_off, image_data, image_size
     );
@@ -1473,6 +1487,11 @@ int DeviceRunnerBase::setup_static_arena(
          &announce, region_gave_up, &announce},
     };
     constexpr size_t kRegionCount = sizeof(requests) / sizeof(requests[0]);
+    if (workspace_.has_capture_references()) {
+        for (auto &request : requests)
+            request.backing_reusable =
+                !workspace_.capture_blocks_reuse(request.arena->raw_backing(), g_workspace_plan.epoch);
+    }
     // What this call would have to replace, decided before anything is staged.
     // A bank every region already covers costs nothing and needs no growth
     // permission, which is what keeps a steady workload — and every reuse of an
@@ -1481,6 +1500,9 @@ int DeviceRunnerBase::setup_static_arena(
     for (size_t i = 0; i < kRegionCount; ++i) {
         if (arena_region_action(requests[i]) == ArenaRegionAction::Replace) needs_growth = true;
     }
+    if (needs_growth && g_workspace_plan.epoch != 0 &&
+        slot_persistent_args_[g_workspace_plan.pipeline_slot].capture_preparing)
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     if (needs_growth && auto_admission_.enabled()) {
         const int permission = claim_growth_permission(
             g_workspace_plan.pipeline_slot, g_workspace_plan.epoch, AutoAdmissionState::Phase::Committing
@@ -1652,6 +1674,7 @@ int DeviceRunnerBase::validate_current_context() const {
 }
 
 int DeviceRunnerBase::finalize() {
+    if (captured_resources_live() || workspace_capture_references_live()) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (device_id_ == -1) return 0;
     const int rc = validate_current_context();
     if (rc != 0) return rc;
@@ -1789,7 +1812,10 @@ int DeviceRunnerBase::ensure_device_initialized() {
     return ensure_dma_workspace_warmed();
 }
 
-int DeviceRunnerBase::init_kernel_context(int device_id) {
+extern "C" __attribute__((weak)) int runtime_native_capture_supported_impl() { return 0; }
+__attribute__((weak)) int DeviceRunnerBase::configure_hbg_kernel_events() { return 0; }
+
+int DeviceRunnerBase::init_kernel_context(int device_id, uint64_t context_generation) {
     int rc = adopt_borrowed_device(device_id);
     if (rc != 0) return rc;
 
@@ -1799,7 +1825,9 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
     clear_staged_workspace();
     if (rc != 0) return rc;
 
-    rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops());
+    rc = configure_hbg_kernel_events();
+    if (rc != 0) return rc;
+    rc = kernel_exec_state_.initialize(device_id_, make_onboard_kernel_context_ops(), context_generation);
     if (rc != 0) {
         LOG_ERROR("init_kernel_context: context stream/event creation failed: %d", rc);
         return rc;
@@ -1824,7 +1852,9 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
     // The async-DMA workspace is program mode's SDMA channel; kernel mode
     // provisions none, so this launch publishes the all-zero addresses that
     // mean "that engine is unavailable".
-    return ensure_aicpu_init_launched(control_stream);
+    rc = ensure_aicpu_init_launched(control_stream);
+    if (rc != 0) return rc;
+    return 0;
 }
 
 PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
@@ -1845,16 +1875,9 @@ PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
     return ops;
 }
 
-int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
-    rtStream_t control_stream = static_cast<rtStream_t>(kernel_exec_state_.hidden_stream(KernelStreamKind::Aicpu));
-    if (control_stream == nullptr) {
-        LOG_ERROR("prepare_kernel_callable: no live kernel context");
-        return PTO_RUNTIME_ERR_INVALID_STATE;
-    }
-
-    int rc = register_callable_on_device(callable_id, control_stream);
-    if (rc != 0) return rc;
-
+int DeviceRunnerBase::prepare_kernel_callable_after_registration(int32_t callable_id) {
+    // Runs after the runtime's device registration of this callable, for the
+    // runtimes whose kernel invocation needs persistent arguments staged.
     // Idempotent: only the first prepared callable allocates. The uploaded
     // Runtime keeps its per-callable and per-invocation fields at the sentinels
     // Runtime() sets, because no callable is bound into this image: a launch
@@ -1866,7 +1889,8 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
     // the init entry validates declares depth 2, which nothing consumes — the
     // number is the contract's, not this owner's, and one set is what a context
     // admitting a single invocation at a time needs.
-    rc = persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
+    const int rc =
+        persistent_args_.prepare_once(kernel_runtime_, persistent_args_ops(), static_cast<uint64_t>(device_id_));
     if (rc != 0) return rc;
 
     return kernel_exec_state_.mark_ready_enqueued();
@@ -1968,7 +1992,7 @@ int DeviceRunnerBase::ensure_binaries_loaded(rtStream_t control_stream) {
     // JSON-register the inner SO and resolve its runtime entry handles. The
     // runtime reports any AICPU entries it exports beyond the base set so the
     // loader stays runtime-agnostic.
-    std::vector<std::string> extra_symbols;
+    std::vector<std::string> extra_symbols{"simpler_aicpu_prepare_execution"};
     size_t extra_count = 0;
     const char *const *extra = runtime_extra_aicpu_symbols(&extra_count);
     for (size_t i = 0; i < extra_count && extra != nullptr; ++i) {
@@ -2523,6 +2547,7 @@ int DeviceRunnerBase::record_host_orch_callable(
 int DeviceRunnerBase::unregister_callable(int32_t callable_id) {
     // Native reservation release is not a device-completion proof.
     if (!can_accept_run()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (captured_callable_live(callable_id)) return PTO_RUNTIME_ERR_INVALID_STATE;
     const int context_rc = validate_current_context();
     if (context_rc != 0) return context_rc;
     auto it = callables_.find(callable_id);
@@ -2764,10 +2789,7 @@ extern "C" int bind_callable_to_runtime_impl(
     const uint64_t *ring_dep_pool
 );
 
-int DeviceRunnerBase::bind_callable_to_runtime(
-    Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
-    const uint64_t *ring_heap, const uint64_t *ring_dep_pool
-) {
+int DeviceRunnerBase::bind_registered_callable_tables(Runtime &runtime, int32_t callable_id) {
     // Clear before anything else, including before the registry lookup: an id
     // that is gone is exactly the case where the reference still standing names
     // a block `unregister_callable` already freed, and the scheduler
@@ -2800,6 +2822,16 @@ int DeviceRunnerBase::bind_callable_to_runtime(
     // descriptor itself was delivered at register time via RegisterCallableArgs.
     runtime.set_active_callable_id(callable_id);
 
+    return 0;
+}
+
+int DeviceRunnerBase::bind_callable_to_runtime(
+    Runtime &runtime, int32_t callable_id, const HostApi *api, const void *orch_args, const uint64_t *ring_task_window,
+    const uint64_t *ring_heap, const uint64_t *ring_dep_pool
+) {
+    int rc = bind_registered_callable_tables(runtime, callable_id);
+    if (rc != 0) return rc;
+    const auto &state = callables_.at(callable_id);
     // Per-run binding (tensor args, GM heap, SM alloc). host_orch_func_ptr is
     // non-null only on the hbg path; signature is the cached ChipCallable
     // signature_[], plumbed end-to-end for per-tensor H2D/D2H direction
@@ -2898,6 +2930,7 @@ int DeviceRunnerBase::finalize_common() { return finalize_common_impl(false); }
 int DeviceRunnerBase::abandon_common_after_device_failure() { return finalize_common_impl(true); }
 
 int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
+    if (captured_resources_live()) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (!abandon_device_resources) {
         if (execution_mode_latch().is_kernel()) {
             const int rc = kernel_exec_state_.begin_close();
@@ -3151,6 +3184,21 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     device_run_results_.fill(DeviceRunResultRegion{});
     device_run_result_initialized_.fill(false);
     device_run_result_reads_.reset();
+    if (native_execution_first_error_ != nullptr) {
+        if (abandon_device_resources) {
+            native_execution_first_error_ = nullptr;
+        } else {
+            const int free_rc = mem_alloc_.free(native_execution_first_error_);
+            capture(free_rc);
+            const bool retryable = execution_mode_latch().is_kernel();
+            if (free_rc == 0 || !retryable) native_execution_first_error_ = nullptr;
+            // Borrowed Kernel contexts retain the explicit owner for retry.
+            // Program teardown delegates a failed release to the allocator's
+            // terminal sweep and device reset, so its alias must not survive.
+            kernel_cleanup_failed = kernel_cleanup_failed || (retryable && free_rc != 0);
+        }
+    }
+    if (native_execution_first_error_ == nullptr) native_execution_first_error_initialized_ = false;
 
     // The AICore register-address tables are device constants committed once per
     // device context, so this is where they are returned — same window and same
@@ -3420,7 +3468,20 @@ int DeviceRunnerBase::ensure_device_run_result_region(
         LOG_ERROR("run-result region: run epoch 0 cannot be published");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
+    if (!native_execution_first_error_initialized_) {
+        if (slot_persistent_args_[pipeline_slot].capture_preparing) return PTO_RUNTIME_ERR_UNSUPPORTED;
+        if (native_execution_first_error_ == nullptr)
+            native_execution_first_error_ = allocate_tensor(sizeof(NativeExecutionFirstError));
+        if (native_execution_first_error_ == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+        const int init_rc = aclrtMemset(
+            native_execution_first_error_, sizeof(NativeExecutionFirstError), 0, sizeof(NativeExecutionFirstError)
+        );
+        if (init_rc != 0) return init_rc;
+        native_execution_first_error_initialized_ = true;
+    }
     void *&slot_ptr = device_run_result_dev_ptrs_[pipeline_slot];
+    if (slot_ptr == nullptr && slot_persistent_args_[pipeline_slot].capture_preparing)
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     if (slot_ptr == nullptr) {
         slot_ptr = allocate_tensor(device_run_result_bytes());
         device_run_result_initialized_[pipeline_slot] = false;
@@ -3544,6 +3605,8 @@ int DeviceRunnerBase::ensure_device_wall_buffer(uint32_t pipeline_slot, KernelAr
     using BufferImage = DevicePhaseBufferStorage<kThreads>;
     static_assert(sizeof(BufferImage) == device_phase_buffer_bytes(kThreads), "device-phase buffer layout drift");
     void *&slot_ptr = device_wall_dev_ptrs_[pipeline_slot];
+    if (slot_ptr == nullptr && slot_persistent_args_[pipeline_slot].capture_preparing)
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     if (slot_ptr == nullptr) slot_ptr = allocate_tensor(sizeof(BufferImage));
     if (slot_ptr == nullptr) return 0;
     static const BufferImage init = [] {
@@ -3658,14 +3721,164 @@ DeviceRunnerBase::RunStreams DeviceRunnerBase::borrowed_run_streams() const {
     };
 }
 
+int DeviceRunnerBase::reserve_native_capture_resources(uint32_t slot, uint32_t bank, void *caller) {
+    if (!execution_mode_latch_.is_kernel() || !supports_native_capture()) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    if (native_runs_outstanding() || !slot_persistent_args_.holds(slot) || !arena_banks_.holds(bank) ||
+        caller == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI model = nullptr;
+    int rc = aclmdlRICaptureGetInfo(caller, &status, &model);
+    if (rc != 0) return rc;
+    if (status != ACL_MODEL_RI_CAPTURE_STATUS_NONE || !native_recording_caller_matches(caller))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    auto &args = slot_persistent_args_[slot];
+    if (args.runtime_args == nullptr || args.eager_upload_bytes == 0 ||
+        (args.retained_runtime_args && args.retained_runtime_args.use_count() > 1))
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    args.capture_resources_reserved = false;
+    // Graph retirement can make superseded backing reclaimable. Settle it at
+    // this proven outside-capture boundary, before granting recording readiness.
+    rc = reclaim_workspace_obsolete();
+    if (rc != 0) return rc;
+    for (size_t region = 0; region < 3; ++region) {
+        void *backing = arena_region_backing(bank, region);
+        if (backing != nullptr && workspace_.capture_blocks_reuse(backing, 0)) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    }
+    if (retained_temp_addrs_[slot] != nullptr && workspace_.capture_blocks_reuse(retained_temp_addrs_[slot], 0))
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    // The arena contains the complete execution image. This conservative bound
+    // includes its used prefix without retaining a reusable prepared call.
+    const uint64_t image_bytes = arena_banks_[bank]->cached_runtime_arena_size;
+    if (image_bytes == 0 || image_bytes > UINT64_MAX - args.eager_upload_bytes) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    rc = args.runtime_upload.reserve(args.eager_upload_bytes + image_bytes);
+    if (rc != 0) return rc;
+    rc = prepare_native_resource_reuse(slot);
+    if (rc != 0) return rc;
+    rc = reserve_native_capture_streams();
+    if (rc != 0) return rc;
+    rc = run_fences_[slot]->reserve_events();
+    if (rc != 0) return rc;
+    rc = caller_orders_[slot]->reserve_events();
+    if (rc == 0) args.capture_resources_reserved = true;
+    return rc;
+}
+
+int DeviceRunnerBase::prepare_native_resource_reuse(uint32_t slot) {
+    if (!run_fences_.holds(slot)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (run_fences_[slot].use_count() == 1 && caller_orders_[slot].use_count() == 1) return 0;
+    auto fence = std::make_shared<RunCompletionFence>(make_acl_event_ops());
+    auto order = std::make_shared<RunCallerOrder>(
+        make_acl_event_ops(),
+        [](void *stream, void *event) {
+            return static_cast<int>(aclrtStreamWaitEvent(stream, event));
+        },
+        [](void *stream, int timeout) {
+            return static_cast<int>(aclrtSynchronizeStreamWithTimeout(stream, timeout));
+        }
+    );
+    run_fences_[slot] = std::move(fence);
+    caller_orders_[slot] = std::move(order);
+    return 0;
+}
+
+int DeviceRunnerBase::retain_native_run_resources(
+    void *model, void *caller, uint32_t slot, uint32_t bank, int32_t callable_id
+) {
+    if (!slot_persistent_args_.holds(slot) || !arena_banks_.holds(bank)) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    if (captured_resources_live() && !captured_graph_resources_.has_streams()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    auto &args = slot_persistent_args_[slot];
+    auto descriptor = args.retain_runtime_args(mem_alloc_);
+    auto source = args.runtime_upload.retain();
+    if (!descriptor || !source) return PTO_RUNTIME_ERR_INVALID_STATE;
+    std::vector<void *> blocks;
+    for (size_t region = 0; region < 3; ++region) {
+        void *base = arena_region_backing(bank, region);
+        if (base != nullptr) blocks.push_back(base);
+    }
+    if (retained_temp_addrs_[slot] != nullptr) blocks.push_back(retained_temp_addrs_[slot]);
+    auto fence = run_fences_[slot];
+    auto order = caller_orders_[slot];
+    // The lane's slot identity is reusable; the graph gets its own snapshot
+    // before any command can retain a pointer to a caller allocation.
+    auto caller_buffers = caller_device_buffers_.retain_capture(static_cast<uint64_t>(slot) + 1);
+    return captured_graph_resources_.retain(
+        model, {caller_buffers},
+        [](void *graph, void (*notify)(void *), void *data) {
+            return static_cast<int>(aclmdlRIDestroyRegisterCallback(graph, notify, data));
+        },
+        blocks.empty() ? nullptr : &workspace_, blocks,
+        {{descriptor,
+          [](void *data) {
+              return static_cast<RetainedRuntimeArgs *>(data)->release();
+          }},
+         {source,
+          [](void *data) {
+              return static_cast<PinnedUploadStorage *>(data)->release();
+          }},
+         {order,
+          [](void *data) {
+              return static_cast<RunCallerOrder *>(data)->release_after_graph_drain();
+          }},
+         {fence,
+          [](void *data) {
+              return static_cast<RunCompletionFence *>(data)->release();
+          }}},
+        {caller}, {callable_id}
+    );
+}
+
+int DeviceRunnerBase::retain_recording_resources(PreparedExecution &prepared, uint32_t bank) {
+    if (prepared.runtime == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    int rc = retain_native_run_resources(
+        prepared.capture_model, prepared.caller_stream, prepared.pipeline_slot, bank,
+        prepared.runtime->get_active_callable_id()
+    );
+    if (rc != 0) return rc;
+    const auto stream_generation = pin_capture_stream_generation();
+    if (stream_generation) {
+        rc = captured_graph_resources_.retain(
+            prepared.capture_model, {stream_generation}, [](void *model, void (*notify)(void *), void *data) {
+                return static_cast<int>(aclmdlRIDestroyRegisterCallback(model, notify, data));
+            }
+        );
+        if (rc != 0) return rc;
+    }
+    native_recording_caller_.store(prepared.caller_stream, std::memory_order_release);
+    rc = captured_graph_resources_.retain(
+        prepared.capture_model, {},
+        [](void *model, void (*notify)(void *), void *data) {
+            return static_cast<int>(aclmdlRIDestroyRegisterCallback(model, notify, data));
+        },
+        nullptr, {}, {}, {prepared.streams.aicpu, prepared.streams.aicore}
+    );
+    if (rc != 0) return rc;
+    rc = caller_orders_[prepared.pipeline_slot]->mark_captured(prepared.identity);
+    if (rc == 0) prepared.capture_resources_retained = true;
+    return rc;
+}
+
+int DeviceRunnerBase::retire_native_graph_resources() {
+    if (native_runs_outstanding()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (captured_resources_live() && !captured_graph_resources_.has_streams()) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int rc = captured_graph_resources_.drain_and_retire([this](void *stream) {
+        return static_cast<int>(aclrtSynchronizeStreamWithTimeout(stream, timeout_config_.stream_sync_timeout_ms));
+    });
+    if (rc == 0) native_recording_caller_.store(nullptr, std::memory_order_release);
+    return rc;
+}
+
 int DeviceRunnerBase::validate_caller_stream(rtStream_t caller) {
-    if (caller == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (caller == nullptr || !native_recording_caller_matches(caller)) return PTO_RUNTIME_ERR_INVALID_STATE;
     int rc = enter_run_thread();
     if (rc != 0) return rc;
     aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     aclmdlRI model = nullptr;
     rc = aclmdlRICaptureGetInfo(caller, &status, &model);
     if (rc != 0) return rc;
+    if (status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE && model != nullptr && execution_mode_latch_.is_kernel() &&
+        supports_native_capture())
+        return 0;
     if (status != ACL_MODEL_RI_CAPTURE_STATUS_NONE) return PTO_RUNTIME_ERR_UNSUPPORTED;
     return 0;
 }
@@ -3679,8 +3892,33 @@ int DeviceRunnerBase::queue_run_entry(PreparedExecution &prepared, LaunchProgres
         if (rc == 0 && prepared.kernel_args.args.device_wall_data_base != 0) {
             device_timing_armed_[prepared.pipeline_slot] = true;
         }
-        return rc;
+        return rc == 0 ? queue_execution_preparation(prepared, sink) : rc;
     });
+}
+
+int DeviceRunnerBase::queue_execution_preparation(PreparedExecution &prepared, LaunchProgressSink &sink) {
+    const auto &args = prepared.kernel_args.args;
+    if (args.execution_control == 0) return 0;
+    if (!native_execution_first_error_initialized_ || args.run_result_data_base == 0 || args.run_result_epoch == 0)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int count = prepared.runtime->get_aicpu_launch_count() > 0 ? prepared.runtime->get_aicpu_launch_count() :
+                                                                       prepared.launch_aicpu_num;
+    if (count <= 0 || prepared.runtime->get_worker_count() <= 0) return PTO_RUNTIME_ERR_INVALID_STATE;
+    NativeExecutionPrepareArgs preparation{
+        args.execution_control,
+        reinterpret_cast<uint64_t>(args.runtime_args),
+        args.run_result_data_base,
+        args.run_result_epoch,
+        reinterpret_cast<uint64_t>(native_execution_first_error_),
+        static_cast<uint32_t>(count),
+        static_cast<uint32_t>(prepared.runtime->get_worker_count())
+    };
+    // Publication and this command precede the same fork. The previous run's
+    // CPU stream tail joins its Core before any successor can reach this point.
+    sink.mark_submitted();
+    return launch_aicpu_payload(
+        prepared.streams.aicpu, &preparation, sizeof(preparation), "simpler_aicpu_prepare_execution", 1
+    );
 }
 
 int DeviceRunnerBase::queue_caller_exit(const PreparedExecution &prepared) {
@@ -3689,13 +3927,14 @@ int DeviceRunnerBase::queue_caller_exit(const PreparedExecution &prepared) {
 }
 
 int DeviceRunnerBase::arm_run_fence(const PreparedExecution &prepared) {
-    int rc = run_fence(prepared.pipeline_slot).arm(prepared.identity);
+    int rc = run_fence(prepared.pipeline_slot).arm(prepared.identity, prepared.capture_model == nullptr);
     if (rc != 0) {
         LOG_ERROR("arm_run_fence: slot %u could not take a completion fence: %d", prepared.pipeline_slot, rc);
     }
     if (rc == 0) {
         rc = caller_orders_[prepared.pipeline_slot]->arm(
-            prepared.identity, prepared.caller_stream, prepared.streams.aicpu, prepared.streams.aicore
+            prepared.identity, prepared.caller_stream, prepared.streams.aicpu, prepared.streams.aicore,
+            prepared.capture_model == nullptr
         );
     }
     return rc;
@@ -5153,6 +5392,9 @@ bool DeviceRunnerBase::try_reserve_native_run(
         return false;
     }
     std::lock_guard<std::mutex> lk(native_run_mu_);
+    // Retirement publishes this gate before checking outstanding reservations.
+    // Program-mode preparation observes it under the same reservation lock.
+    if (registry_callbacks_refuse_.load(std::memory_order_acquire)) return false;
 
     size_t occupied = 0;
     bool every_existing_admits_successor = true;

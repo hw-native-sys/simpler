@@ -106,6 +106,10 @@ public:
         std::unique_ptr<PreparedExecution> *prepared
     ) override;
     void abandon_prepared_execution(PreparedExecution &prepared) noexcept override;
+    bool supports_native_capture() const override { return runtime_native_capture_supported_impl() != 0; }
+    int reserve_native_capture_streams() override { return ensure_run_streams(); }
+    LaunchTransactionResult record_native_run(PreparedExecution &prepared, LaunchPermit permit);
+
     int poll_execution(const ActiveExecution &active) override;
     DrainOutcome drain_execution(ActiveExecution &active) override;
     bool can_accept_run() const override { return !device_unusable_.load(std::memory_order_acquire); }
@@ -113,6 +117,9 @@ public:
     // owns no stream, so there is nothing for a prepared run to provision or
     // hand back. launch_run() readies the pair under the execution claim.
     void mark_run_streams_stale() override { run_streams_.mark_stale(); }
+    std::shared_ptr<void> pin_capture_stream_generation() const override {
+        return run_streams_.pin_aicore_generation();
+    }
 
     // A joining run shares the pair with the run it is ordered behind, which is
     // possible only while the pair needs no AICore replacement: the predecessor
@@ -164,6 +171,7 @@ public:
      * address is a query result and owns nothing.
      */
     int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) override;
+    int configure_kernel_affinity(Runtime &runtime) override;
 
     /**
      * Fill `InitArgs.l2_cache_offset` from the driver's per-device report.

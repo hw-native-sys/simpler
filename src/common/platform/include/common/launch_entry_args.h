@@ -35,6 +35,7 @@ enum class EntryArgsSource : uint32_t {
     Descriptor = 0,        // inside the published Runtime descriptor
     LaunchEnvelope = 1,    // appended to the AICPU launch arguments, copied by RTS
     KernelInvocation = 2,  // validated kernel packet in the RTS launch package
+    // Value 4 is reserved for the retired dedicated HBG packet transport.
 };
 
 /**
@@ -54,6 +55,7 @@ enum class GraphSectionSource : uint32_t {
     None = 0,            // this run submitted no Graph task
     LaunchEnvelope = 1,  // appended to the AICPU launch arguments, copied by RTS
     HostSnapshot = 2,    // a run-owned host snapshot, simulation only
+    // Value 3 is reserved for the retired dedicated HBG slot transport.
 };
 
 /**

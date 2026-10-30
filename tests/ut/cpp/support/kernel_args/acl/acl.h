@@ -11,6 +11,8 @@
 // Minimal RTS declarations for the CPU-only KernelArgsHelper tests.
 #pragma once
 
+#include <cstddef>
+
 extern "C" const char *aclGetRecentErrMsg();
 
 // The capture-status query the launch route's permit asks, and just enough of
@@ -29,3 +31,5 @@ typedef enum {
 } aclmdlRICaptureStatus;
 
 extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream stream, aclmdlRICaptureStatus *status, aclmdlRI *modelRI);
+
+extern "C" aclError aclrtMemset(void *dst, size_t capacity, int value, size_t count);

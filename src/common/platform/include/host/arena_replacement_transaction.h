@@ -87,6 +87,9 @@ struct ArenaRegionRequest {
     // arena's to free, which is every caller that keeps no ledger of its own.
     void (*disposition)(void *ctx, size_t region_index, ArenaRegionDisposition what, void *base){nullptr};
     void *disposition_ctx{nullptr};
+    // Capacity alone does not permit overwriting bytes still held by a capture.
+    // False takes the same replacement transaction as insufficient capacity.
+    bool backing_reusable{true};
 };
 
 enum class ArenaRegionAction {
@@ -111,7 +114,8 @@ inline ArenaRegionAction arena_region_action(const ArenaRegionRequest &request) 
         return (arena.is_committed() && *request.cached_size != 0) ? ArenaRegionAction::Release :
                                                                      ArenaRegionAction::Keep;
     }
-    if (arena.is_committed() && request.requested_size <= *request.cached_size) return ArenaRegionAction::Keep;
+    if (request.backing_reusable && arena.is_committed() && request.requested_size <= *request.cached_size)
+        return ArenaRegionAction::Keep;
     return ArenaRegionAction::Replace;
 }
 

@@ -849,11 +849,13 @@ set(NATIVE_ADMISSION_INCLUDES
     ${SIMPLER_COMMON_PLATFORM_DIR}/sim/sim_context
     ${SIMPLER_SRC}/common/log
     ${SIMPLER_SRC}/common/worker)
-hbg_case(test_native_admission.cpp
+hbg_case(test_native_admission.cpp TIMEOUT 30
     SOURCES ${NATIVE_ADMISSION_SOURCES}
         ${CMAKE_SOURCE_DIR}/support/native_admission/hbg_preparation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/test_native_admission_hbg.cpp
         ${SIMPLER_SRC}/@arch@/runtime/host_build_graph/host/runtime_maker.cpp
+        ${HBG_HOST_DIR}/bind_phase.cpp
+        ${HBG_HOST_DIR}/graph_build.cpp
         ${_hbg_orch_host_sources}
         ${HBG_HOST_DIR}/dep_gen_host_graph.cpp
         ${HBG_HOST_DIR}/host_phase_trace.cpp
@@ -862,7 +864,8 @@ hbg_case(test_native_admission.cpp
     INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
     DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
-tmr_case(test_native_admission.cpp
+
+tmr_case(test_native_admission.cpp TIMEOUT 30
     SOURCES ${NATIVE_ADMISSION_SOURCES}
         ${CMAKE_SOURCE_DIR}/support/native_admission/tmr_preparation.cpp
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/host/runtime_maker.cpp
@@ -894,6 +897,7 @@ simpler_ut_cases(platform_single_case
     test_arena_replacement_transaction.cpp
     test_auto_admission.cpp
     test_caller_device_buffers.cpp
+    test_captured_graph_resources.cpp
     test_context_lifecycle.cpp
     test_device_fault_monitor.cpp
     test_device_health_state.cpp
@@ -912,6 +916,7 @@ simpler_ut_cases(platform_single_case
     test_run_progress_slots.cpp
     test_run_shadow_consumer_evidence.cpp
     test_run_stream_pair.cpp
+    test_runtime_launch_metadata.cpp
     test_teardown_proof.cpp
     test_teardown_recorder.cpp
     test_worker_chip_orch_comm.cpp

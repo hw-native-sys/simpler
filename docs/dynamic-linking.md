@@ -320,9 +320,9 @@ ChipWorker.init(device_id, bins)                       # Python wrapper
            simpler_unregister_callable, get_pipeline_contract,
            supports_concurrent_native_prepare_ctx,
            get_arena_bank_gm_heap_base_ctx, get_retained_temp_addr_ctx,
-           finalize_device, simpler_kernel_mode_supported,
-           simpler_kernel_mode_init, simpler_kernel_mode_prepare_callable,
-           simpler_kernel_mode_launch
+           finalize_device, simpler_kernel_mode_init
+    dlsym optional native capture resource entries:
+           simpler_reserve_capture_resources, simpler_retire_capture_resources
     dlsym optional versioned registration entry; absence is a capability
            verdict, not a stale build:
            simpler_register_callable_v2

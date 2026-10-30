@@ -44,6 +44,11 @@
 #include "common/host_api.h"
 #include "common/launch_entry_args.h"
 #include "host_build_graph/host/graph_host_state.h"
+#include "host_build_graph/host_graph_build.h"
+#include "common/kernel_args.h"
+#include "aicpu/platform_aicpu_affinity.h"
+#include "aicpu/platform_entry_args.h"
+#include "host_build_graph/device/graph_image_source.h"
 #include "host_build_graph/host/dep_gen_host_graph.h"
 #include "host_build_graph/host/host_tensor_access.h"
 #include "host/raii_scope_guard.h"
@@ -1048,7 +1053,7 @@ TEST_F(HbgBindLedgerTest, TheDeviceImageCarriesNoHostOnlyBytes) {
     // prefix — so the exclusions below cover every byte that can cross, not
     // just the ones a steady-state run re-sends.
     std::vector<uint8_t> image(image_bytes);
-    std::memcpy(image.data(), &runtime, image_bytes);
+    std::memcpy(image.data(), &runtime.dev, image_bytes);
 
     auto contains = [&image](const void *needle, size_t bytes) {
         const auto *first = static_cast<const uint8_t *>(needle);
@@ -2774,3 +2779,52 @@ TEST_F(HbgBindLedgerTest, LaunchStagingLeavesOnlyTheLargeImageOnThePrepareCopyPa
     EXPECT_NE(publish_run_image_impl(&runtime, &api_), 0);
     EXPECT_EQ(fake_.copy_count, copies);
 }
+
+class HbgGraphPrepareCapacityTest : public HbgBindLedgerTest,
+                                    public ::testing::WithParamInterface<uint64_t> {};
+
+TEST_P(HbgGraphPrepareCapacityTest, CompletedGraphBuildMeasuresWithoutDeviceAllocationOrPublication) {
+    Runtime runtime;
+    init_runtime(runtime);
+    RuntimeContext context{};
+    HostTensorAccessor access;
+    hbg::GraphBuild build;
+    constexpr uint64_t capacity = 16;
+    const uint64_t sm_bytes = SharedMemoryHandle::calculate_size(capacity);
+    eps_ = {recording_orch_entry, capture_orch_bind};
+    ChipTaskArgs args;
+    const int status = hbg::build_graph(&runtime, &api_, access, &context, sm_bytes, capacity, &eps_, args, build);
+    ASSERT_GT(status, 0);
+    if (GetParam() != 0) {
+        // Queue capacity may exceed the live population of this invocation.
+        auto populations = build.ready_queue_populations;
+        populations.graph_prepare = GetParam();
+        ASSERT_TRUE(populations.derive_capacities(&build.ready_queue_capacities));
+    }
+    EXPECT_TRUE(build.build_complete);
+    EXPECT_EQ(build.total_tasks, status);
+    EXPECT_GT(build.heap_bytes, 0U);
+    EXPECT_GT(build.image_bytes, 0U);
+    ASSERT_EQ(build.definitions.objects.size(), 1U);
+    EXPECT_GT(build.definitions.bytes, 0U);
+    EXPECT_EQ(build.definitions.bindings.size(), 1U);
+    EXPECT_EQ(fake_.device_malloc_count, 0);
+    EXPECT_TRUE(fake_.gm_heap.empty());
+    EXPECT_TRUE(fake_.runtime_arena.empty());
+    EXPECT_EQ(fake_.copy_count, 0);
+    EXPECT_EQ(fake_.section_publications, 0U);
+    EXPECT_EQ(runtime.pending_publication().bytes, 0U);
+    EXPECT_EQ(runtime.get_graph_section_source(), GraphSectionSource::None);
+    EXPECT_EQ(g_orch_runtime, nullptr);
+    EXPECT_EQ(fake_.device_malloc_count, 0);
+    EXPECT_EQ(fake_.copy_count, 0);
+    EXPECT_EQ(
+        hbg::build_graph(&runtime, &api_, access, &context, sm_bytes, capacity, &eps_, args, build),
+        PTO_RUNTIME_ERR_INVALID_STATE
+    );
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    GraphPreparePopulation, HbgGraphPrepareCapacityTest,
+    ::testing::Values(uint64_t{0}, uint64_t{16384}, uint64_t{16385}, uint64_t{32768})
+);

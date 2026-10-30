@@ -30,9 +30,13 @@ a2a3_runtime_case(test_scheduler_retirement.cpp NO_OBJS
     LINK_OPTIONS ${_retirement_gc_link_option}
     TIMEOUT 20)
 target_sources(test_a2a3_tmr_scheduler_retirement PRIVATE
-    ${A2A3_RUNTIME_DIR}/shared/runtime.cpp)
+    ${A2A3_RUNTIME_DIR}/shared/runtime.cpp
+    ${SIMPLER_SRC}/common/platform/shared/aicpu/platform_entry_args.cpp
+    ${SIMPLER_SRC}/common/platform/sim/aicpu/platform_aicpu_affinity.cpp)
 target_sources(test_a2a3_hbg_scheduler_retirement PRIVATE
-    ${HBG_COMMON_SHARED_DIR}/runtime.cpp)
+    ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+    ${SIMPLER_SRC}/common/platform/shared/aicpu/platform_entry_args.cpp
+    ${SIMPLER_SRC}/common/platform/sim/aicpu/platform_aicpu_affinity.cpp)
 
 # NO_OBJS: this case compiles platform/shared/aicpu/platform_regs.cpp, and the
 # runtime object libraries carry support/platform_regs_stub.cpp, which defines the

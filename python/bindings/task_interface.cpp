@@ -3561,6 +3561,7 @@ NB_MODULE(_task_interface, m) {
         .def("activate", &ChipRun::activate)
         .def("abandon", &ChipRun::abandon, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("launched", &ChipRun::launched)
+        .def_prop_ro("recorded", &ChipRun::recorded)
         .def_prop_ro("lane_poisoned", &ChipRun::lane_poisoned)
         .def_prop_ro("preparation_disposition", &ChipRun::preparation_disposition)
         .def(
@@ -3694,6 +3695,18 @@ NB_MODULE(_task_interface, m) {
             "Equivalent to register_callable(callable_id, ChipCallable) but accepts the "
             "ChipCallable layout pointer directly so chip-child loops can prepare "
             "from shm without rebuilding a PyChipCallable wrapper."
+        )
+        .def(
+            "reserve_capture_resources",
+            [](ChipWorker &self, uintptr_t caller_stream) {
+                nb::gil_scoped_release release;
+                self.reserve_capture_resources(reinterpret_cast<void *>(caller_stream));
+            },
+            nb::arg("caller_stream"), "Reserve capture resources for the idle direct slot after a warm invocation."
+        )
+        .def(
+            "retire_capture_resources", &ChipWorker::retire_capture_resources, nb::call_guard<nb::gil_scoped_release>(),
+            "Drain and retire native capture resources after graph destruction."
         )
         .def(
             "run",

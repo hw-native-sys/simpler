@@ -78,6 +78,8 @@ public:
 
 private:
     friend class DeviceRunnerBase;
+    template <typename Record>
+    friend struct ExactRecordingTransaction;
     friend class NativeRunExecutionTestPeer;
     // #2267's retention probe launches a run that holds no C API execution
     // claim, so it mints its permit instead of receiving one.
@@ -135,6 +137,19 @@ private:
     bool valid_{false};
 };
 
+class RecordingReceipt {
+public:
+    bool matches(const NativeRunIdentity &identity, void *model) const {
+        return model != nullptr && model_ == model && identity_ == identity;
+    }
+
+private:
+    template <typename Record>
+    friend struct ExactRecordingTransaction;
+    NativeRunIdentity identity_{};
+    void *model_{nullptr};
+};
+
 enum class LaunchProgress : uint8_t {
     NotStarted,
     Partial,
@@ -166,8 +181,10 @@ struct LaunchTransactionResult {
     int rc{-1};
     LaunchProgress progress{LaunchProgress::NotStarted};
     LaunchReceipt receipt{};
+    RecordingReceipt recording_receipt{};
+    bool recording_attempted{false};
 
-    bool poisoned() const { return progress == LaunchProgress::Partial; }
+    bool poisoned() const { return !recording_attempted && progress == LaunchProgress::Partial; }
 };
 
 /**
@@ -261,4 +278,35 @@ LaunchTransactionResult exact_launch_transaction(
     return ExactLaunchTransaction<AicoreSubmit, AicpuSubmit>::run(
         identity, std::move(permit), std::forward<AicoreSubmit>(submit_aicore), std::forward<AicpuSubmit>(submit_aicpu)
     );
+}
+
+// A capture consumes the same execution claim but mints no execution receipt.
+// The callback retains graph ownership before its first queued operation.
+template <typename Record>
+struct ExactRecordingTransaction {
+    static LaunchTransactionResult
+    run(const NativeRunIdentity &identity, LaunchPermit permit, void *model, Record &&record) {
+        LaunchTransactionResult result;
+        result.recording_attempted = true;
+        if (model == nullptr || !permit.consume(identity)) return result;
+        LaunchProgressSink sink;
+        try {
+            result.rc = std::forward<Record>(record)(sink);
+        } catch (...) {
+            result.rc = PTO_RUNTIME_ERR_INTERNAL;
+            sink.mark_submitted();
+        }
+        result.progress = sink.submitted() ? LaunchProgress::Partial : LaunchProgress::NotStarted;
+        if (result.rc == 0) {
+            result.progress = LaunchProgress::Complete;
+            result.recording_receipt.identity_ = identity;
+            result.recording_receipt.model_ = model;
+        }
+        return result;
+    }
+};
+template <typename Record>
+LaunchTransactionResult
+exact_recording_transaction(const NativeRunIdentity &identity, LaunchPermit permit, void *model, Record &&record) {
+    return ExactRecordingTransaction<Record>::run(identity, std::move(permit), model, std::forward<Record>(record));
 }

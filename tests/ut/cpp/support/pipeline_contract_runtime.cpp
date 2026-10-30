@@ -181,23 +181,11 @@ int comm_barrier(CommHandle h) { return PTO_RUNTIME_ERR_INTERNAL; }
 
 int comm_destroy(CommHandle h) { return PTO_RUNTIME_ERR_INTERNAL; }
 
-int simpler_kernel_mode_supported(DeviceContextHandle ctx) { return PTO_RUNTIME_ERR_INTERNAL; }
-
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
     const CallConfig *config, uint64_t context_generation
 ) {
-    return PTO_RUNTIME_ERR_INTERNAL;
-}
-
-int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
-) {
-    return PTO_RUNTIME_ERR_INTERNAL;
-}
-
-int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
     return PTO_RUNTIME_ERR_INTERNAL;
 }
 

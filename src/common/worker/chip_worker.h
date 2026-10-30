@@ -12,6 +12,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -197,16 +198,19 @@ public:
         int32_t accepted_value = 0, NativeRunProvenance provenance = {}
     );
     /**
-     * What a launch attempt did, for the one outcome that is not a failure.
+     * What a launch attempt established.
      *
      * `DiagnosticCreditFull` means every output slot or terminal bank some
      * enabled owner needs is still held by a run ahead: nothing was submitted,
      * nothing was admitted, and the run is unchanged and launchable again once
-     * credit moves. Every other non-zero result still throws, because it is
-     * this run's failure.
+     * credit moves. `Recorded` means the graph retained the commands and their
+     * resources; it establishes no execution acceptance or device completion.
+     * Errors throw.
      */
-    enum class NativeLaunch : int { Launched, DiagnosticCreditFull };
+    enum class NativeLaunch : int { Launched, DiagnosticCreditFull, Recorded };
     NativeLaunch launch_native_run(const ChipWorkerNativeRun &run, void *caller_stream = nullptr);
+    void retire_capture_resources();
+    void reserve_capture_resources(void *caller_stream);
     void validate_caller_stream(void *caller_stream);
     void validate_execution_context() const;
     /**
@@ -596,10 +600,7 @@ private:
     using CommGlobalDomainReleaseFn = int (*)(uint64_t);
     using CommBarrierFn = int (*)(void *);
     using CommDestroyFn = int (*)(void *);
-    using KernelSupportedFn = decltype(&simpler_kernel_mode_supported);
     using KernelInitFn = decltype(&simpler_kernel_mode_init);
-    using KernelPrepareCallableFn = decltype(&simpler_kernel_mode_prepare_callable);
-    using KernelLaunchFn = decltype(&simpler_kernel_mode_launch);
 
     struct CommSession {
         void *handle = nullptr;
@@ -724,10 +725,8 @@ private:
     CommGlobalDomainReleaseFn comm_global_domain_release_fn_ = nullptr;
     CommBarrierFn comm_barrier_fn_ = nullptr;
     CommDestroyFn comm_destroy_fn_ = nullptr;
-    KernelSupportedFn kernel_supported_fn_ = nullptr;
-    KernelInitFn kernel_init_fn_ = nullptr;
-    KernelPrepareCallableFn kernel_prepare_callable_fn_ = nullptr;
-    KernelLaunchFn kernel_launch_fn_ = nullptr;
+    decltype(&simpler_retire_capture_resources) retire_capture_resources_fn_ = nullptr;
+    decltype(&simpler_reserve_capture_resources) reserve_capture_resources_fn_ = nullptr;
     void *device_ctx_ = nullptr;
     std::vector<CommSession> comm_sessions_;
     std::unordered_map<uint64_t, size_t> comm_session_index_;
@@ -736,7 +735,7 @@ private:
 
     uint32_t arena_bank_for_slot(uint32_t slot_id) const;
 
-    enum class NativeRunPhase : uint8_t { EMPTY, PREPARING, PREPARED, LAUNCHED, REAPED, FINALIZING };
+    enum class NativeRunPhase : uint8_t { EMPTY, PREPARING, PREPARED, LAUNCHED, REAPED, RECORDED, FINALIZING };
     class PreparedRunIncompatible : public std::runtime_error {
     public:
         using std::runtime_error::runtime_error;
@@ -787,12 +786,12 @@ private:
     ChipWorkerNativeRun prepare_native_run_on_slot(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
         uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-        int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
+        int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance, void *caller_stream
     );
     ChipWorkerNativeRun prepare_native_run_for_lane(
         int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
         uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-        bool pipeline_leased, NativeRunProvenance provenance
+        bool pipeline_leased, NativeRunProvenance provenance, void *caller_stream
     );
     void cleanup_native_runs_noexcept() noexcept;
     void clear_runtime_binding(bool release_device_reservation = true);
@@ -859,6 +858,26 @@ private:
      * correctness rests on every re-entry re-looking-up by epoch rather than on that.
      */
     std::unordered_map<uint64_t, std::unique_ptr<NativeRunEntry>> native_runs_;
+    // Pins the runtime binding through initialization, capture resource calls and close.
+    // Raw native close refuses a busy binding; public Worker drains its own leases.
+    class RuntimeLifecycleReservation {
+    public:
+        explicit RuntimeLifecycleReservation(std::atomic<bool> &busy) :
+            busy_(busy) {
+            if (busy_.exchange(true)) {
+                throw std::runtime_error("runtime operation or teardown in flight; retry after it returns");
+            }
+        }
+        ~RuntimeLifecycleReservation() { busy_.store(false); }
+        RuntimeLifecycleReservation(const RuntimeLifecycleReservation &) = delete;
+        RuntimeLifecycleReservation &operator=(const RuntimeLifecycleReservation &) = delete;
+
+    private:
+        std::atomic<bool> &busy_;
+    };
+    std::atomic<bool> runtime_lifecycle_busy_{false};
+    std::atomic<uint64_t> binding_process_id_{0};
+    RuntimeLifecycleReservation reserve_runtime_lifecycle();
     mutable std::mutex native_run_mu_;
     /** Signalled whenever an operation lease is released or a run entry is removed. */
     std::condition_variable native_run_ops_done_;
@@ -940,6 +959,8 @@ private:
     throw_native_run_lease_error(const ChipWorkerNativeRun &run, NativeRunLease lease, const char *operation);
     /** Record that a run's work reached the device. */
     void note_native_run_launched(uint64_t run_epoch) noexcept;
+    /** Record command capture without asserting device execution or completion. */
+    void note_native_run_recorded(uint64_t run_epoch) noexcept;
     /** Record that a run's device work is over, and the error it carries, if any. */
     void note_native_run_completion(uint64_t run_epoch, int rc) noexcept;
     /** Remove an entry that never got past preparation. */

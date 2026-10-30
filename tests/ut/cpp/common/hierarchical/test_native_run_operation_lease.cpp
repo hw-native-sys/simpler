@@ -258,7 +258,8 @@ void prime_joined(ChipWorker &worker) {
 ChipWorkerNativeRun prepare(ChipWorker &worker, uint32_t slot, uint64_t generation) {
     ChipStorageTaskArgs args{};
     return worker.prepare_native_run_on_slot(
-        1, &args, CallConfig{}, slot, generation, generation, generation, nullptr, 0, false, NativeRunProvenance{}
+        1, &args, CallConfig{}, slot, generation, generation, generation, nullptr, 0, false, NativeRunProvenance{},
+        nullptr
     );
 }
 
@@ -361,6 +362,50 @@ private:
 };
 
 }  // namespace
+
+// Recording has no execution completion to poll or wait for. Finalization
+// releases only the host carrier; graph ownership belongs to the runtime.
+TEST(NativeRunOperationLeaseTest, RecordedRunFinalizesWithoutWaitingOrReportingExecution) {
+    ChipWorker worker;
+    prime(worker);
+    const auto run = prepare(worker, 0, 1);
+    g_launch_rc = SIMPLER_NATIVE_RUN_RECORDED;
+    EXPECT_EQ(worker.launch_native_run(run), ChipWorker::NativeLaunch::Recorded);
+    EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::RECORDED);
+    EXPECT_THROW(worker.poll_native_run(run), std::runtime_error);
+    EXPECT_THROW(worker.wait_native_run(run), std::runtime_error);
+    EXPECT_THROW(worker.launch_native_run(run), std::runtime_error);
+    EXPECT_NO_THROW(worker.finalize_native_run(run));
+    EXPECT_EQ(g_wait_calls, 0);
+    EXPECT_EQ(g_finalize_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, PositiveBackendErrorIsNotARecordingReceipt) {
+    ChipWorker worker;
+    prime(worker);
+    const auto run = prepare(worker, 0, 1);
+    g_launch_rc = 2;
+    EXPECT_THROW(worker.launch_native_run(run), std::runtime_error);
+    EXPECT_NE(worker.native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::RECORDED);
+    EXPECT_NO_THROW(worker.finalize_native_run(run));
+}
+
+TEST(NativeRunOperationLeaseTest, RecordedRunKeepsRecordingStateAcrossRefusedFinalize) {
+    ChipWorker worker;
+    prime(worker);
+    const auto run = prepare(worker, 0, 1);
+    g_launch_rc = SIMPLER_NATIVE_RUN_RECORDED;
+    ASSERT_EQ(worker.launch_native_run(run), ChipWorker::NativeLaunch::Recorded);
+    g_finalize_rc = -5;
+    g_finalize_destroys = false;
+    EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
+    EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::RECORDED);
+    g_finalize_rc = 0;
+    g_finalize_destroys = true;
+    EXPECT_NO_THROW(worker.finalize_native_run(run));
+    EXPECT_EQ(g_wait_calls, 0);
+    EXPECT_EQ(g_finalize_calls, 2);
+}
 
 // A refused finalization must not undo the completion its own wait established, or the next
 // attempt waits again and reports whatever that second wait says instead of the first error.

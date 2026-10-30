@@ -847,7 +847,7 @@ int simpler_register_callable_v2(
 ) {
     if (out_callable_id == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     *out_callable_id = -1;
-    int rc = validate_kernel_prepare_callable_args(ctx, 0, callable, callable_size);
+    int rc = validate_callable_registration_args(ctx, 0, callable, callable_size);
     if (rc != 0) return rc;
     rc = validate_kernel_callable_image(callable, callable_size);
     if (rc != 0) return rc;
@@ -1088,6 +1088,9 @@ int simpler_prepare_run(
         state->trace_start_ns = trace_start_ns;
         if (config->enable_chip_swimlane >= 3) state->clock_log_offset = host_clock_alignment_log_offset();
         STRACE_CONTEXT(state->trace_inv, state->trace_hid, 1);
+
+        if (state->descriptor.caller_stream != nullptr)
+            return cleanup_failed_prepare(state, PTO_RUNTIME_ERR_UNSUPPORTED);
 
         // Refuse before bind or diagnostic allocation, but only after this
         // attempt owns a validated carrier. Successful cleanup supplies the
@@ -1404,6 +1407,10 @@ int simpler_validate_execution_context(DeviceContextHandle ctx) {
     return ctx != nullptr ? 0 : PTO_RUNTIME_ERR_INVALID_ARGUMENT;
 }
 
+int simpler_retire_capture_resources(DeviceContextHandle ctx) {
+    return ctx == nullptr ? PTO_RUNTIME_ERR_INVALID_ARGUMENT : PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 int simpler_validate_caller_stream(DeviceContextHandle, void *) { return PTO_RUNTIME_ERR_UNSUPPORTED; }
 
 int simpler_launch_run_on_stream(DeviceContextHandle, RuntimeHandle, void *, RuntimeHandle) {
@@ -1570,15 +1577,10 @@ int device_memory_info_ctx(DeviceContextHandle ctx, DeviceMemoryInfo *info) {
 /* ===========================================================================
  * Kernel-mode lifecycle
  *
- * Simulation never supports kernel mode: it has no real streams for a caller
- * to lend. supported() is 0 and init refuses after the shared structural
- * validation, so no context here ever latches kernel mode and
- * prepare/launch reject with INVALID_STATE. Argument validation is shared
- * with every other component through kernel_entry_validation.h, so an
- * argument this stub accepts is one the onboard path accepts too.
+ * Simulation cannot borrow device streams. Initialization validates its inputs
+ * and refuses without claiming an execution mode; common registration and native
+ * execution retain their ordinary simulator contracts.
  * =========================================================================== */
-
-int simpler_kernel_mode_supported(DeviceContextHandle) { return 0; }
 
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
@@ -1604,22 +1606,6 @@ int simpler_kernel_mode_init(
     }
     LOG_ERROR("simpler_kernel_mode_init: kernel mode is not supported by the simulator");
     return PTO_RUNTIME_ERR_UNSUPPORTED;
-}
-
-int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
-) {
-    const int rc = validate_kernel_prepare_callable_args(ctx, callable_id, callable, callable_size);
-    if (rc != 0) return rc;
-    LOG_ERROR("simpler_kernel_mode_prepare_callable: no live kernel context on this device context");
-    return PTO_RUNTIME_ERR_INVALID_STATE;
-}
-
-int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream) {
-    const int rc = validate_kernel_launch_args(ctx, callable_id, args, caller_stream);
-    if (rc != 0) return rc;
-    LOG_ERROR("simpler_kernel_mode_launch: no live kernel context on this device context");
-    return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
 }  // extern "C"

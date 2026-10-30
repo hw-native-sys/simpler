@@ -25,7 +25,7 @@
  * runtime context: the per-slot retained temporary staging buffer and the three
  * pooled arena regions (GM heap, GM shared memory, prebuilt runtime arena).
  *
- * Off unless a caller configures a finite budget. While off, every consumer
+ * Off until a caller configures ownership management. While off, every consumer
  * allocates exactly as it did before and this class holds nothing.
  *
  * What it owns once on: the backing blocks. A consumer holds the right to use a
@@ -42,7 +42,7 @@
  * consumer retires. Growth therefore means "a newer plan got a bigger block",
  * never "the old block moved".
  *
- * Two kinds of ownership are also kept apart, and conflating them is what makes
+ * The ownership claims are kept apart, because conflating them makes
  * a close either unsafe or impossible:
  *
  *   - the **current backing** of a region is the address that region is
@@ -50,7 +50,10 @@
  *     so it survives every run retiring and is never taken away to fund another
  *     region's growth. It is released when the context tears down.
  *   - a **run reference** is one executing run's claim on a block, identified by
- *     its run epoch. Only these decide whether a close must wait.
+ *     its run epoch. These determine which runs a close must drain.
+ *   - a **capture reference** protects a block beyond its producing run. The
+ *     capture owner releases it only after model and reader retirement. It is
+ *     not a run a capacity waiter can drain to recover the block.
  *
  * Epoch 0 is not a run: it is the context itself, which is what the eager
  * device initialization allocates under. Recording it as a run reference would
@@ -58,7 +61,7 @@
  * and nothing else.
  *
  * An **obsolete generation** — a block its region has since republished
- * elsewhere, or given up without republishing at all, with no run reference
+ * elsewhere, or given up without republishing at all, with no run or capture reference
  * left — is the only storage growth may reclaim, and only after its host
  * mapping is gone.
  *
@@ -192,7 +195,7 @@ public:
     };
 
     /**
-     * References one block can carry at once.
+     * Run references one block can carry at once.
      *
      * A reference is dropped when its run retires or when its run's context is
      * destroyed, and a set admits no new run until its previous one has been
@@ -342,7 +345,7 @@ public:
             if (!(b.region == region)) continue;
             if (b.quarantined || b.release_unconfirmed) continue;
             if (b.bytes < bytes) continue;
-            if (b.ref_count != 0) continue;  // capacity is not permission
+            if (has_references(b)) continue;  // capacity is not permission
             if (!add_ref(b, run_epoch, max_block_refs())) return refuse(why, AcquireRefusal::NotServing);
             // Handed out as this region's backing, so it stops being an
             // obsolete generation now rather than at publication: between the
@@ -379,7 +382,61 @@ public:
         // storage whose free was attempted and failed would let a run write
         // where the platform may already have reclaimed.
         if (b == nullptr || b->quarantined || b->release_unconfirmed) return false;
+        // A capacity hit must not let a new run overwrite capture-held contents.
+        // The already-referenced producer may finish preparing its own bytes.
+        if (capture_blocks_reuse_locked(*b, run_epoch)) return false;
         return add_ref(*b, run_epoch, max_block_refs());
+    }
+
+    // The token names a stable capture-owner record, not an RTS model address
+    // that may be recycled. The caller holds the context and retires this claim
+    // only after the model and every actual reader stop. Run facts cannot retire it.
+    // Validate and reserve the entire batch before publishing any reference.
+    bool retain_capture(const void *token, const std::vector<void *> &bases) {
+        std::scoped_lock lk(mu_);
+        if (!enabled_ || token == nullptr || bases.empty() || admission_ != Admission::Open) return false;
+        for (void *base : bases) {
+            const Block *b = find_locked(base);
+            if (b == nullptr || b->quarantined || b->release_unconfirmed || b->swept) return false;
+        }
+        for (void *base : bases) {
+            Block *b = find_locked(base);
+            if (std::find(b->capture_refs.begin(), b->capture_refs.end(), token) == b->capture_refs.end())
+                b->capture_refs.reserve(b->capture_refs.size() + 1);
+        }
+        for (void *base : bases) {
+            Block *b = find_locked(base);
+            if (std::find(b->capture_refs.begin(), b->capture_refs.end(), token) == b->capture_refs.end())
+                b->capture_refs.push_back(token);
+            b->state = BlockState::Referenced;
+        }
+        return true;
+    }
+
+    bool capture_blocks_reuse(void *base, uint64_t run_epoch) const {
+        std::scoped_lock lk(mu_);
+        const Block *b = find_locked(base);
+        return b != nullptr && capture_blocks_reuse_locked(*b, run_epoch);
+    }
+
+    bool has_capture_references() const {
+        std::scoped_lock lk(mu_);
+        for (const Block &b : blocks_)
+            if (!b.capture_refs.empty()) return true;
+        return false;
+    }
+
+    // Drops only the capture claim. Existing run references, quarantine and
+    // failed-release evidence remain authoritative; ordinary reclaim does the free.
+    void release_capture(const void *token) {
+        std::scoped_lock lk(mu_);
+        if (token == nullptr) return;
+        for (Block &b : blocks_) {
+            b.capture_refs.erase(
+                std::remove(b.capture_refs.begin(), b.capture_refs.end(), token), b.capture_refs.end()
+            );
+            if (!has_references(b) && !b.quarantined && !b.release_unconfirmed) b.state = BlockState::ProvenUnused;
+        }
     }
 
     /**
@@ -508,7 +565,8 @@ public:
         if (out == nullptr) return;
         std::scoped_lock lk(mu_);
         for (const Block &b : blocks_) {
-            if (b.released || b.quarantined || b.release_unconfirmed || b.mapping_retained) continue;
+            if (b.released || b.quarantined || b.release_unconfirmed || b.mapping_retained || !b.capture_refs.empty())
+                continue;
             for (uint32_t i = 0; i < b.ref_count; ++i) {
                 const uint64_t epoch = b.refs[i];
                 if (epoch == kContextEpoch || epoch == requesting_epoch) continue;
@@ -670,7 +728,7 @@ public:
         std::scoped_lock lk(mu_);
         int last_error = 0;
         for (Block &b : blocks_) {
-            if (b.quarantined || b.ref_count != 0 || b.released || b.swept) continue;
+            if (b.quarantined || has_references(b) || b.released || b.swept) continue;
             // A release that already failed is not attempted again here. Its
             // bytes keep their charge and its record keeps the failure, and
             // the terminal sweep below still gets the one further attempt that
@@ -870,6 +928,7 @@ private:
         // consumer the block belongs to, so an epoch identifies a reference.
         std::vector<uint64_t> refs;
         uint32_t ref_count{0};
+        std::vector<const void *> capture_refs;
         int release_rc{0};
         bool quarantined{false};
         bool release_unconfirmed{false};
@@ -889,9 +948,18 @@ private:
         bool run_referenced{false};
     };
 
+    static bool capture_blocks_reuse_locked(const Block &b, uint64_t run_epoch) {
+        if (b.capture_refs.empty()) return false;
+        for (uint32_t i = 0; i < b.ref_count; ++i)
+            if (b.refs[i] == run_epoch) return false;
+        return true;
+    }
+
+    static bool has_references(const Block &b) { return b.ref_count != 0 || !b.capture_refs.empty(); }
+
     bool must_keep_locked(void *base) const noexcept {
         const Block *b = find_locked(base);
-        return b != nullptr && b->quarantined;
+        return b != nullptr && (b->quarantined || !b->capture_refs.empty());
     }
 
     /**
@@ -1021,7 +1089,7 @@ private:
             b.refs[--b.ref_count] = 0;
             break;
         }
-        if (b.ref_count == 0 && !b.quarantined && !b.release_unconfirmed) b.state = BlockState::ProvenUnused;
+        if (!has_references(b) && !b.quarantined && !b.release_unconfirmed) b.state = BlockState::ProvenUnused;
     }
 
     bool references_run(uint64_t epoch) const {
@@ -1148,7 +1216,7 @@ private:
      */
     static bool compactable_locked(const Block &b) {
         return b.released && b.swept && !b.mapping_retained && !b.quarantined && !b.release_unconfirmed &&
-               b.release_rc == 0 && b.ref_count == 0;
+               b.release_rc == 0 && !has_references(b);
     }
 
     /**
@@ -1183,7 +1251,7 @@ private:
     static bool reclaimable_locked(const Block &b) {
         if (b.current || b.released || b.swept) return false;
         if (b.quarantined || b.release_unconfirmed || b.mapping_retained) return false;
-        return b.ref_count == 0;
+        return !has_references(b);
     }
 
     /**
@@ -1203,7 +1271,7 @@ private:
     static bool idle_backing_locked(const Block &b) {
         if (!b.current || b.released || b.swept || !b.run_referenced) return false;
         if (b.quarantined || b.release_unconfirmed || b.mapping_retained) return false;
-        return b.ref_count == 0;
+        return !has_references(b);
     }
 
     bool make_room_locked(size_t bytes) {

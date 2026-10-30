@@ -23,6 +23,7 @@
 #include "device_runner.h"
 #include "common/host_span.h"
 #include "common/device_phase.h"
+#include "common/native_execution_control.h"
 
 static int tokens[64], next_stream, next_event;
 static int fail_at, submits, syncs, copies;
@@ -42,6 +43,7 @@ extern "C" bool publish_runtime_chip_swimlane_extensions(Runtime *) noexcept {
     return true;
 }
 static void *failed_destroy_event;
+static void *failed_free;
 static void *caller = &tokens[60];
 static std::vector<std::string> trace;
 static std::vector<void *> stream_trace, event_trace;
@@ -50,6 +52,12 @@ static int step(const char *op, void *stream, void *event = nullptr) {
     stream_trace.push_back(stream);
     event_trace.push_back(event);
     return ++submits == fail_at ? -777 : 0;
+}
+// Device allocations are host buffers in this probe, including the capture control tail.
+extern "C" aclError aclrtMemset(void *dst, size_t capacity, int32_t value, size_t bytes) {
+    assert(dst != nullptr && bytes <= capacity);
+    std::memset(dst, value, bytes);
+    return ACL_SUCCESS;
 }
 extern "C" rtError_t rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
     ++allocation_attempts;
@@ -65,6 +73,10 @@ extern "C" rtError_t rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
     return *out ? 0 : -1;
 }
 extern "C" rtError_t rtFree(void *ptr) {
+    if (ptr == failed_free) {
+        failed_free = nullptr;
+        return -779;
+    }
     assert(live_allocations.erase(ptr) == 1);
     std::free(ptr);
     return 0;
@@ -141,16 +153,25 @@ extern "C" aclError aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *s
 // The production runner performs publication, arming, launch/drain decisions,
 // both callbacks, and every event/reference step.
 int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &) { return step("core", stream); }
-int host::LoadAicpuOp::LaunchBuiltInOp(rtStream_t stream, void *, size_t, int, const std::string &) {
+int host::LoadAicpuOp::LaunchBuiltInOp(
+    rtStream_t stream, void *payload, size_t size, int count, const std::string &name
+) {
+    if (name == "simpler_aicpu_prepare_execution") {
+        assert(size == sizeof(NativeExecutionPrepareArgs) && count == 1);
+        const auto &args = *static_cast<const NativeExecutionPrepareArgs *>(payload);
+        assert(args.control != 0 && args.runtime_address != 0 && args.result_address != 0);
+        assert(args.first_error_address != 0 && args.launched_callbacks == 2 && args.worker_count == 1);
+        return step("prepare", stream);
+    }
     return step("cpu", stream);
 }
 class ProbeRunner : public DeviceRunner {
 public:
     // The model has no device faults to reset; Partial ownership is still real.
     void recover_device_or_mark_unusable(int) override {}
-    void initialize() {
+    void initialize(bool kernel_mode = true) {
         device_id_ = 0;
-        assert(execution_mode_latch().latch(SIMPLER_MODE_KERNEL) == 0);
+        assert(execution_mode_latch().latch(kernel_mode ? SIMPLER_MODE_KERNEL : SIMPLER_MODE_PROGRAM) == 0);
         KernelContextOps ops;
         ops.get_current_device = [](void *, int *out) noexcept {
             *out = 0;
@@ -178,6 +199,7 @@ public:
     }
     using DeviceRunnerBase::ensure_device_run_result_region;
     using DeviceRunnerBase::ensure_device_wall_buffer;
+    using DeviceRunnerBase::finalize_common;
     bool result_initialized() const { return device_run_result_initialized_[0]; }
     void release_result() {
         free_tensor(device_run_result_dev_ptrs_[0]);
@@ -205,6 +227,7 @@ public:
         device_wall_dev_ptrs_[0] = nullptr;
     }
     MemoryAllocator &allocator() { return mem_alloc_; }
+    void *first_error_storage() const { return native_execution_first_error_; }
     void check_failed_event_close() {
         Runtime runtime;
         runtime.dev = {};
@@ -251,6 +274,8 @@ static void check(int fault, bool capturing) {
     auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
     prepared->caller_stream = caller;
     assert(prepared->kernel_args.prepare_runtime_args(runtime, allocator, slot) == 0);
+    // These publication-only fixtures retain the legacy launch contract; the common gate is tested below.
+    prepared->kernel_args.args.execution_control = 0;
     const int prior_copies = copies;
     assert(simpler_validate_execution_context(nullptr) == PTO_RUNTIME_ERR_INVALID_ARGUMENT);
     assert(simpler_validate_execution_context(&runner) == 0);
@@ -317,6 +342,8 @@ static void check_metadata_publication(int fault, bool drain_fails = false) {
     auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
     prepared->caller_stream = caller;
     assert(prepared->kernel_args.prepare_runtime_args(runtime, allocator, slot) == 0);
+    // These publication-only fixtures retain the legacy launch contract; the common gate is tested below.
+    prepared->kernel_args.args.execution_control = 0;
     assert(target == 0 && copies == 0);
     auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(id));
     assert(syncs == 0);
@@ -471,6 +498,8 @@ static void check_result_publication(bool has_caller, int failure_step) {
     assert(runner.device_run_terminal(0, id.run_epoch).state == DeviceRunTerminalState::Undecided);
     assert(copies == 0);
     assert(prepared->kernel_args.prepare_runtime_args(runtime, runner.allocator(), slot) == 0);
+    // These publication-only fixtures retain the legacy launch contract; the common gate is tested below.
+    prepared->kernel_args.args.execution_control = 0;
     auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(id));
     assert(syncs == 0);
     if (failure_step != 0) {
@@ -572,6 +601,8 @@ static void check_timing_publication(int fault) {
     std::memset(timing_target, 0xa5, bytes);
     assert(copies == 0 && !runner.timing_armed());
     assert(prepared->kernel_args.prepare_runtime_args(runtime, runner.allocator(), slot) == 0);
+    // These publication-only fixtures retain the legacy launch contract; the common gate is tested below.
+    prepared->kernel_args.args.execution_control = 0;
     auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(id));
     assert(syncs == 0);
     if (fault) {
@@ -659,7 +690,83 @@ static void check_arena_growth(SimplerExecutionMode mode) {
     }
     assert(live_allocations.size() == before);
 }
+static void check_first_error_close_retry() {
+    next_stream = next_event = 0;
+    ProbeRunner runner;
+    runner.initialize();
+    KernelArgsHelper args;
+    assert(runner.ensure_device_run_result_region(0, 1, args) == 0);
+    runner.release_result();
+    void *const storage = runner.first_error_storage();
+    assert(storage != nullptr && live_allocations.count(storage) == 1);
+    failed_free = storage;
+    assert(runner.finalize_common() == -779);
+    assert(runner.first_error_storage() == storage && live_allocations.count(storage) == 1);
+    assert(runner.finalize_common() == 0);
+    assert(runner.first_error_storage() == nullptr && live_allocations.count(storage) == 0);
+    runner.finish();
+}
+static void check_program_first_error_terminal_cleanup() {
+    next_stream = next_event = 0;
+    ProbeRunner runner;
+    runner.initialize(false);
+    KernelArgsHelper args;
+    assert(runner.ensure_device_run_result_region(0, 1, args) == 0);
+    runner.release_result();
+    void *const storage = runner.first_error_storage();
+    failed_free = storage;
+    assert(runner.finalize_common() == -779);
+    // Program teardown owns the allocator sweep and device reset, unlike a
+    // borrowed Kernel context's explicit retry. No stale alias may survive it.
+    assert(runner.first_error_storage() == nullptr && live_allocations.count(storage) == 0);
+    const int before = allocation_attempts;
+    assert(runner.ensure_device_run_result_region(0, 2, args) == 0);
+    assert(allocation_attempts == before + 2);
+    runner.release_result();
+    runner.finish();
+}
+static void check_common_preparation(int fault) {
+    capture = false;
+    next_stream = next_event = submits = syncs = copies = 0;
+    trace.clear();
+    stream_trace.clear();
+    event_trace.clear();
+    fail_at = fault;
+    ProbeRunner runner;
+    runner.initialize();
+    Runtime runtime;
+    runtime.dev = {};
+    runtime.set_worker_count(1);
+    runtime.set_aicpu_launch_count(2);
+    const NativeRunIdentity id{1, 1, 1, 0};
+    auto prepared = std::make_unique<DeviceRunnerBase::PreparedExecution>(id, runtime, CallConfig{}, 0);
+    prepared->caller_stream = caller;
+    auto &slot = runner.slot_persistent_args(0);
+    assert(runner.ensure_device_run_result_region(0, id.run_epoch, prepared->kernel_args) == 0);
+    assert(prepared->kernel_args.prepare_runtime_args(runtime, runner.allocator(), slot) == 0);
+    auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(id));
+    assert(syncs == 0);
+    // Caller ordering, initial result publication, descriptor publication, common preparation, then fork.
+    assert(trace[0] == "record" && trace[1] == "wait");
+    assert(trace[2] == "publish" && trace[3] == "publish" && trace[4] == "prepare");
+    if (fault != 0) {
+        assert(outcome.rc == -777 && outcome.progress == LaunchProgress::Partial);
+        assert(trace.size() == 5);
+    } else {
+        assert(outcome.rc == 0 && outcome.progress == LaunchProgress::Complete);
+        assert(trace[5] == "record" && trace[6] == "wait");
+        assert(stream_trace[4] == outcome.active->prepared->streams.aicpu);
+        assert(stream_trace[6] == outcome.active->prepared->streams.aicore);
+        assert(event_trace[5] == event_trace[6]);
+    }
+    runner.release_result();
+    runner.finish();
+}
 int main() {
+    check_first_error_close_retry();
+    check_program_first_error_terminal_cleanup();
+    check_common_preparation(0);
+    check_common_preparation(5);
     check_level_publication(false);
     check_level_publication(true);
     check_result_prepare_refusal();

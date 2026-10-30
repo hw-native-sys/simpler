@@ -87,7 +87,39 @@ This is the converse of the `running-onboard.md` anti-pattern (don't read
 "ci passed" as proof a fix worked): equally, don't wave away "ci failed"
 as someone else's problem.
 
-## 6. Never force-take a branch another worktree holds
+## 6. Review complete execution paths and state transitions
+
+For changes involving callbacks, asynchronous execution or reusable resources,
+check the applicable paths below. Record a concrete call chain or state
+transition; a local error return or a passing happy-path test is insufficient.
+
+- **Callback reentry:** Trace locks held across user callbacks and every public
+  entry reachable from the callback, including registration, retain/release and
+  close. Refusal must happen before a blocking lock. Unlocking requires proof
+  that the callable, context and module remain alive and cannot be mutated.
+  Include workers spawned or joined by a callback: thread-local reentry guards
+  do not cover them. Check native binding lifetime when releasing the Python GIL,
+  including concurrent finalize before runtime entry.
+  Check native and dedicated routes separately. Regressions must reach the real
+  callback through the production entry, with a bounded subprocess for hangs.
+- **Error handoff:** Identify the failing participant, shared error storage,
+  retiring participant and successor gate. Include failures before an attempt
+  or reservation exists, and retirement by another participant with local status
+  zero. Check visibility and cache ordering, failure publication before completion,
+  and whether the next invocation can erase an unconsumed error. Poisoning is
+  not permission to free resources or reset a borrowed device.
+- **Resource reuse:** Walk nonzero-offset allocation, shrink, clear, repeated
+  clear and restore through all validators. Separate immutable backing/layout
+  capacity from the current active view. Check restoration at the original
+  address without reallocation, and that any rejected multi-region update leaves
+  every published view and existing binding snapshot unchanged.
+
+For a defect fix, verify that the regression fails on the unfixed production
+path for the claimed reason and passes with the fix. Attribute results to the
+tested revision and scope; CPU transport tests do not prove device replay, and
+green CI does not cover a counterexample its tests never exercise.
+
+## 7. Never force-take a branch another worktree holds
 
 This repo is worked through many `git worktree` checkouts at once, several of
 them driven by concurrent agent sessions; the count changes by the hour, so

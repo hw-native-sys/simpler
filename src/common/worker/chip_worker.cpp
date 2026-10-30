@@ -282,6 +282,7 @@ void ChipWorker::init(
     uint64_t workspace_budget_bytes, bool manage_workspace, uint32_t requested_pipeline_depth,
     std::optional<uint64_t> borrowed_context_generation
 ) {
+    auto reservation = reserve_runtime_lifecycle();
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
     }
@@ -317,10 +318,7 @@ void ChipWorker::init(
     bind_device_fault_monitor(handle, "host runtime");
 
     GetPipelineContractFn get_pipeline_contract_fn = nullptr;
-    KernelSupportedFn kernel_supported_fn = nullptr;
     KernelInitFn kernel_init_fn = nullptr;
-    KernelPrepareCallableFn kernel_prepare_callable_fn = nullptr;
-    KernelLaunchFn kernel_launch_fn = nullptr;
     decltype(&simpler_get_init_error_ctx) get_init_error = nullptr;
     try {
         create_device_context_fn_ = module->required<CreateDeviceContextFn>("create_device_context");
@@ -430,14 +428,8 @@ void ChipWorker::init(
         // resolve unconditionally and never half-load. The versioned
         // registration entries below are optional on purpose.
         //
-        // simpler_kernel_mode_supported does not answer which runtime has a
-        // kernel backend: it answers whether kernel-mode launches are
-        // available, and stays zero while simpler_kernel_mode_launch is a
-        // rejecting stub — so it is zero on a runtime that can already
-        // establish a kernel context. The runtime-capability question is
-        // answered by simpler_kernel_mode_init, which refuses with
-        // PTO_RUNTIME_ERR_UNSUPPORTED and establishes nothing when its runtime
-        // cannot size kernel resources. Neither gates symbol resolution.
+        // Dedicated launch support is separate from borrowed context init and
+        // native eager support; all builds export the common entry family.
         ensure_acl_ready_fn_ = module->required<EnsureAclReadyFn>("ensure_acl_ready_ctx");
         create_comm_stream_fn_ = module->required<CreateCommStreamFn>("create_comm_stream_ctx");
         destroy_comm_stream_fn_ = module->required<DestroyCommStreamFn>("destroy_comm_stream_ctx");
@@ -453,10 +445,7 @@ void ChipWorker::init(
         comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
         comm_barrier_fn_ = module->required<CommBarrierFn>("comm_barrier");
         comm_destroy_fn_ = module->required<CommDestroyFn>("comm_destroy");
-        kernel_supported_fn = module->required<KernelSupportedFn>("simpler_kernel_mode_supported");
         kernel_init_fn = module->required<KernelInitFn>("simpler_kernel_mode_init");
-        kernel_prepare_callable_fn = module->required<KernelPrepareCallableFn>("simpler_kernel_mode_prepare_callable");
-        kernel_launch_fn = module->required<KernelLaunchFn>("simpler_kernel_mode_launch");
     } catch (...) {
         throw;
     }
@@ -501,6 +490,8 @@ void ChipWorker::init(
     if (device_ctx_ == nullptr) {
         throw std::runtime_error("create_device_context returned null");
     }
+
+    binding_process_id_.store(static_cast<uint64_t>(getpid()));
 
     try {
         // The grant reaches the runtime before anything can name a set, so every
@@ -699,10 +690,10 @@ void ChipWorker::init(
     }
 
     runtime_module_ = module;
-    kernel_supported_fn_ = kernel_supported_fn;
-    kernel_init_fn_ = kernel_init_fn;
-    kernel_prepare_callable_fn_ = kernel_prepare_callable_fn;
-    kernel_launch_fn_ = kernel_launch_fn;
+    reserve_capture_resources_fn_ =
+        module->optional<decltype(reserve_capture_resources_fn_)>("simpler_reserve_capture_resources");
+    retire_capture_resources_fn_ =
+        module->optional<decltype(retire_capture_resources_fn_)>("simpler_retire_capture_resources");
     device_id_ = device_id;
     // Published only once the runtime is up: the rollback paths above leave the
     // default K=1 contract in place, so a failed init never reports the counts
@@ -755,6 +746,7 @@ bool ChipWorker::teardown_report(SimplerTeardownReport *out) const {
 }
 
 void ChipWorker::finalize() {
+    auto reservation = reserve_runtime_lifecycle();
     validate_execution_context();
     if (run_lane_ != nullptr) {
         try {
@@ -837,6 +829,7 @@ void ChipWorker::finalize() {
 }
 
 void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
+    binding_process_id_.store(0);
     create_device_context_fn_ = nullptr;
     simpler_init_fn_ = nullptr;
     destroy_device_context_fn_ = nullptr;
@@ -912,10 +905,8 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     set_retained_epoch_limit_fn_ = nullptr;
     retained_epoch_limit_granted_ = simpler::dfx::runs::kMaxOpenEpochs;
     flush_diagnostics_fn_ = nullptr;
-    kernel_supported_fn_ = nullptr;
-    kernel_init_fn_ = nullptr;
-    kernel_prepare_callable_fn_ = nullptr;
-    kernel_launch_fn_ = nullptr;
+    retire_capture_resources_fn_ = nullptr;
+    reserve_capture_resources_fn_ = nullptr;
     runtime_bufs_.clear();
     runtime_module_.reset();
     pipeline_generations_.reset();
@@ -930,6 +921,34 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
         device_owner_reserved_ = false;
     }
     execution_environment_.reset();
+}
+
+ChipWorker::RuntimeLifecycleReservation ChipWorker::reserve_runtime_lifecycle() {
+    // Only this atomic identity may be read before the binding is reserved.
+    // A fork can inherit an active reservation, so refuse the process first.
+    const uint64_t process = binding_process_id_.load();
+    if (process != 0 && process != static_cast<uint64_t>(getpid())) {
+        throw ExecutionContextRefused("execution environment belongs to another process");
+    }
+    return RuntimeLifecycleReservation(runtime_lifecycle_busy_);
+}
+
+void ChipWorker::reserve_capture_resources(void *caller_stream) {
+    auto reservation = reserve_runtime_lifecycle();
+    if (!initialized_ || reserve_capture_resources_fn_ == nullptr)
+        throw std::runtime_error("native capture resource reservation unsupported");
+    validate_execution_context();
+    const int rc = reserve_capture_resources_fn_(device_ctx_, caller_stream, 0, 0);
+    if (rc != 0) throw std::runtime_error("reserve capture resources failed with code " + std::to_string(rc));
+}
+
+void ChipWorker::retire_capture_resources() {
+    auto reservation = reserve_runtime_lifecycle();
+    if (!initialized_ || retire_capture_resources_fn_ == nullptr)
+        throw std::runtime_error("native capture resource retirement unsupported");
+    validate_execution_context();
+    const int rc = retire_capture_resources_fn_(device_ctx_);
+    if (rc != 0) throw std::runtime_error("retire capture resources failed with code " + std::to_string(rc));
 }
 
 int32_t ChipWorker::register_callable(const void *callable, size_t callable_size) {
@@ -1029,18 +1048,18 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run(
     }
     return prepare_native_run_on_slot(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
-        true, provenance
+        true, provenance, nullptr
     );
 }
 
 ChipWorkerNativeRun ChipWorker::prepare_native_run_for_lane(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, const PipelineSlotLease &lease,
     uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state, int32_t accepted_value,
-    bool pipeline_leased, NativeRunProvenance provenance
+    bool pipeline_leased, NativeRunProvenance provenance, void *caller_stream
 ) {
     return prepare_native_run_on_slot(
         callable_id, args, config, lease.slot_id, lease.generation, run_id, dispatch_id, accepted_state, accepted_value,
-        pipeline_leased, provenance
+        pipeline_leased, provenance, caller_stream
     );
 }
 
@@ -1143,7 +1162,7 @@ void ChipWorker::configure_launch_depth(unsigned depth) {
 ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
     int32_t callable_id, const ChipStorageTaskArgs *args, const CallConfig &config, uint32_t slot_id,
     uint64_t generation, uint64_t run_id, uint64_t dispatch_id, volatile int32_t *accepted_state,
-    int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance
+    int32_t accepted_value, bool admit_pipeline_generation, NativeRunProvenance provenance, void *caller_stream
 ) {
     validate_execution_context();
     try {
@@ -1211,10 +1230,17 @@ ChipWorkerNativeRun ChipWorker::prepare_native_run_on_slot(
 
     int rc = -1;
     try {
-        const NativeRunDescriptor descriptor{
-            slot_id,        arena_bank_for_slot(slot_id), run_id,    generation, dispatch_id, run_epoch, accepted_state,
-            accepted_value, launch_depth_ > 1 ? 1u : 0u,  provenance
-        };
+        const NativeRunDescriptor descriptor{slot_id,
+                                             arena_bank_for_slot(slot_id),
+                                             run_id,
+                                             generation,
+                                             dispatch_id,
+                                             run_epoch,
+                                             accepted_state,
+                                             accepted_value,
+                                             launch_depth_ > 1 ? 1u : 0u,
+                                             provenance,
+                                             caller_stream};
         rc = prepare_run_fn_(device_ctx_, runtime_bufs_[slot_id].data(), callable_id, args, &config, &descriptor);
     } catch (...) {
         drop_preparing_native_run(run_epoch);
@@ -1352,7 +1378,7 @@ bool ChipWorker::native_run_op_admits_phase(NativeRunOp op, NativeRunPhase phase
         return phase == NativeRunPhase::LAUNCHED || phase == NativeRunPhase::REAPED;
     case NativeRunOp::Finalize:
         return phase == NativeRunPhase::PREPARED || phase == NativeRunPhase::LAUNCHED ||
-               phase == NativeRunPhase::REAPED;
+               phase == NativeRunPhase::REAPED || phase == NativeRunPhase::RECORDED;
     case NativeRunOp::Probe:
         return phase == NativeRunPhase::LAUNCHED;
     case NativeRunOp::Predecessor:
@@ -1467,6 +1493,12 @@ void ChipWorker::note_native_run_launched(uint64_t run_epoch) noexcept {
     if (it != native_runs_.end()) it->second->phase = NativeRunPhase::LAUNCHED;
 }
 
+void ChipWorker::note_native_run_recorded(uint64_t run_epoch) noexcept {
+    std::lock_guard<std::mutex> lk(native_run_mu_);
+    const auto it = native_runs_.find(run_epoch);
+    if (it != native_runs_.end()) it->second->phase = NativeRunPhase::RECORDED;
+}
+
 void ChipWorker::note_native_run_completion(uint64_t run_epoch, int rc) noexcept {
     // The execution fact, written whether or not a finalizer has reserved this run: completion
     // and the error it carries are what the run established, not a phase a reservation may hold.
@@ -1505,6 +1537,10 @@ ChipWorker::NativeLaunch ChipWorker::launch_native_run(const ChipWorkerNativeRun
                                         launch_run_fn_(device_ctx_, storage);
     } catch (...) {
         failure = std::current_exception();
+    }
+    if (rc == SIMPLER_NATIVE_RUN_RECORDED && failure == nullptr) {
+        note_native_run_recorded(run.run_epoch);
+        return NativeLaunch::Recorded;
     }
     if (rc == SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL && failure == nullptr) {
         // Not a failure and not a device event: the backend admitted nothing
