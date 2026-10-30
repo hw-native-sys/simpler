@@ -31,6 +31,7 @@
 
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
+#include "host/comm_generation_lease.h"
 #include "host/raii_scope_guard.h"
 
 #include <algorithm>
@@ -150,6 +151,10 @@ struct CommHandle_ {
     int nranks;
     std::string rootinfo_path;
     uint64_t run_token = 0;
+    file_marker_handshake::GenerationLease generation_lease;
+    bool domain_admission_stopped = false;
+    bool domain_release_failed = false;
+    std::optional<uint64_t> last_allocation_id;
 
     // Caller-owned: supplied to comm_init, never created or destroyed here.
     aclrtStream stream = nullptr;
@@ -160,7 +165,6 @@ struct CommHandle_ {
     bool owns_device_ctx = false;
     std::vector<CommContext *> derived_contexts;
     std::map<uint64_t, std::unique_ptr<DomainAllocation>> domain_allocations;
-    std::unordered_set<uint64_t> used_domain_ids;
     std::map<uint64_t, std::unique_ptr<CcuCallableRegistration>> ccu_registrations;
     uint64_t next_ccu_registration = 1;
     bool cleanup_failed = false;
@@ -217,8 +221,18 @@ barrier_marker_path(const std::string &rootinfo_path, uint64_t run_token, const 
     return file_marker_handshake::marker_path(rootinfo_path, run_token, tag, rank);
 }
 
-static void cleanup_handshake_files(const std::string &rootinfo_path) {
-    (void)file_marker_handshake::cleanup(rootinfo_path);
+static void log_marker_error(const file_marker_handshake::Result &result) {
+    LOG_ERROR(
+        "[comm] marker failure stage=%s rank=%d path=%s errno=%d failures=%zu",
+        file_marker_handshake::stage_name(result.stage), result.rank, result.path.c_str(), result.system_error.value(),
+        result.failure_count
+    );
+}
+
+static bool cleanup_handshake_files(const std::string &rootinfo_path) {
+    const auto result = file_marker_handshake::cleanup(rootinfo_path);
+    if (!result.ok()) log_marker_error(result);
+    return result.ok();
 }
 
 static bool
@@ -364,6 +378,11 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     h->nranks = nranks;
     h->rootinfo_path = rootinfo_path;
     h->stream = static_cast<aclrtStream>(stream);
+    if (!h->generation_lease.acquire(h->rootinfo_path)) {
+        LOG_ERROR("[comm rank %d] generation lease unavailable: %s", rank, rootinfo_path);
+        delete h;
+        return nullptr;
+    }
 
     // NOTE: aclInit / aclrtSetDevice / stream creation are intentionally NOT
     // performed here — the caller (DeviceRunner::ensure_acl_ready + a stream
@@ -374,7 +393,10 @@ extern "C" CommHandle comm_init(int rank, int nranks, void *stream, const char *
     // RootInfo exchange
     HcclRootInfo rootInfo{};
     if (rank == 0) {
-        cleanup_handshake_files(h->rootinfo_path);
+        if (!cleanup_handshake_files(h->rootinfo_path)) {
+            delete h;
+            return nullptr;
+        }
         h->run_token = make_run_token(rank);
         HcclResult hret = hccl_get_root_info(&rootInfo);
         if (hret != HCCL_SUCCESS) {
@@ -2118,7 +2140,7 @@ static int allocate_domain_windows(
         (!urma_requested && (jetties != 1 || depth != 0))) {
         return COMM_DOMAIN_URMA_CONFIG_INVALID;
     }
-    if (h->used_domain_ids.count(allocation_id) > 0) {
+    if (h->last_allocation_id && allocation_id <= *h->last_allocation_id) {
         LOG_ERROR(
             "[comm rank %d] alloc_domain: allocation_id=%llu already used", h->rank,
             static_cast<unsigned long long>(allocation_id)
@@ -2145,6 +2167,7 @@ static int allocate_domain_windows(
         publish_host_cleanup_failure(h);
         return COMM_RECLAMATION_UNCONFIRMED;
     }
+    if (h->domain_admission_stopped) return COMM_RECLAMATION_UNCONFIRMED;
     uint32_t aiv_count = pto::comm::urma::kUrmaAutoAivCount;
     if (urma_requested) {
         aiv_count = pto::comm::urma::UrmaWorkspaceManager::QueryDeviceAivCount();
@@ -2159,7 +2182,8 @@ static int allocate_domain_windows(
             return COMM_DOMAIN_URMA_CONFIG_INVALID;
         }
     }
-    h->used_domain_ids.insert(allocation_id);
+    h->last_allocation_id = allocation_id;
+    h->domain_admission_stopped = true;
     auto entry = h->domain_allocations.emplace(allocation_id, std::make_unique<DomainAllocation>()).first;
     auto &alloc = entry->second;
     alloc->workspace_config = config;
@@ -2193,6 +2217,7 @@ static int allocate_domain_windows(
     *device_ctx_out = reinterpret_cast<uint64_t>(alloc->device_ctx);
     *local_window_base_out = reinterpret_cast<uint64_t>(alloc->local_buf);
     *actual_window_size_out = alloc->mapping_size;
+    h->domain_admission_stopped = false;
     return 0;
 } catch (const std::exception &e) {
     LOG_ERROR("[comm] alloc_domain: exception: %s", e.what());
@@ -2427,6 +2452,8 @@ static int release_domain_windows(
         return COMM_RECLAMATION_UNCONFIRMED;
     }
     if (collective && !alloc->initialized) return COMM_INITIALIZATION_ABORT_REQUIRED;
+    const bool prior_admission_stopped = h->domain_admission_stopped;
+    h->domain_admission_stopped = true;
     if (!domain_drained(*alloc) ||
         (collective && !file_barrier(
                            h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count),
@@ -2439,8 +2466,24 @@ static int release_domain_windows(
         LOG_ERROR("[comm rank %d] release_domain: reclamation unconfirmed; retaining owner", h->rank);
         return COMM_RECLAMATION_UNCONFIRMED;
     }
+    int marker_rc = 0;
+    if (collective) {
+        const auto retired = file_marker_handshake::retire_allocation(
+            h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count), h->run_token, allocation_id
+        );
+        if (!retired.ok()) {
+            log_marker_error(retired);
+            if (retired.stage != file_marker_handshake::Stage::CLEANUP) {
+                h->cleanup_failed = true;
+                return COMM_RECLAMATION_UNCONFIRMED;
+            }
+            h->domain_release_failed = true;
+            marker_rc = -1;
+        }
+    }
     h->domain_allocations.erase(it);
-    return 0;
+    h->domain_admission_stopped = h->domain_release_failed || (collective && prior_admission_stopped);
+    return marker_rc;
 } catch (const std::exception &e) {
     LOG_ERROR("[comm] release_domain: exception: %s", e.what());
     if (h) h->cleanup_failed = true;
@@ -2548,6 +2591,7 @@ extern "C" int comm_destroy(CommHandle h) try {
         const auto destroy_release =
             file_marker_handshake::release_after_cleanup(h->rootinfo_path, h->rank, h->nranks, h->run_token, options);
         if (!destroy_release.ok()) {
+            log_marker_error(destroy_release);
             LOG_WARN(
                 "[comm rank %d] comm_destroy: final release failed during %s for rank %d", h->rank,
                 file_marker_handshake::stage_name(destroy_release.stage), destroy_release.rank

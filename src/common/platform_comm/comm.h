@@ -269,8 +269,9 @@ int comm_derive_context(
  * @param h                       Base handle from comm_init().
  * @param allocation_id           Caller-assigned unique id; scopes the
  *                                handshake / barrier filenames.  Must be
- *                                unique for the lifetime of this handle, including
- *                                failed and released allocations (A5 enforces this).
+ *                                strictly increasing on each onboard handle,
+ *                                including failed/released allocations. Calls
+ *                                on a handle must be serialized.
  * @param rank_ids                Base-communicator rank ids in dense
  *                                domain order (length rank_count).
  * @param rank_count              Number of subset members.
@@ -357,6 +358,8 @@ int comm_prepare_ccu_run(
  * communicator-owned workspaces remain owned by their enclosing lifetime.
  * COMM_RECLAMATION_UNCONFIRMED retains the domain on h, including on allocation
  * rollback, and forbids further use or destruction of the enclosing session.
+ * A marker unlink failure after confirmed reclamation returns a different
+ * non-zero status: admission remains stopped, but comm_destroy is permitted.
  *
  * @param h               Base handle from comm_init().
  * @param allocation_id   Same id passed to the domain allocation entry point.
