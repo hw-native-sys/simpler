@@ -187,7 +187,9 @@ def test_mix_subtasks_run_together(st_platform, st_device_ids):
         worker.close()
 
 
-@pytest.mark.platforms(["a5sim", "a5"])
+# Each case holds a device for a process of its own, so a simulator run
+# carries only the plain co-residency above.
+@pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 def test_mix_subtasks_run_together_with_the_aivs_busy(st_platform, st_device_ids, tmp_path):

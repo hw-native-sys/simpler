@@ -18,11 +18,21 @@ extern "C" __attribute__((visibility("default"))) OrchestrationConfig aicpu_orch
 }
 
 extern "C" __attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipTaskArgs &orch_args) {
-    const auto blocks = static_cast<int16_t>(orch_args.scalar<int64_t>(0));
     const auto mask = static_cast<uint32_t>(orch_args.scalar<int64_t>(1));
+    // A negative block count asks for two full waves of this device's own
+    // topology, which the host cannot read before the run. One wave is one
+    // block per execution position, and a cluster offers two of them when a
+    // single AIV lane carries the task and one otherwise.
+    int32_t requested = static_cast<int32_t>(orch_args.scalar<int64_t>(0));
+    if (requested < 0) {
+        const int32_t positions = rt_available_cluster_count() * ((mask == 2U || mask == 4U) ? 2 : 1);
+        requested = positions * 2;
+    }
+    const auto blocks = static_cast<int16_t>(requested);
     CoreTaskArgs root;
     root.add_inout(orch_args.tensor(0).ref());
-    for (int32_t scalar = 0; scalar < 4; ++scalar)
+    root.add_scalar(static_cast<int64_t>(blocks));
+    for (int32_t scalar = 1; scalar < 4; ++scalar)
         root.add_scalar(orch_args.scalar<int64_t>(scalar));
     root.launch_spec.set_block_num(blocks);
     const MixedKernels kernels{

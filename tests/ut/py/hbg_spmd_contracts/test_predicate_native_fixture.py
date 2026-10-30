@@ -108,5 +108,9 @@ def test_predicate_refusal_matrix_covers_mix_and_pure_multiblock(predicate_refus
         for mark in predicate_refusal.test_predicated_cooperative_task_is_refused.pytestmark
         if mark.name == "parametrize"
     }
-    assert set(marks["mask,blocks"]) == expected
-    assert tuple(marks["gate"]) == (0, 1)
+    # Every entry carries its arguments in `.values`, and the ones a simulator
+    # run skips carry an onboard-only platforms mark besides.
+    assert {entry.values for entry in marks["mask,blocks"]} == expected
+    assert tuple(entry.values[0] for entry in marks["gate"]) == (0, 1)
+    assert {entry.values for entry in marks["mask,blocks"] if not entry.marks} == predicate_refusal._SIM_SHAPES
+    assert [entry.values[0] for entry in marks["gate"] if not entry.marks] == [0]

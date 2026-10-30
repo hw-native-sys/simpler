@@ -97,7 +97,11 @@ struct StartupFixture {
     }
 
     void finish_both_tasks_on_cluster_zero() {
-        std::array<SchedulerLocalState, 3> locals{};
+        // SchedulerLocalState's default constructor is explicit, which a
+        // braced initializer here would reach by copy-initialization. These
+        // elements are default-initialized instead; every member of that
+        // struct carries its own initializer, so the state is the same.
+        std::array<SchedulerLocalState, 3> locals;
         std::array<SchedulerLocalProfilingState, 3> profiles{};
         std::array<SchedulerAdmissionLocalState, 3> admissions{};
         for (uint32_t lane = 0; lane < 3; ++lane) {

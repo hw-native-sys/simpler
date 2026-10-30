@@ -33,10 +33,6 @@
 #include <type_traits>
 #include <utility>
 
-#if defined(__aarch64__)
-#include <arm_neon.h>
-#endif
-
 #include "assert_compat.h"
 #include "aicpu/dump_arg_selection.h"
 #include "common/device_phase.h"

@@ -61,10 +61,28 @@ GATE_SOURCE = os.path.join(HERE, "..", "predicated_dispatch", "kernels", "aic", 
 
 ELEMS = 16
 
+# Platform selection sits here rather than on the test so that a per-parameter
+# platforms mark is the closer one and can narrow a case to hardware.
+pytestmark = [pytest.mark.platforms(["a5sim", "a5"])]
+
 # 0b011 / 0b101 / 0b110 / 0b111 — every Mix shape. 0b110 is the one
 # where the AIC holds no subtask of its own.
 MIX_MASKS = (3, 5, 6, 7)
 REFUSED_SHAPES = [(mask, 1) for mask in MIX_MASKS] + [(mask, 2) for mask in (1, 2, 4, *MIX_MASKS)]
+# Every case holds a private Worker because the refusal poisons it, so each one
+# costs a process of its own. A simulator run therefore carries one case per
+# refused class — a Mix task and a pure multi-block task — at a single gate
+# value, since the graph is refused before the predicate is read and the gate
+# selects no other path. Hardware keeps the full sweep.
+_SIM_SHAPES = frozenset({(7, 1), (1, 2)})
+_ONBOARD_ONLY = pytest.mark.platforms(["a5"])
+
+
+def _refused_shape_params():
+    return [
+        pytest.param(mask, blocks, marks=[] if (mask, blocks) in _SIM_SHAPES else [_ONBOARD_ONLY])
+        for mask, blocks in REFUSED_SHAPES
+    ]
 
 
 @functools.cache
@@ -103,11 +121,10 @@ def _build_callable(platform: str) -> ChipCallable:
     )
 
 
-@pytest.mark.platforms(["a5sim", "a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-@pytest.mark.parametrize("mask,blocks", REFUSED_SHAPES)
-@pytest.mark.parametrize("gate", (0, 1))
+@pytest.mark.parametrize("mask,blocks", _refused_shape_params())
+@pytest.mark.parametrize("gate", (pytest.param(0), pytest.param(1, marks=[_ONBOARD_ONLY])))
 def test_predicated_cooperative_task_is_refused(st_platform, st_device_ids, mask, blocks, gate, capfd, drain_host_log):
     """Mix and pure multi-block shapes are refused for either gate value.
 

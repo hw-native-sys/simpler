@@ -195,10 +195,20 @@ def _cohort_shape(cohort, aic_count, aiv_count):
 # supply the backlog that ordinary work now supplies directly.
 
 
-@pytest.mark.platforms(["a5sim", "a5"])
+# Platform selection sits at module scope so that a per-parameter platforms
+# mark is the closer one and can narrow a case to hardware. Each cohort count
+# holds a device for a process of its own, so a simulator run carries the
+# single-cohort case and the silicon keeps the rest.
+pytestmark = [pytest.mark.platforms(["a5sim", "a5"])]
+_SIM_COHORTS = (1,)
+
+
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-@pytest.mark.parametrize("cohort_count", [1, 2, 3])
+@pytest.mark.parametrize(
+    "cohort_count",
+    [pytest.param(n, marks=[] if n in _SIM_COHORTS else [pytest.mark.platforms(["a5"])]) for n in (1, 2, 3)],
+)
 def test_cohorts_assemble_against_competing_ordinary_work(
     st_platform, st_device_ids, tmp_path, cohort_count, assert_cohorts_were_coresident
 ):

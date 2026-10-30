@@ -93,6 +93,15 @@ TEST(SimAicoreTls, LoadingWithoutCallingWrapperDoesNotAllocateKeys) {
 TEST(SimAicoreTls, RealWrapperAllocatesOnceAndUnloadReturnsEveryKey) {
     ReservedKeys guard;
     ASSERT_TRUE(guard.acquire(1));
+    // One load-and-run first, so the C++ runtime has made whatever one-time
+    // thread-local allocation it makes for std::thread. That key belongs to
+    // the runtime, not to the wrapper, and an unload never returns it, so a
+    // baseline taken before it would charge it to the budget below.
+    {
+        WrapperModule settle;
+        ASSERT_TRUE(settle.valid()) << dlerror();
+        EXPECT_EQ(settle.run(1, guard.first()), UINT64_C(6) << 32);
+    }
     const size_t baseline = available_keys();
     ASSERT_GT(baseline, 10u);
     {

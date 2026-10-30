@@ -262,7 +262,10 @@ def test_the_barrier_actually_fires(st_platform, st_device_ids, tmp_path, capfd)
         worker.close()
 
 
-@pytest.mark.platforms(["a5sim", "a5"])
+# Each case here holds a device for a process of its own, so a simulator run
+# carries only the barrier premise above. The cohort widths below are a
+# property of the silicon and stay on hardware.
+@pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 def test_one_full_width_cohort_assembles(st_platform, st_device_ids, tmp_path, assert_cohorts_were_coresident):
@@ -294,7 +297,7 @@ def test_one_full_width_cohort_assembles(st_platform, st_device_ids, tmp_path, a
         worker.close()
 
 
-@pytest.mark.platforms(["a5sim", "a5"])
+@pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.parametrize("cohort_count", [2, 12])

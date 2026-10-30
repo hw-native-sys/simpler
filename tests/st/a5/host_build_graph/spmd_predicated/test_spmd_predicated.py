@@ -130,7 +130,9 @@ def test_predicate_on_a_multi_block_task_is_refused(st_platform, st_device_ids, 
         worker.close()
 
 
-@pytest.mark.platforms(["a5sim", "a5"])
+# Each case holds a device for a process of its own, so a simulator run
+# carries only the refusal above; the accepted shape stays on hardware.
+@pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.parametrize(("gate_value", "expected"), [(1, 0.0), (0, UNWRITTEN)])

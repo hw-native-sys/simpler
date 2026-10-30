@@ -126,7 +126,10 @@ def test_cohort_wider_than_the_machine_is_refused(st_platform, st_device_ids, ca
         worker.close()
 
 
-@pytest.mark.platforms(["a5sim", "a5"])
+# Each case holds a device for a process of its own, so a simulator run
+# carries only the refusal above. The two shapes below are about how the
+# silicon schedules a width it can satisfy.
+@pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 def test_ordinary_task_that_wide_runs_in_waves(st_platform, st_device_ids):
@@ -149,7 +152,7 @@ def test_ordinary_task_that_wide_runs_in_waves(st_platform, st_device_ids):
         worker.close()
 
 
-@pytest.mark.platforms(["a5sim", "a5"])
+@pytest.mark.platforms(["a5"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 def test_sync_start_on_a_single_block_is_dropped_not_refused(st_platform, st_device_ids):

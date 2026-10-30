@@ -30,6 +30,18 @@ pytestmark = [
     pytest.mark.scheduler_mode("resident"),
 ]
 
+# Each mask holds a device for a process of its own. A simulator run carries
+# the single-AIV-lane mask, which the capacity accounting special-cases, and
+# all three lanes together; the silicon keeps the full sweep.
+_SIM_MASKS = (4, 7)
+
+
+def _mask_params():
+    return [
+        pytest.param(mask, marks=[] if mask in _SIM_MASKS else [pytest.mark.platforms(["a5"])])
+        for mask in (1, 2, 4, 3, 5, 6, 7)
+    ]
+
 
 @pytest.fixture(scope="module")
 def sync_probe():
@@ -108,7 +120,7 @@ def _check_normalized_capture(path, mask):
         assert not groups
 
 
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+@pytest.mark.parametrize("mask", _mask_params())
 def test_single_block_sync_request_preserves_execution(st_platform, st_device_ids, mask, sync_probe):
     worker = Worker(level=2, platform=st_platform, runtime="host_build_graph", device_id=int(st_device_ids[0]))
     buffers = []
@@ -146,7 +158,7 @@ def test_single_block_sync_request_preserves_execution(st_platform, st_device_id
         _close_worker(worker, buffers)
 
 
-@pytest.mark.parametrize("mask", (1, 2, 4, 3, 5, 6, 7))
+@pytest.mark.parametrize("mask", _mask_params())
 def test_sync_start_excess_capacity_is_refused(st_platform, st_device_ids, mask, sync_probe, capfd, drain_host_log):
     # The oversized shapes exceed every supported A5 topology, including 36 C / 72 V.
     blocks = 73 if mask in (2, 4) else 37

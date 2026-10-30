@@ -130,10 +130,14 @@ def test_small_fault_capture_requires_the_versioned_claim_policy(native, mask, l
         native._check_failed_capture(raw, blocks, mask, lane)
 
 
-@pytest.mark.parametrize("platform,clusters", (("a5", 32), ("a5sim", 8)))
 @pytest.mark.parametrize("mask", (1, 2, 4, 6, 7))
-def test_two_wave_fault_uses_platform_claimant_population(native, platform, clusters, mask):
-    assert native._two_wave_blocks(platform, mask) == clusters * (4 if mask in (2, 4) else 2)
+def test_two_wave_fault_asks_the_device_for_its_own_claimant_population(native, mask):
+    # The host cannot read the cluster count before the run, so it asks with a
+    # negative sentinel and the orchestration launches two waves against the
+    # device's own topology. The host only sizes buffers, for the widest
+    # topology the platform admits.
+    assert native._TWO_WAVE_REQUEST < 0
+    assert native._two_wave_capacity(mask) == native._MAX_CLUSTERS * (4 if mask in (2, 4) else 2)
 
 
 @pytest.mark.parametrize("mask", (1, 2, 4, 6, 7))
@@ -415,7 +419,7 @@ def test_failed_output_checks_return_writes_and_untouched_successor(native, corr
         records[lane, :2] = 1
         records[lane, 8:14] = torch.tensor([1, 1, lane + 1, 1, 100, 200])
     values = [records.flatten(), torch.zeros(16, dtype=torch.int64)]
-    native._check_output(values, 1, 3, failed=True)
+    native._check_output(values, 1, 1, 3, failed=True)
     if corruption == "duplicate":
         records[0, 0] = 2
     elif corruption == "missing_return":
@@ -431,4 +435,4 @@ def test_failed_output_checks_return_writes_and_untouched_successor(native, corr
     else:
         records[0, 14] = 1
     with pytest.raises(AssertionError):
-        native._check_output(values, 1, 3, failed=True)
+        native._check_output(values, 1, 1, 3, failed=True)
