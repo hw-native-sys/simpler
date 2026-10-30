@@ -191,3 +191,119 @@ TEST(FileMarkerHandshakeTest, FailedAtomicPublishLeavesNoVisibleMarker) {
     EXPECT_FALSE(std::filesystem::exists(path));
     EXPECT_FALSE(std::filesystem::exists(path + ".tmp"));
 }
+
+TEST(FileMarkerHandshakeTest, DirectoryIterationFailureIsReported) {
+    HandshakeDirectory directory;
+    const auto result = file_marker_handshake::cleanup(directory.rootinfo_path() + "/missing/root.bin");
+    EXPECT_FALSE(result.ok());
+}
+
+TEST(FileMarkerHandshakeTest, MatchingEntryErrorIsReportedAfterFollowerRelease) {
+    HandshakeDirectory directory;
+    const std::string rootinfo = directory.rootinfo_path();
+    const auto marker = file_marker_handshake::marker_path(rootinfo, 9, "release", 0);
+    std::filesystem::create_symlink(std::filesystem::path(marker).filename(), marker);
+    { std::ofstream(rootinfo) << "generation"; }
+    const auto result = file_marker_handshake::release_after_cleanup(rootinfo, 0, 2, 9);
+    EXPECT_FALSE(result.ok());
+    EXPECT_FALSE(std::filesystem::exists(rootinfo));
+    EXPECT_TRUE(std::filesystem::exists(file_marker_handshake::release_path(rootinfo, 9, 1)));
+}
+
+TEST(FileMarkerHandshakeTest, RepeatedAllocationsRetireExactlyTheirFiles) {
+    HandshakeDirectory directory;
+    const auto root = directory.rootinfo_path();
+    const auto unrelated = file_marker_handshake::marker_path(root, 19, "alloc_99_release", 0);
+    ASSERT_TRUE(file_marker_handshake::publish_marker(unrelated));
+    for (uint64_t allocation = 0; allocation < 8; ++allocation) {
+        const auto prefix = "alloc_" + std::to_string(allocation) + "_";
+        for (int rank = 0; rank < 2; ++rank) {
+            for (const auto *phase : {"fabric_announce", "fabric_ready", "release"}) {
+                ASSERT_TRUE(
+                    file_marker_handshake::publish_marker(
+                        file_marker_handshake::marker_path(root, 17, prefix + phase, rank)
+                    )
+                );
+            }
+        }
+        auto leader = std::async(std::launch::async, [&]() {
+            return file_marker_handshake::retire_allocation(
+                root, 0, 2, 17, allocation, {std::chrono::seconds(2), std::chrono::milliseconds(1)}
+            );
+        });
+        EXPECT_EQ(leader.wait_for(std::chrono::milliseconds(10)), std::future_status::timeout);
+        EXPECT_TRUE(std::filesystem::exists(file_marker_handshake::marker_path(root, 17, prefix + "release", 0)));
+        ASSERT_TRUE(file_marker_handshake::retire_allocation(root, 1, 2, 17, allocation).ok());
+        ASSERT_TRUE(leader.get().ok());
+        size_t remaining = 0;
+        for (const auto &entry : std::filesystem::directory_iterator(std::filesystem::path(root).parent_path())) {
+            (void)entry;
+            ++remaining;
+        }
+        EXPECT_EQ(remaining, 1U);
+        EXPECT_TRUE(std::filesystem::exists(unrelated));
+    }
+}
+
+TEST(FileMarkerHandshakeTest, MissingConsumptionPreservesReleaseMarkers) {
+    HandshakeDirectory directory;
+    const auto root = directory.rootinfo_path();
+    const auto marker = file_marker_handshake::marker_path(root, 17, "alloc_2_release", 1);
+    ASSERT_TRUE(file_marker_handshake::publish_marker(marker));
+    const auto result = file_marker_handshake::retire_allocation(
+        root, 0, 2, 17, 2, {std::chrono::milliseconds(5), std::chrono::milliseconds(1)}
+    );
+    EXPECT_EQ(result.error, file_marker_handshake::Error::TIMED_OUT);
+    EXPECT_EQ(result.rank, 1);
+    EXPECT_TRUE(std::filesystem::exists(marker));
+}
+
+TEST(FileMarkerHandshakeTest, FailedConsumptionPublicationIsReported) {
+    HandshakeDirectory directory;
+    const auto result =
+        file_marker_handshake::retire_allocation(directory.rootinfo_path() + "/missing/root", 0, 2, 1, 1);
+    EXPECT_EQ(result.error, file_marker_handshake::Error::MARKER_WRITE_FAILED);
+    EXPECT_EQ(result.stage, file_marker_handshake::Stage::DEPARTURE_PUBLISH);
+}
+
+TEST(FileMarkerHandshakeTest, ExactRetirementReportsUnlinkFailure) {
+    HandshakeDirectory directory;
+    const auto root = directory.rootinfo_path();
+    const auto marker = file_marker_handshake::marker_path(root, 1, "alloc_1_fabric_ready", 0);
+    std::filesystem::create_directory(marker);
+    { std::ofstream(std::filesystem::path(marker) / "keep") << "busy"; }
+    const auto result = file_marker_handshake::retire_allocation(root, 0, 1, 1, 1);
+    EXPECT_FALSE(result.ok());
+    EXPECT_EQ(result.path, marker);
+    EXPECT_TRUE(result.system_error);
+    EXPECT_EQ(result.failure_count, 1U);
+}
+
+#include "host/comm_generation_lease.h"
+
+TEST(FileMarkerHandshakeTest, NativeLeaseProtectsGenerationAndRefusesRemovedPath) {
+    HandshakeDirectory directory;
+    const auto registry =
+        std::filesystem::path(directory.rootinfo_path()).parent_path() / ("simpler-comm-" + std::to_string(getuid()));
+    const auto generation = registry / "gen-0123456789abcdef0123456789abcdef";
+    std::filesystem::create_directories(generation);
+    const auto lease = generation / ".lease";
+    { std::ofstream(lease) << ""; }
+    const auto root = (generation / "rootinfo.bin").string();
+    const int fd = open(lease.c_str(), O_RDWR);
+    ASSERT_GE(fd, 0);
+    {
+        file_marker_handshake::GenerationLease rank;
+        ASSERT_TRUE(rank.acquire(root));
+        EXPECT_NE(flock(fd, LOCK_EX | LOCK_NB), 0);
+    }
+    ASSERT_EQ(flock(fd, LOCK_EX | LOCK_NB), 0);
+    auto late = std::async(std::launch::async, [&]() {
+        file_marker_handshake::GenerationLease rank;
+        return rank.acquire(root);
+    });
+    EXPECT_EQ(late.wait_for(std::chrono::milliseconds(20)), std::future_status::timeout);
+    ASSERT_TRUE(std::filesystem::remove(lease));
+    close(fd);
+    EXPECT_FALSE(late.get());
+}

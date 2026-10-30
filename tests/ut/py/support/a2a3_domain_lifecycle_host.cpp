@@ -194,7 +194,7 @@ static void prepare_peer(CommHandle h, uint64_t id, bool release_marker) {
     ipc.mapping_size = 4096;
     ipc.shareable_handle = token;
     assert(write_ipc_announce(domain_ipc_announce_path(h->rootinfo_path, id, 1, h->run_token), ipc));
-    for (const char *phase : {"fabric_ready", "ipc_p2p_ready", "release"}) {
+    for (const char *phase : {"fabric_ready", "ipc_p2p_ready", "release", "release_consumed"}) {
         if (!release_marker && std::strcmp(phase, "release") == 0) continue;
         std::ofstream marker(barrier_marker_path(h->rootinfo_path, h->run_token, domain_barrier_tag(id, phase), 1));
         marker << "1";
