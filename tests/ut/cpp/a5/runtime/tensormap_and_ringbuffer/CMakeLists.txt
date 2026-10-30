@@ -32,6 +32,37 @@ else()
     target_link_options(test_a5_tmr_scheduler_retirement PRIVATE -Wl,--gc-sections)
 endif()
 
+# Real polling/completion code with observable register and profiling sinks.
+# Keep the non-DFX path covered: selective task timing is independent of DFX.
+if(APPLE)
+    set(_completion_batch_gc -Wl,-dead_strip)
+else()
+    set(_completion_batch_gc -Wl,--gc-sections)
+endif()
+foreach(_variant plain dfx profiling)
+    set(_dfx 1)
+    set(_profiling 0)
+    if(_variant STREQUAL plain)
+        set(_dfx 0)
+    elseif(_variant STREQUAL profiling)
+        set(_profiling 1)
+    endif()
+    simpler_ut_add_target(NAME test_a5_tmr_completion_batch_${_variant}
+        SOURCES
+            test_completion_batch.cpp
+            ${A5_RUNTIME_DIR}/scheduler/scheduler_completion.cpp
+            ${A5_RUNTIME_DIR}/scheduler/scheduler.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/args_dump_aicpu.cpp
+        ARCH a5 RUNTIME tensormap_and_ringbuffer TIER aicpu
+        DEFINES SIMPLER_PLATFORM_NAME="a5sim" SIMPLER_DFX=${_dfx} SIMPLER_SCHED_PROFILING=${_profiling}
+        LINK a5_ut_support
+        COMPILE_OPTIONS -ffunction-sections -fdata-sections
+        LINK_OPTIONS ${_completion_batch_gc}
+        LABEL no_hardware TIMEOUT 30 PRIVATE_WORKDIR)
+endforeach()
+
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it

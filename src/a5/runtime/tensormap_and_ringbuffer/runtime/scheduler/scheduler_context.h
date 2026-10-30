@@ -11,6 +11,10 @@
 #ifndef SCHEDULER_CONTEXT_H
 #define SCHEDULER_CONTEXT_H
 
+#include <memory>
+#include <new>
+#include <utility>
+
 #include "aicpu/device_phase_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/chip_swimlane_profiling.h"
@@ -47,6 +51,7 @@ struct RuntimeContext;
 class SchedulerContext {
     friend class MixAdmissionTestPeer;
     friend class SchedulerRetirementTestPeer;
+    friend class CompletionBatchTestPeer;
 
 public:
     // =========================================================================
@@ -126,6 +131,16 @@ public:
     // mode where rt is created by the orchestrator thread after init().
     void bind_runtime(RuntimeContext *rt);
 
+    // The orchestrator prepares owner-local scratch from the validated arena
+    // layout before releasing scheduler threads; the GM header is not ready at
+    // pre-handshake initialization.
+    bool prepare_completion_scratch(const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH]) {
+        for (int t = 0; t < active_sched_threads_; ++t) {
+            if (!completion_scratch_[t].prepare(task_window_sizes)) return false;
+        }
+        return true;
+    }
+
     // Serial orch->sched mode pre-dispatch wait. No AICore dispatch happens
     // before orchestrator_done_.
     void wait_for_orchestration_done_before_dispatch(Runtime *runtime, int32_t thread_idx);
@@ -155,6 +170,44 @@ private:
 
     // Cluster-ordered core trackers, one per scheduler thread
     CoreTracker core_trackers_[MAX_AICPU_THREADS];
+
+    // Owner-local, direct task-slot lookup. Every touched entry is reset before
+    // completion callbacks, so reuse needs no whole-window clearing or task pin.
+    // Storage survives runs; only a ring-geometry change reallocates it.
+    struct CompletionBatchScratch {
+        bool prepare(const uint64_t task_window_sizes[CHIP_MAX_RING_DEPTH]) {
+            size_t bytes = 0;
+            bool unchanged = storage != nullptr;
+            for (int r = 0; r < CHIP_MAX_RING_DEPTH; ++r) {
+                const auto size = task_window_sizes[r];
+                unchanged = unchanged && sizes[r] == size;
+                bytes += size;
+            }
+            if (unchanged) return true;
+            std::unique_ptr<uint8_t[]> replacement(new (std::nothrow) uint8_t[bytes]());
+            if (!replacement) return false;
+            storage = std::move(replacement);
+            size_t offset = 0;
+            for (int r = 0; r < CHIP_MAX_RING_DEPTH; ++r) {
+                sizes[r] = task_window_sizes[r];
+                masks[r] = static_cast<int32_t>(task_window_sizes[r] - 1);
+                groups[r] = storage.get() + offset;
+                offset += sizes[r];
+            }
+            return true;
+        }
+
+        uint8_t &cell(const ChipTaskSlotState &slot) {
+            const uint8_t ring = slot.ring_id;
+            return groups[ring][slot.task->task_id.local_id() & masks[ring]];
+        }
+
+        std::unique_ptr<uint8_t[]> storage;
+        uint64_t sizes[CHIP_MAX_RING_DEPTH]{};
+        int32_t masks[CHIP_MAX_RING_DEPTH]{};
+        uint8_t *groups[CHIP_MAX_RING_DEPTH]{};
+    };
+    CompletionBatchScratch completion_scratch_[MAX_AICPU_THREADS];
 
     // early_dispatch_shape's batch-pop scratch, one set per scheduler thread. The
     // two arrays are indexed in lockstep: task_id_snapshots[i] is the tag batch[i]
@@ -426,12 +479,20 @@ private:
         ,
         uint64_t dispatch_ts, uint64_t finish_ts
 #endif
+        ,
+        int16_t *deferred_completion_count = nullptr, bool flush_completion_count = true
     );
 
     static void promote_pending_to_running(CoreExecState &core);
     static void clear_running_slot(CoreExecState &core);
 
     void check_running_cores_for_completion(
+        int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
+        bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
+    );
+
+    template <bool Batched>
+    void poll_running_cores(
         int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
         bool &made_progress, ChipTaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count
     );

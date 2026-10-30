@@ -200,6 +200,8 @@ public:
         aic_mask_.init();
         aiv_mask_.init();
         pending_occupied_.init();
+        running_groupable_.init();
+        pending_groupable_.init();
         for (int32_t i = 0; i < cluster_count; i++) {
             aic_mask_ |= BitStates::bit(i * 3);
             aiv_mask_ |= (BitStates::bit(i * 3 + 1) | BitStates::bit(i * 3 + 2));
@@ -252,6 +254,17 @@ public:
     BitStates get_all_running_cores() const { return (~core_states_) & (aic_mask_ | aiv_mask_); }
     BitStates get_cluster_offset_states() const { return aic_mask_; }
 
+    // Either slot can produce a completion at the next COND observation.
+    BitStates get_groupable_running_cores() const {
+        return get_all_running_cores() & (running_groupable_ | pending_groupable_);
+    }
+    bool is_running_groupable(int32_t offset) const {
+        return (running_groupable_ & BitStates::bit(offset)).has_value();
+    }
+    bool is_pending_groupable(int32_t offset) const {
+        return (pending_groupable_ & BitStates::bit(offset)).has_value();
+    }
+
     // Every core whose pending slot is free has capacity for early-dispatch
     // staging: an idle core uses its running slot, while a running core uses its
     // pending slot. This is local tracker state with no shared-memory access.
@@ -298,6 +311,24 @@ public:
 
     // Toggle bit at the given bit offset (running <-> idle)
     void change_core_state(int32_t bit_offset) { core_states_ ^= BitStates::bit(bit_offset); }
+
+    // These bits follow task-slot lifetime, independently of payload ACKs.
+    void set_running_groupable(int32_t offset, bool groupable) {
+        running_groupable_.clear_bit(offset);
+        if (groupable) running_groupable_ |= BitStates::bit(offset);
+    }
+    void set_pending_groupable(int32_t offset, bool groupable) {
+        pending_groupable_.clear_bit(offset);
+        if (groupable) pending_groupable_ |= BitStates::bit(offset);
+    }
+    void promote_pending_groupable(int32_t offset) {
+        set_running_groupable(offset, is_pending_groupable(offset));
+        pending_groupable_.clear_bit(offset);
+    }
+    void clear_completion_slots(int32_t offset) {
+        running_groupable_.clear_bit(offset);
+        pending_groupable_.clear_bit(offset);
+    }
 
     // --- Pending-occupied tracking ---
     // Tracks whether a core's pending payload slot is occupied (awaiting hardware ACK).
@@ -484,6 +515,8 @@ private:
     BitStates aiv_mask_;
     BitStates core_states_;
     BitStates pending_occupied_;
+    BitStates running_groupable_;
+    BitStates pending_groupable_;
     int32_t core_id_map_[MAX_CORE_PER_THREAD];  // bit position -> worker id
 };
 
