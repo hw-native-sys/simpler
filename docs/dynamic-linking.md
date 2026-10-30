@@ -185,10 +185,52 @@ C++ `thread_local` uses ELF TLSDESC on aarch64, which has known issues
 with dlclose/re-dlopen cycles in older glibc versions. The sim platform
 uses `pthread_key_t` (POSIX TLS) for per-thread state in framework SOs.
 
+### Module-owned scalar thread state
+
+`ModuleThreadValue<T>` stores small trivially-copyable values in pthread slots,
+one key per pointer-sized word. It does not allocate owning objects per thread
+or register thread-exit callbacks. Each module owns its keys and deletes them
+at unload, after callers have quiesced; a caller thread may remain alive after
+its last call into the module. Pointer values are borrowed, never freed by the
+selector. This requires the existing `-fno-gnu-unique` build contract on GCC.
+
+Partial key creation releases only keys already acquired. Required updates
+return an error or throw; a failed multiword update restores the complete prior
+value. A failed rollback or mandatory restore terminates rather than returning
+with a potentially dangling selector. Optional caches disable reads for the
+whole cache after a binding failure and return their initial value thereafter.
+Host-phase lane failures count as dropped records in the exported JSON, including
+passes with no stored events; per-kind totals omit events denied a lane.
+Notification suppression uses a mutex-protected list of live stack scopes when
+TLS setup fails. This allocation-free fallback suppresses only the scope's
+thread; other threads still publish genuine credit progress. Nested rollback
+scopes remain quiet without manufacturing their own retry notifications.
+
+The host-phase lane/generation and thread-ID caches, per-producer record buffers,
+submission timing and notification suppression use this storage. These are
+module-local values, not the shared host-log state. Recorder scratch and prepare
+transaction ownership are separate migrations; this helper does not make it
+safe to unload a module while a thread is executing its code.
+
+On 64-bit hosts, the trace lane/generation cache uses two keys, the thread-ID
+cache one, the record-buffer selector two, and notification suppression one per
+module instance when initialized. Each orchestration module uses two more keys
+for submission timing only when its bound ops table provides `record_orch_phase`.
+Once initialized, those keys remain owned until module unload.
+The record buffer owns its write cursor; pthread slots change only on pass/buffer
+changes. A context admits at most 64 callable IDs, but pthread key capacity is
+process-wide: independently loaded modules across contexts and other libraries
+share that budget. Additional threads reuse the same keys. Unregistration returns
+keys only when the last loader reference is released and the module really unloads.
+
 ### All TLS Variables
 
 | Variable | Storage | SO | Purpose |
 | -------- | ------- | -- | ------- |
+| host-phase lane/generation and thread ID | `ModuleThreadValue` | host runtime SO | Borrowed producer identity; generation rejects stale passes |
+| `HostPhaseProducerLane` | `ModuleThreadValue` | producing host module | Buffer identity only; exclusive buffer owns the write cursor |
+| `RtSubmitPhaseState` | `ModuleThreadValue` | orchestration SO | Per-thread submission timing; no keys when the bound runtime lacks phase recording |
+| `SuppressSelfNotify` depth | `ModuleThreadValue` with stack-scope fallback | host module | Suppress this thread's rollback notifications |
 | `g_reg_base_key` | `pthread_key_t` | AICore SO | Per-core simulated register base address |
 | `g_core_id_key` | `pthread_key_t` | AICore SO | Per-core physical core ID |
 | `g_device_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread device binding (device_id) |
