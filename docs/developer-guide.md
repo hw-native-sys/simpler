@@ -216,8 +216,10 @@ both read `pto_isa.pin`; use a different ISA revision by updating that file.
 
 The a5 RDMA workspace is an explicit opt-in overlay enabled with
 `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON`. It requires a `pto_isa.pin` revision
-that provides the PTO-ISA RDMA/HNS1825 headers and is mutually exclusive with
-the SDMA and URMA workspace overlays.
+that provides the PTO-ISA RDMA/HNS1825 headers. SDMA, URMA and RDMA providers
+can be compiled together. A5 domains select resources with `workspace_engines`;
+RDMA uses a separate domain because its window has no mapped peer VAs. See
+[communication domains](comm-domain.md#4-backends).
 
 ### Runtime binary lookup
 

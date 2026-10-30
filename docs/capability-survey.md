@@ -202,6 +202,10 @@ Every failed launch runs a recovery path that is easy to miss:
 
 ## Communication engines: SDMA, URMA, CCU, HCCL, Fabric
 
+The engine inventory and reachability findings in this section describe the
+`e6a61f15` survey snapshot. The current A5 workspace model is summarized below
+and documented in [Communication domains](comm-domain.md#4-backends).
+
 Four async engines are declared —
 `ASYNC_ENGINE_{SDMA,ROCE,URMA,CCU}`
 (`src/a2a3/runtime/tensormap_and_ringbuffer/runtime/types.h:53-59`) — and
@@ -235,7 +239,8 @@ without, traced to a single 300,000 ms remote TRS event timeout
 ([investigations/2026-07-a2a3-sdma-fault-teardown.md](investigations/2026-07-a2a3-sdma-fault-teardown.md),
 issue #1425).
 
-**a5 URMA is real code that cannot execute.** The scheduler walks `UrmaCqCtx`
+**Historical a5 URMA reachability (`e6a61f15`).** At the survey snapshot,
+URMA was real code that could not execute. The scheduler walks `UrmaCqCtx`
 CQEs checking the owner bit, advances the tail and rings the doorbell
 (`src/a5/.../backend/urma/urma_completion_scheduler.h:133-215`); the kernel
 submits `TGET_ASYNC`/`TPUT_ASYNC<DmaEngine::URMA>` with 256 MB chunking. Both
@@ -243,9 +248,20 @@ sit behind `PTO_URMA_SUPPORTED`, which is **defined nowhere in this repo and
 nowhere in the installed CANN pto headers**, so the `#else` branch returns
 `SIMPLER_ERROR_ASYNC_COMPLETION_INVALID` immediately. The host overlay macro is
 fully wired, so turning it on does not help — the device path stays unreachable.
-a5's SDMA and URMA overlays are mutually exclusive by CMake `FATAL_ERROR`
-because `CommContext` exposes a single `workSpace` pair
-(`src/a5/platform/onboard/host/CMakeLists.txt:49-53`).
+At that snapshot, A5's SDMA and URMA overlays were mutually exclusive by CMake
+`FATAL_ERROR` because `CommContext` exposed a single `workSpace` pair.
+
+**Current A5 workspace selection.** SDMA is always compiled; optional URMA and
+RDMA providers default OFF and can both be enabled in the same build.
+`CommContext.workspaces` stores independent descriptors indexed by
+`CommWorkspaceKind::{SDMA, URMA, RDMA}`. Domains create synchronous mapped
+windows by default and initialize async providers only when explicitly requested
+through `workspace_engines`. SDMA and URMA can share a domain; RDMA currently
+requires its own domain and cannot be combined with either in one domain.
+The [URMA example](../examples/a5/tensormap_and_ringbuffer/urma_deferred_completion_demo/README.md)
+covers ordered mixed DAGs and same-kernel SDMA/URMA requests. The A5 onboard CI
+job explicitly enables URMA and runs these cases alongside SDMA; ordinary builds
+retain the optional provider's OFF default.
 
 **HCCL is bootstrap, not data movement.** The complete set of functions called
 is `HcclGetRootInfo`, `HcclCommInitRootInfo`, `HcclBarrier`, `HcclCommDestroy`.
@@ -268,7 +284,7 @@ struct that is currently frozen by `static_assert`.
 
 ## Open questions
 
-Unresolved after this survey, in rough order of how much they block:
+Unresolved at the recorded survey snapshot, in rough order of how much they block:
 
 1. **What are `ASYNC_ENGINE_ROCE` and `ASYNC_ENGINE_CCU` for?** No design doc,
    investigation entry, or code comment says whether they are reserved slots or

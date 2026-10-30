@@ -146,11 +146,11 @@ static __aicore__ void combine(
             uint64_t v26 = (uint64_t)v14;
             TASSIGN(v25, v26);
             // pto: %11
-            int64_t v27 = (v5)[v13];
+            int64_t v27 = (v5)[v14];
             // pto: %12, %13, %14, %15
-            int64_t v28 = (v5)[(int64_t)((uint64_t)((int64_t)((int32_t)v27)) + (uint64_t)v8)];
+            int64_t v28 = (v5)[(int64_t)((uint64_t)((int64_t)((int32_t)v27)) + (uint64_t)v13)];
             // pto: %16, %17
-            int64_t v29 = (v5)[(int64_t)((uint64_t)i17 + (uint64_t)v8)];
+            int64_t v29 = (v5)[(int64_t)((uint64_t)i17 + (uint64_t)v13)];
             // pto: %routed_y_buf__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 1, 4096> v30 = pto::Shape<1, 1, 1, 1, 4096>();
             // pto: %routed_y_buf__ssa_v0_peer_pview

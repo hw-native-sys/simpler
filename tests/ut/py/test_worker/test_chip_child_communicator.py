@@ -37,7 +37,7 @@ def shared_memory_granularity(monkeypatch, request):
     monkeypatch.setattr(f"{__name__}.SharedMemory", allocate)
 
 
-def _run_controls(monkeypatch, init_results, commands):
+def _run_controls(monkeypatch, init_results, commands, *, workspace_mask=0):
     cw = MagicMock(
         spec_set=(
             "comm_init",
@@ -73,6 +73,7 @@ def _run_controls(monkeypatch, init_results, commands):
         domain_buf = domain_request.buf
         assert domain_buf is not None
         worker_mod._DOMAIN_REQ_HEADER.pack_into(domain_buf, 0, 7, 1, 0, 64, 0)
+        struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_WORKSPACE_MASK_OFFSET, workspace_mask)
         struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
         reply = allocate(worker_mod._DOMAIN_REPLY_HEADER.size)
         with memoryview(bytearray(worker_mod.mailbox_size(1))) as mailbox:
@@ -126,6 +127,7 @@ def test_bootstrap_handle_is_forwarded_without_mutating_runtime(monkeypatch):
     allocated = cw.comm_alloc_domain_windows.call_args.args
     assert allocated[:5] == (0x1234, 7, [0], 0, 64)
     assert allocated[5] != 0
+    assert cw.comm_alloc_domain_windows.call_args.kwargs == {"workspace_mask": 0}
     cw.comm_release_domain_windows.assert_called_once_with(0x1234, 7, 1, 0)
     assert published == (1, 0xC7, 0xB000, 4096, 0)
 
@@ -134,6 +136,18 @@ def test_bootstrap_handle_is_forwarded_without_mutating_runtime(monkeypatch):
     cold.comm_init.assert_not_called()
     cold.comm_alloc_domain_windows.assert_not_called()
     cold.comm_release_domain_windows.assert_not_called()
+
+
+@pytest.mark.parametrize("workspace_mask", [1, 2, 3, 4])
+def test_async_workspace_mask_reaches_native_unmodified(monkeypatch, workspace_mask):
+    cw, responses, _ = _run_controls(
+        monkeypatch,
+        [0x1234],
+        [worker_mod._CTRL_COMM_INIT, worker_mod._CTRL_ALLOC_DOMAIN],
+        workspace_mask=workspace_mask,
+    )
+    assert responses == [(0, "")] * 2
+    assert cw.comm_alloc_domain_windows.call_args.kwargs == {"workspace_mask": workspace_mask}
 
 
 @pytest.mark.parametrize("failed_init", [0, RuntimeError("init failed")])

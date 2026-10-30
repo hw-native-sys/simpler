@@ -48,26 +48,28 @@ import pytest
 # ---------------------------------------------------------------------------
 # CommContext layout — must stay byte-compatible with
 # src/common/platform_comm/comm_context.h (static_asserts there).
-# If CANN / HCCL ever shifts these offsets, comm_hccl.cpp's build-time asserts
-# will fail first; this struct mirrors them so the Python side can read back a
-# CommContext without rebuilding nanobind just to expose the layout.
+# simpler owns this layout; its producers, kernels and Python mirrors are
+# rebuilt together when the shared ABI changes.
 # ---------------------------------------------------------------------------
 _COMM_MAX_RANK_NUM = 64
 
 
+class _CommWorkspace(ctypes.Structure):
+    _fields_ = [("addr", ctypes.c_uint64), ("size", ctypes.c_uint64)]
+
+
 class _CommContext(ctypes.Structure):
     _fields_ = [
-        ("workSpace", ctypes.c_uint64),
-        ("workSpaceSize", ctypes.c_uint64),
         ("rankId", ctypes.c_uint32),
         ("rankNum", ctypes.c_uint32),
         ("winSize", ctypes.c_uint64),
         ("windowsIn", ctypes.c_uint64 * _COMM_MAX_RANK_NUM),
         ("windowsOut", ctypes.c_uint64 * _COMM_MAX_RANK_NUM),
+        ("workspaces", _CommWorkspace * 3),
     ]
 
 
-assert ctypes.sizeof(_CommContext) == 1056, "CommContext python mirror drifted from C++ header"
+assert ctypes.sizeof(_CommContext) == 1088, "CommContext python mirror drifted from C++ header"
 
 
 def _rank_entry(
@@ -110,7 +112,7 @@ def _rank_entry(
             raise RuntimeError(f"comm_get_window_size={win_size} < 4096")
         result["stage"] = "query"
 
-        # ABI guard: copy the CommContext that HCCL populates back to host
+        # ABI guard: copy the CommContext published by simpler back to host
         # and verify every field we consume in kernels matches what we asked
         # for.  This is the Python twin of EXIT_CTX_FIELDS from the C++ UT.
         # worker.copy_from() is the ChipWorker's device-to-host DMA; we hand

@@ -169,11 +169,11 @@ static __aicore__ void dispatch_meta_3(
         }
         set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
         // pto: %21
-        int64_t v38 = (v9)[v17];
+        int64_t v38 = (v9)[v21];
         // pto: %22, %23, %24, %25
-        int64_t v39 = (v9)[(int64_t)((uint64_t)((int64_t)((int32_t)v38)) + (uint64_t)v14)];
+        int64_t v39 = (v9)[(int64_t)((uint64_t)((int64_t)((int32_t)v38)) + (uint64_t)v17)];
         // pto: %26
-        int64_t v40 = (int64_t)((uint64_t)i34 + (uint64_t)v14);
+        int64_t v40 = (int64_t)((uint64_t)i34 + (uint64_t)v17);
         // pto: %27
         int64_t v41 = (v9)[v40];
         // pto: %my_rank__ssa_v0_idx
@@ -200,9 +200,9 @@ static __aicore__ void dispatch_meta_3(
         // pto: %35
         if (i34 != v42) {
             // pto: %36
-            int64_t v48 = (v10)[v17];
+            int64_t v48 = (v10)[v21];
             // pto: %37, %38, %39, %40
-            int64_t v49 = (v10)[(int64_t)((uint64_t)((int64_t)((int32_t)v48)) + (uint64_t)v14)];
+            int64_t v49 = (v10)[(int64_t)((uint64_t)((int64_t)((int32_t)v48)) + (uint64_t)v17)];
             // pto: %42
             int64_t v50 = (v10)[v40];
             // pto: %arrived__ssa_v0_peer_pview

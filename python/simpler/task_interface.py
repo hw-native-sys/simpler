@@ -1017,19 +1017,22 @@ def _validate_remote_sidecar_access(args: TaskArgs, remote_sidecar: _RemoteTaskA
             )
 
 
+class _CommWorkspaceStruct(ctypes.Structure):
+    _fields_ = [("addr", ctypes.c_uint64), ("size", ctypes.c_uint64)]
+
+
 class _CommContextStruct(ctypes.Structure):
     _fields_ = [
-        ("workSpace", ctypes.c_uint64),
-        ("workSpaceSize", ctypes.c_uint64),
         ("rankId", ctypes.c_uint32),
         ("rankNum", ctypes.c_uint32),
         ("winSize", ctypes.c_uint64),
         ("windowsIn", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
         ("windowsOut", ctypes.c_uint64 * COMM_MAX_RANK_NUM),
+        ("workspaces", _CommWorkspaceStruct * 3),
     ]
 
 
-assert ctypes.sizeof(_CommContextStruct) == 1056
+assert ctypes.sizeof(_CommContextStruct) == 1088
 
 
 def scalar_to_uint64(value) -> int:

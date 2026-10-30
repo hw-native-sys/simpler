@@ -51,6 +51,7 @@ mkdir -p outputs/urma/ascend
 export ASCEND_PROCESS_LOG_PATH="$PWD/outputs/urma/ascend"
 .claude/skills/onboard-arch-precheck/check.sh a5
 task-submit --device auto --device-num 2 --timeout 1800 --max-time 1800 \
+  --env SIMPLER_ENABLE_PTO_URMA_WORKSPACE \
   --run ".venv/bin/python -m pytest tests/st/a5/tensormap_and_ringbuffer/urma_deferred_completion --platform a5 --device \$TASK_DEVICE --require-pto-isa --pto-session-timeout 1200 -v"
 ```
 
@@ -60,12 +61,12 @@ result. Device logs remain under `outputs/urma/`.
 
 ## CI integration dependency
 
-These cases are validated locally on A5 hardware with URMA enabled. CI retains
-its default SDMA build, where the URMA cases are skipped. URMA execution in CI
-is deferred until [#2739](https://github.com/hw-native-sys/simpler/issues/2739)
-allows SDMA and URMA to be enabled together.
+The `st-onboard-a5` CI job enables `SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON` during
+the build and kernel compilation, and explicitly forwards it into the queued
+pytest process. All six cases run alongside the SDMA example and mixed-workspace
+regressions in the same build. RDMA remains OFF in this job.
 
-The current host build selects one backend for the single
-`CommContext.workSpace`/`workSpaceSize` pair. Use an isolated URMA build for these
-cases so existing SDMA coverage remains available in CI. RDMA defaults to OFF
-when its build environment variable is unset.
+The host build can include SDMA and URMA together. These cases explicitly
+request `workspace_engines=("urma",)` and read `comm_workspace<CommWorkspaceKind::URMA>(*ctx)`;
+the SDMA demo uses its independent descriptor. The URMA build option remains
+opt-in, and RDMA defaults to OFF when its build environment variable is unset.

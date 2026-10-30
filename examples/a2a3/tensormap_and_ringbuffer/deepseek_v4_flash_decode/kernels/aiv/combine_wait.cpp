@@ -115,11 +115,11 @@ static __aicore__ void combine_wait(__gm__ int32_t *v1, int32_t v2, __gm__ int64
         // pto: %1
         if (i11 != v12) {
             // pto: %2
-            int64_t v13 = (v3)[v10];
+            int64_t v13 = (v3)[v8];
             // pto: %3, %4, %5, %6
-            int64_t v14 = (v3)[(int64_t)((uint64_t)((int64_t)((int32_t)v13)) + (uint64_t)v7)];
+            int64_t v14 = (v3)[(int64_t)((uint64_t)((int64_t)((int32_t)v13)) + (uint64_t)v10)];
             // pto: %7, %8
-            int64_t v15 = (v3)[(int64_t)((uint64_t)i11 + (uint64_t)v7)];
+            int64_t v15 = (v3)[(int64_t)((uint64_t)i11 + (uint64_t)v10)];
             // pto: %combine_arrived__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 1, 1> v16 = pto::Shape<1, 1, 1, 1, 1>();
             // pto: %combine_arrived__ssa_v0_peer_pview

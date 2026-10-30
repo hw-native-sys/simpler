@@ -6370,7 +6370,8 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
 
             cw = cast(Any, SimpleNamespace())
 
-            def committed(*args):
+            def committed(*args, workspace_mask):
+                assert workspace_mask == 0
                 ctypes.c_uint64.from_address(args[5]).value = 1
                 return 0xC7, 0xB000, 64
 
@@ -6402,7 +6403,8 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             worker_mod._DOMAIN_REQ_HEADER.pack_into(req_buf, 0, 7, 1, 0, 64, 0)
             struct.pack_into("<I", req_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
 
-            def committed_then_failed(*args):
+            def committed_then_failed(*args, workspace_mask):
+                assert workspace_mask == 0
                 commit_address = args[5]
                 ctypes.c_uint64.from_address(commit_address).value = 1
                 raise MemoryError("tuple conversion failed")
