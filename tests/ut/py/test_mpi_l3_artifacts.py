@@ -204,8 +204,9 @@ def session_harness(monkeypatch, tmp_path):
             if state.close_error is not None:
                 raise state.close_error
 
-    def processor(connection, manifest, inner_worker, inner_handles, registry, *args):
+    def processor(connection, manifest, inner_worker, inner_handles, registry, *args, **kwargs):
         state.processor_registry = registry
+        state.task_completed = kwargs.get("task_completed", args[1] if len(args) > 1 else None)
         connection.sendall(encode_frame(FrameHeader(FrameType.HELLO, 11, 3, 0), b""))
         frame = decode_frame(connection.recv(65536))
         assert frame.header.frame_type is FrameType.SHUTDOWN
@@ -446,6 +447,9 @@ def test_hook_receives_local_chip_handles_before_main_thread_init_and_closes_aft
     )
 
     class HookState:
+        def task_completed(self):
+            state.events.append("task_completed")
+
         def close(self):
             assert "worker_close" in state.events and "processor_stop" in state.events
             state.events.append("hook_close")
@@ -473,6 +477,9 @@ def test_hook_receives_local_chip_handles_before_main_thread_init_and_closes_aft
 
     state.init_callback = initialize_children
     assert state.run() == 0
+    assert callable(state.task_completed)
+    state.task_completed()
+    assert state.events[-1] == "task_completed"
     assert state.events.index("hook") < state.events.index("init") < state.events.index("ready")
     assert "bound" in state.events
     assert state.events.index("worker_close") < state.events.index("hook_close")
@@ -595,6 +602,33 @@ def test_wedged_processor_exits_rank_without_closing_live_hook_state(
         child.join(timeout=2.0)
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="MPI rank teardown probe uses POSIX fork")
+def test_failed_worker_close_keeps_live_hook_state_until_rank_exit(session_harness, hook_module, tmp_path):
+    state = session_harness
+    hook_closed = tmp_path / "unsafe-hook-close"
+
+    class HookState:
+        def close(self):
+            hook_closed.write_text("closed", encoding="utf-8")
+
+    hook_module.prepare = lambda context: HookState()
+    state.manifest["startup_hook"] = {"import_path": hook_module.__name__ + ":prepare", "parameters": {}}
+    state.close_error = RuntimeError("accepted run fences still live; teardown deferred")
+    # Real Worker.close explicitly retains its tree on a failed drain. Model
+    # that existing inventory contract at the actual MPI session cleanup seam.
+    state.init_callback = lambda: setattr(state.worker, "_has_live_resources", lambda: True)
+    child = multiprocessing.get_context("fork").Process(target=state.run)
+    child.start()
+    try:
+        child.join(timeout=2.0)
+        assert child.exitcode == 124, "Unconfirmed worker teardown must retain hook state and fail-stop the rank"
+        assert not hook_closed.exists(), "Live invocation storage must survive a failed inner-worker close"
+    finally:
+        if child.is_alive():
+            child.terminate()
+        child.join(timeout=2.0)
+
+
 def test_failed_init_keeps_hook_alive_until_worker_close_and_preserves_startup_cause(session_harness, hook_module):
     state = session_harness
 
@@ -608,6 +642,9 @@ def test_failed_init_keeps_hook_alive_until_worker_close_and_preserves_startup_c
     state.manifest["startup_hook"] = {"import_path": hook_module.__name__ + ":prepare", "parameters": {}}
     state.init_error = RuntimeError("primary init failure")
     state.close_error = RuntimeError("secondary worker cleanup error")
+    # This startup mock has no live tree or accepted work. Supplying the real
+    # inventory contract distinguishes it from an unconfirmed failed teardown.
+    state.init_callback = lambda: setattr(state.worker, "_has_live_resources", lambda: False)
     assert state.run() == 1
     assert "primary init failure" in state.mailbox.terminal_reason()
     assert "hook_close" in state.events and state.mailbox.closed

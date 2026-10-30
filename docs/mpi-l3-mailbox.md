@@ -98,7 +98,24 @@ artifacts introduce no second CHIP payload or metadata format.
 A hook returns `None` or an object with `close()`. The session keeps that object
 alive until the command processor has drained and the inner worker has closed,
 then closes it, including during failed startup. Cleanup continues after an
-individual cleanup error and preserves the original startup failure.
+individual cleanup error and preserves the original startup failure when the
+inner worker's inventory proves that no live resources or accepted work remain.
+An unconfirmed inner-worker close instead exits the rank with status 124 while
+retaining hook state, just as an undrained command processor does.
+The returned object may additionally implement `task_completed()`. The command
+processor calls it once after each successful `inner_worker.run()` has drained
+the complete task DAG, before sending a successful completion reply. It is not
+called when execution fails. A callback error produces a failed task completion;
+the hook object remains alive until worker close so uncertain state can be
+retained safely. The callback receives no compiler-specific objects or arguments.
+
+钩子返回对象还可实现 `task_completed()`。命令处理器在每次成功的
+`inner_worker.run()` 完整排空任务 DAG 后、发送成功完成回复前调用一次。执行失败时
+不调用；回调异常会生成失败的任务完成回复。钩子对象始终保留到内部 Worker 关闭后，
+因此可以安全持有尚未确认完成的状态。该回调没有参数，也不依赖任何编译器对象。
+若内部 Worker 关闭失败，只有在其资源清单能证明没有存活资源、已接收任务及活动操作时，
+才继续释放钩子状态；否则 rank 保留钩子状态并以状态码 124 退出。
+
 If the command processor remains alive after its bounded drain wait, the rank
 exits with status 124 while retaining its worker and hook state until process
 exit. Registry, hook, and initialization errors include the supplied artifact

@@ -497,6 +497,7 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
                     inner_handles,
                     dispatch_registry,
                     bridge.prepare_import,
+                    getattr(hook_state, "task_completed", None),
                 )
             except BaseException as exc:  # noqa: BLE001
                 connection.events.put(("processor_error", (type(exc).__name__, str(exc))))
@@ -530,6 +531,31 @@ def _run_group_session(  # noqa: PLR0912, PLR0915 -- startup, ordered dispatch, 
                     closeable.close()
                 except BaseException as exc:  # noqa: BLE001 -- cleanup must preserve the original startup failure.
                     errors.append(exc)
+                    if closeable is inner_worker:
+                        # CLOSED rejects admission but does not prove teardown:
+                        # failed close retains live fences, children and buffers.
+                        # Hook-owned storage cannot be released without a drain
+                        # proof; fail-stop keeps it alive until process exit.
+                        try:
+                            inventory = getattr(inner_worker, "_has_live_resources", None)
+                            drained = (
+                                callable(inventory)
+                                and not inventory()
+                                and not getattr(inner_worker, "_accepted_run_handles", ())
+                                and not getattr(inner_worker, "_abandoned_run_handles", ())
+                                and not getattr(inner_worker, "_active_ops", 0)
+                            )
+                        except BaseException:  # noqa: BLE001 -- an interrupted proof is not a drain proof.
+                            drained = False
+                        if not drained:
+                            print(_format_remote_error(f"MPI rank {rank} cleanup", exc), file=sys.stderr)
+                            print(
+                                f"MPI rank {rank} cleanup: worker teardown is unconfirmed; "
+                                "exiting rank while retaining live hook state",
+                                file=sys.stderr,
+                                flush=True,
+                            )
+                            os._exit(124)
         for error in errors:
             print(_format_remote_error(f"MPI rank {rank} cleanup", error), file=sys.stderr)
         return not errors

@@ -685,6 +685,7 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
     manifest_inner_handles: dict[tuple[CallableKind, bytes], CallableHandle] | None = None,
     manifest_dispatch_registry: dict[bytes, Callable[..., Any]] | None = None,
     global_domain_prepare_import: Callable[[GlobalDomainCommand, Worker, int], bytes | None] | None = None,
+    task_completed: Callable[[], None] | None = None,
 ) -> None:
     session_id = int(manifest["session_id"])
     worker_id = int(manifest["worker_id"])
@@ -1224,6 +1225,11 @@ def _run_command_loop(  # noqa: PLR0912, PLR0915
                 try:
                     task.config.output_prefix = _level_capture_prefix(task.config.output_prefix, inner_worker)
                     inner_worker.run(orch_fn, task_args, task.config)
+                    # Hook-owned invocation state can outlive the Python graph
+                    # callback. Retire it only after Worker.run drains the DAG;
+                    # a failed/uncertain run retains it until worker shutdown.
+                    if task_completed is not None:
+                        task_completed()
                 finally:
                     for backing in inline_backings:
                         backing.close()
