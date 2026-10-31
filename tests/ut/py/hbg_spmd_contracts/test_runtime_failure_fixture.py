@@ -241,7 +241,17 @@ def test_nonreturning_probe_is_hardware_only_and_covers_each_executing_lane(nati
     assert platforms == [["a5"]]
     shapes = [mark.args[1] for mark in test.pytestmark if mark.name == "parametrize"]
     assert len(shapes) == 1
-    assert sorted(shapes[0]) == [(mask, lane) for mask in range(1, 8) for lane in range(3) if mask & (1 << lane)]
+    entries = shapes[0]
+    assert sorted(entry.values for entry in entries) == [
+        (mask, lane) for mask in range(1, 8) for lane in range(3) if mask & (1 << lane)
+    ]
+    # The sweep keeps every shape; what the tiering decides is which of them a
+    # PR waits for. An unmarked entry is Per-PR, and every other one carries
+    # exactly the a5 manual mark that defers it to the daily sweep.
+    assert {entry.values for entry in entries if not entry.marks} == native._PER_PR_SHAPES
+    for entry in entries:
+        if entry.marks:
+            assert [(mark.name, mark.args[0]) for mark in entry.marks] == [("manual", ["a5"])]
 
 
 def _nonreturning_capture():

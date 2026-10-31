@@ -39,13 +39,32 @@ _TICKET_SHAPES = ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2))
 # slot 1, which is the one every capture check special-cases, and all three
 # lanes together.
 _SIM_SHAPES = frozenset({(4, 2), (7, 0)})
+# Which shapes the silicon carries on every PR. The sweep's cost is one device
+# and one process per case, and the containment machinery under test is shared
+# across every shape, so Per-PR coverage takes one shape per lane position —
+# lane 0 as an AIC's only lane, lane 2 as an AIV's only lane, and lane 1
+# faulting while two siblings must also be contained. The rest of the sweep is
+# what separates a lane-indexing fault from a shared one, which is a question
+# for the daily sweep rather than for every PR.
+_PER_PR_SHAPES = frozenset({(1, 0), (4, 2), (7, 1)})
+
+
+def _onboard_shape_params(shapes):
+    """Shapes for a case the simulator cannot carry: only the Per-PR tier varies."""
+    return [
+        pytest.param(mask, lane, marks=[] if (mask, lane) in _PER_PR_SHAPES else [pytest.mark.manual(["a5"])])
+        for mask, lane in shapes
+    ]
 
 
 def _shape_params(shapes):
-    return [
-        pytest.param(mask, lane, marks=[] if (mask, lane) in _SIM_SHAPES else [pytest.mark.platforms(["a5"])])
-        for mask, lane in shapes
-    ]
+    params = []
+    for mask, lane in shapes:
+        marks = [] if (mask, lane) in _SIM_SHAPES else [pytest.mark.platforms(["a5"])]
+        if (mask, lane) not in _PER_PR_SHAPES:
+            marks.append(pytest.mark.manual(["a5"]))
+        params.append(pytest.param(mask, lane, marks=marks))
+    return params
 
 
 pytestmark = [
@@ -235,7 +254,7 @@ def test_bounded_kernel_timeout_keeps_failed_run_contained(st_platform, st_devic
 
 @pytest.mark.platforms(["a5"])
 @pytest.mark.timeout(180)
-@pytest.mark.parametrize("mask,lane", _SHAPES)
+@pytest.mark.parametrize("mask,lane", _onboard_shape_params(_SHAPES))
 def test_nonreturning_kernel_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, monkeypatch):
     # The simulator has no STARS watchdog; a non-returning kernel would wedge it.
     assert st_platform == "a5"
