@@ -31,6 +31,7 @@
 #include "common/unified_log.h"
 #include "spin_hint.h"  // PLATFORM_TENSOR_DATA_WAIT_TIMEOUT_MS (platform-variant data-wait budget)
 #include "tensormap_and_ringbuffer/task_id.h"
+#include "tensormap_and_ringbuffer/blocking_wait.h"
 #if SIMPLER_DFX
 #include "aicpu/scope_stats_collector_aicpu.h"
 #endif
@@ -50,6 +51,17 @@ static constexpr uint64_t TENSOR_DATA_TIMEOUT_CYCLES =
 static TaskOutputTensors
 submit_task_impl(RuntimeContext *rt, const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
     return rt->orchestrator.submit_task(mixed_kernels, args);
+}
+
+static TaskOutputTensors submit_task_with_wait_impl(
+    RuntimeContext *rt, const MixedKernels &kernels, const CoreTaskArgs &args, const BlockingWait &wait
+) {
+    return rt->orchestrator.submit_task_with_wait(kernels, args, wait);
+}
+
+const BlockingWaitOps *runtime_blocking_wait_ops() {
+    static const BlockingWaitOps ops{BLOCKING_WAIT_OPS_VERSION, sizeof(BlockingWaitOps), submit_task_with_wait_impl};
+    return &ops;
 }
 
 static TaskOutputTensors alloc_tensors_impl(RuntimeContext *rt, const CoreTaskArgs &args) {

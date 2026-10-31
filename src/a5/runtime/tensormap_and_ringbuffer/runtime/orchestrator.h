@@ -63,6 +63,8 @@ struct OrchestratorLayout {
  *
  * Contains all state needed for task graph construction and buffer management.
  */
+struct BlockingWait;
+
 struct OrchestratorState {
     // === SHARED MEMORY ACCESS ===
     SharedMemoryHeader *sm_header;
@@ -193,9 +195,15 @@ struct OrchestratorState {
     void begin_scope(ScopeMode mode = ScopeMode::AUTO);
     void end_scope();
     TaskOutputTensors submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
+    TaskOutputTensors
+    submit_task_with_wait(const MixedKernels &mixed_kernels, const CoreTaskArgs &args, const BlockingWait &wait);
     TaskOutputTensors submit_dummy_task(const CoreTaskArgs &args);
     TaskOutputTensors alloc_tensors(const CoreTaskArgs &args);
     void mark_done();
+
+private:
+    TaskOutputTensors
+    submit_task_impl(const MixedKernels &mixed_kernels, const CoreTaskArgs &args, const BlockingWait *wait);
 };
 
 // =============================================================================

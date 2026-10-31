@@ -37,8 +37,9 @@
 #include "runtime_types.h"  // SIMPLER_ERROR_*
 #include "submit_types.h"   // MixedKernels, INVALID_KERNEL_ID, subtask slots
 #include "types.h"          // Arg, TaskOutputTensors, TensorArgType
-#include "task_args.h"      // ChipStorageTaskArgs, simpler::tmr::Tensor
-#include "tensor.h"         // simpler::tmr::Tensor, TensorCreateInfo
+#include "tensormap_and_ringbuffer/blocking_wait.h"
+#include "task_args.h"  // ChipStorageTaskArgs, simpler::tmr::Tensor
+#include "tensor.h"     // simpler::tmr::Tensor, TensorCreateInfo
 
 // =============================================================================
 // simpler::tmr::Tensor Factory Helpers
@@ -177,6 +178,21 @@ static inline TaskOutputTensors rt_submit_task(const MixedKernels &mixed_kernels
     return rt->ops->submit_task(rt, mixed_kernels, args);
 }
 
+static inline TaskOutputTensors
+rt_submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args, const BlockingWait &wait) {
+    const BlockingWaitOps *ops = framework_current_blocking_wait_ops();
+    RuntimeContext *rt = current_runtime();
+    if (rt->ops->is_fatal(rt)) return {};
+    if (ops == nullptr || ops->version != BLOCKING_WAIT_OPS_VERSION || ops->size < sizeof(BlockingWaitOps) ||
+        ops->submit_task == nullptr) {
+        rt->ops->report_fatal(
+            rt, SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "runtime does not support blocking-wait admission"
+        );
+        return {};
+    }
+    return ops->submit_task(rt, mixed_kernels, args, wait);
+}
+
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
@@ -186,6 +202,13 @@ static inline TaskOutputTensors rt_submit_aic_task(int32_t kernel_id, const Core
     return rt_submit_task(mk, args);
 }
 
+static inline TaskOutputTensors
+rt_submit_aic_task(int32_t kernel_id, const CoreTaskArgs &args, const BlockingWait &wait) {
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    return rt_submit_task(mk, args, wait);
+}
+
 /**
  * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
  */
@@ -193,6 +216,13 @@ static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, const Core
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt_submit_task(mk, args);
+}
+
+static inline TaskOutputTensors
+rt_submit_aiv_task(int32_t kernel_id, const CoreTaskArgs &args, const BlockingWait &wait) {
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    return rt_submit_task(mk, args, wait);
 }
 
 /**

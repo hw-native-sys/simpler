@@ -34,13 +34,25 @@ extern "C" void unified_log_error(const char *func, const char *fmt, ...);
 namespace {
 // Plain global (not thread_local) to avoid glibc TLSDESC stale-resolution
 // crash (BZ #32412) when the orchestration SO is dlclose'd/re-dlopen'd
-// between execution rounds.  All orchestrator threads bind the same rt
-// value, so per-thread storage is unnecessary.
+// between execution rounds. The orchestrator thread binds before the user
+// entry; the last participant clears the binding after every participant joins.
 RuntimeContext *g_current_runtime = nullptr;
+const BlockingWaitOps *g_current_blocking_wait_ops = nullptr;
 }  // namespace
 
 extern "C" __attribute__((visibility("default"))) void framework_bind_runtime(RuntimeContext *rt) {
     g_current_runtime = rt;
+    __atomic_store_n(&g_current_blocking_wait_ops, nullptr, __ATOMIC_RELEASE);
+}
+
+extern "C" __attribute__((visibility("default"))) void
+framework_bind_runtime_with_wait(RuntimeContext *rt, const BlockingWaitOps *ops) {
+    g_current_runtime = rt;
+    __atomic_store_n(&g_current_blocking_wait_ops, ops, __ATOMIC_RELEASE);
+}
+
+extern "C" __attribute__((visibility("hidden"))) const BlockingWaitOps *framework_current_blocking_wait_ops() {
+    return __atomic_load_n(&g_current_blocking_wait_ops, __ATOMIC_ACQUIRE);
 }
 
 // Keep current_runtime local to this .so so orchestration helpers do not

@@ -32,8 +32,11 @@
 extern "C" {
 #endif
 struct RuntimeContext;
+struct BlockingWaitOps;
 RuntimeContext *framework_current_runtime(void);
 void framework_bind_runtime(RuntimeContext *rt);
+const BlockingWaitOps *framework_current_blocking_wait_ops(void);
+void framework_bind_runtime_with_wait(RuntimeContext *rt, const BlockingWaitOps *ops);
 #ifdef __cplusplus
 }
 #endif

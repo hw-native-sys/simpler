@@ -514,6 +514,9 @@ private:
     __attribute__((noinline, cold)) void
     log_stall_diagnostics(int32_t thread_idx, int32_t idle_iterations, StallDumpReport report);
 
+    // Called only by the owner, while its dispatch/completion path is paused.
+    __attribute__((noinline, cold)) void log_owned_dispatch_records(int32_t thread_idx, StallDumpReport report);
+
     __attribute__((noinline, cold)) void
     log_global_stall_diagnostics(int32_t trigger_thread_idx, int32_t idle_iterations, int32_t last_progress_count);
 

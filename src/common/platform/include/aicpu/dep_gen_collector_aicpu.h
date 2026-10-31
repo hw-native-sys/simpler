@@ -142,6 +142,21 @@ void dep_gen_aicpu_record_submit(
 );
 
 /**
+ * Append additional dependencies after the explicit span in the same base/overflow
+ * chain. Every additional dependency carries additional_dep_kind; duplicate task
+ * ids remain separate entries for replay to merge by flags. Both spans are borrowed
+ * only for this call. A negative additional count, a nonempty null additional span,
+ * or a combined count above INT_MAX drops the capture before reading either span.
+ * The record carries dependency kinds, not a target task's admission policy.
+ */
+void dep_gen_aicpu_record_submit(
+    TaskId task_id, bool in_manual_scope, bool early_dispatch, int tensor_count, const void *const *tensor_ptrs,
+    const uint8_t *arg_types, int explicit_dep_count, const TaskId *explicit_deps,
+    const uint8_t *explicit_dep_kinds_raw, uint8_t default_explicit_dep_kind, int block_num,
+    const int32_t kernel_ids[3], int additional_dep_count, const TaskId *additional_deps, uint8_t additional_dep_kind
+);
+
+/**
  * Push the current (partially-filled) DepGenBuffer to the orchestrator
  * thread's ready_queue so the host can pick it up. Called once at end of
  * run, after the orchestrator's last submit.

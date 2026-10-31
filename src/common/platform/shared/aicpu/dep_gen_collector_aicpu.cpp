@@ -29,6 +29,7 @@
 #include "aicpu/dep_gen_collector_aicpu.h"
 
 #include <cstring>
+#include <limits>
 
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/diagnostic_run_terminal_aicpu.h"
@@ -277,6 +278,18 @@ void dep_gen_aicpu_record_submit(
     const uint8_t *arg_types, int explicit_dep_count, const TaskId *explicit_deps,
     const uint8_t *explicit_dep_kinds_raw, uint8_t default_explicit_dep_kind, int block_num, const int32_t kernel_ids[3]
 ) {
+    dep_gen_aicpu_record_submit(
+        task_id, in_manual_scope, early_dispatch, tensor_count, tensor_ptrs, arg_types, explicit_dep_count,
+        explicit_deps, explicit_dep_kinds_raw, default_explicit_dep_kind, block_num, kernel_ids, 0, nullptr, 0
+    );
+}
+
+void dep_gen_aicpu_record_submit(
+    TaskId task_id, bool in_manual_scope, bool early_dispatch, int tensor_count, const void *const *tensor_ptrs,
+    const uint8_t *arg_types, int explicit_dep_count, const TaskId *explicit_deps,
+    const uint8_t *explicit_dep_kinds_raw, uint8_t default_explicit_dep_kind, int block_num,
+    const int32_t kernel_ids[3], int additional_dep_count, const TaskId *additional_deps, uint8_t additional_dep_kind
+) {
     if (!g_enable_dep_gen) {
         return;
     }
@@ -315,6 +328,24 @@ void dep_gen_aicpu_record_submit(
     int dc = explicit_dep_count;
     if (dc < 0) dc = 0;
     if (dc > 0 && explicit_deps == nullptr) dc = 0;
+    if (additional_dep_count < 0 || (additional_dep_count > 0 && additional_deps == nullptr)) {
+        LOG_ERROR("dep_gen: invalid additional dependency span (count=%d), dropping record", additional_dep_count);
+        saturating_add(s_dep_gen_state->dropped_record_count, 1);
+        wmb();
+        return;
+    }
+    const int explicit_dc = dc;
+    const int64_t combined_dc = static_cast<int64_t>(explicit_dc) + additional_dep_count;
+    if (combined_dc > std::numeric_limits<int>::max()) {
+        LOG_ERROR(
+            "dep_gen: combined dependency count exceeds INT_MAX (explicit=%d additional=%d), dropping record",
+            explicit_dc, additional_dep_count
+        );
+        saturating_add(s_dep_gen_state->dropped_record_count, 1);
+        wmb();
+        return;
+    }
+    dc = static_cast<int>(combined_dc);
     int needed = dep_gen_records_needed_for(dc);
 
     rmb();
@@ -393,6 +424,29 @@ void dep_gen_aicpu_record_submit(
         tc = CORE_MAX_TENSOR_ARGS;
     }
 
+    // A destination range intersects at most two borrowed source spans. The
+    // buffer budget bounds the range before any source pointer arithmetic.
+    auto copy_deps = [&](TaskId *deps, uint8_t *kinds, int offset, int count) {
+        int first_count = offset < explicit_dc ? explicit_dc - offset : 0;
+        if (first_count > count) first_count = count;
+        if (first_count > 0) {
+            memcpy(deps, explicit_deps + offset, static_cast<size_t>(first_count) * sizeof(TaskId));
+            if (explicit_dep_kinds_raw != nullptr) {
+                memcpy(kinds, explicit_dep_kinds_raw + offset, static_cast<size_t>(first_count));
+            } else {
+                memset(kinds, default_explicit_dep_kind, static_cast<size_t>(first_count));
+            }
+        }
+        const int second_count = count - first_count;
+        if (second_count > 0) {
+            const int second_offset = offset + first_count - explicit_dc;
+            memcpy(
+                deps + first_count, additional_deps + second_offset, static_cast<size_t>(second_count) * sizeof(TaskId)
+            );
+            memset(kinds + first_count, additional_dep_kind, static_cast<size_t>(second_count));
+        }
+    };
+
     // ---- Write base record ----
     uint32_t idx = local_count;
     DepGenRecord *rec = &buf->records[idx];
@@ -416,12 +470,7 @@ void dep_gen_aicpu_record_submit(
 
     // explicit_deps (tail of the entry, packed; replay reads only the first base_dc entries)
     if (base_dc > 0) {
-        memcpy(rec->explicit_deps, explicit_deps, static_cast<size_t>(base_dc) * sizeof(TaskId));
-        if (explicit_dep_kinds_raw != nullptr) {
-            memcpy(rec->explicit_dep_kinds, explicit_dep_kinds_raw, static_cast<size_t>(base_dc));
-        } else {
-            memset(rec->explicit_dep_kinds, default_explicit_dep_kind, static_cast<size_t>(base_dc));
-        }
+        copy_deps(rec->explicit_deps, rec->explicit_dep_kinds, 0, base_dc);
     }
 
     // arg_types
@@ -482,12 +531,7 @@ void dep_gen_aicpu_record_submit(
         over->dep_count = static_cast<uint16_t>(chunk);
         over->_reserved = 0;
         if (chunk > 0) {
-            memcpy(over->deps, explicit_deps + written, static_cast<size_t>(chunk) * sizeof(TaskId));
-            if (explicit_dep_kinds_raw != nullptr) {
-                memcpy(over->kinds, explicit_dep_kinds_raw + written, static_cast<size_t>(chunk));
-            } else {
-                memset(over->kinds, default_explicit_dep_kind, static_cast<size_t>(chunk));
-            }
+            copy_deps(over->deps, over->kinds, written, chunk);
         }
         written += chunk;
     }

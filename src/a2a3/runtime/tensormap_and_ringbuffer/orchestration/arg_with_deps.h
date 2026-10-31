@@ -159,3 +159,21 @@ template <size_t N>
 static inline TaskOutputTensors rt_submit_aiv_task(int32_t kernel_id, CoreTaskArgsWithDeps<N> &awd) {
     return rt_submit_aiv_task(kernel_id, awd.finalize_for_submit());
 }
+
+template <size_t N>
+static inline TaskOutputTensors
+rt_submit_task(const MixedKernels &kernels, CoreTaskArgsWithDeps<N> &args, const BlockingWait &wait) {
+    return rt_submit_task(kernels, args.finalize_for_submit(), wait);
+}
+
+template <size_t N>
+static inline TaskOutputTensors
+rt_submit_aic_task(int32_t kernel_id, CoreTaskArgsWithDeps<N> &args, const BlockingWait &wait) {
+    return rt_submit_aic_task(kernel_id, args.finalize_for_submit(), wait);
+}
+
+template <size_t N>
+static inline TaskOutputTensors
+rt_submit_aiv_task(int32_t kernel_id, CoreTaskArgsWithDeps<N> &args, const BlockingWait &wait) {
+    return rt_submit_aiv_task(kernel_id, args.finalize_for_submit(), wait);
+}

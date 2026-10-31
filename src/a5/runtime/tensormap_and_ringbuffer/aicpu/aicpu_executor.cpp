@@ -70,10 +70,10 @@
 #include "scheduler/scheduler_context.h"
 
 // Device orchestration function signature (loaded via dlopen).
-// The executor binds the current thread's RuntimeContext into orchestration TLS
-// before calling the user entry.
+// The orchestrator thread binds this run's RuntimeContext before calling the user entry.
 typedef void (*DeviceOrchestrationFunc)(const ChipTaskArgs &orch_args);
 typedef void (*DeviceOrchestrationBindRuntimeFunc)(RuntimeContext *rt);
+typedef void (*DeviceOrchestrationBindRuntimeWithWaitFunc)(RuntimeContext *rt, const BlockingWaitOps *ops);
 
 // Config function exported by orchestration .so
 typedef OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const ChipTaskArgs &orch_args);
@@ -81,6 +81,7 @@ typedef OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const ChipTaskArgs 
 // From orchestration/common.cpp linked into this DSO — updates g_current_runtime here (distinct from
 // framework_bind_runtime in the dlopen'd libdevice_orch_*.so).
 extern "C" void framework_bind_runtime(RuntimeContext *rt);
+extern "C" void framework_bind_runtime_with_wait(RuntimeContext *rt, const BlockingWaitOps *ops);
 
 constexpr const char *DEFAULT_ORCH_ENTRY_SYMBOL = "aicpu_orchestration_entry";
 constexpr const char *DEFAULT_ORCH_CONFIG_SYMBOL = "aicpu_orchestration_config";
@@ -125,6 +126,7 @@ struct OrchSoEntry {
     char path[256]{};
     DeviceOrchestrationFunc func{nullptr};
     DeviceOrchestrationBindRuntimeFunc bind{nullptr};
+    DeviceOrchestrationBindRuntimeWithWaitFunc bind_wait{nullptr};
     DeviceOrchestrationConfigFunc config_func{nullptr};
 };
 
@@ -214,6 +216,7 @@ struct AicpuExecutor {
             entry.handle = nullptr;
             entry.func = nullptr;
             entry.bind = nullptr;
+            entry.bind_wait = nullptr;
             entry.config_func = nullptr;
         }
         if (entry.path[0] != '\0' && unlink(entry.path) != 0 && errno != ENOENT) return -1;
@@ -566,17 +569,25 @@ int32_t AicpuExecutor::load_orch_so(
     }
 
     dlerror();
+    auto bind_wait_func =
+        reinterpret_cast<DeviceOrchestrationBindRuntimeWithWaitFunc>(dlsym(handle, "framework_bind_runtime_with_wait"));
+    if (dlerror() != nullptr) bind_wait_func = nullptr;
+
+    dlerror();
     auto bind_runtime_func =
         reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "framework_bind_runtime"));
     const char *bind_runtime_error = dlerror();
     if (bind_runtime_error != nullptr) {
-        LOG_ERROR("Thread %d: dlsym failed for framework_bind_runtime: %s", thread_idx, bind_runtime_error);
+        if (bind_wait_func == nullptr) {
+            LOG_ERROR("Thread %d: dlsym failed for framework_bind_runtime: %s", thread_idx, bind_runtime_error);
+        }
         bind_runtime_func = nullptr;
     }
 
     entry.handle = handle;
     entry.func = orch_func;
     entry.bind = bind_runtime_func;
+    entry.bind_wait = bind_wait_func;
     entry.config_func = config_func;
     snprintf(entry.path, sizeof(entry.path), "%s", so_path);
     entry.in_use = true;
@@ -638,10 +649,11 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
         // threads spin-wait on runtime_init_ready_ across this whole region.
         // Each sub-phase gets its own `{}` scope so the boundaries are
         // visible and an early `return` still records the end via the guard
-        // dtor. The few values used past their phase (p_func / p_bind for the
+        // dtor. The few values used past their phase (function/binder pointers for the
         // orch call below; rt / sm_ptr across phases) are declared out here.
         DeviceOrchestrationFunc *p_func = nullptr;
         DeviceOrchestrationBindRuntimeFunc *p_bind = nullptr;
+        DeviceOrchestrationBindRuntimeWithWaitFunc *p_bind_wait = nullptr;
         void *sm_ptr = nullptr;
         uint64_t sm_size = 0;
         {
@@ -649,6 +661,7 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
             OrchSoEntry &entry = orch_so_table_[callable_id];
             p_func = &entry.func;
             p_bind = &entry.bind;
+            p_bind_wait = &entry.bind_wait;
             DeviceOrchestrationConfigFunc *p_config_func = &entry.config_func;
 
             // Entry values arrive either in the descriptor already or as raw
@@ -846,8 +859,11 @@ int32_t AicpuExecutor::run_orchestration(Runtime *runtime, int32_t thread_idx) {
 #if SIMPLER_DFX
         orch_cycle_start = get_sys_cnt_aicpu();
 #endif
-        framework_bind_runtime(rt);
-        if (*p_bind != nullptr) {
+        const BlockingWaitOps *wait_ops = runtime_blocking_wait_ops();
+        framework_bind_runtime_with_wait(rt, wait_ops);
+        if (*p_bind_wait != nullptr) {
+            (*p_bind_wait)(rt, wait_ops);
+        } else if (*p_bind != nullptr) {
             (*p_bind)(rt);
         }
         rt_scope_begin(rt);
@@ -1096,9 +1112,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             const int32_t callable_id = runtime->get_active_callable_id();
             framework_bind_runtime(nullptr);
             if (callable_id >= 0 && callable_id < MAX_REGISTERED_CALLABLE_IDS) {
-                DeviceOrchestrationBindRuntimeFunc bind = orch_so_table_[callable_id].bind;
-                if (bind != nullptr) {
-                    bind(nullptr);
+                const OrchSoEntry &entry = orch_so_table_[callable_id];
+                if (entry.bind_wait != nullptr) {
+                    entry.bind_wait(nullptr, nullptr);
+                } else if (entry.bind != nullptr) {
+                    entry.bind(nullptr);
                 }
             }
             runtime_destroy(rt, runtime_arena_);

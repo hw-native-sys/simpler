@@ -126,6 +126,7 @@ nav:
           - CANN source references: hardware/cann-source-references.md
   - Kernels:
       - AICore Kernel Programming: aicore-kernel-programming.md
+      - Blocking waits and task progress: aicore-kernel-programming/blocking-waits.md
       - L2 Cache Bypass: l2-cache-bypass.md
       - a5 SIMT Launch: simt-launch.md
       - Manual Scope: manual-scope.md

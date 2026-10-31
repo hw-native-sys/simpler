@@ -66,6 +66,9 @@ enum RuntimeMode {
  */
 typedef struct RuntimeContext RuntimeContext;  // forward declare for ops signatures
 
+struct BlockingWaitOps;
+__attribute__((visibility("hidden"))) const BlockingWaitOps *runtime_blocking_wait_ops();
+
 struct RuntimeOps {
     TaskOutputTensors (*submit_task)(RuntimeContext *rt, const MixedKernels &mixed_kernels, const CoreTaskArgs &args);
     void (*scope_begin)(RuntimeContext *rt);

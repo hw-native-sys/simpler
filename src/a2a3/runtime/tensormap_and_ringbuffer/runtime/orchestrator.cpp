@@ -18,9 +18,11 @@
  */
 
 #include "orchestrator.h"
+#include "tensormap_and_ringbuffer/blocking_wait.h"
 
 #include <assert.h>
 #include <inttypes.h>
+#include <limits>
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -64,6 +66,10 @@ extern "C" __attribute__((weak, visibility("hidden"))) bool is_dep_gen_enabled()
 __attribute__((weak, visibility("hidden"))) void dep_gen_aicpu_record_submit(
     TaskId, bool, bool, int, const void *const *, const uint8_t *, int, const TaskId *, const uint8_t *, uint8_t, int,
     const int32_t[3]
+) {}
+__attribute__((weak, visibility("hidden"))) void dep_gen_aicpu_record_submit(
+    TaskId, bool, bool, int, const void *const *, const uint8_t *, int, const TaskId *, const uint8_t *, uint8_t, int,
+    const int32_t[3], int, const TaskId *, uint8_t
 ) {}
 
 // Scope_stats enable gate, queried via the same predicate idiom as
@@ -1010,7 +1016,7 @@ static bool ensure_tensormap_capacity(OrchestratorState *orch, int32_t needed) {
 // Orch-side wiring/ready publication.
 static TaskOutputTensors submit_task_common(
     OrchestratorState *orch, const CoreTaskArgs &args, LaneMask active_mask, TaskAttrs task_attrs,
-    int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id
+    int32_t aic_kernel_id, int32_t aiv0_kernel_id, int32_t aiv1_kernel_id, const BlockingWait *wait = nullptr
 ) {
     CYCLE_COUNT_START();
     TaskOutputTensors result;
@@ -1053,12 +1059,22 @@ static TaskOutputTensors submit_task_common(
             arg_types_u8[i] = static_cast<uint8_t>(args.tag(i));
         }
         const int32_t kernel_ids_capture[3] = {aic_kernel_id, aiv0_kernel_id, aiv1_kernel_id};
-        dep_gen_aicpu_record_submit(
-            task_id, orch->in_manual_scope(), args.allow_early_resolve(), tc, tensor_ptrs, arg_types_u8,
-            static_cast<int>(args.explicit_dep_count()), args.explicit_deps_data(),
-            reinterpret_cast<const uint8_t *>(args.explicit_dep_kinds_data()),
-            static_cast<uint8_t>(DEP_WAIT | DEP_RETAIN), args.launch_spec.block_num(), kernel_ids_capture
-        );
+        if (wait != nullptr) {
+            dep_gen_aicpu_record_submit(
+                task_id, orch->in_manual_scope(), args.allow_early_resolve(), tc, tensor_ptrs, arg_types_u8,
+                static_cast<int>(args.explicit_dep_count()), args.explicit_deps_data(),
+                reinterpret_cast<const uint8_t *>(args.explicit_dep_kinds_data()),
+                static_cast<uint8_t>(DEP_WAIT | DEP_RETAIN), args.launch_spec.block_num(), kernel_ids_capture,
+                static_cast<int>(wait->producer_count), wait->producers, static_cast<uint8_t>(DEP_WAIT)
+            );
+        } else {
+            dep_gen_aicpu_record_submit(
+                task_id, orch->in_manual_scope(), args.allow_early_resolve(), tc, tensor_ptrs, arg_types_u8,
+                static_cast<int>(args.explicit_dep_count()), args.explicit_deps_data(),
+                reinterpret_cast<const uint8_t *>(args.explicit_dep_kinds_data()),
+                static_cast<uint8_t>(DEP_WAIT | DEP_RETAIN), args.launch_spec.block_num(), kernel_ids_capture
+            );
+        }
     }
 #endif
 
@@ -1081,28 +1097,35 @@ static TaskOutputTensors submit_task_common(
 
     CYCLE_COUNT_LAP(g_orch_sync_cycle);
 
-    for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
-        TaskId dep_task_id = args.explicit_dep(i);
+    const char *submit_function = __FUNCTION__;
+    auto append_dependency = [&](TaskId dep_task_id, DepFlags kind) -> bool {
         if (!dep_task_id.is_valid()) {
             orch->report_fatal(
-                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.set_dependencies(...) requires valid task ids"
+                SIMPLER_ERROR_INVALID_ARGS, submit_function, "Arg.set_dependencies(...) requires valid task ids"
             );
-            return result;
+            return false;
         }
         uint8_t dep_ring_id = dep_task_id.ring();
         SharedMemoryRingHeader &dep_ring = orch->sm_header->rings[dep_ring_id];
         int32_t dep_local_task_id = dep_task_id.local_id();
         int32_t dep_last_task_alive = dep_ring.fc.last_task_alive.load(std::memory_order_acquire);
         if (dep_local_task_id < dep_last_task_alive) {
-            continue;
+            return true;
         }
         int32_t dep_slot = dep_ring.get_slot_by_task_id(dep_local_task_id);
         ChipTaskSlotState *producer_slot_state = &dep_ring.get_slot_state_by_slot(dep_slot);
-        if (!append_fanin_or_fail(
-                orch, dep_ring_id, dep_slot, producer_slot_state, dep_task_id, &fanin_builder, ring_id,
-                args.explicit_dep_kind(i)
-            )) {
+        return append_fanin_or_fail(
+            orch, dep_ring_id, dep_slot, producer_slot_state, dep_task_id, &fanin_builder, ring_id, kind
+        );
+    };
+    for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
+        if (!append_dependency(args.explicit_dep(i), args.explicit_dep_kind(i))) {
             return result;
+        }
+    }
+    if (wait != nullptr) {
+        for (uint32_t i = 0; i < wait->producer_count; ++i) {
+            if (!append_dependency(wait->producers[i], DEP_WAIT)) return result;
         }
     }
 
@@ -1178,7 +1201,7 @@ static TaskOutputTensors submit_task_common(
     // Store fanin metadata in payload for scheduler to iterate
     payload.fanin_actual_count = fanin_builder.count;
     payload.fanin_wait_count = fanin_builder.wait_count;
-    payload.early_dispatch_blocked = fanin_builder.reduced_unflagged_producer ? 1 : 0;
+    payload.early_dispatch_blocked = fanin_builder.reduced_unflagged_producer || wait != nullptr;
     // fanin_builder.count is finalized here and submit runs once per task, so
     // each dense consumer emits one debug message when enabled. This checks >
     // THRESHOLD because the count lands at its final total here.
@@ -1287,7 +1310,46 @@ static bool require_device_arguments(OrchestratorState *orch, const CoreTaskArgs
     return true;
 }
 
+static bool validate_blocking_wait(OrchestratorState *orch, const BlockingWait &wait) {
+    if (wait.mode != BlockingWaitMode::ProducersComplete) {
+        orch->report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "resident or unknown blocking-wait policy is unsupported"
+        );
+        return false;
+    }
+    if (wait.producer_count == 0 || wait.producers == nullptr ||
+        wait.producer_count > static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+        orch->report_fatal(
+            SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "blocking wait requires named completion predecessors"
+        );
+        return false;
+    }
+    for (uint32_t i = 0; i < wait.producer_count; ++i) {
+        const TaskId producer = wait.producers[i];
+        if (!producer.is_valid() || producer.ring() >= CHIP_MAX_RING_DEPTH || producer.local_id() < 0 ||
+            producer.local_id() >= orch->rings[producer.ring()].task_allocator.task_head()) {
+            orch->report_fatal(
+                SIMPLER_ERROR_INVALID_ARGS, __FUNCTION__, "blocking-wait predecessor %u is not a submitted task", i
+            );
+            return false;
+        }
+    }
+    return true;
+}
+
 TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kernels, const CoreTaskArgs &args) {
+    return submit_task_impl(mixed_kernels, args, nullptr);
+}
+
+TaskOutputTensors OrchestratorState::submit_task_with_wait(
+    const MixedKernels &mixed_kernels, const CoreTaskArgs &args, const BlockingWait &wait
+) {
+    return submit_task_impl(mixed_kernels, args, &wait);
+}
+
+TaskOutputTensors OrchestratorState::submit_task_impl(
+    const MixedKernels &mixed_kernels, const CoreTaskArgs &args, const BlockingWait *wait
+) {
     if (!require_device_arguments(this, args)) return {};
     auto *orch = this;
     // Orchestration API should short-circuit after fatal, but keep this entry
@@ -1308,6 +1370,7 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
         orch_mark_fatal(orch, SIMPLER_ERROR_INVALID_ARGS);
         return TaskOutputTensors{};
     }
+    if (wait != nullptr && !validate_blocking_wait(orch, *wait)) return {};
     const auto &predicate = args.predicate();
     if (predicate.op != PredicateOp::NONE && predicate.operand.tensor != nullptr &&
         predicate.operand.tensor->address_space != AddressSpace::DEVICE) {
@@ -1365,7 +1428,7 @@ TaskOutputTensors OrchestratorState::submit_task(const MixedKernels &mixed_kerne
 
     return submit_task_common(
         orch, args, active_mask, task_attrs, normalized.aic_kernel_id, normalized.aiv0_kernel_id,
-        normalized.aiv1_kernel_id
+        normalized.aiv1_kernel_id, wait
     );
 }
 

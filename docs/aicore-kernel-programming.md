@@ -97,13 +97,15 @@ that the runtime launches:
 | Symbol | Meaning |
 | ------ | ------- |
 | `rt_available_cluster_count()` | Number of physical AICore blocks this run launches — the whole device; there is no per-call knob. |
-| `get_block_num(args)` | Logical block count the kernel partitions work across. Currently always 1; multi-logical-block (`block_num > 1`) is not yet implemented. |
+| `get_block_num(args)` | Logical block count requested by this task's `LaunchSpec`; the scheduler assigns each block its own `block_idx`. |
 
-When the device reports 24 clusters and your kernel sees
-`get_block_num(args) == 1`, that is by design — every physical block
-runs the same kernel and the kernel partitions work however it likes
-using `get_block_idx()` against whatever it expects. Don't conflate
-the two.
+When the device reports 24 clusters and a task requests one logical block,
+that task does not execute once on every physical cluster. Multiple logical
+blocks can be dispatched in batches as compatible cores become available.
+`require_sync_start` requests admission of one task's fitting cohort; it does
+not reserve resources for another task or a remote producer. See the
+[blocking-wait progress contract](aicore-kernel-programming/blocking-waits.md)
+before adding waits between logical blocks or tasks.
 
 ### Each block must write to its own cache line
 
