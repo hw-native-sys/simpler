@@ -1,0 +1,124 @@
+name: vLLM Eager Integration (a2a3)
+
+permissions:
+  contents: read
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: false
+        type: string
+      ref:
+        required: false
+        type: string
+      runs_on:
+        required: true
+        type: string
+      manual_mode:
+        required: false
+        type: string
+        default: exclude
+      model_dir:
+        description: Qwen3-14B BF16 model directory on the runner.
+        required: false
+        type: string
+        default: ""
+      artifact:
+        description: Verified HBG decode artifact directory on the runner.
+        required: false
+        type: string
+        default: ""
+      prompt_ids:
+        description: Frozen 3338-token prompt IDs JSON file on the runner.
+        required: false
+        type: string
+        default: ""
+      adapter_root:
+        description: Checkout containing the fixed-shape vLLM adapter runner.
+        required: false
+        type: string
+        default: ""
+      atb_env:
+        description: NNAL/ATB 9.0 set_env.sh; discovered when empty.
+        required: false
+        type: string
+        default: ""
+      compile_custom_kernels:
+        description: Build vllm-ascend custom kernels.
+        required: false
+        type: string
+        default: "1"
+      vllm_source_dir:
+        description: Cached vLLM v0.20.2 checkout.
+        required: false
+        type: string
+        default: ""
+      vllm_ascend_source_dir:
+        description: Cached vllm-ascend v0.20.2rc1 checkout.
+        required: false
+        type: string
+        default: ""
+
+jobs:
+  run:
+    name: st-vllm-eager-a2a3
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: 150
+    env:
+      TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+      SIMPLER_SCHEDULER_TIMEOUT_MS: "60000"
+      SIMPLER_OP_EXECUTE_TIMEOUT_US: "30000000"
+      SIMPLER_STREAM_SYNC_TIMEOUT_MS: "60000"
+      VLLM_MODEL_DIR: ${{ inputs.model_dir }}
+      VLLM_ARTIFACT: ${{ inputs.artifact }}
+      VLLM_PROMPT_IDS: ${{ inputs.prompt_ids }}
+      VLLM_ADAPTER_ROOT: ${{ inputs.adapter_root }}
+      VLLM_SOURCE_DIR: ${{ inputs.vllm_source_dir }}
+      VLLM_ASCEND_SOURCE_DIR: ${{ inputs.vllm_ascend_source_dir }}
+    steps:
+      - name: Checkout target
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.ref }}
+          persist-credentials: false
+
+      - name: Set up vLLM environment
+        id: vllm
+        uses: ./.github/actions/setup-vllm-eager
+        with:
+          vllm_source_dir: ${{ inputs.vllm_source_dir }}
+          vllm_ascend_source_dir: ${{ inputs.vllm_ascend_source_dir }}
+          compile_custom_kernels: ${{ inputs.compile_custom_kernels }}
+          atb_env: ${{ inputs.atb_env }}
+
+      - name: Run the declared vLLM environment exclusively
+        env:
+          CANN_ENV: ${{ steps.vllm.outputs.cann_env }}
+          ATB_ENV: ${{ steps.vllm.outputs.atb_env }}
+          MANUAL_MODE: ${{ inputs.manual_mode }}
+        run: |
+          case "$MANUAL_MODE" in
+            exclude|include|only) ;;
+            *) echo "::error::manual_mode must be exclude, include, or only"; exit 1 ;;
+          esac
+          source "$CANN_ENV"
+          source "$ATB_ENV"
+          mkdir -p outputs/vllm-eager-ci
+          git rev-parse HEAD | tee outputs/vllm-eager-ci/source.txt
+          task-submit --env CANN_ENV --env ATB_ENV --env MANUAL_MODE \
+            --env VLLM_MODEL_DIR --env VLLM_ARTIFACT --env VLLM_PROMPT_IDS --env VLLM_ADAPTER_ROOT \
+            --env VLLM_SOURCE_DIR --env VLLM_ASCEND_SOURCE_DIR \
+            --timeout 7200 --max-time 7200 --device auto --device-num 1 \
+            --run "source \"\$CANN_ENV\" && source \"\$ATB_ENV\" && .venv-vllm/bin/python .github/actions/setup-vllm-eager/identity.py && .venv-vllm/bin/python -m pytest examples tests/st --platform a2a3 --test-environment vllm_torch_npu --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/vllm-eager-ci/pytest --junitxml outputs/vllm-eager-ci/results.xml && SIMPLER_SCHEDULER_TIMEOUT_MS=2000 SIMPLER_OP_EXECUTE_TIMEOUT_US=3000000 SIMPLER_STREAM_SYNC_TIMEOUT_MS=4000 .venv-vllm/bin/python -m pytest examples tests/st --platform a2a3 --test-environment torch_npu_2_10 --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/vllm-eager-ci/pytest-framework-eager --junitxml outputs/vllm-eager-ci/results-framework-eager.xml"
+          .venv-vllm/bin/python -m simpler_setup.test_environments verify outputs/vllm-eager-ci/results.plan.json outputs/vllm-eager-ci/results.xml
+          .venv-vllm/bin/python -m simpler_setup.test_environments verify outputs/vllm-eager-ci/results-framework-eager.plan.json outputs/vllm-eager-ci/results-framework-eager.xml
+
+      - name: Retain vLLM eager identities and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vllm-eager-a2a3-${{ github.run_id }}-${{ github.run_attempt }}
+          path: outputs/vllm-eager-ci
+          if-no-files-found: warn

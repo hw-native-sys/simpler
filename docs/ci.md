@@ -20,7 +20,7 @@ The complete test-type × hardware-tier matrix. Empty cells have no tests yet; o
 | Category | github-hosted (no hardware) | a2a3 runner | a5 runner |
 | -------- | --------------------------- | ----------- | --------- |
 | **ut** | `ut` (py + cpp) | `ut-a2a3` (py + cpp) | `ut-a5` (py) |
-| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3`, `st-deepseek-onboard-a2a3`, `st-framework-eager-a2a3` | `st-onboard-a5`, `st-framework-eager-a5` |
+| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3`, `st-network1-onboard-a2a3`, `st-deepseek-onboard-a2a3`, `st-framework-eager-a2a3`, `st-vllm-eager-a2a3` | `st-onboard-a5`, `st-framework-eager-a5` |
 
 ## GitHub Actions Jobs
 
@@ -31,9 +31,10 @@ shape. The executable job bodies live in reusable workflows:
 `_packaging.yml`, `_profiling-flags-smoke.yml`, `_st-sim-a2a3.yml`,
 `_st-sim-a5.yml`, `_ut-npu-a2a3.yml`, `_ut-npu-a5.yml`,
 `_st-npu-a2a3.yml`, `_st-npu-a5.yml`, `_st-network1.yml`,
-`_st-deepseek-a2a3.yml`, and `_st-framework-eager.yml`. The simulation,
-ordinary onboard, and NPU unit-test bodies are split by architecture so each
-job renders only its own steps. Framework eager shares `_st-framework-eager.yml`;
+`_st-deepseek-a2a3.yml`, `_st-framework-eager.yml`, and
+`_st-vllm-eager-a2a3.yml`. The simulation, ordinary onboard, and NPU
+unit-test bodies are split by architecture so each job renders only its own
+steps. Framework eager shares `_st-framework-eager.yml`;
 callers supply matching `platform` and `runs_on` inputs. Shared step scaffolding
 that is safe to run after checkout lives in composite actions under `.github/actions/`
 (`apt-install`, `cache-pip`, `cache-ccache`, `setup-gcc-15`, `setup-venv`, and the three `network1-*` actions).
@@ -316,6 +317,14 @@ callers default to `exclude`, while Daily passes `include`. The existing
 framework cases are automated, but a future manual case in this environment is
 discovered and included by Daily without another workflow edit.
 
+The same declared suite has a target-version qualification profile,
+`torch_npu_2_10`. It selects the `test_environment("torch_npu")` cases with the
+vLLM-Ascend 0.20.2rc1 constraints in
+`.github/actions/setup-vllm-eager/constraints.txt` (CPU Torch 2.10.0 and
+torch_npu 2.10.0). The profile reuses the existing declarations instead of
+duplicating cases; its receipt plan records both the selected profile and the
+declared suite it qualifies.
+
 The dedicated environment uses `--system-site-packages` and installs local,
 pinned wheels for CPU Torch 2.7.1 and torch_npu 2.7.1.post4. The pins constrain
 subsequent test/SDK installation too. The profile selects an already installed
@@ -414,6 +423,42 @@ not qualify native failed-drain recovery, pending
 framework-callback close or early HOST-backing release. It does not establish
 overlap, arbitrary strides/cross-tile aliasing, PyPTO dispatch or capture/replay.
 Qualification is limited to the actual platform and environment in each receipt.
+
+### vLLM eager integration (a2a3)
+
+`st-vllm-eager-a2a3` is the Daily integration watch for the fixed-shape
+Qwen3-14B vLLM path tracked by issue #2715. Tests declare
+`@pytest.mark.test_environment("vllm_torch_npu")`. The dedicated A3 job installs
+the pinned vLLM 0.20.2 / vLLM-Ascend 0.20.2rc1 pair with Torch-NPU 2.10.0 using
+the staged upstream recipe, then runs the native vLLM baseline and the Simpler
+decode smoke in separate processes. The same exclusive task then runs the
+target-version framework eager suite through the `torch_npu_2_10` profile, so
+the existing `test_environment("torch_npu")` declarations are qualified on
+Torch-NPU 2.10.0 with their own plan/JUnit receipt. The heavy cases are marked
+`manual`, so Daily includes them while ordinary PR sweeps exclude them.
+
+The runner must provide the model, verified HBG artifact and frozen prompt IDs
+through the `VLLM_MODEL_DIR`, `VLLM_ARTIFACT` and `VLLM_PROMPT_IDS` repository
+variables; `VLLM_ADAPTER_ROOT` selects the adapter checkout, or the
+`qwen3_14b_serving_effective` directory that contains the fixed-shape adapter
+runner. The checkout must support the official stage-0 release layout; the #2605
+head `591f003b` alone requires the legacy `hbg_artifact_manifest.json` and a
+4096-row rope cache, so it cannot consume this release unchanged. Pin the
+adapter checkout from #2758 (`33d266bd555980875fa9a0e5e9c65ef7728bcb9e`) or a
+later revision that keeps the stage-0 contract; its runner validates the
+canonical 3338-token prompt
+(`83d41b1d59bda5281cf2489944632d71247d38c4fdf37bf347d4935297d4d00d`), so
+`VLLM_PROMPT_IDS` must name that prompt file rather than another
+3338-token workload.
+`VLLM_ATB_ENV` pins the NNAL/ATB 9.0.0 environment script, and
+`VLLM_SOURCE_DIR` / `VLLM_ASCEND_SOURCE_DIR` may point at cached source
+checkouts. Missing paths, missing packages, wrong package versions, or an ATB
+line other than 9.0 fail the selected cases; they are not reported as skips.
+The job retains `identity.json`, the environment status/freeze files, the
+plan/JUnit and per-case logs. Both backends run the 16-request cohort (Gate 4a)
+and one active request with isolated fixed-shape padding (Gate 4b) through the
+same adapter contract. It does not qualify numerical equivalence beyond the
+two-token smoke; the 128-token gate remains with #2429.
 
 ### CPU emergency lane (`ci-self-cpu.yml`) and the `/run-cpu` button
 

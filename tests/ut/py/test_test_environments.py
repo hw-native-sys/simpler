@@ -436,6 +436,123 @@ def test_actual_preflight_checks_metadata_without_importing_backends(tmp_path, m
         test_environments.preflight("torch_npu")
 
 
+def test_vllm_environment_registry_and_constraints():
+    profile = test_environments.ENVIRONMENTS["vllm_torch_npu"]
+    assert profile.execution == "direct"
+    assert profile.cann_minimum == (9, 0)
+    assert dict(profile.modules) == {
+        "torch": "torch",
+        "torch-npu": "torch_npu",
+        "numpy": "numpy",
+        "vllm": "vllm",
+        "vllm-ascend": "vllm_ascend",
+    }
+    assert test_environments.requirements("vllm_torch_npu") == {
+        "torch": "2.10.0+cpu",
+        "torch-npu": "2.10.0",
+        "vllm": "0.20.2",
+        "vllm-ascend": "0.20.2rc1",
+        "triton-ascend": "3.2.1",
+        "numpy": "1.26.4",
+    }
+
+
+def test_vllm_preflight_checks_metadata_without_importing_backends(tmp_path, monkeypatch):
+    monkeypatch.setattr(test_environments.platform, "machine", lambda: "aarch64")
+    profile = test_environments.ENVIRONMENTS["vllm_torch_npu"]
+    requirements = test_environments.requirements("vllm_torch_npu")
+    home = tmp_path / "cann"
+    home.mkdir()
+    (home / "ascend_toolkit_install.info").write_text("version=9.0.0\n")
+    monkeypatch.setenv("ASCEND_HOME_PATH", str(home))
+    state: dict[str, object] = {"missing": None}
+    versions = dict(requirements)
+    modules = {module for _, module in profile.modules}
+
+    def find_spec(name):
+        assert name in modules
+        return None if state["missing"] == name else SimpleNamespace(origin="/cpu-contract/" + name)
+
+    real_import = builtins.__import__
+
+    def without_backend(name, *args, **kwargs):
+        assert name.split(".")[0] not in {"torch", "torch_npu", "vllm", "vllm_ascend"}
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", without_backend)
+    monkeypatch.setattr(test_environments.importlib.util, "find_spec", find_spec)
+    monkeypatch.setattr(test_environments.importlib.metadata, "version", versions.__getitem__)
+    record = test_environments.preflight("vllm_torch_npu")
+    expected = {name: versions[name] for name, _ in profile.modules}
+    assert {name: value["version"] for name, value in record["packages"].items()} == expected
+    for missing in modules:
+        state["missing"] = missing
+        with pytest.raises(ValueError, match="module is missing"):
+            test_environments.preflight("vllm_torch_npu")
+    state["missing"] = None
+    versions["vllm"] = "0.19.0"
+    with pytest.raises(ValueError, match="found 0.19.0"):
+        test_environments.preflight("vllm_torch_npu")
+
+
+def test_vllm_environment_selection_is_isolated(tmp_path):
+    source = """
+import pytest
+
+def test_default():
+    pass
+
+@pytest.mark.test_environment("torch_npu")
+def test_torch():
+    pass
+
+@pytest.mark.test_environment("vllm_torch_npu")
+def test_vllm():
+    pass
+"""
+    for profile, expected in (("default", {"test_default"}), ("vllm_torch_npu", {"test_vllm"})):
+        result, plan, xml = _run_pytest(tmp_path / profile, source, profile=profile)
+        _success(result)
+        assert {case.get("name") for case in ET.parse(xml).getroot().iter("testcase")} == expected
+        assert plan.exists() == (profile != "default")
+
+
+def test_target_version_profile_reuses_the_declared_framework_suite():
+    profile = test_environments.ENVIRONMENTS["torch_npu_2_10"]
+    assert profile.execution == "direct"
+    assert profile.cann_minimum == (9, 0)
+    assert profile.suite == "torch_npu"
+    assert dict(profile.modules) == {"torch": "torch", "torch-npu": "torch_npu"}
+    requirements = test_environments.requirements("torch_npu_2_10")
+    assert requirements["torch"] == "2.10.0+cpu"
+    assert requirements["torch-npu"] == "2.10.0"
+
+
+def test_target_version_profile_selects_only_the_declared_framework_suite(tmp_path):
+    source = """
+import pytest
+
+def test_default():
+    pass
+
+@pytest.mark.test_environment("torch_npu")
+def test_framework():
+    pass
+
+@pytest.mark.test_environment("vllm_torch_npu")
+def test_vllm():
+    pass
+"""
+    result, plan_path, xml_path = _run_pytest(tmp_path, source, profile="torch_npu_2_10")
+    _success(result)
+    assert {case.get("name") for case in ET.parse(xml_path).getroot().iter("testcase")} == {"test_framework"}
+    plan = json.loads(plan_path.read_text())
+    assert plan["environment"] == "torch_npu_2_10"
+    assert plan["suite"] == "torch_npu"
+    test_environments.verify_results(plan_path, xml_path)
+    assert "TEST_ENVIRONMENT_VERIFIED" in result.stdout
+
+
 def _recording_direct_source(directory):
     return (
         _DIRECT.format(count=2)

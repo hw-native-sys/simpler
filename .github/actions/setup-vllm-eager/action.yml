@@ -1,0 +1,94 @@
+name: Set up vLLM eager environment
+description: Install vLLM-Ascend 0.20.2rc1 and the fixed-shape Simpler adapter environment.
+
+inputs:
+  vllm_source_dir:
+    description: Existing vLLM v0.20.2 checkout; cloned under RUNNER_TEMP when empty.
+    required: false
+    default: ""
+  vllm_ascend_source_dir:
+    description: Existing vllm-ascend v0.20.2rc1 checkout; cloned under RUNNER_TEMP when empty.
+    required: false
+    default: ""
+  compile_custom_kernels:
+    description: Build vllm-ascend custom kernels (requires clang/clang++ and ATB).
+    required: false
+    default: "1"
+  atb_env:
+    description: NNAL/ATB set_env.sh; discovered under /usr/local/Ascend/nnal/atb when empty.
+    required: false
+    default: ""
+
+outputs:
+  cann_env:
+    description: Environment script for the exact compatible installed CANN toolkit.
+    value: ${{ steps.toolchain.outputs.cann_env }}
+  atb_env:
+    description: Environment script sourced for NNAL/ATB.
+    value: ${{ steps.toolchain.outputs.atb_env }}
+  venv:
+    description: Isolated vLLM virtual environment.
+    value: .venv-vllm
+
+runs:
+  using: composite
+  steps:
+    - name: Select the installed vLLM toolchain
+      id: toolchain
+      shell: bash
+      run: |
+        python3 simpler_setup/test_environments.py select vllm_torch_npu
+        atb_env="${{ inputs.atb_env }}"
+        if [ -z "$atb_env" ]; then
+          for candidate in /usr/local/Ascend/nnal/atb/9*/set_env.sh /usr/local/Ascend/nnal/atb/latest/set_env.sh /usr/local/Ascend/nnal/atb/*/set_env.sh; do
+            if [ -f "$candidate" ]; then atb_env="$candidate"; break; fi
+          done
+        fi
+        if [ -z "$atb_env" ] || [ ! -f "$atb_env" ]; then
+          echo "::error::NNAL/ATB set_env.sh not found; pass the atb_env input or install NNAL/ATB 9.0.0"
+          exit 1
+        fi
+        echo "atb_env=$atb_env" >> "$GITHUB_OUTPUT"
+
+    - name: Install pinned vLLM-Ascend dependencies
+      shell: bash
+      env:
+        CANN_ENV: ${{ steps.toolchain.outputs.cann_env }}
+        ATB_ENV: ${{ steps.toolchain.outputs.atb_env }}
+        COMPILE_CUSTOM_KERNELS: ${{ inputs.compile_custom_kernels }}
+        VLLM_SOURCE_DIR: ${{ inputs.vllm_source_dir }}
+        VLLM_ASCEND_SOURCE_DIR: ${{ inputs.vllm_ascend_source_dir }}
+        TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+      run: |
+        source "$CANN_ENV"
+        source "$ATB_ENV"
+        bash .github/actions/setup-vllm-eager/install.sh
+
+    - name: Install Simpler against the target Torch-NPU
+      shell: bash
+      env:
+        CANN_ENV: ${{ steps.toolchain.outputs.cann_env }}
+        ATB_ENV: ${{ steps.toolchain.outputs.atb_env }}
+        TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
+      run: |
+        source "$CANN_ENV"
+        source "$ATB_ENV"
+        source .venv-vllm/bin/activate
+        constraints=.github/actions/setup-vllm-eager/constraints.txt
+        python -m pip install 'scikit-build-core>=0.10' 'nanobind>=2,<3' 'cmake>=3.20' ninja setuptools
+        python -m pip install -c "$constraints" --no-build-isolation \
+          --config-settings=build.targets=build_package_a2a3 '.[test]'
+        python - <<'PYEOF'
+        import json
+        import sys
+        from pathlib import Path
+
+        from simpler_setup.test_environments import preflight
+
+        record = preflight("vllm_torch_npu")
+        assert all(
+            Path(record["packages"][name]["path"]).is_relative_to(Path(sys.prefix))
+            for name in ("torch", "torch-npu")
+        ), record
+        print("VLLM_TEST_ENVIRONMENT_PACKAGES " + json.dumps(record), flush=True)
+        PYEOF

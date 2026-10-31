@@ -56,6 +56,19 @@ jobs:
       runs_on: '["self-hosted","a5"]'
       manual_mode: include
 
+  st-vllm-eager-a2a3:
+    uses: ./.github/workflows/_st-vllm-eager-a2a3.yml
+    with:
+      runs_on: '["self-hosted","a2a3"]'
+      manual_mode: include
+      model_dir: ${{ vars.VLLM_MODEL_DIR }}
+      artifact: ${{ vars.VLLM_ARTIFACT }}
+      prompt_ids: ${{ vars.VLLM_PROMPT_IDS }}
+      adapter_root: ${{ vars.VLLM_ADAPTER_ROOT }}
+      atb_env: ${{ vars.VLLM_ATB_ENV }}
+      vllm_source_dir: ${{ vars.VLLM_SOURCE_DIR }}
+      vllm_ascend_source_dir: ${{ vars.VLLM_ASCEND_SOURCE_DIR }}
+
   st-onboard-a2a3:
     uses: ./.github/workflows/_st-npu-a2a3.yml
     with:
