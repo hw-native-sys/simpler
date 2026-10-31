@@ -53,10 +53,20 @@ or replace a stream.
 On an execution failure, an owned Program context keeps its bounded device drain
 and reset policy. A borrowed kernel context is poisoned without a device-wide
 drain or reset; the caller owns device recovery. The native eager entry
-`simpler_launch_run_on_stream` binds a borrowed caller stream to an already
-prepared run. Public `Worker.init(borrowed_context_generation=...)` and
-`Worker.submit(..., caller_stream=...)` use this same native path. Capture/replay
-is rejected by the eager entry.
+`NativeRunDescriptor.caller_stream` carries a borrowed caller stream when known
+at prepare. The preparation boundary validates it before bind or device allocation;
+a clean refusal preserves the existing exact-epoch release receipt and retry contract.
+`simpler_launch_run_on_stream` must use that same stream. A null descriptor stream
+retains late binding at launch; the simulator refuses a non-null stream before bind. Public `Worker.init(borrowed_context_generation=...)` and
+`Worker.submit(..., caller_stream=...)` use this same native path. Capture is admitted only through the reserved A2/A3 HBG native branch.
+
+Borrowed contexts retain KernelExecutionState for current-context validation,
+stream/event ownership and retryable close. Native workspace ownership belongs
+to the existing runner arenas and workspace ledger. Native execution uses the
+existing arenas, stream bindings and completion fences. The dedicated kernel
+packet executor, fixed graph slots, token leases and submission binder are retired;
+their exported APIs and Worker bindings have been removed. Warm A2/A3 HBG capture
+uses the common native branch described in the [capture sequence](native-hbg-capture.md).
 
 ## Borrowed caller ordering
 
@@ -98,19 +108,27 @@ quarantined; borrowed execution never resets or synchronizes the whole device.
 Failure does not establish the caller's exit dependency, so the caller must not
 consume output merely because launch returned an error.
 
-This entry is eager-only. It validates the current borrowed RTS context and
-rejects an active caller capture before launch metadata publication. Preparation
-and callable registration take place outside capture. The common eager launch
+The native entry validates the current borrowed RTS context. Warm A2/A3 HBG
+capture uses the reserved recording branch; unsupported capture is refused before
+publication. Callable registration and cold resource reservation take place
+outside capture. The common eager launch
 publishes its Runtime descriptor asynchronously on the actual AICPU stream;
 its entry fork orders the AICore reader behind that copy. The slot retains a
 pinned immutable source through run retirement. A copy attempt marks Partial
 before entering RTS, so enqueue failure cannot acquire a no-submission receipt.
 The two kernel boundaries consume an ordinary publication fork; unproven partial
 work requires bounded private-stream discharge or quarantine. Bulk HBG arena
-publication and DFX writes retain their own synchronization. The compatibility
-`simpler_kernel_mode_launch` stub and capability bit remain closed; public Worker
-eager uses the shared native lane. Native completion events and their caller
-references are not a captured-graph lifetime contract.
+publication and DFX writes retain their own synchronization. Public Worker eager
+and supported capture share the native lane. Captured resources use the common
+graph attachment, surviving run finalize until model destruction and stream drain.
+
+Graph resource reservation and retirement hold a context-wide registry
+reservation. Conflicting callbacks refuse before waiting, preventing a stream
+drain from waiting on a callback that is itself waiting for registry admission.
+The raw `_ChipWorker` resource entries also reserve their binding before runtime
+entry. Concurrent finalize refuses while that operation is in flight and can be
+retried after it returns. This does not change public `Worker.close()` lease
+draining. Host-call completion alone does not retire captured device references.
 
 A direct L2 Python `Worker` owns the native `_ChipWorker` itself. Its callable
 handles, argument imports, source uses and close journal belong to `Worker`;
@@ -229,8 +247,9 @@ the preceding section.
 Native `ChipWorker::register_callable(image, size)` (Python
 `_ChipWorker.register_callable(callable)`) returns a runtime-assigned ID on an
 initialized PROGRAM or KERNEL worker. Both modes use the optional
-`simpler_register_callable_v2` symbol; a KERNEL context uses the kernel
-preparation path internally. Explicit-ID `register_callable(id, callable)`
+`simpler_register_callable_v2` symbol. HBG registers the native callable through
+the shared registry; other KERNEL runtimes use the same entry, which stages
+their persistent arguments after device registration. Explicit-ID `register_callable(id, callable)`
 remains available and shares the registry; an ID that is already registered is
 rejected with INVALID_ARGUMENT. A runtime without the optional entry can still
 initialize and serve its existing APIs; requesting auto-ID registration raises
@@ -249,8 +268,8 @@ first and discard stale IDs. The registration and unregistration entry points
 serialize internally on the context, so an auto-ID scan and its claim cannot
 race an explicit-ID claim of the same slot; finalize takes the same lock, so
 teardown cannot clear the registry under a registration. Runs, initialization
-and destroy still rely on the caller contract. The old C symbol's signature and
-kernel-mode capability bit remain unchanged. Adapters must explicitly select
+and destroy still rely on the caller contract. The explicit-ID registration
+symbol's signature remains unchanged. Adapters must explicitly select
 v2; an integration-branch binary expecting a different signature under the old
 symbol cannot be loaded as if it were compatible.
 
@@ -687,5 +706,9 @@ orchestration view before clearing the storage.
 The first descriptor publication still initializes its complete handshake
 prefix. Program descriptor and launch-envelope routes retain their behavior;
 kernel packets require permitted launch transport and cannot silently fall back
-to unvalidated descriptor values. Active capture remains rejected by the eager
-entry. These per-run resources do not provide captured-graph lifetime.
+to unvalidated descriptor values. TMR capture remains unsupported. Warm borrowed A2/A3 HBG capture is
+handled by the native recording branch. Per-run ownership alone does not provide captured-graph lifetime. The
+explicit common graph-resource attachment retains event owners across run
+finalize and makes later slot preparation use fresh owners. Recording finalization
+does not poll or wait on these events; graph destruction plus stream drain permits
+their eventual release. See [native capture resource attachment](native-hbg-capture.md#common-native-capture-resource-attachment).

@@ -560,4 +560,53 @@ TEST(RunStreamPair, AFailedCreateLeavesThePairEmpty) {
     EXPECT_FALSE(pair.ready());
 }
 
+TEST(RunStreamPairTest, CapturedGenerationSurvivesCodePublicationAndFailedRelease) {
+    FakeStreams fake;
+    RunStreamPair pair(
+        [&](void **out) {
+            return fake.create(out);
+        },
+        [&](void *stream) {
+            return fake.destroy(stream);
+        }
+    );
+    ASSERT_EQ(pair.ensure(), 0);
+    auto graph = pair.pin_aicore_generation();
+    const auto old_core = pair.aicore();
+    pair.mark_stale();
+    ASSERT_EQ(pair.ensure(), 0);
+    EXPECT_NE(pair.aicore(), old_core);
+    EXPECT_EQ(fake.live_count(), 3u);
+    EXPECT_EQ(pair.destroy(), PTO_RUNTIME_ERR_INVALID_STATE);
+    graph.reset();  // model destroyed and all captured users drained
+    fake.fail_next_destroys(1);
+    EXPECT_EQ(pair.ensure(), -13);
+    EXPECT_EQ(fake.live_count(), 3u);
+    ASSERT_EQ(pair.ensure(), 0);
+    EXPECT_EQ(fake.live_count(), 2u);
+    EXPECT_EQ(pair.destroy(), 0);
+    EXPECT_EQ(fake.live_count(), 0u);
+}
+
+TEST(RunStreamPairTest, FailedEagerRetirementCannotDestroyCapturedGeneration) {
+    FakeStreams fake;
+    RunStreamPair pair(
+        [&](void **out) {
+            return fake.create(out);
+        },
+        [&](void *stream) {
+            return fake.destroy(stream);
+        }
+    );
+    ASSERT_EQ(pair.ensure(), 0);
+    auto graph = pair.pin_aicore_generation();
+    ASSERT_EQ(pair.mark_submitted(kOwnerA), 0);
+    ASSERT_EQ(pair.retire(CompletionStatus::Unproven, kOwnerA), 0);
+    EXPECT_EQ(fake.live_count(), 2u);
+    ASSERT_EQ(pair.ensure(), 0);
+    EXPECT_EQ(fake.live_count(), 3u);
+    graph.reset();
+    EXPECT_EQ(pair.destroy(), 0);
+}
+
 }  // namespace

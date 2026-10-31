@@ -118,6 +118,20 @@ TEST_F(HbgScratchRetentionTest, OutputLayoutInitializesOnlyCreatedOutputPosition
     EXPECT_EQ(layout.total_output_size, 0);
 }
 
+TEST_F(HbgScratchRetentionTest, KernelTaskClearsDefinitionOffsetFromRetainedStorage) {
+    sm_handle->header->tasks.storage_at(0).task.graph_definition_offset = 0xa5a5a5a5;
+    uint32_t shape[] = {16};
+    auto tensor = simpler::hbg::make_tensor_external(gm_heap.data(), shape, 1, DataType::FLOAT32);
+    CoreTaskArgs args;
+    args.add_inout(tensor);
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    orch.begin_scope();
+    ASSERT_TRUE(orch.submit_task(kernels, args).task_id().is_valid());
+    EXPECT_EQ(sm_handle->header->tasks.storage_at(0).task.graph_definition_offset, 0u);
+    orch.end_scope();
+}
+
 TEST_F(HbgScratchRetentionTest, FailedSubmissionDoesNotContaminateTheNextGraph) {
     auto *entries = orch.tensor_map.entry_pool.get();
     auto *seen = orch.fanin_seen_epoch.get();

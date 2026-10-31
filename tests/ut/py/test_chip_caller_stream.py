@@ -73,6 +73,93 @@ def _prepare_callable(worker, contexts, callable_image):
     assert worker.register_callable(callable_image) == 0
 
 
+def _check_hbg_eager_then_capture(worker, lib, args, stream, devices, hosts, nbytes, expected):
+    from simpler.task_interface import CallConfig  # noqa: PLC0415
+
+    destination, host = devices[2], hosts[2]
+    host[:] = [expected + 123.0] * len(host)
+    assert lib.aclrtMemcpyAsync(destination, nbytes, ctypes.addressof(host), nbytes, 1, stream) == 0
+    eager = worker._submit_chip_run_direct(0, args, CallConfig(), caller_stream=stream.value)
+    assert eager.launched
+    assert lib.aclrtMemcpyAsync(ctypes.addressof(host), nbytes, destination, nbytes, 2, stream) == 0
+    assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
+    assert all(value == expected for value in host)
+    eager.wait()
+    lib.aclmdlRICaptureBegin.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    lib.aclmdlRICaptureEnd.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+    lib.aclmdlRIExecuteAsync.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.aclmdlRIDestroy.argtypes = [ctypes.c_void_p]
+    other = ctypes.c_void_p()
+    assert lib.aclrtCreateStream(ctypes.byref(other)) == 0
+    worker.reserve_capture_resources(stream.value)
+    graph = ctypes.c_void_p()
+    assert lib.aclmdlRICaptureBegin(stream, 0) == 0
+    recorded = worker._submit_chip_run_direct(0, args, CallConfig(), caller_stream=stream.value)
+    assert recorded.recorded
+    recorded.wait()
+    assert lib.aclmdlRICaptureEnd(stream, ctypes.byref(graph)) == 0
+    with pytest.raises(RuntimeError):
+        worker.retire_capture_resources()
+    with pytest.raises(RuntimeError, match="-1003"):
+        worker._submit_chip_run_direct(0, args, CallConfig(), caller_stream=other.value)
+    with pytest.raises(RuntimeError):
+        worker.unregister_callable(0)
+    for replay in range(2):
+        inputs = (11.0 + replay, 17.0 + 2 * replay)
+        for index, value in enumerate(inputs):
+            hosts[index][:] = [value] * len(hosts[index])
+            assert lib.aclrtMemcpyAsync(devices[index], nbytes, ctypes.addressof(hosts[index]), nbytes, 1, stream) == 0
+        total = sum(inputs)
+        expected = (total + 1) * (total + 2)
+        host[:] = [expected + 123.0] * len(host)
+        assert lib.aclrtMemcpyAsync(destination, nbytes, ctypes.addressof(host), nbytes, 1, stream) == 0
+        assert lib.aclmdlRIExecuteAsync(graph, stream) == 0
+        assert lib.aclrtMemcpyAsync(ctypes.addressof(host), nbytes, destination, nbytes, 2, stream) == 0
+        assert lib.aclrtSynchronizeStreamWithTimeout(stream, 60000) == 0
+        assert all(value == expected for value in host)
+    assert lib.aclmdlRIDestroy(graph) == 0
+    worker.retire_capture_resources()
+    assert lib.aclrtDestroyStream(other) == 0
+    _check_hbg_capture_retirement(worker, lib, args, stream)
+    native = worker._submit_chip_run_direct(0, args, CallConfig(), caller_stream=stream.value)
+    native.wait()
+
+
+def _check_hbg_capture_retirement(worker, lib, args, stream):
+    from simpler.task_interface import CallConfig  # noqa: PLC0415
+
+    lib.aclrtCreateEventExWithFlag.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32]
+    lib.aclrtRecordEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.aclrtStreamWaitEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    lib.aclrtDestroyEvent.argtypes = [ctypes.c_void_p]
+    child, fork = ctypes.c_void_p(), ctypes.c_void_p()
+    assert lib.aclrtCreateStream(ctypes.byref(child)) == 0
+    # ACL_EVENT_SYNC, matching the runtime's capture-compatible event type.
+    assert lib.aclrtCreateEventExWithFlag(ctypes.byref(fork), 1) == 0
+    for failed_end in (False, True):
+        worker.reserve_capture_resources(stream.value)
+        model = ctypes.c_void_p()
+        assert lib.aclmdlRICaptureBegin(stream, 0) == 0
+        recorded = worker._submit_chip_run_direct(0, args, CallConfig(), caller_stream=stream.value)
+        assert recorded.recorded
+        recorded.wait()
+        if failed_end:
+            assert lib.aclrtRecordEvent(fork, stream) == 0
+            assert lib.aclrtStreamWaitEvent(child, fork) == 0
+        rc = lib.aclmdlRICaptureEnd(stream, ctypes.byref(model))
+        if failed_end:
+            assert rc != 0 and model.value is None
+        else:
+            assert rc == 0
+            with pytest.raises(RuntimeError):
+                worker.retire_capture_resources()
+            assert lib.aclmdlRIDestroy(model) == 0
+        # Neither graph executes. Release must not wait on a captured tail.
+        worker.retire_capture_resources()
+    assert lib.aclrtDestroyEvent(fork) == 0
+    assert lib.aclrtDestroyStream(child) == 0
+
+
 def _run(arch, runtime, device, depth, borrowed):
     from _task_interface import _ChipWorker  # noqa: PLC0415
     from simpler.task_interface import (  # noqa: PLC0415
@@ -217,6 +304,10 @@ def _run(arch, runtime, device, depth, borrowed):
             handle.wait()
             assert handle.done
         assert not handle_owner._chip_runs
+        if borrowed and arch == "a2a3" and runtime == "host_build_graph":
+            _check_hbg_eager_then_capture(
+                worker, lib, args, stream, current_device, current_host, nbytes, outputs[-1][1]
+            )
     finally:
         # Native teardown owns this bridge's resources; the public borrowed
         # initialization and admission path is not under test here.

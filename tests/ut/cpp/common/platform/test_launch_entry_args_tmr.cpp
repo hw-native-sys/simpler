@@ -620,7 +620,8 @@ TEST_F(LaunchEntryArgs, EveryCaptureAnswerRoutesThroughTheProductionPublishStep)
 
         const bool launched = answer.expect_launch_route;
         if (launched) {
-            EXPECT_GT(helper.launch_payload_bytes(), sizeof(KernelArgs));
+            EXPECT_GE(helper.launch_payload_bytes(), LAUNCH_ENVELOPE_HEADER_BYTES);
+            EXPECT_EQ(helper.args.entry_args_offset, LAUNCH_ENVELOPE_HEADER_BYTES);
         } else {
             EXPECT_EQ(helper.launch_payload_bytes(), sizeof(KernelArgs));
         }

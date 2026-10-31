@@ -80,4 +80,14 @@ a5_hbg_case(test_hbg_resident_late_aicore_error.cpp
     COMPILE_OPTIONS -ffunction-sections -fdata-sections
     LINK_OPTIONS    ${_gc_link_option})
 
+if(APPLE)
+    set(_terminal_gc -Wl,-dead_strip)
+else()
+    set(_terminal_gc -Wl,--gc-sections)
+endif()
+a5_hbg_case(test_kernel_terminal_retirement.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu ${CMAKE_SOURCE_DIR}/support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_terminal_gc})
+
 simpler_ut_glob_cases(a5_hbg_case)

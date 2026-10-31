@@ -337,3 +337,35 @@ TEST(CallerDeviceBuffers, ARunNamingNoSpanHoldsNoBorrow) {
     // A borrow with no identity is refused: a release could not name it.
     EXPECT_FALSE(buffers.borrow(0, nullptr, 0));
 }
+
+TEST(CallerDeviceBuffers, CaptureSnapshotSurvivesRunReleaseAndSlotReuse) {
+    CallerDeviceBuffers buffers;
+    buffers.record(at(kBase), kSize);
+    buffers.record(at(kBase + kSize), kSize);
+    auto first = span(kBase + 16, 32);
+    ASSERT_TRUE(buffers.borrow(kRunA, &first, 1));
+    auto graph = buffers.retain_capture(kRunA);
+    buffers.release(kRunA, false);
+    EXPECT_TRUE(buffers.borrowed(at(kBase)));
+    auto second = span(kBase + kSize, 32);
+    ASSERT_TRUE(buffers.borrow(kRunA, &second, 1));
+    graph.reset();
+    EXPECT_FALSE(buffers.borrowed(at(kBase)));
+    EXPECT_TRUE(buffers.borrowed(at(kBase + kSize)));
+    buffers.release(kRunA, false);
+    EXPECT_FALSE(buffers.borrowed(at(kBase + kSize)));
+}
+
+TEST(CallerDeviceBuffers, EachCaptureKeepsItsOwnReferenceIncludingDeclaredOutputs) {
+    CallerDeviceBuffers buffers;
+    buffers.record(at(kBase), kSize);
+    auto output = span(kBase, 32);
+    ASSERT_TRUE(buffers.declare_writes(kRunA, &output, 1));
+    auto first = buffers.retain_capture(kRunA);
+    auto second = buffers.retain_capture(kRunA);
+    buffers.release(kRunA, false);
+    first.reset();
+    EXPECT_TRUE(buffers.borrowed(at(kBase)));
+    second.reset();
+    EXPECT_FALSE(buffers.borrowed(at(kBase)));
+}

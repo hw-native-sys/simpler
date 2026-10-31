@@ -1466,3 +1466,131 @@ TEST(WorkspaceManagerOwnership, AnUnreportedDrainQuarantinesTheRegionTheNextRunR
 }
 
 }  // namespace
+
+TEST(WorkspaceManager, CaptureKeepsArenaBackingAfterProducingRunRetires) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    ASSERT_TRUE(m.set_limit(4096));
+    const auto region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::RuntimePool);
+    void *block = m.acquire(region, 41, 4096);
+    ASSERT_NE(block, nullptr);
+    int capture;
+    ASSERT_TRUE(m.retain_capture(&capture, {block}));
+    report_launched_and_drained(m, 0, 41);
+    report_host_side_done(m, 0, 41);
+    EXPECT_FALSE(m.holds_references(41));
+    EXPECT_TRUE(m.has_capture_references());
+    EXPECT_EQ(m.block_state(block), WorkspaceManager::BlockState::Referenced);
+    EXPECT_FALSE(m.reference(block, 42));
+    EXPECT_FALSE(m.reference(block, WorkspaceManager::kContextEpoch));
+    EXPECT_FALSE(m.idle_backing(block));
+    EXPECT_EQ(m.detach_idle_backing(block), 0U);
+    EXPECT_EQ(m.acquire(region, 42, 4096), nullptr);
+    EXPECT_EQ(m.release_unreferenced(), 0);
+    EXPECT_TRUE(backend.released.empty());
+    EXPECT_EQ(m.reserved_bytes(), 4096U);
+    EXPECT_TRUE(m.must_keep(block));
+    m.release_capture(&capture);
+    EXPECT_FALSE(m.has_capture_references());
+    EXPECT_EQ(m.acquire(region, 42, 4096), block);
+    EXPECT_EQ(backend.acquire_calls, 1);
+}
+
+TEST(WorkspaceManager, CaptureBatchRefusalDoesNotPartiallyPinValidBlocks) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const auto region = WorkspaceManager::staging_region(0);
+    void *block = m.acquire(region, 0, 4096);
+    int capture;
+    EXPECT_FALSE(m.retain_capture(&capture, {block, reinterpret_cast<void *>(1)}));
+    EXPECT_FALSE(m.has_capture_references());
+    EXPECT_FALSE(m.retain_capture(nullptr, {block}));
+    EXPECT_FALSE(m.retain_capture(&capture, {}));
+    EXPECT_EQ(m.release_unreferenced(), 0);
+    EXPECT_EQ(backend.released, std::vector<void *>({block}));
+    EXPECT_FALSE(m.retain_capture(&capture, {block}));
+}
+
+TEST(WorkspaceManager, CapturePinsObsoleteGenerationUntilLastGraphRetires) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const auto region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::GmHeap);
+    void *old = m.acquire(region, 0, 4096);
+    int first, second;
+    ASSERT_TRUE(m.retain_capture(&first, {old, old}));
+    ASSERT_TRUE(m.retain_capture(&first, {old}));
+    ASSERT_TRUE(m.retain_capture(&second, {old}));
+    void *replacement = m.acquire(region, 0, 8192);
+    ASSERT_NE(replacement, old);
+    m.note_published(region, replacement);
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_TRUE(backend.released.empty());
+    m.release_capture(&first);
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_TRUE(backend.released.empty());
+    m.release_capture(&second);
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_EQ(backend.released, std::vector<void *>({old}));
+    EXPECT_EQ(m.reserved_bytes(), 8192U);
+}
+
+TEST(WorkspaceManager, CaptureHeldBlockCannotFundAWaitOnItsProducingRun) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    void *block = m.acquire(WorkspaceManager::staging_region(0), 71, 4096);
+    m.note_run_fact(0, 71, WorkspaceManager::RunFact::Launched);
+    int capture;
+    ASSERT_TRUE(m.retain_capture(&capture, {block}));
+    EXPECT_TRUE(m.reference(block, 71));
+    std::vector<uint64_t> holders;
+    m.eligible_holders(72, &holders);
+    EXPECT_TRUE(holders.empty());
+    m.release_capture(&capture);
+    m.eligible_holders(72, &holders);
+    EXPECT_EQ(holders, std::vector<uint64_t>({71}));
+    EXPECT_EQ(m.release_unreferenced(), 0);
+    EXPECT_TRUE(backend.released.empty()) << "a capture release cannot retire the run";
+}
+
+TEST(WorkspaceManager, CaptureRetirementDoesNotUndoRunQuarantine) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    void *block = m.acquire(WorkspaceManager::staging_region(0), 91, 4096);
+    int capture, other;
+    ASSERT_TRUE(m.retain_capture(&capture, {block}));
+    m.note_run_fact(0, 91, WorkspaceManager::RunFact::ContextDestroyed);
+    EXPECT_FALSE(m.retain_capture(&other, {block}));
+    m.release_capture(&capture);
+    EXPECT_EQ(m.block_state(block), WorkspaceManager::BlockState::Quarantined);
+    EXPECT_TRUE(m.must_keep(block));
+    EXPECT_EQ(m.release_unreferenced(), 0);
+    EXPECT_TRUE(backend.released.empty());
+}
+
+TEST(WorkspaceManager, TerminalSweepRetainsCaptureBytesAndAccountsTheirAbandonment) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    void *block = m.acquire(WorkspaceManager::staging_region(0), 0, 4096);
+    int capture, other;
+    ASSERT_TRUE(m.retain_capture(&capture, {block}));
+    m.enter_drain_only();
+    EXPECT_FALSE(m.retain_capture(&other, {block}));
+    {
+        auto sweep = m.begin_terminal_sweep();
+        EXPECT_TRUE(sweep.must_keep(block));
+        sweep.note_result(block, 0, true);
+    }
+    m.release_capture(&capture);
+    SimplerWorkspaceReport report{};
+    ASSERT_TRUE(m.report(&report));
+    EXPECT_EQ(report.relinquished_bytes, 4096U);
+    EXPECT_EQ(report.quarantined_blocks, 1U);
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_TRUE(backend.released.empty());
+}

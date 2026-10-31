@@ -82,6 +82,53 @@ protected:
     }
 };
 
+TEST_F(CallerOrderTest, CaptureArmingRequiresReservedEventsAndDoesNotCreateThem) {
+    EXPECT_EQ(fence.arm(kRun, false), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(order.arm(kRun, caller, cpu, core, false), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(created, 0);
+    ASSERT_EQ(fence.reserve_events(), 0);
+    ASSERT_EQ(order.reserve_events(), 0);
+    EXPECT_EQ(created, 5);
+    ASSERT_TRUE(fence.events_ready());
+    ASSERT_TRUE(order.events_ready());
+    EXPECT_EQ(fence.arm(kRun, false), 0);
+    EXPECT_EQ(order.arm(kRun, caller, cpu, core, false), 0);
+    EXPECT_EQ(created, 5);
+    EXPECT_EQ(order.retire(kRun), 0);
+    EXPECT_EQ(order.release(), 0);
+    EXPECT_EQ(fence.release(), 0);
+    EXPECT_FALSE(order.events_ready());
+    EXPECT_FALSE(fence.events_ready());
+    EXPECT_EQ(fence.arm(kNext, false), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(order.arm(kNext, caller, cpu, core, false), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_EQ(created, 5);
+}
+
+TEST_F(CallerOrderTest, DestroyedNeverReplayedGraphReleasesAfterStreamDrainWithoutEventWait) {
+    arm();
+    ASSERT_EQ(order.mark_captured(kRun), 0);
+    LaunchProgressSink sink;
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
+    publish_whole_boundary();
+    ASSERT_EQ(order.join(kRun, fence), 0);
+    EXPECT_FALSE(completed);
+    EXPECT_NE(order.release(), 0);
+    trace.clear();
+    ASSERT_EQ(order.release_after_graph_drain(), 0);
+    EXPECT_TRUE(trace.empty());
+    EXPECT_EQ(fence.release(), 0);
+    EXPECT_EQ(destroyed, created);
+    EXPECT_EQ(order.release_after_graph_drain(), 0);
+}
+
 TEST_F(CallerOrderTest, CallerWaitPinsTheKernelFenceUntilItsOwnProofCompletes) {
     arm();
     LaunchProgressSink sink;

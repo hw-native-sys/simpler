@@ -37,4 +37,15 @@ a2a3_hbg_case(test_hbg_submit_poison.cpp ORCH)
 a2a3_hbg_case(test_graph_activation.cpp
     SOURCES ${HBG_SHARED_RUNTIME_SOURCES})
 
+
+if(APPLE)
+    set(_terminal_gc -Wl,-dead_strip)
+else()
+    set(_terminal_gc -Wl,--gc-sections)
+endif()
+a2a3_hbg_case(test_kernel_terminal_retirement.cpp
+    INCLUDES ${SIMPLER_SRC}/a2a3/runtime/host_build_graph/aicpu ${CMAKE_SOURCE_DIR}/support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_terminal_gc})
+
 simpler_ut_glob_cases(a2a3_hbg_case)

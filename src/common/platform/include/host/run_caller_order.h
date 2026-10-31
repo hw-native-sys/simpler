@@ -26,6 +26,8 @@
  * until the caller has consumed the wait. No caller stream is owned here.
  */
 class RunCallerOrder {
+    friend class RunRetentionProbePeer;
+
 public:
     using StreamWait = std::function<int(void *, void *)>;
     using StreamSync = std::function<int(void *, int)>;
@@ -37,17 +39,23 @@ public:
         stream_wait_(std::move(stream_wait)),
         sync_(std::move(sync)) {}
 
-    int arm(const NativeRunIdentity &id, void *caller, void *aicpu, void *aicore) {
+    int reserve_events() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (active_) return PTO_RUNTIME_ERR_INVALID_STATE;
+        return reserve_events_locked(true);
+    }
+    bool events_ready() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return events_ready_locked(true);
+    }
+
+    int arm(const NativeRunIdentity &id, void *caller, void *aicpu, void *aicore, bool allow_creation = true) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (active_ || aicpu == nullptr || aicore == nullptr || caller == aicpu || caller == aicore)
             return PTO_RUNTIME_ERR_INVALID_STATE;
-        for (size_t i = 0; i < events_.size(); ++i) {
-            if (caller == nullptr && i != Fork) continue;
-            void *&event = events_[i];
-            if (event != nullptr) continue;
-            int rc = ops_.create(&event);
-            if (rc != 0) return rc;
-        }
+        if (!allow_creation && !events_ready_locked(caller != nullptr)) return PTO_RUNTIME_ERR_UNSUPPORTED;
+        const int event_rc = reserve_events_locked(caller != nullptr);
+        if (event_rc != 0) return event_rc;
         identity_ = id;
         streams_ = {caller, aicpu, aicore};
         active_ = true;
@@ -147,10 +155,36 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         if (!active_) return 0;
         if (!owns(id) || reference_.valid() || (submitted_ && !consumed_)) return PTO_RUNTIME_ERR_INVALID_STATE;
-        active_ = submitted_ = tail_recorded_ = consumed_ = false;
+        active_ = submitted_ = tail_recorded_ = consumed_ = captured_ = false;
         streams_ = {};
         fence_ = nullptr;
         return 0;
+    }
+
+    int mark_captured(const NativeRunIdentity &id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!owns(id) || submitted_) return PTO_RUNTIME_ERR_INVALID_STATE;
+        captured_ = true;
+        return 0;
+    }
+
+    // Called only after model destruction and all retained streams have drained.
+    // An unplayed graph has no completed event to wait for.
+    int release_after_graph_drain() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (active_ && captured_) {
+                if (reference_.valid()) {
+                    const int rc = reference_.committed() ? fence_->release_wait_reference(reference_, Role::Caller) :
+                                                            fence_->revoke_wait_reference(reference_);
+                    if (rc != 0) return rc;
+                }
+                active_ = submitted_ = tail_recorded_ = consumed_ = captured_ = false;
+                streams_ = {};
+                fence_ = nullptr;
+            }
+        }
+        return release();
     }
 
     int release() {
@@ -171,12 +205,28 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         events_ = {};
         streams_ = {};
-        active_ = submitted_ = tail_recorded_ = consumed_ = false;
+        active_ = submitted_ = tail_recorded_ = consumed_ = captured_ = false;
         if (fence_ != nullptr) fence_->discard_stale_wait_reference(reference_);
         fence_ = nullptr;
     }
 
 private:
+    bool events_ready_locked(bool with_caller) const {
+        for (size_t i = 0; i < events_.size(); ++i)
+            if ((with_caller || i == Fork) && events_[i] == nullptr) return false;
+        return true;
+    }
+    int reserve_events_locked(bool with_caller) {
+        for (size_t i = 0; i < events_.size(); ++i) {
+            if (!with_caller && i != Fork) continue;
+            void *&event = events_[i];
+            if (event != nullptr) continue;
+            int rc = ops_.create(&event);
+            if (rc != 0) return rc;
+        }
+        return 0;
+    }
+
     static constexpr size_t Start = 0, Fork = 1, Tail = 2;
     static constexpr size_t Caller = 0, Aicpu = 1, Aicore = 2;
     bool owns(const NativeRunIdentity &id) const { return active_ && identity_ == id; }
@@ -189,6 +239,7 @@ private:
     NativeRunIdentity identity_{};
     RunCompletionFence *fence_{nullptr};
     RunCompletionFence::WaitReference reference_;
+    bool captured_{false};
     bool active_{false};
     bool submitted_{false};
     bool tail_recorded_{false};

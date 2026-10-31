@@ -5024,7 +5024,10 @@ class RunHandle:
         run_id: int,
         keepalive: tuple[Any, ...],
         resources: _RunResources | None = None,
+        *,
+        recorded: bool = False,
     ) -> None:
+        self._recorded = recorded
         self._worker = worker
         self._run_id: int | None = run_id
         self._keepalive: tuple[Any, ...] | None = keepalive
@@ -5047,6 +5050,7 @@ class RunHandle:
     @classmethod
     def _completed(cls, worker: Worker) -> RunHandle:
         handle = cls.__new__(cls)
+        handle._recorded = False
         handle._worker = worker
         handle._run_id = None
         handle._keepalive = None
@@ -5073,10 +5077,20 @@ class RunHandle:
         return _monotonic() + value
 
     @property
+    def recorded(self) -> bool:
+        """Whether this handle reports recording, rather than device execution.
+
+        For a recorded run, ``done`` and ``wait`` cover host finalization only.
+        Replay completion belongs to the caller's graph execution and stream.
+        """
+        return self._recorded
+
+    @property
     def done(self) -> bool:
         """True once waiting on this run would not block.
 
-        This answers the native fence — the device is drained and every task
+        A recorded handle reports host finalization, not replay completion.
+        Otherwise this answers the native fence — the device is drained and every task
         has reached its terminal state — plus this handle's own terminal flag.
         It does **not** say the run's fence-owned cleanup has happened: the
         CommDomain, L3-L2 and remote-slot teardown runs after the fence, in
@@ -5161,7 +5175,7 @@ class RunHandle:
                         self._run_id = None
                         if not self._finalization_abandoned:
                             self._keepalive = None
-                        self._launch_accepted = True
+                        self._launch_accepted = not self._recorded
                         self._terminal = True
                     self._wait_in_progress = False
                     self._accept_wait_in_progress = False
@@ -5339,6 +5353,8 @@ class RunHandle:
 
     def _wait_for_acceptance(self) -> None:
         """Wait until this run's dispatches cross their acceptance boundary."""
+        if self._recorded:
+            raise RuntimeError("a recorded run has no execution acceptance; wait on the replay stream")
         elected = False
         acceptance_completed = False
         try:
@@ -12838,6 +12854,37 @@ class Worker:
             assert self._orch is not None
             return self._orch.device_memory_info(worker_id)
 
+    def reserve_capture_resources(self, *, caller_stream: int) -> None:
+        """Reserve native capture resources outside capture after a warm invocation.
+
+        Requires an idle direct level-2 kernel worker. Call after the warm run's
+        wait and before CaptureBegin. Subsequent eager preparation invalidates
+        the reservation; increased resource demand during capture is refused.
+        Only slot 0 / bank 0 is reserved, for one recorded invocation per resource
+        generation. Finalizing the recorded run does not release its graph-held
+        descriptor; another captured submit on that generation is refused. Establish
+        another generation through successful eager warmup and reservation outside capture.
+        """
+        stream = _nonzero_uint64(caller_stream, "caller_stream")
+        with self._operation_lease("reserve_capture_resources"):
+            if self.level != 2:
+                raise NotImplementedError("native capture resource reservation requires a level-2 worker")
+            assert self._chip_worker is not None
+            self._chip_worker.reserve_capture_resources(stream)
+
+    def retire_capture_resources(self) -> None:
+        """Drain and release native capture resources after destroying the captured graphs.
+
+        Supported by the in-process chip worker (level 2). All retained models
+        must have been destroyed, and their caller streams must remain valid.
+        A failed drain or resource release keeps ownership for a later retry.
+        """
+        with self._operation_lease("retire_capture_resources"):
+            if self.level != 2:
+                raise NotImplementedError("native capture resource retirement requires a level-2 worker")
+            assert self._chip_worker is not None
+            self._chip_worker.retire_capture_resources()
+
     def flush_diagnostics(self, timeout: float | None = None) -> None:
         """Publish every diagnostic run this worker's chip children have closed.
 
@@ -13413,7 +13460,11 @@ class Worker:
         ``caller_stream``: Direct L2 RTS stream handle, required for a borrowed
         environment. Successful submit enqueues the caller exit dependency before
         returning. The caller keeps the stream and external allocations alive through
-        retirement. Capture is rejected before source references are reserved.
+        retirement. Warm A2/A3 HBG native capture requires
+        :meth:`reserve_capture_resources` before CaptureBegin and returns a handle whose
+        ``recorded`` property is true; its wait finalizes host ownership only.
+        Replay and eager use the same caller stream while the graph is retained.
+        Destroy the model before calling :meth:`retire_capture_resources`.
 
         Graph construction remains serialized. A local L3 Worker that owns its
         startup and uses an onboard a2a3/a5 host_build_graph or
@@ -13460,6 +13511,11 @@ class Worker:
 
     def run(self, callable, args=None, config=None, *, caller_stream: int | None = None) -> None:
         """Execute one task or DAG synchronously as ``submit(...).wait()``.
+
+        Under an active caller-stream capture the run is recorded, not executed:
+        ``run`` finalizes host ownership and returns without device completion,
+        exactly like waiting on a recorded ``RunHandle``. Use :meth:`submit` and
+        inspect :attr:`RunHandle.recorded` when the capture outcome matters.
 
         Per-stage run timing (host wall, on-NPU device wall +
         AICPU phase breakdown) is no longer returned — the platform emits it as
@@ -13899,7 +13955,9 @@ class Worker:
             self._chip_runs[run_id] = chip_run
         # The handle owns this invocation's argument values. Storage release is fenced by
         # the touched-identity registration until finalization, not by descriptor copies.
-        handle = RunHandle(self, run_id, (callable_id, args, cfg, chip_args))
+        handle = RunHandle(
+            self, run_id, (callable_id, args, cfg, chip_args), recorded=bool(getattr(chip_run, "recorded", False))
+        )
         with self._hierarchical_start_cv:
             # close() may already be CLOSED and waiting for this operation's
             # lease. This accepted run still belongs to its eventual drain set.

@@ -119,8 +119,9 @@ struct KernelArgs {
     //
     // Unlike the wall buffer this is NOT gated on diagnostics — a run's error
     // result has to survive whether or not timing capture is on. The host does
-    // not clear the region per run; the epoch is what makes a previous run's
-    // payload recognisable as stale, so arming costs no H2D.
+    // not clear the region per run. Common device preparation inspects the prior
+    // terminal before clearing publication; legacy launches use the native identity
+    // to reject stale results. This identity is not an AICore replay handshake.
     // Both zero when no region was allocated.
     uint64_t run_result_data_base{0};
     uint64_t run_result_epoch{0};
@@ -137,6 +138,7 @@ struct KernelArgs {
     uint64_t pmu_run_terminal_bank{0};
     uint64_t dep_gen_run_terminal_bank{0};
     uint64_t scope_stats_run_terminal_bank{0};
+    uint64_t execution_control{0};
     // 32-bit tail: no interior padding, and no field here is offset-locked.
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
     // How this run's entry arguments reached the AICPU, restated from the
@@ -180,9 +182,8 @@ static_assert(offsetof(KernelArgs, regs) == 8, "KernelArgs::regs offset drift");
 // what `launch_aicpu_payload` hands to `rtsLaunchCpuKernel` as `argsSize`, and
 // what `PersistentKernelArgs::prepare_once` allocates and copies H2D. The field
 // offsets differ from a2a3's: this struct has no `ffts_base_addr`, so its
-// seventeen 8-byte fields end at 136 rather than 144, and its 32-bit tail holds
-// nine uint32_t rather than eight. The two sizes coincide at 176 only because
-// the extra tail field is absorbed by the padding a2a3 does not need.
+// eighteen 8-byte fields end at 144, followed by nine uint32_t fields and
+// four bytes of alignment padding. AICore's separate launch ABI is unchanged.
 static_assert(offsetof(KernelArgs, chip_swimlane_data_base) == 24, "KernelArgs::chip_swimlane_data_base offset drift");
 static_assert(
     offsetof(KernelArgs, chip_swimlane_run_terminal_bank) == 32,
@@ -198,8 +199,8 @@ static_assert(
 // reorder inside that tail, because every member of it is the same width, and
 // here it cannot see an appended one either: 172 bytes of members round up to
 // the same 176 as 176 would.
-static_assert(offsetof(KernelArgs, graph_section_offset) == 156, "KernelArgs::graph_section_offset offset drift");
-static_assert(sizeof(KernelArgs) == 176, "KernelArgs launch-payload size drift");
+static_assert(offsetof(KernelArgs, graph_section_offset) == 164, "KernelArgs::graph_section_offset offset drift");
+static_assert(sizeof(KernelArgs) == 184, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
@@ -251,15 +252,14 @@ static_assert(sizeof(AicoreLaunchArgs) == 48, "AicoreLaunchArgs size drift");
  * `KernelArgs` the host already built for the AICPU.
  *
  * `report_epoch` is the projection that gives both processors the same run
- * identity: the AICPU reads `KernelArgs::run_result_epoch` directly, the AICore
- * has no `KernelArgs`, so the identical value travels here. A native program
- * launch supplies a non-zero epoch; a kernel/persistent launch leaves it 0,
- * which selects the protocol that predates the stamp.
+ * identity on legacy launches. Common device preparation resets the worker
+ * reports before the fork and uses the existing unstamped Core handshake.
+ * AICPU keeps the native identity solely for structured result publication.
  */
 inline void fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args) {
     args.runtime_args = reinterpret_cast<uint64_t>(k_args.runtime_args);
     args.enable_profiling_flag = k_args.enable_profiling_flag;
-    args.report_epoch = k_args.run_result_epoch;
+    args.report_epoch = k_args.execution_control != 0 ? 0 : k_args.run_result_epoch;
 }
 
 /**

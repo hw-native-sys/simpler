@@ -259,11 +259,10 @@ Program mode rewrites the same slot block and repeats.
 **Kernel mode is scaffolding at this baseline, and its device-read chain is not
 delivered.** `PersistentKernelArgs::prepare_once`
 (`kernel_persistent_args.cpp:24`, called once from `device_runner_base.cpp:871`)
-does allocate and H2D the descriptor. But `simpler_kernel_mode_supported` returns
-**0** (`c_api_shared.cpp:1561`) and `simpler_kernel_mode_launch`
-(`c_api_shared.cpp:1700`) validates its arguments and then **unconditionally**
-returns `PTO_RUNTIME_ERR_INVALID_STATE`; the section header says so directly —
-*"Launch remains a rejecting stub, so supported() reports 0."*
+does allocate and H2D the descriptor. At that frozen baseline, the capability
+query reported unsupported and the launch stub refused execution. Those legacy
+entries have since been removed; current borrowed execution uses the shared native
+API. The table below describes the historical baseline only.
 
 | kernel-mode stage | status at this baseline |
 | ----------------- | ----------------------- |

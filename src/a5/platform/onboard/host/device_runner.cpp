@@ -719,10 +719,12 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             // than continued.
             void *core_done = nullptr;
             bool whole_operator = false;
-            // Caller exit ordering requires this join even without a successor.
-            const bool needs_join = prepared.joinable_boundary || prepared.caller_stream != nullptr;
+            // Caller exit and common preparation require this join even without a successor.
+            const bool needs_join = prepared.joinable_boundary || prepared.caller_stream != nullptr ||
+                                    prepared.kernel_args.args.execution_control != 0;
             const int own_rc = needs_join ? open_own_boundary_wait(prepared, &core_done) : 0;
-            if (prepared.caller_stream != nullptr && own_rc != 0) return own_rc;
+            if ((prepared.caller_stream != nullptr || prepared.kernel_args.args.execution_control != 0) && own_rc != 0)
+                return own_rc;
             if (needs_join && own_rc == 0) {
                 const int wait_rc = queue_own_boundary_wait(prepared, streams.aicpu, core_done);
                 if (wait_rc != 0) return wait_rc;

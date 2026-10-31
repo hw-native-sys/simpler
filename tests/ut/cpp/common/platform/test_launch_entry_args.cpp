@@ -74,6 +74,11 @@ rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtM
     return 0;
 }
 extern "C" rtError_t rtStreamQuery(rtStream_t) { return 0; }
+extern "C" int aclrtMemset(void *dst, size_t capacity, int value, size_t count) {
+    if (count > capacity) return -1;
+    std::memset(dst, value, count);
+    return 0;
+}
 extern "C" const char *aclGetRecentErrMsg() { return nullptr; }
 
 // The capture-status query the production permit asks. A case chooses the

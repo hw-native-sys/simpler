@@ -20,6 +20,8 @@
 #include <thread>
 
 #include "runtime.h"
+#include "aicpu/platform_entry_args.h"
+#include "aicpu/platform_aicpu_affinity.h"
 #include "scheduler/scheduler_context.h"
 
 namespace {
@@ -170,6 +172,7 @@ protected:
     std::array<uint64_t, kCores> regs{};
 
     void SetUp() override {
+        platform_aicpu_affinity_set_thread_idx(-1);
         test_report_epoch = 0;
         nonce_batches = 0;
         batches = 0;
@@ -510,4 +513,20 @@ TEST_F(SchedulerRetirement, UnstampedModeUsesNonceAfterOwnershipPublication) {
     EXPECT_EQ(request_all(), 0);
     expect_once();
     EXPECT_EQ(nonce_batches.load(), 1);
+}
+
+TEST_F(SchedulerRetirement, CommonNativeEntryAcceptsUnstampedReportWithNonzeroResultIdentity) {
+    test_report_epoch = 42;
+    platform_aicpu_affinity_set_thread_idx(0);
+    PlatformEntryArgs entry{};
+    entry.unstamped_reports = true;
+    set_platform_entry_args(0, entry);
+    ASSERT_EQ(initialize(*context, runtime.get(), reinterpret_cast<uint64_t>(regs.data()), 0), 0);
+    for (int i = 0; i < kCores; ++i)
+        runtime->dev.workers[i].report_epoch = 0;
+    handshake();
+    EXPECT_EQ(request_all(), 0);
+    expect_once();
+    EXPECT_EQ(nonce_batches.load(), 1);
+    platform_aicpu_affinity_set_thread_idx(-1);
 }

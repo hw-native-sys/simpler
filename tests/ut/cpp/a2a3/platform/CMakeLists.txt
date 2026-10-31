@@ -31,6 +31,21 @@ a2a3_platform_case(test_aicpu_affinity_select.cpp
     SOURCES ${A2A3_ONBOARD_HOST_DIR}/aicpu_affinity_select.cpp
     INCLUDES ${A2A3_ONBOARD_HOST_DIR})
 
+a2a3_platform_case(test_native_capture_identity.cpp
+    SOURCES ${SIMPLER_SRC}/common/platform/shared/aicpu/platform_entry_args.cpp
+    LINK a2a3_ut_support)
+
+simpler_ut_add_target(NAME test_a2a3_native_capture_entry
+    ARCH a2a3 RUNTIME host_build_graph TIER aicpu
+    SOURCES test_native_capture_entry.cpp
+            support/native_capture_entry_stubs.cpp
+            ${SIMPLER_SRC}/a2a3/platform/onboard/aicpu/kernel.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/platform_entry_args.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/device_run_result_base_aicpu.cpp
+            ${SIMPLER_SRC}/common/host_build_graph/shared/runtime.cpp
+    LINK a2a3_ut_support
+    LABEL no_hardware)
+
 # The wrapped sched_* symbols are a GNU ld feature, so this builds on Linux only.
 # sched_getscheduler/sched_setscheduler are also not declared on non-Linux
 # headers, so this must stay out of simpler_ut_glob_cases()'s default sweep

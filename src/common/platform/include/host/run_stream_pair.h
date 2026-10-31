@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -36,7 +37,8 @@
  * The AICore stream carries instruction-cache state: cores may retain code
  * fetched from a GM address whose contents a later registration replaced.
  * Publishing new AICore code therefore marks the stream stale, and the next
- * launch destroys it and creates a replacement. Creating a stream is the only
+ * launch retires it and creates a replacement. A graph-pinned generation keeps
+ * its handle until graph destruction and drain. Creating a stream is the only
  * operation known to leave a core free of the previous image's instructions.
  *
  * **Submission state is per owner.** More than one run may have submitted and
@@ -75,6 +77,8 @@ public:
      */
     int ensure() {
         std::lock_guard<std::mutex> lock(mutex_);
+        const int retired_rc = release_unpinned_generations();
+        if (retired_rc != 0) return retired_rc;
         if (aicpu_ == nullptr) {
             int rc = create_(&aicpu_);
             if (rc != 0) {
@@ -88,20 +92,36 @@ public:
             // poll is not a finalized run, and replacing the stream under it
             // would strand a live submission.
             if (owner_count_ != 0) return PTO_RUNTIME_ERR_INTERNAL;
-            int rc = destroy_(aicore_);
-            if (rc != 0) return rc;
+            if (aicore_generation_.use_count() > 1) {
+                retired_generations_.push_back(aicore_generation_);
+            } else {
+                int rc = destroy_(aicore_);
+                if (rc != 0) return rc;
+            }
+            aicore_generation_.reset();
             aicore_ = nullptr;
         }
+        auto generation = std::make_shared<void *>(nullptr);
         int rc = create_(&aicore_);
         if (rc != 0) {
             aicore_ = nullptr;
             return rc;
         }
+        *generation = aicore_;
+        aicore_generation_ = std::move(generation);
         created_count_.fetch_add(1, std::memory_order_relaxed);
         stale_ = false;
         last_retired_owner_ = nullptr;
         last_retired_complete_ = false;
         return 0;
+    }
+
+    // The graph holds this generation through destruction and successful drain.
+    // Rotation preserves its handle; unpinned old handles are reaped on the
+    // next ensure/destroy, with failed destroys retaining ownership for retry.
+    std::shared_ptr<void> pin_aicore_generation() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return aicore_generation_;
     }
 
     /** Mark the AICore stream stale after new AICore code is published. */
@@ -159,7 +179,8 @@ public:
      * for, and the handle survives a failed destroy so teardown can retry it.
      * Unproven *while another run still owns the pair* cannot destroy it —
      * that run's work is still queued on it — so the stream is marked stale
-     * and the last owner's retirement replaces it. A caller that never
+     * and the last owner's retirement replaces it. A graph pin likewise defers
+     * destruction until that generation is no longer referenced. A caller that never
      * submitted retires nothing.
      */
     int retire(CompletionStatus completion_status, const void *owner) {
@@ -173,7 +194,7 @@ public:
         last_retired_owner_ = owner;
         last_retired_complete_ = completion_status == CompletionStatus::Complete;
         if (completion_status == CompletionStatus::Complete) return 0;
-        if (owner_count_ != 0) {
+        if (owner_count_ != 0 || aicore_generation_.use_count() > 1) {
             stale_ = true;
             return 0;
         }
@@ -187,7 +208,9 @@ public:
     /** Destroy both streams, keeping a handle whose destroy failed. */
     int destroy() {
         std::lock_guard<std::mutex> lock(mutex_);
-        int first_error = 0;
+        int first_error = release_unpinned_generations();
+        if (aicore_generation_.use_count() > 1 || !retired_generations_.empty())
+            return first_error != 0 ? first_error : PTO_RUNTIME_ERR_INVALID_STATE;
         owner_count_ = 0;
         last_retired_owner_ = nullptr;
         last_retired_complete_ = false;
@@ -203,6 +226,7 @@ public:
         // A handle that survived teardown may still hold the previous image's
         // instructions, so it stays stale for whoever retries it.
         stale_ = aicore_ != nullptr;
+        if (aicore_ == nullptr) aicore_generation_.reset();
         return first_error;
     }
 
@@ -211,6 +235,8 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         aicpu_ = nullptr;
         aicore_ = nullptr;
+        aicore_generation_.reset();
+        retired_generations_.clear();
         stale_ = false;
         owner_count_ = 0;
         last_retired_owner_ = nullptr;
@@ -275,6 +301,21 @@ private:
         }
     }
 
+    int release_unpinned_generations() {
+        for (auto it = retired_generations_.begin(); it != retired_generations_.end();) {
+            if (it->use_count() > 1) {
+                ++it;
+                continue;
+            }
+            const int rc = destroy_(**it);
+            if (rc != 0) return rc;
+            it = retired_generations_.erase(it);
+        }
+        return 0;
+    }
+
+    std::shared_ptr<void *> aicore_generation_;
+    std::vector<std::shared_ptr<void *>> retired_generations_;
     mutable std::mutex mutex_;
     void *aicpu_{nullptr};
     void *aicore_{nullptr};

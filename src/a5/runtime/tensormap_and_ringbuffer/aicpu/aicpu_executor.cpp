@@ -1014,8 +1014,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         runtime_init_ready_.store(true, std::memory_order_release);
         return -1;
     }
-    int32_t run_rc = 0;
-    bool normal_path = true;
+    const int32_t dispatch_error = get_platform_entry_args(affinity_exec_idx).dispatch_error;
+    int32_t run_rc = dispatch_error;
+    bool normal_path = dispatch_error == 0;
     // Publish the resolved index so per-thread readers in this `.so` (notably
     // the AICPU phase-record slot) agree with the executor. On sim the basic
     // affinity gate leaves the index unset (-1); without this the sub-phase
@@ -1024,7 +1025,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     platform_aicpu_affinity_set_thread_idx(thread_idx);
 
     // Orchestrator check
-    if (thread_idx >= sched_thread_num_) {
+    if (dispatch_error == 0 && thread_idx >= sched_thread_num_) {
         run_rc = run_orchestration(runtime, thread_idx);
         if (run_rc != 0) {
             // This thread submitted nothing the scheduler could run, so it has
@@ -1034,7 +1035,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
     }
 
     // Scheduler thread (orchestrator thread skips dispatch and exits after orchestration)
-    if (!sched_ctx_.is_completed() && thread_idx < sched_thread_num_) {
+    if (dispatch_error == 0 && !sched_ctx_.is_completed() && thread_idx < sched_thread_num_) {
         // Device orchestration: wait for the primary orchestrator to initialize the SM header
         while (!runtime_init_ready_.load(std::memory_order_acquire)) {
             SPIN_WAIT_HINT();

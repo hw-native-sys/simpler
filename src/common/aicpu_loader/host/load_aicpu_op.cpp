@@ -443,7 +443,7 @@ int LoadAicpuOp::Init(const std::vector<std::string> &extra_symbols) {
     }
 
     // Base entries are exported by every runtime; the runtime reports any extra
-    // entries it additionally exports (TMARB: register_callable; hbg: none), so
+    // control entries it additionally exports, so
     // this loader carries no runtime-specific symbol knowledge.
     kernel_symbols_ = {KernelNames::RunName, KernelNames::InitName, KernelNames::FinalizeName};
     kernel_symbols_.insert(kernel_symbols_.end(), extra_symbols.begin(), extra_symbols.end());

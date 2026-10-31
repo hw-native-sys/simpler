@@ -33,10 +33,18 @@ template <typename T, typename = void>
 struct HasRawConstructor : std::false_type {};
 template <typename T>
 struct HasRawConstructor<T, std::void_t<decltype(T::from_bits(uint8_t{}))>> : std::true_type {};
-template <typename T, typename = void>
-struct HasBitConstant : std::false_type {};
+// Keep access checking in function substitution: GCC 10 diagnoses private
+// constexpr members as hard errors in a void_t partial specialization.
 template <typename T>
-struct HasBitConstant<T, std::void_t<decltype(T::kAic)>> : std::true_type {};
+auto has_bit_constant(int) -> decltype(T::kAic, std::true_type{});
+template <typename T>
+auto has_bit_constant(...) -> std::false_type;
+template <typename T>
+using HasBitConstant = decltype(has_bit_constant<T>(0));
+struct PublicBitConstant {
+    static constexpr uint8_t kAic = 1;
+};
+static_assert(HasBitConstant<PublicBitConstant>::value);
 }  // namespace
 
 static_assert(!HasRawBits<LaneMask>::value && !HasBitwiseUnion<LaneMask>::value);

@@ -351,6 +351,12 @@ hand-waving or done implicitly via mechanisms the reader has to guess.
 
 ## Step 6: Type-Specific Analysis
 
+For callback, asynchronous execution or reusable-resource changes, apply
+[Working Discipline §6](../../rules/discipline.md#6-review-complete-execution-paths-and-state-transitions):
+trace callback lock reentry, cross-participant error handoff and successor
+admission, and nonzero-offset clear/restore transitions. Check each actual entry
+route separately and cite the counterexample or validation evidence.
+
 Classify the PR as one of the following and apply the matching checklist.
 A PR with multiple types gets multiple checklists.
 

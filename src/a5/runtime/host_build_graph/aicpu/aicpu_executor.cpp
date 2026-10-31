@@ -34,6 +34,8 @@
 #include "spin_hint.h"
 
 #include "common/run_terminal_accumulator.h"
+#include "common/native_execution_control.h"
+#include "aicpu/platform_entry_args.h"
 #include "common/unified_log.h"
 
 // Register-based communication
@@ -42,6 +44,21 @@
 #include "common/platform_config.h"
 #include "common/memory_barrier.h"
 #include "utils/thread_completion_gate.h"
+
+extern "C" int aicpu_prepare_execution(Runtime *runtime, NativeExecutionDecision decision, int32_t) {
+    if (decision != NativeExecutionDecision::Skip || !aicore_scheduler_runtime_enabled(runtime)) return 0;
+    auto *context = aicore_scheduler_bootstrap_context(runtime);
+    if (context == nullptr) return -1;
+    cache_invalidate_range(context, sizeof(*context));
+    auto *control = aicore_scheduler_run_control(context);
+    if (control == nullptr) return -1;
+    cache_invalidate_range(control, sizeof(*control));
+    (void)record_aicore_scheduler_runtime_error(
+        control, SchedulerGraphResult::INVALID_ARGUMENTS, SchedulerErrorSite::BOOTSTRAP_FAILED
+    );
+    cache_flush_range(control, sizeof(*control));
+    return 0;
+}
 
 struct AicpuExecutor {
     // ===== Thread management state =====
@@ -287,6 +304,8 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
             init_failed_.store(true, std::memory_order_release);
         }
         completion_gate_.reset();
+        if (get_platform_entry_args(platform_aicpu_affinity_thread_idx()).dispatch_error != 0)
+            init_failed_.store(true, std::memory_order_release);
         if (!init_failed_.load(std::memory_order_acquire) && aicore_lifecycle_.post_handshake_init(runtime) != 0) {
             init_failed_.store(true, std::memory_order_release);
         }

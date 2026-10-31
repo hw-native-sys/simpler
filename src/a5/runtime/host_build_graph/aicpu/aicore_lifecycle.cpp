@@ -25,6 +25,8 @@
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/cache_maintenance.h"
 #include "aicpu/device_run_result_base_aicpu.h"
+#include "aicpu/platform_entry_args.h"
+#include "aicpu/platform_aicpu_affinity.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
@@ -112,10 +114,12 @@ void AicoreLifecycle::handshake_partition(Runtime *runtime, int32_t tidx, int32_
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * core_count_) / nthreads);
     const uint32_t physical_core_count = platform_get_physical_cores_count();
     uint64_t *regs = reinterpret_cast<uint64_t *>(regs_base_);
-    // This run's identity, latched from KernelArgs at AICPU entry. Non-zero on a
-    // native program launch, so only a report stamped with it is this run's;
-    // zero on a kernel/persistent launch, which keeps the aicore_done predicate.
-    const uint64_t report_epoch = get_platform_run_result_epoch();
+    // Common native preparation clears the worker reports before the fork, so
+    // Program and Kernel use the same unstamped AICore handshake. The native
+    // result identity remains separate; legacy launches retain stamped reports.
+    const uint64_t report_epoch = get_platform_entry_args(platform_aicpu_affinity_thread_idx()).unstamped_reports ?
+                                      0 :
+                                      get_platform_run_result_epoch();
 
     struct ReadyCore {
         int32_t worker_id;

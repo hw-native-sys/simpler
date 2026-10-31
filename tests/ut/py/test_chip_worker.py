@@ -186,16 +186,12 @@ class TestCallConfig:
 # ============================================================================
 
 
-_KERNEL_LIFECYCLE_SYMBOLS = (
-    "simpler_kernel_mode_init",
-    "simpler_kernel_mode_prepare_callable",
-    "simpler_kernel_mode_launch",
-)
+_KERNEL_LIFECYCLE_SYMBOLS = ("simpler_kernel_mode_init",)
 
 
 @pytest.fixture(scope="module")
 def kernel_symbol_runtime(tmp_path_factory):
-    """Build real DSOs with a selectable kernel capability and export surface."""
+    """Build real DSOs with configurable lifecycle behavior and exports."""
     compiler = shutil.which("c++") or shutil.which("g++")
     assert compiler is not None, "kernel symbol tests require a C++ compiler"
     build_dir = tmp_path_factory.mktemp("kernel_symbol_runtime")
@@ -219,7 +215,6 @@ def kernel_symbol_runtime(tmp_path_factory):
 
     def build(  # noqa: PLR0913 -- independently selectable native lifecycle faults
         *,
-        supported=0,
         missing=(),
         init_result=0,
         finalize_failures=0,
@@ -231,10 +226,10 @@ def kernel_symbol_runtime(tmp_path_factory):
         init_gate=False,
         unproven_cleanup=False,
         init_error=None,
+        blocking_graph_resources=False,
     ):
         nonlocal next_library_id
         key = (
-            supported,
             missing,
             init_result,
             finalize_failures,
@@ -246,6 +241,7 @@ def kernel_symbol_runtime(tmp_path_factory):
             init_gate,
             unproven_cleanup,
             init_error,
+            blocking_graph_resources,
         )
         # Fault scripts retain their consumed failure budget in the loaded DSO.
         if finalize_failures == 0 and not init_gate and key in cache:
@@ -357,15 +353,7 @@ def kernel_symbol_runtime(tmp_path_factory):
             "    context->initialized = 1;\n"
             "    context->scratch = std::make_shared<Scratch>();\n"
             f"    return {init_result};\n"
-            "}\n"
-            + (
-                "int simpler_kernel_mode_supported(DeviceContextHandle ctx) {\n"
-                "    if (ctx == nullptr || static_cast<Context *>(ctx)->initialized != 0) std::abort();\n"
-                f"    return {supported};\n"
-                "}\n"
-                if "simpler_kernel_mode_supported" not in missing
-                else ""
-            ),
+            "}\n",
             encoding="utf-8",
         )
         if workspace:
@@ -459,12 +447,47 @@ def kernel_symbol_runtime(tmp_path_factory):
 
         # These symbols are only resolved during init; any invocation is a test failure.
         # A separate TU keeps the sentinels independent of the C ABI parameter lists.
+        if blocking_graph_resources:
+            with source.open("a", encoding="utf-8") as output:
+                output.write(
+                    textwrap.dedent("""
+                    #include <atomic>
+                    #include <chrono>
+                    static std::atomic<bool> entered{false}, released{false};
+                    extern "C" void test_graph_resources_reset() { entered.store(false); released.store(false); }
+                    extern "C" int test_graph_resources_entered() { return entered.load(); }
+                    extern "C" void test_graph_resources_release() { released.store(true); }
+                    static int wait_for_python() {
+                        entered.store(true);
+                        const auto limit = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+                        while (!released.load()) {
+                            if (std::chrono::steady_clock::now() >= limit) return -91;
+                        }
+                        return 0;
+                    }
+                    extern "C" int simpler_reserve_capture_resources(DeviceContextHandle, void *, uint32_t, uint32_t) {
+                        return wait_for_python();
+                    }
+                    extern "C" int simpler_retire_capture_resources(DeviceContextHandle) {
+                        return wait_for_python();
+                    }
+                """)
+                )
         sentinels.write_text(
             "#include <cstdlib>\n"
             + "".join(
                 f'extern "C" void {symbol}() {{ std::abort(); }}\n'
-                for symbol in (*unused_symbols, *_KERNEL_LIFECYCLE_SYMBOLS)
+                for symbol in (
+                    *unused_symbols,
+                    *_KERNEL_LIFECYCLE_SYMBOLS,
+                    "simpler_reserve_capture_resources",
+                    "simpler_retire_capture_resources",
+                )
                 if symbol not in missing
+                and not (
+                    blocking_graph_resources
+                    and symbol in {"simpler_reserve_capture_resources", "simpler_retire_capture_resources"}
+                )
                 and not (memory and symbol in memory_symbols)
                 and not (
                     borrowed
@@ -597,23 +620,28 @@ class TestChipWorkerKernelSymbols:
             "runtime-unloaded",
         ]
 
-    def test_unsupported_runtime_still_exports_lifecycle_symbols(self, kernel_symbol_runtime):
-        # A runtime that cannot run kernel mode reports so through supported()
-        # and still exports the whole family, the same way the comm group ships
-        # not-supported stubs rather than omitting symbols.
-        runtime = kernel_symbol_runtime(supported=0)
+    @pytest.mark.parametrize("borrowed", [False, True])
+    def test_shared_registration_on_borrowed_and_owned_contexts(self, kernel_symbol_runtime, borrowed):
+        runtime = kernel_symbol_runtime(
+            borrowed=True,
+        )
+        observer = ctypes.CDLL(str(runtime))
+        registered, closed = observer.test_registrations(), observer.test_closes()
         worker = _ChipWorker()
+        options = {"borrowed_context_generation": 77} if borrowed else {}
         try:
-            worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
+            worker.init(str(runtime), os.devnull, os.devnull, "", 0, **options)
+            callable_image = ChipCallable.build(signature=[], func_name="shared", binary=b"\x00", children=[])
+            worker.register_callable(0, callable_image)
+            assert observer.test_registrations() == registered + 1
             assert worker.initialized
-            assert worker.device_id == 0
+            worker.unregister_callable(0)
         finally:
             worker.finalize()
-        assert not worker.initialized
-        assert worker.runtime_slot_count == 0
+        assert observer.test_closes() == closed + 1
 
     def test_supported_runtime_with_complete_lifecycle_symbols(self, kernel_symbol_runtime):
-        runtime = kernel_symbol_runtime(supported=1)
+        runtime = kernel_symbol_runtime()
         worker = _ChipWorker()
         try:
             worker.init(str(runtime), os.devnull, os.devnull, "", device_id=0)
@@ -625,7 +653,6 @@ class TestChipWorkerKernelSymbols:
         "missing",
         (
             *_KERNEL_LIFECYCLE_SYMBOLS,
-            "simpler_kernel_mode_supported",
             "simpler_execution_environment_releasable_ctx",
             "simpler_get_init_error_ctx",
         ),
@@ -633,8 +660,8 @@ class TestChipWorkerKernelSymbols:
     def test_missing_required_runtime_symbol_allows_retry(self, kernel_symbol_runtime, missing):
         # Resolve the complete module contract before creating a context or
         # invoking either initialization path.
-        incomplete = kernel_symbol_runtime(supported=1, missing=(missing,))
-        complete = kernel_symbol_runtime(supported=0)
+        incomplete = kernel_symbol_runtime(missing=(missing,))
+        complete = kernel_symbol_runtime()
         observer = ctypes.CDLL(str(incomplete))
         before = observer.test_creates(), observer.test_program_inits(), observer.test_borrowed_inits()
         assert before == (0, 0, 0)
@@ -652,8 +679,8 @@ class TestChipWorkerKernelSymbols:
             worker.finalize()
 
     def test_program_init_failure_after_kernel_symbol_resolution_allows_retry(self, kernel_symbol_runtime):
-        failing = kernel_symbol_runtime(supported=1, init_result=-1000)
-        complete = kernel_symbol_runtime(supported=0)
+        failing = kernel_symbol_runtime(init_result=-1000)
+        complete = kernel_symbol_runtime()
         worker = _ChipWorker()
         try:
             with pytest.raises(RuntimeError, match="simpler_init failed with code -1000"):
@@ -1002,10 +1029,14 @@ class TestChipWorkerDeviceOwner:
     @pytest.mark.parametrize("second_borrowed", [False, True])
     @pytest.mark.parametrize("different_runtime", [False, True])
     def test_same_device_refused_before_context_creation(
-        self, kernel_symbol_runtime, first_borrowed, second_borrowed, different_runtime
+        self, kernel_symbol_runtime, tmp_path, first_borrowed, second_borrowed, different_runtime
     ):
         runtime = kernel_symbol_runtime(borrowed=True)
-        other_runtime = kernel_symbol_runtime(borrowed=True, supported=1) if different_runtime else runtime
+        other_runtime = (
+            kernel_symbol_runtime(borrowed=True, lifecycle_log=str(tmp_path / "other-runtime.log"))
+            if different_runtime
+            else runtime
+        )
         observer = ctypes.CDLL(str(other_runtime))
         first, second, other_device = _ChipWorker(), _ChipWorker(), _ChipWorker()
         first_options = {"borrowed_context_generation": 77} if first_borrowed else {}
@@ -1284,6 +1315,103 @@ class TestChipWorkerExecutionEnvironment:
             worker.finalize()
         assert worker._execution_environment is None
 
+    @pytest.mark.parametrize("operation", ["reserve", "retire"])
+    def test_graph_resources_blocking_call_allows_python_progress(self, kernel_symbol_runtime, operation):
+        runtime = kernel_symbol_runtime(borrowed=True, blocking_graph_resources=True, finalize_failures=0)
+        observer = ctypes.CDLL(str(runtime))
+        observer.test_graph_resources_entered.restype = ctypes.c_int
+        observer.test_graph_resources_reset()
+        worker = _ChipWorker()
+        worker.init(str(runtime), os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+        stop = threading.Event()
+
+        def release_from_python():
+            while not stop.is_set():
+                if observer.test_graph_resources_entered():
+                    observer.test_graph_resources_release()
+                    return
+                stop.wait(0.001)
+
+        peer = threading.Thread(target=release_from_python)
+        peer.start()
+        try:
+            if operation == "reserve":
+                worker.reserve_capture_resources(1)
+            else:
+                worker.retire_capture_resources()
+        finally:
+            stop.set()
+            peer.join(timeout=3)
+            worker.finalize()
+        assert not peer.is_alive()
+
+    @pytest.mark.parametrize("operation", ["reserve", "retire"])
+    def test_finalize_refuses_inflight_graph_resource_operation(self, kernel_symbol_runtime, operation):
+        runtime = kernel_symbol_runtime(borrowed=True, blocking_graph_resources=True, finalize_failures=0)
+        script = """
+import ctypes
+import os
+import signal
+import sys
+import threading
+import time
+from _task_interface import _ChipWorker
+from simpler.task_interface import ExecutionContextRefused
+observer = ctypes.CDLL(sys.argv[1])
+observer.test_graph_resources_reset()
+worker = _ChipWorker()
+worker.init(sys.argv[1], os.devnull, os.devnull, "", 0, borrowed_context_generation=77)
+errors = []
+def execute():
+    try:
+        if sys.argv[2] == "reserve":
+            worker.reserve_capture_resources(1)
+        else:
+            worker.retire_capture_resources()
+    except BaseException as exc:
+        errors.append(exc)
+peer = threading.Thread(target=execute)
+peer.start()
+try:
+    deadline = time.monotonic() + 1
+    while not observer.test_graph_resources_entered():
+        assert time.monotonic() < deadline
+        time.sleep(0.001)
+    try:
+        worker.finalize()
+    except RuntimeError as exc:
+        assert "in flight" in str(exc), str(exc)
+    else:
+        raise AssertionError("finalize destroyed an in-flight graph resource operation")
+    assert worker.initialized
+    # The child inherits an active reservation; PID refusal must win over busy.
+    child = os.fork()
+    if child == 0:
+        signal.alarm(3)
+        try:
+            worker.retire_capture_resources()
+        except ExecutionContextRefused:
+            os._exit(0)
+        except BaseException:
+            os._exit(2)
+        os._exit(3)
+    assert os.waitpid(child, 0)[1] == 0
+finally:
+    observer.test_graph_resources_release()
+    peer.join(timeout=3)
+assert not peer.is_alive()
+assert not errors, errors
+worker.finalize()
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(runtime), operation],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
     @pytest.mark.parametrize("borrowed", [False, True])
     def test_forked_native_owner_refuses_before_runtime_entry(self, kernel_symbol_runtime, borrowed):
         runtime = kernel_symbol_runtime(borrowed=borrowed, memory=True)
@@ -1295,7 +1423,13 @@ class TestChipWorkerExecutionEnvironment:
             if pid == 0:
                 signal.alarm(3)
                 try:
-                    for operation in (worker._validate_execution_context, lambda: worker.malloc(4), worker.finalize):
+                    for operation in (
+                        worker._validate_execution_context,
+                        lambda: worker.malloc(4),
+                        lambda: worker.reserve_capture_resources(1),
+                        lambda: worker.retire_capture_resources(),
+                        worker.finalize,
+                    ):
                         try:
                             operation()
                         except ExecutionContextRefused:
@@ -2399,3 +2533,22 @@ class TestMailboxConfigRoundtrip:
             # because the nonce is urandom output and JSON carries no bytes.
             "owner_instance_id": "0f1e2d3c4b5a6978",
         }
+
+
+def test_recording_handle_does_not_publish_execution_acceptance():
+    from typing import cast  # noqa: PLC0415
+
+    from simpler.worker import RunHandle  # noqa: PLC0415
+
+    owner = cast(Worker, SimpleNamespace(_run_handle_done=lambda _run_id: True))
+    handle = RunHandle(owner, 1, (), recorded=True)
+    assert handle.recorded
+    assert handle.done
+    with pytest.raises(RuntimeError, match="no execution acceptance"):
+        handle._wait_for_acceptance()
+    assert handle._publish_terminal(None) is None
+    assert handle.done and handle.recorded
+    assert not handle._launch_accepted
+    with pytest.raises(RuntimeError, match="no execution acceptance"):
+        handle._wait_for_acceptance()
+    assert not RunHandle._completed(owner).recorded

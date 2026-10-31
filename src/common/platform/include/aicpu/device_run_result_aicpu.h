@@ -106,6 +106,8 @@ inline bool aicpu_publish_run_terminal(
  */
 class RunTerminalPublisher {
 public:
+    int32_t decided_code() const { return selection_.code; }
+
     void take(RunTerminalSelection selection, const void *payload, size_t payload_bytes) {
         selection_ = selection;
         payload_bytes_ = 0;

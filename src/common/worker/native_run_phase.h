@@ -25,4 +25,5 @@ enum class NativeRunPhase : uint8_t {
     Prepared,
     Running,
     Complete,
+    Recorded,
 };

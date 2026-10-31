@@ -17,6 +17,7 @@
 #include <utility>
 
 #include "common/chip_swimlane_extension.h"
+#include "worker/runtime_c_api.h"
 
 // Borrowed source views, valid through stage_launch_metadata; the platform
 // captures values and never takes ownership of the source containers.
@@ -297,6 +298,9 @@ struct HostApiOps {
  */
 struct HostApi {
 public:
+    void set_capture_recording(bool enabled) { capture_recording_ = enabled; }
+    bool capture_recording() const { return capture_recording_; }
+
     int stage_launch_metadata(const HostMetadataRegion *regions, size_t count) const {
         if (ops_->stage_launch_metadata != nullptr)
             return ops_->stage_launch_metadata(runner_ctx_, pipeline_slot_, regions, count);
@@ -332,25 +336,35 @@ public:
     // so a row without it cannot be attributed once one file holds several runs.
     uint64_t run_epoch() const { return run_epoch_; }
 
-    void *device_malloc(size_t size) const { return ops_->device_malloc(runner_ctx_, size); }
+    void *device_malloc(size_t size) const {
+        return capture_recording_ ? nullptr : ops_->device_malloc(runner_ctx_, size);
+    }
+    // A recording cannot undo a free, so a free is not refused here. The
+    // supported capture orchestration allocates nothing it later frees while
+    // recording; the cold probe checks that no free occurs.
     void device_free(void *dev_ptr) const { ops_->device_free(runner_ctx_, dev_ptr); }
     int copy_to_device(void *dev_ptr, const void *host_ptr, size_t size) const {
+        if (capture_recording_) return PTO_RUNTIME_ERR_UNSUPPORTED;
         return ops_->copy_to_device(runner_ctx_, dev_ptr, host_ptr, size);
     }
     int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) const {
+        if (capture_recording_) return PTO_RUNTIME_ERR_UNSUPPORTED;
         return ops_->copy_from_device(runner_ctx_, host_ptr, dev_ptr, size);
     }
     void *register_device_memory_to_host(void *dev_ptr, size_t bytes) const {
+        if (capture_recording_) return nullptr;
         return ops_->register_device_memory_to_host(runner_ctx_, dev_ptr, bytes);
     }
     void unregister_device_memory_from_host(void *dev_ptr) const {
         ops_->unregister_device_memory_from_host(runner_ctx_, dev_ptr);
     }
     void *acquire_child_memory_host_view(void *dev_ptr, size_t bytes) const {
+        if (capture_recording_) return nullptr;
         if (ops_->acquire_child_memory_host_view == nullptr) return nullptr;
         return ops_->acquire_child_memory_host_view(runner_ctx_, dev_ptr, bytes);
     }
     int device_memset(void *dev_ptr, int value, size_t size) const {
+        if (capture_recording_) return PTO_RUNTIME_ERR_UNSUPPORTED;
         return ops_->device_memset(runner_ctx_, dev_ptr, value, size);
     }
     void get_retained_temp_buffer(void **addr, size_t *size) const {
@@ -571,4 +585,5 @@ private:
     uint64_t run_epoch_{0};
     const HostApiOps *ops_{nullptr};
     std::optional<DiagnosticConfig> diagnostics_;
+    bool capture_recording_{false};
 };

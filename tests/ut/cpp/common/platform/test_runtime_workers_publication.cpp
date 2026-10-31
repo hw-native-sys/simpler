@@ -17,6 +17,7 @@
 
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "acl/acl.h"
 #include "device_runner_helpers.h"
@@ -26,7 +27,19 @@ namespace {
 // left there. A range still holding it was not copied into.
 constexpr unsigned char kDeviceMark = 0xa5;
 
+struct PendingCopy {
+    void *target;
+    const void *source;
+    size_t bytes;
+};
+
 struct RtsState {
+    bool defer_copies = false;
+    std::vector<PendingCopy> pending;
+    int host_alloc_rc = 0;
+    int host_free_rc = 0;
+    int host_allocations = 0;
+    int host_frees = 0;
     int alloc_rc = 0;
     int copy_rc = 0;
     int copies = 0;
@@ -93,10 +106,14 @@ extern "C" rtError_t rtFree(void *ptr) {
     return 0;
 }
 extern "C" rtError_t rtMallocHost(void **ptr, uint64_t bytes, uint16_t) {
+    if (rts.host_alloc_rc != 0) return rts.host_alloc_rc;
+    ++rts.host_allocations;
     *ptr = std::malloc(bytes);
     return *ptr == nullptr ? -1 : 0;
 }
 extern "C" rtError_t rtFreeHost(void *ptr) {
+    if (rts.host_free_rc != 0) return rts.host_free_rc;
+    ++rts.host_frees;
     std::free(ptr);
     return 0;
 }
@@ -111,10 +128,19 @@ rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtM
     EXPECT_EQ(kind, RT_MEMCPY_HOST_TO_DEVICE);
     EXPECT_EQ(capacity, bytes);
     if (rts.copy_rc != 0) return rts.copy_rc;
-    std::memcpy(dst, src, bytes);
+    if (rts.defer_copies) {
+        rts.pending.push_back({dst, src, bytes});
+    } else {
+        std::memcpy(dst, src, bytes);
+    }
     return 0;
 }
 extern "C" rtError_t rtStreamQuery(rtStream_t) { return 0; }
+extern "C" int aclrtMemset(void *dst, size_t capacity, int value, size_t count) {
+    if (count > capacity) return -1;
+    std::memset(dst, value, count);
+    return 0;
+}
 extern "C" const char *aclGetRecentErrMsg() { return nullptr; }
 // These cases drive the publication step with the launch route refused, so the
 // permit never consults a live stream; the query only has to link.
@@ -180,7 +206,7 @@ TEST_F(WorkersPublication, AnAbandonedSlotDoesNotInheritInitialization) {
 
     // The quarantine path drops ownership without freeing: the card is poisoned
     // and per-resource frees are unsafe.
-    void *abandoned_source = slot.runtime_upload_source;
+    void *abandoned_source = slot.runtime_upload.data();
     abandon_slot_persistent_args(slot);
     std::free(abandoned_source);
     expected_leaked_allocations = 1;
@@ -207,4 +233,124 @@ TEST_F(WorkersPublication, PreparingWithoutPublishingCommitsNothing) {
     ASSERT_EQ(publish_once(), 0);
     EXPECT_EQ(rts.last_copy_bytes, initializing_bytes());
     EXPECT_TRUE(slot.workers_initialized);
+}
+
+TEST_F(WorkersPublication, MetadataSourcesRemainValidAfterTheRunViewIsReleased) {
+    unsigned input = 23, target = 0;
+    const HostMetadataRegion region{&target, &input, sizeof(input)};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&region, 1), 0);
+    input = 47;
+    rts.defer_copies = true;
+    ASSERT_EQ(publish_once(), 0);
+    ASSERT_EQ(rts.pending.size(), 2U);
+    EXPECT_EQ(rts.pending[0].target, &target);
+    EXPECT_EQ(rts.pending[0].source, static_cast<std::byte *>(slot.runtime_upload.data()) + slot.runtime_bytes);
+    EXPECT_EQ(rts.pending[1].source, slot.runtime_upload.data());
+    EXPECT_EQ(target, 0U);
+    EXPECT_TRUE(rts.sink.submitted());
+    helper.release_run_view();
+    slot.staged_launch_metadata.clear();
+    for (const auto &copy : rts.pending)
+        std::memcpy(copy.target, copy.source, copy.bytes);
+    EXPECT_EQ(target, 23U);
+    EXPECT_TRUE(device_workers_all(0u));
+}
+
+TEST_F(WorkersPublication, FailedPinnedGrowthPreservesCommittedSource) {
+    ASSERT_EQ(publish_once(), 0);
+    helper.release_run_view();
+    void *original = slot.runtime_upload.data();
+    const auto capacity = slot.runtime_upload.capacity();
+    std::memset(original, 0x3c, capacity);
+    uint64_t target = 0;
+    const uint64_t value = 17;
+    const HostMetadataRegion metadata{&target, &value, sizeof(value)};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&metadata, 1), 0);
+    rts.host_alloc_rc = -4321;
+    EXPECT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), -4321);
+    EXPECT_EQ(slot.runtime_upload.data(), original);
+    EXPECT_EQ(slot.runtime_upload.capacity(), capacity);
+    EXPECT_EQ(rts.host_frees, 0);
+    if (slot.runtime_upload.data() == original) {
+        EXPECT_EQ(static_cast<unsigned char *>(original)[0], 0x3c);
+        EXPECT_EQ(static_cast<unsigned char *>(original)[capacity - 1], 0x3c);
+    }
+    rts.host_alloc_rc = 0;
+    ASSERT_EQ(helper.prepare_runtime_args(runtime, allocator, slot), 0);
+    EXPECT_GE(slot.runtime_upload.capacity(), capacity + sizeof(value));
+}
+
+TEST_F(WorkersPublication, FailedPinnedRollbackRetainsBothAllocationsForRetry) {
+    ASSERT_EQ(publish_once(), 0);
+    helper.release_run_view();
+    void *original = slot.runtime_upload.data();
+    const auto capacity = slot.runtime_upload.capacity();
+    rts.host_free_rc = -4322;
+    EXPECT_EQ(slot.runtime_upload.reserve(capacity + 8), -4322);
+    EXPECT_EQ(slot.runtime_upload.data(), original);
+    EXPECT_EQ(slot.runtime_upload.capacity(), capacity);
+    EXPECT_EQ(rts.host_allocations, 2);
+    EXPECT_EQ(rts.host_frees, 0);
+    EXPECT_EQ(slot.runtime_upload.reserve(capacity + 16), -4322);
+    EXPECT_EQ(rts.host_allocations, 2) << "failed rollback cannot grow unbounded debt";
+    EXPECT_EQ(slot.runtime_upload.release(), -4322);
+    EXPECT_EQ(slot.runtime_upload.data(), original);
+    rts.host_free_rc = 0;
+    EXPECT_EQ(slot.runtime_upload.release(), 0);
+    EXPECT_EQ(rts.host_frees, 2);
+    EXPECT_EQ(slot.runtime_upload.data(), nullptr);
+    EXPECT_EQ(slot.runtime_upload.capacity(), 0U);
+}
+
+TEST_F(WorkersPublication, MovedPinnedSourceOutlivesRunViewAndSlotRelease) {
+    uint64_t value = 79, target = 0;
+    const HostMetadataRegion metadata{&target, &value, sizeof(value)};
+    ASSERT_EQ(slot.staged_launch_metadata.prepare(&metadata, 1), 0);
+    rts.defer_copies = true;
+    ASSERT_EQ(publish_once(), 0);
+    ASSERT_GE(rts.pending.size(), 2U);
+    const PendingCopy metadata_copy = rts.pending.front();
+    void *original = slot.runtime_upload.data();
+    PinnedUploadStorage retained(std::move(slot.runtime_upload));
+    EXPECT_EQ(retained.data(), original);
+    EXPECT_EQ(slot.runtime_upload.data(), nullptr);
+    EXPECT_EQ(slot.runtime_upload.capacity(), 0U);
+    helper.release_run_view();
+    // Only the source is transferred here. The device descriptor destination
+    // is not retained, so no deferred descriptor copy may touch it after release.
+    rts.pending.clear();
+    ASSERT_EQ(release_slot_persistent_args(slot, allocator), 0);
+    EXPECT_EQ(rts.host_frees, 0);
+    value = 101;
+    std::memcpy(metadata_copy.target, metadata_copy.source, metadata_copy.bytes);
+    EXPECT_EQ(target, 79U);
+    ASSERT_EQ(retained.release(), 0);
+    EXPECT_EQ(rts.host_frees, 1);
+    EXPECT_EQ(retained.release(), 0);
+    EXPECT_EQ(rts.host_frees, 1);
+}
+
+TEST_F(WorkersPublication, PinnedCapacityReuseDoesNotAllocateOrReplace) {
+    ASSERT_EQ(publish_once(), 0);
+    void *original = slot.runtime_upload.data();
+    const auto capacity = slot.runtime_upload.capacity();
+    ASSERT_EQ(slot.runtime_upload.reserve(capacity), 0);
+    ASSERT_EQ(slot.runtime_upload.reserve(capacity / 2), 0);
+    EXPECT_EQ(slot.runtime_upload.data(), original);
+    EXPECT_EQ(slot.runtime_upload.capacity(), capacity);
+    EXPECT_EQ(rts.host_allocations, 1);
+    EXPECT_EQ(rts.host_frees, 0);
+}
+
+TEST_F(WorkersPublication, MovingPinnedStorageTransfersRollbackDebt) {
+    ASSERT_EQ(slot.runtime_upload.reserve(64), 0);
+    rts.host_free_rc = -4323;
+    EXPECT_EQ(slot.runtime_upload.reserve(128), -4323);
+    PinnedUploadStorage retained(std::move(slot.runtime_upload));
+    EXPECT_EQ(slot.runtime_upload.release(), 0);
+    EXPECT_EQ(rts.host_frees, 0);
+    EXPECT_EQ(retained.release(), -4323);
+    rts.host_free_rc = 0;
+    EXPECT_EQ(retained.release(), 0);
+    EXPECT_EQ(rts.host_frees, 2);
 }

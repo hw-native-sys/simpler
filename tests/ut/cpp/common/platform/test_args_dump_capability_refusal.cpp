@@ -165,7 +165,7 @@ protected:
     }
 
     /** Drive the real sim `simpler_prepare_run` with this diagnostic request. */
-    int prepare(const CallConfig &config, uint64_t epoch = 7701) {
+    int prepare(const CallConfig &config, uint64_t epoch = 7701, void *caller_stream = nullptr) {
         NativeRunDescriptor descriptor{};
         descriptor.pipeline_slot = 0;
         descriptor.arena_bank = 0;
@@ -173,6 +173,7 @@ protected:
         descriptor.generation = 1;
         descriptor.dispatch_id = 3;
         descriptor.run_epoch = epoch;
+        descriptor.caller_stream = caller_stream;
         return simpler_prepare_run(
             static_cast<DeviceContextHandle>(&runner), storage.handle(), kCallableId, nullptr, &config, &descriptor
         );
@@ -203,6 +204,18 @@ protected:
     PreparableRunner runner;
     RuntimeStorage storage;
 };
+
+TEST_F(ArgsDumpCapabilityRefusalTest, CallerStreamRefusalLeavesTheSimulatorReusable) {
+    int stream;
+    const CallConfig config = config_with(0, false);
+    EXPECT_EQ(prepare(config, 7701, &stream), PTO_RUNTIME_ERR_UNSUPPORTED);
+    EXPECT_FALSE(carrier_present());
+    EXPECT_EQ(runner.prepare_calls, 0);
+    EXPECT_TRUE(consume_released_preparation(storage.handle(), get_runtime_size(), 7701));
+    ASSERT_EQ(prepare(config), 0);
+    EXPECT_EQ(runner.prepare_calls, 1);
+    EXPECT_EQ(finalize(), 0);
+}
 
 // The request names a capture this runtime has no producer for, so it is
 // refused as unsupported rather than prepared. No live carrier remains in the

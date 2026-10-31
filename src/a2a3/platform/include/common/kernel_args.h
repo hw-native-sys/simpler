@@ -144,8 +144,9 @@ struct KernelArgs {
     //
     // Unlike the wall buffer this is NOT gated on diagnostics — a run's error
     // result has to survive whether or not timing capture is on. The host does
-    // not clear the region per run; the epoch is what makes a previous run's
-    // payload recognisable as stale, so arming costs no H2D.
+    // not clear the region per run. Common device preparation inspects the prior
+    // terminal before clearing publication; legacy launches use the native identity
+    // to reject stale results. This identity is not an AICore replay handshake.
     // Both zero when no region was allocated.
     uint64_t run_result_data_base{0};
     uint64_t run_result_epoch{0};
@@ -162,6 +163,7 @@ struct KernelArgs {
     uint64_t pmu_run_terminal_bank{0};
     uint64_t dep_gen_run_terminal_bank{0};
     uint64_t scope_stats_run_terminal_bank{0};
+    uint64_t execution_control{0};
     // 32-bit tail.
     uint32_t enable_profiling_flag{0};  // Profiling umbrella bitmask; dump_args|chip_swimlane|pmu|dep_gen|scope_stats
 
@@ -211,10 +213,10 @@ static_assert(
 );
 // Where the 32-bit tail's Graph triple begins. `sizeof` alone cannot see a
 // reorder inside that tail, because every member of it is the same width: the
-// eighteen 8-byte fields end at 144 and the eight uint32_t that follow fill 176
+// nineteen 8-byte fields end at 152 and the eight uint32_t that follow fill 184
 // exactly, in whatever order they are written.
-static_assert(offsetof(KernelArgs, graph_section_offset) == 164, "KernelArgs::graph_section_offset offset drift");
-static_assert(sizeof(KernelArgs) == 176, "KernelArgs launch-payload size drift");
+static_assert(offsetof(KernelArgs, graph_section_offset) == 172, "KernelArgs::graph_section_offset offset drift");
+static_assert(sizeof(KernelArgs) == 184, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.
@@ -259,15 +261,17 @@ static_assert(sizeof(AicoreLaunchArgs) == 40, "AicoreLaunchArgs size drift");
  * `KernelArgs` the host already built for the AICPU.
  *
  * `report_epoch` is the projection that gives both processors the same run
- * identity: the AICPU reads `KernelArgs::run_result_epoch` directly, the AICore
- * has no `KernelArgs`, so the identical value travels here. A native program
- * launch supplies a non-zero epoch; a kernel/persistent launch leaves it 0,
- * which selects the protocol that predates the stamp.
+ * identity on legacy launches: the AICPU reads `KernelArgs::run_result_epoch`
+ * directly, and the identical value travels to Core here. Common preparation
+ * resets worker reports before the fork, so Core uses the unstamped handshake.
+ * AICPU retains native identity for structured results; captured identities stay fixed.
  */
 inline void fill_shared_launch_args(AicoreLaunchArgs &args, const KernelArgs &k_args) {
     args.runtime_args = reinterpret_cast<uint64_t>(k_args.runtime_args);
     args.enable_profiling_flag = k_args.enable_profiling_flag;
-    args.report_epoch = k_args.run_result_epoch;
+    // Ordinary and recorded common preparation both reset reports before the
+    // fork, so both use the unstamped handshake.
+    args.report_epoch = k_args.execution_control != 0 ? 0 : k_args.run_result_epoch;
 }
 
 /**

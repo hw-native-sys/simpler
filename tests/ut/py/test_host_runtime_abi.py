@@ -29,9 +29,6 @@ _NEWLY_REQUIRED_PIPELINE_SYMBOLS = {
 # report unsupported rather than omitting the symbols.
 _KERNEL_MODE_SYMBOLS = {
     "simpler_kernel_mode_init",
-    "simpler_kernel_mode_launch",
-    "simpler_kernel_mode_prepare_callable",
-    "simpler_kernel_mode_supported",
 }
 _REMOVED_AMBIENT_SELECTION_SYMBOLS = {
     "select_arena_bank_ctx",

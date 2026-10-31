@@ -42,6 +42,8 @@ public:
     void abandon();
 
     bool launched() const;
+    /** Commands were recorded; this does not assert any replay has completed. */
+    bool recorded() const;
 
     /**
      * This run's diagnostic admission deadline, or a default-constructed

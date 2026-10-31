@@ -27,6 +27,54 @@ static_assert(std::is_nothrow_move_constructible_v<LaunchPermit>);
 static_assert(!std::is_copy_constructible_v<LaunchReceipt>);
 static_assert(std::is_nothrow_move_constructible_v<LaunchReceipt>);
 
+TEST(NativeRunExecutionTest, CaptureReceiptDoesNotProveExecution) {
+    int model;
+    auto result = exact_recording_transaction(
+        kIdentity, NativeRunExecutionTestPeer::mint(kIdentity), &model, [](LaunchProgressSink &sink) {
+            sink.mark_submitted();
+            return 0;
+        }
+    );
+    EXPECT_EQ(result.rc, 0);
+    EXPECT_TRUE(result.recording_receipt.matches(kIdentity, &model));
+    EXPECT_FALSE(result.receipt.valid());
+    auto other = kIdentity;
+    ++other.run_epoch;
+    EXPECT_FALSE(result.recording_receipt.matches(other, &model));
+    EXPECT_FALSE(result.poisoned());
+}
+
+TEST(NativeRunExecutionTest, FailedCaptureDoesNotMintEitherReceiptOrPoisonExecution) {
+    int model;
+    auto result = exact_recording_transaction(
+        kIdentity, NativeRunExecutionTestPeer::mint(kIdentity), &model, [](LaunchProgressSink &sink) -> int {
+            sink.mark_submitted();
+            throw std::bad_alloc();
+        }
+    );
+    EXPECT_NE(result.rc, 0);
+    EXPECT_TRUE(result.recording_attempted);
+    EXPECT_EQ(result.progress, LaunchProgress::Partial);
+    EXPECT_FALSE(result.receipt.valid());
+    EXPECT_FALSE(result.recording_receipt.matches(kIdentity, &model));
+    EXPECT_FALSE(result.poisoned());
+}
+
+TEST(NativeRunExecutionTest, CaptureIdentityMismatchDoesNotRecord) {
+    int model, calls = 0;
+    auto other = kIdentity;
+    ++other.run_epoch;
+    auto result = exact_recording_transaction(
+        other, NativeRunExecutionTestPeer::mint(kIdentity), &model, [&](LaunchProgressSink &) {
+            ++calls;
+            return 0;
+        }
+    );
+    EXPECT_NE(result.rc, 0);
+    EXPECT_EQ(calls, 0);
+    EXPECT_FALSE(result.recording_receipt.matches(other, &model));
+}
+
 TEST(NativeRunExecutionTest, IdentityMismatchDoesNotSubmit) {
     NativeRunIdentity other = kIdentity;
     other.run_epoch++;

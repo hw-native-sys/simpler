@@ -314,6 +314,8 @@ def main() -> int:
         print("ERROR: no sim compile databases found under build/cache/*/sim/", file=sys.stderr)
         return 1
 
+    # Anchor to this checkout: dependency paths also contain src/ or include/.
+    header_filter = f"--header-filter=^{re.escape(str(_ROOT))}/(src|include)/"
     failed: set[str] = set()
     for f in changed:
         db_dirs = file_index.get(f)
@@ -322,7 +324,7 @@ def main() -> int:
 
         for db_dir in db_dirs:
             result = subprocess.run(
-                ["clang-tidy", f"-p={db_dir}", "--quiet"] + _SUPPRESS_ARGS + [f],
+                ["clang-tidy", f"-p={db_dir}", "--quiet", header_filter] + _SUPPRESS_ARGS + [f],
                 check=False,
                 capture_output=True,
                 text=True,

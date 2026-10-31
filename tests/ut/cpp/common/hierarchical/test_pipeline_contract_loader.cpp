@@ -146,9 +146,6 @@ TEST(KernelPipelineEntry, RealSimVariantsValidateWithoutClaimingOrCommitting) {
         auto create = symbol<decltype(&create_device_context)>(library.handle, "create_device_context");
         auto destroy = symbol<decltype(&destroy_device_context)>(library.handle, "destroy_device_context");
         auto init = symbol<decltype(&simpler_kernel_mode_init)>(library.handle, "simpler_kernel_mode_init");
-        auto supported =
-            symbol<decltype(&simpler_kernel_mode_supported)>(library.handle, "simpler_kernel_mode_supported");
-        auto launch = symbol<decltype(&simpler_kernel_mode_launch)>(library.handle, "simpler_kernel_mode_launch");
         auto committed = symbol<decltype(&committed_device_memory_ctx)>(library.handle, "committed_device_memory_ctx");
         DeviceContextHandle ctx = create();
         ASSERT_NE(ctx, nullptr);
@@ -170,11 +167,7 @@ TEST(KernelPipelineEntry, RealSimVariantsValidateWithoutClaimingOrCommitting) {
         const std::string diagnostic = testing::internal::GetCapturedStderr();
         EXPECT_EQ(init_result, PTO_RUNTIME_ERR_UNSUPPORTED);
         EXPECT_NE(diagnostic.find("kernel mode is not supported"), std::string::npos) << diagnostic;
-        EXPECT_EQ(supported(ctx), 0);
         EXPECT_EQ(committed(ctx), 0u);
-        // A structurally valid launch still cannot run after unsupported init.
-        int caller_stream_token = 0;
-        EXPECT_EQ(launch(ctx, 0, &config, &caller_stream_token), PTO_RUNTIME_ERR_INVALID_STATE);
         EXPECT_EQ(invoke(&config), PTO_RUNTIME_ERR_UNSUPPORTED);
         EXPECT_EQ(committed(ctx), 0u);
         destroy(ctx);

@@ -16,6 +16,7 @@
 
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
+#include "aicpu/cache_maintenance.h"
 #include "common/platform_config.h"
 #include "aicpu/platform_entry_args.h"
 #include "aicpu/aicpu_device_config.h"
@@ -32,6 +33,7 @@
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include "aicpu/args_dump_aicpu.h"
 #include "runtime.h"
+#include "aicpu/native_execution_aicpu.h"
 
 // Device timing capture: KernelArgs.device_wall_data_base addresses a fixed
 // header followed by per-thread phase records and an optional task-timing tail.
@@ -57,7 +59,7 @@ extern "C" int aicpu_execute(Runtime *arg);
  * @param arg Pointer to the front-less KernelArgs payload (runtime_args @ 0)
  * @return 0 on success, non-zero on error
  */
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
+static int execute_native_body(void *arg) {
     // Log severity was snapshot once by simpler_aicpu_init at worker init; the
     // resident SO keeps it across launches, so exec does not re-snapshot.
     if (arg == nullptr) {
@@ -135,17 +137,22 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // same pair here, which is why that storage is atomic. Both zero when the
     // host allocated no region, which every publisher treats as "nothing to
     // publish into".
-    set_platform_run_result(k_args->run_result_data_base, k_args->run_result_epoch);
+    const uint64_t execution_epoch = k_args->run_result_epoch;
+    // Result publication uses the frozen native identity. Captured publication
+    // clears reports before the fork, so the handshake itself is unstamped.
+    set_platform_run_result(k_args->run_result_data_base, execution_epoch);
     // This thread's own view of the launch package, published under its gate
     // survivor index so no other thread writes the slot and no other thread's
     // arguments are borrowed. Base and offset stay separate: the runtime forms
     // the payload address only after checking both against its descriptor.
+    const auto *execution = reinterpret_cast<const NativeExecutionControl *>(k_args->execution_control);
     set_platform_entry_args(
         platform_aicpu_affinity_thread_idx(),
         PlatformEntryArgs{
             arg, k_args->entry_args_offset, k_args->entry_tensor_count, k_args->entry_scalar_count,
             k_args->entry_args_source, k_args->graph_section_offset, k_args->graph_section_bytes,
-            k_args->graph_section_source
+            k_args->graph_section_source, k_args->execution_control != 0,
+            execution != nullptr && execution->decision == NativeExecutionDecision::Skip ? execution->first_error : 0
         }
     );
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);
@@ -159,6 +166,39 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
     // Run-wall end is stamped by run_wall's destructor (covers the early return
     // above too); host reduces max(end) - min(start) → ns.
     return rc;
+}
+
+// Runtime-specific scheduling work stays behind this preparation hook. The
+// default covers the AICPU-scheduled runtimes; resident AICore schedulers can
+// publish their existing stop state here before either executor starts.
+extern "C" __attribute__((weak)) int aicpu_prepare_execution(Runtime *, NativeExecutionDecision, int32_t) { return 0; }
+
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_prepare_execution(void *arg) {
+    if (arg == nullptr) return -1;
+    return native_execution_prepare_device<Runtime>(
+        *static_cast<const NativeExecutionPrepareArgs *>(arg),
+        [](Runtime *runtime, NativeExecutionDecision decision, int32_t error) {
+            return aicpu_prepare_execution(runtime, decision, error);
+        }
+    );
+}
+
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
+    if (arg == nullptr) return execute_native_body(arg);
+    const auto &args = *static_cast<const KernelArgs *>(arg);
+    auto *control = reinterpret_cast<NativeExecutionControl *>(args.execution_control);
+    // Direct entry consumers may omit the common preparation control.
+    if (control == nullptr) return execute_native_body(arg);
+    if (control->sequence == 0 || control->result_address != args.run_result_data_base ||
+        control->native_epoch != args.run_result_epoch) {
+        return native_execution_complete_device(*control, -1);
+    }
+    // Preparation flushed this control before the RTS fork. AICPU callbacks
+    // share coherent CPU memory: invalidating this mutable line here could
+    // discard a peer callback's concurrent atomic contribution.
+    const int status = execute_native_body(arg);
+    // The inner function's phase scopes and runtime cleanup have ended here.
+    return native_execution_complete_device(*control, status);
 }
 
 /**

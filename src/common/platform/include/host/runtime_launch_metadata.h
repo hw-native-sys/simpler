@@ -20,7 +20,48 @@
 // One invocation's metadata values. DMA sources belong to the slot; publication
 // copies into that pinned storage before any asynchronous reader is queued.
 class RuntimeLaunchMetadata {
+    struct Region {
+        void *target;
+        std::vector<std::byte> bytes;
+    };
+
 public:
+    // Owns the region records, but borrows the pinned source and device targets.
+    // Their owner must retain both allocations and immutable source contents
+    // through all queued readers (and through graph retirement when captured).
+    class Publication {
+    public:
+        Publication() = default;
+        Publication(const Publication &) = delete;
+        Publication &operator=(const Publication &) = delete;
+        Publication(Publication &&other) noexcept :
+            regions_(std::move(other.regions_)),
+            source_(std::exchange(other.source_, nullptr)),
+            ready_(std::exchange(other.ready_, false)) {}
+        Publication &operator=(Publication &&) = delete;
+
+        // Enqueue does not rewrite sources or consume the record. A failure may
+        // leave accepted readers; retirement belongs to the submission owner,
+        // and this operation provides no automatic retry or completion proof.
+        template <typename Copy>
+        int enqueue(Copy &&copy) const {
+            if (!ready_) return PTO_RUNTIME_ERR_INVALID_STATE;
+            size_t offset = 0;
+            for (const auto &region : regions_) {
+                const int rc = copy(region.target, source_ + offset, region.bytes.size());
+                if (rc != 0) return rc;
+                offset += region.bytes.size();
+            }
+            return 0;
+        }
+
+    private:
+        friend class RuntimeLaunchMetadata;
+        std::vector<Region> regions_;
+        const std::byte *source_{nullptr};
+        bool ready_{false};
+    };
+
     RuntimeLaunchMetadata() = default;
     RuntimeLaunchMetadata(const RuntimeLaunchMetadata &) = delete;
     RuntimeLaunchMetadata &operator=(const RuntimeLaunchMetadata &) = delete;
@@ -75,31 +116,33 @@ public:
         bytes_ = 0;
     }
 
-    template <typename Copy>
-    int publish(void *pinned, size_t capacity, Copy &&copy) {
-        if (bytes_ > capacity || (bytes_ != 0 && pinned == nullptr)) return PTO_RUNTIME_ERR_INVALID_STATE;
-        auto captured = std::move(regions_);
-        clear();
+    // All source bytes are materialized before any enqueue callback is allowed.
+    // Invalid capacity or an occupied output leaves the pending snapshot intact.
+    int materialize(void *pinned, size_t capacity, Publication &publication) {
+        if (publication.ready_ || bytes_ > capacity || (bytes_ != 0 && pinned == nullptr))
+            return PTO_RUNTIME_ERR_INVALID_STATE;
         auto *source = static_cast<std::byte *>(pinned);
         size_t offset = 0;
-        for (const auto &region : captured) {
+        for (const auto &region : regions_) {
             std::memcpy(source + offset, region.bytes.data(), region.bytes.size());
             offset += region.bytes.size();
         }
-        offset = 0;
-        for (const auto &region : captured) {
-            const int rc = copy(region.target, source + offset, region.bytes.size());
-            if (rc != 0) return rc;
-            offset += region.bytes.size();
-        }
+        publication.regions_ = std::move(regions_);
+        publication.source_ = source;
+        publication.ready_ = true;
+        clear();
         return 0;
     }
 
+    template <typename Copy>
+    int publish(void *pinned, size_t capacity, Copy &&copy) {
+        Publication publication;
+        const int rc = materialize(pinned, capacity, publication);
+        if (rc != 0) return rc;
+        return publication.enqueue(std::forward<Copy>(copy));
+    }
+
 private:
-    struct Region {
-        void *target;
-        std::vector<std::byte> bytes;
-    };
     std::vector<Region> regions_;
     size_t bytes_{0};
 };

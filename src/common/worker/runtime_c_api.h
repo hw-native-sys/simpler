@@ -32,9 +32,7 @@
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
  *                   get_run_stream_set_create_count
- *   - kernel mode:  simpler_kernel_mode_supported, simpler_kernel_mode_init,
- *                   simpler_kernel_mode_prepare_callable,
- *                   simpler_kernel_mode_launch
+ *   - borrowed initialization: simpler_kernel_mode_init
  *   - pipeline:     get_pipeline_contract,
  *                   supports_concurrent_native_prepare_ctx,
  *                   supports_joined_native_launch_ctx,
@@ -50,6 +48,7 @@
  * entries simply lacks the capability, and ChipWorker raises an explicit error
  * when a caller requests it:
  *   - registration: simpler_register_callable_v2
+ *   - capture lifetime: simpler_reserve_capture_resources, simpler_retire_capture_resources
  *
  * Native-run storage: caller allocates at least get_runtime_size() bytes with
  * get_runtime_alignment() alignment, zero-initializes it before first use, and
@@ -148,6 +147,18 @@ enum {
 enum {
     SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL = PTO_RUNTIME_ERR_BASE - 5,
 };
+
+/**
+ * A recorded native run: its commands were recorded into an active caller
+ * capture and no kernel executed. This host-reserved result is distinct from
+ * eager success (zero) and from positive RTS error codes, and it reports host
+ * finalization rather than execution completion. It never publishes the
+ * execution acceptance sink and owes no device wait. Returned by simpler_run,
+ * by a launch that recorded, and by poll while the run is in the recorded
+ * phase. The producer must retain every recorded resource and known caller
+ * allocation for the graph; host finalization drops run refs.
+ */
+enum { SIMPLER_NATIVE_RUN_RECORDED = PTO_RUNTIME_ERR_BASE - 8 };
 
 /** Return values from simpler_poll_run(). */
 enum {
@@ -292,6 +303,12 @@ typedef struct NativeRunArtifactIdentity {
  * identity used by later phase calls; lease generation, run id, and dispatch
  * id remain diagnostic after admission. A non-null acceptance sink is written
  * only at the real kernel-launch marker.
+ *
+ * ABI: this POD is not self-describing. The caller, this header and the loaded
+ * runtime must come from the same build. A descriptor built against a different
+ * layout is not supported: prepare copies sizeof(NativeRunDescriptor) bytes and
+ * would read past a shorter caller struct. Adding a field (as `caller_stream`
+ * did) therefore requires rebuilding every consumer.
  */
 typedef struct NativeRunDescriptor {
     uint32_t pipeline_slot;
@@ -316,6 +333,8 @@ typedef struct NativeRunDescriptor {
     uint32_t joinable_boundary;
     /** Where this dispatch came from, for diagnostic attribution only. */
     NativeRunProvenance provenance;
+    /** Borrowed through finalization; null permits late binding at launch. */
+    void *caller_stream;
 } NativeRunDescriptor;
 
 /**
@@ -996,8 +1015,10 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
 
 /**
  * Register on an initialized PROGRAM or KERNEL context with an unused ID.
- * KERNEL contexts use the kernel preparation path internally. The entry does
- * not initialize the context; an uninitialized, failed-init or finalized
+ * Registration records the callable; a KERNEL runtime whose invocation carries
+ * persistent arguments also stages them here, before the context becomes
+ * launch-ready. This
+ * entry does not initialize the context; an uninitialized, failed-init or finalized
  * context returns INVALID_STATE. `callable` points to a canonical ChipCallable
  * image of exactly `callable_size` bytes, fully validated before it is hashed
  * or uploaded.
@@ -1011,7 +1032,8 @@ int simpler_register_callable(DeviceContextHandle ctx, int32_t callable_id, cons
  * concurrent auto-ID and explicit-ID registration cannot claim the same slot.
  * Registration is refused with PTO_RUNTIME_ERR_INTERNAL while a native run is
  * prepared or executing on the context. finalize_device takes the same lock;
- * runs, initialization and destroy do not, and callers still order those.
+ * kernel-mode native preparation holds it only until its reservation is acquired,
+ * before invoking orchestration. Callers still order runs, initialization and destroy.
  *
  * Explicit-ID registration rejects an already registered ID with
  * INVALID_ARGUMENT; auto-ID never returns an occupied slot. IDs may be reused
@@ -1060,6 +1082,10 @@ int simpler_register_callable_v2(
  * kernel-launch marker; the sink is not retained after this blocking call.
  *
  * @return 0 on success, negative on error (no prep state, NULL ctx/config, etc.).
+ * A run launched while `descriptor->caller_stream` is capturing records commands
+ * and returns SIMPLER_NATIVE_RUN_RECORDED (-1008) after finalizing host
+ * ownership; that is not execution completion. Capture callers use the phased
+ * entries instead of this one-call form.
  */
 int simpler_run(
     DeviceContextHandle ctx, RuntimeHandle runtime, int32_t callable_id, const void *args, const CallConfig *config,
@@ -1081,9 +1107,12 @@ int simpler_run(
  * finalize path. The caller must keep its borrowed device current. Arguments
  * must be DEVICE/NONE or HOST/NONE; host tensor consumption is supported only
  * by a host-orchestrating runtime. No implicit tensor transfer is performed.
- * This preparation can allocate and synchronously publish metadata and must
- * run outside capture. Borrowed execution requires simpler_launch_run_on_stream;
- * the legacy simpler_kernel_mode_launch entry remains unsupported.
+ * Ordinary preparation can allocate and synchronously publish metadata. Warm
+ * A2/A3 HBG capture requires simpler_reserve_capture_resources outside capture
+ * first; captured preparation refuses cold allocation and stages async publication.
+ * A non-null descriptor caller_stream is checked before bind and retained as the
+ * ordering stream. Borrowed execution requires a stream supplied there or through
+ * simpler_launch_run_on_stream. Recorded runs finalize host ownership only.
  *
  * A clean failed preparation writes a host-only release marker and this
  * descriptor's run_epoch into its destroyed carrier storage. This marker is
@@ -1119,12 +1148,44 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx);
  */
 int simpler_launch_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
+/*
+ * Capture terms, as this header uses them:
+ *   capture  the caller's stream mode; CaptureBegin/End belong to the platform,
+ *            not to these entries;
+ *   record   what a prepared run does inside capture: it records commands,
+ *            executes no kernel, and reports SIMPLER_NATIVE_RUN_RECORDED;
+ *   replay   the caller's later execution of the recorded graph; completion is
+ *            observable only on the caller's stream;
+ *   reserve  capture capacity taken outside capture, before it starts;
+ *   retire   release of the native resources recorded graphs retain, after the
+ *            caller destroys every captured model.
+ */
+
 /**
- * Check the execution environment and reject capture before per-call preparation.
+ * Check the execution environment and the caller stream's supported modes.
  * No run is admitted or published. A successful check does not reserve the stream;
- * the caller serializes capture changes and keeps it live through finalization.
+ * the caller serializes stream-mode changes and keeps it live through finalization.
+ * Eager borrowed use validates the same stream here; capture additionally requires
+ * the resource reservation below.
  */
 int simpler_validate_caller_stream(DeviceContextHandle ctx, void *caller_stream);
+
+/** Reserve capture publication capacity and events outside capture, after a
+ * finalized warm invocation on this slot/bank. No computation is submitted.
+ * A later eager preparation invalidates the reservation. Larger capture
+ * demands are refused without cold allocation; warm and reserve again.
+ * A recorded run must take the reserved slot and bank; a run on another slot
+ * has no reservation and is refused. */
+int simpler_reserve_capture_resources(DeviceContextHandle ctx, void *caller_stream, uint32_t slot, uint32_t bank);
+
+/**
+ * Retire the native resources recorded graphs retain, after all model-destroy
+ * notifications. Refuses outstanding runs while any retained model is still live:
+ * retirement is context-wide, so every captured model must be destroyed before
+ * this call. Drains retained caller streams and retries failed resource releases.
+ * The caller must stop new replay before destroying models.
+ */
+int simpler_retire_capture_resources(DeviceContextHandle ctx);
 
 /**
  * Validate the current borrowed RTS context before changing host run state.
@@ -1136,12 +1197,15 @@ int simpler_validate_execution_context(DeviceContextHandle ctx);
 /**
  * Submit a prepared native run between the caller stream's preceding and
  * following work. The caller retains its stream and external tensor storage
- * through run finalization. Prepare is a host operation performed outside
- * capture; this eager launch rejects an active/invalidated capture before
- * publication. `predecessor`, when non-null, has the joined-launch contract.
+ * through run finalization (or capture retirement for recorded work). Warm A2/A3
+ * HBG prepared within capture records a native launch; other active/invalidated
+ * capture combinations are refused. `predecessor`, when non-null, has the joined
+ * launch contract and is not supported by recording.
  *
  * Both owned and borrowed contexts use the same native run. A borrowed context
- * requires this explicit stream entry. Poll/wait/finalize retain the run and
+ * requires a stream bound at prepare or through this entry. A stream supplied
+ * at prepare cannot be replaced by a different stream here.
+ * Poll/wait/finalize retain the run and
  * its event references through the caller's exit wait. A partial enqueue
  * failure poisons the execution domain; it is not a rollback permission.
  */
@@ -1354,8 +1418,8 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * No borrowed path resets or synchronizes the whole device. Cold-path bring-up
  * and registration synchronize a context-owned stream; partial enqueue cleanup
  * may synchronize the bound caller and private streams to prove references are
- * consumed. Capture/replay and the legacy simpler_kernel_mode_launch entry
- * remain unsupported.
+ * consumed. Warm A2/A3 HBG capture uses the shared native-run family;
+ * capture requires prior resource reservation outside recording.
  *
  * Identity is a write-once property of the context, not a state that evolves:
  * ExecutionModeLatch on the platform runner holds it, the first init entry to
@@ -1374,23 +1438,11 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * while its capacity suffices and transactionally replace it when more is
  * needed. Native-run admission protects a shared bank; HBG per-run banks may
  * prepare independently. Failed staging preserves the committed regions.
- * Capture/replay remains unsupported; graph retention of arena addresses is
- * not provided by this eager resource lifecycle.
- *
- * Every host_runtime.so exports all four entries below, so a consumer resolves
- * them unconditionally like the rest of the uniform ABI; supported answers the
- * capability question at call time rather than gating symbol resolution.
- * Variants without kernel-mode support
- * export stubs that run the same structural validation and then refuse —
- * supported returns 0, init reports PTO_RUNTIME_ERR_UNSUPPORTED, and
- * prepare_callable and launch report PTO_RUNTIME_ERR_INVALID_STATE because
- * no kernel context is live. The fifth lifecycle entry is the existing
- * finalize_device(): in kernel mode it releases only context-owned resources
- * and never resets the device or finalizes ACL. device_id_ records which
- * device a context is on rather than a claim on it, so a kernel context
- * reaches that teardown path; the platform finalize() skips the per-thread
- * device bind on a kernel latch, because the caller already holds its own
- * device current.
+ * Warm A2/A3 HBG capture retains its native resources beyond run finalize.
+ * Other capture backends remain unsupported. Every runtime exports borrowed
+ * initialization; simulated builds validate arguments and refuse initialization.
+ * finalize_device releases context-owned resources without resetting the borrowed
+ * device or finalizing ACL. Registration and execution use the common API.
  *
  * Structural argument errors return PTO_RUNTIME_ERR_INVALID_ARGUMENT before
  * capability or lifecycle checks. These entries accept only POD structs,
@@ -1398,28 +1450,6 @@ int get_teardown_report(DeviceContextHandle ctx, void *out, size_t out_bytes);
  * The caller stream is explicit and borrowed: a native execution retains its
  * handle through finalization, and simpler never destroys it.
  * =========================================================================== */
-
-/**
- * Return nonzero when this runtime can execute kernel-mode launches.
- *
- * Launches, not resources: it stays zero while simpler_kernel_mode_launch is a
- * rejecting stub, including on a runtime whose simpler_kernel_mode_init already
- * establishes a kernel context. Both onboard runtimes support initialization
- * and the shared native eager path via simpler_launch_run_on_stream. This
- * legacy capability bit does not advertise that native entry. Simulated
- * components refuse kernel init
- * with PTO_RUNTIME_ERR_UNSUPPORTED and establish nothing.
- *
- * This is the capability question a caller asks before choosing between the
- * legacy kernel-mode entries and the shared native-run family. It is callable
- * on a context that create_device_context() has returned but that no init has
- * touched; at that point the context exists but names no device —
- * create_device_context() takes no device and device_id_ is still unset — so an
- * implementation must answer from the runtime build alone, never from init
- * state or device identity. `ctx` is accepted for signature symmetry with the
- * rest of the family and must not be dereferenced for a device.
- */
-int simpler_kernel_mode_supported(DeviceContextHandle ctx);
 
 /**
  * Initialize a kernel-mode context on the caller's already-current device.
@@ -1432,9 +1462,10 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * only context-owned persistent handles used by asynchronous preparation and
  * launch. Cold-path bring-up may synchronize a context-owned stream — the AICPU
  * init handshake does — but never a caller stream and never the device; the
- * launch path synchronizes nothing at all. `config` is read here for the
- * runtime's admission check only. Each simpler_prepare_run() copies its own
- * config and resolves that invocation's shape, binding and diagnostics.
+ * prepared capture launch path synchronizes nothing at all. Native preparation
+ * resolves each invocation's shape, resource requirements and diagnostics.
+ * Cold resources for capture are reserved after native eager warmup, outside
+ * capture; insufficient capacity during capture is refused without growth.
  * `context_generation` is a nonzero host-process-unique identity minted by the
  * caller for sequential contexts; generation zero is invalid.
  * The native RTS context current at init is borrowed as well as the device.
@@ -1449,61 +1480,15 @@ int simpler_kernel_mode_supported(DeviceContextHandle ctx);
  * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Invalid generated resource contracts or
  * C++ exceptions during admission return PTO_RUNTIME_ERR_INTERNAL.
  * Simulated variants return PTO_RUNTIME_ERR_UNSUPPORTED and establish nothing.
- * Both onboard runtimes admit initialization; HBG determines per-run image
- * sizes at bind time rather than claiming a config-only size here.
- *
- * Success establishes this context's cold-path resources and latches kernel
- * mode. It does not mean kernel-mode launches are available:
- * simpler_kernel_mode_supported() answers that question and stays zero while
- * simpler_kernel_mode_launch is a rejecting stub. Nor does it retain the
- * validated contract or resolve per-preparation configuration — the contract
- * is validated and discarded, and `context_generation` is checked for being
- * nonzero and not yet given a retained lifecycle.
+ * Both onboard runtimes admit initialization. Shared native execution owns
+ * resource preparation and submission; initialization creates no dedicated HBG
+ * execution slot. The context and callable occupancy generations remain distinct.
  */
 int simpler_kernel_mode_init(
     DeviceContextHandle ctx, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size,
     const uint8_t *aicore_binary, size_t aicore_size, const uint8_t *dispatcher_binary, size_t dispatcher_size,
     const CallConfig *config, uint64_t context_generation
 );
-
-/**
- * Stage one callable for kernel-mode launches, outside ACLGraph capture.
- *
- * `callable` points to a canonical ChipCallable image of exactly
- * `callable_size` bytes. Validating every flexible-array offset before the
- * image is hashed or uploaded is the implementation's obligation; the shared
- * entry validation checks only the image's alignment, its size floor, and the
- * callable id range. Preparation may allocate persistent state and enqueue
- * asynchronous device work on context-owned streams. Registration synchronizes
- * its internal AICPU control stream before committing the callable, but never
- * synchronizes a caller stream or the device. Preparation neither accepts nor
- * retains a caller stream; the current caller/capture stream is supplied
- * independently to each launch.
- *
- * A callable_id that is already registered is rejected with
- * PTO_RUNTIME_ERR_INVALID_ARGUMENT. Registration is refused with
- * PTO_RUNTIME_ERR_INTERNAL while a native run is prepared or executing on the
- * context; retire the run before reusing the registry.
- */
-int simpler_kernel_mode_prepare_callable(
-    DeviceContextHandle ctx, int32_t callable_id, const void *callable, size_t callable_size
-);
-
-/**
- * Reserved legacy single-call entry; currently a rejecting stub.
- * Native eager callers use simpler_prepare_run and simpler_launch_run_on_stream.
- *
- * The intended single-call contract is:
- *
- * `args` points to a ChipStorageTaskArgs POD whose tensor addresses are
- * caller-owned device addresses; they are passed through without ever being
- * dereferenced on the host. A launch performs no device malloc/free, no
- * tensor staging, no synchronize, no capture-state query, and no
- * stream-to-model attachment — keeping those out of the launch path is the
- * implementation's obligation. A return of 0 means the sequence was enqueued;
- * device execution may still be in flight and may still fail asynchronously.
- */
-int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, const void *args, void *caller_stream);
 
 #ifdef __cplusplus
 }

@@ -10,6 +10,7 @@
  */
 // CPU-only transport. Production runner, allocator, ledger, maker and C API own the policy.
 #include "transport.h"
+#include "arg_direction.h"
 #include "runtime/rt.h"
 #include "acl/acl.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
@@ -19,8 +20,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <new>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 namespace native_admission_transport {
 Control &control() {
@@ -51,8 +54,8 @@ int rtMalloc(void **out, uint64_t bytes, uint32_t, uint16_t) {
     ++c.allocations;
     *out = nullptr;
     if (c.allocations == c.fail_allocation || c.bytes > c.ceiling || bytes > c.ceiling - c.bytes) return -12;
-    *out = std::calloc(1, bytes);
-    if (!*out) return -12;
+    if (posix_memalign(out, CALLABLE_ALIGN, bytes) != 0 || !*out) return -12;
+    std::memset(*out, 0, bytes);
     ++c.successful_allocations;
     allocations[*out] = bytes;
     c.bytes += bytes;
@@ -63,6 +66,8 @@ int rtFree(void *ptr) {
         ++native_admission_transport::control().calls_after_retire;
         return -4244;
     }
+    auto &c = native_admission_transport::control();
+    if (c.initialize && std::exchange(c.fail_free_once, false)) return -4327;
     auto it = allocations.find(ptr);
     if (it == allocations.end()) return ptr == nullptr ? 0 : -1;
     native_admission_transport::control().bytes -= it->second;
@@ -113,6 +118,8 @@ int rtStreamDestroy(rtStream_t p) {
 int rtStreamQuery(rtStream_t) { return 0; }
 int rtStreamSynchronize(rtStream_t) { return 0; }
 int rtRegisterAllKernel(const rtDevBinary_t *, void **out) {
+    auto &c = native_admission_transport::control();
+    if (c.initialize && std::exchange(c.throw_kernel_registration, false)) throw std::bad_alloc();
     *out = std::malloc(1);
     return *out ? 0 : -12;
 }
@@ -121,7 +128,10 @@ int rtUnregisterAllKernel(void *p) {
     return 0;
 }
 int rtKernelLaunchWithHandleV2(void *, uint64_t, uint32_t, rtArgsEx_t *, void *, rtStream_t, rtTaskCfgInfo_t *) {
-    return -1;
+    auto &c = native_admission_transport::control();
+    if (!c.initialize) return -1;
+    ++c.aicore_launch_calls;
+    return 0;
 }
 const char *aclGetRecentErrMsg() { return "native admission CPU transport"; }
 int aclFinalize() { return 0; }
@@ -130,10 +140,13 @@ int aclrtGetMemInfo(int, size_t *free, size_t *total) {
     return 0;
 }
 int aclrtCreateEventExWithFlag(aclrtEvent *out, uint32_t) {
+    ++native_admission_transport::control().event_creates;
     *out = std::malloc(1);
     return *out ? 0 : -12;
 }
 int aclrtDestroyEvent(aclrtEvent p) {
+    if (std::exchange(native_admission_transport::control().fail_event_destroy_once, false)) return -4332;
+    ++native_admission_transport::control().event_destroys;
     std::free(p);
     return 0;
 }
@@ -150,7 +163,12 @@ int aclrtEventGetTimestamp(aclrtEvent, uint64_t *out) {
 }
 int aclrtStreamWaitEvent(aclrtStream, aclrtEvent) { return 0; }
 int aclrtSynchronizeStream(aclrtStream) { return 0; }
-int aclrtSynchronizeStreamWithTimeout(aclrtStream, int32_t) { return 0; }
+int aclrtSynchronizeStreamWithTimeout(aclrtStream, int32_t) {
+    auto &c = native_admission_transport::control();
+    if (c.sync_hook) c.sync_hook();
+    if (c.initialize && ++c.sync_calls == c.fail_sync_call) return -4328;
+    return 0;
+}
 int aclrtGetStreamResLimit(aclrtStream, int, uint32_t *out) {
     *out = 1;
     return 0;
@@ -173,8 +191,17 @@ int aclrtStreamGetId(aclrtStream, int32_t *out) {
     return 0;
 }
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *model) {
-    *status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
-    *model = nullptr;
+    const auto &c = native_admission_transport::control();
+    *status = static_cast<aclmdlRICaptureStatus>(c.capture_status);
+    *model = c.capture_model;
+    return c.capture_query_rc;
+}
+int aclmdlRIDestroyRegisterCallback(aclmdlRI, aclrtCallback callback, void *data) {
+    auto &c = native_admission_transport::control();
+    ++c.capture_callback_calls;
+    if (c.capture_callback_rc != 0) return c.capture_callback_rc;
+    c.capture_destroy_callback = callback;
+    c.capture_destroy_data = data;
     return 0;
 }
 int dlog_setlevel(int, int, int) { return 0; }
@@ -187,12 +214,53 @@ int LoadAicpuOp::Finalize(rtStream_t) {
     return c.loader_finalize_error;
 }
 void LoadAicpuOp::ForgetWithoutUnload() {}
-int LoadAicpuOp::BootstrapDispatcher(const void *, size_t, const void *, size_t, rtStream_t, int) { return -1; }
-int LoadAicpuOp::Init(const std::vector<std::string> &) { return -1; }
-int LoadAicpuOp::LaunchBuiltInOp(rtStream_t, void *, size_t, int, const std::string &) { return -1; }
+int LoadAicpuOp::BootstrapDispatcher(const void *, size_t, const void *, size_t, rtStream_t, int) {
+    auto &c = native_admission_transport::control();
+    if (!c.initialize) return -1;
+    ++c.bootstrap_calls;
+    return 0;
+}
+int LoadAicpuOp::Init(const std::vector<std::string> &) {
+    auto &c = native_admission_transport::control();
+    if (!c.initialize) return -1;
+    ++c.loader_init_calls;
+    return 0;
+}
+int LoadAicpuOp::LaunchBuiltInOp(rtStream_t, void *, size_t, int, const std::string &name) {
+    auto &c = native_admission_transport::control();
+    if (!c.initialize) return -1;
+    c.launched_symbols.push_back(name);
+    return 0;
+}
 }  // namespace host
 
-KernelContextOps make_onboard_kernel_context_ops() { return {}; }
+KernelContextOps make_onboard_kernel_context_ops() {
+    if (!native_admission_transport::control().initialize) return {};
+    return {
+        nullptr,
+        [](void *, int *device) noexcept {
+            *device = 0;
+            return 0;
+        },
+        [](void *, void **context) noexcept {
+            static int borrowed_context;
+            *context = &borrowed_context;
+            return 0;
+        },
+        [](void *, void **stream) noexcept {
+            return rtStreamCreate(stream, 0);
+        },
+        [](void *, void *stream) noexcept {
+            return rtStreamDestroy(stream);
+        },
+        [](void *, void **event) noexcept {
+            return aclrtCreateEventExWithFlag(event, 0);
+        },
+        [](void *, void *event) noexcept {
+            return aclrtDestroyEvent(event);
+        }
+    };
+}
 
 // The late-read hardware probe needs real stream-pair ownership. This transport
 // cannot retire that ownership; native admission/close uses the real base runner.

@@ -31,6 +31,7 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -105,11 +106,61 @@ bool launch_entry_args_permitted(rtStream_t aicpu_stream);
  */
 bool launch_route_permitted_by_capture(int query_rc, int capture_status);
 
+// Pinned source ownership is separate from the slot and can be moved without
+// changing the DMA address. Retained sources survive slot reuse; physical free
+// requires proof that their readers stopped. Destruction is not that proof: teardown calls release,
+// while terminal abandonment deliberately leaves the allocation untouched.
+class PinnedUploadStorage {
+public:
+    PinnedUploadStorage() = default;
+    PinnedUploadStorage(const PinnedUploadStorage &) = delete;
+    PinnedUploadStorage &operator=(const PinnedUploadStorage &) = delete;
+    PinnedUploadStorage(PinnedUploadStorage &&other) noexcept :
+        data_(std::exchange(other.data_, nullptr)),
+        capacity_(std::exchange(other.capacity_, 0)),
+        cleanup_debt_(std::exchange(other.cleanup_debt_, nullptr)),
+        captured_(std::move(other.captured_)),
+        retained_source_(other.retained_source_) {}
+    PinnedUploadStorage &operator=(PinnedUploadStorage &&) = delete;
+
+    void *data() const { return captured_ ? captured_->data() : data_; }
+    uint64_t capacity() const { return captured_ ? captured_->capacity() : capacity_; }
+    // Retain before enqueue. The current publication may fill this source once;
+    // a subsequent reserve detaches from externally retained contents. The graph
+    // must call release after drain before dropping its last retained reference.
+    std::shared_ptr<PinnedUploadStorage> retain();
+    int reserve(uint64_t bytes, bool allow_growth = true);
+    int release();
+
+private:
+    void *data_{nullptr};
+    uint64_t capacity_{0};
+    // At most one rejected replacement; a failed rollback must remain owned.
+    void *cleanup_debt_{nullptr};
+    std::shared_ptr<PinnedUploadStorage> captured_;
+    bool retained_source_{false};
+};
+
+// The slot and captured graphs share the actual descriptor allocation. Only
+// explicit retirement can free a generation detached from its original slot.
+struct RetainedRuntimeArgs {
+    MemoryAllocator *allocator{nullptr};
+    Runtime *address{nullptr};
+    bool slot_owned{true};
+    int release() {
+        if (slot_owned || address == nullptr) return 0;
+        const int rc = allocator->free(address);
+        if (rc == 0) address = nullptr;
+        return rc;
+    }
+};
+
 /**
  * The device block one pipeline slot reuses across every run it prepares.
  *
  * Its size is fixed for the runner's lifetime — the runtime variant's device
- * extent — so a run rewrites its contents rather than reallocating it. That
+ * extent — and ordinary runs reuse its contents. A captured generation is
+ * retained while its slot allocates a new descriptor through MemoryAllocator. That
  * extent is never shorter than what a run uploads, and on a variant whose
  * descriptor ends in device-initialized storage it is longer: that range lives
  * inside the block but outside every copy into it. A slot admits at most one run
@@ -120,19 +171,37 @@ bool launch_route_permitted_by_capture(int query_rc, int capture_status);
  * its predecessor executes. The asynchronous copy is ordered on the bound
  * AICPU stream and a fork event orders the AICore reader behind it.
  *
- * The runner owns this for its whole lifetime and releases it in `finalize()`,
- * alongside the collector resources that already work this way.
+ * The runner owns the current slot generation through finalize. A graph can
+ * retain a detached generation until explicit graph retirement after drain.
  *
  * The AICore register tables are deliberately NOT here: they are device
  * constants, identical for every slot, and are owned per device context by
  * `DeviceRunnerBase::aicore_{ctrl,pmu}_reg_table_dev_`. Nor is a device copy of
  * `KernelArgs`: AICore receives everything it needs as launch arguments.
  */
+
+extern "C" size_t native_capture_result_bytes_impl();
+// Nonzero when this runtime build supports the native capture path. A separate
+// capability from the control-tail size: the size says the tail exists, this
+// says recording/replay is implemented.
+extern "C" int runtime_native_capture_supported_impl();
+
 struct SlotPersistentArgs {
+    bool capture_preparing{false};
+    std::shared_ptr<RetainedRuntimeArgs> retained_runtime_args;
+    std::shared_ptr<RetainedRuntimeArgs> retain_runtime_args(MemoryAllocator &allocator) {
+        if (runtime_args == nullptr) return {};
+        if (!retained_runtime_args)
+            retained_runtime_args =
+                std::make_shared<RetainedRuntimeArgs>(RetainedRuntimeArgs{&allocator, runtime_args});
+        return retained_runtime_args;
+    }
     // Pinned copy source, immutable from enqueue through the run's drain. A
-    // slot cannot be prepared again until its previous run has retired.
-    void *runtime_upload_source{nullptr};
-    uint64_t runtime_upload_bytes{0};
+    // slot cannot be prepared again until its previous run has retired. Capture
+    // references preserve an older source across subsequent preparations.
+    PinnedUploadStorage runtime_upload;
+    uint64_t eager_upload_bytes{0};
+    bool capture_resources_reserved{false};
 
     // Bind hands owned metadata values to prepare; launch consumes them once.
     RuntimeLaunchMetadata staged_launch_metadata;
@@ -277,13 +346,11 @@ struct KernelArgsHelper {
      * decision and this run's counts are patched into it; nothing is re-read
      * from the caller's `Runtime`, which by now may hold a successor's values.
      *
-     * The pinned source and destination stay slot-owned until drain or
-     * quarantine. The sink records a copy attempt before the RTS call; an
-     * error does not certify that no stream submission happened.
-     * Callers must check the return
-     * code and abort the run on error — the state stays unpublished, so no
-     * kernel may be submitted. A repeated publish is rejected without another
-     * copy.
+     * The pinned source and destination stay owned through drain or
+     * quarantine, with graph references extending ownership across slot reuse. The sink records a copy attempt before
+     * the RTS call; an error does not certify that no stream submission happened. Callers must check the return code
+     * and abort the run on error — the state stays unpublished, so no kernel may be submitted. A repeated publish is
+     * rejected without another copy.
      */
     int publish_runtime_args(bool launch_route_permitted, rtStream_t stream, LaunchProgressSink &sink);
 

@@ -11,7 +11,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <vector>
 
 #include "host/execution_mode_latch.h"
 #include "host/kernel_execution_state.h"
@@ -37,6 +39,8 @@ struct FakeContextOps {
     int events_created{0};
     int events_destroyed{0};
     uintptr_t next_handle{1};
+    void *destroy_failure_handle{nullptr};
+    std::vector<void *> destroyed_handles;
     static FakeContextOps *self(void *context) { return static_cast<FakeContextOps *>(context); }
 
     static int get_current_device(void *context, int *device_id) noexcept {
@@ -58,13 +62,18 @@ struct FakeContextOps {
         *stream = reinterpret_cast<void *>(ops->next_handle++);
         return 0;
     }
-    static int destroy_hidden_stream(void *context, void *) noexcept {
+    static int destroy_hidden_stream(void *context, void *handle) noexcept {
         auto *ops = self(context);
+        if (handle == ops->destroy_failure_handle) {
+            ops->destroy_failure_handle = nullptr;
+            return -43;
+        }
         if (ops->destroy_failures_remaining > 0) {
             ops->destroy_failures_remaining--;
             return -43;
         }
         ops->streams_destroyed++;
+        ops->destroyed_handles.push_back(handle);
         return 0;
     }
     static int create_event(void *context, void **event) noexcept {
@@ -74,13 +83,18 @@ struct FakeContextOps {
         *event = reinterpret_cast<void *>(ops->next_handle++);
         return 0;
     }
-    static int destroy_event(void *context, void *) noexcept {
+    static int destroy_event(void *context, void *handle) noexcept {
         auto *ops = self(context);
+        if (handle == ops->destroy_failure_handle) {
+            ops->destroy_failure_handle = nullptr;
+            return -43;
+        }
         if (ops->destroy_failures_remaining > 0) {
             ops->destroy_failures_remaining--;
             return -43;
         }
         ops->events_destroyed++;
+        ops->destroyed_handles.push_back(handle);
         return 0;
     }
 
@@ -218,6 +232,45 @@ TEST_P(KernelContextCreationFailure, EveryCreationPointRollsBackAndCanRetry) {
 
 INSTANTIATE_TEST_SUITE_P(
     AllStreamsAndEvents, KernelContextCreationFailure, ::testing::Range(0, static_cast<int>(kStreamCount + kEventCount))
+);
+
+class KernelContextCloseFailure : public ::testing::TestWithParam<int> {};
+
+TEST_P(KernelContextCloseFailure, OnlyTheFailedHandleSurvivesAndIsDestroyedOnceOnRetry) {
+    FakeContextOps fake;
+    KernelExecutionState state;
+    ASSERT_EQ(state.initialize(3, fake.table()), 0);
+    std::vector<void *> handles;
+    for (size_t i = 0; i < kStreamCount; ++i)
+        handles.push_back(state.hidden_stream(static_cast<KernelStreamKind>(i)));
+    for (size_t i = 0; i < kEventCount; ++i)
+        handles.push_back(state.event(static_cast<KernelEventKind>(i)));
+    void *failed = handles.at(GetParam());
+    fake.destroy_failure_handle = failed;
+    EXPECT_EQ(state.close(), -43);
+    EXPECT_EQ(state.phase(), KernelContextPhase::Closing);
+    EXPECT_FALSE(state.accepts_dispatch());
+    ASSERT_EQ(fake.destroyed_handles.size(), handles.size() - 1);
+    for (size_t i = 0; i < handles.size(); ++i) {
+        void *remaining = i < kStreamCount ? state.hidden_stream(static_cast<KernelStreamKind>(i)) :
+                                             state.event(static_cast<KernelEventKind>(i - kStreamCount));
+        EXPECT_EQ(remaining, handles[i] == failed ? failed : nullptr);
+    }
+    fake.current_context = reinterpret_cast<void *>(0x2000);
+    EXPECT_EQ(state.close(), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(fake.destroyed_handles.size(), handles.size() - 1);
+    fake.current_context = reinterpret_cast<void *>(0x1000);
+    EXPECT_EQ(state.close(), 0);
+    EXPECT_FALSE(state.has_live_resources());
+    EXPECT_EQ(state.close(), 0);
+    ASSERT_EQ(fake.destroyed_handles.size(), handles.size());
+    for (void *handle : handles) {
+        EXPECT_EQ(std::count(fake.destroyed_handles.begin(), fake.destroyed_handles.end(), handle), 1);
+    }
+}
+
+INSTANTIATE_TEST_SUITE_P(
+    AllStreamsAndEvents, KernelContextCloseFailure, ::testing::Range(0, static_cast<int>(kStreamCount + kEventCount))
 );
 
 TEST(KernelExecutionState, DestructionWithoutCloseMakesNoRuntimeCalls) {
@@ -525,6 +578,15 @@ TEST(KernelExecutionState, TeardownErrorSlotIsSeparateFromRuntimeError) {
     EXPECT_EQ(state.close(), 0);
     // The first teardown failure stays latched after a successful retry.
     EXPECT_EQ(state.unexpected_teardown_error(), -43);
+}
+
+TEST(KernelExecutionState, ZeroGenerationIsRejectedBeforeCreatingHandles) {
+    FakeContextOps handles;
+    KernelExecutionState state;
+    EXPECT_EQ(state.initialize(3, handles.table(), 0), PTO_RUNTIME_ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(state.phase(), KernelContextPhase::New);
+    EXPECT_EQ(handles.streams_created, 0);
+    EXPECT_EQ(handles.events_created, 0);
 }
 
 }  // namespace

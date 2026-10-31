@@ -162,16 +162,22 @@ public:
      * references are not droppable, so an armed-over fence that still holds
      * one is refused and its slot stops admitting runs.
      */
-    int arm(const NativeRunIdentity &identity) {
+    int reserve_events() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (references_outstanding()) return PTO_RUNTIME_ERR_INVALID_STATE;
+        return reserve_events_locked();
+    }
+    bool events_ready() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return events_ready_locked();
+    }
+
+    int arm(const NativeRunIdentity &identity, bool allow_creation = true) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (references_outstanding()) return PTO_RUNTIME_ERR_INTERNAL;
-        for (Boundary &boundary : boundaries_) {
-            if (boundary.event != nullptr) continue;
-            void *event = nullptr;
-            int rc = ops_.create(&event);
-            if (rc != 0) return rc;
-            boundary.event = event;
-        }
+        if (!allow_creation && !events_ready_locked()) return PTO_RUNTIME_ERR_UNSUPPORTED;
+        const int event_rc = reserve_events_locked();
+        if (event_rc != 0) return event_rc;
         for (Boundary &boundary : boundaries_) {
             boundary.reset_run_facts();
         }
@@ -547,6 +553,22 @@ public:
     }
 
 private:
+    bool events_ready_locked() const {
+        for (const auto &boundary : boundaries_)
+            if (boundary.event == nullptr) return false;
+        return true;
+    }
+    int reserve_events_locked() {
+        for (Boundary &boundary : boundaries_) {
+            if (boundary.event != nullptr) continue;
+            void *event = nullptr;
+            int rc = ops_.create(&event);
+            if (rc != 0) return rc;
+            boundary.event = event;
+        }
+        return 0;
+    }
+
     struct Boundary {
         void *event{nullptr};
         bool kernel_submitted{false};
