@@ -32,9 +32,11 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import tempfile
 import traceback
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,7 +50,7 @@ from simpler_setup.tools._runtime_dispatch import (
     normalize_task_id_int,
     resolve_runtime,
 )
-from simpler_setup.tools.strace_timing import host_process_lanes, parse_spans, span_family
+from simpler_setup.tools.strace_timing import host_process_lanes, parse_span_records, parse_spans, span_family
 
 
 def _func_id_to_letter(func_id):
@@ -3572,9 +3574,10 @@ Examples:
         action="append",
         help="Host [STRACE] log holding the chip.run.runner_run windows the captures are placed in "
         "(repeatable). Single-file input prefers sibling host_clock_alignment.*.log over host.*.log. "
-        "Directory input reads both at the root and rank*/d*/host_clock_alignment.*.log. "
+        "Directory input follows derived Host log paths in dispatch_identity.json, then legacy logs. "
         "A single capture with no matching logs remains unaligned; valid saved alignment needs no logs.",
     )
+    parser.add_argument("--publish-derived-host-logs", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--rank-pid",
         action="append",
@@ -4375,11 +4378,20 @@ def _rank_clock_domain(rank, records_path, raw):
     return str(clock_domain)
 
 
-def _discover_host_logs(root, explicit):
-    """The `[STRACE]` logs that hold the outer windows for these captures.
+def _derived_host_log_path(capture_dir, relative):
+    if not isinstance(relative, str) or not relative or Path(relative).is_absolute():
+        raise ValueError(f"invalid derived Host log path in {capture_dir / 'dispatch_identity.json'}")
+    path = (capture_dir / relative).resolve()
+    if not path.is_relative_to(Path(capture_dir).parent.parent.resolve()) or not path.is_file():
+        raise ValueError(f"derived Host log is missing or escapes its L3 output: {path}")
+    return path
 
-    Persistent ``host.<pid>.log`` files live at the case/level output root;
-    ``host_clock_alignment.<pid>.log`` holds capture-local timing spans.
+
+def _discover_host_logs(root, explicit, capture_dirs=()) -> tuple[list[Path], str]:
+    """Return the `[STRACE]` logs and their source kind for these captures.
+
+    Derived logs live with the L3 capture; legacy
+    ``host_clock_alignment.<pid>.log`` files hold capture-local timing spans.
     See ``docs/dfx/host-trace.md``.
     """
     if explicit:
@@ -4387,7 +4399,26 @@ def _discover_host_logs(root, explicit):
         missing = [str(path) for path in paths if not path.is_file()]
         if missing:
             raise ValueError(f"--host-log names a file that does not exist: {', '.join(missing)}")
-        return paths
+        return paths, "explicit"
+    identities = [_load_dispatch_identity(directory) for directory in capture_dirs]
+    derived = [identity.get("host_trace") if identity else None for identity in identities]
+    if derived and all(derived):
+        if any(identity is not None and "host_trace_publication_id" in identity for identity in identities):
+            publications = [identity.get("host_trace_publication_id") if identity else None for identity in identities]
+            if (
+                any(
+                    not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{32}", value) is None for value in publications
+                )
+                or len(set(publications)) != 1
+            ):
+                raise ValueError("derived Host logs belong to different publications across Ranks")
+        paths = {_derived_host_log_path(directory, relative) for directory, relative in zip(capture_dirs, derived)}
+        for directory, identity in zip(capture_dirs, identities):
+            if identity and identity.get("parent_host_trace"):
+                paths.add(_derived_host_log_path(directory, identity["parent_host_trace"]))
+        return sorted(paths), "derived"
+    if any(derived):
+        raise ValueError("only some Ranks have derived Host logs; cross-Rank placement needs every Rank")
     paths = sorted(
         {
             *Path(root).glob("host_clock_alignment.*.log"),
@@ -4402,7 +4433,128 @@ def _discover_host_logs(root, explicit):
             f"{containment.RUNNER_SPAN} window that contains it. Pass --host-log, or re-run with a Host log "
             f"threshold of TIMING or finer."
         )
-    return paths
+    return paths, "legacy"
+
+
+def _span_key(span):
+    return (span.pid, span.tid, span.inv, span.hid, span.depth, span.name, span.ts, span.dur, span.attrs)
+
+
+def _atomic_text(path, lines):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            output.writelines(lines)
+            output.flush()
+            os.fsync(output.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _atomic_json(path, data):
+    """Write the merged trace completely before replacing its previous file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("x") as output:
+            json.dump(data, output, indent=2)
+            output.flush()
+            os.fsync(output.fileno())
+        if path.is_file():
+            os.chmod(temporary, stat.S_IMODE(path.stat().st_mode))
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _stage_text(path, lines):
+    """Write a complete replacement beside its destination without publishing it."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=f".{path.name}.", delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            output.writelines(lines)
+            output.flush()
+            os.fsync(output.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    return temporary
+
+
+def _publish_identity_updates(companion_dirs, updated_sidecars, original_sidecars):
+    """Stage all Rank identities, then restore committed ones if a replace fails."""
+    staged = {}
+    committed = []
+    try:
+        for rank, directory in companion_dirs.items():
+            staged[rank] = _stage_text(directory / "dispatch_identity.json", [updated_sidecars[rank]])
+        for rank, directory in companion_dirs.items():
+            os.replace(staged[rank], directory / "dispatch_identity.json")
+            committed.append(rank)
+    except BaseException:
+        for rank in reversed(committed):
+            _atomic_text(companion_dirs[rank] / "dispatch_identity.json", [original_sidecars[rank]])
+        raise
+    finally:
+        for temporary in staged.values():
+            temporary.unlink(missing_ok=True)
+
+
+def _publish_derived_host_logs(
+    root, output_path, source_paths, companion_dirs, placements, dispatcher_spans
+) -> list[Path]:
+    """Publish only the spans selected for this merge, then link them from each Rank."""
+    if any(not (directory / "dispatch_identity.json").is_file() for directory in companion_dirs.values()):
+        raise ValueError("derived Host logs require a dispatch_identity.json for every Rank")
+    by_invocation = {(placement.host.pid, placement.host.inv): [] for placement in placements.values()}
+    parent_keys = {_span_key(span) for span in dispatcher_spans}
+    parent_records = []
+    for source in source_paths:
+        with source.open(errors="replace") as log:
+            for span, record in parse_span_records(log):
+                record += "\n"
+                if (span.pid, span.inv) in by_invocation:
+                    by_invocation[(span.pid, span.inv)].append(record)
+                if _span_key(span) in parent_keys:
+                    parent_records.append(record)
+    publication_id = uuid.uuid4().hex
+    parent_path = root / f"host_trace_{output_path.stem}_{publication_id}.log" if parent_records else None
+    rank_paths = {}
+    for rank, placement in placements.items():
+        key = placement.host.pid, placement.host.inv
+        records = by_invocation[key]
+        if not records:
+            raise ValueError(f"no [STRACE] records for paired Rank {rank} invocation {key}")
+        rank_paths[rank] = companion_dirs[rank] / f"host_trace_{key[0]}_{key[1]}_{publication_id}.log"
+    original_sidecars = {}
+    updated_sidecars = {}
+    for rank, directory in companion_dirs.items():
+        sidecar_path = directory / "dispatch_identity.json"
+        original_sidecars[rank] = sidecar_path.read_text()
+        identity = _load_dispatch_identity(directory)
+        if not isinstance(identity, dict):
+            raise ValueError(f"invalid dispatch identity: {sidecar_path}")
+        identity["host_trace"] = os.path.relpath(rank_paths[rank], directory)
+        identity["host_trace_publication_id"] = publication_id
+        if parent_path:
+            identity["parent_host_trace"] = os.path.relpath(parent_path, directory)
+        else:
+            identity.pop("parent_host_trace", None)
+        updated_sidecars[rank] = json.dumps(identity, indent=2) + "\n"
+    for rank, path in rank_paths.items():
+        placement = placements[rank]
+        _atomic_text(path, by_invocation[(placement.host.pid, placement.host.inv)])
+    if parent_path:
+        _atomic_text(parent_path, parent_records)
+    _publish_identity_updates(companion_dirs, updated_sidecars, original_sidecars)
+    return sorted([*rank_paths.values(), *([parent_path] if parent_path else [])])
 
 
 def _parse_rank_pid_pins(values):
@@ -4485,17 +4637,27 @@ def _host_block_lane(rank, lane_index, label):
     ]
 
 
-def _dispatcher_spans(spans, chip_pids, window_ns):
+def _span_dispatch_fields(span):
+    fields = {}
+    for item in span.attrs.split():
+        name, separator, value = item.partition("=")
+        if separator and name in ("run_id", "task_slot") and value.isdecimal():
+            fields[name] = int(value)
+    return fields
+
+
+def _dispatcher_spans(spans, chip_pids, window_ns, dispatch_key=None):
     """The dispatching processes' spans that belong to the merged dispatch.
 
-    Their logs cover the whole run while the merge covers one dispatch, so the
-    Ranks' own span on the Host axis selects what to keep — in two passes,
-    because the level above the chip emits spans of two different scopes.
+    Their logs cover the whole run while the merge covers one dispatch. A
+    parent identity selects its latest preceding submit and that submission's
+    spans by run and task slot, including dispatch calls that finished before a
+    ChipWorker began. Old captures without that identity use the Rank window.
 
-    A span with an invocation is kept or dropped with its whole invocation:
-    `node.submit` runs to completion before the Rank it dispatched to starts,
-    so an overlap test applied span by span would draw the dispatch and drop
-    what led to it.
+    In the fallback, a span with an invocation is kept or dropped with its
+    whole invocation. With a parent identity, task-slot spans are selected
+    exactly and run-scoped spans of that invocation accompany them. The
+    identity names the immediate L3 parent; it cannot identify an L4 task.
 
     ``inv=0`` says the span belongs to a thread rather than to one run —
     `node.scheduler_loop` is emitted that way (`Scheduler::…`, run id 0), so
@@ -4514,26 +4676,79 @@ def _dispatcher_spans(spans, chip_pids, window_ns):
     def overlaps(span, lo, hi):
         return span.ts < hi and span.ts + span.dur > lo
 
-    concurrent = {(span.pid, span.inv) for span in host_spans if span.inv and overlaps(span, window_lo, window_hi)}
-    selected = [span for span in host_spans if span.inv and (span.pid, span.inv) in concurrent]
+    selected = []
+    if dispatch_key is not None:
+        run_id, task_slot = dispatch_key
+        matched = [
+            span
+            for span in host_spans
+            if span.name.startswith("node.")
+            and _span_dispatch_fields(span).get("run_id") == run_id
+            and _span_dispatch_fields(span).get("task_slot") == task_slot
+        ]
+        if len({span.pid for span in matched if span.name in ("node.submit", "node.dispatch")}) > 1:
+            return []
+        if matched:
+            anchors = [span for span in matched if span.name == "node.submit" and span.ts <= window_lo]
+            if not anchors:
+                anchors = [span for span in matched if span.name == "node.dispatch" and span.ts <= window_lo]
+            if anchors:
+                anchor = max(anchors, key=lambda span: span.ts)
+                next_anchor = min(
+                    (
+                        span.ts
+                        for span in matched
+                        if span.pid == anchor.pid and span.name == anchor.name and span.ts > anchor.ts
+                    ),
+                    default=float("inf"),
+                )
+                selected = [
+                    span
+                    for span in host_spans
+                    if span.pid == anchor.pid
+                    and span.inv == anchor.inv
+                    and anchor.ts <= span.ts < next_anchor
+                    and _span_dispatch_fields(span).get("run_id") == run_id
+                    and _span_dispatch_fields(span).get("task_slot") in (None, task_slot)
+                ]
+                selected += [
+                    span
+                    for span in host_spans
+                    if span.pid == anchor.pid
+                    and span.inv == anchor.inv
+                    and span.name == "node.graph_build"
+                    and span.ts < anchor.ts <= span.ts + span.dur
+                    and _span_dispatch_fields(span).get("run_id") == run_id
+                ]
+    if dispatch_key is None:
+        concurrent = {(span.pid, span.inv) for span in host_spans if span.inv and overlaps(span, window_lo, window_hi)}
+        selected = [span for span in host_spans if span.inv and (span.pid, span.inv) in concurrent]
+    elif not selected:
+        return []
 
+    selected_ids = {id(span) for span in selected}
+    selected = [span for span in host_spans if id(span) in selected_ids]
     story_lo = min([window_lo] + [span.ts for span in selected])
     story_hi = max([window_hi] + [span.ts + span.dur for span in selected])
-    selected += [span for span in host_spans if not span.inv and overlaps(span, story_lo, story_hi)]
+    selected_pids = {span.pid for span in selected}
+    selected += [
+        span
+        for span in host_spans
+        if not span.inv
+        and id(span) not in selected_ids
+        and (dispatch_key is None or span.pid in selected_pids)
+        and overlaps(span, story_lo, story_hi)
+    ]
     return selected
 
 
 def _dispatcher_block_events(spans, global_origin_ns):
     """The processes that dispatched to these Ranks, drawn above them.
 
-    Each process writes its `host.<pid>.log` at the root of the level
-    namespace it owns, so a direct L3 run supplies the scheduler's own `node.*`
-    spans — and an L4's `network1.*` above them — from the persistent logs.
-    Under a parent-assigned `nodeN` namespace the levels above it write one
-    directory up, outside the root this merge reads, so only that namespace's
-    own levels reach here. They are Host CLOCK_MONOTONIC and same-host
-    cross-process comparable, so they go straight onto the axis: no
-    containment, no slack. Containment is only ever needed for the device
+    The live Host session supplies the L3 scheduler's `node.*` spans. Derived
+    logs retain the selected records for offline conversion. They are Host
+    CLOCK_MONOTONIC and same-host cross-process comparable, so they go straight
+    onto the axis: no containment, no slack. Containment is only needed for the device
     clock, which is why nothing in this block carries a bound.
     """
     processes = host_process_lanes(spans)
@@ -4813,7 +5028,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             "cross-host splice is not implemented."
         )
 
-    host_logs = _discover_host_logs(root, args.host_log)
+    host_logs, host_log_kind = _discover_host_logs(root, args.host_log, list(companion_dirs.values()))
     placements, host_pairing, host_spans = _place_rank_captures(
         host_logs, raw_inputs, rank_identities, rank_host_pids, _parse_rank_pid_pins(args.rank_pid)
     )
@@ -4841,7 +5056,23 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
         [int(placement.host.end_ns) for placement in placements.values()] + [s.ts + s.dur for s in rank_spans]
     )
     chip_pids = {placement.host.pid for placement in placements.values()}
-    dispatcher_spans = _dispatcher_spans(host_spans, chip_pids, (window_lo, window_hi))
+    parent_identity = pairing_metadata.get("dispatch_identity")
+    dispatch_key = None
+    if isinstance(parent_identity, dict):
+        run_id = parent_identity.get("run_id")
+        task_slot = parent_identity.get("task_slot")
+        if isinstance(run_id, int) and isinstance(task_slot, int):
+            dispatch_key = (run_id, task_slot)
+    dispatcher_spans = _dispatcher_spans(host_spans, chip_pids, (window_lo, window_hi), dispatch_key)
+    parent_dispatch_status = "unknown"
+    if pairing_metadata.get("dispatch_pairing") == "parent_dispatch_identity":
+        parent_found = dispatch_key is not None and any(
+            span.name in ("node.submit", "node.dispatch")
+            and (_span_dispatch_fields(span).get("run_id"), _span_dispatch_fields(span).get("task_slot"))
+            == dispatch_key
+            for span in dispatcher_spans
+        )
+        parent_dispatch_status = "present" if parent_found else "missing"
     global_origin_ns = min([window_lo] + [span.ts for span in dispatcher_spans])
     all_events = _dispatcher_block_events(dispatcher_spans, global_origin_ns)
     rank_metadata = []
@@ -4901,7 +5132,7 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
         rank_metadata.append(
             {
                 "rank": rank,
-                "input": str(records_path),
+                "input": os.path.relpath(records_path, _resolve_output_path(args, Path(root)).parent),
                 "trace_status": timeline["trace_status"],
                 "source_timeline_origin_ns": timeline["source_timeline_origin_ns"],
                 "placement": placement.metadata(),
@@ -4921,30 +5152,51 @@ def _generate_l3_trace(args, root):  # noqa: PLR0912
             "carries one TaskId layout, so these captures cannot be spliced together."
         )
 
-    metadata = {
-        "layout": "containment_spliced_multi_rank",
-        "runtime": resolve_runtime(next(iter(rank_runtimes)) if rank_runtimes else None),
-        "dispatch": args.dispatch,
-        "dispatch_id": args.dispatch_id,
-        "host_clock_domain_id": next(iter(clock_domains)) if clock_domains else None,
-        "host_logs": [str(path) for path in host_logs],
-        "global_origin_ns": global_origin_ns,
-        # The processes that dispatched to these Ranks, drawn on the Host clock
-        # directly — no containment, so no slack applies to their lanes.
-        "dispatcher_pids": sorted({span.pid for span in dispatcher_spans}),
-        "rank_count": len(rank_metadata),
-        **pairing_metadata,
-        "trace_status": "partial" if any(rank["trace_status"] != "complete" for rank in rank_metadata) else "complete",
-        "ranks": rank_metadata,
-        # Worst case for an interval read between two Ranks: each end carries
-        # its own Rank's slack, so the two largest bound any pair. null means
-        # fewer than two Ranks were placed, never that the comparison is exact.
-        "cross_rank_uncertainty_ns": containment.cross_uncertainty_ns(placements.values()),
-    }
     output_path = _resolve_output_path(args, Path(root))
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w") as f:
-        json.dump({"traceEvents": all_events, "metadata": metadata}, f, indent=2)
+    original_sidecars = None
+    if args.publish_derived_host_logs and args.host_log:
+        original_sidecars = {
+            rank: (directory / "dispatch_identity.json").read_text() for rank, directory in companion_dirs.items()
+        }
+        host_logs = _publish_derived_host_logs(
+            Path(root), output_path, host_logs, companion_dirs, placements, dispatcher_spans
+        )
+        host_log_kind = "derived"
+    try:
+        if original_sidecars is not None:
+            for item in rank_metadata:
+                item["dispatch_identity"] = _load_dispatch_identity(companion_dirs[item["rank"]])
+        metadata = {
+            "layout": "containment_spliced_multi_rank",
+            "runtime": resolve_runtime(next(iter(rank_runtimes)) if rank_runtimes else None),
+            "dispatch": args.dispatch,
+            "dispatch_id": args.dispatch_id,
+            "host_clock_domain_id": next(iter(clock_domains)) if clock_domains else None,
+            "host_logs": [
+                os.path.relpath(path, output_path.parent) if host_log_kind == "derived" else str(path)
+                for path in host_logs
+            ],
+            "global_origin_ns": global_origin_ns,
+            # The processes that dispatched to these Ranks, drawn on the Host clock
+            # directly — no containment, so no slack applies to their lanes.
+            "dispatcher_pids": sorted({span.pid for span in dispatcher_spans}),
+            "parent_dispatch_status": parent_dispatch_status,
+            "rank_count": len(rank_metadata),
+            **pairing_metadata,
+            "trace_status": "partial"
+            if any(rank["trace_status"] != "complete" for rank in rank_metadata)
+            else "complete",
+            "ranks": rank_metadata,
+            # Worst case for an interval read between two Ranks: each end carries
+            # its own Rank's slack, so the two largest bound any pair. null means
+            # fewer than two Ranks were placed, never that the comparison is exact.
+            "cross_rank_uncertainty_ns": containment.cross_uncertainty_ns(placements.values()),
+        }
+        _atomic_json(output_path, {"traceEvents": all_events, "metadata": metadata})
+    except BaseException:
+        if original_sidecars is not None:
+            _publish_identity_updates(companion_dirs, original_sidecars, original_sidecars)
+        raise
     return output_path, rank_metadata
 
 

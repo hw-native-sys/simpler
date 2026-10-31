@@ -1272,6 +1272,7 @@ def _run_swimlane_converter(
     dispatch: str | None = None,
     dispatch_id: str | None = None,
     output_path: Path | None = None,
+    publish_derived_host_logs: bool = False,
 ) -> bool:
     """Invoke the bundled swimlane converter as a subprocess.
 
@@ -1304,6 +1305,8 @@ def _run_swimlane_converter(
         cmd += ["--output", str(output_path)]
     for host_log in host_logs or []:
         cmd += ["--host-log", str(host_log)]
+    if publish_derived_host_logs:
+        cmd.append("--publish-derived-host-logs")
     if enable_overhead:
         cmd.append("--overhead")
     try:
@@ -1424,6 +1427,7 @@ def _convert_rank_swimlanes(
             dispatch=target["dispatch"],
             dispatch_id=target["dispatch_id"],
             output_path=output_prefix / f"{target['output_stem']}.json" if len(targets) > 1 else None,
+            publish_derived_host_logs=bool(host_logs),
         )
         if not merged:
             # The files this target selected, never a fresh scan of its
@@ -1455,19 +1459,7 @@ def _convert_case_swimlane(
 
     logger = logging.getLogger(__name__)
     if _rank_dirs(output_prefix):
-        # A capture counts when it holds either shape: the fixed name the
-        # non-retained path writes, or a retained artifact its own dispatch
-        # identity names. The converter applies the same two rules.
-        from simpler_setup.tools.swimlane_converter import _capture_records_paths  # noqa: PLC0415, PLC2701
-
-        captures = [directory for directory in _rank_capture_dirs(output_prefix) if _capture_records_paths(directory)]
-        # Runtime-exported timing logs allow capture-local lookup when all are present.
-        # Other Rank merges use the bound persistent logs.
-        host_logs = (
-            None
-            if captures and all(list(path.glob("host_clock_alignment.*.log")) for path in captures)
-            else _bound_host_logs()
-        )
+        host_logs = _bound_host_logs()
         _convert_rank_swimlanes(
             case_label,
             output_prefix,
@@ -1688,6 +1680,11 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
             _name_failing_case(exc, cls_name, case["name"])
             raise
         finally:
+            if enable_chip_swimlane and getattr(worker, "_config", {}).get("collect_across_runs"):
+                try:
+                    worker.flush_diagnostics()
+                except RuntimeError as error:
+                    logger.warning("[%s] diagnostic flush failed: %s", case_label, error)
             finalize_diagnostic_outputs(
                 case_label,
                 prefix,

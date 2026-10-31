@@ -136,6 +136,21 @@ def test_l3_swimlane_postprocess_falls_back_to_the_retained_file_itself(tmp_path
     assert [call["input_path"] for call in calls] == [tmp_path, artifact]
 
 
+def test_l3_auto_postprocess_publishes_only_when_session_logs_exist(tmp_path, monkeypatch) -> None:
+    scene_test_module = importlib.import_module("simpler_setup.scene_test")
+    capture = tmp_path / "rank0" / "d0"
+    capture.mkdir(parents=True)
+    (capture / "chip_swimlane_records.json").write_text("{}")
+    calls = []
+    monkeypatch.setattr(scene_test_module, "_run_swimlane_converter", _recording_converter(calls))
+    monkeypatch.setattr(scene_test_module, "_bound_host_logs", lambda: [tmp_path / "session" / "host.1.log"])
+
+    scene_test_module._convert_case_swimlane("case", tmp_path)
+
+    assert calls[0]["publish_derived_host_logs"] is True
+    assert calls[0]["host_logs"] == [tmp_path / "session" / "host.1.log"]
+
+
 def test_l3_swimlane_postprocess_fallback_converts_only_the_selected_form(tmp_path, monkeypatch) -> None:
     """A mixed directory is two units. Each failed merge falls back to the file
     its own target selected; re-scanning the directory would convert the other

@@ -387,6 +387,29 @@ def test_l3_directory_merge_uses_common_host_origin_and_rank_namespaces(tmp_path
     } == {6_000}
 
 
+def test_l3_legacy_device_boundary_marker_uses_host_timestamp(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    host_shift = 5_000_000_000_000
+    for rank in (0, 1):
+        _write_l3_rank(root, rank, host_shift_ns=host_shift + rank * 10_000, task_id=rank + 7)
+    source = root / "host.1000.log"
+    source.write_text(
+        source.read_text() + "[STRACE] v=1 pid=1000 tid=1000 inv=1 hid=abc depth=2 "
+        f"name=chip.run.runner_run.device_boundaries ts={host_shift + 5_000} dur=0 "
+        "clk=dev aic_start=123\n"
+    )
+    output = root / "l3.json"
+    args = sc._build_parser().parse_args([str(root), "--dispatch", "d0", "-o", str(output)])
+
+    sc._generate_l3_trace(args, root)
+
+    events = json.loads(output.read_text())["traceEvents"]
+    boundary = next(event for event in events if event.get("name") == "chip.run.runner_run.device_boundaries")
+    assert boundary["cat"] == "host"
+    assert boundary["ts"] == 4.0
+    assert max(event["ts"] for event in events if "ts" in event) < 100
+
+
 def test_l3_directory_merge_persists_hbg_alignment(tmp_path):
     root = tmp_path / "dfx_outputs"
     capture_dir = _write_hbg_l3_rank(root, 0, host_shift_ns=0, task_id=7)
@@ -435,8 +458,12 @@ def test_l3_directory_merge_uses_new_alignment_when_writeback_fails(tmp_path, mo
         rank_traces.append(trace)
         return trace
 
-    def fail_writeback(_source, _destination):
-        raise OSError("read-only capture")
+    original_replace = sc.os.replace
+
+    def fail_writeback(source, destination):
+        if destination == records_path:
+            raise OSError("read-only capture")
+        return original_replace(source, destination)
 
     monkeypatch.setattr(sc, "generate_chrome_trace_json", record_rank_trace)
     monkeypatch.setattr(sc.os, "replace", fail_writeback)
@@ -537,6 +564,363 @@ def test_l3_directory_merge_draws_the_host_log_beside_the_capture(tmp_path):
     assert min(event["ts"] for event in slices) == 0.0
 
 
+def test_l3_derived_host_logs_reopen_without_session_logs(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    captures = [_write_l3_rank(root, rank, host_shift_ns=rank * 10_000, task_id=rank + 7) for rank in (0, 1)]
+    for rank, capture in enumerate(captures):
+        _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=rank, group_size=2)
+    parent = root / "host.2000.log"
+    parent.write_text(
+        "[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=1 "
+        "name=node.graph_build ts=100 dur=1950 run_id=17\n"
+        "[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=1 "
+        "name=node.dispatch ts=400 dur=100 run_id=17 task_slot=5\n"
+        "[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=1 "
+        "name=node.dispatch ts=500 dur=100 run_id=17 task_slot=6\n"
+    )
+    (root / "host.3000.log").write_text(
+        "[STRACE] v=1 pid=3000 tid=3000 inv=2 hid=abc depth=1 "
+        "name=network1.submit ts=250 dur=150 run_id=99 task_slot=2\n"
+        "[STRACE] v=1 pid=3000 tid=3000 inv=2 hid=abc depth=1 "
+        "name=network1.dispatch ts=300 dur=400 run_id=99 task_slot=2\n"
+        "[STRACE] v=1 pid=3000 tid=3000 inv=2 hid=abc depth=1 "
+        "name=network1.complete ts=500 dur=1000 run_id=99 task_slot=2\n"
+        "[STRACE] v=1 pid=3000 tid=3000 inv=3 hid=abc depth=1 "
+        "name=network1.dispatch ts=800 dur=300 run_id=99 task_slot=222\n"
+        "[STRACE] v=1 pid=3000 tid=3000 inv=0 hid=abc depth=1 "
+        "name=network1.scheduler_loop ts=600 dur=500\n"
+    )
+    sources = sorted(root.glob("host.*.log"))
+    output = root / "l3_swimlane.json"
+    args = sc._build_parser().parse_args(
+        [
+            str(root),
+            "--dispatch-id",
+            "17:5",
+            "-o",
+            str(output),
+            "--publish-derived-host-logs",
+            *sum((["--host-log", str(p)] for p in sources), []),
+        ]
+    )
+    sc._generate_l3_trace(args, root)
+    original = json.loads(output.read_text())
+    assert all(not Path(path).is_absolute() for path in original["metadata"]["host_logs"])
+    assert any(event.get("name") == "node.dispatch" for event in original["traceEvents"])
+    assert any(event.get("name") == "node.graph_build" for event in original["traceEvents"])
+    assert original["metadata"]["dispatcher_pids"] == [2000]
+    assert not any(event.get("name", "").startswith("network1.") for event in original["traceEvents"])
+    assert not any(
+        event.get("name") == "node.dispatch" and event.get("args", {}).get("task_slot") == 6
+        for event in original["traceEvents"]
+    )
+    for capture in captures:
+        identity = json.loads((capture / "dispatch_identity.json").read_text())
+        assert (capture / identity["host_trace"]).is_file()
+        assert (capture / identity["parent_host_trace"]).is_file()
+    assert (
+        len(
+            {
+                json.loads((capture / "dispatch_identity.json").read_text())["host_trace_publication_id"]
+                for capture in captures
+            }
+        )
+        == 1
+    )
+    for source in sources:
+        source.unlink()
+    output.chmod(0o640)
+    offline = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(output)])
+    sc._generate_l3_trace(offline, root)
+    reopened = json.loads(output.read_text())
+    assert output.stat().st_mode & 0o777 == 0o640
+    assert reopened["traceEvents"] == original["traceEvents"]
+    assert reopened["metadata"]["host_logs"] == original["metadata"]["host_logs"]
+
+    for capture in captures:
+        sidecar = capture / "dispatch_identity.json"
+        identity = json.loads(sidecar.read_text())
+        identity.pop("host_trace_publication_id")
+        sidecar.write_text(json.dumps(identity))
+    sc._generate_l3_trace(offline, root)
+    assert json.loads(output.read_text())["traceEvents"] == original["traceEvents"]
+
+    missing = captures[0] / json.loads((captures[0] / "dispatch_identity.json").read_text())["host_trace"]
+    missing.unlink()
+    with pytest.raises(ValueError, match="derived Host log is missing"):
+        sc._generate_l3_trace(offline, root)
+
+
+def _write_parent_dispatch_span(root, *, ts=400):
+    (root / "host.2000.log").write_text(
+        "[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=1 "
+        f"name=node.dispatch ts={ts} dur=100 run_id=17 task_slot=5\n"
+    )
+
+
+def _paired_l3_with_parent(root):
+    captures = [_write_l3_rank(root, rank, host_shift_ns=rank * 10_000, task_id=rank + 7) for rank in (0, 1)]
+    for rank, capture in enumerate(captures):
+        _identity_with_nonce(capture, run_id=17, task_slot=5, group_index=rank, group_size=2)
+    _write_parent_dispatch_span(root)
+    sources = sorted(root.glob("host.*.log"))
+    output = root / "l3_swimlane.json"
+    args = sc._build_parser().parse_args(
+        [
+            str(root),
+            "--dispatch-id",
+            "17:5",
+            "-o",
+            str(output),
+            "--publish-derived-host-logs",
+            *sum((["--host-log", str(p)] for p in sources), []),
+        ]
+    )
+    return captures, sources, output, args
+
+
+def test_derived_logs_split_adjacent_records_by_invocation(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    captures, _sources, _output, args = _paired_l3_with_parent(root)
+    source = root / "host.1000.log"
+    first = "[STRACE] v=1 pid=1000 tid=1000 inv=1 hid=abc depth=1 name=chip.run.bind ts=2000 dur=10 "
+    other = "[STRACE] v=1 pid=1000 tid=1000 inv=2 hid=abc depth=1 name=chip.run.bind ts=3000 dur=10 "
+    source.write_text(source.read_text() + first + other + first + "\n")
+
+    sc._generate_l3_trace(args, root)
+
+    identity = json.loads((captures[0] / "dispatch_identity.json").read_text())
+    derived = (captures[0] / identity["host_trace"]).read_text()
+    assert "inv=2" not in derived
+    assert derived.count("name=chip.run.bind") == 2
+    assert derived.count("[STRACE]") == 5
+
+
+def test_derived_log_publication_rolls_back_all_rank_identities(tmp_path, monkeypatch):
+    root = tmp_path / "dfx_outputs"
+    captures, _sources, output, args = _paired_l3_with_parent(root)
+    before = [(capture / "dispatch_identity.json").read_text() for capture in captures]
+    original_replace = sc.os.replace
+    failure_path = captures[1] / "dispatch_identity.json"
+
+    def fail_second_sidecar(source, destination):
+        if destination == failure_path:
+            raise OSError("injected Rank 1 publication failure")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(sc.os, "replace", fail_second_sidecar)
+    with pytest.raises(OSError, match="injected Rank 1"):
+        sc._generate_l3_trace(args, root)
+    assert [(capture / "dispatch_identity.json").read_text() for capture in captures] == before
+    assert not output.exists()
+
+
+def test_failed_republication_keeps_the_previous_derived_logs(tmp_path, monkeypatch):
+    root = tmp_path / "dfx_outputs"
+    captures, sources, output, args = _paired_l3_with_parent(root)
+    sc._generate_l3_trace(args, root)
+    previous_trace = json.loads(output.read_text())
+    previous_identities = [(capture / "dispatch_identity.json").read_text() for capture in captures]
+    previous_log_paths = {
+        capture / json.loads(sidecar)[key]
+        for capture, sidecar in zip(captures, previous_identities)
+        for key in ("host_trace", "parent_host_trace")
+    }
+    previous_logs = {path: path.read_text() for path in previous_log_paths}
+
+    source = root / "host.1000.log"
+    source.write_text(
+        source.read_text() + "[STRACE] v=1 pid=1000 tid=1000 inv=1 hid=abc depth=2 name=chip.run.bind ts=2000 dur=10\n"
+    )
+    original_replace = sc.os.replace
+    failure_path = captures[1] / "dispatch_identity.json"
+
+    def fail_second_sidecar(staged, destination):
+        if destination == failure_path:
+            raise OSError("injected Rank 1 publication failure")
+        return original_replace(staged, destination)
+
+    monkeypatch.setattr(sc.os, "replace", fail_second_sidecar)
+    with pytest.raises(OSError, match="injected Rank 1"):
+        sc._generate_l3_trace(args, root)
+    assert [(capture / "dispatch_identity.json").read_text() for capture in captures] == previous_identities
+    assert {path: path.read_text() for path in previous_logs} == previous_logs
+    assert json.loads(output.read_text()) == previous_trace
+
+    for source in sources:
+        source.unlink()
+    offline = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(output)])
+    sc._generate_l3_trace(offline, root)
+    assert json.loads(output.read_text())["traceEvents"] == previous_trace["traceEvents"]
+
+
+@pytest.mark.parametrize("failure_mode", ["directory", "replace"])
+def test_failed_trace_write_restores_previous_host_links(tmp_path, monkeypatch, failure_mode):
+    root = tmp_path / "dfx_outputs"
+    captures, sources, output, args = _paired_l3_with_parent(root)
+    sc._generate_l3_trace(args, root)
+    previous_trace = json.loads(output.read_text())
+    previous_identities = [(capture / "dispatch_identity.json").read_text() for capture in captures]
+
+    source = root / "host.1000.log"
+    source.write_text(
+        source.read_text() + "[STRACE] v=1 pid=1000 tid=1000 inv=1 hid=abc depth=2 name=chip.run.bind ts=2000 dur=10\n"
+    )
+    if failure_mode == "directory":
+        blocked_output = root / "blocked.json"
+        blocked_output.mkdir()
+        args.output = str(blocked_output)
+    else:
+        original_replace = sc.os.replace
+
+        def fail_trace_replace(staged, destination):
+            if destination == output:
+                raise OSError("injected trace replace failure")
+            return original_replace(staged, destination)
+
+        monkeypatch.setattr(sc.os, "replace", fail_trace_replace)
+    with pytest.raises(OSError):
+        sc._generate_l3_trace(args, root)
+
+    assert [(capture / "dispatch_identity.json").read_text() for capture in captures] == previous_identities
+    assert json.loads(output.read_text()) == previous_trace
+    for source in sources:
+        source.unlink()
+    offline_output = root / "reopened.json"
+    offline = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(offline_output)])
+    sc._generate_l3_trace(offline, root)
+    assert json.loads(offline_output.read_text())["traceEvents"] == previous_trace["traceEvents"]
+
+
+def test_offline_merge_rejects_mixed_derived_log_publications(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    captures, sources, output, args = _paired_l3_with_parent(root)
+    sc._generate_l3_trace(args, root)
+    sidecar = captures[0] / "dispatch_identity.json"
+    identity = json.loads(sidecar.read_text())
+    identity["host_trace_publication_id"] = "0" * 32
+    sidecar.write_text(json.dumps(identity))
+    for source in sources:
+        source.unlink()
+
+    offline = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(output)])
+    with pytest.raises(ValueError, match="different publications"):
+        sc._generate_l3_trace(offline, root)
+
+
+def test_ambiguous_parent_pids_leave_rank_timeline_without_parent_spans(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    _captures, _sources, output, args = _paired_l3_with_parent(root)
+    other_parent = root / "host.3000.log"
+    other_parent.write_text(
+        "[STRACE] v=1 pid=3000 tid=3000 inv=1 hid=abc depth=1 name=node.submit ts=500 dur=100 run_id=17 task_slot=5\n"
+    )
+    args.host_log.append(str(other_parent))
+
+    sc._generate_l3_trace(args, root)
+
+    trace = json.loads(output.read_text())
+    assert trace["metadata"]["parent_dispatch_status"] == "missing"
+    assert trace["metadata"]["dispatcher_pids"] == []
+    assert trace["metadata"]["rank_count"] == 2
+    assert not any(event.get("name", "").startswith("node.") for event in trace["traceEvents"])
+
+
+@pytest.mark.parametrize("session_available", [True, False])
+def test_parent_paired_l3_keeps_rank_merge_without_parent_log(tmp_path, session_available):
+    root = tmp_path / "dfx_outputs"
+    captures, _sources, output, args = _paired_l3_with_parent(root)
+    if session_available:
+        # Another dispatch overlaps the Rank windows but must not be drawn as
+        # the missing parent of this group.
+        (root / "host.2000.log").write_text(
+            "[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=1 "
+            "name=node.dispatch ts=1500 dur=20000 run_id=17 task_slot=6\n"
+        )
+        args.host_log = [str(source) for source in sorted(root.glob("host.*.log"))]
+    else:
+        (root / "host.2000.log").unlink()
+        # The automatic path has no --host-log and discovers only Rank-local
+        # alignment files after the session spool becomes unavailable.
+        for rank, capture in enumerate(captures):
+            (root / f"host.{1000 + rank}.log").rename(capture / f"host_clock_alignment.{1000 + rank}.log")
+        args.host_log = []
+
+    sc._generate_l3_trace(args, root)
+    for capture in captures:
+        identity = json.loads((capture / "dispatch_identity.json").read_text())
+        if session_available:
+            assert (capture / identity["host_trace"]).is_file()
+        else:
+            assert "host_trace" not in identity
+        assert "parent_host_trace" not in identity
+    trace = json.loads(output.read_text())
+    assert trace["metadata"]["parent_dispatch_status"] == "missing"
+    assert trace["metadata"]["rank_count"] == 2
+    assert trace["metadata"]["dispatcher_pids"] == []
+    if session_available:
+        for source in sorted(root.glob("host.*.log")):
+            source.unlink()
+        offline = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(output)])
+        sc._generate_l3_trace(offline, root)
+        reopened = json.loads(output.read_text())
+        assert reopened["metadata"]["parent_dispatch_status"] == "missing"
+        assert reopened["traceEvents"] == trace["traceEvents"]
+
+
+def test_manual_host_log_merges_without_writing_derived_paths(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    captures, sources, output, args = _paired_l3_with_parent(root)
+    session = tmp_path / "session_logs"
+    session.mkdir()
+    external = [source.rename(session / source.name) for source in sources]
+    args.host_log = [str(path) for path in external]
+    args.publish_derived_host_logs = False
+
+    sc._generate_l3_trace(args, root)
+
+    metadata = json.loads(output.read_text())["metadata"]
+    assert metadata["parent_dispatch_status"] == "present"
+    assert metadata["host_logs"] == [str(path) for path in external]
+    for capture in captures:
+        assert "host_trace" not in json.loads((capture / "dispatch_identity.json").read_text())
+
+
+def test_manual_host_log_merges_legacy_captures_without_sidecars(tmp_path):
+    root = tmp_path / "dfx_outputs"
+    for rank in (0, 1):
+        _write_l3_rank(root, rank, host_shift_ns=rank * 10_000, task_id=rank + 7)
+    sources = sorted(root.glob("host.*.log"))
+    output = root / "manual.json"
+    args = sc._build_parser().parse_args(
+        [str(root), "--dispatch", "d0", "-o", str(output), *sum((["--host-log", str(p)] for p in sources), [])]
+    )
+
+    sc._generate_l3_trace(args, root)
+
+    assert json.loads(output.read_text())["metadata"]["rank_count"] == 2
+
+
+def test_parent_dispatch_uses_the_latest_matching_submission_before_the_rank():
+    lines = [
+        f"[STRACE] v=1 pid=2000 tid=2000 inv=1 hid=abc depth=0 name={name} ts={start} dur=20 run_id=17 task_slot=5"
+        for name, start in (
+            ("node.submit", 100),
+            ("node.dispatch", 120),
+            ("node.complete", 300),
+            ("node.submit", 800),
+            ("node.dispatch", 820),
+            ("node.complete", 1600),
+        )
+    ]
+    selected = sc._dispatcher_spans(list(parse_spans(lines)), set(), (1000, 1500), (17, 5))
+    assert [(span.name, span.ts) for span in selected] == [
+        ("node.submit", 800),
+        ("node.dispatch", 820),
+        ("node.complete", 1600),
+    ]
+
+
 def test_l3_directory_merge_leaves_the_standalone_host_swimlane_alone(tmp_path):
     """The merge reads the same log; it does not change what the other tool writes."""
     root = tmp_path / "dfx_outputs"
@@ -631,6 +1015,7 @@ def test_l3_parent_dispatch_identity_pairs_different_local_capture_indexes(tmp_p
     rank1 = _write_l3_rank(root, 1, host_shift_ns=10_000, task_id=8, dispatch="d1")
     _write_dispatch_identity(rank0, run_id=17, task_slot=5, group_index=0, group_size=2)
     _write_dispatch_identity(rank1, run_id=17, task_slot=5, group_index=1, group_size=2)
+    _write_parent_dispatch_span(root)
     output = tmp_path / "semantic.json"
     args = sc._build_parser().parse_args([str(root), "--dispatch-id", "17:5", "-o", str(output)])
 
@@ -2242,6 +2627,8 @@ def test_l3_directory_merge_picks_the_captured_invocation_out_of_a_repeated_run(
         identity["endpoint_dispatch_id"] = 3
         path.write_text(json.dumps(identity))
 
+    _write_parent_dispatch_span(root, ts=5_000_000)
+
     args = sc._build_parser().parse_args([str(root), "--dispatch", "d0"])
     _, rank_metadata = sc._generate_l3_trace(args, root)
 
@@ -2955,7 +3342,7 @@ def test_a_retained_capture_converts_with_the_companions_of_its_own_dispatch(tmp
 
     assert output_path == output
     assert [item["rank"] for item in rank_metadata] == [0]
-    assert [item["input"] for item in rank_metadata] == [str(artifact)]
+    assert [item["input"] for item in rank_metadata] == [str(artifact.relative_to(output.parent))]
     # The sidecar in dN, which the artifact's own directory does not hold.
     assert rank_metadata[0]["dispatch_identity"]["run_id"] == 17
     assert rank_metadata[0]["dispatch_identity"]["endpoint_dispatch_id"] == 1

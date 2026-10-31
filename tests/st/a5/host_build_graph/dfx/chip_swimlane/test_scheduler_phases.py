@@ -277,10 +277,10 @@ class TestConsecutiveClockAlignment(SceneTestCase):
             if not captured_outputs:
                 archived = archive_root / output_prefix.name
                 shutil.copytree(output_prefix, archived)
-                captured_outputs[case_label] = (archived, output_prefix)
+                captured_outputs[case_label] = archived
                 shutil.rmtree(output_prefix)
             else:
-                captured_outputs[case_label] = (output_prefix, output_prefix)
+                captured_outputs[case_label] = output_prefix
 
         _verify_runtime_clock_logs(
             monkeypatch,
@@ -294,7 +294,7 @@ class TestConsecutiveClockAlignment(SceneTestCase):
         invocations = []
         for case in self._matching_cases(st_platform, request):
             label = _sanitize_for_filename(f"TestConsecutiveClockAlignment_{case['name']}")
-            output_prefix, original_prefix = captured_outputs[label]
+            output_prefix = captured_outputs[label]
             captures = list(output_prefix.rglob("chip_swimlane_records.json"))
             assert len(captures) == 1
             capture = captures[0]
@@ -304,8 +304,7 @@ class TestConsecutiveClockAlignment(SceneTestCase):
             assert alignment["status"] == "bounded"
             rank_metadata = merged["metadata"]["ranks"]
             assert len(rank_metadata) == 1
-            expected_input = original_prefix / capture.relative_to(output_prefix)
-            assert rank_metadata[0]["input"] == str(expected_input)
+            assert rank_metadata[0]["input"] == str(capture.relative_to(output_prefix))
             placement = rank_metadata[0]["placement"]
             pid, inv = placement["outer_pid"], placement["outer_inv"]
             assert pid != os.getpid(), "the producer must be a forked ChipWorker"

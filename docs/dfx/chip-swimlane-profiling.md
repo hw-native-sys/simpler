@@ -656,7 +656,8 @@ python -m simpler_setup.tools.swimlane_converter \
 ### Optional alignment embedded in a single capture
 
 For `host_build_graph` captures, single-file conversion prefers sibling
-`host_clock_alignment.*.log` files, falling back to persistent `host.*.log` files.
+`host_clock_alignment.*.log` files, falling back to sibling `host.*.log` files
+when present.
 Explicit `--host-log` arguments override this lookup. The converter identifies
 HBG by the document-level `metadata.runtime`. Automatic alignment also requires Host capture
 information (`host_orchestrator_phases`, `host_device_uploads`, or Host capture
@@ -701,8 +702,11 @@ before runtime returns; the exported `chip.run` span ends before the export itse
 
 SceneTest and PyPTO can then invoke the converter, which reads the sibling timing
 logs, performs containment, saves `metadata.clock_alignment` in mixed HBG source
-captures, and generates the merged trace. Timing-log export itself does not
-calculate or save clock alignment. Device-only captures and other diagnostics
+captures, and generates the merged trace. For automatic multi-Rank conversion,
+SceneTest also reads the live session spool and saves selected `[STRACE]` records
+beside the capture; `dispatch_identity.json` links those derived logs for offline
+conversion. Timing-log export itself does not calculate or save clock
+alignment. Device-only captures and other diagnostics
 alone do not trigger this export. Directory merging retains containment for all
 runtimes and levels. While the process is alive, complete Host call trees
 remain in the session spool's `host.<pid>.log` files and can be supplied through
@@ -810,18 +814,14 @@ It describes placement freedom for the selected join. Phase-join freedom is
 reported separately as `join.residual_ns`; the saved HBG anchor bounds include
 both sources of uncertainty.
 
-The Host block comes first and has two parts. Above the Ranks are the
-processes that dispatched to them — the L3 scheduler's `node.*` lanes, and an
-L4's `network1.*` above those. Each process binds its persistent host log to the root of
-the level namespace it owns, so a direct L3 run stores them above the Rank
-captures. Under a parent-assigned namespace only that namespace's own
-levels are beside them — the L4 above a `nodeN` writes one directory up, where
-a merge reading that `nodeN` does not look. They are Host CLOCK_MONOTONIC and
-same-host cross-process comparable, so they are drawn directly and **carry no
-`slack_ns` at all** — containment is a device-clock term. Their logs cover the
-whole run while the merge covers one dispatch, so the invocations drawn are
-those overlapping the Ranks' own span on the axis, and
-`metadata.dispatcher_pids` names the processes they came from.
+The Host block comes first and has two parts. Above the Ranks are the L3
+scheduler's `node.*` lanes. Automatic conversion reads their spans from the live
+session spool and saves the selected records beside the merged capture. A Rank's
+parent dispatch identity identifies the L3 task, but carries no link to an L4
+task; the converter does not attach `network1.*` spans by timestamp alone. The
+selected L3 spans are Host CLOCK_MONOTONIC and same-host cross-process comparable,
+so they are drawn directly and **carry no `slack_ns` at all** — containment is a
+device-clock term. `metadata.dispatcher_pids` names their source process.
 
 Then each Rank contributes three lanes read off its own Host log — its
 `chip.run` call tree (on the Host clock, no placement error), the `clk=dev`

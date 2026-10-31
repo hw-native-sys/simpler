@@ -51,6 +51,26 @@ complete trace must survive process exit. The AICPU-launch marker is a TIMING Ho
 before the launch API call (`dur=0`, `depth=2`), not a Device-start or
 launch-completion timestamp.
 
+For automatic L3 swimlane conversion, SceneTest selects each Rank's paired
+invocation and the parent dispatch spans from these complete logs. It writes
+Rank-local `host_trace_<pid>_<inv>_<publication>.log` files and a shared
+`host_trace_<output-stem>_<publication>.log`
+beside the merged trace, then records relative paths in each
+`dispatch_identity.json`. Only selected `[STRACE]` records enter these derived
+files; ordinary messages remain in the session logs. The derived files allow
+the capture directory to be reopened after the transient session logs are removed.
+Each publication writes new files before updating the identities, so a failed
+retry leaves the previously linked logs intact. All Ranks in a publication
+record the same `host_trace_publication_id`; offline conversion refuses mixed
+publications, while older captures without this field remain readable. If the
+merged JSON cannot be written, the identities revert to their previous links.
+Manual `--host-log` conversion reads the specified logs without publishing
+derived paths. If the parent dispatch span is unavailable, the converter still
+merges Rank timelines, saves the available Rank Host records, and marks
+`metadata.parent_dispatch_status=missing`. The same Rank-only result is used
+when matching parent spans come from multiple PIDs and cannot be attributed
+without guessing.
+
 **The destination belongs to the logger, not to a record.** Everything that logger
 writes follows it: `LOG_*` records, `[STRACE]` spans, the `host-orch phase=`
 cost-share summaries, and the spans Python emits through
@@ -132,6 +152,11 @@ One line per span, emitted on scope exit
 | `name` | dotted span name (self-locating even without the tree). |
 | `ts` `dur` | start + duration in ns. Maps 1:1 onto a Chrome-trace `"X"` event. For host spans `ts` is `CLOCK_MONOTONIC` (`steady_clock`), same-host cross-process comparable. For `clk=dev` device spans (see below) `ts` is instead a **device-clock** start offset on a per-invocation origin — comparable to the other device spans (so the orch∪sched window is recoverable), not the host clock, and **not comparable between invocations**; for that, see [Comparing device spans across runs](#comparing-device-spans-across-runs). |
 | `k=v ...` | optional per-span attributes (e.g. `ntensor=4`); a parser that doesn't recognize one ignores it. |
+
+`chip.run.runner_run.device_boundaries` is a Host-clock point carrying device
+counter readings in its attributes. New logs tag it `clk=host`; the parser also
+recognizes old logs that tagged this point `clk=dev` so its absolute Host `ts`
+does not stretch a merged timeline.
 
 Span names and attributes percent-encode control bytes and record delimiters.
 They are length-capped (with `~` marking truncation) so each marker remains a

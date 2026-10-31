@@ -1348,7 +1348,7 @@ static void emit_device_boundary_marks(OnboardNativeRunContext *state) {
         state->runner->run_boundary_mark(RunBoundaryMarks::Position::WholeOperatorEnd, state->identity());
     char attrs[SIMPLER_HOST_SPAN_ATTRIBUTES_CAPACITY];
     (void)std::snprintf(
-        attrs, sizeof(attrs), "clk=dev dev_id=%d aic_start=%llu aic_rc=%d wo_end=%llu wo_rc=%d ts_hz=%llu",
+        attrs, sizeof(attrs), "clk=host dev_id=%d aic_start=%llu aic_rc=%d wo_end=%llu wo_rc=%d ts_hz=%llu",
         state->runner->device_id(), static_cast<unsigned long long>(start.available ? start.timestamp : 0), start.rc,
         static_cast<unsigned long long>(end.available ? end.timestamp : 0), end.rc,
         static_cast<unsigned long long>(PLATFORM_ACL_EVENT_TIMESTAMP_FREQ_HZ)
