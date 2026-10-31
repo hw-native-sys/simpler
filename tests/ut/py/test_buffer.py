@@ -64,7 +64,7 @@ from simpler.comm_endpoints import (
     RegionAccessReasonCode,
     buffer_adapter_candidates,
 )
-from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, TaskArgs, Tensor
+from simpler.task_interface import ChipStorageTaskArgs, ChipTensor, TaskArgs, Tensor, TensorArgType
 
 _OID = bytes(range(0xA0, 0xA0 + OWNER_INSTANCE_ID_BYTES))
 
@@ -1328,3 +1328,304 @@ def test_task_args_owns_transfer_without_mutating_the_source_view():
     args.clear()
     args.add_tensor(tensor)
     assert args.transfer(0) == TensorTransfer.H2D
+
+
+def _fabric_host_tensor():
+    descriptor = BufferDescriptor(
+        CanonicalIdentity(_OID, 811, 1),
+        AddressSpace.HOST,
+        AccessMode.READWRITE,
+        BackendKind.REMOTE_SIDECAR,
+        64,
+    )
+    return descriptor.tensor((4,), DataType.FLOAT32, byte_offset=8)
+
+
+@pytest.mark.parametrize("access", [AccessMode.READ, AccessMode.WRITE, AccessMode.READWRITE])
+@pytest.mark.parametrize("space", [AddressSpace.HOST, AddressSpace.DEVICE])
+def test_borrowed_fabric_mapping_preserves_source_and_access(access, space):
+    descriptor = replace(
+        buffer_mod.buffer_reference(_fabric_host_tensor().buffer), access=access, address_space=space
+    ).to_descriptor()
+    context = ImportContext(DEVICE_AICPU)
+    registry = ImportRegistry(context)
+    refusal = "REMOTE_SIDECAR" if space == AddressSpace.HOST else "unrelated"
+    try:
+        with pytest.raises(ValueError, match=refusal):
+            select_adapter(descriptor, context)
+        with pytest.raises(ValueError, match="no live grant"):
+            registry.materialize(descriptor, mapping=1)
+        registry.register_borrowed(descriptor, 4096, mapping=1)
+        imported = registry.materialize(descriptor, mapping=1)
+        assert imported.profile is AdapterProfile.FABRIC_MAP
+        assert imported.address_space == AddressSpace.DEVICE and imported.descriptor == descriptor
+        assert descriptor.address_space == space
+        assert imported.capabilities == capabilities_for_adapter(AdapterKind.DIRECT_MAP, access)
+        assert registry.require(descriptor, mapping=1) is imported
+        with pytest.raises(ValueError, match=refusal):
+            select_adapter(descriptor, context)
+        with pytest.raises(ValueError, match=refusal):
+            registry.materialize(descriptor)
+        registry.unregister(descriptor.identity)
+        with pytest.raises(ValueError, match="no live grant"):
+            registry.materialize(descriptor, mapping=1)
+    finally:
+        registry.close()
+
+
+def test_borrowed_registration_cannot_reclassify_native_device_storage():
+    descriptor = _device_descriptor(_OID, 1, nbytes=64)
+    registry = ImportRegistry(ImportContext(DEVICE_AICPU, _OID))
+    try:
+        with pytest.raises(ValueError, match="Fabric binding"):
+            registry.register_borrowed(descriptor, 4096, mapping=1)
+        with pytest.raises(ValueError, match="no live grant"):
+            registry.materialize(descriptor, mapping=1)
+        with pytest.raises(ValueError, match="unrelated"):
+            select_adapter(descriptor, ImportContext(DEVICE_AICPU))
+        assert select_adapter(descriptor, registry._context) == (
+            AdapterKind.DIRECT_MAP,
+            AdapterProfile.DEVICE_LOCAL,
+        )
+        assert registry.materialize(descriptor).descriptor == descriptor
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize("space", [AddressSpace.HOST, AddressSpace.DEVICE])
+@pytest.mark.parametrize("access", [AccessMode.READ, AccessMode.WRITE, AccessMode.READWRITE])
+def test_host_fabric_binding_affords_copy_without_materializing(space, access):
+    descriptor = replace(
+        buffer_mod.buffer_reference(_fabric_host_tensor().buffer), address_space=space, access=access
+    ).to_descriptor()
+    registry = ImportRegistry(ImportContext(HOST_CPU))
+    registry.register_borrowed(descriptor, 0)
+    imported = registry.require(descriptor)
+    assert imported.base == 0 and imported.descriptor == descriptor
+    assert imported.address_space == space
+    assert imported.profile is AdapterProfile.FABRIC_MAP
+    assert imported.capabilities == capabilities_for_adapter(AdapterKind.OWNER_DELEGATED_COPY, access)
+    for capability in (BufferCapability.COPY_TO, BufferCapability.COPY_FROM):
+        if capability in imported.capabilities:
+            assert registry.require(descriptor, capability, offset=8, nbytes=16) is imported
+        else:
+            with pytest.raises(ValueError, match=capability.value):
+                registry.require(descriptor, capability)
+    for capability in (BufferCapability.DIRECT_LOAD, BufferCapability.DIRECT_STORE):
+        with pytest.raises(ValueError, match=capability.value):
+            registry.require(descriptor, capability)
+    with pytest.raises(ValueError, match="no local address"):
+        registry.materialize(descriptor)
+    registry.unregister(descriptor.identity)
+    with pytest.raises(KeyError):
+        registry.require(descriptor)
+
+
+@pytest.mark.parametrize(
+    ("deployment", "base", "mapping"),
+    [(HOST_CPU, 4096, 0), (HOST_CPU, 0, 1), (DEVICE_AICPU, 0, 1), (DEVICE_AICPU, 4096, 0)],
+)
+def test_borrowed_binding_requires_endpoint_specific_address(deployment, base, mapping):
+    registry = ImportRegistry(ImportContext(deployment))
+    with pytest.raises(ValueError, match="Fabric binding"):
+        registry.register_borrowed(_fabric_host_tensor().buffer, base, mapping=mapping)
+    with pytest.raises(KeyError):
+        registry.require(_fabric_host_tensor().buffer, mapping=mapping)
+
+
+@pytest.mark.parametrize("mapping", [0, 255])
+def test_require_validates_exact_descriptor_range_capability_and_existing_lifecycle(mapping):
+    descriptor = _fabric_host_tensor().buffer
+    registry = ImportRegistry(ImportContext(DEVICE_AICPU if mapping else HOST_CPU))
+    domain = {"phase": "COMMITTED", "revoked": False}
+    registry.register_borrowed(
+        descriptor,
+        4096 if mapping else 0,
+        mapping=mapping,
+        live=lambda: domain["phase"] == "COMMITTED" and not domain["revoked"],
+    )
+    imported = registry.require(descriptor, BufferCapability.COPY_TO, mapping=mapping, offset=8, nbytes=16)
+    assert registry.require(descriptor.identity, mapping=mapping, offset=64, nbytes=0) is imported
+    assert registry.require(descriptor, mapping=mapping, offset=48) is imported
+    for offset, nbytes in ((-1, 1), (0, -1), (65, 0), (48, 17), (1 << 64, 0)):
+        with pytest.raises(ValueError, match="byte range"):
+            registry.require(descriptor, mapping=mapping, offset=offset, nbytes=nbytes)
+    conflicting = replace(buffer_mod.buffer_reference(descriptor), nbytes=128).to_descriptor()
+    with pytest.raises(ValueError, match="different descriptor"):
+        registry.require(conflicting, mapping=mapping)
+    with pytest.raises(ValueError, match="different descriptor"):
+        registry.materialize(conflicting, mapping=mapping)
+    with pytest.raises(KeyError):
+        registry.require(descriptor, mapping=1 if not mapping else 0)
+    with pytest.raises(ValueError, match="DEVICE_PEER_ACCESS"):
+        registry.require(descriptor, BufferCapability.DEVICE_PEER_ACCESS, mapping=mapping)
+    domain["revoked"] = True
+    with pytest.raises(ValueError, match="not live"):
+        registry.require(descriptor, mapping=mapping)
+    with pytest.raises(ValueError, match="not live"):
+        registry.materialize(descriptor, mapping=mapping)
+    domain["revoked"], domain["phase"] = False, "RELEASED"
+    with pytest.raises(ValueError, match="not live"):
+        registry.require(descriptor, mapping=mapping)
+
+
+def test_register_borrowed_pending_binding_becomes_usable_only_through_its_existing_lifecycle():
+    descriptor = _fabric_host_tensor().buffer
+    registry = ImportRegistry(ImportContext(DEVICE_AICPU))
+    domain = {"phase": "IMPORT"}
+    registry.register_borrowed(descriptor, 4096, mapping=1, live=lambda: domain["phase"] == "COMMITTED")
+    registry.register_borrowed(descriptor, 4096, mapping=1, live=lambda: True)
+    with pytest.raises(ValueError, match="not live"):
+        registry.require(descriptor, mapping=1)
+    with pytest.raises(ValueError, match="not live"):
+        registry.materialize(descriptor, mapping=1)
+    domain["phase"] = "COMMITTED"
+    assert registry.require(descriptor, mapping=1).base == 4096
+    domain["phase"] = "RELEASED"
+    registry.register_borrowed(descriptor, 4096, mapping=1, live=lambda: True)
+    with pytest.raises(ValueError, match="not live"):
+        registry.require(descriptor, mapping=1)
+
+
+@pytest.mark.parametrize("space", [AddressSpace.HOST, AddressSpace.DEVICE])
+def test_materialize_args_validates_each_strided_view_and_preserves_native_selection(space):
+    descriptor = replace(buffer_mod.buffer_reference(_fabric_host_tensor().buffer), address_space=space).to_descriptor()
+    registry = ImportRegistry(ImportContext(DEVICE_AICPU, _OID))
+    registry.register_borrowed(descriptor, 8192, mapping=255)
+    args = TaskArgs()
+    args.add_tensor(
+        descriptor.tensor((2, 3), DataType.FLOAT32, strides=(4, 1), byte_offset=8)._with_mapping_ref(255),
+        transfer=TensorTransfer.NONE,
+    )
+    args.add_tensor(
+        descriptor.tensor((2,), DataType.FLOAT32, byte_offset=48)._with_mapping_ref(255), transfer=TensorTransfer.NONE
+    )
+    native = _device_descriptor(_OID, 999, nbytes=64, ptr=4096)
+    args.add_tensor(native.tensor((2,), DataType.FLOAT32))
+    resolved = registry.materialize_args(args)
+    assert resolved == {
+        (descriptor.identity, 255): (8192, int(AddressSpace.DEVICE)),
+        native.identity: (4096, int(AddressSpace.DEVICE)),
+    }
+    assert registry.require(native).profile is AdapterProfile.DEVICE_LOCAL
+    registry.require(descriptor, mapping=255).capabilities = frozenset({BufferCapability.COPY_TO})
+    with pytest.raises(ValueError, match="DIRECT_LOAD"):
+        registry.materialize_args(args)
+    registry.require(descriptor, mapping=255).capabilities = frozenset({BufferCapability.DIRECT_LOAD})
+    with pytest.raises(ValueError, match="DIRECT_STORE"):
+        registry.materialize(descriptor, mapping=255)
+    with pytest.raises(ValueError, match="DIRECT_STORE"):
+        registry.materialize_args(args)
+
+
+def test_materialize_args_preserves_write_only_views_after_mailbox_tag_stripping():
+    descriptor = replace(
+        buffer_mod.buffer_reference(_fabric_host_tensor().buffer), access=AccessMode.WRITE
+    ).to_descriptor()
+    registry = ImportRegistry(ImportContext(DEVICE_AICPU))
+    registry.register_borrowed(descriptor, 4096, mapping=1)
+    args = TaskArgs()
+    args.add_tensor(
+        descriptor.tensor((2,), DataType.FLOAT32)._with_mapping_ref(1),
+        TensorArgType.OUTPUT,
+        transfer=TensorTransfer.NONE,
+    )
+    args.set_tag(0, TensorArgType.INPUT)
+    assert registry.materialize_args(args) == {(descriptor.identity, 1): (4096, int(AddressSpace.DEVICE))}
+
+
+def test_plain_host_h2d_args_keep_the_native_host_mapping():
+    backing = create_host_shared_buffer(64, mint_owner_instance_id(), 1)
+    registry = ImportRegistry(ImportContext(DEVICE_AICPU))
+    try:
+        args = TaskArgs()
+        args.add_tensor(backing.tensor((4,), DataType.FLOAT32))
+        resolved = registry.materialize_args(args)
+        imported = registry.require(backing.identity)
+        assert args.transfer(0) == TensorTransfer.H2D
+        assert imported.profile is AdapterProfile.HOST_SHM_MAP
+        assert resolved == {backing.identity: (imported.base, int(AddressSpace.HOST))}
+    finally:
+        registry.close()
+        backing.close()
+
+
+def test_mapping_ref_requires_explicit_none_without_changing_host_default():
+    plain = _fabric_host_tensor()
+    mapped = plain._with_mapping_ref(1)
+    args = TaskArgs()
+    args.add_tensor(plain)
+    with pytest.raises(ValueError, match="mapping.*NONE"):
+        args.add_tensor(mapped)
+    assert args.tensor_count() == 1 and args.transfer(0) == TensorTransfer.H2D
+    args.add_tensor(mapped, transfer=TensorTransfer.NONE)
+    assert args.tensor_count() == 2 and args.transfer(1) == TensorTransfer.NONE
+    assert mapped.buffer == plain.buffer and plain.mapping_ref == 0
+
+
+def test_mapping_ref_keeps_host_storage_and_binds_each_view_independently():
+    from _task_interface import materialize_task_args  # noqa: PLC0415
+
+    plain = _fabric_host_tensor()
+    mapped = plain._with_mapping_ref(2)
+    other = plain._with_mapping_ref(3)
+    assert plain.mapping_ref == 0
+    assert mapped.mapping_ref == 2 and other.mapping_ref == 3
+    assert mapped not in (plain, other)
+    assert mapped.buffer == plain.buffer and mapped.buffer.address_space == AddressSpace.HOST
+    assert mapped.shapes == plain.shapes and mapped.strides == plain.strides
+    assert mapped.byte_offset == plain.byte_offset and mapped.dtype == plain.dtype
+    args = TaskArgs()
+    args.add_tensor(plain, transfer=TensorTransfer.NONE)
+    args.add_tensor(mapped, transfer=TensorTransfer.NONE)
+    assert args.has_device_backed_tensor()
+    assert args.transfer(1) == TensorTransfer.NONE
+    native = materialize_task_args(
+        args,
+        {
+            plain.buffer.identity: (100, int(AddressSpace.HOST)),
+            (plain.buffer.identity, 2): (200, int(AddressSpace.DEVICE)),
+        },
+    )
+    assert native.tensor(0).data == 108 and native.tensor(0).address_space == AddressSpace.HOST
+    assert native.tensor(1).data == 208 and native.tensor(1).address_space == AddressSpace.DEVICE
+    with pytest.raises(ValueError, match="mapping.*NONE"):
+        TaskArgs().add_tensor(mapped, transfer=TensorTransfer.H2D)
+    with pytest.raises(ValueError, match="mapping.*NONE"):
+        TaskArgs().add_tensor(mapped, transfer=TensorTransfer.D2H)
+    with pytest.raises(RuntimeError, match="import registry"):
+        materialize_task_args(args, {plain.buffer.identity: (100, int(AddressSpace.HOST))})
+
+
+@pytest.mark.parametrize("reference", [-1, 0, 256])
+def test_mapping_ref_rejects_invalid_reference(reference):
+    with pytest.raises(ValueError, match="reference"):
+        _fabric_host_tensor()._with_mapping_ref(reference)
+
+
+def test_mapping_ref_does_not_encode_a_domain_rank_or_backend():
+    tensor = _descriptor_with_path_id(0).tensor((2,), DataType.FLOAT32)
+    mapped = tensor._with_mapping_ref(255)
+    assert mapped.mapping_ref == 255 and mapped.buffer == tensor.buffer
+    with pytest.raises(ValueError):
+        ImportRegistry(ImportContext(DEVICE_AICPU)).materialize(tensor.buffer, mapping=255)
+
+
+def test_mapping_ref_survives_mailbox_without_changing_the_slot_size():
+    from _task_interface import read_args_from_blob  # noqa: PLC0415
+
+    from tests.ut.py.test_worker._wire_blob import encode_blob  # noqa: PLC0415
+
+    plain = _fabric_host_tensor()
+    raw = bytearray(encode_blob([plain], transfers=[TensorTransfer.NONE]))
+    assert len(raw) == 8 + 144
+    raw[8 + 142] = 64
+    blob = ctypes.create_string_buffer(bytes(raw))
+    args = read_args_from_blob(ctypes.addressof(blob), len(blob))
+    assert args.tensor(0).mapping_ref == 64
+    assert args.tensor(0).buffer == plain.buffer
+    assert args.transfer(0) == TensorTransfer.NONE
+    for selector in (65, 255):
+        raw[8 + 142] = selector
+        blob = ctypes.create_string_buffer(bytes(raw))
+        assert read_args_from_blob(ctypes.addressof(blob), len(blob)).tensor(0).mapping_ref == selector

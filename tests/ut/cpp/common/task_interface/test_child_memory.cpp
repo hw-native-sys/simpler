@@ -169,6 +169,37 @@ TEST(ChildMemory, TransferBelongsToEachArgumentAndSurvivesMailboxCopyAndMove) {
     EXPECT_EQ(args.transfer(0), TensorTransfer::H2D);
 }
 
+TEST(ChildMemory, DomainMappingPreservesStorageAndNoneRequestAcrossMailbox) {
+    Tensor plain = make_wire_tensor(1, AddressSpace::HOST);
+    plain.buffer.identity.owner_instance_id[0] = 1;
+    plain.buffer.backend_kind = static_cast<uint8_t>(BackendKind::REMOTE_SIDECAR);
+    plain.buffer.body_len = 0;
+    std::memset(plain.buffer.body, 0, sizeof(plain.buffer.body));
+    Tensor mapped = plain;
+    mapped.mapping_ref = 64;
+    TaskArgs args;
+    args.add_tensor(plain);
+    EXPECT_THROW(args.add_tensor(mapped), std::invalid_argument);
+    EXPECT_EQ(args.tensor_count(), 1);
+    args.add_tensor(mapped, TensorArgType::INPUT, TensorTransfer::NONE);
+    EXPECT_EQ(args.transfer(0), TensorTransfer::H2D);
+    EXPECT_EQ(args.transfer(1), TensorTransfer::NONE);
+    EXPECT_THROW(args.add_tensor(mapped, TensorArgType::INPUT, TensorTransfer::H2D), std::invalid_argument);
+    EXPECT_THROW(args.add_tensor(mapped, TensorArgType::INPUT, TensorTransfer::D2H), std::invalid_argument);
+    ASSERT_EQ(args.tensor_count(), 2);
+    const TaskArgs copy = args;
+    std::vector<uint8_t> blob(task_args_blob_size(copy));
+    EXPECT_EQ(blob.size(), 8u + 2u * 144u);
+    write_blob(blob.data(), copy);
+    const auto view = read_blob(blob.data(), blob.size());
+    EXPECT_EQ(view.tensors(0).mapping_ref, 0);
+    EXPECT_EQ(view.tensors(1).mapping_ref, 64);
+    EXPECT_EQ(view.tensors(0).buffer, view.tensors(1).buffer);
+    EXPECT_EQ(view.transfer(1), TensorTransfer::NONE);
+    blob[8 + 144 + 142] = 65;
+    EXPECT_EQ(view.tensors(1).mapping_ref, 65);
+}
+
 TEST(ChildMemory, InvalidTransferDoesNotAppendAnArgumentAndLocationMutationIsRejected) {
     TaskArgs args;
     Tensor device = make_wire_tensor(1, AddressSpace::DEVICE);

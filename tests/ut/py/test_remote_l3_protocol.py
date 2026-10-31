@@ -16,18 +16,24 @@ from simpler.remote_l3_protocol import (
     CallableKind,
     ControlName,
     ExportBufferResult,
+    FrameHeader,
+    FrameType,
     ImportBufferResult,
     RemoteAddressSpace,
     RemoteRegistryTarget,
     decode_export_buffer_result,
+    decode_frame,
     decode_register_callable_command,
+    decode_remote_task_args,
     decode_task_payload,
     encode_completion,
     encode_control_reply,
     encode_export_buffer_result,
+    encode_frame,
     encode_import_buffer_result,
     encode_register_callable_command,
 )
+from simpler.task_interface import AddressSpace, DataType
 
 
 def _oversized_multibyte_error_message():
@@ -166,3 +172,51 @@ def test_export_buffer_result_decode_rejects_invalid_live_identity(field, value)
 def test_import_buffer_result_rejects_invalid_live_identity(field, value):
     with pytest.raises(ValueError, match="live imported buffer identity"):
         encode_import_buffer_result(_import_result(**{field: value}))
+
+
+def _registered_host_args():
+    descriptor = struct.pack("<8sQIBBBQII", b"creator1", 11, 1, int(AddressSpace.HOST), 2, 3, 64, 0, 0)
+    view = struct.pack("<QIIII", 8, 1, 4, 1, DataType.FLOAT32.value)
+    locator = b"\x01" + struct.pack("<Ii9Q", int(RemoteAddressSpace.REMOTE_DEVICE), 3, 11, 8, 16, 0, 0, 1, 0, 0, 0)
+    return struct.pack("<II", 1, 0) + descriptor + view + locator + struct.pack("<I", 0)
+
+
+def test_registered_host_decodes_without_payload_or_placement_change():
+    args = decode_remote_task_args(_registered_host_args())
+    tensor = args.tensors[0]
+    assert tensor.mapping_ref == 0
+    assert tensor.buffer.address_space == AddressSpace.HOST
+    assert tensor.byte_offset == 8 and tensor.buffer.nbytes == 64
+    assert tensor.buffer.identity.owner_instance_id == b"creator1"
+    assert args.remote_desc[0].desc is not None
+    assert args.remote_desc[0].desc.address_space == RemoteAddressSpace.REMOTE_DEVICE
+    assert args.inline_payload == b""
+
+
+def test_remote_frame_keeps_version_four_and_rejects_version_five():
+    frame = bytearray(encode_frame(FrameHeader(FrameType.HEALTH, 1, 2, 3), b""))
+    assert struct.unpack_from("<I", frame, 4)[0] == 4
+    struct.pack_into("<I", frame, 4, 5)
+    with pytest.raises(ValueError, match="unsupported frame version"):
+        decode_frame(bytes(frame))
+
+
+def test_remote_materializer_rejects_endpoint_local_mapping():
+    from simpler.buffer import buffer_reference  # noqa: PLC0415
+    from simpler.remote_l3_protocol import RemoteTaskArgsWire  # noqa: PLC0415
+    from simpler.remote_l3_session import _materialize_task_args, _RemoteBufferEntry  # noqa: PLC0415
+
+    plain = decode_remote_task_args(_registered_host_args())
+    tensor = plain.tensors[0]._with_mapping_ref(1)
+    backing = buffer_reference(tensor.buffer)
+    locator = plain.remote_desc[0].desc
+    assert locator is not None
+    entry = _RemoteBufferEntry(backing, backing.nbytes, 1, locator.address_space, borrowed_domain=(7, 1))
+    args = RemoteTaskArgsWire((tensor,), plain.remote_desc, (), b"")
+    with pytest.raises(ValueError, match="endpoint-local mapping"):
+        _materialize_task_args(
+            args,
+            {(11, 1): entry},
+            3,
+            mint_inline_buffer=lambda _: pytest.fail("endpoint-local mapping allocated inline storage"),
+        )

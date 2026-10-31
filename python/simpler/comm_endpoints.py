@@ -618,6 +618,7 @@ class AdapterProfile(str, Enum):
     # Buffer candidate/service judgment as the profiles used by region planning.
     FORK_INHERITED_VA = "FORK_INHERITED_VA"
     DEVICE_LOCAL = "DEVICE_LOCAL"
+    FABRIC_MAP = "FABRIC_MAP"
     # A host endpoint reaching a chip-owned `DEVICE_MALLOC` Buffer by asking that chip to copy. The
     # planner has no counterpart because `_backend_kind_for_provider` never gives a region a
     # `DEVICE_MALLOC` Buffer; the `VMM_WINDOW` half of the same relation is `HOST_VMM_COPY`.

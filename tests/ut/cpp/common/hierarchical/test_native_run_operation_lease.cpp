@@ -100,7 +100,7 @@ int stub_release_domain(void *, uint64_t, size_t, uint32_t) {
     ++g_comm_free_calls;
     return 0;
 }
-int stub_release_global_domain(uint64_t) {
+int stub_release_global_domain(uint64_t, uint32_t) {
     ++g_comm_free_calls;
     return 0;
 }
@@ -818,7 +818,7 @@ TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeard
         const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
         ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
         worker.base_comm_handle_ = comm;
-        worker.global_domain_ids_.insert(7);
+        worker.global_domain_ids_.emplace(7, 0);
         const auto module = worker.runtime_module_;
         worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
         ChipStorageTaskArgs args{};
@@ -870,6 +870,33 @@ TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeard
         EXPECT_EQ(g_device_finalize_calls, 2);
         EXPECT_EQ(g_comm_free_calls, 0);
     }
+}
+
+TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsHostDomainContextAcrossCloseRetries) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_global_domain_release_fn_ = stub_release_global_domain;
+    worker.global_domain_ids_.emplace(7, COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC);
+    const auto module = worker.runtime_module_;
+    const auto context = worker.device_ctx_;
+    worker.run_lane_ = std::make_unique<ChipRunLane>(worker);
+    ChipStorageTaskArgs args{};
+    ChipRun run = worker.run_lane_->submit(1, args, CallConfig{});
+    g_wait_rc = -5;
+    EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), std::runtime_error);
+    ASSERT_TRUE(worker.run_lane_->poisoned());
+    EXPECT_EQ(worker.unproven_native_run_count(), 0u);
+
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_THROW(worker.comm_global_domain_release(7, 1), std::runtime_error);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_destroy_context_calls, 0);
+    EXPECT_EQ(g_comm_free_calls, 0);
+    EXPECT_EQ(worker.device_ctx_, context);
+    EXPECT_EQ(worker.global_domain_ids_.count(7), 1u);
+    EXPECT_FALSE(module->unload_allowed_);
 }
 
 // A run the sweep could not prove destroyed still owns whatever its carrier holds, and that

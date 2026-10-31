@@ -212,7 +212,7 @@ def kernel_symbol_runtime(tmp_path_factory):
         ensure_acl_ready_ctx create_comm_stream_ctx destroy_comm_stream_ctx comm_init comm_alloc_windows
         comm_get_local_window_base comm_get_window_size comm_derive_context comm_alloc_domain_windows
         comm_release_domain_windows comm_global_domain_prepare comm_global_domain_import
-        comm_global_domain_release comm_barrier comm_destroy
+        comm_global_domain_release comm_global_domain_window comm_global_domain_copy comm_barrier comm_destroy
     """.split()
     cache = {}
     next_library_id = 0

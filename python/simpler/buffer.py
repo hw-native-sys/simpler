@@ -945,7 +945,7 @@ _RESOLVERS: dict[AdapterProfile, Callable[[BufferDescriptor], tuple[int, SharedM
 
 @dataclass
 class ImportedBuffer:
-    """A buffer materialized into the consumer's address space: identity -> local base.
+    """A consumer's confirmed backing attachment or operation binding.
 
     ``profile`` names the materialization mechanism and ``capabilities`` names the operations this
     endpoint may perform through it.  They are deliberately separate from the wire
@@ -966,6 +966,7 @@ class ImportedBuffer:
     descriptor: BufferDescriptor | None = None
     profile: AdapterProfile | None = None
     capabilities: frozenset[BufferCapability] = frozenset()
+    live: Callable[[], bool] | None = None
 
 
 @dataclass
@@ -1076,9 +1077,18 @@ class ImportContext:
     device_owner_instance_id: bytes | None = None
 
 
+def _import_key(identity: CanonicalIdentity, mapping: int) -> Any:
+    if isinstance(mapping, bool):
+        raise TypeError("ImportRegistry: mapping reference must be an integer")
+    mapping = operator.index(mapping)
+    if not 0 <= mapping <= 255:
+        raise ValueError("ImportRegistry: mapping reference must be in [0, 255]")
+    return (identity, mapping) if mapping else identity
+
+
 class ImportRegistry:
     """Per-consumer-endpoint lazy import cache: materialize a ``Tensor``'s embedded descriptor to a
-    local base on first receipt (map-once), keyed by canonical identity.
+    local base on first receipt (map-once), keyed by canonical identity and optional mapping selector.
 
     A consumer calls ``materialize`` for each tensor's embedded descriptor as it arrives; the first
     sight of an identity maps its backing into this process, later sights reuse the cached base
@@ -1091,10 +1101,55 @@ class ImportRegistry:
     """
 
     def __init__(self, context: ImportContext) -> None:
-        self._by_identity: dict[CanonicalIdentity, ImportedBuffer] = {}
+        self._by_identity: dict[Any, ImportedBuffer] = {}
         self._context = context
 
-    def materialize(self, desc: BufferDescriptor) -> ImportedBuffer:
+    def register_borrowed(
+        self,
+        descriptor: BufferDescriptor,
+        base: int,
+        *,
+        mapping: int = 0,
+        live: Callable[[], bool] | None = None,
+    ) -> None:
+        """Install a confirmed Fabric attachment or copy binding without owning its backing.
+
+        Host bindings have no VA; device bindings use a confirmed VA and mapping reference.
+        Access follows the existing domain lifecycle through ``live``.
+        """
+        key = _import_key(descriptor.identity, mapping)
+        if isinstance(base, bool):
+            raise TypeError("Fabric binding base must be an integer")
+        base = operator.index(base)
+        if (
+            descriptor.address_space not in (AddressSpace.HOST, AddressSpace.DEVICE)
+            or descriptor.backend_kind != BackendKind.REMOTE_SIDECAR
+            or self._context.deployment not in ((DEVICE_AICORE, DEVICE_AICPU) if mapping else (HOST_CPU,))
+            or (not 0 < base <= (1 << 64) - descriptor.nbytes if mapping else base != 0)
+        ):
+            raise ValueError(
+                "Fabric binding requires a host copy operation or a device mapping reference and nonzero VA"
+            )
+        if any(isinstance(k, tuple) and k[0] == descriptor.identity and k != key for k in self._by_identity):
+            raise ValueError("Fabric backing already has a different target on this endpoint")
+        cached = self._by_identity.get(key)
+        if cached is not None:
+            if cached.descriptor != descriptor or cached.base != base:
+                raise ValueError("borrowed mapping conflicts with an existing import")
+            return
+        kind = AdapterKind.DIRECT_MAP if base else AdapterKind.OWNER_DELEGATED_COPY
+        self._by_identity[key] = ImportedBuffer(
+            descriptor.identity,
+            base,
+            descriptor.nbytes,
+            AddressSpace.DEVICE if base else descriptor.address_space,
+            descriptor=descriptor,
+            profile=AdapterProfile.FABRIC_MAP,
+            capabilities=capabilities_for_adapter(kind, descriptor.access),
+            live=live,
+        )
+
+    def materialize(self, desc: BufferDescriptor, *, mapping: int = 0) -> ImportedBuffer:
         """Map ``desc``'s backing into this process on first sight of its identity; reuse the
         cached ImportedBuffer thereafter (map-once).
 
@@ -1113,20 +1168,23 @@ class ImportRegistry:
         that reaches the backing without producing an address is refused *here* rather than there --
         this returns a mapping, and that is the only narrowing it applies to the judgment.
         """
-        key = desc.identity
+        key = _import_key(desc.identity, mapping)
         cached = self._by_identity.get(key)
         if cached is not None:
-            # Field-wise, so wire padding and the unused tail of `body` do not make one backing look
-            # like two. The mapping that exists wins: it is the one already handed out, and callers
-            # may hold addresses into it.
-            if cached.descriptor is not None and cached.descriptor != desc:
-                raise ValueError(
-                    f"ImportRegistry: identity {desc.identity} is already materialized from a "
-                    f"different descriptor ({_descriptor_delta(cached.descriptor, desc)}); one "
-                    f"identity names one backing, so the mapping already handed out is kept and "
-                    f"this is refused"
+            cached = self.require(desc, mapping=mapping)
+            if cached.base == 0:
+                raise _refuse(
+                    "ImportRegistry",
+                    RegionAccessReasonCode.NO_IMPLEMENTED_DIRECT_MAP_PROBE,
+                    f"{desc.identity} has an OWNER_DELEGATED_COPY binding with no local address",
                 )
+            direct = {BufferCapability.DIRECT_LOAD, BufferCapability.DIRECT_STORE}
+            missing = (capabilities_for_adapter(AdapterKind.DIRECT_MAP, desc.access) & direct) - cached.capabilities
+            if missing:
+                raise ValueError(f"ImportRegistry: mapping does not grant {', '.join(cap.value for cap in missing)}")
             return cached
+        if mapping:
+            raise ValueError("Fabric mapping has no live grant on this endpoint")
         kind, profile = select_adapter(desc, self._context)
         resolver = _RESOLVERS.get(profile)
         if resolver is None:
@@ -1152,14 +1210,15 @@ class ImportRegistry:
         self._by_identity[key] = imported
         return imported
 
-    def materialize_args(self, args) -> dict[CanonicalIdentity, tuple[int, int]]:
+    def materialize_args(self, args) -> dict[Any, tuple[int, int]]:
         """Materialize every embedded descriptor in a ``TaskArgs`` and return the resolved map:
         identity -> (local base, address_space), scoped to this call's own tensors."""
-        resolved: dict[CanonicalIdentity, tuple[int, int]] = {}
+        resolved: dict[Any, tuple[int, int]] = {}
         for i in range(args.tensor_count()):
-            desc = args.tensor(i).buffer
-            imported = self.materialize(desc)
-            resolved[desc.identity] = (imported.base, int(imported.address_space))
+            tensor = args.tensor(i)
+            desc, mapping = tensor.buffer, tensor.mapping_ref
+            imported = self.materialize(desc, mapping=mapping) if mapping else self.materialize(desc)
+            resolved[_import_key(desc.identity, mapping)] = (imported.base, int(imported.address_space))
         return resolved
 
     def mapped_args_from_blob(self, blob_ptr: int, capacity: int) -> MappedArgs:
@@ -1172,7 +1231,7 @@ class ImportRegistry:
         tensors = []
         for i in range(args.tensor_count()):
             t = args.tensor(i)
-            if t.buffer.address_space == AddressSpace.DEVICE:
+            if t.buffer.address_space == AddressSpace.DEVICE or t.mapping_ref:
                 # Depth behind the submit-time endpoint check: this process is a host compute leaf, so
                 # a device address here would be handed to torch as a host pointer.
                 raise ValueError(
@@ -1184,10 +1243,14 @@ class ImportRegistry:
 
     def require(
         self,
-        identity: CanonicalIdentity,
+        identity: CanonicalIdentity | BufferDescriptor,
         need: BufferCapability | str | None = None,
+        *,
+        mapping: int = 0,
+        offset: int = 0,
+        nbytes: int | None = None,
     ) -> ImportedBuffer:
-        """The already-materialized import for ``identity``, optionally requiring one capability.
+        """Validate an installed binding's lifecycle, descriptor, capability and byte range.
 
         This is a pure lookup: it never maps as a side effect, so an identity this endpoint has not
         materialized raises ``KeyError``. Missing identity and insufficient capability are
@@ -1195,9 +1258,24 @@ class ImportRegistry:
         selecting a different operation adapter.
         """
 
-        imported = self._by_identity.get(identity)
+        descriptor = identity if isinstance(identity, BufferDescriptor) else None
+        identity = descriptor.identity if descriptor is not None else identity
+        imported = self._by_identity.get(_import_key(identity, mapping))
         if imported is None:
             raise KeyError(f"ImportRegistry: no buffer registered for {identity}")
+        if imported.live is not None and not imported.live():
+            raise ValueError(f"ImportRegistry: binding for {identity} is not live")
+        if descriptor is not None and imported.descriptor is not None and imported.descriptor != descriptor:
+            raise ValueError(
+                f"ImportRegistry: identity {identity} conflicts with a different descriptor "
+                f"({_descriptor_delta(imported.descriptor, descriptor)}); one identity names one backing"
+            )
+        if isinstance(offset, bool) or isinstance(nbytes, bool):
+            raise TypeError("ImportRegistry: byte range must use integers")
+        offset = operator.index(offset)
+        count = imported.nbytes - offset if nbytes is None else operator.index(nbytes)
+        if offset < 0 or count < 0 or offset > imported.nbytes or count > imported.nbytes - offset:
+            raise ValueError(f"ImportRegistry: byte range exceeds the backing for {identity}")
         if need is None:
             return imported
         try:
@@ -1225,12 +1303,12 @@ class ImportRegistry:
         before that point is a mapping nothing can reach to retry — so the raise leaves the entry
         in place for this registry's own ``close()`` to attempt again.
         """
-        imported = self._by_identity.get(identity)
-        if imported is None:
-            return
-        if imported.shm is not None:
-            imported.shm.close()
-        del self._by_identity[identity]
+        for key in list(self._by_identity):
+            if (key[0] if isinstance(key, tuple) else key) == identity:
+                imported = self._by_identity[key]
+                if imported.shm is not None:
+                    imported.shm.close()
+                del self._by_identity[key]
 
     def close(self) -> None:
         """Close every mapping this endpoint made. Consumer-side only — unlinking belongs to the

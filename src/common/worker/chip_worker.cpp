@@ -451,6 +451,8 @@ void ChipWorker::init(
         comm_global_domain_prepare_fn_ = module->required<CommGlobalDomainPrepareFn>("comm_global_domain_prepare");
         comm_global_domain_import_fn_ = module->required<CommGlobalDomainImportFn>("comm_global_domain_import");
         comm_global_domain_release_fn_ = module->required<CommGlobalDomainReleaseFn>("comm_global_domain_release");
+        comm_global_domain_window_fn_ = module->required<CommGlobalDomainWindowFn>("comm_global_domain_window");
+        comm_global_domain_copy_fn_ = module->required<CommGlobalDomainCopyFn>("comm_global_domain_copy");
         comm_barrier_fn_ = module->required<CommBarrierFn>("comm_barrier");
         comm_destroy_fn_ = module->required<CommDestroyFn>("comm_destroy");
         kernel_supported_fn = module->required<KernelSupportedFn>("simpler_kernel_mode_supported");
@@ -789,19 +791,30 @@ void ChipWorker::finalize() {
         );
     }
     if (comm_reclamation_unconfirmed_) {
-        // Carrier destruction does not prove device users stopped. Keep comm
-        // owners and their code alive, but allow the device's reset path below.
+        // Carrier destruction does not prove device users stopped. Host domains
+        // retain the context; HBM-only owners stay alive across device reset.
         if ((!comm_sessions_.empty() || !global_domain_ids_.empty()) && runtime_module_ != nullptr) {
             runtime_module_->retain_until_process_exit();
+        }
+        for (const auto &[domain_id, profile] : global_domain_ids_) {
+            if (profile != 0)
+                throw std::runtime_error("ChipWorker::finalize: Host domain users unconfirmed; keeping context loaded");
         }
     } else {
         // Release windows while the host runtime and device context are alive.
         if (comm_global_domain_release_fn_ != nullptr) {
-            for (uint64_t domain_id : global_domain_ids_) {
-                comm_global_domain_release_fn_(domain_id);
+            for (const auto &[domain_id, profile] : global_domain_ids_) {
+                if (comm_global_domain_release_fn_(domain_id, 0) != 0 && profile != 0)
+                    throw std::runtime_error("ChipWorker::finalize: domain ownership unproven; keeping context loaded");
             }
         }
         global_domain_ids_.clear();
+        if (global_domain_copy_stream_) {
+            int rc = 0;
+            destroy_comm_stream_best_effort(global_domain_copy_stream_, &rc);
+            if (rc) throw std::runtime_error("domain copy stream destruction failed; keeping context loaded");
+            global_domain_copy_stream_ = nullptr;
+        }
         clear_comm_sessions();
     }
 
@@ -906,6 +919,8 @@ void ChipWorker::clear_runtime_binding(bool release_device_reservation) {
     comm_global_domain_prepare_fn_ = nullptr;
     comm_global_domain_import_fn_ = nullptr;
     comm_global_domain_release_fn_ = nullptr;
+    comm_global_domain_window_fn_ = nullptr;
+    comm_global_domain_copy_fn_ = nullptr;
     comm_barrier_fn_ = nullptr;
     comm_destroy_fn_ = nullptr;
     set_retain_runs_fn_ = nullptr;
@@ -2384,27 +2399,25 @@ void ChipWorker::comm_release_domain_windows(
 }
 
 std::tuple<std::vector<uint8_t>, uint64_t, size_t> ChipWorker::comm_global_domain_prepare(
-    uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile
+    uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
+    bool host_enabled
 ) {
     if (comm_global_domain_prepare_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_prepare is not supported by this runtime");
     }
-    auto [tracked, inserted] = global_domain_ids_.insert(domain_id);
+    auto [tracked, inserted] = global_domain_ids_.emplace(domain_id, host_enabled ? profile : 0);
     if (!inserted) {
         throw std::runtime_error("comm_global_domain_prepare received a duplicate domain_id");
     }
     CommGlobalDomainDescriptor descriptor{};
     uint64_t local_window_base = 0;
     int rc = comm_global_domain_prepare_fn_(
-        domain_id, domain_rank, rank_count, window_size, profile, &descriptor, &local_window_base
+        domain_id, domain_rank, rank_count, window_size, profile, host_enabled, &descriptor, &local_window_base
     );
     if (rc != 0) {
-        global_domain_ids_.erase(tracked);
         throw std::runtime_error("comm_global_domain_prepare failed with code " + std::to_string(rc));
     }
     if (local_window_base == 0 || descriptor.mapping_size == 0) {
-        comm_global_domain_release_fn_(domain_id);
-        global_domain_ids_.erase(domain_id);
         throw std::runtime_error("comm_global_domain_prepare returned an invalid window");
     }
     const auto *begin = reinterpret_cast<const uint8_t *>(&descriptor);
@@ -2433,16 +2446,37 @@ uint64_t ChipWorker::comm_global_domain_import(uint64_t domain_id, const std::ve
     return device_ctx;
 }
 
-void ChipWorker::comm_global_domain_release(uint64_t domain_id) {
+void ChipWorker::comm_global_domain_release(uint64_t domain_id, uint32_t stage) {
     require_comm_reclamation_safe();
     if (comm_global_domain_release_fn_ == nullptr) {
         throw std::runtime_error("comm_global_domain_release is not supported by this runtime");
     }
-    int rc = comm_global_domain_release_fn_(domain_id);
+    int rc = comm_global_domain_release_fn_(domain_id, stage);
     if (rc != 0) {
         throw std::runtime_error("comm_global_domain_release failed with code " + std::to_string(rc));
     }
-    global_domain_ids_.erase(domain_id);
+    if (stage != 1) global_domain_ids_.erase(domain_id);
+}
+
+std::pair<uint64_t, size_t> ChipWorker::comm_global_domain_window(uint64_t id, uint32_t slot) {
+    uint64_t base = 0;
+    size_t size = 0;
+    if (!comm_global_domain_window_fn_ || comm_global_domain_window_fn_(id, slot, &base, &size) != 0)
+        throw std::runtime_error("domain window is not live");
+    return {base, size};
+}
+
+void ChipWorker::comm_global_domain_copy(uint64_t id, uint64_t dst_va, uint64_t src_va, size_t bytes) {
+    if (!comm_global_domain_copy_fn_) throw std::runtime_error("domain copy is unavailable");
+    auto domain = global_domain_ids_.find(id);
+    if (domain == global_domain_ids_.end() || domain->second == 0)
+        throw std::runtime_error("domain copy requires a live Host-enabled domain");
+    if (domain->second != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM) {
+        if (!global_domain_copy_stream_) global_domain_copy_stream_ = create_comm_stream_checked("domain copy");
+        if (!global_domain_copy_stream_) throw std::runtime_error("domain copy stream creation failed");
+    }
+    int rc = comm_global_domain_copy_fn_(id, dst_va, src_va, bytes, global_domain_copy_stream_);
+    if (rc) throw std::runtime_error("domain copy failed with code " + std::to_string(rc));
 }
 
 void ChipWorker::comm_barrier(uint64_t comm_handle) {

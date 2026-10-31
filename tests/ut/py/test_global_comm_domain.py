@@ -49,6 +49,7 @@ from simpler.global_comm_domain import (
     GLOBAL_DOMAIN_DESCRIPTOR_BYTES,
     GLOBAL_DOMAIN_MAX_ATTACHMENTS,
     GLOBAL_DOMAIN_MAX_BUFFERS,
+    GLOBAL_DOMAIN_MAX_RANKS,
     GLOBAL_DOMAIN_PROFILE_IDS,
     GLOBAL_DOMAIN_VERSION,
     GlobalCommInitCommand,
@@ -292,7 +293,7 @@ def test_committed_buffer_wire_uses_native_descriptor_validation(remote, corrupt
     elif corruption == "generation":
         struct.pack_into("<I", wire, 24, 0)
     elif corruption == "count":
-        wire *= 4097
+        wire *= GLOBAL_DOMAIN_MAX_RANKS * (GLOBAL_DOMAIN_MAX_BUFFERS + 1) + 1
     if corruption:
         with pytest.raises((RuntimeError, ValueError)):
             decode_domain_buffer_refs(bytes(wire))
@@ -904,7 +905,9 @@ def test_mixed_local_remote_import_failure_rolls_back_local_node(monkeypatch):
                     rank_count,
                     profile_id,
                     window_size,
+                    host_enabled,
                 ) = LOCAL_PREPARE_REQUEST.unpack_from(payload, 0)
+                assert not host_enabled
                 descriptor = GlobalDomainDescriptor(
                     version=GLOBAL_DOMAIN_VERSION,
                     profile_id=profile_id,
@@ -1257,6 +1260,32 @@ def _local_node_domain_commands():
     return prepare, imported
 
 
+@pytest.mark.parametrize("suffix", [False, True])
+def test_hbm_prepare_collector_preserves_descriptor_only_contract(monkeypatch, suffix):
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    prepare, imported = _local_node_domain_commands()
+    reply = encode_descriptor_table(imported.descriptors)
+    if suffix:
+        reply += encode_domain_buffer_refs(
+            [(buffer_reference(wrap_vmm_window(4096, 64, b"original", 1)).to_descriptor(), 0, 0)]
+        )
+    worker = Worker(level=4, num_sub_workers=0)
+    monkeypatch.setattr(worker, "_global_domain_control", lambda *_args: reply)
+    prepared = []
+    try:
+        if suffix:
+            with pytest.raises(ValueError, match="unexpected Buffer reference suffix"):
+                worker._collect_global_domain_buffers(prepare, (0,), prepared)
+        else:
+            descriptors, buffers = worker._collect_global_domain_buffers(prepare, (0,), prepared)
+            assert descriptors == imported.descriptors
+            assert buffers == {0: {}, 1: {}}
+        assert prepared == [0] and not worker._child_alloc
+    finally:
+        worker.close()
+
+
 def test_node_import_failure_rolls_back_partial_local_ranks_and_uses_configured_timeout():
     from simpler.worker import (  # noqa: PLC0415
         CTRL_GLOBAL_DOMAIN_IMPORT,
@@ -1358,6 +1387,7 @@ def test_node_import_reuses_prepared_attachment_row_for_view(corruption):
         assert state.command.attachments == prepare.attachments
         assert state.view is not None
         assert state.view.attachments == prepare.attachments_for_node(0)
+        assert all(member.buffers is state.contexts[member.local_worker_id].buffers for member in state.command.members)
 
         identities = tuple(
             state.contexts[member.local_worker_id].buffers["payload"].identity for member in commit.members
