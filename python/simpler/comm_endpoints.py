@@ -18,7 +18,7 @@ from enum import Enum, IntEnum
 from types import MappingProxyType
 from typing import Protocol
 
-from _task_interface import OWNER_INSTANCE_ID_BYTES, BackendKind  # pyright: ignore[reportMissingImports]
+from _task_interface import OWNER_INSTANCE_ID_BYTES, AddressSpace, BackendKind  # pyright: ignore[reportMissingImports]
 
 EndpointId = int
 NodeScopeId = int
@@ -605,10 +605,12 @@ class AdapterKind(str, Enum):
 class AdapterProfile(str, Enum):
     """How a consumer reaches a Buffer — the mechanism, not the wire backend tag."""
 
-    # `HOST_SVM_MAP` currently has no implemented producer. It remains a named mechanism so the
-    # service can reject it explicitly instead of conflating it with an unknown profile.
+    # The generic region planner does not infer Host registration from a backing alone.
     HOST_SVM_MAP = "HOST_SVM_MAP"
     HOST_VMM_COPY = "HOST_VMM_COPY"
+    # Process-local owner binding registered after allocation, not a region-planner
+    # candidate or a GlobalDomainCommand profile. It has no wire profile id.
+    HOST_VMM_MAP = "HOST_VMM_MAP"
     DEVICE_VMM_PEER_IMPORT = "DEVICE_VMM_PEER_IMPORT"
     DEVICE_FABRIC_V2_PEER_IMPORT = "DEVICE_FABRIC_V2_PEER_IMPORT"
     REMOTE_COPY = "REMOTE_COPY"
@@ -701,6 +703,7 @@ class BufferAccessQuery:
     Provider selection, region layout, and concrete Buffer authorization happen before this query.
     ``same_endpoint`` distinguishes a Buffer already local to the consumer from a same-node peer;
     backend plus deployment alone cannot distinguish DEVICE_LOCAL from DEVICE_PEER.
+    ``confirmed_profile`` is an internal backend result, never a wire-supplied mapping grant.
     """
 
     backend_kind: BackendKind
@@ -709,6 +712,8 @@ class BufferAccessQuery:
     same_endpoint: bool = False
     platform: str | None = None
     runtime: str | None = None
+    confirmed_profile: AdapterProfile | None = None
+    source_address_space: AddressSpace | None = None
 
 
 @dataclass(frozen=True)
@@ -809,6 +814,21 @@ class DefaultRegionAccessService:
         query: BufferAccessQuery,
         candidate: _AdapterCandidate,
     ) -> RegionAccessDecision:
+        if query.confirmed_profile is not None:
+            offered = any(
+                offered.kind is candidate.kind
+                and offered.profile is candidate.profile
+                and offered.unsupported_reason is None
+                for offered in buffer_adapter_candidates(query)
+            )
+            if offered and candidate.unsupported_reason is None:
+                return _region_access_supported(query, candidate)
+            return _region_access_unsupported(
+                RegionAccessReasonCode.UNSUPPORTED_ENDPOINT_RELATION,
+                candidate.unsupported_reason or "confirmed adapter does not match this backend and consumer relation",
+                query,
+                candidate,
+            )
         if query.backend_kind is BackendKind.REMOTE_SIDECAR:
             return _region_access_unsupported(
                 RegionAccessReasonCode.UNSUPPORTED_BACKEND_KIND,
@@ -1061,9 +1081,38 @@ def buffer_adapter_candidates(query: BufferAccessQuery) -> tuple[_AdapterCandida
     the exclusion is structural rather than merely unimplemented it stays here instead, so that an
     injected service cannot override it.
     """
+    if query.confirmed_profile is not None:
+        profile = query.confirmed_profile
+        device = query.consumer_deployment in (DEVICE_AICORE, DEVICE_AICPU)
+        supported = (
+            query.source_address_space == AddressSpace.HOST
+            and query.same_node
+            and query.runtime in ("host_build_graph", "tensormap_and_ringbuffer")
+            and (
+                (profile is AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT and device and query.platform == "a2a3")
+                or (
+                    profile is AdapterProfile.HOST_SHM_MAP
+                    and query.consumer_deployment in (HOST_CPU, DEVICE_AICORE, DEVICE_AICPU)
+                    and query.platform == "a2a3sim"
+                )
+                or (
+                    profile is AdapterProfile.HOST_VMM_MAP
+                    and query.consumer_deployment is HOST_CPU
+                    and query.platform == "a2a3"
+                )
+            )
+        )
+        return (
+            _AdapterCandidate(
+                AdapterKind.DIRECT_MAP,
+                profile,
+                None if supported else "confirmed Host mapping profile does not match this source and consumer",
+            ),
+        )
     if query.backend_kind is BackendKind.REMOTE_SIDECAR:
         return _explicit_transfer_candidates(
-            "REMOTE_SIDECAR is resolved by its remote session, never by a local materializer"
+            "REMOTE_SIDECAR requires an explicit endpoint attachment or transport binding; "
+            "generic mapping is unavailable"
         )
     if query.consumer_deployment is HOST_CPU:
         return _host_consumer_candidates(query.backend_kind, query.same_node)

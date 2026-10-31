@@ -408,8 +408,14 @@ class Buffer:
         return Tensor(self, shapes=shapes, dtype=dtype, strides=strides, byte_offset=byte_offset)
 
     def close(self) -> None:
-        """Release the backing. The owner unlinks it, so a later consumer map fails rather than
-        resolving a name whose bytes are gone. Idempotent; a released Buffer's ``tensor()``/
+        """Revoke this handle and release storage owned directly by it.
+
+        Domain Host handles borrow storage from their resource owner: close only
+        revokes this handle; domain.release / Worker.release_buffer performs view
+        and backing cleanup after accepted users finish. A profile or alias does
+        not transfer ownership. Directly owned shared storage is unlinked so a later
+        consumer map fails rather than resolving a name whose bytes are gone. Idempotent;
+        a released Buffer's ``tensor()``/
         ``to_descriptor()`` are refused rather than building a view over memory that may already be
         gone — that refusal holds from the first call on, whether or not the release itself
         succeeded, since a partly-released backing is no safer to hand out than a fully released one.
@@ -818,7 +824,12 @@ _BUFFER_ACCESS_SERVICE = DefaultRegionAccessService()
 
 
 def select_adapter(
-    desc: BufferDescriptor, context: ImportContext, *, where: str = "ImportRegistry"
+    desc: BufferDescriptor,
+    context: ImportContext,
+    *,
+    where: str = "ImportRegistry",
+    confirmed_profile: AdapterProfile | None = None,
+    mapped: bool = False,
 ) -> tuple[AdapterKind, AdapterProfile]:
     """The mechanism ``context``'s endpoint reaches ``desc``'s backing by -- mapping or not.
 
@@ -863,12 +874,16 @@ def select_adapter(
         # preparing args for a device endpoint. DEVICE buffers use the endpoint deployment from
         # the fork-time context. This preserves the distinction between materializing a local shm
         # name here and planning a POSIX_SHM attachment for an AICPU/AICore endpoint.
-        consumer_deployment=context.deployment if desc.address_space == AddressSpace.DEVICE else HOST_CPU,
+        consumer_deployment=context.deployment if mapped or desc.address_space == AddressSpace.DEVICE else HOST_CPU,
         same_node=True,
         # A device descriptor reaching a device materializer has already passed the owner-side
         # exact-worker check. Region planning sets this false for consumer attachments, which is
         # what distinguishes DEVICE_LOCAL from a same-node DEVICE_PEER over the same backend.
         same_endpoint=desc.address_space == AddressSpace.DEVICE and context.deployment in (DEVICE_AICORE, DEVICE_AICPU),
+        platform=context.platform,
+        runtime=context.runtime,
+        confirmed_profile=confirmed_profile,
+        source_address_space=desc.address_space,
     )
     last_decision = None
     for candidate in buffer_adapter_candidates(query):
@@ -966,6 +981,9 @@ class ImportedBuffer:
     descriptor: BufferDescriptor | None = None
     profile: AdapterProfile | None = None
     capabilities: frozenset[BufferCapability] = frozenset()
+    live: Callable[[], bool] | None = None
+    execution_environment: tuple[int, int, int, int, bool] | None = None
+    closing: bool = False
 
 
 @dataclass
@@ -1074,6 +1092,10 @@ class ImportContext:
 
     deployment: EndpointDeployment
     device_owner_instance_id: bytes | None = None
+    platform: str | None = None
+    runtime: str | None = None
+    execution_environment: tuple[int, int, int, int, bool] | None = None
+    current_environment: Callable[[], tuple[int, int, int, int, bool] | None] | None = None
 
 
 class ImportRegistry:
@@ -1093,6 +1115,128 @@ class ImportRegistry:
     def __init__(self, context: ImportContext) -> None:
         self._by_identity: dict[CanonicalIdentity, ImportedBuffer] = {}
         self._context = context
+        self._attachments: dict[tuple[CanonicalIdentity, int], ImportedBuffer] = {}
+
+    def register_attachment(
+        self,
+        descriptor: BufferDescriptor,
+        base: int,
+        *,
+        mapping_ref: int,
+        profile: AdapterProfile,
+        live: Callable[[], bool],
+        access: AccessMode | None = None,
+    ) -> None:
+        """Register a backend-confirmed address in this endpoint's current context.
+
+        Zero selects native Host access (including explicit H2D at a chip endpoint);
+        nonzero selects a Device address. Only confirmed direct mappings belong here.
+        The domain owns physical cleanup and revokes admission before unregistering.
+        Neither a Tensor selector nor an unregistered descriptor can create a grant.
+        """
+        if isinstance(mapping_ref, bool) or not 0 <= operator.index(mapping_ref) <= 255:
+            raise ValueError("mapping reference must be in [0, 255]")
+        if isinstance(base, bool) or not 0 < operator.index(base) <= (1 << 64) - descriptor.nbytes:
+            raise ValueError("attachment requires a nonempty uint64 address range")
+        deployments = (DEVICE_AICPU, DEVICE_AICORE) if mapping_ref else (HOST_CPU, DEVICE_AICPU, DEVICE_AICORE)
+        if self._context.deployment not in deployments or not live():
+            raise ValueError("attachment requires a live matching endpoint")
+        if not mapping_ref and descriptor.address_space != AddressSpace.HOST:
+            raise ValueError("native Host attachment requires HOST backing")
+        environment = None
+        if mapping_ref:
+            environment = self._context.execution_environment
+            if (
+                not isinstance(environment, tuple)
+                or len(environment) != 5
+                or environment[0] != os.getpid()
+                or self._context.current_environment is None
+                or self._context.current_environment() != environment
+            ):
+                raise ValueError("attachment requires the current target execution environment")
+        kind, profile = select_adapter(descriptor, self._context, confirmed_profile=profile, mapped=bool(mapping_ref))
+        for item in (*self._by_identity.values(), *self._attachments.values()):
+            if item.identity == descriptor.identity and item.descriptor != descriptor:
+                raise ValueError("one identity names one backing descriptor")
+        granted = capabilities_for_adapter(kind, descriptor.access)
+        if access is not None:
+            requested = capabilities_for_adapter(AdapterKind.DIRECT_MAP, AccessMode(access))
+            if not requested <= granted:
+                raise ValueError("attachment grant exceeds source grant")
+            granted = requested
+        key = (descriptor.identity, mapping_ref)
+        old = self._attachments.get(key)
+        if old is not None:
+            if (
+                old.base != base
+                or old.profile != profile
+                or old.capabilities != granted
+                or old.execution_environment != environment
+                or not self._attachment_is_live(old)
+            ):
+                raise ValueError("attachment conflicts with an existing mapping")
+            return
+        self._attachments[key] = ImportedBuffer(
+            descriptor.identity,
+            base,
+            descriptor.nbytes,
+            AddressSpace.DEVICE if mapping_ref else AddressSpace.HOST,
+            descriptor=descriptor,
+            profile=profile,
+            capabilities=granted,
+            live=live,
+            execution_environment=environment,
+        )
+
+    def _attachment_is_live(self, attachment: ImportedBuffer) -> bool:
+        if (
+            attachment.closing
+            or attachment.live is None
+            or not attachment.live()
+            or (
+                attachment.execution_environment is not None
+                and (
+                    attachment.execution_environment[0] != os.getpid()
+                    or self._context.current_environment is None
+                    or self._context.current_environment() != attachment.execution_environment
+                )
+            )
+        ):
+            attachment.closing = True
+            return False
+        return True
+
+    def close_attachment(self, identity: CanonicalIdentity, mapping_ref: int) -> None:
+        """Revoke one view, retaining its record until the backing is unregistered."""
+        attachment = self._attachments.get((identity, mapping_ref))
+        if attachment is not None:
+            attachment.closing = True
+
+    def has_active_attachments(self, identity: CanonicalIdentity) -> bool:
+        """Whether this backing still has a live mapped device view in this context."""
+        return any(
+            key[0] == identity and key[1] != 0 and self._attachment_is_live(attachment)
+            for key, attachment in self._attachments.items()
+        )
+
+    def require_mapping_access(self, tensor: Tensor, access: AccessMode) -> None:
+        imported = self.resolve_tensor(tensor)
+        required = capabilities_for_adapter(AdapterKind.DIRECT_MAP, access)
+        if not required <= imported.capabilities:
+            raise ValueError("selected mapping grant does not cover argument access")
+
+    def resolve_tensor(self, tensor: Tensor) -> ImportedBuffer:
+        """Resolve the selected attachment without changing the backing descriptor."""
+        desc = tensor.buffer
+        key = (desc.identity, tensor.mapping_ref)
+        attachment = self._attachments.get(key)
+        if attachment is not None:
+            if attachment.descriptor != desc or not self._attachment_is_live(attachment):
+                raise ValueError("Tensor attachment is not live or its descriptor differs")
+            return attachment
+        if tensor.mapping_ref or desc.backend_kind == BackendKind.REMOTE_SIDECAR:
+            raise ValueError("Tensor has no granted attachment on this endpoint")
+        return self.materialize(desc)
 
     def materialize(self, desc: BufferDescriptor) -> ImportedBuffer:
         """Map ``desc``'s backing into this process on first sight of its identity; reuse the
@@ -1113,6 +1257,9 @@ class ImportRegistry:
         that reaches the backing without producing an address is refused *here* rather than there --
         this returns a mapping, and that is the only narrowing it applies to the judgment.
         """
+        for attachment in self._attachments.values():
+            if attachment.identity == desc.identity and attachment.descriptor != desc:
+                raise ValueError("one identity names one backing descriptor")
         key = desc.identity
         cached = self._by_identity.get(key)
         if cached is not None:
@@ -1152,14 +1299,19 @@ class ImportRegistry:
         self._by_identity[key] = imported
         return imported
 
-    def materialize_args(self, args) -> dict[CanonicalIdentity, tuple[int, int]]:
-        """Materialize every embedded descriptor in a ``TaskArgs`` and return the resolved map:
-        identity -> (local base, address_space), scoped to this call's own tensors."""
-        resolved: dict[CanonicalIdentity, tuple[int, int]] = {}
+    def materialize_args(self, args) -> dict[Any, tuple[int, int]]:
+        """Resolve each argument's selected view; native and mapped views may coexist."""
         for i in range(args.tensor_count()):
-            desc = args.tensor(i).buffer
-            imported = self.materialize(desc)
-            resolved[desc.identity] = (imported.base, int(imported.address_space))
+            tensor = args.tensor(i)
+            if tensor.mapping_ref:
+                if args.transfer(i) != TensorTransfer.NONE:
+                    raise ValueError("mapped arguments require transfer NONE")
+        resolved: dict[Any, tuple[int, int]] = {}
+        for i in range(args.tensor_count()):
+            tensor = args.tensor(i)
+            imported = self.resolve_tensor(tensor)
+            key = (tensor.buffer.identity, tensor.mapping_ref) if tensor.mapping_ref else tensor.buffer.identity
+            resolved[key] = (imported.base, int(imported.address_space))
         return resolved
 
     def mapped_args_from_blob(self, blob_ptr: int, capacity: int) -> MappedArgs:
@@ -1172,14 +1324,14 @@ class ImportRegistry:
         tensors = []
         for i in range(args.tensor_count()):
             t = args.tensor(i)
-            if t.buffer.address_space == AddressSpace.DEVICE:
+            if t.buffer.address_space == AddressSpace.DEVICE or t.mapping_ref:
                 # Depth behind the submit-time endpoint check: this process is a host compute leaf, so
                 # a device address here would be handed to torch as a host pointer.
                 raise ValueError(
                     f"sub-worker argument {i} is a DEVICE-space tensor "
                     f"({t.buffer.backend_kind.name}); it cannot be mapped into a host process"
                 )
-            tensors.append(MappedArg(self.materialize(t.buffer), t.byte_offset, t.shapes, t.strides, t.dtype))
+            tensors.append(MappedArg(self.resolve_tensor(t), t.byte_offset, t.shapes, t.strides, t.dtype))
         return MappedArgs(tensors, tuple(args.scalar(i) for i in range(args.scalar_count())))
 
     def require(
@@ -1225,6 +1377,9 @@ class ImportRegistry:
         before that point is a mapping nothing can reach to retry — so the raise leaves the entry
         in place for this registry's own ``close()`` to attempt again.
         """
+        for key in tuple(self._attachments):
+            if key[0] == identity:
+                del self._attachments[key]
         imported = self._by_identity.get(identity)
         if imported is None:
             return
@@ -1241,6 +1396,7 @@ class ImportRegistry:
         error is raised once the sweep is done, so a caller still learns the endpoint leaked rather
         than seeing a silent success.
         """
+        self._attachments.clear()
         errors: list[BaseException] = []
         for identity, imported in list(self._by_identity.items()):
             if imported.shm is not None:

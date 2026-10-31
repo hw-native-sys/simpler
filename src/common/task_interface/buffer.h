@@ -23,8 +23,8 @@
  *                              built over the buffer.
  *   - Tensor                 : the argument an L3+ TaskArgs carries, and the element its mailbox
  *                              blob transports. Embeds the full BufferDescriptor plus a view
- *                              (byte_offset, shape, strides, dtype) — self-describing, so a consumer
- *                              materializes it lazily on receipt with no prior handshake. Carries no
+ *                              (byte_offset, shape, strides, dtype). Ordinary backends materialize
+ *                              lazily; REMOTE_SIDECAR requires an explicit binding. Carries no
  *                              address; the consuming endpoint materializes it into the
  *                              GM-address-bearing `ChipTensor` of tensor.h, the distinct device POD
  *                              the L2 runtime reads.
@@ -85,8 +85,9 @@ enum class AccessMode : uint8_t {
 };
 
 // Materialization backend of a buffer. The consumer resolves a Tensor to a local address via the
-// import registry keyed by canonical identity; this tag selects how. REMOTE_SIDECAR is reserved for
-// P2 and rejected on decode in P1. Values 0–5 are frozen; VMM_SHAREABLE is 6; 7.. reserved
+// import registry keyed by canonical identity; this tag selects how. REMOTE_SIDECAR is an
+// address-free canonical descriptor requiring an explicit endpoint attachment or transport binding;
+// it cannot be lazily mapped from the descriptor alone. Values 0–6 are frozen; 7.. reserved
 // (unknown tag => reject).
 //
 // FORK_SHM and FORK_COW materialize identically — the body is a base VA the child already has,
@@ -161,8 +162,9 @@ struct CanonicalIdentityHash {
 
 /**
  * The owner's self-describing buffer descriptor — embedded whole in every Tensor built over the
- * buffer. A consumer materializes it lazily on first receipt (no separate export handshake) and
- * caches `canonical identity -> local base` (map-once). `backend_kind` + `body[0, body_len)` carry
+ * buffer. Ordinary backends materialize lazily on first receipt; REMOTE_SIDECAR requires an explicit
+ * endpoint attachment or transport binding. A consumer caches `canonical identity -> local base`
+ * (map-once). `backend_kind` + `body[0, body_len)` carry
  * the per-backend materialization (POSIX shm name, fork-inherited VA, device VA, ...).
  * `magic` leads as a cheap discriminator; `address_space` / `access` / `backend_kind` are raw u8 so
  * an unknown value can be rejected without invoking undefined enum behavior.
@@ -212,9 +214,9 @@ inline bool operator!=(const BufferDescriptor &a, const BufferDescriptor &b) { r
 
 /**
  * The blob-carried, self-describing wire element: a full embedded buffer descriptor plus a strided
- * view onto it. Because the descriptor travels with the tensor, a consumer needs no prior handshake
- * — it materializes the embedded `buffer` (backend selects how) on first receipt, keyed by
+ * view onto it. A consumer materializes ordinary backends on first receipt, keyed by
  * `buffer.identity`, and reuses the cached base for later tensors over the same identity.
+ * REMOTE_SIDECAR requires an explicit endpoint attachment or transport binding.
  *
  * Invariants:
  *   - Carries NO materialized address. The consumer materializes `buffer` to a local base, then
@@ -231,8 +233,15 @@ struct Tensor {
     uint32_t shapes[MAX_TENSOR_DIMS];
     uint32_t strides[MAX_TENSOR_DIMS];
     DataType dtype;
-    uint8_t _pad[3];
+    uint8_t _pad[1];
+    uint8_t mapping_ref;  // Zero selects the native view; nonzero selects a confirmed endpoint attachment.
+    uint8_t _reserved;    // Must be zero on construction and decode.
 };
+
+inline const char *tensor_transfer_error(const Tensor &tensor, TensorTransfer transfer) {
+    if (tensor.mapping_ref && transfer != TensorTransfer::NONE) return "mapping requires transfer NONE";
+    return tensor_transfer_error(static_cast<AddressSpace>(tensor.buffer.address_space), transfer);
+}
 
 // Saturating u64 arithmetic. Every input below is wire-supplied, and `shapes[i]` and `strides[i]`
 // are each u32, so one product alone reaches ~2^64: an unsaturated sum would wrap to a SMALL extent
@@ -286,8 +295,8 @@ inline uint64_t tensor_extent_bytes(const Tensor &r) {
  * `CanonicalIdentity` gets structurally, and the body itself is checked against the schema its
  * `backend_kind` implies. Throws `std::invalid_argument` naming the field.
  *
- * `REMOTE_SIDECAR` is a legal wire value and passes: an arg bound for a remote worker rides the wire
- * with no local backing, and it is *materialization* that refuses it in P1.
+ * `REMOTE_SIDECAR` is a legal address-free wire value; materialization requires an explicit endpoint
+ * attachment or transport binding for its canonical identity.
  */
 inline void validate_buffer_descriptor(const BufferDescriptor &h) {
     auto reject = [](const char *what) {
@@ -369,8 +378,8 @@ inline void validate_buffer_descriptor(const BufferDescriptor &h) {
         break;
     }
     case BackendKind::REMOTE_SIDECAR:
-        // The authoritative descriptor rides in the per-task sidecar, so nothing belongs here.
-        if (h.body_len != 0) reject("invalid BufferDescriptor: REMOTE_SIDECAR carries no body in P1");
+        // Endpoint attachments and transport bindings are separate from the canonical descriptor.
+        if (h.body_len != 0) reject("invalid BufferDescriptor: REMOTE_SIDECAR carries no body");
         break;
     }
 
@@ -410,6 +419,7 @@ inline void validate_tensor(const Tensor &r) {
 
     validate_buffer_descriptor(h);
 
+    if (r._reserved != 0) reject("invalid Tensor: reserved byte must be zero");
     if (r.ndims == 0 || r.ndims > static_cast<uint32_t>(MAX_TENSOR_DIMS)) reject("invalid Tensor: ndims out of range");
     if (r.dtype >= DataType::DATA_TYPE_NUM) reject("invalid Tensor: unknown dtype");
     const uint64_t elem = get_element_size(r.dtype);
@@ -629,3 +639,6 @@ static_assert(offsetof(Tensor, ndims) == 96);
 static_assert(offsetof(Tensor, shapes) == 100);
 static_assert(offsetof(Tensor, strides) == 120);
 static_assert(offsetof(Tensor, dtype) == 140);
+
+static_assert(offsetof(Tensor, mapping_ref) == 142);
+static_assert(offsetof(Tensor, _reserved) == 143);

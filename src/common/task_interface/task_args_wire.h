@@ -78,7 +78,7 @@ public:
     }
 
     void add_tensor(const Tensor &t, TensorArgType tag, TensorTransfer transfer) {
-        if (const char *error = tensor_transfer_error(static_cast<AddressSpace>(t.buffer.address_space), transfer)) {
+        if (const char *error = tensor_transfer_error(t, transfer)) {
             throw std::invalid_argument(error);
         }
         if (!scalars_.empty()) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
@@ -98,8 +98,7 @@ public:
 
     TensorTransfer transfer(int32_t i) const {
         const auto request = transfers_.at(static_cast<size_t>(i));
-        if (const char *error =
-                tensor_transfer_error(static_cast<AddressSpace>(tensor(i).buffer.address_space), request)) {
+        if (const char *error = tensor_transfer_error(tensor(i), request)) {
             throw std::invalid_argument(error);
         }
         return request;
@@ -112,7 +111,7 @@ public:
 };
 
 // The mailbox argument slot reserves one byte of the view padding for the invocation request.
-// Tensor itself remains a view: standalone Tensor serialization leaves all three bytes padding.
+// Byte 142 carries mapping_ref; byte 143 is reserved and must be zero.
 inline constexpr size_t TASK_ARG_TRANSFER_OFFSET = offsetof(Tensor, _pad);
 static_assert(TASK_ARG_TRANSFER_OFFSET == 141, "mailbox transfer offset is wire ABI");
 
@@ -152,7 +151,7 @@ struct TaskArgsView {
         const auto request = static_cast<TensorTransfer>(
             tensor_bytes[static_cast<size_t>(i) * sizeof(Tensor) + TASK_ARG_TRANSFER_OFFSET]
         );
-        if (const char *error = tensor_transfer_error(static_cast<AddressSpace>(t.buffer.address_space), request)) {
+        if (const char *error = tensor_transfer_error(t, request)) {
             throw std::invalid_argument(error);
         }
         return request;
@@ -171,7 +170,8 @@ struct TaskArgsView {
 // total bytes used:           8 + 144T + 8S
 //
 // Each slot carries the self-describing `Tensor` view and its invocation transfer, so a
-// consumer resolves it with no prior handshake. A chip child materializes each one to a
+// consumer resolves ordinary backends lazily; REMOTE_SIDECAR requires an explicit binding.
+// A chip child materializes each one to a
 // `ChipTensor` (address-bearing) and assembles a `ChipStorageTaskArgs` for the runtime.so ABI.
 
 inline constexpr size_t TASK_ARGS_BLOB_HEADER_SIZE = 8;

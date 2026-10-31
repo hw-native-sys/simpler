@@ -34,12 +34,29 @@ class CommDomainRef:
 
 
 @dataclass(frozen=True)
+class HostWindowSpec:
+    """One local Host allocation shared by the domain's NPU members."""
+
+    nbytes: int
+    numa_id: int = 0
+
+    def __post_init__(self):
+        for value in (self.nbytes, self.numa_id):
+            if isinstance(value, bool):
+                raise TypeError("Host window size and NUMA id must be integers")
+            operator.index(value)
+        if not 0 < self.nbytes < 2**63 or self.nbytes % 64 or not 0 <= self.numa_id < 2**32:
+            raise ValueError("Host window requires positive 64-byte-aligned size and uint32 NUMA id")
+
+
+@dataclass(frozen=True)
 class DomainConfig:
     members: tuple
     window_size: int
     buffers: tuple
     retain_after_run: bool
     topology: tuple
+    host_window: HostWindowSpec | None = None
 
     @classmethod
     def capture(cls, members, window_size, buffers, retain_after_run, topology):
