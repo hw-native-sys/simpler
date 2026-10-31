@@ -2339,7 +2339,7 @@ uint64_t ChipWorker::comm_derive_context(
 
 std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
-    size_t window_size
+    size_t window_size, uint32_t workspace_mask
 ) {
     if (comm_alloc_domain_windows_fn_ == nullptr) {
         throw std::runtime_error("comm_alloc_domain_windows is not supported by this runtime");
@@ -2358,7 +2358,7 @@ std::tuple<uint64_t, uint64_t, size_t> ChipWorker::comm_alloc_domain_windows(
     size_t actual_window_size = 0;
     int rc = comm_alloc_domain_windows_fn_(
         reinterpret_cast<void *>(comm_handle), allocation_id, rank_ids.data(), rank_ids.size(), domain_rank,
-        window_size, &device_ctx, &local_window_base, &actual_window_size
+        window_size, workspace_mask, &device_ctx, &local_window_base, &actual_window_size
     );
     if (rc != 0) {
         throw std::runtime_error("comm_alloc_domain_windows failed with code " + std::to_string(rc));

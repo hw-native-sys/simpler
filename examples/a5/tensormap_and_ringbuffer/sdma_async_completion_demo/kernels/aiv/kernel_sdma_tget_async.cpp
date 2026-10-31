@@ -45,7 +45,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int rank = static_cast<int>(comm_ctx->rankId);
     int nranks = static_cast<int>(comm_ctx->rankNum);
     // A null workspace indicates that host-side SDMA provisioning failed.
-    if (nranks != 2 || comm_ctx->workSpace == 0) {
+    if (nranks != 2 || comm_workspace<CommWorkspaceKind::SDMA>(*comm_ctx).addr == 0) {
         pipe_barrier(PIPE_ALL);
         return;
     }
@@ -66,7 +66,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     AsyncCtx async_ctx = get_async_ctx(args);
     send_request_entry(
-        async_ctx,
-        SdmaTget(local_global, remote_global, scratch_tile, reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace))
+        async_ctx, SdmaTget(
+                       local_global, remote_global, scratch_tile,
+                       reinterpret_cast<__gm__ uint8_t *>(comm_workspace<CommWorkspaceKind::SDMA>(*comm_ctx).addr)
+                   )
     );
 }

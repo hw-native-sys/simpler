@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 
 #if defined(__CPU_SIM)
 // PTOAS v0.50+ emits cache_line_t::ENTIRE_DATA_CACHE / SINGLE_CACHE_LINE as
@@ -97,8 +98,8 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
 }
 
 static __aicore__ void moe_signal_clear(
-    __gm__ float *v1, __gm__ int32_t *v2, __gm__ int32_t *v3, __gm__ int32_t *v4, __gm__ int64_t *v5,
-    __gm__ int64_t *v6, __gm__ int64_t *v7, int64_t v8
+    __gm__ float *v1, __gm__ int32_t *v2, __gm__ int32_t *v3, __gm__ int32_t *v4, __gm__ CommContext *v5,
+    __gm__ CommContext *v6, __gm__ CommContext *v7, int64_t v8
 ) {
     const int64_t v9 = 0;
     const int64_t v10 = 2;
@@ -184,13 +185,13 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         combine_arrived__ssa_v0_tensor->start_offset;
 
     // Unpack CommContext: arrived_ctx
-    __gm__ int64_t *arrived_ctx = reinterpret_cast<__gm__ int64_t *>(args[4]);
+    __gm__ CommContext *arrived_ctx = reinterpret_cast<__gm__ CommContext *>(args[4]);
 
     // Unpack CommContext: data_arrived_ctx
-    __gm__ int64_t *data_arrived_ctx = reinterpret_cast<__gm__ int64_t *>(args[5]);
+    __gm__ CommContext *data_arrived_ctx = reinterpret_cast<__gm__ CommContext *>(args[5]);
 
     // Unpack CommContext: combine_arrived_ctx
-    __gm__ int64_t *combine_arrived_ctx = reinterpret_cast<__gm__ int64_t *>(args[6]);
+    __gm__ CommContext *combine_arrived_ctx = reinterpret_cast<__gm__ CommContext *>(args[6]);
 
     // Extract dynamic dim: T_DYN
     int64_t T_DYN = static_cast<int64_t>(pre_hc_hidden_out__ssa_v0_tensor->shapes[0]);

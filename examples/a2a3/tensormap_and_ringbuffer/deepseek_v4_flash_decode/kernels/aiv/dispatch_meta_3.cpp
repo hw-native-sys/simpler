@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 
 #if defined(__CPU_SIM)
 // PTOAS v0.50+ emits cache_line_t::ENTIRE_DATA_CACHE / SINGLE_CACHE_LINE as
@@ -98,7 +99,7 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
 
 static __aicore__ void dispatch_meta_3(
     __gm__ int32_t *v1, __gm__ int32_t *v2, __gm__ int32_t *v3, __gm__ int32_t *v4, __gm__ int32_t *v5, int32_t v6,
-    int32_t v7, int32_t v8, __gm__ int64_t *v9, __gm__ int64_t *v10
+    int32_t v7, int32_t v8, __gm__ CommContext *v9, __gm__ CommContext *v10
 ) {
     pto::comm::WaitCmp v11 = pto::comm::WaitCmp::GE;
     pto::comm::NotifyOp v12 = pto::comm::NotifyOp::AtomicAdd;
@@ -169,13 +170,12 @@ static __aicore__ void dispatch_meta_3(
         }
         set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
         // pto: %21
-        int64_t v38 = (v9)[v17];
+        int64_t v38 = static_cast<int64_t>(v9->rankId);
         // pto: %22, %23, %24, %25
-        int64_t v39 = (v9)[(int64_t)((uint64_t)((int64_t)((int32_t)v38)) + (uint64_t)v14)];
+        int64_t v39 = static_cast<int64_t>(v9->windowsIn[v38]);
         // pto: %26
-        int64_t v40 = (int64_t)((uint64_t)i34 + (uint64_t)v14);
         // pto: %27
-        int64_t v41 = (v9)[v40];
+        int64_t v41 = static_cast<int64_t>(v9->windowsIn[i34]);
         // pto: %my_rank__ssa_v0_idx
         int64_t v42 = (int64_t)v7;
         // pto: %33
@@ -200,11 +200,11 @@ static __aicore__ void dispatch_meta_3(
         // pto: %35
         if (i34 != v42) {
             // pto: %36
-            int64_t v48 = (v10)[v17];
+            int64_t v48 = static_cast<int64_t>(v10->rankId);
             // pto: %37, %38, %39, %40
-            int64_t v49 = (v10)[(int64_t)((uint64_t)((int64_t)((int32_t)v48)) + (uint64_t)v14)];
+            int64_t v49 = static_cast<int64_t>(v10->windowsIn[v48]);
             // pto: %42
-            int64_t v50 = (v10)[v40];
+            int64_t v50 = static_cast<int64_t>(v10->windowsIn[i34]);
             // pto: %arrived__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 1, 1> v51 = pto::Shape<1, 1, 1, 1, 1>();
             // pto: %arrived__ssa_v0_peer_pview
@@ -322,10 +322,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int32_t last_moe_epoch_inline624__ssa_v0 = last_moe_epoch_inline624__ssa_v0_conv.val;
 
     // Unpack CommContext: recv_meta_ctx
-    __gm__ int64_t *recv_meta_ctx = reinterpret_cast<__gm__ int64_t *>(args[8]);
+    __gm__ CommContext *recv_meta_ctx = reinterpret_cast<__gm__ CommContext *>(args[8]);
 
     // Unpack CommContext: arrived_ctx
-    __gm__ int64_t *arrived_ctx = reinterpret_cast<__gm__ int64_t *>(args[9]);
+    __gm__ CommContext *arrived_ctx = reinterpret_cast<__gm__ CommContext *>(args[9]);
 
     // Forward to ptoas-generated function
     dispatch_meta_3(

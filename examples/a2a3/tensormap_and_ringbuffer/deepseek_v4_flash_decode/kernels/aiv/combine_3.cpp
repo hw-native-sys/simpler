@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 #include "intrinsic.h"
 
 #if defined(__CPU_SIM)
@@ -98,10 +99,9 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
 }
 
 static __aicore__ void combine_3(
-    __gm__ int32_t *v1, __gm__ int32_t *v2, __gm__ bfloat16_t *v3, __gm__ bfloat16_t *v4, __gm__ int64_t *v5,
+    __gm__ int32_t *v1, __gm__ int32_t *v2, __gm__ bfloat16_t *v3, __gm__ bfloat16_t *v4, __gm__ CommContext *v5,
     int32_t v6, int32_t v7
 ) {
-    const int64_t v8 = 4;
     const int64_t v9 = 4096;
     const int64_t v10 = 16;
     const int64_t v11 = 1;
@@ -146,11 +146,11 @@ static __aicore__ void combine_3(
             uint64_t v26 = (uint64_t)v14;
             TASSIGN(v25, v26);
             // pto: %11
-            int64_t v27 = (v5)[v13];
+            int64_t v27 = static_cast<int64_t>(v5->rankId);
             // pto: %12, %13, %14, %15
-            int64_t v28 = (v5)[(int64_t)((uint64_t)((int64_t)((int32_t)v27)) + (uint64_t)v8)];
+            int64_t v28 = static_cast<int64_t>(v5->windowsIn[v27]);
             // pto: %16, %17
-            int64_t v29 = (v5)[(int64_t)((uint64_t)i17 + (uint64_t)v8)];
+            int64_t v29 = static_cast<int64_t>(v5->windowsIn[i17]);
             // pto: %routed_y_buf__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 1, 4096> v30 = pto::Shape<1, 1, 1, 1, 4096>();
             // pto: %routed_y_buf__ssa_v0_peer_pview
@@ -230,7 +230,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         recv_y_flat_inline2828_inline12871__ssa_v0_tensor->start_offset;
 
     // Unpack CommContext: routed_y_buf_ctx
-    __gm__ int64_t *routed_y_buf_ctx = reinterpret_cast<__gm__ int64_t *>(args[4]);
+    __gm__ CommContext *routed_y_buf_ctx = reinterpret_cast<__gm__ CommContext *>(args[4]);
 
     // Forward to ptoas-generated function
     combine_3(

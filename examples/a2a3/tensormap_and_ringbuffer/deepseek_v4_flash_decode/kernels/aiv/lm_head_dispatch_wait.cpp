@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 
 #if defined(__CPU_SIM)
 // PTOAS v0.50+ emits cache_line_t::ENTIRE_DATA_CACHE / SINGLE_CACHE_LINE as
@@ -97,7 +98,7 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
 }
 
 static __aicore__ void
-lm_head_dispatch_wait(__gm__ bfloat16_t *v1, __gm__ int32_t *v2, int32_t v3, __gm__ int64_t *v4, int64_t v5) {
+lm_head_dispatch_wait(__gm__ bfloat16_t *v1, __gm__ int32_t *v2, int32_t v3, __gm__ CommContext *v4, int64_t v5) {
     pto::comm::WaitCmp v6 = pto::comm::WaitCmp::GE;
     const int64_t v7 = 0;
     const int64_t v8 = 2;
@@ -151,7 +152,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int32_t my_rank__ssa_v0 = my_rank__ssa_v0_conv.val;
 
     // Unpack CommContext: lm_head_hidden_done_ctx
-    __gm__ int64_t *lm_head_hidden_done_ctx = reinterpret_cast<__gm__ int64_t *>(args[3]);
+    __gm__ CommContext *lm_head_hidden_done_ctx = reinterpret_cast<__gm__ CommContext *>(args[3]);
 
     // Extract dynamic dim: T_DYN
     int64_t T_DYN = static_cast<int64_t>(x_out__rv_v2_tensor->shapes[0]);

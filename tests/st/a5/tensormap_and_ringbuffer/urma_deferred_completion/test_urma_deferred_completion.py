@@ -39,6 +39,7 @@ def urma_deferred_completion_orch_fn(orch, callables, task_args, config):
     elem_count = task_args.in_0.numel()
     input_nbytes = elem_count * DTYPE_NBYTES
     with orch.allocate_domain(
+        workspace_engines=("urma",),
         name="urma_deferred_completion",
         workers=list(range(NRANKS)),
         window_size=max(URMA_DATA_OFFSET_NBYTES + 2 * input_nbytes, 4 * 1024 * 1024),

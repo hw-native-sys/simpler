@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 #include "intrinsic.h"
 
 #if defined(__CPU_SIM)
@@ -98,7 +99,7 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
 }
 
 static __aicore__ void shared_routed_2(
-    __gm__ bfloat16_t *v1, __gm__ bfloat16_t *v2, __gm__ bfloat16_t *v3, int64_t v4, __gm__ int64_t *v5, int32_t v6,
+    __gm__ bfloat16_t *v1, __gm__ bfloat16_t *v2, __gm__ bfloat16_t *v3, int64_t v4, __gm__ CommContext *v5, int32_t v6,
     int32_t v7
 ) {
     RoundMode v8 = RoundMode::CAST_RINT;
@@ -312,7 +313,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int64_t active_tokens_inline2816_inline12042__phi_v4 = active_tokens_inline2816_inline12042__phi_v4_conv.val;
 
     // Unpack CommContext: routed_y_buf_ctx
-    __gm__ int64_t *routed_y_buf_ctx = reinterpret_cast<__gm__ int64_t *>(args[4]);
+    __gm__ CommContext *routed_y_buf_ctx = reinterpret_cast<__gm__ CommContext *>(args[4]);
 
     // Forward to ptoas-generated function
     shared_routed_2(

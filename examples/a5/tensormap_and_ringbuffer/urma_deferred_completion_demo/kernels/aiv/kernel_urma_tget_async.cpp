@@ -52,7 +52,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     // A null workspace means the host runtime was not built with the URMA
     // backend; self-skip rather than dereferencing it.
     if (comm_ctx == nullptr || comm_ctx->rankNum != 2 || comm_ctx->rankId >= comm_ctx->rankNum ||
-        comm_ctx->workSpace == 0 || comm_ctx->windowsIn[comm_ctx->rankId] == 0) {
+        comm_workspace<CommWorkspaceKind::URMA>(*comm_ctx).addr == 0 || comm_ctx->windowsIn[comm_ctx->rankId] == 0) {
         pipe_barrier(PIPE_ALL);
         return;
     }
@@ -62,7 +62,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     uint32_t peer_rank = 1u - comm_ctx->rankId;
     uint64_t input_offset = reinterpret_cast<uint64_t>(local_input) - comm_ctx->windowsIn[comm_ctx->rankId];
     __gm__ float *remote_input = pto2::urma_backend::peer_mr_ptr<float>(
-        reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace), peer_rank, input_offset
+        reinterpret_cast<__gm__ uint8_t *>(comm_workspace<CommWorkspaceKind::URMA>(*comm_ctx).addr), peer_rank,
+        input_offset
     );
 
     using FlatShape = Shape<1, 1, 1, 1, kElems>;
@@ -75,6 +76,9 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     AsyncCtx async_ctx = get_async_ctx(args);
     (void)send_request_entry(
         async_ctx,
-        UrmaTget(local_global, remote_global, reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace), peer_rank)
+        UrmaTget(
+            local_global, remote_global,
+            reinterpret_cast<__gm__ uint8_t *>(comm_workspace<CommWorkspaceKind::URMA>(*comm_ctx).addr), peer_rank
+        )
     );
 }

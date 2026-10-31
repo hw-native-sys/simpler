@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 #include "intrinsic.h"
 
 #if defined(__CPU_SIM)
@@ -99,7 +100,7 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
 
 static __aicore__ void lm_head_dispatch_push(
     __gm__ bfloat16_t *v1, __gm__ int32_t *v2, __gm__ bfloat16_t *v3, __gm__ bfloat16_t *v4, __gm__ int32_t *v5,
-    int32_t v6, __gm__ int64_t *v7, __gm__ int64_t *v8, int64_t v9, int32_t v10, int32_t v11
+    int32_t v6, __gm__ CommContext *v7, __gm__ CommContext *v8, int64_t v9, int32_t v10, int32_t v11
 ) {
     pto::comm::NotifyOp v12 = pto::comm::NotifyOp::AtomicAdd;
     const int32_t v13 = 1;
@@ -200,13 +201,12 @@ static __aicore__ void lm_head_dispatch_push(
         // pto: %13, %15, %16
         int64_t v41 = (int64_t)((uint64_t)((int64_t)((uint64_t)(v40 % v16) * (uint64_t)v17)) + (uint64_t)v21);
         // pto: %24
-        int64_t v42 = (v7)[v16];
+        int64_t v42 = static_cast<int64_t>(v7->rankId);
         // pto: %25, %26, %27, %28
-        int64_t v43 = (v7)[(int64_t)((uint64_t)((int64_t)((int32_t)v42)) + (uint64_t)v14)];
+        int64_t v43 = static_cast<int64_t>(v7->windowsIn[v42]);
         // pto: %20, %21, %23, %29, %30
-        int64_t v44 = (v7)[(int64_t)((uint64_t)((int64_t)((uint64_t)((int64_t)((uint64_t)(v40 / v16) * (uint64_t)v16)) +
-                                                          (uint64_t)i37)) +
-                                     (uint64_t)v14)];
+        int64_t v44 =
+            static_cast<int64_t>(v7->windowsIn[((int64_t)((uint64_t)(v40 / v16) * (uint64_t)v16)) + (uint64_t)i37]);
         // pto: %lm_head_hidden_window__ssa_v0_peer_pview
         pto::Shape<1, 1, 1, 1, 4096> v45 = pto::Shape<1, 1, 1, 1, 4096>();
         // pto: %lm_head_hidden_window__ssa_v0_peer_pview
@@ -238,14 +238,12 @@ static __aicore__ void lm_head_dispatch_push(
         // pto: %39
         if (i49 != v51) {
             // pto: %45
-            int64_t v52 = (v8)[v16];
+            int64_t v52 = static_cast<int64_t>(v8->rankId);
             // pto: %46, %47, %48, %49
-            int64_t v53 = (v8)[(int64_t)((uint64_t)((int64_t)((int32_t)v52)) + (uint64_t)v14)];
+            int64_t v53 = static_cast<int64_t>(v8->windowsIn[v52]);
             // pto: %41, %42, %44, %50, %51
             int64_t v54 =
-                (v8)[(int64_t)((uint64_t)((int64_t)((uint64_t)((int64_t)((uint64_t)(v50 / v16) * (uint64_t)v16)) +
-                                                    (uint64_t)i49)) +
-                               (uint64_t)v14)];
+                static_cast<int64_t>(v8->windowsIn[((int64_t)((uint64_t)(v50 / v16) * (uint64_t)v16)) + (uint64_t)i49]);
             // pto: %lm_head_hidden_done__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 1, 1> v55 = pto::Shape<1, 1, 1, 1, 1>();
             // pto: %lm_head_hidden_done__ssa_v0_peer_pview
@@ -310,10 +308,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int32_t my_rank__ssa_v0 = my_rank__ssa_v0_conv.val;
 
     // Unpack CommContext: lm_head_hidden_window_ctx
-    __gm__ int64_t *lm_head_hidden_window_ctx = reinterpret_cast<__gm__ int64_t *>(args[6]);
+    __gm__ CommContext *lm_head_hidden_window_ctx = reinterpret_cast<__gm__ CommContext *>(args[6]);
 
     // Unpack CommContext: lm_head_hidden_done_ctx
-    __gm__ int64_t *lm_head_hidden_done_ctx = reinterpret_cast<__gm__ int64_t *>(args[7]);
+    __gm__ CommContext *lm_head_hidden_done_ctx = reinterpret_cast<__gm__ CommContext *>(args[7]);
 
     // Extract dynamic dim: T_DYN
     int64_t T_DYN = static_cast<int64_t>(x_out__rv_v2_tensor->shapes[0]);

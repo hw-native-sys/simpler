@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 
 #if defined(__CPU_SIM)
 // PTOAS v0.50+ emits cache_line_t::ENTIRE_DATA_CACHE / SINGLE_CACHE_LINE as
@@ -96,7 +97,7 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
     dcci((__gm__ void *)ptr, cache_line_t::SINGLE_CACHE_LINE);
 }
 
-static __aicore__ void dispatch_wait(__gm__ int32_t *v1, __gm__ int32_t *v2, int32_t v3, __gm__ int64_t *v4) {
+static __aicore__ void dispatch_wait(__gm__ int32_t *v1, __gm__ int32_t *v2, int32_t v3, __gm__ CommContext *v4) {
     pto::comm::WaitCmp v5 = pto::comm::WaitCmp::GE;
     const int64_t v6 = 0;
     const int64_t v7 = 2;
@@ -151,7 +152,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int32_t my_rank__ssa_v0 = my_rank__ssa_v0_conv.val;
 
     // Unpack CommContext: data_arrived_ctx
-    __gm__ int64_t *data_arrived_ctx = reinterpret_cast<__gm__ int64_t *>(args[3]);
+    __gm__ CommContext *data_arrived_ctx = reinterpret_cast<__gm__ CommContext *>(args[3]);
 
     // Forward to ptoas-generated function
     dispatch_wait(indices_inline9286__ssa_v0, data_arrived__ssa_v0, my_rank__ssa_v0, data_arrived_ctx);

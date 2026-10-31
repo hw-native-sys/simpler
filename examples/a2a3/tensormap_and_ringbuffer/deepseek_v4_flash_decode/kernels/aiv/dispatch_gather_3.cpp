@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 #include "intrinsic.h"
 
 #if defined(__CPU_SIM)
@@ -99,8 +100,8 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
 
 static __aicore__ void dispatch_gather_3(
     __gm__ int8_t *v1, __gm__ int32_t *v2, __gm__ int8_t *v3, __gm__ float *v4, __gm__ float *v5, __gm__ float *v6,
-    __gm__ int32_t *v7, __gm__ int32_t *v8, __gm__ int64_t *v9, __gm__ int64_t *v10, __gm__ int64_t *v11, int32_t v12,
-    int32_t v13
+    __gm__ int32_t *v7, __gm__ int32_t *v8, __gm__ CommContext *v9, __gm__ CommContext *v10, __gm__ CommContext *v11,
+    int32_t v12, int32_t v13
 ) {
     const int64_t v14 = 16;
     const int64_t v15 = 8;
@@ -253,13 +254,13 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         recv_r_route_out_inline13100__ssa_v0_tensor->start_offset;
 
     // Unpack CommContext: recv_x_ctx
-    __gm__ int64_t *recv_x_ctx = reinterpret_cast<__gm__ int64_t *>(args[8]);
+    __gm__ CommContext *recv_x_ctx = reinterpret_cast<__gm__ CommContext *>(args[8]);
 
     // Unpack CommContext: recv_aux_ctx
-    __gm__ int64_t *recv_aux_ctx = reinterpret_cast<__gm__ int64_t *>(args[9]);
+    __gm__ CommContext *recv_aux_ctx = reinterpret_cast<__gm__ CommContext *>(args[9]);
 
     // Unpack CommContext: recv_route_ctx
-    __gm__ int64_t *recv_route_ctx = reinterpret_cast<__gm__ int64_t *>(args[10]);
+    __gm__ CommContext *recv_route_ctx = reinterpret_cast<__gm__ CommContext *>(args[10]);
 
     // Forward to ptoas-generated function
     dispatch_gather_3(

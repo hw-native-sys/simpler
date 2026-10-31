@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 #include "intrinsic.h"
 
 #if defined(__CPU_SIM)
@@ -99,8 +100,8 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
 
 static __aicore__ void dispatch_push_0(
     __gm__ int32_t *v1, __gm__ int8_t *v2, __gm__ int8_t *v3, __gm__ float *v4, __gm__ float *v5, __gm__ float *v6,
-    __gm__ int32_t *v7, __gm__ int32_t *v8, int32_t v9, int32_t v10, __gm__ int64_t *v11, __gm__ int64_t *v12,
-    __gm__ int64_t *v13, __gm__ int64_t *v14, int32_t v15, int32_t v16
+    __gm__ int32_t *v7, __gm__ int32_t *v8, int32_t v9, int32_t v10, __gm__ CommContext *v11, __gm__ CommContext *v12,
+    __gm__ CommContext *v13, __gm__ CommContext *v14, int32_t v15, int32_t v16
 ) {
     pto::comm::NotifyOp v17 = pto::comm::NotifyOp::AtomicAdd;
     const int32_t v18 = 1;
@@ -196,13 +197,12 @@ static __aicore__ void dispatch_push_0(
                 // pto: %18
                 int64_t v51 = v48 < v28 ? v28 : v48;
                 // pto: %20
-                int64_t v52 = (v11)[v24];
+                int64_t v52 = static_cast<int64_t>(v11->rankId);
                 // pto: %21, %22, %23, %24
-                int64_t v53 = (v11)[(int64_t)((uint64_t)((int64_t)((int32_t)v52)) + (uint64_t)v19)];
+                int64_t v53 = static_cast<int64_t>(v11->windowsIn[v52]);
                 // pto: %25
-                int64_t v54 = (int64_t)((uint64_t)v45 + (uint64_t)v19);
                 // pto: %26
-                int64_t v55 = (v11)[v54];
+                int64_t v55 = static_cast<int64_t>(v11->windowsIn[v45]);
                 // pto: %recv_x__ssa_v0_peer_pview
                 pto::Shape<1, 1, 1, 1, 4096> v56 = pto::Shape<1, 1, 1, 1, 4096>();
                 // pto: %recv_x__ssa_v0_peer_pview
@@ -246,11 +246,11 @@ static __aicore__ void dispatch_push_0(
                 v36.SetValue(v25, v64);
                 set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
                 // pto: %37
-                int64_t v65 = (v12)[v24];
+                int64_t v65 = static_cast<int64_t>(v12->rankId);
                 // pto: %38, %39, %40, %41
-                int64_t v66 = (v12)[(int64_t)((uint64_t)((int64_t)((int32_t)v65)) + (uint64_t)v19)];
+                int64_t v66 = static_cast<int64_t>(v12->windowsIn[v65]);
                 // pto: %43
-                int64_t v67 = (v12)[v54];
+                int64_t v67 = static_cast<int64_t>(v12->windowsIn[v45]);
                 // pto: %recv_aux__ssa_v0_peer_pview
                 pto::Shape<1, 1, 1, 1, 8> v68 = pto::Shape<1, 1, 1, 1, 8>();
                 // pto: %recv_aux__ssa_v0_peer_pview
@@ -273,11 +273,11 @@ static __aicore__ void dispatch_push_0(
                 v38.SetValue(v28, v72);
                 set_flag(PIPE_S, PIPE_MTE3, EVENT_ID1);
                 // pto: %53
-                int64_t v73 = (v13)[v24];
+                int64_t v73 = static_cast<int64_t>(v13->rankId);
                 // pto: %54, %55, %56, %57
-                int64_t v74 = (v13)[(int64_t)((uint64_t)((int64_t)((int32_t)v73)) + (uint64_t)v19)];
+                int64_t v74 = static_cast<int64_t>(v13->windowsIn[v73]);
                 // pto: %59
-                int64_t v75 = (v13)[v54];
+                int64_t v75 = static_cast<int64_t>(v13->windowsIn[v45]);
                 // pto: %recv_route__ssa_v0_peer_pview
                 pto::Shape<1, 1, 1, 1, 8> v76 = pto::Shape<1, 1, 1, 1, 8>();
                 // pto: %recv_route__ssa_v0_peer_pview
@@ -301,11 +301,11 @@ static __aicore__ void dispatch_push_0(
         // pto: %67
         if (i80 != v35) {
             // pto: %68
-            int64_t v81 = (v14)[v24];
+            int64_t v81 = static_cast<int64_t>(v14->rankId);
             // pto: %69, %70, %71, %72
-            int64_t v82 = (v14)[(int64_t)((uint64_t)((int64_t)((int32_t)v81)) + (uint64_t)v19)];
+            int64_t v82 = static_cast<int64_t>(v14->windowsIn[v81]);
             // pto: %73, %74
-            int64_t v83 = (v14)[(int64_t)((uint64_t)i80 + (uint64_t)v19)];
+            int64_t v83 = static_cast<int64_t>(v14->windowsIn[i80]);
             // pto: %data_arrived__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 1, 1> v84 = pto::Shape<1, 1, 1, 1, 1>();
             // pto: %data_arrived__ssa_v0_peer_pview
@@ -396,16 +396,16 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int32_t my_rank__ssa_v0 = my_rank__ssa_v0_conv.val;
 
     // Unpack CommContext: recv_x_ctx
-    __gm__ int64_t *recv_x_ctx = reinterpret_cast<__gm__ int64_t *>(args[10]);
+    __gm__ CommContext *recv_x_ctx = reinterpret_cast<__gm__ CommContext *>(args[10]);
 
     // Unpack CommContext: recv_aux_ctx
-    __gm__ int64_t *recv_aux_ctx = reinterpret_cast<__gm__ int64_t *>(args[11]);
+    __gm__ CommContext *recv_aux_ctx = reinterpret_cast<__gm__ CommContext *>(args[11]);
 
     // Unpack CommContext: recv_route_ctx
-    __gm__ int64_t *recv_route_ctx = reinterpret_cast<__gm__ int64_t *>(args[12]);
+    __gm__ CommContext *recv_route_ctx = reinterpret_cast<__gm__ CommContext *>(args[12]);
 
     // Unpack CommContext: data_arrived_ctx
-    __gm__ int64_t *data_arrived_ctx = reinterpret_cast<__gm__ int64_t *>(args[13]);
+    __gm__ CommContext *data_arrived_ctx = reinterpret_cast<__gm__ CommContext *>(args[13]);
 
     // Forward to ptoas-generated function
     dispatch_push_0(

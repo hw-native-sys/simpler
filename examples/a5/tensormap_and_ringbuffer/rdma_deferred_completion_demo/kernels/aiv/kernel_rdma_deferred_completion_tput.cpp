@@ -39,7 +39,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     uint32_t request_count = 1;
     pto2::rdma_backend::RdmaSubmitStatus submit_status = pto2::rdma_backend::submit_rdma_request_status(
         async_ctx, RdmaTput(
-                       remote_tput, local_send, rdma_scratch, reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace),
+                       remote_tput, local_send, rdma_scratch,
+                       reinterpret_cast<__gm__ uint8_t *>(comm_workspace<CommWorkspaceKind::RDMA>(*comm_ctx).addr),
                        peer, comm_ctx->rankId, 0
                    )
     );
@@ -54,7 +55,8 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         submit_status = pto2::rdma_backend::submit_rdma_request_status(
             async_ctx, RdmaTput(
                            remote_tput_tail, local_send_tail, rdma_scratch,
-                           reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace), peer, comm_ctx->rankId, 1
+                           reinterpret_cast<__gm__ uint8_t *>(comm_workspace<CommWorkspaceKind::RDMA>(*comm_ctx).addr),
+                           peer, comm_ctx->rankId, 1
                        )
         );
         if (submit_status != pto2::rdma_backend::RdmaSubmitStatus::OK) {

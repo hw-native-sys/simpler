@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 #include "intrinsic.h"
 
 #if defined(__CPU_SIM)
@@ -98,7 +99,7 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
 }
 
 static __aicore__ void
-lm_head_dispatch_gather(__gm__ bfloat16_t *v1, __gm__ bfloat16_t *v2, __gm__ int64_t *v3, int32_t v4, int32_t v5) {
+lm_head_dispatch_gather(__gm__ bfloat16_t *v1, __gm__ bfloat16_t *v2, __gm__ CommContext *v3, int32_t v4, int32_t v5) {
     const int64_t v6 = 512;
     const int64_t v7 = 16;
     const int64_t v8 = 0;
@@ -169,7 +170,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         owner_hiddens_inline50_inline13292__ssa_v0_tensor->start_offset;
 
     // Unpack CommContext: lm_head_hidden_window_ctx
-    __gm__ int64_t *lm_head_hidden_window_ctx = reinterpret_cast<__gm__ int64_t *>(args[2]);
+    __gm__ CommContext *lm_head_hidden_window_ctx = reinterpret_cast<__gm__ CommContext *>(args[2]);
 
     // Forward to ptoas-generated function
     lm_head_dispatch_gather(

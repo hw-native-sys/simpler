@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 
 #if defined(__CPU_SIM)
 // PTOAS v0.50+ emits cache_line_t::ENTIRE_DATA_CACHE / SINGLE_CACHE_LINE as
@@ -96,7 +97,7 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
     dcci((__gm__ void *)ptr, cache_line_t::SINGLE_CACHE_LINE);
 }
 
-static __aicore__ void combine_wait(__gm__ int32_t *v1, int32_t v2, __gm__ int64_t *v3) {
+static __aicore__ void combine_wait(__gm__ int32_t *v1, int32_t v2, __gm__ CommContext *v3) {
     pto::comm::WaitCmp v4 = pto::comm::WaitCmp::GE;
     pto::comm::NotifyOp v5 = pto::comm::NotifyOp::AtomicAdd;
     const int32_t v6 = 1;
@@ -115,11 +116,11 @@ static __aicore__ void combine_wait(__gm__ int32_t *v1, int32_t v2, __gm__ int64
         // pto: %1
         if (i11 != v12) {
             // pto: %2
-            int64_t v13 = (v3)[v10];
+            int64_t v13 = static_cast<int64_t>(v3->rankId);
             // pto: %3, %4, %5, %6
-            int64_t v14 = (v3)[(int64_t)((uint64_t)((int64_t)((int32_t)v13)) + (uint64_t)v7)];
+            int64_t v14 = static_cast<int64_t>(v3->windowsIn[v13]);
             // pto: %7, %8
-            int64_t v15 = (v3)[(int64_t)((uint64_t)i11 + (uint64_t)v7)];
+            int64_t v15 = static_cast<int64_t>(v3->windowsIn[i11]);
             // pto: %combine_arrived__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 1, 1> v16 = pto::Shape<1, 1, 1, 1, 1>();
             // pto: %combine_arrived__ssa_v0_peer_pview
@@ -171,7 +172,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int32_t my_rank__ssa_v0 = my_rank__ssa_v0_conv.val;
 
     // Unpack CommContext: combine_arrived_ctx
-    __gm__ int64_t *combine_arrived_ctx = reinterpret_cast<__gm__ int64_t *>(args[2]);
+    __gm__ CommContext *combine_arrived_ctx = reinterpret_cast<__gm__ CommContext *>(args[2]);
 
     // Forward to ptoas-generated function
     combine_wait(combine_arrived__ssa_v0, my_rank__ssa_v0, combine_arrived_ctx);

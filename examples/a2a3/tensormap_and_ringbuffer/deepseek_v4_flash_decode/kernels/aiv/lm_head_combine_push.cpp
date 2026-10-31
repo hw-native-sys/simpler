@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 #include "intrinsic.h"
 
 #if defined(__CPU_SIM)
@@ -98,7 +99,7 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
 }
 
 static __aicore__ void lm_head_combine_push(
-    __gm__ float *v1, __gm__ float *v2, __gm__ int32_t *v3, int32_t v4, __gm__ int64_t *v5, __gm__ int64_t *v6,
+    __gm__ float *v1, __gm__ float *v2, __gm__ int32_t *v3, int32_t v4, __gm__ CommContext *v5, __gm__ CommContext *v6,
     int32_t v7, int32_t v8
 ) {
     pto::comm::NotifyOp v9 = pto::comm::NotifyOp::AtomicAdd;
@@ -152,14 +153,12 @@ static __aicore__ void lm_head_combine_push(
             // pto: %7
             int64_t v33 = (int64_t)((uint64_t)v26 + (uint64_t)v30);
             // pto: %16
-            int64_t v34 = (v5)[v18];
+            int64_t v34 = static_cast<int64_t>(v5->rankId);
             // pto: %17, %18, %19, %20
-            int64_t v35 = (v5)[(int64_t)((uint64_t)((int64_t)((int32_t)v34)) + (uint64_t)v14)];
+            int64_t v35 = static_cast<int64_t>(v5->windowsIn[v34]);
             // pto: %12, %13, %15, %21, %22
             int64_t v36 =
-                (v5)[(int64_t)((uint64_t)((int64_t)((uint64_t)((int64_t)((uint64_t)(v24 / v18) * (uint64_t)v18)) +
-                                                    (uint64_t)i27)) +
-                               (uint64_t)v14)];
+                static_cast<int64_t>(v5->windowsIn[((int64_t)((uint64_t)(v24 / v18) * (uint64_t)v18)) + (uint64_t)i27]);
             // pto: %lm_head_logits_window__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 8, 2048> v37 = pto::Shape<1, 1, 1, 8, 2048>();
             // pto: %lm_head_logits_window__ssa_v0_peer_pview
@@ -212,14 +211,12 @@ static __aicore__ void lm_head_combine_push(
             // pto: %29
             int64_t v46 = (int64_t)((uint64_t)v26 + (uint64_t)v12);
             // pto: %38
-            int64_t v47 = (v5)[v18];
+            int64_t v47 = static_cast<int64_t>(v5->rankId);
             // pto: %39, %40, %41, %42
-            int64_t v48 = (v5)[(int64_t)((uint64_t)((int64_t)((int32_t)v47)) + (uint64_t)v14)];
+            int64_t v48 = static_cast<int64_t>(v5->windowsIn[v47]);
             // pto: %34, %35, %37, %43, %44
             int64_t v49 =
-                (v5)[(int64_t)((uint64_t)((int64_t)((uint64_t)((int64_t)((uint64_t)(v24 / v18) * (uint64_t)v18)) +
-                                                    (uint64_t)i27)) +
-                               (uint64_t)v14)];
+                static_cast<int64_t>(v5->windowsIn[((int64_t)((uint64_t)(v24 / v18) * (uint64_t)v18)) + (uint64_t)i27]);
             // pto: %50
             pto::Shape<1, 1, 1, 8, 1152> v50 = pto::Shape<1, 1, 1, 8, 1152>();
             // pto: %50
@@ -260,14 +257,12 @@ static __aicore__ void lm_head_combine_push(
         // pto: %55
         if (i57 != v25) {
             // pto: %61
-            int64_t v58 = (v6)[v18];
+            int64_t v58 = static_cast<int64_t>(v6->rankId);
             // pto: %62, %63, %64, %65
-            int64_t v59 = (v6)[(int64_t)((uint64_t)((int64_t)((int32_t)v58)) + (uint64_t)v14)];
+            int64_t v59 = static_cast<int64_t>(v6->windowsIn[v58]);
             // pto: %57, %58, %60, %66, %67
             int64_t v60 =
-                (v6)[(int64_t)((uint64_t)((int64_t)((uint64_t)((int64_t)((uint64_t)(v24 / v18) * (uint64_t)v18)) +
-                                                    (uint64_t)i57)) +
-                               (uint64_t)v14)];
+                static_cast<int64_t>(v6->windowsIn[((int64_t)((uint64_t)(v24 / v18) * (uint64_t)v18)) + (uint64_t)i57]);
             // pto: %lm_head_logits_done__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 1, 1> v61 = pto::Shape<1, 1, 1, 1, 1>();
             // pto: %lm_head_logits_done__ssa_v0_peer_pview
@@ -323,10 +318,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     int32_t my_rank__ssa_v0 = my_rank__ssa_v0_conv.val;
 
     // Unpack CommContext: lm_head_logits_window_ctx
-    __gm__ int64_t *lm_head_logits_window_ctx = reinterpret_cast<__gm__ int64_t *>(args[4]);
+    __gm__ CommContext *lm_head_logits_window_ctx = reinterpret_cast<__gm__ CommContext *>(args[4]);
 
     // Unpack CommContext: lm_head_logits_done_ctx
-    __gm__ int64_t *lm_head_logits_done_ctx = reinterpret_cast<__gm__ int64_t *>(args[5]);
+    __gm__ CommContext *lm_head_logits_done_ctx = reinterpret_cast<__gm__ CommContext *>(args[5]);
 
     // Forward to ptoas-generated function
     lm_head_combine_push(

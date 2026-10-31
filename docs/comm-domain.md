@@ -367,7 +367,7 @@ symmetric window is realized:
 | Window memory | POSIX shm + `ftruncate`, mmap'd per rank | a2a3: Fabric V2 handle exchange (`ACL_MEM_SHARE_HANDLE_TYPE_FABRIC`), falling back to VMM + shareable-handle IPC where Fabric is unsupported. a5: VMM shareable handles only. Cross-card P2P via `aclrtDeviceEnablePeerAccess` on both |
 | Subset barrier | shm-header atomic, `allocation_id`-scoped | file barriers, `allocation_id`-scoped |
 | Window init | window zeroed before the subset barrier (`memset`) | window zeroed before the handle is announced (`aclrtMemset`) |
-| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: SDMA by default, URMA or RDMA as an opt-in alternative |
+| Async-DMA workspace | opt-in per Worker (`enable_sdma`, provisions inert 16 KiB scratch without STARS streams) | a2a3: opt-in per Worker (`enable_sdma`); a5: domain-selected SDMA/URMA/RDMA; optional providers retain their build gates |
 
 The window is zero-initialized on both backends so scratch/signal protocols see
 a known starting state (matching the historical static-path contract).
@@ -426,13 +426,57 @@ gate is the platform, not the runtime. Only `tensormap_and_ringbuffer` is
 exercised with it, so host-build-graph's path from a provisioned address to a
 kernel's `get_dma_workspace` is unverified rather than closed. Simulation, a5,
 and provider-disabled builds fail Worker init fast when it is set. A5 provisions
-its communication-context SDMA workspace by default; this is separate from
+its communication-context SDMA workspace only when a domain explicitly requests it; this is separate from
 the Worker-level workspace mechanism controlled by `enable_sdma`.
 
-On a5, `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON` selects the HNS1825 RDMA
-workspace overlay instead. RDMA is mutually exclusive with the SDMA and URMA
-overlays because `CommContext` exposes a single `workSpace`/`workSpaceSize`
-pair. The first RDMA integration only supports `orch.allocate_domain()`
+On a5, `SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON` and
+`SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=ON` compile optional providers independently;
+both still default to OFF. SDMA is always compiled. Compilation alone creates
+no streams or domain resources. `allocate_domain` and `get_or_allocate_domain`
+create synchronous mapped-window communication by default, without initializing
+any asynchronous provider. `workspace_engines=("sdma", "urma")` or `("rdma",)`
+adds the requested asynchronous resources. An omitted parameter and an empty
+sequence have identical meaning and can reuse the same retained domain.
+The native `comm_alloc_domain_windows` takes the corresponding bitmask directly;
+zero requests synchronous mappings only. Explicit asynchronous engine selection
+is supported on L3 A5; A2/A3 keeps its Worker-owned SDMA path. Simulation and L4
+domains support synchronous mappings, with no domain-owned asynchronous engines.
+
+Each `CommContext` stores a POD array `workspaces`, indexed by
+`CommWorkspaceKind::{SDMA, URMA, RDMA}`. Kernels use
+`comm_workspace<CommWorkspaceKind::URMA>(*ctx)` (or the corresponding engine),
+whose template argument is checked at compile time. Host publication rejects
+out-of-range enum values before indexing. An absent backend has zero address
+and size.
+
+The context is simpler's own 1088-byte host/device ABI. Rank metadata starts
+at offset zero; there is no legacy workspace pair or PTO-compatible prefix.
+PTO session builders receive the chosen workspace address explicitly and do
+not parse this context. Rebuild host runtimes, bindings and kernels together;
+old context images and compiled consumers cannot be mixed with this layout.
+
+SDMA domains reference the shared CommHandle-owned manager; URMA/RDMA managers
+belong to individual dynamic domains. URMA/RDMA deferred-completion kernels
+remain specific to `tensormap_and_ringbuffer`; workspace storage does not add
+completion backends to `host_build_graph`. Domain cleanup does not release another
+domain's workspace or the shared SDMA resource.
+
+The workspace coverage is split by platform and execution layer:
+
+| Platform / layer | Supported behavior | Coverage |
+| ---------------- | ------------------ | -------- |
+| A5 host | SDMA plus optional URMA/RDMA providers in one build; RDMA uses a separate domain | All four provider combinations, domain isolation, initialization failure rollback and finalization in `tests/ut/py/test_comm_workspaces.py` |
+| A5 TMR | SDMA/URMA in one domain and one Worker | Ordered mixed DAG and same-kernel disjoint transfers in `urma_deferred_completion_demo` |
+| A5 completion scheduler | A task waits for every registered backend condition | Controlled SDMA-first / URMA-first completion and failure in `test_urma_completion_scheduler.cpp` |
+| A2/A3 | Existing Worker-owned SDMA and `enable_sdma` behavior | Existing SDMA and single-card prefetch tests; domain allocation does not provision SDMA |
+| Simulation | Communication windows and zero backend descriptors | Existing domain/window tests; explicit nonempty engine selections are rejected |
+
+The A5 mixed hardware examples use the full two-rank communicator. They do not
+qualify arbitrary URMA subset communicators or multiple producers sharing a
+peer queue. RDMA transfer examples exercise their own low-address domains;
+joint compilation alone does not qualify same-domain RDMA/SDMA/URMA requests.
+
+RDMA selection uses the HNS1825 backend. The RDMA integration only supports `orch.allocate_domain()`
 dynamic domains; it does not support `comm_derive_context()`, sim platforms,
 a2a3, or `host_build_graph`. RDMA kernels derive remote WQE addresses from the
 RDMA workspace peer MR base plus a local-window offset, not from
@@ -440,7 +484,7 @@ RDMA workspace peer MR base plus a local-window offset, not from
 `aclrtMalloc` buffer the HNS1825 NIC can DMA to, and peers are reached over
 RoCE by rkey + VA.
 
-**RDMA-only domain (caller precondition).** Under the RDMA overlay the domain
+**RDMA-only domain (caller precondition).** An RDMA domain's
 allocation path intentionally skips peer import and mapping: `windowsIn[peer]`
 stays zero for every remote rank, and there is no locally addressable mapped VA
 for a peer's window. A peer MR address (`rkey` + VA) is not a substitute — only

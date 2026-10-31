@@ -76,13 +76,14 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     const bool put = args[6] == 1;
     const uint32_t repeats = static_cast<uint32_t>(args[7]);
     AsyncCtx ctx = get_async_ctx(args);
-    if (comm == nullptr || comm->rankNum != 2 || comm->rankId >= 2 || comm->workSpace == 0 ||
-        comm->windowsIn[comm->rankId] == 0 || elems == 0 || repeats == 0) {
+    if (comm == nullptr || comm->rankNum != 2 || comm->rankId >= 2 ||
+        comm_workspace<CommWorkspaceKind::URMA>(*comm).addr == 0 || comm->windowsIn[comm->rankId] == 0 || elems == 0 ||
+        repeats == 0) {
         pto2::detail::defer_error(ctx, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
         pto2::detail::defer_flush(ctx);
         return;
     }
-    auto *workspace = reinterpret_cast<__gm__ uint8_t *>(comm->workSpace);
+    auto *workspace = reinterpret_cast<__gm__ uint8_t *>(comm_workspace<CommWorkspaceKind::URMA>(*comm).addr);
     const uint32_t peer = 1u - comm->rankId;
     auto *local = tensor_data(window_tensor);
     const uint64_t remote_offset =

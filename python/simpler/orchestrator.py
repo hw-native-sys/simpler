@@ -535,6 +535,7 @@ class Orchestrator:
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
         workers: Sequence[int] | None = None,
+        workspace_engines: Sequence[str] = (),
     ) -> CommDomainHandle:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
 
@@ -544,13 +545,23 @@ class Orchestrator:
         No implicit padding is inserted.
         ``workers`` is the legacy L3 spelling; it cannot be combined with ``members``.
         Retained domains survive successful runs until explicit release or Worker.close().
+        Domains provide synchronous mapped-window communication by default.
+        On A5, workspace_engines adds asynchronous resources from sdma/urma/rdma.
+        SDMA and URMA may share a domain. RDMA requires a separate domain with
+        its own low-address window. Explicit selection is limited to L3 A5.
         """
         if (members is None) == (workers is None):
             raise TypeError("provide exactly one of members or legacy workers")
         if workers is not None and self._worker is not None and self._worker.level != 3:
             raise TypeError("legacy workers= is only supported by an L3 Worker")
         return self._domain(
-            name, members if members is not None else workers, window_size, buffers, retain_after_run, reuse=False
+            name,
+            members if members is not None else workers,
+            window_size,
+            buffers,
+            retain_after_run,
+            workspace_engines=workspace_engines,
+            reuse=False,
         )
 
     def get_or_allocate_domain(
@@ -561,15 +572,18 @@ class Orchestrator:
         window_size: int,
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
+        workspace_engines: Sequence[str] = (),
     ) -> CommDomainHandle:
         """Return the same live handle on an exact configuration match, otherwise create it.
 
         Member order, full buffer definitions, window request, retention and topology must match.
         A hit neither allocates nor initializes the existing window.
         """
-        return self._domain(name, members, window_size, buffers, retain_after_run, reuse=True)
+        return self._domain(
+            name, members, window_size, buffers, retain_after_run, workspace_engines=workspace_engines, reuse=True
+        )
 
-    def _domain(self, name, members, window_size, buffers, retain_after_run, *, reuse):
+    def _domain(self, name, members, window_size, buffers, retain_after_run, *, workspace_engines=(), reuse):
         if self._worker is None:
             raise RuntimeError("domain allocation requires an Orchestrator bound to a Worker")
         return self._worker._comm_domain(
@@ -579,6 +593,7 @@ class Orchestrator:
             buffers=buffers,
             retain_after_run=retain_after_run,
             reuse=reuse,
+            workspace_engines=workspace_engines,
         )
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:

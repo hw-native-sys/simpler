@@ -373,11 +373,7 @@ static aclError release_domain_windows(DomainAllocation *alloc) {
 static aclError release_base_windows(CommHandle h) {
     aclError first_error = release_vmm_windows(&h->base_peer_windows);
     record_first_error(release_vmm_window(&h->base_local_window), &first_error);
-    const uint64_t workspace = h->host_ctx.workSpace;
-    const uint64_t workspace_size = h->host_ctx.workSpaceSize;
     h->host_ctx = CommContext{};
-    h->host_ctx.workSpace = workspace;
-    h->host_ctx.workSpaceSize = workspace_size;
     return first_error;
 }
 
@@ -828,10 +824,8 @@ static FabricAttempt alloc_windows_via_fabric(CommHandle h, uint64_t win_size) {
         return FabricAttempt::kError;
     }
 
-    // windowsOut[] is intentionally left zero: no kernel path reads it
-    // (verified by grep across simpler + pto-isa). The field is kept in
-    // CommContext only to preserve byte-equivalence with pto-isa's parallel
-    // HcclDeviceContext declaration.
+    // Base onboard windows publish peer read mappings through windowsIn[].
+    // windowsOut[] stays zero in this allocation path.
     // host_ctx was value-initialized at handle construction (CommContext{}),
     // and the idempotency guard in comm_alloc_windows prevents a second entry;
     // no re-zero needed before populating it here.
@@ -1433,8 +1427,10 @@ extern "C" int comm_barrier(CommHandle h) {
 
 extern "C" int comm_alloc_domain_windows(
     CommHandle h, uint64_t allocation_id, const uint32_t *rank_ids, size_t rank_count, uint32_t domain_rank,
-    size_t window_size, uint64_t *device_ctx_out, uint64_t *local_window_base_out, size_t *actual_window_size_out
+    size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
+    size_t *actual_window_size_out
 ) try {
+    if (workspace_mask != 0) return -1;
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         LOG_ERROR(

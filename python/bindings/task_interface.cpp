@@ -4096,12 +4096,13 @@ NB_MODULE(_task_interface, m) {
         .def(
             "comm_alloc_domain_windows",
             [](ChipWorker &self, uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids,
-               uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address) {
+               uint32_t domain_rank, size_t window_size, uint64_t commit_flag_address, uint32_t workspace_mask) {
                 if (commit_flag_address == 0 || commit_flag_address % alignof(uint64_t) != 0) {
                     throw std::invalid_argument("comm_alloc_domain_windows: commit flag address is invalid");
                 }
-                auto [device_ctx, local_window_base, actual_window_size] =
-                    self.comm_alloc_domain_windows(comm_handle, allocation_id, rank_ids, domain_rank, window_size);
+                auto [device_ctx, local_window_base, actual_window_size] = self.comm_alloc_domain_windows(
+                    comm_handle, allocation_id, rank_ids, domain_rank, window_size, workspace_mask
+                );
                 __atomic_store_n(
                     reinterpret_cast<uint64_t *>(static_cast<uintptr_t>(commit_flag_address)), uint64_t{1},
                     __ATOMIC_RELEASE
@@ -4109,7 +4110,7 @@ NB_MODULE(_task_interface, m) {
                 return nb::make_tuple(device_ctx, local_window_base, actual_window_size);
             },
             nb::arg("comm_handle"), nb::arg("allocation_id"), nb::arg("rank_ids"), nb::arg("domain_rank"),
-            nb::arg("window_size"), nb::arg("commit_flag_address"),
+            nb::arg("window_size"), nb::arg("commit_flag_address"), nb::arg("workspace_mask") = 0,
             "Collectively allocate a fresh per-rank pool for a subset; returns "
             "(device_ctx, local_window_base, actual_window_size) for this rank and publishes the commit flag before "
             "result conversion."

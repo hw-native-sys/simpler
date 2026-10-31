@@ -40,9 +40,10 @@ class DomainConfig:
     buffers: tuple
     retain_after_run: bool
     topology: tuple
+    workspace_engines: tuple[str, ...] = ()
 
     @classmethod
-    def capture(cls, members, window_size, buffers, retain_after_run, topology):
+    def capture(cls, members, window_size, buffers, retain_after_run, topology, workspace_engines=()):
         snapshot = tuple(
             (
                 str(b.name),
@@ -72,7 +73,18 @@ class DomainConfig:
                 )
         if sum(b[3] for b in snapshot) > window_size:
             raise ValueError("domain buffers exceed window_size")
-        return cls(members, window_size, snapshot, bool(retain_after_run), tuple(topology))
+        if isinstance(workspace_engines, str) or workspace_engines is None:
+            raise TypeError("workspace_engines must be a sequence of engine names")
+        names = tuple(workspace_engines)
+        if any(name not in ("sdma", "urma", "rdma") for name in names) or len(set(names)) != len(names):
+            raise ValueError("workspace_engines requires distinct names from sdma, urma, rdma")
+        workspace_engines = tuple(sorted(names))
+        if "rdma" in workspace_engines and len(workspace_engines) > 1:
+            raise ValueError("RDMA domains do not map peer windows; use separate domains for other engines")
+        return cls(members, window_size, snapshot, bool(retain_after_run), tuple(topology), workspace_engines)
+
+    def workspace_mask(self) -> int:
+        return sum(1 << ("sdma", "urma", "rdma").index(name) for name in self.workspace_engines)
 
     def specs(self) -> list[CommBufferSpec]:
         from .task_interface import CommBufferSpec  # noqa: PLC0415

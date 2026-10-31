@@ -82,7 +82,7 @@ inline __aicore__ bool validate_comm(__gm__ CommContext *comm_ctx, uint32_t elem
     return false;
 #else
     if (comm_ctx == nullptr || comm_ctx->rankNum != 2 || comm_ctx->rankId >= comm_ctx->rankNum ||
-        comm_ctx->workSpace == 0 || comm_ctx->windowsIn[comm_ctx->rankId] == 0) {
+        comm_workspace<CommWorkspaceKind::RDMA>(*comm_ctx).addr == 0 || comm_ctx->windowsIn[comm_ctx->rankId] == 0) {
         set_status(status, Status::kInvalidComm);
         return false;
     }
@@ -135,7 +135,9 @@ inline __aicore__ bool wait_rdma_bounded(const Event &event, const Session &sess
 
 inline __aicore__ uint64_t remote_base(__gm__ CommContext *comm_ctx, uint32_t peer) {
 #ifdef PTO_RDMA_SUPPORTED
-    return pto2::rdma_backend::peer_mr_base_addr(reinterpret_cast<__gm__ uint8_t *>(comm_ctx->workSpace), peer);
+    return pto2::rdma_backend::peer_mr_base_addr(
+        reinterpret_cast<__gm__ uint8_t *>(comm_workspace<CommWorkspaceKind::RDMA>(*comm_ctx).addr), peer
+    );
 #else
     (void)comm_ctx;
     (void)peer;

@@ -61,11 +61,11 @@ result. Device logs remain under `outputs/urma/`.
 ## CI integration dependency
 
 These cases are validated locally on A5 hardware with URMA enabled. CI retains
-its default SDMA build, where the URMA cases are skipped. URMA execution in CI
-is deferred until [#2739](https://github.com/hw-native-sys/simpler/issues/2739)
-allows SDMA and URMA to be enabled together.
+its default SDMA build, where the URMA cases are skipped. A validation job can
+enable `SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON` and run these cases alongside the
+SDMA example and its mixed-workspace regression without a second build.
 
-The current host build selects one backend for the single
-`CommContext.workSpace`/`workSpaceSize` pair. Use an isolated URMA build for these
-cases so existing SDMA coverage remains available in CI. RDMA defaults to OFF
-when its build environment variable is unset.
+The host build can include SDMA and URMA together. These cases explicitly
+request `workspace_engines=("urma",)` and read `comm_workspace<CommWorkspaceKind::URMA>(*ctx)`;
+the SDMA demo uses its independent descriptor. The URMA build option remains
+opt-in, and RDMA defaults to OFF when its build environment variable is unset.

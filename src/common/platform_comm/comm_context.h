@@ -9,67 +9,79 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * CommContext — device-side distributed communication context.
- *
- * This struct is the ABI contract between host (comm_hccl.cpp / comm_sim.cpp)
- * and device kernels. PTO communication instructions (TREDUCE, TGET, TPUT)
- * access remote data through the GVA addresses in windowsIn[]/windowsOut[]
- * via MTE2 DMA.
- *
- * Host fills the struct from scratch:
- *   - comm_hccl.cpp (Path D): allocates a per-rank symmetric pool via the
- *     public ACL IPC primitives (aclrtMalloc + aclrtIpcMemGetExportKey +
- *     SetImportPid + ImportByKey), then writes rankId / rankNum / winSize /
- *     windowsIn[]. No HCCL-private struct is reinterpret_cast'd here; the
- *     layout is owned end-to-end by simpler.
- *   - comm_sim.cpp: same shape, filled with malloc'd host pointers.
- *
- * The layout is shared with pto-isa's parallel HcclDeviceContext
- * declaration and must stay byte-equivalent with it.
+ * CommContext is simpler's host/device communication ABI. Host allocation
+ * publishes rank metadata, mapped windows and independent backend descriptors.
+ * Kernels resolve addresses and pass the selected workspace explicitly to PTO
+ * session builders. PTO instructions do not consume this structure directly.
  */
 
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 static constexpr uint32_t COMM_MAX_RANK_NUM = 64;
 
-struct CommContext {
-    uint64_t workSpace;
-    uint64_t workSpaceSize;
+enum class CommWorkspaceKind : uint32_t { SDMA = 0, URMA = 1, RDMA = 2, COUNT = 3 };
+static constexpr size_t COMM_WORKSPACE_COUNT = static_cast<size_t>(CommWorkspaceKind::COUNT);
 
+constexpr uint32_t comm_workspace_bit(CommWorkspaceKind kind) {
+    const auto index = static_cast<uint32_t>(kind);
+    return index < COMM_WORKSPACE_COUNT ? uint32_t{1} << index : 0;
+}
+
+struct CommWorkspace {
+    uint64_t addr;
+    uint64_t size;
+};
+
+struct CommContext {
     uint32_t rankId;
     uint32_t rankNum;
     uint64_t winSize;
     uint64_t windowsIn[COMM_MAX_RANK_NUM];
     uint64_t windowsOut[COMM_MAX_RANK_NUM];
+    CommWorkspace workspaces[COMM_WORKSPACE_COUNT];
 };
 
-// The struct itself lives in this repo, so on the surface these asserts look
-// like they only check that we do not contradict ourselves. Their real value
-// is that this layout is consumed by *two* out-of-band parties that never see
-// this header at the same time:
-//
-//   1. The pto-isa repo carries a parallel declaration (HcclDeviceContext)
-//      that must be byte-equivalent to this struct -- pto-isa kernels read
-//      windowsIn[]/winSize/rankId via that mirror. Any insert/reorder here
-//      that is not matched in pto-isa silently shifts the device-side field
-//      offsets and corrupts MTE2 reads. The locks below pin our side; the
-//      pto-isa side should add its own mirror asserts.
-//
-//   2. Device kernels (AICore / AICPU) compiled with CCEC may apply slightly
-//      different alignment rules than host gcc. A host-side sizeof/offset
-//      lock is a necessary-but-not-sufficient guard.
-//
-// Treat the numbers below as a tripwire: changing them is a deliberate act
-// that forces the editor to coordinate the matching change on the pto-isa
-// side, not a routine "oh I just added a field" edit.
-static_assert(sizeof(CommContext) == 1056, "CommContext size shifted");
-static_assert(offsetof(CommContext, workSpace) == 0, "CommContext layout drift");
-static_assert(offsetof(CommContext, workSpaceSize) == 8, "CommContext layout drift");
-static_assert(offsetof(CommContext, rankId) == 16, "CommContext layout drift");
-static_assert(offsetof(CommContext, rankNum) == 20, "CommContext layout drift");
-static_assert(offsetof(CommContext, winSize) == 24, "CommContext layout drift");
-static_assert(offsetof(CommContext, windowsIn) == 32, "CommContext layout drift");
-static_assert(offsetof(CommContext, windowsOut) == 544, "CommContext layout drift");
+#if defined(__CCE_AICORE__)
+#define COMM_CONTEXT_DEVICE [aicore]
+#define COMM_CONTEXT_GM __gm__
+#else
+#define COMM_CONTEXT_DEVICE
+#define COMM_CONTEXT_GM
+#endif
+
+template <CommWorkspaceKind Kind>
+COMM_CONTEXT_DEVICE inline COMM_CONTEXT_GM CommWorkspace &comm_workspace(COMM_CONTEXT_GM CommContext &ctx) {
+    static_assert(static_cast<size_t>(Kind) < COMM_WORKSPACE_COUNT, "invalid communication workspace kind");
+    return ctx.workspaces[static_cast<size_t>(Kind)];
+}
+
+template <CommWorkspaceKind Kind>
+COMM_CONTEXT_DEVICE inline const COMM_CONTEXT_GM CommWorkspace &comm_workspace(const COMM_CONTEXT_GM CommContext &ctx) {
+    static_assert(static_cast<size_t>(Kind) < COMM_WORKSPACE_COUNT, "invalid communication workspace kind");
+    return ctx.workspaces[static_cast<size_t>(Kind)];
+}
+
+#undef COMM_CONTEXT_GM
+#undef COMM_CONTEXT_DEVICE
+
+inline bool set_comm_workspace(CommContext &ctx, CommWorkspaceKind kind, uint64_t addr, uint64_t size) {
+    const auto index = static_cast<size_t>(kind);
+    if (index >= COMM_WORKSPACE_COUNT) return false;
+    ctx.workspaces[index] = {addr, size};
+    return true;
+}
+
+static_assert(std::is_trivially_copyable_v<CommWorkspace> && std::is_standard_layout_v<CommWorkspace>);
+static_assert(std::is_trivially_copyable_v<CommContext> && std::is_standard_layout_v<CommContext>);
+static_assert(sizeof(CommWorkspace) == 16, "CommWorkspace size shifted");
+static_assert(sizeof(CommContext) == 1088, "CommContext size shifted");
+static_assert(offsetof(CommContext, rankId) == 0, "CommContext layout drift");
+static_assert(offsetof(CommContext, rankNum) == 4, "CommContext layout drift");
+static_assert(offsetof(CommContext, winSize) == 8, "CommContext layout drift");
+static_assert(offsetof(CommContext, windowsIn) == 16, "CommContext layout drift");
+static_assert(offsetof(CommContext, windowsOut) == 528, "CommContext layout drift");
+static_assert(offsetof(CommContext, workspaces) == 1040, "CommContext layout drift");

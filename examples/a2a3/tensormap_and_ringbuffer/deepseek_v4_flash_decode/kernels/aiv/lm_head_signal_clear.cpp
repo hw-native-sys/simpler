@@ -26,6 +26,7 @@
 
 #include <pto/pto-inst.hpp>
 #include "tensor.h"
+#include "platform_comm/comm_context.h"
 
 #if defined(__CPU_SIM)
 // PTOAS v0.50+ emits cache_line_t::ENTIRE_DATA_CACHE / SINGLE_CACHE_LINE as
@@ -96,8 +97,9 @@ static __aicore__ inline void PTOAS__DCCI_SINGLE_CACHE_LINE(Ptr ptr) {
     dcci((__gm__ void *)ptr, cache_line_t::SINGLE_CACHE_LINE);
 }
 
-static __aicore__ void
-lm_head_signal_clear(__gm__ float *v1, __gm__ int32_t *v2, __gm__ int32_t *v3, __gm__ int64_t *v4, __gm__ int64_t *v5) {
+static __aicore__ void lm_head_signal_clear(
+    __gm__ float *v1, __gm__ int32_t *v2, __gm__ int32_t *v3, __gm__ CommContext *v4, __gm__ CommContext *v5
+) {
     const int64_t v6 = 0;
     const int64_t v7 = 2;
     const int64_t v8 = 1;
@@ -164,10 +166,10 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         lm_head_logits_done__ssa_v0_tensor->start_offset;
 
     // Unpack CommContext: lm_head_hidden_done_ctx
-    __gm__ int64_t *lm_head_hidden_done_ctx = reinterpret_cast<__gm__ int64_t *>(args[3]);
+    __gm__ CommContext *lm_head_hidden_done_ctx = reinterpret_cast<__gm__ CommContext *>(args[3]);
 
     // Unpack CommContext: lm_head_logits_done_ctx
-    __gm__ int64_t *lm_head_logits_done_ctx = reinterpret_cast<__gm__ int64_t *>(args[4]);
+    __gm__ CommContext *lm_head_logits_done_ctx = reinterpret_cast<__gm__ CommContext *>(args[4]);
 
     // Forward to ptoas-generated function
     lm_head_signal_clear(

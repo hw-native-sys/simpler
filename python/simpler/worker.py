@@ -925,8 +925,9 @@ _CTRL_SHM_NAME_BYTES = 32
 # of rank_count parity; rank_ids come last (u32 has no alignment concern).
 _DOMAIN_REQ_HEADER = struct.Struct("<QIIQI4x")
 # fields: allocation_id (u64), rank_count (u32), domain_rank (u32),
-#         window_size (u64), buffer_count (u32), padding (4 bytes)
+#         window_size (u64), buffer_count (u32), workspace_mask (u32)
 assert _DOMAIN_REQ_HEADER.size == 32
+_DOMAIN_WORKSPACE_MASK_OFFSET = struct.calcsize("<QIIQI")
 
 # Domain-allocation reply shm layout: 40-byte header + buffer_ptrs (u64).
 _DOMAIN_REPLY_HEADER = struct.Struct("<QQQQI4x")
@@ -2878,6 +2879,7 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
     assert req_buf is not None
     try:
         (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+        workspace_mask = struct.unpack_from("<I", req_buf, _DOMAIN_WORKSPACE_MASK_OFFSET)[0]
         # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
         nbytes_offset = _DOMAIN_REQ_HEADER.size
         nbytes_struct = struct.Struct(f"<{buffer_count}Q") if buffer_count else struct.Struct("")
@@ -2905,6 +2907,7 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
             int(domain_rank),
             int(window_size),
             _buffer_field_addr(reply_buf, _OFF_DOMAIN_REPLY_COMMITTED),
+            workspace_mask=workspace_mask,
         )
 
         # Carve buffer pointers sequentially inside the local window.
@@ -10452,7 +10455,7 @@ class Worker:
             after_success=lambda: setattr(self, "_comm_base_ready", True),
         )
 
-    def _domain_config(self, members, window_size, buffers, retain_after_run) -> DomainConfig:
+    def _domain_config(self, members, window_size, buffers, retain_after_run, workspace_engines=()) -> DomainConfig:
         if self.level == 3:
             ids = tuple(self._config.get("device_ids", ()))
             members = tuple(operator.index(member) for member in members)
@@ -10482,9 +10485,15 @@ class Worker:
             topology = (self._global_cluster_id, tuple(targets))
         else:
             raise RuntimeError("communication domains require an L3+ Worker")
-        return DomainConfig.capture(members, window_size, buffers, retain_after_run, topology)
+        config = DomainConfig.capture(members, window_size, buffers, retain_after_run, topology, workspace_engines)
+        if config.workspace_engines:
+            if self.level != 3:
+                raise ValueError("workspace_engines selection is supported only on L3 domains")
+            if self._config.get("platform") != "a5":
+                raise ValueError("domain workspace selection requires A5; A2/A3 SDMA uses enable_sdma")
+        return config
 
-    def _comm_domain(self, *, name, members, window_size, buffers, retain_after_run, reuse):
+    def _comm_domain(self, *, name, members, window_size, buffers, retain_after_run, reuse, workspace_engines=()):
         resources = self._building_run_resources
         if _callback_frame_for(self) is None or resources is None:
             raise RuntimeError("domain creation and reuse require this Worker's orchestration callback")
@@ -10496,7 +10505,7 @@ class Worker:
         with control:
             if not name:
                 raise ValueError("domain name must be non-empty")
-            config = self._domain_config(members, window_size, buffers, retain_after_run)
+            config = self._domain_config(members, window_size, buffers, retain_after_run, workspace_engines)
             table = self._live_domains if self.level == 3 else self._live_global_domains
             handle = table.get(name)
             if handle is not None:
@@ -10512,7 +10521,11 @@ class Worker:
             try:
                 if self.level == 3:
                     handle = self._allocate_domain(
-                        name=name, workers=config.members, window_size=config.window_size, buffers=config.specs()
+                        name=name,
+                        workers=config.members,
+                        window_size=config.window_size,
+                        buffers=config.specs(),
+                        workspace_mask=config.workspace_mask(),
                     )
                     handle.retain_after_run = config.retain_after_run
                     handle.members = tuple(
@@ -10635,6 +10648,7 @@ class Worker:
         workers: tuple[int, ...],
         window_size: int,
         buffers: list[CommBufferSpec],
+        workspace_mask: int = 0,
     ) -> CommDomainHandle:
         # Admission is the run() lease that the driving orchestrator holds;
         # validation checks resource presence rather than the public lifecycle,
@@ -10685,6 +10699,12 @@ class Worker:
                         int(worker_to_rank[chip_idx]),  # domain_rank
                         int(window_size),
                         int(buffer_count),
+                    )
+                    struct.pack_into(
+                        "<I",
+                        req_buf,
+                        _DOMAIN_WORKSPACE_MASK_OFFSET,
+                        workspace_mask,
                     )
                     nbytes_off = _DOMAIN_REQ_HEADER.size
                     if buffer_count:
