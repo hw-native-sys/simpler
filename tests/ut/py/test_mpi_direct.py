@@ -22,7 +22,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import simpler.mpi_direct_runtime as runtime_mod
@@ -708,6 +708,121 @@ def test_controller_progress_does_not_sleep_on_dispatch_path(monkeypatch):
     progress._run()
 
     sleep.assert_not_called()
+
+
+def test_controller_drains_last_heartbeat_before_shutdown_echo(monkeypatch):
+    from simpler.remote_l3_protocol import FrameHeader, FrameType, encode_frame  # noqa: PLC0415
+
+    shutdown = encode_frame(FrameHeader(FrameType.SHUTDOWN, 1, 0, 0), b"")
+    health = encode_frame(FrameHeader(FrameType.HEALTH, 1, 0, 17), b"")
+    mpi = SimpleNamespace(ANY_SOURCE=-1, BYTE=object())
+    world = Mock(Isend=Mock(return_value=Mock(Test=Mock(return_value=True))))
+    hub = Mock(pending_frame_bytes=1)
+    hub.poll_outbound.side_effect = [
+        (1, 1, SimpleNamespace(value=runtime_mod.LIFECYCLE_TAG), shutdown),
+        None,
+        None,
+        None,
+    ]
+    hub.complete_outbound.side_effect = lambda _ticket: setattr(hub, "pending_frame_bytes", 0)
+
+    def status(tag):
+        return SimpleNamespace(Get_source=lambda: 1, Get_tag=lambda: tag)
+
+    receive = Mock(
+        side_effect=[
+            None,
+            None,
+            (status(runtime_mod.HEALTH_TAG), health),
+            (status(runtime_mod.LIFECYCLE_TAG), shutdown),
+        ]
+    )
+    monkeypatch.setattr(runtime_mod, "_receive_frame", receive)
+    monkeypatch.setattr(runtime_mod.os, "_exit", Mock(side_effect=RuntimeError("unexpected progress abort")))
+    progress = runtime_mod._ControllerProgress(mpi, world, hub)
+    progress._stop.set()
+    progress._run()
+    assert receive.call_count == 4
+    hub.deliver.assert_called_once_with(1, runtime_mod.HEALTH_TAG, health)
+
+
+@pytest.mark.parametrize("pending_send", [False, True])
+def test_controller_drains_all_rank_echoes_and_pending_sends(monkeypatch, pending_send):
+    from simpler.remote_l3_protocol import FrameHeader, FrameType, encode_frame  # noqa: PLC0415
+
+    frames = [encode_frame(FrameHeader(FrameType.SHUTDOWN, 1, worker, 0), b"") for worker in (0, 1)]
+    mpi = SimpleNamespace(ANY_SOURCE=-1, BYTE=object())
+    hub = Mock(pending_frame_bytes=2)
+    hub.poll_outbound.side_effect = [
+        (1, 1, SimpleNamespace(value=runtime_mod.LIFECYCLE_TAG), frames[0]),
+        (2, 2, SimpleNamespace(value=runtime_mod.LIFECYCLE_TAG), frames[1]),
+        None,
+        None,
+        None,
+        None,
+        None,
+    ]
+    hub.complete_outbound.side_effect = lambda _ticket: setattr(hub, "pending_frame_bytes", hub.pending_frame_bytes - 1)
+
+    def inbound(rank, frame):
+        status = SimpleNamespace(Get_source=lambda: rank, Get_tag=lambda: runtime_mod.LIFECYCLE_TAG)
+        return status, frame
+
+    received = Mock(
+        side_effect=[
+            None,
+            None,
+            inbound(3, frames[0]),
+            inbound(1, frames[1]),
+            inbound(2, frames[1]),
+            inbound(1, frames[0]),
+            None,
+        ]
+    )
+    first = Mock(Test=Mock(return_value=True))
+    second = Mock(Test=lambda: not pending_send or received.call_count >= 6)
+    world = Mock(Isend=Mock(side_effect=[first, second]))
+    monkeypatch.setattr(runtime_mod, "_receive_frame", received)
+    monkeypatch.setattr(runtime_mod.os, "_exit", Mock(side_effect=RuntimeError("unexpected progress abort")))
+    progress = runtime_mod._ControllerProgress(mpi, world, hub)
+    progress._stop.set()
+    progress._run()
+    assert received.call_count == (7 if pending_send else 6)
+    assert hub.complete_outbound.call_args_list == [call(1), call(2)]
+    assert hub.deliver.call_args_list == [
+        call(3, runtime_mod.LIFECYCLE_TAG, frames[0]),
+        call(1, runtime_mod.LIFECYCLE_TAG, frames[1]),
+    ]
+
+
+@pytest.mark.parametrize("heartbeat", ["healthy", "stuck", "failed"])
+def test_executor_shutdown_echo_follows_received_frame_and_heartbeat_join(monkeypatch, heartbeat):
+    from simpler.remote_l3_protocol import FrameHeader, FrameType, encode_frame  # noqa: PLC0415
+
+    topology = MpiDirectTopology.from_dict(_topology_dict())
+    channel = runtime_mod._ExecutorFrameSocket(None, None, topology.executors[0], 1, 1.0)
+    frame = encode_frame(FrameHeader(FrameType.SHUTDOWN, 1, 0, 0), b"")
+    status = SimpleNamespace(Get_tag=lambda: runtime_mod.LIFECYCLE_TAG)
+    monkeypatch.setattr(runtime_mod, "_receive_frame", lambda *_args: (status, frame))
+    assert channel._receive_message() == frame
+    events = []
+    channel._health_thread = Mock(
+        is_alive=Mock(return_value=heartbeat == "stuck"), join=lambda _timeout: events.append("joined")
+    )
+    if heartbeat == "failed":
+        channel._health_error = RuntimeError("send failed")
+    send = Mock(side_effect=lambda *_args: events.append("sent"))
+    monkeypatch.setattr(channel, "_send", send)
+    if heartbeat != "healthy":
+        with pytest.raises(RuntimeError, match="heartbeat"):
+            channel.close()
+        assert events == ["joined"]
+        send.assert_not_called()
+        return
+    channel.close()
+    channel.close()
+    assert events == ["joined", "sent", "joined"]
+    send.assert_called_once_with(frame, runtime_mod.LIFECYCLE_TAG)
 
 
 def test_mpi_vendor_family_matches_supported_launchers():

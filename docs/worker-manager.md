@@ -487,7 +487,11 @@ The direct MPI path uses that same endpoint with `MpiDirectTransport`. A
 single launcher owns rank 0 (L4) and ranks 1..N (L3), without the daemon.
 `MpiDirectTransportHub` provides byte credit and frame routing, while a Python
 progress thread performs MPI calls. Its health check covers idle sessions;
-normal teardown sends `SHUTDOWN` before closing the hub. See the
+normal teardown sends `SHUTDOWN` and drains each rank's exact echo before
+closing the hub. Executors stop and join their heartbeat sender before sending
+that echo, so the controller consumes every preceding heartbeat before MPI
+finalization. Every rank in the launcher world must use the same runtime
+protocol revision. See the
 [direct MPI example](../examples/workers/l4/vector_add_mpi_direct_l3/README.md)
 for launcher ownership, failure handling, and polling costs.
 

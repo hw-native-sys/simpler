@@ -193,6 +193,7 @@ class _ControllerProgress:
 
     def _run(self) -> None:
         in_flight: list[tuple[Any, int, bytes]] = []
+        shutdown_pending: dict[int, bytes] = {}
         try:
             while True:
                 remaining: list[tuple[Any, int, bytes]] = []
@@ -207,6 +208,8 @@ class _ControllerProgress:
                 if outbound is not None:
                     ticket, target_rank, tag, frame = outbound
                     frame = bytes(frame)
+                    if int(tag.value) == LIFECYCLE_TAG:
+                        shutdown_pending[int(target_rank)] = frame
                     request = self._world.Isend(
                         [frame, self._MPI.BYTE],
                         dest=int(target_rank),
@@ -217,9 +220,20 @@ class _ControllerProgress:
                 received = _receive_frame(self._MPI, self._world, self._MPI.ANY_SOURCE)
                 if received is not None:
                     status, frame = received
-                    self._hub.deliver(int(status.Get_source()), int(status.Get_tag()), frame)
+                    source, tag = int(status.Get_source()), int(status.Get_tag())
+                    if tag == LIFECYCLE_TAG and shutdown_pending.get(source) == frame:
+                        # The exact shutdown echo is the last message from this rank,
+                        # after its serialized heartbeat sender has stopped.
+                        del shutdown_pending[source]
+                    else:
+                        self._hub.deliver(source, tag, frame)
                 self._hub.check_health(self._health_timeout_s)
-                if self._stop.is_set() and not in_flight and self._hub.pending_frame_bytes == 0:
+                if (
+                    self._stop.is_set()
+                    and not in_flight
+                    and not shutdown_pending
+                    and self._hub.pending_frame_bytes == 0
+                ):
                     return
         except BaseException as exc:  # noqa: BLE001
             self._error = exc
@@ -329,6 +343,7 @@ class _ExecutorFrameSocket:
         self._health_sequence = 0
         self._cleanup_reporter = reporter
         self.shutdown_observed = False
+        self._shutdown_frame: bytes | None = None
 
     def _send(self, data: bytes, tag: int) -> None:
         with self._mpi_mu:
@@ -399,6 +414,7 @@ class _ExecutorFrameSocket:
                 raise RuntimeError("controller SLR3 frame identity mismatch")
             if decoded.header.frame_type == FrameType.SHUTDOWN:
                 self.shutdown_observed = True
+                self._shutdown_frame = frame
                 if self._cleanup_reporter is not None:
                     self._cleanup_reporter.begin(command="observed")
             return frame
@@ -420,6 +436,9 @@ class _ExecutorFrameSocket:
                 raise RuntimeError("executor heartbeat thread did not stop")
         if self._health_error is not None:
             raise RuntimeError("executor heartbeat failed") from self._health_error
+        if self._shutdown_frame is not None:
+            self._send(self._shutdown_frame, LIFECYCLE_TAG)
+            self._shutdown_frame = None
 
 
 def _load_controller(target: str) -> Callable[[MpiDirectControllerContext], Any]:
