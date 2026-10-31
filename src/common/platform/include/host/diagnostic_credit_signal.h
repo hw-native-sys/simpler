@@ -27,6 +27,8 @@
 
 #pragma once
 
+#include "common/module_thread_value.h"
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
@@ -98,16 +100,62 @@ public:
      */
     class SuppressSelfNotify {
     public:
-        SuppressSelfNotify() { depth()++; }
-        ~SuppressSelfNotify() { depth()--; }
+        SuppressSelfNotify() noexcept :
+            previous_(depth().get()),
+            armed_(depth().try_set(previous_ + 1) == 0) {
+            if (!armed_) {
+                auto &state = fallback();
+                std::lock_guard<std::mutex> lock(state.mutex);
+                next_ = state.head;
+                state.head = this;
+                state.count.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        ~SuppressSelfNotify() {
+            if (armed_) {
+                depth().restore(previous_);
+            } else {
+                auto &state = fallback();
+                std::lock_guard<std::mutex> lock(state.mutex);
+                auto **entry = &state.head;
+                while (*entry != this)
+                    entry = &(*entry)->next_;
+                *entry = next_;
+                state.count.fetch_sub(1, std::memory_order_relaxed);
+            }
+        }
         SuppressSelfNotify(const SuppressSelfNotify &) = delete;
         SuppressSelfNotify &operator=(const SuppressSelfNotify &) = delete;
 
-        static bool active() { return depth() != 0; }
+        static bool active() {
+            if (depth().get() != 0) return true;
+            auto &state = fallback();
+            if (state.count.load(std::memory_order_relaxed) == 0) return false;
+            std::lock_guard<std::mutex> lock(state.mutex);
+            for (auto *entry = state.head; entry != nullptr; entry = entry->next_)
+                if (pthread_equal(entry->thread_, pthread_self())) return true;
+            return false;
+        }
 
     private:
-        static unsigned &depth() {
-            static thread_local unsigned value = 0;
+        // Failed TLS binding uses live stack scopes, without allocation. The
+        // mutex protects list traversal and scope removal; only the owning
+        // thread's notifications are suppressed. All scopes precede unload.
+        struct Fallback {
+            std::mutex mutex;
+            std::atomic<unsigned> count{0};
+            SuppressSelfNotify *head{nullptr};
+        };
+        static __attribute__((visibility("hidden"))) Fallback &fallback() {
+            static Fallback state;
+            return state;
+        }
+        pthread_t thread_{pthread_self()};
+        SuppressSelfNotify *next_{nullptr};
+        unsigned previous_;
+        bool armed_;
+        static __attribute__((visibility("hidden"))) simpler::ModuleThreadValue<unsigned> &depth() {
+            static simpler::ModuleThreadValue<unsigned> value;
             return value;
         }
     };

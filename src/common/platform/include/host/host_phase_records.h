@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "common/module_thread_value.h"
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -32,7 +33,7 @@
  * Recording is a header-inline store into platform-allocated memory rather than
  * a call through HostApi: a pass performs a few hundred operations a few
  * microseconds apart on the very path whose budget is under measurement, so the
- * per-event cost must stay at two clock reads, one slot claim and a store.
+ * per-event work consists of clock reads, a private lane update and a store.
  * HostApi carries only the once-per-pass arm and finish.
  *
  * Every producer thread of a pass writes concurrently — a Graph workload records
@@ -67,19 +68,19 @@ struct HostPhaseRecordPool {
 };
 
 /**
- * One producer's place in the pool: which buffer it owns and how much of it is
- * used. Thread-local, so reading and advancing it is private to that thread.
+ * One producer's buffer identity. The exclusive buffer owns its write cursor;
+ * the thread selector changes only on a new pass or buffer rotation.
  */
 struct HostPhaseProducerLane {
     const HostPhaseRecordPool *pool{nullptr};
     uint32_t generation{0};
-    uint32_t buffer{0};
-    uint32_t used{0};
-    bool denied{false};
+    static constexpr uint32_t denied = UINT32_MAX;
+    uint32_t buffer{denied};
 };
 
-inline HostPhaseProducerLane &host_phase_producer_lane() {
-    static thread_local HostPhaseProducerLane lane;
+inline __attribute__((visibility("hidden"))) simpler::ModuleThreadValue<HostPhaseProducerLane> &
+host_phase_producer_lane() {
+    static simpler::ModuleThreadValue<HostPhaseProducerLane> lane;
     return lane;
 }
 
@@ -87,8 +88,8 @@ inline HostPhaseProducerLane &host_phase_producer_lane() {
  * Take the next unclaimed buffer as this producer's own.
  *
  * Cold path: once per PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER records, plus once
- * per pass per producer. Returns false when every buffer is claimed, which is the
- * pool's only lossy outcome; the lane remembers it so a denied producer does not
+ * per pass per producer. Returns false when every buffer is claimed;
+ * the lane remembers it so a denied producer does not
  * retry the atomic on every later record.
  */
 inline bool host_phase_lane_claim_buffer(HostPhaseRecordPool *pool, HostPhaseProducerLane &lane, uint32_t generation) {
@@ -96,12 +97,10 @@ inline bool host_phase_lane_claim_buffer(HostPhaseRecordPool *pool, HostPhasePro
     lane.pool = pool;
     lane.generation = generation;
     if (buffer >= pool->buffer_count) {
-        lane.denied = true;
+        lane.buffer = HostPhaseProducerLane::denied;
         return false;
     }
     lane.buffer = buffer;
-    lane.used = 0;
-    lane.denied = false;
     return true;
 }
 
@@ -211,8 +210,8 @@ private:
  * thread 3.3 us per record at eight producers against 0.1 us at one, and a flat
  * per-record slot claim still cost 1.1 us because a 40-byte record leaves adjacent
  * slots, owned by different threads, sharing a cache line. Per-producer buffers
- * are flat at ~50 ns from one producer to sixteen, which is what two
- * `clock_gettime` calls cost on their own.
+ * avoid that shared cache-line cost. Lane selection uses module-owned pthread
+ * slots, with checked scalar updates rather than compiler TLS.
  *
  * A written record is visible to a reader only after that producer stops, so a
  * reader must not read a pass before its producers are done.
@@ -229,23 +228,32 @@ inline void host_phase_pool_append(
     uint32_t thread_id = 0
 ) {
     if (pool == nullptr) return;
-    HostPhaseProducerLane &lane = host_phase_producer_lane();
+    auto &cache = host_phase_producer_lane();
+    if (!cache.available()) {
+        pool->dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    HostPhaseProducerLane lane = cache.get();
     const uint32_t generation = pool->generation.load(std::memory_order_acquire);
     const bool fresh_pass = lane.pool != pool || lane.generation != generation;
-    if (fresh_pass || (!lane.denied && lane.used >= PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER)) {
+    const bool claim_buffer =
+        fresh_pass || (lane.buffer != HostPhaseProducerLane::denied &&
+                       pool->buffers[lane.buffer].count >= PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER);
+    if (claim_buffer) {
         if (!host_phase_lane_claim_buffer(pool, lane, generation)) {
+            cache.cache(lane);
             pool->dropped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
-    } else if (lane.denied) {
+    } else if (lane.buffer == HostPhaseProducerLane::denied) {
         pool->dropped.fetch_add(1, std::memory_order_relaxed);
         return;
     }
     HostPhaseRecordBuffer &buffer = pool->buffers[lane.buffer];
-    buffer.records[lane.used] =
+    buffer.records[buffer.count] =
         HostPhaseRecord{start_ns, end_ns, payload, static_cast<uint32_t>(kind), index, thread_id, 0};
-    lane.used++;
-    // This producer is the only writer of this buffer's count, and the reader
-    // needs it to know how far the buffer is filled.
-    buffer.count = lane.used;
+    // The buffer has one writer, and readers wait for the producer to drain.
+    // Retain this successfully stored record even if publishing the selector fails.
+    ++buffer.count;
+    if (claim_buffer) cache.cache(lane);
 }
