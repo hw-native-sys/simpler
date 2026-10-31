@@ -268,3 +268,29 @@ def test_terminal_run_error_still_cleans_up_and_does_not_rewait(backend):
     assert obj.closed and obj.run is None and obj.worker is None and not obj.sources
     obj.close()
     assert calls.count("source-closed") == 1
+
+
+@pytest.mark.parametrize("target", ["stream", "worker", "source"])
+def test_terminal_run_and_cleanup_errors_remain_distinct(backend, monkeypatch, target):
+    obj, metadata, calls, stream = backend
+    obj(torch.ones(1), torch.tensor([3338]), metadata, ("request",))
+    primary = RuntimeError("device execution failed")
+    cleanup = OSError("cleanup failed")
+    obj.run.wait = lambda timeout: (_ for _ in ()).throw(primary)
+    owner, method = {
+        "stream": (stream, "synchronize"),
+        "worker": (obj.worker, "close"),
+        "source": (obj.sources[0], "close"),
+    }[target]
+    original = getattr(owner, method)
+    monkeypatch.setattr(owner, method, lambda: (_ for _ in ()).throw(cleanup))
+    with pytest.raises(RuntimeError) as caught:
+        obj.close()
+    assert caught.value is primary and primary.__context__ is cleanup
+    assert obj.cleanup_error is cleanup and obj.failed and not obj.closed
+    assert obj.run is None
+    assert (obj.worker is not None) == (target == "worker")
+    assert bool(obj.sources) == (target == "source")
+    monkeypatch.setattr(owner, method, original)
+    obj.close()
+    assert obj.closed and obj.worker is None and not obj.sources
