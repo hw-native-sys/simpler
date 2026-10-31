@@ -69,6 +69,11 @@ jobs:
       runs_on: '["self-hosted","a5"]'
       include_dfx_smokes: true
       manual_mode: include
+      # include selects the Per-PR sweep and everything deferred out of it,
+      # a corpus the 1200 s default never sized. The job timeout stays above
+      # the queue wait this implies, which is 95 minutes.
+      session_timeout_seconds: 3600
+      job_timeout_minutes: 120
 
   st-network1-onboard-a2a3:
     uses: ./.github/workflows/_st-network1.yml

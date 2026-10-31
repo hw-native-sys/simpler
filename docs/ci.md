@@ -166,6 +166,16 @@ Use `"manual": True` on an individual `SceneTestCase.CASES` entry and
 workflows accept `manual_mode`; Per-PR callers use its `exclude` default and the
 Daily caller passes `include`.
 
+A sweep's budget follows what it selects, so `manual_mode` is not the only
+input a Daily caller sets. `_st-npu-a5.yml` takes `session_timeout_seconds`
+(default 1200, sizing the Per-PR sweep) and derives the `task-submit`
+execution and queue limits from it; the Daily caller raises it, because
+`include` selects a corpus the default never sized. `job_timeout_minutes` has
+to stay above the queue limit that implies. A sweep that outgrows its budget
+does not fail on the case at fault: the session timeout fires on whatever was
+still running and reports that one, so read the `HUNG` group rather than the
+assertion.
+
 For platform-specific pruning, the same `manual` value accepts a platform list,
 for example `"manual": ["a2a3sim", "a5sim"]`; standalone tests use
 `@pytest.mark.manual(["a2a3sim", "a5sim"])`. This removes only the listed Sim

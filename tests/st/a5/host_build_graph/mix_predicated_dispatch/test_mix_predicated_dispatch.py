@@ -73,16 +73,30 @@ REFUSED_SHAPES = [(mask, 1) for mask in MIX_MASKS] + [(mask, 2) for mask in (1, 
 # costs a process of its own. A simulator run therefore carries one case per
 # refused class — a Mix task and a pure multi-block task — at a single gate
 # value, since the graph is refused before the predicate is read and the gate
-# selects no other path. Hardware keeps the full sweep.
+# selects no other path.
 _SIM_SHAPES = frozenset({(7, 1), (1, 2)})
 _ONBOARD_ONLY = pytest.mark.platforms(["a5"])
+_A5_MANUAL = pytest.mark.manual(["a5"])
+# Which refused shapes the silicon carries on every PR: every refused class,
+# at both block counts and on both sides of the one asymmetry the masks carry
+# — a Mix task holding an AIC subtask (0b111) and one that does not (0b110), a
+# pure multi-block task, and a task that is both Mix and multi-block. The
+# remaining masks differ only in which AIV lanes are populated, which the
+# refusal reads through the same active-subtask count. The daily sweep carries
+# them, and the second gate value with them: that value exists to show the
+# refusal does not depend on it, which is a standing claim rather than one a
+# PR can regress without touching this file.
+_PER_PR_SHAPES = frozenset({(7, 1), (6, 1), (1, 2), (7, 2)})
 
 
 def _refused_shape_params():
-    return [
-        pytest.param(mask, blocks, marks=[] if (mask, blocks) in _SIM_SHAPES else [_ONBOARD_ONLY])
-        for mask, blocks in REFUSED_SHAPES
-    ]
+    params = []
+    for mask, blocks in REFUSED_SHAPES:
+        marks = [] if (mask, blocks) in _SIM_SHAPES else [_ONBOARD_ONLY]
+        if (mask, blocks) not in _PER_PR_SHAPES:
+            marks.append(_A5_MANUAL)
+        params.append(pytest.param(mask, blocks, marks=marks))
+    return params
 
 
 @functools.cache
@@ -124,7 +138,7 @@ def _build_callable(platform: str) -> ChipCallable:
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
 @pytest.mark.parametrize("mask,blocks", _refused_shape_params())
-@pytest.mark.parametrize("gate", (pytest.param(0), pytest.param(1, marks=[_ONBOARD_ONLY])))
+@pytest.mark.parametrize("gate", (pytest.param(0), pytest.param(1, marks=[_ONBOARD_ONLY, _A5_MANUAL])))
 def test_predicated_cooperative_task_is_refused(st_platform, st_device_ids, mask, blocks, gate, capfd, drain_host_log):
     """Mix and pure multi-block shapes are refused for either gate value.
 

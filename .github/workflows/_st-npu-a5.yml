@@ -24,14 +24,30 @@ on:
         required: false
         default: exclude
         type: string
+      session_timeout_seconds:
+        description: >-
+          Pytest session timeout in seconds. The default sizes the Per-PR
+          sweep; a caller that selects more than that sweep has to raise it
+          to match what it selected.
+        required: false
+        default: 1200
+        type: number
+      job_timeout_minutes:
+        description: >-
+          Job timeout in minutes. Has to leave room for the whole queue wait
+          below, plus setup and the kernel compile that precede it.
+        required: false
+        default: 75
+        type: number
 
 jobs:
   run:
     name: st-onboard-a5
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    timeout-minutes: 75
+    timeout-minutes: ${{ inputs.job_timeout_minutes }}
     env:
       MANUAL_MODE: ${{ inputs.manual_mode }}
+      SESSION_TIMEOUT_S: ${{ inputs.session_timeout_seconds }}
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
       SIMPLER_STREAM_SYNC_TIMEOUT_MS: "6000"
@@ -100,8 +116,20 @@ jobs:
       - name: Run pytest scene tests (a5)
         run: |
           source /usr/local/Ascend/cann/set_env.sh
-          task-submit --timeout 3300 --max-time 1800 --device auto --device-num "$DEVICE_NUM" \
-            --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout 1200 --manual '$MANUAL_MODE'"
+          # Three nested budgets, each derived from the one it contains, so
+          # that raising the sweep does not silently leave an outer one
+          # behind:
+          #   --max-time  the run itself, which must outlast the session
+          #               budget or the device is reclaimed before pytest can
+          #               report its own timeout and name what was stuck;
+          #   --timeout   how long the client waits, which covers that run
+          #               plus the queue ahead of it on a shared pool.
+          # At the default these are the 1800 s and 3300 s this job has been
+          # using, and the job's own timeout-minutes has to stay above both.
+          MAX_TIME_S=$((SESSION_TIMEOUT_S + 600))
+          QUEUE_TIMEOUT_S=$((MAX_TIME_S + 1500))
+          task-submit --timeout "$QUEUE_TIMEOUT_S" --max-time "$MAX_TIME_S" --device auto --device-num "$DEVICE_NUM" \
+            --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout $SESSION_TIMEOUT_S --manual '$MANUAL_MODE'"
 
       - name: DFX smokes (a5)
         if: inputs.include_dfx_smokes
