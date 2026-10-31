@@ -117,6 +117,7 @@ public:
         merged.bits_ |= other.bits_;
         return merged;
     }
+    SIMPLER_LANE_AICORE constexpr LaneMask without(LaneMask other) const { return from_low_bits(bits_ & ~other.bits_); }
     SIMPLER_LANE_AICORE constexpr bool contains(LaneMask other) const { return (bits_ & other.bits_) == other.bits_; }
 
     SIMPLER_LANE_AICORE constexpr bool operator==(LaneMask other) const { return bits_ == other.bits_; }

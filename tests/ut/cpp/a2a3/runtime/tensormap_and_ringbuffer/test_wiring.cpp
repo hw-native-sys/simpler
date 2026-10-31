@@ -41,6 +41,14 @@ uint64_t get_test_reg_stub_base_addr();
 // Fixture: sets up runtime state with shared memory and provides helpers
 // =============================================================================
 
+namespace {
+ChipTaskSlotState *pop_shaped(ChipReadyQueue *queues, ResourceShape shape) {
+    ChipTaskSlotState *out = nullptr;
+    queues[static_cast<int32_t>(shape)].pop_shaped_batch(&out, nullptr, 1, shape);
+    return out;
+}
+}  // namespace
+
 class WiringTest : public ::testing::Test {
 protected:
     OrchestratorState orch{};
@@ -142,7 +150,7 @@ TEST_F(WiringTest, NoFaninTaskBecomesReady) {
 
     // Task should be in ready queue
     ResourceShape shape = task_slot.active_mask.to_shape();
-    auto *popped = sched.ready_queues[static_cast<int32_t>(shape)].pop();
+    auto *popped = pop_shaped(sched.ready_queues, shape);
     EXPECT_EQ(popped, &task_slot);
 }
 
@@ -181,7 +189,7 @@ TEST_F(WiringTest, WireTaskAllProducersEarlyFinished) {
 
     // Task should be in ready queue
     ResourceShape shape = task_slot.active_mask.to_shape();
-    auto *popped = sched.ready_queues[static_cast<int32_t>(shape)].pop();
+    auto *popped = pop_shaped(sched.ready_queues, shape);
     EXPECT_EQ(popped, &task_slot);
 }
 
@@ -219,7 +227,7 @@ TEST_F(WiringTest, WireTaskProducersPendingTaskNotReady) {
 
     // Ready queue should be empty
     ResourceShape shape = task_slot.active_mask.to_shape();
-    auto *popped = sched.ready_queues[static_cast<int32_t>(shape)].pop();
+    auto *popped = pop_shaped(sched.ready_queues, shape);
     EXPECT_EQ(popped, nullptr);
 
     // Producers should have fanout_head pointing to task_slot
@@ -489,15 +497,17 @@ TEST_F(WiringTest, BatchPushReportsFullInsteadOfSpinning) {
         ASSERT_TRUE(queue.push_tagged(&filler, TaskId::make(0, static_cast<int32_t>(i))));
     }
 
-    ChipTaskSlotState *items[1] = {&filler};
+    CapturedReadySlot items[1] = {CapturedReadySlot(&filler, LaneMask::none())};
     TaskId tags[1] = {TaskId::make(0, static_cast<int32_t>(queue.capacity))};
     // A full queue must end the call, not spin waiting for a consumer. Reaching
     // the next line at all is the assertion.
-    EXPECT_FALSE(queue.push_batch_tagged(items, tags, 1));
+    EXPECT_FALSE(queue.push_shaped_batch(items, tags, 1, filler.active_mask.to_shape()));
     EXPECT_EQ(queue.size(), queue.capacity);
 
     // A batch larger than the queue can never be satisfied and must not spin.
-    EXPECT_FALSE(queue.push_batch_tagged(items, tags, static_cast<int>(queue.capacity) + 1));
+    EXPECT_FALSE(
+        queue.push_shaped_batch(items, tags, static_cast<int>(queue.capacity) + 1, filler.active_mask.to_shape())
+    );
 }
 
 TEST_F(WiringTest, BatchPushSucceedsAfterSpaceIsReclaimed) {
@@ -510,9 +520,11 @@ TEST_F(WiringTest, BatchPushSucceedsAfterSpaceIsReclaimed) {
     ASSERT_NE(queue.pop(), nullptr);
     ASSERT_NE(queue.pop(), nullptr);
 
-    ChipTaskSlotState *items[2] = {&filler, &filler};
+    CapturedReadySlot items[2] = {
+        CapturedReadySlot(&filler, LaneMask::none()), CapturedReadySlot(&filler, LaneMask::none())
+    };
     TaskId tags[2] = {TaskId::make(0, 7), TaskId::make(0, 8)};
-    EXPECT_TRUE(queue.push_batch_tagged(items, tags, 2));
+    EXPECT_TRUE(queue.push_shaped_batch(items, tags, 2, filler.active_mask.to_shape()));
     EXPECT_EQ(queue.size(), queue.capacity);
 }
 
@@ -551,7 +563,7 @@ TEST_F(WiringTest, EarlyDispatchQueueOverflowFallsBackToNormalDispatch) {
     // release routes every block through the ordinary ready queue.
     EXPECT_TRUE(sched.route_ready_once(consumer));
     EXPECT_EQ(consumer.payload->early_dispatch_state.load(), EARLY_DISPATCH_DISPATCHED);
-    EXPECT_EQ(sched.ready_queues[static_cast<int32_t>(shape)].pop(), &consumer);
+    EXPECT_EQ(pop_shaped(sched.ready_queues, shape), &consumer);
 }
 
 TEST_F(WiringTest, EarlyDispatchSyncStartQueueOverflowFallsBackToSyncReadyQueue) {
@@ -574,7 +586,7 @@ TEST_F(WiringTest, EarlyDispatchSyncStartQueueOverflowFallsBackToSyncReadyQueue)
     // shape's sync ready queue, not the plain one.
     ResourceShape shape = consumer.active_mask.to_shape();
     EXPECT_TRUE(sched.route_ready_once(consumer));
-    EXPECT_EQ(sched.ready_sync_queues[static_cast<int32_t>(shape)].pop(), &consumer);
+    EXPECT_EQ(pop_shaped(sched.ready_sync_queues, shape), &consumer);
 }
 
 TEST_F(WiringTest, LateWiredFullyPublishedProducerStillSeedsEarlyDispatch) {
@@ -601,7 +613,7 @@ TEST_F(WiringTest, LateWiredFullyPublishedProducerStillSeedsEarlyDispatch) {
     EXPECT_EQ(consumer_payload.dispatch_fanin.load(), consumer_payload.fanin_actual_count);
     EXPECT_EQ(consumer_payload.early_dispatch_state.load(), EARLY_DISPATCH_STAGING);
     auto shape = static_cast<int32_t>(consumer.active_mask.to_shape());
-    EXPECT_EQ(sched.early_dispatch_queues[shape].pop(), &consumer);
+    EXPECT_EQ(pop_shaped(sched.early_dispatch_queues, static_cast<ResourceShape>(shape)), &consumer);
     EXPECT_NE(producer.fanout_head, nullptr);
 }
 
@@ -647,7 +659,7 @@ TEST_F(WiringTest, WiringSeedEnqueuesAfterConcurrentPropagation) {
     EXPECT_EQ(consumer_payload.dispatch_fanin.load(), consumer_payload.fanin_actual_count);
     EXPECT_EQ(consumer_payload.early_dispatch_state.load(), EARLY_DISPATCH_STAGING);
     auto shape = static_cast<int32_t>(consumer.active_mask.to_shape());
-    EXPECT_EQ(sched.early_dispatch_queues[shape].pop(), &consumer);
+    EXPECT_EQ(pop_shaped(sched.early_dispatch_queues, static_cast<ResourceShape>(shape)), &consumer);
 }
 
 TEST_F(WiringTest, ConcurrentBlockRangeClaimsDoNotOverlap) {
@@ -698,7 +710,7 @@ TEST_F(WiringTest, PartialStagedReleaseRoutesRemainderToReadyQueue) {
     EXPECT_EQ(consumer.next_block_idx.load(), 2);
 
     ResourceShape shape = consumer.active_mask.to_shape();
-    EXPECT_EQ(sched.ready_queues[static_cast<int32_t>(shape)].pop(), &consumer);
+    EXPECT_EQ(pop_shaped(sched.ready_queues, shape), &consumer);
 
     int32_t remaining_start = -1;
     EXPECT_EQ(consumer.claim_block_range(consumer.logical_block_num, 5, remaining_start), 3);
@@ -952,7 +964,7 @@ TEST_F(WiringTest, ArmedEarlySyncDrainOwnsFinalReadyRoute) {
     SchedulerState::mark_early_sync_drain_armed(*sync_consumer.payload);
     EXPECT_TRUE(sched.release_fanin_and_check_ready(sync_consumer));
     auto shape = static_cast<int32_t>(sync_consumer.active_mask.to_shape());
-    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), nullptr);
+    EXPECT_EQ(pop_shaped(sched.ready_sync_queues, static_cast<ResourceShape>(shape)), nullptr);
     EXPECT_EQ(sync_consumer.payload->early_dispatch_state.load(), EARLY_DISPATCH_DISPATCHED);
     EXPECT_EQ(
         sync_consumer.payload->early_sync_drain_state.load(),
@@ -1041,13 +1053,19 @@ TEST_F(WiringTest, CancelledEarlySyncDrainRoutesProducerRelease) {
     sync_consumer.payload->early_dispatch_state.store(EARLY_DISPATCH_STAGING, std::memory_order_relaxed);
 
     ASSERT_TRUE(SchedulerState::try_claim_early_sync_drain(*sync_consumer.payload));
-    sched.cancel_early_sync_drain(sync_consumer);
+    sched.cancel_early_sync_drain(
+        sync_consumer,
+        CapturedReadySlot(
+            &sync_consumer, (sync_consumer.active_mask).is_mix() ? (sync_consumer.active_mask) : LaneMask::none()
+        ),
+        sync_consumer.task->task_id
+    );
     EXPECT_TRUE(sched.release_fanin_and_check_ready(sync_consumer));
 
     auto shape = static_cast<int32_t>(sync_consumer.active_mask.to_shape());
-    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), &sync_consumer);
-    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), nullptr);
-    EXPECT_EQ(sched.early_sync_start_queue.pop(), &sync_consumer);
+    EXPECT_EQ(pop_shaped(sched.ready_sync_queues, static_cast<ResourceShape>(shape)), &sync_consumer);
+    EXPECT_EQ(pop_shaped(sched.ready_sync_queues, static_cast<ResourceShape>(shape)), nullptr);
+    EXPECT_EQ(sched.early_sync_start_queue.pop_sync_start(nullptr).ptr(), &sync_consumer);
 }
 
 TEST_F(WiringTest, ProducerReleaseTransfersReadyRouteToCancellingDrain) {
@@ -1061,12 +1079,18 @@ TEST_F(WiringTest, ProducerReleaseTransfersReadyRouteToCancellingDrain) {
     ASSERT_TRUE(SchedulerState::try_claim_early_sync_drain(*sync_consumer.payload));
     EXPECT_TRUE(sched.release_fanin_and_check_ready(sync_consumer));
     auto shape = static_cast<int32_t>(sync_consumer.active_mask.to_shape());
-    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), nullptr);
+    EXPECT_EQ(pop_shaped(sched.ready_sync_queues, static_cast<ResourceShape>(shape)), nullptr);
 
-    sched.cancel_early_sync_drain(sync_consumer);
-    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), &sync_consumer);
-    EXPECT_EQ(sched.ready_sync_queues[shape].pop(), nullptr);
-    EXPECT_EQ(sched.early_sync_start_queue.pop(), nullptr);
+    sched.cancel_early_sync_drain(
+        sync_consumer,
+        CapturedReadySlot(
+            &sync_consumer, (sync_consumer.active_mask).is_mix() ? (sync_consumer.active_mask) : LaneMask::none()
+        ),
+        sync_consumer.task->task_id
+    );
+    EXPECT_EQ(pop_shaped(sched.ready_sync_queues, static_cast<ResourceShape>(shape)), &sync_consumer);
+    EXPECT_EQ(pop_shaped(sched.ready_sync_queues, static_cast<ResourceShape>(shape)), nullptr);
+    EXPECT_EQ(sched.early_sync_start_queue.pop_sync_start(nullptr).ptr(), nullptr);
 }
 
 TEST_F(WiringTest, EarlyDispatchBlockedByUnflaggedProducer) {
@@ -1205,8 +1229,8 @@ TEST_F(WiringTest, OnMixedTaskCompleteNotifiesConsumers) {
 
     // Both consumers should be ready (fanin_refcount == fanin_count)
     ResourceShape shape = consumer1.active_mask.to_shape();
-    auto *r1 = sched.ready_queues[static_cast<int32_t>(shape)].pop();
-    auto *r2 = sched.ready_queues[static_cast<int32_t>(shape)].pop();
+    auto *r1 = pop_shaped(sched.ready_queues, shape);
+    auto *r2 = pop_shaped(sched.ready_queues, shape);
     EXPECT_TRUE((r1 == &consumer1 && r2 == &consumer2) || (r1 == &consumer2 && r2 == &consumer1));
 }
 

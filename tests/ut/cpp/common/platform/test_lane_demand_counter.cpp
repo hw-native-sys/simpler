@@ -12,9 +12,14 @@
 #include <array>
 #include <thread>
 #include <vector>
-#include "scheduler/scheduler.h"
+#include "common/tagged_ptr.h"
+#include "common/lane_demand_counter.h"
 
 namespace {
+struct alignas(64) TestSlot {};
+using LaneTaggedSlot = TaggedPtr<TestSlot, LaneMask, SUBTASK_SLOT_COUNT>;
+static_assert(std::is_trivially_default_constructible_v<LaneTaggedSlot>);
+static_assert(std::is_trivially_copyable_v<LaneTaggedSlot> && std::is_standard_layout_v<LaneTaggedSlot>);
 constexpr LaneMask lanes_for(unsigned combination) {
     return {(combination & 1) != 0, (combination & 2) != 0, (combination & 4) != 0};
 }
@@ -32,7 +37,7 @@ TEST(LaneReservation, NamedUnionAndContainmentCoverAllCombinations) {
 }
 
 TEST(TaggedSlot, RoundTripsEveryTagAndRequiresExplicitPointerAccess) {
-    ChipTaskSlotState slot{};
+    TestSlot slot{};
     for (uint8_t bits = 0; bits < 8; ++bits) {
         const LaneMask tag = lanes_for(bits);
         LaneTaggedSlot handle(&slot, tag);
@@ -40,16 +45,16 @@ TEST(TaggedSlot, RoundTripsEveryTagAndRequiresExplicitPointerAccess) {
         EXPECT_EQ(handle.tag(), tag);
         EXPECT_FALSE(handle.is_null());
     }
-    LaneTaggedSlot empty;
+    LaneTaggedSlot empty{};
     EXPECT_TRUE(empty.is_null());
     EXPECT_TRUE(empty.tag().is_empty());
 }
 
 TEST(TaggedSlot, TypedSlotArraysPreserveTagAlignment) {
-    static_assert(alignof(ChipTaskSlotState) >= (size_t{1} << SUBTASK_SLOT_COUNT));
-    ChipTaskSlotState slots[8]{};
+    static_assert(alignof(TestSlot) >= (size_t{1} << SUBTASK_SLOT_COUNT));
+    TestSlot slots[8]{};
     for (auto &slot : slots) {
-        EXPECT_EQ(reinterpret_cast<uintptr_t>(&slot) % alignof(ChipTaskSlotState), 0u);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(&slot) % alignof(TestSlot), 0u);
         LaneTaggedSlot handle(&slot, LaneMask::all());
         EXPECT_EQ(handle.ptr(), &slot);
         EXPECT_EQ(handle.tag(), LaneMask::all());

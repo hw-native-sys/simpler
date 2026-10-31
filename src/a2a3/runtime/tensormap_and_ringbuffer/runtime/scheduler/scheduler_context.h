@@ -152,15 +152,16 @@ private:
 
     // early_dispatch_shape's batch-pop scratch, one set per scheduler thread. The
     // two arrays are indexed in lockstep: task_id_snapshots[i] is the tag batch[i]
-    // was queued with. Pure scratch -- pop_batch_tagged writes every element a
+    // was queued with. Pure scratch -- pop_shaped_batch writes every element a
     // later read touches, so nothing here carries meaning across calls or runs and
     // deinit() leaves it alone. It lives here rather than on that function's stack
     // so the TaskId array's default construction is paid once, at construction,
     // instead of on every dispatch attempt that finds a free core.
     struct EarlyStagingScratch {
-        ChipTaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+        CapturedReadySlot batch[CoreTracker::MAX_CLUSTERS * 3];
         TaskId task_id_snapshots[CoreTracker::MAX_CLUSTERS * 3];
     };
+    static_assert(sizeof(EarlyStagingScratch) == CoreTracker::MAX_CLUSTERS * 3 * 16);
     EarlyStagingScratch early_staging_[MAX_AICPU_THREADS];
 
     // Per-core dispatch payload storage: dual-buffer for pipelining.
@@ -281,7 +282,7 @@ private:
     }
 
     int pop_ready_tasks_batch(
-        ChipReadyQueue *queues, ResourceShape shape, int32_t thread_idx, ChipTaskSlotState **out, int max_count
+        ChipReadyQueue *queues, ResourceShape shape, int32_t thread_idx, CapturedReadySlot *out, int max_count
     );
 
     void build_payload(
@@ -366,9 +367,17 @@ private:
         int32_t block_idx, PublishHandle *out_handles, bool force_gate = false
     );
 
+    bool requeue_ready_tasks(
+        int32_t thread_idx, ChipReadyQueue &queue, const CapturedReadySlot *entries, int count, ResourceShape shape
+    );
+
+    enum class MixPriority : uint8_t { ReadySync, Ready, Early };
+    LaneMask unreserved_mix_lanes(MixPriority priority, LaneMask &observed) const;
+
     void dispatch_shape(
         int32_t thread_idx, ChipReadyQueue *disp_queues, ResourceShape shape, CoreTracker::DispatchPhase phase,
-        CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
+        CoreTracker &tracker, bool &stop_dispatch, bool &made_progress, bool &try_pushed, MixPriority priority,
+        LaneMask &observed
     );
 
     // Early-dispatch (Hook 1). Mirrors dispatch_ready_tasks: owns its
@@ -398,31 +407,17 @@ private:
     // given phase (IDLE -> onto idle cores in the RUNNING slot; PENDING -> onto a
     // running core's gated pending slot). Pop is sized to the shape's capacity exactly
     // as dispatch_shape sizes normal dispatch. Returns the number of blocks staged.
-    int32_t early_dispatch_shape(int32_t thread_idx, ResourceShape shape, CoreTracker::DispatchPhase phase);
+    int32_t
+    early_dispatch_shape(int32_t thread_idx, ResourceShape shape, CoreTracker::DispatchPhase phase, LaneMask &observed);
 
-    // One pass of "Phase 4" in the resolve_and_dispatch loop: IDLE-stage dispatch
-    // for MIX then (if no mix residual) AIC/AIV; then PENDING-stage dispatch with
-    // cross-thread idle gating. MIX is strictly prioritized — when mix residual is
-    // detected after MIX-IDLE, AIC/AIV are skipped for the whole pass but
-    // MIX-PENDING still runs.
-    //
-    // Forward-progress argument for AIC/AIV: skip_aic_aiv is sticky for the
-    // current pass only. The next loop iteration re-evaluates after Phase 1
-    // completion polling and the global MIX queue draining (here or on any
-    // peer thread). AIC/AIV starvation is therefore bounded by MIX throughput,
-    // not unbounded — once mix completes on at least one cluster, the next
-    // pass either drains the residual or admits AIC/AIV.
+    // Ready sync_start precedes regular ready work. Each pure placement samples
+    // the applicable MIX priority prefix and retains observed demand for this pass.
     void dispatch_ready_tasks(
         int32_t thread_idx, CoreTracker &tracker, bool pmu_active, bool &made_progress, bool &try_pushed
     );
 
-    // Shared staging order for both dispatch sources (normal ready + speculative early):
-    // MIX strict priority, IDLE stage before PENDING stage, cross-thread idle gating
-    // (MIX-IDLE ▶ c/v-IDLE ▶ MIX-PEND ▶ c/v-PEND). `stage(shape, phase)` stages that
-    // shape+phase bucket for the source and returns true to STOP the pass (normal returns
-    // true when it enters drain mode; early always returns false). `residual_mix()` reports
-    // whether MIX work remains queued for the source (normal reads ready_queues[MIX], early
-    // reads early_dispatch_queues[MIX]). IDLE runs under PMU; PENDING is withheld under PMU.
+    // Shared MIX/idle/pending order. Pure stages filter physical lanes in their
+    // leaf queries; residual_mix() refreshes the prefix for peer-idle hints.
     template <typename StageFn, typename ResidualMixFn>
     void run_staging_order(int32_t thread_idx, bool pmu_active, StageFn &&stage, ResidualMixFn &&residual_mix);
 
@@ -431,29 +426,6 @@ private:
     // — see the implementation in scheduler_dispatch.cpp for the hint-semantics
     // rationale and the safety argument against the drain worker.
     bool has_idle_in_other_threads(int32_t self_thread_idx, ResourceShape shape) const;
-
-    // True if mix tasks remain in the global MIX ready queue. Approximate —
-    // ChipReadyQueue::size() (see scheduler.h) snapshots its enqueue/dequeue
-    // positions with std::memory_order_relaxed and may interleave with concurrent
-    // push/pop. A stale read here causes at most one
-    // extra/missed AIC/AIV skip and self-corrects on the next loop iteration.
-    bool has_residual_mix() const { return sched_->ready_queues[static_cast<int32_t>(ResourceShape::MIX)].size() > 0; }
-
-    // Tier-0 analog of has_residual_mix for the ready sync_start lane: true if MIX
-    // sync_start cohorts remain queued, so the Tier-0 pass keeps MIX strict priority
-    // over its own AIC/AIV sync work. Same relaxed-size snapshot caveat.
-    bool has_residual_sync_mix() const {
-        return sched_->ready_sync_queues[static_cast<int32_t>(ResourceShape::MIX)].size() > 0;
-    }
-
-    // Early-dispatch analog of has_residual_mix: true if MIX early-dispatch candidates
-    // remain queued. has_residual_mix reads the normal MIX ready queue, which is empty
-    // whenever the Phase-4b early pass runs (it is gated on all ready_queues being
-    // empty), so early-dispatch MIX priority needs its own residual check against
-    // early_dispatch_queues[MIX]. Same relaxed-size snapshot caveat as has_residual_mix.
-    bool has_residual_early_mix() const {
-        return sched_->early_dispatch_queues[static_cast<int32_t>(ResourceShape::MIX)].size() > 0;
-    }
 
     // =========================================================================
     // Completion & drain (scheduler_completion.cpp)
@@ -500,6 +472,25 @@ private:
     void handle_drain_mode(
         int32_t thread_idx, uint64_t *out_stage_wall_cycles = nullptr, int32_t *out_staged_blocks = nullptr
     );
+
+    // Returns true iff this call won the first-writer CAS for sched_error_code — the
+    // caller may then write companion fields (e.g. the stall detail) knowing they
+    // describe the same observation that owns the latched code.
+    static bool latch_scheduler_error(SharedMemoryHeader *header, int32_t thread_idx, int32_t error_code) {
+        if (header == nullptr || error_code == SIMPLER_ERROR_NONE) {
+            return false;
+        }
+        // The first error code/thread pair wins; the bitmap cumulatively records all reporting threads.
+        int32_t expected = SIMPLER_ERROR_NONE;
+        bool won = header->sched_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel);
+        if (won) {
+            header->sched_error_thread.store(thread_idx, std::memory_order_release);
+        }
+        if (thread_idx >= 0 && thread_idx < 32) {
+            header->sched_error_bitmap.fetch_or(1U << static_cast<uint32_t>(thread_idx), std::memory_order_acq_rel);
+        }
+        return won;
+    }
 
     // =========================================================================
     // Cold path: exit checks, stall diagnostics, profiling (scheduler_cold_path.cpp)

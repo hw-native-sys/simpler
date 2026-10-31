@@ -499,9 +499,16 @@ public:
 
     enum class DispatchPhase : uint8_t { IDLE, PENDING };
 
-    BitStates get_dispatchable_cores(ResourceShape shape, DispatchPhase phase) const {
-        return (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) :
-                                                get_pending_core_offset_states(shape);
+    BitStates
+    get_dispatchable_cores(ResourceShape shape, DispatchPhase phase, LaneMask allowed = LaneMask::all()) const {
+        BitStates available =
+            (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) : get_pending_core_offset_states(shape);
+        if (shape == ResourceShape::MIX) return available;
+        BitStates lanes;
+        if (allowed.has_aic()) lanes |= aic_mask_;
+        if (allowed.has_aiv0()) lanes |= aic_mask_ << 1;
+        if (allowed.has_aiv1()) lanes |= aic_mask_ << 2;
+        return available & lanes;
     }
 
     // --- Bit offset <-> worker_id mapping ---

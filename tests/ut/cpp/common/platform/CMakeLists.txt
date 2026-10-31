@@ -60,6 +60,46 @@ platform_single_case(test_kernel_execution_state.cpp
     SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_execution_state.cpp)
 
 platform_single_case(test_lane_mask.cpp)
+platform_single_case(test_lane_demand_counter.cpp)
+
+if(APPLE)
+    set(_mix_lane_gc -Wl,-dead_strip)
+else()
+    set(_mix_lane_gc -Wl,--gc-sections)
+endif()
+foreach(arch a2a3 a5)
+    simpler_ut_add_target(NAME test_${arch}_hbg_mix_lane_priority ARCH ${arch} RUNTIME host_build_graph TIER aicpu
+        SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_priority.cpp
+            ${SIMPLER_SRC}/common/host_build_graph/device/graph_execution.cpp
+            ${SIMPLER_SRC}/${arch}/runtime/host_build_graph/runtime/scheduler/scheduler_dispatch.cpp
+            ${SIMPLER_SRC}/${arch}/runtime/host_build_graph/runtime/scheduler/scheduler_completion.cpp
+            ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+        DEFINES SIMPLER_DFX=0 LINK ${arch}_ut_support
+        COMPILE_OPTIONS -ffunction-sections -fdata-sections LINK_OPTIONS ${_mix_lane_gc} TIMEOUT 30)
+endforeach()
+
+target_sources(test_a5_hbg_mix_lane_priority PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../host_build_graph/support/scheduler_drain_a5_stubs.cpp)
+
+simpler_ut_add_target(NAME test_a2a3_tmr_mix_lane_priority ARCH a2a3 RUNTIME tensormap_and_ringbuffer TIER aicpu
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_priority.cpp
+        ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_dispatch.cpp
+        ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer/runtime/scheduler/scheduler_completion.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/device_phase_aicpu.cpp
+        ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
+    DEFINES SIMPLER_DFX=0 LINK a2a3_ut_support
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections LINK_OPTIONS ${_mix_lane_gc} TIMEOUT 30)
+
+
+
+foreach(arch a2a3 a5)
+    simpler_ut_add_target(NAME test_${arch}_hbg_mix_lane_profiling ARCH ${arch} RUNTIME host_build_graph TIER aicpu
+        SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_queue_profiling.cpp
+        DEFINES SIMPLER_DFX=1 SIMPLER_ORCH_PROFILING=1 SIMPLER_SCHED_PROFILING=1 LINK ${arch}_ut_support TIMEOUT 30)
+endforeach()
+simpler_ut_add_target(NAME test_a2a3_tmr_mix_lane_profiling ARCH a2a3 RUNTIME tensormap_and_ringbuffer TIER aicpu
+    SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/test_mix_lane_queue_profiling.cpp
+    DEFINES SIMPLER_DFX=1 SIMPLER_ORCH_PROFILING=1 SIMPLER_SCHED_PROFILING=1 LINK a2a3_ut_support TIMEOUT 30)
 
 # The growth coordinator is production: the onboard host runtime links this
 # same translation unit, so the trim, the retry policy and the holder discovery

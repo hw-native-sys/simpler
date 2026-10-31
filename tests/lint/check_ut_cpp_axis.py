@@ -104,6 +104,17 @@ SINGLE_CONTEXT_TREES = frozenset({"utils", "hierarchical", "runtime_status"})
 # is a gap to close rather than an absent combination, and its reason says so. A
 # stale entry is an error, so the table only shrinks.
 WAIVERS: dict[tuple[str, str], str] = {
+    ("common/platform/test_mix_lane_priority.cpp", "a5/tensormap_and_ringbuffer"): (
+        "this case exercises the three backends' priority-prefix and captured-cell "
+        "queue APIs; a5 TMR uses the same TaggedPtr/LaneDemandCounter types with "
+        "its reservation-before-claim admission policy and different queue APIs, "
+        "covered by test_mix_admission and test_mix_spare_lane"
+    ),
+    ("common/platform/test_mix_lane_queue_profiling.cpp", "a5/tensormap_and_ringbuffer"): (
+        "this case exercises push_mix/pop_shaped_batch profiling APIs of the "
+        "three priority-prefix backends; a5 TMR shares the counter types but "
+        "uses its reservation-aware queue API, covered by test_ready_queue_profiling"
+    ),
     ("common/platform/test_kernel_persistent_args.cpp", "a5/tensormap_and_ringbuffer"): (
         "the test asserts the uploaded Runtime prefix ends at teardown_gates; "
         "a5's tensormap_and_ringbuffer Runtime has no such device-initialized "
