@@ -340,6 +340,36 @@ the runtime's own. See
 for what the namespace guarantees in each view, the cost of one attempt, and how
 to read the records back.
 
+## Native framework queue submission
+
+`Worker.prepare_submission(callable, args, config, caller_stream=address,
+keepalive=(...))` prepares a direct L2 invocation without launching it or waiting
+for lane capacity. It snapshots arguments/configuration and reserves the callable
+and referenced Simpler buffers. Pass external tensor and stream owners in
+`keepalive`; raw addresses do not retain storage. Capture and L3 Python
+orchestration are outside this interface.
+
+The returned `PreparedSubmission` supports the usual `RunHandle.wait()` and
+`done()`. On the Python thread, pass `ticket.native_handle` to your native adapter.
+The capsule is named `simpler.NativeSubmission.v1`; its SDK is
+`src/common/worker/native_submission.h`. The adapter retains a
+`NativeSubmissionRef` before returning to Python and captures only that native
+reference in its framework queue callback. Calling its `submit()` uses the
+existing chip lane admission and caller-stream entry/exit ordering. Retain,
+submit and release require no Python calls or GIL. Native submit errors must be
+reported through the adapter's error channel before consumers use outputs.
+
+Tokens are one-shot. If enqueue fails, `ticket.cancel()` retires a token that has
+not started native submission; it returns false once submission has started.
+A cancelled or consumed token rejects later submission. `ticket.wait()` or
+`Worker.close()` retires Python owners after completion. An unsubmitted,
+uncancelled token can make close time out; cancel it and retry close. Unknown
+completion errors conservatively retain owners. Keep the interpreter alive
+until queued callbacks and Worker cleanup finish; tokens cannot cross a fork.
+
+See the [native queue example](../../../examples/workers/l2/framework_eager/native_submission.py)
+for real framework producer/kernel/consumer ordering and cancellation handling.
+
 ## `simpler_setup`
 
 Compilation and test scaffolding. Exported from the package root:

@@ -21,6 +21,8 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
+#include "native_submission.h"
+
 namespace py = pybind11;
 
 struct QueuedCall {
@@ -40,7 +42,42 @@ struct QueuedCall {
     }
 };
 
+struct QueuedNativeCall {
+    explicit QueuedNativeCall(const SimplerNativeSubmissionV1 &api) :
+        submission(api) {}
+    NativeSubmissionRef submission;
+    std::atomic<bool> complete{false};
+    std::string error;
+    void check() const {
+        if (!complete.load(std::memory_order_acquire)) throw std::runtime_error("native callback is not complete");
+        if (!error.empty()) throw std::runtime_error(error);
+    }
+};
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+    py::class_<QueuedNativeCall, std::shared_ptr<QueuedNativeCall>>(module, "QueuedNativeCall")
+        .def("check", &QueuedNativeCall::check);
+    module.def("enqueue_native", [](py::capsule capsule) {
+        auto *api = static_cast<SimplerNativeSubmissionV1 *>(
+            PyCapsule_GetPointer(capsule.ptr(), SIMPLER_NATIVE_SUBMISSION_CAPSULE)
+        );
+        if (!api) throw py::error_already_set();
+        auto call = std::make_shared<QueuedNativeCall>(*api);
+        auto invoke = [call]() -> int {
+            try {
+                call->submission.submit();
+            } catch (const std::exception &error) {
+                call->error = error.what();
+            } catch (...) {
+                call->error = "unknown native submission exception";
+            }
+            call->complete.store(true, std::memory_order_release);
+            return 0;
+        };
+        py::gil_scoped_release unlocked;
+        at_npu::native::OpCommand::RunOpApi("SimplerNativeSubmit", invoke, false);
+        return call;
+    });
     py::class_<QueuedCall, std::shared_ptr<QueuedCall>>(module, "QueuedCall")
         .def("check", &QueuedCall::check)
         .def(
