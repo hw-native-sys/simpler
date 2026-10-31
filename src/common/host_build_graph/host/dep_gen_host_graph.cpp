@@ -26,11 +26,12 @@
  *
  * The graph accumulates directly in the shape a background writer owns
  * (`simpler::dfx::host_graph::HostGraphExport`), so handing it over is a move of
- * five vectors rather than a copy. The serializer lives in that same header.
+ * its vectors rather than a copy. The serializer lives in that same header.
  */
 
 #include "host_build_graph/host/dep_gen_host_graph.h"
 
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <fstream>
@@ -43,6 +44,7 @@
 #include "common/unified_log.h"
 #include "data_type.h"
 #include "host/host_graph_runs.h"
+#include "host_build_graph/graph_execution.h"
 
 namespace hg = simpler::dfx::host_graph;
 
@@ -136,18 +138,24 @@ struct HostGraphState {
     std::unordered_set<TaskId> task_preds;
     uint64_t current_task_id = 0;
     bool in_task = false;
+    std::unordered_map<uint64_t, uint32_t> definition_index;  // graph_key → graph_definitions[] idx
 
     // Releases the previous graph's memory rather than clear()ing it: a captured
     // graph is proportional to the task count, and a process that ran capture
     // once would otherwise hold that peak for its lifetime.
     void reset() {
         graph.release();
-        std::unordered_map<uint64_t, size_t>{}.swap(tensor_index);
-        std::unordered_set<TaskId>{}.swap(task_preds);
+        release_indexes();
         captured = false;
         capture_open = false;
         current_task_id = 0;
         in_task = false;
+    }
+
+    void release_indexes() {
+        std::unordered_map<uint64_t, size_t>{}.swap(tensor_index);
+        std::unordered_set<TaskId>{}.swap(task_preds);
+        std::unordered_map<uint64_t, uint32_t>{}.swap(definition_index);
     }
 };
 
@@ -218,8 +226,9 @@ void dep_gen_host_graph_begin_capture() {
 }
 
 void dep_gen_host_graph_begin_task(
-    TaskId task_id, bool in_manual_scope, bool early_dispatch, const int32_t kernel_ids[3], int32_t block_num,
-    int32_t tensor_count, const TensorRef *tensors, const TensorArgType *arg_types
+    TaskId task_id, bool in_manual_scope, bool early_dispatch, bool sync_start, bool predicated,
+    const int32_t kernel_ids[3], int32_t block_num, int32_t tensor_count, const TensorRef *tensors,
+    const TensorArgType *arg_types
 ) {
     HostGraphState &s = state();
     if (!s.enabled) {
@@ -231,14 +240,16 @@ void dep_gen_host_graph_begin_task(
     s.captured = true;
 
     // Args live in one flat block addressed by per-task offsets, so the whole
-    // graph is five vectors a hand-off can move. The leading zero is the first
-    // task's start.
+    // graph is a few flat vectors a hand-off can move. The leading zero is the
+    // first task's start.
     if (s.graph.task_arg_offsets.empty()) s.graph.task_arg_offsets.push_back(0);
 
     hg::TaskEntry entry;
     entry.task_id = s.current_task_id;
     entry.in_manual_scope = in_manual_scope;
     entry.early_dispatch = early_dispatch;
+    entry.sync_start = sync_start;
+    entry.predicated = predicated;
     entry.kernel_id[0] = kernel_ids != nullptr ? kernel_ids[0] : -1;
     entry.kernel_id[1] = kernel_ids != nullptr ? kernel_ids[1] : -1;
     entry.kernel_id[2] = kernel_ids != nullptr ? kernel_ids[2] : -1;
@@ -336,6 +347,54 @@ void dep_gen_host_graph_add_tensormap_edge(
     s.graph.edges.push_back(e);
 }
 
+void dep_gen_host_graph_add_graph_body(TaskId graph_task, const GraphDefinition &definition) {
+    HostGraphState &s = state();
+    if (!s.enabled) {
+        return;
+    }
+    hg::HostGraphExport &g = s.graph;
+    auto known = s.definition_index.find(definition.graph_key);
+    if (known == s.definition_index.end()) {
+        const int32_t n = definition.task_count;
+        const auto *subs = graph_definition_array<SubTaskDefinition>(definition, definition.off_sub_tasks, n);
+        const auto *fanin_offsets = graph_definition_array<int32_t>(definition, definition.off_fanin_offsets, n + 1);
+        const auto *fanin_indices =
+            definition.edge_count == 0 ?
+                nullptr :
+                graph_definition_array<uint16_t>(definition, definition.off_fanin_indices, definition.edge_count);
+        if (subs == nullptr || fanin_offsets == nullptr || (definition.edge_count != 0 && fanin_indices == nullptr)) {
+            LOG_ERROR(
+                "dep_gen host graph: Graph task %" PRIu64 " has an unreadable Definition", TaskId::to_uint64(graph_task)
+            );
+            return;
+        }
+        hg::GraphDefinitionEntry entry;
+        entry.first_task = static_cast<uint32_t>(g.graph_tasks.size());
+        entry.task_count = static_cast<uint32_t>(n);
+        entry.first_edge = static_cast<uint32_t>(g.graph_edges.size());
+        for (int32_t i = 0; i < n; i++) {
+            const TaskAttrs attrs(subs[i].task_attrs);
+            hg::GraphTaskEntry task;
+            for (int32_t k = 0; k < 3; k++) {
+                task.kernel_id[k] = subs[i].kernel_id[k];
+            }
+            task.block_num = subs[i].logical_block_num > 0 ? static_cast<uint32_t>(subs[i].logical_block_num) : 1u;
+            task.sync_start = attrs.requires_sync_start();
+            task.predicated = attrs.has_predicate();
+            g.graph_tasks.push_back(task);
+            // The fanin CSR names each task's producers; deps.json names edges.
+            for (int32_t e = fanin_offsets[i]; e < fanin_offsets[i + 1]; e++) {
+                g.graph_edges.push_back(hg::GraphEdgeEntry{fanin_indices[e], static_cast<uint32_t>(i)});
+            }
+        }
+        entry.edge_count = static_cast<uint32_t>(g.graph_edges.size()) - entry.first_edge;
+        known =
+            s.definition_index.emplace(definition.graph_key, static_cast<uint32_t>(g.graph_definitions.size())).first;
+        g.graph_definitions.push_back(entry);
+    }
+    g.graph_shells.push_back(hg::GraphShellEntry{TaskId::to_uint64(graph_task), known->second});
+}
+
 // ---------------------------------------------------------------------------
 // Control surface
 // ---------------------------------------------------------------------------
@@ -361,9 +420,12 @@ extern "C" int dep_gen_host_graph_take(hg::HostGraphExport *out) {
     out->task_args = std::move(s.graph.task_args);
     out->tensors = std::move(s.graph.tensors);
     out->edges = std::move(s.graph.edges);
+    out->graph_definitions = std::move(s.graph.graph_definitions);
+    out->graph_tasks = std::move(s.graph.graph_tasks);
+    out->graph_edges = std::move(s.graph.graph_edges);
+    out->graph_shells = std::move(s.graph.graph_shells);
     s.graph.release();
-    std::unordered_map<uint64_t, size_t>{}.swap(s.tensor_index);
-    std::unordered_set<TaskId>{}.swap(s.task_preds);
+    s.release_indexes();
     s.capture_open = false;
     s.captured = false;
     s.in_task = false;

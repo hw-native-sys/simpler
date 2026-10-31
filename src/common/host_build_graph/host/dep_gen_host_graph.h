@@ -29,6 +29,7 @@
  *   add_creator_edge()      — STEP 3 Step A, per creator-retention producer
  *   add_tensormap_edge()    — STEP 3 Step B, per tensormap producer
  *   end_task()              — closes the task, after its last dependency step
+ *   add_graph_body()        — per Graph task, once bind has fixed its Definition
  *
  * Control surface, called from the device runner (same host_runtime.so):
  *   set_enabled() / active() / take() / emit()
@@ -83,13 +84,14 @@ bool dep_gen_host_graph_enabled();
 void dep_gen_host_graph_begin_capture();
 
 /**
- * Open a task's graph entry: its identity, launch shape, and arg slots. Any
- * tensor arg not yet materialized (OUTPUT) is recorded without tensor info,
- * matching what the runtime knows at submit time.
+ * Open a task's graph entry: its identity, launch shape and attributes, and arg
+ * slots. Any tensor arg not yet materialized (OUTPUT) is recorded without tensor
+ * info, matching what the runtime knows at submit time.
  */
 void dep_gen_host_graph_begin_task(
-    TaskId task_id, bool in_manual_scope, bool early_dispatch, const int32_t kernel_ids[3], int32_t block_num,
-    int32_t tensor_count, const TensorRef *tensors, const TensorArgType *arg_types
+    TaskId task_id, bool in_manual_scope, bool early_dispatch, bool sync_start, bool predicated,
+    const int32_t kernel_ids[3], int32_t block_num, int32_t tensor_count, const TensorRef *tensors,
+    const TensorArgType *arg_types
 );
 
 /**
@@ -110,6 +112,17 @@ void dep_gen_host_graph_add_tensormap_edge(
     TaskId producer, int32_t arg_idx, const simpler::hbg::Tensor &consumer, const ChipTensorMapEntry &entry,
     OverlapStatus overlap
 );
+
+struct GraphDefinition;
+
+/**
+ * The body a Graph task replays, recorded at bind: a Definition is not final
+ * while its task is submitted. A Definition replayed by several tasks — the same
+ * `graph_key` — is recorded once and named by each. A reader names body task `i`
+ * of Graph task `t` TaskId::make_sub_task(t's local id, i), the id the device
+ * runs it under.
+ */
+void dep_gen_host_graph_add_graph_body(TaskId graph_task, const GraphDefinition &definition);
 
 // ---------------------------------------------------------------------------
 // Control surface (device-runner side)

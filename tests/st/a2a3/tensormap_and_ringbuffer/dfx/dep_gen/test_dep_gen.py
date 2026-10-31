@@ -38,7 +38,7 @@ import time
 import torch
 from simpler.task_interface import ArgDirection as D
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
+from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _outputs_dir, _sanitize_for_filename
 from simpler_setup.tools.tmr import TaskId
 
@@ -263,6 +263,176 @@ class TestDepGen(SceneTestCase):
                 check=True,
                 timeout=60,
             )
+
+
+PREDICATED_DISPATCH = "../../predicated_dispatch"
+SPMD_MIX_KERNELS = "../../spmd_multiblock_mix/kernels"
+
+
+def _launch_tasks(test_cls_name, case_name, run_marker):
+    """tasks[] of the deps.json this run wrote, in submit order. Compute
+    correctness is left to the orchestration's own test."""
+    label = _sanitize_for_filename(f"{test_cls_name}_{case_name}")
+    matches = [p for p in _outputs_dir().glob(f"{label}_*") if p.stat().st_mtime >= run_marker]
+    assert matches, f"--enable-dep-gen is on and case {case_name!r} ran, but no output dir was created this run"
+    deps_path = max(matches, key=lambda p: p.stat().st_mtime) / "deps.json"
+    assert deps_path.exists(), f"deps.json was not produced under {deps_path.parent}"
+    with deps_path.open() as f:
+        return json.load(f)["tasks"]
+
+
+class _LaunchAttrsCase(SceneTestCase):
+    """Runs the scene test, then asserts the launch attributes deps.json records."""
+
+    EXPECTED: list = []
+
+    def expected(self, tasks):
+        """(sync_start, predicated) per task, in submit order."""
+        return self.EXPECTED
+
+    def test_run(self, st_platform, st_worker, request):
+        run_marker = int(time.time())
+        super().test_run(st_platform, st_worker, request)
+        if not self._effective_enable_dep_gen(request):
+            return
+        for case in self._matching_cases(st_platform, request):
+            tasks = _launch_tasks(type(self).__name__, case["name"], run_marker)
+            got, want = [(t["sync_start"], t["predicated"]) for t in tasks], self.expected(tasks)
+            assert got == want, f"deps.json launch attributes: got {got}, expected {want}"
+
+
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
+class TestDepGenPredicated(_LaunchAttrsCase):
+    """predicated_dispatch: only the clobber carries a dispatch predicate."""
+
+    RTOL = 0
+    ATOL = 0
+
+    CALLABLE = {
+        "orchestration": {
+            "source": f"{PREDICATED_DISPATCH}/kernels/orchestration/predicated_dispatch_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.INOUT, D.INOUT, D.INOUT],
+        },
+        "incores": [
+            {
+                "func_id": 0,
+                "source": f"{PREDICATED_DISPATCH}/kernels/aic/kernel_write_const.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 1,
+                "source": f"{PREDICATED_DISPATCH}/kernels/aic/kernel_copy_first.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.INOUT],
+            },
+            {
+                "func_id": 2,
+                "source": f"{PREDICATED_DISPATCH}/kernels/aic/kernel_clobber.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 3,
+                "source": f"{PREDICATED_DISPATCH}/kernels/aic/kernel_write_gate.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+        ],
+    }
+
+    CASES = [
+        {
+            "name": "gate_open",
+            "platforms": ["a2a3sim", "a2a3"],
+            "manual": ["a2a3sim"],
+            "config": {"aicpu_thread_num": 2},
+            "params": {"case": 2},
+        },
+    ]
+
+    # Submit order: write gate, write X, the predicated clobber of X, copy X to Y.
+    EXPECTED = [(False, False), (False, False), (False, True), (False, False)]
+
+    def generate_args(self, params):
+        return TaskArgsBuilder(
+            TensorArg("x", torch.full((16,), -1.0, dtype=torch.float32)),
+            TensorArg("y", torch.full((16,), -1.0, dtype=torch.float32)),
+            TensorArg("gate", torch.full((16,), -1, dtype=torch.int32)),
+            Scalar("case", int(params["case"])),
+        )
+
+    def compute_golden(self, args, params):
+        # case=2 opens the gate, so the clobber dispatches and X/Y end at 999.0.
+        args.gate[0] = 1
+        args.x[0] = 999.0
+        args.y[0] = 999.0
+
+
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
+class TestDepGenSyncStart(_LaunchAttrsCase):
+    """spmd_sync_start: four MIX tasks, every one but the third sync-start."""
+
+    CALLABLE = {
+        "orchestration": {
+            "source": "../../spmd_sync_start/kernels/orchestration/spmd_sync_start_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.INOUT, D.INOUT],
+        },
+        "incores": [
+            {
+                "func_id": 0,
+                "source": f"{SPMD_MIX_KERNELS}/aic/kernel_spmd_mix.cpp",
+                "core_type": "aic",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 1,
+                "source": f"{SPMD_MIX_KERNELS}/aiv/kernel_spmd_mix.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
+            {
+                "func_id": 2,
+                "source": f"{SPMD_MIX_KERNELS}/aiv/kernel_spmd_mix.cpp",
+                "core_type": "aiv",
+                "signature": [D.INOUT],
+            },
+        ],
+    }
+
+    CASES = [
+        {
+            "name": "four_tasks",
+            "platforms": ["a2a3sim", "a2a3"],
+            "manual": ["a2a3sim"],
+            "params": {},
+        },
+    ]
+
+    REQUESTED = (True, True, False, True)
+
+    def expected(self, tasks):
+        # The runtime keeps a sync-start request only on a task of more than one
+        # block, and the orchestration sizes each task to the run's clusters.
+        want = [(asked and t["block_num"] > 1, False) for asked, t in zip(self.REQUESTED, tasks)]
+        assert len(tasks) == len(self.REQUESTED) and any(sync for sync, _ in want), [t["block_num"] for t in tasks]
+        return want
+
+    def generate_args(self, params):
+        # The orchestration sizes its four tasks to the run's cluster count; at the
+        # 24 clusters it is planned for they span 24 blocks of three 16-float lines.
+        return TaskArgsBuilder(
+            TensorArg("output", torch.zeros(24 * 3 * 16, dtype=torch.float32)),
+            TensorArg("layout", torch.zeros(2 * 4, dtype=torch.int32)),
+        )
+
+    def compute_golden(self, args, params):
+        pass
+
+    def compare_outputs(self, test_args, golden_args, output_names, params):
+        pass
 
 
 if __name__ == "__main__":

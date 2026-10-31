@@ -26,10 +26,9 @@
  * argument tag is the raw `TensorArgType` byte, which is how
  * `common/platform/include/common/dep_gen.h` already carries it one layer down.
  *
- * The JSON is the schema in docs/dfx/dep-gen.md — byte for byte what the
- * capturing thread wrote before. The writer lives here, inline, so the capture
- * translation unit and the platform's exporter share one implementation without
- * either gaining a link edge on the other.
+ * The JSON is the schema in docs/dfx/dep-gen.md. The writer lives here, inline,
+ * so the capture translation unit and the platform's exporter share one
+ * implementation without either gaining a link edge on the other.
  */
 
 #pragma once
@@ -93,8 +92,38 @@ struct TaskEntry {
     uint64_t task_id{0};  // encoded, TaskId::to_uint64
     bool in_manual_scope{false};
     bool early_dispatch{false};
+    bool sync_start{false};            // its blocks start together or not at all
+    bool predicated{false};            // a dispatch predicate may skip its kernel
     int32_t kernel_id[3]{-1, -1, -1};  // {AIC, AIV0, AIV1}, -1 = inactive
     uint32_t block_num{1};
+};
+
+/** One task of a Graph Definition's body, named by its index in the body. */
+struct GraphTaskEntry {
+    int32_t kernel_id[3]{-1, -1, -1};
+    uint32_t block_num{1};
+    bool sync_start{false};
+    bool predicated{false};
+};
+
+/** An edge inside a Graph body, between two of its tasks' indices. */
+struct GraphEdgeEntry {
+    uint32_t pred{0};
+    uint32_t succ{0};
+};
+
+/** One Definition: its tasks and edges, as ranges of the export's flat vectors. */
+struct GraphDefinitionEntry {
+    uint32_t first_task{0};
+    uint32_t task_count{0};
+    uint32_t first_edge{0};
+    uint32_t edge_count{0};
+};
+
+/** A Graph task, and the Definition (an index into `graph_definitions`) it replays. */
+struct GraphShellEntry {
+    uint64_t task_id{0};  // encoded
+    uint32_t definition{0};
 };
 
 /** The underlying storage behind a tensor id, keyed by (addr, version). */
@@ -144,11 +173,14 @@ inline bool output_dir_fits(size_t length) { return length + kOutputDirNameHeadr
 /**
  * One run's graph, owned independently of the capture that produced it.
  *
- * The writer reads nothing a later run touches: the five vectors were moved out
- * of the thread-local state, and the identity and destination are the ones the
- * run itself supplied rather than whatever the runner's config says by the time
- * the writer gets here. The destination is fixed-capacity so the bytes an
+ * The writer reads nothing a later run touches: the vectors were moved out of
+ * the thread-local state, and the identity and destination are the ones the run
+ * itself supplied rather than whatever the runner's config says by the time the
+ * writer gets here. The destination is fixed-capacity so the bytes an
  * unpublished export holds are known before it is accepted.
+ *
+ * A Graph task is one entry in `tasks`; the body it replays is in the four
+ * `graph_` vectors, each Definition once however many tasks replay it.
  */
 struct HostGraphExport {
     uint64_t run_epoch{0};
@@ -159,12 +191,18 @@ struct HostGraphExport {
     std::vector<TaskArgEntry> task_args;     // tasks[i]'s args are [off[i], off[i + 1])
     std::vector<TensorEntry> tensors;
     std::vector<EdgeEntry> edges;
+    std::vector<GraphDefinitionEntry> graph_definitions;
+    std::vector<GraphTaskEntry> graph_tasks;
+    std::vector<GraphEdgeEntry> graph_edges;
+    std::vector<GraphShellEntry> graph_shells;
 
-    /** The bytes the five vectors hold, from their own capacity. */
+    /** The bytes the vectors hold, from their own capacity. */
     size_t payload_bytes() const {
         return tasks.capacity() * sizeof(TaskEntry) + task_arg_offsets.capacity() * sizeof(uint32_t) +
                task_args.capacity() * sizeof(TaskArgEntry) + tensors.capacity() * sizeof(TensorEntry) +
-               edges.capacity() * sizeof(EdgeEntry);
+               edges.capacity() * sizeof(EdgeEntry) + graph_definitions.capacity() * sizeof(GraphDefinitionEntry) +
+               graph_tasks.capacity() * sizeof(GraphTaskEntry) + graph_edges.capacity() * sizeof(GraphEdgeEntry) +
+               graph_shells.capacity() * sizeof(GraphShellEntry);
     }
 
     /** Drop the payload and report nothing: the charge is the caller's record. */
@@ -174,6 +212,10 @@ struct HostGraphExport {
         std::vector<TaskArgEntry>{}.swap(task_args);
         std::vector<TensorEntry>{}.swap(tensors);
         std::vector<EdgeEntry>{}.swap(edges);
+        std::vector<GraphDefinitionEntry>{}.swap(graph_definitions);
+        std::vector<GraphTaskEntry>{}.swap(graph_tasks);
+        std::vector<GraphEdgeEntry>{}.swap(graph_edges);
+        std::vector<GraphShellEntry>{}.swap(graph_shells);
     }
 };
 
@@ -241,6 +283,39 @@ inline void write_uint_array(std::ostream &out, const uint32_t *data, uint32_t n
     out << ']';
 }
 
+// The Graph bodies, as `,"graph_definitions":[...],"graph_shells":[...]`.
+inline void write_graph_bodies(std::ostream &out, const HostGraphExport &g) {
+    out << ",\"graph_definitions\":[";
+    for (size_t d = 0; d < g.graph_definitions.size(); d++) {
+        if (d > 0) out << ',';
+        const GraphDefinitionEntry &def = g.graph_definitions[d];
+        out << "{\"definition\":" << d << ",\"tasks\":[";
+        for (uint32_t i = 0; i < def.task_count; i++) {
+            if (i > 0) out << ',';
+            const GraphTaskEntry &t = g.graph_tasks[def.first_task + i];
+            out << "{\"index\":" << i;
+            out << ",\"kernel_ids\":[" << t.kernel_id[0] << ',' << t.kernel_id[1] << ',' << t.kernel_id[2] << ']';
+            out << ",\"block_num\":" << t.block_num;
+            out << ",\"sync_start\":" << (t.sync_start ? "true" : "false");
+            out << ",\"predicated\":" << (t.predicated ? "true" : "false") << '}';
+        }
+        out << "],\"edges\":[";
+        for (uint32_t e = 0; e < def.edge_count; e++) {
+            if (e > 0) out << ',';
+            const GraphEdgeEntry &edge = g.graph_edges[def.first_edge + e];
+            out << '[' << edge.pred << ',' << edge.succ << ']';
+        }
+        out << "]}";
+    }
+    out << "],\"graph_shells\":[";
+    for (size_t i = 0; i < g.graph_shells.size(); i++) {
+        if (i > 0) out << ',';
+        out << "{\"task_id\":\"" << g.graph_shells[i].task_id << "\",\"definition\":" << g.graph_shells[i].definition
+            << '}';
+    }
+    out << ']';
+}
+
 }  // namespace detail
 
 /**
@@ -274,6 +349,8 @@ inline void write_host_graph_body(std::ostream &out, const HostGraphExport &g) {
         // kernel without the AICore record carrying the field itself.
         out << ",\"kernel_ids\":[" << t.kernel_id[0] << ',' << t.kernel_id[1] << ',' << t.kernel_id[2] << ']';
         out << ",\"block_num\":" << t.block_num;
+        out << ",\"sync_start\":" << (t.sync_start ? "true" : "false");
+        out << ",\"predicated\":" << (t.predicated ? "true" : "false");
         out << ",\"args\":[";
         const uint32_t first = g.task_arg_offsets[i];
         const uint32_t last = g.task_arg_offsets[i + 1];
@@ -338,7 +415,10 @@ inline void write_host_graph_body(std::ostream &out, const HostGraphExport &g) {
         }
         out << '}';
     }
-    out << "]}\n";
+    out << ']';
+    // Graph sections are written only for a run that replayed a Graph.
+    if (!g.graph_shells.empty()) detail::write_graph_bodies(out, g);
+    out << "}\n";
 }
 
 }  // namespace simpler::dfx::host_graph
