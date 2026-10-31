@@ -1622,4 +1622,20 @@ int simpler_kernel_mode_launch(DeviceContextHandle ctx, int32_t callable_id, con
     return PTO_RUNTIME_ERR_INVALID_STATE;
 }
 
+int simpler_kernel_capture_supported(DeviceContextHandle) { return 0; }
+
+int simpler_retain_run_resources(
+    DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle *reference
+) {
+    if (reference != nullptr) *reference = nullptr;
+    if (ctx == nullptr || runtime == nullptr || caller_stream == nullptr || reference == nullptr)
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
+int simpler_release_run_resources(DeviceContextHandle ctx, RuntimeHandle reference) {
+    if (ctx == nullptr || reference == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    return PTO_RUNTIME_ERR_UNSUPPORTED;
+}
+
 }  // extern "C"

@@ -14,6 +14,10 @@
 #include "host_build_graph/host/dep_gen_host_graph.h"
 
 namespace native_admission_test {
+void inject_runtime_failure_result(DeviceRunResultRegion &, uint64_t) {
+    throw std::logic_error("TMR error-tail injection is unavailable for HBG");
+}
+
 namespace {
 OrchContext *current_orchestrator = nullptr;
 OrchContext *other_orchestrator = nullptr;

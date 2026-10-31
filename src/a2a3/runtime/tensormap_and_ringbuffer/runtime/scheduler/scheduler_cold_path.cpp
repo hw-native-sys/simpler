@@ -783,7 +783,8 @@ void SchedulerContext::handshake_partition(Runtime *runtime, int32_t tidx, int32
     // This run's identity, latched from KernelArgs at AICPU entry. Non-zero on a
     // native program launch, so only a report stamped with it is this run's;
     // zero on a kernel/persistent launch, which keeps the aicore_done predicate.
-    const uint64_t report_epoch = get_platform_run_result_epoch();
+    const uint64_t report_epoch =
+        runtime->get_entry_args_source() == EntryArgsSource::KernelInvocation ? 0 : get_platform_run_result_epoch();
     const int32_t total = cores_total_num_;
     const int32_t lo = static_cast<int32_t>((static_cast<int64_t>(tidx) * total) / nthreads);
     const int32_t hi = static_cast<int32_t>((static_cast<int64_t>(tidx + 1) * total) / nthreads);
@@ -921,7 +922,8 @@ void SchedulerContext::handshake_owned_clusters(Runtime *runtime, int32_t tidx, 
     // This run's identity, latched from KernelArgs at AICPU entry. Non-zero on a
     // native program launch, so only a report stamped with it is this run's;
     // zero on a kernel/persistent launch, which keeps the aicore_done predicate.
-    const uint64_t report_epoch = get_platform_run_result_epoch();
+    const uint64_t report_epoch =
+        runtime->get_entry_args_source() == EntryArgsSource::KernelInvocation ? 0 : get_platform_run_result_epoch();
     const int32_t aic_n = cores_total_num_ / PLATFORM_CORES_PER_BLOCKDIM;
 
     int32_t owned[RUNTIME_MAX_WORKER];

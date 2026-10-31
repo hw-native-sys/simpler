@@ -174,6 +174,28 @@ TEST(HostApiTest, RunResultIsAbsentWhenTheBackendProvidesNoRegion) {
     EXPECT_EQ(bytes, 0u);
 }
 
+TEST(HostApiTest, AnOwnedResultViewDoesNotFallBackToTheRunnersCache) {
+    HostApiOps ops{};
+    unsigned fallback_reads = 0;
+    ops.get_run_result = [](void *ctx, uint32_t, uint64_t, size_t *bytes) -> const void * {
+        ++*static_cast<unsigned *>(ctx);
+        if (bytes != nullptr) *bytes = 99;
+        return ctx;
+    };
+    HostApi api(&fallback_reads, 0, 0, 1, &ops);
+    size_t bytes = 0;
+    EXPECT_EQ(api.run_result(&bytes), &fallback_reads);
+    EXPECT_EQ(fallback_reads, 1u);
+    const uint8_t payload[]{1, 2, 3};
+    api.bind_run_result(payload, sizeof(payload));
+    EXPECT_EQ(api.run_result(&bytes), payload);
+    EXPECT_EQ(bytes, sizeof(payload));
+    api.bind_run_result(nullptr, 0);
+    EXPECT_EQ(api.run_result(&bytes), nullptr);
+    EXPECT_EQ(bytes, 0u);
+    EXPECT_EQ(fallback_reads, 1u);
+}
+
 TEST(HostApiTest, PublicationExceptionsBecomeFailureResults) {
     HostApiOps ops{};
     ops.publish_chip_swimlane_extension = throwing_extension_callback;

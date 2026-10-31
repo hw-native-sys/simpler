@@ -24,6 +24,7 @@
  * Reading either is a byte read, never a use of a destroyed carrier object.
  */
 inline constexpr uint64_t kNativeRunContextMagic = UINT64_C(0x534d504c52554e31);  // "SMPLRUN1"
+inline constexpr uint64_t kNativeRunHandleMagic = UINT64_C(0x534d504c484e4431);   // "SMPLHND1"
 
 // Host-only result in the destroyed carrier's storage; no device image changes.
 inline constexpr uint64_t kNativeRunPrepareReleasedMagic = UINT64_C(0x534d504c5052454c);  // "SMPLPREL"

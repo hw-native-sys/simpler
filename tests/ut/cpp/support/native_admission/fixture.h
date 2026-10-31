@@ -21,6 +21,7 @@
 #include <memory>
 #include <vector>
 #include "device_runner_base.h"
+#include "kernel_capture_api.h"
 #include "native_run_context.h"
 #include "runtime_c_api.h"
 #include "task_args.h"
@@ -32,6 +33,7 @@ namespace native_admission_test {
 // arena-bank selection. These helpers configure its inputs; tests assert the
 // resulting behavior directly in their own source files.
 void *primary_entry_points();
+void inject_runtime_failure_result(DeviceRunResultRegion &result, uint64_t epoch);
 void *alternate_entry_points();
 void set_dep_gen_capture(bool enabled);
 uint32_t arena_bank(uint32_t slot);
@@ -43,9 +45,11 @@ inline int callbacks = 0;
 inline bool refuse_after_callback = false;
 inline std::function<void()> callback_hook;
 extern thread_local bool refuse_next_host_allocation;
+extern thread_local int host_allocations_until_failure;
 
 class Runner : public DeviceRunnerBase {
 public:
+    using DeviceRunnerBase::ensure_device_run_result_region;
     Runner() {
         device_id_ = 0;
         timeout_configuration_rc_ = 0;
@@ -62,6 +66,13 @@ public:
         chip_callable_buffers_[1] = ChipCallableBuffer{};
     }
     void use_other_entry() { callables_[1].host_orch_func_ptr = alternate_entry_points(); }
+    void seed_cold_callable() {
+        set_executors({1}, {1});
+        set_kernel_context_generation(1);
+        callables_[1].residency_generation = 1;
+        chip_callable_buffers_[1].refcount = 1;
+    }
+    int launch_common_core(const KernelArgs &args) { return launch_aicore_kernel(nullptr, args); }
     void allocate_callable() {
         void *allocation = mem_alloc_.alloc(64);
         ASSERT_NE(allocation, nullptr);
@@ -97,6 +108,7 @@ public:
     bool launch_throws{false};
     bool launch_throws_after_submission{false};
     bool forbid_post_submit_allocation{false};
+    bool use_common_submission{false};
     bool admission_poisoned{false};
     bool recovery_throws{false};
     int recovery_calls{0};
@@ -110,9 +122,29 @@ public:
     DrainOutcome drain_result = DrainOutcome::device_complete(0);
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
         ++launch_calls;
+        if (prepared.kernel_resources != nullptr) {
+            prepared.recorded_submission = control().capture_active;
+            prepared.kernel_resources->caller_stream = prepared.caller_stream;
+        }
         if (launch_throws) throw std::runtime_error("unknown launch progress");
         if (launch_refusal_rc != 0 && !partial_launch) {
             return LaunchTransactionResult{launch_refusal_rc, LaunchProgress::NotStarted, LaunchReceipt{}};
+        }
+        if (use_common_submission) {
+            auto result = exact_launch_transaction(
+                prepared.identity, std::move(permit),
+                [&](LaunchProgressSink &sink) -> int {
+                    if (prepared.native_context == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+                    auto &state = *static_cast<NativeRunContext<DeviceRunnerBase> *>(prepared.native_context);
+                    const int rc = prewarm_kernel_run(state, prepared);
+                    if (rc != 0) return rc;
+                    return enqueue_execution_core(prepared, sink);
+                },
+                [&](LaunchProgressSink &sink) {
+                    return enqueue_execution_cpu(prepared, sink);
+                }
+            );
+            return result;
         }
         auto transaction = exact_launch_transaction(
             prepared.identity, std::move(permit),
@@ -129,18 +161,75 @@ public:
         if (forbid_post_submit_allocation) refuse_next_host_allocation = true;
         return transaction;
     }
-    void abandon_prepared_execution(PreparedExecution &) noexcept override {}
-    int poll_execution(const ActiveExecution &) override { return SIMPLER_NATIVE_RUN_POLL_NOT_READY; }
-    DrainOutcome drain_execution(ActiveExecution &) override {
+    int submit_execution_admission_payload(PreparedExecution &prepared) override {
+        return native_admission_transport::note_submission(
+            native_admission_transport::SubmissionOp::Admission, prepared.streams.aicpu
+        );
+    }
+    int submit_execution_core_payload(PreparedExecution &prepared) override {
+        return native_admission_transport::note_submission(
+            native_admission_transport::SubmissionOp::Core, prepared.streams.aicore
+        );
+    }
+    int submit_execution_cpu_payload(PreparedExecution &prepared) override {
+        return native_admission_transport::note_submission(
+            native_admission_transport::SubmissionOp::Cpu, prepared.streams.aicpu
+        );
+    }
+    int prewarm_common_submission(PreparedExecution &prepared, bool kernel_invocation = false) {
+        int rc = prepared.kernel_args.prepare_runtime_args(
+            *prepared.runtime, mem_alloc_, slot_persistent_args(prepared.pipeline_slot)
+        );
+        if (rc == 0 && kernel_invocation) {
+            prepared.kernel_args.args.run_result_epoch = prepared.identity.run_epoch;
+            const auto &entry = prepared.runtime->get_orch_args();
+            rc = prepared.kernel_args.prepare_kernel_invocation(
+                {1, 1, static_cast<uint32_t>(entry.tensor_count()), static_cast<uint32_t>(entry.scalar_count())}
+            );
+        }
+        LaunchProgressSink publication;
+        if (rc == 0)
+            rc = prepared.kernel_args.publish_runtime_args(kernel_invocation, prepared.streams.aicpu, publication);
+        if (rc == 0) rc = arm_run_fence(prepared);
+        if (rc == 0) prepared.submission_prepared = prepared.resources_owned = true;
+        return rc;
+    }
+    void abandon_prepared_execution(PreparedExecution &prepared) noexcept override {
+        if (!use_common_submission || !prepared.resources_owned) return;
+        retire_run_fence(prepared);
+        prepared.kernel_args.release_run_view();
+        prepared.resources_owned = false;
+    }
+    int poll_execution(const ActiveExecution &active) override {
+        if (active.prepared != nullptr && active.prepared->kernel_resources != nullptr &&
+            active.prepared->kernel_resources->graph_retained())
+            return poll_run_fence(*active.prepared);
+        return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    }
+    DrainOutcome drain_execution(ActiveExecution &active) override {
         ++drain_calls;
         if (drain_throws) throw std::runtime_error("completion not observed");
+        if (active.prepared != nullptr && active.prepared->kernel_resources != nullptr &&
+            active.prepared->kernel_resources->graph_retained())
+            return DrainOutcome::device_complete(wait_run_fence(*active.prepared));
         return drain_result;
+    }
+    int abandon_rc{0};
+    int abandon_native_run_resources(uint32_t) override { return abandon_rc; }
+    void inject_cached_result(uint32_t slot, const DeviceRunResultRegion &result) {
+        device_run_results_[slot] = result;
     }
     int finalize_impl() override { return finalize_common(); }
     void arm_host_dep_gen_capture(bool enabled) override { set_dep_gen_capture(enabled); }
     AutoAdmissionState::SlotPlan plan(uint32_t slot) const { return auto_admission_.plan(slot); }
     size_t charged() const { return workspace_.reserved_bytes(); }
     bool holds_epoch(uint64_t epoch) const { return workspace_.holds_references(epoch); }
+    int monitor_faults() { return acquire_device_fault_monitor(); }
+    WorkspaceManager::RunRecord facts(uint32_t slot, uint64_t epoch) const {
+        WorkspaceManager::RunRecord out;
+        EXPECT_TRUE(workspace_.describe_run(slot, epoch, &out));
+        return out;
+    }
     bool arena_referenced(uint32_t bank, size_t region) const {
         void *backing = arena_region_backing(bank, region);
         return backing != nullptr && workspace_.block_state(backing) == WorkspaceManager::BlockState::Referenced;
@@ -187,8 +276,10 @@ struct Attempt {
         uint64_t magic = 0;
         std::memcpy(&magic, storage, sizeof(magic));
         if (magic) EXPECT_EQ(simpler_finalize_run(&runner, storage), 0);
+        if (resource_reference != nullptr) EXPECT_EQ(simpler_release_run_resources(&runner, resource_reference), 0);
         ::operator delete(storage, std::align_val_t(get_runtime_alignment()));
     }
+    NativeRunContext<DeviceRunnerBase> *state() const { return resolve_native_run_storage<DeviceRunnerBase>(storage); }
     int prepare() { return simpler_prepare_run(&runner, storage, 1, &args, &config, &descriptor); }
     bool consume_release() { return consume_released_preparation(storage, get_runtime_size(), descriptor.run_epoch); }
     bool empty() const {
@@ -198,6 +289,9 @@ struct Attempt {
     }
     Runner &runner;
     void *storage;
+    RuntimeHandle resource_reference{nullptr};
+    int caller_token{0};
+    void *caller_stream() { return &caller_token; }
     std::vector<uint8_t> bytes;
     ChipStorageTaskArgs args;
     CallConfig config{};
@@ -213,6 +307,7 @@ protected:
         refuse_after_callback = false;
         callback_hook = {};
         refuse_next_host_allocation = false;
+        host_allocations_until_failure = -1;
     }
     void TearDown() override {
         EXPECT_EQ(control().bytes, 0u);

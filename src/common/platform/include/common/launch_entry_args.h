@@ -34,7 +34,7 @@
 enum class EntryArgsSource : uint32_t {
     Descriptor = 0,        // inside the published Runtime descriptor
     LaunchEnvelope = 1,    // appended to the AICPU launch arguments, copied by RTS
-    KernelInvocation = 2,  // validated kernel packet in the RTS launch package
+    KernelInvocation = 2,  // registered kernel execution packet, copied by RTS
 };
 
 /**

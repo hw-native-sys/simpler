@@ -118,6 +118,30 @@ TEST_F(CallerOrderTest, CallerWaitPinsTheKernelFenceUntilItsOwnProofCompletes) {
     EXPECT_EQ(destroyed, 3);
 }
 
+TEST_F(CallerOrderTest, DestroyedUnexecutedGraphUsesQuiescenceInsteadOfAnUnfiredTail) {
+    arm();
+    LaunchProgressSink sink;
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
+    publish_whole_boundary();
+    ASSERT_EQ(order.join(kRun, fence), 0);
+    EXPECT_FALSE(completed);
+    EXPECT_NE(order.retire(kRun), 0);
+    EXPECT_NE(order.discharge(kRun, 100), 0);
+    trace.clear();
+    ASSERT_EQ(order.discharge_on_quiescence(kRun), 0);
+    EXPECT_TRUE(trace.empty());
+    EXPECT_EQ(order.retire(kRun), 0);
+    EXPECT_EQ(fence.retire(kRun), 0);
+}
+
 TEST_F(CallerOrderTest, EveryForkFailureIsSubmittedAndNeedsAllThreeStreams) {
     for (int fault = 1; fault <= 4; ++fault) {
         SCOPED_TRACE(fault);

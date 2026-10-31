@@ -191,6 +191,7 @@ public:
     int destroy_comm_stream(void *stream);
 
 private:
+    int prepare_submission(PreparedExecution &prepared) override;
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;
 
     int finalize_impl() override;
@@ -257,19 +258,6 @@ protected:
     }
 
 private:
-    // Queue this run's own AICore boundary into the AICPU stream, ahead of the
-    // AICPU boundary record that then covers the whole operator. The reservation
-    // is taken by the caller, so a refusal costs only joinability; this is the
-    // step that touches the stream, and its failure grades the run Partial.
-    int queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done);
-
-    // Order this run behind the whole-operator boundary of the predecessor its
-    // join names, on the AICore stream it submits first, and record the event
-    // that proves the wait consumed. Its AICPU side needs no edge: that stream
-    // already holds the predecessor's kernel and boundary record ahead of this
-    // run's payload, and it is one FIFO.
-    int queue_cross_run_wait(PreparedExecution &prepared, rtStream_t waiter_stream, LaunchProgressSink &sink);
-
     // Release execution-owned per-run resources. Idempotent so prepare rollback
     // and drain share one path. `launched` publishes this set's terminal state,
     // which only a run that reached the streams may claim. Discharges the queued

@@ -34,6 +34,7 @@
 #include "dispatch_payload.h"
 #include "runtime.h"
 #include "tensormap_and_ringbuffer/kernel_launch_admission.h"
+#include "tensormap_and_ringbuffer/kernel_capture_device.h"
 #include "spin_hint.h"
 
 // Runtime headers (full struct definition for create/destroy + SIMPLER_SCOPE)
@@ -1290,4 +1291,32 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
 
     LOG_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
+}
+
+static simpler::tmr::KernelCaptureRegistry g_kernel_capture_registry;
+
+static simpler::tmr::KernelCallableIdentity capture_callable_identity(int32_t id) {
+    if (id < 0 || id >= MAX_REGISTERED_CALLABLE_IDS) return {};
+    return g_aicpu_executor.orch_so_table_[id].kernel_identity;
+}
+
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_capture_registration(void *arg) {
+    if (arg == nullptr) return -1;
+    return g_kernel_capture_registry.update(
+        *static_cast<const simpler::tmr::KernelCaptureRegistrationArgs *>(arg), capture_callable_identity,
+        [](const void *, size_t) {}
+    );
+}
+
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_capture_admit(void *arg) {
+    if (arg == nullptr) return -1;
+    return g_kernel_capture_registry.admit(arg, capture_callable_identity);
+}
+
+extern "C" int enter_kernel_capture(void *arg, KernelArgs *decoded, uint64_t *replay_sequence) {
+    return g_kernel_capture_registry.enter(arg, decoded, replay_sequence);
+}
+
+extern "C" void finish_kernel_capture(void *arg, uint64_t epoch, int status) {
+    g_kernel_capture_registry.finish(arg, epoch, status);
 }

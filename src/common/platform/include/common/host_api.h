@@ -516,12 +516,20 @@ public:
      * from the execution error channel and comes here for the detail.
      */
     const void *run_result(size_t *bytes_out) const noexcept {
+        if (run_result_) {
+            if (bytes_out != nullptr) *bytes_out = run_result_->bytes;
+            return run_result_->data;
+        }
         if (ops_->get_run_result == nullptr) {
             if (bytes_out != nullptr) *bytes_out = 0;
             return nullptr;
         }
         return ops_->get_run_result(runner_ctx_, pipeline_slot_, run_epoch_, bytes_out);
     }
+
+    // A bound view belongs to this run through output validation. An empty
+    // view has no payload and does not consult the runner's cached bytes.
+    void bind_run_result(const void *data, size_t bytes) noexcept { run_result_ = RunResultPayload{data, bytes}; }
 
     /**
      * Declare which caller device allocations this run produces.
@@ -571,4 +579,9 @@ private:
     uint64_t run_epoch_{0};
     const HostApiOps *ops_{nullptr};
     std::optional<DiagnosticConfig> diagnostics_;
+    struct RunResultPayload {
+        const void *data;
+        size_t bytes;
+    };
+    std::optional<RunResultPayload> run_result_;
 };

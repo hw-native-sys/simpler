@@ -1339,7 +1339,7 @@ ChipWorker::RunStorageTag ChipWorker::read_run_storage_tag(const void *storage) 
     uint64_t tag = 0;
     std::memcpy(&tag, storage, sizeof(tag));
     if (tag == 0) return RunStorageTag::Destroyed;
-    if (tag == kNativeRunContextMagic) return RunStorageTag::Canonical;
+    if (tag == kNativeRunContextMagic || tag == kNativeRunHandleMagic) return RunStorageTag::Canonical;
     return RunStorageTag::Noncanonical;
 }
 

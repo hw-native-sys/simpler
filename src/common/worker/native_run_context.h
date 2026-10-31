@@ -15,17 +15,20 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <utility>
 
 #include "call_config.h"
 #include "common/host_api.h"
 #include "native_run_execution.h"
+#include "retained_device_use.h"
 #include "native_run_phase.h"
 #include "native_run_storage_tag.h"
 #include "runtime_c_api.h"
 #include "runtime.h"
+#include "host/kernel_capture_owner.h"
 
 /**
- * The single placement-owned carrier for one progressable native lifecycle.
+ * The address-stable carrier for one progressable native lifecycle.
  * It captures immutable selection, identity, acceptance, configuration, and
  * HostApi binding during prepare; later phases never recover them from a
  * runner field or thread-local. The object is address-stable through finalize.
@@ -47,8 +50,7 @@ struct NativeRunContext {
         ),
         trace_hid(trace_hid_in) {
         // Publish the storage tag only after every potentially-throwing member
-        // has been constructed. A failed placement construction must leave the
-        // caller-owned slot reusable rather than looking like a prepared run.
+        // has been constructed. Failed construction leaves no valid carrier tag.
         magic = kMagic;
     }
 
@@ -80,8 +82,17 @@ struct NativeRunContext {
     int completion_rc{-1};
     std::atomic<NativeRunPhase> phase{NativeRunPhase::Prepared};
     std::unique_ptr<typename Runner::PreparedExecution> prepared_execution{};
+    std::unique_ptr<KernelCaptureOwner> kernel_execution{};
+    std::unique_ptr<KernelCaptureResult> capture_result{};
     std::unique_ptr<typename Runner::ActiveExecution> active_execution{};
+    std::unique_ptr<typename Runner::ActiveExecution> pending_active_execution{};
+    std::atomic<uint32_t> graph_reference_count{0};
+    uint64_t observed_replay_sequence{0};
+    void *public_handle_storage{nullptr};
+    bool heap_owned{false};
+    bool physical_cleanup_complete{false};
     LaunchPermit launch_permit{};
+    RetainedDeviceUse retained_device_use{};
     char trace_attrs[192]{};
     // True only for a launch entry that has not attempted execution-visible
     // submission, or whose returned transaction explicitly reports NotStarted.
@@ -123,6 +134,36 @@ struct NativeRunContext {
         return snapshot;
     }
 };
+
+enum class NativeRunHandleRole : uint8_t { Run, GraphReference };
+
+// A graph reference retains the same address-stable preparation after the
+// caller's original opaque handle storage has been retired and reused.
+template <typename Runner>
+struct NativeRunHandle {
+    static constexpr uint64_t kMagic = kNativeRunHandleMagic;
+
+    NativeRunHandle(std::shared_ptr<NativeRunContext<Runner>> state_in, NativeRunHandleRole role_in) :
+        role(role_in),
+        state(std::move(state_in)) {
+        magic = kMagic;
+    }
+
+    uint64_t magic{0};
+    NativeRunHandleRole role{NativeRunHandleRole::Run};
+    std::shared_ptr<NativeRunContext<Runner>> state;
+};
+
+template <typename Runner>
+NativeRunContext<Runner> *resolve_native_run_storage(void *storage) {
+    if (storage == nullptr) return nullptr;
+    uint64_t magic = 0;
+    std::memcpy(&magic, storage, sizeof(magic));
+    if (magic == NativeRunContext<Runner>::kMagic) return static_cast<NativeRunContext<Runner> *>(storage);
+    if (magic != NativeRunHandle<Runner>::kMagic) return nullptr;
+    auto *handle = static_cast<NativeRunHandle<Runner> *>(storage);
+    return handle->state.get();
+}
 
 /** End object lifetime, then mark the caller-owned storage reusable. */
 template <typename Runner>

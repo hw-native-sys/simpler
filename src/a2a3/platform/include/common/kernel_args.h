@@ -32,8 +32,7 @@
  * we use host memory instead of device memory.
  */
 
-#ifndef PLATFORM_COMMON_KERNEL_ARGS_H_
-#define PLATFORM_COMMON_KERNEL_ARGS_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -330,5 +329,3 @@ struct RegisterCallableArgs {
 #ifdef __cplusplus
 }
 #endif
-
-#endif  // PLATFORM_COMMON_KERNEL_ARGS_H_

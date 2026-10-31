@@ -143,6 +143,21 @@ public:
         return 0;
     }
 
+    // Every participating stream is quiescent and no graph can enqueue another
+    // use of these recorded edges. An event in an unexecuted model need not fire.
+    int discharge_on_quiescence(const NativeRunIdentity &id) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!active_) return 0;
+        if (!owns(id)) return PTO_RUNTIME_ERR_INVALID_STATE;
+        if (reference_.valid()) {
+            int rc = reference_.committed() ? fence_->release_wait_reference_on_quiescence(reference_) :
+                                              fence_->revoke_wait_reference(reference_);
+            if (rc != 0) return rc;
+        }
+        consumed_ = true;
+        return 0;
+    }
+
     int retire(const NativeRunIdentity &id) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!active_) return 0;

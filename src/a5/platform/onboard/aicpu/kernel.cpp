@@ -73,7 +73,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_query_topolo
  * @param arg Pointer to the front-less KernelArgs payload (runtime_args @ 0)
  * @return 0 on success, non-zero on error
  */
-extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
+static int execute_platform_task(void *arg, KernelArgs *k_args, bool invocation_rejected) {
     // Log severity was snapshot once by simpler_aicpu_init at worker init; the
     // resident SO keeps it across launches, so exec does not re-snapshot.
     if (arg == nullptr) {
@@ -81,7 +81,6 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         return -1;
     }
 
-    KernelArgs *k_args = reinterpret_cast<KernelArgs *>(arg);
     Runtime *runtime = k_args->runtime_args;
 
     if (runtime == nullptr) {
@@ -162,7 +161,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         PlatformEntryArgs{
             arg, k_args->entry_args_offset, k_args->entry_tensor_count, k_args->entry_scalar_count,
             k_args->entry_args_source, k_args->graph_section_offset, k_args->graph_section_bytes,
-            k_args->graph_section_source
+            k_args->graph_section_source, invocation_rejected
         }
     );
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);
@@ -175,6 +174,33 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
 
     // Run-wall end is stamped by run_wall's destructor (covers the early return
     // above too); host reduces max(end) - min(start) → ns.
+    return rc;
+}
+
+// TMR supplies the registered implementation. Other runtimes keep the
+// rejecting hook and never advertise capture capability.
+extern "C" __attribute__((weak)) int enter_kernel_capture(void *, KernelArgs *, uint64_t *) { return -1; }
+extern "C" __attribute__((weak)) void finish_kernel_capture(void *, uint64_t, int) {}
+
+extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *arg) {
+    if (arg == nullptr) return -1;
+    KernelArgs decoded = *static_cast<const KernelArgs *>(arg);
+    const bool kernel_execution = decoded.entry_args_source == static_cast<uint32_t>(EntryArgsSource::KernelInvocation);
+    uint64_t replay_sequence = 0;
+    bool invocation_rejected = false;
+    if (kernel_execution) {
+        const int admission = enter_kernel_capture(arg, &decoded, &replay_sequence);
+        if (admission < 0) return -1;
+        invocation_rejected = admission == 0;
+    }
+    const int rc = execute_platform_task(arg, &decoded, invocation_rejected);
+    if (kernel_execution) {
+        finish_kernel_capture(arg, replay_sequence, rc);
+        // The execution control carries the runtime's first error.
+        // The normal native join also covers rejected invocations' handshake
+        // and retirement; no user task is dispatched for those invocations.
+        return 0;
+    }
     return rc;
 }
 

@@ -44,7 +44,7 @@ protected:
     EntryArgsStorage args{};
     EntryArgsStorage output{};
     KernelCallableIdentity identity{3, 7, 1, 1};
-    EagerKernelBinding binding{0x20000, 19};
+    EagerKernelBinding binding{0x20000, 19, {0x40000, 23, 29}};
     std::vector<unsigned char> packet;
 };
 
@@ -67,9 +67,34 @@ TEST_F(KernelInvocation, ReusedCallableIdRejectsOldOccupancy) {
 }
 
 TEST_F(KernelInvocation, RuntimeAddressAndEpochBothBelongToThisRun) {
-    EXPECT_FALSE(consume(identity, {binding.runtime_address + 64, binding.run_epoch}));
-    EXPECT_FALSE(consume(identity, {binding.runtime_address, binding.run_epoch + 1}));
-    EXPECT_FALSE(consume(identity, {binding.runtime_address, 0}));
+    EXPECT_FALSE(consume(identity, {binding.runtime_address + 64, binding.run_epoch, binding.reference}));
+    EXPECT_FALSE(consume(identity, {binding.runtime_address, binding.run_epoch + 1, binding.reference}));
+    EXPECT_FALSE(consume(identity, {binding.runtime_address, 0, binding.reference}));
+}
+
+TEST_F(KernelInvocation, RegisteredReferenceCannotBeSubstitutedOrOmitted) {
+    ASSERT_TRUE(consume(identity, binding));
+    for (size_t field = 0; field < 3; ++field) {
+        auto stale = binding;
+        if (field == 0) stale.reference.control_address += 64;
+        if (field == 1) ++stale.reference.capture_generation;
+        if (field == 2) ++stale.reference.context_generation;
+        EXPECT_FALSE(consume(identity, stale));
+        EXPECT_EQ(output.scalar(0), 73U);
+    }
+    EXPECT_FALSE(consume(identity, {binding.runtime_address, binding.run_epoch, {}}));
+}
+
+TEST_F(KernelInvocation, UnboundColdSnapshotCannotBeConsumedAsAnExecution) {
+    auto staged = binding;
+    staged.reference = {};
+    ASSERT_TRUE(encode_kernel_invocation(args, identity, staged, packet.data(), packet.size()));
+    EXPECT_FALSE(consume(identity, staged));
+    EXPECT_FALSE(consume(identity, binding));
+    const auto before = packet;
+    staged.reference.capture_generation = 1;
+    EXPECT_FALSE(encode_kernel_invocation(args, identity, staged, packet.data(), packet.size()));
+    EXPECT_EQ(packet, before);
 }
 
 TEST_F(KernelInvocation, InvalidFramingDoesNotChangePreviouslyAdmittedStorage) {

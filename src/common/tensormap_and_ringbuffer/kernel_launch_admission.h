@@ -13,6 +13,7 @@
 #include "aicpu/platform_entry_args.h"
 #include "kernel_invocation.h"
 #include "runtime.h"
+#include "task_interface/kernel_capture.h"
 
 namespace simpler::tmr {
 
@@ -20,7 +21,7 @@ inline bool admit_kernel_launch_entry(
     const Runtime &runtime, const PlatformEntryArgs &view, const KernelCallableIdentity &registered, uint64_t run_epoch,
     EntryArgsStorage *output
 ) {
-    if (!valid_kernel_identity(registered) || view.args_base == nullptr || run_epoch == 0 ||
+    if (view.invocation_rejected || !valid_kernel_identity(registered) || view.args_base == nullptr || run_epoch == 0 ||
         view.source != static_cast<uint32_t>(EntryArgsSource::KernelInvocation) ||
         runtime.get_entry_args_source() != EntryArgsSource::KernelInvocation ||
         view.offset != LAUNCH_ENVELOPE_HEADER_BYTES || view.tensor_count != registered.tensor_count ||
@@ -29,9 +30,11 @@ inline bool admit_kernel_launch_entry(
         registered.callable_id != runtime.get_active_callable_id())
         return false;
     const auto *packet = static_cast<const unsigned char *>(view.args_base) + LAUNCH_ENVELOPE_HEADER_BYTES;
+    EagerKernelBinding binding{};
+    std::memcpy(&binding, packet + sizeof(SimplerKernelInvocationHeader), sizeof(binding));
     return consume_kernel_invocation(
         packet, kernel_invocation_bytes(registered.tensor_count, registered.scalar_count), registered,
-        {reinterpret_cast<uint64_t>(&runtime), run_epoch}, output
+        {reinterpret_cast<uint64_t>(&runtime), run_epoch, binding.reference}, output
     );
 }
 

@@ -10,6 +10,8 @@
  */
 // CPU-only transport. Production runner, allocator, ledger, maker and C API own the policy.
 #include "transport.h"
+#include "common/kernel_args.h"
+#include "common/device_run_result.h"
 #include "runtime/rt.h"
 #include "acl/acl.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
@@ -21,11 +23,19 @@
 #include <cstring>
 #include <unordered_map>
 #include <unordered_set>
+#include <new>
+#include <stdexcept>
 
 namespace native_admission_transport {
 Control &control() {
     static Control c;
     return c;
+}
+int note_submission(SubmissionOp operation, void *stream, void *event) {
+    auto &c = control();
+    if (!c.trace_submission) return 0;
+    c.submissions.push_back({operation, stream, event});
+    return operation == c.fail_submission ? c.submission_rc : 0;
 }
 }  // namespace native_admission_transport
 namespace {
@@ -81,7 +91,12 @@ int rtFreeHost(void *ptr) {
 int rtMemcpyAsync(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind, rtStream_t) {
     return rtMemcpy(dst, capacity, src, bytes, kind);
 }
-int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t) {
+int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind) {
+    if (kind == RT_MEMCPY_DEVICE_TO_HOST && bytes == sizeof(DeviceRunResultRegion)) {
+        auto &c = native_admission_transport::control();
+        ++c.run_result_copies;
+        if (c.run_result_copy_rc != 0) return c.run_result_copy_rc;
+    }
     if (const int rc = native_admission_transport::control().copy_rc) return rc;
     if (bytes > capacity || (bytes && (!dst || !src))) return -2;
     std::memcpy(dst, src, bytes);
@@ -120,7 +135,13 @@ int rtUnregisterAllKernel(void *p) {
     std::free(p);
     return 0;
 }
-int rtKernelLaunchWithHandleV2(void *, uint64_t, uint32_t, rtArgsEx_t *, void *, rtStream_t, rtTaskCfgInfo_t *) {
+int rtKernelLaunchWithHandleV2(void *, uint64_t, uint32_t, rtArgsEx_t *args, void *, rtStream_t, rtTaskCfgInfo_t *) {
+    if (auto &c = native_admission_transport::control(); c.capture_active) {
+        ++c.capture_core_calls;
+        c.core_payload_bytes = args->argsSize;
+        c.core_report_epoch = static_cast<const AicoreLaunchArgs *>(args->args)->report_epoch;
+        return 0;
+    }
     return -1;
 }
 const char *aclGetRecentErrMsg() { return "native admission CPU transport"; }
@@ -130,6 +151,7 @@ int aclrtGetMemInfo(int, size_t *free, size_t *total) {
     return 0;
 }
 int aclrtCreateEventExWithFlag(aclrtEvent *out, uint32_t) {
+    ++native_admission_transport::control().event_create_calls;
     *out = std::malloc(1);
     return *out ? 0 : -12;
 }
@@ -137,7 +159,26 @@ int aclrtDestroyEvent(aclrtEvent p) {
     std::free(p);
     return 0;
 }
-int aclrtRecordEvent(aclrtEvent, aclrtStream) { return 0; }
+int aclrtRecordEvent(aclrtEvent event, aclrtStream stream) {
+    const int trace_rc =
+        native_admission_transport::note_submission(native_admission_transport::SubmissionOp::Record, stream, event);
+    if (trace_rc != 0) return trace_rc;
+    auto &c = native_admission_transport::control();
+    if (c.capture_refuse_after_core != nullptr && c.capture_core_calls != 0) {
+        *c.capture_refuse_after_core = true;
+        // The volatile allocator target preserves the faulting call under
+        // optimization. Only bad_alloc observed at this site satisfies the witness.
+        void *(*volatile allocate)(std::size_t) = ::operator new;
+        try {
+            void *storage = allocate(1);
+            ::operator delete(storage);
+        } catch (const std::bad_alloc &) {
+            ++c.capture_record_allocation_failures;
+            throw;
+        }
+    }
+    return 0;
+}
 int aclrtResetEvent(aclrtEvent, aclrtStream) { return 0; }
 int aclrtQueryEventStatus(aclrtEvent, aclrtEventRecordedStatus *out) {
     *out = ACL_EVENT_RECORDED_STATUS_COMPLETE;
@@ -148,9 +189,14 @@ int aclrtEventGetTimestamp(aclrtEvent, uint64_t *out) {
     *out = 1;
     return 0;
 }
-int aclrtStreamWaitEvent(aclrtStream, aclrtEvent) { return 0; }
+int aclrtStreamWaitEvent(aclrtStream stream, aclrtEvent event) {
+    return native_admission_transport::note_submission(native_admission_transport::SubmissionOp::Wait, stream, event);
+}
 int aclrtSynchronizeStream(aclrtStream) { return 0; }
-int aclrtSynchronizeStreamWithTimeout(aclrtStream, int32_t) { return 0; }
+int aclrtSynchronizeStreamWithTimeout(aclrtStream, int32_t) {
+    ++native_admission_transport::control().capture_sync_calls;
+    return native_admission_transport::control().stream_sync_rc;
+}
 int aclrtGetStreamResLimit(aclrtStream, int, uint32_t *out) {
     *out = 1;
     return 0;
@@ -169,11 +215,16 @@ int aclrtSetOpExecuteTimeOutV2(uint64_t wanted, uint64_t *actual) {
     return 0;
 }
 int aclrtStreamGetId(aclrtStream, int32_t *out) {
+    if (native_admission_transport::control().fail_stream_id) return -7;
     *out = 1;
     return 0;
 }
 int aclmdlRICaptureGetInfo(aclrtStream, aclmdlRICaptureStatus *status, aclmdlRI *model) {
-    *status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    auto &c = native_admission_transport::control();
+    ++c.capture_info_calls;
+    if (c.capture_info_rc != 0) return c.capture_info_rc;
+    *status = native_admission_transport::control().capture_active ? ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE :
+                                                                     ACL_MODEL_RI_CAPTURE_STATUS_NONE;
     *model = nullptr;
     return 0;
 }
@@ -189,7 +240,20 @@ int LoadAicpuOp::Finalize(rtStream_t) {
 void LoadAicpuOp::ForgetWithoutUnload() {}
 int LoadAicpuOp::BootstrapDispatcher(const void *, size_t, const void *, size_t, rtStream_t, int) { return -1; }
 int LoadAicpuOp::Init(const std::vector<std::string> &) { return -1; }
-int LoadAicpuOp::LaunchBuiltInOp(rtStream_t, void *, size_t, int, const std::string &) { return -1; }
+int LoadAicpuOp::LaunchBuiltInOp(rtStream_t, void *, size_t, int, const std::string &name) {
+    auto &c = native_admission_transport::control();
+    if (name == "simpler_aicpu_capture_registration") {
+        ++c.capture_registration_calls;
+        if (c.capture_registration_throws) throw std::bad_alloc();
+        return 0;
+    }
+    if (!c.capture_active) return -1;
+    if (name == "simpler_aicpu_exec") {
+        ++c.capture_cpu_calls;
+        if (c.capture_loader_throws) throw std::runtime_error("capture loader failure");
+    }
+    return 0;
+}
 }  // namespace host
 
 KernelContextOps make_onboard_kernel_context_ops() { return {}; }

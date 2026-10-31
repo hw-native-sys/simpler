@@ -55,8 +55,11 @@ and reset policy. A borrowed kernel context is poisoned without a device-wide
 drain or reset; the caller owns device recovery. The native eager entry
 `simpler_launch_run_on_stream` binds a borrowed caller stream to an already
 prepared run. Public `Worker.init(borrowed_context_generation=...)` and
-`Worker.submit(..., caller_stream=...)` use this same native path. Capture/replay
-is rejected by the eager entry.
+`Worker.submit(..., caller_stream=...)` use this same native path. A native run
+without a retained graph-resource reference rejects active capture. Recording
+through this entry requires successful
+[cold graph resource retention](tmr-kernel-capture.md#cold-preparation-and-graph-lifetime).
+The borrowed-context Worker adapters do not expose this graph-retention step.
 
 ## Borrowed caller ordering
 
@@ -98,13 +101,17 @@ quarantined; borrowed execution never resets or synchronizes the whole device.
 Failure does not establish the caller's exit dependency, so the caller must not
 consume output merely because launch returned an error.
 
-This entry is eager-only. It validates the current borrowed RTS context and
-rejects an active caller capture before launch metadata publication. Preparation
-and callable registration take place outside capture. The common eager launch
-publishes its Runtime descriptor asynchronously on the actual AICPU stream;
-its entry fork orders the AICore reader behind that copy. The slot retains a
-pinned immutable source through run retirement. A copy attempt marks Partial
-before entering RTS, so enqueue failure cannot acquire a no-submission receipt.
+An ordinary launch without a retained graph-resource reference validates the
+current borrowed RTS context and rejects active caller capture before launch
+metadata publication. Preparation and callable registration take place outside
+capture. A graph reference requires cold publication and registration to finish
+before capture; this entry then records the
+[common command sequence](tmr-kernel-capture.md#common-submission-and-completion).
+The ordinary eager launch publishes its Runtime descriptor asynchronously on
+the actual AICPU stream; its entry fork orders the AICore reader behind that copy.
+The slot retains a pinned immutable source through run retirement. A copy attempt
+marks Partial before entering RTS, so enqueue failure cannot acquire a
+no-submission receipt.
 The two kernel boundaries consume an ordinary publication fork; unproven partial
 work requires bounded private-stream discharge or quarantine. Bulk HBG arena
 publication and DFX writes retain their own synchronization. The compatibility
@@ -668,7 +675,12 @@ instant the submission is accepted, and the transaction grades a later failure
 Simulation records no events: its submit callbacks take the sink and ignore it,
 and its grading is unchanged.
 
-## Borrowed TMR eager invocation ownership
+## Borrowed TMR eager invocation admission
+
+Borrowed eager already enters the common native-run lane. The framed TMR
+invocation adds registered callable occupancy and per-run binding checks to
+that path; it does not introduce another executor, registration API or caller
+ordering protocol.
 
 Borrowed TMR eager calls use the existing native-run lane, caller ordering and
 completion fence. Their launch package carries a 40-byte invocation header,
@@ -687,5 +699,19 @@ orchestration view before clearing the storage.
 The first descriptor publication still initializes its complete handshake
 prefix. Program descriptor and launch-envelope routes retain their behavior;
 kernel packets require permitted launch transport and cannot silently fall back
-to unvalidated descriptor values. Active capture remains rejected by the eager
-entry. These per-run resources do not provide captured-graph lifetime.
+to unvalidated descriptor values. Active capture requires an additional graph
+resource reference acquired before CaptureBegin. That reference extends these
+per-run resources through successful
+[graph resource release](tmr-kernel-capture.md#failure-and-release-evidence).
+
+Registration and context finalization retain their common locking and admission
+rules. A prepared ordinary native run prevents all registration entries and
+unregistration from changing the registry. Refusal leaves automatic ID output
+at -1 and performs no allocation or copy. A refused context finalize does not
+retire the run or restore dispatch readiness; each of those states keeps its
+own existing check.
+
+Execution stream identities are recorded through the same runner helper used
+by capture, independently of recording a completion fence. An unavailable
+stream ID leaves fault attribution undecided under the existing health policy;
+it does not establish that later unmatched notices belong to another runner.

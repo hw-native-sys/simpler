@@ -9,9 +9,25 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include "fixture.h"
+#include "shared_memory.h"
 #include "host/host_graph_exporter.h"
 
 namespace native_admission_test {
+void inject_runtime_failure_result(DeviceRunResultRegion &result, uint64_t epoch) {
+    SharedMemoryHeader header{};
+    header.orch_error_code.store(9, std::memory_order_relaxed);
+    result = {};
+    result.published = epoch;
+    result.verdict = static_cast<uint32_t>(DeviceRunVerdict::Error);
+    result.completion_code = -9;
+    result.code_source = static_cast<uint32_t>(DeviceRunCodeSource::Header);
+    result.payload_bytes = SHARED_MEMORY_ERROR_TAIL_BYTES;
+    std::memcpy(
+        result.payload, reinterpret_cast<const uint8_t *>(&header) + SHARED_MEMORY_ERROR_TAIL_OFFSET,
+        SHARED_MEMORY_ERROR_TAIL_BYTES
+    );
+}
+
 void *primary_entry_points() { return nullptr; }
 void *alternate_entry_points() { return nullptr; }
 void set_dep_gen_capture(bool) {}

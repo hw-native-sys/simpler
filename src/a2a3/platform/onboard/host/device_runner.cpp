@@ -16,6 +16,7 @@
  */
 
 #include "device_runner.h"
+#include "kernel_capture_api.h"
 
 #include "run_retention_probe.h"
 
@@ -524,6 +525,12 @@ int DeviceRunner::prepare_execution(
 }
 
 int DeviceRunner::poll_execution(const ActiveExecution &active) {
+    if (active.prepared != nullptr && active.prepared->kernel_resources != nullptr &&
+        active.prepared->kernel_resources->graph_retained())
+        return observe_kernel_run(
+            *static_cast<NativeRunContext<DeviceRunnerBase> *>(active.prepared->native_context), false
+        );
+
     if (active.prepared == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     const PreparedExecution &prepared = *active.prepared;
     // The pair still gates the query: it owns the try-lock against a concurrent
@@ -537,12 +544,17 @@ int DeviceRunner::poll_execution(const ActiveExecution &active) {
 }
 
 DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
+    if (active.prepared != nullptr && active.prepared->kernel_resources != nullptr &&
+        active.prepared->kernel_resources->graph_retained())
+        return DrainOutcome::device_error(wait_run_fence(*active.prepared));
+
     if (active.prepared == nullptr || !active.prepared->resources_owned) {
         return DrainOutcome::device_error(PTO_RUNTIME_ERR_INTERNAL);
     }
     PreparedExecution &prepared = *active.prepared;
     auto drain_cleanup = RAIIScopeGuard([this, &prepared]() {
-        cleanup_execution(prepared, /*retire_aicore=*/true);
+        if (prepared.kernel_resources == nullptr || !prepared.kernel_resources->graph_retained())
+            cleanup_execution(prepared, /*retire_aicore=*/true);
     });
 
     // This run's diagnostics ownership result, kept apart from every device
@@ -714,6 +726,94 @@ int DeviceRunner::destroy_run_streams() {
     return rc;
 }
 
+int DeviceRunner::prepare_submission(PreparedExecution &prepared) {
+    if (prepared.submission_prepared) return 0;
+    if (!prepared.streams.ready()) {
+        if (ensure_run_streams() != 0) return PTO_RUNTIME_ERR_INTERNAL;
+        prepared.streams = {
+            static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())
+        };
+    }
+    Runtime &runtime = *prepared.runtime;
+    const int num_aicore = prepared.num_aicore;
+    try {
+        activate_launch_shape(runtime);
+        if (int fence_rc = arm_run_fence(prepared); fence_rc != 0) return fence_rc;
+        if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
+        // This run's own core types, resolved from its own prepared
+        // runtime and handed to admission. The resident copy the
+        // collector keeps is set below and belongs to whichever run
+        // launched last, which under an early-enqueued successor is not
+        // the run whose bucket is being opened here.
+        std::vector<CoreType> core_types;
+        if (prepared.dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
+            core_types.resize(static_cast<size_t>(num_aicore));
+            for (int i = 0; i < num_aicore; i++)
+                core_types[static_cast<size_t>(i)] = runtime.core_type_rule(i);
+        }
+        const RunLocalDfxMetadata run_metadata{
+            core_types.empty() ? nullptr : core_types.data(), static_cast<int>(core_types.size()),
+            host_orchestrated_for_slot(prepared.pipeline_slot), &prepared.artifact_identity,
+            &prepared.scope_stats_capacity
+        };
+        // One all-or-nothing admission across every enabled owner.
+        // A capacity shortage is reported as its own code and nothing
+        // is submitted, so the caller parks on the credit signal and
+        // re-attempts rather than failing a run whose slots are merely
+        // in use; any other refusal is this run's failure.
+        DiagnosticAdmission admission;
+        if (int collect_rc =
+                start_shared_collectors_for_run(prepared.dfx, prepared.identity.run_epoch, run_metadata, &admission);
+            collect_rc != 0) {
+            return admission.refusal == simpler::dfx::runs::AdmissionRefusal::Capacity ?
+                       SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
+                       collect_rc;
+        }
+        // dep_gen admits last and rolls the others back itself, for the
+        // same reason: an export slot held by a run that never reaches
+        // a boundary is never given back. Through the same undo the
+        // all-or-nothing guard takes, so a decline here neither wakes its
+        // own retry nor hides a withdrawal that restored nothing.
+        simpler::dfx::runs::AdmissionRefusal dep_why = simpler::dfx::runs::AdmissionRefusal::None;
+        if (int dep_rc = admit_dep_gen_run(prepared.dfx, prepared.identity.run_epoch, &dep_why); dep_rc != 0) {
+            undo_admission_attempt(prepared.dfx, prepared.identity.run_epoch);
+            return dep_why == simpler::dfx::runs::AdmissionRefusal::Capacity ?
+                       SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
+                       dep_rc;
+        }
+        // Every owner has now admitted this run, so each one's bank is
+        // reserved and its address is resolvable. Written here rather
+        // than during arming because dep_gen admits last, and a run
+        // whose arming resolved an address it was later refused would
+        // hand the device a bank it does not hold.
+        resolve_run_terminal_banks(prepared.dfx, prepared.identity.run_epoch, prepared.kernel_args);
+        // The resident copy, which the serial non-retained path reads at
+        // its own close.
+        if (!core_types.empty()) {
+            chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
+        }
+
+        // Launch the AICore worker BEFORE the AICPU Run task — mirrors the a5 path
+        // so the two arches stay symmetric. First-launch latency optimization +
+        // op-timeout-family defense-in-depth: with the AICPU Run task launched first
+        // it occupies the device (spinning in the handshake), and the first AICore
+        // launch — which lazily loads the kernel binary onto the device inside
+        // rtKernelLaunchWithHandleV2 — is slow; launching AICore first does that load
+        // on an idle device. The handshake is launch-order-independent. The ~1.4 s
+        // slow-launch / 207001 wedge was measured on a5; this mirror is UNVERIFIED on
+        // a2a3 silicon (the dev box is a5-only), relying on CI. See
+        // docs/investigations/2026-06-pa-unroll-207001-optimeout-window.md.
+        // PROGRAM reports carry the run epoch. TMR KernelInvocation uses the
+        // unstamped handshake: device admission clears aicore_done after the
+        // preceding whole-operator join and publishes it before the fork.
+    } catch (...) {
+        LOG_ERROR("launch_run: arming failed before any stream submission");
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    prepared.submission_prepared = true;
+    return 0;
+}
+
 LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) {
     // Prepared is admitted as well as Published: publication happens inside
     // `launch_run`, once this run holds the stream it will submit on. What a
@@ -728,14 +828,9 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
 }
 
 LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, LaunchPermit permit) {
-    Runtime &runtime = *prepared.runtime;
-    const int num_aicore = prepared.num_aicore;
-    const int launch_aicpu_num = prepared.launch_aicpu_num;
-    // KernelLaunch is the pipeline boundary: this method submits exactly the
-    // AICore and AICPU kernels. It intentionally performs no stream
-    // synchronization, no per-run cleanup, and no handshake reset — the
-    // handshake region belongs to the device, and this run's reports are told
-    // apart from a predecessor's by the report epoch.
+    // Host submission does not synchronize streams or retire resources.
+    // TMR KernelInvocation queues device admission before the processor fork;
+    // it clears report markers after the preceding whole-operator join.
     //
     // The pair is readied here rather than at prepare because this is the first
     // point the caller holds the execution claim: a prepared successor overlaps
@@ -745,9 +840,8 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
         return LaunchTransactionResult{};
     }
     prepared.streams = {static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())};
-    const auto &streams = prepared.streams;
     if (prepared.caller_stream != nullptr) {
-        const int rc = validate_caller_stream(prepared.caller_stream);
+        const int rc = validate_execution_stream(prepared);
         if (rc != 0) {
             return LaunchTransactionResult{rc, LaunchProgress::NotStarted, LaunchReceipt{}};
         }
@@ -760,81 +854,15 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
             // and leave the run safely rollback-able. Taking the completion fence
             // belongs here for the same reason: creating its events can fail, and
             // here that failure costs the run nothing.
-            try {
-                activate_launch_shape(runtime);
-                if (int fence_rc = arm_run_fence(prepared); fence_rc != 0) return fence_rc;
-                if (int arm_rc = arm_collectors_for_run(runtime, prepared); arm_rc != 0) return arm_rc;
-                // This run's own core types, resolved from its own prepared
-                // runtime and handed to admission. The resident copy the
-                // collector keeps is set below and belongs to whichever run
-                // launched last, which under an early-enqueued successor is not
-                // the run whose bucket is being opened here.
-                std::vector<CoreType> core_types;
-                if (prepared.dfx.chip_swimlane_enabled() && chip_swimlane_collector_.is_initialized()) {
-                    core_types.resize(static_cast<size_t>(num_aicore));
-                    for (int i = 0; i < num_aicore; i++)
-                        core_types[static_cast<size_t>(i)] = runtime.core_type_rule(i);
-                }
-                const RunLocalDfxMetadata run_metadata{
-                    core_types.empty() ? nullptr : core_types.data(), static_cast<int>(core_types.size()),
-                    host_orchestrated_for_slot(prepared.pipeline_slot), &prepared.artifact_identity,
-                    &prepared.scope_stats_capacity
-                };
-                // One all-or-nothing admission across every enabled owner.
-                // A capacity shortage is reported as its own code and nothing
-                // is submitted, so the caller parks on the credit signal and
-                // re-attempts rather than failing a run whose slots are merely
-                // in use; any other refusal is this run's failure.
-                DiagnosticAdmission admission;
-                if (int collect_rc = start_shared_collectors_for_run(
-                        prepared.dfx, prepared.identity.run_epoch, run_metadata, &admission
-                    );
-                    collect_rc != 0) {
-                    return admission.refusal == simpler::dfx::runs::AdmissionRefusal::Capacity ?
-                               SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
-                               collect_rc;
-                }
-                // dep_gen admits last and rolls the others back itself, for the
-                // same reason: an export slot held by a run that never reaches
-                // a boundary is never given back. Through the same undo the
-                // all-or-nothing guard takes, so a decline here neither wakes its
-                // own retry nor hides a withdrawal that restored nothing.
-                simpler::dfx::runs::AdmissionRefusal dep_why = simpler::dfx::runs::AdmissionRefusal::None;
-                if (int dep_rc = admit_dep_gen_run(prepared.dfx, prepared.identity.run_epoch, &dep_why); dep_rc != 0) {
-                    undo_admission_attempt(prepared.dfx, prepared.identity.run_epoch);
-                    return dep_why == simpler::dfx::runs::AdmissionRefusal::Capacity ?
-                               SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL :
-                               dep_rc;
-                }
-                // Every owner has now admitted this run, so each one's bank is
-                // reserved and its address is resolvable. Written here rather
-                // than during arming because dep_gen admits last, and a run
-                // whose arming resolved an address it was later refused would
-                // hand the device a bank it does not hold.
-                resolve_run_terminal_banks(prepared.dfx, prepared.identity.run_epoch, prepared.kernel_args);
-                // The resident copy, which the serial non-retained path reads at
-                // its own close.
-                if (!core_types.empty()) {
-                    chip_swimlane_collector_.set_core_types(core_types.data(), num_aicore);
-                }
-
-                // Launch the AICore worker BEFORE the AICPU Run task — mirrors the a5 path
-                // so the two arches stay symmetric. First-launch latency optimization +
-                // op-timeout-family defense-in-depth: with the AICPU Run task launched first
-                // it occupies the device (spinning in the handshake), and the first AICore
-                // launch — which lazily loads the kernel binary onto the device inside
-                // rtKernelLaunchWithHandleV2 — is slow; launching AICore first does that load
-                // on an idle device. The handshake is launch-order-independent. The ~1.4 s
-                // slow-launch / 207001 wedge was measured on a5; this mirror is UNVERIFIED on
-                // a2a3 silicon (the dev box is a5-only), relying on CI. See
-                // docs/investigations/2026-06-pa-unroll-207001-optimeout-window.md.
-                // Nothing clears the handshake region here. It is the device's, and
-                // this run is told apart from its predecessors by identity rather than
-                // by a reset: the AICore stamps its report with this run's epoch and
-                // the AICPU sweep accepts only a report carrying it.
-            } catch (...) {
-                LOG_ERROR("launch_run: arming failed before any stream submission");
-                return PTO_RUNTIME_ERR_INTERNAL;
+            const int preparation_rc = prepare_submission(prepared);
+            if (preparation_rc != 0) return preparation_rc;
+            if (execution_mode_latch_.is_kernel() && prepared.kernel_args.kernel_invocation_prepared()) {
+                if (prepared.native_context == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+                auto &state = *static_cast<NativeRunContext<DeviceRunnerBase> *>(prepared.native_context);
+                const int warm_rc = prewarm_kernel_run(state, prepared);
+                if (prepared.kernel_resources != nullptr && prepared.kernel_resources->cold_pending)
+                    sink.mark_submitted();
+                if (warm_rc != 0) return warm_rc;
             }
 
             // Publishing query/drain ownership is a state change, so it sits past
@@ -845,120 +873,13 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 return rc;
             }
 
-            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
-
-            if (prepared.join.predecessor_owner != nullptr) {
-                int join_rc = queue_cross_run_wait(prepared, streams.aicore, sink);
-                if (join_rc != 0) return join_rc;
-            }
-
-            // After any cross-run wait and before the kernel: the instant this stream was
-            // released to begin this run's AICore work. A record is not a wait and no stream
-            // waits on it, so a successor's marker cannot stand in for the production wait
-            // above. A failed record does not fail the run; it makes the position unavailable.
-            (void)mark_run_boundary(RunBoundaryMarks::Position::AicoreStart, prepared.identity, streams.aicore);
-
-            LOG_INFO("=== launch_aicore_kernel ===");
-            int launch_rc = launch_aicore_kernel(streams.aicore, prepared.kernel_args.args);
-            if (launch_rc != 0) {
-                LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
-                recover_device_or_mark_unusable(launch_rc);
-                return launch_rc;
-            }
-            sink.mark_submitted();
-            // Nothing else enters this stream between the kernel and its
-            // boundary, so the boundary completes exactly when the kernel exits.
-            return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore);
+            return enqueue_execution_core(prepared, sink);
         },
         [&](LaunchProgressSink &sink) -> int {
-            int aicpu_launch_n =
-                (runtime.get_aicpu_launch_count() > 0) ? runtime.get_aicpu_launch_count() : launch_aicpu_num;
-            STRACE_HOST_SPAN_AT("chip.run.runner_run.aicpu_launch", STRACE_NOW_NS(), 0, 2);
-            int launch_rc = launch_aicpu_payload(
-                streams.aicpu, prepared.kernel_args.launch_payload(), prepared.kernel_args.launch_payload_bytes(),
-                host::KernelNames::RunName, aicpu_launch_n
-            );
-            if (launch_rc != 0) {
-                LOG_ERROR("launch_aicpu_payload (main) failed: %d", launch_rc);
-                return launch_rc;
-            }
-            sink.mark_submitted();
-            // The AICPU kernel spins in the handshake until the AICore workers
-            // publish, but it returns on its own schedule: the AICore kernel may
-            // still be in its tail. Queueing this run's own AICore boundary ahead
-            // of the AICPU boundary record is what makes that record cover both
-            // kernels, and it is the only thing a successor can safely be
-            // ordered behind.
-            //
-            // A caller-bound run requires this reference; reservation failure
-            // fails its launch. Without a caller, an optional successor boundary
-            // can degrade to non-joinable. Once the wait is attempted, failure
-            // is Partial because the stream may already hold the reference.
-            void *core_done = nullptr;
-            bool whole_operator = false;
-            const bool needs_join = prepared.joinable_boundary || prepared.caller_stream != nullptr;
-            const int own_rc = needs_join ? open_own_boundary_wait(prepared, &core_done) : 0;
-            if (prepared.caller_stream != nullptr && own_rc != 0) return own_rc;
-            if (needs_join && own_rc == 0) {
-                int wait_rc = queue_own_boundary_wait(prepared, streams.aicpu, core_done);
-                if (wait_rc != 0) return wait_rc;
-                whole_operator = true;
-                // Behind that wait and ahead of the boundary record: the instant this run's own
-                // AICore kernel had returned, which is what makes the time a *whole-operator*
-                // end rather than an AICPU-kernel end. Recorded only on this path, because only
-                // here does the stream position carry that meaning.
-                (void)mark_run_boundary(RunBoundaryMarks::Position::WholeOperatorEnd, prepared.identity, streams.aicpu);
-            }
-            int boundary_rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
-            if (boundary_rc == 0 && whole_operator) note_whole_operator_boundary(prepared);
-            if (boundary_rc != 0) return boundary_rc;
-            return queue_caller_exit(prepared);
+            return enqueue_execution_cpu(prepared, sink);
         }
     );
     return result;
-}
-
-int DeviceRunner::queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done) {
-    const aclError wait_rc = aclrtStreamWaitEvent(static_cast<aclrtStream>(aicpu_stream), core_done);
-    // The API documents no guarantee that a failure means the wait was not
-    // queued, so the reference is committed either way: a revoked reservation
-    // would let this run's own boundary events be destroyed while its stream may
-    // still name one.
-    int commit_rc = commit_boundary_wait(QueuedStreamWaits::Shape::Own, prepared);
-    if (wait_rc != ACL_SUCCESS) {
-        LOG_ERROR("aclrtStreamWaitEvent (own AICore boundary) failed: %d", static_cast<int>(wait_rc));
-        ACL_LOG_ERROR_DETAIL(wait_rc);
-        return static_cast<int>(wait_rc);
-    }
-    return commit_rc;
-}
-
-int DeviceRunner::queue_cross_run_wait(
-    PreparedExecution &prepared, rtStream_t waiter_stream, LaunchProgressSink &sink
-) {
-    void *predecessor_boundary = nullptr;
-    int rc = open_cross_run_wait(prepared, &predecessor_boundary);
-    // Nothing has been submitted yet, so a refusal here leaves the run
-    // rollback-able and the caller's launch reports it as never started.
-    if (rc != 0) return rc;
-
-    const aclError wait_rc = aclrtStreamWaitEvent(static_cast<aclrtStream>(waiter_stream), predecessor_boundary);
-    // The wait is an execution-visible submission, and on a non-zero return the
-    // API does not say it was refused. Both facts point the same way: the
-    // reference is committed and the launch is graded as having reached the
-    // device, so a rollback cannot free an event the device may still name.
-    sink.mark_submitted();
-    int commit_rc = commit_boundary_wait(QueuedStreamWaits::Shape::CrossRun, prepared);
-    if (wait_rc != ACL_SUCCESS) {
-        LOG_ERROR("aclrtStreamWaitEvent (predecessor whole-operator boundary) failed: %d", static_cast<int>(wait_rc));
-        ACL_LOG_ERROR_DETAIL(wait_rc);
-        return static_cast<int>(wait_rc);
-    }
-    if (commit_rc != 0) return commit_rc;
-    // Recorded immediately behind the wait, so it completes when the wait is
-    // consumed — not when this run finishes. That is what lets the predecessor
-    // retire its boundary without waiting for this run's kernels.
-    return record_cross_run_proof(prepared, waiter_stream);
 }
 
 int DeviceRunner::reap_run(const PreparedExecution &prepared, int *diagnostics_rc) {

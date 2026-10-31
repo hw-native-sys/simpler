@@ -221,10 +221,7 @@ TEST_F(NativeAdmissionTest, RealHbgCallbackAndOwnedInputsSurviveNativeParkExactl
     EXPECT_GE(runner.phases(1).total_records(), records_before);
     EXPECT_GE(runner.phases(1).dropped_records(), dropped_before);
     EXPECT_TRUE(runner.phases(1).finished());
-    EXPECT_EQ(
-        runner.phases(1).invocation_id(),
-        static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage)->trace_inv
-    );
+    EXPECT_EQ(runner.phases(1).invocation_id(), candidate.state()->trace_inv);
     EXPECT_TRUE(std::filesystem::exists(diagnostic_path + "/deps.json"));
     ASSERT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
     EXPECT_TRUE(candidate.empty());

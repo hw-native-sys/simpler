@@ -57,6 +57,17 @@ TEST_F(LaunchEntryArgs, KernelPacketPreservesFirstInitializationAndUsesRunOwnedA
     };
     const auto *resident = reinterpret_cast<const Runtime *>(slot.runtime_args);
     simpler::tmr::EntryArgsStorage decoded{};
+    EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, 19, &decoded));
+    EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, 19, &decoded));
+    // Cold staging is unbound; device entry receives the independently registered reference.
+    simpler::tmr::KernelCaptureControl control{};
+    const simpler::tmr::KernelCaptureReference reference{reinterpret_cast<uint64_t>(&control), 5, 6};
+    const auto *staging = static_cast<const unsigned char *>(helper.launch_payload());
+    std::vector<unsigned char> packet(staging, staging + helper.launch_payload_bytes());
+    const size_t reference_offset = LAUNCH_ENVELOPE_HEADER_BYTES + sizeof(SimplerKernelInvocationHeader) +
+                                    offsetof(simpler::tmr::EagerKernelBinding, reference);
+    std::memcpy(packet.data() + reference_offset, &reference, sizeof(reference));
+    view.args_base = packet.data();
     ASSERT_TRUE(simpler::tmr::admit_kernel_launch_entry(*resident, view, registered, 19, &decoded));
     EXPECT_EQ(decoded.scalar(0), 0x1111U);
     auto next_occupant = registered;

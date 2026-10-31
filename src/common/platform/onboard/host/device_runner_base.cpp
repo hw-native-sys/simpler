@@ -20,6 +20,9 @@
  */
 
 #include "device_runner_base.h"
+#include "kernel_capture_api.h"
+#include "native_run_context.h"
+#include "common/strace.h"
 
 #include "run_resource_arena.h"
 
@@ -36,6 +39,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <new>
 #include <sstream>
@@ -259,15 +263,16 @@ RunBoundaryMarks::DeviceEventOps make_acl_timing_event_ops() {
 
 }  // namespace
 
-DeviceRunnerBase::LaunchOutcome
-DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) noexcept {
+DeviceRunnerBase::LaunchOutcome DeviceRunnerBase::launch_execution(
+    std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit, std::unique_ptr<ActiveExecution> preallocated
+) noexcept {
     LaunchOutcome outcome;
     outcome.prepared = std::move(prepared);
     if (outcome.prepared == nullptr) return outcome;
 
-    std::unique_ptr<ActiveExecution> active;
+    std::unique_ptr<ActiveExecution> active = std::move(preallocated);
     try {
-        active = std::make_unique<ActiveExecution>(nullptr, LaunchProgress::NotStarted);
+        if (active == nullptr) active = std::make_unique<ActiveExecution>(nullptr, LaunchProgress::NotStarted);
     } catch (...) {
         outcome.rc = PTO_RUNTIME_ERR_INTERNAL;
         return outcome;
@@ -3303,7 +3308,7 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     return rc;
 }
 
-int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args) {
+int DeviceRunnerBase::ensure_aicore_binary_registered() {
     // Lazy-register the AICore binary on first call; reuse cached handle
     // thereafter. CANN has no public rtUnregisterAllKernel, so re-registering
     // every run would pin another device-side copy of the ELF and quickly
@@ -3329,6 +3334,11 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &
         }
     }
 
+    return 0;
+}
+
+int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args) {
+    if (int rc = ensure_aicore_binary_registered(); rc != 0) return rc;
     // `AicoreLaunchArgs` is the host-side image of the entry's parameter list
     // and is defined per-arch beside the entry's ABI, in common/kernel_args.h.
     // The driver copies `argsSize` bytes during the launch call, so a stack
@@ -3336,6 +3346,9 @@ int DeviceRunnerBase::launch_aicore_kernel(rtStream_t stream, const KernelArgs &
     AicoreLaunchArgs args{};
     fill_shared_launch_args(args, k_args);
     fill_arch_launch_args(args, k_args);
+    // Kernel admission clears reports before the fork; the existing unstamped
+    // handshake is independent of the AICPU terminal result's execution index.
+    if (k_args.entry_args_source == static_cast<uint32_t>(EntryArgsSource::KernelInvocation)) args.report_epoch = 0;
     rtArgsEx_t rt_args;
     std::memset(&rt_args, 0, sizeof(rt_args));
     rt_args.args = &args;
@@ -3482,14 +3495,12 @@ int DeviceRunnerBase::read_device_run_result(uint32_t pipeline_slot, uint64_t ru
     // and published it before its kernel returned.
     return device_run_result_reads_.read_with_status(
         pipeline_slot, run_epoch, device_run_results_[pipeline_slot], device_run_result_dev_ptrs_[pipeline_slot],
-        [](void *dst, const void *src) {
+        [this](void *dst, const void *src) {
             // The copy's own status is the caller's: this is an SDK call on the
             // run's drain path, and a code it reports is an error this thread
             // has observed. Returning it rather than a bool is what keeps a
             // later zero from standing in for it.
-            int rc = rtMemcpy(
-                dst, sizeof(DeviceRunResultRegion), src, sizeof(DeviceRunResultRegion), RT_MEMCPY_DEVICE_TO_HOST
-            );
+            int rc = copy_from_device(dst, src, sizeof(DeviceRunResultRegion));
             if (rc != 0) {
                 LOG_WARN("rtMemcpy(run_result) D2H failed: %d", rc);
                 ACL_LOG_ERROR_DETAIL(rc);
@@ -3670,8 +3681,185 @@ int DeviceRunnerBase::validate_caller_stream(rtStream_t caller) {
     return 0;
 }
 
+int DeviceRunnerBase::validate_execution_stream(PreparedExecution &prepared) {
+    if (prepared.caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    int rc = enter_run_thread();
+    if (rc != 0) return rc;
+    aclmdlRICaptureStatus status = ACL_MODEL_RI_CAPTURE_STATUS_NONE;
+    aclmdlRI model = nullptr;
+    rc = aclmdlRICaptureGetInfo(prepared.caller_stream, &status, &model);
+    if (rc != 0) return rc;
+    if (status != ACL_MODEL_RI_CAPTURE_STATUS_NONE) {
+        const auto *resources = prepared.kernel_resources;
+        if (status != ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE || resources == nullptr || !resources->graph_retained() ||
+            !resources->ready || resources->cold_pending || resources->caller_stream != prepared.caller_stream)
+            return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    prepared.recorded_submission = status == ACL_MODEL_RI_CAPTURE_STATUS_ACTIVE;
+    return 0;
+}
+
+int DeviceRunnerBase::poll_kernel_streams(const PreparedExecution &prepared) {
+    if (!prepared.streams.ready()) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    const int pair = query_stream_pair_nonblocking(prepared.streams.aicpu, prepared.streams.aicore);
+    if (pair != SIMPLER_NATIVE_RUN_POLL_COMPLETE || prepared.caller_stream == nullptr) return pair;
+    return query_stream_pair_nonblocking(prepared.caller_stream, prepared.streams.aicpu);
+}
+
+int DeviceRunnerBase::queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done) {
+    const aclError wait_rc = aclrtStreamWaitEvent(static_cast<aclrtStream>(aicpu_stream), core_done);
+    // The API documents no guarantee that a failure means the wait was not
+    // queued, so the reference is committed either way: a revoked reservation
+    // would let this run's own boundary events be destroyed while its stream may
+    // still name one.
+    const int commit_rc = commit_boundary_wait(QueuedStreamWaits::Shape::Own, prepared);
+    if (wait_rc != ACL_SUCCESS) {
+        LOG_ERROR("aclrtStreamWaitEvent (own AICore boundary) failed: %d", static_cast<int>(wait_rc));
+        ACL_LOG_ERROR_DETAIL(wait_rc);
+        return static_cast<int>(wait_rc);
+    }
+    return commit_rc;
+}
+
+int DeviceRunnerBase::queue_cross_run_wait(
+    PreparedExecution &prepared, rtStream_t waiter_stream, LaunchProgressSink &sink
+) {
+    void *predecessor_boundary = nullptr;
+    const int rc = open_cross_run_wait(prepared, &predecessor_boundary);
+    // Nothing has been submitted yet, so a refusal here leaves the run
+    // rollback-able and the caller's launch reports it as never started. It is
+    // not a licence to retry: the lane reaches an ordinary launch only through
+    // the explicit decline the runtime and the claim already express.
+    if (rc != 0) return rc;
+
+    const aclError wait_rc = aclrtStreamWaitEvent(static_cast<aclrtStream>(waiter_stream), predecessor_boundary);
+    // The wait is an execution-visible submission, and on a non-zero return the
+    // API does not say it was refused. Both facts point the same way: the
+    // reference is committed and the launch is graded as having reached the
+    // device, so a rollback cannot free an event the device may still name.
+    sink.mark_submitted();
+    const int commit_rc = commit_boundary_wait(QueuedStreamWaits::Shape::CrossRun, prepared);
+    if (wait_rc != ACL_SUCCESS) {
+        LOG_ERROR("aclrtStreamWaitEvent (predecessor whole-operator boundary) failed: %d", static_cast<int>(wait_rc));
+        ACL_LOG_ERROR_DETAIL(wait_rc);
+        return static_cast<int>(wait_rc);
+    }
+    if (commit_rc != 0) return commit_rc;
+    // Recorded immediately behind the wait, so it completes when the wait is
+    // consumed — not when this run finishes. That is what lets the predecessor
+    // retire its boundary without waiting for this run's kernels. Its own
+    // failure leaves the wait queued and committed, so the entry falls back to
+    // the quiescence proof at discharge rather than failing the run.
+    (void)record_cross_run_proof(prepared, waiter_stream);
+    return 0;
+}
+
+int DeviceRunnerBase::enqueue_execution_core(PreparedExecution &prepared, LaunchProgressSink &sink) {
+    const auto &streams = prepared.streams;
+    if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
+
+    if (prepared.join.predecessor_owner != nullptr) {
+        // This pair's AICPU FIFO already places the predecessor's kernel and
+        // completion boundary ahead of this run. Only the Core stream needs
+        // an additional cross-run edge.
+        const int join_rc = queue_cross_run_wait(prepared, streams.aicore, sink);
+        if (join_rc != 0) return join_rc;
+    }
+
+    // After any cross-run wait and before the kernel: the instant this stream was
+    // released to begin this run's AICore work. A record is not a wait and no stream
+    // waits on it, so a successor's marker cannot stand in for the production wait
+    // above. A failed record does not fail the run; it makes the position unavailable.
+    if (prepared.kernel_resources == nullptr || !prepared.kernel_resources->graph_retained())
+        (void)mark_run_boundary(RunBoundaryMarks::Position::AicoreStart, prepared.identity, streams.aicore);
+
+    LOG_INFO("=== launch_aicore_kernel ===");
+    int launch_rc = submit_execution_core_payload(prepared);
+    if (launch_rc != 0) {
+        LOG_ERROR("launch_aicore_kernel failed: %d", launch_rc);
+        recover_device_or_mark_unusable(launch_rc);
+        return launch_rc;
+    }
+    sink.mark_submitted();
+    // Nothing else enters this stream between the kernel and its
+    // boundary, so the boundary completes exactly when the kernel exits.
+    return record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicore);
+}
+
+int DeviceRunnerBase::enqueue_execution_cpu(PreparedExecution &prepared, LaunchProgressSink &sink) {
+    const auto &streams = prepared.streams;
+    // launch_count = popcount(OCCUPY) from the topology probe — one thread
+    // per user-schedulable cpu_id. The filter gate barriers exactly this
+    // many threads (runtime.aicpu_launch_count is read on the device side
+    // by kernel.cpp). The fallback is defensive; normal runs always publish
+    // the topology-derived launch count above.
+    STRACE_HOST_SPAN_AT("chip.run.runner_run.aicpu_launch", STRACE_NOW_NS(), 0, 2);
+    int launch_rc = submit_execution_cpu_payload(prepared);
+    if (launch_rc != 0) {
+        LOG_ERROR("launch_aicpu_payload (main) failed: %d", launch_rc);
+        return launch_rc;
+    }
+    sink.mark_submitted();
+    // The AICPU kernel spins in the handshake until the AICore workers publish,
+    // but it returns on its own schedule: the AICore kernel may still be in its
+    // tail. Queueing this run's own AICore boundary ahead of the AICPU boundary
+    // record is what makes that record cover both kernels, and it is the only
+    // thing a successor can safely be ordered behind.
+    //
+    // Failing to reserve the reference costs the run nothing but its
+    // joinability — no boundary is published, so no successor is ever ordered
+    // behind a boundary that covers only one kernel. Failing to *queue* the wait
+    // is different: the stream may hold it, so the run is graded Partial rather
+    // than continued.
+    void *core_done = nullptr;
+    bool whole_operator = false;
+    // Caller exit ordering requires this join even without a successor.
+    const bool needs_join = prepared.joinable_boundary || prepared.caller_stream != nullptr;
+    const int own_rc = needs_join ? open_own_boundary_wait(prepared, &core_done) : 0;
+    if (prepared.caller_stream != nullptr && own_rc != 0) return own_rc;
+    if (needs_join && own_rc == 0) {
+        const int wait_rc = queue_own_boundary_wait(prepared, streams.aicpu, core_done);
+        if (wait_rc != 0) return wait_rc;
+        whole_operator = true;
+        // Behind that wait and ahead of the boundary record: the instant this run's own
+        // AICore kernel had returned, which is what makes the time a *whole-operator*
+        // end rather than an AICPU-kernel end. Recorded only on this path, because only
+        // here does the stream position carry that meaning.
+        if (prepared.kernel_resources == nullptr || !prepared.kernel_resources->graph_retained())
+            (void)mark_run_boundary(RunBoundaryMarks::Position::WholeOperatorEnd, prepared.identity, streams.aicpu);
+    }
+    const int boundary_rc = record_run_boundary(prepared, RunCompletionFence::StreamRole::Aicpu);
+    if (boundary_rc == 0 && whole_operator) note_whole_operator_boundary(prepared);
+    if (boundary_rc != 0) return boundary_rc;
+    return queue_caller_exit(prepared);
+}
+
+int DeviceRunnerBase::submit_execution_admission_payload(PreparedExecution &prepared) {
+    auto &resources = *prepared.kernel_resources;
+    return launch_aicpu_payload(
+        prepared.streams.aicpu, resources.launch_packet.data(), resources.launch_packet.size(),
+        "simpler_aicpu_capture_admit", 1
+    );
+}
+
+int DeviceRunnerBase::submit_execution_core_payload(PreparedExecution &prepared) {
+    return launch_aicore_kernel(prepared.streams.aicore, prepared.kernel_args.args);
+}
+
+int DeviceRunnerBase::submit_execution_cpu_payload(PreparedExecution &prepared) {
+    auto *resources = prepared.kernel_resources;
+    const int threads = prepared.runtime->get_aicpu_launch_count() > 0 ? prepared.runtime->get_aicpu_launch_count() :
+                                                                         prepared.launch_aicpu_num;
+    return launch_aicpu_payload(
+        prepared.streams.aicpu,
+        resources != nullptr ? resources->launch_packet.data() : prepared.kernel_args.launch_payload(),
+        resources != nullptr ? resources->launch_packet.size() : prepared.kernel_args.launch_payload_bytes(),
+        host::KernelNames::RunName, threads
+    );
+}
+
 int DeviceRunnerBase::queue_run_entry(PreparedExecution &prepared, LaunchProgressSink &sink) {
-    return caller_orders_[prepared.pipeline_slot]->fork(prepared.identity, sink, [&] {
+    return caller_orders_[prepared.pipeline_slot]->fork(prepared.identity, sink, [&]() -> int {
         const int rc = publish_for_launch(prepared.kernel_args, prepared.streams.aicpu, sink);
         if (rc == 0 && prepared.kernel_args.args.run_result_data_base != 0) {
             device_run_result_initialized_[prepared.pipeline_slot] = true;
@@ -3679,8 +3867,18 @@ int DeviceRunnerBase::queue_run_entry(PreparedExecution &prepared, LaunchProgres
         if (rc == 0 && prepared.kernel_args.args.device_wall_data_base != 0) {
             device_timing_armed_[prepared.pipeline_slot] = true;
         }
-        return rc;
+        if (rc != 0 || prepared.kernel_resources == nullptr) return rc;
+        auto &resources = *prepared.kernel_resources;
+        if (!resources.ready) return PTO_RUNTIME_ERR_INVALID_STATE;
+        sink.mark_submitted();
+        return submit_execution_admission_payload(prepared);
     });
+}
+
+int DeviceRunnerBase::discharge_kernel_quiescence(const PreparedExecution &prepared) {
+    int rc = caller_orders_[prepared.pipeline_slot]->discharge_on_quiescence(prepared.identity);
+    if (rc != 0) return rc;
+    return queued_waits_->discharge_on_quiescence(prepared.identity);
 }
 
 int DeviceRunnerBase::queue_caller_exit(const PreparedExecution &prepared) {
@@ -3701,31 +3899,21 @@ int DeviceRunnerBase::arm_run_fence(const PreparedExecution &prepared) {
     return rc;
 }
 
+void DeviceRunnerBase::note_run_stream_identity(rtStream_t stream) {
+    int32_t stream_id = -1;
+    if (aclrtStreamGetId(static_cast<aclrtStream>(stream), &stream_id) == ACL_SUCCESS) {
+        run_stream_ids_.note(stream_id);
+    } else {
+        LOG_WARN("execution stream identity is unavailable; later unmatched fault notices have undecided attribution");
+        run_stream_ids_.note_unidentified_stream();
+    }
+}
+
 int DeviceRunnerBase::record_run_boundary(const PreparedExecution &prepared, RunCompletionFence::StreamRole role) {
     const rtStream_t stream =
         role == RunCompletionFence::StreamRole::Aicpu ? prepared.streams.aicpu : prepared.streams.aicore;
     RunCompletionFence &fence = run_fence(prepared.pipeline_slot);
-    // The one point where this stream is certainly live and certainly carrying a
-    // run, so it is where its driver id is captured for the fault channel's
-    // filter. A number survives both the stream's replacement and the device
-    // reset that would invalidate the handle; asking the handle later does not.
-    {
-        int32_t stream_id = -1;
-        if (aclrtStreamGetId(static_cast<aclrtStream>(stream), &stream_id) == ACL_SUCCESS) {
-            run_stream_ids_.note(stream_id);
-        } else {
-            // A stream this run submits on whose id is unknown. Skipping it
-            // silently would leave the history claiming to be whole while
-            // missing exactly the entry a later notice on this stream would
-            // carry, and that notice would then read as another runner's.
-            LOG_WARN(
-                "aclrtStreamGetId failed for the %s stream of slot %u; the fault channel's stream history is "
-                "incomplete from here, so an unmatched notice reads as undecided rather than as another runner's",
-                stream_role_name(role), prepared.pipeline_slot
-            );
-            run_stream_ids_.note_unidentified_stream();
-        }
-    }
+    note_run_stream_identity(stream);
     // The submission is a fact the instant the device queue accepted it, and it
     // has to be recorded before anything that can still fail — otherwise a
     // failing record below would leave the run looking unsubmitted.
@@ -3768,6 +3956,11 @@ int DeviceRunnerBase::poll_run_fence(const PreparedExecution &prepared) {
 }
 
 int DeviceRunnerBase::wait_run_fence(const PreparedExecution &prepared) {
+    if (prepared.kernel_resources != nullptr && prepared.kernel_resources->graph_retained()) {
+        if (prepared.native_context == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+        return observe_kernel_run(*static_cast<NativeRunContext<DeviceRunnerBase> *>(prepared.native_context), true);
+    }
+
     if (!prepared.streams.ready()) return PTO_RUNTIME_ERR_INVALID_STATE;
     const auto &streams = prepared.streams;
     const RunBoundaryWait observed = wait_and_retain_run_boundaries(
@@ -5296,4 +5489,37 @@ bool DeviceRunnerBase::retained_consumers_outstanding() const {
     if (!pmu_collector_.retained_runs_idle()) return true;
     if (!scope_stats_collector_.retained_runs_idle()) return true;
     return dep_gen_retained_runs_outstanding();
+}
+
+int DeviceRunnerBase::pin_kernel_capture_callable(int32_t callable_id, uint64_t *hash) {
+    const auto callable = callables_.find(callable_id);
+    if (hash == nullptr || callable == callables_.end() || callable->second.host_dlopen_handle != nullptr)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    const auto buffer = chip_callable_buffers_.find(callable->second.chip_buffer_hash);
+    if (buffer == chip_callable_buffers_.end() || buffer->second.release_pending || buffer->second.refcount <= 0)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    ++buffer->second.refcount;
+    *hash = callable->second.chip_buffer_hash;
+    return 0;
+}
+
+int DeviceRunnerBase::synchronize_kernel_capture_stream(rtStream_t stream) {
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = aclrtSynchronizeStreamWithTimeout(stream, timeout_config_.stream_sync_timeout_ms);
+    } catch (const std::exception &error) {
+        LOG_ERROR("Kernel capture stream synchronization threw: %s", error.what());
+    } catch (...) {
+        LOG_ERROR("Kernel capture stream synchronization threw an unknown C++ exception");
+    }
+    if (rc != 0) {
+        try {
+            recover_device_or_mark_unusable(rc);
+        } catch (const std::exception &error) {
+            LOG_ERROR("Kernel capture stream recovery threw after error %d: %s", rc, error.what());
+        } catch (...) {
+            LOG_ERROR("Kernel capture stream recovery threw an unknown C++ exception after error %d", rc);
+        }
+    }
+    return rc;
 }

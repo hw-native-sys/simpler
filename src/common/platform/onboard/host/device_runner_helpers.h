@@ -323,6 +323,7 @@ struct KernelArgsHelper {
      */
     void *launch_payload();
     size_t launch_payload_bytes() const { return launch_payload_bytes_; }
+    bool kernel_invocation_prepared() const { return !kernel_invocation_.empty(); }
 
     /**
      * Drop this run's view of the slot's device blocks.

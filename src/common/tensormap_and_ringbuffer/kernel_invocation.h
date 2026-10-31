@@ -17,6 +17,7 @@
 #include <type_traits>
 
 #include "task_interface/callable_protocol.h"
+#include "task_interface/kernel_capture.h"
 #include "task_interface/kernel_invocation_header.h"
 #include "task_interface/task_args.h"
 
@@ -32,9 +33,25 @@ struct KernelCallableIdentity {
 struct EagerKernelBinding {
     uint64_t runtime_address{0};
     uint64_t run_epoch{0};
+    KernelCaptureReference reference{};
 };
 static_assert(std::is_trivially_copyable_v<EagerKernelBinding> && std::is_standard_layout_v<EagerKernelBinding>);
-static_assert(sizeof(EagerKernelBinding) == 16);
+static_assert(sizeof(EagerKernelBinding) == 40);
+static_assert(offsetof(EagerKernelBinding, reference) == 16);
+
+inline bool valid_kernel_reference(const KernelCaptureReference &reference) noexcept {
+    return reference.control_address != 0 && reference.control_address % alignof(KernelCaptureControl) == 0 &&
+           reference.capture_generation != 0 && reference.context_generation != 0;
+}
+
+inline bool unbound_kernel_reference(const KernelCaptureReference &reference) noexcept {
+    return reference.control_address == 0 && reference.capture_generation == 0 && reference.context_generation == 0;
+}
+
+inline bool same_kernel_reference(const KernelCaptureReference &a, const KernelCaptureReference &b) noexcept {
+    return a.control_address == b.control_address && a.capture_generation == b.capture_generation &&
+           a.context_generation == b.context_generation;
+}
 
 inline bool valid_kernel_identity(const KernelCallableIdentity &identity) noexcept {
     return identity.callable_id >= 0 && identity.callable_id < MAX_REGISTERED_CALLABLE_IDS &&
@@ -86,6 +103,8 @@ inline bool normalize_kernel_tensor(const ChipTensor &input, ChipTensor *output)
     return true;
 }
 
+// A wholly empty reference is a cold staging snapshot. Device consumption
+// requires a bound reference established by independent registration.
 // The packet owns descriptors and scalar bits; caller-owned DEVICE storage is borrowed.
 template <typename EntryArgs>
 inline bool encode_kernel_invocation(
@@ -93,7 +112,9 @@ inline bool encode_kernel_invocation(
     size_t bytes
 ) {
     if (packet == nullptr || !valid_kernel_identity(identity) || binding.runtime_address == 0 ||
-        binding.run_epoch == 0 || args.tensor_count() != static_cast<int32_t>(identity.tensor_count) ||
+        binding.run_epoch == 0 ||
+        (!valid_kernel_reference(binding.reference) && !unbound_kernel_reference(binding.reference)) ||
+        args.tensor_count() != static_cast<int32_t>(identity.tensor_count) ||
         args.scalar_count() != static_cast<int32_t>(identity.scalar_count) ||
         bytes != kernel_invocation_bytes(identity.tensor_count, identity.scalar_count))
         return false;
@@ -129,7 +150,8 @@ inline bool consume_kernel_invocation(
     EntryArgs *output
 ) {
     if (packet == nullptr || output == nullptr || !valid_kernel_identity(identity) || binding.runtime_address == 0 ||
-        binding.run_epoch == 0 || bytes != kernel_invocation_bytes(identity.tensor_count, identity.scalar_count))
+        binding.run_epoch == 0 || !valid_kernel_reference(binding.reference) ||
+        bytes != kernel_invocation_bytes(identity.tensor_count, identity.scalar_count))
         return false;
     SimplerKernelInvocationHeader header{};
     EagerKernelBinding encoded{};
@@ -142,7 +164,9 @@ inline bool consume_kernel_invocation(
         header.reserved_ != 0)
         return false;
     std::memcpy(&encoded, source + sizeof(header), sizeof(encoded));
-    if (encoded.runtime_address != binding.runtime_address || encoded.run_epoch != binding.run_epoch) return false;
+    if (encoded.runtime_address != binding.runtime_address || encoded.run_epoch != binding.run_epoch ||
+        !same_kernel_reference(encoded.reference, binding.reference))
+        return false;
     const size_t tensors_offset = sizeof(header) + sizeof(encoded);
     for (uint32_t i = 0; i < identity.tensor_count; ++i) {
         ChipTensor tensor{};

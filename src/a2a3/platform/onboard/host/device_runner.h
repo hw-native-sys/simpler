@@ -226,6 +226,7 @@ public:
     size_t run_stream_set_create_count() const override { return run_streams_.created_count(); }
 
 private:
+    int prepare_submission(PreparedExecution &prepared) override;
     LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override;
 
     int finalize_impl() override;
@@ -335,18 +336,6 @@ private:
      * can retire a proven-complete stream as unproven.
      */
     int reap_run(const PreparedExecution &prepared, int *diagnostics_rc);
-
-    // Queue this run's own AICore boundary into its AICPU stream, ahead of the
-    // AICPU boundary record that then covers the whole operator. The reservation
-    // is taken by the caller, so a refusal costs only joinability; this is the
-    // step that touches the stream, and its failure grades the run Partial.
-    int queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done);
-
-    // Order this run behind the whole-operator boundary of the predecessor its
-    // join names, on its own AICore stream, and record the event that proves the
-    // wait consumed. Its AICPU side needs no edge: the pair's AICPU stream
-    // already holds the predecessor's kernel and boundary ahead of this run's.
-    int queue_cross_run_wait(PreparedExecution &prepared, rtStream_t waiter_stream, LaunchProgressSink &sink);
 
     // Emit the device-orchestration dep_gen graph, on both the success and the
     // error return of reap_run: the device flushes its dep_gen buffers during

@@ -11,20 +11,755 @@
 /** Real onboard workspace adapters and native prepare ownership over CPU transport. */
 #include <cstdlib>
 #include <new>
+#include <unistd.h>
 #include <array>
+#include <map>
 #include <optional>
 #include <string>
+#include <tuple>
 #include "callable.h"
 #include "fixture.h"
 
+extern "C" void simpler_bind_device_fault_monitor(void *);
+extern "C" int simpler_execution_environment_releasable_ctx(DeviceContextHandle);
+
 namespace native_admission_test {
 thread_local bool refuse_next_host_allocation = false;
+thread_local int host_allocations_until_failure = -1;
+namespace {
+int initialize_capture_context(Runner &runner);
+}
+
+static int prepare_kernel(Attempt &candidate) {
+    candidate.args.tensor(0).address_space = AddressSpace::DEVICE;
+    candidate.args.tensor(0).transfer = TensorTransfer::NONE;
+    int rc = candidate.runner.execution_mode_latch().latch(SIMPLER_MODE_KERNEL);
+    if (rc == 0) rc = initialize_capture_context(candidate.runner);
+    return rc != 0 ? rc : candidate.prepare();
+}
+
+TEST_F(NativeAdmissionTest, NullCallerIsRefusedBeforeSdkQueryOrPreparedStateMutation) {
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
+    auto &prepared = *candidate.state()->prepared_execution;
+    void *const caller = prepared.caller_stream;
+    const auto calls = control().capture_info_calls;
+    control().capture_info_rc = 100000;
+    EXPECT_EQ(
+        simpler_launch_run_on_stream(&runner, candidate.storage, nullptr, nullptr), PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    EXPECT_EQ(runner.validate_execution_stream(prepared), PTO_RUNTIME_ERR_INVALID_STATE);
+    control().capture_info_rc = 0;
+    EXPECT_EQ(control().capture_info_calls, calls);
+    EXPECT_EQ(prepared.caller_stream, caller);
+    EXPECT_FALSE(prepared.recorded_submission);
+    EXPECT_EQ(candidate.state()->phase.load(), NativeRunPhase::Prepared);
+    EXPECT_EQ(runner.launch_calls, 0);
+    EXPECT_EQ(simpler_launch_run(&runner, candidate.storage), 0);
+    EXPECT_EQ(simpler_wait_run(&runner, candidate.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, CaptureRefusalPreservesProgramEagerLaunchAndCompletion) {
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
+    auto &prepared = *candidate.state()->prepared_execution;
+    ASSERT_EQ(prepared.caller_stream, nullptr);
+    ASSERT_FALSE(prepared.recorded_submission);
+    control().capture_active = true;
+    EXPECT_EQ(
+        simpler_launch_run_on_stream(&runner, candidate.storage, candidate.caller_stream(), nullptr),
+        PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    control().capture_active = false;
+    EXPECT_EQ(prepared.caller_stream, nullptr);
+    EXPECT_FALSE(prepared.recorded_submission);
+    EXPECT_EQ(candidate.state()->phase.load(), NativeRunPhase::Prepared);
+    EXPECT_EQ(runner.launch_calls, 0);
+    ASSERT_EQ(simpler_launch_run(&runner, candidate.storage), 0);
+    EXPECT_EQ(simpler_poll_run(&runner, candidate.storage), SIMPLER_NATIVE_RUN_POLL_NOT_READY);
+    EXPECT_EQ(simpler_wait_run(&runner, candidate.storage), 0);
+    EXPECT_EQ(runner.drain_calls, 1);
+}
+
+TEST_F(NativeAdmissionTest, FailedStreamQueryPreservesCallerAndPriorRecordingState) {
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
+    auto &prepared = *candidate.state()->prepared_execution;
+    prepared.recorded_submission = true;
+    control().capture_info_rc = -4246;
+    EXPECT_EQ(simpler_launch_run_on_stream(&runner, candidate.storage, candidate.caller_stream(), nullptr), -4246);
+    control().capture_info_rc = 0;
+    EXPECT_EQ(prepared.caller_stream, nullptr);
+    EXPECT_TRUE(prepared.recorded_submission);
+    EXPECT_EQ(candidate.state()->phase.load(), NativeRunPhase::Prepared);
+    EXPECT_EQ(runner.launch_calls, 0);
+}
+
+TEST_F(NativeAdmissionTest, RetainHostAllocationFailuresPreservePreparedEagerState) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    for (int fail_after : {0, 1}) {
+        SCOPED_TRACE(fail_after);
+        Runner runner;
+        Attempt candidate(runner, 0, 10);
+        ASSERT_EQ(prepare_kernel(candidate), 0);
+        auto *state = candidate.state();
+        auto *const prepared = state->prepared_execution.get();
+        void *const caller = prepared->caller_stream;
+        const auto claims = runner.native_run_claim_count();
+        const auto reservations = runner.reservations();
+        const auto allocations = control().allocations;
+        RuntimeHandle reference = candidate.storage;
+        host_allocations_until_failure = fail_after;
+        const int rc = simpler_retain_run_resources(&runner, candidate.storage, candidate.caller_stream(), &reference);
+        const int remaining = std::exchange(host_allocations_until_failure, -1);
+        EXPECT_EQ(remaining, -1);
+        EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_EQ(reference, nullptr);
+        EXPECT_EQ(state->prepared_execution.get(), prepared);
+        EXPECT_EQ(prepared->caller_stream, caller);
+        EXPECT_FALSE(prepared->recorded_submission);
+        EXPECT_EQ(state->phase.load(), NativeRunPhase::Prepared);
+        EXPECT_FALSE(state->runner_claimed);
+        EXPECT_EQ(state->graph_reference_count.load(), 0u);
+        EXPECT_EQ(state->kernel_execution, nullptr);
+        EXPECT_EQ(state->capture_result, nullptr);
+        EXPECT_EQ(runner.kernel_capture_owner(), nullptr);
+        EXPECT_EQ(runner.native_run_claim_count(), claims);
+        EXPECT_EQ(runner.reservations(), reservations);
+        EXPECT_EQ(control().allocations, allocations);
+        ASSERT_EQ(simpler_launch_run_on_stream(&runner, candidate.storage, candidate.caller_stream(), nullptr), 0);
+        EXPECT_EQ(simpler_wait_run(&runner, candidate.storage), 0);
+        EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
+    }
+}
+
+TEST_F(NativeAdmissionTest, UnsupportedRetentionPreservesPreparedEagerAdmission) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "host_build_graph") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    ASSERT_EQ(simpler_kernel_capture_supported(&runner), 0);
+    auto *state = candidate.state();
+    ASSERT_NE(state, nullptr);
+    auto *prepared = state->prepared_execution.get();
+    ASSERT_NE(prepared, nullptr);
+    void *const caller = prepared->caller_stream;
+    ASSERT_NE(caller, candidate.caller_stream());
+    const auto claims = runner.native_run_claim_count();
+    const auto reservations = runner.reservations();
+    const auto allocations = control().allocations;
+    ASSERT_EQ(claims, 0u);
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        SCOPED_TRACE(attempt);
+        RuntimeHandle reference = candidate.storage;
+        EXPECT_EQ(
+            simpler_retain_run_resources(&runner, candidate.storage, candidate.caller_stream(), &reference),
+            PTO_RUNTIME_ERR_UNSUPPORTED
+        );
+        EXPECT_EQ(reference, nullptr);
+        EXPECT_EQ(state->prepared_execution.get(), prepared);
+        EXPECT_EQ(prepared->caller_stream, caller);
+        EXPECT_EQ(state->phase.load(), NativeRunPhase::Prepared);
+        EXPECT_FALSE(state->runner_claimed);
+        EXPECT_EQ(runner.native_run_claim_count(), claims);
+        EXPECT_EQ(runner.reservations(), reservations);
+        EXPECT_EQ(state->graph_reference_count.load(), 0u);
+        EXPECT_EQ(state->kernel_execution, nullptr);
+        EXPECT_EQ(state->capture_result, nullptr);
+        EXPECT_EQ(runner.kernel_capture_owner(), nullptr);
+        EXPECT_EQ(control().allocations, allocations);
+        EXPECT_EQ(runner.launch_calls, 0);
+    }
+    Attempt successor(runner, 1, 20);
+    successor.args.tensor(0).address_space = AddressSpace::DEVICE;
+    successor.args.tensor(0).transfer = TensorTransfer::NONE;
+    EXPECT_EQ(successor.prepare(), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(successor.empty());
+    EXPECT_EQ(runner.reservations(), reservations);
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, candidate.storage, candidate.caller_stream(), nullptr), 0);
+    EXPECT_EQ(simpler_wait_run(&runner, candidate.storage), 0);
+    EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
+    EXPECT_TRUE(candidate.empty());
+    EXPECT_EQ(runner.native_run_claim_count(), 0u);
+    EXPECT_EQ(runner.reservations(), 0u);
+}
+
+static simpler::tmr::KernelCaptureControl *inject_execution_resources(Attempt &candidate, uint64_t epoch) {
+    auto &runner = candidate.runner;
+    auto *state = candidate.state();
+    state->kernel_execution = std::make_unique<KernelCaptureOwner>();
+    auto &owner = *state->kernel_execution;
+    owner.graph_reference_count = &state->graph_reference_count;
+    owner.caller_stream = candidate.caller_stream();
+    auto *control = static_cast<simpler::tmr::KernelCaptureControl *>(
+        runner.allocate_tensor(sizeof(simpler::tmr::KernelCaptureControl))
+    );
+    if (control == nullptr) return nullptr;
+    *control = {};
+    // Device evidence is injected; reference acquisition, common retirement and
+    // cleanup execute through their production C API and workspace ledger.
+    owner.reference = {reinterpret_cast<uint64_t>(control), 17, 23};
+    owner.registration.reference = owner.reference;
+    owner.registration.binding_epoch = candidate.descriptor.run_epoch;
+    auto &kernel_args = state->prepared_execution->kernel_args;
+    if (runner.ensure_device_run_result_region(
+            candidate.descriptor.pipeline_slot, candidate.descriptor.run_epoch, kernel_args
+        ) != 0)
+        return nullptr;
+    owner.registration.run_result_address = kernel_args.args.run_result_data_base;
+    owner.control_initialized = true;
+    owner.ready = true;
+    control->capture_generation = 17;
+    control->context_generation = 23;
+    control->binding_epoch = candidate.descriptor.run_epoch;
+    control->decision = static_cast<uint32_t>(simpler::tmr::CaptureDecision::Admitted);
+    control->replay_epoch = epoch == 0 ? candidate.descriptor.run_epoch - 1 : candidate.descriptor.run_epoch + epoch;
+    control->completed_epoch = epoch == 0 ? 0 : control->replay_epoch;
+    state->prepared_execution->kernel_resources = &owner;
+    state->retained_device_use.retain(state->identity());
+    runner.note_workspace_run_fact(
+        candidate.descriptor.pipeline_slot, candidate.descriptor.run_epoch,
+        WorkspaceManager::RunFact::DeviceReferencesRetained
+    );
+    state->prepared_execution->streams = {
+        runner.kernel_execution_state().hidden_stream(KernelStreamKind::Aicpu),
+        runner.kernel_execution_state().hidden_stream(KernelStreamKind::Aicore)
+    };
+    return control;
+}
+
+static simpler::tmr::KernelCaptureControl *retain_capture(Attempt &candidate, uint64_t epoch) {
+    auto *control = inject_execution_resources(candidate, epoch);
+    if (control == nullptr ||
+        simpler_retain_run_resources(
+            &candidate.runner, candidate.storage, candidate.caller_stream(), &candidate.resource_reference
+        ) != 0)
+        return nullptr;
+    return control;
+}
+
+static int release_reference(Attempt &candidate) {
+    if (!candidate.empty()) {
+        const int rc = simpler_finalize_run(&candidate.runner, candidate.storage);
+        if (!candidate.empty()) return rc;
+    }
+    const int rc = simpler_release_run_resources(&candidate.runner, candidate.resource_reference);
+    if (rc == 0) candidate.resource_reference = nullptr;
+    return rc;
+}
+
+TEST_F(NativeAdmissionTest, RefusedGraphRetentionDoesNotReplaceTheOrdinaryResultView) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    ASSERT_NE(inject_execution_resources(candidate, 0), nullptr);
+    int other_caller = 0;
+    RuntimeHandle reference = nullptr;
+    EXPECT_EQ(
+        simpler_retain_run_resources(&runner, candidate.storage, &other_caller, &reference),
+        PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    EXPECT_EQ(reference, nullptr);
+    auto *state = candidate.state();
+    EXPECT_EQ(state->capture_result, nullptr);
+    DeviceRunResultRegion cached{};
+    cached.published = candidate.descriptor.run_epoch;
+    cached.payload_bytes = 1;
+    cached.payload[0] = 0x34;
+    runner.inject_cached_result(0, cached);
+    size_t bytes = 0;
+    const auto *payload = static_cast<const uint8_t *>(state->host_api.run_result(&bytes));
+    ASSERT_NE(payload, nullptr);
+    EXPECT_EQ(bytes, 1u);
+    EXPECT_EQ(payload[0], 0x34);
+    EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, CompletedEagerRetiresWithoutSynchronizingQueuedSuccessors) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    auto *device = inject_execution_resources(candidate, 1);
+    ASSERT_NE(device, nullptr);
+    device->launched_threads = device->arrived_threads = device->finished_threads = 2;
+    device->replay_epoch = device->completed_epoch = candidate.descriptor.run_epoch;
+    auto &owner = *candidate.state()->kernel_execution;
+    owner.registered = true;
+    owner.registration.action = static_cast<uint32_t>(simpler::tmr::CaptureRegistrationAction::RegisterOnce);
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, candidate.storage, candidate.caller_stream(), nullptr), 0);
+    ASSERT_EQ(simpler_wait_run(&runner, candidate.storage), 0);
+    const auto syncs = control().capture_sync_calls;
+    control().stream_sync_rc = -4321;
+    EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
+    EXPECT_TRUE(candidate.empty());
+    EXPECT_EQ(control().capture_sync_calls, syncs);
+    control().stream_sync_rc = 0;
+    if (!candidate.empty()) candidate.state()->kernel_execution->registered = false;
+}
+
+static void graph_result_does_not_poison_ordinary_run(int transfer_error) {
+    Runner runner;
+    runner.use_common_submission = true;
+    Attempt graph(runner, 0, 1);
+    ASSERT_EQ(prepare_kernel(graph), 0);
+    ASSERT_NE(retain_capture(graph, 1), nullptr);
+    auto *result =
+        reinterpret_cast<DeviceRunResultRegion *>(graph.state()->kernel_execution->registration.run_result_address);
+    ASSERT_EQ(runner.prewarm_common_submission(*graph.state()->prepared_execution), 0);
+    control().capture_active = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, graph.storage, graph.caller_stream(), nullptr), 0);
+    control().capture_active = false;
+    *result = {};
+    result->published = graph.descriptor.run_epoch;
+    result->verdict = static_cast<uint32_t>(DeviceRunVerdict::Ok);
+    ASSERT_EQ(simpler_finalize_run(&runner, graph.storage), 0);
+    control().run_result_copy_rc = transfer_error;
+    const int released = simpler_release_run_resources(&runner, graph.resource_reference);
+    control().run_result_copy_rc = 0;
+    ASSERT_EQ(released, 0);
+    graph.resource_reference = nullptr;
+
+    Attempt ordinary(runner, 0, 2);
+    ordinary.args.tensor(0).address_space = AddressSpace::DEVICE;
+    ordinary.args.tensor(0).transfer = TensorTransfer::NONE;
+    ASSERT_EQ(ordinary.prepare(), 0);
+    auto &args = ordinary.state()->prepared_execution->kernel_args;
+    ASSERT_EQ(runner.ensure_device_run_result_region(0, ordinary.descriptor.run_epoch, args), 0);
+    auto *next = reinterpret_cast<DeviceRunResultRegion *>(args.args.run_result_data_base);
+    *next = {};
+    next->published = ordinary.descriptor.run_epoch;
+    next->verdict = static_cast<uint32_t>(DeviceRunVerdict::Ok);
+    const auto copies = control().run_result_copies;
+    EXPECT_EQ(runner.read_device_run_result(0, ordinary.descriptor.run_epoch), 0);
+    EXPECT_EQ(control().run_result_copies, copies + 1);
+    EXPECT_EQ(runner.device_run_terminal(0, ordinary.descriptor.run_epoch).state, DeviceRunTerminalState::Succeeded);
+    EXPECT_EQ(simpler_finalize_run(&runner, ordinary.storage), 0);
+}
+
+TEST_F(NativeAdmissionTest, GraphReplaySequenceCannotReuseAnOrdinaryResultsCachedBytes) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    graph_result_does_not_poison_ordinary_run(0);
+}
+
+TEST_F(NativeAdmissionTest, GraphReadFailureCannotBecomeTheNextOrdinaryRunsTransferError) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    graph_result_does_not_poison_ordinary_run(-4321);
+}
+
+static void graph_observation_survives_cleanup_retry(int runtime_error) {
+    Runner runner;
+    Attempt graph(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(graph), 0);
+    auto *device = retain_capture(graph, 1);
+    ASSERT_NE(device, nullptr);
+    device->first_error = runtime_error;
+    auto *state = graph.state();
+    control().capture_active = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, graph.storage, graph.caller_stream(), nullptr), 0);
+    control().capture_active = false;
+    ASSERT_EQ(simpler_finalize_run(&runner, graph.storage), 0);
+    state->kernel_execution->registered = true;
+    control().capture_registration_throws = true;
+    control().run_result_copy_rc = -4321;
+    const int failed_revoke = simpler_release_run_resources(&runner, graph.resource_reference);
+    control().capture_registration_throws = false;
+    control().run_result_copy_rc = 0;
+    ASSERT_EQ(failed_revoke, PTO_RUNTIME_ERR_INTERNAL);
+    ASSERT_NE(state->kernel_execution, nullptr);
+    const auto first_result_copies = control().run_result_copies;
+    state->runner_resources_owned = true;
+    runner.abandon_rc = -77;
+    const int failed_cleanup = simpler_release_run_resources(&runner, graph.resource_reference);
+    ASSERT_EQ(failed_cleanup, -77);
+    EXPECT_EQ(control().run_result_copies, first_result_copies);
+    ASSERT_NE(state->capture_result, nullptr);
+    EXPECT_EQ(state->kernel_execution, nullptr);
+    EXPECT_EQ(state->completion_rc, runtime_error);
+    EXPECT_EQ(state->capture_result->transfer_rc, -4321);
+    EXPECT_TRUE(state->capture_result->read_attempted);
+    EXPECT_TRUE(state->capture_result->boundaries_complete);
+    size_t payload_bytes = 17;
+    EXPECT_EQ(state->host_api.run_result(&payload_bytes), nullptr);
+    EXPECT_EQ(payload_bytes, 0u);
+    const auto copies = control().run_result_copies;
+    runner.abandon_rc = 0;
+    ASSERT_EQ(simpler_release_run_resources(&runner, graph.resource_reference), 0);
+    graph.resource_reference = nullptr;
+    EXPECT_EQ(control().run_result_copies, copies);
+}
+
+TEST_F(NativeAdmissionTest, GraphObservationKeepsItsFirstTransferErrorAcrossCleanupRetries) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    graph_observation_survives_cleanup_retry(-9);
+}
+
+TEST_F(NativeAdmissionTest, GraphSnapshotReadFailureDoesNotRewriteACompletedRuntimeResult) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    graph_observation_survives_cleanup_retry(0);
+}
+
+TEST_F(NativeAdmissionTest, CommonEagerWaitReadsTheRuntimeFaultAfterAProvedDrain) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    auto *device = inject_execution_resources(candidate, 1);
+    ASSERT_NE(device, nullptr);
+    device->replay_epoch = device->completed_epoch = candidate.descriptor.run_epoch;
+    device->launched_threads = device->arrived_threads = device->finished_threads = 2;
+    device->first_error = -9;
+    candidate.state()->kernel_execution->registration.action =
+        static_cast<uint32_t>(simpler::tmr::CaptureRegistrationAction::RegisterOnce);
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, candidate.storage, candidate.caller_stream(), nullptr), 0);
+    EXPECT_EQ(simpler_wait_run(&runner, candidate.storage), -9);
+    EXPECT_EQ(simpler_wait_run(&runner, candidate.storage), -9);
+    EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), -9);
+    EXPECT_TRUE(candidate.empty());
+}
+
+TEST_F(NativeAdmissionTest, UnexecutedEagerCleanupPreservesItsEarlierSubmissionError) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    ASSERT_NE(inject_execution_resources(candidate, 0), nullptr);
+    candidate.state()->kernel_execution->registration.action =
+        static_cast<uint32_t>(simpler::tmr::CaptureRegistrationAction::RegisterOnce);
+    runner.partial_launch = true;
+    runner.launch_refusal_rc = -6543;
+    EXPECT_EQ(simpler_launch_run_on_stream(&runner, candidate.storage, candidate.caller_stream(), nullptr), -6543);
+    EXPECT_EQ(simpler_wait_run(&runner, candidate.storage), -6543);
+    EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), -6543);
+    EXPECT_TRUE(candidate.empty());
+}
+
+TEST_F(NativeAdmissionTest, RuntimeFailureInspectionDoesNotRetainAReleasedGraph) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    auto *device = retain_capture(candidate, 1);
+    ASSERT_NE(device, nullptr);
+    device->first_error = -9;
+    control().capture_active = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, candidate.storage, candidate.caller_stream(), nullptr), 0);
+    control().capture_active = false;
+    ASSERT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
+    DeviceRunResultRegion result{};
+    inject_runtime_failure_result(result, candidate.descriptor.run_epoch);
+    auto *result_state = resolve_native_run_storage<DeviceRunnerBase>(candidate.resource_reference);
+    ASSERT_NE(result_state, nullptr);
+    *reinterpret_cast<DeviceRunResultRegion *>(result_state->kernel_execution->registration.run_result_address) =
+        result;
+    ASSERT_EQ(simpler_wait_run(&runner, candidate.resource_reference), -9);
+    const int released = simpler_release_run_resources(&runner, candidate.resource_reference);
+    EXPECT_EQ(released, 0);
+    if (released != 0) {
+        runner.inject_cached_result(0, {});
+        EXPECT_EQ(simpler_release_run_resources(&runner, candidate.resource_reference), 0);
+    }
+    candidate.resource_reference = nullptr;
+    EXPECT_EQ(runner.reservations(), 0u);
+}
+
+TEST_F(NativeAdmissionTest, FailedGraphCleanupKeepsItsRuntimeResultAndReportsItsCleanupError) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    auto *device = retain_capture(candidate, 1);
+    ASSERT_NE(device, nullptr);
+    device->first_error = -9;
+    auto *state = candidate.state();
+    control().capture_active = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, candidate.storage, candidate.caller_stream(), nullptr), 0);
+    control().capture_active = false;
+    ASSERT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
+    DeviceRunResultRegion result{};
+    inject_runtime_failure_result(result, candidate.descriptor.run_epoch);
+    auto *result_state = resolve_native_run_storage<DeviceRunnerBase>(candidate.resource_reference);
+    ASSERT_NE(result_state, nullptr);
+    auto *source_result =
+        reinterpret_cast<DeviceRunResultRegion *>(result_state->kernel_execution->registration.run_result_address);
+    *source_result = result;
+    ASSERT_GT(result.payload_bytes, 0u);
+    auto stale = result;
+    stale.payload[0] ^= 0xff;
+    runner.inject_cached_result(0, stale);
+    ASSERT_EQ(simpler_wait_run(&runner, candidate.resource_reference), -9);
+    state->runner_resources_owned = true;
+    runner.abandon_rc = -4321;
+    EXPECT_EQ(simpler_release_run_resources(&runner, candidate.resource_reference), -4321);
+    EXPECT_EQ(runner.reservations(), 1u);
+    EXPECT_EQ(state->kernel_execution, nullptr);
+    size_t payload_bytes = 0;
+    const auto *payload = static_cast<const uint8_t *>(state->host_api.run_result(&payload_bytes));
+    EXPECT_NE(payload, nullptr);
+    EXPECT_EQ(payload_bytes, result.payload_bytes);
+    if (payload != nullptr && payload_bytes == result.payload_bytes)
+        EXPECT_EQ(std::memcmp(payload, result.payload, payload_bytes), 0);
+    *source_result = {};
+    runner.inject_cached_result(0, stale);
+    payload = static_cast<const uint8_t *>(state->host_api.run_result(&payload_bytes));
+    if (payload != nullptr && payload_bytes == result.payload_bytes)
+        EXPECT_EQ(std::memcmp(payload, result.payload, payload_bytes), 0);
+    const auto result_copies = control().run_result_copies;
+    EXPECT_EQ(simpler_wait_run(&runner, candidate.resource_reference), -9);
+    runner.abandon_rc = 0;
+    const int released = simpler_release_run_resources(&runner, candidate.resource_reference);
+    EXPECT_EQ(released, 0);
+    EXPECT_EQ(control().run_result_copies, result_copies);
+    if (released != 0) {
+        runner.inject_cached_result(0, {});
+        EXPECT_EQ(simpler_release_run_resources(&runner, candidate.resource_reference), 0);
+    }
+    candidate.resource_reference = nullptr;
+    EXPECT_EQ(runner.reservations(), 0u);
+}
+
+TEST_F(NativeAdmissionTest, EagerAndRecordedLaunchUseTheSameProductionCommandSequence) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    using Op = native_admission_transport::SubmissionOp;
+    using Step = std::tuple<Op, int, int>;
+    std::array<std::vector<Step>, 2> traces;
+    for (int recorded = 0; recorded < 2; ++recorded) {
+        Runner runner;
+        runner.use_common_submission = true;
+        Attempt candidate(runner, 0, 10);
+        ASSERT_EQ(prepare_kernel(candidate), 0);
+        auto *device = retain_capture(candidate, 0);
+        ASSERT_NE(device, nullptr);
+        auto *prepared = candidate.state()->prepared_execution.get();
+        ASSERT_EQ(runner.prewarm_common_submission(*prepared), 0);
+        auto &transport = control();
+        transport.submissions.clear();
+        transport.submissions.reserve(16);
+        transport.trace_submission = true;
+        transport.capture_active = recorded != 0;
+        const size_t events = transport.event_create_calls;
+        ASSERT_EQ(simpler_launch_run_on_stream(&runner, candidate.storage, candidate.caller_stream(), nullptr), 0);
+        EXPECT_EQ(transport.event_create_calls, events);
+        EXPECT_EQ(runner.facts(0, candidate.descriptor.run_epoch).launched, recorded == 0);
+        std::map<void *, int> event_ids;
+        for (const auto &step : transport.submissions) {
+            const int stream = step.stream == candidate.caller_stream() ? 0 :
+                               step.stream == prepared->streams.aicpu   ? 1 :
+                                                                          2;
+            int event = -1;
+            if (step.event != nullptr) {
+                const auto [it, inserted] = event_ids.emplace(step.event, static_cast<int>(event_ids.size()));
+                (void)inserted;
+                event = it->second;
+            }
+            traces[recorded].emplace_back(step.operation, stream, event);
+        }
+        transport.trace_submission = false;
+        transport.capture_active = false;
+        if (!recorded) device->replay_epoch = device->completed_epoch = candidate.descriptor.run_epoch;
+        EXPECT_EQ(release_reference(candidate), 0);
+    }
+    const std::vector<Step> expected{{Op::Record, 0, 0}, {Op::Wait, 1, 0}, {Op::Admission, 1, -1},
+                                     {Op::Record, 1, 1}, {Op::Wait, 2, 1}, {Op::Core, 2, -1},
+                                     {Op::Record, 2, 2}, {Op::Cpu, 1, -1}, {Op::Wait, 1, 2},
+                                     {Op::Record, 1, 3}, {Op::Wait, 0, 3}, {Op::Record, 0, 4}};
+    EXPECT_EQ(traces[0], expected);
+    EXPECT_EQ(traces[1], traces[0]);
+}
+
+TEST_F(NativeAdmissionTest, FailedCommonPayloadRetainsPartialGraphSubmissionUntilQuiescentRelease) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    using Op = native_admission_transport::SubmissionOp;
+    for (Op failed : {Op::Admission, Op::Core, Op::Cpu}) {
+        Runner runner;
+        runner.use_common_submission = true;
+        Attempt candidate(runner, 0, 10);
+        ASSERT_EQ(prepare_kernel(candidate), 0);
+        ASSERT_NE(retain_capture(candidate, 0), nullptr);
+        auto *state = candidate.state();
+        ASSERT_EQ(runner.prewarm_common_submission(*state->prepared_execution), 0);
+        control().submissions.clear();
+        control().submissions.reserve(16);
+        control().trace_submission = true;
+        control().capture_active = true;
+        control().fail_submission = failed;
+        EXPECT_EQ(
+            simpler_launch_run_on_stream(&runner, candidate.storage, candidate.caller_stream(), nullptr),
+            control().submission_rc
+        );
+        ASSERT_NE(state->active_execution, nullptr);
+        EXPECT_EQ(state->active_execution->progress, LaunchProgress::Partial);
+        EXPECT_NE(candidate.resource_reference, nullptr);
+        EXPECT_EQ(runner.reservations(), 1u);
+        control().capture_active = false;
+        control().trace_submission = false;
+        control().fail_submission = Op::None;
+        EXPECT_EQ(release_reference(candidate), 0);
+        EXPECT_EQ(runner.reservations(), 0u);
+    }
+}
+
+TEST_F(NativeAdmissionTest, CaptureReleaseReportsObservedExecutionInsteadOfNoSubmission) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    ASSERT_NE(retain_capture(candidate, 3), nullptr);
+    EXPECT_EQ(release_reference(candidate), 0);
+    EXPECT_TRUE(candidate.empty());
+    const auto facts = runner.facts(0, 10);
+    EXPECT_TRUE(facts.launched);
+    EXPECT_TRUE(facts.drain_proved);
+    EXPECT_FALSE(facts.no_submission);
+}
+
+TEST_F(NativeAdmissionTest, UnexecutedCaptureRetiresOnlyWithAQuiescenceProof) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    ASSERT_NE(retain_capture(candidate, 0), nullptr);
+    auto *state = candidate.state();
+    void *caller = candidate.caller_stream();
+    state->kernel_execution->caller_stream = caller;
+    EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
+    EXPECT_TRUE(candidate.empty());
+    ASSERT_TRUE(runner.can_accept_run());
+    control().stream_sync_rc = -4321;
+    runner.recovery_throws = true;
+    EXPECT_EQ(release_reference(candidate), -4321);
+    EXPECT_FALSE(runner.can_accept_run());
+    EXPECT_EQ(runner.recovery_rc, -4321);
+    EXPECT_NE(candidate.resource_reference, nullptr);
+    auto facts = runner.facts(0, 10);
+    EXPECT_FALSE(facts.launched);
+    EXPECT_FALSE(facts.no_submission);
+    EXPECT_FALSE(facts.drain_proved);
+    EXPECT_TRUE(runner.holds_epoch(10));
+    runner.recovery_throws = false;
+    control().stream_sync_rc = 0;
+    EXPECT_EQ(release_reference(candidate), 0);
+    facts = runner.facts(0, 10);
+    EXPECT_FALSE(facts.launched);
+    EXPECT_FALSE(facts.no_submission);
+    EXPECT_TRUE(facts.drain_proved);
+    EXPECT_FALSE(runner.can_accept_run());
+}
+
+TEST_F(NativeAdmissionTest, CaptureConsumesLateFaultWithoutRewritingItsRuntimeResult) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    DeviceFaultMonitor monitor(
+        {[] {
+             return 0;
+         },
+         [] {
+             return 0;
+         },
+         [] {
+             return static_cast<long>(getpid());
+         }}
+    );
+    struct Binding {
+        explicit Binding(DeviceFaultMonitor &m) { simpler_bind_device_fault_monitor(&m); }
+        ~Binding() { simpler_bind_device_fault_monitor(nullptr); }
+    } binding(monitor);
+    Runner runner;
+    ASSERT_EQ(runner.monitor_faults(), 0);
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    ASSERT_NE(retain_capture(candidate, 3), nullptr);
+    auto *state = candidate.state();
+    void *caller = candidate.caller_stream();
+    state->kernel_execution->caller_stream = caller;
+    runner.note_run_stream_identity(caller);
+    monitor.report(DeviceFaultNotice{0, 1, 7, 507001, 0});
+    control().capture_active = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, candidate.storage, caller, nullptr), 0);
+    control().capture_active = false;
+    EXPECT_EQ(simpler_wait_run(&runner, candidate.storage), 0);
+    EXPECT_EQ(state->observed_replay_sequence, 13u);
+    EXPECT_FALSE(runner.accepts_new_run());
+    EXPECT_EQ(release_reference(candidate), 0);
+}
+
+TEST_F(NativeAdmissionTest, GraphResourcesSurviveOriginalHandleRetirementAndStorageReuse) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    ASSERT_NE(retain_capture(candidate, 0), nullptr);
+    auto *state = candidate.state();
+    const size_t close_calls = control().loader_finalize_calls;
+    ASSERT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
+    EXPECT_TRUE(candidate.empty());
+    EXPECT_TRUE(runner.holds_epoch(10));
+    EXPECT_EQ(resolve_native_run_storage<DeviceRunnerBase>(candidate.resource_reference), state);
+    EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 0);
+    EXPECT_NE(finalize_device(&runner), 0);
+    EXPECT_EQ(control().loader_finalize_calls, close_calls);
+    std::memset(candidate.storage, 0xa5, get_runtime_size());
+    EXPECT_EQ(simpler_release_run_resources(&runner, candidate.resource_reference), 0);
+    candidate.resource_reference = nullptr;
+    uint64_t overwritten = 0;
+    std::memcpy(&overwritten, candidate.storage, sizeof(overwritten));
+    EXPECT_EQ(overwritten, UINT64_C(0xa5a5a5a5a5a5a5a5));
+    EXPECT_FALSE(runner.holds_epoch(10));
+    std::memset(candidate.storage, 0, get_runtime_size());
+    EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 0);
+    ASSERT_EQ(finalize_device(&runner), 0);
+    EXPECT_EQ(control().loader_finalize_calls, close_calls + 1);
+    EXPECT_EQ(simpler_execution_environment_releasable_ctx(&runner), 1);
+}
+
+TEST_F(NativeAdmissionTest, CommonWaitReadsLaterReplayInsteadOfCachedCompletion) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    auto *device = retain_capture(candidate, 3);
+    ASSERT_NE(device, nullptr);
+    void *caller = candidate.caller_stream();
+    control().capture_active = true;
+    ASSERT_EQ(simpler_launch_run_on_stream(&runner, candidate.storage, caller, nullptr), 0);
+    control().capture_active = false;
+    EXPECT_EQ(simpler_wait_run(&runner, candidate.storage), 0);
+    EXPECT_EQ(candidate.state()->phase.load(), NativeRunPhase::Complete);
+    device->replay_epoch = device->completed_epoch = 14;
+    device->first_error = -77;
+    EXPECT_EQ(simpler_wait_run(&runner, candidate.resource_reference), -77);
+    EXPECT_EQ(candidate.state()->observed_replay_sequence, 14u);
+    EXPECT_EQ(release_reference(candidate), 0);
+}
+
+TEST_F(NativeAdmissionTest, CaptureControlReadFailureRetainsItsLeaseForRetry) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    ASSERT_NE(retain_capture(candidate, 2), nullptr);
+    control().copy_rc = -4321;
+    EXPECT_EQ(release_reference(candidate), -4321);
+    EXPECT_NE(candidate.resource_reference, nullptr);
+    EXPECT_TRUE(runner.holds_epoch(10));
+    control().copy_rc = 0;
+    EXPECT_EQ(release_reference(candidate), 0);
+    EXPECT_FALSE(runner.holds_epoch(10));
+}
+
 }  // namespace native_admission_test
 
 // Only the throwing, unaligned allocation is replaced. Its ordinary delete
 // accepts malloc storage; aligned allocations retain their own allocator pair.
 void *operator new(std::size_t bytes) {
-    if (std::exchange(native_admission_test::refuse_next_host_allocation, false)) throw std::bad_alloc();
+    const bool refuse_next = std::exchange(native_admission_test::refuse_next_host_allocation, false);
+    auto &remaining = native_admission_test::host_allocations_until_failure;
+    const bool refuse_counted = remaining == 0;
+    if (remaining >= 0) --remaining;
+    if (refuse_next || refuse_counted) throw std::bad_alloc();
     if (void *storage = std::malloc(bytes == 0 ? 1 : bytes)) return storage;
     throw std::bad_alloc();
 }
@@ -41,6 +776,7 @@ int fake_current_device(void *, int *device_id) noexcept {
     return 0;
 }
 int fake_current_context(void *, void **context) noexcept {
+    if (control().attach_rc != 0) return control().attach_rc;
     static int token;
     *context = &token;
     return 0;
@@ -92,9 +828,19 @@ public:
     }
     HostRuntimeTimeoutConfig timeouts() const { return timeout_config_; }
 };
-}  // namespace
 
-extern "C" int simpler_execution_environment_releasable_ctx(DeviceContextHandle);
+int initialize_capture_context(Runner &runner) {
+    KernelContextOps ops;
+    ops.get_current_device = fake_current_device;
+    ops.get_current_context = fake_current_context;
+    ops.create_hidden_stream = fake_create_hidden_stream;
+    ops.destroy_hidden_stream = fake_destroy_hidden_stream;
+    ops.create_event = fake_create_event;
+    ops.destroy_event = fake_destroy_event;
+    const int rc = runner.kernel_execution_state().initialize(0, ops);
+    return rc != 0 ? rc : runner.kernel_execution_state().mark_ready_enqueued();
+}
+}  // namespace
 
 TEST_F(NativeAdmissionTest, ProgramColdCleanupDebtAbandonsOnlyAfterResetAttempt) {
     class CloseRunner : public Runner {
@@ -301,6 +1047,125 @@ TEST_F(NativeAdmissionTest, BorrowedDeviceDoesNotConfigureTheGlobalOperatorTimeo
     EXPECT_EQ(runner.timeouts().actual_op_execute_timeout_us, 0u);
 }
 
+TEST_F(NativeAdmissionTest, CoreLaunchPreservesMainlineAbiAndProgramReportIdentity) {
+    Runner runner;
+    runner.seed_cold_callable();
+    control().capture_active = true;
+    KernelArgs args{};
+    args.run_result_epoch = 73;
+    for (const auto source :
+         {EntryArgsSource::KernelInvocation, EntryArgsSource::LaunchEnvelope, EntryArgsSource::Descriptor}) {
+        SCOPED_TRACE(static_cast<uint32_t>(source));
+        args.entry_args_source = static_cast<uint32_t>(source);
+        ASSERT_EQ(runner.launch_common_core(args), 0);
+        EXPECT_EQ(control().core_payload_bytes, sizeof(AicoreLaunchArgs));
+        EXPECT_EQ(control().core_report_epoch, source == EntryArgsSource::KernelInvocation ? 0u : 73u);
+        EXPECT_EQ(args.run_result_epoch, 73u);
+    }
+    control().capture_active = false;
+}
+
+TEST_F(NativeAdmissionTest, UnknownColdRegistrationIsRevokedBeforeControlRelease) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    runner.use_common_submission = true;
+    runner.seed_cold_callable();
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    auto &prepared = *candidate.state()->prepared_execution;
+    prepared.runtime->set_orch_args(candidate.args);
+    prepared.launch_aicpu_num = 2;
+    prepared.num_aicore = 1;
+    DeviceRunResultRegion terminal{};
+    prepared.kernel_args.args.run_result_data_base = reinterpret_cast<uint64_t>(&terminal);
+    prepared.streams = {
+        runner.kernel_execution_state().hidden_stream(KernelStreamKind::Aicpu),
+        runner.kernel_execution_state().hidden_stream(KernelStreamKind::Aicore)
+    };
+    ASSERT_EQ(runner.prewarm_common_submission(prepared, true), 0);
+    control().capture_registration_throws = true;
+    RuntimeHandle reference = nullptr;
+    EXPECT_EQ(
+        simpler_retain_run_resources(&runner, candidate.storage, candidate.caller_stream(), &reference),
+        PTO_RUNTIME_ERR_INTERNAL
+    );
+    EXPECT_EQ(reference, nullptr);
+    ASSERT_NE(candidate.state()->kernel_execution, nullptr);
+    EXPECT_NE(candidate.state()->kernel_execution->reference.control_address, 0u);
+    EXPECT_TRUE(candidate.state()->kernel_execution->cold_pending);
+    control().capture_registration_throws = false;
+    EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
+    EXPECT_TRUE(candidate.empty());
+    // An enqueue exception carries no proof that registration was not queued.
+    // Quiescence must be followed by revoke before freeing its control.
+    EXPECT_EQ(control().capture_registration_calls, 2u);
+}
+
+TEST_F(NativeAdmissionTest, CaptureReleaseLoaderExceptionRetainsRegistrationForRetry) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    ASSERT_NE(retain_capture(candidate, 0), nullptr);
+    auto &owner = *candidate.state()->kernel_execution;
+    owner.registered = true;
+    const auto control_address = owner.reference.control_address;
+    control().capture_registration_throws = true;
+    bool escaped = false;
+    int rc = 0;
+    try {
+        rc = release_reference(candidate);
+    } catch (...) {
+        escaped = true;
+    }
+    control().capture_registration_throws = false;
+    EXPECT_FALSE(escaped);
+    EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_NE(candidate.resource_reference, nullptr);
+    EXPECT_TRUE(owner.registered);
+    EXPECT_EQ(owner.reference.control_address, control_address);
+    EXPECT_FALSE(runner.kernel_execution_state().accepts_dispatch());
+    EXPECT_EQ(control().capture_registration_calls, 1u);
+    EXPECT_EQ(release_reference(candidate), 0);
+    EXPECT_EQ(control().capture_registration_calls, 2u);
+    EXPECT_TRUE(candidate.empty());
+}
+
+TEST_F(NativeAdmissionTest, CommonLaunchExceptionsRetainGraphResourcesForQuiescentRetry) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    for (const bool throw_after_submission : {true, false}) {
+        SCOPED_TRACE(throw_after_submission);
+        Runner runner;
+        Attempt candidate(runner, 0, 10);
+        ASSERT_EQ(prepare_kernel(candidate), 0);
+        ASSERT_NE(retain_capture(candidate, 0), nullptr);
+        control().capture_active = true;
+        runner.launch_throws_after_submission = throw_after_submission;
+        runner.partial_launch = !throw_after_submission;
+        runner.launch_refusal_rc = throw_after_submission ? 0 : PTO_RUNTIME_ERR_INTERNAL;
+        void *caller = candidate.caller_stream();
+        int rc = 0;
+        bool escaped = false;
+        try {
+            rc = simpler_launch_run_on_stream(&runner, candidate.storage, caller, nullptr);
+        } catch (...) {
+            escaped = true;
+        }
+        EXPECT_FALSE(escaped);
+        EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+        EXPECT_EQ(runner.launch_calls, 1);
+        ASSERT_NE(candidate.state()->active_execution, nullptr);
+        EXPECT_EQ(candidate.state()->active_execution->progress, LaunchProgress::Partial);
+        control().capture_active = false;
+        control().stream_sync_rc = -4321;
+        EXPECT_EQ(release_reference(candidate), -4321);
+        EXPECT_NE(candidate.resource_reference, nullptr);
+        control().stream_sync_rc = 0;
+        EXPECT_EQ(release_reference(candidate), 0);
+        EXPECT_TRUE(candidate.empty());
+    }
+}
+
 TEST_F(NativeAdmissionTest, RegistrationRefusesWhileANativeRunIsOutstanding) {
     Runner runner;
     ASSERT_EQ(runner.execution_mode_latch().latch(SIMPLER_MODE_KERNEL), 0);
@@ -327,7 +1192,50 @@ TEST_F(NativeAdmissionTest, RegistrationRefusesWhileANativeRunIsOutstanding) {
     EXPECT_EQ(simpler_kernel_mode_prepare_callable(&runner, 3, image.data(), image.size()), PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_EQ(simpler_register_callable_v2(&runner, image.data(), image.size(), &auto_id), PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_EQ(auto_id, -1);
+    EXPECT_EQ(simpler_unregister_callable(&runner, 1), PTO_RUNTIME_ERR_INTERNAL);
+    EXPECT_TRUE(runner.has_callable(1));
     runner.release_native_run_reservation(&owner);
+}
+
+TEST_F(NativeAdmissionTest, WrongContextDoesNotConsumeCaptureFaultNotices) {
+    if (std::strcmp(SIMPLER_RUNTIME_NAME, "tensormap_and_ringbuffer") != 0) GTEST_SKIP();
+    DeviceFaultMonitor monitor(
+        {[] {
+             return 0;
+         },
+         [] {
+             return 0;
+         },
+         [] {
+             return static_cast<long>(getpid());
+         }}
+    );
+    struct Binding {
+        explicit Binding(DeviceFaultMonitor &m) { simpler_bind_device_fault_monitor(&m); }
+        ~Binding() { simpler_bind_device_fault_monitor(nullptr); }
+    } binding(monitor);
+    Runner runner;
+    ASSERT_EQ(runner.monitor_faults(), 0);
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(prepare_kernel(candidate), 0);
+    ASSERT_NE(retain_capture(candidate, 0), nullptr);
+    auto *state = candidate.state();
+    state->kernel_execution->registered = true;
+    void *caller = candidate.caller_stream();
+    runner.note_run_stream_identity(caller);
+    monitor.report(DeviceFaultNotice{0, 1, 7, 507001, 0});
+    control().attach_rc = -4321;
+    EXPECT_NE(simpler_launch_run_on_stream(&runner, candidate.storage, caller, nullptr), 0);
+    EXPECT_TRUE(runner.accepts_new_run());
+    EXPECT_EQ(runner.launch_calls, 0);
+    EXPECT_EQ(state->phase.load(), NativeRunPhase::Prepared);
+    EXPECT_EQ(state->kernel_execution->caller_stream, caller);
+    EXPECT_NE(simpler_release_run_resources(&runner, candidate.resource_reference), 0);
+    EXPECT_TRUE(runner.accepts_new_run());
+    control().attach_rc = 0;
+    EXPECT_EQ(runner.consume_device_fault_notices(), 1u);
+    state->kernel_execution->registered = false;
+    EXPECT_EQ(release_reference(candidate), 0);
 }
 
 TEST_F(NativeAdmissionTest, AutomaticRegistrationDoesNotRetryFailedProgramInitialization) {
@@ -366,6 +1274,31 @@ TEST_F(NativeAdmissionTest, AutomaticRegistrationDoesNotRetryFailedProgramInitia
     int32_t id = 99;
     EXPECT_EQ(simpler_register_callable_v2(&runner, image.data(), image.size(), &id), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_EQ(id, -1);
+}
+
+TEST_F(NativeAdmissionTest, InvalidCaptureOwnerCannotMutateTheCallableRegistry) {
+    Runner runner;
+    Attempt candidate(runner, 0, 10);
+    ASSERT_EQ(candidate.prepare(), 0);
+    runner.set_kernel_capture_owner(candidate.storage);
+    const uint8_t binary[] = {0x01};
+    const auto image = make_chip_callable(nullptr, 0, "orch", binary, sizeof(binary), nullptr, nullptr, 0, "");
+    const auto allocations = control().allocations;
+    EXPECT_EQ(simpler_register_callable(&runner, 2, image.data()), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(
+        simpler_kernel_mode_prepare_callable(&runner, 2, image.data(), image.size()), PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    int32_t auto_id = 99;
+    EXPECT_EQ(
+        simpler_register_callable_v2(&runner, image.data(), image.size(), &auto_id), PTO_RUNTIME_ERR_INVALID_STATE
+    );
+    EXPECT_EQ(auto_id, -1);
+    EXPECT_EQ(simpler_unregister_callable(&runner, 1), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_TRUE(runner.has_callable(1));
+    EXPECT_FALSE(runner.has_callable(2));
+    EXPECT_EQ(control().allocations, allocations);
+    EXPECT_TRUE(runner.native_runs_outstanding());
+    runner.set_kernel_capture_owner(nullptr);
 }
 
 TEST_F(NativeAdmissionTest, EarlyPrepareFailureDoesNotBlockTheNormalRunComposition) {
@@ -482,7 +1415,7 @@ TEST_F(NativeAdmissionTest, ThrowingBackendRetainsTheOwnerAndNeverPublishesNoSub
     EXPECT_EQ(runner.recovery_calls, 1);
     EXPECT_EQ(runner.recovery_rc, PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_FALSE(runner.can_accept_run());
-    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage);
+    auto *state = candidate.state();
     ASSERT_NE(state->active_execution, nullptr);
     EXPECT_EQ(state->active_execution->progress, LaunchProgress::Partial);
     EXPECT_TRUE(runner.holds_epoch(10));
@@ -512,7 +1445,7 @@ TEST_F(NativeAdmissionTest, ThrowAfterSubmissionRetainsTheCarrierAndAllBindingsU
     EXPECT_EQ(runner.recovery_calls, 1);
     EXPECT_EQ(runner.recovery_rc, PTO_RUNTIME_ERR_INTERNAL);
     EXPECT_FALSE(runner.can_accept_run());
-    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage);
+    auto *state = candidate.state();
     ASSERT_NE(state->active_execution, nullptr);
     ASSERT_NE(state->active_execution->prepared, nullptr);
     EXPECT_EQ(state->active_execution->prepared->runtime, &state->runtime);

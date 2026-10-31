@@ -38,6 +38,7 @@
 #include "runtime_c_api.h"
 #include "task_args_wire.h"
 #include "native_run_context.h"
+#include "kernel_capture_api.h"
 
 #include <acl/acl.h>
 #include <dlfcn.h>
@@ -76,6 +77,9 @@ extern "C" bool dep_gen_host_graph_active();
 extern "C" int dep_gen_host_graph_emit(const char *deps_json_path);
 
 using OnboardNativeRunContext = NativeRunContext<DeviceRunnerBase>;
+using OnboardNativeRunHandle = NativeRunHandle<DeviceRunnerBase>;
+static_assert(sizeof(OnboardNativeRunContext) >= sizeof(OnboardNativeRunHandle));
+static_assert(alignof(OnboardNativeRunContext) >= alignof(OnboardNativeRunHandle));
 // Phase entry points validate raw caller storage before beginning object
 // lifetime, so the on-storage magic must remain the leading bytes.
 static_assert(__builtin_offsetof(OnboardNativeRunContext, magic) == 0, "native-run magic must lead runtime storage");
@@ -1060,6 +1064,8 @@ static int enter_kernel_callable_preparation(DeviceRunnerBase *runner, const cha
         LOG_ERROR("%s: the kernel context no longer accepts preparation", entry);
         return PTO_RUNTIME_ERR_INVALID_STATE;
     }
+    const int capture_rc = quiesce_kernel_capture_for_callable_change(runner, -1, false);
+    if (capture_rc != 0) return capture_rc;
     return runner->enter_run_thread();
 }
 
@@ -1101,7 +1107,7 @@ static int prepare_kernel_callable_on_runner(
 static int
 prepare_kernel_callable_locked(DeviceRunnerBase *runner, int32_t callable_id, const void *callable, const char *entry) {
     try {
-        if (runner->native_runs_outstanding()) {
+        if (runner->native_runs_outstanding() && runner->kernel_capture_owner() == nullptr) {
             LOG_ERROR("%s: native run must be finalized before mutating the callable registry", entry);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
@@ -1122,7 +1128,7 @@ static int
 register_callable_locked(DeviceContextHandle ctx, int32_t callable_id, const void *callable, const char *entry) {
     if (ctx == NULL || callable == NULL) return PTO_RUNTIME_ERR_INTERNAL;
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
-    if (runner->native_runs_outstanding()) {
+    if (runner->native_runs_outstanding() && runner->kernel_capture_owner() == nullptr) {
         LOG_ERROR("%s: native run must be finalized before mutating the callable registry", entry);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -1130,6 +1136,8 @@ register_callable_locked(DeviceContextHandle ctx, int32_t callable_id, const voi
         LOG_ERROR("%s: callable_id=%d is already registered; unregister it before reuse", entry, callable_id);
         return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
     }
+    const int capture_rc = quiesce_kernel_capture_for_callable_change(runner, -1, false);
+    if (capture_rc != 0) return capture_rc;
 
     try {
         int rc = runner->ensure_device_initialized();
@@ -1166,7 +1174,7 @@ static int register_callable_auto_id(
     const bool kernel = runner->execution_mode_latch().is_kernel();
     try {
         std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
-        if (runner->native_runs_outstanding()) {
+        if (runner->native_runs_outstanding() && runner->kernel_capture_owner() == nullptr) {
             LOG_ERROR("%s: native run must be finalized before mutating the callable registry", entry);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
@@ -1306,13 +1314,11 @@ static void emit_device_phase_markers(DeviceRunnerBase *runner, uint32_t pipelin
 static OnboardNativeRunContext *
 native_run_context(DeviceContextHandle ctx, RuntimeHandle runtime, const char *operation) {
     if (ctx == nullptr || runtime == nullptr) return nullptr;
-    uint64_t magic = 0;
-    std::memcpy(&magic, runtime, sizeof(magic));
-    if (magic != OnboardNativeRunContext::kMagic) {
+    auto *state = resolve_native_run_storage<DeviceRunnerBase>(runtime);
+    if (state == nullptr) {
         LOG_ERROR("%s: runtime does not contain a prepared native run", operation);
         return nullptr;
     }
-    auto *state = static_cast<OnboardNativeRunContext *>(runtime);
     if (state->runner != static_cast<DeviceRunnerBase *>(ctx)) {
         LOG_ERROR("%s: prepared run belongs to a different device context", operation);
         return nullptr;
@@ -1383,17 +1389,26 @@ int supports_concurrent_native_prepare_ctx(DeviceContextHandle ctx) {
  * The boundary half is the observation the run's own drain or poll retained,
  * not a fresh poll: by the time this runs, that drain's cleanup has retired the
  * fence's arming, so a poll would answer `Error` about the fence rather than
- * about the run. The record half is the cached copy `read_device_run_result`
- * already took, with its read status, so a failed copy stays distinguishable
+ * about the run. The record half is the retained runner or graph observation,
+ * with its read status, so a failed copy stays distinguishable
  * from a read never attempted. Neither half asks the device anything.
  */
 static RunOutcomeEvidence collect_run_evidence(const OnboardNativeRunContext *state) {
     RunOutcomeEvidence evidence;
+    if (state->capture_result != nullptr) {
+        const auto &result = *state->capture_result;
+        if (result.boundaries_complete) evidence.boundaries = RunCompletionFence::Completion::Complete;
+        evidence.record_read = !result.read_attempted  ? RunRecordRead::NotAttempted :
+                               result.transfer_rc == 0 ? RunRecordRead::Ok :
+                                                         RunRecordRead::Failed;
+        if (evidence.record_read == RunRecordRead::Ok)
+            evidence.terminal = device_run_result_terminal(result.snapshot, state->descriptor.run_epoch);
+        return evidence;
+    }
+    const uint64_t epoch = state->descriptor.run_epoch;
     evidence.boundaries = state->runner->observed_run_boundaries(state->identity());
-    evidence.record_read =
-        state->runner->device_run_result_read_status(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
-    evidence.terminal =
-        state->runner->device_run_terminal(state->descriptor.pipeline_slot, state->descriptor.run_epoch);
+    evidence.record_read = state->runner->device_run_result_read_status(state->descriptor.pipeline_slot, epoch);
+    evidence.terminal = state->runner->device_run_terminal(state->descriptor.pipeline_slot, epoch);
     return evidence;
 }
 
@@ -1574,6 +1589,23 @@ static void emit_overlap_storage_marks(OnboardNativeRunContext *state, bool shar
  * claim and the native-run reservation. The growth permission stays with the
  * waiting plan, since it is still the context's one outstanding grower.
  */
+static void *native_run_public_storage(OnboardNativeRunContext *state) {
+    return state->heap_owned ? state->public_handle_storage : state;
+}
+
+static void destroy_onboard_native_run_context(OnboardNativeRunContext *state) {
+    if (!state->heap_owned) {
+        destroy_native_run_context(state);
+        return;
+    }
+    void *storage = state->public_handle_storage;
+    if (storage == nullptr) return;
+    state->public_handle_storage = nullptr;
+    static_cast<OnboardNativeRunHandle *>(storage)->~OnboardNativeRunHandle();
+    constexpr uint64_t empty = 0;
+    std::memcpy(storage, &empty, sizeof(empty));
+}
+
 static int park_prepare(OnboardNativeRunContext *state, int wait_rc) {
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
@@ -1606,7 +1638,7 @@ static int park_prepare(OnboardNativeRunContext *state, int wait_rc) {
         state->runner->release_native_run_reservation(state);
         state->runner_reserved = false;
     }
-    destroy_native_run_context(state);
+    destroy_onboard_native_run_context(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
     return wait_rc;
 }
@@ -1615,6 +1647,7 @@ static int park_prepare(OnboardNativeRunContext *state, int wait_rc) {
 static bool is_resource_wait(int rc) { return rc == SIMPLER_RUNTIME_ERR_RESOURCE_WAIT; }
 
 static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_rc) {
+    void *storage = native_run_public_storage(state);
     const uint64_t run_epoch = state->descriptor.run_epoch;
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
@@ -1682,11 +1715,11 @@ static int cleanup_failed_prepare(OnboardNativeRunContext *state, int execution_
         state->runner->release_native_run_reservation(state);
         state->runner_reserved = false;
     }
-    destroy_native_run_context(state);
+    destroy_onboard_native_run_context(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
     if (validation_rc != 0) return validation_rc;
     if (resources_rc != 0) return resources_rc;
-    publish_released_preparation(state, run_epoch);
+    publish_released_preparation(storage, run_epoch);
     return execution_rc;
 }
 
@@ -1725,11 +1758,12 @@ int simpler_prepare_run(
         );
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    if (reinterpret_cast<uintptr_t>(runtime) % alignof(OnboardNativeRunContext) != 0) {
+    if (reinterpret_cast<uintptr_t>(runtime) % get_runtime_alignment() != 0) {
         LOG_ERROR("simpler_prepare_run: runtime storage does not satisfy get_runtime_alignment()");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
     DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
+    if (runner->kernel_capture_owner() != nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
     const int context_rc = runner->validate_current_context();
     if (context_rc != 0) return context_rc;
     if (runner->execution_mode_latch().is_kernel()) {
@@ -1751,7 +1785,7 @@ int simpler_prepare_run(
     }
     uint64_t magic = 0;
     std::memcpy(&magic, runtime, sizeof(magic));
-    if (magic == OnboardNativeRunContext::kMagic) {
+    if (magic == OnboardNativeRunContext::kMagic || magic == OnboardNativeRunHandle::kMagic) {
         LOG_ERROR("simpler_prepare_run: runtime already contains a prepared run; finalize it before reuse");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -1782,7 +1816,16 @@ int simpler_prepare_run(
                 resolved.pipeline_slot, descriptor->arena_bank, resolved.arena_bank
             );
         }
-        state = new (runtime) OnboardNativeRunContext(runner, *config, trace_hid, resolved, &g_host_api_ops);
+        if (runner->execution_mode_latch().is_kernel()) {
+            auto owned =
+                std::make_shared<OnboardNativeRunContext>(runner, *config, trace_hid, resolved, &g_host_api_ops);
+            state = owned.get();
+            state->heap_owned = true;
+            state->public_handle_storage = runtime;
+            new (runtime) OnboardNativeRunHandle(std::move(owned), NativeRunHandleRole::Run);
+        } else {
+            state = new (runtime) OnboardNativeRunContext(runner, *config, trace_hid, resolved, &g_host_api_ops);
+        }
         std::snprintf(
             state->trace_attrs, sizeof(state->trace_attrs),
             "run_id=%llu dispatch_id=%llu slot_id=%u generation=%llu run_epoch=%llu",
@@ -1796,7 +1839,7 @@ int simpler_prepare_run(
                 state, state->descriptor.pipeline_slot, state->descriptor.arena_bank, allow_prepared_successor
             )) {
             LOG_ERROR("simpler_prepare_run: native-run admission is occupied (%s)", state->trace_attrs);
-            destroy_native_run_context(state);
+            destroy_onboard_native_run_context(state);
             return PTO_RUNTIME_ERR_INTERNAL;
         }
         state->runner_reserved = true;
@@ -1973,6 +2016,11 @@ int simpler_prepare_run(
             );
         }
         if (rc != 0) return cleanup_failed_prepare(state, rc);
+        if (state->heap_owned) {
+            state->prepared_execution->native_context = state;
+            state->pending_active_execution =
+                std::make_unique<DeviceRunnerBase::ActiveExecution>(nullptr, LaunchProgress::NotStarted);
+        }
         // A launch-time property of the run, carried from the descriptor the
         // caller filled: whether it builds the boundary that makes it joinable.
         // Only honoured where the runtime supports being joined at all, so no
@@ -2049,9 +2097,17 @@ int simpler_launch_run_on_stream(
     if (state == nullptr || state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared ||
         state->prepared_execution == nullptr)
         return PTO_RUNTIME_ERR_INVALID_STATE;
-    const int rc = state->runner->validate_caller_stream(caller_stream);
-    if (rc != 0) return rc;
+    if (caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (state->graph_reference_count.load(std::memory_order_acquire) != 0 &&
+        (state->kernel_execution == nullptr || state->kernel_execution->caller_stream != caller_stream))
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    void *previous_caller = state->prepared_execution->caller_stream;
     state->prepared_execution->caller_stream = caller_stream;
+    const int rc = state->runner->validate_execution_stream(*state->prepared_execution);
+    if (rc != 0) {
+        state->prepared_execution->caller_stream = previous_caller;
+        return rc;
+    }
     return predecessor == nullptr ? launch_prepared_run(state, nullptr) :
                                     simpler_launch_run_joined(ctx, runtime, predecessor);
 }
@@ -2203,6 +2259,10 @@ static void emit_joined_launch_span(const DeviceRunnerBase::JoinedLaunchRecord &
  */
 static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJoin *join) {
     state->launch_not_started_proven = true;
+    if (state->runner->kernel_capture_owner() != nullptr && state->runner->kernel_capture_owner() != state)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (state->graph_reference_count.load(std::memory_order_acquire) != 0 && join != nullptr)
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
     if (state->runner->execution_mode_latch().is_kernel() &&
         (state->prepared_execution == nullptr || state->prepared_execution->caller_stream == nullptr)) {
         return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -2211,7 +2271,8 @@ static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJo
     if (!state->runner->accepts_new_run() || !state->runner_reserved) return PTO_RUNTIME_ERR_INTERNAL;
     if (state->prepared_execution == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     state->prepared_execution->join = join != nullptr ? *join : NativeRunJoin{};
-    if (!state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit, join)) {
+    if (!state->runner_claimed &&
+        !state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit, join)) {
         LOG_ERROR("launch_prepared_run: execution claim is occupied (%s)", state->trace_attrs);
         return PTO_RUNTIME_ERR_INTERNAL;
     }
@@ -2240,17 +2301,18 @@ static int launch_prepared_run(OnboardNativeRunContext *state, const NativeRunJo
         rc = state->runner->enter_run_thread();
         if (rc == 0) {
             state->launch_not_started_proven = false;
-            DeviceRunnerBase::LaunchOutcome launch =
-                state->runner->launch_execution(std::move(state->prepared_execution), std::move(state->launch_permit));
+            DeviceRunnerBase::LaunchOutcome launch = state->runner->launch_execution(
+                std::move(state->prepared_execution), std::move(state->launch_permit),
+                std::move(state->pending_active_execution)
+            );
             state->launch_not_started_proven = launch.progress == LaunchProgress::NotStarted;
             rc = launch.rc;
             progress = launch.progress;
-            // Where the fact becomes true, and from the transaction's own
-            // report of how far it got rather than from a pointer that a later
-            // unwind could clear: any progress past NotStarted means this run
-            // owns device work. Recorded before the receipt check below, so a
-            // failure there cannot lose it.
-            if (launch.progress != LaunchProgress::NotStarted) {
+            // Partial eager submission may have reached the device even on an
+            // error. Recording retains future references; only a device epoch
+            // observed after replay establishes its execution fact.
+            const bool recorded = launch.active != nullptr && launch.active->prepared->recorded_submission;
+            if (launch.progress != LaunchProgress::NotStarted && !recorded) {
                 note_workspace_fact(state, WorkspaceManager::RunFact::Launched);
             }
             state->prepared_execution = std::move(launch.prepared);
@@ -2314,8 +2376,13 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_poll_run");
     if (state == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
+    const bool replay_resources_live = state->graph_reference_count.load(std::memory_order_acquire) != 0 &&
+                                       !state->retained_device_use.can_finalize(state->identity());
     if (phase == NativeRunPhase::Prepared) return SIMPLER_NATIVE_RUN_POLL_ERROR;
-    if (phase == NativeRunPhase::Complete) return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    if (state->active_execution != nullptr && state->active_execution->prepared->recorded_submission &&
+        !replay_resources_live && state->observed_replay_sequence == 0)
+        return SIMPLER_NATIVE_RUN_POLL_ERROR;
+    if (phase == NativeRunPhase::Complete && !replay_resources_live) return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
     int attach_rc = state->runner->enter_run_thread();
     if (attach_rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
     if (state->active_execution == nullptr) return SIMPLER_NATIVE_RUN_POLL_ERROR;
@@ -2327,7 +2394,12 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
     if (phase == NativeRunPhase::Prepared) return PTO_RUNTIME_ERR_INTERNAL;
-    if (phase == NativeRunPhase::Complete) return state->completion_rc;
+    const bool replay_resources_live = state->graph_reference_count.load(std::memory_order_acquire) != 0 &&
+                                       !state->retained_device_use.can_finalize(state->identity());
+    if (!replay_resources_live && state->active_execution != nullptr &&
+        state->active_execution->prepared->recorded_submission && state->observed_replay_sequence == 0)
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (phase == NativeRunPhase::Complete && !replay_resources_live) return state->completion_rc;
     // Drain reads device memory and retires per-run references under the
     // owning context. Program attaches it; borrowed execution only validates
     // the caller's current binding.
@@ -2351,13 +2423,22 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         quarantine_undrained_run(*state->runner, drain.device_rc);
         LOG_ERROR("simpler_wait_run: drain threw (%s)", state->trace_attrs);
     }
-    if (state->completion_rc == 0) state->completion_rc = drain.combined();
     // The device half alone proves this run's device work finished. A
     // diagnostics failure still fails the run above, but it is not evidence
     // about the device, and recording it as one would leave every workspace
     // block this run referenced permanently quarantined at context teardown.
     // The phase below is set on every path and proves nothing.
     if (drain.device_rc == 0) note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
+    int runtime_rc = 0;
+    if (!replay_resources_live && state->kernel_execution != nullptr && drain.device_rc == 0) {
+        try {
+            runtime_rc = read_kernel_run_status(*state);
+        } catch (...) {
+            runtime_rc = PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
+    if (replay_resources_live || state->completion_rc == 0)
+        state->completion_rc = runtime_rc != 0 ? runtime_rc : drain.combined();
     state->phase.store(NativeRunPhase::Complete, std::memory_order_release);
     emit_native_run_runner_wall(state);
     return state->completion_rc;
@@ -2466,12 +2547,28 @@ int simpler_probe_run_retention(
     return rc;
 }
 
-int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
-    OnboardNativeRunContext *state = native_run_context(ctx, runtime, "simpler_finalize_run");
-    if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+struct NativeRunFinalizeResult {
+    int result_rc;
+    int cleanup_rc;
+};
+
+static NativeRunFinalizeResult
+finalize_native_run(DeviceContextHandle ctx, RuntimeHandle runtime, OnboardNativeRunContext *state) {
+    void *storage = native_run_public_storage(state);
     // A refused environment leaves the run owned for a retry on its context.
     const int context_rc = state->runner->validate_current_context();
-    if (context_rc != 0) return context_rc;
+    if (context_rc != 0) return {context_rc, context_rc};
+    if (state->kernel_execution != nullptr) {
+        auto *prepared = state->active_execution != nullptr ? state->active_execution->prepared.get() : nullptr;
+        if (prepared != nullptr && !prepared->recorded_submission &&
+            state->phase.load(std::memory_order_acquire) == NativeRunPhase::Running) {
+            (void)simpler_wait_run(ctx, runtime);
+        }
+        const int release_rc = release_kernel_run(*state);
+        if (release_rc != 0) return {release_rc, release_rc};
+    }
+    if (!state->retained_device_use.can_finalize(state->identity()))
+        return {PTO_RUNTIME_ERR_INVALID_STATE, PTO_RUNTIME_ERR_INVALID_STATE};
     NativeRunPhase phase = state->phase.load(std::memory_order_acquire);
     const uint64_t trace_inv = state->trace_inv;
     const uint64_t trace_hid = state->trace_hid;
@@ -2492,14 +2589,24 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     // Every active owner owes a drain; an error or absent receipt does not
     // establish that the device saw no submission.
     const bool launched = state->active_execution != nullptr;
+    const bool executed =
+        launched && (!state->retained_device_use.retained() || state->retained_device_use.observed_execution());
     // An ownership fact, not a code. A live ActiveExecution proves this run
     // reached the device, so reporting a launch from it is sound; the converse
     // is not, which is why the launch transaction reports its own progress
     // where it happens. The ledger keeps that earlier report, so the branch
     // below can only ever add "never submitted" to a run no launch claimed.
-    note_workspace_fact(
-        state, launched ? WorkspaceManager::RunFact::Launched : WorkspaceManager::RunFact::NoDeviceSubmission
-    );
+    if (state->retained_device_use.retained()) {
+        note_workspace_fact(state, WorkspaceManager::RunFact::DeviceReferencesRetained);
+        if (state->retained_device_use.observed_execution())
+            note_workspace_fact(state, WorkspaceManager::RunFact::Launched);
+        note_workspace_fact(state, WorkspaceManager::RunFact::DrainAttempted);
+        note_workspace_fact(state, WorkspaceManager::RunFact::DrainProvedComplete);
+    } else {
+        note_workspace_fact(
+            state, launched ? WorkspaceManager::RunFact::Launched : WorkspaceManager::RunFact::NoDeviceSubmission
+        );
+    }
     // Drain and copy-back need the correct current device. Program owns that
     // binding; a borrowed context only verifies the caller's binding.
     int attach_rc = PTO_RUNTIME_ERR_INTERNAL;
@@ -2536,6 +2643,7 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     emit_native_run_runner_wall(state);
 
     int validation_rc = PTO_RUNTIME_ERR_INTERNAL;
+    int bindings_release_rc = PTO_RUNTIME_ERR_INTERNAL;
     try {
         if (attach_rc == 0) {
             // Immediately before the consumer, and after whichever drain
@@ -2546,10 +2654,11 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             // already taken it to decide the run, so this call reuses those
             // bytes; it still owns the read for a run whose drain never
             // reached that point.
-            if (launched) {
-                (void)state->runner->read_device_run_result(
-                    state->descriptor.pipeline_slot, state->descriptor.run_epoch
-                );
+            if (executed) {
+                if (state->capture_result == nullptr)
+                    (void)state->runner->read_device_run_result(
+                        state->descriptor.pipeline_slot, state->descriptor.run_epoch
+                    );
                 report_terminal_disagreement(state, execution_rc);
                 // A separate axis from this run's outcome: a notification names a
                 // device and a stream, carries no run identity, and can arrive
@@ -2570,8 +2679,8 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             {
                 STRACE("chip.run.validate");
                 validation_rc = copy_back_run_outputs_impl(
-                    &state->runtime, &state->host_api, launched ? execution_rc : PTO_RUNTIME_ERR_INTERNAL,
-                    launched ? 1 : 0
+                    &state->runtime, &state->host_api, executed ? execution_rc : PTO_RUNTIME_ERR_INTERNAL,
+                    executed ? 1 : 0
                 );
                 // This run is the only user of its bindings, so they end here,
                 // after its outputs have come back through them.
@@ -2580,11 +2689,11 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
                 // the bindings are only proven released when their own code is
                 // zero, because a failed release may leave a borrower behind.
                 note_workspace_fact(state, WorkspaceManager::RunFact::CopybackReturned);
-                const int release_rc = release_run_bindings_impl(&state->runtime, &state->host_api);
-                if (release_rc == 0) note_workspace_fact(state, WorkspaceManager::RunFact::BindingsReleased);
-                if (validation_rc == 0) validation_rc = release_rc;
+                bindings_release_rc = release_run_bindings_impl(&state->runtime, &state->host_api);
+                if (bindings_release_rc == 0) note_workspace_fact(state, WorkspaceManager::RunFact::BindingsReleased);
+                if (validation_rc == 0) validation_rc = bindings_release_rc;
             }
-            if (launched && execution_rc == 0) {
+            if (executed && execution_rc == 0) {
                 emit_device_phase_markers(state->runner, state->descriptor.pipeline_slot);
                 // Placed here and only here: this run's completion is established, which is what
                 // each retrieval's own host-blocking completion step is called after.
@@ -2612,17 +2721,25 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
             resources_rc = PTO_RUNTIME_ERR_INTERNAL;
         }
     }
+    if (state->heap_owned && state->active_execution != nullptr && state->active_execution->prepared != nullptr) {
+        try {
+            state->runner->abandon_prepared_execution(*state->active_execution->prepared);
+        } catch (...) {
+            resources_rc = PTO_RUNTIME_ERR_INTERNAL;
+        }
+    }
     if (state->runner_resources_owned) {
         try {
             int abandon_rc = state->runner->abandon_native_run_resources(state->descriptor.pipeline_slot);
             if (resources_rc == 0) resources_rc = abandon_rc;
+            if (abandon_rc == 0) state->runner_resources_owned = false;
         } catch (...) {
             resources_rc = PTO_RUNTIME_ERR_INTERNAL;
         }
-        state->runner_resources_owned = false;
+        if (!state->heap_owned) state->runner_resources_owned = false;
     }
 
-    const bool export_clock_log = launched && execution_rc == 0 && validation_rc == 0 &&
+    const bool export_clock_log = executed && execution_rc == 0 && validation_rc == 0 &&
                                   state->runner->host_clock_alignment_log_required(state->descriptor.pipeline_slot);
     // Opportunistic, and only where attachment is proven: `attach_rc` is this
     // call's own result, and every device step above is guarded by it. This
@@ -2637,6 +2754,15 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
     int reclaim_rc = 0;
     if (attach_rc == 0) {
         reclaim_rc = state->runner->reclaim_workspace_obsolete();
+    }
+
+    const int cleanup_rc = bindings_release_rc != 0 ? bindings_release_rc :
+                           resources_rc != 0        ? resources_rc :
+                                                      reclaim_rc;
+    // Result inspection also returns the runtime's failure code. Only an
+    // unreleased binding/resource keeps this carrier alive for cleanup retry.
+    if (state->heap_owned && cleanup_rc != 0) {
+        return {validation_rc != 0 ? validation_rc : cleanup_rc, cleanup_rc};
     }
 
     // Before the slot becomes reusable, not after: releasing the claim is "the
@@ -2660,19 +2786,135 @@ int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
         state->runner->release_native_run_reservation(state);
         state->runner_reserved = false;
     }
-    destroy_native_run_context(state);
+    state->physical_cleanup_complete = true;
+    destroy_onboard_native_run_context(state);
     emit_native_run_host_wall(trace_inv, trace_hid, trace_start_ns, trace_attrs);
     if (export_clock_log && !export_host_clock_alignment_log(output_prefix, trace_inv, clock_log_offset)) {
-        return PTO_RUNTIME_ERR_INTERNAL;
+        return {PTO_RUNTIME_ERR_INTERNAL, cleanup_rc};
     }
-    if (validation_rc != 0) return validation_rc;
-    if (resources_rc != 0) return resources_rc;
-    if (launched && execution_rc != 0) return execution_rc;
+    if (validation_rc != 0) return {validation_rc, cleanup_rc};
+    if (resources_rc != 0) return {resources_rc, cleanup_rc};
+    if (launched && execution_rc != 0) return {execution_rc, cleanup_rc};
     // Last: a standalone workspace-reclamation failure is still a failure, and
     // with nothing above it to report this is where the caller learns of it.
-    if (reclaim_rc != 0) return reclaim_rc;
-    if (no_submission && !launched) publish_released_preparation(state, run_epoch);
-    return launched ? execution_rc : 0;
+    if (reclaim_rc != 0) return {reclaim_rc, cleanup_rc};
+    if (no_submission && !launched && storage != nullptr) publish_released_preparation(storage, run_epoch);
+    return {launched ? execution_rc : 0, cleanup_rc};
+}
+
+int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime) {
+    auto *state = native_run_context(ctx, runtime, "simpler_finalize_run");
+    if (state == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
+    if (state->heap_owned) {
+        auto *handle = static_cast<OnboardNativeRunHandle *>(runtime);
+        if (handle->role != NativeRunHandleRole::Run) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+        const int context_rc = state->runner->validate_current_context();
+        if (context_rc != 0) return context_rc;
+        if (state->graph_reference_count.load(std::memory_order_acquire) != 0) {
+            auto *prepared = state->active_execution != nullptr ? state->active_execution->prepared.get() : nullptr;
+            if (prepared != nullptr && !prepared->recorded_submission &&
+                state->phase.load(std::memory_order_acquire) == NativeRunPhase::Running) {
+                const int wait_rc = simpler_wait_run(ctx, runtime);
+                if (wait_rc != 0) return wait_rc;
+            }
+            const int result = state->completion_rc == -1 ? 0 : state->completion_rc;
+            if (state->runner_claimed) {
+                state->runner->release_native_run(state);
+                state->runner_claimed = false;
+            }
+            state->descriptor.accepted_state = nullptr;
+            destroy_onboard_native_run_context(state);
+            return result;
+        }
+    }
+    return finalize_native_run(ctx, runtime, state).result_rc;
+}
+
+extern "C" int simpler_retain_run_resources(
+    DeviceContextHandle ctx, RuntimeHandle runtime, void *caller_stream, RuntimeHandle *out_reference
+) {
+    if (out_reference == nullptr || caller_stream == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    *out_reference = nullptr;
+    auto *state = native_run_context(ctx, runtime, "simpler_retain_run_resources");
+    if (state == nullptr || !state->heap_owned) return PTO_RUNTIME_ERR_UNSUPPORTED;
+    auto *handle = static_cast<OnboardNativeRunHandle *>(runtime);
+    if (handle->role != NativeRunHandleRole::Run || state->prepared_execution == nullptr ||
+        state->phase.load(std::memory_order_acquire) != NativeRunPhase::Prepared ||
+        state->graph_reference_count.load(std::memory_order_acquire) != 0 ||
+        state->runner->kernel_capture_owner() != nullptr || state->runner->native_run_active())
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    if (state->descriptor.pipeline_slot != 0 || state->config.diagnostics_any() ||
+        simpler_kernel_capture_supported(ctx) == 0)
+        return PTO_RUNTIME_ERR_UNSUPPORTED;
+    const int caller_rc = state->runner->validate_caller_stream(caller_stream);
+    if (caller_rc != 0) return caller_rc;
+    try {
+        auto reference = std::make_unique<OnboardNativeRunHandle>(handle->state, NativeRunHandleRole::GraphReference);
+        auto result = std::make_unique<KernelCaptureResult>();
+        if (!state->runner_claimed) {
+            if (!state->runner->try_acquire_native_run(state, state->identity(), &state->launch_permit, nullptr))
+                return PTO_RUNTIME_ERR_INVALID_STATE;
+            state->runner_claimed = true;
+        }
+        state->prepared_execution->caller_stream = caller_stream;
+        int rc = prewarm_kernel_run(*state, *state->prepared_execution, true);
+        if (rc == 0) rc = quiesce_kernel_run(*state);
+        if (rc != 0) return rc;
+        state->capture_result = std::move(result);
+        state->host_api.bind_run_result(nullptr, 0);
+        state->retained_device_use.retain(state->identity());
+        note_workspace_fact(state, WorkspaceManager::RunFact::DeviceReferencesRetained);
+        state->graph_reference_count.store(1, std::memory_order_release);
+        state->runner->set_kernel_capture_owner(state);
+        *out_reference = reference.release();
+        return 0;
+    } catch (...) {
+        LOG_ERROR("simpler_retain_run_resources: retaining execution resources threw (%s)", state->trace_attrs);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+}
+
+extern "C" int simpler_release_run_resources(DeviceContextHandle ctx, RuntimeHandle reference) {
+    if (reference == nullptr) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    uint64_t magic = 0;
+    std::memcpy(&magic, reference, sizeof(magic));
+    if (magic != OnboardNativeRunHandle::kMagic) return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    auto *handle = static_cast<OnboardNativeRunHandle *>(reference);
+    auto *state = native_run_context(ctx, reference, "simpler_release_run_resources");
+    if (state == nullptr || handle->role != NativeRunHandleRole::GraphReference ||
+        state->graph_reference_count.load(std::memory_order_acquire) != 1)
+        return PTO_RUNTIME_ERR_INVALID_ARGUMENT;
+    try {
+        const int quiesce_rc = quiesce_kernel_run(*state);
+        if (quiesce_rc != 0) return quiesce_rc;
+        if (state->public_handle_storage != nullptr) {
+            const int release_rc = release_kernel_run(*state);
+            if (release_rc != 0) return release_rc;
+            state->graph_reference_count.store(0, std::memory_order_release);
+            if (state->runner->kernel_capture_owner() == state) state->runner->set_kernel_capture_owner(nullptr);
+            delete handle;
+            return 0;
+        }
+        const int release_rc = release_kernel_run(*state);
+        if (release_rc != 0) return release_rc;
+        state->graph_reference_count.store(0, std::memory_order_release);
+        const NativeRunFinalizeResult finalized = finalize_native_run(ctx, reference, state);
+        if (!state->physical_cleanup_complete) {
+            state->graph_reference_count.store(1, std::memory_order_release);
+            state->runner->set_kernel_capture_owner(state);
+            return finalized.cleanup_rc;
+        }
+        if (state->runner->kernel_capture_owner() == state) state->runner->set_kernel_capture_owner(nullptr);
+        delete handle;
+        return 0;
+    } catch (...) {
+        if (!state->physical_cleanup_complete) {
+            state->graph_reference_count.store(1, std::memory_order_release);
+            state->runner->set_kernel_capture_owner(state);
+        }
+        LOG_ERROR("simpler_release_run_resources: resource cleanup threw (%s)", state->trace_attrs);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
 }
 
 int simpler_run(
@@ -2710,12 +2952,14 @@ int simpler_unregister_callable(DeviceContextHandle ctx, int32_t callable_id) {
     try {
         DeviceRunnerBase *runner = static_cast<DeviceRunnerBase *>(ctx);
         std::lock_guard<std::mutex> lock(runner->callable_registration_mutex());
-        if (runner->native_runs_outstanding()) {
+        if (runner->native_runs_outstanding() && runner->kernel_capture_owner() == nullptr) {
             LOG_ERROR(
                 "simpler_unregister_callable: native run must be finalized before mutating the callable registry"
             );
             return PTO_RUNTIME_ERR_INTERNAL;
         }
+        const int capture_rc = quiesce_kernel_capture_for_callable_change(runner, callable_id, true);
+        if (capture_rc != 0) return capture_rc;
         return runner->unregister_callable(callable_id);
     } catch (...) {
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -3038,6 +3282,7 @@ int simpler_kernel_mode_init(
             runner->set_dispatcher_binary(std::move(dispatcher_vec));
         }
         rc = runner->init_kernel_context(device_id);
+        if (rc == 0) runner->set_kernel_context_generation(context_generation);
     } catch (...) {
         rc = PTO_RUNTIME_ERR_INTERNAL;
     }

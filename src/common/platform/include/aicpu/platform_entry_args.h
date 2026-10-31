@@ -69,6 +69,8 @@ struct PlatformEntryArgs {
     uint32_t graph_offset{0};
     uint32_t graph_bytes{0};
     uint32_t graph_source{static_cast<uint32_t>(GraphSectionSource::None)};
+    // Rejected invocations still handshake and retire without user dispatch.
+    bool invocation_rejected{false};
 };
 
 /**

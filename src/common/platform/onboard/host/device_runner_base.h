@@ -65,6 +65,7 @@
 #include "utils/retained_scheduler_storage.h"
 #include "aicore_pmu_lease.h"
 #include "device_phase_capture.h"
+#include "host/kernel_capture_owner.h"
 #include "device_runner_helpers.h"
 #include "aicpu_loader/host/load_aicpu_op.h"
 #include "host/arena_replacement_transaction.h"
@@ -330,6 +331,14 @@ public:
         return initialization_error_.empty() ? nullptr : initialization_error_.c_str();
     }
     void clear_initialization_error() { initialization_error_.clear(); }
+
+    void *kernel_capture_owner() const { return kernel_capture_owner_; }
+    void set_kernel_capture_owner(void *owner) { kernel_capture_owner_ = owner; }
+    uint64_t kernel_context_generation() const { return kernel_context_generation_; }
+    void set_kernel_context_generation(uint64_t generation) { kernel_context_generation_ = generation; }
+    int pin_kernel_capture_callable(int32_t callable_id, uint64_t *hash);
+    int release_kernel_capture_control(void *control) { return mem_alloc_.free(control); }
+    int synchronize_kernel_capture_stream(rtStream_t stream);
 
     /** Context-lifetime streams and events, live only in kernel mode. */
     KernelExecutionState &kernel_execution_state() { return kernel_exec_state_; }
@@ -770,6 +779,11 @@ public:
      */
     void note_workspace_run_fact(uint32_t pipeline_slot, std::uint64_t run_epoch, WorkspaceManager::RunFact fact) {
         workspace_.note_run_fact(pipeline_slot, run_epoch, fact);
+    }
+
+    bool native_run_drain_proved(const NativeRunIdentity &identity) const {
+        WorkspaceManager::RunRecord record;
+        return workspace_.describe_run(identity.pipeline_slot, identity.run_epoch, &record) && record.drain_proved;
     }
 
     /**
@@ -1264,6 +1278,7 @@ public:
      * process-wide, and this runner speaks for its own streams.
      */
     uint64_t consume_device_fault_notices() noexcept;
+    void note_run_stream_identity(rtStream_t stream);
 
     /** Evidence this device's fault channel has produced in the live generation. */
     const DeviceHealthState &device_health() const { return device_health_; }
@@ -1560,6 +1575,10 @@ public:
         PreparedExecution(const PreparedExecution &) = delete;
         PreparedExecution &operator=(const PreparedExecution &) = delete;
         PreparedExecution(PreparedExecution &&other) noexcept :
+            native_context(std::exchange(other.native_context, nullptr)),
+            kernel_resources(std::exchange(other.kernel_resources, nullptr)),
+            submission_prepared(other.submission_prepared),
+            recorded_submission(other.recorded_submission),
             identity(other.identity),
             runtime(std::exchange(other.runtime, nullptr)),
             config(other.config),
@@ -1578,6 +1597,10 @@ public:
             join(other.join) {}
         PreparedExecution &operator=(PreparedExecution &&) = delete;
 
+        void *native_context{nullptr};
+        KernelCaptureOwner *kernel_resources{nullptr};
+        bool submission_prepared{false};
+        bool recorded_submission{false};
         NativeRunIdentity identity{};
         Runtime *runtime{nullptr};
         CallConfig config{};
@@ -1797,7 +1820,24 @@ public:
      * exception returns Partial with that same prepared state still owned; only
      * an explicit NotStarted result returns it for rollback.
      */
-    LaunchOutcome launch_execution(std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit) noexcept;
+    LaunchOutcome launch_execution(
+        std::unique_ptr<PreparedExecution> prepared, LaunchPermit permit,
+        std::unique_ptr<ActiveExecution> preallocated = nullptr
+    ) noexcept;
+    virtual int prepare_submission(PreparedExecution &prepared) {
+        (void)prepared;
+        return 0;
+    }
+    int validate_execution_stream(PreparedExecution &prepared);
+    int poll_kernel_streams(const PreparedExecution &prepared);
+    int discharge_kernel_quiescence(const PreparedExecution &prepared);
+    int queue_own_boundary_wait(PreparedExecution &prepared, rtStream_t aicpu_stream, void *core_done);
+    int queue_cross_run_wait(PreparedExecution &prepared, rtStream_t waiter_stream, LaunchProgressSink &sink);
+    int enqueue_execution_core(PreparedExecution &prepared, LaunchProgressSink &sink);
+    int enqueue_execution_cpu(PreparedExecution &prepared, LaunchProgressSink &sink);
+    virtual int submit_execution_admission_payload(PreparedExecution &prepared);
+    virtual int submit_execution_core_payload(PreparedExecution &prepared);
+    virtual int submit_execution_cpu_payload(PreparedExecution &prepared);
     virtual void abandon_prepared_execution(PreparedExecution &prepared) noexcept = 0;
 
     /**
@@ -1932,6 +1972,7 @@ public:
      * the call must follow collector arming.
      */
     int launch_aicore_kernel(rtStream_t stream, const KernelArgs &k_args);
+    int ensure_aicore_binary_registered();
 
     /**
      * Walk the SDMA control path once per channel, so the first TPREFETCH_ASYNC
@@ -2951,6 +2992,8 @@ protected:
     bool program_initialized_{false};
     bool common_cleanup_pending_{false};
     KernelExecutionState kernel_exec_state_;
+    void *kernel_capture_owner_{nullptr};
+    uint64_t kernel_context_generation_{0};
     PersistentKernelArgs persistent_args_;
     Runtime kernel_runtime_;
     int block_dim_{0};

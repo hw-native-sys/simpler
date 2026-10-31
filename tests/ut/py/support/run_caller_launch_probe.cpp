@@ -257,7 +257,8 @@ static void check(int fault, bool capturing) {
     auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(id));
     assert(syncs == 0);
     if (capturing) {
-        assert(outcome.rc == PTO_RUNTIME_ERR_UNSUPPORTED);
+        // ACTIVE recording without a cold-retained execution reference is an invalid submission state.
+        assert(outcome.rc == PTO_RUNTIME_ERR_INVALID_STATE);
         assert(outcome.progress == LaunchProgress::NotStarted);
         assert(trace.empty() && copies == prior_copies);
     } else if (fault != 0) {

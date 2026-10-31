@@ -12,10 +12,12 @@
 #include <cstdint>
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <dlfcn.h>
 #include <unistd.h>
 
 #include "common/host_log_state.h"
+#include "task_interface/kernel_capture.h"
 
 namespace {
 int failure_kind = 0;
@@ -61,6 +63,10 @@ int func_lookup_failures_left = 0;
 // `aclrtResetDeviceForce` belongs to the fatal branch and stays uninjectable.
 int reset_failures_left = 0;
 int reset_calls = 0;
+bool capture_reuse = false;
+void *capture_control = nullptr;
+bool capture_control_idle = false;
+uint64_t capture_generation = 0;
 
 int forbidden(size_t index) {
     ++forbidden_calls[index];
@@ -133,13 +139,37 @@ extern "C" int aclrtGetDevice(int *device) {
 }
 extern "C" void arm_copy_failure() { fail_next_copy = true; }
 extern "C" int copy_call_count() { return copies; }
+extern "C" void arm_capture_control_reuse() { capture_reuse = true; }
+extern "C" uint64_t capture_control_address() { return reinterpret_cast<uint64_t>(capture_control); }
+extern "C" uint64_t capture_control_generation() { return capture_generation; }
+extern "C" int release_capture_control_reuse() {
+    if (capture_control != nullptr && !capture_control_idle) return -1;
+    auto free = reinterpret_cast<int (*)(void *)>(dlsym(RTLD_NEXT, "rtFree"));
+    const int rc = capture_control == nullptr ? 0 : free(capture_control);
+    if (rc == 0) {
+        capture_control = nullptr;
+        capture_control_idle = capture_reuse = false;
+    }
+    return rc;
+}
 extern "C" int rtMemcpy(void *dst, uint64_t dst_bytes, const void *src, uint64_t src_bytes, int kind) {
     ++copies;
     if (fail_next_copy) {
         fail_next_copy = false;
         return -4321;
     }
-    return real_memcpy != nullptr ? real_memcpy(dst, dst_bytes, src, src_bytes, kind) : -4323;
+    const int rc = real_memcpy != nullptr ? real_memcpy(dst, dst_bytes, src, src_bytes, kind) : -4323;
+    if (rc == 0 && capture_reuse && kind == 1 && src_bytes == sizeof(simpler::tmr::KernelCaptureControl)) {
+        simpler::tmr::KernelCaptureControl initial{};
+        std::memcpy(&initial, src, sizeof(initial));
+        if (initial.capture_generation != 0 && initial.context_generation != 0 && initial.runtime_address != 0 &&
+            initial.binding_epoch != 0 && initial.replay_epoch == 0 && initial.completed_epoch == 0 &&
+            initial.decision == static_cast<uint32_t>(simpler::tmr::CaptureDecision::Idle)) {
+            capture_control = dst;
+            capture_generation = initial.capture_generation;
+        }
+    }
+    return rc;
 }
 extern "C" int arm_descriptor_copy_failure() {
     watched_source = latest_pinned;
@@ -272,6 +302,11 @@ extern "C" int watched_alloc_found() { return watched_alloc_ptr != nullptr ? 1 :
 // uint16_t, rtBinHandle and rtFuncHandle are void *), so interposing forwards
 // the caller's arguments unchanged.
 extern "C" int rtMalloc(void **ptr, uint64_t size, uint32_t type, uint16_t module_id) {
+    if (capture_reuse && capture_control_idle && size == sizeof(simpler::tmr::KernelCaptureControl)) {
+        *ptr = capture_control;
+        capture_control_idle = false;
+        return 0;
+    }
     auto real = reinterpret_cast<int (*)(void **, uint64_t, uint32_t, uint16_t)>(dlsym(RTLD_NEXT, "rtMalloc"));
     int rc = real(ptr, size, type, module_id);
     if (rc == 0 && watch_next_alloc) {
@@ -282,6 +317,12 @@ extern "C" int rtMalloc(void **ptr, uint64_t size, uint32_t type, uint16_t modul
 }
 
 extern "C" int rtFree(void *ptr) {
+    // Only a completed lease's control backing is retained. The next lease
+    // receives the same real device allocation, without changing its contents.
+    if (capture_reuse && capture_control != nullptr && ptr == capture_control) {
+        capture_control_idle = true;
+        return 0;
+    }
     if (watched_alloc_ptr != nullptr && ptr == watched_alloc_ptr) {
         watched_alloc_ptr = nullptr;
         ++watched_free_hits;

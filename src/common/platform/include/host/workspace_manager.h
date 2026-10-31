@@ -189,6 +189,8 @@ public:
         BindingsReleased = 5,
         /** The run context is gone: no further fact about it can arrive. */
         ContextDestroyed = 6,
+        /** Device work or a graph may still reference this run's resources. */
+        DeviceReferencesRetained = 7,
     };
 
     /**
@@ -217,6 +219,7 @@ public:
         bool drain_attempted{false};
         bool drain_proved{false};
         bool no_submission{false};
+        bool device_references_retained{false};
         bool copyback_returned{false};
         bool bindings_released{false};
         bool context_destroyed{false};
@@ -476,6 +479,14 @@ public:
         return references_run(run_epoch);
     }
 
+    /** Snapshot retirement evidence without changing any resource ownership. */
+    bool describe_run(uint32_t slot, uint64_t epoch, RunRecord *out) const {
+        std::scoped_lock lk(mu_);
+        if (out == nullptr || slot >= runs_.size() || runs_[slot].epoch != epoch) return false;
+        *out = runs_[slot];
+        return true;
+    }
+
     /**
      * Run epochs whose retirement can return managed storage to this allocator.
      *
@@ -610,13 +621,17 @@ public:
             // Ignored once a launch has claimed this run: a partial unwind can
             // leave the caller's pointer null, and that is not the same fact as
             // never having reached the device.
-            if (!r.launched) r.no_submission = true;
+            if (!r.launched && !r.device_references_retained) r.no_submission = true;
             break;
         case RunFact::CopybackReturned:
             r.copyback_returned = true;
             break;
         case RunFact::BindingsReleased:
             r.bindings_released = true;
+            break;
+        case RunFact::DeviceReferencesRetained:
+            r.device_references_retained = true;
+            r.no_submission = false;
             break;
         case RunFact::ContextDestroyed:
             r.context_destroyed = true;
