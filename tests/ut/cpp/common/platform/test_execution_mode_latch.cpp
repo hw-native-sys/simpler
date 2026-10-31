@@ -47,6 +47,7 @@ TEST(ExecutionModeLatch, ModesAreMutuallyExclusiveInBothDirections) {
 
     ExecutionModeLatch kernel;
     EXPECT_EQ(kernel.latch(SIMPLER_MODE_KERNEL), 0);
+    EXPECT_EQ(kernel.latch(SIMPLER_MODE_KERNEL), 0);
     EXPECT_EQ(kernel.latch(SIMPLER_MODE_PROGRAM), PTO_RUNTIME_ERR_INVALID_STATE);
     EXPECT_TRUE(kernel.is_kernel());
 }

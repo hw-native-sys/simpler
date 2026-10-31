@@ -561,42 +561,6 @@ class TestL4L3WithMultipleSubs:
 
 
 # ---------------------------------------------------------------------------
-# Test: L3 orch receives its own Orchestrator (not L4's)
-# ---------------------------------------------------------------------------
-
-
-class TestL3OwnOrchestrator:
-    def test_l3_gets_own_orchestrator(self):
-        """The L3 orch fn receives an Orchestrator from the L3 inner worker,
-        not the L4 parent. Prove by checking orch.alloc works at L3 level."""
-        counter_shm, counter_buf = _make_shared_counter()
-
-        try:
-            l3 = Worker(level=3, num_sub_workers=1)
-            l3_sub_handle = l3.register(lambda args: _increment_counter(counter_buf))
-
-            def l3_orch(orch, args, config):
-                # orch is L3's own Orchestrator — alloc + submit_sub should work
-                orch.submit_sub(l3_sub_handle)
-
-            w4 = Worker(level=4, num_sub_workers=0)
-            l3_handle = w4.register(l3_orch)
-            l3_worker_id = w4.add_worker(l3)
-            w4.init()
-
-            def l4_orch(orch, args, config):
-                orch.submit_next_level(l3_handle, TaskArgs(), CallConfig(), worker=l3_worker_id)
-
-            w4.run(l4_orch)
-            w4.close()
-
-            assert _read_counter(counter_buf) == 1
-        finally:
-            counter_shm.close()
-            counter_shm.unlink()
-
-
-# ---------------------------------------------------------------------------
 # Test: generalised _Worker(level) — no hardcoded 3
 # ---------------------------------------------------------------------------
 

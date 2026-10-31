@@ -385,6 +385,31 @@ TEST(ProfilerBaseTest, SingleDrainThreadScansEveryLiveQueue) {
     EXPECT_EQ(collector.last_shard(), 0);  // folded onto the only shard
 }
 
+// a5 keeps the device header and host shadow at different addresses. A
+// successful index refresh must update only the shadow, never the producer's
+// queue tail. Publish before starting the drain to keep this control deterministic.
+TEST(ProfilerBaseTest, MirroredHeaderRefreshPreservesPublishedTail) {
+    TestHeader device_header{};
+    TestHeader host_header{};
+    uint64_t device_buffer = 0x1234;
+    uint64_t host_buffer = 0;
+
+    TestCollector<SingleShardModule> collector;
+    collector.init_shadow(&device_header, &host_header);
+    collector.manager().register_mapping(&device_buffer, &host_buffer);
+    publish(device_header, 0, &device_buffer);
+    collector.start(nullptr);
+    collector.quiesce();
+
+    EXPECT_EQ(device_header.queue_tails[0], 1u);
+    EXPECT_EQ(host_header.queue_tails[0], 1u);
+    EXPECT_EQ(device_header.queue_heads[0], 1u);
+    EXPECT_EQ(host_header.queue_heads[0], 1u);
+    EXPECT_EQ(host_buffer, device_buffer);
+    EXPECT_EQ(collector.collected(), 1);
+    collector.stop();
+}
+
 // Every live queue's buffers reach a collector when shards and queues are 1:1.
 TEST(ProfilerBaseTest, EveryLiveQueueIsDrained) {
     constexpr int kThreads = PLATFORM_MAX_AICPU_THREADS;
@@ -473,17 +498,17 @@ TEST(ProfilerBaseTest, LifecycleControlWakesEverySilentCollectorShard) {
 // bring the collector down via execution_complete_, NOT via the idle-timeout
 // hang detector. The guard that used to skip arming the timeout only applied
 // when shard_count > 1, so a single-shard subsystem (DepGen / ScopeStats) would
-// trip it. kIdleTimeoutSec is 2s here and stop() is called well after that, so
-// a regression shows up as a hang or an early-abandoned shard, not a flake.
+// trip it. This case waits past its one-second idle timeout before publishing
+// a late buffer, so a regression shows up as a hang or an early-abandoned shard.
 TEST(ProfilerBaseTest, SilentRunDoesNotTripIdleTimeout) {
     TestHeader header{};
     uint64_t buffer = 0;
-    TestCollector<SingleShardModule> collector;
+    TestCollector<SingleShardModule, 1> collector;
     collector.init(2, &header);
     register_buffer(collector, &buffer);
 
     collector.start(nullptr);
-    std::this_thread::sleep_for(std::chrono::seconds(3));  // > kIdleTimeoutSec
+    std::this_thread::sleep_for(std::chrono::seconds(2));  // > kIdleTimeoutSec
 
     // The collector must still be alive and able to take a late buffer.
     publish(header, 1, &buffer);
@@ -847,7 +872,9 @@ TEST(ProfilerBaseTest, FailedBufferCopyLeavesTheEntryUnacknowledged) {
             buffer_copy_attempts.fetch_add(1, std::memory_order_relaxed);
             if (copy_buffer_fails.load(std::memory_order_relaxed)) return -1;
         }
-        std::memcpy(dst, src, size);
+        // The fixture uses one header for both views (SVM-style). Successful
+        // same-address range reads must not copy stale bytes over publication.
+        if (dst != src) std::memcpy(dst, src, size);
         return 0;
     };
 
@@ -888,7 +915,9 @@ TEST(ProfilerBaseTest, PermanentlyFailingCopyIsRetiredSoQuiesceCompletes) {
     uint64_t buffer = 0;
     auto copy = [&](void *dst, const void *src, size_t size) {
         if (src == &buffer) return -1;
-        std::memcpy(dst, src, size);
+        // Preserve payload failure injection above; avoid copying a shared
+        // header back onto itself during successful queue-index refreshes.
+        if (dst != src) std::memcpy(dst, src, size);
         return 0;
     };
 

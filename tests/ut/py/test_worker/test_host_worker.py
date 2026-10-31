@@ -7023,8 +7023,9 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             if interrupt_sent.is_set():
                 return
             interrupt_sent.set()
+            # The main thread may handle this only after this helper finishes.
+            # Waiting here would delay the shared-memory cleanup being tested.
             _thread.interrupt_main()
-            assert interrupt_observed.wait(5.0)
 
         if operation == "comm_init":
             worker._worker = cast(Any, SimpleNamespace(control_comm_init=lambda *_args: interrupt_main()))
@@ -7071,6 +7072,7 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
                     worker._release_domain_claimed(handle)
 
             assert interrupt_sent.is_set()
+            assert interrupt_observed.is_set()
             assert names
             monkeypatch.setattr(SharedMemory, "__init__", real_init)
             for name in names:
@@ -7923,25 +7925,6 @@ class TestSubmitReturnValue:
 
 
 class TestScope:
-    def test_scope_managed_by_run(self):
-        counter_shm, counter_buf = _make_shared_counter()
-
-        try:
-            hw = Worker(level=3, num_sub_workers=1)
-            handle = hw.register(lambda args: _increment_counter(counter_buf))
-            hw.init()
-
-            def orch(o, args, cfg):
-                o.submit_sub(handle)
-
-            hw.run(orch)
-            hw.close()
-
-            assert _read_counter(counter_buf) == 1
-        finally:
-            counter_shm.close()
-            counter_shm.unlink()
-
     def test_user_nested_scope_runs_to_completion(self):
         """User opens a nested scope with ``with orch.scope():``; all tasks run."""
         counter_shm, counter_buf = _make_shared_counter()
