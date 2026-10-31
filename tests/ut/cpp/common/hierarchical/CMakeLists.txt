@@ -33,6 +33,7 @@ add_library(hierarchical_objs OBJECT
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
     ${WORKER_SRC_DIR}/chip_run_lane.cpp
     ${WORKER_SRC_DIR}/chip_worker.cpp
+    ${WORKER_SRC_DIR}/host_backing_owner.cpp
     ${WORKER_SRC_DIR}/runtime_module.cpp
     # ChipWorker binds the process's device-fault monitor into every host
     # runtime it loads, so the owner that defines it comes along. In production

@@ -442,7 +442,6 @@ def _recovery_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms,
 
 
 def _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatch, stall_ms, *, two_wave=False):
-    monkeypatch.setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", str(_TIMEOUT_MS))
     failure_kind = "nonreturning" if stall_ms < 0 else "bounded"
     output_root = _ROOT / "outputs"
     output_root.mkdir(exist_ok=True)
@@ -452,9 +451,11 @@ def _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatc
         )
     )
     device_id = int(st_device_ids[0])
-    evidence = _run_pass(
-        st_platform, device_id, artifacts, mask, lane, blocks, stall_ms, recovery=False, two_wave=two_wave
-    )
+    with monkeypatch.context() as fault:
+        fault.setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", str(_TIMEOUT_MS))
+        evidence = _run_pass(
+            st_platform, device_id, artifacts, mask, lane, blocks, stall_ms, recovery=False, two_wave=two_wave
+        )
     # Only an onboard runtime binds the releasable hook that holds a failed
     # run's device reservation, so only there must the recovery pass pay for a
     # fresh process. A simulator admits the second Worker in this one.

@@ -9,6 +9,7 @@
 """Legacy communicator controls use child-local state, not runtime attributes."""
 
 import ctypes
+import os
 import struct
 from contextlib import ExitStack
 from multiprocessing.shared_memory import SharedMemory
@@ -40,12 +41,14 @@ def shared_memory_granularity(monkeypatch, request):
 def _run_controls(monkeypatch, init_results, commands):
     cw = MagicMock(
         spec_set=(
+            "_execution_environment",
             "comm_init",
             "comm_alloc_domain_windows",
             "comm_release_domain_windows",
             "set_exported_device_regions_live",
         )
     )
+    cw._execution_environment = (os.getpid(), 1, 1, 0, False)
     cw.comm_init.side_effect = init_results
     cw.comm_alloc_domain_windows.return_value = (0xC7, 0xB000, 4096)
     responses = []
@@ -66,13 +69,13 @@ def _run_controls(monkeypatch, init_results, commands):
         init_request = allocate(worker_mod._COMM_INIT_HEADER.size + len(rootinfo_path))
         init_buf = init_request.buf
         assert init_buf is not None
-        worker_mod._COMM_INIT_HEADER.pack_into(init_buf, 0, 0, 1)
+        worker_mod._COMM_INIT_HEADER.pack_into(init_buf, 0, 0, 1, 0, 0)
         path_offset = worker_mod._COMM_INIT_HEADER.size
         init_buf[path_offset : path_offset + len(rootinfo_path)] = rootinfo_path
         domain_request = allocate(worker_mod._DOMAIN_REQ_HEADER.size + 4)
         domain_buf = domain_request.buf
         assert domain_buf is not None
-        worker_mod._DOMAIN_REQ_HEADER.pack_into(domain_buf, 0, 7, 1, 0, 64, 0)
+        worker_mod._DOMAIN_REQ_HEADER.pack_into(domain_buf, 0, 7, 1, 0, 64, 0, 0)
         struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
         reply = allocate(worker_mod._DOMAIN_REPLY_HEADER.size)
         with memoryview(bytearray(worker_mod.mailbox_size(1))) as mailbox:
@@ -182,3 +185,37 @@ def test_failed_reinitialization_preserves_the_established_handle(monkeypatch, f
     assert responses[2:] == [(0, "")] * 2
     assert cw.comm_alloc_domain_windows.call_args.args[0] == 0x3456
     cw.comm_release_domain_windows.assert_called_once_with(0x3456, 7, 1, 0)
+
+
+@pytest.mark.parametrize("path", [b"/shared/rootinfo\0", ("/shared/" + "\u8def\u5f84" * 100).encode() + b"\0"])
+def test_comm_init_returns_actual_fabric_pid(monkeypatch, path):
+    request = SharedMemory(create=True, size=worker_mod._COMM_INIT_HEADER.size + len(path))
+    try:
+        assert request.buf is not None
+        worker_mod._COMM_INIT_HEADER.pack_into(request.buf, 0, 0, 1, 1, 0)
+        offset = worker_mod._COMM_INIT_HEADER.size
+        request.buf[offset : offset + len(path)] = path
+        mailbox = bytearray(worker_mod.mailbox_size(1))
+        mailbox[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + worker_mod._CTRL_SHM_NAME_BYTES] = (
+            request.name.encode().ljust(worker_mod._CTRL_SHM_NAME_BYTES, b"\0")
+        )
+        cw = MagicMock()
+        cw.comm_init.return_value = 19
+        cw.host_backing_process_identity.return_value = 12345
+        assert worker_mod._handle_ctrl_comm_init(cw, memoryview(mailbox), chip_platform="a2a3") == 19
+        assert worker_mod._COMM_INIT_HEADER.unpack_from(request.buf) == (0, 1, 1, 12345)
+        assert bytes(request.buf[offset : offset + len(path)]) == path
+        cw.comm_init.assert_called_once_with(0, 1, path[:-1].decode())
+    finally:
+        request.close()
+        request.unlink()
+
+
+def test_plain_comm_init_does_not_query_host_fabric_capability(monkeypatch):
+    def reject_pid(_platform):
+        raise AssertionError("ordinary communicator must not query Host Fabric identity")
+
+    monkeypatch.setattr(worker_mod, "host_process_identity", reject_pid)
+    cw, responses, _ = _run_controls(monkeypatch, [19], [worker_mod._CTRL_COMM_INIT])
+    assert responses == [(0, "")]
+    cw.comm_init.assert_called_once()

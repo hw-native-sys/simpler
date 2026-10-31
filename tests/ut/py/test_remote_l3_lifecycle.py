@@ -27,7 +27,6 @@ from simpler import remote_l3_session, remote_l3_worker
 from simpler.buffer import (
     BackendKind,
     CanonicalIdentity,
-    LocalEndpointBufferIdentityAllocator,
     buffer_reference,
     create_host_shared_buffer,
     mint_owner_instance_id,
@@ -35,7 +34,7 @@ from simpler.buffer import (
     wrap_vmm_window,
 )
 from simpler.task_interface import DataType
-from simpler.worker import RunHandle, Worker, _RunResources, _SharedExclusiveLock
+from simpler.worker import RunHandle, Worker, _RunResources
 
 
 def _manifest(**extra):
@@ -1040,26 +1039,8 @@ def test_serve_real_socket_survives_truncated_frame_then_serves_next(monkeypatch
 def _bare_l3_worker():
     """An L3 Worker with the state ``_create_buffer_locked`` and ``release_buffer`` read — no
     fork, no device, no ``init()``."""
-    w = Worker.__new__(Worker)
-    w.level = 3
+    w = Worker(3, num_sub_workers=0)
     w._chip_shms = [object()]
-    w._sub_shms = []
-    w._next_level_shms = []
-    w._registry_lock = threading.Lock()
-    w._owner_instance_id = mint_owner_instance_id()
-    w._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(w._owner_instance_id)
-    w._buffers = {}
-    w._hierarchical_start_mu = threading.Lock()
-    w._hierarchical_start_cv = threading.Condition(w._hierarchical_start_mu)
-    w._accepted_run_handles = set()
-    w._abandoned_run_handles = []
-    # Run admission is shared/exclusive now, not a plain Lock: production code calls
-    # `.exclusive()` / `.shared()` on it, so the stand-in has to be the real type.
-    w._submit_mu = _SharedExclusiveLock()
-    w._chip_run_touched_identities = {}
-    w._chip_import_registry = None
-    w._reexport_by_source = {}
-    w._worker = None
     return w
 
 

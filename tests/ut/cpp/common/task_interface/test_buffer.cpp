@@ -543,3 +543,17 @@ TEST(BufferAbi, DecodedIdentityIgnoresWirePadding) {
 }
 
 }  // namespace
+
+TEST(BufferAbi, MappingSelectorPreservesBackingAndRequiresBorrow) {
+    Tensor native = make_tensor();
+    Tensor mapped = native;
+    mapped.mapping_ref = 2;
+    EXPECT_NO_THROW(validate_tensor(mapped));
+    EXPECT_EQ(offsetof(Tensor, mapping_ref), 142u);
+    EXPECT_EQ(std::memcmp(&native.buffer, &mapped.buffer, sizeof(BufferDescriptor)), 0);
+    Tensor decoded{};
+    std::memcpy(&decoded, &mapped, sizeof(mapped));
+    EXPECT_EQ(decoded.mapping_ref, 2);
+    EXPECT_EQ(tensor_transfer_error(decoded, TensorTransfer::NONE), nullptr);
+    EXPECT_NE(tensor_transfer_error(decoded, TensorTransfer::H2D), nullptr);
+}

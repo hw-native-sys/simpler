@@ -172,10 +172,11 @@ class TestSchedulerPhases(SceneTestCase):
                 assert all("runtime" not in stream for stream in streams)
                 assert all(stream["capture"]["dropped"] == 0 for stream in streams)
                 emitted_kinds = {record["kind"] for stream in streams for record in stream["records"]}
-                required_kinds = {"bootstrap", "state_probe", "dispatch", "complete", "resolve", "refill", "idle"}
+                required_kinds = {"bootstrap", "state_probe", "complete", "resolve", "refill", "idle"}
                 assert required_kinds <= emitted_kinds, (
                     f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
                 )
+                assert {"dispatch", "worksteal"} & emitted_kinds, "missing Ready Inbox launch"
                 assert not ({"fanin", "ready_claim", "ready_steal", "direct_refill"} & emitted_kinds)
                 records = [record for stream in streams for record in stream["records"]]
                 launch_kinds = {"dispatch", "worksteal", "refill"}

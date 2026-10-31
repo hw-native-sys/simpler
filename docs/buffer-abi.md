@@ -103,11 +103,12 @@ it is the resolved `addr` + `size`. That is the whole of what materialization do
 | — | ⟂ | `buffer.addr` |
 | `byte_offset` (bytes) | ≈ | `start_offset` (elements) |
 | `shapes[5]` / `strides[5]` / `ndims` / `dtype` | = | `shapes[5]` / `strides[5]` / `ndims` / `dtype` |
-| `buffer.address_space` | = | `address_space` |
+| `buffer.address_space` + selected mapping | ≈ | `address_space` of the resolved attachment |
+| `mapping_ref` (opaque endpoint-local mapping record) | ⟂ | resolved before the L2 boundary |
 | `TaskArgs.transfer(i)` (per-call metadata) | = | `ChipStorageTaskArgs.tensor(i).transfer` (internal ABI carrier) |
 
 `AddressSpace` describes the backing's physical HOST/DEVICE location. `Tensor` holds
-only the backing descriptor and view geometry. `TensorTransfer` belongs to each
+the backing descriptor, view geometry, and an explicit mapping reference. `TensorTransfer` belongs to each
 TaskArgs entry: `NONE` borrows storage, `H2D` requests Program-managed device storage,
 and `D2H` is reserved and rejected. Callable direction still controls input copies
 and output copy-back; H2D does not mean every argument is copied in. Buffer identity,
@@ -129,6 +130,34 @@ changes `view`. Omitted transfer in `TaskArgs.add_tensor` or the transitional L2
 Mailbox slots preserve each request in byte 141, formerly reserved view padding;
 standalone Tensor values do not carry it. Re-export and L2 materialization preserve
 the request alongside the view. Chip binders accept HOST/H2D and DEVICE/NONE.
+
+An explicit mapping uses byte 142 of the same 144-byte Tensor; zero selects the
+native view. The source descriptor and canonical identity remain unchanged.
+Host allocation confirms physical views without pre-registering device consumption
+grants. Each `map_view` request issues a restricted record in the actual target's
+ImportRegistry. References increase monotonically from 1 through 255 per backing;
+they encode neither rank nor access, are never reused, and fail explicitly on
+exhaustion. The qualified adapter resolves `(identity, mapping_ref)` only against
+a confirmed, live record for the current execution environment, extent and access.
+A mapped Tensor cannot switch references through `_with_mapping_ref`; native ref 0
+remains available for explicit H2D. Mapped arguments require explicit `NONE` and
+resolve to DEVICE/NONE at the chip boundary. Local mapping references are rejected
+by the remote wire.
+
+`Worker.unmap_view(tensor)` and `CommDomainHandle.unmap_view(tensor)` revoke the
+selected record after accepted uses retire; in-flight use is refused rather than
+waited for. L3 mapping control runs before the callback's first submission, or
+outside callbacks with no in-flight Run. Only the target's last active record
+triggers native Host-view detach, retaining the HBM domain and CPU owner. Failed
+cleanup stays CLOSING and can be retried; successful remapping issues a new ref
+without reviving old Tensors. Whole-domain release retains its drain and sticky
+collective-failure semantics and permanently closes attachment admission.
+
+All participants must use the same Python/native build; mixed old/new binaries
+are unsupported. Host detach uses the same optional runtime C-ABI boundary as
+attach. See the [A3 Host domain guide](zh-cn/a3-host-domain.md) for implementation
+and validation scope.
+
 HBG also accepts HOST/NONE with a declared IN/OUT/INOUT direction; TMR device
 orchestration returns UNSUPPORTED for it. Invalid location/transfer pairs return
 INVALID_ARGUMENT before tensor content copying or device allocation. HOST/H2D also requires canonical

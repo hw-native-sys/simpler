@@ -21,7 +21,15 @@ import pytest
 import simpler.worker as worker_mod
 from simpler.buffer import AccessMode, buffer_reference, wrap_vmm_window
 from simpler.orchestrator import _callback_run
-from simpler.task_interface import CommBufferSpec, CommDomainHandle, DataType, GlobalCommDomainHandle, TaskArgs
+from simpler.task_interface import (
+    CommBufferSpec,
+    CommDomainHandle,
+    DataType,
+    GlobalCommDomainHandle,
+    HostWindowSpec,
+    TaskArgs,
+    TensorTransfer,
+)
 from simpler.worker import Worker
 
 
@@ -767,6 +775,60 @@ def test_failed_release_keeps_debt_without_blocking_tree_teardown(domain_worker,
     finally:
         if saved and not saved[0].freed and not worker._cleanup_journal.empty:
             _close_with_domain_debt(worker)
+
+
+@pytest.mark.parametrize("domain_worker", [3], indirect=True)
+@pytest.mark.parametrize("completed", [False, True])
+def test_host_owner_survives_unconfirmed_domain_release(domain_worker, monkeypatch, completed):
+    worker, members = domain_worker
+    chip_pids = set(worker._chip_pids)
+    assert chip_pids
+    saved = []
+    worker.run(
+        lambda orch, _args, _cfg: saved.append(
+            orch.allocate_domain(**_request(members, host_window=HostWindowSpec(128), retain_after_run=True))
+        )
+    )
+    domain = saved[0]
+    resource = domain._host_resource
+    assert resource is not None
+    args = TaskArgs()
+    args.add_tensor(
+        domain.map_view(domain.host().tensor((16,), DataType.FLOAT32), domain_rank=0), transfer=TensorTransfer.NONE
+    )
+    original = worker._release_domain_claimed
+    failure, attempts = RuntimeError("injected Host domain release failure"), []
+
+    def release(handle):
+        attempts.append(handle)
+        if completed:
+            original(handle)
+        raise failure
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(worker, "_release_domain_claimed", release)
+            for free in (domain.release, lambda: worker._release_domain_now(domain)):
+                with pytest.raises(RuntimeError, match="injected Host domain release failure"):
+                    free()
+            assert domain.released and not domain.freed
+            with worker._child_prov_lock, pytest.raises(ValueError, match="not a live allocation"):
+                worker._child_prov_check_dispatch_locked(args, members[0], api="test")
+            assert worker._domain_free_results[domain.allocation_id] is failure
+            assert resource.views_released is completed and not resource.backend.shared.closed
+            _close_with_domain_debt(worker)
+            assert chip_pids <= worker.teardown_reports().keys()
+            assert resource.backend.shared.closed is completed
+            assert attempts == [domain]
+    finally:
+        try:
+            if worker._worker is not None:
+                _close_with_domain_debt(worker)
+            assert chip_pids <= worker.teardown_reports().keys()
+        finally:
+            # The test's SHM is disposable only after all chip processes have been reaped.
+            if chip_pids <= worker.teardown_reports().keys():
+                resource.backend.release()
 
 
 @pytest.mark.parametrize("pending", [False, True])

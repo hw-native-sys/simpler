@@ -82,7 +82,9 @@ def test_invalid_device_identity_is_rejected_before_mapping_or_launch(l2, monkey
         buffer = replace(buffer, nbytes=128)
     mapped = []
     original = worker._materialize_l2_args
-    monkeypatch.setattr(worker, "_materialize_l2_args", lambda args: mapped.append(True) or original(args))
+    monkeypatch.setattr(
+        worker, "_materialize_l2_args", lambda args, target: mapped.append(True) or original(args, target)
+    )
     with pytest.raises(ValueError, match="not a live|does not match"):
         worker._submit_l2_locked(3, arguments(buffer), CallConfig())
     assert not mapped and not calls
@@ -97,7 +99,9 @@ def test_mutated_output_tag_is_rechecked_before_any_mapping(l2, monkeypatch):
     args.set_tag(1, TensorArgType.OUTPUT_EXISTING)
     mapped = []
     original = worker._materialize_l2_args
-    monkeypatch.setattr(worker, "_materialize_l2_args", lambda args: mapped.append(True) or original(args))
+    monkeypatch.setattr(
+        worker, "_materialize_l2_args", lambda args, target: mapped.append(True) or original(args, target)
+    )
     with pytest.raises(ValueError, match="does not grant"):
         worker._submit_l2_locked(3, args, CallConfig())
     assert not mapped and not calls
@@ -110,10 +114,10 @@ def test_mutating_the_callers_args_does_not_change_the_accepted_binding(l2, monk
     args = arguments(first)
     original = worker._materialize_l2_args
 
-    def mutate_then_materialize(accepted):
+    def mutate_then_materialize(accepted, target):
         args.clear()
         args.add_tensor(second.tensor((4,), DataType.FLOAT32))
-        return original(accepted)
+        return original(accepted, target)
 
     monkeypatch.setattr(worker, "_materialize_l2_args", mutate_then_materialize)
     handle = worker._submit_l2_locked(3, args, CallConfig())
@@ -160,7 +164,7 @@ def test_binding_failure_releases_the_reservation(l2, monkeypatch):
     worker, calls, frees = l2
     buffer = register_buffer(worker)
 
-    def fail(_args):
+    def fail(_args, _target):
         raise ValueError("cannot import")
 
     monkeypatch.setattr(worker, "_materialize_l2_args", fail)
@@ -241,7 +245,7 @@ def test_source_wrap_context_and_descriptor_checks_precede_materialization(l2, m
     original = arguments(backing)
     changed = replace(backing, nbytes=128)
     mapped = []
-    monkeypatch.setattr(worker, "_materialize_l2_args", lambda args: mapped.append(args))
+    monkeypatch.setattr(worker, "_materialize_l2_args", lambda args, _target: mapped.append(args))
     with pytest.raises(ValueError, match="descriptor"):
         worker._submit_l2_locked(3, arguments(changed), CallConfig())
     assert not mapped and not calls
@@ -269,7 +273,7 @@ def test_source_environment_change_refuses_before_identity_or_attachment(l2, mon
     )
     materialize = worker._materialize_l2_args
     mapped = []
-    monkeypatch.setattr(worker, "_materialize_l2_args", lambda args: mapped.append(args))
+    monkeypatch.setattr(worker, "_materialize_l2_args", lambda args, _target: mapped.append(args))
     with pytest.raises(ValueError, match="live device context"):
         Buffer.wrap(address=0x9000, nbytes=64, location=location)
     with pytest.raises(ValueError, match="live device context"):
@@ -288,7 +292,7 @@ def test_source_wrap_reservation_precedes_mapping_and_unwinds_on_bind_failure(l2
     worker, calls, _ = l2
     backing = Buffer.wrap(address=0x8000, nbytes=64, location=worker.device_location)
 
-    def fail(args):
+    def fail(args, _target):
         with pytest.raises(RuntimeError, match="in-flight"):
             backing.close()
         raise ValueError("cannot import")
@@ -407,10 +411,10 @@ def test_source_close_is_fenced_while_another_thread_materializes(l2, monkeypatc
     errors = []
     original = worker._materialize_l2_args
 
-    def paused(args):
+    def paused(args, target):
         entered.set()
         assert resume.wait(5)
-        return original(args)
+        return original(args, target)
 
     def submit():
         try:

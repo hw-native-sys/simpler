@@ -393,10 +393,10 @@ class TestL2TouchedIdentityTracking:
         proceed = threading.Event()
         real_materialize = Worker._materialize_l2_args
 
-        def _blocking_materialize(self, args):
+        def _blocking_materialize(self, args, target=None):
             entered_materialize.set()
             proceed.wait(timeout=5)
-            return real_materialize(self, args)
+            return real_materialize(self, args, target)
 
         monkeypatch.setattr(Worker, "_materialize_l2_args", _blocking_materialize)
 
@@ -411,6 +411,70 @@ class TestL2TouchedIdentityTracking:
             proceed.set()
             submit_thread.join(timeout=5)
         assert not buf.closed
+
+
+@pytest.mark.parametrize("failure_site", ["submit", "finalize"])
+def test_unknown_l2_completion_atomically_refuses_direct_host_release(monkeypatch, failure_site):
+    w, buf = _l2_with_registered_buffer()
+    resource = SimpleNamespace(buffer=buf, closed=False, views_released=True, close=MagicMock())
+    w._direct_host_domains[buf.identity] = (resource, 0, 0, SimpleNamespace(value=0))
+    original_lock = w._registry_lock
+    outcomes = []
+
+    def release():
+        try:
+            w._release_direct_host_resource(buf.identity)
+        except RuntimeError as error:
+            outcomes.append(str(error))
+        else:
+            outcomes.append("released")
+
+    class ReleaseAtUnlock:
+        armed = False
+
+        def __enter__(self):
+            original_lock.acquire()
+            return self
+
+        def __exit__(self, *_exc):
+            original_lock.release()
+            if self.armed:
+                self.armed = False
+                releaser = threading.Thread(target=release)
+                releaser.start()
+                releaser.join(timeout=5)
+                assert not releaser.is_alive()
+
+    lock = ReleaseAtUnlock()
+    monkeypatch.setattr(w, "_registry_lock", lock)
+    failure = RuntimeError("completion is unknown")
+    try:
+        if failure_site == "submit":
+
+            def fail_submit(*_args):
+                lock.armed = True
+                raise failure
+
+            monkeypatch.setattr(w._chip_worker, "_submit_chip_run_direct", fail_submit)
+            with pytest.raises(RuntimeError, match="completion is unknown"):
+                w._submit_l2_locked(3, _buffer_args(buf), CallConfig())
+            run_id = w._chip_run_seq
+        else:
+            handle = w._submit_l2_locked(3, _buffer_args(buf), CallConfig())
+            run_id = handle._run_id
+            assert run_id is not None
+            lock.armed = True
+            assert w._finalize_run_handle_unlocked(handle, run_id, failure) is failure
+        assert outcomes == ["Host buffer retained after unconfirmed device completion"]
+        assert w._source_context_failed
+        assert w._chip_run_touched_identities[run_id] == {buf.identity}
+        resource.close.assert_not_called()
+        assert not buf.closed
+    finally:
+        # The fake chip has no outstanding device work; release the actual SHM test backing.
+        w._direct_host_domains.clear()
+        w._chip_run_touched_identities.clear()
+        buf.close()
 
 
 class TestReleaseBufferL2InFlight:

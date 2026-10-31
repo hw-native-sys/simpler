@@ -28,6 +28,8 @@
 #include "common/unified_log.h"
 #include "host/file_marker_handshake.h"
 
+#include <algorithm>
+#include <dlfcn.h>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -85,7 +87,16 @@ struct DomainAllocation {
     int rank = 0;
     int nranks = 0;
     bool release_failed = false;
+    bool release_barrier_attempted = false;
+    bool release_barrier_succeeded = false;
+    bool release_windows_attempted = false;
+    aclError release_windows_status = ACL_SUCCESS;
     VmmWindow local_window;
+    void *host_base = nullptr;
+    aclrtDrvMemHandle host_handle = nullptr;
+    uint64_t host_reservation = 0;
+    bool host_mapped = false;
+    bool host_closing = false;
     std::vector<VmmWindow> peer_windows;
     CommContext *device_ctx = nullptr;  // aclrtMalloc'd CommContext mirror
 };
@@ -364,8 +375,28 @@ static aclError import_ipc_window(int32_t device_id, uint64_t shareable_handle, 
     return status;
 }
 
+static aclError release_domain_host(DomainAllocation *alloc) {
+    alloc->host_closing = true;
+    if (alloc->host_mapped) {
+        if (auto status = aclrtUnmapMem(alloc->host_base); status != ACL_SUCCESS) return status;
+        alloc->host_mapped = false;
+    }
+    if (alloc->host_base) {
+        if (auto status = aclrtReleaseMemAddress(alloc->host_base); status != ACL_SUCCESS) return status;
+        alloc->host_base = nullptr;
+    }
+    if (alloc->host_handle) {
+        if (auto status = aclrtFreePhysical(alloc->host_handle); status != ACL_SUCCESS) return status;
+        alloc->host_handle = nullptr;
+    }
+    alloc->host_reservation = 0;
+    alloc->host_closing = false;
+    return ACL_SUCCESS;
+}
+
 static aclError release_domain_windows(DomainAllocation *alloc) {
-    aclError first_error = release_vmm_windows(&alloc->peer_windows);
+    aclError first_error = release_domain_host(alloc);
+    record_first_error(release_vmm_windows(&alloc->peer_windows), &first_error);
     record_first_error(release_vmm_window(&alloc->local_window), &first_error);
     return first_error;
 }
@@ -401,6 +432,13 @@ VmmWindow &VmmWindow::operator=(VmmWindow &&other) noexcept {
 }
 
 DomainAllocation::~DomainAllocation() {
+    const aclError host_status = release_domain_host(this);
+    if (host_status != ACL_SUCCESS) {
+        LOG_ERROR(
+            "[comm] domain destruction: Host release failed -> %d; dependent resources retained",
+            static_cast<int>(host_status)
+        );
+    }
     if (device_ctx != nullptr) {
         aclrtFree(device_ctx);
         device_ctx = nullptr;
@@ -1490,6 +1528,139 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
+extern "C" int comm_attach_domain_host(
+    CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
+) {
+    const char *stage = "validate arguments";
+    auto fail = [&](int status) {
+        LOG_ERROR(
+            "[comm] attach_domain_host: allocation_id=%llu stage=%s error=%d",
+            static_cast<unsigned long long>(allocation_id), stage, status
+        );
+        if (descriptor) {
+            LOG_ERROR(
+                "[comm] attach_domain_host: allocation_id=%llu descriptor version=%u profile=%u reserved=%u "
+                "handle_size=%u mapping_size=%llu",
+                static_cast<unsigned long long>(allocation_id), descriptor->version, descriptor->profile,
+                descriptor->reserved, descriptor->handle_size, static_cast<unsigned long long>(descriptor->mapping_size)
+            );
+        }
+        return status;
+    };
+    try {
+        if (!h || !descriptor || !base_out) return fail(-1);
+        *base_out = 0;
+        stage = "find allocation";
+        auto it = h->domain_allocations.find(allocation_id);
+        if (it == h->domain_allocations.end()) return fail(-1);
+        stage = "validate descriptor";
+        auto &allocation = *it->second;
+        if (allocation.host_closing || allocation.release_barrier_attempted || allocation.release_windows_attempted)
+            return fail(-1);
+        if (allocation.host_base || allocation.host_handle) {
+            LOG_ERROR(
+                "[comm] attach_domain_host: allocation_id=%llu existing Host base=%p handle=%p",
+                static_cast<unsigned long long>(allocation_id), allocation.host_base, allocation.host_handle
+            );
+            return fail(-1);
+        }
+        if (descriptor->version != COMM_GLOBAL_DOMAIN_VERSION ||
+            descriptor->profile != COMM_GLOBAL_DOMAIN_PROFILE_A3_FABRIC || descriptor->reserved ||
+            descriptor->handle_size != sizeof(aclrtMemFabricHandle) || !descriptor->mapping_size)
+            return fail(-1);
+        constexpr uint64_t unit = 1ULL << 30, begin = 40ULL << 40, end = 224ULL << 40;
+        stage = "validate NoUC extent";
+        if (descriptor->mapping_size > end - begin - unit) return fail(-1);
+        const uint64_t bytes = (descriptor->mapping_size + unit - 1) / unit * unit;
+        std::vector<std::pair<uint64_t, uint64_t>> occupied;
+        for (const auto &entry : h->domain_allocations) {
+            if (entry.second->host_base)
+                occupied.emplace_back(
+                    reinterpret_cast<uint64_t>(entry.second->host_base), entry.second->host_reservation
+                );
+        }
+        std::sort(occupied.begin(), occupied.end());
+        uint64_t address = begin;
+        for (const auto &[base, length] : occupied) {
+            if (address <= base && bytes <= base - address) break;
+            address = std::max(address, base + length);
+        }
+        stage = "select NoUC address";
+        if (address > end - bytes) {
+            LOG_ERROR(
+                "[comm] attach_domain_host: allocation_id=%llu NoUC bytes=%llu address=%llu range=[%llu,%llu)",
+                static_cast<unsigned long long>(allocation_id), static_cast<unsigned long long>(bytes),
+                static_cast<unsigned long long>(address), static_cast<unsigned long long>(begin),
+                static_cast<unsigned long long>(end)
+            );
+            return fail(-1);
+        }
+        stage = "resolve NoUC reservation API";
+        using Reserve = decltype(&aclrtReserveMemAddressNoUCMemory);
+        auto reserve = reinterpret_cast<Reserve>(dlsym(RTLD_DEFAULT, "aclrtReserveMemAddressNoUCMemory"));
+        if (!reserve) return fail(-1);
+        aclrtMemFabricHandle token{};
+        std::memcpy(&token, descriptor->handle, sizeof(token));
+        stage = "import Fabric handle";
+        auto status = aclrtMemImportFromShareableHandleV2(
+            &token, ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, ACL_RT_IPC_MEM_EXPORT_FLAG_DEFAULT, &allocation.host_handle
+        );
+        if (status != ACL_SUCCESS) return fail(static_cast<int>(status));
+        // NoUC needs explicit [40, 224) TiB VA with 1 GiB reservation alignment.
+        void *reserved_base = nullptr;
+        // The driver owns VA reservations across all communicator/runtime instances.
+        // A candidate chosen from this communicator's windows may already belong to
+        // another Worker; do not overwrite its reservation or keep a failed output.
+        stage = "reserve NoUC address";
+        constexpr unsigned max_candidates = 64;
+        aclError first_reservation_error = ACL_SUCCESS;
+        const uint64_t first_address = address;
+        unsigned attempt = 0;
+        for (; attempt < max_candidates && address <= end - bytes; ++attempt, address += bytes) {
+            reserved_base = nullptr;
+            status = reserve(&reserved_base, bytes, 0, reinterpret_cast<void *>(address), 0);
+            if (status == ACL_SUCCESS) break;
+            if (first_reservation_error == ACL_SUCCESS) first_reservation_error = status;
+        }
+        if (status != ACL_SUCCESS) {
+            LOG_ERROR(
+                "[comm] attach_domain_host: allocation_id=%llu stage=%s first error=%d last error=%d "
+                "bytes=%llu first_address=%llu next_address=%llu range=[%llu,%llu) candidates=%u",
+                static_cast<unsigned long long>(allocation_id), stage, static_cast<int>(first_reservation_error),
+                static_cast<int>(status), static_cast<unsigned long long>(bytes),
+                static_cast<unsigned long long>(first_address), static_cast<unsigned long long>(address),
+                static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), attempt
+            );
+            return static_cast<int>(first_reservation_error);
+        }
+        allocation.host_base = reserved_base;
+        allocation.host_reservation = bytes;
+        stage = "map imported Host memory";
+        status = aclrtMapMem(allocation.host_base, descriptor->mapping_size, 0, allocation.host_handle, 0);
+        if (status != ACL_SUCCESS) return fail(static_cast<int>(status));
+        allocation.host_mapped = true;
+        *base_out = reinterpret_cast<uint64_t>(allocation.host_base);
+        return 0;
+    } catch (const std::exception &error) {
+        LOG_ERROR(
+            "[comm] attach_domain_host: allocation_id=%llu stage=%s exception=%s",
+            static_cast<unsigned long long>(allocation_id), stage, error.what()
+        );
+        return -1;
+    } catch (...) {
+        return fail(-1);
+    }
+}
+
+extern "C" int comm_detach_domain_host(CommHandle h, uint64_t allocation_id) try {
+    if (!h) return -1;
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) return -1;
+    return static_cast<int>(release_domain_host(it->second.get()));
+} catch (...) {
+    return -1;
+}
+
 extern "C" int
 comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) try {
     if (!h) return -1;
@@ -1510,31 +1681,44 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         );
         return -1;
     }
-    int rc = 0;
-    // Best-effort subset barrier so peers don't free local memory under each
-    // other.  If a peer crashed mid-allocation, the timeout returns false and
-    // we proceed with local teardown anyway — same shape as comm_destroy.
-    if (!file_barrier(
+    const aclError host_status = release_domain_host(alloc.get());
+    // Every rank publishes its marker, including ranks retaining a failed Host
+    // attachment. The barrier result is terminal; cleanup retries are local.
+    if (!alloc->release_barrier_attempted) {
+        alloc->release_barrier_attempted = true;
+        alloc->release_barrier_succeeded = file_barrier(
             h->rootinfo_path, static_cast<int>(domain_rank), static_cast<int>(rank_count),
             domain_barrier_tag(allocation_id, "release"), h->run_token
-        )) {
-        LOG_WARN("[comm rank %d] release_domain: barrier timed out; releasing local state anyway", h->rank);
-        rc = -1;
+        );
+        if (!alloc->release_barrier_succeeded) {
+            LOG_WARN("[comm rank %d] release_domain: barrier failed; retaining local state", h->rank);
+        }
     }
+    if (host_status != ACL_SUCCESS) return static_cast<int>(host_status);
+    if (!alloc->release_barrier_succeeded) return -1;
 
+    int rc = 0;
     if (alloc->device_ctx) {
         aclError aret = aclrtFree(alloc->device_ctx);
-        if (aret != ACL_SUCCESS && rc == 0) rc = -1;
-        alloc->device_ctx = nullptr;
+        if (aret != ACL_SUCCESS && rc == 0) rc = static_cast<int>(aret);
+        if (aret == ACL_SUCCESS) alloc->device_ctx = nullptr;
     }
-    aclError release_status = release_domain_windows(alloc.get());
-    if (release_status != ACL_SUCCESS) {
+    // VMM helpers clear fields even on failure, so their result remains sticky.
+    if (!alloc->release_windows_attempted) {
+        alloc->release_windows_status = static_cast<aclError>(-1);
+        alloc->release_windows_attempted = true;
+        aclError release_status = release_vmm_windows(&alloc->peer_windows);
+        record_first_error(release_vmm_window(&alloc->local_window), &release_status);
+        alloc->release_windows_status = release_status;
+    }
+    if (alloc->release_windows_status != ACL_SUCCESS) {
         LOG_ERROR(
-            "[comm rank %d] release_domain: release VMM windows -> %d", h->rank, static_cast<int>(release_status)
+            "[comm rank %d] release_domain: release VMM windows -> %d", h->rank,
+            static_cast<int>(alloc->release_windows_status)
         );
-        if (rc == 0) rc = -1;
+        if (rc == 0) rc = static_cast<int>(alloc->release_windows_status);
     }
-    h->domain_allocations.erase(it);
+    if (rc == 0) h->domain_allocations.erase(it);
     return rc;
 } catch (const std::exception &e) {
     LOG_ERROR("[comm] release_domain: exception: %s", e.what());

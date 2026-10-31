@@ -17,6 +17,7 @@ Tensor uses its canonical public import in `simpler.task_interface`.
 """
 
 import ctypes
+import os
 import re
 import subprocess
 import sys
@@ -1328,3 +1329,80 @@ def test_task_args_owns_transfer_without_mutating_the_source_view():
     args.clear()
     args.add_tensor(tensor)
     assert args.transfer(0) == TensorTransfer.H2D
+
+
+class TestExplicitMappedTensor:
+    @pytest.fixture
+    def mapping_context(self):
+        environment = (os.getpid(), 1, 1, 0, False)
+        return ImportContext(
+            DEVICE_AICPU,
+            platform="a2a3",
+            runtime="tensormap_and_ringbuffer",
+            execution_environment=environment,
+            current_environment=lambda: environment,
+        )
+
+    def test_native_and_mapped_arguments_keep_one_backing(self, mapping_context):
+        from types import SimpleNamespace  # noqa: PLC0415
+
+        from simpler.task_interface import ArgDirection, TensorArgType, _materialize_chip_task_args  # noqa: PLC0415
+
+        backing = create_host_shared_buffer(128, mint_owner_instance_id(), 1)
+        registry = ImportRegistry(mapping_context)
+        try:
+            native = Tensor(backing, shapes=(8,), dtype=DataType.FLOAT32, byte_offset=16)
+            mapped = native._with_mapping_ref(1)
+            registry.register_attachment(
+                backing.to_descriptor(),
+                0x8000,
+                mapping_ref=1,
+                profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT,
+                live=lambda: True,
+            )
+            args = TaskArgs()
+            args.add_tensor(native, TensorArgType.INPUT)
+            args.add_tensor(mapped, TensorArgType.INPUT, transfer=TensorTransfer.NONE)
+            target = SimpleNamespace(sig_count=2, sig=lambda _index: ArgDirection.IN)
+            materialized = _materialize_chip_task_args(args, registry, target)
+            assert mapped.buffer == native.buffer
+            assert mapped.buffer.address_space == AddressSpace.HOST
+            assert mapped.mapping_ref == 1 and native.mapping_ref == 0
+            assert materialized.tensor(0).data != materialized.tensor(1).data
+            assert materialized.tensor(1).data == 0x8010
+            assert materialized.tensor(0).address_space == AddressSpace.HOST
+            assert materialized.tensor(1).address_space == AddressSpace.DEVICE
+            with pytest.raises(ValueError, match="transfer NONE"):
+                TaskArgs().add_tensor(mapped)
+        finally:
+            registry.close()
+            backing.close()
+
+    def test_mapping_requires_confirmed_live_target(self, mapping_context):
+        backing = create_host_shared_buffer(64, mint_owner_instance_id(), 2)
+        registry = ImportRegistry(mapping_context)
+        live = [True]
+        try:
+            mapped = backing.tensor((16,), DataType.FLOAT32)._with_mapping_ref(7)
+            with pytest.raises(ValueError, match="no granted attachment"):
+                registry.resolve_tensor(mapped)
+            registry.register_attachment(
+                backing.to_descriptor(),
+                0x8000,
+                mapping_ref=7,
+                profile=AdapterProfile.DEVICE_FABRIC_V2_PEER_IMPORT,
+                live=lambda: live[0],
+            )
+            assert registry.resolve_tensor(mapped).base == 0x8000
+            forged = replace(backing, nbytes=128).tensor((16,), DataType.FLOAT32)._with_mapping_ref(7)
+            with pytest.raises(ValueError, match="descriptor differs"):
+                registry.resolve_tensor(forged)
+            live[0] = False
+            with pytest.raises(ValueError, match="not live"):
+                registry.resolve_tensor(mapped)
+            registry.unregister(backing.identity)
+            with pytest.raises(ValueError, match="no granted attachment"):
+                registry.resolve_tensor(mapped)
+        finally:
+            registry.close()
+            backing.close()

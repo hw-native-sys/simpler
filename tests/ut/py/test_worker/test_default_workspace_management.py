@@ -23,6 +23,7 @@ lifecycle rule the entry applies, and states its own limits.
 from __future__ import annotations
 
 import inspect
+from types import SimpleNamespace
 
 _COMMON = {"platform": "a2a3", "runtime": "host_build_graph"}
 
@@ -83,7 +84,7 @@ def test_the_level_two_route_no_longer_names_the_retired_keyword(monkeypatch):
             pass
 
         def get_binaries(self, *_a, **_k):
-            return object()
+            return SimpleNamespace(host_path="/test/host_runtime.so")
 
     monkeypatch.setattr(worker_mod, "_ChipWorker", _RecordingChip)
     monkeypatch.setattr(

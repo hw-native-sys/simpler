@@ -51,6 +51,7 @@ target_compile_definitions(_task_interface PRIVATE
 )
 
 target_sources(_task_interface PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/common/worker/host_backing_owner.cpp
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_worker.cpp
     ${CMAKE_SOURCE_DIR}/src/common/worker/runtime_module.cpp
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_run_lane.cpp

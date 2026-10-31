@@ -244,6 +244,24 @@ def test_nonreturning_probe_is_hardware_only_and_covers_each_executing_lane(nati
     assert sorted(shapes[0]) == [(mask, lane) for mask in range(1, 8) for lane in range(3) if mask & (1 << lane)]
 
 
+@pytest.mark.parametrize("platform", ["a5sim", "a5"])
+def test_recovery_restores_outer_scheduler_timeout(native, monkeypatch, tmp_path, platform):
+    key = "SIMPLER_SCHEDULER_TIMEOUT_MS"
+    monkeypatch.setenv(key, "10000")
+    monkeypatch.setattr(native, "_ROOT", tmp_path)
+    observed = []
+
+    def record(*_args, recovery=False, **_kwargs):
+        observed.append((recovery, native.os.environ[key]))
+        return []
+
+    monkeypatch.setattr(native, "_run_pass", record)
+    monkeypatch.setattr(native, "_recovery_pass", lambda *_args: record(recovery=True))
+    native._exercise_failure(platform, [0], 7, 0, 257, monkeypatch, native._STALL_MS)
+    assert observed == [(False, str(native._TIMEOUT_MS)), (True, "10000")]
+    assert native.os.environ[key] == "10000"
+
+
 def _nonreturning_capture():
     raw = _capture()
     protocol = raw["aicore_protocol"]

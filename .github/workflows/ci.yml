@@ -72,6 +72,7 @@ jobs:
       setup_variant: github
       include_dfx_smokes: true
       python_version: ${{ matrix.python-version }}
+      session_timeout_seconds: ${{ matrix.os == 'macos-latest' && 1200 || 600 }}
 
   st-sim-a5:
     needs: [detect-changes, pre-commit]
@@ -86,6 +87,7 @@ jobs:
       setup_variant: github
       include_dfx_smokes: true
       python_version: ${{ matrix.python-version }}
+      session_timeout_seconds: ${{ matrix.os == 'macos-latest' && 1200 || 600 }}
 
   profiling-flags-smoke:
     needs: [detect-changes, pre-commit]

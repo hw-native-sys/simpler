@@ -95,13 +95,19 @@ but not freed; its cleanup obligation stays tracked and is reported, while
 independent worker-tree cleanup continues.
 `Worker.live_domains` includes both backends.
 
-`copy_to_domain` and `copy_from_domain` use domain rank and the same named-buffer
+`copy_to_domain` and `copy_from_domain` use NPU domain rank and the same named-buffer
 bounds checks. They synchronously stage data without issuing an implicit run/DAG
 fence. L3 staging precedes task submission and reuses ordinary VMM Buffer
 copies and must stay inside the declared slices, including when `buffer=None`.
 L4 retains the existing bounded whole-window copy path. `buffer_range(name)`
 returns the slice's window offset and byte size. `requested_window_size` preserves the request;
 `mapping_size` reports the backend's actual mapping extent. Complete buffer definitions remain available.
+
+Local Host backing uses `copy_to_host_domain(handle, data, offset=...)` /
+`copy_from_host_domain(handle, nbytes, offset=...)`, without occupying a rank or selecting `rank=None`.
+Both reuse control admission: copy before the first submission inside a callback; outside callbacks,
+wait for outstanding runs first. Refusal precedes data writes. Direct CPU pointer writes bypass this
+gate, so callers must exclude concurrent consumers themselves.
 
 L4 Buffer/Tensor views reach their owning chip through local or remote L3s, preserving canonical
 identity without exposing remote device addresses. Pass an immutable `CommDomainRef` (creator instance,

@@ -44,6 +44,7 @@ from _task_interface import _Orchestrator as _COrchestrator  # pyright: ignore[r
 
 from .buffer import AccessMode, BackendKind, Buffer, wrap_fork_inherited
 from .callable_identity import CallableHandle
+from .comm_domain import HostWindowSpec
 from .task_interface import (
     CallConfig,
     ChipCallable,
@@ -354,7 +355,9 @@ class Orchestrator:
             prov_guard = worker._child_prov_lock
         with prov_guard:
             if needs_prov:
-                worker._child_prov_check_dispatch_locked(c_args, cpp_worker_id, api="submit_next_level")
+                worker._child_prov_check_dispatch_locked(
+                    c_args, cpp_worker_id, api="submit_next_level", sidecar=remote_sidecar
+                )
                 remote_sidecar = worker._prepare_buffer_references(c_args, remote_sidecar, cpp_worker_id)
             final_worker_ids = _remote_data_eligible_worker_ids(remote_sidecar, eligible_worker_ids)
             if worker is not None:
@@ -464,7 +467,12 @@ class Orchestrator:
         with prov_guard:
             for index, c_args in member_checks:
                 assert worker is not None
-                worker._child_prov_check_dispatch_locked(c_args, worker_ids[index], api="submit_next_level_group")
+                worker._child_prov_check_dispatch_locked(
+                    c_args,
+                    worker_ids[index],
+                    api="submit_next_level_group",
+                    sidecar=remote_sidecars[index] if remote_sidecars is not None else None,
+                )
                 prepared = worker._prepare_buffer_references(
                     c_args, remote_sidecars[index] if remote_sidecars is not None else None, worker_ids[index]
                 )
@@ -534,6 +542,7 @@ class Orchestrator:
         window_size: int,
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
+        host_window: HostWindowSpec | None = None,
         workers: Sequence[int] | None = None,
     ) -> CommDomainHandle:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
@@ -550,7 +559,13 @@ class Orchestrator:
         if workers is not None and self._worker is not None and self._worker.level != 3:
             raise TypeError("legacy workers= is only supported by an L3 Worker")
         return self._domain(
-            name, members if members is not None else workers, window_size, buffers, retain_after_run, reuse=False
+            name,
+            members if members is not None else workers,
+            window_size,
+            buffers,
+            retain_after_run,
+            host_window=host_window,
+            reuse=False,
         )
 
     def get_or_allocate_domain(
@@ -561,15 +576,16 @@ class Orchestrator:
         window_size: int,
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
+        host_window: HostWindowSpec | None = None,
     ) -> CommDomainHandle:
         """Return the same live handle on an exact configuration match, otherwise create it.
 
         Member order, full buffer definitions, window request, retention and topology must match.
         A hit neither allocates nor initializes the existing window.
         """
-        return self._domain(name, members, window_size, buffers, retain_after_run, reuse=True)
+        return self._domain(name, members, window_size, buffers, retain_after_run, host_window=host_window, reuse=True)
 
-    def _domain(self, name, members, window_size, buffers, retain_after_run, *, reuse):
+    def _domain(self, name, members, window_size, buffers, retain_after_run, *, host_window=None, reuse):
         if self._worker is None:
             raise RuntimeError("domain allocation requires an Orchestrator bound to a Worker")
         return self._worker._comm_domain(
@@ -579,6 +595,7 @@ class Orchestrator:
             buffers=buffers,
             retain_after_run=retain_after_run,
             reuse=reuse,
+            host_window=host_window,
         )
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:
@@ -645,12 +662,12 @@ class Orchestrator:
         buffer: str | None = None,
         offset: int = 0,
     ) -> None:
-        """Synchronously stage bytes; does not wait for queued tasks.
+        """Synchronously stage bytes to an NPU rank; does not wait for queued tasks.
 
         L3 staging precedes task submission and stays within declared buffer slices.
         L4 keeps its existing window copy path.
         """
-        self._copy_domain(handle, domain_rank, bytes(data), buffer, offset, writing=True)
+        self._copy_domain(handle, operator.index(domain_rank), bytes(data), buffer, offset, writing=True)
 
     def copy_from_domain(
         self,
@@ -662,10 +679,24 @@ class Orchestrator:
         offset: int = 0,
     ) -> bytes:
         """Synchronously read bytes with the same range and ordering rules as copy_to_domain."""
-        return cast(bytes, self._copy_domain(handle, domain_rank, int(nbytes), buffer, offset, writing=False))
+        return cast(
+            bytes, self._copy_domain(handle, operator.index(domain_rank), int(nbytes), buffer, offset, writing=False)
+        )
 
     copy_to_global_domain = copy_to_domain
     copy_from_global_domain = copy_from_domain
+
+    def copy_to_host_domain(self, handle: CommDomainHandle, data: bytes, *, offset: int = 0) -> None:
+        """Write the local Host backing before task submission, or between completed runs.
+
+        This uses the same control ordering as NPU domain copies; it does not
+        wait for outstanding tasks. Direct CPU pointer writes bypass this gate.
+        """
+        self._copy_domain(handle, None, bytes(data), None, offset, writing=True)
+
+    def copy_from_host_domain(self, handle: CommDomainHandle, nbytes: int, *, offset: int = 0) -> bytes:
+        """Read the local Host backing with the same ordering as copy_to_host_domain."""
+        return cast(bytes, self._copy_domain(handle, None, int(nbytes), None, offset, writing=False))
 
     def _copy_domain(self, handle, rank, data, buffer, offset, *, writing):
         if self._worker is None:
@@ -686,6 +717,11 @@ class Orchestrator:
             self._worker._use_domain(handle)
         size = len(data) if writing else data
         handle._require_live()
+        if rank is None:
+            if buffer is not None or handle._host_resource is None:
+                raise ValueError("Host domain copy requires a local Host window and no buffer slice name")
+            with self._control_admission("Host domain copy"):
+                return handle._host_resource.copy(offset, data, writing=writing)
         absolute = self._global_copy_range(handle, buffer=buffer, offset=offset, nbytes=size)
         handle.member(rank)
         if not handle.workers and not handle.borrowed:

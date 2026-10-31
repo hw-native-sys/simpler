@@ -42,6 +42,7 @@ def _bare_worker(level: int, *, chip: int = 0, sub: int = 0, next_level: int = 0
     w._owner_instance_id = mint_owner_instance_id()
     w._buffer_identity_allocator = LocalEndpointBufferIdentityAllocator(w._owner_instance_id)
     w._buffers = {}
+    w._direct_host_domains = {}
     w._hierarchical_start_mu = threading.Lock()
     w._hierarchical_start_cv = threading.Condition(w._hierarchical_start_mu)
     w._accepted_run_handles = set()

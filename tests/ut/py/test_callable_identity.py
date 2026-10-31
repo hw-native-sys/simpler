@@ -64,6 +64,8 @@ from simpler.task_interface import (
     RemoteTensorRef,
     TaskArgs,
     TensorArgType,
+    TensorTransfer,
+    _remote_sidecar_for,
     get_element_size,
 )
 from simpler.worker import (
@@ -1157,7 +1159,10 @@ def test_remote_callable_submit_rejects_tag_access_mismatch(tag, access_flags):
         TensorArgType.NO_DEP,
     ],
 )
-def test_remote_callable_submit_accepts_readwrite_handle_for_all_tags(tag):
+@pytest.mark.parametrize(
+    "address_space", [RemoteAddressSpace.REMOTE_DEVICE, RemoteAddressSpace.REMOTE_WINDOW, RemoteAddressSpace.UB_LDST]
+)
+def test_remote_callable_submit_accepts_readwrite_handle_for_all_tags(tag, address_space):
     class FakeCOrchestrator:
         def submit_next_level(self, *args):
             self.submit_next_level_args = args
@@ -1174,7 +1179,7 @@ def test_remote_callable_submit_accepts_readwrite_handle_for_all_tags(tag):
             buffer_id=1,
             generation=1,
             import_id=9,
-            address_space=RemoteAddressSpace.REMOTE_WINDOW,
+            address_space=address_space,
             nbytes=4,
             offset=0,
             access_flags=3,
@@ -2740,7 +2745,24 @@ def test_remote_sim_input_free_is_deferred_until_slot_refs_drop():
         daemon.stop()
 
 
-def test_remote_sim_host_inline_descriptor_roundtrip():
+def test_host_inline_provenance_requires_explicit_transport_binding():
+    worker = Worker(level=4, num_sub_workers=0)
+    args = TaskArgs()
+    args.add_tensor(RemoteTensorRef.host_inline(b"abcd", shape=(4,), dtype=DataType.UINT8))
+    assert worker._names_device_allocation(args)
+    sidecar = _remote_sidecar_for(args)
+    with worker._child_prov_lock:
+        worker._child_prov_check_dispatch_locked(args, 0, api="test", sidecar=sidecar)
+        with pytest.raises(ValueError, match="not a live"):
+            worker._child_prov_check_dispatch_locked(args, 0, api="test")
+        mapped = TaskArgs()
+        mapped.add_tensor(args.tensor(0)._with_mapping_ref(1), transfer=TensorTransfer.NONE)
+        with pytest.raises(ValueError, match="not a live"):
+            worker._child_prov_check_dispatch_locked(mapped, 0, api="test", sidecar=sidecar)
+
+
+@pytest.mark.parametrize("grouped", [False, True])
+def test_remote_sim_host_inline_descriptor_roundtrip(grouped):
     port = _free_tcp_port()
     daemon = _RemoteL3Daemon(port)
     worker = Worker(level=4, num_sub_workers=0, remote_session_timeout_s=10)
@@ -2767,7 +2789,10 @@ def test_remote_sim_host_inline_descriptor_roundtrip():
                 RemoteTensorRef(remote_out, shape=(1,), dtype=DataType.UINT8),
                 TensorArgType.OUTPUT,
             )
-            orch.submit_next_level(handle, task_args, cfg, worker=worker_id)
+            if grouped:
+                orch.submit_next_level_group(handle, [task_args], cfg, workers=[worker_id])
+            else:
+                orch.submit_next_level(handle, task_args, cfg, worker=worker_id)
 
         worker.run(parent_orch)
 

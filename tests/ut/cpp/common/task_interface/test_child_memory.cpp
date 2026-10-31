@@ -180,6 +180,29 @@ TEST(ChildMemory, InvalidTransferDoesNotAppendAnArgumentAndLocationMutationIsRej
     EXPECT_THROW(validate_submit_args({args}), std::invalid_argument);
 }
 
+TEST(ChildMemory, MailboxDecodeRejectsReservedByteAndPreservesMappingAndTransfer) {
+    Tensor tensor = make_wire_tensor(1, AddressSpace::HOST);
+    tensor.mapping_ref = 2;
+    TaskArgs args;
+    args.add_tensor(tensor, TensorArgType::INPUT, TensorTransfer::NONE);
+    std::vector<uint8_t> blob(task_args_blob_size(args));
+    write_blob(blob.data(), args);
+    const auto view = read_blob(blob.data(), blob.size());
+    ASSERT_EQ(view.tensors(0)._reserved, 0);
+    EXPECT_EQ(view.tensors(0).mapping_ref, 2);
+    EXPECT_EQ(view.transfer(0), TensorTransfer::NONE);
+
+    for (const uint8_t reserved : {uint8_t{1}, uint8_t{255}}) {
+        blob[TASK_ARGS_BLOB_HEADER_SIZE + offsetof(Tensor, _reserved)] = reserved;
+        EXPECT_THROW(view.tensors(0), std::invalid_argument);
+        EXPECT_THROW(view.transfer(0), std::invalid_argument);
+    }
+    blob[TASK_ARGS_BLOB_HEADER_SIZE + offsetof(Tensor, _reserved)] = 0;
+    blob[TASK_ARGS_BLOB_HEADER_SIZE + TASK_ARG_TRANSFER_OFFSET] = static_cast<uint8_t>(TensorTransfer::H2D);
+    EXPECT_EQ(view.tensors(0).mapping_ref, 2);
+    EXPECT_THROW(view.transfer(0), std::invalid_argument);
+}
+
 TEST(ChildMemory, ReusingAnOwnedViewAcrossGrowthPreservesEachRequest) {
     TaskArgs args;
     args.add_tensor(make_wire_tensor(1, AddressSpace::HOST));
