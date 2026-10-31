@@ -10,6 +10,8 @@
 
 import logging
 
+import pytest
+
 from simpler_setup.toolchain import Toolchain
 
 
@@ -91,3 +93,39 @@ def test_instance_cache_is_scoped_by_sanitizer_configuration(monkeypatch):
     assert plain is not sanitized
     assert plain.host_target.toolchain.cxx_path == "g++"
     assert sanitized.host_target.toolchain.cxx_path == "g++-15"
+
+
+@pytest.mark.parametrize("budget, expected", [("2", 2), ("128", 32), (None, 32), ("", 32)])
+def test_build_respects_configured_job_budget(tmp_path, monkeypatch, budget, expected):
+    from simpler_setup import runtime_build_budget, runtime_compiler  # noqa: PLC0415
+
+    monkeypatch.setattr(runtime_build_budget.multiprocessing, "cpu_count", lambda: 64)
+    if budget is None:
+        monkeypatch.delenv("CMAKE_BUILD_PARALLEL_LEVEL", raising=False)
+    else:
+        monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", budget)
+    compiler = runtime_compiler.RuntimeCompiler.__new__(runtime_compiler.RuntimeCompiler)
+    binary = tmp_path / "libtest.so"
+    binary.touch()
+    calls = []
+    monkeypatch.setattr(compiler, "_run_build_step", lambda cmd, *_: calls.append(cmd))
+
+    compiler._run_compilation(str(tmp_path), [], binary.name, build_dir=str(tmp_path))
+
+    build = calls[-1]
+    assert build[build.index("--parallel") + 1] == str(expected)
+
+
+@pytest.mark.parametrize("budget", ["0", "-1", "invalid"])
+def test_invalid_build_job_budget_fails_before_launch(tmp_path, monkeypatch, budget):
+    from simpler_setup import runtime_compiler  # noqa: PLC0415
+
+    monkeypatch.setenv("CMAKE_BUILD_PARALLEL_LEVEL", budget)
+    compiler = runtime_compiler.RuntimeCompiler.__new__(runtime_compiler.RuntimeCompiler)
+    calls = []
+    monkeypatch.setattr(compiler, "_run_build_step", lambda *args: calls.append(args))
+
+    with pytest.raises(ValueError, match="CMAKE_BUILD_PARALLEL_LEVEL"):
+        compiler._run_compilation(str(tmp_path), [], "libtest.so", build_dir=str(tmp_path))
+
+    assert calls == []

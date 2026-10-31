@@ -166,6 +166,19 @@ CANN code), see [aicore-kernel-programming.md](aicore-kernel-programming.md).
 
 ## Build Workflow
 
+Runtime CMake builds respect a positive `CMAKE_BUILD_PARALLEL_LEVEL`, capped
+at the existing CPU-count/32-job limit. Within one runtime prebuild invocation,
+concurrent platform/runtime variants and their targets share that job budget;
+their individual `--parallel` allocations cannot multiply the configured limit.
+Unset or empty values preserve parallel runtime/target builds and the existing
+per-CMake limit, avoiding a default full-build slowdown on larger machines.
+For a CPU-constrained CI runner, set `CMAKE_BUILD_PARALLEL_LEVEL=2` before
+installing the package. Nonempty invalid runtime limits fail before launching
+CMake. This is not a machine-wide limit across separate build processes or the
+outer package build. JIT kernel compilation uses the separate compiler pool;
+see [Lock-free kernel warm-up](testing.md#lock-free-kernel-warm-up) for
+`--compile-workers`.
+
 ### Initial setup
 
 ```bash
