@@ -11,6 +11,7 @@
 
 import copy
 import importlib.util
+import os
 import sys
 from pathlib import Path
 
@@ -446,3 +447,78 @@ def test_failed_output_checks_return_writes_and_untouched_successor(native, corr
         records[0, 14] = 1
     with pytest.raises(AssertionError):
         native._check_output(values, 1, 1, 3, failed=True)
+
+
+@pytest.mark.parametrize("recovery", (False, True))
+def test_unexpected_healthy_failure_preserves_error_and_closes_worker(native, monkeypatch, tmp_path, recovery):
+    class FailingWorker:
+        closed = False
+
+        def __init__(self, **kwargs):
+            pass
+
+        def register(self, callable_obj):
+            return object()
+
+        def init(self):
+            pass
+
+        def malloc(self, size):
+            return object()
+
+        scheduler_mode_publish_count = 0
+
+        def run(self, *args):
+            raise RuntimeError("unexpected healthy-pass timeout")
+
+        def free(self, buffer):
+            pytest.fail("failed run still borrows the buffer")
+
+        def close(self):
+            FailingWorker.closed = True
+
+    monkeypatch.setattr(native, "Worker", FailingWorker)
+    monkeypatch.setattr(native, "_compile", lambda platform: object())
+    monkeypatch.setattr(native, "_args", lambda *args: object())
+    with pytest.raises(RuntimeError, match="unexpected healthy-pass timeout"):
+        native._run_pass("a5sim", 0, tmp_path, 7, 0, 257, 2500, recovery=recovery)
+    assert FailingWorker.closed
+
+
+@pytest.mark.parametrize("platform", ("a5sim", "a5"))
+@pytest.mark.parametrize("stall_ms", (2500, -1))
+def test_failure_budget_keeps_simulation_headroom_and_fault_injection(
+    native, monkeypatch, tmp_path, platform, stall_ms
+):
+    calls = []
+
+    def run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *args, **kwargs):
+        calls.append((int(os.environ["SIMPLER_SCHEDULER_TIMEOUT_MS"]), stall_ms))
+        return []
+
+    monkeypatch.setattr(native, "_ROOT", tmp_path)
+    monkeypatch.setattr(native, "_run_pass", run_pass)
+    monkeypatch.setattr(native, "_recovery_pass", run_pass)
+    native._exercise_failure(platform, [0], 7, 0, 257, monkeypatch, stall_ms)
+    assert len(calls) == 2 and calls[0] == calls[1]
+    timeout_ms, duration = calls[0]
+    if platform == "a5sim":
+        assert timeout_ms >= 10000
+    else:
+        assert timeout_ms == 2000
+    if stall_ms < 0:
+        assert duration == -1
+    else:
+        assert duration >= timeout_ms * 5 // 4
+
+
+def test_failed_capture_checks_the_actual_injected_stall(native):
+    raw = _capture()
+    execution = raw["aicore_protocol"]["executions"][0]
+    execution["returned"][0] = 12_500_000_100
+    execution["visible"][0] = 12_500_000_101
+    raw["aicpu_lifecycle_records"][0]["exit_wait_end_cycles"] = 12_500_000_200
+    native._check_failed_capture(raw, 2, 3, 0, stall_ms=12500)
+    execution["returned"][0] -= 1
+    with pytest.raises(AssertionError):
+        native._check_failed_capture(raw, 2, 3, 0, stall_ms=12500)

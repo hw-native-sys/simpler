@@ -31,6 +31,7 @@ _ROOT = Path(__file__).resolve().parents[5]
 _KERNELS = _ROOT / "tests/fdwic/pa_hbg/spmd/kernels"
 _STALL_MS = 2500
 _TIMEOUT_MS = 2000
+_SIM_TIMEOUT_MS = 10000
 _SHAPES = [(mask, lane) for mask in (1, 2, 4, 3, 5, 6, 7) for lane in range(3) if mask & (1 << lane)]
 _TICKET_SHAPES = ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2))
 # The exhaustive mask/lane sweep is about silicon behaviour, and each case here
@@ -149,7 +150,7 @@ def _check_output(values, capacity, blocks, mask, *, failed):
     torch.testing.assert_close(values[1], summary, rtol=0, atol=0)
 
 
-def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False):
+def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_ms=_STALL_MS):
     protocol = raw["aicore_protocol"]
     assert protocol["producer"] == "aicore"
     assert protocol["scheduler_error"] == 10
@@ -187,7 +188,7 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False):
         assert all(worker["finished"] == 2 for worker in protocol["workers"])
         assert 0 < execution["entry"][1] < execution["returned"][1] < execution["visible"][1]
         assert execution["entry"][0] <= execution["returned"][0] <= execution["visible"][0]
-        assert execution["returned"][0] - execution["entry"][0] >= _STALL_MS * frequency // 1000
+        assert execution["returned"][0] - execution["entry"][0] >= stall_ms * frequency // 1000
     lifecycle = raw["aicpu_lifecycle_records"]
     assert len(lifecycle) == 2
     assert {record["aicpu_thread_id"] for record in lifecycle} == {0, 1}
@@ -338,6 +339,7 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
     )
     buffers = []
     failed = False
+    run_in_flight = False
     evidence = []
     try:
         handle = worker.register(callable_obj)
@@ -356,6 +358,7 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
             config.output_prefix = str(prefix)
             before = worker.scheduler_mode_publish_count
             started = time.monotonic()
+            run_in_flight = True
             if duration:
                 failed = True
                 codes = r"(-100|507(046|018|000))" if nonreturning else "-100"
@@ -363,8 +366,9 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
                     worker.run(handle, args, config)
             else:
                 worker.run(handle, args, config)
+                run_in_flight = False
             elapsed = time.monotonic() - started
-            assert elapsed < 20
+            assert elapsed < (60 if platform.endswith("sim") else 20)
             assert worker.scheduler_mode_publish_count > before
             assert worker.scheduler_runtime_mode in (1, 2)
             path, raw = _capture(prefix)
@@ -381,7 +385,7 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
             _check_two_wave_topology(raw["aicore_protocol"], launched, mask, two_wave)
             if failed:
                 assert raw["aicore_protocol"]["run_epoch"] > evidence[-1]["run_epoch"]
-                _check_failed_capture(raw, launched, mask, lane, nonreturning=nonreturning)
+                _check_failed_capture(raw, launched, mask, lane, nonreturning=nonreturning, stall_ms=stall_ms)
                 if not nonreturning:
                     assert values[0].view(-1, 16)[lane, 0] == 1
                 rejected_count = worker.scheduler_mode_publish_count
@@ -409,15 +413,17 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
                 }
             )
     finally:
-        if not failed:
-            for buffer in buffers:
-                worker.free(buffer)
-        closing = time.monotonic()
-        worker.close()
-        close_elapsed = time.monotonic() - closing
-        assert close_elapsed < (60 if nonreturning and failed else 20)
-        if evidence:
-            evidence[-1]["worker_close_seconds"] = close_elapsed
+        try:
+            if not failed and not run_in_flight:
+                for buffer in buffers:
+                    worker.free(buffer)
+        finally:
+            closing = time.monotonic()
+            worker.close()
+            close_elapsed = time.monotonic() - closing
+            assert close_elapsed < (60 if nonreturning and failed else 20)
+            if evidence:
+                evidence[-1]["worker_close_seconds"] = close_elapsed
     return evidence
 
 
@@ -461,7 +467,12 @@ def _recovery_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms,
 
 
 def _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatch, stall_ms, *, two_wave=False):
-    monkeypatch.setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", str(_TIMEOUT_MS))
+    # A simulator's watchdog includes host scheduling delays in healthy and
+    # recovery passes. The bounded fault must outlast that budget.
+    timeout_ms = _SIM_TIMEOUT_MS if st_platform.endswith("sim") else _TIMEOUT_MS
+    if stall_ms > 0:
+        stall_ms = stall_ms * timeout_ms // _TIMEOUT_MS
+    monkeypatch.setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", str(timeout_ms))
     failure_kind = "nonreturning" if stall_ms < 0 else "bounded"
     output_root = _ROOT / "outputs"
     output_root.mkdir(exist_ok=True)

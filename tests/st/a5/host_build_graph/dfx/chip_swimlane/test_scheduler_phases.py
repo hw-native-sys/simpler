@@ -172,7 +172,8 @@ class TestSchedulerPhases(SceneTestCase):
                 assert all("runtime" not in stream for stream in streams)
                 assert all(stream["capture"]["dropped"] == 0 for stream in streams)
                 emitted_kinds = {record["kind"] for stream in streams for record in stream["records"]}
-                required_kinds = {"bootstrap", "state_probe", "dispatch", "complete", "resolve", "refill", "idle"}
+                # Ready Inbox tasks can all be launched through worksteal.
+                required_kinds = {"bootstrap", "state_probe", "complete", "resolve", "refill", "idle"}
                 assert required_kinds <= emitted_kinds, (
                     f"missing Scheduler kinds: {sorted(required_kinds - emitted_kinds)}"
                 )
