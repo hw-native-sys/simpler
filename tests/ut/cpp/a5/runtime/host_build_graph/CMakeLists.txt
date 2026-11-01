@@ -109,4 +109,17 @@ a5_hbg_case(test_hbg_resident_late_aicore_error.cpp
     COMPILE_OPTIONS -ffunction-sections -fdata-sections
     LINK_OPTIONS    ${_gc_link_option})
 
+a5_hbg_case(test_hbg_resident_entry_result.cpp TIMEOUT 30
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu
+    SOURCES
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu/aicore_lifecycle.cpp
+        ${HBG_COMMON_SHARED_DIR}/runtime.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/aicpu_device_config.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_phase_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/sim/aicpu/platform_aicpu_affinity.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/chip_swimlane_collector_aicpu.cpp
+        ${SIMPLER_SRC}/a5/platform/shared/aicpu/pmu_collector_aicpu.cpp
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_gc_link_option})
+
 simpler_ut_glob_cases(a5_hbg_case)
