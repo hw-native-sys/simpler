@@ -42,6 +42,7 @@ jobs:
       - name: Load network1 machine config
         run: |
           set -euo pipefail
+          date +%s > "$RUNNER_TEMP/network1-job-start"
 
           # The runner root holds .env and sits two levels above
           # RUNNER_WORKSPACE (<root>/_work/<repo>). NETWORK1_ENV_FILE overrides the

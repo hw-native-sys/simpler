@@ -118,8 +118,8 @@ Its body splits by what is per-run and what is per-pytest session:
 | Action | Called | What it does |
 | ------ | ------ | ------------ |
 | `network1-stage` | once | rsync this run's tree onto the peer and build it there |
-| `network1-run-pytest` | once | start the peer's L3 daemon, set the network1 pytest environment, run `pytest examples tests/st --level 4`, stop the daemon and pull its logs |
-| `network1-teardown` | once, `if: always()` | remove the run's tree from the peer |
+| `network1-run-pytest` | once | reserve both device sets, start the peer daemon, run pytest, drain both hosts, release their reservations and copy logs |
+| `network1-teardown` | once, `if: always()` | remove the peer tree only after verified retirement and log collection |
 
 Staging and the peer-side build are the job's whole cost, and every network1 test
 runs against that same tree and venv, so they happen once. The pytest command
@@ -134,6 +134,50 @@ Parent-side `ASCEND_PROCESS_LOG_PATH` is split per pytest nodeid by
 The directory is uploaded on a best-effort basis: artifact-service failures are
 ignored so they cannot override the `network1` test result. Preserve relevant
 diagnostics in the inline job log as well when investigating a failure.
+
+Both hosts require `task-submit`; configured device lists do not reserve cards.
+The coordinator acquires hosts in a common machine-ID order and waits for the
+first actual grant before requesting the second. One queue deadline covers both
+acquisitions. Daemon readiness and pytest execution have separate deadlines after
+both grants; readiness requires the managed daemon's live PID to own the configured
+IPv4 listening socket. A foreign listener is neither accepted nor killed.
+
+The first workflow step records this job's start before staging and builds.
+The coordinator fits queue waiting, the configured readiness/run deadlines, two
+120-second cleanup phases, bounded configuration commands and a 120-second finalization margin into the remaining
+60-minute job budget. It refuses before submission if insufficient time remains.
+Holder execution limits include time spent waiting for the other host.
+
+MPI interpreter launchers admit ranks under their own host's reservation and
+inherit its exact task identity. Cleanup closes both launch gates, drains owned
+processes and diagnostics on both hosts while both reservations remain held,
+then permits release and confirms both task statuses terminal. Pending cancellation
+is rechecked for a racing grant. SSH exit and a `--kill` acknowledgement do not
+prove release. Unreachable hosts or unproved cleanup retain staging and task IDs;
+the finite queue watchdog is a fallback, not evidence of a complete pair drain.
+
+Each host stamps admission with its own monotonic clock and Linux boot ID during
+configuration. A worker granted after that bounded queue/configuration window,
+or after a host reboot, records rejection and exits before granting work or
+running diagnostics. A killed coordinator can still leave a queued entry, but a
+late grant cannot start stale work or hold the devices for the full run budget.
+An already granted pair with unproved cleanup remains subject to the finite
+watchdog and is reported as unknown, rather than successfully retired.
+
+The host helper requires Linux `/proc`, `pidfd_open` and `pidfd_send_signal`.
+Unprivileged holders scan their effective UID; root holders also cover ordinary
+SSH-launched ranks. Descendants must not change credentials or hide their process
+identity. A process born before the holder cannot be this job's newly launched
+work; equal birth ticks remain candidates. Unreadable potential work born at or
+after that boundary fails closed, including unrelated protected processes whose
+ownership cannot be excluded. Such host configurations require investigation.
+The coordinator records queue version/list diagnostics outside the holders;
+`task-submit` rejects even read-only CLI calls from inside a granted task.
+After-drain queue queries use the remaining cleanup-phase budget and cannot
+prevent release of a pair already proved drained. The holders record `npu-smi`
+and OS process snapshots while holding their reservations. Reservation timelines,
+exact task IDs, raw work logs and all diagnostic command statuses are retained
+under `reservations/`.
 
 Writing an example — the files, the entry module, the `run(...)` entry point,
 the `test_*.py` network1 wrapper, and the manual `run_parent.sh` — is covered in

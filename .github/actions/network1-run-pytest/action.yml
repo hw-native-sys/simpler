@@ -1,8 +1,7 @@
 name: Run network1 pytest across the pair
 description: >-
-  Start the peer's L3 daemon, run network1-marked pytest against it, then stop the
-  daemon and pull its logs back. network1-stage has already put the tree and venv on
-  the peer.
+  Reserve both hosts through task-submit, run the peer daemon and local pytest,
+  drain owned processes, and retain queue, device, process and failure logs.
 
 inputs:
   pytest-args:
@@ -12,130 +11,19 @@ inputs:
 runs:
   using: composite
   steps:
-    # The daemon must outlive this step, so its ssh is backgrounded with its
-    # output redirected to a file. The pid goes to a file because the collect
-    # step below cannot inherit a shell variable. python3, not the venv's
-    # python: this poll only needs the stdlib and the venv is not activated.
-    - name: Start the peer's L3 daemon
-      shell: bash
-      working-directory: ${{ github.workspace }}
-      run: |
-        set -euo pipefail
-        source "$NETWORK1_SSH_HELPER"
-        DAEMON_PORT="$NETWORK1_L3_DAEMON_PORT"
-        LOCAL_LOGS="$RUN_DIR/pytest/daemon-${NETWORK1_REMOTE_MACHINE}"
-        REMOTE_LOGS="output/network1-ci/pytest/daemon-${NETWORK1_REMOTE_MACHINE}"
-        mkdir -p "$LOCAL_LOGS" "$RUN_DIR/pytest/parent-${NETWORK1_MACHINE}/ascend"
-        {
-          echo "NETWORK1_REMOTE_ENDPOINT=${REMOTE_DAEMON_HOST}:${DAEMON_PORT}"
-          echo "NETWORK1_PYTEST_REMOTE_LOGS=$REMOTE_LOGS"
-        } >> "$GITHUB_ENV"
-
-        network1_ssh "
-          pkill -f 'python -m simpler.remote_l3_worker --host ${REMOTE_DAEMON_HOST} --port ${DAEMON_PORT}' || true
-        " || true
-
-        network1_ssh "
-          set -eo pipefail
-          cd '$REMOTE_WORKDIR'
-          export PYTHONPATH=\"\${PYTHONPATH:-}\"
-          export CMAKE_PREFIX_PATH=\"\${CMAKE_PREFIX_PATH:-}\"
-          source '$NETWORK1_REMOTE_CANN_ENV'
-          set -u
-          source .venv/bin/activate
-          export SIMPLER_SCHEDULER_TIMEOUT_MS='$SIMPLER_SCHEDULER_TIMEOUT_MS'
-          export SIMPLER_OP_EXECUTE_TIMEOUT_US='$SIMPLER_OP_EXECUTE_TIMEOUT_US'
-          export SIMPLER_STREAM_SYNC_TIMEOUT_MS='$SIMPLER_STREAM_SYNC_TIMEOUT_MS'
-          mkdir -p '$REMOTE_LOGS'
-          export ASCEND_PROCESS_LOG_PATH=\"\$PWD/$REMOTE_LOGS\"
-          echo '[network1-daemon] machine${NETWORK1_REMOTE_MACHINE} listening on ${REMOTE_DAEMON_HOST}:${DAEMON_PORT}'
-          python -m simpler.remote_l3_worker --host '${REMOTE_DAEMON_HOST}' --port '${DAEMON_PORT}'
-        " > "$LOCAL_LOGS/daemon.ssh.log" 2>&1 &
-        echo $! > "$RUNNER_TEMP/network1-daemon-pytest.pid"
-
-        # A daemon that dies during import never opens the port, so on its own
-        # the connect probe only reports that after the full wait. The ssh
-        # process exits with it, so its absence is the earlier and more precise
-        # signal, and it can name the log holding the reason.
-        python3 - <<PYWAIT
-        import os
-        import socket
-        import sys
-        import time
-
-        ssh_pid = int(open("$RUNNER_TEMP/network1-daemon-pytest.pid").read().strip())
-
-        def ssh_alive():
-            try:
-                os.kill(ssh_pid, 0)
-            except ProcessLookupError:
-                return False
-            try:
-                with open(f"/proc/{ssh_pid}/stat") as stat:
-                    return stat.read().rsplit(") ", 1)[1].split(" ", 1)[0] != "Z"
-            except OSError:
-                return False
-
-        deadline = time.time() + ${NETWORK1_DAEMON_WAIT_S}
-        while time.time() < deadline:
-            if not ssh_alive():
-                print(
-                    "remote daemon ssh exited before the port opened; "
-                    "see $LOCAL_LOGS/daemon.ssh.log",
-                    file=sys.stderr,
-                )
-                sys.exit(1)
-            try:
-                with socket.create_connection(("${REMOTE_DAEMON_HOST}", ${DAEMON_PORT}), timeout=2):
-                    sys.exit(0)
-            except OSError:
-                time.sleep(1)
-        print("remote daemon did not become reachable", file=sys.stderr)
-        sys.exit(1)
-        PYWAIT
-
-    - name: Run network1 pytest
+    - name: Reserve both hosts and run network1 pytest
       shell: bash
       working-directory: ${{ github.workspace }}
       env:
         PYTEST_ARGS: ${{ inputs.pytest-args }}
       run: |
-        set -eo pipefail
-        export PYTHONPATH="${PYTHONPATH:-}"
-        export CMAKE_PREFIX_PATH="${CMAKE_PREFIX_PATH:-}"
-        source "$NETWORK1_CANN_ENV"
-        source .venv/bin/activate
-        set -u
-        mkdir -p "$RUN_DIR/pytest/parent-${NETWORK1_MACHINE}/ascend"
-        timeout "${NETWORK1_SMOKE_TIMEOUT_S}s" python -m pytest $PYTEST_ARGS
+        set -euo pipefail
+        python3 .github/actions/network1-run-pytest/run.py run
 
-    # Runs even when pytest failed, since a device-side failure names its reason
-    # only in the daemon or ASCEND logs. The staging tree itself stays for
-    # network1-teardown.
-    - name: Stop the daemon and collect peer logs
+    - name: Confirm retirement and collect peer logs
       if: always()
       shell: bash
       working-directory: ${{ github.workspace }}
       run: |
-        set +e
-        [ -r "${NETWORK1_SSH_HELPER:-}" ] || exit 0
-        source "$NETWORK1_SSH_HELPER"
-
-        PID_FILE="$RUNNER_TEMP/network1-daemon-pytest.pid"
-        if [ -r "$PID_FILE" ]; then
-          kill "$(cat "$PID_FILE")" 2>/dev/null
-          rm -f "$PID_FILE"
-        fi
-        DAEMON_PORT="${NETWORK1_L3_DAEMON_PORT:-19073}"
-        network1_ssh "
-          pkill -f 'python -m simpler.remote_l3_worker --host ${REMOTE_DAEMON_HOST} --port ${DAEMON_PORT}' || true
-          for _ in \$(seq 1 20); do
-            pgrep -f 'python -m simpler.remote_l3_worker --host ${REMOTE_DAEMON_HOST} --port ${DAEMON_PORT}' >/dev/null || break
-            sleep 0.5
-          done
-        "
-        mkdir -p "$RUN_DIR/pytest/daemon-${NETWORK1_REMOTE_MACHINE}"
-        rsync -a -e "$RSYNC_SSH" \
-          "$REMOTE_TARGET:$REMOTE_WORKDIR/${NETWORK1_PYTEST_REMOTE_LOGS:-output/network1-ci/pytest/daemon-${NETWORK1_REMOTE_MACHINE}}/" \
-          "$RUN_DIR/pytest/daemon-${NETWORK1_REMOTE_MACHINE}/" 2>/dev/null
-        exit 0
+        set -euo pipefail
+        python3 .github/actions/network1-run-pytest/run.py cleanup
