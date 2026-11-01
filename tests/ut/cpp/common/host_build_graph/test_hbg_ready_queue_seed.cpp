@@ -16,11 +16,13 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <vector>
 
+#include "host_build_graph/host/orchestrator.h"
 #include "host_build_graph/host/ready_queue_sizing.h"
 #include "scheduler/scheduler.h"
 #include "host_build_graph/graph_execution.h"
@@ -384,4 +386,139 @@ TEST(HbgReadyQueueSizing, FullGraphSeedPreservesTheCopiedRuntimeAndSharedMemoryT
     const auto *tail = static_cast<const uint8_t *>(arena.region_ptr(tail_offset));
     for (size_t i = 0; i < sm_tail_bytes; ++i)
         EXPECT_EQ(tail[i], 0xA5);
+}
+
+TEST(HbgReadyQueueSeed, DirtyDeviceRebindPreservesThePopulatedGraphAndExternalInout) {
+    constexpr uint64_t task_capacity = 8;
+    DeviceArena arena;
+    auto layout = runtime_reserve_layout(arena, task_capacity);
+    for (int shape = 0; shape < NUM_RESOURCE_SHAPES; ++shape) {
+        layout.sched.capacities.ready[shape] = CAPACITY;
+        layout.sched.capacities.ready_sync[shape] = CAPACITY;
+    }
+    layout.sched.capacities.dummy = CAPACITY;
+    layout.sched.capacities.graph_prepare = CAPACITY;
+    const size_t sm_bytes = SharedMemoryHandle::calculate_size(task_capacity);
+    const size_t sm_offset = arena.reserve(sm_bytes, CHIP_ALIGN_SIZE);
+    ASSERT_NE(arena.commit(), nullptr);
+    auto *sm = static_cast<uint8_t *>(arena.region_ptr(sm_offset));
+    std::memset(sm, 0, sm_bytes);
+    SharedMemoryHandle host_handle{};
+    ASSERT_TRUE(host_handle.init(sm, sm_bytes, task_capacity));
+
+    std::array<float, 16> inout{};
+    alignas(CHIP_ALIGN_SIZE) std::array<char, 4096> output_heap{};
+    uint32_t shape[] = {static_cast<uint32_t>(inout.size())};
+    auto tensor = simpler::hbg::make_tensor_external(inout.data(), shape, 1, DataType::FLOAT32);
+    OrchestratorState orch{};
+    ASSERT_TRUE(orch.init(sm, output_heap.data(), output_heap.size(), task_capacity));
+    orch.begin_scope();
+    CoreTaskArgs args;
+    args.add_inout(tensor);
+    args.add_scalar(uint64_t{73});
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+    const auto task = orch.submit_task(kernels, args);
+    ASSERT_TRUE(task.task_id().is_valid());
+    TensorCreateInfo created(shape, 1, DataType::FLOAT32);
+    CoreTaskArgs allocation;
+    allocation.add_output(created);
+    const auto hidden = orch.alloc_tensors(allocation);
+    ASSERT_TRUE(hidden.task_id().is_valid());
+    orch.end_scope();
+    auto &tasks = host_handle.header->tasks;
+    tasks.total_tasks = orch.task_allocator.active_count();
+    ASSERT_TRUE(tasks.is_completed(hidden.task_id().local_id()));
+    ASSERT_FALSE(tasks.is_completed(task.task_id().local_id()));
+
+    auto *runtime = runtime_init_data_from_layout(arena, layout, MODE_EXECUTE, sm, sm_bytes);
+    ASSERT_NE(runtime, nullptr);
+    runtime->prebuilt_layout = layout;
+    runtime_wire_arena_pointers(arena, layout, runtime);
+    auto *copied = static_cast<uint8_t *>(arena.region_ptr(layout.off_copied_begin));
+    const size_t copied_bytes = layout.off_copied_end - layout.off_copied_begin;
+    const std::vector<uint8_t> copied_image(copied, copied + copied_bytes);
+    const std::vector<uint8_t> graph_image(sm, sm + sm_bytes);
+    const auto heap_image = output_heap;
+    auto *slot = &tasks.get_slot_state_by_task_id(task.task_id().local_id());
+
+    for (int round = 0; round < 3; ++round) {
+        SCOPED_TRACE(round);
+        inout.fill(static_cast<float>(round + 11));
+        const auto inout_before = inout;
+        // This prefix has no uploaded image. The middle round inherits actual
+        // queued work and a held async lock; the others model allocator bytes.
+        if (round != 1) std::memset(arena.base(), 0xA5 + round, layout.off_copied_begin);
+        runtime_wire_arena_pointers(arena, layout, runtime);
+        std::memset(runtime->sm_handle, 0, sizeof(*runtime->sm_handle));
+        ASSERT_TRUE(runtime->sm_handle->attach_populated(sm, sm_bytes, task_capacity, task_capacity, sm_bytes));
+        auto &scheduler = *runtime->scheduler;
+        ASSERT_TRUE(scheduler.init_data_from_layout(layout.sched, arena, sm));
+        scheduler.seed_queue_slots();
+        runtime->aicore_mailbox->init_empty();
+
+        ASSERT_EQ(std::memcmp(copied, copied_image.data(), copied_bytes), 0);
+        ASSERT_EQ(std::memcmp(sm, graph_image.data(), sm_bytes), 0);
+        EXPECT_TRUE(tasks.is_completed(hidden.task_id().local_id()));
+        EXPECT_FALSE(tasks.is_completed(task.task_id().local_id()));
+        EXPECT_EQ(
+            tasks.storage_at(task.task_id().local_id()).payload.tensor_data()[0].buffer.addr,
+            reinterpret_cast<uint64_t>(inout.data())
+        );
+        EXPECT_EQ(inout, inout_before);
+        EXPECT_EQ(output_heap, heap_image);
+        EXPECT_EQ(scheduler.async_wait_list.count, 0);
+        EXPECT_EQ(scheduler.async_wait_list.mpsc_skipped_count.load(), 0u);
+        ASSERT_TRUE(scheduler.async_wait_list.try_lock());
+        scheduler.async_wait_list.unlock();
+        AICoreCompletionMsgView message{};
+        EXPECT_FALSE(runtime->aicore_mailbox->try_pop(message));
+        ASSERT_TRUE(runtime->aicore_mailbox->try_push_normal_done(task.task_id(), reinterpret_cast<uint64_t>(slot)));
+        ASSERT_TRUE(runtime->aicore_mailbox->try_pop(message));
+        EXPECT_EQ(message.task_token, task.task_id());
+
+        std::vector<ChipReadyQueue *> queues;
+        for (int resource = 0; resource < NUM_RESOURCE_SHAPES; ++resource) {
+            queues.push_back(&scheduler.ready_queues[resource]);
+            queues.push_back(&scheduler.ready_sync_queues[resource]);
+            queues.push_back(&scheduler.early_dispatch_queues[resource]);
+        }
+        queues.push_back(&scheduler.dummy_ready_queue);
+        queues.push_back(&scheduler.graph_prepare_queue);
+        queues.push_back(&scheduler.early_sync_start_queue);
+        queues.push_back(&scheduler.ed_publish_drain_queue);
+        for (size_t index = 0; index < queues.size(); ++index) {
+            const auto begin = reinterpret_cast<uintptr_t>(queues[index]->slots);
+            const auto end = begin + queues[index]->capacity * sizeof(ChipReadyQueueSlot);
+            for (size_t other = 0; other < index; ++other) {
+                const auto other_begin = reinterpret_cast<uintptr_t>(queues[other]->slots);
+                const auto other_end = other_begin + queues[other]->capacity * sizeof(ChipReadyQueueSlot);
+                ASSERT_TRUE(end <= other_begin || other_end <= begin) << index << " overlaps " << other;
+            }
+        }
+        for (size_t index = 0; index < queues.size(); ++index) {
+            SCOPED_TRACE(index);
+            auto &queue = *queues[index];
+            for (uint64_t position = 0; position < CAPACITY; ++position)
+                ASSERT_TRUE(queue.push(slot)) << position;
+        }
+        // Every queue is occupied simultaneously: aliased slot arrays cannot
+        // pass by having their contents drained before the next queue runs.
+        for (size_t index = 0; index < queues.size(); ++index) {
+            SCOPED_TRACE(index);
+            auto &queue = *queues[index];
+            for (uint64_t position = 0; position < CAPACITY; ++position)
+                ASSERT_EQ(queue.pop(), slot) << position;
+            ASSERT_EQ(queue.pop(), nullptr);
+            // A predecessor need not have left a drained queue or async list.
+            ASSERT_TRUE(queue.push(slot));
+        }
+        scheduler.async_wait_list.count = 2;
+        ASSERT_TRUE(scheduler.async_wait_list.try_lock());
+        ASSERT_TRUE(runtime->aicore_mailbox->try_push_normal_done(task.task_id(), reinterpret_cast<uint64_t>(slot)));
+        EXPECT_EQ(std::memcmp(copied, copied_image.data(), copied_bytes), 0);
+        EXPECT_EQ(std::memcmp(sm, graph_image.data(), sm_bytes), 0);
+        EXPECT_EQ(inout, inout_before);
+        EXPECT_EQ(output_heap, heap_image);
+    }
 }

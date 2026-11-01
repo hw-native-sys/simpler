@@ -22,19 +22,36 @@ from pathlib import Path
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
+_A5_LEGACY_GRAPH = 3
 
 
 @pytest.mark.requires_hardware
-@pytest.mark.platforms(["a2a3"])
-@pytest.mark.parametrize("runtime", ["tensormap_and_ringbuffer", "host_build_graph"])
+@pytest.mark.platforms(["a2a3", "a5"])
+@pytest.mark.parametrize(
+    ("runtime", "error_origin"),
+    [
+        ("tensormap_and_ringbuffer", "aicpu"),
+        ("tensormap_and_ringbuffer", "aicore"),
+        ("host_build_graph", "aicore"),
+    ],
+)
 @pytest.mark.parametrize("failure", [False, True], ids=["success", "reported-error"])
-def test_kernel_error_reaches_caller_stream(runtime, failure, request, tmp_path):
+def test_kernel_error_reaches_caller_stream(runtime, error_origin, failure, request, tmp_path):
     arch = request.config.getoption("--platform")
     device = str(request.config.getoption("--device")).split("-")[0].split(",")[0]
     logs = tmp_path / "ascend"
     logs.mkdir()
     result = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), arch, runtime, device, str(int(failure)), str(tmp_path)],
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            arch,
+            runtime,
+            error_origin,
+            device,
+            str(int(failure)),
+            str(tmp_path),
+        ],
         capture_output=True,
         text=True,
         timeout=120,
@@ -51,12 +68,18 @@ def test_kernel_error_reaches_caller_stream(runtime, failure, request, tmp_path)
     assert len(records) == 1, result.stdout + result.stderr
     observed = json.loads(records[0])
     assert observed["runtime"] == runtime
+    assert observed["error_origin"] == error_origin
     assert observed["failure"] is failure
     assert observed["peek_before"] == 0, observed
     assert observed["caller_sync_rc"] == (507018 if failure else 0), observed
+    if error_origin == "aicore" and not failure:
+        assert observed["output_marker"] == 42, observed
+    if arch == "a5" and runtime == "host_build_graph":
+        assert observed["scheduler_runtime_mode"] == _A5_LEGACY_GRAPH, observed
+        assert observed["scheduler_mode_publish_count"] > 0, observed
 
 
-def _callable(arch, runtime, failure, output):
+def _callable(arch, runtime, error_origin, failure, output):
     from simpler.task_interface import ArgDirection, ChipCallable, CoreCallable  # noqa: PLC0415
 
     from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
@@ -67,12 +90,15 @@ def _callable(arch, runtime, failure, output):
     children = []
     signature = []
     kernel_source = None
-    if runtime == "host_build_graph":
-        source = Path(__file__).with_name("support") / "kernel_stream_graph.cpp"
+    kernel_binary = None
+    if error_origin == "aicore":
+        source = Path(__file__).with_name("support") / (
+            "kernel_stream_graph.cpp" if runtime == "host_build_graph" else "kernel_stream_task.cpp"
+        )
         kernel_source = (
-            _ROOT
-            / "tests/st/runtime_fatal_codes/kernels/aiv"
-            / ("kernel_async_completion_invalid.cpp" if failure else "kernel_noop.cpp")
+            _ROOT / "tests/st/runtime_fatal_codes/kernels/aiv" / "kernel_async_completion_invalid.cpp"
+            if failure
+            else Path(__file__).with_name("support") / "kernel_stream_output.cpp"
         )
         kernel = compiler.compile_incore(
             source_path=str(kernel_source),
@@ -81,7 +107,8 @@ def _callable(arch, runtime, failure, output):
             extra_include_dirs=list(compiler.get_orchestration_include_dirs(runtime)) + [str(_ROOT / "src/common")],
         )
         signature = [ArgDirection.INOUT]
-        children = [(0, CoreCallable.build(signature=signature, binary=extract_text_section(kernel)))]
+        kernel_binary = extract_text_section(kernel)
+        children = [(0, CoreCallable.build(signature=signature, binary=kernel_binary))]
     else:
         source = (
             _ROOT / "tests/st/automatic_reported_fatal.cpp"
@@ -96,12 +123,17 @@ def _callable(arch, runtime, failure, output):
         "fixture_sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
         "orchestration_sha256": hashlib.sha256(binary).hexdigest(),
     }
+    hashes["callable_image_sha256"] = hashlib.sha256(
+        ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
+    ).hexdigest()
     if kernel_source is not None:
+        assert kernel_binary is not None
         hashes["kernel_fixture_sha256"] = hashlib.sha256(kernel_source.read_bytes()).hexdigest()
+        hashes["core_binary_sha256"] = hashlib.sha256(kernel_binary).hexdigest()
     return chip, hashes
 
 
-def _probe(arch, runtime, device, failure, output):
+def _probe(arch, runtime, error_origin, device, failure, output):
     from simpler.task_interface import AddressSpace, ChipStorageTaskArgs, ChipTensor, DataType  # noqa: PLC0415
     from test_kernel_mode_c_api import (  # noqa: PLC0415
         CallConfig,
@@ -111,8 +143,9 @@ def _probe(arch, runtime, device, failure, output):
         _native_run_storage,
     )
 
-    chip, hashes = _callable(arch, runtime, failure, output)
+    chip, hashes = _callable(arch, runtime, error_origin, failure, output)
     image = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
+    (output / "callable.bin").write_bytes(image)
     lib = _load(arch, "onboard", runtime)
     lib.rtSetDevice.argtypes = [ctypes.c_int]
     lib.aclrtCreateStream.argtypes = [ctypes.POINTER(ctypes.c_void_p)]
@@ -134,10 +167,13 @@ def _probe(arch, runtime, device, failure, output):
     assert lib.aclrtCreateStream(ctypes.byref(caller)) == 0
     ctx = lib.create_device_context()
     device_tensor = ctypes.c_void_p()
-    if runtime == "host_build_graph":
+    if error_origin == "aicore":
         lib.aclrtMalloc.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_size_t, ctypes.c_int]
         lib.aclrtFree.argtypes = [ctypes.c_void_p]
+        lib.aclrtMemset.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_size_t]
+        lib.aclrtMemcpy.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
         assert lib.aclrtMalloc(ctypes.byref(device_tensor), 4, 0) == 0
+        assert lib.aclrtMemset(device_tensor, 4, 0, 4) == 0
     config = CallConfig()
     config.aicpu_thread_num = 2
     aicpu, aicore, dispatcher = _binaries(arch, runtime)
@@ -157,12 +193,30 @@ def _probe(arch, runtime, device, failure, output):
     assert lib.simpler_launch_run_on_stream(ctx, run, caller, None) == 0
     # This is the first execution observer: neither native wait nor finalize ran.
     peek_before = lib.aclrtPeekAtLastError(0)
+    started = time.monotonic()
     rc = lib.aclrtSynchronizeStreamWithTimeout(caller, 60000)
+    elapsed = time.monotonic() - started
+    mode = count = 0
+    if arch == "a5" and runtime == "host_build_graph":
+        lib.get_last_scheduler_runtime_mode.argtypes = [ctypes.c_void_p]
+        lib.get_last_scheduler_runtime_mode.restype = ctypes.c_uint32
+        lib.get_scheduler_mode_publish_count.argtypes = [ctypes.c_void_p]
+        lib.get_scheduler_mode_publish_count.restype = ctypes.c_size_t
+        mode = lib.get_last_scheduler_runtime_mode(ctx)
+        count = lib.get_scheduler_mode_publish_count(ctx)
+    marker = ctypes.c_int32(-1)
+    if error_origin == "aicore" and not failure and rc == 0:
+        assert lib.aclrtMemcpy(ctypes.byref(marker), 4, device_tensor, 4, 2) == 0
     print(
         "NATIVE_CALLER_STATUS "
         + json.dumps(
             {
                 "runtime": runtime,
+                "error_origin": error_origin,
+                "scheduler_runtime_mode": mode,
+                "scheduler_mode_publish_count": count,
+                "output_marker": marker.value,
+                "observer_seconds": elapsed,
                 "failure": failure,
                 "caller_sync_rc": rc,
                 "peek_before": peek_before,
@@ -186,4 +240,4 @@ def _probe(arch, runtime, device, failure, output):
 
 
 if __name__ == "__main__":
-    _probe(sys.argv[1], sys.argv[2], int(sys.argv[3]), bool(int(sys.argv[4])), Path(sys.argv[5]))
+    _probe(sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4]), bool(int(sys.argv[5])), Path(sys.argv[6]))
