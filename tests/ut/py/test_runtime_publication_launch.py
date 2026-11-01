@@ -94,6 +94,27 @@ def test_onboard_execution_contract(arch: str, runtime: str, probe: str, tmp_pat
     result = subprocess.run(run_args, capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS:" in result.stdout
+    if probe == "run_caller_launch":
+        # Each close-failure case has a fresh process. Unconfirmed resets retain
+        # the context and backing.
+        for scenario in ("reset-failure", "probe-failure", "acl-finalize-retry", "borrowed"):
+            failed_reset = subprocess.run(
+                [str(binary), scenario], capture_output=True, text=True, timeout=30, check=False
+            )
+            assert failed_reset.returncode == 0, failed_reset.stdout + failed_reset.stderr
+            expected = (
+                "standalone collector acl-finalize-retry: confirmed reset reused; original error="
+                if scenario == "acl-finalize-retry"
+                else "standalone collector borrowed: context retained, no reset"
+                if scenario == "borrowed"
+                else f"standalone collector {scenario}: unconfirmed context retained"
+            )
+            assert expected in failed_reset.stderr
+            if scenario in ("reset-failure", "probe-failure"):
+                assert (
+                    f"standalone collector {scenario}: same-runner retry confirmed; original error=-739"
+                    in failed_reset.stderr
+                )
     if probe == "runtime_timeout_configuration":
         output = result.stdout + result.stderr
         assert output.count("Configured timeout ordering warning:") == 1

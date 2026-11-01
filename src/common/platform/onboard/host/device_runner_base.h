@@ -47,6 +47,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -1842,6 +1843,9 @@ public:
      * The public entry is non-virtual; subclasses implement finalize_impl().
      */
     int finalize();
+    bool terminal_reset_confirmed() const {
+        return terminal_close_generation_.has_value() && device_health_.generation() != *terminal_close_generation_;
+    }
 
     virtual int fill_persistent_arch_fields(KernelArgs *args, uint64_t device_id) = 0;
 
@@ -2090,6 +2094,11 @@ protected:
     DeviceRunnerBase();
 
     virtual int finalize_impl() = 0;
+    void begin_fatal_close() {
+        if (!terminal_close_generation_.has_value()) terminal_close_generation_ = device_health_.generation();
+    }
+    void stop_shared_collectors_for_device_failure();
+    void abandon_shared_collectors_after_device_reset();
 
     /**
      * `DeviceArena` callback trampolines bridging from C-style
@@ -2925,6 +2934,7 @@ protected:
         uint32_t arena_bank{0};
         bool permits_prepared_successor{false};
     };
+    std::optional<uint64_t> terminal_close_generation_;
     mutable std::mutex native_run_mu_;
     RunResourceSlots<NativeRunReservation> native_run_reservations_;
     struct NativeRunClaim {

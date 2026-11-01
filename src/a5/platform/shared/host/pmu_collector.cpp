@@ -68,6 +68,19 @@ bool recycled_seed_capacity_is_sufficient(int num_cores, int thread_count, int s
 
 }  // namespace
 
+void PmuCollector::stop_for_device_failure() {
+    retained_runs_.stop_writer();
+    profiling_common::ProfilerBase<PmuCollector, PmuModule>::stop(false);
+    retained_runs_.note_unpublished_runs_abandoned();
+}
+
+void PmuCollector::abandon_after_device_reset() {
+    terminal_banks_.abandon_after_device_reset();
+    abandon_memory_after_device_reset();
+    shm_dev_ = nullptr;
+    initialized_ = false;
+}
+
 PmuCollector::~PmuCollector() {
     // The writer before the collector threads: it is the one that asks them for
     // a reference release, so joining it second could leave it waiting on

@@ -1228,14 +1228,9 @@ int DeviceRunner::finalize_impl() {
     // Stop collector threads locally, drain and force-reset the card, then
     // forget the old generation's handles.
     if (device_unusable_.load(std::memory_order_acquire)) {
-        // Its result cannot displace the device failure that brought this path
-        // here, so it is folded in below only if nothing about the device
-        // itself was reported. It is sticky in the collector's own summary
-        // either way.
-        const int fatal_collector_rc = finalize_collectors(true);
-        if (fatal_collector_rc != 0) {
-            LOG_ERROR("Fatal teardown: diagnostics collectors reported %d while being released", fatal_collector_rc);
-        }
+        begin_fatal_close();
+        stop_shared_collectors_for_device_failure();
+        dep_gen_collector_.stop_for_device_failure();
 
         // force_reset_device() drains before it resets and returns 0 only when
         // its post-reset probe confirms the card, so a second pass runs against
@@ -1251,15 +1246,15 @@ int DeviceRunner::finalize_impl() {
         // once per attempt and then report a reset that "did not confirm
         // clean", which reads as a failed reset rather than the designed
         // refusal it is.
-        const bool owns_device_reset = !execution_mode_latch().is_kernel();
-        int reset_rc = owns_device_reset ? attempt_fatal_reset(
-                                               [this]() {
-                                                   return force_reset_device();
-                                               },
-                                               sdma_provisioned ? 1 : kFatalResetAttempts
-                                           ) :
-                                           0;
-        const bool reset_confirmed = owns_device_reset && reset_rc == 0;
+        const bool owns_device_reset = execution_mode_latch().latched_mode() == SIMPLER_MODE_PROGRAM;
+        int reset_rc = owns_device_reset && !terminal_reset_confirmed() ? attempt_fatal_reset(
+                                                                              [this]() {
+                                                                                  return force_reset_device();
+                                                                              },
+                                                                              sdma_provisioned ? 1 : kFatalResetAttempts
+                                                                          ) :
+                                                                          0;
+        const bool reset_confirmed = owns_device_reset && terminal_reset_confirmed();
         if (!reset_confirmed && owns_device_reset) {
             LOG_ERROR(
                 "Fatal teardown: force reset of device %d did not confirm clean (rc=%d); "
@@ -1268,50 +1263,36 @@ int DeviceRunner::finalize_impl() {
             );
         }
 
-        // Program mode abandons resource bookkeeping after the reset attempt.
-        // Kernel mode cannot reset the borrowed device, so it retains ownership
-        // and quarantines the context permanently. Later close calls cannot
-        // release these resources.
-        int abandon_rc = 0;
-        if (owns_device_reset) {
-            abandon_rc = abandon_common_after_device_failure();
-        } else {
-            kernel_exec_state_.poison(PTO_RUNTIME_ERR_INVALID_STATE);
-        }
-        if (acl_ready_) {
-            if (reset_confirmed) {
-                int finalize_rc = aclFinalize();
-                if (finalize_rc != 0) {
-                    LOG_ERROR("aclFinalize failed during fatal finalize: %d", finalize_rc);
-                    if (abandon_rc == 0) abandon_rc = finalize_rc;
-                }
-            } else {
-                LOG_WARN("Fatal teardown: skipping aclFinalize because device reset was not confirmed");
+        if (!reset_confirmed) {
+            if (!owns_device_reset) {
+                kernel_exec_state_.poison(PTO_RUNTIME_ERR_INVALID_STATE);
+                LOG_ERROR(
+                    "Fatal teardown: kernel context on borrowed device %d quarantined — resources stay pinned for the "
+                    "process lifetime; no later close can retire them",
+                    device_id_
+                );
             }
-            acl_ready_ = false;
+            return owns_device_reset && reset_rc != 0 ? reset_rc : PTO_RUNTIME_ERR_INVALID_STATE;
+        }
+        abandon_shared_collectors_after_device_reset();
+        dep_gen_collector_.abandon_after_device_reset();
+        int abandon_rc = abandon_common_after_device_failure();
+        if (acl_ready_) {
+            const int finalize_rc = aclFinalize();
+            if (finalize_rc != 0) {
+                LOG_ERROR("aclFinalize failed during fatal finalize: %d", finalize_rc);
+                if (abandon_rc == 0) abandon_rc = finalize_rc;
+            } else {
+                acl_ready_ = false;
+            }
         }
 
-        // The quarantine is terminal: `device_unusable_` routes every later
-        // close onto this same branch, so these resources stay pinned for the
-        // process lifetime. No entry point retires them.
-        if (!owns_device_reset) {
-            LOG_ERROR(
-                "Fatal teardown: kernel context on borrowed device %d quarantined — resources stay pinned for the "
-                "process lifetime; no later close can retire them",
-                device_id_
-            );
-            return abandon_rc != 0 ? abandon_rc : PTO_RUNTIME_ERR_INVALID_STATE;
-        }
-
-        device_id_ = -1;
-        if (reset_confirmed) {
+        if (abandon_rc == 0) {
+            device_id_ = -1;
             device_unusable_.store(false, std::memory_order_release);
         }
         LOG_WARN("DeviceRunner finalized after fatal device failure");
         int fatal_rc = abandon_rc != 0 ? abandon_rc : reset_rc;
-        // Last in priority: a diagnostics failure found while releasing the
-        // collectors is reported only when the device side reported nothing.
-        if (fatal_rc == 0) fatal_rc = fatal_collector_rc;
         return fatal_rc;
     }
 

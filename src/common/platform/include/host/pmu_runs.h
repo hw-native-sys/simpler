@@ -572,6 +572,7 @@ struct Epoch {
     int cut_slot{-1};
     uint64_t cut_request{0};
     bool target_installed{false};
+    bool abandonment_recorded{false};
     std::chrono::steady_clock::time_point closed_at{};
 
     void reset_run_state(size_t shard_count) {
@@ -583,6 +584,7 @@ struct Epoch {
         cut_slot = -1;
         cut_request = 0;
         target_installed = false;
+        abandonment_recorded = false;
     }
 };
 
@@ -1184,6 +1186,21 @@ public:
         writer_.join();
     }
 
+    /** Report lost output after joins without changing retained storage ownership. */
+    void note_unpublished_runs_abandoned() {
+        for (auto &epoch : epochs_) {
+            const int state = epoch.state.load(std::memory_order_acquire);
+            if (state == static_cast<int>(EpochState::Free) || state == static_cast<int>(EpochState::Quarantined) ||
+                epoch.abandonment_recorded)
+                continue;
+            epoch.abandonment_recorded = true;
+            errors_.record(
+                epoch.epoch.load(std::memory_order_acquire), Verdict::Abandoned,
+                "the collector was torn down before this run was published"
+            );
+        }
+    }
+
     /**
      * Hand back the transport counters and the pool cap. The sticky summary is
      * logged here and **not** cleared: it belongs to the collector's whole
@@ -1201,6 +1218,7 @@ public:
         observe_transport();
         owner_.report_drain_drops();
         errors_.rebaseline_transport(0);
+        note_unpublished_runs_abandoned();
         for (size_t slot = 0; slot < epochs_.size(); slot++) {
             const int state = epochs_[slot].state.load(std::memory_order_acquire);
             if (state == static_cast<int>(EpochState::Free)) continue;
@@ -1223,11 +1241,6 @@ public:
             // never-launched rollback — has already returned its slot as `Free`
             // and is deliberately not here: it promised no file, so recording
             // one for it would make a rolled-back launch read as lost output.
-            if (state != static_cast<int>(EpochState::Quarantined)) {
-                errors_.record(
-                    run_epoch, Verdict::Abandoned, "the collector was torn down before this run was published"
-                );
-            }
             LOG_WARN(
                 "PmuCollector: run %llu storage is held until the collector threads are joined",
                 static_cast<unsigned long long>(run_epoch)

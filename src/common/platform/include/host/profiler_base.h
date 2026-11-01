@@ -1300,6 +1300,12 @@ public:
         collector_threads_.clear();
     }
 
+    /** Host readers are joined and a confirmed reset invalidated device backing. */
+    void abandon_memory_after_device_reset() {
+        manager_.release_all_owned([](void *) {});
+        clear_memory_context();
+    }
+
     Manager &manager() { return manager_; }
     const Manager &manager() const { return manager_; }
 

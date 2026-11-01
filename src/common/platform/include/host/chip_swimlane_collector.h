@@ -461,6 +461,10 @@ public:
 
     ChipSwimlaneCollector() = default;
     ~ChipSwimlaneCollector();
+    /** Join host readers without a final device drain. */
+    void stop_for_device_failure();
+    /** Forget backing only after confirmed reset and host-reader stop. */
+    void abandon_after_device_reset();
 
     ChipSwimlaneCollector(const ChipSwimlaneCollector &) = delete;
     ChipSwimlaneCollector &operator=(const ChipSwimlaneCollector &) = delete;
@@ -699,9 +703,9 @@ public:
      *
      * The order is the contract: a seal waits on the reader shards'
      * acknowledgement that they hold no reference, so the writer has to finish
-     * while those shards are still running. Idempotent, and the sole owner of
-     * the writer's lifetime — no close path joins it, and the only place it is
-     * spawned is the preparation that gives it something to seal.
+     * while those shards are still running. Idempotent; fatal shutdown also
+     * joins the writer before the readers. Preparation starts the writer when
+     * it has something to seal.
      */
     void stop() {
         stop_run_writer();

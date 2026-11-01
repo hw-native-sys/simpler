@@ -1651,6 +1651,20 @@ int DeviceRunnerBase::validate_current_context() const {
     return rc;
 }
 
+void DeviceRunnerBase::stop_shared_collectors_for_device_failure() {
+    chip_swimlane_collector_.stop_for_device_failure();
+    dump_collector_.stop_for_device_failure();
+    pmu_collector_.stop_for_device_failure();
+    scope_stats_collector_.stop_for_device_failure();
+}
+
+void DeviceRunnerBase::abandon_shared_collectors_after_device_reset() {
+    chip_swimlane_collector_.abandon_after_device_reset();
+    dump_collector_.abandon_after_device_reset();
+    pmu_collector_.abandon_after_device_reset();
+    scope_stats_collector_.abandon_after_device_reset();
+}
+
 int DeviceRunnerBase::finalize() {
     if (device_id_ == -1) return 0;
     const int rc = validate_current_context();
