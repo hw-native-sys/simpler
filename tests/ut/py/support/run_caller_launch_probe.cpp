@@ -183,7 +183,15 @@ public:
         free_tensor(device_run_result_dev_ptrs_[0]);
         device_run_result_dev_ptrs_[0] = nullptr;
     }
+    using DeviceRunnerBase::discharge_boundary_waits;
     using DeviceRunnerBase::slot_persistent_args;
+    int finish_common() { return finalize_common(); }
+    void *whole_event(const NativeRunIdentity &identity) {
+        return run_fence(identity.pipeline_slot).boundary_event(identity, RunCompletionFence::StreamRole::Aicpu);
+    }
+    int retire_boundary(const NativeRunIdentity &identity) {
+        return run_fence(identity.pipeline_slot).retire(identity);
+    }
     void prepare_diagnostics(Runtime &runtime, int level, int pmu_event_type, int dump_level = 0) {
         max_block_dim_ = 1;
         CallConfig config;
@@ -268,33 +276,97 @@ static void check(int fault, bool capturing) {
     } else {
         assert(outcome.rc == 0 && outcome.progress == LaunchProgress::Complete);
         const auto streams = outcome.active->prepared->streams;
+        assert(streams.aicpu == caller && streams.aicore != caller);
         assert(
-            (trace == std::vector<std::string>{
-                          "record", "wait", "publish", "record", "wait", "record", "core", "record", "cpu", "wait",
-                          "record", "record", "wait", "record"
-                      })
+            (trace ==
+             std::vector<std::string>{
+                 "publish", "record", "wait", "record", "core", "record", "cpu", "wait", "record", "record", "record"
+             })
         );
         assert(
             (stream_trace == std::vector<void *>{
-                                 caller, streams.aicpu, streams.aicpu, streams.aicpu, streams.aicore, streams.aicore,
-                                 streams.aicore, streams.aicore, streams.aicpu, streams.aicpu, streams.aicpu,
-                                 streams.aicpu, caller, caller
+                                 caller, caller, streams.aicore, streams.aicore, streams.aicore, streams.aicore, caller,
+                                 caller, caller, caller, caller
                              })
         );
     }
     if (!capturing && fault == 0) {
         // Each wait names its own record, not just the expected stream.
-        for (const auto edge : {std::pair{0, 1}, std::pair{3, 4}, std::pair{7, 9}, std::pair{11, 12}}) {
+        for (const auto edge : {std::pair{1, 2}, std::pair{5, 7}}) {
             assert(event_trace[edge.first] != nullptr);
             assert(event_trace[edge.first] == event_trace[edge.second]);
         }
-        assert(event_trace[0] != event_trace[3]);
-        assert(event_trace[7] != event_trace[11]);
-        assert(event_trace[13] != event_trace[11]);
+        assert(event_trace[1] != event_trace[5]);
+        assert(event_trace[10] != event_trace[9]);
     }
     runner.finish();
     assert(release_slot_persistent_args(slot, allocator) == 0);
 }
+static void check_joined_callers(void *first_caller, void *second_caller, bool fail_proof = false) {
+    fail_at = 0;
+    capture = false;
+    next_stream = next_event = submits = syncs = copies = 0;
+    trace.clear();
+    stream_trace.clear();
+    event_trace.clear();
+    ProbeRunner runner;
+    runner.initialize();
+    Runtime first_runtime, second_runtime;
+    first_runtime.dev = second_runtime.dev = {};
+    MemoryAllocator allocator;
+    SlotPersistentArgs first_slot, second_slot;
+    const NativeRunIdentity first_id{1, 1, 1, 0}, second_id{2, 1, 2, 1};
+    auto first = std::make_unique<DeviceRunnerBase::PreparedExecution>(first_id, first_runtime, CallConfig{}, 0);
+    first->caller_stream = first_caller;
+    first->joinable_boundary = true;
+    assert(first->kernel_args.prepare_runtime_args(first_runtime, allocator, first_slot) == 0);
+    auto preceding = runner.launch_execution(std::move(first), NativeRunExecutionTestPeer::mint(first_id));
+    assert(preceding.rc == 0 && preceding.active != nullptr);
+    void *whole_done = runner.whole_event(first_id);
+    assert(whole_done != nullptr);
+    auto second = std::make_unique<DeviceRunnerBase::PreparedExecution>(second_id, second_runtime, CallConfig{}, 1);
+    second->caller_stream = second_caller;
+    second->joinable_boundary = true;
+    second->join = NativeRunJoin{preceding.active->prepared.get(), first_id};
+    assert(second->kernel_args.prepare_runtime_args(second_runtime, allocator, second_slot) == 0);
+    submits = 0;
+    trace.clear();
+    stream_trace.clear();
+    event_trace.clear();
+    fail_at = fail_proof ? 2 : 0;
+    auto following = runner.launch_execution(std::move(second), NativeRunExecutionTestPeer::mint(second_id));
+    assert(syncs == 0);
+    assert(following.active != nullptr);
+    const auto streams = following.active->prepared->streams;
+    if (second_caller != nullptr) assert(streams.aicpu == second_caller);
+    assert(trace[0] == "wait" && trace[1] == "record");
+    assert(stream_trace[0] == streams.aicpu && stream_trace[1] == streams.aicpu);
+    assert(event_trace[0] == whole_done);
+    if (fail_proof) {
+        assert(following.rc == -777 && following.progress == LaunchProgress::Partial);
+        assert(trace.size() == 2);
+        const size_t pending = runner.queued_boundary_wait_count();
+        assert(pending == 2);
+        for (int retry = 0; retry != 2; ++retry) {
+            assert(runner.discharge_boundary_waits(*preceding.active->prepared, true) != 0);
+            assert(runner.queued_boundary_wait_count() == 1);
+            assert(runner.finish_common() != 0);
+            assert(runner.queued_boundary_wait_count() == 1);
+        }
+    } else {
+        assert(following.rc == 0 && following.progress == LaunchProgress::Complete);
+        assert(trace[2] == "publish" && stream_trace[2] == streams.aicpu);
+        assert(trace[3] == "record" && stream_trace[3] == streams.aicpu);
+        assert(trace[4] == "wait" && stream_trace[4] == streams.aicore);
+        assert(event_trace[3] == event_trace[4]);
+        assert(runner.retire_boundary(first_id) == PTO_RUNTIME_ERR_INTERNAL);
+        assert(runner.discharge_boundary_waits(*preceding.active->prepared, true) == 0);
+        assert(runner.retire_boundary(first_id) == 0);
+    }
+    preceding.active->prepared->kernel_args.release_run_view();
+    following.active->prepared->kernel_args.release_run_view();
+}
+
 static void check_metadata_publication(int fault, bool drain_fails = false) {
     metadata_extensions = 0;
     fail_at = fault;
@@ -326,21 +398,21 @@ static void check_metadata_publication(int fault, bool drain_fails = false) {
         assert(trace.back() == "publish");
         for (const auto &step : trace)
             assert(step != "core" && step != "cpu");
-        assert(target == (fault == 3 ? 0u : 37u));
+        assert(target == (fault == 1 ? 0u : 37u));
     } else {
         assert(outcome.rc == 0 && outcome.progress == LaunchProgress::Complete);
         assert(target == 37);
         assert(
             (trace == std::vector<std::string>{
-                          "record", "wait", "publish", "publish", "record", "wait", "record", "core", "record", "cpu",
-                          "wait", "record", "record", "wait", "record"
+                          "publish", "publish", "record", "wait", "record", "core", "record", "cpu", "wait", "record",
+                          "record", "record"
                       })
         );
         const auto streams = outcome.active->prepared->streams;
-        for (size_t i : {1u, 2u, 3u, 4u})
+        for (size_t i : {0u, 1u, 2u})
             assert(stream_trace[i] == streams.aicpu);
-        assert(stream_trace[5] == streams.aicore);
-        assert(event_trace[4] == event_trace[5] && event_trace[4] != nullptr);
+        assert(stream_trace[3] == streams.aicore);
+        assert(event_trace[2] == event_trace[3] && event_trace[2] != nullptr);
     }
     // A5's production backend is linked into this probe so its private runtime
     // exporter can be observed without replacing the drain's readiness check.
@@ -445,7 +517,7 @@ static void check_result_publication(bool has_caller, int failure_step) {
     trace.clear();
     stream_trace.clear();
     event_trace.clear();
-    fail_at = failure_step == 0 ? 0 : failure_step + (has_caller ? 2 : 0);
+    fail_at = failure_step == 0 ? 0 : failure_step;
     result_source = nullptr;
     ProbeRunner runner;
     runner.initialize();
@@ -487,7 +559,7 @@ static void check_result_publication(bool has_caller, int failure_step) {
     } else {
         assert(outcome.rc == 0 && outcome.progress == LaunchProgress::Complete);
         assert(runner.result_initialized());
-        const size_t publication = has_caller ? 2 : 0;
+        const size_t publication = 0;
         assert(trace[publication] == "publish" && trace[publication + 1] == "publish");
         assert(stream_trace[publication] == outcome.active->prepared->streams.aicpu);
         assert(stream_trace[publication + 1] == outcome.active->prepared->streams.aicpu);
@@ -583,8 +655,8 @@ static void check_timing_publication(int fault) {
         assert(outcome.rc == 0 && outcome.progress == LaunchProgress::Complete);
         assert(runner.timing_armed());
         assert(scheduler_target == scheduler_source);
-        assert(trace[2] == "publish" && trace[3] == "publish" && trace[4] == "publish");
-        for (int i : {2, 3, 4})
+        assert(trace[0] == "publish" && trace[1] == "publish" && trace[2] == "publish");
+        for (int i : {0, 1, 2})
             assert(stream_trace[i] == outcome.active->prepared->streams.aicpu);
         // The DMA reader outlives the per-run host snapshot, with no intervening wait.
         outcome.active->prepared->kernel_args.release_run_view();
@@ -660,6 +732,12 @@ static void check_arena_growth(SimplerExecutionMode mode) {
     assert(live_allocations.size() == before);
 }
 int main() {
+    check_joined_callers(nullptr, nullptr);
+    check_joined_callers(nullptr, caller);
+    check_joined_callers(caller, nullptr);
+    check_joined_callers(caller, caller);
+    check_joined_callers(caller, &tokens[62]);
+    check_joined_callers(caller, &tokens[62], true);
     check_level_publication(false);
     check_level_publication(true);
     check_result_prepare_refusal();
@@ -668,22 +746,22 @@ int main() {
             check_result_publication(has_caller, failure_step);
     check_timing_prepare_refusal();
     check_timing_publication(0);
-    check_timing_publication(4);
-    check_timing_publication(5);
+    check_timing_publication(2);
+    check_timing_publication(3);
     check_metadata_publication(0);
-    check_metadata_publication(3);  // Metadata enqueue failure.
-    check_metadata_publication(4);  // Descriptor enqueue after accepted metadata.
+    check_metadata_publication(1);  // Metadata enqueue failure.
+    check_metadata_publication(2);  // Descriptor enqueue after accepted metadata.
 
     if (std::strcmp(get_platform(), "a5") == 0) {
         check_metadata_publication(0, true);
-        check_metadata_publication(3, true);
-        check_metadata_publication(4, true);
+        check_metadata_publication(1, true);
+        check_metadata_publication(2, true);
     }
     check_arena_growth(SIMPLER_MODE_PROGRAM);
     check_arena_growth(SIMPLER_MODE_KERNEL);
     check(0, false);
-    // Positions 6 and 11 are optional timing marks; their failure is deliberately non-fatal.
-    for (int fault : {1, 2, 3, 4, 5, 7, 8, 9, 10, 12, 13, 14})
+    // Positions 4 and 9 are optional timing marks; their failure is deliberately non-fatal.
+    for (int fault : {1, 2, 3, 5, 6, 7, 8, 10, 11})
         check(fault, false);
     check(0, true);
     next_stream = next_event = 0;

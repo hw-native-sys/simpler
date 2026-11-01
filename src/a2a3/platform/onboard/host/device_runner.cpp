@@ -745,6 +745,7 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
         return LaunchTransactionResult{};
     }
     prepared.streams = {static_cast<rtStream_t>(run_streams_.aicpu()), static_cast<rtStream_t>(run_streams_.aicore())};
+    if (prepared.caller_stream != nullptr) prepared.streams.aicpu = prepared.caller_stream;
     const auto &streams = prepared.streams;
     if (prepared.caller_stream != nullptr) {
         const int rc = validate_caller_stream(prepared.caller_stream);
@@ -845,12 +846,11 @@ LaunchTransactionResult DeviceRunner::launch_run(PreparedExecution &prepared, La
                 return rc;
             }
 
-            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
-
             if (prepared.join.predecessor_owner != nullptr) {
-                int join_rc = queue_cross_run_wait(prepared, streams.aicore, sink);
+                const int join_rc = queue_cross_run_wait(prepared, streams.aicpu, sink);
                 if (join_rc != 0) return join_rc;
             }
+            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
 
             // After any cross-run wait and before the kernel: the instant this stream was
             // released to begin this run's AICore work. A record is not a wait and no stream

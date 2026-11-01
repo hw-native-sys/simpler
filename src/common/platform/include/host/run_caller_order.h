@@ -21,9 +21,10 @@
 /**
  * One slot's publication/caller entry fork and caller exit-wait proof.
  * The AICPU stream publishes before the AICore may read shared state; without
- * a caller and without an upload no fork is queued. Kernel completion belongs
- * to RunCompletionFence; a caller exit keeps its AICPU boundary referenced
- * until the caller has consumed the wait. No caller stream is owned here.
+ * a caller or any queued dependency/publication no fork is queued. Kernel completion belongs
+ * to RunCompletionFence; a distinct caller keeps its AICPU boundary referenced
+ * until the caller has consumed the wait. An aliased CPU caller records only
+ * its tail proof. No caller stream is owned here.
  */
 class RunCallerOrder {
 public:
@@ -39,10 +40,10 @@ public:
 
     int arm(const NativeRunIdentity &id, void *caller, void *aicpu, void *aicore) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (active_ || aicpu == nullptr || aicore == nullptr || caller == aicpu || caller == aicore)
-            return PTO_RUNTIME_ERR_INVALID_STATE;
+        if (active_ || aicpu == nullptr || aicore == nullptr || caller == aicore) return PTO_RUNTIME_ERR_INVALID_STATE;
         for (size_t i = 0; i < events_.size(); ++i) {
             if (caller == nullptr && i != Fork) continue;
+            if (caller == aicpu && i == Start) continue;
             void *&event = events_[i];
             if (event != nullptr) continue;
             int rc = ops_.create(&event);
@@ -58,9 +59,8 @@ public:
     int fork(const NativeRunIdentity &id, LaunchProgressSink &sink, Publish &&publish) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!owns(id) || submitted_) return PTO_RUNTIME_ERR_INVALID_STATE;
-        // This entry is the transaction's first sink user; every submission
-        // observed here belongs to its caller edges or publication callback.
-        if (streams_[Caller] != nullptr) {
+        // Earlier dependency commands can already make this transaction Partial.
+        if (streams_[Caller] != nullptr && streams_[Caller] != streams_[Aicpu]) {
             // A failed record/wait can still leave a queued reference.
             submitted_ = true;
             sink.mark_submitted();
@@ -77,6 +77,11 @@ public:
             throw;
         }
         submitted_ = submitted_ || sink.submitted();
+        if (rc == 0 && streams_[Caller] == streams_[Aicpu]) {
+            // A caller's preceding commands must order the Core even without publication.
+            submitted_ = true;
+            sink.mark_submitted();
+        }
         if (rc != 0 || !submitted_) return rc;
         // The AICore cannot read its descriptor or report startup before the
         // AICPU-stream publication has completed, including on a cold block.
@@ -89,6 +94,11 @@ public:
     int join(const NativeRunIdentity &id, RunCompletionFence &fence) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!owns(id) || !submitted_ || reference_.valid()) return PTO_RUNTIME_ERR_INVALID_STATE;
+        if (streams_[Caller] == streams_[Aicpu]) {
+            const int rc = ops_.record(events_[Tail], streams_[Caller]);
+            tail_recorded_ = rc == 0;
+            return rc;
+        }
         int rc = fence.reserve_wait_reference(id, Role::Aicpu, Role::Caller, &reference_);
         if (rc != 0) return rc;
         fence_ = &fence;
@@ -126,8 +136,13 @@ public:
                 // Partial enqueue has no tail proof. Both private streams and
                 // the borrowed caller may still name a fork or completion event.
                 int first = 0;
-                for (void *stream : streams_) {
+                for (size_t i = 0; i < streams_.size(); ++i) {
+                    void *stream = streams_[i];
                     if (stream == nullptr) continue;
+                    bool duplicate = false;
+                    for (size_t j = 0; j < i; ++j)
+                        duplicate = duplicate || streams_[j] == stream;
+                    if (duplicate) continue;
                     const int rc = sync_(stream, timeout_ms);
                     if (first == 0) first = rc;
                 }

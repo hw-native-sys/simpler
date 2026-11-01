@@ -548,6 +548,7 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
 
     prepared.streams =
         execution_mode_latch_.is_kernel() ? borrowed_run_streams() : RunStreams{stream_aicpu_, stream_aicore_};
+    if (prepared.caller_stream != nullptr) prepared.streams.aicpu = prepared.caller_stream;
     const auto &streams = prepared.streams;
 
     if (prepared.caller_stream != nullptr) {
@@ -655,19 +656,12 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             run_progress_.claim(prepared.identity);
             (void)run_progress_.publish(prepared.identity, RunProgressState::Enqueuing);
 
-            // Ahead of this run's first execution-visible submission, on the stream that
-            // submission enters: a successor is ordered behind its predecessor's whole
-            // operator by one queued wait on the AICore stream, and the proof event
-            // recorded behind that wait is what lets the predecessor retire without
-            // waiting for this run's kernels. The AICPU half needs no token of its own —
-            // that stream's FIFO already places this run's payload behind the
-            // predecessor's whole-operator boundary record.
-            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
-
+            // The successor's CPU stream may differ from its predecessor's.
             if (prepared.join.predecessor_owner != nullptr) {
-                const int join_rc = queue_cross_run_wait(prepared, streams.aicore, sink);
+                const int join_rc = queue_cross_run_wait(prepared, streams.aicpu, sink);
                 if (join_rc != 0) return join_rc;
             }
+            if (int caller_rc = queue_run_entry(prepared, sink); caller_rc != 0) return caller_rc;
 
             // After any cross-run wait and before the kernel: the instant this stream was
             // released to begin this run's AICore work. A record is not a wait and no stream
@@ -1008,10 +1002,9 @@ int DeviceRunner::queue_cross_run_wait(
     // Recorded immediately behind the wait, so it completes when the wait is
     // consumed — not when this run finishes. That is what lets the predecessor
     // retire its boundary without waiting for this run's kernels. Its own
-    // failure leaves the wait queued and committed, so the entry falls back to
-    // the quiescence proof at discharge rather than failing the run.
-    (void)record_cross_run_proof(prepared, waiter_stream);
-    return 0;
+    // failure leaves the wait queued and committed. Stop before publication;
+    // the owner's stream pair cannot prove this successor CPU consumed it.
+    return record_cross_run_proof(prepared, waiter_stream);
 }
 
 void DeviceRunner::mark_device_unusable(int runtime_rc) {

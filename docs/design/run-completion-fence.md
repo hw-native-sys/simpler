@@ -67,36 +67,58 @@ prepare/launch/poll/wait/finalize transaction; `predecessor` is null for ordinar
 launch, or names the same joined-launch predecessor as `simpler_launch_run_joined`.
 The caller must serialize submissions and keep its stream, external buffers and
 native run storage alive until finalization proves completion. Launch returns an
-enqueue result; wait/finalize still report the run's device verdict.
+enqueue result; wait/finalize report the native drain outcome, with the status
+scope described below.
 
 ```text
-caller:  prior work -> record Start ------------------------ wait CpuDone -> record Tail -> later work
-AICPU:                wait Start -> metadata/descriptor H2D -> record Fork -> kernel -> wait CoreDone -> record CpuDone
-AICore:                                              wait Fork -> kernel -> record CoreDone
+caller/AICPU: prior work -> metadata/descriptor H2D -> record Fork -> kernel -> wait CoreDone -> record CpuDone -> record Tail -> later work
+AICore:                                            wait Fork -> kernel -> record CoreDone
 ```
 
-`Fork` precedes the AICPU kernel: that kernel can wait for AICore's handshake,
-so putting the fork after it would deadlock. `CpuDone` is the existing run fence,
-recorded after both the AICPU kernel and the wait for `CoreDone`; caller ordering
-requires this whole-operator join even when cross-run early enqueue is disabled.
+An explicit caller is the actual AICPU execution stream, not a third stream
+joined to a hidden AICPU queue. `Fork` precedes the AICPU kernel: that kernel can
+wait for AICore's handshake, so putting the fork after it would deadlock.
+`CpuDone` follows both the AICPU kernel and the wait for `CoreDone`; caller
+ordering requires this whole-operator join even without cross-run early enqueue.
+A controlled AICPU failure is therefore on the caller stream itself. Completion
+events and nonblocking queries are not error verdicts; the caller observes the
+RTS execution error through stream synchronization. Native wait/finalize retain
+their existing result-readback and retirement responsibilities.
 
-`RunCallerOrder` owns three reusable events per occupied slot, allocated lazily
-for explicit caller launches. It holds a reference to the run's existing AICPU
-boundary until `Tail` proves the caller consumed that wait. Poll therefore also
-queries `Tail`, and drain discharges that reference before retirement. Ordinary
-program launch borrows no caller stream. An asynchronous descriptor publication
-uses the same AICPU-to-AICore fork even without a caller; a cached descriptor with
-no caller queues neither a copy nor a fork. Timing marks are independent
-and do not substitute for these ordering edges.
+The normal success path uses this run's completion boundaries and recorded
+result. Exceptional drain fallbacks synchronize the bound streams, including
+the actual caller stream. That status observation is stream-wide: caller work
+queued after this launch can affect its latency or returned RTS error. It does
+not provide isolated error attribution to this run. Synchronizing a boundary or
+`Tail` proves completion but does not replace the measured error observer.
+
+Controlled caller-status propagation and matched success are qualified on A3
+silicon through the A2/A3 backend for TMR and HBG. A5 has build and production
+RTS-stub routing coverage; its caller-status behavior remains unqualified on
+silicon, including resident HBG.
+
+`RunCallerOrder` owns two reusable events for this alias: `Fork` and `Tail`,
+allocated lazily per occupied slot. There is no caller-to-CPU Start edge and no
+CPU-to-caller self wait. Poll queries `Tail`, and drain proves that tail consumed
+before retirement. The helper still supports a distinct caller, whose queued
+exit wait holds the AICPU boundary reference until its tail completes. No caller
+stream is owned, destroyed, reset or assigned a new failure policy by this helper.
+
+Ordinary program launch without a caller retains its owned stream pair. A
+publication or an earlier cross-run dependency uses the same CPU-to-Core fork;
+a cached descriptor with no caller and no preceding dependency queues neither
+a copy nor a fork. Timing marks do not substitute for these ordering edges.
 
 An attempted record or wait may be enqueued even when its API reports an error.
-The launch transaction is therefore `Partial` from the first caller-edge or
-asynchronous descriptor-copy attempt, with its resources retained. If no tail
-was recorded, bounded synchronization of the bound streams is the fallback
-proof (the two private streams, and the caller stream when present). A failed proof keeps references
-quarantined; borrowed execution never resets or synchronizes the whole device.
-Failure does not establish the caller's exit dependency, so the caller must not
-consume output merely because launch returned an error.
+The launch transaction is therefore `Partial` from the first dependency,
+caller-edge or asynchronous publication attempt, with its resources retained.
+If no tail was recorded, bounded synchronization of each distinct bound stream
+is the failure-path fallback. A cross-run CPU wait lacking its proof event is
+conservatively retained even if its predecessor's pair synchronizes: the table
+cannot prove that pair includes the actual waiting CPU stream. Failed proof
+keeps references quarantined; borrowed execution never resets or synchronizes
+the whole device. Launch failure does not establish the exit dependency, so
+callers cannot consume output merely because launch returned an error.
 
 This entry is eager-only. It validates the current borrowed RTS context and
 rejects an active caller capture before launch metadata publication. Preparation
@@ -272,17 +294,21 @@ a mode violation.
 
 ## The boundary
 
-Each stream records an event immediately after its own kernel:
+Each stream records a boundary after its own kernel. The AICPU sequence has two
+forms, depending on whether it queues its own AICore join:
 
 ```text
-AICore stream: kernel(N) -> record core_done(N)
-AICPU  stream: kernel(N) -> record cpu_done(N)
+AICore: kernel(N) -> record core_done(N)
+AICPU without Core join: kernel(N) -> record cpu_done(N)
+AICPU with Core join: kernel(N) -> wait core_done(N) -> [WholeOperatorEnd timing mark] -> record cpu_done(N)
 ```
 
-Stream order is what makes this a proof: nothing else enters the stream between
-the kernel and its record, so the event cannot complete before the kernel it
-follows has exited. A run is device-complete when **both** of its recorded
-boundaries complete.
+Stream order makes each record a proof: the event cannot complete before the
+kernel ahead of it exits. An intervening dependency wait or optional timing mark
+does not weaken that ordering. Caller exit ordering requires the Core join;
+when this join is queued, `cpu_done` covers both kernels and can serve as the
+joined successor's whole-operator dependency. A run is device-complete when
+**both** of its recorded boundaries complete.
 
 Three things that are *not* proofs, each of which is a way to get this wrong:
 
@@ -335,10 +361,10 @@ not a hidden completion dependency — completion is already settled before it
 runs. **On a normal success it no longer runs at all**: when both boundaries
 complete, the run's own record transfer reports nothing and that record says
 `Ok`, `wait_run_fence` returns on that evidence alone. Every other shape still
-reaches `sync_stream_pair`, and on those shapes a change that queues a
-successor makes it wait for the successor's kernels to answer a question about
-the predecessor's. That cost is bounded by the stream-sync timeout and is
-disclosed rather than solved.
+reaches `sync_stream_pair`. On those shapes, queued successors or later external
+caller work can affect the synchronize's latency and RTS status; the result is
+not isolated per-run error attribution. That cost is bounded by the stream-sync
+timeout and is disclosed rather than solved.
 
 The candidate that does not require a synchronize is
 `aclrtSetExceptionInfoCallback` — the driver invokes it when a device exception
@@ -579,40 +605,37 @@ then fails admission, and `finalize()` takes its force-reset teardown, which is
 the only thing that actually invalidates the device's references. Nothing is
 freed on an unproven path and nothing is re-executed.
 
-## The cross-run join a later change will use
+## The cross-run dependency and its proof
 
-Opening admission to two launched runs needs the successor ordered after the
-predecessor. With per-run boundaries that is two queued waits, crossed:
+A successor waits on its actual CPU stream for the predecessor's whole-operator
+boundary before publication or any shared-state reuse. That boundary already
+covers both predecessor kernels. The successor's publication fork then carries
+this ordering to its Core stream:
 
 ```text
-successor AICore stream waits predecessor cpu_done
-successor AICPU  stream waits predecessor core_done
+predecessor CPU: kernel -> wait own CoreDone -> record WholeDone
+successor CPU:  wait WholeDone -> record proof -> publication -> Fork -> kernel
+successor Core:                                               wait Fork -> kernel
 ```
 
-Crossed rather than parallel, because each stream already orders itself: the
-AICore edge puts `cpu_done` before the successor's AICore kernel, the stream's
-own order puts `core_done` before `cpu_done`'s peer, and together the two edges
-put **both** predecessor kernels ahead of **either** successor kernel. A
-predecessor record must already be submitted before a successor wait on it is
-queued, and no wait may point back at a successor, or the pair deadlocks.
+This applies with the same caller, different callers, and either mixture of
+caller and no-caller submissions. It does not rely on a hidden CPU FIFO shared
+by the two runs. The proof event immediately follows the queued wait, so the
+predecessor can retire without waiting for successor computation. It is a
+storage last-use dependency, not a check of the predecessor's semantic result.
 
-`RunCompletionFence` carries the reference protocol this needs today, with no
-production caller — inserting the waits and admitting a second launched run
-belong to the change that opens admission. The normal success path no longer
-synchronizes, but the fallback shapes still do, so that change also owes a
-decision on what a fallback synchronize means once a successor is queued
-behind the run it is draining.
+1. Reserve a boundary reference before queueing its wait.
+2. Queue the wait on the predecessor's already recorded whole boundary.
+3. Commit the reference once the wait is attempted, including an API error that
+   does not prove refusal. A reservation may be revoked only before submission.
+4. Release the reference exactly once, after its own CPU proof event is observed.
+   An unproved CPU cross-run wait survives generic predecessor-pair quiescence;
+   without actual stream provenance that fallback cannot establish consumption.
+   Unknown completion retains the reference and refuses unsafe reuse/release.
 
-1. `reserve_wait_reference(identity, boundary, waiter)` before queueing the
-   wait. Reserving first is what makes the failure path decidable.
-2. Queue the stream wait on `boundary_event(identity, boundary)`.
-3. `commit_wait_reference` on success, `revoke_wait_reference` on failure.
-4. `release_wait_reference(ref, proven_waiter)` exactly once, and only once a
-   completion proof covers the successor stream `waiter` — the stream that
-   actually holds the wait. Since the join crosses the streams, a proof about
-   the *other* stream leaves the wait uncovered, and the call rejects it.
-   `release_wait_reference_on_quiescence` is the alternative for a verified
-   reset or quarantine, which invalidates every reference at once.
+A verified device reset can invalidate device references. Terminal quarantine
+instead retains backing with unknown use and stops admission. Neither makes an
+ordinary event or successful pair sync a cross-run retirement proof.
 
 A reference *is* a count, and there is exactly one way to get a count wrong:
 decrement one that is not yours. Every rule below closes one route to that.

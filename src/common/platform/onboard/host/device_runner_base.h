@@ -1620,9 +1620,9 @@ public:
         int launch_aicpu_num{0};
         KernelArgsHelper kernel_args{};
         // Bound before publication under the execution claim, unchanged through
-        // retirement. Handles are borrowed: A2/A3's pair retains submitted owners;
-        // A5's runner owns its streams until all runs retire. Neither preparation
-        // nor moving this state transfers ownership of the streams themselves.
+        // retirement. The runner retains its Core stream and the caller owns
+        // an aliased CPU stream. Neither preparation nor moving this state
+        // transfers ownership of the streams themselves.
         RunStreams streams{};
         /**
          * This run's whole published identity, copied from its descriptor.

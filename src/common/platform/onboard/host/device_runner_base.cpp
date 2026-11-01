@@ -3953,7 +3953,7 @@ int DeviceRunnerBase::open_cross_run_wait(const PreparedExecution &prepared, voi
     }
     int rc = queued_waits_->open(
         QueuedStreamWaits::Shape::CrossRun, prepared.identity, join.predecessor_identity, run_fence(predecessor_slot),
-        RunCompletionFence::StreamRole::Aicpu, RunCompletionFence::StreamRole::Aicore, predecessor_boundary_out
+        RunCompletionFence::StreamRole::Aicpu, RunCompletionFence::StreamRole::Aicpu, predecessor_boundary_out
     );
     if (rc != 0) {
         LOG_ERROR(
@@ -4025,10 +4025,8 @@ int DeviceRunnerBase::discharge_boundary_waits(const PreparedExecution &prepared
     // alone.
     const QueuedWaitDischargeOps ops{
         [this, &prepared]() -> int {
-            // Nothing cheaper is left. A pair synchronize covers the boundary and
-            // everything queued behind it, which is what an unproven queued wait
-            // needs — and it is a failure-path cost only, because a proved discharge
-            // never reaches this rung.
+            // This covers the owner's bound pair. A CPU cross-run wait without
+            // its own proof can remain retained on another caller stream.
             LOG_WARN(
                 "discharge_boundary_waits: slot %u still holds a queued wait on one of its boundaries; falling back "
                 "to the bounded whole-stream synchronize",

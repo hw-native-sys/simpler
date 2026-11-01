@@ -28,7 +28,7 @@ jobs:
   run:
     name: ut
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    timeout-minutes: ${{ inputs.setup_variant == 'github' && contains(inputs.runs_on, 'macos') && 30 || 20 }}
+    timeout-minutes: ${{ inputs.setup_variant == 'github' && 30 || 20 }}
     # Single-host CPU MPI tests must not select the runner's unsupported RDMA devices.
     env:
       UCX_TLS: "self,sm,tcp"

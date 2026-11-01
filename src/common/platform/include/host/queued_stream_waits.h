@@ -33,7 +33,7 @@
  *   boundary therefore covers the whole operator — both kernels — rather than
  *   only the AICPU one. The run's own boundaries completing is the proof: the
  *   wait sits ahead of a boundary that has fired.
- * - **Cross-run.** A successor queues, on its own AICore stream, a wait for the
+ * - **Cross-run.** A successor queues, on its execution stream, a wait for the
  *   predecessor's whole-operator boundary. Nothing about the predecessor
  *   completing proves the host has observed the successor's stream passing that
  *   wait, so the wait carries a proof event of its own, recorded into the
@@ -219,10 +219,9 @@ public:
     }
 
     /**
-     * Retire every wait naming a boundary of `boundary_owner` against a proof
-     * that covers the device as a whole — a stream-pair synchronize the caller
-     * itself issued and that returned success, which covers everything queued
-     * behind the boundary as well as the boundary itself.
+     * Retire waits covered by the owner's synchronized stream pair. A cross-run
+     * CPU wait still needs its own proof event because the table does not retain
+     * enough stream identity to prove it shares that pair.
      */
     int discharge_on_quiescence(const NativeRunIdentity &boundary_owner) {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -230,6 +229,8 @@ public:
         for (Entry &entry : entries_) {
             if (!entry.occupied || entry.boundary_owner != boundary_owner) continue;
             if (!entry.reference.committed()) continue;
+            // A CPU cross-run wait has no stream-identity proof tying it to this pair.
+            if (entry.shape == Shape::CrossRun && entry.reference.waiter() == StreamRole::Aicpu) continue;
             int rc = entry.fence->release_wait_reference_on_quiescence(entry.reference);
             if (rc != 0) {
                 if (first_rc == 0) first_rc = rc;

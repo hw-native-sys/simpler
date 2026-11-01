@@ -382,18 +382,11 @@ public:
 
     // ---- Cross-run join contract -----------------------------------------
     //
-    // A successor orders itself after this run by queueing, on each of its own
-    // streams, a wait for the opposite predecessor boundary:
-    //
-    //     successor AICore stream waits predecessor cpu_done
-    //     successor AICPU  stream waits predecessor core_done
-    //
-    // Together with each stream's own order, those two edges put both
-    // predecessor kernels ahead of either successor kernel. The reference
-    // protocol below is what keeps the predecessor's events alive for exactly
-    // as long as those queued waits can name them. Production insertion of the
-    // waits, and admitting a second launched run, belong to the change that
-    // opens admission.
+    // A successor waits on its actual CPU stream for this run's whole-operator
+    // CPU boundary before publication. Its fork orders Core behind that CPU
+    // dependency. A proof event behind the cross-run wait covers consumption
+    // without waiting for successor computation. Each queued wait holds its
+    // own boundary reference until the corresponding proof is observed.
     //
     // A reference is a count, and every guard below exists because there is
     // exactly one way to get a count wrong: decrement one that is not yours.
