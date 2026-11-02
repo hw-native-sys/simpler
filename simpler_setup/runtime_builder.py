@@ -81,8 +81,8 @@ def _a5_async_workspace_overlay_defines() -> dict[str, str]:
     explicit ON/OFF: a value left in the CMake cache by an earlier build cannot
     otherwise survive a reconfigure (build once with RDMA=ON, then unset it, and
     the cached option stays ON). `SIMPLER_ENABLE_PTO_SDMA_WORKSPACE` is not
-    forwarded — it is an internal marker the CMakeLists derives from these two,
-    and a `-D` value for it is overwritten unconditionally.
+    forwarded — it is an internal marker the CMakeLists always enables, and a
+    `-D` value for it is overwritten unconditionally.
     """
     return {
         "SIMPLER_ENABLE_PTO_URMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_URMA_WORKSPACE") or "OFF",
@@ -240,7 +240,7 @@ class RuntimeBuilder:
         """Return True when this runtime embeds PTO-ISA headers into host code.
 
         Driven by :func:`platform_embeds_pto_isa`: a2a3 and a5 onboard always
-        embed one async workspace backend; simulation platforms do not.
+        embed async workspace backends; simulation platforms do not.
         """
         return platform_embeds_pto_isa(self.platform)
 

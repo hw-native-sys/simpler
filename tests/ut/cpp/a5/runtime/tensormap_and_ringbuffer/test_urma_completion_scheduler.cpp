@@ -13,9 +13,12 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 
 #include "async_wait.h"
 #include "backend/urma/urma_completion_scheduler.h"
+#include "scheduler/scheduler.h"
+#include "utils/device_arena.h"
 
 namespace {
 
@@ -291,3 +294,121 @@ TEST(A5UrmaCompletionScheduler, TargetOutsideOutstandingWindowFails) {
 }
 
 static_assert(sizeof(TestCqe) == 64);
+
+class A5MixedCompletionTest : public ::testing::TestWithParam<bool> {
+protected:
+    WorkspaceFixture urma;
+    alignas(64) uint64_t sdma_record = 0;
+    std::unique_ptr<SchedulerState> sched = std::make_unique<SchedulerState>();
+    DeviceArena sm_arena;
+    DeviceArena sched_arena;
+    ChipTaskSlotState producer{};
+    TaskPayload payload{};
+    ChipTaskSlotState *releases[1]{};
+    int32_t release_count = 0;
+
+    void SetUp() override {
+        auto *sm = SharedMemoryHandle::create_and_init_default(sm_arena);
+        ASSERT_NE(sm, nullptr);
+        const auto layout = SchedulerState::reserve_layout(sched_arena);
+        ASSERT_NE(sched_arena.commit(), nullptr);
+        ASSERT_TRUE(sched->init_data_from_layout(layout, sched_arena, sm->header));
+        sched->wire_arena_pointers(layout, sched_arena);
+        producer.task_state.store(CHIP_TASK_PENDING);
+        producer.active_mask = LaneMask::aiv0();
+        producer.total_required_subtasks = 1;
+        producer.logical_block_num = 1;
+        producer.fanout_count = 1;
+        producer.payload = &payload;
+
+        auto &waits = sched->async_wait_list;
+        waits.count = 1;
+        auto &entry = waits.entries[0];
+        entry.slot_state = &producer;
+        entry.task_token = TaskId::make(0, 0);
+        entry.normal_done = true;
+        int32_t error = SIMPLER_ERROR_NONE;
+        auto sdma = [&] {
+            ASSERT_TRUE(waits.append_condition_locked(
+                entry, reinterpret_cast<uint64_t>(&sdma_record), 1, 0, ASYNC_ENGINE_SDMA,
+                COMPLETION_TYPE_SDMA_EVENT_RECORD, error
+            ));
+        };
+        auto urma_condition = [&] {
+            ASSERT_TRUE(waits.append_condition_locked(
+                entry, 1, urma.addr(), 1, ASYNC_ENGINE_URMA, COMPLETION_TYPE_URMA_EVENT_HANDLE, error
+            ));
+        };
+        if (GetParam()) {
+            sdma();
+            urma_condition();
+        } else {
+            urma_condition();
+            sdma();
+        }
+        ASSERT_EQ(error, SIMPLER_ERROR_NONE);
+        ASSERT_EQ(entry.waiting_completion_count, 2);
+    }
+
+    void TearDown() override {
+        sched->destroy();
+        sched_arena.release();
+        sm_arena.release();
+    }
+
+    AsyncPollResult poll() {
+        return sched->async_wait_list.poll_and_complete<false>(nullptr, sched.get(), releases, release_count, 1);
+    }
+
+    void complete_first() {
+        if (GetParam()) sdma_record = 1;
+        else urma.set_cqe(0, 0, true);
+    }
+
+    void complete_second() {
+        if (GetParam()) urma.set_cqe(0, 0, true);
+        else sdma_record = 1;
+    }
+};
+
+TEST_P(A5MixedCompletionTest, BothEnginesMustCompleteBeforeProducerRelease) {
+    EXPECT_EQ(poll().completed, 0);
+    complete_first();
+    auto first = poll();
+    EXPECT_EQ(first.error_code, SIMPLER_ERROR_NONE);
+    EXPECT_EQ(first.completed, 0);
+    EXPECT_EQ(producer.task_state.load(), CHIP_TASK_PENDING);
+    EXPECT_EQ(release_count, 0);
+    ASSERT_EQ(sched->async_wait_list.count, 1);
+    EXPECT_EQ(sched->async_wait_list.entries[0].waiting_completion_count, 1);
+    complete_second();
+    auto second = poll();
+    EXPECT_EQ(second.error_code, SIMPLER_ERROR_NONE);
+    EXPECT_EQ(second.completed, 1);
+    EXPECT_EQ(producer.task_state.load(), CHIP_TASK_COMPLETED);
+    EXPECT_EQ(release_count, 1);
+    EXPECT_EQ(releases[0], &producer);
+    EXPECT_EQ(sched->async_wait_list.count, 0);
+    EXPECT_EQ(poll().completed, 0);
+}
+
+TEST_P(A5MixedCompletionTest, CompletedEngineCannotHideOtherEngineFailure) {
+    complete_first();
+    ASSERT_EQ(poll().error_code, SIMPLER_ERROR_NONE);
+    ASSERT_EQ(sched->async_wait_list.entries[0].waiting_completion_count, 1);
+    if (GetParam()) {
+        urma.set_cqe(0, 0, true, 7);
+    } else {
+        for (auto &condition : sched->async_wait_list.entries[0].conditions) {
+            if (condition.completion_type == COMPLETION_TYPE_SDMA_EVENT_RECORD) condition.addr = 0;
+        }
+    }
+    auto result = poll();
+    EXPECT_EQ(result.error_code, SIMPLER_ERROR_ASYNC_COMPLETION_INVALID);
+    EXPECT_EQ(result.failed_slot_state, &producer);
+    EXPECT_EQ(result.completed, 0);
+    EXPECT_EQ(release_count, 0);
+    EXPECT_EQ(producer.task_state.load(), CHIP_TASK_PENDING);
+}
+
+INSTANTIATE_TEST_SUITE_P(EngineOrder, A5MixedCompletionTest, ::testing::Bool());

@@ -71,13 +71,11 @@ def test_rdma_completion_type_is_registered_in_async_wait() -> None:
     assert "COMPLETION_TYPE_RDMA_EVENT_HANDLE = 3" in wait_source
 
 
-def test_a5_host_cmake_gates_rdma_workspace_overlay() -> None:
+def test_a5_host_cmake_keeps_optional_rdma_provider() -> None:
     cmake = HOST_CMAKE.read_text(encoding="utf-8")
 
     assert "option(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE" in cmake
-    assert "set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OFF)" in cmake
     assert "set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)" in cmake
-    assert "Only one PTO async workspace overlay may be enabled" in cmake
     assert "PTO RDMA workspace overlay requires pto-isa RDMA headers" in cmake
     assert "PTO_RDMA_SUPPORTED" in cmake
     assert "PTO_RDMA_BACKEND_HNS_1825_SUPPORTED" in cmake
@@ -213,7 +211,7 @@ def test_rdma_kernel_uses_peer_independent_session_and_explicit_peer_ops() -> No
     assert "desc.scratch, desc.workspace, desc.peer_rank, desc.local_rank, session" not in backend
     assert "TGET_ASYNC<pto::comm::DmaEngine::RDMA>(desc.dst, desc.src, session, desc.peer_rank)" in backend
     assert "TPUT_ASYNC<pto::comm::DmaEngine::RDMA>(desc.dst, desc.src, session, desc.peer_rank)" in backend
-    assert "comm_ctx->workSpace), comm_ctx->rankId," in consumer
+    assert "comm_workspace<CommWorkspaceKind::RDMA>(*comm_ctx).addr), comm_ctx->rankId," in " ".join(consumer.split())
     assert "readback_session, 2" in consumer
     assert "TGET_ASYNC<pto::comm::DmaEngine::RDMA>(local_scratch, remote_tput, readback_session, peer)" in consumer
 

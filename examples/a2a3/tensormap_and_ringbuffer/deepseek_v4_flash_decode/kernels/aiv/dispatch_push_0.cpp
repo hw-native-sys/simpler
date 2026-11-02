@@ -196,11 +196,11 @@ static __aicore__ void dispatch_push_0(
                 // pto: %18
                 int64_t v51 = v48 < v28 ? v28 : v48;
                 // pto: %20
-                int64_t v52 = (v11)[v24];
+                int64_t v52 = (v11)[v28];
                 // pto: %21, %22, %23, %24
-                int64_t v53 = (v11)[(int64_t)((uint64_t)((int64_t)((int32_t)v52)) + (uint64_t)v19)];
+                int64_t v53 = (v11)[(int64_t)((uint64_t)((int64_t)((int32_t)v52)) + (uint64_t)v24)];
                 // pto: %25
-                int64_t v54 = (int64_t)((uint64_t)v45 + (uint64_t)v19);
+                int64_t v54 = (int64_t)((uint64_t)v45 + (uint64_t)v24);
                 // pto: %26
                 int64_t v55 = (v11)[v54];
                 // pto: %recv_x__ssa_v0_peer_pview
@@ -246,9 +246,9 @@ static __aicore__ void dispatch_push_0(
                 v36.SetValue(v25, v64);
                 set_flag(PIPE_S, PIPE_MTE3, EVENT_ID0);
                 // pto: %37
-                int64_t v65 = (v12)[v24];
+                int64_t v65 = (v12)[v28];
                 // pto: %38, %39, %40, %41
-                int64_t v66 = (v12)[(int64_t)((uint64_t)((int64_t)((int32_t)v65)) + (uint64_t)v19)];
+                int64_t v66 = (v12)[(int64_t)((uint64_t)((int64_t)((int32_t)v65)) + (uint64_t)v24)];
                 // pto: %43
                 int64_t v67 = (v12)[v54];
                 // pto: %recv_aux__ssa_v0_peer_pview
@@ -273,9 +273,9 @@ static __aicore__ void dispatch_push_0(
                 v38.SetValue(v28, v72);
                 set_flag(PIPE_S, PIPE_MTE3, EVENT_ID1);
                 // pto: %53
-                int64_t v73 = (v13)[v24];
+                int64_t v73 = (v13)[v28];
                 // pto: %54, %55, %56, %57
-                int64_t v74 = (v13)[(int64_t)((uint64_t)((int64_t)((int32_t)v73)) + (uint64_t)v19)];
+                int64_t v74 = (v13)[(int64_t)((uint64_t)((int64_t)((int32_t)v73)) + (uint64_t)v24)];
                 // pto: %59
                 int64_t v75 = (v13)[v54];
                 // pto: %recv_route__ssa_v0_peer_pview
@@ -301,11 +301,11 @@ static __aicore__ void dispatch_push_0(
         // pto: %67
         if (i80 != v35) {
             // pto: %68
-            int64_t v81 = (v14)[v24];
+            int64_t v81 = (v14)[v28];
             // pto: %69, %70, %71, %72
-            int64_t v82 = (v14)[(int64_t)((uint64_t)((int64_t)((int32_t)v81)) + (uint64_t)v19)];
+            int64_t v82 = (v14)[(int64_t)((uint64_t)((int64_t)((int32_t)v81)) + (uint64_t)v24)];
             // pto: %73, %74
-            int64_t v83 = (v14)[(int64_t)((uint64_t)i80 + (uint64_t)v19)];
+            int64_t v83 = (v14)[(int64_t)((uint64_t)i80 + (uint64_t)v24)];
             // pto: %data_arrived__ssa_v0_peer_pview
             pto::Shape<1, 1, 1, 1, 1> v84 = pto::Shape<1, 1, 1, 1, 1>();
             // pto: %data_arrived__ssa_v0_peer_pview

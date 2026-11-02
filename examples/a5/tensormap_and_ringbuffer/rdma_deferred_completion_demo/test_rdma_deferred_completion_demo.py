@@ -179,6 +179,7 @@ def _run_case_on_worker(worker: Worker, chip_handle, elem_count: int, nranks: in
 
     def orch_fn(orch, _args, cfg):
         with orch.allocate_domain(
+            workspace_engines=("rdma",),
             name=f"rdma_deferred_completion_{elem_count}",
             workers=list(range(nranks)),
             window_size=window_size,

@@ -29,28 +29,28 @@ directories. Only the transfer kernel and the orchestration change:
 Read them side by side and the transport is the only variable — which is
 exactly what you want when deciding which one a workload should use.
 
-## SDMA is the default; URMA is the opt-in alternative
+## Independent workspaces
 
-This is the part to know before trying to run either.
+URMA remains opt-in at build time through
+`SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON`. The host runtime can include SDMA,
+URMA and RDMA together; each domain explicitly selects its resources. This
+example requests `workspace_engines=("urma",)` and reads
+`comm_workspace<CommWorkspaceKind::URMA>(*ctx).addr`.
 
-```cmake
-option(SIMPLER_ENABLE_PTO_URMA_WORKSPACE "..." OFF)
-if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
-    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE OFF)
-else()
-    set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
-endif()
-```
+`TestSdmaUrmaWorkspaceMix` requests both SDMA and URMA on one domain and runs
+both callables on the same Worker. A shared result output orders URMA after
+SDMA on each rank, and separate SDMA and URMA outputs validate both transfers.
+This does not assert unordered simultaneous submission on shared engine queues.
 
-— `src/a5/platform/onboard/host/CMakeLists.txt`. **One host runtime build can
-carry one overlay, not both**, because `CommContext` has a single
-`workSpace` / `workSpaceSize` pair to hand the kernel. So the two demos cannot
-pass in the same build; comparing them means rebuilding.
+`TestSdmaUrmaSameTask` uses one producer kernel to fetch the first half of its
+output through SDMA and the second half through URMA. Both requests register
+completion conditions in the same task. The consumer reads the entire output
+and adds one, so both transfers must finish before its dependency is released.
+The two ranks post the engines in opposite orders. This covers outstanding
+requests on independent engines; it does not cover multiple producers posting
+to one engine queue.
 
-The kernel checks for this at run time too: `workSpace == 0` means the overlay
-was not built in.
-
-## Consequently it is doubly gated, and never runs in CI
+## Build and test gates
 
 | Gate | Effect |
 | ---- | ------ |
@@ -59,9 +59,10 @@ was not built in.
 | `@pytest.mark.skipif(not _urma_workspace_enabled())` | skipped unless `SIMPLER_ENABLE_PTO_URMA_WORKSPACE` is one of `1` / `ON` / `TRUE` / `YES` in the environment |
 | `urma_deferred_completion_orch_fn()` raises | re-checks the env var immediately before allocating the communication domain |
 
-Since the URMA CMake option defaults `OFF`, a stock build skips this test even on a5
-hardware. **A green CI run says nothing about URMA.** Treat it as a manual
-bring-up check, not as coverage.
+The URMA CMake option defaults `OFF`, so a stock build skips these tests even on
+A5 hardware. The `st-onboard-a5` CI job explicitly enables URMA for its build,
+kernel compilation and queued pytest run, exercising the URMA and mixed-workspace
+cases alongside SDMA. This CI selection does not change the build option's default.
 
 ## Run
 
@@ -78,7 +79,7 @@ SIMPLER_ENABLE_PTO_URMA_WORKSPACE=ON \
 The variable is needed twice for different reasons: `runtime_builder.py`
 forwards it to CMake so the overlay is compiled in, and the test reads it from
 the environment to decide whether to skip. Setting only one of the two gives
-you either a skipped test or a `workSpace == 0` failure.
+you either a skipped test or a host-side unsupported-workspace error.
 
 Wrap the hardware run in `task-submit` on a shared box.
 

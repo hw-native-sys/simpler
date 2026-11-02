@@ -79,6 +79,18 @@ def _retained(worker, members):
     return saved[0]
 
 
+def test_explicit_empty_workspace_selection_round_trips_to_chip(domain_worker):
+    worker, members = domain_worker
+    saved = []
+    request = _request(members, workspace_engines=[])
+    worker.run(lambda orch, _args, _cfg: saved.append(orch.allocate_domain(**request)))
+    assert saved[0]._config.workspace_mask() == 0
+    worker.run(lambda orch, _args, _cfg: saved.append(orch.get_or_allocate_domain(**request)))
+    assert saved[0] is saved[1]
+    worker.run(lambda orch, _args, _cfg: saved.append(orch.get_or_allocate_domain(**_request(members))))
+    assert saved[0] is saved[2]
+
+
 def _tensor_args(domain):
     args = TaskArgs()
     args.add_tensor(domain.member(0).buffers["payload"].tensor([8], DataType.UINT8))

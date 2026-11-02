@@ -60,6 +60,7 @@ platform_single_case(test_kernel_execution_state.cpp
     SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/kernel_execution_state.cpp)
 
 platform_single_case(test_lane_mask.cpp)
+platform_single_case(test_comm_workspaces.cpp)
 
 # The growth coordinator is production: the onboard host runtime links this
 # same translation unit, so the trim, the retry policy and the holder discovery

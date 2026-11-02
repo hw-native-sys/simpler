@@ -15,8 +15,6 @@ async event. The consumer depends on that output and writes
 ``result = out + 1``.
 """
 
-import os
-
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -28,26 +26,12 @@ from simpler_setup.scene_test import _rehosted_buffer_for, _rehosted_ref_for
 N = 128 * 128
 NRANKS = 2
 DTYPE_NBYTES = 4
-_URMA_WORKSPACE_ENV = "SIMPLER_ENABLE_PTO_URMA_WORKSPACE"
-_WORKSPACE_TRUTHY = {"1", "ON", "TRUE", "YES"}
-
-
-def _urma_workspace_enabled():
-    return os.environ.get(_URMA_WORKSPACE_ENV, "").upper() in _WORKSPACE_TRUTHY
-
-
-def _require_sdma_workspace():
-    if _urma_workspace_enabled():
-        raise RuntimeError(
-            "sdma_async_completion_demo requires the default SDMA backend; "
-            f"unset {_URMA_WORKSPACE_ENV} and rebuild simpler."
-        )
 
 
 def sdma_async_completion_orch_fn(orch, callables, task_args, config):
-    _require_sdma_workspace()
     input_nbytes = N * DTYPE_NBYTES
     with orch.allocate_domain(
+        workspace_engines=("sdma",),
         name="default",
         workers=list(range(NRANKS)),
         window_size=max(input_nbytes, 4 * 1024),
@@ -71,10 +55,6 @@ def sdma_async_completion_orch_fn(orch, callables, task_args, config):
 
 
 @pytest.mark.sdma(worker_workspace=False)
-@pytest.mark.skipif(
-    _urma_workspace_enabled(),
-    reason="SDMA demo requires the default SDMA backend; unset SIMPLER_ENABLE_PTO_URMA_WORKSPACE and rebuild simpler.",
-)
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestSdmaAsyncCompletionDemo(SceneTestCase):
     CALLABLE = {
