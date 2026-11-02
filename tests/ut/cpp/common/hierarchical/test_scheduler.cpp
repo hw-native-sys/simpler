@@ -693,9 +693,14 @@ public:
     bool activate_progress(RunId run_id) override {
         ProgressCall call(*this);
         std::lock_guard<std::mutex> lk(mu_);
+        ++activation_attempts_[run_id];
         for (const auto &[dispatch_id, outstanding] : outstanding_) {
             (void)dispatch_id;
             if (outstanding.dispatch.prepare_only && outstanding.run_id == run_id) {
+                if (declined_activation_attempts_ != 0) {
+                    --declined_activation_attempts_;
+                    return false;
+                }
                 activated_runs_.insert(run_id);
                 cv_.notify_all();
                 return true;
@@ -736,6 +741,26 @@ public:
         return cv_.wait_for(lk, timeout, [this, count] {
             return submitted_.size() >= count;
         });
+    }
+
+    size_t activation_attempts(RunId run_id) const {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto found = activation_attempts_.find(run_id);
+        return found == activation_attempts_.end() ? 0 : found->second;
+    }
+
+    void decline_next_activation_attempts(size_t attempts) {
+        std::lock_guard<std::mutex> lk(mu_);
+        declined_activation_attempts_ = attempts;
+    }
+
+    void emit_staged(const WorkerDispatch &dispatch, MailboxPreparationDisposition disposition) {
+        std::lock_guard<std::mutex> lk(mu_);
+        WorkerEndpointProgress progress;
+        progress.kind = WorkerProgressKind::FRAME_STAGED;
+        progress.dispatch = dispatch;
+        progress.preparation_disposition = disposition;
+        events_.push_back(std::move(progress));
     }
 
     bool wait_activated(RunId run_id, std::chrono::milliseconds timeout = std::chrono::seconds(3)) {
@@ -895,6 +920,8 @@ private:
     std::unordered_map<uint64_t, Outstanding> outstanding_;
     std::deque<WorkerEndpointProgress> events_;
     std::set<RunId> activated_runs_;
+    std::map<RunId, size_t> activation_attempts_;
+    size_t declined_activation_attempts_{0};
     bool stop_requested_{false};
     bool stop_terminalized_{false};
     size_t stop_request_count_{0};
@@ -1542,6 +1569,168 @@ TEST(WorkerManagerTest, SingleFrameSuccessorIsNotReportedAsStageable) {
     EXPECT_FALSE(worker->can_stage());
 
     manager.stop();
+    allocator.shutdown();
+}
+
+TEST(WorkerManagerTest, AcceptedEarlyActivationIsHandedOffOnceThroughPromotionAndReuse) {
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    TaskSlot first = make_progress_slot(allocator, /*run_id=*/11, /*pipeline_slot=*/0, /*generation=*/1);
+    TaskSlot second = make_progress_slot(allocator, /*run_id=*/12, /*pipeline_slot=*/1, /*generation=*/1);
+    WorkerThread worker;
+    auto endpoint = std::make_unique<DeterministicProgressEndpoint>();
+    auto *endpoint_ptr = endpoint.get();
+    worker.start(&allocator, [](WorkerCompletion) {}, [](WorkerDispatch) {}, std::move(endpoint));
+    worker.dispatch(WorkerDispatch{first, 0});
+    worker.dispatch_prepared(WorkerDispatch{second, 0});
+    auto submitted = endpoint_ptr->submitted();
+    ASSERT_EQ(submitted.size(), 2u);
+    endpoint_ptr->emit_staged(submitted[1], MailboxPreparationDisposition::NATIVE_PREPARED);
+    worker.progress();
+    for (int tick = 0; tick < 32; ++tick) {
+        (void)worker.authorize_staged_launch(12);
+        worker.progress();
+    }
+    EXPECT_EQ(endpoint_ptr->activation_attempts(12), 1u);
+    endpoint_ptr->emit(WorkerProgressKind::COMPLETED, submitted[0]);
+    worker.progress();
+    ASSERT_TRUE(worker.activate_prepared(12));
+    worker.progress();
+    EXPECT_EQ(endpoint_ptr->activation_attempts(12), 1u);
+    endpoint_ptr->emit(WorkerProgressKind::COMPLETED, submitted[1]);
+    worker.progress();
+
+    TaskSlot reused = make_progress_slot(allocator, /*run_id=*/12, /*pipeline_slot=*/0, /*generation=*/2);
+    worker.dispatch_prepared(WorkerDispatch{reused, 0});
+    submitted = endpoint_ptr->submitted();
+    ASSERT_EQ(submitted.size(), 3u);
+    EXPECT_NE(submitted[1].dispatch_id, submitted[2].dispatch_id);
+    endpoint_ptr->emit_staged(submitted[2], MailboxPreparationDisposition::NATIVE_PREPARED);
+    worker.progress();
+    EXPECT_TRUE(worker.authorize_staged_launch(12));
+    worker.progress();
+    EXPECT_EQ(endpoint_ptr->activation_attempts(12), 2u);
+    ASSERT_TRUE(worker.activate_prepared(12));
+    worker.progress();
+    EXPECT_EQ(endpoint_ptr->activation_attempts(12), 2u);
+    endpoint_ptr->emit(WorkerProgressKind::COMPLETED, submitted[2]);
+    worker.progress();
+    EXPECT_FALSE(worker.busy());
+    worker.stop();
+    allocator.shutdown();
+}
+
+TEST(WorkerManagerTest, DeclinedActivationRetriesUntilTheEndpointOwnsIt) {
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    TaskSlot first = make_progress_slot(allocator, /*run_id=*/21, /*pipeline_slot=*/0, /*generation=*/1);
+    TaskSlot second = make_progress_slot(allocator, /*run_id=*/22, /*pipeline_slot=*/1, /*generation=*/1);
+    WorkerThread worker;
+    auto endpoint = std::make_unique<DeterministicProgressEndpoint>();
+    auto *endpoint_ptr = endpoint.get();
+    endpoint_ptr->decline_next_activation_attempts(2);
+    worker.start(&allocator, [](WorkerCompletion) {}, [](WorkerDispatch) {}, std::move(endpoint));
+    worker.dispatch(WorkerDispatch{first, 0});
+    worker.dispatch_prepared(WorkerDispatch{second, 0});
+    const auto submitted = endpoint_ptr->submitted();
+    ASSERT_EQ(submitted.size(), 2u);
+    endpoint_ptr->emit_staged(submitted[1], MailboxPreparationDisposition::NATIVE_PREPARED);
+    worker.progress();
+    ASSERT_TRUE(worker.authorize_staged_launch(22));
+    for (size_t attempts = 1; attempts <= 3; ++attempts) {
+        worker.progress();
+        EXPECT_EQ(endpoint_ptr->activation_attempts(22), attempts);
+    }
+    EXPECT_TRUE(endpoint_ptr->wait_activated(22, std::chrono::milliseconds(0)));
+    for (int tick = 0; tick < 32; ++tick) {
+        EXPECT_FALSE(worker.authorize_staged_launch(22));
+        worker.progress();
+    }
+    EXPECT_EQ(endpoint_ptr->activation_attempts(22), 3u);
+    for (const auto &dispatch : submitted) {
+        endpoint_ptr->emit(WorkerProgressKind::COMPLETED, dispatch);
+        worker.progress();
+    }
+    worker.stop();
+    allocator.shutdown();
+}
+
+TEST(WorkerManagerTest, ActivationRequiresNativePreparationUnlessPromotedToTheFront) {
+    for (bool native_promotion : {false, true}) {
+        Ring allocator;
+        allocator.init(/*heap_bytes=*/0);
+        TaskSlot first = make_progress_slot(allocator, /*run_id=*/31, /*pipeline_slot=*/0, /*generation=*/1);
+        TaskSlot second = make_progress_slot(allocator, /*run_id=*/32, /*pipeline_slot=*/1, /*generation=*/1);
+        WorkerThread worker;
+        auto endpoint = std::make_unique<DeterministicProgressEndpoint>();
+        auto *endpoint_ptr = endpoint.get();
+        worker.start(&allocator, [](WorkerCompletion) {}, [](WorkerDispatch) {}, std::move(endpoint));
+        worker.dispatch(WorkerDispatch{first, 0});
+        worker.dispatch_prepared(WorkerDispatch{second, 0});
+        const auto submitted = endpoint_ptr->submitted();
+        ASSERT_EQ(submitted.size(), 2u);
+        EXPECT_FALSE(worker.authorize_staged_launch(32));
+        endpoint_ptr->emit_staged(submitted[1], MailboxPreparationDisposition::VALIDATED_ONLY);
+        worker.progress();
+        EXPECT_FALSE(worker.authorize_staged_launch(32));
+        worker.progress();
+        EXPECT_EQ(endpoint_ptr->activation_attempts(32), 0u);
+        if (native_promotion) {
+            endpoint_ptr->emit_staged(submitted[1], MailboxPreparationDisposition::NATIVE_PREPARED);
+            worker.progress();
+            EXPECT_TRUE(worker.authorize_staged_launch(32));
+            worker.progress();
+            EXPECT_EQ(endpoint_ptr->activation_attempts(32), 1u);
+        }
+        endpoint_ptr->emit(WorkerProgressKind::COMPLETED, submitted[0]);
+        worker.progress();
+        EXPECT_TRUE(worker.activate_prepared(32));
+        worker.progress();
+        EXPECT_EQ(endpoint_ptr->activation_attempts(32), 1u);
+        endpoint_ptr->emit(WorkerProgressKind::COMPLETED, submitted[1]);
+        worker.progress();
+        worker.stop();
+        allocator.shutdown();
+    }
+}
+
+TEST(WorkerManagerTest, AcceptedMailboxActivationPublishesAfterTheFrameArrivesWithoutAnotherHandoff) {
+    class CountingMailboxEndpoint final : public LocalMailboxEndpoint {
+    public:
+        using LocalMailboxEndpoint::LocalMailboxEndpoint;
+        bool activate_progress(RunId run_id) override {
+            ++attempts;
+            return LocalMailboxEndpoint::activate_progress(run_id);
+        }
+        size_t attempts{0};
+    };
+    alignas(8) std::array<char, MAILBOX_SIZE> mailbox{};
+    Ring allocator;
+    allocator.init(/*heap_bytes=*/0);
+    TaskSlot slot = make_progress_slot(allocator, /*run_id=*/41, /*pipeline_slot=*/0, /*generation=*/1);
+    WorkerThread worker;
+    auto endpoint = std::make_unique<CountingMailboxEndpoint>(0, mailbox.data(), mailbox.size(), -1, 2);
+    auto *endpoint_ptr = endpoint.get();
+    worker.start(&allocator, [](WorkerCompletion) {}, [](WorkerDispatch) {}, std::move(endpoint));
+    worker.dispatch_prepared(WorkerDispatch{slot, 0});
+    EXPECT_TRUE(worker.activate_prepared(41));
+    worker.progress();
+    EXPECT_EQ(endpoint_ptr->attempts, 1u);
+    auto *entry = test_entry(mailbox, 0);
+    EXPECT_EQ(test_entry_state(entry), MailboxState::IDLE);
+    const uint64_t entry_generation = entry->entry_generation;
+    test_child_consume_frame(mailbox, 0, MailboxPreparationDisposition::NATIVE_PREPARED);
+    worker.progress();
+    EXPECT_EQ(test_entry_state(entry), MailboxState::ACTIVATE);
+    for (int tick = 0; tick < 32; ++tick)
+        worker.progress();
+    EXPECT_EQ(endpoint_ptr->attempts, 1u);
+    EXPECT_EQ(entry->entry_generation, entry_generation);
+    set_test_entry_state(entry, MailboxState::TASK_DONE);
+    worker.progress();
+    EXPECT_NE(entry->entry_generation, entry_generation);
+    EXPECT_FALSE(worker.busy());
+    worker.stop();
     allocator.shutdown();
 }
 

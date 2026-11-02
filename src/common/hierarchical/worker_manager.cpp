@@ -783,7 +783,8 @@ void WorkerThread::progress() {
                 std::lock_guard<std::mutex> lane_lk(lane_mu_);
                 for (size_t index = 0; index < lanes_.size(); ++index) {
                     const LaneState &dispatch_lane = lanes_[index];
-                    if (dispatch_lane.occupied && dispatch_lane.activation_requested) {
+                    if (dispatch_lane.occupied && dispatch_lane.activation_requested &&
+                        !dispatch_lane.activation_handed_off) {
                         activate[index] = dispatch_lane.run_id;
                     }
                 }
@@ -795,7 +796,7 @@ void WorkerThread::progress() {
                         std::lock_guard<std::mutex> lane_lk(lane_mu_);
                         LaneState &dispatch_lane = lanes_[index];
                         if (dispatch_lane.occupied && dispatch_lane.run_id == activate[index]) {
-                            dispatch_lane.activation_requested = false;
+                            dispatch_lane.activation_handed_off = true;
                         }
                     }
                 } catch (const std::exception &e) {
