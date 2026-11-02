@@ -83,6 +83,28 @@ private:
     std::array<std::optional<std::string>, 3> saved_;
 };
 
+class CallerOrderRunner : public Runner {
+public:
+    RunCallerOrder &caller_order(uint32_t slot) { return *caller_orders_[slot]; }
+};
+
+// Admission follows the onboard arming prologue; transport supplies only
+// kernel submission and completion in the inherited runner.
+class ArmedAdmissionRunner : public CallerOrderRunner {
+public:
+    LaunchTransactionResult launch_execution_impl(PreparedExecution &prepared, LaunchPermit permit) override {
+        prepared.streams =
+            execution_mode_latch().is_kernel() ? borrowed_run_streams() : RunStreams{&cpu_stream_, &core_stream_};
+        const int rc = arm_run_fence(prepared);
+        if (rc != 0) return {rc, LaunchProgress::NotStarted, {}};
+        return Runner::launch_execution_impl(prepared, std::move(permit));
+    }
+
+private:
+    int cpu_stream_{0};
+    int core_stream_{0};
+};
+
 class TimeoutRunner : public Runner {
 public:
     TimeoutRunner() {
@@ -421,6 +443,130 @@ TEST_F(NativeAdmissionTest, FailurePolicyCannotReplaceTheResultOrLoseTheOwner) {
     EXPECT_FALSE(runner.can_accept_run());
     EXPECT_EQ(runner.recovery_calls, 1);
     EXPECT_EQ(runner.recovery_rc, -4321);
+}
+
+TEST_F(NativeAdmissionTest, CapacityRefusalAllowsTheSamePreparedIdentityToLaunchAgain) {
+    for (bool kernel : {false, true}) {
+        SCOPED_TRACE(kernel ? "Kernel" : "Program");
+        ArmedAdmissionRunner runner;
+        ASSERT_EQ(runner.execution_mode_latch().latch(kernel ? SIMPLER_MODE_KERNEL : SIMPLER_MODE_PROGRAM), 0);
+        if (kernel) {
+            KernelContextOps ops;
+            ops.context = &runner;
+            ops.get_current_device = fake_current_device;
+            ops.get_current_context = fake_current_context;
+            ops.create_hidden_stream = fake_create_hidden_stream;
+            ops.destroy_hidden_stream = fake_destroy_hidden_stream;
+            ops.create_event = fake_create_event;
+            ops.destroy_event = fake_destroy_event;
+            ASSERT_EQ(runner.kernel_execution_state().initialize(0, ops), 0);
+            ASSERT_EQ(runner.kernel_execution_state().mark_ready_enqueued(), 0);
+        }
+        Attempt candidate(runner, 0, 10);
+        if (kernel) {
+            candidate.args.tensor(0).address_space = AddressSpace::DEVICE;
+            candidate.args.tensor(0).transfer = TensorTransfer::NONE;
+        }
+        ASSERT_EQ(candidate.prepare(), 0);
+        auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(candidate.storage);
+        auto *prepared = state->prepared_execution.get();
+        const auto identity = prepared->identity;
+        int caller;
+        auto launch = [&] {
+            return kernel ? simpler_launch_run_on_stream(&runner, candidate.storage, &caller, nullptr) :
+                            simpler_launch_run(&runner, candidate.storage);
+        };
+        runner.launch_refusal_rc = SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+        EXPECT_EQ(launch(), SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL);
+        EXPECT_EQ(state->phase.load(), NativeRunPhase::Prepared);
+        EXPECT_EQ(state->prepared_execution.get(), prepared);
+        EXPECT_EQ(state->active_execution, nullptr);
+        EXPECT_EQ(runner.recovery_calls, 0);
+        EXPECT_EQ(runner.launch_calls, 1);
+
+        runner.launch_refusal_rc = 0;
+        EXPECT_EQ(launch(), 0);
+        EXPECT_EQ(runner.launch_calls, 2);
+        // The transport's inherited launch does not enqueue caller dependencies.
+        EXPECT_EQ(runner.caller_order(0).retire(identity), 0);
+        EXPECT_EQ(simpler_wait_run(&runner, candidate.storage), 0);
+        EXPECT_EQ(simpler_finalize_run(&runner, candidate.storage), 0);
+        if (!candidate.empty()) EXPECT_TRUE(candidate.consume_release());
+        EXPECT_TRUE(candidate.empty());
+    }
+}
+
+TEST_F(NativeAdmissionTest, UnstartedLaunchRetiresOnlyItsUnsubmittedCallerOrder) {
+    CallerOrderRunner runner;
+    Runtime runtime;
+    const NativeRunIdentity identity{10, 10, 10, 0};
+    int cpu, core;
+    auto &order = runner.caller_order(0);
+    ASSERT_EQ(order.arm(identity, nullptr, &cpu, &core), 0);
+    auto prepared = std::make_unique<Runner::PreparedExecution>(identity, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    runner.launch_refusal_rc = SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+    auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(identity));
+    EXPECT_EQ(outcome.rc, SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL);
+    EXPECT_EQ(outcome.progress, LaunchProgress::NotStarted);
+    EXPECT_EQ(outcome.prepared.get(), original);
+    EXPECT_EQ(outcome.active, nullptr);
+    EXPECT_EQ(runner.recovery_calls, 0);
+    EXPECT_EQ(order.arm(identity, nullptr, &cpu, &core), 0);
+    EXPECT_EQ(order.retire(identity), 0);
+}
+
+TEST_F(NativeAdmissionTest, RefusedCallerRollbackKeepsActiveOwnershipAndThePrimaryError) {
+    CallerOrderRunner runner;
+    Runtime runtime;
+    const NativeRunIdentity identity{10, 10, 10, 0};
+    const NativeRunIdentity other{11, 11, 11, 0};
+    int cpu, core;
+    auto &order = runner.caller_order(0);
+    ASSERT_EQ(order.arm(other, nullptr, &cpu, &core), 0);
+    auto prepared = std::make_unique<Runner::PreparedExecution>(identity, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    runner.launch_refusal_rc = SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+    runner.recovery_throws = true;
+    auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(identity));
+    EXPECT_EQ(outcome.rc, SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL);
+    EXPECT_EQ(outcome.progress, LaunchProgress::Partial);
+    EXPECT_EQ(outcome.prepared, nullptr);
+    EXPECT_NE(outcome.active, nullptr);
+    if (outcome.active != nullptr) {
+        EXPECT_EQ(outcome.active->prepared.get(), original);
+        EXPECT_EQ(outcome.active->progress, LaunchProgress::Partial);
+    }
+    EXPECT_FALSE(outcome.receipt.valid());
+    EXPECT_EQ(runner.recovery_calls, 1);
+    EXPECT_EQ(runner.recovery_rc, SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL);
+    EXPECT_FALSE(runner.can_accept_run());
+    EXPECT_NE(order.arm(identity, nullptr, &cpu, &core), 0);
+    EXPECT_EQ(order.retire(other), 0);
+}
+
+TEST_F(NativeAdmissionTest, PartialLaunchDoesNotRetireItsCallerOrder) {
+    CallerOrderRunner runner;
+    Runtime runtime;
+    const NativeRunIdentity identity{10, 10, 10, 0};
+    int cpu, core;
+    auto &order = runner.caller_order(0);
+    ASSERT_EQ(order.arm(identity, nullptr, &cpu, &core), 0);
+    auto prepared = std::make_unique<Runner::PreparedExecution>(identity, runtime, CallConfig{}, 0);
+    auto *original = prepared.get();
+    runner.launch_refusal_rc = SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL;
+    runner.partial_launch = true;
+    auto outcome = runner.launch_execution(std::move(prepared), NativeRunExecutionTestPeer::mint(identity));
+    EXPECT_EQ(outcome.rc, SIMPLER_RUNTIME_ERR_DIAGNOSTIC_CAPACITY_FULL);
+    EXPECT_EQ(outcome.progress, LaunchProgress::Partial);
+    EXPECT_EQ(outcome.prepared, nullptr);
+    ASSERT_NE(outcome.active, nullptr);
+    EXPECT_EQ(outcome.active->prepared.get(), original);
+    EXPECT_EQ(outcome.active->progress, LaunchProgress::Partial);
+    EXPECT_EQ(runner.recovery_calls, 1);
+    EXPECT_EQ(order.arm(identity, nullptr, &cpu, &core), PTO_RUNTIME_ERR_INVALID_STATE);
+    // The transport's inherited launch does not enqueue caller dependencies.
+    EXPECT_EQ(order.retire(identity), 0);
 }
 
 TEST_F(NativeAdmissionTest, CompleteSubmissionHandsOffItsOwnerWithoutAnyLaterAllocation) {
