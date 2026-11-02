@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -79,11 +80,16 @@ TEST(ChipSwimlaneCollectorTest, CollectedRecordsCarryTheirRunAfterTheBufferIsReu
     buf.records[0].reg_task_id = 5;
     buf.records[0].task_token = simpler::ut::test_task_id(0xabc);
 
+    std::vector<unsigned char> storage(sizeof(buf) + alignof(ChipSwimlaneAicoreTaskBuffer));
+    auto *mapping = storage.data() + alignof(uint64_t);
+    ASSERT_NE(reinterpret_cast<uintptr_t>(mapping) % alignof(ChipSwimlaneAicoreTaskRecord), 0u);
+    std::memcpy(mapping, &buf, sizeof(buf));
+
     ReadyBufferInfo info{};
     info.type = ProfBufferType::AICORE_TASK;
     info.index = 0;
-    info.dev_buffer_ptr = &buf;
-    info.host_buffer_ptr = &buf;
+    info.dev_buffer_ptr = mapping;
+    info.host_buffer_ptr = mapping;
     info.buffer_seq = 3;
     collector.on_buffer_collected(info, /*collector_shard=*/0);
 
@@ -91,6 +97,7 @@ TEST(ChipSwimlaneCollectorTest, CollectedRecordsCarryTheirRunAfterTheBufferIsReu
     buf.run_epoch = 92;
     buf.local_seq = 0;
     buf.records[0].reg_task_id = 99;
+    std::memcpy(mapping, &buf, sizeof(buf));
 
     const auto records = collector.collected_aicore_records_for_test();
     ASSERT_EQ(records.size(), 1u);

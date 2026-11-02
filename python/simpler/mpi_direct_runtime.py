@@ -23,8 +23,9 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TypedDict, cast
 
+from .mpi_direct_bootstrap import receive_startup
 from .mpi_direct_cleanup import MpiDirectCleanupReport, _RankCleanupReporter, cleanup_failure
 from .mpi_direct_protocol import (
     MPI_DIRECT_STARTUP_TOKEN_ENV,
@@ -43,8 +44,17 @@ LIFECYCLE_TAG = int(MpiDirectTag.LIFECYCLE)
 _MPI_GATE_RETRY_INTERVAL_S = 0.01
 
 
+class _UnconfirmedExecutorDrain(RuntimeError):
+    pass
+
+
 class _MpiDirectCleanupError(RuntimeError):
     pass
+
+
+class _CommandLoopOptions(TypedDict, total=False):
+    cleanup_errors: list[BaseException]
+    task_completed: Callable[[], None] | None
 
 
 def _launcher_rank() -> int:
@@ -118,8 +128,10 @@ def _pre_mpi_gate(
     rank: int,
     timeout_s: float,
     error: BaseException | None = None,
+    *,
+    deadline: float | None = None,
 ) -> None:
-    deadline = time.monotonic() + float(timeout_s)
+    deadline = time.monotonic() + float(timeout_s) if deadline is None else deadline
     last_error: BaseException | None = None
     while True:
         remaining = deadline - time.monotonic()
@@ -249,10 +261,19 @@ class _ControllerProgress:
 
 class MpiDirectControllerContext:
     def __init__(
-        self, MPI, world, topology: MpiDirectTopology, session_id: int, reporter: _RankCleanupReporter | None = None
+        self,
+        MPI,
+        world,
+        topology: MpiDirectTopology,
+        session_id: int,
+        reporter: _RankCleanupReporter | None = None,
+        startup_record: dict | None = None,
     ) -> None:
         from _task_interface import _MpiDirectTransportHub  # noqa: PLC0415
 
+        self._startup_record = startup_record or {}
+        self.startup_parameters = self._startup_record.get("parameters", {})
+        self.startup_registry = {}
         self.topology = topology
         self.session_id = int(session_id)
         self.cluster_id = f"mpi-direct-{self.session_id:016x}"
@@ -278,10 +299,19 @@ class MpiDirectControllerContext:
         return worker_ids
 
     def create_worker(self, **config):
+        """Attach an L4 Worker with the initial registry installed before init()."""
         from .worker import Worker  # noqa: PLC0415
 
         worker = Worker(level=4, **config)
         self.attach(worker)
+        from .remote_l3_session import _install_manifest_inner_registry  # noqa: PLC0415
+
+        manifest = {
+            **self._startup_record,
+            "platform": str(config.get("platform", "")),
+            "runtime": str(config.get("runtime", "")),
+        }
+        self.startup_registry = _install_manifest_inner_registry(manifest, worker)
         return worker
 
     def close(self) -> None:
@@ -459,9 +489,15 @@ def _load_controller(target: str) -> Callable[[MpiDirectControllerContext], Any]
 
 
 def _run_controller(
-    MPI, world, topology: MpiDirectTopology, session_id: int, target: str, reporter: _RankCleanupReporter | None = None
+    MPI,
+    world,
+    topology: MpiDirectTopology,
+    session_id: int,
+    target: str,
+    reporter: _RankCleanupReporter | None = None,
+    startup_record: dict | None = None,
 ) -> None:
-    context = MpiDirectControllerContext(MPI, world, topology, session_id, reporter)
+    context = MpiDirectControllerContext(MPI, world, topology, session_id, reporter, startup_record)
     try:
         _load_controller(target)(context)
     except BaseException:
@@ -475,7 +511,15 @@ def _run_controller(
 
 
 def _run_executor(
-    MPI, world, topology: MpiDirectTopology, session_id: int, spec, worker, reporter: _RankCleanupReporter | None = None
+    MPI,
+    world,
+    topology: MpiDirectTopology,
+    session_id: int,
+    spec,
+    worker,
+    reporter: _RankCleanupReporter | None = None,
+    *,
+    startup_state=None,
 ) -> int:
     from .remote_l3_session import _run_command_loop  # noqa: PLC0415
 
@@ -490,10 +534,14 @@ def _run_executor(
         "node_rank": spec.rank - 1,
         "node_count": len(topology.executors),
     }
+    dispatch_registry, inner_handles, hook_state = startup_state or ({}, {}, None)
     cleanup_errors: list[BaseException] = []
     fatal_error: BaseException | None = None
     try:
-        _run_command_loop(channel, manifest, worker, {}, {}, cleanup_errors=cleanup_errors)  # type: ignore[arg-type]
+        kwargs: _CommandLoopOptions = {"cleanup_errors": cleanup_errors}
+        if hook_state is not None:
+            kwargs["task_completed"] = getattr(hook_state, "task_completed", None)
+        _run_command_loop(cast(socket.socket, channel), manifest, worker, inner_handles, dispatch_registry, **kwargs)
     except BaseException as exc:  # noqa: BLE001
         fatal_error = exc
     failures = [cleanup_failure("command-loop buffer release", exc) for exc in cleanup_errors]
@@ -506,19 +554,89 @@ def _run_executor(
         if fatal_error is None:
             fatal_error = exc
     try:
-        worker.close()
+        _close_executor_resources(worker, hook_state)
     except BaseException as exc:  # noqa: BLE001
         failures.append(cleanup_failure("L3 Worker.close", exc))
-        if fatal_error is None and not isinstance(exc, Exception):
+        if isinstance(exc, _UnconfirmedExecutorDrain) or (fatal_error is None and not isinstance(exc, Exception)):
             fatal_error = exc
     if reporter is not None:
         reporter.finish(failures)
+    if isinstance(fatal_error, _UnconfirmedExecutorDrain):
+        print(str(fatal_error), file=sys.stderr, flush=True)
+        os._exit(124)
     if fatal_error is not None:
         raise fatal_error
     return 1 if failures else 0
 
 
-def run_runtime(
+def _close_executor_resources(worker, hook_state):
+    error = None
+    try:
+        worker.close()
+    except BaseException as exc:
+        error = exc
+    if hook_state is not None:
+        try:
+            drained = (
+                callable(getattr(worker, "_has_live_resources", None))
+                and not worker._has_live_resources()
+                and not getattr(worker, "_accepted_run_handles", ())
+                and not getattr(worker, "_abandoned_run_handles", ())
+                and not getattr(worker, "_active_ops", 0)
+            )
+        except BaseException:
+            drained = False
+        if not drained:
+            raise _UnconfirmedExecutorDrain("worker teardown is unconfirmed; retaining hook state") from error
+        hook_state.close()
+    if error is not None:
+        raise error
+
+
+def _prepare_executor(worker, spec, record, deadline, state=None):
+    from .remote_l3_protocol import CallableKind  # noqa: PLC0415
+    from .remote_l3_session import (  # noqa: PLC0415
+        _install_manifest_dispatcher_registry,
+        _install_manifest_inner_registry,
+    )
+    from .startup_preparation import NodeStartupContext, _install_node_artifacts, _invoke_node_hook  # noqa: PLC0415
+
+    state = state if state is not None else [None]
+    roots = _install_node_artifacts(record.get("startup_artifacts", []))
+    manifest = {**record, **spec.to_dict()}
+    inner = _install_manifest_inner_registry(manifest, worker)
+    dispatch = _install_manifest_dispatcher_registry(manifest)
+    hook = _invoke_node_hook(
+        record.get("startup_hook"),
+        NodeStartupContext(
+            rank=spec.worker_id,
+            artifact_roots=roots,
+            inner_worker=worker,
+            chip_handles={
+                digest.hex(): handle for (kind, digest), handle in inner.items() if kind == CallableKind.CHIP_CALLABLE
+            },
+            parameters={},
+        ),
+    )
+    state[0] = hook
+    worker.init(_startup_deadline=deadline)
+    return dispatch, inner, hook
+
+
+def _receive_rank_startup(host, port, token, rank, deadline):
+    with socket.create_connection((host, port), timeout=max(0.001, deadline - time.monotonic())) as sock:
+        _gate_send(sock, {"token": token, "rank": rank, "state": "bootstrap"})
+        response = _gate_recv(sock, deadline)
+        if response.get("token") != token or response.get("state") != "bootstrap":
+            raise RuntimeError("MPI bootstrap authentication failed")
+        timeout_s = response["timeout_s"]
+        if not isinstance(timeout_s, (int, float, str)):
+            raise ValueError("MPI bootstrap timeout must be numeric")
+        deadline = min(deadline, time.monotonic() + float(timeout_s))
+        return receive_startup(sock, deadline), deadline
+
+
+def run_runtime(  # noqa: PLR0912 -- rank startup and cleanup share the prefork resource owner
     manifest_json: str,
     controller: str,
     *,
@@ -536,10 +654,20 @@ def run_runtime(
     rank = _launcher_rank()
     if rank < 0 or rank >= topology.world_size:
         raise ValueError("launcher rank is outside the topology world")
+    deadline = time.monotonic() + topology.startup_timeout_s
     worker = None
+    startup_record = {}
+    startup_state = None
+    hook_state = [None]
     startup_error: BaseException | None = None
     try:
+        if data.get("bootstrap"):
+            startup_record, deadline = _receive_rank_startup(startup_host, startup_port, startup_token, rank, deadline)
         _assert_native_wire_constants()
+        if rank == 0:
+            from .startup_preparation import _install_node_artifacts  # noqa: PLC0415
+
+            _install_node_artifacts(startup_record.get("startup_artifacts", []))
         if rank != 0:
             from .worker import Worker  # noqa: PLC0415
 
@@ -547,6 +675,7 @@ def run_runtime(
             launcher_fds = _open_fds()
             worker = Worker(
                 level=3,
+                enable_sdma=spec.enable_sdma,
                 platform=spec.platform,
                 runtime=spec.runtime,
                 device_ids=spec.device_ids,
@@ -556,15 +685,33 @@ def run_runtime(
                 startup_timeout_s=topology.startup_timeout_s,
                 fork_child_close_fds=launcher_fds,
             )
-            worker.init()
+            if data.get("bootstrap"):
+                startup_state = _prepare_executor(worker, spec, startup_record, deadline, hook_state)
+            else:
+                worker.init(_startup_deadline=deadline)
     except BaseException as exc:
         startup_error = exc
+    try:
+        _pre_mpi_gate(
+            startup_host,
+            startup_port,
+            startup_token,
+            rank,
+            topology.startup_timeout_s,
+            startup_error,
+            deadline=deadline,
+        )
+        if startup_error is not None:
+            raise startup_error
+    except BaseException:
         if worker is not None:
-            with contextlib.suppress(BaseException):
-                worker.close()
-    _pre_mpi_gate(startup_host, startup_port, startup_token, rank, topology.startup_timeout_s, startup_error)
-    if startup_error is not None:
-        raise startup_error
+            try:
+                _close_executor_resources(worker, hook_state[0])
+            except _UnconfirmedExecutorDrain:
+                os._exit(124)
+            except BaseException:
+                traceback.print_exc(file=sys.stderr)
+        raise
 
     MPI = _import_mpi()
     world = None
@@ -587,10 +734,19 @@ def run_runtime(
     try:
         world = _init_mpi(MPI, rank, topology.world_size)
         if rank == 0:
-            _run_controller(MPI, world, topology, session_id, controller, reporter)
+            _run_controller(MPI, world, topology, session_id, controller, reporter, startup_record)
         else:
             assert worker is not None
-            return _run_executor(MPI, world, topology, session_id, topology.executor_for_rank(rank), worker, reporter)
+            return _run_executor(
+                MPI,
+                world,
+                topology,
+                session_id,
+                topology.executor_for_rank(rank),
+                worker,
+                reporter,
+                startup_state=startup_state,
+            )
         return 0
     except _MpiDirectCleanupError:
         return 1

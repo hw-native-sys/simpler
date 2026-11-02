@@ -95,9 +95,10 @@ struct TestFreeQueue {
     volatile uint64_t buffer_ptrs[kSlotCount]{};
 };
 
-struct TestReadyEntry {
+struct alignas(32) TestReadyEntry {
     uint64_t buffer_ptr{0};
     uint32_t buffer_seq{0};
+    uint32_t reserved[5]{};
 };
 
 // Mirrors the real subsystems: the ready-queue array is dimensioned by the
@@ -243,6 +244,31 @@ bool wait_for_collected(const Collector &c, int expected, std::chrono::milliseco
 }
 
 }  // namespace
+
+TEST(ProfilerBaseTest, PeekReadsOveralignedEntryFromByteMappedStorage) {
+    TestHeader expected{};
+    expected.queue_heads[1] = 3;
+    expected.queue_tails[1] = 4;
+    expected.queues[1][3].buffer_ptr = 0x1234;
+    expected.queues[1][3].buffer_seq = 42;
+    expected.queues[1][3].reserved[4] = 17;
+    alignas(TestHeader) unsigned char storage[sizeof(TestHeader) + alignof(TestHeader)]{};
+    auto *mapping = storage + alignof(uint64_t);
+    std::memcpy(mapping, &expected, sizeof(expected));
+    ASSERT_NE(reinterpret_cast<uintptr_t>(mapping) % alignof(TestReadyEntry), 0u);
+
+    TestCollector<PerThreadModule> collector;
+    collector.init(2, mapping);
+    TestReadyEntry entry{};
+    ASSERT_TRUE(
+        profiling_common::ProfilerAlgorithms<PerThreadModule>::try_peek_aicpu_entry(
+            collector.manager(), reinterpret_cast<TestHeader *>(mapping), 1, entry, true
+        )
+    );
+    EXPECT_EQ(entry.buffer_ptr, 0x1234u);
+    EXPECT_EQ(entry.buffer_seq, 42u);
+    EXPECT_EQ(entry.reserved[4], 17u);
+}
 
 TEST(ProfilerBaseTest, ReinitializedContextIsAvailableBeforeStart) {
     TestHeader previous{};

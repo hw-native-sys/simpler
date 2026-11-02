@@ -24,8 +24,8 @@ rarely that a clean run is not evidence of anything, which is why the existing
 smoke passes while the defect is live.
 
 How long the window may be is set elsewhere, not chosen here: the onboard lanes
-cap a single task at `SIMPLER_SCHEDULER_TIMEOUT_MS=2000`, so the window is
-about 0.9 s and the loss is a minority of runs. See `_SPIN_ITERS` for what that
+cap a single task at `SIMPLER_SCHEDULER_TIMEOUT_MS=2000`, so the synthetic delay
+is bounded to one second and the loss is a minority of runs. See `_SPIN_ITERS` for what that
 makes a pass worth.
 
 The payload is ``worker_async_fifo``'s: one spinning ``delayed_add`` followed by
@@ -50,12 +50,11 @@ _SIZE = 128 * 128
 #: Scalar-add steps the orchestration submits after the spinning task. Must
 #: agree with `kChainLength` in pipelined_vector_orch.cpp.
 _CHAIN_LENGTH = 512
-#: Iterations of the first task's device spin, which is what holds the counting
-#: window open. `worker_async_fifo`'s own count, and the longest this may be:
+#: Upper iteration bound for the first task's device spin, which holds the
+#: counting window open. The shared kernel also stops after one elapsed second:
 #: the onboard lanes export `SIMPLER_SCHEDULER_TIMEOUT_MS=2000`, and a single
 #: task that outlasts that budget is reaped as a scheduler timeout rather than
-#: measured. This spin runs about 0.9 s, so the window is under half the
-#: budget.
+#: measured. The elapsed bound leaves half that budget for scheduling.
 #:
 #: That bounds how much of the defect one run can see. At a window this long
 #: the counters are lost in a minority of runs, not in most of them — the rate
@@ -64,17 +63,15 @@ _CHAIN_LENGTH = 512
 #: evidence: this case is a regression barrier, which accumulates across CI
 #: runs, rather than a detector that settles the question in one.
 _SPIN_ITERS = 200_000_000
-#: Floor on the spinning task's counter. The spin measures 1.6333e9 cycles, and
-#: that is a property of the loop's pipeline rather than of the core's clock:
-#: at four times this count it varied by 1294 cycles — two parts in ten million
-#: — across five runs. The floor sits far below it anyway, because its job is
-#: to catch a window that stopped early, not to pin the measurement.
+#: Floor on the spinning task's counter, below both the complete loop's measured
+#: 1.6333e9 cycles and the one-second elapsed limit. Its job is to catch a
+#: counting window that stopped early, not to require an exact iteration count.
 _SPIN_CYCLES_FLOOR = 1_000_000_000
 
 
 @scene_test(level=2, runtime="host_build_graph")
 class TestPmuCountingWindow(SceneTestCase):
-    """Every row of a 513-task run counted, over a window held open ~0.9 s."""
+    """Every row of a 513-task run counted, over a delay bounded to one second."""
 
     CALLABLE = {
         "orchestration": {
@@ -184,7 +181,7 @@ class TestPmuCountingWindow(SceneTestCase):
         zeros = [i for i, c in enumerate(cycles) if c == 0]
         assert not zeros, (
             f"{len(zeros)} of {len(cycles)} PMU rows report zero cycles over a window held open for "
-            f"{_SPIN_ITERS} spin iterations. The rows carry this run's task identities, so the records "
+            f"up to {_SPIN_ITERS} spin iterations or one elapsed second. The rows carry this run's task identities, "
             f"were produced and attributed and only the counter values are zero: the window stopped "
             f"counting rather than never having been armed. First row indices: {zeros[:16]}"
         )
@@ -197,6 +194,6 @@ class TestPmuCountingWindow(SceneTestCase):
         spin_cycles = cycles[spins[0]]
         assert spin_cycles >= _SPIN_CYCLES_FLOOR, (
             f"the spinning task counted {spin_cycles} cycles against a floor of {_SPIN_CYCLES_FLOOR} for "
-            f"{_SPIN_ITERS} iterations: non-zero but short, so the window was counting and stopped before "
+            f"a delay bounded by {_SPIN_ITERS} iterations and one second: short, so counting stopped before "
             f"the task ended. Highest four rows overall: {sorted(cycles)[-4:]}"
         )
