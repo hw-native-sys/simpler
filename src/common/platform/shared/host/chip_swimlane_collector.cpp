@@ -101,6 +101,31 @@ bool recycled_seed_capacity_is_sufficient(
 
 }  // namespace
 
+void ChipSwimlaneCollector::stop_for_device_failure() {
+    stop_run_writer();
+    profiling_common::ProfilerBase<ChipSwimlaneCollector, ChipSwimlaneModule>::stop(false);
+    size_t held = 0;
+    uint64_t first_epoch = 0;
+    for (const auto &bucket : retained_runs_) {
+        const int state = bucket.state.load(std::memory_order_acquire);
+        if (state == static_cast<int>(EpochState::Free) || state == static_cast<int>(EpochState::Quarantined)) continue;
+        if (held++ == 0) first_epoch = bucket.epoch.load(std::memory_order_acquire);
+    }
+    if (held != 0) {
+        char detail[192];
+        std::snprintf(
+            detail, sizeof(detail), "fatal stop left %zu unpublished run(s), first run %llu", held,
+            static_cast<unsigned long long>(first_epoch)
+        );
+        publish_fatal(detail);
+    }
+}
+
+void ChipSwimlaneCollector::abandon_after_device_reset() {
+    abandon_memory_after_device_reset();
+    perf_shared_mem_dev_ = nullptr;
+}
+
 ChipSwimlaneCollector::~ChipSwimlaneCollector() {
     stop();
     if (shm_host_ != nullptr) {

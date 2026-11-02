@@ -94,6 +94,7 @@ void ArgsDumpCollector::RetainedEpoch::reset_run_state(size_t bucket_count, int 
     cut_slot = -1;
     cut_request = 0;
     target_installed = false;
+    abandonment_recorded = false;
     cut_settled_at_close = false;
     fixed_charge = 0;
 }
@@ -1051,6 +1052,24 @@ bool ArgsDumpCollector::retained_drain_payload_batch(int max_requests) {
     return drained_any;
 }
 
+void ArgsDumpCollector::retained_drain_copied_payloads() {
+    if (!retain_across_runs_) return;
+    // Every producer and both writers are joined. Only copied host payloads
+    // remain; sealing would ask stopped shards to release their references.
+    try {
+        while (retained_drain_payload_batch(kWriterPayloadBatch)) {}
+        for (auto &epoch : retained_epochs_) {
+            if (!epoch.payload_opened) continue;
+            epoch.payload_file.flush();
+            if (!epoch.payload_file.good()) epoch.io_failed.store(true, std::memory_order_relaxed);
+        }
+    } catch (const std::exception &error) {
+        retained_set_fatal(error.what());
+    } catch (...) {
+        retained_set_fatal("the copied-payload drain failed");
+    }
+}
+
 void ArgsDumpCollector::retained_writer_loop() {
     while (retained_writer_running_.load(std::memory_order_acquire)) {
         uint64_t seen = 0;
@@ -1458,11 +1477,26 @@ void ArgsDumpCollector::retained_finish() {
 
 void ArgsDumpCollector::finish_retained_runs() { retained_finish(); }
 
+void ArgsDumpCollector::retained_note_unpublished_runs_abandoned() {
+    for (auto &epoch : retained_epochs_) {
+        const int state = epoch.state.load(std::memory_order_acquire);
+        if (state == static_cast<int>(EpochState::Free) || state == static_cast<int>(EpochState::Quarantined) ||
+            epoch.abandonment_recorded)
+            continue;
+        epoch.abandonment_recorded = true;
+        retained_errors_.record(
+            epoch.epoch.load(std::memory_order_acquire), Verdict::Abandoned,
+            "the collector was torn down before this run was published"
+        );
+    }
+}
+
 void ArgsDumpCollector::retained_release_resources() {
     if (!retained_ready_.exchange(false, std::memory_order_acq_rel)) return;
     set_drain_quantum(0);
     set_run_counters(false);
     report_drain_drops();
+    retained_note_unpublished_runs_abandoned();
     for (size_t slot = 0; slot < retained_epochs_.size(); slot++) {
         const int state = retained_epochs_[slot].state.load(std::memory_order_acquire);
         if (state == static_cast<int>(EpochState::Free)) continue;
@@ -1474,11 +1508,6 @@ void ArgsDumpCollector::retained_release_resources() {
         // not prove a release, and a withdrawn admission has already returned
         // its slot as `Free`: it promised no file, so recording one for it
         // would make a rolled-back launch read as lost output.
-        if (state != static_cast<int>(EpochState::Quarantined)) {
-            retained_errors_.record(
-                run_epoch, Verdict::Abandoned, "the collector was torn down before this run was published"
-            );
-        }
         LOG_WARN(
             "Args dump: run %llu storage is held until the collector threads are joined",
             static_cast<unsigned long long>(run_epoch)

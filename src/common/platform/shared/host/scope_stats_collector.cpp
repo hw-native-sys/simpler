@@ -44,6 +44,18 @@
 #include "host/profiling_copy.h"
 #include "../../../worker/runtime_c_api.h"
 
+void ScopeStatsCollector::stop_for_device_failure() {
+    stop_writer();
+    profiling_common::ProfilerBase<ScopeStatsCollector, ScopeStatsModule>::stop(false);
+}
+
+void ScopeStatsCollector::abandon_after_device_reset() {
+    terminal_banks_.abandon_after_device_reset();
+    abandon_memory_after_device_reset();
+    shm_dev_ = nullptr;
+    initialized_ = false;
+}
+
 ScopeStatsCollector::~ScopeStatsCollector() {
     // The writer outlives the collector threads, so it is joined here too: a
     // joinable thread left behind at destruction terminates the process.

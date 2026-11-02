@@ -176,6 +176,10 @@ class DepGenCollector : public profiling_common::ProfilerBase<DepGenCollector, D
 public:
     DepGenCollector() = default;
     ~DepGenCollector();
+    /** Join host readers without a final device drain. */
+    void stop_for_device_failure();
+    /** Forget backing only after confirmed reset and host-reader stop. */
+    void abandon_after_device_reset();
 
     DepGenCollector(const DepGenCollector &) = delete;
     DepGenCollector &operator=(const DepGenCollector &) = delete;

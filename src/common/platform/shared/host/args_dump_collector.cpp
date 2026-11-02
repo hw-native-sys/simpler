@@ -48,6 +48,25 @@
 // ArgsDumpCollector
 // =============================================================================
 
+void ArgsDumpCollector::stop_for_device_failure() {
+    retained_stop_writer();
+    profiling_common::ProfilerBase<ArgsDumpCollector, DumpModule>::stop(false);
+    // Only collector threads create the ordinary writer lazily. Join those
+    // producers before reading its thread object, then finish copied payloads.
+    if (writer_thread_.joinable()) {
+        request_writer_stop();
+        writer_thread_.join();
+    }
+    retained_drain_copied_payloads();
+    retained_note_unpublished_runs_abandoned();
+}
+
+void ArgsDumpCollector::abandon_after_device_reset() {
+    terminal_banks_.abandon_after_device_reset();
+    abandon_memory_after_device_reset();
+    dump_shared_mem_dev_ = nullptr;
+}
+
 ArgsDumpCollector::~ArgsDumpCollector() {
     // Both threads this collector can own, in the order that cannot leave one
     // joinable: a `std::thread` destroyed while joinable terminates the
@@ -1156,21 +1175,21 @@ int ArgsDumpCollector::finalize(DumpUnregisterCallback unregister_cb, const Dump
     }
 
     // ProfilerBase::stop() only joins the mgmt + poll threads. The writer
-    // thread is otherwise torn down solely by export_dump_files(), so any path
-    // that skips export — e.g. drain bailing on a device error before its
+    // thread is also joined by export_dump_files() and fatal stop. A path
+    // that reaches neither — e.g. drain bailing on a device error before its
     // collector-teardown block — would leak it: left blocked on write_cv_ with
     // writer_done_ == false while writer_thread_ stays joinable, which trips
     // std::terminate when the collector is destroyed or re-run. finalize() is
     // reached via device-runner active-run cleanup on every exit path, so join
     // the writer here too. Idempotent: export_dump_files() clears writer_started_
-    // on the success path, making this a no-op.
+    // on the success path, and fatal stop joins it too, making this a no-op.
     if (writer_started_ && writer_thread_.joinable()) {
         request_writer_stop();
         writer_thread_.join();
     }
 
     // The writer thread opens bin_file_ in start_writer_thread_once() and it is
-    // otherwise closed only by export_dump_files(). Close it here too so an
+    // normally closed by export_dump_files(). Close it here too so an
     // export-skipping path does not leave it open — a stale-open stream makes
     // the next run's bin_file_.open() set failbit. Guarded for idempotency.
     if (bin_file_.is_open()) {
