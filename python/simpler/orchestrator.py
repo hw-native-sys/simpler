@@ -135,7 +135,7 @@ def _reject_device_args(args: object, *, kind: str) -> None:
 
     for i in range(args.tensor_count()):
         desc = args.tensor(i).buffer
-        if desc.address_space == AddressSpace.DEVICE:
+        if desc.address_space == AddressSpace.DEVICE or args.tensor(i).mapping_ref:
             raise ValueError(
                 f"{kind}: argument {i} is a DEVICE-space tensor ({desc.backend_kind.name}); a Python "
                 f"sub-worker runs on the host and can only take HOST-space tensors"
@@ -535,6 +535,7 @@ class Orchestrator:
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
         workers: Sequence[int] | None = None,
+        host_windows=None,
     ) -> CommDomainHandle:
         """Create a domain using L3 chip ids or L4 ``(node, chip)`` members.
 
@@ -550,7 +551,13 @@ class Orchestrator:
         if workers is not None and self._worker is not None and self._worker.level != 3:
             raise TypeError("legacy workers= is only supported by an L3 Worker")
         return self._domain(
-            name, members if members is not None else workers, window_size, buffers, retain_after_run, reuse=False
+            name,
+            members if members is not None else workers,
+            window_size,
+            buffers,
+            retain_after_run,
+            reuse=False,
+            host_windows=host_windows,
         )
 
     def get_or_allocate_domain(
@@ -561,15 +568,18 @@ class Orchestrator:
         window_size: int,
         buffers: Sequence[CommBufferSpec] = (),
         retain_after_run: bool = False,
+        host_windows=None,
     ) -> CommDomainHandle:
         """Return the same live handle on an exact configuration match, otherwise create it.
 
         Member order, full buffer definitions, window request, retention and topology must match.
         A hit neither allocates nor initializes the existing window.
         """
-        return self._domain(name, members, window_size, buffers, retain_after_run, reuse=True)
+        return self._domain(
+            name, members, window_size, buffers, retain_after_run, reuse=True, host_windows=host_windows
+        )
 
-    def _domain(self, name, members, window_size, buffers, retain_after_run, *, reuse):
+    def _domain(self, name, members, window_size, buffers, retain_after_run, *, reuse, host_windows=None):
         if self._worker is None:
             raise RuntimeError("domain allocation requires an Orchestrator bound to a Worker")
         return self._worker._comm_domain(
@@ -579,6 +589,7 @@ class Orchestrator:
             buffers=buffers,
             retain_after_run=retain_after_run,
             reuse=reuse,
+            host_windows=host_windows,
         )
 
     def get_domain(self, name: str | CommDomainRef) -> CommDomainHandle:

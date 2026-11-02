@@ -105,7 +105,7 @@ class MpiGlobalDomainExchange:
         return list(result[0])
 
     def prepare_import(self, command: GlobalDomainCommand, inner_worker: Worker, worker_id: int) -> bytes | None:
-        if command.phase is not GlobalDomainPhase.PREPARE_EXPORT:
+        if command.host_windows or command.phase is not GlobalDomainPhase.PREPARE_EXPORT:
             return None
         if {int(member.node_worker_id) for member in command.members} != self._group_worker_id_set:
             return None

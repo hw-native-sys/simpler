@@ -164,7 +164,7 @@ int comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t ran
 
 int comm_global_domain_prepare(
     uint64_t domain_id, uint32_t domain_rank, uint32_t rank_count, size_t window_size, uint32_t profile,
-    CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
+    uint32_t host_enabled, CommGlobalDomainDescriptor *descriptor_out, uint64_t *local_window_base_out
 ) {
     return PTO_RUNTIME_ERR_INTERNAL;
 }
@@ -175,7 +175,10 @@ int comm_global_domain_import(
     return PTO_RUNTIME_ERR_INTERNAL;
 }
 
-int comm_global_domain_release(uint64_t domain_id) { return PTO_RUNTIME_ERR_INTERNAL; }
+int comm_global_domain_release(uint64_t domain_id, uint32_t stage) { return PTO_RUNTIME_ERR_INTERNAL; }
+
+int comm_global_domain_window(uint64_t, uint32_t, uint64_t *, size_t *) { return PTO_RUNTIME_ERR_INTERNAL; }
+int comm_global_domain_copy(uint64_t, uint64_t, uint64_t, size_t, void *) { return PTO_RUNTIME_ERR_INTERNAL; }
 
 int comm_barrier(CommHandle h) { return PTO_RUNTIME_ERR_INTERNAL; }
 

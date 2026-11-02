@@ -66,6 +66,8 @@ payload = domain.member(0).buffers["payload"]
 tensor = payload.tensor([1024], DataType.FLOAT32)
 ```
 
+Host DRAM / `host_windows` / `map_view`: [API](zh-cn/host-comm-domain-design.md).
+
 `allocate_domain` rejects a live name. `get_or_allocate_domain` returns the
 same handle only if ordered members and target identities, requested window
 size, every ordered buffer definition field, retention, and communication
