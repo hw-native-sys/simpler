@@ -118,8 +118,8 @@ Its body splits by what is per-run and what is per-pytest session:
 | Action | Called | What it does |
 | ------ | ------ | ------------ |
 | `network1-stage` | once | rsync this run's tree onto the peer and build it there |
-| `network1-run-pytest` | once | start the peer's L3 daemon, set the network1 pytest environment, run `pytest examples tests/st --level 4`, stop the daemon and pull its logs |
-| `network1-teardown` | once, `if: always()` | remove the run's tree from the peer |
+| `network1-run-pytest` | once | submit the peer daemon and local pytest through `task-submit`, then collect logs |
+| `network1-teardown` | once, `if: always()` | remove the peer tree after both tasks end and logs are copied |
 
 Staging and the peer-side build are the job's whole cost, and every network1 test
 runs against that same tree and venv, so they happen once. The pytest command
@@ -134,6 +134,26 @@ Parent-side `ASCEND_PROCESS_LOG_PATH` is split per pytest nodeid by
 The directory is uploaded on a best-effort basis: artifact-service failures are
 ignored so they cannot override the `network1` test result. Preserve relevant
 diagnostics in the inline job log as well when investigating a failure.
+
+Both hosts require `task-submit`; configured device lists alone do not reserve cards.
+The peer daemon starts in its own device task. Once its port opens, the local
+pytest starts in another device task. The daemon keeps its allocation while
+the local task queues and runs. A port already open before submission is treated
+as a stale listener and fails the job.
+
+The first workflow step records this job's start. Queue waiting can use the
+remaining 60-minute job, except for 90 seconds reserved for task cleanup and
+log collection. Pytest calculates its timeout when its task actually starts,
+so waiting in the queue leaves it whatever time remains. Both task bodies
+refuse to run if they start after that deadline. The runner records task IDs;
+cleanup cancels pending tasks or kills running ones and waits for terminal status.
+If terminal status cannot be confirmed, it retains the peer tree for diagnosis.
+
+MPI ranks started over SSH source a run-specific file with their host task's
+`TASKQUEUE_TASK_ID` and device environment. The task daemon uses this marker
+to clean up ranks that have detached from the task's original process group.
+`npu-smi` and process snapshots are captured inside the allocated tasks; raw
+work logs and task IDs are kept under `output/network1-ci-<run>-<attempt>/`.
 
 Writing an example — the files, the entry module, the `run(...)` entry point,
 the `test_*.py` network1 wrapper, and the manual `run_parent.sh` — is covered in
