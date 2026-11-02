@@ -942,4 +942,24 @@ macro(platform_case_without_axes src)
         "docs/testing/adding-a-cpp-unit-test.md — "
         "tests/lint/check_ut_cpp_axis.py checks it the same way.")
 endmacro()
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    platform_single_case(test_module_thread_value.cpp)
+    target_link_options(test_module_thread_value PRIVATE
+        -Wl,--wrap=pthread_key_create -Wl,--wrap=pthread_key_delete -Wl,--wrap=pthread_setspecific)
+else()
+    simpler_ut_exclude_case(test_module_thread_value.cpp)
+endif()
+
+foreach(consumer module_thread_value_consumer module_thread_value_peer)
+    add_library(${consumer} SHARED ${CMAKE_SOURCE_DIR}/common/support/module_thread_value_consumer.cpp)
+    target_include_directories(${consumer} PRIVATE ${SIMPLER_COMMON_PLATFORM_DIR}/include)
+    target_compile_options(${consumer} PRIVATE -fvisibility=hidden
+        $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>)
+    target_link_libraries(${consumer} PRIVATE pthread)
+endforeach()
+platform_single_case(test_module_thread_value_lifetime.cpp
+    DEFINES TEST_MODULE_THREAD_VALUE_PATH="$<TARGET_FILE:module_thread_value_consumer>"
+        TEST_MODULE_THREAD_VALUE_PEER_PATH="$<TARGET_FILE:module_thread_value_peer>"
+    LINK ${CMAKE_DL_LIBS} DEPENDS module_thread_value_consumer module_thread_value_peer)
+
 simpler_ut_glob_cases(platform_case_without_axes)

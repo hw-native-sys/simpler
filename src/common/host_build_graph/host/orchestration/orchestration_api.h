@@ -27,6 +27,8 @@
 
 #pragma once
 
+#include "common/module_thread_value.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -100,8 +102,8 @@ struct RtSubmitPhaseState {
     uint64_t count;
 };
 
-inline RtSubmitPhaseState &rt_submit_phase_state() {
-    static thread_local RtSubmitPhaseState state{};
+inline __attribute__((visibility("hidden"))) simpler::ModuleThreadValue<RtSubmitPhaseState> &rt_submit_phase_state() {
+    static simpler::ModuleThreadValue<RtSubmitPhaseState> state;
     return state;
 }
 
@@ -282,8 +284,8 @@ static inline void rt_scope_end() {
 
 static inline void rt_orchestration_done() {
     rt_graph_commit();
-    rt_submit_phase_state() = RtSubmitPhaseState{};
     OrchContext *ctx = current_orch_context();
+    if (ctx->ops->record_orch_phase != nullptr) rt_submit_phase_state().cache({});
     ctx->ops->orchestration_done(ctx);
 }
 
@@ -460,13 +462,15 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
             "a Graph boundary cannot hold a runtime-allocated output (TensorCreateInfo)"
         );
     }
-    RtSubmitPhaseState &_phase = rt_submit_phase_state();
+    // No timing consumer means no per-module keys or per-submit TLS work.
+    const bool _trace_enabled = current_orch_context()->ops->record_orch_phase != nullptr;
+    RtSubmitPhaseState _phase = _trace_enabled ? rt_submit_phase_state().get() : RtSubmitPhaseState{};
     const uint64_t _entry_ns = rt_orch_phase_now_ns();
     // Only a gap inside one orchestration is this .so's own work.
     // rt_orchestration_done() clears the state, so the submitting thread cannot carry a
     // value across that boundary at all. The duration test below is the backstop for a
     // thread that submits without ever reaching that call — a recording worker, or an
-    // orchestration that fails before completing — where the state is thread_local and
+    // orchestration that fails before completing — where the state is thread-scoped and
     // outlives the bind. Real gaps here are single-digit microseconds, so a millisecond
     // separates the two cases by three orders of magnitude.
     constexpr uint64_t kBindBoundaryNs = 1000000;
@@ -554,8 +558,11 @@ static inline GraphSubmitResult rt_submit_graph_impl(uint64_t graph_key, const G
         // not reached its first sub-task yet.
         rt_record_orch_phase(HostPhaseKind::OrchRecordHandoff, _begun_ns, _exit_ns, graph_key);
     }
-    _phase.count++;
-    _phase.prev_exit_ns = _exit_ns;
+    if (_trace_enabled) {
+        _phase.count++;
+        _phase.prev_exit_ns = _exit_ns;
+        rt_submit_phase_state().cache(_phase);
+    }
     return result;
 }
 

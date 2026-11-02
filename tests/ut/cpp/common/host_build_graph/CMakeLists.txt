@@ -60,6 +60,20 @@ endmacro()
 
 hbg_case(test_hbg_scope_mode.cpp)
 
+# Fault injection uses the ELF linker's pthread wrappers.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    hbg_case(test_hbg_host_phase_failure.cpp
+        SOURCES
+            ${HBG_HOST_DIR}/host_phase_trace.cpp
+            ${SIMPLER_SRC}/common/platform/shared/host/host_phase_records.cpp
+            ${SIMPLER_SRC}/common/log/host_log.cpp
+        LINK_OPTIONS -Wl,--wrap=pthread_key_create -Wl,--wrap=pthread_setspecific
+        TIMEOUT 30)
+else()
+    simpler_ut_exclude_case(test_hbg_host_phase_failure.cpp)
+endif()
+
+
 
 # These drive the real orchestrator, so they link the orchestrator object
 # library. That is the whole of what they have beyond a plain case.

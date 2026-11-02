@@ -14,6 +14,7 @@
  * record pool. See host_build_graph/host_phase_trace.h.
  */
 
+#include "common/module_thread_value.h"
 #include "host_build_graph/host/host_phase_trace.h"
 
 #include <stdio.h>
@@ -87,9 +88,8 @@ struct TraceState {
     std::atomic<bool> active{false};
     std::atomic<uint32_t> generation{0};
     std::atomic<uint32_t> next_lane{0};
-    // Records dropped because every lane was taken. Unreachable while the lane
-    // count covers the producer ceiling; counted rather than assumed so a workload
-    // that outgrows it says so instead of silently under-reporting.
+    // Records denied a lane by capacity or TLS setup failure. The lifecycle
+    // mutex serializes failure accounting with closing/resetting a pass.
     std::atomic<uint64_t> lane_denied{0};
     std::mutex lifecycle_mutex;
     std::atomic<uint64_t> submitted_tasks{0};
@@ -108,23 +108,41 @@ TraceState &state() {
     return s;
 }
 
-// This thread's lane for the current bind, or nullptr when every lane is taken.
+// This thread's lane, or nullptr on lane exhaustion or TLS setup failure.
 //
 // `generation` is what makes a cached lane safe to reuse: it is process-unique per
 // bind, so a lane claimed under one bind is never mistaken for a claim under
 // another. Returns the generation it claimed under, because the caller must
 // re-check it once admitted -- see host_phase_record.
 ProducerLane *producer_lane(TraceState &s, uint32_t &claimed_generation) {
-    static thread_local ProducerLane *lane = nullptr;
-    static thread_local uint32_t lane_generation = 0;
+    struct Cache {
+        ProducerLane *lane{};
+        uint32_t generation{};
+    };
     const uint32_t generation = s.generation.load(std::memory_order_acquire);
+    claimed_generation = generation;
+    static simpler::ModuleThreadValue<Cache> cache;
+    if (!cache.available()) return nullptr;
+    auto local = cache.get();
+    auto &lane = local.lane;
+    auto &lane_generation = local.generation;
     if (lane == nullptr || lane_generation != generation) {
         const uint32_t index = s.next_lane.fetch_add(1, std::memory_order_relaxed);
         lane = index < kProducerLanes ? &s.lanes[index] : nullptr;
         lane_generation = generation;
+        if (!cache.cache(local)) return nullptr;
     }
-    claimed_generation = generation;
     return lane;
+}
+
+void record_lane_denial(TraceState &s, uint32_t claimed_generation) {
+    // No lane means no admission claim to keep the pool alive. Serialize this
+    // cold path with begin/end and reject failures from a closed generation.
+    std::scoped_lock lock(s.lifecycle_mutex);
+    if (s.active.load(std::memory_order_acquire) &&
+        s.generation.load(std::memory_order_acquire) == claimed_generation) {
+        s.lane_denied.fetch_add(1, std::memory_order_relaxed);
+    }
 }
 
 // Publish-then-check against the trace lifecycle's clear-then-drain. Claiming a
@@ -183,13 +201,15 @@ uint32_t current_thread_id() {
     // A thread's identity is fixed for its lifetime, so resolve it once. This
     // runs per record on the path being measured, where a syscall would inflate
     // the very durations it is annotating.
-    static thread_local const uint32_t id = []() -> uint32_t {
+    static simpler::ModuleThreadValue<uint32_t> cached_id;
+    auto id = cached_id.get();
+    if (id != 0) return id;
 #if defined(__linux__) && defined(SYS_gettid)
-        return static_cast<uint32_t>(syscall(SYS_gettid));
+    id = static_cast<uint32_t>(syscall(SYS_gettid));
 #else
-        return static_cast<uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+    id = static_cast<uint32_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
 #endif
-    }();
+    cached_id.cache(id);
     return id;
 }
 
@@ -270,7 +290,7 @@ host_phase_record(uint64_t start_ns, uint64_t end_ns, uint32_t kind, uint64_t pa
     uint32_t claimed_generation = 0;
     ProducerLane *lane = producer_lane(s, claimed_generation);
     if (lane == nullptr) {
-        s.lane_denied.fetch_add(1, std::memory_order_relaxed);
+        record_lane_denial(s, claimed_generation);
         return;
     }
     RecordAdmission admission(s, *lane);
@@ -296,7 +316,7 @@ void host_phase_record_bind(uint32_t kind, uint64_t start_ns, const char *attrs,
     uint32_t claimed_generation = 0;
     ProducerLane *lane = producer_lane(s, claimed_generation);
     if (lane == nullptr) {
-        s.lane_denied.fetch_add(1, std::memory_order_relaxed);
+        record_lane_denial(s, claimed_generation);
         return;
     }
     RecordAdmission admission(s, *lane);
@@ -368,11 +388,12 @@ void host_phase_trace_end(const void *host_api) {
     // makes a second end() without an intervening begin() a no-op rather than a
     // stale read plus a duplicate report.
     HostPhaseRecordPool *pool = s.pool.load(std::memory_order_relaxed);
-    // Both ways a record can be lost: no buffer left in the pool, or no lane left
-    // to count it in. The second is unreachable while the lane count covers the
-    // producer ceiling, and is summed in rather than assumed away.
-    const uint64_t dropped = (pool != nullptr ? pool->dropped.load(std::memory_order_relaxed) : 0) +
-                             s.lane_denied.load(std::memory_order_relaxed);
+    // Publish lane failures into the pool's ledger before finish/export, even
+    // when no event could be stored. The summary and JSON then share one tally.
+    // active=false makes repeated end() calls unable to merge the tally twice.
+    const uint64_t denied = s.lane_denied.load(std::memory_order_relaxed);
+    const uint64_t dropped =
+        pool != nullptr ? pool->dropped.fetch_add(denied, std::memory_order_relaxed) + denied : denied;
     if (s.api != nullptr) {
         uint64_t inv = 0;
 #if SIMPLER_HOST_STRACE

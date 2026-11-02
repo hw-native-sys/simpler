@@ -105,8 +105,7 @@ void HostPhaseRecordStore::finish(uint64_t submitted_tasks, uint64_t invocation_
     finished_ = true;
     if (dropped_records() > 0) {
         LOG_WARN(
-            "Host phase pool dropped %llu of %llu records (%d buffers of %d); the per-event views are truncated while "
-            "the per-kind totals stay exact",
+            "Host phase pool dropped %llu of %llu records (%d buffers of %d); trace data is incomplete",
             static_cast<unsigned long long>(dropped_records()), static_cast<unsigned long long>(total_records()),
             PLATFORM_HOST_PHASE_BUFFERS, PLATFORM_HOST_PHASE_RECORDS_PER_BUFFER
         );
