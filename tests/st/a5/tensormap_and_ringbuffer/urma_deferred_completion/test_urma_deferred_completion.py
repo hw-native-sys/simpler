@@ -9,8 +9,6 @@
 # -----------------------------------------------------------------------------------------------------------
 """Two-rank URMA transfers whose successors consume deferred outputs."""
 
-import os
-
 import pytest
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -25,17 +23,9 @@ CONSUMER_TILE_ELEMS = 64 * 128
 SMALL_ELEMS = 128 * 128
 CHUNKED_ELEMS = 256 * 1024 * 1024 // DTYPE_NBYTES + 8192
 URMA_DATA_OFFSET_NBYTES = 256
-_URMA_WORKSPACE_ENV = "SIMPLER_ENABLE_PTO_URMA_WORKSPACE"
-_WORKSPACE_TRUTHY = {"1", "ON", "TRUE", "YES"}
-
-
-def _urma_workspace_enabled():
-    return os.environ.get(_URMA_WORKSPACE_ENV, "").upper() in _WORKSPACE_TRUTHY
 
 
 def urma_deferred_completion_orch_fn(orch, callables, task_args, config):
-    if not _urma_workspace_enabled():
-        raise RuntimeError("URMA demo requires an explicit URMA=ON host-runtime build")
     elem_count = task_args.in_0.numel()
     input_nbytes = elem_count * DTYPE_NBYTES
     with orch.allocate_domain(
@@ -63,14 +53,13 @@ def urma_deferred_completion_orch_fn(orch, callables, task_args, config):
                 args.add_tensor(
                     _rehosted_ref_for(task_args, getattr(task_args, f"{name}_{rank}")), TensorArgType.OUTPUT_EXISTING
                 )
-            args.add_scalar(domain.device_ctx)
+            args.add_scalar(handle.device_context(rank, workspace_engines=("urma",)))
             args.add_scalar(elem_count)
             args.add_scalar(task_args.mode)
             args.add_scalar(task_args.repeats)
             orch.submit_next_level(callables.urma_deferred_completion, args, config, worker=rank)
 
 
-@pytest.mark.skipif(not _urma_workspace_enabled(), reason="URMA workspace overlay is OFF")
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class _UrmaRegression(SceneTestCase):
     CALLABLE = {

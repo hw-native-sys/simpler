@@ -1137,3 +1137,52 @@ def test_registered_views_resolve_and_revalidate_after_revocation(domain_worker)
             worker._reexport(logical.to_descriptor())
     finally:
         registry.close()
+
+
+@pytest.mark.parametrize("engines", [(), ("sdma",), ("rdma",)])
+def test_checked_device_context_rejects_missing_urma(domain_worker, engines):
+    worker, members = domain_worker
+
+    def build(orch, _args, _cfg):
+        handle = orch.allocate_domain(**_request(members))
+        if worker.level != 3:
+            with pytest.raises(KeyError):
+                handle.device_context(0, workspace_engines=("urma",))
+            return
+        handle._config = replace(handle._config, workspace_engines=engines)
+        with pytest.raises(ValueError, match="urma.*not initialized"):
+            handle.device_context(handle.workers[0], workspace_engines=("urma",))
+
+    worker.run(build)
+
+
+def test_checked_device_context_validates_live_domain_and_scalar_use(domain_worker):
+    worker, members = domain_worker
+    if worker.level != 3:
+        return
+    saved = []
+
+    def allocate(orch, _args, _cfg):
+        handle = orch.allocate_domain(**_request(members))
+        handle._config = replace(handle._config, workspace_engines=("sdma", "urma"))
+        saved.append(handle)
+        target = handle.workers[0]
+        assert handle.device_context(target, workspace_engines=("urma", "sdma")) == handle[target].device_ctx
+        with pytest.raises(KeyError):
+            handle.device_context(999, workspace_engines=("urma",))
+        with pytest.raises(ValueError, match="distinct names"):
+            handle.device_context(target, workspace_engines=("unknown",))
+
+    worker.run(allocate)
+    handle = saved[0]
+
+    def reuse(_orch, _args, _cfg):
+        handle.device_context(handle.workers[0], workspace_engines=("urma",))
+        resources = worker._building_run_resources
+        table = resources.live_domains if worker.level == 3 else resources.live_global_domains
+        assert table[handle.name] is handle
+
+    worker.run(reuse)
+    handle.release()
+    with pytest.raises(RuntimeError, match="released"):
+        handle.device_context(handle.workers[0], workspace_engines=("urma",))

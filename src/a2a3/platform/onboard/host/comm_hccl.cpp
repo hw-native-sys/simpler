@@ -47,9 +47,7 @@
 #include "acl/acl.h"
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
 #include "pto/comm/async/sdma/sdma_workspace_manager.hpp"
-#endif
 
 // Thin wrappers around the HCCL public APIs we use. Kept as a translation
 // layer in case we need to swap (e.g., InitConfig variant) later.
@@ -1074,28 +1072,16 @@ static int domain_alloc_via_ipc(
 // opaque handle returned to the runner IS this manager; dma_workspace_release()
 // destroys it. There is no per-device generation gate: an SDMA-enabled Worker
 // owns its provider for its whole life and releases it at finalize.
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
 using SdmaManager = pto::comm::sdma::SdmaWorkspaceManager;
-#endif
 
-extern "C" uint32_t dma_workspace_supported_mask(void) {
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
-    return uint32_t{1} << DMA_WORKSPACE_SDMA;
-#else
-    return 0;
-#endif
-}
+extern "C" uint32_t dma_workspace_supported_mask(void) { return uint32_t{1} << DMA_WORKSPACE_SDMA; }
 
 extern "C" uint32_t dma_workspace_channel_count(void) {
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     // kSdmaMaxChannelGroups, not the device-side kSdmaMaxChannel: the two are the
     // same 48 (PTO static_asserts kPostMaxQueues == kSdmaMaxChannelGroups) but
     // only this one comes in through the host-safe workspace-manager header, and
     // it is what SdmaWorkspaceManager::Init actually creates streams for.
     return pto::comm::sdma::kSdmaMaxChannelGroups;
-#else
-    return 0;
-#endif
 }
 
 extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_out, int count, void **handle_out) {
@@ -1105,7 +1091,6 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
         addr_out[i] = 0;
     const uint32_t supported = dma_workspace_supported_mask();
     if ((required_mask & ~supported) != 0) return -1;
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     if ((required_mask & (uint32_t{1} << DMA_WORKSPACE_SDMA)) == 0) return 0;
     if (count <= DMA_WORKSPACE_SDMA) return -1;
     try {
@@ -1137,13 +1122,9 @@ extern "C" int dma_workspace_provision(uint32_t required_mask, uint64_t *addr_ou
         LOG_ERROR("dma_workspace_provision: exception while provisioning SDMA");
         return -1;
     }
-#else
-    return required_mask == 0 ? 0 : -1;
-#endif
 }
 
 extern "C" void dma_workspace_release(void *handle) {
-#ifdef SIMPLER_ENABLE_PTO_SDMA_WORKSPACE
     if (!handle) return;
     try {
         std::unique_ptr<SdmaManager> manager(static_cast<SdmaManager *>(handle));
@@ -1151,9 +1132,6 @@ extern "C" void dma_workspace_release(void *handle) {
     } catch (...) {
         LOG_ERROR("dma_workspace_release: exception while releasing SDMA resources");
     }
-#else
-    (void)handle;
-#endif
 }
 
 // Performs the per-allocation Fabric V2 exchange for one subset rank. rank_ids
@@ -1430,7 +1408,7 @@ extern "C" int comm_alloc_domain_windows(
     size_t window_size, uint32_t workspace_mask, uint64_t *device_ctx_out, uint64_t *local_window_base_out,
     size_t *actual_window_size_out
 ) try {
-    if (workspace_mask != 0) return -1;
+    if (workspace_mask != 0) return COMM_DOMAIN_WORKSPACE_UNSUPPORTED;
     if (!h || !rank_ids || !device_ctx_out || !local_window_base_out || !actual_window_size_out) return -1;
     if (rank_count == 0 || rank_count > COMM_MAX_RANK_NUM || domain_rank >= rank_count || window_size == 0) {
         LOG_ERROR(

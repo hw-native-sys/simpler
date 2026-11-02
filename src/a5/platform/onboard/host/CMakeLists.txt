@@ -36,11 +36,9 @@ else()
 endif()
 set(ASCEND_ARCH_HOME "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux")
 
-option(SIMPLER_ENABLE_PTO_URMA_WORKSPACE "Enable a5 PTO URMA workspace overlay" OFF)
 option(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE "Enable a5 PTO RDMA workspace overlay" OFF)
 # Async providers are available only to domains that explicitly request them.
 # SDMA is compiled in every a5 build; compilation creates no SDMA streams.
-set(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE ON)
 
 # Pin-resolved checkout path is passed by RuntimeBuilder as -DPTO_ISA_ROOT=
 # (#1403). Do not read $ENV{PTO_ISA_ROOT} — ambient exports are not the pin.
@@ -156,15 +154,7 @@ target_compile_definitions(host_runtime PRIVATE
     SIMPLER_RUNTIME_NAME="${SIMPLER_RUNTIME_NAME}"
 )
 
-if(SIMPLER_ENABLE_PTO_SDMA_WORKSPACE)
-    target_compile_definitions(host_runtime PRIVATE SIMPLER_ENABLE_PTO_SDMA_WORKSPACE=1)
-endif()
-if(SIMPLER_ENABLE_PTO_URMA_WORKSPACE)
-    target_compile_definitions(host_runtime PRIVATE
-        SIMPLER_ENABLE_PTO_URMA_WORKSPACE=1
-        PTO_URMA_SUPPORTED
-    )
-endif()
+target_compile_definitions(host_runtime PRIVATE PTO_URMA_SUPPORTED)
 if(SIMPLER_ENABLE_PTO_RDMA_WORKSPACE)
     target_compile_definitions(host_runtime PRIVATE
         SIMPLER_ENABLE_PTO_RDMA_WORKSPACE=1

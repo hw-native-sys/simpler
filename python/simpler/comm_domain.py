@@ -18,6 +18,18 @@ if TYPE_CHECKING:
     from .task_interface import CommBufferSpec
 
 
+def normalize_workspace_engines(workspace_engines) -> tuple[str, ...]:
+    if isinstance(workspace_engines, str) or workspace_engines is None:
+        raise TypeError("workspace_engines must be a sequence of engine names")
+    names = tuple(workspace_engines)
+    if any(name not in ("sdma", "urma", "rdma") for name in names) or len(set(names)) != len(names):
+        raise ValueError("workspace_engines requires distinct names from sdma, urma, rdma")
+    workspace_engines = tuple(sorted(names))
+    if "rdma" in workspace_engines and len(workspace_engines) > 1:
+        raise ValueError("RDMA domains do not map peer windows; use separate domains for other engines")
+    return workspace_engines
+
+
 @dataclass(frozen=True)
 class CommDomainRef:
     """Creator identity and generation of an already established domain."""
@@ -73,14 +85,7 @@ class DomainConfig:
                 )
         if sum(b[3] for b in snapshot) > window_size:
             raise ValueError("domain buffers exceed window_size")
-        if isinstance(workspace_engines, str) or workspace_engines is None:
-            raise TypeError("workspace_engines must be a sequence of engine names")
-        names = tuple(workspace_engines)
-        if any(name not in ("sdma", "urma", "rdma") for name in names) or len(set(names)) != len(names):
-            raise ValueError("workspace_engines requires distinct names from sdma, urma, rdma")
-        workspace_engines = tuple(sorted(names))
-        if "rdma" in workspace_engines and len(workspace_engines) > 1:
-            raise ValueError("RDMA domains do not map peer windows; use separate domains for other engines")
+        workspace_engines = normalize_workspace_engines(workspace_engines)
         return cls(members, window_size, snapshot, bool(retain_after_run), tuple(topology), workspace_engines)
 
     def workspace_mask(self) -> int:

@@ -74,20 +74,12 @@ def _normalize_overlay_env(name: str) -> Optional[str]:
 
 
 def _a5_async_workspace_overlay_defines() -> dict[str, str]:
-    """Explicit a5 host backend selection for the two cached overlay options.
+    """Forward the optional RDMA provider selection, clearing stale cached ON values.
 
-    `SIMPLER_ENABLE_PTO_URMA_WORKSPACE` and `SIMPLER_ENABLE_PTO_RDMA_WORKSPACE`
-    are the host CMakeLists' only cached options, so each is forwarded with an
-    explicit ON/OFF: a value left in the CMake cache by an earlier build cannot
-    otherwise survive a reconfigure (build once with RDMA=ON, then unset it, and
-    the cached option stays ON). `SIMPLER_ENABLE_PTO_SDMA_WORKSPACE` is not
-    forwarded — it is an internal marker the CMakeLists always enables, and a
-    `-D` value for it is overwritten unconditionally.
+    A5 SDMA and URMA providers are always compiled. Compilation creates no
+    resources; communication domains select their engines at allocation time.
     """
-    return {
-        "SIMPLER_ENABLE_PTO_URMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_URMA_WORKSPACE") or "OFF",
-        "SIMPLER_ENABLE_PTO_RDMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE") or "OFF",
-    }
+    return {"SIMPLER_ENABLE_PTO_RDMA_WORKSPACE": _normalize_overlay_env("SIMPLER_ENABLE_PTO_RDMA_WORKSPACE") or "OFF"}
 
 
 def _abbrev_stamp(stamp: str) -> str:

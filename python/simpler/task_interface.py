@@ -127,7 +127,7 @@ from _task_interface import (
 )
 
 from .buffer import AccessMode, AddressSpace, Buffer, ImportContext, ImportRegistry, Tensor, TensorTransfer
-from .comm_domain import CommDomainRef
+from .comm_domain import CommDomainRef, normalize_workspace_engines
 from .comm_endpoints import DEVICE_AICPU
 
 
@@ -1160,6 +1160,7 @@ class CommDomainHandle:
         "_domain_ranks",
         "_release_fn",
         "_release_scope",
+        "_use_fn",
         "_released",
         "_freed",
         "members",
@@ -1194,6 +1195,7 @@ class CommDomainHandle:
         ref: CommDomainRef | None = None,
         requested_window_size: int | None = None,
         _release_scope: Callable[[CommDomainHandle], contextlib.AbstractContextManager] = contextlib.nullcontext,
+        _use_fn: Callable[[CommDomainHandle], None] | None = None,
     ) -> None:
         self.name = name
         self.workers = tuple(workers)
@@ -1205,6 +1207,7 @@ class CommDomainHandle:
         )
         self._release_fn = _release_fn
         self._release_scope = _release_scope
+        self._use_fn = _use_fn
         self.members = tuple(members)
         self.buffers = tuple(buffers)
         self.domain_id = self.allocation_id if domain_id is None else int(domain_id)
@@ -1221,6 +1224,28 @@ class CommDomainHandle:
     def __getitem__(self, chip_idx: int) -> ChipDomainContext:
         self._require_live()
         return self.contexts[chip_idx]
+
+    def device_context(self, worker: int, *, workspace_engines=()) -> int:
+        """Return a live context requiring the named initialized domain workspaces.
+
+        Native allocation validates provider descriptors before publishing this
+        handle. Engine selection is immutable for its lifetime. This method also
+        records scalar-only context use in the current orchestration run.
+        """
+        context = self[worker]
+        required = normalize_workspace_engines(workspace_engines)
+        initialized = self._config.workspace_engines if self._config is not None else ()
+        for engine in required:
+            if engine not in initialized:
+                raise ValueError(
+                    f"domain {self.name!r}: {engine} workspace is not initialized; "
+                    f"request workspace_engines={required!r} when allocating the domain"
+                )
+        if context.device_ctx == 0:
+            raise RuntimeError(f"domain {self.name!r}: device context is null")
+        if self._use_fn is not None:
+            self._use_fn(self)
+        return context.device_ctx
 
     def _require_live(self) -> None:
         if self._released:
