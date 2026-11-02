@@ -405,6 +405,11 @@ public:
         uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint32_t> &rank_ids, uint32_t domain_rank,
         size_t window_size
     );
+    uint64_t
+    comm_attach_domain_host(uint64_t comm_handle, uint64_t allocation_id, const std::vector<uint8_t> &descriptor);
+    void comm_detach_domain_host(uint64_t comm_handle, uint64_t allocation_id);
+    int host_backing_process_identity() const;
+
     /// Pair to `comm_alloc_domain_windows`: collectively free the per-rank
     /// pool and the device CommContext, then drop the allocation record.
     /// `rank_count` + `domain_rank` size the subset barrier; the rank list
@@ -597,6 +602,8 @@ private:
     using CommDeriveContextFn = int (*)(void *, const uint32_t *, size_t, uint32_t, size_t, size_t, uint64_t *);
     using CommAllocDomainWindowsFn =
         int (*)(void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint64_t *, uint64_t *, size_t *);
+    using CommAttachDomainHostFn = int (*)(void *, uint64_t, const CommGlobalDomainDescriptor *, uint64_t *);
+    using CommDetachDomainHostFn = int (*)(void *, uint64_t);
     using CommReleaseDomainWindowsFn = int (*)(void *, uint64_t, size_t, uint32_t);
     using CommGlobalDomainPrepareFn =
         int (*)(uint64_t, uint32_t, uint32_t, size_t, uint32_t, CommGlobalDomainDescriptor *, uint64_t *);
@@ -732,6 +739,8 @@ private:
     CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
     CommDeriveContextFn comm_derive_context_fn_ = nullptr;
     CommAllocDomainWindowsFn comm_alloc_domain_windows_fn_ = nullptr;
+    CommAttachDomainHostFn comm_attach_domain_host_fn_ = nullptr;
+    CommDetachDomainHostFn comm_detach_domain_host_fn_ = nullptr;
     CommReleaseDomainWindowsFn comm_release_domain_windows_fn_ = nullptr;
     CommGlobalDomainPrepareFn comm_global_domain_prepare_fn_ = nullptr;
     CommGlobalDomainImportFn comm_global_domain_import_fn_ = nullptr;

@@ -93,6 +93,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     MAX_REGISTERED_CALLABLE_IDS,
     RUNTIME_ENV_RING_COUNT,
     WorkerType,
+    _decode_buffer_descriptor_wire,
     _emit_host_span,
     _mailbox_load_i32,
     _mailbox_load_u64,
@@ -128,6 +129,7 @@ from .buffer import (
     ImportContext,
     ImportRegistry,
     LocalEndpointBufferIdentityAllocator,
+    Tensor,
     _DeviceBufferSource,
     buffer_reference,
     capabilities_for_adapter,
@@ -152,7 +154,7 @@ from .callable_identity import (
     parse_python_callable_payload,
     parse_python_import_target,
 )
-from .comm_domain import CommDomainRef, DomainConfig
+from .comm_domain import CommDomainRef, DomainConfig, HostWindowSpec
 from .comm_endpoints import (
     DEVICE_AICORE,
     DEVICE_AICPU,
@@ -274,6 +276,8 @@ from .global_comm_domain import (
     resolve_global_comm_capability,
     validate_descriptor_table,
 )
+from .host_domain import HostDomainResource, HostDomainView
+from .host_domain_backend import host_attachment_profile, host_backing_type, host_process_identity
 from .mpi_direct_topology import MpiDirectExecutorSpec, MpiDirectTopology
 from .orchestrator import Orchestrator, _callback_frame_for, _callback_run, direct_control
 from .remote_l3_protocol import HOST_TCP_TRANSPORT_PROFILE
@@ -896,14 +900,18 @@ _CTRL_OP_NAMES[_CTRL_DFX_FLUSH] = "flush_diagnostics"
 # is 64-bit, so a malformed frame is clamped here rather than left to fail
 # inside the binding with an overflow that says nothing about the cause.
 _MAX_FLUSH_TIMEOUT_MS = 2**31 - 1
+# Python-only Host view control, carried by the existing generic payload mailbox.
+_CTRL_HOST_VIEW = 28
+_HOST_VIEW_REQUEST = struct.Struct("<QBBBB")
+_CTRL_OP_NAMES[_CTRL_HOST_VIEW] = "host_view"
 _CTRL_DELEGATED_REGION = 26
 _LOCAL_GLOBAL_CONTROL_HEADER = struct.Struct("<IIQ")
 _CTRL_OP_NAMES[_CTRL_GLOBAL_DOMAIN_NODE] = "global_domain"
 _CTRL_OP_NAMES[_CTRL_DELEGATED_REGION] = "delegated_region"
 
 # Layout of the CTRL_COMM_INIT request shm.
-_COMM_INIT_HEADER = struct.Struct("<II")  # rank (u32), nranks (u32)
-assert _COMM_INIT_HEADER.size == 8
+_COMM_INIT_HEADER = struct.Struct("<IIIi")  # rank, nranks, request Host PID (0/1), PID reply
+assert _COMM_INIT_HEADER.size == 16
 
 _PY_CALLABLE_MAGIC = b"SPYC"
 _PY_CALLABLE_VERSION = 1
@@ -923,9 +931,9 @@ _CTRL_SHM_NAME_BYTES = 32
 # Domain-allocation request shm layout: 32-byte header + buffer_nbytes (u64) +
 # rank_ids (u32).  Buffer specs first so they remain 8-byte aligned regardless
 # of rank_count parity; rank_ids come last (u32 has no alignment concern).
-_DOMAIN_REQ_HEADER = struct.Struct("<QIIQI4x")
+_DOMAIN_REQ_HEADER = struct.Struct("<QIIQII")
 # fields: allocation_id (u64), rank_count (u32), domain_rank (u32),
-#         window_size (u64), buffer_count (u32), padding (4 bytes)
+#         window_size (u64), buffer_count (u32), host_size (u32)
 assert _DOMAIN_REQ_HEADER.size == 32
 
 # Domain-allocation reply shm layout: 40-byte header + buffer_ptrs (u64).
@@ -2860,7 +2868,15 @@ def _read_shm_name(buf, offset: int) -> str:
     return raw[: nul if nul >= 0 else _CTRL_SHM_NAME_BYTES].decode("utf-8", "replace")
 
 
-def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_handle: int) -> None:
+def _handle_ctrl_alloc_domain(
+    cw: _ChipWorker,
+    buf: memoryview,
+    *,
+    base_comm_handle: int,
+    import_registry=None,
+    host_sources=None,
+    chip_platform: str = "",
+) -> None:
     """CTRL_ALLOC_DOMAIN handler — runs on the chip child.
 
     Reads the request shm (header + buffer_nbytes + rank_ids), calls
@@ -2877,7 +2893,9 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
     req_buf = req_shm.buf
     assert req_buf is not None
     try:
-        (allocation_id, rank_count, domain_rank, window_size, buffer_count) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+        (allocation_id, rank_count, domain_rank, window_size, buffer_count, host_size) = _DOMAIN_REQ_HEADER.unpack_from(
+            req_buf, 0
+        )
         # Layout: header | buffer_nbytes[buffer_count] (u64) | rank_ids[rank_count] (u32)
         nbytes_offset = _DOMAIN_REQ_HEADER.size
         nbytes_struct = struct.Struct(f"<{buffer_count}Q") if buffer_count else struct.Struct("")
@@ -2885,9 +2903,31 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
         rank_ids_offset = nbytes_offset + nbytes_struct.size
         rank_ids_struct = struct.Struct(f"<{rank_count}I")
         rank_ids = list(rank_ids_struct.unpack_from(req_buf, rank_ids_offset))
+        host_offset = rank_ids_offset + rank_ids_struct.size
+        host_request = bytes(req_buf[host_offset : host_offset + host_size])
+        if len(host_request) != host_size:
+            raise ValueError("Host domain request exceeds control payload")
     finally:
         req_buf.release()
         req_shm.close()
+
+    host_export = host_descriptor = None
+    if host_request:
+        # Local Host export reuses the fixed v2 native descriptor envelope, never a rank-table entry.
+        # REMOTE_SIDECAR is address-free here; only this endpoint's confirmed attachment resolves it.
+        host_export = GlobalDomainDescriptor.decode(host_request[:GLOBAL_DOMAIN_DESCRIPTOR_BYTES])
+        host_descriptor = _decode_buffer_descriptor_wire(host_request[GLOBAL_DOMAIN_DESCRIPTOR_BYTES:])
+        if (
+            import_registry is None
+            or host_sources is None
+            or host_descriptor.address_space != AddressSpace.HOST
+            or host_descriptor.backend_kind != BackendKind.REMOTE_SIDECAR
+            or host_descriptor.nbytes > host_export.mapping_size
+            or host_export.rank_count != rank_count
+            or host_export.domain_rank != 0
+        ):
+            raise ValueError("invalid Host domain attachment request")
+        host_attachment_profile(host_export, chip_platform)
 
     # Opened before the collective so the commit can be published the instant
     # the window exists. Everything after that point — the carving bounds check,
@@ -2906,6 +2946,17 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
             int(window_size),
             _buffer_field_addr(reply_buf, _OFF_DOMAIN_REPLY_COMMITTED),
         )
+
+        if host_export is not None:
+            assert host_descriptor is not None and host_sources is not None and import_registry is not None
+            host_base = cw.comm_attach_domain_host(int(handle), int(allocation_id), host_export.encode())
+            host_sources[int(allocation_id)] = HostDomainView(
+                host_descriptor,
+                host_export,
+                host_base,
+                cw._execution_environment,
+                lambda: int(allocation_id) in host_sources,
+            )
 
         # Carve buffer pointers sequentially inside the local window.
         buffer_ptrs: list[int] = []
@@ -2929,7 +2980,7 @@ def _handle_ctrl_alloc_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_han
         reply_shm.close()
 
 
-def _handle_ctrl_comm_init(cw: _ChipWorker, buf: memoryview) -> int:
+def _handle_ctrl_comm_init(cw: _ChipWorker, buf: memoryview, *, chip_platform: str = "") -> int:
     """CTRL_COMM_INIT handler — drives `cw.comm_init` on the chip child.
 
     The native runtime caches the communicator and returns its existing
@@ -2941,19 +2992,24 @@ def _handle_ctrl_comm_init(cw: _ChipWorker, buf: memoryview) -> int:
     req_buf = req_shm.buf
     assert req_buf is not None
     try:
-        (rank, nranks) = _COMM_INIT_HEADER.unpack_from(req_buf, 0)
-        # rootinfo_path is the rest of the shm, NUL-terminated.
+        (rank, nranks, request_pid, _pid) = _COMM_INIT_HEADER.unpack_from(req_buf, 0)
+        if request_pid not in (0, 1):
+            raise ValueError("comm_init has invalid Host PID request")
+        # Python-owned startup record: fixed reply field followed by a NUL-terminated path.
         raw = bytes(req_buf[_COMM_INIT_HEADER.size :])
         nul = raw.find(b"\x00")
-        rootinfo_path = raw[: nul if nul >= 0 else len(raw)].decode("utf-8", "replace")
+        if nul < 0:
+            raise ValueError("comm_init rootinfo path must be NUL-terminated")
+        rootinfo_path = raw[:nul].decode("utf-8", "replace")
+        handle = cw.comm_init(int(rank), int(nranks), rootinfo_path)
+        if handle == 0:
+            raise RuntimeError("comm_init returned 0 handle for hidden base communicator")
+        identity = host_process_identity(chip_platform, cw) if request_pid else 0
+        _COMM_INIT_HEADER.pack_into(req_buf, 0, rank, nranks, request_pid, identity)
+        return int(handle)
     finally:
         req_buf.release()
         req_shm.close()
-
-    handle = cw.comm_init(int(rank), int(nranks), rootinfo_path)
-    if handle == 0:
-        raise RuntimeError("comm_init returned 0 handle for hidden base communicator")
-    return int(handle)
 
 
 @dataclass
@@ -3394,20 +3450,55 @@ def _teardown_chip_process_resources(
     raise aggregated
 
 
-def _handle_ctrl_release_domain(cw: _ChipWorker, buf: memoryview, *, base_comm_handle: int) -> None:
+def _handle_ctrl_release_domain(
+    cw: _ChipWorker, buf: memoryview, *, base_comm_handle: int, import_registry=None, host_sources=None
+) -> None:
     """CTRL_RELEASE_DOMAIN handler — collective free for one allocation."""
     request_shm_name = _read_shm_name(buf, _OFF_ARGS)
     req_shm = SharedMemory(name=request_shm_name)
     req_buf = req_shm.buf
     assert req_buf is not None
     try:
-        (allocation_id, rank_count, domain_rank, _ws, _bc) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
+        (allocation_id, rank_count, domain_rank, _ws, _bc, _host_size) = _DOMAIN_REQ_HEADER.unpack_from(req_buf, 0)
     finally:
         req_buf.release()
         req_shm.close()
 
+    if host_sources is not None:
+        source = host_sources.pop(int(allocation_id), None)
+        if source is not None:
+            assert import_registry is not None
+            import_registry.unregister(source.descriptor.identity)
     handle = _require_base_communicator(base_comm_handle)
     cw.comm_release_domain_windows(int(handle), int(allocation_id), int(rank_count), int(domain_rank))
+
+
+def _handle_ctrl_host_view(cw, buf, *, base_comm_handle, import_registry, host_sources, chip_platform):
+    staged, payload, size = _open_ctrl_payload(buf, what="Host view")
+    try:
+        if size != _HOST_VIEW_REQUEST.size:
+            raise ValueError("invalid Host view payload size")
+        allocation, reference, access, unmap, reserved = _HOST_VIEW_REQUEST.unpack_from(payload)
+        if not reference or unmap not in (0, 1) or reserved or (unmap and access):
+            raise ValueError("invalid Host view request")
+        if not unmap:
+            access = AccessMode(access)
+        source = host_sources.get(allocation)
+        if source is None:
+            raise ValueError("Host view requires a live allocation")
+        source.apply(
+            cw,
+            import_registry,
+            _require_base_communicator(base_comm_handle),
+            allocation,
+            reference,
+            access,
+            unmap=bool(unmap),
+            platform=chip_platform,
+        )
+    finally:
+        payload.release()
+        staged.close()
 
 
 def _require_base_communicator(handle: int) -> int:
@@ -3478,9 +3569,14 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
         ImportContext(
             deployment=DEVICE_AICPU,
             device_owner_instance_id=owner_instance_id,
+            platform=chip_platform,
+            runtime=chip_runtime,
+            execution_environment=getattr(cw, "_execution_environment", None),
+            current_environment=lambda: getattr(cw, "_execution_environment", None),
         )
     )
     global_domain_store = _L2GlobalDomainStore()
+    host_domain_sources = {}
     base_comm_handle = 0
     diagnostic_capture_index = 0
 
@@ -3571,7 +3667,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             args_ptr = task_addr + _OFF_TASK_ARGS_BLOB
             args = read_args_from_blob(args_ptr, _MAILBOX_ARGS_CAPACITY)
             _validate_host_control_access(registry.get(cid), args)
-            chip_args = _materialize_chip_task_args(args, import_registry)
+            chip_args = _materialize_chip_task_args(args, import_registry, registry.get(cid))
             # The acceptance flag lives in the mailbox, not in the materialized args, so
             # the fence still publishes through the address the parent polls.
             if cfg.output_prefix:
@@ -3702,11 +3798,33 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
                         registry.pop(int(cid), None)
                         prepared.discard(int(cid))
             elif sub_cmd == _CTRL_ALLOC_DOMAIN:
-                _handle_ctrl_alloc_domain(cw, buf, base_comm_handle=base_comm_handle)
+                _handle_ctrl_alloc_domain(
+                    cw,
+                    buf,
+                    base_comm_handle=base_comm_handle,
+                    import_registry=import_registry,
+                    host_sources=host_domain_sources,
+                    chip_platform=chip_platform,
+                )
             elif sub_cmd == _CTRL_RELEASE_DOMAIN:
-                _handle_ctrl_release_domain(cw, buf, base_comm_handle=base_comm_handle)
+                _handle_ctrl_release_domain(
+                    cw,
+                    buf,
+                    base_comm_handle=base_comm_handle,
+                    import_registry=import_registry,
+                    host_sources=host_domain_sources,
+                )
+            elif sub_cmd == _CTRL_HOST_VIEW:
+                _handle_ctrl_host_view(
+                    cw,
+                    buf,
+                    base_comm_handle=base_comm_handle,
+                    import_registry=import_registry,
+                    host_sources=host_domain_sources,
+                    chip_platform=chip_platform,
+                )
             elif sub_cmd == _CTRL_COMM_INIT:
-                base_comm_handle = _handle_ctrl_comm_init(cw, buf)
+                base_comm_handle = _handle_ctrl_comm_init(cw, buf, chip_platform=chip_platform)
             elif sub_cmd == _CTRL_DELEGATED_REGION:
                 _handle_ctrl_delegated_region_terminal(buf, provider_transaction_table, provider_region_store)
             elif sub_cmd == _CTRL_COMMITTED_DEVICE_MEMORY:
@@ -3966,7 +4084,7 @@ def _run_chip_main_loop(  # noqa: PLR0913, PLR0915 -- fork-child entry: every de
             # its own storage, so this POD need not outlive the call.
             args = staged.pending_args  # type: ignore[attr-defined]
             _validate_host_control_access(registry.get(staged.cid), args)
-            chip_args = _materialize_chip_task_args(args, import_registry)
+            chip_args = _materialize_chip_task_args(args, import_registry, registry.get(staged.cid))
             if staged.config.output_prefix:
                 _bind_host_log_session_directory()
             staged.chip_run = cw._submit_chip_run_materialized(
@@ -4760,6 +4878,10 @@ class CleanupJournal:
         if any((entry_kind, entry_identity) == key for entry_kind, entry_identity, _fn in self._entries):
             return
         self.add(kind, identity, cleanup_fn)
+
+    def discard(self, kind, identity):
+        """Forget a cleanup only after its owner has confirmed physical release."""
+        self._entries = [entry for entry in self._entries if entry[:2] != (kind, identity)]
 
     def extend(self, entries):
         self._entries.extend(entries)
@@ -5881,6 +6003,7 @@ class Worker:
         # args itself (no forked child, no mailbox), resolving each ref's descriptor to a local base
         # map-once — the chip-child path minus the mailbox hop. Lazily created on first L2 run.
         self._chip_import_registry: ImportRegistry | None = None
+        self._direct_host_domains = {}
 
     @property
     def _initialized(self) -> bool:
@@ -9246,6 +9369,7 @@ class Worker:
 
         builder = RuntimeBuilder(platform)
         binaries = builder.get_binaries(runtime)
+        self._host_runtime_path = str(binaries.host_path)
 
         # This is the one route whose teardown can be fenced before the public
         # Buffer release (see _check_workspace_live), so it is the one route the
@@ -9341,6 +9465,7 @@ class Worker:
             # invocation is `os.fork()` + direct function call, so no pickle
             # barrier — the bins object is just a Python value passed through.
             self._l3_bins = binaries
+            self._host_runtime_path = str(binaries.host_path)
 
             # Allocate chip mailboxes, sized the same way.
             for i, _dev_id in enumerate(device_ids):
@@ -10397,7 +10522,11 @@ class Worker:
     # do not call directly from user code — use the orch API.)
     # ------------------------------------------------------------------
 
-    def _ensure_comm_base(self) -> None:
+    def _allocate_host_domain_backing(self, resource, workers):
+        resource.allocate()
+        resource.backend.authorize([self._host_process_ids[w] for w in workers])
+
+    def _ensure_comm_base(self, *, require_host_identity=False) -> None:
         """Lazily establish the base HCCL/sim communicator across all chips.
 
         Idempotent — sets ``self._comm_base_ready`` after the first
@@ -10407,13 +10536,15 @@ class Worker:
         the chip child runs ``ChipWorker.comm_init`` (which itself caches
         the handle, so a re-dispatch would be a no-op anyway).
         """
-        if getattr(self, "_comm_base_ready", False):
+        if getattr(self, "_comm_base_ready", False) and (
+            not require_host_identity or getattr(self, "_host_identity_ready", False)
+        ):
             return
         assert self._worker is not None
         device_ids = self._config.get("device_ids", [])
         rootinfo_path = self._comm_plan_rootinfo_path()
 
-        # Layout: header (rank, nranks) + NUL-terminated rootinfo_path bytes.
+        # Layout: header (rank, nranks, Host PID request/reply) + NUL-terminated rootinfo_path bytes.
         path_bytes = rootinfo_path.encode("utf-8") + b"\x00"
         req_size = _COMM_INIT_HEADER.size + len(path_bytes)
 
@@ -10424,16 +10555,23 @@ class Worker:
                 request_shms[chip_idx] = req
                 req_buf = req.buf
                 assert req_buf is not None
-                _COMM_INIT_HEADER.pack_into(req_buf, 0, int(chip_idx), int(len(device_ids)))
+                _COMM_INIT_HEADER.pack_into(
+                    req_buf, 0, int(chip_idx), int(len(device_ids)), int(require_host_identity), 0
+                )
                 req_buf[_COMM_INIT_HEADER.size : _COMM_INIT_HEADER.size + len(path_bytes)] = path_bytes
 
             dw = self._worker
             assert dw is not None
             errors: dict[int, BaseException] = {}
 
+            process_ids = {}
+
             def dispatch(chip_idx: int) -> None:
                 try:
                     dw.control_comm_init(chip_idx, request_shms[chip_idx].name)
+                    reply_buffer = request_shms[chip_idx].buf
+                    assert reply_buffer is not None
+                    process_ids[chip_idx] = _COMM_INIT_HEADER.unpack_from(reply_buffer)[3]
                 except BaseException as e:  # noqa: BLE001
                     errors[chip_idx] = e
 
@@ -10445,11 +10583,17 @@ class Worker:
                     f"first error chip={first[0]}: {first[1]}"
                 )
 
+            self._host_process_ids = process_ids
+
+        def publish_ready():
+            self._comm_base_ready = True
+            self._host_identity_ready = getattr(self, "_host_identity_ready", False) or require_host_identity
+
         _run_with_owned_shared_memory(
             len(device_ids),
             initialize,
             name_prefix="shm-comm-init-lifecycle-",
-            after_success=lambda: setattr(self, "_comm_base_ready", True),
+            after_success=publish_ready,
         )
 
     def _domain_config(self, members, window_size, buffers, retain_after_run) -> DomainConfig:
@@ -10484,7 +10628,7 @@ class Worker:
             raise RuntimeError("communication domains require an L3+ Worker")
         return DomainConfig.capture(members, window_size, buffers, retain_after_run, topology)
 
-    def _comm_domain(self, *, name, members, window_size, buffers, retain_after_run, reuse):
+    def _comm_domain(self, *, name, members, window_size, buffers, retain_after_run, reuse, host_window=None):
         resources = self._building_run_resources
         if _callback_frame_for(self) is None or resources is None:
             raise RuntimeError("domain creation and reuse require this Worker's orchestration callback")
@@ -10497,6 +10641,13 @@ class Worker:
             if not name:
                 raise ValueError("domain name must be non-empty")
             config = self._domain_config(members, window_size, buffers, retain_after_run)
+            if host_window is not None:
+                if not isinstance(host_window, HostWindowSpec):
+                    raise TypeError("host_window requires HostWindowSpec")
+                if self.level != 3:
+                    raise ValueError("Host domain windows require a local L3 Worker")
+                host_backing_type(self._config.get("platform"))
+                config = replace(config, host_window=host_window)
             table = self._live_domains if self.level == 3 else self._live_global_domains
             handle = table.get(name)
             if handle is not None:
@@ -10512,7 +10663,11 @@ class Worker:
             try:
                 if self.level == 3:
                     handle = self._allocate_domain(
-                        name=name, workers=config.members, window_size=config.window_size, buffers=config.specs()
+                        name=name,
+                        workers=config.members,
+                        window_size=config.window_size,
+                        buffers=config.specs(),
+                        **({"host_window": host_window} if host_window is not None else {}),
                     )
                     handle.retain_after_run = config.retain_after_run
                     handle.members = tuple(
@@ -10628,13 +10783,14 @@ class Worker:
             self._use_domain(handle)
             return handle
 
-    def _allocate_domain(  # noqa: PLR0912 -- linear input-validation + per-chip shm staging + dispatch + reply unpack; splitting obscures the fail-fast ordering
+    def _allocate_domain(  # noqa: PLR0912, PLR0915 -- linear input-validation + per-chip shm staging + dispatch + reply unpack; splitting obscures the fail-fast ordering
         self,
         *,
         name: str,
         workers: tuple[int, ...],
         window_size: int,
         buffers: list[CommBufferSpec],
+        host_window: HostWindowSpec | None = None,
     ) -> CommDomainHandle:
         # Admission is the run() lease that the driving orchestrator holds;
         # validation checks resource presence rather than the public lifecycle,
@@ -10646,7 +10802,10 @@ class Worker:
         # triggers HCCL RootInfo handshake + EnablePeerAccess on every chip.
         # Cheap enough to do once per Worker; defers cost from init() (which
         # used to pre-bootstrap) to the first DAG that actually needs comm.
-        self._ensure_comm_base()
+        if host_window is not None:
+            self._ensure_comm_base(require_host_identity=True)
+        else:
+            self._ensure_comm_base()
 
         with self._alloc_id_lock:
             allocation_id = self._next_alloc_id
@@ -10662,11 +10821,34 @@ class Worker:
         # this, `workers.index(chip_idx)` makes the hot path quadratic.
         worker_to_rank = {w: r for r, w in enumerate(workers)}
 
+        host_resource = None
+        host_request = b""
+        if host_window is not None:
+            identity = self._burn_buffer_identity()
+            host_resource = HostDomainResource(
+                host_window,
+                identity,
+                workers,
+                self._config["platform"],
+                self._config["device_ids"][workers[0]],
+                host_runtime_path=getattr(self, "_host_runtime_path", None),
+                view_scope=self._host_view_scope,
+                view_control=self._control_host_view,
+            )
+            self._cleanup_journal.add_once("host-domain", str(allocation_id), host_resource.close)
+            try:
+                self._allocate_host_domain_backing(host_resource, workers)
+                host_request = host_resource.request()
+            except BaseException:
+                self._cleanup_journal.drive({("host-domain", str(allocation_id))})
+                raise
+            req_size += len(host_request)
+
         handle: CommDomainHandle | None = None
         contexts: dict[int, ChipDomainContext] = {}
         previous_ordered_cleanup = resources.requires_ordered_cleanup
 
-        def allocate(staged_shms: _SharedMemoryOwner) -> CommDomainHandle:
+        def allocate(staged_shms: _SharedMemoryOwner) -> CommDomainHandle:  # noqa: PLR0912 -- ordered allocation and commit sampling must share one rollback boundary
             nonlocal handle
             request_shms: dict[int, SharedMemory] = {}
             reply_shms: dict[int, SharedMemory] = {}
@@ -10685,12 +10867,15 @@ class Worker:
                         int(worker_to_rank[chip_idx]),  # domain_rank
                         int(window_size),
                         int(buffer_count),
+                        len(host_request),
                     )
                     nbytes_off = _DOMAIN_REQ_HEADER.size
                     if buffer_count:
                         struct.pack_into(f"<{buffer_count}Q", req_buf, nbytes_off, *[int(b.nbytes) for b in buffers])
                     rank_ids_off = nbytes_off + buffer_count * 8
                     struct.pack_into(f"<{len(workers)}I", req_buf, rank_ids_off, *[int(w) for w in workers])
+                    if host_request:
+                        req_buf[req_size - len(host_request) : req_size] = host_request
                     reply = staged_shms.create(reply_size)
                     reply_shms[chip_idx] = reply
 
@@ -10709,6 +10894,7 @@ class Worker:
                     _domain_size=len(workers),
                     _domain_ranks=worker_to_rank,
                 )
+                handle._host_resource = host_resource
                 self._live_domains[name] = handle
                 resources.live_domains[name] = handle
                 resources.requires_ordered_cleanup = True
@@ -10720,6 +10906,8 @@ class Worker:
                 # run owns, so the fence sweep releases exactly those and poisons
                 # the worker if that release fails too. Inferring it from the RPC
                 # outcome leaks an allocation whose reply could not be delivered.
+                if host_resource is not None:
+                    host_resource.published = True
                 dispatch_started = True
                 try:
                     self._dispatch_control_domain(
@@ -10772,6 +10960,10 @@ class Worker:
                     committed = tuple(w for w in workers if _domain_reply_committed(reply_shms.get(w)))
                     handle.workers = committed
                     if not committed:
+                        if host_resource is not None:
+                            # All control calls have joined; no committed window means
+                            # no Host import could have started in any child.
+                            host_resource.views_released = True
                         if self._live_domains.get(name) is handle:
                             self._live_domains.pop(name)
                         if resources.live_domains.get(name) is handle:
@@ -10794,6 +10986,8 @@ class Worker:
             # and every carved buffer pointer before the lifecycle publishes
             # success back to the interruptible caller.
             with self._child_prov_lock:
+                if host_resource is not None:
+                    self._domain_members.setdefault(allocation_id, set()).add(host_resource.identity)
                 # Only the carved buffers are registered: the window itself is named by no public
                 # Buffer -- `ChipDomainContext` exposes `local_window_base` as a bare address -- so
                 # no operand can reach it and nothing would resolve an entry for it.
@@ -10921,6 +11115,8 @@ class Worker:
 
         def retire() -> None:
             if allocation_id in results and results[allocation_id] is None:
+                if local:
+                    self._release_host_domain_owner(handle)
                 handle._freed = True
             if not handle.freed:
                 raise RuntimeError(f"domain {handle.name!r}: window reclamation is unconfirmed")
@@ -10962,6 +11158,8 @@ class Worker:
             self._drop_domain_allocs(allocation_id)
             release = self._release_domain_now if self.level == 3 else self._release_global_domain_now
             release(handle)
+            if self.level == 3:
+                self._release_host_domain_owner(handle)
         except BaseException:
             self._defer_domain_retirement(handle)
             raise
@@ -10982,6 +11180,14 @@ class Worker:
         with resources.domain_lock:
             pending = list(resources.pending_release_domains)
         self._drain_pending_domain_snapshot(resources, pending)
+
+    def _release_host_domain_owner(self, handle: CommDomainHandle) -> None:
+        # The collective release is exact-once; owner cleanup is independently
+        # retryable after that confirmed result, without replaying the collective.
+        if handle._host_resource is not None:
+            error = self._cleanup_journal.drive({("host-domain", str(handle.allocation_id))})
+            if error is not None:
+                raise error
 
     def _release_domain_now(self, handle: CommDomainHandle) -> None:
         """Synchronous backend release for one handle, exactly once.
@@ -11068,6 +11274,7 @@ class Worker:
                     int(handle._domain_ranks[chip_idx]),  # noqa: SLF001 -- preserve the allocation-time rank
                     0,  # window_size — ignored on release
                     0,  # buffer_count — ignored on release
+                    0,  # no Host payload on release
                 )
             self._dispatch_control_domain(
                 workers=workers,
@@ -11078,6 +11285,8 @@ class Worker:
             )
 
         def retire_live_handle() -> None:
+            if handle._host_resource is not None:
+                handle._host_resource.views_released = True
             if self._live_domains.get(handle.name) is handle:
                 self._live_domains.pop(handle.name)
 
@@ -12472,17 +12681,16 @@ class Worker:
 
     @staticmethod
     def _names_device_allocation(args: Any) -> bool:
-        """Whether any arg names a child device allocation, and so needs authorizing.
+        """Whether any arg needs device or registered-reference provenance checks.
 
         A ``DEVICE_MALLOC`` (worker device malloc) or ``VMM_WINDOW`` (domain-carved) ref names an
         allocation behind a chip boundary, so its identity is what the owner can resolve.
-        Host-backed refs (POSIX/fork shm) name nothing the owner allocation table holds and
-        contribute nothing.
+        Ordinary POSIX/fork host refs name nothing the owner allocation table holds.
+        REMOTE_SIDECAR also enters this gate: local Host mappings require endpoint validation;
+        the dispatch check distinguishes them from explicit remote transport bindings.
         """
         return args.has_device_backed_tensor() or any(
-            (descriptor := args.tensor(index).buffer).address_space == AddressSpace.DEVICE
-            and descriptor.backend_kind == BackendKind.REMOTE_SIDECAR
-            for index in range(args.tensor_count())
+            args.tensor(index).buffer.backend_kind == BackendKind.REMOTE_SIDECAR for index in range(args.tensor_count())
         )
 
     def _prepare_buffer_references(self, args, sidecar, target_worker_id: int):
@@ -12557,7 +12765,7 @@ class Worker:
             return
         resources.touched_identities.update(self._identities_in_args(args))
 
-    def _child_prov_check_dispatch_locked(self, args: Any, target_worker_id: int, *, api: str) -> None:
+    def _child_prov_check_dispatch_locked(self, args: Any, target_worker_id: int, *, api: str, sidecar=None) -> None:
         """Validate device args against the worker they are dispatched to.
 
         The caller holds ``_child_prov_lock`` until native submission or an accepted-use
@@ -12574,6 +12782,35 @@ class Worker:
         each one's descriptor back into Python costs more than comparing it. Only the refusal
         returns here, where naming the argument is worth an object.
         """
+        for index in range(args.tensor_count()):
+            tensor = args.tensor(index)
+            if tensor.mapping_ref or (
+                tensor.buffer.address_space == AddressSpace.HOST
+                and tensor.buffer.backend_kind == BackendKind.REMOTE_SIDECAR
+            ):
+                resource = next(
+                    (
+                        handle._host_resource
+                        for handle in self._live_domains.values()
+                        if not handle.released
+                        and handle._host_resource is not None
+                        and handle._host_resource.identity == tensor.buffer.identity
+                    ),
+                    None,
+                )
+                direct = self._direct_host_domains.get(tensor.buffer.identity)
+                if resource is None and direct is not None:
+                    resource = direct[0]
+                remote = sidecar.tensors[index] if sidecar is not None else None
+                if resource is None and not tensor.mapping_ref and remote is not None and remote.present:
+                    continue
+                if resource is None:
+                    raise ValueError("Host domain Tensor is not a live allocation on this Worker")
+                resource.validate(
+                    tensor,
+                    target_worker_id,
+                    native=direct is not None and self.level == 2,
+                )
         failure = self._child_alloc.check_dispatch(args, target_worker_id)
         if failure is None:
             return
@@ -12750,7 +12987,7 @@ class Worker:
         with self._registry_lock:
             for touched in self._chip_run_touched_identities.values():
                 if identity in touched:
-                    raise RuntimeError(f"Worker.free: {identity} is still referenced by an in-flight L2 run")
+                    raise RuntimeError(f"Worker.free: {identity} is still in use by a submitted run (in-flight L2 run)")
 
     def free(self, handle: Buffer) -> None:
         """Free a device ``Buffer`` allocated by ``malloc`` / ``alloc_child_tensor``.
@@ -13122,10 +13359,12 @@ class Worker:
     # Post-fork zero-copy host buffers
     # ------------------------------------------------------------------
 
-    def create_buffer(self, nbytes: int) -> Buffer:
+    def create_buffer(self, nbytes: int, *, host_window: HostWindowSpec | None = None) -> Buffer:
         """Allocate a shared ``Buffer`` owned by this Worker (P1-B).
 
-        The backing is a POSIX shm; the Buffer carries a typed canonical identity and a
+        With host_window, this returns a Host resource handle (shm is None); use
+        map_view for the device view and release_buffer after all users finish.
+        Otherwise the backing is a POSIX shm; the Buffer carries a typed canonical identity and a
         self-describing descriptor, so a consumer can resolve it with no prior handshake: the
         descriptor travels embedded in every ``Tensor`` built over this Buffer and the consumer
         materializes it lazily on first receipt (map-once, keyed by canonical identity). At L3+ that
@@ -13136,7 +13375,162 @@ class Worker:
         if self.level < 2:
             raise TypeError("create_buffer requires a level >= 2 Worker")
         with self._operation_lease("create_buffer", allow_continuation=True):
+            if host_window is not None:
+                return self._create_direct_host_buffer(int(nbytes), host_window)
             return self._create_buffer_locked(int(nbytes))
+
+    def _create_direct_host_buffer(self, nbytes: int, spec: HostWindowSpec) -> Buffer:
+        if self.level != 2:
+            raise ValueError("host_window requires a direct L2 Worker")
+        host_backing_type(self._config["platform"])
+        if not isinstance(spec, HostWindowSpec) or spec.nbytes != nbytes:
+            raise ValueError("host_window must describe the requested buffer size")
+        cw = self._chip_worker
+        if cw is None:
+            raise RuntimeError("Host allocation requires an initialized Worker")
+        if cw._execution_environment is not None and cw._execution_environment[4]:
+            raise ValueError("Host communication backing requires an owned execution context")
+        with self._device_control_admission("create_buffer(host_window)"):
+            comm = cw.comm_init(0, 1, self._comm_plan_rootinfo_path())
+            with self._alloc_id_lock:
+                allocation_id = self._next_alloc_id
+                self._next_alloc_id += 1
+            resource = HostDomainResource(
+                spec,
+                self._burn_buffer_identity(),
+                (0,),
+                self._config["platform"],
+                self._config.get("device_id", 0),
+                host_runtime_path=getattr(self, "_host_runtime_path", None),
+                view_scope=self._host_view_scope,
+                view_control=self._control_host_view,
+            )
+            # A one-rank domain supplies the existing attachment and release machinery.
+            # Its 64-byte logical HBM window is control storage, not Host-table staging.
+            committed = ctypes.c_uint64(0)
+            self._direct_host_domains[resource.identity] = (resource, comm, allocation_id, committed)
+            self._cleanup_journal.add_once(
+                "host-domain", f"direct-{allocation_id}", lambda: self._release_direct_host_resource(resource.identity)
+            )
+            try:
+                resource.allocate()
+                buffer, exported = resource.buffer, resource.export
+                assert buffer is not None and exported is not None
+                resource.backend.authorize([resource.backend.process_identity()])
+                cw.comm_alloc_domain_windows(comm, allocation_id, [0], 0, 64, ctypes.addressof(committed))
+                resource.published = True
+                base = cw.comm_attach_domain_host(comm, allocation_id, exported.encode())
+                registry = self._ensure_chip_import_registry()
+
+                resource._direct_view = HostDomainView(
+                    buffer.to_descriptor(),
+                    exported,
+                    base,
+                    cw._execution_environment,
+                    lambda: not resource.closed and not self._source_context_failed,
+                )
+
+                def live():
+                    return not resource.closed and not buffer.closed and not self._source_context_failed
+
+                registry.register_attachment(
+                    buffer.to_descriptor(),
+                    buffer.base,
+                    mapping_ref=0,
+                    profile=resource.backend.profile,
+                    access=AccessMode.READWRITE,
+                    live=live,
+                )
+                return buffer
+            except BaseException:
+                self._release_direct_host_resource(resource.identity)
+                raise
+
+    @contextlib.contextmanager
+    def _host_view_scope(self, resource, worker, api):
+        with (
+            self._operation_lease(api, allow_continuation=True),
+            self._device_control_admission(api),
+            self._child_prov_worker_lock(worker),
+            self._child_prov_lock,
+            self._registry_lock,
+        ):
+            if self._source_context_failed:
+                raise RuntimeError("Host mapping retained after unconfirmed device completion")
+            if any(resource.identity in touched for touched in self._chip_run_touched_identities.values()):
+                raise RuntimeError("Host mapping still referenced by an in-flight L2 run")
+            if self.level == 3 and not any(
+                handle._host_resource is resource and not handle.released for handle in self._live_domains.values()
+            ):
+                raise ValueError("Host mapping requires the live domain backing")
+            yield
+
+    def _control_host_view(self, resource, worker, reference, access, *, unmap):
+        if self.level == 2:
+            _, comm, allocation, _ = self._direct_host_domains[resource.identity]
+            resource._direct_view.apply(
+                self._chip_worker,
+                self._ensure_chip_import_registry(),
+                comm,
+                allocation,
+                reference,
+                access,
+                unmap=unmap,
+                platform=self._config["platform"],
+            )
+        else:
+            handle = next(handle for handle in self._live_domains.values() if handle._host_resource is resource)
+            payload = _HOST_VIEW_REQUEST.pack(handle.allocation_id, reference, int(access), int(unmap), 0)
+            assert self._worker is not None
+            self._worker.control_payload(
+                WorkerType.NEXT_LEVEL,
+                worker,
+                _CTRL_HOST_VIEW,
+                payload,
+                self._py_control_timeout_s,
+            )
+
+    def map_view(self, tensor: Tensor, *, target=None, access=AccessMode.READWRITE) -> Tensor:
+        """Establish a restricted direct L2 mapping over the same Host backing."""
+        if self.level != 2 or (target is not None and target != self.device_location):
+            raise ValueError("map_view requires this Worker's device endpoint")
+        entry = self._direct_host_domains.get(tensor.buffer.identity)
+        if entry is None:
+            raise ValueError("map_view requires a Host buffer allocated by this Worker")
+        return entry[0].map_view(tensor, 0, access=access)
+
+    def unmap_view(self, tensor: Tensor) -> None:
+        """Revoke one issued mapping; reject while accepted users remain in flight."""
+        if self.level != 2:
+            raise ValueError("unmap_view requires a direct L2 Worker")
+        entry = self._direct_host_domains.get(tensor.buffer.identity)
+        if entry is None:
+            raise ValueError("unmap_view requires this Worker's Host backing")
+        entry[0].unmap_view(tensor)
+
+    def _release_direct_host_resource(self, identity):
+        with self._child_prov_worker_lock(0), self._registry_lock:
+            entry = self._direct_host_domains.get(identity)
+            if entry is None:
+                return
+            resource, comm, allocation_id, committed = entry
+            if self._source_context_failed:
+                raise RuntimeError("Host buffer retained after unconfirmed device completion")
+            if any(identity in touched for touched in self._chip_run_touched_identities.values()):
+                raise RuntimeError("Host buffer still referenced by an in-flight L2 run")
+            resource.closed = True
+            if resource.buffer is not None:
+                resource.buffer.closed = True
+            if committed.value and not resource.views_released:
+                if self._chip_worker is None:
+                    raise RuntimeError("Host buffer retained: native teardown did not confirm member view release")
+                self._chip_worker.comm_release_domain_windows(comm, allocation_id, 1, 0)
+            resource.views_released = True
+            if self._chip_import_registry is not None:
+                self._chip_import_registry.unregister(identity)
+            resource.close()
+            del self._direct_host_domains[identity]
+            self._cleanup_journal.discard("host-domain", f"direct-{allocation_id}")
 
     def alloc_shared_tensor(self, shapes: tuple[int, ...], dtype) -> Buffer:
         """Allocate a runtime-managed intermediate buffer (the ``Tensor`` form of ``orch.alloc``).
@@ -13320,6 +13714,13 @@ class Worker:
         The slot is dropped only when it still holds *this* buffer: a buffer_id minted elsewhere can
         collide with a registry key, and evicting the live entry it names would strand that
         backing."""
+        entry = self._direct_host_domains.get(buffer.identity)
+        if entry is not None:
+            if entry[0].buffer is not buffer:
+                raise ValueError("release_buffer requires the original owning Host Buffer")
+            with self._operation_lease("release_buffer", allow_continuation=True):
+                self._release_direct_host_resource(buffer.identity)
+            return
         if not buffer.closed:
             # Exclusive, not shared: `shared()` would already exclude admission and so
             # satisfy the "never mid-callback" argument above, but this keeps the
@@ -13881,19 +14282,21 @@ class Worker:
                     self._chip_source_uses[run_id] = sources
         native_entered = False
         try:
-            chip_args = self._materialize_l2_args(args)
+            chip_args = self._materialize_l2_args(args, self._callable_registry.get(callable_id))
             native_entered = True
             submit_options = {} if caller_stream is None else {"caller_stream": caller_stream}
             chip_run = self._chip_worker._submit_chip_run_direct(callable_id, chip_args, cfg, **submit_options)
         except BaseException as error:
+            proven_released = not native_entered or isinstance(error, RunPreparationRefused)
             with self._registry_lock:
-                self._chip_run_touched_identities.pop(run_id, None)
-            # Only this invocation's native release verdict discharges its source
-            # reservation after entry; arbitrary exceptions carry no lifetime proof.
-            if not native_entered or isinstance(error, RunPreparationRefused):
+                if proven_released:
+                    self._chip_run_touched_identities.pop(run_id, None)
+                else:
+                    # Publish failure before releasing the lock and retain every
+                    # touched backing until device quiescence is actually proved.
+                    self._source_context_failed = True
+            if proven_released:
                 self._release_source_uses(run_id)
-            else:
-                self._source_context_failed = True
             raise
         with self._registry_lock:
             self._chip_runs[run_id] = chip_run
@@ -14051,12 +14454,14 @@ class Worker:
         with self._registry_lock:
             was_l2_run = self._chip_runs.pop(run_id, None) is not None
             if was_l2_run:
-                self._chip_run_touched_identities.pop(run_id, None)
+                proven_released = native_error is None or isinstance(native_error, RunPreparationRefused)
+                if proven_released:
+                    self._chip_run_touched_identities.pop(run_id, None)
+                else:
+                    self._source_context_failed = True
         if was_l2_run:
-            if native_error is None or isinstance(native_error, RunPreparationRefused):
+            if proven_released:
                 self._release_source_uses(run_id)
-            else:
-                self._source_context_failed = True
             handle._cache_finalization_error(native_error)
             with self._hierarchical_start_cv:
                 handle._cleanup_published = True
@@ -14170,7 +14575,24 @@ class Worker:
         # the reason the worker is now shut.
         return handle._finalization_error
 
-    def _materialize_l2_args(self, args) -> Any:
+    def _ensure_chip_import_registry(self) -> ImportRegistry:
+        registry = self._chip_import_registry
+        if registry is None:
+            # This worker runs its own chip in-process (no fork, no mailbox): it is its own device
+            # endpoint, so DEVICE backings it materializes must be its own.
+            context = ImportContext(
+                deployment=DEVICE_AICPU,
+                device_owner_instance_id=self._owner_instance_id,
+                platform=self._config.get("platform"),
+                runtime=self._config.get("runtime"),
+                execution_environment=getattr(self._chip_worker, "_execution_environment", None),
+                current_environment=lambda: getattr(self._chip_worker, "_execution_environment", None),
+            )
+            registry = ImportRegistry(context)
+            self._chip_import_registry = registry
+        return registry
+
+    def _materialize_l2_args(self, args, target=None) -> Any:
         """Resolve an L2 leaf's tensor args to a chip-POD blob in this process.
 
         The user builds args as ``TaskArgs`` (``Tensor``) at every level; an L2 leaf is the consumer of
@@ -14181,24 +14603,15 @@ class Worker:
         ``args`` is a ``TaskArgs`` or ``None`` (no args). The chip-only POD
         ``ChipStorageTaskArgs`` is not accepted here; this boundary requires address-free ``TaskArgs``.
         """
-        registry = self._chip_import_registry
-        if registry is None:
-            # This worker runs its own chip in-process (no fork, no mailbox): it is its own device
-            # endpoint, so DEVICE backings it materializes must be its own.
-            context = ImportContext(
-                deployment=DEVICE_AICPU,
-                device_owner_instance_id=self._owner_instance_id,
-            )
-            registry = ImportRegistry(context)
-            self._chip_import_registry = registry
+        registry = self._ensure_chip_import_registry()
         if args is None:
             args = TaskArgs()
-        return _materialize_chip_task_args(args, registry)
+        return _materialize_chip_task_args(args, registry, target)
 
     def _run_l2_materialized(self, callable_id: int, args, cfg) -> None:
         """Materialize an L2 leaf's tensor args and run the kernel to completion."""
         _validate_host_control_access(self._callable_registry.get(callable_id), TaskArgs() if args is None else args)
-        chip_args = self._materialize_l2_args(args)
+        chip_args = self._materialize_l2_args(args, self._callable_registry.get(callable_id))
         assert self._chip_worker is not None
         self._chip_worker.run_materialized(callable_id, chip_args, cfg)
 
@@ -14847,7 +15260,8 @@ class Worker:
         Every ownership-bearing step is first recorded in the post-success
         journal. Independent pre-transport steps are attempted together; if one
         remains owed, the native transport and children stay alive for a later
-        close() retry. The child-reap grace starts only after SHUTDOWN
+        close() retry. Host-domain owner debt is retried after consumer
+        teardown and does not fence that teardown. The child-reap grace starts only after SHUTDOWN
         has been broadcast to every group (below), not at teardown entry, so the
         (potentially blocking) pre-child cleanup cannot consume it and reduce the
         reap to a single poll.
@@ -14896,6 +15310,11 @@ class Worker:
             errors.append(journal_err)
             if not startup_abort:
                 raise journal_err
+
+        # Local Host owners can depend on child teardown. Their retained debt
+        # must not fence the shutdown that removes those consumers. Other
+        # pre-transport ownership gates above retain their existing ordering.
+        self._cleanup_journal.drive_kinds({"host-domain"})
 
         # Session shutdown is the remote transport barrier: never run it in the
         # same all-attempt batch as pending remote frees.
@@ -14973,6 +15392,8 @@ class Worker:
                 if not self._next_level_pids and not self._next_level_shms:
                     self._next_level_workers.clear()
                     self._next_level_worker_ids.clear()
+                if (host_error := self._cleanup_journal.drive_kinds({"host-domain"})) is not None:
+                    errors.append(host_error)
                 if errors:
                     raise errors[0]
                 return
@@ -15007,6 +15428,10 @@ class Worker:
                 self._next_level_workers.clear()
                 self._next_level_worker_ids.clear()
 
+        # Process exit alone does not assert a successful domain release or
+        # authorize freeing backing imported outside this local worker tree.
+        if (host_error := self._cleanup_journal.drive_kinds({"host-domain"})) is not None:
+            errors.append(host_error)
         if errors:
             raise errors[0]
 

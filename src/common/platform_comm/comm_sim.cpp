@@ -163,6 +163,10 @@ struct DomainAllocation {
     void *mmap_base = nullptr;
     size_t mmap_size = 0;
     bool is_creator = false;
+    void *host_base = nullptr;
+    size_t host_bytes = 0;
+    bool host_closing = false;
+    bool release_started = false;
     std::unique_ptr<CommContext> host_ctx;  // device_ctx points here on sim
 };
 
@@ -711,6 +715,53 @@ extern "C" int comm_alloc_domain_windows(
     return -1;
 }
 
+extern "C" int comm_attach_domain_host(
+    CommHandle h, uint64_t allocation_id, const CommGlobalDomainDescriptor *descriptor, uint64_t *base_out
+) try {
+    if (!h || !descriptor || !base_out) return -1;
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end() || it->second->host_base || it->second->host_closing ||
+        it->second->release_started || descriptor->version != COMM_GLOBAL_DOMAIN_VERSION || descriptor->reserved ||
+        descriptor->profile != COMM_GLOBAL_DOMAIN_PROFILE_SIM_SHM || !descriptor->mapping_size ||
+        !descriptor->handle_size || descriptor->handle_size > COMM_GLOBAL_DOMAIN_HANDLE_BYTES)
+        return -1;
+    std::string name(reinterpret_cast<const char *>(descriptor->handle), descriptor->handle_size);
+    if (name.find('\0') != std::string::npos) return -1;
+    if (name.front() != '/') name.insert(name.begin(), '/');
+    const int fd = shm_open(name.c_str(), O_RDWR, 0600);
+    if (fd < 0) return -1;
+    struct stat statbuf{};
+    if (fstat(fd, &statbuf) || statbuf.st_size < 0 ||
+        static_cast<uint64_t>(statbuf.st_size) < descriptor->mapping_size) {
+        close(fd);
+        return -1;
+    }
+    void *base = mmap(nullptr, descriptor->mapping_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (base == MAP_FAILED) return -1;
+    it->second->host_base = base;
+    it->second->host_bytes = descriptor->mapping_size;
+    *base_out = reinterpret_cast<uint64_t>(base);
+    return 0;
+} catch (...) {
+    return -1;
+}
+
+extern "C" int comm_detach_domain_host(CommHandle h, uint64_t allocation_id) try {
+    if (!h) return -1;
+    auto it = h->domain_allocations.find(allocation_id);
+    if (it == h->domain_allocations.end()) return -1;
+    auto &allocation = *it->second;
+    allocation.host_closing = true;
+    if (allocation.host_base && munmap(allocation.host_base, allocation.host_bytes)) return -1;
+    allocation.host_base = nullptr;
+    allocation.host_bytes = 0;
+    allocation.host_closing = false;
+    return 0;
+} catch (...) {
+    return -1;
+}
+
 extern "C" int
 comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_count, uint32_t domain_rank) try {
     // The shm header's `destroy_count` atomic is the subset-scoped release
@@ -740,6 +791,8 @@ comm_release_domain_windows(CommHandle h, uint64_t allocation_id, size_t rank_co
         );
         return -1;
     }
+    alloc->release_started = true;
+    if (comm_detach_domain_host(h, allocation_id)) return -1;
     int rc = 0;
     if (alloc->mmap_base != nullptr) {
         auto *hdr = static_cast<SharedHeader *>(alloc->mmap_base);
@@ -936,6 +989,7 @@ extern "C" int comm_destroy(CommHandle h) try {
     // also be cleaning up may already be gone).
     for (auto &kv : h->domain_allocations) {
         auto &alloc = kv.second;
+        if (alloc->host_base != nullptr && munmap(alloc->host_base, alloc->host_bytes) != 0) rc = -1;
         if (alloc->mmap_base != nullptr) {
             munmap(alloc->mmap_base, alloc->mmap_size);
             shm_unlink(alloc->shm_name.c_str());

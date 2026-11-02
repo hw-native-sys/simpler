@@ -180,6 +180,29 @@ TEST(ChildMemory, InvalidTransferDoesNotAppendAnArgumentAndLocationMutationIsRej
     EXPECT_THROW(validate_submit_args({args}), std::invalid_argument);
 }
 
+TEST(ChildMemory, MailboxDecodeRejectsReservedByteAndPreservesMappingAndTransfer) {
+    Tensor tensor = make_wire_tensor(1, AddressSpace::HOST);
+    tensor.mapping_ref = 2;
+    TaskArgs args;
+    args.add_tensor(tensor, TensorArgType::INPUT, TensorTransfer::NONE);
+    std::vector<uint8_t> blob(task_args_blob_size(args));
+    write_blob(blob.data(), args);
+    const auto view = read_blob(blob.data(), blob.size());
+    ASSERT_EQ(view.tensors(0)._reserved, 0);
+    EXPECT_EQ(view.tensors(0).mapping_ref, 2);
+    EXPECT_EQ(view.transfer(0), TensorTransfer::NONE);
+
+    for (const uint8_t reserved : {uint8_t{1}, uint8_t{255}}) {
+        blob[TASK_ARGS_BLOB_HEADER_SIZE + offsetof(Tensor, _reserved)] = reserved;
+        EXPECT_THROW(view.tensors(0), std::invalid_argument);
+        EXPECT_THROW(view.transfer(0), std::invalid_argument);
+    }
+    blob[TASK_ARGS_BLOB_HEADER_SIZE + offsetof(Tensor, _reserved)] = 0;
+    blob[TASK_ARGS_BLOB_HEADER_SIZE + TASK_ARG_TRANSFER_OFFSET] = static_cast<uint8_t>(TensorTransfer::H2D);
+    EXPECT_EQ(view.tensors(0).mapping_ref, 2);
+    EXPECT_THROW(view.transfer(0), std::invalid_argument);
+}
+
 TEST(ChildMemory, ReusingAnOwnedViewAcrossGrowthPreservesEachRequest) {
     TaskArgs args;
     args.add_tensor(make_wire_tensor(1, AddressSpace::HOST));
@@ -190,4 +213,18 @@ TEST(ChildMemory, ReusingAnOwnedViewAcrossGrowthPreservesEachRequest) {
         EXPECT_EQ(args.tensor(i).buffer, args.tensor(0).buffer);
         EXPECT_EQ(args.transfer(i), i % 2 ? TensorTransfer::NONE : TensorTransfer::H2D);
     }
+}
+
+TEST(BufferAbi, MappingSelectorPreservesBackingAndRequiresBorrow) {
+    Tensor native = make_wire_tensor(1, AddressSpace::HOST);
+    Tensor mapped = native;
+    mapped.mapping_ref = 2;
+    EXPECT_NO_THROW(validate_tensor(mapped));
+    EXPECT_EQ(offsetof(Tensor, mapping_ref), 142u);
+    EXPECT_EQ(std::memcmp(&native.buffer, &mapped.buffer, sizeof(BufferDescriptor)), 0);
+    Tensor decoded{};
+    std::memcpy(&decoded, &mapped, sizeof(mapped));
+    EXPECT_EQ(decoded.mapping_ref, 2);
+    EXPECT_EQ(tensor_transfer_error(decoded, TensorTransfer::NONE), nullptr);
+    EXPECT_NE(tensor_transfer_error(decoded, TensorTransfer::H2D), nullptr);
 }
