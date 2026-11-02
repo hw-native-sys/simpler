@@ -13,9 +13,9 @@ runs:
         # network1-stage may never have run, so assume nothing.
         [ -n "${REMOTE_WORKDIR:-}" ] || exit 0
         [ -r "${NETWORK1_SSH_HELPER:-}" ] || exit 0
-        if [ ! -r "$RUN_DIR/reservations/cleanup.json" ] || ! python3 -c \
+        if [ ! -r "$RUN_DIR/cleanup.json" ] || ! python3 -c \
           'import json,sys; sys.exit(not json.load(open(sys.argv[1]))["complete"])' \
-          "$RUN_DIR/reservations/cleanup.json"; then
+          "$RUN_DIR/cleanup.json"; then
           echo "::error::network1 retirement unproved; retaining peer tree $REMOTE_WORKDIR"
           exit 1
         fi

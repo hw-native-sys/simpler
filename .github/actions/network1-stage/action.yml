@@ -129,24 +129,29 @@ runs:
         # interpreter must resolve at a single absolute path on both. The
         # launcher pinned here sources CANN, enters that machine's copy of
         # this run's tree (rank-side orchestration imports resolve from the
-        # cwd), and admits each rank through that host's live reservation gate.
+        # cwd). Each task writes an environment file so SSH-launched MPI ranks
+        # carry that task's ownership marker.
         # mpirun/mpi4py are machine-provisioned; tests skip when absent.
         MPI_PYTHON="/tmp/simpler-network1-mpi-python-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
         cat > "$MPI_PYTHON" <<LOCAL_LAUNCHER
         #!/usr/bin/env bash
         source '$NETWORK1_CANN_ENV'
+        set -e
         cd '$GITHUB_WORKSPACE'
-        exec python3 '$GITHUB_WORKSPACE/.github/actions/network1-run-pytest/reservation.py' rank \
-          '$RUN_DIR/reservations/local' '$GITHUB_WORKSPACE/.venv/bin/python' "\$@"
+        source '$RUN_DIR/local-task.env'
+        [ -n "\${TASKQUEUE_TASK_ID:-}" ]
+        exec '$GITHUB_WORKSPACE/.venv/bin/python' "\$@"
         LOCAL_LAUNCHER
         chmod +x "$MPI_PYTHON"
         network1_ssh "
           cat > '$MPI_PYTHON' <<'REMOTE_LAUNCHER'
         #!/usr/bin/env bash
         source '$NETWORK1_REMOTE_CANN_ENV'
+        set -e
         cd '$REMOTE_WORKDIR'
-        exec python3 '$REMOTE_WORKDIR/.github/actions/network1-run-pytest/reservation.py' rank \\
-          '$REMOTE_WORKDIR/output/network1-ci/reservation' '$REMOTE_WORKDIR/.venv/bin/python' \"\$@\"
+        source '$REMOTE_WORKDIR/output/network1-ci/remote-task.env'
+        [ -n \"\${TASKQUEUE_TASK_ID:-}\" ]
+        exec '$REMOTE_WORKDIR/.venv/bin/python' \"\$@\"
         REMOTE_LAUNCHER
           chmod +x '$MPI_PYTHON'
         "
