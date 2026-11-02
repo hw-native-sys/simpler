@@ -66,6 +66,7 @@ function(simpler_ut_add_target)
     endif()
 
     add_executable(${T_NAME} ${T_SOURCES})
+    set_property(GLOBAL APPEND PROPERTY SIMPLER_UT_TARGETS ${T_NAME})
 
     # Record which case files this target consumed, so the directory's glob
     # knows what is already declared and takes only the rest.
@@ -126,6 +127,111 @@ function(simpler_ut_add_target)
     if(T_RESOURCES)
         set_tests_properties(${T_NAME} PROPERTIES RESOURCE_GROUPS "${T_RESOURCES}")
     endif()
+endfunction()
+
+# Share production translation units after every test target has its final
+# compile properties. The object is keyed by the source plus its recorded
+# target contract. A different include order, definition, option, linked usage
+# requirement or export mode produces a different object. Test and support
+# sources remain with their executable, preserving each case's own symbols.
+function(simpler_ut_share_production_sources)
+    # CMake 3.21 places linked $<TARGET_OBJECTS> after target-owned objects
+    # and before libraries, with an object-library build dependency.
+    if(CMAKE_VERSION VERSION_LESS 3.21)
+        return()
+    endif()
+    get_property(_targets GLOBAL PROPERTY SIMPLER_UT_TARGETS)
+    foreach(_target IN LISTS _targets)
+        get_target_property(_sources ${_target} SOURCES)
+        get_target_property(_source_dir ${_target} SOURCE_DIR)
+        foreach(_property IN ITEMS INCLUDE_DIRECTORIES COMPILE_DEFINITIONS COMPILE_OPTIONS COMPILE_FLAGS
+                                   COMPILE_FEATURES LINK_LIBRARIES POSITION_INDEPENDENT_CODE
+                                   ENABLE_EXPORTS CXX_STANDARD CXX_STANDARD_REQUIRED CXX_EXTENSIONS
+                                   CXX_VISIBILITY_PRESET VISIBILITY_INLINES_HIDDEN
+                                   INTERPROCEDURAL_OPTIMIZATION CXX_COMPILER_LAUNCHER
+                                   PRECOMPILE_HEADERS UNITY_BUILD)
+            get_target_property(_value ${_target} ${_property})
+            if(_value STREQUAL "_value-NOTFOUND")
+                set(_value "")
+            endif()
+            set(_${_property} "${_value}")
+        endforeach()
+        # PCH and unity change how a source is compiled, so leave such targets
+        # under CMake's own source handling.
+        if(_PRECOMPILE_HEADERS OR _UNITY_BUILD)
+            continue()
+        endif()
+        # Linked object files follow the executable's own compiled sources.
+        # If production and test/support sources are interleaved, or a production
+        # source has custom properties, sharing would change object link order.
+        set(_seen_production FALSE)
+        set(_interleaved FALSE)
+        set(_source_custom FALSE)
+        foreach(_source IN LISTS _sources)
+            string(FIND "${_source}" "${SIMPLER_SRC}/" _src_prefix)
+            if(_src_prefix EQUAL 0 AND _source MATCHES "\.cpp$")
+                set(_seen_production TRUE)
+                foreach(_property IN ITEMS COMPILE_FLAGS COMPILE_OPTIONS COMPILE_DEFINITIONS INCLUDE_DIRECTORIES
+                                           HEADER_FILE_ONLY OBJECT_DEPENDS)
+                    get_source_file_property(_value "${_source}" ${_property} TARGET_DIRECTORY ${_target})
+                    if(NOT _value STREQUAL "NOTFOUND")
+                        set(_source_custom TRUE)
+                    endif()
+                endforeach()
+            elseif(_seen_production AND _source MATCHES "\.cpp$")
+                set(_interleaved TRUE)
+            endif()
+        endforeach()
+        if(_interleaved OR _source_custom)
+            continue()
+        endif()
+        set(_new_sources "")
+        set(_shared_objects "")
+        foreach(_source IN LISTS _sources)
+            string(FIND "${_source}" "${SIMPLER_SRC}/" _src_prefix)
+            if(NOT _src_prefix EQUAL 0 OR NOT _source MATCHES "\.cpp$")
+                list(APPEND _new_sources "${_source}")
+                continue()
+            endif()
+            set(_export_define "")
+            if(_ENABLE_EXPORTS)
+                set(_export_define "${_target}_EXPORTS")
+            endif()
+            string(SHA256 _key
+                "${_source}|${_source_dir}|${_INCLUDE_DIRECTORIES}|${_COMPILE_DEFINITIONS}|${_COMPILE_OPTIONS}|${_COMPILE_FLAGS}|${_COMPILE_FEATURES}|${_LINK_LIBRARIES}|${_POSITION_INDEPENDENT_CODE}|${_export_define}|${_CXX_STANDARD}|${_CXX_STANDARD_REQUIRED}|${_CXX_EXTENSIONS}|${_CXX_VISIBILITY_PRESET}|${_VISIBILITY_INLINES_HIDDEN}|${_INTERPROCEDURAL_OPTIMIZATION}|${_CXX_COMPILER_LAUNCHER}")
+            set(_object simpler_ut_source_${_key})
+            if(NOT TARGET ${_object})
+                add_library(${_object} OBJECT "${_source}")
+                if(_INCLUDE_DIRECTORIES)
+                    target_include_directories(${_object} PRIVATE ${_INCLUDE_DIRECTORIES})
+                endif()
+                if(_COMPILE_DEFINITIONS OR _export_define)
+                    target_compile_definitions(${_object} PRIVATE ${_COMPILE_DEFINITIONS} ${_export_define})
+                endif()
+                if(_COMPILE_OPTIONS)
+                    target_compile_options(${_object} PRIVATE ${_COMPILE_OPTIONS})
+                endif()
+                if(_COMPILE_FEATURES)
+                    target_compile_features(${_object} PRIVATE ${_COMPILE_FEATURES})
+                endif()
+                if(_LINK_LIBRARIES)
+                    target_link_libraries(${_object} PRIVATE ${_LINK_LIBRARIES})
+                endif()
+                foreach(_property IN ITEMS COMPILE_FLAGS POSITION_INDEPENDENT_CODE CXX_STANDARD CXX_STANDARD_REQUIRED
+                                           CXX_EXTENSIONS CXX_VISIBILITY_PRESET VISIBILITY_INLINES_HIDDEN
+                                           INTERPROCEDURAL_OPTIMIZATION CXX_COMPILER_LAUNCHER)
+                    if(NOT "${_${_property}}" STREQUAL "")
+                        set_target_properties(${_object} PROPERTIES ${_property} "${_${_property}}")
+                    endif()
+                endforeach()
+            endif()
+            list(APPEND _shared_objects "$<TARGET_OBJECTS:${_object}>")
+        endforeach()
+        set_property(TARGET ${_target} PROPERTY SOURCES "${_new_sources}")
+        if(_shared_objects)
+            target_link_libraries(${_target} PRIVATE ${_shared_objects})
+        endif()
+    endforeach()
 endfunction()
 
 # One runtime case, built once per arch.

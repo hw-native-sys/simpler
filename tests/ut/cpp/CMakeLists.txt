@@ -185,6 +185,9 @@ add_subdirectory(common)
 add_subdirectory(a2a3)
 add_subdirectory(a5)
 
+# Share production objects using final target compile properties.
+simpler_ut_share_production_sources()
+
 # Last, so every target has registered the cases it consumed.
 simpler_ut_assert_no_orphan_cases()
 
