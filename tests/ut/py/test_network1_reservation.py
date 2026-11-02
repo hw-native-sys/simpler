@@ -555,6 +555,7 @@ def test_insufficient_job_budget_submits_no_tasks(pair, monkeypatch):
     assert not pair["events"].exists()
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="reservation configuration reads Linux /proc")
 def test_budget_reserves_preflight_and_control_time(pair, monkeypatch):
     _, coordinator = _load_helpers(monkeypatch)
     workflow = yaml.safe_load((_ROOT / ".github/workflows/_st-network1.yml").read_text())
@@ -756,6 +757,7 @@ def test_rank_preserves_inherited_mpi_pipe(tmp_path, monkeypatch):
             os.close(write_fd)
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="MPI rank admission reads Linux /proc")
 def test_generated_mpi_launchers_admit_both_hosts_and_forward_arguments(tmp_path, monkeypatch):
     worker, _ = _load_helpers(monkeypatch)
     stage = yaml.load((_ROOT / ".github/actions/network1-stage/action.yml").read_text(), Loader=yaml.BaseLoader)
