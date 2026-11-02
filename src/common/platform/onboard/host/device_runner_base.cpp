@@ -286,9 +286,20 @@ DeviceRunnerBase::launch_execution(std::unique_ptr<PreparedExecution> prepared, 
     outcome.receipt = std::move(transaction.receipt);
     if (transaction.progress == LaunchProgress::NotStarted) {
         withdraw_unlaunched_collectors_for_run(outcome.prepared->dfx, outcome.prepared->identity.run_epoch);
-    } else {
+        bool caller_retired = false;
+        try {
+            caller_retired = caller_orders_[outcome.prepared->pipeline_slot]->retire(outcome.prepared->identity) == 0;
+        } catch (...) {}
+        if (!caller_retired) {
+            // A failed rollback proof retains active ownership without proving
+            // that a kernel was submitted.
+            if (outcome.rc == 0) outcome.rc = PTO_RUNTIME_ERR_INTERNAL;
+            outcome.progress = LaunchProgress::Partial;
+        }
+    }
+    if (outcome.progress != LaunchProgress::NotStarted) {
         active->prepared = std::move(outcome.prepared);
-        active->progress = transaction.progress;
+        active->progress = outcome.progress;
         outcome.active = std::move(active);
     }
     if (outcome.poisoned()) {
