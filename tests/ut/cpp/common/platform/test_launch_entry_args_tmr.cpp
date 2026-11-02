@@ -632,3 +632,84 @@ TEST_F(LaunchEntryArgs, EveryCaptureAnswerRoutesThroughTheProductionPublishStep)
             << "the published descriptor and the launch header must name one route";
     }
 }
+
+TEST_F(LaunchEntryArgs, EntryMaintenanceFollowsAllocationPublicationAndFinalHeaderCopy) {
+    helper.set_entry_cache_epoch(1);
+    runtime.set_orch_args(entry_args(2, 1, 17));
+    ASSERT_EQ(run_once(true), 0);
+    EXPECT_EQ(helper.args.entry_cache_maintenance, static_cast<uint32_t>(EntryCacheMaintenance::Full));
+    EXPECT_FALSE(slot.entry_cache_qualification.eligible());
+    slot.entry_cache_qualification.observe_success(1);
+    EXPECT_EQ(slot.entry_cache_qualification.eligible(), PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE);
+    helper.release_run_view();
+    ASSERT_EQ(run_once(true), 0);
+    const auto expected =
+        PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE ? EntryCacheMaintenance::Live : EntryCacheMaintenance::Full;
+    KernelArgs transported{};
+    std::memcpy(&transported, helper.launch_payload(), sizeof(transported));
+    EXPECT_EQ(transported.entry_cache_maintenance, static_cast<uint32_t>(expected));
+    EXPECT_FALSE(slot.entry_cache_qualification.eligible());
+    EXPECT_EQ(slot.entry_cmo_may_have_trimmed, PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE);
+    KernelArgsHelper moved(std::move(helper));
+    std::memcpy(&transported, moved.launch_payload(), sizeof(transported));
+    EXPECT_EQ(transported.entry_cache_maintenance, static_cast<uint32_t>(expected));
+    EXPECT_EQ(helper.args.entry_cache_maintenance, static_cast<uint32_t>(EntryCacheMaintenance::Full));
+    moved.release_run_view();
+    runtime.set_orch_args(entry_args(8, 3, 29));
+    ASSERT_EQ(run_once(false), 0);
+    EXPECT_EQ(
+        helper.args.entry_cache_maintenance,
+        static_cast<uint32_t>(
+            PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE ? EntryCacheMaintenance::FullFreshen : EntryCacheMaintenance::Full
+        )
+    );
+    EXPECT_FALSE(slot.entry_cache_qualification.eligible());
+    helper.release_run_view();
+    ASSERT_EQ(run_once(false), 0);
+    EXPECT_EQ(slot.entry_cmo_may_have_trimmed, PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE);
+}
+
+TEST_F(LaunchEntryArgs, FailedAsyncPublicationDropsQualificationButPreservesTrimHistory) {
+    helper.set_entry_cache_epoch(1);
+    ASSERT_EQ(run_once(true), 0);
+    slot.entry_cache_qualification.observe_success(1);
+    helper.release_run_view();
+    ASSERT_EQ(run_once(true), 0);
+    helper.release_run_view();
+    rts.copy_rc = -77;
+    runtime.set_orch_args(entry_args(9, 1, 12));
+    ASSERT_EQ(prepare(), 0);
+    EXPECT_EQ(publish(false), -77);
+    EXPECT_FALSE(slot.entry_cache_qualification.eligible());
+    EXPECT_EQ(slot.entry_cmo_may_have_trimmed, PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE);
+    rts.copy_rc = 0;
+    ASSERT_EQ(run_once(false), 0);
+    EXPECT_EQ(
+        helper.args.entry_cache_maintenance,
+        static_cast<uint32_t>(
+            PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE ? EntryCacheMaintenance::FullFreshen : EntryCacheMaintenance::Full
+        )
+    );
+}
+
+TEST_F(LaunchEntryArgs, KernelAdmissionRejectsNonFullMaintenanceBeforePacketConsumption) {
+    runtime.set_active_callable_id(3);
+    runtime.set_orch_args(entry_args(0, 1, 73));
+    helper.args.run_result_epoch = 19;
+    ASSERT_EQ(prepare(), 0);
+    ASSERT_EQ(helper.prepare_kernel_invocation({3, 7, 0, 1}), 0);
+    ASSERT_EQ(publish(true), 0);
+    PlatformEntryArgs view{
+        helper.launch_payload(), LAUNCH_ENVELOPE_HEADER_BYTES, 0, 1,
+        static_cast<uint32_t>(EntryArgsSource::KernelInvocation)
+    };
+    const auto *resident = reinterpret_cast<const Runtime *>(slot.runtime_args);
+    simpler::tmr::EntryArgsStorage output{};
+    for (uint32_t policy : {1u, 2u, 99u}) {
+        view.cache_maintenance = policy;
+        EXPECT_FALSE(simpler::tmr::admit_kernel_launch_entry(*resident, view, {3, 7, 0, 1}, 19, &output));
+        EXPECT_EQ(output.scalar_count(), 0);
+    }
+    view.cache_maintenance = 0;
+    EXPECT_TRUE(simpler::tmr::admit_kernel_launch_entry(*resident, view, {3, 7, 0, 1}, 19, &output));
+}

@@ -41,6 +41,8 @@
 #include "common/dma_workspace.h"
 #include "common/launch_entry_args.h"
 
+inline constexpr bool PLATFORM_SUPPORTS_LIVE_ENTRY_CACHE = true;
+
 // Forward declarations
 class Runtime;
 
@@ -97,8 +99,8 @@ struct KernelArgs {
     uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
     // Remaining 64-bit fields. Grouped before the 32-bit tail so the struct
     // needs no interior alignment padding — every uint64_t lands on its natural
-    // 8-byte boundary, and the tail's eight uint32_t fill the last two 8-byte
-    // slots exactly, so the struct carries no padding byte at all. Order among
+    // 8-byte boundary. The nine 32-bit tail members require four trailing
+    // padding bytes for the structure's 8-byte alignment. Order among
     // these is free (device reads by field name, not offset); only
     // runtime_args/regs are offset-locked.
     uint64_t ffts_base_addr{0};  // FFTS base address for AICore
@@ -187,6 +189,7 @@ struct KernelArgs {
     uint32_t graph_section_offset{0};
     uint32_t graph_section_bytes{0};
     uint32_t graph_section_source{static_cast<uint32_t>(GraphSectionSource::None)};
+    uint32_t entry_cache_maintenance{static_cast<uint32_t>(EntryCacheMaintenance::Full)};
 };
 
 static_assert(offsetof(KernelArgs, runtime_args) == 0, "KernelArgs::runtime_args offset drift");
@@ -211,10 +214,10 @@ static_assert(
 );
 // Where the 32-bit tail's Graph triple begins. `sizeof` alone cannot see a
 // reorder inside that tail, because every member of it is the same width: the
-// eighteen 8-byte fields end at 144 and the eight uint32_t that follow fill 176
-// exactly, in whatever order they are written.
+// eighteen 8-byte fields end at 144; the Graph triple starts at 164.
 static_assert(offsetof(KernelArgs, graph_section_offset) == 164, "KernelArgs::graph_section_offset offset drift");
-static_assert(sizeof(KernelArgs) == 176, "KernelArgs launch-payload size drift");
+static_assert(offsetof(KernelArgs, entry_cache_maintenance) == 176, "entry cache policy offset drift");
+static_assert(sizeof(KernelArgs) == 184, "KernelArgs launch-payload size drift");
 static_assert(alignof(KernelArgs) == 8, "KernelArgs launch-payload alignment drift");
 // No conditional members: the struct body carries no preprocessor branch, so
 // these values are the same in every translation unit that sees this header.

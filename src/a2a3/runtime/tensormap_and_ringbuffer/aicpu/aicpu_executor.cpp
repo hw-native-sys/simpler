@@ -29,6 +29,7 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/orch_so_file.h"
 #include "aicpu/platform_entry_args.h"
+#include "entry_cache_maintenance.h"
 #include "callable_protocol.h"
 #include "common/kernel_args.h"
 #include "dispatch_payload.h"
@@ -252,13 +253,14 @@ static_assert(
 namespace {
 
 // Whether this launch's entry-argument header names values the descriptor
-// agrees with, adopting them when it does. A descriptor-route run consumes
-// nothing: its values are already in place, and the header only has to say so.
+// agrees with, adopting them when it does. Descriptor values stay resident;
+// FullFreshen refreshes their active storage before those values are consumed.
 bool adopt_launch_entry_args(Runtime *runtime, int32_t thread_idx) {
     // This thread's own slot: `thread_idx` is the gate survivor index the
     // platform entry published under, on this same thread, so the block the
     // view names is the one that thread still owns.
     const PlatformEntryArgs view = get_platform_entry_args(thread_idx);
+    if (!simpler::tmr::valid_entry_cache_route(view)) return false;
     const uint32_t source = view.source;
     const uint32_t offset = view.offset;
     const uint32_t tensors = view.tensor_count;
@@ -266,7 +268,8 @@ bool adopt_launch_entry_args(Runtime *runtime, int32_t thread_idx) {
     // Decided before any address is formed from these values; the verdict says
     // which check refused, and Adopt is the only one that licenses the read.
     const LaunchEntryArgsVerdict verdict = classify_launch_entry_args(*runtime, source, offset, tensors, scalars);
-    if (verdict == LaunchEntryArgsVerdict::Descriptor) return true;
+    if (verdict == LaunchEntryArgsVerdict::Descriptor)
+        return simpler::tmr::freshen_entry_descriptor(*runtime, view, cache_invalidate_range);
     if (verdict != LaunchEntryArgsVerdict::Adopt) {
         LOG_ERROR(
             "Thread %d: launch entry-args rejected (verdict=%d, source=%u/%u, offset=%u, counts=%u/%u vs %u/%u)",
@@ -1147,7 +1150,8 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     //    HBM. `dev` is the device descriptor: it spans more than the uploaded
     //    prefix, because the gate tail inside it is device-written and still
     //    needs this maintenance.
-    cache_invalidate_range(runtime, sizeof(runtime->dev));
+    const PlatformEntryArgs view = get_platform_entry_args(platform_aicpu_affinity_thread_idx());
+    simpler::tmr::clean_entry_runtime(*runtime, view, terminal_publisher_.snapshot_is_ok(), cache_invalidate_range);
 
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();

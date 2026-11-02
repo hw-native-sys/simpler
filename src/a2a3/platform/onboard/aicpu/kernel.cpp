@@ -145,7 +145,7 @@ extern "C" __attribute__((visibility("default"))) int simpler_aicpu_exec(void *a
         PlatformEntryArgs{
             arg, k_args->entry_args_offset, k_args->entry_tensor_count, k_args->entry_scalar_count,
             k_args->entry_args_source, k_args->graph_section_offset, k_args->graph_section_bytes,
-            k_args->graph_section_source
+            k_args->graph_section_source, k_args->entry_cache_maintenance
         }
     );
     AicpuPhaseScope run_wall(AicpuPhase::RunWall);

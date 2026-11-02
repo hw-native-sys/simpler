@@ -20,7 +20,8 @@ inline bool admit_kernel_launch_entry(
     const Runtime &runtime, const PlatformEntryArgs &view, const KernelCallableIdentity &registered, uint64_t run_epoch,
     EntryArgsStorage *output
 ) {
-    if (!valid_kernel_identity(registered) || view.args_base == nullptr || run_epoch == 0 ||
+    if (view.cache_maintenance != static_cast<uint32_t>(EntryCacheMaintenance::Full) ||
+        !valid_kernel_identity(registered) || view.args_base == nullptr || run_epoch == 0 ||
         view.source != static_cast<uint32_t>(EntryArgsSource::KernelInvocation) ||
         runtime.get_entry_args_source() != EntryArgsSource::KernelInvocation ||
         view.offset != LAUNCH_ENVELOPE_HEADER_BYTES || view.tensor_count != registered.tensor_count ||

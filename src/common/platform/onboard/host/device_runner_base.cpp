@@ -3949,6 +3949,14 @@ int DeviceRunnerBase::wait_run_fence(PreparedExecution &prepared) {
             run_boundaries_observed_.observed(prepared.identity)
         );
     }
+    // Retirement releases the run view before a caller observes success. Match
+    // the allocation's last publication epoch instead of retaining that view;
+    // a new prepare or free invalidates the old observer's qualification.
+    if (rc == 0 && !execution_mode_latch_.is_kernel()) {
+        slot_persistent_args_[prepared.pipeline_slot].entry_cache_qualification.observe_success(
+            prepared.identity.run_epoch
+        );
+    }
     if (rc != 0) (void)read_device_run_result(prepared.pipeline_slot, prepared.identity.run_epoch);
     return rc;
 }
