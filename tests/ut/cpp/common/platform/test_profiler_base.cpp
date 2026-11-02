@@ -27,6 +27,9 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
+#include <memory>
+#include <system_error>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
@@ -1068,4 +1071,47 @@ TEST(ProfilerBaseTest, FailureSnapshotNamesUnacknowledgedReferenceShard) {
     const auto after = Peer::snapshot(collector, -1);
     EXPECT_EQ(after.control_epoch, before.control_epoch);
     EXPECT_EQ(after.shards[1].control_ack, before.shards[1].control_ack);
+}
+
+TEST(ProfilerBaseTest, FailedStartJoinsEveryCreatedThreadBeforeRetry) {
+    // Two drain threads, one replenisher and two collectors.
+    for (int fail_at = 0; fail_at < 5; ++fail_at) {
+        SCOPED_TRACE(fail_at);
+        TestHeader header{};
+        TestCollector<PerThreadModule> collector;
+        collector.init(2, &header);
+        int attempts = 0;
+        std::vector<std::weak_ptr<int>> closures;
+        EXPECT_THROW(
+            collector.start([&](std::function<void()> fn) {
+                if (attempts++ == fail_at) throw std::system_error(EAGAIN, std::generic_category());
+                auto token = std::make_shared<int>(0);
+                closures.push_back(token);
+                return std::thread([fn = std::move(fn), token = std::move(token)] {
+                    (void)token;
+                    fn();
+                });
+            }),
+            std::system_error
+        );
+        const bool joined = std::all_of(closures.begin(), closures.end(), [](const auto &token) {
+            return token.expired();
+        });
+        EXPECT_TRUE(joined);
+        EXPECT_FALSE(collector.collector_threads_started());
+        // Keep the regression safe to run against the broken implementation.
+        if (joined && !collector.collector_threads_started()) {
+            int restarted = 0;
+            collector.start([&](std::function<void()> fn) {
+                ++restarted;
+                return std::thread(std::move(fn));
+            });
+            EXPECT_EQ(restarted, 5);
+            collector.quiesce();
+        }
+        collector.stop(false);
+        collector.manager().release_all_owned([](void *ptr) {
+            std::free(ptr);
+        });
+    }
 }

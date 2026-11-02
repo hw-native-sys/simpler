@@ -398,6 +398,7 @@ set(SIM_CALLABLE_POOL_INCLUDES
     ${SIMPLER_SRC}/common/worker)
 
 hbg_case(test_sim_callable_pool.cpp
+    TIMEOUT 90
     SOURCES  ${SIM_CALLABLE_POOL_SOURCES} ${HBG_COMMON_SHARED_DIR}/runtime.cpp
     INCLUDES ${SIM_CALLABLE_POOL_INCLUDES}
     # chip_swimlane_collector.cpp refuses to compile without the runtime name,
@@ -415,6 +416,7 @@ hbg_case(test_sim_callable_pool.cpp
 # at different levels of src, so there is no single path template — the same
 # reason test_runtime_workers_publication above is a pair.
 tmr_case(test_sim_callable_pool.cpp
+    TIMEOUT 90
     SOURCES
         ${SIM_CALLABLE_POOL_SOURCES}
         ${SIMPLER_SRC}/@arch@/runtime/tensormap_and_ringbuffer/runtime/shared/runtime.cpp
@@ -424,6 +426,16 @@ tmr_case(test_sim_callable_pool.cpp
         FAKE_KERNEL_SO_PATH="$<TARGET_FILE:test_fake_child_kernel>"
     LINK    ${CMAKE_DL_LIBS}
     DEPENDS test_fake_child_kernel)
+
+# pthread failure injection uses the ELF linker's wrapping support.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(arch a2a3 a5)
+        foreach(runtime hbg tmr)
+            target_link_options(test_${arch}_${runtime}_sim_callable_pool PRIVATE
+                "-Wl,--wrap=pthread_setspecific" "-Wl,--wrap=pthread_key_create")
+        endforeach()
+    endforeach()
+endif()
 
 # One source, three builds differing only in how capture is switched on: the
 # compile-time flag, the environment variable, and both. A separate process
@@ -633,6 +645,15 @@ tmr_case(test_diagnostic_capacity_refusal_phase.cpp
     INCLUDES ${CAPACITY_REFUSAL_INCLUDES}
     DEFINES  SIMPLER_RUNTIME_NAME="tensormap_and_ringbuffer"
     LINK     ${CMAKE_DL_LIBS})
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    foreach(arch a2a3 a5)
+        foreach(runtime hbg tmr)
+            target_link_options(test_${arch}_${runtime}_diagnostic_capacity_refusal_phase PRIVATE
+                "-Wl,--wrap=pthread_setspecific")
+        endforeach()
+    endforeach()
+endif()
 
 # What the preparation entry does with an argument dump the runtime beneath it
 # has no producer for. Takes the capacity case's closure for the same reason:

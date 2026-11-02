@@ -1193,35 +1193,41 @@ public:
         // queues rely on.
         const int n = shard_count_;
 
-        drain_device_queues_on_stop_.store(true, std::memory_order_relaxed);
-        mgmt_running_.store(true, std::memory_order_release);
-        mgmt_drain_threads_.reserve(n);
-        for (int i = 0; i < n; i++) {
-            if (thread_factory) {
-                mgmt_drain_threads_.push_back(thread_factory([this, i, n]() {
-                    mgmt_drain_loop(i, n);
-                }));
-            } else {
-                mgmt_drain_threads_.emplace_back(&ProfilerBase::mgmt_drain_loop, this, i, n);
+        try {
+            drain_device_queues_on_stop_.store(true, std::memory_order_relaxed);
+            mgmt_drain_threads_.reserve(n);
+            collector_threads_.reserve(n);
+            mgmt_running_.store(true, std::memory_order_release);
+            for (int i = 0; i < n; i++) {
+                if (thread_factory) {
+                    mgmt_drain_threads_.push_back(thread_factory([this, i, n]() {
+                        mgmt_drain_loop(i, n);
+                    }));
+                } else {
+                    mgmt_drain_threads_.emplace_back(&ProfilerBase::mgmt_drain_loop, this, i, n);
+                }
             }
-        }
-        if (thread_factory) {
-            mgmt_replenish_thread_ = thread_factory([this]() {
-                mgmt_replenish_loop();
-            });
-        } else {
-            mgmt_replenish_thread_ = std::thread(&ProfilerBase::mgmt_replenish_loop, this);
-        }
+            if (thread_factory) {
+                mgmt_replenish_thread_ = thread_factory([this]() {
+                    mgmt_replenish_loop();
+                });
+            } else {
+                mgmt_replenish_thread_ = std::thread(&ProfilerBase::mgmt_replenish_loop, this);
+            }
 
-        collector_threads_.reserve(n);
-        for (int i = 0; i < n; i++) {
-            if (thread_factory) {
-                collector_threads_.push_back(thread_factory([this, i]() {
-                    poll_and_collect_loop(i);
-                }));
-            } else {
-                collector_threads_.emplace_back(&ProfilerBase::poll_and_collect_loop, this, i);
+            for (int i = 0; i < n; i++) {
+                if (thread_factory) {
+                    collector_threads_.push_back(thread_factory([this, i]() {
+                        poll_and_collect_loop(i);
+                    }));
+                } else {
+                    collector_threads_.emplace_back(&ProfilerBase::poll_and_collect_loop, this, i);
+                }
             }
+        } catch (...) {
+            // Missing collector shards cannot consume a final device-queue drain.
+            stop(false);
+            throw;
         }
     }
 

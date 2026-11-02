@@ -131,6 +131,10 @@ enum {
        remains whose retirement could supply them: either none ever held any, or
        this plan has already waited for every one that did. Terminal. */
     SIMPLER_RUNTIME_ERR_RESOURCE_UNAVAILABLE = PTO_RUNTIME_ERR_BASE - 7,
+    /* Reserved for simpler_wait_run: this wait did not observe the result.
+       The run remains live and may be waited/finalized again. Never store this
+       operation result as the execution's terminal error. */
+    SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE = PTO_RUNTIME_ERR_BASE - 8,
 };
 
 /**
@@ -1222,7 +1226,15 @@ int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  */
 int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime);
 
-/** Observe the actual run streams once; may include later queued work. */
+/**
+ * Observe the actual run streams once; may include later queued work.
+ * For a valid launched run, SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE means the
+ * operation failed before observation; retain the run for retry. Every other
+ * return records the observer result, not proof of physical completion; use
+ * poll or wait_run_completion to establish that separate fact.
+ * The reserved incomplete code is never a terminal run result. Host consumers
+ * and runtime modules must be rebuilt together for this contract.
+ */
 int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /**

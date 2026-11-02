@@ -54,11 +54,15 @@
 
 #include <gtest/gtest.h>
 
+#include "cpu_sim_context.h"
 #include "device_runner_base.h"
 #include "native_run_context.h"
 #include "native_run_execution.h"
 
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <pthread.h>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -170,6 +174,17 @@ int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
 
 }  // extern "C"
 
+#if defined(__linux__)
+namespace {
+std::atomic<bool> reject_device_binding{false};
+}
+extern "C" int __real_pthread_setspecific(pthread_key_t key, const void *value);
+extern "C" int __wrap_pthread_setspecific(pthread_key_t key, const void *value) {
+    if (value == reinterpret_cast<void *>(uintptr_t{1}) && reject_device_binding.load()) return ENOMEM;
+    return __real_pthread_setspecific(key, value);
+}
+#endif
+
 namespace {
 
 constexpr int32_t kCallableId = 11;
@@ -198,6 +213,11 @@ public:
         // no reference for a callable that dispatches nothing.
         callables_[kCallableId] = CallableState{};
         chip_callable_buffers_[CallableState{}.chip_buffer_hash] = ChipCallableBuffer{};
+    }
+
+    ~RetryRunner() override {
+        pto_cpu_sim_bind_device(-1);
+        pto_cpu_sim_release_device(kSimDeviceId);
     }
 
     /** Everything a real prepare needs from the runner, and nothing more. */
@@ -1095,3 +1115,48 @@ TEST(DiagnosticCapacityRefusalPhaseTest, FinalizePrefixAllocationFailureKeepsLau
         check_sim_finalize_prefix_allocation_failure(true, delivery_entry);
     }
 }
+#if defined(__linux__)
+TEST(SimRunBindingFailure, WaitFailureKeepsTheRunDrainable) {
+    PreparedRun run;
+    ASSERT_TRUE(run.runner.stand_up());
+    ASSERT_EQ(run.prepare(), 0);
+    run.runner.refuse_for_capacity = false;
+    ASSERT_EQ(run.launch(), 0);
+    reject_device_binding = true;
+    const int rc = simpler_wait_run(&run.runner, run.storage.handle());
+    reject_device_binding = false;
+    EXPECT_EQ(rc, SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE);
+    EXPECT_FALSE(run.state()->result_observed);
+    EXPECT_FALSE(run.state()->physical_complete);
+    EXPECT_EQ(run.phase(), NativeRunPhase::Running);
+    EXPECT_EQ(run.runner.drain_calls, 0);
+    EXPECT_TRUE(run.runner.claim_held_by(run.storage.handle()));
+    EXPECT_EQ(run.finalize(), 0);
+    EXPECT_EQ(run.runner.drain_calls, 1);
+    EXPECT_FALSE(run.runner.native_run_active());
+}
+
+TEST(SimRunBindingFailure, FinalizeFailurePreservesTheCarrierAndClaimForRetry) {
+    for (bool already_drained : {false, true}) {
+        PreparedRun run;
+        ASSERT_TRUE(run.runner.stand_up());
+        ASSERT_EQ(run.prepare(), 0);
+        run.runner.refuse_for_capacity = false;
+        ASSERT_EQ(run.launch(), 0);
+        if (already_drained) ASSERT_EQ(simpler_wait_run(&run.runner, run.storage.handle()), 0);
+        reject_device_binding = true;
+        const int rc = run.finalize();
+        reject_device_binding = false;
+        EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+        uint64_t tag = 0;
+        std::memcpy(&tag, run.storage.handle(), sizeof(tag));
+        const bool intact = tag == kNativeRunContextMagic;
+        EXPECT_TRUE(intact);
+        EXPECT_TRUE(run.runner.claim_held_by(run.storage.handle()));
+        EXPECT_EQ(run.runner.drain_calls, already_drained ? 1 : 0);
+        if (intact) EXPECT_EQ(run.finalize(), 0);
+        EXPECT_EQ(run.runner.drain_calls, 1);
+        EXPECT_FALSE(run.runner.native_run_active());
+    }
+}
+#endif

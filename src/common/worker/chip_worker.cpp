@@ -1770,11 +1770,14 @@ void ChipWorker::wait_native_run(const ChipWorkerNativeRun &run) {
     std::exception_ptr failure;
     try {
         wait_rc = wait_run_fn_(device_ctx_, storage);
+        if (wait_rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE) {
+            throw std::runtime_error("native run wait incomplete; retry wait or finalize");
+        }
     } catch (...) {
         failure = std::current_exception();
     }
     // Cache the observer once, independently of whether device last use is proved.
-    // An exception supplies neither fact and leaves the observation retryable.
+    // An exception or incomplete wait leaves the observation retryable.
     if (failure == nullptr) note_native_run_wait(run.run_epoch, storage, wait_rc);
     if (failure != nullptr) std::rethrow_exception(failure);
 }
@@ -1936,6 +1939,9 @@ ChipWorker::NativeRunFinalizeOutcome ChipWorker::finalize_native_run_epoch(
         int wait_rc = 0;
         try {
             wait_rc = wait_run_fn_(device_ctx_, storage);
+            if (wait_rc == SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE) {
+                throw std::runtime_error("native run wait incomplete; retry wait or finalize");
+            }
         } catch (...) {
             outcome.captured = std::current_exception();
         }

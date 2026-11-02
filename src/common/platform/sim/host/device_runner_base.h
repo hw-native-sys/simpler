@@ -340,6 +340,9 @@ public:
      * over a hundred of them share this factory — without a name every one
      * reports as the host process's own `comm` and a crash dump cannot say
      * which tier faulted.
+     *
+     * Returns only after binding succeeds. Failure joins the child without
+     * invoking fn and throws std::system_error; an unattached runner is rejected.
      */
     std::thread create_thread(std::function<void()> fn, std::string name = {});
     int attach_current_thread(int device_id);

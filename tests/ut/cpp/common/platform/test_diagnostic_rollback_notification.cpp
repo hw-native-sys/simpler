@@ -97,6 +97,8 @@ class RollbackRunner : public SimDeviceRunnerBase {
 public:
     /** Retention on, ScopeStats initialized, and the notifiers wired. */
     bool stand_up_scope_stats() {
+        // Collector threads use the runner's device-binding factory.
+        if (attach_current_thread(kSimDeviceId) != 0) return false;
         set_retain_runs(true);
         if (scope_stats_collector_.init(/*num_threads=*/1, rollback_alloc, nullptr, rollback_free, 0) != 0) {
             return false;

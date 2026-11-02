@@ -1260,3 +1260,76 @@ TEST(NativeRunOperationLeaseTest, FailedLaunchThatCompletedKeepsItsOwnError) {
     }
     EXPECT_EQ(g_wait_calls, 1);
 }
+
+// Model the checked sim wait's early binding failure using the existing backend
+// stubs, while exercising the production ChipWorker state machine.
+TEST(NativeRunOperationLeaseTest, IncompleteWaitRemainsRetryable) {
+    ChipWorker worker;
+    prime(worker);
+    const auto run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_wait_rc = SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    EXPECT_THROW(worker.wait_native_run(run), std::runtime_error);
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->pending_rc_set);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->result_observed);
+    EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::LAUNCHED);
+    EXPECT_FALSE(worker.poll_native_run(run));
+    // A second caller must reach the backend while it still owes a drain.
+    EXPECT_THROW(worker.wait_native_run(run), std::runtime_error);
+    EXPECT_EQ(g_wait_calls, 2);
+    // A later successful wait must complete without retaining the transient error.
+    g_wait_rc = 0;
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    EXPECT_NO_THROW(worker.wait_native_run(run));
+    EXPECT_EQ(g_wait_calls, 3);
+    EXPECT_TRUE(worker.poll_native_run(run));
+    EXPECT_NO_THROW(worker.finalize_native_run(run));
+}
+
+TEST(NativeRunOperationLeaseTest, FinalizeIncompleteWaitRemainsRetryable) {
+    ChipWorker worker;
+    prime(worker);
+    const auto run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_wait_rc = SIMPLER_NATIVE_RUN_WAIT_INCOMPLETE;
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    g_finalize_rc = PTO_RUNTIME_ERR_INTERNAL;
+    g_finalize_destroys = false;
+    EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->pending_rc_set);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->result_observed);
+    EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::LAUNCHED);
+    EXPECT_FALSE(worker.poll_native_run(run));
+    EXPECT_EQ(g_finalize_calls, 0);
+    EXPECT_FALSE(worker.native_runs_.at(run.run_epoch)->finalize_reserved);
+    EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
+    EXPECT_EQ(g_wait_calls, 2);
+    g_wait_rc = 0;
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    g_finalize_rc = 0;
+    g_finalize_destroys = true;
+    EXPECT_NO_THROW(worker.finalize_native_run(run));
+    EXPECT_EQ(g_wait_calls, 3);
+    EXPECT_EQ(g_finalize_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, CompletedExecutionErrorStaysComplete) {
+    for (int error : {-7, static_cast<int>(PTO_RUNTIME_ERR_INTERNAL)}) {
+        ChipWorker worker;
+        prime(worker);
+        const auto run = prepare(worker, 0, 1);
+        worker.launch_native_run(run);
+        g_wait_rc = error;
+        g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        EXPECT_NO_THROW(worker.wait_native_run(run));
+        EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->phase, ChipWorker::NativeRunPhase::REAPED);
+        EXPECT_TRUE(worker.poll_native_run(run));
+        EXPECT_NO_THROW(worker.wait_native_run(run));
+        EXPECT_EQ(g_wait_calls, 1);
+        EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
+        EXPECT_EQ(g_finalize_calls, 1);
+    }
+}

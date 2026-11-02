@@ -17,6 +17,10 @@
 #include <pthread.h>
 #endif
 
+#include <algorithm>
+#include <cerrno>
+#include <future>
+#include <system_error>
 #include <chrono>
 #include <cstddef>
 #include <cstdio>
@@ -359,19 +363,44 @@ void *SimDeviceRunnerBase::acquire_pooled_runtime_arena(uint32_t arena_bank) {
 }
 
 std::thread SimDeviceRunnerBase::create_thread(std::function<void()> fn, std::string name) {
-    int dev_id = device_id_;
-    return std::thread([dev_id, fn = std::move(fn), name = std::move(name)]() {
+    const int dev_id = device_id_;
+    if (dev_id < 0) throw std::system_error(EINVAL, std::generic_category(), "sim device is unbound");
+    // Linux thread names allow at most 15 characters plus NUL.
+    name.resize(std::min(name.size(), size_t{15}));
+    std::promise<int> binding;
+    auto ready = binding.get_future();
+    std::thread child([dev_id, fn = std::move(fn), name, binding = std::move(binding)]() mutable {
 #if defined(__linux__)
-        // Linux caps a thread name at 15 characters plus NUL and fails the call
-        // outright on a longer one, which would leave the thread unnamed.
-        if (!name.empty()) {
-            pthread_setname_np(pthread_self(), name.substr(0, 15).c_str());
-        }
+        if (!name.empty()) pthread_setname_np(pthread_self(), name.c_str());
 #endif
-        pto_cpu_sim_bind_device(dev_id);
+        int error;
+        try {
+            error = pto_cpu_sim_bind_device_checked(dev_id);
+        } catch (...) {
+            error = EIO;
+        }
+        binding.set_value(error);
+        if (error != 0) return;
         fn();
-        pto_cpu_sim_bind_device(-1);
+        // A fresh thread's scalar binding expires at thread exit.
     });
+    int error;
+    try {
+        // attach_current_thread() initializes the process key before publishing
+        // device_id_: child binding takes no key-initialization mutex.
+        // This wait has no deadline: a timed-out child still needs joining before
+        // its runner or module can be released; detaching is not safe cleanup.
+        error = ready.get();
+    } catch (...) {
+        child.join();
+        throw;
+    }
+    if (error != 0) {
+        child.join();
+        LOG_ERROR("sim device binding failed: device=%d thread=%s pthread_error=%d", dev_id, name.c_str(), error);
+        throw std::system_error(error, std::generic_category(), "sim device binding failed");
+    }
+    return child;
 }
 
 int SimDeviceRunnerBase::attach_current_thread(int device_id) {
@@ -390,7 +419,10 @@ int SimDeviceRunnerBase::attach_current_thread(int device_id) {
     // Per-thread bind so sim hooks (TPUSH/TPOP, identity helpers) route through
     // the correct context. acquire is process-wide and idempotent (no-op after
     // first call for a given device_id), so it is safe to fold in here.
-    pto_cpu_sim_bind_device(device_id);
+    if (const int error = pto_cpu_sim_bind_device_checked(device_id); error != 0) {
+        LOG_ERROR("Failed to bind simulated device %d: %d", device_id, error);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
     pto_cpu_sim_acquire_device(device_id);
     device_id_ = device_id;
     return 0;

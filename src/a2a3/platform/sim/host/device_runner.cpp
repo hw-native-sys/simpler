@@ -21,6 +21,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -45,6 +47,7 @@
 #include "host/run_boundary.h"
 #include "host/runtime_timeout_config.h"
 #include "runtime.h"
+#include "sim_thread_start_gate.h"
 
 // dep_gen has two shapes, one per orchestration site, and each runtime provides
 // the strong symbols for the one it uses:
@@ -84,12 +87,25 @@ extern "C" __attribute__((weak, visibility("hidden"))) int dep_gen_host_graph_em
 }
 
 struct DeviceRunner::ActiveRun {
+    SimThreadStartGate startup;
     Runtime *runtime{nullptr};
     void *reg_blocks{nullptr};
     void *pmu_reg_blocks{nullptr};
     std::vector<std::thread> aicpu_threads;
     std::vector<std::thread> aicore_threads;
     DevicePhaseBufferStorage<PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH> phase_buf{};
+
+    void reset_startup() {
+        // The launch owner serializes reset with thread creation and join.
+        // A joinable thread may not have reached startup.wait() yet.
+        assert(std::all_of(aicpu_threads.begin(), aicpu_threads.end(), [](const std::thread &thread) {
+            return !thread.joinable();
+        }));
+        assert(std::all_of(aicore_threads.begin(), aicore_threads.end(), [](const std::thread &thread) {
+            return !thread.joinable();
+        }));
+        startup.reset();
+    }
 
     void join() noexcept {
         for (auto &thread : aicpu_threads) {
@@ -576,6 +592,14 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
         return LaunchTransactionResult{};
     }
 
+    run->reset_startup();
+    int startup_error = PTO_RUNTIME_ERR_INTERNAL;
+    auto startup_cleanup = RAIIScopeGuard([this, run, &startup_error]() {
+        run->startup.cancel();
+        run->join();
+        // Includes workers never created and those cancelled before execution.
+        run_completion_.abandon(startup_error);
+    });
     std::chrono::steady_clock::time_point sim_t0;
 
     LaunchTransactionResult result = exact_launch_transaction(
@@ -686,6 +710,9 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
                 uint32_t physical_core_id = static_cast<uint32_t>(i);
                 run->aicore_threads.push_back(create_thread(
                     [this, run, i, core_type, physical_core_id]() {
+                        // Cancelled startup is joined and abandoned by the launch owner;
+                        // only released workers contribute task_finished().
+                        if (!run->startup.wait()) return;
                         aicore_execute_func_(
                             run->runtime, i, core_type, physical_core_id, kernel_args_.regs,
                             kernel_args_.enable_profiling_flag, kernel_args_.chip_swimlane_aicore_rotation_table,
@@ -703,6 +730,9 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             for (int i = 0; i < over_launch; i++) {
                 run->aicpu_threads.push_back(create_thread(
                     [this, run, launch_aicpu_num, over_launch, sim_t0]() {
+                        // Cancelled startup is joined and abandoned by the launch owner;
+                        // only released workers contribute task_finished().
+                        if (!run->startup.wait()) return;
                         if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
                             run_completion_.task_finished();
                             return;
@@ -722,6 +752,12 @@ LaunchTransactionResult DeviceRunner::launch_execution_impl(PreparedExecution &p
             return 0;
         }
     );
+    if (result.rc == 0) {
+        run->startup.release();
+        startup_cleanup.dismiss();
+    } else {
+        startup_error = result.rc;
+    }
     return result;
 }
 
