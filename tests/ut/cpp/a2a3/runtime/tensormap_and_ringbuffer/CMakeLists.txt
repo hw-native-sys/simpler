@@ -62,6 +62,24 @@ else()
     simpler_ut_exclude_case(test_entry_cache_projection.cpp)
 endif()
 
+if(APPLE)
+    set(_entry_preparation_gc -Wl,-dead_strip)
+else()
+    set(_entry_preparation_gc -Wl,--gc-sections)
+endif()
+a2a3_tmr_case(test_entry_args_preparation.cpp NO_OBJS
+    SOURCES
+        ${A2A3_RUNTIME_DIR}/shared/runtime.cpp
+        ${A2A3_RUNTIME_DIR}/scheduler/scheduler_cold_path.cpp
+        ${A2A3_RUNTIME_DIR}/scheduler/scheduler.cpp
+        ${SIMPLER_SRC}/common/platform/shared/aicpu/aicpu_device_config.cpp
+    INCLUDES ${SIMPLER_SRC}/a2a3/runtime/tensormap_and_ringbuffer/aicpu
+    LINK a2a3_ut_support ${CMAKE_DL_LIBS}
+    DEFINES SIMPLER_DFX=0 SIMPLER_ORCH_PROFILING=0
+    COMPILE_OPTIONS -ffunction-sections -fdata-sections
+    LINK_OPTIONS ${_entry_preparation_gc}
+    TIMEOUT 20)
+
 # Everything not named above is a plain case: one file, this runtime's whole
 # object library, nothing else to say. Dropping a new test_*.cpp into this
 # directory is all it takes — declaring one by hand above is what removes it
