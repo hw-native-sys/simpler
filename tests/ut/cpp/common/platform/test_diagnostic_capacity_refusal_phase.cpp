@@ -66,6 +66,7 @@
 #include <cstdlib>
 #include <new>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 #include <array>
@@ -77,6 +78,16 @@
 #include "common/host_span.h"
 #include "common/log_level.h"
 #include "utils/tensor_lease_release.h"
+
+namespace finalize_prefix_test {
+struct AllocationFault {
+    bool armed{false};
+    size_t consumed{0};
+    size_t bytes{0};
+};
+thread_local AllocationFault prefix_allocation_fault;
+thread_local size_t copyback_calls{0};
+}  // namespace finalize_prefix_test
 
 namespace {
 thread_local bool refuse_result_retention_allocation = false;
@@ -95,6 +106,12 @@ void *operator new(std::size_t bytes) {
         throw std::bad_alloc();
     }
     if (std::exchange(refuse_result_retention_allocation, false)) throw std::bad_alloc();
+    auto &fault = finalize_prefix_test::prefix_allocation_fault;
+    if (std::exchange(fault.armed, false)) {
+        ++fault.consumed;
+        fault.bytes = bytes;
+        throw std::bad_alloc();
+    }
     if (void *storage = std::malloc(bytes == 0 ? 1 : bytes)) return storage;
     throw std::bad_alloc();
 }
@@ -134,6 +151,7 @@ int publish_run_image_impl(Runtime * /*runtime*/, const HostApi * /*api*/) { ret
 int copy_in_run_inputs_impl(const Runtime * /*runtime*/, const HostApi * /*api*/) { return 0; }
 
 int copy_back_run_outputs_impl(const Runtime *runtime, const HostApi *api, int execution_rc, int launched) {
+    ++finalize_prefix_test::copyback_calls;
     if (execution_rc == 0 && launched != 0 && runtime != nullptr) {
         for (const auto &lease : runtime->tensor_leases()) {
             if (lease.needs_copy_back) {
@@ -984,4 +1002,96 @@ TEST(DiagnosticCapacityRefusalPhaseTest, ClockExportFollowsItsRootAfterSlotReuse
         stderr, "SIM_CLOCK_EXPORT path=%s inv=%llu successor_inv=%llu\n", target.c_str(),
         static_cast<unsigned long long>(invocation), static_cast<unsigned long long>(successor_invocation)
     );
+}
+
+namespace {
+void check_sim_finalize_prefix_allocation_failure(bool launched, bool delivery_entry) {
+    PreparedRun run;
+    ASSERT_TRUE(run.runner.stand_up());
+    CallConfig config = diagnostic_config();
+    config.enable_scope_stats = 0;
+    const std::string prefix(160, 'p');
+    std::memcpy(config.output_prefix, prefix.c_str(), prefix.size() + 1);
+    ASSERT_EQ(run.prepare(config), 0);
+    if (launched) {
+        run.runner.refuse_for_capacity = false;
+        ASSERT_EQ(run.launch(), 0);
+    }
+    const auto phase = run.phase();
+    const auto completion = run.completion_rc();
+    const auto acceptance = run.acceptance();
+    const auto *prepared_owner = run.state()->prepared_execution.get();
+    const auto *active_owner = run.state()->active_execution.get();
+    const auto descriptor = run.state()->descriptor;
+    const auto launches = run.runner.launch_calls;
+    ASSERT_TRUE(run.runner.claim_held_by(run.storage.handle()));
+    std::vector<unsigned char> carrier(get_runtime_size());
+    std::memcpy(carrier.data(), run.storage.handle(), carrier.size());
+    const auto finalize = [&] {
+        return delivery_entry ? simpler_finalize_run_with_delivery(&run.runner, run.storage.handle(), 1) :
+                                run.finalize();
+    };
+    auto &fault = finalize_prefix_test::prefix_allocation_fault;
+    fault = {true, 0, 0};
+    finalize_prefix_test::copyback_calls = 0;
+    bool escaped = false;
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = finalize();
+    } catch (const std::bad_alloc &) {
+        escaped = true;
+    }
+    const bool fault_unconsumed = std::exchange(fault.armed, false);
+    std::printf(
+        "FINALIZE_PREFIX backend=sim launched=%d delivery_entry=%d consumed=%zu escaped=%d rc=%d bytes=%zu\n", launched,
+        delivery_entry, fault.consumed, escaped, rc, fault.bytes
+    );
+    EXPECT_FALSE(fault_unconsumed);
+    EXPECT_EQ(fault.consumed, 1u);
+    EXPECT_GE(fault.bytes, prefix.size() + 1);
+    EXPECT_FALSE(escaped);
+    EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+    ASSERT_EQ(run.state()->magic, NativeRunContext<SimDeviceRunnerBase>::kMagic);
+    EXPECT_EQ(std::memcmp(carrier.data(), run.storage.handle(), carrier.size()), 0);
+    EXPECT_EQ(run.phase(), phase);
+    EXPECT_EQ(run.completion_rc(), completion);
+    EXPECT_EQ(run.acceptance(), acceptance);
+    EXPECT_EQ(run.state()->prepared_execution.get(), prepared_owner);
+    EXPECT_EQ(run.state()->active_execution.get(), active_owner);
+    EXPECT_TRUE(run.runner.claim_held_by(run.storage.handle()));
+    EXPECT_EQ(run.runner.launch_calls, launches);
+    EXPECT_EQ(finalize_prefix_test::copyback_calls, 0u);
+
+    ASSERT_EQ(finalize(), 0);
+    uint64_t magic = 1;
+    std::memcpy(&magic, run.storage.handle(), sizeof(magic));
+    EXPECT_EQ(magic, 0u);
+    EXPECT_FALSE(run.runner.native_run_active());
+    EXPECT_EQ(finalize_prefix_test::copyback_calls, 1u);
+    RuntimeStorage successor;
+    auto next = descriptor;
+    ++next.run_id;
+    ++next.generation;
+    ++next.dispatch_id;
+    ++next.run_epoch;
+    ASSERT_EQ(simpler_prepare_run(&run.runner, successor.handle(), kCallableId, nullptr, &config, &next), 0);
+    run.runner.refuse_for_capacity = false;
+    ASSERT_EQ(simpler_launch_run(&run.runner, successor.handle()), 0);
+    EXPECT_EQ(simpler_finalize_run(&run.runner, successor.handle()), 0);
+    EXPECT_FALSE(run.runner.native_run_active());
+}
+}  // namespace
+
+TEST(DiagnosticCapacityRefusalPhaseTest, FinalizePrefixAllocationFailureKeepsPreparedOwnerRetryable) {
+    for (bool delivery_entry : {false, true}) {
+        SCOPED_TRACE(delivery_entry);
+        check_sim_finalize_prefix_allocation_failure(false, delivery_entry);
+    }
+}
+
+TEST(DiagnosticCapacityRefusalPhaseTest, FinalizePrefixAllocationFailureKeepsLaunchedOwnerRetryable) {
+    for (bool delivery_entry : {false, true}) {
+        SCOPED_TRACE(delivery_entry);
+        check_sim_finalize_prefix_allocation_failure(true, delivery_entry);
+    }
 }

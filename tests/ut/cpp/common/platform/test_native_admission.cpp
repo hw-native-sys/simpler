@@ -17,6 +17,7 @@
 #include <string>
 #include "callable.h"
 #include "fixture.h"
+#include "native_run_context.h"
 #include "acl/acl.h"
 #define private public
 #include "chip_worker.h"
@@ -25,12 +26,18 @@
 
 namespace native_admission_test {
 thread_local bool refuse_next_host_allocation = false;
+thread_local size_t refused_host_allocation_bytes = 0;
+thread_local size_t refused_host_allocation_count = 0;
 }  // namespace native_admission_test
 
 // Only the throwing, unaligned allocation is replaced. Its ordinary delete
 // accepts malloc storage; aligned allocations retain their own allocator pair.
 void *operator new(std::size_t bytes) {
-    if (std::exchange(native_admission_test::refuse_next_host_allocation, false)) throw std::bad_alloc();
+    if (std::exchange(native_admission_test::refuse_next_host_allocation, false)) {
+        native_admission_test::refused_host_allocation_bytes = bytes;
+        ++native_admission_test::refused_host_allocation_count;
+        throw std::bad_alloc();
+    }
     if (void *storage = std::malloc(bytes == 0 ? 1 : bytes)) return storage;
     throw std::bad_alloc();
 }
@@ -2042,6 +2049,96 @@ TEST_F(NativeAdmissionTest, AWaitingPlanCannotReleaseBorrowsWhileItsNativeEpochS
     runner.release_caller_buffers(20, false);
     EXPECT_EQ(runner.free_caller_buffer(caller), 0);
     runner.retire(0, 10);
+}
+
+namespace {
+void check_finalize_prefix_allocation_failure(bool launched, bool delivery_entry) {
+    Runner runner;
+    Attempt run(runner, 0, 8100);
+    const std::string prefix(160, 'p');
+    std::memcpy(run.config.output_prefix, prefix.c_str(), prefix.size() + 1);
+    volatile int32_t accepted = -9;
+    run.descriptor.accepted_state = &accepted;
+    run.descriptor.accepted_value = 7;
+    ASSERT_EQ(run.prepare(), 0);
+    if (launched) ASSERT_EQ(simpler_launch_run(&runner, run.storage), 0);
+    auto *state = static_cast<NativeRunContext<DeviceRunnerBase> *>(run.storage);
+    const auto phase = state->phase.load();
+    const int completion = state->completion_rc;
+    const auto *prepared_owner = state->prepared_execution.get();
+    const auto *active_owner = state->active_execution.get();
+    const int32_t acceptance = accepted;
+    const auto payload = run.bytes;
+    const auto charged = runner.charged();
+    const auto reservations = runner.reservations();
+    const int launches = runner.launch_calls;
+    const int drains = runner.drain_calls;
+    const auto allocated = control().bytes;
+    std::vector<unsigned char> carrier(get_runtime_size());
+    std::memcpy(carrier.data(), run.storage, carrier.size());
+
+    const auto finalize = [&] {
+        return delivery_entry ? simpler_finalize_run_with_delivery(&runner, run.storage, 1) :
+                                simpler_finalize_run(&runner, run.storage);
+    };
+    refused_host_allocation_bytes = refused_host_allocation_count = 0;
+    refuse_next_host_allocation = true;
+    bool escaped = false;
+    int rc = PTO_RUNTIME_ERR_INTERNAL;
+    try {
+        rc = finalize();
+    } catch (const std::bad_alloc &) {
+        escaped = true;
+    }
+    const bool fault_unconsumed = std::exchange(refuse_next_host_allocation, false);
+    std::printf(
+        "FINALIZE_PREFIX backend=onboard launched=%d delivery_entry=%d consumed=%zu escaped=%d rc=%d bytes=%zu\n",
+        launched, delivery_entry, refused_host_allocation_count, escaped, rc, refused_host_allocation_bytes
+    );
+    EXPECT_FALSE(fault_unconsumed);
+    EXPECT_EQ(refused_host_allocation_count, 1u);
+    EXPECT_GE(refused_host_allocation_bytes, prefix.size() + 1);
+    EXPECT_FALSE(escaped);
+    EXPECT_EQ(rc, PTO_RUNTIME_ERR_INTERNAL);
+    ASSERT_EQ(state->magic, NativeRunContext<DeviceRunnerBase>::kMagic);
+    EXPECT_EQ(std::memcmp(carrier.data(), run.storage, carrier.size()), 0);
+    EXPECT_EQ(state->phase.load(), phase);
+    EXPECT_EQ(state->completion_rc, completion);
+    EXPECT_EQ(state->prepared_execution.get(), prepared_owner);
+    EXPECT_EQ(state->active_execution.get(), active_owner);
+    EXPECT_EQ(accepted, acceptance);
+    EXPECT_EQ(run.bytes, payload);
+    EXPECT_EQ(runner.charged(), charged);
+    EXPECT_EQ(runner.reservations(), reservations);
+    EXPECT_EQ(runner.launch_calls, launches);
+    EXPECT_EQ(runner.drain_calls, drains);
+    EXPECT_EQ(control().bytes, allocated);
+
+    ASSERT_EQ(finalize(), 0);
+    EXPECT_TRUE(run.empty());
+    EXPECT_EQ(runner.reservations(), 0u);
+    EXPECT_FALSE(runner.holds_epoch(8100));
+    EXPECT_EQ(runner.drain_calls, drains + (launched ? 1 : 0));
+    EXPECT_EQ(run.bytes, payload);
+    Attempt successor(runner, 0, 8101);
+    EXPECT_EQ(simpler_run(&runner, successor.storage, 1, &successor.args, &successor.config, &successor.descriptor), 0);
+    EXPECT_TRUE(successor.empty());
+    EXPECT_EQ(runner.reservations(), 0u);
+}
+}  // namespace
+
+TEST_F(NativeAdmissionTest, FinalizePrefixAllocationFailureKeepsPreparedOwnerRetryable) {
+    for (bool delivery_entry : {false, true}) {
+        SCOPED_TRACE(delivery_entry);
+        check_finalize_prefix_allocation_failure(false, delivery_entry);
+    }
+}
+
+TEST_F(NativeAdmissionTest, FinalizePrefixAllocationFailureKeepsLaunchedOwnerRetryable) {
+    for (bool delivery_entry : {false, true}) {
+        SCOPED_TRACE(delivery_entry);
+        check_finalize_prefix_allocation_failure(true, delivery_entry);
+    }
 }
 
 }  // namespace native_admission_test
