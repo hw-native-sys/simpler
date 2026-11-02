@@ -10,6 +10,7 @@
 
 import argparse
 import json
+import math
 import os
 import re
 import shlex
@@ -24,12 +25,16 @@ from pathlib import Path
 from reservation import event, write_json
 
 _HELPER = ".github/actions/network1-run-pytest/reservation.py"
-_QUEUE_WAIT_S = 600
+_QUEUE_WAIT_S = None  # use the job's remaining budget; tests can set a shorter limit
 _CLEANUP_WAIT_S = 120
 _POLL_S = 0.2
 _JOB_SECONDS = 3600
 _FINALIZE_MARGIN_S = 120
 _RPC_TIMEOUT_S = 30
+_PREFLIGHT_S = 30  # npu-smi and ps, each with a 15-second limit
+_MIN_PYTEST_S = 120  # leave enough time to run a useful smoke after a long queue wait
+_QUEUE_OVERRUN_S = 2 * _RPC_TIMEOUT_S  # status and receipt reads may finish after the queue deadline
+_WORK_RPCS = 4  # a final readiness/result poll can overrun its phase deadline
 _TASK_ID = re.compile(r"task_[0-9_]+\Z")
 
 
@@ -142,13 +147,37 @@ def configure(journal, env):
         if record["remote"]:
             host.run(["mkdir", "-p", str(Path(record["cwd"]) / "output/network1-ci/pytest")])
     remaining = _JOB_SECONDS - (time.time() - started)
-    work = int(env["NETWORK1_DAEMON_WAIT_S"]) + int(env["NETWORK1_SMOKE_TIMEOUT_S"]) + 2 * _CLEANUP_WAIT_S
+    # Queue as long as possible while leaving a minimum smoke and proven cleanup.
+    # The actual pytest timeout is recalculated after both grants arrive.
+    minimum_work = math.ceil(
+        int(env["NETWORK1_DAEMON_WAIT_S"])
+        + min(_MIN_PYTEST_S, int(env["NETWORK1_SMOKE_TIMEOUT_S"]))
+        + 2 * _CLEANUP_WAIT_S
+        + _PREFLIGHT_S
+        + (_WORK_RPCS + 2) * _RPC_TIMEOUT_S  # daemon and pytest start controls
+        + 2 * _POLL_S
+    )
     configure_seconds = len(records) * _RPC_TIMEOUT_S
-    # A task's watchdog starts after its own queue delay, not at submission.
-    queue_seconds = min(_QUEUE_WAIT_S, int((remaining - work - _FINALIZE_MARGIN_S - configure_seconds) / 2))
+    # Both hosts share one queue deadline. The first holder may wait for the
+    # second for that entire period, so its watchdog includes the same wait.
+    queue_seconds = int(remaining - minimum_work - _FINALIZE_MARGIN_S - configure_seconds - _QUEUE_OVERRUN_S)
+    if _QUEUE_WAIT_S is not None:
+        queue_seconds = min(_QUEUE_WAIT_S, queue_seconds)
     if queue_seconds < 1:
         raise TimeoutError("insufficient network1 job budget for queue, run and cleanup")
-    event(journal, "budget", remaining=remaining, queue_seconds=queue_seconds, hold_seconds=queue_seconds + work)
+    # Configuration runs before task-submit starts the holder's max-time clock.
+    hold_seconds = queue_seconds + _QUEUE_OVERRUN_S + minimum_work + configure_seconds
+    event(
+        journal,
+        "budget",
+        remaining=remaining,
+        queue_seconds=queue_seconds,
+        hold_seconds=hold_seconds,
+        setup_seconds=configure_seconds,
+        preflight_seconds=_PREFLIGHT_S,
+        minimum_pytest_seconds=min(_MIN_PYTEST_S, int(env["NETWORK1_SMOKE_TIMEOUT_S"])),
+        queue_overrun_seconds=_QUEUE_OVERRUN_S,
+    )
     for record in records:
         record["queue_seconds"] = queue_seconds
         host = Host(journal, record)
@@ -180,13 +209,12 @@ def configure(journal, env):
             }
             command = ["python", "-m", "pytest", *shlex.split(env["PYTEST_ARGS"])]
             cann = env["NETWORK1_CANN_ENV"]
-        hold = queue_seconds + work
-        record["hold_seconds"] = hold
+        record["hold_seconds"] = hold_seconds
         config: dict = dict(
             role=role,
             devices=record["devices"],
             cwd=record["cwd"],
-            hold_seconds=hold,
+            hold_seconds=hold_seconds,
             cleanup_seconds=_CLEANUP_WAIT_S,
             admission_seconds=queue_seconds + configure_seconds,
             command=_body(cann, command, environment),
@@ -219,9 +247,13 @@ def acquire(journal, records):
             state = host.read()
             if state.get("rejected", {}).get("task_id") == record["task_id"]:
                 raise RuntimeError(state["rejected"]["reason"])
-            if "drained" in state and "granted" not in state:
-                raise RuntimeError("reservation worker failed before granting work")
-            if status == "running" and state.get("granted", {}).get("task_id") == record["task_id"]:
+            if "drained" in state:
+                raise RuntimeError("reservation worker drained before both hosts passed preflight; see before.log")
+            if (
+                status == "running"
+                and state.get("granted", {}).get("task_id") == record["task_id"]
+                and state.get("preflight", {}).get("task_id") == record["task_id"]
+            ):
                 event(journal, "granted", machine=record["machine"], task_id=record["task_id"])
                 break
             if status not in ("pending", "running"):
@@ -229,6 +261,17 @@ def acquire(journal, records):
             time.sleep(_POLL_S)
         else:
             raise TimeoutError("two-host reservation queue wait expired")
+
+
+def pytest_budget(env):
+    started = float((Path(env["RUNNER_TEMP"]) / "network1-job-start").read_text())
+    remaining = _JOB_SECONDS - (time.time() - started)
+    # A late grant shortens pytest, never the time needed to drain and release.
+    reserve = 2 * _CLEANUP_WAIT_S + _FINALIZE_MARGIN_S + _WORK_RPCS * _RPC_TIMEOUT_S
+    seconds = min(int(env["NETWORK1_SMOKE_TIMEOUT_S"]), int(remaining - reserve))
+    if seconds < 1:
+        raise TimeoutError("insufficient network1 job budget for pytest and cleanup")
+    return seconds
 
 
 def run_work(journal, records, env):
@@ -252,8 +295,9 @@ def run_work(journal, records, env):
     else:
         raise TimeoutError("peer daemon readiness expired after reservation grant")
     local.control("start")
-    event(journal, "pytest_start")
-    deadline = time.monotonic() + int(env["NETWORK1_SMOKE_TIMEOUT_S"])
+    smoke_seconds = pytest_budget(env)
+    event(journal, "pytest_start", timeout_seconds=smoke_seconds)
+    deadline = time.monotonic() + smoke_seconds
     while time.monotonic() < deadline:
         if any(key in remote.read() for key in ("result", "drained")) or remote.status() != "running":
             raise RuntimeError("peer daemon exited while pytest was running")
@@ -433,7 +477,7 @@ def cleanup(journal, records):
         event(journal, "pair_drained")
         collect_queue_state(journal, records, deadline)
         complete = release_pair(journal, records)
-    artifacts_copied = collect_artifacts(journal, records)
+    artifacts_copied = collect_artifacts(journal, records) if any(record.get("intent") for record in records) else True
     complete = complete and artifacts_copied
     remote = next(record for record in records if record["remote"])
     write_json(journal / "cleanup.json", dict(complete=complete, remote_workdir=remote["cwd"], records=records))
@@ -452,6 +496,11 @@ def main():
     if args.operation == "cleanup":
         if not (journal / "tasks.json").exists():
             return 0
+        try:
+            if json.loads((journal / "cleanup.json").read_text()).get("complete"):
+                return 0
+        except (OSError, ValueError):
+            pass
         return 0 if cleanup(journal, json.loads((journal / "tasks.json").read_text())) else 1
 
     def interrupted(signum, _):

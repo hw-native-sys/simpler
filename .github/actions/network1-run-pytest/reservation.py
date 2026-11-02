@@ -82,7 +82,9 @@ def rank(state, argv):
         if not (state / "start").exists() or (state / "closing").exists():
             raise RuntimeError("MPI rank has no active reservation")
         env = {**os.environ, **grant["environment"]}
-        child = subprocess.Popen(argv, env=env)
+        # MPI supplies PMI communication through an inherited descriptor.
+        # The rank launcher must keep it open when it starts the test Python.
+        child = subprocess.Popen(argv, env=env, close_fds=False)
     return child.wait()
 
 
@@ -130,7 +132,7 @@ def marked_processes(task_id, excluded, since):
     return found
 
 
-def signal_owned(pid, start):
+def signal_owned(pid, start, sig=signal.SIGTERM):
     try:
         descriptor = os.pidfd_open(pid)
     except ProcessLookupError:
@@ -140,7 +142,7 @@ def signal_owned(pid, start):
             return
         # The scanner already proved the marker. The stable handle and birth
         # check preserve that identity even if environ becomes unreadable at exit.
-        signal.pidfd_send_signal(descriptor, signal.SIGTERM)
+        signal.pidfd_send_signal(descriptor, sig)
     except (FileNotFoundError, ProcessLookupError):
         return
     finally:
@@ -178,7 +180,7 @@ def owns_listener(pid, address, port):
 def read_state(state):
     values = {
         name: json.loads(path.read_text())
-        for name in ("granted", "rejected", "result", "ready", "drained", "closed")
+        for name in ("granted", "rejected", "preflight", "result", "ready", "drained", "closed")
         if (path := state / f"{name}.json").exists()
     }
     if "ready" in values and (
@@ -228,7 +230,9 @@ def drain(state, task_id, seconds):
             _, parent, _ = process_info(parent)
         except (OSError, ValueError, IndexError):
             break
-    deadline = time.monotonic() + seconds
+    started = time.monotonic()
+    deadline = started + seconds
+    escalate_at = started + min(5, seconds / 2)
     since = process_info(os.getpid())[2]
     while True:
         try:
@@ -243,10 +247,19 @@ def drain(state, task_id, seconds):
             return
         if time.monotonic() >= deadline:
             raise RuntimeError(f"owned processes did not drain: {remaining}")
+        sig = signal.SIGKILL if time.monotonic() >= escalate_at else signal.SIGTERM
         for pid, start in remaining:
-            signal_owned(pid, start)
-        event(state, "draining", pids=[pid for pid, _ in remaining])
+            signal_owned(pid, start, sig)
+        event(state, "draining", pids=[pid for pid, _ in remaining], signal=sig.name)
         time.sleep(0.1)
+
+
+def publish_preflight(state, task_id, stopped):
+    with gate(state, exclusive=True):
+        if stopped() or (state / "closing").exists():
+            return
+        write_json(state / "preflight.json", dict(task_id=task_id, time=time.time()))
+        event(state, "preflight_complete", task_id=task_id)
 
 
 def worker(state):
@@ -299,6 +312,7 @@ def worker(state):
         event(state, "granted", task_id=task_id, devices=config["devices"])
         if not snapshot(state, "before"):
             raise RuntimeError("reservation preflight queries failed; see before.log")
+        publish_preflight(state, task_id, lambda: stop_requested)
         while not stop_requested and not (state / "closing").exists():
             if time.monotonic() - started >= config["hold_seconds"]:
                 raise TimeoutError("reservation lifetime expired")

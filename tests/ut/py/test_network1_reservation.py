@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -77,13 +78,13 @@ def pair(tmp_path):
         binary / "npu-smi",
         "import json,os,subprocess,sys,time\n"
         "c=json.load(open(os.environ['FAKE_CONTROL']))\n"
-        "if os.environ.get('FAKE_HOST')=='remote':time.sleep(c.get('remote_preflight_delay',0))\n"
+        "time.sleep(c.get(os.environ.get('FAKE_HOST','local')+'_preflight_delay',0))\n"
         "if c.get('diagnostic_child'):\n"
         " p=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'],start_new_session=True)\n"
         " event=json.dumps(dict(kind='diagnostic_child',pid=p.pid))+'\\n'\n"
         " with open(os.environ['FAKE_EVENTS'],'a') as f:f.write(event)\n"
         "print('memory/process snapshot')\n"
-        "sys.exit(1 if os.environ.get('FAKE_HOST')=='local' and c.get('local_preflight_failure') else 0)\n",
+        "sys.exit(1 if c.get(os.environ.get('FAKE_HOST','local')+'_preflight_failure') else 0)\n",
     )
     _executable(
         binary / "task-submit",
@@ -461,13 +462,15 @@ def test_foreign_listener_never_counts_as_owned_daemon_readiness(pair):
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="real reservation worker preflight inspects Linux /proc")
-def test_local_preflight_failure_is_prompt_and_never_runs_pytest(pair):
-    pair["control"].write_text(json.dumps({"local_preflight_failure": True}))
+@pytest.mark.parametrize("host", ["local", "remote"])
+def test_failed_preflight_is_prompt_and_never_starts_work(pair, host):
+    pair["control"].write_text(json.dumps({f"{host}_preflight_failure": True, f"{host}_preflight_delay": 3}))
     before = time.monotonic()
     code, output = _finish(_start_controller(pair, cleanup_wait=6))
     assert code == 1, output
     assert time.monotonic() - before < 15
     assert not any(e["kind"] == "pytest" for e in _events(pair))
+    assert not any(e["kind"] == "daemon" for e in _events(pair))
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="diagnostic descendant drain inspects Linux /proc")
@@ -542,12 +545,99 @@ def test_insufficient_job_budget_submits_no_tasks(pair, monkeypatch):
     _, coordinator = _load_helpers(monkeypatch)
     for key, value in pair["env"].items():
         monkeypatch.setenv(key, value)
-    (Path(pair["env"]["RUNNER_TEMP"]) / "network1-job-start").write_text(str(time.time() - 3590))
+    (Path(pair["env"]["RUNNER_TEMP"]) / "network1-job-start").write_text(
+        str(time.time() - coordinator._JOB_SECONDS + 10)
+    )
     journal = Path(pair["env"]["RUN_DIR"]) / "reservations"
     journal.mkdir(parents=True)
     with pytest.raises(TimeoutError, match="insufficient"):
         coordinator.configure(journal, pair["env"])
     assert not pair["events"].exists()
+
+
+def test_budget_reserves_preflight_and_control_time(pair, monkeypatch):
+    _, coordinator = _load_helpers(monkeypatch)
+    workflow = yaml.safe_load((_ROOT / ".github/workflows/_st-network1.yml").read_text())
+    assert workflow["jobs"]["run"]["timeout-minutes"] * 60 == coordinator._JOB_SECONDS
+    pair["env"].update(NETWORK1_DAEMON_WAIT_S="120", NETWORK1_SMOKE_TIMEOUT_S="2400")
+    for key, value in pair["env"].items():
+        monkeypatch.setenv(key, value)
+    journal = Path(pair["env"]["RUN_DIR"]) / "reservations"
+    journal.mkdir(parents=True)
+    (Path(pair["env"]["RUNNER_TEMP"]) / "network1-job-start").write_text(str(time.time() - 140))
+    records = coordinator.configure(journal, pair["env"])
+    budget = next(
+        item
+        for line in (journal / "timeline.jsonl").read_text().splitlines()
+        if (item := json.loads(line))["event"] == "budget"
+    )
+    assert budget["preflight_seconds"] >= 30
+    assert 40 * 60 <= budget["queue_seconds"] < 45 * 60
+    assert budget["setup_seconds"] >= 2 * coordinator._RPC_TIMEOUT_S
+    assert budget["hold_seconds"] >= (
+        budget["queue_seconds"]
+        + budget["queue_overrun_seconds"]
+        + int(pair["env"]["NETWORK1_DAEMON_WAIT_S"])
+        + coordinator._MIN_PYTEST_S
+        + 2 * coordinator._CLEANUP_WAIT_S
+        + budget["preflight_seconds"]
+        + 6 * coordinator._RPC_TIMEOUT_S
+    )
+    assert budget["hold_seconds"] + coordinator._FINALIZE_MARGIN_S >= budget["remaining"] - 1
+    assert budget["hold_seconds"] + coordinator._FINALIZE_MARGIN_S <= budget["remaining"]
+    assert all(record["hold_seconds"] == budget["hold_seconds"] for record in records)
+
+
+def test_pytest_budget_uses_time_left_after_waiting_for_devices(tmp_path, monkeypatch):
+    _, coordinator = _load_helpers(monkeypatch)
+    started = tmp_path / "network1-job-start"
+    started.write_text(str(time.time()))
+    env = dict(RUNNER_TEMP=str(tmp_path), NETWORK1_SMOKE_TIMEOUT_S="2400")
+    assert coordinator.pytest_budget(env) == 2400
+    started.write_text(str(time.time() - 3000))
+    assert 110 <= coordinator.pytest_budget(env) <= 120
+    started.write_text(str(time.time() - coordinator._JOB_SECONDS + 470))
+    with pytest.raises(TimeoutError, match="pytest"):
+        coordinator.pytest_budget(env)
+
+
+def test_cleanup_without_submission_does_not_collect_missing_peer_state(tmp_path, monkeypatch):
+    _, coordinator = _load_helpers(monkeypatch)
+    journal = tmp_path / "reservations"
+    journal.mkdir()
+    records = [
+        dict(machine="125", cwd=str(tmp_path / "local"), remote=False),
+        dict(machine="126", cwd=str(tmp_path / "remote"), remote=True),
+    ]
+    assert coordinator.cleanup(journal, records)
+    assert json.loads((journal / "cleanup.json").read_text())["complete"]
+    assert not (journal / "peer").exists()
+
+
+def test_completed_cleanup_is_not_repeated_by_always_step(tmp_path, monkeypatch):
+    _, coordinator = _load_helpers(monkeypatch)
+    journal = tmp_path / "reservations"
+    journal.mkdir()
+    (journal / "tasks.json").write_text("[]")
+    (journal / "cleanup.json").write_text(json.dumps(dict(complete=True)))
+    monkeypatch.setenv("RUN_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["run.py", "cleanup"])
+    monkeypatch.setattr(coordinator, "cleanup", lambda *_: pytest.fail("completed cleanup was repeated"))
+    assert coordinator.main() == 0
+
+
+def test_incomplete_cleanup_is_retried_by_always_step(tmp_path, monkeypatch):
+    _, coordinator = _load_helpers(monkeypatch)
+    journal = tmp_path / "reservations"
+    journal.mkdir()
+    (journal / "tasks.json").write_text("[]")
+    (journal / "cleanup.json").write_text(json.dumps(dict(complete=False)))
+    monkeypatch.setenv("RUN_DIR", str(tmp_path))
+    monkeypatch.setattr(sys, "argv", ["run.py", "cleanup"])
+    retried = []
+    monkeypatch.setattr(coordinator, "cleanup", lambda *_: retried.append(True) or True)
+    assert coordinator.main() == 0
+    assert retried == [True]
 
 
 @pytest.mark.parametrize("status", ["pending", "running", "completed (exit=17)", "not_found"])
@@ -603,7 +693,8 @@ def test_cleanup_gate_blocks_accepted_spawn_then_rejects_late_rank(tmp_path, mon
     closing_finished = threading.Event()
     launched = []
 
-    def popen(argv, env):
+    def popen(argv, env, close_fds):
+        assert close_fds is False
         accepted.set()
         assert spawn.wait(5)
         launched.append(env)
@@ -642,6 +733,103 @@ def test_rank_without_live_grant_never_spawns(tmp_path, monkeypatch):
     monkeypatch.setattr(worker, "process_info", lambda _: ("Z", 0, "1"))
     with pytest.raises(RuntimeError, match="not live"):
         worker.rank(tmp_path, ["rank"])
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="MPI ranks inherit a Linux PMI pipe")
+def test_rank_preserves_inherited_mpi_pipe(tmp_path, monkeypatch):
+    worker, _ = _load_helpers(monkeypatch)
+    (tmp_path / "gate").touch()
+    (tmp_path / "start").touch()
+    monkeypatch.setattr(worker, "live_grant", lambda _: dict(uid=os.geteuid(), environment={}))
+    read_fd, write_fd = os.pipe()
+    try:
+        os.set_inheritable(write_fd, True)
+        monkeypatch.setenv("PMI_FD", str(write_fd))
+        code = worker.rank(tmp_path, [sys.executable, "-c", "import os;os.write(int(os.environ['PMI_FD']), b'P')"])
+        os.close(write_fd)
+        write_fd = -1
+        assert code == 0
+        assert os.read(read_fd, 1) == b"P"
+    finally:
+        os.close(read_fd)
+        if write_fd >= 0:
+            os.close(write_fd)
+
+
+def test_generated_mpi_launchers_admit_both_hosts_and_forward_arguments(tmp_path, monkeypatch):
+    worker, _ = _load_helpers(monkeypatch)
+    stage = yaml.load((_ROOT / ".github/actions/network1-stage/action.yml").read_text(), Loader=yaml.BaseLoader)
+    script = stage["runs"]["steps"][0]["run"]
+    script = script[script.index("MPI_PYTHON=") :]
+    local, remote = tmp_path / "local", tmp_path / "remote"
+    for checkout in (local, remote):
+        shutil.copytree(_ROOT / ".github", checkout / ".github")
+        (checkout / ".venv/bin").mkdir(parents=True)
+    cann = tmp_path / "set_env.sh"
+    cann.write_text(":\n")
+    local_launcher = tmp_path / "local-launcher"
+    remote_launcher = tmp_path / "remote-launcher"
+    env = {
+        **os.environ,
+        "GITHUB_RUN_ID": str(time.time_ns()),
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_WORKSPACE": str(local),
+        "REMOTE_WORKDIR": str(remote),
+        "RUN_DIR": str(tmp_path / "run"),
+        "NETWORK1_CANN_ENV": str(cann),
+        "NETWORK1_REMOTE_CANN_ENV": str(cann),
+        "GITHUB_ENV": str(tmp_path / "github-env"),
+        "LOCAL_LAUNCHER_CAPTURE": str(local_launcher),
+        "REMOTE_LAUNCHER_CAPTURE": str(remote_launcher),
+    }
+    generate = (
+        'network1_ssh() { cp "$MPI_PYTHON" "$LOCAL_LAUNCHER_CAPTURE"; '
+        'bash -c "$1"; cp "$MPI_PYTHON" "$REMOTE_LAUNCHER_CAPTURE"; };\n' + script
+    )
+    result = subprocess.run(
+        ["bash", "-e", "-o", "pipefail", "-c", generate], env=env, capture_output=True, text=True, check=False
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    generated = Path(f"/tmp/simpler-network1-mpi-python-{env['GITHUB_RUN_ID']}-{env['GITHUB_RUN_ATTEMPT']}")
+    try:
+        for host, launcher, checkout in (("local", local_launcher, local), ("remote", remote_launcher, remote)):
+            interpreter = checkout / ".venv/bin/python"
+            interpreter.symlink_to(sys.executable)
+            state = (
+                Path(env["RUN_DIR"]) / "reservations/local"
+                if host == "local"
+                else checkout / "output/network1-ci/reservation"
+            )
+            state.mkdir(parents=True)
+            (state / "gate").touch()
+            (state / "start").touch()
+            task_id = f"task_1_{os.getpid()}"
+            worker.write_json(
+                state / "granted.json",
+                dict(
+                    task_id=task_id,
+                    pid=os.getpid(),
+                    uid=os.geteuid(),
+                    start=worker.process_info(os.getpid())[2],
+                    environment=dict(TASKQUEUE_TASK_ID=task_id, TASK_DEVICE="14,15"),
+                ),
+            )
+            output = tmp_path / f"{host}.json"
+            command = (
+                "import json,os,pathlib,sys;"
+                "pathlib.Path(sys.argv[1]).write_text(json.dumps([os.environ['TASKQUEUE_TASK_ID'],sys.argv[2:]]))"
+            )
+            result = subprocess.run(
+                ["bash", str(launcher), "-c", command, str(output), "two words", "last"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0, f"{host}: {result.stdout}{result.stderr}"
+            assert json.loads(output.read_text()) == [task_id, ["two words", "last"]]
+    finally:
+        generated.unlink(missing_ok=True)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="real marker drain inspects Linux /proc")
@@ -771,6 +959,34 @@ def test_known_owned_handle_does_not_reread_exiting_process_environment(tmp_path
     monkeypatch.setattr(worker.signal, "pidfd_send_signal", lambda *args: sent.append(args), raising=False)
     worker.signal_owned(123, "100")
     assert sent == [(descriptor, worker.signal.SIGTERM)]
+
+
+@pytest.mark.skipif(not hasattr(os, "pidfd_open"), reason="real marker drain requires pidfd")
+def test_drain_kills_owned_process_that_ignores_term(tmp_path, monkeypatch):
+    worker, _ = _load_helpers(monkeypatch)
+    task_id = f"task_1_{os.getpid()}_{time.time_ns()}"
+    ready = tmp_path / "ready"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import pathlib,signal,sys,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "pathlib.Path(sys.argv[1]).touch();"
+            "time.sleep(60)",
+            str(ready),
+        ],
+        env={**os.environ, "TASKQUEUE_TASK_ID": task_id},
+        start_new_session=True,
+    )
+    try:
+        _wait_for(ready.exists)
+        worker.drain(tmp_path, task_id, 2)
+        assert child.wait(timeout=1) == -signal.SIGKILL
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait()
 
 
 @pytest.mark.parametrize("persistent", [False, True])
