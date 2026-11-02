@@ -41,12 +41,13 @@ def shared_memory_granularity(monkeypatch, request):
     monkeypatch.setattr(f"{__name__}.SharedMemory", allocate)
 
 
-def _run_controls(_monkeypatch, init_results, commands, *, workspace_mask=0):
+def _run_controls(_monkeypatch, init_results, commands, *, workspace_mask=0, abort_initialization=False):
     cw = MagicMock(
         spec_set=(
             "comm_init",
             "comm_alloc_domain_windows",
             "comm_release_domain_windows",
+            "comm_abort_domain_windows",
             "set_exported_device_regions_live",
             "_close_chip_run_lane",
         )
@@ -80,6 +81,10 @@ def _run_controls(_monkeypatch, init_results, commands, *, workspace_mask=0):
         worker_mod._DOMAIN_REQ_HEADER.pack_into(domain_buf, 0, 7, 1, 0, 64, 0)
         struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_WORKSPACE_MASK_OFFSET, workspace_mask)
         struct.pack_into("<I", domain_buf, worker_mod._DOMAIN_REQ_HEADER.size, 0)
+        release_request = allocate(worker_mod._DOMAIN_REQ_HEADER.size)
+        release_buf = release_request.buf
+        assert release_buf is not None
+        worker_mod._DOMAIN_REQ_HEADER.pack_into(release_buf, 0, 7, 1, 0, int(abort_initialization), 0)
         reply = allocate(worker_mod._DOMAIN_REPLY_HEADER.size)
         with memoryview(bytearray(worker_mod.mailbox_size(1))) as mailbox:
             address = ctypes.addressof(ctypes.c_char.from_buffer(mailbox))
@@ -91,7 +96,12 @@ def _run_controls(_monkeypatch, init_results, commands, *, workspace_mask=0):
             def submit_controls():
                 try:
                     for command in commands:
-                        request = init_request if command == worker_mod._CTRL_COMM_INIT else domain_request
+                        requests = {
+                            worker_mod._CTRL_COMM_INIT: init_request,
+                            worker_mod._CTRL_ALLOC_DOMAIN: domain_request,
+                            worker_mod._CTRL_RELEASE_DOMAIN: release_request,
+                        }
+                        request = requests[command]
                         for offset, name in (
                             (worker_mod._OFF_ARGS, request.name),
                             (worker_mod._OFF_ARGS + worker_mod._CTRL_SHM_NAME_BYTES, reply.name),
@@ -143,6 +153,18 @@ def _run_controls(_monkeypatch, init_results, commands, *, workspace_mask=0):
         assert reply_buf is not None
         published = worker_mod._DOMAIN_REPLY_HEADER.unpack_from(reply_buf, 0)
     return cw, responses, published
+
+
+def test_unpublished_domain_abort_reaches_the_creating_chip(monkeypatch):
+    cw, responses, _ = _run_controls(
+        monkeypatch,
+        [0x1234],
+        [worker_mod._CTRL_COMM_INIT, worker_mod._CTRL_RELEASE_DOMAIN],
+        abort_initialization=True,
+    )
+    assert responses == [(0, "")] * 2
+    cw.comm_abort_domain_windows.assert_called_once_with(0x1234, 7, 1, 0)
+    cw.comm_release_domain_windows.assert_not_called()
 
 
 def test_bootstrap_handle_is_forwarded_without_mutating_runtime(monkeypatch):

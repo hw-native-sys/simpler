@@ -6434,22 +6434,23 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
         worker._worker = cast(Any, object())
         return worker
 
-    def test_a_partial_domain_allocation_keeps_its_original_release_ranks(self, monkeypatch):
-        """Two chips of three committed a window and no handle exists.
+    @pytest.mark.parametrize("failed_rank_owns", [False, True])
+    def test_a_partial_domain_allocation_keeps_its_original_release_ranks(self, monkeypatch, failed_rank_owns):
+        """Abort every reported owner after all allocation requests finish.
 
-        The release has to reach exactly the two that allocated: driving it at
-        the third would fail on a debt it does not hold, and poison the worker
-        for a partial failure that was handled correctly.
+        A failed rank may retain an unpublished allocation for late import.
+        A rank that failed before acquiring ownership has no cleanup debt.
         """
         worker = self._worker()
         worker._config = {"device_ids": [0, 1, 2]}
         resources = worker_mod._RunResources()
         worker._building_run_resources = resources
         monkeypatch.setattr(worker, "_ensure_comm_base", lambda: None)
+        owners = (0, 1, 2) if failed_rank_owns else (0, 2)
 
         def partial_failure(*, reply_shms, **_kwargs):
             assert reply_shms is not None
-            for chip_idx in (0, 2):
+            for chip_idx in owners:
                 reply_buf = reply_shms[chip_idx].buf
                 assert reply_buf is not None
                 struct.pack_into("<Q", reply_buf, worker_mod._OFF_DOMAIN_REPLY_COMMITTED, 1)
@@ -6460,25 +6461,31 @@ class TestUnreclaimedDeviceStateIsNeverSilent:
             worker._allocate_domain(name="d", workers=(0, 1, 2), window_size=64, buffers=[])
 
         handle = resources.live_domains["d"]
-        assert handle.workers == (0, 2), "release would reach a chip that never allocated"
+        assert handle.workers == owners
+        assert handle.contexts == {}, "failed initialization must not publish usable contexts"
         assert worker._live_domains["d"] is handle
         assert resources.requires_ordered_cleanup, "a leaked window did not degrade the successor"
 
         release_headers = {}
+        abort_calls = []
+        cw = SimpleNamespace(comm_abort_domain_windows=lambda *args: abort_calls.append(args))
 
         def capture_release(*, workers, request_shms, **_kwargs):
             for chip_idx in workers:
                 request_buf = request_shms[chip_idx].buf
                 assert request_buf is not None
-                release_headers[chip_idx] = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request_buf, 0)[:3]
+                release_headers[chip_idx] = worker_mod._DOMAIN_REQ_HEADER.unpack_from(request_buf, 0)[:4]
+                mailbox = memoryview(bytearray(worker_mod.mailbox_size(worker_mod._DEFAULT_PIPELINE_DEPTH_REQUEST)))
+                encoded = request_shms[chip_idx].name.encode("utf-8")
+                mailbox[worker_mod._OFF_ARGS : worker_mod._OFF_ARGS + len(encoded)] = encoded
+                worker_mod._handle_ctrl_release_domain(cw, mailbox, base_comm_handle=1)
 
         monkeypatch.setattr(worker, "_dispatch_control_domain", capture_release)
         worker._release_domain_claimed(handle)
 
-        assert release_headers == {
-            0: (handle.allocation_id, 3, 0),
-            2: (handle.allocation_id, 3, 2),
-        }
+        assert release_headers == {rank: (handle.allocation_id, 3, rank, 1) for rank in owners}
+
+        assert abort_calls == [(1, handle.allocation_id, 3, rank) for rank in owners]
 
     def test_a_chip_that_committed_before_its_reply_failed_is_still_reclaimed(self):
         """The window exists before the reply is written.

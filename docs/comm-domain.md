@@ -501,6 +501,32 @@ remain specific to `tensormap_and_ringbuffer`; workspace storage does not add
 completion backends to `host_build_graph`. Domain cleanup does not release another
 domain's workspace or the shared SDMA resource.
 
+Each A5 URMA domain owns an HCCL subcommunicator, including its registrations
+and channels. The L2 host process keeps that owner from the first initialization
+step through rollback or release. After the run fence, release checks every
+active queue's BB and CQE completion counters, waits for peer quiescence, destroys
+the domain communicator, and then releases its workspace and windows. A healthy
+domain is reclaimed without waiting for the base communicator or Worker to close.
+The additional communicator costs initialization time and HCCL resources per live
+domain; synchronous and SDMA-only domains do not create it.
+
+If any allocation participant fails before the domain is published, the parent
+joins the allocation requests and locally aborts every reported A2/A3 or A5 owner,
+including failed participants. Failed initialization keeps exported physical
+memory alive until peers finish importing; its ownership flag does not publish
+a usable domain. This rollback does not use a normal release collective.
+The A2/A3 Fabric-to-IPC fallback can discard its temporary Fabric window only
+before publishing the export; failed initialization after publication keeps the
+window owned until abort.
+Allocation IDs cannot be reused during an A5 communicator's lifetime. Used-ID
+bookkeeping remains until communicator close; device windows and communication
+resources do not. Python allocates fresh IDs automatically.
+
+On A5, an unconfirmed drain, handshake or communication destruction is reported as an
+error. The affected owner, its stream and device environment remain retained,
+new work is refused, and later close does not blindly retry uncertain handles.
+This is a terminal failure of that Worker, not successful resource reclamation.
+
 The workspace coverage is split by platform and execution layer:
 
 | Platform / layer | Supported behavior | Coverage |

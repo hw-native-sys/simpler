@@ -113,18 +113,39 @@ std::unordered_map<uint64_t, int> g_per_run_wait_rc;
 std::vector<uint64_t> g_waited_epochs;
 
 int validate_context(void *) { return g_context_rc; }
+int g_comm_rc = 0;
+int g_comm_stream_free_calls = 0;
+int g_comm_stream_rc = 0;
+int g_comm_alloc_calls = 0;
+int g_comm_abort_calls = 0;
 
 int stub_release_domain(void *, uint64_t, size_t, uint32_t) {
     ++g_comm_free_calls;
-    return 0;
+    return g_comm_rc;
 }
 int stub_release_global_domain(uint64_t) {
     ++g_comm_free_calls;
     return 0;
 }
+int stub_abort_domain(void *, uint64_t, size_t, uint32_t) {
+    ++g_comm_abort_calls;
+    return g_comm_rc;
+}
 int stub_destroy_comm(void *) {
     ++g_comm_free_calls;
-    return 0;
+    return g_comm_rc;
+}
+
+int stub_destroy_comm_stream(void *, void *) {
+    ++g_comm_stream_free_calls;
+    return g_comm_stream_rc;
+}
+
+int stub_alloc_domain(
+    void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t, uint64_t *, uint64_t *, size_t *
+) {
+    ++g_comm_alloc_calls;
+    return g_comm_rc;
 }
 
 int prepare_run(
@@ -277,6 +298,11 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
     g_context_rc = 0;
     g_per_run_wait_rc.clear();
     g_waited_epochs.clear();
+    g_comm_rc = 0;
+    g_comm_stream_free_calls = 0;
+    g_comm_stream_rc = 0;
+    g_comm_alloc_calls = 0;
+    g_comm_abort_calls = 0;
     worker.initialized_ = true;
     // The stubs ignore it, but teardown refuses to run without one, which is the production
     // guard against closing a worker that never reached a device.
@@ -1128,6 +1154,310 @@ TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeard
         EXPECT_EQ(g_device_finalize_calls, 2);
         EXPECT_EQ(g_comm_free_calls, 0);
     }
+}
+
+TEST(NativeRunOperationLeaseTest, UnpublishedDomainAbortUsesLocalBackendAndHonorsReclamationGuard) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    worker.comm_release_domain_windows_fn_ = stub_release_domain;
+    worker.comm_abort_domain_windows_fn_ = stub_abort_domain;
+    int comm_placeholder = 0;
+    const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+    ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
+    EXPECT_NO_THROW(worker.comm_abort_domain_windows(comm, 1, 2, 0));
+    EXPECT_EQ(g_comm_abort_calls, 1);
+    EXPECT_EQ(g_comm_free_calls, 0);
+
+    const ChipWorkerNativeRun run = prepare(worker, 0, 1);
+    EXPECT_THROW(worker.comm_abort_domain_windows(comm, 2, 2, 0), std::runtime_error);
+    EXPECT_EQ(g_comm_abort_calls, 1);
+    worker.finalize_native_run(run);
+
+    g_comm_rc = COMM_RECLAMATION_UNCONFIRMED;
+    EXPECT_THROW(worker.comm_abort_domain_windows(comm, 2, 2, 0), std::runtime_error);
+    EXPECT_EQ(g_comm_abort_calls, 2);
+    ASSERT_NE(worker.find_comm_session(comm), nullptr);
+    EXPECT_THROW(worker.comm_abort_domain_windows(comm, 2, 2, 0), std::runtime_error);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_comm_abort_calls, 2);
+    EXPECT_EQ(g_comm_free_calls, 0);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_destroy_context_calls, 0);
+}
+
+TEST(NativeRunOperationLeaseTest, DomainAllocationFailurePublishesCleanupOwnership) {
+    const int results[] = {
+        -1,
+        COMM_DOMAIN_WORKSPACE_UNSUPPORTED,
+        COMM_DOMAIN_URMA_CONFIG_INVALID,
+        COMM_DOMAIN_URMA_INIT_FAILED,
+        COMM_DOMAIN_URMA_WORKSPACE_INVALID,
+        COMM_INITIALIZATION_ABORT_REQUIRED,
+        COMM_RECLAMATION_UNCONFIRMED
+    };
+    for (int rc : results) {
+        SCOPED_TRACE(rc);
+        ChipWorker worker;
+        prime(worker);
+        worker.comm_destroy_fn_ = stub_destroy_comm;
+        worker.comm_alloc_domain_windows_fn_ = stub_alloc_domain;
+        worker.comm_abort_domain_windows_fn_ = stub_abort_domain;
+        int comm_placeholder = 0;
+        const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+        ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
+        uint64_t ownership = 0;
+        g_comm_rc = rc;
+        EXPECT_THROW(worker.comm_alloc_domain_windows(comm, 1, {0, 1}, 0, 4096, 2, &ownership), std::runtime_error);
+        EXPECT_EQ(
+            __atomic_load_n(&ownership, __ATOMIC_ACQUIRE),
+            (rc == COMM_INITIALIZATION_ABORT_REQUIRED || rc == COMM_RECLAMATION_UNCONFIRMED) ? 1u : 0u
+        );
+        ASSERT_NE(worker.find_comm_session(comm), nullptr);
+        EXPECT_EQ(worker.comm_cleanup_unconfirmed_, rc == COMM_RECLAMATION_UNCONFIRMED);
+        g_comm_rc = 0;
+        if (rc == COMM_INITIALIZATION_ABORT_REQUIRED) {
+            EXPECT_NO_THROW(worker.comm_abort_domain_windows(comm, 1, 2, 0));
+            EXPECT_EQ(g_comm_abort_calls, 1);
+            EXPECT_NO_THROW(worker.finalize());
+        } else if (rc == COMM_RECLAMATION_UNCONFIRMED) {
+            EXPECT_THROW(worker.comm_abort_domain_windows(comm, 1, 2, 0), std::runtime_error);
+            EXPECT_EQ(g_comm_abort_calls, 0);
+            EXPECT_THROW(worker.finalize(), std::runtime_error);
+        }
+    }
+}
+
+TEST(NativeRunOperationLeaseTest, DomainAllocationOwnershipPrecedesOutputValidation) {
+    ChipWorker worker;
+    prime(worker);
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    worker.comm_alloc_domain_windows_fn_ = stub_alloc_domain;
+    worker.comm_abort_domain_windows_fn_ = stub_abort_domain;
+    int comm_placeholder = 0;
+    const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+    ASSERT_NE(worker.create_comm_session(&comm_placeholder, nullptr, true), nullptr);
+    uint64_t ownership = 0;
+    EXPECT_THROW(worker.comm_alloc_domain_windows(comm, 1, {0, 1}, 0, 4096, 2, &ownership), std::runtime_error);
+    EXPECT_EQ(__atomic_load_n(&ownership, __ATOMIC_ACQUIRE), 1u);
+    EXPECT_NO_THROW(worker.comm_abort_domain_windows(comm, 1, 2, 0));
+
+    worker.comm_alloc_domain_windows_fn_ = [](void *, uint64_t, const uint32_t *, size_t, uint32_t, size_t, uint32_t,
+                                              uint64_t *ctx, uint64_t *window, size_t *size) {
+        *ctx = 0x100;
+        *window = 0x200;
+        *size = 4096;
+        return 0;
+    };
+    ownership = 0;
+    const auto result = worker.comm_alloc_domain_windows(comm, 2, {0, 1}, 0, 4096, 2, &ownership);
+    EXPECT_EQ(std::get<0>(result), 0x100u);
+    EXPECT_EQ(std::get<1>(result), 0x200u);
+    EXPECT_EQ(__atomic_load_n(&ownership, __ATOMIC_ACQUIRE), 1u);
+}
+
+TEST(NativeRunOperationLeaseTest, FailedCommCleanupRetainsOwnerStreamAndDeviceAcrossClose) {
+    for (int operation = 0; operation < 3; ++operation) {
+        SCOPED_TRACE(operation);
+        const auto module = std::make_shared<RuntimeModule>(nullptr);
+        {
+            ChipWorker worker;
+            worker.runtime_module_ = module;
+            prime(worker);
+            worker.finalize_device_fn_ = stub_finalize_device;
+            worker.comm_destroy_fn_ = stub_destroy_comm;
+            worker.comm_release_domain_windows_fn_ = stub_release_domain;
+            worker.comm_alloc_domain_windows_fn_ = stub_alloc_domain;
+            worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+            int comm_placeholder = 0;
+            int stream_placeholder = 0;
+            const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+            ASSERT_NE(worker.create_comm_session(&comm_placeholder, &stream_placeholder, true), nullptr);
+            worker.base_comm_handle_ = comm;
+            g_comm_rc = COMM_RECLAMATION_UNCONFIRMED;
+            if (operation == 0) {
+                EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+            } else if (operation == 1) {
+                EXPECT_THROW(worker.comm_release_domain_windows(comm, 1, 2, 0), std::runtime_error);
+            } else {
+                EXPECT_THROW(worker.comm_alloc_domain_windows(comm, 1, {0, 1}, 0, 4096, 2), std::runtime_error);
+            }
+            ASSERT_NE(worker.find_comm_session(comm), nullptr);
+            EXPECT_EQ(worker.find_comm_session(comm)->handle, &comm_placeholder);
+            EXPECT_EQ(worker.find_comm_session(comm)->stream, &stream_placeholder);
+            EXPECT_EQ(worker.base_comm_handle_, comm);
+            EXPECT_EQ(g_comm_stream_free_calls, 0);
+            const int cleanup_calls = g_comm_free_calls;
+            const int allocation_calls = g_comm_alloc_calls;
+            EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+            EXPECT_THROW(worker.comm_release_domain_windows(comm, 1, 2, 0), std::runtime_error);
+            EXPECT_THROW(worker.comm_alloc_domain_windows(comm, 2, {0, 1}, 0, 4096, 2), std::runtime_error);
+            EXPECT_THROW(prepare(worker, 0, 1), std::runtime_error);
+            EXPECT_THROW(worker.finalize(), std::runtime_error);
+            EXPECT_THROW(worker.finalize(), std::runtime_error);
+            EXPECT_EQ(g_comm_free_calls, cleanup_calls);
+            EXPECT_EQ(g_comm_alloc_calls, allocation_calls);
+            EXPECT_EQ(g_device_finalize_calls, 0);
+            EXPECT_EQ(g_destroy_context_calls, 0);
+            EXPECT_FALSE(module->unload_allowed_);
+        }
+        EXPECT_EQ(g_comm_stream_free_calls, 0);
+        EXPECT_EQ(g_device_finalize_calls, 0);
+        EXPECT_EQ(g_destroy_context_calls, 0);
+        EXPECT_FALSE(module->unload_allowed_);
+    }
+}
+
+TEST(NativeRunOperationLeaseTest, FinalizeStopsBeforeBaseWhenChildCommCleanupIsUnconfirmed) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+    int base = 0;
+    int child = 0;
+    int stream = 0;
+    ASSERT_NE(worker.create_comm_session(&base, &stream, true), nullptr);
+    ASSERT_NE(worker.create_comm_session(&child, &stream, false), nullptr);
+    worker.base_comm_handle_ = reinterpret_cast<uint64_t>(&base);
+    g_comm_rc = COMM_RECLAMATION_UNCONFIRMED;
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_comm_free_calls, 1);
+    EXPECT_EQ(worker.comm_sessions_.size(), 2u);
+    EXPECT_EQ(worker.comm_session_index_.size(), 2u);
+    EXPECT_EQ(g_comm_stream_free_calls, 0);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_destroy_context_calls, 0);
+}
+
+TEST(NativeRunOperationLeaseTest, ConsumedCommErrorStillReleasesSessionAndStream) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+    int comm_placeholder = 0;
+    int stream_placeholder = 0;
+    const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+    ASSERT_NE(worker.create_comm_session(&comm_placeholder, &stream_placeholder, true), nullptr);
+    worker.base_comm_handle_ = comm;
+    g_comm_rc = -1;
+    EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+    EXPECT_EQ(worker.find_comm_session(comm), nullptr);
+    EXPECT_EQ(worker.base_comm_handle_, 0u);
+    EXPECT_EQ(g_comm_stream_free_calls, 1);
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_EQ(g_comm_free_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 1);
+    EXPECT_EQ(g_destroy_context_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, FailedCommStreamDestroyRetainsStreamWithoutRetryingConsumedHandle) {
+    for (int backend_rc : {0, -1}) {
+        SCOPED_TRACE(backend_rc);
+        ChipWorker worker;
+        prime(worker);
+        worker.finalize_device_fn_ = stub_finalize_device;
+        worker.comm_destroy_fn_ = stub_destroy_comm;
+        worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+        int comm_placeholder = 0;
+        int stream_placeholder = 0;
+        const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+        ASSERT_NE(worker.create_comm_session(&comm_placeholder, &stream_placeholder, true), nullptr);
+        worker.base_comm_handle_ = comm;
+        g_comm_rc = backend_rc;
+        g_comm_stream_rc = -7;
+        EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+        ASSERT_EQ(worker.comm_sessions_.size(), 1u);
+        EXPECT_EQ(worker.comm_sessions_[0].handle, nullptr);
+        EXPECT_EQ(worker.comm_sessions_[0].stream, &stream_placeholder);
+        EXPECT_EQ(worker.find_comm_session(comm), nullptr);
+        EXPECT_EQ(worker.base_comm_handle_, 0u);
+        EXPECT_EQ(g_comm_free_calls, 1);
+        EXPECT_EQ(g_comm_stream_free_calls, 1);
+        EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+        EXPECT_THROW(worker.finalize(), std::runtime_error);
+        EXPECT_EQ(g_comm_free_calls, 1);
+        EXPECT_EQ(g_comm_stream_free_calls, 1);
+        EXPECT_EQ(g_device_finalize_calls, 0);
+        EXPECT_EQ(g_destroy_context_calls, 0);
+        EXPECT_FALSE(worker.runtime_module_->unload_allowed_);
+    }
+}
+
+TEST(NativeRunOperationLeaseTest, UntrackedCommCleanupFailureRegistersRetainedOwner) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    int comm_placeholder = 0;
+    const uint64_t comm = reinterpret_cast<uint64_t>(&comm_placeholder);
+    g_comm_rc = COMM_RECLAMATION_UNCONFIRMED;
+    EXPECT_THROW(worker.comm_destroy(comm), std::runtime_error);
+    ASSERT_NE(worker.find_comm_session(comm), nullptr);
+    EXPECT_EQ(worker.find_comm_session(comm)->handle, &comm_placeholder);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_comm_free_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+}
+
+TEST(NativeRunOperationLeaseTest, FailedCommInitRetainsStreamWhenRollbackFails) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+    static int stream_placeholder = 0;
+    worker.ensure_acl_ready_fn_ = [](void *, int) {
+        return 0;
+    };
+    worker.create_comm_stream_fn_ = [](void *) -> void * {
+        return &stream_placeholder;
+    };
+    worker.comm_init_fn_ = [](int, int, void *, const char *) -> void * {
+        return nullptr;
+    };
+    g_comm_stream_rc = -7;
+    EXPECT_THROW(worker.create_base_comm(0, 2, "unused"), std::runtime_error);
+    ASSERT_EQ(worker.comm_sessions_.size(), 1u);
+    EXPECT_EQ(worker.comm_sessions_[0].handle, nullptr);
+    EXPECT_EQ(worker.comm_sessions_[0].stream, &stream_placeholder);
+    EXPECT_EQ(g_comm_stream_free_calls, 1);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_comm_stream_free_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_destroy_context_calls, 0);
+}
+
+TEST(NativeRunOperationLeaseTest, DuplicateCommCleanupFailureRetainsBothStreams) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.comm_destroy_fn_ = stub_destroy_comm;
+    worker.destroy_comm_stream_fn_ = stub_destroy_comm_stream;
+    static int comm_placeholder = 0;
+    static int new_stream_placeholder = 0;
+    int old_stream_placeholder = 0;
+    ASSERT_NE(worker.create_comm_session(&comm_placeholder, &old_stream_placeholder, false), nullptr);
+    worker.ensure_acl_ready_fn_ = [](void *, int) {
+        return 0;
+    };
+    worker.create_comm_stream_fn_ = [](void *) -> void * {
+        return &new_stream_placeholder;
+    };
+    worker.comm_init_fn_ = [](int, int, void *, const char *) -> void * {
+        return &comm_placeholder;
+    };
+    g_comm_rc = COMM_RECLAMATION_UNCONFIRMED;
+    EXPECT_THROW(worker.create_base_comm(0, 2, "unused"), std::runtime_error);
+    EXPECT_EQ(g_comm_free_calls, 1);
+    EXPECT_EQ(g_comm_stream_free_calls, 0);
+    ASSERT_EQ(worker.comm_sessions_.size(), 2u);
+    EXPECT_EQ(worker.comm_sessions_[0].stream, &old_stream_placeholder);
+    EXPECT_EQ(worker.comm_sessions_[1].stream, &new_stream_placeholder);
+    EXPECT_THROW(worker.finalize(), std::runtime_error);
+    EXPECT_EQ(g_comm_free_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 0);
 }
 
 // A run the sweep could not prove destroyed still owns whatever its carrier holds, and that
