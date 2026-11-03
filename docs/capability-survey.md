@@ -223,7 +223,7 @@ values yield `SIMPLER_ERROR_ASYNC_COMPLETION_INVALID`.
 
 | Engine | a2a3 | a5 | Status |
 | ------ | ---- | -- | ------ |
-| COUNTER (default) | registered | registered | **Shipped** — `tests/st/worker/comm_domain/async_notify` runs onboard on both architectures; `tests/st/worker/comm_domain/deferred_notify` runs in sim on both and onboard on a2a3, through the `st-onboard-*` / `st-sim-*` jobs in `ci.yml`. Routed by `CASES[*]["platforms"]`, no `skipif` |
+| COUNTER (default) | registered | registered | **Shipped** — `tests/st/worker/comm_domain/async_notify` runs onboard on both architectures. `tests/st/worker/comm_domain/deferred_notify` runs Per-PR on a2a3 onboard and a5sim, and in Daily on a2a3sim. Selection uses `CASES[*]["platforms"]` and `CASES[*]["manual"]`. |
 | SDMA | build macro forced ON; runtime opt-in | `option(... OFF)` | a2a3 **Shipped** (the "SDMA pytest (a2a3)" step in `ci.yml`); a5 not built |
 | URMA | absent | full implementation | **Gated** — see below |
 | ROCE, CCU | enum only | enum only | **Name only** |

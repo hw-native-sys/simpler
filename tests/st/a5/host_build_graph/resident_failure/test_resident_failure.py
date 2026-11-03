@@ -36,17 +36,12 @@ _SHAPES = [(mask, lane) for mask in (1, 2, 4, 3, 5, 6, 7) for lane in range(3) i
 _TICKET_SHAPES = ((1, 0), (2, 1), (4, 2), (6, 1), (7, 0), (7, 1), (7, 2))
 # The exhaustive mask/lane sweep is about silicon behaviour, and each case here
 # holds a device for its own process because a failed run poisons it. A
-# simulator run therefore carries two shapes: the lane the protocol reports in
-# slot 1, which is the one every capture check special-cases, and all three
-# lanes together.
+# simulator tiers therefore cover two shapes: the lane the protocol reports in
+# slot 1, which the Per-PR capture check uses, and all three lanes together in
+# Daily.
 _SIM_SHAPES = frozenset({(4, 2), (7, 0)})
-# Which shapes the silicon carries on every PR. The sweep's cost is one device
-# and one process per case, and the containment machinery under test is shared
-# across every shape, so Per-PR coverage takes one shape per lane position —
-# lane 0 as an AIC's only lane, lane 2 as an AIV's only lane, and lane 1
-# faulting while two siblings must also be contained. The rest of the sweep is
-# what separates a lane-indexing fault from a shared one, which is a question
-# for the daily sweep rather than for every PR.
+# On silicon, Per-PR keeps one shape per failed-lane position for every timeout
+# mode. The remaining mask/lane combinations run in Daily.
 _PER_PR_SHAPES = frozenset({(1, 0), (4, 2), (7, 1)})
 
 
@@ -62,8 +57,13 @@ def _shape_params(shapes):
     params = []
     for mask, lane in shapes:
         marks = [] if (mask, lane) in _SIM_SHAPES else [pytest.mark.platforms(["a5"])]
+        manual_platforms = []
+        if (mask, lane) == (7, 0):
+            manual_platforms.append("a5sim")
         if (mask, lane) not in _PER_PR_SHAPES:
-            marks.append(pytest.mark.manual(["a5"]))
+            manual_platforms.append("a5")
+        if manual_platforms:
+            marks.append(pytest.mark.manual(manual_platforms))
         params.append(pytest.param(mask, lane, marks=marks))
     return params
 

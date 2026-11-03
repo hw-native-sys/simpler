@@ -175,16 +175,34 @@ instead use
 corpus under their target paths; a `manual_mode` of `only` remains `only` in
 those steps. Marking a case under one of those paths manual therefore removes
 its duplicate main-step execution without removing its dedicated Per-PR
-coverage. Scope-stats needs its own step for a reason the others do not: its
-scene test runs in the main sweep either way, but `_validate_scope_stats_artifact`
-returns early unless `--enable-scope-stats` is supplied, so without the dedicated
-step the run happens and the `scope_stats.jsonl` it should have produced is never
-asserted on.
+coverage. Scope-stats needs its own step for a reason the others do not:
+`_validate_scope_stats_artifact` returns early unless `--enable-scope-stats` is
+supplied. Its Sim cases run in that dedicated step, which asserts the
+`scope_stats.jsonl` artifact.
 
 Use `"manual": True` on an individual `SceneTestCase.CASES` entry and
 `@pytest.mark.manual` on a standalone pytest test. The reusable scene-test
 workflows accept `manual_mode`; Per-PR callers use its `exclude` default and the
 Daily caller passes `include`.
+
+The Sim host-build-graph invalid-input test keeps every distinct owner, output,
+dependency, and block-count error path in Per-PR, with two wide-count boundaries.
+Daily adds the remaining wide-count values.
+For Sim, the Per-PR sweep keeps onephase Sum and Max Allreduce and the
+bidirectional-ring non-Sum rejection check. Daily adds onephase Min/Prod,
+twophase and ring non-Sum, and the ibing rejection check; their onboard
+executions remain in Per-PR. Storage readiness, local domain tensors, and SPSC
+fault checks also remain in the Sim Per-PR sweep. A2/A3 Sim's L3 child-memory
+and expert-dispatch examples and deferred-notify case run in Daily; A2/A3
+onboard and A5 Sim retain their Per-PR executions.
+For A5 Sim, predicated multi-block refusal retains one gate value in Per-PR;
+Daily and A5 onboard exercise both values.
+The A5 resident-failure Per-PR sweep retains the slot-1 shape for each timeout
+mode; Daily also exercises the all-lane shape.
+The A5 onboard resident-failure Per-PR selection is unchanged; its existing
+Daily sweep covers the remaining mask and failed-lane combinations.
+The two-rank onboard non-Sum Allreduce variants remain in Per-PR: each class
+takes only a few seconds, and its algorithm path is distinct.
 
 A sweep's budget follows what it selects, so `manual_mode` is not the only
 input a Daily caller sets. `_st-npu-a5.yml` takes `session_timeout_seconds`
