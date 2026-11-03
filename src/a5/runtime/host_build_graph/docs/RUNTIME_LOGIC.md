@@ -446,6 +446,13 @@ separate participation policy to bootstrap, dispatch and shutdown. All discovere
 lanes therefore participate, and bootstrap partitions the task scan across their
 Schedulers. This scan parallelism is not an isolated performance measurement.
 
+Task-level Mix membership is the active lane mask plus the AIC coordinator.
+A 1C1V task therefore coordinates two lanes per cluster; 1C2V and 2V coordinate
+all three. The inactive AIV has no obligation for a two-lane group. Per-lane
+assignment and predecessor sequences preserve descriptor ownership when the
+resource mask changes between groups. This task-level selection does not remove
+workers from bootstrap or shutdown.
+
 Owner pending endpoints and publication masks are private to the Scheduler.
 Self-execution notifications contain only a pending-slot mask: the slot stays
 READY with the same generation until the local Executor claims it, so the ready

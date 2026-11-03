@@ -13,6 +13,8 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
+SCHEMAS = tuple(f"hbg-native-protocol-v{version}" for version in range(1, 9))
+
 ROOT_NUMBERS = frozenset(
     """
 run_epoch task_count worker_count trace_count member_count cooperative_task_count
@@ -39,6 +41,7 @@ NUMBERS = {
         "active_mask flags member_words_offset close_seals_offset"
     ),
     "control": "task_ref state next_block completed_blocks admission_state",
+    "claim": "run_epoch worker_index block_idx confirmed_count seal_value",
     "actor": "run_epoch task_ref order_key worker_index flags",
     "member": (
         "index run_epoch task_ref order_key observed_tail closed_cursor "
@@ -59,6 +62,7 @@ NUMBERS = {
     ),
 }
 STAMPS = {
+    "claim": "published_before published_after",
     "actor": "before after",
     "member": "observed closed",
     "owner": (
@@ -75,6 +79,16 @@ ARRAYS = {
     "lane": {"arrived_seq": 3, "lane_subtasks": 3},
 }
 SIGNED_FIELDS = frozenset(("task_ref", "core_id", "core_type", "state"))
+
+
+def protocol_version(section):
+    schema = section.get("schema") if isinstance(section, dict) else None
+    return int(schema.rsplit("v", 1)[-1]) if schema in SCHEMAS else 0
+
+
+def uses_resource_scoped_mix(section):
+    """Version 8 coordinates only the declared Mix resource lanes."""
+    return protocol_version(section) == 8
 
 
 def _error(message):
@@ -99,17 +113,22 @@ def _array(value, path, count=None, *, signed=False):
         _number(item, f"{path}[{index}]", signed=signed)
 
 
-def _record(record, kind, path, extra_numbers=()):
+def _record(record, kind, path, extra_numbers=(), extra_arrays=None):
     numbers = NUMBERS[kind].split() + list(extra_numbers)
     stamps = STAMPS.get(kind, "").split()
-    arrays = ARRAYS.get(kind, {})
+    arrays = ARRAYS.get(kind, {}) | (extra_arrays or {})
     _object(record, {*numbers, *stamps, *arrays}, path)
     for name in numbers:
         _number(record[name], f"{path}.{name}", signed=name in SIGNED_FIELDS)
     for name in stamps:
         _array(record[name], f"{path}.{name}", 2)
     for name, count in arrays.items():
-        _array(record[name], f"{path}.{name}", count, signed=name == "dependencies")
+        _array(
+            record[name],
+            f"{path}.{name}",
+            count,
+            signed=name == "dependencies",
+        )
 
 
 def _indices(rows, count, path, *, key="index", dense=False):
@@ -128,23 +147,18 @@ def _indices(rows, count, path, *, key="index", dense=False):
 
 def read_native_protocol(section):
     """Validate the wire schema; preserve incomplete/error records for diagnosis."""
-    _object(section, ROOT_NUMBERS | ROOT_TABLES | {"schema", "producer", "first_error"}, "root")
-    if (
-        section["schema"]
-        not in (
-            "hbg-native-protocol-v1",
-            "hbg-native-protocol-v2",
-            "hbg-native-protocol-v3",
-            "hbg-native-protocol-v4",
-            "hbg-native-protocol-v5",
-        )
-        or section["producer"] != "aicore"
-    ):
+    version = protocol_version(section)
+    root_numbers = ROOT_NUMBERS | ({"close_seal_stride"} if version >= 7 else set())
+    _object(section, root_numbers | ROOT_TABLES | {"schema", "producer", "first_error"}, "root")
+    if not version or section["producer"] != "aicore":
         _error("unknown schema or producer")
-    for field in ROOT_NUMBERS:
+    for field in root_numbers:
         _number(section[field], field)
-    _object(section["first_error"], ERROR_NUMBERS, "first_error")
-    for field in ERROR_NUMBERS:
+    if version >= 7 and section["close_seal_stride"] != 128:
+        _error("close_seal_stride must be 128 for v7 and later")
+    error_numbers = ERROR_NUMBERS
+    _object(section["first_error"], error_numbers, "first_error")
+    for field in error_numbers:
         _number(section["first_error"][field], f"first_error.{field}")
     if section["member_count"] != section["worker_count"] * section["cooperative_task_count"]:
         _error("member region capacity disagrees with task/worker counts")
@@ -157,9 +171,11 @@ def read_native_protocol(section):
     ):
         _indices(section[table], count, table, key=key, dense=True)
         for row in section[table]:
-            extra = ("claim_tickets",) if kind == "control" and section["schema"] != "hbg-native-protocol-v1" else ()
-            if kind == "control" and section["schema"] == "hbg-native-protocol-v5":
+            extra = ("claim_tickets",) if kind == "control" and version >= 2 else ()
+            if kind == "control" and version >= 5:
                 extra += ("admission_claim_lock",)
+            if kind == "control" and version >= 6:
+                extra += ("claim_seal",)
             _record(row, kind, f"{table}[{row[key]}]", extra)
     for row in section["admissions"]:
         if len(row["member_words"]) != (section["worker_count"] + 63) // 64:
@@ -172,7 +188,8 @@ def read_native_protocol(section):
     ):
         _indices(section[table], count, table)
         for row in section[table]:
-            _record(row, kind, f"{table}[{row['index']}]")
+            extra = ("claim_seal_seen", "claim_cursor_seen") if kind == "member" and version >= 6 else ()
+            _record(row, kind, f"{table}[{row['index']}]", extra)
     _read_nested_events(section)
     return section
 
@@ -186,12 +203,18 @@ def _read_nested_events(section):
                 _record(row[name], "actor", f"task_events[{row['index']}].{name}")
     _indices(section["blocks"], section["trace_count"], "blocks")
     for row in section["blocks"]:
-        _object(row, {"index", "owner", "lanes"}, "block row")
+        fields = {"index", "owner", "lanes"}
+        if protocol_version(section) >= 6:
+            fields.add("claim")
+        _object(row, fields, "block row")
+        if protocol_version(section) >= 6 and row["claim"] is not None:
+            _record(row["claim"], "claim", f"blocks[{row['index']}].claim")
         if row["owner"] is not None:
             _record(row["owner"], "owner", f"blocks[{row['index']}].owner")
         _indices(row["lanes"], 3, "block lanes")
         for lane in row["lanes"]:
-            _record(lane, "lane", f"blocks[{row['index']}].lanes[{lane['index']}]")
+            extra = {"previous_lane_seq": 3} if uses_resource_scoped_mix(section) else None
+            _record(lane, "lane", f"blocks[{row['index']}].lanes[{lane['index']}]", extra_arrays=extra)
 
 
 def _event_records(section):
@@ -200,6 +223,8 @@ def _event_records(section):
             if row[name] is not None:
                 yield row[name], "actor", f"task_events[{row['index']}].{name}"
     for row in section["blocks"]:
+        if protocol_version(section) >= 6 and row["claim"] is not None:
+            yield row["claim"], "claim", f"blocks[{row['index']}].claim"
         if row["owner"] is not None:
             yield row["owner"], "owner", f"blocks[{row['index']}].owner"
         for lane in row["lanes"]:

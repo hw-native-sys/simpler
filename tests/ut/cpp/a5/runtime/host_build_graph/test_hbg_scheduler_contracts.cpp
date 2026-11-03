@@ -112,7 +112,7 @@ TEST(AicoreSchedulerState, ResidentSyncStartShapeRequiresMultipleBlocksAndSepara
     }
 }
 
-TEST(AicoreSchedulerState, SyncDemandCountsDistinctCoresOrCompleteResourceClusters) {
+TEST(AicoreSchedulerState, SyncDemandCountsDistinctCoresInTheDeclaredResourceScope) {
     for (uint64_t workers : {3U, 6U, 9U, 96U, 108U}) {
         for (LaneMask mask :
              {LaneMask::aic(), LaneMask::aiv0(), LaneMask::aiv1(),
@@ -129,9 +129,12 @@ TEST(AicoreSchedulerState, SyncDemandCountsDistinctCoresOrCompleteResourceCluste
                 EXPECT_EQ(scheduler_resident_worker_demand_checked(mask, blocks, true, workers, &demand), valid);
                 if (valid) {
                     const bool mix = mask.is_mix();
-                    const bool aic_only = mask == LaneMask::aic();
-                    EXPECT_EQ(demand.aic, (mix || aic_only) ? blocks : 0u);
-                    EXPECT_EQ(demand.aiv, mix ? blocks * 2 : (aic_only ? 0 : blocks));
+                    EXPECT_EQ(demand.aic, (mix || mask.is_aic()) ? blocks : 0u);
+                    EXPECT_EQ(
+                        demand.aiv, mix ? blocks * (static_cast<uint32_t>(mask.has_aiv0()) +
+                                                    static_cast<uint32_t>(mask.has_aiv1())) :
+                                          (mask.is_aic() ? 0 : blocks)
+                    );
                 }
             }
             SchedulerMinimumWorkerDemand ordinary{};
@@ -540,7 +543,7 @@ TEST(SchedulerState, PreservesCacheLineAlignmentAndArrayStride) {
 
     std::array<SchedulerTaskControl, 2> controls{};
     std::array<SchedulerWorkerContext, 2> contexts{};
-    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 512u);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(&controls[1]) - reinterpret_cast<uintptr_t>(&controls[0]), 640u);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(&contexts[1]) - reinterpret_cast<uintptr_t>(&contexts[0]), 1024u);
     EXPECT_EQ(offsetof(SchedulerTaskControl, state) / 64, offsetof(SchedulerTaskControl, wake_list_head) / 64);
     // Both chain links belong to the atomic line: they are written as single

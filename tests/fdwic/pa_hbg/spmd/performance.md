@@ -1,5 +1,9 @@
 # CSA performance and retained optimizations
 
+This page records the 2026-10-28 experiment. The current main-based extraction
+and its ten-call CSA/SWA comparison are documented in
+[CSA/SWA scheduling optimization](../csa-swa-scheduler-optimization-20261103.md).
+
 ## Measurement boundary
 
 Use the frozen HBG CSA B4S2 seed-0 workload: 54 registered kernels, 52 arguments,

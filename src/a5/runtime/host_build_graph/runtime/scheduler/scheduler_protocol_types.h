@@ -75,7 +75,9 @@ struct alignas(128) SchedulerProtocolMemberTrace {
     uint32_t worker_index;
     uint32_t flags;
     uint64_t pending_mask;
-    uint64_t reserved[3];
+    uint64_t claim_seal_seen;
+    uint64_t claim_cursor_seen;
+    uint64_t reserved;
 };
 
 struct alignas(64) SchedulerProtocolBlockOwner {
@@ -121,11 +123,23 @@ struct alignas(128) SchedulerProtocolLaneTrace {
     uint32_t logical_block_num;
     LaneMask resource_mask;
     uint8_t lane_subtasks[3];
-    uint8_t reserved[8];
+    uint8_t reserved[5];
+    uint64_t previous_lane_seq[3];
+};
+
+struct alignas(64) SchedulerProtocolClaimTrace {
+    SchedulerProtocolStamp published_before;
+    SchedulerProtocolStamp published_after;
+    uint64_t confirmed_count;
+    uint64_t seal_value;
+    uint32_t worker_index;
+    uint32_t block_idx;
+    uint64_t run_epoch;
 };
 
 struct alignas(128) SchedulerProtocolBlockTrace {
     SchedulerProtocolBlockOwner owner;
+    SchedulerProtocolClaimTrace claim;
     SchedulerProtocolLaneTrace lanes[3];
 };
 
@@ -187,6 +201,8 @@ static_assert(sizeof(SchedulerProtocolTaskTrace) == 128);
 static_assert(offsetof(SchedulerProtocolTaskTrace, completion) == 64);
 static_assert(sizeof(SchedulerProtocolMemberTrace) == 128);
 static_assert(sizeof(SchedulerProtocolBlockOwner) == 192);
+static_assert(sizeof(SchedulerProtocolClaimTrace) == 64);
+static_assert(offsetof(SchedulerProtocolBlockTrace, claim) == 192);
 static_assert(sizeof(SchedulerProtocolLaneTrace) == 256);
 static_assert(offsetof(SchedulerProtocolBlockTrace, lanes) == 256);
 static_assert(sizeof(SchedulerProtocolBlockTrace) == 1024);

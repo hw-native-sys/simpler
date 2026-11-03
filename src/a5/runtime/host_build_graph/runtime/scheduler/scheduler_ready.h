@@ -134,6 +134,7 @@ struct SchedulerGmMixLocalState {
     uint64_t mailbox_offset{0};
     uint64_t group_seq{0};
     uint64_t task_last_seq{0};
+    uint64_t vector_last_published_seq[2]{};
     uint32_t block_idx{0};
     uint32_t cluster_index{UINT32_MAX};
     uint32_t slot_generation{0};
@@ -165,12 +166,13 @@ struct SchedulerAdmissionLocalState {
     // READY freezes topology for this run. This cache contains membership
     // facts only, never a task frontier or an execution permission.
     uint64_t topology_cube_words[(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
+    uint64_t topology_vector0_words[(SCHEDULER_WORKER_CAPACITY + 63) / 64]{};
     uint64_t topology_worker_count{0};
 };
 
 static_assert(sizeof(SchedulerOrderedCandidate) == 48, "ordered candidate size changed");
-static_assert(sizeof(SchedulerGmMixLocalState) == 40, "GM group-local state size changed");
-static_assert(sizeof(SchedulerAdmissionLocalState) == 256, "admission-local state size changed");
+static_assert(sizeof(SchedulerGmMixLocalState) == 56, "GM group-local state size changed");
+static_assert(sizeof(SchedulerAdmissionLocalState) == 288, "admission-local state size changed");
 
 struct SchedulerFreeSlotClaim {
     uint64_t worker_id{UINT64_MAX};
