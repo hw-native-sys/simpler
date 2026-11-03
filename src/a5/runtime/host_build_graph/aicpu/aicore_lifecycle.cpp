@@ -197,6 +197,10 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
     int32_t aic_count = 0;
     int32_t aiv_count = 0;
     for (int32_t i = 0; i < core_count_; ++i) {
+        if (contexts[i].worker_index != static_cast<uint64_t>(i)) {
+            LOG_ERROR("A5 HBG AICore scheduler: worker context %d has an invalid compact identity", i);
+            return -1;
+        }
         if (cores_[i].core_type == CoreType::AIC) {
             contexts[i].type_rank = aic_count++;
         } else if (cores_[i].core_type == CoreType::AIV) {
@@ -289,6 +293,11 @@ int32_t AicoreLifecycle::post_handshake_init(Runtime *runtime) {
     run_control->aiv_active_worker_count = static_cast<uint64_t>(aiv_count);
     run_control->scheduler_count = static_cast<uint64_t>(core_count_);
     run_control->scheduler_timeout_cycles = resident_scheduler_timeout_cycles();
+
+    // Discovery checked each compact launch ID, core type and complete cluster
+    // before constructing these contexts. READY publishes this immutable proof
+    // together with them; workers need not repeat the full peer-context scan.
+    graph_summary->topology_layout = SchedulerTopologyLayout::COMPACT_LAUNCH;
 
     const uint64_t topology_complete_cycles = record_lifecycle_timing ? get_sys_cnt_aicpu() : 0;
     lifecycle_traces[0].topology_complete_cycles = topology_complete_cycles;

@@ -1,13 +1,13 @@
 # A5 HBG 原生 Graph task 设计
 
 本文规定 `host_build_graph` 的 Graph task 如何接入 A5 AICore resident scheduler。
-**状态：native Graph 已实现；按用户要求恢复 `queue-ordinary-credit-v1` 的 T/H8 普通领取额度实现，独立 block 调度原型已撤回。**
-实测进度与证据见[实施记录](../../../tests/docs/a5-hbg-graph-task/README.zh-CN.md)。
-当前 T/H8 与普通任务领取额度版本为 38.454 ms，历史主线为 29.478 ms；跨设备参照，尚未达标。
+**状态：native Graph 与共享 ready 队列已实现，默认 T/H8；开发基线同时包含 CSA/SWA 的普通调度优化。**
+双 lane MIX 按资源选择成员，并使用独立的 atomic 领取结束证明；原生 Graph 协议为 v9，普通任务协议为 v8。
+历史测量与证据见[实施记录](../../../tests/docs/a5-hbg-graph-task/README.zh-CN.md)。
+性能页的数据只对应各节标注的被测提交，不代表叠加普通调度优化后的开发基线性能。
 [独立 block 调度与 MIX lease](a5-hbg-graph-task/block-ready-scheduling.md)保留为后续待选方案，因编译成本不可接受而暂缓；详见[模型实测](a5-hbg-graph-task/qwen-performance.md)。
-基线为 `main@8f42cef9b3f0ebbda800e239aab0949e95552f25`，核对日期为 2026-10-31。
+原始设计基线为 `main@8f42cef9b3f0ebbda800e239aab0949e95552f25`，核对日期为 2026-10-31。
 下文保留设计契约，实际实现与验证范围以当前代码和候选证据为准；阶段名称不对应独立 Git 提交。
-本分支已整理为单一提交，尚未合入主线。
 
 ## 目标与边界
 
@@ -34,7 +34,7 @@ Graph 内合法但 resident 尚不支持的形状在 bind 前整 run 选择 lega
 | [性能与自主迭代流程](a5-hbg-graph-task/performance.md) | 主线基线、ST 筛选、无 Graph 门禁、现有 A5 Qwen 的验证与优化闭环 |
 | [设计复审](a5-hbg-graph-task/review.md) | 反例、修正、证明边界、并行 PR 与剩余风险 |
 
-## 主线事实与复用范围
+## 设计基线事实与复用范围（2026-10-31）
 
 | 位置 | 已核对行为 |
 | ---- | ---------- |

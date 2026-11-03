@@ -1,6 +1,7 @@
 # A5 Qwen 性能与正确性记录
 
 本文历史测量所引用的 JSON 仅保存在本地 `outputs/a5-hbg-graph-task/evidence-summary/`，不随仓库分发；下文保留文件名用于追溯。
+各节数值对应原 PR #2864 中标注的被测提交，未重新计时或改标为叠加 PR #2857 后的开发基线结果。
 
 **当前采用 `queue-ordinary-credit-v1` 的 T/H8 普通领取额度实现**。
 审查修复后 Qwen 的 Device 中位数为 **38.744 ms**、p95 **38.985 ms**，完整 out/K/V 通过。

@@ -17,10 +17,12 @@ MAX = (1 << 64) - 1
 
 
 class ProtocolBuilder:
-    def __init__(self, shapes, clusters=2, epoch=0, sync_tasks=()):
+    def __init__(self, shapes, clusters=2, epoch=0, sync_tasks=(), *, resource_scoped=False):
         self.raw: dict[str, Any] = capture(epoch)
         self.clock = 0
         self.groups = [0] * clusters
+        self.resource_scoped = resource_scoped
+        self.lane_groups = [[0, 0, 0] for _ in range(clusters)]
         self.generations = {}
         self.identities: list[dict[str, Any]] = []
         raw = self.raw
@@ -144,6 +146,8 @@ class ProtocolBuilder:
 
     def members(self, task):
         spec = self.raw["tasks"][task]
+        if self.resource_scoped and spec["flags"] & 4:
+            return [w["index"] for w in self.raw["workers"] if (spec["active_mask"] | 1) & (1 << (w["index"] % 3))]
         return [
             w["index"]
             for w in self.raw["workers"]
@@ -298,7 +302,10 @@ class ProtocolBuilder:
         owner["group_seq"] = group
         self.stamp(owner, "publish_before")
         self.stamp(owner, "publish_after")
+        resources = owner["active_mask"] | 1 if self.resource_scoped else 7
         for lane, worker in enumerate(workers):
+            if not resources & (1 << lane):
+                continue
             row = dict(
                 self.common(task, worker),
                 index=lane,
@@ -308,10 +315,12 @@ class ProtocolBuilder:
                 group_seq=group,
                 block_num=owner["block_num"],
                 active_mask=owner["active_mask"],
-                resource_mask=7,
-                arrived_seq=[group] * 3,
+                resource_mask=resources,
+                arrived_seq=[group if resources & (1 << peer) else 0 for peer in range(3)],
                 lane_subtasks=[i if owner["active_mask"] & (1 << i) else 255 for i in range(3)],
             )
+            if self.resource_scoped:
+                row["previous_lane_seq"] = list(self.lane_groups[cluster])
             for name in (
                 "descriptor_ready",
                 "arrive_before",
@@ -330,7 +339,10 @@ class ProtocolBuilder:
                 self.execute(task, block, row["lane"], row["worker_index"], group=group)
             self.stamp(row, "release_before")
             self.stamp(row, "release_after")
-        owner["released_seq"] = [group] * 3
+        owner["released_seq"] = [group if resources & (1 << peer) else 0 for peer in range(3)]
+        for lane in range(3):
+            if resources & (1 << lane):
+                self.lane_groups[cluster][lane] = group
         self.stamp(owner, "releases_observed")
         self.complete_block(result)
         return result

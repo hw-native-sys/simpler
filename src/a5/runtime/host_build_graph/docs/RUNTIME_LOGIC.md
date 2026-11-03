@@ -16,8 +16,8 @@ device: attach the image, classify tasks, dispatch with the selected scheduler
 host: collect outputs and destroy/reset per-run state
 ```
 
-The device has no orchestration thread. The resident scheduler uses one AIV
-Scheduler per discovered cluster; AICPU initializes, monitors, and tears down the
+The device has no orchestration thread. The resident scheduler runs on the discovered
+AIC/AIV workers; AICPU initializes, monitors, and tears down the
 workers. The explicit legacy path uses AICPU scheduling.
 
 Supported Graph tasks use the resident scheduler. The host builds a separate
@@ -454,6 +454,13 @@ Partial-core masking has no current workload requirement and would add a
 separate participation policy to bootstrap, dispatch and shutdown. All discovered
 lanes therefore participate, and bootstrap partitions the task scan across their
 Schedulers. This scan parallelism is not an isolated performance measurement.
+
+Task-level Mix membership is the active lane mask plus the AIC coordinator.
+A 1C1V task therefore coordinates two lanes per cluster; 1C2V and 2V coordinate
+all three. The inactive AIV has no obligation for a two-lane group. Per-lane
+assignment and predecessor sequences preserve descriptor ownership when the
+resource mask changes between groups. This task-level selection does not remove
+workers from bootstrap or shutdown.
 
 Kernel Ready work uses a type-separated shared ticket pool. The host appends
 its immutable header and descriptors to the run allocation and sizes each queue

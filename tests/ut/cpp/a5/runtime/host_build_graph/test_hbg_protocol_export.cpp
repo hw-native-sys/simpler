@@ -11,6 +11,8 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -51,7 +53,8 @@ struct ProtocolExportFixture : ::testing::Test {
 TEST_F(ProtocolExportFixture, PreservesFrozenGraphAndHostCompletedNodeWithoutFabricatingEvents) {
     at<SchedulerTaskMetadata>(layout.task_metadata_offset)[0].logical_block_num = 99;
     const auto json = dump();
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v5\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v8\""), std::string::npos);
+    EXPECT_NE(json.find("\"close_seal_stride\":128"), std::string::npos);
     EXPECT_NE(json.find("\"claim_tickets\":0"), std::string::npos);
     EXPECT_NE(json.find("\"admission_claim_lock\":0"), std::string::npos);
     EXPECT_NE(json.find("\"block_num\":2"), std::string::npos);
@@ -71,7 +74,7 @@ TEST_F(ProtocolExportFixture, NativeSchemaCarriesBothIdentitiesAndIndependentSou
     const auto json = scheduler_export_protocol(
         storage->base(), layout.total_size, layout, 0, tasks, "{\"tasks\":[],\"definitions\":[]}"
     );
-    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v6\""), std::string::npos);
+    EXPECT_NE(json.find("\"schema\":\"hbg-native-protocol-v9\""), std::string::npos);
     EXPECT_NE(json.find("\"original_task_id\":7,\"local_child_id\":3"), std::string::npos);
     EXPECT_NE(json.find("\"graph_source\":{\"tasks\":[],\"definitions\":[]}"), std::string::npos);
 }
@@ -170,7 +173,7 @@ TEST_F(ProtocolExportFixture, RejectsOutOfRegionSeal) {
 TEST_F(ProtocolExportFixture, PreservesMemberWordsSealAndRawTopology) {
     auto *record = at<SchedulerAdmissionRecord>(layout.admission_records_offset);
     *at<uint64_t>(record->member_words_offset) = UINT64_C(0x8000000000000007);
-    *at<uint64_t>(record->mix_close_seals_offset) = 17;
+    at<SchedulerMixCloseSeal>(record->mix_close_seals_offset)->value = 17;
     auto *contexts = at<SchedulerWorkerContext>(layout.worker_contexts_offset);
     contexts[1].physical_core_id = 65;
     contexts[1].cluster_index = 0;
@@ -182,6 +185,59 @@ TEST_F(ProtocolExportFixture, PreservesMemberWordsSealAndRawTopology) {
     EXPECT_NE(json.find("\"close_seals\":[17]"), std::string::npos);
     EXPECT_NE(json.find("\"core_id\":65"), std::string::npos);
     EXPECT_NE(json.find("\"cluster_workers\":[0,2,1]"), std::string::npos);
+}
+
+TEST(ProtocolCloseSealExport, ReadsEveryClusterAndTaskValueWithoutInterpretingCellPadding) {
+    AicoreSchedulerLayout layout{};
+    ASSERT_TRUE(scheduler_plan_layout(2, 2, 2, &layout, false, 4, {6, 2, 2, 2}, true));
+    scheduler_test::SchedulerStateBuffer storage(layout);
+    auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(storage.base(), layout.task_metadata_offset);
+    scheduler_test::BasicGraphBuffer<2> graph(2);
+    for (uint32_t task = 0; task < 2; ++task) {
+        graph.mixed(task, LaneMask(true, true, false));
+        metadata[task].active_mask = LaneMask(true, true, false);
+        metadata[task].logical_block_num = 1;
+        metadata[task].flags = SCHEDULER_TASK_EXECUTABLE | SCHEDULER_TASK_MIX;
+        metadata[task].trace_index_base = task * 2;
+        metadata[task].timing_slot = -1;
+        metadata[task].kernel_ids[0] = metadata[task].kernel_ids[1] = 1;
+        metadata[task].kernel_ids[2] = UINT16_MAX;
+    }
+    ASSERT_TRUE(scheduler_init_spmd_task_records(storage.base(), layout, 91));
+    const auto tasks = scheduler_protocol_freeze_graph(graph.graph(), {metadata[0], metadata[1]});
+    const std::array<std::array<uint64_t, 2>, 2> expected{{{17, 29}, {41, 53}}};
+    for (uint32_t task = 0; task < 2; ++task) {
+        auto *record = scheduler_state_at<SchedulerAdmissionRecord>(
+            storage.base(), layout.admission_records_offset + task * layout.admission_record_stride
+        );
+        auto *cells = scheduler_state_at<SchedulerMixCloseSeal>(storage.base(), record->mix_close_seals_offset);
+        for (uint32_t cluster = 0; cluster < 2; ++cluster) {
+            auto *bytes = reinterpret_cast<uint8_t *>(&cells[cluster]);
+            std::memset(bytes + sizeof(uint64_t), 0xa5, sizeof(SchedulerMixCloseSeal) - sizeof(uint64_t));
+            cells[cluster].value = expected[task][cluster];
+        }
+    }
+    const auto dump = [&] {
+        return scheduler_export_protocol(storage.base(), layout.total_size, layout, 91, tasks);
+    };
+    const auto json = dump();
+    EXPECT_NE(json.find("\"close_seal_stride\":128"), std::string::npos);
+    EXPECT_NE(json.find("\"close_seals\":[17,29]"), std::string::npos);
+    EXPECT_NE(json.find("\"close_seals\":[41,53]"), std::string::npos);
+    auto *record = scheduler_state_at<SchedulerAdmissionRecord>(storage.base(), layout.admission_records_offset);
+    for (uint64_t delta : {UINT64_C(1), UINT64_C(8), UINT64_C(16), UINT64_C(128), UINT64_C(512)}) {
+        SCOPED_TRACE(delta);
+        record->mix_close_seals_offset = layout.mix_close_seals_offset + delta;
+        EXPECT_THROW(dump(), std::invalid_argument);
+    }
+}
+
+TEST(ProtocolCloseSealExport, RejectsARegionThatContainsTheValueButNotTheCompleteCell) {
+    alignas(128) std::array<uint8_t, 2 * sizeof(SchedulerMixCloseSeal)> bytes{};
+    const scheduler_protocol_export::Image image(bytes.data(), sizeof(SchedulerMixCloseSeal) + sizeof(uint64_t));
+    EXPECT_NE(image.array<SchedulerMixCloseSeal>(0, 1), nullptr);
+    EXPECT_THROW(image.array<SchedulerMixCloseSeal>(0, 2), std::invalid_argument);
+    EXPECT_THROW(image.array<SchedulerMixCloseSeal>(sizeof(uint64_t), 1), std::invalid_argument);
 }
 
 TEST(ProtocolGraphSnapshot, OwnsMetadataAndFaninsAcrossHostGraphReuse) {

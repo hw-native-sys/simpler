@@ -168,6 +168,7 @@ protected:
         runtime->dev.host_total_tasks = 1;
         for (int32_t i = 0; i < kParticipants; ++i) {
             auto &context = image->contexts[i];
+            context.worker_index = static_cast<uint64_t>(i);
             context.scheduler_state_base_address = reinterpret_cast<uint64_t>(image.get());
             context.worker_contexts_offset = offsetof(SchedulerImage, contexts);
             context.run_control_offset = offsetof(SchedulerImage, control);
