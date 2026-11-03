@@ -234,7 +234,7 @@ private:
     // executor + dispatcher bytes, aicore_bin_handle_,
     // load_aicpu_op_, mem_alloc_, the three DeviceArenas + their cached
     // sizes, persistent AICPU/AICore streams, device_wall_*,
-    // binaries_loaded_) is inherited from `DeviceRunnerBase`.
+    // aicpu_runtime_registered_) is inherited from `DeviceRunnerBase`.
 
     // Group D state (`chip_callable_buffers_`, `callables_`,
     // `aicpu_seen_callable_ids_`, `aicpu_dlopen_total_`,
@@ -388,8 +388,8 @@ private:
     // offline replay. a2a3-only.
     DepGenCollector dep_gen_collector_;
 
-    // `query_max_block_dim`, `validate_block_dim`, `ensure_binaries_loaded`,
-    // `configure_aicore_op_timeout`, and `prepare_orch_so` are inherited
+    // `query_max_block_dim`, `validate_block_dim`, `ensure_aicpu_runtime_registered`,
+    // `configure_aicore_op_timeout`, and `validate_active_callable` are inherited
     // (protected) from `DeviceRunnerBase`.
 
     /**

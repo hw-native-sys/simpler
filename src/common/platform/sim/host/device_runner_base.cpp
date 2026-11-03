@@ -814,30 +814,17 @@ void SimDeviceRunnerBase::clear_temporary_buffer() {
     }
 }
 
-int SimDeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid) {
-    // Registered-callable flow only: the orch SO was already delivered to the
-    // sim AICPU at launch_device_register time. A run just needs the active
-    // callable_id so the AICPU dispatches the right orch_so_table_ slot.
-    if (cid < 0) {
-        LOG_ERROR("stamp_orch_so: invalid callable_id=%d", cid);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    auto it = callables_.find(cid);
-    if (it == callables_.end()) {
-        LOG_ERROR("stamp_orch_so: callable_id=%d not registered", cid);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    runtime.set_active_callable_id(cid);
-    return 0;
-}
-
-int SimDeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
+int SimDeviceRunnerBase::validate_active_callable(const Runtime &runtime) const {
     const int32_t cid = runtime.get_active_callable_id();
     if (cid < 0) {
-        LOG_ERROR("prepare_orch_so: no active callable_id; prepared-callable flow required");
+        LOG_ERROR("validate_active_callable: no active callable_id; registered-callable flow required");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    return stamp_orch_so(runtime, cid);
+    if (callables_.find(cid) == callables_.end()) {
+        LOG_ERROR("validate_active_callable: callable_id=%d not registered", cid);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    return 0;
 }
 
 int SimDeviceRunnerBase::commit_device_register(int32_t cid) {

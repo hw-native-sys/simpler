@@ -67,7 +67,7 @@
 // `runtime.h` (pulled in via `device_runner_helpers.h` in the base header)
 // supplies the per-arch `Handshake` + `Runtime` types used by
 // `print_handshake_results` / `bind_callable_to_runtime` /
-// `prepare_orch_so`.
+// `validate_active_callable`.
 
 // Implemented by each runtime's host part (runtime_maker.cpp). Reports the
 // AICPU entry symbols this runtime exports beyond the base {exec, init} set, so
@@ -1738,14 +1738,21 @@ int DeviceRunnerBase::configure_aicore_op_timeout() {
 
 int DeviceRunnerBase::ensure_device_initialized() {
     if (execution_mode_latch().is_kernel()) {
-        if (!kernel_exec_state_.accepts_dispatch() || !binaries_loaded_ || !aicpu_init_launched_) {
-            return PTO_RUNTIME_ERR_INVALID_STATE;
-        }
-        // Kernel init already completed the cold control-stream work. Run
-        // preparation neither creates program streams nor binds a device.
-        return enter_run_thread();
+        return validate_kernel_context_ready();
     }
+    return initialize_program_device();
+}
 
+int DeviceRunnerBase::validate_kernel_context_ready() {
+    if (!kernel_exec_state_.accepts_dispatch() || !aicpu_runtime_registered_ || !aicpu_initialized_) {
+        return PTO_RUNTIME_ERR_INVALID_STATE;
+    }
+    // Kernel init already completed the cold control-stream work. Run
+    // preparation neither creates program streams nor binds a device.
+    return enter_run_thread();
+}
+
+int DeviceRunnerBase::initialize_program_device() {
     // Attach the current thread to the device (device_id_ was set in
     // attach_current_thread() during simpler_init) and create the persistent
     // AICPU/AICore streams. Streams live for the DeviceRunner's lifetime and
@@ -1800,7 +1807,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
         );
     }
 
-    rc = ensure_binaries_loaded(stream_aicpu_);
+    rc = ensure_aicpu_runtime_registered(stream_aicpu_);
     if (rc != 0) return rc;
 
     // Before the AICPU init launch: that launch is what publishes the workspace
@@ -1808,7 +1815,7 @@ int DeviceRunnerBase::ensure_device_initialized() {
     rc = ensure_dma_workspace_provisioned();
     if (rc != 0) return rc;
 
-    rc = ensure_aicpu_init_launched(stream_aicpu_);
+    rc = ensure_aicpu_initialized(stream_aicpu_);
     if (rc != 0) return rc;
 
     return ensure_dma_workspace_warmed();
@@ -1843,13 +1850,13 @@ int DeviceRunnerBase::init_kernel_context(int device_id) {
         );
     }
 
-    rc = ensure_binaries_loaded(control_stream);
+    rc = ensure_aicpu_runtime_registered(control_stream);
     if (rc != 0) return rc;
 
     // The async-DMA workspace is program mode's SDMA channel; kernel mode
     // provisions none, so this launch publishes the all-zero addresses that
     // mean "that engine is unavailable".
-    return ensure_aicpu_init_launched(control_stream);
+    return ensure_aicpu_initialized(control_stream);
 }
 
 PersistentArgsOps DeviceRunnerBase::persistent_args_ops() {
@@ -1910,8 +1917,8 @@ int DeviceRunnerBase::prepare_kernel_callable(int32_t callable_id) {
  * answers ACL_ERROR_RT_FEATURE_NOT_SUPPORT, and that is not a defect: the alias
  * is an L2 optimization, so its absence costs bandwidth, not correctness.
  */
-int DeviceRunnerBase::ensure_aicpu_init_launched(rtStream_t control_stream) {
-    if (aicpu_init_launched_) {
+int DeviceRunnerBase::ensure_aicpu_initialized(rtStream_t control_stream) {
+    if (aicpu_initialized_) {
         return 0;
     }
 
@@ -1939,23 +1946,22 @@ int DeviceRunnerBase::ensure_aicpu_init_launched(rtStream_t control_stream) {
         control_stream, &init_args, sizeof(init_args), host::KernelNames::InitName, /*aicpu_num=*/1
     );
     if (rc != 0) {
-        LOG_ERROR("ensure_aicpu_init_launched: launch_aicpu_payload failed: %d", rc);
+        LOG_ERROR("ensure_aicpu_initialized: launch_aicpu_payload failed: %d", rc);
         return rc;
     }
 
     rc = aclrtSynchronizeStreamWithTimeout(control_stream, PLATFORM_STREAM_SYNC_TIMEOUT_MS);
     if (rc != 0) {
-        LOG_ERROR("ensure_aicpu_init_launched: stream sync failed: %d (device_id=%d)", rc, device_id_);
+        LOG_ERROR("ensure_aicpu_initialized: stream sync failed: %d (device_id=%d)", rc, device_id_);
         return rc;
     }
-    aicpu_init_launched_ = true;
+    aicpu_initialized_ = true;
     return 0;
 }
 
-int DeviceRunnerBase::ensure_binaries_loaded(rtStream_t control_stream) {
-    // Check if already loaded (binaries are owned by the runner via
-    // set_executors and live for the runner's lifetime).
-    if (binaries_loaded_) {
+int DeviceRunnerBase::ensure_aicpu_runtime_registered(rtStream_t control_stream) {
+    // Registration and entry handles remain usable until loader finalization.
+    if (aicpu_runtime_registered_) {
         return 0;
     }
 
@@ -2016,8 +2022,8 @@ int DeviceRunnerBase::ensure_binaries_loaded(rtStream_t control_stream) {
     aicpu_so_binary_.clear();
     aicpu_so_binary_.shrink_to_fit();
 
-    binaries_loaded_ = true;
-    LOG_INFO("DeviceRunner: binaries loaded");
+    aicpu_runtime_registered_ = true;
+    LOG_INFO("DeviceRunner: AICPU runtime registered");
     return 0;
 }
 
@@ -2313,31 +2319,17 @@ int DeviceRunnerBase::release_chip_callable_buffer(uint64_t hash) {
     return 0;
 }
 
-int DeviceRunnerBase::stamp_orch_so(Runtime &runtime, int32_t cid) {
-    // Registered-callable flow only: the orch SO was already H2D'd and
-    // dlopen'd device-side at record_device_orch_callable / launch_device_register
-    // time. All that remains for a run is to tell the AICPU which orch_so_table_
-    // slot to dispatch — the active callable_id.
-    if (cid < 0) {
-        LOG_ERROR("stamp_orch_so: invalid callable_id=%d", cid);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    auto it = callables_.find(cid);
-    if (it == callables_.end()) {
-        LOG_ERROR("stamp_orch_so: callable_id=%d not registered", cid);
-        return PTO_RUNTIME_ERR_INTERNAL;
-    }
-    runtime.set_active_callable_id(cid);
-    return 0;
-}
-
-int DeviceRunnerBase::prepare_orch_so(Runtime &runtime) {
+int DeviceRunnerBase::validate_active_callable(const Runtime &runtime) const {
     const int32_t cid = runtime.get_active_callable_id();
     if (cid < 0) {
-        LOG_ERROR("prepare_orch_so: no active callable_id; registered-callable flow required");
+        LOG_ERROR("validate_active_callable: no active callable_id; registered-callable flow required");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
-    return stamp_orch_so(runtime, cid);
+    if (callables_.find(cid) == callables_.end()) {
+        LOG_ERROR("validate_active_callable: callable_id=%d not registered", cid);
+        return PTO_RUNTIME_ERR_INTERNAL;
+    }
+    return 0;
 }
 
 int DeviceRunnerBase::commit_device_register(int32_t cid) {
@@ -3062,11 +3054,11 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     aicore_bin_handle_ = nullptr;
     sdma_warmup_bin_handle_ = nullptr;
     sdma_warmed_ = false;
-    binaries_loaded_ = false;
+    aicpu_runtime_registered_ = false;
     // RTS registration is retired above; CANN may retain the immutable SO.
     // Clear the one-shot guard so a reused runner
-    // re-launches simpler_aicpu_init after the next ensure_binaries_loaded().
-    aicpu_init_launched_ = false;
+    // re-launches simpler_aicpu_init after the next ensure_aicpu_runtime_registered().
+    aicpu_initialized_ = false;
 
     // Release any chip callable buffers callers forgot to unregister. On a
     // kernel context a failed free keeps its entry so an explicit close can
@@ -4362,7 +4354,7 @@ int DeviceRunnerBase::init_runtime_args_with_metadata(
     // transaction. The slot retains the pinned source until run retirement.
     // Log config and device ordinal are no longer published per-run on
     // KernelArgs — they were latched once into the AICPU SO globals by
-    // simpler_aicpu_init (ensure_aicpu_init_launched) at device init.
+    // simpler_aicpu_init (ensure_aicpu_initialized) at device init.
     return 0;
 }
 

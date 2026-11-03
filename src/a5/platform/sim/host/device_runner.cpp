@@ -151,7 +151,7 @@ void DeviceRunner::cleanup_active_run() noexcept {
 }
 
 int DeviceRunner::ensure_binaries_loaded() {
-    // AICPU .so: load-once, matching onboard's binaries_loaded_ pattern.
+    // AICPU .so: load-once, matching onboard's aicpu_runtime_registered_ pattern.
     if (!aicpu_so_loaded_ && !aicpu_so_binary_.empty()) {
         if (!simpler::common::sim_host::create_temp_so_file(
                 "/tmp/aicpu_sim_XXXXXX", aicpu_so_binary_.data(), aicpu_so_binary_.size(), &aicpu_so_path_
@@ -515,9 +515,9 @@ int DeviceRunner::prepare_execution(
     // The profiling flag is built by `arm_collectors_for_run` at launch, beside
     // the collector pools it describes.
 
-    rc = prepare_orch_so(runtime);
+    rc = validate_active_callable(runtime);
     if (rc != 0) {
-        LOG_ERROR("prepare_orch_so failed: %d", rc);
+        LOG_ERROR("validate_active_callable failed: %d", rc);
         return rc;
     }
 

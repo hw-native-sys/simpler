@@ -460,7 +460,8 @@ device_worker_main(device_id)
                 DeviceRunner::prepare_execution(..., slot, identity)
               simpler_launch_run(...)
                 child progress path: DeviceRunner::launch_execution(prepared, permit)
-                  ensure_binaries_loaded()     already done by init
+                  # AICPU runtime registration completed during init via
+                  # ensure_aicpu_runtime_registered(); launch uses cached handles
                   launch_aicore_kernel()       cached rtRegisterAllKernel handle
                                                  + rtKernelLaunchWithHandleV2
                                                  + record core_done on that stream
