@@ -179,6 +179,9 @@ the raw admission claim lock, zero at successful termination. v6 adds claim
 certificates, v7 requires the 128-byte close-seal stride, and v8 records scoped
 Mix membership and per-lane predecessor sequences. Missing fields
 are not synthesized, and old captures without protocol objects remain unverified.
+Native Graph captures use v9 with the same resource and claim contracts plus
+`node_map` and `graph_source`. Legacy Graph v6 is identified by those source tables
+and validated separately from the ordinary v6 claim-certificate format.
 The strict CSA gate additionally matches independent dep-gen, original kernels,
 block counts, all fan-in and the full task/block/slot set. Truncated/missing
 evidence fails the gate even when golden values match. Failed runs require their

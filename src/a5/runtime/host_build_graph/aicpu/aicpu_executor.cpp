@@ -139,6 +139,7 @@ static void log_unfinished_tasks(Runtime *runtime) {
     auto *controls = scheduler_state_at<SchedulerTaskControl>(scheduler_state_base, context->task_controls_offset);
     auto *metadata = scheduler_state_at<SchedulerTaskMetadata>(scheduler_state_base, context->task_metadata_offset);
     const uint64_t count = context->graph_task_count;
+    const auto graph = aicore_scheduler_graph_view(*context);
     uint64_t reported = 0;
     struct TaskSnapshot {
         uint64_t task;
@@ -149,9 +150,13 @@ static void log_unfinished_tasks(Runtime *runtime) {
     TaskSnapshot snapshots[64];
     uint64_t snapshot_count = 0;
     for (uint64_t task = 0; task < count; ++task) {
-        if (!scheduler_task_is_executable(metadata[task].flags)) continue;
+        if (graph.native_header_offset == 0 && !scheduler_task_is_executable(metadata[task].flags)) continue;
         if (controls[task].state == static_cast<int64_t>(SchedulerTaskState::DONE)) continue;
         if (reported++ >= 64) break;
+        if (graph.native_header_offset != 0) {
+            const auto identity = aicore_scheduler_public_identity(graph, task);
+            LOG_ERROR("A5 HBG native node=%" PRIu64 " public_id=%" PRIu64, task, TaskId::to_uint64(identity));
+        }
         if (snapshot_count < 64) {
             snapshots[snapshot_count++] = {
                 task, controls[task].state, controls[task].wake_list_head, controls[task].next_waiter
@@ -189,7 +194,7 @@ static void log_unfinished_tasks(Runtime *runtime) {
             controls[task].waiting_producer >= 0 && static_cast<uint64_t>(controls[task].waiting_producer) < count ?
                 controls[controls[task].waiting_producer].wake_list_head :
                 INT64_C(-1),
-            metadata[task].active_mask, metadata[task].flags
+            metadata[task].active_mask.raw(), metadata[task].flags
         );
     }
     // A task that is neither on a wake list nor in a queue was dropped between

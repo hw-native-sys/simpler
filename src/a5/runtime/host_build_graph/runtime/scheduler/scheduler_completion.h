@@ -15,8 +15,8 @@
 
 #include "scheduler_gm_mix.h"
 
-// The caller publishes only at idle or in the common run epilogue. A barrier
-// keeps trace/error publication ahead of the terminal completion count.
+// Idle and the run epilogue flush pending counts; native runs also publish
+// bounded progress batches. Trace/error publication precedes the exit count.
 inline __aicore__ void
 scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLocalState *local) {
     const uint64_t completed = local->pending_completed;
@@ -27,7 +27,7 @@ scheduler_flush_completions(__gm__ SchedulerRunControl *run_control, SchedulerLo
 }
 
 inline __aicore__ void scheduler_account_failed_completion(
-    const SchedulerGraphView &graph, SchedulerLocalState *scheduler, __gm__ SchedulerRunControl *run_control,
+    const SchedulerGraphAccess &graph, SchedulerLocalState *scheduler, __gm__ SchedulerRunControl *run_control,
     int64_t task_ref, SchedulerErrorSite error_site
 ) {
     // Preserve a more specific error already latched by the failing helper. The
@@ -48,7 +48,7 @@ struct SchedulerRefillCandidates {
 // successors may retain one persistent admission candidate.
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_complete_ordered_task(
-    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
+    const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, int64_t task_ref, uint64_t profiling_level, SchedulerWakeStats *wake_stats,
     SchedulerReadyStats *ready_stats, SchedulerCompletionStats *completion_stats
 ) {
@@ -75,7 +75,7 @@ static inline __aicore__ bool scheduler_complete_ordered_task(
 
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_service_cluster_completion_slot(
-    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
+    const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, uint32_t cluster_lane, uint32_t pending_slot,
     uint32_t completed_generation, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
     SchedulerCompletionStats *completion_stats, uint64_t profiling_level, const SchedulerReadyClaim *replacement_ready,
@@ -368,7 +368,7 @@ static inline __aicore__ bool scheduler_service_cluster_completion_slot(
 
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_service_cluster_completions(
-    const SchedulerGraphView &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
+    const SchedulerGraphAccess &graph, __gm__ void *scheduler_state_base, SchedulerLocalState *scheduler,
     __gm__ SchedulerRunControl *run_control, SchedulerWakeStats *wake_stats, SchedulerReadyStats *ready_stats,
     SchedulerCompletionStats *completion_stats, uint64_t profiling_level, uint64_t *direct_refilled_slot_mask,
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf_region, SchedulerRefillCandidates *candidates = nullptr

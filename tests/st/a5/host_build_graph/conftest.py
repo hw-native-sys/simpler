@@ -43,7 +43,7 @@ _MODE_NAMES = {
     0: "none",
     1: "resident (pending)",
     2: "resident (ready)",
-    3: "legacy (graph task)",
+    3: "legacy (Graph capability fallback)",
     4: "legacy (unsupported shape)",
 }
 _RESIDENT_MODES = frozenset({1, 2})

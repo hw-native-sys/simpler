@@ -107,7 +107,7 @@ def test_resident_routes_registration_to_the_owned_log_before_worker_creation(na
             def close(self):
                 events["closed"] = True
 
-        scene._compile = lambda platform: object()
+        scene._compile = lambda platform, *, native_graph=False: object()
         scene.Worker = LoggedWorker
         try:
             scene._run_pass("a5", 5, artifacts, 1, 0, 1, 2500, recovery=False)
@@ -150,7 +150,7 @@ def test_resident_log_bind_failure_precedes_worker_creation(native, monkeypatch,
     def create_worker(**kwargs):
         pytest.fail("a Worker was created before the diagnostic sink was bound")
 
-    monkeypatch.setattr(native, "_compile", lambda platform: events.append("compile"))
+    monkeypatch.setattr(native, "_compile", lambda platform, *, native_graph=False: events.append("compile"))
     monkeypatch.setattr(native._task_interface, "_bind_host_log_session_directory", refuse_binding)
     monkeypatch.setattr(native, "Worker", create_worker)
     with pytest.raises(RuntimeError, match="controlled host-log binding refused"):
@@ -589,7 +589,10 @@ def test_failed_output_checks_return_writes_and_untouched_successor(native, corr
 
 
 @pytest.mark.parametrize("recovery", (False, True))
-def test_unexpected_healthy_failure_preserves_error_and_closes_worker(native, monkeypatch, tmp_path, recovery):
+@pytest.mark.parametrize("native_graph", (False, True))
+def test_unexpected_healthy_failure_preserves_error_and_closes_worker(
+    native, monkeypatch, tmp_path, recovery, native_graph
+):
     class FailingWorker:
         closed = False
 
@@ -617,10 +620,10 @@ def test_unexpected_healthy_failure_preserves_error_and_closes_worker(native, mo
             FailingWorker.closed = True
 
     monkeypatch.setattr(native, "Worker", FailingWorker)
-    monkeypatch.setattr(native, "_compile", lambda platform: object())
+    monkeypatch.setattr(native, "_compile", lambda platform, **kwargs: object())
     monkeypatch.setattr(native, "_args", lambda *args: object())
     with pytest.raises(RuntimeError, match="unexpected healthy-pass timeout"):
-        native._run_pass("a5sim", 0, tmp_path, 7, 0, 257, 2500, recovery=recovery)
+        native._run_pass("a5sim", 0, tmp_path, 7, 0, 257, 2500, recovery=recovery, native_graph=native_graph)
     assert FailingWorker.closed
 
 
@@ -649,6 +652,30 @@ def test_failure_budget_keeps_simulation_headroom_and_fault_injection(
         assert duration == -1
     else:
         assert duration >= timeout_ms * 5 // 4
+
+
+@pytest.mark.parametrize("platform", ("a5sim", "a5"))
+def test_native_graph_failure_budget_covers_failure_and_recovery(native, monkeypatch, tmp_path, platform):
+    calls = []
+
+    def run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, recovery, native_graph):
+        assert native_graph
+        calls.append((int(os.environ["SIMPLER_SCHEDULER_TIMEOUT_MS"]), stall_ms, recovery))
+        return []
+
+    def recover_in_subprocess(command, **kwargs):
+        run_pass(**json.loads(command[-1]))
+        return SimpleNamespace(returncode=0, stdout=native._RECOVERY_MARKER + "[]", stderr="")
+
+    monkeypatch.setattr(native, "_ROOT", tmp_path)
+    monkeypatch.setattr(native, "_run_pass", run_pass)
+    monkeypatch.setattr(native.subprocess, "run", recover_in_subprocess)
+    native.test_native_graph_failure_does_not_release_exit(platform, [0], 7, 2, monkeypatch)
+    assert len(calls) == 2 and calls[0][:2] == calls[1][:2]
+    assert [call[2] for call in calls] == [False, True]
+    timeout_ms, duration, _ = calls[0]
+    assert timeout_ms >= 10000 if platform == "a5sim" else timeout_ms == 2000
+    assert duration >= timeout_ms * 5 // 4
 
 
 def test_failed_capture_checks_the_actual_injected_stall(native):
@@ -819,10 +846,13 @@ def _check_fault_buffer_policy(
                 raise FileNotFoundError("controlled missing owned capture")
             raw = _large_ticket_capture(7, 0, 1)
             protocol = raw["aicore_protocol"]
-            protocol.update(schema="hbg-native-protocol-v5", run_epoch=owner.scheduler_mode_publish_count)
+            protocol.update(
+                schema="hbg-native-protocol-v8", close_seal_stride=128, run_epoch=owner.scheduler_mode_publish_count
+            )
             for control in protocol["task_controls"]:
                 control["admission_claim_lock"] = 0
                 control["claim_tickets"] = 0
+                control["claim_seal"] = 0
             if not owner.poisoned or damage == "scheduler":
                 protocol["scheduler_error"] = 0
             if owner.poisoned:
@@ -835,7 +865,7 @@ def _check_fault_buffer_policy(
             return prefix / "capture.bin", raw
         return prefix / "capture.bin", {
             "aicore_protocol": {
-                "schema": "hbg-native-protocol-v5",
+                "schema": "hbg-native-protocol-v8",
                 "run_epoch": owner.scheduler_mode_publish_count,
                 "scheduler_error": 100 if owner.poisoned else 0,
                 "first_error": {"site": 95 if owner.poisoned else 0},
@@ -872,7 +902,7 @@ def _check_fault_buffer_policy(
         events.append("output-checked")
 
     monkeypatch.setattr(native, "Worker", ControlledWorker)
-    monkeypatch.setattr(native, "_compile", lambda platform: object())
+    monkeypatch.setattr(native, "_compile", lambda platform, *, native_graph=False: object())
     monkeypatch.setattr(native, "_args", lambda *args: args[-1])
     monkeypatch.setattr(native, "_capture", capture)
     monkeypatch.setattr(native, "_root_block_num", lambda protocol: 1)
@@ -1201,6 +1231,8 @@ def test_owned_proof_partial_free_does_not_retry_a_confirmed_free(native, monkey
     _check_fault_buffer_policy(
         native, monkeypatch, tmp_path, "a5", case["stall_ms"], owned_wait_case=case, fail_second_free=True
     )
+
+
 @pytest.mark.parametrize("task", (0, 1))
 @pytest.mark.parametrize("value", (None, False, True, -1, 1 << 32, (1 << 64) - 1))
 @pytest.mark.parametrize("version", (6, 7, 8))

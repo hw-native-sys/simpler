@@ -13,7 +13,7 @@ Sequence integrity proves lossless local event streams, not scheduler causality,
 execution coverage, membership, dependency ordering or Mix resource correctness.
 """
 
-SCHEMAS = tuple(f"hbg-native-protocol-v{version}" for version in range(1, 9))
+SCHEMAS = tuple(f"hbg-native-protocol-v{version}" for version in range(1, 10))
 
 ROOT_NUMBERS = frozenset(
     """
@@ -87,8 +87,20 @@ def protocol_version(section):
 
 
 def uses_resource_scoped_mix(section):
-    """Version 8 coordinates only the declared Mix resource lanes."""
-    return protocol_version(section) == 8
+    """Versions 8 and 9 coordinate only the declared Mix resource lanes."""
+    return protocol_version(section) >= 8
+
+
+def has_native_graph(section):
+    """Native Graph v6 is distinguished from claim-seal v6 by its source tables."""
+    version = protocol_version(section)
+    return version == 9 or (version == 6 and ("node_map" in section or "graph_source" in section))
+
+
+def has_claim_seal(section):
+    """Legacy native Graph v6 predates the claim-seal contract."""
+    version = protocol_version(section)
+    return version >= 6 and not (version == 6 and has_native_graph(section))
 
 
 def _error(message):
@@ -148,8 +160,10 @@ def _indices(rows, count, path, *, key="index", dense=False):
 def read_native_protocol(section):
     """Validate the wire schema; preserve incomplete/error records for diagnosis."""
     version = protocol_version(section)
+    native = has_native_graph(section)
     root_numbers = ROOT_NUMBERS | ({"close_seal_stride"} if version >= 7 else set())
-    _object(section, root_numbers | ROOT_TABLES | {"schema", "producer", "first_error"}, "root")
+    extra = {"node_map", "graph_source"} if native else set()
+    _object(section, root_numbers | ROOT_TABLES | {"schema", "producer", "first_error"} | extra, "root")
     if not version or section["producer"] != "aicore":
         _error("unknown schema or producer")
     for field in root_numbers:
@@ -174,7 +188,7 @@ def read_native_protocol(section):
             extra = ("claim_tickets",) if kind == "control" and version >= 2 else ()
             if kind == "control" and version >= 5:
                 extra += ("admission_claim_lock",)
-            if kind == "control" and version >= 6:
+            if kind == "control" and has_claim_seal(section):
                 extra += ("claim_seal",)
             _record(row, kind, f"{table}[{row[key]}]", extra)
     for row in section["admissions"]:
@@ -188,9 +202,13 @@ def read_native_protocol(section):
     ):
         _indices(section[table], count, table)
         for row in section[table]:
-            extra = ("claim_seal_seen", "claim_cursor_seen") if kind == "member" and version >= 6 else ()
+            extra = ("claim_seal_seen", "claim_cursor_seen") if kind == "member" and has_claim_seal(section) else ()
             _record(row, kind, f"{table}[{row['index']}]", extra)
     _read_nested_events(section)
+    if native:
+        from .native_graph import read_graph_source  # noqa: PLC0415
+
+        read_graph_source(section)
     return section
 
 
@@ -204,10 +222,10 @@ def _read_nested_events(section):
     _indices(section["blocks"], section["trace_count"], "blocks")
     for row in section["blocks"]:
         fields = {"index", "owner", "lanes"}
-        if protocol_version(section) >= 6:
+        if has_claim_seal(section):
             fields.add("claim")
         _object(row, fields, "block row")
-        if protocol_version(section) >= 6 and row["claim"] is not None:
+        if has_claim_seal(section) and row["claim"] is not None:
             _record(row["claim"], "claim", f"blocks[{row['index']}].claim")
         if row["owner"] is not None:
             _record(row["owner"], "owner", f"blocks[{row['index']}].owner")
@@ -223,7 +241,7 @@ def _event_records(section):
             if row[name] is not None:
                 yield row[name], "actor", f"task_events[{row['index']}].{name}"
     for row in section["blocks"]:
-        if protocol_version(section) >= 6 and row["claim"] is not None:
+        if has_claim_seal(section) and row["claim"] is not None:
             yield row["claim"], "claim", f"blocks[{row['index']}].claim"
         if row["owner"] is not None:
             yield row["owner"], "owner", f"blocks[{row['index']}].owner"

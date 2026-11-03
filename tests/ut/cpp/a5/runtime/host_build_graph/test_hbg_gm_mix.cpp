@@ -1838,6 +1838,16 @@ TEST_P(HbgGmMixOrdinaryResource, ArrivesOnlyAfterRealOrdinarySlotCompletionIsCon
         ASSERT_TRUE(scheduler_ready_batch_append(fixture.base(), local, task, &batch, nullptr));
     }
     ASSERT_TRUE(scheduler_ready_batch_push(fixture.base(), local, core_type, &batch, nullptr));
+    // Direct retention can populate both slots independently of queue prefetch.
+    for (uint32_t task : {first_task, 1U - first_task}) {
+        SchedulerReadyClaim claim{};
+        ASSERT_TRUE(scheduler_claim_ready_for_slot(
+            fixture.graph.graph(), fixture.base(), local, fixture.run(), local->config.scheduler_count, core_type,
+            &fixture.cursors[lane][core_type], nullptr, &claim, nullptr, true
+        ));
+        ASSERT_EQ(claim.task_ref, task);
+        ASSERT_TRUE(scheduler_ordered_retain_candidate(&fixture.admissions[lane], claim));
+    }
     ASSERT_TRUE(fixture.fill(lane));
     ASSERT_EQ(local->local_ready_mask, 3u);
     GmExecution ordinary{};

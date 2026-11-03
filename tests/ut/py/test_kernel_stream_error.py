@@ -25,9 +25,6 @@ from types import SimpleNamespace
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[3]
-_A5_LEGACY_GRAPH = 3
-
-
 _RESIDENT_TIMEOUT_SIGNATURES = (
     r"aicpu_execute: runtime failed with rc=-100(?!\d)",
     r"simpler_aicpu_exec: aicpu_execute failed with rc=-100(?!\d)",
@@ -1029,8 +1026,11 @@ def test_kernel_error_reaches_caller_stream(runtime, error_origin, failure, requ
     if error_origin == "aicore" and not failure:
         assert observed["output_marker"] == 42, observed
     if arch == "a5" and runtime == "host_build_graph":
-        assert observed["scheduler_runtime_mode"] == _A5_LEGACY_GRAPH, observed
+        assert observed["scheduler_runtime_mode"] in (1, 2), observed
         assert observed["scheduler_mode_publish_count"] > 0, observed
+        if failure:
+            assert observed["resident_timeout_evidence"], observed
+            _resident_timeout_evidence(logs)
 
 
 @pytest.mark.requires_hardware
@@ -1064,7 +1064,7 @@ def test_completed_public_handle_observes_later_caller_error(runtime, request, t
     assert observed["repeat_wait_error"] == 507018 and observed["distinct_caller_outputs"]
     assert observed["caller_resources_retained"]
     if arch == "a5" and runtime == "host_build_graph":
-        assert observed["scheduler_runtime_mode"] == _A5_LEGACY_GRAPH, observed
+        assert observed["scheduler_runtime_mode"] in (1, 2), observed
         assert observed["scheduler_mode_publish_count"] > 0, observed
 
 
@@ -1089,11 +1089,15 @@ def _callable(arch, runtime, error_origin, failure, output):
             if failure
             else Path(__file__).with_name("support") / "kernel_stream_output.cpp"
         )
+        includes = list(compiler.get_orchestration_include_dirs(runtime)) + [str(_ROOT / "src/common")]
+        if arch == "a5" and runtime == "host_build_graph" and failure:
+            kernel_source = Path(__file__).with_name("support") / "kernel_stream_timeout.cpp"
+            includes.append(str(compiler.platform_dir / "onboard/aicore"))
         kernel = compiler.compile_incore(
             source_path=str(kernel_source),
             core_type="aiv",
             pto_isa_root=ensure_pto_isa_root(),
-            extra_include_dirs=list(compiler.get_orchestration_include_dirs(runtime)) + [str(_ROOT / "src/common")],
+            extra_include_dirs=includes,
         )
         signature = [ArgDirection.INOUT]
         kernel_binary = extract_text_section(kernel)
@@ -1132,6 +1136,9 @@ def _probe(arch, runtime, error_origin, device, failure, output):
         _native_run_storage,
     )
 
+    resident_graph = arch == "a5" and runtime == "host_build_graph"
+    if resident_graph and failure:
+        _resident_timeout_profile(os.environ)
     chip, hashes = _callable(arch, runtime, error_origin, failure, output)
     image = ctypes.string_at(int(chip.buffer_ptr()), int(chip.buffer_size()))
     (output / "callable.bin").write_bytes(image)
@@ -1185,6 +1192,11 @@ def _probe(arch, runtime, error_origin, device, failure, output):
     started = time.monotonic()
     rc = lib.aclrtSynchronizeStreamWithTimeout(caller, 60000)
     elapsed = time.monotonic() - started
+    evidence = (
+        _wait_for_resident_timeout_evidence(Path(os.environ["ASCEND_PROCESS_LOG_PATH"]), (4, 2))
+        if resident_graph and failure
+        else []
+    )
     mode = count = 0
     if arch == "a5" and runtime == "host_build_graph":
         lib.get_last_scheduler_runtime_mode.argtypes = [ctypes.c_void_p]
@@ -1209,6 +1221,7 @@ def _probe(arch, runtime, error_origin, device, failure, output):
                 "failure": failure,
                 "caller_sync_rc": rc,
                 "peek_before": peek_before,
+                "resident_timeout_evidence": evidence,
                 **hashes,
             }
         ),
@@ -1234,6 +1247,8 @@ def _public_observer_probe(arch, runtime, device, output):
     from simpler.worker import Worker  # noqa: PLC0415
     from test_kernel_mode_c_api import _load  # noqa: PLC0415
 
+    if arch == "a5" and runtime == "host_build_graph":
+        _resident_timeout_profile(os.environ)
     lib = _load(arch, "onboard", runtime)
     lib.rtSetDevice.argtypes = [ctypes.c_int]
     lib.aclrtCreateStream.argtypes = [ctypes.POINTER(ctypes.c_void_p)]

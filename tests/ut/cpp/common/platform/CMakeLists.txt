@@ -907,6 +907,10 @@ hbg_case(test_native_admission.cpp
     INCLUDES_BEFORE ${NATIVE_ADMISSION_INCLUDES}
     DEFINES SIMPLER_RUNTIME_NAME="host_build_graph"
     LINK @arch@_ut_support ${CMAKE_DL_LIBS})
+if(TARGET test_a5_hbg_native_admission)
+    target_sources(test_a5_hbg_native_admission PRIVATE
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
+endif()
 tmr_case(test_native_admission.cpp
     SOURCES ${NATIVE_ADMISSION_SOURCES}
         ${CMAKE_SOURCE_DIR}/support/native_admission/tmr_preparation.cpp

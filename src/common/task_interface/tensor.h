@@ -22,16 +22,7 @@
 #include "assert_compat.h"
 #include "data_type.h"
 
-/**
- * Buffer Handle
- *
- * Represents a device memory buffer with address and total size in bytes.
- * This is the underlying memory allocation that a ChipTensor describes access patterns for.
- */
-struct PTOBufferHandle {
-    uint64_t addr;  // Device memory address (bytes)
-    uint64_t size;  // Total buffer size in bytes
-};
+#include "buffer_handle.h"
 
 /**
  * TensorArgType - Distinguishes inputs, outputs, and in-place updates.

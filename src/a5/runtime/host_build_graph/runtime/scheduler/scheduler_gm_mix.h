@@ -20,7 +20,7 @@ enum class SchedulerGmMixResult : uint8_t { WAIT, PROGRESS, TASK_LAST, ERROR };
 // still observes error and epoch; phase, identity and ACK checks are separate.
 template <bool StaticContextValidated = false>
 inline __aicore__ bool scheduler_gm_mix_context_valid(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     if constexpr (StaticContextValidated)
         return scheduler_admission_detail::active_run_valid(graph, base, local, run, local->admission);
@@ -74,7 +74,7 @@ inline __aicore__ bool scheduler_gm_mix_descriptor_valid(
 
 template <bool RecordProtocol = true, bool StaticContextValidated = false>
 static inline __aicore__ bool scheduler_gm_mix_close(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool *closed, bool critical = false
 ) {
     if (closed == nullptr) return false;
@@ -157,7 +157,7 @@ static inline __aicore__ bool scheduler_gm_mix_close(
 
 template <bool RecordProtocol = true, bool StaticContextValidated = false>
 static inline __aicore__ SchedulerBlockClaimResult scheduler_gm_mix_claim(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     // No shared ownership changes until the cursor helper's error gate.
     if (!scheduler_gm_mix_context_valid<StaticContextValidated>(graph, base, local, run))
@@ -196,7 +196,7 @@ static inline __aicore__ SchedulerBlockClaimResult scheduler_gm_mix_claim(
 
 template <bool RecordProtocol = true, bool StaticContextValidated = false>
 static inline __aicore__ bool scheduler_gm_mix_publish(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run
 ) {
     if (!scheduler_gm_mix_context_valid<StaticContextValidated>(graph, base, local, run)) return false;
     auto &admission = *local->admission;
@@ -251,7 +251,7 @@ static inline __aicore__ bool scheduler_gm_mix_publish(
 
 template <bool RecordProtocol = true, bool StaticContextValidated = false>
 static inline __aicore__ bool scheduler_gm_mix_observe(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool *progress
 ) {
     if (progress == nullptr) return false;
@@ -307,7 +307,7 @@ static inline __aicore__ bool scheduler_gm_mix_observe(
 
 template <bool RecordProtocol = true, bool StaticContextValidated = false>
 static inline __aicore__ bool scheduler_gm_mix_arrive(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool *progress
 ) {
     if (progress == nullptr) return false;
@@ -329,7 +329,7 @@ static inline __aicore__ bool scheduler_gm_mix_arrive(
 
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_gm_mix_check_acks(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool releases, bool *all, bool query_prefiltered = false
 ) {
     *all = false;
@@ -371,7 +371,7 @@ static inline __aicore__ void scheduler_gm_mix_publish_release(__gm__ void *base
 
 template <bool RecordProtocol = true, bool StaticContextValidated = false>
 static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t profiling_level, bool *progress, bool query_prefiltered = false
 ) {
     if (progress == nullptr) return false;
@@ -429,7 +429,7 @@ static inline __aicore__ bool scheduler_gm_mix_prepare_lane(
 // publication precede this release operation.
 template <bool RecordProtocol = true>
 static inline __aicore__ bool scheduler_gm_mix_release_lane(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     int64_t task_ref, uint32_t slot_index, uint32_t generation
 ) {
     if (!scheduler_gm_mix_context_valid(graph, base, local, run)) return false;
@@ -446,7 +446,7 @@ static inline __aicore__ bool scheduler_gm_mix_release_lane(
 
 template <bool RecordProtocol = true, bool StaticContextValidated = false>
 static inline __aicore__ SchedulerGmMixResult scheduler_gm_mix_retire(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     bool query_prefiltered = false
 ) {
     // The completion contribution below owns the error gate. A partial

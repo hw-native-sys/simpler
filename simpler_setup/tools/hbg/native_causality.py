@@ -16,6 +16,8 @@ from .native_order import CausalOrder
 from .native_protocol import (
     _error,
     audit_protocol_sequences,
+    has_claim_seal,
+    has_native_graph,
     protocol_version,
     uses_resource_scoped_mix,
 )
@@ -40,6 +42,8 @@ class NativeAudit:
     def __init__(self, section, identities):
         self.raw = section
         self.resource_scoped = uses_resource_scoped_mix(section)
+        self.node_map = {}
+        self.control_nodes = set()
         self.sequence_result = audit_protocol_sequences(section)
         self.causal = CausalOrder(section)
         self.before = self.causal.before
@@ -105,12 +109,21 @@ class NativeAudit:
         require({w["cluster_index"] for w in self.workers.values()} == set(range(clusters)), "missing cluster")
 
     def graph(self):
+        if has_native_graph(self.raw):
+            from .native_graph import audit_graph_expansion  # noqa: PLC0415
+
+            self.node_map = audit_graph_expansion(self.raw)
+            self.control_nodes = {ref for ref, node in self.node_map.items() if node["kind"] in (2, 3, 4)}
         prefix = 0
+        trace_indices = set()
         for ref, task in sorted(self.tasks.items()):
             flags, mask, blocks = task["flags"], task["active_mask"], task["block_num"]
             deps = task["dependencies"]
             require(len(set(deps)) == len(deps) and all(0 <= dep < ref for dep in deps), "invalid frozen dependencies")
             require(flags < 128, "unknown task flags")
+            if ref in self.control_nodes:
+                require(mask == 0 and blocks == 1 and flags in (0, FANIN), "invalid native control metadata")
+                continue
             if flags == 0:
                 require(
                     mask == blocks == task["trace_base"] == 0 and task["kernel_ids"] == [0, 0, 0],
@@ -118,6 +131,8 @@ class NativeAudit:
                 )
                 continue
             require(flags & EXECUTABLE and bool(flags & FANIN) == bool(deps), "invalid executable task metadata")
+            if self.node_map:
+                prefix = task["trace_base"]
             require(task["trace_base"] == prefix <= (1 << 32) - 1, "noncontiguous frozen trace prefix")
             if flags & INLINE:
                 require(
@@ -142,13 +157,18 @@ class NativeAudit:
                 if flags & (MIX | SPMD):
                     self.expected_blocks[base] = ref, block
                 for offset, slot in enumerate(slot for slot in range(3) if mask & (1 << slot)):
+                    require(base + offset not in trace_indices, "overlapping execution trace ranges")
+                    trace_indices.add(base + offset)
                     self.expected_executions[base + offset] = ref, block, slot
             prefix += blocks * active
+        if self.node_map:
+            prefix = len(trace_indices)
+            require(trace_indices == set(range(prefix)), "noncontiguous native trace ranges")
         require(
             prefix == self.raw["trace_count"] or (prefix == 0 and self.raw["trace_count"] == len(self.tasks)),
             "trace capacity mismatch",
         )
-        device = {ref for ref, task in self.tasks.items() if task["flags"] & EXECUTABLE}
+        device = {ref for ref, task in self.tasks.items() if task["flags"] & EXECUTABLE} | self.control_nodes
         require(set(self.actors) == device, "missing or extraneous logical completion record")
         for ref in device:
             done = self.actors[ref]["completion"]
@@ -459,7 +479,9 @@ class NativeAudit:
                 run_epoch=self.raw["run_epoch"],
                 core_id=execution["worker_index"],
                 reg_task_id=index,
-                task_id=execution["task_ref"],
+                task_id=self.node_map[execution["task_ref"]]["public_task_id"]
+                if self.node_map
+                else execution["task_ref"],
                 block_idx=execution["block_idx"],
                 block_num=execution["block_num"],
                 subtask_slot=execution["subtask_slot"],
@@ -531,7 +553,7 @@ class NativeAudit:
                 "duplicate or missing block completion ticket",
             )
             self.ordered_intervals([b["owner"] for b in by_ticket], "completion_before", "completion_after")
-            if protocol_version(self.raw) >= 6:
+            if has_claim_seal(self.raw):
                 self.claim_certificates(ref, blocks)
             owned = defaultdict(list)
             for block in blocks:
@@ -540,7 +562,7 @@ class NativeAudit:
                 require(all(len(indices) == 1 for indices in owned.values()), "sync_start reused an execution position")
             for worker in self.task_members[ref]:
                 if self.tasks[ref]["flags"] & MIX and self.positions[worker][1]:
-                    if protocol_version(self.raw) >= 6:
+                    if has_claim_seal(self.raw):
                         member = self.member(ref, worker)
                         require(
                             member["claim_seal_seen"] == member["claim_cursor_seen"] == 0,
@@ -627,7 +649,7 @@ class NativeAudit:
         self.close_reads[(ref, worker)] = read
         self.causal.add(("event", worker, closed[2] - 1), read)
         self.causal.add(read, closed)
-        if protocol_version(self.raw) >= 6:
+        if has_claim_seal(self.raw):
             self.causal.add(self.confirm_points[(ref, cursor)], read)
             if cursor < blocks:
                 self.causal.add(read, self.confirm_points[(ref, cursor + 1)])
@@ -656,7 +678,7 @@ class NativeAudit:
             )
             if protocol_version(self.raw) >= 5:
                 require(control["admission_claim_lock"] == 0, "invalid terminal admission claim lock")
-            if protocol_version(self.raw) >= 6:
+            if has_claim_seal(self.raw):
                 require(
                     control["claim_seal"] == (task["block_num"] if cooperative else 0), "invalid terminal claim seal"
                 )
@@ -673,7 +695,7 @@ class NativeAudit:
                     task["block_num"] <= tickets <= task["block_num"] + positions if uses_tickets else tickets == 0,
                     "invalid terminal claim ticket counter",
                 )
-            if not task["flags"] & EXECUTABLE:
+            if not task["flags"] & EXECUTABLE and ref not in self.control_nodes:
                 continue
             done = self.actors[ref]["completion"]
             require(done is not None, "missing TaskDone")
@@ -693,7 +715,7 @@ class NativeAudit:
                     )
             else:
                 require(self.actors[ref]["admission"] is None, "ordinary/service task has an admission event")
-                if not task["flags"] & INLINE:
+                if not task["flags"] & INLINE and ref not in self.control_nodes:
                     execution = self.executions[task["trace_base"]]
                     require(execution["worker_index"] == done["worker_index"], "ordinary TaskDone wrong worker")
                     self.before(
@@ -719,13 +741,13 @@ class NativeAudit:
         ref = task["task_ref"]
         if ref in self.orders:
             earliest = point(self.actors[ref]["admission"], "before")
-        elif task["flags"] & INLINE:
+        elif task["flags"] & INLINE or ref in self.control_nodes:
             earliest = point(done, "before")
         else:
             execution = self.executions[task["trace_base"]]
             earliest = self.payload_points[execution["index"]][0]
         for dep in task["dependencies"]:
-            if self.tasks[dep]["flags"] & EXECUTABLE:
+            if self.tasks[dep]["flags"] & EXECUTABLE or dep in self.control_nodes:
                 self.causal.add(self.done_points[dep], earliest)
 
     def audit(self):

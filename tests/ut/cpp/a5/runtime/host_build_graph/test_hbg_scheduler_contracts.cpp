@@ -617,7 +617,7 @@ TEST(SchedulerGraph, AddressesEveryTaskAtTheStorageStride) {
         std::array<ChipTaskStorage, kTasks> storage{};
     } image;
     auto &storage = image.storage;
-    SchedulerGraphView graph{reinterpret_cast<uint64_t>(storage.data()), 0, kTasks, kTasks - 1};
+    const auto graph = scheduler_ordinary_graph_view(reinterpret_cast<uint64_t>(storage.data()), kTasks, kTasks - 1);
 
     for (size_t task = 0; task < kTasks; ++task) {
         SCOPED_TRACE(testing::Message() << "task " << task);
@@ -654,7 +654,7 @@ TEST(SchedulerGraph, NonPowerOfTwoWindowKeepsDirectTaskIdIndexing) {
         storage[task].payload.bind_regions(nullptr, nullptr, fanins[task].data());
     }
     storage[1].task.kernel_id[0] = 1;
-    SchedulerGraphView graph{reinterpret_cast<uint64_t>(storage.data()), 0, 3, 2};
+    const auto graph = scheduler_ordinary_graph_view(reinterpret_cast<uint64_t>(storage.data()), 3, 2);
 
     // Both records of task 1 resolve from the one base, at that entry's stride.
     EXPECT_EQ(scheduler_graph_descriptor(graph, 1), reinterpret_cast<uint8_t *>(&storage[1].task));

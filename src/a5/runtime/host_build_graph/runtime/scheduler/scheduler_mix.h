@@ -13,7 +13,7 @@
 #include "scheduler_dispatch.h"
 
 inline __aicore__ bool scheduler_dispatch_mix_ready(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     const SchedulerReadyClaim &ready, const SchedulerMixPlacement &placement, uint64_t profiling_level,
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf
 ) {
@@ -73,7 +73,7 @@ inline __aicore__ bool scheduler_dispatch_mix_ready(
 }
 
 inline __aicore__ bool scheduler_fill_cluster_mix_slots(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     uint64_t *victim_cursor, SchedulerReadyStats *stats, uint64_t profiling_level, bool allow_steal,
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf, bool *progress
 ) {
@@ -97,7 +97,7 @@ inline __aicore__ bool scheduler_fill_cluster_mix_slots(
 }
 
 inline __aicore__ bool scheduler_publish_direct_mix_candidate(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerReadyClaim *candidate, SchedulerReadyStats *stats, uint64_t profiling_level,
     SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf, bool *progress
 ) {
@@ -120,7 +120,7 @@ inline __aicore__ bool scheduler_publish_direct_mix_candidate(
 }
 
 inline __aicore__ bool scheduler_fill_mix_after_completions(
-    const SchedulerGraphView &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
+    const SchedulerGraphAccess &graph, __gm__ void *base, SchedulerLocalState *local, __gm__ SchedulerRunControl *run,
     SchedulerReadyClaim *candidate, uint64_t *victim_cursor, SchedulerReadyStats *stats, uint64_t profiling_level,
     bool allow_steal, SCHEDULER_SSBUF SchedulerSsbufRegion *ssbuf, bool *progress
 ) {
