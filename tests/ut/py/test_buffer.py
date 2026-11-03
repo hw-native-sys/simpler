@@ -1331,7 +1331,7 @@ def test_task_args_owns_transfer_without_mutating_the_source_view():
     assert args.transfer(0) == TensorTransfer.H2D
 
 
-def _slice_descriptor(backing, offset, nbytes, buffer_id):
+def _slice_descriptor(backing, offset, nbytes, buffer_id, *, producer=None):
     assert backing.shm is not None
     return BufferDescriptor(
         identity=CanonicalIdentity(bytes(backing.identity.owner_instance_id), buffer_id, 1),
@@ -1340,8 +1340,49 @@ def _slice_descriptor(backing, offset, nbytes, buffer_id):
         access=AccessMode.READWRITE,
         backend_kind=BackendKind.SHARED_FD_SLICE,
         nbytes=nbytes,
-        body=os.getpid().to_bytes(4, "little") + backing.shm._fd.to_bytes(4, "little") + offset.to_bytes(8, "little"),
+        body=(os.getpid() if producer is None else producer).to_bytes(4, "little")
+        + backing.shm._fd.to_bytes(4, "little")
+        + offset.to_bytes(8, "little"),
     )
+
+
+@pytest.mark.parametrize("deployment", [HOST_CPU, DEVICE_AICPU])
+@pytest.mark.parametrize("fork_inherited", [False, True])
+def test_local_heap_slice_needs_no_inherited_fd_registration(deployment, fork_inherited):
+    backing = create_host_shared_buffer(64, mint_owner_instance_id(), 1)
+    registry = ImportRegistry(ImportContext(deployment=deployment, fork_inherited=fork_inherited))
+    try:
+        assert backing.shm is not None and backing.shm.buf is not None
+        backing.shm.buf[:64] = b"!" * 64
+        mapped = registry.materialize(_slice_descriptor(backing, 16, 16, 2))
+        ctypes.memmove(mapped.base, b"x" * 16, 16)
+        assert bytes(backing.shm.buf[:64]) == b"!" * 16 + b"x" * 16 + b"!" * 32
+    finally:
+        registry.close()
+        backing.close()
+
+
+def test_foreign_heap_slice_requires_matching_inherited_fd_registration():
+    backing = create_host_shared_buffer(64, mint_owner_instance_id(), 1)
+    producer = os.getpid() + 1
+    desc = _slice_descriptor(backing, 16, 16, 2, producer=producer)
+    assert backing.shm is not None
+    owner, fd = bytes(backing.identity.owner_instance_id), backing.shm._fd
+    try:
+        for facts in ((), ((owner, producer + 1, (fd,)),), ((mint_owner_instance_id(), producer, (fd,)),)):
+            registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU, shared_heap_files=facts))
+            try:
+                with pytest.raises(ValueError, match="fd was not attached"):
+                    registry.materialize(desc)
+            finally:
+                registry.close()
+        registry = ImportRegistry(ImportContext(deployment=DEVICE_AICPU, shared_heap_files=((owner, producer, (fd,)),)))
+        try:
+            assert registry.materialize(desc).base != 0
+        finally:
+            registry.close()
+    finally:
+        backing.close()
 
 
 def test_shm_slices_share_one_mapping_and_bound_sub_views():

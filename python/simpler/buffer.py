@@ -919,6 +919,8 @@ def _host_file_attached(desc: BufferDescriptor, context: ImportContext) -> bool:
     body = bytes(desc.body)
     pid = int.from_bytes(body[:4], "little")
     fd = int.from_bytes(body[4:8], "little")
+    if pid == os.getpid():
+        return True
     return any(
         owner == bytes(desc.identity.owner_instance_id) and producer == pid and fd in fds
         for owner, producer, fds in context.shared_heap_files

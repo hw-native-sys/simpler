@@ -16,3 +16,7 @@ args.add_tensor(shared.tensor((4,), DataType.FLOAT32), TensorArgType.INPUT)
 `Orchestrator.alloc()` 和 `Worker.alloc_shared_tensor()` 的中间结果由 Worker 的共享 HeapRing 管理。描述符记录 backing fd 和分配偏移；芯片或 SUB 可在不同虚拟地址映射同一 backing。调用者不应保存中间结果并跨越所属 run/scope 使用。
 
 创建者拥有 backing，导入者只拥有本地映射。多个分配共用同一物理映射；所有子进程退出并完成清理后，Worker 才释放自身资源。初始化失败沿用现有回滚与 `waitpid` 回收协议；关闭失败仍按原约定保留尚未清理的资源。
+
+同进程的直接 L2 / `ChipWorker` 可导入仍有效的本地 HeapRing fd，不需要子进程继承记录。跨进程导入仍要求启动时已传递相应 fd，并匹配 owner 与生产进程。
+
+Torch 调用者可使用 `simpler_setup.torch_interop.create_shared_tensor(worker, tensor)` 显式复制到共享 Buffer；返回的任务参数与 Torch 视图指向同一 backing。原张量保持独立，关闭 Worker 前须释放所有返回视图。

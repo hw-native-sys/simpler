@@ -88,7 +88,7 @@ from simpler.worker import Worker  # noqa: E402
 from simpler_setup.elf_parser import extract_text_section  # noqa: E402
 from simpler_setup.kernel_compiler import KernelCompiler  # noqa: E402
 from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
-from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
+from simpler_setup.torch_interop import create_shared_tensor  # noqa: E402
 
 _F32 = DataType.FLOAT32
 
@@ -482,7 +482,7 @@ def run(
         torch.tensor(
             [[r * 100 + t * 10 + d for d in range(D)] for t in range(T)],
             dtype=torch.bfloat16,
-        ).share_memory_()
+        )
         for r in range(nranks)
     ]
     weights = torch.tensor(
@@ -493,28 +493,28 @@ def run(
     indices = generate_routing_indices(seed=20260510)
     print(f"[ep_dispatch] indices shape={tuple(indices.shape)} (rank,t,k -> global expert id)")
 
-    indices_per_rank = [indices[r].clone().contiguous().share_memory_() for r in range(nranks)]
-    w_padded_list = [pack_weights_padded(weights[r]).share_memory_() for r in range(nranks)]
+    indices_per_rank = [indices[r].clone().contiguous() for r in range(nranks)]
+    w_padded_list = [pack_weights_padded(weights[r]) for r in range(nranks)]
     # idx_padded is rank-independent (r = t*TOPK + k is intrinsic), but each
     # rank gets its own shared-memory copy so the framework can plumb it as a
     # per-rank input tensor.
-    idx_padded_list = [pack_idx_padded().share_memory_() for _ in range(nranks)]
+    idx_padded_list = [pack_idx_padded() for _ in range(nranks)]
 
     # Outputs — recv_x_out is BF16 (matches kernel TPUT/TSTORE element type);
     # recv_w_out / recv_idx_out are compacted to [L, R] inside the kernel.
     # recv_count_out is [L, 1] INT32 — dispatch's prefix_sum phase fills it
     # from pub_counts so local_expert can iterate `recv_count[e]` rows per expert.
-    recv_x_outs = [torch.zeros(L, R, D, dtype=torch.bfloat16).share_memory_() for _ in range(nranks)]
-    recv_w_outs = [torch.zeros(L, R, dtype=torch.float32).share_memory_() for _ in range(nranks)]
-    recv_idx_outs = [torch.zeros(L, R, dtype=torch.int32).share_memory_() for _ in range(nranks)]
-    recv_count_outs = [torch.zeros(L, 1, dtype=torch.int32).share_memory_() for _ in range(nranks)]
+    recv_x_outs = [torch.zeros(L, R, D, dtype=torch.bfloat16) for _ in range(nranks)]
+    recv_w_outs = [torch.zeros(L, R, dtype=torch.float32) for _ in range(nranks)]
+    recv_idx_outs = [torch.zeros(L, R, dtype=torch.int32) for _ in range(nranks)]
+    recv_count_outs = [torch.zeros(L, 1, dtype=torch.int32) for _ in range(nranks)]
     # Cross-kernel host-backed tensors:
     #   recv_y    [L, R, D]  BF16 — local_expert output; feeds combine as its
     #                                OUTPUT_EXISTING input.
     #   routed_y  [T, D]     FP32 — combine output: the TOPK reduce sum, written
     #                                straight from the FP32 accumulator.
-    recv_y_outs = [torch.zeros(L, R, D, dtype=torch.bfloat16).share_memory_() for _ in range(nranks)]
-    routed_y_outs = [torch.zeros(T, D, dtype=torch.float32).share_memory_() for _ in range(nranks)]
+    recv_y_outs = [torch.zeros(L, R, D, dtype=torch.bfloat16) for _ in range(nranks)]
+    routed_y_outs = [torch.zeros(T, D, dtype=torch.float32) for _ in range(nranks)]
 
     print("[ep_dispatch] computing host golden...")
     expected_recv_x, expected_recv_w, expected_recv_idx, expected_count = compute_golden(x_norms, indices, weights)
@@ -532,9 +532,21 @@ def run(
     )
     chip_handle = worker.register(chip_callable)
 
+    shared = {}
     try:
-        print("[ep_dispatch] init worker (forks chip children; base comm is lazy)...")
+        print("[ep_dispatch] init worker (starts chip children; base comm is lazy)...")
         worker.init()
+
+        shared["indices_per_rank"] = [create_shared_tensor(worker, tensor) for tensor in indices_per_rank]
+        shared["x_norms"] = [create_shared_tensor(worker, tensor) for tensor in x_norms]
+        shared["w_padded_list"] = [create_shared_tensor(worker, tensor) for tensor in w_padded_list]
+        shared["idx_padded_list"] = [create_shared_tensor(worker, tensor) for tensor in idx_padded_list]
+        shared["recv_x_outs"] = [create_shared_tensor(worker, tensor) for tensor in recv_x_outs]
+        shared["recv_w_outs"] = [create_shared_tensor(worker, tensor) for tensor in recv_w_outs]
+        shared["recv_idx_outs"] = [create_shared_tensor(worker, tensor) for tensor in recv_idx_outs]
+        shared["recv_count_outs"] = [create_shared_tensor(worker, tensor) for tensor in recv_count_outs]
+        shared["recv_y_outs"] = [create_shared_tensor(worker, tensor) for tensor in recv_y_outs]
+        shared["routed_y_outs"] = [create_shared_tensor(worker, tensor) for tensor in routed_y_outs]
 
         def orch_fn(orch, _args, cfg):
             with orch.allocate_domain(
@@ -559,16 +571,16 @@ def run(
                         f"scratch=0x{domain.buffers['scratch'].base:x}"
                     )
                     chip_args = TaskArgs()
-                    chip_args.add_tensor(make_tensor_arg(worker, indices_per_rank[i]), TensorArgType.INPUT)
-                    chip_args.add_tensor(make_tensor_arg(worker, x_norms[i]), TensorArgType.INPUT)
-                    chip_args.add_tensor(make_tensor_arg(worker, w_padded_list[i]), TensorArgType.INPUT)
-                    chip_args.add_tensor(make_tensor_arg(worker, idx_padded_list[i]), TensorArgType.INPUT)
-                    chip_args.add_tensor(make_tensor_arg(worker, recv_x_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                    chip_args.add_tensor(make_tensor_arg(worker, recv_w_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                    chip_args.add_tensor(make_tensor_arg(worker, recv_idx_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                    chip_args.add_tensor(make_tensor_arg(worker, recv_count_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                    chip_args.add_tensor(make_tensor_arg(worker, recv_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
-                    chip_args.add_tensor(make_tensor_arg(worker, routed_y_outs[i]), TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(shared["indices_per_rank"][i][0], TensorArgType.INPUT)
+                    chip_args.add_tensor(shared["x_norms"][i][0], TensorArgType.INPUT)
+                    chip_args.add_tensor(shared["w_padded_list"][i][0], TensorArgType.INPUT)
+                    chip_args.add_tensor(shared["idx_padded_list"][i][0], TensorArgType.INPUT)
+                    chip_args.add_tensor(shared["recv_x_outs"][i][0], TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(shared["recv_w_outs"][i][0], TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(shared["recv_idx_outs"][i][0], TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(shared["recv_count_outs"][i][0], TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(shared["recv_y_outs"][i][0], TensorArgType.OUTPUT_EXISTING)
+                    chip_args.add_tensor(shared["routed_y_outs"][i][0], TensorArgType.OUTPUT_EXISTING)
                     chip_args.add_tensor(
                         Tensor(domain.buffers["scratch"], shapes=(SCRATCH_NBYTES // 4,), dtype=_F32),
                         TensorArgType.INOUT,
@@ -580,6 +592,19 @@ def run(
 
         print("[ep_dispatch] running 2-chip dispatch DAG...")
         worker.run(orch_fn, args=None, config=CallConfig())
+
+        for i in range(len(recv_x_outs)):
+            recv_x_outs[i].copy_(shared["recv_x_outs"][i][1])
+        for i in range(len(recv_w_outs)):
+            recv_w_outs[i].copy_(shared["recv_w_outs"][i][1])
+        for i in range(len(recv_idx_outs)):
+            recv_idx_outs[i].copy_(shared["recv_idx_outs"][i][1])
+        for i in range(len(recv_count_outs)):
+            recv_count_outs[i].copy_(shared["recv_count_outs"][i][1])
+        for i in range(len(recv_y_outs)):
+            recv_y_outs[i].copy_(shared["recv_y_outs"][i][1])
+        for i in range(len(routed_y_outs)):
+            routed_y_outs[i].copy_(shared["routed_y_outs"][i][1])
 
         if platform.endswith("sim"):
             # Sim keeps intermediate child outputs (recv_y) device-local when they
@@ -605,6 +630,7 @@ def run(
         print("[ep_dispatch] all ranks matched golden ✅")
         return 0
     finally:
+        shared.clear()
         worker.close()
 
 
