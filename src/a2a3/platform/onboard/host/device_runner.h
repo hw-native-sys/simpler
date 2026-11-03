@@ -178,22 +178,6 @@ public:
     // `upload_chip_callable_buffer` is inherited from `DeviceRunnerBase`.
 
     /**
-     * Make the ACL context ready on the current thread.
-     *
-     * Calls aclInit() once per process (subsequent calls are idempotent and
-     * tolerate the ACL_ERROR_REPEAT_INITIALIZE sentinel) and aclrtSetDevice()
-     * on the current thread. This is the entry point for consumers that need
-     * to call acl* / Hccl* APIs (for example the comm_hccl backend) but
-     * intentionally do not want those modules to own ACL lifecycle themselves.
-     *
-     * Symmetric with finalize(): aclrtResetDevice + aclFinalize run there.
-     *
-     * @param device_id  Device ID to bind on the current thread.
-     * @return 0 on success, error code on failure.
-     */
-    int ensure_acl_ready(int device_id);
-
-    /**
      * Create a caller-owned aclrtStream for comm_* usage.
      *
      * Intended to back the ChipWorker Python wrapper's internal stream
@@ -241,11 +225,6 @@ private:
     // `host_dlopen_total_`) and inner struct types
     // (`ChipCallableBuffer`, `CallableState`) are
     // inherited from `DeviceRunnerBase`.
-
-    // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
-    // gates it behind this flag. finalize() drives aclFinalize only if we observed
-    // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.
-    bool acl_ready_{false};
 
     // Set true when an AICore launch/sync error (e.g. an op-timeout reaped by
     // STARS, surfaced as 507000/507018 at stream sync, or a 207001 launch

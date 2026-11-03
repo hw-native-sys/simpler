@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <new>
 #include <sstream>
@@ -1556,18 +1557,27 @@ int DeviceRunnerBase::setup_static_arena(
 }
 
 std::thread DeviceRunnerBase::create_thread(std::function<void()> fn) {
-    // A freshly spawned thread carries no CANN device context of its own, so
-    // this bind creates one rather than taking anything from the caller — it
-    // is the one rtSetDevice a borrowed-device context still owns, and it is
-    // scoped to a thread this runner created.
-    int dev_id = device_id_;
-    return std::thread([dev_id, fn = std::move(fn)]() {
-        rtSetDevice(dev_id);
-        fn();
+    int rc = execution_mode_latch().is_kernel() ? validate_current_context() : bind_current_thread(device_id_);
+    rtContext_t context = nullptr;
+    if (rc == 0) rc = rtCtxGetCurrent(&context);
+    if (rc != 0 || context == nullptr) throw std::runtime_error("Cannot create a device thread without its context");
+    std::promise<int> bound;
+    auto ready = bound.get_future();
+    std::thread thread([context, fn = std::move(fn), bound = std::move(bound)]() mutable {
+        const int bind_rc = rtCtxSetCurrent(context);
+        bound.set_value(bind_rc);
+        if (bind_rc == 0) fn();
     });
+    rc = ready.get();
+    if (rc != 0) {
+        thread.join();
+        throw std::runtime_error("Device thread context binding failed: " + std::to_string(rc));
+    }
+    return thread;
 }
 
 int DeviceRunnerBase::bind_current_thread(int device_id) {
+    if (execution_mode_latch().is_kernel()) return PTO_RUNTIME_ERR_INVALID_STATE;
     if (device_id < 0) {
         LOG_ERROR("Invalid device_id: %d", device_id);
         return PTO_RUNTIME_ERR_INTERNAL;
@@ -1580,14 +1590,91 @@ int DeviceRunnerBase::bind_current_thread(int device_id) {
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 
-    // CANN device context is per-thread, so every caller must attach explicitly.
-    int rc = rtSetDevice(device_id);
-    if (rc != 0) {
-        LOG_ERROR("rtSetDevice(%d) failed: %d", device_id, rc);
-        ACL_LOG_ERROR_DETAIL(rc);
-        return rc;
+    if (!rts_device_ref_ && !acl_device_ref_) {
+        const int rc = rtSetDevice(device_id);
+        if (rc != 0) {
+            LOG_ERROR("rtSetDevice(%d) failed: %d", device_id, rc);
+            ACL_LOG_ERROR_DETAIL(rc);
+            return rc;
+        }
+        rts_device_ref_ = true;
+        if (device_id_ == -1) device_id_ = device_id;
+        rtContext_t context = nullptr;
+        const int capture_rc = rtCtxGetCurrent(&context);
+        if (capture_rc != 0) return capture_rc;
+        if (context == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+        owned_context_ = context;
+        return 0;
     }
+    if (owned_context_ == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    return rtCtxSetCurrent(owned_context_);
+}
+
+int DeviceRunnerBase::ensure_acl_ready(int device_id) {
+    if (device_id < 0 || (device_id_ != -1 && device_id_ != device_id)) return PTO_RUNTIME_ERR_INVALID_STATE;
+    if ((rts_device_ref_ || acl_device_ref_) && owned_context_ == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+    const int mode_rc = execution_mode_latch().latch(SIMPLER_MODE_PROGRAM);
+    if (mode_rc != 0) return mode_rc;
+    if (!acl_ready_) {
+        const int rc = aclInit(nullptr);
+        constexpr int kAclRepeatInit = 100002;
+        if (rc != 0 && rc != kAclRepeatInit) return rc;
+        acl_init_owned_ = rc == 0;
+        acl_ready_ = true;
+    }
+    if (!acl_device_ref_) {
+        const int rc = aclrtSetDevice(device_id);
+        if (rc != 0) return rc;
+        acl_device_ref_ = true;
+        if (device_id_ == -1) device_id_ = device_id;
+        rtContext_t context = nullptr;
+        const int capture_rc = rtCtxGetCurrent(&context);
+        if (capture_rc != 0) return capture_rc;
+        if (context == nullptr) return PTO_RUNTIME_ERR_INVALID_STATE;
+        if (owned_context_ == nullptr) owned_context_ = context;
+    }
+    return bind_current_thread(device_id);
+}
+
+void DeviceRunnerBase::retire_owned_device_binding() noexcept {
+    owned_context_ = nullptr;
+    rts_device_ref_ = false;
+    acl_device_ref_ = false;
+    timeout_configured_ = false;
+}
+
+int DeviceRunnerBase::finalize_owned_acl() {
+    if (acl_init_owned_) {
+        const int rc = aclFinalize();
+        if (rc != 0) return rc;
+        acl_init_owned_ = false;
+    }
+    acl_ready_ = false;
     return 0;
+}
+
+int DeviceRunnerBase::release_owned_device_binding(
+    bool &reset_completed, const std::function<void(TeardownResetApi, int)> &record_reset
+) {
+    reset_completed = false;
+    bool released_any = false;
+    if (acl_device_ref_) {
+        const int rc = aclrtResetDevice(device_id_);
+        if (rc == 0) acl_device_ref_ = false;
+        if (record_reset) record_reset(TEARDOWN_RESET_API_ACL_RESET_DEVICE, rc);
+        if (rc != 0) return rc;
+        released_any = true;
+    }
+    if (rts_device_ref_) {
+        const int rc = rtDeviceReset(device_id_);
+        if (rc == 0) rts_device_ref_ = false;
+        if (record_reset) record_reset(TEARDOWN_RESET_API_RT_DEVICE_RESET, rc);
+        if (rc != 0) return rc;
+        released_any = true;
+    }
+    if (!rts_device_ref_ && !acl_device_ref_) retire_owned_device_binding();
+    reset_completed = released_any;
+    return finalize_owned_acl();
 }
 
 int DeviceRunnerBase::attach_current_thread(int device_id) {
@@ -1602,14 +1689,10 @@ int DeviceRunnerBase::attach_current_thread(int device_id) {
     int rc = bind_current_thread(device_id);
     if (rc != 0) return rc;
 
-    // Both writers of device_id_ — this one and adopt_borrowed_device — guard
-    // on the still-unset value, and both run before any prepare, execution or
-    // collector thread attaches. Prepared-run admission and execution
-    // subsequently attach different host threads, so repeated same-value
-    // writes here would still be a C++ data race.
-    if (device_id_ == -1) {
+    // Configuration failures remain sticky until this owned binding is released.
+    if (!timeout_configured_) {
         // A successful bind owns device state even if timeout configuration fails.
-        device_id_ = device_id;
+        timeout_configured_ = true;
         timeout_configuration_rc_ = PTO_RUNTIME_ERR_INVALID_STATE;
         clear_initialization_error();
         timeout_config_ = resolve_onboard_timeout_config();
@@ -1677,7 +1760,7 @@ void DeviceRunnerBase::abandon_shared_collectors_after_device_reset() {
 }
 
 int DeviceRunnerBase::finalize() {
-    if (device_id_ == -1) return 0;
+    if (device_id_ == -1 && !acl_init_owned_) return 0;
     const int rc = validate_current_context();
     if (rc != 0) return rc;
     return finalize_impl();

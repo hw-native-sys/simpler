@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <cstdint>
 using rtStream_t = void *;
+using rtContext_t = void *;
 using rtFuncHandle = void *;
 using rtError_t = int32_t;
 constexpr int RT_ERROR_NONE = 0;
@@ -44,6 +45,8 @@ int rtMemcpyAsync(
 int rtMemcpy(void *dst, uint64_t capacity, const void *src, uint64_t bytes, rtMemcpyKind_t kind);
 int rtSetDevice(int32_t device);
 int rtDeviceReset(int32_t device);
+int rtCtxGetCurrent(rtContext_t *context);
+int rtCtxSetCurrent(rtContext_t context);
 int rtStreamCreate(rtStream_t *stream, int32_t priority);
 int rtStreamDestroy(rtStream_t stream);
 int rtStreamQuery(rtStream_t stream);

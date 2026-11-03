@@ -49,6 +49,7 @@ public:
     Runner() {
         device_id_ = 0;
         timeout_configuration_rc_ = 0;
+        timeout_configured_ = true;
         max_block_dim_ = block_dim_ = 1;
         EXPECT_EQ(install_staged_workspace(), 0);
         EXPECT_TRUE(set_run_resource_grant(6));
