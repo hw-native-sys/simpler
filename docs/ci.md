@@ -7,7 +7,7 @@ The CI pipeline maps test categories (st, ut-py, ut-cpp) × hardware tiers to Gi
 Design principles:
 
 1. **Merge by runner, not by language** — Python and applicable C++ unit tests share setup cost and run as steps within a single job per runner tier. A runner with no platform-specific C++ tests does not carry an empty CTest step; currently `ut-a5` is Python-only.
-2. **Runner matches hardware tier** — no-hardware tests run on `ubuntu-latest`; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
+2. **Runner matches hardware tier** — no-hardware tests run on GitHub-hosted `ubuntu-24.04` and `macos-latest`; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
 3. **`--platform` is the only filter** — pytest uses `--platform` + the `requires_hardware` marker; ctest uses label `-LE` exclusion. No `-m st`, no `-m "not requires_hardware"`.
 4. **sim = no hardware** — `a2a3sim`/`a5sim` jobs run on github-hosted runners alongside unit tests.
 5. **Skip irrelevant platforms, and irrelevant suites** — `detect-changes` gates `st-sim-*` and `st-onboard-*` by platform, so pure-a5 PRs skip a2a3 scene-test runs and vice versa. **UT jobs are still not gated by platform** — unit tests cover shared contracts and the cost of a falsely-skipped regression outweighs the savings. They *are* gated by test category: a diff confined to `tests/st/` or `examples/` cannot break a unit test, and one confined to `tests/ut/` cannot break a scene test, because the two suites execute disjoint trees (`pytest examples tests/st` vs `pytest tests/ut` plus the C++ ctest) and no unit test reads `examples/` or `tests/st/`. Shared test infrastructure — the root `conftest.py`, `pyproject.toml`, `simpler_setup/`, `tests/lint/` — belongs to neither category and runs both.
@@ -66,11 +66,11 @@ timeouts remain a per-connection safeguard, not a wall-clock guarantee.
 
 ```text
 PullRequest
-  ├── pre-commit             (ubuntu-latest)
+  ├── pre-commit             (ubuntu-24.04)
   ├── packaging-matrix       (ubuntu + macOS)        — [needs !examples_only && !tests_only]
-  ├── profiling-flags-smoke  (ubuntu-latest)         — (a2a3_changed || a5_changed) && !examples_only && !tests_only
+  ├── profiling-flags-smoke  (ubuntu-24.04)         — (a2a3_changed || a5_changed) && !examples_only && !tests_only
   ├── ut                     (ubuntu + macOS)        — Python + C++ UT, no hardware [needs ut_affected]
-  ├── detect-changes         (reusable; ubuntu-latest in ci.yml) — outputs non_code_only, a{2a3,5}_changed, {st,ut}_affected, examples_only, tests_only
+  ├── detect-changes         (reusable; ubuntu-24.04 in ci.yml) — outputs non_code_only, a{2a3,5}_changed, {st,ut}_affected, examples_only, tests_only
   ├── st-sim-a2a3            (ubuntu + macOS)        — a2a3_changed && st_affected
   ├── st-sim-a5              (ubuntu + macOS)        — a5_changed && st_affected
   ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [needs ut_affected]
@@ -85,9 +85,9 @@ PullRequest
 
 | Job | Runner | What it runs |
 | --- | ------ | ------------ |
-| `ut` | `ubuntu-latest`, `macos-latest` | `pytest tests/ut` + `ctest -LE requires_hardware` |
-| `st-sim-a2a3` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a2a3sim` |
-| `st-sim-a5` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a5sim` |
+| `ut` | `ubuntu-24.04`, `macos-latest` | `pytest tests/ut` + `ctest -LE requires_hardware` |
+| `st-sim-a2a3` | `ubuntu-24.04`, `macos-latest` | `pytest examples tests/st --platform a2a3sim` |
+| `st-sim-a5` | `ubuntu-24.04`, `macos-latest` | `pytest examples tests/st --platform a5sim` |
 | `ut-a2a3` | a2a3 self-hosted | Hardware Python UT: `device_count` cases use resource scheduling, RuntimeBuilder integration runs before the xdist fanout, and remaining cases use one worker per allocated device. Then `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` and CANN example smokes. |
 | `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st -m "not sdma and not sdma_fault" --platform a2a3 --exclude-level 4 --device ...`, then separate SDMA-demo and `sdma_fault` device tasks, then adaptive-parallel DFX feature smokes |
 | `st-framework-eager-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --test-environment torch_npu --manual exclude --require-pto-isa --device ... --max-parallel 1 -p no:xdist` in one exclusive task, then verify plan/JUnit |
@@ -286,7 +286,7 @@ itself.
 
 ### Sim jobs on CPU-constrained runners
 
-Sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on `ubuntu-latest`, whose standard
+The Ubuntu cells of sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on `ubuntu-24.04`, whose standard
 GitHub-hosted runner currently has **4 vCPUs**. `--device 0-15` is still the
 right choice for the **pool size** (some L3 cases need several virtual ids), but
 the default `--max-parallel auto` caps the in-flight subprocess count to
@@ -295,7 +295,7 @@ the default `--max-parallel auto` caps the in-flight subprocess count to
 quota, so this is the true core count, not a container limit.
 
 ```bash
-# Sim: --max-parallel auto resolves to 4 on a standard ubuntu-latest runner
+# Sim: --max-parallel auto resolves to 4 on a standard ubuntu-24.04 runner
 pytest examples tests/st --platform a2a3sim --device 0-15
 
 # Throttle further on a CPU-starved runner: 4 concurrent cases (each forking
@@ -476,7 +476,7 @@ Three hardware tiers, applied to all test categories. See [testing.md](testing.m
 
 | Tier | CI Runner | Job examples |
 | ---- | --------- | ------------ |
-| No hardware | `ubuntu-latest` | `ut`, `st-sim-*` |
+| No hardware | `ubuntu-24.04`, `macos-latest` | `ut`, `st-sim-*` |
 | Platform-specific (a2a3) | `[self-hosted, a2a3]` | `ut-a2a3`, `st-onboard-a2a3` |
 | Platform-specific (a5) | `[self-hosted, a5]` | `ut-a5`, `st-onboard-a5` |
 

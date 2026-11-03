@@ -847,7 +847,9 @@ TEST(ProfilerBaseTest, FailedBufferCopyLeavesTheEntryUnacknowledged) {
             buffer_copy_attempts.fetch_add(1, std::memory_order_relaxed);
             if (copy_buffer_fails.load(std::memory_order_relaxed)) return -1;
         }
-        std::memcpy(dst, src, size);
+        // This fixture identity-maps device and host storage. Copying a header
+        // field onto itself can write a stale value over a concurrent publish.
+        if (dst != src) std::memcpy(dst, src, size);
         return 0;
     };
 
@@ -888,7 +890,7 @@ TEST(ProfilerBaseTest, PermanentlyFailingCopyIsRetiredSoQuiesceCompletes) {
     uint64_t buffer = 0;
     auto copy = [&](void *dst, const void *src, size_t size) {
         if (src == &buffer) return -1;
-        std::memcpy(dst, src, size);
+        if (dst != src) std::memcpy(dst, src, size);
         return 0;
     };
 

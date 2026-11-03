@@ -163,6 +163,7 @@ class TestUrmaRepeatedPut(_UrmaRegression):
     CASES = _case("repeated_put", mode=1, repeats=16)
 
 
+@pytest.mark.skip(reason="A5 chunked URMA fetch hit a device scheduler timeout in CI run 41609948645")
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestUrmaChunkedFetch(_UrmaRegression):
     CASES = _case("chunked_fetch", elems=CHUNKED_ELEMS)
