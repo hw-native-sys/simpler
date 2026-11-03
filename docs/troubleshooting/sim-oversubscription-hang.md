@@ -44,7 +44,7 @@ Two distinct signatures, both only on sim and only under load:
    `orch_error_code=` / `error detail:` pair accompanies it. A failure raised by
    the host runtime would report `-1000` or below.
 
-Both appear intermittently in `st-sim-*` on `ubuntu-latest` (≈4 vCPU) and are
+Both appear intermittently in `st-sim-*` on `ubuntu-24.04` (≈4 vCPU) and are
 easy to trip on any box running concurrent sim tests.
 
 ## Root Cause
