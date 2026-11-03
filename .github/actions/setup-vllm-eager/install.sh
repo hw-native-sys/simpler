@@ -15,6 +15,9 @@
 #   * vllm-ascend source install: SETUPTOOLS_SCM_PRETEND_VERSION=0.20.2rc1
 #   * triton-ascend 3.2.1: Huawei Ascend mirror, numpy 1.26.4
 #
+# Custom vllm_ascend_C kernels are opt-in (COMPILE_CUSTOM_KERNELS=1) and need
+# clang/clang++; the validated configuration leaves them disabled.
+#
 # The caller must source CANN 9.0.0 and NNAL/ATB before invoking this script.
 set -euo pipefail
 
@@ -22,7 +25,7 @@ ROOT=${GITHUB_WORKSPACE:-${ROOT:-$(pwd)}}
 SRC_ROOT=${VLLM_SOURCE_ROOT:-${RUNNER_TEMP:-/tmp}/vllm-src}
 VENV=${VLLM_VENV:-$ROOT/.venv-vllm}
 PYTHON=${VLLM_PYTHON:-python3}
-COMPILE_CUSTOM_KERNELS=${COMPILE_CUSTOM_KERNELS:-1}
+COMPILE_CUSTOM_KERNELS=${COMPILE_CUSTOM_KERNELS:-0}
 MAX_JOBS=${MAX_JOBS:-32}
 VLLM_SRC=${VLLM_SOURCE_DIR:-$SRC_ROOT/vllm-v0.20.2}
 VLLM_ASCEND_SRC=${VLLM_ASCEND_SOURCE_DIR:-$SRC_ROOT/vllm-ascend-v0.20.2rc1}
@@ -139,6 +142,19 @@ stage=freeze
 log freeze
 python -m pip freeze --all | tee "$REPORT/freeze.txt"
 python -m pip check > "$REPORT/pip-check.txt" 2>&1 || true
+# The validated stack has exactly two known deviations: triton-ascend pulls
+# the upstream triton distribution name although triton-ascend provides the
+# module, and opencv 4.13 metadata asks for numpy>=2 while the stack pins
+# 1.26.4 for triton-ascend (cv2 is verified to import below). Any other
+# conflict involving a declared package is a new resolver deviation.
+known_deviations='^(triton-ascend|opencv-python-headless) '
+declared_stack='(^|[^a-z-])(torch|torch-npu|vllm|vllm-ascend|triton-ascend|numpy|opencv-python-headless)([^a-z-]|$)'
+unexpected=$(grep -E "$declared_stack" "$REPORT/pip-check.txt" | grep -vE "$known_deviations" || true)
+if [ -n "$unexpected" ]; then
+  echo "ERROR: unexpected dependency conflict in the declared vLLM stack:" >&2
+  printf '%s\n' "$unexpected" >&2
+  exit 1
+fi
 python - "$REPORT" <<'PY'
 import importlib
 import json

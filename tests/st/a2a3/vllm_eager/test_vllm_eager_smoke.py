@@ -15,9 +15,10 @@ import os
 import re
 import subprocess
 import sys
-from pathlib import Path
 
 import pytest
+
+from simpler_setup.vllm_eager import atb_home
 
 pytestmark = [
     pytest.mark.requires_hardware,
@@ -29,23 +30,6 @@ REQUESTS = 16
 TOKENS = 2
 
 
-def _atb_home() -> Path:
-    candidates = []
-    atb_env = os.environ.get("ATB_ENV")
-    if atb_env:
-        candidates.append(Path(atb_env).resolve().parent)
-    for name in ("ATB_HOME_PATH", "ATB_HOME"):
-        value = os.environ.get(name)
-        if value:
-            candidates.append(Path(value))
-    candidates.append(Path("/usr/local/Ascend/nnal/atb/latest"))
-    for base in candidates:
-        for candidate in (base, base / "latest", *base.parents):
-            if (candidate / "version.info").is_file():
-                return candidate
-    return candidates[0]
-
-
 def test_target_versions_are_pinned():
     assert importlib.metadata.version("torch") == "2.10.0+cpu"
     assert importlib.metadata.version("torch-npu") == "2.10.0"
@@ -53,8 +37,9 @@ def test_target_versions_are_pinned():
     assert importlib.metadata.version("vllm-ascend") == "0.20.2rc1"
     assert importlib.metadata.version("triton-ascend") == "3.2.1"
     assert importlib.metadata.version("numpy") == "1.26.4"
-    version_file = _atb_home() / "version.info"
-    assert version_file.is_file(), f"ATB version.info not found under {_atb_home()}"
+    home = atb_home()
+    version_file = home / "version.info"
+    assert version_file.is_file(), f"ATB version.info not found under {home}"
     version = version_file.read_text()
     match = re.search(r"Ascend-cann-atb\s*:\s*([0-9]+\.[0-9]+(?:\.[0-9]+)?)", version)
     assert match is not None, version

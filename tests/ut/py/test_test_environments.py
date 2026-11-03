@@ -528,6 +528,16 @@ def test_target_version_profile_reuses_the_declared_framework_suite():
     assert requirements["torch-npu"] == "2.10.0"
 
 
+def test_suite_must_name_a_registered_profile(monkeypatch):
+    monkeypatch.setitem(
+        test_environments.ENVIRONMENTS,
+        "broken",
+        test_environments.TestEnvironment("direct", suite="missing"),
+    )
+    with pytest.raises(ValueError, match="unknown suite"):
+        test_environments.declared_suite("broken")
+
+
 def test_target_version_profile_selects_only_the_declared_framework_suite(tmp_path):
     source = """
 import pytest

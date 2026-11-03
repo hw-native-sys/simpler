@@ -76,7 +76,10 @@ _ASCEND_ROOT = Path("/usr/local/Ascend")
 def _environment(name: str) -> TestEnvironment:
     if name not in ENVIRONMENTS:
         raise ValueError(f"Unknown test environment {name!r}; choose from {', '.join(ENVIRONMENTS)}")
-    return ENVIRONMENTS[name]
+    profile = ENVIRONMENTS[name]
+    if profile.suite is not None and profile.suite not in ENVIRONMENTS:
+        raise ValueError(f"Test environment {name!r} declares unknown suite {profile.suite!r}")
+    return profile
 
 
 def environment_for_item(item) -> str:

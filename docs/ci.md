@@ -433,18 +433,21 @@ decode smoke in separate processes. The same exclusive task then runs the
 target-version framework eager suite through the `torch_npu_2_10` profile, so
 the existing `test_environment("torch_npu")` declarations are qualified on
 Torch-NPU 2.10.0 with their own plan/JUnit receipt. The heavy cases are marked
-`manual`, so Daily includes them while ordinary PR sweeps exclude them.
+`manual`, so Daily includes them while ordinary PR sweeps exclude them. The
+Daily job is skipped while `VLLM_MODEL_DIR` is unconfigured: its inputs are
+maintainer-owned repository variables, and without them the job would install
+the whole stack and then fail on the missing model.
 
 The runner must provide the model, verified HBG artifact and frozen prompt IDs
 through the `VLLM_MODEL_DIR`, `VLLM_ARTIFACT` and `VLLM_PROMPT_IDS` repository
-variables; `VLLM_ADAPTER_ROOT` selects the adapter checkout, or the
+variables. `VLLM_ADAPTER_ROOT` selects the adapter checkout, or the
 `qwen3_14b_serving_effective` directory that contains the fixed-shape adapter
-runner. The checkout must support the official stage-0 release layout; the #2605
-head `591f003b` alone requires the legacy `hbg_artifact_manifest.json` and a
-4096-row rope cache, so it cannot consume this release unchanged. Pin the
-adapter checkout from #2758 (`33d266bd555980875fa9a0e5e9c65ef7728bcb9e`) or a
-later revision that keeps the stage-0 contract; its runner validates the
-canonical 3338-token prompt
+runner; when it is unset the in-repo
+`examples/a2a3/host_build_graph/qwen3_14b_serving_effective/run_vllm_eager.py`
+(merged with #2758) is used. A checkout that supports the official stage-0
+release layout is required; an adapter predating #2758 needs the legacy
+`hbg_artifact_manifest.json` and a 4096-row rope cache, so it cannot consume
+this release unchanged. Its runner validates the canonical 3338-token prompt
 (`83d41b1d59bda5281cf2489944632d71247d38c4fdf37bf347d4935297d4d00d`), so
 `VLLM_PROMPT_IDS` must name that prompt file rather than another
 3338-token workload.
@@ -452,6 +455,20 @@ canonical 3338-token prompt
 `VLLM_SOURCE_DIR` / `VLLM_ASCEND_SOURCE_DIR` may point at cached source
 checkouts. Missing paths, missing packages, wrong package versions, or an ATB
 line other than 9.0 fail the selected cases; they are not reported as skips.
+
+The action resolves the runner through the same helper the ST fixture uses, so
+the executed adapter and the retained receipt cannot diverge: `identity.json`
+records the resolved runner path, its sha256, and — when it is a checkout — the
+checkout HEAD and whether the runner file is modified. The staged install also
+records its deliberate dependency overrides: `numpy==1.26.4` is pinned for
+triton-ascend, opencv 4.13 is installed with `--no-deps` even though its
+metadata asks for `numpy>=2`, and `import cv2` verifies the combination. The
+`pip check` output is retained, and the install fails if a declared package
+(Torch, vLLM, triton-ascend, NumPy, OpenCV) reports any deviation beyond those
+two known ones. Custom `vllm_ascend_C` kernels are off by default
+(`compile_custom_kernels: "0"`); enabling the build requires clang/clang++ and
+has not been validated in this job.
+
 The job retains `identity.json`, the environment status/freeze files, the
 plan/JUnit and per-case logs. Both backends run the 16-request cohort (Gate 4a)
 and one active request with isolated fixed-shape padding (Gate 4b) through the

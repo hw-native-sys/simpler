@@ -24,6 +24,7 @@ import vllm
 import vllm_ascend
 
 from simpler_setup.test_environments import preflight
+from simpler_setup.vllm_eager import adapter_identity, adapter_runner, atb_home
 
 # Import eagerly so identity fails before the exclusive task if a backend is
 # missing; the tuple also makes the imported modules intentional.
@@ -80,26 +81,7 @@ def _optional_file(path):
     return {"path": str(candidate), "sha256": None}
 
 
-def _atb_home():
-    candidates = []
-    atb_env = os.environ.get("ATB_ENV")
-    if atb_env:
-        candidates.append(Path(atb_env).resolve().parent)
-    for name in ("ATB_HOME_PATH", "ATB_HOME"):
-        value = os.environ.get(name)
-        if value:
-            candidates.append(Path(value))
-    candidates.append(Path("/usr/local/Ascend/nnal/atb/latest"))
-    for base in candidates:
-        for candidate in (base, base / "latest", *base.parents):
-            if (candidate / "version.info").is_file():
-                return candidate
-    return candidates[0] if candidates else None
-
-
 def _atb_version(home):
-    if home is None:
-        return None
     version_file = home / "version.info"
     return version_file.read_text().strip() if version_file.is_file() else None
 
@@ -108,7 +90,7 @@ def main():
     source = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     assert _task_interface.__build_commit__ == source, (_task_interface.__build_commit__, source)
     environment = preflight("vllm_torch_npu")
-    atb_home = _atb_home()
+    atb = atb_home()
     record = {
         "source": source,
         "python": sys.version,
@@ -119,11 +101,12 @@ def main():
         "distributions": {name: _distribution_identity(name) for name in _DISTRIBUTIONS if _is_installed(name)},
         "setup": {
             "cann_home": os.environ.get("ASCEND_HOME_PATH"),
-            "atb_home": str(atb_home) if atb_home else None,
-            "atb_version": _atb_version(atb_home),
+            "atb_home": str(atb),
+            "atb_version": _atb_version(atb),
             "vllm_source_dir": os.environ.get("VLLM_SOURCE_DIR"),
             "vllm_ascend_source_dir": os.environ.get("VLLM_ASCEND_SOURCE_DIR"),
         },
+        "adapter": adapter_identity(adapter_runner()),
         "inputs": {
             "model": _optional_file(os.environ.get("VLLM_MODEL_DIR")),
             "artifact": _optional_file(os.environ.get("VLLM_ARTIFACT")),

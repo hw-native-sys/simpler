@@ -11,9 +11,9 @@ inputs:
     required: false
     default: ""
   compile_custom_kernels:
-    description: Build vllm-ascend custom kernels (requires clang/clang++ and ATB).
+    description: Build vllm-ascend custom kernels (requires clang/clang++; not yet validated).
     required: false
-    default: "1"
+    default: "0"
   atb_env:
     description: NNAL/ATB set_env.sh; discovered under /usr/local/Ascend/nnal/atb when empty.
     required: false
@@ -26,9 +26,6 @@ outputs:
   atb_env:
     description: Environment script sourced for NNAL/ATB.
     value: ${{ steps.toolchain.outputs.atb_env }}
-  venv:
-    description: Isolated vLLM virtual environment.
-    value: .venv-vllm
 
 runs:
   using: composite

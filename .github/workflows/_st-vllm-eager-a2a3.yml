@@ -45,10 +45,10 @@ on:
         type: string
         default: ""
       compile_custom_kernels:
-        description: Build vllm-ascend custom kernels.
+        description: Build vllm-ascend custom kernels (not yet validated; off by default).
         required: false
         type: string
-        default: "1"
+        default: "0"
       vllm_source_dir:
         description: Cached vLLM v0.20.2 checkout.
         required: false
@@ -64,7 +64,7 @@ jobs:
   run:
     name: st-vllm-eager-a2a3
     runs-on: ${{ fromJSON(inputs.runs_on) }}
-    timeout-minutes: 150
+    timeout-minutes: 180
     env:
       TORCH_DEVICE_BACKEND_AUTOLOAD: "0"
       SIMPLER_SCHEDULER_TIMEOUT_MS: "60000"
@@ -107,11 +107,12 @@ jobs:
           source "$ATB_ENV"
           mkdir -p outputs/vllm-eager-ci
           git rev-parse HEAD | tee outputs/vllm-eager-ci/source.txt
+          task-submit --list
           task-submit --env CANN_ENV --env ATB_ENV --env MANUAL_MODE \
             --env VLLM_MODEL_DIR --env VLLM_ARTIFACT --env VLLM_PROMPT_IDS --env VLLM_ADAPTER_ROOT \
             --env VLLM_SOURCE_DIR --env VLLM_ASCEND_SOURCE_DIR \
-            --timeout 7200 --max-time 7200 --device auto --device-num 1 \
-            --run "source \"\$CANN_ENV\" && source \"\$ATB_ENV\" && .venv-vllm/bin/python .github/actions/setup-vllm-eager/identity.py && .venv-vllm/bin/python -m pytest examples tests/st --platform a2a3 --test-environment vllm_torch_npu --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/vllm-eager-ci/pytest --junitxml outputs/vllm-eager-ci/results.xml && SIMPLER_SCHEDULER_TIMEOUT_MS=2000 SIMPLER_OP_EXECUTE_TIMEOUT_US=3000000 SIMPLER_STREAM_SYNC_TIMEOUT_MS=4000 .venv-vllm/bin/python -m pytest examples tests/st --platform a2a3 --test-environment torch_npu_2_10 --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/vllm-eager-ci/pytest-framework-eager --junitxml outputs/vllm-eager-ci/results-framework-eager.xml"
+            --timeout 3600 --max-time 3600 --device auto --device-num 1 \
+            --run "source \"\$CANN_ENV\" && source \"\$ATB_ENV\" && .claude/skills/onboard-arch-precheck/check.sh a2a3 && .venv-vllm/bin/python .github/actions/setup-vllm-eager/identity.py && .venv-vllm/bin/python -m pytest examples tests/st --platform a2a3 --test-environment vllm_torch_npu --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/vllm-eager-ci/pytest --junitxml outputs/vllm-eager-ci/results.xml && SIMPLER_SCHEDULER_TIMEOUT_MS=2000 SIMPLER_OP_EXECUTE_TIMEOUT_US=3000000 SIMPLER_STREAM_SYNC_TIMEOUT_MS=4000 .venv-vllm/bin/python -m pytest examples tests/st --platform a2a3 --test-environment torch_npu_2_10 --manual \"\$MANUAL_MODE\" --require-pto-isa --device \$TASK_DEVICE --max-parallel 1 -p no:xdist -v -s --basetemp outputs/vllm-eager-ci/pytest-framework-eager --junitxml outputs/vllm-eager-ci/results-framework-eager.xml"
           .venv-vllm/bin/python -m simpler_setup.test_environments verify outputs/vllm-eager-ci/results.plan.json outputs/vllm-eager-ci/results.xml
           .venv-vllm/bin/python -m simpler_setup.test_environments verify outputs/vllm-eager-ci/results-framework-eager.plan.json outputs/vllm-eager-ci/results-framework-eager.xml
 

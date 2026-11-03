@@ -57,6 +57,10 @@ jobs:
       manual_mode: include
 
   st-vllm-eager-a2a3:
+    # The runner inputs are maintainer-owned repository variables. Until they
+    # are configured the job would install the whole stack and then fail on the
+    # missing model, so it stays skipped instead of reddening Daily.
+    if: ${{ vars.VLLM_MODEL_DIR != '' }}
     uses: ./.github/workflows/_st-vllm-eager-a2a3.yml
     with:
       runs_on: '["self-hosted","a2a3"]'

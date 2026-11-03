@@ -19,8 +19,9 @@ from pathlib import Path
 
 import pytest
 
+from simpler_setup.vllm_eager import adapter_runner as _resolve_adapter_runner
+
 _ROOT = Path(__file__).resolve().parents[4]
-_ADAPTER_CASE = Path("examples/a2a3/host_build_graph/qwen3_14b_serving_effective")
 
 
 @dataclass(frozen=True)
@@ -44,16 +45,10 @@ def _required(name: str) -> Path:
 
 @pytest.fixture(scope="session")
 def adapter_runner() -> Path:
-    root = Path(os.environ.get("VLLM_ADAPTER_ROOT") or _ROOT)
-    candidates = [root / "run_vllm_eager.py", root / _ADAPTER_CASE / "run_vllm_eager.py"]
-    runner = next((candidate for candidate in candidates if candidate.is_file()), None)
-    if runner is None:
-        tried = ", ".join(str(candidate) for candidate in candidates)
-        pytest.fail(
-            f"vLLM adapter runner not found under {root} (tried {tried}); set VLLM_ADAPTER_ROOT to the "
-            "pinned adapter checkout or its qwen3_14b_serving_effective directory"
-        )
-    return runner
+    try:
+        return _resolve_adapter_runner(_ROOT)
+    except ValueError as error:
+        pytest.fail(str(error))
 
 
 @pytest.fixture(scope="session")
