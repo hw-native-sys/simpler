@@ -18,7 +18,8 @@ namespace pto::comm::sdma {
 inline constexpr uint32_t kSdmaMaxChannelGroups = 48;
 class SdmaWorkspaceManager {
 public:
-    bool Init() { throw std::logic_error("SDMA is outside this lifecycle fixture"); }
+    static int GetWorkspaceSize(uint64_t *) { throw std::logic_error("SDMA is outside this lifecycle fixture"); }
+    bool Init(void *, uint64_t) { throw std::logic_error("SDMA is outside this lifecycle fixture"); }
     void *GetWorkspaceAddr() const { return nullptr; }
     uint64_t GetWorkspaceSize() const { return 0; }
 };

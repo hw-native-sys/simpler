@@ -202,7 +202,8 @@ static void test_peer_import_rollback(CommHandle h, uint64_t &next_id) {
         assert(imported_handles.size() == held_imports && peer_mappings.size() == held_peers);
     }
     assert(comm_release_domain_windows(h, held_id, 2, 0) == 0);
-    assert(mappings.empty() && physical_handles == 0 && imported_handles.empty() && peer_mappings.empty());
+    assert(mappings.size() == 1 && mappings.count(h->sdma_workspace->GetWorkspaceAddr()) == 1);
+    assert(physical_handles == 0 && imported_handles.empty() && peer_mappings.empty());
     h->nranks = old_nranks;
 }
 
@@ -302,6 +303,14 @@ int main() {
         assert(live[1] == 1 && live[0] == 1);
         const auto held_mappings = mappings.size();
         const int held_physical = physical_handles;
+        zero_size_engine = 1;
+        const int starts = started[1];
+        uint64_t zero_id = 0, zero_ctx = 0;
+        assert(allocate(3, zero_id, zero_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
+        assert(started[1] == starts);
+        assert(comm_abort_domain_windows(h, zero_id, h->domain_allocations.at(zero_id)->nranks, 0) == 0);
+        assert(mappings.size() == held_mappings && physical_handles == held_physical);
+        zero_size_engine = -1;
         for (int failure : {0, 1, 2, 3, 4}) {
             invalid_addr_engine = failure == 3 ? 1 : -1;
             invalid_size_engine = failure == 4 ? 1 : -1;
@@ -332,6 +341,14 @@ int main() {
         assert(live[2] == 1);
         const auto held_mappings = mappings.size();
         const int held_physical = physical_handles;
+        zero_size_engine = 2;
+        const int starts = started[2];
+        uint64_t zero_id = 0, zero_ctx = 0;
+        assert(allocate(4, zero_id, zero_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
+        assert(started[2] == starts);
+        assert(comm_abort_domain_windows(h, zero_id, h->domain_allocations.at(zero_id)->nranks, 0) == 0);
+        assert(mappings.size() == held_mappings && physical_handles == held_physical);
+        zero_size_engine = -1;
         for (int failure : {0, 1, 2}) {
             fail_engine = failure == 0 ? 2 : -1;
             throw_engine = failure == 1 ? 2 : -1;
@@ -360,7 +377,8 @@ int main() {
     release(first);
     assert(allocate(7, first, first_ctx) != 0);
     assert(allocate(8, first, first_ctx) != 0);
-    assert(mappings.empty() && physical_handles == 0);
+    assert(mappings.size() == 1 && mappings.count(h->sdma_workspace->GetWorkspaceAddr()) == 1);
+    assert(physical_handles == 0);
     test_peer_import_rollback(h, next_id);
     // Finalization must also reclaim domains whose caller skipped explicit release.
     assert(allocate(1, first, first_ctx) == 0);
@@ -387,6 +405,12 @@ int main() {
     h->nranks = 1;
     h->rootinfo_path = std::string(folder) + "/second";
     h->hccl_comm = reinterpret_cast<HcclComm>(1);
+    zero_size_engine = 0;
+    const int starts = started[0];
+    assert(allocate(1, first, first_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
+    assert(comm_abort_domain_windows(h, first, 1, 0) == 0);
+    assert(started[0] == starts && !h->sdma_workspace && mappings.empty() && physical_handles == 0);
+    zero_size_engine = -1;
     throw_engine = 0;
     assert(allocate(1, first, first_ctx) == COMM_INITIALIZATION_ABORT_REQUIRED);
     assert(comm_abort_domain_windows(h, first, 1, 0) == 0);
