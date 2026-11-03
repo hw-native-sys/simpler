@@ -18,7 +18,8 @@
 #include "arg_direction.h"
 
 struct DumpArgSelection {
-    static_assert(CORE_MAX_TENSOR_ARGS + CORE_MAX_SCALAR_ARGS <= 64, "dump arg mask assumes at most 64 arguments");
+    // The diagnostic wire mask selects only slots 0..63, independently of the
+    // callable capacity. Higher indices are rejected by is_valid_arg_index().
 
     void clear() {
         dump_arg_mask_ = 0;

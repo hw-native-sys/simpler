@@ -41,10 +41,8 @@ namespace simpler::dfx::dep_gen_runs {
 /**
  * Bytes per record block.
  *
- * `sizeof(DepGenRecord)` is 4736 B, so a 64 KiB block holds 13 records and
- * wastes 3948 B (6.0%). Larger blocks waste less and allocate less often; this
- * is the same 64 KiB the other retained collectors use, kept for uniformity
- * rather than tuned.
+ * A 64 KiB block holds one 33664-byte DepGenRecord. The block size matches
+ * the retained collectors; records stay contiguous and cache-line aligned.
  */
 inline constexpr size_t kRecordBlockBytes = 64 * 1024;
 inline constexpr size_t kRecordsPerBlock = kRecordBlockBytes / sizeof(DepGenRecord);

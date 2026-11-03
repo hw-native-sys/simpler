@@ -643,3 +643,52 @@ def test_clean_prepare_refusal_releases_only_its_source_reservation(l2, monkeypa
     worker._submit_l2_locked(3, arguments(backing), CallConfig()).wait()
     backing.close()
     assert backing.closed
+
+
+@pytest.mark.parametrize("read_first", [False, True])
+def test_exact_device_read_alias_preserves_the_same_address(l2, read_first):
+    """A dense reshape of a device workspace observes the same task's writes."""
+    worker, calls, _ = l2
+    buffer = register_buffer(worker)
+    pair = [
+        (buffer.tensor((4,), DataType.FLOAT32), TensorArgType.INOUT),
+        (buffer.tensor((2, 2), DataType.FLOAT32), TensorArgType.INPUT),
+    ]
+    if read_first:
+        pair.reverse()
+    args = TaskArgs()
+    for tensor, tag in pair:
+        args.add_tensor(tensor, tag)
+    worker._submit_l2_locked(3, args, CallConfig())
+    assert len(calls) == 1
+    assert calls[0].tensor(0).data == calls[0].tensor(1).data == buffer.base
+
+
+@pytest.mark.parametrize("read_first", [False, True])
+def test_partial_device_read_write_alias_is_rejected_in_both_orders(l2, read_first):
+    """Parameter order cannot hide a partial overlap with a writable argument."""
+    worker, calls, _ = l2
+    buffer = register_buffer(worker)
+    pair = [
+        (buffer.tensor((4,), DataType.FLOAT32), TensorArgType.INOUT),
+        (buffer.tensor((4,), DataType.FLOAT32, byte_offset=8), TensorArgType.INPUT),
+    ]
+    if read_first:
+        pair.reverse()
+    args = TaskArgs()
+    for tensor, tag in pair:
+        args.add_tensor(tensor, tag)
+    with pytest.raises(ValueError, match="overlapping bytes"):
+        worker._submit_l2_locked(3, args, CallConfig())
+    assert not calls
+
+
+def test_exact_device_write_write_alias_still_rejected(l2):
+    worker, calls, _ = l2
+    buffer = register_buffer(worker)
+    args = TaskArgs()
+    args.add_tensor(buffer.tensor((4,), DataType.FLOAT32), TensorArgType.INOUT)
+    args.add_tensor(buffer.tensor((2, 2), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+    with pytest.raises(ValueError, match="overlapping bytes"):
+        worker._submit_l2_locked(3, args, CallConfig())
+    assert not calls

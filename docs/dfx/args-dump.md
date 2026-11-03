@@ -84,6 +84,10 @@ rather than numbered:
 > Plain `hybrid` metadata, including inline scalar values, does not consume
 > tensor payload and remains available.
 
+The selective `partial` and `hybrid` argument masks address slots 0–63.
+The Core callable capacity is 256 tensor arguments; higher slots require
+`full` mode for payload capture. They remain visible as metadata in `hybrid`.
+
 `hybrid` is the capture mode used by
 `python -m simpler_setup.tools.core_swimlane` to build a Core swimlane simulator replay:
 it provides complete per-task argument metadata without dumping every tensor's

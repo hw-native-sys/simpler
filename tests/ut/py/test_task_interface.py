@@ -1509,6 +1509,23 @@ class TestCoreCallable:
         assert cc.sig(2) == ArgDirection.SCALAR
         assert cc.binary_size == 4
 
+    @pytest.mark.parametrize("count", [33, 132, 256])
+    def test_large_tensor_signature_round_trip(self, count):
+        signature = [ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT]
+        signature = [signature[i % len(signature)] for i in range(count)]
+        cc = CoreCallable.build(signature=signature, binary=b"\x12\x34")
+        assert cc.sig_count == count
+        assert [cc.sig(i) for i in range(count)] == signature
+        assert cc.binary_size == 2
+        # CoreCallable::binary_data_offset() is pinned by callable.h's ABI assertion.
+        binary_offset = 1088
+        assert cc.buffer_size() >= binary_offset + cc.binary_size
+        assert ctypes.string_at(cc.buffer_ptr() + binary_offset, cc.binary_size) == b"\x12\x34"
+
+    def test_tensor_signature_over_capacity(self):
+        with pytest.raises((ValueError, RuntimeError)):
+            CoreCallable.build(signature=[ArgDirection.IN] * 257, binary=b"")
+
     def test_empty_signature(self):
         cc = CoreCallable.build(signature=[], binary=b"\xab")
         assert cc.sig_count == 0

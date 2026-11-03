@@ -225,12 +225,12 @@ static_assert(
 static_assert(offsetof(ChipCallable, storage_) == 17568, "ChipCallable wire ABI: storage offset changed");
 static_assert(sizeof(ChipCallable) == 17568, "ChipCallable wire ABI: header size changed");
 static_assert(offsetof(CoreCallable, signature_) == 0, "CoreCallable wire ABI: signature offset changed");
-static_assert(offsetof(CoreCallable, sig_count_) == 128, "CoreCallable wire ABI: sig_count offset changed");
-static_assert(offsetof(CoreCallable, binary_size_) == 132, "CoreCallable wire ABI: binary_size offset changed");
-static_assert(offsetof(CoreCallable, resolved_addr_) == 136, "CoreCallable wire ABI: resolved_addr offset changed");
-static_assert(offsetof(CoreCallable, storage_) == 144, "CoreCallable wire ABI: storage offset changed");
-static_assert(sizeof(CoreCallable) == 144, "CoreCallable wire ABI: header size changed");
-static_assert(CoreCallable::binary_data_offset() == 192, "CoreCallable wire ABI: binary data offset changed");
+static_assert(offsetof(CoreCallable, sig_count_) == 1024, "CoreCallable wire ABI: sig_count offset changed");
+static_assert(offsetof(CoreCallable, binary_size_) == 1028, "CoreCallable wire ABI: binary_size offset changed");
+static_assert(offsetof(CoreCallable, resolved_addr_) == 1032, "CoreCallable wire ABI: resolved_addr offset changed");
+static_assert(offsetof(CoreCallable, storage_) == 1040, "CoreCallable wire ABI: storage offset changed");
+static_assert(sizeof(CoreCallable) == 1040, "CoreCallable wire ABI: header size changed");
+static_assert(CoreCallable::binary_data_offset() == 1088, "CoreCallable wire ABI: binary data offset changed");
 
 // ============================================================================
 // Factory: make_callable for static leaf

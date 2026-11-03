@@ -115,7 +115,29 @@ INTEGER_DTYPES = frozenset(
     }
 )
 
-KARGS_SLOTS = 50  # MAX_TENSOR_ARGS(16) + MAX_SCALAR_ARGS(32) + 2
+
+def _core_arg_limits():
+    """Read the same capacity definitions used by the replay kernel headers.
+
+    PROJECT_ROOT resolves source/editable trees and packaged wheel assets.
+    Refuse an unrecognized declaration instead of falling back to a stale ABI.
+    """
+    header = PROJECT_ROOT / "src/common/task_interface/arg_direction.h"
+    source = header.read_text()
+    limits = []
+    for name in ("CORE_MAX_TENSOR_ARGS", "CORE_MAX_SCALAR_ARGS"):
+        match = re.search(rf"^inline constexpr int {name}\s*=\s*(\d+)\s*;", source, re.MULTILINE)
+        if match is None:
+            raise ValueError(f"cannot read {name} from the shared Core argument ABI")
+        limits.append(int(match.group(1)))
+    return tuple(limits)
+
+
+CORE_TENSOR_SLOTS, CORE_SCALAR_SLOTS = _core_arg_limits()
+KARGS_PAYLOAD_SLOTS = CORE_TENSOR_SLOTS + CORE_SCALAR_SLOTS
+KARGS_LOCAL_CONTEXT = KARGS_PAYLOAD_SLOTS
+KARGS_GLOBAL_CONTEXT = KARGS_LOCAL_CONTEXT + 1
+KARGS_SLOTS = KARGS_GLOBAL_CONTEXT + 1
 
 # Per-arch build parameters. soc = msprof/simulator SoC version (and the
 # $CANN/aarch64-linux/simulator/<soc>/lib path); aicore_arch = bisheng
@@ -143,8 +165,8 @@ ARCH_CONFIG = {
 }
 
 # --- SPMD context + mix detection (no per-test markers needed) --------------
-# SPMD kernels read an execution context at args slots 48/49 —
-# LocalContext{block_idx, block_num} (48) and GlobalContext{sub_block_id} (49) —
+# SPMD kernels read the two context slots after the Core argument capacity —
+# LocalContext{block_idx, block_num} and GlobalContext{sub_block_id} —
 # which the orchestration builds per dispatch. core_swimlane runs an isolated
 # replay (no orchestration), so it SYNTHESIZES that context host-side. None of
 # its inputs need a per-test marker; they are all derived:
@@ -155,7 +177,7 @@ ARCH_CONFIG = {
 #                   mixed_example) goes through the AIC/AIV-only path.
 #   * block_num   — the selected SPMD task's logical grid width, from
 #                   `--spmd-block-num` (defaults to 1). The args dump does not
-#                   carry slot-48 context; read the real value from the
+#                   carry the LocalContext; read the real value from the
 #                   orchestration, where it may be task-specific or derived
 #                   from rt_available_cluster_count().
 #   * aiv_lanes_per_block      — the arch's hardware subblockdim (ARCH_CONFIG).
@@ -173,7 +195,7 @@ def _first_platform_case(cls, platform):
     always dumps with `--manual include`). None if no case lists the platform.
     Auto-pinning one case makes the dump deterministic (no "run all cases,
     reconstruct from the newest dump dir" ambiguity), and ties the synthesized
-    slot-48 replay to the SAME case the dump ran."""
+    SPMD replay to the SAME case the dump ran."""
     for c in getattr(cls, "CASES", []):
         if platform in c.get("platforms", []):
             return c.get("name")
@@ -725,7 +747,7 @@ extern "C" __global__ AICORE void replay_entry(__gm__ int64_t *args) {{
     // bare camodel replay op returns the true physical lane (0=AIV0, 1=AIV1) is
     // UNVERIFIED — validate the trace shows veccore0 and veccore1 running
     // DIFFERENT kernels. get_sub_block_id(args) is NOT usable here: the replay's
-    // single shared args[] gives both lanes the same slot-49 GlobalContext.
+    // single shared args[] gives both lanes the same GlobalContext suffix slot.
     if (get_subblockid() == 0) {{
         {_member_entry_symbol(aiv0)}(args);  // AIV0: func_id={aiv0["func_id"]} {aiv0["name"]}
     }} else {{
@@ -824,6 +846,9 @@ def _emit_tensor_alloc_descs(args):
 
 
 def emit_replay_host(tensor_count: int, args, block_num: int = 1) -> str:
+    for arg in args:
+        if not 0 <= arg["slot"] < KARGS_PAYLOAD_SLOTS:
+            raise ValueError(f"argument slot {arg['slot']} must be in [0, {KARGS_PAYLOAD_SLOTS - 1}]")
     alloc, descs, argrow, free_list = _emit_tensor_alloc_descs(args)
     for a in args:
         if a["kind"] == "scalar":
@@ -899,8 +924,8 @@ int main() {{
     std::vector<int64_t> h_args(kArgsSlots, 0);
 {chr(10).join(argrow)}
 
-    // SPMD context at slots 48/49 — built unconditionally. Harmless for
-    // positional kernels (they ignore 48/49); required for SPMD kernels that
+    // SPMD context follows the full Core tensor/scalar argument capacity.
+    // Positional kernels ignore this suffix; it is required for SPMD kernels that
     // read get_block_idx / get_block_num / get_sub_block_id, which would
     // otherwise dereference a null context. block_idx=0 traces a representative
     // block. block_num={block_num} comes from --spmd-block-num; 1 models a
@@ -915,8 +940,8 @@ int main() {{
     ACL_CHECK(aclrtMemcpy(d_local, sizeof(h_local), h_local, sizeof(h_local), ACL_MEMCPY_HOST_TO_DEVICE));
     ACL_CHECK(aclrtMalloc(&d_global, sizeof(h_global), ACL_MEM_MALLOC_HUGE_FIRST));
     ACL_CHECK(aclrtMemcpy(d_global, sizeof(h_global), h_global, sizeof(h_global), ACL_MEMCPY_HOST_TO_DEVICE));
-    h_args[48] = (int64_t)(uintptr_t)d_local;
-    h_args[49] = (int64_t)(uintptr_t)d_global;
+    h_args[{KARGS_LOCAL_CONTEXT}] = (int64_t)(uintptr_t)d_local;
+    h_args[{KARGS_GLOBAL_CONTEXT}] = (int64_t)(uintptr_t)d_global;
 
     void *d_args = nullptr;
     ACL_CHECK(aclrtMalloc(&d_args, kArgsSlots * sizeof(int64_t), ACL_MEM_MALLOC_HUGE_FIRST));
@@ -1496,7 +1521,7 @@ def main():
         default=None,
         metavar="N",
         help="block_num written into the synthesized SPMD LocalContext "
-        "(slot 48). Default: 1. The args dump does not carry this context. "
+        "(default: 1). The args dump does not carry this context. "
         "For kernels that branch/stride on block_num, pass the selected "
         "task's real logical grid width from its orchestration.",
     )
@@ -1524,9 +1549,9 @@ def main():
         ap.error("--msprof-timeout MINUTES must be in [1, 2880]")
     set_arg = parse_arg_overrides(args.set_arg, ap)
     restore_slots = list(dict.fromkeys(args.restore_arg))
-    invalid_restore_slots = [slot for slot in restore_slots if slot < 0 or slot >= KARGS_SLOTS]
+    invalid_restore_slots = [slot for slot in restore_slots if slot < 0 or slot >= KARGS_PAYLOAD_SLOTS]
     if invalid_restore_slots:
-        ap.error(f"--restore-arg SLOT must be in [0, {KARGS_SLOTS - 1}] (got {invalid_restore_slots})")
+        ap.error(f"--restore-arg SLOT must be in [0, {KARGS_PAYLOAD_SLOTS - 1}] (got {invalid_restore_slots})")
     conflicts = sorted(set(restore_slots) & {slot for slot, _ in set_arg})
     if conflicts:
         ap.error(f"arg slot(s) {conflicts} cannot use both --restore-arg and --set-arg")
@@ -1552,7 +1577,7 @@ def main():
     selected_case = args.case or meta["auto_case"]
     if not args.case and meta["auto_case"]:
         print(f"[core_swimlane] no --case; auto-pinned first {args.platform} case: {meta['auto_case']}")
-    # block_num for the synthesized slot-48 LocalContext. An SPMD cohort sizes
+    # block_num for the synthesized LocalContext. An SPMD cohort sizes
     # itself from rt_available_cluster_count() on device, so its width is not
     # readable from the test file; pass --spmd-block-num to replay one. Default
     # 1 is a non-SPMD single block.

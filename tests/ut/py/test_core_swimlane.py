@@ -10,6 +10,7 @@
 """Contract tests for payload restoration in simpler_setup.tools.core_swimlane."""
 
 import json
+import re
 import struct
 import sys
 from pathlib import Path
@@ -308,3 +309,94 @@ def test_default_tensor_initialization_remains_zero_fill():
     host = core_swimlane.emit_replay_host(1, [tensor])
 
     assert "aclrtMemset(d_t0, t0Bytes, 0, t0Bytes)" in host
+
+
+@pytest.mark.parametrize("tensor_count", [2, 49, 50, 51, 256])
+@pytest.mark.parametrize("scalar_count", [0, 16])
+def test_replay_preserves_arguments_and_context_suffix(tensor_count, scalar_count):
+    """Every argument survives; context never aliases a tensor or scalar slot."""
+    args = [
+        dict(kind="tensor", slot=i, dtype="INT32", shape=[1], strides=[1], start_offset=0) for i in range(tensor_count)
+    ]
+    args += [dict(kind="scalar", slot=tensor_count + i, value=1000 + i) for i in range(scalar_count)]
+    host = core_swimlane.emit_replay_host(tensor_count, args, block_num=24)
+    capacity_match = re.search(r"kArgsSlots = (\d+);", host)
+    assert capacity_match is not None
+    capacity = int(capacity_match.group(1))
+    writes = [int(slot) for slot in re.findall(r"h_args\[(\d+)\] =", host)]
+    assert capacity == 274  # shared Core ABI: 256 tensors + 16 scalars + 2 contexts
+    assert len(writes) == len(set(writes)), "context overwrites a task argument"
+    assert all(0 <= slot < capacity for slot in writes)
+    assert set(writes) == set(range(tensor_count + scalar_count)) | {272, 273}
+    assert "h_args[272] = (int64_t)(uintptr_t)d_local;" in host
+    assert "h_args[273] = (int64_t)(uintptr_t)d_global;" in host
+
+
+@pytest.mark.parametrize("slot", [-1, 272, 273, 274])
+def test_replay_rejects_argument_outside_payload(slot):
+    with pytest.raises(ValueError, match="argument slot"):
+        core_swimlane.emit_replay_host(0, [dict(kind="scalar", slot=slot, value=7)])
+
+
+@pytest.mark.parametrize("slot", [50, 255, 271])
+def test_cli_accepts_wide_restore_slots(monkeypatch, capsys, slot):
+    # The conflict check follows slot validation and precedes any device work.
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "core_swimlane",
+            "--test",
+            "unused.py",
+            "--func-id",
+            "0",
+            "--restore-arg",
+            str(slot),
+            "--set-arg",
+            f"{slot}=1",
+        ],
+    )
+    with pytest.raises(SystemExit, match="2"):
+        core_swimlane.main()
+    assert "cannot use both --restore-arg and --set-arg" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("slot", [-1, 272, 273, 274])
+def test_cli_rejects_restore_context_and_out_of_range_slots(monkeypatch, capsys, slot):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "core_swimlane",
+            "--test",
+            "unused.py",
+            "--func-id",
+            "0",
+            "--restore-arg",
+            str(slot),
+        ],
+    )
+    with pytest.raises(SystemExit, match="2"):
+        core_swimlane.main()
+    assert "--restore-arg SLOT must be in [0, 271]" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("tensor_limit,scalar_limit", [(32, 16), (256, 16)])
+def test_replay_reads_shared_abi_capacity(monkeypatch, tmp_path, tensor_limit, scalar_limit):
+    header = tmp_path / "src/common/task_interface/arg_direction.h"
+    header.parent.mkdir(parents=True)
+    header.write_text(
+        f"inline constexpr int CORE_MAX_TENSOR_ARGS = {tensor_limit};\n"
+        f"inline constexpr int CORE_MAX_SCALAR_ARGS = {scalar_limit};\n"
+    )
+    monkeypatch.setattr(core_swimlane, "PROJECT_ROOT", tmp_path)
+    assert core_swimlane._core_arg_limits() == (tensor_limit, scalar_limit)
+
+
+def test_replay_refuses_unknown_abi_capacity(monkeypatch, tmp_path):
+    header = tmp_path / "src/common/task_interface/arg_direction.h"
+    header.parent.mkdir(parents=True)
+    header.write_text("inline constexpr int CORE_MAX_TENSOR_ARGS = an_unknown_expression;\n")
+    monkeypatch.setattr(core_swimlane, "PROJECT_ROOT", tmp_path)
+    with pytest.raises(ValueError, match="shared Core argument ABI"):
+        core_swimlane._core_arg_limits()

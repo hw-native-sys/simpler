@@ -70,8 +70,9 @@ constexpr uint32_t TASKPAYLOAD_TENSOR_COUNT_OFFSET = 0;
 constexpr uint32_t TASKPAYLOAD_SCALAR_COUNT_OFFSET = 4;
 // Cache line 9 (byte 576) holds the AICPU-only DispatchPredicate; tensors follow it.
 constexpr uint32_t TASKPAYLOAD_TENSORS_OFFSET = 640;
-constexpr uint32_t TASKPAYLOAD_SCALARS_OFFSET = 4736;
 constexpr uint32_t TASKPAYLOAD_TENSOR_STRIDE = 128;  // sizeof(simpler::tmr::Tensor)
+constexpr uint32_t TASKPAYLOAD_SCALARS_OFFSET =
+    TASKPAYLOAD_TENSORS_OFFSET + CORE_MAX_TENSOR_ARGS * TASKPAYLOAD_TENSOR_STRIDE;
 
 /**
  * Per-core dispatch payload: function address + args[] + SPMD context.
@@ -127,6 +128,6 @@ struct alignas(64) DispatchPayload {
     );
 };
 
-static_assert(sizeof(DispatchPayload) == 512, "DispatchPayload hardware ABI size drift");
+static_assert(sizeof(DispatchPayload) == 2304, "DispatchPayload hardware ABI size drift");
 static_assert(offsetof(DispatchPayload, args) == 64, "args[] must start at cache line 1 (control block = CL0)");
 static_assert(offsetof(DispatchPayload, src_payload) < 64, "src_payload (gate) must live on the CL0 control block");
