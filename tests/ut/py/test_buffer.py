@@ -17,6 +17,7 @@ Tensor uses its canonical public import in `simpler.task_interface`.
 """
 
 import ctypes
+import os
 import re
 import subprocess
 import sys
@@ -1328,3 +1329,184 @@ def test_task_args_owns_transfer_without_mutating_the_source_view():
     args.clear()
     args.add_tensor(tensor)
     assert args.transfer(0) == TensorTransfer.H2D
+
+
+def _slice_descriptor(backing, offset, nbytes, buffer_id):
+    assert backing.shm is not None
+    return BufferDescriptor(
+        identity=CanonicalIdentity(bytes(backing.identity.owner_instance_id), buffer_id, 1),
+        owner_worker_path_id=backing.owner_worker_path_id,
+        address_space=AddressSpace.HOST,
+        access=AccessMode.READWRITE,
+        backend_kind=BackendKind.SHARED_FD_SLICE,
+        nbytes=nbytes,
+        body=os.getpid().to_bytes(4, "little") + backing.shm._fd.to_bytes(4, "little") + offset.to_bytes(8, "little"),
+    )
+
+
+def test_shm_slices_share_one_mapping_and_bound_sub_views():
+    backing = create_host_shared_buffer(4096, mint_owner_instance_id(), 1)
+    assert backing.shm is not None and backing.shm.buf is not None
+    registry = ImportRegistry(
+        ImportContext(
+            deployment=HOST_CPU,
+            shared_heap_files=((bytes(backing.identity.owner_instance_id), os.getpid(), (backing.shm._fd,)),),
+        )
+    )
+    try:
+        backing.shm.buf[:4096] = b"!" * 4096
+        first = registry.materialize(_slice_descriptor(backing, 128, 16, 2))
+        second = registry.materialize(_slice_descriptor(backing, 1024, 16, 3))
+        assert first.shm is second.shm
+        assert second.base - first.base == 896
+        argument = MappedArg(second, 4, (3,), (1,), DataType.INT32.value)
+        view = argument.buffer
+        try:
+            assert len(view) == 12
+            view[:] = b"x" * 12
+        finally:
+            view.release()
+        assert bytes(backing.shm.buf[1023:1041]) == b"!!!!!" + b"x" * 12 + b"!"
+        registry.unregister(first.identity)
+        assert ctypes.string_at(second.base, 16) == b"!!!!" + b"x" * 12
+        registry.unregister(second.identity)
+        assert not registry._shared_backings
+    finally:
+        registry.close()
+        backing.close()
+
+
+def test_shm_slice_many_identities_keep_mapping_count_bounded():
+    backing = create_host_shared_buffer(4096, mint_owner_instance_id(), 1)
+    assert backing.shm is not None and backing.shm.buf is not None
+    registry = ImportRegistry(
+        ImportContext(
+            deployment=HOST_CPU,
+            shared_heap_files=((bytes(backing.identity.owner_instance_id), os.getpid(), (backing.shm._fd,)),),
+        )
+    )
+    try:
+        for index in range(256):
+            registry.materialize(_slice_descriptor(backing, (index % 8) * 64, 32, index + 2))
+        assert len(registry._shared_backings) == 1
+        assert len({id(value.shm) for value in registry._by_identity.values()}) == 1
+        registry.close()
+        assert not registry._shared_backings
+        assert not registry._mapping_uses
+    finally:
+        registry.close()
+        backing.close()
+
+
+def test_shm_slice_checks_actual_backing_span():
+    backing = create_host_shared_buffer(64, mint_owner_instance_id(), 1)
+    assert backing.shm is not None and backing.shm.buf is not None
+    registry = ImportRegistry(
+        ImportContext(
+            deployment=HOST_CPU,
+            shared_heap_files=((bytes(backing.identity.owner_instance_id), os.getpid(), (backing.shm._fd,)),),
+        )
+    )
+    try:
+        size = backing.shm.size
+        for offset, nbytes in [(size + 1, 0), (size - 1, 2)]:
+            with pytest.raises(ValueError, match="descriptor span"):
+                registry.materialize(_slice_descriptor(backing, offset, nbytes, 2))
+        assert not registry._shared_backings
+    finally:
+        registry.close()
+        backing.close()
+
+
+@pytest.mark.parametrize(
+    "backend,access",
+    [
+        (BackendKind.FORK_COW, AccessMode.READ),
+        (BackendKind.FORK_SHM, AccessMode.READWRITE),
+    ],
+)
+def test_new_interpreter_context_refuses_unimported_fork_address(backend, access):
+    storage = ctypes.create_string_buffer(16)
+    backing = wrap_fork_inherited(
+        ctypes.addressof(storage),
+        16,
+        mint_owner_instance_id(),
+        1,
+        backend_kind=backend,
+        access=access,
+    )
+    registry = ImportRegistry(ImportContext(deployment=HOST_CPU, fork_inherited=False))
+    with pytest.raises(ValueError, match="fork-inherited VA"):
+        registry.materialize(backing.to_descriptor())
+
+
+def test_independent_importer_exit_preserves_owner_shm_name():
+    backing = create_host_shared_buffer(16, mint_owner_instance_id(), 1)
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                textwrap.dedent("""
+                import sys
+                from _task_interface import _decode_buffer_descriptor_wire
+                from simpler.buffer import ImportContext, ImportRegistry
+                from simpler.comm_endpoints import HOST_CPU
+                registry = ImportRegistry(ImportContext(deployment=HOST_CPU, fork_inherited=False))
+                desc = _decode_buffer_descriptor_wire(bytes.fromhex(sys.stdin.read()))
+                registry.materialize(desc)
+                registry.close()
+            """),
+            ],
+            input=_encode_buffer_descriptor_wire(backing.to_descriptor()).hex(),
+            text=True,
+            capture_output=True,
+            timeout=15,
+            check=True,
+        )
+        assert "resource_tracker" not in result.stderr
+        assert backing.shm is not None
+        attachment = SharedMemory(name=backing.shm.name)
+        attachment.close()
+    finally:
+        backing.close()
+
+
+def test_shared_fd_close_failure_retains_mapping_for_retry():
+    backing = create_host_shared_buffer(64, mint_owner_instance_id(), 1)
+    assert backing.shm is not None and backing.shm.buf is not None
+    registry = ImportRegistry(
+        ImportContext(
+            deployment=HOST_CPU,
+            shared_heap_files=((bytes(backing.identity.owner_instance_id), os.getpid(), (backing.shm._fd,)),),
+        )
+    )
+    try:
+        imported = registry.materialize(_slice_descriptor(backing, 16, 16, 2))
+        view = MappedArg(imported, 0, (4,), (1,), DataType.INT32.value).buffer
+        with pytest.raises(BufferError):
+            registry.close()
+        assert imported.identity in registry._by_identity
+        assert len(registry._shared_backings) == 1
+        view.release()
+        registry.close()
+        assert not registry._by_identity
+        assert not registry._shared_backings
+    finally:
+        registry.close()
+        backing.close()
+
+
+def test_shared_fd_requires_explicit_child_attachment():
+    backing = create_host_shared_buffer(64, mint_owner_instance_id(), 1)
+    assert backing.shm is not None and backing.shm.buf is not None
+    registry = ImportRegistry(ImportContext(deployment=HOST_CPU, fork_inherited=False))
+    try:
+        desc = _slice_descriptor(backing, 0, 16, 2)
+        body = (os.getpid() + 1).to_bytes(4, "little") + bytes(desc.body)[4:]
+        foreign = BufferDescriptor(desc.identity, desc.address_space, desc.access, desc.backend_kind, desc.nbytes, body)
+        with pytest.raises(ValueError, match="fd was not attached"):
+            registry.materialize(foreign)
+    finally:
+        registry.close()
+        backing.close()

@@ -109,6 +109,11 @@ public:
     // scope ref.
     uint64_t alloc(const std::vector<uint32_t> &shape, DataType dtype, const CanonicalIdentity &identity);
 
+    BufferDescriptor
+    describe_shared_buffer(uint64_t address, uint64_t nbytes, const CanonicalIdentity &identity) const {
+        return allocator_->shared_descriptor(address, nbytes, identity);
+    }
+
     // Bytes currently committed by a specific next-level worker's device
     // allocator. Thread-safe: can be called from the orch thread while the
     // target worker is running a task (MemoryAllocator is mutex-protected).

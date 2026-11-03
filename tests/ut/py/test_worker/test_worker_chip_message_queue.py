@@ -166,14 +166,23 @@ class _FakeCOrch:
         self._buffers = []
         self.fail_next_alloc = False
 
-    def alloc(self, shape, dtype, identity):
+    def _alloc_shared_buffer(self, shape, dtype, identity):
         if self.fail_next_alloc:
             self.fail_next_alloc = False
             raise RuntimeError("injected allocation failure")
         nbytes = math.prod(int(x) for x in shape) * int(get_element_size(dtype))
         storage = (ctypes.c_uint8 * nbytes)()
         self._buffers.append(storage)
-        return ctypes.addressof(storage)
+        address = ctypes.addressof(storage)
+        descriptor = BufferDescriptor(
+            identity,
+            AddressSpace.HOST,
+            AccessMode.READWRITE,
+            BackendKind.FORK_SHM,
+            nbytes,
+            address.to_bytes(8, "little"),
+        )
+        return address, descriptor
 
 
 class _FakeClient:
