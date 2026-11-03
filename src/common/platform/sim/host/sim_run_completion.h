@@ -26,7 +26,8 @@ namespace simpler::common::sim_host {
  * reset() is called before any kernel thread starts. On a successful launch,
  * each released thread calls task_finished() exactly once. If startup is
  * cancelled, the launch owner joins every created thread and calls abandon(rc);
- * cancelled or uncreated threads do not decrement the remaining task count.
+ * wrappers may report completion while cancelled peers skip it. After join,
+ * abandon() publishes ERROR without requiring the remaining count to reach zero.
  * The final task of a successful launch publishes COMPLETE only
  * after every earlier task's writes and any recorded error are visible to a
  * poller that observes completion. abandon() publishes sticky ERROR when

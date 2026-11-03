@@ -12,6 +12,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstddef>
 #include <mutex>
 
 // The run owns this gate until all core threads have joined. Only a complete
@@ -22,6 +23,8 @@ public:
     void reset() {
         std::lock_guard<std::mutex> lock(mutex_);
         state_ = State::Waiting;
+        ready_ = 0;
+        error_ = 0;
     }
     bool wait() {
         std::unique_lock<std::mutex> lock(mutex_);
@@ -29,6 +32,26 @@ public:
             return state_ != State::Waiting;
         });
         return state_ == State::Released;
+    }
+    static bool report_ready_and_wait(void *context, int error) {
+        return static_cast<SimThreadStartGate *>(context)->arrive_and_wait(error);
+    }
+    bool arrive_and_wait(int error) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        ++ready_;
+        if (error_ == 0) error_ = error;
+        changed_.notify_all();
+        changed_.wait(lock, [&] {
+            return state_ != State::Waiting;
+        });
+        return state_ == State::Released;
+    }
+    int wait_for_arrivals_or_error(std::size_t expected) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        changed_.wait(lock, [&] {
+            return ready_ == expected || error_ != 0;
+        });
+        return error_;
     }
     void release() { publish(State::Released); }
     void cancel() { publish(State::Cancelled); }
@@ -43,4 +66,6 @@ private:
     std::mutex mutex_;
     std::condition_variable changed_;
     State state_{State::Waiting};
+    std::size_t ready_{0};
+    int error_{0};
 };

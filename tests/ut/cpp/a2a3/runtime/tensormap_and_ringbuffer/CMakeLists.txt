@@ -46,6 +46,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     a2a3_tmr_case(test_entry_cache_projection.cpp NO_OBJS
         SOURCES ${_entry_cache_sources}
             ${SIMPLER_SRC}/a2a3/platform/onboard/aicpu/kernel.cpp
+            ${SIMPLER_SRC}/a2a3/platform/sim/aicpu/inner_platform_regs.cpp
             ${SIMPLER_SRC}/a2a3/platform/shared/aicpu/platform_regs.cpp
             ${SIMPLER_SRC}/common/platform/shared/aicpu/args_dump_aicpu.cpp
             ${SIMPLER_SRC}/common/platform/shared/aicpu/chip_swimlane_collector_aicpu.cpp

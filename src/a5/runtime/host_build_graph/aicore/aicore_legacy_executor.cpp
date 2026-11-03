@@ -108,6 +108,8 @@ legacy_aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type
     while (read_reg(RegId::DATA_MAIN_BASE) == 0) {
         SPIN_WAIT_HINT();
     }
+    // The outer executor owns the exit ACK; no task/profiling state exists yet.
+    if (read_reg(RegId::DATA_MAIN_BASE) == AICORE_EXIT_SIGNAL) return;
     // Report initial idle status via register (the window is now open).
     write_reg(RegId::COND, AICORE_IDLE_VALUE);
 

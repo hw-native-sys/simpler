@@ -236,12 +236,24 @@ keys only when the last loader reference is released and the module really unloa
 | `g_device_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread device binding (device_id) |
 | `g_subblock_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread subblock identity (for TPUSH/TPOP) |
 | `g_cluster_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread cluster identity (for TPUSH/TPOP) |
-| `s_orch_thread_idx` | `__thread int` | AICPU SO | Profiling thread index (profiling off by default) |
+| affinity executor index | `AffinityThreadState` | AICPU SO | Borrows a simulated thread stack cell or an onboard classification slot; module owns one key |
 | `g_platform_phase_base` | plain global + `extern "C"` setter | AICPU SO | Device-phase buffer base; published by host (onboard kernel.cpp / sim dlsym), read by the `[STRACE]` phase stamps. Per-thread slotting via the affinity pthread-key index, not TLS. |
 | strace `inv`/`depth`/`hid` | process-owned `pthread_key_t` (`SimplerHostTraceState`) | resident `_task_interface` host-log owner; borrowed by runtime/generated SOs | Scalar trace state allocated with `calloc`, freed by libc at thread exit. |
 | onboard prepare ownership | `pthread_key_t` | host runtime SO | Rejects same-thread recursive prepare across contexts; the key is deleted when the module unloads. |
 | `execution_context` | `thread_local` | Kernel SO (PTO ISA) | Per-thread execution context (fallback, cached values only) |
 | `NPUMemoryModel::instance` | `thread_local` | Kernel SO (PTO ISA) | Per-core memory model simulation |
+
+The affinity gate's classification slots remain borrowed throughout executor
+execution. The next invocation must wait for all prior executors to stop reading
+those slots; gate return, callback admission and reset counters alone do not prove
+that lifetime has ended. Backend classification stays platform-specific, while
+`AffinityBindingCohort` owns the common first-error publication and binding-arrival
+barrier. Its reset runs only after all participants copied the result.
+
+The same-build loader/wrapper callback types live in `aicore/sim_core_callbacks.h`.
+The existing 6/10-key layout is retained: consolidating to a single typed context
+would also change all getter/setter accessors and key-position fault injection.
+That optimization is separate from proving startup failure and core retirement.
 
 ### Sim Context device binding and thread startup
 
@@ -283,6 +295,48 @@ execution claim and carrier. The caller must retain the run's resources and
 retry finalization after binding becomes available; a failed attach is not
 proof that simulated worker threads have stopped.
 
+### Core identity and module-owned simulator keys
+
+Each AICore module owns six keys on A2/A3 or ten on A5. The host calls
+`initialize_aicore_sim_tls` before launching threads; partial creation releases
+only acquired keys and preserves the error until unload. A5's existing key owner
+and A2/A3's matching owner delete the keys when the module unloads, after every
+core thread has joined. Keys have no thread-exit callbacks and do not own values.
+
+The checked executor wrapper binds keys to cells on its stack. Profiling setters
+update those cells without fallible pthread writes during execution. Before any
+executor starts, the run's gate collects every AICore binding result, including
+Sim Context subblock/cluster identity, and every AICPU affinity binding result.
+Failure cancels and joins created threads before releasing their module or run
+storage. AICore identity failure is a before-submission refusal; an AICPU startup
+failure conservatively retains the existing partial-launch/drain contract.
+Sim Context's two identity keys are process-resident; their checked setters
+return pthread errors, roll back partial key creation and allow later retry.
+
+Simulation AICPU threads borrow a stack executor index through one module-owned
+key. Onboard AICPU workers borrow their module's classification slot, with a
+cohort barrier publishing all binding results before admitting any survivor.
+An onboard binding error rejects the entire cohort. Each caller copies the error
+before the last participant resets shared gate state, allowing the next launch
+to retry. Failed affinity key creation is also retryable without unloading the
+resident AICPU SO. Native entry initialization still runs on binding failure;
+each callback retains its index and receives a failed gate result so it can
+contribute to invocation completion without entering the executor. Onboard has
+already launched AICores at this point: callback 0 first discovers this launch's
+core reports and runs the EXIT/nonce/close/release protocol, without affinity
+TLS or executor initialization. Its completion contribution is held until this
+retirement attempt ends. Startup EXIT bypasses task and profiling initialization
+on the cores. Missing reports or ACKs are bounded failures and leave unreleased
+cores to host device recovery; a failed native result alone does not authorize
+resource reuse or another launch on a poisoned runner. Gate/key retryability
+therefore does not imply same-Worker recovery from a device execution failure.
+No identity binding failure may silently drop just one required executor. The filter gate requires exactly `total_launched` participants and no
+next launch until all prior calls return; a late excess arrival after reset
+cannot be distinguished from a new launch without a launch identity.
+These internal wrapper/helper symbols require host, AICPU and AICore libraries
+from the same build; mixed old/new wrappers are not supported. The public legacy
+`pto_cpu_sim_bind_device` ABI is unchanged.
+
 ### STRACE ownership across module unload
 
 STRACE borrows one process-owned pthread key through the bound host-log state.
@@ -299,12 +353,7 @@ for the owner lifetime and binding contract.
 
 ### Known Risks
 
-1. **`s_orch_thread_idx`** uses `__thread` (ELF TLS) in the AICPU SO. Could
-   cause issues on aarch64 glibc <2.39 if the AICPU SO is dlclosed and
-   re-dlopen'd while profiling is enabled. Currently safe because profiling
-   is off by default and the variable is only accessed during profiling.
-
-2. **PTO ISA `thread_local`** variables (`execution_context`,
+1. **PTO ISA `thread_local`** variables (`execution_context`,
    `NPUMemoryModel::instance`) are in kernel SOs. Kernel SOs are short-lived
    (loaded per task, dlclosed after validation), and each kernel thread is
    freshly created, so stale TLS is not a concern in practice.

@@ -52,9 +52,13 @@ bool platform_aicpu_affinity_gate(
 // (PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH on the target arch); the
 // gate stops exactly that many threads on its barrier and lets only the
 // allowed_count survivors continue.
+// Exactly total_launched calls must participate; the next launch must wait for
+// all previous executors to exit and stop reading the borrowed identity slots,
+// not just their gate calls to return. Late excess calls after reset cannot be detected
+// without a launch identity. error_out copies the cohort binding error before reset.
 bool platform_aicpu_affinity_gate_filter(
     const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched,
-    AicpuEntryInitializer initialize = nullptr
+    AicpuEntryInitializer initialize = nullptr, int *error_out = nullptr
 );
 
 // Deterministic position (0..allowed_count-1) of the calling thread in the
@@ -63,7 +67,7 @@ bool platform_aicpu_affinity_gate_filter(
 // Returns -1 if this thread was dropped or did not go through the filter
 // gate.
 //
-// Stable across the lifetime of the surviving thread — safe to call from
+// Stable for the bound execution interval — safe to call from
 // aicpu_executor as the per-launch role identifier (sched 0..N-2 / orch
 // N-1).
 int32_t platform_aicpu_affinity_thread_idx();
@@ -78,7 +82,8 @@ int32_t platform_aicpu_affinity_thread_idx();
 // particular the per-thread AICPU phase-record slot
 // (aicpu_phase_self_records()), which otherwise has no valid index on sim and
 // drops every sub-phase stamp. Must be called on the executing thread, before
-// any phase stamping.
+// any phase stamping. The executing thread must have a bound identity cell;
+// direct executor callers must bind first. An unbound setter logs and terminates.
 void platform_aicpu_affinity_set_thread_idx(int32_t idx);
 
 // The native index includes filtered callbacks. It is not a runtime role index.
@@ -102,3 +107,6 @@ platform_aicpu_entry_gate(int32_t logical_count, int32_t total_launched, AicpuEn
 AicpuEntryGateResult platform_aicpu_entry_gate_filter(
     const int32_t *allowed_cpus, int32_t allowed_count, int32_t total_launched, AicpuEntryGateInitializer initialize
 );
+
+// Sim binds a stack cell before admission; onboard binds a module-owned slot.
+extern "C" int platform_aicpu_affinity_bind_thread(int32_t *cell);
