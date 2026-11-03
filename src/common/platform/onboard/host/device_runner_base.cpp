@@ -3056,8 +3056,8 @@ int DeviceRunnerBase::finalize_common_impl(bool abandon_device_resources) {
     sdma_warmed_ = false;
     aicpu_runtime_registered_ = false;
     // RTS registration is retired above; CANN may retain the immutable SO.
-    // Clear the one-shot guard so a reused runner
-    // re-launches simpler_aicpu_init after the next ensure_aicpu_runtime_registered().
+    // Clear the one-shot guard so a reused runner re-launches
+    // simpler_aicpu_init on the next ensure_aicpu_initialized().
     aicpu_initialized_ = false;
 
     // Release any chip callable buffers callers forgot to unregister. On a
