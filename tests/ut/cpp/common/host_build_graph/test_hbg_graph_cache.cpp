@@ -822,12 +822,13 @@ TEST(GraphExecutionStorage, ComputesAlignedExactSize) {
     EXPECT_EQ(layout.total_bytes, layout.states_offset + TASK_COUNT * sizeof(std::atomic<ChipTaskState>));
 }
 
-// A Graph boundary is GraphTaskArgs-wide while the pools budget MAX_TENSOR_ARGS /
-// MAX_SCALAR_ARGS per window slot, so the widest legal boundary draws several slots'
-// worth. graph_submit_outer's preflight exists because of that gap; pin the gap itself
-// so a cap change cannot quietly close or widen it unnoticed.
-TEST(GraphBoundaryPool, WidestBoundaryExceedsOneSlotBudget) {
-    EXPECT_GT(static_cast<size_t>(GRAPH_MAX_TENSOR_ARGS), static_cast<size_t>(MAX_TENSOR_ARGS));
+// A window slot covers the widest Graph tensor boundary. The scalar boundary
+// spans several slots, so graph_submit_outer still needs its pool preflight.
+TEST(GraphBoundaryPool, WidestTensorBoundaryFitsOneSlotBudget) {
+    EXPECT_LE(static_cast<size_t>(GRAPH_MAX_TENSOR_ARGS), static_cast<size_t>(MAX_TENSOR_ARGS));
+}
+
+TEST(GraphBoundaryPool, WidestScalarBoundaryExceedsOneSlotBudget) {
     EXPECT_GT(
         static_cast<size_t>(
             CHIP_ALIGN_UP(static_cast<int32_t>(GRAPH_MAX_SCALAR_ARGS), ARG_POOL_ALIGN / (int32_t)sizeof(uint64_t))
