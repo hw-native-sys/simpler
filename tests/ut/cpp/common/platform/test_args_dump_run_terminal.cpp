@@ -171,6 +171,10 @@ TEST_F(ArgsDumpRunTerminalTest, ADeliveredRunConservesAndCarriesItsPayloadBytes)
 
 TEST_F(ArgsDumpRunTerminalTest, ARecordRefusedBeforeTheWriteIsAlsoThisRunsTotal) {
     ASSERT_EQ(record_tensor(0x904, 0), 0);
+    // Consume an empty replacement slot instead of waiting 30 seconds for a
+    // free buffer that this fixture has no host thread to return.
+    state_->free_queue.buffer_ptrs[state_->free_queue.tail % PLATFORM_DUMP_SLOT_COUNT] = 0;
+    ++state_->free_queue.tail;
     dump_args_flush(kLane);  // hands the only buffer over, leaving none free
 
     // With no free buffer and nothing held, the next record is refused before

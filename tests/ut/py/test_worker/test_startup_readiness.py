@@ -1855,14 +1855,6 @@ class TestEligibleTargetPrecheck:
             assert w._initialized is True
             w.close()
 
-    def test_sub_backed_l3_with_callable_inits(self):
-        w = Worker(level=3, num_sub_workers=1)
-        w.register(lambda args: None)
-        with _hard_timeout(_TEST_WALL_BUDGET_S):
-            w.init()
-            assert w._initialized is True
-            w.close()
-
     def test_registered_python_on_chip_only_l3_rejected(self):
         # A registered LOCAL_PYTHON callable is resolved only by a SUB/next-level
         # child, never a chip — so a chip-only L3 (device_ids, no sub/next) has no

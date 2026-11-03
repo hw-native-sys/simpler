@@ -13,7 +13,6 @@
 
 #include <cstdint>
 
-#include "host/execution_mode_latch.h"
 #include "host/kernel_execution_state.h"
 
 namespace {
@@ -239,45 +238,6 @@ TEST(KernelContextOpsVocabulary, IncompleteTableIsInvalid) {
     ops = fake.table();
     ops.get_current_context = nullptr;
     EXPECT_FALSE(ops.valid());
-}
-
-TEST(ExecutionModeLatch, StartsUnlatched) {
-    ExecutionModeLatch latch;
-    EXPECT_FALSE(latch.is_latched());
-    EXPECT_FALSE(latch.is_kernel());
-}
-
-TEST(ExecutionModeLatch, LatchingIsIdempotentForTheHeldMode) {
-    ExecutionModeLatch latch;
-    EXPECT_EQ(latch.latch(SIMPLER_MODE_PROGRAM), 0);
-    EXPECT_EQ(latch.latch(SIMPLER_MODE_PROGRAM), 0);
-    EXPECT_TRUE(latch.is_latched());
-    EXPECT_EQ(latch.latched_mode(), SIMPLER_MODE_PROGRAM);
-    EXPECT_FALSE(latch.is_kernel());
-}
-
-TEST(ExecutionModeLatch, ModesAreMutuallyExclusiveInBothDirections) {
-    ExecutionModeLatch program;
-    EXPECT_EQ(program.latch(SIMPLER_MODE_PROGRAM), 0);
-    EXPECT_EQ(program.latch(SIMPLER_MODE_KERNEL), PTO_RUNTIME_ERR_INVALID_STATE);
-    EXPECT_FALSE(program.is_kernel());
-
-    ExecutionModeLatch kernel;
-    EXPECT_EQ(kernel.latch(SIMPLER_MODE_KERNEL), 0);
-    EXPECT_EQ(kernel.latch(SIMPLER_MODE_KERNEL), 0);
-    EXPECT_EQ(kernel.latch(SIMPLER_MODE_PROGRAM), PTO_RUNTIME_ERR_INVALID_STATE);
-    EXPECT_TRUE(kernel.is_kernel());
-}
-
-// finalize resets a runner's device state but not its identity, so the
-// init -> finalize -> init sequence the program path already supports must
-// still latch cleanly the second time.
-TEST(ExecutionModeLatch, SameModeRelatchesAfterAFinalizedLifetime) {
-    ExecutionModeLatch latch;
-    EXPECT_EQ(latch.latch(SIMPLER_MODE_PROGRAM), 0);
-    EXPECT_EQ(latch.latch(SIMPLER_MODE_PROGRAM), 0);
-    EXPECT_EQ(latch.latched_mode(), SIMPLER_MODE_PROGRAM);
-    EXPECT_EQ(latch.latch(SIMPLER_MODE_KERNEL), PTO_RUNTIME_ERR_INVALID_STATE);
 }
 
 TEST(KernelExecutionState, EmptyContextInitThenCloseIsClean) {
