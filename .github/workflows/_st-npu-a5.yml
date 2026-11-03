@@ -53,6 +53,8 @@ jobs:
       SIMPLER_SCHEDULER_TIMEOUT_MS: "2000"
       SIMPLER_OP_EXECUTE_TIMEOUT_US: "3000000"
       SIMPLER_STREAM_SYNC_TIMEOUT_MS: "6000"
+      A5_DIAGNOSTIC_DIR: ${{ github.workspace }}/outputs/a5-onboard-${{ github.run_id }}-${{ github.run_attempt }}
+      ASCEND_PROCESS_LOG_PATH: ${{ github.workspace }}/outputs/a5-onboard-${{ github.run_id }}-${{ github.run_attempt }}/ascend
     steps:
       - name: Checkout target
         uses: actions/checkout@v5
@@ -60,6 +62,11 @@ jobs:
           repository: ${{ inputs.repository || github.repository }}
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
+
+      - name: Prepare A5 diagnostic logs
+        run: |
+          mkdir -p "$ASCEND_PROCESS_LOG_PATH"
+          git rev-parse HEAD > "$A5_DIAGNOSTIC_DIR/source.txt"
 
       - name: Validate manual mode
         run: |
@@ -116,6 +123,7 @@ jobs:
           done
 
       - name: Run pytest scene tests (a5)
+        shell: bash
         run: |
           source /usr/local/Ascend/cann/set_env.sh
           # Three nested budgets, each derived from the one it contains, so
@@ -132,10 +140,23 @@ jobs:
           QUEUE_TIMEOUT_S=$((MAX_TIME_S + 1500))
           task-submit --timeout "$QUEUE_TIMEOUT_S" --max-time "$MAX_TIME_S" --device auto --device-num "$DEVICE_NUM" \
             --env SIMPLER_ENABLE_PTO_URMA_WORKSPACE --env SIMPLER_ENABLE_PTO_RDMA_WORKSPACE \
-            --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout $SESSION_TIMEOUT_S --manual '$MANUAL_MODE'"
+            --env ASCEND_PROCESS_LOG_PATH \
+            --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout $SESSION_TIMEOUT_S --manual '$MANUAL_MODE'" \
+            2>&1 | tee "$A5_DIAGNOSTIC_DIR/pytest-task.log"
 
       - name: DFX smokes (a5)
         if: inputs.include_dfx_smokes
         uses: ./.github/actions/run-onboard-dfx-smokes
         with:
           platform: a5
+
+      - name: Retain A5 onboard diagnostic logs
+        if: always()
+        # Artifact service failures only lose diagnostics; pytest owns the test result.
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: a5-onboard-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.A5_DIAGNOSTIC_DIR }}
+          if-no-files-found: warn
+          retention-days: 7

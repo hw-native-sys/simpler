@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <string>
 
 #include "async_wait.h"
 #include "backend/urma/urma_completion_scheduler.h"
@@ -80,9 +81,70 @@ struct WorkspaceFixture {
     CompletionPollResult poll(uint32_t row, uint32_t target_bb, uint32_t target_cqe) {
         return poll_urma_event_handle(((static_cast<uint64_t>(row) << 32) | target_bb), addr(), target_cqe);
     }
+
+    std::string snapshot(uint32_t row, uint32_t target_bb, uint32_t target_cqe) {
+        auto waits = std::make_unique<AsyncWaitList>();
+        waits->reset_for_reuse();
+        waits->count = 1;
+        auto &entry = waits->entries[0];
+        entry.task_token = TaskId::make(0, 0);
+        entry.normal_done = true;
+        entry.condition_count = 1;
+        entry.waiting_completion_count = 1;
+        auto &condition = entry.conditions[0];
+        condition.addr = (static_cast<uint64_t>(row) << 32) | target_bb;
+        condition.backend_cookie = addr();
+        condition.expected_value = target_cqe;
+        condition.engine = ASYNC_ENGINE_URMA;
+        condition.completion_type = COMPLETION_TYPE_URMA_EVENT_HANDLE;
+        testing::internal::CaptureStderr();
+        waits->log_diagnostics(nullptr, "urma_snapshot");
+        return testing::internal::GetCapturedStderr();
+    }
 };
 
 }  // namespace
+
+TEST(A5UrmaCompletionScheduler, SnapshotFindsSecondPendingCqeWithoutPublishingTails) {
+    WorkspaceFixture fixture;
+    fixture.sq_head[6] = 2;
+    fixture.sq[6].submittedWqeCount = 2;
+    fixture.set_cqe(6, 0, true);
+    fixture.set_cqe(6, 1, false);
+
+    const auto output = fixture.snapshot(6, 2, 2);
+    EXPECT_NE(output.find("row=6 head=2 bb_tail=0 submitted=2 cq_tail=0"), std::string::npos);
+    EXPECT_NE(output.find("row=6 sequence=0 target=2 dw0=0x4 owner=1 expected_owner=1"), std::string::npos);
+    EXPECT_NE(output.find("row=6 sequence=1 target=2 dw0=0x0 owner=0 expected_owner=1"), std::string::npos);
+    EXPECT_EQ(fixture.sq_head[6], 2u);
+    EXPECT_EQ(fixture.sq_tail[6], 0u);
+    EXPECT_EQ(fixture.cq_tail[6], 0u);
+    EXPECT_EQ(fixture.cq_doorbell[6], 0u);
+    EXPECT_EQ(fixture.entries[6][0].words[0], 4u);
+    EXPECT_EQ(fixture.poll(6, 2, 2).state, CompletionPollState::PENDING);
+}
+
+TEST(A5UrmaCompletionScheduler, SnapshotReportsWrappedOwnerAndCqeError) {
+    WorkspaceFixture fixture;
+    fixture.cq_tail[0] = kDepth;
+    fixture.set_cqe(0, kDepth, true, 1, 2);
+
+    const auto output = fixture.snapshot(0, 2, kDepth + 1);
+    EXPECT_NE(output.find("owner=0 expected_owner=0 error=0x102"), std::string::npos);
+    EXPECT_EQ(fixture.cq_tail[0], kDepth);
+    EXPECT_EQ(fixture.sq_tail[0], 0u);
+}
+
+TEST(A5UrmaCompletionScheduler, SnapshotSkipsInvalidQueueBeforeReadingCqe) {
+    WorkspaceFixture fixture;
+    fixture.cq[0].depth = 3;
+    fixture.cq[0].bufAddr = 1;
+
+    const auto output = fixture.snapshot(0, 1, 1);
+    EXPECT_NE(output.find("[URMA_SNAPSHOT best_effort=1]"), std::string::npos);
+    EXPECT_EQ(output.find("[URMA_CQE"), std::string::npos);
+    EXPECT_EQ(fixture.cq_tail[0], 0u);
+}
 
 TEST(A5UrmaCompletionScheduler, NullWorkspaceFailsEvenForZeroTarget) {
     const auto result = poll_urma_event_handle(0, 0, 0);

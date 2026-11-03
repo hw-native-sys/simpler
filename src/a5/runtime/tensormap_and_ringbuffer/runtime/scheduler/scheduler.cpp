@@ -265,6 +265,55 @@ void AsyncWaitList::log_diagnostics(AICoreCompletionMailbox *aicore_mailbox, con
             static_cast<unsigned long long>(detail.addr), static_cast<unsigned long long>(detail.backend_cookie),
             detail.expected_value, observed, static_cast<unsigned>(detail.retired)
         );
+        // Queue storage remains live while the scheduler runs; unlocked samples are best effort.
+        if (detail.completion_type == COMPLETION_TYPE_URMA_EVENT_HANDLE && detail.backend_cookie != 0) {
+            using namespace pto2::urma_backend;
+            auto *info = reinterpret_cast<volatile UrmaInfo *>(detail.backend_cookie);
+            const uint32_t row = static_cast<uint32_t>(detail.addr >> 32);
+            LOG_WARN(
+                "[URMA_SNAPSHOT best_effort=1] task=%llu row=%u target_bb=%u target_cqe=%u rows=%u sq=0x%llx cq=0x%llx",
+                static_cast<unsigned long long>(detail.task_id), row, static_cast<uint32_t>(detail.addr),
+                detail.expected_value, info->jettyCount, static_cast<unsigned long long>(info->sqPtr),
+                static_cast<unsigned long long>(info->scqPtr)
+            );
+            if (row < info->jettyCount && info->sqPtr != 0 && info->scqPtr != 0) {
+                auto *wq = reinterpret_cast<volatile UrmaWQCtx *>(info->sqPtr) + row;
+                auto *cq = reinterpret_cast<volatile UrmaCqCtx *>(info->scqPtr) + row;
+                if (wq->headAddr != 0 && wq->tailAddr != 0 && cq->tailAddr != 0 && cq->bufAddr != 0 &&
+                    is_power_of_two(cq->depth) && cq->depth < (1u << 31) && cq->cqeShiftSize == 6) {
+                    const uint32_t head = load_device_u32(wq->headAddr);
+                    const uint32_t tail = load_device_u32(wq->tailAddr);
+                    const uint32_t cq_tail = load_device_u32(cq->tailAddr);
+                    const uint64_t cqe = cq->bufAddr + kCqeBytes * static_cast<uint64_t>(cq_tail & (cq->depth - 1u));
+                    const uint32_t dw0 = load_device_u32(cqe);
+                    LOG_WARN(
+                        "[URMA_SNAPSHOT] row=%u head=%u bb_tail=%u submitted=%u cq_tail=%u "
+                        "sq_depth=%u cq_depth=%u wqe_shift=%u db=0x%llx cqe=0x%llx "
+                        "dw0=0x%x owner=%u expected_owner=%u error=0x%x",
+                        row, head, tail, wq->submittedWqeCount, cq_tail, wq->depth, cq->depth, wq->wqeShiftSize,
+                        static_cast<unsigned long long>(wq->dbAddr), static_cast<unsigned long long>(cqe), dw0,
+                        (dw0 >> 2) & 1u, 1u ^ ((cq_tail / cq->depth) & 1u), dw0 >> 16
+                    );
+                    const uint32_t outstanding = detail.expected_value - cq_tail;
+                    if (!has_reached(cq_tail, detail.expected_value) && outstanding <= cq->depth) {
+                        for (uint32_t offset = 0; offset < outstanding && offset < 8; ++offset) {
+                            const uint32_t sequence = cq_tail + offset;
+                            const uint64_t address =
+                                cq->bufAddr + kCqeBytes * static_cast<uint64_t>(sequence & (cq->depth - 1u));
+                            const uint32_t raw = load_device_u32(address);
+                            const uint32_t expected_owner = 1u ^ ((sequence / cq->depth) & 1u);
+                            LOG_WARN(
+                                "[URMA_CQE best_effort=1] row=%u sequence=%u target=%u dw0=0x%x "
+                                "owner=%u expected_owner=%u error=0x%x truncated=%u",
+                                row, sequence, detail.expected_value, raw, (raw >> 2) & 1u, expected_owner, raw >> 16,
+                                outstanding > 8 ? 1u : 0u
+                            );
+                            if (((raw >> 2) & 1u) != expected_owner || (raw >> 16) != 0) break;
+                        }
+                    }
+                }
+            }
+        }
         if (detail.completion_type == COMPLETION_TYPE_RDMA_EVENT_HANDLE) {
             pto2::rdma_backend::log_rdma_event_handle_snapshot(
                 detail.addr, detail.backend_cookie, detail.entry_idx, detail.condition_idx
