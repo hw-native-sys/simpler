@@ -32,6 +32,7 @@
 #include "aicpu/scope_stats_collector_aicpu.h"
 #include "device_runner_base.h"
 #include "host/profiling_copy.h"
+#include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 
@@ -54,7 +55,7 @@ using simpler::dfx::scope_stats_runs::CapacityMetadata;
 std::atomic<const volatile void *> refused_source{nullptr};
 std::atomic<uint32_t> refused_copies{0};
 
-void *close_alloc(size_t size) { return std::calloc(1, size); }
+void *close_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int close_free(void *ptr) {
     std::free(ptr);

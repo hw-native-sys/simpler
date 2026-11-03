@@ -26,13 +26,14 @@
 #include <limits>
 #include <string>
 #include <unistd.h>
+#include "profiler_test_allocator.h"
 
 namespace {
 const volatile void *refused_source = nullptr;
 void *last_buffer_shadow = nullptr;
 const volatile void *tracked_buffer_source = nullptr;
 int refused_copies = 0;
-void *allocate(size_t bytes) { return std::calloc(1, bytes); }
+void *allocate(size_t bytes) { return profiler_test_calloc(bytes); }
 int release(void *ptr) {
     std::free(ptr);
     return 0;

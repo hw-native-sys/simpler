@@ -41,6 +41,7 @@
 #include "common/memory_barrier.h"
 #include "common/pmu_profiling.h"
 #include "host/pmu_collector.h"
+#include "profiler_test_allocator.h"
 
 #if defined(SIMPLER_TEST_PMU_ARCH_A5)
 constexpr int kPmuCounterCount = PMU_COUNTER_COUNT_A5;
@@ -90,7 +91,7 @@ void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
 
 namespace {
 
-void *pmu_test_alloc(size_t size) { return std::calloc(1, size); }
+void *pmu_test_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int pmu_test_free(void *ptr) {
     std::free(ptr);

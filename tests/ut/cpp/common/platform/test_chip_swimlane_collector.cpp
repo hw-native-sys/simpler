@@ -25,6 +25,7 @@
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "host/chip_swimlane_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 TEST(ChipSwimlaneCollectorTest, BeginRunReleasesRuntimeExtensionSlots) {
     ChipSwimlaneCollector collector;
@@ -42,7 +43,7 @@ TEST(ChipSwimlaneCollectorTest, BeginRunReleasesRuntimeExtensionSlots) {
 
 namespace {
 
-void *swimlane_test_alloc(size_t size) { return std::calloc(1, size); }
+void *swimlane_test_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int swimlane_test_free(void *ptr) {
     std::free(ptr);

@@ -47,6 +47,7 @@
 #include "chip_callable_layout.h"
 #include "device_runner_base.h"
 #include "runtime.h"
+#include "profiler_test_allocator.h"
 
 namespace {
 
@@ -84,7 +85,7 @@ namespace {
 
 // The collector owns host storage for its terminal banks; this is the allocator pair the runner
 // would otherwise be handed by the platform.
-void *sim_bank_alloc(size_t size) { return std::calloc(1, size); }
+void *sim_bank_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int sim_bank_free(void *ptr) {
     std::free(ptr);
