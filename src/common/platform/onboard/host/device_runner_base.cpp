@@ -1968,7 +1968,7 @@ int DeviceRunnerBase::ensure_aicpu_runtime_registered(rtStream_t control_stream)
     // The control stream is what the bootstrap launch rides; a context that
     // has not created one yet has no device to bootstrap on.
     if (control_stream == nullptr) {
-        LOG_ERROR("Device not set before loading binaries");
+        LOG_ERROR("Device not set before registering the AICPU runtime");
         return PTO_RUNTIME_ERR_INTERNAL;
     }
 

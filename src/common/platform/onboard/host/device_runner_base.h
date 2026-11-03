@@ -1468,8 +1468,8 @@ public:
      * simpler_register_callable(): launches `simpler_aicpu_register_callable` with a
      * RegisterCallableArgs descriptor so the AICPU dlopens the callable's
      * orch SO. Host-orchestration callables are a no-op. On success, AICPU has
-     * populated orch_so_table_[callable_id] and subsequent runs only need to
-     * stamp the active callable_id.
+     * populated orch_so_table_[callable_id]; a later run validates that the
+     * active callable_id names this registered entry.
      */
     int launch_device_register(int32_t callable_id);
 
@@ -3290,7 +3290,7 @@ protected:
     PrebuiltRuntimeArenaCache prebuilt_runtime_arena_cache_;
 
     // Persistent AICPU / AICore streams created in
-    // `ensure_device_initialized()` and torn down in the subclass's
+    // `initialize_program_device()` and torn down in the subclass's
     // `finalize()`. A2A3 reserves these for bootstrap/control operations and
     // submits runs on its own per-slot stream sets; A5 submits runs on these.
     // `nullptr` before init.
