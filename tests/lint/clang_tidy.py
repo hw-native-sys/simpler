@@ -25,6 +25,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from typing import Optional
 
 from clang_tidy_paths import should_run_clang_tidy
 
@@ -302,6 +303,50 @@ def _build_file_index() -> dict[str, list[Path]]:
     return index
 
 
+def _changed_line_filter(changed: list[str]) -> Optional[str]:
+    """Limit diagnostics to added lines, including changed project headers.
+
+    A touched translation unit can include many unchanged headers with existing
+    tidy findings. CI passes the same base/head as pre-commit's file selection;
+    local commit hooks use the staged diff. A direct all-files invocation with
+    no diff keeps the old full-file behavior.
+    """
+    base = os.environ.get("CLANG_TIDY_BASE_REF")
+    head = os.environ.get("CLANG_TIDY_HEAD_REF")
+    if bool(base) != bool(head):
+        raise RuntimeError("CLANG_TIDY_BASE_REF and CLANG_TIDY_HEAD_REF must be set together")
+    diff_args = [f"{base}...{head}"] if base else ["--cached"]
+    result = subprocess.run(
+        ["git", "diff", "--no-ext-diff", "--unified=0", *diff_args, "--", *changed],
+        cwd=_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    ranges: dict[str, list[list[int]]] = {}
+    current: Optional[str] = None
+    changed_set = set(changed)
+    for line in result.stdout.splitlines():
+        if line.startswith("+++ b/"):
+            candidate = os.path.abspath(_ROOT / line[6:])
+            current = candidate if candidate in changed_set else None
+        elif line.startswith("+++ "):
+            current = None
+        elif current is not None and line.startswith("@@ "):
+            match = re.search(r"\+(\d+)(?:,(\d+))?", line)
+            if match is None:
+                raise RuntimeError(f"cannot parse git diff hunk: {line}")
+            start = int(match.group(1))
+            count = int(match.group(2) or 1)
+            if count:
+                ranges.setdefault(current, []).append([start, start + count - 1])
+
+    if not result.stdout and not base:
+        return None
+    return json.dumps([{"name": name, "lines": lines} for name, lines in sorted(ranges.items())])
+
+
 def main() -> int:
     changed = [os.path.abspath(path) for path in sys.argv[1:] if should_run_clang_tidy(path)]
     if not changed:
@@ -314,6 +359,7 @@ def main() -> int:
         print("ERROR: no sim compile databases found under build/cache/*/sim/", file=sys.stderr)
         return 1
 
+    line_filter = _changed_line_filter(changed)
     failed: set[str] = set()
     for f in changed:
         db_dirs = file_index.get(f)
@@ -321,8 +367,9 @@ def main() -> int:
             continue  # file not in any sim compile database (e.g. onboard-only)
 
         for db_dir in db_dirs:
+            filter_args = [f"--line-filter={line_filter}"] if line_filter is not None else []
             result = subprocess.run(
-                ["clang-tidy", f"-p={db_dir}", "--quiet"] + _SUPPRESS_ARGS + [f],
+                ["clang-tidy", f"-p={db_dir}", "--quiet"] + filter_args + _SUPPRESS_ARGS + [f],
                 check=False,
                 capture_output=True,
                 text=True,

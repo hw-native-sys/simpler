@@ -8,6 +8,7 @@
 # -----------------------------------------------------------------------------------------------------------
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -148,6 +149,30 @@ def test_clang_tidy_excluded_paths_exit_before_build_or_compile_database(monkeyp
     monkeypatch.setattr(sys, "argv", [str(CLANG_TIDY), path])
 
     assert module.main() == 0
+
+
+def test_clang_tidy_line_filter_keeps_only_added_lines(monkeypatch) -> None:
+    module = _load_clang_tidy_module(monkeypatch)
+    source = REPO_ROOT / "src/a5/platform/sim/host/device_runner.cpp"
+    monkeypatch.setenv("CLANG_TIDY_BASE_REF", "base")
+    monkeypatch.setenv("CLANG_TIDY_HEAD_REF", "head")
+
+    def fake_run(command, **kwargs):
+        assert "base...head" in command
+        assert str(source) in command
+        assert kwargs["check"] is True
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="+++ b/src/a5/platform/sim/host/device_runner.cpp\n"
+            "@@ -99,1 +99,2 @@\n"
+            "@@ -105,1 +106,0 @@\n"
+            "+++ b/src/common/platform/include/host/unchanged.h\n"
+            "@@ -4,1 +4,1 @@\n",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    assert json.loads(module._changed_line_filter([str(source)])) == [{"name": str(source), "lines": [[99, 100]]}]
 
 
 def test_self_cpu_uses_the_project_venv_for_lint() -> None:

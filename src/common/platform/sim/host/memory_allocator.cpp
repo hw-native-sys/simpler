@@ -11,18 +11,19 @@
 /**
  * Memory Allocator Implementation (Simulation)
  *
- * Uses standard malloc/free to simulate device memory operations.
+ * Uses aligned host allocation/free to simulate device memory operations.
  */
 
 #include "host/memory_allocator.h"
 
 #include <cstdlib>
 #include "common/unified_log.h"
+#include "host/aligned_allocation.h"
 
 MemoryAllocator::~MemoryAllocator() { finalize(); }
 
 void *MemoryAllocator::alloc(size_t size) {
-    void *ptr = std::malloc(size);
+    void *ptr = simpler::platform::aligned_host_alloc(size);
     if (ptr == nullptr) {
         LOG_ERROR("malloc failed (size=%zu)", size);
         return nullptr;
@@ -66,7 +67,7 @@ void *MemoryAllocator::Reservation::commit_alloc(size_t size) {
         LOG_ERROR("commit_alloc without a valid reservation (size=%zu)", size);
         return nullptr;
     }
-    void *ptr = std::malloc(size);
+    void *ptr = simpler::platform::aligned_host_alloc(size);
     if (ptr == nullptr) {
         LOG_ERROR("malloc failed (size=%zu)", size);
         return nullptr;

@@ -150,6 +150,9 @@ jobs:
 
       - name: Run pre-commit
         uses: pre-commit/action@v3.0.0
+        env:
+          CLANG_TIDY_BASE_REF: ${{ inputs.setup_variant == 'self-cpu' && steps.base.outputs.base_sha || inputs.base_sha }}
+          CLANG_TIDY_HEAD_REF: ${{ inputs.setup_variant == 'self-cpu' && (inputs.ref || github.sha) || inputs.head_sha }}
         with:
           extra_args: >-
             --from-ref ${{ inputs.setup_variant == 'self-cpu' && steps.base.outputs.base_sha || inputs.base_sha }}

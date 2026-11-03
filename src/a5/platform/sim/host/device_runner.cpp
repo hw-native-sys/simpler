@@ -41,6 +41,7 @@
 #include "cpu_sim_context.h"
 #include "host_log.h"
 #include "host/dfx_run_config.h"
+#include "host/aligned_allocation.h"
 #include "host/host_graph_runs.h"
 #include "host/raii_scope_guard.h"
 #include "host/run_boundary.h"
@@ -92,12 +93,12 @@ extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip
     return true;
 }
 
-// a5 sim: malloc / free wrappers shared by the four profiling subsystems'
+// a5 sim: aligned allocation / free wrappers shared by the profiling subsystems'
 // init_* methods. Plain function pointers convert implicitly into the
 // framework's std::function alloc / free shapes. Kept on the subclass (not
 // SimDeviceRunnerBase) because the corresponding a2a3 path uses the device
-// allocator (mem_alloc_) directly; a5's stays on std::malloc/free as before.
-static void *prof_alloc_cb(size_t size) { return std::malloc(size); }
+// allocator (mem_alloc_) directly.
+static void *prof_alloc_cb(size_t size) { return simpler::platform::aligned_host_alloc(size); }
 
 static int prof_free_cb(void *dev_ptr) {
     std::free(dev_ptr);

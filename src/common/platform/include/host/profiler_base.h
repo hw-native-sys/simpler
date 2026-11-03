@@ -239,6 +239,7 @@
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
+#include "host/aligned_allocation.h"
 #include "host/buffer_pool_manager.h"
 #include "host/chip_swimlane_runs.h"
 #include "host/profiling_copy.h"
@@ -1528,7 +1529,7 @@ protected:
             ops.reg = [this,
                        copy_to_device](void *dev_ptr, size_t size, int /*device_id*/, void **host_ptr_out) -> int {
                 if (host_ptr_out == nullptr) return PTO_RUNTIME_ERR_INTERNAL;
-                void *host_ptr = std::malloc(size);
+                void *host_ptr = simpler::platform::aligned_host_alloc(size);
                 if (host_ptr == nullptr) {
                     *host_ptr_out = nullptr;
                     return PTO_RUNTIME_ERR_INTERNAL;
@@ -1649,7 +1650,7 @@ protected:
                     return nullptr;
                 }
             } else if (copy_to_device_) {
-                host_ptr = std::malloc(size);
+                host_ptr = simpler::platform::aligned_host_alloc(size);
                 if (host_ptr == nullptr) {
                     rollback();
                     return nullptr;

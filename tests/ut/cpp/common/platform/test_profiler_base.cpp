@@ -198,6 +198,8 @@ public:
         );
     }
 
+    void *allocate_paired_for_test(size_t size, void **host) { return this->alloc_paired_buffer(size, host); }
+
     // Stand-in for a real Derived::init(): latch the thread count and hand the
     // base an identity-mapped (SVM-style) memory context.
     void
@@ -255,6 +257,48 @@ TEST(ProfilerBaseTest, ReinitializedContextIsAvailableBeforeStart) {
     collector.init(1, &current);
     EXPECT_EQ(collector.manager().shared_mem_host(), &current);
     EXPECT_EQ(collector.manager().shared_mem_dev(), &current);
+}
+
+TEST(ProfilerBaseTest, NonSvmHostShadowsAreCacheLineAlignedAndZeroed) {
+    TestHeader device{};
+    TestHeader shadow{};
+    TestCollector<SingleShardModule> collector;
+    collector.init_shadow(&device, &shadow);
+
+    for (int i = 0; i < 8; ++i) {
+        // Exercise non-round sizes as well as repeated allocations: malloc may
+        // coincidentally return a cache-line-aligned address for one request.
+        const size_t size = 1 + static_cast<size_t>(i) * 17;
+        void *paired_host = nullptr;
+        void *paired_dev = collector.allocate_paired_for_test(size, &paired_host);
+        EXPECT_NE(paired_dev, nullptr);
+        EXPECT_NE(paired_host, nullptr);
+        if (paired_dev != nullptr && paired_host != nullptr) {
+            EXPECT_EQ(reinterpret_cast<uintptr_t>(paired_dev) % 64, 0u);
+            EXPECT_EQ(reinterpret_cast<uintptr_t>(paired_host) % 64, 0u);
+            const auto *bytes = static_cast<const unsigned char *>(paired_host);
+            EXPECT_TRUE(std::all_of(bytes, bytes + size, [](unsigned char byte) {
+                return byte == 0;
+            }));
+        }
+
+        void *pool_host = nullptr;
+        void *pool_dev = collector.manager().alloc_and_register_block(size, &pool_host);
+        EXPECT_NE(pool_dev, nullptr);
+        EXPECT_NE(pool_host, nullptr);
+        if (pool_dev != nullptr && pool_host != nullptr) {
+            EXPECT_EQ(reinterpret_cast<uintptr_t>(pool_dev) % 64, 0u);
+            EXPECT_EQ(reinterpret_cast<uintptr_t>(pool_host) % 64, 0u);
+            const auto *bytes = static_cast<const unsigned char *>(pool_host);
+            EXPECT_TRUE(std::all_of(bytes, bytes + size, [](unsigned char byte) {
+                return byte == 0;
+            }));
+        }
+    }
+
+    collector.manager().release_all_owned([](void *ptr) {
+        std::free(ptr);
+    });
 }
 
 TEST(ProfilerBaseTest, ReusedShadowWritesToTheCurrentDeviceRegionBeforeStart) {
