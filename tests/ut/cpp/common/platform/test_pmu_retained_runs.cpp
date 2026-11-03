@@ -50,6 +50,7 @@
 #include "common/pmu_profiling.h"
 #include "host/pmu_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 // The platform register accessors, for the reason test_pmu_run_identity.cpp
 // gives: the two architectures define them in translation units that reach
@@ -90,7 +91,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-void *retained_alloc(size_t size) { return std::calloc(1, size); }
+void *retained_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int retained_free(void *ptr) {
     std::free(ptr);
@@ -839,7 +840,7 @@ TEST(PmuRetainedRuns, FatalLossSurvivesConfirmedResetWithoutInvokingReleaseCallb
     size_t releases = 0;
     PmuCollector collector;
     auto alloc = [&](size_t bytes) {
-        void *ptr = std::calloc(1, bytes);
+        void *ptr = profiler_test_calloc(bytes);
         backing.emplace_back(ptr, &std::free);
         return ptr;
     };

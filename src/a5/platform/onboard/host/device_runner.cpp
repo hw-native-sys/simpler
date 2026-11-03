@@ -1627,7 +1627,7 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int device_id, Kernel
 }
 
 int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
-    // a5: register_cb=nullptr, so the collector mallocs a host shadow per
+    // a5: register_cb=nullptr, so the collector allocates a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device (see
     // ProfilerBase::alloc_paired_buffer). No halHostRegister on a5.
     auto alloc_cb = [this](size_t size) -> void * {
@@ -1646,7 +1646,7 @@ int DeviceRunner::init_scope_stats(int num_threads, int device_id, KernelArgsHel
 }
 
 int DeviceRunner::init_dep_gen(int num_threads, int device_id, KernelArgsHelper &kernel_args) {
-    // a5: register_cb=nullptr, so the collector mallocs a host shadow per
+    // a5: register_cb=nullptr, so the collector allocates a host shadow per
     // device buffer + rtMemcpy's the zeroed shadow to device. No
     // halHostRegister on a5 (matches PMU / chip swimlane / dump collectors).
     auto alloc_cb = [this](size_t size) -> void * {

@@ -45,12 +45,13 @@
 #include "common/memory_barrier.h"
 #include "host/args_dump_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 
 namespace {
 
-void *attribution_alloc(size_t size) { return std::calloc(1, size); }
+void *attribution_alloc(size_t size) { return profiler_test_calloc(size); }
 
 int attribution_free(void *ptr) {
     std::free(ptr);

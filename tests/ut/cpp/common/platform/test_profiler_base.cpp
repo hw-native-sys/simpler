@@ -37,6 +37,7 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#include "profiler_test_allocator.h"
 
 namespace profiling_common {
 
@@ -186,7 +187,7 @@ public:
         };
         this->set_memory_context(
             [](size_t size) {
-                return std::calloc(1, size);
+                return profiler_test_calloc(size);
             },
             nullptr,
             [](void *ptr) {

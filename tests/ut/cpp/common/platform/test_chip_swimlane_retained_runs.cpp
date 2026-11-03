@@ -39,12 +39,13 @@
 #include "host/chip_swimlane_collector.h"
 #include "support/test_task_id.h"
 #include "host/run_boundary.h"
+#include "profiler_test_allocator.h"
 
 namespace fs = std::filesystem;
 
 namespace {
 
-void *retained_alloc(size_t size) { return std::calloc(1, size); }
+void *retained_alloc(size_t size) { return profiler_test_calloc(size); }
 
 // An allocator that runs out after a fixed number of successful calls, so a
 // collector's `init()` fails part-way and its rollback guard runs.
@@ -53,7 +54,7 @@ int g_alloc_budget = -1;
 void *retained_alloc_limited(size_t size) {
     if (g_alloc_budget == 0) return nullptr;
     if (g_alloc_budget > 0) g_alloc_budget--;
-    return std::calloc(1, size);
+    return profiler_test_calloc(size);
 }
 
 int retained_free(void *ptr) {
@@ -1688,7 +1689,7 @@ int g_orch_alloc_calls = 0;
 
 void *counting_alloc(size_t size) {
     g_orch_alloc_calls++;
-    return std::calloc(1, size);
+    return profiler_test_calloc(size);
 }
 
 /** Emit `count` orchestrator-phase records through the production entries. */
@@ -2157,7 +2158,7 @@ TEST(ChipSwimlaneRetainedRunsTest, FatalLossSurvivesConfirmedResetWithoutInvokin
     size_t releases = 0;
     ChipSwimlaneCollector collector;
     auto alloc = [&](size_t bytes) {
-        void *ptr = std::calloc(1, bytes);
+        void *ptr = profiler_test_calloc(bytes);
         backing.emplace_back(ptr, &std::free);
         return ptr;
     };

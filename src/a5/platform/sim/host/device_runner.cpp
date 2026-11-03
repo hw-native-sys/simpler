@@ -92,18 +92,6 @@ extern "C" __attribute__((weak, visibility("hidden"))) bool publish_runtime_chip
     return true;
 }
 
-// a5 sim: malloc / free wrappers shared by the four profiling subsystems'
-// init_* methods. Plain function pointers convert implicitly into the
-// framework's std::function alloc / free shapes. Kept on the subclass (not
-// SimDeviceRunnerBase) because the corresponding a2a3 path uses the device
-// allocator (mem_alloc_) directly; a5's stays on std::malloc/free as before.
-static void *prof_alloc_cb(size_t size) { return std::malloc(size); }
-
-static int prof_free_cb(void *dev_ptr) {
-    std::free(dev_ptr);
-    return 0;
-}
-
 struct DeviceRunner::ActiveRun {
     Runtime *runtime{nullptr};
     void *reg_blocks{nullptr};
@@ -1054,24 +1042,27 @@ bool DeviceRunner::terminal_backing_retained() const {
 
 int DeviceRunner::finalize_collectors() {
     clear_collector_shape();
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
     if (chip_swimlane_collector_.is_initialized()) {
-        chip_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        chip_swimlane_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
     // The one collector whose finalize can discover a failure of its own:
     // retained ArgsDump does its last host sealing there, after the caller's
     // own diagnostic flush has already run and returned.
     int rc = 0;
     if (dump_collector_.is_initialized()) {
-        rc = dump_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        rc = dump_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
     if (pmu_collector_.is_initialized()) {
-        pmu_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        pmu_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
     if (dep_gen_collector_.is_initialized()) {
-        dep_gen_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        dep_gen_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
     }
     if (scope_stats_collector_.is_initialized()) {
-        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, prof_free_cb);
+        scope_stats_collector_.finalize(/*unregister_cb=*/nullptr, free_cb);
         kernel_args_.scope_stats_data_base = 0;
     }
     if (terminal_backing_retained() && rc == 0) rc = PTO_RUNTIME_ERR_INTERNAL;
@@ -1215,9 +1206,14 @@ int DeviceRunner::arm_collectors_for_run(const Runtime &runtime, PreparedExecuti
 int DeviceRunner::init_chip_swimlane(
     int num_aicore, int aicpu_thread_num, int device_id, ChipSwimlaneLevel chip_swimlane_level
 ) {
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
     int rc = chip_swimlane_collector_.initialize(
-        num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, prof_alloc_cb, /*register_cb=*/nullptr,
-        prof_free_cb
+        num_aicore, aicpu_thread_num, device_id, chip_swimlane_level, alloc_cb, /*register_cb=*/nullptr, free_cb
     );
     if (rc == 0) {
         kernel_args_.chip_swimlane_data_base =
@@ -1230,9 +1226,14 @@ int DeviceRunner::init_chip_swimlane(
 
 int DeviceRunner::init_args_dump(const Runtime &runtime, int device_id, DumpArgsLevel dump_args_level) {
     int num_dump_threads = runtime.get_aicpu_thread_num();
-
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
     int rc = dump_collector_.initialize(
-        num_dump_threads, device_id, dump_args_level, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb
+        num_dump_threads, device_id, dump_args_level, alloc_cb, /*register_cb=*/nullptr, free_cb
     );
     if (rc != 0) {
         return rc;
@@ -1243,9 +1244,13 @@ int DeviceRunner::init_args_dump(const Runtime &runtime, int device_id, DumpArgs
 }
 
 int DeviceRunner::init_pmu(int num_cores, int num_threads, int /*device_id*/) {
-    int rc = pmu_collector_.init(
-        num_cores, num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*device_id=*/-1
-    );
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
+    int rc = pmu_collector_.init(num_cores, num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, /*device_id=*/-1);
     if (rc == 0) {
         kernel_args_.pmu_data_base = reinterpret_cast<uint64_t>(pmu_collector_.get_pmu_shm_device_ptr());
         kernel_args_.aicore_pmu_ring_addrs =
@@ -1255,12 +1260,16 @@ int DeviceRunner::init_pmu(int num_cores, int num_threads, int /*device_id*/) {
 }
 
 int DeviceRunner::init_scope_stats(int num_threads) {
-    // a5 sim: register_cb=nullptr, so the collector mallocs a host shadow per
+    // a5 sim: register_cb=nullptr, so the collector allocates a host shadow per
     // device buffer; sim's profiling_copy_* are plain memcpys, so the dev/host
     // shadow path collapses to one allocation pair without address-space tricks.
-    int rc = scope_stats_collector_.init(
-        num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*device_id=*/-1
-    );
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
+    int rc = scope_stats_collector_.init(num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, /*device_id=*/-1);
     if (rc != 0) {
         return rc;
     }
@@ -1272,8 +1281,13 @@ int DeviceRunner::init_scope_stats(int num_threads) {
 int DeviceRunner::init_dep_gen(int num_threads, int /*device_id*/) {
     // a5 sim: register_cb=nullptr; sim's profiling_copy_* are plain memcpys, so
     // the dev/host shadow path collapses to one allocation pair.
-    int rc =
-        dep_gen_collector_.init(num_threads, prof_alloc_cb, /*register_cb=*/nullptr, prof_free_cb, /*device_id=*/-1);
+    auto alloc_cb = [this](size_t size) -> void * {
+        return mem_alloc_.alloc(size);
+    };
+    auto free_cb = [this](void *dev_ptr) -> int {
+        return mem_alloc_.free(dev_ptr);
+    };
+    int rc = dep_gen_collector_.init(num_threads, alloc_cb, /*register_cb=*/nullptr, free_cb, /*device_id=*/-1);
     if (rc != 0) {
         return rc;
     }

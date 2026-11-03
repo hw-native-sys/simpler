@@ -24,6 +24,7 @@
 #include <iterator>
 #include <string>
 #include <unistd.h>
+#include "profiler_test_allocator.h"
 
 namespace {
 
@@ -35,7 +36,7 @@ public:
     void *host_shared() const { return shm_host_; }
 };
 
-void *allocate(size_t size) { return std::calloc(1, size); }
+void *allocate(size_t size) { return profiler_test_calloc(size); }
 
 int release(void *ptr) {
     std::free(ptr);

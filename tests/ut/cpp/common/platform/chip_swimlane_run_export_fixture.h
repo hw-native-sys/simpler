@@ -37,6 +37,7 @@
 #include "common/chip_swimlane_profiling.h"
 #include "host/chip_swimlane_collector.h"
 #include "support/test_task_id.h"
+#include "profiler_test_allocator.h"
 
 namespace chip_swimlane_fixture {
 
@@ -64,7 +65,7 @@ static_assert(
     "the phase_data union's task_id arm"
 );
 
-inline void *fixture_alloc(size_t size) { return std::calloc(1, size); }
+inline void *fixture_alloc(size_t size) { return profiler_test_calloc(size); }
 
 inline int fixture_free(void *ptr) {
     std::free(ptr);
@@ -79,9 +80,9 @@ struct PhaseBuffers {
     ChipSwimlaneAicpuTaskBuffer *perf{nullptr};
 
     PhaseBuffers() {
-        sched = static_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(std::calloc(1, sizeof(*sched)));
-        orch = static_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(std::calloc(1, sizeof(*orch)));
-        perf = static_cast<ChipSwimlaneAicpuTaskBuffer *>(std::calloc(1, sizeof(*perf)));
+        sched = static_cast<ChipSwimlaneAicpuSchedPhaseBuffer *>(profiler_test_calloc(sizeof(*sched)));
+        orch = static_cast<ChipSwimlaneAicpuOrchPhaseBuffer *>(profiler_test_calloc(sizeof(*orch)));
+        perf = static_cast<ChipSwimlaneAicpuTaskBuffer *>(profiler_test_calloc(sizeof(*perf)));
     }
     ~PhaseBuffers() {
         std::free(sched);
