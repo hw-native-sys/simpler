@@ -17,6 +17,15 @@ endmacro()
 a5_hbg_case(test_hbg_scheduler_contracts.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/aicpu)
 
+a5_hbg_case(test_hbg_graph_view.cpp)
+
+a5_hbg_case(test_hbg_ready_pool.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
+
+a5_hbg_case(test_hbg_native_graph_plan.cpp
+    INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host
+    SOURCES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
+
 a5_hbg_case(test_hbg_protocol_export.cpp
     INCLUDES ${SIMPLER_SRC}/a5/runtime/host_build_graph/host)
 

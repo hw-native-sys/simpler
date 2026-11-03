@@ -61,6 +61,7 @@ public:
         callables_[1] = std::move(callable);
         chip_callable_buffers_[1] = ChipCallableBuffer{};
     }
+    size_t scheduler_capacity(uint32_t slot) const { return scheduler_state_storage_[slot].device_capacity(); }
     void use_other_entry() { callables_[1].host_orch_func_ptr = alternate_entry_points(); }
     void allocate_callable() {
         void *allocation = mem_alloc_.alloc(64);

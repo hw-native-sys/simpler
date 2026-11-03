@@ -21,7 +21,7 @@ MAX_CLUSTERS = 36
 TOTAL_FLOATS = MAX_CLUSTERS * SLOTS_PER_BLOCK * FLOATS_PER_CACHE_LINE
 
 
-@pytest.mark.scheduler_mode("legacy")
+@pytest.mark.scheduler_mode("resident")
 @scene_test(level=2, runtime="host_build_graph")
 class TestGraphExecutionMixSpmdHostBuildGraphA5(SceneTestCase):
     RTOL = 0

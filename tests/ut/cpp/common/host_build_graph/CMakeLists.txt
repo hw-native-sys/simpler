@@ -133,6 +133,11 @@ hbg_case(test_hbg_bind_ledger.cpp
         # HostLogger is missing, so this takes host_log.cpp for that alone.
         ${SIMPLER_SRC}/common/log/host_log.cpp)
 
+if(TARGET test_a5_hbg_bind_ledger)
+    target_sources(test_a5_hbg_bind_ledger PRIVATE
+        ${SIMPLER_SRC}/a5/runtime/host_build_graph/host/native_graph_plan.cpp)
+endif()
+
 # Which maker states the caller device buffers a run produces. a2a3's does; a5's makes no such
 # statement, so the cases covering the declaration assert the opposite fact there rather than
 # skipping. Named after the property, not the arch, so the assertions read as what they check.

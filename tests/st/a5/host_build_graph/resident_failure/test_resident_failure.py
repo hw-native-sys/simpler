@@ -81,13 +81,16 @@ pytestmark = [
 ]
 
 
-def _compile(platform):
+def _compile(platform, *, native_graph=False):
     compiler = KernelCompiler(platform=platform)
     variant = "sim" if platform.endswith("sim") else "onboard"
     includes = [str(compiler.platform_dir / variant / "aicore")]
     spec = {
         "orchestration": {
-            "source": str(_KERNELS / "runtime_failure_orchestration.cpp"),
+            "source": str(
+                _KERNELS
+                / ("runtime_graph_failure_orchestration.cpp" if native_graph else "runtime_failure_orchestration.cpp")
+            ),
             "function_name": "aicpu_orchestration_entry",
             "signature": [ArgDirection.INOUT, ArgDirection.INOUT],
         },
@@ -114,7 +117,7 @@ def _compile(platform):
         ],
     }
     return compile_chip_callable_spec(
-        spec, platform, "host_build_graph", (__name__, platform, _pto_isa_compile_cache_token())
+        spec, platform, "host_build_graph", (__name__, platform, native_graph, _pto_isa_compile_cache_token())
     )
 
 
@@ -228,15 +231,16 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
         "hbg-native-protocol-v3",
         "hbg-native-protocol-v4",
         "hbg-native-protocol-v5",
+        "hbg-native-protocol-v6",
     )
-    if protocol["schema"] == "hbg-native-protocol-v5":
+    if protocol["schema"] in ("hbg-native-protocol-v5", "hbg-native-protocol-v6"):
         assert all(
             type(control.get("admission_claim_lock")) is int and control["admission_claim_lock"] == 0
             for control in control_rows
         )
     minimum_blocks = (
         2
-        if protocol["schema"] in ("hbg-native-protocol-v4", "hbg-native-protocol-v5")
+        if protocol["schema"] in ("hbg-native-protocol-v4", "hbg-native-protocol-v5", "hbg-native-protocol-v6")
         else positions * 2 + (1 if protocol["schema"] == "hbg-native-protocol-v2" else 0)
     )
     uses_tickets = blocks >= minimum_blocks
@@ -247,7 +251,14 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
     else:
         assert tickets == 0
     assert controls[consumer["task_ref"]]["claim_tickets"] == 0
-    assert protocol["resolved_task_count"] == 0
+    if protocol["schema"] == "hbg-native-protocol-v6":
+        enters = [node["node_ref"] for node in protocol["node_map"] if node["kind"] == 3]
+        exits = [node["node_ref"] for node in protocol["node_map"] if node["kind"] == 4]
+        assert len(enters) == len(exits) == 1
+        assert controls[enters[0]]["state"] == 2 and controls[exits[0]]["state"] == 0
+        assert protocol["resolved_task_count"] == 1
+    else:
+        assert protocol["resolved_task_count"] == 0
     assert all(controls[ref]["state"] == 0 for ref in (root["task_ref"], consumer["task_ref"]))
 
 
@@ -255,6 +266,53 @@ def _check_failed_capture(raw, blocks, mask, lane, *, nonreturning=False, stall_
 @pytest.mark.parametrize("blocks", (1, 2))
 def test_bounded_kernel_timeout_keeps_failed_run_contained(st_platform, st_device_ids, mask, lane, blocks, monkeypatch):
     _exercise_failure(st_platform, st_device_ids, mask, lane, blocks, monkeypatch, _STALL_MS)
+
+
+@pytest.mark.parametrize("mask,lane", [(2, 1), (7, 2)])
+def test_native_graph_failure_does_not_release_exit(st_platform, st_device_ids, mask, lane, monkeypatch):
+    timeout_ms = _SIM_TIMEOUT_MS if st_platform.endswith("sim") else _TIMEOUT_MS
+    stall_ms = _STALL_MS * timeout_ms // _TIMEOUT_MS
+    monkeypatch.setenv("SIMPLER_SCHEDULER_TIMEOUT_MS", str(timeout_ms))
+    output_root = _ROOT / "outputs"
+    output_root.mkdir(exist_ok=True)
+    artifacts = Path(tempfile.mkdtemp(prefix="native-graph-failure-", dir=output_root))
+    device = int(st_device_ids[0])
+    evidence = _run_pass(st_platform, device, artifacts, mask, lane, 2, stall_ms, recovery=False, native_graph=True)
+    if st_platform.endswith("sim"):
+        evidence += _run_pass(st_platform, device, artifacts, mask, lane, 2, stall_ms, recovery=True, native_graph=True)
+    else:
+        code = (
+            "import runpy,sys,json; from pathlib import Path; "
+            "ns=runpy.run_path(sys.argv[1]); p=json.loads(sys.argv[2]); p['artifacts']=Path(p['artifacts']); "
+            "print(ns['_RECOVERY_MARKER']+json.dumps(ns['_run_pass'](**p)))"
+        )
+        parameters = dict(
+            platform=st_platform,
+            device_id=device,
+            artifacts=str(artifacts),
+            mask=mask,
+            lane=lane,
+            blocks=2,
+            stall_ms=stall_ms,
+            recovery=True,
+            native_graph=True,
+        )
+        result = subprocess.run(
+            [sys.executable, "-u", "-c", code, str(Path(__file__).resolve()), json.dumps(parameters)],
+            capture_output=True,
+            text=True,
+            timeout=300,
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        rows = [
+            json.loads(line.removeprefix(_RECOVERY_MARKER))
+            for line in result.stdout.splitlines()
+            if line.startswith(_RECOVERY_MARKER)
+        ]
+        assert len(rows) == 1, result.stdout + result.stderr
+        evidence += rows[0]
+    (artifacts / "result.json").write_text(json.dumps(evidence, indent=2))
 
 
 @pytest.mark.platforms(["a5"])
@@ -516,7 +574,9 @@ def _retain_completion_proof(
     return row
 
 
-def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, recovery, two_wave=False):  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup paths
+def _run_pass(  # noqa: PLR0912 -- one Worker owns healthy, failed, and cleanup paths
+    platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, recovery, two_wave=False, native_graph=False
+):
     """Drive one Worker over this case and return its evidence rows.
 
     Returned bounded SIM faults use their joined-producer release check.
@@ -526,7 +586,7 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
     """
     nonreturning = stall_ms < 0
     capacity = _two_wave_capacity(mask) if blocks < 0 else blocks
-    callable_obj = _compile(platform)
+    callable_obj = _compile(platform, native_graph=native_graph)
     _task_interface._bind_host_log_session_directory()
     worker = Worker(
         level=2,
@@ -583,7 +643,9 @@ def _run_pass(platform, device_id, artifacts, mask, lane, blocks, stall_ms, *, r
             assert worker.scheduler_runtime_mode in (1, 2)
             path, raw = _capture(prefix)
             proof_call.update(capture=str(path), capture_run_epoch=raw["aicore_protocol"]["run_epoch"])
-            assert raw["aicore_protocol"]["schema"] == "hbg-native-protocol-v5"
+            assert raw["aicore_protocol"]["schema"] == (
+                "hbg-native-protocol-v6" if native_graph else "hbg-native-protocol-v5"
+            )
             launched = _root_block_num(raw["aicore_protocol"])
             assert blocks < 0 or launched == blocks
             # A STARS-killed op can poison device access; its D2H output is

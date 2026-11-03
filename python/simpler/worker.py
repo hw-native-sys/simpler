@@ -14276,9 +14276,9 @@ class Worker:
         """L2 only: which device-side scheduler the most recent bind selected.
 
         A ``SCHEDULER_RUNTIME_MODE_*`` value: 1 = resident pending, 2 = resident
-        ready, 3 = legacy because the graph holds a graph task, 4 = legacy
-        because a task shape the resident scheduler does not support. 0 means no
-        selection was ever published.
+        ready, 3 = legacy Graph capability fallback, 4 = legacy because a task
+        shape is unsupported by the resident scheduler. Supported Graph tasks
+        use resident mode. 0 means no selection was ever published.
 
         Returns 0 on non-L2 workers, on every arch other than a5, and on the
         tensormap_and_ringbuffer runtime -- only a5 host_build_graph chooses
