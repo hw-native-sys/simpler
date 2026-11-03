@@ -378,12 +378,14 @@ class TestAllreduceOnephaseP2MaxMinProd(SceneTestCase):
         {
             "name": "onephase_min",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "manual": ["a2a3sim", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "mode_id": 0, "reduce_op": 2},
         },
         {
             "name": "onephase_prod",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "manual": ["a2a3sim", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "mode_id": 0, "reduce_op": 3},
         },
@@ -410,18 +412,21 @@ class TestAllreduceTwophaseP2MaxMinProd(SceneTestCase):
         {
             "name": "twophase_max",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "manual": ["a2a3sim", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "mode_id": 1, "reduce_op": 1},
         },
         {
             "name": "twophase_min",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "manual": ["a2a3sim", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "mode_id": 1, "reduce_op": 2},
         },
         {
             "name": "twophase_prod",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "manual": ["a2a3sim", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "mode_id": 1, "reduce_op": 3},
         },
@@ -448,18 +453,21 @@ class TestAllreduceRingP2MaxMinProd(SceneTestCase):
         {
             "name": "ring_max",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "manual": ["a2a3sim", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "mode_id": 2, "reduce_op": 1},
         },
         {
             "name": "ring_min",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "manual": ["a2a3sim", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "mode_id": 2, "reduce_op": 2},
         },
         {
             "name": "ring_prod",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "manual": ["a2a3sim", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "mode_id": 2, "reduce_op": 3},
         },
@@ -575,6 +583,7 @@ class TestAllreduceIbingRejectNonSum(SceneTestCase):
         {
             "name": "ibing_max_rejected",
             "platforms": ["a2a3sim", "a2a3", "a5sim", "a5"],
+            "manual": ["a2a3sim", "a5sim"],
             "config": {"device_count": 2},
             "params": {"nranks": 2, "mode_id": 4, "reduce_op": 1},
         }

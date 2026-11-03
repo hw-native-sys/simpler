@@ -51,6 +51,13 @@ CASES = {
     "wide_count_int64_max": 13,
 }
 
+_DAILY_VALIDATION_CASES = {
+    "wide_count_wraps_to_one",
+    "negative_count_wraps_to_one",
+    "larger_count_wraps_to_one",
+    "wide_count_int64_min",
+}
+
 
 @functools.cache
 def _build_callable(platform: str) -> ChipCallable:
@@ -88,7 +95,13 @@ def _build_callable(platform: str) -> ChipCallable:
 @pytest.mark.platforms(["a2a3sim", "a5sim"])
 @pytest.mark.device_count(1)
 @pytest.mark.runtime(RUNTIME)
-@pytest.mark.parametrize("case_name", list(CASES))
+@pytest.mark.parametrize(
+    "case_name",
+    [
+        pytest.param(name, marks=pytest.mark.manual(["a2a3sim", "a5sim"])) if name in _DAILY_VALIDATION_CASES else name
+        for name in CASES
+    ],
+)
 def test_invalid_input_reports_code_five(st_platform, st_device_ids, case_name, capfd, drain_host_log):
     worker = Worker(level=2, platform=st_platform, runtime=RUNTIME, device_id=int(st_device_ids[0]))
     buffer = None

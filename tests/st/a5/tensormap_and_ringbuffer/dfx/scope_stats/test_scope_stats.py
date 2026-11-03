@@ -88,11 +88,13 @@ class TestScopeStats(SceneTestCase):
         {
             "name": "default",
             "platforms": ["a5sim", "a5"],
+            "manual": ["a5sim"],
             "params": {},
         },
         {
             "name": "aicpu_threads_2",
             "platforms": ["a5sim", "a5"],
+            "manual": ["a5sim"],
             "config": {"aicpu_thread_num": 2},
             "params": {},
         },
