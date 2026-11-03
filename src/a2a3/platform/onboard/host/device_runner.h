@@ -25,15 +25,11 @@
 
 #include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <string>
-#include <thread>
 #include <unordered_map>
-#include <unordered_set>
-#include <vector>
 
 #include "callable.h"
 #include "prepare_callable_common.h"
@@ -101,6 +97,8 @@ public:
 
     // The blocking entry point composes these operations. enqueue owns rollback
     // until the AICPU launch marker; drain takes that ownership on success.
+    int prepare_execution_streams(PreparedExecution &prepared, std::shared_ptr<const void> *lease) override;
+    int reclaim_execution_streams() override { return run_streams_.reclaim(); }
     int prepare_execution(
         Runtime &runtime, const CallConfig &config, uint32_t pipeline_slot, const NativeRunIdentity &identity,
         std::unique_ptr<PreparedExecution> *prepared
@@ -404,15 +402,11 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    /**
-     * Build this run's collector pools, profiling flag and device KernelArgs
-     * refresh, under the execution claim.
-     *
-     * The collectors are resident and shared by every run on this runner, and a
-     * run whose core / AICPU-thread counts differ from the pools' releases and
-     * rebuilds them. Neither is safe while another run is executing against
-     * them, which is why none of it happens during preparation.
-     */
+    // Resident pools may still have device/retained-writer users. Storage
+    // construction requires the execution claim until those pools have
+    // independent lifetimes; it does not acquire a run bank or start readers.
+    int prepare_collector_storage(const Runtime &runtime, PreparedExecution &prepared);
+    // Bind the per-run terminal bank after storage preparation succeeds.
     int arm_collectors_for_run(const Runtime &runtime, PreparedExecution &prepared);
 
     int init_chip_swimlane(

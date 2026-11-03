@@ -110,16 +110,21 @@ struct AicpuExecutor {
     int32_t init(Runtime *runtime);
     int32_t run(Runtime *runtime);
     void deinit(Runtime *runtime);
+    void reset_entry_state();
     // Decide this run's terminal record while the state it reads is still
     // valid. Runs inside the completion gate's finalizer, on the last
     // participant out.
     void snapshot_run_terminal(Runtime *runtime);
     // Commit the decided record. Runs on the thread that claims cleanup, after
     // teardown and before it returns from the kernel.
-    void publish_run_terminal();
+    void handoff_run_terminal();
 };
 
 static AicpuExecutor g_aicpu_executor;
+
+extern "C" __attribute__((visibility("default"))) void aicpu_reset_execution_entry() {
+    g_aicpu_executor.reset_entry_state();
+}
 
 // HBG orchestration handles belong to the host. Per-run deinit releases its
 // device execution state, so cold close has no persistent callable to destroy.
@@ -307,6 +312,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 // sequence ramp (slot i holds i), the mailbox's is zeroed cursors
                 // and publication gates. Zeroing the region is a substitute for
                 // neither call.
+                // The attach view is valid; no classification or dispatch is released yet.
+                // Prepared arguments survive, while progress belongs to this invocation.
+                rt->sm_handle->header->reset_execution_state();
                 rt->scheduler->seed_queue_slots();
                 rt->aicore_mailbox->init_empty();
             }
@@ -443,13 +451,31 @@ void AicpuExecutor::snapshot_run_terminal(Runtime *runtime) {
     terminal_publisher_.take(run_terminal_select(normal_path, header_status, terminal_), nullptr, 0);
 }
 
-void AicpuExecutor::publish_run_terminal() {
-    if (!terminal_publisher_.publish(get_platform_run_result_base(), get_platform_run_result_epoch())) {
+void AicpuExecutor::handoff_run_terminal() {
+    if (!terminal_publisher_.handoff()) {
         // Nothing to publish is the normal shape for a run that never reached
         // its rendezvous; a refused record is a producer defect. Either way the
         // host reads the run as undecided, so say which one happened.
-        LOG_INFO("%s", "aicpu_execute: no terminal record published for this run");
+        LOG_INFO("%s", "aicpu_execute: no terminal record handed off for this run");
     }
+}
+
+void AicpuExecutor::reset_entry_state() {
+    // Only invocation-private coordination is reset. The terminal publisher
+    // and resource owners remain valid through teardown and publication.
+    completion_gate_.reset();
+    runtime_init_ready_.store(false, std::memory_order_release);
+    terminal_.reset();
+    normal_path_claims_.store(0, std::memory_order_release);
+    aicpu_thread_num_ = 0;
+    init_done_.store(false, std::memory_order_release);
+    init_failed_.store(false, std::memory_order_release);
+    hs_setup_done_.store(false, std::memory_order_release);
+    hs_arrived_.store(0, std::memory_order_release);
+    hs_thread_seq_.store(0, std::memory_order_release);
+    classify_ready_.store(false, std::memory_order_release);
+    classify_arrived_.store(0, std::memory_order_release);
+    thread_idx_.store(0, std::memory_order_release);
 }
 
 void AicpuExecutor::deinit(Runtime *runtime) {
@@ -463,30 +489,11 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     // Reset all SchedulerContext-owned state in one place.
     sched_ctx_.deinit();
 
-    completion_gate_.reset();
-    runtime_init_ready_.store(false, std::memory_order_release);
-    // Both are this run's inputs to the terminal record, already folded into
-    // terminal_publisher_ by the finalizer. That snapshot is deliberately not
-    // cleared here: the thread running this deinit is the one that publishes it
-    // next, after teardown.
-    terminal_.reset();
-    normal_path_claims_.store(0, std::memory_order_release);
-
-    aicpu_thread_num_ = 0;
-
     // Clear the file-scope runtime pointer (freed by the last scheduler thread before deinit).
     rt = nullptr;
 
+    reset_entry_state();
     LOG_INFO("DeInit: Runtime execution state reset");
-
-    init_done_.store(false, std::memory_order_release);
-    init_failed_.store(false, std::memory_order_release);
-    hs_setup_done_.store(false, std::memory_order_release);
-    hs_arrived_.store(0, std::memory_order_release);
-    hs_thread_seq_.store(0, std::memory_order_release);
-    classify_ready_.store(false, std::memory_order_release);
-    classify_arrived_.store(0, std::memory_order_release);
-    thread_idx_.store(0, std::memory_order_release);
 
     LOG_INFO("DeInit: AicpuExecutor reset complete");
 }
@@ -545,7 +552,7 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     if (g_aicpu_executor.completion_gate_.claim_cleanup()) {
         LOG_INFO("aicpu_execute: All threads finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
-        g_aicpu_executor.publish_run_terminal();
+        g_aicpu_executor.handoff_run_terminal();
     }
 
     if (runtime_rc != 0) {

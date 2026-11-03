@@ -28,12 +28,14 @@ protected:
     int tokens[16]{};
     int created = 0, destroyed = 0, operation = 0, fail_at = 0;
     int sync_error = 0;
+    int fail_create_at = -1;
     bool completed = false;
     std::vector<std::string> trace;
     void *caller = &tokens[10], *cpu = &tokens[11], *core = &tokens[12];
     RunCompletionFence::DeviceEventOps ops() {
         return {
             [this](void **out) {
+                if (created == fail_create_at) return -101;
                 *out = &tokens[created++];
                 return 0;
             },
@@ -81,6 +83,66 @@ protected:
         ASSERT_EQ(fence.record(kRun, Role::Aicpu, cpu), 0);
     }
 };
+
+TEST_F(CallerOrderTest, ColdPreparationCreatesAllEdgesWithoutBindingOrSubmitting) {
+    ASSERT_EQ(order.prepare_resources(), 0);
+    EXPECT_EQ(created, 3);
+    EXPECT_TRUE(trace.empty());
+    LaunchProgressSink sink;
+    EXPECT_NE(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
+    ASSERT_EQ(order.arm(kRun, caller, cpu, core), 0);
+    EXPECT_EQ(created, 3);
+    ASSERT_EQ(order.prepare_resources(), 0);
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
+    EXPECT_EQ(trace, (std::vector<std::string>{"record caller", "wait cpu", "record cpu", "wait core"}));
+    EXPECT_EQ(created, 3);
+}
+
+TEST_F(CallerOrderTest, UnusedColdResourcesCanBeReleased) {
+    ASSERT_EQ(order.prepare_resources(), 0);
+    EXPECT_EQ(order.release(), 0);
+    EXPECT_EQ(destroyed, 3);
+    EXPECT_TRUE(trace.empty());
+}
+
+TEST_F(CallerOrderTest, PartialColdPreparationCanRetryWithoutBindingOrLeaking) {
+    fail_create_at = 1;
+    EXPECT_EQ(order.prepare_resources(), -101);
+    EXPECT_EQ(created, 1);
+    LaunchProgressSink sink;
+    EXPECT_NE(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
+    EXPECT_FALSE(sink.submitted());
+    fail_create_at = -1;
+    ASSERT_EQ(order.prepare_resources(), 0);
+    EXPECT_EQ(created, 3);
+    EXPECT_EQ(order.release(), 0);
+    EXPECT_EQ(destroyed, 3);
+    EXPECT_TRUE(trace.empty());
+}
 
 TEST_F(CallerOrderTest, CallerWaitPinsTheKernelFenceUntilItsOwnProofCompletes) {
     arm();
@@ -436,4 +498,49 @@ TEST_F(CallerOrderTest, FailedPublicationForkRecordDoesNotDiscardTheCopy) {
     EXPECT_NE(order.retire(kRun), 0);
     ASSERT_EQ(order.discharge(kRun, 100), 0);
     EXPECT_EQ(order.retire(kRun), 0);
+}
+
+TEST_F(CallerOrderTest, RecordingKeepsEventsUntilExternalUseEndsWithoutWaitingForExecution) {
+    ASSERT_EQ(fence.arm(kRun), 0);
+    ASSERT_EQ(order.arm(kRun, caller, caller, core), 0);
+    LaunchProgressSink sink;
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
+    ASSERT_EQ(order.join(kRun, fence), 0);
+    const auto recording_trace = trace;
+    EXPECT_NE(order.retire(kRun), 0);
+    EXPECT_NE(order.release(), 0);
+    EXPECT_NE(order.end_recording(kNext), 0);
+    EXPECT_EQ(destroyed, 0);
+    ASSERT_EQ(order.end_recording(kRun), 0);
+    ASSERT_EQ(order.retire(kRun), 0);
+    EXPECT_EQ(trace, recording_trace);
+    EXPECT_EQ(order.release(), 0);
+    EXPECT_GT(destroyed, 0);
+}
+
+TEST_F(CallerOrderTest, ExternalRecordingEndDoesNotDischargeAnEagerCallerReference) {
+    arm();
+    LaunchProgressSink sink;
+    ASSERT_EQ(
+        order.fork(
+            kRun, sink,
+            [] {
+                return 0;
+            }
+        ),
+        0
+    );
+    publish_whole_boundary();
+    ASSERT_EQ(order.join(kRun, fence), 0);
+    EXPECT_NE(order.end_recording(kRun), 0);
+    EXPECT_NE(order.retire(kRun), 0);
+    EXPECT_EQ(destroyed, 0);
 }

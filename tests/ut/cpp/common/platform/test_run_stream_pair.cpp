@@ -560,4 +560,80 @@ TEST(RunStreamPair, AFailedCreateLeavesThePairEmpty) {
     EXPECT_FALSE(pair.ready());
 }
 
+TEST(RunStreamPair, RetainedPreparationKeepsItsStreamAcrossReplacement) {
+    FakeStreams fake;
+    auto pair = make_pair(fake);
+    ASSERT_EQ(pair.ensure(), 0);
+    auto old = pair.retain();
+    const auto old_core = old->aicore;
+    pair.mark_stale();
+    ASSERT_EQ(pair.ensure(), 0);
+    EXPECT_NE(pair.aicore(), old_core);
+    EXPECT_EQ(fake.live_count(), 3u);
+    ASSERT_EQ(pair.mark_submitted(kOwnerA, old_core), 0);
+    ASSERT_EQ(pair.mark_submitted(kOwnerB, pair.aicore()), 0);
+    EXPECT_EQ(
+        pair.poll(
+            kOwnerA,
+            [&](void *cpu, void *core) {
+                EXPECT_EQ(cpu, old->aicpu);
+                EXPECT_EQ(core, old_core);
+                return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+            }
+        ),
+        SIMPLER_NATIVE_RUN_POLL_COMPLETE
+    );
+    EXPECT_EQ(pair.retire(CompletionStatus::Unproven, kOwnerA), 0);
+    EXPECT_EQ(pair.live_owner_count(), 1u);
+    EXPECT_FALSE(pair.aicore_replacement_pending());
+    EXPECT_EQ(pair.destroy(), PTO_RUNTIME_ERR_INVALID_STATE);
+    EXPECT_EQ(pair.retire(CompletionStatus::Complete, kOwnerB), 0);
+    old.reset();
+    fake.fail_next_destroys(1);
+    EXPECT_EQ(pair.reclaim(), -13);
+    EXPECT_EQ(fake.live_count(), 3u);
+    EXPECT_EQ(pair.reclaim(), 0);
+    EXPECT_EQ(fake.live_count(), 2u);
+    EXPECT_EQ(pair.destroy(), 0);
+    EXPECT_TRUE(pair.retired());
+}
+
+TEST(RunStreamPair, FailedRetiredDestroyStillCountsAsLive) {
+    FakeStreams fake;
+    auto pair = make_pair(fake);
+    ASSERT_EQ(pair.ensure(), 0);
+    auto old = pair.retain();
+    pair.mark_stale();
+    ASSERT_EQ(pair.ensure(), 0);
+    old.reset();
+    fake.fail_next_destroys(1);
+    EXPECT_EQ(pair.destroy(), -13);
+    EXPECT_FALSE(pair.retired());
+    EXPECT_EQ(pair.destroy(), 0);
+    EXPECT_TRUE(pair.retired());
+}
+
+TEST(RunStreamPair, BorrowedStreamsAreTrackedWithoutCreatingOrDestroyingOwnedStreams) {
+    FakeStreams fake;
+    auto pair = make_pair(fake);
+    void *cpu = reinterpret_cast<void *>(101);
+    void *core = reinterpret_cast<void *>(102);
+    ASSERT_EQ(pair.mark_submitted(kOwnerA, core, cpu), 0);
+    EXPECT_EQ(
+        pair.poll(
+            kOwnerA,
+            [&](void *actual_cpu, void *actual_core) {
+                EXPECT_EQ(actual_cpu, cpu);
+                EXPECT_EQ(actual_core, core);
+                return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+            }
+        ),
+        SIMPLER_NATIVE_RUN_POLL_COMPLETE
+    );
+    EXPECT_EQ(pair.retire(CompletionStatus::Unproven, kOwnerA), 0);
+    EXPECT_EQ(pair.destroy(), 0);
+    EXPECT_EQ(fake.live_count(), 0u);
+    EXPECT_EQ(pair.created_count(), 0u);
+}
+
 }  // namespace

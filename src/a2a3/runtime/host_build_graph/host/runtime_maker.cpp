@@ -1356,6 +1356,7 @@ extern "C" int bind_callable_to_runtime_impl(
     auto host_phase_guard = RAIIScopeGuard([runtime, api, &prepared]() {
         if (!prepared) {
             runtime->clear_pending_publication();
+            runtime->clear_prepared_publication();
             host_phase_trace_end(api);
         }
     });
@@ -1689,6 +1690,7 @@ extern "C" int publish_run_image_impl(Runtime *runtime, const HostApi *api) {
         const auto plan = std::static_pointer_cast<HostPreparePlan>(saved);
         dep_gen_host_graph_restore_for_export(&plan->diagnostic_graph, plan->diagnostic_outcome);
     }
+    runtime->retain_prepared_publication(std::move(publication));
     return 0;
 }
 
@@ -1718,6 +1720,7 @@ extern "C" int release_run_bindings_impl(Runtime *runtime, const HostApi *api) {
     // Close only this run's trace; another run may already own the recorder.
     host_phase_trace_end(api);
     runtime->clear_pending_publication();
+    runtime->clear_prepared_publication();
     release_run_tensor_leases(runtime, api);
     // The dispatch table is owned by bind_callable_to_runtime, which clears it
     // before replaying the active callable's addresses. The chip-callable device

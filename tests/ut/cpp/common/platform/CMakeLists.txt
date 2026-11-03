@@ -966,6 +966,7 @@ simpler_ut_cases(platform_single_case
     test_arena_replacement_transaction.cpp
     test_auto_admission.cpp
     test_caller_device_buffers.cpp
+    test_native_invocation_completion.cpp
     test_context_lifecycle.cpp
     test_device_fault_monitor.cpp
     test_device_health_state.cpp
@@ -974,6 +975,7 @@ simpler_ut_cases(platform_single_case
     test_host_api.cpp
     test_kernel_entry_validation.cpp
     test_queued_stream_waits.cpp
+    test_prepared_run_resources.cpp
     test_retained_scheduler_storage.cpp
     test_retained_temp_bump.cpp
     test_run_caller_order.cpp
@@ -1033,5 +1035,19 @@ platform_single_case(test_module_thread_value_lifetime.cpp
     DEFINES TEST_MODULE_THREAD_VALUE_PATH="$<TARGET_FILE:module_thread_value_consumer>"
         TEST_MODULE_THREAD_VALUE_PEER_PATH="$<TARGET_FILE:module_thread_value_peer>"
     LINK ${CMAKE_DL_LIBS} DEPENDS module_thread_value_consumer module_thread_value_peer)
+
+platform_single_case(test_aicpu_entry_gate.cpp
+    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/sim/aicpu/platform_aicpu_affinity.cpp)
+platform_single_case(test_aicpu_filter_entry_gate.cpp
+    SOURCES ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/aicpu/platform_aicpu_affinity.cpp)
+
+set_tests_properties(test_aicpu_entry_gate test_aicpu_filter_entry_gate PROPERTIES TIMEOUT 15)
+
+platform_single_case(test_native_invocation_entry.cpp
+    SOURCES
+        ${SIMPLER_COMMON_PLATFORM_DIR}/shared/aicpu/device_run_result_base_aicpu.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/sim/aicpu/cache_ops.cpp
+        ${SIMPLER_COMMON_PLATFORM_DIR}/sim/aicpu/platform_aicpu_affinity.cpp)
+set_tests_properties(test_native_invocation_entry PROPERTIES TIMEOUT 15)
 
 simpler_ut_glob_cases(platform_case_without_axes)

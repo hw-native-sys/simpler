@@ -18,6 +18,7 @@
 #include "common/unified_log.h"
 #include "aicpu/aicpu_device_config.h"
 #include "aicpu/device_time.h"
+#include "aicpu/cache_maintenance.h"
 #include "aicpu/chip_swimlane_collector_aicpu.h"
 #include "aicpu/device_run_result_base_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -661,6 +662,13 @@ int32_t SchedulerContext::retire_claimed_cores(Runtime *runtime, const int32_t *
     // metadata before a unique retirement claimant can enter this helper.
     const uint64_t deadline = platform_aicore_exit_deadline();
     const int32_t rc = platform_retire_aicore_group(targets, count, deadline, released);
+    for (size_t i = 0; i < count; ++i) {
+        if (!released[i]) continue;
+        Handshake *report = &runtime->dev.workers[claimed_ids[i]];
+        aicore_invalidate_retired_report(report);
+        cache_flush_range(report, sizeof(*report));
+    }
+    wmb();
     if (rc != 0) {
         // Naming the cores is the only signal an unreleased worker leaves: it
         // spins on a gate it cannot log about, and the host sees just a stream

@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <vector>
@@ -344,7 +345,7 @@ public:
             if (!(b.region == region)) continue;
             if (b.quarantined || b.release_unconfirmed) continue;
             if (b.bytes < bytes) continue;
-            if (b.ref_count != 0) continue;  // capacity is not permission
+            if (b.ref_count != 0 || b.prepared_references()) continue;  // capacity is not permission
             if (!add_ref(b, run_epoch, max_block_refs())) return refuse(why, AcquireRefusal::NotServing);
             // Handed out as this region's backing, so it stops being an
             // obsolete generation now rather than at publication: between the
@@ -689,7 +690,7 @@ public:
         std::scoped_lock lk(mu_);
         int last_error = 0;
         for (Block &b : blocks_) {
-            if (b.quarantined || b.ref_count != 0 || b.released || b.swept) continue;
+            if (b.quarantined || b.ref_count != 0 || b.prepared_references() || b.released || b.swept) continue;
             // A release that already failed is not attempted again here. Its
             // bytes keep their charge and its record keeps the failure, and
             // the terminal sweep below still gets the one further attempt that
@@ -745,6 +746,51 @@ public:
         }
         compact_locked();
         return last_error;
+    }
+
+    // A backing lease is independent of a run's retirement. Its destruction
+    // only drops a host reference; reclamation still uses the device backend.
+    struct BackingReference {};
+    using BackingLease = std::shared_ptr<const BackingReference>;
+    // Identity without a use obligation, including after an allocation's address is reused.
+    using BackingIdentity = std::weak_ptr<const BackingReference>;
+
+    BackingLease retain_backing(void *base) {
+        std::scoped_lock lk(mu_);
+        Block *b = find_locked(base);
+        if (b == nullptr || b->released || b->swept || b->quarantined || b->release_unconfirmed) return {};
+        if (!b->prepared_reference) b->prepared_reference = std::make_shared<BackingReference>();
+        return b->prepared_reference;
+    }
+
+    // Prepared-owner close releases only its own obsolete backing and retries
+    // its unmapped failed frees. Current backing and live readers stay protected.
+    int release_prepared_backing(const std::vector<BackingIdentity> &backing) {
+        std::scoped_lock lk(mu_);
+        int first_error = 0;
+        bool recovered = false;
+        for (Block &b : blocks_) {
+            if (!b.prepared_reference || b.released) continue;
+            const bool selected = std::any_of(backing.begin(), backing.end(), [&](const auto &identity) {
+                return !identity.owner_before(b.prepared_reference) && !b.prepared_reference.owner_before(identity);
+            });
+            if (!selected) continue;
+            const bool failed = b.release_unconfirmed || b.quarantined;
+            int rc = failed ? (b.release_rc != 0 ? b.release_rc : PTO_RUNTIME_ERR_INVALID_STATE) : 0;
+            if (reclaimable_locked(b) || (b.release_unconfirmed && !b.current && !b.swept && !b.quarantined &&
+                                          !b.mapping_retained && b.ref_count == 0 && !b.prepared_references())) {
+                rc = apply_release_locked(b);
+                recovered = recovered || (failed && rc == 0);
+            }
+            if (first_error == 0) first_error = rc;
+        }
+        if (recovered) {
+            degraded_ = std::any_of(blocks_.begin(), blocks_.end(), [](const Block &b) {
+                return b.quarantined || b.release_unconfirmed;
+            });
+        }
+        compact_locked();
+        return first_error;
     }
 
     /** Whether the allocator's terminal sweep must keep `base`. */
@@ -876,7 +922,9 @@ public:
     BlockState block_state(void *base) const {
         std::scoped_lock lk(mu_);
         const Block *b = find_locked(base);
-        return b == nullptr ? BlockState::ProvenUnused : b->state;
+        if (b == nullptr) return BlockState::ProvenUnused;
+        if (b->state == BlockState::ProvenUnused && b->prepared_references()) return BlockState::Referenced;
+        return b->state;
     }
 
 private:
@@ -889,6 +937,8 @@ private:
         // consumer the block belongs to, so an epoch identifies a reference.
         std::vector<uint64_t> refs;
         uint32_t ref_count{0};
+        std::shared_ptr<const BackingReference> prepared_reference;
+        bool prepared_references() const { return prepared_reference.use_count() > 1; }
         int release_rc{0};
         bool quarantined{false};
         bool release_unconfirmed{false};
@@ -910,7 +960,7 @@ private:
 
     bool must_keep_locked(void *base) const noexcept {
         const Block *b = find_locked(base);
-        return b != nullptr && b->quarantined;
+        return b != nullptr && (b->quarantined || b->prepared_references());
     }
 
     /**
@@ -1105,9 +1155,9 @@ private:
      * Ownership of some block can no longer be proved, so this manager stops
      * publishing new ones.
      *
-     * Nothing this manager does on its own can clear such a record. The
-     * terminal sweep is the one place a failed free can still be settled, and
-     * only there, once; a failed unmap leaves a live host address that no
+     * Ordinary reclamation cannot clear such a record. Explicit prepared-owner
+     * close or the terminal sweep can settle an unmapped failed free; a failed
+     * unmap leaves a live host address that no
      * later attempt makes safe; and a run destroyed before its facts completed
      * can never produce them. Without this latch each later round could
      * publish another block and leave another record behind it, so the ledger
@@ -1132,6 +1182,8 @@ private:
         if (outcome == ReleaseOutcome::Freed) {
             b.released = true;
             b.swept = true;  // accounted for here; the terminal sweep skips it
+            b.release_unconfirmed = false;
+            b.release_rc = 0;
             b.state = BlockState::ProvenUnused;
             reserved_bytes_ -= b.bytes;
             return 0;
@@ -1141,6 +1193,7 @@ private:
             // never be handed to another allocation. Quarantined rather than
             // merely unconfirmed: this is not a free that might be retried.
             b.quarantined = true;
+            b.release_rc = platform_rc;
             b.state = BlockState::Quarantined;
             if (!b.mapping_retained) {
                 b.mapping_retained = true;
@@ -1169,7 +1222,7 @@ private:
      */
     static bool compactable_locked(const Block &b) {
         return b.released && b.swept && !b.mapping_retained && !b.quarantined && !b.release_unconfirmed &&
-               b.release_rc == 0 && b.ref_count == 0;
+               b.release_rc == 0 && b.ref_count == 0 && !b.prepared_references();
     }
 
     /**
@@ -1204,7 +1257,7 @@ private:
     static bool reclaimable_locked(const Block &b) {
         if (b.current || b.released || b.swept) return false;
         if (b.quarantined || b.release_unconfirmed || b.mapping_retained) return false;
-        return b.ref_count == 0;
+        return b.ref_count == 0 && !b.prepared_references();
     }
 
     /**
@@ -1224,7 +1277,7 @@ private:
     static bool idle_backing_locked(const Block &b) {
         if (!b.current || b.released || b.swept || !b.run_referenced) return false;
         if (b.quarantined || b.release_unconfirmed || b.mapping_retained) return false;
-        return b.ref_count == 0;
+        return b.ref_count == 0 && !b.prepared_references();
     }
 
     bool make_room_locked(size_t bytes) {

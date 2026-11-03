@@ -657,6 +657,37 @@ void retire(WorkspaceManager &m, uint32_t slot, uint64_t epoch) {
     report_host_side_done(m, slot, epoch);
 }
 
+TEST(WorkspaceManagerLifecycle, PreparedBackingSurvivesRunRetirementAndBlocksReuseAndSweep) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const auto region = WorkspaceManager::arena_region(0, WorkspaceManager::ArenaRegion::RuntimePool);
+    void *first = m.acquire(region, 1, 4096);
+    ASSERT_NE(first, nullptr);
+    auto held = m.retain_backing(first);
+    ASSERT_NE(held, nullptr);
+    retire(m, 0, 1);
+    m.note_run_fact(0, 1, WorkspaceManager::RunFact::ContextDestroyed);
+    EXPECT_TRUE(m.must_keep(first));
+    EXPECT_EQ(m.block_state(first), WorkspaceManager::BlockState::Referenced);
+    {
+        auto sweep = m.begin_terminal_sweep();
+        EXPECT_TRUE(sweep.must_keep(first));
+    }
+    EXPECT_EQ(m.detach_idle_backing(first), 0U);
+    void *next = m.acquire(region, 2, 4096);
+    ASSERT_NE(next, nullptr);
+    EXPECT_NE(next, first);
+    m.note_published(region, next);
+    ASSERT_EQ(m.reclaim_obsolete(), 0);
+    ASSERT_EQ(m.release_unreferenced(), 0);
+    EXPECT_EQ(backend.live_bytes.count(first), 1U);
+    held.reset();
+    EXPECT_FALSE(m.must_keep(first));
+    ASSERT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_EQ(backend.live_bytes.count(first), 0U);
+}
+
 TEST(WorkspaceManagerLifecycle, TheContextsOwnBackingIsNoConsumerACloseMustWaitFor) {
     FakeBackend backend;
     WorkspaceManager m;
@@ -1263,6 +1294,135 @@ TEST(WorkspaceManagerDegraded, AnUnprovableRunStopsNewPublication) {
     // Nothing was freed to get there.
     EXPECT_TRUE(backend.released.empty());
     EXPECT_EQ(m.reserved_bytes(), kOneMiB);
+}
+
+TEST(WorkspaceManagerPreparedClose, OnlyNamedBackingIsFreedAndUnrelatedFailureStillBlocksGrowth) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    void *selected = nullptr;
+    void *other = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, WorkspaceManager::staging_region(0), 1, kOneMiB, &selected));
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, WorkspaceManager::staging_region(1), 2, kTwoMiB, &other));
+    std::vector<WorkspaceManager::BackingIdentity> selected_identity{m.retain_backing(selected)};
+    std::vector<WorkspaceManager::BackingIdentity> other_identity{m.retain_backing(other)};
+    ASSERT_TRUE(m.note_unpublished(selected));
+    ASSERT_TRUE(m.note_unpublished(other));
+
+    backend.fail_release_of = other;
+    ASSERT_EQ(m.release_prepared_backing(selected_identity), 0);
+    ASSERT_EQ(backend.released, std::vector<void *>({selected}));
+    EXPECT_EQ(m.reserved_bytes(), kTwoMiB);
+    EXPECT_EQ(m.release_prepared_backing(other_identity), -7);
+    EXPECT_EQ(m.block_state(other), WorkspaceManager::BlockState::ReleaseUnconfirmed);
+    backend.fail_release_of = nullptr;
+    const auto attempts = backend.released.size();
+    EXPECT_EQ(m.reclaim_obsolete(), 0);
+    EXPECT_EQ(m.release_prepared_backing(selected_identity), 0);
+    EXPECT_EQ(backend.released.size(), attempts);
+    WorkspaceManager::AcquireRefusal why{};
+    EXPECT_EQ(m.acquire(WorkspaceManager::staging_region(2), 3, kOneMiB, &why), nullptr);
+    EXPECT_EQ(why, WorkspaceManager::AcquireRefusal::Degraded);
+
+    ASSERT_EQ(m.release_prepared_backing(other_identity), 0);
+    EXPECT_EQ(backend.released.back(), other);
+    EXPECT_EQ(m.reserved_bytes(), 0u);
+    SimplerWorkspaceReport recovered{};
+    ASSERT_TRUE(m.report(&recovered));
+    EXPECT_EQ(recovered.proof_unavailable, 0u);
+    EXPECT_NE(m.acquire(WorkspaceManager::staging_region(2), 4, kOneMiB), nullptr);
+}
+
+TEST(WorkspaceManagerPreparedClose, SuccessfulRetryDoesNotClearUnrelatedFailedOrQuarantinedBacking) {
+    for (int other_failure : {0, 1, 2}) {
+        SCOPED_TRACE(other_failure);
+        FakeBackend backend;
+        WorkspaceManager m;
+        ASSERT_TRUE(m.configure(backend.ops()));
+        void *selected = nullptr;
+        void *other = nullptr;
+        ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, WorkspaceManager::staging_region(0), 1, kOneMiB, &selected));
+        ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, WorkspaceManager::staging_region(1), 2, kTwoMiB, &other));
+        std::vector<WorkspaceManager::BackingIdentity> selected_identity{m.retain_backing(selected)};
+        std::vector<WorkspaceManager::BackingIdentity> other_identity{m.retain_backing(other)};
+        ASSERT_TRUE(m.note_unpublished(selected));
+        backend.fail_release_of = selected;
+        ASSERT_EQ(m.release_prepared_backing(selected_identity), -7);
+        backend.fail_release_of = nullptr;
+        ASSERT_TRUE(m.note_unpublished(other));
+        if (other_failure == 0) backend.fail_release_of = other;
+        if (other_failure == 1) backend.keep_mapped_of = other;
+        if (other_failure == 2) ASSERT_TRUE(m.note_mapping_unregister_failed(other));
+        EXPECT_NE(m.release_prepared_backing(other_identity), 0);
+        const auto attempts = backend.released.size();
+        backend.fail_release_of = backend.keep_mapped_of = nullptr;
+        EXPECT_EQ(m.release_prepared_backing(selected_identity), 0);
+        EXPECT_EQ(backend.released.size(), attempts + 1);
+        EXPECT_EQ(backend.released.back(), selected);
+        WorkspaceManager::AcquireRefusal why{};
+        EXPECT_EQ(m.acquire(WorkspaceManager::staging_region(2), 3, kOneMiB, &why), nullptr);
+        EXPECT_EQ(why, WorkspaceManager::AcquireRefusal::Degraded);
+    }
+}
+
+TEST(WorkspaceManagerPreparedClose, MappedAndUnprovedDeviceUseAreNeverRetried) {
+    for (bool mapped : {false, true}) {
+        SCOPED_TRACE(mapped);
+        FakeBackend backend;
+        WorkspaceManager m;
+        ASSERT_TRUE(m.configure(backend.ops()));
+        void *block = m.acquire(WorkspaceManager::staging_region(0), 1, kOneMiB);
+        ASSERT_NE(block, nullptr);
+        m.note_published(WorkspaceManager::staging_region(0), block);
+        std::vector<WorkspaceManager::BackingIdentity> identity{m.retain_backing(block)};
+        if (mapped) {
+            report_launched_and_drained(m, 0, 1);
+            report_host_side_done(m, 0, 1);
+            ASSERT_TRUE(m.note_unpublished(block));
+            backend.keep_mapped_of = block;
+            ASSERT_EQ(m.release_prepared_backing(identity), -9);
+            backend.keep_mapped_of = nullptr;
+        } else {
+            m.note_run_fact(0, 1, WorkspaceManager::RunFact::Launched);
+            m.note_run_fact(0, 1, WorkspaceManager::RunFact::ContextDestroyed);
+        }
+        const auto attempts = backend.released.size();
+        EXPECT_NE(m.release_prepared_backing(identity), 0);
+        EXPECT_EQ(backend.released.size(), attempts);
+        EXPECT_EQ(m.block_state(block), WorkspaceManager::BlockState::Quarantined);
+        EXPECT_EQ(m.reserved_bytes(), kOneMiB);
+        EXPECT_TRUE(m.must_keep(block));
+    }
+}
+
+TEST(WorkspaceManagerPreparedClose, EmptyAndExpiredIdentitiesCannotReleaseAReissuedAddress) {
+    FakeBackend backend;
+    WorkspaceManager m;
+    ASSERT_TRUE(m.configure(backend.ops()));
+    const auto region = WorkspaceManager::staging_region(0);
+    void *old = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 1, kOneMiB, &old));
+    std::vector<WorkspaceManager::BackingIdentity> old_identity{m.retain_backing(old), {}};
+    ASSERT_TRUE(m.note_unpublished(old));
+    ASSERT_EQ(m.release_prepared_backing(old_identity), 0);
+    ASSERT_TRUE(old_identity.front().expired());
+    backend.next_forced = old;
+    void *reissued = nullptr;
+    ASSERT_NO_FATAL_FAILURE(publish_and_retire(m, region, 2, kTwoMiB, &reissued));
+    ASSERT_EQ(reissued, old);
+    std::vector<WorkspaceManager::BackingIdentity> new_identity{m.retain_backing(reissued)};
+    ASSERT_TRUE(m.note_unpublished(reissued));
+    backend.fail_release_of = reissued;
+    ASSERT_EQ(m.release_prepared_backing(new_identity), -7);
+    backend.fail_release_of = nullptr;
+    const auto attempts = backend.released.size();
+    EXPECT_EQ(m.release_prepared_backing({}), 0);
+    EXPECT_EQ(m.release_prepared_backing(old_identity), 0);
+    EXPECT_EQ(backend.released.size(), attempts);
+    EXPECT_EQ(m.block_state(reissued), WorkspaceManager::BlockState::ReleaseUnconfirmed);
+    EXPECT_EQ(m.release_prepared_backing(new_identity), 0);
+    EXPECT_EQ(backend.released.size(), attempts + 1);
+    EXPECT_EQ(m.reserved_bytes(), 0u);
 }
 
 TEST(WorkspaceManagerOwnership, ALateFactFromAReleasedSlotDoesNotReplaceItsSuccessor) {

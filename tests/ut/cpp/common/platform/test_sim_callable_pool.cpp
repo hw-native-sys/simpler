@@ -53,7 +53,7 @@
 #include "chip_callable_layout.h"
 #include "device_runner_base.h"
 #include "cpu_sim_context.h"
-#include "sim_thread_start_gate.h"
+#include "host/sim_thread_start_gate.h"
 #include "runtime.h"
 #include "profiler_test_allocator.h"
 

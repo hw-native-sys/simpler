@@ -11,16 +11,20 @@
 #include <gtest/gtest.h>
 #include "common/kernel_args.h"
 #include "aicpu/platform_entry_args.h"
+#include "aicpu/device_run_result_base_aicpu.h"
 #include "runtime.h"
 
 extern "C" int simpler_aicpu_exec(void *);
 namespace {
 PlatformEntryArgs received;
 int calls = 0;
+int resets = 0;
 }  // namespace
+extern "C" void aicpu_reset_execution_entry() { ++resets; }
 extern "C" int aicpu_execute(Runtime *) {
     received = get_platform_entry_args(0);
     ++calls;
+    EXPECT_TRUE(aicpu_accept_runtime_terminal({DeviceRunVerdict::Ok, 0, DeviceRunCodeSource::None}, nullptr, 0));
     return 0;
 }
 TEST(EntryCacheProjection, ActualKernelEntryPreservesEveryPolicy) {
@@ -36,8 +40,10 @@ TEST(EntryCacheProjection, ActualKernelEntryPreservesEveryPolicy) {
     for (auto policy : {EntryCacheMaintenance::Full, EntryCacheMaintenance::FullFreshen, EntryCacheMaintenance::Live}) {
         args.entry_cache_maintenance = static_cast<uint32_t>(policy);
         const int before = calls;
+        const int resets_before = resets;
         ASSERT_EQ(simpler_aicpu_exec(&args), 0);
         ASSERT_EQ(calls, before + 1);
+        EXPECT_EQ(resets, resets_before + 1);
         EXPECT_EQ(received.args_base, &args);
         EXPECT_EQ(received.cache_maintenance, args.entry_cache_maintenance);
         EXPECT_EQ(received.offset, args.entry_args_offset);
