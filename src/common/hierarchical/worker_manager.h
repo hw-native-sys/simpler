@@ -985,6 +985,9 @@ private:
     struct LaneState {
         bool occupied{false};
         bool activation_requested{false};
+        // The endpoint owns the sticky intent, including publication delayed
+        // until staging. Promotion preserves this fact with the dispatch.
+        bool activation_handed_off{false};
         RunId run_id{INVALID_RUN_ID};
         uint64_t dispatch_id{0};
         // What the child reported it did with the staged frame. Staging admits
