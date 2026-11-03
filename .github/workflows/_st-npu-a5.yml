@@ -144,6 +144,45 @@ jobs:
             --run ".venv/bin/python -m pytest examples tests/st --platform a5 --exclude-level 4 --device \$TASK_DEVICE -v --require-pto-isa --pto-session-timeout $SESSION_TIMEOUT_S --manual '$MANUAL_MODE'" \
             2>&1 | tee "$A5_DIAGNOSTIC_DIR/pytest-task.log"
 
+      - name: Print A5 device diagnostics
+        if: always()
+        # Device-log transport must preserve the scene-test result.
+        continue-on-error: true
+        run: |
+          python3 - <<'PY'
+          import gzip
+          import os
+          import sys
+          import uuid
+          import zlib
+          from pathlib import Path
+
+          root = Path(os.environ["ASCEND_PROCESS_LOG_PATH"])
+          markers = ("[URMA_SNAPSHOT", "[URMA_CQE", "[ASYNC_WAIT", "[SHUTDOWN_SNAPSHOT", "[STALL")
+          printed = 0
+          for path in sorted(root.rglob("*.log*")):
+              if not path.is_file() or path.is_symlink():
+                  continue
+              try:
+                  opener = gzip.open if path.suffix == ".gz" else open
+                  with opener(path, "rt", encoding="utf-8", errors="replace") as stream:
+                      contents = stream.read()
+              except (OSError, EOFError, zlib.error) as error:
+                  print(f"Cannot read A5 device log {path.relative_to(root)}: {error}")
+                  continue
+              if not any(marker in contents for marker in markers):
+                  continue
+              boundary = uuid.uuid4().hex
+              print(f"::group::A5 device diagnostics: {path.relative_to(root)}", flush=True)
+              print(f"::stop-commands::{boundary}", flush=True)
+              sys.stdout.write(contents)
+              print(f"\n::{boundary}::\n::endgroup::", flush=True)
+              printed += 1
+          print(f"A5 device diagnostics: printed_files={printed}")
+          if printed == 0:
+              print(f"No matching A5 device diagnostics under {root}")
+          PY
+
       - name: DFX smokes (a5)
         if: inputs.include_dfx_smokes
         uses: ./.github/actions/run-onboard-dfx-smokes
