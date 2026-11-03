@@ -1739,3 +1739,62 @@ TEST_F(OrchestratorFixture, ClosingEmptySuccessorCannotOverwriteActivation) {
 TEST_F(OrchestratorFixture, ClosingSuccessorPreservesActivationAndTaskFence) {
     check_close_activation_race(*this, true);
 }
+
+TEST_F(OrchestratorFixture, PhysicalEndDoesNotRetireAnOpenSubmissionOrDeliverItsResult) {
+    auto first = orch.submit_next_level(C(180), TaskArgs{}, cfg, 0);
+    orch.mark_task_ended(first.task_slot, 0);
+    EXPECT_TRUE(orch.can_dispatch_run(run_id));
+    EXPECT_FALSE(orch.run_done(run_id));
+    orch.close_run_submission(run_id);
+    EXPECT_FALSE(orch.can_dispatch_run(run_id));
+    EXPECT_FALSE(orch.run_done(run_id));
+    RunId successor = orch.begin_run();
+    orch.close_run_submission(successor);
+    S(first.task_slot).state.store(TaskState::COMPLETED, std::memory_order_release);
+    ASSERT_TRUE(orch.on_consumed(first.task_slot));
+    EXPECT_NO_THROW(orch.wait_run(run_id));
+    orch.release_run(run_id);
+    orch.release_run(successor);
+}
+
+TEST_F(OrchestratorFixture, PhysicalGroupCreditRequiresEachDistinctMember) {
+    auto group = orch.submit_next_level_group(C(184), {TaskArgs{}, TaskArgs{}}, cfg, {0, 1});
+    orch.close_run_submission(run_id);
+    RunId successor = orch.begin_run();
+    auto next = orch.submit_next_level(C(185), TaskArgs{}, cfg, 0);
+    orch.close_run_submission(successor);
+    orch.mark_task_ended(group.task_slot, 0);
+    orch.mark_task_ended(group.task_slot, 0);
+    orch.mark_task_ended(group.task_slot, 2);  // Not a member of this group.
+    EXPECT_FALSE(orch.can_dispatch_run(successor));
+    orch.mark_task_ended(group.task_slot, 1);
+    EXPECT_TRUE(orch.can_dispatch_run(successor));
+    EXPECT_FALSE(orch.run_done(run_id));
+    S(group.task_slot).state.store(TaskState::COMPLETED, std::memory_order_release);
+    EXPECT_TRUE(orch.on_consumed(group.task_slot));
+    S(next.task_slot).state.store(TaskState::COMPLETED, std::memory_order_release);
+    EXPECT_TRUE(orch.on_consumed(next.task_slot));
+    orch.release_run(run_id);
+    orch.release_run(successor);
+}
+
+TEST_F(OrchestratorFixture, AnAlreadyEndedSuccessorRetiresWhenItsSlowPredecessorEnds) {
+    auto first = orch.submit_next_level_group(C(186), {TaskArgs{}, TaskArgs{}}, cfg, {0, 1});
+    orch.close_run_submission(run_id);
+    RunId second = orch.begin_run();
+    auto next = orch.submit_next_level(C(187), TaskArgs{}, cfg, 0);
+    orch.close_run_submission(second);
+    // Worker0 finishes A then B, while A's worker1 member is still live.
+    orch.mark_task_ended(first.task_slot, 0);
+    orch.mark_task_ended(next.task_slot, 0);
+    EXPECT_FALSE(orch.can_dispatch_run(second));
+    orch.mark_task_ended(first.task_slot, 1);
+    EXPECT_FALSE(orch.can_dispatch_run(second)) << "already-ended B must not keep an execution lease after promotion";
+    EXPECT_FALSE(orch.run_done(second)) << "physical retirement must not fabricate semantic delivery";
+    for (TaskSlot slot : {first.task_slot, next.task_slot}) {
+        S(slot).state.store(TaskState::COMPLETED, std::memory_order_release);
+        EXPECT_TRUE(orch.on_consumed(slot));
+    }
+    orch.release_run(run_id);
+    orch.release_run(second);
+}

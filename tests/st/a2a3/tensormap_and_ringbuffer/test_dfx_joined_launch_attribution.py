@@ -9,9 +9,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """Continuous collecting runs through ``Worker.submit``, each owning their diagnostic artifacts.
 
-The agreeing case keeps a two-run front over six public submissions. After waiting
-only the older handle it submits another run, without an intermediate flush. It
-requires actual slot/generation reuse and a later joined receipt after reuse;
+The agreeing case offers six public submissions through a two-run execution front,
+without intermediate semantic waits or flushes. It requires actual slot/generation
+reuse and a later joined receipt after reuse;
 the first pair alone cannot qualify refill. The mixed pair remains a serial
 fallback control. Buffer initialization is outside the submission window, but
 host scheduling can still miss overlap: that is a failure, never a retry-to-pass.
@@ -651,7 +651,7 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
         handles = []
         try:
             # Allocation and tensor initialization must not consume the overlap window between
-            # a predecessor's wait and the next submit. Each run keeps its own buffers alive.
+            # execution-credit reuse and the next submit. Each run keeps its own buffers alive.
             for index, value in enumerate(_REFILL_INPUT_VALUES):
                 buffers = [worker.create_buffer(SIZE * DTYPE.itemsize) for _ in range(3)]
                 tensors = [torch.frombuffer(buffer.shm.buf, dtype=DTYPE, count=SIZE) for buffer in buffers]
@@ -661,11 +661,9 @@ class TestDfxJoinedLaunchAttribution(SceneTestCase):
                 prefix = root / f"run{index}"
                 prepared.append((buffers, tensors, prefix, self._diagnostic_config(prefix, shifted=False)))
 
-            for index, (buffers, _tensors, _prefix, config) in enumerate(prepared):
-                if index >= 2:
-                    # Retire only the older handle. Its successor remains offered to the device
-                    # while this submission reuses capacity; publication proceeds independently.
-                    handles[index - 2].wait()
+            # Submission uses physical execution credit. A strong wait here would also
+            # observe already queued successors on their shared streams and serialize refill.
+            for buffers, _tensors, _prefix, config in prepared:
                 handles.append(self._submit(worker, buffers, config, 0 if simulated else _SPIN_ITERS))
             self._drain(handles)
             for index, (_buffers, tensors, _prefix, _config) in enumerate(prepared):

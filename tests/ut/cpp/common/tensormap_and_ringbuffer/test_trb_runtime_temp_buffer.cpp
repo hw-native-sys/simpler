@@ -26,6 +26,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <string>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -118,6 +119,7 @@ struct FakeHostApi {
     // memory the device wrote before its kernel returned, and the host reads it
     // through a cached copy, so no D2H happens on this path.
     std::vector<uint8_t> run_result;
+    int run_result_reads = 0;
 
     ~FakeHostApi() { release_all(); }
 
@@ -285,6 +287,7 @@ uint64_t fake_upload_chip_callable_buffer(void * /*runner_ctx*/, const void * /*
 // that published none reads as absent, which is what an empty buffer models.
 const void *
 fake_get_run_result(void * /*runner_ctx*/, uint32_t /*pipeline_slot*/, uint64_t /*run_epoch*/, size_t *bytes_out) {
+    ++g_fake->run_result_reads;
     if (g_fake->run_result.empty()) {
         if (bytes_out != nullptr) *bytes_out = 0;
         return nullptr;
@@ -421,7 +424,10 @@ TEST_F(TrbRuntimeTempBufferTest, SuccessfulValidateCopiesOnlyOutputTensor) {
     ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
     std::memset(runtime.tensor_leases_[0].dev_ptr, 0x2a, output.size());
 
+    // A private diagnostic record cannot turn SDK success into a failure.
+    fake_.run_result = published_error_tail(SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
     ASSERT_EQ(finish_run(runtime, 0), 0);
+    EXPECT_EQ(fake_.run_result_reads, 0);
     EXPECT_EQ(fake_.copy_from_count, 1);
     EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](uint8_t value) {
         return value == 0x2a;
@@ -431,7 +437,7 @@ TEST_F(TrbRuntimeTempBufferTest, SuccessfulValidateCopiesOnlyOutputTensor) {
 TEST_F(TrbRuntimeTempBufferTest, FailedExecutionReadsThisRunsPublishedSnapshot) {
     fake_.reset();
     Runtime runtime = make_runtime();
-    std::vector<uint8_t> output(64, 0);
+    std::vector<uint8_t> output(64, 0x7b);
     ChipStorageTaskArgs args;
     args.add_tensor(make_tensor(output));
     ArgDirection signature[1] = {ArgDirection::OUT};
@@ -448,8 +454,23 @@ TEST_F(TrbRuntimeTempBufferTest, FailedExecutionReadsThisRunsPublishedSnapshot) 
     ASSERT_NE(header, nullptr);
     header->orch_error_code.store(SIMPLER_ERROR_SCOPE_DEADLOCK, std::memory_order_relaxed);
 
-    EXPECT_EQ(finish_run(runtime, -1), -SIMPLER_ERROR_EXPLICIT_ORCH_FATAL);
+    ASSERT_EQ(runtime.tensor_leases_.size(), 1u);
+    std::memset(runtime.tensor_leases_[0].dev_ptr, 0x2a, output.size());
+    testing::internal::CaptureStderr();
+    const int rc = finish_run(runtime, -1);
+    const std::string diagnostic = testing::internal::GetCapturedStderr();
+    // This helper reports copy/release status; CAPI preserves the SDK error.
+    EXPECT_EQ(rc, 0);
+    EXPECT_NE(diagnostic.find("orch_error_code=9 sched_error_code=0 runtime_status=-9"), std::string::npos);
+    EXPECT_EQ(
+        diagnostic.find("orch_error_code=" + std::to_string(SIMPLER_ERROR_SCOPE_DEADLOCK) + " "), std::string::npos
+    );
+    EXPECT_EQ(fake_.run_result_reads, 1);
     EXPECT_EQ(fake_.copy_from_count, 0);
+    EXPECT_TRUE(runtime.tensor_leases_.empty());
+    EXPECT_TRUE(std::all_of(output.begin(), output.end(), [](uint8_t value) {
+        return value == 0x7b;
+    }));
 }
 
 TEST_F(TrbRuntimeTempBufferTest, FailedExecutionWithoutASnapshotKeepsItsExecutionError) {
@@ -475,7 +496,13 @@ TEST_F(TrbRuntimeTempBufferTest, FailedExecutionWithoutASnapshotKeepsItsExecutio
     // call proceed. The run keeps the execution error its caller already holds.
     // Both runtimes declare joined launch, so both answer this way; the planted
     // code above is what a header read would wrongly report as this run's.
-    EXPECT_EQ(finish_run(runtime, -1), 0);
+    testing::internal::CaptureStderr();
+    const int rc = finish_run(runtime, -1);
+    const std::string diagnostic = testing::internal::GetCapturedStderr();
+    EXPECT_EQ(rc, 0);
+    EXPECT_EQ(fake_.run_result_reads, 1);
+    EXPECT_NE(diagnostic.find("this run published no terminal record"), std::string::npos);
+    EXPECT_EQ(diagnostic.find("simpler runtime failed:"), std::string::npos);
     EXPECT_EQ(fake_.copy_from_count, 0);
     // The failure skips the tensor copy-back either way, so the caller's buffer
     // keeps its own content rather than whatever the device slice held.

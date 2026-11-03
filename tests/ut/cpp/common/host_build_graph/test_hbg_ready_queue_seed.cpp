@@ -452,8 +452,11 @@ TEST(HbgReadyQueueSeed, DirtyDeviceRebindPreservesThePopulatedGraphAndExternalIn
         runtime_wire_arena_pointers(arena, layout, runtime);
         std::memset(runtime->sm_handle, 0, sizeof(*runtime->sm_handle));
         ASSERT_TRUE(runtime->sm_handle->attach_populated(sm, sm_bytes, task_capacity, task_capacity, sm_bytes));
+        ASSERT_EQ(runtime->sm_handle->sm_base, static_cast<void *>(sm));
+        ASSERT_EQ(runtime->sm_handle->sm_size, sm_bytes);
         auto &scheduler = *runtime->scheduler;
         ASSERT_TRUE(scheduler.init_data_from_layout(layout.sched, arena, sm));
+        ASSERT_EQ(scheduler.task_view.tasks, &tasks);
         scheduler.seed_queue_slots();
         runtime->aicore_mailbox->init_empty();
 
@@ -476,6 +479,7 @@ TEST(HbgReadyQueueSeed, DirtyDeviceRebindPreservesThePopulatedGraphAndExternalIn
         ASSERT_TRUE(runtime->aicore_mailbox->try_push_normal_done(task.task_id(), reinterpret_cast<uint64_t>(slot)));
         ASSERT_TRUE(runtime->aicore_mailbox->try_pop(message));
         EXPECT_EQ(message.task_token, task.task_id());
+        EXPECT_EQ(message.addr, reinterpret_cast<uint64_t>(slot));
 
         std::vector<ChipReadyQueue *> queues;
         for (int resource = 0; resource < NUM_RESOURCE_SHAPES; ++resource) {

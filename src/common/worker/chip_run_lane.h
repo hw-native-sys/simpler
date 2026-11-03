@@ -42,6 +42,8 @@ public:
     void abandon();
 
     bool launched() const;
+    // Physical END awaiting result observation, distinct from cached TERMINAL.
+    bool execution_ended() const;
 
     /**
      * This run's diagnostic admission deadline, or a default-constructed
@@ -56,6 +58,7 @@ public:
     /** Bring this run's admission deadline forward, so a case need not wait. */
     void expire_credit_deadline_for_test();
     bool lane_poisoned() const;
+    bool owner_recovery_required() const;
     ChipRunPreparationDisposition preparation_disposition() const;
 
 private:

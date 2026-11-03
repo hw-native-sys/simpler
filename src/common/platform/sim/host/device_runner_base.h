@@ -301,6 +301,10 @@ public:
     bool reissue_launch_permit(const void *owner, const NativeRunIdentity &identity, LaunchPermit *permit);
     void release_native_run(const void *owner);
     bool native_run_active() const;
+    bool native_runs_outstanding() const;
+    void retain_run_result(uint32_t pipeline_slot, uint64_t run_epoch);
+    void release_run_result(uint64_t run_epoch);
+    DeviceRunTerminal device_run_terminal(uint32_t pipeline_slot, uint64_t run_epoch) const;
     /** Cleanup-only terminal storage keeps this context alive for close retry. */
     virtual bool terminal_backing_retained() const {
         return dump_collector_.terminal_backing_retained() || pmu_collector_.terminal_backing_retained() ||
@@ -1227,6 +1231,8 @@ protected:
      * fails the epoch comparison rather than being mistaken for this run's.
      */
     RunResourceSlots<DeviceRunResultRegion> device_run_results_;
+    mutable std::mutex retained_result_mu_;
+    std::unordered_map<uint64_t, DeviceRunResultRegion> retained_run_results_;
     ArgsDumpCollector dump_collector_;
     PmuCollector pmu_collector_;
     ScopeStatsCollector scope_stats_collector_;

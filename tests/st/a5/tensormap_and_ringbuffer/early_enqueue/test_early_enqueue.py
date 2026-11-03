@@ -35,8 +35,8 @@ What is checked, for exactly the runs each case submitted:
   endpoints  a Worker with two a5 devices reaches that state on *each* endpoint independently,
              which is the actual scope of the capability: it is answered per device context, and
              no gate on the path checks how many endpoints a Worker has.
-  attributed a run that fails beside a live predecessor reports its own status, and the
-             predecessor still produces its own correct result — with the join for *that exact
+  attributed an SDK stream failure names its observing call; propagated lane failure is
+             distinguished from kernel attribution — with the join for *that exact
              pair* asserted, so the case cannot pass under serial submission.
   refused    a worker holding a live comm resource establishes no joined launch at all.
   default    with ``launch_depth`` unset, none of it happens.
@@ -66,6 +66,7 @@ passed.
 
 import contextlib
 import ctypes
+import re
 import tempfile
 import threading
 import time
@@ -398,6 +399,37 @@ def _join_record(span):
         return {"pid": span.pid, "inv": span.inv, "malformed": span.attrs}
 
 
+def _native_stream_failure(line):
+    """The existing native SDK failure record; it deliberately carries no run_id."""
+    match = re.search(
+        r"Run device failure: device=(?P<device>-?\d+) runner=0x[0-9a-fA-F]+ rc=(?P<rc>-?\d+) "
+        r"run_epoch=(?P<run_epoch>\d+) generation=(?P<generation>\d+) "
+        r"dispatch_id=(?P<dispatch_id>\d+) pipeline_slot=(?P<slot_id>\d+) "
+        r"cid=-?\d+ chip_hash=0x[0-9a-fA-F]+ chip_dev=0x[0-9a-fA-F]+ "
+        r"runtime_args=(?:0x[0-9a-fA-F]+|\(nil\))\s*$",
+        line,
+    )
+    return None if match is None else {name: int(value) for name, value in match.groupdict().items()}
+
+
+def _handle_stream_failure(error):
+    """A supported strong-observation status with the original native handle identity."""
+    matches = list(
+        re.finditer(
+            r"finalize_native_run failed with code (?P<rc>-?\d+) "
+            r"\(run_id=(?P<run_id>\d+) slot=(?P<slot_id>\d+) generation=(?P<generation>\d+) "
+            r"dispatch_id=(?P<dispatch_id>\d+) run_epoch=(?P<run_epoch>\d+)\)",
+            error,
+        )
+    )
+    if len(matches) != 1:
+        return None
+    fields = {name: int(value) for name, value in matches[0].groupdict().items()}
+    # This bounded controlled-fault scene has only qualified this SDK status. Other failures
+    # remain failures with their original evidence, rather than becoming a generic poison pass.
+    return fields if fields["rc"] == 507018 else None
+
+
 class _RunTrace:
     """A byte cursor over each of this worker's chip children's host-log files.
 
@@ -417,6 +449,18 @@ class _RunTrace:
     def __init__(self, worker):
         directory = Path(_child_log_directory())
         self._pids = list(worker._chip_pids)  # noqa: SLF001 -- white-box child attribution
+        # Worker forks and appends chip PIDs in its explicit configured device order.
+        # A failed observation need not emit a device-boundary timing row.
+        config = getattr(worker, "_config", {})
+        device_ids = config.get("device_ids") if isinstance(config, dict) else None
+        self.device_by_pid = {}
+        if (
+            isinstance(device_ids, (list, tuple))
+            and len(device_ids) == len(self._pids)
+            and len(set(self._pids)) == len(self._pids)
+            and all(isinstance(device, int) and not isinstance(device, bool) and device >= 0 for device in device_ids)
+        ):
+            self.device_by_pid = dict(zip(self._pids, device_ids))
         self._paths = {pid: directory / f"host.{pid}.log" for pid in self._pids}
         self._offsets = {pid: self._size(pid) for pid in self._pids}
         #: Where each file stood when this cursor opened, so a diagnostic window can start there
@@ -426,6 +470,9 @@ class _RunTrace:
         self.run_of_invocation: dict[tuple, tuple] = {}
         #: ``(pid, inv)`` -> that run's two device-boundary marker times, or their reasons.
         self.boundary_of_invocation: dict[tuple, dict] = {}
+        self.full_identity_of_invocation: dict[tuple, dict] = {}
+        self.identity_conflicts: set[tuple] = set()
+        self.native_stream_failures: list[dict] = []
 
     def _size(self, pid):
         try:
@@ -441,8 +488,8 @@ class _RunTrace:
     def take(self):
         """Every joined-launch record appended since the previous call.
 
-        The other two families are folded into this cursor's own state rather than returned:
-        they are looked up by invocation, not iterated.
+        Identity, boundary and native failure records are folded into this cursor's own state;
+        only joined-launch records are returned.
         """
         fresh = []
         for pid in self._pids:
@@ -455,6 +502,10 @@ class _RunTrace:
                 continue
             self._offsets[pid] += consumed
             lines = window[:consumed].decode("utf-8", errors="replace").splitlines()
+            for line in lines:
+                failure = _native_stream_failure(line)
+                if failure is not None:
+                    self.native_stream_failures.append({**failure, "pid": pid})
             for span in parse_spans(lines):
                 if span.pid != pid:
                     continue
@@ -470,6 +521,18 @@ class _RunTrace:
         attributes = _attributes(span)
         with contextlib.suppress(KeyError, ValueError):
             self.run_of_invocation[pid, span.inv] = (int(attributes["dispatch_id"]), int(attributes["slot_id"]))
+        try:
+            identity = {
+                name: int(attributes[name]) for name in ("run_id", "dispatch_id", "slot_id", "generation", "run_epoch")
+            }
+            key = pid, span.inv
+            previous = self.full_identity_of_invocation.get(key)
+            if previous is not None and previous != identity:
+                self.identity_conflicts.add(key)
+            else:
+                self.full_identity_of_invocation[key] = identity
+        except (KeyError, ValueError):
+            self.identity_conflicts.add((pid, span.inv))
 
     def _note_boundaries(self, pid, span):
         """One run's marker times. A position with a non-zero rc carries no time, by construction.
@@ -478,9 +541,12 @@ class _RunTrace:
         check the rc rather than the value — a zero could not otherwise be told from an absence.
         """
         attributes = _attributes(span)
-        with contextlib.suppress(KeyError, ValueError):
+        try:
             aicore_rc = int(attributes["aic_rc"])
             whole_operator_rc = int(attributes["wo_rc"])
+            previous = self.boundary_of_invocation.get((pid, span.inv))
+            if previous is not None and previous["device"] != int(attributes["dev_id"]):
+                self.identity_conflicts.add((pid, span.inv))
             self.boundary_of_invocation[pid, span.inv] = {
                 "device": int(attributes["dev_id"]),
                 "aicore_start": int(attributes["aic_start"]) if aicore_rc == 0 else None,
@@ -489,6 +555,8 @@ class _RunTrace:
                 "whole_operator_rc": whole_operator_rc,
                 "hz": int(attributes["ts_hz"]),
             }
+        except (KeyError, ValueError):
+            self.identity_conflicts.add((pid, span.inv))
 
     def boundaries_of_run(self, pid, run_key):
         """That run's marker times on this child, or None while they have not been published."""
@@ -496,6 +564,45 @@ class _RunTrace:
             if row_pid == pid and self.run_of_invocation.get((row_pid, inv)) == run_key:
                 return row
         return None
+
+    def identity_of_run(self, pid, run_key):
+        """One exact root and its configured owned device, cross-checked if timing exists."""
+        if pid not in self.device_by_pid:
+            return None
+        device = self.device_by_pid[pid]
+        matches = []
+        for key, identity in self.full_identity_of_invocation.items():
+            if key[0] != pid or (identity["dispatch_id"], identity["slot_id"]) != run_key:
+                continue
+            boundary = self.boundary_of_invocation.get(key)
+            if key in self.identity_conflicts or (boundary is not None and boundary["device"] != device):
+                return None
+            matches.append({**identity, "device": device, "pid": pid})
+        return matches[0] if len(matches) == 1 else None
+
+    def stream_failure(self, pid, error):
+        """Match a handle's exact SDK status to its root and original native record.
+
+        The native line has no run_id. Only the exact matching root supplies that field. This
+        proves the call whose stream observation failed, not which queued kernel caused it.
+        """
+        fields = _handle_stream_failure(error)
+        if fields is None:
+            return None
+        identity = self.identity_of_run(pid, (fields["dispatch_id"], fields["slot_id"]))
+        if identity is None or any(identity[name] != value for name, value in fields.items() if name != "rc"):
+            return None
+        records = [
+            row
+            for row in self.native_stream_failures
+            if row["pid"] == pid
+            and all(
+                row[name] == identity[name] for name in ("device", "run_epoch", "generation", "dispatch_id", "slot_id")
+            )
+        ]
+        if not records or any(row["rc"] != fields["rc"] for row in records):
+            return None
+        return {**identity, "rc": fields["rc"]}
 
     def child_log_window(self, keep_lines=_DIAGNOSTIC_LOG_LINES):
         """The child's own account of this case, for a failure message to carry.
@@ -672,6 +779,55 @@ def _await_records(cursor, records, budget_s, satisfied):
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.02)
+
+
+def _assert_stream_observations(trace, pid, case_runs, outcomes, records, what):
+    """Keep SDK errors, numerical success and propagated context failure distinct."""
+    keys = case_runs.sorted_keys()
+    assert len(keys) == len(outcomes), f"{what}: accepted handle/identity population differs: {keys}"
+    errors = [error for _out, _expected, error in outcomes if error is not None]
+    _await_records(
+        trace,
+        records,
+        _EVIDENCE_BUDGET_S,
+        lambda _seen: all(trace.identity_of_run(pid, key) is not None for key in keys)
+        and all(trace.stream_failure(pid, error) is not None for error in errors),
+    )
+    identities = [trace.identity_of_run(pid, key) for key in keys]
+    assert all(identity is not None for identity in identities), (
+        f"{what}: missing or conflicting owned invocation/device identity.\n{_log_window_text(trace)}"
+    )
+    observations = [None if error is None else trace.stream_failure(pid, error) for _out, _expected, error in outcomes]
+    own = {
+        keys[index]
+        for index, observation in enumerate(observations)
+        if observation is not None and (observation["dispatch_id"], observation["slot_id"]) == keys[index]
+    }
+    for index, ((out, expected, error), observation) in enumerate(zip(outcomes, observations)):
+        if error is None:
+            try:
+                torch.testing.assert_close(out, expected)
+            except AssertionError as mismatch:
+                raise AssertionError(
+                    f"{what}: successful call {keys[index]} has incorrect output.\n{_log_window_text(trace)}"
+                ) from mismatch
+            continue
+        assert observation is not None, (
+            f"{what}: unsupported or unowned stream error for {keys[index]}: {error}\n{_log_window_text(trace)}"
+        )
+        anchor = observation["dispatch_id"], observation["slot_id"]
+        assert anchor in own, (
+            f"{what}: no handle independently reported this owned stream failure: {observation}\n"
+            f"{_log_window_text(trace)}"
+        )
+        if anchor != keys[index]:
+            assert "chip run lane is poisoned:" in error, (
+                f"{what}: a different call's error is not an explicit propagated lane failure: {error}"
+            )
+        assert torch.count_nonzero(out).item() == 0, (
+            f"{what}: a failed observation copied output for {keys[index]} instead of retaining its zero sentinel.\n"
+            f"{_log_window_text(trace)}"
+        )
 
 
 def _wait_for_one_launched_frame(frames, timeout):
@@ -1176,30 +1332,12 @@ class TestA5TmrEarlyEnqueueTwoEndpoints(_A5TmrEarlyEnqueueBase):
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestA5TmrEarlyEnqueueErrorAttribution(_A5TmrEarlyEnqueueBase):
-    """A run that fails beside a live predecessor reports its own status, and only its own.
+    """A queued fault preserves the SDK stream verdict and each successful output.
 
-    This is the case for the second production change. Only a run's own published snapshot now
-    decides the status it is reported with; the shared memory header, which whichever run occupies
-    the arena next resets and refills, is read for the diagnostic detail line alone and the line
-    says so. Before, its value could become one run's reported failure while describing another's.
-
-    The failing run is the *successor* deliberately. Its orchestration latches its own fatal code
-    and returns, exhausting no resource and hanging no core, so the predecessor ahead of it is
-    unaffected and must still produce its correct result. A poisoned runner after the failure can
-    then affect no later run, because there is none.
-
-    What is asserted is the attribution, not the numeral: onboard, a generic CANN status can mask a
-    device-side code, so pinning the reported number here would be pinning the masking race rather
-    than this change. Which run reports a failure at all is the property the change protects.
-
-    This case does **not** cover which status channel was read. A device-side fatal publishes a
-    terminal snapshot, so it exercises the preferred channel rather than the missing-snapshot one,
-    and which of the two a given failure takes is not this case's to decide. That contract is
-    pinned deterministically at the host boundary instead, by
-    ``TrbRuntimeTempBufferTest.FailedExecutionReadsThisRunsPublishedSnapshot`` and
-    ``...WithoutASnapshotKeepsItsExecutionError`` in
-    ``tests/ut/cpp/common/tensormap_and_ringbuffer/test_trb_runtime_temp_buffer.cpp``, which drive
-    both channels directly over the real maker.
+    A predecessor's strong wait can observe its queued successor's fault. An error counts only
+    with its owned post-cursor native record and full root identity. A later lane failure may
+    propagate that same observation; it does not identify another kernel as its cause. The exact
+    good/fatal pair must still have joined, and every handle is drained before its owners leave.
     """
 
     CASES = [
@@ -1220,7 +1358,7 @@ class TestA5TmrEarlyEnqueueErrorAttribution(_A5TmrEarlyEnqueueBase):
 
     @pytest.mark.platforms(["a5"])
     def test_a_failing_successor_reports_its_own_status(self, st_platform, st_worker):
-        """This exact pair was joined, the predecessor's result survives, and the failure is its own.
+        """This exact pair was joined, and every observed SDK error has its own call identity.
 
         The join evidence is scoped to *these two* runs. Without it the case would pass under
         ordinary serial submission — the fatal callable declining the join, or the predecessor
@@ -1257,7 +1395,7 @@ class TestA5TmrEarlyEnqueueErrorAttribution(_A5TmrEarlyEnqueueBase):
                     failing_error = None
                     try:
                         good_group, good_out, good_expected = self._three_buffers(st_worker, 2.0, 3.0)
-                        failing_group, _failing_out, _unused = self._three_buffers(st_worker, 5.0, 7.0)
+                        failing_group, failing_out, failing_expected = self._three_buffers(st_worker, 5.0, 7.0)
                         buffers.extend(good_group)
                         buffers.extend(failing_group)
                         good_handle = self._submit_vector(
@@ -1268,9 +1406,8 @@ class TestA5TmrEarlyEnqueueErrorAttribution(_A5TmrEarlyEnqueueBase):
                             st_worker, failing_group, output_prefix, callable_name="reported_fatal"
                         )
                     finally:
-                        # The predecessor is drained first and separately: its result is the half
-                        # of this case that must survive, and its wait must not be skipped by the
-                        # successor's failure.
+                        # Keep both observations even if the predecessor sees the successor's
+                        # queued stream fault. Neither accepted handle may be abandoned.
                         if good_handle is not None:
                             good_failure = _drain_handles([good_handle], "a5 TMR error attribution predecessor")
                         if failing_handle is not None:
@@ -1285,19 +1422,14 @@ class TestA5TmrEarlyEnqueueErrorAttribution(_A5TmrEarlyEnqueueBase):
                 sampler.join(timeout=5.0)
                 observed = case_runs.sorted_keys()
 
-        assert not good_failure, (
-            f"the predecessor failed while its successor was the one made to fail: {good_failure}. Its own run "
-            f"must be unaffected by a later run's fatal report"
-        )
-        torch.testing.assert_close(good_out, good_expected)
+        assert len(good_failure or []) <= 1, "one handle produced multiple completion errors"
         assert failing_error is not None, (
             "the run whose orchestration reports a fatal code completed successfully, so this case establishes "
             "nothing about how a failure is attributed"
         )
 
-        # Dispatch ids are allocated in submission order, so of this case's two runs the lower is
-        # the predecessor that must survive and the higher is the one made to fail. That is what
-        # names the pair the record below has to be about.
+        # Dispatch ids are allocated in submission order, so the lower key is the predecessor
+        # and the higher key is the intentional fatal. The join must name this exact pair.
         assert len(observed) == 2, (
             f"this case's two runs were not both seen in the negotiated frames above dispatch floor "
             f"{case_runs.floor}: {observed}. Without both identities the record below cannot be attributed "
@@ -1305,6 +1437,17 @@ class TestA5TmrEarlyEnqueueErrorAttribution(_A5TmrEarlyEnqueueBase):
         )
         predecessor, successor = observed[0], observed[1]
         records: list[dict] = []
+        _assert_stream_observations(
+            trace,
+            pid,
+            case_runs,
+            [
+                (good_out, good_expected, good_failure[0] if good_failure else None),
+                (failing_out, failing_expected, failing_error),
+            ],
+            records,
+            "a5 TMR queued stream failure",
+        )
         _await_records(
             trace,
             records,
@@ -1771,26 +1914,11 @@ def _observe_launch_prefix(entries, want, timeout, case_runs):
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")
 class TestA5TmrWideFailureAttribution(_A5TmrEarlyEnqueueBase):
-    """One run fails amid a wide prefix of accepted runs; each outcome is its own.
+    """Five accepted calls retain each successful output and every owned stream failure.
 
-    The narrow sibling pairs one good run with one fatal at the old width. Here four good runs and
-    one fatal are admitted together at `_WIDE_SETS`, which is the state rows 29 and 32 are about: a
-    poisoned runner after the failure must affect no run that was already accepted, and each of the
-    concurrent failures keeps its own attribution rather than being collapsed into one.
-
-    What each check can see:
-
-    attributed  exactly one handle raises, and it is the one whose orchestration latches a fatal
-                code. The other four return without error.
-    distinct    each surviving run's own output equals its own inputs' arithmetic, so a failure
-                beside them did not corrupt the sets they held.
-    own text    the failure's message is non-empty and reaches the caller through its own handle.
-    settled     every handle is drained before anything of this case's leaves scope, on every path,
-                and the failing one is waited exactly once.
-
-    What is asserted is the attribution, not the numeral — onboard, a generic CANN status can mask
-    a device-side code, so pinning the number would pin the masking race rather than the ownership
-    this case is about.
+    A shared-stream SDK error may be reported by an earlier call's observer. Later poisoned-lane
+    delivery must anchor to that original observation rather than masquerade as another call's
+    kernel error. All five handles are drained before their buffers leave the case.
     """
 
     CASES = [
@@ -1825,55 +1953,61 @@ class TestA5TmrWideFailureAttribution(_A5TmrEarlyEnqueueBase):
             f"not be one of a wide prefix of accepted runs"
         )
 
+        trace = _RunTrace(st_worker)
+        pid = self._endpoint_pid(st_worker)
         good_handles: list = []
         expectations: list = []
         buffers: list = []
         failing_handle = None
         failing_error = None
-        good_failures: list = []
-        with tempfile.TemporaryDirectory(prefix="simpler-a5-tmr-wide-failure-") as output_prefix:
-            try:
-                # The good runs first and the fatal last, so every one of them is already accepted
-                # when the failure is reported: a failure ahead of them would prove nothing about
-                # a run that was already holding a set.
-                for index in range(_WIDE_SETS - 1):
-                    group, out, expected = self._three_buffers(st_worker, float(2 * index + 2), float(2 * index + 3))
-                    buffers.extend(group)
-                    expectations.append((out, expected))
-                    good_handles.append(
-                        self._submit_vector(st_worker, group, output_prefix, spin_iters=_DEVICE_SPIN_ITERS)
-                    )
-                failing_group, _out, _unused = self._three_buffers(st_worker, 11.0, 13.0)
-                buffers.extend(failing_group)
-                failing_handle = self._submit_vector(
-                    st_worker, failing_group, output_prefix, callable_name="reported_fatal"
-                )
-            finally:
-                # The surviving runs are drained first and separately: their results are the half
-                # of this case that must survive, and their waits must not be skipped by the
-                # failure behind them.
-                good_failures = _drain_handles(good_handles, "a5 TMR wide failure attribution")
-                if failing_handle is not None:
-                    try:
-                        failing_handle.wait()
-                    except Exception as error:  # noqa: BLE001 -- this case's subject
-                        failing_error = str(error)
+        good_errors: list = []
+        with _frame_views(st_worker) as frames:
+            case_runs = _CaseRuns(frames)
 
-            assert not good_failures, (
-                f"a run accepted before the failure reported one of its own: {good_failures}. A later run's "
-                f"fatal report must not become an earlier run's outcome"
-            )
-            assert len(good_handles) == _WIDE_SETS - 1, (
-                f"only {len(good_handles)} of {_WIDE_SETS - 1} surviving runs were submitted, so the failing run "
-                f"was not one of a wide prefix"
-            )
-            assert failing_error is not None, (
-                "the run whose orchestration reports a fatal code completed successfully, so this case "
-                "establishes nothing about how a failure is attributed"
-            )
-            assert failing_error.strip(), "the failure reached the caller with no text of its own"
-            for out, expected in expectations:
-                torch.testing.assert_close(out, expected)
+            with _WideWindowObserver(st_worker, frames, case_runs, _WIDE_SETS):
+                with tempfile.TemporaryDirectory(prefix="simpler-a5-tmr-wide-failure-") as output_prefix:
+                    try:
+                        # All four ordinary calls are accepted before the intentional fatal.
+                        for index in range(_WIDE_SETS - 1):
+                            group, out, expected = self._three_buffers(
+                                st_worker, float(2 * index + 2), float(2 * index + 3)
+                            )
+                            buffers.extend(group)
+                            expectations.append((out, expected))
+                            good_handles.append(
+                                self._submit_vector(st_worker, group, output_prefix, spin_iters=_DEVICE_SPIN_ITERS)
+                            )
+                        failing_group, failing_out, failing_expected = self._three_buffers(st_worker, 11.0, 13.0)
+                        buffers.extend(failing_group)
+                        failing_handle = self._submit_vector(
+                            st_worker, failing_group, output_prefix, callable_name="reported_fatal"
+                        )
+                    finally:
+                        # Keep one outcome per accepted handle, even after the first SDK error.
+                        for handle in good_handles:
+                            errors = _drain_handles([handle], "a5 TMR wide stream observation")
+                            good_errors.append(errors[0] if errors else None)
+                        if failing_handle is not None:
+                            try:
+                                failing_handle.wait()
+                            except Exception as error:  # noqa: BLE001 -- this case's subject
+                                failing_error = str(error)
+
+        assert len(good_handles) == _WIDE_SETS - 1, (
+            f"only {len(good_handles)} of {_WIDE_SETS - 1} ordinary runs were submitted, so the failing run "
+            f"was not one of a wide prefix"
+        )
+        assert failing_error is not None, (
+            "the intentional fatal completed successfully, so no fault delivery was tested"
+        )
+        assert failing_error.strip(), "the failure reached the caller with no text of its own"
+        assert len(case_runs) == _WIDE_SETS, (
+            f"this case's five accepted native identities were not all observed above floor "
+            f"{case_runs.floor}: {case_runs.sorted_keys()}"
+        )
+        outcomes = [(out, expected, error) for (out, expected), error in zip(expectations, good_errors)]
+        outcomes.append((failing_out, failing_expected, failing_error))
+        _assert_stream_observations(trace, pid, case_runs, outcomes, [], "a5 TMR wide stream observation")
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")

@@ -37,8 +37,8 @@
 
 #define private public
 #include "chip_worker.h"
-#undef private
 #include "chip_run_lane.h"
+#undef private
 
 #include <gtest/gtest.h>
 
@@ -57,11 +57,14 @@ std::array<uint64_t, 2> g_epochs{};
 std::array<size_t, 2> g_prepare_count{};
 std::array<bool, 2> g_reject_first_prepare{};
 size_t g_poll_count{0};
+size_t g_completion_wait_count{0};
 // When nonzero, the poll stub completes the run after this many polls. Only
 // UnboundedWaitBlocksInsteadOfPolling sets it, so that a regression there fails
 // on the poll count instead of looping forever.
 size_t g_poll_completes_after{0};
 bool g_supports_successor{true};
+int g_context_rc{0};
+size_t g_context_checks{0};
 std::mutex g_wait_mu;
 std::condition_variable g_wait_cv;
 bool g_wait_entered{false};
@@ -73,7 +76,7 @@ uint32_t slot_of(void *runtime) { return g_slots.at(runtime); }
 int prepare_run(
     void *, void *runtime, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *descriptor
 ) {
-    EXPECT_EQ(slot_of(runtime), descriptor->pipeline_slot);
+    g_slots[runtime] = descriptor->pipeline_slot;
     g_complete[descriptor->pipeline_slot] = false;
     g_epochs[descriptor->pipeline_slot] = descriptor->run_epoch;
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
@@ -116,7 +119,19 @@ int wait_run(void *, void *runtime) {
     return g_wait_rc[slot];
 }
 
-int finalize_run(void *, void *runtime) {
+int wait_run_completion(void *, void *runtime) {
+    ++g_completion_wait_count;
+    std::unique_lock<std::mutex> lk(g_wait_mu);
+    g_wait_entered = true;
+    g_wait_cv.notify_all();
+    g_wait_cv.wait(lk, [] {
+        return g_release_wait;
+    });
+    g_complete[slot_of(runtime)] = true;
+    return 0;
+}
+
+int finalize_run(void *, void *runtime, int) {
     const uint32_t slot = slot_of(runtime);
     g_events.push_back("finalize" + std::to_string(slot));
     if (g_finalize_no_submission[slot] && g_finalize_rc[slot] == 0) {
@@ -126,6 +141,11 @@ int finalize_run(void *, void *runtime) {
 }
 
 int supports_successor(void *) { return g_supports_successor ? 1 : 0; }
+
+int validate_context(void *) {
+    ++g_context_checks;
+    return g_context_rc;
+}
 
 void prime_worker(ChipWorker &worker) {
     g_slots.clear();
@@ -141,8 +161,11 @@ void prime_worker(ChipWorker &worker) {
     g_prepare_count = {};
     g_reject_first_prepare = {};
     g_poll_count = 0;
+    g_completion_wait_count = 0;
     g_poll_completes_after = 0;
     g_supports_successor = true;
+    g_context_rc = 0;
+    g_context_checks = 0;
     {
         std::lock_guard<std::mutex> lk(g_wait_mu);
         g_wait_entered = false;
@@ -157,13 +180,11 @@ void prime_worker(ChipWorker &worker) {
     worker.pipeline_generations_.resize(2);
     worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
-    for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {
-        g_slots.emplace(worker.runtime_bufs_[slot].data(), slot);
-    }
     worker.prepare_run_fn_ = prepare_run;
     worker.launch_run_fn_ = launch_run;
     worker.poll_run_fn_ = poll_run;
     worker.wait_run_fn_ = wait_run;
+    worker.wait_run_completion_fn_ = wait_run_completion;
     worker.finalize_run_fn_ = finalize_run;
     worker.supports_concurrent_native_prepare_fn_ = supports_successor;
 }
@@ -191,11 +212,80 @@ TEST(ChipRunLaneTest, OwnsFifoPreparationAndLaunch) {
     EXPECT_TRUE(first.done());
     EXPECT_FALSE(second.done());
     EXPECT_TRUE(second.launched());
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "prepare1", "finalize0", "launch1"}));
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "prepare1", "launch1"}));
 
     g_complete[1] = true;
     EXPECT_TRUE(second.done());
     lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, DoneDoesNotObserveOrDeliverTheRun) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipRun run = submit(lane, 101, 0);
+    g_complete[0] = true;
+    ASSERT_TRUE(run.done());
+    EXPECT_TRUE(run.done());
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0"}));
+
+    ASSERT_TRUE(run.wait_until(ChipRun::Deadline::max()));
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "wait0", "finalize0"}));
+    ASSERT_TRUE(run.wait_until(ChipRun::Deadline::max()));
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "wait0", "finalize0"}));
+    lane.close();
+    worker.finalize();
+}
+
+TEST(ChipRunLaneTest, CompletedRunContextRefusalPreservesLateObservationForRetry) {
+    ChipWorker worker;
+    prime_worker(worker);
+    ChipRunLane lane(worker);
+    ChipRun run = submit(lane, 101, 0);
+    g_complete[0] = true;
+    ASSERT_TRUE(run.done());
+    const uint64_t epoch = g_epochs[0];
+    auto *const entry = worker.native_runs_.at(epoch).get();
+    void *const storage = entry->storage.data();
+    int context = 0;
+    worker.device_ctx_ = &context;
+    const auto clear_context = [&worker](int *) {
+        worker.device_ctx_ = nullptr;
+    };
+    const std::unique_ptr<int, decltype(clear_context)> context_guard(&context, clear_context);
+    worker.validate_execution_context_fn_ = validate_context;
+    g_context_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+
+    const auto events_before = g_events;
+    EXPECT_TRUE(run.done());
+    EXPECT_EQ(g_context_checks, 0U);
+    EXPECT_THROW(run.wait_until(ChipRun::Deadline::max()), ExecutionContextRefused);
+    EXPECT_FALSE(run.lane_poisoned());
+    EXPECT_EQ(g_events, events_before);
+    ASSERT_EQ(worker.native_runs_.at(epoch).get(), entry);
+    EXPECT_EQ(entry->storage.data(), storage);
+    EXPECT_FALSE(entry->finalize_reserved);
+    EXPECT_FALSE(entry->result_observed);
+    EXPECT_FALSE(entry->destruction_unknown);
+
+    g_context_rc = 0;
+    EXPECT_TRUE(run.wait_until(ChipRun::Deadline::max()));
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "wait0", "finalize0"}));
+    const size_t checks_after_observation = g_context_checks;
+    g_context_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    EXPECT_TRUE(run.done());
+    EXPECT_TRUE(run.wait_until(ChipRun::Deadline::max()));
+    EXPECT_EQ(g_context_checks, checks_after_observation);
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "wait0", "finalize0"}));
+
+    g_context_rc = 0;
+    ChipRun successor = submit(lane, 102, 0);
+    g_complete[0] = true;
+    EXPECT_TRUE(successor.wait_until(ChipRun::Deadline::max()));
+    lane.close();
+    worker.device_ctx_ = nullptr;
     worker.finalize();
 }
 
@@ -222,7 +312,7 @@ TEST(ChipRunLaneTest, DiagnosticSuccessorPreparesLikeAnyOther) {
     g_complete[0] = true;
     EXPECT_TRUE(first.done());
     EXPECT_FALSE(second.done());
-    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "prepare1", "finalize0", "launch1"}));
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "prepare1", "launch1"}));
     lane.close();
     worker.finalize();
 }
@@ -242,9 +332,7 @@ TEST(ChipRunLaneTest, IncompatibleSuccessorRetriesAfterPredecessorFence) {
     g_complete[0] = true;
     EXPECT_TRUE(first.done());
     EXPECT_TRUE(second.launched());
-    EXPECT_EQ(
-        g_events, (std::vector<std::string>{"prepare0", "launch0", "prepare1", "finalize0", "prepare1", "launch1"})
-    );
+    EXPECT_EQ(g_events, (std::vector<std::string>{"prepare0", "launch0", "prepare1", "prepare1", "launch1"}));
 
     g_complete[1] = true;
     EXPECT_TRUE(second.done());
@@ -582,7 +670,8 @@ TEST(ChipRunLaneTest, UnboundedWaitBlocksInsteadOfPolling) {
 
     EXPECT_NE(std::find(g_events.begin(), g_events.end(), "wait0"), g_events.end())
         << "unbounded wait never reached the device's blocking wait";
-    EXPECT_LE(g_poll_count, 1u) << "unbounded wait polled " << g_poll_count << " times instead of blocking";
+    EXPECT_EQ(g_completion_wait_count, 1u);
+    EXPECT_LE(g_poll_count, 2u) << "unbounded wait polled " << g_poll_count << " times instead of blocking";
     lane.close();
     worker.finalize();
 }
@@ -652,6 +741,8 @@ TEST(ChipRunLaneTest, EarlierFailedRunRetainsItsErrorAfterLaterRunPoisonsLane) {
     g_complete[1] = true;
     g_finalize_rc[1] = -7;
     EXPECT_TRUE(poisoner.done());
+    EXPECT_FALSE(lane.poisoned());
+    EXPECT_THROW(poisoner.wait_until(ChipRunLane::Deadline::max()), std::runtime_error);
     EXPECT_TRUE(lane.poisoned());
 
     try {
@@ -802,6 +893,38 @@ void require_process_refusal(const std::function<void()> &operation) {
 }
 
 }  // namespace
+
+TEST(ChipRunLaneTest, TerminalDetachKeepsBothCompletedAndExecutingHandlesHostOnly) {
+    EXPECT_EXIT(
+        {
+            ChipWorker worker;
+            prime_worker(worker);
+            ChipRunLane lane(worker);
+            ChipRun completed = submit(lane, 1, 0);
+            g_complete[0] = true;
+            if (!completed.done()) _exit(2);
+            ChipRun executing = submit(lane, 2, 1);
+            const auto failure = std::make_exception_ptr(std::runtime_error("owned generation ended"));
+            lane.detach_after_failed_teardown(failure);
+            const auto events = g_events;
+            for (ChipRun *run : {&completed, &executing}) {
+                if (!run->done() || !run->lane_poisoned()) _exit(3);
+                for (int retry = 0; retry != 2; ++retry) {
+                    try {
+                        (void)run->wait_until(ChipRun::Clock::now());
+                        _exit(4);
+                    } catch (const std::runtime_error &error) {
+                        if (std::string(error.what()).find("owned generation ended") == std::string::npos) _exit(5);
+                    }
+                }
+                run->abandon();
+            }
+            if (events != g_events) _exit(6);
+            _exit(0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
 
 TEST(ChipRunLaneTest, ForkedHandlesRefuseBeforeTakingAnInheritedMutex) {
     ChipWorker worker;

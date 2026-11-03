@@ -25,6 +25,7 @@ plateau after the first launch until another code publication.
 
 import copy
 import itertools
+import time
 
 import pytest
 import torch
@@ -44,6 +45,9 @@ def _rebase_callable(callable_spec: dict, kernels_dir: str) -> dict:
     for incore in out["incores"]:
         incore["source"] = incore["source"].replace("kernels", kernels_dir, 1)
     return out
+
+
+_SLOT_ORACLE_FAILURE_KEEPERS = []
 
 
 @scene_test(level=2, runtime="host_build_graph")
@@ -334,70 +338,76 @@ class TestRunStreamReuseHbg(SceneTestCase):
             st_worker.unregister(add_handle)
 
     def test_depth_two_slots_own_separate_resources(self, st_platform, st_worker):
-        """Each slot owns its own host Runtime buffer, arena bank, and staging buffer.
-
-        Runs on simulation too: sim implements the same depth, so HBG — whose
-        GM heap is HOST_PER_RUN — must commit a distinct bank per slot there as
-        well. This is the only case that exercises two *committed* banks; the
-        TMR suite cannot, because its arenas are DEVICE_SCRATCH and both slots
-        correctly resolve to bank 0.
-        """
+        """Four live calls preserve their outputs while both execution slots are reused."""
         if not st_platform.startswith("a2a3"):
             pytest.skip("pipeline slot banks are an a2a3 resource")
 
         chip_worker = st_worker._chip_worker
         assert chip_worker.pipeline_depth == 2
         assert chip_worker.runtime_slot_count == 2
-
-        addrs = chip_worker.runtime_buffer_addrs
-        assert len(addrs) == 2, addrs
-        assert addrs[0] != addrs[1], f"both pipeline slots stage into one Runtime buffer: {addrs}"
-
-        add_handle = st_worker.register(self.build_callable(st_platform))
+        records = []
+        handle = st_worker.register(self.build_callable(st_platform))
         try:
+            state = st_worker._resolve_handle(handle)
+            signature = self.CALLABLE["orchestration"]["signature"]
+            config = self._build_config(self.CASES[0].get("config", {}))
             stream_sets = st_worker.run_stream_set_create_count
-            self._run_registered_with_lease(
-                st_worker,
-                add_handle,
-                slot_id=0,
-                generation=self._next_generation(),
-            )
-            after_slot0 = st_worker.run_stream_set_create_count
-            # Registering the callable published its code, so the first launch
-            # replaces the pair. Slot 1 then submits on that same pair: the
-            # stream set is not part of what a slot indexes.
-            expected_increment = 1 if st_platform == "a2a3" else 0
-            assert after_slot0 == stream_sets + expected_increment
-            self._run_registered_with_lease(st_worker, add_handle, slot_id=1, generation=self._next_generation())
-            assert st_worker.run_stream_set_create_count == after_slot0
-
-            self._run_registered_with_lease(
-                st_worker,
-                add_handle,
-                slot_id=0,
-                generation=self._next_generation(),
-            )
-            self._run_registered_with_lease(st_worker, add_handle, slot_id=1, generation=self._next_generation())
-            assert st_worker.run_stream_set_create_count == after_slot0
-
-            # hbg declares its GM heap HOST_PER_RUN, so a run on slot 1 must
-            # commit a second device allocation rather than reuse slot 0's.
+            for index, slot_id in enumerate((0, 1, 0, 1)):
+                test_args = self.generate_args({})
+                test_args.a.add_(index)
+                test_args.b.add_(2 * index)
+                sentinel = -1000.0 - index
+                test_args.f.fill_(sentinel)
+                golden = test_args.clone()
+                self.compute_golden(golden, {})
+                chip_args, output_names = _build_chip_task_args(test_args, signature)
+                record = {
+                    "args": test_args,
+                    "chip_args": chip_args,
+                    "golden": golden,
+                    "outputs": output_names,
+                    "sentinel": sentinel,
+                    "run": None,
+                }
+                records.append(record)
+                native_run = chip_worker._prepare_native_run_with_pipeline_lease(
+                    state.slot_id, chip_args, slot_id=slot_id, generation=self._next_generation(), config=config
+                )
+                record["run"] = native_run
+                # Slot aliases name this new owner only until physical retirement.
+                storage = chip_worker.runtime_buffer_addrs[slot_id]
+                staging = chip_worker.retained_temp_addr(slot_id)
+                assert storage != 0 and staging != 0
+                assert all(storage != old["storage"] and staging != old["staging"] for old in records[:-1])
+                record.update(storage=storage, staging=staging)
+                chip_worker._launch_native_run(native_run)
+                deadline = time.monotonic() + 60.0
+                while not chip_worker._poll_native_run(native_run):
+                    assert time.monotonic() < deadline, "native execution did not physically retire"
+                    time.sleep(0)
+                # Physical progress releases capacity, not these calls' HOST outputs.
+                for owner in records:
+                    assert torch.all(owner["args"].f == owner["sentinel"]), (
+                        "physical poll delivered an unresolved output"
+                    )
+                expected_increment = 1 if st_platform == "a2a3" else 0
+                assert st_worker.run_stream_set_create_count == stream_sets + expected_increment
             bank0 = chip_worker.arena_bank_gm_heap_base(0)
             bank1 = chip_worker.arena_bank_gm_heap_base(1)
             assert bank0 != 0 and bank1 != 0, f"a served bank is uncommitted: {bank0:#x}, {bank1:#x}"
             assert bank0 != bank1, f"both arena banks resolve to one GM heap: {bank0:#x}"
-
-            # hbg stages device args through the retained temporary buffer, and
-            # that buffer is per pipeline slot. Both slots ran, so both hold
-            # one, and they must be distinct — sequential runs re-stage their
-            # arguments every round, so correct output alone would survive both
-            # slots sharing a staging buffer.
-            temp0 = chip_worker.retained_temp_addr(0)
-            temp1 = chip_worker.retained_temp_addr(1)
-            assert temp0 != 0 and temp1 != 0, f"a slot that ran staged nothing: slot0={temp0:#x}, slot1={temp1:#x}"
-            assert temp0 != temp1, f"both slots stage through one retained buffer: {temp0:#x}"
-        finally:
-            st_worker.unregister(add_handle)
+            # Both same-slot successors are admitted before any strong observation.
+            while records:
+                record = records[-1]
+                chip_worker._wait_native_run(record["run"])
+                chip_worker._finalize_native_run(record["run"])
+                _compare_outputs(record["args"], record["golden"], record["outputs"], self.RTOL, self.ATOL)
+                records.pop()
+            st_worker.unregister(handle)
+        except BaseException:
+            # Keep unknown last-use owners and their argument storage through teardown.
+            _SLOT_ORACLE_FAILURE_KEEPERS.append((st_worker, handle, records))
+            raise
 
     def test_unleased_runs_do_not_consume_lease_generations(
         self, st_platform, device_pool, _l2_worker_pool, _l2_poisoned

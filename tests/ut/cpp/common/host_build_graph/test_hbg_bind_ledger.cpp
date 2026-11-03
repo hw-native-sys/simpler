@@ -1849,16 +1849,16 @@ protected:
         NativeRunContext<Runner> first(&runner, before, 0, first_id, &ops);
         NativeRunContext<Runner> second(&runner, after, 0, second_id, &ops);
         auto cleanup = RAIIScopeGuard([&]() {
-            EXPECT_EQ(release_run_bindings_impl(&second.runtime, &second.host_api), 0);
-            EXPECT_EQ(release_run_bindings_impl(&first.runtime, &first.host_api), 0);
+            EXPECT_EQ(release_run_bindings_impl(second.runtime.get(), &second.host_api), 0);
+            EXPECT_EQ(release_run_bindings_impl(first.runtime.get(), &first.host_api), 0);
         });
-        init_runtime(first.runtime);
-        init_runtime(second.runtime);
+        init_runtime(*first.runtime);
+        init_runtime(*second.runtime);
         // Production prepare_launch_shape fills these before binding.
-        first.runtime.dev.chip_swimlane_level = static_cast<uint32_t>(before.enable_chip_swimlane);
-        second.runtime.dev.chip_swimlane_level = static_cast<uint32_t>(after.enable_chip_swimlane);
-        install_callable_tables(first.runtime);
-        second.runtime.set_callable_tables(
+        first.runtime->dev.chip_swimlane_level = static_cast<uint32_t>(before.enable_chip_swimlane);
+        second.runtime->dev.chip_swimlane_level = static_cast<uint32_t>(after.enable_chip_swimlane);
+        install_callable_tables(*first.runtime);
+        second.runtime->set_callable_tables(
             object_table_, reinterpret_cast<uint64_t>(object_table_), reinterpret_cast<uint64_t>(entry_table_), 1
         );
         eps_ = {ordinary_orch_entry, capture_orch_bind};
@@ -1866,20 +1866,20 @@ protected:
         const uint64_t window[4] = {8, 0, 0, 0};
         ASSERT_EQ(
             bind_callable_to_runtime_impl(
-                &first.runtime, &first.host_api, &args, &eps_, nullptr, 0, window, nullptr, nullptr
+                first.runtime.get(), &first.host_api, &args, &eps_, nullptr, 0, window, nullptr, nullptr
             ),
             0
         );
-        ASSERT_GT(first.runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
+        ASSERT_GT(first.runtime->dev.scheduler_bootstrap.worker_context_base, 0u);
         const size_t predecessor_bytes = slot(0).capacity;
         const auto predecessor_host = slot(0).host;
         ASSERT_EQ(
             bind_callable_to_runtime_impl(
-                &second.runtime, &second.host_api, &args, &eps_, nullptr, 0, window, nullptr, nullptr
+                second.runtime.get(), &second.host_api, &args, &eps_, nullptr, 0, window, nullptr, nullptr
             ),
             0
         );
-        ASSERT_GT(second.runtime.dev.scheduler_bootstrap.worker_context_base, 0u);
+        ASSERT_GT(second.runtime->dev.scheduler_bootstrap.worker_context_base, 0u);
         // Identical task shape, distinct fresh slots: only the current run's
         // optional PMU cells or activity buffers can change the requested size.
         if (after_pmu > before_pmu || after_level > before_level) {

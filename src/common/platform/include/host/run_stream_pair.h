@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <functional>
 #include <mutex>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -36,7 +37,8 @@
  * The AICore stream carries instruction-cache state: cores may retain code
  * fetched from a GM address whose contents a later registration replaced.
  * Publishing new AICore code therefore marks the stream stale, and the next
- * launch destroys it and creates a replacement. Creating a stream is the only
+ * launch replaces it. A physically retired call can retain the original
+ * handle until its explicit observer ends. Creating a stream is the only
  * operation known to leave a core free of the previous image's instructions.
  *
  * **Submission state is per owner.** More than one run may have submitted and
@@ -75,6 +77,15 @@ public:
      */
     int ensure() {
         std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = retired_streams_.begin(); it != retired_streams_.end();) {
+            if (it->lifetime.expired()) {
+                const int rc = destroy_(it->stream);
+                if (rc != 0) return rc;
+                it = retired_streams_.erase(it);
+            } else {
+                ++it;
+            }
+        }
         if (aicpu_ == nullptr) {
             int rc = create_(&aicpu_);
             if (rc != 0) {
@@ -84,19 +95,25 @@ public:
         }
         if (aicore_ != nullptr) {
             if (!stale_) return 0;
-            // A run that has not retired still owns the pair: a device-complete
-            // poll is not a finalized run, and replacing the stream under it
-            // would strand a live submission.
+            // Active executions still name this queue. Retired observations
+            // retain their own lifetime reference independently of this table.
             if (owner_count_ != 0) return PTO_RUNTIME_ERR_INTERNAL;
-            int rc = destroy_(aicore_);
-            if (rc != 0) return rc;
+            if (aicore_lifetime_.use_count() > 1) {
+                retired_streams_.push_back({aicore_, aicore_lifetime_});
+            } else {
+                int rc = destroy_(aicore_);
+                if (rc != 0) return rc;
+            }
             aicore_ = nullptr;
+            aicore_lifetime_.reset();
         }
+        auto lifetime = std::make_shared<int>(0);
         int rc = create_(&aicore_);
         if (rc != 0) {
             aicore_ = nullptr;
             return rc;
         }
+        aicore_lifetime_ = std::move(lifetime);
         created_count_.fetch_add(1, std::memory_order_relaxed);
         stale_ = false;
         last_retired_owner_ = nullptr;
@@ -178,6 +195,10 @@ public:
             return 0;
         }
         if (aicore_ == nullptr) return 0;
+        if (aicore_lifetime_.use_count() > 1) {
+            stale_ = true;
+            return 0;
+        }
         int rc = destroy_(aicore_);
         if (rc != 0) return rc;
         aicore_ = nullptr;
@@ -191,7 +212,20 @@ public:
         owner_count_ = 0;
         last_retired_owner_ = nullptr;
         last_retired_complete_ = false;
+        for (auto it = retired_streams_.begin(); it != retired_streams_.end();) {
+            const int rc = !it->lifetime.expired() ? PTO_RUNTIME_ERR_INTERNAL : destroy_(it->stream);
+            if (rc != 0) {
+                if (first_error == 0) first_error = rc;
+                ++it;
+            } else {
+                it = retired_streams_.erase(it);
+            }
+        }
         for (void **stream : {&aicpu_, &aicore_}) {
+            if (stream == &aicore_ && aicore_lifetime_.use_count() > 1) {
+                if (first_error == 0) first_error = PTO_RUNTIME_ERR_INTERNAL;
+                continue;
+            }
             if (*stream == nullptr) continue;
             int rc = destroy_(*stream);
             if (rc != 0) {
@@ -211,10 +245,19 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         aicpu_ = nullptr;
         aicore_ = nullptr;
+        aicore_lifetime_.reset();
+        retired_streams_.clear();
         stale_ = false;
         owner_count_ = 0;
         last_retired_owner_ = nullptr;
         last_retired_complete_ = false;
+    }
+
+    // The pair keeps ownership of the actual handle; the call keeps this
+    // lifetime reference until its explicit observer no longer uses it.
+    std::shared_ptr<void> retain_aicore() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return aicore_lifetime_;
     }
 
     // Handle reads are unsynchronized: the claim holder is the only writer once
@@ -278,6 +321,12 @@ private:
     mutable std::mutex mutex_;
     void *aicpu_{nullptr};
     void *aicore_{nullptr};
+    std::shared_ptr<void> aicore_lifetime_;
+    struct RetiredStream {
+        void *stream;
+        std::weak_ptr<void> lifetime;
+    };
+    std::vector<RetiredStream> retired_streams_;
     // Runs that submitted and have not retired, in submission order. As many as
     // the grant allows: a run holds its place here for as long as it is
     // unretired, so the capacity is the count of runs a context may hold.

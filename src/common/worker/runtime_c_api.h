@@ -27,7 +27,8 @@
  *   - prepared run: simpler_register_callable, simpler_prepare_run,
  *                   simpler_launch_run, simpler_launch_run_joined,
  *                   simpler_poll_run, simpler_wait_run,
- *                   simpler_finalize_run, simpler_run, simpler_launch_run_on_stream,
+ *                   simpler_finalize_run_with_delivery, simpler_finalize_run,
+ *                   simpler_run, simpler_launch_run_on_stream,
  *                   simpler_validate_caller_stream, simpler_validate_execution_context,
  *                   simpler_unregister_callable,
  *                   get_aicpu_dlopen_count, get_host_dlopen_count,
@@ -563,6 +564,10 @@ const PipelineContract *get_pipeline_contract(void);
  * unregistration; initialization and destroy are not.
  * Finalize must establish resource retirement before destroy; the handle's
  * immutable mode alone is not evidence that its resources can be released.
+ * An already-fatal Program owner may close with retained unknown runs only
+ * after a reset and its probes confirm generation end. That exceptional zero
+ * return is terminal environment teardown, not successful execution; old run
+ * carriers remain abandoned and subsequent run operations are rejected.
  * @return Opaque handle on success, NULL on failure.
  */
 DeviceContextHandle create_device_context(void);
@@ -1189,8 +1194,10 @@ int supports_joined_diagnostic_launch_ctx(DeviceContextHandle ctx, RuntimeHandle
  *
  * The successor's native submission reaches the device while the predecessor is
  * still executing; the device still executes one at a time, ordered by a queued
- * wait for the predecessor's whole-operator completion boundary. Neither run's
- * results, outputs or errors are shared: each is decided from its own evidence.
+ * wait for the predecessor's whole-operator completion boundary. Each call
+ * retains its own results and output backing. Explicit observation synchronizes
+ * that call's retained streams, so later work on those streams can affect its
+ * latency or returned SDK error; per-call SDK error isolation is not promised.
  *
  * Returns PTO_RUNTIME_ERR_UNSUPPORTED, having changed nothing, when this
  * context, this runtime or this moment cannot order the two — the run is still
@@ -1201,16 +1208,21 @@ int supports_joined_diagnostic_launch_ctx(DeviceContextHandle ctx, RuntimeHandle
 int simpler_launch_run_joined(DeviceContextHandle ctx, RuntimeHandle runtime, RuntimeHandle predecessor);
 
 /**
- * Non-blocking device-completion query. Returns
- * SIMPLER_NATIVE_RUN_POLL_NOT_READY, SIMPLER_NATIVE_RUN_POLL_COMPLETE, or a
- * negative validation, phase, or device-query error. COMPLETE is published
- * only after the executor has also finished host-side drain work. Polling
- * never releases the prepared run's resources; call only after
- * simpler_launch_run() returns.
+ * Nonblocking own-execution completion query after launch. Returns POLL_*.
+ * COMPLETE proves owned physical retirement, without reading semantic status
+ * or copying Program outputs. The live call still requires wait/finalize.
  */
 int simpler_poll_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
-/** Wait for device execution to terminate. Does not release prepared resources. */
+/**
+ * Internal blocking physical progress under the runtime's existing timeout.
+ * Zero proves own boundaries and queued-wait consumption, and retires execution
+ * resources. Never synchronizes whole streams or reads the private result.
+ * An error retains unresolved debt and does not prove device stop.
+ */
+int simpler_wait_run_completion(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/** Observe the actual run streams once; may include later queued work. */
 int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime);
 
 /**
@@ -1222,6 +1234,15 @@ int simpler_wait_run(DeviceContextHandle ctx, RuntimeHandle runtime);
  * ActiveExecution alone does not. The original launch error remains observable.
  */
 int simpler_finalize_run(DeviceContextHandle ctx, RuntimeHandle runtime);
+
+/**
+ * Internal worker finalization: observe and release the run while permitting
+ * (1) or withholding (0) successful Program HOST-output delivery. A rejected
+ * result still owes the same drain and ownership cleanup. The run's own native
+ * status is returned unchanged; an earlier lane failure is reported by its
+ * caller. This operation is required before a worker accepts any run.
+ */
+int simpler_finalize_run_with_delivery(DeviceContextHandle ctx, RuntimeHandle runtime, int deliver_outputs);
 
 /**
  * Committed GM heap base of one arena bank, or 0 when that bank has never been
