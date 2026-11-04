@@ -41,6 +41,36 @@ jobs:
           ref: ${{ inputs.ref || github.ref }}
           persist-credentials: false
 
+      - name: Diagnose A3 runner cross-compiler environment
+        if: inputs.platform == 'a2a3'
+        run: |
+          echo "Runner: $RUNNER_NAME on $(hostname)"
+          echo "Before CANN: CXXFLAGS=${CXXFLAGS-<unset>}"
+          echo "Before CANN: CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS-<unset>}"
+          cann_env="$(python3 -c 'from simpler_setup.test_environments import select_toolchain; print(select_toolchain("torch_npu"))' | tail -n 1)"
+          source "$cann_env"
+          echo "After CANN: CXXFLAGS=${CXXFLAGS-<unset>}"
+          echo "After CANN: CMAKE_CXX_FLAGS=${CMAKE_CXX_FLAGS-<unset>}"
+          command -v cmake
+          cmake --version | head -n 1
+          command -v ninja
+          ninja --version
+          compiler="$ASCEND_HOME_PATH/tools/hcc/bin/aarch64-target-linux-gnu-g++"
+          "$compiler" --version | head -n 1
+          probe="$(mktemp -d)"
+          trap 'rm -rf "$probe"' EXIT
+          printf 'cmake_minimum_required(VERSION 3.20)\nproject(a3_probe LANGUAGES CXX)\n' > "$probe/CMakeLists.txt"
+          if cmake -S "$probe" -B "$probe/inherited" -G Ninja -DCMAKE_CXX_COMPILER="$compiler" -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY; then
+            echo "Inherited environment: cross-compiler probe passed"
+          else
+            echo "Inherited environment: cross-compiler probe failed"
+          fi
+          if env -u CXXFLAGS -u CMAKE_CXX_FLAGS cmake -S "$probe" -B "$probe/clean" -G Ninja -DCMAKE_CXX_COMPILER="$compiler" -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY; then
+            echo "Without compiler flags: cross-compiler probe passed"
+          else
+            echo "Without compiler flags: cross-compiler probe failed"
+          fi
+
       - name: Set up framework environment
         id: framework
         uses: ./.github/actions/setup-framework-eager
