@@ -11,13 +11,14 @@
 
 TMR classifies its GM heap, GM shared memory, and runtime image as
 `DEVICE_SCRATCH`, so every slot shares arena bank 0 — only its task args are
-`HOST_PER_RUN`. What still separates per slot is the host `Runtime` staging
-buffer and the retained temporary buffer TMR stages device args through.
+`HOST_PER_RUN`. Each live call owns its native storage and the retained temporary buffer
+TMR stages device args through.
 host_build_graph exercises the opposite split, so neither runtime's coverage
 substitutes for the other's.
 """
 
 import itertools
+import time
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -26,6 +27,9 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, TensorArg, scene_test
 from simpler_setup.scene_test import _build_chip_task_args, _build_l2_ref_args, _compare_outputs
 
 _VECTOR_KERNELS = "../../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
+
+
+_SLOT_ORACLE_FAILURE_KEEPERS = []
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -111,37 +115,67 @@ class TestPipelineSlotsTmr(SceneTestCase):
         _compare_outputs(test_args, golden, output_names, self.RTOL, self.ATOL)
 
     def test_slot_one_keeps_tmr_per_run_state_separate(self, st_platform, st_worker):
+        """Four live calls preserve their outputs while both execution slots are reused."""
         chip_worker = st_worker._chip_worker
         assert chip_worker.pipeline_depth == 2
         assert chip_worker.runtime_slot_count == 2
-
-        addrs = chip_worker.runtime_buffer_addrs
-        assert len(addrs) == 2, addrs
-        assert addrs[0] != addrs[1], f"both slots stage into one host Runtime: {addrs}"
-
+        records = []
         handle = st_worker.register(self.build_callable(st_platform))
         try:
-            # Interleave the slots: if slot 1 shared slot 0's host Runtime or
-            # its retained temporary buffer, the run after the switch back
-            # would read arguments the other slot staged.
-            self._run(st_worker, handle)
-            self._run(st_worker, handle, slot_id=1)
-            self._run(st_worker, handle)
-            self._run(st_worker, handle, slot_id=1)
-
-            # Sequential runs re-stage their arguments every round, so correct
-            # output alone would survive both slots sharing one staging buffer.
-            # Read the addresses instead.
-            temp0 = chip_worker.retained_temp_addr(0)
-            temp1 = chip_worker.retained_temp_addr(1)
-            assert temp0 != 0 and temp1 != 0, f"a slot that ran staged nothing: slot0={temp0:#x}, slot1={temp1:#x}"
-            assert temp0 != temp1, f"both slots stage through one retained buffer: {temp0:#x}"
-
-            # TMR declares its three pooled regions DEVICE_SCRATCH, so both
-            # slots must still resolve to the one committed bank.
+            state = st_worker._resolve_handle(handle)
+            signature = self.CALLABLE["orchestration"]["signature"]
+            config = self._build_config(self.CASES[0].get("config", {}))
+            for index, slot_id in enumerate((0, 1, 0, 1)):
+                test_args = self.generate_args({})
+                test_args.a.add_(index)
+                test_args.b.add_(2 * index)
+                sentinel = -1000.0 - index
+                test_args.f.fill_(sentinel)
+                golden = test_args.clone()
+                self.compute_golden(golden, {})
+                chip_args, output_names = _build_chip_task_args(test_args, signature)
+                record = {
+                    "args": test_args,
+                    "chip_args": chip_args,
+                    "golden": golden,
+                    "outputs": output_names,
+                    "sentinel": sentinel,
+                    "run": None,
+                }
+                records.append(record)
+                native_run = chip_worker._prepare_native_run_with_pipeline_lease(
+                    state.slot_id, chip_args, slot_id=slot_id, generation=next(self._generation_counter), config=config
+                )
+                record["run"] = native_run
+                # Slot aliases name this new owner only until physical retirement.
+                storage = chip_worker.runtime_buffer_addrs[slot_id]
+                staging = chip_worker.retained_temp_addr(slot_id)
+                assert storage != 0 and staging != 0
+                assert all(storage != old["storage"] and staging != old["staging"] for old in records[:-1])
+                record.update(storage=storage, staging=staging)
+                chip_worker._launch_native_run(native_run)
+                deadline = time.monotonic() + 60.0
+                while not chip_worker._poll_native_run(native_run):
+                    assert time.monotonic() < deadline, "native execution did not physically retire"
+                    time.sleep(0)
+                # Physical progress releases capacity, not these calls' HOST outputs.
+                for owner in records:
+                    assert torch.all(owner["args"].f == owner["sentinel"]), (
+                        "physical poll delivered an unresolved output"
+                    )
             bank0 = chip_worker.arena_bank_gm_heap_base(0)
             bank1 = chip_worker.arena_bank_gm_heap_base(1)
             assert bank0 != 0, "the shared device-scratch bank was never committed"
             assert bank1 == 0, f"slot 1 committed a second device-scratch bank: {bank1:#x}"
-        finally:
+            # Both same-slot successors are admitted before any strong observation.
+            while records:
+                record = records[-1]
+                chip_worker._wait_native_run(record["run"])
+                chip_worker._finalize_native_run(record["run"])
+                _compare_outputs(record["args"], record["golden"], record["outputs"], self.RTOL, self.ATOL)
+                records.pop()
             st_worker.unregister(handle)
+        except BaseException:
+            # Keep unknown last-use owners and their argument storage through teardown.
+            _SLOT_ORACLE_FAILURE_KEEPERS.append((st_worker, handle, records))
+            raise

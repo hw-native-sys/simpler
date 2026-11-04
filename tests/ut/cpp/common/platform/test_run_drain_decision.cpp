@@ -8,23 +8,9 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-// What a fenced drain does once a run's boundaries have settled: whether it
-// returns on the run's own record, and what happens to a status the record
-// transfer itself reported.
-//
-// The production pieces are driven, not imitated. Boundaries come from a real
-// `RunCompletionFence` through `wait_and_retain_run_boundaries`; the record
-// read goes through `RunRecordReadLedger::read_with_status` against a
-// scripted transport; the terminal comes from the shared
-// `device_run_result_terminal` validator; and the branch is chosen by
-// `decide_run_drain`, which is the rule `DeviceRunnerBase::wait_run_fence`
-// switches on. The only thing a case supplies is what the device and the
-// transport did.
-//
-// What this cannot cover, and what the PR says instead of simulating: the
-// `rtMemcpy` inside `read_device_run_result` and the `sync_stream_pair` call
-// the `Synchronize` and `ReportTransferError` branches make, both of which are
-// CANN-bound members of an abstract runner.
+// Cached diagnostic records retain transfer status and run identity. Public
+// execution verdicts come from the retained RTS streams; these tests exercise
+// the read ledger and record validator without assigning business authority.
 #include <gtest/gtest.h>
 
 #include <array>
@@ -86,8 +72,6 @@ public:
         };
         return ops;
     }
-
-    void device_never_completes() { complete_ = false; }
 
 private:
     std::array<uint8_t, RunCompletionFence::kRoleCount> handles_{};
@@ -163,17 +147,17 @@ private:
     bool lands_bytes_{true};
 };
 
-// One drained run's evidence, assembled the way `wait_run_fence` assembles it.
-struct DrainedRun {
+// Diagnostic evidence after the recorded boundaries are safe to read.
+struct DiagnosticRead {
     int transfer_rc{0};
     RunOutcomeEvidence evidence;
 };
 
-DrainedRun drain(
+DiagnosticRead read_diagnostic_after_boundaries(
     RunCompletionFence &fence, RunBoundaryLedger &boundaries, RunRecordReadLedger &reads, DeviceRunResultRegion &cached,
     const NativeRunIdentity &run, const DeviceRunResultRegion *device_region, const ScriptedTransport &transport
 ) {
-    DrainedRun out;
+    DiagnosticRead out;
     out.evidence.boundaries = wait_and_retain_run_boundaries(fence, boundaries, run, kTimeoutMs).completion;
     out.transfer_rc = reads.read_with_status(run.pipeline_slot, run.run_epoch, cached, device_region, transport);
     out.evidence.record_read = reads.state(run.pipeline_slot, run.run_epoch);
@@ -183,78 +167,9 @@ DrainedRun drain(
     return out;
 }
 
-// ===== The fast branch =====
+// ===== Failed diagnostic transfers clear cached bytes =====
 
-TEST(RunDrainDecision, BothBoundariesAndAValidOkDecideSuccessWithoutSynchronizing) {
-    ScriptedEvents events;
-    RunCompletionFence fence(events.ops());
-    RunBoundaryLedger boundaries(kSlots);
-    RunRecordReadLedger reads(kSlots);
-    const NativeRunIdentity run = run_at(1, 11);
-    fence_the_run(fence, run);
-
-    const DeviceRunResultRegion device_region = published_success(run.run_epoch);
-    DeviceRunResultRegion cached{};
-    ScriptedTransport transport(&device_region);
-    const DrainedRun drained = drain(fence, boundaries, reads, cached, run, &device_region, transport);
-
-    ASSERT_EQ(drained.evidence.boundaries, Completion::Complete);
-    ASSERT_EQ(drained.transfer_rc, 0);
-    ASSERT_EQ(drained.evidence.record_read, RunRecordRead::Ok);
-    EXPECT_EQ(decide_run_drain(drained.transfer_rc, drained.evidence), RunDrainAction::AcceptRecordedSuccess);
-}
-
-TEST(RunDrainDecision, AnOkRecordWhoseBoundariesHaveNotCompletedStillSynchronizes) {
-    ScriptedEvents events;
-    events.device_never_completes();
-    RunCompletionFence fence(events.ops());
-    RunBoundaryLedger boundaries(kSlots);
-    RunRecordReadLedger reads(kSlots);
-    const NativeRunIdentity run = run_at(1, 12);
-    // Submitted but never recorded: the fence cannot decide it.
-    ASSERT_EQ(fence.arm(run), 0);
-    fence.note_kernel_submitted(run, StreamRole::Aicore);
-    fence.note_kernel_submitted(run, StreamRole::Aicpu);
-
-    const DeviceRunResultRegion device_region = published_success(run.run_epoch);
-    DeviceRunResultRegion cached{};
-    ScriptedTransport transport(&device_region);
-    const DrainedRun drained = drain(fence, boundaries, reads, cached, run, &device_region, transport);
-
-    ASSERT_EQ(drained.evidence.boundaries, Completion::Unfenced);
-    EXPECT_EQ(decide_run_drain(drained.transfer_rc, drained.evidence), RunDrainAction::Synchronize)
-        << "a success record is not the missing completion proof";
-}
-
-// ===== An observed transport error is never replaced =====
-
-TEST(RunDrainDecision, ATransportStatusOutranksARecordThatWouldOtherwiseDecideSuccess) {
-    ScriptedEvents events;
-    RunCompletionFence fence(events.ops());
-    RunBoundaryLedger boundaries(kSlots);
-    RunRecordReadLedger reads(kSlots);
-    const NativeRunIdentity run = run_at(2, 21);
-    fence_the_run(fence, run);
-
-    const DeviceRunResultRegion device_region = published_success(run.run_epoch);
-    DeviceRunResultRegion cached{};
-    ScriptedTransport transport(&device_region);
-    // The bytes land and they say Ok; the transport still reports a code.
-    transport.reports(kTransportError);
-    const DrainedRun drained = drain(fence, boundaries, reads, cached, run, &device_region, transport);
-
-    EXPECT_EQ(drained.transfer_rc, kTransportError) << "the transport's own code, not a substitute";
-    EXPECT_EQ(drained.evidence.boundaries, Completion::Complete);
-    EXPECT_EQ(drained.evidence.record_read, RunRecordRead::Failed)
-        << "a transfer that reported a status did not produce a record to trust";
-    EXPECT_EQ(decide_run_drain(drained.transfer_rc, drained.evidence), RunDrainAction::ReportTransferError);
-
-    // The discriminator: the same evidence with no observed status does not
-    // reach that branch, so it is the retained code that decides here.
-    EXPECT_EQ(decide_run_drain(0, drained.evidence), RunDrainAction::Synchronize);
-}
-
-TEST(RunDrainDecision, AFailedTransferLeavesNoBytesForAnyBranchToRead) {
+TEST(RunRecordTransferStatus, AFailedTransferClearsTheCachedBytes) {
     RunRecordReadLedger reads(kSlots);
     const NativeRunIdentity run = run_at(0, 31);
     const DeviceRunResultRegion device_region = published_success(run.run_epoch);
@@ -359,7 +274,7 @@ TEST(RunRecordTransferStatus, AStatusBelongsToTheRunThatOwnsTheRead) {
     EXPECT_EQ(reads.transfer_status(predecessor.pipeline_slot, predecessor.run_epoch), kOtherTransportError);
 }
 
-TEST(RunDrainDecision, ARecordPublishedUnderAnEarlierEpochSynchronizes) {
+TEST(RunRecordTransferStatus, AStaleRecordDoesNotSupplyDiagnosticTerminal) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
     RunBoundaryLedger boundaries(kSlots);
@@ -373,16 +288,16 @@ TEST(RunDrainDecision, ARecordPublishedUnderAnEarlierEpochSynchronizes) {
     ScriptedTransport transport(&device_region);
 
     fence_the_run(fence, successor);
-    const DrainedRun drained = drain(fence, boundaries, reads, cached, successor, &device_region, transport);
+    const DiagnosticRead drained =
+        read_diagnostic_after_boundaries(fence, boundaries, reads, cached, successor, &device_region, transport);
 
     ASSERT_EQ(drained.evidence.boundaries, Completion::Complete);
     ASSERT_EQ(drained.evidence.record_read, RunRecordRead::Ok) << "the bytes did arrive";
     EXPECT_EQ(drained.evidence.terminal.state, DeviceRunTerminalState::Undecided)
         << "but they were published under another run's epoch";
-    EXPECT_EQ(decide_run_drain(drained.transfer_rc, drained.evidence), RunDrainAction::Synchronize);
 }
 
-TEST(RunDrainDecision, AReadForgottenByAGenerationResetSynchronizes) {
+TEST(RunRecordTransferStatus, AGenerationResetForgetsTheDiagnosticRead) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
     RunBoundaryLedger boundaries(kSlots);
@@ -393,8 +308,9 @@ TEST(RunDrainDecision, AReadForgottenByAGenerationResetSynchronizes) {
     const DeviceRunResultRegion device_region = published_success(run.run_epoch);
     DeviceRunResultRegion cached{};
     ScriptedTransport transport(&device_region);
-    DrainedRun drained = drain(fence, boundaries, reads, cached, run, &device_region, transport);
-    ASSERT_EQ(decide_run_drain(drained.transfer_rc, drained.evidence), RunDrainAction::AcceptRecordedSuccess);
+    DiagnosticRead drained =
+        read_diagnostic_after_boundaries(fence, boundaries, reads, cached, run, &device_region, transport);
+    ASSERT_EQ(drained.evidence.terminal.state, DeviceRunTerminalState::Succeeded);
 
     // What a runner starting a fresh device generation does.
     reads.reset();
@@ -403,12 +319,11 @@ TEST(RunDrainDecision, AReadForgottenByAGenerationResetSynchronizes) {
     drained.evidence.terminal = DeviceRunTerminal{};
     EXPECT_EQ(drained.evidence.record_read, RunRecordRead::NotAttempted);
     EXPECT_EQ(reads.transfer_status(run.pipeline_slot, run.run_epoch), 0);
-    EXPECT_EQ(decide_run_drain(/*record_transfer_rc=*/0, drained.evidence), RunDrainAction::Synchronize);
 }
 
-// ===== Every remaining shape keeps the synchronize =====
+// ===== Diagnostic record validity =====
 
-TEST(RunDrainDecision, APublishedFailureSynchronizesAndKeepsItsAttribution) {
+TEST(RunRecordTransferStatus, APublishedFailureKeepsItsDiagnosticAttribution) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
     RunBoundaryLedger boundaries(kSlots);
@@ -419,15 +334,15 @@ TEST(RunDrainDecision, APublishedFailureSynchronizesAndKeepsItsAttribution) {
     const DeviceRunResultRegion device_region = published_failure(run.run_epoch);
     DeviceRunResultRegion cached{};
     ScriptedTransport transport(&device_region);
-    const DrainedRun drained = drain(fence, boundaries, reads, cached, run, &device_region, transport);
+    const DiagnosticRead drained =
+        read_diagnostic_after_boundaries(fence, boundaries, reads, cached, run, &device_region, transport);
 
     ASSERT_EQ(drained.evidence.terminal.state, DeviceRunTerminalState::Failed);
     EXPECT_EQ(drained.evidence.terminal.code, kRuntimeCode);
     EXPECT_EQ(drained.evidence.terminal.source, DeviceRunCodeSource::Header);
-    EXPECT_EQ(decide_run_drain(drained.transfer_rc, drained.evidence), RunDrainAction::Synchronize);
 }
 
-TEST(RunDrainDecision, ARecordNeverPublishedSynchronizes) {
+TEST(RunRecordTransferStatus, AnUnpublishedRecordSuppliesNoDiagnosticTerminal) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
     RunBoundaryLedger boundaries(kSlots);
@@ -438,14 +353,14 @@ TEST(RunDrainDecision, ARecordNeverPublishedSynchronizes) {
     const DeviceRunResultRegion device_region{};
     DeviceRunResultRegion cached{};
     ScriptedTransport transport(&device_region);
-    const DrainedRun drained = drain(fence, boundaries, reads, cached, run, &device_region, transport);
+    const DiagnosticRead drained =
+        read_diagnostic_after_boundaries(fence, boundaries, reads, cached, run, &device_region, transport);
 
     ASSERT_EQ(drained.evidence.record_read, RunRecordRead::Ok);
     EXPECT_EQ(drained.evidence.terminal.state, DeviceRunTerminalState::Undecided);
-    EXPECT_EQ(decide_run_drain(drained.transfer_rc, drained.evidence), RunDrainAction::Synchronize);
 }
 
-TEST(RunDrainDecision, ASelfInconsistentRecordSynchronizes) {
+TEST(RunRecordTransferStatus, AnInconsistentRecordSuppliesNoDiagnosticTerminal) {
     ScriptedEvents events;
     RunCompletionFence fence(events.ops());
     RunBoundaryLedger boundaries(kSlots);
@@ -456,10 +371,10 @@ TEST(RunDrainDecision, ASelfInconsistentRecordSynchronizes) {
     const DeviceRunResultRegion device_region = self_inconsistent(run.run_epoch);
     DeviceRunResultRegion cached{};
     ScriptedTransport transport(&device_region);
-    const DrainedRun drained = drain(fence, boundaries, reads, cached, run, &device_region, transport);
+    const DiagnosticRead drained =
+        read_diagnostic_after_boundaries(fence, boundaries, reads, cached, run, &device_region, transport);
 
     EXPECT_EQ(drained.evidence.terminal.state, DeviceRunTerminalState::Undecided);
-    EXPECT_EQ(decide_run_drain(drained.transfer_rc, drained.evidence), RunDrainAction::Synchronize);
 }
 
 }  // namespace

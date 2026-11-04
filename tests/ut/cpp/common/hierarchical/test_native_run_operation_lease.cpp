@@ -17,6 +17,8 @@
  * tag. The runtime entries are stubs here, so each of those can be produced on demand rather than
  * waited for.
  */
+#include <unistd.h>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -24,9 +26,11 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
+#include <unordered_map>
 #include <vector>
 
 #include <dlfcn.h>
@@ -68,6 +72,11 @@ TEST(NativeRunOperationLeaseTest, RunStorageRetainsItsModuleAcrossMoves) {
 // What each stub should do on its next call. Plain globals because one case drives one worker.
 std::mutex g_mu;
 std::condition_variable g_cv;
+uint64_t g_prepare_epoch = 0;
+bool g_prepare_entered = false;
+bool g_prepare_released = true;
+bool g_prepare_in_progress = false;
+bool g_finalize_during_prepare = false;
 bool g_wait_entered = false;
 bool g_wait_released = true;
 int g_wait_rc = 0;
@@ -95,6 +104,15 @@ int g_device_finalize_rc = 0;
 int g_device_finalize_calls = 0;
 int g_destroy_context_calls = 0;
 int g_comm_free_calls = 0;
+int g_context_rc = 0;
+struct StubCarrier {
+    uint64_t magic;
+    uint64_t epoch;
+};
+std::unordered_map<uint64_t, int> g_per_run_wait_rc;
+std::vector<uint64_t> g_waited_epochs;
+
+int validate_context(void *) { return g_context_rc; }
 
 int stub_release_domain(void *, uint64_t, size_t, uint32_t) {
     ++g_comm_free_calls;
@@ -109,10 +127,23 @@ int stub_destroy_comm(void *) {
     return 0;
 }
 
-int prepare_run(void *, void *runtime, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *) {
+int prepare_run(
+    void *, void *runtime, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *descriptor
+) {
+    {
+        std::unique_lock<std::mutex> lk(g_mu);
+        g_prepare_epoch = descriptor->run_epoch;
+        g_prepare_entered = true;
+        g_prepare_in_progress = true;
+        g_cv.notify_all();
+        g_cv.wait(lk, [] {
+            return g_prepare_released;
+        });
+        g_prepare_in_progress = false;
+    }
     // The carrier the platform would place here; only its tag matters to the worker.
-    uint64_t tag = kNativeRunContextMagic;
-    std::memcpy(runtime, &tag, sizeof(tag));
+    const StubCarrier carrier{kNativeRunContextMagic, descriptor->run_epoch};
+    std::memcpy(runtime, &carrier, sizeof(carrier));
     return 0;
 }
 
@@ -120,7 +151,7 @@ int launch_run(void *, void *) { return g_launch_rc; }
 
 int poll_run(void *, void *) { return g_poll_rc; }
 
-int wait_run(void *, void *) {
+int wait_run(void *, void *runtime) {
     {
         std::unique_lock<std::mutex> lk(g_mu);
         ++g_wait_calls;
@@ -131,10 +162,28 @@ int wait_run(void *, void *) {
         });
     }
     if (g_wait_throws) throw std::runtime_error("stub wait failed");
+    StubCarrier carrier{};
+    std::memcpy(&carrier, runtime, sizeof(carrier));
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_waited_epochs.push_back(carrier.epoch);
+    const auto found = g_per_run_wait_rc.find(carrier.epoch);
+    if (found != g_per_run_wait_rc.end()) return found->second;
+    if (g_wait_rc == 0) g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
     return g_wait_rc;
 }
 
-int finalize_run(void *, void *runtime) {
+int wait_run_completion(void *, void *) {
+    std::unique_lock<std::mutex> lk(g_mu);
+    g_wait_entered = true;
+    g_cv.notify_all();
+    g_cv.wait(lk, [] {
+        return g_wait_released;
+    });
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    return 0;
+}
+
+int finalize_run(void *, void *runtime, int) {
     ++g_finalize_calls;
     if (g_finalize_destroys) {
         uint64_t cleared = 0;
@@ -184,6 +233,8 @@ int supports_joined_diagnostic_launch(void *, void *, void *predecessor_runtime)
 }
 
 int stub_finalize_device(void *) {
+    std::lock_guard<std::mutex> lk(g_mu);
+    g_finalize_during_prepare |= g_prepare_in_progress;
     ++g_device_finalize_calls;
     return g_device_finalize_rc;
 }
@@ -193,6 +244,9 @@ void stub_destroy_device_context(void *) { ++g_destroy_context_calls; }
 void prime(ChipWorker &worker, uint32_t depth = 2) {
     {
         std::lock_guard<std::mutex> lk(g_mu);
+        g_prepare_entered = false;
+        g_prepare_released = true;
+        g_prepare_in_progress = g_finalize_during_prepare = false;
         g_wait_entered = false;
         g_wait_released = true;
     }
@@ -220,12 +274,16 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
     g_device_finalize_calls = 0;
     g_destroy_context_calls = 0;
     g_comm_free_calls = 0;
+    g_context_rc = 0;
+    g_per_run_wait_rc.clear();
+    g_waited_epochs.clear();
     worker.initialized_ = true;
     // The stubs ignore it, but teardown refuses to run without one, which is the production
     // guard against closing a worker that never reached a device.
     static int device_context_placeholder = 0;
     worker.device_ctx_ = &device_context_placeholder;
     worker.destroy_device_context_fn_ = stub_destroy_device_context;
+    worker.validate_execution_context_fn_ = validate_context;
     // A reference to this executable supplies the runtime owner without another DSO.
     if (worker.runtime_module_ == nullptr) worker.runtime_module_ = std::make_shared<RuntimeModule>(nullptr);
     EXPECT_NE(worker.runtime_module_, nullptr);
@@ -241,6 +299,7 @@ void prime(ChipWorker &worker, uint32_t depth = 2) {
     worker.launch_run_fn_ = launch_run;
     worker.poll_run_fn_ = poll_run;
     worker.wait_run_fn_ = wait_run;
+    worker.wait_run_completion_fn_ = wait_run_completion;
     worker.finalize_run_fn_ = finalize_run;
     worker.supports_concurrent_native_prepare_fn_ = supports_successor;
 }
@@ -362,6 +421,132 @@ private:
 
 }  // namespace
 
+TEST(NativeRunOperationLeaseTest, CompletedPollDoesNotReplaceTheExplicitObserver) {
+    ChipWorker worker;
+    prime(worker);
+    const ChipWorkerNativeRun run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    EXPECT_TRUE(worker.poll_native_run(run));
+    EXPECT_TRUE(worker.poll_native_run(run));
+    EXPECT_EQ(g_wait_calls, 0);
+    EXPECT_EQ(g_finalize_calls, 0);
+
+    g_wait_rc = -731;
+    worker.wait_native_run(run);
+    EXPECT_EQ(g_wait_calls, 1);
+    g_wait_rc = -732;
+    worker.wait_native_run(run);
+    EXPECT_EQ(g_wait_calls, 1);
+    try {
+        worker.finalize_native_run(run);
+        FAIL() << "the explicit observer's failure was replaced by a completed poll";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(std::string(error.what()).find("-731"), std::string::npos);
+    }
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_EQ(g_finalize_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, CloseBeforeWaitObservesEvenAfterCompletedPoll) {
+    ChipWorker worker;
+    prime(worker);
+    const ChipWorkerNativeRun run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    ASSERT_TRUE(worker.poll_native_run(run));
+    g_wait_rc = -733;
+    try {
+        worker.finalize_native_run(run);
+        FAIL() << "closing an unobserved call omitted the explicit observer";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(std::string(error.what()).find("-733"), std::string::npos);
+    }
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_EQ(g_finalize_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, CompletedPollKeepsAnUnobservedRunRetryableAfterContextRefusal) {
+    ChipWorker worker;
+    prime(worker);
+    const ChipWorkerNativeRun run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    ASSERT_TRUE(worker.poll_native_run(run));
+    g_context_rc = PTO_RUNTIME_ERR_INVALID_STATE;
+    EXPECT_THROW(worker.wait_native_run(run), ExecutionContextRefused);
+    EXPECT_THROW(worker.finalize_native_run(run), ExecutionContextRefused);
+    EXPECT_EQ(g_wait_calls, 0);
+    EXPECT_EQ(g_finalize_calls, 0);
+    g_context_rc = 0;
+    g_wait_rc = -734;
+    worker.wait_native_run(run);
+    EXPECT_EQ(g_wait_calls, 1);
+    try {
+        worker.finalize_native_run(run);
+        FAIL() << "context refusal lost the pending explicit observation";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(std::string(error.what()).find("-734"), std::string::npos);
+    }
+    EXPECT_EQ(g_wait_calls, 1);
+}
+
+TEST(NativeRunOperationLeaseTest, SlotReuseKeepsEachUnobservedCallAndDoesNotForceAnObserver) {
+    ChipWorker worker;
+    prime(worker);
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    std::vector<ChipWorkerNativeRun> runs;
+    for (uint64_t generation = 1; generation <= 6; ++generation) {
+        std::optional<ChipWorkerNativeRun> current;
+        EXPECT_NO_THROW(current = prepare(worker, (generation - 1) % 2, generation));
+        if (!current) break;
+        runs.push_back(*current);
+        g_per_run_wait_rc[current->run_epoch] = -740 - static_cast<int>(generation);
+        worker.launch_native_run(*current);
+        ASSERT_TRUE(worker.poll_native_run(*current));
+        EXPECT_EQ(g_wait_calls, 0);
+        EXPECT_EQ(g_finalize_calls, 0);
+    }
+    ASSERT_EQ(runs.size(), 6u) << "unobserved calls are not executing occupants of the pipeline slots";
+    for (auto it = runs.rbegin(); it != runs.rend(); ++it) {
+        const int expected = g_per_run_wait_rc.at(it->run_epoch);
+        EXPECT_TRUE(worker.poll_native_run(*it));
+        worker.wait_native_run(*it);
+        worker.wait_native_run(*it);
+        try {
+            worker.finalize_native_run(*it);
+            FAIL() << "the old handle lost its own observer error";
+        } catch (const std::runtime_error &error) {
+            EXPECT_NE(std::string(error.what()).find(std::to_string(expected)), std::string::npos);
+        }
+    }
+    EXPECT_EQ(g_wait_calls, 6);
+    EXPECT_EQ(g_finalize_calls, 6);
+    std::vector<uint64_t> expected_epochs;
+    for (auto it = runs.rbegin(); it != runs.rend(); ++it)
+        expected_epochs.push_back(it->run_epoch);
+    EXPECT_EQ(g_waited_epochs, expected_epochs);
+}
+
+TEST(NativeRunOperationLeaseTest, ObserverErrorDoesNotProvePhysicalCompletionOrReleaseTheSlot) {
+    ChipWorker worker;
+    prime(worker);
+    const ChipWorkerNativeRun run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    g_poll_rc = SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+    g_wait_rc = -751;
+    worker.wait_native_run(run);
+    EXPECT_EQ(g_wait_calls, 1);
+    EXPECT_FALSE(worker.poll_native_run(run)) << "an observer error does not prove that device readers stopped";
+    EXPECT_THROW(prepare(worker, 0, 2), RunPreparationRefused);
+    EXPECT_EQ(g_finalize_calls, 0);
+    g_finalize_destroys = false;
+    g_finalize_rc = -752;
+    EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
+    EXPECT_THROW(prepare(worker, 0, 3), RunPreparationRefused);
+    EXPECT_EQ(g_wait_calls, 1);
+}
+
 // A refused finalization must not undo the completion its own wait established, or the next
 // attempt waits again and reports whatever that second wait says instead of the first error.
 TEST(NativeRunOperationLeaseTest, RefusedFinalizeKeepsItsWaitOutcomeAndDoesNotWaitTwice) {
@@ -380,7 +565,8 @@ TEST(NativeRunOperationLeaseTest, RefusedFinalizeKeepsItsWaitOutcomeAndDoesNotWa
         std::lock_guard<std::mutex> lk(worker.native_run_mu_);
         const auto it = worker.native_runs_.find(run.run_epoch);
         ASSERT_NE(it, worker.native_runs_.end());
-        EXPECT_EQ(it->second->phase, ChipWorker::NativeRunPhase::REAPED);
+        EXPECT_EQ(it->second->phase, ChipWorker::NativeRunPhase::LAUNCHED);
+        EXPECT_TRUE(it->second->result_observed);
         EXPECT_TRUE(it->second->pending_rc_set);
         EXPECT_EQ(it->second->pending_rc, -7);
         EXPECT_FALSE(it->second->finalize_reserved);
@@ -525,8 +711,8 @@ TEST(NativeRunOperationLeaseTest, AdmittingLaterRunsRehashesTheTableUnderASleepi
         const auto it = worker.native_runs_.find(run.run_epoch);
         ASSERT_NE(it, worker.native_runs_.end());
         EXPECT_EQ(it->second.get(), entry_before);
-        EXPECT_EQ(it->second->phase, ChipWorker::NativeRunPhase::REAPED)
-            << "the waiter's own completion did not land on its own entry";
+        EXPECT_EQ(it->second->phase, ChipWorker::NativeRunPhase::LAUNCHED);
+        EXPECT_TRUE(it->second->result_observed) << "the waiter's own observation did not land on its own entry";
         EXPECT_TRUE(it->second->pending_rc_set);
         EXPECT_EQ(it->second->pending_rc, -7) << "the waiter's own outcome was not the one it recorded";
         EXPECT_EQ(it->second->ops_in_flight, 0u);
@@ -783,6 +969,78 @@ TEST(NativeRunOperationLeaseTest, TeardownClosesEveryRunAndSwallowsForeignExcept
     }
 }
 
+TEST(NativeRunOperationLeaseTest, WholeCloseCannotDetachAHostPreparationInProgress) {
+    EXPECT_EXIT(
+        {
+            ChipWorker worker;
+            prime(worker);
+            worker.finalize_device_fn_ = stub_finalize_device;
+            worker.destroy_device_context_fn_ = stub_destroy_device_context;
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_prepare_released = false;
+            }
+            std::thread preparer([&] {
+                try {
+                    (void)prepare(worker, 0, 1);
+                } catch (...) {}
+            });
+            uint64_t preparing_epoch = 0;
+            {
+                std::unique_lock<std::mutex> lk(g_mu);
+                if (!g_cv.wait_for(lk, std::chrono::seconds(5), [] {
+                        return g_prepare_entered;
+                    }))
+                    _exit(2);
+                preparing_epoch = g_prepare_epoch;
+            }
+            bool close_started = false;
+            bool close_finished = false;
+            std::thread closer([&] {
+                {
+                    std::lock_guard<std::mutex> lk(g_mu);
+                    close_started = true;
+                    g_cv.notify_all();
+                }
+                try {
+                    worker.finalize();
+                } catch (...) {}
+                {
+                    std::lock_guard<std::mutex> lk(g_mu);
+                    close_finished = true;
+                    g_cv.notify_all();
+                }
+            });
+            {
+                std::unique_lock<std::mutex> lk(g_mu);
+                g_cv.wait(lk, [&] {
+                    return close_started;
+                });
+                (void)g_cv.wait_for(lk, std::chrono::milliseconds(200), [&] {
+                    return close_finished;
+                });
+            }
+            bool retained = false;
+            {
+                std::lock_guard<std::mutex> lk(worker.native_run_mu_);
+                const auto found = worker.native_runs_.find(preparing_epoch);
+                retained = found != worker.native_runs_.end() && found->second->storage.data() != nullptr;
+            }
+            {
+                std::lock_guard<std::mutex> lk(g_mu);
+                g_prepare_released = true;
+                g_cv.notify_all();
+            }
+            preparer.join();
+            closer.join();
+            if (!retained) _exit(3);
+            if (g_finalize_during_prepare) _exit(4);
+            _exit(0);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+
 // The whole close, not just its sweep: a worker whose every run closed cleanly reaches the device
 // teardown and the context destruction, and gives up its run storage.
 TEST(NativeRunOperationLeaseTest, WholeCloseReleasesEverythingWhenEveryRunIsProvedDestroyed) {
@@ -875,10 +1133,11 @@ TEST(NativeRunOperationLeaseTest, PoisonedLaneRetainsCommOwnersAcrossDeviceTeard
 // A run the sweep could not prove destroyed still owns whatever its carrier holds, and that
 // carrier still lives in this worker's run storage. The close therefore refuses the whole
 // reclamation below it rather than freeing those resources twice or unloading their owner.
-TEST(NativeRunOperationLeaseTest, WholeCloseRefusesToReclaimBehindAnUnprovenRun) {
+TEST(NativeRunOperationLeaseTest, WholeCloseRetainsAnUnprovenRunWhenDeviceTeardownRefuses) {
     ChipWorker worker;
     prime(worker);
     worker.finalize_device_fn_ = stub_finalize_device;
+    g_device_finalize_rc = -9;
     worker.destroy_device_context_fn_ = stub_destroy_device_context;
     const ChipWorkerNativeRun run = prepare(worker, 0, 1);
     worker.launch_native_run(run);
@@ -886,7 +1145,7 @@ TEST(NativeRunOperationLeaseTest, WholeCloseRefusesToReclaimBehindAnUnprovenRun)
     g_finalize_destroys = false;
     g_finalize_corrupts = true;
     EXPECT_THROW(worker.finalize(), std::runtime_error);
-    EXPECT_EQ(g_device_finalize_calls, 0) << "the device teardown ran behind an undestroyed run";
+    EXPECT_EQ(g_device_finalize_calls, 1);
     EXPECT_EQ(g_destroy_context_calls, 0) << "the context was destroyed behind an undestroyed run";
     EXPECT_NE(worker.device_ctx_, nullptr);
     EXPECT_FALSE(worker.runtime_bufs_.empty()) << "the carrier's storage was released under it";
@@ -897,12 +1156,36 @@ TEST(NativeRunOperationLeaseTest, WholeCloseRefusesToReclaimBehindAnUnprovenRun)
         EXPECT_TRUE(it->second->destruction_unknown);
     }
     // The refusal is not a one-shot: a second close sees the same unproven run and refuses again
-    // without attempting any device call, so nothing is reclaimed by a retry either.
+    // without re-entering the partially executed destructor. The common close may retry its proof.
     EXPECT_THROW(worker.finalize(), std::runtime_error);
-    EXPECT_EQ(g_device_finalize_calls, 0);
+    EXPECT_EQ(g_device_finalize_calls, 2);
     EXPECT_EQ(g_finalize_calls, 1) << "an isolated run was handed to the runtime again";
     // The fixture's worker is destroyed holding the isolated run, which is what production does
     // too; its destructor absorbs the same refusal.
+}
+
+// This zero models the strengthened common-close contract, not the business
+// verdict: the real architecture/probe consumer separately proves reset.
+TEST(NativeRunOperationLeaseTest, ConfirmedTerminalCloseNeverReentersAPartialDestructor) {
+    ChipWorker worker;
+    prime(worker);
+    worker.finalize_device_fn_ = stub_finalize_device;
+    worker.destroy_device_context_fn_ = stub_destroy_device_context;
+    const auto run = prepare(worker, 0, 1);
+    worker.launch_native_run(run);
+    void *carrier = worker.native_runs_.at(run.run_epoch)->storage.data();
+    g_finalize_destroys = false;
+    g_finalize_corrupts = true;
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_EQ(g_finalize_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 1);
+    EXPECT_EQ(g_destroy_context_calls, 1);
+    EXPECT_EQ(worker.device_ctx_, nullptr);
+    EXPECT_TRUE(worker.native_runs_.empty());
+    EXPECT_NO_THROW(worker.finalize());
+    EXPECT_EQ(g_finalize_calls, 1);
+    EXPECT_EQ(g_device_finalize_calls, 1);
+    std::free(carrier);  // This stub carrier owns no real resources.
 }
 
 // Retaining a map entry preserves nothing once the owner is gone: the entry and
@@ -921,10 +1204,11 @@ TEST(NativeRunOperationLeaseTest, AnUnprovenRunsStorageOutlivesTheWorkerThatHeld
         ChipWorker worker;
         prime(worker);
         worker.finalize_device_fn_ = stub_finalize_device;
+        g_device_finalize_rc = -9;
         worker.destroy_device_context_fn_ = stub_destroy_device_context;
         const ChipWorkerNativeRun run = prepare(worker, 0, 1);
         worker.launch_native_run(run);
-        carrier = worker.runtime_bufs_[run.slot_id].data();
+        carrier = worker.native_runs_.at(run.run_epoch)->storage.data();
         ASSERT_NE(carrier, nullptr);
 
         // A teardown that leaves the tag unreadable: the run is isolated, and
@@ -937,7 +1221,7 @@ TEST(NativeRunOperationLeaseTest, AnUnprovenRunsStorageOutlivesTheWorkerThatHeld
         // Detached from the owner, so the block is no longer this object's to
         // free — the run table still names the set, but that is bookkeeping and
         // this is the ownership.
-        EXPECT_EQ(worker.runtime_bufs_[run.slot_id].data(), nullptr)
+        EXPECT_EQ(worker.native_runs_.at(run.run_epoch)->storage.data(), nullptr)
             << "the carrier's storage is still owned by a worker that is about to be destroyed";
         std::memcpy(carrier, &kCarrierWitness, sizeof(kCarrierWitness));
     }
@@ -950,8 +1234,8 @@ TEST(NativeRunOperationLeaseTest, AnUnprovenRunsStorageOutlivesTheWorkerThatHeld
     std::free(carrier);
 }
 
-// A failed launch that nonetheless reached the device records completion and its own error, so a
-// later finalization reports that error instead of waiting.
+// A launch error outranks the later explicit observer's error, independently of
+// which operation first established physical completion.
 TEST(NativeRunOperationLeaseTest, FailedLaunchThatCompletedKeepsItsOwnError) {
     ChipWorker worker;
     prime(worker);
@@ -967,6 +1251,12 @@ TEST(NativeRunOperationLeaseTest, FailedLaunchThatCompletedKeepsItsOwnError) {
         EXPECT_EQ(it->second->phase, ChipWorker::NativeRunPhase::REAPED);
         EXPECT_EQ(it->second->pending_rc, -11);
     }
-    EXPECT_THROW(worker.finalize_native_run(run), std::runtime_error);
-    EXPECT_EQ(g_wait_calls, 0) << "a completed run was waited on";
+    g_wait_rc = -12;
+    try {
+        worker.finalize_native_run(run);
+        FAIL() << "the launch error was discarded";
+    } catch (const std::runtime_error &error) {
+        EXPECT_NE(std::string(error.what()).find("-11"), std::string::npos);
+    }
+    EXPECT_EQ(g_wait_calls, 1);
 }

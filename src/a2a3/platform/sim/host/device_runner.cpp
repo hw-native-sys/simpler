@@ -816,7 +816,7 @@ DrainOutcome DeviceRunner::drain_execution(ActiveExecution &active) {
             dfx, active.prepared->identity.run_epoch, /*device_execution_complete=*/false,
             /*device_producers_stopped=*/true
         );
-        return DrainOutcome::device_error(runtime_rc);
+        return DrainOutcome::device_error(runtime_rc, true);
     }
 
     // A retained diagnostics close that could not prove it owns this run's

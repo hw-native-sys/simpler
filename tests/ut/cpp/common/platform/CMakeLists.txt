@@ -828,6 +828,10 @@ platform_case(test_chip_swimlane_aicore.cpp PER_ARCH PER_RUNTIME BARE
 file(GLOB NATIVE_ADMISSION_SHARED_HOST CONFIGURE_DEPENDS
     ${SIMPLER_COMMON_PLATFORM_DIR}/shared/host/*.cpp)
 set(NATIVE_ADMISSION_SOURCES
+    ${SIMPLER_SRC}/common/worker/chip_run_lane.cpp
+    ${SIMPLER_SRC}/common/worker/chip_worker.cpp
+    ${SIMPLER_SRC}/common/worker/runtime_module.cpp
+    ${SIMPLER_SRC}/common/worker/device_fault_monitor_host.cpp
     ${CMAKE_SOURCE_DIR}/support/native_admission/transport.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/device_runner_base.cpp
     ${SIMPLER_COMMON_PLATFORM_DIR}/onboard/host/aicore_pmu_lease.cpp

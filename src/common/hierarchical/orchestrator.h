@@ -153,7 +153,7 @@ public:
 
     /**
      * Set how many runs may hold a native pipeline-slot lease at once
-     * (`depth`) and how many non-terminal logical runs may be admitted
+     * (`depth`) and how many physically unretired runs may be admitted
      * (`pending_depth`).
      *
      * The two are separate budgets. `depth` bounds a device resource: the
@@ -172,11 +172,11 @@ public:
      *
      * `launch_depth` bounds how many runs may have their device work launched
      * at once. One — the default — is the serial behaviour: a successor's work
-     * reaches a child only once its predecessor is terminal. Two authorizes the
+     * reaches a child only once its predecessor physically retires. Two authorizes the
      * staged successor of a run whose every dispatch has already reached an
      * endpoint outcome, so its work reaches the device while the predecessor is
      * still executing. It cannot exceed `depth`, since a launched run holds a
-     * pipeline lease for its whole lifetime.
+     * pipeline lease through its physical execution.
      */
     void configure_pipeline_depth(
         uint32_t depth, uint32_t pending_depth = 0, uint32_t launch_depth = 1, uint32_t initial_admission_depth = 0
@@ -222,6 +222,8 @@ public:
     void wait_run(RunId run_id);
     bool wait_run_for(RunId run_id, double timeout_seconds);
     bool run_done(RunId run_id) const;
+    // Non-allocating query after endpoint publication, outside admission locks.
+    bool run_observation_requested(RunId run_id) const noexcept;
     bool run_failed(RunId run_id) const;
     bool can_dispatch_run(RunId run_id) const;
 
@@ -271,6 +273,9 @@ public:
      * `early_launch_run_id` reports.
      */
     std::vector<RunId> early_launch_run_ids() const;
+    // Current normal or early activation permission, from one policy snapshot.
+    // Used outside endpoint/admission locks when handing over observation demand.
+    bool run_activation_authorized(RunId run_id) const noexcept;
 
     /**
      * The staged successor authorized to launch its device work while the
@@ -325,6 +330,7 @@ public:
     // Called once for each dispatched group member after its endpoint has
     // accepted the launch, or conservatively at endpoint completion.
     void mark_task_accepted(TaskSlot slot);
+    void mark_task_ended(TaskSlot slot, int32_t group_index = -1);
 
     // Called by Scheduler (via Worker) when a task becomes CONSUMED:
     // erases TensorMap entries, releases the allocator slot (and implicitly
@@ -406,6 +412,8 @@ private:
     std::shared_ptr<RunState> current_building_run() const;
     void finish_run_if_ready(const std::shared_ptr<RunState> &run);
     static bool is_terminal(RunPhase phase);
+    // Caller holds the run's completion_mu.
+    static bool execution_ended_locked(const RunState &run);
     static bool acceptance_ready(const std::shared_ptr<RunState> &run);
     // Callers hold runs_mu_.
     bool quiescent_locked() const;
@@ -468,8 +476,10 @@ private:
     std::vector<RunId> early_launch_prefix_locked() const;
     void activate_fifo_head();
     void retire_terminal_run(const std::shared_ptr<RunState> &run);
+    void retire_execution_if_ready(const std::shared_ptr<RunState> &run);
+    void request_run_observation(const std::shared_ptr<RunState> &run);
     void cancel_unstarted_run(const std::shared_ptr<RunState> &run, const std::string &message);
-    void register_run_slot(const std::shared_ptr<RunState> &run, TaskSlot slot);
+    void register_run_slot(const std::shared_ptr<RunState> &run, TaskSlot slot, size_t members = 1);
     void clear_run_ready_queues(RunId run_id);
     void compact_if_quiescent();
     void decrement_run_tasks(RunId run_id);

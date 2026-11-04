@@ -461,11 +461,13 @@ void WorkerThread::start(
         throw std::invalid_argument("WorkerThread::start: endpoint capacity is zero");
     }
     inflight_.store(0, std::memory_order_relaxed);
+    execution_inflight_.store(0, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lane_lk(lane_mu_);
         // One active lane plus one staged lane per further run the endpoint may
         // hold, which is exactly the capacity it just published.
         lanes_.assign(endpoint_->caps().max_inflight_tasks, LaneState{});
+        execution_ended_dispatch_ids_.assign(endpoint_->caps().max_inflight_tasks + MAILBOX_REQUEST_FRAMES, 0);
         activation_scratch_.assign(endpoint_->caps().max_inflight_tasks, INVALID_RUN_ID);
     }
 }
@@ -573,7 +575,7 @@ WorkerThread::submit_dispatch(WorkerDispatch d, size_t lane_index, RunId expecte
     if (shutdown_.load(std::memory_order_acquire)) {
         return SubmitDispatchResult::STOPPING;
     }
-    if (inflight_.load(std::memory_order_acquire) >= endpoint_->caps().max_inflight_tasks) {
+    if (execution_inflight_.load(std::memory_order_acquire) >= endpoint_->caps().max_inflight_tasks) {
         return SubmitDispatchResult::CAPACITY_EXCEEDED;
     }
     d.dispatch_id = next_dispatch_id_;
@@ -588,6 +590,11 @@ WorkerThread::submit_dispatch(WorkerDispatch d, size_t lane_index, RunId expecte
     }
     ++next_dispatch_id_;
     inflight_.fetch_add(1, std::memory_order_release);
+    execution_inflight_.fetch_add(1, std::memory_order_release);
+    // Capture while this dispatch owns the slot. A later terminal callback may
+    // consume it; observation propagation must not look through it afterward.
+    const TaskSlotState *const task = ring_->slot_state(d.task_slot);
+    const RunId run_id = task == nullptr ? INVALID_RUN_ID : task->run_id;
 #if SIMPLER_HOST_STRACE
     RunId trace_run = INVALID_RUN_ID;
     uint64_t trace_hash = 0;
@@ -609,6 +616,18 @@ WorkerThread::submit_dispatch(WorkerDispatch d, size_t lane_index, RunId expecte
         fail_submission(d, "submit_progress failed with unknown exception");
     }
     admission_lk.unlock();
+    if (published) {
+        try {
+            // A request before publication persists on RunState; one after
+            // this query sees the now-installed entry in its immediate scan.
+            if (observation_demand_ && observation_demand_(run_id)) endpoint_->request_observation(run_id);
+            endpoint_->progress_observations();
+        } catch (const std::exception &e) {
+            fail_progress_driver(std::string("observation publication failed: ") + e.what());
+        } catch (...) {
+            fail_progress_driver("observation publication failed with unknown exception");
+        }
+    }
 #if SIMPLER_HOST_STRACE
     if (trace_enabled) {
         const int64_t trace_end_ns = simpler::host_trace::now_ns();
@@ -670,7 +689,7 @@ bool WorkerThread::has_staged_run(RunId run_id) const {
 bool WorkerThread::can_stage() const {
     const WorkerEndpointCaps &endpoint_caps = caps();
     if (!endpoint_caps.supports_frame_staging) return false;
-    if (inflight_.load(std::memory_order_acquire) >= endpoint_caps.max_inflight_tasks) return false;
+    if (execution_inflight_.load(std::memory_order_acquire) >= endpoint_caps.max_inflight_tasks) return false;
     {
         std::lock_guard<std::mutex> lane_lk(lane_mu_);
         if (free_staged_lane_locked() >= lanes_.size()) return false;
@@ -762,6 +781,7 @@ void WorkerThread::progress() {
         endpoint_->request_progress_stop();
     }
 
+    bool changed = false;
     // Every lane, oldest first. Only the active lane can hold an activation
     // while the launch depth is one; above it, a staged run authorized to
     // launch early keeps its own lane — the predecessor still owns the active
@@ -793,6 +813,7 @@ void WorkerThread::progress() {
                 if (activate[index] == INVALID_RUN_ID) continue;
                 try {
                     if (endpoint_->activate_progress(activate[index])) {
+                        changed = true;
                         std::lock_guard<std::mutex> lane_lk(lane_mu_);
                         LaneState &dispatch_lane = lanes_[index];
                         if (dispatch_lane.occupied && dispatch_lane.run_id == activate[index]) {
@@ -810,11 +831,23 @@ void WorkerThread::progress() {
 
     WorkerEndpointProgress progress;
     try {
-        if (endpoint_->poll_progress(progress)) finish_progress_dispatch(progress);
+        if (endpoint_->poll_progress(progress)) {
+            changed = true;
+            finish_progress_dispatch(progress);
+        }
     } catch (const std::exception &e) {
         fail_progress_driver(std::string("poll_progress failed: ") + e.what());
     } catch (...) {
         fail_progress_driver("poll_progress failed with unknown exception");
+    }
+    // Parent policy queries may take runs_mu_. Keep them outside the outer
+    // admission lock above, not merely outside the endpoint's progress lock.
+    try {
+        if (changed) endpoint_->progress_observations();
+    } catch (const std::exception &e) {
+        fail_progress_driver(std::string("observation progress failed: ") + e.what());
+    } catch (...) {
+        fail_progress_driver("observation progress failed with unknown exception");
     }
 }
 
@@ -882,6 +915,30 @@ void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progre
         return;
     }
 
+    if (progress.kind == WorkerProgressKind::ENDED) {
+        auto ended =
+            std::find(execution_ended_dispatch_ids_.begin(), execution_ended_dispatch_ids_.end(), dispatch.dispatch_id);
+        if (ended != execution_ended_dispatch_ids_.end()) return;
+        auto available = std::find(execution_ended_dispatch_ids_.begin(), execution_ended_dispatch_ids_.end(), 0);
+        if (available == execution_ended_dispatch_ids_.end()) {
+            fail_progress_driver("physical-end ledger exceeds the endpoint entry grant");
+            return;
+        }
+        *available = dispatch.dispatch_id;
+        {
+            std::lock_guard<std::mutex> lane_lk(lane_mu_);
+            for (LaneState &dispatch_lane : lanes_) {
+                if (dispatch_lane.occupied && dispatch_lane.dispatch_id == dispatch.dispatch_id) {
+                    dispatch_lane = {};
+                    break;
+                }
+            }
+        }
+        execution_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+        if (on_ended_) on_ended_(progress.completion);
+        return;
+    }
+
 #if SIMPLER_HOST_STRACE
     const bool trace_enabled = simpler::host_trace::enabled();
     RunId trace_run = INVALID_RUN_ID;
@@ -935,6 +992,10 @@ void WorkerThread::finish_progress_dispatch(const WorkerEndpointProgress &progre
             }
         }
     }
+    auto ended =
+        std::find(execution_ended_dispatch_ids_.begin(), execution_ended_dispatch_ids_.end(), dispatch.dispatch_id);
+    if (ended == execution_ended_dispatch_ids_.end()) execution_inflight_.fetch_sub(1, std::memory_order_acq_rel);
+    else *ended = 0;
     inflight_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
@@ -1059,6 +1120,7 @@ void LocalMailboxEndpoint::submit_progress(Ring *ring, const WorkerDispatch &dis
     const uint64_t group_index = static_cast<uint64_t>(dispatch.group_index);
     const uint64_t group_size = static_cast<uint64_t>(state.group_size());
     entry->error = 0;
+    entry->observation_requested = 0;
     entry->preparation_disposition = static_cast<int32_t>(MailboxPreparationDisposition::NONE);
     std::memset(entry->error_text, 0, MAILBOX_ERROR_MSG_SIZE);
     entry->run_epoch = 0;
@@ -1200,6 +1262,94 @@ WorkerCompletion LocalMailboxEndpoint::terminal_completion(
     return completion;
 }
 
+void LocalMailboxEndpoint::request_observation(RunId run_id) {
+    std::unique_lock<std::mutex> lk(progress_mu_);
+    for (size_t index = 0; index < entries_.size(); ++index) {
+        const EntryRecord original = entries_[index];
+        if (!original.occupied || original.run_id != run_id) continue;
+        auto *entry = run_entry(index);
+        if (!entry_identity_matches(original, entry)) {
+            poison_progress("stale run-state entry identity at observation request");
+            return;
+        }
+        const auto terminal = [](MailboxRunEntry *value) {
+            const auto state = static_cast<MailboxState>(load_entry_i32(&value->state));
+            return state == MailboxState::TASK_DONE || state == MailboxState::TASK_FAILED;
+        };
+        if (terminal(entry) || load_entry_i32(&entry->observation_requested) != 0) continue;
+
+        // A policy callout cannot hold progress_mu_: submission/activation
+        // reaches this endpoint while the scheduler owns its admission lock.
+        // The existing installation cursor witnesses the whole candidate set,
+        // including a new later entry installed while the callout is unlocked.
+        const uint64_t installations = next_entry_generation_;
+        bool deferred = false;
+        for (size_t later = 0; later < entries_.size(); ++later) {
+            const EntryRecord candidate = entries_[later];
+            if (!candidate.occupied || candidate.run_id == run_id || !candidate.dispatch.prepare_only ||
+                candidate.dispatch.dispatch_id <= original.dispatch.dispatch_id || candidate.activation_published) {
+                continue;
+            }
+            auto *later_entry = run_entry(later);
+            if (!entry_identity_matches(candidate, later_entry)) {
+                poison_progress("stale successor entry identity at observation request");
+                return;
+            }
+            if (terminal(later_entry) || load_entry_i32(&later_entry->preparation_disposition) ==
+                                             static_cast<int32_t>(MailboxPreparationDisposition::VALIDATED_ONLY)) {
+                continue;
+            }
+            bool authorized = false;
+            if (activation_permission_) {
+                lk.unlock();
+                try {
+                    authorized = activation_permission_(candidate.run_id);
+                } catch (...) {
+                    // Preserve explicit observation if policy is unavailable.
+                }
+                lk.lock();
+            }
+            if (next_entry_generation_ != installations || !entries_[index].occupied ||
+                entries_[index].entry_generation != original.entry_generation) {
+                return;  // Persistent RunState demand is revisited on actual progress.
+            }
+            if (!entry_identity_matches(original, entry)) {
+                poison_progress("stale observation entry after policy query");
+                return;
+            }
+            const EntryRecord &current = entries_[later];
+            if (current.occupied && current.entry_generation == candidate.entry_generation &&
+                !entry_identity_matches(current, later_entry)) {
+                poison_progress("stale successor entry after policy query");
+                return;
+            }
+            if (authorized && current.occupied && current.entry_generation == candidate.entry_generation &&
+                !current.activation_published && !terminal(later_entry) &&
+                load_entry_i32(&later_entry->preparation_disposition) !=
+                    static_cast<int32_t>(MailboxPreparationDisposition::VALIDATED_ONLY)) {
+                deferred = true;
+                break;
+            }
+        }
+        if (!deferred && !terminal(entry)) store_entry_i32(&entry->observation_requested, 1);
+    }
+}
+
+void LocalMailboxEndpoint::progress_observations() {
+    for (size_t index = 0; index < entries_.size(); ++index) {
+        RunId run_id = INVALID_RUN_ID;
+        {
+            std::lock_guard<std::mutex> lk(progress_mu_);
+            if (entries_[index].occupied) run_id = entries_[index].run_id;
+        }
+        // A physically retired run may no longer own a WorkerThread lane, but
+        // its entry and the persistent RunState demand still own delivery.
+        if (run_id != INVALID_RUN_ID && observation_demand_ && observation_demand_(run_id)) {
+            request_observation(run_id);
+        }
+    }
+}
+
 bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
     std::lock_guard<std::mutex> lk(progress_mu_);
     progress.preparation_disposition = MailboxPreparationDisposition::NONE;
@@ -1311,6 +1461,25 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
             continue;
         }
 
+        if (state == MailboxState::TASK_ENDED && !record.ended_reported) {
+            if (!entry_identity_matches(record, entry)) {
+                poison_progress("stale run-state entry identity at physical end");
+                break;
+            }
+            record.ended_reported = true;
+            progress.kind = WorkerProgressKind::ENDED;
+            progress.dispatch = record.dispatch;
+            progress.completion.task_slot = record.dispatch.task_slot;
+            progress.completion.group_index = record.dispatch.group_index;
+            progress.completion.worker_id = caps_.worker_id;
+            // END retains child ownership; terminal publication may update the
+            // same capacity field while this parent consumes the physical fact.
+            progress.completion.admissible_run_resource_sets =
+                __atomic_load_n(&entry->admissible_run_resource_sets, __ATOMIC_ACQUIRE);
+            poll_cursor_ = (index + 1) % entry_count;
+            return true;
+        }
+
         if (state == MailboxState::TASK_DONE || state == MailboxState::TASK_FAILED) {
             if (!entry_identity_matches(record, entry)) {
                 poison_progress("stale run-state entry identity at terminal completion");
@@ -1325,7 +1494,8 @@ bool LocalMailboxEndpoint::poll_progress(WorkerEndpointProgress &progress) {
         }
 
         if (state != MailboxState::IDLE && state != MailboxState::TASK_READY && state != MailboxState::PREPARE_READY &&
-            state != MailboxState::ACTIVATE && state != MailboxState::TASK_LAUNCHED) {
+            state != MailboxState::ACTIVATE && state != MailboxState::TASK_LAUNCHED &&
+            state != MailboxState::TASK_ENDED) {
             poison_progress("run-state entry entered an invalid state " + std::to_string(static_cast<int32_t>(state)));
             break;
         }
@@ -1441,7 +1611,9 @@ void WorkerManager::add_sub(void *mailbox, size_t mailbox_bytes, int child_pid) 
 }
 
 void WorkerManager::start(
-    Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept, const OnStagedFn &on_staged
+    Ring *ring, const OnCompleteFn &on_complete, const OnAcceptFn &on_accept, const OnStagedFn &on_staged,
+    const OnCompleteFn &on_ended, const std::function<bool(RunId)> &observation_demand,
+    const std::function<bool(RunId)> &activation_permission
 ) {
     if (ring == nullptr) throw std::invalid_argument("WorkerManager::start: null ring");
 
@@ -1473,6 +1645,9 @@ void WorkerManager::start(
                 entry.worker_id, entry.mailbox, entry.mailbox_bytes, entry.child_pid, entry.granted_sets
             );
             wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
+            wt->set_on_ended(on_ended);
+            wt->set_observation_demand(observation_demand);
+            wt->set_activation_permission(activation_permission);
             next_level_threads_.push_back(std::move(wt));
         }
     };
@@ -1484,6 +1659,9 @@ void WorkerManager::start(
                 static_cast<int32_t>(i), entries[i].mailbox, entries[i].mailbox_bytes, entries[i].child_pid
             );
             wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
+            wt->set_on_ended(on_ended);
+            wt->set_observation_demand(observation_demand);
+            wt->set_activation_permission(activation_permission);
             threads.push_back(std::move(wt));
         }
     };
@@ -1491,6 +1669,9 @@ void WorkerManager::start(
     for (auto &endpoint : next_level_endpoint_entries_) {
         auto wt = std::make_unique<WorkerThread>();
         wt->start(ring, on_complete, on_accept, on_staged, std::move(endpoint));
+        wt->set_on_ended(on_ended);
+        wt->set_observation_demand(observation_demand);
+        wt->set_activation_permission(activation_permission);
         next_level_threads_.push_back(std::move(wt));
     }
     next_level_endpoint_entries_.clear();
@@ -1523,6 +1704,13 @@ void WorkerManager::progress() {
         worker->progress();
     for (auto &worker : sub_threads_)
         worker->progress();
+}
+
+void WorkerManager::request_observation(RunId run_id) {
+    // The worker list is fixed from startup until operation leases drain.
+    // A wait request allocates nothing and never waits for a control reply.
+    for (auto &worker : next_level_threads_)
+        worker->request_observation(run_id);
 }
 
 WorkerThread *WorkerManager::get_worker_by_id(WorkerType type, int32_t worker_id) const {

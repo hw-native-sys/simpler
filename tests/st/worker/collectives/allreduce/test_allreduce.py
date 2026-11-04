@@ -14,8 +14,11 @@ class) because multiple cases within a single class exhibit a Worker state-leak
 that causes golden-mismatch failures on sequential worker.run() calls.
 """
 
+import json
 import os
+import re
 from multiprocessing.shared_memory import SharedMemory
+from pathlib import Path
 
 import pytest
 import torch
@@ -485,7 +488,66 @@ class TestAllreduceRingP2MaxMinProd(SceneTestCase):
             getattr(args, f"out_{rank}").copy_(expected)
 
 
+def _copy_rejected_rank_logs(rank_logs, output):
+    output.mkdir()
+    captured = {}
+    for device, (pid, source, offset) in rank_logs.items():
+        destination = output / f"host.{pid}.log"
+        record = {"pid": pid, "source": source, "path": destination, "offset": offset, "text": None}
+        if source.exists():
+            body = source.read_bytes()[offset:]
+            destination.write_bytes(body)
+            record["text"] = body.decode("utf-8", errors="replace")
+        captured[device] = record
+    (output / "rank-logs.json").write_text(
+        json.dumps(
+            {
+                device: {
+                    key: str(value) if isinstance(value, Path) else value
+                    for key, value in record.items()
+                    if key != "text"
+                }
+                for device, record in captured.items()
+            },
+            indent=2,
+        )
+    )
+    return captured
+
+
+def _assert_rejected_domain_error(error, platform, rank_logs):
+    if platform.endswith("sim"):
+        assert re.search(r"reduce_op=1 unsupported|failed with code -5\b", error), error
+        return
+    match = re.search(
+        r"chip_process dev=(\d+): chip run: RuntimeError: chip run lane is poisoned: "
+        r"finalize_native_run failed with code 507018 "
+        r"\(run_id=\d+ slot=\d+ generation=\d+ dispatch_id=\d+ run_epoch=\d+\)",
+        error,
+    )
+    assert match is not None, error
+    assert int(match[1]) in rank_logs, error
+    assert len(rank_logs) == 2
+    for record in rank_logs.values():
+        assert record["source"].name == f"host.{record['pid']}.log"
+        assert record["path"].name == f"host.{record['pid']}.log"
+        assert record["text"] is not None, f"missing owned rank log: {record['source']}"
+        assert re.search(
+            r"\[ERROR\] copy_back_run_outputs_impl: \[runtime_maker\.cpp:\d+\] "
+            r"simpler runtime failed: orch_error_code=5 sched_error_code=0 runtime_status=-5\b",
+            record["text"],
+        ), f"missing controlled INVALID_ARGS classification in {record['path']}"
+
+
 def _run_rejected_domain_case(case, platform, device_ids, request, monkeypatch):
+    from _task_interface import _host_log_directory  # noqa: PLC0415  # pyright: ignore[reportMissingImports]
+
+    request.getfixturevalue("drain_host_log")
+    directory = _host_log_directory()
+    assert directory
+    log_directory = Path(directory)
+    output = request.getfixturevalue("tmp_path") / "collective-rejection"
+    rank_logs, captured_logs, primary_error = {}, {}, None
     worker = Worker(
         level=3,
         platform=platform,
@@ -516,8 +578,13 @@ def _run_rejected_domain_case(case, platform, device_ids, request, monkeypatch):
         worker.init()
         pids = (*worker._chip_pids, *worker._sub_pids, *worker._next_level_pids)
         mailboxes = tuple(shm.name for shm in (*worker._chip_shms, *worker._next_level_shms))
-        with pytest.raises(RuntimeError, match=r"reduce_op=1 unsupported|failed with code -5"):
+        assert len(worker._chip_pids) == len(device_ids) == 2
+        for device, pid in zip(device_ids, worker._chip_pids, strict=True):
+            source = log_directory / f"host.{pid}.log"
+            rank_logs[device] = (pid, source, source.stat().st_size if source.exists() else 0)
+        with pytest.raises(RuntimeError) as failure:
             SceneTestCase.test_run(case, platform, worker, request)
+        primary_error = str(failure.value)
         assert len(domains) == 1
         domain = domains[0]
         assert domain.released and not domain.freed
@@ -540,11 +607,17 @@ def _run_rejected_domain_case(case, platform, device_ids, request, monkeypatch):
                     SharedMemory(name=name)
         assert release_calls == [domain]
     finally:
-        if worker._cleanup_journal.empty:
-            worker.close()
-        else:
-            with pytest.raises(RuntimeError, match="window reclamation is unconfirmed"):
+        try:
+            if worker._cleanup_journal.empty:
                 worker.close()
+            else:
+                with pytest.raises(RuntimeError, match="window reclamation is unconfirmed"):
+                    worker.close()
+        finally:
+            captured_logs = _copy_rejected_rank_logs(rank_logs, output)
+            (output / "primary-error.txt").write_text(primary_error or "no RuntimeError captured")
+    assert primary_error is not None
+    _assert_rejected_domain_error(primary_error, platform, captured_logs)
 
 
 @pytest.mark.device_count(2)

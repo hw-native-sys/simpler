@@ -422,6 +422,8 @@ public:
     // copy_in_run_inputs_impl and copy_back_run_outputs_impl, and released by
     // release_run_bindings_impl. Host-only (after `dev`): never uploaded.
     std::vector<TensorLease> tensor_leases_;
+    std::vector<TensorLease> &tensor_leases() { return tensor_leases_; }
+    const std::vector<TensorLease> &tensor_leases() const { return tensor_leases_; }
 
     simpler::dfx::scope_stats_runs::CapacityMetadata scope_stats_capacity_;
     const simpler::dfx::scope_stats_runs::CapacityMetadata &scope_stats_capacity() const {

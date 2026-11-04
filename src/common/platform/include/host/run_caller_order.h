@@ -122,7 +122,35 @@ public:
         return complete ? Completion::Complete : Completion::Pending;
     }
 
-    int discharge(const NativeRunIdentity &id, int timeout_ms, bool boundaries_complete = false) {
+    // Consume only first-hand physical proof; never wait or synchronize.
+    int poll_discharge(const NativeRunIdentity &id, bool boundaries_complete) {
+        std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
+        if (!lock.owns_lock()) return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+        if (!active_) return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+        if (!owns(id)) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        if (submitted_ && !consumed_) {
+            if (streams_[Caller] == nullptr && boundaries_complete) {
+                consumed_ = true;
+            } else if (tail_recorded_) {
+                bool complete = false;
+                if (ops_.query(events_[Tail], &complete) != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+                if (!complete) return SIMPLER_NATIVE_RUN_POLL_NOT_READY;
+                consumed_ = true;
+            } else {
+                return SIMPLER_NATIVE_RUN_POLL_ERROR;
+            }
+        }
+        if (reference_.valid()) {
+            const int rc = reference_.committed() ? fence_->release_wait_reference(reference_, Role::Caller) :
+                                                    fence_->revoke_wait_reference(reference_);
+            if (rc != 0) return SIMPLER_NATIVE_RUN_POLL_ERROR;
+        }
+        return SIMPLER_NATIVE_RUN_POLL_COMPLETE;
+    }
+
+    int discharge(
+        const NativeRunIdentity &id, int timeout_ms, bool boundaries_complete = false, bool allow_stream_sync = true
+    ) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!active_) return 0;
         if (!owns(id)) return PTO_RUNTIME_ERR_INVALID_STATE;
@@ -133,6 +161,7 @@ public:
                 int rc = ops_.wait(events_[Tail], timeout_ms);
                 if (rc != 0) return rc;
             } else {
+                if (!allow_stream_sync) return PTO_RUNTIME_ERR_INTERNAL;
                 // Partial enqueue has no tail proof. Both private streams and
                 // the borrowed caller may still name a fork or completion event.
                 int first = 0;

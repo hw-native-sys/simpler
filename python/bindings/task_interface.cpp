@@ -3561,7 +3561,9 @@ NB_MODULE(_task_interface, m) {
         .def("activate", &ChipRun::activate)
         .def("abandon", &ChipRun::abandon, nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro("launched", &ChipRun::launched)
+        .def_prop_ro("_execution_ended", &ChipRun::execution_ended)
         .def_prop_ro("lane_poisoned", &ChipRun::lane_poisoned)
+        .def_prop_ro("_owner_recovery_required", &ChipRun::owner_recovery_required)
         .def_prop_ro("preparation_disposition", &ChipRun::preparation_disposition)
         .def(
             "wait",

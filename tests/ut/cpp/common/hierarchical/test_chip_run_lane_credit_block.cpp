@@ -75,7 +75,7 @@ uint32_t slot_of(void *runtime) { return g_slots.at(runtime); }
 int prepare_run(
     void *, void *runtime, int32_t, const void *, const CallConfig *, const NativeRunDescriptor *descriptor
 ) {
-    (void)runtime;
+    g_slots[runtime] = descriptor->pipeline_slot;
     g_complete[descriptor->pipeline_slot] = false;
     g_events.push_back("prepare" + std::to_string(descriptor->pipeline_slot));
     return 0;
@@ -101,7 +101,12 @@ int wait_run(void *, void *runtime) {
 int g_finalize_rc{0};
 bool g_finalize_throws{false};
 
-int finalize_run(void *, void *runtime) {
+int wait_run_completion(void *, void *runtime) {
+    g_complete[slot_of(runtime)] = true;
+    return 0;
+}
+
+int finalize_run(void *, void *runtime, int) {
     g_events.push_back("finalize" + std::to_string(slot_of(runtime)));
     if (g_finalize_throws) return PTO_RUNTIME_ERR_INTERNAL;
     return g_finalize_rc;
@@ -185,13 +190,11 @@ void prime_worker(ChipWorker &worker, unsigned launch_depth = 2) {
     worker.pipeline_generations_.resize(worker.pipeline_contract_.pipeline_depth);
     worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
     worker.runtime_bufs_.emplace_back(64, alignof(std::max_align_t), nullptr);
-    for (uint32_t slot = 0; slot < worker.runtime_bufs_.size(); ++slot) {
-        g_slots.emplace(worker.runtime_bufs_[slot].data(), slot);
-    }
     worker.prepare_run_fn_ = prepare_run;
     worker.launch_run_fn_ = launch_run;
     worker.poll_run_fn_ = poll_run;
     worker.wait_run_fn_ = wait_run;
+    worker.wait_run_completion_fn_ = wait_run_completion;
     worker.finalize_run_fn_ = finalize_run;
     worker.supports_concurrent_native_prepare_fn_ = supports_successor;
     worker.supports_joined_native_launch_fn_ = declines_joined_launch;

@@ -779,6 +779,36 @@ def test_claim_release_span_stays_inside_the_invocation_tree():
     assert invocation.root().dur == 210 - 50
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "chip.run.proof.record",
+        "chip.run.proof.consume",
+        "chip.run.proof.event_query",
+        "chip.run.proof.event_wait",
+        "chip.run.proof.stream_wait",
+        "chip.run.proof.observe_begin",
+        "chip.run.proof.observe_return",
+        "chip.run.proof.invalid",
+        "chip.run.borrow_release",
+        "chip.run.borrow_release.invalid",
+    ],
+)
+def test_instant_proof_before_root_preserves_native_overlap(name):
+    lines = [_record(7, 1, name, depth=1, ts=50, dur=0)]
+    lines += _run_records(run_epoch=1, prepare=(50, 20), device=(100, 100), release=200)
+    lines += [_record(7, 2, name, depth=1, ts=150, dur=0)]
+    lines += _run_records(run_epoch=2, prepare=(150, 30), device=(240, 100), release=340)
+
+    checks = assert_native_overlap(parse_spans(lines))
+    invocations = group_invocations(invocation_spans(list(parse_spans(lines))))
+
+    assert len(checks) == 1
+    assert len(invocations) == 2
+    assert all(invocation.root().name == "chip.run" for invocation in invocations)
+    assert all(invocation.by_name()[name].depth == 1 for invocation in invocations)
+
+
 def test_swimlane_splits_an_interleaved_thread_into_one_lane_per_pipeline_slot():
     """A K-deep pipeline runs on one OS thread, so tid is not the unit of concurrency.
 
