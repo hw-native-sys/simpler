@@ -225,8 +225,8 @@ def test_real_workflow_body_preserves_platform_through_the_exclusive_task(tmp_pa
         "args=sys.argv[1:]\n"
         "if args==['--list']: sys.exit(0)\n"
         "assert args[args.index('--device-num')+1]=='1'\n"
-        "assert args[args.index('--timeout')+1]=='900'\n"
-        "assert args[args.index('--max-time')+1]=='900'\n"
+        "assert args[args.index('--timeout')+1]=='1200'\n"
+        "assert args[args.index('--max-time')+1]=='1200'\n"
         "assert ['--env','PLATFORM']==args[4:6]\n"
         "subprocess.run(['bash','-e','-c',args[args.index('--run')+1]], "
         "env={**os.environ,'TASK_DEVICE':'0'},check=True)\n",
